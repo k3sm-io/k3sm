@@ -1368,22 +1368,36 @@ func (r *runtimedRuntime) allocError(pod *corev1.Pod, err error) error {
 // is a host-owned lo0 alias the Service proxy's relay listens on, and the
 // override is what keeps that relay up. Dropping the override closes the relay's
 // listeners and every connection it was relaying before the call returns
-// (transportFeed.drop -> proxy.RoutingTable.SetTransportOverrides), so the alias
-// is removed only once nothing is listening on or relaying from it. The reverse
-// order would pull the address out from under live sockets and leave the relay
-// retrying a bind on an address the node no longer holds. Every teardown path
-// releases through here (DeletePod and the orphan reaper via teardownPod, a
-// refused create, a refused re-attach), so the order holds on all of them by
-// construction; for a host-process pod the drop is a no-op.
+// (transportFeed.beginRelease -> proxy.RoutingTable.SetTransportOverrides), so
+// the alias is removed only once nothing is listening on or relaying from it.
+// The reverse order would pull the address out from under live sockets and
+// leave the relay retrying a bind on an address the node no longer holds.
+//
+// NO REINSTALL WHILE RELEASING. A status observation can run concurrently and
+// would otherwise put the override (and the relay) back between the drop and
+// the alias removal. beginRelease marks the pod so observe refuses it, and
+// endRelease clears the mark only after the adapter's Teardown has deleted the
+// guest record that observe re-checks under the same lock, so no window exists
+// in which an observation can reinstall it.
+//
+// Every path that releases a pod's /32 goes through here (DeletePod and the
+// orphan reaper via teardownPod, a refused create, a refused re-attach), so the
+// order holds on all of them by construction; for a host-process pod the drop
+// is a no-op. The one path that drops an override WITHOUT releasing the /32 is
+// eviction (evictPod): the evicted pod stays in the apiserver, its guest is
+// stopped, its override and relay go, and its /32 is released by the DeletePod
+// that follows, through here.
 func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
+	id := string(pod.UID)
 	// Unconditional: the feed (nil-tolerant) holds the override even on a node
 	// whose pod-network seam is absent, and its liveness obligation does not
 	// depend on that seam.
-	r.transport.drop(string(pod.UID))
+	r.transport.beginRelease(id)
+	defer r.transport.endRelease(id)
 	if r.network == nil {
 		return
 	}
-	if err := r.network.Teardown(string(pod.UID)); err != nil {
+	if err := r.network.Teardown(id); err != nil {
 		r.log.Warn("pod network teardown", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 	}
 }

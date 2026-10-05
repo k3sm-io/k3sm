@@ -586,8 +586,8 @@ func TestGuestLeaseFeedsTransportOverride(t *testing.T) {
 			t.Fatal("newTransportFeed returned the inert feed for a real routing table")
 		}
 		pub, live := netip.MustParseAddr("100.64.0.9"), netip.MustParseAddr(leaseFirst)
-		feed.observe("pod-1", pub, live, []uint16{80})
-		feed.observe("pod-1", pub, netip.MustParseAddr(leaseSecond), []uint16{80})
+		feed.observe("pod-1", pub, live, []uint16{80}, nil)
+		feed.observe("pod-1", pub, netip.MustParseAddr(leaseSecond), []uint16{80}, nil)
 		feed.drop("pod-1")
 	})
 }
@@ -601,7 +601,7 @@ func TestTransportFeedInertWithoutSink(t *testing.T) {
 		t.Fatalf("newTransportFeed(nil) = %v, want the inert nil feed", f)
 	}
 	var f *transportFeed
-	f.observe("pod-1", netip.MustParseAddr("100.64.0.9"), netip.MustParseAddr(leaseFirst), nil)
+	f.observe("pod-1", netip.MustParseAddr("100.64.0.9"), netip.MustParseAddr(leaseFirst), nil, nil)
 	f.drop("pod-1")
 }
 
@@ -692,9 +692,9 @@ func TestTransportFeedPublishesDeclaredPorts(t *testing.T) {
 		feed := newTransportFeed(&recordingSink{}, nil)
 		sink := feed.sink.(*recordingSink)
 		pub, live := netip.MustParseAddr("100.64.0.9"), netip.MustParseAddr(leaseFirst)
-		feed.observe("pod-1", pub, live, []uint16{80})
-		feed.observe("pod-1", pub, live, []uint16{80})
-		feed.observe("pod-1", pub, live, []uint16{80, 443})
+		feed.observe("pod-1", pub, live, []uint16{80}, nil)
+		feed.observe("pod-1", pub, live, []uint16{80}, nil)
+		feed.observe("pod-1", pub, live, []uint16{80, 443}, nil)
 		sets, got := sink.snapshot()
 		if sets != 2 {
 			t.Errorf("generations = %d, want 2 (install, then the port change; the repeat is a no-op)", sets)
@@ -711,12 +711,12 @@ func TestTransportFeedPublishesDeclaredPorts(t *testing.T) {
 		feed.sink.(*recordingSink).onSet = func(m map[netip.Addr]proxy.VMPodTransport) { handed = m }
 		ports := []uint16{80, 443}
 		pub := netip.MustParseAddr("100.64.0.9")
-		feed.observe("pod-1", pub, netip.MustParseAddr(leaseFirst), ports)
+		feed.observe("pod-1", pub, netip.MustParseAddr(leaseFirst), ports, nil)
 		// Neither the caller's slice nor the generation the sink took may alias
 		// the feed's tracked state: the next generation must be rebuilt intact.
 		ports[0] = 1
 		handed[pub].Ports[1] = 2
-		feed.observe("pod-2", netip.MustParseAddr("100.64.0.10"), netip.MustParseAddr(leaseSecond), nil)
+		feed.observe("pod-2", netip.MustParseAddr("100.64.0.10"), netip.MustParseAddr(leaseSecond), nil, nil)
 		if got := handed[pub].Ports; !slices.Equal(got, []uint16{80, 443}) {
 			t.Errorf("pod-1 ports in the next generation = %v, want [80 443]", got)
 		}

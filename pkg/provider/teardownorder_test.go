@@ -82,3 +82,96 @@ func TestTeardownDropsTransportBeforeAlias(t *testing.T) {
 			droppedWithAlias, droppedWithoutAlias)
 	}
 }
+
+// racingNetwork is the leaseNode's adapter with a hook run inside Teardown, on
+// either side of the real alias release: the two instants a concurrent status
+// observation can land while releasePodNetwork is in progress.
+type racingNetwork struct {
+	*PodNetAdapter
+	before, after func(podID string)
+}
+
+func (n *racingNetwork) Teardown(podID string) error {
+	if n.before != nil {
+		n.before(podID)
+	}
+	err := n.PodNetAdapter.Teardown(podID)
+	if n.after != nil {
+		n.after(podID)
+	}
+	return err
+}
+
+// TestReleaseRefusesARacingReinstall pins the security-critique condition on
+// releasePodNetwork: a status observation that reports the guest's lease while
+// the pod's network is being released (after the override drop, before or after
+// the alias removal) must not leave an override, and so a relay, behind. Each
+// interleaving is a separate case because each is closed by a different guard:
+// before the alias removal the release mark refuses it, after it the under-lock
+// guest re-check does.
+func TestReleaseRefusesARacingReinstall(t *testing.T) {
+	t.Parallel()
+	for _, at := range []string{"before alias release", "after alias release", "after release returns"} {
+		t.Run(at, func(t *testing.T) {
+			t.Parallel()
+			n := newLeaseNode(t)
+			pod := portedVMPod("team-a", "racer")
+			id := string(pod.UID)
+			race := func() { n.r.observeTransport(pod, leaseStatus(id, "", leaseFirst)) }
+			net := &racingNetwork{PodNetAdapter: n.adapt}
+			switch at {
+			case "before alias release":
+				net.before = func(string) { race() }
+			case "after alias release":
+				net.after = func(string) { race() }
+			}
+			n.r.network = net
+
+			if err := n.r.CreatePod(context.Background(), pod); err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			n.watch(t)
+			pub := n.published(t, id)
+			n.rt.push(t, id, leaseFirst)
+			n.awaitOverrides(t, map[string]string{pub: leaseFirst})
+
+			n.r.releasePodNetwork(pod)
+			if at == "after release returns" {
+				race()
+			}
+
+			if n.r.transport.has(id) {
+				t.Error("an override survived the release")
+			}
+			if _, last := n.sink.snapshot(); len(last) != 0 {
+				t.Errorf("the proxy's last generation still names %v after the release", renderOverrides(last))
+			}
+		})
+	}
+}
+
+// TestObserveRechecksTheGuestUnderTheLock pins the second guard: an observation
+// whose caller read the guest record before the release removed it (the
+// time-of-check/time-of-use race releasePodNetwork cannot see) re-checks the
+// record under the feed lock and installs nothing, dropping any override it
+// finds instead.
+func TestObserveRechecksTheGuestUnderTheLock(t *testing.T) {
+	t.Parallel()
+	sink := &recordingSink{}
+	feed := newTransportFeed(sink, nil)
+	pub, live := netip.MustParseAddr("100.64.0.9"), netip.MustParseAddr(leaseFirst)
+	gone := func() bool { return false }
+
+	feed.observe("pod-1", pub, live, []uint16{80}, gone)
+	if feed.has("pod-1") {
+		t.Fatal("an observation whose guest is gone installed an override")
+	}
+	feed.observe("pod-1", pub, live, []uint16{80}, nil)
+	feed.observe("pod-1", pub, netip.MustParseAddr(leaseSecond), []uint16{80}, gone)
+	if feed.has("pod-1") {
+		t.Error("an observation whose guest is gone left the previous override in place")
+	}
+	if _, last := sink.snapshot(); len(last) != 0 {
+		t.Errorf("last generation = %v, want empty", renderOverrides(last))
+	}
+}

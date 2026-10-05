@@ -79,10 +79,9 @@ func (l transportLease) equal(o transportLease) bool {
 //
 // The result is deterministic so the feed's change test is exact and the relay
 // sees one canonical list. The node's relay refuses a pod whose port set (this
-// list together with the Service-targeted ports) is over its per-pod cap, 32
-// ports, rather than relaying a truncated subset; that ceiling is the relay's to
-// enforce and is documented in docs/user/limitations.md, so the list is never
-// trimmed here.
+// list together with the Service-targeted ports) is over its per-pod ceiling
+// (proxy.MaxRelayPorts) rather than relaying a truncated subset; that ceiling is
+// the relay's to enforce, so the list is never trimmed here.
 //
 // It is exported for the one other reader that must agree with the feed: the
 // root k3sm-netd's privileged-port authorizer, which admits a <1024 relay bind
@@ -146,6 +145,11 @@ type transportFeed struct {
 
 	mu     sync.Mutex
 	leases map[string]transportLease // pod id -> its two addresses
+	// releasing holds the pods whose network release has begun
+	// (beginRelease .. endRelease). observe refuses them, so a status
+	// observation that races the release cannot reinstall an override, and so
+	// the relay, over the alias being removed.
+	releasing map[string]struct{}
 }
 
 // newTransportFeed returns the feed publishing into sink, or nil when no sink is
@@ -157,7 +161,7 @@ func newTransportFeed(sink TransportOverrideSink, log *slog.Logger) *transportFe
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &transportFeed{sink: sink, log: log, leases: map[string]transportLease{}}
+	return &transportFeed{sink: sink, log: log, leases: map[string]transportLease{}, releasing: map[string]struct{}{}}
 }
 
 // observe records podID's published/live pair and its declared TCP ports (in the
@@ -165,13 +169,27 @@ func newTransportFeed(sink TransportOverrideSink, log *slog.Logger) *transportFe
 // changed. An unchanged report is a no-op: a vm pod's status is re-observed on
 // every stream event and every resync tick, and re-pushing an identical map would
 // churn the table's override generation, and the relay's, for nothing.
-func (f *transportFeed) observe(podID string, published, live netip.Addr, ports []uint16) {
+//
+// stillGuest, when non-nil, is re-checked UNDER the feed lock: false means the
+// node no longer records a guest for the pod (its network was torn down after
+// the caller read it), and the pod's override is dropped instead of installed.
+// Together with the releasing set this closes the window in which a status
+// observation read the guest record, lost the race to releasePodNetwork, and
+// would otherwise reinstall a relay on an address the node has just given up.
+func (f *transportFeed) observe(podID string, published, live netip.Addr, ports []uint16, stillGuest func() bool) {
 	if f == nil {
 		return
 	}
 	next := transportLease{published: published, live: live, ports: slices.Clone(ports)}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, ok := f.releasing[podID]; ok {
+		return
+	}
+	if stillGuest != nil && !stillGuest() {
+		f.dropLocked(podID)
+		return
+	}
 	if cur, ok := f.leases[podID]; ok && cur.equal(next) {
 		return
 	}
@@ -193,12 +211,44 @@ func (f *transportFeed) drop(podID string) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.dropLocked(podID)
+}
+
+// dropLocked is drop's body. Callers hold mu.
+func (f *transportFeed) dropLocked(podID string) {
 	if _, ok := f.leases[podID]; !ok {
 		return
 	}
 	delete(f.leases, podID)
 	f.log.Info("vm pod transport override dropped", "pod", podID)
 	f.republishLocked()
+}
+
+// beginRelease marks podID's network release as begun and drops its override in
+// the same critical section, so no observation can reinstall it until
+// endRelease. Paired with endRelease by releasePodNetwork.
+func (f *transportFeed) beginRelease(podID string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releasing[podID] = struct{}{}
+	f.dropLocked(podID)
+}
+
+// endRelease clears podID's release mark. By then the pod's guest record is gone
+// (the adapter's Teardown deletes it), so observe's under-lock stillGuest check
+// keeps refusing a late observation without the mark, and the set stays bounded
+// by the releases in flight. A later create of the same pod records a new guest
+// and is observed normally.
+func (f *transportFeed) endRelease(podID string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.releasing, podID)
 }
 
 // has reports whether podID currently holds an override — the exact predicate
@@ -333,7 +383,11 @@ func (r *runtimedRuntime) observeTransport(pod *corev1.Pod, rs *runtimev1.PodSta
 		r.transport.drop(podID)
 		return
 	}
-	r.transport.observe(podID, gn.PodIP.Unmap(), live, DeclaredTCPPorts(pod))
+	published := gn.PodIP.Unmap()
+	r.transport.observe(podID, published, live, DeclaredTCPPorts(pod), func() bool {
+		cur, ok := r.guestNetwork(podID)
+		return ok && cur.PodIP.Unmap() == published
+	})
 }
 
 // transportGateFor computes the pod-level readiness precondition for pod: whether
