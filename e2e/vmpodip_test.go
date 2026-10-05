@@ -34,6 +34,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // vm pod IP reachability: the lab twin of darwin-net's
@@ -60,6 +61,10 @@ const (
 	// guest really listens there, a refusal is the relay's verdict, not an empty
 	// port.
 	vmPodIPHiddenPort = 9090
+	// vmPodIPServicePort is a port the second guest serves on WITHOUT declaring
+	// it, and that a Service targets: the relay must serve it, because the
+	// Pod's EndpointSlice names it.
+	vmPodIPServicePort = 9191
 )
 
 // vmBannerPy serves "BANNER=<name>" on every port in PORTS, one line per accepted
@@ -86,8 +91,8 @@ serve(ports[0])
 // TestVMPodIPReachableAcrossNodes is the B440 lab gate for the k3sm half: two vm
 // Pods on the worker, each answering its own banner; a dial of either's
 // status.podIP reaches that Pod and never the other, from the server, from the
-// worker host and from a native pod on the worker; an undeclared, non-Service
-// port is refused; and once a Pod is deleted a dial of its address fails fast
+// worker host and from a native pod on the worker; an undeclared port a Service
+// targets is served, while an undeclared, non-Service port is refused; and once a Pod is deleted a dial of its address fails fast
 // rather than hanging.
 func TestVMPodIPReachableAcrossNodes(t *testing.T) {
 	c := Up(t)
@@ -119,7 +124,8 @@ func TestVMPodIPReachableAcrossNodes(t *testing.T) {
 	}
 
 	a := createVMBannerPod(t, c, ns, "alpha", worker, vmPodIPHiddenPort)
-	b := createVMBannerPod(t, c, ns, "beta", worker)
+	b := createVMBannerPod(t, c, ns, "beta", worker, vmPodIPServicePort)
+	createTargetingService(t, c, ns, b, vmPodIPServicePort)
 	ipA := waitPodIPInCIDR(t, c, ns, a, nodeCIDR)
 	ipB := waitPodIPInCIDR(t, c, ns, b, nodeCIDR)
 	if ipA == ipB {
@@ -151,6 +157,11 @@ func TestVMPodIPReachableAcrossNodes(t *testing.T) {
 	t.Run("from a native pod on that node", func(t *testing.T) {
 		p := workerDialPod(ns, "pod-dial", worker, bin, false, addrB, "beta")
 		applyAndWaitSucceeded(t, c, p, 4*time.Minute)
+	})
+
+	t.Run("an undeclared but Service-targeted port is served", func(t *testing.T) {
+		svcPort := net.JoinHostPort(ipB.String(), fmt.Sprint(vmPodIPServicePort))
+		expectBanner(t, svcPort, "beta", 3*time.Minute)
 	})
 
 	t.Run("an undeclared non-Service port is refused", func(t *testing.T) {
@@ -227,6 +238,27 @@ func createVMBannerPod(t *testing.T, c *Cluster, ns, name, worker string, extra 
 		t.Fatalf("vm pod %s/%s scheduled on %s, want the worker %s", ns, name, got.Spec.NodeName, worker)
 	}
 	return name
+}
+
+// createTargetingService creates a ClusterIP Service selecting pod by its app
+// label and targeting port, so the pod's EndpointSlice names port at its pod IP.
+func createTargetingService(t *testing.T, c *Cluster, ns, pod string, port int) {
+	t.Helper()
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: pod + "-extra", Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": pod},
+			Ports: []corev1.ServicePort{{
+				Name:       "extra",
+				Port:       int32(port),
+				TargetPort: intstr.FromInt32(int32(port)),
+				Protocol:   corev1.ProtocolTCP,
+			}},
+		},
+	}
+	if _, err := c.Client.CoreV1().Services(ns).Create(context.Background(), svc, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create service %s/%s: %v", ns, svc.Name, err)
+	}
 }
 
 // waitPodIPInCIDR waits for the pod's status.podIP and asserts it lies in the
