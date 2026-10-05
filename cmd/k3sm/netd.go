@@ -78,14 +78,15 @@ type netdOptions struct {
 func netdFlags(opts *netdOptions) *flag.FlagSet {
 	fs := flag.NewFlagSet("netd", flag.ExitOnError)
 	fs.StringVar(&opts.socket, "socket", netd.DefaultSocketPath, "unix socket to listen on")
-	// The pre-adoption node /24 default is DERIVED, never typed: it is the same
-	// index-0 carve of the cluster pod CIDR the server gives itself
-	// (defaultNodePodCIDR), and the two must be the SAME value. netd's adoption
-	// treats "the identity already in force" as a no-op and refuses a DIFFERENT
-	// identity once anything is live, so on a server — whose ConfigureMesh carries
-	// exactly that index-0 carve — a literal here that drifted from the carve would
+	// The pre-adoption node /24 default is DERIVED, never typed: it is the
+	// index-0 carve of the cluster pod CIDR (defaultNodePodCIDR) a single node
+	// gives itself, and the two must be the SAME value. netd's adoption treats
+	// "the identity already in force" as a no-op and refuses a DIFFERENT identity
+	// once anything is live, so a literal here that drifted from the carve would
 	// turn a silent no-op into a refused adoption on a node that already holds
-	// aliases. One derivation, so drift is not expressible.
+	// aliases. A mesh server's plist overrides it with this server's --mesh-ip /24
+	// (install.MeshNodePodCIDR), the range its ConfigureMesh carries. One
+	// derivation each, so drift is not expressible.
 	fs.StringVar(&opts.nodePodCIDR, "node-pod-cidr", defaultNodePodCIDR(), "this node's pod /24 (a pod-IP alias must fall within it); PRE-ADOPTION VALUE — on a worker the real prefix is decided by the join and a ConfigureMesh replaces this value, so a worker's installed plist passes none; a mesh server's installed plist passes the /24 its --mesh-ip is the mesh-egress address of, because the server aliases that address before its own enrol")
 	fs.StringVar(&opts.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR (REQUIRED so the proxy's ClusterIP VIP aliases are admitted)")
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")

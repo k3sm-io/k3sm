@@ -18,11 +18,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/netip"
 	"os"
+	"strconv"
+	"time"
 
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -31,6 +37,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/ingresshost"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
@@ -217,9 +224,12 @@ type serverMesh struct {
 	nodePasswords bootstrap.NodePasswordStore
 	// down is the mesh teardown handle runServer's deferred teardown runs.
 	down meshTeardown
-	// podCIDR is the control-plane node's pod /24: the reserved index-0 carve of
-	// the cluster pod CIDR — the ONE value the routing-table locality (step 4c)
-	// and the node's podnet adapter (step 5) both allocate against.
+	// podCIDR is the control-plane node's pod /24: on the mesh path the /24 this
+	// server's --mesh-ip is the mesh-egress address of (serverSelfPodCIDR), and
+	// the first-server default off it — the ONE value the routing-table locality
+	// (step 4c) and the node's podnet adapter (step 5) both allocate against. It
+	// is seeded before the enrol, so a failed enrol still leaves it agreeing with
+	// the lo0 alias and the netd seed, which read the same derivation.
 	podCIDR string
 	// egressIP is the mesh-egress source the proxy binds for cross-node backend
 	// dials, and peerEgress the peer mesh-egress /32s the NetworkPolicy table
@@ -227,15 +237,92 @@ type serverMesh struct {
 	// MeshEgressIP is the honest "no mesh here".
 	egressIP   string
 	peerEgress []string
+	// dataPathRefused is set when this server's pod range is not its own to use
+	// (isServerMeshDataPathRefusal): another node holds it, this name holds a
+	// different one, or --mesh-ip names none. runServer then starts no datapath
+	// and no node, while etcd, the apiserver and the controllers keep running.
+	dataPathRefused error
 }
 
-// enrollServerMesh is step 4b: THIS SERVER JOINS ITS OWN MESH.
+// errServerMeshIPNoRange marks a --mesh-ip that names no node pod range.
+var errServerMeshIPNoRange = errors.New("--mesh-ip names no node pod range")
+
+// serverSelfPodCIDR is the pod /24 a server's --mesh-ip names: the range whose
+// mesh-egress .1 the address is (install.MeshNodePodCIDR, the derivation the
+// install's netd seed and the lo0 alias already use). A LOOPBACK mesh IP is the
+// single-host acceptance posture, which has no range of its own and keeps the
+// first-server default.
+func serverSelfPodCIDR(meshIP string) (netip.Prefix, error) {
+	if ip, err := netip.ParseAddr(meshIP); err == nil && ip.IsLoopback() {
+		return netip.ParsePrefix(defaultNodePodCIDR())
+	}
+	cidr, err := install.MeshNodePodCIDR(meshIP)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%w: %w", errServerMeshIPNoRange, err)
+	}
+	return cidr, nil
+}
+
+// isServerMeshDataPathRefusal reports whether a step-4b failure means this
+// server's pod range is not its own: running pods in it would duplicate another
+// node's pod IPs, so the data path must not start. Every other mesh fault keeps
+// its survivable, logged posture.
+func isServerMeshDataPathRefusal(err error) bool {
+	return errors.Is(err, ErrMeshIndexClaimed) || errors.Is(err, bootstrap.ErrMeshClaimRefused) || errors.Is(err, errServerMeshIPNoRange)
+}
+
+// serverMeshRefusalRemedy is the recovery a data-path refusal names. It states both
+// paths, because which one applies depends on whether the cluster has quorum.
+func serverMeshRefusalRemedy(err error) string {
+	switch {
+	case errors.Is(err, errServerMeshIPNoRange):
+		return "reinstall this server with a --mesh-ip that is the first address of a free /24 inside 100.64.0.0/10 (for example 100.64.1.1)"
+	case errors.Is(err, bootstrap.ErrMeshClaimRefused):
+		return "this node name already holds a different pod range or a worker's row; re-addressing a server is manual: with quorum, `kubectl delete meshpeer <this node>` and `kubectl -n kube-system delete lease <its claim>`, then `sudo launchctl kickstart -k system/io.k3sm.server`; if a member is down, run `sudo k3sm server --cluster-reset` on the survivor first"
+	}
+	return "another node holds this server's pod range (named in the error, with its claim). With quorum: if that holder is stale, `kubectl delete meshpeer <holder>` and `kubectl -n kube-system delete lease <claim>`, otherwise reinstall this server with a free --mesh-ip; then `sudo launchctl kickstart -k system/io.k3sm.server`. If a member is down, run `sudo k3sm server --cluster-reset` on the survivor first (the HA guide's reset sequence)"
+}
+
+// serverDataPathParkInterval is how often a server parked on its data path says so
+// again, so the reason stays in the log tail an operator reads.
+const serverDataPathParkInterval = 10 * time.Minute
+
+// parkServerDataPath is runServer's end on a data-path refusal: it says why, and
+// what to do, and then waits for shutdown with the control plane still serving.
+// It is NOT a crash: the crash-loop breaker is never told, because restarting
+// would change nothing and would take this member's vote with it each time.
+func parkServerDataPath(ctx context.Context, opts serverOptions, refusal error, logger *slog.Logger) error {
+	remedy := serverMeshRefusalRemedy(refusal)
+	say := func() {
+		logger.Error("this server's pod range is not its own, so its node, pod network and mesh egress are NOT started; etcd, the apiserver and the controllers keep running",
+			"node", opts.nodeName, "mesh-ip", opts.meshIP, "err", refusal, "remedy", remedy)
+	}
+	say()
+	t := time.NewTicker(serverDataPathParkInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			say()
+		}
+	}
+}
+
+// enrollServerMesh is step 4b: THIS SERVER JOINS ITS OWN MESH, at the pod range
+// its own --mesh-ip names.
 //
 // The enroller is constructed here, not at the supervisor (step 4d), because both
-// callers must share ONE instance: its mutex is what serializes this node's
-// index-0 claim against a worker join, and two instances would contend on
-// nothing. Its construction stays FAIL-CLOSED — a supervisor that cannot enroll
-// is a control plane that rejects every join.
+// callers must share ONE instance: its mutex serializes this process's claims, and
+// two instances would contend on nothing. Its construction stays FAIL-CLOSED — a
+// supervisor that cannot enroll is a control plane that rejects every join. Before
+// the self-enroll it back-fills a range claim for every existing MeshPeer, so a
+// cluster upgraded from before claims is protected from this start.
+//
+// A refusal that means the range is not this server's (isServerMeshDataPathRefusal)
+// is returned in serverMesh.dataPathRefused, not as an error: runServer keeps the
+// control plane up and starts no data path.
 //
 // The self-enroll itself is LOG-AND-CONTINUE, following the precedent
 // provisionClusterPolicies sets and the repo's one rule for a fault on this
@@ -248,8 +335,8 @@ type serverMesh struct {
 //
 // It completes BEFORE step 4c builds the proxy (mesh.Start plumbs the mesh-egress
 // lo0 alias the proxy's source bind depends on) and BEFORE step 4d opens the join
-// listener (EnrollSelf list-back verifies the index-0 claim, so no worker can be
-// assigned index 0 in the window).
+// listener (EnrollSelf holds this range's claim, so no worker can be assigned it
+// in the window).
 //
 // meshDown is the teardown handle runServer has already deferred; the returned
 // serverMesh.down is that handle, re-armed when the bring-up got far enough to
@@ -279,12 +366,27 @@ func enrollServerMesh(ctx context.Context, plan serverPlan, restCfg *rest.Config
 		return sm, fmt.Errorf("build mesh enroller: %w", err)
 	}
 	sm.enroller = e
-	if res, down, err := enrollSelfAndBringUpMesh(ctx, sm.enroller, nodePasswords, opts, plan.mode, kubeconfig, logger); err != nil {
-		msg, attrs := serverMeshBringUpFailure(opts, err)
-		logger.Error(msg, attrs...)
+	selfCIDR, err := serverSelfPodCIDR(opts.meshIP)
+	if err != nil {
+		sm.dataPathRefused = err
+		return sm, nil
+	}
+	sm.podCIDR = selfCIDR.String()
+	if err := e.BackfillClaims(ctx); err != nil {
+		logger.Error("could not claim the pod range of every existing MeshPeer; a worker join can still be handed a range an existing peer holds until the next server start", "err", err)
+	}
+	if res, down, err := enrollSelfAndBringUpMesh(ctx, sm.enroller, nodePasswords, opts, selfCIDR, plan.mode, kubeconfig, logger); err != nil {
 		// A bring-up that failed part-way still owns a utun, so the handle is
 		// armed even here; it is a no-op when nothing came up.
 		sm.down = down
+		if isServerMeshDataPathRefusal(err) {
+			// Not a return and not an exit: the control plane serves on, and
+			// runServer parks only the data path (parkServerDataPath says why).
+			sm.dataPathRefused = err
+		} else {
+			msg, attrs := serverMeshBringUpFailure(opts, err)
+			logger.Error(msg, attrs...)
+		}
 	} else {
 		// Arms the teardown runServer deferred, which runs SYNCHRONOUSLY on the way
 		// out and after the control plane has stopped. The mesh watcher's own
@@ -309,7 +411,14 @@ func enrollServerMesh(ctx context.Context, plan serverPlan, restCfg *rest.Config
 // node certs + enrolls peers), plus the CA-bundle endpoint in the HA posture. Only
 // when multi-node is enabled (sm.enroller non-nil); the live two-Mac join is the
 // K3SM_LAB gate (step 4a has already ensured the MeshPeer CRD the enroller's write
-// lands in, and step 4b has already claimed index 0 through this same enroller).
+// lands in, and step 4b has already claimed this server's range through this same
+// enroller).
+//
+// A join is answered with this server's apiserver first and then every other
+// server whose Node is Ready (serverAPIEndpoints), read per join. In the etcd
+// posture the member route reserves a joining server's mesh range before its
+// member add (the enroller is the bootstrap.ServerMeshReserver), and the
+// abandoned-claim janitor runs beside it.
 //
 // The returned stop closes the local etcd admin client the HA member routes use;
 // it is noStop when no such client was built.
@@ -333,8 +442,12 @@ func startJoinSupervisor(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		// The store step 4b already bound this node's own name in.
 		nodePasswords: sm.nodePasswords,
 		enroller:      sm.enroller,
-		apiServers:    []string{fmt.Sprintf("%s:%d", opts.meshIP, opts.apiPort)},
+		apiServers:    []string{net.JoinHostPort(opts.meshIP, strconv.Itoa(opts.apiPort))},
+		apiServersFunc: func(ctx context.Context) []string {
+			return sm.enroller.serverAPIEndpoints(ctx, opts.nodeName, opts.meshIP, opts.apiPort, nodeReadyFunc(cs))
+		},
 	}
+	var members func(context.Context) ([]bootstrap.EtcdMember, error)
 	// Serve the AES-256-GCM CA bundle authorized by the
 	// SERVER-class token ONLY (never a worker), sealing the live hierarchy; publish
 	// the sealed envelope to the shared datastore (the k3s bootstrap-key model).
@@ -356,9 +469,13 @@ func startJoinSupervisor(ctx context.Context, plan serverPlan, cs kubernetes.Int
 			logger.Error("etcd member routes disabled: cannot reach the local etcd member", "err", err)
 		} else {
 			stop = func() { _ = admin.Close() }
-			deps.members = localMemberJoiner{admin: admin}
+			joiner := localMemberJoiner{admin: admin}
+			deps.members = joiner
+			deps.serverMesh = sm.enroller
+			members = joiner.MemberList
 		}
 	}
+	go runMeshClaimJanitor(ctx, sm.enroller, opts.workDir, opts.nodeName, members, logger)
 	go func() {
 		if err := startBootstrapServer(ctx, deps, logger); err != nil && ctx.Err() == nil {
 			logger.Error("worker-join supervisor", "err", err)
@@ -507,6 +624,28 @@ func startServerLBHosting(ctx context.Context, plan serverPlan, cs kubernetes.In
 			logger.Error("svclb loadbalancer controller", "err", err)
 		}
 	}()
+}
+
+// prepareServerNode is steps 4g/4h and the first half of 5: ingress hosting +
+// svclb (startServerLBHosting), then the admin client clearing a stale role label
+// the node cannot (repairServerNodeLabels), right before runServer hands the node
+// options to startNode (the Virtual Kubelet node, reusing runNode's bring-up).
+func prepareServerNode(ctx context.Context, plan serverPlan, cs kubernetes.Interface, nodeOpts nodeOptions, logger *slog.Logger) error {
+	opts := plan.opts
+	startServerLBHosting(ctx, plan, cs, nodeOpts, logger)
+	if err := repairServerNodeLabels(ctx, cs, opts.nodeName, logger); err != nil {
+		return err
+	}
+	logger.Info(fmt.Sprintf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName))
+	return nil
+}
+
+// nodeReadyFunc reports, per call, whether a node's Node object is Ready.
+func nodeReadyFunc(cs kubernetes.Interface) func(ctx context.Context, node string) bool {
+	return func(ctx context.Context, node string) bool {
+		n, err := cs.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
+		return err == nil && nodeIsReady(n)
+	}
 }
 
 // repairServerNodeLabels clears, through the ADMIN client, the one piece of Node

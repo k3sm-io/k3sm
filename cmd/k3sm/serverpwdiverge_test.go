@@ -51,7 +51,7 @@ func TestSelfNodePasswordMismatchNamesTheRemedy(t *testing.T) {
 		workDir := t.TempDir()
 		opts := selfEnrollOptions(workDir, nodeName)
 
-		_, _, err := enrollSelfAndBringUpMesh(ctx, e, passwords, opts, mode, "", quietLogger())
+		_, _, err := enrollSelfAndBringUpMesh(ctx, e, passwords, opts, firstServerCIDR, mode, "", quietLogger())
 		if !errors.Is(err, bootstrap.ErrNodePasswordMismatch) {
 			t.Fatalf("self-enroll error = %v, want ErrNodePasswordMismatch", err)
 		}
@@ -99,7 +99,7 @@ func TestSelfNodePasswordMismatchNamesTheRemedy(t *testing.T) {
 		e, _ := enrollerOverStub(t)
 		opts := selfEnrollOptions(t.TempDir(), nodeName)
 
-		_, _, err := enrollSelfAndBringUpMesh(ctx, e, nil, opts, mode, "", quietLogger())
+		_, _, err := enrollSelfAndBringUpMesh(ctx, e, nil, opts, firstServerCIDR, mode, "", quietLogger())
 		if err == nil || errors.Is(err, bootstrap.ErrNodePasswordMismatch) {
 			t.Fatalf("self-enroll error = %v, want a non-mismatch failure", err)
 		}

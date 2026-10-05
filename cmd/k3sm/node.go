@@ -173,8 +173,9 @@ type nodeOptions struct {
 
 	// podCIDR is this node's pod /24 the runtimed podnet adapter allocates /32s
 	// from — the SAME CIDR the mesh AllowedIPs carry: an enrolled worker's
-	// assigned res.PodCIDR, the reserved index-0 /24 on the control-plane/
-	// single node (defaultNodePodCIDR). Never a second IPAM source.
+	// assigned res.PodCIDR, this server's --mesh-ip /24 on a mesh control-plane
+	// node (serverSelfPodCIDR), the index-0 default on a single node
+	// (defaultNodePodCIDR). Never a second IPAM source.
 	podCIDR string
 	// netMode is the resolved host-network backend the podnet adapter's lo0
 	// alias plumbing and the runtimed preflight follow (helper vs direct vs
@@ -396,8 +397,8 @@ func runNode(args []string) error {
 		return err
 	}
 	opts.netMode = mode
-	// Single/standalone node: the reserved index-0 /24 (the same value the mesh
-	// enroller reserves for the control-plane node).
+	// Single/standalone node: the index-0 /24, the first server's conventional
+	// range (a mesh server's is the /24 its own --mesh-ip names instead).
 	opts.podCIDR = defaultNodePodCIDR()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -436,12 +437,12 @@ func standaloneDNSGuard(opts nodeOptions, log *slog.Logger) error {
 	return nil
 }
 
-// defaultNodePodCIDR is the control-plane/single-node pod /24: node index 0 of
-// the cluster pod CIDR (100.64.0.0/24) — the SAME derivation the mesh enroller
-// uses (enroll.go reserves index 0 for the control-plane node; workers get
-// index 1+) and the same value netserve's routing-table locality defaults to.
-// An enrolled worker overrides it with its assigned res.PodCIDR; there is
-// deliberately no second IPAM source.
+// defaultNodePodCIDR is the single-node pod /24 and the first server's
+// conventional range: node index 0 of the cluster pod CIDR (100.64.0.0/24),
+// which the worker allocator never hands out (workers get index 1+), and the
+// same value netserve's routing-table locality defaults to. A mesh server uses
+// the /24 its own --mesh-ip names (serverSelfPodCIDR) and an enrolled worker its
+// assigned res.PodCIDR; there is deliberately no second IPAM source.
 func defaultNodePodCIDR() string {
 	cidr, err := podnet.NodeCIDR(podnet.ClusterPodCIDR, 0)
 	if err != nil {

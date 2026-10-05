@@ -358,9 +358,10 @@ func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Lo
 	// The MESH rewrite. It runs here, at mesh bring-up, and must stay STRICTLY
 	// BEFORE the pod-CIDR advertise derivation (advertisedNodeIP, applied inside
 	// startNode / lbHostingConfigs): applied the other way round, a mesh server
-	// would advertise the pod /24's 100.64.0.1 while its peers — and every HA
-	// server, which all compute the SAME index-0 podCIDR — know it by its mesh
-	// IP, so two Macs would publish one EXTERNAL-IP.
+	// would advertise its pod /24's mesh-egress .1 while its peers know it by
+	// its mesh IP. (Each server's /24 is now the one its own --mesh-ip names, so
+	// two HA servers no longer share a pod /24; the rewrite still keeps the
+	// advertised address the one the peers route to.)
 	opts.nodeIP = meshNodeIP(*opts)
 	servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP)
 	if err != nil {

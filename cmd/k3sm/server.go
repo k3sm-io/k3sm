@@ -524,21 +524,19 @@ func runServer(args []string) (err error) {
 	defer stopProvisioner()
 	mlxGPU, stopMLX := startMLXOperator(ctx, plan, restCfg, cs, logger)
 	defer stopMLX()
+	if sm.dataPathRefused != nil { // this server's pod range is not its own
+		return parkServerDataPath(ctx, opts, sm.dataPathRefused, logger)
+	}
 	nodeOpts, err := serverNodeOptions(plan, restCfg, nodeAddressing,
 		serverNodeWiring{net: net, mlxGPU: mlxGPU, cpStop: cpStop, registryPuller: registryPuller}, logger)
 	if err != nil {
 		return err
 	}
-	// 4g/4h. Ingress hosting + svclb (startServerLBHosting).
-	startServerLBHosting(ctx, plan, cs, nodeOpts, logger)
-
-	// 5. The Virtual Kubelet node (reuse runNode's bring-up), after the admin
-	// client clears a stale role label the node cannot (repairServerNodeLabels).
-	if err = repairServerNodeLabels(ctx, cs, opts.nodeName, logger); err != nil {
+	// 4g/4h, then 5's label repair (prepareServerNode). The deferred crash check
+	// above names the component on the startNode path too.
+	if err = prepareServerNode(ctx, plan, cs, nodeOpts, logger); err != nil {
 		return err
 	}
-	logger.Info(fmt.Sprintf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName))
-	// The deferred crash check above names the component on this path too.
 	return startNode(ctx, nodeOpts)
 }
 
@@ -556,7 +554,13 @@ func runServer(args []string) (err error) {
 // wiring a real mesh-egress source here does not disturb loopback, ClusterIP or
 // node-LAN dials — an unscoped source bind is what made this wiring unsafe
 // before.
+//
+// A server whose pod range is not its own (sm.dataPathRefused) starts NO datapath
+// and returns zero values: runServerNode parks it before anything reads them.
 func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions) {
+	if sm.dataPathRefused != nil {
+		return nil, nodeOptions{}
+	}
 	opts, mode := plan.opts, plan.mode
 	// The kubernetes-VIP backend: ONLY the loopback-advertise posture (single
 	// node) pins the static proxy backend at the apiserver's real loopback listen
@@ -676,7 +680,7 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		pathShim:    opts.pathShim,
 		dnsVIP:      opts.clusterIP,         // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		domain:      opts.domain,            // SAME cluster domain the per-node resolver serves → in-pod shim search list
-		podCIDR:     nodeAddressing.podCIDR, // the reserved index-0 /24 (same source as the netserve locality)
+		podCIDR:     nodeAddressing.podCIDR, // this server's --mesh-ip /24 (same source as the netserve locality)
 		netMode:     nodeAddressing.netMode, // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:    true,                   // serve kubelet API over TLS so logs/exec work via the proxy
 

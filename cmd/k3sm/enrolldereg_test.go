@@ -24,6 +24,7 @@ import (
 	"sync"
 	"testing"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 )
@@ -48,6 +49,10 @@ func (s *deregisterAPIStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var resource string
 	switch {
+	case strings.HasPrefix(r.URL.Path, leaseAPIPath) && r.Method == http.MethodGet:
+		// The range claims Deregister releases with the peer: none here.
+		writeJSON(w, http.StatusOK, coordinationv1.LeaseList{TypeMeta: metav1.TypeMeta{APIVersion: "coordination.k8s.io/v1", Kind: "LeaseList"}})
+		return
 	case strings.HasPrefix(r.URL.Path, meshPeerAPIPath):
 		resource = "meshpeer"
 	case strings.HasPrefix(r.URL.Path, nodeAPIPath):
