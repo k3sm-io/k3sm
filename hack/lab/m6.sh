@@ -385,14 +385,19 @@ else
 	remote B 'daemon_stop' || true
 	# The reset runs B's own daemon arguments plus --cluster-reset, as the service
 	# user the daemon runs as, so every file it re-mints keeps the daemon's ownership.
+	# The daemon's work dir defaults to $HOME/server, and launchd gives it HOME and
+	# its WorkingDirectory from the plist, so the replay carries both, not only
+	# ProgramArguments, or the reset opens a work dir under the caller's home.
 	if remote B '
-cd /
+home="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HOME" "$PLIST" 2>/dev/null || true)"
+wdir="$(/usr/libexec/PlistBuddy -c "Print :WorkingDirectory" "$PLIST" 2>/dev/null || echo /)"
+cd "$wdir" || exit 1
 i=0; set --
 while v="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:$i" "$PLIST" 2>/dev/null)"; do set -- "$@" "$v"; i=$((i+1)); done
 [ "$#" -ge 2 ] && [ "$2" = server ] || { echo "unexpected ProgramArguments in $PLIST" >&2; exit 1; }
 bin=$1; shift 2
 user="$(/usr/libexec/PlistBuddy -c "Print :UserName" "$PLIST" 2>/dev/null || echo root)"
-sudo -u "$user" "$bin" server --cluster-reset "$@"' >> "$LOG" 2>&1; then
+sudo -u "$user" env HOME="${home:-$HOME}" "$bin" server --cluster-reset "$@"' >> "$LOG" 2>&1; then
 		ladder ok "m6.D  k3sm server --cluster-reset on B exited 0"
 	else
 		ladder no "m6.D  k3sm server --cluster-reset on B exited 0"
