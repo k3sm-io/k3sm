@@ -30,15 +30,19 @@ limitations under the License.
 //     request. It is a file, not a cluster object, because pairing must work
 //     before the apiserver is reachable over the cable.
 //   - The pair verb (Handler): POST /v1-k3sm/pair on the server's per-interface
-//     link-local listeners. After the shared pre-authentication bound and a body
-//     limit it decides, in order and each with its own refusal reason: the
+//     link-local listeners. After the shared pre-authentication bound it decides, in order and each with its own refusal reason: the
 //     connection's LOCAL address is fe80::/10 with a zone that the system's own
 //     hardware-port mapping names a Thunderbolt port (Decide); the remote is fe80
 //     on the same zone; the window is open with joins to spare; and the
-//     interface has not been accepted in the last 10 s and the window's mint cap
-//     is not spent. It then mints an ordinary worker join token, bound to the
-//     requested node name, one-shot, with a 2-minute TTL, so the existing join is
-//     reused unchanged.
+//     interface has not been accepted in the last 10 s; only then is the
+//     (size-limited) body read, and a body that does not decode is refused as
+//     malformed. The window's mint cap and its outstanding-token cap (no more
+//     unconsumed tokens than joins left) must not be spent. It then mints an ordinary worker join token, bound to the
+//     requested node name, one-shot, with a 2-minute TTL, stamped with the window's
+//     generation, so the existing join is reused unchanged; at join time the
+//     server asks the window again (Handler.AdmitJoin) and refuses a token of a
+//     closed, full or earlier window, which is what makes --max-joins a hard
+//     bound on completed joins.
 //   - The joiner (Joiner): on the new Mac, armed for a bounded time by
 //     `sudo k3sm install --auto-join`, it listens for beacons, skips any whose
 //     pin differs from the operator's --cluster pin, asks the first open server

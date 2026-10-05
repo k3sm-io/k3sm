@@ -112,9 +112,16 @@ type ServerConfig struct {
 	// server route its replies to the new node over the cable at once. Nil does
 	// nothing; a join that did not arrive on a cable port is never reported.
 	OnCableJoin func(local net.Addr, podCIDR string, portOrdinal int32)
-	// OnOneShotJoin is told, after the fact, that a join signed with a one-shot
-	// (pairing) token completed; it advances the pairing window's completed-join
-	// count. Nil does nothing.
+	// OneShotAdmit is asked, once a one-shot (pairing) token has verified and
+	// before any work is done for the join, whether the pairing window that
+	// minted it (its generation) still admits a join. A non-nil error refuses the
+	// join with a 403 naming it; the callee logs and records the refusal. Nil
+	// admits every verified token.
+	OneShotAdmit func(window time.Time, nodeName string) error
+	// OnOneShotJoin is told that a join signed with a one-shot (pairing) token is
+	// about to be spent, before the token is consumed, so the window's
+	// completed-join count moves before the token stops counting as outstanding.
+	// Nil does nothing.
 	OnOneShotJoin func(nodeName string)
 }
 
@@ -334,6 +341,14 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		claim = c
+		if c.OneShot() && s.cfg.OneShotAdmit != nil {
+			if aerr := s.cfg.OneShotAdmit(c.Window(), req.NodeName); aerr != nil {
+				c.Release()
+				s.cfg.Logger.Warn("join rejected", "reason", "pairing-window", "node", req.NodeName, "err", aerr, "remote", r.RemoteAddr)
+				http.Error(w, "join refused: "+aerr.Error(), http.StatusForbidden)
+				return
+			}
+		}
 	} else if err := s.cfg.Tokens.VerifyToken(r.Context(), req.Token); err != nil {
 		s.cfg.Logger.Warn("join rejected", "reason", "token", "node", req.NodeName, "err", err)
 		http.Error(w, "invalid join token", http.StatusUnauthorized)
@@ -612,6 +627,9 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	// response is written, so a client that hangs up now cannot reuse it. A
 	// consume that cannot be persisted fails the join (and gives the allocation
 	// back) rather than leaving a spent token able to verify again.
+	if claim.OneShot() && s.cfg.OnOneShotJoin != nil {
+		s.cfg.OnOneShotJoin(req.NodeName)
+	}
 	if err := claim.Consume(); err != nil {
 		consumed = true // the claim is resolved either way; do not release it
 		s.releaseFresh(r, req.NodeName, alloc, "token-consume")
@@ -620,9 +638,6 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	consumed = true
-	if claim.OneShot() && s.cfg.OnOneShotJoin != nil {
-		s.cfg.OnOneShotJoin(req.NodeName)
-	}
 
 	resp := JoinResponse{
 		SchemaVersion:         JoinSchemaVersion,

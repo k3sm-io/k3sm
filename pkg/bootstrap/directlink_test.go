@@ -263,7 +263,7 @@ func TestOneShotTokenJoin(t *testing.T) {
 	clusterCA, _ := certs.NewCA("k3sm-cluster-ca")
 	signingCA, _ := certs.NewCA("k3sm-signing-ca")
 	tokens := bootstrap.NewFileTokenStore(filepath.Join(t.TempDir(), bootstrap.BootstrapTokensFile), nil)
-	user, secret, _, err := tokens.CreateBound(2*time.Minute, "new-mac")
+	user, secret, _, err := tokens.CreateBound(2*time.Minute, "new-mac", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,3 +320,48 @@ func TestOneShotTokenJoin(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// TestJoinRefusesAOneShotTokenTheWindowDoesNotAdmit pins the join-time bound: a
+// verified one-shot token whose window refuses is answered 403, nothing is
+// counted, and the token is released, not spent.
+func TestJoinRefusesAOneShotTokenTheWindowDoesNotAdmit(t *testing.T) {
+	tokens := bootstrap.NewFileTokenStore(filepath.Join(t.TempDir(), bootstrap.BootstrapTokensFile), nil)
+	window := time.Date(2026, 10, 5, 12, 10, 0, 0, time.UTC)
+	user, secret, _, err := tokens.CreateBound(2*time.Minute, "new-mac", window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clusterCA, _ := certs.NewCA("k3sm-cluster-ca")
+	signingCA, _ := certs.NewCA("k3sm-signing-ca")
+	admit := errors.New("the pairing window does not admit this join (window-closed)")
+	var counted int
+	var gotWindow time.Time
+	srv, err := bootstrap.NewServer(bootstrap.ServerConfig{
+		ClusterCA: clusterCA, SigningCA: signingCA, Tokens: tokens,
+		NodePasswords: bootstrap.NewMemoryNodePasswords(),
+		Enroller:      &fakeEnroller{podCIDR: "100.64.1.0/24", meshIP: "100.64.1.1", peers: []netv1.MeshPeerSpec{}},
+		OneShotAdmit:  func(w time.Time, node string) error { gotWindow = w; return admit },
+		OnOneShotJoin: func(string) { counted++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := bootstrap.FormatToken(clusterCA.PinHash(), user, secret)
+	_, err = bootstrap.Join(context.Background(), bootstrap.JoinOptions{
+		Server: "https://[fe80::1%25en2]:9345", Token: token, NodeName: "new-mac", NodePassword: "pw",
+		MeshEndpoint: "192.0.2.50:51820",
+		HTTPClient:   &http.Client{Transport: handlerTransport{h: srv.Handler(), local: &net.TCPAddr{IP: net.ParseIP("fe80::1"), Port: 9345, Zone: "en2"}}},
+	})
+	if err == nil || !contains(err.Error(), "403") {
+		t.Fatalf("a join the window refuses = %v, want a 403", err)
+	}
+	if counted != 0 {
+		t.Errorf("a refused join was counted %d time(s)", counted)
+	}
+	if !gotWindow.Equal(window) {
+		t.Errorf("OneShotAdmit saw window %v, want the token's stamped generation %v", gotWindow, window)
+	}
+	if n, _ := tokens.OutstandingOneShot(window); n != 1 {
+		t.Errorf("outstanding after a refused join = %d, want 1 (released, not spent)", n)
+	}
+}

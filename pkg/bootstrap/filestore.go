@@ -51,6 +51,10 @@ type fileToken struct {
 	OneShot bool `json:"oneShot,omitempty"`
 	// Consumed records that a signed join has used this one-shot token.
 	Consumed bool `json:"consumed,omitempty"`
+	// Window is the generation (the closing time) of the pairing window that
+	// minted a one-shot token. A token of an earlier window never counts against,
+	// nor is admitted by, a later one.
+	Window time.Time `json:"window,omitempty"`
 }
 
 // FileTokenStore is a file-backed TokenStore. Create appends a record and rewrites
@@ -86,22 +90,13 @@ func NewFileTokenStore(path string, now func() time.Time) *FileTokenStore {
 // Path returns the store's file path.
 func (s *FileTokenStore) Path() string { return s.path }
 
-// WithLock runs fn while holding the store's mutex. It is how a file that must be
-// written under the same discipline as the token records (the pairing window,
-// whose completed-join count moves when a one-shot token is consumed) shares the
-// one in-process lock instead of growing a second one.
-func (s *FileTokenStore) WithLock(fn func() error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return fn()
-}
-
 // CreateBound mints a ONE-SHOT token bound to nodeName, valid for ttl. A join
 // presenting it must claim exactly nodeName (ErrTokenNodeMismatch otherwise), and
 // the first signed join consumes it (ErrTokenConsumed afterwards). It is the
-// credential a pairing window hands a cabled Mac. The name is not validated here;
-// the caller passes a canonical node name.
-func (s *FileTokenStore) CreateBound(ttl time.Duration, nodeName string) (user, secret string, expiry time.Time, err error) {
+// credential a pairing window hands a cabled Mac, stamped with the generation of
+// the window that minted it. The name is not validated here; the caller passes a
+// canonical node name.
+func (s *FileTokenStore) CreateBound(ttl time.Duration, nodeName string, window time.Time) (user, secret string, expiry time.Time, err error) {
 	if nodeName == "" {
 		return "", "", time.Time{}, fmt.Errorf("bootstrap: a bound token needs a node name")
 	}
@@ -129,7 +124,7 @@ func (s *FileTokenStore) CreateBound(ttl time.Duration, nodeName string) (user, 
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
-	recs = append(pruneSpentLocked(recs, s.now()), fileToken{User: user, SecretHash: string(hash), Expiry: expiry, NodeName: nodeName, OneShot: true})
+	recs = append(pruneSpentLocked(recs, s.now()), fileToken{User: user, SecretHash: string(hash), Expiry: expiry, NodeName: nodeName, OneShot: true, Window: window.UTC()})
 	if err := s.save(recs); err != nil {
 		return "", "", time.Time{}, err
 	}
@@ -150,6 +145,24 @@ func pruneSpentLocked(recs []fileToken, now time.Time) []fileToken {
 	return out
 }
 
+// OutstandingOneShot counts the one-shot tokens stamped with window that can still
+// verify: not consumed, not expired at the store's clock.
+func (s *FileTokenStore) OutstandingOneShot(window time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recs, err := s.load()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range recs {
+		if r.OneShot && !r.Consumed && s.now().Before(r.Expiry) && r.Window.Equal(window) {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // TokenClaim is a verified join token held by one join request. Release gives a
 // one-shot token back (the join failed); Consume spends it (a signed join). Both
 // are idempotent and the first one called wins; on an ordinary token both are
@@ -159,14 +172,18 @@ type TokenClaim interface {
 	Consume() error
 	// OneShot reports whether the claim is on a one-shot (pairing) token.
 	OneShot() bool
+	// Window is the generation of the pairing window that minted a one-shot
+	// token (zero for any other).
+	Window() time.Time
 }
 
 // noClaim is the claim of an ordinary (reusable) token.
 type noClaim struct{}
 
-func (noClaim) Release()       {}
-func (noClaim) Consume() error { return nil }
-func (noClaim) OneShot() bool  { return false }
+func (noClaim) Release()          {}
+func (noClaim) Consume() error    { return nil }
+func (noClaim) OneShot() bool     { return false }
+func (noClaim) Window() time.Time { return time.Time{} }
 
 // JoinTokenVerifier is the optional TokenVerifier extension the join handler
 // prefers: it verifies the token FOR a node name, and returns a claim the join
@@ -245,7 +262,7 @@ func (s *FileTokenStore) VerifyJoinToken(ctx context.Context, tok, nodeName stri
 		return nil, ErrTokenInUse
 	}
 	s.reserved[t.User] = true
-	return &fileClaim{store: s, user: t.User}, nil
+	return &fileClaim{store: s, user: t.User, window: rec.Window}, nil
 }
 
 // fileClaim is the claim on a reserved one-shot token.
@@ -253,13 +270,17 @@ func (s *FileTokenStore) VerifyJoinToken(ctx context.Context, tok, nodeName stri
 // Locking: done is guarded by the store's mu, the same lock the reservation map
 // uses, so a Release racing a Consume resolves to exactly one of them.
 type fileClaim struct {
-	store *FileTokenStore
-	user  string
-	done  bool
+	store  *FileTokenStore
+	user   string
+	window time.Time
+	done   bool
 }
 
 // OneShot reports true: only one-shot tokens are reserved.
 func (c *fileClaim) OneShot() bool { return true }
+
+// Window is the generation of the window that minted the token.
+func (c *fileClaim) Window() time.Time { return c.window }
 
 // Release gives the reservation back, so the joiner's retry can use the token.
 func (c *fileClaim) Release() {

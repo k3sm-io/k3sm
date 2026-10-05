@@ -66,6 +66,9 @@ const (
 	ReasonRateLimited Reason = "rate-limited"
 	// ReasonMintCap: the window minted all the tokens it may.
 	ReasonMintCap Reason = "mint-cap"
+	// ReasonMalformed: the request body is not a decodable pair request, or is
+	// over the body limit.
+	ReasonMalformed Reason = "malformed"
 	// ReasonBadName: the requested node name is not a canonical node name.
 	ReasonBadName Reason = "invalid-node-name"
 )
@@ -75,7 +78,7 @@ func (r Reason) status() int {
 	switch r {
 	case ReasonRateLimited:
 		return http.StatusTooManyRequests
-	case ReasonBadName:
+	case ReasonBadName, ReasonMalformed:
 		return http.StatusBadRequest
 	default:
 		return http.StatusForbidden
@@ -114,7 +117,9 @@ func Decide(local, remote netip.Addr, ports map[string]int) Decision {
 
 // Minter mints a one-shot, name-bound join token (bootstrap.FileTokenStore).
 type Minter interface {
-	CreateBound(ttl time.Duration, nodeName string) (user, secret string, expiry time.Time, err error)
+	CreateBound(ttl time.Duration, nodeName string, window time.Time) (user, secret string, expiry time.Time, err error)
+	// OutstandingOneShot counts the unconsumed, unexpired tokens of a window.
+	OutstandingOneShot(window time.Time) (int, error)
 }
 
 // Recorder records a pairing outcome as a Node Event. Refusals are rate-limited
@@ -126,7 +131,9 @@ type Recorder interface {
 // Handler serves the pairing verb. Every field but Logger, Now and Events is
 // required.
 //
-// Locking: mu guards lastAccept and lastEvent only.
+// Locking: mu guards lastAccept and lastEvent only. mintMu serializes the
+// outstanding-token count, the reserve and the mint, so two requests cannot both
+// count the same free slot.
 type Handler struct {
 	// Gate is the join listener's shared pre-authentication bound
 	// (bootstrap.Server.PreAuthAllow); it runs before the body is read.
@@ -150,6 +157,7 @@ type Handler struct {
 	// Events records Node Events; nil records none.
 	Events Recorder
 
+	mintMu     sync.Mutex
 	mu         sync.Mutex
 	lastAccept map[string]time.Time
 	lastEvent  map[Reason]time.Time
@@ -182,12 +190,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.Gate != nil && !h.Gate(w, r) {
 		return
 	}
-	var req netv1alpha1.PairRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, pairBodyLimit)).Decode(&req); err != nil {
-		http.Error(w, "decode pair request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
 	local, remote := connAddrs(r)
 	ports, err := h.HardwarePorts(r.Context())
 	if err != nil {
@@ -218,6 +220,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.refuse(w, ReasonRateLimited, local, remote, d.Iface)
 		return
 	}
+	// Everything the connection already tells is decided above, so a request
+	// from the wrong port or into a closed window is refused before its body is
+	// read at all.
+	var req netv1alpha1.PairRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, pairBodyLimit)).Decode(&req); err != nil {
+		h.refuse(w, ReasonMalformed, local, remote, d.Iface)
+		return
+	}
 	name, err := bootstrap.CanonicalNodeName(req.NodeName)
 	if err != nil || name != req.NodeName || bootstrap.ValidateNodeName(name) != nil {
 		h.refuse(w, ReasonBadName, local, remote, d.Iface)
@@ -225,7 +235,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// The mint cap and the window are re-checked in one locked step, so the last
 	// mint cannot be taken twice.
-	_, open, capped, err := h.Windows.ReserveMint(now)
+	h.mintMu.Lock()
+	defer h.mintMu.Unlock()
+	reserved, open, capped, err := h.Windows.ReserveMint(now, h.Tokens.OutstandingOneShot)
 	switch {
 	case err != nil:
 		h.log().Error("pairing: the window could not be updated; refusing", "err", err)
@@ -238,7 +250,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.refuse(w, ReasonMintCap, local, remote, d.Iface)
 		return
 	}
-	user, secret, _, err := h.Tokens.CreateBound(TokenTTL, name)
+	user, secret, _, err := h.Tokens.CreateBound(TokenTTL, name, reserved.Until)
 	if err != nil {
 		h.log().Error("pairing: minting the join token failed", "iface", d.Iface, "err", err)
 		http.Error(w, "pairing failed", http.StatusInternalServerError)
@@ -262,6 +274,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.Events != nil {
 		h.Events.Record("Normal", "DirectLinkPaired", fmt.Sprintf("minted a one-shot join token for %q over the cable on %s", name, d.Iface))
 	}
+}
+
+// AdmitJoin is the join-time half of the window's bound
+// (bootstrap.ServerConfig.OneShotAdmit): a one-shot token minted by the window
+// generation window may complete a join only while that very window is open and
+// has joins left. A token of an earlier window, a closed or expired window and a
+// full one each refuse with their own reason, logged and recorded like a refused
+// pair request.
+func (h *Handler) AdmitJoin(window time.Time, node string) error {
+	now := h.now()
+	win, ok, err := h.Windows.Load()
+	reason := Reason("")
+	switch {
+	case err != nil:
+		h.log().Error("pairing: the window could not be read; refusing the join", "err", err)
+		reason = ReasonWindowClosed
+	case !ok || !now.Before(win.Until) || !win.Until.Equal(window):
+		reason = ReasonWindowClosed
+	case win.Completed >= win.MaxJoins:
+		reason = ReasonWindowFull
+	}
+	if reason == "" {
+		return nil
+	}
+	h.log().Warn("pairing: refused a join with a pairing token", "reason", string(reason), "node", node)
+	if h.Events != nil && h.eventDue(reason) {
+		h.Events.Record("Warning", "DirectLinkJoinRefused", fmt.Sprintf("refused a join of %q with a pairing token (%s)", node, reason))
+	}
+	return fmt.Errorf("the pairing window does not admit this join (%s)", reason)
 }
 
 // refuse answers a refused request and records it: a Warn line every time, a

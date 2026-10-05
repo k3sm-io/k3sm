@@ -1084,7 +1084,7 @@ func wirePairing(ctx context.Context, cfg *bootstrap.ServerConfig, deps bootstra
 		return nil, nil
 	}
 	hw := linkenum.HardwarePorts
-	win := pairing.WindowStore{Path: pairing.WindowPath(deps.workDir), Lock: deps.fileTokens.WithLock}
+	win := pairing.WindowStore{Path: pairing.WindowPath(deps.workDir)}
 	pin := deps.hierarchy.Cluster.PinHash()
 	cfg.LinkIPFor = func(a net.Addr) string { return serverLinkIPFor(ctx, hw, podCIDR, zoneOf(a)) }
 	cfg.OnCableJoin = func(local net.Addr, podCIDR string, portOrdinal int32) {
@@ -1102,7 +1102,12 @@ func wirePairing(ctx context.Context, cfg *bootstrap.ServerConfig, deps bootstra
 	}
 	cfg.OnOneShotJoin = func(node string) {
 		if err := win.RecordCompleted(); err != nil {
-			log.Warn("pairing: the completed join was not counted against the window", "node", node, "err", err)
+			// Fail closed: a window whose count cannot be written must not keep
+			// admitting joins it cannot account for.
+			log.Warn("pairing: the completed join could not be counted, so the window is closed", "node", node, "err", err)
+			if cerr := win.FailClosed(); cerr != nil {
+				log.Error("pairing: the window could not be closed either; close it with `sudo k3sm pair --close`", "err", cerr)
+			}
 		}
 	}
 	pair := &pairing.Handler{
@@ -1116,6 +1121,7 @@ func wirePairing(ctx context.Context, cfg *bootstrap.ServerConfig, deps bootstra
 		Events:        deps.pairEvents,
 	}
 	cfg.Pair = pair
+	cfg.OneShotAdmit = pair.AdmitJoin
 	beacon := func() netv1alpha1.Beacon {
 		w, ok, err := win.Load()
 		open := err == nil && ok && w.IsOpen(time.Now())

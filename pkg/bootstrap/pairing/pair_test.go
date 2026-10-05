@@ -60,7 +60,7 @@ func newFixture(t *testing.T) *fixture {
 	dir := t.TempDir()
 	clock := &fakeClock{t: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
 	tokens := bootstrap.NewFileTokenStore(bootstrap.TokensPath(dir), clock.Now)
-	win := WindowStore{Path: WindowPath(dir), Lock: tokens.WithLock}
+	win := WindowStore{Path: WindowPath(dir)}
 	h := &Handler{
 		HardwarePorts: func(context.Context) (map[string]int, error) { return tbPorts, nil },
 		Windows:       win,
@@ -228,7 +228,7 @@ func TestPairTrustDecision(t *testing.T) {
 			if w := f.pair(t, tbLocal, tbRemote, "new-mac"); w.Code != http.StatusOK {
 				t.Fatalf("mint %d: status %d (%s)", i, w.Code, w.Body.String())
 			}
-			f.clock.Advance(AcceptInterval)
+			f.clock.Advance(TokenTTL) // the minted token expires, so it is no longer outstanding
 		}
 		w := f.pair(t, tbLocal, tbRemote, "new-mac")
 		if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), string(ReasonMintCap)) {
@@ -313,5 +313,161 @@ func TestDecideTakesTheZoneFromTheLocalAddressOnly(t *testing.T) {
 func TestWindowPathIsUnderTheWorkDir(t *testing.T) {
 	if got := WindowPath("/w"); got != filepath.Join("/w", WindowFile) {
 		t.Fatalf("WindowPath = %q", got)
+	}
+}
+
+// rawPair posts an arbitrary body to the handler from the given connection.
+func (f *fixture) rawPair(local, remote, body string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, bootstrap.PairPath, strings.NewReader(body))
+	la := netip.MustParseAddr(local)
+	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey,
+		&net.TCPAddr{IP: net.IP(la.AsSlice()), Port: 9345, Zone: la.Zone()}))
+	r.RemoteAddr = net.JoinHostPort(remote, "51234")
+	w := httptest.NewRecorder()
+	f.h.ServeHTTP(w, r)
+	return w
+}
+
+// TestPairOutstandingTokensAreCappedByTheJoinsLeft pins that a window never has
+// more unconsumed tokens out than joins left, so --max-joins bounds the joins and
+// not just a mint count.
+func TestPairOutstandingTokensAreCappedByTheJoinsLeft(t *testing.T) {
+	const tbLocal, tbRemote = "fe80::1%en2", "fe80::2%en2"
+	f := newFixture(t)
+	f.open(t, 1)
+	if w := f.pair(t, tbLocal, tbRemote, "mac-a"); w.Code != http.StatusOK {
+		t.Fatalf("first mint: status %d (%s)", w.Code, w.Body.String())
+	}
+	f.clock.Advance(AcceptInterval)
+	w := f.pair(t, tbLocal, tbRemote, "mac-b")
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), string(ReasonMintCap)) {
+		t.Fatalf("second mint with one token outstanding and maxJoins 1: status %d body %q, want 403 mint-cap", w.Code, w.Body.String())
+	}
+	// With room for two joins, two tokens may be out and a third is refused.
+	f2 := newFixture(t)
+	f2.open(t, 2)
+	for i := 0; i < 2; i++ {
+		if w := f2.pair(t, tbLocal, tbRemote, "mac"); w.Code != http.StatusOK {
+			t.Fatalf("mint %d of maxJoins 2: status %d (%s)", i, w.Code, w.Body.String())
+		}
+		f2.clock.Advance(AcceptInterval)
+	}
+	if w := f2.pair(t, tbLocal, tbRemote, "mac"); w.Code != http.StatusForbidden {
+		t.Fatalf("third mint with two outstanding and maxJoins 2: status %d, want 403", w.Code)
+	}
+}
+
+// TestAdmitJoinRefusesTokensOfAClosedOrEarlierWindow pins the join-time half of
+// the bound: a token outstanding when the window closes is refused, and a token
+// of an earlier window neither joins the new window nor counts against its quota.
+func TestAdmitJoinRefusesTokensOfAClosedOrEarlierWindow(t *testing.T) {
+	const tbLocal, tbRemote = "fe80::1%en2", "fe80::2%en2"
+	f := newFixture(t)
+	f.open(t, 1)
+	first, _, _ := f.win.Load()
+	if w := f.pair(t, tbLocal, tbRemote, "mac-a"); w.Code != http.StatusOK {
+		t.Fatalf("mint: status %d (%s)", w.Code, w.Body.String())
+	}
+	if err := f.h.AdmitJoin(first.Until, "mac-a"); err != nil {
+		t.Fatalf("a token of the open window must be admitted: %v", err)
+	}
+
+	t.Run("outstanding when the window closes", func(t *testing.T) {
+		if err := f.win.Close(); err != nil {
+			t.Fatal(err)
+		}
+		err := f.h.AdmitJoin(first.Until, "mac-a")
+		if err == nil || !strings.Contains(err.Error(), string(ReasonWindowClosed)) {
+			t.Fatalf("AdmitJoin after close = %v, want window-closed", err)
+		}
+	})
+
+	t.Run("a token of an earlier window", func(t *testing.T) {
+		f.clock.Advance(time.Minute)
+		f.open(t, 1)
+		second, _, _ := f.win.Load()
+		if second.Until.Equal(first.Until) {
+			t.Fatal("the new window must have its own generation")
+		}
+		if err := f.h.AdmitJoin(first.Until, "mac-a"); err == nil {
+			t.Fatal("a token of the earlier window must be refused by the new window")
+		}
+		// The earlier window's token is still unexpired, yet takes none of the new
+		// window's single join slot.
+		f.clock.Advance(AcceptInterval)
+		if w := f.pair(t, tbLocal, tbRemote, "mac-b"); w.Code != http.StatusOK {
+			t.Fatalf("a mint in the new window: status %d (%s), want 200 (the old token does not count)", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("a full window", func(t *testing.T) {
+		if err := f.win.RecordCompleted(); err != nil {
+			t.Fatal(err)
+		}
+		cur, _, _ := f.win.Load()
+		err := f.h.AdmitJoin(cur.Until, "mac-b")
+		if err == nil || !strings.Contains(err.Error(), string(ReasonWindowFull)) {
+			t.Fatalf("AdmitJoin on a full window = %v, want window-full", err)
+		}
+	})
+}
+
+// TestWindowCloseDuringReserveStaysClosed pins the cross-process lock: a close
+// issued while a mint holds the window serializes after it, so the close is the
+// last write and cannot be undone by the mint.
+func TestWindowCloseDuringReserveStaysClosed(t *testing.T) {
+	dir := t.TempDir()
+	s := WindowStore{Path: WindowPath(dir)}
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	if _, err := s.Open(now, 10*time.Minute, 1); err != nil {
+		t.Fatal(err)
+	}
+	inReserve := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := s.ReserveMint(now, func(time.Time) (int, error) {
+			close(inReserve)
+			<-release
+			return 0, nil
+		})
+		done <- err
+	}()
+	<-inReserve
+	closed := make(chan error, 1)
+	go func() { closed <- WindowStore{Path: s.Path}.Close() }() // a second process's store
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) while a reserve held the window lock", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.Load(); err != nil || ok {
+		t.Fatalf("Load after the close = ok %v err %v, want no window", ok, err)
+	}
+}
+
+// TestPairRefusalsPrecedeTheBodyAndCoverMalformed pins that the connection and
+// window checks run before the body is read, and that an undecodable body is a
+// logged, named refusal.
+func TestPairRefusalsPrecedeTheBodyAndCoverMalformed(t *testing.T) {
+	const tbLocal, tbRemote = "fe80::1%en2", "fe80::2%en2"
+	f := newFixture(t)
+	f.open(t, 1)
+	if w := f.rawPair("fe80::1%en0", "fe80::2%en0", "{not json"); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), string(ReasonNotThunderbolt)) {
+		t.Fatalf("garbage from a non-Thunderbolt port: status %d body %q, want 403 not-thunderbolt", w.Code, w.Body.String())
+	}
+	if w := f.rawPair(tbLocal, tbRemote, "{not json"); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), string(ReasonMalformed)) {
+		t.Fatalf("garbage body: status %d body %q, want 400 malformed", w.Code, w.Body.String())
+	}
+	big := `{"nodeName":"` + strings.Repeat("a", pairBodyLimit) + `"}`
+	if w := f.rawPair(tbLocal, tbRemote, big); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), string(ReasonMalformed)) {
+		t.Fatalf("oversized body: status %d body %q, want 400 malformed", w.Code, w.Body.String())
 	}
 }
