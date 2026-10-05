@@ -49,8 +49,10 @@
 #                sudo k3sm install --server-join --server <A LAN ip> \
 #                  --token-file /var/root/k3sm-server-token \
 #                  --node-ip <B LAN ip> --mesh-ip <B mesh ip>
-#     (the etcd peers talk on the LAN node IPs; the mesh carries pod traffic only. The
-#     install stages the token at <work-dir>/join-token for B's daemon, which reads it
+#     (the etcd peers talk on the LAN addresses; the mesh carries pod traffic only.
+#     `k3sm install --node-ip` on a server is the etcd peer address and is rendered
+#     onto the daemon as `k3sm server --etcd-peer-ip`; each server's node advertises
+#     and lo0-aliases its --mesh-ip, never the LAN address. The install stages the token at <work-dir>/join-token for B's daemon, which reads it
 #     at every start; the root-only file is yours to delete afterwards)
 #   - this host: kubectl, curl and go (the e2e criteria run from this checkout); each server's HA admin kubeconfig (the CA-bearing
 #     <work-dir>/admin.kubeconfig, NOT the loopback token kubeconfig) as $KUBECONFIG

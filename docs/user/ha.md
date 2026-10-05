@@ -40,7 +40,12 @@ sudo k3sm install --server-join \
 
 `--node-ip` is each Mac's own **LAN** address. The etcd members talk to each other on it, so it must
 be an address the other server can reach, and it cannot be loopback. The mesh carries Pod traffic
-only. `--server` names the first server by that same LAN address; the joining server fetches the
+only. The install hands this address to the server daemon as `--etcd-peer-ip`, which is the etcd
+peer address and nothing else. The node itself is known in the cluster by its `--mesh-ip`, the same
+as on a single control-plane Mac, so the LAN address is never added to the loopback interface. If you
+run `k3sm server` by hand, pass the LAN address as `--etcd-peer-ip` and leave `--node-ip` unset;
+`k3sm server` refuses `--cluster-init` or `--server-join` without `--etcd-peer-ip`, and refuses a
+`--node-ip` equal to it. `--server` names the first server by that same LAN address; the joining server fetches the
 cluster certificate authorities from it and is added to the etcd cluster through it.
 
 The install checks that the server it names answers and is the cluster the token belongs to before
