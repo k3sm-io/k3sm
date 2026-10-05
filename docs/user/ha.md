@@ -3,9 +3,9 @@
 Running the k3sm control plane so a single Mac is not a single point of failure.
 
 > **Status: EXPERIMENTAL.** `k3sm install --cluster-init` forms an embedded etcd control plane on
-> the first server, and `k3sm install --server-join` adds a second one. A two-server cluster has not
-> yet been run end to end on two Macs, so treat this page as preview quality and keep datastore
-> backups. External-datastore (Postgres) HA and the `--datastore-endpoint` and
+> the first server, and `k3sm install --server-join` adds a second one. Treat it as preview quality
+> and keep datastore backups. A controller manager or scheduler that loses its leader lease when
+> quorum is lost is counted as a crash, so repeated quorum loss can park a server. External-datastore (Postgres) HA and the `--datastore-endpoint` and
 > `--datastore-endpoint-file` flags were removed in v0.1.6. See [Limitations](limitations.md).
 
 ## HA Model
