@@ -34,6 +34,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
@@ -118,10 +120,7 @@ func TestVMPodIPReachableAcrossNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get worker node %s: %v", worker, err)
 	}
-	nodeCIDR, err := netip.ParsePrefix(node.Spec.PodCIDR)
-	if err != nil {
-		t.Fatalf("worker %s has no usable spec.podCIDR %q: %v", worker, node.Spec.PodCIDR, err)
-	}
+	nodeCIDR := workerPodCIDR(t, c, node)
 
 	a := createVMBannerPod(t, c, ns, "alpha", worker, vmPodIPHiddenPort)
 	b := createVMBannerPod(t, c, ns, "beta", worker, vmPodIPServicePort)
@@ -238,6 +237,39 @@ func createVMBannerPod(t *testing.T, c *Cluster, ns, name, worker string, extra 
 		t.Fatalf("vm pod %s/%s scheduled on %s, want the worker %s", ns, name, got.Spec.NodeName, worker)
 	}
 	return name
+}
+
+// workerPodCIDR returns the worker's pod /24. k3sm never sets Node.spec.podCIDR:
+// the node's range is the podCIDR of its MeshPeer (net.k3sm.io, cluster-scoped,
+// named after the node). When the worker has no MeshPeer, the range is the /24
+// of its InternalIP, which is that range's .1.
+func workerPodCIDR(t *testing.T, c *Cluster, node *corev1.Node) netip.Prefix {
+	t.Helper()
+	gvr := schema.GroupVersionResource{Group: "net.k3sm.io", Version: "v1", Resource: "meshpeers"}
+	mp, err := dynamicClient(t, c).Resource(gvr).Get(context.Background(), node.Name, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		raw, _, ferr := unstructured.NestedString(mp.Object, "spec", "podCIDR")
+		cidr, perr := netip.ParsePrefix(raw)
+		if ferr != nil || perr != nil {
+			t.Fatalf("MeshPeer %s has no usable spec.podCIDR %q (%v, %v)", node.Name, raw, ferr, perr)
+		}
+		return cidr.Masked()
+	case !apierrors.IsNotFound(err):
+		t.Fatalf("get MeshPeer %s: %v", node.Name, err)
+	}
+	for _, a := range node.Status.Addresses {
+		if a.Type != corev1.NodeInternalIP {
+			continue
+		}
+		ip, perr := netip.ParseAddr(a.Address)
+		if perr == nil && ip.Is4() {
+			t.Logf("worker %s has no MeshPeer; using its InternalIP's /24", node.Name)
+			return netip.PrefixFrom(ip, 24).Masked()
+		}
+	}
+	t.Fatalf("worker %s has neither a MeshPeer nor an IPv4 InternalIP to derive its pod range from", node.Name)
+	return netip.Prefix{}
 }
 
 // createTargetingService creates a ClusterIP Service selecting pod by its app
