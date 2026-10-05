@@ -66,7 +66,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		if err := Install(ctx, f, first); err != nil {
 			t.Fatalf("Install --cluster-init: %v", err)
 		}
-		want := []string{"--mesh-ip", "100.64.0.1", "--cluster-init", "--node-ip", "192.0.2.10"}
+		want := []string{"--mesh-ip", "100.64.0.1", "--cluster-init", "--etcd-peer-ip", "192.0.2.10"}
 		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
 			t.Errorf("server plist carries %q, want %q", got, want)
 		}
@@ -93,6 +93,25 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		}
 	})
 
+	t.Run("an HA request strips a carried --node-ip and renders the peer address as --etcd-peer-ip", func(t *testing.T) {
+		// Before the peer address had a flag of its own, an HA server's LAN
+		// address was carried as --node-ip. Left on the argv it is the node's
+		// advertised address, aliased on lo0 at every start; the request must
+		// drop it, not carry it beside the --etcd-peer-ip it renders.
+		f := &fakeSystem{}
+		cfg := testConfig(t)
+		configureServerArgs(f, cfg, "--mesh-ip", "100.64.0.1", "--cluster-init", "--node-ip", "192.0.2.10")
+		req := cfg
+		req.ClusterInit, req.NodeIP = true, "192.0.2.10"
+		if err := Install(ctx, f, req); err != nil {
+			t.Fatalf("Install --cluster-init over a pre-split record: %v", err)
+		}
+		want := []string{"--mesh-ip", "100.64.0.1", "--cluster-init", "--etcd-peer-ip", "192.0.2.10"}
+		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("server plist carries %q, want %q", got, want)
+		}
+	})
+
 	t.Run("--server-join stages the server token and points the daemon at it", func(t *testing.T) {
 		f := &fakeSystem{}
 		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
@@ -102,7 +121,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		if err := Install(ctx, f, join); err != nil {
 			t.Fatalf("Install --server-join: %v", err)
 		}
-		want := []string{"--server-join", "--server", "192.0.2.10", "--node-ip", "192.0.2.20"}
+		want := []string{"--server-join", "--server", "192.0.2.10", "--etcd-peer-ip", "192.0.2.20"}
 		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
 			t.Errorf("server plist carries %q, want %q", got, want)
 		}
@@ -206,7 +225,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		if err := Install(ctx, f, join); err != nil {
 			t.Fatalf("Install --server-join with no member data: %v", err)
 		}
-		want := []string{"--mesh-ip", "100.64.0.1", "--server-join", "--server", "192.0.2.11", "--node-ip", "192.0.2.10"}
+		want := []string{"--mesh-ip", "100.64.0.1", "--server-join", "--server", "192.0.2.11", "--etcd-peer-ip", "192.0.2.10"}
 		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
 			t.Errorf("server plist carries %q, want %q", got, want)
 		}

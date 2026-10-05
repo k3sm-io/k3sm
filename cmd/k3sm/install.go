@@ -155,8 +155,8 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.agent, "agent", false, "install this Mac as a WORKER that joins an existing cluster (the io.k3sm.agent daemon) instead of as the control plane; needs --server")
 	fs.BoolVar(&o.clusterInit, "cluster-init", false, "form a new embedded etcd HA control plane on this server; needs --node-ip")
 	fs.BoolVar(&o.serverJoin, "server-join", false, "join this server to an existing embedded etcd HA control plane; needs --server, --token-file and --node-ip")
-	fs.StringVar(&o.server, "server", "", "with --agent: the control-plane host to join; with --server-join: an existing server's LAN address (its --node-ip). Either way an UNDERLAY address (a LAN IP or DNS name, no scheme, no port), because the join dials <host>:9345 before this node has any mesh")
-	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: optional; the join assigns this Mac's mesh address, pass it only to assert the expected value (a value that differs from the assignment fails the join instead of minting a certificate for an address this node does not hold). With --cluster-init or --server-join: required; this Mac's LAN address, which the etcd peer listener binds and every other server dials (not loopback)")
+	fs.StringVar(&o.server, "server", "", "with --agent: the control-plane host to join; with --server-join: an existing server's LAN address (the --node-ip it was installed with). Either way an UNDERLAY address (a LAN IP or DNS name, no scheme, no port), because the join dials <host>:9345 before this node has any mesh")
+	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: optional; the join assigns this Mac's mesh address, pass it only to assert the expected value (a value that differs from the assignment fails the join instead of minting a certificate for an address this node does not hold). With --cluster-init or --server-join: required; this Mac's LAN address, which the etcd peer listener binds and every other server dials (not loopback). The server daemon receives it as --etcd-peer-ip; the node itself advertises its --mesh-ip")
 	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token (a joined node needs none). With --server-join: required; a file holding the server token `k3sm token create --server` printed on an existing server. Read once by this install and copied for the daemon; it must not be group- or world-readable, and it is yours to delete afterwards")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")
@@ -250,7 +250,8 @@ func (o installFlags) role() install.Role {
 //
 // A server install takes the embedded-etcd HA flags: --cluster-init alone, or
 // --server-join with --server and --token-file, and either with a non-loopback
-// --node-ip, which is the predicate `k3sm server` itself applies.
+// --node-ip, rendered as the daemon's --etcd-peer-ip; the predicate is the one
+// `k3sm server` itself applies to that flag.
 func (o installFlags) validateRole() error {
 	if !o.agent {
 		return o.validateServerRole()

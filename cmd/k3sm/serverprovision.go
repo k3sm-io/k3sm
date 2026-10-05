@@ -361,9 +361,7 @@ func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Lo
 	// would advertise the pod /24's 100.64.0.1 while its peers — and every HA
 	// server, which all compute the SAME index-0 podCIDR — know it by its mesh
 	// IP, so two Macs would publish one EXTERNAL-IP.
-	if isLoopbackDefault(opts.nodeIP) {
-		opts.nodeIP = opts.meshIP
-	}
+	opts.nodeIP = meshNodeIP(*opts)
 	servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP)
 	if err != nil {
 		return nil, "", err
@@ -391,6 +389,20 @@ func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Lo
 	// bootstrapListenAddr).
 	logger.Info("multi-node mode: apiserver bound to the mesh interface; the worker-join supervisor listens on every interface", "mesh-ip", opts.meshIP)
 	return h, serverSecret, nil
+}
+
+// meshNodeIP is the node address a mesh server advertises: its --mesh-ip when
+// --node-ip was left at the loopback default, else the explicit --node-ip. It is
+// the same on every mesh server, HA or not, because the etcd peer address is a
+// flag of its own (--etcd-peer-ip) and never reaches the node's addressing: an
+// HA server's LAN address is on an interface already, and handing it to the node
+// would have the pod network alias it on lo0 at startup (netd refuses, the
+// daemon exits, launchd restarts it, and every restart reaps the node's pods).
+func meshNodeIP(opts serverOptions) string {
+	if isLoopbackDefault(opts.nodeIP) {
+		return opts.meshIP
+	}
+	return opts.nodeIP
 }
 
 // componentExitHandler is the executor's OnComponentExit for `k3sm server`.

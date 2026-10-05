@@ -1121,7 +1121,8 @@ type Config struct {
 	// when set it is rendered onto the daemon's argv and the join refuses a value
 	// that differs from the assignment. On RoleServer it is the LAN address the
 	// embedded etcd member's peer listener binds, required with ClusterInit or
-	// ServerJoin and used only with them.
+	// ServerJoin and used only with them; it is rendered as the daemon's
+	// --etcd-peer-ip, never its --node-ip (see setEtcdArgs).
 	NodeIP string
 	// ClusterInit asks this server to form a new embedded etcd HA control
 	// plane (`k3sm server --cluster-init`). RoleServer only; needs NodeIP.
@@ -1481,8 +1482,8 @@ func (c Config) datavolStaging() string { return filepath.Join(c.InstallDir, dat
 // persisted record can never disagree about which address won.
 //
 // An HA request (ClusterInit or ServerJoin) is merged the same way, after the
-// mesh address: it REPLACES every carried role flag, --server and --node-ip
-// (setEtcdArgs). With neither set the carried arguments come back as they were,
+// mesh address: it REPLACES every carried role flag, --server, --etcd-peer-ip
+// and --node-ip (setEtcdArgs). With neither set the carried arguments come back as they were,
 // so a single-node install renders exactly what it rendered before HA flags
 // existed.
 func (c Config) resolvedExtraServerArgs() []string {
@@ -2581,7 +2582,7 @@ func deregisterNode(ctx context.Context, cfg Config, m []artifact) {
 // member could not be removed: with the member still registered, a two-server
 // cluster has lost its quorum the moment this daemon stops.
 const serverDeregisterRemedy = "on the surviving server run: sudo launchctl bootout system/" + ServerLabel +
-	" && sudo k3sm server --cluster-reset --work-dir <its work dir> --node-ip <its node IP>, then start it again; or, while the cluster still has quorum, remove the member from a surviving server"
+	" && sudo k3sm server --cluster-reset --work-dir <its work dir> --etcd-peer-ip <its LAN address>, then start it again; or, while the cluster still has quorum, remove the member from a surviving server"
 
 // deregisterServer removes this server's etcd member before the teardown stops it,
 // on a server whose installed plist selects the embedded-etcd posture and on no

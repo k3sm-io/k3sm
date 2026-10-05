@@ -136,7 +136,7 @@ func TestServerTokenFile(t *testing.T) {
 		opts := serverOptions{
 			serverJoin: true,
 			joinServer: "192.0.2.10",
-			nodeIP:     "192.0.2.20",
+			etcdPeerIP: "192.0.2.20",
 			nodeName:   "server-b",
 			workDir:    t.TempDir(),
 			tokenFile:  write(t, joinToken+"\n", 0o600),
@@ -166,7 +166,7 @@ func TestServerTokenFile(t *testing.T) {
 		}{
 			{"from the token file", serverOptions{tokenFile: write(t, serverToken+"\n", 0o600)}},
 			{"from --token", serverOptions{token: serverToken}},
-			{"from the token file on a --cluster-init server", serverOptions{clusterInit: true, nodeIP: "192.0.2.10", tokenFile: write(t, serverToken+"\n", 0o600)}},
+			{"from the token file on a --cluster-init server", serverOptions{clusterInit: true, etcdPeerIP: "192.0.2.10", tokenFile: write(t, serverToken+"\n", 0o600)}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				opts := tc.opts

@@ -53,27 +53,27 @@ func TestInstallRecordsEmbeddedEtcdServerFlags(t *testing.T) {
 			tokenFile: adminToken,
 		},
 		{
-			name:      "--cluster-init forms a cluster on the LAN node IP",
+			name:      "--cluster-init forms a cluster on the LAN peer address",
 			args:      []string{"--cluster-init", "--node-ip", "192.0.2.10"},
-			wantArgs:  []string{"--cluster-init", "--node-ip", "192.0.2.10"},
+			wantArgs:  []string{"--cluster-init", "--etcd-peer-ip", "192.0.2.10"},
 			tokenFile: adminToken,
 		},
 		{
 			name:      "--cluster-init beside the mesh address",
 			args:      []string{"--cluster-init", "--node-ip", "192.0.2.10", "--mesh-ip", "100.64.0.1"},
-			wantArgs:  []string{"--mesh-ip", "100.64.0.1", "--cluster-init", "--node-ip", "192.0.2.10"},
+			wantArgs:  []string{"--mesh-ip", "100.64.0.1", "--cluster-init", "--etcd-peer-ip", "192.0.2.10"},
 			tokenFile: adminToken,
 		},
 		{
 			name:      "--server-join through an existing server, its token staged off the argv",
 			args:      []string{"--server-join", "--server", "192.0.2.10", "--token-file", operatorToken, "--node-ip", "192.0.2.20", "--mesh-ip", "100.64.0.2"},
-			wantArgs:  []string{"--mesh-ip", "100.64.0.2", "--server-join", "--server", "192.0.2.10", "--node-ip", "192.0.2.20"},
+			wantArgs:  []string{"--mesh-ip", "100.64.0.2", "--server-join", "--server", "192.0.2.10", "--etcd-peer-ip", "192.0.2.20"},
 			tokenFile: joinToken,
 		},
 		{
 			name:      "--server-join takes a DNS name for the existing server",
 			args:      []string{"--server-join", "--server", "server-a.lan", "--token-file", operatorToken, "--node-ip", "192.0.2.20"},
-			wantArgs:  []string{"--server-join", "--server", "server-a.lan", "--node-ip", "192.0.2.20"},
+			wantArgs:  []string{"--server-join", "--server", "server-a.lan", "--etcd-peer-ip", "192.0.2.20"},
 			tokenFile: joinToken,
 		},
 	}

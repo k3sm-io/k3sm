@@ -62,9 +62,19 @@ type serverOptions struct {
 	// clearCrashLoop clears the crash-loop record and exits instead of serving.
 	clearCrashLoop bool
 	nodeName       string
-	nodeIP         string
-	meshIP         string // wireguard mesh IP; set => multi-node worker-join supervisor
-	podRoot        string
+	// nodeIP is the node's advertised InternalIP and nothing else. A non-loopback
+	// value is aliased on lo0 by the pod network, so it must be an address this
+	// node answers for inside its pod range (on a mesh server, leave it at the
+	// default and the mesh path advertises --mesh-ip). It is never the etcd peer
+	// address: that is etcdPeerIP, a LAN address that is already on an interface
+	// and must never be aliased on lo0.
+	nodeIP string
+	meshIP string // wireguard mesh IP; set => multi-node worker-join supervisor
+	// etcdPeerIP is the embedded-etcd member's peer address (--etcd-peer-ip): this
+	// server's LAN address, which the peer listener binds and every other server
+	// dials. Required in the etcd posture and by --cluster-reset; unused otherwise.
+	etcdPeerIP string
+	podRoot    string
 	// logs is the container-log flag group, passed through to the in-process node.
 	logs     containerLogOptions
 	rtName   string
@@ -156,10 +166,13 @@ func (opts serverOptions) etcdPosture() bool {
 }
 
 // etcdConfig renders the executor's etcd block for these flags: nil in the kine
-// posture. The member name is the canonical node name, and the peer address is the
-// --node-ip as given (the LAN address; never the mesh IP the mesh path later
-// substitutes for a loopback default). A --cluster-reset with neither role flag is
-// treated as an init member: a reset makes a one-member cluster either way.
+// posture. The member name is the canonical node name, and the peer address is
+// --etcd-peer-ip (the LAN address). It is deliberately NOT --node-ip: that flag is
+// the node's advertised address, which the pod network aliases on lo0, and a LAN
+// address aliased there is refused by netd's policy (it is outside the node's pod
+// range) and would shadow the interface that actually carries it. A
+// --cluster-reset with neither role flag is treated as an init member: a reset
+// makes a one-member cluster either way.
 func (opts serverOptions) etcdConfig() *executor.EtcdConfig {
 	role := executor.EtcdRole(0)
 	switch {
@@ -173,26 +186,39 @@ func (opts serverOptions) etcdConfig() *executor.EtcdConfig {
 	return &executor.EtcdConfig{
 		Role:        role,
 		Name:        opts.nodeName,
-		PeerIP:      opts.nodeIP,
+		PeerIP:      opts.etcdPeerIP,
 		PeerPort:    opts.etcdPeerPort,
 		MetricsPort: opts.etcdMetricsPort,
 	}
 }
 
 // validateEtcdFlags refuses the HA flag combinations that cannot describe a server,
-// before any state is touched: --cluster-init with --server-join, and either one (or
-// --cluster-reset) without a non-loopback --node-ip, which the member advertises to
-// its peers as its own address.
+// before any state is touched: --cluster-init with --server-join; either one (or
+// --cluster-reset) without a non-loopback --etcd-peer-ip, which the member advertises
+// to its peers as its own address; --etcd-peer-ip outside that posture, where nothing
+// reads it; and a --node-ip equal to the peer address, which is the pre-split grammar
+// (the LAN address on --node-ip) and would have the pod network alias the LAN address
+// on lo0 at every start.
 func (opts serverOptions) validateEtcdFlags() error {
 	if opts.clusterInit && opts.serverJoin {
 		return errors.New("--cluster-init and --server-join are mutually exclusive: --cluster-init forms a new etcd cluster on this server, --server-join adds it to an existing one")
 	}
 	if !opts.etcdPosture() && !opts.clusterReset {
+		if opts.etcdPeerIP != "" {
+			return errors.New("--etcd-peer-ip needs --cluster-init, --server-join or --cluster-reset: it is the embedded etcd member's peer address, and a single-server control plane runs no etcd member")
+		}
 		return nil
 	}
-	ip := net.ParseIP(opts.nodeIP)
+	ip := net.ParseIP(opts.etcdPeerIP)
 	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
-		return fmt.Errorf("%w (got --node-ip %q; the etcd peer listener binds this address and every other server dials it)", executor.ErrEtcdNeedsNodeIP, opts.nodeIP)
+		hint := ""
+		if n := net.ParseIP(opts.nodeIP); n != nil && !n.IsLoopback() && !n.IsUnspecified() {
+			hint = fmt.Sprintf("; --node-ip %s no longer carries the etcd peer address, pass this server's LAN address as --etcd-peer-ip instead", opts.nodeIP)
+		}
+		return fmt.Errorf("%w (got --etcd-peer-ip %q; the etcd peer listener binds this address and every other server dials it%s)", executor.ErrEtcdNeedsNodeIP, opts.etcdPeerIP, hint)
+	}
+	if n := net.ParseIP(opts.nodeIP); n != nil && n.Equal(ip) {
+		return fmt.Errorf("--node-ip %s is the etcd peer address: --node-ip is the node's advertised address, which the pod network aliases on lo0, and a LAN address must never be aliased there. Drop --node-ip (a mesh server advertises its --mesh-ip) and keep the LAN address on --etcd-peer-ip only", opts.nodeIP)
 	}
 	return nil
 }
@@ -240,7 +266,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.StringVar(&opts.workDir, "work-dir", defaultWorkDir, "control-plane state root (binaries, kine DB, certs, kubeconfig); posture-aware default")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.BoolVar(&opts.clearCrashLoop, "clear-crashloop", false, "clear the crash-loop record under --work-dir and exit 0 instead of serving; a parked daemon then exits and launchd starts a clean boot")
-	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise")
+	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise; a non-loopback value is aliased on lo0 by the pod network, so it must lie in this node's pod range (leave it at the default on a mesh server: the node then advertises --mesh-ip). Never the etcd peer address: that is --etcd-peer-ip")
 	fs.StringVar(&opts.meshIP, "mesh-ip", "", "wireguard mesh IP to bind the apiserver + worker-join supervisor on (enables multi-node join; empty = single-node)")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
 	registerContainerLogFlags(fs, &opts.logs)
@@ -297,17 +323,22 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// Embedded etcd HA (the k3s shape). --cluster-init forms a new etcd cluster on
 	// this server; --server-join (with --server and a server-class --token) adds this
 	// server to an existing one as a learner that is then promoted. Either needs a
-	// non-loopback --node-ip: the member's peer listener binds it. There is no
-	// external-datastore flag; a retired one fails as an unknown flag.
-	fs.BoolVar(&opts.clusterInit, "cluster-init", false, "form a new embedded etcd HA control plane on this server (requires a non-loopback --node-ip); a restart of an existing member is unaffected")
-	fs.BoolVar(&opts.serverJoin, "server-join", false, "join an existing embedded etcd HA control plane (requires a non-loopback --node-ip); with --server it also fetches the identical-CA bundle from an existing server")
+	// non-loopback --etcd-peer-ip: the member's peer listener binds it. It is a flag
+	// of its own because the peer address is a LAN address already on an interface,
+	// while --node-ip is the node's advertised address that the pod network aliases
+	// on lo0; one flag carrying both crash-looped every HA server at its pod-network
+	// startup reconcile. There is no external-datastore flag; a retired one fails as
+	// an unknown flag.
+	fs.BoolVar(&opts.clusterInit, "cluster-init", false, "form a new embedded etcd HA control plane on this server (requires a non-loopback --etcd-peer-ip); a restart of an existing member is unaffected")
+	fs.BoolVar(&opts.serverJoin, "server-join", false, "join an existing embedded etcd HA control plane (requires a non-loopback --etcd-peer-ip); with --server it also fetches the identical-CA bundle from an existing server")
+	fs.StringVar(&opts.etcdPeerIP, "etcd-peer-ip", "", "this server's LAN address, which the embedded etcd member's peer listener binds and every other server dials (embedded etcd HA and --cluster-reset only; not loopback). It is never aliased on lo0 and is not the node's advertised address (--node-ip)")
 	fs.BoolVar(&opts.clusterReset, "cluster-reset", false, "turn this server's existing etcd member into a one-member cluster that keeps its data, then exit; refused while the server is running. Restart the server normally afterwards")
-	fs.IntVar(&opts.etcdPeerPort, "etcd-peer-port", executor.DefaultEtcdPeerPort, "etcd peer listener port on --node-ip (embedded etcd HA only) — every member on a host needs its own")
+	fs.IntVar(&opts.etcdPeerPort, "etcd-peer-port", executor.DefaultEtcdPeerPort, "etcd peer listener port on --etcd-peer-ip (embedded etcd HA only) — every member on a host needs its own")
 	fs.IntVar(&opts.etcdMetricsPort, "etcd-metrics-port", executor.DefaultEtcdMetricsPort, "etcd metrics listener port on 127.0.0.1 (embedded etcd HA only) — every member on a host needs its own")
 	// HA server-join: a SECOND control-plane server reconstructs the identical
 	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
-	fs.StringVar(&opts.joinServer, "server", "", "an existing server's LAN address (its --node-ip): the joining server fetches the identical-CA bootstrap bundle from it and, on its first start, is added to the etcd cluster through it (HA server-join; requires --server-join and --token or --token-file)")
+	fs.StringVar(&opts.joinServer, "server", "", "an existing server's LAN address (its --etcd-peer-ip): the joining server fetches the identical-CA bootstrap bundle from it and, on its first start, is added to the etcd cluster through it (HA server-join; requires --server-join and --token or --token-file)")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "server-class join token (K10<caHash>::server:<secret>) for the HA server-join (or $K3SM_TOKEN)")
 	// The static admin token as a FILE, and the only way the installed daemon is
 	// given one. A LaunchDaemon plist is read by launchd as root but the token on

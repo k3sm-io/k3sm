@@ -1386,7 +1386,51 @@ func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return provider.NewPodNetAdapter(nw, opts.nodeIP, slog.Default()), nil
+	return newNodePodNetAdapter(nw, opts)
+}
+
+// newNodePodNetAdapter wraps ipam in the provider adapter whose startup reconcile
+// aliases opts.nodeIP on lo0, after refusing a node address the pod network must
+// not alias (checkNodeAliasAddr). It is the seam between the node's addressing
+// and the one alias request it makes, split from buildPodNetAdapter so a test can
+// drive it over a recording IPAM instead of a real lo0.
+func newNodePodNetAdapter(ipam provider.PodIPAM, opts nodeOptions) (*provider.PodNetAdapter, error) {
+	if err := checkNodeAliasAddr(opts.nodeIP, opts.podCIDR); err != nil {
+		return nil, err
+	}
+	return provider.NewPodNetAdapter(ipam, opts.nodeIP, slog.Default()), nil
+}
+
+// errNodeAliasOutsidePodNetwork names a node address the pod network would be
+// asked to alias on lo0 although it lies outside both this node's pod CIDR and
+// the cluster Service CIDR.
+var errNodeAliasOutsidePodNetwork = errors.New("node address cannot be aliased on lo0")
+
+// checkNodeAliasAddr refuses, before anything on the node starts, a node address
+// the podnet adapter's startup reconcile would alias on lo0 but must not: one
+// outside this node's pod CIDR and outside the cluster Service CIDR. That is
+// exactly netd's alias policy, and the reason to check it here is the failure
+// shape when it is not: the reconcile asks netd, netd refuses, the daemon exits,
+// launchd restarts it, and every restart reaps the node's pods before failing the
+// same way. A LAN address is the usual culprit (an HA server's etcd peer address
+// passed as --node-ip); it is already on an interface, and aliasing it on lo0
+// would shadow the route that actually carries it.
+//
+// A loopback or unparseable address is the reconcile's own skip, and passes.
+func checkNodeAliasAddr(nodeIP, podCIDR string) error {
+	ip, err := netip.ParseAddr(nodeIP)
+	if err != nil || ip.IsLoopback() {
+		return nil
+	}
+	ip = ip.Unmap()
+	if p, err := netip.ParsePrefix(podCIDR); err == nil && p.Contains(ip) {
+		return nil
+	}
+	if p, err := netip.ParsePrefix(install.DefaultServiceCIDR); err == nil && p.Contains(ip) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s is outside this node's pod CIDR %s and the Service CIDR %s, so netd refuses it and the node would fail its pod-network startup reconcile at every start. --node-ip is the node's advertised address; on a mesh server leave it unset (the node advertises --mesh-ip), and give an embedded-etcd server's LAN address as --etcd-peer-ip",
+		errNodeAliasOutsidePodNetwork, ip, podCIDR, install.DefaultServiceCIDR)
 }
 
 // runtimedConfig builds the runtimed runtime configuration from the node options:

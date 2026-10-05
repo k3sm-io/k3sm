@@ -31,8 +31,12 @@ import (
 // The embedded-etcd HA request of `k3sm install`.
 //
 // `k3sm server` forms an HA control plane with --cluster-init and joins one with
-// --server-join --server <host>, each with a non-loopback --node-ip the etcd peer
-// listener binds. Before the installer could say so itself, those flags reached
+// --server-join --server <host>, each with a non-loopback --etcd-peer-ip the etcd
+// peer listener binds. The installer's own flag for that address is --node-ip
+// (on a control-plane install it means nothing else), and setEtcdArgs renders it
+// as --etcd-peer-ip: the daemon's --node-ip is the node's advertised address,
+// which the pod network aliases on lo0, and a LAN address rendered there made
+// every HA server exit at its pod-network startup reconcile. Before the installer could say so itself, those flags reached
 // a daemon only through a carried argument set, which a first install does not
 // have: an operator could form a cluster only by hand-writing the server-arguments
 // record. Config.ClusterInit and Config.ServerJoin are the installer's own
@@ -42,10 +46,15 @@ import (
 // already is.
 
 const (
-	// serverJoinServerFlag and nodeIPFlag are the two valued `k3sm server` flags
-	// an HA request renders beside its role flag.
+	// serverJoinServerFlag and etcdPeerIPFlag are the two valued `k3sm server`
+	// flags an HA request renders beside its role flag.
 	serverJoinServerFlag = "server"
-	nodeIPFlag           = "node-ip"
+	etcdPeerIPFlag       = "etcd-peer-ip"
+	// nodeIPFlag is the daemon's advertised-address flag. An HA request never
+	// renders it, and strips a carried one: before the peer address had a flag of
+	// its own, an HA server's LAN address was carried as --node-ip, and left on the
+	// argv it would still be aliased on lo0.
+	nodeIPFlag = "node-ip"
 	// serverJoinTokenName is the leaf name of the staged server-class join token
 	// in the server work dir. It is a different file from the static admin token
 	// (serverTokenName) because it is a different credential: the admin token is
@@ -60,12 +69,13 @@ const (
 var ErrEtcdRoleSwitch = errors.New("install: this server already holds an embedded etcd member in the other role")
 
 // etcdRoleFlags are the flags an HA request replaces in the carried arguments:
-// both role flags (a request for one drops the other) and the two values that
-// describe the member.
+// both role flags (a request for one drops the other), the two values that
+// describe the member, and a carried --node-ip (see nodeIPFlag).
 var etcdRoleFlags = map[string]bool{
 	clusterInitFlag:      true,
 	serverJoinFlag:       true,
 	serverJoinServerFlag: true,
+	etcdPeerIPFlag:       true,
 	nodeIPFlag:           true,
 }
 
@@ -80,10 +90,10 @@ func (c Config) serverJoining() bool { return c.Role == RoleServer && c.ServerJo
 
 // setEtcdArgs returns args with every carried HA flag removed (either spelling,
 // inline or separate value) and this install's request appended:
-// --cluster-init, or --server-join --server <host>, then --node-ip <ip>.
-// The two role flags are booleans, which Go's flag package never gives a
-// separate value, so only --server and --node-ip consume the argument after
-// them.
+// --cluster-init, or --server-join --server <host>, then --etcd-peer-ip <ip>
+// (the install's --node-ip). The two role flags are booleans, which Go's flag
+// package never gives a separate value, so only --server, --etcd-peer-ip and
+// --node-ip consume the argument after them.
 func setEtcdArgs(args []string, c Config) []string {
 	out := make([]string, 0, len(args)+5)
 	for i := 0; i < len(args); i++ {
@@ -92,7 +102,7 @@ func setEtcdArgs(args []string, c Config) []string {
 			out = append(out, args[i])
 			continue
 		}
-		if !inline && (name == serverJoinServerFlag || name == nodeIPFlag) {
+		if !inline && (name == serverJoinServerFlag || name == etcdPeerIPFlag || name == nodeIPFlag) {
 			i++ // drop the separate value too
 		}
 	}
@@ -101,7 +111,7 @@ func setEtcdArgs(args []string, c Config) []string {
 	} else {
 		out = append(out, "--"+clusterInitFlag)
 	}
-	return append(out, "--"+nodeIPFlag, c.NodeIP)
+	return append(out, "--"+etcdPeerIPFlag, c.NodeIP)
 }
 
 // boolFlagSet reports whether args set the named boolean flag, in any spelling
@@ -211,8 +221,8 @@ func ValidateHARequest(cfg Config) error {
 
 // ValidateEtcdNodeIP refuses a --node-ip an embedded etcd member cannot
 // advertise: one that does not parse, loopback, or unspecified. It is the
-// predicate `k3sm server` applies to the same flag, so the installer refuses
-// at the terminal what the daemon would refuse at every start.
+// predicate `k3sm server` applies to the --etcd-peer-ip it is rendered as, so the
+// installer refuses at the terminal what the daemon would refuse at every start.
 func ValidateEtcdNodeIP(raw string) error {
 	ip := net.ParseIP(raw)
 	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
