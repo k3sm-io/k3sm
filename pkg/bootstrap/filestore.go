@@ -44,6 +44,13 @@ type fileToken struct {
 	User       string    `json:"user"`
 	SecretHash string    `json:"secretHash"`
 	Expiry     time.Time `json:"expiry"`
+	// NodeName binds the token to one node name: a join presenting it must claim
+	// exactly this name. Empty is an ordinary, unbound token.
+	NodeName string `json:"nodeName,omitempty"`
+	// OneShot marks a token a single signed join consumes (a pairing token).
+	OneShot bool `json:"oneShot,omitempty"`
+	// Consumed records that a signed join has used this one-shot token.
+	Consumed bool `json:"consumed,omitempty"`
 }
 
 // FileTokenStore is a file-backed TokenStore. Create appends a record and rewrites
@@ -59,6 +66,11 @@ type FileTokenStore struct {
 	path string
 	now  func() time.Time
 	mu   sync.Mutex
+	// reserved holds the ids of one-shot tokens a join is using right now
+	// (VerifyJoinToken). It is in memory on purpose: a reservation lives as long
+	// as one join request, and only the supervisor process verifies joins. Guarded
+	// by mu.
+	reserved map[string]bool
 }
 
 // NewFileTokenStore returns a file-backed token store at path. now defaults to
@@ -68,7 +80,219 @@ func NewFileTokenStore(path string, now func() time.Time) *FileTokenStore {
 		now = time.Now
 	}
 	dummyTokenHash()
-	return &FileTokenStore{path: path, now: now}
+	return &FileTokenStore{path: path, now: now, reserved: map[string]bool{}}
+}
+
+// Path returns the store's file path.
+func (s *FileTokenStore) Path() string { return s.path }
+
+// WithLock runs fn while holding the store's mutex. It is how a file that must be
+// written under the same discipline as the token records (the pairing window,
+// whose completed-join count moves when a one-shot token is consumed) shares the
+// one in-process lock instead of growing a second one.
+func (s *FileTokenStore) WithLock(fn func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fn()
+}
+
+// CreateBound mints a ONE-SHOT token bound to nodeName, valid for ttl. A join
+// presenting it must claim exactly nodeName (ErrTokenNodeMismatch otherwise), and
+// the first signed join consumes it (ErrTokenConsumed afterwards). It is the
+// credential a pairing window hands a cabled Mac. The name is not validated here;
+// the caller passes a canonical node name.
+func (s *FileTokenStore) CreateBound(ttl time.Duration, nodeName string) (user, secret string, expiry time.Time, err error) {
+	if nodeName == "" {
+		return "", "", time.Time{}, fmt.Errorf("bootstrap: a bound token needs a node name")
+	}
+	if ttl <= 0 {
+		return "", "", time.Time{}, fmt.Errorf("bootstrap: token ttl must be positive, got %s", ttl)
+	}
+	u, err := randHex(6)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	sec, err := randHex(32)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(sec), bcrypt.DefaultCost)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("hash token secret: %w", err)
+	}
+	user = "pair-" + u
+	expiry = s.now().Add(ttl)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recs, err := s.load()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	recs = append(pruneSpentLocked(recs, s.now()), fileToken{User: user, SecretHash: string(hash), Expiry: expiry, NodeName: nodeName, OneShot: true})
+	if err := s.save(recs); err != nil {
+		return "", "", time.Time{}, err
+	}
+	return user, sec, expiry, nil
+}
+
+// pruneSpentLocked drops one-shot records that can never verify again (consumed,
+// or expired), so a store that pairs many Macs does not grow without bound.
+// Ordinary tokens are kept exactly as before.
+func pruneSpentLocked(recs []fileToken, now time.Time) []fileToken {
+	out := recs[:0:0]
+	for _, r := range recs {
+		if r.OneShot && (r.Consumed || !now.Before(r.Expiry)) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// TokenClaim is a verified join token held by one join request. Release gives a
+// one-shot token back (the join failed); Consume spends it (a signed join). Both
+// are idempotent and the first one called wins; on an ordinary token both are
+// no-ops.
+type TokenClaim interface {
+	Release()
+	Consume() error
+	// OneShot reports whether the claim is on a one-shot (pairing) token.
+	OneShot() bool
+}
+
+// noClaim is the claim of an ordinary (reusable) token.
+type noClaim struct{}
+
+func (noClaim) Release()       {}
+func (noClaim) Consume() error { return nil }
+func (noClaim) OneShot() bool  { return false }
+
+// JoinTokenVerifier is the optional TokenVerifier extension the join handler
+// prefers: it verifies the token FOR a node name, and returns a claim the join
+// releases on failure and consumes on success. It is what makes a pairing token
+// name-bound and one-shot without a second credential kind.
+type JoinTokenVerifier interface {
+	VerifyJoinToken(ctx context.Context, tok, nodeName string) (TokenClaim, error)
+}
+
+// VerifyJoinToken is VerifyToken plus the binding and the one-shot reserve:
+//
+//   - a token bound to a node name verifies only for that name
+//     (ErrTokenNodeMismatch);
+//   - a consumed one-shot token never verifies again (ErrTokenConsumed);
+//   - a one-shot token another join holds right now is refused with
+//     ErrTokenInUse, and the reservation is taken atomically under the store
+//     mutex, so two concurrent joins cannot both pass verification.
+//
+// The returned claim's Release drops the reservation; Consume persists the token
+// as consumed. The bcrypt compare runs exactly once on every outcome, as
+// VerifyToken's does.
+func (s *FileTokenStore) VerifyJoinToken(ctx context.Context, tok, nodeName string) (TokenClaim, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	t, err := ParseToken(tok)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	recs, err := s.load()
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	var rec *fileToken
+	for i := range recs {
+		if recs[i].User == t.User {
+			rec = &recs[i]
+			break
+		}
+	}
+	hash := dummyTokenHash()
+	if rec != nil {
+		hash = []byte(rec.SecretHash)
+	}
+	cmpErr := compareHash(hash, []byte(t.Secret))
+	switch {
+	case rec == nil:
+		return nil, ErrTokenUnknown
+	case !s.now().Before(rec.Expiry):
+		return nil, ErrTokenExpired
+	case cmpErr != nil:
+		return nil, ErrTokenMismatch
+	}
+	if rec.NodeName != "" && rec.NodeName != nodeName {
+		return nil, ErrTokenNodeMismatch
+	}
+	if !rec.OneShot {
+		return noClaim{}, nil
+	}
+	// The reserve re-reads the record under the mutex: the load above is a
+	// snapshot, and a Consume that landed since must win.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range cur {
+		if r.User == t.User && r.Consumed {
+			return nil, ErrTokenConsumed
+		}
+	}
+	if s.reserved[t.User] {
+		return nil, ErrTokenInUse
+	}
+	s.reserved[t.User] = true
+	return &fileClaim{store: s, user: t.User}, nil
+}
+
+// fileClaim is the claim on a reserved one-shot token.
+//
+// Locking: done is guarded by the store's mu, the same lock the reservation map
+// uses, so a Release racing a Consume resolves to exactly one of them.
+type fileClaim struct {
+	store *FileTokenStore
+	user  string
+	done  bool
+}
+
+// OneShot reports true: only one-shot tokens are reserved.
+func (c *fileClaim) OneShot() bool { return true }
+
+// Release gives the reservation back, so the joiner's retry can use the token.
+func (c *fileClaim) Release() {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	if c.done {
+		return
+	}
+	c.done = true
+	delete(c.store.reserved, c.user)
+}
+
+// Consume marks the token consumed on disk and drops the reservation. A token
+// that vanished from the store meanwhile is still consumed in memory: it cannot
+// verify again either way.
+func (c *fileClaim) Consume() error {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	if c.done {
+		return nil
+	}
+	c.done = true
+	delete(c.store.reserved, c.user)
+	recs, err := c.store.load()
+	if err != nil {
+		return err
+	}
+	for i := range recs {
+		if recs[i].User == c.user {
+			recs[i].Consumed = true
+		}
+	}
+	return c.store.save(recs)
 }
 
 // Create mints a TTL-bounded bootstrap token, appends its (hashed) record, and
@@ -148,6 +372,12 @@ func (s *FileTokenStore) VerifyToken(ctx context.Context, tok string) error {
 	}
 	if cmpErr != nil {
 		return ErrTokenMismatch
+	}
+	if rec.NodeName != "" || rec.OneShot {
+		// A bound or one-shot token is honoured only through VerifyJoinToken,
+		// which can check the name and take the reservation; a caller that cannot
+		// must not treat it as an ordinary token.
+		return ErrTokenNodeMismatch
 	}
 	return nil
 }

@@ -267,8 +267,10 @@ func (itNoEnroll) Enroll(context.Context, string, netv1.MeshEnrollRequest) (netv
 func (itNoEnroll) ReleaseAllocation(context.Context, string, bootstrap.Allocation) error {
 	return errITNoEnroll
 }
-func (itNoEnroll) RefreshEndpoint(context.Context, string, string) error { return errITNoEnroll }
-func (itNoEnroll) Deregister(context.Context, string) error              { return errITNoEnroll }
+func (itNoEnroll) RefreshEndpoint(context.Context, string, string, []netv1.EndpointCandidate) error {
+	return errITNoEnroll
+}
+func (itNoEnroll) Deregister(context.Context, string) error { return errITNoEnroll }
 
 // itRoute is an existing member's bootstrap server, serving the member routes.
 type itRoute struct {

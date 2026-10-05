@@ -62,6 +62,15 @@ var (
 	ErrTokenExpired = errors.New("bootstrap: bootstrap token expired")
 	// ErrTokenMismatch is returned by Verify when the secret does not match.
 	ErrTokenMismatch = errors.New("bootstrap: bootstrap token secret mismatch")
+	// ErrTokenNodeMismatch is returned when a token bound to one node name is
+	// presented for another (or through a verifier that cannot check the name).
+	ErrTokenNodeMismatch = errors.New("bootstrap: this join token is bound to a different node name")
+	// ErrTokenConsumed is returned when a one-shot token a signed join already
+	// used is presented again.
+	ErrTokenConsumed = errors.New("bootstrap: this one-shot join token has already been used")
+	// ErrTokenInUse is returned when a one-shot token is presented while another
+	// join holds it; the caller retries once that join finishes.
+	ErrTokenInUse = errors.New("bootstrap: this one-shot join token is in use by another join")
 )
 
 // Token is a parsed K10 join token.

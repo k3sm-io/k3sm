@@ -30,6 +30,8 @@ import (
 	"strings"
 	"time"
 
+	netv1 "k3sm.io/apis/net/v1"
+
 	"k3sm.io/k3sm/pkg/certs"
 )
 
@@ -187,7 +189,16 @@ func (s *Server) handleMeshEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.cfg.Enroller.RefreshEndpoint(r.Context(), req.NodeName, req.Endpoint); err != nil {
+	for i, c := range req.Endpoints {
+		if err := ValidateMeshEndpoint(c.Address); err != nil {
+			s.cfg.Logger.Warn("mesh endpoint refresh rejected", "reason", "candidate-syntax",
+				"node", req.NodeName, "candidate", i, "err", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	if err := s.cfg.Enroller.RefreshEndpoint(r.Context(), req.NodeName, req.Endpoint, req.Endpoints); err != nil {
 		if errors.Is(err, ErrNoMeshPeer) {
 			s.cfg.Logger.Warn("mesh endpoint refresh rejected", "reason", "no-such-peer", "node", req.NodeName)
 			http.Error(w, "no MeshPeer for this node; rejoin the cluster", http.StatusNotFound)
@@ -275,15 +286,16 @@ func NodeIdentityClient(clusterCAPEM, clientCertPEM, clientKeyPEM []byte) (*http
 	}, nil
 }
 
-// RefreshMeshEndpoint POSTs this node's new wireguard endpoint to the supervisor.
-// serverURL is the bootstrap base URL (https://<host>:9345); client must present
-// the node's own certificate (NodeIdentityClient).
+// RefreshMeshEndpoint POSTs this node's new wireguard endpoint, and its endpoint
+// candidates, to the supervisor. serverURL is the bootstrap base URL
+// (https://<host>:9345); client must present the node's own certificate
+// (NodeIdentityClient). A nil candidates list leaves the stored list unchanged.
 //
 // A 404 is returned as ErrNoMeshPeer so the caller can tell "the server does not
 // know this node" — rejoin — from a transient failure, which is retried on the
 // next tick.
-func RefreshMeshEndpoint(ctx context.Context, client *http.Client, serverURL, nodeName, endpoint string) error {
-	body, err := json.Marshal(MeshEndpointRefreshRequest{NodeName: nodeName, Endpoint: endpoint})
+func RefreshMeshEndpoint(ctx context.Context, client *http.Client, serverURL, nodeName, endpoint string, candidates []netv1.EndpointCandidate) error {
+	body, err := json.Marshal(MeshEndpointRefreshRequest{NodeName: nodeName, Endpoint: endpoint, Endpoints: candidates})
 	if err != nil {
 		return fmt.Errorf("marshal mesh endpoint refresh: %w", err)
 	}

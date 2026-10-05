@@ -24,12 +24,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	netv1 "k3sm.io/apis/net/v1"
 
 	"k3sm.io/k3sm/pkg/certs"
 )
@@ -92,6 +95,27 @@ type ServerConfig struct {
 	// takes. time.Now when nil; a test advances it instead of sleeping out a
 	// refill window.
 	Now func() time.Time
+	// DirectLinks writes a node's DirectLink spec for the direct-link publish
+	// verb (DirectLinkPath). When nil the verb is not served, and a node that
+	// calls it gets the 404 an older server would give.
+	DirectLinks DirectLinkWriter
+	// LinkIPFor maps the LOCAL address a join request arrived on to this
+	// server's direct-link address on that cable port, or "" when the address is
+	// not on a cable port. It fills JoinResponse.ServerLinkIP. Nil leaves it empty.
+	LinkIPFor func(local net.Addr) string
+	// Pair is the pairing verb's handler, served at PairPath by LinkHandler only.
+	// Nil serves no pairing.
+	Pair http.Handler
+	// OnCableJoin is told about a join that arrived on a cable port and named its
+	// own port on that cable (JoinRequest.Cable): the connection's local address,
+	// the pod /24 the join was assigned and the joiner's port ordinal. It lets the
+	// server route its replies to the new node over the cable at once. Nil does
+	// nothing; a join that did not arrive on a cable port is never reported.
+	OnCableJoin func(local net.Addr, podCIDR string, portOrdinal int32)
+	// OnOneShotJoin is told, after the fact, that a join signed with a one-shot
+	// (pairing) token completed; it advances the pairing window's completed-join
+	// count. Nil does nothing.
+	OnOneShotJoin func(nodeName string)
 }
 
 // nodePasswordStoreRetryAfterSeconds is the Retry-After a join is answered with
@@ -190,6 +214,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc(JoinPath, s.handleJoin)
 	mux.HandleFunc(MeshEndpointPath, s.handleMeshEndpoint)
 	mux.HandleFunc(DeregisterPath, s.handleDeregister)
+	if s.cfg.DirectLinks != nil {
+		mux.HandleFunc(DirectLinkPath, s.handleDirectLink)
+	}
 	if s.cfg.ServerAuth != nil && s.cfg.Bundle != nil {
 		mux.HandleFunc(BundlePath, s.handleBundle)
 	}
@@ -198,6 +225,40 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc(EtcdMemberPromotePath, s.handleEtcdMemberPromote)
 	}
 	return mux
+}
+
+// LinkHandler is Handler plus the pairing verb (PairPath). It is the handler of
+// the per-interface link-local listeners a server opens on its cable ports, and
+// of nothing else: the pairing verb is never reachable on the wildcard join
+// listener, so its own local-address check is a second gate rather than the
+// only one. When ServerConfig.Pair is nil it is Handler.
+func (s *Server) LinkHandler() http.Handler {
+	base := s.Handler()
+	if s.cfg.Pair == nil {
+		return base
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/", base)
+	mux.Handle(PairPath, s.cfg.Pair)
+	return mux
+}
+
+// PreAuthAllow runs the join listener's identity-blind pre-authentication bound
+// (per source address and in total) for r, writing the 429 and returning false
+// when the request is over it. Every anonymous verb on the join listener runs it
+// FIRST, before any body is read: it is shared, not copied, so a flood across
+// several verbs draws on one budget.
+func (s *Server) PreAuthAllow(w http.ResponseWriter, r *http.Request) bool {
+	ok, retryAfter := s.preauth.allow(preAuthSourceKey(r.RemoteAddr))
+	if ok {
+		return true
+	}
+	secs := retryAfterSeconds(retryAfter)
+	s.cfg.Logger.Debug("request rejected", "reason", "pre-auth-rate-limit", "path", r.URL.Path,
+		"retryAfterSeconds", secs, "remote", r.RemoteAddr)
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	http.Error(w, fmt.Sprintf("too many requests; retry in %ds", secs), http.StatusTooManyRequests)
+	return false
 }
 
 // handleCACert serves the cluster CA PEM (the anchor a joining node hash-verifies).
@@ -248,12 +309,42 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	req = req.WithDefaults()
 
-	// 1. Bootstrap token (authorizes the join; NOT the admin identity).
-	if err := s.cfg.Tokens.VerifyToken(r.Context(), req.Token); err != nil {
+	// 1. Bootstrap token (authorizes the join; NOT the admin identity). A store
+	// that can bind a token to a name and spend it once (a pairing token) is
+	// asked FOR this name, and the claim it returns is released on every
+	// failure below and consumed only once the certificates are signed.
+	claim := TokenClaim(noClaim{})
+	if jv, ok := s.cfg.Tokens.(JoinTokenVerifier); ok {
+		c, err := jv.VerifyJoinToken(r.Context(), req.Token, req.NodeName)
+		switch {
+		case errors.Is(err, ErrTokenNodeMismatch):
+			s.cfg.Logger.Warn("join rejected", "reason", "token-node-binding", "node", req.NodeName, "remote", r.RemoteAddr)
+			http.Error(w, "join refused: this token is bound to a different node name", http.StatusForbidden)
+			return
+		case errors.Is(err, ErrTokenInUse):
+			// Another join holds this one-shot token right now. Answered as a
+			// rate limit, which the joining agent already waits out and retries.
+			s.cfg.Logger.Warn("join rejected", "reason", "token-in-use", "node", req.NodeName, "remote", r.RemoteAddr)
+			w.Header().Set("Retry-After", "2")
+			http.Error(w, "join refused: this token is in use by another join; retry in 2s", http.StatusTooManyRequests)
+			return
+		case err != nil:
+			s.cfg.Logger.Warn("join rejected", "reason", "token", "node", req.NodeName, "err", err)
+			http.Error(w, "invalid join token", http.StatusUnauthorized)
+			return
+		}
+		claim = c
+	} else if err := s.cfg.Tokens.VerifyToken(r.Context(), req.Token); err != nil {
 		s.cfg.Logger.Warn("join rejected", "reason", "token", "node", req.NodeName, "err", err)
 		http.Error(w, "invalid join token", http.StatusUnauthorized)
 		return
 	}
+	consumed := false
+	defer func() {
+		if !consumed {
+			claim.Release()
+		}
+	}()
 	// 1a. ONE CANONICAL NAME. The name is canonicalized exactly once, here, and
 	// a request must already spell it canonically: every non-canonical spelling
 	// (case, surrounding space) gets the same fixed 400 whatever name it is a
@@ -433,7 +524,23 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	// From here to the response, EVERY failure path releases a FRESH allocation
 	// (see releaseFresh): the index this join carved is the index this join must
 	// give back when it does not finish.
-	meshResp, alloc, err := s.cfg.Enroller.Enroll(r.Context(), req.NodeName, req.Mesh)
+	var (
+		meshResp netv1.MeshEnrollResponse
+		alloc    Allocation
+	)
+	if req.Direct != nil {
+		// A cable-only joiner: its endpoint is derived from the index this
+		// enroll assigns, which only an Enroller that can derive it may do.
+		de, ok := s.cfg.Enroller.(DirectEnroller)
+		if !ok {
+			s.cfg.Logger.Warn("join rejected", "reason", "direct-enroll-unsupported", "node", req.NodeName)
+			http.Error(w, "join refused: this control plane cannot enroll a node with no underlay address", http.StatusBadRequest)
+			return
+		}
+		meshResp, alloc, err = de.EnrollDirect(r.Context(), req.NodeName, req.Mesh, *req.Direct)
+	} else {
+		meshResp, alloc, err = s.cfg.Enroller.Enroll(r.Context(), req.NodeName, req.Mesh)
+	}
 	if err != nil {
 		// An enroll can fail with the peer already written (its own list-back, say),
 		// in which case it reports the fresh allocation it made — so this is a reap
@@ -501,6 +608,22 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The certificates are signed: a one-shot token is spent HERE, before the
+	// response is written, so a client that hangs up now cannot reuse it. A
+	// consume that cannot be persisted fails the join (and gives the allocation
+	// back) rather than leaving a spent token able to verify again.
+	if err := claim.Consume(); err != nil {
+		consumed = true // the claim is resolved either way; do not release it
+		s.releaseFresh(r, req.NodeName, alloc, "token-consume")
+		s.cfg.Logger.Error("join rejected", "reason", "token-consume", "node", req.NodeName, "err", err)
+		http.Error(w, "join failed: the one-shot token could not be spent", http.StatusInternalServerError)
+		return
+	}
+	consumed = true
+	if claim.OneShot() && s.cfg.OnOneShotJoin != nil {
+		s.cfg.OnOneShotJoin(req.NodeName)
+	}
+
 	resp := JoinResponse{
 		SchemaVersion:         JoinSchemaVersion,
 		NodeName:              req.NodeName,
@@ -511,6 +634,14 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		KubeletServingCertPEM: string(servingCert),
 		APIServers:            s.cfg.APIServers,
 		Mesh:                  meshResp,
+	}
+	if s.cfg.LinkIPFor != nil {
+		if la, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+			resp.ServerLinkIP = s.cfg.LinkIPFor(la)
+			if resp.ServerLinkIP != "" && req.Cable != nil && s.cfg.OnCableJoin != nil {
+				s.cfg.OnCableJoin(la, meshResp.PodCIDR, req.Cable.PortOrdinal)
+			}
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {

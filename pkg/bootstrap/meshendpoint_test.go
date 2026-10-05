@@ -313,7 +313,7 @@ func TestMeshEndpointVerbAuthAndGuard(t *testing.T) {
 		}
 
 		// The production client helper drives the same exchange end to end.
-		if err := bootstrap.RefreshMeshEndpoint(context.Background(), client, f.ts.URL, "worker-1", "192.0.2.112:51820"); err != nil {
+		if err := bootstrap.RefreshMeshEndpoint(context.Background(), client, f.ts.URL, "worker-1", "192.0.2.112:51820", nil); err != nil {
 			t.Fatalf("RefreshMeshEndpoint: %v", err)
 		}
 		if final, _ := f.enroller.snapshot(); final.Endpoint != "192.0.2.112:51820" {

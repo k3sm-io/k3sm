@@ -78,6 +78,12 @@ type JoinOptions struct {
 	// re-reconciles. Empty mints a fresh keypair (the zero value stays usable), and
 	// an unusable value fails the join rather than falling through to a mint.
 	WGPrivateKeyB64 string
+	// Direct is set by a node with no underlay address, which joins over a direct
+	// cable: the server derives its wireguard endpoint (JoinRequest.Direct) and
+	// MeshEndpoint is left empty.
+	Direct *JoinDirect
+	// Cable is set by a node joining over a direct cable (JoinRequest.Cable).
+	Cable *JoinCable
 	// HTTPClient overrides the default pinned-CA client (tests inject one). When nil,
 	// Join builds a client that verifies the server's chain against the token's CA
 	// hash.
@@ -119,6 +125,9 @@ type JoinResult struct {
 	// point. Empty only when the server serves no mesh (single-node), where
 	// the joined-over address is the apiserver's address too.
 	APIServers []string
+	// ServerLinkIP is the server's direct-link address on the cable the join
+	// arrived over, or empty when it did not arrive over a cable.
+	ServerLinkIP string
 }
 
 // PinnedClient returns an http.Client whose TLS verification is REPLACED by a
@@ -211,6 +220,8 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 			Endpoint:  opts.MeshEndpoint,
 			PodCIDR:   opts.RequestedPodCIDR,
 		},
+		Direct: opts.Direct,
+		Cable:  opts.Cable,
 	}.WithDefaults()
 
 	client := opts.HTTPClient
@@ -245,6 +256,7 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 		WGPrivateKeyB64:       wgPriv,
 		WGPublicKeyB64:        wgPub,
 		APIServers:            resp.APIServers,
+		ServerLinkIP:          resp.ServerLinkIP,
 	}, nil
 }
 
@@ -468,3 +480,13 @@ func WireguardPublicKey(privB64 string) (string, error) {
 
 // wireguardKeyBytes is the Curve25519 scalar/point size a wireguard key carries.
 const wireguardKeyBytes = 32
+
+// HTTPSURL returns the https URL of a host:port, escaping an IPv6 zone so a zoned
+// link-local literal ("[fe80::1%en2]:9345", a join over a direct cable) survives
+// URL parsing: in a URL the zone separator is written "%25" (RFC 6874).
+func HTTPSURL(hostport string) string {
+	if i := strings.Index(hostport, "%"); i >= 0 && strings.HasPrefix(hostport, "[") && !strings.HasPrefix(hostport[i:], "%25") {
+		hostport = hostport[:i] + "%25" + hostport[i+1:]
+	}
+	return "https://" + hostport
+}

@@ -88,7 +88,7 @@ func (f *fakeEnroller) ReleaseAllocation(_ context.Context, nodeName string, _ b
 	return fmt.Errorf("the join fixture's enroller was asked to release %q, an allocation it never carved", nodeName)
 }
 
-func (f *fakeEnroller) RefreshEndpoint(_ context.Context, _, endpoint string) error {
+func (f *fakeEnroller) RefreshEndpoint(_ context.Context, _, endpoint string, _ []netv1.EndpointCandidate) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.refreshes++

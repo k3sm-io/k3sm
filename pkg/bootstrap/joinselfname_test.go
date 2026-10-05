@@ -94,7 +94,9 @@ func (e *peerStoreEnroller) ReleaseAllocation(_ context.Context, _ string, _ boo
 	return nil
 }
 
-func (e *peerStoreEnroller) RefreshEndpoint(_ context.Context, _, _ string) error { return nil }
+func (e *peerStoreEnroller) RefreshEndpoint(_ context.Context, _, _ string, _ []netv1.EndpointCandidate) error {
+	return nil
+}
 
 func (e *peerStoreEnroller) Deregister(_ context.Context, _ string) error { return nil }
 

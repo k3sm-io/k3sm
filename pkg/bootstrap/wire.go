@@ -48,6 +48,18 @@ const (
 	// the same guard, so a node can deregister itself and nothing else (see
 	// DeregisterRequest).
 	DeregisterPath = "/v1-k3sm/mesh/deregister"
+	// DirectLinkPath is the direct-link publish verb: a joined node writes the
+	// spec of its own DirectLink (its cable ports, as it observes them). It is
+	// authenticated exactly as MeshEndpointPath is, by the node's own client
+	// certificate, and self-scoped by the same guard, so a node writes its own
+	// DirectLink and no other (see DirectLinkRequest).
+	DirectLinkPath = "/v1-k3sm/directlink"
+	// PairPath is the pairing verb: a Mac that is not yet in the cluster asks,
+	// over a direct cable, for a one-shot join token while the server's pairing
+	// window is open. It is served ONLY on the per-interface link-local listeners
+	// a server opens on its cable ports, never on the wildcard join listener
+	// (Server.LinkHandler).
+	PairPath = "/v1-k3sm/pair"
 )
 
 // JoinSchemaVersion stamps the k3sm-internal join exchange payloads (JoinRequest /
@@ -86,6 +98,37 @@ type JoinRequest struct {
 	// Mesh is the wireguard mesh-enroll request (public key + endpoint + requested
 	// podCIDR).
 	Mesh netv1.MeshEnrollRequest `json:"mesh"`
+	// Direct is set only by a node that has NO underlay address: it joined over a
+	// direct cable and cannot name a wireguard endpoint, because its direct-link
+	// address is derived from the node index the server is about to assign. The
+	// server then derives the endpoint itself (DirectEnroller) and Mesh.Endpoint is
+	// left empty. An older server ignores the field and refuses the empty endpoint,
+	// which is the honest outcome: it cannot enroll a cable-only node.
+	Direct *JoinDirect `json:"direct,omitempty"`
+	// Cable is set by a node joining over a direct cable: the ordinal of its port
+	// on that cable. The server, which knows the index it assigns, derives the
+	// node's cable address from it and routes its replies back over the same
+	// cable before any other link state exists (the node does the same toward the
+	// server with JoinResponse.ServerLinkIP). An older server ignores it.
+	Cable *JoinCable `json:"cable,omitempty"`
+}
+
+// JoinCable names the joiner's port on the cable it joined over.
+type JoinCable struct {
+	// PortOrdinal is the joiner's port ordinal (receptacle − 1).
+	PortOrdinal int32 `json:"portOrdinal"`
+}
+
+// JoinDirect is what a cable-only joiner tells the server so the server can derive
+// its wireguard endpoint: the ordinal of the cable port it joined over and the UDP
+// port its wireguard listens on. The endpoint is
+// netv1alpha1.LinkIP(<assigned index>, PortOrdinal):MeshPort.
+type JoinDirect struct {
+	// PortOrdinal is the joiner's port ordinal (receptacle − 1) on the cable it
+	// joined over.
+	PortOrdinal int32 `json:"portOrdinal"`
+	// MeshPort is the UDP port the joiner's wireguard listens on.
+	MeshPort int32 `json:"meshPort"`
 }
 
 // WithDefaults returns a copy with SchemaVersion stamped when zero and the embedded
@@ -116,6 +159,11 @@ type MeshEndpointRefreshRequest struct {
 	// with this node — an UNDERLAY address, for the same reason the join-time
 	// endpoint is one.
 	Endpoint string `json:"endpoint"`
+	// Endpoints are the node's endpoint candidates (an underlay one and one direct
+	// one per cable port with an address). They replace the MeshPeer's candidate
+	// list as a whole. A server older than the field ignores it and keeps only
+	// Endpoint, which an older reader uses anyway.
+	Endpoints []netv1.EndpointCandidate `json:"endpoints,omitempty"`
 }
 
 // DeregisterRequest is the payload a node being uninstalled POSTs to
@@ -175,6 +223,12 @@ type JoinResponse struct {
 	// Mesh is the mesh-enroll response (assigned podCIDR + mesh-egress IP + peer
 	// snapshot).
 	Mesh netv1.MeshEnrollResponse `json:"mesh"`
+	// ServerLinkIP is the server's direct-link address on the cable port the join
+	// request arrived on, or empty when the request did not arrive on a cable
+	// port. A cable-only joiner installs its first host route to this address
+	// before any link state exists, which is what makes the server's mesh
+	// endpoint reachable at all, and persists it as its bootstrap address.
+	ServerLinkIP string `json:"serverLinkIP,omitempty"`
 }
 
 // TokenVerifier verifies a raw K10 join token (the seam the bootstrap server uses;
@@ -291,12 +345,15 @@ type Enroller interface {
 	// It runs under the SAME lock as Enroll, so a concurrent join of another node
 	// cannot be handed this index between the failure and the release.
 	ReleaseAllocation(ctx context.Context, nodeName string, alloc Allocation) error
-	// RefreshEndpoint updates ONLY spec.endpoint on the node's EXISTING MeshPeer.
-	// It never creates one: a node whose peer is gone has lost its podCIDR
-	// assignment too, and inventing a peer here would hand it an endpoint with no
-	// AllowedIPs behind it. That case returns ErrNoMeshPeer, which the handler
-	// maps to 404 — the signal for the agent to rejoin.
-	RefreshEndpoint(ctx context.Context, nodeName, endpoint string) error
+	// RefreshEndpoint updates ONLY spec.endpoint and spec.endpoints on the node's
+	// EXISTING MeshPeer. It never creates one: a node whose peer is gone has lost
+	// its podCIDR assignment too, and inventing a peer here would hand it an
+	// endpoint with no AllowedIPs behind it. That case returns ErrNoMeshPeer,
+	// which the handler maps to 404 — the signal for the agent to rejoin.
+	//
+	// candidates replaces the candidate list whole; nil leaves the stored list
+	// as it is, which is what a node that predates candidates sends.
+	RefreshEndpoint(ctx context.Context, nodeName, endpoint string, candidates []netv1.EndpointCandidate) error
 	// Deregister removes the node from the cluster: its MeshPeer FIRST, so the
 	// remaining peers drop the tunnel entry for a Mac that is going away, and
 	// then its Node object. An object that is already gone is not an error —
@@ -308,4 +365,13 @@ type Enroller interface {
 	// deliberately does not give it one. What authenticates the request is the
 	// node's certificate; what performs the write is the supervisor.
 	Deregister(ctx context.Context, nodeName string) error
+}
+
+// DirectEnroller is the optional Enroller extension a cable-only join needs: it
+// enrolls exactly as Enroll does, except that the node's wireguard endpoint is
+// DERIVED from the index the enroll assigns and the joiner's port ordinal
+// (netv1alpha1.LinkIP), because the joiner cannot know that address before the
+// server has chosen its index. An Enroller without it refuses a cable-only join.
+type DirectEnroller interface {
+	EnrollDirect(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest, direct JoinDirect) (netv1.MeshEnrollResponse, Allocation, error)
 }

@@ -154,7 +154,7 @@ func (e *allocatingEnroller) releasedWith() []bootstrap.Allocation {
 // RefreshEndpoint satisfies bootstrap.Enroller. This fixture exercises the JOIN
 // path only; a refresh reaching it would be a test wiring mistake, so it reports
 // the "rejoin" error rather than silently succeeding.
-func (e *allocatingEnroller) RefreshEndpoint(_ context.Context, _, _ string) error {
+func (e *allocatingEnroller) RefreshEndpoint(_ context.Context, _, _ string, _ []netv1.EndpointCandidate) error {
 	return bootstrap.ErrNoMeshPeer
 }
 
