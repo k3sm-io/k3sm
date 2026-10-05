@@ -129,8 +129,15 @@ v0.1.1 followed on 2026-09-02; see [CHANGELOG.md](CHANGELOG.md) for what it adds
   the two bullets below would attach to: distributed inference is what a fleet would route
   across, and autoscaling is a planner sitting above one. `MLXModel` stays the one-object way to
   serve a single model.
-- **JACCL / distributed inference.** Multi-Mac model sharding (the reserved `MLXModel.Distributed`
-  seam + the already-rendered headless governing Service).
+- **Direct links.** Macs cabled together over Thunderbolt find each other on the cable, and a new
+  Mac joins while the server's pairing window is open (`sudo k3sm pair`), optionally pinned to the
+  cluster it expects. Cluster traffic between two cabled Macs then takes the cable as a plain kernel
+  route, with the wireguard mesh kept for peers that have no cable and as the fallback when one is
+  pulled. That route is not encrypted, so the cable is treated as a trusted segment, and a per-link
+  switch sends a link back through the tunnel. On top of the link graph, an `MLXModel` can be
+  sharded across cabled Macs (the reserved `MLXModel.Distributed` seam, one rank per Mac) on MLX's
+  `ring` backend. The `jaccl` backend over RDMA follows where macOS exposes it, which today means
+  Thunderbolt 5 Macs on macOS 26.2 or later with RDMA enabled once in macOS Recovery.
 - **Autoscaling.** Scale-to-zero / activator-fronted model serving.
 
 ### Non-goals
