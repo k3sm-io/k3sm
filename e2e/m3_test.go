@@ -44,7 +44,7 @@ import (
 
 // TestM3_NodePort proves a Deployment behind a NodePort Service is reachable on
 // the node's *:nodePort wildcard listener — the VSCode SSH NodePort / snapshot
-// gRPC range stockkitty feature. It dials the node InternalIP:nodePort and asserts
+// gRPC range reference-workload feature. It dials the node InternalIP:nodePort and asserts
 // the backend answered. Needs routable pod IPs + the NodePort listener (the
 // runtimed runtime + a direct/helper datapath, NOT --network none).
 func TestM3_NodePort(t *testing.T) {
