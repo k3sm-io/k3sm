@@ -203,7 +203,7 @@ func countPrefix(calls []string, prefix string) int {
 func TestEtcdMemberRouteAddsLearner(t *testing.T) {
 	rig := newMemberRig(t, &fakeMembers{members: []bootstrap.EtcdMember{serverA}})
 
-	resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, "server-b", joinerPeer, rig.ts.Client())
+	resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}, rig.ts.Client())
 	if err != nil {
 		t.Fatalf("RequestEtcdMember: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestEtcdMemberRouteReusesUnstartedLearner(t *testing.T) {
 	rig := newMemberRig(t, &fakeMembers{members: []bootstrap.EtcdMember{serverA, pending}})
 
 	for range 2 {
-		resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, "server-b", joinerPeer, rig.ts.Client())
+		resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}, rig.ts.Client())
 		if err != nil {
 			t.Fatalf("RequestEtcdMember: %v", err)
 		}
@@ -288,7 +288,7 @@ func TestEtcdMemberRouteRemovesStaleMember(t *testing.T) {
 			other := bootstrap.EtcdMember{ID: 0xc, PeerURLs: []string{"https://192.0.2.77:2380"}, IsLearner: true}
 			rig := newMemberRig(t, &fakeMembers{members: []bootstrap.EtcdMember{serverA, tc.stale, other}})
 
-			resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, "server-b", joinerPeer, rig.ts.Client())
+			resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}, rig.ts.Client())
 			if err != nil {
 				t.Fatalf("RequestEtcdMember: %v", err)
 			}
@@ -411,7 +411,7 @@ func TestServerClassRoutesRejectWorkerToken(t *testing.T) {
 	if calls := rig.members.callLog(); len(calls) != 0 {
 		t.Fatalf("a refused request reached the membership: %v", calls)
 	}
-	if _, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.workerToken, "server-b", joinerPeer, rig.ts.Client()); !errors.Is(err, bootstrap.ErrNotServerToken) {
+	if _, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.workerToken, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}, rig.ts.Client()); !errors.Is(err, bootstrap.ErrNotServerToken) {
 		t.Errorf("the client helper accepted a worker token: %v", err)
 	}
 	if resp, _ := rig.post(t, bootstrap.EtcdMemberPath, rig.serverToken, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}); resp.StatusCode != http.StatusOK {
@@ -476,7 +476,7 @@ func TestServerRouteFailureClassification(t *testing.T) {
 				http.Error(w, "permanent transient retry refused", tc.code)
 			}))
 			defer ts.Close()
-			_, err := bootstrap.RequestEtcdMember(context.Background(), ts.URL, token, "server-b", joinerPeer, ts.Client())
+			_, err := bootstrap.RequestEtcdMember(context.Background(), ts.URL, token, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}, ts.Client())
 			re, ok := errors.AsType[*bootstrap.ServerRouteError](err)
 			if !ok || re.StatusCode != tc.code || re.Path != bootstrap.EtcdMemberPath {
 				t.Fatalf("err = %v (%T), want a *ServerRouteError for %d on %s", err, err, tc.code, bootstrap.EtcdMemberPath)
@@ -492,7 +492,7 @@ func TestServerRouteFailureClassification(t *testing.T) {
 
 	t.Run("a token that does not parse, or is a worker token: permanent", func(t *testing.T) {
 		for _, bad := range []string{"not-a-token", bootstrap.FormatToken(clusterCA.PinHash(), "abcdef", "0123456789abcdef")} {
-			_, err := bootstrap.RequestEtcdMember(context.Background(), "https://192.0.2.10:9345", bad, "server-b", joinerPeer, nil)
+			_, err := bootstrap.RequestEtcdMember(context.Background(), "https://192.0.2.10:9345", bad, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}, nil)
 			if err == nil || !bootstrap.IsPermanentServerRouteFailure(err) {
 				t.Errorf("token %q: err = %v, permanent = %v; want a permanent failure", bad, err, bootstrap.IsPermanentServerRouteFailure(err))
 			}
@@ -506,7 +506,7 @@ func TestServerRouteFailureClassification(t *testing.T) {
 		defer ts.Close()
 		// client nil: the helper builds the CA-pinned client from the token, and the
 		// test server's certificate is not the cluster CA the token pins.
-		_, err := bootstrap.RequestEtcdMember(context.Background(), ts.URL, token, "server-b", joinerPeer, nil)
+		_, err := bootstrap.RequestEtcdMember(context.Background(), ts.URL, token, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}, nil)
 		if err == nil || !errors.Is(err, certs.ErrPinMismatch) || !bootstrap.IsPermanentServerRouteFailure(err) {
 			t.Errorf("err = %v; want a permanent failure wrapping certs.ErrPinMismatch", err)
 		}
@@ -516,7 +516,7 @@ func TestServerRouteFailureClassification(t *testing.T) {
 		ts := httptest.NewServer(http.NotFoundHandler())
 		url := ts.URL
 		ts.Close()
-		_, err := bootstrap.RequestEtcdMember(context.Background(), url, token, "server-b", joinerPeer, http.DefaultClient)
+		_, err := bootstrap.RequestEtcdMember(context.Background(), url, token, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}, http.DefaultClient)
 		if err == nil || bootstrap.IsPermanentServerRouteFailure(err) {
 			t.Errorf("err = %v, permanent = %v; want a transient failure", err, bootstrap.IsPermanentServerRouteFailure(err))
 		}

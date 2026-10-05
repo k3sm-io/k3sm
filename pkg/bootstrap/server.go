@@ -74,6 +74,14 @@ type ServerConfig struct {
 	// APIServers are the control-plane apiserver endpoints advertised to a joining node
 	// in the JoinResponse (for its client-side load-balancer). Optional.
 	APIServers []string
+	// APIServersFunc, when set, is asked for the endpoint list on every join and
+	// takes precedence over APIServers, so a list that changes as servers join and
+	// become Ready is current for each join. Optional.
+	APIServersFunc func(ctx context.Context) []string
+	// ServerMesh reserves a joining server's mesh range on the etcd member route
+	// before its member is added. Nil leaves a member request that carries a mesh
+	// claim refused, never silently unreserved.
+	ServerMesh ServerMeshReserver
 	// ServerAuth authorizes the CA-bundle endpoint (BundlePath) to the SERVER-class
 	// token only. When nil (single-node / non-HA), the bundle endpoint is not served.
 	ServerAuth ServerAuthorizer
@@ -198,6 +206,15 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc(EtcdMemberPromotePath, s.handleEtcdMemberPromote)
 	}
 	return mux
+}
+
+// apiServers is the endpoint list a join is answered with: APIServersFunc's answer
+// for this join when it is set, else the static APIServers.
+func (s *Server) apiServers(ctx context.Context) []string {
+	if s.cfg.APIServersFunc != nil {
+		return s.cfg.APIServersFunc(ctx)
+	}
+	return s.cfg.APIServers
 }
 
 // handleCACert serves the cluster CA PEM (the anchor a joining node hash-verifies).
@@ -509,7 +526,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		ClientCAPEM:           string(s.cfg.SigningCA.CertPEM),
 		NodeClientCertPEM:     string(clientCert),
 		KubeletServingCertPEM: string(servingCert),
-		APIServers:            s.cfg.APIServers,
+		APIServers:            s.apiServers(r.Context()),
 		Mesh:                  meshResp,
 	}
 	w.Header().Set("Content-Type", "application/json")

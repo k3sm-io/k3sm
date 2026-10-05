@@ -109,7 +109,7 @@ func newServerEtcdJoin(opts serverOptions) *serverEtcdJoin {
 	j := &serverEtcdJoin{
 		memberExists: func() bool { return executor.EtcdMemberExists(opts.workDir) },
 		member: func(ctx context.Context, name, peerURL string) (bootstrap.EtcdMemberResponse, error) {
-			return bootstrap.RequestEtcdMember(ctx, base, token, name, peerURL, nil)
+			return bootstrap.RequestEtcdMember(ctx, base, token, bootstrap.EtcdMemberRequest{Name: name, PeerURL: peerURL}, nil)
 		},
 	}
 	if opts.joinServer != "" && token != "" {

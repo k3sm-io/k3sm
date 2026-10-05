@@ -449,7 +449,7 @@ func (m *itMember) requestMember(t *testing.T, route itRoute) bootstrap.EtcdMemb
 	var resp bootstrap.EtcdMemberResponse
 	for {
 		var err error
-		resp, err = bootstrap.RequestEtcdMember(t.Context(), route.url, route.token, m.name, m.routePeerURL(t), route.client)
+		resp, err = bootstrap.RequestEtcdMember(t.Context(), route.url, route.token, bootstrap.EtcdMemberRequest{Name: m.name, PeerURL: m.routePeerURL(t)}, route.client)
 		if err == nil {
 			break
 		}
