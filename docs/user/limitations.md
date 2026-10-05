@@ -772,17 +772,38 @@ tested rig and both a property of the shared-filesystem transport, not of PVC st
   they are unpacked, but a workload's own runtime writes are not, so a workload that itself creates
   case-colliding filenames on this path will lose data silently.
 
-### `vm` Pods: Same-Node Services, Not Direct Pod IPs
+### `vm` Pods: Services and Direct Pod IPs
 
 A `vm` Pod **consumes and serves** ClusterIP Services on its own node like any other pod. Delivery
 from the guest to a Service VIP is native on this path, and the proxy routes a Service to a `vm`
 Pod backend the same way.
 
-**Dialing a `vm` Pod's pod IP directly does not work.** The pod IP a `vm` Pod reports is its published
-identity, not a live address a peer can connect to, so anything that depends on a direct pod-IP dial,
-including headless-Service and per-pod DNS name resolution, does not reach a `vm` Pod. Reach it through
-its Service's ClusterIP instead, which does work. Cross-node traffic to or from a `vm` Pod is out of
-scope for this release.
+**A `vm` Pod's pod IP answers a direct dial, through a relay on its node, with these limits.** The
+guest never holds its pod IP. The node does, and relays each connection to the guest's own address.
+The relay covers each TCP `containerPort` the Pod declares and each port a Service targets on the Pod,
+so a peer on the same node, the node itself, or another node can dial the pod IP on those ports, and
+headless-Service and per-pod DNS names reach the Pod on them too. What it does not do:
+
+- **TCP only.** UDP to a `vm` Pod's pod IP is not relayed. Reach a `vm` Pod over UDP through its
+  Service's ClusterIP.
+- **Undeclared ports are refused.** A dial to a port the Pod does not declare and no Service targets
+  is refused. A native Pod has no such limit. A Pod whose declared and Service-targeted ports together
+  exceed the relay's per-pod port ceiling is not relayed at all, rather than relayed on some of them.
+- **Ports below 1024 need the network helper's view of the cluster.** The relay opens a port below 1024
+  through the root network helper, which allows it only for a port it can itself see the Pod declare or
+  a Service target, read from the API server. Until the helper has that view, or if it cannot read Pods
+  and EndpointSlices, those ports are refused rather than opened.
+- **The guest sees one client address.** Every relayed connection, local or remote, reaches the guest
+  from the node's guest-network gateway address, not from the caller's address. A workload in the guest
+  must not allowlist that address, and must not rely on the client address in its logs.
+- **NetworkPolicy applies, and has the same gap it has for a native Pod.** A direct pod-IP connection
+  to a `vm` Pod gets the same NetworkPolicy verdict the Service path applies. A process on the node
+  that dials the guest's own guest-network address skips the relay and the policy, exactly as a direct
+  dial of a native Pod's pod IP skips it.
+- **The relay forwards only to the guest the node attributes to that Pod.** It never forwards a
+  connection to any other address.
+
+Traffic a `vm` Pod opens toward another node is out of scope for this release.
 
 Three further properties of the guest network:
 

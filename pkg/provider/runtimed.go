@@ -1279,22 +1279,25 @@ var (
 //     runtimed as sandbox.VMSpec.Network through the runtime.GuestNetworker seam.
 //     SetupGuest is idempotent per podID, so buildBox's later call a few frames
 //     down returns this very address and there is still exactly one authority.
-//     NO lo0 alias is plumbed for it (SetupGuest is the not-taken branch of
-//     podnet's path fork): a host alias for the guest's address would make the
-//     host answer for the guest and blackhole it.
+//     SetupGuest also aliases the /32 on lo0 for the pod's lifetime, owned by
+//     the HOST, not the guest: the guest never holds this address. The alias is
+//     what makes the published address answer on this node, and what the mesh's
+//     route for the node's /24 delivers remote traffic to.
 //
-//     WHY THE GUEST'S /32 IS PUBLISHED WHILE THE HOST DOES NOT HOLD IT. A vm pod
+//     WHY THE GUEST'S /32 IS PUBLISHED WHILE THE GUEST DOES NOT HOLD IT. A vm pod
 //     has TWO addresses and they are never reconciled into one. This /32 is its
 //     cluster IDENTITY — what status.podIP, its EndpointSlices, cluster DNS and
-//     every NetworkPolicy carry — and it is deliberately live on no interface.
-//     The address that carries bytes is the guest's macOS-assigned vmnet DHCP
-//     lease, reported by the guest agent as PodStatus.guest_transport_address;
-//     it is never published, because a lease churns on every guest restart while
-//     an identity must not. The dial paths TRANSLATE between the two:
-//     observeTransport feeds the Service proxy a published->live override map
-//     keyed on exactly this /32 (proxy.RoutingTable.SetTransportOverrides), so a
-//     Service backend picked and policy-checked on the identity is dialed at the
-//     lease. Publishing the node IP here — which this branch used to do — gave
+//     every NetworkPolicy carry. The address that carries bytes is the guest's
+//     macOS-assigned vmnet DHCP lease, reported by the guest agent as
+//     PodStatus.guest_transport_address; it is never published, because a lease
+//     churns on every guest restart while an identity must not. The node
+//     TRANSLATES between the two: observeTransport feeds the Service proxy a
+//     published->live transport map keyed on exactly this /32, with the pod's
+//     declared TCP ports (proxy.RoutingTable.SetTransportOverrides), so a Service
+//     backend picked and policy-checked on the identity is dialed at the lease,
+//     and the proxy's relay listens on the aliased /32 for each declared or
+//     Service-targeted TCP port and forwards to the lease. Publishing the node IP
+//     here — which this branch used to do — gave
 //     every vm pod on a node the same status.podIP, which no override map can be
 //     keyed on and which no Service could distinguish.
 //
@@ -1360,11 +1363,41 @@ func (r *runtimedRuntime) allocError(pod *corev1.Pod, err error) error {
 // then) covers the paths where the RPC failed or the pod never reached the
 // runtime (a translate failure after allocation), so a churned pod cannot leak
 // one of the 253 node addresses. The adapter's startup sweep is the backstop.
+//
+// ORDER: TRANSPORT OVERRIDE FIRST, THEN THE ALIAS. For a vm pod the published /32
+// is a host-owned lo0 alias the Service proxy's relay listens on, and the
+// override is what keeps that relay up. Dropping the override closes the relay's
+// listeners and every connection it was relaying before the call returns
+// (transportFeed.beginRelease -> proxy.RoutingTable.SetTransportOverrides), so
+// the alias is removed only once nothing is listening on or relaying from it.
+// The reverse order would pull the address out from under live sockets and
+// leave the relay retrying a bind on an address the node no longer holds.
+//
+// NO REINSTALL WHILE RELEASING. A status observation can run concurrently and
+// would otherwise put the override (and the relay) back between the drop and
+// the alias removal. beginRelease marks the pod so observe refuses it, and
+// endRelease clears the mark only after the adapter's Teardown has deleted the
+// guest record that observe re-checks under the same lock, so no window exists
+// in which an observation can reinstall it.
+//
+// Every path that releases a pod's /32 goes through here (DeletePod and the
+// orphan reaper via teardownPod, a refused create, a refused re-attach), so the
+// order holds on all of them by construction; for a host-process pod the drop
+// is a no-op. The one path that drops an override WITHOUT releasing the /32 is
+// eviction (evictPod): the evicted pod stays in the apiserver, its guest is
+// stopped, its override and relay go, and its /32 is released by the DeletePod
+// that follows, through here.
 func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
+	id := string(pod.UID)
+	// Unconditional: the feed (nil-tolerant) holds the override even on a node
+	// whose pod-network seam is absent, and its liveness obligation does not
+	// depend on that seam.
+	r.transport.beginRelease(id)
+	defer r.transport.endRelease(id)
 	if r.network == nil {
 		return
 	}
-	if err := r.network.Teardown(string(pod.UID)); err != nil {
+	if err := r.network.Teardown(id); err != nil {
 		r.log.Warn("pod network teardown", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 	}
 }
@@ -2084,8 +2117,8 @@ func (t *podTrack) quiesce() {
 }
 
 // teardownPod is the delete path after preStop: the runtime RPC with grace, the
-// probe runner, the pod's /32, its log tree, its transport override, the track,
-// and the apiserver object. DeletePod and the orphan reaper (orphanreap.go) share
+// probe runner, the pod's transport override and then its /32 (in that order,
+// see releasePodNetwork), its log tree, the track, and the apiserver object. DeletePod and the orphan reaper (orphanreap.go) share
 // it, so a reaped pod is torn down exactly as a deleted one is.
 //
 // owned selects how the track is forgotten. nil forgets whatever track the pod
@@ -2101,19 +2134,20 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	// Stop the probe runner before forgetting the pod (stopProber waits for the
 	// loops outside the lock, so no probe goroutine outlives the pod).
 	r.stopProber(id)
-	// Release the pod's /32 (log-and-continue; idempotent after runtimed's own
-	// delete-path teardown) so pod churn never leaks a node pool address.
+	// Drop any Service-proxy transport override for the pod, THEN release its /32
+	// (log-and-continue; idempotent after runtimed's own delete-path teardown) so
+	// pod churn never leaks a node pool address. releasePodNetwork does both, in
+	// that order (see its doc): the drop closes the pod's relay before the alias
+	// it listens on goes. No further status will ever arrive to retract the
+	// override, and one that outlives its guest points at a lease macOS is free to
+	// hand to the NEXT guest — a cross-pod misdelivery, not a failed dial (see
+	// transportFeed).
 	r.releasePodNetwork(pod)
 	// Remove the pod's log tree, now that runtimed has confirmed every container
 	// is gone (the RPC above is synchronous). Deleting it while a container still
 	// held the file open would strand the output on an unlinked inode, which is
 	// the one way this node can lose logs without saying so.
 	r.removePodLogs(pod)
-	// Drop any Service-proxy transport override for the pod IN THE SAME STEP. No
-	// further status will ever arrive to retract it, and an override that outlives
-	// its guest points at a lease macOS is free to hand to the NEXT guest — a
-	// cross-pod misdelivery, not a failed dial (see transportFeed).
-	r.transport.drop(id)
 	r.mu.Lock()
 	t := r.track[id]
 	forget := false
@@ -2313,7 +2347,7 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	// node's own guest record; it contributes NOTHING to the corev1 status being
 	// built, because the live address must never reach status.podIP, the
 	// EndpointSlice or DNS (see observeTransport).
-	r.observeTransport(string(pod.UID), rs)
+	r.observeTransport(pod, rs)
 	// A restricted main process lost the pod shim; runtimed says so with the
 	// k3sm.io/shim-inactive condition and the node turns it into one Warning
 	// Event per pod per reason, on whichever status path delivers it first.

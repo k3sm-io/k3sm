@@ -366,18 +366,21 @@ func vmnetPolicyPrefix(vmBackend bool, natSubnet string) netip.Prefix {
 }
 
 // SetTransportOverrides replaces the Service proxy's published-to-live TRANSPORT
-// address map: the seam a vm pod's guest DHCP lease reaches the backend dial
-// through (proxy.RoutingTable.SetTransportOverrides — read its contract before
-// calling). The node assembler feeds it from the provider, which is the only
-// component holding both a vm pod's published /32 and its reported lease; nothing
-// in netserve derives either.
+// map: the seam a vm pod's guest DHCP lease reaches the backend dial through, and
+// the set of published addresses the proxy relays to their guests, each on the
+// pod's declared TCP ports plus every port a Service targets there
+// (proxy.RoutingTable.SetTransportOverrides — read its contract before calling).
+// The node assembler feeds it from the provider, which is the only component
+// holding both a vm pod's published /32 and its reported lease; nothing in
+// netserve derives either.
 //
 // The map is replaced WHOLESALE and the caller owns the liveness obligation: an
 // override that outlives its lease dials an address that may now belong to a
-// different guest. Overrides affect the DIAL only — the picked backend, the
-// NetworkPolicy verdict and the affinity binding all stay keyed on the published
-// identity.
-func (s *Server) SetTransportOverrides(overrides map[netip.Addr]netip.Addr) {
+// different guest. A generation that drops or changes a pod closes its relay
+// before this returns. For the VIP path overrides affect the DIAL only — the
+// picked backend, the NetworkPolicy verdict and the affinity binding all stay
+// keyed on the published identity.
+func (s *Server) SetTransportOverrides(overrides map[netip.Addr]proxy.VMPodTransport) {
 	s.table.SetTransportOverrides(overrides)
 }
 

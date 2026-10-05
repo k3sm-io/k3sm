@@ -91,7 +91,7 @@ func netdFlags(opts *netdOptions) *flag.FlagSet {
 	fs.StringVar(&opts.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR (REQUIRED so the proxy's ClusterIP VIP aliases are admitted)")
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
 	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
-	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer's Service informer uses — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
+	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer reads with: Services (VIP and ingress binds), and this node's Pods and EndpointSlices (relay binds on published vm pod addresses) — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the node resolver entry routes svc and the cluster domain to")
 	fs.StringVar(&opts.clusterDomain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the node resolver entry registers as a match domain")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT: ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
@@ -150,6 +150,7 @@ func runNetd(args []string) error {
 		LBDeclarers:        lbDeclarers,
 		NodeAddressService: canonicalLBService(),
 		NodeIP:             nodeIP,
+		VMPodPorts:         buildVMPodSet(ctx, opts.kubeconfig, logger),
 		MeshKeyDir:         opts.meshKeyDir,
 		Logger:             logger,
 	})

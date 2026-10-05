@@ -597,6 +597,11 @@ spike_topology() {
 		echo "      the server Mac's k3sm kubectl cannot list nodes"
 		return 1
 	}
+	# k3sm leaves Node.spec.podCIDR empty; a node's pod /24 is its MeshPeer's spec.podCIDR.
+	kc get meshpeers.net.k3sm.io -o json >"$RUNG_DIR/meshpeers.json" 2>/dev/null || {
+		echo "      the server Mac's k3sm kubectl cannot list meshpeers"
+		return 1
+	}
 	python3 - "$RUNG_DIR" "${K3SM_M17_SERVER_IFACE:-}" "${K3SM_M17_WORKER_IFACE:-}" >"$RUNG_DIR/topology.env" <<'PY' || return 1
 import json, sys
 d, srv_if, wrk_if = sys.argv[1:4]
@@ -619,12 +624,15 @@ if not pair:
     sys.stderr.write("no Thunderbolt port pair whose peer domain UUIDs point at each other (is the cable in?)\n")
     sys.exit(1)
 nodes = json.load(open(f"{d}/nodes.json"))["items"]
+cidrs = {m["spec"].get("nodeName", m["metadata"]["name"]): m["spec"].get("podCIDR", "")
+         for m in json.load(open(f"{d}/meshpeers.json"))["items"]}
 def node_for(side):
     mine = set(open(f"{d}/addrs-{side}.txt").read().split())
     for n in nodes:
         ips = {a["address"] for a in n["status"].get("addresses", []) if a["type"] == "InternalIP"}
         if ips & mine:
-            return n["metadata"]["name"], n["spec"].get("podCIDR", "")
+            name = n["metadata"]["name"]
+            return name, n["spec"].get("podCIDR") or cidrs.get(name, "")
     return "", ""
 sn, scidr = node_for("server")
 wn, wcidr = node_for("worker")
