@@ -617,14 +617,15 @@ func doctorReport(env doctorEnv, ver version.Info, now time.Time) status.Report 
 		host = ""
 	}
 	return status.Report{
-		Verdict:   verdict,
-		Role:      role,
-		Summary:   summary,
-		Rows:      rows,
-		Next:      next,
-		Version:   ver,
-		Host:      host,
-		Timestamp: now,
+		SchemaVersion: status.SchemaVersion,
+		Verdict:       verdict,
+		Role:          role,
+		Summary:       summary,
+		Rows:          rows,
+		Next:          next,
+		Version:       ver,
+		Host:          host,
+		Timestamp:     now,
 	}
 }
 

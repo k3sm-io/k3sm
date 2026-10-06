@@ -36,4 +36,9 @@ limitations under the License.
 //   - The verdict is a machine contract. Verdict.ExitCode is what `k3sm status`
 //     exits with, the numbers are additive-only, and Unknown ("could not
 //     determine") is deliberately distinct from an internal error.
+//   - The JSON is a versioned contract. Report (`k3sm status -o json`) and
+//     DaemonsReport (the launchd-only `k3sm status daemons -o json` probe) both
+//     carry SchemaVersion, which bumps only on a breaking change; the key sets
+//     and enums are pinned by TestStatusJSONContractGolden against the goldens in
+//     testdata, and docs/user/status-json.md states them for readers.
 package status

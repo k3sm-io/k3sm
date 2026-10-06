@@ -183,6 +183,16 @@ func TestDoctorRendersRemedies(t *testing.T) {
 	// The rows render on the status screen's columns: same glyphs, same state
 	// column, same headline. A second renderer in cmd/k3sm is exactly what the
 	// shared one exists to prevent.
+	// doctor --json promises the full report's shape, so it carries the same
+	// schema stamp; a reader that checks schemaVersion must accept it.
+	t.Run("the-json-carries-the-schema-version", func(t *testing.T) {
+		t.Parallel()
+		rep := doctorReport(healthyDoctorEnv(), doctorTestVersion, doctorTestTime)
+		if rep.SchemaVersion != status.SchemaVersion {
+			t.Errorf("doctor report schemaVersion = %d, want %d", rep.SchemaVersion, status.SchemaVersion)
+		}
+	})
+
 	t.Run("the-screen-is-the-status-screen", func(t *testing.T) {
 		t.Parallel()
 		env := healthyDoctorEnv()

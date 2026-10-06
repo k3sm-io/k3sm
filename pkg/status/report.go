@@ -100,7 +100,10 @@ type PeerStatus struct {
 // `k3sm status -o json`; the text screen is rendered FROM it and never the
 // other way round, so the two can never disagree.
 type Report struct {
-	Verdict Verdict `json:"verdict"`
+	// SchemaVersion is the version of this JSON contract (SchemaVersion, the
+	// constant). Collect sets it; it is never stamped on at the render layer.
+	SchemaVersion int     `json:"schemaVersion"`
+	Verdict       Verdict `json:"verdict"`
 	// Role is which node this Mac is installed as, decided from the two
 	// node-daemon plists on disk (dataroot.RoleFromPlists). It picks the rows
 	// the screens render and the daemon the verdict is about, so it is part of

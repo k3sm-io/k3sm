@@ -686,3 +686,73 @@ func TestStatusCollectorParsesServerArgs(t *testing.T) {
 		}
 	}
 }
+
+// TestStatusDaemonsJSONIsTheProbe pins the wiring of the cheap probe: `status
+// daemons -o json` is answered by the launchd-only collector in its own shape,
+// the full report's collector is never called, the JSON reaches stdout whatever
+// the verdict, and the exit code is the probe verdict's. The text daemons view
+// still renders the full report.
+func TestStatusDaemonsJSONIsTheProbe(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		verdict status.Verdict
+		want    int
+	}{
+		{status.VerdictRunning, 0},
+		{status.VerdictStopped, 3},
+		{status.VerdictDegraded, 4},
+		{status.VerdictNotInstalled, 5},
+		{status.VerdictUnknown, 6},
+	} {
+		t.Run(tc.verdict.String(), func(t *testing.T) {
+			t.Parallel()
+			var out, errOut bytes.Buffer
+			r := testRunner(&out, &errOut, func(context.Context) status.Report {
+				t.Error("the full report was collected for `status daemons -o json`")
+				return reportOf(status.VerdictRunning)
+			})
+			r.probe = func() status.DaemonsReport {
+				return status.DaemonsReport{
+					SchemaVersion: status.SchemaVersion,
+					Verdict:       tc.verdict,
+					Role:          "server",
+					Summary:       "a summary",
+					Daemons:       []status.Row{{Name: status.RowNetd, State: status.StateRunning, Severity: status.SeverityOK, Detail: "pid 1"}},
+				}
+			}
+			if got := r.run(context.Background(), statusOptions{view: "daemons", format: "json"}); got != tc.want {
+				t.Fatalf("exit = %d, want %d", got, tc.want)
+			}
+			dec := json.NewDecoder(bytes.NewReader(out.Bytes()))
+			dec.DisallowUnknownFields()
+			var back status.DaemonsReport
+			if err := dec.Decode(&back); err != nil {
+				t.Fatalf("stdout is not a DaemonsReport: %v\n%s", err, out.String())
+			}
+			if back.Verdict != tc.verdict || back.SchemaVersion != status.SchemaVersion {
+				t.Errorf("decoded %v schemaVersion %d", back.Verdict, back.SchemaVersion)
+			}
+			if errOut.Len() != 0 {
+				t.Errorf("stderr is not empty: %q", errOut.String())
+			}
+		})
+	}
+
+	t.Run("the text daemons view still renders the full report", func(t *testing.T) {
+		t.Parallel()
+		var out, errOut bytes.Buffer
+		collected := false
+		r := testRunner(&out, &errOut, func(context.Context) status.Report {
+			collected = true
+			return reportOf(status.VerdictRunning)
+		})
+		r.probe = func() status.DaemonsReport {
+			t.Error("the probe answered the text daemons view")
+			return status.DaemonsReport{}
+		}
+		r.run(context.Background(), statusOptions{view: "daemons", format: "text"})
+		if !collected {
+			t.Error("the text daemons view did not collect the full report")
+		}
+	})
+}

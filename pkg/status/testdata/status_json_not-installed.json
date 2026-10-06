@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "verdict": "not-installed",
+  "role": "server",
+  "summary": "k3sm is not installed on this Mac",
+  "rows": [
+    {
+      "name": "install",
+      "state": "absent",
+      "severity": "fail",
+      "detail": "no k3sm install found on this Mac",
+      "remedy": "sudo k3sm install",
+      "wide": {
+        "binary": "/Library/k3sm/k3sm",
+        "link": "/usr/local/bin/k3sm",
+        "plists": "/Library/LaunchDaemons",
+        "role": "server"
+      }
+    },
+    {
+      "name": "netd",
+      "state": "not-loaded",
+      "severity": "fail",
+      "detail": "io.k3sm.netd is not loaded in the system domain",
+      "remedy": "sudo k3sm install",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "0"
+      }
+    },
+    {
+      "name": "server",
+      "state": "not-loaded",
+      "severity": "fail",
+      "detail": "io.k3sm.server is not loaded in the system domain",
+      "remedy": "sudo k3sm install",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "label": "io.k3sm.server",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/server.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "0"
+      }
+    },
+    {
+      "name": "apiserver",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "no kubeconfig: no k3sm context in ~/.kube/config",
+      "remedy": "sudo k3sm install\nk3sm kubeconfig --write"
+    },
+    {
+      "name": "node",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "apiserver unreachable",
+      "remedy": "k3sm status logs server"
+    },
+    {
+      "name": "workloads",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "apiserver unreachable",
+      "remedy": "k3sm kubectl get pods -A"
+    },
+    {
+      "name": "data-root",
+      "state": "absent",
+      "severity": "fail",
+      "detail": "/var/lib/k3sm does not exist",
+      "remedy": "sudo k3sm install",
+      "wide": {
+        "declared": "false",
+        "mounted": "false",
+        "owner": "0"
+      }
+    },
+    {
+      "name": "datastore",
+      "state": "skip",
+      "severity": "skip",
+      "detail": "no state.db yet",
+      "wide": {
+        "path": "/nonexistent/k3sm-status-contract/server/db/state.db"
+      }
+    },
+    {
+      "name": "kubeconfig",
+      "state": "missing",
+      "severity": "warn",
+      "detail": "no k3sm context in ~/.kube/config",
+      "remedy": "sudo k3sm install\nk3sm kubeconfig --write"
+    },
+    {
+      "name": "runtimed",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "needs sudo (socket is owner-only)"
+    }
+  ],
+  "next": [
+    "sudo k3sm install",
+    "k3sm kubeconfig --write",
+    "k3sm status logs server",
+    "k3sm kubectl get pods -A"
+  ],
+  "version": {
+    "version": "v0.1.7",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "dirty": false,
+    "date": "2026-10-01T00:00:00Z",
+    "goVersion": "go1.26.1",
+    "platform": "darwin/arm64",
+    "kubeVersion": "v1.36.2",
+    "kineVersion": "v1.14.2",
+    "modules": [
+      {
+        "path": "k3sm.io/apis",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/darwin-net",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/runtimed",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/k3sm",
+        "sha": "v0.1.7"
+      }
+    ]
+  },
+  "host": "26.1",
+  "timestamp": "2026-09-05T09:30:00Z"
+}

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "verdict": "stopped",
+  "role": "server",
+  "summary": "io.k3sm.server is crash-looping (497 runs, last exit 1)",
+  "daemons": [
+    {
+      "name": "netd",
+      "state": "running",
+      "severity": "ok",
+      "detail": "pid 1292 · socket /var/lib/k3sm/run/netd.sock",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "1"
+      }
+    },
+    {
+      "name": "server",
+      "state": "crash-loop",
+      "severity": "fail",
+      "detail": "497 runs, last exit 1",
+      "remedy": "sudo launchctl kickstart -k system/io.k3sm.server\nk3sm status logs server",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "label": "io.k3sm.server",
+        "last-exit": "1",
+        "log": "level=ERROR msg=\"control plane exited\" err=\"bind: address already in use\"",
+        "log-path": "/var/log/k3sm/server.log",
+        "log-repeats": "1",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "497"
+      }
+    }
+  ]
+}

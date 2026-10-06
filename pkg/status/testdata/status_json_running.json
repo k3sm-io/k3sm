@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "verdict": "running",
+  "role": "server",
+  "summary": "1/1 nodes ready",
+  "rows": [
+    {
+      "name": "install",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "/Library/k3sm/k3sm · launcher /usr/local/bin/k3sm · 2 LaunchDaemons in /Library/LaunchDaemons",
+      "wide": {
+        "binary": "/Library/k3sm/k3sm",
+        "link": "/usr/local/bin/k3sm",
+        "plists": "/Library/LaunchDaemons",
+        "role": "server"
+      }
+    },
+    {
+      "name": "netd",
+      "state": "running",
+      "severity": "ok",
+      "detail": "pid 1292 · socket /var/lib/k3sm/run/netd.sock",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "1"
+      }
+    },
+    {
+      "name": "server",
+      "state": "running",
+      "severity": "ok",
+      "detail": "pid 1292",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "label": "io.k3sm.server",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/server.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "1"
+      }
+    },
+    {
+      "name": "apiserver",
+      "state": "ready",
+      "severity": "ok",
+      "detail": "https://127.0.0.1:6444 readyz ok",
+      "wide": {
+        "readyz": "[+]ping ok\nreadyz check passed",
+        "server": "https://127.0.0.1:6444",
+        "tls": "ca pinned"
+      }
+    },
+    {
+      "name": "node",
+      "state": "ready",
+      "severity": "ok",
+      "detail": "1/1 nodes ready · my-mac kubelet v1.36.2",
+      "wide": {
+        "kubelet": "v1.36.2",
+        "node": "my-mac"
+      }
+    },
+    {
+      "name": "workloads",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "3 running"
+    },
+    {
+      "name": "data-root",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "/var/lib/k3sm (apfs device disk3s7, mounted)",
+      "wide": {
+        "declared": "false",
+        "mounted": "true",
+        "owner": "0"
+      }
+    },
+    {
+      "name": "datastore",
+      "state": "skip",
+      "severity": "skip",
+      "detail": "no state.db yet",
+      "wide": {
+        "path": "/nonexistent/k3sm-status-contract/server/db/state.db"
+      }
+    },
+    {
+      "name": "kubeconfig",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "~/.kube/config context \"k3sm\""
+    },
+    {
+      "name": "runtimed",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "needs sudo (socket is owner-only)"
+    }
+  ],
+  "next": [
+    "k3sm kubectl get pods -A"
+  ],
+  "version": {
+    "version": "v0.1.7",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "dirty": false,
+    "date": "2026-10-01T00:00:00Z",
+    "goVersion": "go1.26.1",
+    "platform": "darwin/arm64",
+    "kubeVersion": "v1.36.2",
+    "kineVersion": "v1.14.2",
+    "modules": [
+      {
+        "path": "k3sm.io/apis",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/darwin-net",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/runtimed",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/k3sm",
+        "sha": "v0.1.7"
+      }
+    ]
+  },
+  "host": "26.1",
+  "timestamp": "2026-09-05T09:30:00Z"
+}

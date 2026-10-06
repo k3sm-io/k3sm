@@ -92,36 +92,39 @@ var modulePaths = []string{
 	"k3sm.io/k3sm",
 }
 
-// ModuleRef is one assembled k3sm.io module and the SHA/version it was built from.
+// ModuleRef is one assembled k3sm.io module and the SHA/version it was built
+// from. Its JSON keys are lowerCamel, like Info's.
 type ModuleRef struct {
 	// Path is the module path, e.g. "k3sm.io/apis".
-	Path string
+	Path string `json:"path"`
 	// SHA is the module's build-info version (a pseudo-version carrying the SHA
 	// in a release build; "(devel)" or "unknown" in a workspace/dev build).
-	SHA string
+	SHA string `json:"sha"`
 }
 
-// Info is the resolved version provenance for the running k3sm binary.
+// Info is the resolved version provenance for the running k3sm binary. Its
+// lowerCamel JSON keys are part of the `k3sm status -o json` contract, where it
+// is embedded as "version".
 type Info struct {
 	// Version is the k3sm release version (stamped, or recovered from build info).
-	Version string
+	Version string `json:"version"`
 	// Commit is the k3sm source revision (stamped, or vcs.revision).
-	Commit string
+	Commit string `json:"commit"`
 	// Dirty reports that the VCS-recovered Commit was built from a modified
 	// working tree (vcs.modified) — the SHA does not exactly identify the source.
-	Dirty bool
+	Dirty bool `json:"dirty"`
 	// Date is the build timestamp (stamped, or vcs.time).
-	Date string
+	Date string `json:"date"`
 	// GoVersion is the toolchain that built the binary.
-	GoVersion string
+	GoVersion string `json:"goVersion"`
 	// Platform is the GOOS/GOARCH the binary targets.
-	Platform string
+	Platform string `json:"platform"`
 	// KubeVersion is the aligned Kubernetes control-plane version.
-	KubeVersion string
+	KubeVersion string `json:"kubeVersion"`
 	// KineVersion is the aligned kine (etcd shim) version — one pin, both postures.
-	KineVersion string
+	KineVersion string `json:"kineVersion"`
 	// Modules are the assembled k3sm.io modules and their release SHAs.
-	Modules []ModuleRef
+	Modules []ModuleRef `json:"modules,omitempty"`
 }
 
 // Get resolves the running binary's version provenance. When the ldflags were
