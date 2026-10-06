@@ -18,7 +18,13 @@ cheap enough to poll.
 
 ## Versioning
 
-Both shapes carry `"schemaVersion": 1`.
+Both shapes carry `"schemaVersion": 1`, and so does `k3sm doctor --json`, which emits the full
+report's shape.
+
+Output from releases before the stamp has no `schemaVersion` key; treat it as version 0. Version 1
+renamed the keys under `version` from capitalised (`Version`, `Commit`, `GoVersion`) to the
+lowerCamel spelling every other key uses, so a script written against version 0 that reads
+`.version.Version` must read `.version.version`.
 
 - `schemaVersion` changes only on a **breaking** change: a field removed or renamed, a field whose
   type changes, or a field or enum value whose meaning changes.
