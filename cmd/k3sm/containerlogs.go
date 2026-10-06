@@ -88,6 +88,13 @@ func (o containerLogOptions) validate() error {
 	return nil
 }
 
+// containerLogRepair is the repair every ensureWritable refusal names. Both
+// repairs run as root and re-apply the install policy (owner, group, mode) to
+// the tree, creating it when it is missing: the root netd job does so at every
+// start (reapplyLogPolicy), and `k3sm install` does so on every install.
+const containerLogRepair = "restart the root helper with `sudo launchctl kickstart -k system/" + install.NetdLabel +
+	"`, which re-creates the container log tree owned by the service user at every start, or run `sudo k3sm install`; or pass --pod-logs-dir"
+
 // ensureWritable fails fast when the pod-logs directory is missing or the node
 // cannot write in it.
 //
@@ -95,8 +102,9 @@ func (o containerLogOptions) validate() error {
 // and only root can create it that way, so a node that finds it absent is a node
 // running on an install that did not happen — and a node that started anyway
 // would run every pod with nowhere to write, answer `kubectl logs` with "no log
-// file" for the rest of its life, and give no hint why. The error names
-// `k3sm install` because that is the fix.
+// file" for the rest of its life, and give no hint why. The error names the two
+// repairs: restarting the root io.k3sm.netd job, which re-applies the install
+// policy at every start, and `k3sm install`.
 //
 // The writability probe is a real create-and-remove rather than a mode check:
 // ownership, ACLs and a read-only mount all produce the same answer that way, and
@@ -104,15 +112,15 @@ func (o containerLogOptions) validate() error {
 func (o containerLogOptions) ensureWritable() error {
 	info, err := os.Stat(o.dir)
 	if err != nil {
-		return fmt.Errorf("container log directory %s is not available: %w (run `sudo k3sm install`, which creates it, or pass --pod-logs-dir)", o.dir, err)
+		return fmt.Errorf("container log directory %s is not available: %w (%s)", o.dir, err, containerLogRepair)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("container log directory %s is not a directory (run `sudo k3sm install`, or pass --pod-logs-dir)", o.dir)
+		return fmt.Errorf("container log directory %s is not a directory (%s)", o.dir, containerLogRepair)
 	}
 	probe := filepath.Join(o.dir, ".k3sm-write-probe")
 	f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
-		return fmt.Errorf("container log directory %s is not writable by this node: %w (run `sudo k3sm install`, which creates it owned by the service user, or pass --pod-logs-dir)", o.dir, err)
+		return fmt.Errorf("container log directory %s is not writable by this node: %w (%s)", o.dir, err, containerLogRepair)
 	}
 	_ = f.Close()
 	_ = os.Remove(probe)

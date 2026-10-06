@@ -119,6 +119,10 @@ defaults a k3s user already has:
 the directory is missing or it cannot write there, and says so, rather than running Pods that have
 nowhere to write.
 
+The root `io.k3sm.netd` helper re-applies the install's policy for these two directories and for
+`/var/log/k3sm` at every start, so a macOS upgrade that replaces `/var/log` repairs itself on the next
+boot.
+
 `k3sm dev` puts each instance's logs under that instance's own runtime root instead of the shared
 tree, so two dev instances never mix their output and `k3sm dev down` takes the logs with it.
 

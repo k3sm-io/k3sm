@@ -128,6 +128,9 @@ func runNetd(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Before anything else this job does: launchd starts netd ahead of the
+	// _k3sm jobs, and those cannot start while their log trees are wrong.
+	reapplyLogPolicy(install.NewDarwinSystem(), uint32(uid), logger)
 
 	// The node's own InternalIP for the node-address LB branch of the port
 	// authorizer. Empty is a valid posture — the branch simply denies —
@@ -231,6 +234,51 @@ func resolveServiceUID(flagUID int) (int, error) {
 		return 0, fmt.Errorf("parse %s uid %q: %w", install.DefaultServiceUser, u.Uid, err)
 	}
 	return uid, nil
+}
+
+// logPolicyEnsurer is the slice of install.System netd re-applies the log
+// ownership policy through: the installer's own ensure functions, so netd
+// carries no second copy of the owners, groups or modes.
+type logPolicyEnsurer interface {
+	EnsureLogDir(dir string, uid uint32) error
+	EnsureContainerLogDir(dir string, uid uint32) error
+}
+
+// reapplyLogPolicy re-applies, at every netd start, the two log-tree policies
+// `k3sm install` lays down: the daemon log dir (install.LogDir, with the server,
+// agent, netd and datavol logs EnsureLogDir pre-creates inside it) and every
+// directory of the container-log tree (install.ContainerLogDirs).
+//
+// Only the installer created them before, so a tree that disappeared after the
+// install stayed gone. A macOS upgrade does exactly that: /var/log came back
+// with /var/log/k3sm root:wheel 0744 and no agent.log, and without
+// /var/log/pods or /var/log/containers. launchd then could not open the _k3sm
+// agent's StandardOutPath as _k3sm and refused to start it, and once that was
+// fixed by hand the agent exited on the missing /var/log/pods. netd is the one
+// k3sm job that runs as root and launchd starts it before the _k3sm jobs, so
+// re-applying here repairs the trees on the next boot with nobody involved.
+//
+// uid is the service uid netd already resolved to admit its peer: the same
+// _k3sm account lookup the installer's EnsureServiceUser performs. Every ensure
+// is idempotent. An error is logged at Warn and never fails netd's start: netd's
+// own verbs are what every pod needs to exist, and a log tree it could not
+// repair is something `sudo k3sm install` still fixes.
+func reapplyLogPolicy(sys logPolicyEnsurer, uid uint32, logger *slog.Logger) {
+	if err := sys.EnsureLogDir(install.LogDir, uid); err != nil {
+		logger.Warn("netd: could not re-apply the daemon log directory policy; run `sudo k3sm install` to repair it",
+			"dir", install.LogDir, "uid", uid, "err", err)
+	} else {
+		logger.Info("netd: re-applied the daemon log directory policy", "dir", install.LogDir, "uid", uid,
+			"files", []string{install.ServerLogPath(), install.AgentLogPath(), install.NetdLogPath(), install.DatavolLogPath()})
+	}
+	for _, dir := range install.ContainerLogDirs() {
+		if err := sys.EnsureContainerLogDir(dir, uid); err != nil {
+			logger.Warn("netd: could not re-apply the container log directory policy; run `sudo k3sm install` to repair it",
+				"dir", dir, "uid", uid, "err", err)
+			continue
+		}
+		logger.Info("netd: re-applied the container log directory policy", "dir", dir, "uid", uid)
+	}
 }
 
 // canonicalLBService names the ONE Service whose declaration authorizes a
