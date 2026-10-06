@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "verdict": "stopped",
+  "role": "server",
+  "summary": "io.k3sm.server is disabled",
+  "daemons": [
+    {
+      "name": "netd",
+      "state": "not-loaded",
+      "severity": "fail",
+      "detail": "io.k3sm.netd is not loaded in the system domain",
+      "remedy": "sudo k3sm install",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "0"
+      }
+    },
+    {
+      "name": "server",
+      "state": "disabled",
+      "severity": "fail",
+      "detail": "io.k3sm.server is disabled in the system domain",
+      "remedy": "sudo launchctl enable system/io.k3sm.server\nsudo launchctl kickstart -k system/io.k3sm.server",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "label": "io.k3sm.server",
+        "last-exit": "0",
+        "log-path": "/var/log/k3sm/server.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "3"
+      }
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "verdict": "running",
+  "role": "server",
+  "summary": "the control-plane daemon and netd are running (the apiserver was not probed)",
+  "daemons": [
+    {
+      "name": "netd",
+      "state": "running",
+      "severity": "ok",
+      "detail": "pid 1292 · socket /var/lib/k3sm/run/netd.sock",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "1"
+      }
+    },
+    {
+      "name": "server",
+      "state": "running",
+      "severity": "ok",
+      "detail": "pid 1292",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "label": "io.k3sm.server",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/server.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "1"
+      }
+    }
+  ]
+}

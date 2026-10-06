@@ -160,9 +160,10 @@ var downStates = map[RowState]bool{
 //
 //  1. Not installed wins outright: there is no cluster to have an opinion about.
 //  2. A crash-looping or failed server, or a server that is down while the
-//     apiserver is unreachable, is STOPPED — and the summary names the cause,
-//     because "stopped" alone sends an operator to the wrong log.
-//  3. If the four core rows are ALL unprobeable, UNKNOWN — an ordinary user
+//     apiserver is unreachable (or was not probed: the daemons probe), is
+//     STOPPED — and the summary names the cause, because "stopped" alone sends
+//     an operator to the wrong log.
+//  3. If the core rows (see coreRows) are ALL unprobeable, UNKNOWN — an ordinary user
 //     reading a root daemon's private state. This outranks the Fail/Warn tests
 //     below, and that ordering is the honest one: DEGRADED asserts the control
 //     plane is serving, and a report that could not reach the apiserver has not
@@ -177,7 +178,7 @@ func Aggregate(rows []Row, installed bool, role dataroot.Role) (Verdict, string,
 	if v, summary, ok := stoppedVerdict(rows, role); ok {
 		return v, summary, nextSteps(rows, v)
 	}
-	if allUnknown(rows, RowNetd, nodeRowName(role), RowAPIServer, RowNode) {
+	if allUnknown(rows, coreRows(rows, role)...) {
 		return VerdictUnknown, "could not determine cluster state as this user (re-run with sudo)", nextSteps(rows, VerdictUnknown)
 	}
 	for _, sev := range []Severity{SeverityFail, SeverityWarn} {
@@ -220,10 +221,31 @@ func stoppedVerdict(rows []Row, role dataroot.Role) (Verdict, string, bool) {
 	if role == dataroot.RoleAgent {
 		return VerdictStopped, fmt.Sprintf("%s is %s, so this Mac is not serving pods", name, node.State), true
 	}
-	if api, ok := rowByName(rows, RowAPIServer); ok && api.State == StateDown {
+	api, probed := rowByName(rows, RowAPIServer)
+	if !probed {
+		// The daemons probe reads launchd alone and carries no apiserver row.
+		// With nothing to corroborate against, the daemon is the whole answer,
+		// exactly as it is on a worker. A full report always carries the row,
+		// so this arm never decides its verdict.
+		return VerdictStopped, fmt.Sprintf("%s is %s", name, node.State), true
+	}
+	if api.State == StateDown {
 		return VerdictStopped, fmt.Sprintf("%s is %s and the apiserver is not serving", name, node.State), true
 	}
 	return 0, "", false
+}
+
+// coreRows names the rows whose being ALL unprobeable makes the verdict
+// unknown: netd and this Mac's node daemon, plus the apiserver and node rows
+// when the report probed the apiserver at all. The full report always does;
+// the daemons probe never does, and its unknown is then decided by the two
+// daemons it read.
+func coreRows(rows []Row, role dataroot.Role) []string {
+	names := []string{RowNetd, nodeRowName(role)}
+	if _, probed := rowByName(rows, RowAPIServer); probed {
+		names = append(names, RowAPIServer, RowNode)
+	}
+	return names
 }
 
 // runningSummary is the headline a healthy node gets: the node row's own
@@ -243,6 +265,11 @@ func runningSummary(rows []Row, role dataroot.Role) string {
 	}
 	if role == dataroot.RoleAgent {
 		return "this Mac is a joined worker: the agent daemon is running with a valid node credential"
+	}
+	if _, probed := rowByName(rows, RowAPIServer); !probed {
+		// The daemons probe: launchd says the daemons are up, and nothing
+		// here asked the apiserver whether it is serving.
+		return "the control-plane daemon and netd are running (the apiserver was not probed)"
 	}
 	return "the control plane is serving"
 }

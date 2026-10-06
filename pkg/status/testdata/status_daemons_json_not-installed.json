@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "verdict": "not-installed",
+  "role": "server",
+  "summary": "k3sm is not installed on this Mac",
+  "daemons": [
+    {
+      "name": "netd",
+      "state": "not-loaded",
+      "severity": "fail",
+      "detail": "io.k3sm.netd is not loaded in the system domain",
+      "remedy": "sudo k3sm install",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "0"
+      }
+    },
+    {
+      "name": "server",
+      "state": "not-loaded",
+      "severity": "fail",
+      "detail": "io.k3sm.server is not loaded in the system domain",
+      "remedy": "sudo k3sm install",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "label": "io.k3sm.server",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/server.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "0"
+      }
+    }
+  ]
+}

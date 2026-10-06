@@ -65,23 +65,9 @@ func (c Collector) Collect(ctx context.Context) Report {
 	role, _, bothRoles := c.installedRole()
 
 	dataRoot, volume := c.dataRootRow(ctx, role)
-	instRow, installed := c.installRow(volume != nil, role, bothRoles)
-	netd, _ := c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
-	var node Row
-	var nodePID int
-	// credential is the worker's node credential state, read once: the agent
-	// row reports it, and the apiserver row needs it to tell "this Mac has not
-	// joined" apart from "the control plane is down". It stays unknown on a
-	// server, which holds no such credential.
-	credential := CredentialUnknown
-	if role == dataroot.RoleAgent {
-		node, nodePID, credential = c.agentRow(now())
-	} else {
-		node, nodePID = c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
-		c.crashLoop(&node)
-		c.stagedControlPlane(&node)
-	}
-	apiserver := c.apiserverRow(ctx, role, credential)
+	ld := c.launchdRows(now(), role, bothRoles, volume != nil)
+	instRow, installed, netd, node, nodePID := ld.install, ld.installed, ld.netd, ld.node, ld.nodePID
+	apiserver := c.apiserverRow(ctx, role, ld.credential)
 	serving := apiserver.Severity == SeverityOK
 	// The node list is read ONCE and handed to both rows that use it, so the
 	// node row and the workloads row describe the same snapshot: two reads
@@ -153,15 +139,50 @@ func (c Collector) Collect(ctx context.Context) Report {
 
 	verdict, summary, next := Aggregate(rows, installed, role)
 	return Report{
-		Verdict:   verdict,
-		Role:      role,
-		Summary:   summary,
-		Rows:      rows,
-		Next:      next,
-		Version:   c.Version,
-		Host:      c.Host,
-		Timestamp: now(),
+		SchemaVersion: SchemaVersion,
+		Verdict:       verdict,
+		Role:          role,
+		Summary:       summary,
+		Rows:          rows,
+		Next:          next,
+		Version:       c.Version,
+		Host:          c.Host,
+		Timestamp:     now(),
 	}
+}
+
+// launchdView is the part of a report that launchd and the local disk answer
+// on their own: the install row, netd, and this Mac's node daemon. It is built
+// by ONE method so the full report and the daemons probe carry the same rows,
+// produced by the same builders, and can never describe a daemon differently.
+type launchdView struct {
+	install   Row
+	installed bool
+	netd      Row
+	node      Row
+	nodePID   int
+	// credential is the worker's node credential state, read once: the agent
+	// row reports it, and the apiserver row needs it to tell "this Mac has not
+	// joined" apart from "the control plane is down". It stays unknown on a
+	// server, which holds no such credential.
+	credential CredentialState
+}
+
+// launchdRows builds the launchdView. hasDataVolume is whether this Mac's data
+// root is a data volume, which decides whether the install row demands the
+// mount job's plist.
+func (c Collector) launchdRows(now time.Time, role dataroot.Role, bothRoles, hasDataVolume bool) launchdView {
+	v := launchdView{credential: CredentialUnknown}
+	v.install, v.installed = c.installRow(hasDataVolume, role, bothRoles)
+	v.netd, _ = c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
+	if role == dataroot.RoleAgent {
+		v.node, v.nodePID, v.credential = c.agentRow(now)
+	} else {
+		v.node, v.nodePID = c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
+		c.crashLoop(&v.node)
+		c.stagedControlPlane(&v.node)
+	}
+	return v
 }
 
 // exists reports whether path is there, through the FS seam.
@@ -951,11 +972,7 @@ func (c Collector) dataRootRow(ctx context.Context, role dataroot.Role) (Row, *d
 		row.Detail = "the data root was not probed"
 		return row, nil
 	}
-	recordPath := c.Paths.DatavolRecord
-	if recordPath == "" {
-		recordPath = dataroot.DefaultRecordPath
-	}
-	st, err := dataroot.ReadWithRecord(c.DataRoot, c.Paths.DataRoot, recordPath)
+	st, err := dataroot.ReadWithRecord(c.DataRoot, c.Paths.DataRoot, c.datavolRecordPath())
 	if err != nil {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "could not read " + c.Paths.DataRoot + ": " + errText(err)

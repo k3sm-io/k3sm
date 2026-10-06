@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "verdict": "degraded",
+  "role": "server",
+  "summary": "netd: launchd reports running, but pid 1292 is not in the process table · socket /var/lib/k3sm/run/netd.sock",
+  "daemons": [
+    {
+      "name": "netd",
+      "state": "unknown",
+      "severity": "warn",
+      "detail": "launchd reports running, but pid 1292 is not in the process table · socket /var/lib/k3sm/run/netd.sock",
+      "remedy": "sudo launchctl kickstart -k system/io.k3sm.netd",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "1"
+      }
+    },
+    {
+      "name": "server",
+      "state": "unknown",
+      "severity": "warn",
+      "detail": "launchd reports running, but pid 1292 is not in the process table",
+      "remedy": "sudo launchctl kickstart -k system/io.k3sm.server",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "label": "io.k3sm.server",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/server.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "1"
+      }
+    }
+  ]
+}

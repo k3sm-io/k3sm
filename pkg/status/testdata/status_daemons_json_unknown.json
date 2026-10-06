@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "verdict": "unknown",
+  "role": "server",
+  "summary": "could not determine cluster state as this user (re-run with sudo)",
+  "daemons": [
+    {
+      "name": "netd",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "launchctl reported a state this build cannot read",
+      "remedy": "sudo k3sm status",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "0"
+      }
+    },
+    {
+      "name": "server",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "launchctl reported a state this build cannot read",
+      "remedy": "sudo k3sm status",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "label": "io.k3sm.server",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/server.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "0"
+      }
+    }
+  ]
+}
