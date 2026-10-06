@@ -232,6 +232,13 @@ const (
 	ContainerLogsDir = podlogs.ContainerLogsDir
 )
 
+// ContainerLogDirs returns every directory of the container-log tree the
+// installer hands to the service user through System.EnsureContainerLogDir, in
+// the order it ensures them. It is the one list both the installer and the root
+// netd job (which re-applies the policy at every start, so a tree an OS upgrade
+// removed comes back on the next boot) iterate, so the two cannot drift.
+func ContainerLogDirs() []string { return []string{PodLogsDir, ContainerLogsDir} }
+
 // ContainerLogDirMode and ContainerLogDirGID are the ownership POLICY for the
 // container-log tree: service-user-owned, group WHEEL (gid 0), mode 0700.
 //
@@ -1924,7 +1931,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     node refuses to start without it, and only root can create it owned by
 	//     the service user with a mode that does not expose every pod's output to
 	//     every local account.
-	for _, dir := range []string{PodLogsDir, ContainerLogsDir} {
+	for _, dir := range ContainerLogDirs() {
 		if err := sys.EnsureContainerLogDir(dir, uid); err != nil {
 			return fmt.Errorf("install: ensure container log dir %s: %w", dir, err)
 		}

@@ -23,6 +23,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // TestContainerLogFlagsMatchKubeletDefaults pins the container-log flag surface:
@@ -116,6 +118,9 @@ func TestContainerLogFlagsMatchKubeletDefaults(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "k3sm install") {
 			t.Errorf("err = %v, want it to name `k3sm install`", err)
+		}
+		if !strings.Contains(err.Error(), "kickstart -k system/"+install.NetdLabel) {
+			t.Errorf("err = %v, want it to name the %s restart that repairs it", err, install.NetdLabel)
 		}
 		if _, statErr := os.Stat(missing.dir); statErr == nil {
 			t.Error("ensureWritable CREATED the directory; it must refuse instead")
