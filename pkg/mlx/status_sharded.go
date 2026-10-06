@@ -54,8 +54,8 @@ const (
 	ReasonInsufficientMemory = "InsufficientMemory"
 	// ReasonInsufficientGPU means too few candidate nodes have a free
 	// mlx.k3sm.io/gpu slot: every slot on the others is held by pods of other
-	// models (or other GPU workloads), so a rank placed there would fail node
-	// admission and restart the gang.
+	// models (or other GPU workloads), so a rank placed there could not get the
+	// extended resource and the gang would restart.
 	ReasonInsufficientGPU = "InsufficientGPU"
 )
 

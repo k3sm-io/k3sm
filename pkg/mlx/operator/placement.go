@@ -95,7 +95,7 @@ func (e *PlacementError) Error() string { return e.Reason + ": " + e.Message }
 //     mlx.k3sm.io/gpu resource. Fewer than ranks candidates is
 //     NoDirectLinkTopology.
 //   - A candidate whose GPU slots are all held by other pods is skipped: a
-//     rank bound there fails node admission and restarts the gang. Fewer than
+//     rank bound there cannot get the extended resource and restarts the gang. Fewer than
 //     ranks candidates with a free slot is InsufficientGPU, naming the held
 //     nodes.
 //   - Fewer than ranks free candidates whose allocatable memory holds the
@@ -265,18 +265,18 @@ func hasGPU(node *corev1.Node) bool {
 }
 
 // gpuSlotFree reports whether one more rank's GPU slot fits on node beside the
-// held units. The arithmetic is mlx.GPUFits, the one home of the capacity rule,
-// applied to slot units instead of bytes: the node's allocatable slot count is
-// the ceiling (it is what mlx.GPUSlots advertised), held is the admitted total,
-// and a rank wants one slot. Only the verdict is read; the refusal message is
-// Place's, because GPUFits words its own in bytes.
+// held units. This is the scheduler's extended-resource rule over slot units:
+// the node's allocatable mlx.k3sm.io/gpu count (what mlx.GPUSlots advertised)
+// minus the slots already requested on it. A node advertising no slot is never
+// free. The provider's byte-level admission (mlx.GPUFits) still runs later and
+// is not mirrored here.
 func gpuSlotFree(node *corev1.Node, held int64) bool {
 	slots := node.Status.Allocatable[corev1.ResourceName(mlxv1alpha1.ResourceGPU)]
-	return mlx.GPUFits(slots.Value(), held, 1) == nil
+	return slots.Value()-held >= 1
 }
 
 // HeldGPUSlots sums, per node, the mlx.k3sm.io/gpu units requested by the pods
-// bound there, which is what node admission counts a new GPU pod against.
+// bound there: the extended-resource total the scheduler counts a new GPU pod against.
 //
 // Two kinds of pod hold nothing. An ended pod (Succeeded or Failed) has released
 // its slot. The model's OWN rank Pods are excluded too: placement runs only once
