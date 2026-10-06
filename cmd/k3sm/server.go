@@ -428,7 +428,8 @@ func runServer(args []string) (err error) {
 	ctx, crashCancel := context.WithCancel(ctx)
 	defer crashCancel()
 	var crashedComponent atomic.Pointer[string]
-	cfg.OnComponentExit = componentExitHandler(&crashedComponent, breaker, crashCancel, logger)
+	var cpProbe supervisedProbe // filled by startControlPlane once the executor exists
+	cfg.OnComponentExit = componentExitHandler(&crashedComponent, breaker, &cpProbe, crashCancel, logger)
 	// A crash cancels ctx, so most errors below would be a bare "context canceled"
 	// (and startNode's a nil). Rewriting err here, once, names the crashed
 	// component on every return path after this point (componentExitHandler).
@@ -456,7 +457,7 @@ func runServer(args []string) (err error) {
 	defer func() { meshTeardownOnExit(ctx, meshDown, logger) }()
 
 	// The HA etcd member route, then the supervised executor (startControlPlane).
-	plan, exec, err := startControlPlane(ctx, opts, mode, cfg, pki, breaker, logger)
+	plan, exec, err := startControlPlane(ctx, opts, mode, cfg, pki, breaker, &cpProbe, logger)
 	if err != nil {
 		return err
 	}

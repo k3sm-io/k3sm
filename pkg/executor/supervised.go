@@ -298,6 +298,38 @@ var _ Executor = (*Supervised)(nil)
 // Kubeconfig returns the admin kubeconfig path.
 func (s *Supervised) Kubeconfig() string { return kubeconfigPath(s.cfg.WorkDir) }
 
+// LeaderElected reports whether this control plane runs kube-scheduler and
+// kube-controller-manager with --leader-elect=true (the HA posture). A consumer
+// of OnComponentExit reads it to tell a lost-lease exit from a crash: with
+// leader election off neither component can lose a lease.
+func (s *Supervised) LeaderElected() bool { return s.cfg.leaderElect() }
+
+// ComponentExited reports whether the named child — "kine", "etcd",
+// "kube-apiserver", "kube-scheduler" or "kube-controller-manager" — has exited,
+// asked of the kernel as well as of its reaper so the answer does not wait on
+// the reaper goroutine being scheduled. A name this executor never spawned (kine
+// on an etcd server) reports false: there is no child of that name to be dead.
+// Safe to call from OnComponentExit, which runs outside mu.
+func (s *Supervised) ComponentExited(name string) bool {
+	s.mu.Lock()
+	var c *component
+	for _, cand := range s.comps {
+		if cand.name == name {
+			c = cand
+		}
+	}
+	s.mu.Unlock()
+	if c == nil {
+		return false
+	}
+	select {
+	case <-c.exited:
+		return true
+	default:
+		return c.exitedNow()
+	}
+}
+
 // RESTConfigToken returns the apiserver URL and static token.
 func (s *Supervised) RESTConfigToken() (string, string) {
 	return apiServerURL(s.cfg), s.currentToken()

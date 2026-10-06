@@ -84,6 +84,20 @@ const (
 	// not count) and the reset (a bring-up that stays healthy this long clears
 	// the record).
 	CrashLoopWindow = 10 * time.Minute
+	// LeaderLostThreshold is how many leader-lease losses inside CrashLoopWindow
+	// trip the breaker. A lease loss is not a crash: on an HA server that loses
+	// etcd quorum, kube-controller-manager and kube-scheduler exit on purpose
+	// (upstream's OnStoppedLeading), and the daemon restarts to take part in the
+	// next election. So these entries never count toward CrashLoopThreshold, and
+	// they get a bound of their own only so that a lease that flaps forever
+	// cannot restart the daemon forever. Twice the crash threshold, not more,
+	// because the count shares the crash window and must stay reachable inside
+	// it: one lap is a daemon restart, a bring-up (tens of seconds once quorum is
+	// back), the upstream 15 s lease duration before a new holder can acquire,
+	// and the 10 s renew deadline before it loses the lease again — roughly a
+	// minute, so ten laps fit the ten-minute window while a few quorum blips do
+	// not come close.
+	LeaderLostThreshold = 2 * CrashLoopThreshold
 	// crashLoopFile is the record's name under the work dir.
 	crashLoopFile = "crashloop.json"
 )
@@ -93,6 +107,10 @@ const (
 // crash, and one that never came up at all is a bring-up failure an operator
 // will look for in a different part of the log. The give-up is the same for
 // both — the breaker counts them together and the park ends the same way.
+//
+// The third origin is not a failure: a leader-elected component that exited
+// because it lost its lease. It is recorded so an operator can see it, and it
+// is counted apart from the other two (LeaderLostThreshold).
 const (
 	// CrashOriginCrash is a component that was supervised and then exited
 	// (OnComponentExit's path).
@@ -101,13 +119,18 @@ const (
 	// provision step or a component that would not start, listen, or stay up
 	// (BringUpError's path).
 	CrashOriginBringUp = "bring-up"
+	// CrashOriginLeaderLost is a supervised kube-controller-manager or
+	// kube-scheduler that exited because it lost its leader lease while the
+	// rest of the control plane was alive — upstream's intended exit on an HA
+	// server that lost etcd quorum, not a crash. cmd/k3sm classifies it.
+	CrashOriginLeaderLost = "leader-lost"
 )
 
 // Crash is one control-plane failure the breaker counted.
 type Crash struct {
 	At        time.Time `json:"at"`
 	Component string    `json:"component"`
-	// Origin is CrashOriginCrash or CrashOriginBringUp. It is omitempty, and an
+	// Origin is CrashOriginCrash, CrashOriginBringUp or CrashOriginLeaderLost. It is omitempty, and an
 	// empty value reads as a crash: records written before the daemon counted
 	// bring-up failures hold only crashes.
 	Origin string `json:"origin,omitempty"`
@@ -228,10 +251,26 @@ func (r *CrashRecord) RecordPermanent(now time.Time, origin, component, detail, 
 		Permanent: true, Remedy: remedy})
 }
 
+// RecordLeaderLost appends one leader-lease loss and trips the breaker when the
+// window now holds LeaderLostThreshold of them. Lease losses never count toward
+// CrashLoopThreshold, and crashes never count toward this one. It reports
+// whether THIS call tripped the breaker.
+func (r *CrashRecord) RecordLeaderLost(now time.Time, component, detail string) (tripped bool) {
+	r.Crashes = append(r.Crashes, Crash{At: now, Origin: CrashOriginLeaderLost, Component: component, Detail: detail})
+	r.Prune(now)
+	return r.trip(now, r.LeaderLost(now) >= LeaderLostThreshold)
+}
+
 func (r *CrashRecord) record(now time.Time, c Crash) (tripped bool) {
 	r.Crashes = append(r.Crashes, c)
 	r.Prune(now)
-	if r.TrippedAt == nil && (c.Permanent || len(r.Crashes) >= CrashLoopThreshold) {
+	return r.trip(now, c.Permanent || r.Recent(now) >= CrashLoopThreshold)
+}
+
+// trip opens the breaker when reached and it is not open already, and reports
+// whether it did.
+func (r *CrashRecord) trip(now time.Time, reached bool) bool {
+	if r.TrippedAt == nil && reached {
 		t := now
 		r.TrippedAt = &t
 		return true
@@ -243,12 +282,23 @@ func (r *CrashRecord) record(now time.Time, c Crash) (tripped bool) {
 // bring up.
 func (r CrashRecord) Tripped() bool { return r.TrippedAt != nil }
 
-// Recent counts the crashes inside the window ending at now.
+// Recent counts the crashes and bring-up failures inside the window ending at
+// now — the entries CrashLoopThreshold counts. Leader-lease losses are not
+// failures and are counted by LeaderLost instead.
 func (r CrashRecord) Recent(now time.Time) int {
+	return r.count(now, func(c Crash) bool { return c.Origin != CrashOriginLeaderLost })
+}
+
+// LeaderLost counts the leader-lease losses inside the window ending at now.
+func (r CrashRecord) LeaderLost(now time.Time) int {
+	return r.count(now, func(c Crash) bool { return c.Origin == CrashOriginLeaderLost })
+}
+
+func (r CrashRecord) count(now time.Time, match func(Crash) bool) int {
 	cutoff := now.Add(-CrashLoopWindow)
 	n := 0
 	for _, c := range r.Crashes {
-		if !c.At.Before(cutoff) {
+		if !c.At.Before(cutoff) && match(c) {
 			n++
 		}
 	}

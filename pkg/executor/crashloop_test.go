@@ -248,3 +248,33 @@ func TestRecordPermanentTripsOnFirst(t *testing.T) {
 		t.Error("one unclassified failure tripped the breaker")
 	}
 }
+
+// Leader-lease losses and failures are two counts over one window: neither
+// moves the other's threshold, and each trips at its own.
+func TestRecordLeaderLostCountsApart(t *testing.T) {
+	t0 := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	var r CrashRecord
+	for i := 0; i < LeaderLostThreshold-1; i++ {
+		if r.RecordLeaderLost(t0.Add(time.Duration(i)*time.Second), "kube-controller-manager", "tail") {
+			t.Fatalf("lease loss %d tripped, want the trip at %d", i+1, LeaderLostThreshold)
+		}
+	}
+	now := t0.Add(time.Minute)
+	if r.Recent(now) != 0 || r.LeaderLost(now) != LeaderLostThreshold-1 {
+		t.Fatalf("Recent=%d LeaderLost=%d, want 0 and %d", r.Recent(now), r.LeaderLost(now), LeaderLostThreshold-1)
+	}
+	if r.Record(now, CrashOriginCrash, "kine", "tail") {
+		t.Fatal("one crash after lease losses tripped the crash threshold")
+	}
+	if !r.RecordLeaderLost(now.Add(time.Second), "kube-scheduler", "tail") {
+		t.Fatalf("lease loss %d did not trip", LeaderLostThreshold)
+	}
+}
+
+// A name the executor never spawned is not a dead child.
+func TestComponentExitedUnspawnedIsNotDead(t *testing.T) {
+	s := NewSupervised(Config{WorkDir: t.TempDir()})
+	if s.ComponentExited("kine") {
+		t.Fatal("an unspawned component reported exited")
+	}
+}
