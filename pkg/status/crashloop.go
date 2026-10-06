@@ -96,9 +96,9 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 			n := rec.LeaderLost(*rec.TrippedAt)
 			return CrashLoopVerdict{
 				Posture: PostureParked,
-				Detail: fmt.Sprintf("crash-loop breaker tripped at %s on repeated leader-lease loss: %s lost its leader lease %d times within %s, so this server keeps losing etcd quorum; the daemon is parked and serves nothing",
+				Detail: fmt.Sprintf("crash-loop breaker tripped at %s on repeated leader-lease loss: %s lost its leader lease %d times within %s while its etcd, kine and apiserver children were running (lost etcd quorum, an overloaded apiserver or datastore, or a clock jump all do this); the daemon is parked and serves nothing, which also removes it as an etcd voter",
 					rec.TrippedAt.Format(time.RFC3339), last.Component, n, executor.CrashLoopWindow),
-				Remedy:     "restore etcd quorum between the servers (sudo k3sm status on each), then sudo k3sm server --clear-crashloop   # the parked daemon restarts itself",
+				Remedy:     "find why the lease is not renewed: etcd quorum and apiserver health on every server (sudo k3sm status on each), then sudo k3sm server --clear-crashloop   # the parked daemon restarts itself",
 				LeaderLost: lostNote,
 			}
 		}
@@ -143,9 +143,9 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 		lost := lastLeaderLost(rec)
 		return CrashLoopVerdict{
 			Posture: PostureRestarting,
-			Detail: fmt.Sprintf("lost the leader lease %d times in the last %s (last: %s at %s): this server keeps losing etcd quorum; each loss restarts the daemon and is not a crash; trips at %d",
+			Detail: fmt.Sprintf("lost the leader lease %d times in the last %s (last: %s at %s) while the control plane kept running; each loss restarts the daemon and is not a crash; trips at %d",
 				n, executor.CrashLoopWindow, lost.Component, lost.At.Format(time.RFC3339), executor.LeaderLostThreshold),
-			Remedy:     "sudo k3sm status   # on every server: is etcd quorum flapping?",
+			Remedy:     "sudo k3sm status   # on every server: is etcd quorum or the apiserver flapping?",
 			LeaderLost: lostNote,
 		}
 	}

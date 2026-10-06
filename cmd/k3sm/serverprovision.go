@@ -466,9 +466,9 @@ func componentExitHandler(crashed *atomic.Pointer[string], breaker *crashBreaker
 				}
 			} else {
 				logger.Warn("control-plane component lost its leader lease and exited as upstream does; restarting the daemon so it rejoins the election (not counted as a crash)",
-					"component", name, "exit-code", leaseLossExitCode, "log", logPath)
+					"component", name, "exit-code", leaseLossExitCode, "log", logPath, "log-tail", logTail)
 				if breaker.recordLeaderLost(name, logTail) {
-					logger.Error("crash-loop breaker tripped on repeated leader-lease loss; this server keeps losing etcd quorum and the next start will park until an operator clears the record",
+					logger.Error("crash-loop breaker tripped on repeated leader-lease loss while its etcd, kine and apiserver children were running; the next start will park until an operator clears the record",
 						"path", breaker.path, "threshold", executor.LeaderLostThreshold, "window", executor.CrashLoopWindow)
 				}
 			}
