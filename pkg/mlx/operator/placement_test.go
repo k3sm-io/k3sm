@@ -142,7 +142,7 @@ func TestPlace(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := Place(tc.model, tc.graph, tc.nodes)
+			p, err := Place(tc.model, tc.graph, tc.nodes, nil)
 			if tc.wantReason != "" {
 				var pe *PlacementError
 				if !errors.As(err, &pe) {
@@ -193,7 +193,7 @@ func withRuntime(m *mlxv1alpha1.MLXModel) *mlxv1alpha1.MLXModel {
 func TestPlaceJACCLDevicesIndexedByPeerRank(t *testing.T) {
 	g := cable(cable(cable(topology.Graph{}, "a", "b", true), "b", "c", true), "a", "c", true)
 	nodes := []corev1.Node{gpuNode("a", "64Gi", true), gpuNode("b", "64Gi", true), gpuNode("c", "64Gi", true)}
-	p, err := Place(shardSpec(3, mlxv1alpha1.MLXDistributedBackendJACCL, "48Gi"), g, nodes)
+	p, err := Place(shardSpec(3, mlxv1alpha1.MLXDistributedBackendJACCL, "48Gi"), g, nodes, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestPlaceJACCLDevicesIndexedByPeerRank(t *testing.T) {
 	}
 	// Determinism: node input order never changes the answer.
 	rev := []corev1.Node{nodes[2], nodes[0], nodes[1]}
-	q, err := Place(shardSpec(3, mlxv1alpha1.MLXDistributedBackendJACCL, "48Gi"), g, rev)
+	q, err := Place(shardSpec(3, mlxv1alpha1.MLXDistributedBackendJACCL, "48Gi"), g, rev, nil)
 	if err != nil || !reflect.DeepEqual(p, q) {
 		t.Errorf("Place over reordered nodes = %+v, %v; want %+v", q, err, p)
 	}

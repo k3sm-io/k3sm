@@ -66,7 +66,8 @@ func StaticTopology(g topology.Graph) Topology {
 // a single-node fallback: a sharding request served on one node would look
 // like success.
 type PlacementError struct {
-	// Reason is mlx.ReasonNoDirectLinkTopology or mlx.ReasonInsufficientMemory.
+	// Reason is mlx.ReasonNoDirectLinkTopology, mlx.ReasonInsufficientGPU or
+	// mlx.ReasonInsufficientMemory.
 	Reason string
 	// Message names what was missing.
 	Message string
@@ -75,9 +76,13 @@ type PlacementError struct {
 // Error returns the message prefixed by the reason.
 func (e *PlacementError) Error() string { return e.Reason + ": " + e.Message }
 
-// Place decides where a sharded model's ranks run. It is pure: the graph and
-// nodes are inputs, nothing is read or written, and the same inputs always give
-// the same placement.
+// Place decides where a sharded model's ranks run. It is pure: the graph, the
+// nodes and the held GPU slots are inputs, nothing is read or written, and the
+// same inputs always give the same placement.
+//
+// held is the number of mlx.k3sm.io/gpu units already requested on each node by
+// pods that are not this model's own ranks (see HeldGPUSlots); a missing node
+// holds none.
 //
 // The rules, in order:
 //
@@ -88,8 +93,13 @@ func (e *PlacementError) Error() string { return e.Reason + ": " + e.Message }
 //     selector (spec.nodeSelector under the darwin and GPU-present guardrails,
 //     the same selector the rank Pod carries), and advertises the
 //     mlx.k3sm.io/gpu resource. Fewer than ranks candidates is
-//     NoDirectLinkTopology; fewer than ranks candidates whose allocatable
-//     memory holds the per-rank share is InsufficientMemory.
+//     NoDirectLinkTopology.
+//   - A candidate whose GPU slots are all held by other pods is skipped: a
+//     rank bound there fails node admission and restarts the gang. Fewer than
+//     ranks candidates with a free slot is InsufficientGPU, naming the held
+//     nodes.
+//   - Fewer than ranks free candidates whose allocatable memory holds the
+//     per-rank share is InsufficientMemory.
 //   - jaccl needs a CLIQUE of ranks fitting nodes, every one labelled
 //     k3sm.io/rdma, with RDMA at both ends of every link.
 //   - ring prefers a CYCLE of ranks fitting nodes in the cable graph, so every
@@ -100,7 +110,7 @@ func (e *PlacementError) Error() string { return e.Reason + ": " + e.Message }
 // Among equal choices the lexicographically first wins (the topology searches
 // are ordered), so a gang restart over an unchanged cluster lands every rank
 // where it was.
-func Place(model *mlxv1alpha1.MLXModel, graph topology.Graph, nodes []corev1.Node) (Placement, error) {
+func Place(model *mlxv1alpha1.MLXModel, graph topology.Graph, nodes []corev1.Node, held map[string]int64) (Placement, error) {
 	d := model.Spec.Distributed
 	if d == nil || d.Ranks < 2 {
 		return Placement{}, &PlacementError{Reason: mlx.ReasonNoDirectLinkTopology, Message: "spec.distributed.ranks must be at least 2"}
@@ -120,7 +130,7 @@ func Place(model *mlxv1alpha1.MLXModel, graph topology.Graph, nodes []corev1.Nod
 
 	sorted := slices.Clone(nodes)
 	slices.SortFunc(sorted, func(a, b corev1.Node) int { return strings.Compare(a.Name, b.Name) })
-	var candidates, fitting []string
+	var candidates, free, heldNodes, fitting []string
 	byName := map[string]*corev1.Node{}
 	for i := range sorted {
 		node := &sorted[i]
@@ -129,6 +139,11 @@ func Place(model *mlxv1alpha1.MLXModel, graph topology.Graph, nodes []corev1.Nod
 		}
 		candidates = append(candidates, node.Name)
 		byName[node.Name] = node
+		if !gpuSlotFree(node, held[node.Name]) {
+			heldNodes = append(heldNodes, node.Name)
+			continue
+		}
+		free = append(free, node.Name)
 		if mem, ok := node.Status.Allocatable[corev1.ResourceMemory]; ok && mem.Cmp(perRank) >= 0 {
 			fitting = append(fitting, node.Name)
 		}
@@ -140,11 +155,18 @@ func Place(model *mlxv1alpha1.MLXModel, graph topology.Graph, nodes []corev1.Nod
 				n, n, mlxv1alpha1.ResourceGPU, len(candidates), nameList(candidates)),
 		}
 	}
+	if len(free) < n {
+		return Placement{}, &PlacementError{
+			Reason: mlx.ReasonInsufficientGPU,
+			Message: fmt.Sprintf("%d ranks need %d nodes with a free %s slot; every slot is held by other pods on %d of %d candidate nodes%s",
+				n, n, mlxv1alpha1.ResourceGPU, len(heldNodes), len(candidates), nameList(heldNodes)),
+		}
+	}
 	if len(fitting) < n {
 		return Placement{}, &PlacementError{
 			Reason: mlx.ReasonInsufficientMemory,
 			Message: fmt.Sprintf("each of %d ranks needs %s of allocatable memory; %d of %d candidate nodes have it%s",
-				n, perRank.String(), len(fitting), len(candidates), nameList(fitting)),
+				n, perRank.String(), len(fitting), len(free), nameList(fitting)),
 		}
 	}
 
@@ -240,6 +262,75 @@ func nodeReady(node *corev1.Node) bool {
 func hasGPU(node *corev1.Node) bool {
 	q, ok := node.Status.Allocatable[corev1.ResourceName(mlxv1alpha1.ResourceGPU)]
 	return ok && q.Cmp(*resource.NewQuantity(1, resource.DecimalSI)) >= 0
+}
+
+// gpuSlotFree reports whether one more rank's GPU slot fits on node beside the
+// held units. The arithmetic is mlx.GPUFits, the one home of the capacity rule,
+// applied to slot units instead of bytes: the node's allocatable slot count is
+// the ceiling (it is what mlx.GPUSlots advertised), held is the admitted total,
+// and a rank wants one slot. Only the verdict is read; the refusal message is
+// Place's, because GPUFits words its own in bytes.
+func gpuSlotFree(node *corev1.Node, held int64) bool {
+	slots := node.Status.Allocatable[corev1.ResourceName(mlxv1alpha1.ResourceGPU)]
+	return mlx.GPUFits(slots.Value(), held, 1) == nil
+}
+
+// HeldGPUSlots sums, per node, the mlx.k3sm.io/gpu units requested by the pods
+// bound there, which is what node admission counts a new GPU pod against.
+//
+// Two kinds of pod hold nothing. An ended pod (Succeeded or Failed) has released
+// its slot. The model's OWN rank Pods are excluded too: placement runs only once
+// they are gone or going, and a gang restart re-placing onto the nodes its own
+// terminating ranks still occupy must not refuse itself. An unbound pod holds no
+// node's slot yet.
+func HeldGPUSlots(model *mlxv1alpha1.MLXModel, pods []corev1.Pod) map[string]int64 {
+	own, err := labels.Parse(mlx.ShardedSelector(model.Name))
+	if err != nil {
+		own = labels.Nothing()
+	}
+	held := map[string]int64{}
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Spec.NodeName == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if pod.Namespace == model.Namespace && own.Matches(labels.Set(pod.Labels)) {
+			continue
+		}
+		if units := podGPUUnits(pod); units > 0 {
+			held[pod.Spec.NodeName] += units
+		}
+	}
+	return held
+}
+
+// podGPUUnits is a pod's effective mlx.k3sm.io/gpu request, by the scheduler's
+// rule: the app containers plus the restartable (sidecar) init containers run
+// together, and each ordinary init container runs alone, so the pod needs the
+// larger of the two. A container's limit is read first, since an extended
+// resource's request defaults to (and must equal) its limit.
+func podGPUUnits(pod *corev1.Pod) int64 {
+	gpu := corev1.ResourceName(mlxv1alpha1.ResourceGPU)
+	units := func(c *corev1.Container) int64 {
+		if q, ok := c.Resources.Limits[gpu]; ok {
+			return q.Value()
+		}
+		q := c.Resources.Requests[gpu]
+		return q.Value()
+	}
+	var running, initPeak int64
+	for i := range pod.Spec.Containers {
+		running += units(&pod.Spec.Containers[i])
+	}
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			running += units(c)
+			continue
+		}
+		initPeak = max(initPeak, units(c))
+	}
+	return max(running, initPeak)
 }
 
 // subset reports whether every element of a is in b.
