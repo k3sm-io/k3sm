@@ -322,6 +322,26 @@ func TestShardedRefusalsAreStatuses(t *testing.T) {
 		})
 	}
 
+	t.Run("gpu_held_by_another_model", func(t *testing.T) {
+		h, _ := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(), topology.Graph{})
+		other := gpuPod("elsewhere", "other-model-0", "mac-b", 1)
+		if _, err := h.kube.CoreV1().Pods(other.Namespace).Create(context.Background(), &other, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("seed pod: %v", err)
+		}
+		h.reconcile(t)
+		if n := len(h.rankPods(t)); n != 0 {
+			t.Errorf("%d rank pods created onto a held GPU", n)
+		}
+		s := h.status(t)
+		c := condition(t, s, mlx.ConditionShardsPlaced)
+		if c.Status != metav1.ConditionFalse || c.Reason != mlx.ReasonInsufficientGPU || !strings.Contains(c.Message, "(mac-b)") {
+			t.Errorf("ShardsPlaced = %s/%s %q, want False/%s naming mac-b", c.Status, c.Reason, c.Message, mlx.ReasonInsufficientGPU)
+		}
+		if s.Phase != mlxv1alpha1.MLXModelPhasePending {
+			t.Errorf("phase = %s, want Pending", s.Phase)
+		}
+	})
+
 	t.Run("two_replicas_is_an_invalid_spec", func(t *testing.T) {
 		m := shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing)
 		m.Spec.Replicas = ptr.To(int32(2))

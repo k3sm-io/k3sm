@@ -52,6 +52,11 @@ const (
 	// ReasonInsufficientMemory means the per-rank share of spec.memory does not
 	// fit on enough candidate nodes, or cannot fund a serving context at all.
 	ReasonInsufficientMemory = "InsufficientMemory"
+	// ReasonInsufficientGPU means too few candidate nodes have a free
+	// mlx.k3sm.io/gpu slot: every slot on the others is held by pods of other
+	// models (or other GPU workloads), so a rank placed there could not get the
+	// extended resource and the gang would restart.
+	ReasonInsufficientGPU = "InsufficientGPU"
 )
 
 // Reasons carried by LinksHealthy.

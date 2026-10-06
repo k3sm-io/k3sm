@@ -198,7 +198,13 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	if err != nil {
 		return fmt.Errorf("list nodes for mlxmodel %s: %w", key, err)
 	}
-	placement, err := Place(model, graph, nodes.Items)
+	// Every pod in the cluster, not only this namespace's: a GPU slot is a node
+	// resource, and a model in another namespace holds it just the same.
+	allPods, err := c.client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list pods for mlxmodel %s gpu slots: %w", key, err)
+	}
+	placement, err := Place(model, graph, nodes.Items, HeldGPUSlots(model, allPods.Items))
 	var refused *PlacementError
 	if errors.As(err, &refused) {
 		c.log.Info("sharded mlxmodel cannot be placed yet; no rank pod created",
