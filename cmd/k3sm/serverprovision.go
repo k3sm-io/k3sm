@@ -326,18 +326,14 @@ func serverExecutorConfig(opts serverOptions, encryptionConfig string, logger *s
 // kubeconfig, the mesh nodeIP rewrite, and the apiserver's mesh-bound,
 // cluster-CA-served posture written into cfg.
 func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Logger) (*certs.Hierarchy, string, error) {
-	h, err := certs.EnsureHierarchy(opts.workDir)
+	// The posture's CAs (in HA the etcd server + peer CAs too, which ride the same
+	// bootstrap bundle). A joined server (--server-join) LOADS what its import
+	// installed and never mints: an absent CA is certs.ErrCANotImported, including
+	// --server-join without --server, which imports nothing. A non-HA mesh server
+	// mints no etcd CA.
+	h, err := certs.EnsureHierarchy(opts.workDir, opts.role(), opts.posture())
 	if err != nil {
 		return nil, "", fmt.Errorf("ensure CA hierarchy: %w", err)
-	}
-	// HA only: the etcd server + peer CAs ride the same bootstrap bundle (a
-	// joining server's import wrote them, so this LOADS them). A non-HA mesh
-	// server mints none.
-	if opts.etcdPosture() {
-		h.EtcdServer, h.EtcdPeer, err = certs.EnsureEtcdCAs(opts.workDir)
-		if err != nil {
-			return nil, "", fmt.Errorf("ensure etcd CAs: %w", err)
-		}
 	}
 	// The server-bootstrap secret (machine-generated ≥256-bit) — minted +
 	// persisted on the first server, already saved by importServerCABundle on a

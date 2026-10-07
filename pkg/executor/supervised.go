@@ -519,8 +519,8 @@ func (s *Supervised) provision(ctx context.Context) error {
 	return nil
 }
 
-// provisionComponentCerts ensures the cluster + signing CA hierarchy exists (so the
-// apiserver's unconditional --client-ca-file has a CA to trust) and writes the
+// provisionComponentCerts ensures the cluster, signing and request-header CAs exist (so
+// the apiserver's unconditional --client-ca-file has a CA to trust) and writes the
 // per-component client-cert kubeconfigs the scheduler and controller-manager
 // authenticate with — each its own system: identity instead of the shared system:masters
 // admin token (the k3s model; no shared component identity). The certs
@@ -531,7 +531,11 @@ func (s *Supervised) provision(ctx context.Context) error {
 // starts the scheduler/KCM) so the kubeconfigs and the client-CA exist when those
 // components — and the apiserver — start.
 func (s *Supervised) provisionComponentCerts() error {
-	h, err := certs.EnsureHierarchy(s.cfg.WorkDir)
+	// The role is the server's (a joined member never mints; Config.CARole). The
+	// posture is kine's on purpose: the executor ensures the CAs every server holds
+	// here, and the etcd pair is provisionEtcdCerts's, behind its own init-member
+	// guard (an absent pair on a restart is ErrEtcdCAsMissing, never a mint).
+	h, err := certs.EnsureHierarchy(s.cfg.WorkDir, s.cfg.CARole(), certs.PostureKine)
 	if err != nil {
 		return fmt.Errorf("ensure CA hierarchy: %w", err)
 	}
@@ -556,7 +560,9 @@ func (s *Supervised) provisionComponentCerts() error {
 	if err := writeAPIServerKubeletClientCert(s.cfg.WorkDir, h); err != nil {
 		return err
 	}
-	return nil
+	// The aggregation layer's front-proxy client, unconditional for the same reason:
+	// apiServerArgs renders --proxy-client-cert-file in every posture.
+	return writeProxyClientCert(s.cfg.WorkDir, h)
 }
 
 // componentReadyTimeout bounds each component's bring-up wait — the same budget
@@ -877,6 +883,26 @@ func apiServerArgs(cfg Config) []string {
 	args = append(args,
 		"--kubelet-client-certificate", apiServerKubeletClientCertPath(wd),
 		"--kubelet-client-key", apiServerKubeletClientKeyPath(wd))
+	// The aggregation layer (k3s's values, UNCONDITIONAL in every posture as k3s sets
+	// them): the request-header CA is the only issuer of the front-proxy client and a
+	// root of its own, never the --client-ca-file; system:auth-proxy is the one
+	// allowed name. No --requestheader-uid-headers (k3s sets none).
+	//
+	// --enable-aggregator-routing=false, rendered explicitly so a flip is a reviewed
+	// argv diff: with routing on the aggregator dials an APIService's endpoint IP,
+	// off it dials the Service's ClusterIP. k3s turns it on only beside its
+	// egress-selector tunnel, which is how a k3s server reaches pod IPs; k3sm has no
+	// egress selector, and the ClusterIP path through the userspace Service proxy is
+	// the one the apiserver's webhook delivery already uses.
+	args = append(args,
+		"--requestheader-client-ca-file", certs.RequestHeaderCACertPath(wd),
+		"--requestheader-allowed-names", certs.ProxyClientCN,
+		"--requestheader-username-headers", requestHeaderUsernameHeader,
+		"--requestheader-group-headers", requestHeaderGroupHeader,
+		"--requestheader-extra-headers-prefix", requestHeaderExtraHeadersPrefix,
+		"--proxy-client-cert-file", ProxyClientCertPath(wd),
+		"--proxy-client-key-file", ProxyClientKeyPath(wd),
+		"--enable-aggregator-routing=false")
 	if cfg.KubeletCAFile != "" {
 		args = append(args, "--kubelet-certificate-authority", cfg.KubeletCAFile)
 	}

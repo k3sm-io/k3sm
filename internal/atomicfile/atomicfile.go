@@ -59,6 +59,35 @@ func WriteNew(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
+// Replace installs data at path with mode, replacing whatever is there. The bytes go
+// to a temp file in path's directory (created 0600), which is chmod'ed to mode,
+// fsync'ed and renamed over path; the directory is then fsync'ed. rename(2) replaces
+// the directory entry itself, so an existing symlink at path is replaced, never
+// followed, and a pre-existing file's wider mode does not survive: the result is
+// always a fresh regular file with exactly mode. For material re-issued on every
+// start (a component leaf); a file that must never be overwritten uses WriteNew.
+// The temp file is removed on every error return.
+func Replace(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, tempPrefix(filepath.Base(path)))
+	if err != nil {
+		return fmt.Errorf("atomicfile: create temp for %s: %w", path, err)
+	}
+	tmpPath := tmp.Name()
+	if err := writeAndSync(tmp, data, mode); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("atomicfile: write temp for %s: %w", path, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("atomicfile: install %s: %w", path, err)
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("atomicfile: sync directory of %s: %w", path, err)
+	}
+	return nil
+}
+
 // ReapOrphans removes the temp files a killed WriteNew of dir/name may have left: the
 // regular files in dir named ".<name>.tmp-<digits>". Nothing else is touched, and an
 // absent dir is not an error. It must not run concurrently with a WriteNew of the same

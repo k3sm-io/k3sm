@@ -43,8 +43,8 @@ func parseFirstCert(t *testing.T, certPEM []byte) *x509.Certificate {
 	return cert
 }
 
-// newTestHierarchy builds an in-memory four-CA hierarchy (distinct cluster, signing,
-// etcd server and etcd peer roots) for the bundle tests.
+// newTestHierarchy builds an in-memory five-CA hierarchy (distinct cluster, signing,
+// etcd server, etcd peer and request-header roots) for the bundle tests.
 func newTestHierarchy(t *testing.T) *Hierarchy {
 	t.Helper()
 	mk := func(cn string) *CA {
@@ -55,10 +55,11 @@ func newTestHierarchy(t *testing.T) *Hierarchy {
 		return ca
 	}
 	return &Hierarchy{
-		Cluster:    mk("k3sm-cluster-ca"),
-		Signing:    mk("k3sm-signing-ca"),
-		EtcdServer: mk(etcdServerCACN),
-		EtcdPeer:   mk(etcdPeerCACN),
+		Cluster:       mk("k3sm-cluster-ca"),
+		Signing:       mk("k3sm-signing-ca"),
+		EtcdServer:    mk(etcdServerCACN),
+		EtcdPeer:      mk(etcdPeerCACN),
+		requestHeader: mk(requestHeaderCACN),
 	}
 }
 
@@ -96,7 +97,7 @@ func TestHierarchyMarshalUnmarshalRoundTrip(t *testing.T) {
 	}
 
 	// A version mismatch is rejected (tamper-evident schema).
-	bad, err := json.Marshal(marshalledHierarchy{
+	bad, err := json.Marshal(v2Struct{
 		SchemaVersion:    999,
 		ClusterCACertPEM: src.Cluster.CertPEM,
 		ClusterCAKeyPEM:  src.Cluster.KeyPEM,
@@ -111,6 +112,60 @@ func TestHierarchyMarshalUnmarshalRoundTrip(t *testing.T) {
 	}
 }
 
+// v2Struct is the schema-2 bundle exactly as the release before the CA table encoded
+// it: a Go struct whose field order is the JSON key order.
+type v2Struct struct {
+	SchemaVersion       int    `json:"schemaVersion"`
+	ClusterCACertPEM    []byte `json:"clusterCACertPEM"`
+	ClusterCAKeyPEM     []byte `json:"clusterCAKeyPEM"`
+	SigningCACertPEM    []byte `json:"signingCACertPEM"`
+	SigningCAKeyPEM     []byte `json:"signingCAKeyPEM"`
+	EtcdServerCACertPEM []byte `json:"etcdServerCACertPEM"`
+	EtcdServerCAKeyPEM  []byte `json:"etcdServerCAKeyPEM"`
+	EtcdPeerCACertPEM   []byte `json:"etcdPeerCACertPEM"`
+	EtcdPeerCAKeyPEM    []byte `json:"etcdPeerCAKeyPEM"`
+}
+
+// v2StructBytes encodes h's four B410 CAs the way the struct encoder did, stamped
+// with version.
+func v2StructBytes(t *testing.T, h *Hierarchy, version int) []byte {
+	t.Helper()
+	b, err := json.Marshal(v2Struct{
+		SchemaVersion:       version,
+		ClusterCACertPEM:    h.Cluster.CertPEM,
+		ClusterCAKeyPEM:     h.Cluster.KeyPEM,
+		SigningCACertPEM:    h.Signing.CertPEM,
+		SigningCAKeyPEM:     h.Signing.KeyPEM,
+		EtcdServerCACertPEM: h.EtcdServer.CertPEM,
+		EtcdServerCAKeyPEM:  h.EtcdServer.KeyPEM,
+		EtcdPeerCACertPEM:   h.EtcdPeer.CertPEM,
+		EtcdPeerCAKeyPEM:    h.EtcdPeer.KeyPEM,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestBundleEncodingKeepsTheV2Bytes pins that schema 3 is schema 2 plus two keys: the
+// table-driven encoder writes v2's eight keys byte for byte as the struct encoder
+// before it did (same keys, same order, same base64), stamped 3, then the
+// request-header CA's certificate and key.
+func TestBundleEncodingKeepsTheV2Bytes(t *testing.T) {
+	h := newTestHierarchy(t)
+	got, err := h.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	v2 := v2StructBytes(t, h, 3)
+	certJSON, _ := json.Marshal(h.requestHeader.CertPEM)
+	keyJSON, _ := json.Marshal(h.requestHeader.KeyPEM)
+	want := append(append([]byte{}, v2[:len(v2)-1]...), []byte(`,"requestHeaderCACertPEM":`+string(certJSON)+`,"requestHeaderCAKeyPEM":`+string(keyJSON)+`}`)...)
+	if !bytes.Equal(got, want) {
+		t.Errorf("the encoding changed:\n got %.120s...\nwant %.120s...", got, want)
+	}
+}
+
 // TestImportedHierarchyThenEnsureLoads proves the HA import-then-load primitive:
 // ReconcileImportedHierarchy into an empty work dir lays down the four CA keypairs
 // (keys 0600, the etcd pairs in a 0700 subdirectory), and a SUBSEQUENT EnsureHierarchy
@@ -121,7 +176,7 @@ func TestImportedHierarchyThenEnsureLoads(t *testing.T) {
 	src := newTestHierarchy(t)
 	wd := t.TempDir()
 
-	if err := ReconcileImportedHierarchy(wd, src); err != nil {
+	if err := ReconcileImportedHierarchy(wd, src, PostureEtcd); err != nil {
 		t.Fatalf("import hierarchy: %v", err)
 	}
 	ep := EtcdCertPaths(wd)
@@ -141,7 +196,7 @@ func TestImportedHierarchyThenEnsureLoads(t *testing.T) {
 		t.Errorf("etcd PKI dir: stat err %v, mode %v, want 0700", err, info)
 	}
 
-	loaded, err := EnsureHierarchy(wd)
+	loaded, err := EnsureHierarchy(wd, RoleMintAuthority, PostureKine)
 	if err != nil {
 		t.Fatalf("ensure (load imported): %v", err)
 	}
@@ -166,7 +221,7 @@ func TestImportedHierarchyThenEnsureLoads(t *testing.T) {
 		t.Fatalf("read the incumbent CA: %v", err)
 	}
 	other := newTestHierarchy(t)
-	err = ReconcileImportedHierarchy(wd, other)
+	err = ReconcileImportedHierarchy(wd, other, PostureEtcd)
 	if err == nil {
 		t.Fatal("an import must refuse to replace an existing CA")
 	}

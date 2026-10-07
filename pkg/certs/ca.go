@@ -105,7 +105,8 @@ func NewCA(commonName string) (*CA, error) {
 
 // LoadCA reconstructs a CA from its PEM-encoded certificate and private key (the
 // form NewCA emits and the server persists to its 0600 work dir). It is how a
-// running server reloads a CA created on a previous boot.
+// running server reloads a CA created on a previous boot. It refuses a key that is
+// not the certificate's.
 func LoadCA(certPEM, keyPEM []byte) (*CA, error) {
 	certBlock, _ := pem.Decode(certPEM)
 	if certBlock == nil || certBlock.Type != "CERTIFICATE" {
@@ -122,6 +123,11 @@ func LoadCA(certPEM, keyPEM []byte) (*CA, error) {
 	key, err := x509.ParseECPrivateKey(keyBlock.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse CA key: %w", err)
+	}
+	// A key that is not the certificate's would sign leaves nothing verifies, and a
+	// bundle carrying such a pair would be installed as a CA that cannot issue.
+	if !key.PublicKey.Equal(cert.PublicKey) {
+		return nil, errors.New("certs: load CA: the private key does not match the certificate")
 	}
 	return &CA{Cert: cert, Key: key, CertPEM: certPEM, KeyPEM: keyPEM}, nil
 }

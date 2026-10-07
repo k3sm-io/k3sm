@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -48,9 +49,9 @@ func serverSecretPath(workDir string) string { return filepath.Join(workDir, "se
 func adminKubeconfigPath(workDir string) string { return filepath.Join(workDir, "admin.kubeconfig") }
 
 // importServerCABundle is the FAIL-CLOSED HA server-join: it brings this server's
-// cluster, signing and etcd CA keypairs level with the existing server's AES-256-GCM
-// CA bundle, so the subsequent certs.EnsureHierarchy and certs.EnsureEtcdCAs LOAD the
-// IDENTICAL CAs. Any failure returns an error (the caller halts bring-up); it NEVER
+// cluster, signing, etcd and request-header CA keypairs level with the existing
+// server's AES-256-GCM CA bundle, so the subsequent certs.EnsureHierarchy (role
+// joined) LOADS the IDENTICAL CAs. Any failure returns an error (the caller halts bring-up); it NEVER
 // falls through to minting fresh, divergent CAs. See importServerCABundleVia.
 func importServerCABundle(ctx context.Context, opts serverOptions, logger *slog.Logger) error {
 	return importServerCABundleVia(ctx, opts, nil, logger)
@@ -68,7 +69,43 @@ func importServerCABundle(ctx context.Context, opts serverOptions, logger *slog.
 //  3. Otherwise the bundle is fetched, unsealed and reconciled: absent CAs are
 //     installed, present ones are kept, and a present CA whose pin differs from the
 //     bundle's fails with certs.ErrHierarchyDiverged and nothing written.
+//  4. A bundle from a server one release older (no request-header CA,
+//     bootstrap.ErrBundlePredatesRequestHeaderCA) is waited on, bounded
+//     (awaitBundleSource); a divergence or a secret mismatch returns at once, since
+//     each needs a human.
 func importServerCABundleVia(ctx context.Context, opts serverOptions, client *http.Client, logger *slog.Logger) error {
+	return importServerCABundleWith(ctx, opts, client, defaultBundleWait, logger)
+}
+
+// errBundleSourceStale ends the bounded wait on a bundle source that still runs a
+// release older than this one. Its text is the remedy.
+var errBundleSourceStale = errors.New("the server this one joins from still serves a bundle without the request-header CA: upgrade the mint-authority server first and make sure its bootstrap endpoint answers, then restart this server; if both servers of a two-server cluster are down, run `k3sm server --cluster-reset` on the mint authority, start it, wipe this server's etcd data dir and re-join it (never mint a CA by hand)")
+
+// bundleWait bounds the wait on an older bundle source: retry every retry, log the
+// remedy at ERROR every logEvery, give up after bound. now and sleep are the clock.
+//
+// The bound is what keeps the wait out of launchd's and the crash breaker's way: the
+// wait runs before the executor starts, and it exits at most once per bound (30
+// minutes), so it can never make the 5-crashes-in-10-minutes breaker trip nor spin
+// under KeepAlive.
+type bundleWait struct {
+	retry, logEvery, bound time.Duration
+	now                    func() time.Time
+	sleep                  func(ctx context.Context, d time.Duration) error
+}
+
+// defaultBundleWait is the production bound: 30 s retries, the remedy every 5
+// minutes, at most 30 minutes before the process exits.
+var defaultBundleWait = bundleWait{
+	retry:    30 * time.Second,
+	logEvery: 5 * time.Minute,
+	bound:    30 * time.Minute,
+	now:      time.Now,
+	sleep:    sleepCtx,
+}
+
+// importServerCABundleWith is importServerCABundleVia over an injectable wait clock.
+func importServerCABundleWith(ctx context.Context, opts serverOptions, client *http.Client, wait bundleWait, logger *slog.Logger) error {
 	tok, err := bootstrap.ParseServerToken(opts.token)
 	if err != nil {
 		return fmt.Errorf("parse server token: %w", err)
@@ -76,7 +113,7 @@ func importServerCABundleVia(ctx context.Context, opts serverOptions, client *ht
 	if err := bootstrap.EnsureServerSecret(serverSecretPath(opts.workDir), tok.Secret); err != nil {
 		return err
 	}
-	missing, err := certs.MissingOnDisk(opts.workDir)
+	missing, err := certs.MissingOnDisk(opts.workDir, opts.posture())
 	if err != nil {
 		return fmt.Errorf("inspect the local CA hierarchy: %w", err)
 	}
@@ -87,16 +124,50 @@ func importServerCABundleVia(ctx context.Context, opts serverOptions, client *ht
 	bootstrapURL := fmt.Sprintf("https://%s:%d", opts.joinServer, bootstrapPort)
 	logger.Info("HA server-join: importing the identical-CA bundle from the existing server",
 		"server", bootstrapURL, "missing", missing)
-	if err := bootstrap.ImportCABundle(ctx, bootstrap.ServerJoinOptions{
-		Server:     bootstrapURL,
-		Token:      opts.token,
-		WorkDir:    opts.workDir,
-		HTTPClient: client,
-	}); err != nil {
+	attempt := func() error {
+		return bootstrap.ImportCABundle(ctx, bootstrap.ServerJoinOptions{
+			Server:     bootstrapURL,
+			Token:      opts.token,
+			WorkDir:    opts.workDir,
+			HTTPClient: client,
+		})
+	}
+	if err := awaitBundleSource(ctx, attempt, wait, logger); err != nil {
 		return err
 	}
 	logger.Info("HA server-join: installed the missing CAs from the bundle", "installed", missing)
 	return nil
+}
+
+// awaitBundleSource runs attempt until it does anything but report a bundle source one
+// release older (bootstrap.ErrBundlePredatesRequestHeaderCA), retrying every
+// wait.retry and logging the remedy at ERROR every wait.logEvery, and returns
+// errBundleSourceStale once wait.bound has passed. Every other result, success
+// included, returns at once. Nothing is written while it waits: the refusal comes
+// before the import writes anything. The log lines carry the waited time and the
+// remedy, never key material or the secret.
+func awaitBundleSource(ctx context.Context, attempt func() error, wait bundleWait, logger *slog.Logger) error {
+	start := wait.now()
+	var lastLog time.Time
+	logged := false
+	for {
+		err := attempt()
+		if !errors.Is(err, bootstrap.ErrBundlePredatesRequestHeaderCA) {
+			return err
+		}
+		waited := wait.now().Sub(start)
+		if waited >= wait.bound {
+			return fmt.Errorf("%w (waited %s)", errBundleSourceStale, waited.Round(time.Second))
+		}
+		if !logged || wait.now().Sub(lastLog) >= wait.logEvery {
+			logger.Error("HA server-join: waiting for the bundle source to be upgraded",
+				"err", err, "waited", waited.Round(time.Second), "retry-every", wait.retry, "give-up-after", wait.bound)
+			lastLog, logged = wait.now(), true
+		}
+		if err := wait.sleep(ctx, wait.retry); err != nil {
+			return err
+		}
+	}
 }
 
 // liveBundleSource implements bootstrap.BundleSource by sealing the live in-memory

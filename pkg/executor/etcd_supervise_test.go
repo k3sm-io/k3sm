@@ -358,7 +358,7 @@ func TestEtcdDeathReportedOnce(t *testing.T) {
 			fake := &fakeEtcd{status: etcdMemberStatus{MemberID: testOwnID}}
 			clk := newFakeClock(time.Hour)
 			s, _, sink := etcdTestSupervised(t, EtcdInit, fake, clk)
-			if _, err := certs.EnsureHierarchy(s.cfg.WorkDir); err != nil {
+			if _, err := certs.EnsureHierarchy(s.cfg.WorkDir, certs.RoleMintAuthority, certs.PostureKine); err != nil {
 				t.Fatal(err)
 			}
 			die := filepath.Join(s.cfg.WorkDir, "die")
@@ -579,7 +579,7 @@ func TestEtcdRestartSkipsMemberAdd(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := certs.EnsureHierarchy(wd); err != nil {
+			if _, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine); err != nil {
 				t.Fatal(err)
 			}
 			if tc.memberExists {
@@ -625,7 +625,7 @@ func TestEtcdRestartPromotesStrandedLearner(t *testing.T) {
 		fake := healthyFake()
 		fake.status.IsLearner = true
 		s, logs, sink := etcdTestSupervised(t, EtcdJoin, fake, clk)
-		if _, err := certs.EnsureHierarchy(s.cfg.WorkDir); err != nil {
+		if _, err := certs.EnsureHierarchy(s.cfg.WorkDir, certs.RoleMintAuthority, certs.PostureKine); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.MkdirAll(etcdMemberDir(s.cfg.WorkDir), 0o700); err != nil {

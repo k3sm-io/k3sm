@@ -76,7 +76,7 @@ func TestSchedulerKubeconfigSystemSchedulerIdentity(t *testing.T) {
 	if err := s.provisionComponentCerts(); err != nil {
 		t.Fatalf("provision component certs: %v", err)
 	}
-	h, err := certs.EnsureHierarchy(wd) // idempotent — loads the hierarchy provision created
+	h, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine) // idempotent — loads the hierarchy provision created
 	if err != nil {
 		t.Fatalf("load hierarchy: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestKCMKubeconfigSystemKCMIdentity(t *testing.T) {
 	if err := s.provisionComponentCerts(); err != nil {
 		t.Fatalf("provision component certs: %v", err)
 	}
-	h, err := certs.EnsureHierarchy(wd)
+	h, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("load hierarchy: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestComponentKubeconfigClusterCAVerifiedWhenServingCertSet(t *testing.T) {
 	if err := s.provisionComponentCerts(); err != nil {
 		t.Fatalf("provision component certs: %v", err)
 	}
-	h, err := certs.EnsureHierarchy(wd)
+	h, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("load hierarchy: %v", err)
 	}

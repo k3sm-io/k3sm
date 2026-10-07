@@ -25,13 +25,14 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // allCAIDs is every id of the table, in table order.
-var allCAIDs = []string{"cluster", "signing", "etcd-server", "etcd-peer"}
+var allCAIDs = []CAID{CACluster, CASigning, CAEtcdServer, CAEtcdPeer, CARequestHeader}
 
 // specByID returns the table row for id.
-func specByID(t *testing.T, id string) caSpec {
+func specByID(t *testing.T, id CAID) caSpec {
 	t.Helper()
 	for _, spec := range caSpecs {
 		if spec.id == id {
@@ -43,7 +44,7 @@ func specByID(t *testing.T, id string) caSpec {
 }
 
 // caPaths returns the cert and key paths of CA id under wd.
-func caPaths(t *testing.T, wd, id string) (cert, key string) {
+func caPaths(t *testing.T, wd string, id CAID) (cert, key string) {
 	t.Helper()
 	spec := specByID(t, id)
 	dir := spec.dir(wd)
@@ -51,7 +52,7 @@ func caPaths(t *testing.T, wd, id string) (cert, key string) {
 }
 
 // removeCA deletes both files of CA id under wd.
-func removeCA(t *testing.T, wd, id string) {
+func removeCA(t *testing.T, wd string, id CAID) {
 	t.Helper()
 	cert, key := caPaths(t, wd, id)
 	for _, p := range []string{cert, key} {
@@ -125,7 +126,7 @@ func assertUnchanged(t *testing.T, before, after map[string]pkiFile) {
 func writeFull(t *testing.T, h *Hierarchy) string {
 	t.Helper()
 	wd := t.TempDir()
-	if err := ReconcileImportedHierarchy(wd, h); err != nil {
+	if err := ReconcileImportedHierarchy(wd, h, PostureEtcd); err != nil {
 		t.Fatalf("install hierarchy: %v", err)
 	}
 	return wd
@@ -139,24 +140,24 @@ func TestMissingOnDisk(t *testing.T) {
 	cases := []struct {
 		name    string
 		setup   func(t *testing.T) string
-		want    []string
+		want    []CAID
 		wantErr []string // substrings of the error; nil means no error
 	}{
-		{name: "empty work dir: all four", setup: func(t *testing.T) string { return t.TempDir() }, want: allCAIDs},
+		{name: "empty work dir: all five", setup: func(t *testing.T) string { return t.TempDir() }, want: allCAIDs},
 		{name: "complete hierarchy: none", setup: func(t *testing.T) string { return writeFull(t, h) }, want: nil},
 		{name: "subset: the removed CAs only", setup: func(t *testing.T) string {
 			wd := writeFull(t, h)
 			removeCA(t, wd, "signing")
 			removeCA(t, wd, "etcd-peer")
 			return wd
-		}, want: []string{"signing", "etcd-peer"}},
+		}, want: []CAID{CASigning, CAEtcdPeer}},
 		{name: "etcd dir gone: both etcd CAs", setup: func(t *testing.T) string {
 			wd := writeFull(t, h)
 			if err := os.RemoveAll(EtcdCertPaths(wd).Dir); err != nil {
 				t.Fatal(err)
 			}
 			return wd
-		}, want: []string{"etcd-server", "etcd-peer"}},
+		}, want: []CAID{CAEtcdServer, CAEtcdPeer}},
 		{name: "key without cert: error names the key", setup: func(t *testing.T) string {
 			wd := writeFull(t, h)
 			cert, _ := caPaths(t, wd, "etcd-server")
@@ -188,7 +189,7 @@ func TestMissingOnDisk(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			wd := tc.setup(t)
-			got, err := MissingOnDisk(wd)
+			got, err := MissingOnDisk(wd, PostureEtcd)
 			if tc.wantErr != nil {
 				if err == nil {
 					t.Fatalf("MissingOnDisk = %v, want an error", got)
@@ -213,7 +214,7 @@ func TestMissingOnDisk(t *testing.T) {
 	}
 }
 
-// TestReconcileImportedHierarchy pins the B435 import: only absent CAs are installed
+// TestReconcileImportedHierarchy pins the server-join import: only absent CAs are installed
 // (key 0600, cert 0644, the etcd dir 0700), a present CA with the bundle's pin is left
 // untouched, and a present CA with any other pin is ErrHierarchyDiverged with nothing
 // written, even when another CA is missing.
@@ -221,9 +222,9 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 	hA := newTestHierarchy(t)
 	hB := newTestHierarchy(t)
 
-	t.Run("fresh dir: all four installed with their modes", func(t *testing.T) {
+	t.Run("fresh dir: all five installed with their modes", func(t *testing.T) {
 		wd := t.TempDir()
-		if err := ReconcileImportedHierarchy(wd, hA); err != nil {
+		if err := ReconcileImportedHierarchy(wd, hA, PostureEtcd); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 		assertInstalled(t, wd, hA, allCAIDs)
@@ -240,7 +241,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 		}
 		removeCA(t, wd, "signing")
 		before := snapshotPKI(t, wd)
-		if err := ReconcileImportedHierarchy(wd, hA); err != nil {
+		if err := ReconcileImportedHierarchy(wd, hA, PostureEtcd); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 		after := snapshotPKI(t, wd)
@@ -251,7 +252,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 				t.Errorf("present %s was modified or replaced", rel)
 			}
 		}
-		assertInstalled(t, wd, hA, []string{"signing", "etcd-server", "etcd-peer"})
+		assertInstalled(t, wd, hA, []CAID{CASigning, CAEtcdServer, CAEtcdPeer})
 		if info, err := os.Stat(EtcdCertPaths(wd).Dir); err != nil || info.Mode().Perm() != 0o700 {
 			t.Errorf("etcd PKI dir: err %v, want mode 0700", err)
 		}
@@ -261,7 +262,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 	t.Run("complete and same-pin: a no-op, byte-identical", func(t *testing.T) {
 		wd := writeFull(t, hA)
 		before := snapshotPKI(t, wd)
-		if err := ReconcileImportedHierarchy(wd, hA); err != nil {
+		if err := ReconcileImportedHierarchy(wd, hA, PostureEtcd); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 		assertUnchanged(t, before, snapshotPKI(t, wd))
@@ -270,7 +271,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 	diverged := func(t *testing.T, wd string, h *Hierarchy, wantPins ...string) {
 		t.Helper()
 		before := snapshotPKI(t, wd)
-		err := ReconcileImportedHierarchy(wd, h)
+		err := ReconcileImportedHierarchy(wd, h, PostureEtcd)
 		if !errors.Is(err, ErrHierarchyDiverged) {
 			t.Fatalf("reconcile err = %v, want ErrHierarchyDiverged", err)
 		}
@@ -290,9 +291,9 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 	t.Run("divergent later CA, earlier CA missing: nothing written", func(t *testing.T) {
 		wd := writeFull(t, hA)
 		removeCA(t, wd, "cluster")
-		mixed := &Hierarchy{Cluster: hA.Cluster, Signing: hA.Signing, EtcdServer: hA.EtcdServer, EtcdPeer: hB.EtcdPeer}
+		mixed := &Hierarchy{Cluster: hA.Cluster, Signing: hA.Signing, EtcdServer: hA.EtcdServer, EtcdPeer: hB.EtcdPeer, requestHeader: hA.requestHeader}
 		diverged(t, wd, mixed, hA.EtcdPeer.PinHash(), hB.EtcdPeer.PinHash())
-		if got, err := MissingOnDisk(wd); err != nil || !slices.Equal(got, []string{"cluster"}) {
+		if got, err := MissingOnDisk(wd, PostureEtcd); err != nil || !slices.Equal(got, []CAID{CACluster}) {
 			t.Errorf("after a refused reconcile MissingOnDisk = %v, %v; want [cluster]", got, err)
 		}
 	})
@@ -304,7 +305,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 			t.Fatal(err)
 		}
 		before := snapshotPKI(t, wd)
-		if err := ReconcileImportedHierarchy(wd, hA); !errors.Is(err, ErrIncompleteHierarchy) || !strings.Contains(err.Error(), "half-present") {
+		if err := ReconcileImportedHierarchy(wd, hA, PostureEtcd); !errors.Is(err, ErrIncompleteHierarchy) || !strings.Contains(err.Error(), "half-present") {
 			t.Fatalf("reconcile err = %v, want the half-present ErrIncompleteHierarchy", err)
 		}
 		assertUnchanged(t, before, snapshotPKI(t, wd))
@@ -324,7 +325,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := ReconcileImportedHierarchy(wd, hA); err != nil {
+		if err := ReconcileImportedHierarchy(wd, hA, PostureEtcd); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 		for _, o := range orphans {
@@ -335,12 +336,49 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 		assertUnchanged(t, before, snapshotPKI(t, wd))
 	})
 
+	refusedBeforeWrite := func(t *testing.T, h *Hierarchy) {
+		t.Helper()
+		wd := t.TempDir()
+		if err := ReconcileImportedHierarchy(wd, h, PostureEtcd); err == nil {
+			t.Fatal("reconcile accepted an invalid bundle CA")
+		}
+		if got := snapshotPKI(t, wd); len(got) != 0 {
+			t.Errorf("a refused reconcile wrote %d PKI entries", len(got))
+		}
+	}
+
+	t.Run("bundle CA key does not match its cert: refused before any write", func(t *testing.T) {
+		bad := *hA
+		bad.Signing = &CA{Cert: hA.Signing.Cert, Key: hB.Signing.Key, CertPEM: hA.Signing.CertPEM, KeyPEM: hB.Signing.KeyPEM}
+		refusedBeforeWrite(t, &bad)
+	})
+
+	t.Run("bundle CA that is not a CA: refused before any write", func(t *testing.T) {
+		leafPEM, leafKey, err := hA.Cluster.IssueClient("not-a-ca", nil, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf, err := LoadCA(leafPEM, leafKey)
+		if err != nil {
+			t.Fatalf("load the leaf as a CA struct: %v", err)
+		}
+		bad := *hA
+		bad.EtcdPeer = leaf
+		refusedBeforeWrite(t, &bad)
+	})
+
+	t.Run("bundle without the request-header CA: refused before any write", func(t *testing.T) {
+		bad := *hA
+		bad.requestHeader = nil
+		refusedBeforeWrite(t, &bad)
+	})
+
 	t.Run("incomplete bundle: refused before any disk access", func(t *testing.T) {
 		wd := t.TempDir()
-		if err := ReconcileImportedHierarchy(wd, &Hierarchy{Cluster: hA.Cluster, Signing: hA.Signing}); err == nil {
-			t.Fatal("reconcile must require all four CAs")
+		if err := ReconcileImportedHierarchy(wd, &Hierarchy{Cluster: hA.Cluster, Signing: hA.Signing}, PostureEtcd); err == nil {
+			t.Fatal("reconcile must require all five CAs")
 		}
-		if err := ReconcileImportedHierarchy(wd, nil); err == nil {
+		if err := ReconcileImportedHierarchy(wd, nil, PostureEtcd); err == nil {
 			t.Fatal("reconcile must refuse a nil hierarchy")
 		}
 		if got := snapshotPKI(t, wd); len(got) != 0 {
@@ -351,7 +389,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 
 // assertInstalled checks that each CA in ids is on disk with h's bytes, the key 0600
 // and the cert 0644, and that no temp file was left beside it.
-func assertInstalled(t *testing.T, wd string, h *Hierarchy, ids []string) {
+func assertInstalled(t *testing.T, wd string, h *Hierarchy, ids []CAID) {
 	t.Helper()
 	for _, id := range ids {
 		spec := specByID(t, id)
@@ -389,7 +427,7 @@ func assertInstalled(t *testing.T, wd string, h *Hierarchy, ids []string) {
 // rather than minting.
 func assertLoads(t *testing.T, wd string, h *Hierarchy) {
 	t.Helper()
-	got, err := EnsureHierarchy(wd)
+	got, err := EnsureHierarchy(wd, RoleMintAuthority, PostureKine)
 	if err != nil {
 		t.Fatalf("EnsureHierarchy: %v", err)
 	}

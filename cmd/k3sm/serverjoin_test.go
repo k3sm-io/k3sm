@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -30,9 +32,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -96,7 +100,7 @@ func TestNodePasswordSharedAcrossServersInHA(t *testing.T) {
 func TestAdminKubeconfigUsesClientCert(t *testing.T) {
 	t.Parallel()
 	wd := t.TempDir()
-	h, err := certs.EnsureHierarchy(wd)
+	h, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("hierarchy: %v", err)
 	}
@@ -210,12 +214,14 @@ type serverJoinFixture struct {
 	sealed []byte
 	secret string
 	token  string
+	// rhPin is server A's request-header CA pin ("" if A has none).
+	rhPin string
 }
 
 func newServerJoinFixture(t *testing.T) serverJoinFixture {
 	t.Helper()
 	wdA := t.TempDir()
-	hA, err := certs.EnsureHierarchy(wdA)
+	hA, err := certs.EnsureHierarchy(wdA, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("server A hierarchy: %v", err)
 	}
@@ -231,22 +237,70 @@ func newServerJoinFixture(t *testing.T) serverJoinFixture {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	return serverJoinFixture{h: hA, sealed: sealed, secret: secret,
+	var rhPin string
+	if b, err := os.ReadFile(certs.RequestHeaderCACertPath(wdA)); err == nil {
+		if rhPin, err = certs.CertPin(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return serverJoinFixture{h: hA, sealed: sealed, secret: secret, rhPin: rhPin,
 		token: bootstrap.FormatServerToken(hA.Cluster.PinHash(), secret)}
+}
+
+// v2Sealed seals a schema-2 bundle (no request-header CA) of f's hierarchy, as a
+// server one release older serves it.
+func (f serverJoinFixture) v2Sealed(t *testing.T) []byte {
+	t.Helper()
+	h := f.h
+	v2, err := json.Marshal(map[string]any{
+		"schemaVersion":       2,
+		"clusterCACertPEM":    h.Cluster.CertPEM,
+		"clusterCAKeyPEM":     h.Cluster.KeyPEM,
+		"signingCACertPEM":    h.Signing.CertPEM,
+		"signingCAKeyPEM":     h.Signing.KeyPEM,
+		"etcdServerCACertPEM": h.EtcdServer.CertPEM,
+		"etcdServerCAKeyPEM":  h.EtcdServer.KeyPEM,
+		"etcdPeerCACertPEM":   h.EtcdPeer.CertPEM,
+		"etcdPeerCAKeyPEM":    h.EtcdPeer.KeyPEM,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := bootstrap.SealBundle(f.secret, v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sealed
 }
 
 // join runs importServerCABundleVia for workDir over tr, failing the test if the log
 // carries the secret or any private key.
-func (f serverJoinFixture) join(t *testing.T, workDir string, tr *countingBundleTransport) error {
+func (f serverJoinFixture) join(t *testing.T, workDir string, tr http.RoundTripper) error {
 	t.Helper()
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	opts := serverOptions{workDir: workDir, joinServer: "192.0.2.1", token: f.token}
+	opts := serverOptions{workDir: workDir, joinServer: "192.0.2.1", token: f.token, serverJoin: true}
 	err := importServerCABundleVia(context.Background(), opts, &http.Client{Transport: tr}, logger)
-	if strings.Contains(logs.String(), f.secret) || strings.Contains(logs.String(), "PRIVATE KEY") {
-		t.Errorf("the server-join log leaks the secret or a key:\n%s", logs.String())
-	}
+	f.assertNoSecrets(t, logs.String(), err)
 	return err
+}
+
+// assertNoSecrets fails the test if a log or an error carries the server secret, a
+// PEM block, or any of the fixture's CA private keys.
+func (f serverJoinFixture) assertNoSecrets(t *testing.T, logs string, err error) {
+	t.Helper()
+	text := logs
+	if err != nil {
+		text += err.Error()
+	}
+	if strings.Contains(text, f.secret) || strings.Contains(text, "PRIVATE KEY") || strings.Contains(text, "-----BEGIN") {
+		t.Errorf("the server-join log or error leaks the secret or a key:\n%s", text)
+	}
+	for _, ca := range []*certs.CA{f.h.Cluster, f.h.Signing, f.h.EtcdServer, f.h.EtcdPeer} {
+		if block, _ := pem.Decode(ca.KeyPEM); block != nil && strings.Contains(text, base64.StdEncoding.EncodeToString(block.Bytes)[:24]) {
+			t.Errorf("the server-join log or error carries a CA key's DER:\n%s", text)
+		}
+	}
 }
 
 // readPKITree returns every regular file under workDir's PKI dir, by path.
@@ -288,11 +342,11 @@ func TestServerJoinFetchesBundleOnlyWhenCAMissing(t *testing.T) {
 
 	assertComplete := func(t *testing.T, wd string) {
 		t.Helper()
-		missing, err := certs.MissingOnDisk(wd)
+		missing, err := certs.MissingOnDisk(wd, certs.PostureEtcd)
 		if err != nil || len(missing) != 0 {
 			t.Fatalf("MissingOnDisk = %v, %v; want a complete hierarchy", missing, err)
 		}
-		h, err := certs.EnsureHierarchy(wd)
+		h, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine)
 		if err != nil {
 			t.Fatalf("EnsureHierarchy: %v", err)
 		}
@@ -303,6 +357,9 @@ func TestServerJoinFetchesBundleOnlyWhenCAMissing(t *testing.T) {
 		if h.Cluster.PinHash() != fx.h.Cluster.PinHash() || h.Signing.PinHash() != fx.h.Signing.PinHash() ||
 			server.PinHash() != fx.h.EtcdServer.PinHash() || peer.PinHash() != fx.h.EtcdPeer.PinHash() {
 			t.Error("the installed CAs are not the bundle's")
+		}
+		if pin, err := certs.LoadRequestHeaderPin(wd); err != nil || pin == "" || pin != fx.rhPin {
+			t.Errorf("request-header CA pin %q (err %v), want the bundle's %q", pin, err, fx.rhPin)
 		}
 	}
 	assertSecret := func(t *testing.T, wd, want string) {
@@ -360,6 +417,40 @@ func TestServerJoinFetchesBundleOnlyWhenCAMissing(t *testing.T) {
 		assertComplete(t, wd)
 	})
 
+	t.Run("request-header pair deleted (an upgraded joined server): one fetch, only it written", func(t *testing.T) {
+		for _, p := range []string{certs.RequestHeaderCACertPath(wd), certs.RequestHeaderCAKeyPath(wd)} {
+			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				t.Fatal(err)
+			}
+		}
+		before := readPKITree(t, wd)
+		calls := tr.count()
+		if err := fx.join(t, wd, tr); err != nil {
+			t.Fatalf("backfill join: %v", err)
+		}
+		if tr.count() != calls+1 {
+			t.Errorf("fetches = %d, want %d", tr.count(), calls+1)
+		}
+		after := readPKITree(t, wd)
+		for p, b := range before {
+			if after[p] != b {
+				t.Errorf("present %s changed", p)
+			}
+		}
+		var added []string
+		for p := range after {
+			if _, ok := before[p]; !ok {
+				added = append(added, p)
+			}
+		}
+		slices.Sort(added)
+		want := []string{certs.RequestHeaderCACertPath(wd), certs.RequestHeaderCAKeyPath(wd)}
+		if !slices.Equal(added, want) {
+			t.Errorf("the backfill wrote %v, want only %v", added, want)
+		}
+		assertComplete(t, wd)
+	})
+
 	t.Run("transport 500: secret kept, no CA, a later good fetch succeeds", func(t *testing.T) {
 		wd := t.TempDir()
 		tr := &countingBundleTransport{sealed: fx.sealed, failing: true, secretPath: serverSecretPath(wd)}
@@ -401,7 +492,7 @@ func TestServerJoinFetchesBundleOnlyWhenCAMissing(t *testing.T) {
 
 	t.Run("divergent local cluster CA, etcd CAs missing: nothing written", func(t *testing.T) {
 		wd := t.TempDir()
-		if _, err := certs.EnsureHierarchy(wd); err != nil { // a different cluster + signing CA
+		if _, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine); err != nil { // a different cluster + signing CA
 			t.Fatal(err)
 		}
 		before := readPKITree(t, wd)
@@ -435,4 +526,148 @@ func TestServerJoinSavesSecretBeforeFetch(t *testing.T) {
 	if err != nil || string(got) != fx.secret {
 		t.Errorf("after the failed fetch the secret is not recorded (err %v)", err)
 	}
+}
+
+// switchingBundleTransport serves before at bootstrap.BundlePath until serveAfter
+// reports true, then after; it counts the fetches.
+type switchingBundleTransport struct {
+	mu            sync.Mutex
+	before, after []byte
+	serveAfter    func() bool
+	calls         int
+}
+
+func (s *switchingBundleTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	body := s.before
+	if s.serveAfter() {
+		body = s.after
+	}
+	s.calls++
+	return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(bytes.NewReader(body)),
+		Header: http.Header{}, Request: req}, nil
+}
+
+// fakeWait is a bundleWait on a fake clock: sleep advances now by d and counts.
+type fakeWait struct {
+	start, now time.Time
+	sleeps     int
+}
+
+func newFakeWait() *fakeWait {
+	t0 := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	return &fakeWait{start: t0, now: t0}
+}
+
+func (f *fakeWait) elapsed() time.Duration { return f.now.Sub(f.start) }
+
+func (f *fakeWait) wait() bundleWait {
+	w := defaultBundleWait
+	w.now = func() time.Time { return f.now }
+	w.sleep = func(_ context.Context, d time.Duration) error {
+		f.sleeps++
+		f.now = f.now.Add(d)
+		return nil
+	}
+	return w
+}
+
+// TestServerJoinWaitsOnOlderBundleSource pins the bounded wait on a bundle source one
+// release older (a schema-2 bundle): it retries every 30 s on a fake clock, logs the
+// remedy at ERROR every 5 minutes, neither returns nor writes while it waits,
+// continues once the source serves the request-header CA, gives up at 30 minutes
+// with errBundleSourceStale naming the remedy, and returns at once on a divergence.
+// No log line or error carries the secret or key material.
+func TestServerJoinWaitsOnOlderBundleSource(t *testing.T) {
+	fx := newServerJoinFixture(t)
+	v2 := fx.v2Sealed(t)
+	run := func(t *testing.T, wd string, tr http.RoundTripper, fw *fakeWait) (string, error) {
+		t.Helper()
+		var logs bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logs, nil))
+		opts := serverOptions{workDir: wd, joinServer: "192.0.2.1", token: fx.token, serverJoin: true}
+		err := importServerCABundleWith(context.Background(), opts, &http.Client{Transport: tr}, fw.wait(), logger)
+		fx.assertNoSecrets(t, logs.String(), err)
+		return logs.String(), err
+	}
+	remedyLines := func(logs string) int {
+		n := 0
+		for _, l := range strings.Split(logs, "\n") {
+			if strings.Contains(l, "level=ERROR") && strings.Contains(l, "upgrade the mint-authority server first") {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("older source for 25 minutes, then upgraded: waits, then backfills", func(t *testing.T) {
+		wd := t.TempDir()
+		fw := newFakeWait()
+		tr := &switchingBundleTransport{before: v2, after: fx.sealed, serveAfter: func() bool { return fw.elapsed() >= 25*time.Minute }}
+		logs, err := run(t, wd, tr, fw)
+		if err != nil {
+			t.Fatalf("join: %v", err)
+		}
+		if fw.elapsed() < 25*time.Minute {
+			t.Fatalf("the join returned after %s on the fake clock; it must wait for the upgraded source", fw.elapsed())
+		}
+		if got := remedyLines(logs); got != 5 {
+			t.Errorf("remedy logged at ERROR %d times over 25 minutes, want 5 (every 5 minutes):\n%s", got, logs)
+		}
+		if tr.calls != 51 {
+			t.Errorf("fetches = %d, want 51 (every 30 s for 25 minutes, then the good one)", tr.calls)
+		}
+		if pin, err := certs.LoadRequestHeaderPin(wd); err != nil || pin != fx.rhPin {
+			t.Errorf("request-header pin %q (err %v), want %q", pin, err, fx.rhPin)
+		}
+	})
+
+	t.Run("older source past the bound: errBundleSourceStale, nothing written", func(t *testing.T) {
+		wd := t.TempDir()
+		fw := newFakeWait()
+		tr := &switchingBundleTransport{before: v2, after: v2, serveAfter: func() bool { return false }}
+		_, err := run(t, wd, tr, fw)
+		if !errors.Is(err, errBundleSourceStale) {
+			t.Fatalf("err = %v, want errBundleSourceStale", err)
+		}
+		if fw.elapsed() < 30*time.Minute || fw.elapsed() > 31*time.Minute {
+			t.Errorf("gave up after %s on the fake clock, want 30 minutes", fw.elapsed())
+		}
+		for _, want := range []string{"upgrade the mint-authority server first", "--cluster-reset", "never mint a CA"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not name the remedy %q", err, want)
+			}
+		}
+		if got := readPKITree(t, wd); len(got) != 0 {
+			t.Errorf("the wait wrote %d PKI files", len(got))
+		}
+	})
+
+	t.Run("divergent local CA: returns at once", func(t *testing.T) {
+		wd := t.TempDir()
+		if _, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine); err != nil {
+			t.Fatal(err)
+		}
+		fw := newFakeWait()
+		_, err := run(t, wd, &countingBundleTransport{sealed: fx.sealed}, fw)
+		if !errors.Is(err, certs.ErrHierarchyDiverged) {
+			t.Fatalf("err = %v, want ErrHierarchyDiverged", err)
+		}
+		if fw.sleeps != 0 {
+			t.Errorf("a divergence waited %d times; it needs a human and must return at once", fw.sleeps)
+		}
+	})
+
+	t.Run("different recorded secret: returns at once", func(t *testing.T) {
+		wd := t.TempDir()
+		if err := os.WriteFile(serverSecretPath(wd), []byte("another-server-secret-0000"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fw := newFakeWait()
+		_, err := run(t, wd, &countingBundleTransport{sealed: v2}, fw)
+		if !errors.Is(err, bootstrap.ErrServerSecretMismatch) || fw.sleeps != 0 {
+			t.Fatalf("err = %v after %d sleeps, want ErrServerSecretMismatch at once", err, fw.sleeps)
+		}
+	})
 }

@@ -26,7 +26,7 @@ import (
 	"testing"
 )
 
-// helperBins maps a conformance helper name (hello-http, conftool) to the
+// helperBins maps a conformance helper name (hello-http, conftool, b411-echo) to the
 // absolute path TestMain built it at. It is the set of native "images" the
 // conformance pods exec; empty until TestMain builds them (only when a cluster is
 // targeted — see TestMain).
@@ -36,7 +36,7 @@ var helperBins = map[string]string{}
 // stdlib-only native Mach-O binaries (the workload's "image" in k3sm's native
 // model), built once and ad-hoc-signed so they exec under the default-deny
 // Seatbelt profile.
-var conformanceHelpers = []string{"hello-http", "conftool"}
+var conformanceHelpers = []string{"hello-http", "conftool", "b411-echo"}
 
 // helperBin returns the absolute path of a built conformance helper, skipping the
 // test when TestMain did not build it (no $KUBECONFIG → the compile-smoke, where

@@ -126,3 +126,44 @@ func TestReapOrphans(t *testing.T) {
 		t.Errorf("an absent dir must not be an error: %v", err)
 	}
 }
+
+// Replace must leave a fresh regular file with exactly the requested mode: a
+// pre-existing wider-mode file does not keep its mode, and a symlink at the path is
+// replaced rather than written through.
+func TestReplaceNeverFollowsALinkAndResetsTheMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client.key")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Replace(path, []byte("new"), 0o600); err != nil {
+		t.Fatalf("Replace over a 0644 file: %v", err)
+	}
+	if fi, err := os.Lstat(path); err != nil || fi.Mode().Perm() != 0o600 || !fi.Mode().IsRegular() {
+		t.Fatalf("after Replace: mode %v, err %v; want a regular 0600 file", fi.Mode(), err)
+	}
+
+	target := filepath.Join(dir, "elsewhere")
+	if err := os.WriteFile(target, []byte("victim"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "linked.key")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := Replace(link, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("Replace over a symlink: %v", err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "victim" {
+		t.Fatalf("Replace wrote through the symlink: target now %q", got)
+	}
+	if fi, err := os.Lstat(link); err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("the link path is %v (err %v); want a regular 0600 file", fi.Mode(), err)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if isTempOf(e.Name(), tempPrefix("client.key")) || isTempOf(e.Name(), tempPrefix("linked.key")) {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+	}
+}

@@ -18,11 +18,15 @@ package bootstrap_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -54,7 +58,7 @@ func bundleTestServer(t *testing.T, sealed []byte, missing bool) *httptest.Serve
 func TestServerJoinImportsBundleBeforeEnsureHierarchy(t *testing.T) {
 	// Server A's hierarchy (the source of truth).
 	wdA := t.TempDir()
-	hA, err := certs.EnsureHierarchy(wdA)
+	hA, err := certs.EnsureHierarchy(wdA, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("server A hierarchy: %v", err)
 	}
@@ -94,7 +98,7 @@ func TestServerJoinImportsBundleBeforeEnsureHierarchy(t *testing.T) {
 	}
 
 	// EnsureHierarchy on B now LOADS the imported CAs → identical pins to A.
-	hB, err := certs.EnsureHierarchy(wdB)
+	hB, err := certs.EnsureHierarchy(wdB, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("server B EnsureHierarchy: %v", err)
 	}
@@ -143,7 +147,7 @@ func TestServerJoinFailsClosedOnAbsentBundle(t *testing.T) {
 
 	t.Run("wrong secret (tag fails)", func(t *testing.T) {
 		wdA := t.TempDir()
-		hA, _ := certs.EnsureHierarchy(wdA)
+		hA, _ := certs.EnsureHierarchy(wdA, certs.RoleMintAuthority, certs.PostureKine)
 		hA.EtcdServer, hA.EtcdPeer, _ = certs.EnsureEtcdCAs(wdA)
 		pt, err := hA.Marshal()
 		if err != nil {
@@ -191,7 +195,7 @@ func TestServerJoinFailsClosedOnAbsentBundle(t *testing.T) {
 // and a half-present CA refuses the import with nothing written.
 func TestImportCABundleBackfillsOnlyMissingCA(t *testing.T) {
 	wdA := t.TempDir()
-	hA, err := certs.EnsureHierarchy(wdA)
+	hA, err := certs.EnsureHierarchy(wdA, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("server A hierarchy: %v", err)
 	}
@@ -270,6 +274,44 @@ func TestImportCABundleBackfillsOnlyMissingCA(t *testing.T) {
 		t.Error("the backfilled etcd peer CA is not the bundle's")
 	}
 
+	// The request-header pair is what an upgraded joined server lacks: the first
+	// import installed it, and once it is gone only it is installed again, with the
+	// bundle's pin.
+	pinA, err := certs.LoadRequestHeaderPin(wdA)
+	if err != nil {
+		t.Fatalf("server A request-header pin: %v", err)
+	}
+	for _, p := range []string{certs.RequestHeaderCACertPath(wdB), certs.RequestHeaderCAKeyPath(wdB)} {
+		if err := os.Remove(p); err != nil {
+			t.Fatalf("the first import did not install the request-header CA: %v", err)
+		}
+	}
+	before = read(append(present, ep.PeerCACert, ep.PeerCAKey))
+	if err := importB(); err != nil {
+		t.Fatalf("request-header backfill import: %v", err)
+	}
+	if after := read(append(present, ep.PeerCACert, ep.PeerCAKey)); !reflect.DeepEqual(before, after) {
+		t.Error("the request-header backfill changed a present CA")
+	}
+	if pinB, err := certs.LoadRequestHeaderPin(wdB); err != nil || pinB != pinA {
+		t.Errorf("backfilled request-header pin %q (err %v), want the bundle's %q", pinB, err, pinA)
+	}
+
+	// A server holding a different cluster CA is refused as diverged, nothing written.
+	wdC := t.TempDir()
+	if _, err := certs.EnsureHierarchy(wdC, certs.RoleMintAuthority, certs.PostureKine); err != nil {
+		t.Fatal(err)
+	}
+	err = bootstrap.ImportCABundle(context.Background(), bootstrap.ServerJoinOptions{
+		Server: ts.URL, Token: bootstrap.FormatServerToken(hA.Cluster.PinHash(), secret), WorkDir: wdC, HTTPClient: ts.Client(),
+	})
+	if !errors.Is(err, certs.ErrHierarchyDiverged) {
+		t.Errorf("import over a different cluster CA: err = %v, want ErrHierarchyDiverged", err)
+	}
+	if _, err := os.Lstat(certs.EtcdCertPaths(wdC).Dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Error("a diverged import created the etcd PKI dir")
+	}
+
 	// A half-present CA (the signing key gone, its cert kept) refuses the import.
 	if err := os.Remove(certs.SigningCAKeyPath(wdB)); err != nil {
 		t.Fatal(err)
@@ -280,4 +322,86 @@ func TestImportCABundleBackfillsOnlyMissingCA(t *testing.T) {
 	if _, err := os.Stat(certs.SigningCAKeyPath(wdB)); !os.IsNotExist(err) {
 		t.Error("a refused import must not write the missing signing key")
 	}
+}
+
+// TestImportCABundleRefusesBundleWithoutRequestHeaderCA pins the policy refusal of a
+// schema-2 bundle (served by a server one release older): ErrBundlePredatesRequestHeaderCA,
+// returned before any write, both into an empty work dir and into the upgraded joined
+// server that lacks only the request-header CA.
+func TestImportCABundleRefusesBundleWithoutRequestHeaderCA(t *testing.T) {
+	wdA := t.TempDir()
+	hA, err := certs.EnsureHierarchy(wdA, certs.RoleMintAuthority, certs.PostureKine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hA.EtcdServer, hA.EtcdPeer, err = certs.EnsureEtcdCAs(wdA); err != nil {
+		t.Fatal(err)
+	}
+	v2, err := json.Marshal(map[string]any{
+		"schemaVersion":       2,
+		"clusterCACertPEM":    hA.Cluster.CertPEM,
+		"clusterCAKeyPEM":     hA.Cluster.KeyPEM,
+		"signingCACertPEM":    hA.Signing.CertPEM,
+		"signingCAKeyPEM":     hA.Signing.KeyPEM,
+		"etcdServerCACertPEM": hA.EtcdServer.CertPEM,
+		"etcdServerCAKeyPEM":  hA.EtcdServer.KeyPEM,
+		"etcdPeerCACertPEM":   hA.EtcdPeer.CertPEM,
+		"etcdPeerCAKeyPEM":    hA.EtcdPeer.KeyPEM,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const secret = "server-bootstrap-secret-deadbeefdeadbeefdeadbeef"
+	sealed, err := bootstrap.SealBundle(secret, v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := bundleTestServer(t, sealed, false)
+	defer ts.Close()
+	importInto := func(wd string) error {
+		return bootstrap.ImportCABundle(context.Background(), bootstrap.ServerJoinOptions{
+			Server: ts.URL, Token: bootstrap.FormatServerToken(hA.Cluster.PinHash(), secret), WorkDir: wd, HTTPClient: ts.Client(),
+		})
+	}
+
+	t.Run("empty work dir", func(t *testing.T) {
+		wd := t.TempDir()
+		err := importInto(wd)
+		if !errors.Is(err, bootstrap.ErrBundlePredatesRequestHeaderCA) {
+			t.Fatalf("err = %v, want ErrBundlePredatesRequestHeaderCA", err)
+		}
+		if !strings.Contains(err.Error(), "upgrade the mint-authority server first") {
+			t.Errorf("error %q does not name the remedy", err)
+		}
+		if _, err := os.Lstat(certs.PKIDir(wd)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("a refused import created the PKI dir (stat err %v)", err)
+		}
+	})
+
+	t.Run("upgraded joined server lacking only the request-header CA", func(t *testing.T) {
+		wd := t.TempDir()
+		for _, p := range []struct{ src, dst string }{
+			{certs.ClusterCACertPath(wdA), certs.ClusterCACertPath(wd)}, {certs.ClusterCAKeyPath(wdA), certs.ClusterCAKeyPath(wd)},
+			{certs.SigningCACertPath(wdA), certs.SigningCACertPath(wd)}, {certs.SigningCAKeyPath(wdA), certs.SigningCAKeyPath(wd)},
+			{certs.EtcdCertPaths(wdA).ServerCACert, certs.EtcdCertPaths(wd).ServerCACert}, {certs.EtcdCertPaths(wdA).ServerCAKey, certs.EtcdCertPaths(wd).ServerCAKey},
+			{certs.EtcdCertPaths(wdA).PeerCACert, certs.EtcdCertPaths(wd).PeerCACert}, {certs.EtcdCertPaths(wdA).PeerCAKey, certs.EtcdCertPaths(wd).PeerCAKey},
+		} {
+			b, err := os.ReadFile(p.src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(p.dst), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p.dst, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := importInto(wd); !errors.Is(err, bootstrap.ErrBundlePredatesRequestHeaderCA) {
+			t.Fatalf("err = %v, want ErrBundlePredatesRequestHeaderCA", err)
+		}
+		if _, err := os.Lstat(certs.RequestHeaderCACertPath(wd)); !errors.Is(err, fs.ErrNotExist) {
+			t.Error("a refused import wrote a request-header CA")
+		}
+	})
 }

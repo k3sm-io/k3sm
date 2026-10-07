@@ -123,6 +123,11 @@ func (c Collector) Collect(ctx context.Context) Report {
 		if r, ok := c.etcdRow(ctx, c.installedServerArgs()); ok {
 			rows = append(rows, r)
 		}
+		// The aggregation layer's trust root, beside the HA member it is read with:
+		// this server's role, its request-header CA pin, the cluster's trusted count.
+		if r, ok := c.requestHeaderRow(ctx, c.installedServerArgs(), serving); ok {
+			rows = append(rows, r)
+		}
 		// Abandoned pod-range claims, on a server that has recorded any check.
 		if r, ok := c.meshClaimsRow(now()); ok {
 			rows = append(rows, r)

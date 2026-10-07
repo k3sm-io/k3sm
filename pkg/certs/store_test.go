@@ -99,7 +99,7 @@ func TestLoadCAPins(t *testing.T) {
 			dir := t.TempDir()
 			var want *certs.Hierarchy
 			if tc.seed {
-				h, err := certs.EnsureHierarchy(dir)
+				h, err := certs.EnsureHierarchy(dir, certs.RoleMintAuthority, certs.PostureKine)
 				if err != nil {
 					t.Fatalf("EnsureHierarchy: %v", err)
 				}
@@ -149,7 +149,7 @@ func TestLoadCAPinsNeverOpensCAKeys(t *testing.T) {
 		t.Skip("root bypasses file mode bits — the 0000 keys would be readable")
 	}
 	dir := t.TempDir()
-	h, err := certs.EnsureHierarchy(dir)
+	h, err := certs.EnsureHierarchy(dir, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("EnsureHierarchy: %v", err)
 	}
