@@ -204,6 +204,41 @@ join token is not involved and is not kept on the node after the join; it expire
 default, so an update that depended on it would stop working after a day. `kubectl describe node
 <name>` shows a `MeshEndpointChanged` event with the old and new values whenever this happens.
 
+### A worker on Wi-Fi
+
+A worker proves it is alive with two writes to the apiserver: it renews its `Lease` every 10 seconds
+and posts its node status once a minute. The controller-manager marks a node `NotReady` when its
+Lease has not been renewed for the node-monitor grace period, 50 seconds by default (40 seconds
+before Kubernetes 1.32). A lossy Wi-Fi link, or a roam to a new access point or a new DHCP address,
+can break the connection those writes travel on without closing it, so k3sm bounds them:
+
+- Both writes go through a client of their own, on their own connection, separate from the one the
+  node's watches use.
+- Each request has a 10 second timeout, so a write on a broken connection fails before the next
+  renewal is due.
+- The connection is checked with an HTTP/2 PING after 5 seconds without traffic, and closed if the
+  PING is not answered within 5 seconds. The next write dials a new connection from whatever address
+  the Mac has at that moment.
+
+What that gives you:
+
+- If the path to the server comes back within the 50 second grace period, the node stays `Ready`.
+- If the path stays down longer, the node goes `NotReady` 50 seconds after its last renewal. Once the
+  path returns, the Lease renewal resumes after a retry backoff of up to 7 seconds, and the worker
+  posts its status within 10 seconds of finding that the post failed or that the controller-manager
+  changed its `Ready` condition, as a kubelet does. The node is `Ready` again about 10 to 20 seconds
+  after the path comes back.
+- A node that stays `NotReady` or unreachable for 5 minutes has its Pods evicted, because Pods carry
+  the default `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` tolerations of 300
+  seconds. A Pod with a shorter `tolerationSeconds` is evicted sooner. A flap shorter than that
+  evicts nothing, but every flap restarts the clock.
+
+When a write fails, the worker's log says which request failed and why, and repeats of the same
+failure are logged at most once every 30 seconds. Once a write has not landed within its window (40
+seconds for the Lease, 100 seconds for the status), the log carries a `node heartbeat is stale` line
+naming the write and its age, and `k3sm status` shows a `heartbeat` row with both ages. The node does
+not restart itself: a write that cannot reach the server is a network problem a restart does not fix.
+
 ### Removing a worker
 
 `sudo k3sm uninstall` on a worker asks the cluster to forget the node before it tears the local

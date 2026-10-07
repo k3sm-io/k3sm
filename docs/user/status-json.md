@@ -150,10 +150,16 @@ four.
 
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig` and `runtimed`; some rows appear only when the
-thing they describe exists (`datavol`, `server-args`, `pre-volume`, `etcd`, `mesh-claims`,
-`node-resolver`, `shadow-shells`). Besides the daemon states above, a row's `state` may be `ok`,
-`ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`, `skip`,
-`drift`, `healthy` or `unhealthy`.
+thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
+`mesh-claims`, `node-resolver`, `shadow-shells`). Besides the daemon states above, a row's `state` may
+be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
+`skip`, `drift`, `healthy`, `unhealthy` or `stale`.
+
+The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
+Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was
+identified. Its `state` is `ok`, or `stale` (severity `warn`) when the Lease renewal is older than 40
+seconds or the status post is older than 100 seconds. `detail` gives both ages; `wide` carries them
+as `leaseAgeSeconds` and `statusAgeSeconds` when known.
 
 ## Rows
 

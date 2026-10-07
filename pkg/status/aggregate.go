@@ -40,8 +40,12 @@ const (
 	RowServerArgs = "server-args"
 	RowAPIServer  = "apiserver"
 	RowNode       = "node"
-	RowWorkloads  = "workloads"
-	RowDataRoot   = "data-root"
+	// RowHeartbeat is how long ago THIS Mac's node last posted its status and
+	// renewed its Lease, as the apiserver holds them. The row exists only when
+	// the apiserver answered and this Mac's node was identified.
+	RowHeartbeat = "heartbeat"
+	RowWorkloads = "workloads"
+	RowDataRoot  = "data-root"
 	// RowPreVolume is the copy a data-root migration left behind. The row
 	// exists only while the copy does.
 	RowPreVolume = "pre-volume"

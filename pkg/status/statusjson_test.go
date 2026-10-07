@@ -76,7 +76,7 @@ var (
 		StateOK, StateRunning, StateReady, StateCrashLoop, StateFailed, StateStopped, StateNotLoaded,
 		StateDisabled, StateDown, StateNotReady, StateWrongOwner, StateNotMounted, StateAbsent, StatePartial,
 		StateMissing, StateSkip, StateWaiting, StateExpired, StateCorrupt, StateAddressMismatch, StateDrift,
-		StateUnknown, StateHealthy, StateUnhealthy,
+		StateUnknown, StateHealthy, StateUnhealthy, StateStale,
 	}
 )
 
@@ -165,7 +165,7 @@ func contractAgent(t *testing.T, stage func(*testing.T, Paths, fakeFS) fakeFS) C
 func contractScenarios() map[string]contractScenario {
 	return map[string]contractScenario{
 		"running": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
-			return contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", healthyKube(), nil)
+			return contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", heartbeatingKube(goldenTime), nil)
 		}},
 		"degraded": {verdict: VerdictDegraded, collector: func(t *testing.T) Collector {
 			c := contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", healthyKube(), nil)

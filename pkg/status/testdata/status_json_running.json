@@ -67,6 +67,17 @@
       }
     },
     {
+      "name": "heartbeat",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "my-mac: node status posted 20s ago · lease renewed 5s ago",
+      "wide": {
+        "leaseAgeSeconds": "5",
+        "node": "my-mac",
+        "statusAgeSeconds": "20"
+      }
+    },
+    {
       "name": "workloads",
       "state": "ok",
       "severity": "ok",
