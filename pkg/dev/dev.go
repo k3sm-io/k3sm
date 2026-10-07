@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -182,9 +183,9 @@ type Manager struct {
 	// (handBack). A field so a test observes the hand-back without root; nil
 	// means os.Lchown.
 	lchown func(path string, uid, gid int) error
-	// lstat inspects a helper path's owner and mode for the execshim trust
-	// checks. A field so a test can present a file as root-owned without root;
-	// nil means unix.Lstat.
+	// lstat inspects a path's owner and mode for the execshim and pod-shim
+	// trust checks. A field so a test can present a file as root-owned (or as
+	// another user's) without root; nil means unix.Lstat.
 	lstat func(path string, st *unix.Stat_t) error
 	// rootBinDir, when set, overrides the root run's helper dir
 	// (rootExecShimDir, /Library/k3sm-dev/bin), so a test drives the root path
@@ -547,15 +548,36 @@ func (m *Manager) teardown(ctx context.Context, inst Instance) error {
 	// blob cache and PVC storage. `down` is destructive by contract — the
 	// pre-split layout put all three inside the instance dir Remove wipes.
 	if dir := removablePodRoot(inst, m.podRootBaseDir()); dir != "" {
-		if err := os.RemoveAll(dir); err != nil {
-			fmt.Fprintf(m.out, "warning: remove pod-root %q: %v\n", dir, err)
-		}
+		m.removePodRoot(dir)
 	}
 	if err := m.reg.Remove(inst.Name); err != nil && !errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("remove registry entry %q: %w", inst.Name, err)
 	}
 	fmt.Fprintf(m.out, "instance %q down\n", inst.Name)
 	return nil
+}
+
+// removePodRoot deletes an instance's runtime root (already bounded to a proper
+// descendant of the base by removablePodRoot), but only when the base and the
+// root are both directories this euid alone controls (ownedDirProblem). The
+// lexical bound alone is not enough: the base sits under the world-writable
+// /private/var/tmp, and a base another user planted (a link to elsewhere, or a
+// directory they own) would turn teardown, as root in the datapath tier, into a
+// recursive delete of a tree they chose. A refusal deletes nothing and is a
+// warning, like a failed removal; the registry entry is still removed.
+func (m *Manager) removePodRoot(dir string) {
+	for _, d := range []string{filepath.Dir(dir), dir} {
+		if _, err := os.Lstat(d); errors.Is(err, fs.ErrNotExist) {
+			return // nothing left to reclaim
+		}
+		if problem := m.ownedDirProblem(d); problem != "" {
+			fmt.Fprintf(m.out, "warning: not removing pod-root %q: %s. Remedy: %s\n", dir, problem, refusedDirRemedy(d))
+			return
+		}
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Fprintf(m.out, "warning: remove pod-root %q: %v\n", dir, err)
+	}
 }
 
 // removablePodRoot returns the instance's runtime root when it is safe to delete
@@ -759,9 +781,15 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	// Pre-create the runtime root so a base the caller cannot write (a stale tree
 	// owned by the other euid) fails here, with the path named, instead of inside
 	// the detached server's first pod create.
-	// Component by component with a symlink refusal: the base sits under the
-	// world-writable /private/var/tmp (see mkdirNoFollow).
-	if err := mkdirNoFollow(0o700, filepath.Dir(podRoot), podRoot); err != nil {
+	// Component by component, through the same walker as the shim stage: the base
+	// sits under the world-writable /private/var/tmp, so another local user can
+	// create it first (see ownedMkdirs). Unlike a refused shim stage, which only
+	// costs a feature, this is fatal: the runtime root holds every pod's data, and
+	// a root another user controls cannot be used at all.
+	if err := m.ownedMkdirs(0o700, filepath.Dir(podRoot), podRoot); err != nil {
+		if errors.Is(err, ErrForeignDir) || errors.Is(err, ErrSymlinkStage) {
+			return nil, fmt.Errorf("pod-root %s cannot be used, it holds every pod's data and another user could read or replace it: %w", podRoot, err)
+		}
 		return nil, fmt.Errorf("create pod-root %s: %w", podRoot, err)
 	}
 	// The instance's container-log root. The node REFUSES to start without it
