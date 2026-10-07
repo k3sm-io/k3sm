@@ -176,12 +176,25 @@ E="$WD/tls/etcd"
 etcd_api() { curl -sS --max-time 10 --cacert "$E/server-ca.crt" --cert "$E/client.crt" --key "$E/client.key" -X POST -d "$2" "https://127.0.0.1:$CP$1"; }
 etcd_metrics() { curl -sS --max-time 10 "http://127.0.0.1:$MP/metrics"; }
 daemon_running() { launchctl print "system/$LABEL" 2>/dev/null | grep -q 'state = running'; }
+# launchd removes a booted-out service asynchronously: the daemon keeps stopping its
+# children for several seconds, and a bootstrap issued meanwhile fails with 5
+# (Input/output error) while kickstart on the departing service returns 0 and starts
+# nothing. So stop waits until launchd no longer knows the service, and start retries
+# bootstrap and confirms the daemon runs, both bounded.
 daemon_stop() {
 	launchctl bootout "system/$LABEL" 2>/dev/null || true
+	i=0; while [ $i -lt 90 ] && launchctl print "system/$LABEL" >/dev/null 2>&1; do sleep 1; i=$((i+1)); done
 	i=0; while [ $i -lt 60 ] && pgrep -f "^$WD/bin/etcd " >/dev/null; do sleep 1; i=$((i+1)); done
-	! pgrep -f "^$WD/bin/etcd " >/dev/null
+	! launchctl print "system/$LABEL" >/dev/null 2>&1 && ! pgrep -f "^$WD/bin/etcd " >/dev/null
 }
-daemon_start() { launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl kickstart "system/$LABEL"; }
+daemon_start() {
+	i=0
+	until launchctl print "system/$LABEL" >/dev/null 2>&1 || launchctl bootstrap system "$PLIST" 2>/dev/null; do
+		i=$((i+1)); [ $i -ge 30 ] && return 1; sleep 1
+	done
+	launchctl kickstart "system/$LABEL" >/dev/null 2>&1 || true
+	i=0; until daemon_running; do i=$((i+1)); [ $i -ge 30 ] && return 1; sleep 1; done
+}
 crash_record_empty() { f="$WD/crashloop.json"; [ ! -s "$f" ] || ! grep -Eq '"component"|"tripped_at"' "$f"; }
 crash_record_tripped() { grep -q '"tripped_at"' "$WD/crashloop.json" 2>/dev/null; }
 etcd_pid() { pgrep -f "^$WD/bin/etcd " | head -n 1; }
