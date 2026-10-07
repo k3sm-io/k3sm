@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -236,6 +238,7 @@ func admitServerStart(ctx context.Context, opts serverOptions, breaker *crashBre
 		last, _ := rec.Last()
 		logger.Error(parkReason(last), "path", breaker.path, "tripped-at", rec.TrippedAt.Format(time.RFC3339),
 			"last-component", last.Component, "crashes-in-window", rec.Recent(time.Now()),
+			"leader-lost-in-window", rec.LeaderLost(time.Now()),
 			"clear-with", "k3sm server --clear-crashloop")
 		return "", true, parkUntilCleared(ctx, breaker.path, crashLoopPollInterval, logger)
 	}
@@ -436,24 +439,170 @@ func meshNodeIP(opts serverOptions) string {
 // crash, since exiting 0 would tell the operator this was a clean shutdown.
 // launchd restarts either way (KeepAlive is an unconditional bool), so the exit
 // status is for the human; the crash-loop breaker is what bounds the restarts.
-func componentExitHandler(crashed *atomic.Pointer[string], breaker *crashBreaker, crashCancel context.CancelFunc, logger *slog.Logger) func(name string, exitErr error, logPath, logTail string) {
+//
+// One exit is not a crash: on an HA server that loses etcd quorum, a
+// kube-controller-manager or kube-scheduler that held its leader lease exits
+// on purpose when it cannot renew it (leaderLeaseLost). That exit still
+// restarts the daemon exactly like a crash — the component has to rejoin the
+// next election — but it is recorded as executor.CrashOriginLeaderLost, which
+// never counts toward the crash threshold and has a bound of its own, so
+// repeated quorum loss no longer parks a server that is doing what upstream
+// intends.
+func componentExitHandler(crashed *atomic.Pointer[string], breaker *crashBreaker, probe controlPlaneProbe, crashCancel context.CancelFunc, logger *slog.Logger) func(name string, exitErr error, logPath, logTail string) {
 	return func(name string, exitErr error, logPath, logTail string) {
 		// First writer wins: the components die in a cascade (kine's exit takes
 		// the apiserver with it), and the FIRST one names the actual cause.
 		if crashed.CompareAndSwap(nil, &name) {
-			// The tail is already redacted and capped by pkg/executor, because
-			// launchd captures this logger into a world-readable
-			// /var/log/k3sm/server.log while the component log is 0600. The path
-			// is logged so the operator knows where the unredacted original is.
-			logger.Error("control-plane component exited; shutting down so launchd restarts the daemon",
-				"component", name, "err", exitErr, "log", logPath, "log-tail", logTail)
-			if breaker.record(name, logTail) {
-				logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
-					"path", breaker.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
+			if !leaderLeaseLost(probe, name, exitErr, logTail) {
+				// The tail is already redacted and capped by pkg/executor, because
+				// launchd captures this logger into a world-readable
+				// /var/log/k3sm/server.log while the component log is 0600. The path
+				// is logged so the operator knows where the unredacted original is.
+				logger.Error("control-plane component exited; shutting down so launchd restarts the daemon",
+					"component", name, "err", exitErr, "log", logPath, "log-tail", logTail)
+				if breaker.record(name, logTail) {
+					logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
+						"path", breaker.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
+				}
+			} else {
+				logger.Warn("control-plane component lost its leader lease and exited as upstream does; restarting the daemon so it rejoins the election (not counted as a crash)",
+					"component", name, "exit-code", leaseLossExitCode, "log", logPath, "log-tail", logTail)
+				if breaker.recordLeaderLost(name, logTail) {
+					logger.Error("crash-loop breaker tripped on repeated leader-lease loss while its etcd, kine and apiserver children were running; the next start will park until an operator clears the record",
+						"path", breaker.path, "threshold", executor.LeaderLostThreshold, "window", executor.CrashLoopWindow)
+				}
 			}
 		}
 		crashCancel()
 	}
+}
+
+// controlPlaneProbe is what componentExitHandler asks of the running control
+// plane to classify an exit. *supervisedProbe is the production one.
+type controlPlaneProbe interface {
+	// LeaderElected reports whether the scheduler and the controller-manager run
+	// with leader election (the HA posture).
+	LeaderElected() bool
+	// ComponentExited reports whether the named child has exited; a name that
+	// was never spawned reports false.
+	ComponentExited(name string) bool
+}
+
+// supervisedProbe is the production controlPlaneProbe. componentExitHandler is
+// wired into the executor's Config before the executor exists, so the
+// executor is stored here as soon as it is constructed (startControlPlane),
+// which is before any child is spawned. An empty probe answers as a
+// single-node control plane — leader election off — so every exit it is asked
+// about is classified the way it always was: as a crash.
+type supervisedProbe struct {
+	s atomic.Pointer[executor.Supervised]
+}
+
+func (p *supervisedProbe) set(s *executor.Supervised) { p.s.Store(s) }
+
+func (p *supervisedProbe) LeaderElected() bool {
+	s := p.s.Load()
+	return s != nil && s.LeaderElected()
+}
+
+func (p *supervisedProbe) ComponentExited(name string) bool {
+	s := p.s.Load()
+	return s == nil || s.ComponentExited(name)
+}
+
+// leaseLossMessages maps each leader-elected component to the exact message its
+// upstream OnStoppedLeading callback logs before it exits, as of the pinned
+// v1.36.5:
+//
+//   - kube-controller-manager, cmd/kube-controller-manager/app/controllermanager.go:
+//     logger.Error(nil, "leaderelection lost/stopped"), then
+//     klog.FlushAndExit(klog.ExitFlushTimeout, 1). (With the alpha
+//     ControllerManagerReleaseLeaderElectionLockOnExit gate on it does not exit
+//     there; k3sm does not enable it.)
+//   - kube-scheduler, cmd/kube-scheduler/app/server.go:
+//     logger.Error(nil, "Leaderelection lost"), then
+//     klog.FlushAndExit(klog.ExitFlushTimeout, 1).
+//
+// klog's text format quotes a structured message, so the quotes are part of the
+// match: they keep the controller-manager's leader-MIGRATION line
+// ("migration leaderelection lost/stopped"), which k3sm never configures, from
+// matching by substring. The pin is upstream text, so a version bump that
+// rewords either line turns lease loss back into a crash — the safe direction —
+// and TestLeaderLeaseLossIsNotACrash names the source lines to re-read.
+var leaseLossMessages = map[string]string{
+	"kube-controller-manager": `"leaderelection lost/stopped"`,
+	"kube-scheduler":          `"Leaderelection lost"`,
+}
+
+// leaseLossExitCode is the status both components exit with on a lost lease
+// (klog.FlushAndExit(..., 1)). Upstream has no distinct code for it — 1 is also
+// what most fatal errors exit with — so the code is a necessary condition and
+// the log line is the key.
+const leaseLossExitCode = 1
+
+// leaseLossPrerequisites are the children a leader-elected component depends
+// on. If any of them is dead when the lease loss is reported, the lease was
+// lost BECAUSE of a real crash, and the exit is recorded as one.
+var leaseLossPrerequisites = []string{"etcd", "kine", "kube-apiserver"}
+
+// leaderLeaseLost reports whether a component's exit is upstream's intended
+// exit on a lost leader lease rather than a crash. All of these must hold:
+// leader election is on; the component is the controller-manager or the
+// scheduler; it exited with leaseLossExitCode; the last fatal-looking line of
+// its redacted log tail is its lease-loss message (a lease-loss line followed by
+// some other fatal is that other fatal); and etcd, kine and the apiserver are
+// still running. Anything else is a crash, so a classification miss costs one
+// crash entry, never a hidden crash.
+func leaderLeaseLost(probe controlPlaneProbe, name string, exitErr error, logTail string) bool {
+	msg, ok := leaseLossMessages[name]
+	if !ok || probe == nil || !probe.LeaderElected() {
+		return false
+	}
+	var coded interface{ ExitCode() int }
+	if !errors.As(exitErr, &coded) || coded.ExitCode() != leaseLossExitCode {
+		return false
+	}
+	if !lastFatalIsLeaseLoss(logTail, msg) {
+		return false
+	}
+	for _, lower := range leaseLossPrerequisites {
+		if probe.ComponentExited(lower) {
+			return false
+		}
+	}
+	return true
+}
+
+// lastFatalIsLeaseLoss reports whether the tail carries the lease-loss message
+// and no fatal line after it. Ordinary log lines may follow it — the component's
+// other goroutines keep logging until klog's flush-and-exit returns — but a
+// klog fatal, a Go panic or a runtime fatal error after it means the process
+// died of that instead.
+func lastFatalIsLeaseLoss(tail, msg string) bool {
+	lines := strings.Split(tail, "\n")
+	at := -1
+	for i, l := range lines {
+		if strings.Contains(l, msg) {
+			at = i
+		}
+	}
+	if at < 0 {
+		return false
+	}
+	for _, l := range lines[at+1:] {
+		if fatalLine(l) {
+			return false
+		}
+	}
+	return true
+}
+
+// klogFatalHeader is a klog FATAL line's header: "F", MMDD, then the time.
+var klogFatalHeader = regexp.MustCompile(`^F\d{4} \d{2}:\d{2}:\d{2}`)
+
+func fatalLine(l string) bool {
+	l = strings.TrimSpace(l)
+	return klogFatalHeader.MatchString(l) || strings.HasPrefix(l, "panic:") || strings.HasPrefix(l, "fatal error:")
 }
 
 // startControlPlane runs the HA etcd member route over cfg, freezes the result
@@ -461,7 +610,7 @@ func componentExitHandler(crashed *atomic.Pointer[string], breaker *crashBreaker
 // executor from that plan's Config and brings it up, returning once every
 // component is healthy. The plan is returned BY VALUE and only after the
 // member route's Config reassignment, so nothing downstream reads a stale cfg.
-func startControlPlane(ctx context.Context, opts serverOptions, mode hostnet.Mode, cfg executor.Config, pki serverPKI, breaker *crashBreaker, logger *slog.Logger) (serverPlan, *executor.Supervised, error) {
+func startControlPlane(ctx context.Context, opts serverOptions, mode hostnet.Mode, cfg executor.Config, pki serverPKI, breaker *crashBreaker, probe *supervisedProbe, logger *slog.Logger) (serverPlan, *executor.Supervised, error) {
 	// On a joining HA server's first boot the etcd member route runs here, before the
 	// executor (serveretcd.go): the member starts with the route's initial cluster.
 	// A transient answer is retried in-process and never counted; a PERMANENT refusal
@@ -475,6 +624,8 @@ func startControlPlane(ctx context.Context, opts serverOptions, mode hostnet.Mod
 	}
 	plan := serverPlan{opts: opts, mode: mode, cfg: cfg, serverPKI: pki}
 	exec := executor.NewSupervised(plan.cfg)
+	// Before Start, so the exit handler can ask about any child it is told of.
+	probe.set(exec)
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
 	if err := exec.Start(ctx); err != nil {
 		// This is the place a control plane that never came up gets counted.

@@ -72,6 +72,17 @@ func (b *crashBreaker) record(component, detail string) (tripped bool) {
 	return b.recordOrigin(executor.CrashOriginCrash, component, detail)
 }
 
+// recordLeaderLost appends one leader-lease loss — a leader-elected component
+// that exited as upstream intends when its lease could not be renewed — and
+// reports whether it tripped the breaker. It never counts toward the crash
+// threshold; it has its own, executor.LeaderLostThreshold, so a lease that
+// flaps forever still parks the server instead of restarting it forever.
+func (b *crashBreaker) recordLeaderLost(component, detail string) (tripped bool) {
+	return b.write(func(r *executor.CrashRecord, now time.Time) bool {
+		return r.RecordLeaderLost(now, component, detail)
+	})
+}
+
 // recordBringUp appends one BRING-UP failure — a control plane that never came
 // up at all, which the component-exit callback never sees because the child
 // either never started or died before it was marked supervised. Detail is the
@@ -249,6 +260,10 @@ func (b *crashBreaker) resetIfHealthy() {
 // difference survives the restart. The remedy is the same either way and is
 // logged beside this.
 func parkReason(last executor.Crash) string {
+	if last.Origin == executor.CrashOriginLeaderLost {
+		return "crash-loop breaker tripped on repeated leader-lease loss (last: " + last.Component +
+			"); this server keeps losing etcd quorum; parking until an operator clears the record"
+	}
 	if last.Origin == executor.CrashOriginBringUp {
 		return "crash-loop breaker tripped; the control plane never came up (last: " + last.Component +
 			"); parking until an operator clears the record"
