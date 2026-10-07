@@ -17,13 +17,16 @@ limitations under the License.
 package certs
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 // bundleSchemaVersion stamps the serialized CA hierarchy so a field change is
 // detectable rather than silently mis-parsed. Version 2 added the etcd server and peer
-// CA pairs; Unmarshal accepts exactly this version.
+// CA pairs; Unmarshal accepts exactly this version. The CAs a version carries are the
+// rows of caSpecs whose sinceSchema is at most that version.
 const bundleSchemaVersion = 2
 
 // bundleSchemaPreEtcd is the schema a server that predates etcd HA emits (cluster +
@@ -31,23 +34,21 @@ const bundleSchemaVersion = 2
 // way to receive one is a mixed-release HA control plane.
 const bundleSchemaPreEtcd = 1
 
-// marshalledHierarchy is the on-the-wire shape of Marshal: the eight PEMs (four CA
-// certificates and their private keys) the HA server-join bundle reconstructs.
-// encoding/json base64-encodes the []byte fields.
-type marshalledHierarchy struct {
-	SchemaVersion       int    `json:"schemaVersion"`
-	ClusterCACertPEM    []byte `json:"clusterCACertPEM"`
-	ClusterCAKeyPEM     []byte `json:"clusterCAKeyPEM"`
-	SigningCACertPEM    []byte `json:"signingCACertPEM"`
-	SigningCAKeyPEM     []byte `json:"signingCAKeyPEM"`
-	EtcdServerCACertPEM []byte `json:"etcdServerCACertPEM"`
-	EtcdServerCAKeyPEM  []byte `json:"etcdServerCAKeyPEM"`
-	EtcdPeerCACertPEM   []byte `json:"etcdPeerCACertPEM"`
-	EtcdPeerCAKeyPEM    []byte `json:"etcdPeerCAKeyPEM"`
+// bundleRows returns the CA rows a bundle of schema version carries, in key order.
+func bundleRows(version int) []caSpec {
+	var rows []caSpec
+	for _, spec := range caSpecs {
+		if spec.sinceSchema <= version {
+			rows = append(rows, spec)
+		}
+	}
+	return rows
 }
 
 // Marshal serializes the four-CA hierarchy — the cluster, signing, etcd server and
-// etcd peer CA certificate and PRIVATE-KEY PEMs — into opaque, self-describing bytes.
+// etcd peer CA certificate and PRIVATE-KEY PEMs — into opaque, self-describing bytes:
+// a JSON object of schemaVersion followed by each CA's certificate and key, in the CA
+// table's order (encoding/json base64-encodes the PEMs).
 // All four CAs are required: the bundle exists only for an HA control plane, and HA
 // is the etcd posture. This is the plaintext the HA server-join bootstrap bundle
 // AES-256-GCM-seals (k3sm.io/k3sm/pkg/bootstrap.SealBundle) so a joining control-plane
@@ -56,20 +57,28 @@ type marshalledHierarchy struct {
 // edge does not cycle. The bytes carry private keys and must only ever leave a host
 // SEALED.
 func (h *Hierarchy) Marshal() ([]byte, error) {
-	if h == nil || h.Cluster == nil || h.Signing == nil || h.EtcdServer == nil || h.EtcdPeer == nil {
+	if !hierarchyComplete(h) {
 		return nil, fmt.Errorf("certs: marshal hierarchy: cluster, signing, etcd server and etcd peer CAs are required")
 	}
-	return json.Marshal(marshalledHierarchy{
-		SchemaVersion:       bundleSchemaVersion,
-		ClusterCACertPEM:    h.Cluster.CertPEM,
-		ClusterCAKeyPEM:     h.Cluster.KeyPEM,
-		SigningCACertPEM:    h.Signing.CertPEM,
-		SigningCAKeyPEM:     h.Signing.KeyPEM,
-		EtcdServerCACertPEM: h.EtcdServer.CertPEM,
-		EtcdServerCAKeyPEM:  h.EtcdServer.KeyPEM,
-		EtcdPeerCACertPEM:   h.EtcdPeer.CertPEM,
-		EtcdPeerCAKeyPEM:    h.EtcdPeer.KeyPEM,
-	})
+	var b bytes.Buffer
+	b.WriteString(`{"schemaVersion":`)
+	b.WriteString(strconv.Itoa(bundleSchemaVersion))
+	for _, spec := range bundleRows(bundleSchemaVersion) {
+		ca := spec.ca(h)
+		for _, kv := range []struct {
+			key string
+			pem []byte
+		}{{spec.certKey, ca.CertPEM}, {spec.keyKey, ca.KeyPEM}} {
+			val, err := json.Marshal(kv.pem)
+			if err != nil {
+				return nil, fmt.Errorf("certs: marshal hierarchy: %s CA: %w", spec.label, err)
+			}
+			b.WriteString(`,"` + kv.key + `":`)
+			b.Write(val)
+		}
+	}
+	b.WriteByte('}')
+	return b.Bytes(), nil
 }
 
 // Unmarshal reconstructs the hierarchy from Marshal's bytes, parsing the eight PEMs
@@ -80,36 +89,42 @@ func (h *Hierarchy) Marshal() ([]byte, error) {
 // tag failure means these bytes are never reached) and BEFORE
 // ReconcileImportedHierarchy, so a refusal here writes nothing.
 func (h *Hierarchy) Unmarshal(data []byte) error {
-	var m marshalledHierarchy
-	if err := json.Unmarshal(data, &m); err != nil {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return fmt.Errorf("certs: unmarshal hierarchy: %w", err)
 	}
-	switch m.SchemaVersion {
+	var version int
+	if v, ok := raw["schemaVersion"]; ok {
+		if err := json.Unmarshal(v, &version); err != nil {
+			return fmt.Errorf("certs: unmarshal hierarchy: schemaVersion: %w", err)
+		}
+	}
+	switch version {
 	case bundleSchemaVersion:
 	case bundleSchemaPreEtcd:
-		return fmt.Errorf("certs: unmarshal hierarchy: unsupported schema version %d: this server predates etcd HA; every HA server must run the same release", m.SchemaVersion)
+		return fmt.Errorf("certs: unmarshal hierarchy: unsupported schema version %d: this server predates etcd HA; every HA server must run the same release", version)
 	default:
-		return fmt.Errorf("certs: unmarshal hierarchy: unsupported schema version %d (want %d)", m.SchemaVersion, bundleSchemaVersion)
+		return fmt.Errorf("certs: unmarshal hierarchy: unsupported schema version %d (want %d)", version, bundleSchemaVersion)
 	}
-	cluster, err := LoadCA(m.ClusterCACertPEM, m.ClusterCAKeyPEM)
-	if err != nil {
-		return fmt.Errorf("certs: unmarshal hierarchy: cluster CA: %w", err)
+	var out Hierarchy
+	for _, spec := range bundleRows(version) {
+		var certPEM, keyPEM []byte
+		for _, kv := range []struct {
+			key string
+			dst *[]byte
+		}{{spec.certKey, &certPEM}, {spec.keyKey, &keyPEM}} {
+			if v, ok := raw[kv.key]; ok {
+				if err := json.Unmarshal(v, kv.dst); err != nil {
+					return fmt.Errorf("certs: unmarshal hierarchy: %s: %w", kv.key, err)
+				}
+			}
+		}
+		ca, err := LoadCA(certPEM, keyPEM)
+		if err != nil {
+			return fmt.Errorf("certs: unmarshal hierarchy: %s CA: %w", spec.label, err)
+		}
+		spec.set(&out, ca)
 	}
-	signing, err := LoadCA(m.SigningCACertPEM, m.SigningCAKeyPEM)
-	if err != nil {
-		return fmt.Errorf("certs: unmarshal hierarchy: signing CA: %w", err)
-	}
-	etcdServer, err := LoadCA(m.EtcdServerCACertPEM, m.EtcdServerCAKeyPEM)
-	if err != nil {
-		return fmt.Errorf("certs: unmarshal hierarchy: etcd server CA: %w", err)
-	}
-	etcdPeer, err := LoadCA(m.EtcdPeerCACertPEM, m.EtcdPeerCAKeyPEM)
-	if err != nil {
-		return fmt.Errorf("certs: unmarshal hierarchy: etcd peer CA: %w", err)
-	}
-	h.Cluster = cluster
-	h.Signing = signing
-	h.EtcdServer = etcdServer
-	h.EtcdPeer = etcdPeer
+	*h = out
 	return nil
 }

@@ -280,19 +280,16 @@ func CertPin(certPEM []byte) (string, error) {
 // are written 0600; certs 0644. It fails fast on a partially-written hierarchy rather
 // than silently regenerating (which would invalidate every issued node cert).
 func EnsureHierarchy(workDir string, role Role, posture Posture) (*Hierarchy, error) {
-	dir := PKIDir(workDir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("create PKI dir: %w", err)
+	h := &Hierarchy{}
+	for _, spec := range caSpecs {
+		if spec.class != classAlways {
+			continue
+		}
+		if err := ensureRow(workDir, spec, h); err != nil {
+			return nil, err
+		}
 	}
-	cluster, err := ensureCA(dir, clusterCACert, clusterCAKey, "k3sm-cluster-ca")
-	if err != nil {
-		return nil, fmt.Errorf("cluster CA: %w", err)
-	}
-	signing, err := ensureCA(dir, signingCACert, signingCAKey, "k3sm-signing-ca")
-	if err != nil {
-		return nil, fmt.Errorf("signing CA: %w", err)
-	}
-	return &Hierarchy{Cluster: cluster, Signing: signing}, nil
+	return h, nil
 }
 
 // EnsureEtcdCAs loads the etcd server and peer CAs from <PKI>/etcd, creating and
@@ -304,19 +301,30 @@ func EnsureHierarchy(workDir string, role Role, posture Posture) (*Hierarchy, er
 // already installed by ReconcileImportedHierarchy from the bootstrap bundle and so
 // LOADS the identical CAs.
 func EnsureEtcdCAs(workDir string) (server, peer *CA, err error) {
-	dir, err := ensureEtcdDir(workDir)
-	if err != nil {
-		return nil, nil, err
+	h := &Hierarchy{}
+	for _, spec := range caSpecs {
+		if spec.class != classEtcd {
+			continue
+		}
+		if err := ensureRow(workDir, spec, h); err != nil {
+			return nil, nil, err
+		}
 	}
-	server, err = ensureCA(dir, etcdServerCACert, etcdServerCAKey, etcdServerCACN)
+	return h.EtcdServer, h.EtcdPeer, nil
+}
+
+// ensureRow loads or mints spec's CA into h, creating its directory with its mode.
+func ensureRow(workDir string, spec caSpec, h *Hierarchy) error {
+	dir, err := spec.ensureDir(workDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("etcd server CA: %w", err)
+		return err
 	}
-	peer, err = ensureCA(dir, etcdPeerCACert, etcdPeerCAKey, etcdPeerCACN)
+	ca, err := ensureCA(dir, spec.certFile, spec.keyFile, spec.commonName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("etcd peer CA: %w", err)
+		return fmt.Errorf("%s CA: %w", spec.label, err)
 	}
-	return server, peer, nil
+	spec.set(h, ca)
+	return nil
 }
 
 // ensureEtcdDir creates <PKI>/etcd (the PKI dir 0755 as EnsureHierarchy makes it, the
@@ -340,32 +348,57 @@ func ensureEtcdDir(workDir string) (string, error) {
 	return dir, nil
 }
 
-// caSpec is one CA keypair of the hierarchy: its id (for reports), the directory it
-// lives in, its file names there, and the Hierarchy field that holds it in memory.
+// caClass says which servers hold a CA: every server, or only the etcd HA posture.
+type caClass int
+
+const (
+	classAlways caClass = iota + 1
+	classEtcd
+)
+
+// caSpec is one CA of the hierarchy, and the one place everything about it is said:
+// its id and the word errors use for it, the directory it lives in (with the mode
+// that directory is created with), its file names there, its common name, which
+// servers hold it, the bundle schema that first carried it and the bundle's JSON
+// keys for it, and the Hierarchy field that holds it in memory.
 type caSpec struct {
 	id CAID
+	// label names the CA in errors ("cluster" -> "cluster CA: ...").
+	label string
 	// dir returns the keypair's directory under workDir; it creates nothing.
 	dir func(workDir string) string
 	// ensureDir creates the keypair's directory with its mode (the PKI dir 0755, the
 	// etcd subdirectory 0700) and returns its path.
-	ensureDir func(workDir string) (string, error)
-	certFile  string
-	keyFile   string
-	ca        func(*Hierarchy) *CA
+	ensureDir  func(workDir string) (string, error)
+	certFile   string
+	keyFile    string
+	commonName string
+	class      caClass
+	// sinceSchema is the first bundle schema that carries this CA; certKey and
+	// keyKey are its JSON keys there.
+	sinceSchema     int
+	certKey, keyKey string
+	ca              func(*Hierarchy) *CA
+	set             func(*Hierarchy, *CA)
 }
 
-// caSpecs is the whole CA hierarchy, one row per CA, in install order. Every walk over
-// the on-disk hierarchy (MissingOnDisk, ReconcileImportedHierarchy) goes through
-// it, so a CA is never added to one walk and forgotten by another.
+// caSpecs is the whole CA hierarchy, one row per CA, in install order (which is also
+// the bundle's key order). Every walk over the hierarchy (ensure, MissingOnDisk,
+// ReconcileImportedHierarchy, the bundle codec) goes through it, so a CA is never
+// added to one walk and forgotten by another.
 var caSpecs = []caSpec{
-	{id: CACluster, dir: PKIDir, ensureDir: ensurePKIDir, certFile: clusterCACert, keyFile: clusterCAKey,
-		ca: func(h *Hierarchy) *CA { return h.Cluster }},
-	{id: CASigning, dir: PKIDir, ensureDir: ensurePKIDir, certFile: signingCACert, keyFile: signingCAKey,
-		ca: func(h *Hierarchy) *CA { return h.Signing }},
-	{id: CAEtcdServer, dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdServerCACert, keyFile: etcdServerCAKey,
-		ca: func(h *Hierarchy) *CA { return h.EtcdServer }},
-	{id: CAEtcdPeer, dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdPeerCACert, keyFile: etcdPeerCAKey,
-		ca: func(h *Hierarchy) *CA { return h.EtcdPeer }},
+	{id: CACluster, label: "cluster", dir: PKIDir, ensureDir: ensurePKIDir, certFile: clusterCACert, keyFile: clusterCAKey,
+		commonName: "k3sm-cluster-ca", class: classAlways, sinceSchema: 1, certKey: "clusterCACertPEM", keyKey: "clusterCAKeyPEM",
+		ca: func(h *Hierarchy) *CA { return h.Cluster }, set: func(h *Hierarchy, ca *CA) { h.Cluster = ca }},
+	{id: CASigning, label: "signing", dir: PKIDir, ensureDir: ensurePKIDir, certFile: signingCACert, keyFile: signingCAKey,
+		commonName: "k3sm-signing-ca", class: classAlways, sinceSchema: 1, certKey: "signingCACertPEM", keyKey: "signingCAKeyPEM",
+		ca: func(h *Hierarchy) *CA { return h.Signing }, set: func(h *Hierarchy, ca *CA) { h.Signing = ca }},
+	{id: CAEtcdServer, label: "etcd server", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdServerCACert, keyFile: etcdServerCAKey,
+		commonName: etcdServerCACN, class: classEtcd, sinceSchema: 2, certKey: "etcdServerCACertPEM", keyKey: "etcdServerCAKeyPEM",
+		ca: func(h *Hierarchy) *CA { return h.EtcdServer }, set: func(h *Hierarchy, ca *CA) { h.EtcdServer = ca }},
+	{id: CAEtcdPeer, label: "etcd peer", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdPeerCACert, keyFile: etcdPeerCAKey,
+		commonName: etcdPeerCACN, class: classEtcd, sinceSchema: 2, certKey: "etcdPeerCACertPEM", keyKey: "etcdPeerCAKeyPEM",
+		ca: func(h *Hierarchy) *CA { return h.EtcdPeer }, set: func(h *Hierarchy, ca *CA) { h.EtcdPeer = ca }},
 }
 
 // etcdPKIDir returns <PKI>/etcd; it creates nothing.

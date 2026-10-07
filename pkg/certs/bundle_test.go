@@ -96,7 +96,7 @@ func TestHierarchyMarshalUnmarshalRoundTrip(t *testing.T) {
 	}
 
 	// A version mismatch is rejected (tamper-evident schema).
-	bad, err := json.Marshal(marshalledHierarchy{
+	bad, err := json.Marshal(v2Struct{
 		SchemaVersion:    999,
 		ClusterCACertPEM: src.Cluster.CertPEM,
 		ClusterCAKeyPEM:  src.Cluster.KeyPEM,
@@ -108,6 +108,55 @@ func TestHierarchyMarshalUnmarshalRoundTrip(t *testing.T) {
 	}
 	if err := (&Hierarchy{}).Unmarshal(bad); err == nil {
 		t.Error("Unmarshal must reject an unsupported schema version")
+	}
+}
+
+// v2Struct is the schema-2 bundle exactly as the release before the CA table encoded
+// it: a Go struct whose field order is the JSON key order.
+type v2Struct struct {
+	SchemaVersion       int    `json:"schemaVersion"`
+	ClusterCACertPEM    []byte `json:"clusterCACertPEM"`
+	ClusterCAKeyPEM     []byte `json:"clusterCAKeyPEM"`
+	SigningCACertPEM    []byte `json:"signingCACertPEM"`
+	SigningCAKeyPEM     []byte `json:"signingCAKeyPEM"`
+	EtcdServerCACertPEM []byte `json:"etcdServerCACertPEM"`
+	EtcdServerCAKeyPEM  []byte `json:"etcdServerCAKeyPEM"`
+	EtcdPeerCACertPEM   []byte `json:"etcdPeerCACertPEM"`
+	EtcdPeerCAKeyPEM    []byte `json:"etcdPeerCAKeyPEM"`
+}
+
+// v2StructBytes encodes h's four B410 CAs the way the struct encoder did, stamped
+// with version.
+func v2StructBytes(t *testing.T, h *Hierarchy, version int) []byte {
+	t.Helper()
+	b, err := json.Marshal(v2Struct{
+		SchemaVersion:       version,
+		ClusterCACertPEM:    h.Cluster.CertPEM,
+		ClusterCAKeyPEM:     h.Cluster.KeyPEM,
+		SigningCACertPEM:    h.Signing.CertPEM,
+		SigningCAKeyPEM:     h.Signing.KeyPEM,
+		EtcdServerCACertPEM: h.EtcdServer.CertPEM,
+		EtcdServerCAKeyPEM:  h.EtcdServer.KeyPEM,
+		EtcdPeerCACertPEM:   h.EtcdPeer.CertPEM,
+		EtcdPeerCAKeyPEM:    h.EtcdPeer.KeyPEM,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestBundleEncodingKeepsTheV2Bytes pins that the table-driven encoder writes the
+// schema-2 bundle byte for byte as the struct encoder before it did: same keys, same
+// order, same base64.
+func TestBundleEncodingKeepsTheV2Bytes(t *testing.T) {
+	h := newTestHierarchy(t)
+	got, err := h.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if want := v2StructBytes(t, h, 2); !bytes.Equal(got, want) {
+		t.Errorf("the encoding changed:\n got %.120s...\nwant %.120s...", got, want)
 	}
 }
 
