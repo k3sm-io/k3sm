@@ -560,7 +560,9 @@ func (s *Supervised) provisionComponentCerts() error {
 	if err := writeAPIServerKubeletClientCert(s.cfg.WorkDir, h); err != nil {
 		return err
 	}
-	return nil
+	// The aggregation layer's front-proxy client, unconditional for the same reason:
+	// apiServerArgs renders --proxy-client-cert-file in every posture.
+	return writeProxyClientCert(s.cfg.WorkDir, h)
 }
 
 // componentReadyTimeout bounds each component's bring-up wait — the same budget
@@ -881,6 +883,26 @@ func apiServerArgs(cfg Config) []string {
 	args = append(args,
 		"--kubelet-client-certificate", apiServerKubeletClientCertPath(wd),
 		"--kubelet-client-key", apiServerKubeletClientKeyPath(wd))
+	// The aggregation layer (k3s's values, UNCONDITIONAL in every posture as k3s sets
+	// them): the request-header CA is the only issuer of the front-proxy client and a
+	// root of its own, never the --client-ca-file; system:auth-proxy is the one
+	// allowed name. No --requestheader-uid-headers (k3s sets none).
+	//
+	// --enable-aggregator-routing=false, rendered explicitly so a flip is a reviewed
+	// argv diff: with routing on the aggregator dials an APIService's endpoint IP,
+	// off it dials the Service's ClusterIP. k3s turns it on only beside its
+	// egress-selector tunnel, which is how a k3s server reaches pod IPs; k3sm has no
+	// egress selector, and the ClusterIP path through the userspace Service proxy is
+	// the one the apiserver's webhook delivery already uses.
+	args = append(args,
+		"--requestheader-client-ca-file", certs.RequestHeaderCACertPath(wd),
+		"--requestheader-allowed-names", certs.ProxyClientCN,
+		"--requestheader-username-headers", requestHeaderUsernameHeader,
+		"--requestheader-group-headers", requestHeaderGroupHeader,
+		"--requestheader-extra-headers-prefix", requestHeaderExtraHeadersPrefix,
+		"--proxy-client-cert-file", ProxyClientCertPath(wd),
+		"--proxy-client-key-file", ProxyClientKeyPath(wd),
+		"--enable-aggregator-routing=false")
 	if cfg.KubeletCAFile != "" {
 		args = append(args, "--kubelet-certificate-authority", cfg.KubeletCAFile)
 	}

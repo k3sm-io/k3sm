@@ -198,17 +198,18 @@ func RotateCertificates(ctx context.Context, opts RotateOptions) (*RotationRepor
 	}
 
 	// Fail closed on an absent or half-present hierarchy — LoadCAPins never mints one.
-	clusterPin, signingPin, err := certs.LoadCAPins(opts.WorkDir)
+	pins, err := loadRotationPins(opts.WorkDir)
 	if err != nil {
 		return nil, fmt.Errorf("verify CA hierarchy: %w", err)
 	}
 
 	rep := &RotationReport{
-		WorkDir:      opts.WorkDir,
-		ClusterCAPin: clusterPin,
-		SigningCAPin: signingPin,
-		Reissued:     reissuedArtifacts(opts.WorkDir),
-		OutOfScope:   outOfScopeArtifacts(opts.WorkDir),
+		WorkDir:            opts.WorkDir,
+		ClusterCAPin:       pins.cluster,
+		SigningCAPin:       pins.signing,
+		RequestHeaderCAPin: pins.requestHeader,
+		Reissued:           reissuedArtifacts(opts.WorkDir),
+		OutOfScope:         outOfScopeArtifacts(opts.WorkDir),
 	}
 	if !opts.Restart {
 		return rep, nil
@@ -230,7 +231,7 @@ func RotateCertificates(ctx context.Context, opts RotateOptions) (*RotationRepor
 
 	// Re-verify immediately: if the kickstart somehow disturbed the PKI, say so before
 	// spending the wait budget.
-	if err := verifyPinsUnchanged(opts.WorkDir, clusterPin, signingPin); err != nil {
+	if err := verifyPinsUnchanged(opts.WorkDir, pins); err != nil {
 		return rep, err
 	}
 	newPID, err := awaitRestartedInstance(ctx, opts, priorPID)
@@ -243,23 +244,48 @@ func RotateCertificates(ctx context.Context, opts RotateOptions) (*RotationRepor
 	// the CA hierarchy (EnsureHierarchy's load arm) rather than minting a fresh,
 	// cluster-orphaning one. It is only meaningful because the wait above refused to
 	// accept an answer from the outgoing instance.
-	if err := verifyPinsUnchanged(opts.WorkDir, clusterPin, signingPin); err != nil {
+	if err := verifyPinsUnchanged(opts.WorkDir, pins); err != nil {
 		return rep, err
 	}
 	return rep, nil
 }
 
-// verifyPinsUnchanged re-reads the CA pins and fails loudly if either moved.
-func verifyPinsUnchanged(workDir, cluster, signing string) error {
-	gotCluster, gotSigning, err := certs.LoadCAPins(workDir)
+// rotationPins are the CA pins a rotation records before the restart and re-reads
+// after it: every CA the boot loads and must never re-mint.
+type rotationPins struct {
+	cluster, signing, requestHeader string
+}
+
+// loadRotationPins reads the pins of the cluster, signing and request-header CAs,
+// certificates only (no CA private key is opened).
+func loadRotationPins(workDir string) (rotationPins, error) {
+	var p rotationPins
+	var err error
+	if p.cluster, p.signing, err = certs.LoadCAPins(workDir); err != nil {
+		return rotationPins{}, err
+	}
+	if p.requestHeader, err = certs.LoadRequestHeaderPin(workDir); err != nil {
+		return rotationPins{}, err
+	}
+	return p, nil
+}
+
+// verifyPinsUnchanged re-reads the CA pins and fails loudly if any moved. The
+// request-header CA is compared like the other two: it is the aggregation layer's
+// impersonation root, the CA whose silent replacement would matter most.
+func verifyPinsUnchanged(workDir string, want rotationPins) error {
+	got, err := loadRotationPins(workDir)
 	if err != nil {
 		return fmt.Errorf("re-verify CA hierarchy: %w", err)
 	}
-	if gotCluster != cluster {
-		return fmt.Errorf("%w: cluster CA %s -> %s", ErrCAPinChanged, cluster, gotCluster)
-	}
-	if gotSigning != signing {
-		return fmt.Errorf("%w: signing CA %s -> %s", ErrCAPinChanged, signing, gotSigning)
+	for _, c := range []struct{ name, was, now string }{
+		{"cluster", want.cluster, got.cluster},
+		{"signing", want.signing, got.signing},
+		{"request-header", want.requestHeader, got.requestHeader},
+	} {
+		if c.now != c.was {
+			return fmt.Errorf("%w: %s CA %s -> %s", ErrCAPinChanged, c.name, c.was, c.now)
+		}
 	}
 	return nil
 }
@@ -324,6 +350,10 @@ func reissuedArtifacts(workDir string) []RotationArtifact {
 			"client cert CN="+certs.APIServerKubeletClientCN+", issued by the signing CA — the identity a node's kubelet endpoint admits; re-issued on every boot"),
 		artifact(APIServerKubeletClientKeyPath(workDir),
 			"apiserver kubelet-client key for the cert above"),
+		artifact(ProxyClientCertPath(workDir),
+			"client cert CN="+certs.ProxyClientCN+", issued by the request-header CA — the aggregation layer's front-proxy client; re-issued on every boot"),
+		artifact(ProxyClientKeyPath(workDir),
+			"front-proxy client key for the cert above"),
 		artifact(certs.APIServerServingCertPath(workDir),
 			"apiserver serving cert, issued by the cluster CA — multi-node (--mesh-ip) servers only; re-issued on every boot"),
 		artifact(certs.APIServerServingKeyPath(workDir),
@@ -382,6 +412,10 @@ func outOfScopeArtifacts(workDir string) []RotationArtifact {
 			"the cluster CA itself — every join token pins K10<sha256(this cert)>; re-minting it orphans every node"),
 		artifact(certs.SigningCACertPath(workDir),
 			"the signing CA itself — every issued node and component client cert chains to it"),
+		artifact(certs.RequestHeaderCACertPath(workDir),
+			"the request-header CA itself — the aggregation layer's trust root; every server holds the same one, and a re-mint is a second impersonation root"),
+		artifact(certs.RequestHeaderCAKeyPath(workDir),
+			"the request-header CA private key — never rotated, never read by this command"),
 		artifact(KubeconfigPath(workDir),
 			"admin kubeconfig — it carries the static bearer token, not a CA-signed identity"),
 		artifact(TokenFilePath(workDir),

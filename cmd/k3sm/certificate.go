@@ -249,8 +249,9 @@ func renderRotationReport(w io.Writer, rep *executor.RotationReport, opts execut
 	fmt.Fprintf(w, "k3sm certificate rotate — work dir %s\n\n", rep.WorkDir)
 
 	fmt.Fprint(w, "CA hierarchy (never re-minted — these pins MUST NOT change):\n")
-	fmt.Fprintf(w, "  cluster CA  sha256:%s\n", rep.ClusterCAPin)
-	fmt.Fprintf(w, "  signing CA  sha256:%s\n\n", rep.SigningCAPin)
+	fmt.Fprintf(w, "  cluster CA         sha256:%s\n", rep.ClusterCAPin)
+	fmt.Fprintf(w, "  signing CA         sha256:%s\n", rep.SigningCAPin)
+	fmt.Fprintf(w, "  request-header CA  sha256:%s\n\n", rep.RequestHeaderCAPin)
 
 	fmt.Fprint(w, "Leaf credentials the control plane re-issues from those CAs on its next boot:\n")
 	writeArtifacts(w, rep.Reissued)

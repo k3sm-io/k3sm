@@ -91,6 +91,14 @@ func APIServerKubeletClientKeyPath(workDir string) string {
 	return apiServerKubeletClientKeyPath(workDir)
 }
 
+// The request headers the aggregator sets and every backend trusting the
+// request-header CA reads the user from (k3s's and upstream's names).
+const (
+	requestHeaderUsernameHeader     = "X-Remote-User"
+	requestHeaderGroupHeader        = "X-Remote-Group"
+	requestHeaderExtraHeadersPrefix = "X-Remote-Extra-"
+)
+
 // ProxyClientCertPath / ProxyClientKeyPath are the aggregator's front-proxy client
 // keypair (--proxy-client-cert-file / --proxy-client-key-file): CN
 // certs.ProxyClientCN, issued by the request-header CA, re-minted every boot.
@@ -1081,6 +1089,27 @@ func writeAPIServerKubeletClientCert(workDir string, h *certs.Hierarchy) error {
 	}
 	if err := os.WriteFile(apiServerKubeletClientKeyPath(workDir), keyPEM, 0o600); err != nil {
 		return fmt.Errorf("write apiserver kubelet-client key: %w", err)
+	}
+	return nil
+}
+
+// writeProxyClientCert writes the aggregator's front-proxy client keypair the
+// apiserver presents to an extension apiserver (--proxy-client-cert-file /
+// --proxy-client-key-file): certs.ProxyClientCN, no Organization, clientAuth only,
+// issued by the request-header CA through Hierarchy.IssueProxyClient (the only
+// issuance that CA makes). Re-minted every boot like every other component leaf. The
+// key is 0600: it is an impersonation credential at any backend that trusts the
+// request-header CA, protected exactly as the CA keys beside it are.
+func writeProxyClientCert(workDir string, h *certs.Hierarchy) error {
+	certPEM, keyPEM, err := h.IssueProxyClient(ComponentCertValidity)
+	if err != nil {
+		return fmt.Errorf("issue %s proxy client cert: %w", certs.ProxyClientCN, err)
+	}
+	if err := os.WriteFile(ProxyClientCertPath(workDir), certPEM, 0o644); err != nil {
+		return fmt.Errorf("write proxy client cert: %w", err)
+	}
+	if err := os.WriteFile(ProxyClientKeyPath(workDir), keyPEM, 0o600); err != nil {
+		return fmt.Errorf("write proxy client key: %w", err)
 	}
 	return nil
 }

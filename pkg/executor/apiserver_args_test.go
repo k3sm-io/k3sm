@@ -178,6 +178,13 @@ func TestApiserverArgsSingleNodeDefault(t *testing.T) {
 			t.Errorf("single-node path must not set %s, args=%v", absent, args)
 		}
 	}
+	// The aggregation layer is part of the single-node posture too (k3s sets it in
+	// every posture): a single-node cluster needs `kubectl top` as much as a mesh.
+	for _, present := range []string{"--requestheader-client-ca-file", "--proxy-client-cert-file", "--enable-aggregator-routing=false"} {
+		if !strings.Contains(joined, present) {
+			t.Errorf("single-node path must set %s, args=%v", present, args)
+		}
+	}
 }
 
 // TestApiserverArgs_AuditPolicyWired is the M10.0 argv guard (B70 supplementary
