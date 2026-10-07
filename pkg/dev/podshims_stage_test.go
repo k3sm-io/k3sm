@@ -311,13 +311,13 @@ func TestPodShimStageRefusesForeignOwnedBase(t *testing.T) {
 		{
 			name:      "foreign-owned base is refused",
 			setup:     func(t *testing.T, base, _ string) []string { mkdirMode(t, base, 0o755); return []string{base} },
-			wantNote:  []string{"is owned by uid 0", "Remedy: sudo rm -rf "},
+			wantNote:  []string{"is owned by uid 0", "Remedy: inspect it with `ls -ld ", ".refused-"},
 			untouched: "base",
 		},
 		{
 			name:      "0777 base is refused",
 			setup:     func(t *testing.T, base, _ string) []string { mkdirMode(t, base, 0o777); return nil },
-			wantNote:  []string{"group- or other-writable (mode 0777)", "Remedy: chmod go-w "},
+			wantNote:  []string{"group- or other-writable (mode 0777)", "Remedy: inspect it with `ls -ld ", ".refused-"},
 			untouched: "base",
 		},
 		{
@@ -333,7 +333,7 @@ func TestPodShimStageRefusesForeignOwnedBase(t *testing.T) {
 				mkdirMode(t, instRoot, 0o755)
 				return []string{instRoot}
 			},
-			wantNote:  []string{"is owned by uid 0", "Remedy: sudo rm -rf "},
+			wantNote:  []string{"is owned by uid 0", "Remedy: inspect it with `ls -ld ", ".refused-"},
 			untouched: "instance",
 		},
 		{
@@ -470,20 +470,31 @@ func TestDevRuntimeRootRefusesForeignOwnedBase(t *testing.T) {
 		name      string
 		mode      os.FileMode
 		foreign   bool
-		wantErr   bool
+		symlink   bool // the base is a link to a dir the user owns
+		wantErr   error
 		wantInErr []string
 	}{
 		{name: "user-owned base is used", mode: 0o700},
-		{name: "foreign-owned base is refused", mode: 0o755, foreign: true, wantErr: true,
-			wantInErr: []string{"is owned by uid 0", "Remedy: sudo rm -rf ", "cannot be used"}},
-		{name: "other-writable base is refused", mode: 0o777, wantErr: true,
-			wantInErr: []string{"group- or other-writable (mode 0777)", "Remedy: chmod go-w "}},
+		{name: "foreign-owned base is refused", mode: 0o755, foreign: true, wantErr: ErrForeignDir,
+			wantInErr: []string{"is owned by uid 0", "Remedy: inspect it with `ls -ld ", ".refused-", "cannot be used"}},
+		{name: "other-writable base is refused", mode: 0o777, wantErr: ErrForeignDir,
+			wantInErr: []string{"group- or other-writable (mode 0777)", "Remedy: inspect it with `ls -ld ", ".refused-"}},
+		{name: "symlinked base is refused", mode: 0o700, symlink: true, wantErr: ErrSymlinkStage,
+			wantInErr: []string{"cannot be used", "Remedy: inspect it with `ls -ld ", ".refused-"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newTestManager(t, newFakeSystem(), euid)
 			m.podRootBase = filepath.Join(t.TempDir(), "k3sm-dev-"+strconv.Itoa(euid))
-			mkdirMode(t, m.podRootBase, tc.mode)
+			created := m.podRootBase
+			if tc.symlink {
+				created = t.TempDir()
+				if err := os.Symlink(created, m.podRootBase); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				mkdirMode(t, m.podRootBase, tc.mode)
+			}
 			if tc.foreign {
 				m.lstat = foreignOwned(m.podRootBase)
 			}
@@ -496,7 +507,7 @@ func TestDevRuntimeRootRefusesForeignOwnedBase(t *testing.T) {
 			podRoot := m.podRoot("dev")
 
 			proc, err := m.spawnServer(context.Background(), "dev", workDir, podRoot, testPorts, "none", runtimeHostProcess, "", "", "")
-			if !tc.wantErr {
+			if tc.wantErr == nil {
 				if err != nil {
 					t.Fatalf("spawnServer over a user-owned base: %v", err)
 				}
@@ -513,8 +524,8 @@ func TestDevRuntimeRootRefusesForeignOwnedBase(t *testing.T) {
 				}
 				return
 			}
-			if !errors.Is(err, ErrForeignDir) {
-				t.Fatalf("spawnServer = %v, want ErrForeignDir", err)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("spawnServer = %v, want %v", err, tc.wantErr)
 			}
 			for _, want := range append(tc.wantInErr, m.podRootBase) {
 				if !strings.Contains(err.Error(), want) {
@@ -524,8 +535,8 @@ func TestDevRuntimeRootRefusesForeignOwnedBase(t *testing.T) {
 			if _, serr := os.Stat(started); serr == nil {
 				t.Error("the server started over a refused runtime root")
 			}
-			if entries, _ := os.ReadDir(m.podRootBase); len(entries) != 0 {
-				t.Errorf("refused base %s gained %v", m.podRootBase, entries)
+			if entries, _ := os.ReadDir(created); len(entries) != 0 {
+				t.Errorf("refused base %s gained %v", created, entries)
 			}
 		})
 	}

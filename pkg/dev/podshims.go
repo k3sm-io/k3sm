@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -435,24 +436,27 @@ func (m *Manager) prepareShimStage(instance, name string) (string, bool, error) 
 func (m *Manager) ownedMkdirs(perm os.FileMode, dirs ...string) error {
 	for _, d := range dirs {
 		if err := mkdirNoFollow(perm, d); err != nil {
+			if errors.Is(err, ErrSymlinkStage) {
+				return fmt.Errorf("%w. Remedy: %s", err, refusedDirRemedy(d))
+			}
 			return err
 		}
 		if problem := m.ownedDirProblem(d); problem != "" {
-			return fmt.Errorf("%w: %s. Remedy: %s", ErrForeignDir, problem, m.stageRemedy(d))
+			return fmt.Errorf("%w: %s. Remedy: %s", ErrForeignDir, problem, refusedDirRemedy(d))
 		}
 	}
 	return nil
 }
 
-// stageRemedy is the one-line fix for a refused per-user dev dir: one this
-// user owns only needs its group/other write bit dropped; anything else (another
-// user's dir, a non-directory) is removed so the next run creates it afresh.
-func (m *Manager) stageRemedy(dir string) string {
-	st, err := m.lstatT(dir)
-	if err == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR && int(st.Uid) == m.euid {
-		return "chmod go-w " + dir
-	}
-	return "sudo rm -rf " + dir
+// refusedDirRemedy is the one-line fix for a refused per-user dev dir. It never
+// recommends deleting the path, which someone else may have created, nor
+// loosening or tightening it in place: a dir that was group/other-writable may
+// already hold entries planted meanwhile, and a chmod would bless them. So it
+// says to look first and then move the dir aside, after which the next run
+// creates a fresh one; the moved-aside copy stays for inspection.
+func refusedDirRemedy(dir string) string {
+	return fmt.Sprintf("inspect it with `ls -ld %s`; if you did not create it so, move it aside with `sudo mv %s %s.refused-%s` and run again",
+		dir, dir, dir, time.Now().Format("20060102"))
 }
 
 // verifiedShim returns shim only if it passes helperProblem at this moment, the

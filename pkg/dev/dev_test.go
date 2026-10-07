@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -406,6 +407,58 @@ func TestTeardownRemovesPodRoot(t *testing.T) {
 			t.Errorf("pod root %q survived teardown (stat err = %v) — every torn-down instance would leak its pod dirs, blob cache and PVC storage", inst.PodRoot, err)
 		}
 	})
+
+	// The lexical bound is not enough: the base sits under the world-writable
+	// /private/var/tmp, so one another user planted (as a link, or a directory
+	// they own) must make teardown delete nothing.
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, base, victim string) func(string, *unix.Stat_t) error
+		want  string
+	}{
+		{"a foreign-owned base is not deleted from", func(t *testing.T, base, _ string) func(string, *unix.Stat_t) error {
+			if err := os.Mkdir(base, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return foreignOwned(base)
+		}, "is owned by uid 0"},
+		{"a symlinked base is not deleted through", func(t *testing.T, base, victim string) func(string, *unix.Stat_t) error {
+			if err := os.Symlink(victim, base); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}, "is a symlink"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestManager(t, newFakeSystem(), testEUID(t))
+			out := &bytes.Buffer{}
+			m.out = out
+			m.podRootBase = filepath.Join(t.TempDir(), "base")
+			victim := t.TempDir()
+			m.lstat = tc.plant(t, m.podRootBase, victim)
+			inst := sampleInstance("gone")
+			inst.PID = 0
+			inst.PodRoot = filepath.Join(m.podRootBase, "gone")
+			keep := filepath.Join(inst.PodRoot, "storage", "keep")
+			if err := os.MkdirAll(keep, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.reg.Save(inst); err != nil {
+				t.Fatalf("seed manifest: %v", err)
+			}
+			if err := m.teardown(t.Context(), inst); err != nil {
+				t.Fatalf("teardown: %v", err)
+			}
+			if _, err := os.Stat(keep); err != nil {
+				t.Errorf("teardown deleted %s under a base it cannot vouch for: %v", keep, err)
+			}
+			for _, want := range []string{"not removing pod-root", tc.want, "Remedy: inspect it with `ls -ld ", ".refused-"} {
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("output %q, want it to contain %q", out, want)
+				}
+			}
+		})
+	}
 
 	t.Run("removablePodRoot refuses anything it cannot vouch for", func(t *testing.T) {
 		const base = "/private/var/tmp/k3sm-dev-0"

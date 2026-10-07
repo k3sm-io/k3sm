@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -547,15 +548,36 @@ func (m *Manager) teardown(ctx context.Context, inst Instance) error {
 	// blob cache and PVC storage. `down` is destructive by contract — the
 	// pre-split layout put all three inside the instance dir Remove wipes.
 	if dir := removablePodRoot(inst, m.podRootBaseDir()); dir != "" {
-		if err := os.RemoveAll(dir); err != nil {
-			fmt.Fprintf(m.out, "warning: remove pod-root %q: %v\n", dir, err)
-		}
+		m.removePodRoot(dir)
 	}
 	if err := m.reg.Remove(inst.Name); err != nil && !errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("remove registry entry %q: %w", inst.Name, err)
 	}
 	fmt.Fprintf(m.out, "instance %q down\n", inst.Name)
 	return nil
+}
+
+// removePodRoot deletes an instance's runtime root (already bounded to a proper
+// descendant of the base by removablePodRoot), but only when the base and the
+// root are both directories this euid alone controls (ownedDirProblem). The
+// lexical bound alone is not enough: the base sits under the world-writable
+// /private/var/tmp, and a base another user planted (a link to elsewhere, or a
+// directory they own) would turn teardown, as root in the datapath tier, into a
+// recursive delete of a tree they chose. A refusal deletes nothing and is a
+// warning, like a failed removal; the registry entry is still removed.
+func (m *Manager) removePodRoot(dir string) {
+	for _, d := range []string{filepath.Dir(dir), dir} {
+		if _, err := os.Lstat(d); errors.Is(err, fs.ErrNotExist) {
+			return // nothing left to reclaim
+		}
+		if problem := m.ownedDirProblem(d); problem != "" {
+			fmt.Fprintf(m.out, "warning: not removing pod-root %q: %s. Remedy: %s\n", dir, problem, refusedDirRemedy(d))
+			return
+		}
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Fprintf(m.out, "warning: remove pod-root %q: %v\n", dir, err)
+	}
 }
 
 // removablePodRoot returns the instance's runtime root when it is safe to delete
@@ -765,7 +787,7 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	// costs a feature, this is fatal: the runtime root holds every pod's data, and
 	// a root another user controls cannot be used at all.
 	if err := m.ownedMkdirs(0o700, filepath.Dir(podRoot), podRoot); err != nil {
-		if errors.Is(err, ErrForeignDir) {
+		if errors.Is(err, ErrForeignDir) || errors.Is(err, ErrSymlinkStage) {
 			return nil, fmt.Errorf("pod-root %s cannot be used, it holds every pod's data and another user could read or replace it: %w", podRoot, err)
 		}
 		return nil, fmt.Errorf("create pod-root %s: %w", podRoot, err)
