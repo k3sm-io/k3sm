@@ -134,6 +134,9 @@ type RotationReport struct {
 	// rotation (a rotation re-issues leaves; it never re-mints a CA).
 	ClusterCAPin string
 	SigningCAPin string
+	// RequestHeaderCAPin is the request-header CA's pin, verified unchanged the same
+	// way: the aggregator's impersonation root never moves on a rotation.
+	RequestHeaderCAPin string
 	// Reissued are the leaf credentials the control-plane boot re-issues from those CAs.
 	Reissued []RotationArtifact
 	// OutOfScope are credentials this command deliberately does NOT rotate.

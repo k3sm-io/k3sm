@@ -531,7 +531,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 // starts the scheduler/KCM) so the kubeconfigs and the client-CA exist when those
 // components — and the apiserver — start.
 func (s *Supervised) provisionComponentCerts() error {
-	h, err := certs.EnsureHierarchy(s.cfg.WorkDir)
+	h, err := certs.EnsureHierarchy(s.cfg.WorkDir, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		return fmt.Errorf("ensure CA hierarchy: %w", err)
 	}

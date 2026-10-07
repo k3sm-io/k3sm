@@ -166,6 +166,25 @@ func (opts serverOptions) etcdPosture() bool {
 	return opts.clusterInit || opts.serverJoin
 }
 
+// role is this server's CA mint role, derived from --server-join alone: a server
+// that joined an HA control plane never mints a CA (certs.RoleJoined), with or
+// without --server; every other server is a mint authority.
+func (opts serverOptions) role() certs.Role {
+	if opts.serverJoin {
+		return certs.RoleJoined
+	}
+	return certs.RoleMintAuthority
+}
+
+// posture is the CA posture of these flags, from the one HA predicate: the etcd
+// posture needs the etcd CA pair as well.
+func (opts serverOptions) posture() certs.Posture {
+	if opts.etcdPosture() {
+		return certs.PostureEtcd
+	}
+	return certs.PostureKine
+}
+
 // etcdConfig renders the executor's etcd block for these flags: nil in the kine
 // posture. The member name is the canonical node name, and the peer address is
 // --etcd-peer-ip (the LAN address). It is deliberately NOT --node-ip: that flag is
@@ -653,7 +672,7 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 	// it). The hierarchy is loaded here rather than reusing plan.hierarchy, which is
 	// set only on the mesh path; EnsureHierarchy LOADS the existing CAs in every
 	// posture, because the executor's provisioning step created them at exec.Start.
-	nodeHierarchy, err := certs.EnsureHierarchy(opts.workDir)
+	nodeHierarchy, err := certs.EnsureHierarchy(opts.workDir, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		return nodeOptions{}, fmt.Errorf("load the CA hierarchy for the server node's client identity: %w", err)
 	}

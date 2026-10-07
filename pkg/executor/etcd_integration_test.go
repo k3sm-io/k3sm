@@ -326,10 +326,10 @@ func newITMember(t *testing.T, name, docIP string, role EtcdRole, h *certs.Hiera
 	bin := itEtcdBinary(t)
 	wd := t.TempDir()
 	if role == EtcdInit {
-		if _, err := certs.EnsureHierarchy(wd); err != nil {
+		if _, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine); err != nil {
 			t.Fatal(err)
 		}
-	} else if err := certs.ReconcileImportedHierarchy(wd, h); err != nil {
+	} else if err := certs.ReconcileImportedHierarchy(wd, h, certs.PostureEtcd); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(binDir(wd), 0o755); err != nil {
@@ -361,7 +361,7 @@ func (m *itMember) provision(t *testing.T) {
 // would carry).
 func (m *itMember) hierarchy(t *testing.T) *certs.Hierarchy {
 	t.Helper()
-	h, err := certs.EnsureHierarchy(m.wd)
+	h, err := certs.EnsureHierarchy(m.wd, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatal(err)
 	}

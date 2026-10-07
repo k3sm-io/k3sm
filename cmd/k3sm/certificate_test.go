@@ -245,8 +245,24 @@ func remintCAHierarchy(t *testing.T, dir string) {
 	if err := os.RemoveAll(certs.PKIDir(dir)); err != nil {
 		t.Fatalf("remove PKI dir: %v", err)
 	}
-	if _, err := certs.EnsureHierarchy(dir); err != nil {
+	if _, err := certs.EnsureHierarchy(dir, certs.RoleMintAuthority, certs.PostureKine); err != nil {
 		t.Fatalf("re-mint CA hierarchy: %v", err)
+	}
+}
+
+// remintRequestHeaderCA replaces only the request-header CA pair with a fresh root,
+// the way a boot that minted a second impersonation root would leave it.
+func remintRequestHeaderCA(t *testing.T, dir string) {
+	t.Helper()
+	ca, err := certs.NewCA("k3sm-request-header-ca")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certs.RequestHeaderCACertPath(dir), ca.CertPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certs.RequestHeaderCAKeyPath(dir), ca.KeyPEM, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -325,7 +341,7 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 			name:       "dry-run reports both pins and never restarts",
 			wantLabels: nil,
 			wantOutHas: []string{
-				"cluster CA", "signing CA",
+				"cluster CA", "signing CA", "request-header CA",
 				executor.SchedulerKubeconfigPath(""),
 				executor.ControllerManagerKubeconfigPath(""),
 				"BLAST RADIUS", "does not revoke",
@@ -349,7 +365,7 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 				return ""
 			},
 			lock: func(t *testing.T, dir string) {
-				for _, p := range []string{certs.ClusterCAKeyPath(dir), certs.SigningCAKeyPath(dir)} {
+				for _, p := range []string{certs.ClusterCAKeyPath(dir), certs.SigningCAKeyPath(dir), certs.RequestHeaderCAKeyPath(dir)} {
 					if err := os.Chmod(p, 0o000); err != nil {
 						t.Fatalf("chmod 0000 %s: %v", p, err)
 					}
@@ -471,7 +487,7 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 			}
 			dir := t.TempDir()
 			if !tc.noHierarchy {
-				if _, err := certs.EnsureHierarchy(dir); err != nil {
+				if _, err := certs.EnsureHierarchy(dir, certs.RoleMintAuthority, certs.PostureKine); err != nil {
 					t.Fatalf("seed CA hierarchy: %v", err)
 				}
 			}
@@ -489,10 +505,11 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 			}
 
 			// Independent pin computation (never via the code under test).
-			var preClusterPin, preSigningPin string
+			var preClusterPin, preSigningPin, preRequestHeaderPin string
 			if !tc.noHierarchy {
 				preClusterPin = pinOf(t, certs.ClusterCACertPath(dir))
 				preSigningPin = pinOf(t, certs.SigningCACertPath(dir))
+				preRequestHeaderPin = pinOf(t, certs.RequestHeaderCACertPath(dir))
 			}
 
 			restarter := &fakeRestarter{
@@ -583,6 +600,9 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 				if got := pinOf(t, certs.SigningCACertPath(dir)); got != preSigningPin {
 					t.Errorf("signing CA pin changed: %s -> %s", preSigningPin, got)
 				}
+				if got := pinOf(t, certs.RequestHeaderCACertPath(dir)); got != preRequestHeaderPin {
+					t.Errorf("request-header CA pin changed: %s -> %s", preRequestHeaderPin, got)
+				}
 			}
 
 			// --- report expectations -------------------------------------------------
@@ -601,6 +621,9 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 				}
 				if !strings.Contains(out, preSigningPin) {
 					t.Errorf("report does not print the signing CA pin %s:\n%s", preSigningPin, out)
+				}
+				if !strings.Contains(out, preRequestHeaderPin) {
+					t.Errorf("report does not print the request-header CA pin %s:\n%s", preRequestHeaderPin, out)
 				}
 				for _, want := range tc.wantOutHas {
 					if !strings.Contains(out, want) {
@@ -633,29 +656,39 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 		name       string
 		duringBoot bool
 		wantHealth bool
+		// requestHeaderOnly re-mints only the request-header CA, leaving the
+		// cluster and signing pins intact, so only its own pin can catch it.
+		requestHeaderOnly bool
 	}{
 		{name: "CA re-minted during the kickstart is caught"},
 		{name: "CA re-minted by the booting daemon is caught", duringBoot: true, wantHealth: true},
+		{name: "request-header CA alone re-minted during the kickstart is caught", requestHeaderOnly: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
-			if _, err := certs.EnsureHierarchy(dir); err != nil {
+			if _, err := certs.EnsureHierarchy(dir, certs.RoleMintAuthority, certs.PostureKine); err != nil {
 				t.Fatalf("seed CA hierarchy: %v", err)
 			}
-			prePin := pinOf(t, certs.ClusterCACertPath(dir))
+			pinPath := certs.ClusterCACertPath(dir)
+			remint := func() { remintCAHierarchy(t, dir) }
+			if tc.requestHeaderOnly {
+				pinPath = certs.RequestHeaderCACertPath(dir)
+				remint = func() { remintRequestHeaderCA(t, dir) }
+			}
+			prePin := pinOf(t, pinPath)
 
 			restarter := &fakeRestarter{pid: 4242}
 			var healthCalls int
 			health := func(context.Context) error {
 				healthCalls++
 				if tc.duringBoot {
-					remintCAHierarchy(t, dir)
+					remint()
 				}
 				return nil
 			}
 			if !tc.duringBoot {
-				restarter.onKickstart = func() { remintCAHierarchy(t, dir) }
+				restarter.onKickstart = remint
 			}
 
 			var buf bytes.Buffer
@@ -672,8 +705,8 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 			}
 			// The fake must really have replaced the hierarchy — otherwise the
 			// assertion above would pass for a reason that is not the one under test.
-			if got := pinOf(t, certs.ClusterCACertPath(dir)); got == prePin {
-				t.Fatalf("the case did not re-mint the cluster CA (pin still %s); it proves nothing", prePin)
+			if got := pinOf(t, pinPath); got == prePin {
+				t.Fatalf("the case did not re-mint the CA (pin still %s); it proves nothing", prePin)
 			}
 			if strings.Contains(buf.String(), rotateSuccessSentence) {
 				t.Errorf("a rotation that orphaned every node's join-token pin reported success:\n%s", buf.String())
@@ -965,7 +998,7 @@ func TestAPIServerTrustAnchor(t *testing.T) {
 // seedHierarchy mints the two-CA hierarchy in dir.
 func seedHierarchy(t *testing.T, dir string) {
 	t.Helper()
-	if _, err := certs.EnsureHierarchy(dir); err != nil {
+	if _, err := certs.EnsureHierarchy(dir, certs.RoleMintAuthority, certs.PostureKine); err != nil {
 		t.Fatalf("seed CA hierarchy: %v", err)
 	}
 }

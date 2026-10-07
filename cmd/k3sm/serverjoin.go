@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -69,6 +70,33 @@ func importServerCABundle(ctx context.Context, opts serverOptions, logger *slog.
 //     installed, present ones are kept, and a present CA whose pin differs from the
 //     bundle's fails with certs.ErrHierarchyDiverged and nothing written.
 func importServerCABundleVia(ctx context.Context, opts serverOptions, client *http.Client, logger *slog.Logger) error {
+	return importServerCABundleWith(ctx, opts, client, defaultBundleWait, logger)
+}
+
+// errBundleSourceStale ends the bounded wait on a bundle source that still runs a
+// release older than this one. Its text is the remedy.
+var errBundleSourceStale = errors.New("the server this one joins from still serves a bundle without the request-header CA: upgrade the mint-authority server first and make sure its bootstrap endpoint answers, then restart this server; if both servers of a two-server cluster are down, run `k3sm server --cluster-reset` on the mint authority, start it, wipe this server's etcd data dir and re-join it (never mint a CA by hand)")
+
+// bundleWait bounds the wait on an older bundle source: retry every retry, log the
+// remedy at ERROR every logEvery, give up after bound. now and sleep are the clock.
+type bundleWait struct {
+	retry, logEvery, bound time.Duration
+	now                    func() time.Time
+	sleep                  func(ctx context.Context, d time.Duration) error
+}
+
+// defaultBundleWait is the production bound: 30 s retries, the remedy every 5
+// minutes, at most 30 minutes before the process exits.
+var defaultBundleWait = bundleWait{
+	retry:    30 * time.Second,
+	logEvery: 5 * time.Minute,
+	bound:    30 * time.Minute,
+	now:      time.Now,
+	sleep:    sleepCtx,
+}
+
+// importServerCABundleWith is importServerCABundleVia over an injectable wait clock.
+func importServerCABundleWith(ctx context.Context, opts serverOptions, client *http.Client, wait bundleWait, logger *slog.Logger) error {
 	tok, err := bootstrap.ParseServerToken(opts.token)
 	if err != nil {
 		return fmt.Errorf("parse server token: %w", err)
@@ -76,7 +104,7 @@ func importServerCABundleVia(ctx context.Context, opts serverOptions, client *ht
 	if err := bootstrap.EnsureServerSecret(serverSecretPath(opts.workDir), tok.Secret); err != nil {
 		return err
 	}
-	missing, err := certs.MissingOnDisk(opts.workDir)
+	missing, err := certs.MissingOnDisk(opts.workDir, certs.PostureEtcd)
 	if err != nil {
 		return fmt.Errorf("inspect the local CA hierarchy: %w", err)
 	}

@@ -66,14 +66,14 @@ func TestLoadCARoundTrip(t *testing.T) {
 // across a server restart), with the keys written 0600.
 func TestEnsureHierarchy(t *testing.T) {
 	wd := t.TempDir()
-	h1, err := EnsureHierarchy(wd)
+	h1, err := EnsureHierarchy(wd, RoleMintAuthority, PostureKine)
 	if err != nil {
 		t.Fatalf("ensure (create): %v", err)
 	}
 	if h1.Cluster.PinHash() == h1.Signing.PinHash() {
 		t.Error("cluster and signing CA must be distinct")
 	}
-	h2, err := EnsureHierarchy(wd)
+	h2, err := EnsureHierarchy(wd, RoleMintAuthority, PostureKine)
 	if err != nil {
 		t.Fatalf("ensure (reload): %v", err)
 	}

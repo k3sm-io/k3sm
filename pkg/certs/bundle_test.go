@@ -121,7 +121,7 @@ func TestImportedHierarchyThenEnsureLoads(t *testing.T) {
 	src := newTestHierarchy(t)
 	wd := t.TempDir()
 
-	if err := ReconcileImportedHierarchy(wd, src); err != nil {
+	if err := ReconcileImportedHierarchy(wd, src, PostureEtcd); err != nil {
 		t.Fatalf("import hierarchy: %v", err)
 	}
 	ep := EtcdCertPaths(wd)
@@ -141,7 +141,7 @@ func TestImportedHierarchyThenEnsureLoads(t *testing.T) {
 		t.Errorf("etcd PKI dir: stat err %v, mode %v, want 0700", err, info)
 	}
 
-	loaded, err := EnsureHierarchy(wd)
+	loaded, err := EnsureHierarchy(wd, RoleMintAuthority, PostureKine)
 	if err != nil {
 		t.Fatalf("ensure (load imported): %v", err)
 	}
@@ -166,7 +166,7 @@ func TestImportedHierarchyThenEnsureLoads(t *testing.T) {
 		t.Fatalf("read the incumbent CA: %v", err)
 	}
 	other := newTestHierarchy(t)
-	err = ReconcileImportedHierarchy(wd, other)
+	err = ReconcileImportedHierarchy(wd, other, PostureEtcd)
 	if err == nil {
 		t.Fatal("an import must refuse to replace an existing CA")
 	}

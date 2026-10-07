@@ -91,6 +91,16 @@ func APIServerKubeletClientKeyPath(workDir string) string {
 	return apiServerKubeletClientKeyPath(workDir)
 }
 
+// ProxyClientCertPath / ProxyClientKeyPath are the aggregator's front-proxy client
+// keypair (--proxy-client-cert-file / --proxy-client-key-file): CN
+// certs.ProxyClientCN, issued by the request-header CA, re-minted every boot.
+func ProxyClientCertPath(workDir string) string {
+	return filepath.Join(workDir, "client-auth-proxy.crt")
+}
+func ProxyClientKeyPath(workDir string) string {
+	return filepath.Join(workDir, "client-auth-proxy.key")
+}
+
 // tokenFilePath is the static token-auth CSV.
 func tokenFilePath(workDir string) string { return filepath.Join(workDir, "tokens.csv") }
 

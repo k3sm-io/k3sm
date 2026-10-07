@@ -326,7 +326,7 @@ func serverExecutorConfig(opts serverOptions, encryptionConfig string, logger *s
 // kubeconfig, the mesh nodeIP rewrite, and the apiserver's mesh-bound,
 // cluster-CA-served posture written into cfg.
 func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Logger) (*certs.Hierarchy, string, error) {
-	h, err := certs.EnsureHierarchy(opts.workDir)
+	h, err := certs.EnsureHierarchy(opts.workDir, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		return nil, "", fmt.Errorf("ensure CA hierarchy: %w", err)
 	}

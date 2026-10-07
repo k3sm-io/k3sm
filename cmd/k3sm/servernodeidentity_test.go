@@ -51,7 +51,7 @@ import (
 // cannot sign is an error, never a fallback to the admin identity.
 func TestServerNodeClientIsSystemNodeIdentity(t *testing.T) {
 	wd := t.TempDir()
-	h, err := certs.EnsureHierarchy(wd)
+	h, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("EnsureHierarchy: %v", err)
 	}

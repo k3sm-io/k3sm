@@ -517,6 +517,11 @@ func (c Config) isHA() bool {
 	return c.Etcd != nil
 }
 
+// CARole is the CA mint role of this server, read off the one HA role field.
+func (c Config) CARole() certs.Role {
+	return certs.RoleMintAuthority
+}
+
 // schedulerPort resolves the kube-scheduler secure-serving port: the configured
 // value, or the upstream default when unset. Resolving through an accessor (like
 // leaderElect) keeps the pure argv renderers TOTAL — a Config built by hand in a

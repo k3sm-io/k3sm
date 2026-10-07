@@ -59,6 +59,11 @@ var (
 	// ErrServerSecretMismatch is returned when a joining server already holds a
 	// server-bootstrap secret different from the one its server token carries.
 	ErrServerSecretMismatch = errors.New("bootstrap: the recorded server-bootstrap secret differs from the server token's")
+	// ErrBundlePredatesRequestHeaderCA is returned by ImportCABundle when the server
+	// it fetched from sealed a schema-2 bundle, which carries no request-header CA:
+	// that server runs an older release. Nothing is written. The joining server
+	// waits for it to be upgraded; it never mints the CA itself.
+	ErrBundlePredatesRequestHeaderCA = errors.New("bootstrap: the server you are joining from runs an older release (its bundle carries no request-header CA): upgrade the mint-authority server first")
 )
 
 // FormatServerToken renders the server join token K10<caHash>::server:<secret>. caHash

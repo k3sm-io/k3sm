@@ -44,7 +44,7 @@ func TestAPIServerKubeletClientIdentity(t *testing.T) {
 	if err := s.provisionComponentCerts(); err != nil {
 		t.Fatalf("provision component certs: %v", err)
 	}
-	h, err := certs.EnsureHierarchy(wd) // idempotent — loads what provision created
+	h, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine) // idempotent — loads what provision created
 	if err != nil {
 		t.Fatalf("load hierarchy: %v", err)
 	}

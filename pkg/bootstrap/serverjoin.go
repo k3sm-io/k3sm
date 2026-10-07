@@ -110,7 +110,7 @@ func ImportCABundle(ctx context.Context, opts ServerJoinOptions) error {
 	if err := h.Unmarshal(plaintext); err != nil {
 		return fmt.Errorf("decode reconstructed CA hierarchy: %w", err)
 	}
-	if err := certs.ReconcileImportedHierarchy(opts.WorkDir, &h); err != nil {
+	if err := certs.ReconcileImportedHierarchy(opts.WorkDir, &h, certs.PostureEtcd); err != nil {
 		return fmt.Errorf("reconcile reconstructed CA hierarchy: %w", err)
 	}
 	return nil

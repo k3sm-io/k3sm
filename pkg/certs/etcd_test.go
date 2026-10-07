@@ -53,7 +53,7 @@ func verifyAs(t *testing.T, leafPEM []byte, roots *x509.CertPool, usage x509.Ext
 // the documented CNs, and lays them out under <PKI>/etcd with the documented modes.
 func TestEtcdCAsDistinctFromClusterAndSigning(t *testing.T) {
 	wd := t.TempDir()
-	h, err := EnsureHierarchy(wd)
+	h, err := EnsureHierarchy(wd, RoleMintAuthority, PostureKine)
 	if err != nil {
 		t.Fatalf("EnsureHierarchy: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestBundleV2RoundTripCarriesEtcdCAs(t *testing.T) {
 			if _, err := h.Marshal(); err == nil {
 				t.Error("Marshal must require all four CAs")
 			}
-			if err := ReconcileImportedHierarchy(t.TempDir(), &h); err == nil {
+			if err := ReconcileImportedHierarchy(t.TempDir(), &h, PostureEtcd); err == nil {
 				t.Error("ReconcileImportedHierarchy must require all four CAs")
 			}
 		})
@@ -355,7 +355,7 @@ func TestBundleRefusesSchemaV1WithoutWriting(t *testing.T) {
 			var h Hierarchy
 			err := h.Unmarshal(envelope(tc.version))
 			if err == nil {
-				if werr := ReconcileImportedHierarchy(wd, &h); werr != nil {
+				if werr := ReconcileImportedHierarchy(wd, &h, PostureEtcd); werr != nil {
 					t.Logf("write after accepted unmarshal: %v", werr)
 				}
 				t.Fatalf("Unmarshal must refuse schema %d", tc.version)

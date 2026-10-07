@@ -44,8 +44,8 @@ var ErrHierarchyDiverged = errors.New("certs: the local CA hierarchy diverges fr
 // that crashed between the key and the certificate leaves exactly that, and
 // re-importing over it would hide which half survived. An entry that is not a regular
 // file is also an ErrIncompleteHierarchy.
-func MissingOnDisk(workDir string) ([]string, error) {
-	var missing []string
+func MissingOnDisk(workDir string, posture Posture) ([]CAID, error) {
+	var missing []CAID
 	for _, spec := range caSpecs {
 		present, err := caOnDisk(workDir, spec)
 		if err != nil {
@@ -73,7 +73,7 @@ func MissingOnDisk(workDir string) ([]string, error) {
 // certificate, which MissingOnDisk then reports. Keys are 0600, certificates 0644,
 // the etcd pairs go under <PKI>/etcd (0700). A hierarchy that is already complete and
 // identical is a no-op.
-func ReconcileImportedHierarchy(workDir string, h *Hierarchy) error {
+func ReconcileImportedHierarchy(workDir string, h *Hierarchy, posture Posture) error {
 	if !hierarchyComplete(h) {
 		return errors.New("certs: reconcile hierarchy: cluster, signing, etcd server and etcd peer CAs are required")
 	}
@@ -110,10 +110,10 @@ func ReconcileImportedHierarchy(workDir string, h *Hierarchy) error {
 			return err
 		}
 		ca := spec.ca(h)
-		if err := installNew(dir, spec.keyFile, ca.KeyPEM, 0o600); err != nil {
+		if err := installCAFile(dir, spec.keyFile, ca.KeyPEM, 0o600); err != nil {
 			return fmt.Errorf("%s CA: %w", spec.id, err)
 		}
-		if err := installNew(dir, spec.certFile, ca.CertPEM, 0o644); err != nil {
+		if err := installCAFile(dir, spec.certFile, ca.CertPEM, 0o644); err != nil {
 			return fmt.Errorf("%s CA: %w", spec.id, err)
 		}
 	}
@@ -161,6 +161,10 @@ func regularExists(path string) (bool, error) {
 	}
 	return true, nil
 }
+
+// installCAFile is the one write of a reconciled CA file: installNew, swapped only by
+// the tests that crash an install between its key and its certificate.
+var installCAFile = installNew
 
 // installNew installs data at dir/name with mode through atomicfile.WriteNew, so an
 // existing file is never replaced and no temp file outlives the call.

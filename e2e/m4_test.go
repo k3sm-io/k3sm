@@ -194,7 +194,7 @@ func nodeIdentityConfig(t *testing.T, nodeName string) (*rest.Config, bool) {
 	if _, err := os.Stat(certs.SigningCACertPath(wd)); err != nil {
 		return nil, false
 	}
-	h, err := certs.EnsureHierarchy(wd)
+	h, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine)
 	if err != nil {
 		t.Fatalf("load CA hierarchy from %s: %v", wd, err)
 	}

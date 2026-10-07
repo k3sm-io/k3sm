@@ -63,7 +63,7 @@ func resetSeams(fake *fakeEtcd, wd string) etcdSeams {
 // hierarchy, the etcd CAs and the member dir.
 func existingMember(t *testing.T, wd string) {
 	t.Helper()
-	if _, err := certs.EnsureHierarchy(wd); err != nil {
+	if _, err := certs.EnsureHierarchy(wd, certs.RoleMintAuthority, certs.PostureKine); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := certs.EnsureEtcdCAs(wd); err != nil {

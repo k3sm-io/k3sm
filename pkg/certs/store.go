@@ -53,6 +53,10 @@ type Hierarchy struct {
 	// member-to-member mutual TLS (peer-server-client.crt). It is nil outside the
 	// etcd HA posture.
 	EtcdPeer *CA
+	// requestHeader is the request-header CA: --requestheader-client-ca-file, the
+	// issuer of the aggregator's front-proxy client leaf and of nothing else. It is
+	// unexported so no caller can issue another leaf from it (IssueProxyClient).
+	requestHeader *CA
 }
 
 // On-disk filenames within the PKI dir: the two CA keypairs, plus the multi-node
@@ -275,7 +279,7 @@ func CertPin(certPEM []byte) (string, error) {
 // creating and persisting them on first call (idempotent across restarts). CA keys
 // are written 0600; certs 0644. It fails fast on a partially-written hierarchy rather
 // than silently regenerating (which would invalidate every issued node cert).
-func EnsureHierarchy(workDir string) (*Hierarchy, error) {
+func EnsureHierarchy(workDir string, role Role, posture Posture) (*Hierarchy, error) {
 	dir := PKIDir(workDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create PKI dir: %w", err)
@@ -339,7 +343,7 @@ func ensureEtcdDir(workDir string) (string, error) {
 // caSpec is one CA keypair of the hierarchy: its id (for reports), the directory it
 // lives in, its file names there, and the Hierarchy field that holds it in memory.
 type caSpec struct {
-	id string
+	id CAID
 	// dir returns the keypair's directory under workDir; it creates nothing.
 	dir func(workDir string) string
 	// ensureDir creates the keypair's directory with its mode (the PKI dir 0755, the
@@ -354,13 +358,13 @@ type caSpec struct {
 // the on-disk hierarchy (MissingOnDisk, ReconcileImportedHierarchy) goes through
 // it, so a CA is never added to one walk and forgotten by another.
 var caSpecs = []caSpec{
-	{id: "cluster", dir: PKIDir, ensureDir: ensurePKIDir, certFile: clusterCACert, keyFile: clusterCAKey,
+	{id: CACluster, dir: PKIDir, ensureDir: ensurePKIDir, certFile: clusterCACert, keyFile: clusterCAKey,
 		ca: func(h *Hierarchy) *CA { return h.Cluster }},
-	{id: "signing", dir: PKIDir, ensureDir: ensurePKIDir, certFile: signingCACert, keyFile: signingCAKey,
+	{id: CASigning, dir: PKIDir, ensureDir: ensurePKIDir, certFile: signingCACert, keyFile: signingCAKey,
 		ca: func(h *Hierarchy) *CA { return h.Signing }},
-	{id: "etcd-server", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdServerCACert, keyFile: etcdServerCAKey,
+	{id: CAEtcdServer, dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdServerCACert, keyFile: etcdServerCAKey,
 		ca: func(h *Hierarchy) *CA { return h.EtcdServer }},
-	{id: "etcd-peer", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdPeerCACert, keyFile: etcdPeerCAKey,
+	{id: CAEtcdPeer, dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdPeerCACert, keyFile: etcdPeerCAKey,
 		ca: func(h *Hierarchy) *CA { return h.EtcdPeer }},
 }
 
