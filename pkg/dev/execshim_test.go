@@ -67,7 +67,7 @@ func newTestManagerWithBuilder(t *testing.T, b ExecShimBuilder, euid int) *Manag
 
 func TestProvisionExecShimBuildsWhenAbsent(t *testing.T) {
 	b := &fakeBuilder{}
-	m := newTestManagerWithBuilder(t, b, 501)
+	m := newTestManagerWithBuilder(t, b, testEUID(t))
 
 	dir, ok, err := m.provisionExecShim(context.Background())
 	if err != nil {
@@ -103,7 +103,7 @@ func TestProvisionExecShimBuildsWhenAbsent(t *testing.T) {
 // reuse it is now the guard against.
 func TestProvisionExecShimRebuildsOverCached(t *testing.T) {
 	b := &fakeBuilder{}
-	m := newTestManagerWithBuilder(t, b, 501)
+	m := newTestManagerWithBuilder(t, b, testEUID(t))
 	// Seed a cached helper — stand-in for one left by an earlier session.
 	if err := os.MkdirAll(m.devBinDir(), 0o755); err != nil {
 		t.Fatal(err)
@@ -185,7 +185,7 @@ func TestExecShimUnwritableCacheIsNotReused(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			b := &fakeBuilder{buildErr: tc.buildErr}
-			m := newTestManagerWithBuilder(t, b, os.Geteuid())
+			m := newTestManagerWithBuilder(t, b, testEUID(t))
 			out := &bytes.Buffer{}
 			m.out = out
 			bin := m.devBinDir()
@@ -209,7 +209,7 @@ func TestExecShimUnwritableCacheIsNotReused(t *testing.T) {
 				t.Cleanup(func() { _ = os.Chmod(bin, 0o755) })
 			}
 			if tc.foreign {
-				m.euid = os.Geteuid() + 4242
+				m.euid = testEUID(t) + 4242
 			}
 
 			dir, ok, err := m.provisionExecShim(context.Background())
@@ -443,7 +443,7 @@ func TestExecShimSudoRunHandsCacheBack(t *testing.T) {
 // the unconfined hostprocess fallback.
 func TestProvisionExecShimKeepsCachedWhenRebuildFails(t *testing.T) {
 	b := &fakeBuilder{buildErr: errors.New("no workspace source")}
-	m := newTestManagerWithBuilder(t, b, 501)
+	m := newTestManagerWithBuilder(t, b, testEUID(t))
 	if err := os.MkdirAll(m.devBinDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +466,7 @@ func TestProvisionExecShimKeepsCachedWhenRebuildFails(t *testing.T) {
 
 func TestProvisionExecShimFallsBackWhenBuildFails(t *testing.T) {
 	b := &fakeBuilder{buildErr: errors.New("no workspace source")}
-	m := newTestManagerWithBuilder(t, b, 501)
+	m := newTestManagerWithBuilder(t, b, testEUID(t))
 
 	dir, ok, err := m.provisionExecShim(context.Background())
 	if err != nil {
@@ -605,7 +605,7 @@ func TestDevUpWaitsForDefaultNamespaceBootstrap(t *testing.T) {
 	})
 
 	t.Run("Up is wired to a non-nil wait by default", func(t *testing.T) {
-		m := newTestManager(t, newFakeSystem(), 501)
+		m := newTestManager(t, newFakeSystem(), testEUID(t))
 		if m.awaitNamespaceBootstrap != nil {
 			t.Fatal("a fresh Manager must leave the seam nil so Up falls back to the production wait")
 		}

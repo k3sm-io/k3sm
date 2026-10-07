@@ -35,7 +35,7 @@ import (
 // Only the failure paths are exercised: a loadable kubeconfig sends each wait on
 // to a 90s/5m poll against a real apiserver, which is not a unit test.
 func TestDevKubeClientResolution(t *testing.T) {
-	m := newTestManager(t, newFakeSystem(), 501)
+	m := newTestManager(t, newFakeSystem(), testEUID(t))
 
 	unparseable := func(t *testing.T) string {
 		t.Helper()

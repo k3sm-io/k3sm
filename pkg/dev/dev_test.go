@@ -52,8 +52,22 @@ func newTestManager(t *testing.T, sys System, euid int) *Manager {
 	return m
 }
 
+// testEUID is the euid a test gives an unprivileged Manager: the running
+// user's, never a literal. The trust checks compare the owner of real files the
+// test creates against the Manager's euid, so a literal (501, the first macOS
+// user) passes only for the developer who happens to have it. A test process
+// running as root has no unprivileged posture to offer, so the test is skipped.
+func testEUID(t *testing.T) int {
+	t.Helper()
+	euid := os.Geteuid()
+	if euid == 0 {
+		t.Skip("needs an unprivileged test process")
+	}
+	return euid
+}
+
 func TestUpDatapathRequiresRoot(t *testing.T) {
-	m := newTestManager(t, newFakeSystem(), 501) // non-root
+	m := newTestManager(t, newFakeSystem(), testEUID(t)) // non-root
 	_, err := m.Up(context.Background(), UpOptions{Name: "dev", Datapath: true})
 	if !errors.Is(err, ErrDatapathRequiresRoot) {
 		t.Fatalf("Up(--datapath) as non-root = %v, want ErrDatapathRequiresRoot", err)
@@ -92,7 +106,7 @@ func TestUpDatapathSingletonLockHeld(t *testing.T) {
 }
 
 func TestPreflightReclaimNoManifest(t *testing.T) {
-	m := newTestManager(t, newFakeSystem(), 501)
+	m := newTestManager(t, newFakeSystem(), testEUID(t))
 	// A missing manifest is a clean first boot — no error, nothing reaped.
 	if err := m.preflightReclaim(t.Context(), "fresh"); err != nil {
 		t.Fatalf("preflightReclaim on absent manifest = %v, want nil", err)
@@ -131,8 +145,8 @@ func TestPreflightReclaimReapsStalePidAndAliases(t *testing.T) {
 
 func TestPreflightReclaimRootlessSkipsFlush(t *testing.T) {
 	sys := newFakeSystem()
-	sys.aliases = []string{"10.43.0.10"} // a stray alias, but the prior run was rootless
-	m := newTestManager(t, sys, 501)     // non-root
+	sys.aliases = []string{"10.43.0.10"}     // a stray alias, but the prior run was rootless
+	m := newTestManager(t, sys, testEUID(t)) // non-root
 	prior := sampleInstance("rl")
 	prior.PID = 0 // rootless: no live server recorded
 	prior.Datapath = DatapathNone
@@ -149,7 +163,7 @@ func TestPreflightReclaimRootlessSkipsFlush(t *testing.T) {
 }
 
 func TestLoadValidatesPath(t *testing.T) {
-	m := newTestManager(t, newFakeSystem(), 501)
+	m := newTestManager(t, newFakeSystem(), testEUID(t))
 	// A non-existent path is rejected here, not at pod admission.
 	if _, err := m.Load("/definitely/not/a/real/binary/xyz"); err == nil {
 		t.Error("Load on a missing path = nil, want an error")
@@ -278,7 +292,7 @@ func TestDevUpWaitsForNodeRegistration(t *testing.T) {
 	})
 
 	t.Run("Up consults the seam and propagates its failure", func(t *testing.T) {
-		m := newTestManager(t, newFakeSystem(), 501)
+		m := newTestManager(t, newFakeSystem(), testEUID(t))
 		if m.awaitNodeRegistration != nil {
 			t.Fatal("a fresh Manager must leave the seam nil so Up falls back to the production wait")
 		}
@@ -374,7 +388,7 @@ func TestPodRootOutsideProtectedTree(t *testing.T) {
 func TestTeardownRemovesPodRoot(t *testing.T) {
 	t.Run("the recorded root is deleted", func(t *testing.T) {
 		base := t.TempDir()
-		m := newTestManager(t, newFakeSystem(), 501)
+		m := newTestManager(t, newFakeSystem(), testEUID(t))
 		m.podRootBase = base
 		inst := sampleInstance("gone")
 		inst.PID = 0
@@ -551,7 +565,7 @@ func TestDevUpFailsWhenServerDies(t *testing.T) {
 			// The spawned server is a REAL process, so the liveness seam must answer
 			// about it truthfully — the in-memory pid table cannot.
 			sys.aliveProbe = func(pid int) bool { return syscall.Kill(pid, 0) == nil }
-			m := newTestManager(t, sys, 501)
+			m := newTestManager(t, sys, testEUID(t))
 			out := &bytes.Buffer{}
 			m.out = out
 			m.builder = &fakeBuilder{}
@@ -669,7 +683,7 @@ func TestListReportsUnknownNotStaleWhenUnprobeable(t *testing.T) {
 	sys.alivePIDs[livePID] = true        // kill -0 -> nil
 	// deadPID is in neither map: kill -0 -> ESRCH.
 
-	m := newTestManager(t, sys, 501) // unprivileged shell, the reported posture
+	m := newTestManager(t, sys, testEUID(t)) // unprivileged shell, the reported posture
 	for _, inst := range []Instance{
 		{Version: registryVersion, Name: "rootowned", PID: rootOwnedPID, Tier: "root", Datapath: DatapathDirect},
 		{Version: registryVersion, Name: "mine", PID: livePID, Tier: "rootless", Datapath: DatapathNone},
@@ -754,7 +768,7 @@ func TestUnprobeableInstanceIsNotReaped(t *testing.T) {
 	const pid = 4242
 	sys := newFakeSystem()
 	sys.unprobeable[pid] = true
-	m := newTestManager(t, sys, 501)
+	m := newTestManager(t, sys, testEUID(t))
 	if err := m.reg.Save(Instance{Version: registryVersion, Name: "rootowned", PID: pid, Tier: "root", Datapath: DatapathDirect}); err != nil {
 		t.Fatalf("save: %v", err)
 	}

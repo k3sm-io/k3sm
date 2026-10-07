@@ -59,9 +59,9 @@ func TestDevStagesShimDylibsIntoAPodReadableDir(t *testing.T) {
 
 	t.Run("rootless tier stages", func(t *testing.T) {
 		b := &fakePodShimBuilder{}
-		m := newTestManager(t, newFakeSystem(), os.Geteuid())
+		m := newTestManager(t, newFakeSystem(), testEUID(t))
 		m.shimBuilder = b
-		m.podRootBase = filepath.Join(t.TempDir(), "k3sm-dev-501")
+		m.podRootBase = filepath.Join(t.TempDir(), "k3sm-dev-"+strconv.Itoa(m.euid))
 		const instance = "dev"
 
 		pathShim, dnsShim, err := m.stagePodShims(context.Background(), instance, false, runtimeRuntimed)
@@ -150,9 +150,9 @@ func TestDevStagesShimDylibsIntoAPodReadableDir(t *testing.T) {
 	for _, tc := range symlinkCases {
 		t.Run("refuses a "+tc.name, func(t *testing.T) {
 			b := &fakePodShimBuilder{}
-			m := newTestManager(t, newFakeSystem(), os.Geteuid())
+			m := newTestManager(t, newFakeSystem(), testEUID(t))
 			m.shimBuilder = b
-			m.podRootBase = filepath.Join(t.TempDir(), "k3sm-dev-501")
+			m.podRootBase = filepath.Join(t.TempDir(), "k3sm-dev-"+strconv.Itoa(m.euid))
 			victim := t.TempDir()
 			victimFile := filepath.Join(victim, pathShimName)
 			if err := os.WriteFile(victimFile, []byte("victim"), 0o600); err != nil {
@@ -179,8 +179,8 @@ func TestDevStagesShimDylibsIntoAPodReadableDir(t *testing.T) {
 	}
 
 	t.Run("refuses a symlink planted at the cached shim before the re-sign", func(t *testing.T) {
-		m := newTestManager(t, newFakeSystem(), os.Geteuid())
-		m.podRootBase = filepath.Join(t.TempDir(), "k3sm-dev-501")
+		m := newTestManager(t, newFakeSystem(), testEUID(t))
+		m.podRootBase = filepath.Join(t.TempDir(), "k3sm-dev-"+strconv.Itoa(m.euid))
 		// Seed a cached shim with one successful build.
 		m.shimBuilder = &fakePodShimBuilder{}
 		cached, err := m.provisionPodShim(context.Background(), "dev", pathShimName)
@@ -218,7 +218,7 @@ func TestDevStagesShimDylibsIntoAPodReadableDir(t *testing.T) {
 	})
 
 	t.Run("the execshim dev-bin cache refuses a symlink too", func(t *testing.T) {
-		m := newTestManagerWithBuilder(t, &fakeBuilder{}, 501)
+		m := newTestManagerWithBuilder(t, &fakeBuilder{}, testEUID(t))
 		victim := t.TempDir()
 		if err := os.MkdirAll(filepath.Dir(m.devBinDir()), 0o755); err != nil {
 			t.Fatal(err)
@@ -290,10 +290,7 @@ func foreignOwned(paths ...string) func(string, *unix.Stat_t) error {
 // stage writes nothing, and the run degrades to no shim with a note naming the
 // path and the remedy.
 func TestPodShimStageRefusesForeignOwnedBase(t *testing.T) {
-	euid := os.Geteuid()
-	if euid == 0 {
-		t.Skip("the rootless tier needs an unprivileged test process")
-	}
+	euid := testEUID(t)
 	tests := []struct {
 		name string
 		// setup prepares the base (and anything under it) and returns the paths
@@ -468,10 +465,7 @@ func mkdirMode(t *testing.T, dir string, mode os.FileMode) {
 // the server starts, and the error names the path and the remedy. This holds on
 // a hostprocess run too, where no shim stage runs first to catch it.
 func TestDevRuntimeRootRefusesForeignOwnedBase(t *testing.T) {
-	euid := os.Geteuid()
-	if euid == 0 {
-		t.Skip("the rootless tier needs an unprivileged test process")
-	}
+	euid := testEUID(t)
 	tests := []struct {
 		name      string
 		mode      os.FileMode
