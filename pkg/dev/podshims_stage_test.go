@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -457,5 +458,81 @@ func mkdirMode(t *testing.T, dir string, mode os.FileMode) {
 	}
 	if err := os.Chmod(dir, mode); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestDevRuntimeRootRefusesForeignOwnedBase is the spawnServer half of B464.
+// The instance runtime root (every pod's data) sits under the same per-user base
+// as the rootless shim stage, so it goes through the same walker (ownedMkdirs):
+// a base another user created, or one group/other can write, is refused before
+// the server starts, and the error names the path and the remedy. This holds on
+// a hostprocess run too, where no shim stage runs first to catch it.
+func TestDevRuntimeRootRefusesForeignOwnedBase(t *testing.T) {
+	euid := os.Geteuid()
+	if euid == 0 {
+		t.Skip("the rootless tier needs an unprivileged test process")
+	}
+	tests := []struct {
+		name      string
+		mode      os.FileMode
+		foreign   bool
+		wantErr   bool
+		wantInErr []string
+	}{
+		{name: "user-owned base is used", mode: 0o700},
+		{name: "foreign-owned base is refused", mode: 0o755, foreign: true, wantErr: true,
+			wantInErr: []string{"is owned by uid 0", "Remedy: sudo rm -rf ", "cannot be used"}},
+		{name: "other-writable base is refused", mode: 0o777, wantErr: true,
+			wantInErr: []string{"group- or other-writable (mode 0777)", "Remedy: chmod go-w "}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestManager(t, newFakeSystem(), euid)
+			m.podRootBase = filepath.Join(t.TempDir(), "k3sm-dev-"+strconv.Itoa(euid))
+			mkdirMode(t, m.podRootBase, tc.mode)
+			if tc.foreign {
+				m.lstat = foreignOwned(m.podRootBase)
+			}
+			workDir := t.TempDir()
+			started := filepath.Join(workDir, "started")
+			m.self = filepath.Join(t.TempDir(), "fake-k3sm")
+			if err := os.WriteFile(m.self, []byte("#!/bin/sh\ntouch \"$K3SM_WORK_DIR/started\"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			podRoot := m.podRoot("dev")
+
+			proc, err := m.spawnServer(context.Background(), "dev", workDir, podRoot, testPorts, "none", runtimeHostProcess, "", "", "")
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("spawnServer over a user-owned base: %v", err)
+				}
+				select {
+				case <-proc.exited:
+				case <-time.After(30 * time.Second):
+					t.Fatal("fake server did not exit")
+				}
+				if _, err := os.Stat(started); err != nil {
+					t.Errorf("server did not start: %v", err)
+				}
+				if fi, err := os.Lstat(podRoot); err != nil || !fi.IsDir() {
+					t.Errorf("runtime root %s not created: %v", podRoot, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrForeignDir) {
+				t.Fatalf("spawnServer = %v, want ErrForeignDir", err)
+			}
+			for _, want := range append(tc.wantInErr, m.podRootBase) {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q, want it to contain %q", err, want)
+				}
+			}
+			if _, serr := os.Stat(started); serr == nil {
+				t.Error("the server started over a refused runtime root")
+			}
+			if entries, _ := os.ReadDir(m.podRootBase); len(entries) != 0 {
+				t.Errorf("refused base %s gained %v", m.podRootBase, entries)
+			}
+		})
 	}
 }

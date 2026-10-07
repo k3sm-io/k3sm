@@ -759,9 +759,15 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	// Pre-create the runtime root so a base the caller cannot write (a stale tree
 	// owned by the other euid) fails here, with the path named, instead of inside
 	// the detached server's first pod create.
-	// Component by component with a symlink refusal: the base sits under the
-	// world-writable /private/var/tmp (see mkdirNoFollow).
-	if err := mkdirNoFollow(0o700, filepath.Dir(podRoot), podRoot); err != nil {
+	// Component by component, through the same walker as the shim stage: the base
+	// sits under the world-writable /private/var/tmp, so another local user can
+	// create it first (see ownedMkdirs). Unlike a refused shim stage, which only
+	// costs a feature, this is fatal: the runtime root holds every pod's data, and
+	// a root another user controls cannot be used at all.
+	if err := m.ownedMkdirs(0o700, filepath.Dir(podRoot), podRoot); err != nil {
+		if errors.Is(err, ErrForeignDir) {
+			return nil, fmt.Errorf("pod-root %s cannot be used, it holds every pod's data and another user could read or replace it: %w", podRoot, err)
+		}
 		return nil, fmt.Errorf("create pod-root %s: %w", podRoot, err)
 	}
 	// The instance's container-log root. The node REFUSES to start without it

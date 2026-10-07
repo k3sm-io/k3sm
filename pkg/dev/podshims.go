@@ -99,6 +99,13 @@ const podShimMode os.FileMode = 0o755
 // chooses.
 var ErrSymlinkStage = errors.New("dev: refusing to stage through a symlink")
 
+// ErrForeignDir reports a dev directory (the per-user pod-root base, an
+// instance's runtime root) that this euid does not alone control: owned by
+// another user, writable by group or other, or not a real directory. It is
+// refused, never repaired, because whoever made it may already have put
+// something inside.
+var ErrForeignDir = errors.New("dev: refusing a directory this user does not own")
+
 // refuseSymlink returns ErrSymlinkStage when path exists and is a symbolic link,
 // and nil when it is absent or not a link. It checks the path itself (Lstat),
 // never the link target.
@@ -251,8 +258,8 @@ func (m *Manager) podShimParents(instance string) []string {
 // sits under the world-writable /private/var/tmp: any local user can pre-create
 // that name as a link. MkdirAll would follow it, and staging would then write
 // the shim that is DYLD-injected into EVERY pod into the planter's tree. They
-// can equally create it as a real directory they own; the shim stage refuses
-// that too, through mkdirOwned.
+// can equally create it as a real directory they own; ownedMkdirs, built on
+// this, refuses that too.
 func mkdirNoFollow(perm os.FileMode, dirs ...string) error {
 	for _, d := range dirs {
 		if err := refuseSymlink(d); err != nil {
@@ -393,12 +400,15 @@ func (m *Manager) prepareShimStage(instance, name string) (string, bool, error) 
 	} else {
 		// The parents at the runtime root's own 0700, so the stage dir below does
 		// not create the instance's runtime root 0755.
-		for _, d := range m.podShimParents(instance) {
-			if ok, err := m.mkdirOwned(0o700, d, name); err != nil || !ok {
-				return "", false, err
-			}
+		err := m.ownedMkdirs(0o700, m.podShimParents(instance)...)
+		if err == nil {
+			err = m.ownedMkdirs(0o755, dir)
 		}
-		if ok, err := m.mkdirOwned(0o755, dir, name); err != nil || !ok {
+		if errors.Is(err, ErrForeignDir) {
+			fmt.Fprintf(m.out, "note: not staging %s: %v\n", name, err)
+			return "", false, nil
+		}
+		if err != nil {
 			return "", false, err
 		}
 	}
@@ -413,24 +423,28 @@ func (m *Manager) prepareShimStage(instance, name string) (string, bool, error) 
 	return dir, true, nil
 }
 
-// mkdirOwned creates dir with perm (its parent must exist), refusing a symlink
-// (ErrSymlinkStage) like mkdirNoFollow, and then requires it to pass
-// ownedDirProblem whether it was just created or already there. An existing
-// dir that fails is refused, never chowned or chmodded into shape: whoever made
-// it may already have put something inside. ok is false (after a note naming
-// the path and the remedy) when it fails.
-func (m *Manager) mkdirOwned(perm os.FileMode, dir, name string) (ok bool, err error) {
-	if err := mkdirNoFollow(perm, dir); err != nil {
-		return false, err
+// ownedMkdirs creates each dir in order with perm (each one's parent must exist
+// or precede it), and requires each, whether just created or already there, to
+// pass ownedDirProblem BEFORE the next one is created inside it, so nothing is
+// ever written into a directory someone else controls. It is the one walker for
+// the per-user dev tree under the world-writable, sticky /private/var/tmp: the
+// pod-root base, an instance's runtime root, and the shim stage below it. Any
+// local user can create the base name first, as a link (ErrSymlinkStage, from
+// mkdirNoFollow) or as a real directory they own or everyone can write
+// (ErrForeignDir, wrapping the reason, the path and the remedy).
+func (m *Manager) ownedMkdirs(perm os.FileMode, dirs ...string) error {
+	for _, d := range dirs {
+		if err := mkdirNoFollow(perm, d); err != nil {
+			return err
+		}
+		if problem := m.ownedDirProblem(d); problem != "" {
+			return fmt.Errorf("%w: %s. Remedy: %s", ErrForeignDir, problem, m.stageRemedy(d))
+		}
 	}
-	if problem := m.ownedDirProblem(dir); problem != "" {
-		fmt.Fprintf(m.out, "note: not staging %s: %s. Remedy: %s\n", name, problem, m.stageRemedy(dir))
-		return false, nil
-	}
-	return true, nil
+	return nil
 }
 
-// stageRemedy is the one-line fix for a refused rootless stage dir: one this
+// stageRemedy is the one-line fix for a refused per-user dev dir: one this
 // user owns only needs its group/other write bit dropped; anything else (another
 // user's dir, a non-directory) is removed so the next run creates it afresh.
 func (m *Manager) stageRemedy(dir string) string {
