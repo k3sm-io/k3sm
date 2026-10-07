@@ -1,15 +1,18 @@
 # S3 findings — the engine decision (M16.0-d4)
 
-> **Status: RUN 2026-10-02 02:37Z, one run of `s3.sh` at `main` dba9ee6 on the outside
-> machine named under Rig, through the local-payload shim.** The payload exited at its
+> **Status: RUN 2026-10-02 02:37Z, one run of `s3.sh` at `main` dba9ee6 on an outside
+> machine (Apple M4 Max, 64 GiB), not the M16 rig, through the local-payload shim. Per
+> the #446 ruling the canonical run is the rig's and this record is advisory.** The payload exited at its
 > first criterion: `s3.1` **FAIL** on the invariants check, so `s3.2`–`s3.4` were never
 > reached and `s3.5` recorded that the control did not serve. The payload's own API
 > dump, quoted on the verdict line, shows **what** failed: the probe asks the core's
 > constructor for `max_kv_size`, `max_num_seqs` and `continuous_batching` by keyword,
 > and the constructor is `(model, tokenizer, config: EngineConfig)`. The invariants are
 > fields of `SchedulerConfig`, carried inside that `EngineConfig`. Driven that way,
-> outside the ladder and recorded below as supplementary, the in-process path answered
-> all four shape questions. Re-running the script overwrites rig state under `$PREFIX`;
+> outside the ladder and recorded below as supplementary, the in-process path accepted
+> token IDs with the invariants pinned, accepted an abort mid-stream, exposed a block-hash
+> function, and timed the publish call. Eviction was not exercised, and the stream did not
+> end after the abort. Re-running the script overwrites rig state under `$PREFIX`;
 > it does not rewrite this file.
 
 > **Rig substitution.** The host under Rig is not the sanctioned M16 rig (the laptop
@@ -18,13 +21,13 @@
 > and this record is advisory. S3's criteria are API shape, not budget, so the
 > substitution bears on `s3.4`'s absolute timings and the `s3.5` control only.
 
-> **The halt is not landed here, and that is a deliberate departure from the ladder.**
-> The halt condition is "the in-process path fails". The verdict line says the path's
-> constructor does not take three keywords; it does not say the path fails. Landing R3's
-> sidecar shape in `docs/user/mlx-fleet.md` on that line would write a product decision
-> from a false negative of the probe. Whether the rung re-runs on the rig with the probe
-> corrected (fix shape under Harness notes) or R3 lands as the ladder says is the
-> maintainers' call, not decided here.
+> **The halt is not landed here.** Per #446 a run off the rig does not discharge the
+> rung, so neither this run's FAIL nor the halt's substitution can land on its strength.
+> Context for the rig re-run: the verdict line says the core's constructor does not take
+> three keywords, while the supplementary records below show the same invariants carried
+> in `SchedulerConfig`, so the FAIL may be a miss of the probe rather than of the path.
+> Whether the rung re-runs on the rig with a corrected probe (Harness notes) or R3 lands
+> as the ladder says is the maintainers' call, not decided here.
 
 ## Question
 
@@ -82,18 +85,20 @@ S0(1), S0(2) and S0(3) are not claimed.
 The same five questions, asked the way the engine's API expects: `model, tokenizer =
 mlx_lm.load(path)`, the invariants in `SchedulerConfig`, the core started on the
 running loop. One run, `use_paged_cache=True` (the default `False` selects
-`PrefixCacheManager`, which has no block-hash function). Every line is a `RECORD`.
+`PrefixCacheManager`, which has no block-hash function). The lines carry a `SUPP` prefix
+so they are never read as ladder output. The driver that produced them is not in the
+tree, and the figures cannot be reproduced from the repo.
 
 ```
-RECORD load mlx_lm.load: 0.3s
-RECORD construct: AsyncEngineCore(model, tokenizer, EngineConfig(scheduler_config=SchedulerConfig(max_num_seqs=4, max_kv_size=4096, use_paged_cache=True))); scheduler sees max_num_seqs=4 max_kv_size=4096 use_paged_cache=True block_size=64
-RECORD add_request accepted token ids (12) -> 's3-1'
-RECORD s3.1-shape 64 output tokens over 64 stream events, TTFT 0.428s, finish=length
-RECORD s3.2-shape abort_request returned True after 8 events; 0 events after the abort; finish=None
-RECORD s3.3-shape PagedCacheManager.compute_block_hash(tokens: 'List[int]') -> 'str' block_size=64; evict_lru_blocks/register_block_hash/get_computed_blocks present
-RECORD block hash sample args=['tokens'] -> '4e4c04d8c9fbcecf'
-RECORD s3.4-shape publish cost per block: sync median 2.8us p99 3.6us; via an await median 2.6us p99 3.4us (200 samples each)
-RECORD get_cache_stats: {"hits": 0, "misses": 2, "hit_rate": 0.0, "tokens_saved": 0, "active_requests": 0, "block_size": 64, "max_blocks": 1000, "allocated_blocks": 1, "free_blocks": 999, "shared_blocks": 0, "total_tokens_cached": 0, "utilization": 0.001, "cache_hit_rate": 0}
+SUPP load mlx_lm.load: 0.3s
+SUPP construct: AsyncEngineCore(model, tokenizer, EngineConfig(scheduler_config=SchedulerConfig(max_num_seqs=4, max_kv_size=4096, use_paged_cache=True))); scheduler sees max_num_seqs=4 max_kv_size=4096 use_paged_cache=True block_size=64
+SUPP add_request accepted token ids (12) -> 's3-1'
+SUPP s3.1-shape 64 output tokens over 64 stream events, TTFT 0.428s, finish=length
+SUPP s3.2-shape abort_request returned True after 8 events; 0 events after the abort; finish=None
+SUPP s3.3-shape PagedCacheManager.compute_block_hash(tokens: 'List[int]') -> 'str' block_size=64; evict_lru_blocks/register_block_hash/get_computed_blocks present
+SUPP block hash sample args=['tokens'] -> '4e4c04d8c9fbcecf'
+SUPP s3.4-shape publish cost per block: sync median 2.8us p99 3.6us; via an await median 2.6us p99 3.4us (200 samples each)
+SUPP get_cache_stats: {"hits": 0, "misses": 2, "hit_rate": 0.0, "tokens_saved": 0, "active_requests": 0, "block_size": 64, "max_blocks": 1000, "allocated_blocks": 1, "free_blocks": 999, "shared_blocks": 0, "total_tokens_cached": 0, "utilization": 0.001, "cache_hit_rate": 0}
 ```
 
 Two things the lines do not say on their own. After `abort_request` returned `True`
@@ -118,7 +123,7 @@ single-engine half of S0(2) and nothing more.
 These are two numbers from one machine with no M8 figures taken on it; they are the
 negative space the ladder asks for, never a criterion.
 
-## Consequences recorded here
+## What this run observed
 
 - **The in-process construction, verbatim:**
   `model, tokenizer = mlx_lm.load(path)`;
@@ -128,27 +133,39 @@ negative space the ladder asks for, never a criterion.
   Continuous batching is the `EngineCore` path itself: the CLI's `--continuous-batching`
   chooses `BatchedEngine` over `SimpleEngine`, and in-process there is no flag to forget.
   `use_paged_cache=True` is not the default and is the one setting without which there
-  are no block hashes to publish. These are the values the image's `mlx_worker` tests
-  must pin, as the ladder says.
-- **The publish call can ride the request path:** 2.8 µs median, 3.6 µs p99 per block,
-  identical through an `await`. The cost is the hash, not the hook.
-- **The worker owns stream termination on abort**, not only the abort call.
+  are no block hashes to publish. This run observed these values; whether the image's
+  `mlx_worker` tests pin them follows from the rig re-run, not from this record.
+- **The publish call was cheap enough to ride the request path on this machine:** 2.8 µs
+  median, 3.6 µs p99 per block, identical through an `await`. The cost is the hash, not
+  the hook.
+- **The stream did not end after the abort here**, so a worker would own stream
+  termination on abort, not only the abort call.
 
 ## Harness notes (file:line, fix shape; not changed in this write-back)
 
 1. `s3.sh:103` tests the invariants as constructor keywords; the engine carries them in
-   `EngineConfig.scheduler_config`. Fix shape: build `SchedulerConfig`/`EngineConfig`
-   with the pinned values and assert `core.engine.scheduler.config` echoes them, which is
-   the same check the probe meant to make, against the API that exists.
+   `EngineConfig.scheduler_config`. Correcting that check is not enough: the probe would
+   then fail at `s3.sh:115`, which constructs the core from a path with no tokenizer, and
+   the calls after it do not match the API the supplementary run used. The request id and
+   token ids are passed in a different order, `stream_outputs` is called without a
+   request id, and the probe looks for the prefix cache on the core rather than behind
+   the scheduler. The drive needs rewriting against that API: `mlx_lm.load`, then
+   `SchedulerConfig`/`EngineConfig` with the pinned values, asserting
+   `core.engine.scheduler.config` echoes them.
 2. `s3.sh:240` starts the control as `python -m vllm.entrypoints.openai.api_server`;
    `vllm-metal` 0.1.0 ships that module only under its `[vllm]` extra, and its own entry
-   point is the `vllm-metal` console script. Fix shape: `"$PREFIX/venv-metal/bin/vllm-metal" --model "$MP" --port 8103`,
-   or install `vllm-metal[vllm]` at `s3.sh:235` and keep the module form.
+   point is the `vllm-metal` console script. Fix shape: `"$PREFIX/venv-metal/bin/vllm-metal" --model "$MP" --port 8103`.
+   Installing the `[vllm]` extra instead would pull an unpinned dependency tree into the
+   control venv.
 3. `s3.sh:224` pipes the drive through `tee` under `pipefail`, so the drive's exit code is
    the payload's; `s3.sh:253`'s trailing `kill` returns non-zero when the server has
    already exited. Each non-zero payload earns a `FAIL` from `lib.sh:250`, which is how one
    failed criterion read as three. Fix shape: end the drive payload with `exit 0` once a
    `VERDICT` line has been written, and `kill "$PID" 2>/dev/null || true`.
+4. `s3.sh:165-173`, the s3.2 loop, breaks only on a ninth event after the abort at the
+   eighth. The stream stays open after an abort and sends nothing more (Supplementary
+   records), so the loop would wait with no timeout. Fix shape: bound the wait with the
+   stream's own timeout and treat its expiry after the abort as the expected end.
 
 ## Rig
 
