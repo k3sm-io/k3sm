@@ -298,7 +298,12 @@ run_psa_enforce_leg() {
 		--api-port "$api" --kine-port "$kine" --kubelet-port "$kubelet"
 		--scheduler-port "$sched" --controller-manager-port "$cm"
 		--ingress-http-port 0 --ingress-https-port 0
+		--pod-logs-dir "$SIT_PSA_WORKDIR/pod-logs"
 	)
+	# The leg runs as the invoking user. On a host with k3sm installed the system
+	# /var/log/pods is the installed node's (_k3sm, 0700), so this instance keeps
+	# its container logs under its own state root, as `k3sm dev` does.
+	mkdir -p "$SIT_PSA_WORKDIR/pod-logs" || return 1
 	local regex; regex="$(run_regex "${crits[@]}")"
 	if [ "$SIT_PLAN" -eq 1 ]; then
 		echo "  PLAN boot: k3sm ${argv[*]}"
