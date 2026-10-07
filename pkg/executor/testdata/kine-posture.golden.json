@@ -1,0 +1,32 @@
+[
+  {
+    "name": "root posture defaults",
+    "workDir": "/var/lib/k3sm/server",
+    "kinePort": 2379,
+    "kineArgs": [
+      "--listen-address",
+      "127.0.0.1:2379",
+      "--metrics-bind-address",
+      "0",
+      "--endpoint",
+      "sqlite:///var/lib/k3sm/server/db/state.db?_journal=WAL\u0026_busy_timeout=30000\u0026_kine_disable_startup_vacuum"
+    ],
+    "datastorePosture": "sqlite",
+    "etcdServers": "http://127.0.0.1:2379"
+  },
+  {
+    "name": "custom work dir and port",
+    "workDir": "/srv/k3sm/server",
+    "kinePort": 32379,
+    "kineArgs": [
+      "--listen-address",
+      "127.0.0.1:32379",
+      "--metrics-bind-address",
+      "0",
+      "--endpoint",
+      "sqlite:///srv/k3sm/server/db/state.db?_journal=WAL\u0026_busy_timeout=30000\u0026_kine_disable_startup_vacuum"
+    ],
+    "datastorePosture": "sqlite",
+    "etcdServers": "http://127.0.0.1:32379"
+  }
+]

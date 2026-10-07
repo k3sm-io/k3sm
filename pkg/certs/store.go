@@ -28,16 +28,31 @@ import (
 	"path/filepath"
 )
 
-// Hierarchy is k3sm's two-CA PKI (DESIGN §5c): the CLUSTER CA — the
-// serving anchor a join token pins and the issuer of kubelet-serving certs — and the
-// SIGNING CA that issues system:node client certs. They are independent self-signed
-// roots (the k3s server-ca / client-ca split): a compromised serving key cannot mint
-// client identities.
+// Hierarchy is k3sm's CA PKI (DESIGN §5c). Every multi-node server holds two CAs: the
+// CLUSTER CA — the serving anchor a join token pins and the issuer of kubelet-serving
+// certs — and the SIGNING CA that issues system:node client certs. They are
+// independent self-signed roots (the k3s server-ca / client-ca split): a compromised
+// serving key cannot mint client identities.
+//
+// An etcd-backed HA server holds two more, the etcd SERVER CA and the etcd PEER CA
+// (EnsureEtcdCAs), which anchor only etcd's client and peer TLS. Neither existing CA
+// can serve as etcd's anchor: the signing CA issues every joined worker's client cert,
+// so trusting it at etcd would hand every worker the whole datastore, and the cluster
+// CA would be safe only while it never issues a clientAuth leaf, an invariant nothing
+// enforces. k3s draws the same line (its etcd server-ca / peer-ca).
 type Hierarchy struct {
 	// Cluster is the cluster CA (the pinned serving anchor; --kubelet-certificate-authority).
 	Cluster *CA
 	// Signing is the signing CA (issues node client certs; --client-ca-file).
 	Signing *CA
+	// EtcdServer is the etcd server CA: the issuer and --trusted-ca-file of etcd's
+	// client listener (server-client.crt) and of the etcd clients (client.crt). It is
+	// nil outside the etcd HA posture.
+	EtcdServer *CA
+	// EtcdPeer is the etcd peer CA: the issuer and --peer-trusted-ca-file of the
+	// member-to-member mutual TLS (peer-server-client.crt). It is nil outside the
+	// etcd HA posture.
+	EtcdPeer *CA
 }
 
 // On-disk filenames within the PKI dir: the two CA keypairs, plus the multi-node
@@ -51,6 +66,70 @@ const (
 	apiServerKey  = "apiserver.key"
 )
 
+// On-disk filenames within the etcd PKI subdirectory (<PKI>/etcd, mode 0700). The
+// names follow k3s's server/tls/etcd layout.
+const (
+	etcdDirName              = "etcd"
+	etcdServerCACert         = "server-ca.crt"
+	etcdServerCAKey          = "server-ca.key"
+	etcdPeerCACert           = "peer-ca.crt"
+	etcdPeerCAKey            = "peer-ca.key"
+	etcdServerClientCert     = "server-client.crt"
+	etcdServerClientKey      = "server-client.key"
+	etcdPeerServerClientCert = "peer-server-client.crt"
+	etcdPeerServerClientKey  = "peer-server-client.key"
+	etcdClientCert           = "client.crt"
+	etcdClientKey            = "client.key"
+)
+
+// Common names of the two etcd CA roots.
+const (
+	etcdServerCACN = "k3sm-etcd-server-ca"
+	etcdPeerCACN   = "k3sm-etcd-peer-ca"
+)
+
+// EtcdPaths names every file of the etcd PKI under <PKI>/etcd. The two CA pairs are
+// minted once by the first HA server (EnsureEtcdCAs) and carried to every other
+// server by the bootstrap bundle; the three leaf pairs are re-issued by each server
+// on every boot.
+type EtcdPaths struct {
+	// Dir is <PKI>/etcd, mode 0700.
+	Dir string
+	// ServerCACert / ServerCAKey are the etcd server CA (--trusted-ca-file).
+	ServerCACert, ServerCAKey string
+	// PeerCACert / PeerCAKey are the etcd peer CA (--peer-trusted-ca-file).
+	PeerCACert, PeerCAKey string
+	// ServerClientCert / ServerClientKey are etcd's client-listener keypair, issued
+	// by the server CA with serverAuth+clientAuth (--cert-file / --key-file).
+	ServerClientCert, ServerClientKey string
+	// PeerServerClientCert / PeerServerClientKey are the member's peer keypair, issued
+	// by the peer CA with serverAuth+clientAuth (--peer-cert-file / --peer-key-file).
+	PeerServerClientCert, PeerServerClientKey string
+	// ClientCert / ClientKey are the etcd client identity (clientAuth only) the
+	// apiserver and the local admin client present, issued by the server CA.
+	ClientCert, ClientKey string
+}
+
+// EtcdCertPaths returns the etcd PKI file layout under workDir's PKI directory. It
+// creates nothing.
+func EtcdCertPaths(workDir string) EtcdPaths {
+	dir := filepath.Join(PKIDir(workDir), etcdDirName)
+	j := func(name string) string { return filepath.Join(dir, name) }
+	return EtcdPaths{
+		Dir:                  dir,
+		ServerCACert:         j(etcdServerCACert),
+		ServerCAKey:          j(etcdServerCAKey),
+		PeerCACert:           j(etcdPeerCACert),
+		PeerCAKey:            j(etcdPeerCAKey),
+		ServerClientCert:     j(etcdServerClientCert),
+		ServerClientKey:      j(etcdServerClientKey),
+		PeerServerClientCert: j(etcdPeerServerClientCert),
+		PeerServerClientKey:  j(etcdPeerServerClientKey),
+		ClientCert:           j(etcdClientCert),
+		ClientKey:            j(etcdClientKey),
+	}
+}
+
 // PKIDir returns the directory under the server work dir that holds the CA
 // hierarchy (certs world-readable 0644, keys 0600).
 func PKIDir(workDir string) string { return filepath.Join(workDir, "tls") }
@@ -62,8 +141,9 @@ func SigningCACertPath(workDir string) string { return filepath.Join(PKIDir(work
 
 // ClusterCAKeyPath / SigningCAKeyPath are the CA PRIVATE KEY paths (0600). They are
 // exported so a caller can NAME a key file — to os.Stat it, or to report on it —
-// without re-joining the layout. Nothing outside EnsureHierarchy / WriteHierarchy
-// should ever OPEN them: pin verification needs only the certificate.
+// without re-joining the layout. Nothing outside EnsureHierarchy /
+// ReconcileImportedHierarchy should ever OPEN them: pin verification needs only the
+// certificate.
 func ClusterCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), clusterCAKey) }
 func SigningCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), signingCAKey) }
 
@@ -96,11 +176,11 @@ func APIServerServingKeyPath(workDir string) string {
 var ErrNoHierarchy = errors.New("certs: no CA hierarchy in the work dir's PKI directory")
 
 // ErrIncompleteHierarchy reports a DAMAGED hierarchy: a CA certificate present
-// without its private key (the half-present hierarchy ensureCA also refuses), or a
-// PKI entry that is not a regular file. Distinct from ErrNoHierarchy so a caller can
-// tell "nothing here" (wrong work dir / missing privilege) from "the PKI on this host
-// is damaged". Compare with errors.Is.
-var ErrIncompleteHierarchy = errors.New("certs: damaged CA hierarchy (a CA certificate has no private key, or a PKI path is not a regular file)")
+// without its private key or a private key without its certificate (the half-present
+// pair ensureCA also refuses), or a PKI entry that is not a regular file. Distinct
+// from ErrNoHierarchy so a caller can tell "nothing here" (wrong work dir / missing
+// privilege) from "the PKI on this host is damaged". Compare with errors.Is.
+var ErrIncompleteHierarchy = errors.New("certs: damaged CA hierarchy (a CA certificate without its private key, a CA private key without its certificate, or a PKI path that is not a regular file)")
 
 // LoadCAPins reads ONLY the two CA CERTIFICATES from workDir's PKI directory and
 // returns their PinHash values (the lowercase-hex SHA-256 of the certificate DER that
@@ -130,8 +210,8 @@ func LoadCAPins(workDir string) (cluster, signing string, err error) {
 // exists at keyPath. The key is STATTED ONLY — never opened, never parsed.
 //
 // Both paths are LSTAT'ed and required to be REGULAR files. A symlink in the PKI dir
-// is never legitimate (EnsureHierarchy/WriteHierarchy only ever create regular files),
-// and following one would let a planted link redirect this — frequently root — read at
+// is never legitimate (EnsureHierarchy/ReconcileImportedHierarchy only ever create
+// regular files), and following one would let a planted link redirect this — frequently root — read at
 // an arbitrary file, or point the key path at some unrelated existing file and make
 // ErrIncompleteHierarchy unreachable for a hierarchy that is in fact half-present.
 func caPin(certPath, keyPath string) (string, error) {
@@ -211,51 +291,102 @@ func EnsureHierarchy(workDir string) (*Hierarchy, error) {
 	return &Hierarchy{Cluster: cluster, Signing: signing}, nil
 }
 
-// WriteHierarchy writes h's four CA PEMs into the work dir's PKI directory (certs
-// 0644, keys 0600) — the inverse of EnsureHierarchy's load. The HA server-join path
-// calls it AFTER decrypting the AES-256-GCM bootstrap bundle and BEFORE EnsureHierarchy,
-// so EnsureHierarchy then LOADS the IDENTICAL cluster + signing CAs instead of minting
-// fresh, divergent ones (which would split cluster trust). It REFUSES to overwrite any
-// existing CA file: a server that already has a hierarchy must never be silently
-// re-based onto another's — the import is a first-write, not a replace. The refusal
-// is the kernel's (O_CREATE|O_EXCL), not a stat-then-write, so two joins racing into
-// one work dir cannot both pass the check and then clobber each other's CA.
-func WriteHierarchy(workDir string, h *Hierarchy) error {
-	if h == nil || h.Cluster == nil || h.Signing == nil {
-		return fmt.Errorf("certs: write hierarchy: cluster and signing CA are required")
+// EnsureEtcdCAs loads the etcd server and peer CAs from <PKI>/etcd, creating and
+// persisting them on first call (idempotent across restarts; certs 0644, keys 0600,
+// the directory 0700). They are self-signed roots distinct from the cluster and
+// signing CAs and from each other. Like EnsureHierarchy it refuses a half-present
+// pair rather than silently re-minting, which would invalidate every etcd member's
+// certificates. Only the etcd HA posture calls it; a joining server finds the pairs
+// already installed by ReconcileImportedHierarchy from the bootstrap bundle and so
+// LOADS the identical CAs.
+func EnsureEtcdCAs(workDir string) (server, peer *CA, err error) {
+	dir, err := ensureEtcdDir(workDir)
+	if err != nil {
+		return nil, nil, err
 	}
+	server, err = ensureCA(dir, etcdServerCACert, etcdServerCAKey, etcdServerCACN)
+	if err != nil {
+		return nil, nil, fmt.Errorf("etcd server CA: %w", err)
+	}
+	peer, err = ensureCA(dir, etcdPeerCACert, etcdPeerCAKey, etcdPeerCACN)
+	if err != nil {
+		return nil, nil, fmt.Errorf("etcd peer CA: %w", err)
+	}
+	return server, peer, nil
+}
+
+// ensureEtcdDir creates <PKI>/etcd (the PKI dir 0755 as EnsureHierarchy makes it, the
+// etcd subdirectory 0700) and returns its path. An existing entry that is not a
+// directory is refused.
+func ensureEtcdDir(workDir string) (string, error) {
+	if err := os.MkdirAll(PKIDir(workDir), 0o755); err != nil {
+		return "", fmt.Errorf("create PKI dir: %w", err)
+	}
+	dir := EtcdCertPaths(workDir).Dir
+	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return "", fmt.Errorf("create etcd PKI dir: %w", err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", fmt.Errorf("stat etcd PKI dir: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("certs: etcd PKI dir %s is not a directory", dir)
+	}
+	return dir, nil
+}
+
+// caSpec is one CA keypair of the hierarchy: its id (for reports), the directory it
+// lives in, its file names there, and the Hierarchy field that holds it in memory.
+type caSpec struct {
+	id string
+	// dir returns the keypair's directory under workDir; it creates nothing.
+	dir func(workDir string) string
+	// ensureDir creates the keypair's directory with its mode (the PKI dir 0755, the
+	// etcd subdirectory 0700) and returns its path.
+	ensureDir func(workDir string) (string, error)
+	certFile  string
+	keyFile   string
+	ca        func(*Hierarchy) *CA
+}
+
+// caSpecs is the whole CA hierarchy, one row per CA, in install order. Every walk over
+// the on-disk hierarchy (MissingOnDisk, ReconcileImportedHierarchy) goes through
+// it, so a CA is never added to one walk and forgotten by another.
+var caSpecs = []caSpec{
+	{id: "cluster", dir: PKIDir, ensureDir: ensurePKIDir, certFile: clusterCACert, keyFile: clusterCAKey,
+		ca: func(h *Hierarchy) *CA { return h.Cluster }},
+	{id: "signing", dir: PKIDir, ensureDir: ensurePKIDir, certFile: signingCACert, keyFile: signingCAKey,
+		ca: func(h *Hierarchy) *CA { return h.Signing }},
+	{id: "etcd-server", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdServerCACert, keyFile: etcdServerCAKey,
+		ca: func(h *Hierarchy) *CA { return h.EtcdServer }},
+	{id: "etcd-peer", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdPeerCACert, keyFile: etcdPeerCAKey,
+		ca: func(h *Hierarchy) *CA { return h.EtcdPeer }},
+}
+
+// etcdPKIDir returns <PKI>/etcd; it creates nothing.
+func etcdPKIDir(workDir string) string { return EtcdCertPaths(workDir).Dir }
+
+// ensurePKIDir creates the PKI dir (0755, as EnsureHierarchy makes it) and returns it.
+func ensurePKIDir(workDir string) (string, error) {
 	dir := PKIDir(workDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create PKI dir: %w", err)
+		return "", fmt.Errorf("create PKI dir: %w", err)
 	}
-	files := []struct {
-		name string
-		data []byte
-		mode os.FileMode
-	}{
-		{clusterCACert, h.Cluster.CertPEM, 0o644},
-		{clusterCAKey, h.Cluster.KeyPEM, 0o600},
-		{signingCACert, h.Signing.CertPEM, 0o644},
-		{signingCAKey, h.Signing.KeyPEM, 0o600},
+	return dir, nil
+}
+
+// hierarchyComplete reports whether h carries every CA of the table.
+func hierarchyComplete(h *Hierarchy) bool {
+	if h == nil {
+		return false
 	}
-	for _, f := range files {
-		p := filepath.Join(dir, f.name)
-		fh, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, f.mode)
-		if err != nil {
-			if errors.Is(err, fs.ErrExist) {
-				return fmt.Errorf("certs: write hierarchy: %s already exists (refusing to overwrite an existing CA): %w", f.name, err)
-			}
-			return fmt.Errorf("write %s: %w", f.name, err)
-		}
-		if _, err := fh.Write(f.data); err != nil {
-			_ = fh.Close()
-			return fmt.Errorf("write %s: %w", f.name, err)
-		}
-		if err := fh.Close(); err != nil {
-			return fmt.Errorf("write %s: %w", f.name, err)
+	for _, spec := range caSpecs {
+		if spec.ca(h) == nil {
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
 // ensureCA loads the CA at dir/<certFile>+<keyFile>, or creates + persists a new one

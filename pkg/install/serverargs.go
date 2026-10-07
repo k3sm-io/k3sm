@@ -24,6 +24,7 @@ import (
 	"io"
 	"io/fs"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -93,10 +94,9 @@ var urlCredentials = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]+):
 // It is applied to EVERY place the carried arguments are written out — the two
 // install log lines, the un-carried warning, and the unparsable-plist error —
 // because those arguments are the operator's own and k3sm has no idea what is in
-// them. The one shape that is certainly a secret is a DSN:
-// `--datastore-endpoint postgres://user:password@host/db` is a supported
-// argument, and it would otherwise be echoed into /var/log/k3sm on every
-// install.
+// them. The one shape that is certainly a secret is a URL carrying a password
+// (scheme://user:password@host), which would otherwise be echoed into
+// /var/log/k3sm on every install.
 //
 // The returned slice is a copy; the arguments actually rendered into the plist
 // and written to the record are never the redacted ones.
@@ -194,6 +194,44 @@ func OperatorServerArgs(plist []byte) ([]string, error) {
 	return preservedServerArgs(args), nil
 }
 
+// InstalledMeshIP returns the --mesh-ip the installed control plane runs with,
+// or "" for a single-node server, read from the SAME two sources and in the same
+// precedence installedServerArgs uses: the installed server plist at plistPath
+// (authoritative — it is the argv launchd runs), then, only when that plist is
+// absent, the server-arguments record at recordPath. Neither present is "" with
+// no error: there is nothing installed to say otherwise.
+//
+// It is exported for `k3sm certificate rotate --restart`, whose post-restart
+// probe must dial the address the apiserver is bound to; a mesh server binds
+// only its mesh IP, so a loopback probe there never sees the control plane come
+// back. A plist that exists but cannot be read or parsed is an ERROR, never "",
+// because "" would send that probe to loopback on exactly the posture where
+// loopback is refused.
+func InstalledMeshIP(read func(path string) ([]byte, error), plistPath, recordPath string) (string, error) {
+	raw, err := read(plistPath)
+	switch {
+	case err == nil:
+		args, perr := OperatorServerArgs(raw)
+		if perr != nil {
+			return "", fmt.Errorf("read the installed server plist %s: %w", plistPath, perr)
+		}
+		return flagValue(args, "mesh-ip"), nil
+	case !errors.Is(err, fs.ErrNotExist):
+		return "", fmt.Errorf("read the installed server plist %s: %w", plistPath, err)
+	}
+	rec, err := dataroot.ReadServerArgsRecord(readerFunc(read), recordPath)
+	if err != nil || rec == nil {
+		return "", err
+	}
+	return flagValue(filterManagedServerArgs(rec.Args), "mesh-ip"), nil
+}
+
+// readerFunc adapts a plain read function to dataroot.FileReader.
+type readerFunc func(path string) ([]byte, error)
+
+// ReadFile implements dataroot.FileReader.
+func (f readerFunc) ReadFile(path string) ([]byte, error) { return f(path) }
+
 // recordedServerArgs returns the arguments the server-arguments record carries,
 // or nil when there is no record.
 //
@@ -275,8 +313,9 @@ func unreadablePlistError(sys System, cfg Config, path string, cause error) erro
 // famous two would lose the next flag an operator adds.
 //
 // It records cfg.resolvedExtraServerArgs(), not cfg.ExtraServerArgs directly, so
-// an explicit `k3sm install --mesh-ip` on THIS install is what a LATER reinstall
-// (with no flag of its own) carries forward — not the address it replaced.
+// an explicit `k3sm install --mesh-ip` (or --cluster-init, or --server-join) on
+// THIS install is what a LATER reinstall (with no flag of its own) carries
+// forward — not what it replaced.
 func writeServerArgsRecord(sys System, cfg Config) error {
 	path := cfg.ServerArgsRecord
 	rec := dataroot.ServerArgsRecord{
@@ -379,36 +418,32 @@ func setMeshIPArg(args []string, meshIP string) []string {
 	return append(out, "--mesh-ip", meshIP)
 }
 
-// datastoreEndpointFileFlag is the flag the installed daemon is given its HA
-// datastore DSN through, and setDatastoreEndpointFileArg is what puts it on the
-// argv in the inline flag's place. Both are spelled once, here, because the
-// installer that renders the flag and the carry-over that recognises it on a
-// later install have to agree about the name.
-const (
-	datastoreEndpointFlag     = "datastore-endpoint"
-	datastoreEndpointFileFlag = "datastore-endpoint-file"
-)
+// retiredDatastoreFlags are the `k3sm server` flags of the external-datastore HA
+// posture this release removed. `k3sm server` no longer registers them, so a
+// daemon rendered with one exits on an unknown flag at every launchd respawn;
+// preflightServerArgs refuses the install instead.
+var retiredDatastoreFlags = []string{"datastore-endpoint", "datastore-endpoint-file"}
+
+// ErrRetiredDatastoreFlag refuses an install whose carried `k3sm server`
+// arguments name a retired external-datastore flag.
+var ErrRetiredDatastoreFlag = errors.New("install: the server's carried arguments name the external-datastore HA posture, which this release removed")
 
 // preflightServerArgs reads, for a control-plane install only, the operator's
 // carried `k3sm server` arguments — the SAME two sources installedServerArgs
 // always has, in the same precedence (the installed plist, then the
 // survives-uninstall record) — and refuses here, before Install has written
-// anything, when the carried set names a --datastore-endpoint-file that is no
-// longer on disk. See requireDatastoreEndpointFile for why that refusal cannot
-// wait: rendering the plist anyway hands an HA control plane a daemon that
-// silently falls back to its own single-node datastore.
+// anything, when the carried set names a retired external-datastore flag
+// (retiredDatastoreFlags). Rendering the plist anyway would hand launchd a
+// daemon that exits on an unknown flag at every respawn; the refusal names the
+// replacement instead.
 //
 // It returns the SAME slice step 2d assigns to cfg.ExtraServerArgs later, so
 // the plist/record carry-over reads the installed state exactly once per
 // install rather than once here and once more downstream — a second read
 // would also re-emit installedServerArgs' own "preserved" log line.
-// requireDatastoreEndpointFile itself takes no uid: the write half of this
-// decision (stageDatastoreEndpoint's inline-DSN case) stays at its original,
-// post-copy point, because THAT path needs the service uid this preflight
-// point does not have yet.
 //
-// An agent install returns (nil, nil) immediately: --datastore-endpoint-file is
-// a `k3sm server` flag only.
+// An agent install returns (nil, nil) immediately: the retired flags were
+// `k3sm server` flags only.
 func preflightServerArgs(sys System, cfg Config) ([]string, error) {
 	if cfg.Role != RoleServer {
 		return nil, nil
@@ -417,130 +452,32 @@ func preflightServerArgs(sys System, cfg Config) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseEtcdRoleSwitch(cfg, extra); err != nil {
+		return nil, err
+	}
+	if err := refusePreSplitEtcdArgs(cfg, extra); err != nil {
+		return nil, err
+	}
 	cfg.ExtraServerArgs = extra
-	if named := flagValue(cfg.resolvedExtraServerArgs(), datastoreEndpointFileFlag); named != "" {
-		if err := requireDatastoreEndpointFile(sys, cfg, named); err != nil {
-			return nil, err
-		}
+	if err := refuseRetiredDatastoreFlags(cfg); err != nil {
+		return nil, err
 	}
 	return extra, nil
 }
 
-// stageDatastoreEndpoint moves a credentialed datastore DSN off the server
-// daemon's command line: the DSN goes into a service-user-owned 0600 file in
-// the server work dir and cfg.ExtraServerArgs comes back naming that file
-// instead.
-//
-// It is called with the arguments this install is about to render — after the
-// carry-over has decided them and before the record is written and the plist is
-// laid down — so the rewritten form is what reaches BOTH on-disk copies. A
-// rewrite applied to only one of them would leave the password in the other.
-//
-// Three cases, in this order:
-//
-//  1. the arguments already name a DSN FILE. Then there is nothing to stage:
-//     the file is the operator's Postgres credential, which k3sm did not mint
-//     and must not re-mint or delete, so it is carried like any other operator
-//     flag and its bytes are left alone. The file's PRESENCE is checked, and a
-//     missing one REFUSES the install — see below;
-//  2. the arguments carry an inline DSN with a password in it (the shape
-//     urlCredentials matches, and the only shape earlier builds could render).
-//     The value is staged and the flag is replaced;
-//  3. anything else — no datastore flag at all, or a DSN with no credential in
-//     it. Nothing is staged and nothing is rewritten: a flag that publishes no
-//     secret is left exactly where the operator put it, and a file this
-//     installer wrote for it would be a file nobody asked for.
-//
-// A configuration carrying BOTH flags is not resolved here. `k3sm server`
-// refuses to start on the pair rather than choosing one, which is the loud
-// failure; silently dropping whichever one this install liked less would be the
-// quiet one.
-func stageDatastoreEndpoint(sys System, cfg *Config, uid uint32) error {
-	args := cfg.resolvedExtraServerArgs()
-	if named := flagValue(args, datastoreEndpointFileFlag); named != "" {
-		return requireDatastoreEndpointFile(sys, *cfg, named)
-	}
-	dsn := flagValue(args, datastoreEndpointFlag)
-	if dsn == "" || !urlCredentials.MatchString(dsn) {
-		return nil
-	}
-	path := cfg.datastoreEndpointPath()
-	// The trailing newline is the staged token's convention and the reader
-	// trims, so the two staged files have one shape between them.
-	if err := sys.WriteServiceUserFile(path, []byte(dsn+"\n"), uid, DatastoreEndpointFileMode, ServerTokenDirMode); err != nil {
-		return fmt.Errorf("install: stage the datastore endpoint at %s: %w", path, err)
-	}
-	// MeshIP is merged in by resolvedExtraServerArgs above, so assigning the
-	// rewritten list back to ExtraServerArgs would make an explicit
-	// `k3sm install --mesh-ip` permanent in the carried set. Rewrite the
-	// UNRESOLVED list instead and let the merge keep happening downstream.
-	cfg.ExtraServerArgs = setDatastoreEndpointFileArg(cfg.ExtraServerArgs, path)
-	cfg.Logger.Info("staged the HA datastore endpoint for the server daemon (the daemon is told where its DSN is, never what it is — `ps` publishes an argv to every local account)",
-		"path", path)
-	return nil
-}
-
-// requireDatastoreEndpointFile refuses the install when a carried
-// --datastore-endpoint-file does not name a regular file that is there.
-//
-// The absent case is the one that matters most, and the alternative to stopping
-// is worse than stopping. `k3sm server` treats an empty datastore endpoint as
-// the single-node SQLite default, so rendering the flag over a missing file
-// would produce an HA control-plane Mac that silently came back on its own local
-// datastore — a split cluster whose only symptom is objects that other servers
-// cannot see. The file is the operator's, so the error names it and says what to
-// put back rather than offering to re-mint it.
-//
-// The check is a READ through the O_NOFOLLOW seam rather than a stat, so a
-// symlink, a directory, a fifo or a device at that path is refused here instead
-// of becoming a daemon that reads whatever the path resolves to at start. The
-// directory it sits in is the service user's, so what is at that name is not
-// automatically what this installer put there; the bytes are discarded, because
-// the only question being asked is whether the daemon has an endpoint to read.
-func requireDatastoreEndpointFile(sys System, cfg Config, path string) error {
-	switch _, err := sys.ReadRegularFile(path); {
-	case err == nil:
-		return nil
-	case errors.Is(err, ErrNotRegularFile):
-		return fmt.Errorf("install: the server is configured with --datastore-endpoint-file %s and that path is not a regular file (%v): put the datastore DSN in an ordinary file there, mode 0600 and owned by %s",
-			path, err, cfg.ServiceUser)
-	case errors.Is(err, fs.ErrNotExist):
-		return fmt.Errorf("install: the server is configured with --datastore-endpoint-file %s and that file is not there: write the datastore DSN into it (mode 0600, owned by %s), or drop the flag from the arguments this install carries (the installed plist %s, or the recorded set %s) to bring the server up on its own single-node datastore, which is NOT what an HA control plane wants",
-			path, cfg.ServiceUser, cfg.plistPath(ServerLabel), cfg.ServerArgsRecord)
-	default:
-		return fmt.Errorf("install: read the datastore endpoint file %s: %w", path, err)
-	}
-}
-
-// setDatastoreEndpointFileArg returns args with the --datastore-endpoint flag
-// (either spelling, inline or separate value) replaced IN PLACE by
-// "--datastore-endpoint-file <path>".
-//
-// In place rather than removed-and-appended, unlike setMeshIPArg: the operator
-// reads these arguments back off the plist and out of `k3sm status`, and a flag
-// that moved to the end of the list on the install that rewrote it would look
-// like an argument something else had added.
-func setDatastoreEndpointFileArg(args []string, path string) []string {
-	out := make([]string, 0, len(args)+1)
-	replaced := false
-	for i := 0; i < len(args); i++ {
-		name, _, inline := splitFlag(args[i])
-		if name != datastoreEndpointFlag {
-			out = append(out, args[i])
+// refuseRetiredDatastoreFlags is preflightServerArgs' refusal: any spelling of a
+// retired flag (--x v, --x=v, -x, with or without a value) in the arguments this
+// install would render. It reads only the arguments.
+func refuseRetiredDatastoreFlags(cfg Config) error {
+	for _, a := range cfg.resolvedExtraServerArgs() {
+		name, _, _ := splitFlag(a)
+		if !slices.Contains(retiredDatastoreFlags, name) {
 			continue
 		}
-		if !inline {
-			i++ // the DSN is the next argument; it goes with the flag
-		}
-		if !replaced {
-			out = append(out, "--"+datastoreEndpointFileFlag, path)
-			replaced = true
-		}
+		return fmt.Errorf("%w (--%s, in the installed plist %s or the recorded set %s). HA is now embedded etcd: re-create the cluster with `k3sm server --cluster-init` on the first server and `--server-join` on the others; there is no conversion from the old datastore to etcd. To install this server single-node, remove the flag (and its value) from those arguments",
+			ErrRetiredDatastoreFlag, name, cfg.plistPath(ServerLabel), cfg.ServerArgsRecord)
 	}
-	if !replaced {
-		out = append(out, "--"+datastoreEndpointFileFlag, path)
-	}
-	return out
+	return nil
 }
 
 // flagValue returns the value of the named flag (dashes stripped) in args, in

@@ -2,7 +2,7 @@
 
 ## Is k3sm a Certified Kubernetes Distribution?
 
-No. k3sm **cannot pass** the CNCF `[Conformance]` / Sonobuoy suite, which assumes Linux containers,
+No. k3sm **cannot pass** the CNCF `[Conformance]` suite, which assumes Linux containers,
 cgroups, CNI, and network namespaces. k3sm has none of them. See [Limitations](limitations.md).
 
 ## Does k3sm Use a Container Engine or a VM?
@@ -38,8 +38,8 @@ container without respawning it. See
 On the default runtime, yes. Cluster Service names, headless Services, StatefulSet per-Pod names,
 SRV and PTR all resolve from inside a Pod. Two caveats apply. The resolver is k3sm's own, not CoreDNS
 (IPv4/A only, no AAAA), and the `getaddrinfo` shim that redirects a Pod's lookups cannot load into a
-restricted binary. Host shells (`/bin/sh`, `bash`, `zsh`, `dash`, `env`) run as re-signed copies that
-keep the shim; any other restricted main process (the system `python3`, for example) gets a
+restricted binary. Host shells (`/bin/sh`, `bash`, `zsh`, `dash`, `env`), `tar` and the common file
+utilities run as re-signed copies that keep the shim; any other restricted main process (the system `python3`, for example) gets a
 `ShimInactive` Event and still resolves fully qualified and `<svc>.<ns>.svc` names through the node resolver.
 In-pod cluster DNS is **not** wired on `--runtime hostprocess`; on the `vm` RuntimeClass it works. See
 [Limitations](limitations.md#dns-what-resolves-and-on-which-runtime-path).
@@ -57,7 +57,9 @@ Not by uid. Same-node Pods share one `_k3sm` trust domain. Untrusted workloads b
 
 ## Is Multi-Node / HA Production-Ready?
 
-No. Both ship **EXPERIMENTAL**. See [Multi-node](multi-node.md) and [HA](ha.md).
+No. Multi-node ships **EXPERIMENTAL**; see [Multi-node](multi-node.md). A multi-server (HA) control
+plane is not available in v0.1.6: a cluster runs one server, and a second server cannot join yet.
+See [HA](ha.md).
 
 ## Which Kubernetes Version Does k3sm Track?
 

@@ -28,15 +28,18 @@ import (
 //
 // The split is deliberate and load-bearing:
 //
-//   - computeNodeConditions is STATELESS. It sees one snapshot and emits the raw
-//     verdict for it. No syscalls, no time.Now, no I/O, no memory of the past.
+//   - computeNodeConditions is PURE over one snapshot. No syscalls, no time.Now,
+//     no I/O. The one piece of history it honours, the MemoryPressure hold, rides
+//     inside the snapshot (stamped by the pressure monitor, pressure.go), so it is
+//     still a function of its arguments.
 //   - reconcileTransitions is where every fact about the PREVIOUS publication
 //     lives: LastTransitionTime preservation, and the DiskPressure Schmitt
 //     trigger (trip low, clear high) that a single snapshot cannot express.
 //
 // Sampling lives elsewhere (nodesample_darwin.go fills a hostStats from
-// host_statistics64, statfs and sysctl); the node-status loop in nodestatus.go
-// drives both functions and publishes the result. Keeping the threshold math
+// host_statistics64, statfs and sysctl); the pressure monitor owns the sample,
+// and the node-status loop in nodestatus.go drives both functions over the
+// monitor's latest snapshot and publishes the result. Keeping the threshold math
 // hermetic here lets every boundary be pinned by a faked snapshot with no
 // privilege and no host.
 //
@@ -46,12 +49,15 @@ import (
 // software k3sm neither owns nor can reclaim. A condition here reports the state
 // of the MACHINE, not of a k3sm-exclusive resource pool.
 //
-// HONEST LIMITATION, second: k3sm has no eviction manager. A True pressure
-// condition is an ADVERTISEMENT — it makes the node-lifecycle controller apply
-// the matching NoSchedule taint, and nothing more. No pod is ranked, evicted, or
-// restarted to relieve it, so the taint is ABSORBING: it persists until a human
-// (or, for the image store, the runtime's own garbage collector) frees space.
-// Nothing in this file promises eviction, and callers must not read it as such.
+// MEMORY PRESSURE IS ACTED ON; THE OTHERS ARE ADVERTISED. A True MemoryPressure
+// is the eviction manager's trigger as well as a condition: the same predicate
+// (memoryPressured, pressure.go) over the same stored snapshot decides both, and
+// the manager (eviction.go) evicts one pod at a time, ranked like the kubelet,
+// until the signal releases. The node-lifecycle controller applies the matching
+// NoSchedule taint from the condition as upstream does. DiskPressure and
+// PIDPressure have no eviction behind them: a True condition buys the taint only,
+// and it persists until the resource is freed (for the image store, by the
+// runtime's own garbage collector).
 //
 // Allocatable and the system reserve are deliberately NOT computed here; they
 // are derived from the node's published Capacity at registration.
@@ -67,7 +73,7 @@ const memAvailableHardEvictionBytes int64 = 100 * 1024 * 1024
 // absolute figure, not a percentage of the volume: k3sm shares one APFS volume
 // with a human's $HOME, Xcode caches and simulators, where a routine steady state
 // is well under any sane percentage floor — a percentage would NoSchedule-taint a
-// perfectly healthy dev Mac, and with no eviction manager to relieve it (see the
+// perfectly healthy dev Mac, and with no disk eviction to relieve it (see the
 // package note above) that taint never clears on its own.
 //
 // 2 GiB is chosen to sit BELOW the image garbage collector's own reclaim band, so
@@ -174,17 +180,42 @@ type hostStats struct {
 	// PIDMax is the systemwide process ceiling, kern.maxproc. A zero value means
 	// "not yet sampled" and is treated as no pressure.
 	PIDMax int64
+
+	// CompressorPages and CompressorPagesLimit are vm.compressor.pages_compressed
+	// and vm.compressor.pages_compressed_limit; CompressorSegments and
+	// CompressorSegmentsLimit are vm.compressor.segment.total and
+	// vm.compressor.segment.limit. They feed the compressor-headroom arm of
+	// memoryPressured and are only ever compared as like-for-like ratios (pages
+	// to pages, segments to segments). A zero limit means "not sampled" and is no
+	// pressure.
+	CompressorPages         int64
+	CompressorPagesLimit    int64
+	CompressorSegments      int64
+	CompressorSegmentsLimit int64
+	// SwapUsedBytes is the used field of vm.swapusage.
+	SwapUsedBytes int64
+	// SwapVolumeAvailableBytes is free space (f_bavail*f_bsize) on the volume
+	// the swapfiles live on; SwapVolumeCapacityBytes is that volume's size, the
+	// sampled witness (zero means "not sampled" and the swap arm cannot fire).
+	SwapVolumeAvailableBytes int64
+	SwapVolumeCapacityBytes  int64
+
+	// history is stamped by the pressure monitor from the samples before this
+	// one: the memory-pressure hysteresis hold and the previous swap reading.
+	// The zero value (a snapshot that never passed through the monitor) means no
+	// hold, so memoryPressured returns the raw trip verdict.
+	history pressureHistory
 }
 
 // computeNodeConditions reduces a hostStats snapshot to the node's four
-// pressure / network NodeConditions at instant now. It is PURE and STATELESS: no
-// syscalls, no time.Now (now is injected by the caller), no I/O, and no knowledge
-// of any previous snapshot — every field of every returned condition is a
-// deterministic function of (s, now).
+// pressure / network NodeConditions at instant now. It is PURE: no syscalls, no
+// time.Now (now is injected by the caller), no I/O — every field of every
+// returned condition is a deterministic function of (s, now).
 //
-// The verdicts it returns are RAW: the DiskPressure verdict here is the trip-edge
-// answer only. Hysteresis (holding DiskPressure True until free space recovers to
-// diskPressureClearFreeBytes) and LastTransitionTime preservation both need the
+// The DiskPressure verdict here is the trip-edge answer only; the MemoryPressure
+// verdict already honours its hysteresis, because the hold rides inside s (see
+// pressure.go). DiskPressure hysteresis (holding it True until free space recovers
+// to diskPressureClearFreeBytes) and LastTransitionTime preservation both need the
 // previously published conditions, so both live in reconcileTransitions. A caller
 // that publishes this function's output directly gets a correct but FLAPPING
 // DiskPressure and a LastTransitionTime that churns every heartbeat.
@@ -195,20 +226,23 @@ type hostStats struct {
 // make the scheduler treat a perfectly healthy node as under pressure. Both the
 // True and False branches therefore set Status, Reason, and Message explicitly.
 func computeNodeConditions(s hostStats, now metav1.Time) []corev1.NodeCondition {
-	// MemoryPressure: True iff available memory is below the upstream
-	// memory.available<100Mi hard-eviction floor.
+	// MemoryPressure: memoryPressured's verdict, the SAME function the eviction
+	// manager triggers on. The upstream memory.available<100Mi floor is one of
+	// its arms; the compressor and swap headroom arms are k3sm's, and the
+	// Message names whichever fired, so a node reporting MemoryPressure with
+	// plenty of available memory says why. The Reason stays the kubelet's.
 	mem := corev1.NodeCondition{
 		Type:               corev1.NodeMemoryPressure,
 		Status:             corev1.ConditionFalse,
-		Reason:             "KubeletHasSufficientMemory",
-		Message:            "kubelet has sufficient memory available",
+		Reason:             sufficientMemoryReason,
+		Message:            sufficientMemoryMessage,
 		LastHeartbeatTime:  now,
 		LastTransitionTime: now,
 	}
-	if s.MemAvailableBytes < memAvailableHardEvictionBytes {
+	if pressured, _ := memoryPressured(s); pressured {
 		mem.Status = corev1.ConditionTrue
-		mem.Reason = "KubeletHasInsufficientMemory"
-		mem.Message = "kubelet has insufficient memory available"
+		mem.Reason = insufficientMemoryReason
+		mem.Message = insufficientMemoryMessage + ": " + evaluateMemory(s).reading
 	}
 
 	// DiskPressure: the TRIP edge only — True iff free space on the data-root

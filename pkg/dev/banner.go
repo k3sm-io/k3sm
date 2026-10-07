@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"strings"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/defaults"
 )
 
 // FidelityBanner returns the SAFE/NEEDS-datapath/UNFAITHFUL text `k3sm dev up`
@@ -55,15 +55,15 @@ func FidelityBanner(datapath, runtime string) string {
 	// as uid 0 (provider.PodExecutionUID: no uid/gid on the PodBox => runtimed
 	// resolves Credential{Drop: false} => the pod keeps the daemon's own identity).
 	// That is strictly worse than the documented shipped posture — the installed
-	// LaunchDaemon runs as install.DefaultServiceUser — and it was invisible here
+	// LaunchDaemon runs as defaults.ServiceUser — and it was invisible here
 	// until it was reported, so the banner now says it outright on both tiers.
 	if datapath == DatapathDirect {
 		b.WriteString("pod identity: pods run as ROOT (uid 0) — a pod with no securityContext.runAsUser keeps this root\n")
 		b.WriteString("  daemon's identity. Seatbelt still confines them, but the installed cluster runs pods as the\n")
-		b.WriteString("  unprivileged " + install.DefaultServiceUser + " user; --datapath is dev-only. Do not run untrusted workloads on it.\n")
+		b.WriteString("  unprivileged " + defaults.ServiceUser + " user; --datapath is dev-only. Do not run untrusted workloads on it.\n")
 	} else {
 		b.WriteString("pod identity: pods run as YOU (your own uid) — a pod with no securityContext.runAsUser keeps this\n")
-		b.WriteString("  daemon's identity; the installed cluster runs pods as the unprivileged " + install.DefaultServiceUser + " user.\n")
+		b.WriteString("  daemon's identity; the installed cluster runs pods as the unprivileged " + defaults.ServiceUser + " user.\n")
 	}
 	b.WriteString("\n")
 

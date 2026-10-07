@@ -18,64 +18,12 @@ package main
 
 import (
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"testing"
 )
 
-// This file asserts M14.2's bring-up WIRING structurally, by reading server.go.
-//
-// runServer boots a real control plane, so no unit test can call it — and this
-// repo's recurring defect class is a well-tested helper bring-up never calls
-// (B195, B209), or calls in the wrong order. Source position is a sound proxy
-// here because every call asserted below sits in runServer's straight-line
-// bring-up sequence; there is no loop or branch that could execute them out of
-// textual order.
-
-// runServerBody parses server.go and returns runServer's body.
-func runServerBody(t *testing.T) (*token.FileSet, *ast.BlockStmt) {
-	t.Helper()
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "server.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse server.go: %v", err)
-	}
-	for _, decl := range file.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == "runServer" {
-			return fset, fn.Body
-		}
-	}
-	t.Fatal("server.go declares no runServer function")
-	return nil, nil
-}
-
-// firstCallPositions maps a call name to its FIRST occurrence in body. It records
-// both bare identifiers (enrollSelfAndBringUpMesh) and qualified selectors
-// (netserve.New), because the ordering M14.2 depends on spans both shapes.
-func firstCallPositions(body *ast.BlockStmt) map[string]token.Pos {
-	first := map[string]token.Pos{}
-	note := func(name string, pos token.Pos) {
-		if _, seen := first[name]; !seen {
-			first[name] = pos
-		}
-	}
-	ast.Inspect(body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		switch fun := call.Fun.(type) {
-		case *ast.Ident:
-			note(fun.Name, call.Pos())
-		case *ast.SelectorExpr:
-			if pkg, ok := fun.X.(*ast.Ident); ok {
-				note(pkg.Name+"."+fun.Sel.Name, call.Pos())
-			}
-		}
-		return true
-	})
-	return first
-}
+// This file asserts M14.2's bring-up WIRING structurally, by reading runServer's
+// trace (servertrace_test.go): runServer's body with its server*.go helpers
+// expanded at their call sites, every pinned call in a straight-line sequence.
 
 // TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener is M14.2 d4's ordering
 // pin, and it encodes two distinct reasons:
@@ -92,8 +40,8 @@ func firstCallPositions(body *ast.BlockStmt) map[string]token.Pos {
 // after the RBAC graph and after the MeshPeer CRD ensure — the CRD its very first
 // write lands in.
 func TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener(t *testing.T) {
-	fset, body := runServerBody(t)
-	first := firstCallPositions(body)
+	tr := runServerTrace(t)
+	first := tr.firstCalls()
 
 	required := []string{
 		"rbac.Provision",
@@ -117,10 +65,10 @@ func TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener(t *testing.T) {
 		{"enrollSelfAndBringUpMesh", "startBootstrapServer", "the index-0 claim must be durable before a worker can be assigned an index"},
 	}
 	for _, want := range mustPrecede {
-		if first[want.before] >= first[want.after] {
+		if first[want.before].pos >= first[want.after].pos {
 			t.Errorf("runServer calls %s at %s, NOT before %s at %s — %s",
-				want.before, fset.Position(first[want.before]),
-				want.after, fset.Position(first[want.after]), want.why)
+				want.before, tr.where(first[want.before].call),
+				want.after, tr.where(first[want.after].call), want.why)
 		}
 	}
 }
@@ -130,9 +78,8 @@ func TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener(t *testing.T) {
 // anything if both callers hold the SAME enroller. Two constructions would
 // contend on nothing.
 func TestRunServerSharesOneMeshEnroller(t *testing.T) {
-	_, body := runServerBody(t)
 	calls := 0
-	ast.Inspect(body, func(n ast.Node) bool {
+	runServerTrace(t).inspect(func(n ast.Node) bool {
 		if call, ok := n.(*ast.CallExpr); ok {
 			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "newMeshEnroller" {
 				calls++
@@ -154,9 +101,9 @@ func TestRunServerSharesOneMeshEnroller(t *testing.T) {
 // assertion is the absence of a `return` in its error branch, which is exactly
 // what a well-meaning later edit would add.
 func TestServerMeshBringUpIsLogAndContinue(t *testing.T) {
-	fset, body := runServerBody(t)
+	tr := runServerTrace(t)
 	found := false
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		ifStmt, ok := n.(*ast.IfStmt)
 		if !ok || ifStmt.Init == nil {
 			return true
@@ -175,7 +122,7 @@ func TestServerMeshBringUpIsLogAndContinue(t *testing.T) {
 		ast.Inspect(ifStmt.Body, func(m ast.Node) bool {
 			if ret, ok := m.(*ast.ReturnStmt); ok {
 				t.Errorf("runServer RETURNS at %s when the server mesh bring-up fails; a mesh-only defect is survivable and must not take the control plane down (M14.2 d7 requires log-and-continue)",
-					fset.Position(ret.Pos()))
+					tr.where(ret))
 			}
 			return true
 		})
@@ -208,9 +155,8 @@ func TestServerMeshBringUpIsLogAndContinue(t *testing.T) {
 // Asserted on the netserve.Config composite literal inside runServer, so a field
 // silently dropped in a later edit reddens here rather than in a two-Mac lab.
 func TestServerNetserveWiresTheMeshEgressSource(t *testing.T) {
-	_, body := runServerBody(t)
 	var cfg *ast.CompositeLit
-	ast.Inspect(body, func(n ast.Node) bool {
+	runServerTrace(t).inspect(func(n ast.Node) bool {
 		lit, ok := n.(*ast.CompositeLit)
 		if !ok {
 			return true
@@ -267,8 +213,8 @@ func TestServerNetserveWiresTheMeshEgressSource(t *testing.T) {
 // rather than calling it under some other predicate — the same shape
 // ensureMeshPeerCRD uses one phase later.
 func TestRunServerEnsuresTheMeshIPAliasBeforeTheControlPlane(t *testing.T) {
-	fset, body := runServerBody(t)
-	first := firstCallPositions(body)
+	tr := runServerTrace(t)
+	first := tr.firstCalls()
 
 	for _, name := range []string{"ensureMeshIPAlias", "executor.NewSupervised", "exec.Start"} {
 		if _, ok := first[name]; !ok {
@@ -280,15 +226,15 @@ func TestRunServerEnsuresTheMeshIPAliasBeforeTheControlPlane(t *testing.T) {
 		{"ensureMeshIPAlias", "exec.Start", "the apiserver binds the mesh IP the moment the control plane starts"},
 		{"ensureMeshIPAlias", "enrollSelfAndBringUpMesh", "mesh.Start plumbs the same alias far too late to serve the apiserver's bind"},
 	} {
-		if first[want.before] >= first[want.after] {
+		if first[want.before].pos >= first[want.after].pos {
 			t.Errorf("runServer calls %s at %s, NOT before %s at %s — %s",
-				want.before, fset.Position(first[want.before]),
-				want.after, fset.Position(first[want.after]), want.why)
+				want.before, tr.where(first[want.before].call),
+				want.after, tr.where(first[want.after].call), want.why)
 		}
 	}
 
 	var call *ast.CallExpr
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		c, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -313,6 +259,6 @@ func TestRunServerEnsuresTheMeshIPAliasBeforeTheControlPlane(t *testing.T) {
 	}
 	if !passesMeshIP {
 		t.Errorf("runServer's ensureMeshIPAlias at %s is not passed opts.meshIP — the single-node posture's no-op is what keeps this call free there",
-			fset.Position(call.Pos()))
+			tr.where(call))
 	}
 }

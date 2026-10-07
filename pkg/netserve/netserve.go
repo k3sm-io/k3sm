@@ -35,6 +35,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/proxy"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // defaultPodCIDR is the node's pod CIDR used for backend locality classification
@@ -146,6 +147,21 @@ type Config struct {
 	// set: an unknown vm source then fails OPEN like any other unattributable
 	// source, which is the unscoped behavior and never a wrong deny.
 	VMNetSubnet string
+	// EnforceNetworkPolicy starts the NetworkPolicy watcher that fills the policy
+	// table. The watcher lists and watches NetworkPolicies and Namespaces cluster
+	// wide, which only an identity granted those reads can do: the server sets it
+	// (its datapath runs under the admin client). A joined worker leaves it false,
+	// because its node identity is granted neither read and a watcher that cannot
+	// sync leaves the table empty anyway; with it false no policy informer starts,
+	// the table stays empty (every connection allowed) and Run logs that once.
+	EnforceNetworkPolicy bool
+	// PodScopeNode is the node whose pods this datapath may see. Set it when the
+	// datapath runs under that node's own identity: the Node authorizer refuses a
+	// node's cluster-wide pod list, so the NetworkPolicy watcher then lists only
+	// spec.nodeName=PodScopeNode (proxy.WithPodNodeScope). Empty is cluster-wide
+	// (the server, under the admin identity). It only matters with
+	// EnforceNetworkPolicy set.
+	PodScopeNode string
 	// NetdSocket, when non-empty, routes the proxy's privileged operations (the
 	// lo0 ClusterIP VIP alias and any privileged-port <1024 bind) through the root
 	// k3sm-netd helper at this socket, so the proxy runs unprivileged (the _k3sm
@@ -180,6 +196,7 @@ type Server struct {
 	policy *proxy.PolicyTable
 	// policyWatch resolves NetworkPolicies+Pods+Namespaces into policy's verdict
 	// state; Run hosts it beside the Service watcher (same client, same errgroup).
+	// Nil when cfg.EnforceNetworkPolicy is false: no policy informer is built.
 	policyWatch *proxy.PolicyWatcher
 	// dnsVIP is the infra DNS VIP the per-node resolver owns and the proxy is
 	// exempted from (proxy.WithInfraVIPExemptions). Zero (invalid) when cfg.DNSVIP
@@ -302,7 +319,9 @@ func New(cfg Config) *Server {
 		}
 	}
 	s.watch = proxy.NewWatcher(cfg.Client, s.proxy, log, watchOpts...)
-	s.policyWatch = proxy.NewPolicyWatcher(cfg.Client, s.policy, log)
+	if cfg.EnforceNetworkPolicy {
+		s.policyWatch = proxy.NewPolicyWatcher(cfg.Client, s.policy, log, proxy.WithPodNodeScope(cfg.PodScopeNode))
+	}
 	return s
 }
 
@@ -347,18 +366,21 @@ func vmnetPolicyPrefix(vmBackend bool, natSubnet string) netip.Prefix {
 }
 
 // SetTransportOverrides replaces the Service proxy's published-to-live TRANSPORT
-// address map: the seam a vm pod's guest DHCP lease reaches the backend dial
-// through (proxy.RoutingTable.SetTransportOverrides — read its contract before
-// calling). The node assembler feeds it from the provider, which is the only
-// component holding both a vm pod's published /32 and its reported lease; nothing
-// in netserve derives either.
+// map: the seam a vm pod's guest DHCP lease reaches the backend dial through, and
+// the set of published addresses the proxy relays to their guests, each on the
+// pod's declared TCP ports plus every port a Service targets there
+// (proxy.RoutingTable.SetTransportOverrides — read its contract before calling).
+// The node assembler feeds it from the provider, which is the only component
+// holding both a vm pod's published /32 and its reported lease; nothing in
+// netserve derives either.
 //
 // The map is replaced WHOLESALE and the caller owns the liveness obligation: an
 // override that outlives its lease dials an address that may now belong to a
-// different guest. Overrides affect the DIAL only — the picked backend, the
-// NetworkPolicy verdict and the affinity binding all stay keyed on the published
-// identity.
-func (s *Server) SetTransportOverrides(overrides map[netip.Addr]netip.Addr) {
+// different guest. A generation that drops or changes a pod closes its relay
+// before this returns. For the VIP path overrides affect the DIAL only — the
+// picked backend, the NetworkPolicy verdict and the affinity binding all stay
+// keyed on the published identity.
+func (s *Server) SetTransportOverrides(overrides map[netip.Addr]proxy.VMPodTransport) {
 	s.table.SetTransportOverrides(overrides)
 }
 
@@ -380,7 +402,8 @@ func (s *Server) Run(ctx context.Context) error {
 	// The NetworkPolicy watcher runs beside the Service watcher: same
 	// client, same lifecycle. The table stays empty (allow-everything) until its
 	// informers sync — the documented fail-open — so it never gates bring-up.
-	g.Go(func() error { return s.policyWatch.Run(gctx) })
+	// Without EnforceNetworkPolicy it starts no informer and only waits on ctx.
+	g.Go(func() error { return s.RunPolicyWatch(gctx) })
 	// Provision the canonical kube-system/kube-dns Service BEFORE the resolver binds:
 	// it is the DECLARING SUBJECT the netd port authorizer confirms the privileged
 	// DNS-VIP :53 bind against (exactly as k3sm-ingress is for :80/:443). Without it
@@ -402,6 +425,25 @@ func (s *Server) Run(ctx context.Context) error {
 		return nil // clean shutdown
 	}
 	return err
+}
+
+// RunPolicyWatch runs only the NetworkPolicy watcher (the Pods, Namespaces and
+// NetworkPolicies informers that resolve policies into the verdict table) until
+// ctx is cancelled. Run hosts it beside the Service watcher; it is exported on
+// its own because it is the one part of the datapath that needs no privilege
+// (no socket bind, no lo0 alias, no netd), so a caller can exercise exactly what
+// this Server lists and watches under a given identity. It ignores Disabled:
+// Run is what decides not to start it.
+//
+// When the Config does not set EnforceNetworkPolicy it starts no informer: it
+// logs one Info line and blocks until ctx, leaving the table empty.
+func (s *Server) RunPolicyWatch(ctx context.Context) error {
+	if s.policyWatch == nil {
+		s.log.Info("NetworkPolicy enforcement is off on this node: worker nodes wait for a dedicated controller identity; policies on the server node's pods are enforced")
+		<-ctx.Done()
+		return nil
+	}
+	return s.policyWatch.Run(ctx)
 }
 
 // ensureDNSService idempotently provisions kube-system/kube-dns: a selector-less
@@ -574,7 +616,10 @@ func (s *Server) bindDNSVIPOnce(ctx context.Context, ap netip.AddrPort) (net.Pac
 		_ = udp.Close()
 		return nil, nil, fmt.Errorf("bind 53/TCP: %w", err)
 	}
-	return udp, tcp, nil
+	// Pods reach the DNS VIP over lo0, so the TCP listener clamps each accepted
+	// connection's segment size (whichever binder opened it): a connection that
+	// re-routes onto the mesh must not carry lo0-sized segments.
+	return udp, tcpseg.WrapListener(tcp), nil
 }
 
 // PodDNSConfig returns the netv1.DNSConfig a pod in namespace should receive (the

@@ -52,9 +52,9 @@ var DefaultServerArgsRecordPath = "/Library/Preferences/io.k3sm.server-args.json
 // serverArgsRecordMode is the record's file mode: root-owned, ROOT-ONLY.
 //
 // 0600 rather than the data-volume record's 0644 because an operator argument
-// can carry a credential — `--datastore-endpoint postgres://user:password@host`
-// is the obvious one — and a world-readable copy of a datastore password is a
-// leak no amount of redaction in the logs would undo.
+// can carry a credential — a URL with user info, `https://user:password@host`,
+// is the obvious one — and a world-readable copy of a password is a leak no
+// amount of redaction in the logs would undo.
 const serverArgsRecordMode fs.FileMode = 0o600
 
 // ManagedServerFlags are the `k3sm server` flag names (leading dashes stripped)

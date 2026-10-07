@@ -249,6 +249,9 @@ type Allocation struct {
 	// in front of it is still the one its own join wrote. Empty means the enroll
 	// wrote no peer it can claim, and a release refuses to act on it.
 	EnrollID string
+	// PodCIDR is the range this Enroll assigned. A release frees the range's
+	// ownership claim along with the peer, so the next node can be handed it.
+	PodCIDR string
 }
 
 // String renders the allocation for logs.

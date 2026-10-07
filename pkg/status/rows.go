@@ -65,23 +65,9 @@ func (c Collector) Collect(ctx context.Context) Report {
 	role, _, bothRoles := c.installedRole()
 
 	dataRoot, volume := c.dataRootRow(ctx, role)
-	instRow, installed := c.installRow(volume != nil, role, bothRoles)
-	netd, _ := c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
-	var node Row
-	var nodePID int
-	// credential is the worker's node credential state, read once: the agent
-	// row reports it, and the apiserver row needs it to tell "this Mac has not
-	// joined" apart from "the control plane is down". It stays unknown on a
-	// server, which holds no such credential.
-	credential := CredentialUnknown
-	if role == dataroot.RoleAgent {
-		node, nodePID, credential = c.agentRow(now())
-	} else {
-		node, nodePID = c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
-		c.crashLoop(&node)
-		c.stagedControlPlane(&node)
-	}
-	apiserver := c.apiserverRow(ctx, role, credential)
+	ld := c.launchdRows(now(), role, bothRoles, volume != nil)
+	instRow, installed, netd, node, nodePID := ld.install, ld.installed, ld.netd, ld.node, ld.nodePID
+	apiserver := c.apiserverRow(ctx, role, ld.credential)
 	serving := apiserver.Severity == SeverityOK
 	// The node list is read ONCE and handed to both rows that use it, so the
 	// node row and the workloads row describe the same snapshot: two reads
@@ -115,6 +101,12 @@ func (c Collector) Collect(ctx context.Context) Report {
 	rows = append(rows,
 		apiserver,
 		c.nodeRow(serving, role, nodes, nodesErr),
+	)
+	// Beside the node row it details, and only when this Mac's node is known.
+	if hb, ok := c.heartbeatRow(ctx, serving, role, nodes, nodesErr, now()); ok {
+		rows = append(rows, hb)
+	}
+	rows = append(rows,
 		c.workloadsRow(ctx, serving, nodePID, nodes, nodesErr, now()),
 		dataRoot,
 	)
@@ -124,8 +116,19 @@ func (c Collector) Collect(ctx context.Context) Report {
 	if pre, ok := c.preVolumeRow(); ok {
 		rows = append(rows, pre)
 	}
+	rows = append(rows, c.datastoreRow(role))
+	// The embedded etcd member, on an etcd-posture server only: quorum, alarms,
+	// size against quota and WAL fsync latency, beside the datastore row it details.
+	if role != dataroot.RoleAgent {
+		if r, ok := c.etcdRow(ctx, c.installedServerArgs()); ok {
+			rows = append(rows, r)
+		}
+		// Abandoned pod-range claims, on a server that has recorded any check.
+		if r, ok := c.meshClaimsRow(now()); ok {
+			rows = append(rows, r)
+		}
+	}
 	rows = append(rows,
-		c.datastoreRow(role),
 		c.kubeconfigRow(),
 		c.runtimedRow(ctx, role),
 	)
@@ -142,15 +145,50 @@ func (c Collector) Collect(ctx context.Context) Report {
 
 	verdict, summary, next := Aggregate(rows, installed, role)
 	return Report{
-		Verdict:   verdict,
-		Role:      role,
-		Summary:   summary,
-		Rows:      rows,
-		Next:      next,
-		Version:   c.Version,
-		Host:      c.Host,
-		Timestamp: now(),
+		SchemaVersion: SchemaVersion,
+		Verdict:       verdict,
+		Role:          role,
+		Summary:       summary,
+		Rows:          rows,
+		Next:          next,
+		Version:       c.Version,
+		Host:          c.Host,
+		Timestamp:     now(),
 	}
+}
+
+// launchdView is the part of a report that launchd and the local disk answer
+// on their own: the install row, netd, and this Mac's node daemon. It is built
+// by ONE method so the full report and the daemons probe carry the same rows,
+// produced by the same builders, and can never describe a daemon differently.
+type launchdView struct {
+	install   Row
+	installed bool
+	netd      Row
+	node      Row
+	nodePID   int
+	// credential is the worker's node credential state, read once: the agent
+	// row reports it, and the apiserver row needs it to tell "this Mac has not
+	// joined" apart from "the control plane is down". It stays unknown on a
+	// server, which holds no such credential.
+	credential CredentialState
+}
+
+// launchdRows builds the launchdView. hasDataVolume is whether this Mac's data
+// root is a data volume, which decides whether the install row demands the
+// mount job's plist.
+func (c Collector) launchdRows(now time.Time, role dataroot.Role, bothRoles, hasDataVolume bool) launchdView {
+	v := launchdView{credential: CredentialUnknown}
+	v.install, v.installed = c.installRow(hasDataVolume, role, bothRoles)
+	v.netd, _ = c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
+	if role == dataroot.RoleAgent {
+		v.node, v.nodePID, v.credential = c.agentRow(now)
+	} else {
+		v.node, v.nodePID = c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
+		c.crashLoop(&v.node)
+		c.stagedControlPlane(&v.node)
+	}
+	return v
 }
 
 // exists reports whether path is there, through the FS seam.
@@ -320,6 +358,23 @@ func (c Collector) serverArgsRow() (Row, bool) {
 	// where a credential would be if one ever reached this row.
 	row.Detail = Redact(strings.Join(args, " "))
 	return row, true
+}
+
+// installedServerArgs returns the operator arguments the installed server plist
+// carries, or nil when there is no plist, no parser, or it cannot be read.
+func (c Collector) installedServerArgs() []string {
+	if c.ServerArgs == nil || c.FS == nil || c.Paths.ServerLabel == "" {
+		return nil
+	}
+	raw, err := c.FS.ReadFile(c.plistPath(c.Paths.ServerLabel))
+	if err != nil {
+		return nil
+	}
+	args, err := c.ServerArgs(raw)
+	if err != nil {
+		return nil
+	}
+	return args
 }
 
 // daemonRow reports one LaunchDaemon. It returns the row and the job's pid (0
@@ -923,11 +978,7 @@ func (c Collector) dataRootRow(ctx context.Context, role dataroot.Role) (Row, *d
 		row.Detail = "the data root was not probed"
 		return row, nil
 	}
-	recordPath := c.Paths.DatavolRecord
-	if recordPath == "" {
-		recordPath = dataroot.DefaultRecordPath
-	}
-	st, err := dataroot.ReadWithRecord(c.DataRoot, c.Paths.DataRoot, recordPath)
+	st, err := dataroot.ReadWithRecord(c.DataRoot, c.Paths.DataRoot, c.datavolRecordPath())
 	if err != nil {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "could not read " + c.Paths.DataRoot + ": " + errText(err)
@@ -1364,11 +1415,21 @@ const WorkerDatastoreDetail = "not this node's: the control plane's datastore li
 // database's journal mode and user_version as this node's datastore, with a
 // remedy pointing at a server log no daemon on this Mac writes. The row is
 // returned BEFORE the path is even built, so nothing opens the stale db.
+//
+// On an embedded etcd HA server the datastore is the etcd member, not a state.db,
+// so an initialized member (executor.EtcdMemberExists) is reported as such rather
+// than as "no state.db yet" — which would read as a server that never came up.
 func (c Collector) datastoreRow(role dataroot.Role) Row {
 	row := Row{Name: RowDatastore}
 	if role == dataroot.RoleAgent {
 		row.State, row.Severity = StateSkip, SeveritySkip
 		row.Detail = WorkerDatastoreDetail
+		return row
+	}
+	if executor.EtcdMemberExists(c.Paths.WorkDir) {
+		row.Wide = map[string]string{"path": executor.EtcdDataDir(c.Paths.WorkDir)}
+		row.State, row.Severity = StateOK, SeverityOK
+		row.Detail = "embedded etcd member (HA); no kine state.db in this posture"
 		return row
 	}
 	path := executor.StateDBPath(c.Paths.WorkDir)

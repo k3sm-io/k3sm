@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // The MESH/GUEST RELAY: a TCP forwarder that accepts on an address other
@@ -127,8 +128,8 @@ type Relay struct {
 	log   *slog.Logger
 
 	// listen and dial are seams so the accept/forward mechanics are testable over
-	// a loopback pair, with no mesh and no guest. Production wires net.Listen and
-	// a net.Dialer.
+	// a loopback pair, with no mesh and no guest. Production wires a
+	// segment-clamped net.Listen and a net.Dialer.
 	listen func(addr string) (net.Listener, error)
 	dial   func(ctx context.Context, addr string) (net.Conn, error)
 }
@@ -164,8 +165,16 @@ func newRelay(port int, binds []netip.Addr, log *slog.Logger) *Relay {
 		port:  port,
 		binds: binds,
 		log:   log,
+		// The relay binds a mesh address and the vm NAT gateway, which local pods
+		// reach over lo0, so every accepted connection's TCP segment size is
+		// clamped. The dial is not: it targets the registry's 127.0.0.1 listener,
+		// and 127/8 is permanently on lo0, so that connection never re-routes.
 		listen: func(addr string) (net.Listener, error) {
-			return net.Listen("tcp", addr)
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return nil, err
+			}
+			return tcpseg.WrapListener(ln), nil
 		},
 		dial: func(ctx context.Context, addr string) (net.Conn, error) {
 			d := net.Dialer{Timeout: relayDialTimeout}

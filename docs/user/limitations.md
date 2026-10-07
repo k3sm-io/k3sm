@@ -23,9 +23,10 @@ profile.
   apply.
 - The resource model is best-effort. There is **no CFS millicore CPU enforcement** on the native
   path, so CPU `limits` are not enforced and `HPA`-on-CPU is **unservable**. Memory is sampled
-  (`proc_pid_rusage`) and can drive OOMKill, but this is best-effort, not cgroup enforcement, and
-  there is no node-pressure eviction guarantee. `kubectl top` always needs an **operator-installed
-  metrics-server**, which k3sm does not ship.
+  (`proc_pid_rusage`) and can drive OOMKill, but this is best-effort, not cgroup enforcement. Under
+  node memory pressure k3sm evicts one Pod at a time, ranked as the kubelet ranks them (see
+  [Memory Pressure and Eviction](#memory-pressure-and-eviction)). `kubectl top` always needs an
+  **operator-installed metrics-server**, which k3sm does not ship.
   The **`vm` RuntimeClass differs**. A guest is a real Linux kernel, so each container gets a cgroup2
   leaf and the node publishes genuine per-container CPU **and** memory for `vm` Pods on the
   `metrics.k8s.io` scrape target. Native Pods publish neither, because that endpoint emits the
@@ -34,7 +35,7 @@ profile.
 - Workloads must be adapted. A raw upstream `[Conformance]` Pod, one that assumes a Linux image,
   bind mounts, or Linux-only fields, is rejected at admission or stranded. Images are the k3sm native
   image model (see [Images](images.md)), not arbitrary OCI Linux images.
-- k3sm cannot pass CNCF `[Conformance]` / Sonobuoy. That suite assumes Linux containers, cgroups,
+- k3sm cannot pass the CNCF `[Conformance]` suite. That suite assumes Linux containers, cgroups,
   CNI, and netns; k3sm has none of them, and k3sm does not claim a
   Certified-Kubernetes badge. See [Conformance profile](../conformance-profile.md).
 
@@ -64,12 +65,13 @@ empty search rather than a failure. On a host whose System keychain holds certif
 both exit `0`. A workload that branches on "did I find a certificate" therefore takes the wrong
 branch silently.
 
-Anything built on the keychain inherits this. **Notarization** is out on three counts at once: the
-`notarytool` binary lives inside the Xcode application bundle, which the profile does not read; its
-stored credentials live in the keychain; and it needs outbound network, which a Pod is denied unless
-it carries the `k3sm.io/internet-egress` annotation. Signing with a Developer ID identity has the
-same keychain dependency. Sign and notarize on the host. A `vm` Pod runs Linux, so it cannot run
-this tooling either.
+Anything built on the keychain inherits this. **Notarization** is out on two counts at once: the
+`notarytool` binary lives inside the Xcode application bundle, which the profile does not read, and
+its stored credentials live in the keychain. Signing with a Developer ID identity has the same
+keychain dependency. Sign and notarize on the host. A `vm` Pod runs Linux, so it cannot run this
+tooling either. Network is not the obstacle: every native Pod may open outbound connections on the
+host network stack, and k3sm does not filter them (see "NetworkPolicy Is a Policy Hint, Not a
+Security Boundary" below).
 
 ### Signing Names Files by Relative Path, and SwiftPM Cannot Finish
 
@@ -126,6 +128,16 @@ message described above, it is not a failure, and the compile that follows it su
 silenced from inside the Pod. `xcrun`'s documented `xcrun_nocache=1` and `--no-cache` both *refresh*
 the cache entry rather than skip it, so the write happens anyway, and so does the message.
 
+A tool in `/usr/bin` (`python3`, `git`, `clang` and the other developer-tool shims) run with no
+`DEVELOPER_DIR` set prints `xcode-select: error: unable to read data link at
+'/var/db/xcode_select_link'` on stderr, with `Operation not permitted`. The sandbox denies that link
+on purpose. The tool usually still runs, but `xcrun --find …` and other lookups routed through
+`xcrun` fail with exit code 1. Two remedies work: call the Command Line Tools binary by path, for
+example `/Library/Developer/CommandLineTools/usr/bin/python3`, which prints nothing extra, or set
+`DEVELOPER_DIR=/Library/Developer/CommandLineTools` in the container's `env`, which makes the shims
+and `xcrun` work. `DEVELOPER_DIR` only picks which toolchain runs. It changes nothing in the
+sandbox profile: the data link and the `xcrun` cache stay denied.
+
 ### Volume Mounts Resolve for Native Workloads and Host Shells
 
 k3sm pods run at host paths with **no chroot / mount namespace**, so a volume mounted at an
@@ -134,10 +146,54 @@ resolve there by a **`DYLD_INSERT_LIBRARIES` path-rebase shim** that rewrites th
 The shim loads into ordinary **native workloads** (Go/C binaries such as your app, `nats`, or
 `postgres`), so their absolute volume mounts work as expected.
 
-macOS strips `DYLD_INSERT_LIBRARIES` from a **SIP platform binary**, so on an installed node a Pod's
-`/bin/sh`, `bash`, `zsh`, `dash` and `env` run as the re-signed copies `sudo k3sm install` makes
-under `/Library/k3sm/shadow`. Those copies keep the path-rebase and DNS shims, so a shell script
-that reads a mounted file at its absolute path sees it, and so does whatever the script execs.
+macOS strips `DYLD_INSERT_LIBRARIES` from a **SIP platform binary**, so on an installed node the
+runtime runs re-signed copies that `sudo k3sm install` makes under `/Library/k3sm/shadow` in place of
+the host binaries. The set covers the shells (`/bin/sh`, `bash`, `zsh`, `dash`, `env`), `tar`, and
+the common file utilities: `cat`, `cp`, `mv`, `ls`, `mkdir`, `rm`, `chmod`, `ln`, `sed`, `grep`,
+`awk`, `head`, `tail`, `find`, `xargs`, `sort`, `gzip` and the rest of the usual set. Those copies
+keep the path-rebase and DNS shims, so a script's `cat /mnt/x` sees the mounted file, `kubectl cp`
+into or out of a mounted path works, and so does any binary from your image that the script execs.
+
+The shim rebases opens (including C stdio `fopen`), file status, directory listings, `cd` and exec,
+and the directory and metadata calls: `mkdir`, `rmdir`, `rm` of a file, `mv`, `chmod`, `ln` and
+`ln -s`, `readlink`, `touch`, and `cp` including the APFS clone path. Recursive walks work too,
+because the walker's own opens are rebased: `rm -r`, `ls` and `ls -R` of a mounted directory,
+`chmod -R`, `find` and `cp -R`. These work on an absolute mount path from the shadow set.
+
+What still does not work, with the workaround:
+
+- `chown -R` and `chgrp -R` on a mounted tree. Each entry is changed through a call the shim does not
+  rebase, so use relative paths from inside the mount.
+- A platform utility outside the shadow set, such as `du`. It loses the shim when it starts, so give
+  it a relative path from inside the mount.
+- `mkdir -p` of a path whose parent directories above the mount point do not exist on the host. The
+  mount point itself always exists, so create directories under it.
+- `readlink -f` and `realpath`.
+- A symlink whose target is an absolute mount path. The kernel follows it on the host, so use
+  relative targets inside a mount.
+- A path that climbs above its mount with `..`. It is treated as a host path.
+
+The shadow set is a compatibility aid and adds no isolation. Pods on one node stay one trust domain;
+untrusted tenants belong on the `vm` RuntimeClass.
+
+A **platform binary outside the set** that a Pod's process spawns is a ceiling, for example
+`/usr/bin/diff`, `/usr/bin/zip` or `/usr/bin/openssl` run from a shell script. macOS strips the shim
+from it, so absolute volume-mount paths resolve to the unmounted host path in such a child (and in
+anything it runs in turn), and it also loses per-namespace DNS precedence and the bind/connect
+discipline. Workarounds, in order of preference:
+
+- Use a binary from the set, or a shell built-in, which runs inside the shell and keeps the shim:
+  `read`, `echo`, `$(<file)` in bash, and redirections such as `while read l; do ...; done < /mnt/x`.
+- Use a relative path. When the container sets no `workingDir` (and its image sets none), its
+  working directory is the Pod data volume, where a volume mounted at `/P` is materialized at `./P`,
+  so `cat ./mnt/sec/key` resolves without the shim.
+- Ship the binary in the image. A binary from the image is not a platform binary and keeps the shim.
+
+When the Pod mounts volumes, the runtime notices such a child exec and the Pod gets one
+`ShimInactive` Warning Event naming the child binary. The Event is advisory, because the report
+comes from inside the Pod. This covers SIP-protected system binaries. A
+hardened-runtime third-party child is not detected, and neither is anything a platform binary
+itself spawns.
 
 The remaining ceiling is any other restricted or hardened main process, such as the system
 `python3`, `perl` or `swift`. dyld still strips the shim from those, so their absolute mount paths
@@ -225,6 +281,22 @@ headless-Service and StatefulSet traffic**, bypasses it completely. **Egress rul
 are never enforced**, and policies against `kube-dns` or the `kubernetes` VIP are unenforceable
 because those VIPs bypass the proxy. It is a policy hint, NOT a security boundary. Isolate untrusted
 workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
+
+In a multi-node cluster:
+
+- A worker starts no NetworkPolicy informers and enforces nothing, because its node identity is
+  not granted access to NetworkPolicies and Namespaces and no dedicated controller identity exists
+  yet. Connections to a backend on a worker are allowed whatever the policy says.
+- The server node enforces policies for its own Pods.
+- A `from` rule with a `podSelector` or `namespaceSelector` cannot match a Pod on another node.
+  Traffic arriving from a peer node's mesh address is always allowed.
+
+The `k3sm.io/internet-egress` annotation is the same kind of control. It records that a Pod needs to
+reach networks beyond the cluster, and admission surfaces a hand-set one, but leaving it off does not
+stop a native Pod from reaching the internet. k3sm does not manage the host's packet filter, and the
+sandbox cannot restrict network access by destination address, so nothing filters a connection a
+Pod opens on the shared host network stack. Treat egress restriction on the default runtime as
+cooperative, and run workloads you do not trust on the [`vm` RuntimeClass](vm-runtimeclass.md).
 
 ### Which Addresses Your Services Answer On
 
@@ -360,9 +432,13 @@ network isolation**, and any same-node process can dial any pod IP. Untrusted wo
 
 ### Ingress TLS Keys and Secrets at Rest
 
-Ingress TLS private keys are held **in-memory by the server process**, and Secrets are
-**plaintext-at-rest in the kine SQLite datastore** (file mode 0600, unreachable from pods). There is
-no KMS/envelope encryption. Treat read access to the host disk as read access to every Secret.
+Ingress TLS private keys are held **in-memory by the server process**. By default, Secrets are
+**plaintext-at-rest in the kine SQLite datastore** (file mode 0600, unreachable from pods), so treat
+read access to the host disk as read access to every Secret. Encryption at rest is opt-in on the
+install that creates a new cluster (`sudo k3sm install --secrets-encryption`), with a key generated
+on the Mac and kept under `/var/lib/k3sm/server/cred`. There is no KMS/envelope encryption, no key rotation, and no
+way to switch an existing cluster over. See
+[Secrets Encryption at Rest](install.md#secrets-encryption-at-rest).
 
 ### Certificate Rotation Does Not Revoke
 
@@ -410,24 +486,31 @@ We measured this on 2026-09-26 on a Mac with the agent stopped.
 **Single-label names and per-namespace precedence need the `getaddrinfo` shim.** A Pod on a
 cluster-first `dnsPolicy` (`ClusterFirst`, `ClusterFirstWithHostNet`, or unset) gets the cluster DNS
 configuration injected into every container, and the shim applies the Pod's search list and ndots, so
-a bare `postgres` resolves in the Pod's own namespace first. The node resolver does not do this:
-`<svc>` alone, `<svc>.<ns>` and `<svc>.svc` get no answer from it. The shim also carries the
+a bare `postgres` resolves in the Pod's own namespace first. The node resolver does not do this. A
+process without the shim resolves the fully qualified name and `<svc>.<ns>.svc`, but not
+`<svc>.<ns>`, `<svc>.svc` or `<svc>` alone. That matches k3s, where a process on the host resolves
+no cluster names at all. The shim also carries the
 bind/connect discipline that gives a Pod its own source address and port space. What to know:
 
-- **Host shells keep the shim.** macOS strips `DYLD_INSERT_LIBRARIES` from a SIP platform binary, so
-  `sudo k3sm install` makes re-signed copies of `/bin/bash`, `/bin/zsh`, `/bin/dash` and `/usr/bin/env`
-  under `/Library/k3sm/shadow`, and the runtime runs those in their place: a `/bin/sh -c` entrypoint, a
-  script whose shebang names one of them, and one exec'd from inside the Pod. A macOS update replaces
+- **Host shells and the common utilities keep the shim.** macOS strips `DYLD_INSERT_LIBRARIES` from a
+  SIP platform binary, so `sudo k3sm install` makes re-signed copies of the shells, `tar` and the
+  common file utilities under `/Library/k3sm/shadow` (the set is listed under volume mounts above), and
+  the runtime runs those in their place: a `/bin/sh -c` entrypoint, a script whose shebang names one of
+  them, and one exec'd from inside the Pod. A macOS update replaces
   the host binaries and the copies then lag behind. The `shadow-shells` row of `k3sm status` reports
   the drift, and running `sudo k3sm install` again makes a fresh set.
 - **Any other restricted main process loses the shim**, for example `/usr/bin/python3` or a
   hardened-runtime binary. The runtime reads the process's code-signing flags after it starts and the
   Pod gets a `ShimInactive` Warning Event naming what is unavailable. Such a process still resolves
   FQDNs and `<svc>.<ns>.svc` through the node resolver. Use fully qualified names, or a compiled
-  binary as the entrypoint.
+  binary as the entrypoint. The same holds for a platform binary outside the re-signed set that a
+  Pod's shell script spawns, as described under volume mounts above.
 - **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing**, so those Pods use the host resolver,
   which now answers cluster-shaped names (`*.svc`, `*.<domain>`) from the node resolver entry. For
-  `None` that is a gap, because a Pod's own `dnsConfig.nameservers` are not yet honored.
+  `None`, k3sm does not read the Pod's `dnsConfig` at all: its `nameservers`, `searches` and
+  `options` are ignored, and the Pod resolves through the host. The `getaddrinfo` shim can serve a
+  `None` Pod's IPv4 nameservers exclusively (up to three) and apply its `ndots`, but the provider
+  does not pass that configuration to it yet.
 - **Under `ClusterFirst`, `dnsConfig` is merged additively**, so extra `searches` are appended and
   `ndots` is overridden. Not yet honored are `dnsConfig.nameservers`, an explicit `ndots: 0`, and
   options other than `ndots`.
@@ -493,23 +576,18 @@ A native Pod's processes outlive the node daemon. When the daemon restarts (`sud
 -k system/io.k3sm.server`, or `io.k3sm.agent` on a worker, a crash, an upgrade), the new daemon reads
 the Pods bound to its node from the API server and re-attaches to every running Pod whose processes
 are still alive, instead of killing them and creating the Pod again. A re-attached Pod keeps its Pod
-IP, its listeners and its `restartCount`, and records one `PodReattached` Warning Event.
+IP, its listeners and its `restartCount`, and records one `PodReattached` Warning Event. Each
+container runs under its own resident shim, which holds the container's output and exit status
+across the restart: the container log continues with no gap, exit codes stay real, and
+`kubectl exec` works on a re-attached Pod.
 
 What a re-attached Pod does not get back:
 
-- **Log timestamps during the gap.** Output the containers write while no daemon is running is kept
-  in a capture file and appended to the container log when the new daemon reads it, so nothing is
-  lost, but those lines carry the time they were read, not the time they were written. One line in
-  the log marks where the gap was. A Pod started before this capture existed (by an older k3sm) did
-  lose its output; it carries the `k3sm.io/log-stream-lost` condition with reason `RuntimeRestarted`.
-- **Exit status.** A re-attached container is no longer the daemon's child, so when it exits the
-  daemon sees the exit but not the status. The container reports terminated with reason
-  `ExitStatusUnknown` and exit code `-1`, never `0`. A container that exited while the daemon was down
-  reports the same.
-- **`kubectl exec`.** It needs a resident shim that holds the container's launch environment, and
-  k3sm runs none, so the new daemon cannot enter a running container and exec is refused on a
-  re-attached Pod. Delete the Pod (or let its controller replace it) to get it back.
-- **CPU accounting.** CPU usage restarts from zero at the re-attachment.
+- CPU usage restarts from zero at the re-attachment.
+- A container whose shim died reports terminated with reason `ExitStatusUnknown` and exit code `-1`
+  when it exits, never `0`. Its later output is not logged, `kubectl exec` into it is refused, and
+  the Pod carries the `k3sm.io/log-stream-lost` condition with reason `ShimCrashed`. Delete the Pod
+  (or let its controller replace it) to get it back.
 
 Some Pods are created again rather than re-attached: `vm` Pods (a guest never outlives its helper),
 Pods that were still running an init container, Pods whose processes all exited, and every Pod after
@@ -525,6 +603,59 @@ the daemons are gone, so nothing k3sm started keeps running and a reinstall star
 group whose original leader process has already exited is left alone and logged, because nothing
 proves it still belongs to the Pod.
 
+### Memory Pressure and Eviction
+
+When the node runs low on memory, k3sm evicts Pods itself, one at a time, the way the kubelet does.
+The node's `MemoryPressure` condition and the eviction decision come from the same sample, so they
+always agree.
+
+- **Hard and memory-only.** There are no soft thresholds, no disk or PID eviction, no refusal of
+  new BestEffort Pods while the node is under pressure, and no `--eviction-hard` override. The
+  thresholds are fixed.
+- **Ranked like the kubelet.** Pods using more memory than they request go first, then lower
+  `priority`, then the largest usage over request. A BestEffort Pod requests nothing, so it ranks
+  first. Pods at `system-cluster-critical` or `system-node-critical` priority are never evicted.
+- **Three signals.** `MemoryPressure` goes True when available memory drops below 100Mi (the
+  kubelet's default), when the memory compressor reaches 80% of either of its kernel limits, or
+  when swap is in use, still growing, and the volume that holds swap has under 8 GiB free. The
+  condition's message names the one that fired, for example
+  `kubelet has insufficient memory available: compressor 83% of limit`. macOS starts killing
+  processes itself at 98% of a compressor limit, so k3sm acts first.
+- **One Pod per round.** After each eviction k3sm waits for that Pod to stop and for a fresh
+  sample, and evicts again only if pressure is not falling. After 3 evictions in 5 minutes it stops
+  for the rest of that pressure episode, logs an error, and records an `EvictionCascadeHalted`
+  Event on the node.
+- **What an evicted Pod shows.** Phase `Failed`, reason `Evicted`, the kubelet's message, an
+  `Evicted` Event, and the `DisruptionTarget` condition. Its containers are killed at once, with no
+  `preStop` hook, and exit 137. The Pod object stays until it is deleted, so its controller replaces
+  it as it would on a kubelet, and this node never starts it again.
+- **Two differences from the kubelet.** Eviction sends SIGKILL at once, with no SIGTERM grace
+  window (the kubelet gives about 2 s), and the `EvictionThresholdMet` Event is recorded once per
+  pressure episode.
+
+If a Pod fills memory faster than k3sm can react, macOS's own out-of-swap kill takes over. k3sm
+marks every Pod process so that kill picks a Pod before the control plane. The mark has limits:
+
+- A Pod's child processes (anything it forks or spawns) are unmarked. A single-process Pod is
+  fully covered.
+- An unmarked process holding more than half of all compressed memory is killed first, whatever
+  the marks say.
+- macOS picks its victim by how much compressed memory it holds. Total footprint does not count.
+- A `vm` Pod's guest memory is not covered by the mark. Eviction still covers `vm` Pods.
+- A kernel kill shows as a plain SIGKILL exit: exit code 137 with reason `Error`. It is never
+  reported as `OOMKilled`.
+- The mark is not an isolation control: a Pod can clear its own. Run untrusted workloads on the
+  [`vm` RuntimeClass](vm-runtimeclass.md).
+
+Runbook:
+
+- To tell an eviction from a kernel kill: an evicted Pod is `Failed` with reason `Evicted` and has
+  an `Evicted` Event. A kernel kill leaves a container that exited 137 with no such Event, and a
+  kernel log line you can find with
+  `log show --predicate 'sender == "kernel"' --last 1h | grep -i "paging space"`.
+- After upgrading k3sm, recreate long-running Pods. A Pod started by an older version is not marked
+  until it is recreated.
+
 ### `vm` RuntimeClass, Multi-Node, and HA Status
 
 - The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) boots and runs a Pod.
@@ -538,9 +669,13 @@ proves it still belongs to the Pod.
   **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for a later
   release), and it passes against the release build. See
   [`vm` RuntimeClass](vm-runtimeclass.md).
-- **Multi-node and HA** ship as documented **EXPERIMENTAL** and are not launch-blocking; their
-  de-EXPERIMENTAL graduation is the **v0.3** milestone. See [Multi-node](multi-node.md) and
-  [HA](ha.md).
+- **Multi-node** ships as documented **EXPERIMENTAL** and is not launch-blocking; its
+  de-EXPERIMENTAL graduation is the **v0.3** milestone. See [Multi-node](multi-node.md).
+- **A multi-server (HA) control plane is not available in v0.1.6.** `k3sm server` carries
+  `--cluster-init` and `--server-join` for an embedded etcd cluster, but a second server cannot
+  join yet, and `k3sm install` does not expose the flags. External-datastore HA and its flags were
+  removed in v0.1.6, and there is no conversion from an existing single-node SQLite cluster to etcd.
+  See [HA](ha.md).
 
 ### `vm` Pods: Node Selection and Security-Context Admission
 
@@ -637,17 +772,38 @@ tested rig and both a property of the shared-filesystem transport, not of PVC st
   they are unpacked, but a workload's own runtime writes are not, so a workload that itself creates
   case-colliding filenames on this path will lose data silently.
 
-### `vm` Pods: Same-Node Services, Not Direct Pod IPs
+### `vm` Pods: Services and Direct Pod IPs
 
 A `vm` Pod **consumes and serves** ClusterIP Services on its own node like any other pod. Delivery
 from the guest to a Service VIP is native on this path, and the proxy routes a Service to a `vm`
 Pod backend the same way.
 
-**Dialing a `vm` Pod's pod IP directly does not work.** The pod IP a `vm` Pod reports is its published
-identity, not a live address a peer can connect to, so anything that depends on a direct pod-IP dial,
-including headless-Service and per-pod DNS name resolution, does not reach a `vm` Pod. Reach it through
-its Service's ClusterIP instead, which does work. Cross-node traffic to or from a `vm` Pod is out of
-scope for this release.
+**A `vm` Pod's pod IP answers a direct dial, through a relay on its node, with these limits.** The
+guest never holds its pod IP. The node does, and relays each connection to the guest's own address.
+The relay covers each TCP `containerPort` the Pod declares and each port a Service targets on the Pod,
+so a peer on the same node, the node itself, or another node can dial the pod IP on those ports, and
+headless-Service and per-pod DNS names reach the Pod on them too. What it does not do:
+
+- **TCP only.** UDP to a `vm` Pod's pod IP is not relayed. Reach a `vm` Pod over UDP through its
+  Service's ClusterIP.
+- **Undeclared ports are refused.** A dial to a port the Pod does not declare and no Service targets
+  is refused. A native Pod has no such limit. A Pod whose declared and Service-targeted ports together
+  exceed the relay's per-pod port ceiling is not relayed at all, rather than relayed on some of them.
+- **Ports below 1024 need the network helper's view of the cluster.** The relay opens a port below 1024
+  through the root network helper, which allows it only for a port it can itself see the Pod declare or
+  a Service target, read from the API server. Until the helper has that view, or if it cannot read Pods
+  and EndpointSlices, those ports are refused rather than opened.
+- **The guest sees one client address.** Every relayed connection, local or remote, reaches the guest
+  from the node's guest-network gateway address, not from the caller's address. A workload in the guest
+  must not allowlist that address, and must not rely on the client address in its logs.
+- **NetworkPolicy applies, and has the same gap it has for a native Pod.** A direct pod-IP connection
+  to a `vm` Pod gets the same NetworkPolicy verdict the Service path applies. A process on the node
+  that dials the guest's own guest-network address skips the relay and the policy, exactly as a direct
+  dial of a native Pod's pod IP skips it.
+- **The relay forwards only to the guest the node attributes to that Pod.** It never forwards a
+  connection to any other address.
+
+Traffic a `vm` Pod opens toward another node is out of scope for this release.
 
 Three further properties of the guest network:
 
@@ -772,18 +928,24 @@ dev-Mac churn soak). Until that soak is signed off, treat heavy-churn watch sema
 accepted-with-known-issue rather than guaranteed. See [Backup & restore](backup-restore.md) for the
 datastore operational model.
 
-### Mesh MTU Spread and the UDP Segmentation Gap
+### Mesh MTU Spread and UDP Fragmentation
 
-A k3sm node presents a wide MTU spread: loopback pod aliases sit at 16384, and the mesh
-WireGuard tunnel sits at 1380. The mesh loads a TCP MSS-clamp rule into its own
-pf anchor, but a stock macOS install neither enables pf nor references that anchor from the
-main ruleset, so the clamp is not currently in effect; until that wiring lands, TCP and UDP
-flows alike can carry loopback-sized segments toward the tunnel. UDP gets no such clamp by design, because the
-scrub rule is TCP-only, so a UDP datagram sized for the loopback path can still exceed the
-tunnel MTU when it crosses the mesh. One unattributed host kernel panic in the segmentation-
-offload path is on record on macOS 26.6.2 with the mesh active; the evidence collected at the
-time was insufficient to name the flow that triggered it. If it recurs, the audit gate collects
-the snapshot needed to attribute it.
+- Loopback pod aliases sit at MTU 16384. The mesh WireGuard tunnel sits at 1380.
+- TCP: the kernel takes the MSS from the route to the destination, and the pod-CIDR routes inherit
+  the tunnel MTU, so cross-node connections (IPv4, the only pod family) negotiate an MSS of 1340. k3sm enables no pf and loads
+  no pf rule.
+- UDP: datagrams up to 1352 bytes cross the tunnel whole. Larger ones are fragmented and delivered.
+  With don't-fragment set, a larger send fails locally with `EMSGSIZE`.
+- Two host kernel panics are on record, on two Macs running a node with the mesh active, both in
+  the kernel's network packet-segmentation code. The cause is not established. One path that
+  could reach that code is a connection that outlives the loopback alias of the pod or Service
+  address it was opened to: the route then falls through to the mesh tunnel with a segment size
+  taken from the 16384-byte loopback MTU. k3sm defends that path in two ways. Connections k3sm
+  opens or accepts toward those addresses have their TCP segment size lowered to 1328 after
+  connect, and when a pod's alias is torn down its address gets a blackhole route, so a lingering
+  connection stays on loopback and its segments are dropped until it times out. No panic has been
+  reproduced since both are in place. UDP above 1352 bytes has not been exercised under load, so
+  avoid sustained large-datagram UDP across the mesh. A panic costs a reboot of the host.
 
 ## MLX / Apple-GPU Workloads
 

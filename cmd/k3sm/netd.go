@@ -78,19 +78,20 @@ type netdOptions struct {
 func netdFlags(opts *netdOptions) *flag.FlagSet {
 	fs := flag.NewFlagSet("netd", flag.ExitOnError)
 	fs.StringVar(&opts.socket, "socket", netd.DefaultSocketPath, "unix socket to listen on")
-	// The pre-adoption node /24 default is DERIVED, never typed: it is the same
-	// index-0 carve of the cluster pod CIDR the server gives itself
-	// (defaultNodePodCIDR), and the two must be the SAME value. netd's adoption
-	// treats "the identity already in force" as a no-op and refuses a DIFFERENT
-	// identity once anything is live, so on a server — whose ConfigureMesh carries
-	// exactly that index-0 carve — a literal here that drifted from the carve would
+	// The pre-adoption node /24 default is DERIVED, never typed: it is the
+	// index-0 carve of the cluster pod CIDR (defaultNodePodCIDR) a single node
+	// gives itself, and the two must be the SAME value. netd's adoption treats
+	// "the identity already in force" as a no-op and refuses a DIFFERENT identity
+	// once anything is live, so a literal here that drifted from the carve would
 	// turn a silent no-op into a refused adoption on a node that already holds
-	// aliases. One derivation, so drift is not expressible.
-	fs.StringVar(&opts.nodePodCIDR, "node-pod-cidr", defaultNodePodCIDR(), "this node's pod /24 (a pod-IP alias must fall within it); PRE-ADOPTION DEFAULT ONLY — the node's real prefix is decided by the join, and a ConfigureMesh may replace this value, so the installed plist passes no --node-pod-cidr")
+	// aliases. A mesh server's plist overrides it with this server's --mesh-ip /24
+	// (install.MeshNodePodCIDR), the range its ConfigureMesh carries. One
+	// derivation each, so drift is not expressible.
+	fs.StringVar(&opts.nodePodCIDR, "node-pod-cidr", defaultNodePodCIDR(), "this node's pod /24 (a pod-IP alias must fall within it); PRE-ADOPTION VALUE — on a worker the real prefix is decided by the join and a ConfigureMesh replaces this value, so a worker's installed plist passes none; a mesh server's installed plist passes the /24 its --mesh-ip is the mesh-egress address of, because the server aliases that address before its own enrol")
 	fs.StringVar(&opts.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR (REQUIRED so the proxy's ClusterIP VIP aliases are admitted)")
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
 	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
-	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer's Service informer uses — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
+	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer reads with: Services (VIP and ingress binds), and this node's Pods and EndpointSlices (relay binds on published vm pod addresses) — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the node resolver entry routes svc and the cluster domain to")
 	fs.StringVar(&opts.clusterDomain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the node resolver entry registers as a match domain")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT: ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
@@ -110,7 +111,7 @@ func runNetd(args []string) error {
 		return fmt.Errorf("k3sm netd must run as root (it owns lo0/utun/pf/privileged-port ops); it is launched by the io.k3sm.netd LaunchDaemon")
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -127,6 +128,9 @@ func runNetd(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Before anything else this job does: launchd starts netd ahead of the
+	// _k3sm jobs, and those cannot start while their log trees are wrong.
+	reapplyLogPolicy(install.NewDarwinSystem(), uint32(uid), logger)
 
 	// The node's own InternalIP for the node-address LB branch of the port
 	// authorizer. Empty is a valid posture — the branch simply denies —
@@ -149,6 +153,7 @@ func runNetd(args []string) error {
 		LBDeclarers:        lbDeclarers,
 		NodeAddressService: canonicalLBService(),
 		NodeIP:             nodeIP,
+		VMPodPorts:         buildVMPodSet(ctx, opts.kubeconfig, logger),
 		MeshKeyDir:         opts.meshKeyDir,
 		Logger:             logger,
 	})
@@ -229,6 +234,51 @@ func resolveServiceUID(flagUID int) (int, error) {
 		return 0, fmt.Errorf("parse %s uid %q: %w", install.DefaultServiceUser, u.Uid, err)
 	}
 	return uid, nil
+}
+
+// logPolicyEnsurer is the slice of install.System netd re-applies the log
+// ownership policy through: the installer's own ensure functions, so netd
+// carries no second copy of the owners, groups or modes.
+type logPolicyEnsurer interface {
+	EnsureLogDir(dir string, uid uint32) error
+	EnsureContainerLogDir(dir string, uid uint32) error
+}
+
+// reapplyLogPolicy re-applies, at every netd start, the two log-tree policies
+// `k3sm install` lays down: the daemon log dir (install.LogDir, with the server,
+// agent, netd and datavol logs EnsureLogDir pre-creates inside it) and every
+// directory of the container-log tree (install.ContainerLogDirs).
+//
+// Only the installer created them before, so a tree that disappeared after the
+// install stayed gone. A macOS upgrade does exactly that: /var/log came back
+// with /var/log/k3sm root:wheel 0744 and no agent.log, and without
+// /var/log/pods or /var/log/containers. launchd then could not open the _k3sm
+// agent's StandardOutPath as _k3sm and refused to start it, and once that was
+// fixed by hand the agent exited on the missing /var/log/pods. netd is the one
+// k3sm job that runs as root and launchd starts it before the _k3sm jobs, so
+// re-applying here repairs the trees on the next boot with nobody involved.
+//
+// uid is the service uid netd already resolved to admit its peer: the same
+// _k3sm account lookup the installer's EnsureServiceUser performs. Every ensure
+// is idempotent. An error is logged at Warn and never fails netd's start: netd's
+// own verbs are what every pod needs to exist, and a log tree it could not
+// repair is something `sudo k3sm install` still fixes.
+func reapplyLogPolicy(sys logPolicyEnsurer, uid uint32, logger *slog.Logger) {
+	if err := sys.EnsureLogDir(install.LogDir, uid); err != nil {
+		logger.Warn("netd: could not re-apply the daemon log directory policy; run `sudo k3sm install` to repair it",
+			"dir", install.LogDir, "uid", uid, "err", err)
+	} else {
+		logger.Info("netd: re-applied the daemon log directory policy", "dir", install.LogDir, "uid", uid,
+			"files", []string{install.ServerLogPath(), install.AgentLogPath(), install.NetdLogPath(), install.DatavolLogPath()})
+	}
+	for _, dir := range install.ContainerLogDirs() {
+		if err := sys.EnsureContainerLogDir(dir, uid); err != nil {
+			logger.Warn("netd: could not re-apply the container log directory policy; run `sudo k3sm install` to repair it",
+				"dir", dir, "uid", uid, "err", err)
+			continue
+		}
+		logger.Info("netd: re-applied the container log directory policy", "dir", dir, "uid", uid)
+	}
 }
 
 // canonicalLBService names the ONE Service whose declaration authorizes a

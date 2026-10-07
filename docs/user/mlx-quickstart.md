@@ -1,6 +1,6 @@
 # MLX quickstart
 
-Serve a language model on your Mac's GPU and call it from an OpenAI-compatible client. k3sm models the
+Serve a language model on your Mac's GPU and call it from any client of the common `/v1/chat/completions` HTTP API. k3sm models the
 workload as an **`MLXModel`** object. You declare the model and the memory it needs, and k3sm renders
 the serving workload, its Services, and its weight cache.
 
@@ -109,7 +109,7 @@ curl -sS "http://$VIP:8000/v1/chat/completions" \
       }'
 ```
 
-Any OpenAI-compatible client works. Point its base URL at `http://$VIP:8000/v1` and give it any
+Any client of that API works. Point its base URL at `http://$VIP:8000/v1` and give it any
 non-empty API key. Concurrent requests are batched by the server; the number it will batch is derived
 from `memory`.
 
@@ -131,8 +131,12 @@ That removes the serving workload, both Services, and the cache PVC. The underly
 - Weights never live in the image. They are downloaded on first start into the cache volume, so give
   that volume room for the model you are serving. A pinned `revision` is loaded from that volume rather
   than downloaded into it (see step 2).
-- `spec.distributed` is reserved for future multi-node sharded serving and is rejected today. One model
-  serves from one node.
+- Sharded serving is experimental: an alpha, for trusted tenancy only, and not yet run on hardware.
+  A model may set `spec.distributed` (`ranks`, `backend`, `parallelism`), and the operator places
+  the ranks as gang-scheduled rank Pods with per-rank DNS and reports placement and link health in
+  status. The `ring` backend places over the existing mesh. The `jaccl` backend needs RDMA-capable
+  direct links between Macs, which are not wired into the node yet, so it reports
+  `ShardsPlaced=False`. Without `spec.distributed`, one model serves from one node.
 - The **Apple Neural Engine is not a serving target**. MLX runs on the GPU; Apple publishes no stable
   API for scheduling ANE work, so k3sm has no ANE path planned.
 - Memory accounting covers the serving process group; the context window is pinned from `memory` so the

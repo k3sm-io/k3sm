@@ -46,8 +46,8 @@ import (
 // to a tcpSocket one instead of taking http.Transport's default dialer straight
 // to an address nothing answers at.
 //
-// The runtime-level r.probeTransport is NOT replaced: it keeps the default dialer
-// and stays the transport of everything that is not a pod's own probe — today the
+// The runtime-level r.probeTransport is NOT replaced: it keeps its own
+// segment-clamped dialer (newProbeTransport) and stays the transport of everything that is not a pod's own probe — today the
 // httpGet lifecycle hooks (lifecycle.go), which are dispatched per call rather
 // than per prober, and which fail OPEN where a probe fails closed.
 type probeSeams struct {

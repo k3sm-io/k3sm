@@ -72,16 +72,29 @@ func (b *crashBreaker) record(component, detail string) (tripped bool) {
 	return b.recordOrigin(executor.CrashOriginCrash, component, detail)
 }
 
+// recordLeaderLost appends one leader-lease loss — a leader-elected component
+// that exited as upstream intends when its lease could not be renewed — and
+// reports whether it tripped the breaker. It never counts toward the crash
+// threshold; it has its own, executor.LeaderLostThreshold, so a lease that
+// flaps forever still parks the server instead of restarting it forever.
+func (b *crashBreaker) recordLeaderLost(component, detail string) (tripped bool) {
+	return b.write(func(r *executor.CrashRecord, now time.Time) bool {
+		return r.RecordLeaderLost(now, component, detail)
+	})
+}
+
 // recordBringUp appends one BRING-UP failure — a control plane that never came
 // up at all, which the component-exit callback never sees because the child
 // either never started or died before it was marked supervised. Detail is the
 // bring-up error text, already redacted by pkg/executor before it was formatted.
 //
-// The two record sites are exclusive by construction, so a single failure is
-// never counted twice: a bring-up failure returns from executor.Start, and Start
-// returns only after it has torn every component down, while OnComponentExit
-// fires only for a component that was already marked supervised — which is to
-// say for a crash that by definition did not return from Start.
+// The two record sites must never count one failure twice. OnComponentExit fires
+// only for a component that was already marked supervised, and for every component
+// but one that mark is the last step of its bring-up. The exception is the etcd
+// member, which is supervised BEFORE its learner promotion and quorum waits; a
+// death during those waits is seen by both observers, and pkg/executor gives the
+// report to exactly one of them — when the exit callback took it, the bring-up
+// error wraps executor.ErrEtcdChildExited and noteBringUpFailure skips it.
 func (b *crashBreaker) recordBringUp(component, detail string) (tripped bool) {
 	return b.recordOrigin(executor.CrashOriginBringUp, component, detail)
 }
@@ -127,14 +140,23 @@ func (b *crashBreaker) write(add func(*executor.CrashRecord, time.Time) bool) (t
 // it could not mint) is still recorded, under "control-plane": the loop it would
 // otherwise produce is the same loop, and an unnamed count is better than none.
 //
-// A PERMANENT failure — today only executor.ErrNoGoToolchain, matched with
-// errors.Is through BringUpError's chain — trips the breaker on this one
-// failure: the launchd PATH that lacked `go` this lap lacks it on every lap.
+// A PERMANENT failure — executor.ErrNoGoToolchain, matched with errors.Is
+// through BringUpError's chain — trips the breaker on this one failure: the
+// launchd PATH that lacked `go` this lap lacks it on every lap. (The joining
+// server's permanent member-route refusal is the other permanent class; it fails
+// before the executor starts, so noteEtcdMemberRouteFailure records it.)
 func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 	component := "control-plane"
 	var bu *executor.BringUpError
 	if errors.As(err, &bu) {
 		component = bu.Component
+	}
+	if errors.Is(err, executor.ErrEtcdChildExited) {
+		// The exit callback already recorded this death as a crash; recording the
+		// bring-up error too would count one death twice toward the threshold.
+		logger.Error("the control plane did not come up: its etcd member exited, already recorded as a crash",
+			"component", component, "err", err)
+		return
 	}
 	if errors.Is(err, executor.ErrNoGoToolchain) {
 		logger.Error("the control plane did not come up with a fault that cannot heal on retry; parking on this failure",
@@ -150,6 +172,25 @@ func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 	if b.recordBringUp(component, err.Error()) {
 		logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
 			"path", b.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
+	}
+}
+
+// noteEtcdMemberRouteFailure records a joining server's member-route failure on the
+// breaker when, and only when, it is PERMANENT (errEtcdMemberRoutePermanent): such a
+// refusal reproduces on every lap, exactly like executor.ErrNoGoToolchain, so it
+// trips the breaker on the first one. Anything else that reaches here is a shutdown
+// during the step's in-process retry, which is not a failure at all. The detail is
+// redacted here because the error is this command's own text.
+func noteEtcdMemberRouteFailure(b *crashBreaker, logger *slog.Logger, err error) {
+	if !errors.Is(err, errEtcdMemberRoutePermanent) {
+		return
+	}
+	remedy := etcdMemberRouteRemedyFor(err)
+	logger.Error("the existing server permanently refused this server's etcd member; parking on this failure",
+		"component", etcdMemberRouteComponent, "err", err, "remedy", remedy)
+	if b.recordBringUpPermanent(etcdMemberRouteComponent, status.Redact(err.Error()), remedy) {
+		logger.Error("crash-loop breaker tripped on a permanent fault; the next start will park until an operator clears the record",
+			"path", b.path)
 	}
 }
 
@@ -219,6 +260,10 @@ func (b *crashBreaker) resetIfHealthy() {
 // difference survives the restart. The remedy is the same either way and is
 // logged beside this.
 func parkReason(last executor.Crash) string {
+	if last.Origin == executor.CrashOriginLeaderLost {
+		return "crash-loop breaker tripped on repeated leader-lease loss (last: " + last.Component +
+			"); this server keeps losing etcd quorum; parking until an operator clears the record"
+	}
 	if last.Origin == executor.CrashOriginBringUp {
 		return "crash-loop breaker tripped; the control plane never came up (last: " + last.Component +
 			"); parking until an operator clears the record"

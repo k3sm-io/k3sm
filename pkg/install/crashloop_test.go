@@ -96,6 +96,15 @@ func TestVerifyDaemonsFailsWhenTheServerIsParked(t *testing.T) {
 			wantErr:    ErrServerParked,
 			wantPhrase: []string{"kept crashing (last: kube-apiserver)", "parked"},
 		},
+		{
+			name: "a tripped leader-lost record fails in lease words, not crash words",
+			rec: executor.CrashRecord{
+				Crashes:   []executor.Crash{crash(installStart.Add(-time.Hour), executor.CrashOriginLeaderLost, "kube-scheduler")},
+				TrippedAt: &trippedAt,
+			},
+			wantErr:    ErrServerParked,
+			wantPhrase: []string{"kept losing its leader lease (last: kube-scheduler)", "parked"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

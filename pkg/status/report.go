@@ -60,12 +60,16 @@ const (
 	// StateAddressMismatch is the fourth: the credential is complete and in
 	// date, and names an address this node is not assigned.
 	StateAddressMismatch RowState = "address-mismatch"
-	// StateDrift is the shadow shell set's word for a copy made from a host
-	// binary macOS has since replaced.
+	// StateDrift is the shadow binary set's word for a copy made from a host
+	// binary macOS has since replaced, or a set made by an older install.
 	StateDrift     RowState = "drift"
 	StateUnknown   RowState = "unknown"
 	StateHealthy   RowState = "healthy"
 	StateUnhealthy RowState = "unhealthy"
+	// StateStale is the heartbeat row's word for a node whose last successful
+	// status post or Lease renewal is older than the window the node lifecycle
+	// allows it.
+	StateStale RowState = "stale"
 )
 
 // Row is one subsystem's line in the report.
@@ -100,7 +104,10 @@ type PeerStatus struct {
 // `k3sm status -o json`; the text screen is rendered FROM it and never the
 // other way round, so the two can never disagree.
 type Report struct {
-	Verdict Verdict `json:"verdict"`
+	// SchemaVersion is the version of this JSON contract (SchemaVersion, the
+	// constant). Collect sets it; it is never stamped on at the render layer.
+	SchemaVersion int     `json:"schemaVersion"`
+	Verdict       Verdict `json:"verdict"`
 	// Role is which node this Mac is installed as, decided from the two
 	// node-daemon plists on disk (dataroot.RoleFromPlists). It picks the rows
 	// the screens render and the daemon the verdict is about, so it is part of

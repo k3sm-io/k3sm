@@ -20,10 +20,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -80,21 +83,31 @@ func runInstall(args []string) error {
 		fmt.Fprintln(os.Stderr, fileVaultNote)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 	ctx := context.Background()
-	return install.Install(ctx, install.NewDarwinSystem(), install.Config{
-		Role:              opts.role(),
-		JoinServer:        opts.server,
-		NodeIP:            opts.nodeIP,
-		TokenFile:         opts.tokenFile,
+	return install.Install(ctx, install.NewDarwinSystem(), opts.installConfig(self, volume, logger))
+}
+
+// installConfig is the install package's Config these flags describe. It is
+// split out of runInstall so the mapping from flag to Config, and through it to
+// the rendered daemon arguments, is assertable without root.
+func (o installFlags) installConfig(self string, volume *datavol.Options, logger *slog.Logger) install.Config {
+	return install.Config{
+		Role:              o.role(),
+		JoinServer:        o.server,
+		NodeIP:            o.nodeIP,
+		ClusterInit:       o.clusterInit,
+		ServerJoin:        o.serverJoin,
+		TokenFile:         o.tokenFile,
 		BinarySource:      self,
-		TargetUser:        opts.targetUser,
-		ServiceCIDR:       opts.serviceCIDR,
+		TargetUser:        o.targetUser,
+		ServiceCIDR:       o.serviceCIDR,
 		DataVolume:        volume,
-		RemoveOldDataRoot: opts.removeOldDataRoot,
-		MeshIP:            opts.meshIP,
+		RemoveOldDataRoot: o.removeOldDataRoot,
+		MeshIP:            o.meshIP,
+		SecretsEncryption: o.secretsEncryption,
 		Logger:            logger,
-	})
+	}
 }
 
 // installFlags is the parsed `k3sm install` command line. It is a struct rather
@@ -104,7 +117,13 @@ func runInstall(args []string) error {
 type installFlags struct {
 	// agent selects the WORKER role: this Mac joins an existing cluster and runs
 	// the io.k3sm.agent LaunchDaemon instead of io.k3sm.server.
-	agent     bool
+	agent bool
+	// clusterInit and serverJoin select the embedded-etcd HA role of a SERVER
+	// install: form a new HA control plane, or join an existing one.
+	clusterInit bool
+	serverJoin  bool
+	// server, nodeIP and tokenFile are shared by the two roles, with a
+	// different meaning on each (see their help text).
 	server    string
 	nodeIP    string
 	tokenFile string
@@ -123,6 +142,7 @@ type installFlags struct {
 	dataVolumeEncrypt bool
 	removeOldDataRoot bool
 	meshIP            string
+	secretsEncryption bool
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
@@ -133,9 +153,11 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.StringVar(&o.targetUser, "user", os.Getenv("SUDO_USER"), "the human whose ~/.kube/config receives the admin kubeconfig (default $SUDO_USER)")
 	fs.StringVar(&o.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR")
 	fs.BoolVar(&o.agent, "agent", false, "install this Mac as a WORKER that joins an existing cluster (the io.k3sm.agent daemon) instead of as the control plane; needs --server")
-	fs.StringVar(&o.server, "server", "", "with --agent: the control-plane host to join, an UNDERLAY address (a LAN IP or DNS name, no scheme, no port) because the join dials <host>:9345 before this node has any mesh")
-	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: optional; the join assigns this Mac's mesh address, pass it only to assert the expected value (a value that differs from the assignment fails the join instead of minting a certificate for an address this node does not hold)")
-	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token, read once at each daemon start (a joined node needs none). It must not be group- or world-readable, and it is yours to delete once the node is Ready")
+	fs.BoolVar(&o.clusterInit, "cluster-init", false, "form a new embedded etcd HA control plane on this server; needs --node-ip")
+	fs.BoolVar(&o.serverJoin, "server-join", false, "join this server to an existing embedded etcd HA control plane; needs --server, --token-file and --node-ip")
+	fs.StringVar(&o.server, "server", "", "with --agent: the control-plane host to join; with --server-join: an existing server's LAN address (the --node-ip it was installed with). Either way an UNDERLAY address (a LAN IP or DNS name, no scheme, no port), because the join dials <host>:9345 before this node has any mesh")
+	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: optional; the join assigns this Mac's mesh address, pass it only to assert the expected value (a value that differs from the assignment fails the join instead of minting a certificate for an address this node does not hold). With --cluster-init or --server-join: required; this Mac's LAN address, which the etcd peer listener binds and every other server dials (not loopback). The server daemon receives it as --etcd-peer-ip; the node itself advertises its --mesh-ip")
+	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token (a joined node needs none). With --server-join: required; a file holding the server token `k3sm token create --server` printed on an existing server. Read once by this install and copied for the daemon; it must not be group- or world-readable, and it is yours to delete afterwards")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")
 	fs.StringVar(&o.dataVolumeName, "data-volume-name", defaultDataVolumeName, "the APFS volume label to create or adopt")
@@ -143,6 +165,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.dataVolumeEncrypt, "data-volume-encrypt", false, "encrypt the data volume with a random passphrase kept in the System keychain (a volume k3sm creates only)")
 	fs.BoolVar(&o.removeOldDataRoot, "remove-old-data-root", false, "after a verified migration, delete the .pre-volume copy of the old data root instead of keeping it")
 	fs.StringVar(&o.meshIP, "mesh-ip", "", "this node's wireguard mesh address, written into the server daemon's arguments; needed on every Mac that serves the control plane in a multi-node cluster")
+	fs.BoolVar(&o.secretsEncryption, "secrets-encryption", false, "encrypt Secrets at rest with a key generated on this Mac; a new single-server cluster only (back up <data root>/server/cred with every datastore backup)")
 	if err := fs.Parse(args); err != nil {
 		return installFlags{}, err
 	}
@@ -160,9 +183,10 @@ func parseInstallFlags(args []string) (installFlags, error) {
 }
 
 // validateMeshIP refuses a --mesh-ip this install can never serve from: an
-// address that fails to parse at all, and the three IP shapes that are always
-// wrong for a server's own bind address — unspecified (0.0.0.0/::), loopback,
-// and multicast. It runs at flag-parse time, before root/privilege checks, so a
+// address that fails to parse at all, the IP shapes that are always wrong for a
+// server's own bind address — unspecified (0.0.0.0/::), loopback, and multicast
+// — and any address that is not the mesh-egress address of a node pod range
+// inside the cluster pod range (install.MeshNodePodCIDR). It runs at flag-parse time, before root/privilege checks, so a
 // typo is reported immediately rather than after `sudo` and the rest of a
 // (possibly slow) install has already run.
 func validateMeshIP(raw string) error {
@@ -182,15 +206,24 @@ func validateMeshIP(raw string) error {
 	case addr.IsMulticast():
 		return fmt.Errorf("--mesh-ip %q is a multicast address and cannot be bound", raw)
 	}
+	// A server's mesh address is the mesh-egress address of its own node pod
+	// range: the install seeds netd's node range from it, so an address that
+	// names no range would leave netd refusing the server's own mesh alias.
+	if _, err := install.MeshNodePodCIDR(raw); err != nil {
+		return err
+	}
 	return nil
 }
 
 // serverOnlyInstallFlags configure the CONTROL PLANE and mean nothing on a
 // worker: the Service CIDR the control plane pins, the mesh address its
-// apiserver binds, and the data volume the datastore lives on. Passing one with
-// --agent is a misunderstanding worth stopping rather than silently ignoring,
-// because every one of them would otherwise look configured and do nothing.
+// apiserver binds, the data volume the datastore lives on, and the embedded-etcd
+// HA role. Passing one with --agent is a misunderstanding worth stopping rather
+// than silently ignoring, because every one of them would otherwise look
+// configured and do nothing.
 var serverOnlyInstallFlags = []string{
+	"cluster-init",
+	"server-join",
 	"service-cidr",
 	"mesh-ip",
 	"data-volume",
@@ -198,10 +231,8 @@ var serverOnlyInstallFlags = []string{
 	"data-volume-size",
 	"data-volume-encrypt",
 	"remove-old-data-root",
+	"secrets-encryption",
 }
-
-// agentOnlyInstallFlags describe a JOIN and mean nothing on a control plane.
-var agentOnlyInstallFlags = []string{"server", "node-ip", "token-file"}
 
 // role is the install role these flags select.
 func (o installFlags) role() install.Role {
@@ -223,14 +254,14 @@ func (o installFlags) role() install.Role {
 // The refusals are separate sentences rather than one "invalid combination"
 // because each names a different mistake, and the operator is at a terminal
 // with a machine they are about to change.
+//
+// A server install takes the embedded-etcd HA flags: --cluster-init alone, or
+// --server-join with --server and --token-file, and either with a non-loopback
+// --node-ip, rendered as the daemon's --etcd-peer-ip; the predicate is the one
+// `k3sm server` itself applies to that flag.
 func (o installFlags) validateRole() error {
 	if !o.agent {
-		for _, name := range agentOnlyInstallFlags {
-			if o.set[name] {
-				return fmt.Errorf("--%s needs --agent: it configures a node joining an existing cluster, and without --agent this Mac is being installed as the control plane", name)
-			}
-		}
-		return nil
+		return o.validateServerRole()
 	}
 	if o.server == "" {
 		return fmt.Errorf("--agent needs --server (the control-plane host to join, an underlay address)")
@@ -241,6 +272,14 @@ func (o installFlags) validateRole() error {
 		}
 	}
 	return nil
+}
+
+// validateServerRole is validateRole for a control-plane install. It is the
+// install package's ValidateHARequest over the Config these flags become, the
+// same validator install.Install runs before it writes anything, so the CLI
+// and the installer refuse exactly one set of HA shapes.
+func (o installFlags) validateServerRole() error {
+	return install.ValidateHARequest(o.installConfig("", nil, nil))
 }
 
 // The data-volume flag defaults.
@@ -316,28 +355,102 @@ const fileVaultNote = "FileVault is on and the data volume is not passphrase-pro
 // the bootstrap client live; install decides when to call it and never lets it
 // block the teardown. A worker with nothing to deregister with says so once, in
 // one line, and the uninstall carries on.
+//
+// With --purge --yes it also removes everything a plain uninstall keeps. The
+// flags are judged before anything else, so a purge that was not confirmed
+// refuses without touching the system.
 func runUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
+	purgeFlag := fs.Bool("purge", false, "also remove everything a plain uninstall keeps: the cluster data (and the data volume with its keychain item), the daemon logs, the _k3sm user, the k3sm context in your kubeconfig, the /etc/fstab line and the recorded arguments. Irreversible; requires --yes")
+	yes := fs.Bool("yes", false, "confirm --purge")
 	_ = fs.Parse(args)
+	if err := checkPurgeFlags(*purgeFlag, *yes); err != nil {
+		return err
+	}
 
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("k3sm uninstall must run as root — use 'sudo k3sm uninstall'")
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg := uninstallConfig(os.Stdout, os.Stderr)
+	logger := cfg.Logger
 	sys := install.NewDarwinSystem()
 	deregister, why := agentDeregister(sys, install.DefaultDataRoot, time.Now())
 	if deregister == nil && why != "" {
 		logger.Warn("not asking the cluster to forget this node: "+why,
 			"remedy", "on the control plane: kubectl delete meshpeer/<node> node/<node>")
 	}
-	if err := install.Uninstall(context.Background(), sys, install.Config{
-		Logger:     logger,
-		Deregister: deregister,
-	}); err != nil {
+	cfg.Deregister = deregister
+	// On an embedded-etcd HA server, remove its etcd member first (install decides
+	// whether the installed plist is one; see uninstalletcd.go).
+	cfg.DeregisterServer = serverMemberDeregister(filepath.Join(install.DefaultDataRoot, "server"), dialLocalEtcdAdmin, logger)
+	if *purgeFlag {
+		human, home, err := purgeTarget(os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
+		if err != nil {
+			return err
+		}
+		cfg.Purge, cfg.PurgeConfirmed = true, true
+		cfg.TargetUser, cfg.TargetHome = human, home
+	}
+	if err := install.Uninstall(context.Background(), sys, cfg); err != nil {
 		return err
 	}
 	removeNodeResolverEntry(logger)
 	return nil
+}
+
+// uninstallConfig is the uninstall's output wiring: result lines (what a purge
+// removed, and an account it could not delete with how to finish by hand) to
+// stdout, progress and diagnostics through the logger to stderr.
+func uninstallConfig(stdout, stderr io.Writer) install.Config {
+	return install.Config{
+		// Not newDaemonLogger: called with injected writers, and install_test.go asserts on an isolated buffer; setting the process default here would leak test state.
+		Logger: slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Out:    stdout,
+	}
+}
+
+// purgeWarning names what `k3sm uninstall --purge` destroys, for the refusal
+// an unconfirmed purge prints.
+const purgeWarning = "k3sm uninstall --purge permanently deletes this Mac's cluster: the datastore and every image and volume under " +
+	install.DefaultDataRoot + " (and the data volume, if there is one, with its keychain item), the daemon logs in " +
+	install.LogDir + ", the " + install.DefaultServiceUser + " user (deletion attempted; macOS may need an approval at the screen), the k3sm context in your kubeconfig, the /etc/fstab line and the recorded arguments"
+
+// checkPurgeFlags judges --purge and --yes together: --yes confirms a purge
+// and nothing else, and a purge is never run unconfirmed.
+func checkPurgeFlags(purge, yes bool) error {
+	switch {
+	case yes && !purge:
+		return fmt.Errorf("--yes only confirms --purge; a plain 'sudo k3sm uninstall' needs no confirmation")
+	case purge && !yes:
+		return fmt.Errorf("%s. Nothing was changed. Re-run as 'sudo k3sm uninstall --purge --yes' to do it", purgeWarning)
+	}
+	return nil
+}
+
+// purgeTarget is the human a purge cleans the kubeconfig of, and that
+// human's home, which the purge never deletes into. It must be a real,
+// non-root account: run through sudo from it.
+//
+// sudo sets both SUDO_USER and SUDO_UID; either alone is just an environment
+// variable a caller can set. The account the name looks up must carry the uid
+// sudo recorded, so a SUDO_USER pointed at someone else's account is refused
+// rather than trusted with whose home is protected and whose kubeconfig is
+// edited.
+func purgeTarget(sudoUser, sudoUID string) (name, home string, err error) {
+	if sudoUser == "" || sudoUser == "root" {
+		return "", "", fmt.Errorf("run 'sudo k3sm uninstall --purge --yes' from your own account, so k3sm knows whose kubeconfig holds the k3sm context")
+	}
+	if sudoUID == "" {
+		return "", "", fmt.Errorf("SUDO_USER is set but SUDO_UID is not; run 'sudo k3sm uninstall --purge --yes' through sudo")
+	}
+	u, err := user.Lookup(sudoUser)
+	if err != nil {
+		return "", "", fmt.Errorf("look up %s: %w", sudoUser, err)
+	}
+	if u.Uid != sudoUID {
+		return "", "", fmt.Errorf("SUDO_USER %s has uid %s, but SUDO_UID is %s; refusing to purge on behalf of a user sudo did not record", sudoUser, u.Uid, sudoUID)
+	}
+	return u.Username, u.HomeDir, nil
 }
 
 // removeNodeResolverEntry deletes netd's node resolver entry from the dynamic

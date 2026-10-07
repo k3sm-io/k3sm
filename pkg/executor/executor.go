@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -149,26 +150,11 @@ type Config struct {
 	// identities get a pre-provisioned datapath grant (pkg/rbac); set it
 	// to "AlwaysAllow" only for a deliberate diagnostic bring-up.
 	AuthorizationMode string
-	// DatastoreEndpoint, when non-empty, is the kine datastore endpoint — a Postgres
-	// connection URL (postgres://user[:password]@host:port/dbname?sslmode=...) for the
-	// HA multi-writer posture: 2+ control-plane servers share ONE Postgres, the
-	// single source of truth (no etcd quorum). Empty keeps the single-node kine->SQLite
-	// WAL default. The apiserver always talks to the LOCAL kine
-	// (--etcd-servers 127.0.0.1:<KinePort>); each server runs its own kine against the
-	// shared Postgres (the k3s topology). The DSN PASSWORD is kept off argv and out of
-	// the logs — it is relocated to a 0600 PGPASSFILE handed to the kine child, and only
-	// the password-stripped DSN reaches kine's --endpoint. Setting this also moves kine
-	// on the shared Postgres (see KineVersion — one pin serves both postures) and
-	// turns on leader election.
-	DatastoreEndpoint string
-	// ServerJoin marks this control-plane server as joining/forming an HA control plane
-	// (a 2nd+ apiserver). It is the split-brain guard's trigger: an HA server MUST carry
-	// a DatastoreEndpoint — Validate fails closed otherwise, so a 2nd server can NEVER
-	// silently fall back to its own SQLite (two servers each on their own SQLite is
-	// split-brain — divergent state, no single source of truth). The full HA server-join
-	// bootstrap (the identical-CA bundle, DESIGN §5c) is a separate path; this field
-	// drives only the guard + the leader-election posture.
-	ServerJoin bool
+	// Etcd, when non-nil, selects the embedded-etcd HA posture: this server runs one
+	// etcd member as a supervised child (instead of kine) and its apiserver talks to
+	// that local member over mutual TLS. Nil is the kine posture (single-node SQLite),
+	// which nothing about this field changes. See EtcdConfig.
+	Etcd *EtcdConfig
 	// PSAEnforceBaseline, when true, flips the cluster-wide Pod Security Admission
 	// default ENFORCE level from privileged to baseline in the provisioned
 	// PodSecurityConfiguration (see admissionConfigYAML — the SINGLE authority for
@@ -180,9 +166,16 @@ type Config struct {
 	// here is conformance-surface + defense-in-depth, NOT the privilege boundary
 	// (the foreign-uid VAP + Seatbelt stay that).
 	PSAEnforceBaseline bool
+	// EncryptionProviderConfig, when non-empty, is the path of the apiserver
+	// EncryptionConfiguration, passed as --encryption-provider-config so Secrets
+	// are encrypted at rest. The caller sets it only after EncryptionAtStart has
+	// accepted the credential pair under the work dir. It is a single-server
+	// option: Validate refuses it in the etcd HA posture, because every server of an
+	// HA control plane would need the same key and nothing distributes one.
+	EncryptionProviderConfig string
 	// LeaderElect, when non-nil, forces the scheduler + controller-manager --leader-elect
-	// setting. A nil pointer DERIVES it from the datastore posture: ON in HA (a Postgres
-	// multi-writer datastore — so only one server's scheduler/KCM is active; two active
+	// setting. A nil pointer DERIVES it from the datastore posture: ON in HA (the etcd
+	// posture, every server sharing one cluster — so only one server's scheduler/KCM is active; two active
 	// schedulers double-bind pods, two KCMs double-reconcile) and OFF single-node (one
 	// candidate, no lease churn — the single-node default). Only the apiserver is active/active
 	// in HA. The leader-election Leases are authorized by the apiserver's auto-created
@@ -215,34 +208,104 @@ type Config struct {
 	Logger *slog.Logger
 }
 
+// EtcdRole is how this server's etcd member enters the cluster on its first boot.
+type EtcdRole int
+
+const (
+	// EtcdInit forms a new single-member cluster (`k3sm server --cluster-init`).
+	EtcdInit EtcdRole = iota + 1
+	// EtcdJoin joins an existing cluster as a learner that is then promoted
+	// (`k3sm server --server-join`).
+	EtcdJoin
+)
+
+// String names the role for logs.
+func (r EtcdRole) String() string {
+	switch r {
+	case EtcdInit:
+		return "init"
+	case EtcdJoin:
+		return "join"
+	}
+	return "unknown"
+}
+
+// EtcdConfig configures the embedded-etcd HA posture (Config.Etcd).
+//
+// The role matters only on a member's FIRST boot: once <WorkDir>/etcd/member exists
+// the member restarts from its own data dir, both roles behave identically, and the
+// initial-cluster fields are ignored (a restart never re-adds or re-promotes).
+type EtcdConfig struct {
+	// Role is EtcdInit or EtcdJoin.
+	Role EtcdRole
+	// Name is the member name (the node name). It must be unique in the cluster.
+	Name string
+	// PeerIP is the address the member's peer listener binds and advertises: the
+	// server's LAN address (`k3sm server --etcd-peer-ip`, never the node's
+	// advertised --node-ip). Peers reach each other directly on it under the
+	// etcd peer CA's mutual TLS; the wireguard mesh carries pod traffic only. It must
+	// be a parseable, non-loopback IP (Validate: ErrEtcdNeedsNodeIP).
+	PeerIP string
+	// PeerPort is the peer listener port. Defaults to DefaultEtcdPeerPort.
+	PeerPort int
+	// MetricsPort is the loopback-only plain-HTTP metrics listener. Defaults to
+	// DefaultEtcdMetricsPort.
+	MetricsPort int
+	// InitialCluster is the `name=https://ip:port,...` set a JOINING member starts
+	// with on its first boot, as the existing server's member route returned it
+	// (every current member plus this one). Unused for EtcdInit and on a restart.
+	InitialCluster string
+	// Reset starts the member with --force-new-cluster. Only ClusterReset sets it.
+	Reset bool
+	// Promote, for an EtcdJoin member, asks an existing server to promote this
+	// learner to a voting member (a learner cannot serve that RPC itself). On every
+	// boot of a joining member, first or restart, the executor asks its own member
+	// whether it is still a learner once the client port accepts; if it is, Promote is
+	// retried every etcdPromoteInterval with no expiry until it returns nil (a failure
+	// is logged and is never a crash). A learner with a nil Promote cannot leave that
+	// state on its own: bring-up logs the remedy at ERROR and keeps waiting.
+	Promote func(ctx context.Context) error
+}
+
 // Pinned defaults — the versions VALIDATED by the bring-up spike.
 const (
 	// DefaultKubeVersion is the kwok-ci/k8s darwin-arm64 control-plane release.
 	DefaultKubeVersion = "v1.36.5"
-	// DefaultKineVersion is THE kine module version — one pin for BOTH datastore
-	// postures (single-node SQLite and Postgres-HA), built CGO_ENABLED=0 against
-	// kine's pure-Go modernc.org/sqlite backend (kineBuildVariant).
+	// DefaultKineVersion is THE kine module version for the single-node SQLite
+	// posture, built CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend
+	// (kineBuildVariant).
 	//
-	// It replaces the former two-pin split (v1.14.2 SQLite / v0.16.3 Postgres-HA).
-	// The old SQLite pin had no corresponding upstream tag — it resolves only from a
-	// warmed module proxy, so a cold GOPROXY=direct build of the datastore could not
-	// be reproduced at all — and it predated the kine#577 watch-progress-notify fix.
-	// v0.17.x is what k3s itself pins (v0.17.1 since the bump off v0.17.0: bugfixes
-	// and dependency patches only, no schema or encoding change); it defaults
-	// --watch-progress-notify-interval to 5s and --emulated-etcd-version to 3.6.11,
-	// so the apiserver's watch cache
-	// stays fresh on both postures, and its no-cgo build is a real, supported variant
-	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo) rather than the
-	// SQLite-disabled stub the spike measured on the old pin.
+	// It replaces the former v1.14.2 SQLite pin, which had no corresponding upstream
+	// tag — it resolves only from a warmed module proxy, so a cold GOPROXY=direct build
+	// of the datastore could not be reproduced at all — and which predated the kine#577
+	// watch-progress-notify fix. v0.17.x is what k3s itself pins (v0.17.1 since the bump
+	// off v0.17.0: bugfixes and dependency patches only, no schema or encoding change);
+	// it defaults --watch-progress-notify-interval to 5s and --emulated-etcd-version to
+	// 3.6.11, so the apiserver's watch cache stays fresh, and its no-cgo build is a
+	// real, supported variant (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo)
+	// rather than the SQLite-disabled stub the spike measured on the old pin.
 	//
 	// Moving an EXISTING single-node state.db onto this pin is a one-way datastore
 	// migration; snapshotBeforeKineUpgrade takes the verified pre-migration backup
 	// (and preserves the old kine binary) before the new pin ever opens the db.
 	DefaultKineVersion = "v0.17.1"
+	// DefaultEtcdVersion is the etcd server module version (go.etcd.io/etcd/server/v3)
+	// the executor builds CGO_ENABLED=0 from the embedded wrapper module
+	// (pkg/executor/etcdchild). It must equal the wrapper's go.mod.txt require; a bump
+	// is `hack/etcd-wrapper.sh regen <version>` plus this line, in one commit. 3.6 is
+	// the line the pinned kube-apiserver and k3sm's own etcd client are on.
+	DefaultEtcdVersion = "v3.6.15"
 	// DefaultAPIServerPort avoids Docker Desktop's :6443.
 	DefaultAPIServerPort = 6444
-	// DefaultKinePort is the kine etcd-shim listen port.
+	// DefaultKinePort is the kine etcd-shim listen port. In the etcd posture the etcd
+	// member's loopback client listener reuses it (KinePort): kine and etcd never run
+	// in the same posture, and the port is already per-server and preflight-guarded.
 	DefaultKinePort = 2379
+	// DefaultEtcdPeerPort is the etcd member's peer listener port (upstream's).
+	DefaultEtcdPeerPort = 2380
+	// DefaultEtcdMetricsPort is the etcd member's loopback metrics listener port (the
+	// value k3s uses).
+	DefaultEtcdMetricsPort = 2381
 	// DefaultSchedulerPort is the kube-scheduler secure-serving port (the
 	// upstream default), bound on loopback only.
 	DefaultSchedulerPort = 10259
@@ -337,13 +400,6 @@ func EnsureWorkDirWritable(dir string) error {
 	return nil
 }
 
-// ErrHARequiresDatastore is returned by Validate when an HA control-plane server
-// (ServerJoin) is requested without a shared datastore endpoint. A 2nd server must
-// NEVER fall back to its own SQLite — two servers each on their own single-writer
-// SQLite is split-brain (divergent state, no single source of truth). The guard is
-// fail-closed: bring-up halts rather than silently diverging.
-var ErrHARequiresDatastore = errors.New("executor: HA server-join requires a shared datastore endpoint (a Postgres DSN); refusing to start a second server on its own SQLite (split-brain)")
-
 // ErrRootCAWithoutServingCert is returned by Validate when a RootCAFile is supplied
 // without the serving keypair it is supposed to anchor. The two are one posture, not
 // two knobs: on the single-node path the apiserver self-signs into its own --cert-dir,
@@ -353,19 +409,64 @@ var ErrHARequiresDatastore = errors.New("executor: HA server-join requires a sha
 // of silently ignored.
 var ErrRootCAWithoutServingCert = errors.New("executor: RootCAFile is set without ServingCertFile/ServingKeyFile; the published kube-root-ca.crt must anchor the apiserver serving cert, and single-node the apiserver self-signs into its own --cert-dir")
 
-// Validate checks cfg is internally consistent before bring-up. The load-bearing
-// check is the split-brain guard: an HA server (ServerJoin) MUST carry a
-// DatastoreEndpoint. It is called at the top of Start so a misconfigured HA server
-// fails fast with a clear error instead of quietly forming a divergent cluster.
-// The second check is the trust-anchor guard (see ErrRootCAWithoutServingCert).
+// Validate checks cfg is internally consistent before bring-up. It is called at the
+// top of Start so a misconfigured server fails fast with a clear error. The checks are
+// the trust-anchor guard (see ErrRootCAWithoutServingCert), the single-server-only
+// encryption guard (ErrEncryptionHA) and the etcd posture's own shape (ErrEtcdRole,
+// ErrEtcdNeedsNodeIP). There is no split-brain guard to check: an HA role exists only
+// inside Etcd, so "join without a shared datastore" has no Config value.
 func (c Config) Validate() error {
-	if c.ServerJoin && c.DatastoreEndpoint == "" {
-		return ErrHARequiresDatastore
-	}
 	if c.RootCAFile != "" && !c.meshServingCert() {
 		return ErrRootCAWithoutServingCert
 	}
+	if c.EncryptionProviderConfig != "" && c.isHA() {
+		return ErrEncryptionHA
+	}
+	if c.Etcd != nil {
+		if err := c.Etcd.validate(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// ErrEtcdNeedsNodeIP is returned by Validate when the etcd posture has no usable peer
+// address: an empty, unparseable or loopback PeerIP. The member advertises that
+// address to every other member, so the single-node default 127.0.0.1 would make
+// each server dial itself.
+var ErrEtcdNeedsNodeIP = errors.New("executor: the etcd HA posture needs --etcd-peer-ip set to this server's LAN address (empty, unparseable or loopback addresses cannot be an etcd peer address)")
+
+// ErrEtcdRole is returned by Validate for an EtcdConfig whose Role is neither EtcdInit
+// nor EtcdJoin, or that has no member name.
+var ErrEtcdRole = errors.New("executor: the etcd HA posture needs a role (init or join) and a member name")
+
+// validate checks the etcd posture's own fields.
+func (e *EtcdConfig) validate() error {
+	if (e.Role != EtcdInit && e.Role != EtcdJoin) || e.Name == "" {
+		return ErrEtcdRole
+	}
+	ip := net.ParseIP(e.PeerIP)
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+		return fmt.Errorf("%w: got %q", ErrEtcdNeedsNodeIP, e.PeerIP)
+	}
+	return nil
+}
+
+// EtcdDataDir is the etcd member's data directory, <workDir>/etcd (mode 0700). It
+// follows the work dir, so it moves with --data-volume.
+func EtcdDataDir(workDir string) string { return filepath.Join(workDir, "etcd") }
+
+// etcdMemberDir is <workDir>/etcd/member, which etcd creates on a member's first
+// start and which marks every later start as a restart.
+func etcdMemberDir(workDir string) string { return filepath.Join(EtcdDataDir(workDir), "member") }
+
+// EtcdMemberExists reports whether workDir holds an initialized etcd member
+// (<workDir>/etcd/member is a directory). It is the restart predicate: a member that
+// exists starts from its own data dir and is never re-added (a joiner that is still
+// a learner is promoted on restart; see EtcdConfig.Promote).
+func EtcdMemberExists(workDir string) bool {
+	fi, err := os.Stat(etcdMemberDir(workDir))
+	return err == nil && fi.IsDir()
 }
 
 // meshServingCert reports whether an explicit apiserver serving keypair was supplied
@@ -411,10 +512,9 @@ func (c Config) rootCAFile() string {
 	return certs.ClusterCACertPath(c.WorkDir)
 }
 
-// isHA reports whether this server runs the HA multi-writer posture: it has a shared
-// datastore endpoint, or it was told to join/form an HA control plane.
+// isHA reports whether this server runs the HA posture: an embedded etcd member.
 func (c Config) isHA() bool {
-	return c.DatastoreEndpoint != "" || c.ServerJoin
+	return c.Etcd != nil
 }
 
 // schedulerPort resolves the kube-scheduler secure-serving port: the configured
@@ -466,9 +566,8 @@ func (c Config) withDefaults() Config {
 		c.KubeVersion = DefaultKubeVersion
 	}
 	if c.KineVersion == "" {
-		// ONE pin for both datastore postures (see DefaultKineVersion) — the
-		// SQLite/Postgres split is a driver choice inside a single kine build,
-		// never a second version.
+		// ONE kine pin (see DefaultKineVersion). The etcd posture never runs
+		// kine; it carries the field only because the default is posture-blind.
 		c.KineVersion = DefaultKineVersion
 	}
 	if c.NodeIP == "" {
@@ -487,6 +586,17 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
+	}
+	if c.Etcd != nil {
+		// A copy, so filling the ports never writes through the caller's pointer.
+		e := *c.Etcd
+		if e.PeerPort == 0 {
+			e.PeerPort = DefaultEtcdPeerPort
+		}
+		if e.MetricsPort == 0 {
+			e.MetricsPort = DefaultEtcdMetricsPort
+		}
+		c.Etcd = &e
 	}
 	return c
 }

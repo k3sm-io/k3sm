@@ -288,6 +288,16 @@ func postJSON(ctx context.Context, client *http.Client, url string, body JoinReq
 				Reason:     reason,
 			}
 		}
+		// A 503 is the control plane failing to reach a verdict (its node-password
+		// store did not answer), not a verdict against this node, so it too comes
+		// back as retry-later rather than as a rejection.
+		if httpResp.StatusCode == http.StatusServiceUnavailable {
+			return nil, &JoinUnavailableError{
+				RetryAfter: parseRetryAfter(httpResp.Header.Get("Retry-After")),
+				Status:     httpResp.Status,
+				Reason:     reason,
+			}
+		}
 		return nil, fmt.Errorf("join rejected (%s): %s", httpResp.Status, reason)
 	}
 	var resp JoinResponse
@@ -343,6 +353,34 @@ func (e *JoinRateLimitedError) Error() string {
 // worth waiting for", without reaching for the concrete type unless they want
 // the wait.
 func (e *JoinRateLimitedError) Unwrap() error { return ErrJoinRateLimited }
+
+// ErrJoinUnavailable is the sentinel a 503 join carries: the control plane
+// could not decide the join (typically its datastore did not answer the
+// node-password check). Like ErrJoinRateLimited it is RETRY-LATER, never a
+// refusal of this node. Compare with errors.Is; recover the wait with errors.As on
+// *JoinUnavailableError.
+var ErrJoinUnavailable = errors.New("the control plane could not decide this join right now")
+
+// JoinUnavailableError is the 503 a join received, carrying the Retry-After the
+// server named.
+type JoinUnavailableError struct {
+	// RetryAfter is the wait the server named, or zero when it named none this
+	// client could read.
+	RetryAfter time.Duration
+	// Status is the HTTP status line; Reason is the server's message.
+	Status string
+	Reason string
+}
+
+func (e *JoinUnavailableError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("join unavailable (%s): %s (retry after %s)", e.Status, e.Reason, e.RetryAfter)
+	}
+	return fmt.Sprintf("join unavailable (%s): %s", e.Status, e.Reason)
+}
+
+// Unwrap makes errors.Is(err, ErrJoinUnavailable) hold.
+func (e *JoinUnavailableError) Unwrap() error { return ErrJoinUnavailable }
 
 // parseRetryAfter reads a Retry-After header. Only the delta-seconds form is
 // understood, which is the form this control plane sends; an absent, HTTP-date

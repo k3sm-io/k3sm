@@ -119,3 +119,46 @@ func soleContext(m map[string]*clientcmdapi.Context) *clientcmdapi.Context {
 	}
 	return nil
 }
+
+// unmergeAdminKubeconfig is mergeAdminKubeconfig's inverse, for `k3sm
+// uninstall --purge`: it removes the context named name from existing and,
+// only when they are also named name and no remaining context references them,
+// the cluster and user that context referenced. current-context is cleared only
+// when it was name. Every other entry is kept. changed is false (and out nil)
+// when there is no such context, so a caller leaves the file untouched. Pure.
+func unmergeAdminKubeconfig(existing []byte, name string) (out []byte, changed bool, err error) {
+	if len(existing) == 0 {
+		return nil, false, nil
+	}
+	cfg, err := clientcmd.Load(existing)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse existing kubeconfig: %w", err)
+	}
+	kctx, ok := cfg.Contexts[name]
+	if !ok {
+		return nil, false, nil
+	}
+	delete(cfg.Contexts, name)
+	referenced := func(cluster, user string) bool {
+		for _, c := range cfg.Contexts {
+			if (cluster != "" && c.Cluster == cluster) || (user != "" && c.AuthInfo == user) {
+				return true
+			}
+		}
+		return false
+	}
+	if kctx.Cluster == name && !referenced(name, "") {
+		delete(cfg.Clusters, name)
+	}
+	if kctx.AuthInfo == name && !referenced("", name) {
+		delete(cfg.AuthInfos, name)
+	}
+	if cfg.CurrentContext == name {
+		cfg.CurrentContext = ""
+	}
+	out, err = clientcmd.Write(*cfg)
+	if err != nil {
+		return nil, false, fmt.Errorf("render kubeconfig: %w", err)
+	}
+	return out, true, nil
+}

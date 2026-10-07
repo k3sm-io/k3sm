@@ -116,6 +116,12 @@ func (r *runtimedRuntime) refreshProjectedOnce(ctx context.Context) {
 	}
 	r.mu.Unlock()
 
+	// The tick's cost is the trigger for a Watch-strategy follow-up (a tick
+	// over 30 s, or D above 300), so it is observable at Debug.
+	start := r.clk.Now()
+	defer func() {
+		r.log.Debug("projected refresh tick", "duration", r.clk.Since(start), "pods", len(cands), "distinct_refs", r.refs.distinct())
+	}()
 	cache := newRefreshCache()
 	for _, c := range cands {
 		if ctx.Err() != nil {

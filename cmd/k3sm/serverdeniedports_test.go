@@ -42,15 +42,15 @@ import (
 // stays publishable, which is exactly the defect the policy exists to close.
 //
 // runServer boots a real control plane, so no unit test can call it; the wiring is
-// therefore asserted structurally, by reading server.go (the idiom
-// servermeshwiring_test.go establishes). Both assertions are about a single
+// therefore asserted structurally, by reading runServer's trace (the idiom
+// servertrace_test.go establishes). Both assertions are about a single
 // expression, so source position is not even needed — only identity.
 func TestServerSingleSourcesTheDeniedLocalPorts(t *testing.T) {
-	_, body := runServerBody(t)
+	tr := runServerTrace(t)
 
 	// The value handed to the admission provisioning.
 	var policyArg string
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -72,7 +72,7 @@ func TestServerSingleSourcesTheDeniedLocalPorts(t *testing.T) {
 
 	// The value stamped onto the node.
 	var nodeStamp string
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		kv, ok := n.(*ast.KeyValueExpr)
 		if !ok {
 			return true
@@ -137,5 +137,24 @@ func TestBringupDeniedLocalPortPolicyCarriesTheKinePort(t *testing.T) {
 	expr := pol.Spec.Validations[0].Expression
 	if !strings.Contains(expr, strconv.Itoa(sentinelKinePort)) {
 		t.Errorf("provisioned CEL does not pin this server's kine port %d:\n%s", sentinelKinePort, expr)
+	}
+}
+
+// TestDeniedLocalPortsIncludesEtcdMetrics pins the etcd posture's deny set: the
+// member's loopback client port (--kine-port) and its unauthenticated loopback
+// metrics port, for either role flag; the kine posture is unchanged.
+func TestDeniedLocalPortsIncludesEtcdMetrics(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts serverOptions
+		want []int
+	}{
+		{"kine posture", serverOptions{kinePort: 2379, etcdMetricsPort: 2381}, []int{2379}},
+		{"--cluster-init", serverOptions{kinePort: 12379, etcdMetricsPort: 12381, clusterInit: true}, []int{12379, 12381}},
+		{"--server-join", serverOptions{kinePort: 12379, etcdMetricsPort: 12381, serverJoin: true}, []int{12379, 12381}},
+	} {
+		if got := tc.opts.deniedLocalPorts(); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: deniedLocalPorts() = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

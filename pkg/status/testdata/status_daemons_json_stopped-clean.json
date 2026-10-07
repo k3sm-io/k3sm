@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "verdict": "stopped",
+  "role": "server",
+  "summary": "io.k3sm.server is stopped",
+  "daemons": [
+    {
+      "name": "netd",
+      "state": "failed",
+      "severity": "fail",
+      "detail": "1 run, last exit 1",
+      "remedy": "sudo launchctl kickstart -k system/io.k3sm.netd",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "1",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "1"
+      }
+    },
+    {
+      "name": "server",
+      "state": "stopped",
+      "severity": "fail",
+      "detail": "loaded but not running (3 runs)",
+      "remedy": "sudo launchctl kickstart -k system/io.k3sm.server\nk3sm status logs server",
+      "wide": {
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "label": "io.k3sm.server",
+        "last-exit": "0",
+        "log-path": "/var/log/k3sm/server.log",
+        "pid": "0",
+        "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
+        "runs": "3"
+      }
+    }
+  ]
+}

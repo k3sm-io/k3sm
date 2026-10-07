@@ -33,7 +33,50 @@ green — so nothing else catches it. Measurements:
 | `requirements.in` | the engine pin — the only direct requirement |
 | `requirements.lock` | the resolved closure, one hash per artifact; do not hand-edit |
 | `walk-verify.sh` | asserts every Mach-O in the payload is validly signed |
+| `k3sm_shard.py` | the entrypoint of one rank of a sharded `MLXModel` (see below) |
 | `selftest.sh` | the checks that do not need a build (see below) |
+
+## Sharded models
+
+A sharded `MLXModel` (one that sets `spec.distributed`) runs one Pod per rank,
+and every rank runs this same image with a different command:
+
+```
+/bin/python3.12 -m k3sm_shard --model <ref> [spec.runtime.args...]
+```
+
+The sharded engine is **`mlx-lm`'s server** (`mlx_lm.server`), which the
+engine closure already carries. **`vllm-mlx` is not used for sharded models**: it
+has no multi-node support, so the image's `ENTRYPOINT` stays the single-node
+server and only the operator's sharded render overrides the command. A sharded
+model is one logical replica; rank 0 alone serves HTTP.
+
+`k3sm_shard` does name resolution and `exec`, nothing else. It reads the
+environment the operator renders (`MLX_RANK`, `MLX_WORLD_SIZE`,
+`MLX_METAL_FAST_SYNCH`, `K3SM_MLX_BACKEND`, `K3SM_MLX_PARALLELISM`,
+`K3SM_MLX_RANKS`, `K3SM_MLX_PORT`, `K3SM_MLX_SERVE_PORT`, and for `jaccl`
+`K3SM_MLX_IBV_DEVICES_JSON`), resolves every rank's per-pod name under the
+model's headless Service (retrying, bounded), and writes MLX's rendezvous file
+into the pod data volume (`$TMPDIR`, the one writable path under the pod's
+sandbox profile):
+
+| backend | file | also set |
+|---|---|---|
+| `ring` | `MLX_HOSTFILE`: `[["<podIP>:<port>"], ...]`, one entry per rank | |
+| `jaccl` | `MLX_IBV_DEVICES`: the per-rank RDMA device matrix, `null` for self | `MLX_JACCL_COORDINATOR=<rank 0 podIP>:<port>` |
+
+It then execs `mlx_lm.server --host 0.0.0.0 --port <serve port>`, adding
+`--pipeline` for pipeline parallelism, with its own arguments last.
+
+`k3sm_shard --probe` is the rank-0 liveness probe: a one-token completion
+against the local server every 60 seconds, to catch a collective that hung
+while the listener stayed up. A server that is not listening yet passes, so a
+long first download is never killed. The probe costs one forward pass of the
+whole sharded model per minute; that cost is measured on the lab rig beside
+the serving figure.
+
+Rank ports are unauthenticated and reachable by every pod in the cluster, so
+sharded serving is for trusted tenants only.
 
 ## Build
 
@@ -132,8 +175,12 @@ and carries the serving argv, that the lockfile is exactly pinned with a hash
 per artifact, that `build.sh` refuses a lockfile that is not and refuses to run
 without uv, and that `walk-verify.sh` goes red on an invalid signature, on a
 mislabelled layer, on a blob that does not match its digest, and on a
-non-Mach-O entrypoint. It prints what it does **not** cover; the live build,
-the real payload walk and the push are the lab run.
+non-Mach-O entrypoint. It also drives `k3sm_shard` with fake name resolution
+(no model, no GPU): the ring hostfile and the `jaccl` device matrix land in the
+pod data volume, resolution retries and gives up on time, and the liveness
+probe answers correctly. It prints what it does **not** cover; the live build,
+the real payload walk, the push, and a sharded model on two Macs are the lab
+run.
 
 ## Regenerating the lockfile
 

@@ -18,16 +18,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"sync"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 
 	netv1 "k3sm.io/apis/net/v1"
@@ -169,8 +166,8 @@ func TestLowestFreeNodeIndex(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("lowestFreeNodeIndex = %d, want %d", got, tc.want)
 			}
-			if got == serverNodeIndex {
-				t.Errorf("lowestFreeNodeIndex returned the reserved control-plane index %d", serverNodeIndex)
+			if got == firstServerIndex {
+				t.Errorf("lowestFreeNodeIndex returned the first server's index %d", firstServerIndex)
 			}
 		})
 	}
@@ -220,9 +217,11 @@ func TestEnrollAssignsLowestFreeIndexAboveZero(t *testing.T) {
 		t.Errorf("second worker podCIDR = %q, want 100.64.2.0/24", second.PodCIDR)
 	}
 
-	// A worker deleted and re-joined must RECLAIM the hole, not extend the range.
+	// A worker deregistered — its peer and its range claim removed — leaves a hole
+	// the next join must RECLAIM, not extend the range past.
 	api.mu.Lock()
 	delete(api.peers, "worker-a")
+	delete(api.leases, meshRangeClaimName(1))
 	api.mu.Unlock()
 	third, _, err := e.Enroll(context.Background(), "worker-c", enrollRequest("worker-c"))
 	if err != nil {
@@ -377,12 +376,17 @@ func TestEnrollStampsEveryWriteAndTheReleaseObeysIt(t *testing.T) {
 	}
 }
 
-// TestEnrollSelfPinsIndexZero: the control-plane node claims index 0 explicitly,
-// never through the free-index scanner, and re-enrolling is an in-place update.
+// firstServerCIDR is the first server's range: the /24 its --mesh-ip 100.64.0.1
+// names.
+var firstServerCIDR = netip.MustParsePrefix("100.64.0.0/24")
+
+// TestEnrollSelfPinsIndexZero: the first server (--mesh-ip 100.64.0.1) claims index
+// 0 explicitly, never through the free-index scanner, and re-enrolling is an
+// in-place update.
 func TestEnrollSelfPinsIndexZero(t *testing.T) {
 	e, api := enrollerOverStub(t)
 
-	res, err := e.EnrollSelf(context.Background(), "k3sm-server", enrollRequest("k3sm-server"))
+	res, err := e.EnrollSelf(context.Background(), "k3sm-server", firstServerCIDR, enrollRequest("k3sm-server"))
 	if err != nil {
 		t.Fatalf("EnrollSelf: %v", err)
 	}
@@ -416,7 +420,7 @@ func TestEnrollSelfPinsIndexZero(t *testing.T) {
 	// Rejoin (a launchd kickstart): same index, an in-place update, no duplicate.
 	req := enrollRequest("k3sm-server")
 	req.Endpoint = "192.0.2.77:51820"
-	again, err := e.EnrollSelf(context.Background(), "k3sm-server", req)
+	again, err := e.EnrollSelf(context.Background(), "k3sm-server", firstServerCIDR, req)
 	if err != nil {
 		t.Fatalf("EnrollSelf rejoin: %v", err)
 	}
@@ -438,7 +442,7 @@ func TestEnrollSelfFailsClosedOnAForeignIndexZeroClaim(t *testing.T) {
 	e, api := enrollerOverStub(t)
 	seedPeer(t, api, "some-other-node", "100.64.0.0/24")
 
-	_, err := e.EnrollSelf(context.Background(), "k3sm-server", enrollRequest("k3sm-server"))
+	_, err := e.EnrollSelf(context.Background(), "k3sm-server", firstServerCIDR, enrollRequest("k3sm-server"))
 	if err == nil {
 		t.Fatal("EnrollSelf overwrote a foreign index-0 claim; it must fail closed")
 	}
@@ -453,34 +457,22 @@ func TestEnrollSelfFailsClosedOnAForeignIndexZeroClaim(t *testing.T) {
 	}
 }
 
-// TestEnrollSelfRequiresTheWriteToReadBack is the list-back verification, which is
-// the whole basis of the happens-before the caller relies on. An apiserver that
-// accepts the write and does not serve it back must NOT be reported as a durable
-// index-0 claim — otherwise the caller opens the join listener over a claim that
-// does not exist.
-func TestEnrollSelfRequiresTheWriteToReadBack(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			// Always an EMPTY list: the write never reads back.
-			writeJSON(w, http.StatusOK, netv1.MeshPeerList{
-				TypeMeta: metav1.TypeMeta{APIVersion: netv1.SchemeGroupVersion.String(), Kind: "MeshPeerList"},
-			})
-		case http.MethodPost:
-			var in netv1.MeshPeer
-			_ = json.NewDecoder(r.Body).Decode(&in)
-			writeJSON(w, http.StatusCreated, &in)
-		default:
-			writeStatus(w, http.StatusMethodNotAllowed, metav1.StatusReasonMethodNotAllowed)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	e, err := newMeshEnroller(&rest.Config{Host: srv.URL}, quietLogger())
-	if err != nil {
-		t.Fatalf("newMeshEnroller: %v", err)
+// TestEnrollSelfDoesNotWriteWithoutItsClaim: the range's claim object, not a
+// read-back of the write, is what makes a server's range its own. A claim another
+// node already holds — with no MeshPeer of its own yet, the window between a
+// concurrent enroller's claim and its write — refuses the self-enroll before any
+// MeshPeer is written.
+func TestEnrollSelfDoesNotWriteWithoutItsClaim(t *testing.T) {
+	e, api := enrollerOverStub(t)
+	if holder, created, err := e.claimRange(context.Background(), 0, firstServerCIDR, "racing-node", rangeClaimMeta{}); err != nil || !created || holder != "racing-node" {
+		t.Fatalf("seed the claim: holder %q created %v err %v", holder, created, err)
 	}
-	if _, err := e.EnrollSelf(context.Background(), "k3sm-server", enrollRequest("k3sm-server")); err == nil {
-		t.Fatal("EnrollSelf reported success without reading its own write back")
+	_, err := e.EnrollSelf(context.Background(), "k3sm-server", firstServerCIDR, enrollRequest("k3sm-server"))
+	if !errors.Is(err, ErrMeshIndexClaimed) {
+		t.Fatalf("EnrollSelf = %v, want ErrMeshIndexClaimed: the claim is held by another node", err)
+	}
+	if api.creates != 0 || api.updates != 0 {
+		t.Errorf("EnrollSelf wrote %d creates / %d updates without holding the claim", api.creates, api.updates)
 	}
 }
 
@@ -511,7 +503,7 @@ func TestSelfEnrollRacesConcurrentJoinsWithoutSharingAnIndex(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		if _, err := e.EnrollSelf(context.Background(), "k3sm-server", enrollRequest("k3sm-server")); err != nil {
+		if _, err := e.EnrollSelf(context.Background(), "k3sm-server", firstServerCIDR, enrollRequest("k3sm-server")); err != nil {
 			errs <- fmt.Errorf("EnrollSelf: %w", err)
 		}
 	}()
@@ -549,11 +541,11 @@ func TestSelfEnrollRacesConcurrentJoinsWithoutSharingAnIndex(t *testing.T) {
 			t.Errorf("node %q was assigned %q, which is not a node index of %s", name, p.Spec.PodCIDR, podnet.ClusterPodCIDR)
 			continue
 		}
-		if idx == serverNodeIndex && name != "k3sm-server" {
-			t.Errorf("worker %q was assigned the control-plane index %d (%s)", name, serverNodeIndex, p.Spec.PodCIDR)
+		if idx == firstServerIndex && name != "k3sm-server" {
+			t.Errorf("worker %q was assigned the first server's index %d (%s)", name, firstServerIndex, p.Spec.PodCIDR)
 		}
-		if idx != serverNodeIndex && name == "k3sm-server" {
-			t.Errorf("the control-plane node was assigned index %d (%s), not the pinned %d", idx, p.Spec.PodCIDR, serverNodeIndex)
+		if idx != firstServerIndex && name == "k3sm-server" {
+			t.Errorf("the control-plane node was assigned index %d (%s), not its --mesh-ip range %d", idx, p.Spec.PodCIDR, firstServerIndex)
 		}
 	}
 }

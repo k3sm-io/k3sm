@@ -76,3 +76,44 @@ func TestPermanentBringUpFailureParksImmediately(t *testing.T) {
 		})
 	}
 }
+
+// TestEtcdDeathRecordedOnce: one etcd death during its promotion or quorum wait is
+// ONE crash record. The member is supervised before those waits, so the exit
+// callback records the death (breaker.record, the OnComponentExit path) and the
+// bring-up error that follows wraps executor.ErrEtcdChildExited, which
+// noteBringUpFailure must not count again. A bring-up error that does NOT carry
+// the sentinel (the wait claimed the report itself) is still counted.
+func TestEtcdDeathRecordedOnce(t *testing.T) {
+	reported := &executor.BringUpError{Component: "etcd", Phase: executor.PhaseBringUp,
+		Err: fmt.Errorf("%w: etcd exited while waiting for quorum: exit status 3", executor.ErrEtcdChildExited)}
+	claimed := &executor.BringUpError{Component: "etcd", Phase: executor.PhaseBringUp,
+		Err: errors.New("etcd exited while waiting for quorum: exit status 3")}
+	for _, tc := range []struct {
+		name       string
+		callback   bool
+		bringUpErr error
+		wantOrigin string
+	}{
+		{"the exit callback took the report", true, fmt.Errorf("start control plane: %w", reported), executor.CrashOriginCrash},
+		{"the wait claimed the report", false, claimed, executor.CrashOriginBringUp},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			b := newCrashBreaker(dir, quietLogger())
+			if tc.callback {
+				b.record("etcd", "etcd: fatal")
+			}
+			noteBringUpFailure(b, quietLogger(), tc.bringUpErr)
+			rec, err := executor.ReadCrashRecord(executor.CrashLoopPath(dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rec.Crashes) != 1 {
+				t.Fatalf("one etcd death left %d records, want exactly 1: %+v", len(rec.Crashes), rec.Crashes)
+			}
+			if c := rec.Crashes[0]; c.Component != "etcd" || c.Origin != tc.wantOrigin || c.Permanent {
+				t.Errorf("record = %+v, want one non-permanent etcd %s", c, tc.wantOrigin)
+			}
+		})
+	}
+}

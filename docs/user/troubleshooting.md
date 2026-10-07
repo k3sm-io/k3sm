@@ -59,8 +59,11 @@ And two flags for scripts and for watching a restart:
 
 ```sh
 k3sm status -o json          # the machine interface; the text screen is rendered from it
+k3sm status daemons -o json  # a cheap launchd-only probe, safe to poll
 k3sm status --wait           # poll until the cluster is running, or --timeout elapses
 ```
+
+Both JSON shapes are versioned; [Status JSON](status-json.md) is their contract.
 
 The exit code is the verdict, so a script can branch on it. `k3sm status --help` lists the codes.
 

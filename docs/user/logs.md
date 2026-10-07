@@ -86,6 +86,21 @@ logs are bounded at roughly five times the size limit.
 `kubectl logs` output, which is upstream's behavior and upstream's limitation. Read the rotated
 files directly, or ship them off the node, if you need more than the current file holds.
 
+## Python output appears late or not at all
+
+Python block-buffers stdout when it is not a terminal, which is always the case in a Pod. A Pod that
+prints and keeps running shows nothing in `kubectl logs` until the buffer fills, and if it is
+stopped with SIGTERM the buffered output is lost inside the Python process and never reaches the
+log. k3sm is not dropping it. This is standard Python behavior and is the same on Linux Kubernetes;
+output written before a clean exit always arrives. Run `python3 -u`, or set the variable in the
+container's `env`:
+
+```yaml
+env:
+  - name: PYTHONUNBUFFERED
+    value: "1"
+```
+
 ## Configuration
 
 Five flags on `k3sm server`, `k3sm agent` and `k3sm node`. The names and the defaults are the
@@ -103,6 +118,10 @@ defaults a k3s user already has:
 `sudo k3sm install` creates `/var/log/pods` and `/var/log/containers`. A node refuses to start when
 the directory is missing or it cannot write there, and says so, rather than running Pods that have
 nowhere to write.
+
+The root `io.k3sm.netd` helper re-applies the install's policy for these two directories and for
+`/var/log/k3sm` at every start, so a macOS upgrade that replaces `/var/log` repairs itself on the next
+boot.
 
 `k3sm dev` puts each instance's logs under that instance's own runtime root instead of the shared
 tree, so two dev instances never mix their output and `k3sm dev down` takes the logs with it.

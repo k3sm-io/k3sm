@@ -22,7 +22,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"log/slog"
 	"math"
 	"net"
@@ -54,6 +53,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/runtimed/pkg/image"
 
+	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/clustermirror"
 	"k3sm.io/k3sm/pkg/hostnet"
@@ -108,21 +108,32 @@ var _ vkadapter.Provider = (*provider.VKProvider)(nil)
 // nodeOptions configures a Virtual Kubelet node bring-up. It is shared by the
 // standalone `k3sm node` command and the in-process node `k3sm server` runs.
 type nodeOptions struct {
+	// kubeconfig and restConfig are the node's client: exactly one is set, and
+	// nodeClientConfig refuses both and neither. `k3sm agent` and `k3sm node` name a
+	// kubeconfig file; `k3sm server` hands its in-process node an in-memory
+	// system:node config (serverNodeRESTConfig) and no file at all.
 	kubeconfig string
+	restConfig *rest.Config
 	nodeName   string
 	listen     string
 	podRoot    string
 	// logs is the container-log flag group (--pod-logs-dir and the four rotation
 	// knobs), carried through every bring-up path so `k3sm server`, `k3sm agent`
 	// and `k3sm node` configure the node's logs identically.
-	logs     containerLogOptions
-	nodeIP   string
-	runtime  string // "runtimed" (default) or "hostprocess" — see defaultRuntime
-	dnsShim  string // getaddrinfo DNS shim dylib path (runtimed only)
-	pathShim string // path-rebase DYLD shim dylib path (runtimed only)
-	dnsVIP   string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
-	domain   string // cluster DNS domain the in-pod shim search list is built from (runtimed)
-	serveTLS bool   // serve the kubelet HTTP API over TLS (logs/exec over the proxy)
+	logs   containerLogOptions
+	nodeIP string
+	// serviceCIDR is the cluster Service CIDR, the second range netd admits an lo0
+	// alias in and so the second range checkNodeAliasAddr accepts a node address
+	// in. Every bring-up sets it from the one cluster value (install.DefaultServiceCIDR,
+	// which the apiserver's --service-cluster-ip-range and netd's --service-cidr
+	// default to; no k3sm command configures another). Empty admits the pod CIDR only.
+	serviceCIDR string
+	runtime     string // "runtimed" (default) or "hostprocess" — see defaultRuntime
+	dnsShim     string // getaddrinfo DNS shim dylib path (runtimed only)
+	pathShim    string // path-rebase DYLD shim dylib path (runtimed only)
+	dnsVIP      string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
+	domain      string // cluster DNS domain the in-pod shim search list is built from (runtimed)
+	serveTLS    bool   // serve the kubelet HTTP API over TLS (logs/exec over the proxy)
 
 	// kubeletClientCAPEM is the cluster's CLIENT-IDENTITY CA (the signing CA)
 	// certificate, in PEM. It is the anchor the kubelet HTTP endpoint (:10250 —
@@ -162,8 +173,9 @@ type nodeOptions struct {
 
 	// podCIDR is this node's pod /24 the runtimed podnet adapter allocates /32s
 	// from — the SAME CIDR the mesh AllowedIPs carry: an enrolled worker's
-	// assigned res.PodCIDR, the reserved index-0 /24 on the control-plane/
-	// single node (defaultNodePodCIDR). Never a second IPAM source.
+	// assigned res.PodCIDR, this server's --mesh-ip /24 on a mesh control-plane
+	// node (serverSelfPodCIDR), the index-0 default on a single node
+	// (defaultNodePodCIDR). Never a second IPAM source.
 	podCIDR string
 	// netMode is the resolved host-network backend the podnet adapter's lo0
 	// alias plumbing and the runtimed preflight follow (helper vs direct vs
@@ -344,6 +356,7 @@ func runNode(args []string) error {
 	registerNodeFlags(fs, &opts)
 	_ = fs.Parse(args)
 	opts.standalone = true
+	opts.serviceCIDR = install.DefaultServiceCIDR
 
 	// The kubelet endpoint is never served open. `k3sm server` and `k3sm agent`
 	// obtain this anchor from the cluster itself; a standalone node is pointed at
@@ -384,8 +397,8 @@ func runNode(args []string) error {
 		return err
 	}
 	opts.netMode = mode
-	// Single/standalone node: the reserved index-0 /24 (the same value the mesh
-	// enroller reserves for the control-plane node).
+	// Single/standalone node: the index-0 /24, the first server's conventional
+	// range (a mesh server's is the /24 its own --mesh-ip names instead).
 	opts.podCIDR = defaultNodePodCIDR()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -424,12 +437,12 @@ func standaloneDNSGuard(opts nodeOptions, log *slog.Logger) error {
 	return nil
 }
 
-// defaultNodePodCIDR is the control-plane/single-node pod /24: node index 0 of
-// the cluster pod CIDR (100.64.0.0/24) — the SAME derivation the mesh enroller
-// uses (enroll.go reserves index 0 for the control-plane node; workers get
-// index 1+) and the same value netserve's routing-table locality defaults to.
-// An enrolled worker overrides it with its assigned res.PodCIDR; there is
-// deliberately no second IPAM source.
+// defaultNodePodCIDR is the single-node pod /24 and the first server's
+// conventional range: node index 0 of the cluster pod CIDR (100.64.0.0/24),
+// which the worker allocator never hands out (workers get index 1+), and the
+// same value netserve's routing-table locality defaults to. A mesh server uses
+// the /24 its own --mesh-ip names (serverSelfPodCIDR) and an enrolled worker its
+// assigned res.PodCIDR; there is deliberately no second IPAM source.
 func defaultNodePodCIDR() string {
 	cidr, err := podnet.NodeCIDR(podnet.ClusterPodCIDR, 0)
 	if err != nil {
@@ -472,9 +485,16 @@ func isLoopbackDefault(nodeIP string) bool {
 // rewrite already replaced the loopback default with --mesh-ip), or because the
 // podCIDR does not yield one.
 //
-// It is deliberately distinct from advertisedNodeIP: only a DERIVED address is a
-// pod-CIDR /32 this node must alias on lo0 to answer for. An explicit --node-ip or
-// a mesh IP is the operator's/mesh's address and must never be aliased on lo0 here.
+// The address the node advertises, and that the podnet adapter's startup
+// reconcile aliases on lo0, is decided in this order: the loopback default
+// becomes --mesh-ip on a mesh server (meshNodeIP); a loopback default that is
+// left becomes this derived .1 on a datapath node; anything else is the explicit
+// --node-ip as given. Whatever results, checkNodeAliasAddr refuses it before the
+// node starts unless it lies in the node's pod CIDR or the Service CIDR, the two
+// ranges netd will alias. This function is distinct from advertisedNodeIP only
+// for ensureAdvertisedNodeAlias, which pre-plumbs the DERIVED address alone ahead
+// of the LB/ingress controllers and leaves an explicit or mesh address to the
+// reconcile.
 func derivedNodeAdvertiseIP(opts nodeOptions) string {
 	if !opts.netMode.DataPath() || !isLoopbackDefault(opts.nodeIP) {
 		return ""
@@ -716,15 +736,50 @@ func nodeRESTConfig(kubeconfig string) (*rest.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
+	applyNodeClientBudget(cfg)
+	return cfg, nil
+}
+
+// applyNodeClientBudget sets nodeAPIRequestTimeout and the kubelet's QPS/Burst on
+// cfg. It is the one place those values live, shared by the kubeconfig-loaded
+// client (nodeRESTConfig) and the server node's in-memory one
+// (serverNodeRESTConfig), so the two paths cannot pace themselves differently.
+func applyNodeClientBudget(cfg *rest.Config) {
 	cfg.Timeout = nodeAPIRequestTimeout
 	cfg.QPS = 50
 	cfg.Burst = 100
-	return cfg, nil
+}
+
+// errNodeClientAmbiguous / errNodeClientMissing are nodeClientConfig's refusals.
+// Both-set is an error rather than a precedence rule: a caller that sets both has
+// two identities in mind, and silently picking one is how a node ends up running
+// as the wrong one.
+var (
+	errNodeClientAmbiguous = errors.New("node client: both an in-memory client config and a kubeconfig path are set; exactly one must be")
+	errNodeClientMissing   = errors.New("node client: neither an in-memory client config nor a kubeconfig path is set")
+)
+
+// nodeClientConfig is the ONLY place startNode gets its client config from.
+// opts.restConfig (the server's in-memory system:node identity) is used as given,
+// and the kubeconfig path is then never opened; opts.kubeconfig (agent, `k3sm
+// node`) is loaded through nodeRESTConfig. Exactly one must be set.
+func nodeClientConfig(opts nodeOptions) (*rest.Config, error) {
+	switch {
+	case opts.restConfig != nil && opts.kubeconfig != "":
+		return nil, errNodeClientAmbiguous
+	case opts.restConfig != nil:
+		return opts.restConfig, nil
+	case opts.kubeconfig != "":
+		return nodeRESTConfig(opts.kubeconfig)
+	default:
+		return nil, errNodeClientMissing
+	}
 }
 
 // startNode builds the client, selects the runtime, registers the VK node, and
 // blocks until ctx ends or the node exits. The server calls it directly with an
-// already-built kubeconfig.
+// in-memory system:node client config (nodeOptions.restConfig); the agent and
+// `k3sm node` pass a kubeconfig path. nodeClientConfig chooses between the two.
 func startNode(ctx context.Context, opts nodeOptions) error {
 	// Posture guard: refuse to start (named error, actionable message) when
 	// the default runtimed runtime's posture is missing — BEFORE anything
@@ -770,13 +825,21 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 			"internal_ip", internalIP, "node_ip", opts.nodeIP, "listen", opts.listen)
 	}
 
-	restCfg, err := nodeRESTConfig(opts.kubeconfig)
+	restCfg, err := nodeClientConfig(opts)
 	if err != nil {
 		return err
 	}
 	cs, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		return fmt.Errorf("build client: %w", err)
+	}
+	// The node-status update and the Lease renewal get a client of their own:
+	// a short request bound, its own connection and an HTTP/2 health check, so
+	// a connection that went half-open on a Wi-Fi roam is detected and redialled
+	// inside the node-monitor grace period. See heartbeatRESTConfig.
+	heartbeatCS, err := nodeHeartbeatClient(opts, restCfg)
+	if err != nil {
+		return err
 	}
 
 	// Event sink for node-emitted pod lifecycle Events (Pulled/Created/Started/
@@ -883,7 +946,17 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// The closure is idempotent, so this defer and awaitNodeExit's call below
 	// (which is what runs it on the two normal exit paths) cannot double-stop; the
 	// defer is what covers the paths that return before the node is ever ready.
-	stopRuntime := stopEmbeddedRuntime(prov, slog.Default())
+	// The eviction loop acts THROUGH the runtime (it tears pods down), so it is
+	// stopped, and waited for, before the runtime closes, on every exit path:
+	// the ctx path, the run-loop-error path, and the early returns. It is
+	// created here so the closure below can name it; it starts gated and only
+	// runs once the node is Ready (open, below).
+	eviction := newGatedLoop(ctx)
+	closeRuntime := stopEmbeddedRuntime(prov, slog.Default())
+	stopRuntime := func() {
+		eviction.stop(evictionStopTimeout)
+		closeRuntime()
+	}
 	// nodeExited closes once BOTH of this node's loops have returned — the Virtual
 	// Kubelet run loop and the node-status loop, which are what is still writing to
 	// the apiserver when a signal arrives. It is declared HERE, ahead of the
@@ -930,8 +1003,17 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// SYNCHRONOUSLY inside NewNode — so it is set before NewNode returns and the
 	// status loop can be started right after, with no handshake.
 	var nodeStatus *provider.NodeStatusProvider
+	// The by-name Secret/ConfigMap reader behind the node's Virtual Kubelet
+	// listers: the provider's own pod-reference manager when it has one (the
+	// runtimed provider), else none, and such a read then fails loudly.
+	var objects vkadapter.ObjectGetter
+	if s, ok := prov.(provider.ObjectSource); ok {
+		objects = s.Objects()
+	}
 	n, err := vkadapter.NewNode(opts.nodeName, vkadapter.NodeConfig{
 		Client:           cs,
+		HeartbeatClient:  heartbeatCS, // nil on the server's in-process node: cs carries the heartbeat there
+		Log:              slog.Default(),
 		Provider:         prov,
 		HTTPListenAddr:   opts.listen,
 		NumWorkers:       4,
@@ -946,6 +1028,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		// pointer intact. Empty when the runtime keeps no CRI log tree (the
 		// hostprocess node), in which case VK's route stands.
 		ExtraRoutes: containerLogRoutes(prov),
+		Objects:     objects,
 		// Replace VK's auto-Ready naive node provider with the real one: it samples
 		// this Mac for memory/disk/PID pressure and debounces the runtime's health
 		// into Ready. It receives the node AFTER configureNode stamped it, and
@@ -971,7 +1054,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	}
 
 	errc := make(chan error, 1)
-	// Both loops report their return through nodeLoops, which is what closes the
+	// Every loop reports its return through nodeLoops, which is what closes the
 	// nodeExited signal declared above: the exit hook waits on it (bounded) so a
 	// caller's teardown — `k3sm server` stopping its control plane — does not take
 	// the apiserver away while this node is still writing to it.
@@ -983,9 +1066,31 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// life of the node, not only after startup succeeds. Its first UpdateStatus
 	// blocks until VK registers the notify callback, so starting it here is safe.
 	go func() { defer nodeLoops.Done(); _ = nodeStatus.Run(ctx) }()
+	// The node-pressure eviction manager is counted in nodeLoops from here, but
+	// held until the node is Ready (eviction.open, below): only then has Virtual
+	// Kubelet's pod informer synced, so the provider's pod set is the cluster's.
+	// Counting it now rather than adding it later keeps the WaitGroup's Add ahead
+	// of every Wait.
+	eviction.start(&nodeLoops, func(ctx context.Context) {
+		runEvictionManager(ctx, prov, provider.EvictionConfig{
+			Status:   nodeStatus,
+			Recorder: recorder,
+			NodeName: opts.nodeName,
+			Log:      slog.Default(),
+		})
+	})
 	loopsDone := make(chan struct{})
 	go func() { nodeLoops.Wait(); close(loopsDone) }()
 	nodeExited = loopsDone
+
+	// The heartbeat watchdog: it reports, in this daemon's log, a node whose
+	// status posts or Lease renewals have stopped landing, whatever the reason.
+	// It runs from here, with its own stop, so every return path ends it.
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	watchDone := make(chan struct{})
+	hbWatch := &heartbeatWatch{node: opts.nodeName, started: time.Now(), log: slog.Default()}
+	go func() { defer close(watchDone); hbWatch.run(watchCtx, n.Heartbeat) }()
+	defer func() { stopWatch(); <-watchDone }()
 
 	if err := awaitNodeReady(ctx, n.Ready(), errc, nodeStartupTimeout, opts.nodeName, opts.listen); err != nil {
 		return err
@@ -996,7 +1101,11 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// earlier would let it read an empty pod set as "every pod is gone" and delete
 	// the whole log tree on every restart.
 	startContainerLogMaintenance(ctx, prov)
-	log.Printf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir)
+	// The eviction manager starts at the same point and for the same reason as
+	// the log GC: it acts on the provider's pod set, which is not the cluster's
+	// until the node is ready.
+	eviction.open()
+	slog.Default().Info(fmt.Sprintf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir))
 
 	return awaitNodeExit(ctx, errc, stopRuntime)
 }
@@ -1100,6 +1209,21 @@ func runtimeHealthProbe(prov vkadapter.Provider) func(context.Context) bool {
 		return nil
 	}
 	return h.RuntimeHealthy
+}
+
+// evictionManagerRunner is the optional provider capability that runs the
+// node-pressure eviction manager. It is declared at this consumer, like
+// containerLogMaintainer.
+type evictionManagerRunner interface {
+	RunEvictionManager(ctx context.Context, cfg provider.EvictionConfig)
+}
+
+// runEvictionManager runs prov's eviction manager until ctx ends, or returns at
+// once when prov has none (the hostprocess runtime).
+func runEvictionManager(ctx context.Context, prov any, cfg provider.EvictionConfig) {
+	if m, ok := prov.(evictionManagerRunner); ok {
+		m.RunEvictionManager(ctx, cfg)
+	}
 }
 
 // nodeStartupTimeout bounds startNode's wait for the VK node to signal readiness.
@@ -1296,7 +1420,57 @@ func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return provider.NewPodNetAdapter(nw, opts.nodeIP, slog.Default()), nil
+	return newNodePodNetAdapter(nw, opts)
+}
+
+// newNodePodNetAdapter wraps ipam in the provider adapter whose startup reconcile
+// aliases opts.nodeIP on lo0, after refusing a node address the pod network must
+// not alias (checkNodeAliasAddr). It is the seam between the node's addressing
+// and the one alias request it makes, split from buildPodNetAdapter so a test can
+// drive it over a recording IPAM instead of a real lo0.
+func newNodePodNetAdapter(ipam provider.PodIPAM, opts nodeOptions) (*provider.PodNetAdapter, error) {
+	if err := checkNodeAliasAddr(opts.nodeIP, opts.podCIDR, opts.serviceCIDR); err != nil {
+		return nil, err
+	}
+	return provider.NewPodNetAdapter(ipam, opts.nodeIP, slog.Default()), nil
+}
+
+// errNodeAliasOutsidePodNetwork names a node address the pod network would be
+// asked to alias on lo0 although it lies outside both this node's pod CIDR and
+// the cluster Service CIDR.
+var errNodeAliasOutsidePodNetwork = errors.New("node address cannot be aliased on lo0")
+
+// checkNodeAliasAddr refuses, before anything on the node starts, a node address
+// the podnet adapter's startup reconcile would alias on lo0 but must not.
+//
+// Its predicate MIRRORS netd's alias policy (darwin-net pkg/netd validateAliasIP):
+// an IPv4 unicast host that is inside BOTH the cluster pod aggregate and this
+// node's pod CIDR, or inside the configured Service CIDR (when one is set). A
+// change to either side must change the other; TestCheckNodeAliasAddr carries
+// netd's own policy-test rows. The reason to check it here is the failure shape
+// when it is not: the reconcile asks netd, netd refuses, the daemon exits,
+// launchd restarts it, and every restart reaps the node's pods before failing the
+// same way. A LAN address is the usual culprit (an HA server's etcd peer address
+// passed as --node-ip); it is already on an interface, and aliasing it on lo0
+// would shadow the route that actually carries it.
+//
+// A loopback or unparseable address is the reconcile's own skip, and passes.
+func checkNodeAliasAddr(nodeIP, podCIDR, serviceCIDR string) error {
+	ip, err := netip.ParseAddr(nodeIP)
+	if err != nil || ip.IsLoopback() {
+		return nil
+	}
+	ip = ip.Unmap()
+	if ip.Is4() && !ip.IsMulticast() && !ip.IsUnspecified() {
+		if p, err := netip.ParsePrefix(podCIDR); err == nil && podnet.ClusterPodCIDR.Contains(ip) && p.Contains(ip) {
+			return nil
+		}
+		if p, err := netip.ParsePrefix(serviceCIDR); err == nil && p.Contains(ip) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s is not an IPv4 unicast host inside this node's pod CIDR %s (cluster aggregate %s) or the Service CIDR %q, so netd refuses it and the node would fail its pod-network startup reconcile at every start. --node-ip is the node's advertised address; on a mesh server leave it unset (the node advertises --mesh-ip), and give an embedded-etcd server's LAN address as --etcd-peer-ip",
+		errNodeAliasOutsidePodNetwork, ip, podCIDR, podnet.ClusterPodCIDR, serviceCIDR)
 }
 
 // runtimedConfig builds the runtimed runtime configuration from the node options:
@@ -1325,7 +1499,7 @@ func resolveDNSShim() string {
 	return resolveSiblingDylib(install.DNSShimName)
 }
 
-// resolveShadowDir returns the shadow shell directory beside the running k3sm
+// resolveShadowDir returns the shadow binary directory beside the running k3sm
 // executable (<InstallDir>/shadow for an installed node) when it is a real
 // directory, else "". runtimed verifies each copy's ownership before it execs
 // one; this only decides whether the node has a set at all.
@@ -1399,8 +1573,8 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// temp dir, so the sibling lookup finds nothing there and the flag is the
 		// ONLY way the dev cluster gets absolute volume mounts.
 		PathShim: firstNonEmpty(opts.pathShim, resolvePathShim()),
-		// The shadow shell set `sudo k3sm install` makes beside the binary; a
-		// dev or from-source run has none and keeps the host shells.
+		// The shadow binary set `sudo k3sm install` makes beside the binary; a
+		// dev or from-source run has none and keeps the host binaries.
 		ShadowBinDir:  resolveShadowDir(),
 		ResolverVIP:   resolverVIP,
 		ClusterDomain: clusterDomain,
@@ -1981,11 +2155,131 @@ func kubeletServingCertificate(servingCertPEM, servingKeyPEM []byte, nodeName st
 	return certs.SelfSignedServing([]string{nodeName, "localhost"}, ips)
 }
 
+// defaultNodeName is the --node-name default: "k3sm-" plus this host's name,
+// made into a valid canonical node name (nodeNameFromHostname).
 func defaultNodeName() string {
 	h, _ := os.Hostname()
-	h = strings.TrimSuffix(strings.ToLower(h), ".local")
+	return nodeNameFromHostname(h)
+}
+
+// fallbackNodeName is the default node name when nothing usable survives of the
+// hostname.
+const fallbackNodeName = "k3sm-node"
+
+// nodeNameFromHostname derives a node name from hostname that is ALWAYS a valid
+// canonical node name (bootstrap.CanonicalNodeName), whatever the hostname
+// holds: a macOS computer name such as "Alex's MacBook" or one with non-ASCII
+// letters must not hand the control plane a name it then refuses to start with.
+//
+// ASCII letters are lowercased, a trailing ".local" is dropped, every run of
+// bytes outside [a-z0-9-] within a label becomes one '-', each label is trimmed
+// of leading and trailing '-' and capped at 63 bytes, empty labels are dropped,
+// and trailing labels are dropped while the name exceeds 253 bytes. A hostname
+// that already yields a valid name ("k3sm-" + the lowercased hostname) is left
+// exactly as it was; nothing usable at all yields fallbackNodeName.
+func nodeNameFromHostname(hostname string) string {
+	b := []byte(hostname)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	h := strings.TrimSuffix(strings.TrimRight(string(b), "."), ".local")
 	if h == "" {
 		h = "node"
 	}
-	return "k3sm-" + h
+	var labels []string
+	total := -1
+	for raw := range strings.SplitSeq("k3sm-"+h, ".") {
+		var sb strings.Builder
+		invalidRun := false
+		for i := 0; i < len(raw); i++ {
+			c := raw[i]
+			if ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' {
+				if invalidRun {
+					sb.WriteByte('-')
+					invalidRun = false
+				}
+				sb.WriteByte(c)
+				continue
+			}
+			invalidRun = true
+		}
+		label := strings.Trim(sb.String(), "-")
+		if len(label) > 63 {
+			label = strings.TrimRight(label[:63], "-")
+		}
+		if label == "" {
+			continue
+		}
+		if total+1+len(label) > 253 {
+			break
+		}
+		total += 1 + len(label)
+		labels = append(labels, label)
+	}
+	name, err := bootstrap.CanonicalNodeName(strings.Join(labels, "."))
+	if err != nil || name == "k3sm" {
+		return fallbackNodeName
+	}
+	return name
+}
+
+// evictionStopTimeout bounds how long node teardown waits for the eviction loop
+// to return after cancelling it. An eviction in flight is cut short by the
+// cancelled context; the bound only keeps a wedged runtime call from holding the
+// whole shutdown.
+const evictionStopTimeout = 10 * time.Second
+
+// gatedLoop is a node loop that is counted in the node's WaitGroup from the
+// start, runs only once opened, and can be stopped and waited for
+// independently of the node's context. The eviction manager is one: it must
+// not start before the node is Ready, and it must have stopped before the
+// runtime it acts through is closed.
+type gatedLoop struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	gate     chan struct{}
+	done     chan struct{}
+	openOnce sync.Once
+	started  bool
+}
+
+// newGatedLoop returns a loop whose context is a child of parent.
+func newGatedLoop(parent context.Context) *gatedLoop {
+	ctx, cancel := context.WithCancel(parent)
+	return &gatedLoop{ctx: ctx, cancel: cancel, gate: make(chan struct{}), done: make(chan struct{})}
+}
+
+// start launches the loop's goroutine, counted in wg. run is called with the
+// loop's context once open is called, unless the loop is stopped first.
+func (g *gatedLoop) start(wg *sync.WaitGroup, run func(ctx context.Context)) {
+	g.started = true
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(g.done)
+		select {
+		case <-g.gate:
+			run(g.ctx)
+		case <-g.ctx.Done():
+		}
+	}()
+}
+
+// open lets the loop run. Idempotent.
+func (g *gatedLoop) open() { g.openOnce.Do(func() { close(g.gate) }) }
+
+// stop cancels the loop and waits for it to return, at most timeout. A loop
+// that was never started returns at once.
+func (g *gatedLoop) stop(timeout time.Duration) {
+	g.cancel()
+	if !g.started {
+		return
+	}
+	select {
+	case <-g.done:
+	case <-time.After(timeout):
+		slog.Warn("the eviction loop did not stop before the runtime closed", "timeout", timeout)
+	}
 }

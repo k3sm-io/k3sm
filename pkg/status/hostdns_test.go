@@ -18,6 +18,7 @@ package status
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -97,4 +98,94 @@ func TestHostDNSRows(t *testing.T) {
 			t.Errorf("%s is not advisory", name)
 		}
 	}
+}
+
+// TestShadowShellsRowAgainstTheList pins the shadow-shells row against the
+// shared list: each source's cdhash is read once however many copies share
+// it; drift names at most three paths and counts the rest; a manifest missing
+// copies of the current list (an older install) is drift with the install
+// remedy; and a source this host lacks is never expected.
+func TestShadowShellsRowAgainstTheList(t *testing.T) {
+	t.Parallel()
+	const manifest = "/Library/k3sm/shadow/sources.json"
+	all := shadow.Copies()
+	full := make([]shadow.Source, 0, len(all))
+	present := map[string]bool{}
+	paths := map[string]bool{}
+	for _, c := range all {
+		full = append(full, shadow.Source{Name: c.Name, Path: c.Source, CDHash: "h"})
+		present[c.Source] = true
+		paths[c.Source] = true
+	}
+	encode := func(src []shadow.Source) []byte {
+		b, err := shadow.Encode(shadow.Manifest{Version: shadow.ManifestVersion, Sources: src})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	collector := func(src []shadow.Source, present map[string]bool, cdhash func(string) (string, error)) Collector {
+		return Collector{
+			FS:     fakeFS{contents: map[string][]byte{manifest: encode(src)}, present: present},
+			Paths:  Paths{ShadowManifest: manifest},
+			CDHash: cdhash,
+		}
+	}
+
+	t.Run("a current set is ok and reads each source once", func(t *testing.T) {
+		t.Parallel()
+		dup := append(append([]shadow.Source(nil), full...), shadow.Source{Name: "extra", Path: full[0].Path, CDHash: "h"})
+		reads := map[string]int{}
+		r, _ := collector(dup, present, func(p string) (string, error) { reads[p]++; return "h", nil }).shadowShellsRow()
+		if r.State != StateOK || r.Remedy != "" {
+			t.Errorf("row = %+v, want ok", r)
+		}
+		for p, n := range reads {
+			if n != 1 {
+				t.Errorf("%s read %d times, want once", p, n)
+			}
+		}
+		if len(reads) != len(paths) {
+			t.Errorf("read %d sources, want %d", len(reads), len(paths))
+		}
+	})
+
+	t.Run("drift names three paths and counts the rest", func(t *testing.T) {
+		t.Parallel()
+		r, _ := collector(full, present, func(string) (string, error) { return "new", nil }).shadowShellsRow()
+		want := fmt.Sprintf("%d of %d host binaries changed since the last install", len(paths), len(paths))
+		more := fmt.Sprintf("and %d more", len(paths)-3)
+		if r.State != StateDrift || r.Remedy != "sudo k3sm install" || !strings.Contains(r.Detail, want) ||
+			!strings.Contains(r.Detail, more) || !strings.Contains(r.Detail, full[2].Path) || strings.Contains(r.Detail, full[3].Path+",") {
+			t.Errorf("row = %+v, want drift %q listing three paths %q", r, want, more)
+		}
+	})
+
+	t.Run("a set from an older install is drift", func(t *testing.T) {
+		t.Parallel()
+		r, _ := collector(full[:4], present, func(string) (string, error) { return "h", nil }).shadowShellsRow()
+		want := fmt.Sprintf("the shadow set is from an older install (4 of %d copies)", len(all))
+		if r.State != StateDrift || r.Severity != SeverityWarn || r.Remedy != "sudo k3sm install" || !strings.Contains(r.Detail, want) {
+			t.Errorf("row = %+v, want drift %q", r, want)
+		}
+	})
+
+	t.Run("a source this host lacks is not expected", func(t *testing.T) {
+		t.Parallel()
+		var kept []shadow.Source
+		lacking := map[string]bool{}
+		for p := range present {
+			lacking[p] = true
+		}
+		delete(lacking, "/bin/dash")
+		for _, s := range full {
+			if s.Path != "/bin/dash" {
+				kept = append(kept, s)
+			}
+		}
+		r, _ := collector(kept, lacking, func(string) (string, error) { return "h", nil }).shadowShellsRow()
+		if r.State != StateOK {
+			t.Errorf("row = %+v, want ok (the installer skipped the absent source)", r)
+		}
+	})
 }

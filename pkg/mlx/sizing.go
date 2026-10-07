@@ -269,3 +269,39 @@ func (s Sizing) Args() []string {
 		argContinuousBatching,
 	}
 }
+
+// perRankRoundingBytes rounds a per-rank memory figure UP to a whole MiB, so
+// the request a rank Pod carries is a legible quantity rather than a byte count
+// left over from a division.
+const perRankRoundingBytes = 1 << 20
+
+// PerRankMemory is the unified memory ONE rank of a sharded model needs: its
+// share of spec.memory (rounded up, so the shares never sum to less than the
+// whole) plus the fixed per-process floor every rank pays on its own —
+// compileScratchBytes, the interpreter, the MLX runtime and kernel compilation,
+// which do not shard. The weights and the KV cache split across ranks; that
+// overhead is replicated.
+//
+// The result must still fund the minimum serving context through DeriveSizing,
+// the same check a single-node model passes; a share that cannot is refused
+// with ErrMemoryTooSmall rather than rendered as ranks that die at load time.
+// ranks < 1 is ErrNoMemory's sibling: there is no share to compute.
+func PerRankMemory(memory resource.Quantity, ranks int32) (resource.Quantity, error) {
+	total := memory.Value()
+	if total <= 0 {
+		return resource.Quantity{}, ErrNoMemory
+	}
+	if ranks < 1 {
+		return resource.Quantity{}, fmt.Errorf("%w: %d ranks", ErrInvalidRanks, ranks)
+	}
+	share := (total + int64(ranks) - 1) / int64(ranks)
+	perRank := share + compileScratchBytes
+	if rem := perRank % perRankRoundingBytes; rem != 0 {
+		perRank += perRankRoundingBytes - rem
+	}
+	q := *resource.NewQuantity(perRank, resource.BinarySI)
+	if _, err := DeriveSizing(q); err != nil {
+		return resource.Quantity{}, fmt.Errorf("per-rank share of %s across %d ranks: %w", memory.String(), ranks, err)
+	}
+	return q, nil
+}

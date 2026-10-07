@@ -33,6 +33,9 @@
 # the reads go through the re-signed shell that keeps the path-rebase shim; it
 # logs the JWT payload segment only, never the signed token.
 #
+# Needs K3SM_LAB=1. With K3SM_LAB unset the gate reports LAB-PENDING and exits
+# 3, which is not a pass and never 0.
+#
 # Requires: kubectl, python3.
 set -euo pipefail
 
@@ -46,6 +49,10 @@ finish() {
 	echo "=========== B234 GREEN ==========="
 }
 
+if [ "${K3SM_LAB:-}" != "1" ]; then
+	echo "B234 gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
+	exit 3
+fi
 if [ -z "${KUBECONFIG:-}" ]; then
 	echo "KUBECONFIG must point at the RUNNING cluster this installed node belongs to (this gate boots nothing itself)" >&2
 	exit 1

@@ -182,18 +182,14 @@ func TestInstallVerifiesTheVMHostBeforeWritingTheRoot(t *testing.T) {
 		}
 	})
 
-	t.Run("a carried datastore-endpoint-file that is gone refuses with zero copies", func(t *testing.T) {
+	t.Run("a carried retired datastore flag refuses with zero copies", func(t *testing.T) {
 		f := &fakeSystem{}
 		cfg := testConfig(t)
-		path := stagedEndpointPath(cfg)
 
-		configureServerArgs(f, cfg, "--datastore-endpoint-file", path)
+		configureServerArgs(f, cfg, "--datastore-endpoint-file", "/var/lib/k3sm/server/datastore-endpoint")
 		err := Install(context.Background(), f, cfg)
-		if err == nil {
-			t.Fatal("Install succeeded with a --datastore-endpoint-file naming a file that is not there")
-		}
-		if !strings.Contains(err.Error(), path) {
-			t.Errorf("the refusal does not name the missing file: %v", err)
+		if !errors.Is(err, ErrRetiredDatastoreFlag) {
+			t.Fatalf("Install = %v, want ErrRetiredDatastoreFlag", err)
 		}
 		if calls := copyCalls(f.calls); len(calls) != 0 {
 			t.Errorf("install copied artifacts into the root before refusing: %v", calls)

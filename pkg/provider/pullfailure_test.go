@@ -64,6 +64,7 @@ type startRecord struct {
 // can observe the provider inside its attempt window.
 func (f *fakeRuntimeServer) StartContainer(ctx context.Context, req *runtimev1.StartContainerRequest) (*runtimev1.StartContainerResponse, error) {
 	f.mu.Lock()
+	f.checkKnownLocked("StartContainer", req.GetPodId())
 	f.startCalls++
 	f.lastStart = startRecord{podID: req.GetPodId(), container: req.GetContainer()}
 	var out startOutcome
@@ -1519,6 +1520,89 @@ func TestCreateFailureAttribution(t *testing.T) {
 		}
 		if other.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED {
 			t.Errorf("the unnamed container carries failure_reason %v, want none", other.GetFailureReason())
+		}
+	})
+}
+
+// TestVMRunAsNonRootRefusalParksTheNamedContainer pins the kubelet surface of a
+// vm pod whose container violates runAsNonRoot. runtimed refuses the whole
+// create (one guest per pod) with FAILURE_REASON_CONTAINER_CONFIG and a message
+// that starts "container <name>:" (runtimed pkg/runtime/vmcontainers.go, the
+// ErrRunAsNonRoot arm). The kubelet shows that container Waiting
+// CreateContainerConfigError with the pod Pending; it never fails the pod.
+//
+// The two containers are named "app" and "app-2" on purpose: the refusal names
+// app-2, and the attribution must not land on app, which is declared first.
+//
+// Non-vacuity (attribution rows): attributeCreateFailure picked the first
+// DECLARED container whose token appeared anywhere in the message, so a refusal
+// about app-2 that also mentions "container app:" later was pinned on app.
+func TestVMRunAsNonRootRefusalParksTheNamedContainer(t *testing.T) {
+	const kubeletText = `container has runAsNonRoot and image will run as root (pod: "rnr_default(uid-rnr)", container: app-2)`
+	vmPod := func() *corev1.Pod {
+		pod := runtimedPod("default", "rnr")
+		vm := "vm"
+		pod.Spec.RuntimeClassName = &vm
+		pod.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsNonRoot: ptr(true)}
+		pod.Spec.Containers = []corev1.Container{
+			{Name: "app", Image: "registry.example/app:1"},
+			{Name: "app-2", Image: "registry.example/root:1"},
+		}
+		return pod
+	}
+
+	t.Run("attribution", func(t *testing.T) {
+		tests := []struct {
+			name, message, wantImage, wantContainer string
+		}{
+			{"the refusal's subject", "container app-2: " + kubeletText, "registry.example/root:1", "app-2"},
+			{"app never matches the app-2 token", "container app-2: boom", "registry.example/root:1", "app-2"},
+			{"the leading token wins over a sibling mentioned later",
+				"container app-2: config refers to container app: and failed", "registry.example/root:1", "app-2"},
+			{"a token inside a longer word is not a token", "subcontainer app: boom", "registry.example/app:1", ""},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				image, container := attributeCreateFailure(vmPod(), tt.message)
+				if image != tt.wantImage || container != tt.wantContainer {
+					t.Errorf("attributeCreateFailure = (%q, %q), want (%q, %q)", image, container, tt.wantImage, tt.wantContainer)
+				}
+			})
+		}
+	})
+
+	t.Run("the named container waits CreateContainerConfigError and the pod stays Pending", func(t *testing.T) {
+		pod := vmPod()
+		r, f, _, rec := newPullProvider(t)
+		f.pushCreate(createRefusal(runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG, "container app-2: "+kubeletText))
+
+		if err := r.CreatePod(context.Background(), pod); err != nil {
+			t.Fatalf("CreatePod = %v, want the pod parked (an error lands it ProviderFailed)", err)
+		}
+		st, err := r.GetPodStatus(context.Background(), "default", "rnr")
+		if err != nil {
+			t.Fatalf("GetPodStatus: %v", err)
+		}
+		if st.Phase != corev1.PodPending {
+			t.Errorf("phase = %s, want Pending", st.Phase)
+		}
+		if st.Reason == "ProviderFailed" {
+			t.Errorf("pod reason = %q, want no provider failure", st.Reason)
+		}
+		named := waitingOf(st, "app-2")
+		if named == nil || named.Reason != reasonCreateContainerConfigError {
+			t.Fatalf("app-2 waiting = %+v, want Waiting{CreateContainerConfigError}", named)
+		}
+		if !strings.Contains(named.Message, kubeletText) {
+			t.Errorf("app-2 waiting message = %q, want it to carry the kubelet text %q", named.Message, kubeletText)
+		}
+		sibling := waitingOf(st, "app")
+		if sibling == nil || sibling.Reason != reasonContainerCreating || sibling.Message != "" {
+			t.Errorf("app waiting = %+v, want Waiting{ContainerCreating} with no message", sibling)
+		}
+		events := recordedEvents(rec.Events)
+		if !containsEvent(events, msgContainerConfigError("container app-2: "+kubeletText)) {
+			t.Errorf("events = %v, want the Failed CreateContainerConfigError event", events)
 		}
 	})
 }

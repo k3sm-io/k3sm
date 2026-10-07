@@ -76,6 +76,7 @@ func newStatusRunner(o statusOptions) statusRunner {
 		out:       os.Stdout,
 		errOut:    os.Stderr,
 		collect:   func(ctx context.Context) status.Report { return o.scopeDatavol(newStatusCollector()).Collect(ctx) },
+		probe:     func() status.DaemonsReport { return o.scopeDatavol(newDaemonsCollector()).CollectDaemons() },
 		stdoutTTY: status.IsTerminal(os.Stdout),
 		stderrTTY: status.IsTerminal(os.Stderr),
 		color:     color,
@@ -155,7 +156,7 @@ func newStatusCollector() status.Collector {
 		// netd's node resolver entry, read from the dynamic store (no
 		// privilege needed to read a State: key).
 		NodeResolverPresent: nodeResolverPresent,
-		// The live host binaries' cdhashes, for the shadow shell drift check.
+		// The live host binaries' cdhashes, for the shadow binary drift check.
 		CDHash: func(path string) (string, error) {
 			return shadow.CDHash(context.Background(), path)
 		},
@@ -165,6 +166,25 @@ func newStatusCollector() status.Collector {
 		Version:    version.Get(),
 		Host:       macOSVersionOrEmpty(),
 		Hostname:   hostnameOrEmpty(),
+	}
+}
+
+// newDaemonsCollector assembles the collector for the launchd-only daemons
+// probe. It wires launchd, the filesystem, the process table and the data-root
+// reader, and NOTHING that reaches the apiserver or the runtime socket: no
+// kubeconfig is resolved and no client is built, which is what keeps the probe
+// cheap enough to poll.
+func newDaemonsCollector() status.Collector {
+	euid := os.Geteuid()
+	serviceUID := lookupServiceUID()
+	return status.Collector{
+		Launchd:    launchctlProbe{},
+		FS:         osStatusFS{},
+		Procs:      procTable{},
+		DataRoot:   dataRootFS{},
+		Paths:      statusPaths(statusWorkDir(euid, serviceUID)),
+		EUID:       euid,
+		ServiceUID: serviceUID,
 	}
 }
 

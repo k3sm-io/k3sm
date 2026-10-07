@@ -83,19 +83,20 @@ type NodeStatusConfig struct {
 //     and every label — silently, with no compile-time signal.
 //   - Ready is published as an explicit condition through UpdateStatus, never
 //     signalled by returning an error from Ping. A Ping error only SUPPRESSES the
-//     status update and the lease renewal and logs to the VK logger, which is a
-//     no-op sink here: the node would go stale with no condition and no diagnostic
-//     — strictly worse observability than saying nothing.
+//     status update and the lease renewal: the node would go stale with no
+//     condition, only a log line — strictly worse than saying NotReady.
 //   - Supplying any non-nil NodeProvider disables the node helper's built-in
 //     auto-Ready callback, so this type owns the Ready condition outright. Nothing
 //     else in the process sets it.
 //
-// HONEST LIMITATION: a True pressure condition here buys a NoSchedule taint and
-// nothing else. k3sm has no eviction manager, so no pod is ranked or evicted to
-// relieve the pressure and the taint is ABSORBING — it persists until a human (or,
-// for the image store, the runtime's own garbage collector) frees the resource.
-// The DiskPressure hysteresis band exists so that recovery, when it comes, is not
-// immediately undone by a flap.
+// It does not sample the host itself. The pressure monitor it owns (pressure.go)
+// takes every host sample on its own adaptive cadence; the status loop publishes
+// the monitor's latest snapshot, and the eviction manager (eviction.go) triggers
+// on the same snapshot through the same predicate, so MemoryPressure and the
+// eviction decision are one verdict. A True MemoryPressure is acted on by that
+// manager; DiskPressure and PIDPressure buy the NoSchedule taint only, and persist
+// until the resource is freed. The DiskPressure hysteresis band exists so that
+// recovery, when it comes, is not immediately undone by a flap.
 type NodeStatusProvider struct {
 	// naive supplies the NodeProvider contract itself (Ping/NotifyNodeStatus) and
 	// the UpdateStatus channel into the node controller.
@@ -111,7 +112,8 @@ type NodeStatusProvider struct {
 	health    func(ctx context.Context) bool
 
 	// Seams, defaulted by the constructor. Tests replace them to drive the loop
-	// hermetically — no Mach, no statfs, no apiserver.
+	// hermetically — no Mach, no statfs, no apiserver. sample is the HOST
+	// sampler; only the monitor calls it.
 	sample  func(dataRoot string) (hostStats, error)
 	now     func() time.Time
 	publish func(ctx context.Context, node *corev1.Node) error
@@ -122,6 +124,9 @@ type NodeStatusProvider struct {
 	mu    sync.Mutex
 	ready *probeGauge
 	prev  []corev1.NodeCondition
+
+	// monitor owns the host sample (see the type doc).
+	monitor *pressureMonitor
 }
 
 // Compile-time check that the status provider satisfies the VK node contract.
@@ -170,12 +175,20 @@ func NewNodeStatusProvider(cfg NodeStatusConfig) (*NodeStatusProvider, error) {
 		// threshold intervals before the flip.
 		ready: newProbeGauge(1, defaultProbeFailureThreshold, outcomeSuccess),
 	}
+	// The monitor reads p.sample at call time, so a test that swaps the seam
+	// after construction is honoured.
+	p.monitor = newPressureMonitor(func() (hostStats, error) { return p.sample(p.dataRoot) }, log)
 	return p, nil
 }
 
 // Ping implements the VK node contract. It reports only context cancellation:
 // runtime health is published as an explicit Ready condition instead, because a
 // Ping error suppresses the status update rather than communicating anything.
+//
+// Keep it that way. vkadapter's pingGuard answers for a Ping that has not
+// returned within two seconds, so a Ping that did real runtime work could have
+// its failure turned into a healthy heartbeat. A runtime check belongs in the
+// Ready condition, never here.
 func (p *NodeStatusProvider) Ping(ctx context.Context) error { return p.naive.Ping(ctx) }
 
 // NotifyNodeStatus implements the VK node contract, registering the node
@@ -189,10 +202,22 @@ func (p *NodeStatusProvider) NotifyNodeStatus(ctx context.Context, cb func(*core
 // then every interval. The first publication is what makes the node Ready, so it
 // must not wait for the first tick.
 //
+// The pressure monitor runs inside Run, sharing its ctx: it takes its first
+// sample BEFORE the first publish (so the first publication carries pressure
+// conditions), then samples on its own cadence. A False->True memory-pressure
+// edge publishes at once instead of waiting up to an interval. Run returns only
+// after the monitor has stopped.
+//
 // It returns ctx.Err() on cancellation. A publication failure is logged and the
 // loop continues: the next tick republishes, and a permanently failing publish is
 // already visible as a node whose status goes stale.
 func (p *NodeStatusProvider) Run(ctx context.Context) error {
+	p.monitor.sampleOnce()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); p.monitor.run(ctx) }()
+	defer wg.Wait()
+
 	p.publishLogged(ctx)
 	t := time.NewTicker(p.interval)
 	defer t.Stop()
@@ -201,6 +226,8 @@ func (p *NodeStatusProvider) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+			p.publishLogged(ctx)
+		case <-p.monitor.edges():
 			p.publishLogged(ctx)
 		}
 	}
@@ -217,23 +244,23 @@ func (p *NodeStatusProvider) publishLogged(ctx context.Context) {
 	}
 }
 
-// publishOnce samples the host, recomputes the node conditions, and publishes a
-// fresh copy of the bootstrap node carrying them.
+// publishOnce recomputes the node conditions from the pressure monitor's latest
+// snapshot and publishes a fresh copy of the bootstrap node carrying them. It
+// takes no host sample of its own.
+//
+// A failed sample never reaches here as a zero snapshot: the monitor keeps the
+// previous one (and says so), so the conditions it yields are the previous
+// verdicts. Before the first successful sample there is no snapshot, and the
+// pressure conditions are omitted entirely — an absent condition is the
+// truthful "not observed", and it is exactly the state the node was in before
+// any of this existed.
 func (p *NodeStatusProvider) publishOnce(ctx context.Context) error {
-	s, sampleErr := p.sample(p.dataRoot)
-	if sampleErr != nil {
-		// A failed sample is reported ONCE per cycle and then carried: the pressure
-		// conditions keep their previous values (or, on a first-pass failure, are
-		// omitted entirely — an absent condition is the truthful "not observed", and
-		// it is exactly the state the node was in before any of this existed).
-		p.log.Warn("node resource sample failed; carrying the previous pressure conditions",
-			"error", sampleErr, "data_root", p.dataRoot)
-	}
+	s, _, sampled := p.monitor.latest()
 	healthy := true
 	if p.health != nil {
 		healthy = p.health(ctx)
 	}
-	node := p.recompute(s, sampleErr == nil, healthy, metav1.NewTime(p.now()))
+	node := p.recompute(s, sampled, healthy, metav1.NewTime(p.now()))
 	return p.publish(ctx, node)
 }
 

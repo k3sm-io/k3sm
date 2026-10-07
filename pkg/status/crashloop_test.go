@@ -46,6 +46,12 @@ func TestClassifyCrashLoop(t *testing.T) {
 	legacy := func(ago time.Duration, comp string) executor.Crash {
 		return executor.Crash{At: now.Add(-ago), Component: comp, Detail: "token=REDACTED secret material"}
 	}
+	// An HA scheduler or controller-manager that exited on a lost leader lease:
+	// recorded, but not a failure.
+	leaderLost := func(ago time.Duration, comp string) executor.Crash {
+		return executor.Crash{At: now.Add(-ago), Component: comp, Origin: executor.CrashOriginLeaderLost,
+			Detail: "token=REDACTED secret material"}
+	}
 	tripped := now.Add(-time.Minute)
 
 	tests := []struct {
@@ -87,6 +93,23 @@ func TestClassifyCrashLoop(t *testing.T) {
 		{"a pre-origin record still reads as a crash",
 			executor.CrashRecord{Crashes: []executor.Crash{legacy(3*time.Minute, "kine"), legacy(time.Minute, "kine")}}, nil,
 			PostureRestarting, []string{"restarted 2 times", "last crash: kine"}, []string{"never came up"}},
+		{"one leader-lease loss is quiet (the wide view notes it)",
+			executor.CrashRecord{Crashes: []executor.Crash{leaderLost(time.Minute, "kube-controller-manager")}}, nil,
+			PostureQuiet, nil, nil},
+		{"two leader-lease losses say quorum is flapping, not that anything crashed",
+			executor.CrashRecord{Crashes: []executor.Crash{leaderLost(3*time.Minute, "kube-scheduler"), leaderLost(time.Minute, "kube-controller-manager")}}, nil,
+			PostureRestarting, []string{"lost the leader lease 2 times", "kube-controller-manager", "not a crash", "trips at 10"},
+			[]string{"restarted", "last crash", "never came up"}},
+		{"leader-lease losses do not count as crashes, and one crash among them names the crash",
+			executor.CrashRecord{Crashes: []executor.Crash{crash(3*time.Minute, "kine"), leaderLost(2*time.Minute, "kube-scheduler"), leaderLost(time.Minute, "kube-scheduler")}}, nil,
+			PostureRestarting, []string{"lost the leader lease 2 times"}, []string{"restarted"}},
+		{"a crash count names the last crash, not a later lease loss",
+			executor.CrashRecord{Crashes: []executor.Crash{crash(4*time.Minute, "kine"), crash(3*time.Minute, "kube-apiserver"), leaderLost(time.Minute, "kube-scheduler")}}, nil,
+			PostureRestarting, []string{"restarted 2 times", "last crash: kube-apiserver"}, []string{"kube-scheduler"}},
+		{"a park on repeated leader-lease loss says so and names quorum",
+			executor.CrashRecord{Crashes: []executor.Crash{leaderLost(2*time.Minute, "kube-scheduler"), leaderLost(time.Minute, "kube-controller-manager")}, TrippedAt: &tripped}, nil,
+			PostureParked, []string{"repeated leader-lease loss", "kube-controller-manager", "etcd quorum", "parked", "--clear-crashloop"},
+			[]string{"crashed", "never came up"}},
 		{"permission denied is unreadable, named as the user's posture",
 			executor.CrashRecord{}, os.ErrPermission, PostureUnreadable, []string{"not readable by this user"}, nil},
 		{"any other read error is unreadable with the error",
@@ -148,6 +171,13 @@ func TestApplyCrashLoopOnTheServerRow(t *testing.T) {
 		row := running()
 		applyCrashLoop(&row, CrashLoopVerdict{Posture: PostureUnreadable, Detail: "not readable"})
 		if row.Severity != SeverityOK || row.Wide["crash-loop"] != "not readable" {
+			t.Fatalf("%+v", row)
+		}
+	})
+	t.Run("a leader-lease loss is a wide note on a quiet row, never a severity", func(t *testing.T) {
+		row := running()
+		applyCrashLoop(&row, CrashLoopVerdict{Posture: PostureQuiet, LeaderLost: "1 in the last 10m0s"})
+		if row.Severity != SeverityOK || row.Wide["leader-lost"] != "1 in the last 10m0s" {
 			t.Fatalf("%+v", row)
 		}
 	})

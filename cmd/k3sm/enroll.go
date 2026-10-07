@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes"
+	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -54,17 +55,26 @@ import (
 // (named == nodeName, so bootstrap's write-guard holds — a node never writes a peer
 // for any other node), and returns the current peer snapshot.
 //
-// Locking discipline: mu serializes the assign→write so two concurrent joins do not
-// claim the same /24, and the SAME instance serves both the join RPC and this
-// server's own EnrollSelf — the two allocators must contend on one lock or a worker
-// joining during bring-up can be handed the index the server is claiming.
-// podCIDR assignment is the LOWEST FREE index ≥ 1 (index 0 is the control-plane
-// node's, pinned by EnrollSelf); it is a dev-scale scheme — robust index recycling
-// across node deletes is not implemented.
+// Ownership of a /24 is decided by the DATASTORE, not by this process: every
+// assignment first creates the range's claim object (a Lease named for the index,
+// meshclaim.go), and create-if-absent is the compare-and-swap. A second server's
+// enroller racing this one loses the create and moves on, so two names can never
+// both hold one /24. A MeshPeer is written only once its claim is held.
+//
+// Locking discipline: mu serializes this process's own claim→write sequences (the
+// join RPC, this server's EnrollSelf, the member route's reservation, refreshes and
+// releases), so one process never interleaves two of them. It is not what makes a
+// range unique across processes; the claim is. A worker's podCIDR is the LOWEST
+// index ≥ 1 whose claim it wins (index 0 is the first server's by convention); it is
+// a dev-scale scheme — robust index recycling across node deletes is not
+// implemented.
 type meshEnroller struct {
 	client     rest.Interface
 	clusterPod netip.Prefix
 	log        *slog.Logger
+	// leases is the claim-object client (meshclaim.go). It is required: an
+	// enroller that cannot claim a range cannot assign one.
+	leases coordinationv1client.LeaseInterface
 	// events records an endpoint change against the Node object. It is nil when
 	// the core client could not be built, in which case the refresh still writes
 	// the MeshPeer and only the Event is lost.
@@ -84,17 +94,22 @@ func newMeshEnroller(cfg *rest.Config, log *slog.Logger) (*meshEnroller, error) 
 	if err != nil {
 		return nil, err
 	}
-	e := &meshEnroller{client: client, clusterPod: podnet.ClusterPodCIDR, log: log}
-	// The Event sink is best-effort by construction: an enroller that cannot
-	// record events still enrolls, and refusing to build one here would turn an
-	// observability dependency into a join outage.
-	if cs, err := kubernetes.NewForConfig(cfg); err != nil {
-		log.Warn("mesh endpoint changes will not be recorded as Node Events, and a deregistering node's Node object cannot be deleted", "err", err)
-	} else {
-		e.events = cs.CoreV1().Events(metav1.NamespaceDefault)
-		e.nodes = cs.CoreV1().Nodes()
+	// The core clientset carries the Event sink, the Node client and the
+	// range-claim client. The claims are not optional — they are what makes a
+	// range unique — so a clientset that cannot be built fails the enroller, which
+	// is the same REST config the MeshPeer client above was just built from.
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build the mesh range-claim client: %w", err)
 	}
-	return e, nil
+	return &meshEnroller{
+		client:     client,
+		clusterPod: podnet.ClusterPodCIDR,
+		log:        log,
+		leases:     cs.CoordinationV1().Leases(meshRangeClaimNamespace),
+		events:     cs.CoreV1().Events(metav1.NamespaceDefault),
+		nodes:      cs.CoreV1().Nodes(),
+	}, nil
 }
 
 // Enroll implements bootstrap.Enroller.
@@ -120,64 +135,80 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, err
 	}
 
-	existing, err := e.listPeers(ctx)
+	existing, err := e.listPeerObjects(ctx)
 	if err != nil {
 		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("list mesh peers: %w", err)
 	}
 
-	// Reuse this node's already-assigned CIDR on a rejoin; else assign the next /24.
-	podCIDR := ""
-	for _, p := range existing {
-		if p.NodeName == nodeName {
-			podCIDR = p.PodCIDR
+	// Reuse this node's already-assigned CIDR on a rejoin; else claim the next /24.
+	var own *netv1.MeshPeer
+	for i := range existing {
+		if existing[i].Spec.NodeName == nodeName {
+			own = &existing[i]
 		}
 	}
-	// THE JOIN PATH NEVER TOUCHES THE CONTROL-PLANE NODE'S OWN PEER. The peer
-	// that would be reused here is the one this write is about to replace, so
-	// an existing assignment at serverNodeIndex means this enroll would hand the
-	// caller the control plane's mesh identity: its public key, its endpoint, its
-	// AllowedIPs. EnrollSelf is the only writer of that object, and it does not
-	// come through Enroll.
+	// THE JOIN PATH NEVER TOUCHES A CONTROL-PLANE NODE'S PEER. The peer that would
+	// be reused here is the one this write is about to replace, so a server row
+	// under this name means this enroll would hand the caller a control plane's
+	// mesh identity: its public key, its endpoint, its AllowedIPs. Only the server
+	// paths (EnrollSelf, the member route's reservation) write a server row, and
+	// neither comes through Enroll.
 	//
-	// The test is the EXISTING object's index, not a copy of the server's name.
-	// A name would need a second source of truth to be threaded here and kept in
-	// step with the process's own; the index is already in the object being
+	// The test is the EXISTING object (isServerPeer: the server label, or the
+	// first server's index 0), not a list of server names. A name list would be a
+	// second source of truth to keep in step; the object is the one being
 	// overwritten, so this guard holds even when the name guard in front of it is
 	// absent or bypassed.
-	if idx, ok := nodeIndexOf(e.clusterPod, podCIDR); ok && idx == serverNodeIndex {
+	if own != nil && isServerPeer(e.clusterPod, *own) {
 		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{},
-			fmt.Errorf("%w: %q holds %s", ErrServerPeerOverwrite, nodeName, podCIDR)
+			fmt.Errorf("%w: %q holds %s", ErrServerPeerOverwrite, nodeName, own.Spec.PodCIDR)
 	}
 	alloc := bootstrap.Allocation{EnrollID: enrollID}
-	if podCIDR == "" {
-		alloc.Fresh = true
-		index, err := lowestFreeNodeIndex(e.clusterPod, existing)
-		if err != nil {
-			return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("assign podCIDR: %w", err)
+	podCIDR := ""
+	if own != nil {
+		podCIDR = own.Spec.PodCIDR
+		// A rejoin re-asserts its claim: on a cluster upgraded from before claims
+		// existed this is where a worker's range first gets one, and a claim held
+		// by a different name means two rows share this /24, which no write here
+		// may make worse.
+		if idx, ok := nodeIndexOf(e.clusterPod, podCIDR); ok {
+			cidr, _ := netip.ParsePrefix(podCIDR)
+			holder, _, err := e.claimRange(ctx, idx, cidr.Masked(), nodeName, rangeClaimMeta{})
+			if err != nil {
+				return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("claim podCIDR %s: %w", podCIDR, err)
+			}
+			if holder != nodeName {
+				return netv1.MeshEnrollResponse{}, bootstrap.Allocation{},
+					fmt.Errorf("claim podCIDR %s: the range is claimed by %q (claim %s/%s), not %q; resolve the duplicate before this node rejoins",
+						podCIDR, holder, meshRangeClaimNamespace, meshRangeClaimName(idx), nodeName)
+			}
 		}
-		cidr, err := podnet.NodeCIDR(e.clusterPod, index)
+	} else {
+		alloc.Fresh = true
+		cidr, err := e.claimLowestFreeIndex(ctx, nodeName, existing)
 		if err != nil {
 			return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("assign podCIDR: %w", err)
 		}
 		podCIDR = cidr.String()
 	}
+	// From here the range's claim is held, so every failure reports the
+	// allocation: the caller's release gives back the claim with the peer.
+	alloc.PodCIDR = podCIDR
 	prefix, err := netip.ParsePrefix(podCIDR)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("parse assigned podCIDR %q: %w", podCIDR, err)
+		return netv1.MeshEnrollResponse{}, alloc, fmt.Errorf("parse assigned podCIDR %q: %w", podCIDR, err)
 	}
 	meshIP, err := podnet.MeshEgressIP(prefix)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("derive mesh-egress IP: %w", err)
+		return netv1.MeshEnrollResponse{}, alloc, fmt.Errorf("derive mesh-egress IP: %w", err)
 	}
 
 	peer, err := bootstrap.BuildMeshPeer(nodeName, podCIDR, meshIP.String(), req)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, err
+		return netv1.MeshEnrollResponse{}, alloc, err
 	}
 	stampEnrollID(peer, enrollID)
-	// Past this point the peer may exist, so the real allocation is reported: the
-	// failures below are the ones whose orphan a caller has to be able to reap.
-	if err := e.writePeer(ctx, peer, false); err != nil {
+	if err := e.writePeer(ctx, peer, workerPeerWrite); err != nil {
 		return netv1.MeshEnrollResponse{}, alloc, fmt.Errorf("write mesh peer %q: %w", nodeName, err)
 	}
 
@@ -223,13 +254,16 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 // exists under that name belongs to an earlier join this call has no business
 // touching.
 //
-// It LIST-BACK VERIFIES after an ACTUAL delete, for the reason EnrollSelf does:
-// reporting success is the claim that the index is assignable again, and that has
-// to be read from the apiserver rather than inferred from a delete that returned
-// no error. A peer that was never this join's is not verified against, because the
-// index is legitimately still held — by its new owner. A NotFound is success — the
-// reap is idempotent, and a peer that is already gone is exactly the state asked
-// for.
+// It LIST-BACK VERIFIES after an ACTUAL delete: reporting success is the claim
+// that the index is assignable again, and that has to be read from the apiserver
+// rather than inferred from a delete that returned no error. A peer that was never
+// this join's is not verified against, because the index is legitimately still
+// held — by its new owner. A NotFound is success — the reap is idempotent, and a
+// peer that is already gone is exactly the state asked for.
+//
+// Once no peer of this name remains, the range's CLAIM is released too (fenced on
+// its holder), or the index would stay unassignable with nothing behind it. A
+// peer kept because a newer enroll wrote it keeps its claim with it.
 func (e *meshEnroller) ReleaseAllocation(ctx context.Context, nodeName string, alloc bootstrap.Allocation) error {
 	if nodeName == "" {
 		return errors.New("release allocation: no node name")
@@ -243,7 +277,7 @@ func (e *meshEnroller) ReleaseAllocation(ctx context.Context, nodeName string, a
 	var cur netv1.MeshPeer
 	if err := e.client.Get().Resource(meshPeerResource).Name(nodeName).Do(ctx).Into(&cur); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil
+			return e.releaseAllocatedClaim(ctx, nodeName, alloc)
 		}
 		return fmt.Errorf("read mesh peer %q: %w", nodeName, err)
 	}
@@ -278,7 +312,24 @@ func (e *meshEnroller) ReleaseAllocation(ctx context.Context, nodeName string, a
 			return fmt.Errorf("verify the release of mesh peer %q: it still holds %s", nodeName, p.PodCIDR)
 		}
 	}
+	if err := e.releaseAllocatedClaim(ctx, nodeName, alloc); err != nil {
+		return err
+	}
 	e.log.Info("released the mesh allocation of a failed join", "node", nodeName)
+	return nil
+}
+
+// releaseAllocatedClaim releases the claim on the range alloc assigned, when the
+// allocation names one; a claim another name holds is kept (releaseClaim). The
+// caller holds e.mu and has established that no peer of this name remains.
+func (e *meshEnroller) releaseAllocatedClaim(ctx context.Context, nodeName string, alloc bootstrap.Allocation) error {
+	idx, ok := nodeIndexOf(e.clusterPod, alloc.PodCIDR)
+	if !ok {
+		return nil
+	}
+	if err := e.releaseClaim(ctx, idx, nodeName); err != nil {
+		return fmt.Errorf("release the claim on %s: %w", alloc.PodCIDR, err)
+	}
 	return nil
 }
 
@@ -308,104 +359,61 @@ func stampEnrollID(peer *netv1.MeshPeer, enrollID string) {
 	peer.Annotations[meshPeerEnrollIDAnnotation] = enrollID
 }
 
-// serverNodeIndex is the node index the CONTROL-PLANE node's pod /24 is carved
-// at. It is pinned, not assigned: defaultNodePodCIDR() hard-codes the same index-0
-// carve and feeds it to this node's routing locality and its pod IPAM, so a
-// self-assigned different index would split "what the mesh routes here" from "what
-// this node's pods are" — and mesh.BuildPlan's self-exclusion keys on exact CIDR
-// equality, so the node would program a route to itself.
-const serverNodeIndex = 0
+// firstServerIndex is node index 0, the range the FIRST server conventionally
+// takes (its --mesh-ip is 100.64.0.1). It is not special to a server — every
+// server's range is the one its own --mesh-ip names (EnrollSelf) — but the worker
+// allocator never hands it out, so the first server's range stays free for it, and
+// an unlabelled peer at it is treated as a server's (isServerPeer), which keeps the
+// rows written before the server label existed protected.
+const firstServerIndex = 0
 
-// ErrMeshIndexClaimed is returned by EnrollSelf when the control-plane node's
-// index-0 pod /24 is already held by a DIFFERENT node. Compare with errors.Is.
-var ErrMeshIndexClaimed = errors.New("enroll: the control-plane mesh index is claimed by another node")
+// ErrMeshIndexClaimed is returned when a server's mesh range is held by a DIFFERENT
+// node. It is bootstrap.ErrMeshRangeClaimed, so the member route and EnrollSelf
+// report one condition with one sentinel. Compare with errors.Is.
+var ErrMeshIndexClaimed = bootstrap.ErrMeshRangeClaimed
 
 // ErrServerPeerOverwrite is returned by the WORKER-JOIN enroll path when the
-// MeshPeer it would write over holds the control-plane node's pod index. It is
-// the last of the three layers that keep a join from taking the control plane's
-// mesh identity, and the only one that reads the object being overwritten rather
-// than the name being claimed. Compare with errors.Is.
-var ErrServerPeerOverwrite = errors.New("enroll: a join may not overwrite the mesh peer holding the control-plane node's index")
+// MeshPeer it would write over is a control-plane node's (isServerPeer). It is the
+// last of the three layers that keep a join from taking a control plane's mesh
+// identity, and the only one that reads the object being overwritten rather than
+// the name being claimed. Compare with errors.Is.
+var ErrServerPeerOverwrite = errors.New("enroll: a join may not overwrite a control-plane node's mesh peer")
 
-// EnrollSelf asserts-or-creates the CONTROL-PLANE node's own MeshPeer at index 0
-// and returns the resulting peer snapshot, so the server participates in the mesh
-// it hosts rather than only brokering other nodes into it.
+// EnrollSelf asserts-or-creates the CONTROL-PLANE node's own MeshPeer at selfCIDR —
+// the /24 its own --mesh-ip names (install.MeshNodePodCIDR) — and returns the
+// resulting peer snapshot, so the server participates in the mesh it hosts rather
+// than only brokering other nodes into it.
 //
-// It runs under the SAME mutex as Enroll and through the same writePeer upsert, so
-// it is serialized against every concurrent worker join; and it LIST-BACK VERIFIES
-// its own write before returning, so a caller that opens the join listener only
-// after this returns has a durable index-0 claim in place. Without that
-// happens-before, Enroll's lowest-free-index scanner would legitimately hand index
-// 0 to a worker that joins in the window, and two peers would claim one AllowedIPs
-// — which wireguard cannot admit.
+// It runs under the SAME mutex as Enroll and through the server claim path
+// (claimServerRange): the range's claim object is created, or found already held
+// by this name, before the peer is written, so a caller that opens the join
+// listener after this returns has a durable claim in place and no worker can be
+// handed this range.
 //
-// It NEVER runs the free-index scanner (see serverNodeIndex) and it FAILS CLOSED
-// with ErrMeshIndexClaimed if index 0 is held by a different node name: silently
-// taking the slot would rewrite a live peer's AllowedIPs out from under it.
-// Re-enrolling this same node is idempotent — the upsert updates the endpoint and
-// public key in place.
-func (e *meshEnroller) EnrollSelf(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
+// It FAILS CLOSED, never evicts and never moves:
+//   - ErrMeshIndexClaimed when another node's peer or claim holds selfCIDR;
+//   - bootstrap.ErrMeshClaimRefused when this name already holds a WORKER row, or a
+//     server row at a DIFFERENT range (re-addressing a server is a manual
+//     procedure, not an automatic move).
+//
+// Re-enrolling this same node at the same range is idempotent: the upsert updates
+// the endpoint (and the public key, which only this server's own process may
+// rotate) in place.
+func (e *meshEnroller) EnrollSelf(ctx context.Context, nodeName string, selfCIDR netip.Prefix, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	selfCIDR, err := podnet.NodeCIDR(e.clusterPod, serverNodeIndex)
-	if err != nil {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("derive the control-plane podCIDR: %w", err)
-	}
+	selfCIDR = selfCIDR.Masked()
 	meshIP, err := podnet.MeshEgressIP(selfCIDR)
 	if err != nil {
 		return netv1.MeshEnrollResponse{}, fmt.Errorf("derive mesh-egress IP: %w", err)
 	}
-
-	existing, err := e.listPeers(ctx)
-	if err != nil {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("list mesh peers: %w", err)
-	}
-	for _, p := range existing {
-		idx, ok := nodeIndexOf(e.clusterPod, p.PodCIDR)
-		if !ok || idx != serverNodeIndex || p.NodeName == nodeName {
-			continue
-		}
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("%w: %s is held by node %q, not %q",
-			ErrMeshIndexClaimed, selfCIDR, p.NodeName, nodeName)
-	}
-
-	peer, err := bootstrap.BuildMeshPeer(nodeName, selfCIDR.String(), meshIP.String(), req)
-	if err != nil {
+	if _, err := e.claimServerRange(ctx, nodeName, selfCIDR, req, serverClaimOrigin{}); err != nil {
 		return netv1.MeshEnrollResponse{}, err
 	}
-	// Stamped like every other enroll, so no id an earlier enroll of this name
-	// handed out survives this write — a release holding one must find a stranger's
-	// peer and keep it, which is the invariant the fence rests on.
-	enrollID, err := newEnrollID()
-	if err != nil {
-		return netv1.MeshEnrollResponse{}, err
-	}
-	stampEnrollID(peer, enrollID)
-	// The ONE write allowed over the control-plane index: this is the process
-	// whose peer that is. The permission is an explicit argument rather than a
-	// field or a package-level flag, so it is visible at the call site and cannot
-	// be left set for a later join.
-	if err := e.writePeer(ctx, peer, true); err != nil {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("write mesh peer %q: %w", nodeName, err)
-	}
-
-	// LIST-BACK VERIFY. This is not a re-read for convenience: it is the
-	// happens-before the caller depends on. Returning nil here is the claim that
-	// index 0 is durably this node's, so it has to be read back from the apiserver
-	// rather than inferred from a successful write.
 	peers, err := e.listPeers(ctx)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("verify self-enroll: %w", err)
-	}
-	verified := false
-	for _, p := range peers {
-		if p.NodeName == nodeName && p.PodCIDR == selfCIDR.String() {
-			verified = true
-		}
-	}
-	if !verified {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("verify self-enroll: no MeshPeer %q at %s after the write", nodeName, selfCIDR)
+		return netv1.MeshEnrollResponse{}, fmt.Errorf("snapshot mesh peers: %w", err)
 	}
 	return netv1.MeshEnrollResponse{
 		NodeName: nodeName,
@@ -504,7 +512,8 @@ const meshEndpointChangedReason = "MeshEndpointChanged"
 // tunnel entry for a Mac that is going away; deleting the Node first would leave
 // a peer entry alive for a node that no longer exists in the cluster, which is
 // precisely the residue this verb exists to remove. Freeing the peer also frees
-// its pod /24, which lowestFreeNodeIndex hands to the next node that joins.
+// its pod /24 (the peer and its range claim), which lowestFreeNodeIndex hands to
+// the next node that joins.
 //
 // A NotFound on either object is SUCCESS. Deregistration is idempotent by
 // construction: an uninstall can be re-run, an operator may have deleted one
@@ -532,6 +541,11 @@ func (e *meshEnroller) Deregister(ctx context.Context, nodeName string) error {
 	if err := e.client.Delete().Resource(meshPeerResource).Name(nodeName).Do(ctx).Error(); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete mesh peer %q: %w", nodeName, err)
 	}
+	// The peer's range claims go with it, so lowestFreeNodeIndex can hand the
+	// range to the next node.
+	if err := e.releaseClaimsHeldBy(ctx, nodeName); err != nil {
+		return fmt.Errorf("release the mesh range claims of %q: %w", nodeName, err)
+	}
 	if e.nodes == nil {
 		return fmt.Errorf("delete node %q: this supervisor has no core apiserver client, so only the MeshPeer was removed (`kubectl delete node %s` removes the rest)", nodeName, nodeName)
 	}
@@ -550,7 +564,7 @@ func (e *meshEnroller) Deregister(ctx context.Context, nodeName string) error {
 // counter returns 2, skipping index 1 forever, and with the server plus one worker
 // it returns 3 — an index scheme whose answers depend on how many peers exist
 // rather than on which indices are taken. It also never recovered an index after a
-// node was deleted. Starting at 1 keeps index 0 reserved (serverNodeIndex); a peer
+// node was deleted. Starting at 1 keeps index 0 for the first server (firstServerIndex); a peer
 // whose podCIDR does not parse or falls outside the cluster CIDR is ignored rather
 // than allowed to shift the numbering.
 func lowestFreeNodeIndex(clusterCIDR netip.Prefix, existing []netv1.MeshPeerSpec) (int, error) {
@@ -560,7 +574,7 @@ func lowestFreeNodeIndex(clusterCIDR netip.Prefix, existing []netv1.MeshPeerSpec
 			used[idx] = struct{}{}
 		}
 	}
-	for index := serverNodeIndex + 1; ; index++ {
+	for index := firstServerIndex + 1; ; index++ {
 		if _, taken := used[index]; taken {
 			continue
 		}
@@ -601,6 +615,17 @@ const nodePodCIDRBits = 24
 // listPeers returns the current MeshPeer specs from the apiserver.
 func (e *meshEnroller) listPeers(ctx context.Context) ([]netv1.MeshPeerSpec, error) {
 	return listMeshPeers(ctx, e.client)
+}
+
+// listPeerObjects returns the current MeshPeers WITH their metadata: the server
+// label (isServerPeer) and the enroll fence live there, and the spec projection
+// drops both.
+func (e *meshEnroller) listPeerObjects(ctx context.Context) ([]netv1.MeshPeer, error) {
+	var list netv1.MeshPeerList
+	if err := e.client.Get().Resource(meshPeerResource).Do(ctx).Into(&list); err != nil {
+		return nil, err
+	}
+	return list.Items, nil
 }
 
 // listMeshPeers is the one-shot LIST of every MeshPeer spec in the cluster. It is
@@ -654,23 +679,32 @@ func meshPeerLister(kubeconfig string) func(context.Context) ([]netv1.MeshPeerSp
 	}
 }
 
+// peerWrite names which path is writing a MeshPeer, and so which existing rows the
+// write may replace.
+type peerWrite int
+
+const (
+	// workerPeerWrite is the worker-join enroll: it may never replace a server's
+	// row (ErrServerPeerOverwrite).
+	workerPeerWrite peerWrite = iota
+	// serverPeerWrite is a server writing its OWN row (EnrollSelf, the member
+	// route's reservation): it may replace only a server's row, never a worker's
+	// (bootstrap.ErrMeshClaimRefused).
+	serverPeerWrite
+)
+
 // writePeer creates the MeshPeer, or updates it in place on a rejoin (AlreadyExists).
 //
-// allowServerIndex is the permission to overwrite a peer holding the
-// CONTROL-PLANE node's pod index (serverNodeIndex). Only EnrollSelf passes true,
-// because only that call is the control-plane process writing its own peer; the
-// worker-join path passes false and is refused with ErrServerPeerOverwrite.
-//
-// The decision is made on the object READ BACK from the apiserver, which is what
-// makes this the last line rather than a duplicate of Enroll's check: the list
-// Enroll scanned can be stale or racing, while the object fetched here is the one
-// the PUT is about to replace.
-func (e *meshEnroller) writePeer(ctx context.Context, peer *netv1.MeshPeer, allowServerIndex bool) error {
+// The overwrite decision is made on the object READ BACK from the apiserver, which
+// is what makes this the last line rather than a duplicate of the caller's check:
+// the list the caller scanned can be stale or racing, while the object fetched here
+// is the one the PUT is about to replace. A worker write over a server's row and a
+// server write over a worker's row are both refused.
+func (e *meshEnroller) writePeer(ctx context.Context, peer *netv1.MeshPeer, by peerWrite) error {
 	err := e.client.Post().Resource(meshPeerResource).Body(peer).Do(ctx).Into(&netv1.MeshPeer{})
 	if err == nil {
-		// A CREATE cannot overwrite anything, and the join path is never assigned
-		// serverNodeIndex (lowestFreeNodeIndex starts at 1), so there is nothing
-		// for the guard to decide on this arm.
+		// A CREATE cannot overwrite anything, so there is nothing for the guard
+		// to decide on this arm.
 		return nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
@@ -680,26 +714,34 @@ func (e *meshEnroller) writePeer(ctx context.Context, peer *netv1.MeshPeer, allo
 	if err := e.client.Get().Resource(meshPeerResource).Name(peer.Name).Do(ctx).Into(&cur); err != nil {
 		return err
 	}
-	if !allowServerIndex {
-		if idx, ok := nodeIndexOf(e.clusterPod, cur.Spec.PodCIDR); ok && idx == serverNodeIndex {
-			return fmt.Errorf("%w: %q holds %s", ErrServerPeerOverwrite, cur.Name, cur.Spec.PodCIDR)
-		}
+	switch server := isServerPeer(e.clusterPod, cur); {
+	case by == workerPeerWrite && server:
+		return fmt.Errorf("%w: %q holds %s", ErrServerPeerOverwrite, cur.Name, cur.Spec.PodCIDR)
+	case by == serverPeerWrite && !server:
+		return fmt.Errorf("%w: %q holds a worker's MeshPeer at %s", bootstrap.ErrMeshClaimRefused, cur.Name, cur.Spec.PodCIDR)
 	}
 	peer.ResourceVersion = cur.ResourceVersion
 	// The peer is assembled fresh from the enroll, so an update would otherwise
-	// DROP every annotation the object carries. The caller's own keys win (the
-	// enroll id is the point of the write); everything else is carried forward,
-	// because this write is about the spec and has no opinion on metadata another
-	// writer put there.
-	for k, v := range cur.Annotations {
-		if _, set := peer.Annotations[k]; !set {
-			if peer.Annotations == nil {
-				peer.Annotations = map[string]string{}
+	// DROP every annotation and label the object carries. The caller's own keys
+	// win (the enroll id and the server label are the point of the write);
+	// everything else is carried forward, because this write is about the spec
+	// and has no opinion on metadata another writer put there.
+	peer.Annotations = mergeMissing(peer.Annotations, cur.Annotations)
+	peer.Labels = mergeMissing(peer.Labels, cur.Labels)
+	return e.client.Put().Resource(meshPeerResource).Name(peer.Name).Body(peer).Do(ctx).Into(&netv1.MeshPeer{})
+}
+
+// mergeMissing returns dst with every key of src that dst does not already set.
+func mergeMissing(dst, src map[string]string) map[string]string {
+	for k, v := range src {
+		if _, set := dst[k]; !set {
+			if dst == nil {
+				dst = map[string]string{}
 			}
-			peer.Annotations[k] = v
+			dst[k] = v
 		}
 	}
-	return e.client.Put().Resource(meshPeerResource).Name(peer.Name).Body(peer).Do(ctx).Into(&netv1.MeshPeer{})
+	return dst
 }
 
 // meshPeerResource is the MeshPeer CRD resource name within net.k3sm.io/v1.
@@ -768,7 +810,14 @@ type bootstrapServerDeps struct {
 	enroller      bootstrap.Enroller
 	serverAuth    bootstrap.ServerAuthorizer
 	bundle        bootstrap.BundleSource
-	apiServers    []string
+	// members drives the server-class etcd member routes (the etcd posture only).
+	members    bootstrap.MemberJoiner
+	apiServers []string
+	// apiServersFunc answers each join's apiserver list (it takes precedence
+	// over apiServers); serverMesh reserves a joining server's mesh range on the
+	// member route. Both are set by startJoinSupervisor.
+	apiServersFunc func(ctx context.Context) []string
+	serverMesh     bootstrap.ServerMeshReserver
 	// listen binds the supervisor's address. Nil is net.Listen — the shipped
 	// value; it is a field so a test can drive the rebind retry without racing a
 	// real port.
@@ -846,16 +895,19 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 	h := deps.hierarchy
 	meshIP := deps.meshIP
 	srv, err := bootstrap.NewServer(bootstrap.ServerConfig{
-		ClusterCA:     h.Cluster,
-		SigningCA:     h.Signing,
-		Tokens:        deps.tokens,
-		NodePasswords: deps.nodePasswords,
-		SelfNodeName:  deps.selfNodeName,
-		Enroller:      deps.enroller,
-		APIServers:    deps.apiServers,
-		ServerAuth:    deps.serverAuth,
-		Bundle:        deps.bundle,
-		Logger:        log,
+		ClusterCA:      h.Cluster,
+		SigningCA:      h.Signing,
+		Tokens:         deps.tokens,
+		NodePasswords:  deps.nodePasswords,
+		SelfNodeName:   deps.selfNodeName,
+		Enroller:       deps.enroller,
+		APIServers:     deps.apiServers,
+		APIServersFunc: deps.apiServersFunc,
+		ServerMesh:     deps.serverMesh,
+		ServerAuth:     deps.serverAuth,
+		Bundle:         deps.bundle,
+		Members:        deps.members,
+		Logger:         log,
 	})
 	if err != nil {
 		return fmt.Errorf("build bootstrap server: %w", err)

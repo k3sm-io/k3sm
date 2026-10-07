@@ -1014,11 +1014,16 @@ func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
 		seen[ci.image] = true
 		named = append(named, ci.image)
 	}
-	container := ""
+	// The named container is the one whose "container <name>:" token comes
+	// FIRST in the message, which is where runtimed's refusal puts its subject;
+	// declaration order must not decide it, or a message that also mentions a
+	// sibling later (wrapped text, a quoted reference) is pinned on whichever
+	// container the pod happens to declare first. The ':' ends the token, so
+	// "app" never matches "container app-2:".
+	container, at := "", -1
 	for _, ci := range cs {
-		if strings.Contains(message, "container "+ci.name+":") {
-			container = ci.name
-			break
+		if i := containerTokenIndex(message, ci.name); i >= 0 && (at < 0 || i < at) {
+			container, at = ci.name, i
 		}
 	}
 	switch {
@@ -1031,6 +1036,30 @@ func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
 	default:
 		return "", ""
 	}
+}
+
+// containerTokenIndex returns the byte offset of the first "container <name>:"
+// token in message that starts at a word boundary, or -1. The boundary keeps a
+// longer word ending in "container" (say "subcontainer app:") from matching.
+func containerTokenIndex(message, name string) int {
+	token := "container " + name + ":"
+	for from := 0; from <= len(message); {
+		i := strings.Index(message[from:], token)
+		if i < 0 {
+			return -1
+		}
+		i += from
+		if i == 0 || !isWordByte(message[i-1]) {
+			return i
+		}
+		from = i + 1
+	}
+	return -1
+}
+
+// isWordByte reports whether b is an ASCII letter, digit, '-' or '_'.
+func isWordByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '-' || b == '_'
 }
 
 // parkedRuntimeStatus synthesizes the runtime status of a parked pod: Pending,

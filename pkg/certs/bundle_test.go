@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,23 +43,27 @@ func parseFirstCert(t *testing.T, certPEM []byte) *x509.Certificate {
 	return cert
 }
 
-// newTestHierarchy builds an in-memory two-CA hierarchy (distinct cluster + signing
-// roots) for the bundle tests.
+// newTestHierarchy builds an in-memory four-CA hierarchy (distinct cluster, signing,
+// etcd server and etcd peer roots) for the bundle tests.
 func newTestHierarchy(t *testing.T) *Hierarchy {
 	t.Helper()
-	cluster, err := NewCA("k3sm-cluster-ca")
-	if err != nil {
-		t.Fatalf("cluster CA: %v", err)
+	mk := func(cn string) *CA {
+		ca, err := NewCA(cn)
+		if err != nil {
+			t.Fatalf("%s: %v", cn, err)
+		}
+		return ca
 	}
-	signing, err := NewCA("k3sm-signing-ca")
-	if err != nil {
-		t.Fatalf("signing CA: %v", err)
+	return &Hierarchy{
+		Cluster:    mk("k3sm-cluster-ca"),
+		Signing:    mk("k3sm-signing-ca"),
+		EtcdServer: mk(etcdServerCACN),
+		EtcdPeer:   mk(etcdPeerCACN),
 	}
-	return &Hierarchy{Cluster: cluster, Signing: signing}
 }
 
 // TestHierarchyMarshalUnmarshalRoundTrip proves the bundle plaintext round-trips: the
-// four CA PEMs Marshal emits Unmarshal back into a hierarchy with the IDENTICAL pins,
+// CA PEMs Marshal emits Unmarshal back into a hierarchy with the IDENTICAL pins,
 // and the reconstructed signing CA still issues a cert the original verifies (the keys,
 // not just the certs, survived). This is the plaintext the AES-256-GCM bundle seals.
 func TestHierarchyMarshalUnmarshalRoundTrip(t *testing.T) {
@@ -108,19 +111,25 @@ func TestHierarchyMarshalUnmarshalRoundTrip(t *testing.T) {
 	}
 }
 
-// TestWriteHierarchyThenEnsureLoads proves the HA import-then-load primitive: WriteHierarchy
-// lays down the four CA PEMs (keys 0600), and a SUBSEQUENT EnsureHierarchy LOADS them —
-// returning the IDENTICAL pins instead of minting fresh, divergent CAs. It also confirms
-// WriteHierarchy refuses to overwrite an existing CA (an import is a first-write).
-func TestWriteHierarchyThenEnsureLoads(t *testing.T) {
+// TestImportedHierarchyThenEnsureLoads proves the HA import-then-load primitive:
+// ReconcileImportedHierarchy into an empty work dir lays down the four CA keypairs
+// (keys 0600, the etcd pairs in a 0700 subdirectory), and a SUBSEQUENT EnsureHierarchy
+// / EnsureEtcdCAs LOADS them — returning the IDENTICAL pins instead of minting fresh,
+// divergent CAs. It also confirms an import never replaces an existing CA: a different
+// hierarchy is refused as ErrHierarchyDiverged.
+func TestImportedHierarchyThenEnsureLoads(t *testing.T) {
 	src := newTestHierarchy(t)
 	wd := t.TempDir()
 
-	if err := WriteHierarchy(wd, src); err != nil {
-		t.Fatalf("write hierarchy: %v", err)
+	if err := ReconcileImportedHierarchy(wd, src); err != nil {
+		t.Fatalf("import hierarchy: %v", err)
 	}
-	for _, f := range []string{clusterCAKey, signingCAKey} {
-		info, err := os.Stat(filepath.Join(PKIDir(wd), f))
+	ep := EtcdCertPaths(wd)
+	for _, f := range []string{
+		filepath.Join(PKIDir(wd), clusterCAKey), filepath.Join(PKIDir(wd), signingCAKey),
+		ep.ServerCAKey, ep.PeerCAKey,
+	} {
+		info, err := os.Stat(f)
 		if err != nil {
 			t.Fatalf("stat %s: %v", f, err)
 		}
@@ -128,32 +137,43 @@ func TestWriteHierarchyThenEnsureLoads(t *testing.T) {
 			t.Errorf("%s mode = %o, want 0600", f, info.Mode().Perm())
 		}
 	}
+	if info, err := os.Stat(ep.Dir); err != nil || info.Mode().Perm() != 0o700 {
+		t.Errorf("etcd PKI dir: stat err %v, mode %v, want 0700", err, info)
+	}
 
 	loaded, err := EnsureHierarchy(wd)
 	if err != nil {
 		t.Fatalf("ensure (load imported): %v", err)
 	}
 	if loaded.Cluster.PinHash() != src.Cluster.PinHash() || loaded.Signing.PinHash() != src.Signing.PinHash() {
-		t.Error("EnsureHierarchy after WriteHierarchy must LOAD the imported CAs (identical pins), not mint fresh ones")
+		t.Error("EnsureHierarchy after the import must LOAD the imported CAs (identical pins), not mint fresh ones")
+	}
+	eServer, ePeer, err := EnsureEtcdCAs(wd)
+	if err != nil {
+		t.Fatalf("ensure etcd CAs (load imported): %v", err)
+	}
+	if eServer.PinHash() != src.EtcdServer.PinHash() || ePeer.PinHash() != src.EtcdPeer.PinHash() {
+		t.Error("EnsureEtcdCAs after the import must LOAD the imported etcd CAs (identical pins)")
 	}
 
-	// A second write into a dir that already has the CAs is refused (no silent
-	// rebase), the refusal names the file and is machine-checkable as fs.ErrExist
-	// (the kernel's O_EXCL, not a stat-then-write), and the incumbent CA is left
+	// A second import of a different hierarchy into a dir that already has the CAs
+	// is refused (no silent rebase), the refusal names the CA and both pins and is
+	// machine-checkable as ErrHierarchyDiverged, and the incumbent CA is left
 	// byte-for-byte intact — a refusal that had already truncated the file would
 	// have destroyed the trust it exists to protect.
 	before, err := os.ReadFile(filepath.Join(PKIDir(wd), clusterCACert))
 	if err != nil {
 		t.Fatalf("read the incumbent CA: %v", err)
 	}
-	err = WriteHierarchy(wd, newTestHierarchy(t))
+	other := newTestHierarchy(t)
+	err = ReconcileImportedHierarchy(wd, other)
 	if err == nil {
-		t.Fatal("WriteHierarchy must refuse to overwrite an existing CA")
+		t.Fatal("an import must refuse to replace an existing CA")
 	}
-	if !errors.Is(err, fs.ErrExist) {
-		t.Errorf("refusal %v must wrap fs.ErrExist", err)
+	if !errors.Is(err, ErrHierarchyDiverged) {
+		t.Errorf("refusal %v must wrap ErrHierarchyDiverged", err)
 	}
-	for _, want := range []string{clusterCACert, "refusing to overwrite an existing CA"} {
+	for _, want := range []string{"cluster CA", src.Cluster.PinHash(), other.Cluster.PinHash()} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal %q must contain %q", err, want)
 		}

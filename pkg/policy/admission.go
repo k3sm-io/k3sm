@@ -763,8 +763,9 @@ func EnsureDarwinAdmission(ctx context.Context, cs kubernetes.Interface) error {
 	return nil
 }
 
-// foreignUserExpr is the CEL the foreign-user policy enforces on Pod CREATE: it
-// admits a pod ONLY if every uid/gid it declares equals allowedID — the single
+// foreignUserExpr is the CEL the foreign-user policy enforces on Pod CREATE and
+// on the pods/ephemeralcontainers UPDATE `kubectl debug` issues (whose object is
+// the whole Pod): it admits a pod ONLY if every uid/gid it declares equals allowedID — the single
 // identity every k3sm pod runs as (the _k3sm daemon; there is no per-pod uid/gid
 // isolation). It pins ALL the uid/gid-setting fields, so no container shape leaves
 // a gap:
@@ -815,6 +816,14 @@ func containersClause(list string, allowedID int64, optional bool) string {
 // refusal. Safe to call on every server start (create-or-update; an unchanged spec
 // is not rewritten).
 //
+// It matches Pod CREATE and the pods/ephemeralcontainers UPDATE. The second rule
+// keeps an ephemeral container from being the way around it: the node starts an
+// appended ephemeral container inside the pod's sandbox, so a user allowed to
+// update that subresource can run code there, and an unmatched subresource would
+// admit any runAsUser/runAsGroup on the new entry. The subresource writes only
+// spec.ephemeralContainers, and the pod it appends to was admitted at create, so
+// re-evaluating the whole expression judges exactly the new entries.
+//
 // Provisioned in every posture, not only under the netd-helper backend:
 // scoping it to that backend let a `--network none`/`direct` cluster admit a
 // foreign-uid pod with no policy object at all, which then wedged at spawn under
@@ -838,16 +847,32 @@ func EnsureNoForeignUserAdmission(ctx context.Context, cs kubernetes.Interface, 
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
 			FailurePolicy: &failFail,
 			MatchConstraints: &admissionregistrationv1.MatchResources{
-				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
-					RuleWithOperations: admissionregistrationv1.RuleWithOperations{
-						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
-						Rule: admissionregistrationv1.Rule{
-							APIGroups:   []string{""},
-							APIVersions: []string{"v1"},
-							Resources:   []string{"pods"},
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
+					{
+						RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+							Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+							Rule: admissionregistrationv1.Rule{
+								APIGroups:   []string{""},
+								APIVersions: []string{"v1"},
+								Resources:   []string{"pods"},
+							},
 						},
 					},
-				}},
+					{
+						// A rule on "pods" does not match a subresource. `kubectl
+						// debug` appends through pods/ephemeralcontainers, which
+						// reaches admission as UPDATE with the whole Pod as the
+						// object, so the same expression judges the new entry.
+						RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+							Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
+							Rule: admissionregistrationv1.Rule{
+								APIGroups:   []string{""},
+								APIVersions: []string{"v1"},
+								Resources:   []string{"pods/ephemeralcontainers"},
+							},
+						},
+					},
+				},
 			},
 			Validations: []admissionregistrationv1.Validation{{
 				Expression: foreignUserExpr(allowedUID),

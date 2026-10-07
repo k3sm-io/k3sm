@@ -68,6 +68,10 @@ type CrashLoopVerdict struct {
 	Posture CrashLoopPosture
 	Detail  string
 	Remedy  string
+	// LeaderLost is a wide-view note when the window holds leader-lease losses:
+	// an HA server's scheduler or controller-manager that exited on a lost lease,
+	// which restarts the daemon but is not a crash. Empty when there are none.
+	LeaderLost string
 }
 
 // restartingFloor is how many crashes inside the window make the row say so.
@@ -86,7 +90,20 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 		return CrashLoopVerdict{Posture: PostureUnreadable,
 			Detail: "crash-loop record unreadable: " + errText(readErr)}
 	}
-	last, _ := rec.Last()
+	lostNote := leaderLostNote(rec, now)
+	if rec.Tripped() {
+		if last, _ := rec.Last(); last.Origin == executor.CrashOriginLeaderLost {
+			n := rec.LeaderLost(*rec.TrippedAt)
+			return CrashLoopVerdict{
+				Posture: PostureParked,
+				Detail: fmt.Sprintf("crash-loop breaker tripped at %s on repeated leader-lease loss: %s lost its leader lease %d times within %s while its etcd, kine and apiserver children were running (lost etcd quorum, an overloaded apiserver or datastore, or a clock jump all do this); the daemon is parked and serves nothing, which also removes it as an etcd voter",
+					rec.TrippedAt.Format(time.RFC3339), last.Component, n, executor.CrashLoopWindow),
+				Remedy:     "find why the lease is not renewed: etcd quorum and apiserver health on every server (sudo k3sm status on each), then sudo k3sm server --clear-crashloop   # the parked daemon restarts itself",
+				LeaderLost: lostNote,
+			}
+		}
+	}
+	last := lastFailure(rec)
 	if rec.Tripped() {
 		n := rec.Recent(*rec.TrippedAt)
 		detail := fmt.Sprintf("crash-loop breaker tripped at %s: %s crashed %d times within %s; the daemon is parked and serves nothing",
@@ -102,9 +119,10 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 			remedy = last.Remedy + "; then sudo k3sm server --clear-crashloop   # the parked daemon restarts itself"
 		}
 		return CrashLoopVerdict{
-			Posture: PostureParked,
-			Detail:  detail,
-			Remedy:  remedy,
+			Posture:    PostureParked,
+			Detail:     detail,
+			Remedy:     remedy,
+			LeaderLost: lostNote,
 		}
 	}
 	if n := rec.Recent(now); n >= restartingFloor {
@@ -115,12 +133,59 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 				last.Component, n, executor.CrashLoopWindow, last.At.Format(time.RFC3339), executor.CrashLoopThreshold)
 		}
 		return CrashLoopVerdict{
-			Posture: PostureRestarting,
-			Detail:  detail,
-			Remedy:  "sudo tail -n 50 " + path + "   # the failures, with redacted log tails",
+			Posture:    PostureRestarting,
+			Detail:     detail,
+			Remedy:     "sudo tail -n 50 " + path + "   # the failures, with redacted log tails",
+			LeaderLost: lostNote,
 		}
 	}
-	return CrashLoopVerdict{Posture: PostureQuiet}
+	if n := rec.LeaderLost(now); n >= restartingFloor {
+		lost := lastLeaderLost(rec)
+		return CrashLoopVerdict{
+			Posture: PostureRestarting,
+			Detail: fmt.Sprintf("lost the leader lease %d times in the last %s (last: %s at %s) while the control plane kept running; each loss restarts the daemon and is not a crash; trips at %d",
+				n, executor.CrashLoopWindow, lost.Component, lost.At.Format(time.RFC3339), executor.LeaderLostThreshold),
+			Remedy:     "sudo k3sm status   # on every server: is etcd quorum or the apiserver flapping?",
+			LeaderLost: lostNote,
+		}
+	}
+	return CrashLoopVerdict{Posture: PostureQuiet, LeaderLost: lostNote}
+}
+
+// lastFailure is the record's most recent crash or bring-up failure — the entry
+// the crash-loop wording describes. A leader-lease loss is skipped: it is not
+// a failure, and naming it as "last crash" would be the misreport the
+// leader-lost origin exists to prevent.
+func lastFailure(rec executor.CrashRecord) executor.Crash {
+	for i := len(rec.Crashes) - 1; i >= 0; i-- {
+		if rec.Crashes[i].Origin != executor.CrashOriginLeaderLost {
+			return rec.Crashes[i]
+		}
+	}
+	return executor.Crash{}
+}
+
+// lastLeaderLost is the record's most recent leader-lease loss.
+func lastLeaderLost(rec executor.CrashRecord) executor.Crash {
+	for i := len(rec.Crashes) - 1; i >= 0; i-- {
+		if rec.Crashes[i].Origin == executor.CrashOriginLeaderLost {
+			return rec.Crashes[i]
+		}
+	}
+	return executor.Crash{}
+}
+
+// leaderLostNote is the wide-view line for the leader-lease losses in the
+// window, or "" when there are none. One loss is a fact worth showing — an HA
+// server that restarted on a quorum blip — without being a finding.
+func leaderLostNote(rec executor.CrashRecord, now time.Time) string {
+	n := rec.LeaderLost(now)
+	if n == 0 {
+		return ""
+	}
+	lost := lastLeaderLost(rec)
+	return fmt.Sprintf("%d in the last %s (last: %s at %s; not a crash)",
+		n, executor.CrashLoopWindow, lost.Component, lost.At.Format(time.RFC3339))
 }
 
 // neverCameUp reports whether the record's last entry was a BRING-UP failure
@@ -140,6 +205,9 @@ func neverCameUp(last executor.Crash) bool { return last.Origin == executor.Cras
 // is a WARN on a running row; unreadable is a wide-view note only, never a
 // severity, because "we could not look" is not a finding.
 func applyCrashLoop(row *Row, v CrashLoopVerdict) {
+	if v.LeaderLost != "" {
+		row.Wide["leader-lost"] = v.LeaderLost
+	}
 	switch v.Posture {
 	case PostureParked:
 		row.State, row.Severity = StateCrashLoop, SeverityFail

@@ -71,10 +71,12 @@ type fakeSystem struct {
 	calls []string
 	// podReap is the runtime reap store ReadPodReapRecords answers with, and
 	// podLeaders[pgid] the live leader start of each group (absent: no leader).
+	// podMembers[pgid][pid] the live start of each non-leader member, and
 	// podLingering are the groups still alive when the SIGTERM grace ends. The
 	// zero values describe a node with no recorded pods.
 	podReap      []runtimed.PodReapRecord
 	podLeaders   map[int]int64
+	podMembers   map[int]map[int]int64
 	podLingering map[int]bool
 	// handleSeq numbers the directories OpenDirNoFollow hands out, so a test can
 	// assert every read and removal went through the SAME held handle.
@@ -145,6 +147,9 @@ type fakeSystem struct {
 	// EVERY path present, so an unconfigured fake describes a healthy install and
 	// only a test that cares about the netd socket has to say so.
 	missingPaths map[string]bool
+	// verifyErrs[path] is the error VerifyShadowCopy reports for a made shadow
+	// copy; the zero value verifies every copy.
+	verifyErrs map[string]error
 	// links models the symlinks EnsureSymlink has laid down (link -> target), so a
 	// SECOND Install over the same fake describes the real "already correct"
 	// reinstall rather than a fresh lay-down.
@@ -255,6 +260,10 @@ type fakeSystem struct {
 	// describes a Mac with no prior agent state, and only a test that cares about
 	// the migration has to say anything at all.
 	owners map[string]OwnedEntry
+	// purge is the fake's model of everything `uninstall --purge` reads and
+	// changes beyond the plain uninstall: markers, path stats, the service user
+	// record, the processes it runs, launchd's loaded list. See purge_fake_test.go.
+	purge fakePurge
 }
 
 // delayedFile is one file of the fake root filesystem that CHANGES part-way
@@ -772,6 +781,19 @@ func (f *fakeSystem) AdHocSign(path string) error {
 	return nil
 }
 
+// VerifyShadowCopy records the check and answers verifyErrs[path], or a fixed
+// size so the logged total is predictable.
+func (f *fakeSystem) VerifyShadowCopy(path string) (int64, error) {
+	f.calls = append(f.calls, "VerifyShadowCopy:"+path)
+	if err := f.verifyErrs[path]; err != nil {
+		return 0, err
+	}
+	return fakeShadowCopySize, nil
+}
+
+// fakeShadowCopySize is the size the fake reports for every shadow copy.
+const fakeShadowCopySize = 1000
+
 // CDHash answers a cdhash derived from the path, so the manifest's contents are
 // predictable.
 func (f *fakeSystem) CDHash(path string) (string, error) {
@@ -1077,6 +1099,15 @@ func (f *fakeSystem) LaunchctlBootstrap(label string) error {
 // before the label has left the domain.
 func (f *fakeSystem) LaunchctlBootout(label string) error {
 	f.calls = append(f.calls, "Bootout:"+label)
+	if err := f.purge.bootoutErrs[label]; err != nil {
+		if f.purge.unloadDespiteErr[label] {
+			delete(f.loaded, label)
+		}
+		return err
+	}
+	if f.purge.stuck[label] {
+		return nil // launchd accepted the bootout and the job never leaves
+	}
 	if f.drain[label] > 0 {
 		return nil // still in the domain; ServicePID drains the counter
 	}
@@ -1556,6 +1587,11 @@ func (f *fakeSystem) ProcessGroupLeaderStart(pgid int) (int64, bool) {
 	return start, ok
 }
 
+func (f *fakeSystem) ProcessGroupMemberStart(pgid, pid int) (int64, bool) {
+	start, ok := f.podMembers[pgid][pid]
+	return start, ok
+}
+
 func (f *fakeSystem) SignalProcessGroup(pgid int, sig syscall.Signal) error {
 	name := map[syscall.Signal]string{syscall.SIGTERM: "TERM", syscall.SIGKILL: "KILL"}[sig]
 	f.calls = append(f.calls, fmt.Sprintf("Signal:%d:%s", pgid, name))
@@ -1631,7 +1667,7 @@ func TestInstallOrchestration(t *testing.T) {
 		t.Fatalf("Install: %v", err)
 	}
 
-	want := []string{
+	want := slices.Concat([]string{
 		// Before anything is written: is the OTHER role's daemon already on this
 		// Mac? A node is a control plane or a worker, never both.
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.agent.plist",
@@ -1663,8 +1699,8 @@ func TestInstallOrchestration(t *testing.T) {
 		"LockInstall:/Library/k3sm.lock",
 		// The installed server plist, read here for the SAME reason and to
 		// answer a different refusal: does the argument set this install would
-		// carry over name a --datastore-endpoint-file that is no longer there?
-		// (See requireDatastoreEndpointFile.) There is none here (a first
+		// carry over name a retired external-datastore flag? (See
+		// refuseRetiredDatastoreFlags.) There is none here (a first
 		// install), so the second source is read next: the root-owned record
 		// that survives an uninstall. Both reads are reused later, at the carry-
 		// over step below, rather than repeated.
@@ -1697,6 +1733,10 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureOwnedDir:/var/lib/k3sm/podreap:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/vmreap:271:20:0700",
 		"EnsureLogDir:/var/log/k3sm",
+		// The purge markers, once both trees exist: `uninstall --purge` refuses
+		// to delete either tree without the marker naming it.
+		"WriteDataRootMarker:/var/lib/k3sm",
+		"WriteDataRootMarker:/var/log/k3sm",
 		// The container-log tree, at the same moment and for the same reason: the
 		// node refuses to start without it, and only root can create it owned by
 		// the service user at a mode that keeps pod output off every local account.
@@ -1760,31 +1800,24 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-controller-manager",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kubectl",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kine",
+		"CopyToRootOwned:/Library/k3sm.staging/bin/etcd",
 		// The pinned helm the helm controller's Jobs run, a payload binary like
 		// kubectl.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + helmchart.HelmBinaryName,
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KineMarkerName,
+		// The etcd version marker, staged the same best-effort way.
+		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.EtcdMarkerName,
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KubeMarkerName,
-		// The shadow shell set, staged with the binary that uses it: each host
-		// shell cloned root:wheel 0755, re-signed ad hoc, its source's cdhash
-		// read, then the manifest (TestShadowSetIsMadeAtInstall owns the detail).
+		// The shadow binary set, staged with the binary that uses it: each copy
+		// in the shared list cloned root:wheel 0755, re-signed ad hoc, verified,
+		// its source's cdhash read, then the manifest (TestShadowSetIsMadeAtInstall
+		// owns the detail).
 		"EnsureRootDir:/Library/k3sm.staging/shadow",
-		"CloneToOwned:/bin/bash->/Library/k3sm.staging/shadow/bash:0:0:0755",
-		"AdHocSign:/Library/k3sm.staging/shadow/bash",
-		"CDHash:/bin/bash",
-		"CloneToOwned:/bin/zsh->/Library/k3sm.staging/shadow/zsh:0:0:0755",
-		"AdHocSign:/Library/k3sm.staging/shadow/zsh",
-		"CDHash:/bin/zsh",
-		"CloneToOwned:/bin/dash->/Library/k3sm.staging/shadow/dash:0:0:0755",
-		"AdHocSign:/Library/k3sm.staging/shadow/dash",
-		"CDHash:/bin/dash",
-		"CloneToOwned:/usr/bin/env->/Library/k3sm.staging/shadow/env:0:0:0755",
-		"AdHocSign:/Library/k3sm.staging/shadow/env",
-		"CDHash:/usr/bin/env",
+	}, shadowSetCalls("/Library/k3sm.staging/shadow", nil), []string{
 		"WriteRootOnlyFile:/Library/k3sm.staging/shadow/sources.json:0644",
 		// The installed server plist and args record were already read, in the
 		// preflight block before any of these copies ran (see above); the carry-
@@ -1855,7 +1888,7 @@ func TestInstallOrchestration(t *testing.T) {
 		// (TestInstallStagesTheRootAndPublishesItOnce).
 		"WriteUserKubeconfig:alice",
 		"UnlockInstall:/Library/k3sm.lock",
-	}
+	})
 	if len(f.calls) != len(want) {
 		t.Fatalf("call sequence = %v, want %v", f.calls, want)
 	}
@@ -1915,7 +1948,7 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			// The FIRST privileged call — the refuse-before-write probes ahead of
 			// it (the cross-role plist read, the launcher-directory trust read,
 			// the staged vmhost helper's entitlement, the carried server
-			// arguments' datastore-endpoint-file check and the free-space
+			// arguments' retired-flag check and the free-space
 			// estimate) are all reads, the install-wide lock creates no state
 			// the install owns, and install performs nothing else before the
 			// service user exists: the data root is its home, and every later
@@ -1973,10 +2006,10 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// The payload set lands at InstallDir/bin/<name> — one copy per
 	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims + vmhost.
 	head := len(fixedHead)
-	// +2 for the two version markers (kine, then the control-plane set), staged
-	// beside the binaries they describe.
-	if want := head + len(executor.PayloadBinaries()) + 2; len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the two markers)", len(dsts), want)
+	// +3 for the three version markers (kine, etcd, then the control-plane set),
+	// staged beside the binaries they describe.
+	if want := head + len(executor.PayloadBinaries()) + 3; len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the three markers)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], stage+"/bin/"+name; got != want {
@@ -2057,6 +2090,10 @@ func TestUninstallIdempotent(t *testing.T) {
 		// preserved mesh key dir that goes: a role change goes through
 		// uninstall, and the next role's netd must not restore this /24.
 		"RemoveAll:/var/lib/k3sm/keys/node-pod-cidr",
+		// A joining HA server's staged server-class join token, removed in the
+		// same position as the admin token below and for the same reason; on a
+		// server that never joined, removing an absent file is a no-op.
+		"RemoveAll:/var/lib/k3sm/server/join-token",
 		// The staged admin token, removed with the daemons rather than preserved
 		// with the rest of the data root: it is a system:masters credential with
 		// no use on a Mac that is no longer a k3sm server, and it goes AFTER the
@@ -2644,6 +2681,14 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		// key dir it sits in must never appear in the removed set.
 		if toSet(recorded(installCalls, "Bootstrap:"))[NetdLabel] {
 			created[netdsvc.NodeIdentityPath(MeshKeyDir)] = true
+		}
+		// A joining server's staged join token is written through the same
+		// service-user seam by a --server-join install, which this single-node
+		// install is not. Uninstall runs from a Config that cannot say whether
+		// an earlier install joined, so it removes that one path on every
+		// server; it is admitted by that exact path, and only on the server role.
+		if dc.Role == RoleServer {
+			created[dc.serverJoinTokenPath()] = true
 		}
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
 			if !created[p] {

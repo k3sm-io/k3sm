@@ -14,6 +14,11 @@
 : "${K3SM_WORKDIR:=/tmp/k3sm-cluster}"
 : "${APISERVER_PORT:=6444}"           # NOT 6443 — Docker Desktop's k8s squats there
 : "${KINE_PORT:=2379}"
+# The scheduler's and controller-manager's secure ports (executor.DefaultSchedulerPort /
+# DefaultControllerManagerPort). Like the two above they are overridable BEFORE sourcing,
+# so a gate can boot its server beside an installed node that holds the defaults.
+: "${SCHEDULER_PORT:=10259}"
+: "${CONTROLLER_MANAGER_PORT:=10257}"
 
 BIN="$K3SM_WORKDIR/bin"
 # Pod-support artifacts staged for the runtimed posture (see server_up). It MUST sit
@@ -238,7 +243,7 @@ cluster_reset() {
 	for port in "$KINE_PORT" "$APISERVER_PORT"; do
 		reap_port "$port" fatal || return 1
 	done
-	for port in 10250 10259 10257; do
+	for port in 10250 "$SCHEDULER_PORT" "$CONTROLLER_MANAGER_PORT"; do
 		reap_port "$port" warn || return 1
 	done
 	# $SERVER_WORKDIR defaults INSIDE $K3SM_WORKDIR, so the outer sweep must keep
@@ -327,7 +332,7 @@ cluster_down() {
 	# attribute is a fact to report, not a teardown failure. cluster_down runs from
 	# an EXIT trap under `set -e` and the gate's verdict is already decided by then,
 	# so a non-zero return here could only corrupt an already-correct verdict.
-	for port in 10250 10259 10257 "$APISERVER_PORT" "$KINE_PORT"; do
+	for port in 10250 "$SCHEDULER_PORT" "$CONTROLLER_MANAGER_PORT" "$APISERVER_PORT" "$KINE_PORT"; do
 		reap_port "$port" warn || true
 	done
 	# Remove the staged pod-support artifacts, through the same assertion the
@@ -426,8 +431,8 @@ EOF
 		--secure-port="$APISERVER_PORT" --cert-dir="$K3SM_WORKDIR/apiserver-certs" --allow-privileged=true > apiserver.log 2>&1 &
 	  until [ "$(kc get --raw /healthz 2>/dev/null)" = "ok" ]; do sleep 0.5; done
 	  # 6. scheduler + controller-manager
-	  nohup "$BIN/kube-scheduler" --kubeconfig="$KUBECONFIG" --authentication-kubeconfig="$KUBECONFIG" --authorization-kubeconfig="$KUBECONFIG" --leader-elect=false --bind-address=127.0.0.1 --secure-port=10259 > scheduler.log 2>&1 &
-	  nohup "$BIN/kube-controller-manager" --kubeconfig="$KUBECONFIG" --authentication-kubeconfig="$KUBECONFIG" --authorization-kubeconfig="$KUBECONFIG" --leader-elect=false --service-account-private-key-file="$K3SM_WORKDIR/sa.key" --root-ca-file="$K3SM_WORKDIR/apiserver-certs/apiserver.crt" --bind-address=127.0.0.1 --secure-port=10257 --controllers=serviceaccount,serviceaccount-token,namespace,garbagecollector > cm.log 2>&1 &
+	  nohup "$BIN/kube-scheduler" --kubeconfig="$KUBECONFIG" --authentication-kubeconfig="$KUBECONFIG" --authorization-kubeconfig="$KUBECONFIG" --leader-elect=false --bind-address=127.0.0.1 --secure-port="$SCHEDULER_PORT" > scheduler.log 2>&1 &
+	  nohup "$BIN/kube-controller-manager" --kubeconfig="$KUBECONFIG" --authentication-kubeconfig="$KUBECONFIG" --authorization-kubeconfig="$KUBECONFIG" --leader-elect=false --service-account-private-key-file="$K3SM_WORKDIR/sa.key" --root-ca-file="$K3SM_WORKDIR/apiserver-certs/apiserver.crt" --bind-address=127.0.0.1 --secure-port="$CONTROLLER_MANAGER_PORT" --controllers=serviceaccount,serviceaccount-token,namespace,garbagecollector > cm.log 2>&1 &
 	)
 }
 
@@ -548,8 +553,10 @@ server_up() {
 		chmod 644 "$STAGE_DIR"/*.dylib 2>/dev/null || true
 		K3SM_CMD=("$STAGE_DIR/k3sm")
 	fi
-	# The two optional flags are appended only when asked for, so the argv of every
-	# existing gate is byte-identical to what it was before agent_up existed.
+	# The two optional flags are appended only when asked for. The four control-plane
+	# ports are always passed, from the variables at the top of this file; their
+	# defaults are the server's own, so a gate that overrides none of them boots on
+	# exactly the ports it did before they were passed.
 	local extra=()
 	[ -n "$mesh_ip" ] && extra+=(--mesh-ip "$mesh_ip")
 	[ -n "$kubelet_port" ] && extra+=(--kubelet-port "$kubelet_port")
@@ -558,6 +565,8 @@ server_up() {
 		--work-dir "$SERVER_WORKDIR" --node-name "$node_name" --node-ip 127.0.0.1 \
 		--runtime "$runtime" --pod-root "$K3SM_WORKDIR/pods" --network "$network" \
 		--pod-logs-dir "$K3SM_WORKDIR/pods/log/pods" \
+		--api-port "$APISERVER_PORT" --kine-port "$KINE_PORT" \
+		--scheduler-port "$SCHEDULER_PORT" --controller-manager-port "$CONTROLLER_MANAGER_PORT" \
 		"${extra[@]+"${extra[@]}"}" \
 		> "$K3SM_WORKDIR/server.log" 2>&1 &
 	SERVER_PID=$!

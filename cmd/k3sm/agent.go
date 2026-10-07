@@ -23,7 +23,6 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
-	"log"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -196,7 +195,7 @@ func runAgent(args []string) error {
 		return err
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -465,8 +464,8 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	// The mesh teardown handle. It is declared — and its deferred run registered —
 	// BEFORE anything is brought up, so it covers a half-built bring-up too, and it
 	// stays a no-op under `--network none`. Running it here rather than leaving it
-	// to the watcher goroutine is what guarantees the per-peer routes and the
-	// MSS-clamp anchor are gone before this process exits.
+	// to the watcher goroutine is what guarantees the per-peer routes are gone
+	// before this process exits.
 	meshDown := meshTeardown(noMeshTeardown)
 	defer func() { meshTeardownOnExit(ctx, meshDown, logger) }()
 	if mode.DataPath() {
@@ -534,7 +533,7 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	defer healthyReset.Stop()
 
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
-	log.Printf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName)
+	logger.Info(fmt.Sprintf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName))
 	return startNode(ctx, agentNodeOptions(opts, res, kubeconfigPath, mode, datapath))
 }
 
@@ -622,7 +621,8 @@ const joinRateLimitFallbackWait = 5 * time.Second
 type joinFunc func(context.Context, bootstrap.JoinOptions) (*bootstrap.JoinResult, error)
 
 // awaitJoin runs the join, re-trying within joinRateLimitGrace for as long as
-// the control plane answers that this token is rate-limited, and returning
+// the control plane answers that this token is rate-limited or that it could not
+// decide the join right now (a 503: its datastore did not answer), and returning
 // every other outcome — success or failure — on the spot. A rejected token, a
 // refused CSR and an unreachable server all come straight back, because nothing
 // about waiting changes any of them.
@@ -637,7 +637,18 @@ func awaitJoin(ctx context.Context, join joinFunc, opts bootstrap.JoinOptions, l
 	for attempt := 1; ; attempt++ {
 		res, err := join(ctx, opts)
 		var limited *bootstrap.JoinRateLimitedError
-		if !errors.As(err, &limited) {
+		var unavailable *bootstrap.JoinUnavailableError
+		var wait time.Duration
+		switch {
+		case errors.As(err, &limited):
+			wait = limited.RetryAfter
+		case errors.As(err, &unavailable):
+			// The control plane reached no verdict (its datastore did not answer
+			// the node-password check). Waited out under the same grace: it is
+			// not a refusal of this node, and failing the start on it would fail
+			// an install over a fault that clears in seconds.
+			wait = unavailable.RetryAfter
+		default:
 			return res, err
 		}
 		// A daemon asked to stop stops, and that is decided BEFORE the grace: a
@@ -646,16 +657,24 @@ func awaitJoin(ctx context.Context, join joinFunc, opts bootstrap.JoinOptions, l
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		wait := limited.RetryAfter
 		if wait <= 0 {
 			wait = joinRateLimitFallbackWait
 		}
 		if left := time.Until(deadline); left <= 0 || wait > left {
+			if unavailable != nil {
+				return nil, fmt.Errorf("the control plane still could not decide this join after %s (attempts: %d); it last asked this node to wait %s. Its datastore is not answering, so check the server's log; the next start retries: %w",
+					joinRateLimitGrace, attempt, wait, err)
+			}
 			return nil, fmt.Errorf("the control plane is still rate-limiting joins for this token after %s (attempts: %d); it last asked this node to wait %s. It bounds how fast ONE token may join, so onboarding several Macs at once goes faster with a token per Mac (`sudo k3sm token create` on the server): %w",
 				joinRateLimitGrace, attempt, wait, err)
 		}
-		logger.Warn("the control plane is rate-limiting joins for this token; waiting and retrying inside this start",
-			"attempt", attempt, "wait", wait, "err", err)
+		if unavailable != nil {
+			logger.Warn("the control plane could not decide this join right now; waiting and retrying inside this start",
+				"attempt", attempt, "wait", wait, "err", err)
+		} else {
+			logger.Warn("the control plane is rate-limiting joins for this token; waiting and retrying inside this start",
+				"attempt", attempt, "wait", wait, "err", err)
+		}
 		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -727,14 +746,16 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		podRoot:    opts.podRoot,
 		logs:       opts.logs,
 		nodeIP:     agentInternalIP(opts.nodeIP, res),
-		runtime:    opts.rtName,
-		dnsShim:    opts.dnsShim,
-		pathShim:   opts.pathShim,
-		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,    // SAME cluster domain the per-node resolver serves → in-pod shim search list
-		podCIDR:    res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source)
-		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
-		serveTLS:   true,
+		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
+		serviceCIDR: install.DefaultServiceCIDR,
+		runtime:     opts.rtName,
+		dnsShim:     opts.dnsShim,
+		pathShim:    opts.pathShim,
+		dnsVIP:      opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
+		domain:      opts.domain,    // SAME cluster domain the per-node resolver serves → in-pod shim search list
+		podCIDR:     res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source)
+		netMode:     mode,           // the resolved --network backend the podnet alias plumbing follows
+		serveTLS:    true,
 
 		// The cluster's client-identity (signing) CA, received in the join
 		// response — the anchor this worker's :10250 verifies the apiserver's client
@@ -916,7 +937,8 @@ type meshWatch interface {
 // the selected backend's Down releases:
 //
 //   - direct mode (WGDevice): the per-peer kernel routes are deleted, the
-//     utun-scoped MSS-clamp pf anchor is flushed, the mesh-egress alias is removed
+//     io.k3sm.mesh pf anchor an older release loaded is flushed (nothing loads it
+//     now), the mesh-egress alias is removed
 //     and the wireguard utun is closed;
 //   - helper mode (netdDevice): a RemoveMesh to the root netd daemon, which owns
 //     the datapath. The device is rebuilt on the next start — bringUpMesh's Start
@@ -1006,7 +1028,7 @@ var activeMeshSeam = productionMeshSeam
 // It RETURNS a teardown handle, and that return is the point. Nothing used to hold
 // the mesh, so the only Close was the last act of the watcher goroutine — which
 // runs after ctx is already cancelled and therefore races process death: on a
-// SIGTERM the process could exit with the per-peer routes and the pf anchor still
+// SIGTERM the process could exit with the per-peer routes still
 // installed. A caller now defers this handle, so the teardown completes BEFORE it
 // returns; the watcher's Close remains as the fallback for a path that never
 // reaches the deferred call.
@@ -1379,9 +1401,19 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 		// worker with no vm backend keeps the byte-identical plain table.
 		VMBackend:   vmCapable,
 		VMNetSubnet: netserve.DefaultVMNetSubnet,
-		NetdSocket:  mode.Socket,
-		Disabled:    !mode.DataPath(),
-		Logger:      logger,
+		// The worker's datapath runs under the node kubeconfig
+		// (system:node:<name>). The policy watcher's cluster-wide
+		// NetworkPolicies and Namespaces reads are granted to neither the Node
+		// authorizer nor system:nodes, so the worker runs no policy watcher
+		// (its table could never sync). Granting those reads is an RBAC
+		// decision, not made here. PodScopeNode stays set so that, once a
+		// worker does enforce, its pods list is the one the Node authorizer
+		// allows: only the pods bound to this node.
+		EnforceNetworkPolicy: false,
+		PodScopeNode:         opts.nodeName,
+		NetdSocket:           mode.Socket,
+		Disabled:             !mode.DataPath(),
+		Logger:               logger,
 	}
 }
 

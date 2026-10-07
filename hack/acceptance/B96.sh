@@ -32,6 +32,9 @@
 # chart the controller has not finalized within 120 s of exit has its finalizer,
 # ClusterRoleBinding and ServiceAccount removed by hand.
 #
+# Needs K3SM_LAB=1. With K3SM_LAB unset the gate reports LAB-PENDING and exits
+# 3, which is not a pass and never 0.
+#
 # Requires: kubectl, python3, sudo (to write the root-owned manifest directory).
 set -euo pipefail
 
@@ -47,6 +50,10 @@ finish() {
 	echo "=========== B96 GREEN ==========="
 }
 
+if [ "${K3SM_LAB:-}" != "1" ]; then
+	echo "B96 gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
+	exit 3
+fi
 if [ -z "${KUBECONFIG:-}" ]; then
 	echo "KUBECONFIG must point at the RUNNING cluster this installed server belongs to (this gate boots nothing itself)" >&2
 	exit 1

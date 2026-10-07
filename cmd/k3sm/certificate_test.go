@@ -23,6 +23,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -40,6 +41,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -525,7 +527,7 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 					Health:        health,
 					HealthTimeout: 30 * time.Millisecond,
 					HealthPoll:    5 * time.Millisecond,
-				})
+				}, "")
 				outputs = append(outputs, buf.String())
 				if lastErr != nil {
 					break
@@ -664,7 +666,7 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 				Health:        health,
 				HealthTimeout: 30 * time.Millisecond,
 				HealthPoll:    5 * time.Millisecond,
-			})
+			}, "")
 			if !errors.Is(err, executor.ErrCAPinChanged) {
 				t.Fatalf("certificateRotate error = %v, want errors.Is executor.ErrCAPinChanged", err)
 			}
@@ -981,4 +983,115 @@ func writeCertFile(t *testing.T, path, cn string) {
 	if err := os.WriteFile(path, ca.CertPEM, 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+// TestCertificateRotateProbesTheBoundAPIServerAddress pins WHERE the post-restart
+// health probe dials. A mesh server (`k3sm server --mesh-ip`) binds the apiserver to
+// its mesh IP only, so a probe hard-coded to 127.0.0.1 never sees the control plane
+// come back there and reports a completed rotation as failed (observed on a two-Mac
+// rig: the daemon restarted and served on https://100.64.0.1:6444 while the verb
+// probed refused loopback). The address follows the installed server arguments —
+// the plist launchd runs, else the server-arguments record — and falls back to
+// loopback only for a single-node server. --apiserver-port is the port either way.
+func TestCertificateRotateProbesTheBoundAPIServerAddress(t *testing.T) {
+	t.Parallel()
+
+	meshPlist := install.ServerPlist(install.Config{
+		AdminToken:      "k3sm-fixed",
+		ExtraServerArgs: []string{"--mesh-ip", "100.64.0.1", "--registry-port", "6450"},
+	})
+	stockPlist := install.ServerPlist(install.Config{AdminToken: "k3sm-fixed"})
+	record := func(args ...string) []byte {
+		raw, err := json.Marshal(dataroot.ServerArgsRecord{
+			Version: dataroot.ServerArgsRecordVersion, Args: args,
+			CreatedBy: "k3sm test", CreatedAt: time.Unix(0, 0).UTC(),
+		})
+		if err != nil {
+			t.Fatalf("marshal record: %v", err)
+		}
+		return raw
+	}
+
+	for _, tc := range []struct {
+		name    string
+		plist   []byte // nil = no installed plist
+		record  []byte // nil = no record
+		port    int
+		want    string
+		wantErr string
+	}{
+		{name: "mesh server (plist carries --mesh-ip) probes the mesh IP", plist: meshPlist, port: 6444, want: "100.64.0.1:6444"},
+		{name: "mesh server with no plist (record carries --mesh-ip) probes the mesh IP", record: record("--mesh-ip=100.64.0.1"), port: 6444, want: "100.64.0.1:6444"},
+		{name: "single-node server (stock plist) probes loopback", plist: stockPlist, port: 6443, want: "127.0.0.1:6443"},
+		{name: "the installed plist wins over a stale record", plist: stockPlist, record: record("--mesh-ip", "100.64.0.9"), port: 6443, want: "127.0.0.1:6443"},
+		{name: "nothing installed probes loopback", port: 6443, want: "127.0.0.1:6443"},
+		{name: "--apiserver-port is honoured on a mesh server", plist: meshPlist, port: 7443, want: "100.64.0.1:7443"},
+		{name: "an unparsable plist refuses before the restart", plist: []byte("not a plist"), port: 6443, wantErr: "resolve the address the apiserver binds"},
+		{name: "a mesh-ip that is not an IP refuses before the restart", record: record("--mesh-ip", "mesh0"), port: 6443, wantErr: "not an IP address"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			plistPath := filepath.Join(dir, install.ServerLabel+".plist")
+			recordPath := filepath.Join(dir, "io.k3sm.server-args.json")
+			if tc.plist != nil {
+				if err := os.WriteFile(plistPath, tc.plist, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.record != nil {
+				if err := os.WriteFile(recordPath, tc.record, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := apiServerProbeAddr(os.ReadFile, plistPath, recordPath, tc.port)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("apiServerProbeAddr = %q, %v; want an error containing %q", got, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("apiServerProbeAddr: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("apiServerProbeAddr = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// A probe that never answers is bounded: the rotation exits non-zero once the
+	// stated deadline passes, naming the address it probed and how long it waited.
+	// The dialled address is a just-closed loopback port, so the refusal is real and
+	// hermetic (no mesh address is dialled from a unit test).
+	t.Run("timeout names the probed address and the wait", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		seedHierarchy(t, dir)
+		chain, pool := servingChain(t, "kube-apiserver", false)
+		addr, stop := serveTLS(t, http.StatusOK, chain)
+		stop()
+		var buf bytes.Buffer
+		err := certificateRotate(context.Background(), &buf, executor.RotateOptions{
+			WorkDir:   dir,
+			Restart:   true,
+			Restarter: &fakeRestarter{pid: 100},
+			Health: func(ctx context.Context) error {
+				return probeAPIServerServing(ctx, addr, pool, "the-anchor")
+			},
+			HealthTimeout: 40 * time.Millisecond,
+			HealthPoll:    5 * time.Millisecond,
+		}, addr)
+		if err == nil {
+			t.Fatal("certificateRotate: want a non-zero error when the probe never answers, got nil")
+		}
+		for _, want := range []string{"https://" + addr + "/healthz", "within 40ms"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("certificateRotate error %q does not name %q", err, want)
+			}
+		}
+		if strings.Contains(buf.String(), rotateSuccessSentence) {
+			t.Fatalf("a timed-out rotation printed the success sentence:\n%s", buf.String())
+		}
+	})
 }

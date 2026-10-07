@@ -203,13 +203,19 @@ func TestAgentMeshTeardownReleasesUtun(t *testing.T) {
 		// body is agentStart — runAgent is the thin wrapper that records a start
 		// failure on the crash-loop record — so that is the function that must
 		// hold the handle.
+		//
+		// runServer's row reads its OWN body (the trace's decl), never the expanded
+		// trace: a defer only orders runServer's teardown when runServer registers it.
 		for _, tc := range []struct {
-			file, fn, why string
+			fn, why string
+			body    func(*testing.T) *ast.BlockStmt
 		}{
-			{"agent.go", "agentStart", "a worker's mesh teardown must run after startNode returns, before the process exits"},
-			{"server.go", "runServer", "the control-plane node's mesh must come down on the way out, not be left to a goroutine racing process death"},
+			{"agentStart", "a worker's mesh teardown must run after startNode returns, before the process exits",
+				func(t *testing.T) *ast.BlockStmt { return funcBodyInFile(t, "agent.go", "agentStart") }},
+			{"runServer", "the control-plane node's mesh must come down on the way out, not be left to a goroutine racing process death",
+				func(t *testing.T) *ast.BlockStmt { return runServerTrace(t).decl.Body }},
 		} {
-			body := funcBodyInFile(t, tc.file, tc.fn)
+			body := tc.body(t)
 			if deferPos(body, "meshDown") == token.NoPos {
 				t.Errorf("%s does not defer its mesh teardown handle (meshDown) — %s", tc.fn, tc.why)
 			}
@@ -222,8 +228,10 @@ func TestAgentMeshTeardownReleasesUtun(t *testing.T) {
 		// posture the apiserver binds and advertises the mesh IP, so releasing the
 		// utun and its alias first would pull the interface out from under a control
 		// plane still draining its components. The agent has no such constraint —
-		// its mesh teardown is simply last, after startNode returns.
-		body := funcBodyInFile(t, "server.go", "runServer")
+		// its mesh teardown is simply last, after startNode returns. Both defers
+		// are read off runServer's OWN body: registration order is only LIFO
+		// order within one function.
+		body := runServerTrace(t).decl.Body
 		mesh := deferPos(body, "meshDown")
 		// The control-plane stop's defer WAITS for a stop the node already began
 		// (cpStop.finish, exitoverlap.go) instead of calling exec.Stop itself — the

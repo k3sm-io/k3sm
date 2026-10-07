@@ -1,0 +1,57 @@
+# Connections the k3sm process opens or accepts WITHOUT the TCP segment clamp
+# (k3sm.io/darwin-net/pkg/tcpseg), read by TestPodNetworkDialsGoThroughTheSegmentClamp.
+# Format:
+#
+#   <module-relative path> <enclosing declaration> <construct> # <why>
+#
+# The declaration is Func, Recv.Method, or a struct type name. An entry that
+# matches nothing fails the gate: when a site is wrapped or deleted, delete its
+# line. An entry belongs here only when the connection can never ride an lo0
+# alias that might re-route onto the mesh: 127/8 (permanently on lo0), a unix
+# socket, a bind probe that never accepts, or a dial negotiated on the physical
+# interface toward a LAN or internet peer.
+#
+# Residual, deliberately not an entry: kube-apiserver, the controller-manager and
+# the scheduler run as child processes, so their outbound transports (admission
+# webhooks, API aggregation toward a Service VIP) cannot be reached by an
+# in-process clamp.
+
+# 127.0.0.1 only.
+pkg/executor/supervised.go tcpReady net.Dialer{} # readiness dial of a child component on 127.0.0.1
+pkg/registrysvc/service.go Service.await net.Dialer{} # readiness dial of the registry child; validateBind admits loopback only
+pkg/registrysvc/relay.go newRelay net.Dialer{} # relay's upstream is the registry's 127.0.0.1 listener; the relay listener itself is clamped
+cmd/k3sm/certificate.go probeAPIServerServing http.Transport{} # healthz probe of the local apiserver at 127.0.0.1
+
+# Bind probes: the listener is closed at once and never accepts.
+pkg/executor/portguard.go preflightDatastorePort net.Listen # 127.0.0.1 bind probe, closed immediately
+pkg/executor/portguard.go preflightComponentPort net.Listen # 127.0.0.1 bind probe, closed immediately
+pkg/executor/snapshot.go portHeld net.Listen # 127.0.0.1 bind probe, closed immediately
+pkg/dev/system.go realSystem.PortFree net.Listen # 127.0.0.1 bind probe, closed immediately
+pkg/registrysvc/service.go preflightPort net.Listen # loopback-only bind probe, closed immediately
+
+# Unix sockets (the dialer is built here, the network is "unix" at the call).
+pkg/hostnet/hostnet.go Mode.Probe net.Dialer{} # dials the netd helper's unix socket
+cmd/k3sm/image.go dialRuntimed var net.Dialer # dials the runtimed unix socket
+
+# The DNS VIP's TCP listener is wrapped by its one consumer.
+pkg/netserve/resolver.go directDNSBinder.listenTCP var net.ListenConfig # Server.bindDNSVIPOnce wraps every binder's TCP listener with tcpseg.WrapListener
+
+# Join, bootstrap and install: dials to the --server underlay address, made before
+# the node has a mesh and negotiated on the physical interface.
+pkg/install/install_darwin.go darwinSystem.DialJoinServer net.Dialer{} # install-time reachability check of the join server over the LAN
+pkg/install/install_darwin.go darwinSystem.FetchJoinCA http.Transport{} # install-time fetch of the join server's public CA over the LAN
+pkg/install/install_darwin.go darwinSystem.FetchJoinCA net.Dialer{} # install-time fetch of the join server's public CA over the LAN
+pkg/bootstrap/join.go PinnedClient http.Transport{} # join client toward the --server underlay; pinnedJoinClient replaces its dialer
+pkg/bootstrap/meshendpoint.go NodeIdentityClient http.Transport{} # mesh-endpoint refresh toward the --server underlay host
+cmd/k3sm/agentmesh.go localAddrDialer field net.Dialer # records the underlay source address of the join dial
+cmd/k3sm/agentmesh.go pinnedJoinClient net.Dialer{} # join dial toward the --server underlay address
+cmd/k3sm/agent.go agentResumeFromCredential net.Dialer{} # route probe toward the --server underlay address
+cmd/k3sm/meshrefresh.go newWorkerEndpointRefresher net.Dialer{} # route probe toward the --server underlay address
+
+# Internet downloads, digest-verified, over the default route.
+pkg/executor/helm.go downloadHashed http.DefaultClient # helm release tarball download
+pkg/builder/buildxhost.go downloadTo http.DefaultClient # buildx release asset download
+
+# Embedded etcd: its client and metrics listeners are loopback-only by argv (etcdArgs), never a pod address.
+pkg/executor/etcdsupervise.go tcpDial net.Dialer{} # readiness probe of the etcd child's 127.0.0.1 client port
+pkg/status/etcd.go httpGetLoopback http.DefaultClient # etcd metrics/health read on 127.0.0.1

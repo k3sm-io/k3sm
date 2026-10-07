@@ -18,7 +18,7 @@ limitations under the License.
 
 // M2 synthetic conformance criteria (DESIGN §9 M2). Each TestM2_<Criterion> is a
 // fails-before/passes-
-// after unit named so a red test points to exactly one stockkitty feature class;
+// after unit named so a red test points to exactly one reference-workload feature class;
 // the integration gate hack/acceptance/m2.sh enumerates this set and turns a
 // missing OR skipped required criterion RED (the non-vacuous guard). These assert
 // real k8s transition semantics (mount mode, downward-API == status.podIP,
@@ -44,7 +44,7 @@ import (
 )
 
 // TestM2_ConfigMapMount proves a ConfigMap is mounted as a file with its content
-// intact — the nats-server-config (nats.conf) stockkitty feature. A native workload
+// intact — the nats-server-config (nats.conf) reference-workload feature. A native workload
 // helper (conftool) reads the mount at its absolute container path; the path-rebase
 // DYLD shim resolves it to the materialized copy under the pod data volume (a
 // compiled helper, NOT /bin/sh — a SIP platform binary cannot load the shim).
@@ -75,7 +75,7 @@ func TestM2_ConfigMapMount(t *testing.T) {
 }
 
 // TestM2_SecretMount proves a Secret is mounted read-only with mode 0400 — the
-// git-ssh-key stockkitty feature. The pod asserts the exact octal mode and content.
+// git-ssh-key reference-workload feature. The pod asserts the exact octal mode and content.
 func TestM2_SecretMount(t *testing.T) {
 	c := Up(t)
 	ctx := context.Background()
@@ -104,7 +104,7 @@ func TestM2_SecretMount(t *testing.T) {
 }
 
 // TestM2_EmptyDir proves an emptyDir scratch volume is writable and readable — the
-// /dev/shm (snapshot gRPC) stockkitty feature.
+// /dev/shm (snapshot gRPC) reference-workload feature.
 func TestM2_EmptyDir(t *testing.T) {
 	c := Up(t)
 	pod := nativePod("m2-emptydir",
@@ -147,7 +147,7 @@ func TestM2_DownwardAPIEnv(t *testing.T) {
 }
 
 // TestM2_EnvFrom proves envFrom (configMapRef + secretRef) populates the container
-// environment — the bulk-config stockkitty pattern.
+// environment — the bulk-config reference-workload pattern.
 func TestM2_EnvFrom(t *testing.T) {
 	c := Up(t)
 	ctx := context.Background()
@@ -419,10 +419,10 @@ func TestM2_DenyUsers(t *testing.T) {
 // criterion moved to the M10 conformance set once the pull path landed (resolver.go +
 // runtimed/pkg/image/pull.go, M2.6). This stub is retained only as the M2 checklist-of-
 // record reference (hack/acceptance/conformance/README.md, hack/acceptance/m2.sh);
-// the single owning criterion lives in e2e/m10_test.go.
+// the single owning criterion lives in e2e/m10_pullsecret_test.go.
 func TestM2_ImagePullSecrets(t *testing.T) {
 	Up(t)
-	t.Skip("superseded by TestM10_ImagePullSecret — B80 (imagePullSecrets pull-auth criterion; see e2e/m10_test.go)")
+	t.Skip("superseded by TestM10_ImagePullSecret — B80 (imagePullSecrets pull-auth criterion; see e2e/m10_pullsecret_test.go)")
 }
 
 // TestM2_DaemonSet is a DEFERRED criterion: DaemonSet scheduling is not yet a k3sm

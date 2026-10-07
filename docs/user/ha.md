@@ -2,34 +2,87 @@
 
 Running the k3sm control plane so a single Mac is not a single point of failure.
 
-> **Status: EXPERIMENTAL.** HA ships as documented **EXPERIMENTAL** and is **not** launch-blocking;
-> its de-EXPERIMENTAL graduation is the **v0.3** milestone. Treat it as preview-quality until then.
-> See [Limitations](limitations.md).
+> **Status: EXPERIMENTAL.** `k3sm install --cluster-init` forms an embedded etcd control plane on
+> the first server, and `k3sm install --server-join` adds a second one. Treat it as preview quality
+> and keep datastore backups. A controller manager or scheduler that loses its leader lease when
+> quorum is lost is counted as a crash, so repeated quorum loss can park a server. External-datastore (Postgres) HA and the `--datastore-endpoint` and
+> `--datastore-endpoint-file` flags were removed in v0.1.6. See [Limitations](limitations.md).
 
 ## HA Model
 
 A single-node k3sm embeds the control plane over **kine/SQLite**. HA extends this to multiple
-control-plane Macs so the apiserver remains reachable if one node is lost, with kine pointed at an
-operator-managed **Postgres** instead of the local SQLite file. The controller-manager and scheduler
-elect a leader across the servers, and a joining server authenticates against the same cluster CA
-bundle. This builds on the [multi-node](multi-node.md) mesh.
+control-plane Macs so the apiserver remains reachable if one node is lost, with an embedded
+**etcd** cluster instead of the local SQLite file. The design opts in with `--cluster-init` on the
+first server and `--server-join` on the others. There is no conversion from an existing SQLite
+cluster to etcd, and none from an external database. The controller-manager and scheduler elect a
+leader across the servers, and a joining server authenticates against the same cluster CA bundle.
+This builds on the [multi-node](multi-node.md) mesh.
+
+## Mesh Addresses and Pod Ranges
+
+Each server's `--mesh-ip` is also its pod range: the /24 whose first address (`.1`) it is. The
+first server conventionally takes `100.64.0.1`, which is the range `100.64.0.0/24`. Give every
+further server the `.1` of its own unused /24, for example `100.64.1.1`. The server's loopback
+alias, its apiserver, its node's pods and its entry in the wireguard mesh all use that one range,
+and workers are never assigned a range a server holds.
+
+When a server joins with `--server-join`, the existing server checks the joiner's range and
+reserves it before it adds the joiner's etcd member:
+
+- If another node already holds that range, the join is refused and nothing is added to etcd. The
+  holder is never evicted, whether it is a worker or another server. Choose a free `--mesh-ip`, or
+  remove the stale entry on the existing server (`kubectl delete meshpeer <holder>` and
+  `kubectl -n kube-system delete lease meshrange-<n>`, where `<n>` is the third number of the
+  range), then install the joining server again. The joining server records the refusal as a
+  permanent failure, so `k3sm status` shows it with this remedy, and the crash-loop record has to
+  be cleared before it tries again.
+- The joining server's node name is bound to that Mac, the same way a worker's is, so a second Mac
+  cannot join under a server name that is already taken.
+- An existing server that runs an older k3sm does not reserve the range. The joining server notices
+  that its reservation was not acknowledged and refuses to start, asking you to upgrade the
+  existing servers first.
+- A server's range is never moved for you. If a server's name already holds a different range than
+  its `--mesh-ip` names, the server refuses that range until you remove its old `MeshPeer` and lease.
+- A server whose range is not its own (another node took it, or its name holds a different one)
+  keeps etcd, the apiserver and the controllers running, so the cluster keeps its quorum, but it
+  starts no node and no pod network. Its log names the holder and the recovery: while the cluster
+  has quorum, delete the stale `MeshPeer` and lease and run
+  `sudo launchctl kickstart -k system/io.k3sm.server`; if a server is down, run
+  `sudo k3sm server --cluster-reset` on the survivor first.
+- A reservation is released again when the etcd member add that follows it fails. One left behind
+  for more than 15 minutes, by a server with no Ready node and no etcd member, is listed by
+  `k3sm status` on a server (the `mesh-claims` row) and removed the next time a server starts.
+
+## Reaching the Apiservers
+
+Each server writes an admin kubeconfig (`<work-dir>/admin.kubeconfig`) that points at its own mesh
+IP. That address is reachable from every Mac on the mesh, so either server's kubeconfig works from
+any of them. kubectl takes a single server address and does not fail over, so when one server is
+down, use the other server's kubeconfig.
+
+A worker that joins receives a list of apiserver endpoints: the server it joined through first, then
+every other server whose node is Ready. Workers stay attached to the server they joined through;
+there is no client-side failover between servers yet.
 
 ## What to Plan For
 
-- The Postgres datastore is the state of record. Read [Backup & restore](backup-restore.md) before
+- The embedded etcd datastore is the state of record. Read [Backup & restore](backup-restore.md) before
   running HA; a datastore restore is the recovery path if data is lost.
 - Control-plane Macs upgrade **node-by-node** via launchd restart, creating a brief
-  binary-version-skew window. See [Upgrade](upgrade.md).
+  binary-version-skew window. See [Upgrade](upgrade.md). Upgrade every existing server before you
+  join a new one.
+- Two servers tolerate no failure: losing either one stops all writes until it returns, or until
+  the survivor runs `sudo k3sm server --cluster-reset`. Tolerating the loss of a server takes three.
 - Single-node datastore consistency is consistent-LIST with a soak-pending watch-staleness posture,
   and multi-node consistency semantics inherit that caveat. See [Limitations](limitations.md).
 
 ## Caveats
 
-Because HA is EXPERIMENTAL, do not treat it as a production availability guarantee yet. Validate
-failover and restore on your own hardware, and keep datastore backups. With HA that means
-`pg_dump`/PITR against your Postgres, not the single-node SQLite procedure (see
-[Backup & restore](backup-restore.md)). `k3sm snapshot save`/`restore` refuse here and say so,
-because they cover the single-node SQLite datastore only and k3sm does not read your Postgres.
+Until a two-server cluster has been run end to end, there is no HA control plane to rely on, and no
+availability guarantee. Keep datastore backups (see [Backup & restore](backup-restore.md)).
+On a server started with `--cluster-init`, `k3sm snapshot save` streams an online snapshot of this
+server's etcd member, and `k3sm snapshot restore` refuses, because restoring an etcd member is not
+supported in this release.
 
 ## Next
 

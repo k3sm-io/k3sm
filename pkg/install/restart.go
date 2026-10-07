@@ -648,12 +648,15 @@ func freshBringUpFailures(rec executor.CrashRecord, since time.Time) (int, execu
 	return n, last
 }
 
-// parkedSummary says which of the two failures the breaker counted last, in the
+// parkedSummary says which of the three failures the breaker counted last, in the
 // words an operator needs to start looking: a control plane that came up and
 // then died is a different search through the log than one that never came up.
 func parkedSummary(last executor.Crash) string {
-	if last.Origin == executor.CrashOriginBringUp {
+	switch last.Origin {
+	case executor.CrashOriginBringUp:
 		return "the control plane never came up (last: " + last.Component + ")"
+	case executor.CrashOriginLeaderLost:
+		return "the control plane kept losing its leader lease (last: " + last.Component + ")"
 	}
 	return "the control plane kept crashing (last: " + last.Component + ")"
 }

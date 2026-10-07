@@ -85,12 +85,19 @@ one package to edit and one gate to flip.
 ## The vkadapter surface (for maintainers)
 
 - **Type aliases** re-exporting VK's provider/node/streaming types by identity:
-  `Provider`, `ProviderConfig`, `Node`, `PodLifecycleHandler`, `PodNotifier`,
-  `NodeProvider`, `AttachIO`, `ContainerLogOpts`, `TermSize`.
+  `Provider`, `PodLifecycleHandler`, `PodNotifier`, `NodeProvider`,
+  `NaiveNodeProvider`, `AttachIO`, `ContainerLogOpts`, `TermSize`.
+- **`Node` is an owned type**, not an alias: the adapter assembles the node from
+  VK's `node` package constructors itself, so nothing outside the adapter depends
+  on its identity.
 - **`errdefs` pass-throughs** (`NotFound`, `NotFoundf`, `IsNotFound`) delegating
   to VK's own not-found error so VK's reconcile agrees on "gone".
-- **`NewNode(nodeName, NodeConfig)`** encapsulating the `nodeutil` node-builder
-  dance (config options, `NewNode`, the nil-`NodeProvider` → `NaiveNodeProvider`
-  path, and the TLS-gated provider-route/HTTP-handler wiring).
+- **`NewNode(nodeName, NodeConfig)`** owning the node assembly: one pod informer
+  filtered to the node, VK's `NodeController` and `PodController`, the
+  nil-`NodeProvider` → `NaiveNodeProvider` path, and the TLS-gated
+  provider-route/HTTP-handler wiring. It no longer calls `nodeutil.NewNode`,
+  whose builder starts cluster-wide Secret, ConfigMap and Service informers a
+  node identity is not granted; the Secret/ConfigMap listers VK requires answer
+  by name through `NodeConfig.Objects` and never list.
 
 Everything else in the repo imports `vkadapter`, never Virtual Kubelet.

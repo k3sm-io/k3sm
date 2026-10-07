@@ -22,6 +22,10 @@ sudo k3sm install --mesh-ip <this-macs-mesh-address>
 ```
 
 The mesh address is IPv4 (the default mesh range is 100.64.0.0/10); a link-local or IPv6 address is refused at install time.
+It must be the first address (`.1`) of a /24 inside that range that no other node uses, such as
+100.64.0.1; the install refuses any other address, because that /24 becomes this Mac's pod range.
+In an [HA](ha.md) cluster every server works this way: each server's `--mesh-ip` names its own /24,
+and a server joining with a range another node already holds is refused rather than taking it.
 
 This writes the address into the server daemon's arguments and restarts it. A plain `sudo k3sm
 install` re-run already boots the daemons out and back in, so it always picks up the address you
@@ -68,6 +72,12 @@ and issues the node's certificates for it, so there is nothing you have to suppl
 from the one the server assigns fails the join with a message naming both, instead of bringing the
 node up on an address it does not hold.
 
+On a control-plane install `--node-ip` means something else. There it is accepted only with
+`--cluster-init` or `--server-join`, and it names the Mac's own **LAN** address, which the embedded
+etcd member binds and the other servers dial. The install passes it to the server daemon as
+`--etcd-peer-ip`; the server's node still advertises its `--mesh-ip`, so the LAN address is never
+added to the loopback interface. See [HA](ha.md).
+
 A node that joined with a wrong `--node-ip` before this release still holds a certificate issued for
 that address, and the control plane cannot reach its kubelet, so `kubectl logs` and `kubectl exec`
 against it fail. `k3sm status` on that Mac now reports the agent row as an address mismatch and
@@ -81,12 +91,19 @@ k3sm kubectl get meshpeers
 ```
 
 Every node already in the mesh shows up here with a `PODCIDR` column, a /24 carved out of the mesh
-range in the order nodes joined: the first node holds `100.64.0.0/24`, the second `100.64.1.0/24`,
-and so on. The lowest number in the third position that is **not** already listed is the new
-node's index, and its mesh address is the first host address in that node's /24 (the address
+range: the first server holds `100.64.0.0/24`, and each worker takes the next free one in the order
+nodes joined. The lowest number above 0 in the third position that is **not** already listed is the
+new node's index, and its mesh address is the first host address in that node's /24 (the address
 ending in `.1`). For example: if `get meshpeers` lists one existing peer at `100.64.0.0/24`, the
 new node is index 1, its pod range is `100.64.1.0/24`, and the address it will be assigned is
-`100.64.1.1`.
+`100.64.1.1`. A worker is never given index 0, and never a range an [HA](ha.md) server holds or has
+reserved, so with a second server at `100.64.1.0/24` the next worker gets `100.64.2.0/24`. Each
+range is owned through a claim object (a `Lease` named `meshrange-<n>` in `kube-system`), and two
+servers answering joins at once cannot hand out the same range.
+
+The join also returns the list of apiserver endpoints the worker may use: the server it joined
+through first, then any other server whose node is Ready. The worker keeps talking to the server it
+joined through.
 
 `--agent` installs the `io.k3sm.agent` LaunchDaemon, so the worker starts at boot and is restarted
 if it exits, exactly as the control plane is on the server Mac. A Mac is one role or the other: an
@@ -136,6 +153,40 @@ for the cluster the node is already in is ignored, so leaving one in a start scr
 The node certificate an agent receives at join is valid for one year. Nothing renews it in place, so
 renewing it means rejoining with a fresh token before it expires.
 
+### Node-password bindings
+
+The first join for a node name binds that name to the node's node-password, and every later join for
+the name must present the same password. That binding is what stops another holder of a join token
+from claiming an existing node's name. The server keeps each binding in the datastore as a
+`kube-system` Secret named `<node>.node-password.k3sm`, holding only a hash of the password, so
+bindings survive a server restart.
+
+- After upgrading the server to this version, or after its datastore is wiped, workers that joined
+  earlier have no binding until their next join. Stop handing out any join token you suspect has
+  leaked and let it expire, and rejoin the workers you care about so their names are bound again.
+- Rolling back to an older version leaves the Secrets in place. A later upgrade picks them up again.
+- If the server logs that its own node-password file no longer matches the binding the datastore
+  holds, put the original `server.node-password` file back in the server's work dir and restart the
+  server. The log line names the path: `/var/lib/k3sm/server/` for a server running as root, or
+  `server/` under the service user's home for one running unprivileged. If that file is gone,
+  delete the server's binding and restart, and the server binds its name again:
+
+  ```sh
+  kubectl -n kube-system delete secret <node>.node-password.k3sm
+  sudo launchctl kickstart -k system/io.k3sm.server
+  ```
+
+- A worker refused with a node-password mismatch after a reinstall may also mean another token
+  holder bound its name first. Join tokens cannot be revoked from the CLI, so let any token you
+  suspect has leaked expire (24 hours by default) before you recover. Then, on the server, delete the
+  stale Node and its binding, and rejoin the worker right away with a fresh token from
+  `sudo k3sm token create`:
+
+  ```sh
+  kubectl delete node <node>
+  kubectl -n kube-system delete secret <node>.node-password.k3sm
+  ```
+
 ### If a node's address changes
 
 The endpoint a node publishes is the address its peers dial to open a wireguard handshake, and on a
@@ -152,6 +203,41 @@ joined, and the update can carry nothing but the endpoint. A node can only chang
 join token is not involved and is not kept on the node after the join; it expires after 24 hours by
 default, so an update that depended on it would stop working after a day. `kubectl describe node
 <name>` shows a `MeshEndpointChanged` event with the old and new values whenever this happens.
+
+### A worker on Wi-Fi
+
+A worker proves it is alive with two writes to the apiserver: it renews its `Lease` every 10 seconds
+and posts its node status once a minute. The controller-manager marks a node `NotReady` when its
+Lease has not been renewed for the node-monitor grace period, 50 seconds by default (40 seconds
+before Kubernetes 1.32). A lossy Wi-Fi link, or a roam to a new access point or a new DHCP address,
+can break the connection those writes travel on without closing it, so k3sm bounds them:
+
+- Both writes go through a client of their own, on their own connection, separate from the one the
+  node's watches use.
+- Each request has a 10 second timeout, so a write on a broken connection fails before the next
+  renewal is due.
+- The connection is checked with an HTTP/2 PING after 5 seconds without traffic, and closed if the
+  PING is not answered within 5 seconds. The next write dials a new connection from whatever address
+  the Mac has at that moment.
+
+What that gives you:
+
+- If the path to the server comes back within the 50 second grace period, the node stays `Ready`.
+- If the path stays down longer, the node goes `NotReady` 50 seconds after its last renewal. Once the
+  path returns, the Lease renewal resumes after a retry backoff of up to 7 seconds, and the worker
+  posts its status within 10 seconds of finding that the post failed or that the controller-manager
+  changed its `Ready` condition, as a kubelet does. The node is `Ready` again about 10 to 20 seconds
+  after the path comes back.
+- A node that stays `NotReady` or unreachable for 5 minutes has its Pods evicted, because Pods carry
+  the default `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` tolerations of 300
+  seconds. A Pod with a shorter `tolerationSeconds` is evicted sooner. A flap shorter than that
+  evicts nothing, but every flap restarts the clock.
+
+When a write fails, the worker's log says which request failed and why, and repeats of the same
+failure are logged at most once every 30 seconds. Once a write has not landed within its window (40
+seconds for the Lease, 100 seconds for the status), the log carries a `node heartbeat is stale` line
+naming the write and its age, and `k3sm status` shows a `heartbeat` row with both ages. The node does
+not restart itself: a write that cannot reach the server is a network problem a restart does not fix.
 
 ### Removing a worker
 

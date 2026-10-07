@@ -127,15 +127,20 @@ c=ok
 for s in stagedBinary stagedExecShim stagedPathShim stagedDNSShim stagedVMHost; do
 	grep -q "sys\.CopyToRootOwned(.*cfg\.$s(" "$INSTALL_GO" || c=no
 done
-# The payload loop and the kine marker reach the staged path through a `dst`
-# binding and a wrapped call, so they are asserted by their own accessor.
-[ "$(grep -c 'cfg\.stagedPayloadFile(' "$INSTALL_GO" || true)" = 2 ] || c=no
+# The payload loop and the three version markers (kine, etcd, control plane)
+# reach the staged path through a `dst` binding and wrapped calls, so they are
+# asserted by their own accessor: one use in the loop plus one per marker.
+# Counted across both files that carry Install's code, so a copy moved between
+# them is still counted rather than lost.
+[ "$(cat "$INSTALL_GO" "$DARWIN_GO" | grep -c 'cfg\.stagedPayloadFile(' || true)" = 4 ] || c=no
 # ...and NO copy names a live path. This is the negative that matters: one
 # CopyToRootOwned(..., cfg.installed*) would be a hole straight back into the
 # defect, and it would pass every positive rung above.
-grep -qE 'sys\.CopyToRootOwned\([^)]*cfg\.installed' "$INSTALL_GO" && c=no
-[ "$(grep -c 'sys\.CopyToRootOwned(' "$INSTALL_GO" || true)" = 7 ] || c=no
-ladder "$c" "b352.1  all 7 CopyToRootOwned calls in Install name a staged destination, none an installed one"
+# The total is the five named binaries + the payload loop + the three markers;
+# a tenth call is one the rungs above have not classified.
+grep -qE 'sys\.CopyToRootOwned\([^)]*cfg\.installed' "$INSTALL_GO" "$DARWIN_GO" && c=no
+[ "$(cat "$INSTALL_GO" "$DARWIN_GO" | grep -c 'sys\.CopyToRootOwned(' || true)" = 9 ] || c=no
+ladder "$c" "b352.1  all 9 CopyToRootOwned calls in Install name a staged destination, none an installed one"
 
 # The ORDER, by line number: stage, publish, wire, reap. This is the single
 # choice that makes rollback possible — a reap before the verification would

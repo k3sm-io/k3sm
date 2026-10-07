@@ -183,6 +183,16 @@ func TestDoctorRendersRemedies(t *testing.T) {
 	// The rows render on the status screen's columns: same glyphs, same state
 	// column, same headline. A second renderer in cmd/k3sm is exactly what the
 	// shared one exists to prevent.
+	// doctor --json promises the full report's shape, so it carries the same
+	// schema stamp; a reader that checks schemaVersion must accept it.
+	t.Run("the-json-carries-the-schema-version", func(t *testing.T) {
+		t.Parallel()
+		rep := doctorReport(healthyDoctorEnv(), doctorTestVersion, doctorTestTime)
+		if rep.SchemaVersion != status.SchemaVersion {
+			t.Errorf("doctor report schemaVersion = %d, want %d", rep.SchemaVersion, status.SchemaVersion)
+		}
+	})
+
 	t.Run("the-screen-is-the-status-screen", func(t *testing.T) {
 		t.Parallel()
 		env := healthyDoctorEnv()
@@ -468,10 +478,10 @@ func TestDoctorRendersRemedies(t *testing.T) {
 const fakeBundleDir = "/fake/bundle/dir"
 
 // seededJoinToken and seededDSN are the two credential shapes a daemon log can
-// echo: the CA-pinned bootstrap token and a datastore DSN's password.
+// echo: the CA-pinned bootstrap token and a URL's embedded password.
 const (
 	seededJoinToken = "K10abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567::server:deadbeef"
-	seededDSN       = "postgres://kine:hunter2@db.example:5432/k3sm"
+	seededDSN       = "scheme://kine:hunter2@db.example:5432/k3sm"
 )
 
 // bundleEnv is a healthy Mac with the bundle seams faked: a status report and
@@ -482,7 +492,7 @@ func bundleEnv(files map[string]string) doctorEnv {
 	env.statusReport = func(context.Context) status.Report {
 		return status.Report{
 			Verdict: status.VerdictDegraded,
-			Summary: "server: started with --datastore-endpoint " + seededDSN,
+			Summary: "server: started with --example-endpoint " + seededDSN,
 			Rows: []status.Row{
 				{Name: "server", State: status.StateCrashLoop, Severity: status.SeverityFail,
 					Detail: "497 runs, last exit 1", Remedy: "sudo launchctl kickstart -k system/io.k3sm.server"},

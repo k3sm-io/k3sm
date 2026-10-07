@@ -44,7 +44,8 @@ var ErrPinMismatch = errors.New("certs: presented chain does not match the pinne
 // serving cert, kubelet-serving certs, and the system:node client certs handed to
 // joining nodes. k3sm stands up two CAs (DESIGN §5c): a CLUSTER CA
 // (the serving anchor the join token pins) and a SIGNING CA (issues node client
-// certs). The PEM encodings are cached so the server can write them to disk and
+// certs). An etcd-backed HA server adds two more, the etcd SERVER and PEER CAs
+// (EnsureEtcdCAs), which anchor only etcd's own TLS. The PEM encodings are cached so the server can write them to disk and
 // embed them in kubeconfigs without re-marshalling.
 type CA struct {
 	// Cert is the parsed CA certificate.
@@ -144,7 +145,7 @@ func (c *CA) IssueServing(cn string, dnsNames []string, ipAddrs []net.IP, validF
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate serving key: %w", err)
 	}
-	der, err := c.signLeaf(&key.PublicKey, pkix.Name{CommonName: cn}, dnsNames, ipAddrs, x509.ExtKeyUsageServerAuth, validFor)
+	der, err := c.signLeaf(&key.PublicKey, pkix.Name{CommonName: cn}, dnsNames, ipAddrs, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, validFor)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -192,13 +193,40 @@ func (c *CA) IssueClient(cn string, org []string, validFor time.Duration) (certP
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate client key: %w", err)
 	}
-	der, err := c.signLeaf(&key.PublicKey, pkix.Name{CommonName: cn, Organization: org}, nil, nil, x509.ExtKeyUsageClientAuth, validFor)
+	der, err := c.signLeaf(&key.PublicKey, pkix.Name{CommonName: cn, Organization: org}, nil, nil, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, validFor)
 	if err != nil {
 		return nil, nil, err
 	}
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal client key: %w", err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM, nil
+}
+
+// IssueServerClient mints a fresh keypair signed by this CA that carries BOTH
+// ExtKeyUsageServerAuth and ExtKeyUsageClientAuth, with dnsNames + ipAddrs as SANs.
+// It exists for etcd, whose listeners present one certificate both ways: a peer
+// connection is mutual TLS in which each member is server and client at once (k3s
+// mints its etcd server and peer leaves with the same dual usage). It
+// is for the dedicated etcd CAs only — the cluster and signing CAs keep their
+// single-EKU leaves (IssueServing / IssueClient), so neither ever emits a cert
+// usable on the other side of its trust boundary.
+func (c *CA) IssueServerClient(cn string, dnsNames []string, ipAddrs []net.IP, validFor time.Duration) (certPEM, keyPEM []byte, err error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate server-client key: %w", err)
+	}
+	der, err := c.signLeaf(&key.PublicKey, pkix.Name{CommonName: cn}, dnsNames, ipAddrs,
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}, validFor)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal server-client key: %w", err)
 	}
 	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
@@ -215,7 +243,7 @@ func (c *CA) ServingChainTLS(cn string, dnsNames []string, ipAddrs []net.IP, val
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("generate serving key: %w", err)
 	}
-	der, err := c.signLeaf(&key.PublicKey, pkix.Name{CommonName: cn}, dnsNames, ipAddrs, x509.ExtKeyUsageServerAuth, validFor)
+	der, err := c.signLeaf(&key.PublicKey, pkix.Name{CommonName: cn}, dnsNames, ipAddrs, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, validFor)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -240,7 +268,7 @@ func (c *CA) SignClientCSR(csr *x509.CertificateRequest, subject pkix.Name, dnsS
 	if err := csr.CheckSignature(); err != nil {
 		return nil, fmt.Errorf("verify CSR self-signature: %w", err)
 	}
-	der, err := c.signLeaf(csr.PublicKey, subject, dnsSANs, ipSANs, x509.ExtKeyUsageClientAuth, validFor)
+	der, err := c.signLeaf(csr.PublicKey, subject, dnsSANs, ipSANs, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, validFor)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +285,7 @@ func (c *CA) SignServingCSR(csr *x509.CertificateRequest, subject pkix.Name, dns
 	if err := csr.CheckSignature(); err != nil {
 		return nil, fmt.Errorf("verify CSR self-signature: %w", err)
 	}
-	der, err := c.signLeaf(csr.PublicKey, subject, dnsSANs, ipSANs, x509.ExtKeyUsageServerAuth, validFor)
+	der, err := c.signLeaf(csr.PublicKey, subject, dnsSANs, ipSANs, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, validFor)
 	if err != nil {
 		return nil, err
 	}
@@ -265,8 +293,12 @@ func (c *CA) SignServingCSR(csr *x509.CertificateRequest, subject pkix.Name, dns
 }
 
 // signLeaf is the shared leaf-issuance core: build the template, set the extended
-// key usage, and sign with the CA key.
-func (c *CA) signLeaf(pub any, subject pkix.Name, dnsSANs []string, ipSANs []net.IP, eku x509.ExtKeyUsage, validFor time.Duration) ([]byte, error) {
+// key usages, and sign with the CA key. Every caller but IssueServerClient passes
+// exactly one EKU; ekus is copied so a caller's slice never aliases the template.
+func (c *CA) signLeaf(pub any, subject pkix.Name, dnsSANs []string, ipSANs []net.IP, ekus []x509.ExtKeyUsage, validFor time.Duration) ([]byte, error) {
+	if len(ekus) == 0 {
+		return nil, errors.New("certs: sign leaf: at least one extended key usage is required")
+	}
 	serial, err := randomSerial()
 	if err != nil {
 		return nil, err
@@ -281,7 +313,7 @@ func (c *CA) signLeaf(pub any, subject pkix.Name, dnsSANs []string, ipSANs []net
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.Add(validFor),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{eku},
+		ExtKeyUsage:           append([]x509.ExtKeyUsage(nil), ekus...),
 		BasicConstraintsValid: true,
 		DNSNames:              dnsSANs,
 		IPAddresses:           ipSANs,

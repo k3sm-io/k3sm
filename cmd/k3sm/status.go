@@ -43,7 +43,8 @@ Usage: k3sm status [view] [flags]
 
 Views:
   (none)      the one screen: install, daemons, apiserver, node, workloads, data root
-  daemons     per-LaunchDaemon detail — state, pid, run count, last exit, plist and log paths
+  daemons     per-LaunchDaemon detail — state, pid, run count, last exit, plist and log paths;
+              with -o json, a cheap probe that reads launchd only (no apiserver)
   cluster     control-plane detail — readyz, node, workloads by phase, datastore, runtime daemon
   logs [job]  tail the daemons' log files; job is netd, server or agent — when
               omitted, the two this Mac is installed with (netd and the node
@@ -294,9 +295,13 @@ func parseStatusArgs(args []string, errOut io.Writer) (statusOptions, error) {
 // and how a log file is read. runStatus builds the production one; the tests
 // build fakes and drive the same code.
 type statusRunner struct {
-	out       io.Writer
-	errOut    io.Writer
-	collect   func(context.Context) status.Report
+	out     io.Writer
+	errOut  io.Writer
+	collect func(context.Context) status.Report
+	// probe is the cheap launchd-only collector behind `status daemons -o
+	// json`. It is a separate seam from collect because it must never build
+	// the apiserver client the full report needs.
+	probe     func() status.DaemonsReport
 	stdoutTTY bool
 	stderrTTY bool
 	color     bool
@@ -323,23 +328,50 @@ func (r statusRunner) run(ctx context.Context, o statusOptions) int {
 	case o.wait:
 		return r.runWait(ctx, o)
 	default:
-		return r.emit(r.collect(ctx), o)
+		_, emit := r.snapshot(ctx, o)
+		return emit()
 	}
+}
+
+// snapshot collects one answer for the requested view and returns its verdict
+// and the function that writes it. `status daemons -o json` is answered by the
+// launchd-only probe and its own shape; every other view and format by the
+// full report.
+func (r statusRunner) snapshot(ctx context.Context, o statusOptions) (status.Verdict, func() int) {
+	if o.view == "daemons" && o.format == "json" {
+		if r.probe == nil {
+			return status.VerdictUnknown, func() int {
+				fmt.Fprintln(r.errOut, "k3sm status: the daemons probe is not wired")
+				return exitInternalError
+			}
+		}
+		rep := r.probe()
+		return rep.Verdict, func() int { return r.emitJSON(rep, rep.Verdict) }
+	}
+	rep := r.collect(ctx)
+	return rep.Verdict, func() int { return r.emit(rep, o) }
+}
+
+// emitJSON writes one JSON document and returns the verdict's exit code. The
+// document goes to stdout whatever the verdict, so a caller that branches on
+// the exit code still has the answer to read.
+func (r statusRunner) emitJSON(v any, verdict status.Verdict) int {
+	encoded, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		fmt.Fprintln(r.errOut, "k3sm status: encode report:", err)
+		return exitInternalError
+	}
+	if _, err := fmt.Fprintln(r.out, string(encoded)); err != nil {
+		fmt.Fprintln(r.errOut, "k3sm status: write report:", err)
+		return exitInternalError
+	}
+	return verdict.ExitCode()
 }
 
 // emit writes one report in the requested format and returns its exit code.
 func (r statusRunner) emit(rep status.Report, o statusOptions) int {
 	if o.format == "json" {
-		encoded, err := json.MarshalIndent(rep, "", "  ")
-		if err != nil {
-			fmt.Fprintln(r.errOut, "k3sm status: encode report:", err)
-			return exitInternalError
-		}
-		if _, err := fmt.Fprintln(r.out, string(encoded)); err != nil {
-			fmt.Fprintln(r.errOut, "k3sm status: write report:", err)
-			return exitInternalError
-		}
-		return rep.Verdict.ExitCode()
+		return r.emitJSON(rep, rep.Verdict)
 	}
 	if _, err := io.WriteString(r.out, r.render(rep, o)); err != nil {
 		fmt.Fprintln(r.errOut, "k3sm status: write report:", err)
@@ -368,10 +400,10 @@ func (r statusRunner) render(rep status.Report, o statusOptions) string {
 func (r statusRunner) runWait(ctx context.Context, o statusOptions) int {
 	dots := false
 	for {
-		rep := r.collect(ctx)
-		if rep.Verdict == status.VerdictRunning {
+		verdict, emit := r.snapshot(ctx, o)
+		if verdict == status.VerdictRunning {
 			r.endDots(dots)
-			return r.emit(rep, o)
+			return emit()
 		}
 		if r.stderrTTY {
 			fmt.Fprint(r.errOut, ".")
@@ -379,7 +411,7 @@ func (r statusRunner) runWait(ctx context.Context, o statusOptions) int {
 		}
 		if !r.sleep(ctx, waitPollInterval) {
 			r.endDots(dots)
-			return r.emit(rep, o)
+			return emit()
 		}
 	}
 }
@@ -406,8 +438,8 @@ func (r statusRunner) runWatch(ctx context.Context, o statusOptions) int {
 			fmt.Fprintln(r.errOut, "k3sm status: write report:", err)
 			return exitInternalError
 		}
-		rep := r.collect(ctx)
-		code = r.emit(rep, o)
+		_, emit := r.snapshot(ctx, o)
+		code = emit()
 		if !r.sleep(ctx, o.watch) {
 			return code
 		}

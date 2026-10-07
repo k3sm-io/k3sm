@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-09-26
-updated_by: M14.0/M14.2/M14.3 acceptance write-back (B213.sh, m14-servermesh.sh rig evidence)
+updated: 2026-10-05
+updated_by: M17.4 build (sharded MLXModel placement, rank Pods, gang lifecycle, the k3sm-shard entrypoint)
 
 phases:
   - id: M0
@@ -287,12 +287,12 @@ phases:
         deliverables:
           - id: M4.2-d1
             done: true
-            desc: "the stockkitty-driven synthetic conformance set runs as build-tagged per-criterion Go tests in e2e/ (//go:build e2e), invoked by m<n>.sh via the shared non-vacuous guard hack/lib/conformance.sh: M2 (ConfigMap/Secret-mode-0400/EmptyDir/DownwardAPI==podIP/EnvFrom/Probes-transitions/FsGroup/GracefulStop/OOMKilled/KubectlTop/InPodKubectl/InPodDNS/DenyUsers + deferred-skipped ImagePullSecrets/DaemonSet) + M3 single-node (NodePort, PVCPersistsAcrossRestart) at the integration tier (CGO_ENABLED=1), M3 cross-node (InPodKubectlAndDNSOnWorker) + M5 lab-tiered (K3SM_LAB=1). Helper images hello-http+conftool built+ad-hoc-signed by TestMain. The reference-workload feature-gap matrix records the assertion→feature mapping. AUTHORED + compile-verified + gate-wired this session; the live integration run is owed (a1)."
+            desc: "the reference-workload-driven synthetic conformance set runs as build-tagged per-criterion Go tests in e2e/ (//go:build e2e), invoked by m<n>.sh via the shared non-vacuous guard hack/lib/conformance.sh: M2 (ConfigMap/Secret-mode-0400/EmptyDir/DownwardAPI==podIP/EnvFrom/Probes-transitions/FsGroup/GracefulStop/OOMKilled/KubectlTop/InPodKubectl/InPodDNS/DenyUsers + deferred-skipped ImagePullSecrets/DaemonSet) + M3 single-node (NodePort, PVCPersistsAcrossRestart) at the integration tier (CGO_ENABLED=1), M3 cross-node (InPodKubectlAndDNSOnWorker) + M5 lab-tiered (K3SM_LAB=1). Helper images hello-http+conftool built+ad-hoc-signed by TestMain. The reference-workload feature-gap matrix records the assertion→feature mapping. AUTHORED + compile-verified + gate-wired this session; the live integration run is owed (a1)."
         acceptance:
           - id: M4.2-a1
             met: true
             evidence: "PROVEN 2026-09-25 on the dev Mac: hack/acceptance/m2.sh exit 0 — `M2: 10 passed, 0 failed`, m2.A `all 13 required criteria PASS, none skipped` (the non-vacuous guard live), full install→suite→uninstall lifecycle including the daemon-reap bounce; hack/acceptance/m3.sh exit 0 — `M3 (integration): 2 passed, 0 failed` (NodePort reachable + PVC persists across restart); hack/acceptance/m4.sh re-run green the same day. One gate defect fixed first and landed with this write-back: m2.sh predated the vm RuntimeClass and never built the k3sm-vmhost sibling pkg/install.RequiredSiblings now demands, so its install refused the tree before the first check — the gate now builds it, signs it with the virtualization entitlement, and reads the entitlement back off the signed Mach-O."
-            check: "INTEGRATION (needs a dev Mac + root; does NOT run in unit CI; RUN GREEN 2026-09-25, see evidence). hack/acceptance/m2.sh and hack/acceptance/m3.sh exit 0 with EVERY required criterion PASS (non-vacuous guard: a missing/failed/skipped required criterion is RED), and the conformance assertions map to stockkitty features."
+            check: "INTEGRATION (needs a dev Mac + root; does NOT run in unit CI; RUN GREEN 2026-09-25, see evidence). hack/acceptance/m2.sh and hack/acceptance/m3.sh exit 0 with EVERY required criterion PASS (non-vacuous guard: a missing/failed/skipped required criterion is RED), and the conformance assertions map to reference-workload features."
             method: integration
 
   - id: M5
@@ -314,7 +314,7 @@ phases:
             desc: "VERIFIABLE FOUNDATION (unit-proven): the provider dispatches a pod by RuntimeClass to runtimed:M5's backend via the apis:M5.1 handler-config — pkg/provider/translate.go toPodBox reads spec.runtimeClassName and resolves runtimev1.DefaultHandlerConfig().Backend(handler), stamping SandboxProfile.Backend: runtimeClassName=vm → SANDBOX_BACKEND_VM (and VmVcpus from ceil(summed cpu milli) + VmMemoryBytes from summed memory, limit-else-request across regular containers, 0=VZ default); empty/no RuntimeClass → SANDBOX_BACKEND_UNSPECIFIED (NOT a hardcoded seatbelt rung — this FIXES the architect-flagged EXEC=1-vs-INPROC=2 mismatch, letting runtimed's reworked SelectBackend(UNSPECIFIED,…) pick the host-OS-gated rung); an unknown handler FAILS CLOSED (toPodBox returns an error wrapping runtimev1.ErrUnknownHandler — never a silent downgrade). The upstream node.k8s.io/RuntimeClass is consumed, not forked. pkg/runtimeclass.Provision idempotently lays down the node.k8s.io/v1 RuntimeClass vm (handler vm) with a scheduling.nodeSelector pinning it to k3sm.io/virtualization-labelled nodes (provisioned in cmd/k3sm/server.go alongside RBAC/policy, log-and-continue); cmd/k3sm/node.go sources the node label from the node's VZ availability via applyVirtualizationLabel(n, nodeVMCapable()). REPORTED cross-repo need (not faked): runtimed's GetRuntimeInfo reports only the selected host-process backend's health, NOT per-backend (VZ) availability, so nodeVMCapable() defaults false → label ABSENT → a vm pod stays Pending/Unschedulable (fail-closed, complementing runtimed's SelectBackend ErrBackendUnavailable backstop). Proven by TestToPodBoxVMRuntimeClass / TestToPodBoxDefaultBackendUnspecified / TestToPodBoxUnknownRuntimeClassFailsClosed (pkg/provider) + TestVMRuntimeClassNodeSelector / TestVMRuntimeClassProvisionIdempotent (pkg/runtimeclass) + TestNodeVirtualizationLabel (cmd/k3sm), -race clean."
           - id: M5.1-d2
             done: true  # 2026-09-01 — delivered by M11.4-d1..d6 (the live vm dispatch's remaining half: capability labels d1, arch truthfulness d2, image-platform pre-pull d3, the guest-network producer wiring d4 — SetupGuest before toPodBox, the in-process runtimed.Deps carrier this row anticipated, no apis change — admission notes d5, the limitations rewrite d6) plus runtimed:M11.2's digest-pinned linux-guest kernel/initramfs (k3sm-io/linux-guest v6.18.48-k3sm.1) served over vmnet. See docs/PHASES.md's M11 block for the full deliverable ledger.
-            desc: "LAB REMAINDER (needs a VZ Mac + the com.apple.security.virtualization entitlement): the LIVE vm dispatch — provider → darwin-net podnet.Network.SetupGuest for the guest network → thread the GuestNetwork (guest IP/gateway/NAT-subnet/DNS-VIP) to runtimed's VZ backend → boot a digest-pinned Linux guest (not Mach-O ⇒ codesign/notarization N/A inside the VM; the guest kernel/initramfs is the notarized host asset). darwin-net flagged there is NO transport for GuestNetwork to runtimed yet — the clean fix is a runtimed consumer-side supervisor.GuestNetwork seam (no apis change). Plus: the M4.1 foreign-user VAP should EXEMPT runtimeClassName=vm (a vm guest CAN honor a foreign runAsUser/fsGroup — deferred, observable only once the VM boots); the guest resolv.conf injection (pinned static/immutable per darwin-net's caveat); Rosetta-for-amd64; and the separate-binary virtualization-entitlement signing (M4.0 packaging). This is what runs stockkitty's Linux-only Postgres/pgvector. Also needs the reported runtimed GetRuntimeInfo per-backend-availability extension so the node VZ label can be set truthfully. DELIVERED 2026-09-01 by M11 — see the done:true comment on this row."
+            desc: "LAB REMAINDER (needs a VZ Mac + the com.apple.security.virtualization entitlement): the LIVE vm dispatch — provider → darwin-net podnet.Network.SetupGuest for the guest network → thread the GuestNetwork (guest IP/gateway/NAT-subnet/DNS-VIP) to runtimed's VZ backend → boot a digest-pinned Linux guest (not Mach-O ⇒ codesign/notarization N/A inside the VM; the guest kernel/initramfs is the notarized host asset). darwin-net flagged there is NO transport for GuestNetwork to runtimed yet — the clean fix is a runtimed consumer-side supervisor.GuestNetwork seam (no apis change). Plus: the M4.1 foreign-user VAP should EXEMPT runtimeClassName=vm (a vm guest CAN honor a foreign runAsUser/fsGroup — deferred, observable only once the VM boots); the guest resolv.conf injection (pinned static/immutable per darwin-net's caveat); Rosetta-for-amd64; and the separate-binary virtualization-entitlement signing (M4.0 packaging). This is what runs a reference workload's Linux-only Postgres/pgvector. Also needs the reported runtimed GetRuntimeInfo per-backend-availability extension so the node VZ label can be set truthfully. DELIVERED 2026-09-01 by M11 — see the done:true comment on this row."
         acceptance:
           - id: M5.1-a1
             met: true  # 2026-09-01 — proven by hack/lab/m11.sh legs m11.7-c/d (in-guest cluster DNS VIP resolution of kubernetes.default.svc + a TCP connect to the kubernetes ClusterIP) and m11.10-b (a client reaches the vm-hosted workload through its ClusterIP), run on an entitled VZ Mac, log hack/lab/runs/m11-lab-v0.1.0-dev.22a84ba-2026-09-01.log. Proven single-node on one VZ Mac — the check's "two-Mac/VZ lab" phrasing names the VZ half M5 needed; multi-node vm is an M14 matter, not an M5 gap.
@@ -1207,6 +1207,156 @@ phases:
             met: false
             check: "hack/acceptance/m16.sh exits 0 on the R16 rig (rungs m16.0 through m16.10, with m16.8 required unless R3's substitution was taken), the phases.json M16 row reads skeleton:false so TestNonManualSkeletonsAlwaysRed no longer selects it, and the run is recorded; hack/ci.sh green"
             method: integration
+  - id: M17
+    title: Direct links — Thunderbolt-cabled Macs form, carry, and shard the cluster on their own
+    status: in-progress
+    strategy: "phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)"
+    depends_on:
+      - k3sm:M3
+      - k3sm:M8
+      - k3sm:M14
+      - apis:M17
+      - darwin-net:M17
+    note: "Authoritative input: docs/m17-plan.md (workspace) — Phase C encodes ONLY from that doc; its research findings F1-F7 (Apple TN3205, the MLX distributed sources, the rig probe) and its BINDING resolutions R1-R15 are the inputs, and nothing in this block is re-derived from upstream by hand. M17 adds DIRECT LINKS: a point-to-point link between two cluster Macs that k3sm discovers, addresses, routes over, prefers and exposes as topology (net.k3sm.io/v1alpha1 DirectLink, one per node, server-resolved into a link graph). Thunderbolt is the only medium at v1 and appears only as a VALUE — the type, the verbs and the label keys are medium-agnostic (R1). Addresses are DERIVED from the node index into the RFC 3927 reserved halves of 169.254/16 by one pure function in apis, never allocated (R4). THE DEPLOY CONTRACT (phased, named exception: wireguard MeshPeer protocol / AllowedIPs change) covers TWO SURFACES, and a leaf touching either is never a plain hard cut: (1) THE MESH ENDPOINT/ROUTE PROTOCOL ACROSS NODES — MeshPeerSpec gains an additive Endpoints[] candidate list while SchemaVersion STAYS 1 (R12: the plan reader skips any peer whose stamp differs, so a bump would blackhole every new node from every old reader); Endpoint is always written, so an old reader programs the tunnel exactly as today; a node installs the two direct /25 routes toward a peer only when that peer's port is up in DirectLink.status (both ends routeReady, the peer's Lease fresh) AND the link is up locally (R13); the utun /24 never leaves, so the kernel's own route deletion on unplug is the fallback (R14); AllowedIPs are unchanged. (2) THE ADDITIVE k3sm-netd HELPER IPC MINOR BUMP 1.0 → 1.1 (ConfigureLink, RemoveLink, DirectRoutes inside ConfigureMesh), gated by the helper's REPORTED version: a 1.0 helper is never sent DirectRoutes and answers unknown verb to ConfigureLink, and the client then runs mesh-only with one Info line. Any restart order is safe; the server goes first for the feature (it hosts the resolver, /v1-k3sm/directlink and /v1-k3sm/pair, so a new worker against an old server logs server-too-old once and runs tunnel-only); io.k3sm.netd restarts first on each node. Rollback releases host state BEFORE the old binary goes in: tunnelOnly: true per port is the kill switch, then k3sm link reset (or k3sm uninstall) removes every alias and route and restores bridge0 membership, then revert + reinstall node by node. THE RULINGS, recorded in the ledger run log at encode time: PAIRING WINDOW — physical presence on a Thunderbolt hardware port while the operator's window (sudo k3sm pair --for <dur>) is open is the server-side credential; the joiner is ARMED for a bounded window and may pin the cluster with --cluster <pin>, and without the pin it trusts the first open-pairing server heard while armed, a documented limitation (R2). PLAINTEXT ON THE CABLE — the direct route carries cluster traffic in the clear as a TRUST STATEMENT, not a mitigation: nothing on the wire checks that a pod source arriving on the cable is that peer's pod, vm guest traffic rides it too, and the state is visible in DirectLink.status, k3sm status, a Node Event and the direct-links label, with tunnelOnly as the per-link opt-out (R3); sharded serving is trusted tenancy only (R7). THE RIG (R11): the two lab Macs, both Thunderbolt 4, with one cable between them; plugging that cable is the ONE physical human touch, and after it every M17 row except M17-rdma is rig-runnable under K3SM_LAB=1 (manual:true means manual in the gate sense, not human-run). M17-rdma needs a Thunderbolt 5 Mac with RDMA enabled in macOS Recovery, which the rig does not have, so it is RECORDED-only until one exists (R6). TRUST: human_gate is none on every M17 item — no external trust root, no human key material, no RBAC widening; the pair token is machine-minted internal PKI under the operator's window — while the pairing leaves are tier: integration under the cert/secret merge-precondition (the named gate run green on the rig AND a recorded security-engineer sign-off before merge). The k3sm leaves filed against this block are B443 (the MLXDistributed CEL flip, after M17.4's operator, never ahead of it), B444 (the doctor/status direct-link section, after M17.3-d1) and B445 (the M17.0 spike)."
+    subphases:
+      - id: M17.0
+        title: spike S1-S5 — enumeration, addressing and routing, the link-local transport, unplug under load, ring ranks
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "Rig-run under K3SM_LAB=1, never a human session once the cable is in. Scripts live in hack/spike/m17/ in the M16 spike shape: lib.sh owns the exit contract 0 PASS / 1 FAIL / 2 RECORDED (a measurement with no verdict is not a green M17.0); --plan is parsed BEFORE any host requirement and pinned by a unit test, so the ladder's shape is reviewable on a machine with no cable; K3SM_LAB unset prints PENDING and exits 0. The ladder is driven from the dev Mac as a PRIVILEGED SCRIPT FILE run under sudo on each Mac WITH A RESTORE-ON-EXIT TRAP that puts back bridge0 membership, the aliases and the routes, and it never touches the LAN route, so ssh survives every rung; the rig is left on main with both nodes Ready. run.sh chains S1-S5 ONLY: S6 needs Thunderbolt 5 and lives in the M17-rdma row, so this row can exit 0 on the rig. Every halt is binding and every halt's substitution is pre-decided by R8, so no rung needs a human to continue. One findings-s<n>.md per rung is the write-back."
+        deliverables:
+          - id: M17.0-d1
+            done: false
+            desc: "S1 — enumeration and mapping: the system_profiler SPThunderboltDataType -json + networksetup -listallhardwareports join (domain UUID to cabled peer UUID, receptacle to Thunderbolt N to enX), that mapping's stability across reboots and docks, system_profiler's wall and CPU cost, whether an unprivileged PF_ROUTE socket delivers RTM_IFINFO / IFF_RUNNING for a Thunderbolt enX, whether the interface is destroyed or merely flagged on unplug, and whether ioreg -c IOThunderboltPort substitutes when the Thunderbolt Bridge service is deleted. HALT (R8): PF_ROUTE silent → the 2 s poll is the only event source and the fallback figure is re-measured."
+          - id: M17.0-d2
+            done: false
+            desc: "S2 — addressing and routing: bridge0 deletem, the /32 alias plus an on-link host route that ARP-resolves across the cable, the two /25 gateway routes with RTAX_IFA = the node's mesh-egress .1, weak-host acceptance of a lo0-alias destination arriving on enX and the reply source address, a TCP dial sourced from a reserved-half address under the _k3sm profile, TSO/LRO off, and whether a pf ingress filter is warranted (a recorded question, R3). THE R15 FIGURE SCHEMA: iperf3 single and 4-stream in both directions for direct, wireguard-over-cable and Wi-Fi; idle and loaded RTT; k3sm-netd / wireguard-go / proxy CPU%; ClusterIP versus pod-IP path; UDP loss at the MTU boundary with netstat -s fragmentation counters and netstat -I enX errors — medians and p99 over at least 5 runs with the exact command, Mac models, macOS build and cable recorded. HALTS (R8): weak-host delivery fails → route-only via the on-link peer address with the peer /25s re-pointed through a second host route (never an on-link /24 alias on enX); RTAX_IFA not honoured → the proxy and the shim pin the .1 source for all cross-node dials and unbound host dials are documented cable-only."
+          - id: M17.0-d3
+            done: false
+            desc: "S3 — the link-local transport: ff02::1 multicast and a TLS dial over fe80::%enX after member removal, the DAD delay before the port regains its own fe80, and the zone string Go's net/http reports for an accepted link-local connection on Darwin — recorded as the GOLDEN VALUE the pairing trust table fakes and the real-socket zone test asserts. HALT (R8): fe80 unusable on a removed member → the beacon rides bridge0 on the UNJOINED Mac only and the server keeps its ports removed."
+          - id: M17.0-d4
+            done: false
+            desc: "S4 — sleep, unplug and replug UNDER A BULK iperf3 FLOW: what the kernel does to the enX-bound routes, the fallback latency distribution over at least 10 unplugs, no kernel fault across repeated flips (the B350/B370 panic class has no input once one MSS and offload-off hold), how often configd re-adds the bridge member, the wireguard endpoint re-programming time, and peer-asleep fallback with the cable intact. HALT (R8): configd re-adds faster than the watcher removes → the watcher removes on every network-change event and the doc says the bridge is managed."
+          - id: M17.0-d5
+            done: false
+            desc: "S5 — two mlx-lm ranks over the ring backend between pods on the two Macs, a pinned tiny model and revision with a fixed prompt and an expected-token shape (the laptop has 8 GiB), proving the ranks BIND AND DIAL POD IPs under the shim and not only that tokens flow; tokens/s for ring-over-direct, ring-over-wireguard, ring-over-Wi-Fi and the same model on one Mac, so a negative result is published honestly. HALT (R8): fails on 8 GiB → the rung moves the model to the workstation."
+        acceptance:
+          - id: M17.0-a1
+            met: false
+            check: "hack/spike/m17/run.sh exits 0 on the rig under K3SM_LAB=1 (the phases.json M17.0 row) with S1-S5 each reaching a verdict rather than a bare recording, and findings-s1.md through findings-s5.md written back with each halt's pre-decided substitution landed in the same write-back; AND hack/spike/m17/run.sh --plan exits 0 with no host set. Lab-ledger carve-out applies: met only by a recorded K3SM_LAB=1 rig run whose log sits beside hack/lab/m17.sh's run logs, never auto-greened by CI."
+            method: lab
+      - id: M17.3
+        title: direct-link networking, pairing and operability — the writer, the resolver, plug-and-join, the CLI, the docs, the lab ladder
+        status: todo
+        strategy: "phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)"
+        depends_on:
+          - apis:M17.1
+          - darwin-net:M17.2
+        note: "Consumes apis:M17.1 (EndpointCandidate, LinkIP, DirectLink, the beacon and pair wire types) and darwin-net:M17.2 (pkg/linkenum as the ONE HardwarePorts implementation, pkg/linkwatch, the netd 1.1 verbs). Both contract surfaces of the milestone note pass through this subphase: the candidates it publishes and the routes it asks for. The pairing deliverable is tier: integration under the cert/secret merge-precondition — /v1-k3sm/pair mints a token in pkg/bootstrap, so the named gate is run green on the rig and a security-engineer sign-off is recorded on the PR before merge."
+        deliverables:
+          - id: M17.3-d1
+            done: false
+            desc: "The DirectLink writer: cmd/k3sm/linkrefresh.go in the meshrefresh.go shape plus an immediate tick on a link event, WRITE-ON-CHANGE only (the probe loop is an in-memory heartbeat; lastTransition lives in status), so kine sees no idle churn; the new bootstrap verb POST /v1-k3sm/directlink (pkg/bootstrap/directlink.go) with the meshendpoint identity check — CN system:node:<name> must equal spec.nodeName — and the same pre-auth limiter and body limit as /join; the server publishes its own DirectLink in-process. The advisory node labels k3sm.io/direct-link-ports, k3sm.io/direct-link-medium, k3sm.io/direct-link-speed-gbps and the presence label k3sm.io/rdma (rdma_ctl enabled AND at least one rdma_enX) set in configureNode with setLabelPresence — advisory, because placement reads DirectLink.status and never a self-asserted label. Endpoint candidates (underlay | direct) in the mesh refresher and the enroll payloads; endpoint derivation admits the reserved halves ONLY for the direct class and keeps rejecting every other link-local address for the underlay."
+          - id: M17.3-d2
+            done: false
+            desc: "The server resolver pkg/linkgraph: an informer started after the apiserver serves and stopped on ctx, indexing domainUUID → (node, iface, linkIP, rdma) and writing status.ports[] through the status subresource with state up | peer-unknown | down and lastTransition. THE UP RULE: both ends list each other, both report linkUp AND routeReady, neither sets tunnelOnly, AND the peer node's Lease is fresh (a vanished node cannot report down, so liveness demotes it). domainUUID UNIQUENESS across the cluster — a collision is refused, never last-write-wins; GC on /mesh/deregister plus the Node ownerReference; the display label k3sm.io/direct-links=<up count>. Graph{Edges} from up ports only, with deterministic Clique(n, requireRDMA) and Ring(n) searches, table-tested over fake graphs."
+          - id: M17.3-d3
+            done: false
+            desc: "Cold start and the HA boundary: the join response gains ServerLinkIP (the server's address on the port the request arrived on), and the agent's first ConfigureLink{PeerLinkIP} installs the first-contact host route UNCONDITIONALLY, which breaks the cable-only circularity; the agent persists the server's link IP in node-assignment.json as its bootstrap address for the post-join verbs. The preflight and the pinned client accept a zoned IPv6 literal FOR THE AGENT JOIN ONLY; --server-join and --cluster-init REFUSE a zoned or reserved-half --server/--node-ip with a named error (R9 — HA over a cable-only cluster is a seam, not a promise)."
+          - id: M17.3-d4
+            done: false
+            desc: "pkg/bootstrap/pairing. The beacon: an unsigned UDP datagram every 2 s to ff02::1 on each Thunderbolt enX, port 9346, {v, cluster pin, node, joinPort, pairing: open|closed} — data only, a hint to ask, its pin information and not authentication. POST /v1-k3sm/pair on the join listener, bound per Thunderbolt interface (IPV6_BOUND_IF), never the wildcard: the identity-blind pre-auth limiter and body limit run BEFORE the decode (the handleJoin step-0 invariant), then in order, each a distinct 403/429 reason — (a) the LOCAL address is fe80::/10 with a zone that maps to a Thunderbolt hardware port through linkenum (never by source address or interface name; bridge0, Wi-Fi, Ethernet, a dock's Ethernet Adapter and utun refused), (b) the remote is fe80 on the same zone, (c) the window is open and completed < maxJoins, (d) one accept per interface per 10 s and a per-window mint cap. It mints an ordinary worker token through the filestore with a 2-minute TTL, BOUND TO nodeName (/join must present the same name) and ONE-SHOT WITH AN ATOMIC RESERVE (verify reserves under the store mutex, a failed join releases, a signed join consumes, reuse is ErrTokenConsumed); /join is otherwise byte-identical (R5). The window file <workDir>/pairing-window.json (0600, _k3sm, atomic rename under the token-store mutex; not a kine object). The agent pairing state machine, inert unless armed, armed for --arm (default 10 min), honouring --cluster <pin>, then the unchanged Join over [fe80::…%enX]:9345; the token never touches the new Mac's disk. THE TRUST DECISION IS PINNED by TestPairTrustDecision (a table over an injected HardwarePorts, a fake clock and fake addresses covering every refusal reason, the name binding, the one-shot reuse, a pin-mismatched beacon and an unarmed machine) PLUS a real-socket test recording the zone Go's net/http reports for an accepted link-local connection on Darwin, asserted against S3's golden value."
+          - id: M17.3-d5
+            done: false
+            desc: "The CLI: sudo k3sm pair --for <dur> [--max-joins N] opens the window (maxJoins counts COMPLETED joins, default 1), --close removes it, k3sm pair alone shows state AND prints the cluster pin with the exact --auto-join --cluster <pin> line for the new Mac, k3sm pair --listen <dur> re-arms a joiner; sudo k3sm install --auto-join [--cluster <pin>] [--arm <dur>] installs the agent role with no --server and no token; install --server --pairing <dur> opens the window at first install; k3sm link reset runs RemoveLink for every port and restores bridge0 membership (the rollback step), and k3sm link tunnel-only [--all] sets the per-port kill switch; k3sm uninstall restores bridge0 membership too."
+          - id: M17.3-d6
+            done: false
+            desc: "Operability: every link up/down transition, every pairing and every pairing refusal is a Node Event (refusals rate-limited) and a Warn-level slog / os_log line under io.k3sm.* naming the interface, the peer and the reason; k3sm doctor gains the direct-link section (ports and peers including peer-unknown cabled Macs, bridge membership, rdma_ctl status, the last transition, and idle sleep / auto-login / start-after-power-failure as advisories with the exact remedy — the Recovery step for RDMA is printed, never attempted); k3sm status gains the links row, and the plaintext state is visible on it (R3)."
+          - id: M17.3-d7
+            done: false
+            desc: "User docs, same change: docs/user/direct-links.md (the plug-and-join walkthrough, the cable-only cluster with one server, the TRUST STATEMENT in its own section — plaintext on the cable, every cable device can send as any pod, vm guest traffic rides the route, rank ports are reachable by every pod, the beacon discloses the pin and node name to every cable neighbour — the arming window and --cluster with the no-pin limitation stated, the sharded MLXModel example, the Thunderbolt 5 / RDMA ceiling, what unplugging does as facts with reasons including cable-only NotReady and the eviction timing, and what a mixed-version roll looks like), with cross-links and sections in multi-node.md, limitations.md, troubleshooting.md and the user-docs README. Figures name the Mac models and macOS build, never a hostname; EXPERIMENTAL as an attribute."
+          - id: M17.3-d8
+            done: false
+            desc: "hack/lab/m17.sh: the REAL ladder replacing the skeleton, flipping the phases.json M17-lab skeleton flag to false IN THE SAME CHANGE (the M11.5 / M15.3 precedent), with the M11 run-log header (gate, artifact sha256, per-repo git SHA, result). Rungs: cable-only join via pairing; the direct route up; the R15 figures recorded; LAN pulled → the cluster stays; cable pulled under load with the LAN present → fallback measured; peer asleep with the cable intact → fallback within 20 s; cable-only unplug → NotReady, replug → reconverges; pairing from Wi-Fi refused; the real-socket zone value matches the golden; the mixed-version rung (one Mac old, one new, cable live); downgrade with a live cable leaves no stale enX state; the sharded ring model (M17.4) serves through rank 0 with its tokens/s beside the single-Mac figure."
+        acceptance:
+          - id: M17.3-a1
+            met: false
+            check: "k3sm::TestPairTrustDecision and the pkg/linkgraph up-rule, domainUUID-uniqueness, Clique and Ring tables pass -race, plus the write-on-change and identity-check tests of the directlink verb; hack/ci.sh green"
+            method: unit
+          - id: M17.3-a2
+            met: false
+            check: "the pkg/bootstrap/pairing real-socket zone test passes on a dev Mac with its value equal to S3's golden (integration tier, so the pairing leaf lands lab-pending and this rung discharges it together with the recorded security-engineer sign-off)"
+            method: integration
+          - id: M17.3-a3
+            met: false
+            check: "hack/lab/m17.sh exits 0 on the rig under K3SM_LAB=1 with every rung above, the run log in hack/lab/runs/ carrying the four header fields, and the phases.json M17-lab row reading skeleton:false. Lab-ledger carve-out applies: met only by a recorded K3SM_LAB=1 run of hack/lab/m17.sh on the rig, never auto-greened by CI."
+            method: lab
+      - id: M17.4
+        title: sharded MLXModel — placement over the link graph, gang-scheduled rank Pods, the k3sm-shard entrypoint
+        status: in-progress  # 2026-10-05 — d1-d4 built and unit-proven; d5 (the CEL flip, B443) and d7 (the m17.sh composite) are not done, and d6's sandbox-apply half is runtimed's follow-up
+        strategy: hard cut
+        depends_on: []
+        note: "Depends on M17.3-d2 (the link graph). The CRD's CEL rule and the operator that honours spec.distributed ship in ONE binary (the CRD is ensured by the k3sm binary through pkg/crdensure), so a cluster can never accept ranks: 2 and serve single-node — the M8 silent-success rule. The sharded engine is mlx-lm in the M8 mlx-serve image; vllm-mlx and the M16 fleet are untouched, and a sharded model is one logical replica (R7). The jaccl leg is a CEILING until a Thunderbolt 5 rig proves it (R6)."
+        deliverables:
+          - id: M17.4-d1
+            done: true  # 2026-10-05 — pkg/mlx/operator/placement.go (Place, PlacementError, the consumer-defined Topology interface) over the pkg/mlx/topology Graph (Clique/Ring/FromDirectLinks from up DirectLink status ports); per-rank fit through mlx.PerRankMemory (share + per-process floor, checked by DeriveSizing). Proven by TestPlace (clique, one-TCP-edge refusal, rdma label, auto, cycle, any-nodes, too few nodes, NotReady, node selector, memory fit, unfundable share), TestPlaceJACCLDevicesIndexedByPeerRank and TestGraphSearches/TestFromDirectLinks. The graph is a consumer-side type in pkg/mlx/topology; whether the M17.3-d2 resolver graph and it become one type is decided when M17.3-d2 lands
+            desc: "Placement (pkg/mlx placement.go) over a consumer-defined Topology interface so its tests use a fake graph: jaccl needs a CLIQUE of ranks nodes with RDMA on every edge; ring needs ranks nodes with mlx.k3sm.io/gpu capacity and prefers a CYCLE in the cable graph (every hop a direct route), else any nodes (hops without a cable ride the utun); auto = jaccl if a clique exists, else ring. Each rank must fit memory / ranks plus the per-rank floor. Failure is ShardsPlaced=False naming what was missing (NoDirectLinkTopology: no rdma clique of 3, …), NEVER a single-node fallback."
+          - id: M17.4-d2
+            done: true  # 2026-10-05 — pkg/mlx/render_sharded.go (RenderSharded: owned <model>-rank-<i> Pods, nodeName, hostname/subdomain, the shared podNodeSelector + providerTolerations builder, per-rank memory/GPU, restartPolicy Never, cache claim per placed node, ClusterIP selector narrowed to rank 0) and the gang lifecycle in pkg/mlx/operator/sharded.go. Proven by TestRenderShardedGolden (testdata/sharded-ring-2 and sharded-jaccl-3), TestRenderShardedContract, TestShardedReconcilePlacesRankPods, TestShardedGangRestart (deleted, ended, NotReady node, older spec), TestShardedReplacesTheSingleNodeShape; the single-node render refuses a sharded spec (ErrDistributedSpec)
+            desc: "Rendering and lifecycle: N rank Pods OWNED BY THE OPERATOR (ownerReferences to the MLXModel, <model>-rank-<i>, nodeName from placement, the M8 memory/GPU resources, the cache claim per rank, spec.hostname/spec.subdomain so per-pod identity records exist) built with the SAME podNodeSelector + provider-toleration builder the StatefulSet path uses so the VAP admits them; the existing headless governing Service for per-rank DNS; the ClusterIP Service selecting rank 0 only through a rank label. GANG SEMANTICS: any rank lost (deleted, evicted, node NotReady) → the operator deletes the survivors and re-places all ranks; a partial set never serves. The single-node StatefulSet render is unchanged."
+          - id: M17.4-d3
+            done: true  # 2026-10-05 — ShardsPlaced (Placed / NoDirectLinkTopology / InsufficientMemory), LinksHealthy (LinksUp / LinkDegraded naming the link; ring keeps serving, jaccl cannot) and Ready over all ranks in pkg/mlx/status_sharded.go; the per-rank env and the rank-0 exec liveness probe (k3sm-shard --probe, 60 s period, 30 s timeout) in the render. Proven by TestDeriveShardedStatus, TestShardedReadyNeedsEveryRank, TestShardedLinksHealthy, TestShardedRefusalsAreStatuses. The probe COST figure is owed to the sharded-ring rung of hack/lab/m17.sh (M17.4-a3)
+            desc: "Conditions and env: ShardsPlaced, LinksHealthy (LinkDegraded when a placed link goes down — ring keeps serving over the utun, jaccl cannot), Ready over ALL ranks; a rank-0 liveness probe running a one-token generation on a 60 s cadence to catch a hung collective, its cost measured (too costly → a recorded open question, not a silent gap). Per-pod env MLX_RANK, MLX_WORLD_SIZE, MLX_METAL_FAST_SYNCH=1, K3SM_MLX_BACKEND, K3SM_MLX_RANKS (the per-rank headless names) and, for jaccl, K3SM_MLX_IBV_DEVICES_JSON rendered from the link graph (for peer rank j the local rdma_enX on the up link to rank j's node, null for self)."
+          - id: M17.4-d4
+            done: true  # 2026-10-05 — hack/images/mlx-serve/k3sm_shard.py, installed by build.sh as a top-level module; hack/images/mlx-serve/selftest.sh section 7 drives it with fake name resolution (16 checks: ring hostfile and jaccl device matrix written only under $TMPDIR, coordinator, --pipeline, bounded retry, refusals, probe verdicts), 51 passed / 0 failed. NOT covered here: the run under the real sandbox profile with live per-pod records, which is the sharded-ring rung of hack/lab/m17.sh
+            desc: "The k3sm-shard entrypoint in hack/images/mlx-serve/: DNS resolution and exec only — it resolves every rank name through the headless Service, writes MLX_HOSTFILE (ring) or MLX_IBV_DEVICES + MLX_JACCL_COORDINATOR (jaccl) ONLY INTO THE POD DATA VOLUME (the one writable path under the profile), then execs mlx_lm.server (--pipeline for pipeline parallelism); the mlx-serve selftest covers it under the real profile."
+          - id: M17.4-d5
+            done: true  # 2026-10-05 — the CEL flip landed: apis#79 moved the MLXModel rule from !has(self.distributed) to shape validation on spec.distributed (ranks set and >= 2; backend auto|ring|jaccl; parallelism tensor|pipeline), and TestCELAcceptsDistributedShape (pkg/crdensure) proves ranks: 2 ring/tensor ACCEPTED and ranks: 1, a missing ranks, backend: nccl and parallelism: expert REJECTED, CEL through the API server structural-cel validator and the enums through its OpenAPI schema validator
+            desc: "The CEL flip, IN THE SAME CHANGE AS THE OPERATOR: the MLXModel rule moves from !has(self.distributed) to shape validation (ranks >= 2, the backend and parallelism enums), and TestCELRejectsReservedDistributed and the apis embed_test reserved-field case flip with it — never ahead of placement, which is the reserved seam's whole point."
+          - id: M17.4-d6
+            done: false  # 2026-10-05 — the operator half is built: Place advertises jaccl only on a clique of nodes labelled k3sm.io/rdma with RDMA at both ends of every link (TestPlace jaccl rows). The sandbox-apply fail-closed half is the runtimed allow_rdma follow-up and is not built
+            desc: "The jaccl leg compiled and gated behind M17-rdma: advertised only where k3sm.io/rdma is present (no rig node), and a jaccl rank on a node without it FAILS CLOSED at sandbox apply, never degrading to a wider profile; the exact iokit-user-client-class grant is runtimed's follow-up through its sandbox backend seam once S6 records the class, set only by the MLX operator."
+          - id: M17.4-d7
+            done: false  # 2026-10-05 — hack/acceptance/m17.sh stays the skeleton; the composite needs a running cluster
+            desc: "hack/acceptance/m17.sh: the REAL single-Mac composite replacing the skeleton, flipping the phases.json M17 skeleton flag to false IN THE SAME CHANGE: enumeration with no cable yields an empty DirectLink; the CRDs are ensured; k3sm doctor prints the direct-link section; an MLXModel with ranks: 2 reports ShardsPlaced=False with the named reason; rank-Pod VAP admission; and the kubectl logs / exec / delete rank rungs, the delete ending in the documented gang restart."
+        acceptance:
+          - id: M17.4-a1
+            met: false  # 2026-10-05 — holds: the placement table, the rank-Pod render golden, the gang-restart test and the flipped CEL tests (TestCELAcceptsDistributedShape, B443) pass -race. Still owed: the mlx-serve selftest under the real profile (lab) and a workspace hack/ci.sh run, so met stays false
+            check: "the placement table over a fake Topology (clique, cycle, any-nodes, memory fit, every named ShardsPlaced reason), the rank-Pod render golden (owner, hostname/subdomain, the shared guardrail builder, rank-0 ClusterIP selector), the gang-restart test and the flipped CEL tests pass -race; the mlx-serve selftest covers k3sm-shard under the real profile; hack/ci.sh green"
+            method: unit
+          - id: M17.4-a2
+            met: false  # 2026-10-05 — m17.sh is still the skeleton (M17.4-d7)
+            check: "hack/acceptance/m17.sh exits 0 on a dev Mac and the phases.json M17 row reads skeleton:false, so TestNonManualSkeletonsAlwaysRed no longer selects it"
+            method: integration
+          - id: M17.4-a3
+            met: false  # 2026-10-05 — lab-ledger carve-out: met only by a recorded K3SM_LAB=1 run of hack/lab/m17.sh on the rig
+            check: "the sharded ring rung of hack/lab/m17.sh serves through rank 0 across the two cabled Macs with its tokens/s recorded beside the same model's single-Mac figure. Lab-ledger carve-out applies: met only by a recorded K3SM_LAB=1 run of hack/lab/m17.sh on the rig, never auto-greened by CI; the jaccl leg is NOT part of this acceptance (it is the M17-rdma row, RECORDED-only until a Thunderbolt 5 rig exists)."
+            method: lab
+      - id: M17.5
+        title: the site page, the register rows, and the EXPERIMENTAL bar
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        deliverables:
+          - id: M17.5-d1
+            done: false
+            desc: "site: the direct-links page, landed only after the M17-lab ladder is green on the rig; every figure is the measured Thunderbolt 4 figure with the Mac models and macOS build named, no RDMA figure k3sm did not measure, and a direct-route result below the wireguard-over-cable figure published as such (R15)."
+          - id: M17.5-d2
+            done: false
+            desc: "The register rows were written by the encode on 2026-10-05 (the k3s-distribution row, verdict not-applicable because k3s has no direct-link concept; the NetworkPolicy honest-limitation row's cable sentence, verdict unchanged). This deliverable re-reads both against what shipped and amends prose only; any verdict change is a human review, never a sweep."
+          - id: M17.5-d3
+            done: false
+            desc: "EXPERIMENTAL stays an ATTRIBUTE of direct links (the DirectLink type stays v1alpha1, docs/user/direct-links.md and the site carry the label) until the two-Mac lab ledger hack/lab/m17.sh is green TWICE on the rig; the public ROADMAP Future bullet this encoding lands is rewritten for what actually shipped."
+        acceptance:
+          - id: M17.5-a1
+            met: false
+            check: "hack/site.sh verify green with the direct-links page; the page's figures match the recorded S2/S5 and hack/lab/m17.sh run logs"
+            method: unit
+          - id: M17.5-a2
+            met: false
+            check: "two recorded green hack/lab/m17.sh runs on the rig before the EXPERIMENTAL attribute is removed. Lab-ledger carve-out applies: met only by recorded K3SM_LAB=1 runs of hack/lab/m17.sh, never auto-greened by CI."
+            method: lab
 ---
 
 # k3sm — Phase roadmap
@@ -1318,10 +1468,13 @@ Exit (§9 M3): two Macs, one cluster, cross-node pod-to-pod + ClusterIP + a Node
   `hack/lab/m7.sh` greens in the M7 tail — so M4 does not falsely flip `done`. (NodeNetwork no-op recording convention.)
 - 🟡 **M4.1** — RBAC enforcement (**hard cut**), CODE-COMPLETE + unit-proven. The apiserver default authorizer flips
   `AlwaysAllow → Node,RBAC` + the additive `NodeRestriction` admission plugin (`pkg/executor`); the flip is a **pure
-  authorizer switch** because the VK node / provisioners keep the static admin token (`system:masters`, RBAC-exempt) and
+  authorizer switch** because the provisioners keep the static admin token (`system:masters`, RBAC-exempt) and
   the scheduler + KCM carry their **own per-component client certs** (`system:kube-scheduler` /
   `system:kube-controller-manager`, #14) that the apiserver's bootstrap RBAC binds — the M4.1 **component-identity
-  divergence**, since narrowed to the VK node + provisioning client. `pkg/rbac.Provision` (NEW; Create-tolerate-
+  divergence**, since narrowed to the post-bring-up admin client with the server-side controllers on it, `kubectl`,
+  and the healthz probe: the server's in-process VK node now runs as `system:node:<name>` under the Node authorizer
+  (this narrows the node client, not the server process, which still holds the admin kubeconfig and the signing CA).
+  `pkg/rbac.Provision` (NEW; Create-tolerate-
   `AlreadyExists`, no watch-cache LIST-to-decide) lays down, **fail-closed before the node/join-supervisor start**, the
   **node-datapath ClusterRole** (`system:nodes` ⇒ read `services`/`endpointslices`/`meshpeers` — the grant the Node
   authorizer/stock `system:node` role do *not* give a joined worker, keeping its Service proxy + DNS + mesh watcher
@@ -1340,7 +1493,7 @@ Exit (§9 M3): two Macs, one cluster, cross-node pod-to-pod + ClusterIP + a Node
   (integration-pending** — the M2/M3 integration legs need a dev Mac + root).
 
 ## M5 — vm RuntimeClass (committed) ✅
-Promoted from a stretch goal to a committed milestone to run stockkitty's **Linux-only** Postgres/pgvector
+Promoted from a stretch goal to a committed milestone to run a reference workload's **Linux-only** Postgres/pgvector
 (the HYBRID decision — native arm64 for everything else). `runtimeClassName: vm` dispatches to runtimed:M5's
 Virtualization.framework Linux micro-VM via the apis:M5.1 `runtime.k3sm.io` handler-config (mapping the value
 to the existing `SANDBOX_BACKEND_VM`; the upstream `node.k8s.io/RuntimeClass` is consumed, not forked). Linux
@@ -1564,7 +1717,7 @@ d4 B6 producer wiring (`SetupGuest` **before** `toPodBox`, in-process `runtimed.
 proto field); d5 admission + docs (os=darwin incantation; the fsGroup VAP exemption is
 **human-gated B112**, cited by name so no wave relaxes `pkg/policy/admission.go` ad hoc;
 `limitations.md` vm rewrite with the published S1/S2/S3 figures and the honest ceilings).
-Guest hostPath stays fail-closed pending human-gated B98 — stockkitty acceptance is
+Guest hostPath stays fail-closed pending human-gated B98 — reference-workload acceptance is
 **PVC-backed PGDATA**.
 
 ### M11.5 — gate ⬜
@@ -1732,3 +1885,93 @@ green on the rig 2026-09-14 with a security sign-off, re-run green at head on a 
 2026-09-24 (35/35, no leftover volumes). An earlier revision of this record claimed no such gate
 existed; that was wrong — the lab rungs live in `hack/acceptance/`, not `hack/lab/`, and the
 correction is this sentence. CI still runs only the unit tier; the lab tier stays opt-in.
+
+## M17 — Direct links: Thunderbolt-cabled Macs form, carry, and shard the cluster on their own ⬜
+`docs/m17-plan.md` is authoritative (encoded 2026-10-05). M17 adds **direct links**: a
+point-to-point link between two cluster Macs that k3sm discovers, addresses, routes over, prefers,
+and exposes as topology. Thunderbolt is the only medium at v1 and appears only as a value; the
+type (`net.k3sm.io/v1alpha1 DirectLink`), the verbs (`k3sm pair`, `k3sm link`, `--auto-join`) and
+the label keys (`k3sm.io/direct-link-*`) are medium-agnostic. Control stays where it is (the
+apiserver over the wireguard mesh, the join port, CRDs in kine); the cable becomes a **data path
+and a discovery path**, applied by the root helper from typed values and withdrawn by the kernel
+when the cable goes. Link addresses are **derived** from the node index into the RFC 3927 reserved
+halves of `169.254/16` by one pure function in `apis`, never allocated.
+
+**Phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)**, over two surfaces.
+The mesh endpoint/route protocol: `MeshPeerSpec` gains an additive `Endpoints[]` candidate list,
+`SchemaVersion` **stays 1** (the plan reader skips any other stamp, so a bump would blackhole every
+new node from every old reader), `Endpoint` is always written, and a node installs two direct /25
+routes toward a peer only when that peer's port is `up` (both ends `routeReady`, the peer's Lease
+fresh) and the link is up locally; the utun /24 never leaves, so the kernel's own route deletion
+is the fallback. The `k3sm-netd` helper IPC: an additive minor bump to 1.1, gated by the helper's
+reported version, so a 1.0 helper is never sent a field it would silently drop. Any restart order
+is safe; the server goes first for the feature, `io.k3sm.netd` first on each node. Rollback
+releases host state first (`tunnelOnly: true` per port, then `k3sm link reset`), then revert and
+reinstall.
+
+Two rulings are recorded in the ledger run log at encode time. **Pairing window**: physical
+presence on a Thunderbolt hardware port while the operator's window (`sudo k3sm pair --for 10m`)
+is open is the server-side credential; the joiner is armed for a bounded window and may pin the
+cluster with `--cluster <pin>`, and without the pin it trusts the first open-pairing server it
+hears while armed, which the user doc states as a limitation. **Plaintext on the cable** is a
+trust statement, not a mitigation: nothing on the wire checks that a pod source arriving on the
+cable is that peer's pod, `vm` guest traffic rides the route too, the state is visible wherever
+the link is, and `tunnelOnly` is the per-link opt-out. Sharded serving is trusted tenancy only.
+
+The rig is the two lab Macs (both Thunderbolt 4) with one cable between them; plugging it is the
+one physical touch, and after it every M17 row except `M17-rdma` runs on the rig under
+`K3SM_LAB=1`. `M17-rdma` needs a Thunderbolt 5 Mac with RDMA enabled in macOS Recovery and is
+recorded-only until one exists. `human_gate` is none throughout (no external trust root, no human
+key, no RBAC widening); the pairing work is `tier: integration` and carries the cert/secret
+merge-precondition (the named gate green on the rig and a recorded `security-engineer` sign-off).
+
+### M17.0 — spike S1–S5 ⬜
+A privileged script file run under `sudo` on each Mac with a **restore-on-exit trap** (bridge
+membership, aliases and routes put back, the LAN route never touched, the rig left on `main` with
+both nodes Ready), in the M16 spike shape: exit contract 0 PASS / 1 FAIL / 2 RECORDED, `--plan`
+parsed before any host requirement, `K3SM_LAB` unset prints PENDING. **S1** enumeration and the
+`system_profiler` ↔ `networksetup` mapping, its stability and cost, and whether `PF_ROUTE` sees a
+Thunderbolt `enX`. **S2** the /32 alias, the on-link host route and the two /25 gateway routes
+with the mesh-egress source, and the R15 figure schema (direct, wireguard-over-cable and Wi-Fi,
+medians and p99 with the exact command, Mac models, macOS build and cable). **S3** link-local
+multicast and a TLS dial over `fe80::%enX`, with the zone string `net/http` reports recorded as the
+golden value the pairing trust table depends on. **S4** sleep, unplug and replug under a bulk flow.
+**S5** two `mlx-lm` ranks over the `ring` backend between pods on the two Macs, binding and dialing
+pod IPs under the shim, against the single-Mac figure. S6 (Thunderbolt 5 / RDMA) is the `M17-rdma`
+row, not this one, so `run.sh` can exit 0 on the rig. Every halt's substitution is pre-decided.
+
+### M17.3 — networking, pairing and operability ⬜
+The `DirectLink` writer (`linkrefresh.go`, write-on-change, so kine sees no idle churn) and
+`POST /v1-k3sm/directlink` with the node-cert identity check; the server resolver `pkg/linkgraph`
+(the Lease-aware `up` rule, `domainUUID` uniqueness refused on collision, GC on deregister,
+`Graph`/`Clique`/`Ring`); the advisory labels, read by nothing that places work; endpoint
+candidates in the refresher and enroll payloads; `ServerLinkIP` in the join response and the
+unconditional first-contact `ConfigureLink`, which breaks the cable-only cold-start circularity.
+`pkg/bootstrap/pairing` carries the beacon, `/v1-k3sm/pair` behind the step-0 limiter and bound per
+Thunderbolt interface, and a name-bound, one-shot, atomically reserved token through the existing
+filestore, so `/join` stays the join. The trust decision is pinned by `TestPairTrustDecision` plus a
+real-socket zone test against S3's golden value. The CLI (`sudo k3sm pair`, `install --auto-join` /
+`--pairing`, `k3sm link reset` / `tunnel-only`), the zoned-literal preflight scoped to the agent
+join, the HA flags refusing a zoned or reserved-half address, Node Events and `os_log` transitions,
+the `doctor` and `status` rows, `docs/user/direct-links.md` with its cross-links, and the real
+`hack/lab/m17.sh` ladder, which replaces the skeleton and flips `skeleton` to `false` in the same
+change.
+
+### M17.4 — sharded `MLXModel` ⬜
+`spec.distributed` leaves reserved: placement over a consumer-defined `Topology` seam (`jaccl` needs
+an RDMA clique, `ring` prefers a cable cycle, failure is `ShardsPlaced=False` with a named reason and
+never a single-node fallback), N operator-owned rank Pods with gang semantics, `hostname` /
+`subdomain` for per-rank DNS, the same guardrail builder as the StatefulSet path so admission
+accepts them, the ClusterIP selecting rank 0, `ShardsPlaced` / `LinksHealthy` / `Ready` over all
+ranks, and a rank-0 liveness probe for a hung collective. The engine is `mlx-lm` in the M8
+`mlx-serve` image behind a `k3sm-shard` entrypoint that writes only into the pod data volume;
+`vllm-mlx` and the M16 fleet are untouched. The CRD's CEL rule flips in the **same change** as the
+operator, so a cluster never accepts `ranks: 2` and serves single-node. The real
+`hack/acceptance/m17.sh` composite replaces its skeleton; the `jaccl` leg compiles and is gated
+behind `M17-rdma`.
+
+### M17.5 — site, registers, EXPERIMENTAL ⬜
+The direct-links page lands after the lab ladder is green, with measured Thunderbolt 4 figures that
+name the Mac models and macOS build and no RDMA figure k3sm did not measure. The register rows were
+written by the encode; this sub-phase re-reads them against what shipped. Direct links stay
+EXPERIMENTAL, as an attribute, until `hack/lab/m17.sh` is green twice on the rig.

@@ -2,7 +2,7 @@
 
 > ## ⚠️ This is NOT a CNCF Certified-Kubernetes badge
 >
-> **k3sm has not run the upstream Sonobuoy `[Conformance]` suite, and by design cannot pass it.** That
+> **k3sm has not run the upstream `[Conformance]` suite, and by design cannot pass it.** That
 > suite ([CNCF Certified Kubernetes](https://www.cncf.io/training/certification/software-conformance/))
 > assumes **Linux containers, cgroups, CNI, and network namespaces**; k3sm runs Pods as **native Darwin
 > processes** on Apple Silicon with none of those substrates, so it does not pass
@@ -71,5 +71,5 @@ Per the internal §By-design summary, summarized rather than restated:
   `[Conformance]` pass. Re-derive any row against current `main`.
 - A `🟡 planned` row's criterion is **owed**, not present; it names the behaviour still to be
   asserted.
-- A live `[Conformance]`/Sonobuoy run against the *adapted* subset remains an explicit future lab goal
+- A live `[Conformance]` run against the *adapted* subset remains an explicit future lab goal
   (DESIGN §9), out of scope for this static profile.

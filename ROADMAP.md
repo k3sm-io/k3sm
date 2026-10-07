@@ -61,8 +61,28 @@ release engineering. What ships:
   buildkitd image currently defaults to the pinned upstream digest rather than the (still-private)
   k3sm GHCR mirror, and buildx ships as a verified prebuilt asset rather than source-built; both are
   the remaining packaging work.
-- **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
-  with an identical-CA bundle. *(implemented; a two-Mac + Postgres failover has not run yet)*
+- **HA control plane (experimental).** Since v0.1.7 two Macs can share the control plane on
+  embedded etcd: `k3sm install --cluster-init` on the first server and `k3sm install
+  --server-join` on the second, each server's pod range coming from its `--mesh-ip`. Two servers
+  tolerate no failures, workers stay attached to the server they joined through, and a leader
+  lease lost to quorum loss is still counted as a crash. The external-datastore path (kine to
+  Postgres) was removed in v0.1.6, and single-node installs keep the SQLite-backed datastore.
+- **v0.1.7.** A `vm` Pod answers on its pod IP from every node: its node holds the address and
+  relays each TCP connection on the Pod's declared and Service-targeted ports to the guest, so
+  Services reach `vm` Pods across nodes. The experimental two-server control plane above ships in
+  this release.
+- **v0.1.6.** Hosts survive heavy pod-network traffic: TCP connections on the pod network have
+  their segment size lowered after connect, and a torn-down pod's address is blackholed, so an open
+  connection fails cleanly instead of re-routing onto the mesh interface and triggering a macOS
+  kernel panic. A shadow set of re-signed shell utilities makes mounted paths work for `tar`, the
+  usual coreutils and recursive walks (`rm -r`, `ls -R`, `find`, `cp -R`). Native Pods run `curl`
+  and other TLS clients. The server's node runs as `system:node:<name>` under the Node authorizer.
+  The node evicts Pods under memory pressure, one at a time. Container logs are written to disk in
+  the CRI format, and a resident shim keeps container output and exit status. `k3sm status`
+  reports the data volume, and `k3sm install --data-volume` puts the data root on a size-capped
+  APFS volume. Two alphas ride along: the groundwork for Thunderbolt direct links between Macs
+  (contracts and the networking library, not yet wired into the node) and sharded MLX models
+  placed over the existing mesh, neither yet run on hardware.
 - **Conformance hardening.** As close to standard k8s as the Darwin substrate
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
@@ -70,12 +90,12 @@ release engineering. What ships:
   is **not** a CNCF `[Conformance]` pass (the default path, which the suite targets, runs no Linux
   containers). [`docs/conformance-profile.md`](docs/conformance-profile.md) is the self-assessment,
   mapping targeted feature classes to a passing criterion or a documented ceiling.
-- **Native Apple-Silicon ML serving with MLX (the NVIDIA-GPU-Operator analog for Mac).** Schedule
+- **Native Apple-Silicon ML serving with MLX (the GPU-operator analog for Mac).** Schedule
   and serve ML models on Apple GPUs / unified memory with first-class Kubernetes semantics: an
   **`MLXModel` CRD** (`mlx.k3sm.io/v1alpha1`), an `mlx.k3sm.io/gpu` **extended resource**, and an
   in-binary operator that reconciles a model to a StatefulSet + Service serving an
-  OpenAI-compatible API. *(22 of 22 checks pass on an
-  Apple GPU, including a Hugging Face weight
+  `/v1/chat/completions` API. *(22 of 22 checks pass on an
+  Apple GPU, including a model-hub weight
   download under a default-deny Seatbelt profile and a clean deletion)*
 
 ## v0.1.0, the public release (shipped 2026-09-01)
@@ -98,7 +118,7 @@ release engineering. What ships:
   published performance figures and the remaining gaps ship in v0.2, below)*
 - linux/amd64 images do not run on any path yet. Running them needs Rosetta-for-Linux
   translation inside the guest, cut from the first release so the arm64 path could
-  ship on its own. There is no emulation fallback, because no qemu exists for a Darwin host. An
+  ship on its own. There is no emulation fallback, because no user-mode x86 emulator exists for a Darwin host. An
   amd64-only image is refused at pull with a no-matching-platform error rather than started and
   left to crash, and a node that cannot translate does not advertise that it can.
   *(scheduled for a v0.1.x follow-up)*
@@ -123,14 +143,21 @@ v0.1.1 followed on 2026-09-02; see [CHANGELOG.md](CHANGELOG.md) for what it adds
 - **ANE.** Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA.** Dynamic Resource Allocation for GPUs, once extended resources have shipped.
 - **A serving fleet for MLX models.** Multi-model, multi-worker inference above `MLXModel`: an
-  OpenAI-compatible frontend, worker discovery, and routing that prefers the worker already
-  holding a request's prefix. The control plane is the upstream NVIDIA Dynamo serving stack
+  `/v1/chat/completions` frontend, worker discovery, and routing that prefers the worker already
+  holding a request's prefix. The control plane is an upstream open-source inference-serving stack
   (Apache-2.0) run as `vm` Pods, with the workers native beneath it on the GPU. It is the layer
   the two bullets below would attach to: distributed inference is what a fleet would route
   across, and autoscaling is a planner sitting above one. `MLXModel` stays the one-object way to
   serve a single model.
-- **JACCL / distributed inference.** Multi-Mac model sharding (the reserved `MLXModel.Distributed`
-  seam + the already-rendered headless governing Service).
+- **Direct links.** Macs cabled together over Thunderbolt find each other on the cable, and a new
+  Mac joins while the server's pairing window is open (`sudo k3sm pair`), optionally pinned to the
+  cluster it expects. Cluster traffic between two cabled Macs then takes the cable as a plain kernel
+  route, with the wireguard mesh kept for peers that have no cable and as the fallback when one is
+  pulled. That route is not encrypted, so the cable is treated as a trusted segment, and a per-link
+  switch sends a link back through the tunnel. On top of the link graph, an `MLXModel` can be
+  sharded across cabled Macs (the reserved `MLXModel.Distributed` seam, one rank per Mac) on MLX's
+  `ring` backend. The `jaccl` backend over RDMA follows where macOS exposes it, which today means
+  Thunderbolt 5 Macs on macOS 26.2 or later with RDMA enabled once in macOS Recovery.
 - **Autoscaling.** Scale-to-zero / activator-fronted model serving.
 
 ### Non-goals

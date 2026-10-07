@@ -156,6 +156,11 @@ func (r *runtimedRuntime) attachPod(ctx context.Context, a podAttacher, pod *cor
 		return false
 	}
 	ctx = withPodIdentity(ctx, pod)
+	// Registered before the first read (buildBox resolves env) and before
+	// the first refresh tick, or both would be refused as unreferenced. A
+	// failed attach leaves it registered: the pod still exists on this node,
+	// and its create or delete takes the registration from here.
+	r.refs.RegisterPod(pod)
 	box, err := r.buildBox(ctx, pod, podIP)
 	if err != nil {
 		r.log.Warn("startup re-attachment: cannot translate the pod; it will be created again", "namespace", pod.Namespace, "name", pod.Name, "err", err)
@@ -195,6 +200,15 @@ func (r *runtimedRuntime) attachPod(ctx context.Context, a podAttacher, pod *cor
 // reattachPodIP returns the address an attached pod keeps, re-reserving it on
 // the pod network. false means the pod cannot be attached with its address
 // intact and must be created again.
+//
+// NO VM BRANCH, deliberately. A vm guest never survives a node-daemon restart:
+// its VM helper dies with the daemon, runtimed's AttachPod refuses a vm pod
+// (ErrNothingToAttach, "not a host-process pod"), and listPodsToAttach drops vm
+// pods before an attach is tried. So a vm pod never reaches here, its published
+// /32 alias is an orphan that the startup sweep (ReconcileStartup) correctly
+// removes, and the pod is created again with a fresh SetupGuest. podnet's
+// ReattachGuest exists for the day guests outlive the daemon; wiring it here is
+// part of that change, together with reattaching the guest itself.
 func (r *runtimedRuntime) reattachPodIP(ctx context.Context, pod *corev1.Pod) (string, bool) {
 	if r.network == nil {
 		return r.nodeIP, true

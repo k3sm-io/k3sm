@@ -246,29 +246,34 @@ func TestJoinRefusesTheControlPlaneNodeName(t *testing.T) {
 		}
 	})
 
-	t.Run("the name match is trimmed and case-insensitive", func(t *testing.T) {
+	t.Run("a near-miss spelling is refused before the name match", func(t *testing.T) {
 		t.Parallel()
 		enroller := newPeerStoreEnroller("100.64.0.0/24", selfMeshIP, selfPeer)
 		rig := newSelfNameJoinServerRig(t, enroller, selfName)
 
 		// A Kubernetes node name is lowercase RFC-1123, so a request differing
 		// only in case or surrounding space is never a second legitimate node —
-		// but it WOULD be a one-character bypass of a byte-equality guard.
+		// and it must not be a one-character bypass of the exact-match guard.
+		// It is refused as a non-canonical name (400), with the same answer any
+		// other non-canonical name gets, so it never reaches the comparison.
 		for _, claimed := range []string{"K3SM-Host", " k3sm-host", "k3sm-host\n"} {
 			status, body := rig.post(t, bootstrap.JoinRequest{
 				SchemaVersion: bootstrap.JoinSchemaVersion,
 				Token:         rig.token,
 				NodeName:      claimed,
 				NodePassword:  "attacker-node-password",
-				ClientCSRPEM:  nodeCSRPEM(t, claimed, nil, []net.IP{net.ParseIP(selfMeshIP)}),
+				ClientCSRPEM:  nodeCSRPEM(t, selfName, nil, []net.IP{net.ParseIP(selfMeshIP)}),
 				Mesh:          netv1.MeshEnrollRequest{NodeName: claimed}.WithDefaults(),
 			})
-			if status != http.StatusForbidden {
-				t.Errorf("node name %q: status = %d (%s), want 403", claimed, status, body)
+			if status != http.StatusBadRequest {
+				t.Errorf("node name %q: status = %d (%s), want 400", claimed, status, body)
 			}
 		}
 		if n := enroller.calls(); n != 0 {
 			t.Errorf("the enroll ran %d times across the near-miss names, want 0", n)
+		}
+		if _, bound := rig.passwords.StoredHash(selfName); bound {
+			t.Error("a near-miss spelling bound a node-password for the control plane's own name")
 		}
 	})
 

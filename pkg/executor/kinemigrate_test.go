@@ -198,9 +198,9 @@ func TestKineSnapshotWriteOnce(t *testing.T) {
 	}
 }
 
-// TestKineSnapshotSkips pins the three no-op cases. Each matters on its own: a fresh
-// node has nothing to protect, an unchanged pin must not re-copy the database on every
-// boot, and the Postgres posture has no state.db at all.
+// TestKineSnapshotSkips pins the no-op cases. Each matters on its own: a fresh node has
+// nothing to protect, and an unchanged pin must not re-copy the database on every boot.
+// (The etcd posture never reaches the snapshot: provision skips it there.)
 func TestKineSnapshotSkips(t *testing.T) {
 	ctx, log := t.Context(), discardLogger()
 
@@ -216,7 +216,7 @@ func TestKineSnapshotSkips(t *testing.T) {
 
 	t.Run("pin unchanged (stamp matches)", func(t *testing.T) {
 		work := newWALFixture(t, 3)
-		if err := recordKinePin(work, DefaultKineVersion, ""); err != nil {
+		if err := recordKinePin(work, DefaultKineVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		if err := snapshotBeforeKineUpgrade(ctx, log, work, DefaultKineVersion); err != nil {
@@ -298,7 +298,7 @@ func TestKineSnapshotPreservesOldBinary(t *testing.T) {
 // get stamped at all is TestKinePinStampedOnFirstBoot's contract.
 func TestRecordKinePinRoundTrip(t *testing.T) {
 	work := newWALFixture(t, 1)
-	if err := recordKinePin(work, DefaultKineVersion, ""); err != nil {
+	if err := recordKinePin(work, DefaultKineVersion, false); err != nil {
 		t.Fatal(err)
 	}
 	v, variant, ok := readKinePin(work)
@@ -319,23 +319,23 @@ func TestRecordKinePinRoundTrip(t *testing.T) {
 // SECOND boot. Anything treating the stamp as authoritative (the pin-witness of a
 // long-running soak; an operator asking what opened this database) read "unknown" for a
 // datastore a known pin was serving. The posture that legitimately skips the stamp is
-// an EXTERNAL datastore, which is what the endpoint names.
+// the etcd posture, which runs no kine.
 func TestKinePinStampedOnFirstBoot(t *testing.T) {
 	cases := []struct {
 		name      string
-		stateDB   bool   // does state.db exist when kine reports ready?
-		endpoint  string // "" = this node's own SQLite datastore
+		stateDB   bool // does state.db exist when kine reports ready?
+		etcd      bool // the etcd posture: no kine datastore
 		wantStamp bool
 		because   string
 	}{
-		{"fresh node — kine has not created state.db yet", false, "", true,
+		{"fresh node — kine has not created state.db yet", false, false, true,
 			"a first boot is exactly when the stamp starts being the answer, and it went missing"},
-		{"returning node — state.db already on disk", true, "", true,
+		{"returning node — state.db already on disk", true, false, true,
 			"the pre-existing case, which was the only one that ever worked"},
-		{"external datastore, no state.db", false, "postgres://k3sm@db.example:5432/kine", false,
-			"there is no per-node SQLite file for the stamp to describe"},
-		{"external datastore beside a leftover state.db", true, "postgres://k3sm@db.example:5432/kine", false,
-			"the endpoint decides the posture — a stale local file must not resurrect the stamp"},
+		{"etcd posture, no state.db", false, true, false,
+			"there is no kine SQLite file for the stamp to describe"},
+		{"etcd posture beside a leftover state.db", true, true, false,
+			"the configuration decides the posture — a stale local file must not resurrect the stamp"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -348,7 +348,7 @@ func TestKinePinStampedOnFirstBoot(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := recordKinePin(work, DefaultKineVersion, tc.endpoint); err != nil {
+			if err := recordKinePin(work, DefaultKineVersion, tc.etcd); err != nil {
 				t.Fatalf("recordKinePin = %v, want nil", err)
 			}
 			v, variant, ok := readKinePin(work)
@@ -372,7 +372,7 @@ func TestKinePinStampedOnFirstBoot(t *testing.T) {
 		if err := os.Remove(StateDBPath(work)); err != nil { // reset to a fresh node
 			t.Fatal(err)
 		}
-		if err := recordKinePin(work, DefaultKineVersion, ""); err != nil {
+		if err := recordKinePin(work, DefaultKineVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(StateDBPath(work), []byte("SQLite format 3"), 0o600); err != nil {

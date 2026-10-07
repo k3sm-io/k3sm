@@ -73,8 +73,8 @@ You do not have to do anything for this, but you should know what it does.
 - Keep the `.bak` until you are satisfied with the new release, then delete it. It is a full copy
   of the database.
 
-On the [HA](ha.md) Postgres setup none of this applies. The datastore is your Postgres, and its
-backup is `pg_dump`/PITR on your schedule.
+A server started with `--cluster-init` keeps its state in an embedded etcd member instead, and none
+of this applies there. A multi-server control plane is not available in v0.1.6; see [HA](ha.md).
 
 ## Upgrading Into the Reserved-Port Policy
 
@@ -144,9 +144,10 @@ Anything listed has two ways out:
   restart, and it changes the port anything else of yours uses to reach the datastore.
 
 One limit: the policy is a single cluster-scoped object carrying the ports of the server that
-provisioned it, while `--kine-port` is per server. In an HA set whose servers use different datastore
-ports, the policy names one of them. A Service on another server's port is admitted by the API and is
-still unreachable from the pods on that server's node.
+provisioned it, while `--kine-port` is per server. A control plane whose servers used different
+datastore ports would have a policy that names one of them, and a Service on another server's port
+would be admitted by the API and still unreachable from the pods on that server's node. A
+multi-server control plane is not available in v0.1.6 (see [HA](ha.md)).
 
 ## Rollback
 

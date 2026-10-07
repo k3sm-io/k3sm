@@ -36,6 +36,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"k3sm.io/darwin-net/pkg/netbind"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // IgnoreLabel marks a LoadBalancer Service this controller must SKIP entirely
@@ -145,8 +146,8 @@ type Controller struct {
 	// recorder records Warning Events on Services; set by New from the config or
 	// by Run before the reconcile loop starts.
 	recorder record.EventRecorder
-	// dial is the backend-dial seam handed to every forwarder; nil means a plain
-	// net.Dialer (tests inject a recording fake).
+	// dial is the backend-dial seam handed to every forwarder; nil means a
+	// segment-clamped tcpseg.Dialer (tests inject a recording fake).
 	dial dialFunc
 	// now is the clock seam for the throttle (tests).
 	now func() time.Time
@@ -437,10 +438,14 @@ func (c *Controller) bind(ctx context.Context, port int32, dst netip.AddrPort, r
 	if c.cfg.ReservedPorts[port] {
 		return nil, fmt.Errorf("svclb: refusing port %d: %w", port, errReservedPort)
 	}
-	ln, err := c.dir.Listen(ctx, "tcp", c.bindAddrPort(port))
+	raw, err := c.dir.Listen(ctx, "tcp", c.bindAddrPort(port))
 	if err != nil {
 		return nil, err
 	}
+	// Clamp every accepted connection's TCP segment size: a local pod reaches a
+	// LoadBalancer address over lo0, and that connection must not carry
+	// lo0-sized segments onto the mesh if its route moves.
+	ln := tcpseg.WrapListener(raw)
 	fctx, cancel := context.WithCancel(ctx)
 	f := &forwarder{ln: ln, dst: dst, cancel: cancel, done: make(chan struct{}), log: c.log, dial: c.dial}
 	f.setRanges(ranges)
@@ -676,7 +681,7 @@ type forwarder struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	log    *slog.Logger
-	// dial is the backend-dial seam; nil means a plain net.Dialer.
+	// dial is the backend-dial seam; nil means a segment-clamped tcpseg.Dialer.
 	dial dialFunc
 	// ranges is the client source-range set enforced at accept. It is WRITTEN by
 	// the controller's reconcile goroutine (bind, then every reconcile) and READ
@@ -739,7 +744,9 @@ func (f *forwarder) splice(ctx context.Context, src net.Conn) {
 	defer src.Close()
 	dial := f.dial
 	if dial == nil {
-		var d net.Dialer
+		// The VIP is an lo0 alias: the clamp keeps this connection's segment
+		// size safe for the mesh should the alias's route move.
+		var d tcpseg.Dialer
 		dial = d.DialContext
 	}
 	dst, err := dial(ctx, "tcp", f.dst.String())

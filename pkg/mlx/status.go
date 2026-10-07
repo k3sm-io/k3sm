@@ -190,7 +190,11 @@ func DeriveStatus(m *mlxv1alpha1.MLXModel, obs Observation, opts StatusOptions, 
 	status := *m.Status.DeepCopy()
 	status.ObservedGeneration = m.Generation
 
-	ready, counts, reason, message := deriveReady(m, obs)
+	desired := int32(1)
+	if m.Spec.Replicas != nil {
+		desired = *m.Spec.Replicas
+	}
+	ready, counts, reason, message := deriveReady(desired, obs, unitReplicas)
 	status.Replicas = counts.replicas
 	status.UpdatedReplicas = counts.updated
 	status.ReadyReplicas = counts.ready
@@ -267,7 +271,10 @@ func PhaseFromConditions(conds []metav1.Condition) mlxv1alpha1.MLXModelPhase {
 		return mlxv1alpha1.MLXModelPhaseReady
 	}
 	switch c.Reason {
-	case ReasonPending, ReasonScaledToZero:
+	case ReasonPending, ReasonScaledToZero, ReasonNoDirectLinkTopology, ReasonInsufficientMemory, ReasonInsufficientGPU:
+		// The sharded placement refusals read as Pending, not Failed: the
+		// operator re-places on its own when nodes or cables appear, so the
+		// model is waiting on the cluster, not dead.
 		return mlxv1alpha1.MLXModelPhasePending
 	case ReasonDownloading:
 		return mlxv1alpha1.MLXModelPhaseDownloading
@@ -330,6 +337,12 @@ type replicaCounts struct {
 	replicas, updated, ready int32
 }
 
+// The nouns deriveReady's messages count in.
+const (
+	unitReplicas = "replicas"
+	unitRanks    = "ranks"
+)
+
 // deriveReady is the whole state machine, in precedence order. The order is the
 // contract, not an implementation detail:
 //
@@ -349,12 +362,11 @@ type replicaCounts struct {
 // model-weights ResolvedRevision). Without that, a roll to a new template would
 // report Serving the moment it began, off the strength of the old pods still
 // answering.
-func deriveReady(m *mlxv1alpha1.MLXModel, obs Observation) (ready bool, counts replicaCounts, reason, message string) {
-	desired := int32(1)
-	if m.Spec.Replicas != nil {
-		desired = *m.Spec.Replicas
-	}
-
+//
+// desired is the number of pods that must be ready (spec.replicas for the
+// single-node path, the rank count for a sharded model), and unit names them in
+// the messages ("replicas" or "ranks").
+func deriveReady(desired int32, obs Observation, unit string) (ready bool, counts replicaCounts, reason, message string) {
 	counts.replicas = int32(len(obs.Pods))
 	var failed, laggardName string
 	laggardStale := false
@@ -391,19 +403,19 @@ func deriveReady(m *mlxv1alpha1.MLXModel, obs Observation) (ready bool, counts r
 	case desired <= 0:
 		return false, counts, ReasonScaledToZero, "spec.replicas is 0: no replica is serving"
 	case readyCount >= desired:
-		return true, counts, ReasonServing, fmt.Sprintf("%d of %d replicas ready", readyCount, desired)
+		return true, counts, ReasonServing, fmt.Sprintf("%d of %d %s ready", readyCount, desired, unit)
 	case failed != "":
-		return false, counts, ReasonPodFailed, fmt.Sprintf("replica %s failed (%d of %d replicas ready)", failed, readyCount, desired)
+		return false, counts, ReasonPodFailed, fmt.Sprintf("replica %s failed (%d of %d %s ready)", failed, readyCount, desired, unit)
 	case laggard == stageLoading:
-		return false, counts, ReasonLoading, fmt.Sprintf("replica %s is loading the model (%d of %d replicas ready)", laggardName, readyCount, desired)
+		return false, counts, ReasonLoading, fmt.Sprintf("replica %s is loading the model (%d of %d %s ready)", laggardName, readyCount, desired, unit)
 	case laggard == stageDownloading:
-		return false, counts, ReasonDownloading, fmt.Sprintf("replica %s has not answered its serving surface yet (%d of %d replicas ready)", laggardName, readyCount, desired)
+		return false, counts, ReasonDownloading, fmt.Sprintf("replica %s has not answered its serving surface yet (%d of %d %s ready)", laggardName, readyCount, desired, unit)
 	case laggardStale:
-		return false, counts, ReasonPending, fmt.Sprintf("replica %s is not on the current pod template yet (%d of %d replicas ready)", laggardName, readyCount, desired)
+		return false, counts, ReasonPending, fmt.Sprintf("replica %s is not on the current pod template yet (%d of %d %s ready)", laggardName, readyCount, desired, unit)
 	case laggardName != "":
-		return false, counts, ReasonPending, fmt.Sprintf("replica %s is not running (%d of %d replicas ready)", laggardName, readyCount, desired)
+		return false, counts, ReasonPending, fmt.Sprintf("replica %s is not running (%d of %d %s ready)", laggardName, readyCount, desired, unit)
 	default:
-		return false, counts, ReasonPending, fmt.Sprintf("%d of %d replicas ready, %d not created yet", readyCount, desired, missing)
+		return false, counts, ReasonPending, fmt.Sprintf("%d of %d %s ready, %d not created yet", readyCount, desired, unit, missing)
 	}
 }
 

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "verdict": "degraded",
+  "role": "agent",
+  "summary": "agent: pid 1292 · the node credential expired on 2026-09-04, so this worker can no longer authenticate",
+  "daemons": [
+    {
+      "name": "netd",
+      "state": "running",
+      "severity": "ok",
+      "detail": "pid 1292 · socket /var/lib/k3sm/run/netd.sock",
+      "wide": {
+        "label": "io.k3sm.netd",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/netd.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
+        "runs": "1"
+      }
+    },
+    {
+      "name": "agent",
+      "state": "expired",
+      "severity": "warn",
+      "detail": "pid 1292 · the node credential expired on 2026-09-04, so this worker can no longer authenticate",
+      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
+      "wide": {
+        "credential": "expired",
+        "credential-dir": "/var/lib/k3sm/agent",
+        "credential-expires": "2026-09-04T09:30:00Z",
+        "label": "io.k3sm.agent",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/agent.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.agent.plist",
+        "runs": "1"
+      }
+    }
+  ]
+}

@@ -57,7 +57,7 @@ func TestServerBindsItsOwnNodePassword(t *testing.T) {
 		workDir := t.TempDir()
 
 		res, down, err := enrollSelfAndBringUpMesh(ctx, e, passwords,
-			selfEnrollOptions(workDir, nodeName), hostnet.Mode{Backend: hostnet.BackendNone}, "", quietLogger())
+			selfEnrollOptions(workDir, nodeName), firstServerCIDR, hostnet.Mode{Backend: hostnet.BackendNone}, "", quietLogger())
 		if err != nil {
 			t.Fatalf("self-enroll: %v", err)
 		}
@@ -104,7 +104,7 @@ func TestServerBindsItsOwnNodePassword(t *testing.T) {
 		mode := hostnet.Mode{Backend: hostnet.BackendNone}
 
 		for _, boot := range []string{"first", "second"} {
-			_, down, err := enrollSelfAndBringUpMesh(ctx, e, passwords, opts, mode, "", quietLogger())
+			_, down, err := enrollSelfAndBringUpMesh(ctx, e, passwords, opts, firstServerCIDR, mode, "", quietLogger())
 			if err != nil {
 				t.Fatalf("%s start-up: %v", boot, err)
 			}
@@ -123,7 +123,7 @@ func TestServerBindsItsOwnNodePassword(t *testing.T) {
 		}
 
 		_, _, err := enrollSelfAndBringUpMesh(ctx, e, passwords,
-			selfEnrollOptions(t.TempDir(), nodeName), hostnet.Mode{Backend: hostnet.BackendNone}, "", quietLogger())
+			selfEnrollOptions(t.TempDir(), nodeName), firstServerCIDR, hostnet.Mode{Backend: hostnet.BackendNone}, "", quietLogger())
 		if !errors.Is(err, bootstrap.ErrNodePasswordMismatch) {
 			t.Fatalf("self-enroll error = %v, want ErrNodePasswordMismatch", err)
 		}
@@ -173,8 +173,8 @@ func TestEnrollRefusesToOverwriteTheControlPlanePeer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build peer: %v", err)
 		}
-		if err := e.writePeer(ctx, peer, false); !errors.Is(err, ErrServerPeerOverwrite) {
-			t.Fatalf("writePeer(allowServerIndex=false) error = %v, want ErrServerPeerOverwrite", err)
+		if err := e.writePeer(ctx, peer, workerPeerWrite); !errors.Is(err, ErrServerPeerOverwrite) {
+			t.Fatalf("writePeer(workerPeerWrite) error = %v, want ErrServerPeerOverwrite", err)
 		}
 		if got := *api.peer(selfName); !reflect.DeepEqual(got.Spec, before.Spec) {
 			t.Errorf("the control-plane peer changed:\n got  %+v\n want %+v", got.Spec, before.Spec)
@@ -183,8 +183,8 @@ func TestEnrollRefusesToOverwriteTheControlPlanePeer(t *testing.T) {
 		// And the permitted write — the control-plane process writing its own
 		// peer — still goes through, or the server could not re-enroll itself on
 		// any restart.
-		if err := e.writePeer(ctx, peer, true); err != nil {
-			t.Fatalf("writePeer(allowServerIndex=true) must still write the server's own peer: %v", err)
+		if err := e.writePeer(ctx, peer, serverPeerWrite); err != nil {
+			t.Fatalf("writePeer(serverPeerWrite) must still write the server's own peer: %v", err)
 		}
 		if got := api.peer(selfName); got == nil || got.Spec.Endpoint != enrollRequest(selfName).Endpoint {
 			t.Errorf("the permitted write did not land: %+v", got)
@@ -197,7 +197,7 @@ func TestEnrollRefusesToOverwriteTheControlPlanePeer(t *testing.T) {
 		e, api := enrollerOverStub(t)
 		seedPeer(t, api, selfName, "100.64.0.0/24")
 
-		res, err := e.EnrollSelf(ctx, selfName, enrollRequest(selfName))
+		res, err := e.EnrollSelf(ctx, selfName, firstServerCIDR, enrollRequest(selfName))
 		if err != nil {
 			t.Fatalf("EnrollSelf: %v", err)
 		}

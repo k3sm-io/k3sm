@@ -449,3 +449,125 @@ func TestWildcardAuthorizerAllowlist(t *testing.T) {
 		})
 	}
 }
+
+// TestPortAuthorizerAdmitsPublishedVMPodPorts is the B440 named gate for the
+// published-vm-pod bind class: a privileged bind on a vm pod's published address
+// is authorized only on a port the vm pod set lists for THAT address. It refuses
+// an address the set does not list (an unpublished pod address, a native pod's),
+// an undeclared port, a port the set lists only for a different pod, an address
+// outside this node's pod /24 even when the set would list it, a nil set, and a
+// missing node pod CIDR. The address and port set come from the policy's
+// predicate; nothing in the request widens them.
+func TestPortAuthorizerAdmitsPublishedVMPodPorts(t *testing.T) {
+	t.Parallel()
+	node := netip.MustParsePrefix("100.64.3.0/24")
+	webhook := netip.MustParseAddr("100.64.3.7") // vm pod: declares 443, a Service targets 80
+	other := netip.MustParseAddr("100.64.3.8")   // vm pod: declares 53
+	remote := netip.MustParseAddr("100.64.4.7")  // a vm pod on ANOTHER node
+	set := map[netip.Addr][]uint16{
+		webhook: {443, 80},
+		other:   {53},
+		remote:  {443},
+	}
+	vmPodPorts := func(addr netip.Addr) []uint16 { return set[addr] }
+	full := PortPolicy{
+		ServiceCIDR: netip.MustParsePrefix("10.43.0.0/16"),
+		Declares:    func(int) bool { return false },
+		NodePodCIDR: func() netip.Prefix { return node },
+		VMPodPorts:  vmPodPorts,
+	}
+
+	cases := []struct {
+		name   string
+		policy PortPolicy
+		port   int
+		addr   string
+		allow  bool
+	}{
+		{name: "declared port on a published vm pod address", policy: full, port: 443, addr: "100.64.3.7", allow: true},
+		{name: "Service-targeted port on a published vm pod address", policy: full, port: 80, addr: "100.64.3.7", allow: true},
+		{name: "IPv4-mapped spelling of the same address", policy: full, port: 443, addr: "::ffff:100.64.3.7", allow: true},
+		{name: "unpublished pod address", policy: full, port: 443, addr: "100.64.3.9"},
+		{name: "undeclared port", policy: full, port: 22, addr: "100.64.3.7"},
+		{name: "a port only another vm pod declares", policy: full, port: 53, addr: "100.64.3.7"},
+		{name: "a vm pod address outside this node's pod CIDR", policy: full, port: 443, addr: "100.64.4.7"},
+		{name: "nil vm pod set", policy: PortPolicy{NodePodCIDR: full.NodePodCIDR}, port: 443, addr: "100.64.3.7"},
+		{name: "no node pod CIDR", policy: PortPolicy{VMPodPorts: vmPodPorts}, port: 443, addr: "100.64.3.7"},
+		{name: "invalid node pod CIDR", policy: PortPolicy{VMPodPorts: vmPodPorts, NodePodCIDR: func() netip.Prefix { return netip.Prefix{} }}, port: 443, addr: "100.64.3.7"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := PortAuthorizer(tc.policy).Authorize(context.Background(), tc.port, tc.addr)
+			if tc.allow && err != nil {
+				t.Errorf("Authorize(%d, %s) = %v, want authorized", tc.port, tc.addr, err)
+			}
+			if !tc.allow && err == nil {
+				t.Errorf("Authorize(%d, %s) authorized, want refused", tc.port, tc.addr)
+			}
+		})
+	}
+
+	t.Run("a refusal names the relayed ports", func(t *testing.T) {
+		t.Parallel()
+		err := PortAuthorizer(full).Authorize(context.Background(), 22, "100.64.3.7")
+		if err == nil || !strings.Contains(err.Error(), "80, 443") {
+			t.Errorf("refusal = %v, want it to name the relayed ports 80, 443", err)
+		}
+	})
+
+	t.Run("BuildConfig wires the class", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := BuildConfig(Options{
+			NodePodCIDR: node,
+			ServiceCIDR: netip.MustParsePrefix("10.43.0.0/16"),
+			VMPodPorts:  vmPodPorts,
+		})
+		if err != nil {
+			t.Fatalf("BuildConfig: %v", err)
+		}
+		if err := cfg.PortAuthorizer.Authorize(context.Background(), 443, "100.64.3.7"); err != nil {
+			t.Errorf("assembled authorizer refused a published vm pod's declared port: %v", err)
+		}
+		if err := cfg.PortAuthorizer.Authorize(context.Background(), 443, "100.64.3.9"); err == nil {
+			t.Error("assembled authorizer admitted an unpublished pod address")
+		}
+	})
+}
+
+// TestNodePodCIDRInForce pins the bound the published-vm-pod class reads: the
+// identity netd persisted once a join adopted one, re-read on every call, and
+// the configured pre-adoption value otherwise (no file, a malformed file, a
+// prefix outside the cluster aggregate, persistence off).
+func TestNodePodCIDRInForce(t *testing.T) {
+	t.Parallel()
+	configured := netip.MustParsePrefix("100.64.0.0/24")
+	dir := t.TempDir()
+	path := filepath.Join(dir, NodeIdentityFileName)
+	inForce := NodePodCIDRInForce(path, configured)
+
+	if got := inForce(); got != configured {
+		t.Errorf("no identity file: %s, want %s", got, configured)
+	}
+	write := func(v string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(v), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("100.64.5.0/24\n")
+	if got, want := inForce(), netip.MustParsePrefix("100.64.5.0/24"); got != want {
+		t.Errorf("adopted identity: %s, want %s", got, want)
+	}
+	write("not a prefix")
+	if got := inForce(); got != configured {
+		t.Errorf("malformed identity: %s, want %s", got, configured)
+	}
+	write("10.0.0.0/24")
+	if got := inForce(); got != configured {
+		t.Errorf("identity outside the cluster aggregate: %s, want %s", got, configured)
+	}
+	if got := NodePodCIDRInForce("", configured)(); got != configured {
+		t.Errorf("persistence off: %s, want %s", got, configured)
+	}
+}

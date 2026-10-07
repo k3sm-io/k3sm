@@ -54,47 +54,47 @@ limitations under the License.
 //
 // # HA datastore
 //
-// Strategy: phased (named exception: kine/SQLite datastore migration). The default
-// stays single-node kine->SQLite (WAL). Setting
-// Config.DatastoreEndpoint to a Postgres DSN switches kine to Postgres (pure-Go
-// jackc/pgx/v5) so 2+ control-plane servers can share ONE datastore — the single
-// source of truth, no etcd quorum (the k3s external-datastore-HA topology). The
-// apiserver still points at the LOCAL kine on 127.0.0.1; each server runs its own
-// kine against the shared Postgres.
+// Strategy: hard cut. The default stays single-node kine->SQLite (WAL), byte-unchanged.
+// Setting Config.Etcd selects the HA posture, the k3s embedded-etcd shape: every
+// control-plane server runs ONE etcd member as a supervised child in place of kine,
+// and its apiserver talks only to that local member. HA is etcd-FROM-INIT
+// (greenfield): an existing SQLite cluster is never converted, and --cluster-init over
+// a non-empty state.db is refused (ErrClusterInitOverSQLite).
 //
-// HA is Postgres-FROM-INIT (greenfield): there is NO live SQLite->Postgres data
-// conversion — the single-node SQLite default is untouched, and the only path from an
-// existing SQLite cluster to Postgres is an operator kine dump/restore (in-place
-// conversion is out of scope). BOTH postures run the SAME pinned kine build
-// (DefaultKineVersion, a >=0.16 release built CGO_ENABLED=0 against the pure-Go
-// modernc.org/sqlite backend), which carries the kine#577 watch-progress-notify fix;
-// the SQLite/Postgres split is a driver choice inside one binary, not a second
-// version. Moving an EXISTING single-node datastore onto a new pin is a one-way
-// migration, so the boot takes a verified pre-migration snapshot first
-// (snapshotBeforeKineUpgrade — TRUNCATE-checkpointed, integrity-checked, write-once,
-// with the superseded kine binary preserved beside it). The multi-writer
-// watch-staleness soak (a consistent LIST on server B immediately after server A's
-// committed write, under sustained churn — the kine#577 failure mode) is the LAB
-// production-trust gate (hack/lab/m6.sh), not a unit-provable property.
+// Build: etcd is built exactly like kine — out-of-module from an embedded wrapper
+// module at the pinned DefaultEtcdVersion, CGO_ENABLED=0, behind a versioned marker,
+// through the same staged-child protocol — and is staged only in the etcd posture.
 //
-// Secret handling: the operator's DSN may carry a password, but it must never land
-// on argv (world-readable via ps) or in a 0644 log. startKine relocates it to a 0600
-// PGPASSFILE handed to the kine child (kineSecretEnv); only the password-stripped DSN
-// reaches kine's --endpoint. pgx reads the password from PGPASSFILE as the libpq env
-// fallback. Component logs are mode 0600 for the same reason.
+// Listeners: the client listener is loopback only (https://127.0.0.1:<KinePort>), so
+// no etcd client endpoint is reachable off-host; the apiserver reaches it with a client
+// certificate (--etcd-cafile/--etcd-certfile/--etcd-keyfile). The peer listener is on
+// the server's LAN address (--etcd-peer-ip; never the mesh, never loopback:
+// ErrEtcdNeedsNodeIP),
+// and the metrics listener is loopback. Peer and client traffic are mutual TLS under two
+// dedicated etcd CAs inside the k3sm hierarchy (pkg/certs), distinct from the cluster
+// and signing CAs, so no Kubernetes client certificate is an etcd identity and no etcd
+// certificate is a Kubernetes one.
 //
-// Connection pool / Postgres SPOF: kine's --datastore-max-open-connections defaults
-// to 0 (UNLIMITED), so N servers against one Postgres could exhaust its
-// max_connections; kineArgs pins per-server bounds (see datastore.go) so 2*pool stays
-// within the Postgres default max_connections (100). SQLite's _busy_timeout has no
-// Postgres analog — under contention Postgres relies on its own statement/lock
-// timeouts (an operator postgresql.conf concern: set statement_timeout /
-// idle_in_transaction_session_timeout / lock_timeout). The write-latency tradeoff is
-// explicit: SQLite WAL is a local sub-millisecond fsync; Postgres adds a network
-// round-trip per write. HA buys control-plane PROCESS redundancy (kill one server,
-// the other serves), NOT datastore redundancy — Postgres becomes the operator-managed
-// datastore SPOF; its own HA/backup (a pg_dump/PITR runbook, streaming replication,
-// or a managed Postgres) is the operator's responsibility, as in k3s.
+// Join: the first server forms a one-member cluster (EtcdInit). Every other server
+// (EtcdJoin) is added as a LEARNER by an existing server and starts with the member
+// set it was handed; it is promoted to a voting member only once it serves
+// (EtcdConfig.Promote), so a joiner that fails to start never costs the cluster its
+// quorum. A restart (an existing <WorkDir>/etcd/member, EtcdMemberExists) is never
+// re-added or re-promoted.
+//
+// Quorum: after its member serves, bring-up waits for a leader with no expiry and
+// outside every bring-up deadline, recording no failure: a peer that is still booting
+// is not this server's fault, and a two-server cluster cold-starting one Mac at a time
+// must not park the first one. Only the etcd child exiting is a failure. The server
+// holds <WorkDir>/server.lock for its whole life and reports the member's state in
+// <WorkDir>/etcd-status.json.
+//
+// Recovery: ClusterReset (k3sm server --cluster-reset) restarts the local member once
+// with --force-new-cluster, refused while the daemon holds the work-dir lock or with no
+// member to reset, and succeeds only when the member list is exactly this member.
+// SnapshotEtcd streams an online snapshot of the local member to a 0600 file and
+// verifies it; restoring one is not supported in this release
+// (ErrEtcdRestoreUnsupported).
 //
 // # Leader election
 //
@@ -117,9 +117,10 @@ limitations under the License.
 // model, with no shared component identity). The KCM additionally runs
 // with --use-service-account-credentials=true, so each controller authenticates as its
 // own system:controller:<name> service account. --client-ca-file is set unconditionally
-// (single-node included) so those client certs authenticate. The in-process VK node, the
-// post-bring-up provisioning client, and the healthz probe still carry the system:masters
-// admin token: the embedded node cannot move to a system:node identity until the
-// Virtual-Kubelet secret/configmap informers are scoped (they LIST/WATCH cluster-wide,
-// which the Node authorizer does not grant).
+// (single-node included) so those client certs authenticate. The server's in-process VK
+// node authenticates the same way, as system:node:<node name> in system:nodes with a
+// signing-CA cert cmd/k3sm mints in memory on every boot. The post-bring-up admin client
+// (and the server-side controllers on it), kubectl, and the healthz probe still carry the
+// system:masters admin token. That narrows the node client only: the server process
+// still holds the admin kubeconfig and the signing CA.
 package executor

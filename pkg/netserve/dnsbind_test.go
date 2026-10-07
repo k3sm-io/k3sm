@@ -25,6 +25,8 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // flakyBinder fails the first failUntil bind attempts (as the netd helper does
@@ -101,6 +103,9 @@ func TestBindDNSVIPRetriesUntilAuthorized(t *testing.T) {
 	defer tcp.Close()
 	if b.attempts != 3 {
 		t.Fatalf("expected 3 bind attempts (2 denied + 1 authorized), got %d", b.attempts)
+	}
+	if _, ok := tcp.(*tcpseg.Listener); !ok {
+		t.Fatalf("DNS TCP listener is %T, want *tcpseg.Listener (accepted connections must be segment-clamped)", tcp)
 	}
 }
 

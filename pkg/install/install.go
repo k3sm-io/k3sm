@@ -28,22 +28,20 @@ limitations under the License.
 package install
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
-	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/netip"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -51,13 +49,11 @@ import (
 	"time"
 
 	"k3sm.io/darwin-net/pkg/podnet"
-	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/executor"
-	"k3sm.io/k3sm/pkg/netdsvc"
-	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -83,11 +79,20 @@ const (
 	DatavolLabel = "io.k3sm.datavol"
 )
 
+// Leaf values shared with the runtime packages; their home is pkg/defaults.
+const (
+	// DefaultServiceUser is defaults.ServiceUser.
+	DefaultServiceUser = defaults.ServiceUser
+	// DefaultServiceCIDR is defaults.ServiceCIDR.
+	DefaultServiceCIDR = defaults.ServiceCIDR
+	// PathShimName is defaults.PathShimName.
+	PathShimName = defaults.PathShimName
+	// DNSShimName is defaults.DNSShimName.
+	DNSShimName = defaults.DNSShimName
+)
+
 // Default install locations.
 const (
-	// DefaultServiceUser is the unprivileged, no-login system user the control
-	// plane, node, runtimed, and Service proxy all run as.
-	DefaultServiceUser = "_k3sm"
 	// DefaultInstallDir is the root-owned (root:wheel 0755) directory the binary
 	// and supporting files are copied into.
 	DefaultInstallDir = "/Library/k3sm"
@@ -112,17 +117,6 @@ const (
 	// copy of a signed Mach-O out of its install tree is a signature/notarization
 	// hazard a symlink simply does not have.
 	DefaultLinkDir = "/usr/local/bin"
-	// PathShimName is the basename of the path-rebase DYLD shim (runtimed's
-	// shim/pathrebase_shim.c) installed beside the binary. runtimed resolves it
-	// next to the executable and injects it into a mounting pod so an absolute
-	// volume mount resolves under the pod data volume (no chroot).
-	PathShimName = "libk3sm_pathrebase_shim.dylib"
-	// DNSShimName is the basename of the getaddrinfo DNS shim (darwin-net's
-	// shim/getaddrinfo_shim.c) installed beside the binary. The provider resolves it
-	// next to the executable and injects it into each pod (DYLD_INSERT_LIBRARIES) so
-	// an in-pod cluster-name lookup goes to the per-node resolver on the DNS VIP;
-	// without it a pod uses the system resolver and cluster names are NXDOMAIN.
-	DNSShimName = "libk3sm_getaddrinfo_shim.dylib"
 	// DefaultLaunchDaemonDir is where the two .plist files are written.
 	DefaultLaunchDaemonDir = "/Library/LaunchDaemons"
 	// DefaultDataRoot is the data root (the _k3sm home): the control-plane
@@ -142,9 +136,6 @@ const (
 	DefaultNetdSocket = DefaultRunDir + "/netd.sock"
 	// DefaultAPIServerPort is the apiserver secure port (avoids Docker's :6443).
 	DefaultAPIServerPort = 6444
-	// DefaultServiceCIDR is the cluster Service CIDR the netd daemon pins so the
-	// proxy's ClusterIP VIP aliases are admitted.
-	DefaultServiceCIDR = "10.43.0.0/16"
 	// MeshKeyDir is the directory the netd MeshKeyResolver reads the node's
 	// wireguard private key from, and where netd persists the node identity
 	// (netdsvc.NodeIdentityPath). It sits DIRECTLY under the root-owned data
@@ -241,6 +232,13 @@ const (
 	ContainerLogsDir = podlogs.ContainerLogsDir
 )
 
+// ContainerLogDirs returns every directory of the container-log tree the
+// installer hands to the service user through System.EnsureContainerLogDir, in
+// the order it ensures them. It is the one list both the installer and the root
+// netd job (which re-applies the policy at every start, so a tree an OS upgrade
+// removed comes back on the next boot) iterate, so the two cannot drift.
+func ContainerLogDirs() []string { return []string{PodLogsDir, ContainerLogsDir} }
+
 // ContainerLogDirMode and ContainerLogDirGID are the ownership POLICY for the
 // container-log tree: service-user-owned, group WHEEL (gid 0), mode 0700.
 //
@@ -292,14 +290,6 @@ const (
 	// without dragging the other with it.
 	ServerTokenDirMode  fs.FileMode = 0o700
 	ServerTokenFileMode fs.FileMode = 0o600
-	// DatastoreEndpointFileMode is the mode of the staged HA datastore DSN, the
-	// other credential the control-plane daemon is handed as a file. Stated
-	// separately from ServerTokenFileMode for the reason that one is stated
-	// separately from the agent's: it is a decision about a different file, whose
-	// contents are the OPERATOR's Postgres password rather than a token k3sm
-	// minted, and the two may move independently. The directory is the server
-	// work dir, so its mode is ServerTokenDirMode's — one directory, one answer.
-	DatastoreEndpointFileMode fs.FileMode = 0o600
 	// agentWorkSubdir is the agent's state root under the data root, the same
 	// directory `k3sm agent --work-dir` defaults to, so the token the installer
 	// stages and the state the agent keeps are one tree rather than two.
@@ -311,10 +301,6 @@ const (
 	// sits in the agent work dir: the credential a daemon presents lives in
 	// that daemon's own state tree.
 	serverTokenName = "token"
-	// datastoreEndpointName is the leaf name of the staged HA datastore DSN,
-	// beside the admin token in the server work dir for the same reason: what a
-	// daemon must read lives in that daemon's own state tree.
-	datastoreEndpointName = "datastore-endpoint"
 	// agentNodeKubeconfigName is the leaf name of the node kubeconfig the agent
 	// writes on a successful join — see AgentCredentialPath.
 	agentNodeKubeconfigName = "node.kubeconfig"
@@ -523,7 +509,7 @@ type System interface {
 	// CloneToOwned clones src to exactly dst (APFS clonefile, falling back to
 	// a plain copy across volumes), creating dst's parent root:wheel 0755 and
 	// leaving dst owned uid:gid at mode. Unlike CopyToRootOwned the source's
-	// signature is not the point: the shadow shells are re-signed right after
+	// signature is not the point: the shadow copies are re-signed right after
 	// (AdHocSign). A missing src reports an error wrapping fs.ErrNotExist.
 	CloneToOwned(src, dst string, uid, gid int, mode fs.FileMode) error
 	// AdHocSign replaces path's code signature with an ad-hoc one, carrying no
@@ -533,6 +519,12 @@ type System interface {
 	AdHocSign(path string) error
 	// CDHash reads path's code directory hash (codesign -dvvv).
 	CDHash(path string) (string, error)
+	// VerifyShadowCopy checks a made shadow copy (shadow.CheckCopyFile and
+	// shadow.CheckCopySignature: a regular file, not SF_RESTRICTED, no
+	// setuid/setgid or group/world write, an ad-hoc signature without the
+	// hardened runtime or restrict flag and with no entitlements) and returns
+	// its size in bytes. A failing copy is an error naming the property.
+	VerifyShadowCopy(path string) (int64, error)
 	// EnsureSymlink idempotently makes link a symlink pointing at target — the
 	// `k3sm` launcher in LinkDir. It is the ONE thing install writes outside the
 	// root-owned trees it owns, so it is fail-closed on both halves of that
@@ -625,6 +617,11 @@ type System interface {
 	// are re-applied to the directory AND to those files on every install,
 	// repairing a previously mis-created or over-permissive tree.
 	EnsureLogDir(dir string, uid uint32) error
+	// WriteDataRootMarker writes dataroot.MarkerName into dir, root:wheel 0644,
+	// naming dir itself (dataroot.WriteMarker). Install writes one into the data
+	// root and one into the log dir on every install, and `k3sm uninstall
+	// --purge` refuses to delete a tree that does not carry one. Idempotent.
+	WriteDataRootMarker(dir string) error
 	// EnsureContainerLogDir creates (or repairs) one directory of the container-log
 	// tree — /var/log/pods and /var/log/containers — owned by the service uid,
 	// group wheel, mode 0700 (ContainerLogDirMode / ContainerLogDirGID).
@@ -1019,16 +1016,13 @@ type System interface {
 	// It inspects the live interface (ifconfig) rather than walking ranges, so it
 	// removes exactly what exists. A no-op when nothing matches.
 	FlushLo0Aliases(prefixes []netip.Prefix) error
-	// FlushMeshPFAnchor is the uninstall backstop for the mesh's MSS-clamp pf
-	// anchor (darwin-net's mesh.PFAnchor, "io.k3sm.mesh"), which outlives netd:
-	// the anchor is loaded against a utun interface number, and only the
-	// RemoveMesh RPC — not a daemon shutdown — ever reaches mesh.WGDevice.Down,
-	// which flushes it. Left in place, the rule survives the booted-out daemon
-	// scoped to a utun that no longer exists, and macOS recycles utun numbers —
-	// so the next tunnel that is assigned that same number silently inherits a
-	// stale MSS clamp. Best-effort like FlushLo0Aliases: an anchor that was
-	// never loaded is a no-op (pfctl succeeds flushing zero rules), and a
-	// pfctl failure is reported but never stops the rest of uninstall.
+	// FlushMeshPFAnchor is the uninstall backstop for the pf anchor (darwin-net's
+	// mesh.PFAnchor, "io.k3sm.mesh") that an older release loaded the mesh MSS
+	// clamp into. Nothing loads it now (k3sm loads no pf rule), but a rule an
+	// older release left behind outlives netd, scoped to a utun that no longer
+	// exists. Best-effort like FlushLo0Aliases: an anchor that was never loaded
+	// is a no-op (pfctl succeeds flushing zero rules), and a pfctl failure is
+	// reported but never stops the rest of uninstall.
 	FlushMeshPFAnchor() error
 	// ReadPodReapRecords returns the pod process groups the runtime recorded in
 	// its reap store under dataRoot (runtime.ReadPodReapRecords). An absent store
@@ -1039,12 +1033,80 @@ type System interface {
 	// false when no such member exists: the group is empty, or only a
 	// grandchild of the leader keeps it alive.
 	ProcessGroupLeaderStart(pgid int) (startUnixNano int64, alive bool)
+	// ProcessGroupMemberStart reports the kernel start time (unix nanoseconds)
+	// of process pid, read as a member of process group pgid. alive is false
+	// when pid is not a live member of that group: it exited, or it now
+	// belongs to another group.
+	ProcessGroupMemberStart(pgid, pid int) (startUnixNano int64, alive bool)
 	// SignalProcessGroup sends sig to every member of process group pgid. A
 	// group that no longer exists is a no-op success.
 	SignalProcessGroup(pgid int, sig syscall.Signal) error
 	// WaitProcessGroupsGone waits up to timeout for every group in pgids to
 	// have no members, and returns the groups that still have one.
 	WaitProcessGroupsGone(ctx context.Context, pgids []int, timeout time.Duration) []int
+
+	// The methods below serve `k3sm uninstall --purge` only.
+
+	// ResolvePath returns path with every symlink resolved (EvalSymlinks).
+	ResolvePath(path string) (string, error)
+	// StatNoFollow lstats path. A missing path has ReadFile's fs.ErrNotExist
+	// contract.
+	StatNoFollow(path string) (PathStat, error)
+	// ReadDataRootMarker reports what dir's dataroot.MarkerName file is, read
+	// off one O_NOFOLLOW descriptor (dataroot.ReadMarker). Missing has
+	// ReadFile's fs.ErrNotExist contract.
+	ReadDataRootMarker(dir string) (dataroot.MarkerFacts, error)
+	// PurgeTree deletes the tree at root, which must still be the directory
+	// (dev, ino) the purge guard approved. It walks descriptor-relative and
+	// never follows a symlink (a symlink is unlinked, its target untouched),
+	// never enters a directory on another device (that is reported as an
+	// error, and the walk goes on), clears file flags and retries once on
+	// EPERM, collects every failure rather than stopping at the first, and
+	// unlinks root's marker and then root itself only when everything else is
+	// gone. It never uses os.RemoveAll.
+	//
+	// A root that is no longer the (dev, ino) handed in is refused with an
+	// error wrapping ErrPurgeTreeChanged and nothing removed.
+	PurgeTree(root string, dev, ino uint64) error
+	// DirIsEmpty reports whether dir (not followed if it is a symlink) holds no
+	// entries at all.
+	DirIsEmpty(dir string) (bool, error)
+	// LoadedLabels lists the launchd jobs loaded in the system domain whose
+	// label starts with prefix. The subprocess is bounded by ctx.
+	LoadedLabels(ctx context.Context, prefix string) ([]string, error)
+	// ProcessesOfUID lists the pids whose real or effective uid is uid,
+	// leaving out zombies (exited, awaiting their parent's wait): they hold
+	// nothing open and no signal reaches them.
+	ProcessesOfUID(uid uint32) ([]int, error)
+	// KillProcess sends SIGKILL to pid. A process that is already gone is
+	// success.
+	KillProcess(pid int) error
+	// BootoutUserDomain boots out uid's per-user launchd domain (launchctl
+	// bootout user/<uid>), stopping every agent launchd runs there and keeps
+	// respawning. A domain that is already gone is success. The subprocess is
+	// bounded by ctx.
+	BootoutUserDomain(ctx context.Context, uid uint32) error
+	// ServiceUser reads the named user's directory-service record. A user that
+	// does not exist is Exists=false with a nil error. Subprocesses are bounded
+	// by ctx.
+	ServiceUser(ctx context.Context, name string) (ServiceUserRecord, error)
+	// DeleteServiceUser deletes the named user's record (dscl . -delete
+	// /Users/<name>). It deletes no group. The subprocess is bounded by ctx
+	// alone; a kill at ctx's deadline returns an error wrapping ctx.Err(). A
+	// deletion macOS refused (eDSPermissionError: deleting a user record needs
+	// an approval at the screen, which an unattended process cannot get)
+	// returns an error wrapping errServiceUserDeleteDenied.
+	DeleteServiceUser(ctx context.Context, name string) error
+	// DisableServiceUser leaves the named account, which the purge could not
+	// delete, with no login shell, hidden, and a RealName that says to delete
+	// it by hand (serviceUserDisabledRealName). It changes attributes only,
+	// none of which needs the approval a deletion does.
+	DisableServiceUser(ctx context.Context, name string) error
+	// RemoveAdminKubeconfigContext removes the k3sm context (and the cluster
+	// and user it alone references) from targetUser's ~/.kube/config, keeping
+	// every other entry, the file's owner and its mode. An absent file or
+	// context is a no-op success, reported as removed=false.
+	RemoveAdminKubeconfigContext(targetUser string) (removed bool, err error)
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -1055,25 +1117,38 @@ type Config struct {
 	// is written; everything else install lays down is identical, because a
 	// worker runs the same binary, the same shims and the same netd helper.
 	Role Role
-	// JoinServer is the control-plane host a RoleAgent node joins — an UNDERLAY
-	// address, because the join dials <host>:9345 before this node has any mesh
-	// to route over. Required for RoleAgent, ignored otherwise.
+	// JoinServer is the host this node joins, an UNDERLAY address, because the
+	// join dials <host>:9345 before this node has any mesh to route over. On
+	// RoleAgent it is the control-plane host and is required. On RoleServer it
+	// is an existing server's LAN address and is used only with ServerJoin.
 	JoinServer string
-	// NodeIP is an OPTIONAL assertion of the joining worker's own mesh
-	// InternalIP. The control plane assigns that address and issues the node's
-	// certificates for it, so a worker needs none; when set it is rendered onto
-	// the daemon's argv and the join refuses a value that differs from the
-	// assignment. Ignored outside RoleAgent.
+	// NodeIP is role-dependent. On RoleAgent it is an OPTIONAL assertion of the
+	// joining worker's own mesh InternalIP: the control plane assigns that
+	// address and issues the node's certificates for it, so a worker needs none;
+	// when set it is rendered onto the daemon's argv and the join refuses a value
+	// that differs from the assignment. On RoleServer it is the LAN address the
+	// embedded etcd member's peer listener binds, required with ClusterInit or
+	// ServerJoin and used only with them; it is rendered as the daemon's
+	// --etcd-peer-ip, never its --node-ip (see setEtcdArgs).
 	NodeIP string
+	// ClusterInit asks this server to form a new embedded etcd HA control
+	// plane (`k3sm server --cluster-init`). RoleServer only; needs NodeIP.
+	ClusterInit bool
+	// ServerJoin asks this server to join an existing embedded etcd HA control
+	// plane through JoinServer (`k3sm server --server-join`). RoleServer only;
+	// needs JoinServer, NodeIP and TokenFile holding a server-class token.
+	ServerJoin bool
 	// TokenFile is the OPERATOR's join-token file, read once by Install (which
-	// is root) and copied to agentTokenPath() for the daemon. It is not what the
-	// daemon reads and is never named on its argv: the operator's file is
-	// root-only by construction, and the service user the agent runs as could
+	// is root) and copied to stagedJoinTokenPath() for the daemon: the agent's
+	// K10 join token, or with ServerJoin the server-class token. It is not what
+	// the daemon reads and is never named on its argv: the operator's file is
+	// root-only by construction, and the service user the daemon runs as could
 	// not open it.
 	//
-	// It is optional. A node that has already joined starts from its stored
-	// credential and needs no token at all, so a reinstall with no --token-file
-	// stages nothing and leaves whatever is already there.
+	// It is optional on an agent. A node that has already joined starts from its
+	// stored credential and needs no token at all, so a reinstall with no
+	// --token-file stages nothing and leaves whatever is already there. A
+	// ServerJoin install requires it.
 	TokenFile       string
 	ServiceUser     string // _k3sm
 	InstallDir      string // /Library/k3sm
@@ -1094,7 +1169,7 @@ type Config struct {
 	ExecShimSource string
 	// PayloadSource is a directory holding the control-plane payload
 	// (executor.PayloadBinaries: kube-apiserver/scheduler/controller-manager/
-	// kubectl + kine) staged by `k3sm payload <dir>`. Install copies it to
+	// kubectl + kine + etcd) staged by `k3sm payload <dir>`. Install copies it to
 	// InstallDir/bin, from which the daemon boot seeds its workdir — the launchd
 	// _k3sm daemon has neither gh nor a Go toolchain to acquire them itself.
 	// Defaults to the cp-payload sibling dir of BinarySource.
@@ -1218,6 +1293,17 @@ type Config struct {
 	// encrypted volume (an encrypted volume beside a plaintext duplicate of the
 	// same secrets is not encryption) and optional otherwise.
 	RemoveOldDataRoot bool
+	// SecretsEncryption is `k3sm install --secrets-encryption`: enable secrets
+	// encryption at rest on a NEW single-server control plane. The install mints
+	// a key and writes the credential pair under <DataRoot>/server/cred before
+	// the first start; it refuses on a worker, beside a carried --cluster-init or
+	// --server-join, and over an existing datastore. False never touches
+	// the credential directory. See preflightSecretsEncryption.
+	SecretsEncryption bool
+	// KeyEntropy is where a minted secrets-encryption key is read from. Nil is
+	// crypto/rand.Reader; a test injects a placeholder reader so no real key
+	// material is ever produced.
+	KeyEntropy io.Reader
 	// Deregister removes this node from the cluster it joined, and is called by
 	// Uninstall on a WORKER teardown only. Nil — the zero value — skips it, and
 	// is what every server-role uninstall and every caller that has no stored
@@ -1246,12 +1332,44 @@ type Config struct {
 	// terminal error naming the remedy (mint a token on the server and start the
 	// agent with it).
 	Deregister func(ctx context.Context) error
+	// DeregisterServer removes this server's own etcd member from the embedded-etcd
+	// cluster it belongs to, and is called by Uninstall on a SERVER teardown whose
+	// installed plist carries --cluster-init or --server-join, and on no other. Nil
+	// skips it.
+	//
+	// It runs at the same point as Deregister — after any purge preflight, before
+	// a single daemon is booted out — because the call needs the local etcd member
+	// still running: a member removes itself through its own loopback client, which
+	// needs only the cluster's quorum, the same condition any membership change
+	// needs. The uninstalling host holds no server-class token, so it does not ask
+	// a peer.
+	//
+	// BEST EFFORT, like Deregister: a failure (no quorum, the member already gone)
+	// is one warning with the remedy for the servers that stay, and the teardown
+	// continues. A purge the preflight refuses makes no call.
+	DeregisterServer func(ctx context.Context) error
+	// Purge makes Uninstall also remove everything it otherwise keeps: the data
+	// root (and the data volume under it), the daemon log dir, the arguments
+	// records, the k3sm context in TargetUser's kubeconfig and the service user.
+	// See purge for the order and the guards.
+	Purge bool
+	// PurgeConfirmed is the operator's --yes. A Purge without it is refused
+	// before any system call.
+	PurgeConfirmed bool
+	// TargetHome is the invoking human's home directory. A purge refuses to
+	// delete any tree that equals, contains or lies inside it. Empty skips that
+	// one rule; the /Users and /Volumes rules still hold.
+	TargetHome string
 	// DataRootFS is the read-only filesystem the data-root posture is read
 	// through (the record, /etc/fstab, the mount state). It defaults to the real
 	// filesystem; a test injects a fake so the sequencing can be exercised
 	// against a mount posture no unprivileged process could create.
 	DataRootFS dataroot.FS
 	Logger     *slog.Logger
+	// Out receives a command's result lines: what a purge removed, and what it
+	// could not and how to finish by hand. The CLI hands it stdout; Logger
+	// (stderr) carries the progress and diagnostics. Nil discards.
+	Out io.Writer
 	// dataVolumeDeclared reports that this Mac has a data volume to manage --
 	// either a record already declares one, or --data-volume asked for one. It
 	// is what puts the io.k3sm.datavol daemon and the record into the artifact
@@ -1287,6 +1405,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
+	}
+	if c.Out == nil {
+		c.Out = io.Discard
 	}
 	if c.DataRootFS == nil {
 		c.DataRootFS = dataroot.OSFS{}
@@ -1366,12 +1487,29 @@ func (c Config) datavolStaging() string { return filepath.Join(c.InstallDir, dat
 // and writeServerArgsRecord all call it rather than reading ExtraServerArgs
 // directly, so the bind/kubeconfig decision, the rendered daemon argv, and the
 // persisted record can never disagree about which address won.
+//
+// An HA request (ClusterInit or ServerJoin) is merged the same way, after the
+// mesh address: it REPLACES every carried role flag, --server, --etcd-peer-ip
+// and --node-ip (setEtcdArgs). With neither set the carried arguments come back as they were,
+// so a single-node install renders exactly what it rendered before HA flags
+// existed.
 func (c Config) resolvedExtraServerArgs() []string {
-	if c.MeshIP == "" {
-		return c.ExtraServerArgs
+	args := c.ExtraServerArgs
+	if c.MeshIP != "" {
+		args = setMeshIPArg(args, c.MeshIP)
 	}
-	return setMeshIPArg(c.ExtraServerArgs, c.MeshIP)
+	if c.etcdRequested() {
+		args = setEtcdArgs(args, c)
+	}
+	return args
 }
+
+// RecordedServerArgs returns the operator `k3sm server` arguments an install
+// with cfg renders after the managed set AND writes to the server-arguments
+// record: the carried arguments with this install's --mesh-ip and HA request
+// merged in. It is exported so the CLI can assert, without root, that what
+// its flags ask for is what a later reinstall carries forward.
+func RecordedServerArgs(cfg Config) []string { return cfg.resolvedExtraServerArgs() }
 
 // meshIP returns the effective --mesh-ip value (resolvedExtraServerArgs), or ""
 // when the server runs single-node. It is the discriminator between the two
@@ -1413,338 +1551,6 @@ func (c Config) agentTokenPath() string {
 	return filepath.Join(c.agentWorkDir(), agentTokenName)
 }
 
-// legacyAgentArtifacts is the FIXED table of leaf names the agent work dir is
-// known to hold: the five artifacts of a stored node credential, plus the three
-// this package and cmd/k3sm name themselves.
-//
-// The credential names come from nodecred.Store rather than being retyped, so
-// the directory the installer repairs and the directory the daemon reads can
-// never disagree about what lives in it. The dir value is irrelevant — only the
-// leaf names are taken.
-func legacyAgentArtifacts() map[string]bool {
-	store := nodecred.Store{Dir: "."}
-	known := make(map[string]bool, len(store.Paths())+3)
-	for _, p := range store.Paths() {
-		known[filepath.Base(p)] = true
-	}
-	for _, name := range []string{agentNodePasswordName, agentMeshKeyName, agentTokenName} {
-		known[name] = true
-	}
-	return known
-}
-
-// serviceCanRead reports whether the service user can open e.
-//
-// Three ways, and the middle one is the trap this predicate exists to avoid.
-// The owner can always read its own 0600 file. An other-read bit lets everyone
-// read it, the service user included. A GROUP-read bit only helps when the group
-// is one the service user is IN — and the only group this installer can assert
-// that about is ServiceTreeGID (staff), the service user's primary group. A
-// root:wheel 0640 file carries a group-read bit and is still unreadable to
-// _k3sm, so a predicate that took any group-read bit as "readable" would wave
-// exactly the file an operator most needs to be told about straight through.
-func serviceCanRead(e OwnedEntry, svcUID, svcGID int) bool {
-	switch {
-	case e.UID == svcUID:
-		return true
-	case e.Mode&0o004 != 0:
-		return true
-	case e.Mode&0o040 != 0 && e.GID == svcGID:
-		return true
-	}
-	return false
-}
-
-// adoptLegacyAgentFiles hands the agent work dir and the known artifacts inside
-// it to the service user, on a reinstall over a worker that was installed before
-// the node daemon moved from root to _k3sm.
-//
-// This is a MIGRATION to the posture a fresh install already produces — service
-// uid, group staff, the mode untouched, which is exactly what
-// WriteServiceUserFile writes the staged join token at — and NOT a widening of
-// anything. Nothing becomes readable to an account that could not read it
-// before: every file involved is 0600 both before and after, and the mode is
-// carried across verbatim rather than re-decided. What changes is only WHICH
-// single uid the 0600 names, from root to the unprivileged user the daemon now
-// runs as.
-//
-// Without it, such a node crash-loops: `k3sm agent` starts as _k3sm, finds a
-// root-owned 0600 node-password it cannot rewrite, and dies on "persist
-// node-password: permission denied" — with the same fate waiting behind it for
-// the mesh key and the node credential. Only root can hand those files over and
-// only the installer runs as root, which is why this is an install step and not
-// something the node does for itself at start-up (the reasoning EnsureRunDir and
-// EnsureContainerLogDir already record for their own directories).
-//
-// Three limits, all deliberate:
-//
-//   - Only the entries in legacyAgentArtifacts are adopted. A file k3sm does not
-//     recognise is never chowned, because giving an unknown file to the service
-//     user IS the widening this function is careful not to be.
-//   - An unrecognised regular file the service user cannot read REFUSES the
-//     install, before a single chown happens. It would otherwise be a silent
-//     landmine: the daemon may need it, nothing here can know, and an install
-//     that reported success over it would hand back the crash-loop it was run to
-//     fix. The operator is told the file and both remedies.
-//   - An entry under one of the KNOWN names that is not a regular file refuses
-//     the install too. An adoption is decided about a name and applied to what
-//     the name resolves to, so a symlink standing in for node.key is not a file
-//     to hand over.
-//   - Nothing is walked. Subdirectories are not descended into and not judged:
-//     this is the five-artifact credential directory, not a tree.
-//
-// The chowns are ordered files-first, directory-last, so the service user never
-// owns the directory while a root-owned artifact inside it is still pending.
-func adoptLegacyAgentFiles(sys System, cfg Config, uid uint32) error {
-	dir := cfg.agentWorkDir()
-	svcUID, svcGID := int(uid), ServiceTreeGID
-	self, err := sys.Owner(dir)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		// No work dir yet: a first install, or one whose token staging is still
-		// to create it. Nothing to migrate.
-		return nil
-	case err != nil:
-		return fmt.Errorf("install: inspect the agent work dir %s: %w", dir, err)
-	case self.Kind != EntryDir:
-		return fmt.Errorf("install: the agent work dir %s is not a directory: the agent daemon keeps this node's credential there, so move whatever is at that path aside before reinstalling", dir)
-	}
-	entries, err := sys.ListOwned(dir)
-	if err != nil {
-		return fmt.Errorf("install: list the agent work dir %s: %w", dir, err)
-	}
-
-	// Two passes, and the split is the contract: everything is CLASSIFIED before
-	// anything is changed, so a refusal leaves the directory exactly as it was
-	// found rather than half-migrated.
-	known := legacyAgentArtifacts()
-	var adopt []OwnedEntry
-	var unreadable, notRegular, ignored []string
-	for _, e := range entries {
-		switch {
-		case known[filepath.Base(e.Path)]:
-			switch {
-			case e.Kind != EntryRegular:
-				notRegular = append(notRegular, fmt.Sprintf("%s (%s)", e.Path, e.Kind))
-			case e.UID == 0 && svcUID != 0:
-				adopt = append(adopt, e)
-			}
-		case e.Kind != EntryRegular:
-			// A subdirectory, a symlink, a socket under a name k3sm does not
-			// claim: not this step's business, and never chowned.
-		case !serviceCanRead(e, svcUID, svcGID):
-			unreadable = append(unreadable, e.Path)
-		default:
-			ignored = append(ignored, e.Path)
-		}
-	}
-	// The known-name-wrong-kind refusal comes first because it is the sharper
-	// one. An adoption is a decision made about a NAME and applied to whatever
-	// that name resolves to; a symlink at node.key, plantable by anything that
-	// can write in this directory, would aim a root-run chown at a file
-	// somewhere else on the Mac. Lchown means the link itself would move rather
-	// than its target, so this is a refusal out of caution rather than a repair
-	// of a live escalation — but "the artifact k3sm was about to hand over is
-	// not the artifact" is never something to continue past.
-	if len(notRegular) > 0 {
-		return fmt.Errorf("install: the agent work dir %s holds an entry under one of this node's own state file names that is not a regular file; remove it and let the agent write its state afresh: %s — k3sm hands ownership of a state file to %s, never of something standing in for one",
-			dir, strings.Join(notRegular, ", "), cfg.ServiceUser)
-	}
-	if len(unreadable) > 0 {
-		return fmt.Errorf("install: the agent work dir %s holds file(s) the %s service user the node daemon runs as cannot read, and k3sm does not recognise them: %s — `sudo chown %s <file>` if the file belongs to this node's agent, or remove it if it is not k3sm's; k3sm will not hand a file it cannot account for to the service user on its own",
-			dir, cfg.ServiceUser, strings.Join(unreadable, ", "), cfg.ServiceUser)
-	}
-	for _, path := range ignored {
-		// The PATH only, never a byte of the file: an unrecognised file in a
-		// credential directory is exactly the thing not to echo into a log. It is
-		// still worth one line each, because "k3sm saw this and chose to leave it"
-		// is the record an operator needs when they later wonder why it was not
-		// repaired.
-		cfg.Logger.Info("left an unrecognised file in the agent work dir alone: the service user can already read it, and k3sm does not adopt files it cannot account for", "path", path)
-	}
-	// The files FIRST and the directory LAST. In between, the directory is still
-	// root's while its contents move — never the reverse. Handing the directory
-	// over first would give the service user a 0700 directory it owns (and so
-	// may rename or unlink within) for the duration of the remaining chowns,
-	// while root-owned artifacts inside were still pending; ending with the
-	// directory means that window does not exist.
-	if self.UID == 0 && svcUID != 0 {
-		adopt = append(adopt, self)
-	}
-	for _, e := range adopt {
-		if err := sys.Chown(e.Path, svcUID, svcGID); err != nil {
-			return fmt.Errorf("install: hand the agent state %s over to %s (uid %d): %w", e.Path, cfg.ServiceUser, svcUID, err)
-		}
-	}
-	if len(adopt) > 0 {
-		paths := make([]string, len(adopt))
-		for i, e := range adopt {
-			paths[i] = e.Path
-		}
-		cfg.Logger.Info("adopted agent state left root-owned by an install that predates the service user (the mode is unchanged; only the uid the 0600 names moves)",
-			"user", cfg.ServiceUser, "uid", svcUID, "paths", strings.Join(paths, ","))
-	}
-	return nil
-}
-
-// podLogWalkMaxDepth bounds the pod-log adoption walk below the tree's root.
-// The layout podlogs defines is exactly
-// <root>/<ns>_<pod>_<uid>/<container>/<n>.log — three levels — so this bound is
-// never reached by a tree k3sm itself wrote, and it is what keeps a walk run as
-// root from descending forever into whatever a hand-run mkdir, a half-finished
-// restore, or a rotation tool left behind. It bounds DEPTH rather than entries
-// because the walk never follows a symlink: the only way down is for the
-// directories to really be there.
-const podLogWalkMaxDepth = 8
-
-// AdoptPolicy says which entries at the TOP level of a tree AdoptTree may hand
-// over. It exists because k3sm's two container-log directories have opposite
-// rules about the one entry kind that matters, and neither rule is safe to apply
-// to the other directory.
-type AdoptPolicy int
-
-const (
-	// AdoptPodDirs is /var/log/pods: at the top level ONLY a directory whose
-	// name has the <ns>_<pod>_<uid> shape podlogs writes is adopted, and then
-	// everything inside it recursively (directories and regular files). A
-	// symlink is never adopted and never descended into, at any level.
-	//
-	// It is the ZERO value so that a policy nobody set is the conservative one.
-	AdoptPodDirs AdoptPolicy = iota
-	// AdoptLogLinks is /var/log/containers: a FLAT directory of symlinks, which
-	// is the one place a symlink is the artifact rather than an intruder — a log
-	// shipper globs them and the node has to be able to replace them. They are
-	// adopted with an lchown, so the link moves and its target is never touched,
-	// and nothing is descended into.
-	AdoptLogLinks
-)
-
-// SkippedEntry is one entry an adoption walk stepped over, and why — the record
-// the installer turns into a line for the operator. It carries the PATH only:
-// a log directory's name is namespace/pod/container, which the operator already
-// knows, and nothing here ever reads a byte of a pod's output.
-type SkippedEntry struct {
-	Path   string
-	Reason string
-}
-
-// TreeAdoption is what one AdoptTree walk did: how many entries it handed over,
-// and every entry it did not.
-//
-// The skipped entries are RETURNED rather than logged inside the seam, because
-// the seam performs syscalls and this package decides what an operator is told.
-// The count is separate from len(Skipped) for nobody's benefit but the caller's
-// summary line.
-type TreeAdoption struct {
-	Adopted int
-	Skipped []SkippedEntry
-}
-
-// podLogDirName mirrors the pod-log directory name
-// podlogs.BuildPodLogsDirectory writes: <namespace>_<pod>_<uid>, where the
-// namespace and the pod name are DNS-1123 names (so neither can contain the `_`
-// delimiter) and the uid is a Kubernetes UID.
-//
-// podlogs exports a parser (ParsePodUIDFromLogsDirectory) but not a validator —
-// it answers "the last field" for any string at all, including one with no
-// delimiter — so the shape is re-stated here as the smallest thing that can say
-// NO. It is deliberately a shape check and not a lookup against live pods: the
-// tree is full of directories whose pods are long gone, and adopting only the
-// pods currently scheduled here would leave exactly the debris an operator
-// cannot clean up.
-var podLogDirName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?_[a-z0-9]([-a-z0-9.]*[a-z0-9])?_[A-Za-z0-9-]+$`)
-
-// isPodLogDirName reports whether name is one of this node's own pod log
-// directories. Getting it wrong in either direction is survivable and neither
-// direction is silent: a genuine directory rejected here is reported to the
-// operator and left root-owned, and debris accepted here is chowned inside a
-// tree the service user already owns the root of. What it buys is that a
-// root-run walk descends only into the shape k3sm itself writes.
-func isPodLogDirName(name string) bool { return podLogDirName.MatchString(name) }
-
-// adoptPodLogTree hands the per-pod log directories an OLDER install left
-// root-owned over to the service user, on a reinstall over a node whose daemon
-// once ran as root.
-//
-// It is adoptLegacyAgentFiles' sibling for the one tree that step deliberately
-// does not touch, and it closes the failure that survived it: the log-dir step
-// above chowns the ROOT of the tree, and only the root, so a node whose
-// root-era daemon had already created <root>/<ns>_<pod>_<uid> directories
-// (0700, root-owned) came back up as _k3sm and failed every CreatePod with
-//
-//	failed to create container log directory
-//	/var/log/pods/<ns>_<pod>_<uid>/<container>: permission denied
-//
-// — a per-pod directory it can traverse to and not write in. Only root can hand
-// those directories over and only the installer runs as root, which is the same
-// reason EnsureContainerLogDir is an install step rather than something the node
-// does for itself.
-//
-// This is a MIGRATION to the posture a fresh install already produces — service
-// uid, group wheel (ContainerLogDirGID), the mode carried across verbatim — and
-// widens nothing: a 0700 directory is readable by exactly one account before and
-// after, and what moves is which uid that is.
-//
-// Four properties, all deliberate, and all different from the agent work dir's:
-//
-//   - The walk is performed by the System seam, DESCRIPTOR-relative (see
-//     AdoptTree). Pods are running as the service user throughout an install,
-//     so a path re-resolved after it was classified is a path something else
-//     can have replaced in between.
-//   - It NEVER refuses the install. The tree is GC-pending debris by nature —
-//     pkg/provider/podlogs GC is its sole deleter and runs asynchronously — so
-//     an unreadable directory or an entry k3sm cannot account for is reported
-//     and stepped over, not turned into a failed install of an otherwise healthy
-//     node.
-//   - It DELETES nothing, for the same reason: the GC owns removal, and an
-//     installer that also removed would be a second deleter racing it.
-//   - It is unconditional across roles, exactly like the EnsureContainerLogDir
-//     step it repairs: a single-node server runs pods and writes this same tree.
-func adoptPodLogTree(sys System, cfg Config, uid uint32) {
-	svcUID := int(uid)
-	if svcUID == 0 {
-		// Nothing to migrate TO: the service user is root, so the tree already
-		// names the account the node runs as.
-		return
-	}
-	trees := []struct {
-		root   string
-		policy AdoptPolicy
-		depth  int
-	}{
-		{PodLogsDir, AdoptPodDirs, podLogWalkMaxDepth},
-		// A flat directory: one level, and the bound says so rather than
-		// relying on the policy never to descend.
-		{ContainerLogsDir, AdoptLogLinks, 1},
-	}
-	var adopted, skipped int
-	for _, t := range trees {
-		rep, err := sys.AdoptTree(t.root, svcUID, ContainerLogDirGID, t.depth, t.policy)
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			// A node that has never run a pod has no tree. A posture, not a
-			// problem, and not worth a line.
-			continue
-		case err != nil:
-			cfg.Logger.Info("left a container-log directory alone", "path", t.root, "reason", err.Error())
-			skipped++
-			continue
-		}
-		for _, s := range rep.Skipped {
-			cfg.Logger.Info("left an entry in the container-log tree alone", "path", s.Path, "reason", s.Reason)
-		}
-		adopted += rep.Adopted
-		skipped += len(rep.Skipped)
-	}
-	if adopted > 0 || skipped > 0 {
-		// One line, with counts rather than paths: a node with a long pod
-		// history has thousands of entries, and the per-entry lines above are
-		// already there for the ones that were NOT adopted.
-		cfg.Logger.Info("adopted container-log entries left root-owned by an install that predates the service user (modes unchanged; only the uid the entries name moves)",
-			"user", cfg.ServiceUser, "uid", svcUID, "gid", ContainerLogDirGID, "adopted", adopted, "skipped", skipped)
-	}
-}
-
 // serverTokenPath is where Install stages the static admin token for the
 // control-plane daemon to read: <DataRoot>/server/token, service-user-owned
 // 0600 (see ServerTokenFileMode).
@@ -1761,24 +1567,6 @@ func adoptPodLogTree(sys System, cfg Config, uid uint32) {
 // a second spelling of either would be a daemon pointed at a file nobody wrote.
 func (c Config) serverTokenPath() string {
 	return filepath.Join(c.serverWorkDir(), serverTokenName)
-}
-
-// datastoreEndpointPath is where Install stages the HA datastore DSN for the
-// control-plane daemon to read: <DataRoot>/server/datastore-endpoint,
-// service-user-owned 0600 (see DatastoreEndpointFileMode).
-//
-// It is serverTokenPath's sibling and exists for the same reason, against a
-// credential that is not k3sm's to mint. A Postgres DSN carries a password, and
-// rendering it as a VALUE on the server LaunchDaemon's argv published it twice
-// over even after B249 narrowed the plist to 0600: `ps` shows a running job's
-// arguments to every account on the Mac for the daemon's whole life, and
-// launchd echoes them back from its own job description. Neither is affected by
-// the plist's mode.
-//
-// The path is derived rather than configured, exactly as the token's is: it is
-// the one path the installer writes and the one path it renders onto the argv.
-func (c Config) datastoreEndpointPath() string {
-	return filepath.Join(c.serverWorkDir(), datastoreEndpointName)
 }
 
 // stageTokenFile writes token at dst, owned by the service uid at mode inside a
@@ -1853,345 +1641,12 @@ func ensureStateTree(sys System, cfg Config, uid uint32) error {
 	return nil
 }
 
-// meshKeyRef is the bare file name THIS role stores its wireguard private key
-// under, in both copies. It is an accessor rather than a branch at each use so
-// no code path can provision one role's identity under the other's name.
-func (c Config) meshKeyRef() string {
-	if c.Role == RoleAgent {
-		return MeshKeyRefAgent
-	}
-	return MeshKeyRefServer
-}
-
-// meshKeyWorkPath is the role's WORK-DIR copy of that key: the file `k3sm
-// server`/`k3sm agent` loads (or, on a node this installer never reached,
-// mints) as the unprivileged service user, inside the same state tree that
-// role's token is staged in.
-func (c Config) meshKeyWorkPath() string {
-	if c.Role == RoleAgent {
-		return filepath.Join(c.DataRoot, agentWorkSubdir, MeshKeyRefAgent)
-	}
-	return filepath.Join(c.serverWorkDir(), MeshKeyRefServer)
-}
-
-// meshKeyHelperPath is the ROOT-ONLY copy of that key, inside MeshKeyDir.
-//
-// The directory is the MeshKeyDir constant rather than a derivation from this
-// Config's data root, deliberately and for the same reason VMRunDir is: the
-// netd plist this very install renders puts that constant on the helper's
-// `--mesh-key-dir` argv, so provisioning anywhere else would write a key at a
-// path netd is not reading.
-func (c Config) meshKeyHelperPath() string { return filepath.Join(MeshKeyDir, c.meshKeyRef()) }
-
 // ErrNotRegularFile is what ReadRegularFile reports for a path that exists but
 // is a symlink, a directory, a device or a fifo. It is a sentinel because the
 // callers must tell it apart from "absent": absence is a posture (nothing has
 // been provisioned yet), while a non-regular file where a key belongs is
 // somebody having put it there, and the two lead to opposite actions.
 var ErrNotRegularFile = errors.New("not a regular file")
-
-// readMeshKey reads one copy of this node's wireguard identity and returns
-// (nil, nil) when that copy does not exist — the only absence this step treats
-// as a posture rather than a failure.
-//
-// Everything else is refused, and refused LOUDLY. The work-dir copy sits in a
-// directory the service user owns, so a file there is not automatically this
-// node's identity — it is whatever the last writer put there; the root-only
-// copy is held to the same checks so one reader serves both. Two things are therefore checked before any byte is copied anywhere:
-// the path is a regular file that was opened without following a symlink, and
-// the bytes decode as a usable Curve25519 private key. what names the copy in
-// the error, so the operator is told which of the two to look at.
-//
-// The validation is not decoration. The whole step exists to copy one file's
-// bytes into a root-only file netd hands to wireguard; bytes that are not a key
-// would fail there, at mesh bring-up, as an opaque device error on a node that
-// installed cleanly.
-func readMeshKey(sys System, path, what string) ([]byte, error) {
-	b, err := sys.ReadRegularFile(path)
-	switch {
-	case err == nil:
-	case errors.Is(err, fs.ErrNotExist):
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("install: read the %s mesh key %s: %w", what, path, err)
-	}
-	if _, err := bootstrap.WireguardPublicKey(string(b)); err != nil {
-		return nil, fmt.Errorf("install: the %s mesh key %s is not a usable wireguard private key: %w "+
-			"(remove it only if you accept that this node's mesh identity changes and every peer must re-learn it)", what, path, err)
-	}
-	return b, nil
-}
-
-// provisionMeshKey makes this node's wireguard identity exist, in both places
-// it has to exist, before either daemon starts — for whichever role is being
-// installed.
-//
-// The WORK-DIR copy is the source of truth whenever it exists, because the node
-// daemon is what owns the identity: it loads that file on every start and
-// derives the public key its MeshPeer advertises from it, so a key minted
-// anywhere else would have to agree with it byte for byte or rotate the node's
-// identity. This step reads it and copies exactly its bytes into MeshKeyDir.
-//
-// When it does NOT exist the root-only copy is consulted before anything is
-// minted, and if it holds a usable key the work-dir copy is RESTORED from it.
-// That order is the point: the two copies are one identity, and a node whose
-// work dir was wiped (a data-root repair, a hand-deleted file) still has every
-// peer holding the public half of the key in the key dir. Minting there would
-// silently orphan the node — its MeshPeer would advertise a public key no peer's
-// AllowedIPs carries, and the mesh would stay dark on an install that reported
-// success. A key is minted ONLY when neither copy exists, and then both are
-// written from the same bytes: the work-dir one through the service-user seam,
-// so the daemon finds it and never mints a second, different key of its own.
-//
-// The step exists at all because the daemon's own best-effort write into
-// MeshKeyDir cannot work in the posture k3sm ships: that directory is
-// root-owned, the daemon runs as _k3sm, and until this step existed a fresh
-// install did not create it — so a worker in helper mode asked netd for a key
-// ref that resolved to nothing and the mesh never came up. Provisioning is the
-// privileged installer's job because only the privileged installer can do it.
-//
-// A re-run is a no-op when the two copies already agree, and a REPAIR when they
-// do not: a root-only copy that differs, or that is unusable while the work dir
-// holds a good key, is overwritten from the work dir (logged), because a stale
-// copy is a key netd would hand wireguard while the node advertises the public
-// half of a different one. An unusable copy with NO work-dir key to repair from
-// is a hard failure — see readMeshKey.
-//
-// MeshKeyDir sits directly under the root-owned data root (OwnershipOf), so no
-// unprivileged principal owns any component of its path: the root-only copy is
-// protected in its confidentiality AND against being renamed or unlinked by the
-// service user. The work-dir copy is still the service user's, so every read
-// below is O_NOFOLLOW and type-checked, and every write is a temp-and-rename.
-//
-// Before any of that, a key an older build left in LegacyMeshKeyDir is moved
-// into MeshKeyDir (migrateLegacyMeshKeys), so an upgrade reads the identity
-// the node already has rather than finding the new directory empty.
-func provisionMeshKey(sys System, cfg Config, uid uint32) error {
-	if err := sys.EnsureMeshKeyDir(MeshKeyDir, MeshKeyDirMode); err != nil {
-		return fmt.Errorf("install: ensure the root-only mesh key dir %s: %w", MeshKeyDir, err)
-	}
-	if err := migrateLegacyMeshKeys(sys, cfg.Logger); err != nil {
-		return err
-	}
-	workPath, helperPath := cfg.meshKeyWorkPath(), cfg.meshKeyHelperPath()
-	work, err := readMeshKey(sys, workPath, "work-dir")
-	if err != nil {
-		return err
-	}
-	helper, herr := readMeshKey(sys, helperPath, "root-only")
-	if herr != nil {
-		// A root-only copy that cannot be read or is not a key is repairable
-		// EXACTLY when the work dir holds the identity to repair it from.
-		// Otherwise it is the only thing standing between this node and a new
-		// identity, and overwriting it is the one outcome that cannot be undone.
-		if work == nil {
-			return herr
-		}
-		cfg.Logger.Warn("the root-only mesh key is unusable; re-provisioning it from this node's work-dir key", "path", helperPath, "err", herr)
-		helper = nil
-	}
-
-	key := work
-	switch {
-	case key != nil:
-		// The node's own copy decides; nothing is minted or restored.
-	case helper != nil:
-		// Restore rather than mint: these bytes are the identity every peer
-		// already knows this node by.
-		key = helper
-		workDirMode := ServerTokenDirMode
-		if cfg.Role == RoleAgent {
-			workDirMode = AgentTokenDirMode
-		}
-		if err := sys.WriteServiceUserFile(workPath, key, uid, MeshKeyFileMode, workDirMode); err != nil {
-			return fmt.Errorf("install: restore this node's mesh key at %s: %w", workPath, err)
-		}
-		cfg.Logger.Info("restored this node's mesh key into the daemon's work dir from the root-only copy (the identity its peers already know)",
-			"path", workPath, "source", helperPath, "keyRef", cfg.meshKeyRef())
-	default:
-		priv, pub, gerr := bootstrap.GenerateWireguardKey()
-		if gerr != nil {
-			return fmt.Errorf("install: mint this node's mesh key: %w", gerr)
-		}
-		key = []byte(priv)
-		// The work dir IS the directory this role's token is staged in, so its
-		// mode is read from that decision rather than restated under a third name.
-		workDirMode := ServerTokenDirMode
-		if cfg.Role == RoleAgent {
-			workDirMode = AgentTokenDirMode
-		}
-		if werr := sys.WriteServiceUserFile(workPath, key, uid, MeshKeyFileMode, workDirMode); werr != nil {
-			return fmt.Errorf("install: write this node's mesh key at %s: %w", workPath, werr)
-		}
-		// The PUBLIC half is logged and the private half never is: the public key
-		// is what every peer programs into its wireguard device, so having it in
-		// the install log is what makes a mesh that did not come up diagnosable.
-		cfg.Logger.Info("minted this node's wireguard identity (neither copy existed)", "path", workPath, "keyRef", cfg.meshKeyRef(), "publicKey", pub)
-	}
-
-	if helper != nil && bytes.Equal(helper, key) {
-		return nil
-	}
-	if helper != nil {
-		cfg.Logger.Info("the root-only mesh key did not match this node's identity; re-provisioning it from the work dir", "path", helperPath)
-	}
-	if err := sys.WriteRootOnlyFile(helperPath, key, MeshKeyFileMode); err != nil {
-		return fmt.Errorf("install: provision the root-only mesh key at %s: %w", helperPath, err)
-	}
-	cfg.Logger.Info("provisioned this node's mesh key for the netd helper (root-only; the daemon passes netd the ref, never the key)",
-		"path", helperPath, "keyRef", cfg.meshKeyRef())
-	return nil
-}
-
-// legacyKeyLeaves are the files an older build kept in LegacyMeshKeyDir, and so
-// the ones the one-time move carries: both roles' mesh keys and the node
-// identity netd persists beside them.
-func legacyKeyLeaves() []string {
-	return []string{MeshKeyRefServer, MeshKeyRefAgent, netdsvc.NodeIdentityFileName}
-}
-
-// migrateLegacyMeshKeys moves the files an older build kept in
-// LegacyMeshKeyDir (inside the service-user-owned run dir) into MeshKeyDir
-// (directly under the root-owned data root). It runs once per install, after
-// MeshKeyDir exists and before provisionMeshKey reads it, and it is
-// FORWARD-ONLY: a binary older than this move looks in LegacyMeshKeyDir, finds
-// nothing, and mints a new identity, so the remedy before a downgrade is to copy
-// the files back by hand.
-//
-// Per leaf, in this order:
-//
-//  1. When MeshKeyDir has no copy, the legacy bytes are copied in root-only
-//     (WriteRootOnlyFile, fsynced), read back, and compared. A key is also
-//     validated as a wireguard private key first: the legacy directory was the
-//     service user's, so its content is whatever the last writer left.
-//  2. Only when the new copy exists (just written and verified, or already
-//     there) is the legacy leaf removed. Removal is independent of the copy: a
-//     stale legacy leaf beside an existing new copy is removed and nothing is
-//     copied, because the new copy is the identity the node already uses.
-//  3. The emptied legacy directory is removed last.
-//
-// A symlink at the legacy directory, at its parent, or at a legacy leaf is a
-// hard error and nothing is touched: those are service-user-writable places, and
-// following a link planted there would have root copy or delete a file of the
-// planter's choosing. Nothing is ever minted here; minting stays
-// provisionMeshKey's, under its rule that it happens only when neither copy
-// exists.
-func migrateLegacyMeshKeys(sys System, logger *slog.Logger) error {
-	// The run dir sits in the root-owned data root (ensured at step 1a, which
-	// refuses a symlink there), so nothing unprivileged can swap it from here
-	// on; it is checked once for a clear error.
-	parent := filepath.Dir(LegacyMeshKeyDir)
-	switch e, err := sys.Owner(parent); {
-	case errors.Is(err, fs.ErrNotExist):
-		return nil // no run dir: a fresh install
-	case err != nil:
-		return fmt.Errorf("install: inspect %s: %w", parent, err)
-	case e.Kind != EntryDir:
-		return fmt.Errorf("install: %s is %s, not a directory; refusing to move keys through it (remove it by hand, then re-run `sudo k3sm install`)", parent, e.Kind)
-	}
-	// The keys dir itself is INSIDE the service user's run dir, so it is held
-	// by one descriptor opened without following a symlink, and every read and
-	// removal below goes through that descriptor: the service user can rename
-	// the path at any moment, but not the directory this install already holds.
-	legacyDir, err := sys.OpenDirNoFollow(LegacyMeshKeyDir)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return nil // no legacy tree: a fresh install, or one already moved
-	case err != nil:
-		return fmt.Errorf("install: open the legacy mesh key dir %s: %w (refusing to move keys through it; remove it by hand, then re-run `sudo k3sm install`)", LegacyMeshKeyDir, err)
-	}
-	defer func() { _ = legacyDir.Close() }()
-
-	// acted records whether this run moved or dropped a known leaf. A run that
-	// finds nothing k3sm knows in the legacy dir (the keys were moved by an
-	// earlier run) says nothing above Debug, whatever else the dir holds.
-	acted := false
-	for _, leaf := range legacyKeyLeaves() {
-		legacy := filepath.Join(LegacyMeshKeyDir, leaf)
-		dest := filepath.Join(MeshKeyDir, leaf)
-		old, err := legacyDir.ReadEntry(leaf)
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			continue
-		case err != nil:
-			return fmt.Errorf("install: read the legacy %s: %w (refusing to move it; remove it by hand if it is not this node's, then re-run `sudo k3sm install`)", legacy, err)
-		}
-		cur, err := sys.ReadRegularFile(dest)
-		switch {
-		case err == nil && bytes.Equal(cur, old):
-			// Already moved, and the legacy copy is the same bytes: only the
-			// leftover goes.
-			logger.Info("dropping a legacy mesh key file the root-owned key dir already holds, byte for byte", "legacy", legacy, "path", dest)
-		case err == nil:
-			// Both places hold this leaf and they DIFFER. The root-owned copy is
-			// never silently overwritten, and the legacy one is never silently
-			// deleted: which identity this node keeps is the operator's call.
-			return fmt.Errorf("install: %s and %s both exist and differ; the root-owned %s is what this node uses now: delete %s by hand if it is stale (or copy it over %s if it is the identity the node's peers know), then re-run `sudo k3sm install`",
-				legacy, dest, dest, legacy, dest)
-		case errors.Is(err, fs.ErrNotExist):
-			if err := validateLegacyLeaf(leaf, old); err != nil {
-				return fmt.Errorf("install: the legacy %s %w (it was not moved; remove it only if you accept that this node's mesh identity changes)", legacy, err)
-			}
-			if err := sys.WriteRootOnlyFile(dest, old, MeshKeyFileMode); err != nil {
-				return fmt.Errorf("install: move the legacy %s to %s: %w", legacy, dest, err)
-			}
-			got, rerr := sys.ReadRegularFile(dest)
-			if rerr != nil {
-				return fmt.Errorf("install: verify the moved %s: %w (the legacy copy %s is kept)", dest, rerr, legacy)
-			}
-			if !bytes.Equal(got, old) {
-				return fmt.Errorf("install: verify the moved %s: its bytes differ from %s (the legacy copy is kept)", dest, legacy)
-			}
-			logger.Info("moved a mesh key file out of the service user's run dir into the root-owned key dir (one-time; a binary older than this move would not find it)",
-				"from", legacy, "to", dest)
-		default:
-			return fmt.Errorf("install: read %s: %w", dest, err)
-		}
-		if err := legacyDir.RemoveEntry(leaf); err != nil {
-			return fmt.Errorf("install: remove the legacy %s: %w", legacy, err)
-		}
-		acted = true
-	}
-	// The directory goes only when it is empty. Anything left in it is not a
-	// file k3sm wrote (the known leaves are gone by now): it is reported by
-	// name and kept, never deleted and never a reason to fail the install. k3s
-	// does not fail on unknown files in its data dir either.
-	leftovers, err := legacyDir.ListEntries()
-	if err != nil {
-		return fmt.Errorf("install: list the legacy mesh key dir %s: %w", LegacyMeshKeyDir, err)
-	}
-	if len(leftovers) > 0 {
-		level := slog.LevelDebug
-		if acted {
-			level = slog.LevelWarn
-		}
-		logger.Log(context.Background(), level, "the mesh keys were moved out of the legacy key dir, but it still holds files k3sm does not know; they are kept, and may be deleted by hand",
-			"dir", LegacyMeshKeyDir, "entries", strings.Join(leftovers, ","))
-		return nil
-	}
-	if err := sys.RemoveEntry(parent, filepath.Base(LegacyMeshKeyDir)); err != nil {
-		return fmt.Errorf("install: remove the empty legacy mesh key dir %s: %w", LegacyMeshKeyDir, err)
-	}
-	return nil
-}
-
-// validateLegacyLeaf checks a legacy file's bytes before they are promoted into
-// the root-only key dir: the legacy dir was the service user's, so its content
-// is whatever the last writer left there. A key must be a usable wireguard
-// private key; the node identity must be one parseable CIDR, the only thing
-// netd ever writes there.
-func validateLegacyLeaf(leaf string, b []byte) error {
-	if leaf == netdsvc.NodeIdentityFileName {
-		if _, err := netip.ParsePrefix(strings.TrimSpace(string(b))); err != nil {
-			return fmt.Errorf("is not a parseable CIDR: %w", err)
-		}
-		return nil
-	}
-	if _, err := bootstrap.WireguardPublicKey(string(b)); err != nil {
-		return fmt.Errorf("is not a usable wireguard private key: %w", err)
-	}
-	return nil
-}
 
 // argsRecordPath is the arguments record THIS role reads and writes: the
 // server record on a control plane, the agent record on a worker. It is an
@@ -2216,143 +1671,6 @@ func (c Config) installedBinary() string {
 // exists outside the tests that pin this derivation.
 func (c Config) installedLink() string {
 	return filepath.Join(c.LinkDir, filepath.Base(c.installedBinary()))
-}
-
-// linkDirMaxMode is the permission bits a link directory may NOT carry: group or
-// other write. A directory anyone in the `admin` group (or any local user) can
-// write is a directory in which the launcher can be swapped for something else,
-// and the launcher is what a human types.
-const linkDirMaxMode = 0o022
-
-// linkDirFacts is what a launcher directory IS, already read off the disk — the
-// four properties linkDirVerdict decides on. It exists so that the decision can
-// be a pure function of resolved inputs: the Lstat and the euid read stay in the
-// darwin System, and every arm of the refusal (including the root-ownership arm,
-// which an unprivileged test could not otherwise reach, since it cannot chown a
-// temp dir to root) is stated in a table instead of in a live filesystem.
-type linkDirFacts struct {
-	// UID is the owning uid of the directory.
-	UID uint32
-	// Mode is the mode Lstat reported; only the permission bits are consulted.
-	Mode fs.FileMode
-	// IsDir reports whether the path is a directory.
-	IsDir bool
-	// IsSymlink reports whether the path ITSELF is a symlink — an Lstat question,
-	// never a Stat one: a symlink to a trusted directory is not a trusted
-	// directory, because whoever can re-point the link chooses the destination.
-	IsSymlink bool
-	// Absent reports that the judged path is not there at all. It is stated the
-	// negative way round so the zero value describes a path that EXISTS, which is
-	// every ordinary case; an absent path is routed through the same verdict
-	// table as every other refusal rather than escaping as a bare Lstat error,
-	// because "no such file or directory" tells an operator nothing about which
-	// directory k3sm wanted or what to do about it.
-	Absent bool
-}
-
-// linkDirVerdict reports whether dir may hold — or, when it is an ancestor,
-// may come to hold — the `k3sm` launcher symlink for launcherDir: a REAL
-// directory (not a symlink to one), not group- or other-writable, and — when
-// euid is 0, the only posture in which the answer is meaningful — owned by root.
-//
-// dir and launcherDir are the same path in the ordinary case. They differ when
-// the launcher directory does not exist yet and linkDirTrustTarget has ESCALATED
-// the judgement to its parent — the directory whose permissions decide who could
-// create the missing one. That distinction is carried into the message rather
-// than left to the reader, because it changes the remedy: telling an operator to
-// `remove /usr/local` because /usr/local/bin is missing would be advice to
-// delete a base system directory, when what they actually need is to create the
-// launcher directory under it.
-//
-// THE HAZARD, named here because the check has always asserted it without ever
-// saying it: the launcher directory sits on ROOT's PATH, and /usr/local/bin
-// precedes /usr/bin in the default /etc/paths. A launcher directory some local
-// user can write is therefore a directory in which that user can leave a file
-// called `k3sm` — and the next `sudo k3sm …`, install script or root-run helper
-// that types the bare command executes it as root. That is a local privilege
-// escalation k3sm would have created by linking there, which is why this refuses
-// rather than warns. It is not hypothetical: on a Mac carrying an Intel-prefix
-// Homebrew, /usr/local/bin is owned by the admin user who installed Homebrew
-// (and /opt/homebrew/bin is, on an Apple Silicon one), so this is the ordinary
-// state of a developer's machine rather than a misconfiguration.
-//
-// This is also the one deliberate exception to the privilege model's "the binary
-// and plist live in /Library/k3sm, never a Homebrew, /usr/local or /Applications
-// prefix an `admin`-group member could overwrite" rule (docs/privilege-model.md
-// §Root-owned everything). The exception is narrow and is trusted ONLY because
-// this check holds: nothing executable is placed in the link directory, only a
-// symlink back into the root-owned tree, and the link is refused outright unless
-// the directory holding it has the same trust properties /Library does.
-//
-// The refusal names the path, the property that is wrong, the literal command
-// that fixes it, and why k3sm cares. An operator told only the rule has to guess
-// the remedy, and guessing at chown under /usr/local is how a Homebrew tree gets
-// broken; the uid-0 half is conditional on euid because an unprivileged caller
-// (the unit table, a dry run) cannot chown anything anyway.
-func linkDirVerdict(dir, launcherDir string, f linkDirFacts, euid int) error {
-	if launcherDir == "" {
-		launcherDir = dir
-	}
-	escalated := dir != launcherDir
-	why := fmt.Sprintf("root's PATH searches %s, so anything named k3sm left there is what the next `sudo k3sm …` would run as root", launcherDir)
-	// Three remedies, and which one applies is decided by what is wrong rather
-	// than by how it was phrased: repair the judged directory's ownership/mode;
-	// create the launcher directory under an ancestor that can never hold a link
-	// itself; or clear the way when the LAUNCHER path is the thing that is not a
-	// directory. Only the third ever says "remove", and it never names an
-	// ancestor.
-	chown := fmt.Sprintf("sudo chown root:wheel %s && sudo chmod 755 %s", dir, dir)
-	create := fmt.Sprintf("create %s as a root-owned directory first: sudo mkdir -p %s && sudo chown root:wheel %s && sudo chmod 755 %s", launcherDir, launcherDir, launcherDir, launcherDir)
-	remove := fmt.Sprintf("remove %s, or choose another directory already on your shell's PATH", dir)
-
-	reason, remedy := "", ""
-	switch {
-	case f.Absent:
-		reason, remedy = "does not exist", create
-	case f.IsSymlink:
-		reason, remedy = "is a symlink, not a real directory, and whoever can re-point it decides where the launcher lands", remove
-		if escalated {
-			remedy = create
-		}
-	case !f.IsDir:
-		reason, remedy = "is not a directory", remove
-		if escalated {
-			remedy = create
-		}
-	case f.Mode.Perm()&linkDirMaxMode != 0:
-		which := "group-writable"
-		switch f.Mode.Perm() & linkDirMaxMode {
-		case 0o002:
-			which = "world-writable"
-		case 0o022:
-			which = "group- and world-writable"
-		}
-		reason, remedy = fmt.Sprintf("is %s (mode %04o, want 755)", which, f.Mode.Perm()), chown
-	case euid == 0 && f.UID != 0:
-		reason, remedy = fmt.Sprintf("is owned by uid %d, not root", f.UID), chown
-	default:
-		return nil
-	}
-	if escalated {
-		return fmt.Errorf("refusing to create the k3sm launcher directory %s: its parent %s %s, so %s cannot be created under it — %s — fix it: %s", launcherDir, dir, reason, launcherDir, why, remedy)
-	}
-	return fmt.Errorf("refusing to link the k3sm launcher into %s: it %s — %s — fix it: %s", dir, reason, why, remedy)
-}
-
-// linkDirTrustTarget reports WHICH directory's trust decides whether the launcher
-// may be linked at link, given whether link's parent already exists.
-//
-// When the parent does not exist the answer is its own parent: that is the
-// directory whose permissions decide who could have created the missing one —
-// and therefore who could own it — before k3sm gets there. parentAbsent is also
-// the caller's signal that it must create the parent itself once the verdict is
-// clean.
-func linkDirTrustTarget(link string, parentExists bool) (dir string, parentAbsent bool) {
-	parent := filepath.Dir(link)
-	if parentExists {
-		return parent, false
-	}
-	return filepath.Dir(parent), true
 }
 
 // installedExecShim is the path the k3sm-execshim helper is copied to — beside
@@ -2384,335 +1702,6 @@ func (c Config) plistPath(label string) string {
 	return filepath.Join(c.LaunchDaemonDir, label+".plist")
 }
 
-// The two LaunchDaemon plist modes, and why the control plane's is not the
-// other one.
-//
-// PlistMode is launchd's conventional 0644: root writes it, launchd reads it as
-// root, and anyone may look at it. That is right for a plist whose argv is a set
-// of paths and ports.
-//
-// ServerPlistMode is 0600, because the server plist's argv is the one that
-// carries credentials. Not the admin token any more — that moved to a staged
-// file — but the OPERATOR's preserved arguments, which legitimately include
-// `--datastore-endpoint postgres://user:password@host/db`. pkg/dataroot already
-// keeps the server-arguments record root-only 0600 for exactly that reason
-// (serverArgsRecordMode), and the plist holds the same string, so leaving it
-// 0644 kept a world-readable second copy of what the record is careful about.
-// Nothing but root needs to read it: launchd is root, and `k3sm install` and
-// `k3sm status` read it as root when they can.
-//
-// One consequence is deliberate and visible: `k3sm status` run as an ordinary
-// user can no longer read the server plist, so its server-arguments row reports
-// "unreadable as this user" instead of listing the flags. That row already had
-// that state for exactly this case and it never moves the verdict; `sudo k3sm
-// status` still shows them.
-const (
-	PlistMode       fs.FileMode = 0o644
-	ServerPlistMode fs.FileMode = 0o600
-)
-
-// plistMode is the mode the labelled daemon's plist is written at. It is a
-// function of the LABEL rather than a field on the artifact so a new daemon
-// cannot be added with no decision taken about its mode: it lands on the 0644
-// default, and only a label named here is treated as carrying secrets.
-func plistMode(label string) fs.FileMode {
-	if label == ServerLabel {
-		return ServerPlistMode
-	}
-	return PlistMode
-}
-
-// artifactKind classifies a manifest entry so install/uninstall can perform the
-// right operation (a launchd daemon tears down differently from a plain file).
-type artifactKind int
-
-const (
-	// kindFile is a single root-owned file (e.g. the k3sm binary).
-	kindFile artifactKind = iota
-	// kindDir is a directory tree (e.g. the InstallDir sweep, DataRoot, LogDir).
-	kindDir
-	// kindDaemon is a launchd job: a compound of a Label AND its plistPath, torn
-	// down as Bootout(label) THEN RemoveAll(plistPath) so the two never diverge.
-	kindDaemon
-	// kindServiceUser is the _k3sm no-login system user.
-	kindServiceUser
-	// kindKubeconfig is the admin kubeconfig written into the human's ~/.kube/config.
-	kindKubeconfig
-	// kindSymlink is a symlink whose target is another manifest artifact; laid
-	// down after its target, removed only when it still points at that target.
-	kindSymlink
-)
-
-// disposition is what uninstall does with an artifact install laid down.
-type disposition int
-
-const (
-	// dispRemove is torn down on uninstall (the two plists; the InstallDir tree).
-	dispRemove disposition = iota
-	// dispInstallDirCovered lives under InstallDir and is removed by the single
-	// RemoveAll(InstallDir) sweep — never individually (that would double-remove).
-	dispInstallDirCovered
-	// dispPreserve is installed but kept on uninstall: DataRoot (kine state.db +
-	// mesh keys — nuking it loses data on reinstall), the human kubeconfig (may
-	// hold other clusters), the _k3sm user, LogDir.
-	dispPreserve
-)
-
-// artifact is one thing install lays down. Every path is derived from a Config
-// accessor/const — never a re-hardcoded /Library/... literal (a third copy of a
-// path is the same divergence bug this manifest exists to prevent). A daemon binds its Label and
-// plistPath into one entry so a booted-out label can never leave a leaked
-// KeepAlive plist (the original leak).
-type artifact struct {
-	kind  artifactKind
-	disp  disposition
-	path  string // file/dir/plist path; empty for kindServiceUser/kindKubeconfig
-	label string // launchd label for kindDaemon; empty otherwise
-	user  string // user name for kindServiceUser/kindKubeconfig; empty otherwise
-	// target is what a kindSymlink entry points at — itself a manifest path, so
-	// the link and its target cannot name different files. Empty otherwise.
-	target string
-	// assertExists records whether the path is expected on disk today. It is
-	// false for the forward-declared cp-payload items (the /Library/k3sm/bin tree
-	// + relocated k3sm-netd): the packaging follow-up owns moving cp/kine off
-	// DataRoot into InstallDir, so those paths do not exist yet. The manifest
-	// proves the disposition (InstallDir-covered), not on-disk presence — that
-	// follow-up lights them up with no manifest change.
-	assertExists bool
-	// oneshot marks a kindDaemon that RUNS AND EXITS rather than staying up
-	// (io.k3sm.datavol). It changes two things and nothing else: the restart
-	// sequence waits for the job to be LOADED rather than for a live pid, and
-	// the post-restart verification does not demand a pid it was never going to
-	// have.
-	oneshot bool
-}
-
-// artifactManifest is the single source of truth for what install lays down and
-// how uninstall tears it down. It is a pure func(Config) — hermetic and testable
-// — deriving every path from the existing Config accessors/consts. Both Install
-// (lay-down order + plist paths) and Uninstall (reverse-order teardown) consume
-// it, closing the divergence between the two hardcoded lists that leaked the
-// plists. Order is install order; uninstall walks it in reverse.
-func artifactManifest(cfg Config) []artifact {
-	cfg = cfg.withDefaults()
-	items := []artifact{
-		// The _k3sm service user — created before the server daemon can resolve it.
-		// Preserved: its home is DataRoot; removing it orphans the data root.
-		{kind: kindServiceUser, disp: dispPreserve, user: cfg.ServiceUser},
-
-		// The InstallDir tree — the single RemoveAll(InstallDir) sweep on uninstall.
-		{kind: kindDir, disp: dispRemove, path: cfg.InstallDir, assertExists: true},
-		// The k3sm binary copied into InstallDir — covered by the sweep, not
-		// removed individually.
-		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedBinary(), assertExists: true},
-		// The `k3sm` launcher symlink in LinkDir pointing at that binary. It sits
-		// immediately after its target so install order lays the target down
-		// first, and so the reverse uninstall walk removes the link BEFORE the
-		// InstallDir sweep deletes what it points at (a link removed after its
-		// target would be judged against a path that no longer exists).
-		{kind: kindSymlink, disp: dispRemove, path: cfg.installedLink(), target: cfg.installedBinary(), assertExists: true},
-		// The k3sm-execshim Seatbelt helper beside it (sandbox.FindExecShim's
-		// first probe) — the runtimed backend the server plist hardcodes cannot
-		// boot without it. Covered by the InstallDir sweep.
-		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedExecShim(), assertExists: true},
-		// The path-rebase DYLD shim beside the binary (runtimedConfig resolves it
-		// next to the executable) — injected into a mounting pod so an absolute
-		// volume mount resolves under the pod data volume. Covered by the sweep.
-		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedPathShim(), assertExists: true},
-		// The getaddrinfo DNS shim beside the binary — injected into each pod so an
-		// in-pod cluster-name lookup reaches the per-node resolver. Covered by the sweep.
-		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedDNSShim(), assertExists: true},
-		// The k3sm-vmhost VM-host helper beside the binary (sandbox.FindVMHost's
-		// first probe) — vm-RuntimeClass pods cannot boot without it. Covered by
-		// the sweep.
-		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedVMHost(), assertExists: true},
-		// The control-plane payload staged into InstallDir/bin (the daemon boot
-		// seeds its workdir from it — no gh/go under launchd). Covered by the sweep.
-	}
-	// Ranged over executor.PayloadBinaries() — the same source Install copies from
-	// — so a new payload binary cannot be installed without also being uninstalled
-	// (the manifest test asserts install ⊆ uninstall coverage).
-	for _, b := range executor.PayloadBinaries() {
-		items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", b), assertExists: true})
-	}
-	// The kine version marker rides beside the kine binary it describes: it is what tells
-	// the daemon's work-dir seed which kine pin+variant was staged, so a pin change reaches
-	// an already-booted node instead of being masked by the old binary's mere presence.
-	// assertExists is false — an archive produced before markers existed still installs, and
-	// the seed falls back to rebuilding rather than trusting bytes nothing vouched for.
-	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName), assertExists: false})
-	// The control-plane version marker rides beside the four kube binaries on the same
-	// terms: it is what lets the work-dir seed replace a stale control-plane set after a
-	// binary-only upgrade, and a pre-marker archive has none, so it is not asserted.
-	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KubeMarkerName), assertExists: false})
-	items = append(items, []artifact{
-		// Forward-declared: the cp-payload bin tree + relocated k3sm-netd land
-		// under InstallDir once the packaging follow-up moves them off DataRoot. They
-		// do not exist on disk today (cp/kine land under DataRoot at runtime), so
-		// existence is not asserted; the InstallDir sweep already covers them.
-		{kind: kindDir, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin"), assertExists: false},
-		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "k3sm-netd"), assertExists: false},
-
-		// The two LaunchDaemons — netd before server (install order: netd is
-		// bootstrapped first, the server depends on it). Each removed on uninstall:
-		// Bootout(label) then RemoveAll(plistPath). Removing the plist is the fix for
-		// a leak — previously the label was booted out but the plist leaked, leaving a
-		// phantom KeepAlive respawn-throttle root job pointing at a deleted binary.
-	}...)
-	// The data-volume mount daemon goes IMMEDIATELY BEFORE netd, present only
-	// when this Mac has a data volume to manage. Its position is its contract:
-	// install lays plists down and restarts jobs in manifest order, so the
-	// mount is attempted before the two daemons that refuse an unmounted data
-	// root, and the reverse uninstall walk boots it out last of the three.
-	// assertExists is false because a Mac that never asked for a volume has no
-	// such plist, and one that just asked for its first has none yet either.
-	if cfg.dataVolumeDeclared {
-		items = append(items, artifact{kind: kindDaemon, disp: dispRemove, label: DatavolLabel, path: cfg.plistPath(DatavolLabel), oneshot: true, assertExists: false})
-	}
-	// The staged join token, for an agent node only, and REMOVED on uninstall
-	// unlike everything else under the preserved data root. It is a credential
-	// with no further use once the node has joined (the stored node credential
-	// is what every later start presents), so leaving it behind would leave a
-	// cluster-joining secret on a machine somebody just uninstalled k3sm from.
-	// It sits before the daemon entries so the reverse uninstall walk removes it
-	// AFTER the agent has been booted out, never from under a running daemon.
-	// assertExists is false: an install that staged no token wrote no file.
-	if cfg.Role == RoleAgent {
-		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.agentTokenPath(), assertExists: false})
-	}
-	// The control plane's staged admin token, the same entry for the other role
-	// and in the same position, for the same reason: it is a system:masters
-	// bearer token with no use once this Mac is no longer a k3sm server, so it
-	// is REMOVED rather than preserved with the rest of the data root, and it is
-	// removed after the daemon that reads it has been booted out.
-	// assertExists is false because a data root an older build installed has no
-	// such file until the next install stages one.
-	if cfg.Role == RoleServer {
-		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
-		// The staged HA datastore DSN, beside it and with the OPPOSITE
-		// disposition: PRESERVED, like everything else under the data root.
-		//
-		// The token is a credential this install minted and can mint again, so
-		// leaving it behind would leave a cluster-admin secret on a machine
-		// somebody just uninstalled k3sm from. The DSN is the OPERATOR's: k3sm
-		// cannot re-derive it, the flag naming it is carried across a reinstall
-		// out of the preserved arguments record, and an uninstall that deleted
-		// the file would turn the next install into the refusal
-		// requireDatastoreEndpointFile exists to raise. It is no more exposed
-		// there than the rest of the preserved data root, which holds the
-		// cluster's signing keys.
-		//
-		// assertExists is false: a single-node server stages no DSN at all.
-		items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: cfg.datastoreEndpointPath(), assertExists: false})
-	}
-	// This node's wireguard identity: the role's work-dir copy, the root-only
-	// key dir, and the copy inside it that netd's MeshKeyResolver reads. All
-	// three are PRESERVED, which is the disposition of everything else under the
-	// data root that is state rather than a credential in transit:
-	//
-	//   - the work-dir key IS the node's mesh identity. Removing it would rotate
-	//     the public key every peer has in its AllowedIPs on the next install,
-	//     which is the failure loadOrCreateMeshKey exists to prevent, and it is
-	//     already covered by DataRoot's own preserve entry ("kine state.db + mesh
-	//     keys").
-	//   - the helper copy and its directory, MeshKeyDir, are root-owned state
-	//     directly under the data root and are preserved in their own right: a
-	//     reinstall picks the identity up where it left off (provisionMeshKey
-	//     restores the work-dir copy from it rather than minting). Removing the
-	//     whole tree for good is a separate, explicit operation, not uninstall.
-	//
-	// Neither path's existence is asserted: a data root an older build installed
-	// has no key until the install that provisions one, and a node that has never
-	// run has no work-dir copy either.
-	items = append(items,
-		artifact{kind: kindFile, disp: dispPreserve, path: cfg.meshKeyWorkPath(), assertExists: false},
-		artifact{kind: kindDir, disp: dispPreserve, path: MeshKeyDir, assertExists: false},
-		artifact{kind: kindFile, disp: dispPreserve, path: cfg.meshKeyHelperPath(), assertExists: false},
-	)
-	// The one leaf inside that preserved key dir that is REMOVED: the node pod
-	// CIDR netd adopted from this role's join and persisted so a restart the node
-	// daemon did not drive keeps the same /24. It is state OF A ROLE, not of the
-	// machine. A role change goes through uninstall (refuseCrossRole refuses
-	// anything else), so if it survived, the returning role's netd would restore
-	// the other role's /24 at start and admit pod aliases against a boundary the
-	// cluster handed to a node that no longer exists. Removing it costs nothing:
-	// the next join hands netd its pod CIDR again. The directory, node.key and the
-	// helper key above stay exactly as they are.
-	//
-	// It sits after the key-dir entries and before the daemons, so the reverse
-	// uninstall walk removes it only once netd has been booted out and can no
-	// longer rewrite it. Install never writes it (netd does), so nothing lays it
-	// down; assertExists is false because a node that never adopted has none.
-	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: netdsvc.NodeIdentityPath(MeshKeyDir), assertExists: false})
-	// The node daemon AFTER netd, and it is the ROLE's daemon: io.k3sm.server on
-	// a control plane, io.k3sm.agent on a joining worker. Exactly one of them is
-	// ever in a manifest — a Mac that carried both would register two nodes out
-	// of one data root — and the position is the same either way, because both
-	// depend on the helper netd bootstraps first.
-	items = append(items, []artifact{
-		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
-		{kind: kindDaemon, disp: dispRemove, label: daemonLabel(cfg.Role), path: cfg.plistPath(daemonLabel(cfg.Role)), assertExists: true},
-
-		// The admin kubeconfig in the human's home — preserved (it may hold other
-		// clusters; k3sm never owns the whole file).
-		{kind: kindKubeconfig, disp: dispPreserve, user: cfg.TargetUser},
-
-		// Preserved privileged state: DataRoot (kine state.db + mesh keys) and the
-		// daemon LogDir. Both survive an uninstall→reinstall.
-		{kind: kindDir, disp: dispPreserve, path: cfg.DataRoot, assertExists: false},
-		{kind: kindDir, disp: dispPreserve, path: LogDir, assertExists: false},
-	}...)
-	// The data-volume record, beside the data root it declares and preserved for
-	// the same reason: an uninstall keeps the volume mounted and its data
-	// intact, so deleting the declaration would leave the next `k3sm install`
-	// unable to tell a k3sm volume from an operator's. It lives outside
-	// InstallDir precisely so the uninstall sweep cannot reach it; the entry is
-	// here to say that is deliberate. `k3sm datavol delete --yes` is the one
-	// thing that removes it.
-	if cfg.dataVolumeDeclared {
-		items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: dataroot.DefaultRecordPath, assertExists: false})
-	}
-	// The role's arguments record, UNCONDITIONALLY and preserved: every install
-	// writes one (an empty set is the truthful record of a node with no operator
-	// flags), and an uninstall must keep it or the next install is back to
-	// re-rendering the stock template over an operator's configuration. It lives
-	// outside InstallDir so the sweep cannot reach it; the entry is here to say
-	// that is deliberate, and to put it in the list uninstall prints. A server
-	// install names the server record and an agent install the agent one, so
-	// neither role can ever be handed the other's flags.
-	items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: cfg.argsRecordPath(), assertExists: false})
-	items = append(items, []artifact{
-		// The container-log tree is REMOVED on uninstall, unlike the daemon LogDir
-		// above and unlike DataRoot. It holds no state a reinstall wants and no
-		// record anyone is keeping: every file in it belongs to a pod that no
-		// longer exists once k3sm is gone, and leaving a root-equivalent tree of
-		// former workloads' output behind on a machine somebody just uninstalled
-		// k3sm from is not a kindness.
-		{kind: kindDir, disp: dispRemove, path: PodLogsDir, assertExists: false},
-		{kind: kindDir, disp: dispRemove, path: ContainerLogsDir, assertExists: false},
-	}...)
-	return items
-}
-
-// plistContent renders the launchd plist for a daemon label, so Install can drive
-// the writes from the manifest's daemon entries rather than a second hardcoded
-// list. An unknown label is a programmer error (a daemon in the manifest with no
-// renderer) surfaced as an error, never a panic.
-func plistContent(label string, cfg Config) ([]byte, error) {
-	switch label {
-	case NetdLabel:
-		return NetdPlist(cfg), nil
-	case ServerLabel:
-		return ServerPlist(cfg), nil
-	case AgentLabel:
-		return AgentPlist(cfg), nil
-	case DatavolLabel:
-		return DatavolPlist(cfg), nil
-	default:
-		return nil, fmt.Errorf("no plist renderer for daemon %s", label)
-	}
-}
-
 // Install lays down both daemons in dependency order. It is the single root step
 // (run via sudo): ensure _k3sm, copy the binary root-owned, write the two
 // plists, bootstrap netd (the helper) BEFORE server (which needs it), then write
@@ -2736,6 +1725,17 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// half-overwritten state would outlive whichever install failed second.
 	// Refusing here costs an operator one command and nothing else.
 	if err := refuseCrossRole(sys, cfg); err != nil {
+		return err
+	}
+	// The HA request's own shape, from the Config alone: the same validator
+	// the CLI ran at parse time.
+	if err := ValidateHARequest(cfg); err != nil {
+		return fmt.Errorf("install: %w", err)
+	}
+	// An explicit --mesh-ip must name this server's own node pod range (see
+	// checkServerMeshIP). A CARRIED one is checked at 0b″, once the carried
+	// arguments have been read.
+	if err := checkServerMeshIP(cfg, nil); err != nil {
 		return err
 	}
 	// Still before anything is written: the directory that will hold the `k3sm`
@@ -2838,12 +1838,11 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 
 	// 0b. Still before anything else is written: on a control-plane install,
 	//     does the carried `k3sm server` argument set (the installed plist, or
-	//     the survives-uninstall record when there is none) name a
-	//     --datastore-endpoint-file that is no longer on disk? Rendering the
-	//     plist anyway would bring an HA control plane up on its own
-	//     single-node datastore with no log line — a split cluster whose only
-	//     symptom is objects the other servers cannot see — so this refuses
-	//     before the copies below rather than after them. It returns the SAME
+	//     the survives-uninstall record when there is none) name a retired
+	//     external-datastore flag? Rendering the plist anyway would hand launchd
+	//     a daemon that exits on an unknown flag at every respawn, so this
+	//     refuses before the copies below rather than after them, and names the
+	//     embedded-etcd replacement. It returns the SAME
 	//     carried arguments step 2d assigns to cfg.ExtraServerArgs, so the
 	//     installed plist/record is read exactly once per install. Runs after
 	//     the data volume above: the carry-over's "nothing was carried" warning
@@ -2852,6 +1851,22 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     one with no operator server arguments) gets back a nil slice and no
 	//     error.
 	serverArgs, err := preflightServerArgs(sys, cfg)
+	if err != nil {
+		return err
+	}
+	// 0b″. The effective --mesh-ip must name this server's own node pod /24
+	//      (MeshNodePodCIDR): the netd plist seeds netd's node range from it,
+	//      and an address that names no range would leave netd refusing the
+	//      server's own mesh alias at every start.
+	if err := checkServerMeshIP(cfg, serverArgs); err != nil {
+		return err
+	}
+	// 0b′. Secrets encryption, decided from reads alone and before the first
+	//      write that follows: it needs the carried arguments above (a carried
+	//      --cluster-init or --server-join refuses it) and the data root as the
+	//      data volume left it (a datastore already there refuses it). The
+	//      pair itself is written at 1f′, once the service uid is known.
+	encryptionAction, err := preflightSecretsEncryption(sys, cfg, serverArgs)
 	if err != nil {
 		return err
 	}
@@ -2901,11 +1916,22 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 		return fmt.Errorf("install: ensure log dir %s: %w", LogDir, err)
 	}
 
+	// 1b‴. The purge markers, in the two trees `k3sm uninstall --purge` deletes
+	//     whole. Both directories exist by now (the data root from step 1a, the
+	//     log dir from the step above), and the marker is rewritten on every
+	//     install, so a Mac installed before markers existed gains them on its
+	//     next install. Each names the directory it sits in.
+	for _, dir := range []string{cfg.DataRoot, LogDir} {
+		if err := sys.WriteDataRootMarker(dir); err != nil {
+			return fmt.Errorf("install: write the k3sm marker in %s: %w", dir, err)
+		}
+	}
+
 	// 1b'. The container-log tree, for the same reason and at the same moment: the
 	//     node refuses to start without it, and only root can create it owned by
 	//     the service user with a mode that does not expose every pod's output to
 	//     every local account.
-	for _, dir := range []string{PodLogsDir, ContainerLogsDir} {
+	for _, dir := range ContainerLogDirs() {
 		if err := sys.EnsureContainerLogDir(dir, uid); err != nil {
 			return fmt.Errorf("install: ensure container log dir %s: %w", dir, err)
 		}
@@ -2949,7 +1975,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     happens before the plist that names it is written. A reinstall with no
 	//     --token-file stages nothing and leaves any previous copy alone: a
 	//     joined node presents its stored credential and needs no token.
-	if cfg.Role == RoleAgent && cfg.TokenFile != "" {
+	//     A joining server stages its server-class token the same way, into
+	//     its own work dir.
+	if (cfg.Role == RoleAgent && cfg.TokenFile != "") || cfg.serverJoining() {
 		if err := stageJoinToken(sys, cfg, uid, joinToken); err != nil {
 			return err
 		}
@@ -2982,6 +2010,22 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 			return err
 		}
 		cfg.Logger.Info("staged the control plane's admin token for the server daemon (the daemon is told where its token is, never what it is)", "path", cfg.serverTokenPath())
+	}
+
+	// 1f″. A server that is no longer a joining member (its etcd role changed
+	//      to --cluster-init over removed member data) has no use for the
+	//      server-class join token it staged as one, and that token decrypts
+	//      every cluster CA, so it goes with the role rather than lingering
+	//      until an uninstall.
+	if err := retireStaleServerJoinToken(sys, cfg, serverArgs); err != nil {
+		return err
+	}
+
+	// 1f′. The secrets encryption pair, when 0b′ decided to write one: after
+	//      the service uid exists and before any daemon is started, so the
+	//      first start of a new cluster already encrypts.
+	if err := stageSecretsEncryption(sys, cfg, uid, encryptionAction); err != nil {
+		return err
 	}
 
 	// 1g. This node's wireguard identity, in both copies, for BOTH roles — see
@@ -3068,6 +2112,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     with a pin nothing vouched for.
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
 		cfg.stagedPayloadFile(executor.KineMarkerName))
+	//     The etcd version marker is staged the same way, for the same reasons.
+	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.EtcdMarkerName),
+		cfg.stagedPayloadFile(executor.EtcdMarkerName))
 	//     The control-plane version marker is staged the same way and for the same
 	//     reasons: without it the seed cannot tell this release's kube binaries from
 	//     the ones an earlier release left in the work dir, and an absent marker only
@@ -3075,8 +2122,8 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KubeMarkerName),
 		cfg.stagedPayloadFile(executor.KubeMarkerName))
 
-	// 2c′. The shadow shell set: ad-hoc re-signed copies of the host shells
-	//      under <InstallDir>/shadow, with the manifest of what they were made
+	// 2c′. The shadow binary set: ad-hoc re-signed copies of the host shells,
+	//      tar and the common coreutils under <InstallDir>/shadow, with the manifest of what they were made
 	//      from. Made HERE, by the privileged installer and nowhere else (a
 	//      daemon-writable copy would be a code-injection path into every pod),
 	//      and staged like every other artifact, so the set is published with
@@ -3122,19 +2169,6 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//      log-only: nothing here needs to mutate cfg.ExtraServerArgs itself.
 	if old := flagValue(cfg.ExtraServerArgs, "mesh-ip"); cfg.MeshIP != "" && old != "" && old != cfg.MeshIP {
 		cfg.Logger.Info("--mesh-ip replaces the mesh address carried over from the previous install", "old", old, "new", cfg.MeshIP)
-	}
-	// 2d‴. Move a password-bearing datastore DSN off the daemon's command line,
-	//      into a service-user-owned 0600 file the argv then merely names. It sits
-	//      HERE and nowhere else: after the carry-over has decided the arguments,
-	//      and before both the record below and the plist at step 3 are written
-	//      from them, so the two on-disk copies of the argv agree and neither
-	//      holds the password. It also refuses an install whose carried
-	//      --datastore-endpoint-file names a file that is gone — see
-	//      stageDatastoreEndpoint.
-	if cfg.Role == RoleServer {
-		if err := stageDatastoreEndpoint(sys, &cfg, uid); err != nil {
-			return err
-		}
 	}
 	// 2d′. Record them, on EVERY install and whatever the source was — including
 	//      an empty set, which is the truthful record of a node that has none.
@@ -3330,13 +2364,12 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 //
 //   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
 //     because no daemon does it.
-//   - the mesh MSS-clamp pf anchor — SWEPT, by the FlushMeshPFAnchor backstop
-//     below (B274). Left alone it survives netd, scoped to a utun that is gone,
-//     and macOS recycles utun numbers — the next tunnel assigned that number
-//     silently inherits the stale clamp. A daemon-shutdown-path fix was
-//     considered and rejected: a restart already self-heals, because Up
-//     reloads the anchor for the current interface on every daemon start, so
-//     the uninstall backstop is the only place the residue is user-visible.
+//   - the pf anchor an older release loaded the mesh MSS clamp into: SWEPT, by
+//     the FlushMeshPFAnchor backstop below. Nothing loads it now (k3sm loads no
+//     pf rule), but a rule an older release left behind would survive netd,
+//     scoped to a utun that is gone, and macOS recycles utun numbers. A
+//     daemon-shutdown-path fix was considered and rejected: the flush is a
+//     backstop for old state, not a live resource.
 //   - the wireguard utun and its routes — NOT explicitly removed. The interface
 //     is created in-process (tun.CreateTUN) and goes away with netd, and the
 //     kernel drops routes whose interface has vanished; nothing here proves the
@@ -3345,8 +2378,25 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 // Flushing the utun/routes class on the way out (if it ever proves necessary)
 // is a darwin-net change (a shutdown hook that reaches Down), not an installer
 // one, and would be filed separately. Uninstall makes no claim to do it.
+//
+// With cfg.Purge set it is `k3sm uninstall --purge`: the same teardown, then
+// every artifact this one keeps (see purge).
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
+	if cfg.Purge {
+		return purge(ctx, sys, cfg)
+	}
+	_, err := uninstall(ctx, sys, cfg, nil)
+	return err
+}
+
+// uninstall is Uninstall's teardown, and returns the manifest it walked so a
+// purge consumes that same manifest rather than one rebuilt after the state it
+// was derived from has changed. preflight, when non-nil, runs after the
+// manifest is built and BEFORE anything is torn down, and is handed the
+// data-root posture and the error reading it; an error from it is
+// returned as it stands, with nothing changed. cfg already carries its defaults.
+func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []artifact, st dataroot.State, stErr error) error) ([]artifact, error) {
 	var firstErr error
 	note := func(err error) {
 		if err != nil && firstErr == nil {
@@ -3384,6 +2434,11 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// default role would leave the other one's KeepAlive plist behind pointing
 	// at a deleted binary — the exact leak the shared manifest exists to prevent.
 	m := uninstallManifest(sys, cfg)
+	if preflight != nil {
+		if err := preflight(m, st, sterr); err != nil {
+			return m, err
+		}
+	}
 	// Leave the cluster BEFORE anything local is torn down. Everything the call
 	// depends on is alive right now and stops being alive a few lines below: the
 	// agent daemon still holds the mesh up, the stored credential is still on
@@ -3391,6 +2446,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// best-effort and never note()d — a Mac being retired is often being retired
 	// because the cluster is gone, and an uninstall that refused to finish over
 	// that would leave the operator with a half-installed machine.
+	deregisterServer(ctx, sys, cfg, m)
 	deregisterNode(ctx, cfg, m)
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
@@ -3454,10 +2510,9 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
 	// kine ports + the SQLite DB, breaking the next install.
 	note(sys.ReapOrphans(filepath.Join(cfg.serverWorkDir(), "bin")))
-	// Backstop: flush the mesh MSS-clamp pf anchor (B274). It outlives netd —
-	// only the RemoveMesh RPC reaches mesh.WGDevice.Down, and no signal path
-	// ever calls it — so a booted-out daemon leaves the anchor loaded against a
-	// utun number macOS will eventually recycle onto an unrelated tunnel.
+	// Backstop: flush the pf anchor an older release loaded the mesh MSS clamp
+	// into. Nothing loads it now, so this only clears what an older release left
+	// behind, which would outlive netd scoped to a utun that is gone.
 	note(sys.FlushMeshPFAnchor())
 	// Backstop: flush the k3sm-owned lo0 aliases. They are durable kernel state
 	// no daemon removes on the way out — netd tracks per-connection alias caps
@@ -3473,9 +2528,13 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	}
 	note(sys.FlushLo0Aliases(flush))
 	if firstErr != nil {
-		return fmt.Errorf("uninstall: %w", firstErr)
+		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}
 	cfg.Logger.Info("k3sm uninstalled", "install-dir", cfg.InstallDir)
+	if cfg.Purge {
+		// Nothing is kept: the purge removes it next and says what it removed.
+		return m, nil
+	}
 	// What was KEPT, named. An uninstall that lists only what it removed leaves
 	// the operator guessing whether their datastore, their kubeconfig and the
 	// server flags they configured are still there — and guessing wrong in the
@@ -3492,7 +2551,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			"reinstall", "sudo k3sm install --data-volume",
 			"remove-for-good", "sudo k3sm datavol delete --yes")
 	}
-	return nil
+	return m, nil
 }
 
 // deregisterTimeout is the outer bound on the whole deregistration attempt.
@@ -3539,356 +2598,37 @@ func deregisterNode(ctx context.Context, cfg Config, m []artifact) {
 	cfg.Logger.Info("removed this node from the cluster: its MeshPeer and Node are gone, so the remaining nodes drop their wireguard entry for it")
 }
 
-// carriesAgentDaemon reports whether the manifest tears down the worker daemon,
-// which is the one durable fact that says this Mac is a worker.
-func carriesAgentDaemon(m []artifact) bool {
-	for _, a := range m {
-		if a.kind == kindDaemon && a.label == AgentLabel {
-			return true
-		}
+// serverDeregisterRemedy is what the servers that stay do when this server's etcd
+// member could not be removed: with the member still registered, a two-server
+// cluster has lost its quorum the moment this daemon stops.
+const serverDeregisterRemedy = "on the surviving server run: sudo launchctl bootout system/" + ServerLabel +
+	" && sudo k3sm server --cluster-reset --work-dir <its work dir> --etcd-peer-ip <its LAN address>, then start it again; or, while the cluster still has quorum, remove the member from a surviving server"
+
+// deregisterServer removes this server's etcd member before the teardown stops it,
+// on a server whose installed plist selects the embedded-etcd posture and on no
+// other. The posture is read from the plist on disk (as the role is read from the
+// manifest), so `sudo k3sm uninstall` needs no flags. A plist that cannot be read or
+// parsed says nothing about the posture, so nothing is attempted.
+func deregisterServer(ctx context.Context, sys System, cfg Config, m []artifact) {
+	if cfg.DeregisterServer == nil || !carriesServerDaemon(m) {
+		return
 	}
-	return false
-}
-
-// keptArtifacts describes, in manifest order, what an uninstall deliberately
-// leaves on disk. It is derived from the manifest's dispPreserve entries rather
-// than hand-listed, so an artifact that becomes preserved (or stops being)
-// cannot quietly fall out of the sentence an operator reads.
-func keptArtifacts(cfg Config, m []artifact) []string {
-	var kept []string
-	for _, a := range m {
-		switch {
-		case a.disp != dispPreserve:
-			continue
-		case a.kind == kindServiceUser:
-			kept = append(kept, "the "+a.user+" service user")
-		case a.kind == kindKubeconfig:
-			kept = append(kept, "your admin kubeconfig")
-		case a.path == cfg.DataRoot:
-			// Named with its record, because that file is the one preserved
-			// thing whose existence is not obvious: it is why the next install
-			// still knows this node's --mesh-ip.
-			kept = append(kept, "the data root "+a.path+" (your cluster state)")
-		case a.path == LogDir:
-			kept = append(kept, "the daemon log dir "+a.path)
-		case a.path == cfg.ServerArgsRecord:
-			kept = append(kept, "the server arguments you configured, in "+a.path)
-		case a.path == cfg.AgentArgsRecord:
-			kept = append(kept, "the agent arguments you configured, in "+a.path)
-		case a.path == dataroot.DefaultRecordPath:
-			kept = append(kept, "the data-volume record "+a.path)
-		default:
-			kept = append(kept, a.path)
-		}
+	raw, err := sys.ReadFile(cfg.plistPath(ServerLabel))
+	if err != nil {
+		return
 	}
-	return kept
-}
-
-// NetdPlist renders the io.k3sm.netd LaunchDaemon plist. It runs as ROOT (no
-// UserName) — it is the only irreducibly-root component — execing `k3sm netd`
-// with the Service CIDR (so proxy VIP binds are authorizable), the socket, the
-// mesh key dir, and a read kubeconfig (the PortAuthorizer's Service informer).
-//
-// The kubeconfig is the ONE argument that follows the node's role, because the
-// two roles hold different credentials in different places. A RoleServer node
-// runs the control plane, so netd reads the admin kubeconfig in the server work
-// dir. A RoleAgent node has no server work dir at all: the credential a worker
-// owns is the node kubeconfig `k3sm agent` writes when its join succeeds
-// (AgentCredentialPath), and that is what its netd is handed. Handing a worker
-// the server path is not a cosmetic mismatch — buildServiceSet's informer is the
-// authorizer's only source of truth, so a kubeconfig that cannot load leaves
-// every <1024 bind denied for the daemon's whole life, and on a Mac that was
-// once a server the file still exists and is a STALE credential.
-//
-// It deliberately passes NO --node-pod-cidr on either role. The node's pod /24
-// is not knowable at install time — it is decided by the join — so netd starts
-// on the flag's own pre-adoption default and adopts the real prefix from the
-// agent's ConfigureMesh RPC. Writing the install-time value into the launchd job
-// would pin a guess that the next netd restart comes back on, dropping every pod
-// alias and route the adopted prefix had established. It passes no --node-ip for
-// the separate reason TestNetdPlistXML records (the node-address authorizer
-// branch is dormant by configuration).
-func NetdPlist(cfg Config) []byte {
-	cfg = cfg.withDefaults()
-	kubeconfig := filepath.Join(cfg.serverWorkDir(), "k3sm.kubeconfig")
-	if cfg.Role == RoleAgent {
-		kubeconfig = AgentCredentialPath(cfg.DataRoot)
+	args, err := parseProgramArguments(raw)
+	if err != nil || !carriesEtcdPosture(args) {
+		return
 	}
-	return renderPlist(launchdPlist{
-		Label: NetdLabel,
-		ProgramArguments: []string{
-			cfg.installedBinary(), "netd",
-			"--socket", cfg.NetdSocket,
-			"--service-cidr", cfg.ServiceCIDR,
-			"--mesh-key-dir", MeshKeyDir,
-			"--kubeconfig", kubeconfig,
-		},
-		RunAtLoad:  true,
-		KeepAlive:  true,
-		StdoutPath: NetdLogPath(),
-		StderrPath: NetdLogPath(),
-		// No UserName: netd is root.
-	})
-}
-
-// daemonEnv is the environment a service-user node daemon runs under: HOME is
-// the data root (the _k3sm home), and the Go module and build caches are pinned
-// inside the role's own work dir rather than left to derive from HOME.
-//
-// The pin is what keeps the boot-time kine build working under a root-owned
-// data root. Derived from HOME, the caches land at <home>/go/pkg/mod and
-// <home>/Library/Caches/go-build, and the service user cannot create a new
-// top-level directory in a root:wheel 0755 root. The work dir is already the
-// service user's (0700, see OwnershipOf), so nothing new has to be handed over.
-// The executor's module-cache lookup (`go env GOMODCACHE`) and the kine build's
-// inherited environment honour both variables as they are.
-func daemonEnv(dataRoot, workDir string) map[string]string {
-	return map[string]string{
-		"HOME":       dataRoot,
-		"GOMODCACHE": filepath.Join(workDir, "go", "mod"),
-		"GOCACHE":    filepath.Join(workDir, "go", "build"),
+	ctx, cancel := context.WithTimeout(ctx, deregisterTimeout)
+	defer cancel()
+	if err := cfg.DeregisterServer(ctx); err != nil {
+		cfg.Logger.Warn("could not remove this server's etcd member from the cluster; the servers that stay still count it toward quorum",
+			"err", err, "remedy", serverDeregisterRemedy)
+		return
 	}
-}
-
-// serverFileLimit is the soft+hard RLIMIT_NOFILE (launchd NumberOfFiles) the
-// server AND agent LaunchDaemons request — both host a node, and a worker runs
-// the same Service proxy the control plane does. The process hosts the proxy /
-// UDP relay, whose flow budget darwin-net sizes as max(8192, rl.Cur/2)
-// (defaultUDPFlowBudget) — so the fd table it reads must be raised above launchd's
-// 256 default, which floors the budget at 8192 with NO headroom for the
-// co-resident apiserver/kine.
-//
-// 131072 is ≤ kern.maxfilesperproc on a large Mac, so every descriptor it grants
-// can actually be allocated there. That ceiling scales with installed RAM
-// (measured on macOS 26: 245760 at 64 GB, 10240 at 8 GB); launchd still grants
-// the requested soft limit on a small Mac, but the kernel refuses opens past the
-// ceiling with EMFILE. The k3s Linux value (1048576) exceeds the macOS ceiling
-// on every Mac. 131072 yields a UDP flow budget of 65536 (rl.Cur/2), ~8× the
-// 8192 floor, leaving the control plane the other half; darwin-net derives the
-// budget from the kernel ceiling too, so a small Mac falls back toward the floor.
-//
-// Reload contract: launchd applies *ResourceLimits at process spawn from the job
-// definition captured at bootstrap — so this raised limit binds on a fresh
-// install or an uninstall→install (bootout→bootstrap), not on
-// `launchctl kickstart -k`, which respawns the existing in-memory job with the
-// old limit. Existing installs need a reinstall for the new limit to bind.
-// Install says both halves out loud (checkFileLimit): a WARN when the kernel
-// ceiling sits below this value, and a post-restart notice when the plist it
-// replaced requested a different one.
-const serverFileLimit = 131072
-
-// ServerPlist renders the io.k3sm.server LaunchDaemon plist. It runs as the
-// unprivileged _k3sm user (UserName) execing `k3sm server` (the control plane +
-// VK node), which reaches the root helper over the netd socket. KeepAlive +
-// RunAtLoad make it boot-surviving and headless.
-//
-// The argument list is the fixed managed set followed by Config.ExtraServerArgs
-// — the operator's own arguments, which Install resolves from the installed
-// plist when there is one and otherwise from the server-arguments record in
-// /Library/Preferences, so neither a reinstall nor an uninstall-then-install
-// re-renders the bare template over them (a first install has neither source and
-// renders the template alone). They are appended AFTER the managed set (and in
-// their original relative order) so a preserved argument can never displace one
-// this renderer owns.
-func ServerPlist(cfg Config) []byte {
-	cfg = cfg.withDefaults()
-	args := []string{
-		cfg.installedBinary(), "server",
-		"--runtime", "runtimed",
-		// The STAGED copy's PATH, never the token value — the agent plist's
-		// contract, applied to the credential that matters most. The token this
-		// names is the static admin bearer token: it authenticates as
-		// system:masters, so a copy of it on a world-readable argv is a copy of
-		// cluster-admin. Install writes the file (serverTokenPath, 0600, owned by
-		// the service user) before this plist is laid down, and the server reads
-		// it once at start through the same reader the agent uses.
-		"--token-file", cfg.serverTokenPath(),
-	}
-	args = append(args, cfg.resolvedExtraServerArgs()...)
-	return renderPlist(launchdPlist{
-		Label:            ServerLabel,
-		UserName:         cfg.ServiceUser,
-		ProgramArguments: args,
-		RunAtLoad:        true,
-		KeepAlive:        true,
-		WorkingDirectory: cfg.DataRoot,
-		StdoutPath:       ServerLogPath(),
-		StderrPath:       ServerLogPath(),
-		EnvironmentVars:  daemonEnv(cfg.DataRoot, cfg.serverWorkDir()),
-		// Derived from the stages the server actually runs on its way out — see
-		// serverExitTimeOut. Never a hand-picked number: every stage's bound lives
-		// in its own package, and a literal here would be wrong the first time one
-		// of them moved.
-		ExitTimeOut: serverExitTimeOut,
-		// Raise RLIMIT_NOFILE so darwin-net's UDP flow budget sizes against a real
-		// fd table, not launchd's 256 default (the agent plist does the same; netd
-		// is not a relay host). Binds at bootstrap, not on kickstart -k — see the
-		// serverFileLimit reload contract above.
-		SoftFileLimit: serverFileLimit,
-	})
-}
-
-// The teardown budget, and why ExitTimeOut is derived rather than chosen.
-//
-// launchd SIGTERMs the job at `bootout`/`kickstart -k` and SIGKILLs it
-// ExitTimeOut seconds later (its default is 20). Everything a k3sm daemon does on
-// its way out happens inside that ONE number, and each stage's bound is owned by a
-// different package — so a hand-picked literal here is wrong the first time any of
-// them moves, and the failure is silent and bad: a SIGKILL mid-stop orphans
-// exactly the children the stop exists to reap (kine and the apiserver on the
-// server path, a vm host helper on either).
-//
-// The stages, each with the symbol that owns its bound:
-//
-//	runtimed close     37s  vmShutdownBound (35s) + defaultCloseGrace (2s), both
-//	                        runtimed pkg/runtime/close.go — the embedded runtime's
-//	                        concurrent vm-helper stop, deferred by startNode.
-//	control-plane stop 40s  executor.StopBound (30s) — four components drained
-//	                        serially at drainGrace each, plus the post-SIGKILL reap
-//	                        — plus the 5s outer margin runServer's WAIT for it adds
-//	                        (cmd/k3sm's controlPlaneStopWaitMargin), plus the 5s the
-//	                        stop waits for the node's own loops to drain first
-//	                        (cmd/k3sm's nodeDrainGrace), so the apiserver does not go
-//	                        away under a run loop still publishing status. SERVER
-//	                        ONLY: a worker runs no control plane.
-//	                        It runs CONCURRENTLY with the runtimed close above (the
-//	                        node starts the server's stop from its own teardown —
-//	                        cmd/k3sm/exitoverlap.go), so the two together cost the
-//	                        LARGER of them, never their sum.
-//	control socket      5s  runtimedSocketShutdownGrace, cmd/k3sm/runtimedsocket.go.
-//	mesh teardown       5s  meshTeardownTimeout, cmd/k3sm/agent.go — both roles.
-//	headroom           10s  launchd's own signal/reap latency and the log flush.
-//
-// Every bound is a LITERAL here so the table above can be read in one place, and
-// each literal is bound back to its owner by a test rather than by trust:
-// TestExitTimeOutCoversTheDaemonTeardown compares the control-plane stage with
-// executor.StopBound (the one owner this package can import), and
-// hack/acceptance/B253.sh's CI tier reads runtimed's two constants out of its
-// module and compares them with the close stage. The three stages whose owners live
-// in package main (runtimedSocketShutdownGrace, controlPlaneStopWaitMargin and
-// nodeDrainGrace) have no importable owner and no gate — 15s of a 60s budget
-// between them, and the headroom absorbs a drift in any of them.
-//
-// The sums are rounded UP to the next multiple of ten, because an ExitTimeOut is
-// read by operators in a plist and 60 is legible where 57 invites the question of
-// what the 7 was for. Rounding up can only add headroom.
-//
-// Both roles land on the same 60s today, and that is a RESULT, not a coincidence
-// to lean on: the server's extra stage is overlapped with the runtimed close, so
-// only the 3s by which it now exceeds that close reaches the total, and the
-// rounding absorbs them.
-const (
-	teardownRuntimedClose = 37
-	teardownControlSocket = 5
-	teardownControlPlane  = 30
-	teardownMesh          = 5
-	teardownHeadroom      = 10
-
-	// teardownStopWaitMargin is the slack runServer's WAIT for the control-plane
-	// stop adds on top of that stop's own budget — cmd/k3sm's
-	// controlPlaneStopWaitMargin, which lives in package main and so, like
-	// runtimedSocketShutdownGrace, cannot be imported and asserted here.
-	teardownStopWaitMargin = 5
-	// teardownNodeDrain is how long the control-plane stop waits, before it starts
-	// at all, for the node's Virtual Kubelet and status loops to return —
-	// cmd/k3sm's nodeDrainGrace, another package-main bound. It is part of the
-	// concurrent stage rather than a stage of its own: it is spent inside the same
-	// window the runtimed close occupies.
-	teardownNodeDrain = 5
-
-	// serverConcurrentTeardown is the cost of the server's two LONGEST stages,
-	// which overlap rather than queue: the node starts the control-plane stop at
-	// the very beginning of its own teardown and closes its embedded runtime while
-	// that stop drains (cmd/k3sm/exitoverlap.go). They contend for nothing — vm
-	// host helpers on one side, control-plane children on the other — so the budget
-	// is the larger of the two, and the day either one grows past the other this
-	// arithmetic follows it without being re-chosen. The control-plane side counts
-	// its own drain wait, because the clock on it starts when the node's teardown
-	// does, not when the stop finally begins.
-	serverConcurrentTeardown = max(teardownRuntimedClose, teardownNodeDrain+teardownControlPlane+teardownStopWaitMargin)
-
-	serverTeardownBudget = serverConcurrentTeardown + teardownControlSocket + teardownMesh + teardownHeadroom
-	agentTeardownBudget  = teardownRuntimedClose + teardownControlSocket + teardownMesh + teardownHeadroom
-
-	// serverExitTimeOut is the io.k3sm.server plist's ExitTimeOut: every stage
-	// above, rounded up to the next multiple of ten.
-	serverExitTimeOut = ((serverTeardownBudget + 9) / 10) * 10
-	// agentExitTimeOut is the io.k3sm.agent plist's, on the same derivation minus
-	// the control-plane stop a worker never runs.
-	agentExitTimeOut = ((agentTeardownBudget + 9) / 10) * 10
-)
-
-// agentThrottleInterval is launchd's minimum seconds between spawns of the
-// agent job. The agent's terminal start failures — no credential and no token,
-// an expired credential, a cluster that has forgotten this node's MeshPeer —
-// recur identically on the next start, and KeepAlive respawns an exited job
-// immediately, so without a throttle a node that cannot join burns a core and
-// floods agent.log while looking, from the outside, like an agent that is
-// running. 10 is launchd's own default, stated explicitly because it is a
-// decision here rather than an inherited one: the agent already backs off
-// in-process (agentTerminalBackoff) and this is the supervisor-side floor
-// under it.
-const agentThrottleInterval = 10
-
-// AgentPlist renders the io.k3sm.agent LaunchDaemon plist — the joining
-// worker's daemon, the sibling of ServerPlist on a Mac that has no control
-// plane of its own. It runs as the same unprivileged _k3sm user, with the same
-// data root as its working directory and HOME, and reaches the root helper over
-// the same netd socket.
-//
-// The join credential is rendered as a --token-file PATH and NEVER as a token
-// value. A LaunchDaemon plist is root-owned 0644, so a token on this argv would
-// be readable by every account on the Mac and visible in `ps` for the life of
-// the process; the file the path names is the operator's, is read once at
-// start, and is theirs to delete once the node has joined. A node that has
-// already joined needs neither: it starts from its stored credential.
-//
-// ExitTimeOut is derived the same way the server's is (see serverExitTimeOut),
-// from the stages an AGENT runs: it stops its embedded runtime's vm guests, tears
-// down the runtimed control socket, drains the Service proxy's listeners and runs
-// the same deferred mesh teardown the server does — everything except the
-// control-plane stop, which a worker has no control plane to run. A SIGKILL
-// part-way through leaves vm helpers, or a utun and its routes, behind on a node
-// that looks stopped.
-func AgentPlist(cfg Config) []byte {
-	cfg = cfg.withDefaults()
-	args := []string{
-		cfg.installedBinary(), "agent",
-		"--server", cfg.JoinServer,
-		// The STAGED copy, unconditionally — never Config.TokenFile, which is a
-		// root-only file this user cannot open, and never a token value. The
-		// path is rendered even on an install that staged nothing: the agent
-		// treats a missing token file as "no token" and starts from its stored
-		// credential, so this is the one durable place a token is ever read
-		// from, and the argv does not churn between installs.
-		"--token-file", cfg.agentTokenPath(),
-	}
-	// --node-ip ONLY when the operator asserted one. Rendering an empty value
-	// would put `--node-ip ""` on the daemon's argv, which is not "no assertion"
-	// but an unparseable one, and the join is the wrong place to discover it.
-	if cfg.NodeIP != "" {
-		args = append(args, "--node-ip", cfg.NodeIP)
-	}
-	args = append(args, cfg.ExtraAgentArgs...)
-	return renderPlist(launchdPlist{
-		Label:            AgentLabel,
-		UserName:         cfg.ServiceUser,
-		ProgramArguments: args,
-		RunAtLoad:        true,
-		KeepAlive:        true,
-		ThrottleInterval: agentThrottleInterval,
-		WorkingDirectory: cfg.DataRoot,
-		StdoutPath:       AgentLogPath(),
-		StderrPath:       AgentLogPath(),
-		EnvironmentVars:  daemonEnv(cfg.DataRoot, cfg.agentWorkDir()),
-		ExitTimeOut:      agentExitTimeOut,
-		// The same RLIMIT_NOFILE raise the control plane gets, for the same
-		// reason and with the same reload contract: a worker hosts the Service
-		// proxy and the UDP relay, whose flow budget darwin-net sizes as
-		// max(8192, rl.Cur/2), so under launchd's 256-fd default the budget
-		// floors with no headroom for the node's own watches and pod streams.
-		SoftFileLimit: serverFileLimit,
-	})
+	cfg.Logger.Info("removed this server's etcd member from the cluster; the remaining servers no longer count it toward quorum")
 }
 
 // adminLoopbackHost is the apiserver address the admin kubeconfig uses on a
@@ -4034,157 +2774,6 @@ users:
   user:
     token: %s
 `, server, clusterTLS, cfg.AdminToken))
-}
-
-// launchdPlist is the subset of a launchd job we render. A non-empty UserName
-// makes the daemon run as that user (the server); an empty UserName runs as root
-// (netd).
-type launchdPlist struct {
-	Label            string
-	UserName         string
-	ProgramArguments []string
-	RunAtLoad        bool
-	KeepAlive        bool
-	// KeepAliveOnFailure renders KeepAlive as the dict {SuccessfulExit: false}
-	// instead of a bare boolean: launchd then relaunches the job ONLY when it
-	// exits non-zero. It is what a oneshot needs — `k3sm datavol mount` mounts
-	// and exits 0, and a bare KeepAlive would respawn it forever. It is
-	// mutually exclusive with KeepAlive, and renderPlist emits one or the other.
-	KeepAliveOnFailure bool
-	// ThrottleInterval, when > 0, is launchd's minimum seconds between spawns.
-	// For the datavol oneshot it bounds how fast a failing mount is retried,
-	// against the in-process retry MountRecorded already performs. 0 omits the
-	// key (launchd's own 10s default applies).
-	ThrottleInterval int
-	WorkingDirectory string
-	StdoutPath       string
-	StderrPath       string
-	EnvironmentVars  map[string]string
-	// SoftFileLimit, when > 0, emits SoftResourceLimits + HardResourceLimits with
-	// NumberOfFiles (RLIMIT_NOFILE) at this value. 0 (netd) omits both.
-	SoftFileLimit int
-	// ExitTimeOut, when > 0, is the launchd ExitTimeOut (seconds) — how long
-	// bootout waits after SIGTERM before SIGKILL. The server needs longer than
-	// launchd's 20s default: its Stop() tears the control-plane children down
-	// SERIALLY (apiserver→scheduler→KCM→kine, up to 4×drainGrace), and a SIGKILL
-	// mid-teardown orphans the not-yet-reaped children (own process groups). 0
-	// omits the key (launchd default).
-	ExitTimeOut int
-}
-
-// renderPlist serializes p to a launchd XML property list. String values are
-// XML-escaped; booleans render as <true/>/<false/>; the ProgramArguments array
-// and the optional EnvironmentVariables dict follow the launchd schema.
-func renderPlist(p launchdPlist) []byte {
-	var b bytes.Buffer
-	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
-	b.WriteString(`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n")
-	b.WriteString(`<plist version="1.0">` + "\n<dict>\n")
-
-	writeKeyString(&b, "Label", p.Label)
-	if p.UserName != "" {
-		writeKeyString(&b, "UserName", p.UserName)
-	}
-
-	b.WriteString("  <key>ProgramArguments</key>\n  <array>\n")
-	for _, a := range p.ProgramArguments {
-		b.WriteString("    <string>")
-		xmlEscape(&b, a)
-		b.WriteString("</string>\n")
-	}
-	b.WriteString("  </array>\n")
-
-	writeKeyBool(&b, "RunAtLoad", p.RunAtLoad)
-	// KeepAlive is EITHER the boolean the two long-running daemons carry or the
-	// {SuccessfulExit: false} dict the oneshot carries, never both: launchd
-	// reads one KeepAlive key, and emitting two would leave which one binds to
-	// the parser's order rather than to this decision.
-	if p.KeepAliveOnFailure {
-		b.WriteString("  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n")
-	} else {
-		writeKeyBool(&b, "KeepAlive", p.KeepAlive)
-	}
-	if p.ThrottleInterval > 0 {
-		writeKeyInt(&b, "ThrottleInterval", p.ThrottleInterval)
-	}
-	if p.ExitTimeOut > 0 {
-		writeKeyInt(&b, "ExitTimeOut", p.ExitTimeOut)
-	}
-	if p.SoftFileLimit > 0 {
-		// Emit both Soft and Hard NumberOfFiles: a soft limit may never exceed the
-		// hard one, and an MDM-managed Mac may set a finite launchd hard limit that
-		// would clamp a soft-only raise — launchd (PID 1) can raise the hard limit
-		// up to the kernel ceiling, so we set both to the requested value.
-		for _, key := range []string{"SoftResourceLimits", "HardResourceLimits"} {
-			b.WriteString("  <key>" + key + "</key>\n  <dict>\n    ")
-			writeKeyInt(&b, "NumberOfFiles", p.SoftFileLimit)
-			b.WriteString("  </dict>\n")
-		}
-	}
-	if p.WorkingDirectory != "" {
-		writeKeyString(&b, "WorkingDirectory", p.WorkingDirectory)
-	}
-	if p.StdoutPath != "" {
-		writeKeyString(&b, "StandardOutPath", p.StdoutPath)
-	}
-	if p.StderrPath != "" {
-		writeKeyString(&b, "StandardErrorPath", p.StderrPath)
-	}
-	if len(p.EnvironmentVars) > 0 {
-		b.WriteString("  <key>EnvironmentVariables</key>\n  <dict>\n")
-		for _, k := range sortedKeys(p.EnvironmentVars) {
-			b.WriteString("    ")
-			writeKeyString(&b, k, p.EnvironmentVars[k])
-		}
-		b.WriteString("  </dict>\n")
-	}
-
-	b.WriteString("</dict>\n</plist>\n")
-	return b.Bytes()
-}
-
-func writeKeyString(b *bytes.Buffer, key, val string) {
-	b.WriteString("  <key>")
-	xmlEscape(b, key)
-	b.WriteString("</key>\n  <string>")
-	xmlEscape(b, val)
-	b.WriteString("</string>\n")
-}
-
-func writeKeyBool(b *bytes.Buffer, key string, val bool) {
-	b.WriteString("  <key>")
-	xmlEscape(b, key)
-	if val {
-		b.WriteString("</key>\n  <true/>\n")
-	} else {
-		b.WriteString("</key>\n  <false/>\n")
-	}
-}
-
-func writeKeyInt(b *bytes.Buffer, key string, val int) {
-	b.WriteString("  <key>")
-	xmlEscape(b, key)
-	b.WriteString("</key>\n  <integer>")
-	b.WriteString(strconv.Itoa(val))
-	b.WriteString("</integer>\n")
-}
-
-func xmlEscape(b *bytes.Buffer, s string) {
-	_ = xml.EscapeText(b, []byte(s))
-}
-
-// sortedKeys returns the map keys in deterministic order (stable plist output).
-func sortedKeys(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j-1] > out[j]; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
-	return out
 }
 
 // generateToken returns a random hex bearer token for the admin kubeconfig +

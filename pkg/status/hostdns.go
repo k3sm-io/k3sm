@@ -29,7 +29,7 @@ import (
 // entry on every start.
 const nodeResolverKickstart = "sudo launchctl kickstart -k system/io.k3sm.netd"
 
-// shadowRemedy re-makes the shadow shell set from the live host binaries.
+// shadowRemedy re-makes the shadow binary set from the live host binaries.
 const shadowRemedy = "sudo k3sm install"
 
 // nodeResolverRow reports whether netd's node resolver entry (svc and the
@@ -77,10 +77,17 @@ func (c Collector) netdAlive(netd Row) bool {
 	return err == nil || errors.Is(err, fs.ErrPermission)
 }
 
-// shadowShellsRow compares the shadow shell manifest's source cdhashes with
-// the live host binaries. A macOS update replaces /bin/bash and friends; the
-// copies then lag until the next install, which is what the remedy does. ok is
-// false when no cdhash reader was wired in.
+// shadowDriftListed is how many drifted paths the shadow-shells row names
+// before it summarizes the rest.
+const shadowDriftListed = 3
+
+// shadowShellsRow compares the shadow binary set's manifest with the live
+// host and with the set this binary declares. A macOS update replaces the host
+// binaries; the copies then lag until the next install, which is what the
+// remedy does. A manifest that lacks copies of the current list (an install
+// older than this binary) is reported the same way; a copy whose source this
+// host does not have is never expected, because the installer skips it. ok is
+// false when no cdhash reader was wired in. The row keeps its historical name.
 func (c Collector) shadowShellsRow() (Row, bool) {
 	if c.CDHash == nil || c.FS == nil || c.Paths.ShadowManifest == "" {
 		return Row{}, false
@@ -90,7 +97,7 @@ func (c Collector) shadowShellsRow() (Row, bool) {
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			row.State, row.Severity = StateMissing, SeverityWarn
-			row.Detail = "no shadow shell set: pods that start through /bin/sh lose the DNS and path shims"
+			row.Detail = "no shadow binary set: pods that start through /bin/sh lose the DNS and path shims"
 			return row, true
 		}
 		row.State, row.Severity = StateUnknown, SeverityUnknown
@@ -104,19 +111,47 @@ func (c Collector) shadowShellsRow() (Row, bool) {
 		row.Detail = errText(err)
 		return row, true
 	}
-	drifted := shadow.Drift(m, c.CDHash)
-	if len(drifted) == 0 {
-		row.State, row.Severity = StateOK, SeverityOK
-		row.Detail = fmt.Sprintf("%d re-signed host shells match their sources", len(m.Sources))
-		row.Remedy = ""
+	if drifted := shadow.Drift(m, c.CDHash); len(drifted) > 0 {
+		var paths []string
+		seen := map[string]bool{}
+		for _, d := range drifted {
+			if !seen[d.Source.Path] {
+				seen[d.Source.Path] = true
+				paths = append(paths, d.Source.Path)
+			}
+		}
+		total := map[string]bool{}
+		for _, s := range m.Sources {
+			total[s.Path] = true
+		}
+		listed := paths
+		var more string
+		if len(paths) > shadowDriftListed {
+			listed = paths[:shadowDriftListed]
+			more = fmt.Sprintf(" and %d more", len(paths)-shadowDriftListed)
+		}
+		row.State, row.Severity = StateDrift, SeverityWarn
+		row.Detail = fmt.Sprintf("%d of %d host binaries changed since the last install (a macOS update): %s%s; pods keep running the older copies: run sudo k3sm install",
+			len(paths), len(total), strings.Join(listed, ", "), more)
 		return row, true
 	}
-	var paths []string
-	for _, d := range drifted {
-		paths = append(paths, d.Source.Path)
+	missing, expected := shadow.Missing(m, c.sourcePresent)
+	if len(missing) > 0 {
+		row.State, row.Severity = StateDrift, SeverityWarn
+		row.Detail = fmt.Sprintf("the shadow set is from an older install (%d of %d copies): run sudo k3sm install",
+			expected-len(missing), expected)
+		return row, true
 	}
-	row.State, row.Severity = StateDrift, SeverityWarn
-	row.Detail = fmt.Sprintf("%s changed since the last install (a macOS update); pods keep running the older copies: run sudo k3sm install",
-		strings.Join(paths, ", "))
+	row.State, row.Severity = StateOK, SeverityOK
+	row.Detail = fmt.Sprintf("%d re-signed host binaries match their sources", len(m.Sources))
+	row.Remedy = ""
 	return row, true
+}
+
+// sourcePresent reports whether a shadow copy's source is on this host. Only
+// a definite absence counts as absent; an unreadable path is assumed present,
+// so a set that lacks it is still reported.
+func (c Collector) sourcePresent(path string) bool {
+	_, err := c.FS.Stat(path)
+	return !errors.Is(err, fs.ErrNotExist)
 }
