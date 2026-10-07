@@ -188,7 +188,7 @@ not repeat it. Check that no `requestheader-` key remains:
 kubectl -n kube-system get configmap extension-apiserver-authentication -o jsonpath='{.data}'
 ```
 
-`K3SM_LAB=1 hack/acceptance/B411.sh --rollback-check` from a checkout makes the same check. On an HA
+The output must not contain `requestheader-`. On an HA
 cluster, roll back the mint-authority server last and delete the ConfigMap only after the last server
 runs the older release, because a running new apiserver adds the CA back. A joined server that will
 not restart on the older release is recovered with `sudo k3sm server --cluster-reset` on the server
