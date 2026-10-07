@@ -79,8 +79,8 @@ const (
 //     one of the runtime root's daemon-private subtrees.
 //
 // Either way the shims are regular-file copies (never symlinks) with mode 0755,
-// and staging refuses a stage dir or target that is a symlink (see
-// refuseSymlink).
+// staging refuses a stage dir or target that is a symlink (see refuseSymlink),
+// and it refuses a stage this euid does not alone control (prepareShimStage).
 const DefaultPodShimDir = "/Library/k3sm-dev"
 
 // podShimSubdir is the rootless tier's stage dir name under the instance's
@@ -250,7 +250,9 @@ func (m *Manager) podShimParents(instance string) []string {
 // It exists for the rootless pod-root base, <PodRootBasePrefix>-<euid>, which
 // sits under the world-writable /private/var/tmp: any local user can pre-create
 // that name as a link. MkdirAll would follow it, and staging would then write
-// the shim that is DYLD-injected into EVERY pod into the planter's tree.
+// the shim that is DYLD-injected into EVERY pod into the planter's tree. They
+// can equally create it as a real directory they own; the shim stage refuses
+// that too, through mkdirOwned.
 func mkdirNoFollow(perm os.FileMode, dirs ...string) error {
 	for _, d := range dirs {
 		if err := refuseSymlink(d); err != nil {
@@ -296,38 +298,27 @@ func (m *Manager) stagePodShims(ctx context.Context, instance string, datapath b
 // pod-readable stage dir and returns its absolute path, or "" when it is not
 // provisionable. It MIRRORS provisionExecShim: the shim is ALWAYS rebuilt when
 // the source is available (never trusted on existence alone), and a cached
-// artifact is reused ONLY when the rebuild FAILS — and then with a STALE warning
-// naming the build error, because the re-sign rewrites the file and refreshes its
-// mtime, so nothing else would show that the cached shim may predate the source.
+// artifact is reused ONLY when the rebuild FAILS, only when it passes
+// helperProblem (a regular file this euid owns that nobody else can write), and
+// then with a STALE warning naming the build error, because the re-sign rewrites
+// the file and refreshes its mtime, so nothing else would show that the cached
+// shim may predate the source.
+//
+// The stage itself must be one only this euid controls (prepareShimStage); one
+// that is not is refused, never repaired, and the shim is not provisioned.
 //
 // The build runs in a fresh private temp dir inside the stage dir; the result is
 // signed and made pod-readable THERE and then renamed over the target, so the
 // staged file is always a regular-file copy and no chmod or write ever follows a
 // link at the target path. A symlinked stage dir or target is refused outright
 // (ErrSymlinkStage). A non-nil error is a filesystem failure, which IS fatal; an
-// unbuildable shim is not (it degrades to the pre-shim behavior — system-resolver
-// DNS, host-absolute mount paths — exactly as a from-source `k3sm node` without
-// the staged dylibs does).
+// unbuildable or untrusted shim is not (it degrades to the pre-shim behavior —
+// system-resolver DNS, host-absolute mount paths — exactly as a from-source
+// `k3sm node` without the staged dylibs does).
 func (m *Manager) provisionPodShim(ctx context.Context, instance, name string) (string, error) {
-	dir := m.podShimDir(instance)
-	// Create the parents component by component, refusing a symlink at each, and
-	// at the runtime root's own 0700 so the stage dir below does not create the
-	// instance's runtime root 0755. For the rootless tier that is the euid-scoped
-	// base under the world-writable /private/var/tmp and the instance's runtime
-	// root (see mkdirNoFollow for why a planted link there matters).
-	if err := mkdirNoFollow(0o700, m.podShimParents(instance)...); err != nil {
+	dir, ok, err := m.prepareShimStage(instance, name)
+	if err != nil || !ok {
 		return "", err
-	}
-	if err := refuseSymlink(dir); err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create pod shim stage dir %s: %w", dir, err)
-	}
-	// MkdirAll applies the process umask, and a restrictive one (0077) would leave
-	// the dir untraversable by the pod's uid — re-assert the mode explicitly.
-	if err := os.Chmod(dir, 0o755); err != nil {
-		return "", fmt.Errorf("make pod shim stage dir %s traversable: %w", dir, err)
 	}
 	shim := filepath.Join(dir, name)
 	if err := refuseSymlink(shim); err != nil {
@@ -344,21 +335,121 @@ func (m *Manager) provisionPodShim(ctx context.Context, instance, name string) (
 		return "", err
 	}
 	if buildErr != nil {
-		if cached {
-			fmt.Fprintf(m.out, "WARNING: %s is STALE: rebuild failed (%v); reusing the cached shim from an earlier build, which may predate the current source\n", name, buildErr)
-			// The failed build may have taken a while; re-check the target right
-			// before codesign rewrites it in place, so a link planted meanwhile is
-			// refused rather than followed.
-			if err := refuseSymlink(shim); err != nil {
-				return "", err
-			}
-			_ = m.shimBuilder.Sign(ctx, shim)
-			return m.podReadable(shim)
+		if !cached {
+			fmt.Fprintf(m.out, "note: could not build %s: %v\n", name, buildErr)
+			return "", nil
 		}
-		fmt.Fprintf(m.out, "note: could not build %s: %v\n", name, buildErr)
-		return "", nil
+		// The failed build may have taken a while; re-check the target right
+		// before codesign rewrites it in place, so a link planted meanwhile is
+		// refused rather than followed.
+		if err := refuseSymlink(shim); err != nil {
+			return "", err
+		}
+		// A shim someone else left (or could have rewritten) is not reused: it is
+		// DYLD-injected into every pod, and nothing says which source it came from.
+		if problem := m.helperProblem(shim); problem != "" {
+			fmt.Fprintf(m.out, "note: could not build %s (%v), and the cached %s %s; not reusing it\n", name, buildErr, shim, problem)
+			return "", nil
+		}
+		fmt.Fprintf(m.out, "WARNING: %s is STALE: rebuild failed (%v); reusing the cached shim from an earlier build, which may predate the current source\n", name, buildErr)
+		_ = m.shimBuilder.Sign(ctx, shim)
 	}
-	return m.podReadable(shim)
+	staged, err := m.podReadable(shim)
+	if err != nil || staged == "" {
+		return staged, err
+	}
+	return m.verifiedShim(staged), nil
+}
+
+// prepareShimStage creates instance's shim stage dir and returns it, with ok
+// false (after a note) when the stage is not one this euid alone controls.
+//
+//   - Rootless tier: the euid-scoped pod-root base sits under the world-writable
+//     (sticky) /private/var/tmp, so any local user can create that name first, as
+//     a link or as a real directory they own. Each component from the base down
+//     (the base, the instance's runtime root, the stage dir) is created or reused
+//     one at a time and must pass ownedDirProblem BEFORE anything is created
+//     inside it, so nothing is ever written into a directory someone else
+//     controls.
+//   - Root tier (DefaultPodShimDir): the whole ancestor chain must pass
+//     rootChainProblem, the check the root run's k3sm-execshim dir uses, since a
+//     shim in a dir the user could swap is code the user injects into every pod.
+//
+// A symlinked component is ErrSymlinkStage (fatal), as before.
+func (m *Manager) prepareShimStage(instance, name string) (string, bool, error) {
+	dir := m.podShimDir(instance)
+	if m.euid == 0 {
+		// Create the parents component by component, refusing a symlink at each.
+		if err := mkdirNoFollow(0o700, m.podShimParents(instance)...); err != nil {
+			return "", false, err
+		}
+		if err := mkdirNoFollow(0o755, dir); err != nil {
+			return "", false, err
+		}
+		if problem := m.rootChainProblem(dir); problem != "" {
+			fmt.Fprintf(m.out, "note: not staging %s in %s: %s\n", name, dir, problem)
+			return "", false, nil
+		}
+	} else {
+		// The parents at the runtime root's own 0700, so the stage dir below does
+		// not create the instance's runtime root 0755.
+		for _, d := range m.podShimParents(instance) {
+			if ok, err := m.mkdirOwned(0o700, d, name); err != nil || !ok {
+				return "", false, err
+			}
+		}
+		if ok, err := m.mkdirOwned(0o755, dir, name); err != nil || !ok {
+			return "", false, err
+		}
+	}
+	// Mkdir applies the process umask, and a restrictive one (0077) would leave
+	// the dir untraversable by the pod's uid — re-assert the mode explicitly.
+	if err := refuseSymlink(dir); err != nil {
+		return "", false, err
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		return "", false, fmt.Errorf("make pod shim stage dir %s traversable: %w", dir, err)
+	}
+	return dir, true, nil
+}
+
+// mkdirOwned creates dir with perm (its parent must exist), refusing a symlink
+// (ErrSymlinkStage) like mkdirNoFollow, and then requires it to pass
+// ownedDirProblem whether it was just created or already there. An existing
+// dir that fails is refused, never chowned or chmodded into shape: whoever made
+// it may already have put something inside. ok is false (after a note naming
+// the path and the remedy) when it fails.
+func (m *Manager) mkdirOwned(perm os.FileMode, dir, name string) (ok bool, err error) {
+	if err := mkdirNoFollow(perm, dir); err != nil {
+		return false, err
+	}
+	if problem := m.ownedDirProblem(dir); problem != "" {
+		fmt.Fprintf(m.out, "note: not staging %s: %s. Remedy: %s\n", name, problem, m.stageRemedy(dir))
+		return false, nil
+	}
+	return true, nil
+}
+
+// stageRemedy is the one-line fix for a refused rootless stage dir: one this
+// user owns only needs its group/other write bit dropped; anything else (another
+// user's dir, a non-directory) is removed so the next run creates it afresh.
+func (m *Manager) stageRemedy(dir string) string {
+	st, err := m.lstatT(dir)
+	if err == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR && int(st.Uid) == m.euid {
+		return "chmod go-w " + dir
+	}
+	return "sudo rm -rf " + dir
+}
+
+// verifiedShim returns shim only if it passes helperProblem at this moment, the
+// last check before its path is handed to the server (the pod-shim twin of
+// verifiedBinDir); otherwise "" with a note, so the shim is not injected.
+func (m *Manager) verifiedShim(shim string) string {
+	if problem := m.helperProblem(shim); problem != "" {
+		fmt.Fprintf(m.out, "note: not injecting %s: it %s\n", shim, problem)
+		return ""
+	}
+	return shim
 }
 
 // buildPodShim builds name into a fresh private temp dir under dir, signs it

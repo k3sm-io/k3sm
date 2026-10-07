@@ -182,9 +182,9 @@ type Manager struct {
 	// (handBack). A field so a test observes the hand-back without root; nil
 	// means os.Lchown.
 	lchown func(path string, uid, gid int) error
-	// lstat inspects a helper path's owner and mode for the execshim trust
-	// checks. A field so a test can present a file as root-owned without root;
-	// nil means unix.Lstat.
+	// lstat inspects a path's owner and mode for the execshim and pod-shim
+	// trust checks. A field so a test can present a file as root-owned (or as
+	// another user's) without root; nil means unix.Lstat.
 	lstat func(path string, st *unix.Stat_t) error
 	// rootBinDir, when set, overrides the root run's helper dir
 	// (rootExecShimDir, /Library/k3sm-dev/bin), so a test drives the root path

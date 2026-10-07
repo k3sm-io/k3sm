@@ -338,29 +338,38 @@ func (m *Manager) helperProblem(path string) string {
 }
 
 // rootChainProblem says why dir cannot hold a helper root will execute, or ""
-// when it can: dir and every ancestor up to "/" is a real directory (not a
-// link), owned by this euid, and writable by neither group nor other. A single
+// when it can: dir and every ancestor up to "/" passes ownedDirProblem. A single
 // component the user could write would let them swap everything below it.
 func (m *Manager) rootChainProblem(dir string) string {
 	for p := filepath.Clean(dir); ; p = filepath.Dir(p) {
-		st, err := m.lstatT(p)
-		if err != nil {
-			return fmt.Sprintf("%s cannot be inspected (%v)", p, err)
-		}
-		switch {
-		case st.Mode&unix.S_IFMT == unix.S_IFLNK:
-			return fmt.Sprintf("%s is a symlink", p)
-		case st.Mode&unix.S_IFMT != unix.S_IFDIR:
-			return fmt.Sprintf("%s is not a directory", p)
-		case int(st.Uid) != m.euid:
-			return fmt.Sprintf("%s is owned by uid %d, not %d", p, st.Uid, m.euid)
-		case st.Mode&0o022 != 0:
-			return fmt.Sprintf("%s is group- or other-writable (mode %#o)", p, st.Mode&0o777)
+		if problem := m.ownedDirProblem(p); problem != "" {
+			return problem
 		}
 		if filepath.Dir(p) == p {
 			return ""
 		}
 	}
+}
+
+// ownedDirProblem says why dir is not a directory this euid alone controls, or
+// "" when it is: a real directory (not a link), owned by this euid, and
+// writable by neither group nor other. The reason names the path.
+func (m *Manager) ownedDirProblem(dir string) string {
+	st, err := m.lstatT(dir)
+	if err != nil {
+		return fmt.Sprintf("%s cannot be inspected (%v)", dir, err)
+	}
+	switch {
+	case st.Mode&unix.S_IFMT == unix.S_IFLNK:
+		return fmt.Sprintf("%s is a symlink", dir)
+	case st.Mode&unix.S_IFMT != unix.S_IFDIR:
+		return fmt.Sprintf("%s is not a directory", dir)
+	case int(st.Uid) != m.euid:
+		return fmt.Sprintf("%s is owned by uid %d, not %d", dir, st.Uid, m.euid)
+	case st.Mode&0o022 != 0:
+		return fmt.Sprintf("%s is group- or other-writable (mode %#o)", dir, st.Mode&0o777)
+	}
+	return ""
 }
 
 // lstatT is unix.Lstat through the Manager's seam (m.lstat), so a test can

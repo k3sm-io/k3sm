@@ -60,13 +60,16 @@ func (f *fakePodShimBuilder) buildNames() []string {
 	return out
 }
 
-// newTestManagerWithShimBuilder builds a Manager whose pod-support shims are
-// staged into a temp dir (never /Library) and built by b.
+// newTestManagerWithShimBuilder builds a root-tier Manager whose pod-support
+// shims are staged into a temp dir (never /Library) and built by b. The temp dir
+// has no symlink in its path (rootBase) and the lstat seam presents every path
+// as root-owned, so the root tier's whole-chain check passes unprivileged.
 func newTestManagerWithShimBuilder(t *testing.T, b PodShimBuilder) *Manager {
 	t.Helper()
 	m := newTestManager(t, newFakeSystem(), 0)
 	m.shimBuilder = b
-	m.shimDir = filepath.Join(t.TempDir(), "stage")
+	m.shimDir = filepath.Join(rootBase(t), "stage")
+	m.lstat = rootOwnedExcept()
 	return m
 }
 
