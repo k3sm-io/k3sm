@@ -21,7 +21,9 @@
 #         both admin kubeconfigs answer from this host.
 #   m6.A  (a) TestM6_WriteOnAReadOnB  (b) TestM6_LeaderElectionSingleActive
 #         (c) TestM6_WatchStalenessSoak at its 20 s default
-#         (e) TestM6_SecondServerJoinsReconstructsCAs incl. the etcd CA pins.
+#         (e) TestM6_SecondServerJoinsReconstructsCAs incl. the etcd CA pins; then the
+#             request-header CA pin (SHA-256 of $WD/tls/request-header-ca.crt) read from
+#             each server and required present and equal. A missing file is a FAIL.
 #   m6.B  stop A. FIRST the precondition: B's daemon is running, B's /livez is ok and
 #         B's etcd answers Status. Then, within 60 s: B's etcd reports no leader, a
 #         write through B's apiserver fails with a timeout/no-leader error, and a
@@ -36,7 +38,8 @@
 #         MeshPeer is back at its pre-reset /24 with the SAME public key (the wipe
 #         removes only $WD/etcd, so A's mesh key file survives it), and B's member list
 #         carries the pre-reset etcd peer URLs (A's https://<A LAN ip>:2380, never a
-#         mesh address).
+#         mesh address). The request-header CA pin on A and B is compared again after
+#         the re-join and must still match.
 #   m6.E  cold restart: stop both, start B first, after 5 min B must still be waiting
 #         (daemon running, not parked, no leader); then start A; both /readyz ok
 #         within 2 min.
@@ -211,6 +214,25 @@ voting() {
 	[ "$(printf '%s' "$out" | grep -o '"ID":' | wc -l | tr -d ' ')" = "$2" ] && ! printf '%s' "$out" | grep -q '"isLearner":true'
 }
 cm_value() { kubectl --kubeconfig "$1" get configmap -n default "$2" -o jsonpath='{.data.v}' 2>/dev/null || true; }
+# rh_pin <A|B> <tag>: the SHA-256 fingerprint of that server's request-header CA
+# certificate, read through its runner prefix (the exact file pkg/certs writes) and
+# saved to the evidence dir. Prints nothing and fails when the file is absent or is
+# not a certificate.
+rh_pin() {
+	local f="$EV/request-header-ca-$2-$1.crt"
+	remote "$1" 'cat "$WD/tls/request-header-ca.crt"' > "$f" 2>/dev/null || true
+	grep -q 'BEGIN CERTIFICATE' "$f" || return 1
+	openssl x509 -noout -fingerprint -sha256 -in "$f" 2>/dev/null | sed 's/^.*=//' | grep -E '^[0-9A-F:]+$'
+}
+# rh_pins_equal <tag>: both servers hold a request-header CA and the pins match; the
+# pin is noted in the evidence log.
+rh_pins_equal() {
+	local pa pb
+	pa="$(rh_pin A "$1")" || { note "m6 request-header CA ($1): missing or unreadable on A"; return 1; }
+	pb="$(rh_pin B "$1")" || { note "m6 request-header CA ($1): missing or unreadable on B"; return 1; }
+	note "m6 request-header CA pin ($1) A=$pa B=$pb"
+	[ -n "$pa" ] && [ "$pa" = "$pb" ]
+}
 put_cm() { kubectl --kubeconfig "$1" create configmap -n default "$2" --from-literal=v="$3" --request-timeout=20s >/dev/null 2>&1; }
 
 echo "==> k3sm M6 lab gate (two embedded-etcd servers; A=$KA B=$KB; evidence $EV)"
@@ -273,6 +295,12 @@ if (unset K3SM_M6_SOAK_DURATION; run_conformance_slice "$REPO_ROOT" \
 	ladder ok "m6.A  write on A read on B, single active leader, 20 s read-after-write soak, identical cluster + etcd CAs"
 else
 	ladder no "m6.A  write on A read on B, single active leader, 20 s read-after-write soak, identical cluster + etcd CAs (a criterion missing, failed or skipped)"
+fi
+
+if rh_pins_equal join; then
+	ladder ok "m6.A  request-header CA pin identical on both servers ($(rh_pin A join))"
+else
+	ladder no "m6.A  request-header CA pin identical on both servers (a file missing on a server, or the pins differ; see $LOG)"
 fi
 
 # ── m6.B — kill one: stop A; B must lose quorum for the right reason, fail safe ─
@@ -414,6 +442,11 @@ sudo -u "$user" env HOME="${home:-$HOME}" "$bin" server --cluster-reset "$@"' >>
 		ladder ok "m6.D  A wiped and re-joined through B: 2 voting members, both /readyz ok"
 	else
 		ladder no "m6.D  A wiped and re-joined through B: 2 voting members, both /readyz ok"
+	fi
+	if rh_pins_equal reset; then
+		ladder ok "m6.D  request-header CA pin still identical on both servers after the re-join ($(rh_pin A reset))"
+	else
+		ladder no "m6.D  request-header CA pin still identical on both servers after the re-join (a file missing on a server, or the pins differ; see $LOG)"
 	fi
 	member_list B > "$EV/members-after-reset-B.json" || true
 	# A rejoined with its mesh key file intact (the wipe above removes only
