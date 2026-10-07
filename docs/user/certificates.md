@@ -22,6 +22,22 @@ join token and every node's kubeconfig; re-minting the signing CA would invalida
 certificate at once. There is no CA-replacement flow. `k3sm certificate rotate-ca` exists only
 to say so explicitly. Replacing a CA means recreating the cluster.
 
+## The Request-Header CA
+
+One more CA, `tls/request-header-ca.crt`, backs the Kubernetes aggregation layer. The apiserver trusts
+a client certificate that chains to it, with the name `system:auth-proxy`, to say which user and
+groups a request is for, so it can forward requests to an extension apiserver on a user's behalf. It
+issues one thing, that front-proxy client certificate (`client-auth-proxy.crt` in the server work
+dir), which is re-issued on every boot like the other leaves. It is separate from the signing CA on
+purpose: a certificate it issues can act as any user, so no node or component certificate may chain
+to it.
+
+It is created on the first boot of a release that has the aggregation layer, on a single server or on
+the first server of an HA cluster. A server started with `--server-join` never creates it and imports
+it from the server it joins through. It is not part of the join token pin, and
+`k3sm certificate rotate` never rotates it. The `request-header` row of `k3sm status` shows its pin.
+For an HA upgrade see [HA](ha.md#upgrading-an-ha-cluster-to-the-aggregation-layer).
+
 ## What Rotation Is
 
 Every control-plane boot re-issues the CA-signed leaves unconditionally: the scheduler and
@@ -93,7 +109,7 @@ restart model applied to a version bump.
 
 | Not rotated | Why |
 |---|---|
-| The cluster CA and signing CA | Re-minting either orphans every node; see above. |
+| The cluster, signing and request-header CAs | Re-minting either orphans every node; see above. |
 | `apiserver-certs/` | The apiserver's own self-signed serving material. It is also the controller-manager's `--root-ca-file` and therefore the source of every pod's projected `kube-root-ca.crt`; replacing it is a cluster-wide trust event. Out of scope. |
 | The admin kubeconfig and `tokens.csv` | The admin credential is a static bearer token set at install time, not a CA-signed identity. Re-run `sudo k3sm install` to change it. |
 | `sa.key` / `sa.pub` | The service-account signing keypair. Replacing it invalidates every issued ServiceAccount token. |
