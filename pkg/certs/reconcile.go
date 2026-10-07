@@ -33,10 +33,9 @@ import (
 // would split cluster trust. Compare with errors.Is.
 var ErrHierarchyDiverged = errors.New("certs: the local CA hierarchy diverges from the imported bundle")
 
-// MissingOnDisk returns the ids ("cluster", "signing", "etcd-server", "etcd-peer") of
-// the CAs whose certificate AND private key are both absent from workDir's PKI
-// directory, in table order. It creates nothing and opens no file: every path is
-// lstat'ed only.
+// MissingOnDisk returns the ids of the CAs posture needs whose certificate AND private
+// key are both absent from workDir's PKI directory, in table order. It creates nothing
+// and opens no file: every path is lstat'ed only.
 //
 // A half-present CA (a key without its certificate, or a certificate without its key)
 // is never "missing": it is an ErrIncompleteHierarchy naming the leftover file and the
@@ -45,8 +44,12 @@ var ErrHierarchyDiverged = errors.New("certs: the local CA hierarchy diverges fr
 // re-importing over it would hide which half survived. An entry that is not a regular
 // file is also an ErrIncompleteHierarchy.
 func MissingOnDisk(workDir string, posture Posture) ([]CAID, error) {
+	rows, err := postureRows(posture)
+	if err != nil {
+		return nil, err
+	}
 	var missing []CAID
-	for _, spec := range caSpecs {
+	for _, spec := range rows {
 		present, err := caOnDisk(workDir, spec)
 		if err != nil {
 			return nil, err
@@ -59,29 +62,41 @@ func MissingOnDisk(workDir string, posture Posture) ([]CAID, error) {
 }
 
 // ReconcileImportedHierarchy brings workDir's on-disk CA hierarchy level with h, the
-// hierarchy an HA server-join decoded from the bootstrap bundle, without ever
-// replacing a CA that is already present.
+// hierarchy an HA server-join decoded from the bootstrap bundle, for every CA posture
+// needs, without ever replacing a CA that is already present.
 //
-// It first removes any temp file a killed earlier install left beside a CA file
-// (atomicfile.ReapOrphans), then runs in two passes. The first writes nothing: every
-// CA present on disk is compared with the bundle's by pin (certificate only; no
-// private key is read), and any difference returns ErrHierarchyDiverged naming both
-// pins; a half-present CA returns ErrIncompleteHierarchy (see MissingOnDisk). Only when
-// all four CAs check out does the second pass install the absent ones, the key before
-// the certificate, each through atomicfile.WriteNew: an existing file fails with
-// fs.ErrExist and is never replaced, and a crash leaves at most a key without its
-// certificate, which MissingOnDisk then reports. Keys are 0600, certificates 0644,
-// the etcd pairs go under <PKI>/etcd (0700). A hierarchy that is already complete and
-// identical is a no-op.
+// Before touching the disk it validates every bundle CA: h must hold all of them
+// (Hierarchy.Missing), and each must be a self-signed, path-length-zero CA whose key
+// is its certificate's (LoadCA). It then removes any temp file a killed earlier
+// install left beside a CA file (atomicfile.ReapOrphans), and runs in two passes. The
+// first writes nothing: every CA present on disk is compared with the bundle's by pin
+// (certificate only; no private key is read), and any difference returns
+// ErrHierarchyDiverged naming both pins; a half-present CA returns
+// ErrIncompleteHierarchy (see MissingOnDisk). Only when every CA checks out does the
+// second pass install the absent ones, the key before the certificate, each through
+// atomicfile.WriteNew: an existing file fails with fs.ErrExist and is never replaced,
+// and a crash leaves at most a key without its certificate, which MissingOnDisk and
+// EnsureHierarchy then report. Keys are 0600, certificates 0644, the etcd pairs go
+// under <PKI>/etcd (0700). A hierarchy that is already complete and identical is a
+// no-op.
 func ReconcileImportedHierarchy(workDir string, h *Hierarchy, posture Posture) error {
-	if !hierarchyComplete(h) {
-		return errors.New("certs: reconcile hierarchy: cluster, signing, etcd server and etcd peer CAs are required")
+	rows, err := postureRows(posture)
+	if err != nil {
+		return err
+	}
+	if missing := h.Missing(posture); len(missing) > 0 {
+		return fmt.Errorf("certs: reconcile hierarchy: the bundle lacks the %s CA; nothing was written", joinIDs(missing))
+	}
+	for _, spec := range rows {
+		if err := validateBundleCA(spec.ca(h)); err != nil {
+			return fmt.Errorf("certs: reconcile hierarchy: the bundle's %s CA: %w; nothing was written", spec.label, err)
+		}
 	}
 	if err := reapOrphanTemps(workDir); err != nil {
 		return err
 	}
 	var missing []caSpec
-	for _, spec := range caSpecs {
+	for _, spec := range rows {
 		present, err := caOnDisk(workDir, spec)
 		if err != nil {
 			return err
@@ -116,6 +131,23 @@ func ReconcileImportedHierarchy(workDir string, h *Hierarchy, posture Posture) e
 		if err := installCAFile(dir, spec.certFile, ca.CertPEM, 0o644); err != nil {
 			return fmt.Errorf("%s CA: %w", spec.id, err)
 		}
+	}
+	return nil
+}
+
+// validateBundleCA checks that ca's PEMs (the bytes that would be installed) are a
+// self-signed, path-length-zero CA certificate and its own private key.
+func validateBundleCA(ca *CA) error {
+	loaded, err := LoadCA(ca.CertPEM, ca.KeyPEM)
+	if err != nil {
+		return err
+	}
+	c := loaded.Cert
+	if !c.BasicConstraintsValid || !c.IsCA || !c.MaxPathLenZero || c.MaxPathLen != 0 {
+		return errors.New("the certificate is not a path-length-zero CA")
+	}
+	if err := c.CheckSignatureFrom(c); err != nil {
+		return fmt.Errorf("the certificate is not self-signed: %w", err)
 	}
 	return nil
 }

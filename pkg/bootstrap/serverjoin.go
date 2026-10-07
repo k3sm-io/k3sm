@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 
 	"k3sm.io/k3sm/pkg/certs"
@@ -83,7 +84,9 @@ func FetchCABundle(ctx context.Context, serverURL, token string, client *http.Cl
 
 // ImportCABundle is the FAIL-CLOSED HA server-join import: fetch the sealed bundle,
 // decrypt + authenticate it with the server token's secret (the KDF passphrase), decode
-// the four CA keypairs (cluster, signing, etcd server, etcd peer), and reconcile them
+// the five CA keypairs (cluster, signing, etcd server, etcd peer, request-header) — a
+// schema-2 bundle, which lacks the request-header CA, is ErrBundlePredatesRequestHeaderCA
+// with nothing written — and reconcile them
 // into the work dir's PKI dir (certs.ReconcileImportedHierarchy) — so a subsequent
 // certs.EnsureHierarchy / certs.EnsureEtcdCAs LOADS the IDENTICAL CAs instead of
 // minting fresh, divergent ones. Only CAs absent from disk are installed; a CA already
@@ -109,6 +112,15 @@ func ImportCABundle(ctx context.Context, opts ServerJoinOptions) error {
 	var h certs.Hierarchy
 	if err := h.Unmarshal(plaintext); err != nil {
 		return fmt.Errorf("decode reconstructed CA hierarchy: %w", err)
+	}
+	// A schema-2 bundle decodes without the request-header CA: its server runs the
+	// previous release. Refuse it by policy before any write, so the caller waits for
+	// that server's upgrade instead of this server ever minting the CA itself.
+	if missing := h.Missing(certs.PostureEtcd); len(missing) > 0 {
+		if slices.Equal(missing, []certs.CAID{certs.CARequestHeader}) {
+			return ErrBundlePredatesRequestHeaderCA
+		}
+		return fmt.Errorf("decode reconstructed CA hierarchy: the bundle lacks the %v CAs", missing)
 	}
 	if err := certs.ReconcileImportedHierarchy(opts.WorkDir, &h, certs.PostureEtcd); err != nil {
 		return fmt.Errorf("reconcile reconstructed CA hierarchy: %w", err)

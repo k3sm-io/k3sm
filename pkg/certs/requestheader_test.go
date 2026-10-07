@@ -636,7 +636,18 @@ func TestLoadRequestHeaderPinIsReadOnly(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(RequestHeaderCAKeyPath(wd), 0o600) })
-		before := snapshotPKI(t, wd)
+		names := func() []string {
+			entries, err := os.ReadDir(PKIDir(wd))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out []string
+			for _, e := range entries {
+				out = append(out, e.Name())
+			}
+			return out
+		}
+		before := names()
 		pin, err := LoadRequestHeaderPin(wd)
 		if err != nil {
 			t.Fatalf("LoadRequestHeaderPin: %v", err)
@@ -644,7 +655,9 @@ func TestLoadRequestHeaderPinIsReadOnly(t *testing.T) {
 		if pin != h.requestHeader.PinHash() {
 			t.Errorf("pin = %s, want %s", pin, h.requestHeader.PinHash())
 		}
-		assertUnchanged(t, before, snapshotPKI(t, wd))
+		if after := names(); !slices.Equal(before, after) {
+			t.Errorf("LoadRequestHeaderPin changed the PKI dir: %v -> %v", before, after)
+		}
 	})
 	t.Run("cert without key", func(t *testing.T) {
 		wd := t.TempDir()

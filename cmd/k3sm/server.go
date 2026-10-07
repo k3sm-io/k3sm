@@ -672,7 +672,9 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 	// it). The hierarchy is loaded here rather than reusing plan.hierarchy, which is
 	// set only on the mesh path; EnsureHierarchy LOADS the existing CAs in every
 	// posture, because the executor's provisioning step created them at exec.Start.
-	nodeHierarchy, err := certs.EnsureHierarchy(opts.workDir, certs.RoleMintAuthority, certs.PostureKine)
+	// It takes this server's own role all the same, so a joined server proves here
+	// that it only loads.
+	nodeHierarchy, err := certs.EnsureHierarchy(opts.workDir, opts.role(), opts.posture())
 	if err != nil {
 		return nodeOptions{}, fmt.Errorf("load the CA hierarchy for the server node's client identity: %w", err)
 	}

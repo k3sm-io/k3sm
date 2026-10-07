@@ -29,7 +29,7 @@ import (
 )
 
 // allCAIDs is every id of the table, in table order.
-var allCAIDs = []CAID{CACluster, CASigning, CAEtcdServer, CAEtcdPeer}
+var allCAIDs = []CAID{CACluster, CASigning, CAEtcdServer, CAEtcdPeer, CARequestHeader}
 
 // specByID returns the table row for id.
 func specByID(t *testing.T, id CAID) caSpec {
@@ -143,7 +143,7 @@ func TestMissingOnDisk(t *testing.T) {
 		want    []CAID
 		wantErr []string // substrings of the error; nil means no error
 	}{
-		{name: "empty work dir: all four", setup: func(t *testing.T) string { return t.TempDir() }, want: allCAIDs},
+		{name: "empty work dir: all five", setup: func(t *testing.T) string { return t.TempDir() }, want: allCAIDs},
 		{name: "complete hierarchy: none", setup: func(t *testing.T) string { return writeFull(t, h) }, want: nil},
 		{name: "subset: the removed CAs only", setup: func(t *testing.T) string {
 			wd := writeFull(t, h)
@@ -214,7 +214,7 @@ func TestMissingOnDisk(t *testing.T) {
 	}
 }
 
-// TestReconcileImportedHierarchy pins the B435 import: only absent CAs are installed
+// TestReconcileImportedHierarchy pins the server-join import: only absent CAs are installed
 // (key 0600, cert 0644, the etcd dir 0700), a present CA with the bundle's pin is left
 // untouched, and a present CA with any other pin is ErrHierarchyDiverged with nothing
 // written, even when another CA is missing.
@@ -222,7 +222,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 	hA := newTestHierarchy(t)
 	hB := newTestHierarchy(t)
 
-	t.Run("fresh dir: all four installed with their modes", func(t *testing.T) {
+	t.Run("fresh dir: all five installed with their modes", func(t *testing.T) {
 		wd := t.TempDir()
 		if err := ReconcileImportedHierarchy(wd, hA, PostureEtcd); err != nil {
 			t.Fatalf("reconcile: %v", err)
@@ -291,7 +291,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 	t.Run("divergent later CA, earlier CA missing: nothing written", func(t *testing.T) {
 		wd := writeFull(t, hA)
 		removeCA(t, wd, "cluster")
-		mixed := &Hierarchy{Cluster: hA.Cluster, Signing: hA.Signing, EtcdServer: hA.EtcdServer, EtcdPeer: hB.EtcdPeer}
+		mixed := &Hierarchy{Cluster: hA.Cluster, Signing: hA.Signing, EtcdServer: hA.EtcdServer, EtcdPeer: hB.EtcdPeer, requestHeader: hA.requestHeader}
 		diverged(t, wd, mixed, hA.EtcdPeer.PinHash(), hB.EtcdPeer.PinHash())
 		if got, err := MissingOnDisk(wd, PostureEtcd); err != nil || !slices.Equal(got, []CAID{CACluster}) {
 			t.Errorf("after a refused reconcile MissingOnDisk = %v, %v; want [cluster]", got, err)
@@ -376,7 +376,7 @@ func TestReconcileImportedHierarchy(t *testing.T) {
 	t.Run("incomplete bundle: refused before any disk access", func(t *testing.T) {
 		wd := t.TempDir()
 		if err := ReconcileImportedHierarchy(wd, &Hierarchy{Cluster: hA.Cluster, Signing: hA.Signing}, PostureEtcd); err == nil {
-			t.Fatal("reconcile must require all four CAs")
+			t.Fatal("reconcile must require all five CAs")
 		}
 		if err := ReconcileImportedHierarchy(wd, nil, PostureEtcd); err == nil {
 			t.Fatal("reconcile must refuse a nil hierarchy")

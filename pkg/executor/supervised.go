@@ -519,8 +519,8 @@ func (s *Supervised) provision(ctx context.Context) error {
 	return nil
 }
 
-// provisionComponentCerts ensures the cluster + signing CA hierarchy exists (so the
-// apiserver's unconditional --client-ca-file has a CA to trust) and writes the
+// provisionComponentCerts ensures the cluster, signing and request-header CAs exist (so
+// the apiserver's unconditional --client-ca-file has a CA to trust) and writes the
 // per-component client-cert kubeconfigs the scheduler and controller-manager
 // authenticate with — each its own system: identity instead of the shared system:masters
 // admin token (the k3s model; no shared component identity). The certs
@@ -531,7 +531,11 @@ func (s *Supervised) provision(ctx context.Context) error {
 // starts the scheduler/KCM) so the kubeconfigs and the client-CA exist when those
 // components — and the apiserver — start.
 func (s *Supervised) provisionComponentCerts() error {
-	h, err := certs.EnsureHierarchy(s.cfg.WorkDir, certs.RoleMintAuthority, certs.PostureKine)
+	// The role is the server's (a joined member never mints; Config.CARole). The
+	// posture is kine's on purpose: the executor ensures the CAs every server holds
+	// here, and the etcd pair is provisionEtcdCerts's, behind its own init-member
+	// guard (an absent pair on a restart is ErrEtcdCAsMissing, never a mint).
+	h, err := certs.EnsureHierarchy(s.cfg.WorkDir, s.cfg.CARole(), certs.PostureKine)
 	if err != nil {
 		return fmt.Errorf("ensure CA hierarchy: %w", err)
 	}

@@ -104,23 +104,42 @@ func RequestHeaderCAKeyPath(workDir string) string {
 	return filepath.Join(PKIDir(workDir), requestHeaderCAKey)
 }
 
-// LoadRequestHeaderPin is the read-only pin read of the request-header CA.
+// LoadRequestHeaderPin is the request-header CA's counterpart of LoadCAPins, with the
+// same read-only contract: it reads only the certificate and returns its PinHash, it
+// creates nothing (an absent CA is ErrNoHierarchy), and it never opens the private
+// key, which is lstat'ed only to refuse a half-present pair (ErrIncompleteHierarchy).
+// `k3sm certificate rotate` and `k3sm status` read the pin with it.
 func LoadRequestHeaderPin(workDir string) (string, error) {
-	return "", fmt.Errorf("request-header CA: %w", ErrNoHierarchy)
+	pin, err := caPin(RequestHeaderCACertPath(workDir), RequestHeaderCAKeyPath(workDir))
+	if err != nil {
+		return "", fmt.Errorf("request-header CA: %w", err)
+	}
+	return pin, nil
 }
 
-// IssueProxyClient mints the aggregator's front-proxy client leaf.
+// IssueProxyClient mints the aggregator's front-proxy client leaf from the
+// request-header CA: CN ProxyClientCN, no Organization, clientAuth only. It is the
+// only issuance the request-header CA makes: the CA is held in an unexported field,
+// so no caller can issue any other leaf from it. The leaf carries no groups and is
+// no identity at kube-apiserver itself (its issuer is not --client-ca-file); what it
+// grants is the right to assert a user in the request headers to a backend that
+// trusts the request-header CA, which is why its key is 0600 beside the CA keys.
 func (h *Hierarchy) IssueProxyClient(validFor time.Duration) (certPEM, keyPEM []byte, err error) {
 	if h == nil || h.requestHeader == nil {
 		return nil, nil, errors.New("certs: issue proxy client: the hierarchy holds no request-header CA")
 	}
-	return nil, nil, errors.New("certs: issue proxy client: not implemented")
+	return h.requestHeader.IssueClient(ProxyClientCN, nil, validFor)
 }
 
-// Missing returns the ids of the CAs posture needs that h does not hold.
+// Missing returns the ids of the CAs posture needs that h does not hold, in table
+// order. A nil h holds none. An invalid posture is treated as PostureEtcd, the
+// stricter one.
 func (h *Hierarchy) Missing(posture Posture) []CAID {
 	var out []CAID
 	for _, spec := range caSpecs {
+		if spec.class != classAlways && posture == PostureKine {
+			continue
+		}
 		if h == nil || spec.ca(h) == nil {
 			out = append(out, spec.id)
 		}

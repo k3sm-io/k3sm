@@ -26,6 +26,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Hierarchy is k3sm's CA PKI (DESIGN §5c). Every multi-node server holds two CAs: the
@@ -40,6 +41,13 @@ import (
 // so trusting it at etcd would hand every worker the whole datastore, and the cluster
 // CA would be safe only while it never issues a clientAuth leaf, an invariant nothing
 // enforces. k3s draws the same line (its etcd server-ca / peer-ca).
+//
+// Every server also holds a fifth CA, the REQUEST-HEADER CA (k3s's request-header-ca):
+// the apiserver's --requestheader-client-ca-file, which issues one leaf, the
+// aggregator's front-proxy client (IssueProxyClient). A client cert that chains to it
+// may assert any user in X-Remote-User, so it is a root of its own: neither the
+// signing CA (which issues every node's client cert) nor the cluster CA (which issues
+// serving leaves) may ever be one CN away from that grant.
 type Hierarchy struct {
 	// Cluster is the cluster CA (the pinned serving anchor; --kubelet-certificate-authority).
 	Cluster *CA
@@ -275,21 +283,76 @@ func CertPin(certPEM []byte) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// EnsureHierarchy loads the cluster + signing CAs from the work dir's PKI directory,
-// creating and persisting them on first call (idempotent across restarts). CA keys
-// are written 0600; certs 0644. It fails fast on a partially-written hierarchy rather
-// than silently regenerating (which would invalidate every issued node cert).
+// EnsureHierarchy loads every CA posture needs from the work dir's PKI directory (the
+// cluster, signing and request-header CAs; in PostureEtcd the etcd server and peer CAs
+// too). CA keys are 0600, certs 0644, the etcd pair under <PKI>/etcd 0700.
+//
+// What happens to an ABSENT CA is decided per CA by role, and nothing is written until
+// every CA has been checked:
+//
+//   - RoleMintAuthority mints and persists it. This is a fresh server's first boot, and
+//     an upgraded server gaining a CA a newer release added (the request-header CA).
+//   - RoleJoined returns ErrCANotImported naming it and writes nothing: a joined server
+//     takes every CA from the bootstrap bundle, and one minted here would be a second,
+//     divergent root (for the request-header CA, a second impersonation root that every
+//     extension apiserver would trust for its whole life).
+//
+// A half-present CA (a certificate without its key or the reverse) is
+// ErrIncompleteHierarchy in both roles, naming the surviving file: it is never treated
+// as absent, so it is never silently re-minted, which would invalidate every
+// certificate the CA issued.
 func EnsureHierarchy(workDir string, role Role, posture Posture) (*Hierarchy, error) {
-	h := &Hierarchy{}
-	for _, spec := range caSpecs {
-		if spec.class != classAlways {
-			continue
+	if role != RoleMintAuthority && role != RoleJoined {
+		return nil, fmt.Errorf("certs: ensure hierarchy: invalid role %v", role)
+	}
+	rows, err := postureRows(posture)
+	if err != nil {
+		return nil, err
+	}
+	var absent []CAID
+	for _, spec := range rows {
+		present, err := caOnDisk(workDir, spec)
+		if err != nil {
+			return nil, err
 		}
+		if !present {
+			absent = append(absent, spec.id)
+		}
+	}
+	if role == RoleJoined && len(absent) > 0 {
+		return nil, fmt.Errorf("%w: the %s CA is absent from %s, and a server started with --server-join never mints a CA; start it with --server <an upgraded server> so the server-join imports it from the bootstrap bundle",
+			ErrCANotImported, joinIDs(absent), PKIDir(workDir))
+	}
+	h := &Hierarchy{}
+	for _, spec := range rows {
 		if err := ensureRow(workDir, spec, h); err != nil {
 			return nil, err
 		}
 	}
 	return h, nil
+}
+
+// postureRows returns the CA rows posture needs, in table order.
+func postureRows(posture Posture) ([]caSpec, error) {
+	if posture != PostureKine && posture != PostureEtcd {
+		return nil, fmt.Errorf("certs: invalid posture %d", int(posture))
+	}
+	var rows []caSpec
+	for _, spec := range caSpecs {
+		if spec.class == classAlways || posture == PostureEtcd {
+			rows = append(rows, spec)
+		}
+	}
+	return rows, nil
+}
+
+// joinIDs renders ids as "a, b".
+func joinIDs(ids []CAID) string {
+	s := make([]string, len(ids))
+	for i, id := range ids {
+		s[i] = string(id)
+	}
+	return strings.Join(s, ", ")
 }
 
 // EnsureEtcdCAs loads the etcd server and peer CAs from <PKI>/etcd, creating and
@@ -399,6 +462,13 @@ var caSpecs = []caSpec{
 	{id: CAEtcdPeer, label: "etcd peer", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdPeerCACert, keyFile: etcdPeerCAKey,
 		commonName: etcdPeerCACN, class: classEtcd, sinceSchema: 2, certKey: "etcdPeerCACertPEM", keyKey: "etcdPeerCAKeyPEM",
 		ca: func(h *Hierarchy) *CA { return h.EtcdPeer }, set: func(h *Hierarchy, ca *CA) { h.EtcdPeer = ca }},
+	// The request-header CA's field is unexported and this row's accessor and setter
+	// are its only readers and writers besides IssueProxyClient
+	// (TestRequestHeaderCAIssuesOnlyProxyClient): the codec, the reconcile and Missing
+	// reach it only through the row.
+	{id: CARequestHeader, label: "request-header", dir: PKIDir, ensureDir: ensurePKIDir, certFile: requestHeaderCACert, keyFile: requestHeaderCAKey,
+		commonName: requestHeaderCACN, class: classAlways, sinceSchema: 3, certKey: "requestHeaderCACertPEM", keyKey: "requestHeaderCAKeyPEM",
+		ca: func(h *Hierarchy) *CA { return h.requestHeader }, set: func(h *Hierarchy, ca *CA) { h.requestHeader = ca }},
 }
 
 // etcdPKIDir returns <PKI>/etcd; it creates nothing.
@@ -411,19 +481,6 @@ func ensurePKIDir(workDir string) (string, error) {
 		return "", fmt.Errorf("create PKI dir: %w", err)
 	}
 	return dir, nil
-}
-
-// hierarchyComplete reports whether h carries every CA of the table.
-func hierarchyComplete(h *Hierarchy) bool {
-	if h == nil {
-		return false
-	}
-	for _, spec := range caSpecs {
-		if spec.ca(h) == nil {
-			return false
-		}
-	}
-	return true
 }
 
 // ensureCA loads the CA at dir/<certFile>+<keyFile>, or creates + persists a new one
@@ -445,7 +502,7 @@ func ensureCA(dir, certFile, keyFile, commonName string) (*CA, error) {
 		}
 		return LoadCA(certPEM, keyPEM)
 	case certErr == nil || keyErr == nil:
-		return nil, fmt.Errorf("incomplete CA: exactly one of %s / %s is present", certFile, keyFile)
+		return nil, fmt.Errorf("%w: incomplete CA: exactly one of %s / %s is present", ErrIncompleteHierarchy, certFile, keyFile)
 	}
 	ca, err := NewCA(commonName)
 	if err != nil {

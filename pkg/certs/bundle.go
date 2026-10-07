@@ -20,14 +20,24 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 )
 
 // bundleSchemaVersion stamps the serialized CA hierarchy so a field change is
 // detectable rather than silently mis-parsed. Version 2 added the etcd server and peer
-// CA pairs; Unmarshal accepts exactly this version. The CAs a version carries are the
-// rows of caSpecs whose sinceSchema is at most that version.
-const bundleSchemaVersion = 2
+// CA pairs; version 3 added the request-header CA. The CAs a version carries are the
+// rows of caSpecs whose sinceSchema is at most that version, so a v3 plaintext is a v2
+// plaintext with two more keys. Marshal writes this version; Unmarshal decodes it and
+// bundleSchemaPreRequestHeader (TestBundleSchemaVersionSingleSourced pins the number
+// and the CAs together).
+const bundleSchemaVersion = 3
+
+// bundleSchemaPreRequestHeader is the schema a server one release older emits: every
+// CA but the request-header one. It decodes, and Hierarchy.Missing then names the
+// request-header CA, which the server-join turns into a wait for that server to be
+// upgraded (never a local mint).
+const bundleSchemaPreRequestHeader = 2
 
 // bundleSchemaPreEtcd is the schema a server that predates etcd HA emits (cluster +
 // signing CAs only). It is refused with a message naming the cause, since the only
@@ -45,20 +55,21 @@ func bundleRows(version int) []caSpec {
 	return rows
 }
 
-// Marshal serializes the four-CA hierarchy — the cluster, signing, etcd server and
-// etcd peer CA certificate and PRIVATE-KEY PEMs — into opaque, self-describing bytes:
-// a JSON object of schemaVersion followed by each CA's certificate and key, in the CA
-// table's order (encoding/json base64-encodes the PEMs).
-// All four CAs are required: the bundle exists only for an HA control plane, and HA
-// is the etcd posture. This is the plaintext the HA server-join bootstrap bundle
+// Marshal serializes the five-CA hierarchy — the cluster, signing, etcd server, etcd
+// peer and request-header CA certificate and PRIVATE-KEY PEMs — into opaque,
+// self-describing bytes: a JSON object of schemaVersion followed by each CA's
+// certificate and key, in the CA table's order (encoding/json base64-encodes the
+// PEMs). Every CA is required (Hierarchy.Missing(PostureEtcd) must be empty): the
+// bundle exists only for an HA control plane, HA is the etcd posture, and a bundle
+// without the request-header CA would leave a joiner to mint its own. This is the plaintext the HA server-join bootstrap bundle
 // AES-256-GCM-seals (k3sm.io/k3sm/pkg/bootstrap.SealBundle) so a joining control-plane
 // server reconstructs the IDENTICAL CAs (DESIGN §5c). The seal lives in pkg/bootstrap,
 // not here, so certs keeps no crypto-secret dependency and the bootstrap→certs import
 // edge does not cycle. The bytes carry private keys and must only ever leave a host
 // SEALED.
 func (h *Hierarchy) Marshal() ([]byte, error) {
-	if !hierarchyComplete(h) {
-		return nil, fmt.Errorf("certs: marshal hierarchy: cluster, signing, etcd server and etcd peer CAs are required")
+	if missing := h.Missing(PostureEtcd); len(missing) > 0 {
+		return nil, fmt.Errorf("certs: marshal hierarchy: the %s CA is required", joinIDs(missing))
 	}
 	var b bytes.Buffer
 	b.WriteString(`{"schemaVersion":`)
@@ -81,10 +92,13 @@ func (h *Hierarchy) Marshal() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// Unmarshal reconstructs the hierarchy from Marshal's bytes, parsing the eight PEMs
-// back into four loaded CAs (identical pins to the source). It populates the receiver
-// only on success. A schema-1 bundle (from a server that predates etcd HA) and any
-// other version are refused, as is a v2 bundle missing either etcd pair. The caller
+// Unmarshal reconstructs the hierarchy from Marshal's bytes, parsing the PEMs back into
+// loaded CAs (identical pins to the source). It decodes schema 3 (five CAs) and schema
+// 2 (the four before the request-header CA; the caller decides what a bundle without
+// it means, through Hierarchy.Missing). It populates the receiver only on success. A
+// schema-1 bundle (from a server that predates etcd HA) and any other version are
+// refused, as is a bundle missing a CA its version carries or carrying a key its
+// version does not. The caller
 // is the HA server-join path, AFTER it has decrypted + authenticated the bundle (a GCM
 // tag failure means these bytes are never reached) and BEFORE
 // ReconcileImportedHierarchy, so a refusal here writes nothing.
@@ -99,15 +113,29 @@ func (h *Hierarchy) Unmarshal(data []byte) error {
 			return fmt.Errorf("certs: unmarshal hierarchy: schemaVersion: %w", err)
 		}
 	}
-	switch version {
-	case bundleSchemaVersion:
-	case bundleSchemaPreEtcd:
+	switch {
+	case version == bundleSchemaPreEtcd:
 		return fmt.Errorf("certs: unmarshal hierarchy: unsupported schema version %d: this server predates etcd HA; every HA server must run the same release", version)
-	default:
+	case version < bundleSchemaPreRequestHeader || version > bundleSchemaVersion:
 		return fmt.Errorf("certs: unmarshal hierarchy: unsupported schema version %d (want %d)", version, bundleSchemaVersion)
 	}
+	rows := bundleRows(version)
+	known := map[string]bool{"schemaVersion": true}
+	for _, spec := range rows {
+		known[spec.certKey], known[spec.keyKey] = true, true
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if !known[k] {
+			return fmt.Errorf("certs: unmarshal hierarchy: schema %d carries no field %q", version, k)
+		}
+	}
 	var out Hierarchy
-	for _, spec := range bundleRows(version) {
+	for _, spec := range rows {
 		var certPEM, keyPEM []byte
 		for _, kv := range []struct {
 			key string

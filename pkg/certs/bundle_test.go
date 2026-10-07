@@ -43,8 +43,8 @@ func parseFirstCert(t *testing.T, certPEM []byte) *x509.Certificate {
 	return cert
 }
 
-// newTestHierarchy builds an in-memory four-CA hierarchy (distinct cluster, signing,
-// etcd server and etcd peer roots) for the bundle tests.
+// newTestHierarchy builds an in-memory five-CA hierarchy (distinct cluster, signing,
+// etcd server, etcd peer and request-header roots) for the bundle tests.
 func newTestHierarchy(t *testing.T) *Hierarchy {
 	t.Helper()
 	mk := func(cn string) *CA {
@@ -55,10 +55,11 @@ func newTestHierarchy(t *testing.T) *Hierarchy {
 		return ca
 	}
 	return &Hierarchy{
-		Cluster:    mk("k3sm-cluster-ca"),
-		Signing:    mk("k3sm-signing-ca"),
-		EtcdServer: mk(etcdServerCACN),
-		EtcdPeer:   mk(etcdPeerCACN),
+		Cluster:       mk("k3sm-cluster-ca"),
+		Signing:       mk("k3sm-signing-ca"),
+		EtcdServer:    mk(etcdServerCACN),
+		EtcdPeer:      mk(etcdPeerCACN),
+		requestHeader: mk(requestHeaderCACN),
 	}
 }
 
@@ -146,16 +147,21 @@ func v2StructBytes(t *testing.T, h *Hierarchy, version int) []byte {
 	return b
 }
 
-// TestBundleEncodingKeepsTheV2Bytes pins that the table-driven encoder writes the
-// schema-2 bundle byte for byte as the struct encoder before it did: same keys, same
-// order, same base64.
+// TestBundleEncodingKeepsTheV2Bytes pins that schema 3 is schema 2 plus two keys: the
+// table-driven encoder writes v2's eight keys byte for byte as the struct encoder
+// before it did (same keys, same order, same base64), stamped 3, then the
+// request-header CA's certificate and key.
 func TestBundleEncodingKeepsTheV2Bytes(t *testing.T) {
 	h := newTestHierarchy(t)
 	got, err := h.Marshal()
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	if want := v2StructBytes(t, h, 2); !bytes.Equal(got, want) {
+	v2 := v2StructBytes(t, h, 3)
+	certJSON, _ := json.Marshal(h.requestHeader.CertPEM)
+	keyJSON, _ := json.Marshal(h.requestHeader.KeyPEM)
+	want := append(append([]byte{}, v2[:len(v2)-1]...), []byte(`,"requestHeaderCACertPEM":`+string(certJSON)+`,"requestHeaderCAKeyPEM":`+string(keyJSON)+`}`)...)
+	if !bytes.Equal(got, want) {
 		t.Errorf("the encoding changed:\n got %.120s...\nwant %.120s...", got, want)
 	}
 }

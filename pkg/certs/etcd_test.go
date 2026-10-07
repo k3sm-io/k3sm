@@ -242,9 +242,9 @@ func TestIssueServerClientDualEKU(t *testing.T) {
 	}
 }
 
-// TestBundleV2RoundTripCarriesEtcdCAs proves the schema-2 bundle carries all four CA
-// pairs with identical pins (and working keys), and that Marshal refuses a hierarchy
-// missing any of them.
+// TestBundleV2RoundTripCarriesEtcdCAs proves the bundle (schema 3 since the
+// request-header CA) carries all five CA pairs with identical pins (and working keys),
+// and that Marshal refuses a hierarchy missing any of them.
 func TestBundleV2RoundTripCarriesEtcdCAs(t *testing.T) {
 	src := newTestHierarchy(t)
 	data, err := src.Marshal()
@@ -257,8 +257,8 @@ func TestBundleV2RoundTripCarriesEtcdCAs(t *testing.T) {
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		t.Fatalf("decode envelope: %v", err)
 	}
-	if envelope.SchemaVersion != 2 {
-		t.Errorf("schemaVersion = %d, want 2", envelope.SchemaVersion)
+	if envelope.SchemaVersion != 3 {
+		t.Errorf("schemaVersion = %d, want 3", envelope.SchemaVersion)
 	}
 
 	var dst Hierarchy
@@ -273,6 +273,7 @@ func TestBundleV2RoundTripCarriesEtcdCAs(t *testing.T) {
 		{"signing", src.Signing, dst.Signing},
 		{"etcd server", src.EtcdServer, dst.EtcdServer},
 		{"etcd peer", src.EtcdPeer, dst.EtcdPeer},
+		{"request-header", src.requestHeader, dst.requestHeader},
 	}
 	for _, p := range pairs {
 		if p.dst == nil {
@@ -301,16 +302,17 @@ func TestBundleV2RoundTripCarriesEtcdCAs(t *testing.T) {
 		{"no etcd peer CA", func(h *Hierarchy) { h.EtcdPeer = nil }},
 		{"no cluster CA", func(h *Hierarchy) { h.Cluster = nil }},
 		{"no signing CA", func(h *Hierarchy) { h.Signing = nil }},
+		{"no request-header CA", func(h *Hierarchy) { h.requestHeader = nil }},
 	}
 	for _, tc := range missing {
 		t.Run(tc.name, func(t *testing.T) {
 			h := *src
 			tc.drop(&h)
 			if _, err := h.Marshal(); err == nil {
-				t.Error("Marshal must require all four CAs")
+				t.Error("Marshal must require all five CAs")
 			}
 			if err := ReconcileImportedHierarchy(t.TempDir(), &h, PostureEtcd); err == nil {
-				t.Error("ReconcileImportedHierarchy must require all four CAs")
+				t.Error("ReconcileImportedHierarchy must require all five CAs")
 			}
 		})
 	}
@@ -347,7 +349,7 @@ func TestBundleRefusesSchemaV1WithoutWriting(t *testing.T) {
 	}{
 		{"schema 1 (predates etcd HA)", 1, wantV1, ""},
 		{"schema 0", 0, "unsupported schema version 0", "predates etcd HA"},
-		{"schema 3", 3, "unsupported schema version 3", "predates etcd HA"},
+		{"schema 4", 4, "unsupported schema version 4", "predates etcd HA"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
