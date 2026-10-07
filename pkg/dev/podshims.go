@@ -455,7 +455,7 @@ func (m *Manager) ownedMkdirs(perm os.FileMode, dirs ...string) error {
 // says to look first and then move the dir aside, after which the next run
 // creates a fresh one; the moved-aside copy stays for inspection.
 func refusedDirRemedy(dir string) string {
-	return fmt.Sprintf("inspect it with `ls -ld %s`; if you did not create it so, move it aside with `sudo mv %s %s.refused-%s` and run again",
+	return fmt.Sprintf("inspect it with `ls -ld %s`; if it is not yours or others can write to it, move it aside with `sudo mv %s %s.refused-%s` and run again",
 		dir, dir, dir, time.Now().Format("20060102"))
 }
 
