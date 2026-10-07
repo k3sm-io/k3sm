@@ -47,6 +47,8 @@ func newTestManager(t *testing.T, sys System, euid int) *Manager {
 	// Force not-under-sudo chown semantics regardless of the test environment's
 	// SUDO_USER, so the merge/chown paths are deterministic.
 	m.kubeMg.chownUser, m.kubeMg.chownUID, m.kubeMg.chownGID = "", -1, -1
+	// Never let a root-euid test reach the real /Library/k3sm-dev/bin.
+	m.rootBinDir = filepath.Join(t.TempDir(), "k3sm-dev", "bin")
 	return m
 }
 

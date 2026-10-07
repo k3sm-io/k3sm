@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -177,6 +178,18 @@ type Manager struct {
 	// not a plain method, so the wait is testable without a live cluster. nil
 	// means the production implementation (awaitNodeRegistered).
 	awaitNodeRegistration func(ctx context.Context, kubeconfig string) error
+	// lchown hands a dev-cache path back to the invoking human under sudo
+	// (handBack). A field so a test observes the hand-back without root; nil
+	// means os.Lchown.
+	lchown func(path string, uid, gid int) error
+	// lstat inspects a helper path's owner and mode for the execshim trust
+	// checks. A field so a test can present a file as root-owned without root;
+	// nil means unix.Lstat.
+	lstat func(path string, st *unix.Stat_t) error
+	// rootBinDir, when set, overrides the root run's helper dir
+	// (rootExecShimDir, /Library/k3sm-dev/bin), so a test drives the root path
+	// against a temp dir, like shimDir does for the pod shims.
+	rootBinDir string
 }
 
 // ManagerConfig constructs a Manager.
