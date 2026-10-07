@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"k3sm.io/k3sm/internal/atomicfile"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/helmchart"
 )
@@ -1105,11 +1106,14 @@ func writeProxyClientCert(workDir string, h *certs.Hierarchy) error {
 	if err != nil {
 		return fmt.Errorf("issue %s proxy client cert: %w", certs.ProxyClientCN, err)
 	}
-	if err := os.WriteFile(ProxyClientCertPath(workDir), certPEM, 0o644); err != nil {
-		return fmt.Errorf("write proxy client cert: %w", err)
-	}
-	if err := os.WriteFile(ProxyClientKeyPath(workDir), keyPEM, 0o600); err != nil {
+	// The key lets its holder assert any user to the apiserver through the request
+	// headers, so it is installed by rename: an existing symlink is replaced, not
+	// followed, and an older file's wider mode cannot survive.
+	if err := atomicfile.Replace(ProxyClientKeyPath(workDir), keyPEM, 0o600); err != nil {
 		return fmt.Errorf("write proxy client key: %w", err)
+	}
+	if err := atomicfile.Replace(ProxyClientCertPath(workDir), certPEM, 0o644); err != nil {
+		return fmt.Errorf("write proxy client cert: %w", err)
 	}
 	return nil
 }
