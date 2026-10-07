@@ -37,6 +37,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
@@ -95,8 +96,22 @@ func IsNotFound(err error) bool { return errdefs.IsNotFound(err) }
 // config, a callback that stamps the registering Node object, and the by-name
 // object reader the node's Secret/ConfigMap listers answer through.
 type NodeConfig struct {
-	// Client is the apiserver client the VK node registers and syncs through.
+	// Client is the apiserver client the VK node registers and syncs through:
+	// the pod informer, pod status writes and events.
 	Client kubernetes.Interface
+	// HeartbeatClient, when non-nil, is the client the node's two liveness
+	// writes go through: the node-status update and the Lease renewal. nil uses
+	// Client.
+	//
+	// It exists so those two writes can run on a client of their own, with a
+	// per-request timeout shorter than the node-monitor grace period and its own
+	// connection, while Client keeps the longer timeout its watches need. A
+	// heartbeat that shares a connection with every informer shares that
+	// connection's failures too.
+	HeartbeatClient kubernetes.Interface
+	// Log receives Virtual Kubelet's own log lines (through the adapter in
+	// vklog.go), tagged with the node name. nil uses slog.Default().
+	Log *slog.Logger
 	// Provider is the pod-execution provider the node drives.
 	Provider Provider
 	// HTTPListenAddr is the address the kubelet HTTP API (logs/exec) listens on.

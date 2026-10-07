@@ -101,6 +101,12 @@ func (c Collector) Collect(ctx context.Context) Report {
 	rows = append(rows,
 		apiserver,
 		c.nodeRow(serving, role, nodes, nodesErr),
+	)
+	// Beside the node row it details, and only when this Mac's node is known.
+	if hb, ok := c.heartbeatRow(ctx, serving, role, nodes, nodesErr, now()); ok {
+		rows = append(rows, hb)
+	}
+	rows = append(rows,
 		c.workloadsRow(ctx, serving, nodePID, nodes, nodesErr, now()),
 		dataRoot,
 	)

@@ -83,9 +83,8 @@ type NodeStatusConfig struct {
 //     and every label — silently, with no compile-time signal.
 //   - Ready is published as an explicit condition through UpdateStatus, never
 //     signalled by returning an error from Ping. A Ping error only SUPPRESSES the
-//     status update and the lease renewal and logs to the VK logger, which is a
-//     no-op sink here: the node would go stale with no condition and no diagnostic
-//     — strictly worse observability than saying nothing.
+//     status update and the lease renewal: the node would go stale with no
+//     condition, only a log line — strictly worse than saying NotReady.
 //   - Supplying any non-nil NodeProvider disables the node helper's built-in
 //     auto-Ready callback, so this type owns the Ready condition outright. Nothing
 //     else in the process sets it.

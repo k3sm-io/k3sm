@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"path"
@@ -84,7 +85,17 @@ type Node struct {
 	workers int
 
 	eb record.EventBroadcaster
+
+	// vkLog is Virtual Kubelet's logger for this node; Run hands it to VK on
+	// every context it passes down.
+	vkLog *vkLogger
+	// heartbeat records the node's last successful status post and Lease renewal.
+	heartbeat *heartbeatRecorder
 }
+
+// Heartbeat returns when this node's status post and Lease renewal last
+// succeeded. Safe to call from any goroutine.
+func (n *Node) Heartbeat() Heartbeat { return n.heartbeat.snapshot() }
 
 // Ready returns a channel that is closed once the node is ready: both
 // controllers are running and, for a nil NodeProvider, the node was marked
@@ -97,6 +108,9 @@ func (n *Node) Ready() <-chan struct{} { return n.ready }
 func (n *Node) Run(ctx context.Context) (retErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Every VK controller derives its context from this one, and VK reads its
+	// logger from the context before falling back to the process default.
+	ctx = vklog.WithLogger(ctx, n.vkLog)
 
 	n.eb.StartLogging(vklog.G(ctx).Infof)
 	n.eb.StartRecordingToSink(&corev1client.EventSinkImpl{Interface: n.client.CoreV1().Events(corev1.NamespaceAll)})
@@ -281,6 +295,13 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 		return nil, errors.New("vkadapter: NodeConfig.Provider is required")
 	}
 
+	logger := cfg.Log
+	if logger == nil {
+		logger = slog.Default()
+	}
+	vkLog := newVKLogger(logger.With("node", nodeName, "component", "virtual-kubelet"))
+	installVKLogger(vkLog)
+
 	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(
 		cfg.Client,
 		informerResyncPeriod,
@@ -299,6 +320,7 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 		if np, err = cfg.NodeProvider(nodeSpec); err != nil {
 			return nil, fmt.Errorf("error creating provider: %w", err)
 		}
+		np = &pingGuard{NodeProvider: np, budget: nodePingBudget, log: vkLog}
 	}
 	p := cfg.Provider
 
@@ -335,11 +357,21 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 		}
 	}
 
+	// The liveness writes go through the heartbeat client and are recorded on
+	// success, which is what Node.Heartbeat reports.
+	hbClient := cfg.HeartbeatClient
+	if hbClient == nil {
+		hbClient = cfg.Client
+	}
+	rec := &heartbeatRecorder{now: time.Now}
 	nc, err := vknode.NewNodeController(
 		np,
 		nodeSpec,
-		cfg.Client.CoreV1().Nodes(),
-		vknode.WithNodeEnableLeaseV1(nodeutil.NodeLeaseV1Client(cfg.Client), vknode.DefaultLeaseDuration),
+		recordingNodes{NodeInterface: hbClient.CoreV1().Nodes(), rec: rec},
+		vknode.WithNodeEnableLeaseV1(recordingLeases{LeaseInterface: nodeutil.NodeLeaseV1Client(hbClient), rec: rec}, vknode.DefaultLeaseDuration),
+		vknode.WithNodePingInterval(nodePingInterval),
+		vknode.WithNodePingTimeout(nodePingTimeout),
+		vknode.WithNodeStatusUpdateInterval(nodeStatusUpdateInterval),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error creating node controller: %w", err)
@@ -384,5 +416,7 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 		tlsConfig:          cfg.TLSConfig,
 		workers:            cfg.NumWorkers,
 		eb:                 eb,
+		vkLog:              vkLog,
+		heartbeat:          rec,
 	}, nil
 }

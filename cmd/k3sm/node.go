@@ -833,6 +833,14 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	if err != nil {
 		return fmt.Errorf("build client: %w", err)
 	}
+	// The node-status update and the Lease renewal get a client of their own:
+	// a short request bound, its own connection and an HTTP/2 health check, so
+	// a connection that went half-open on a Wi-Fi roam is detected and redialled
+	// inside the node-monitor grace period. See heartbeatRESTConfig.
+	heartbeatCS, err := nodeHeartbeatClient(opts, restCfg)
+	if err != nil {
+		return err
+	}
 
 	// Event sink for node-emitted pod lifecycle Events (Pulled/Created/Started/
 	// Killing) so `kubectl describe pod` shows them. The broadcaster starts a
@@ -1004,6 +1012,8 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	}
 	n, err := vkadapter.NewNode(opts.nodeName, vkadapter.NodeConfig{
 		Client:           cs,
+		HeartbeatClient:  heartbeatCS, // nil on the server's in-process node: cs carries the heartbeat there
+		Log:              slog.Default(),
 		Provider:         prov,
 		HTTPListenAddr:   opts.listen,
 		NumWorkers:       4,
@@ -1072,6 +1082,15 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	loopsDone := make(chan struct{})
 	go func() { nodeLoops.Wait(); close(loopsDone) }()
 	nodeExited = loopsDone
+
+	// The heartbeat watchdog: it reports, in this daemon's log, a node whose
+	// status posts or Lease renewals have stopped landing, whatever the reason.
+	// It runs from here, with its own stop, so every return path ends it.
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	watchDone := make(chan struct{})
+	hbWatch := &heartbeatWatch{node: opts.nodeName, started: time.Now(), log: slog.Default()}
+	go func() { defer close(watchDone); hbWatch.run(watchCtx, n.Heartbeat) }()
+	defer func() { stopWatch(); <-watchDone }()
 
 	if err := awaitNodeReady(ctx, n.Ready(), errc, nodeStartupTimeout, opts.nodeName, opts.listen); err != nil {
 		return err

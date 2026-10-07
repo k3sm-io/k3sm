@@ -66,6 +66,10 @@ const (
 	StateUnknown   RowState = "unknown"
 	StateHealthy   RowState = "healthy"
 	StateUnhealthy RowState = "unhealthy"
+	// StateStale is the heartbeat row's word for a node whose last successful
+	// status post or Lease renewal is older than the window the node lifecycle
+	// allows it.
+	StateStale RowState = "stale"
 )
 
 // Row is one subsystem's line in the report.
