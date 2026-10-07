@@ -76,6 +76,38 @@ there is no client-side failover between servers yet.
 - Single-node datastore consistency is consistent-LIST with a soak-pending watch-staleness posture,
   and multi-node consistency semantics inherit that caveat. See [Limitations](limitations.md).
 
+## Upgrading an HA Cluster to the Aggregation Layer
+
+The release that adds the aggregation layer gives the cluster a request-header CA (see
+[Certificates](certificates.md#the-request-header-ca)) and moves the join bundle to schema 3. An
+older joined server cannot read a schema 3 bundle, and a new joined server refuses a schema 2 bundle,
+so the order matters:
+
+1. Upgrade the **mint-authority server** first: the one installed with `--cluster-init`. Its
+   `k3sm status` shows `ha-role mint-authority` on the `request-header` row. On its next start it
+   creates the CA. Wait until it is ready and answering on its join port before going on.
+2. Upgrade each **joined server**, one at a time, and wait for it to be ready before the next. On
+   start it fetches the CA from the server it joins through (any server already upgraded).
+3. You are done when the `request-header` row shows the same pin on every server and a trusted count
+   of 1. A count above 1, or a pin that differs between servers, means a CA came from outside this
+   procedure and needs investigating.
+
+A joined server whose `--server` is still on the old release waits up to 30 minutes, logging that it
+is waiting, and then exits. It starts by itself once that server is upgraded in time, and it writes
+nothing while it waits. Workers are not affected and can restart in any order.
+
+Do not restart every server at once while a joined server still lacks the CA. On two servers the
+joined server waits for a bundle and the mint authority waits for etcd quorum, so neither comes up.
+Recover with etcd's own path: run `sudo k3sm server --cluster-reset` on the mint authority, start it
+normally, then wipe the joined server's etcd data and join it again as a new member. Its CA files are
+kept.
+
+If the mint-authority server is lost, do not drop `--server-join` on a survivor. Run
+`sudo k3sm server --cluster-reset` on it and reinstall it with `--cluster-init` in place of
+`--server-join`; it keeps the CAs it imported and becomes the mint authority.
+
+Rolling back is described under [Upgrade](upgrade.md#rolling-back-past-the-aggregation-layer).
+
 ## Caveats
 
 Until a two-server cluster has been run end to end, there is no HA control plane to rely on, and no

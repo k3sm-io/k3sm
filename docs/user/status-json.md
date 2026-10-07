@@ -151,7 +151,7 @@ four.
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig` and `runtimed`; some rows appear only when the
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
-`mesh-claims`, `node-resolver`, `shadow-shells`). Besides the daemon states above, a row's `state` may
+`mesh-claims`, `node-resolver`, `shadow-shells`, `request-header`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
 `skip`, `drift`, `healthy`, `unhealthy` or `stale`.
 

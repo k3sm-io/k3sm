@@ -38,7 +38,7 @@ kern.maxfilesperproc=131072` raises it until the next reboot.
 A cluster upgrades **one node at a time**, not all at once. Restarting each node's daemon via `launchctl
 kickstart` creates a short **binary-version-skew window** where old and new nodes coexist; k3sm releases
 are designed so adjacent versions interoperate across that window. Upgrade agents first and the
-control-plane Mac last unless a release note says otherwise. See [Multi-node](multi-node.md) and
+control-plane Mac last unless a release note says otherwise. An HA cluster has its own order, mint-authority server first; see [HA](ha.md#upgrading-an-ha-cluster-to-the-aggregation-layer). See [Multi-node](multi-node.md) and
 [HA](ha.md).
 
 ## Before You Upgrade
@@ -170,6 +170,30 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist
 anything, and prints the verification step you must then run; see
 [Backup & restore](backup-restore.md). Rolling the binary back without restoring the backup leaves an
 older k3sm pointed at a database a newer engine has migrated.
+
+### Rolling Back Past the Aggregation Layer
+
+A release without the aggregation layer ignores the new request-header CA files, but the apiserver
+keeps the CA it published in `kube-system/extension-apiserver-authentication`. After rolling back,
+delete that ConfigMap once, and the older apiserver recreates it with only the client CA:
+
+```sh
+kubectl -n kube-system delete configmap extension-apiserver-authentication
+```
+
+The scheduler and controller manager watch it and see a short client-CA gap, so delete it once and do
+not repeat it. Check that no `requestheader-` key remains:
+
+```sh
+kubectl -n kube-system get configmap extension-apiserver-authentication -o jsonpath='{.data}'
+```
+
+`K3SM_LAB=1 hack/acceptance/B411.sh --rollback-check` from a checkout makes the same check. On an HA
+cluster, roll back the mint-authority server last and delete the ConfigMap only after the last server
+runs the older release, because a running new apiserver adds the CA back. A joined server that will
+not restart on the older release is recovered with `sudo k3sm server --cluster-reset` on the server
+that keeps the cluster, then the others join again as new members; see [HA](ha.md). No join token,
+node certificate or kubeconfig is affected in either direction.
 
 ### Mesh Keys After Rolling Back Past the Key Directory Move
 
