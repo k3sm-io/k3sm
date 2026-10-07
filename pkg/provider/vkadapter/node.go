@@ -255,6 +255,11 @@ func setNodeReady(n *corev1.Node) {
 // which refuses to build a node whose routes would answer to anything that can
 // reach the port.
 func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
+	return newNode(nodeName, cfg, defaultNodeTimings)
+}
+
+// newNode is NewNode with the node controller's intervals as a parameter.
+func newNode(nodeName string, cfg NodeConfig, timings nodeTimings) (*Node, error) {
 	// Fast-fail on a nil ConfigureNode rather than a nil-call panic at bring-up.
 	if cfg.ConfigureNode == nil {
 		return nil, errors.New("vkadapter: NodeConfig.ConfigureNode is required")
@@ -364,14 +369,30 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 		hbClient = cfg.Client
 	}
 	rec := &heartbeatRecorder{now: time.Now}
+	hbNodes := hbClient.CoreV1().Nodes()
+	np = &statusResync{
+		NodeProvider: np,
+		interval:     timings.resyncInterval,
+		rec:          rec,
+		server: func(ctx context.Context) (*corev1.Node, error) {
+			return hbNodes.Get(ctx, nodeName, metav1.GetOptions{ResourceVersion: "0"})
+		},
+		log: logger.With("node", nodeName),
+	}
 	nc, err := vknode.NewNodeController(
 		np,
 		nodeSpec,
-		recordingNodes{NodeInterface: hbClient.CoreV1().Nodes(), rec: rec},
+		recordingNodes{NodeInterface: hbNodes, rec: rec},
 		vknode.WithNodeEnableLeaseV1(recordingLeases{LeaseInterface: nodeutil.NodeLeaseV1Client(hbClient), rec: rec}, vknode.DefaultLeaseDuration),
 		vknode.WithNodePingInterval(nodePingInterval),
 		vknode.WithNodePingTimeout(nodePingTimeout),
-		vknode.WithNodeStatusUpdateInterval(nodeStatusUpdateInterval),
+		vknode.WithNodeStatusUpdateInterval(timings.statusInterval),
+		// Record the failure (statusResync retries it) and return it unchanged,
+		// so VK neither retries at once nor logs anything differently.
+		vknode.WithNodeStatusUpdateErrorHandler(func(_ context.Context, err error) error {
+			rec.statusPostFailed()
+			return err
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error creating node controller: %w", err)

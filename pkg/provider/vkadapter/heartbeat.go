@@ -18,6 +18,7 @@ package vkadapter
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -49,7 +50,25 @@ const (
 	// node status while the Lease carries liveness. It is VK's default, kept, and
 	// the cadence NodeStatusProvider publishes on.
 	nodeStatusUpdateInterval = time.Minute
+	// nodeStatusResyncInterval is how often the node checks whether its status
+	// must be posted before the next nodeStatusUpdateInterval: after a failed
+	// post, or when the apiserver's Ready condition is not the one the provider
+	// reports. It is the kubelet's node-status update frequency, so a node whose
+	// path comes back is posted within one check, as a kubelet is.
+	nodeStatusResyncInterval = 10 * time.Second
 )
+
+// nodeTimings are the node controller intervals NewNode wires. Tests shorten
+// them; production uses defaultNodeTimings.
+type nodeTimings struct {
+	statusInterval time.Duration
+	resyncInterval time.Duration
+}
+
+var defaultNodeTimings = nodeTimings{
+	statusInterval: nodeStatusUpdateInterval,
+	resyncInterval: nodeStatusResyncInterval,
+}
 
 // Heartbeat is when this node's two liveness writes last landed at the
 // apiserver. A zero time means that write has not succeeded since the node
@@ -62,19 +81,38 @@ type Heartbeat struct {
 	LeaseRenewed time.Time
 }
 
-// heartbeatRecorder holds the Heartbeat. mu guards hb.
+// heartbeatRecorder holds the Heartbeat. mu guards hb and statusFailed.
 type heartbeatRecorder struct {
 	now func() time.Time
 
 	mu sync.Mutex
 	hb Heartbeat
+	// statusFailed is set when a node-status post fails and cleared when one
+	// lands: while it is set, the next post is due at the next resync check.
+	statusFailed bool
 }
 
 func (r *heartbeatRecorder) statusPosted() {
 	t := r.now()
 	r.mu.Lock()
 	r.hb.StatusPosted = t
+	r.statusFailed = false
 	r.mu.Unlock()
+}
+
+// statusPostFailed records that the node controller's last status post failed.
+func (r *heartbeatRecorder) statusPostFailed() {
+	r.mu.Lock()
+	r.statusFailed = true
+	r.mu.Unlock()
+}
+
+// statusRetryDue reports whether the last status post failed and none has
+// landed since.
+func (r *heartbeatRecorder) statusRetryDue() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.statusFailed
 }
 
 func (r *heartbeatRecorder) leaseRenewed() {
@@ -212,4 +250,115 @@ func (g *pingGuard) Ping(ctx context.Context) error {
 			Warn("node provider ping has not answered; posting node status and renewing the lease anyway (runtime health is reported as the Ready condition, not through the ping)")
 		return nil
 	}
+}
+
+// statusResync makes the node controller post the node status soon after it
+// has gone wrong, instead of at the next nodeStatusUpdateInterval.
+//
+// Virtual Kubelet posts the status on a fixed interval (a minute, with the
+// Lease carrying liveness) and on every status the provider pushes. A failed
+// post is not retried until that interval comes round again, and a Ready
+// condition the node lifecycle controller rewrote to Unknown while the node was
+// unreachable stays Unknown until then, even though the Lease is renewing
+// again. A kubelet checks every 10 seconds and posts as soon as its status
+// differs from the apiserver's, so it recovers within one check. statusResync
+// gives the node the same check: every interval it re-pushes the provider's
+// latest node through the controller's own update path when
+//
+//   - the last status post failed and none has landed since, or
+//   - the apiserver's Ready condition (read from its watch cache, as the
+//     kubelet's first read is) is not the one the provider last reported.
+//
+// When neither holds it pushes nothing, so the steady-state cadence stays one
+// post per status interval. It never changes what the provider reports: it
+// re-sends the provider's own latest node.
+type statusResync struct {
+	NodeProvider
+	interval time.Duration
+	rec      *heartbeatRecorder
+	// server reads this node from the apiserver.
+	server func(ctx context.Context) (*corev1.Node, error)
+	log    *slog.Logger
+
+	// mu guards last, a copy of the node the provider last pushed (nil until
+	// it pushes one).
+	mu   sync.Mutex
+	last *corev1.Node
+}
+
+// NotifyNodeStatus implements NodeProvider. It records every node the provider
+// pushes on its way to the node controller, and starts the resync check, which
+// runs until ctx ends.
+//
+// The check pushes through the controller's callback, which blocks until the
+// controller's loop takes the node. That loop runs until ctx ends, and the
+// check does not push once ctx has ended; a push already blocked when the loop
+// exits stays blocked, exactly as a provider's own push would.
+func (s *statusResync) NotifyNodeStatus(ctx context.Context, cb func(*corev1.Node)) {
+	s.NodeProvider.NotifyNodeStatus(ctx, func(n *corev1.Node) {
+		s.remember(n)
+		cb(n)
+	})
+	go s.run(ctx, cb)
+}
+
+func (s *statusResync) remember(n *corev1.Node) {
+	c := n.DeepCopy()
+	s.mu.Lock()
+	s.last = c
+	s.mu.Unlock()
+}
+
+func (s *statusResync) run(ctx context.Context, cb func(*corev1.Node)) {
+	t := time.NewTicker(s.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if n := s.due(ctx); n != nil && ctx.Err() == nil {
+			cb(n)
+		}
+	}
+}
+
+// due returns the node to push now, or nil when no post is due.
+func (s *statusResync) due(ctx context.Context) *corev1.Node {
+	s.mu.Lock()
+	last := s.last
+	s.mu.Unlock()
+	if last == nil {
+		return nil
+	}
+	if s.rec.statusRetryDue() {
+		return last.DeepCopy()
+	}
+	want := readyStatus(last)
+	if want == "" {
+		return nil
+	}
+	server, err := s.server(ctx)
+	if err != nil {
+		// The read fails when the path is down. The node controller's next post
+		// then fails too, and that failure makes the post due.
+		return nil
+	}
+	if got := readyStatus(server); got != want {
+		s.log.Info("posting node status now: the apiserver's Ready condition differs from this node's",
+			"apiserver_ready", string(got), "node_ready", string(want))
+		return last.DeepCopy()
+	}
+	return nil
+}
+
+// readyStatus returns the status of n's Ready condition, or "" when it has none.
+func readyStatus(n *corev1.Node) corev1.ConditionStatus {
+	for _, c := range n.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status
+		}
+	}
+	return ""
 }

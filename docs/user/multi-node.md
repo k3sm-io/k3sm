@@ -222,11 +222,12 @@ can break the connection those writes travel on without closing it, so k3sm boun
 
 What that gives you:
 
-- If the path to the server comes back at once after a roam, the next successful renewal lands within
-  about 30 seconds of the last one, inside the grace period, and the node stays `Ready`.
-- If the path stays down longer, the node goes `NotReady` 50 seconds after its last renewal and comes
-  back within about 30 seconds of the path returning (one lost renewal, a new connection, the next
-  renewal).
+- If the path to the server comes back within the 50 second grace period, the node stays `Ready`.
+- If the path stays down longer, the node goes `NotReady` 50 seconds after its last renewal. Once the
+  path returns, the Lease renewal resumes after a retry backoff of up to 7 seconds, and the worker
+  posts its status within 10 seconds of finding that the post failed or that the controller-manager
+  changed its `Ready` condition, as a kubelet does. The node is `Ready` again about 10 to 20 seconds
+  after the path comes back.
 - A node that stays `NotReady` or unreachable for 5 minutes has its Pods evicted, because Pods carry
   the default `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` tolerations of 300
   seconds. A Pod with a shorter `tolerationSeconds` is evicted sooner. A flap shorter than that
