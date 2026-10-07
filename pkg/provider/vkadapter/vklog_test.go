@@ -178,3 +178,25 @@ func TestVKLoggerLevelsAndRepeats(t *testing.T) {
 		}
 	}
 }
+
+// A redial after a roam picks a new source port, so the same failure carries a
+// new address in its error text every time; the limiter must still see it as a
+// repeat, or the incident it exists for floods the log.
+func TestVKLoggerRepeatsIgnoreAddressAndPort(t *testing.T) {
+	buf := &syncBuffer{}
+	now := time.Unix(1_000_000, 0)
+	l := &vkLogger{
+		log: slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		lim: newRepeatLimiter(vkLogRepeatWindow, func() time.Time { return now }),
+	}
+	for _, e := range []string{
+		"read tcp 100.64.1.255:50092->100.64.0.1:6444: operation timed out",
+		"read tcp 100.64.1.255:50131->100.64.0.1:6444: operation timed out",
+		"read tcp [fe80::1%en0]:50200->100.64.0.1:6444: operation timed out",
+	} {
+		l.WithError(errors.New(e)).Error("failed to update node lease")
+	}
+	if recs := buf.records(t); len(recs) != 1 {
+		t.Fatalf("got %d lines for one failure on three source ports, want 1: %v", len(recs), recs)
+	}
+}

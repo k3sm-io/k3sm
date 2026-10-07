@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sync"
 	"time"
 
@@ -102,7 +103,7 @@ func (l *vkLogger) emit(level slog.Level, msg string) {
 	}
 	attrs := l.attrs
 	if level >= slog.LevelWarn {
-		ok, suppressed := l.lim.allow(msg + "\x00" + errorText(attrs))
+		ok, suppressed := l.lim.allow(msg + "\x00" + addrPort.ReplaceAllString(errorText(attrs), "<addr>"))
 		if !ok {
 			return
 		}
@@ -153,8 +154,13 @@ func (l *vkLogger) WithError(err error) vklog.Logger {
 	if err == nil {
 		return l
 	}
-	return l.with("error", err.Error())
+	return l.with("error", clampValue(err.Error()))
 }
+
+// addrPort matches an IPv4 or bracketed IPv6 address with its port. Repeats are
+// keyed on the error text with these blanked, because every redial after a
+// roam picks a new source port and would otherwise make each line unique.
+var addrPort = regexp.MustCompile(`(\[[0-9A-Fa-f:.]+(%[0-9A-Za-z]+)?\]|\d{1,3}(\.\d{1,3}){3}):\d+`)
 
 // errorText returns the value of the last "error" field in attrs, the part of a
 // warning that distinguishes one failure from another.

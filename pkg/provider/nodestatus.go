@@ -184,6 +184,11 @@ func NewNodeStatusProvider(cfg NodeStatusConfig) (*NodeStatusProvider, error) {
 // Ping implements the VK node contract. It reports only context cancellation:
 // runtime health is published as an explicit Ready condition instead, because a
 // Ping error suppresses the status update rather than communicating anything.
+//
+// Keep it that way. vkadapter's pingGuard answers for a Ping that has not
+// returned within two seconds, so a Ping that did real runtime work could have
+// its failure turned into a healthy heartbeat. A runtime check belongs in the
+// Ready condition, never here.
 func (p *NodeStatusProvider) Ping(ctx context.Context) error { return p.naive.Ping(ctx) }
 
 // NotifyNodeStatus implements the VK node contract, registering the node
