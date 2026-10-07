@@ -26,6 +26,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // fakeBuilder is an in-memory ExecShimBuilder — no real `go build` / `codesign`.
@@ -247,12 +249,145 @@ func TestExecShimUnwritableCacheIsNotReused(t *testing.T) {
 	}
 }
 
-// TestExecShimSudoRunHandsCacheBack pins that a sudo `k3sm dev up --datapath`
-// gives the dev-bin cache it creates to the invoking human, so a later rootless
-// run can replace the helper instead of tripping over a root-owned file.
+// rootOwnedUnder returns an lstat seam that reports every path under prefix as
+// owned by uid 0, so a test running unprivileged can drive the root-run checks.
+// Mode and type come from the real file.
+func rootOwnedUnder(prefix string) func(string, *unix.Stat_t) error {
+	return func(path string, st *unix.Stat_t) error {
+		if err := unix.Lstat(path, st); err != nil {
+			return err
+		}
+		if path == prefix || strings.HasPrefix(path, prefix+string(filepath.Separator)) {
+			st.Uid = 0
+		}
+		return nil
+	}
+}
+
+// TestExecShimRootRunUsesPrivateDir pins the root-run half of B461. A
+// `sudo k3sm dev up --datapath` server runs as root and execs the helper as its
+// Seatbelt launcher, so it must never execute a helper the unprivileged user can
+// replace: not the user's .bin, and not a .bin-0 whose owner or mode would let
+// someone else swap the file.
+func TestExecShimRootRunUsesPrivateDir(t *testing.T) {
+	const userHelper = "user-owned-helper"
+	tests := []struct {
+		name       string
+		buildErr   error
+		userCached bool        // a user-owned helper sits in the user's .bin
+		bin0Mode   os.FileMode // pre-create .bin-0 with this mode (0 = absent)
+		bin0Helper bool        // a helper already sits in .bin-0
+		rootOwned  bool        // present .bin-0 and its contents as root-owned
+		wantBin0   bool        // want .bin-0 returned (else hostprocess)
+		wantFresh  bool        // the returned helper is the fresh build
+		wantNote   string
+	}{
+		{
+			name:       "a user-owned helper in .bin is not executed; .bin-0 gets the fresh build",
+			userCached: true, rootOwned: true, wantBin0: true, wantFresh: true,
+		},
+		{
+			name:       ".bin-0 not owned by root: refused",
+			userCached: true, wantNote: "is owned by uid",
+		},
+		{
+			name:     ".bin-0 with group/other bits: refused",
+			bin0Mode: 0o755, rootOwned: true, wantNote: "want 0700",
+		},
+		{
+			name:       "no source: the user's .bin helper is never reused under root",
+			buildErr:   errors.New("no workspace source"),
+			userCached: true, rootOwned: true, wantNote: "could not build " + execShimName,
+		},
+		{
+			name:     "no source: a root-private helper in .bin-0 is reused",
+			buildErr: errors.New("no workspace source"),
+			bin0Mode: 0o700, bin0Helper: true, rootOwned: true, wantBin0: true,
+			wantNote: "reusing the cached helper",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &fakeBuilder{buildErr: tc.buildErr}
+			m := newTestManagerWithBuilder(t, b, 0)
+			out := &bytes.Buffer{}
+			m.out = out
+			bin0 := m.freshBinDir()
+			if !strings.HasSuffix(bin0, ".bin-0") {
+				t.Fatalf("root helper dir = %s, want .bin-0", bin0)
+			}
+			if tc.rootOwned {
+				m.lstat = rootOwnedUnder(bin0)
+			}
+			userShim := filepath.Join(m.devBinDir(), execShimName)
+			if tc.userCached {
+				if err := os.MkdirAll(m.devBinDir(), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(userShim, []byte(userHelper), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.bin0Mode != 0 {
+				if err := os.Mkdir(bin0, tc.bin0Mode); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(bin0, tc.bin0Mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.bin0Helper {
+				if err := os.WriteFile(filepath.Join(bin0, execShimName), []byte("root-cached"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			dir, ok, err := m.provisionExecShim(context.Background())
+			if err != nil {
+				t.Fatalf("provisionExecShim: %v", err)
+			}
+			if dir == m.devBinDir() {
+				t.Fatalf("root run returned the user's .bin %s\noutput: %s", dir, out)
+			}
+			if tc.wantBin0 {
+				if !ok || dir != bin0 {
+					t.Fatalf("provisionExecShim = (%q, %v), want (%q, true)\noutput: %s", dir, ok, bin0, out)
+				}
+				got, _ := os.ReadFile(filepath.Join(bin0, execShimName))
+				if tc.wantFresh && string(got) != "stub-execshim" {
+					t.Errorf("helper in .bin-0 = %q, want the fresh build", got)
+				}
+				info, statErr := os.Stat(bin0)
+				if statErr != nil || info.Mode().Perm() != 0o700 {
+					t.Errorf(".bin-0 mode = %v (%v), want 0700", info.Mode().Perm(), statErr)
+				}
+			} else if ok || dir != "" {
+				t.Fatalf("provisionExecShim = (%q, %v), want the hostprocess fallback\noutput: %s", dir, ok, out)
+			}
+			if tc.userCached {
+				if got, _ := os.ReadFile(userShim); string(got) != userHelper {
+					t.Errorf("user's .bin helper = %q, want it untouched", got)
+				}
+			}
+			if !strings.Contains(out.String(), tc.wantNote) {
+				t.Errorf("output %q, want it to contain %q", out, tc.wantNote)
+			}
+		})
+	}
+}
+
+// TestExecShimSudoRunHandsCacheBack pins what a sudo run gives back to the
+// invoking human: the registry dirs it had to create (so the next rootless run
+// can write its registry), and nothing else. The helper stays root-private in
+// .bin-0, and the user's .bin is not created, so a sudo run leaves nothing
+// root-owned there.
 func TestExecShimSudoRunHandsCacheBack(t *testing.T) {
 	b := &fakeBuilder{}
-	m := newTestManagerWithBuilder(t, b, os.Geteuid())
+	m := newTestManagerWithBuilder(t, b, 0)
+	home := filepath.Join(t.TempDir(), "home")
+	m.reg = NewRegistry(filepath.Join(home, ".k3sm", "dev"))
+	// Everything this run creates is root-owned, as under a real sudo.
+	m.lstat = rootOwnedUnder(home)
 	m.kubeMg.chownUser, m.kubeMg.chownUID, m.kubeMg.chownGID = "human", 4242, 4243
 	var chowned []string
 	m.lchown = func(path string, uid, gid int) error {
@@ -264,14 +399,20 @@ func TestExecShimSudoRunHandsCacheBack(t *testing.T) {
 	}
 
 	dir, ok, err := m.provisionExecShim(context.Background())
-	if err != nil || !ok || dir != m.devBinDir() {
-		t.Fatalf("provisionExecShim = (%q, %v, %v), want the cache dir", dir, ok, err)
+	if err != nil || !ok || dir != m.freshBinDir() {
+		t.Fatalf("provisionExecShim = (%q, %v, %v), want .bin-0", dir, ok, err)
 	}
-	shim := filepath.Join(dir, execShimName)
-	for _, want := range []string{dir, shim} {
-		if !slices.Contains(chowned, want) {
-			t.Errorf("handed back %v, want it to include %s", chowned, want)
+	want := []string{home, filepath.Join(home, ".k3sm"), m.reg.root}
+	if !slices.Equal(chowned, want) {
+		t.Errorf("handed back %v, want exactly the created registry dirs %v", chowned, want)
+	}
+	for _, p := range chowned {
+		if strings.Contains(p, execShimName) || strings.HasPrefix(p, m.freshBinDir()) {
+			t.Errorf("handed back %s: a helper or the root-private dir must never be chowned", p)
 		}
+	}
+	if _, statErr := os.Lstat(m.devBinDir()); statErr == nil {
+		t.Errorf("a root run created the user's %s; it must leave nothing there", m.devBinDir())
 	}
 
 	// Outside sudo nothing is chowned.

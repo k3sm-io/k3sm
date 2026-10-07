@@ -94,11 +94,12 @@ func (goExecShimBuilder) Sign(ctx context.Context, path string) error {
 // exec.LookPath resolves it.
 func (m *Manager) devBinDir() string { return filepath.Join(m.reg.root, ".bin") }
 
-// freshBinDir is the per-user fallback helper dir, <registry root>/.bin-<euid>,
-// used only when a fresh k3sm-execshim build exists but cannot be installed into
-// the shared cache (devBinDir): a file or dir there is owned by someone else
-// (typically root, left by an earlier sudo run) or is not writable. The euid in
-// the name keeps a root run and a rootless run from sharing it.
+// freshBinDir is <registry root>/.bin-<euid>. For a rootless run it is the
+// per-user fallback, used only when a fresh k3sm-execshim build exists but
+// cannot be installed into the shared cache (devBinDir): a file or dir there is
+// owned by someone else (typically root, left by an earlier sudo run) or is not
+// writable. For a root run (euid 0) it is the ONLY helper dir: root-owned, mode
+// 0700, never handed back (see provisionRootExecShim).
 func (m *Manager) freshBinDir() string {
 	return filepath.Join(m.reg.root, ".bin-"+strconv.Itoa(m.euid))
 }
@@ -106,40 +107,51 @@ func (m *Manager) freshBinDir() string {
 // provisionExecShim ensures a k3sm-execshim helper built from the current source
 // is on hand and returns the dir holding it (prepended to the detached server's
 // PATH). The helper is built (CGO_ENABLED=1, workspace go.work) into a private
-// staging dir and ad-hoc signed there via the builder seam, then installed into
-// the shared dev-bin cache by rename.
+// staging dir and ad-hoc signed there via the builder seam, then installed by
+// rename: into the shared dev-bin cache for a rootless run, into the root-private
+// freshBinDir for a root run (provisionRootExecShim).
 //
 // The two failure modes are kept apart, because they call for opposite answers:
 //
 //   - The build fails (an installed k3sm with no workspace source, or no
 //     toolchain): a helper cached by an earlier session is reused, but only one
-//     the invoking user owns. A helper owned by anyone else is refused and the
-//     caller falls back to hostprocess (see trustedOwner).
+//     that passes helperProblem (owned by this euid, not group/other-writable).
+//     Anything else is refused and the caller falls back to hostprocess.
 //   - The build succeeds but cannot be installed into the cache (the cached file
 //     is owned by someone else, or the cache is not writable): the cached helper
 //     is NEVER reused, since a fresh one exists and the cached one may predate
 //     the current argv contract. The fresh build goes to freshBinDir instead, and
 //     one note names the blocking path and the remedy.
 //
+// Every helper is re-checked by helperProblem right before its dir is returned.
 // It returns ("", false, nil) when no trustworthy helper is available: the caller
 // then falls back to hostprocess with a loud notice rather than booting a
 // runtimed server that would die at `init sandbox backend`. A non-nil error is a
 // filesystem failure (the dev root cannot be written, or a symlinked stage path),
-// which IS fatal. Under sudo, every path this run creates or installs is handed
-// back to the invoking human (handBack), so a later rootless run can replace it.
+// which IS fatal. Under sudo, only the registry dirs this run had to create are
+// handed back to the invoking human; a helper binary never is.
 func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool, err error) {
-	dir := m.devBinDir()
-	// The same symlink refusal as the pod-shim stage (refuseSymlink): a root
-	// `k3sm dev up --datapath` writes and signs here, and a pre-planted link would
-	// redirect that write into a tree the planter chooses.
-	if err := refuseSymlink(dir); err != nil {
+	root := m.reg.root
+	if err := refuseSymlink(root); err != nil {
 		return "", false, err
 	}
-	created := missingAncestors(dir)
-	if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
-		return "", false, fmt.Errorf("create dev bin cache %s: %w", dir, mkErr)
+	created := missingAncestors(root)
+	if mkErr := os.MkdirAll(root, 0o755); mkErr != nil {
+		return "", false, fmt.Errorf("create dev root %s: %w", root, mkErr)
 	}
+	// The dev root (and ~/.k3sm above it) belong to the human even when a sudo
+	// run creates them, or the next rootless run cannot write its registry.
 	m.handBack(created...)
+	if m.euid == 0 {
+		return m.provisionRootExecShim(ctx)
+	}
+
+	dir := m.devBinDir()
+	// The same symlink refusal as the pod-shim stage (refuseSymlink): a planted
+	// link would redirect the helper write into a tree the planter chooses.
+	if err := mkdirNoFollow(0o755, dir); err != nil {
+		return "", false, err
+	}
 	shim := filepath.Join(dir, execShimName)
 	if err := refuseSymlink(shim); err != nil {
 		return "", false, err
@@ -171,9 +183,9 @@ func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool
 	//
 	// go build is itself cached, so an up-to-date rebuild is ~a second — far
 	// cheaper than the failure mode it removes.
-	stage, err := os.MkdirTemp(m.reg.root, ".execshim-build-")
+	stage, err := os.MkdirTemp(root, ".execshim-build-")
 	if err != nil {
-		return "", false, fmt.Errorf("create %s build dir in %s: %w", execShimName, m.reg.root, err)
+		return "", false, fmt.Errorf("create %s build dir in %s: %w", execShimName, root, err)
 	}
 	defer func() { _ = os.RemoveAll(stage) }()
 	built := filepath.Join(stage, execShimName)
@@ -190,13 +202,13 @@ func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool
 			fmt.Fprintf(m.out, "note: could not build %s: %v\n", execShimName, buildErr)
 			return "", false, nil
 		}
-		if uid, trusted := m.trustedOwner(shim); !trusted {
-			fmt.Fprintf(m.out, "note: could not build %s (%v), and the cached %s is owned by uid %d, not by you; not reusing it\n", execShimName, buildErr, shim, uid)
+		if problem := m.helperProblem(shim); problem != "" {
+			fmt.Fprintf(m.out, "note: could not build %s (%v), and the cached %s %s; not reusing it\n", execShimName, buildErr, shim, problem)
 			return "", false, nil
 		}
 		fmt.Fprintf(m.out, "note: could not rebuild %s (%v); reusing the cached helper\n", execShimName, buildErr)
 		_ = m.builder.Sign(ctx, shim)
-		return dir, true, nil
+		return m.verifiedBinDir(dir, shim)
 	}
 	// Re-sign so a stale ad-hoc signature from a prior toolchain does not wedge
 	// exec. Signed before the rename, so codesign never writes at the cache path.
@@ -204,8 +216,7 @@ func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool
 
 	blocker, installErr := m.installExecShim(built, dir, shim, cached)
 	if installErr == nil {
-		m.handBack(dir, shim)
-		return dir, true, nil
+		return m.verifiedBinDir(dir, shim)
 	}
 
 	// The fresh build exists but the cache refused it. Never reuse the cached
@@ -217,17 +228,128 @@ func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool
 			execShimName, blocker, installErr, fresh, err, remedyFor(blocker))
 		return "", false, nil
 	}
-	m.handBack(fresh, freshShim)
 	fmt.Fprintf(m.out, "note: built %s, but %s is not writable by you (%v); using the fresh build from %s and NOT the cached helper. Remedy: %s\n",
 		execShimName, blocker, installErr, freshShim, remedyFor(blocker))
-	return fresh, true, nil
+	return m.verifiedBinDir(fresh, freshShim)
+}
+
+// provisionRootExecShim is provisionExecShim for a root run (euid 0, a
+// `sudo k3sm dev up --datapath`). The detached server runs as root and execs the
+// helper as its Seatbelt launcher, so the helper must be one the unprivileged
+// user cannot replace: it is never installed into, or executed from, the user's
+// devBinDir, and never handed back. It lives in freshBinDir (.bin-0), created
+// root-owned mode 0700; the dir's owner and mode are checked as well as the
+// file's, and a dir that fails the check is refused (hostprocess), never
+// repaired. The build is staged inside that dir, so no user-writable path ever
+// holds the binary between build and install.
+func (m *Manager) provisionRootExecShim(ctx context.Context) (string, bool, error) {
+	dir := m.freshBinDir()
+	if err := mkdirNoFollow(0o700, dir); err != nil {
+		return "", false, err
+	}
+	if problem := m.privateDirProblem(dir); problem != "" {
+		fmt.Fprintf(m.out, "note: not using %s for the root %s: %s. Remedy: sudo rm -rf %s\n", dir, execShimName, problem, dir)
+		return "", false, nil
+	}
+	shim := filepath.Join(dir, execShimName)
+	if err := refuseSymlink(shim); err != nil {
+		return "", false, err
+	}
+	stage, err := os.MkdirTemp(dir, ".build-")
+	if err != nil {
+		return "", false, fmt.Errorf("create %s build dir in %s: %w", execShimName, dir, err)
+	}
+	defer func() { _ = os.RemoveAll(stage) }()
+	built := filepath.Join(stage, execShimName)
+
+	if buildErr := m.builder.Build(ctx, built); buildErr != nil {
+		// Same reasoning as the rootless path: reuse only a helper that passes the
+		// root-private check, else the honest hostprocess fallback.
+		if _, statErr := os.Lstat(shim); statErr != nil {
+			fmt.Fprintf(m.out, "note: could not build %s: %v\n", execShimName, buildErr)
+			return "", false, nil
+		}
+		if problem := m.helperProblem(shim); problem != "" {
+			fmt.Fprintf(m.out, "note: could not build %s (%v), and the cached %s %s; not reusing it\n", execShimName, buildErr, shim, problem)
+			return "", false, nil
+		}
+		fmt.Fprintf(m.out, "note: could not rebuild %s (%v); reusing the cached helper\n", execShimName, buildErr)
+		_ = m.builder.Sign(ctx, shim)
+		return m.verifiedBinDir(dir, shim)
+	}
+	_ = m.builder.Sign(ctx, built)
+	if err := os.Rename(built, shim); err != nil {
+		fmt.Fprintf(m.out, "note: could not install %s into %s: %v\n", execShimName, shim, err)
+		return "", false, nil
+	}
+	return m.verifiedBinDir(dir, shim)
+}
+
+// verifiedBinDir returns dir as the helper's PATH dir only if shim passes
+// helperProblem at this moment, the last check before the server is handed the
+// path; otherwise it is the hostprocess fallback with a note.
+func (m *Manager) verifiedBinDir(dir, shim string) (string, bool, error) {
+	if problem := m.helperProblem(shim); problem != "" {
+		fmt.Fprintf(m.out, "note: not using %s: it %s\n", shim, problem)
+		return "", false, nil
+	}
+	return dir, true, nil
+}
+
+// helperProblem says why path is not a helper this process may execute, or ""
+// when it is: a regular file (not a link), owned by this euid, and writable by
+// neither group nor other.
+func (m *Manager) helperProblem(path string) string {
+	st, err := m.lstatT(path)
+	if err != nil {
+		return fmt.Sprintf("cannot be inspected (%v)", err)
+	}
+	switch {
+	case st.Mode&unix.S_IFMT != unix.S_IFREG:
+		return "is not a regular file"
+	case int(st.Uid) != m.euid:
+		return fmt.Sprintf("is owned by uid %d, not by you", st.Uid)
+	case st.Mode&0o022 != 0:
+		return fmt.Sprintf("is group- or other-writable (mode %#o)", st.Mode&0o777)
+	}
+	return ""
+}
+
+// privateDirProblem says why dir is not a private helper dir for this euid, or
+// "" when it is: a real directory (not a link), owned by this euid, with no
+// group or other permission bits at all.
+func (m *Manager) privateDirProblem(dir string) string {
+	st, err := m.lstatT(dir)
+	if err != nil {
+		return fmt.Sprintf("cannot be inspected (%v)", err)
+	}
+	switch {
+	case st.Mode&unix.S_IFMT != unix.S_IFDIR:
+		return "is not a directory"
+	case int(st.Uid) != m.euid:
+		return fmt.Sprintf("is owned by uid %d, not %d", st.Uid, m.euid)
+	case st.Mode&0o077 != 0:
+		return fmt.Sprintf("has mode %#o, want 0700", st.Mode&0o777)
+	}
+	return ""
+}
+
+// lstatT is unix.Lstat through the Manager's seam (m.lstat), so a test can
+// present a file as root-owned without being root.
+func (m *Manager) lstatT(path string) (unix.Stat_t, error) {
+	var st unix.Stat_t
+	lstat := m.lstat
+	if lstat == nil {
+		lstat = unix.Lstat
+	}
+	err := lstat(path, &st)
+	return st, err
 }
 
 // installExecShim renames the staged build over the cached helper. It refuses
-// to replace a cached file the invoking user does not own (a rename over it
-// would discard someone else's file). On failure it returns the path that
-// blocked the install: the cached file, or the cache dir when that is what
-// refused the write.
+// to replace a cached file this euid does not own (a rename over it would
+// discard someone else's file). On failure it returns the path that blocked the
+// install: the cached file, or the cache dir when that is what refused the write.
 func (m *Manager) installExecShim(built, dir, shim string, cached bool) (string, error) {
 	if cached {
 		if uid, trusted := m.trustedOwner(shim); !trusted {
@@ -250,7 +372,7 @@ func (m *Manager) installExecShim(built, dir, shim string, cached bool) (string,
 }
 
 // installFresh moves the staged build into the per-user fallback dir, refusing
-// a dir or file there that is a symlink or that the invoking user does not own.
+// a dir or file there that is a symlink or that this euid does not own.
 func (m *Manager) installFresh(built, fresh, freshShim string) error {
 	if err := mkdirNoFollow(0o755, fresh); err != nil {
 		return err
@@ -273,23 +395,22 @@ func (m *Manager) installFresh(built, fresh, freshShim string) error {
 }
 
 // trustedOwner reports the owner uid of path (not following a link) and whether
-// that owner is the invoking user: this process's euid or, under sudo, the
-// SUDO_USER human a datapath run hands its artifacts back to. An unreadable
-// path is untrusted, with uid -1.
+// it is this process's euid. Only the euid is trusted: a root run never trusts a
+// file the unprivileged user owns, because root would then execute a binary the
+// user can replace. An unreadable path is untrusted, with uid -1.
 func (m *Manager) trustedOwner(path string) (int, bool) {
-	var st unix.Stat_t
-	if err := unix.Lstat(path, &st); err != nil {
+	st, err := m.lstatT(path)
+	if err != nil {
 		return -1, false
 	}
-	uid := int(st.Uid)
-	return uid, uid == m.euid || (m.kubeMg.chownUID >= 0 && uid == m.kubeMg.chownUID)
+	return int(st.Uid), int(st.Uid) == m.euid
 }
 
-// handBack gives each path to the invoking human under sudo, so a root
-// `k3sm dev up --datapath` stops leaving root-owned files in the user's dev
-// cache that a later rootless run cannot replace. Only a path this process's
-// euid owns is touched (one this run created or installed); anything else is
-// left alone. Outside sudo it is a no-op. Best-effort: a failure is a note, not
+// handBack gives each path to the invoking human under sudo. It is called only
+// with the registry dirs a sudo run had to create (the dev root and its missing
+// ancestors), which the next rootless run must be able to write; never with a
+// helper binary or the root-private .bin-0. Only a path this process's euid owns
+// is touched. Outside sudo it is a no-op. Best-effort: a failure is a note, not
 // fatal, because the root run itself is unaffected.
 func (m *Manager) handBack(paths ...string) {
 	if m.kubeMg.chownUID < 0 {
@@ -300,8 +421,7 @@ func (m *Manager) handBack(paths ...string) {
 		chown = os.Lchown
 	}
 	for _, p := range paths {
-		var st unix.Stat_t
-		if err := unix.Lstat(p, &st); err != nil || int(st.Uid) != m.euid {
+		if _, owned := m.trustedOwner(p); !owned {
 			continue
 		}
 		if err := chown(p, m.kubeMg.chownUID, m.kubeMg.chownGID); err != nil {
@@ -327,13 +447,16 @@ func missingAncestors(dir string) []string {
 }
 
 // remedyFor is the one-line fix for a path the invoking user cannot replace:
-// remove it, or take it back.
+// remove exactly that file, or take back exactly that directory.
 func remedyFor(path string) string {
-	who := strconv.Itoa(os.Getuid())
-	if u, err := user.Current(); err == nil && u.Username != "" {
-		who = u.Username
+	if info, err := os.Lstat(path); err == nil && info.IsDir() {
+		who := strconv.Itoa(os.Getuid())
+		if u, err := user.Current(); err == nil && u.Username != "" {
+			who = u.Username
+		}
+		return fmt.Sprintf("sudo chown %s %s", who, path)
 	}
-	return fmt.Sprintf("sudo rm -rf %s (or sudo chown -R %s %s)", path, who, path)
+	return fmt.Sprintf("sudo rm -f %s", path)
 }
 
 // withExecShimPath returns a copy of env with binDir prepended to PATH so a

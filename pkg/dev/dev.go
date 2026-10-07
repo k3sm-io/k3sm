@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -181,6 +182,10 @@ type Manager struct {
 	// (handBack). A field so a test observes the hand-back without root; nil
 	// means os.Lchown.
 	lchown func(path string, uid, gid int) error
+	// lstat inspects a helper path's owner and mode for the execshim trust
+	// checks. A field so a test can present a file as root-owned without root;
+	// nil means unix.Lstat.
+	lstat func(path string, st *unix.Stat_t) error
 }
 
 // ManagerConfig constructs a Manager.
