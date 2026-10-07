@@ -186,6 +186,10 @@ type Manager struct {
 	// checks. A field so a test can present a file as root-owned without root;
 	// nil means unix.Lstat.
 	lstat func(path string, st *unix.Stat_t) error
+	// rootBinDir, when set, overrides the root run's helper dir
+	// (rootExecShimDir, /Library/k3sm-dev/bin), so a test drives the root path
+	// against a temp dir, like shimDir does for the pod shims.
+	rootBinDir string
 }
 
 // ManagerConfig constructs a Manager.

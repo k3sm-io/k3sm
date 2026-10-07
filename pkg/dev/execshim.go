@@ -94,22 +94,38 @@ func (goExecShimBuilder) Sign(ctx context.Context, path string) error {
 // exec.LookPath resolves it.
 func (m *Manager) devBinDir() string { return filepath.Join(m.reg.root, ".bin") }
 
-// freshBinDir is <registry root>/.bin-<euid>. For a rootless run it is the
-// per-user fallback, used only when a fresh k3sm-execshim build exists but
-// cannot be installed into the shared cache (devBinDir): a file or dir there is
-// owned by someone else (typically root, left by an earlier sudo run) or is not
-// writable. For a root run (euid 0) it is the ONLY helper dir: root-owned, mode
-// 0700, never handed back (see provisionRootExecShim).
+// freshBinDir is the rootless run's per-user fallback helper dir,
+// <registry root>/.bin-<euid>, used only when a fresh k3sm-execshim build exists
+// but cannot be installed into the shared cache (devBinDir): a file or dir there
+// is owned by someone else (typically root, left by an earlier sudo run) or is
+// not writable. A root run never uses it (see rootExecShimDir).
 func (m *Manager) freshBinDir() string {
 	return filepath.Join(m.reg.root, ".bin-"+strconv.Itoa(m.euid))
+}
+
+// rootExecShimSubdir is the root run's helper dir under DefaultPodShimDir.
+// It does not collide with the pod shims staged in DefaultPodShimDir itself,
+// which are files, not a "bin" directory.
+const rootExecShimSubdir = "bin"
+
+// rootExecShimDir is where a root run (euid 0) keeps its k3sm-execshim:
+// DefaultPodShimDir/bin, i.e. /Library/k3sm-dev/bin. Every ancestor of that
+// path is root-owned and writable by nobody else, so the unprivileged user can
+// neither replace the helper nor swap a directory above it, unlike any path
+// under their home. m.rootBinDir overrides it so a test stays unprivileged.
+func (m *Manager) rootExecShimDir() string {
+	if m.rootBinDir != "" {
+		return m.rootBinDir
+	}
+	return filepath.Join(DefaultPodShimDir, rootExecShimSubdir)
 }
 
 // provisionExecShim ensures a k3sm-execshim helper built from the current source
 // is on hand and returns the dir holding it (prepended to the detached server's
 // PATH). The helper is built (CGO_ENABLED=1, workspace go.work) into a private
 // staging dir and ad-hoc signed there via the builder seam, then installed by
-// rename: into the shared dev-bin cache for a rootless run, into the root-private
-// freshBinDir for a root run (provisionRootExecShim).
+// rename: into the shared dev-bin cache for a rootless run, into the root-owned
+// rootExecShimDir for a root run (provisionRootExecShim).
 //
 // The two failure modes are kept apart, because they call for opposite answers:
 //
@@ -237,18 +253,24 @@ func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool
 // `sudo k3sm dev up --datapath`). The detached server runs as root and execs the
 // helper as its Seatbelt launcher, so the helper must be one the unprivileged
 // user cannot replace: it is never installed into, or executed from, the user's
-// devBinDir, and never handed back. It lives in freshBinDir (.bin-0), created
-// root-owned mode 0700; the dir's owner and mode are checked as well as the
-// file's, and a dir that fails the check is refused (hostprocess), never
-// repaired. The build is staged inside that dir, so no user-writable path ever
-// holds the binary between build and install.
+// devBinDir, and never handed back. It lives in rootExecShimDir, whose whole
+// ancestor chain is checked (rootChainProblem): a chain that fails is refused
+// (hostprocess), never repaired. The build is staged inside that dir, so no
+// user-writable path ever holds the binary between build and install.
 func (m *Manager) provisionRootExecShim(ctx context.Context) (string, bool, error) {
-	dir := m.freshBinDir()
+	dir := m.rootExecShimDir()
+	// The same creation as the root tier's pod-shim stage under
+	// DefaultPodShimDir: component by component, refusing a symlink at each.
+	// The base stays 0755 (pods read the shims staged in it); the helper dir
+	// needs no reader but root.
+	if err := mkdirNoFollow(0o755, filepath.Dir(dir)); err != nil {
+		return "", false, err
+	}
 	if err := mkdirNoFollow(0o700, dir); err != nil {
 		return "", false, err
 	}
-	if problem := m.privateDirProblem(dir); problem != "" {
-		fmt.Fprintf(m.out, "note: not using %s for the root %s: %s. Remedy: sudo rm -rf %s\n", dir, execShimName, problem, dir)
+	if problem := m.rootChainProblem(dir); problem != "" {
+		fmt.Fprintf(m.out, "note: not using %s for the root %s: %s\n", dir, execShimName, problem)
 		return "", false, nil
 	}
 	shim := filepath.Join(dir, execShimName)
@@ -315,23 +337,30 @@ func (m *Manager) helperProblem(path string) string {
 	return ""
 }
 
-// privateDirProblem says why dir is not a private helper dir for this euid, or
-// "" when it is: a real directory (not a link), owned by this euid, with no
-// group or other permission bits at all.
-func (m *Manager) privateDirProblem(dir string) string {
-	st, err := m.lstatT(dir)
-	if err != nil {
-		return fmt.Sprintf("cannot be inspected (%v)", err)
+// rootChainProblem says why dir cannot hold a helper root will execute, or ""
+// when it can: dir and every ancestor up to "/" is a real directory (not a
+// link), owned by this euid, and writable by neither group nor other. A single
+// component the user could write would let them swap everything below it.
+func (m *Manager) rootChainProblem(dir string) string {
+	for p := filepath.Clean(dir); ; p = filepath.Dir(p) {
+		st, err := m.lstatT(p)
+		if err != nil {
+			return fmt.Sprintf("%s cannot be inspected (%v)", p, err)
+		}
+		switch {
+		case st.Mode&unix.S_IFMT == unix.S_IFLNK:
+			return fmt.Sprintf("%s is a symlink", p)
+		case st.Mode&unix.S_IFMT != unix.S_IFDIR:
+			return fmt.Sprintf("%s is not a directory", p)
+		case int(st.Uid) != m.euid:
+			return fmt.Sprintf("%s is owned by uid %d, not %d", p, st.Uid, m.euid)
+		case st.Mode&0o022 != 0:
+			return fmt.Sprintf("%s is group- or other-writable (mode %#o)", p, st.Mode&0o777)
+		}
+		if filepath.Dir(p) == p {
+			return ""
+		}
 	}
-	switch {
-	case st.Mode&unix.S_IFMT != unix.S_IFDIR:
-		return "is not a directory"
-	case int(st.Uid) != m.euid:
-		return fmt.Sprintf("is owned by uid %d, not %d", st.Uid, m.euid)
-	case st.Mode&0o077 != 0:
-		return fmt.Sprintf("has mode %#o, want 0700", st.Mode&0o777)
-	}
-	return ""
 }
 
 // lstatT is unix.Lstat through the Manager's seam (m.lstat), so a test can
@@ -409,7 +438,7 @@ func (m *Manager) trustedOwner(path string) (int, bool) {
 // handBack gives each path to the invoking human under sudo. It is called only
 // with the registry dirs a sudo run had to create (the dev root and its missing
 // ancestors), which the next rootless run must be able to write; never with a
-// helper binary or the root-private .bin-0. Only a path this process's euid owns
+// helper binary or the root-owned rootExecShimDir. Only a path this process's euid owns
 // is touched. Outside sudo it is a no-op. Best-effort: a failure is a note, not
 // fatal, because the root run itself is unaffected.
 func (m *Manager) handBack(paths ...string) {
