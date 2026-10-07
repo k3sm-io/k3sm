@@ -177,6 +177,10 @@ type Manager struct {
 	// not a plain method, so the wait is testable without a live cluster. nil
 	// means the production implementation (awaitNodeRegistered).
 	awaitNodeRegistration func(ctx context.Context, kubeconfig string) error
+	// lchown hands a dev-cache path back to the invoking human under sudo
+	// (handBack). A field so a test observes the hand-back without root; nil
+	// means os.Lchown.
+	lchown func(path string, uid, gid int) error
 }
 
 // ManagerConfig constructs a Manager.
