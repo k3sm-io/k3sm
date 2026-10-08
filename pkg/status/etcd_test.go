@@ -172,6 +172,18 @@ func TestEtcdRowSnapshotWide(t *testing.T) {
 			s.SnapshotSchedule, s.SnapshotRetention = "0 */12 * * *", 5
 			s.LastScheduledSnapshot, s.ScheduledSnapshotsKept = taken, 3
 		}, map[string]string{"snapshot-schedule": "0 */12 * * *", "scheduled-snapshots-kept": "3 of 5", "last-scheduled-snapshot": "2026-10-02T00:00:00Z"}},
+		{"a failure and a skip for lack of space", func(s *executor.EtcdStatus) {
+			s.SnapshotSchedule, s.SnapshotRetention = "0 */12 * * *", 5
+			s.LastScheduledSnapshotError = "stream the etcd snapshot: member unavailable"
+			s.LastScheduledSnapshotSkipped = &executor.EtcdSnapshotSkip{At: taken, Reason: executor.EtcdSnapshotSkipSpace, Detail: "1 byte free"}
+		}, map[string]string{
+			"last-scheduled-snapshot-error":   "stream the etcd snapshot: member unavailable",
+			"last-scheduled-snapshot-skipped": "2026-10-02T00:00:00Z not enough free space: 1 byte free",
+		}},
+		{"a skip because the free space could not be read", func(s *executor.EtcdStatus) {
+			s.SnapshotSchedule, s.SnapshotRetention = "0 */12 * * *", 5
+			s.LastScheduledSnapshotSkipped = &executor.EtcdSnapshotSkip{At: taken, Reason: executor.EtcdSnapshotSkipError, Detail: "statfs: input/output error"}
+		}, map[string]string{"last-scheduled-snapshot-skipped": "2026-10-02T00:00:00Z could not read the free space: statfs: input/output error"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := healthyEtcd(now)
@@ -195,13 +207,16 @@ func TestEtcdRowSnapshotWide(t *testing.T) {
 					t.Errorf("wide[%q] = %q, want %q", k, row.Wide[k], v)
 				}
 			}
+			if tc.want["last-scheduled-snapshot-error"] == "" && row.Wide["last-scheduled-snapshot-error"] != "" {
+				t.Errorf("no failure recorded but wide carries %q", row.Wide["last-scheduled-snapshot-error"])
+			}
 			if tc.edit == nil {
-				for _, k := range []string{"scheduled-snapshots-kept", "last-scheduled-snapshot"} {
+				for _, k := range []string{"scheduled-snapshots-kept", "last-scheduled-snapshot", "last-scheduled-snapshot-skipped"} {
 					if _, ok := row.Wide[k]; ok {
 						t.Errorf("schedule off but wide carries %q", k)
 					}
 				}
-				if strings.Contains(string(raw), "lastScheduledSnapshot") {
+				if strings.Contains(string(raw), "ScheduledSnapshot") || strings.Contains(string(raw), "snapshotSchedule") {
 					t.Errorf("a record with no schedule encodes lastScheduledSnapshot: %s", raw)
 				}
 			}

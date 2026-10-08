@@ -215,8 +215,10 @@ func etcdRowFrom(st executor.EtcdStatus, p99 *float64, now time.Time) Row {
 }
 
 // addEtcdSnapshotWide adds the scheduled-snapshot view: the schedule, when the
-// newest scheduled snapshot was taken, and how many are kept of how many the
-// retention allows. A record with no schedule says the schedule is off.
+// newest scheduled snapshot was taken, how many are kept of how many the retention
+// allows, and, until the next success, the last failure and the last skipped tick
+// (no room, or the free space could not be read). A record with no schedule says
+// the schedule is off.
 func addEtcdSnapshotWide(wide map[string]string, st executor.EtcdStatus) {
 	if st.SnapshotSchedule == "" {
 		wide["snapshot-schedule"] = "off"
@@ -228,6 +230,20 @@ func addEtcdSnapshotWide(wide map[string]string, st executor.EtcdStatus) {
 		wide["last-scheduled-snapshot"] = "none yet"
 	} else {
 		wide["last-scheduled-snapshot"] = st.LastScheduledSnapshot.UTC().Format(time.RFC3339)
+	}
+	if st.LastScheduledSnapshotError != "" {
+		wide["last-scheduled-snapshot-error"] = st.LastScheduledSnapshotError
+	}
+	if sk := st.LastScheduledSnapshotSkipped; sk != nil {
+		why := "not enough free space"
+		if sk.Reason == executor.EtcdSnapshotSkipError {
+			why = "could not read the free space"
+		}
+		v := sk.At.UTC().Format(time.RFC3339) + " " + why
+		if sk.Detail != "" {
+			v += ": " + sk.Detail
+		}
+		wide["last-scheduled-snapshot-skipped"] = v
 	}
 }
 
