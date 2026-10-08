@@ -115,8 +115,9 @@ availability guarantee. Keep datastore backups (see [Backup & restore](backup-re
 On a server started with `--cluster-init` or `--server-join`, `k3sm snapshot save` streams an online
 snapshot of this server's etcd member. `k3sm snapshot restore` puts one back as a new single-member
 cluster, and every other server joins it again as a new member; see
-[Restoring an HA Server](backup-restore.md#restoring-an-ha-server-embedded-etcd). Scheduled snapshots
-are not offered yet; take them yourself.
+[Restoring an HA Server](backup-restore.md#restoring-an-ha-server-embedded-etcd). Every server also
+takes a scheduled snapshot of its own member, every 12 hours and keeping 5 by default; see
+[Scheduled etcd Snapshots](backup-restore.md#scheduled-etcd-snapshots).
 
 ## Next
 

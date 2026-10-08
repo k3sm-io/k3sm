@@ -161,6 +161,11 @@ identified. Its `state` is `ok`, or `stale` (severity `warn`) when the Lease ren
 seconds or the status post is older than 100 seconds. `detail` gives both ages; `wide` carries them
 as `leaseAgeSeconds` and `statusAgeSeconds` when known.
 
+The `etcd` row's `wide` carries the scheduled etcd snapshots: `snapshot-schedule` (the cron
+expression, or `off`), and when a schedule is set, `last-scheduled-snapshot` (RFC 3339, or
+`none yet`) and `scheduled-snapshots-kept` (`<kept> of <retention>`). Like every `wide` key, these
+are informational and not part of the contract.
+
 ## Rows
 
 | field | type | notes |
