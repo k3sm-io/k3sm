@@ -27,12 +27,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
-// Scheduled etcd snapshots, the k3s behaviour on an embedded-etcd server: every
-// server takes a snapshot of its own member on a cron schedule (k3s's default, every
-// 12 hours) into <WorkDir>/db/snapshots, and keeps the newest N of them (default 5).
+// Scheduled etcd snapshots, the k3s behaviour: every server takes a snapshot of its
+// own member on a cron schedule (k3s's default, every 12 hours) into
+// <WorkDir>/db/snapshots, and keeps the newest N of them (default 5).
 //
 // The loop starts once the member has quorum and the post-quorum checks have run,
 // and Stop ends it BEFORE anything else in the teardown: it streams from the admin
@@ -40,17 +41,32 @@ import (
 // through saveEtcdSnapshot, the path `k3sm snapshot save` uses, so a scheduled file
 // is verified and 0600 exactly like a manual one.
 //
+// The loop does not sleep until the next cron minute on one timer: a Mac's monotonic
+// timers stop while it sleeps, and the wall clock can be stepped. It wakes at least
+// every etcdSnapshotWakeEvery and compares the wall clock with the due time, so a Mac
+// that slept through one or several cron minutes takes ONE catch-up snapshot on wake
+// (logged as late), never a burst.
+//
 // Retention deletes, so it is narrow on purpose. It runs only after a snapshot has
 // been written and verified (a failing schedule never eats the snapshots it has), it
 // considers only names this schedule writes for THIS node, so a manual
 // `k3sm snapshot save` file (k3sm-etcd-snapshot-<stamp>.db) or a file another
 // server's schedule left on a shared directory is never touched, and it never
-// deletes the snapshot the tick just took.
+// deletes the snapshot the tick just took. Snapshots are ordered by the earlier of
+// the name's stamp and the file's mtime, and one dated after the current time (taken
+// under a clock that was wrong) sorts as the oldest, so it cannot evict real ones.
+// A node renamed since its snapshots were taken leaves them under the old name for
+// the operator to remove; the schedule never deletes a name it did not write.
+//
+// At start the schedule removes the partial `.tmp` files its own earlier runs may
+// have left (this node's prefix, regular files only, never through a symlink) and
+// makes the snapshots directory 0700 when this process owns it.
 //
 // A tick is skipped, with a warning, when the snapshot directory's volume has less
 // free space than snapshotFreeSpaceFactor times the last snapshot's size: a
 // snapshot schedule that fills the disk the datastore lives on breaks the cluster it
-// exists to protect.
+// exists to protect. A skip and a failure are recorded for `k3sm status` until the
+// next success.
 //
 // The kine posture has no schedule, as in k3s, where the snapshot schedule is an
 // etcd feature and a SQLite server is backed up by copying its database file.
@@ -66,7 +82,24 @@ const (
 	scheduledSnapshotPrefix = "etcd-snapshot-"
 	// etcdScheduledSnapshotTimeout bounds one scheduled snapshot's stream.
 	etcdScheduledSnapshotTimeout = 10 * time.Minute
+	// etcdSnapshotWakeEvery is the longest the loop waits before it re-reads the wall
+	// clock, so a sleep or a clock step delays a due snapshot by at most this much.
+	etcdSnapshotWakeEvery = time.Minute
+	// etcdSnapshotLateAfter is how far past its due minute a tick has to run before
+	// it is logged as a late catch-up.
+	etcdSnapshotLateAfter = 2 * etcdSnapshotWakeEvery
+	// Skip reasons recorded in EtcdSnapshotSkip.Reason.
+	EtcdSnapshotSkipSpace = "space" // the volume has less free space than the floor
+	EtcdSnapshotSkipError = "error" // the free space could not be read
 )
+
+// EtcdSnapshotSkip is a scheduled snapshot that was not attempted.
+type EtcdSnapshotSkip struct {
+	At time.Time `json:"at"`
+	// Reason is EtcdSnapshotSkipSpace or EtcdSnapshotSkipError; Detail the message.
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
+}
 
 // ErrEtcdSnapshotRetention reports a schedule asked to keep fewer than one snapshot.
 var ErrEtcdSnapshotRetention = errors.New("executor: the etcd snapshot retention must keep at least one snapshot")
@@ -118,11 +151,25 @@ func parseScheduledEtcdSnapshot(node, name string) (time.Time, bool) {
 	return time.Unix(sec, 0).UTC(), true
 }
 
-// scheduledSnapshot is one of this node's scheduled snapshots on disk.
+// scheduledSnapshot is one of this node's scheduled snapshots on disk. order is
+// what retention sorts by: the earlier of the name's stamp and the file's mtime.
 type scheduledSnapshot struct {
 	path  string
 	taken time.Time
+	order time.Time
 	size  int64
+}
+
+// etcdSnapshotState is the schedule's view for the status record.
+type etcdSnapshotState struct {
+	// last is the newest scheduled snapshot's time (zero: none), kept how many are
+	// on disk.
+	last time.Time
+	kept int
+	// lastErr is the last failed snapshot's error and skipped the last skipped
+	// tick; both are cleared by the next success.
+	lastErr string
+	skipped *EtcdSnapshotSkip
 }
 
 // etcdSnapshotScheduler is the schedule loop and its view of what it has kept.
@@ -143,16 +190,16 @@ type etcdSnapshotScheduler struct {
 	dbSize func(ctx context.Context) (int64, error)
 	log    *slog.Logger
 
-	// mu guards the summary below, which collectEtcdStatus reads.
+	// mu guards state and lastSize; collectEtcdStatus reads state.
 	mu       sync.Mutex
-	last     time.Time
-	kept     int
+	state    etcdSnapshotState
 	lastSize int64
 }
 
-// newEtcdSnapshotScheduler builds the scheduler for this server's member, reading the
-// snapshots a previous run of this server kept so the status record and the
-// free-space floor are right before the first tick.
+// newEtcdSnapshotScheduler builds the scheduler for this server's member: it
+// prepares the snapshots directory and reads the snapshots a previous run of this
+// server kept, so the status record and the free-space floor are right before the
+// first tick.
 func (s *Supervised) newEtcdSnapshotScheduler(m etcdMembers) *etcdSnapshotScheduler {
 	cfg := s.cfg.Etcd.Snapshots
 	sc := &etcdSnapshotScheduler{
@@ -170,12 +217,56 @@ func (s *Supervised) newEtcdSnapshotScheduler(m etcdMembers) *etcdSnapshotSchedu
 		},
 		log: s.cfg.Logger,
 	}
+	sc.prepare()
 	sc.refresh()
 	return sc
 }
 
-// list returns this node's scheduled snapshots, newest first.
-func (sc *etcdSnapshotScheduler) list() ([]scheduledSnapshot, error) {
+// prepare makes the snapshots directory 0700 and removes this node's own partial
+// snapshots. Failures are logged; none of them stops the schedule.
+func (sc *etcdSnapshotScheduler) prepare() {
+	log := sc.log
+	if err := os.MkdirAll(sc.dir, 0o700); err != nil {
+		log.Warn("could not create the etcd snapshot directory", "component", etcdComponent, "dir", sc.dir, "err", err)
+		return
+	}
+	// MkdirAll leaves an existing directory's mode alone, and `k3sm snapshot save`
+	// or an older release may have created it wider. Tighten it when it is ours.
+	if fi, err := os.Lstat(sc.dir); err == nil && fi.IsDir() && fi.Mode().Perm() != 0o700 {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) == os.Geteuid() {
+			if err := os.Chmod(sc.dir, 0o700); err != nil {
+				log.Warn("could not restrict the etcd snapshot directory to 0700", "component", etcdComponent,
+					"dir", sc.dir, "err", err)
+			}
+		}
+	}
+	entries, err := os.ReadDir(sc.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		// ReadDir reports a symlink as a symlink, never its target: only a regular
+		// file of this node's own .tmp shape is removed.
+		base, ok := strings.CutSuffix(e.Name(), ".tmp")
+		if !ok || !e.Type().IsRegular() {
+			continue
+		}
+		if _, ours := parseScheduledEtcdSnapshot(sc.node, base); !ours {
+			continue
+		}
+		path := filepath.Join(sc.dir, e.Name())
+		if err := os.Remove(path); err != nil {
+			log.Warn("could not remove a partial scheduled etcd snapshot", "component", etcdComponent, "path", path, "err", err)
+			continue
+		}
+		log.Info("removed a partial scheduled etcd snapshot an earlier run left", "component", etcdComponent, "path", path)
+	}
+}
+
+// list returns this node's scheduled snapshots, newest first by order. A snapshot
+// whose order is after now (taken under a clock that was ahead) sorts last: its
+// real age is unknown, and it must not outrank real snapshots in retention.
+func (sc *etcdSnapshotScheduler) list(now time.Time) ([]scheduledSnapshot, error) {
 	entries, err := os.ReadDir(sc.dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -189,14 +280,20 @@ func (sc *etcdSnapshotScheduler) list() ([]scheduledSnapshot, error) {
 		if !ok || !e.Type().IsRegular() {
 			continue
 		}
-		snap := scheduledSnapshot{path: filepath.Join(sc.dir, e.Name()), taken: taken}
+		snap := scheduledSnapshot{path: filepath.Join(sc.dir, e.Name()), taken: taken, order: taken}
 		if fi, err := e.Info(); err == nil {
 			snap.size = fi.Size()
+			if mt := fi.ModTime(); mt.Before(snap.order) {
+				snap.order = mt
+			}
+		}
+		if snap.order.After(now.Add(etcdSnapshotWakeEvery)) {
+			snap.order = time.Time{}
 		}
 		out = append(out, snap)
 	}
 	slices.SortFunc(out, func(a, b scheduledSnapshot) int {
-		if c := b.taken.Compare(a.taken); c != 0 {
+		if c := b.order.Compare(a.order); c != 0 {
 			return c
 		}
 		return strings.Compare(b.path, a.path)
@@ -204,56 +301,90 @@ func (sc *etcdSnapshotScheduler) list() ([]scheduledSnapshot, error) {
 	return out, nil
 }
 
-// refresh re-reads the summary from disk.
+// refresh re-reads the kept snapshots from disk into the state.
 func (sc *etcdSnapshotScheduler) refresh() {
-	snaps, err := sc.list()
+	snaps, err := sc.list(sc.clock.Now())
 	if err != nil {
 		return
 	}
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	sc.kept = len(snaps)
-	sc.last = time.Time{}
-	if len(snaps) > 0 {
-		sc.last, sc.lastSize = snaps[0].taken, snaps[0].size
+	sc.state.kept = len(snaps)
+	sc.state.last = time.Time{}
+	if len(snaps) > 0 && !snaps[0].order.IsZero() {
+		sc.state.last, sc.lastSize = snaps[0].taken, snaps[0].size
 	}
 }
 
-// summary is the newest scheduled snapshot's time and how many are kept.
-func (sc *etcdSnapshotScheduler) summary() (last time.Time, kept int) {
+// snapshotState is the schedule's view for the status record.
+func (sc *etcdSnapshotScheduler) snapshotState() etcdSnapshotState {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	return sc.last, sc.kept
+	st := sc.state
+	if st.skipped != nil {
+		skip := *st.skipped
+		st.skipped = &skip
+	}
+	return st
 }
 
-// run ticks on the schedule until ctx ends.
+// run ticks on the schedule until ctx ends. It re-reads the wall clock at least
+// every etcdSnapshotWakeEvery rather than trusting one long timer, and after a tick
+// it plans the next one from the time it finished, so cron minutes missed while the
+// Mac slept collapse into the one catch-up tick.
 func (sc *etcdSnapshotScheduler) run(ctx context.Context) {
+	next := sc.cron.Next(sc.clock.Now().In(sc.loc))
 	for {
-		now := sc.clock.Now().In(sc.loc)
-		next := sc.cron.Next(now)
 		if next.IsZero() {
 			sc.log.Warn("the etcd snapshot schedule names no future time; no scheduled snapshots will be taken",
 				"component", etcdComponent, "schedule", sc.cron.String())
 			return
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-sc.clock.After(next.Sub(now)):
+		now := sc.clock.Now()
+		if now.Before(next) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sc.clock.After(min(next.Sub(now), etcdSnapshotWakeEvery)):
+			}
+			continue
 		}
 		if ctx.Err() != nil {
 			return
 		}
+		if late := now.Sub(next); late >= etcdSnapshotLateAfter {
+			sc.log.Info("a scheduled etcd snapshot is late (the Mac slept or the clock moved); taking one now for the missed time",
+				"component", etcdComponent, "due", next.UTC().Format(time.RFC3339), "late-by", late.Round(time.Second).String())
+		}
 		sc.tick(ctx)
+		next = sc.cron.Next(sc.clock.Now().In(sc.loc))
 	}
+}
+
+// skip records and logs a tick that was not attempted.
+func (sc *etcdSnapshotScheduler) skip(reason string, err error) {
+	msg := "skipped a scheduled etcd snapshot: not enough free space for it"
+	if reason == EtcdSnapshotSkipError {
+		msg = "skipped a scheduled etcd snapshot: could not read the free space"
+	}
+	sc.log.Warn(msg, "component", etcdComponent, "dir", sc.dir, "err", err)
+	sc.mu.Lock()
+	sc.state.skipped = &EtcdSnapshotSkip{At: sc.clock.Now().UTC(), Reason: reason, Detail: err.Error()}
+	sc.mu.Unlock()
+}
+
+// fail records and logs a failed snapshot.
+func (sc *etcdSnapshotScheduler) fail(msg, path string, err error) {
+	sc.log.Warn(msg, "component", etcdComponent, "path", path, "err", err)
+	sc.mu.Lock()
+	sc.state.lastErr = err.Error()
+	sc.mu.Unlock()
 }
 
 // tick takes one scheduled snapshot and, only when it succeeded, applies retention.
 func (sc *etcdSnapshotScheduler) tick(ctx context.Context) {
-	log := sc.log
 	if err := os.MkdirAll(sc.dir, 0o700); err != nil {
-		log.Warn("scheduled etcd snapshot failed: cannot create the snapshot directory", "component", etcdComponent,
-			"dir", sc.dir, "err", err)
+		sc.fail("scheduled etcd snapshot failed: cannot create the snapshot directory", sc.dir, err)
 		return
 	}
 	sc.mu.Lock()
@@ -268,8 +399,11 @@ func (sc *etcdSnapshotScheduler) tick(ctx context.Context) {
 	}
 	if basis > 0 {
 		if err := sc.space(sc.dir, uint64(basis)*snapshotFreeSpaceFactor); err != nil {
-			log.Warn("skipped a scheduled etcd snapshot: not enough free space for it", "component", etcdComponent,
-				"dir", sc.dir, "err", err)
+			reason := EtcdSnapshotSkipError
+			if errors.Is(err, ErrSnapshotSpace) {
+				reason = EtcdSnapshotSkipSpace
+			}
+			sc.skip(reason, err)
 			return
 		}
 	}
@@ -281,21 +415,21 @@ func (sc *etcdSnapshotScheduler) tick(ctx context.Context) {
 	cancel()
 	if err != nil {
 		if ctx.Err() != nil {
-			log.Info("a scheduled etcd snapshot was interrupted by shutdown; nothing was kept from it",
+			sc.log.Info("a scheduled etcd snapshot was interrupted by shutdown; nothing was kept from it",
 				"component", etcdComponent, "path", path)
 			return
 		}
-		log.Warn("scheduled etcd snapshot failed; older snapshots are kept", "component", etcdComponent,
-			"path", path, "err", err)
+		sc.fail("scheduled etcd snapshot failed; older snapshots are kept", path, err)
 		return
 	}
 	var size int64
 	if fi, err := os.Stat(path); err == nil {
 		size = fi.Size()
 	}
-	log.Info("took a scheduled etcd snapshot", "component", etcdComponent, "path", path, "bytes", size)
+	sc.log.Info("took a scheduled etcd snapshot", "component", etcdComponent, "path", path, "bytes", size)
 	sc.mu.Lock()
 	sc.lastSize = size
+	sc.state.lastErr, sc.state.skipped = "", nil
 	sc.mu.Unlock()
 	sc.retain(path)
 	sc.refresh()
@@ -304,14 +438,19 @@ func (sc *etcdSnapshotScheduler) tick(ctx context.Context) {
 // retain deletes this node's scheduled snapshots past the newest sc.retention,
 // never the one just taken.
 func (sc *etcdSnapshotScheduler) retain(justTaken string) {
-	snaps, err := sc.list()
+	snaps, err := sc.list(sc.clock.Now())
 	if err != nil {
 		sc.log.Warn("could not list the scheduled etcd snapshots for retention; none were removed",
 			"component", etcdComponent, "dir", sc.dir, "err", err)
 		return
 	}
-	for i, snap := range snaps {
-		if i < sc.retention || snap.path == justTaken {
+	keep := sc.retention
+	for _, snap := range snaps {
+		if snap.path == justTaken {
+			continue
+		}
+		if keep > 1 {
+			keep-- // the slot the just-taken snapshot does not use
 			continue
 		}
 		if err := os.Remove(snap.path); err != nil {
@@ -357,14 +496,17 @@ func (s *Supervised) stopEtcdSnapshotSchedule(ctx context.Context) {
 	}
 }
 
-// etcdSnapshotSummary is the schedule's view for the status record; zero when off.
-func (s *Supervised) etcdSnapshotSummary() (schedule string, retention int, last time.Time, kept int) {
+// fillEtcdSnapshotStatus copies the schedule's view into a status record; it leaves
+// st untouched when the schedule is off.
+func (s *Supervised) fillEtcdSnapshotStatus(st *EtcdStatus) {
 	s.mu.Lock()
 	sc := s.etcdSnap
 	s.mu.Unlock()
 	if sc == nil {
-		return "", 0, time.Time{}, 0
+		return
 	}
-	last, kept = sc.summary()
-	return sc.cron.String(), sc.retention, last, kept
+	v := sc.snapshotState()
+	st.SnapshotSchedule, st.SnapshotRetention = sc.cron.String(), sc.retention
+	st.LastScheduledSnapshot, st.ScheduledSnapshotsKept = v.last, v.kept
+	st.LastScheduledSnapshotError, st.LastScheduledSnapshotSkipped = v.lastErr, v.skipped
 }

@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,16 +69,33 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// Files retention must never touch: a manual save, another server's scheduled
-	// snapshot on the same directory, a partial write, and a near-miss name.
+	// Files the schedule must never touch: a manual save and its partial write,
+	// another server's scheduled snapshot and partial write on the same directory,
+	// and a near-miss name.
 	untouchable := []string{
 		"k3sm-etcd-snapshot-20261001T000000Z.db",
+		"k3sm-etcd-snapshot-20261001T000000Z.db.tmp",
 		"etcd-snapshot-server-b-1700000000",
-		"etcd-snapshot-server-a-1700000000.tmp",
+		"etcd-snapshot-server-b-1700000000.tmp",
 		"etcd-snapshot-server-a-old",
+		"etcd-snapshot-server-a-old.tmp",
 	}
 	for _, name := range untouchable {
 		mustWrite(t, filepath.Join(dir, name), []byte("not mine to delete"))
+	}
+	// Debris an earlier run of THIS node left: removed at start. A symlink of the
+	// same shape is not followed or removed, and neither is its target.
+	ownTmp := filepath.Join(dir, "etcd-snapshot-server-a-1700000000.tmp")
+	mustWrite(t, ownTmp, []byte("partial"))
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	mustWrite(t, target, []byte("someone else's file"))
+	linkTmp := filepath.Join(dir, "etcd-snapshot-server-a-1700000001.tmp")
+	if err := os.Symlink(target, linkTmp); err != nil {
+		t.Fatal(err)
+	}
+	// The directory was created wider than 0700 by some other path.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
 	}
 
 	clk := newFakeClock(5 * 24 * time.Hour)
@@ -87,9 +105,27 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 	var floorAsked atomic.Uint64
 	sc.space = func(string, uint64) error { return nil }
 
+	t.Run("start removes this node's partial files and makes the directory 0700", func(t *testing.T) {
+		if _, err := os.Lstat(ownTmp); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("this node's stale .tmp survived the start: %v", err)
+		}
+		if _, err := os.Lstat(linkTmp); err != nil {
+			t.Fatalf("a symlink of the .tmp shape was removed: %v", err)
+		}
+		if b, err := os.ReadFile(target); err != nil || string(b) != "someone else's file" {
+			t.Fatalf("the symlink's target was touched: %q %v", b, err)
+		}
+		if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+			t.Fatalf("snapshot dir mode = %v (%v), want 0700", fi.Mode().Perm(), err)
+		}
+		if !strings.Contains(logs.String(), "removed a partial scheduled etcd snapshot") {
+			t.Fatalf("no Info line for the removal:\n%s", logs.String())
+		}
+	})
+
 	scheduled := func() []string {
 		t.Helper()
-		snaps, err := sc.list()
+		snaps, err := sc.list(sc.clock.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -153,8 +189,8 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 			}
 		}
 		assertUntouched()
-		if got, kept := sc.summary(); !got.Equal(last) || kept != retention {
-			t.Fatalf("summary = %s, %d; want %s, %d", got, kept, last, retention)
+		if v := sc.snapshotState(); !v.last.Equal(last) || v.kept != retention || v.lastErr != "" || v.skipped != nil {
+			t.Fatalf("state = %+v; want last %s, %d kept, no error or skip", v, last, retention)
 		}
 		out := logs.String()
 		if n := strings.Count(out, "took a scheduled etcd snapshot"); n != 10 {
@@ -170,6 +206,9 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 		s.etcdSnap = sc
 		s.mu.Unlock()
 		st := s.collectEtcdStatus(context.Background(), fake)
+		if st.LastScheduledSnapshotError != "" || st.LastScheduledSnapshotSkipped != nil {
+			t.Fatalf("a healthy schedule reports a failure: %+v", st)
+		}
 		if st.SnapshotSchedule != DefaultEtcdSnapshotCron || st.SnapshotRetention != retention ||
 			st.ScheduledSnapshotsKept != retention || !st.LastScheduledSnapshot.Equal(time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC)) {
 			t.Fatalf("status = %+v", st)
@@ -206,6 +245,9 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 			if !strings.Contains(logs.String(), "scheduled etcd snapshot failed; older snapshots are kept") {
 				t.Fatalf("no Warn for the failure:\n%s", logs.String())
 			}
+			if v := sc.snapshotState(); v.lastErr == "" {
+				t.Fatal("the failure is not recorded for status")
+			}
 		})
 	}
 
@@ -229,6 +271,62 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 		}
 		if !strings.Contains(logs.String(), "skipped a scheduled etcd snapshot: not enough free space") {
 			t.Fatalf("no Warn for the skip:\n%s", logs.String())
+		}
+		if v := sc.snapshotState(); v.skipped == nil || v.skipped.Reason != EtcdSnapshotSkipSpace {
+			t.Fatalf("skip recorded as %+v, want reason %q", v.skipped, EtcdSnapshotSkipSpace)
+		}
+	})
+
+	t.Run("a free-space read failure is a skip of its own kind", func(t *testing.T) {
+		sc.space = func(string, uint64) error { return errors.New("statfs /x: input/output error") }
+		n := streams.Load()
+		sc.tick(context.Background())
+		if streams.Load() != n {
+			t.Fatal("a tick that could not read the free space streamed a snapshot")
+		}
+		if v := sc.snapshotState(); v.skipped == nil || v.skipped.Reason != EtcdSnapshotSkipError || !strings.Contains(v.skipped.Detail, "statfs") {
+			t.Fatalf("skip recorded as %+v, want reason %q", v.skipped, EtcdSnapshotSkipError)
+		}
+		if !strings.Contains(logs.String(), "could not read the free space") {
+			t.Fatalf("no Warn naming the statfs failure:\n%s", logs.String())
+		}
+		st := EtcdStatus{}
+		s.mu.Lock()
+		s.etcdSnap = sc
+		s.mu.Unlock()
+		s.fillEtcdSnapshotStatus(&st)
+		if st.LastScheduledSnapshotError == "" || st.LastScheduledSnapshotSkipped == nil {
+			t.Fatalf("status record = %+v, want the error and the skip", st)
+		}
+	})
+
+	t.Run("the next success clears the recorded error and skip", func(t *testing.T) {
+		sc.space = func(string, uint64) error { return nil }
+		sc.tick(context.Background())
+		if v := sc.snapshotState(); v.lastErr != "" || v.skipped != nil {
+			t.Fatalf("state after a success = %+v, want no error or skip", v)
+		}
+	})
+
+	t.Run("a snapshot stamped in the future cannot evict real ones", func(t *testing.T) {
+		before := scheduled()
+		future := filepath.Join(dir, ScheduledEtcdSnapshotName("server-a", clk.Now().Add(10*365*24*time.Hour)))
+		mustWrite(t, future, good)
+		farFuture := clk.Now().Add(10 * 365 * 24 * time.Hour)
+		if err := os.Chtimes(future, farFuture, farFuture); err != nil {
+			t.Fatal(err)
+		}
+		// Twelve hours on, so the new snapshot has a name of its own.
+		later := clk.Now().Add(12 * time.Hour)
+		sc.clock = &fakeClock{now: later}
+		sc.tick(context.Background())
+		got := scheduled()
+		if slices.Contains(got, filepath.Base(future)) {
+			t.Fatalf("the future-stamped snapshot outranked real ones: kept %v", got)
+		}
+		want := []string{ScheduledEtcdSnapshotName("server-a", later), before[0], before[1]}
+		if !slices.Equal(got, want) {
+			t.Fatalf("kept %v, want the new snapshot and the %d newest real ones: %v", got, retention-1, want)
 		}
 	})
 
@@ -298,6 +396,119 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 			t.Fatalf("a snapshot cut short by shutdown should be an Info, not a failure:\n%s", out)
 		}
 	})
+}
+
+// TestEtcdSnapshotScheduleCatchesUpOnce: the loop reads the wall clock rather than
+// trusting one long timer, so a Mac that sleeps (or a clock stepped forward) past one
+// or several cron minutes takes exactly ONE snapshot within a minute of waking,
+// logged as late, and then resumes the schedule. The clock models a sleep: a wait
+// that spans it returns with the wall clock moved by the wait plus the sleep.
+func TestEtcdSnapshotScheduleCatchesUpOnce(t *testing.T) {
+	good := withTrailer(etcdBackendBytes(t, "key", "meta"))
+	cron, err := ParseCron(DefaultEtcdSnapshotCron)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		jump time.Duration // at 06:00 on day one, from midnight
+		want int           // snapshots before the clock reaches the run's end
+	}{
+		{"one cron minute missed", 8 * time.Hour, 1},
+		{"six cron minutes missed", 3 * 24 * time.Hour, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &lockedBuffer{}
+			s := NewSupervised(Config{
+				WorkDir: t.TempDir(),
+				Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP,
+					Snapshots: &EtcdSnapshotSchedule{Cron: cron, Retention: 10}},
+				Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			})
+			start := time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)
+			// After the jump the run ends one hour before the next cron minute, so
+			// every snapshot counted is the catch-up.
+			wake := start.Add(6 * time.Hour).Add(tc.jump)
+			clk := &jumpClock{now: start, jumpAt: start.Add(6 * time.Hour), jump: tc.jump,
+				limit: cron.Next(wake).Add(-time.Hour), reached: make(chan struct{})}
+			s.etcd.clock = clk
+			fake := healthyFake()
+			var streams atomic.Int32
+			fake.snapshot = func() (io.ReadCloser, error) {
+				streams.Add(1)
+				return io.NopCloser(bytes.NewReader(good)), nil
+			}
+			sc := s.newEtcdSnapshotScheduler(fake)
+			sc.loc = time.UTC
+			sc.space = func(string, uint64) error { return nil }
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				sc.run(ctx)
+			}()
+			select {
+			case <-clk.reached:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the schedule never reached the end of the run")
+			}
+			cancel()
+			<-done
+			if got := int(streams.Load()); got != tc.want {
+				t.Fatalf("took %d snapshots across the jump, want %d", got, tc.want)
+			}
+			// On wake, not when a timer armed before the sleep would have fired: a
+			// timer that does not count sleep fires `jump` later than its due time.
+			snaps, err := sc.list(clk.Now())
+			if err != nil || len(snaps) != 1 {
+				t.Fatalf("snapshots on disk = %v (%v), want the one catch-up", snaps, err)
+			}
+			if at := snaps[0].taken; at.Before(wake) || at.After(wake.Add(etcdSnapshotWakeEvery)) {
+				t.Fatalf("the catch-up was taken at %s, want within %s of the wake at %s", at, etcdSnapshotWakeEvery, wake)
+			}
+			out := logs.String()
+			if !strings.Contains(out, "a scheduled etcd snapshot is late") || !strings.Contains(out, "late-by=") {
+				t.Fatalf("the catch-up was not logged as late:\n%s", out)
+			}
+		})
+	}
+}
+
+// jumpClock advances on each wait like fakeClock, and once, when a wait first
+// reaches jumpAt, also jumps forward by jump (a sleep, or a stepped clock). A wait
+// past limit parks and closes reached.
+type jumpClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	jumpAt  time.Time
+	jump    time.Duration
+	jumped  bool
+	limit   time.Time
+	reached chan struct{}
+	once    sync.Once
+}
+
+func (c *jumpClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *jumpClock) After(d time.Duration) <-chan time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	next := c.now.Add(d)
+	if !c.jumped && !next.Before(c.jumpAt) {
+		next, c.jumped = next.Add(c.jump), true
+	}
+	if next.After(c.limit) {
+		c.once.Do(func() { close(c.reached) })
+		return make(chan time.Time)
+	}
+	c.now = next
+	ch := make(chan time.Time, 1)
+	ch <- next
+	return ch
 }
 
 // TestScheduledEtcdSnapshotNames: retention's name test admits only this node's

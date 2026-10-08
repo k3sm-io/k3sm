@@ -699,10 +699,7 @@ func (s *Supervised) collectEtcdStatus(ctx context.Context, m etcdMembers) EtcdS
 		ExpectedPeerURL: etcdPeerURL(s.cfg.Etcd.PeerIP, s.cfg.Etcd.PeerPort),
 		PID:             pid,
 	}
-	if sched, retention, last, kept := s.etcdSnapshotSummary(); sched != "" {
-		st.SnapshotSchedule, st.SnapshotRetention = sched, retention
-		st.LastScheduledSnapshot, st.ScheduledSnapshotsKept = last, kept
-	}
+	s.fillEtcdSnapshotStatus(&st)
 	local, err := m.Status(ctx)
 	if err == nil {
 		st.MemberID = local.MemberID
@@ -866,6 +863,11 @@ type EtcdStatus struct {
 	// taken (zero: none yet), and ScheduledSnapshotsKept how many are on disk.
 	LastScheduledSnapshot  time.Time `json:"lastScheduledSnapshot,omitzero"`
 	ScheduledSnapshotsKept int       `json:"scheduledSnapshotsKept,omitempty"`
+	// LastScheduledSnapshotError is the last scheduled snapshot's failure and
+	// LastScheduledSnapshotSkipped the last tick skipped before it streamed (no
+	// room, or the free space could not be read); the next success clears both.
+	LastScheduledSnapshotError   string            `json:"lastScheduledSnapshotError,omitempty"`
+	LastScheduledSnapshotSkipped *EtcdSnapshotSkip `json:"lastScheduledSnapshotSkipped,omitempty"`
 }
 
 // etcdStatusName is the status record's basename. It lives beside the data dir, not
