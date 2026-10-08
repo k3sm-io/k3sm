@@ -122,14 +122,63 @@ func TestEtcdBuildEnvNoCgoOutOfModule(t *testing.T) {
 	})
 }
 
+// TestEtcdutlBuiltFromTheWrapper: etcdutl is staged under the stagedChild protocol
+// from the SAME materialized wrapper, building upstream's etcdutl main package (the
+// module's tool) with the etcd build's argv, and gets its own marker.
+func TestEtcdutlBuiltFromTheWrapper(t *testing.T) {
+	cache := t.TempDir()
+	origCache, origBuild := kineModuleCacheDir, runEtcdBuild
+	t.Cleanup(func() { kineModuleCacheDir, runEtcdBuild = origCache, origBuild })
+	kineModuleCacheDir = func(context.Context) (string, error) { return cache, nil }
+	var got *exec.Cmd
+	runEtcdBuild = func(cmd *exec.Cmd) ([]byte, error) {
+		got = cmd
+		if b, err := os.ReadFile(filepath.Join(cmd.Dir, "go.mod")); err != nil || string(b) != string(etcdchild.GoMod) {
+			t.Errorf("the build dir does not hold the embedded wrapper go.mod (%v)", err)
+		}
+		out := cmd.Args[slices.Index(cmd.Args, "-o")+1]
+		return nil, os.WriteFile(out, []byte("pretend-etcdutl"), 0o755)
+	}
+	bd := t.TempDir()
+	if err := ensureEtcdutlInto(t.Context(), bd, DefaultEtcdVersion); err != nil {
+		t.Fatalf("ensureEtcdutlInto = %v", err)
+	}
+	if got == nil || got.Args[len(got.Args)-1] != etcdutlPackage || !slices.Contains(got.Args, "-mod=readonly") {
+		t.Fatalf("build argv = %v, want `go build ... -mod=readonly -o <bin> %s`", got, etcdutlPackage)
+	}
+	if v, _ := envLast(got.Env, "GOWORK"); v != "off" {
+		t.Errorf("GOWORK = %q, want off", v)
+	}
+	if b, err := os.ReadFile(filepath.Join(bd, EtcdutlMarkerName)); err != nil || string(b) != DefaultEtcdVersion+" nocgo\n" {
+		t.Errorf("etcdutl marker = %q (%v)", b, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(bd, etcdutlBinaryName)); string(b) != "pretend-etcdutl" {
+		t.Errorf("staged etcdutl = %q, want the built bytes", b)
+	}
+	if err := ensureEtcdutlInto(t.Context(), t.TempDir(), "v3.7.0"); !errors.Is(err, ErrEtcdVersionUnpinned) {
+		t.Errorf("ensureEtcdutlInto(v3.7.0) = %v, want ErrEtcdVersionUnpinned", err)
+	}
+}
+
 // TestDefaultEtcdVersionMatchesWrapper keeps the Go pin and the embedded wrapper in
 // lockstep: a DefaultEtcdVersion bump without a regenerated wrapper (or the reverse)
-// would build one version and stamp the marker with another.
+// would build one version and stamp the marker with another. Both programs the
+// wrapper builds, the etcd server and the etcdutl that restores its snapshots, must
+// sit at that one pin, and etcdutl must be the module's declared tool (the only way
+// it is built from the server's own module graph).
 func TestDefaultEtcdVersionMatchesWrapper(t *testing.T) {
 	mod := string(etcdchild.GoMod)
-	req := regexp.MustCompile(`(?m)^\s*(?:require\s+)?go\.etcd\.io/etcd/server/v3 (\S+)\s*$`).FindAllStringSubmatch(mod, -1)
-	if len(req) != 1 || req[0][1] != DefaultEtcdVersion {
-		t.Errorf("go.mod.txt requires go.etcd.io/etcd/server/v3 at %v, want exactly %s once", req, DefaultEtcdVersion)
+	for _, m := range []string{"go.etcd.io/etcd/server/v3", etcdutlPackage} {
+		req := regexp.MustCompile(`(?m)^\s*(?:require\s+)?`+regexp.QuoteMeta(m)+` (\S+)(?:\s*// indirect)?\s*$`).FindAllStringSubmatch(mod, -1)
+		if len(req) != 1 || req[0][1] != DefaultEtcdVersion {
+			t.Errorf("go.mod.txt requires %s at %v, want exactly %s once", m, req, DefaultEtcdVersion)
+		}
+	}
+	if !regexp.MustCompile(`(?m)^tool ` + regexp.QuoteMeta(etcdutlPackage) + `$`).MatchString(mod) {
+		t.Errorf("go.mod.txt does not declare `tool %s`", etcdutlPackage)
+	}
+	if etcdChild(DefaultEtcdVersion).markerContent() != etcdutlChild(DefaultEtcdVersion).markerContent() {
+		t.Error("the etcd and etcdutl markers vouch for different (version, variant) pairs")
 	}
 	if !regexp.MustCompile(`(?m)^module k3sm\.io/etcd-child$`).MatchString(mod) {
 		t.Error("go.mod.txt does not declare module k3sm.io/etcd-child")
@@ -147,6 +196,8 @@ func TestDefaultEtcdVersionMatchesWrapper(t *testing.T) {
 	for _, want := range []string{
 		"go.etcd.io/etcd/server/v3 " + DefaultEtcdVersion + " h1:",
 		"go.etcd.io/etcd/server/v3 " + DefaultEtcdVersion + "/go.mod h1:",
+		etcdutlPackage + " " + DefaultEtcdVersion + " h1:",
+		etcdutlPackage + " " + DefaultEtcdVersion + "/go.mod h1:",
 	} {
 		if !strings.Contains(sum, want) {
 			t.Errorf("go.sum.txt has no %q line", want)

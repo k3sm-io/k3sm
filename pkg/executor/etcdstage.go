@@ -28,7 +28,9 @@ import (
 )
 
 // etcd staging constants. etcd is the second stagedChild: built from source at a pin,
-// staged beside a version marker, exactly like kine.
+// staged beside a version marker, exactly like kine. etcdutl is the third: the
+// offline tool `k3sm snapshot restore` runs, built from the SAME wrapper module, so
+// it links exactly the etcd modules the server does.
 const (
 	// etcdBinaryName is the staged etcd server binary's basename.
 	etcdBinaryName = "etcd"
@@ -36,6 +38,15 @@ const (
 	// etcd binary. Exported so the packaging/install paths name the one file the
 	// staging contract depends on rather than re-typing the string.
 	EtcdMarkerName = "etcd.version"
+	// etcdutlBinaryName is the staged etcdutl binary's basename.
+	etcdutlBinaryName = "etcdutl"
+	// EtcdutlMarkerName is the version marker written beside a staged etcdutl.
+	EtcdutlMarkerName = "etcdutl.version"
+	// etcdServerPackage and etcdutlPackage are what the wrapper builds: its own main
+	// (upstream's server/main.go) and upstream's etcdutl main, a `tool` of the
+	// wrapper module.
+	etcdServerPackage = "."
+	etcdutlPackage    = "go.etcd.io/etcd/etcdutl/v3"
 	// etcdBuildVariant records HOW the binary was built: CGO_ENABLED=0. etcd needs no
 	// cgo, and a cgo build would pull a C toolchain into the release stage.
 	etcdBuildVariant = "nocgo"
@@ -67,18 +78,44 @@ func etcdChild(version string) stagedChild {
 		version: version,
 		variant: etcdBuildVariant,
 		build: func(ctx context.Context, scratch string) (string, error) {
-			return buildEtcd(ctx, version, scratch)
+			return buildEtcdWrapper(ctx, version, scratch, etcdServerPackage, etcdBinaryName)
 		},
 	}
 }
 
-// buildEtcd materializes the embedded wrapper module under scratch and builds it.
+// etcdutlChild is etcdutl's stagedChild declaration at the given pin: the same
+// wrapper module, the same variant, its own binary and marker.
+func etcdutlChild(version string) stagedChild {
+	return stagedChild{
+		name:    etcdutlBinaryName,
+		marker:  EtcdutlMarkerName,
+		version: version,
+		variant: etcdBuildVariant,
+		build: func(ctx context.Context, scratch string) (string, error) {
+			return buildEtcdWrapper(ctx, version, scratch, etcdutlPackage, etcdutlBinaryName)
+		},
+	}
+}
+
+// ensureEtcdutlInto stages the pinned etcdutl into bd. Like ensureEtcdInto, a version
+// other than DefaultEtcdVersion is refused before anything is touched.
+func ensureEtcdutlInto(ctx context.Context, bd, version string) error {
+	if version != DefaultEtcdVersion {
+		return fmt.Errorf("stage etcdutl %s: %w (%s)", version, ErrEtcdVersionUnpinned, DefaultEtcdVersion)
+	}
+	return etcdutlChild(version).ensureInto(ctx, bd)
+}
+
+// buildEtcdWrapper materializes the embedded wrapper module under scratch and builds
+// pkg from it into scratch/out.
 //
 // `go install go.etcd.io/etcd/server/v3@<pin>` is not an option: upstream's
 // server/go.mod carries monorepo-relative replace directives, which `go install
 // pkg@version` refuses. The wrapper requires the server module at the pin and its
-// main is upstream's own server/main.go, so the binary is the same etcd server.
-func buildEtcd(ctx context.Context, version, scratch string) (string, error) {
+// main is upstream's own server/main.go, so the binary is the same etcd server; it
+// declares etcdutl as a tool, so etcdutl is built from the same module graph and
+// cannot drift to another etcd version.
+func buildEtcdWrapper(ctx context.Context, version, scratch, pkg, out string) (string, error) {
 	src := filepath.Join(scratch, "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		return "", fmt.Errorf("etcd wrapper dir: %w", err)
@@ -98,22 +135,23 @@ func buildEtcd(ctx context.Context, version, scratch string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	out := filepath.Join(scratch, etcdBinaryName)
-	cmd := exec.CommandContext(ctx, "go", etcdBuildArgs(out)...)
+	bin := filepath.Join(scratch, out)
+	cmd := exec.CommandContext(ctx, "go", etcdBuildArgs(bin, pkg)...)
 	cmd.Dir = src
 	cmd.Env = etcdBuildEnv(scratch, modCache)
 	if combined, err := runEtcdBuild(cmd); err != nil {
-		return "", fmt.Errorf("build etcd %s (CGO_ENABLED=0): %w (a packaged install has no Go toolchain — re-run `sudo k3sm install` so the staged payload carries this pin): %s",
-			version, err, combined)
+		return "", fmt.Errorf("build %s %s (CGO_ENABLED=0): %w (a packaged install has no Go toolchain — re-run `sudo k3sm install` so the staged payload carries this pin): %s",
+			out, version, err, combined)
 	}
-	return out, nil
+	return bin, nil
 }
 
-// etcdBuildArgs is the `go build` argv for the wrapper. -trimpath and -buildvcs=false
-// keep host paths and the (absent) VCS state out of the binary; -mod=readonly makes
-// the committed go.sum the only acceptable source of module hashes.
-func etcdBuildArgs(out string) []string {
-	return []string{"build", "-trimpath", "-buildvcs=false", "-mod=readonly", "-o", out, "."}
+// etcdBuildArgs is the `go build` argv for one of the wrapper's programs. -trimpath
+// and -buildvcs=false keep host paths and the (absent) VCS state out of the binary;
+// -mod=readonly makes the committed go.sum the only acceptable source of module
+// hashes.
+func etcdBuildArgs(out, pkg string) []string {
+	return []string{"build", "-trimpath", "-buildvcs=false", "-mod=readonly", "-o", out, pkg}
 }
 
 // etcdBuildEnv is kineBuildEnv's environment (CGO_ENABLED=0, GOWORK=off, GOBIN
