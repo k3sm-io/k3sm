@@ -163,8 +163,11 @@ as `leaseAgeSeconds` and `statusAgeSeconds` when known.
 
 The `etcd` row's `wide` carries the scheduled etcd snapshots: `snapshot-schedule` (the cron
 expression, or `off`), and when a schedule is set, `last-scheduled-snapshot` (RFC 3339, or
-`none yet`) and `scheduled-snapshots-kept` (`<kept> of <retention>`). Like every `wide` key, these
-are informational and not part of the contract.
+`none yet`) and `scheduled-snapshots-kept` (`<kept> of <retention>`). Until the next successful
+snapshot it also carries `last-scheduled-snapshot-error` (the last failure) and
+`last-scheduled-snapshot-skipped` (when a snapshot was skipped and why: not enough free space, or
+the free space could not be read). Like every `wide` key, these are informational and not part of
+the contract.
 
 ## Rows
 
