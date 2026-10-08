@@ -210,7 +210,15 @@ func snapshotEtcd(ctx context.Context, workDir, dst string, dial func(context.Co
 		return err
 	}
 	defer func() { _ = admin.Close() }()
-	rc, err := admin.Snapshot(ctx)
+	return saveEtcdSnapshot(ctx, admin, dst)
+}
+
+// saveEtcdSnapshot streams the member's snapshot to dst through
+// writeVerifiedEtcdSnapshot. It is the one save path: `k3sm snapshot save` and the
+// scheduled snapshots both write through it, so both get the same verification and
+// the same 0600 file.
+func saveEtcdSnapshot(ctx context.Context, m etcdMembers, dst string) error {
+	rc, err := m.Snapshot(ctx)
 	if err != nil {
 		return fmt.Errorf("stream the etcd snapshot: %w", err)
 	}

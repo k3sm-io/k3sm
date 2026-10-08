@@ -289,7 +289,7 @@ func (s *Supervised) startEtcd(ctx context.Context, memberExists bool, extra fun
 //     and, if so, run the promote loop (no expiry);
 //  4. wait for quorum (no expiry, outside every bring-up deadline);
 //  5. the post-quorum checks (local defragment, peer-URL drift, even quorum);
-//  6. start the background watcher.
+//  6. start the background watcher, then the snapshot schedule when one is set.
 func (s *Supervised) bringUpEtcdMember(ctx context.Context) error {
 	memberExists := EtcdMemberExists(s.cfg.WorkDir)
 	etcd, err := s.startEtcd(ctx, memberExists, nil)
@@ -312,8 +312,20 @@ func (s *Supervised) bringUpEtcdMember(ctx context.Context) error {
 	if err := s.promoteAndAwaitQuorum(ctx, admin, etcd); err != nil {
 		return bringUpErr(etcd.name, PhaseBringUp, err)
 	}
+	var sched *etcdSnapshotScheduler
+	if s.cfg.Etcd.Snapshots != nil {
+		// Built before the post-quorum status write, so the first record already
+		// reports the snapshots a previous run of this server kept.
+		sched = s.newEtcdSnapshotScheduler(admin)
+		s.mu.Lock()
+		s.etcdSnap = sched
+		s.mu.Unlock()
+	}
 	s.afterEtcdQuorum(ctx, admin)
 	s.startEtcdWatcher(ctx, admin)
+	if sched != nil {
+		s.startEtcdSnapshotSchedule(ctx, sched)
+	}
 	return nil
 }
 
@@ -687,6 +699,7 @@ func (s *Supervised) collectEtcdStatus(ctx context.Context, m etcdMembers) EtcdS
 		ExpectedPeerURL: etcdPeerURL(s.cfg.Etcd.PeerIP, s.cfg.Etcd.PeerPort),
 		PID:             pid,
 	}
+	s.fillEtcdSnapshotStatus(&st)
 	local, err := m.Status(ctx)
 	if err == nil {
 		st.MemberID = local.MemberID
@@ -842,6 +855,19 @@ type EtcdStatus struct {
 	// a restore (a Mac reinstalled at a server's address, say): a warning, never a
 	// reason to stop.
 	ForeignPeer string `json:"foreignPeer,omitempty"`
+	// SnapshotSchedule is the scheduled-snapshot cron expression and
+	// SnapshotRetention how many are kept; both empty when the schedule is off.
+	SnapshotSchedule  string `json:"snapshotSchedule,omitempty"`
+	SnapshotRetention int    `json:"snapshotRetention,omitempty"`
+	// LastScheduledSnapshot is when this server's newest scheduled snapshot was
+	// taken (zero: none yet), and ScheduledSnapshotsKept how many are on disk.
+	LastScheduledSnapshot  time.Time `json:"lastScheduledSnapshot,omitzero"`
+	ScheduledSnapshotsKept int       `json:"scheduledSnapshotsKept,omitempty"`
+	// LastScheduledSnapshotError is the last scheduled snapshot's failure and
+	// LastScheduledSnapshotSkipped the last tick skipped before it streamed (no
+	// room, or the free space could not be read); the next success clears both.
+	LastScheduledSnapshotError   string            `json:"lastScheduledSnapshotError,omitempty"`
+	LastScheduledSnapshotSkipped *EtcdSnapshotSkip `json:"lastScheduledSnapshotSkipped,omitempty"`
 }
 
 // etcdStatusName is the status record's basename. It lives beside the data dir, not

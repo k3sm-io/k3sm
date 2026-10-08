@@ -12,7 +12,8 @@ local-path directories on each node (see [Storage](storage.md)) and must be back
 
 Three things back it up. **`k3sm snapshot save`** (below) runs on your own schedule. k3sm takes an
 automatic pre-upgrade backup when a release changes the datastore engine. The file-level procedure
-further down is the fallback for a node where the binary will not run.
+further down is the fallback for a node where the binary will not run. An HA server also takes
+[scheduled etcd snapshots](#scheduled-etcd-snapshots) on its own.
 
 If the cluster was installed with secrets encryption, back up `/var/lib/k3sm/server/cred` with
 every backup and snapshot: neither contains the key, and without it the Secrets are unreadable. See
@@ -65,6 +66,70 @@ The restore is built to be survivable when it goes wrong:
 
 Restoring onto a node with no datastore at all (a rebuilt Mac) is supported, and is what the drill
 is for.
+
+## Scheduled etcd Snapshots
+
+A server installed with `--cluster-init` or `--server-join` snapshots its etcd member on a schedule,
+the way k3s does. Three flags control it, on both `k3sm install` and `k3sm server`, with the k3s
+names and defaults:
+
+| flag | default | meaning |
+|---|---|---|
+| `--etcd-snapshot-schedule-cron` | `0 */12 * * *` | when to take a snapshot: a five-field cron expression (minute, hour, day of month, month, day of week) in the server's local time; the default is midnight and noon |
+| `--etcd-snapshot-retention` | `5` | how many of this server's scheduled snapshots to keep |
+| `--etcd-disable-snapshots` | `false` | take no scheduled snapshots |
+
+```sh
+sudo k3sm install --cluster-init --node-ip 192.0.2.10 \
+  --etcd-snapshot-schedule-cron '0 */6 * * *' --etcd-snapshot-retention 8
+```
+
+`k3sm install` writes the flags you pass into the server's recorded arguments, so a later
+reinstall keeps them; passing one again replaces the recorded value. The cron fields accept `*`,
+numbers, ranges (`1-5`), steps (`*/6`, `0-12/3`) and comma lists; names such as `MON` and shortcuts
+such as `@daily` are not accepted, and an expression that never fires is refused at start. When
+both day fields are set, a day matching either one fires, except that a day field starting with
+`*` (`*/2` included) counts as unset, as in Vixie cron.
+
+What the schedule does:
+
+- **Every server snapshots its own member**, into its own `<work-dir>/db/snapshots`
+  (`/var/lib/k3sm/server/db/snapshots` on an installed server, made `0700` when the schedule
+  starts). A three-server cluster keeps three sets. Nothing is copied between servers or off the
+  node.
+- A Mac that was asleep at a scheduled time takes **one** snapshot within a minute of waking, and
+  logs that it was late and by how much. Several missed times still give one snapshot, not one
+  each.
+- A scheduled snapshot is named `etcd-snapshot-<node>-<unix seconds>`, the k3s name. It goes
+  through the same path as `k3sm snapshot save`: streamed from the running member, checked against
+  etcd's SHA-256 hash and opened read-only before it takes its name, and written `0600`.
+- **Retention** keeps the newest `--etcd-snapshot-retention` scheduled snapshots of this server and
+  deletes older ones. It runs only after a new snapshot was written and checked, so a failing
+  schedule never deletes the snapshots it already has. It never deletes a snapshot taken with
+  `k3sm snapshot save` (those are named `k3sm-etcd-snapshot-<UTC>.db`) or one named for another
+  node. Snapshots are ordered by the earlier of the time in the name and the file's modification
+  time, and one dated in the future (taken while the clock was wrong) counts as the oldest. If you
+  rename a server, its snapshots under the old name are left for you to remove.
+- When the schedule starts it removes the partial `.tmp` files an interrupted snapshot of this
+  server left behind, and nothing else.
+- A snapshot is **skipped** when the snapshot directory's volume has less than twice the last
+  snapshot's size free, so the schedule does not fill the disk the datastore lives on.
+- Each snapshot taken and each one removed is an `INFO` line in the server log; a failed or skipped
+  snapshot is a `WARN` line. `k3sm status -o wide` shows, on the `etcd` row, the schedule, when the
+  newest scheduled snapshot was taken, how many are kept, and, until the next snapshot succeeds,
+  the last failure and the last skip (no room, or the free space could not be read).
+
+**A snapshot holds every Secret in plaintext**, including service-account tokens and any credential
+stored in the cluster. With the defaults, every server therefore keeps up to five plaintext copies
+of every Secret on its own disk, one per retained snapshot; `--etcd-disable-snapshots` turns the
+schedule, and those copies, off. The files are `0600` and owned by the service user; keep any copy
+you make just as private, and do not put them on shared storage.
+
+Like a manual snapshot, a scheduled one lives on the same volume as the cluster it protects, and
+does not contain PersistentVolume data. Copy the snapshots you want to keep off the node. On a
+single-server control plane (no `--cluster-init` or `--server-join`) the flags are accepted and
+ignored with one log line, as in k3s, which takes no scheduled snapshot of a SQLite datastore; use
+`k3sm snapshot save` there.
 
 ## Restoring an HA Server (Embedded etcd)
 

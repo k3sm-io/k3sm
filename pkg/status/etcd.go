@@ -183,6 +183,7 @@ func etcdRowFrom(st executor.EtcdStatus, p99 *float64, now time.Time) Row {
 	if !st.UpdatedAt.IsZero() {
 		row.Wide["recorded"] = st.UpdatedAt.UTC().Format(time.RFC3339)
 	}
+	addEtcdSnapshotWide(row.Wide, st)
 	sev, detail, remedy := EtcdHealth(st)
 	if p99 == nil {
 		p99 = st.WALFsyncP99Seconds
@@ -211,6 +212,39 @@ func etcdRowFrom(st executor.EtcdStatus, p99 *float64, now time.Time) Row {
 	}
 	row.Severity, row.Detail, row.Remedy = sev, detail, remedy
 	return row
+}
+
+// addEtcdSnapshotWide adds the scheduled-snapshot view: the schedule, when the
+// newest scheduled snapshot was taken, how many are kept of how many the retention
+// allows, and, until the next success, the last failure and the last skipped tick
+// (no room, or the free space could not be read). A record with no schedule says
+// the schedule is off.
+func addEtcdSnapshotWide(wide map[string]string, st executor.EtcdStatus) {
+	if st.SnapshotSchedule == "" {
+		wide["snapshot-schedule"] = "off"
+		return
+	}
+	wide["snapshot-schedule"] = st.SnapshotSchedule
+	wide["scheduled-snapshots-kept"] = fmt.Sprintf("%d of %d", st.ScheduledSnapshotsKept, st.SnapshotRetention)
+	if st.LastScheduledSnapshot.IsZero() {
+		wide["last-scheduled-snapshot"] = "none yet"
+	} else {
+		wide["last-scheduled-snapshot"] = st.LastScheduledSnapshot.UTC().Format(time.RFC3339)
+	}
+	if st.LastScheduledSnapshotError != "" {
+		wide["last-scheduled-snapshot-error"] = st.LastScheduledSnapshotError
+	}
+	if sk := st.LastScheduledSnapshotSkipped; sk != nil {
+		why := "not enough free space"
+		if sk.Reason == executor.EtcdSnapshotSkipError {
+			why = "could not read the free space"
+		}
+		v := sk.At.UTC().Format(time.RFC3339) + " " + why
+		if sk.Detail != "" {
+			v += ": " + sk.Detail
+		}
+		wide["last-scheduled-snapshot-skipped"] = v
+	}
 }
 
 // etcdRow reports this server's etcd member, or false when this is not an etcd

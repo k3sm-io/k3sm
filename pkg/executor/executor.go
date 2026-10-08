@@ -265,6 +265,10 @@ type EtcdConfig struct {
 	// is logged and is never a crash). A learner with a nil Promote cannot leave that
 	// state on its own: bring-up logs the remedy at ERROR and keeps waiting.
 	Promote func(ctx context.Context) error
+	// Snapshots is the scheduled-snapshot configuration: a snapshot of this member
+	// on Snapshots.Cron into SnapshotDir, keeping the newest Snapshots.Retention.
+	// Nil takes none (`k3sm server --etcd-disable-snapshots`).
+	Snapshots *EtcdSnapshotSchedule
 }
 
 // Pinned defaults — the versions VALIDATED by the bring-up spike.
@@ -448,6 +452,9 @@ func (e *EtcdConfig) validate() error {
 	ip := net.ParseIP(e.PeerIP)
 	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
 		return fmt.Errorf("%w: got %q", ErrEtcdNeedsNodeIP, e.PeerIP)
+	}
+	if e.Snapshots != nil {
+		return e.Snapshots.validate()
 	}
 	return nil
 }
