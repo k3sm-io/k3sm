@@ -1092,3 +1092,66 @@ func TestEtcdPostureHoldsWorkDirLock(t *testing.T) {
 		t.Errorf("the kine posture created a lock file (%v)", err)
 	}
 }
+
+// TestEtcdSupersededMemberRefused: a member whose registered peer answers with a
+// different cluster ID belongs to a cluster restored elsewhere. Bring-up says so and
+// stops, whether its quorum wait is stuck (one stale member) or already satisfied
+// (two stale members electing a leader between them), and records the status row's
+// signal. An unreachable peer or the same cluster ID proves nothing.
+func TestEtcdSupersededMemberRefused(t *testing.T) {
+	const peerB = "https://192.0.2.11:2380"
+	stale := func(leader uint64) *fakeEtcd {
+		return &fakeEtcd{
+			status: etcdMemberStatus{MemberID: testOwnID, ClusterID: 0x1, Leader: leader},
+			members: []etcdMember{
+				{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}},
+				{ID: 0xb, Name: "server-b", PeerURLs: []string{peerB}},
+			},
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		leader    uint64
+		peerID    uint64
+		peerErr   error
+		wantRefus bool
+	}{
+		{"no quorum, the peer was restored", 0, 0x2, nil, true},
+		{"quorum among stale members, the peer was restored", 0xb, 0x2, nil, true},
+		{"quorum, the peer is in this cluster", 0xb, 0x1, nil, false},
+		{"quorum, the peer is unreachable", 0xb, 0, errors.New("connection refused"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := stale(tc.leader)
+			s, _, _ := etcdTestSupervised(t, EtcdInit, fake, newFakeClock(time.Hour))
+			var asked []string
+			s.etcd.peerClusterID = func(_ context.Context, _ string, peerURL string) (uint64, error) {
+				asked = append(asked, peerURL)
+				return tc.peerID, tc.peerErr
+			}
+			c := &component{name: etcdComponent, exited: make(chan struct{})}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			err := s.promoteAndAwaitQuorum(ctx, fake, c)
+			if !slices.Contains(asked, peerB) {
+				t.Fatalf("asked peers %v, want %s (never itself)", asked, peerB)
+			}
+			if slices.Contains(asked, testOwnPeer) {
+				t.Errorf("the member asked itself for its cluster ID")
+			}
+			if !tc.wantRefus {
+				if err != nil {
+					t.Fatalf("promoteAndAwaitQuorum = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrEtcdMemberSuperseded) || !strings.Contains(err.Error(), "wipe <work-dir>/etcd") {
+				t.Fatalf("promoteAndAwaitQuorum = %v, want ErrEtcdMemberSuperseded naming the remedy", err)
+			}
+			st, rerr := ReadEtcdStatus(s.cfg.WorkDir)
+			if rerr != nil || !st.Superseded || !strings.Contains(st.SupersededDetail, "reports cluster 2") {
+				t.Errorf("status record = %+v (%v), want Superseded with the peer's cluster", st, rerr)
+			}
+		})
+	}
+}

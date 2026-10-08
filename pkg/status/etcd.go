@@ -152,6 +152,11 @@ func EtcdHealth(st executor.EtcdStatus) (severity Severity, detail, remedy strin
 	detail = strings.Join(parts, ", ")
 
 	switch {
+	case st.Superseded:
+		// Ahead of everything: this member's view of its own cluster is the
+		// replaced cluster's, so every other figure here describes data that no
+		// longer counts.
+		return SeverityFail, executor.EtcdMemberSupersededMessage + " (" + st.SupersededDetail + ")", executor.EtcdMemberSupersededRemedy
 	case slices.Contains(st.Alarms, "NOSPACE"):
 		return SeverityFail, detail + "; the cluster is read-only (NOSPACE)", EtcdNoSpaceRemedy
 	case len(st.Alarms) > 0:

@@ -297,8 +297,8 @@ func TestEtcdSnapshotSaveVerifies(t *testing.T) {
 	})
 }
 
-// TestRestoreRefusesEtcdMember: snapshot restore is refused on an etcd member before
-// anything is read or moved.
+// TestRestoreRefusesEtcdMember: the kine restore is refused on an etcd member before
+// anything is read or moved (the etcd restore is RestoreEtcdSnapshot).
 func TestRestoreRefusesEtcdMember(t *testing.T) {
 	wd := t.TempDir()
 	if err := os.MkdirAll(etcdMemberDir(wd), 0o700); err != nil {
@@ -309,8 +309,8 @@ func TestRestoreRefusesEtcdMember(t *testing.T) {
 		return "", nil
 	}
 	_, err := RestoreSnapshot(t.Context(), SnapshotRestoreOptions{WorkDir: wd, Snapshot: filepath.Join(wd, "absent.db"), Running: probe})
-	if !errors.Is(err, ErrEtcdRestoreUnsupported) {
-		t.Fatalf("restore on an etcd member = %v, want ErrEtcdRestoreUnsupported", err)
+	if !errors.Is(err, ErrSnapshotEtcdMember) {
+		t.Fatalf("kine restore on an etcd member = %v, want ErrSnapshotEtcdMember", err)
 	}
 	if _, err := os.Stat(dbDir(wd)); !os.IsNotExist(err) {
 		t.Error("the refusal touched the datastore dir")

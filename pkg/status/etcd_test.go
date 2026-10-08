@@ -110,6 +110,11 @@ func TestEtcdRowStates(t *testing.T) {
 			detail: []string{"nearing the backend quota"}, remedyIn: []string{"compact"}},
 		{name: "stale record", edit: func(s *executor.EtcdStatus) { s.UpdatedAt = now.Add(-20 * time.Minute) }, sev: SeverityUnknown, state: StateUnknown,
 			detail: []string{"not refreshing it"}},
+		{name: "superseded by a restore elsewhere", edit: func(s *executor.EtcdStatus) {
+			s.LeaderPresent = false
+			s.Superseded, s.SupersededDetail = true, "peer etcd-a at https://192.0.2.10:2380 reports cluster 2; this member's cluster is 1"
+		}, sev: SeverityFail, state: StateUnhealthy,
+			detail: []string{"belongs to a cluster that was reset or restored", "reports cluster 2"}, remedyIn: []string{"wipe <work-dir>/etcd", "re-join"}},
 		{name: "stale but leaderless is still a failure", edit: func(s *executor.EtcdStatus) {
 			s.UpdatedAt, s.LeaderPresent = now.Add(-20*time.Minute), false
 		}, sev: SeverityFail, state: StateUnhealthy, detail: []string{"NO LEADER"}},

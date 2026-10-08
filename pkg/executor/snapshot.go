@@ -53,9 +53,10 @@ import (
 // depend on the drain.
 //
 // Scope: the single-node kine→SQLite datastore only. An etcd member is saved by
-// SnapshotEtcd (etcdreset.go): SaveSnapshot refuses it (ErrSnapshotEtcdMember) rather
-// than copy a state.db that is not the cluster's state, and restore refuses it
-// (ErrEtcdRestoreUnsupported).
+// SnapshotEtcd (etcdreset.go) and restored by RestoreEtcdSnapshot (etcdrestore.go):
+// SaveSnapshot and RestoreSnapshot refuse it (ErrSnapshotEtcdMember) rather than copy
+// or replace a state.db that is not the cluster's state, and RestoreSnapshot refuses
+// an etcd snapshot file (ErrEtcdSnapshotForKine).
 
 // Snapshot failures. Each is a typed sentinel (errors.Is-comparable) so the CLI can turn
 // it into an actionable message and a non-zero exit without string matching.
@@ -246,10 +247,7 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 		return nil, errors.New("executor: snapshot restore requires a snapshot to restore")
 	}
 	// An etcd member's state is not a state.db; restoring one over it would be
-	// neither its data nor a working cluster.
-	if EtcdMemberExists(opts.WorkDir) {
-		return nil, ErrEtcdRestoreUnsupported
-	}
+	// neither its data nor a working cluster. RestoreEtcdSnapshot restores a member.
 	if err := requireLocalDatastore(opts.WorkDir); err != nil {
 		return nil, err
 	}
@@ -270,6 +268,11 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 	}
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%w: %s is not a regular file", ErrSnapshotNotFound, opts.Snapshot)
+	}
+	// The posture preflight shared with the etcd restore: an etcd snapshot is never
+	// handed to SQLite, whose integrity_check would only say "not a database".
+	if err := refuseEtcdSnapshotForKine(opts.Snapshot); err != nil {
+		return nil, err
 	}
 	// VERIFY FIRST — before the datastore is touched. A restore that discovers the
 	// snapshot is corrupt only after moving the live database aside has destroyed the

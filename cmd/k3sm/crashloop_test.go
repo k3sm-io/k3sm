@@ -77,6 +77,24 @@ func TestPermanentBringUpFailureParksImmediately(t *testing.T) {
 	}
 }
 
+// TestSupersededEtcdMemberParksImmediately: a member whose cluster was restored on
+// another server finds the same data dir on every restart, so its bring-up refusal
+// parks on the first failure and names the wipe-and-re-join remedy.
+func TestSupersededEtcdMemberParksImmediately(t *testing.T) {
+	dir := t.TempDir()
+	err := &executor.BringUpError{Component: "etcd", Phase: executor.PhaseBringUp,
+		Err: fmt.Errorf("%w: peer etcd-a reports cluster 2", executor.ErrEtcdMemberSuperseded)}
+	noteBringUpFailure(newCrashBreaker(dir, quietLogger()), quietLogger(), err)
+	rec, rerr := executor.ReadCrashRecord(executor.CrashLoopPath(dir))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	last, _ := rec.Last()
+	if !rec.Tripped() || !last.Permanent || last.Remedy != executor.EtcdMemberSupersededRemedy {
+		t.Fatalf("record tripped=%v last=%+v, want a permanent entry naming the superseded remedy", rec.Tripped(), last)
+	}
+}
+
 // TestEtcdDeathRecordedOnce: one etcd death during its promotion or quorum wait is
 // ONE crash record. The member is supervised before those waits, so the exit
 // callback records the death (breaker.record, the OnComponentExit path) and the

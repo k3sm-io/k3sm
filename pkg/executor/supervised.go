@@ -266,6 +266,8 @@ type Supervised struct {
 	etcdAdmin     etcdAdmin
 	etcdWatchStop context.CancelFunc
 	etcdWatchDone chan struct{}
+	// etcdPID is the running etcd child's pid, for the status record.
+	etcdPID int
 	// unlockWorkDir releases the work-dir lock the etcd posture holds from Start
 	// until Stop has reaped every child (see lockWorkDir). Guarded by mu.
 	unlockWorkDir func() error

@@ -158,6 +158,16 @@ func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 			"component", component, "err", err)
 		return
 	}
+	if errors.Is(err, executor.ErrEtcdMemberSuperseded) {
+		// Every restart finds the same data dir, so this cannot heal on retry.
+		logger.Error("the control plane did not come up: "+executor.EtcdMemberSupersededMessage+"; parking on this failure",
+			"component", component, "err", err, "remedy", executor.EtcdMemberSupersededRemedy)
+		if b.recordBringUpPermanent(component, err.Error(), executor.EtcdMemberSupersededRemedy) {
+			logger.Error("crash-loop breaker tripped on a permanent fault; the next start will park until an operator clears the record",
+				"path", b.path)
+		}
+		return
+	}
 	if errors.Is(err, executor.ErrNoGoToolchain) {
 		logger.Error("the control plane did not come up with a fault that cannot heal on retry; parking on this failure",
 			"component", component, "err", err, "remedy", executor.NoGoToolchainRemedy)

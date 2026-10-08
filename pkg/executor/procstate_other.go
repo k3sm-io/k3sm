@@ -23,3 +23,7 @@ package executor
 // health deadline behaves exactly as it did before the probe existed — the
 // conservative direction — and keeps this package cross-compilable.
 func processExited(int) bool { return false }
+
+// processIsEtcd has no non-darwin implementation either; false keeps the restore's
+// other live-server probes (the work-dir lock and the ports) in charge there.
+func processIsEtcd(int) bool { return false }

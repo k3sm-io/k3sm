@@ -32,8 +32,8 @@ import (
 )
 
 // Day-2 operations on an etcd member: --cluster-reset (k3s's flag and semantics) and
-// an online snapshot save. Snapshot restore is not offered yet; RestoreSnapshot
-// refuses an etcd work dir with ErrEtcdRestoreUnsupported.
+// an online snapshot save. Restoring a snapshot is RestoreEtcdSnapshot
+// (etcdrestore.go).
 
 // Cluster-reset and etcd snapshot failures.
 var (
@@ -45,8 +45,6 @@ var (
 	// ErrClusterResetFailed reports a reset that did not end with a single-member
 	// cluster of this server.
 	ErrClusterResetFailed = errors.New("executor: the cluster reset did not leave this server as the only member; restore the etcd data dir from a snapshot")
-	// ErrEtcdRestoreUnsupported refuses `k3sm snapshot restore` on an etcd member.
-	ErrEtcdRestoreUnsupported = errors.New("executor: snapshot restore is not supported for an etcd HA server in this release (snapshot save is); to roll back, save a snapshot, uninstall, and recreate the cluster")
 	// ErrNoEtcdClient reports that the work dir records no local etcd member to
 	// snapshot.
 	ErrNoEtcdClient = errors.New("executor: no local etcd member is recorded in this work dir")

@@ -93,8 +93,10 @@ limitations under the License.
 // with --force-new-cluster, refused while the daemon holds the work-dir lock or with no
 // member to reset, and succeeds only when the member list is exactly this member.
 // SnapshotEtcd streams an online snapshot of the local member to a 0600 file and
-// verifies it; restoring one is not supported in this release
-// (ErrEtcdRestoreUnsupported).
+// verifies it; RestoreEtcdSnapshot (`k3sm snapshot restore`) rebuilds a single-member
+// cluster from one with etcdutl at the same pin, under a new cluster ID, and moves the
+// superseded data dir aside. A member left on the replaced data is refused at bring-up
+// (ErrEtcdMemberSuperseded) instead of waiting for a quorum that cannot form.
 //
 // # Leader election
 //

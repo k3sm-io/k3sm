@@ -18,10 +18,13 @@ package executor
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -104,10 +107,13 @@ type etcdSeams struct {
 	ready func(port int) func(context.Context) bool
 	// dialPeer reports whether a peer's host:port accepts TCP (for the wait's log).
 	dialPeer func(ctx context.Context, hostport string) bool
+	// peerClusterID asks a peer listener for its cluster ID (the superseded-member
+	// check). Nil skips the check.
+	peerClusterID func(ctx context.Context, workDir, peerURL string) (uint64, error)
 }
 
 func defaultEtcdSeams() etcdSeams {
-	return etcdSeams{clock: realClock{}, dial: dialEtcdAdmin, ready: tcpReady, dialPeer: tcpDial}
+	return etcdSeams{clock: realClock{}, dial: dialEtcdAdmin, ready: tcpReady, dialPeer: tcpDial, peerClusterID: peerClusterID}
 }
 
 // tcpDial reports whether hostport accepts a TCP connection within a second.
@@ -249,12 +255,26 @@ func (s *Supervised) startEtcd(ctx context.Context, memberExists bool, extra fun
 		"peer-url", etcdPeerURL(s.cfg.Etcd.PeerIP, s.cfg.Etcd.PeerPort), "reset", s.cfg.Etcd.Reset)
 	// The client URL is recorded before the spawn so `k3sm snapshot save` can find the
 	// member as soon as it serves, quorum or not.
-	if err := writeEtcdStatus(s.cfg.WorkDir, EtcdStatus{UpdatedAt: s.etcd.clock.Now().UTC(),
+	rec := EtcdStatus{UpdatedAt: s.etcd.clock.Now().UTC(),
 		ClientURL: etcdClientURL(s.cfg.KinePort), MemberName: s.cfg.Etcd.Name,
-		ExpectedPeerURL: etcdPeerURL(s.cfg.Etcd.PeerIP, s.cfg.Etcd.PeerPort)}); err != nil {
+		ExpectedPeerURL: etcdPeerURL(s.cfg.Etcd.PeerIP, s.cfg.Etcd.PeerPort)}
+	if err := writeEtcdStatus(s.cfg.WorkDir, rec); err != nil {
 		return nil, err
 	}
-	return s.spawn(ctx, etcdComponent, etcdArgs(in)...)
+	c, err := s.spawn(ctx, etcdComponent, etcdArgs(in)...)
+	if err != nil {
+		return nil, err
+	}
+	// ...and the pid right after it, the record `k3sm snapshot restore` checks.
+	pid := c.cmd.Process.Pid
+	s.mu.Lock()
+	s.etcdPID = pid
+	s.mu.Unlock()
+	rec.PID = pid
+	if err := writeEtcdStatus(s.cfg.WorkDir, rec); err != nil {
+		s.cfg.Logger.Warn("could not record the etcd member's pid", "component", etcdComponent, "err", err)
+	}
+	return c, nil
 }
 
 // bringUpEtcdMember is the etcd posture's datastore bring-up, in the order the
@@ -322,7 +342,13 @@ func (s *Supervised) promoteAndAwaitQuorum(ctx context.Context, m etcdMembers, c
 			}
 		}
 	}
-	return s.awaitEtcdQuorum(ctx, m, c)
+	if err := s.awaitEtcdQuorum(ctx, m, c); err != nil {
+		return err
+	}
+	// Quorum among stale members is still the wrong cluster: two of three servers
+	// left on the data a restore replaced elect a leader between them. Ask once more
+	// with quorum in hand, before anything serves from it.
+	return s.refuseIfSuperseded(ctx, m)
 }
 
 // etcdSelfIsLearner asks the local member whether it is a learner, retrying every
@@ -474,6 +500,7 @@ func (s *Supervised) awaitEtcdQuorum(ctx context.Context, m etcdMembers, c *comp
 	clk := s.etcd.clock
 	start := clk.Now()
 	lastLog := start
+	var lastProbe time.Time
 	for {
 		select {
 		case <-c.exited:
@@ -481,6 +508,14 @@ func (s *Supervised) awaitEtcdQuorum(ctx context.Context, m etcdMembers, c *comp
 		default:
 		}
 		q := readEtcdQuorum(ctx, m)
+		// A member whose cluster was restored elsewhere never reaches quorum with its
+		// old peers' help: say so and stop, instead of waiting forever.
+		if now := clk.Now(); !q.ok() && (lastProbe.IsZero() || now.Sub(lastProbe) >= etcdSupersededProbeEvery) {
+			lastProbe = now
+			if err := s.refuseIfSuperseded(ctx, m); err != nil {
+				return err
+			}
+		}
 		if q.ok() {
 			s.cfg.Logger.Info("etcd quorum reached", "component", etcdComponent, "waited", clk.Now().Sub(start).Round(time.Second))
 			return nil
@@ -639,11 +674,15 @@ const EtcdPeerURLDriftRemedy = "server node IPs must be stable (a DHCP reservati
 // collectEtcdStatus reads the local member, the member list and the alarms into a
 // status record. Fields it cannot read stay zero.
 func (s *Supervised) collectEtcdStatus(ctx context.Context, m etcdMembers) EtcdStatus {
+	s.mu.Lock()
+	pid := s.etcdPID
+	s.mu.Unlock()
 	st := EtcdStatus{
 		UpdatedAt:       s.etcd.clock.Now().UTC(),
 		ClientURL:       etcdClientURL(s.cfg.KinePort),
 		MemberName:      s.cfg.Etcd.Name,
 		ExpectedPeerURL: etcdPeerURL(s.cfg.Etcd.PeerIP, s.cfg.Etcd.PeerPort),
+		PID:             pid,
 	}
 	local, err := m.Status(ctx)
 	if err == nil {
@@ -715,6 +754,11 @@ func (s *Supervised) watchEtcd(ctx context.Context, m etcdMembers) {
 		if now := clk.Now(); now.Sub(lastRefresh) >= etcdAlarmLogEvery {
 			lastRefresh = now
 			st := s.collectEtcdStatus(cctx, m)
+			if detail, superseded := s.supersededBy(cctx, m); superseded {
+				st.Superseded, st.SupersededDetail = true, detail
+				log.Error(EtcdMemberSupersededMessage, "component", etcdComponent, "detail", detail,
+					"remedy", EtcdMemberSupersededRemedy)
+			}
 			if slices.Contains(st.Alarms, etcdAlarmNoSpace) {
 				log.Error("etcd NOSPACE alarm is active: the cluster is read-only until space is reclaimed (compact, defragment, then disarm the alarm)",
 					"component", etcdComponent, "db-size", st.DBSizeBytes, "quota", st.QuotaBytes)
@@ -774,6 +818,16 @@ type EtcdStatus struct {
 	// WALFsyncP99Seconds is the local WAL fsync p99 from the metrics endpoint, when
 	// something has measured it; nil when not.
 	WALFsyncP99Seconds *float64 `json:"walFsyncP99Seconds,omitempty"`
+	// PID is the etcd child's pid, so `k3sm snapshot restore` can refuse while a
+	// member this work dir started is still alive (a server killed with SIGKILL can
+	// leave it behind).
+	PID int `json:"pid,omitempty"`
+	// Superseded is set when a peer registered in this member's cluster answers
+	// with a different cluster ID: the cluster was restored (or rebuilt) elsewhere
+	// and this member's data belongs to the one it replaced. SupersededDetail names
+	// the peer and both IDs.
+	Superseded       bool   `json:"superseded,omitempty"`
+	SupersededDetail string `json:"supersededDetail,omitempty"`
 }
 
 // etcdStatusName is the status record's basename. It lives beside the data dir, not
@@ -803,4 +857,112 @@ func writeEtcdStatus(workDir string, st EtcdStatus) error {
 		return err
 	}
 	return writeFileAtomic(EtcdStatusPath(workDir), append(b, '\n'), 0o600)
+}
+
+// The superseded-member check (`k3sm snapshot restore` rebuilds a cluster with a new
+// cluster ID; a member left on the old data must be told, not left waiting).
+const (
+	// etcdSupersededProbeEvery is how often the quorum wait asks the peers for their
+	// cluster ID.
+	etcdSupersededProbeEvery = 10 * time.Second
+	// etcdPeerProbeTimeout bounds one peer's answer.
+	etcdPeerProbeTimeout = 2 * time.Second
+	// EtcdMemberSupersededMessage is the status row's and the log's sentence.
+	EtcdMemberSupersededMessage = "this server's etcd member belongs to a cluster that was reset or restored"
+	// EtcdMemberSupersededRemedy is the fix: the member re-joins the restored cluster
+	// as a fresh learner.
+	EtcdMemberSupersededRemedy = "wipe <work-dir>/etcd and re-join: stop this server, move <work-dir>/etcd aside (or delete it), then start it again with --server-join --server <the restored server> and the server token"
+)
+
+// ErrEtcdMemberSuperseded ends a bring-up whose member belongs to a cluster another
+// server has replaced. It is PERMANENT: every restart finds the same data dir.
+var ErrEtcdMemberSuperseded = errors.New("executor: " + EtcdMemberSupersededMessage)
+
+// refuseIfSuperseded records and returns ErrEtcdMemberSuperseded when a peer reports
+// another cluster ID.
+func (s *Supervised) refuseIfSuperseded(ctx context.Context, m etcdMembers) error {
+	detail, superseded := s.supersededBy(ctx, m)
+	if !superseded {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, etcdCallTimeout)
+	st := s.collectEtcdStatus(cctx, m)
+	cancel()
+	st.Superseded, st.SupersededDetail = true, detail
+	if err := writeEtcdStatus(s.cfg.WorkDir, st); err != nil {
+		s.cfg.Logger.Warn("could not record the etcd status", "component", etcdComponent, "err", err)
+	}
+	s.cfg.Logger.Error(EtcdMemberSupersededMessage, "component", etcdComponent, "detail", detail,
+		"remedy", EtcdMemberSupersededRemedy)
+	return fmt.Errorf("%w: %s; %s", ErrEtcdMemberSuperseded, detail, EtcdMemberSupersededRemedy)
+}
+
+// supersededBy asks every OTHER member in the local member's view for its cluster ID
+// and reports the first that differs from the local one. An unreachable peer, or a
+// local member that cannot say its own ID yet, proves nothing and reads false.
+func (s *Supervised) supersededBy(ctx context.Context, m etcdMembers) (string, bool) {
+	if s.etcd.peerClusterID == nil {
+		return "", false
+	}
+	st, err := m.Status(ctx)
+	if err != nil || st.ClusterID == 0 {
+		return "", false
+	}
+	members, err := m.MemberList(ctx)
+	if err != nil {
+		return "", false
+	}
+	own := etcdPeerURL(s.cfg.Etcd.PeerIP, s.cfg.Etcd.PeerPort)
+	for _, mem := range members {
+		if mem.ID == st.MemberID || slices.Contains(mem.PeerURLs, own) {
+			continue
+		}
+		for _, pu := range mem.PeerURLs {
+			pctx, cancel := context.WithTimeout(ctx, etcdPeerProbeTimeout)
+			id, err := s.etcd.peerClusterID(pctx, s.cfg.WorkDir, pu)
+			cancel()
+			if err == nil && id != 0 && id != st.ClusterID {
+				return fmt.Sprintf("peer %s at %s reports cluster %x; this member's cluster is %x",
+					mem.Name, pu, id, st.ClusterID), true
+			}
+		}
+	}
+	return "", false
+}
+
+// peerClusterID asks the etcd peer listener at peerURL for its cluster ID: the
+// X-Etcd-Cluster-ID header of its /members answer, over the peer CA's mutual TLS
+// with this server's peer identity.
+func peerClusterID(ctx context.Context, workDir, peerURL string) (uint64, error) {
+	p := certs.EtcdCertPaths(workDir)
+	pair, err := tls.LoadX509KeyPair(p.PeerServerClientCert, p.PeerServerClientKey)
+	if err != nil {
+		return 0, fmt.Errorf("load the etcd peer identity: %w", err)
+	}
+	caPEM, err := os.ReadFile(p.PeerCACert)
+	if err != nil {
+		return 0, fmt.Errorf("read the etcd peer CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return 0, errors.New("the etcd peer CA file holds no certificate")
+	}
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{Certificates: []tls.Certificate{pair}, RootCAs: pool, MinVersion: tls.VersionTLS12},
+	}}
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(peerURL, "/")+"/members", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	h := resp.Header.Get("X-Etcd-Cluster-ID")
+	if h == "" {
+		return 0, fmt.Errorf("%s answered without a cluster ID (HTTP %d)", peerURL, resp.StatusCode)
+	}
+	return strconv.ParseUint(h, 16, 64)
 }
