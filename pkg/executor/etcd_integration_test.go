@@ -1122,8 +1122,9 @@ func TestEtcdSnapshotRestoreSingleMember(t *testing.T) {
 	}
 	for _, m := range []*itMember{b, c} {
 		st, err := ReadEtcdStatus(m.wd)
-		if err != nil || !st.Superseded || !strings.Contains(st.SupersededDetail, a.name) {
-			t.Errorf("%s status record = %+v (%v), want Superseded naming %s", m.name, st, err, a.name)
+		if err != nil || !st.Superseded || !strings.Contains(st.SupersededDetail, a.name) ||
+			!strings.Contains(st.SupersededRemedy, "confirm "+a.name) || st.ForeignPeer != "" {
+			t.Errorf("%s status record = %+v (%v), want Superseded naming %s, with the verify-first remedy", m.name, st, err, a.name)
 		}
 		m.stop(t)
 	}

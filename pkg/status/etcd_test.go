@@ -111,10 +111,16 @@ func TestEtcdRowStates(t *testing.T) {
 		{name: "stale record", edit: func(s *executor.EtcdStatus) { s.UpdatedAt = now.Add(-20 * time.Minute) }, sev: SeverityUnknown, state: StateUnknown,
 			detail: []string{"not refreshing it"}},
 		{name: "superseded by a restore elsewhere", edit: func(s *executor.EtcdStatus) {
+			se := &executor.EtcdSupersededError{Peer: "etcd-a", PeerURL: "https://192.0.2.10:2380", PeerCluster: 2, OwnCluster: 1, PeerRevision: 1_000_000_002}
 			s.LeaderPresent = false
-			s.Superseded, s.SupersededDetail = true, "peer etcd-a at https://192.0.2.10:2380 reports cluster 2; this member's cluster is 1"
+			s.Superseded, s.SupersededDetail, s.SupersededRemedy = true, se.Error(), se.Remedy()
 		}, sev: SeverityFail, state: StateUnhealthy,
-			detail: []string{"belongs to a cluster that was reset or restored", "reports cluster 2"}, remedyIn: []string{"wipe <work-dir>/etcd", "re-join"}},
+			detail:   []string{"belongs to a cluster that was reset or restored", "only member of cluster 2"},
+			remedyIn: []string{"confirm etcd-a", "is the server you restored; then wipe <work-dir>/etcd and re-join"}},
+		{name: "a peer answers for another cluster", edit: func(s *executor.EtcdStatus) {
+			s.ForeignPeer = "peer etcd-b at https://192.0.2.11:2380 answers for cluster 9 (1 member(s), revision 4); this member's cluster is 1"
+		}, sev: SeverityWarn, state: StateUnhealthy,
+			detail: []string{"a peer answers for a different etcd cluster; check it", "etcd-b", "cluster 9"}, remedyIn: []string{"reinstalled there by mistake"}},
 		{name: "stale but leaderless is still a failure", edit: func(s *executor.EtcdStatus) {
 			s.UpdatedAt, s.LeaderPresent = now.Add(-20*time.Minute), false
 		}, sev: SeverityFail, state: StateUnhealthy, detail: []string{"NO LEADER"}},

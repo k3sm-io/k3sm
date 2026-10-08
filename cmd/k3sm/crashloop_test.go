@@ -19,6 +19,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"k3sm.io/k3sm/pkg/executor"
@@ -82,15 +83,16 @@ func TestPermanentBringUpFailureParksImmediately(t *testing.T) {
 // parks on the first failure and names the wipe-and-re-join remedy.
 func TestSupersededEtcdMemberParksImmediately(t *testing.T) {
 	dir := t.TempDir()
-	err := &executor.BringUpError{Component: "etcd", Phase: executor.PhaseBringUp,
-		Err: fmt.Errorf("%w: peer etcd-a reports cluster 2", executor.ErrEtcdMemberSuperseded)}
+	se := &executor.EtcdSupersededError{Peer: "etcd-a", PeerURL: "https://192.0.2.10:2380", PeerCluster: 2, OwnCluster: 1, PeerRevision: 1_000_000_002}
+	err := &executor.BringUpError{Component: "etcd", Phase: executor.PhaseBringUp, Err: fmt.Errorf("await quorum: %w", se)}
 	noteBringUpFailure(newCrashBreaker(dir, quietLogger()), quietLogger(), err)
 	rec, rerr := executor.ReadCrashRecord(executor.CrashLoopPath(dir))
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
 	last, _ := rec.Last()
-	if !rec.Tripped() || !last.Permanent || last.Remedy != executor.EtcdMemberSupersededRemedy {
+	if !rec.Tripped() || !last.Permanent || last.Remedy != se.Remedy() ||
+		!strings.Contains(last.Remedy, "confirm etcd-a (https://192.0.2.10:2380, cluster 2) is the server you restored; then wipe <work-dir>/etcd and re-join") {
 		t.Fatalf("record tripped=%v last=%+v, want a permanent entry naming the superseded remedy", rec.Tripped(), last)
 	}
 }

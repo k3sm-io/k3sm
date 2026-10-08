@@ -1093,65 +1093,145 @@ func TestEtcdPostureHoldsWorkDirLock(t *testing.T) {
 	}
 }
 
-// TestEtcdSupersededMemberRefused: a member whose registered peer answers with a
-// different cluster ID belongs to a cluster restored elsewhere. Bring-up says so and
-// stops, whether its quorum wait is stuck (one stale member) or already satisfied
-// (two stale members electing a leader between them), and records the status row's
-// signal. An unreachable peer or the same cluster ID proves nothing.
+// TestEtcdSupersededMemberRefused: a peer answering for another cluster parks this
+// member ONLY with the shape a restore leaves (the peer lists only itself, at a
+// revision at or past the restore bump), whether the quorum wait is stuck (one stale
+// member) or already satisfied (two stale members electing a leader). Any other
+// differing peer is a recorded warning and bring-up continues; a peer that errors,
+// times out, or answers for this cluster proves nothing.
 func TestEtcdSupersededMemberRefused(t *testing.T) {
 	const peerB = "https://192.0.2.11:2380"
-	stale := func(leader uint64) *fakeEtcd {
-		return &fakeEtcd{
-			status: etcdMemberStatus{MemberID: testOwnID, ClusterID: 0x1, Leader: leader},
-			members: []etcdMember{
-				{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}},
-				{ID: 0xb, Name: "server-b", PeerURLs: []string{peerB}},
-			},
-		}
-	}
+	const bumped = int64(EtcdRestoreRevisionBump) + 2
+	blackhole := func(ctx context.Context) (EtcdPeerView, error) { <-ctx.Done(); return EtcdPeerView{}, ctx.Err() }
 	for _, tc := range []struct {
 		name      string
 		leader    uint64
-		peerID    uint64
-		peerErr   error
-		wantRefus bool
+		answer    func(ctx context.Context) (EtcdPeerView, error)
+		wantPark  bool
+		wantWarn  bool
+		maxWaited time.Duration
 	}{
-		{"no quorum, the peer was restored", 0, 0x2, nil, true},
-		{"quorum among stale members, the peer was restored", 0xb, 0x2, nil, true},
-		{"quorum, the peer is in this cluster", 0xb, 0x1, nil, false},
-		{"quorum, the peer is unreachable", 0xb, 0, errors.New("connection refused"), false},
+		{name: "restored peer, no quorum: park", answer: fixedView(EtcdPeerView{ClusterID: 2, Members: 1, Revision: bumped}), wantPark: true},
+		{name: "restored peer, quorum among stale members: park", leader: 0xb,
+			answer: fixedView(EtcdPeerView{ClusterID: 2, Members: 1, Revision: bumped}), wantPark: true},
+		{name: "fresh rogue peer (single member, low revision): warn", leader: 0xb,
+			answer: fixedView(EtcdPeerView{ClusterID: 9, Members: 1, Revision: 4}), wantWarn: true},
+		{name: "other multi-member cluster past the bump: warn", leader: 0xb,
+			answer: fixedView(EtcdPeerView{ClusterID: 9, Members: 3, Revision: bumped}), wantWarn: true},
+		{name: "peer erroring: nothing", leader: 0xb,
+			answer: func(context.Context) (EtcdPeerView, error) { return EtcdPeerView{}, errors.New("connection refused") }},
+		{name: "peer timing out: nothing, within one bound", leader: 0xb, answer: blackhole, maxWaited: etcdPeerProbeTimeout + time.Second},
+		{name: "same cluster ID: nothing", leader: 0xb, answer: fixedView(EtcdPeerView{ClusterID: 1, Members: 3})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fake := stale(tc.leader)
+			fake := &fakeEtcd{
+				status: etcdMemberStatus{MemberID: testOwnID, ClusterID: 0x1, Leader: tc.leader},
+				members: []etcdMember{
+					{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}},
+					{ID: 0xb, Name: "server-b", PeerURLs: []string{peerB}},
+				},
+			}
 			s, _, _ := etcdTestSupervised(t, EtcdInit, fake, newFakeClock(time.Hour))
+			var mu sync.Mutex
 			var asked []string
-			s.etcd.peerClusterID = func(_ context.Context, _ string, peerURL string) (uint64, error) {
+			s.etcd.peerView = func(ctx context.Context, _ string, peerURL string, own uint64) (EtcdPeerView, error) {
+				mu.Lock()
 				asked = append(asked, peerURL)
-				return tc.peerID, tc.peerErr
+				mu.Unlock()
+				if own != 0x1 {
+					t.Errorf("asked with own cluster %x, want 1", own)
+				}
+				return tc.answer(ctx)
 			}
 			c := &component{name: etcdComponent, exited: make(chan struct{})}
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
-			err := s.promoteAndAwaitQuorum(ctx, fake, c)
-			if !slices.Contains(asked, peerB) {
-				t.Fatalf("asked peers %v, want %s (never itself)", asked, peerB)
+			start := time.Now()
+			err := s.checkPeers(ctx, fake)
+			if tc.maxWaited > 0 && time.Since(start) > tc.maxWaited {
+				t.Errorf("a blackholed peer held the check for %s (bound %s)", time.Since(start), tc.maxWaited)
 			}
-			if slices.Contains(asked, testOwnPeer) {
-				t.Errorf("the member asked itself for its cluster ID")
+			if !slices.Contains(asked, peerB) || slices.Contains(asked, testOwnPeer) {
+				t.Fatalf("asked %v, want %s and never itself", asked, peerB)
 			}
-			if !tc.wantRefus {
-				if err != nil {
-					t.Fatalf("promoteAndAwaitQuorum = %v, want nil", err)
+			st, _ := ReadEtcdStatus(s.cfg.WorkDir)
+			if tc.wantPark {
+				var se *EtcdSupersededError
+				if !errors.Is(err, ErrEtcdMemberSuperseded) || !errors.As(err, &se) {
+					t.Fatalf("checkPeers = %v, want an *EtcdSupersededError", err)
+				}
+				if want := "confirm server-b (" + peerB + ", cluster 2) is the server you restored; then wipe <work-dir>/etcd and re-join"; !strings.Contains(se.Remedy(), want) {
+					t.Errorf("remedy %q lacks %q", se.Remedy(), want)
+				}
+				if !st.Superseded || st.SupersededRemedy != se.Remedy() {
+					t.Errorf("status record = %+v, want Superseded with the remedy", st)
+				}
+				// And through the production bring-up waits, quorum or not.
+				if err := s.promoteAndAwaitQuorum(ctx, fake, c); !errors.Is(err, ErrEtcdMemberSuperseded) {
+					t.Errorf("promoteAndAwaitQuorum = %v, want ErrEtcdMemberSuperseded", err)
 				}
 				return
 			}
-			if !errors.Is(err, ErrEtcdMemberSuperseded) || !strings.Contains(err.Error(), "wipe <work-dir>/etcd") {
-				t.Fatalf("promoteAndAwaitQuorum = %v, want ErrEtcdMemberSuperseded naming the remedy", err)
+			if err != nil {
+				t.Fatalf("checkPeers = %v, want nil (never a park without a restore's evidence)", err)
 			}
-			st, rerr := ReadEtcdStatus(s.cfg.WorkDir)
-			if rerr != nil || !st.Superseded || !strings.Contains(st.SupersededDetail, "reports cluster 2") {
-				t.Errorf("status record = %+v (%v), want Superseded with the peer's cluster", st, rerr)
+			if st.Superseded {
+				t.Errorf("status record marks this member superseded: %+v", st)
+			}
+			if tc.wantWarn != (st.ForeignPeer != "") || (tc.wantWarn && !strings.Contains(st.ForeignPeer, "server-b")) {
+				t.Errorf("status ForeignPeer = %q, want a warning: %v", st.ForeignPeer, tc.wantWarn)
+			}
+			if err := s.promoteAndAwaitQuorum(ctx, fake, c); tc.leader != 0 && err != nil {
+				t.Errorf("promoteAndAwaitQuorum with quorum = %v, want nil", err)
 			}
 		})
+	}
+
+	t.Run("peers are asked concurrently", func(t *testing.T) {
+		fake := &fakeEtcd{
+			status: etcdMemberStatus{MemberID: testOwnID, ClusterID: 0x1, Leader: 0xb},
+			members: []etcdMember{
+				{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}},
+				{ID: 0xb, Name: "server-b", PeerURLs: []string{peerB}},
+				{ID: 0xc, Name: "server-c", PeerURLs: []string{"https://192.0.2.12:2380"}},
+				{ID: 0xd, Name: "server-d", PeerURLs: []string{"https://192.0.2.13:2380"}},
+			},
+		}
+		s, _, _ := etcdTestSupervised(t, EtcdInit, fake, newFakeClock(time.Hour))
+		s.etcd.peerView = func(ctx context.Context, _, _ string, _ uint64) (EtcdPeerView, error) { return blackhole(ctx) }
+		start := time.Now()
+		if err := s.checkPeers(t.Context(), fake); err != nil {
+			t.Fatal(err)
+		}
+		if waited := time.Since(start); waited > etcdPeerProbeTimeout+time.Second {
+			t.Errorf("three blackholed peers took %s, want about one bound (%s)", waited, etcdPeerProbeTimeout)
+		}
+	})
+}
+
+// fixedView answers every peer probe with v.
+func fixedView(v EtcdPeerView) func(context.Context) (EtcdPeerView, error) {
+	return func(context.Context) (EtcdPeerView, error) { return v, nil }
+}
+
+// TestClassifyPeer pins the evidence rule on its own.
+func TestClassifyPeer(t *testing.T) {
+	bump := int64(EtcdRestoreRevisionBump)
+	for _, tc := range []struct {
+		name string
+		v    EtcdPeerView
+		err  error
+		want peerFindingKind
+	}{
+		{"restored", EtcdPeerView{ClusterID: 2, Members: 1, Revision: bump}, nil, peerSupersedes},
+		{"one short of the bump", EtcdPeerView{ClusterID: 2, Members: 1, Revision: bump - 1}, nil, peerForeign},
+		{"two members past the bump", EtcdPeerView{ClusterID: 2, Members: 2, Revision: bump}, nil, peerForeign},
+		{"same cluster", EtcdPeerView{ClusterID: 1, Members: 1, Revision: bump}, nil, peerSameOrUnknown},
+		{"no answer", EtcdPeerView{}, errors.New("timeout"), peerSameOrUnknown},
+		{"no cluster ID", EtcdPeerView{Members: 1, Revision: bump}, nil, peerSameOrUnknown},
+	} {
+		if got := classifyPeer(tc.v, tc.err, 1); got != tc.want {
+			t.Errorf("%s: classifyPeer = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
