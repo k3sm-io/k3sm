@@ -183,6 +183,7 @@ func etcdRowFrom(st executor.EtcdStatus, p99 *float64, now time.Time) Row {
 	if !st.UpdatedAt.IsZero() {
 		row.Wide["recorded"] = st.UpdatedAt.UTC().Format(time.RFC3339)
 	}
+	addEtcdSnapshotWide(row.Wide, st)
 	sev, detail, remedy := EtcdHealth(st)
 	if p99 == nil {
 		p99 = st.WALFsyncP99Seconds
@@ -211,6 +212,23 @@ func etcdRowFrom(st executor.EtcdStatus, p99 *float64, now time.Time) Row {
 	}
 	row.Severity, row.Detail, row.Remedy = sev, detail, remedy
 	return row
+}
+
+// addEtcdSnapshotWide adds the scheduled-snapshot view: the schedule, when the
+// newest scheduled snapshot was taken, and how many are kept of how many the
+// retention allows. A record with no schedule says the schedule is off.
+func addEtcdSnapshotWide(wide map[string]string, st executor.EtcdStatus) {
+	if st.SnapshotSchedule == "" {
+		wide["snapshot-schedule"] = "off"
+		return
+	}
+	wide["snapshot-schedule"] = st.SnapshotSchedule
+	wide["scheduled-snapshots-kept"] = fmt.Sprintf("%d of %d", st.ScheduledSnapshotsKept, st.SnapshotRetention)
+	if st.LastScheduledSnapshot.IsZero() {
+		wide["last-scheduled-snapshot"] = "none yet"
+	} else {
+		wide["last-scheduled-snapshot"] = st.LastScheduledSnapshot.UTC().Format(time.RFC3339)
+	}
 }
 
 // etcdRow reports this server's etcd member, or false when this is not an etcd

@@ -152,6 +152,63 @@ func TestEtcdRowStates(t *testing.T) {
 	}
 }
 
+// TestEtcdRowSnapshotWide: the etcd row's wide view reports the scheduled
+// snapshots from the status record (schedule, newest, kept of the retention), says
+// "off" when the record carries no schedule, and survives the record's JSON round
+// trip; the row's verdict does not depend on it.
+func TestEtcdRowSnapshotWide(t *testing.T) {
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	taken := time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		edit func(*executor.EtcdStatus)
+		want map[string]string
+	}{
+		{"schedule off", nil, map[string]string{"snapshot-schedule": "off"}},
+		{"schedule on, none taken yet", func(s *executor.EtcdStatus) {
+			s.SnapshotSchedule, s.SnapshotRetention = "0 */12 * * *", 5
+		}, map[string]string{"snapshot-schedule": "0 */12 * * *", "scheduled-snapshots-kept": "0 of 5", "last-scheduled-snapshot": "none yet"}},
+		{"schedule on, snapshots kept", func(s *executor.EtcdStatus) {
+			s.SnapshotSchedule, s.SnapshotRetention = "0 */12 * * *", 5
+			s.LastScheduledSnapshot, s.ScheduledSnapshotsKept = taken, 3
+		}, map[string]string{"snapshot-schedule": "0 */12 * * *", "scheduled-snapshots-kept": "3 of 5", "last-scheduled-snapshot": "2026-10-02T00:00:00Z"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := healthyEtcd(now)
+			if tc.edit != nil {
+				tc.edit(&st)
+			}
+			raw, err := json.Marshal(st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var back executor.EtcdStatus
+			if err := json.Unmarshal(raw, &back); err != nil {
+				t.Fatal(err)
+			}
+			row := etcdRowFrom(back, nil, now)
+			if row.Severity != SeverityOK {
+				t.Fatalf("severity %s, want ok: the schedule is a report, not a verdict", row.Severity)
+			}
+			for k, v := range tc.want {
+				if row.Wide[k] != v {
+					t.Errorf("wide[%q] = %q, want %q", k, row.Wide[k], v)
+				}
+			}
+			if tc.edit == nil {
+				for _, k := range []string{"scheduled-snapshots-kept", "last-scheduled-snapshot"} {
+					if _, ok := row.Wide[k]; ok {
+						t.Errorf("schedule off but wide carries %q", k)
+					}
+				}
+				if strings.Contains(string(raw), "lastScheduledSnapshot") {
+					t.Errorf("a record with no schedule encodes lastScheduledSnapshot: %s", raw)
+				}
+			}
+		})
+	}
+}
+
 // TestEtcdRowCollect pins the row's wiring: present only in the etcd posture (the
 // plist's role flag, a member dir, or a record), the record read through the FS
 // seam (unreadable is unknown, absent is a skip), the metrics read from the plist's
