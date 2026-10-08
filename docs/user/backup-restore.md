@@ -1,7 +1,8 @@
 # Backup & restore
 
-k3sm keeps cluster state in an embedded **kine** datastore over **SQLite (WAL)**. Backing it up and
-restoring it is how you protect and recover a cluster.
+k3sm keeps cluster state in an embedded **kine** datastore over **SQLite (WAL)**, or, on an HA
+server, in an embedded **etcd** member. Backing it up and restoring it is how you protect and
+recover a cluster.
 
 ## What Holds the State
 
@@ -64,6 +65,98 @@ The restore is built to be survivable when it goes wrong:
 
 Restoring onto a node with no datastore at all (a rebuilt Mac) is supported, and is what the drill
 is for.
+
+## Restoring an HA Server (Embedded etcd)
+
+On a server installed with `--cluster-init` or `--server-join`, the datastore is an embedded etcd
+member, and `k3sm snapshot save` writes an etcd snapshot. `k3sm snapshot restore` puts one back.
+It does what `k3s server --cluster-reset --cluster-reset-restore-path` does: it turns this server
+into the **only member of a new etcd cluster** holding the snapshot's data. Every other server then
+joins that cluster again as a new member.
+
+Run it on the mint-authority server, the one installed with `--cluster-init`. If that server is
+lost, run it on a joined server, then reinstall that server with `--cluster-init` in place of
+`--server-join`, as [HA](ha.md) describes for `--cluster-reset`. Stop **every** server first, and
+do not start the others again until step 4.
+
+```sh
+# 1. On every server: stop it.
+sudo launchctl bootout system/io.k3sm.server
+
+# 2. On the server you restore: restore, then start it.
+sudo k3sm snapshot restore /Volumes/backups/k3sm-etcd-snapshot.db
+sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist
+
+# 3. Verify it (see Verify the Restore below), and check that `k3sm status` shows one voting
+#    etcd member with a leader present.
+
+# 4. On every OTHER server: move its old etcd data aside, then start it. It joins the restored
+#    server as a new member and is promoted.
+sudo mv /var/lib/k3sm/server/etcd /var/lib/k3sm/server/etcd.pre-restore
+sudo k3sm server --clear-crashloop          # only if it was started on its old data and parked
+sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist
+```
+
+The restore reads the server's member name, etcd peer address and peer port from the installed
+server. Pass `--node-name`, `--etcd-peer-ip` and `--etcd-peer-port` to override them, for example on
+a rebuilt Mac with no installed server yet. A server joins through its `--server` address, so a
+server whose `--server` names a server other than the restored one has to be reinstalled with
+`--server` set to the restored server before step 4. If its join is refused for its token, mint a
+new server token on the restored server and reinstall with it.
+
+What the restore does, in order:
+
+- It **refuses while the server is running**: the work-dir lock, the etcd client, peer and apiserver
+  ports, the launchd job, and the etcd process the server last recorded. A server stopped with
+  `kill -9` can leave its etcd process running, and the restore names that process.
+- It **refuses the wrong kind of file**. A kine SQLite snapshot is not restored into an etcd server,
+  and an etcd snapshot is not restored into a single-server control plane. A copy of an etcd
+  member's `member/snap/db` is not a snapshot: it carries no integrity hash, so it cannot be
+  verified, and the restore refuses it by name. Take snapshots with `k3sm snapshot save`.
+- It **verifies the snapshot before touching anything**: the SHA-256 hash etcd appends to every
+  snapshot, then a read-only open of the database with etcd's own buckets. A corrupt or truncated
+  file costs you an error and nothing else.
+- It refuses unless the volume has **twice the snapshot's size** free.
+- It **rebuilds the data dir beside the live one** (`etcd.restore-<UTC>.tmp`, mode 0700, owned like
+  the data dir it replaces) with `etcdutl`, built from the same etcd release the server runs. The
+  rebuilt cluster gets a new cluster ID, and its revision is raised by one billion and marked
+  compacted. Every client that watched the old cluster holds a resource version the restored one
+  has not reached, so without that bump a watcher could take old data for new. With it, every
+  watcher and informer lists again from scratch.
+- It **preserves what it replaces**. The old data dir becomes `etcd.restore-<UTC>.bak` and the etcd
+  status record moves beside it. Nothing is deleted. If moving either into place fails, both are
+  moved back and the work dir is as it was.
+
+### What a Restore Puts Back, and What It Does Not
+
+The snapshot is the datastore and nothing else. Restoring it puts the **whole datastore** back to
+the moment the snapshot was taken:
+
+- Objects created after the snapshot are gone, and objects deleted since are back. That includes
+  Nodes and Pods, leases, the node-password bindings that tie node names to Macs, and bootstrap
+  tokens. A worker that joined after the snapshot has to join again.
+- The PKI is not reverted. The cluster CA, the etcd CAs, the service-account key and every
+  certificate stay exactly as they are; the restore only reads them. A certificate issued after the
+  snapshot stays valid.
+- PersistentVolume data is not in the snapshot. Restore it separately (see [Storage](storage.md)).
+
+### Servers Left on the Old Data
+
+A server started on its old etcd data after the restore belongs to the cluster the restore
+replaced. It asks the other servers for their cluster ID, finds the restored server on a different
+one, and refuses to start. `k3sm status` shows the etcd row as `this server's etcd member belongs to
+a cluster that was reset or restored` with the fix: move `<work-dir>/etcd` aside and join again,
+which is step 4 above. The refusal parks the server until the crash-loop record is cleared. If two
+servers on old data are started while the restored server is down, they can elect a leader and
+serve the old data between them until they reach it. Start the restored server first.
+
+### Snapshots Hold Secrets in Plaintext
+
+An etcd snapshot holds every Secret in the cluster, unencrypted unless the cluster uses
+[secrets encryption](install.md#secrets-encryption-at-rest). `k3sm snapshot save` writes it 0600.
+Keep it that way, and keep it off shared storage. `k3sm snapshot restore` warns when the file it is
+given is readable by its group or by others. It does not change the file's mode, because the file is
+yours: run `chmod 600` on it yourself.
 
 ## Automatic Pre-Migration Backup
 
