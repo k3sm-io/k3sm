@@ -212,11 +212,13 @@ func TestDefaultEtcdVersionMatchesWrapper(t *testing.T) {
 // toolchain) can run it, and the set check admits its marker while still refusing
 // anything else riding along.
 func TestPayloadSetIncludesEtcd(t *testing.T) {
-	if !slices.Contains(PayloadBinaries(), "etcd") {
-		t.Fatalf("PayloadBinaries() = %v, want it to include etcd", PayloadBinaries())
+	for _, want := range []string{"etcd", "etcdutl"} {
+		if !slices.Contains(PayloadBinaries(), want) {
+			t.Fatalf("PayloadBinaries() = %v, want it to include %s", PayloadBinaries(), want)
+		}
 	}
 	dir := t.TempDir()
-	for _, name := range append(PayloadBinaries(), KineMarkerName, EtcdMarkerName, KubeMarkerName) {
+	for _, name := range append(PayloadBinaries(), KineMarkerName, EtcdMarkerName, EtcdutlMarkerName, KubeMarkerName) {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -229,6 +231,18 @@ func TestPayloadSetIncludesEtcd(t *testing.T) {
 	}
 	if err := VerifyPayloadSet(dir); !errors.Is(err, ErrPayloadDigestMismatch) {
 		t.Errorf("VerifyPayloadSet with an extra file = %v, want ErrPayloadDigestMismatch", err)
+	}
+	// etcdutl is run from the payload by `k3sm snapshot restore`, never by the
+	// daemon, so no posture's work-dir seed copies it.
+	work := t.TempDir()
+	if err := os.Remove(filepath.Join(dir, "etcdctl")); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedBinDir(discardLogger(), work, dir, DefaultKineVersion, DefaultKubeVersion, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(binDir(work), etcdutlBinaryName)); !os.IsNotExist(err) {
+		t.Errorf("the work-dir seed copied etcdutl (stat err %v); only the restore command runs it", err)
 	}
 }
 
