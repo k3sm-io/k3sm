@@ -188,6 +188,12 @@ func preflightServer(opts *serverOptions, workDirErr error, logger *slog.Logger)
 	if err := validateServerOptions(opts, workDirErr, logger); err != nil {
 		return nil, mode, true, err
 	}
+	// The snapshot schedule, refused before anything is written when it cannot
+	// run, and said once when it is not read.
+	if err := opts.validateEtcdSnapshotFlags(); err != nil {
+		return nil, mode, true, err
+	}
+	opts.logEtcdSnapshotPosture(logger)
 	// The crash-loop circuit breaker (k3sm#344). Every component crash below is
 	// recorded under the work dir; once CrashLoopThreshold of them land inside
 	// CrashLoopWindow the record is tripped and this daemon PARKS instead of

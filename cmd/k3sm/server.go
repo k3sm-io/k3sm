@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -115,8 +116,14 @@ type serverOptions struct {
 	// other singleton ports: two members on one host each need their own.
 	etcdPeerPort    int
 	etcdMetricsPort int
-	joinServer      string // an existing server's LAN address: the CA bundle and the etcd member route (HA server-join)
-	token           string // static admin bearer token (standalone) or the server-class join token (HA server-join)
+	// etcdSnapshotCron, etcdSnapshotRetention and etcdDisableSnapshots are the
+	// scheduled etcd snapshot (k3s's flags and defaults). Read in the etcd posture
+	// only: a single-server SQLite datastore has no schedule, as in k3s.
+	etcdSnapshotCron      string
+	etcdSnapshotRetention int
+	etcdDisableSnapshots  bool
+	joinServer            string // an existing server's LAN address: the CA bundle and the etcd member route (HA server-join)
+	token                 string // static admin bearer token (standalone) or the server-class join token (HA server-join)
 	// tokenFile is a file holding that token, read once at start. It is how the
 	// INSTALLED daemon is given its static admin token: the value never appears
 	// on the argv a plist publishes. See resolveTokenFile.
@@ -209,6 +216,54 @@ func (opts serverOptions) etcdConfig() *executor.EtcdConfig {
 		PeerIP:      opts.etcdPeerIP,
 		PeerPort:    opts.etcdPeerPort,
 		MetricsPort: opts.etcdMetricsPort,
+		Snapshots:   opts.etcdSnapshotSchedule(),
+	}
+}
+
+// etcdSnapshotSchedule renders the scheduled-snapshot block: nil with
+// --etcd-disable-snapshots, and nil for an expression validateEtcdSnapshotFlags
+// would have refused (it runs before any config is built).
+func (opts serverOptions) etcdSnapshotSchedule() *executor.EtcdSnapshotSchedule {
+	if opts.etcdDisableSnapshots {
+		return nil
+	}
+	cron, err := executor.ParseCron(opts.etcdSnapshotCron)
+	if err != nil {
+		return nil
+	}
+	return &executor.EtcdSnapshotSchedule{Cron: cron, Retention: opts.etcdSnapshotRetention}
+}
+
+// etcdSnapshotFlagsChanged reports whether any scheduled-snapshot flag differs from
+// its default.
+func (opts serverOptions) etcdSnapshotFlagsChanged() bool {
+	return opts.etcdDisableSnapshots ||
+		opts.etcdSnapshotRetention != executor.DefaultEtcdSnapshotRetention ||
+		strings.Join(strings.Fields(opts.etcdSnapshotCron), " ") != executor.DefaultEtcdSnapshotCron
+}
+
+// validateEtcdSnapshotFlags refuses a schedule that cannot run: an expression that
+// does not parse or never fires, or a retention below one. It checks them in every
+// posture, because a typo is worth stopping even where the schedule is not read.
+func (opts serverOptions) validateEtcdSnapshotFlags() error {
+	if _, err := executor.ParseCron(opts.etcdSnapshotCron); err != nil {
+		return fmt.Errorf("--etcd-snapshot-schedule-cron: %w", err)
+	}
+	if opts.etcdSnapshotRetention < 1 {
+		return fmt.Errorf("--etcd-snapshot-retention %d: %w", opts.etcdSnapshotRetention, executor.ErrEtcdSnapshotRetention)
+	}
+	return nil
+}
+
+// logEtcdSnapshotPosture says once, at start, when the snapshot flags are not
+// read: in the kine posture (k3s takes no scheduled snapshot of a SQLite datastore
+// either) or with the schedule turned off.
+func (opts serverOptions) logEtcdSnapshotPosture(logger *slog.Logger) {
+	switch {
+	case !opts.etcdPosture() && opts.etcdSnapshotFlagsChanged():
+		logger.Info("the etcd snapshot flags are ignored: scheduled snapshots are an embedded etcd feature, and a single-server SQLite datastore is backed up with `k3sm snapshot save`")
+	case opts.etcdPosture() && opts.etcdDisableSnapshots:
+		logger.Info("scheduled etcd snapshots are off (--etcd-disable-snapshots); take them with `k3sm snapshot save`")
 	}
 }
 
@@ -355,6 +410,11 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.BoolVar(&opts.clusterReset, "cluster-reset", false, "turn this server's existing etcd member into a one-member cluster that keeps its data, then exit; refused while the server is running. Restart the server normally afterwards")
 	fs.IntVar(&opts.etcdPeerPort, "etcd-peer-port", executor.DefaultEtcdPeerPort, "etcd peer listener port on --etcd-peer-ip (embedded etcd HA only) — every member on a host needs its own")
 	fs.IntVar(&opts.etcdMetricsPort, "etcd-metrics-port", executor.DefaultEtcdMetricsPort, "etcd metrics listener port on 127.0.0.1 (embedded etcd HA only) — every member on a host needs its own")
+	// Scheduled etcd snapshots: k3s's three flags with k3s's defaults. Each server
+	// snapshots its own member into <work-dir>/db/snapshots.
+	fs.StringVar(&opts.etcdSnapshotCron, "etcd-snapshot-schedule-cron", executor.DefaultEtcdSnapshotCron, "when to take a scheduled etcd snapshot, as a five-field cron expression in local time (embedded etcd HA only)")
+	fs.IntVar(&opts.etcdSnapshotRetention, "etcd-snapshot-retention", executor.DefaultEtcdSnapshotRetention, "how many of this server's scheduled etcd snapshots to keep; manual snapshots are never removed (embedded etcd HA only)")
+	fs.BoolVar(&opts.etcdDisableSnapshots, "etcd-disable-snapshots", false, "take no scheduled etcd snapshots (embedded etcd HA only)")
 	// HA server-join: a SECOND control-plane server reconstructs the identical
 	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).

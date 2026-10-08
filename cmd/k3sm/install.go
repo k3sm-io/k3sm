@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/version"
@@ -106,8 +107,41 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 		RemoveOldDataRoot: o.removeOldDataRoot,
 		MeshIP:            o.meshIP,
 		SecretsEncryption: o.secretsEncryption,
+		EtcdSnapshots:     o.etcdSnapshotFlags(),
 		Logger:            logger,
 	}
+}
+
+// etcdSnapshotFlags is the install package's request for the scheduled-snapshot
+// flags: only the ones the operator passed, so an unpassed one keeps its carried
+// value (or the daemon's default).
+func (o installFlags) etcdSnapshotFlags() install.EtcdSnapshotFlags {
+	var f install.EtcdSnapshotFlags
+	if o.set["etcd-snapshot-schedule-cron"] {
+		f.Cron = strings.Join(strings.Fields(o.etcdSnapshotCron), " ")
+	}
+	if o.set["etcd-snapshot-retention"] {
+		f.Retention = o.etcdSnapshotRetention
+	}
+	if o.set["etcd-disable-snapshots"] {
+		v := o.etcdDisableSnapshots
+		f.Disable = &v
+	}
+	return f
+}
+
+// validateEtcdSnapshotFlags refuses, before anything is written, a schedule the
+// daemon would refuse at every start.
+func (o installFlags) validateEtcdSnapshotFlags() error {
+	if o.set["etcd-snapshot-schedule-cron"] {
+		if _, err := executor.ParseCron(o.etcdSnapshotCron); err != nil {
+			return fmt.Errorf("--etcd-snapshot-schedule-cron: %w", err)
+		}
+	}
+	if o.set["etcd-snapshot-retention"] && o.etcdSnapshotRetention < 1 {
+		return fmt.Errorf("--etcd-snapshot-retention %d: %w", o.etcdSnapshotRetention, executor.ErrEtcdSnapshotRetention)
+	}
+	return nil
 }
 
 // installFlags is the parsed `k3sm install` command line. It is a struct rather
@@ -143,6 +177,12 @@ type installFlags struct {
 	removeOldDataRoot bool
 	meshIP            string
 	secretsEncryption bool
+	// etcdSnapshotCron, etcdSnapshotRetention and etcdDisableSnapshots are the
+	// scheduled etcd snapshot flags, rendered into the server daemon's arguments
+	// only when passed (see etcdSnapshotFlags).
+	etcdSnapshotCron      string
+	etcdSnapshotRetention int
+	etcdDisableSnapshots  bool
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
@@ -166,6 +206,9 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.removeOldDataRoot, "remove-old-data-root", false, "after a verified migration, delete the .pre-volume copy of the old data root instead of keeping it")
 	fs.StringVar(&o.meshIP, "mesh-ip", "", "this node's wireguard mesh address, written into the server daemon's arguments; needed on every Mac that serves the control plane in a multi-node cluster")
 	fs.BoolVar(&o.secretsEncryption, "secrets-encryption", false, "encrypt Secrets at rest with a key generated on this Mac; a new single-server cluster only (back up <data root>/server/cred with every datastore backup)")
+	fs.StringVar(&o.etcdSnapshotCron, "etcd-snapshot-schedule-cron", executor.DefaultEtcdSnapshotCron, "when the server takes a scheduled etcd snapshot, as a five-field cron expression in local time (embedded etcd HA servers only); written into the server daemon's arguments when passed")
+	fs.IntVar(&o.etcdSnapshotRetention, "etcd-snapshot-retention", executor.DefaultEtcdSnapshotRetention, "how many of this server's scheduled etcd snapshots to keep (embedded etcd HA servers only); written into the server daemon's arguments when passed")
+	fs.BoolVar(&o.etcdDisableSnapshots, "etcd-disable-snapshots", false, "take no scheduled etcd snapshots on this server (embedded etcd HA servers only); written into the server daemon's arguments when passed")
 	if err := fs.Parse(args); err != nil {
 		return installFlags{}, err
 	}
@@ -177,6 +220,9 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	o.set = map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { o.set[f.Name] = true })
 	if err := o.validateRole(); err != nil {
+		return installFlags{}, err
+	}
+	if err := o.validateEtcdSnapshotFlags(); err != nil {
 		return installFlags{}, err
 	}
 	return o, nil
@@ -232,6 +278,9 @@ var serverOnlyInstallFlags = []string{
 	"data-volume-encrypt",
 	"remove-old-data-root",
 	"secrets-encryption",
+	"etcd-snapshot-schedule-cron",
+	"etcd-snapshot-retention",
+	"etcd-disable-snapshots",
 }
 
 // role is the install role these flags select.
