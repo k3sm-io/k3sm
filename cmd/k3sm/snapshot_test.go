@@ -279,3 +279,77 @@ func TestSnapshotSaveDispatchesByPosture(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveRestoreTarget: the posture comes from configuration (the installed
+// server's role flags, or --etcd-peer-ip here), never from a member existing on disk,
+// and the member identity defaults to the installed server's own flags.
+func TestResolveRestoreTarget(t *testing.T) {
+	installedEtcd := []string{"--cluster-init", "--etcd-peer-ip", "192.0.2.10", "--node-name=studio", "--etcd-peer-port", "2390"}
+	for _, tc := range []struct {
+		name      string
+		installed []string
+		flags     restoreFlags
+		want      restoreTarget
+	}{
+		{"single-server install", []string{"--mesh-ip", "100.64.0.1"}, restoreFlags{}, restoreTarget{}},
+		{"cluster-init install", installedEtcd, restoreFlags{},
+			restoreTarget{etcd: true, name: "studio", peerIP: "192.0.2.10", peerPort: 2390}},
+		{"server-join install, flags win", []string{"--server-join=true", "--etcd-peer-ip", "192.0.2.10"},
+			restoreFlags{nodeName: "b", peerIP: "192.0.2.11", peerPort: 2400},
+			restoreTarget{etcd: true, name: "b", peerIP: "192.0.2.11", peerPort: 2400}},
+		{"--cluster-init=false is the kine posture", []string{"--cluster-init=false"}, restoreFlags{}, restoreTarget{}},
+		{"no install, --etcd-peer-ip given", nil, restoreFlags{peerIP: "192.0.2.12", nodeName: "c"},
+			restoreTarget{etcd: true, name: "c", peerIP: "192.0.2.12", peerPort: executor.DefaultEtcdPeerPort}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveRestoreTarget(tc.installed, tc.flags)
+			got.identitySource = ""
+			if got != tc.want {
+				t.Errorf("resolveRestoreTarget = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRestoreDispatchesByPosture: an etcd-configured server takes the etcd restore
+// with its identity; an unconfigured work dir that holds a member is refused with the
+// flag to pass; everything else takes the kine restore.
+func TestRestoreDispatchesByPosture(t *testing.T) {
+	var gotEtcd *executor.EtcdRestoreOptions
+	kineCalled := false
+	r := snapshotRestorers{
+		etcdMember: func(string) bool { return true },
+		etcd: func(_ context.Context, o executor.EtcdRestoreOptions) (*executor.EtcdRestoreResult, error) {
+			gotEtcd = &o
+			return &executor.EtcdRestoreResult{Snapshot: o.Snapshot, MemberName: o.Name, PeerURL: "https://192.0.2.10:2390",
+				RevisionBump: executor.EtcdRestoreRevisionBump, PreviousDataDir: "/wd/etcd.restore-x.bak"}, nil
+		},
+		kine: func(context.Context, executor.SnapshotRestoreOptions) (*executor.SnapshotRestoreResult, error) {
+			kineCalled = true
+			return &executor.SnapshotRestoreResult{}, nil
+		},
+	}
+	var out bytes.Buffer
+	req := restoreRequest{workDir: "/wd", snapshot: "/s.db", payloadBinDir: "/Library/k3sm/bin",
+		target: restoreTarget{etcd: true, name: "studio", peerIP: "192.0.2.10", peerPort: 2390}}
+	if err := restoreSnapshot(context.Background(), &out, req, r); err != nil {
+		t.Fatal(err)
+	}
+	if gotEtcd == nil || gotEtcd.Name != "studio" || gotEtcd.PeerIP != "192.0.2.10" || gotEtcd.PeerPort != 2390 || gotEtcd.PayloadBinDir != "/Library/k3sm/bin" || kineCalled {
+		t.Fatalf("etcd dispatch got %+v (kine called %v)", gotEtcd, kineCalled)
+	}
+	for _, want := range []string{"only member of a NEW cluster", "relists", "etcd.restore-x.bak", "Re-join every OTHER server", "--server-join"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("etcd restore report lacks %q:\n%s", want, out.String())
+		}
+	}
+
+	req.target = restoreTarget{}
+	if err := restoreSnapshot(context.Background(), &out, req, r); !errors.Is(err, executor.ErrEtcdRestoreNeedsEtcd) || !strings.Contains(err.Error(), "--etcd-peer-ip") {
+		t.Fatalf("unconfigured member restore = %v, want ErrEtcdRestoreNeedsEtcd naming --etcd-peer-ip", err)
+	}
+	r.etcdMember = func(string) bool { return false }
+	if err := restoreSnapshot(context.Background(), &out, req, r); err != nil || !kineCalled {
+		t.Fatalf("kine restore = %v (called %v)", err, kineCalled)
+	}
+}

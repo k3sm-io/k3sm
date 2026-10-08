@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -208,22 +209,61 @@ func OperatorServerArgs(plist []byte) ([]string, error) {
 // because "" would send that probe to loopback on exactly the posture where
 // loopback is refused.
 func InstalledMeshIP(read func(path string) ([]byte, error), plistPath, recordPath string) (string, error) {
+	args, err := InstalledServerArgs(read, plistPath, recordPath)
+	if err != nil {
+		return "", err
+	}
+	return flagValue(args, "mesh-ip"), nil
+}
+
+// InstalledServerArgs returns the operator-supplied `k3sm server` arguments of the
+// installed control plane, read from the installed server plist at plistPath
+// (authoritative: it is the argv launchd runs), then, only when that plist is absent,
+// the server-arguments record at recordPath. Neither present is nil with no error. A
+// plist that exists but cannot be read or parsed is an ERROR, never nil.
+//
+// Exported for the commands that act on the installed server offline (`k3sm
+// certificate rotate --restart`, `k3sm snapshot restore`), which must see the flags
+// the daemon runs with rather than guess them.
+func InstalledServerArgs(read func(path string) ([]byte, error), plistPath, recordPath string) ([]string, error) {
 	raw, err := read(plistPath)
 	switch {
 	case err == nil:
 		args, perr := OperatorServerArgs(raw)
 		if perr != nil {
-			return "", fmt.Errorf("read the installed server plist %s: %w", plistPath, perr)
+			return nil, fmt.Errorf("read the installed server plist %s: %w", plistPath, perr)
 		}
-		return flagValue(args, "mesh-ip"), nil
+		return args, nil
 	case !errors.Is(err, fs.ErrNotExist):
-		return "", fmt.Errorf("read the installed server plist %s: %w", plistPath, err)
+		return nil, fmt.Errorf("read the installed server plist %s: %w", plistPath, err)
 	}
 	rec, err := dataroot.ReadServerArgsRecord(readerFunc(read), recordPath)
 	if err != nil || rec == nil {
-		return "", err
+		return nil, err
 	}
-	return flagValue(filterManagedServerArgs(rec.Args), "mesh-ip"), nil
+	return filterManagedServerArgs(rec.Args), nil
+}
+
+// ServerArgValue returns the value of the valued flag name in args (either
+// spelling, inline or separate), or "".
+func ServerArgValue(args []string, name string) string { return flagValue(args, name) }
+
+// ServerArgBool reports whether the boolean flag name is set in args: present bare,
+// or with an inline value Go's flag package reads as true.
+func ServerArgBool(args []string, name string) bool {
+	set := false
+	for _, a := range args {
+		n, v, inline := splitFlag(a)
+		if n != name {
+			continue
+		}
+		set = !inline
+		if inline {
+			b, err := strconv.ParseBool(v)
+			set = err == nil && b
+		}
+	}
+	return set
 }
 
 // readerFunc adapts a plain read function to dataroot.FileReader.
