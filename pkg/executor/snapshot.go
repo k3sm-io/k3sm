@@ -53,18 +53,22 @@ import (
 // depend on the drain.
 //
 // Scope: the single-node kine→SQLite datastore only. An etcd member is saved by
-// SnapshotEtcd (etcdreset.go): SaveSnapshot refuses it (ErrSnapshotEtcdMember) rather
-// than copy a state.db that is not the cluster's state, and restore refuses it
-// (ErrEtcdRestoreUnsupported).
+// SnapshotEtcd (etcdreset.go) and restored by RestoreEtcdSnapshot (etcdrestore.go):
+// SaveSnapshot and RestoreSnapshot refuse it (ErrSnapshotEtcdMember) rather than copy
+// or replace a state.db that is not the cluster's state, and RestoreSnapshot refuses
+// an etcd snapshot file (ErrEtcdSnapshotForKine).
 
 // Snapshot failures. Each is a typed sentinel (errors.Is-comparable) so the CLI can turn
 // it into an actionable message and a non-zero exit without string matching.
 var (
-	// ErrSnapshotEtcdMember reports a SQLite save attempted on a node whose state of
-	// record is an embedded etcd member. A "snapshot" of a local SQLite file on such a
-	// node would be empty (--cluster-init refuses a non-empty one) presented as the
-	// cluster's state; the member is saved with the etcd snapshot instead.
-	ErrSnapshotEtcdMember = errors.New("executor: this server's datastore is an embedded etcd member, not a kine SQLite file; save it with the etcd snapshot")
+	// ErrSnapshotEtcdMember reports a SQLite save or restore attempted on a node whose
+	// state of record is an embedded etcd member. A "snapshot" of a local SQLite file
+	// on such a node would be empty (--cluster-init refuses a non-empty one) presented
+	// as the cluster's state. The error names the etcd command for the operation.
+	ErrSnapshotEtcdMember = errors.New("executor: this server's datastore is an embedded etcd member, not a kine SQLite file")
+	// ErrSnapshotSpace reports a volume without room for a snapshot save or restore.
+	// The error also matches ErrKineSnapshotSpace, which callers before it matched.
+	ErrSnapshotSpace = errors.New("executor: not enough free space for the snapshot")
 	// ErrNoDatastore reports that the work dir holds no state.db to snapshot.
 	ErrNoDatastore = errors.New("executor: no kine SQLite datastore to snapshot")
 	// ErrSnapshotIntegrity reports a snapshot that failed PRAGMA integrity_check. On
@@ -164,7 +168,7 @@ func SaveSnapshot(ctx context.Context, opts SnapshotSaveOptions) (*SnapshotSaveR
 	if opts.WorkDir == "" {
 		return nil, errors.New("executor: snapshot save requires a work dir")
 	}
-	if err := requireLocalDatastore(opts.WorkDir); err != nil {
+	if err := requireLocalDatastore(opts.WorkDir, "`k3sm snapshot save` takes an etcd snapshot on this server"); err != nil {
 		return nil, err
 	}
 	db := StateDBPath(opts.WorkDir)
@@ -183,7 +187,7 @@ func SaveSnapshot(ctx context.Context, opts SnapshotSaveOptions) (*SnapshotSaveR
 	}
 	// The floor is measured on the DESTINATION volume, which is the one the write can
 	// fill — an --out onto external storage moves the constraint with it.
-	if err := requireFreeSpace(filepath.Dir(out), uint64(fi.Size())*snapshotFreeSpaceFactor); err != nil {
+	if err := requireSnapshotSpace(filepath.Dir(out), uint64(fi.Size())*snapshotFreeSpaceFactor); err != nil {
 		return nil, err
 	}
 
@@ -246,11 +250,8 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 		return nil, errors.New("executor: snapshot restore requires a snapshot to restore")
 	}
 	// An etcd member's state is not a state.db; restoring one over it would be
-	// neither its data nor a working cluster.
-	if EtcdMemberExists(opts.WorkDir) {
-		return nil, ErrEtcdRestoreUnsupported
-	}
-	if err := requireLocalDatastore(opts.WorkDir); err != nil {
+	// neither its data nor a working cluster. RestoreEtcdSnapshot restores a member.
+	if err := requireLocalDatastore(opts.WorkDir, "restore an etcd snapshot with `k3sm snapshot restore` on an etcd server: the installed server's --cluster-init or --server-join selects it, or pass --etcd-peer-ip"); err != nil {
 		return nil, err
 	}
 	if opts.Running == nil {
@@ -271,6 +272,11 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%w: %s is not a regular file", ErrSnapshotNotFound, opts.Snapshot)
 	}
+	// The posture preflight shared with the etcd restore: an etcd snapshot is never
+	// handed to SQLite, whose integrity_check would only say "not a database".
+	if err := refuseEtcdSnapshotForKine(opts.Snapshot); err != nil {
+		return nil, err
+	}
 	// VERIFY FIRST — before the datastore is touched. A restore that discovers the
 	// snapshot is corrupt only after moving the live database aside has destroyed the
 	// one copy of the state that was still good.
@@ -282,7 +288,7 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 	if err := os.MkdirAll(dbd, 0o755); err != nil {
 		return nil, fmt.Errorf("create datastore dir: %w", err)
 	}
-	if err := requireFreeSpace(dbd, uint64(fi.Size())*snapshotFreeSpaceFactor); err != nil {
+	if err := requireSnapshotSpace(dbd, uint64(fi.Size())*snapshotFreeSpaceFactor); err != nil {
 		return nil, err
 	}
 
@@ -399,9 +405,9 @@ func portHeld(ctx context.Context, port int) (string, bool) {
 // SQLite file: an initialized etcd member is decisive even when a state.db is present,
 // because snapshotting THAT would hand the operator a database that is not the
 // cluster's state.
-func requireLocalDatastore(workDir string) error {
+func requireLocalDatastore(workDir, etcdAction string) error {
 	if EtcdMemberExists(workDir) {
-		return fmt.Errorf("%w (%s)", ErrSnapshotEtcdMember, EtcdDataDir(workDir))
+		return fmt.Errorf("%w (%s); %s", ErrSnapshotEtcdMember, EtcdDataDir(workDir), etcdAction)
 	}
 	return nil
 }
@@ -486,6 +492,34 @@ func inheritDatastoreOwner(db, staged string) error {
 	if err := os.Chown(staged, int(st.Uid), int(st.Gid)); err != nil {
 		return fmt.Errorf("give the restored datastore the ownership of %s (uid %d gid %d) — the control plane runs as that user and could not write a datastore owned by anyone else; re-run with sudo: %w",
 			db, st.Uid, st.Gid, err)
+	}
+	return nil
+}
+
+// snapshotSpaceError is a snapshot save or restore refused for space. It matches both
+// ErrSnapshotSpace and the older ErrKineSnapshotSpace.
+type snapshotSpaceError struct {
+	dir         string
+	avail, want uint64
+}
+
+func (e *snapshotSpaceError) Error() string {
+	return fmt.Sprintf("%v: %s has %d bytes available, need %d (%dx the snapshot's size); free space and re-run",
+		ErrSnapshotSpace, e.dir, e.avail, e.want, snapshotFreeSpaceFactor)
+}
+
+func (e *snapshotSpaceError) Is(target error) bool {
+	return target == ErrSnapshotSpace || target == ErrKineSnapshotSpace
+}
+
+// requireSnapshotSpace is requireFreeSpace for a snapshot save or restore.
+func requireSnapshotSpace(dir string, want uint64) error {
+	avail, err := freeSpace(dir)
+	if err != nil {
+		return err
+	}
+	if avail < want {
+		return &snapshotSpaceError{dir: dir, avail: avail, want: want}
 	}
 	return nil
 }

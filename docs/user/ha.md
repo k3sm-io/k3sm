@@ -112,9 +112,11 @@ Rolling back is described under [Upgrade](upgrade.md#rolling-back-past-the-aggre
 
 Until a two-server cluster has been run end to end, there is no HA control plane to rely on, and no
 availability guarantee. Keep datastore backups (see [Backup & restore](backup-restore.md)).
-On a server started with `--cluster-init`, `k3sm snapshot save` streams an online snapshot of this
-server's etcd member, and `k3sm snapshot restore` refuses, because restoring an etcd member is not
-supported in this release.
+On a server started with `--cluster-init` or `--server-join`, `k3sm snapshot save` streams an online
+snapshot of this server's etcd member. `k3sm snapshot restore` puts one back as a new single-member
+cluster, and every other server joins it again as a new member; see
+[Restoring an HA Server](backup-restore.md#restoring-an-ha-server-embedded-etcd). Scheduled snapshots
+are not offered yet; take them yourself.
 
 ## Next
 

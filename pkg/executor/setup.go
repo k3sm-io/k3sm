@@ -737,11 +737,12 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // PayloadBinaries is the full control-plane payload set a packaged install must
 // stage beside the daemon (the boot path otherwise acquires them with gh/go —
 // dev-shell tools a launchd daemon does not have): the kwok-ci/k8s prebuilt
-// binaries plus kine and etcd, and the pinned helm the helm controller's Jobs run (see
+// binaries plus kine, etcd and etcdutl (the offline tool `k3sm snapshot restore` runs
+// on an etcd server), and the pinned helm the helm controller's Jobs run (see
 // helm.go). The single source for `k3sm payload`, `k3sm install`, and
 // the boot-time seed, so the three can never disagree on the set.
 func PayloadBinaries() []string {
-	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, helmchart.HelmBinaryName)
+	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, etcdutlBinaryName, helmchart.HelmBinaryName)
 }
 
 // StagePayload acquires the full control-plane payload into destDir using the
@@ -775,6 +776,9 @@ func StagePayload(ctx context.Context, destDir string) error {
 		return err
 	}
 	if err := ensureEtcdInto(ctx, destDir, DefaultEtcdVersion); err != nil {
+		return err
+	}
+	if err := ensureEtcdutlInto(ctx, destDir, DefaultEtcdVersion); err != nil {
 		return err
 	}
 	// helm is re-downloaded and re-verified even if present (force): these bytes
@@ -859,6 +863,11 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 	}
 	for _, name := range PayloadBinaries() {
 		if name == etcdBinaryName && !withEtcd {
+			continue
+		}
+		// etcdutl is never seeded: the daemon does not run it. `k3sm snapshot restore`
+		// runs it offline, from the payload directory itself.
+		if name == etcdutlBinaryName {
 			continue
 		}
 		dst := filepath.Join(bd, name)

@@ -150,6 +150,8 @@ func VerifyPayloadSet(dir string) error {
 	allowed[KineMarkerName] = true
 	// The etcd version marker rides beside the etcd binary on exactly kine's terms.
 	allowed[EtcdMarkerName] = true
+	// So does etcdutl's, beside the restore tool built from the same wrapper.
+	allowed[EtcdutlMarkerName] = true
 	// The control-plane version marker (KubeMarkerName) rides beside the four
 	// kwok-ci/k8s binaries on the same terms: StagePayload writes it after they are
 	// digest-verified and signed, and it is what lets the workdir seed replace a stale

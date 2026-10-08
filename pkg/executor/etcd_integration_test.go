@@ -45,6 +45,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -83,8 +84,8 @@ const (
 	itConverge = 45 * time.Second
 )
 
-// itEtcd is the wrapper binary, built once per test binary and shared by the three
-// tests; afterTestBinary removes it.
+// itEtcd is the wrapper's etcd binary (and etcdutl beside it), built once per test
+// binary and shared by the tests; afterTestBinary removes them.
 var itEtcd struct {
 	once sync.Once
 	bin  string
@@ -120,7 +121,12 @@ func stageITEtcd() {
 	afterTestBinary = append(afterTestBinary, func() { _ = os.RemoveAll(dir) })
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
-	if err := ensureEtcdInto(ctx, dir, DefaultEtcdVersion); err != nil {
+	err = ensureEtcdInto(ctx, dir, DefaultEtcdVersion)
+	if err == nil {
+		// etcdutl from the same wrapper, beside it: the restore test's payload dir.
+		err = ensureEtcdutlInto(ctx, dir, DefaultEtcdVersion)
+	}
+	if err != nil {
 		switch {
 		case errors.Is(err, ErrNoGoToolchain):
 			itEtcd.skip = "no Go toolchain to build the etcd wrapper: " + err.Error()
@@ -960,4 +966,187 @@ func hasMember(ms []bootstrap.EtcdMember, id uint64, name string) bool {
 		}
 	}
 	return false
+}
+
+// itPKIDigests hashes every file under a work dir's PKI dir, keyed by relative path.
+func itPKIDigests(t *testing.T, wd string) map[string][32]byte {
+	t.Helper()
+	return itTreeDigests(t, certs.PKIDir(wd))
+}
+
+// itTreeDigests hashes every regular file under root, keyed by relative path.
+func itTreeDigests(t *testing.T, root string) map[string][32]byte {
+	t.Helper()
+	out := map[string][32]byte{}
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return err
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		out[rel] = sha256.Sum256(b)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// bringUpResult starts the member and runs the production bring-up waits, returning
+// their error instead of failing the test (a stale member is EXPECTED to fail).
+func (m *itMember) bringUpResult(t *testing.T, ctx context.Context) func() error {
+	t.Helper()
+	m.start(t, ctx)
+	admin, err := dialEtcdAdmin(ctx, m.wd, m.clientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	return func() error { return m.s.promoteAndAwaitQuorum(ctx, admin, m.c) }
+}
+
+// TestEtcdSnapshotRestoreSingleMember is the restore gate: from a three-member
+// loopback cluster, write K1, save a snapshot, write K2; stop every member and
+// restore the snapshot on A through the production restore (the real etcdutl from
+// the wrapper, under the work-dir lock). A comes back as the only member of a NEW
+// cluster with K1 and without K2, its revision past the pre-restore head; its old
+// data dir is preserved byte-identical. B and C started on their old data are
+// refused as superseded (cluster-ID mismatch) within a bound, with the status
+// record saying so. B, wiped, re-joins as a learner and is promoted. A's PKI is
+// byte-identical throughout.
+func TestEtcdSnapshotRestoreSingleMember(t *testing.T) {
+	a, b, c, h, peers, ports := threeMembers(t)
+	cli := itClient(t, a.wd, a.clientURL(), b.clientURL(), c.clientURL())
+	putEventually(t, cli, "/k3sm-it/K1", "before-snapshot")
+	snap := filepath.Join(t.TempDir(), "k3sm-etcd-snapshot.db")
+	if err := SnapshotEtcd(t.Context(), a.wd, snap); err != nil {
+		t.Fatalf("SnapshotEtcd: %v", err)
+	}
+	putEventually(t, cli, "/k3sm-it/K2", "after-snapshot")
+	gctx, gcancel := context.WithTimeout(t.Context(), 10*time.Second)
+	head, err := cli.Get(gctx, "/k3sm-it/K2")
+	gcancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	preRestoreRev := head.Header.Revision
+	oldCluster := head.Header.ClusterId
+
+	a.stop(t)
+	b.stop(t)
+	c.stop(t)
+
+	pkiBefore := itPKIDigests(t, a.wd)
+	dataBefore := itTreeDigests(t, EtcdDataDir(a.wd))
+
+	// The real seams, with etcdutl's run wrapped to prove the work-dir lock is held
+	// while the data dir is rebuilt.
+	seams := defaultEtcdRestoreSeams()
+	realRun := seams.run
+	lockHeld := false
+	seams.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if _, err := lockWorkDir(a.wd); errors.Is(err, ErrWorkDirLocked) {
+			lockHeld = true
+		}
+		return realRun(ctx, bin, args)
+	}
+	rctx, rcancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer rcancel()
+	res, err := restoreEtcdSnapshot(rctx, EtcdRestoreOptions{
+		WorkDir: a.wd, Snapshot: snap, Name: a.name, PeerIP: "127.0.0.1", PeerPort: a.cfg.Etcd.PeerPort,
+		ClientPort: a.cfg.KinePort, APIServerPort: ports.next(t), PayloadBinDir: filepath.Dir(itEtcdBinary(t)),
+	}, seams)
+	if err != nil {
+		t.Fatalf("restore on %s: %v", a.name, err)
+	}
+	if !lockHeld {
+		t.Error("the work-dir lock was not held while etcdutl rebuilt the data dir")
+	}
+	if res.PreviousDataDir == "" {
+		t.Fatal("the restore preserved no previous data dir")
+	}
+	if got := itTreeDigests(t, res.PreviousDataDir); len(got) != len(dataBefore) {
+		t.Errorf(".bak holds %d files, the live data dir held %d", len(got), len(dataBefore))
+	} else {
+		for k, v := range dataBefore {
+			if got[k] != v {
+				t.Errorf(".bak %s differs from the data dir it preserved", k)
+			}
+		}
+	}
+
+	// A alone: exactly itself at its peer URL, a new cluster, K1 and not K2, and a
+	// revision past the pre-restore head.
+	a.bringUp(t)
+	aadmin := localAdmin(t, a)
+	ms := awaitMembers(t, aadmin, "exactly the restored member", votingExactly(1))
+	if want := etcdPeerURL("127.0.0.1", a.cfg.Etcd.PeerPort); ms[0].Name != a.name || len(ms[0].PeerURLs) != 1 || ms[0].PeerURLs[0] != want {
+		t.Fatalf("after the restore the member list is %+v, want only %s at %s", ms, a.name, want)
+	}
+	acli := itClient(t, a.wd, a.clientURL())
+	mustGet(t, acli, "/k3sm-it/K1", "before-snapshot")
+	gctx, gcancel = context.WithTimeout(t.Context(), 10*time.Second)
+	k2, err := acli.Get(gctx, "/k3sm-it/K2")
+	gcancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(k2.Kvs) != 0 {
+		t.Errorf("K2, written after the snapshot, survived the restore: %v", k2.Kvs)
+	}
+	if k2.Header.ClusterId == oldCluster {
+		t.Errorf("the restored cluster kept the old cluster ID %x", oldCluster)
+	}
+	if k2.Header.Revision < preRestoreRev {
+		t.Errorf("revision after the restore %d < the pre-restore head %d", k2.Header.Revision, preRestoreRev)
+	}
+	t.Logf("restored: cluster %x -> %x, revision %d -> %d", oldCluster, k2.Header.ClusterId, preRestoreRev, k2.Header.Revision)
+
+	// B and C on their old data: both refused as superseded within the bound,
+	// whether or not the two of them elect a leader first.
+	const staleBound = 90 * time.Second
+	sctx, scancel := context.WithTimeout(t.Context(), staleBound)
+	defer scancel()
+	waitB, waitC := b.bringUpResult(t, sctx), c.bringUpResult(t, sctx)
+	errs := make(chan error, 2)
+	go func() { errs <- waitB() }()
+	go func() { errs <- waitC() }()
+	for range 2 {
+		if err := <-errs; !errors.Is(err, ErrEtcdMemberSuperseded) {
+			t.Fatalf("a stale member's bring-up = %v, want ErrEtcdMemberSuperseded within %s", err, staleBound)
+		}
+	}
+	for _, m := range []*itMember{b, c} {
+		st, err := ReadEtcdStatus(m.wd)
+		if err != nil || !st.Superseded || !strings.Contains(st.SupersededDetail, a.name) ||
+			!strings.Contains(st.SupersededRemedy, "confirm "+a.name) || st.ForeignPeer != "" {
+			t.Errorf("%s status record = %+v (%v), want Superseded naming %s, with the verify-first remedy", m.name, st, err, a.name)
+		}
+		m.stop(t)
+	}
+	// The restored cluster was never joined by either.
+	awaitMembers(t, aadmin, "still exactly the restored member", votingExactly(1))
+
+	// B, wiped, re-joins the restored cluster as a learner and is promoted.
+	route := newITRoute(t, a, h, peers)
+	b.wipe(t)
+	b.join(t, route)
+	awaitMembers(t, aadmin, "two voting members", votingExactly(2))
+	bcli := itClient(t, b.wd, b.clientURL())
+	mustGet(t, bcli, "/k3sm-it/K1", "before-snapshot")
+	putEventually(t, bcli, "/k3sm-it/after-rejoin", "two")
+
+	pkiAfter := itPKIDigests(t, a.wd)
+	if len(pkiAfter) != len(pkiBefore) {
+		t.Errorf("A's PKI dir has %d files after, %d before", len(pkiAfter), len(pkiBefore))
+	}
+	for k, v := range pkiBefore {
+		if pkiAfter[k] != v {
+			t.Errorf("A's PKI file %s changed across the restore", k)
+		}
+	}
 }

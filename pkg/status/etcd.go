@@ -152,12 +152,22 @@ func EtcdHealth(st executor.EtcdStatus) (severity Severity, detail, remedy strin
 	detail = strings.Join(parts, ", ")
 
 	switch {
+	case st.Superseded:
+		// Ahead of everything: this member's view of its own cluster is the
+		// replaced cluster's, so every other figure here describes data that no
+		// longer counts.
+		return SeverityFail, st.SupersededDetail, st.SupersededRemedy
 	case slices.Contains(st.Alarms, "NOSPACE"):
 		return SeverityFail, detail + "; the cluster is read-only (NOSPACE)", EtcdNoSpaceRemedy
 	case len(st.Alarms) > 0:
 		return SeverityFail, detail, "read the server log for the alarm's cause; a CORRUPT member must be removed and re-joined with a wiped etcd data dir"
 	case !st.LeaderPresent:
 		return SeverityFail, detail + "; writes are stopped until a majority of members is reachable", EtcdNoLeaderRemedy
+	case st.ForeignPeer != "":
+		// A warning, never a failure: this member's own cluster may be healthy, and
+		// the peer is what needs checking.
+		return SeverityWarn, detail + "; " + executor.EtcdPeerForeignMessage + ": " + st.ForeignPeer,
+			"check the Mac at that peer address: if it was reinstalled there by mistake, stop its server; if it is the server you restored, wipe this server's <work-dir>/etcd and re-join it"
 	case st.PeerURLDrift:
 		return SeverityWarn, fmt.Sprintf("%s; registered peer URL %s is not this server's %s", detail, strings.Join(st.RegisteredPeerURLs, ","), st.ExpectedPeerURL), executor.EtcdPeerURLDriftRemedy
 	case st.QuotaBytes > 0 && float64(st.DBSizeBytes) >= etcdQuotaWarnFraction*float64(st.QuotaBytes):

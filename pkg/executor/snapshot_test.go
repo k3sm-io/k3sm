@@ -197,8 +197,9 @@ func TestSaveSnapshotRefusals(t *testing.T) {
 		t.Cleanup(func() { freeSpace = orig })
 		freeSpace = func(string) (uint64, error) { return 1, nil }
 		_, err := SaveSnapshot(context.Background(), SnapshotSaveOptions{WorkDir: work})
-		if !errors.Is(err, ErrKineSnapshotSpace) {
-			t.Fatalf("err = %v, want ErrKineSnapshotSpace", err)
+		// The neutral sentinel, and the older one its callers matched.
+		if !errors.Is(err, ErrSnapshotSpace) || !errors.Is(err, ErrKineSnapshotSpace) || strings.Contains(err.Error(), "pre-migration") {
+			t.Fatalf("err = %v, want ErrSnapshotSpace (and ErrKineSnapshotSpace) without the pre-migration wording", err)
 		}
 		if entries, _ := os.ReadDir(SnapshotDir(work)); len(entries) != 0 {
 			t.Errorf("a refused save left %d files behind: %v", len(entries), entries)

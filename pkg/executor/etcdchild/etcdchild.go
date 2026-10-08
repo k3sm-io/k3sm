@@ -15,13 +15,16 @@ limitations under the License.
 */
 
 // Package etcdchild carries the three-file wrapper module the executor builds the
-// pinned etcd server from.
+// pinned etcd server, and etcdutl at the same pin, from.
 //
 // `go install go.etcd.io/etcd/server/v3@<pin>` cannot work: upstream's server/go.mod
 // carries monorepo-relative replace directives, and `go install pkg@version` refuses
 // any module that does. So the binary is built from a tiny module of our own that
 // requires the server module at the pin and whose main is upstream's own
-// server/main.go body (etcdmain.Main).
+// server/main.go body (etcdmain.Main). The same module declares upstream's etcdutl
+// as a `tool`, so `go build go.etcd.io/etcd/etcdutl/v3` inside it produces the
+// restore tool from the one module graph the server is built from: one go.mod, one
+// pin, no second etcd version.
 //
 // The files are embedded as text, not as go.mod/main.go: a directory holding a go.mod
 // is a nested module that //go:embed cannot reach into, and a .go file would be

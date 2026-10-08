@@ -266,6 +266,8 @@ type Supervised struct {
 	etcdAdmin     etcdAdmin
 	etcdWatchStop context.CancelFunc
 	etcdWatchDone chan struct{}
+	// etcdPID is the running etcd child's pid, for the status record.
+	etcdPID int
 	// unlockWorkDir releases the work-dir lock the etcd posture holds from Start
 	// until Stop has reaped every child (see lockWorkDir). Guarded by mu.
 	unlockWorkDir func() error
@@ -448,6 +450,12 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// anything in the work dir is touched.
 	if err := provisionStep("cluster-init", RefuseClusterInitOverSQLite(s.cfg)); err != nil {
 		return err
+	}
+	// An etcd member never starts over a restore that stopped between its renames.
+	if s.cfg.Etcd != nil {
+		if err := provisionStep("etcd-restore", RefuseInterruptedEtcdRestore(s.cfg.WorkDir)); err != nil {
+			return err
+		}
 	}
 	if err := provisionStep("workdirs", ensureWorkDirs(s.cfg.WorkDir)); err != nil {
 		return err

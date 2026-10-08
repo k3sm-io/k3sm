@@ -2,27 +2,35 @@
 #
 # etcd-wrapper.sh — regenerate and verify the embedded etcd wrapper module.
 #
-# The executor builds the pinned etcd server from a three-file wrapper module
-# embedded as text in pkg/executor/etcdchild (go.mod.txt, go.sum.txt,
-# main.go.txt). `go install go.etcd.io/etcd/server/v3@<pin>` is impossible
-# because upstream's server/go.mod carries monorepo replace directives, so the
-# wrapper requires the server module at the pin and its main is upstream's own
-# server/main.go. Nothing outside this script sees the wrapper's dependency
-# graph (it is not a module of this repo), so this is where it is refreshed and
-# checked.
+# The executor builds two programs from a three-file wrapper module embedded as
+# text in pkg/executor/etcdchild (go.mod.txt, go.sum.txt, main.go.txt):
+#
+#   - the pinned etcd server: the wrapper's main is upstream's own
+#     server/main.go. `go install go.etcd.io/etcd/server/v3@<pin>` is impossible
+#     because upstream's server/go.mod carries monorepo replace directives;
+#   - etcdutl at the SAME pin, the offline tool `k3sm snapshot restore` runs to
+#     rebuild a data dir from a snapshot. It is upstream's own etcdutl main
+#     package, declared with a `tool` directive so one go.mod (and one go.sum)
+#     selects every module both programs link.
+#
+# Nothing outside this script sees the wrapper's dependency graph (it is not a
+# module of this repo), so this is where it is refreshed and checked.
 #
 #   regen <version>   rewrite the three files: upstream's server/main.go at
-#                     <version>, a fresh `go get` (plus the OVERRIDES below)
-#                     + `go mod tidy`, keeping the current go/toolchain
-#                     lines. Bump DefaultEtcdVersion
-#                     (pkg/executor/executor.go) in the same commit;
-#                     TestDefaultEtcdVersionMatchesWrapper fails until you do.
+#                     <version>, a fresh `go get` of the server and of etcdutl
+#                     as a tool (plus the OVERRIDES below) + `go mod tidy`,
+#                     keeping the current go/toolchain lines. Bump
+#                     DefaultEtcdVersion (pkg/executor/executor.go) in the same
+#                     commit; TestDefaultEtcdVersionMatchesWrapper fails until
+#                     you do.
 #   verify            materialize the wrapper and run `go mod verify`,
 #                     `go mod tidy -diff` (the committed go.sum is complete),
-#                     and `govulncheck ./...`. A missing govulncheck prints a
-#                     SKIP line and does not fail; every real finding or error
-#                     does. Needs the module proxy (or a warm module cache) and,
-#                     for govulncheck, the vulnerability database.
+#                     the one-pin check (server and etcdutl at one version),
+#                     and `govulncheck` over both programs. A missing
+#                     govulncheck prints a SKIP line and does not fail; every
+#                     real finding or error does. Needs the module proxy (or a
+#                     warm module cache) and, for govulncheck, the
+#                     vulnerability database.
 #
 # Exit status: 0 pass; 1 failure; 2 usage.
 set -euo pipefail
@@ -59,9 +67,29 @@ OVERRIDES=(
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.45.0
 )
 
+# ETCDUTL is the restore tool's main package, built from the wrapper module.
+ETCDUTL=go.etcd.io/etcd/etcdutl/v3
+
 # Every go invocation here builds the wrapper as its own module: never this
 # repo's workspace, never a downloaded toolchain.
 wgo() { GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0 go "$@"; }
+
+# onepin fails unless the server module and etcdutl resolve to <want> (or, with
+# no argument, to one shared version), in the wrapper at $WORK.
+onepin() {
+	local want="${1:-}" server util
+	server="$(cd "$WORK" && wgo list -m -f '{{.Version}}' go.etcd.io/etcd/server/v3)"
+	util="$(cd "$WORK" && wgo list -m -f '{{.Version}}' "$ETCDUTL")"
+	[ -n "$want" ] || want="$server"
+	if [ "$server" != "$want" ] || [ "$util" != "$want" ]; then
+		echo "etcd-wrapper: etcd server is $server and etcdutl is $util (want both at $want)" >&2
+		exit 1
+	fi
+	if ! (cd "$WORK" && grep -qx "tool $ETCDUTL" go.mod); then
+		echo "etcd-wrapper: go.mod declares no 'tool $ETCDUTL'" >&2
+		exit 1
+	fi
+}
 
 regen() {
 	local version="$1"
@@ -85,16 +113,15 @@ regen() {
 	[ -f "$dir/main.go" ] || { echo "regen: upstream main.go not found in $dir" >&2; exit 1; }
 	cp "$dir/main.go" "$WORK/main.go"
 	chmod 0644 "$WORK/main.go"
+	(cd "$WORK" && GOFLAGS=-mod=mod wgo get -tool "$ETCDUTL@$version")
 	(cd "$WORK" && GOFLAGS=-mod=mod wgo get "${OVERRIDES[@]}")
-	# The overrides must not move the server module off the requested pin.
-	local got
-	got="$(cd "$WORK" && wgo list -m -f '{{.Version}}' go.etcd.io/etcd/server/v3)"
-	[ "$got" = "$version" ] || { echo "regen: overrides moved etcd server to $got (want $version)" >&2; exit 1; }
 	(cd "$WORK" && GOFLAGS=-mod=mod wgo mod tidy)
+	# Neither the tool nor the overrides may move either program off the pin.
+	onepin "$version"
 	cp "$WORK/go.mod" "$WRAPPER/go.mod.txt"
 	cp "$WORK/go.sum" "$WRAPPER/go.sum.txt"
 	cp "$WORK/main.go" "$WRAPPER/main.go.txt"
-	echo "regen: wrapper now pins go.etcd.io/etcd/server/v3 $version; set DefaultEtcdVersion = \"$version\" in pkg/executor/executor.go"
+	echo "regen: wrapper now pins go.etcd.io/etcd/server/v3 and $ETCDUTL at $version; set DefaultEtcdVersion = \"$version\" in pkg/executor/executor.go"
 }
 
 verify() {
@@ -106,6 +133,8 @@ verify() {
 	(cd "$WORK" && GOFLAGS=-mod=readonly wgo mod download && GOFLAGS=-mod=readonly wgo mod verify)
 	echo "==> [etcd-wrapper] go mod tidy -diff (the committed lockfile is complete)"
 	(cd "$WORK" && GOFLAGS= wgo mod tidy -diff)
+	echo "==> [etcd-wrapper] one pin: etcd server and etcdutl at the same version"
+	onepin
 	local vc=""
 	for c in "$(command -v govulncheck || true)" "$(go env GOPATH)/bin/govulncheck"; do
 		if [ -n "$c" ] && [ -x "$c" ]; then
@@ -116,8 +145,8 @@ verify() {
 	if [ -z "$vc" ]; then
 		echo "==> [etcd-wrapper] SKIP govulncheck: not installed (go install golang.org/x/vuln/cmd/govulncheck@latest)"
 	else
-		echo "==> [etcd-wrapper] govulncheck ./..."
-		(cd "$WORK" && GOWORK=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly "$vc" ./...)
+		echo "==> [etcd-wrapper] govulncheck ./... $ETCDUTL"
+		(cd "$WORK" && GOWORK=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly "$vc" ./... "$ETCDUTL")
 	fi
 	echo "OK: etcd wrapper verified"
 }

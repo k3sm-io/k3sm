@@ -24,8 +24,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -35,6 +37,7 @@ import (
 // cover before they run it, not after.
 const snapshotUsage = `Usage: k3sm snapshot save    [--out <path>] [--work-dir <dir>]
        k3sm snapshot restore <snapshot> [--work-dir <dir>]
+                             [--node-name <name>] [--etcd-peer-ip <ip>] [--etcd-peer-port <port>]
 
 Back up and restore this node's datastore — the control plane's state of record:
 the kine SQLite datastore on a single server, the embedded etcd member on an HA
@@ -48,14 +51,20 @@ server.
            it supersedes is preserved beside it as a .bak, never deleted.
 
 Flags:
-  --work-dir <dir>  control-plane state root (default: this posture's work dir)
-  --out <path>      save: the snapshot file, or a directory to name one in
-                    (default: %s under the work dir)
+  --work-dir <dir>        control-plane state root (default: this posture's work dir)
+  --out <path>            save: the snapshot file, or a directory to name one in
+                          (default: %s under the work dir)
+  --node-name <name>      restore, etcd: this server's member name
+  --etcd-peer-ip <ip>     restore, etcd: this server's etcd peer address
+  --etcd-peer-port <port> restore, etcd: this server's etcd peer port
+                          (all three default to the installed server's own flags)
 
 On an embedded etcd HA server, save streams an online snapshot of this server's
 etcd member (no member is stopped and no quorum is spent), verifies it, and writes
-it 0600: it holds every Secret in plaintext. Restoring an etcd member is not
-supported in this release; restore refuses there.
+it 0600: it holds every Secret in plaintext. Restore, with the server stopped,
+rebuilds this server as the ONLY member of a new etcd cluster holding the
+snapshot's data, and moves the old etcd data dir aside; every other server then
+re-joins as a fresh member with its etcd data dir wiped.
 
 PersistentVolume data is NOT in a snapshot: it lives in local-path directories on each
 node and is backed up separately. See docs/user/backup-restore.md.
@@ -183,41 +192,208 @@ func renderEtcdSnapshotSave(w io.Writer, path string) {
 	}
 	fmt.Fprint(w, `
 Taken online from this server's etcd member and verified. It holds every Secret in
-plaintext: keep it 0600 and copy it OFF this node. Restoring an etcd member is not
-supported in this release.
+plaintext: keep it 0600 and copy it OFF this node. Restore it with (server stopped):
+  k3sm snapshot restore <the file>
 
 PersistentVolume data is NOT in this snapshot — see docs/user/storage.md.
 `)
 }
 
-// runSnapshotRestore parses the flags, wires the live-control-plane probe, and restores.
+// runSnapshotRestore parses the flags, decides the posture, and restores.
 func runSnapshotRestore(args []string) error {
 	fs := flag.NewFlagSet("snapshot restore", flag.ExitOnError)
 	workDir := snapshotWorkDirFlag(fs)
 	apiPort := fs.Int("apiserver-port", executor.DefaultAPIServerPort, "apiserver secure port the running-server check probes")
-	kinePort := fs.Int("datastore-port", executor.DefaultKinePort, "kine listen port the running-server check probes")
+	kinePort := fs.Int("datastore-port", executor.DefaultKinePort, "kine listen port (the etcd client port on an etcd server) the running-server check probes")
+	nodeName := fs.String("node-name", "", "etcd: this server's member name (default: the installed server's --node-name, else this host's node name)")
+	peerIP := fs.String("etcd-peer-ip", "", "etcd: this server's etcd peer address (default: the installed server's --etcd-peer-ip)")
+	peerPort := fs.Int("etcd-peer-port", 0, "etcd: this server's etcd peer port (default: the installed server's --etcd-peer-port, else 2380)")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, snapshotHelp()) }
 	_ = fs.Parse(args)
 	if fs.NArg() != 1 {
 		return fmt.Errorf("snapshot restore takes exactly one argument, the snapshot to restore (got %d)\n\n%s", fs.NArg(), snapshotHelp())
 	}
-
-	res, err := executor.RestoreSnapshot(context.Background(), executor.SnapshotRestoreOptions{
-		WorkDir:  *workDir,
-		Snapshot: fs.Arg(0),
-		Running:  liveControlPlaneProbe(install.NewDarwinSystem(), install.ServerLabel, *kinePort, *apiPort),
-	})
+	installed, err := install.InstalledServerArgs(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath)
 	if err != nil {
-		return annotateSnapshotError(err, *workDir)
+		return fmt.Errorf("read the installed server's flags (the restore needs its etcd posture): %w", err)
 	}
-	renderSnapshotRestore(os.Stdout, res)
+	target := resolveRestoreTarget(installed, restoreFlags{nodeName: *nodeName, peerIP: *peerIP, peerPort: *peerPort})
+	sys := install.NewDarwinSystem()
+	return restoreSnapshot(context.Background(), os.Stdout, restoreRequest{
+		workDir: *workDir, snapshot: fs.Arg(0), target: target, kinePort: *kinePort, apiPort: *apiPort,
+		payloadBinDir: installedPayloadBinDir(),
+		kineProbe:     liveControlPlaneProbe(sys, install.ServerLabel, *kinePort, *apiPort),
+		launchd:       launchdProbe(sys, install.ServerLabel),
+	}, defaultSnapshotRestorers())
+}
+
+// restoreFlags are the etcd identity flags given on the command line ("" / 0: not
+// given).
+type restoreFlags struct {
+	nodeName, peerIP string
+	peerPort         int
+}
+
+// restoreTarget is the posture a restore runs in and, for etcd, the member identity.
+type restoreTarget struct {
+	// etcd is set when the server is configured as an embedded etcd member: the
+	// installed server carries --cluster-init or --server-join, or --etcd-peer-ip was
+	// given here.
+	etcd           bool
+	name, peerIP   string
+	peerPort       int
+	identitySource string
+}
+
+// resolveRestoreTarget decides the posture from configuration, never from whether an
+// etcd member exists on disk: a rebuilt server has none and still restores. A flag
+// given here wins over the installed server's.
+func resolveRestoreTarget(installed []string, f restoreFlags) restoreTarget {
+	t := restoreTarget{
+		etcd: f.peerIP != "" || install.ServerArgBool(installed, "cluster-init") || install.ServerArgBool(installed, "server-join"),
+		name: f.nodeName, peerIP: f.peerIP, peerPort: f.peerPort, identitySource: "flags",
+	}
+	if !t.etcd {
+		return t
+	}
+	if t.name == "" {
+		t.name = install.ServerArgValue(installed, "node-name")
+	}
+	if t.name == "" {
+		t.name = defaultNodeName()
+	}
+	if t.peerIP == "" {
+		t.peerIP = install.ServerArgValue(installed, "etcd-peer-ip")
+		t.identitySource = "the installed server's flags"
+	}
+	if t.peerPort == 0 {
+		if p, err := strconv.Atoi(install.ServerArgValue(installed, "etcd-peer-port")); err == nil && p > 0 {
+			t.peerPort = p
+		} else {
+			t.peerPort = executor.DefaultEtcdPeerPort
+		}
+	}
+	return t
+}
+
+// restoreRequest is one restore's inputs.
+type restoreRequest struct {
+	workDir, snapshot string
+	target            restoreTarget
+	kinePort, apiPort int
+	payloadBinDir     string
+	kineProbe         executor.LiveControlPlaneProbe
+	launchd           executor.LiveControlPlaneProbe
+}
+
+// snapshotRestorers are the two restore paths; seams so the dispatch is testable.
+type snapshotRestorers struct {
+	etcdMember func(workDir string) bool
+	etcd       func(ctx context.Context, opts executor.EtcdRestoreOptions) (*executor.EtcdRestoreResult, error)
+	kine       func(ctx context.Context, opts executor.SnapshotRestoreOptions) (*executor.SnapshotRestoreResult, error)
+}
+
+func defaultSnapshotRestorers() snapshotRestorers {
+	return snapshotRestorers{etcdMember: executor.EtcdMemberExists, etcd: executor.RestoreEtcdSnapshot, kine: executor.RestoreSnapshot}
+}
+
+// restoreSnapshot runs the restore the posture calls for.
+func restoreSnapshot(ctx context.Context, w io.Writer, req restoreRequest, r snapshotRestorers) error {
+	if req.target.etcd {
+		res, err := r.etcd(ctx, executor.EtcdRestoreOptions{
+			WorkDir: req.workDir, Snapshot: req.snapshot,
+			Name: req.target.name, PeerIP: req.target.peerIP, PeerPort: req.target.peerPort,
+			ClientPort: req.kinePort, APIServerPort: req.apiPort,
+			PayloadBinDir: req.payloadBinDir, Running: req.launchd,
+		})
+		if err != nil {
+			return annotateSnapshotError(err, req.workDir)
+		}
+		renderEtcdSnapshotRestore(w, res)
+		return nil
+	}
+	if r.etcdMember(req.workDir) {
+		return fmt.Errorf("%w: %s holds an etcd member, but neither the installed server nor this command names its etcd posture; pass --etcd-peer-ip <this server's LAN address> (and --node-name if it is not this host's node name)",
+			executor.ErrEtcdRestoreNeedsEtcd, executor.EtcdDataDir(req.workDir))
+	}
+	res, err := r.kine(ctx, executor.SnapshotRestoreOptions{WorkDir: req.workDir, Snapshot: req.snapshot, Running: req.kineProbe})
+	if err != nil {
+		return annotateSnapshotError(err, req.workDir)
+	}
+	renderSnapshotRestore(w, res)
 	return nil
+}
+
+// installedPayloadBinDir is the bin/ beside the running k3sm binary, where a packaged
+// install staged its payload (etcdutl among it), or "" on a dev shell.
+func installedPayloadBinDir() string {
+	dir, err := install.ExecutableDir()
+	if err != nil {
+		return ""
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "bin")); err == nil && fi.IsDir() {
+		return filepath.Join(dir, "bin")
+	}
+	return ""
+}
+
+// renderEtcdSnapshotRestore prints what an etcd restore did and the steps that make
+// it a working cluster again.
+func renderEtcdSnapshotRestore(w io.Writer, res *executor.EtcdRestoreResult) {
+	fmt.Fprintf(w, "k3sm snapshot restore (embedded etcd) %s\n\n", res.Snapshot)
+	for _, warn := range res.Warnings {
+		fmt.Fprintf(w, "  WARNING    %s\n", warn)
+	}
+	fmt.Fprintf(w, "  restored   %s (%d bytes of snapshot)\n", res.DataDir, res.Bytes)
+	fmt.Fprintf(w, "  member     %s at %s, the only member of a NEW cluster\n", res.MemberName, res.PeerURL)
+	fmt.Fprintf(w, "  revision   raised by %d and marked compacted, so every watcher relists\n", res.RevisionBump)
+	if res.PreviousDataDir != "" {
+		fmt.Fprintf(w, "  preserved  %s (the etcd data dir you replaced, NOT deleted)\n", res.PreviousDataDir)
+	} else {
+		fmt.Fprint(w, "  preserved  nothing: the work dir held no etcd data dir to replace\n")
+	}
+	for _, m := range res.MovedAside {
+		fmt.Fprintf(w, "  moved      %s\n", m)
+	}
+	fmt.Fprintf(w, `
+Next:
+
+1. Start this server:
+     sudo launchctl bootstrap system %s
+
+2. VERIFY the restore before anything else joins:
+     k3sm kubectl get --raw='/readyz?verbose'    # every check ok
+     k3sm kubectl get nodes                      # the nodes the snapshot held
+     k3sm kubectl get pods -A                    # the workloads the snapshot should hold
+     k3sm status                                 # etcd: 1 voting member, leader present
+
+3. Re-join every OTHER server as a fresh member. Their etcd data belongs to the
+   cluster this restore replaced, and they refuse to start on it. On each one:
+     sudo launchctl bootout system/%s
+     sudo mv <its work dir>/etcd <its work dir>/etcd.pre-restore
+     then start it with --server-join, --server <this server's LAN address> and the
+     server token, as when it first joined.
+`, filepath.Join(install.DefaultLaunchDaemonDir, install.ServerLabel+".plist"), install.ServerLabel)
 }
 
 // servicePIDReader reads the pid launchd has for a label. It is the read-only half of
 // install.System, declared here at the consumer so the probe is testable with a fake.
 type servicePIDReader interface {
 	LaunchctlServicePID(label string) (int, error)
+}
+
+// launchdProbe reports the server's launchd job when it is running. A launchd error
+// (usually "not loaded") is not a refusal: the etcd restore's own lock, port and pid
+// probes stay honest in that case.
+func launchdProbe(sys servicePIDReader, label string) executor.LiveControlPlaneProbe {
+	return func(context.Context) (string, error) {
+		if sys != nil {
+			if pid, err := sys.LaunchctlServicePID(label); err == nil && pid > 0 {
+				return fmt.Sprintf("the %s launchd job is running (pid %d)", label, pid), nil
+			}
+		}
+		return "", nil
+	}
 }
 
 // liveControlPlaneProbe reports a running control plane, from two independent signals.
@@ -233,11 +409,10 @@ type servicePIDReader interface {
 // that case, and IT fails closed.
 func liveControlPlaneProbe(sys servicePIDReader, label string, kinePort, apiPort int) executor.LiveControlPlaneProbe {
 	ports := executor.ControlPlanePortProbe(kinePort, apiPort)
+	launchd := launchdProbe(sys, label)
 	return func(ctx context.Context) (string, error) {
-		if sys != nil {
-			if pid, err := sys.LaunchctlServicePID(label); err == nil && pid > 0 {
-				return fmt.Sprintf("the %s launchd job is running (pid %d)", label, pid), nil
-			}
+		if holder, _ := launchd(ctx); holder != "" {
+			return holder, nil
 		}
 		return ports(ctx)
 	}
@@ -248,7 +423,7 @@ func liveControlPlaneProbe(sys servicePIDReader, label string, kinePort, apiPort
 // preserved with %w so errors.Is still works.
 func annotateSnapshotError(err error, workDir string) error {
 	switch {
-	case errors.Is(err, executor.ErrControlPlaneRunning):
+	case errors.Is(err, executor.ErrControlPlaneRunning), errors.Is(err, executor.ErrWorkDirLocked):
 		return fmt.Errorf("%w\n\nStop it first:\n  sudo launchctl bootout system/%s\nand start it again after the restore:\n  sudo launchctl bootstrap system %s",
 			err, install.ServerLabel, filepath.Join(install.DefaultLaunchDaemonDir, install.ServerLabel+".plist"))
 	case errors.Is(err, executor.ErrNoDatastore):

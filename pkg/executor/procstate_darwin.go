@@ -17,6 +17,7 @@ limitations under the License.
 package executor
 
 import (
+	"bytes"
 	"errors"
 
 	"golang.org/x/sys/unix"
@@ -56,4 +57,23 @@ func processExited(pid int) bool {
 		return false
 	}
 	return kp.Proc.P_stat == pStatZombie
+}
+
+// processIsEtcd reports whether pid is a live (not zombie) process whose command name
+// is etcd. A recycled pid that now names something else reads false, which is what
+// keeps a stale status record from refusing a restore forever; an inconclusive kernel
+// answer reads true, the conservative verdict for a check that guards a data dir.
+func processIsEtcd(pid int) bool {
+	if pid <= 0 || processExited(pid) {
+		return false
+	}
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return true
+	}
+	comm := kp.Proc.P_comm[:]
+	if i := bytes.IndexByte(comm, 0); i >= 0 {
+		comm = comm[:i]
+	}
+	return string(comm) == etcdBinaryName
 }

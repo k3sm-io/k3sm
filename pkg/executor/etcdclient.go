@@ -44,8 +44,9 @@ type etcdMember struct {
 
 // etcdMemberStatus is the LOCAL member's Status answer.
 type etcdMemberStatus struct {
-	// MemberID is the answering member; Leader the member it believes leads (0: none).
-	MemberID, Leader uint64
+	// MemberID is the answering member; Leader the member it believes leads (0: none);
+	// ClusterID the cluster the member belongs to.
+	MemberID, Leader, ClusterID uint64
 	// DBSize is the backend file's allocated size, DBSizeInUse the part in use,
 	// DBSizeQuota the configured backend quota.
 	DBSize, DBSizeInUse, DBSizeQuota int64
@@ -150,7 +151,7 @@ func (a *clientv3Admin) Status(ctx context.Context) (etcdMemberStatus, error) {
 	st := etcdMemberStatus{Leader: r.Leader, DBSize: r.DbSize, DBSizeInUse: r.DbSizeInUse,
 		DBSizeQuota: r.DbSizeQuota, IsLearner: r.IsLearner}
 	if r.Header != nil {
-		st.MemberID = r.Header.MemberId
+		st.MemberID, st.ClusterID = r.Header.MemberId, r.Header.ClusterId
 	}
 	return st, nil
 }

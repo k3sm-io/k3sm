@@ -146,6 +146,9 @@ func artifactManifest(cfg Config) []artifact {
 	// The etcd version marker rides beside the etcd binary on exactly the kine marker's
 	// terms (the work-dir seed replaces a stale etcd only from a payload it vouches for).
 	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.EtcdMarkerName), assertExists: false})
+	// etcdutl's marker rides beside it on the same terms: `k3sm snapshot restore` runs
+	// etcdutl from here only when this marker vouches for the pin.
+	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.EtcdutlMarkerName), assertExists: false})
 	// The control-plane version marker rides beside the four kube binaries on the same
 	// terms: it is what lets the work-dir seed replace a stale control-plane set after a
 	// binary-only upgrade, and a pre-marker archive has none, so it is not asserted.

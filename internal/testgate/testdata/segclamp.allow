@@ -54,4 +54,5 @@ pkg/builder/buildxhost.go downloadTo http.DefaultClient # buildx release asset d
 
 # Embedded etcd: its client and metrics listeners are loopback-only by argv (etcdArgs), never a pod address.
 pkg/executor/etcdsupervise.go tcpDial net.Dialer{} # readiness probe of the etcd child's 127.0.0.1 client port
+pkg/executor/etcdsupervise.go peerView http.Transport{} # cluster-ID and revision probe of an etcd peer listener on a server's --etcd-peer-ip LAN address (the underlay, never an lo0 alias)
 pkg/status/etcd.go httpGetLoopback http.DefaultClient # etcd metrics/health read on 127.0.0.1

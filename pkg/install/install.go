@@ -2115,6 +2115,8 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     The etcd version marker is staged the same way, for the same reasons.
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.EtcdMarkerName),
 		cfg.stagedPayloadFile(executor.EtcdMarkerName))
+	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.EtcdutlMarkerName),
+		cfg.stagedPayloadFile(executor.EtcdutlMarkerName))
 	//     The control-plane version marker is staged the same way and for the same
 	//     reasons: without it the seed cannot tell this release's kube binaries from
 	//     the ones an earlier release left in the work dir, and an absent marker only

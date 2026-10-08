@@ -1801,6 +1801,9 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kubectl",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kine",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/etcd",
+		// etcdutl, built from the etcd wrapper: `k3sm snapshot restore` runs it
+		// offline on an etcd server.
+		"CopyToRootOwned:/Library/k3sm.staging/bin/etcdutl",
 		// The pinned helm the helm controller's Jobs run, a payload binary like
 		// kubectl.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + helmchart.HelmBinaryName,
@@ -1809,6 +1812,8 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KineMarkerName,
 		// The etcd version marker, staged the same best-effort way.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.EtcdMarkerName,
+		// The etcdutl version marker, staged the same best-effort way.
+		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.EtcdutlMarkerName,
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KubeMarkerName,
@@ -2006,10 +2011,10 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// The payload set lands at InstallDir/bin/<name> — one copy per
 	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims + vmhost.
 	head := len(fixedHead)
-	// +3 for the three version markers (kine, etcd, then the control-plane set),
-	// staged beside the binaries they describe.
-	if want := head + len(executor.PayloadBinaries()) + 3; len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the three markers)", len(dsts), want)
+	// +4 for the four version markers (kine, etcd, etcdutl, then the control-plane
+	// set), staged beside the binaries they describe.
+	if want := head + len(executor.PayloadBinaries()) + 4; len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the four markers)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], stage+"/bin/"+name; got != want {
