@@ -126,6 +126,17 @@ What the restore does, in order:
 - It **preserves what it replaces**. The old data dir becomes `etcd.restore-<UTC>.bak` and the etcd
   status record moves beside it. Nothing is deleted. If moving either into place fails, both are
   moved back and the work dir is as it was.
+- If the restore is cut off between those moves (a crash or a power cut), the server has no
+  `etcd` directory and the restore's `.bak` or `.tmp` beside it. It then refuses to start, rather
+  than form an empty cluster or join as a new member, and says how to finish the restore (run it
+  again) or undo it (move the `.bak` back to `etcd`).
+
+### When the `.bak` Directories Can Go
+
+Keep `etcd.restore-<UTC>.bak` and `etcd-status.json.restore-<UTC>.bak` until the restored cluster
+has been verified and every other server has joined it again. They are the only copy of the data
+the restore replaced. After that they are safe to delete. The `etcd.pre-restore` directories moved
+aside on the other servers can go at the same time.
 
 ### What a Restore Puts Back, and What It Does Not
 
@@ -143,12 +154,28 @@ the moment the snapshot was taken:
 ### Servers Left on the Old Data
 
 A server started on its old etcd data after the restore belongs to the cluster the restore
-replaced. It asks the other servers for their cluster ID, finds the restored server on a different
-one, and refuses to start. `k3sm status` shows the etcd row as `this server's etcd member belongs to
-a cluster that was reset or restored` with the fix: move `<work-dir>/etcd` aside and join again,
-which is step 4 above. The refusal parks the server until the crash-loop record is cleared. If two
-servers on old data are started while the restored server is down, they can elect a leader and
-serve the old data between them until they reach it. Start the restored server first.
+replaced. It asks the other servers about their clusters. When one answers as the only member of a
+different cluster, with a revision past the billion a restore adds, that is the restored server,
+and this one refuses to start. `k3sm status` shows the etcd row as `this server's etcd member
+belongs to a cluster that was reset or restored`, naming the peer and both cluster IDs. The fix
+starts with a check: confirm that peer is the server you restored, then move `<work-dir>/etcd`
+aside and join again, which is step 4 above. The refusal parks the server until the crash-loop
+record is cleared.
+
+A peer that answers for a different cluster without that shape (a Mac reinstalled at a server's
+address, for example) is only a warning on the status row: `a peer answers for a different etcd
+cluster; check it`. The server keeps running, and nothing tells you to delete its data.
+
+If two servers on old data are started while the restored server is down, they can elect a leader
+and serve the old data between them until they reach it. Start the restored server first.
+
+### A Snapshot Proves Integrity, Not Origin
+
+The SHA-256 hash at the end of a snapshot proves the file is complete and unchanged since it was
+written. It does not prove who wrote it: anyone can write a file with a valid hash. Restoring a
+snapshot makes everything in it the cluster's state, including its RBAC roles and bindings, its
+Secrets and its service accounts. Restore only a snapshot you took yourself, from storage only you
+can write to.
 
 ### Snapshots Hold Secrets in Plaintext
 
