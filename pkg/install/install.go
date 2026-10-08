@@ -1300,6 +1300,11 @@ type Config struct {
 	// --server-join, and over an existing datastore. False never touches
 	// the credential directory. See preflightSecretsEncryption.
 	SecretsEncryption bool
+	// EtcdSnapshots are the scheduled etcd snapshot flags this install was given
+	// (`k3sm install --etcd-snapshot-schedule-cron`, `--etcd-snapshot-retention`,
+	// `--etcd-disable-snapshots`). Each one given REPLACES the carried flag of the
+	// same name in resolvedExtraServerArgs; the zero value changes nothing.
+	EtcdSnapshots EtcdSnapshotFlags
 	// KeyEntropy is where a minted secrets-encryption key is read from. Nil is
 	// crypto/rand.Reader; a test injects a placeholder reader so no real key
 	// material is ever produced.
@@ -1492,7 +1497,8 @@ func (c Config) datavolStaging() string { return filepath.Join(c.InstallDir, dat
 // mesh address: it REPLACES every carried role flag, --server, --etcd-peer-ip
 // and --node-ip (setEtcdArgs). With neither set the carried arguments come back as they were,
 // so a single-node install renders exactly what it rendered before HA flags
-// existed.
+// existed. The scheduled-snapshot flags this install was given are merged last,
+// each replacing its carried namesake (setEtcdSnapshotArgs).
 func (c Config) resolvedExtraServerArgs() []string {
 	args := c.ExtraServerArgs
 	if c.MeshIP != "" {
@@ -1501,7 +1507,7 @@ func (c Config) resolvedExtraServerArgs() []string {
 	if c.etcdRequested() {
 		args = setEtcdArgs(args, c)
 	}
-	return args
+	return setEtcdSnapshotArgs(args, c.EtcdSnapshots)
 }
 
 // RecordedServerArgs returns the operator `k3sm server` arguments an install
