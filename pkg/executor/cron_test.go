@@ -46,6 +46,11 @@ func TestParseCron(t *testing.T) {
 		{"Sunday as 7", "0 0 * * 7", []time.Time{at(10, 4, 0, 0), at(10, 11, 0, 0)}},
 		{"day of month only", "0 0 1 * *", []time.Time{at(11, 1, 0, 0), at(12, 1, 0, 0)}},
 		{"both day fields: either matches", "0 0 10 * 0", []time.Time{at(10, 4, 0, 0), at(10, 10, 0, 0), at(10, 11, 0, 0)}},
+		// Vixie cron's day rule: a day field starting with `*` (`*/n` too) is
+		// unrestricted, so the other day field must ALSO match.
+		{"a stepped day of month is unrestricted: odd days that are Mondays", "0 0 */2 * 1", []time.Time{at(10, 5, 0, 0), at(10, 19, 0, 0)}},
+		{"a stepped day of week is unrestricted: every even weekday", "0 0 * * */2", []time.Time{at(10, 3, 0, 0), at(10, 4, 0, 0), at(10, 6, 0, 0)}},
+		{"a stepped range is restricted: odd days OR Mondays", "0 0 1-31/2 * 1", []time.Time{at(10, 3, 0, 0), at(10, 5, 0, 0), at(10, 7, 0, 0)}},
 		{"a month", "0 0 1 1 *", []time.Time{time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)}},
 		{"leap day", "0 0 29 2 *", []time.Time{time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC)}},
 	} {

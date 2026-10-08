@@ -30,8 +30,13 @@ import (
 //
 // Each field is `*`, a number, a range `a-b`, a step `*/n` or `a-b/n`, or a comma
 // list of those. Day-of-week is 0-6 with Sunday as 0 (7 is accepted as Sunday too).
-// When both day fields are restricted a day matches either one, and when one of them
-// is `*` only the other decides: the rule every cron, and k3s's scheduler, follows.
+//
+// The two day fields combine by Vixie cron's rule: a day field whose text starts
+// with `*` (so `*` and `*/n` alike) counts as unrestricted; when either day field is
+// unrestricted a day must match both, and when both are restricted a day matching
+// either one fires. k3s's default schedule restricts neither day field, so the
+// rule does not change when it fires.
+//
 // Names (JAN, MON), the `@daily` descriptors and a seconds field are not accepted;
 // k3s's own default and documented examples need none of them.
 
@@ -47,8 +52,8 @@ const cronSearchYears = 5
 type CronSchedule struct {
 	spec                          string
 	minute, hour, dom, month, dow uint64
-	// domStar and dowStar record a literal `*` day field, which decides how the two
-	// day fields combine.
+	// domStar and dowStar record a day field that starts with `*`, which decides
+	// how the two day fields combine (Vixie cron's rule).
 	domStar, dowStar bool
 }
 
@@ -87,7 +92,7 @@ func ParseCron(spec string) (*CronSchedule, error) {
 	c := &CronSchedule{
 		spec:   strings.Join(fields, " "),
 		minute: bits[0], hour: bits[1], dom: bits[2], month: bits[3], dow: bits[4],
-		domStar: fields[2] == "*", dowStar: fields[4] == "*",
+		domStar: strings.HasPrefix(fields[2], "*"), dowStar: strings.HasPrefix(fields[4], "*"),
 	}
 	probe := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	if c.Next(probe).IsZero() {
