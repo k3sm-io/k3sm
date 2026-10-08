@@ -268,6 +268,15 @@ type Supervised struct {
 	etcdWatchDone chan struct{}
 	// etcdPID is the running etcd child's pid, for the status record.
 	etcdPID int
+	// etcdSnap is the scheduled-snapshot loop (nil when the schedule is off), and
+	// etcdSnapStop / etcdSnapDone its lifetime; set by bring-up, ended first by Stop.
+	// Guarded by mu.
+	etcdSnap     *etcdSnapshotScheduler
+	etcdSnapStop context.CancelFunc
+	etcdSnapDone chan struct{}
+	// stopping, when set, runs in Stop just before each component is signalled. A
+	// test seam that observes the teardown order; nil in production.
+	stopping func(c *component)
 	// unlockWorkDir releases the work-dir lock the etcd posture holds from Start
 	// until Stop has reaped every child (see lockWorkDir). Guarded by mu.
 	unlockWorkDir func() error
@@ -1335,8 +1344,10 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
-	// The etcd watcher and admin client go first: they talk to the member this Stop is
-	// about to kill.
+	// The snapshot schedule, then the etcd watcher and admin client, go first: they
+	// talk to the member this Stop is about to kill, and a scheduled snapshot streams
+	// through that admin client.
+	s.stopEtcdSnapshotSchedule(ctx)
 	s.stopEtcdWatcher(ctx)
 
 	// Reverse start order = correct shutdown order, but the datastore (index 0) must
@@ -1345,6 +1356,9 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	var alive []string
 	var unreaped []*component
 	for _, c := range shutdownOrder(comps) {
+		if s.stopping != nil {
+			s.stopping(c)
+		}
 		if !s.stopComponent(ctx, c) {
 			alive = append(alive, c.name)
 			unreaped = append(unreaped, c)
