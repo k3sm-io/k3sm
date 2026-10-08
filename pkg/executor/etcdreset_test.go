@@ -309,8 +309,8 @@ func TestRestoreRefusesEtcdMember(t *testing.T) {
 		return "", nil
 	}
 	_, err := RestoreSnapshot(t.Context(), SnapshotRestoreOptions{WorkDir: wd, Snapshot: filepath.Join(wd, "absent.db"), Running: probe})
-	if !errors.Is(err, ErrSnapshotEtcdMember) {
-		t.Fatalf("kine restore on an etcd member = %v, want ErrSnapshotEtcdMember", err)
+	if !errors.Is(err, ErrSnapshotEtcdMember) || !strings.Contains(err.Error(), "`k3sm snapshot restore` on an etcd server") {
+		t.Fatalf("kine restore on an etcd member = %v, want ErrSnapshotEtcdMember pointing at the etcd restore", err)
 	}
 	if _, err := os.Stat(dbDir(wd)); !os.IsNotExist(err) {
 		t.Error("the refusal touched the datastore dir")

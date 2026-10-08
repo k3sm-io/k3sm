@@ -166,6 +166,15 @@ func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.L
 	if err := executor.RefuseClusterInitOverSQLite(executor.Config{WorkDir: opts.workDir, Etcd: opts.etcdConfig()}); err != nil {
 		return err
 	}
+	// An etcd server whose snapshot restore stopped between its renames has no data
+	// dir and the restore's directories beside it. Refused here, before the HA join
+	// could add a fresh member or an init member could bootstrap an empty cluster;
+	// the executor checks it again at provision.
+	if opts.etcdConfig() != nil {
+		if err := executor.RefuseInterruptedEtcdRestore(opts.workDir); err != nil {
+			return err
+		}
+	}
 	// Fail fast if the work-dir is not writable (the unprivileged control plane
 	// must not EACCES mid-bring-up against the root-owned default).
 	return executor.EnsureWorkDirWritable(opts.workDir)

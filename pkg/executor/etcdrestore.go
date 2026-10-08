@@ -81,6 +81,10 @@ var (
 	// ErrEtcdRestoreFailed reports a rebuild that did not complete. The live etcd
 	// data dir has not been touched.
 	ErrEtcdRestoreFailed = errors.New("executor: rebuilding the etcd data dir from the snapshot failed; the existing etcd data dir was not touched")
+	// ErrEtcdRestoreInterrupted refuses to start an etcd member in a work dir a
+	// restore was interrupted in: <work-dir>/etcd is gone and the restore's .bak or
+	// .tmp is beside it. Starting there would bootstrap or join from nothing.
+	ErrEtcdRestoreInterrupted = errors.New("executor: an etcd snapshot restore was interrupted in this work dir: the etcd data dir is missing and the restore's directories are beside it")
 	// ErrEtcdRestoreSwap reports a failed swap of the rebuilt data dir into place.
 	// The original was moved back unless the error says otherwise.
 	ErrEtcdRestoreSwap = errors.New("executor: swapping the rebuilt etcd data dir into place failed")
@@ -243,7 +247,7 @@ func restoreEtcdSnapshot(ctx context.Context, opts EtcdRestoreOptions, seams etc
 	if err != nil {
 		return nil, err
 	}
-	if err := requireFreeSpace(opts.WorkDir, uint64(fi.Size())*snapshotFreeSpaceFactor); err != nil {
+	if err := requireSnapshotSpace(opts.WorkDir, uint64(fi.Size())*snapshotFreeSpaceFactor); err != nil {
 		return nil, err
 	}
 	bin, err := seams.etcdutl(ctx, opts.WorkDir, opts.PayloadBinDir)
@@ -270,6 +274,46 @@ func restoreEtcdSnapshot(ctx context.Context, opts EtcdRestoreOptions, seams etc
 		return res, err
 	}
 	return res, nil
+}
+
+// RefuseInterruptedEtcdRestore refuses an etcd start in a work dir where a restore
+// stopped between its renames (a crash or a power cut): the data dir is absent and an
+// etcd.restore-*.bak or etcd.restore-*.tmp sibling exists. Started there, an init
+// member would bootstrap an empty cluster and a joiner would join as a new member,
+// either way stranding the data in the sibling. The error names both ways out.
+func RefuseInterruptedEtcdRestore(workDir string) error {
+	live := EtcdDataDir(workDir)
+	if _, err := os.Lstat(live); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	baks, err := filepath.Glob(filepath.Join(workDir, "etcd.restore-*.bak"))
+	if err != nil {
+		return err
+	}
+	tmps, err := filepath.Glob(filepath.Join(workDir, "etcd.restore-*.tmp"))
+	if err != nil {
+		return err
+	}
+	if len(baks) == 0 && len(tmps) == 0 {
+		return nil
+	}
+	// Glob sorts, and the UTC stamp sorts by time: the last is the newest.
+	var ways []string
+	ways = append(ways, "finish it: re-run `sudo k3sm snapshot restore <the snapshot>`, which rebuilds the data dir from the snapshot (nothing it moved aside is touched)")
+	if len(baks) > 0 {
+		bak := baks[len(baks)-1]
+		ways = append(ways, fmt.Sprintf("or undo it: `sudo mv %s %s` (and move %s back to %s if it exists)",
+			bak, live, filepath.Join(workDir, etcdStatusName+".restore-"+restoreStamp(bak)+".bak"), EtcdStatusPath(workDir)))
+	}
+	if len(tmps) > 0 {
+		ways = append(ways, fmt.Sprintf("then remove the unfinished rebuild %s", tmps[len(tmps)-1]))
+	}
+	return fmt.Errorf("%w (%s); %s", ErrEtcdRestoreInterrupted, strings.Join(append(baks, tmps...), ", "), strings.Join(ways, "; "))
+}
+
+// restoreStamp is the <ts> of an etcd.restore-<ts>.bak path.
+func restoreStamp(path string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), "etcd.restore-"), ".bak")
 }
 
 // rebuildEtcdDataDir runs etcdutl into tmp and gives the result the live data dir's

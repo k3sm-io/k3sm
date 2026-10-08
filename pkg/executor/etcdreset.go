@@ -93,6 +93,9 @@ func clusterReset(ctx context.Context, cfg Config, seams etcdSeams) error {
 		return err
 	}
 	defer func() { _ = unlock() }()
+	if err := RefuseInterruptedEtcdRestore(cfg.WorkDir); err != nil {
+		return err
+	}
 	if !EtcdMemberExists(cfg.WorkDir) {
 		return fmt.Errorf("%w: %s is absent", ErrNoEtcdMember, etcdMemberDir(cfg.WorkDir))
 	}

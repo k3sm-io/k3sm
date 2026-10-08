@@ -272,7 +272,7 @@ func TestEtcdRestoreRefusals(t *testing.T) {
 					t.Fatal(err)
 				}
 			}},
-		{name: "not twice the snapshot's size free", want: ErrKineSnapshotSpace,
+		{name: "not twice the snapshot's size free", want: ErrSnapshotSpace, say: "the snapshot's size",
 			setup: func(t *testing.T, f *restoreFixture, o *EtcdRestoreOptions, _ *etcdRestoreSeams) {
 				o.Snapshot = f.good
 				orig := freeSpace
@@ -497,3 +497,95 @@ func TestRestoreEtcdSnapshotRefusesLoopbackPeer(t *testing.T) {
 		t.Fatalf("RestoreEtcdSnapshot(loopback peer) = %v, want ErrEtcdNeedsNodeIP", err)
 	}
 }
+
+// TestRefuseInterruptedEtcdRestore: a work dir a restore stopped in (no data dir, its
+// .bak or .tmp beside it) refuses every etcd start path, the executor's provision and
+// --cluster-reset included; finishing the restore by re-running it clears it.
+func TestRefuseInterruptedEtcdRestore(t *testing.T) {
+	const stamp = "20261007T120000Z"
+	for _, tc := range []struct {
+		name      string
+		live, bak bool
+		tmp       bool
+		want      bool
+		say       []string
+	}{
+		{name: "a completed restore (data dir and .bak)", live: true, bak: true},
+		{name: "a fresh work dir", want: false},
+		{name: "crashed after the aside rename", bak: true, tmp: true, want: true,
+			say: []string{"k3sm snapshot restore", "sudo mv", "etcd.restore-" + stamp + ".bak", "remove the unfinished rebuild"}},
+		{name: "a rebuilt server that crashed mid-rebuild", tmp: true, want: true, say: []string{"k3sm snapshot restore", "remove the unfinished rebuild"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wd := t.TempDir()
+			mk := func(cond bool, name string) {
+				if cond {
+					if err := os.MkdirAll(filepath.Join(wd, name, "member"), 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			mk(tc.live, "etcd")
+			mk(tc.bak, "etcd.restore-"+stamp+".bak")
+			mk(tc.tmp, "etcd.restore-"+stamp+".tmp")
+			err := RefuseInterruptedEtcdRestore(wd)
+			if got := errors.Is(err, ErrEtcdRestoreInterrupted); got != tc.want {
+				t.Fatalf("RefuseInterruptedEtcdRestore = %v, want refusal %v", err, tc.want)
+			}
+			for _, want := range tc.say {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q does not say %q", err, want)
+				}
+			}
+			if !tc.want {
+				return
+			}
+			cfg := Config{WorkDir: wd, Etcd: &EtcdConfig{Role: EtcdInit, Name: "etcd-a", PeerIP: "192.0.2.10"}}
+			if err := NewSupervised(cfg).provision(t.Context()); !errors.Is(err, ErrEtcdRestoreInterrupted) {
+				t.Errorf("executor provision = %v, want ErrEtcdRestoreInterrupted", err)
+			}
+			if err := clusterReset(t.Context(), cfg, defaultEtcdSeams()); !errors.Is(err, ErrEtcdRestoreInterrupted) {
+				t.Errorf("cluster reset = %v, want ErrEtcdRestoreInterrupted", err)
+			}
+			if _, err := os.Stat(EtcdDataDir(wd)); !os.IsNotExist(err) {
+				t.Error("a refusal created an etcd data dir")
+			}
+		})
+	}
+
+	t.Run("re-running the restore finishes it", func(t *testing.T) {
+		f := newRestoreFixture(t, true)
+		s := fakeRestoreSeams(t, nil)
+		calls := 0
+		s.rename = func(oldpath, newpath string) error {
+			calls++
+			if calls == 3 { // the rebuilt dir into place: the process dies here
+				panic(errCrashBetweenRenames)
+			}
+			return os.Rename(oldpath, newpath)
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != errCrashBetweenRenames {
+					t.Fatalf("restore did not reach the third rename (recovered %v)", r)
+				}
+			}()
+			_, _ = restoreEtcdSnapshot(t.Context(), f.opts(f.good), s)
+		}()
+		if err := RefuseInterruptedEtcdRestore(f.wd); !errors.Is(err, ErrEtcdRestoreInterrupted) {
+			t.Fatalf("after the crash, start check = %v, want ErrEtcdRestoreInterrupted", err)
+		}
+		s2 := fakeRestoreSeams(t, nil)
+		s2.now = func() time.Time { return time.Date(2026, 10, 7, 13, 0, 0, 0, time.UTC) }
+		if _, err := restoreEtcdSnapshot(t.Context(), f.opts(f.good), s2); err != nil {
+			t.Fatalf("re-run restore = %v", err)
+		}
+		if err := RefuseInterruptedEtcdRestore(f.wd); err != nil {
+			t.Errorf("after finishing the restore, start check = %v, want nil", err)
+		}
+	})
+}
+
+// errCrashBetweenRenames stands in for the process dying mid-swap: a panic skips the
+// swap's own rollback exactly as a crash would.
+var errCrashBetweenRenames = errors.New("crashed between the renames")
