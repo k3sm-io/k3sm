@@ -58,7 +58,10 @@ mkwork() {
 # pinned etcd selects that version (or newer) on its own.
 #   go.opentelemetry.io/otel family v1.45.0: GO-2026-6505 (reached through the
 #   otlptrace exporter etcd's tracing setup initializes).
+#   golang.org/x/net v0.60.0: GO-2026-6611, GO-2026-6612, GO-2026-6617 (the
+#   http2 server and client both programs serve and dial through).
 OVERRIDES=(
+	golang.org/x/net@v0.60.0
 	go.opentelemetry.io/otel@v1.45.0
 	go.opentelemetry.io/otel/sdk@v1.45.0
 	go.opentelemetry.io/otel/trace@v1.45.0
@@ -116,6 +119,16 @@ regen() {
 	(cd "$WORK" && GOFLAGS=-mod=mod wgo get -tool "$ETCDUTL@$version")
 	(cd "$WORK" && GOFLAGS=-mod=mod wgo get "${OVERRIDES[@]}")
 	(cd "$WORK" && GOFLAGS=-mod=mod wgo mod tidy)
+	# go get and tidy rewrite the go line (and drop a toolchain line equal to it)
+	# when a dependency asks for a newer patch release. Put the saved lines back;
+	# if the module graph really needs a newer go, tidy -diff says so and regen
+	# stops, so the pin is raised on purpose and never as a side effect.
+	(cd "$WORK" && wgo mod edit -go="${goline#go }")
+	[ -z "$toolline" ] || (cd "$WORK" && wgo mod edit -toolchain="${toolline#toolchain }")
+	(cd "$WORK" && GOFLAGS=-mod=mod wgo mod tidy -diff >/dev/null) || {
+		echo "regen: the new module graph needs a newer go than '$goline'; raise it in $WRAPPER/go.mod.txt deliberately, then re-run regen" >&2
+		exit 1
+	}
 	# Neither the tool nor the overrides may move either program off the pin.
 	onepin "$version"
 	cp "$WORK/go.mod" "$WRAPPER/go.mod.txt"
