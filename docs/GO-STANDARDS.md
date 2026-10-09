@@ -104,6 +104,18 @@ missing or reports any other version, because a different staticcheck reports di
 - **Bumping the pin**: bump it with the Go toolchain. An older staticcheck cannot read export data
   from a newer Go (2025.1 does not run under go1.27), so a toolchain bump can strand the old pin.
   Change this line and every `STATICCHECK_VERSION` together, and fix the new findings in the same change.
+- **Go 1.27.2 and later, until a newer staticcheck release ships**: 2026.2.1 installed with
+  `go install` cannot read Go 1.27.2's export data ("export data version 5 is greater than maximum
+  supported version 4"). Build the same release against a newer `golang.org/x/tools` instead; it
+  still reports 2026.2.1 and runs the same checks:
+  ```sh
+  mkdir -p /tmp/staticcheck && cd /tmp/staticcheck
+  printf 'module local/staticcheck\n\ngo 1.26.0\n' > go.mod
+  printf 'package main\n\nimport _ "honnef.co/go/tools/cmd/staticcheck"\n' > tools.go
+  go get honnef.co/go/tools@v0.8.1 golang.org/x/tools@v0.50.0 && go mod tidy
+  go build -o "$(go env GOPATH)/bin/staticcheck" honnef.co/go/tools/cmd/staticcheck
+  ```
+  Drop this step when the pin moves to a release that reads the current Go.
 
 Keep commits small and focused. **Sign off every commit** for the Developer Certificate of Origin (see
 `DCO` / `CONTRIBUTING.md`): use `git commit -s`, which adds a `Signed-off-by` line certifying the DCO.
