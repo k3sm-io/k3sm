@@ -76,6 +76,26 @@ You do not have to do anything for this, but you should know what it does.
 A server started with `--cluster-init` keeps its state in an embedded etcd member instead, and none
 of this applies there. A multi-server control plane is not available in v0.1.6; see [HA](ha.md).
 
+## Upgrading Into the Checkpointing kine
+
+Earlier releases ran a kine that never let SQLite checkpoint its write-ahead log, so on a single-node
+server `db/state.db-wal` grew by gigabytes a day. The kine in this release fixes that. Nothing about
+the database's schema or encoding changes, and no backup is taken for it.
+
+- **The first boot folds the old log into the database.** kine does this before it starts serving,
+  so that boot is slower in proportion to the size of `state.db-wal`. On an Apple-silicon SSD a 2 GB
+  log took about 3 seconds, and the server waits up to 15 seconds per GiB on top of its usual wait.
+  The server log says when it is recovering a large log, with its size.
+- **It needs room for the database to grow.** The checkpoint copies the newest version of every page
+  in the log into `state.db`, which grows by that much before the log is truncated. The server reads
+  the size it will need from the log itself, and if the volume cannot take it the server refuses to
+  start, says how much space it needs, and changes nothing. Free space and start it again.
+- **Upgrade with `sudo k3sm install`**, not by replacing the binary alone. The kine is shipped in the
+  release's payload, and a server whose binary was swapped without that payload stops on its first
+  start and asks you to re-run the install.
+- **Rolling back brings the old behaviour back.** A server returned to an earlier release runs the
+  old kine again, and the log starts growing again from that boot.
+
 ## Upgrading Into the Reserved-Port Policy
 
 The release that moved LoadBalancer listeners to the wildcard also provisions a
