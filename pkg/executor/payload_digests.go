@@ -42,10 +42,11 @@ import (
 // So each binary is pinned to the sha256 the release published, verified after
 // download, and the pipeline FAILS CLOSED on a mismatch or an unknown file.
 //
-// kine is deliberately absent: it is not downloaded but built from source by
-// `go install github.com/k3s-io/kine@<version>`, whose bytes the Go module
-// checksum database already authenticates. Pinning a digest for a locally
-// compiled binary would pin the toolchain, not the source.
+// kine is deliberately absent: it is not downloaded but built from source
+// (buildPatchedKine): the module source `go mod download` fetches, which the Go
+// module checksum database already authenticates, plus k3sm's own reviewed
+// patches (kinePatches). Pinning a digest for a locally compiled binary would pin
+// the toolchain, not the source.
 //
 // Refreshing a pin (a DefaultKubeVersion bump) means recording the digests the
 // new release publishes. They are readable without downloading the assets:

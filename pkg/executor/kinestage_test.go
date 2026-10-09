@@ -84,7 +84,8 @@ func TestKineStagedPredicate(t *testing.T) {
 // TestKineMarkerRoundTrip proves the marker records the build VARIANT alongside the
 // version, and that the shipped variant is the pure-Go one. "nocgo" is the whole point
 // of the collapse: it is what keeps the unmaintained mattn/go-sqlite3 (and a C
-// toolchain) out of every k3sm artifact.
+// toolchain) out of every k3sm artifact. A "+p<n>" suffix names the carried patch set
+// (TestKinePatchSetIsMarked) and does not change the backend.
 func TestKineMarkerRoundTrip(t *testing.T) {
 	bd := t.TempDir()
 	if err := writeKineMarker(bd, DefaultKineVersion); err != nil {
@@ -94,8 +95,8 @@ func TestKineMarkerRoundTrip(t *testing.T) {
 	if v != DefaultKineVersion || variant != kineBuildVariant {
 		t.Errorf("readKineMarker = (%q,%q), want (%q,%q)", v, variant, DefaultKineVersion, kineBuildVariant)
 	}
-	if kineBuildVariant != "nocgo" {
-		t.Errorf("kineBuildVariant = %q, want \"nocgo\" (the pure-Go modernc.org/sqlite backend)", kineBuildVariant)
+	if base, _, _ := strings.Cut(kineBuildVariant, "+"); base != "nocgo" {
+		t.Errorf("kineBuildVariant = %q, want \"nocgo\" or \"nocgo+p<n>\" (the pure-Go modernc.org/sqlite backend)", kineBuildVariant)
 	}
 	if _, err := os.Stat(kineMarkerPath(bd) + ".tmp"); !os.IsNotExist(err) {
 		t.Error("the atomic marker write left its .tmp behind")

@@ -66,9 +66,12 @@
 # first line carrying the kine#577 fix). Three independent witnesses must agree, and
 # it prints what it found when they do not:
 #
-#   the built binary   `go version -m <workdir>/bin/kine` module version
-#   the staging marker <workdir>/bin/kine.version           ("<pin> nocgo")
-#   the datastore stamp <workdir>/db/state.db.kine-pin      ("<pin> nocgo")
+#   the built binary   `<workdir>/bin/kine --version`       ("<pin>+<patch set>")
+#   the staging marker <workdir>/bin/kine.version           ("<pin> <variant>")
+#   the datastore stamp <workdir>/db/state.db.kine-pin      ("<pin> <variant>")
+#
+# where <variant> is executor's kineBuildVariant ("nocgo", plus "+p<n>" for the patch
+# set k3sm carries against the pin).
 #
 # plus, on a booted run, a LIVE witness: the process listening on the instance's kine
 # port must be that very binary, serving that very state.db. The live witness exists
@@ -171,6 +174,11 @@ source_pin() {
 		"$EXEC_PKG/executor.go" | head -1
 }
 
+source_variant() {
+	sed -nE 's/^[[:space:]]*kineBuildVariant[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+		"$EXEC_PKG/setup.go" | head -1
+}
+
 # marker_pin <file> prints the "<version> <variant>" a marker/stamp records, or "".
 marker_pin() { [ -f "$1" ] && head -1 "$1" | tr -d '\r' || true; }
 
@@ -193,7 +201,7 @@ marker_pin() { [ -f "$1" ] && head -1 "$1" | tr -d '\r' || true; }
 # and the stamp becomes mandatory, because something must tie the pin to THIS
 # datastore rather than merely to the bytes staged beside it.
 assert_pin() {
-	local wd="$1" port="${2:-}" want minor ok=true
+	local wd="$1" port="${2:-}" want variant want_built minor ok=true
 	local kine="$wd/bin/kine" marker="$wd/bin/kine.version" stamp="$wd/db/state.db.kine-pin"
 	local built m_txt s_txt kpid kcomm kargs
 
@@ -202,6 +210,15 @@ assert_pin() {
 		echo "  could not read DefaultKineVersion out of pkg/executor/executor.go" >&2
 		return 1
 	fi
+	variant="$(source_variant)"
+	if [ -z "$variant" ]; then
+		echo "  could not read kineBuildVariant out of pkg/executor/setup.go" >&2
+		return 1
+	fi
+	# The version the build stamps: the pin, plus "+<patch set>" when the variant
+	# carries one (executor.kineStampedVersion).
+	want_built="$want"
+	case "$variant" in *+*) want_built="$want+${variant#*+}" ;; esac
 	# Floor check on the SHAPE, not a version sort: the superseded v1.14.x line is a
 	# higher number but older code, so a naive comparison would accept exactly the pin
 	# this soak exists to run against the retirement of.
@@ -220,8 +237,11 @@ assert_pin() {
 	esac
 
 	built=""
-	if [ -x "$kine" ] && command -v go >/dev/null 2>&1; then
-		built="$(go version -m "$kine" 2>/dev/null | awk '$1=="mod" && $2=="github.com/k3s-io/kine" {print $3; exit}')"
+	if [ -x "$kine" ]; then
+		# "kine version <pin>+<patch set> (<commit>)": the executor's build stamps the
+		# pin and the carried patch set into kine's version package, so an unpatched
+		# kine (which reports "dev", or a bare pin) fails this witness.
+		built="$("$kine" --version 2>/dev/null | awk '$1=="kine" && $2=="version" {print $3; exit}')"
 	fi
 	m_txt="$(marker_pin "$marker")"
 	s_txt="$(marker_pin "$stamp")"
@@ -234,18 +254,18 @@ assert_pin() {
 	if [ -z "$built" ]; then
 		echo "  no kine binary to interrogate at $kine — cannot prove which kine served" >&2
 		ok=false
-	elif [ "$built" != "$want" ]; then
-		echo "  the staged kine binary is $built, NOT the shipped pin $want" >&2
+	elif [ "$built" != "$want_built" ]; then
+		echo "  the staged kine binary is $built, NOT the shipped pin and patch set $want_built" >&2
 		ok=false
 	fi
-	if [ "$m_txt" != "$want nocgo" ]; then
-		echo "  staging marker says '${m_txt:-<absent>}', want '$want nocgo'" >&2
+	if [ "$m_txt" != "$want $variant" ]; then
+		echo "  staging marker says '${m_txt:-<absent>}', want '$want $variant'" >&2
 		ok=false
 	fi
 	# The stamp speaks about the DATASTORE ("this pin opened this database"), not about
 	# the staging — so a present one that disagrees is fatal in either mode.
-	if [ -n "$s_txt" ] && [ "$s_txt" != "$want nocgo" ]; then
-		echo "  datastore pin stamp says '$s_txt', want '$want nocgo' — a different kine opened this datastore" >&2
+	if [ -n "$s_txt" ] && [ "$s_txt" != "$want $variant" ]; then
+		echo "  datastore pin stamp says '$s_txt', want '$want $variant' — a different kine opened this datastore" >&2
 		ok=false
 	fi
 
@@ -328,8 +348,8 @@ echo "==> k3sm B28 watch-staleness soak (single node, consistent LIST after a co
 WANT_PIN="$(source_pin)"
 echo "    shipped kine pin: ${WANT_PIN:-<unreadable>}"
 
-# The server builds the pinned kine on first use with `go install` under a SCRATCH
-# GOPATH it deletes afterwards — and an unset GOMODCACHE derives from GOPATH, so every
+# The server builds the pinned kine on first use under a SCRATCH GOPATH it deletes
+# afterwards — and an unset GOMODCACHE derives from GOPATH, so every
 # boot re-downloads kine's whole dependency tree into a directory that is then thrown
 # away. On a cold-ish cache that download outruns `dev up`'s 90s kubeconfig deadline
 # and the boot fails for a reason that has nothing to do with the soak. Pinning
@@ -345,13 +365,13 @@ echo "==> building k3sm (CGO_ENABLED=1)"
 # on first use, inside `dev up`'s 90s kubeconfig deadline; on a cold Go build cache
 # that compile does not finish in 90s (observed: the boot log ends with
 # "build kine v0.17.0 (CGO_ENABLED=0): signal: terminated" mid-compile, on a Go
-# toolchain running translated under Rosetta). Running the IDENTICAL `go install` here
-# — same pin, same CGO/GOWORK settings, so the same cache entries — makes the
-# in-boot build a cache hit and turns a timing lottery into a deterministic boot.
-# It writes only to the shared GOCACHE/GOMODCACHE; the scratch GOPATH is discarded.
+# toolchain running translated under Rosetta). Running the executor's own kine build
+# here (`k3sm payload --kine-only`: the same patched source, flags and environment the
+# boot uses, so the same cache entries) makes the in-boot build a cache hit and turns a
+# timing lottery into a deterministic boot. It stages into a throwaway dir; what it
+# leaves behind that matters is the shared GOCACHE/GOMODCACHE.
 echo "==> pre-warming the pinned kine build (kine $WANT_PIN, CGO_ENABLED=0) — first run compiles, later runs are a cache hit"
-if ! ( CGO_ENABLED=0 GOWORK=off GOBIN='' GOPATH="$WORK/gopath" \
-		go install "github.com/k3s-io/kine@$WANT_PIN" >"$WORK/kine-build.log" 2>&1 ); then
+if ! "$K3SM_BIN" payload --kine-only "$WORK/kine-prewarm" >"$WORK/kine-build.log" 2>&1; then
 	echo "B28 soak: pre-warming the kine build failed — the in-boot build would fail the same way:" >&2
 	tail -20 "$WORK/kine-build.log" >&2
 	exit 1

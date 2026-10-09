@@ -172,6 +172,17 @@ func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 		}
 		return
 	}
+	if errors.Is(err, executor.ErrKinePayloadStale) {
+		// Checked before ErrNoGoToolchain, which it also wraps: the missing toolchain
+		// is incidental here, and the remedy is the install that brings the payload.
+		logger.Error("the control plane did not come up: the k3sm binary was replaced without its payload; parking on this failure",
+			"component", component, "err", err, "remedy", executor.KinePayloadStaleRemedy)
+		if b.recordBringUpPermanent(component, err.Error(), executor.KinePayloadStaleRemedy) {
+			logger.Error("crash-loop breaker tripped on a permanent fault; the next start will park until an operator clears the record",
+				"path", b.path)
+		}
+		return
+	}
 	if errors.Is(err, executor.ErrNoGoToolchain) {
 		logger.Error("the control plane did not come up with a fault that cannot heal on retry; parking on this failure",
 			"component", component, "err", err, "remedy", executor.NoGoToolchainRemedy)

@@ -30,14 +30,16 @@ import (
 
 // runPayload is `k3sm payload <dir>`: stage the control-plane payload
 // (kube-apiserver/scheduler/controller-manager/kubectl + kine + helm) into <dir> using
-// the executor's own pinned versions and acquisition code. It is the
+// the executor's own pinned versions and acquisition code. `--kine-only` stages just
+// kine (executor.StageKine), for the test harnesses that run kine themselves. It is the
 // packaging-side PRODUCER — run it in a shell that has `gh` and the Go toolchain
 // (a dev Mac, goreleaser); `k3sm install` then stages <dir> beside the daemon so
 // the launchd boot (which has neither tool) seeds from it.
 func runPayload(args []string) error {
 	fs := flag.NewFlagSet("payload", flag.ExitOnError)
+	kineOnly := fs.Bool("kine-only", false, "stage only the pinned kine and its version marker (needs go on PATH)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: k3sm payload <dir>  — stage the control-plane payload (needs gh + go on PATH)")
+		fmt.Fprintln(os.Stderr, "usage: k3sm payload [--kine-only] <dir>  — stage the control-plane payload (needs gh + go on PATH)")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
@@ -47,6 +49,13 @@ func runPayload(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *kineOnly {
+		if err := executor.StageKine(ctx, fs.Arg(0)); err != nil {
+			return err
+		}
+		fmt.Printf("staged kine %s -> %s\n", executor.DefaultKineVersion, fs.Arg(0))
+		return nil
+	}
 	if err := executor.StagePayload(ctx, fs.Arg(0)); err != nil {
 		return err
 	}

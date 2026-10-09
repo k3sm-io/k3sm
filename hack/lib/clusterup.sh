@@ -9,7 +9,6 @@
 #
 # Requires: macOS 26+ arm64, Go, Xcode CLT (clang), gh, curl, openssl, nc.
 
-: "${KINE_VERSION:=v0.17.1}"     # ONE pin, both postures (executor.DefaultKineVersion)
 : "${KUBE_VERSION:=v1.36.5}"          # executor.DefaultKubeVersion (kwok-ci/k8s darwin-arm64)
 : "${K3SM_WORKDIR:=/tmp/k3sm-cluster}"
 : "${APISERVER_PORT:=6444}"           # NOT 6443 — Docker Desktop's k8s squats there
@@ -402,11 +401,13 @@ cluster_up() {
 		chmod +x "$BIN"/*
 	  fi
 	  for b in kube-apiserver kube-scheduler kube-controller-manager kubectl; do codesign -s - -f "$BIN/$b" >/dev/null 2>&1 || true; done
-	  # 2. kine — built CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend,
-	  #    the same variant pkg/executor stages. The version marker is written beside it so
-	  #    the server's marker-gated staging finds it current and does not rebuild it.
-	  if [ ! -x "$BIN/kine" ]; then CGO_ENABLED=0 GOWORK=off GOBIN="$BIN" go install "github.com/k3s-io/kine@${KINE_VERSION}"; codesign -s - -f "$BIN/kine" >/dev/null 2>&1 || true; fi
-	  printf '%s nocgo\n' "${KINE_VERSION}" > "$BIN/kine.version"
+	  # 2. kine — staged by the executor's own build (`k3sm payload --kine-only`): the
+	  #    pinned kine, CGO_ENABLED=0 against its pure-Go modernc.org/sqlite backend, with
+	  #    k3sm's carried patches (pkg/executor/kinepatch.go), signed, and its version
+	  #    marker written. One build for every harness and the daemon, so no gate runs a
+	  #    kine the product would not; a current marker makes it a no-op re-sign.
+	  ( cd "$REPO_ROOT" && CGO_ENABLED=0 go run ./cmd/k3sm payload --kine-only "$BIN" ) \
+		|| { echo "cluster_up: staging kine failed" >&2; exit 1; }
 	  # 3. SA keypair, static token, kubeconfig
 	  [ -f sa.key ] || { openssl genrsa -out sa.key 2048 2>/dev/null; openssl rsa -in sa.key -pubout -out sa.pub 2>/dev/null; }
 	  printf '%s,admin,admin-uid,"system:masters"\n' "$CP_TOKEN" > tokens.csv; chmod 600 tokens.csv

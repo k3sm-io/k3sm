@@ -10,6 +10,10 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Fixed
+
+- **The single-node datastore's write-ahead log is checkpointed again.** kine held a read transaction open from its start, so SQLite could never checkpoint, and `state.db-wal` grew by gigabytes a day until the data volume filled. The first boot after the upgrade folds the old log into `state.db`, which takes longer in proportion to its size and needs room for the database to grow; see [upgrade](https://k3sm.io/docs/upgrade/). Rolling back to an earlier release brings the growth back.
+
 ## v0.1.7 — 2026-10-05
 
 `vm` Pods answer on their own pod IP from anywhere in the cluster, and two Macs can run the control plane together as an experimental preview.

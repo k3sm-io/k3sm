@@ -29,7 +29,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -293,7 +292,7 @@ func downloadControlPlane(ctx context.Context, dir, kubeVersion string, verify b
 }
 
 // runControlPlaneDownload runs the release download. It is a var so a test can stand
-// in for `gh` without a network, the way runKineBuild stands in for `go install`.
+// in for `gh` without a network, the way runKineBuild stands in for the kine build.
 var runControlPlaneDownload = ghReleaseDownload
 
 // ghReleaseDownload runs `gh release download <tag>` from kwok-ci/k8s into dir and
@@ -537,11 +536,15 @@ const (
 	KineMarkerName = "kine.version"
 	// kineBuildVariant records HOW the pinned kine child was built. "nocgo" is
 	// CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend
-	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo). It is part of the marker
+	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo); "+p1" is the first
+	// carried patch set (kinePatches, kinepatch.go). It is part of the marker
 	// because version alone does not identify the binary: the same kine tag builds two
 	// different SQLite implementations depending on CGO_ENABLED, and only this one
-	// keeps the unmaintained mattn/go-sqlite3 out of every k3sm artifact.
-	kineBuildVariant = "nocgo"
+	// keeps the unmaintained mattn/go-sqlite3 out of every k3sm artifact; and the same
+	// tag built with and without the patches behaves differently on disk. Changing the
+	// patch set changes the "+p" suffix, which is what makes every already-staged kine
+	// (and every node seeding from an older payload) re-stage the patched build.
+	kineBuildVariant = "nocgo+p1"
 )
 
 // kinePath / kineMarkerPath name the staged kine binary and its version marker in a
@@ -572,8 +575,47 @@ func writeKineMarker(bd, version string) error { return kineChild(version).write
 // modernc.org/sqlite backend) into the workdir bin, ad-hoc signs it, and records the
 // version marker. It is a no-op only when the marker already vouches for the wanted
 // version+variant — never on mere presence.
-func ensureKine(ctx context.Context, workDir, kineVersion string) error {
-	return ensureKineInto(ctx, binDir(workDir), kineVersion)
+//
+// payloadDir is the staged install payload seedBinDir seeds from ("" for none). When
+// neither the work dir nor that payload vouches for the target build and there is no
+// Go toolchain to make one, the k3sm binary was replaced without the payload that
+// ships beside it (a swapped binary, then a kickstart): that is ErrKinePayloadStale,
+// named as such rather than as a missing toolchain, because the fix is the install.
+func ensureKine(ctx context.Context, workDir, payloadDir, kineVersion string) error {
+	bd := binDir(workDir)
+	if err := kinePayloadStale(bd, payloadDir, kineVersion); err != nil {
+		return err
+	}
+	return ensureKineInto(ctx, bd, kineVersion)
+}
+
+// ErrKinePayloadStale marks a server whose staged payload carries a different kine
+// build than this binary runs, with no Go toolchain to build the right one. It is
+// returned wrapped together with ErrNoGoToolchain, so the crash-loop breaker parks on
+// the first failure (it cannot heal on retry); the recording site matches this
+// sentinel first and records KinePayloadStaleRemedy.
+var ErrKinePayloadStale = errors.New("the staged control-plane payload carries a different kine build than this k3sm runs")
+
+// KinePayloadStaleRemedy is the operator's fix for ErrKinePayloadStale.
+const KinePayloadStaleRemedy = "the k3sm binary was replaced without its control-plane payload; re-run `sudo k3sm install` from this release so the staged payload carries the kine it runs"
+
+// kinePayloadStale reports ErrKinePayloadStale when nothing can supply the target
+// kine: the work dir's marker does not vouch for it, the payload's does not either,
+// and there is no Go toolchain. Any one of those holding returns nil and the normal
+// seed or build path proceeds.
+func kinePayloadStale(bd, payloadDir, kineVersion string) error {
+	if payloadDir == "" || kineStaged(bd, kineVersion) || kineStaged(payloadDir, kineVersion) {
+		return nil
+	}
+	if _, err := lookPathGo(); err == nil {
+		return nil
+	}
+	want := kineChild(kineVersion)
+	pv, pvar := readKineMarker(payloadDir)
+	wv, wvar := readKineMarker(bd)
+	return fmt.Errorf("stage kine: %w (%w): this k3sm runs kine %q, the payload in %s carries %q and the work dir %q; %s",
+		ErrKinePayloadStale, ErrNoGoToolchain, strings.TrimSpace(want.markerContent()), payloadDir,
+		strings.TrimSpace(pv+" "+pvar), strings.TrimSpace(wv+" "+wvar), KinePayloadStaleRemedy)
 }
 
 // ensureKineInto is ensureKine against an explicit bin dir — shared by the boot
@@ -597,16 +639,10 @@ func kineChild(kineVersion string) stagedChild {
 	}
 }
 
-// buildKine runs the pinned `go install` (CGO_ENABLED=0, see kineBuildEnv) into the
-// scratch GOPATH and returns the built binary's path.
-//
-// `go install pkg@version` REFUSES to write a cross-compiled binary when GOBIN
-// is set ("cannot install cross-compiled binaries when GOBIN is set"), and the
-// release stages for darwin/arm64 explicitly — which counts as cross-compiling
-// whenever the toolchain's own GOARCH differs, as it does on a Mac running Go
-// under Rosetta. So install into a scratch GOPATH instead of GOBIN and copy the
-// result out. Cross-compiled installs land in bin/<goos>_<goarch>/, native ones
-// directly in bin/, so both are probed.
+// buildKine builds the pinned kine from its patched module source (CGO_ENABLED=0,
+// see kineBuildEnv and buildPatchedKine) into the scratch GOPATH and returns the
+// built binary's path, gopath/bin/kine. An explicit GOOS/GOARCH in the environment
+// (the release stages darwin/arm64 explicitly) cross-compiles to the same path.
 func buildKine(ctx context.Context, kineVersion, gopath string) (string, error) {
 	// The scratch GOPATH is thrown away with the build; the MODULE CACHE must not be.
 	modCache, err := kineModuleCacheDir(ctx)
@@ -617,29 +653,17 @@ func buildKine(ctx context.Context, kineVersion, gopath string) (string, error) 
 		return "", fmt.Errorf("build kine %s (CGO_ENABLED=0): %w (a packaged install has no Go toolchain — re-run `sudo k3sm install` so the staged payload carries this pin): %s",
 			kineVersion, err, out)
 	}
-
-	goos, goarch := runtime.GOOS, runtime.GOARCH
-	if v := os.Getenv("GOOS"); v != "" {
-		goos = v
-	}
-	if v := os.Getenv("GOARCH"); v != "" {
-		goarch = v
-	}
-	built := filepath.Join(gopath, "bin", goos+"_"+goarch, "kine") // cross-compiled
-	if _, statErr := os.Stat(built); statErr != nil {
-		built = filepath.Join(gopath, "bin", "kine") // native
-	}
-	return built, nil
+	return filepath.Join(gopath, "bin", kineBinaryName), nil
 }
 
-// kineBuildEnv is the environment the pinned kine `go install` runs under.
+// kineBuildEnv is the environment the pinned kine build runs under.
 //
 // CGO_ENABLED=0 selects kine's pure-Go SQLite backend (modernc.org/sqlite, behind
 // //go:build !cgo). It is a real, supported kine variant on the pinned version — not
 // the SQLite-disabled stub the spike measured on the old pin — and it is what keeps
 // the unmaintained mattn/go-sqlite3 (and a C toolchain) out of every k3sm artifact.
-// GOBIN is cleared (not just unset in our env) so an ambient GOBIN cannot re-trigger
-// the cross-compile refusal ensureKineInto documents.
+// GOBIN is cleared (not just unset in our env) so an ambient GOBIN cannot redirect
+// any install step out of the scratch GOPATH.
 //
 // GOMODCACHE is pinned AWAY from the scratch GOPATH, and that pin is the load-bearing
 // part: a module cache left to derive from GOPATH lands inside the per-build temp dir,
@@ -673,7 +697,7 @@ func lookPathGo() (string, error) { return exec.LookPath("go") }
 // environment and the cache's reuse across builds without fetching anything.
 var (
 	kineModuleCacheDir = hostGoModCache
-	runKineBuild       = goInstallKine
+	runKineBuild       = buildPatchedKine
 )
 
 // hostGoModCache returns the HOST TOOLCHAIN's own module cache (`go env GOMODCACHE`,
@@ -700,20 +724,11 @@ func hostGoModCache(ctx context.Context) (string, error) {
 		dir = filepath.Join(base, "k3sm", "gomodcache")
 	}
 	// Created here rather than left to the toolchain so an unwritable cache fails with
-	// the path named instead of inside a `go install` diagnostic.
+	// the path named instead of inside a toolchain diagnostic.
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create Go module cache %s: %w", dir, err)
 	}
 	return dir, nil
-}
-
-// goInstallKine runs `go install github.com/k3s-io/kine@<version>` into the scratch
-// GOPATH's bin, downloading through the stable module cache. It returns the combined
-// output so a failure carries the toolchain's own diagnostic.
-func goInstallKine(ctx context.Context, version, gopath, modCache string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "go", "install", "github.com/k3s-io/kine@"+version)
-	cmd.Env = kineBuildEnv(gopath, modCache)
-	return cmd.CombinedOutput()
 }
 
 // copyFile copies src to dst with the given mode, replacing dst if present.
@@ -747,7 +762,7 @@ func PayloadBinaries() []string {
 
 // StagePayload acquires the full control-plane payload into destDir using the
 // executor's own pinned versions (DefaultKubeVersion via `gh release download`,
-// DefaultKineVersion via a CGO_ENABLED=0 `go install`, DefaultEtcdVersion via a
+// DefaultKineVersion via a patched CGO_ENABLED=0 source build, DefaultEtcdVersion via a
 // CGO_ENABLED=0 build of the embedded wrapper module). Each part drops its version
 // marker beside the binaries it describes — KubeMarkerName after the four
 // kwok-ci/k8s binaries are digest-verified and signed, KineMarkerName after kine and
@@ -788,6 +803,17 @@ func StagePayload(ctx context.Context, destDir string) error {
 		return err
 	}
 	return VerifyPayloadSet(destDir)
+}
+
+// StageKine stages the pinned, patched kine (and its version marker) into destDir
+// through the same stagedChild protocol the daemon boot and StagePayload use. It is
+// the one kine build: `k3sm payload --kine-only` exposes it to the hack scripts, so
+// no harness runs a kine built any other way.
+func StageKine(ctx context.Context, destDir string) error {
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("create kine dir %s: %w", destDir, err)
+	}
+	return ensureKineInto(ctx, destDir, DefaultKineVersion)
 }
 
 // seedBinDir copies every payload binary present in payloadDir and absent from
