@@ -186,8 +186,12 @@ func TestDefaultEtcdVersionMatchesWrapper(t *testing.T) {
 	if !regexp.MustCompile(`(?m)^go 1\.\d+(\.\d+)?$`).MatchString(mod) {
 		t.Error("go.mod.txt carries no go line")
 	}
-	if !regexp.MustCompile(`(?m)^toolchain go1\.\d+\.\d+$`).MatchString(mod) {
-		t.Error("go.mod.txt carries no toolchain line")
+	// The minimum toolchain is either an explicit toolchain line or a go line that
+	// names a patch release: Go drops a toolchain line equal to the go line, which
+	// is what a dependency asking for go1.N.P produces.
+	if !regexp.MustCompile(`(?m)^toolchain go1\.\d+\.\d+$`).MatchString(mod) &&
+		!regexp.MustCompile(`(?m)^go 1\.\d+\.\d+$`).MatchString(mod) {
+		t.Error("go.mod.txt names no minimum toolchain (a toolchain line, or a go line with a patch release)")
 	}
 	if strings.Contains(mod, "\nreplace") {
 		t.Error("go.mod.txt carries a replace directive; the wrapper must build the upstream module as published")
