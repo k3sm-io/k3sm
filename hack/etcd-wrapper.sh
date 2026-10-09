@@ -119,6 +119,16 @@ regen() {
 	(cd "$WORK" && GOFLAGS=-mod=mod wgo get -tool "$ETCDUTL@$version")
 	(cd "$WORK" && GOFLAGS=-mod=mod wgo get "${OVERRIDES[@]}")
 	(cd "$WORK" && GOFLAGS=-mod=mod wgo mod tidy)
+	# go get and tidy rewrite the go line (and drop a toolchain line equal to it)
+	# when a dependency asks for a newer patch release. Put the saved lines back;
+	# if the module graph really needs a newer go, tidy -diff says so and regen
+	# stops, so the pin is raised on purpose and never as a side effect.
+	(cd "$WORK" && wgo mod edit -go="${goline#go }")
+	[ -z "$toolline" ] || (cd "$WORK" && wgo mod edit -toolchain="${toolline#toolchain }")
+	(cd "$WORK" && GOFLAGS=-mod=mod wgo mod tidy -diff >/dev/null) || {
+		echo "regen: the new module graph needs a newer go than '$goline'; raise it in $WRAPPER/go.mod.txt deliberately, then re-run regen" >&2
+		exit 1
+	}
 	# Neither the tool nor the overrides may move either program off the pin.
 	onepin "$version"
 	cp "$WORK/go.mod" "$WRAPPER/go.mod.txt"
