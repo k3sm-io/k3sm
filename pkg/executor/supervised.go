@@ -674,14 +674,23 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	return nil
 }
 
-// bringUpKine is the kine posture's datastore bring-up: spawn kine, wait for its
-// listener, mark it supervised, stamp the pin.
+// bringUpKine is the kine posture's datastore bring-up: size the WAL kine is about
+// to recover, spawn kine, wait for its listener, mark it supervised, stamp the pin.
+//
+// The wait is componentReadyTimeout unless a large WAL is left over (prepareKineWAL):
+// kine checkpoints it before it listens, and a kine built before the Migrate patch
+// (kinePatches) can leave gigabytes, so the first boot of the patched build waits in
+// proportion rather than counting a slow recovery as a failed bring-up.
 func (s *Supervised) bringUpKine(ctx context.Context) error {
+	wait, err := prepareKineWAL(s.cfg.Logger, s.cfg.WorkDir)
+	if err != nil {
+		return bringUpErr("kine", PhaseBringUp, err)
+	}
 	kine, err := s.startKine(ctx)
 	if err != nil {
 		return bringUpErr("kine", PhaseBringUp, fmt.Errorf("start kine: %w", err))
 	}
-	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), componentReadyTimeout, 300*time.Millisecond, kine.exitDetail); err != nil {
+	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), wait, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return bringUpErr(kine.name, PhaseBringUp, fmt.Errorf("kine not listening: %w", err))
 	}
 	if err := s.markSupervised(kine); err != nil {

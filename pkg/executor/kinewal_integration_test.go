@@ -22,12 +22,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -141,6 +143,120 @@ func TestKineWALCheckpoints(t *testing.T) {
 	}
 }
 
+// TestKineRecoversLeftoverWAL is the upgrade's first boot: a kine built WITHOUT the
+// carried patches (the build every node ran before them) grows a large WAL and is
+// killed, then the patched kine starts over it. prepareKineWAL must size the
+// recovery (an Info line, a proportional wait, and a free-space need that matches the
+// growth state.db actually takes), and the patched kine must checkpoint and truncate
+// the whole WAL and listen well inside that wait.
+func TestKineRecoversLeftoverWAL(t *testing.T) {
+	patched := itKineBinary(t)
+	unpatched := itUnpatchedKineBinary(t)
+	if !fileExists(sqlite3Bin) {
+		t.Fatalf("%s not found", sqlite3Bin)
+	}
+	work := t.TempDir()
+	if err := os.MkdirAll(dbDir(work), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var ports itPorts
+	cfg := Config{WorkDir: work, KinePort: ports.next(t)}
+	args, err := kineArgs(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := StateDBPath(work)
+
+	// Grow a WAL past largeWALBytes with the unpatched build, then kill -9 it.
+	stop := startITKine(t, unpatched, args, cfg.KinePort)
+	putLoad(t, cfg.KinePort, 2000)
+	stop()
+	fi, err := os.Stat(db + "-wal")
+	if err != nil || fi.Size() < largeWALBytes {
+		t.Fatalf("the unpatched kine left a WAL of %v bytes (%v), want >= %d", fi.Size(), err, largeWALBytes)
+	}
+	walBytes := fi.Size()
+	dbBefore, err := os.Stat(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	growth, err := walCheckpointGrowth(db)
+	if err != nil {
+		t.Fatalf("walCheckpointGrowth on a real WAL: %v", err)
+	}
+	var logs strings.Builder
+	wait, err := prepareKineWAL(slog.New(slog.NewTextHandler(&logs, nil)), work)
+	if err != nil {
+		t.Fatalf("prepareKineWAL: %v", err)
+	}
+	if wait <= componentReadyTimeout || !strings.Contains(logs.String(), "recovering a large datastore WAL") {
+		t.Errorf("prepareKineWAL = %v with log %q; want a longer wait and an Info line", wait, logs.String())
+	}
+
+	start := time.Now()
+	startITKine(t, patched, args, cfg.KinePort)
+	took := time.Since(start)
+	dbAfter, err := os.Stat(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := dbAfter.Size() - dbBefore.Size()
+	t.Logf("leftover WAL %d bytes: patched kine listening after %v (wait %v); state.db grew %d bytes, estimated %d", walBytes, took, wait, actual, growth)
+	if took > wait/4 {
+		t.Errorf("recovery took %v, more than a quarter of the %v wait", took, wait)
+	}
+	if actual > growth {
+		t.Errorf("state.db grew %d bytes, more than the %d the free-space check reserved", actual, growth)
+	}
+	if growth > actual+(8<<20) {
+		t.Errorf("the free-space check reserved %d bytes for a growth of %d: the estimate is not the WAL's commit size", growth, actual)
+	}
+	if fi, err := os.Stat(db + "-wal"); err == nil && fi.Size() > walTestBound {
+		t.Errorf("WAL is %d bytes after the patched start, want it truncated", fi.Size())
+	}
+}
+
+// putLoad writes n lease-sized values through kine's etcd API, with a watch open.
+func putLoad(t *testing.T, port, n int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{"127.0.0.1:" + strconv.Itoa(port)}, DialTimeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("etcd client: %v", err)
+	}
+	defer func() { _ = cli.Close() }()
+	watch := cli.Watch(ctx, "/registry/", clientv3.WithPrefix())
+	go func() {
+		for range watch {
+		}
+	}()
+	val := strings.Repeat("x", walTestValue)
+	for i := range n {
+		if _, err := cli.Put(ctx, fmt.Sprintf("/registry/leases/kube-node-lease/node-%d", i%50), val); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+}
+
+// itUnpatchedKineBinary builds the pinned kine through the production build with the
+// carried patches removed: the binary every node ran before them.
+func itUnpatchedKineBinary(t *testing.T) string {
+	t.Helper()
+	saved := kinePatches
+	kinePatches = nil
+	t.Cleanup(func() { kinePatches = saved })
+	scratch := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Minute)
+	defer cancel()
+	bin, err := buildKine(ctx, DefaultKineVersion, scratch)
+	if err != nil {
+		t.Fatalf("build unpatched kine: %v", err)
+	}
+	kinePatches = saved
+	return bin
+}
+
 // passiveCheckpoint runs PRAGMA wal_checkpoint(PASSIVE) from a second connection and
 // returns its busy, log-frame and checkpointed-frame counts.
 func passiveCheckpoint(t *testing.T, db string) (busy, log, ckpt int) {
@@ -189,15 +305,16 @@ func itKineBinary(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("staged kine --version: %v: %s", err, out)
 	}
-	if want := "kine version " + DefaultKineVersion + " "; !strings.HasPrefix(string(out), want) {
+	if want := "kine version " + kineStampedVersion(DefaultKineVersion) + " "; !strings.HasPrefix(string(out), want) {
 		t.Errorf("staged kine --version = %q, want it to start %q", out, want)
 	}
 	return bin
 }
 
-// startITKine starts kine with args, waits for its listener, and stops it (and
-// waits for it) when the test ends.
-func startITKine(t *testing.T, bin string, args []string, port int) {
+// startITKine starts kine with args and waits for its listener. The returned stop
+// kills it with SIGKILL (as a crash or a power cut would) and waits for it; it also
+// runs when the test ends, and is safe to call twice.
+func startITKine(t *testing.T, bin string, args []string, port int) (stop func()) {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout = itLogWriter{t: t, name: "kine"}
@@ -205,17 +322,21 @@ func startITKine(t *testing.T, bin string, args []string, port int) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start kine: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+	}
+	t.Cleanup(stop)
 	addr := "127.0.0.1:" + strconv.Itoa(port)
 	deadline := time.Now().Add(time.Minute)
 	for {
 		c, err := net.DialTimeout("tcp", addr, time.Second)
 		if err == nil {
 			_ = c.Close()
-			return
+			return stop
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("kine did not listen on %s within a minute: %v", addr, err)
