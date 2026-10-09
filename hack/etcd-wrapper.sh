@@ -58,7 +58,10 @@ mkwork() {
 # pinned etcd selects that version (or newer) on its own.
 #   go.opentelemetry.io/otel family v1.45.0: GO-2026-6505 (reached through the
 #   otlptrace exporter etcd's tracing setup initializes).
+#   golang.org/x/net v0.60.0: GO-2026-6611, GO-2026-6612, GO-2026-6617 (the
+#   http2 server and client both programs serve and dial through).
 OVERRIDES=(
+	golang.org/x/net@v0.60.0
 	go.opentelemetry.io/otel@v1.45.0
 	go.opentelemetry.io/otel/sdk@v1.45.0
 	go.opentelemetry.io/otel/trace@v1.45.0
