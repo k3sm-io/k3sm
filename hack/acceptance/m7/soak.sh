@@ -66,7 +66,7 @@
 # first line carrying the kine#577 fix). Three independent witnesses must agree, and
 # it prints what it found when they do not:
 #
-#   the built binary   `<workdir>/bin/kine --version`       (the pin the build stamped)
+#   the built binary   `<workdir>/bin/kine --version`       ("<pin>+<patch set>")
 #   the staging marker <workdir>/bin/kine.version           ("<pin> <variant>")
 #   the datastore stamp <workdir>/db/state.db.kine-pin      ("<pin> <variant>")
 #
@@ -201,7 +201,7 @@ marker_pin() { [ -f "$1" ] && head -1 "$1" | tr -d '\r' || true; }
 # and the stamp becomes mandatory, because something must tie the pin to THIS
 # datastore rather than merely to the bytes staged beside it.
 assert_pin() {
-	local wd="$1" port="${2:-}" want variant minor ok=true
+	local wd="$1" port="${2:-}" want variant want_built minor ok=true
 	local kine="$wd/bin/kine" marker="$wd/bin/kine.version" stamp="$wd/db/state.db.kine-pin"
 	local built m_txt s_txt kpid kcomm kargs
 
@@ -215,6 +215,10 @@ assert_pin() {
 		echo "  could not read kineBuildVariant out of pkg/executor/setup.go" >&2
 		return 1
 	fi
+	# The version the build stamps: the pin, plus "+<patch set>" when the variant
+	# carries one (executor.kineStampedVersion).
+	want_built="$want"
+	case "$variant" in *+*) want_built="$want+${variant#*+}" ;; esac
 	# Floor check on the SHAPE, not a version sort: the superseded v1.14.x line is a
 	# higher number but older code, so a naive comparison would accept exactly the pin
 	# this soak exists to run against the retirement of.
@@ -234,8 +238,9 @@ assert_pin() {
 
 	built=""
 	if [ -x "$kine" ]; then
-		# "kine version <pin> (<commit>)": the executor's build stamps the pin into
-		# kine's version package, as kine's own release build does.
+		# "kine version <pin>+<patch set> (<commit>)": the executor's build stamps the
+		# pin and the carried patch set into kine's version package, so an unpatched
+		# kine (which reports "dev", or a bare pin) fails this witness.
 		built="$("$kine" --version 2>/dev/null | awk '$1=="kine" && $2=="version" {print $3; exit}')"
 	fi
 	m_txt="$(marker_pin "$marker")"
@@ -249,8 +254,8 @@ assert_pin() {
 	if [ -z "$built" ]; then
 		echo "  no kine binary to interrogate at $kine — cannot prove which kine served" >&2
 		ok=false
-	elif [ "$built" != "$want" ]; then
-		echo "  the staged kine binary is $built, NOT the shipped pin $want" >&2
+	elif [ "$built" != "$want_built" ]; then
+		echo "  the staged kine binary is $built, NOT the shipped pin and patch set $want_built" >&2
 		ok=false
 	fi
 	if [ "$m_txt" != "$want $variant" ]; then

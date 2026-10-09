@@ -17,6 +17,8 @@ limitations under the License.
 package executor
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"slices"
@@ -66,10 +68,46 @@ func TestApplyKinePatches(t *testing.T) {
 	})
 }
 
+// kinePatchSetDigest is the sha256 of kinePatches' content.
+func kinePatchSetDigest() string {
+	h := sha256.New()
+	for _, p := range kinePatches {
+		for _, f := range []string{p.name, p.file, p.old, p.new} {
+			h.Write([]byte(f))
+			h.Write([]byte{0})
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// kinePatchSetHistory records every carried patch set by the variant that named it.
+// It is APPEND-ONLY: a variant is never reused for different patches, because a node
+// whose marker names that variant would never re-stage onto the new ones. Changing
+// kinePatches means a new "+p<n>" in kineBuildVariant and a new line here.
+var kinePatchSetHistory = map[string]string{
+	"nocgo+p1": "d6c6334601320bd1bc3c88c5e97144f0df8c38e41ede21f225bdff71ff19af24",
+}
+
 // TestKinePatchSetIsMarked pins the link between the carried patches and the staging
 // marker: a patched build must not share a variant with the unpatched one, or nodes
-// that staged the unpatched kine would never re-stage.
+// that staged the unpatched kine would never re-stage; and the patches cannot change
+// without the variant changing, for the same reason.
 func TestKinePatchSetIsMarked(t *testing.T) {
+	got := kinePatchSetDigest()
+	want, ok := kinePatchSetHistory[kineBuildVariant]
+	switch {
+	case !ok:
+		t.Errorf("kineBuildVariant %q has no kinePatchSetHistory entry; add %q: %q", kineBuildVariant, kineBuildVariant, got)
+	case want != got:
+		t.Errorf("kinePatches changed (digest %s) but kineBuildVariant is still %q, which names %s: bump the \"+p<n>\" suffix and add the new pair to kinePatchSetHistory", got, kineBuildVariant, want)
+	}
+	seen := map[string]string{}
+	for variant, digest := range kinePatchSetHistory {
+		if prev, dup := seen[digest]; dup {
+			t.Errorf("variants %q and %q name the same patch set", prev, variant)
+		}
+		seen[digest] = variant
+	}
 	if len(kinePatches) == 0 {
 		t.Fatal("no carried kine patches; if upstream fixed them, return kineBuildVariant to \"nocgo\" and delete this test")
 	}
@@ -84,10 +122,12 @@ func TestKinePatchSetIsMarked(t *testing.T) {
 }
 
 // TestKineBuildArgs pins the build argv: -mod=readonly hash-checks every module
-// against kine's own go.sum, and the pin is stamped into kine's version package.
+// against kine's own go.sum, -trimpath keeps host paths out, and the pin plus the
+// patch set is stamped into kine's version package.
 func TestKineBuildArgs(t *testing.T) {
 	args := kineBuildArgs("v0.17.1", "/out/kine")
-	for _, want := range []string{"build", "-mod=readonly", "-X github.com/k3s-io/kine/pkg/version.Version=v0.17.1", "/out/kine"} {
+	stamp := "-X github.com/k3s-io/kine/pkg/version.Version=v0.17.1+" + kinePatchSetID()
+	for _, want := range []string{"build", "-trimpath", "-mod=readonly", stamp, "/out/kine"} {
 		if !slices.Contains(args, want) {
 			t.Errorf("kineBuildArgs = %q, missing %q", args, want)
 		}

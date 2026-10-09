@@ -45,6 +45,7 @@ type kineSourcePatch struct {
 
 // kinePatches is the patch set the kine child is built with. kineBuildVariant names
 // it: any change to this list changes that variant, so every staged kine re-stages.
+// TestKinePatchSetIsMarked enforces that, against an append-only history of digests.
 //
 // migrate-scan-in-order: generic.(*Generic).Migrate issues BOTH of its COUNT(*)
 // queries before scanning either, then returns after the first Scan (the legacy
@@ -58,6 +59,11 @@ type kineSourcePatch struct {
 // to the first Next, which is why the cgo build k3s ships does not show it. The fix
 // scans each query before issuing the next, so both rows are closed by their Scan.
 // Upstream: unfixed at v0.17.2 and on main (2026-10-09).
+//
+// This is a forward fix only. Rolling a node back to a k3sm whose kine is the
+// unpatched build brings the leaked reader back with it, and the WAL resumes growing
+// from that boot; the patched build's next start checkpoints whatever accumulated
+// (prepareKineWAL sizes that first boot).
 var kinePatches = []kineSourcePatch{{
 	name: "migrate-scan-in-order",
 	file: "pkg/drivers/generic/generic.go",
@@ -120,8 +126,11 @@ func applyKinePatches(root string, patches []kineSourcePatch) error {
 // -mod=readonly` builds it against kine's own go.sum, so the dependency graph is the
 // one the upstream tag pins and every module is hash-checked. The flags match what
 // `go install` used (no -trimpath), so dependency packages a previous build compiled
-// stay cache hits. The upstream version is stamped into kine's version package, as
-// kine's own release build does, so `kine --version` names the pin.
+// stay cache hits. The build is -trimpath and GOTOOLCHAIN=local, like the etcd
+// wrapper's, so no host path lands in the binary and no other compiler is fetched on
+// the go.mod's say-so. kineStampedVersion is stamped into kine's version package, as
+// kine's own release build stamps its tag, so `kine --version` names both the pin and
+// the patch set and the binary itself proves it is the patched build.
 func buildPatchedKine(ctx context.Context, version, gopath, modCache string) ([]byte, error) {
 	var log bytes.Buffer
 	dl := exec.CommandContext(ctx, "go", "mod", "download", "-json", kineModulePath+"@"+version)
@@ -154,7 +163,7 @@ func buildPatchedKine(ctx context.Context, version, gopath, modCache string) ([]
 	bin := filepath.Join(gopath, "bin", kineBinaryName)
 	build := exec.CommandContext(ctx, "go", kineBuildArgs(version, bin)...)
 	build.Dir = src
-	build.Env = append(kineBuildEnv(gopath, modCache), "GOFLAGS=-mod=readonly")
+	build.Env = append(kineBuildEnv(gopath, modCache), "GOFLAGS=-mod=readonly", "GOTOOLCHAIN=local")
 	combined, err := build.CombinedOutput()
 	log.Write(combined)
 	return log.Bytes(), err
@@ -162,9 +171,25 @@ func buildPatchedKine(ctx context.Context, version, gopath, modCache string) ([]
 
 // kineBuildArgs is the `go build` argv for the patched kine tree.
 func kineBuildArgs(version, out string) []string {
-	return []string{"build", "-buildvcs=false", "-mod=readonly",
-		"-ldflags", "-X " + kineModulePath + "/pkg/version.Version=" + version,
+	return []string{"build", "-trimpath", "-buildvcs=false", "-mod=readonly",
+		"-ldflags", "-X " + kineModulePath + "/pkg/version.Version=" + kineStampedVersion(version),
 		"-o", out, "."}
+}
+
+// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p1" of "nocgo+p1").
+func kinePatchSetID() string {
+	_, id, _ := strings.Cut(kineBuildVariant, "+")
+	return id
+}
+
+// kineStampedVersion is the version a patched kine build reports: the upstream pin
+// plus the patch set, "v0.17.1+p1" (the bare pin with no patch set). `kine --version`
+// prints it.
+func kineStampedVersion(version string) string {
+	if id := kinePatchSetID(); id != "" {
+		return version + "+" + id
+	}
+	return version
 }
 
 // copyTree copies the regular files under src to dst, creating directories as it
