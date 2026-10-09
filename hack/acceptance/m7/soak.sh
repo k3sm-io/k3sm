@@ -348,8 +348,8 @@ echo "==> k3sm B28 watch-staleness soak (single node, consistent LIST after a co
 WANT_PIN="$(source_pin)"
 echo "    shipped kine pin: ${WANT_PIN:-<unreadable>}"
 
-# The server builds the pinned kine on first use with `go install` under a SCRATCH
-# GOPATH it deletes afterwards — and an unset GOMODCACHE derives from GOPATH, so every
+# The server builds the pinned kine on first use under a SCRATCH GOPATH it deletes
+# afterwards — and an unset GOMODCACHE derives from GOPATH, so every
 # boot re-downloads kine's whole dependency tree into a directory that is then thrown
 # away. On a cold-ish cache that download outruns `dev up`'s 90s kubeconfig deadline
 # and the boot fails for a reason that has nothing to do with the soak. Pinning
@@ -365,15 +365,13 @@ echo "==> building k3sm (CGO_ENABLED=1)"
 # on first use, inside `dev up`'s 90s kubeconfig deadline; on a cold Go build cache
 # that compile does not finish in 90s (observed: the boot log ends with
 # "build kine v0.17.0 (CGO_ENABLED=0): signal: terminated" mid-compile, on a Go
-# toolchain running translated under Rosetta). Running `go install` of the same pin
-# here — same CGO/GOWORK settings and build flags, so the same cache entries — compiles
-# every dependency package the in-boot build reuses (it builds the same module tree with
-# k3sm's carried patches applied, so only kine's patched packages and their importers
-# recompile), which turns a timing lottery into a deterministic boot.
-# It writes only to the shared GOCACHE/GOMODCACHE; the scratch GOPATH is discarded.
+# toolchain running translated under Rosetta). Running the executor's own kine build
+# here (`k3sm payload --kine-only`: the same patched source, flags and environment the
+# boot uses, so the same cache entries) makes the in-boot build a cache hit and turns a
+# timing lottery into a deterministic boot. It stages into a throwaway dir; what it
+# leaves behind that matters is the shared GOCACHE/GOMODCACHE.
 echo "==> pre-warming the pinned kine build (kine $WANT_PIN, CGO_ENABLED=0) — first run compiles, later runs are a cache hit"
-if ! ( CGO_ENABLED=0 GOWORK=off GOBIN='' GOPATH="$WORK/gopath" \
-		go install "github.com/k3s-io/kine@$WANT_PIN" >"$WORK/kine-build.log" 2>&1 ); then
+if ! "$K3SM_BIN" payload --kine-only "$WORK/kine-prewarm" >"$WORK/kine-build.log" 2>&1; then
 	echo "B28 soak: pre-warming the kine build failed — the in-boot build would fail the same way:" >&2
 	tail -20 "$WORK/kine-build.log" >&2
 	exit 1

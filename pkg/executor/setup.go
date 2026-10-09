@@ -805,6 +805,17 @@ func StagePayload(ctx context.Context, destDir string) error {
 	return VerifyPayloadSet(destDir)
 }
 
+// StageKine stages the pinned, patched kine (and its version marker) into destDir
+// through the same stagedChild protocol the daemon boot and StagePayload use. It is
+// the one kine build: `k3sm payload --kine-only` exposes it to the hack scripts, so
+// no harness runs a kine built any other way.
+func StageKine(ctx context.Context, destDir string) error {
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("create kine dir %s: %w", destDir, err)
+	}
+	return ensureKineInto(ctx, destDir, DefaultKineVersion)
+}
+
 // seedBinDir copies every payload binary present in payloadDir and absent from
 // the workdir bin into it (0755), so the subsequent ensure* steps find them
 // present and only re-sign — never shelling out to gh/go. A missing payloadDir
