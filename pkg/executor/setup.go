@@ -575,8 +575,47 @@ func writeKineMarker(bd, version string) error { return kineChild(version).write
 // modernc.org/sqlite backend) into the workdir bin, ad-hoc signs it, and records the
 // version marker. It is a no-op only when the marker already vouches for the wanted
 // version+variant — never on mere presence.
-func ensureKine(ctx context.Context, workDir, kineVersion string) error {
-	return ensureKineInto(ctx, binDir(workDir), kineVersion)
+//
+// payloadDir is the staged install payload seedBinDir seeds from ("" for none). When
+// neither the work dir nor that payload vouches for the target build and there is no
+// Go toolchain to make one, the k3sm binary was replaced without the payload that
+// ships beside it (a swapped binary, then a kickstart): that is ErrKinePayloadStale,
+// named as such rather than as a missing toolchain, because the fix is the install.
+func ensureKine(ctx context.Context, workDir, payloadDir, kineVersion string) error {
+	bd := binDir(workDir)
+	if err := kinePayloadStale(bd, payloadDir, kineVersion); err != nil {
+		return err
+	}
+	return ensureKineInto(ctx, bd, kineVersion)
+}
+
+// ErrKinePayloadStale marks a server whose staged payload carries a different kine
+// build than this binary runs, with no Go toolchain to build the right one. It is
+// returned wrapped together with ErrNoGoToolchain, so the crash-loop breaker parks on
+// the first failure (it cannot heal on retry); the recording site matches this
+// sentinel first and records KinePayloadStaleRemedy.
+var ErrKinePayloadStale = errors.New("the staged control-plane payload carries a different kine build than this k3sm runs")
+
+// KinePayloadStaleRemedy is the operator's fix for ErrKinePayloadStale.
+const KinePayloadStaleRemedy = "the k3sm binary was replaced without its control-plane payload; re-run `sudo k3sm install` from this release so the staged payload carries the kine it runs"
+
+// kinePayloadStale reports ErrKinePayloadStale when nothing can supply the target
+// kine: the work dir's marker does not vouch for it, the payload's does not either,
+// and there is no Go toolchain. Any one of those holding returns nil and the normal
+// seed or build path proceeds.
+func kinePayloadStale(bd, payloadDir, kineVersion string) error {
+	if payloadDir == "" || kineStaged(bd, kineVersion) || kineStaged(payloadDir, kineVersion) {
+		return nil
+	}
+	if _, err := lookPathGo(); err == nil {
+		return nil
+	}
+	want := kineChild(kineVersion)
+	pv, pvar := readKineMarker(payloadDir)
+	wv, wvar := readKineMarker(bd)
+	return fmt.Errorf("stage kine: %w (%w): this k3sm runs kine %q, the payload in %s carries %q and the work dir %q; %s",
+		ErrKinePayloadStale, ErrNoGoToolchain, strings.TrimSpace(want.markerContent()), payloadDir,
+		strings.TrimSpace(pv+" "+pvar), strings.TrimSpace(wv+" "+wvar), KinePayloadStaleRemedy)
 }
 
 // ensureKineInto is ensureKine against an explicit bin dir — shared by the boot

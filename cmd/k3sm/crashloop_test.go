@@ -25,6 +25,28 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
+// TestStaleKinePayloadParksWithTheInstallRemedy: a binary replaced without its
+// payload (executor.ErrKinePayloadStale, which also wraps ErrNoGoToolchain) parks on
+// the first failure, and the record names the install as the fix rather than a
+// missing toolchain.
+func TestStaleKinePayloadParksWithTheInstallRemedy(t *testing.T) {
+	err := fmt.Errorf("start control plane: %w", &executor.BringUpError{Component: "provision/kine", Phase: executor.PhaseProvision,
+		Err: fmt.Errorf("stage kine: %w (%w)", executor.ErrKinePayloadStale, executor.ErrNoGoToolchain)})
+	dir := t.TempDir()
+	noteBringUpFailure(newCrashBreaker(dir, quietLogger()), quietLogger(), err)
+	rec, rerr := executor.ReadCrashRecord(executor.CrashLoopPath(dir))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if !rec.Tripped() {
+		t.Fatal("a stale payload did not park on its first failure")
+	}
+	last, _ := rec.Last()
+	if !last.Permanent || last.Remedy != executor.KinePayloadStaleRemedy {
+		t.Errorf("last entry %+v, want permanent with remedy %q", last, executor.KinePayloadStaleRemedy)
+	}
+}
+
 // TestPermanentBringUpFailureParksImmediately is the two-tier breaker's gate
 // (B393). A kine pin bump on a daemon whose launchd PATH has no `go` used to
 // burn CrashLoopThreshold identical bring-up failures before parking, though

@@ -505,7 +505,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 		if err := provisionStep("etcd", ensureEtcdInto(ctx, binDir(s.cfg.WorkDir), DefaultEtcdVersion)); err != nil {
 			return err
 		}
-	} else if err := provisionStep("kine", ensureKine(ctx, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {
+	} else if err := provisionStep("kine", ensureKine(ctx, s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion)); err != nil {
 		return err
 	}
 	if err := provisionStep("sa-keys", writeServiceAccountKeys(ctx, s.cfg.WorkDir)); err != nil {
