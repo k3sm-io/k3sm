@@ -403,10 +403,11 @@ cluster_up() {
 	  fi
 	  for b in kube-apiserver kube-scheduler kube-controller-manager kubectl; do codesign -s - -f "$BIN/$b" >/dev/null 2>&1 || true; done
 	  # 2. kine — built CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend,
-	  #    the same variant pkg/executor stages. The version marker is written beside it so
-	  #    the server's marker-gated staging finds it current and does not rebuild it.
+	  #    for this harness's own short-lived control plane. It is the UNPATCHED upstream
+	  #    build, so no version marker is written: pkg/executor stages kine with its
+	  #    carried patches (kinepatch.go), and an unmarked binary makes a later server_up
+	  #    in this work dir re-stage the patched one instead of trusting this one.
 	  if [ ! -x "$BIN/kine" ]; then CGO_ENABLED=0 GOWORK=off GOBIN="$BIN" go install "github.com/k3s-io/kine@${KINE_VERSION}"; codesign -s - -f "$BIN/kine" >/dev/null 2>&1 || true; fi
-	  printf '%s nocgo\n' "${KINE_VERSION}" > "$BIN/kine.version"
 	  # 3. SA keypair, static token, kubeconfig
 	  [ -f sa.key ] || { openssl genrsa -out sa.key 2048 2>/dev/null; openssl rsa -in sa.key -pubout -out sa.pub 2>/dev/null; }
 	  printf '%s,admin,admin-uid,"system:masters"\n' "$CP_TOKEN" > tokens.csv; chmod 600 tokens.csv
