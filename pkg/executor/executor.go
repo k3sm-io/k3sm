@@ -274,7 +274,7 @@ type EtcdConfig struct {
 // Pinned defaults — the versions VALIDATED by the bring-up spike.
 const (
 	// DefaultKubeVersion is the kwok-ci/k8s darwin-arm64 control-plane release.
-	DefaultKubeVersion = "v1.36.5"
+	DefaultKubeVersion = "v1.37.1"
 	// DefaultKineVersion is THE kine module version for the single-node SQLite
 	// posture, built CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend
 	// (kineBuildVariant).

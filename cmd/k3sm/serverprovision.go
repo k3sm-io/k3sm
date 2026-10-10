@@ -523,7 +523,7 @@ func (p *supervisedProbe) ComponentExited(name string) bool {
 
 // leaseLossMessages maps each leader-elected component to the exact message its
 // upstream OnStoppedLeading callback logs before it exits, as of the pinned
-// v1.36.5:
+// v1.37.1:
 //
 //   - kube-controller-manager, cmd/kube-controller-manager/app/controllermanager.go:
 //     logger.Error(nil, "leaderelection lost/stopped"), then

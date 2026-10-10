@@ -25,7 +25,7 @@ import (
 
 // TestControllersFlagScoping asserts the KCM controller scoping: the flag is
 // "*" (all on-by-default controllers) minus the node-side controllers that
-// assume Linux kubelets/cloud providers, and the endpointslice-controller (which
+// assume Linux kubelets, and the endpointslice-controller (which
 // M1.4's Service proxy reconciles off) is NOT among the disabled set, so it stays
 // on.
 func TestControllersFlagScoping(t *testing.T) {
@@ -47,9 +47,6 @@ func TestControllersFlagScoping(t *testing.T) {
 	}
 	for _, dropped := range []string{
 		"persistentvolume-attach-detach-controller",
-		"cloud-node-lifecycle-controller",
-		"node-route-controller",
-		"service-lb-controller",
 		"node-ipam-controller",
 	} {
 		if !disabled[dropped] {

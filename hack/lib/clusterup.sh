@@ -9,7 +9,7 @@
 #
 # Requires: macOS 26+ arm64, Go, Xcode CLT (clang), gh, curl, openssl, nc.
 
-: "${KUBE_VERSION:=v1.36.5}"          # executor.DefaultKubeVersion (kwok-ci/k8s darwin-arm64)
+: "${KUBE_VERSION:=v1.37.1}"          # executor.DefaultKubeVersion (kwok-ci/k8s darwin-arm64)
 : "${K3SM_WORKDIR:=/tmp/k3sm-cluster}"
 : "${APISERVER_PORT:=6444}"           # NOT 6443 — Docker Desktop's k8s squats there
 : "${KINE_PORT:=2379}"
