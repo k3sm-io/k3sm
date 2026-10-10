@@ -41,11 +41,11 @@ import (
 // released bytes match neither that file (which omits them) nor the SLSA
 // provenance subject digest (efe594…, which is the pre-signing artifact). The pin
 // below is therefore the sha256 of the RELEASED darwin-arm64 asset itself,
-// recorded 2026-09-25 from
+// recorded 2026-10-10 from
 //
-//	https://github.com/docker/buildx/releases/download/v0.37.1/buildx-v0.37.1.darwin-arm64
+//	https://github.com/docker/buildx/releases/download/v0.38.0/buildx-v0.38.0.darwin-arm64
 //
-// (Mach-O 64-bit arm64, 63027232 bytes, notarized, "Developer ID Application:
+// (Mach-O 64-bit arm64, 65462960 bytes, notarized, "Developer ID Application:
 // Docker Inc (9BNSXJN65R)"; the digest matches the release API's asset digest).
 // The signer changed at this bump: v0.17.1 was signed "Tonis Tiigi
 // (F32M533787)".
@@ -61,7 +61,7 @@ const (
 	// HostBuildxAsset is the pinned host buildx asset name (the host is darwin/arm64).
 	HostBuildxAsset = "buildx-" + BuildxVersion + "." + hostBuildxPlatform
 	// HostBuildxSHA256 is the released darwin/arm64 asset's sha256.
-	HostBuildxSHA256 = "c3cbbc820d578b0aa8158dd62ef1af25a0c8a75ef53331dbe4e219471e1dbe8c"
+	HostBuildxSHA256 = "85989b895add5f119c1ccf8eada2f6892fc33ccf16bd8917638eae404ef26344"
 	// HostBuildxTeamID is the Apple Developer Team ID the pinned darwin asset
 	// must be signed by: "Developer ID Application: Docker Inc". It is the ONE
 	// current expected signer, checked at re-pin time by
@@ -244,7 +244,7 @@ func HostHomeDir(cfgDir string) string {
 // not use and cannot be reached by any hint variable: buildx v0.17.1 calls
 // desktop.PrintBuildDetails unconditionally (commands/build.go, the default arm
 // of the progressMode switch), gated only on desktop.BuildBackendEnabled(),
-// which is (unchanged at v0.37.1, where it sits at util/desktop/desktop.go:19-28)
+// which is (unchanged at v0.38.0, where it sits at util/desktop/desktop.go:19-28)
 //
 //	home, err := os.UserHomeDir()        // util/desktop/desktop.go:21-26
 //	_, err = os.Stat(filepath.Join(home, ".docker", "desktop-build", ".lastaccess"))

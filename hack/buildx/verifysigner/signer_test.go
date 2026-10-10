@@ -28,7 +28,7 @@ import (
 // Developer ID shape interpolates the Team ID so the expected signer lives only
 // in pkg/builder.
 func developerIDOutput(team string) string {
-	return fmt.Sprintf(`Executable=/tmp/buildx-v0.37.1.darwin-arm64
+	return fmt.Sprintf(`Executable=/tmp/buildx-v0.38.0.darwin-arm64
 Identifier=buildx
 Format=Mach-O thin (arm64)
 CodeDirectory v=20500 size=491626 flags=0x10000(runtime) hashes=15356+2 location=embedded
