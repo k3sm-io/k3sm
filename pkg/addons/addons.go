@@ -56,8 +56,8 @@ const manifestRoot = "manifests"
 const FieldManager = "k3sm-addons"
 
 // FS returns the production embedded add-on manifest tree, rooted so that a manifest
-// added at manifests/foo.yaml is walked as "foo.yaml". It ships EMPTY of product
-// manifests today (only the authoring README lives there), so converging it is a no-op.
+// added at manifests/foo.yaml is walked as "foo.yaml". It holds the metrics-server
+// add-on (manifests/metrics-server.yaml) beside the authoring README.
 func FS() fs.FS {
 	sub, err := fs.Sub(embedded, manifestRoot)
 	if err != nil {

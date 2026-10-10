@@ -89,8 +89,8 @@ func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.
 	// repo's one rule for a fault on this process: UNSURVIVABLE faults exit (a dead
 	// control-plane child does, and the crash-loop breaker bounds the respawns);
 	// SURVIVABLE ones continue, and a manifest that will not apply is survivable —
-	// the control plane is up without it. The shipped set is EMPTY of product
-	// manifests today, so this is inert until the first add-on lands.
+	// the control plane is up without it. The shipped set is metrics-server
+	// (pkg/addons/manifests/metrics-server.yaml).
 	if ar, err := addons.NewFromConfig(addons.FS(), restCfg); err != nil {
 		logger.Error("build embedded add-on reconciler", "err", err)
 	} else if err := ar.Converge(ctx); err != nil {

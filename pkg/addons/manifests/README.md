@@ -4,9 +4,11 @@ Every `*.yaml` / `*.yml` file in this directory is **compiled into the `k3sm` bi
 (`//go:embed manifests` in `../addons.go`) and server-side-applied onto the cluster on every
 server start by `addons.Reconciler.Converge`.
 
-**This directory deliberately ships with no product manifest yet.** The reconciler is the
-substrate; the first real add-on (metrics-server) lands separately. An empty set converges to
-zero API calls, which is the intended posture until then.
+It holds one add-on today: **`metrics-server.yaml`**, upstream metrics-server v0.9.0. Its RBAC
+is upstream's verbatim; its Deployment header comment lists the only lines changed to run the
+Linux image as a `vm` pod on a Darwin node. `TestMetricsServerAddonManifest` pins the exact
+object set, the RBAC, the image digest and the scheduling fields, so any change to this file
+is a deliberate change to that test too.
 
 ## Why the manifests live in the binary and not on disk
 
