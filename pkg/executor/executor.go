@@ -288,7 +288,8 @@ const (
 	// the client as complete) plus dependency bumps, among them modernc.org/sqlite
 	// v1.58.0 to v1.60.1; no schema or encoding change, and the file kinePatches edits
 	// is byte-identical across the two tags. v0.17.x defaults
-	// --watch-progress-notify-interval to 5s and --emulated-etcd-version to 3.6.11, so the apiserver's watch cache stays fresh, and its no-cgo build is a
+	// --watch-progress-notify-interval to 5s and --emulated-etcd-version to 3.6.11,
+	// so the apiserver's watch cache stays fresh, and its no-cgo build is a
 	// real, supported variant (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo)
 	// rather than the SQLite-disabled stub the spike measured on the old pin.
 	//
