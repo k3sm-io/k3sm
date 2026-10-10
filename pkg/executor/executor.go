@@ -282,17 +282,20 @@ const (
 	// It replaces the former v1.14.2 SQLite pin, which had no corresponding upstream
 	// tag — it resolves only from a warmed module proxy, so a cold GOPROXY=direct build
 	// of the datastore could not be reproduced at all — and which predated the kine#577
-	// watch-progress-notify fix. v0.17.x is what k3s itself pins (v0.17.1 since the bump
-	// off v0.17.0: bugfixes and dependency patches only, no schema or encoding change);
-	// it defaults --watch-progress-notify-interval to 5s and --emulated-etcd-version to
-	// 3.6.11, so the apiserver's watch cache stays fresh, and its no-cgo build is a
+	// watch-progress-notify fix. v0.17.x is what k3s itself pins. v0.17.2 over v0.17.1
+	// changes only a rows.Err() check in sqllog ListStream (a list cut short by a
+	// cancelled query or a dropped connection now reports the error instead of reaching
+	// the client as complete) plus dependency bumps, among them modernc.org/sqlite
+	// v1.58.0 to v1.60.1; no schema or encoding change, and the file kinePatches edits
+	// is byte-identical across the two tags. v0.17.x defaults
+	// --watch-progress-notify-interval to 5s and --emulated-etcd-version to 3.6.11, so the apiserver's watch cache stays fresh, and its no-cgo build is a
 	// real, supported variant (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo)
 	// rather than the SQLite-disabled stub the spike measured on the old pin.
 	//
 	// Moving an EXISTING single-node state.db onto this pin is a one-way datastore
 	// migration; snapshotBeforeKineUpgrade takes the verified pre-migration backup
 	// (and preserves the old kine binary) before the new pin ever opens the db.
-	DefaultKineVersion = "v0.17.1"
+	DefaultKineVersion = "v0.17.2"
 	// DefaultEtcdVersion is the etcd server module version (go.etcd.io/etcd/server/v3)
 	// the executor builds CGO_ENABLED=0 from the embedded wrapper module
 	// (pkg/executor/etcdchild). It must equal the wrapper's go.mod.txt require; a bump

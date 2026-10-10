@@ -183,7 +183,7 @@ func kinePatchSetID() string {
 }
 
 // kineStampedVersion is the version a patched kine build reports: the upstream pin
-// plus the patch set, "v0.17.1+p1" (the bare pin with no patch set). `kine --version`
+// plus the patch set, "v0.17.2+p1" (the bare pin with no patch set). `kine --version`
 // prints it.
 func kineStampedVersion(version string) string {
 	if id := kinePatchSetID(); id != "" {
