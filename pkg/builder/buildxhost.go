@@ -47,8 +47,8 @@ import (
 //
 // (Mach-O 64-bit arm64, 65462960 bytes, notarized, "Developer ID Application:
 // Docker Inc (9BNSXJN65R)"; the digest matches the release API's asset digest).
-// The signer changed at this bump: v0.17.1 was signed "Tonis Tiigi
-// (F32M533787)".
+// The signer is unchanged from v0.37.1, the bump that moved it off v0.17.1's
+// "Tonis Tiigi (F32M533787)".
 //
 // Re-record a bump the same way: download the asset, sha256 it, cross-check the
 // release API's asset digest, then run hack/verify-buildx-signer.sh. That script
