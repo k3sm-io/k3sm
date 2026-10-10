@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-10-05
-updated_by: M17.4 build (sharded MLXModel placement, rank Pods, gang lifecycle, the k3sm-shard entrypoint)
+updated: 2026-10-10
+updated_by: M18 encode (docs/m18-plan.md — k3sm.app, the lifecycle CLI, the menu-bar controls)
 
 phases:
   - id: M0
@@ -1357,6 +1357,158 @@ phases:
             met: false
             check: "two recorded green hack/lab/m17.sh runs on the rig before the EXPERIMENTAL attribute is removed. Lab-ledger carve-out applies: met only by recorded K3SM_LAB=1 runs of hack/lab/m17.sh, never auto-greened by CI."
             method: lab
+  - id: M18
+    title: k3sm.app — the macOS app, its installer, and the menu-bar controls (stop, start, status)
+    status: in-progress
+    strategy: "phased (named exception: multi-node launchd rolling restart)"
+    depends_on:
+      - k3sm:M7
+      - runtimed:M18
+    note: "Authoritative input: docs/m18-plan.md (workspace), which adopts docs/menubar-plan.md Amendment A (A1-A20) and adds the binding L-series (L1-L12). The named exception covers only the in-app Update (A9: a worker updates any time; a server with joined workers only after every worker is at or above the payload version; one release of skew, worker ahead). Stop and start are hard cuts with zero skew. The macOS app's own source lives in a private repo; its gates are tracked in the workspace backlog and never pathed from this repo. Rows here cite k3sm-side checks only."
+    subphases:
+      - id: M18.0
+        title: foundations — the versioned status JSON contract, the six-repo wiring, the app skeleton
+        status: done
+        strategy: hard cut
+        depends_on: []
+        note: "Evidence, not aspiration: B456 shipped the schemaVersion 1 contract and the launchd-only daemons probe (gate pkg/status TestStatusJSONContractGolden); the macOS app repo and the workspace wiring merged 2026-10-09; the app skeleton landed 2026-10-10 (out of tree, private)."
+        deliverables:
+          - id: M18.0-d1
+            done: true
+            desc: "B456 — `k3sm status -o json` carries schemaVersion 1 and `k3sm status daemons -o json` is a launchd-only probe, both pinned by golden fixtures (pkg/status TestStatusJSONContractGolden)."
+          - id: M18.0-d2
+            done: true
+            desc: "B457 — the macOS app repo exists (private, Actions off) and every workspace repo loop reads one canonical list; out of tree, cited for completeness."
+        acceptance:
+          - id: M18.0-a1
+            met: true
+            check: "go test ./pkg/status -run TestStatusJSONContractGolden passes on main."
+            method: integration
+      - id: M18.1
+        title: lifecycle CLI — k3sm stop / start / restart, the lifecycle transitions, the stoppedBy status field, the user docs
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "L1-L4, L11, L12. Stop is the full stop (the k3s-killall analog) that stays stopped across reboot until start: an intent marker first, best-effort cordon and the k3sm.io/stopped-by-user annotation, disable plus bootout of the node daemon with awaitUnloaded, ONE shared teardown extracted from Uninstall (pod groups SIGTERM then 10 s then SIGKILL, RemoveMesh, FlushLo0Aliases from the persisted record), netd disable plus bootout, the completion marker last; plists stay; every step idempotent. netd does NOT tear down on SIGTERM (L12): launchd sends SIGTERM for every restart and upgrade. Install and update honour a user stop unless --start (L3)."
+        deliverables:
+          - id: M18.1-d1
+            done: false
+            desc: "B481 — `k3sm stop` per L1, with the Uninstall teardown extracted into one function both verbs call, the await barriers from pkg/install/restart.go, the two-phase marker (stopping, stopped) 0644 in a root-owned directory, best-effort cordon and annotation, and actor/reason/result logged to slog and os_log."
+          - id: M18.1-d2
+            done: false
+            desc: "B482 — `k3sm start` (markers removed, enable, netd then node daemon, the shared flush as a precondition, best-effort uncordon) and `k3sm restart` (pods keep running); install, in-app update and uninstall form one state machine: install and update honour the marker unless --start, uninstall clears the disable override and the markers."
+          - id: M18.1-d3
+            done: false
+            desc: "B483 — an additive omitempty `stoppedBy {actor, reason, at, phase}` on both status shapes, no new verdict or state enum, golden fixtures extended, docs/user/status-json.md updated."
+          - id: M18.1-d4
+            done: false
+            desc: "B484 — the user page docs/user/stop-start.md (the CLI, what stop does to pods, node-bound volumes and the cluster, the app equivalents, auto-stop's limits) with its site manifest entry, the docs/user README index row, and links from install, upgrade and troubleshooting."
+        acceptance:
+          - id: M18.1-a1
+            met: false
+            check: "go test ./pkg/install -run 'TestStopTearsDownPodsAndKeepsPlists|TestInstallHonoursUserStop' and go test ./pkg/status -run TestStoppedByIsAdditive pass."
+            method: integration
+          - id: M18.1-a2
+            met: false
+            check: "On the rig under K3SM_LAB=1: stop the worker, then no k3sm, shim or pod process and no cluster lo0 alias remains and status reports stoppedBy; start returns it Ready (part of the M18-lab row)."
+            method: lab
+      - id: M18.2
+        title: signed payload — boot verify-then-use, the payload manifest, prebuilt kine and etcd, the release scripts
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - runtimed:M18.2
+        note: "A7, A10-A12, A20 of docs/menubar-plan.md. M7.1-d1b is delivered here through B480 (verify-then-use at boot, the control-plane binaries built from pinned upstream source, so no third-party build is ever signed)."
+        deliverables:
+          - id: M18.2-d1
+            done: false
+            desc: "B480 — boot verifies payload signatures in place and never ad-hoc re-signs them; hack/release/build-cp.sh builds the control-plane binaries from pinned upstream source (also flips M7.1-d1b)."
+          - id: M18.2-d2
+            done: false
+            desc: "B477 — stage.sh writes a per-file SHA-256 payload manifest and gains --verify-release <TEAMID> (hardened runtime, secure timestamp, Team ID on every Mach-O)."
+          - id: M18.2-d3
+            done: false
+            desc: "B475 — kine and etcd ship prebuilt in the payload; the executor prefers the shipped binary only when its stamped version and patch-set id match the pins."
+          - id: M18.2-d4
+            done: false
+            desc: "B479 — the release driver and the attended signing and notarization scripts, which refuse to run under automation."
+        acceptance:
+          - id: M18.2-a1
+            met: false
+            check: "go test ./pkg/executor -run 'TestBootVerifiesPayloadWithoutResigning|TestShippedKinePreferredOnlyWhenStampMatches' passes and hack/release/stage.sh --verify-release fails an ad-hoc tree."
+            method: integration
+      - id: M18.3
+        title: the macOS app — status item (only while running), the menu, the window, the login item
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M18.1
+          - k3sm:M18.2
+        note: "L6-L8. The app is out of tree (private); this sub-phase tracks the k3sm-side contract it consumes. Menu: verdict and summary, status rows, Stop (warns on a server with joined workers), Restart, open status and logs, bug report, copy join command (server; admin prompt per use, TTL 15 min or less, concealed pasteboard cleared after 60 s), Open k3sm, Quit. After Stop the icon hides; at the next login a notification offers Start. The window carries first run, Start, Stop, Update and Uninstall. Lifecycle actions run the root-owned /Library/k3sm/k3sm stop|start|restart through the admin prompt."
+        deliverables:
+          - id: M18.3-d1
+            done: false
+            desc: "B458, B485, B486 (out of tree) — the app per L6-L8; k3sm-side, the status contract fixtures the app vendors stay the single copy (R1) and gain the stoppedBy shape."
+        acceptance:
+          - id: M18.3-a1
+            met: false
+            check: "go test ./pkg/status -run TestStatusJSONContractGolden passes with the stoppedBy fixtures the app vendors."
+            method: integration
+      - id: M18.4
+        title: install side — install --from-staging, the staging path and lock, the token-file join
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M18.3
+        note: "A8, A14 of docs/menubar-plan.md. Open questions carried from the app skeleton: the copy-out staging root clashes with install's own /Library/k3sm.staging; the copy-out cannot yet share install's lock; the join port is fixed at 9345."
+        deliverables:
+          - id: M18.4-d1
+            done: false
+            desc: "B459 — `k3sm install --from-staging <dir>` refuses any path outside the root-owned staging root, uninstall sweeps the staging root, the agent join reads --token-file, and the staging-path clash and lock sharing are resolved."
+        acceptance:
+          - id: M18.4-a1
+            met: false
+            check: "go test ./pkg/install -run TestFromStagingRefusesOutsideStagingRoot passes."
+            method: integration
+      - id: M18.5
+        title: lifecycle helper and auto-stop — password-free stop and start for the app, auto-stop on untrusted Wi-Fi
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M18.1
+          - k3sm:M18.2
+        note: "L9, L10. B487 is human_gate (it widens who may stop a root-managed service and pins a trust anchor) and is sequenced after the release signing pipeline. The helper is a root-owned LaunchDaemon with an XPC Mach service: the caller must satisfy the app's code-signing requirement by audit token AND be the console user in the admin group; a closed enum stop|start|restart; a hard-coded re-verified exec path; async verbs; rate limit and an audit line; pods denied mach-lookup of the service. Auto-stop (out of tree) is best-effort hygiene, not a protection: SSID plus security type, an open network is always untrusted, an unknown identity is a no-op, 30 s debounce and a 5 min cooldown, off by default on a server, and a same-named evil-twin access point defeats it."
+        deliverables:
+          - id: M18.5-d1
+            done: false
+            desc: "B487 — the root-owned lifecycle helper per L9, installed and removed by install and uninstall, excluded from the stop sequence, with docs/privilege-model.md amended in the same change."
+          - id: M18.5-d2
+            done: false
+            desc: "B488 (out of tree) — auto-stop on untrusted Wi-Fi per L10."
+        acceptance:
+          - id: M18.5-a1
+            met: false
+            check: "go test ./pkg/install -run TestLifecycleHelperCallerPolicy passes: an unsigned client, a different Team ID, a requirement-satisfying non-admin uid, a writable plist or target, and any string argument are each refused."
+            method: integration
+      - id: M18.6
+        title: distribution — the signed and notarized disk image, the cask, the publish, the closed-source note
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M18.4
+        note: "A6, A11, A16, A19 of docs/menubar-plan.md. The signing run and the publish are attended by the operator; the Homebrew tap is a public act. The app is a closed-source free component of an otherwise Apache-2.0 project, stated where users learn what they install."
+        deliverables:
+          - id: M18.6-d1
+            done: false
+            desc: "B37, B478, B139 — the first signed and notarized release of both channels, the cask, and the publish (operator-attended)."
+          - id: M18.6-d2
+            done: false
+            desc: "B489 — the closed-source note and the app documentation across the install page, the README and the site."
+        acceptance:
+          - id: M18.6-a1
+            met: false
+            check: "hack/verify-site-clean.sh --sources is clean over the app pages and the release notes name the notarized disk image."
+            method: e2e
 ---
 
 # k3sm — Phase roadmap
@@ -1975,3 +2127,45 @@ The direct-links page lands after the lab ladder is green, with measured Thunder
 name the Mac models and macOS build and no RDMA figure k3sm did not measure. The register rows were
 written by the encode; this sub-phase re-reads them against what shipped. Direct links stay
 EXPERIMENTAL, as an attribute, until `hack/lab/m17.sh` is green twice on the rig.
+
+## M18 — k3sm.app: the macOS app, its installer, and the menu-bar controls 🟡
+`docs/m18-plan.md` is authoritative (encoded 2026-10-10). It adopts `docs/menubar-plan.md`
+Amendment A and adds the binding L-series. M18 ships k3sm two ways from one payload: the existing
+command-line install and a notarized macOS app people drag into Applications, with a menu-bar item
+that shows while k3sm runs and a window for first run, start, stop, update and uninstall. The app's
+source is private and the app is free to use; everything it drives is the open `k3sm` CLI.
+
+The piece the menu needed first is a real lifecycle CLI. `k3sm stop` is a full stop, the analog of
+k3s's killall script: the node daemon, every pod, the mesh and the cluster addresses on lo0 come
+down, and the node stays stopped across a reboot until `k3sm start`. `k3sm restart` keeps pods
+running, as a restart does today. A stopped node is never silently started again by an install or
+an update. netd deliberately does not tear anything down on SIGTERM, because launchd sends that
+signal for every restart and upgrade.
+
+**Phased (named exception: multi-node launchd rolling restart)**, for the in-app Update only: a
+worker updates any time, a server with joined workers only after every worker is at or above the
+payload version. Stop and start are hard cuts.
+
+### M18.0 — foundations ✅
+The versioned status contract, the macOS app repo and its workspace wiring, and the app skeleton.
+
+### M18.1 — lifecycle CLI ⬜
+`k3sm stop`, `start` and `restart`, one shared teardown with uninstall, the lifecycle transitions,
+the `stoppedBy` status field and the user page on stopping and starting.
+
+### M18.2 — signed payload ⬜
+Boot verifies signatures instead of re-signing, the payload manifest, prebuilt kine and etcd, the
+control-plane binaries built from pinned source, and the attended release scripts.
+
+### M18.3 — the macOS app ⬜
+The status item, the menu, the window and the login item (out of tree).
+
+### M18.4 — install side ⬜
+`install --from-staging`, the staging path and lock, the token-file join.
+
+### M18.5 — lifecycle helper and auto-stop ⬜
+Password-free stop and start for the app through a root-owned helper with a strict caller policy,
+and auto-stop on untrusted Wi-Fi as best-effort hygiene.
+
+### M18.6 — distribution ⬜
+The first signed and notarized release of both channels, the cask, and the closed-source note.
