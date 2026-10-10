@@ -158,6 +158,15 @@ v0.1.1 followed on 2026-09-02; see [CHANGELOG.md](CHANGELOG.md) for what it adds
   sharded across cabled Macs (the reserved `MLXModel.Distributed` seam, one rank per Mac) on MLX's
   `ring` backend. The `jaccl` backend over RDMA follows where macOS exposes it, which today means
   Thunderbolt 5 Macs on macOS 26.2 or later with RDMA enabled once in macOS Recovery.
+- **A macOS app, and a real stop and start.** k3sm gains `k3sm stop`, `k3sm start` and
+  `k3sm restart`. Stop is a full stop, like k3s's killall script: the node, its pods, the mesh and
+  the cluster addresses come down, and the node stays stopped across a reboot until you start it
+  again. Restart keeps pods running. On top of that, k3sm gets a second way to install: a notarized
+  app you drag into Applications. While k3sm runs it shows a menu-bar item with status, stop,
+  restart and logs (and, on the server, a command that joins a worker), and its window handles
+  first-time setup, updates and uninstall. An optional auto-stop takes the node down when the Mac
+  joins a Wi-Fi network you have not marked trusted; it is a convenience, not a security boundary.
+  The command-line install stays exactly as it is.
 - **Autoscaling.** Scale-to-zero / activator-fronted model serving.
 
 ### Non-goals
