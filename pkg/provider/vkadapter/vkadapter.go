@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
@@ -122,10 +123,21 @@ type NodeConfig struct {
 	// provider routes (logs/exec/attach/port-forward); nil is the plain-HTTP path
 	// with no provider routes.
 	//
-	// When it is set it MUST require and verify a client certificate
-	// (tls.RequireAndVerifyClientCert against a non-nil ClientCAs) — NewNode refuses
-	// otherwise. See validateProviderRouteAuth.
+	// When it is set it MUST verify every client certificate presented against a
+	// non-nil ClientCAs: tls.RequireAndVerifyClientCert, or
+	// tls.VerifyClientCertIfGiven only when TokenRoutes names the routes the
+	// authorizer admits without one. NewNode refuses otherwise. See
+	// validateProviderRouteAuth.
 	TLSConfig *tls.Config
+	// TokenRoutes declares the request paths AuthorizeHandler may admit WITHOUT a
+	// client certificate, on a delegated bearer token. It must be a subset of the
+	// fixed read-only metrics routes TokenRouteSubresource knows, and it must be
+	// non-empty exactly when TLSConfig.ClientAuth is tls.VerifyClientCertIfGiven:
+	// the relaxed handshake is accepted only together with a declaration that
+	// confines it, and a declaration on a listener that requires a certificate is
+	// an incoherent config. Exec, attach, port-forward and logs can never appear
+	// here.
+	TokenRoutes []string
 	// AuthorizeHandler wraps the provider-route handler with the kubelet endpoint's
 	// authorization predicate (provider.KubeletEndpointAuth.Handler). It is REQUIRED
 	// whenever TLSConfig is set and ignored otherwise, because the only wiring that
@@ -185,25 +197,79 @@ type Route struct {
 // regression test pins; keep NewNode's route wiring routed through it.
 func providerRoutesEnabled(cfg NodeConfig) bool { return cfg.TLSConfig != nil }
 
+// tokenRouteSubresource maps every kubelet endpoint path that may be admitted on a
+// delegated bearer token to the nodes subresource a SubjectAccessReview checks for
+// it. It is the whole set, and it is read-only resource metrics only: the two
+// routes metrics-server scrapes, each with the trailing-slash form Virtual
+// Kubelet also registers. The mapping is upstream kubelet's (/stats/* is
+// nodes/stats, /metrics/* is nodes/metrics).
+var tokenRouteSubresource = map[string]string{
+	"/metrics/resource":  "metrics",
+	"/metrics/resource/": "metrics",
+	"/stats/summary":     "stats",
+	"/stats/summary/":    "stats",
+}
+
+// TokenRouteSubresource reports whether path may ever be admitted on a delegated
+// bearer token and, if so, which nodes subresource authorizes it. It is an exact
+// match on the decoded path: a prefix, a dot-segment or any other route is not a
+// token route.
+func TokenRouteSubresource(path string) (string, bool) {
+	sub, ok := tokenRouteSubresource[path]
+	return sub, ok
+}
+
+// TokenRoutes returns every path TokenRouteSubresource admits, sorted. A caller
+// that serves the bearer path passes it as NodeConfig.TokenRoutes.
+func TokenRoutes() []string {
+	out := make([]string, 0, len(tokenRouteSubresource))
+	for p := range tokenRouteSubresource {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // validateProviderRouteAuth is the fail-closed structural gate on the kubelet
 // endpoint's authentication: when the provider routes are served, the listener
-// must demand a verified client certificate AND an authorization predicate must
-// be wrapped around them. A NodeConfig that satisfies neither is a construction
-// ERROR, not a degraded mode.
+// must verify every client certificate it is shown AND an authorization predicate
+// must be wrapped around the routes. A NodeConfig that misses any of it is a
+// construction ERROR, not a degraded mode.
 //
 // It is stated here, in the one constructor, rather than trusted to each caller,
 // because the earlier posture — nodeutil.NoAuth() over a tls.NoClientCert
 // listener — was reachable by simply not thinking about it: every field involved
-// had a usable zero value. Requiring the three facts together means a regression
-// on ANY of them (an authorizer dropped, ClientAuth relaxed back to NoClientCert
-// or RequestClientCert, a nil CA pool) refuses to start the node instead of
-// quietly re-opening exec to the LAN.
+// had a usable zero value. Requiring the facts together means a regression on ANY
+// of them (an authorizer dropped, ClientAuth relaxed to NoClientCert,
+// RequestClientCert or RequireAnyClientCert, a nil CA pool) refuses to start the
+// node instead of quietly re-opening exec to the LAN.
+//
+// The one relaxation is tls.VerifyClientCertIfGiven, which lets a request with no
+// certificate reach the authorizer so it can be judged on a bearer token. It is
+// accepted only with a non-empty TokenRoutes drawn from TokenRouteSubresource's
+// fixed read-only set, so the config itself states that the cert-less path is
+// confined to resource metrics. A presented certificate is still verified at the
+// handshake in both modes.
 func validateProviderRouteAuth(cfg NodeConfig) error {
 	if cfg.AuthorizeHandler == nil {
 		return errors.New("vkadapter: NodeConfig.AuthorizeHandler is required when TLSConfig is set (the kubelet provider routes — logs/exec/attach/port-forward — are never served unauthorized)")
 	}
-	if cfg.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert {
-		return fmt.Errorf("vkadapter: NodeConfig.TLSConfig.ClientAuth is %v, want tls.RequireAndVerifyClientCert (the kubelet endpoint authenticates the apiserver by client certificate)", cfg.TLSConfig.ClientAuth)
+	switch cfg.TLSConfig.ClientAuth {
+	case tls.RequireAndVerifyClientCert:
+		if len(cfg.TokenRoutes) != 0 {
+			return fmt.Errorf("vkadapter: NodeConfig.TokenRoutes %v is set on a listener that requires a client certificate (token routes need tls.VerifyClientCertIfGiven)", cfg.TokenRoutes)
+		}
+	case tls.VerifyClientCertIfGiven:
+		if len(cfg.TokenRoutes) == 0 {
+			return errors.New("vkadapter: NodeConfig.TLSConfig.ClientAuth is tls.VerifyClientCertIfGiven but TokenRoutes is empty (a listener that admits a request without a certificate must declare the read-only routes that path is confined to; otherwise use tls.RequireAndVerifyClientCert)")
+		}
+		for _, p := range cfg.TokenRoutes {
+			if _, ok := TokenRouteSubresource(p); !ok {
+				return fmt.Errorf("vkadapter: NodeConfig.TokenRoutes entry %q is not a read-only metrics route (allowed: /metrics/resource, /stats/summary)", p)
+			}
+		}
+	default:
+		return fmt.Errorf("vkadapter: NodeConfig.TLSConfig.ClientAuth is %v, want tls.RequireAndVerifyClientCert, or tls.VerifyClientCertIfGiven with TokenRoutes (the kubelet endpoint verifies every client certificate it is shown)", cfg.TLSConfig.ClientAuth)
 	}
 	if cfg.TLSConfig.ClientCAs == nil {
 		return errors.New("vkadapter: NodeConfig.TLSConfig.ClientCAs is nil, so no client certificate could verify (the kubelet endpoint anchors on the cluster's client-identity CA)")
