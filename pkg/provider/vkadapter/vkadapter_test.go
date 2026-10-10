@@ -49,10 +49,12 @@ func TestProviderRoutesEnabledGate(t *testing.T) {
 
 // TestValidateProviderRouteAuth pins the B176 fail-closed gate on the OTHER
 // security axis: given that the routes are served at all, they are served
-// authenticated. The three facts must hold TOGETHER — an authorization predicate,
-// a listener that REQUIRES a client certificate, and a CA pool to verify it
-// against — and dropping any one of them is a construction error, not a degraded
-// mode. The accepted row is the positive control: without it a validator that
+// authenticated. The facts must hold TOGETHER — an authorization predicate, a
+// listener that verifies every client certificate it is shown, and a CA pool to
+// verify it against — and dropping any one of them is a construction error, not a
+// degraded mode. Since B93 the listener may skip REQUIRING a certificate only when
+// the config declares token routes, and only routes from the fixed read-only
+// metrics set. The accepted row is the positive control: without it a validator that
 // rejected everything would pass this table vacuously.
 func TestValidateProviderRouteAuth(t *testing.T) {
 	pool := x509.NewCertPool()
@@ -92,8 +94,38 @@ func TestValidateProviderRouteAuth(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "VerifyClientCertIfGiven (verified only when offered) is refused",
+			name:    "ClientAuth relaxed to RequireAnyClientCert (presented but never verified) is refused",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.RequireAnyClientCert, ClientCAs: pool}, AuthorizeHandler: pass},
+			wantErr: true,
+		},
+		{
+			name:    "VerifyClientCertIfGiven without declared token routes is refused",
 			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.VerifyClientCertIfGiven, ClientCAs: pool}, AuthorizeHandler: pass},
+			wantErr: true,
+		},
+		{
+			name:    "VerifyClientCertIfGiven confined to the read-only metrics routes is accepted",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.VerifyClientCertIfGiven, ClientCAs: pool}, AuthorizeHandler: pass, TokenRoutes: TokenRoutes()},
+			wantErr: false,
+		},
+		{
+			name:    "a token route outside the metrics set (exec) is refused",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.VerifyClientCertIfGiven, ClientCAs: pool}, AuthorizeHandler: pass, TokenRoutes: []string{"/metrics/resource", "/exec/"}},
+			wantErr: true,
+		},
+		{
+			name:    "a token route prefix that is not an exact metrics path is refused",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.VerifyClientCertIfGiven, ClientCAs: pool}, AuthorizeHandler: pass, TokenRoutes: []string{"/"}},
+			wantErr: true,
+		},
+		{
+			name:    "token routes on a listener that requires a certificate are refused as incoherent",
+			cfg:     NodeConfig{TLSConfig: mutual(), AuthorizeHandler: pass, TokenRoutes: TokenRoutes()},
+			wantErr: true,
+		},
+		{
+			name:    "VerifyClientCertIfGiven against a nil CA pool is refused",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.VerifyClientCertIfGiven}, AuthorizeHandler: pass, TokenRoutes: TokenRoutes()},
 			wantErr: true,
 		},
 		{
