@@ -325,18 +325,22 @@ func TestEtcdMemberRouteBindsTheServerName(t *testing.T) {
 
 // TestEtcdMemberRouteBoundsTheReservation: the reservation runs under its own
 // deadline, so a reserver that never answers cannot hold the member lock past it.
+// The bound is read inside the reserver as the time left at call time, so how late
+// the handler is scheduled does not enter the measurement: the route sets the
+// deadline before calling, so the remaining time can only be at most the timeout.
 func TestEtcdMemberRouteBoundsTheReservation(t *testing.T) {
 	var mu sync.Mutex
-	var deadline time.Time
+	var remaining time.Duration
 	var hadDeadline bool
 	reserver := reserverFunc(func(ctx context.Context) error {
 		mu.Lock()
 		defer mu.Unlock()
+		var deadline time.Time
 		deadline, hadDeadline = ctx.Deadline()
+		remaining = time.Until(deadline)
 		return nil
 	})
 	rig := newMeshMemberRig(t, &fakeMembers{members: []bootstrap.EtcdMember{serverA}}, reserver)
-	start := time.Now()
 	if _, err := rig.request(claimedRequest()); err != nil {
 		t.Fatalf("RequestEtcdMember: %v", err)
 	}
@@ -345,8 +349,8 @@ func TestEtcdMemberRouteBoundsTheReservation(t *testing.T) {
 	if !hadDeadline {
 		t.Fatal("the reservation ran with no deadline")
 	}
-	if d := deadline.Sub(start); d > bootstrap.ServerMeshReserveTimeout+time.Second {
-		t.Errorf("the reservation's deadline is %s away, want at most %s", d, bootstrap.ServerMeshReserveTimeout)
+	if remaining <= 0 || remaining > bootstrap.ServerMeshReserveTimeout {
+		t.Errorf("the reservation had %s left when called, want more than 0 and at most %s", remaining, bootstrap.ServerMeshReserveTimeout)
 	}
 }
 
