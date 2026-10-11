@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Stub go for hack/verify-deps.sh --self-test. It answers from ./stub, the
+# fixture repo the script runs in, and never touches the network.
+set -euo pipefail
+case "${1:-} ${2:-}" in
+"env "*)
+	grep -E "^${2}=" stub/goenv | head -1 | cut -d= -f2- || true
+	;;
+"mod verify")
+	if [ -f stub/modverify-fail ]; then
+		echo "example.com/old v1.2.3: dir has been modified" >&2
+		exit 1
+	fi
+	echo "all modules verified"
+	;;
+"list -m")
+	cat stub/golist
+	;;
+*)
+	echo "stub go: unexpected arguments: $*" >&2
+	exit 2
+	;;
+esac

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Stub curl for hack/verify-deps.sh --self-test. It serves the module proxy's
+# .info and the OSV query API from ./stub, the fixture repo the script runs in,
+# and never touches the network. Files it reads:
+#   stub/net-fail      present: every request fails as a connection error
+#   stub/info          "<module> <version> <age in days>" per line
+#   stub/osv-mal       "<module> <version> <MAL id>": a batch result carries the id
+#   stub/osv-page      "<module> <version> <MAL id>": the id arrives on page two
+#   stub/osv-garbled   present: the batch endpoint answers with non-JSON
+set -euo pipefail
+exec python3 -I -c '
+import datetime, json, os, sys, time
+
+args, out, body, url, i = sys.argv[1:], None, None, None, 0
+while i < len(args):
+    a = args[i]
+    if a in ("-o", "--data-binary", "--max-time", "--retry", "-X", "-H"):
+        if a == "-o":
+            out = args[i + 1]
+        elif a == "--data-binary":
+            body = args[i + 1]
+        i += 2
+        continue
+    if a.startswith("http"):
+        url = a
+    i += 1
+
+def lines(name):
+    p = os.path.join("stub", name)
+    if not os.path.exists(p):
+        return []
+    with open(p) as f:
+        return [l.split() for l in f if l.strip()]
+
+def unescape(s):
+    r, j = [], 0
+    while j < len(s):
+        if s[j] == "!":
+            r.append(s[j + 1].upper()); j += 2
+        else:
+            r.append(s[j]); j += 1
+    return "".join(r)
+
+def emit(text):
+    if out:
+        with open(out, "w") as f:
+            f.write(text)
+    else:
+        sys.stdout.write(text)
+
+def notfound():
+    sys.stderr.write("curl: (22) The requested URL returned error: 404\n")
+    sys.exit(22)
+
+if os.path.exists("stub/net-fail"):
+    sys.stderr.write("curl: (7) Failed to connect\n")
+    sys.exit(7)
+if url is None:
+    notfound()
+proxy = "https://proxy.golang.org/"
+if url.startswith(proxy):
+    rest = url[len(proxy):]
+    if "/@v/" not in rest or not rest.endswith(".info") or rest != rest.lower():
+        notfound()
+    mp, ver = rest[:-len(".info")].split("/@v/", 1)
+    mp, ver = unescape(mp), unescape(ver)
+    for l in lines("info"):
+        if l[0] == mp and l[1] == ver:
+            t = time.time() - float(l[2]) * 86400
+            stamp = datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            emit(json.dumps({"Version": ver, "Time": stamp}))
+            sys.exit(0)
+    notfound()
+req = {}
+if body and body.startswith("@"):
+    with open(body[1:]) as f:
+        req = json.load(f)
+if url == "https://api.osv.dev/v1/querybatch":
+    if os.path.exists("stub/osv-garbled"):
+        emit("<html>upstream error</html>")
+        sys.exit(0)
+    res = []
+    for q in req["queries"]:
+        p, v, r = q["package"]["name"], q["version"], {}
+        vulns = [{"id": l[2]} for l in lines("osv-mal") if l[0] == p and l[1] == v]
+        if any(l[0] == p and l[1] == v for l in lines("osv-page")):
+            vulns.append({"id": "GO-2026-0000"})
+            r["next_page_token"] = "page-2"
+        if vulns:
+            r["vulns"] = vulns
+        res.append(r)
+    emit(json.dumps({"results": res}))
+    sys.exit(0)
+if url == "https://api.osv.dev/v1/query":
+    p, v = req["package"]["name"], req["version"]
+    vulns = [{"id": l[2]} for l in lines("osv-page") if l[0] == p and l[1] == v]
+    emit(json.dumps({"vulns": vulns} if vulns else {}))
+    sys.exit(0)
+notfound()
+' "$@"

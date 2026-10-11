@@ -135,4 +135,19 @@ fi
 # Keep the genproto replace (resolves the monolith-vs-split ambiguous import).
 grep -q 'replace google.golang.org/genproto' go.mod || { echo "missing genproto replace in go.mod"; exit 1; }
 
+# The dependency supply-chain check (hack/verify-deps.sh): the go environment
+# cannot weaken verification, go mod verify, the hack/deps.lock module graph,
+# the 14-day cooldown on new versions, the OSV malicious-package query, go.mod
+# replace discipline, and exact pins on every remote go install / go run. It
+# needs proxy.golang.org and api.osv.dev; there is no offline skip, because a
+# network failure there is RED by design. Like the examples gate, it runs only in
+# the real module: hack/acceptance/ci_guard_test.go runs this script in a
+# throwaway module whose graph the lock could never describe.
+if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
+	echo "==> [k3sm] verify-deps (self-test)"
+	hack/verify-deps.sh --self-test
+	echo "==> [k3sm] verify-deps"
+	hack/verify-deps.sh
+fi
+
 echo "OK: k3sm ci green"
