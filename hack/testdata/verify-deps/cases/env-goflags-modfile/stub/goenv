@@ -1,0 +1,7 @@
+GOSUMDB=sum.golang.org
+GONOSUMDB=
+GOINSECURE=
+GOPRIVATE=
+GONOPROXY=
+GOFLAGS=-modfile=alt.mod
+GOPROXY=https://proxy.golang.org,direct

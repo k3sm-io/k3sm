@@ -13,14 +13,22 @@
 #   go mod verify            the module cache matches go.sum
 #   lock                     hack/deps.lock equals `go list -m all`; any new,
 #                            removed or changed module is a reviewed change
-#   cooldown                 no module version younger than 14 days, unless
-#                            hack/deps.cooldown-exempt names it with a reason
+#   cooldown                 no module version whose age is under 14 days,
+#                            unless hack/deps.cooldown-exempt names it with a
+#                            reason. The age is the commit time the module
+#                            proxy records for the version (the .info Time),
+#                            NOT when the version was first published: a
+#                            backdated commit is a known gap. Every module
+#                            added or changed since the merge base has its
+#                            time re-read from the proxy, so a forged lock
+#                            time cannot clear the cooldown.
 #   malicious-package check  no module version carries an OSV MAL- advisory
 #   replace discipline       every go.mod replace sits directly under its own
 #                            comment line, and a filesystem replace points
 #                            only at a sibling repo
 #   pinned tools             no `go install` / `go run` of a remote module in
-#                            hack/** or a Makefile without an exact version
+#                            hack/**, a Makefile or a //go:generate line
+#                            without an exact version
 #
 # Usage (from anywhere; the script runs from the repo root with GOWORK=off):
 #   hack/verify-deps.sh              run every stage
@@ -30,8 +38,9 @@
 #   hack/verify-deps.sh --self-test  hermetic fixtures (hack/testdata/verify-deps),
 #                                    stubbed go and curl, no network
 #
-# Network: the malicious-package stage queries https://api.osv.dev, and --update
-# reads publish times from https://proxy.golang.org. A network failure is a
+# Network: the malicious-package stage queries https://api.osv.dev; the cooldown
+# stage and --update read commit times from https://proxy.golang.org. A network
+# failure is a
 # failure, never a skip: a supply-chain check that passes when it cannot look
 # has checked nothing.
 #
@@ -72,9 +81,10 @@ import datetime, json, os, re, shlex, sys, time
 EXACT = re.compile(r'^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+incompatible)?$')
 HEADER = (
     "# Module graph lock for hack/verify-deps.sh: one line per module in\n"
-    "# `go list -m all` (main module excluded), each with the publish time the\n"
-    "# module proxy reports for the version that is built (`local` for a\n"
-    "# filesystem replacement). Regenerate with: hack/verify-deps.sh --update\n"
+    "# `go list -m all` (main module excluded), each with the commit time the\n"
+    "# module proxy records for the version that is built (not its first\n"
+    "# publication; `local` for a filesystem replacement).\n"
+    "# Regenerate with: hack/verify-deps.sh --update\n"
 )
 
 
@@ -120,7 +130,7 @@ def read_lock(path):
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
             if " # " not in line:
-                raise ValueError("%s:%d: no publish time (want '<module line> # <time>')" % (path, n))
+                raise ValueError("%s:%d: no commit time (want '<module line> # <time>')" % (path, n))
             key, tm = line.split(" # ", 1)
             key, tm = key.strip(), tm.strip()
             parse_key(key)
@@ -236,6 +246,59 @@ def cmd_update_write(lockpath, work):
         print("  " + l)
 
 
+def cmd_verify_plan(lockpath, basepath, work, proxy):
+    try:
+        lock = read_lock(lockpath)
+    except ValueError as e:
+        die(str(e))
+    base = set()
+    if basepath != "-":
+        try:
+            base = {k for k, _ in read_lock(basepath)}
+        except (OSError, ValueError):
+            base = set()
+    if basepath == "-" or not base:
+        print("    no base lock at the merge base with origin/main: every line is re-checked")
+    fetch = open(os.path.join(work, "fetch"), "w")
+    plan = open(os.path.join(work, "verify"), "w")
+    n = 0
+    for i, (key, tm) in enumerate(lock):
+        _, _, ep, ev, local = parse_key(key)
+        if local or key in base:
+            plan.write("%s\t%s\t-\n" % (key, tm))
+            continue
+        out = os.path.join(work, "vinfo.%d" % i)
+        fetch.write("%s/%s/@v/%s.info %s\n" % (proxy, escape(ep), escape(ev), out))
+        plan.write("%s\t%s\t%s\n" % (key, tm, out))
+        n += 1
+    fetch.close()
+    plan.close()
+    print("    %d lock lines added or changed since the base; re-reading their times from the proxy" % n)
+
+
+def cmd_verify_times(work, outpath):
+    lines, bad = [], []
+    with open(os.path.join(work, "verify")) as f:
+        for raw in f:
+            key, tm, info = raw.rstrip("\n").split("\t")
+            if info != "-":
+                try:
+                    with open(info) as g:
+                        proxy_tm = str(json.load(g)["Time"])
+                except (OSError, ValueError, KeyError, TypeError) as e:
+                    die("unreadable proxy .info for %s: %s" % (key, e))
+                a, b = parse_time(tm), parse_time(proxy_tm)
+                if a is None or b is None or abs(a - b) > 3600:
+                    bad.append("%s: lock time %s does not match the proxy (%s)" % (key, tm, proxy_tm))
+                tm = proxy_tm
+            lines.append("%s # %s" % (key, tm))
+    for b in bad:
+        print("  " + b)
+    with open(outpath, "w") as f:
+        f.write(HEADER + "".join(l + "\n" for l in lines))
+    sys.exit(1 if bad else 0)
+
+
 def read_exempt(path):
     ex = {}
     if not os.path.exists(path):
@@ -269,22 +332,23 @@ def cmd_cooldown(entries, exemptpath, days):
             continue
         ts = parse_time(tm)
         if ts is None:
-            bad.append("%s: unparseable publish time %r (run hack/verify-deps.sh --update)" % (key, tm))
+            bad.append("%s: unparseable commit time %r (run hack/verify-deps.sh --update)" % (key, tm))
             continue
-        # The proxy reports the zero time when it does not know when a version
-        # was published; an unknown age cannot clear the cooldown.
+        # The proxy records the zero time when it does not know a version's
+        # commit time; an unknown age cannot clear the cooldown.
         unknown = tm.startswith("0001-01-01")
         age = (now - ts) / 86400.0
         if unknown or age < days:
-            what = "no known publish time" if unknown else "%.1f days old" % age
+            what = "no known commit time" if unknown else "%.1f days old" % age
             if (ep, ev) in ex:
                 used.add((ep, ev))
                 print("  exempt: %s %s (%s): %s" % (ep, ev, what, ex[(ep, ev)]))
                 continue
             if unknown:
-                bad.append("%s %s: the module proxy reports no publish time (%s)" % (ep, ev, tm))
+                bad.append("%s %s: the module proxy records no commit time (%s)" % (ep, ev, tm))
             else:
-                bad.append("%s %s was published %s, %.1f days ago (cooldown is %d days)" % (ep, ev, tm, age, days))
+                bad.append("%s %s has a proxy-recorded commit time of %s, %.1f days ago (cooldown is %d days)"
+                           % (ep, ev, tm, age, days))
     for k in sorted(set(ex) - used):
         print("  note: exemption '%s %s' matches no module version under the cooldown; delete it" % k)
     for b in bad:
@@ -421,6 +485,11 @@ PREFIX_WORDS = {"env", "nohup", "exec", "sudo", "command", "time", "then", "do",
                 "elif", "if", "while", "until", "!", "nice"}
 
 
+LITERAL_VAR = re.compile(r'\$\{[^}]*\}|\$\([A-Za-z_][A-Za-z0-9_]*\)')
+GO_WORD = re.compile(r'^(?:go|\$\(GO[A-Za-z0-9_]*\)|\$\{GO[^}]*\}|\$GO[A-Za-z0-9_]*)$')
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+
+
 def segments(line):
     """Split one line into shell command segments, outside quotes."""
     segs, cur, stack, i = [], [], ["n"], 0
@@ -455,6 +524,12 @@ def segments(line):
             else:
                 cur.append(c)
             i += 1
+            continue
+        m = LITERAL_VAR.match(line, i)
+        if m:
+            # ${...} and a make-style $(NAME) are words, not grouping.
+            cur.append(m.group(0))
+            i = m.end()
             continue
         if c == "'":
             stack.append("s")
@@ -494,7 +569,8 @@ def words(seg):
 ASSIGN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
 
-def go_invocation(seg):
+def go_invocations(seg, depth=0):
+    """Return [(verb, target)] for every go install / go run in one segment."""
     w = words(seg)
     i, after_env = 0, False
     while i < len(w):
@@ -506,22 +582,39 @@ def go_invocation(seg):
             i += 1
         else:
             break
-    if i + 1 >= len(w):
-        return None
+    if i >= len(w):
+        return []
     first = w[i].lstrip("@+-") if i == 0 else w[i]
-    if first != "go" or w[i + 1] not in ("install", "run"):
-        return None
-    args, j = w[i + 2:], 0
-    while j < len(args):
-        a = args[j]
-        if a == "--":
+    # sh -c "..." / bash -euc '...': the command string is scanned in turn.
+    if os.path.basename(first) in SHELLS and depth < 3:
+        j = i + 1
+        while j < len(w) and w[j].startswith("-"):
+            if "c" in w[j].lstrip("-") and not w[j].startswith("--") and j + 1 < len(w):
+                out = []
+                for sub in segments(w[j + 1]):
+                    out += go_invocations(sub, depth + 1)
+                return out
             j += 1
+        return []
+    if not GO_WORD.match(first):
+        return []
+    j = i + 1
+    # go's own flags before the verb: -C <dir> (or -C=<dir>).
+    while j < len(w) and w[j].startswith("-"):
+        j += 2 if w[j] == "-C" else 1
+    if j >= len(w) or w[j] not in ("install", "run"):
+        return []
+    verb, args, k = w[j], w[j + 1:], 0
+    while k < len(args):
+        a = args[k]
+        if a == "--":
+            k += 1
             break
         if a.startswith("-"):
-            j += 2 if ("=" not in a and a.split("=")[0] in VALUE_FLAGS) else 1
+            k += 2 if ("=" not in a and a.split("=")[0] in VALUE_FLAGS) else 1
             continue
         break
-    return (w[i + 1], args[j] if j < len(args) else None)
+    return [(verb, args[k] if k < len(args) else None)]
 
 
 def assignments(files):
@@ -608,45 +701,64 @@ def cmd_tools(root, listfile):
     locals_ = local_module_prefixes(root)
     bad, notes = [], []
     for rel, lines in files:
+        is_go = rel.endswith(".go")
         # A version variable resolves through assignments in the same file only;
         # anything else (a sourced file, a caller's argument) is reported as computed.
-        tab = assignments([(rel, lines)])
+        tab = {} if is_go else assignments([(rel, lines)])
         for n, raw in enumerate(lines, 1):
             s = raw.strip()
-            if not s or s.startswith("#") or s.startswith("//"):
+            if is_go:
+                # In Go source only a //go:generate directive runs a command.
+                m = re.match(r'^//go:generate\s+(.*)$', s)
+                if not m:
+                    continue
+                raw = m.group(1)
+            elif not s or s.startswith("#") or s.startswith("//"):
                 continue
             for seg in segments(raw):
-                inv = go_invocation(seg)
-                if not inv:
-                    continue
-                verb, target = inv
-                where = "%s:%d: go %s" % (rel, n, verb)
-                if target is None:
-                    continue
-                if "@" in target:
-                    mod, ver = target.rsplit("@", 1)
-                    if mod.startswith((".", "/")):
+                for verb, target in go_invocations(seg):
+                    where = "%s:%d: go %s" % (rel, n, verb)
+                    if target is None:
                         continue
-                    lits, computed = resolve(ver, tab)
-                    nonexact = [l for l in lits if not EXACT.match(l)]
-                    if nonexact:
-                        bad.append("%s %s: version %s is not an exact vX.Y.Z or pseudo-version"
-                                   % (where, target, ", ".join(repr(l) for l in nonexact)))
-                    elif computed and not lits:
-                        notes.append("%s %s: the version is computed at run time, not checked here" % (where, target))
-                    continue
-                if target.startswith((".", "/", "$", "~")) or target.endswith(".go"):
-                    continue
-                if "." not in target.split("/")[0]:
-                    continue
-                if any(target == p or target.startswith(p + "/") for p in locals_):
-                    continue
-                bad.append("%s %s: a remote module without an @version" % (where, target))
+                    if "@" in target:
+                        mod, ver = target.rsplit("@", 1)
+                        if mod.startswith((".", "/")):
+                            continue
+                        lits, computed = resolve(ver, tab)
+                        nonexact = [l for l in lits if not EXACT.match(l)]
+                        if nonexact:
+                            bad.append("%s %s: version %s is not an exact vX.Y.Z or pseudo-version"
+                                       % (where, target, ", ".join(repr(l) for l in nonexact)))
+                        elif computed and not lits:
+                            notes.append("%s %s: the version is computed at run time, not checked here" % (where, target))
+                        continue
+                    if target.startswith((".", "/", "$", "~")) or target.endswith(".go"):
+                        continue
+                    if "." not in target.split("/")[0]:
+                        continue
+                    if any(target == p or target.startswith(p + "/") for p in locals_):
+                        continue
+                    bad.append("%s %s: a remote module without an @version" % (where, target))
     for x in notes:
         print("  note: " + x)
     for b in bad:
         print("  " + b)
     sys.exit(1 if bad else 0)
+
+
+def cmd_govcs(value):
+    """Exit 0 when GOVCS allows nothing beyond the default public:git|hg,private:all."""
+    for entry in value.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            die("malformed GOVCS entry %r" % entry)
+        pattern, vcs = entry.rsplit(":", 1)
+        if pattern == "private":
+            continue
+        if not set(vcs.split("|")) <= {"git", "hg", "off"}:
+            die("GOVCS entry %r allows %s" % (entry, vcs))
 
 
 def cmd_ago(days):
@@ -657,9 +769,9 @@ def cmd_ago(days):
 CMDS = {
     "graph-clean": cmd_graph_clean, "lockdiff": cmd_lockdiff,
     "update-plan": cmd_update_plan, "update-write": cmd_update_write,
-    "cooldown": cmd_cooldown, "osv-build": cmd_osv_build, "osv-parse": cmd_osv_parse,
+    "cooldown": cmd_cooldown, "verify-plan": cmd_verify_plan, "verify-times": cmd_verify_times, "osv-build": cmd_osv_build, "osv-parse": cmd_osv_parse,
     "osv-page-req": cmd_osv_page_req, "osv-page-parse": cmd_osv_page_parse,
-    "replace": cmd_replace, "tools": cmd_tools, "ago": cmd_ago,
+    "replace": cmd_replace, "tools": cmd_tools, "ago": cmd_ago, "govcs": cmd_govcs,
     "escape": lambda s: print(escape(s)), "unescape": lambda s: print(unescape(s)),
 }
 
@@ -683,8 +795,10 @@ env_guard() {
 	command -v python3 >/dev/null 2>&1 || fail "env guard" "python3 is not on PATH"
 	local v bad=""
 	v="$(go env GOSUMDB)" || fail "env guard" "go env GOSUMDB failed"
-	case "$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')" in
-	"" | off | off,*) bad="${bad}  GOSUMDB='$v' disables checksum-database verification"$'\n' ;;
+	# Only the default checksum database: no "off", no other database or key.
+	case "$v" in
+	"" | sum.golang.org) ;;
+	*) bad="${bad}  GOSUMDB='$v': it must be sum.golang.org (or unset)"$'\n' ;;
 	esac
 	local name
 	for name in GONOSUMDB GONOSUMCHECK GOINSECURE GOPRIVATE GONOPROXY; do
@@ -699,11 +813,19 @@ env_guard() {
 		case "$f" in
 		-insecure | -insecure=* | --insecure | --insecure=*) bad="${bad}  GOFLAGS carries $f"$'\n' ;;
 		-mod=mod | --mod=mod) bad="${bad}  GOFLAGS carries $f, which lets the go command rewrite go.mod and go.sum"$'\n' ;;
+		-modfile | -modfile=* | --modfile | --modfile=*) bad="${bad}  GOFLAGS carries $f, which swaps in a different go.mod and go.sum"$'\n' ;;
 		esac
 	done
 	v="$(go env GOPROXY)" || fail "env guard" "go env GOPROXY failed"
-	local first="${v%%[,|]*}"
-	[ "$first" = "$PROXY_URL" ] || bad="${bad}  GOPROXY='$v': the first proxy must be $PROXY_URL"$'\n'
+	case "$v" in
+	"" | "$PROXY_URL" | "$PROXY_URL,direct") ;;
+	*) bad="${bad}  GOPROXY='$v': it must be $PROXY_URL or $PROXY_URL,direct (or unset)"$'\n' ;;
+	esac
+	v="$(go env GOVCS)" || fail "env guard" "go env GOVCS failed"
+	[ -n "$v" ] || v="$(printenv GOVCS || true)"
+	if [ -n "$v" ] && ! py govcs "$v" >/dev/null; then
+		bad="${bad}  GOVCS='$v' allows more version control systems than the default (public:git|hg,private:all)"$'\n'
+	fi
 	if [ -n "$bad" ]; then
 		printf '%s' "$bad" >&2
 		fail "env guard" "the go environment weakens module verification; unset the variables above"
@@ -736,7 +858,8 @@ lock_check() {
 The module graph no longer matches $LOCK (lines above).
 Before accepting it, check every added or changed module:
   - provenance: who publishes it, and is it the module you meant (not a look-alike)?
-  - publish age: a version released in the last $COOLDOWN_DAYS days is refused by the cooldown stage
+  - age: a version whose proxy-recorded commit time is under $COOLDOWN_DAYS days old is
+    refused by the cooldown stage (a backdated commit is not caught; check the release)
   - need: why this change needs it, and which import pulls it in (go mod why -m <module>)
   - alternative: would a small in-repo implementation do instead?
 Then run hack/verify-deps.sh --update and commit $LOCK with the change.
@@ -746,11 +869,48 @@ EOF
 }
 
 # ---- d: cooldown -------------------------------------------------------------
-cooldown_check() { # cooldown_check <lock-format file>
-	stage "cooldown"
+cooldown_ages() { # cooldown_ages <lock-format file>
 	local rc=0
 	py cooldown "$1" "$EXEMPT" "$COOLDOWN_DAYS" || rc=$?
-	[ "$rc" -eq 0 ] || fail "cooldown" "module versions under $COOLDOWN_DAYS days old (above); wait, or add '<module> <version> <reason>' to $EXEMPT after an audit"
+	[ "$rc" -eq 0 ] || fail "cooldown" "module versions whose proxy-recorded commit time is under $COOLDOWN_DAYS days old (above). The age is the commit time the proxy records, not first publication, so a backdated commit is not caught. Wait, or add '<module> <version> <reason>' to $EXEMPT after an audit"
+}
+
+# cooldown_check <lock-format file>: the age check on lock times that are
+# already trusted (--update just fetched them from the proxy).
+cooldown_check() {
+	stage "cooldown"
+	cooldown_ages "$1"
+}
+
+# cooldown_verify: check mode. A lock line added or changed since the merge base
+# with origin/main carries a time nobody has re-checked, so its time is read
+# from the proxy again and must agree with the lock within an hour; the age
+# check then uses the proxy's time. Lines unchanged since the base keep the lock
+# time. With no base lock (no origin/main, or no lock there) every line is new.
+cooldown_verify() {
+	stage "cooldown"
+	local base="-" mb
+	if [ -e .git ] && command -v git >/dev/null 2>&1 &&
+		mb="$(git merge-base HEAD origin/main 2>/dev/null)" &&
+		git show "$mb:$LOCK" >"$WORK/base.lock" 2>/dev/null; then
+		base="$WORK/base.lock"
+	fi
+	py verify-plan "$LOCK" "$base" "$WORK" "$PROXY_URL" || fail "cooldown" "could not read $LOCK"
+	fetch_infos cooldown
+	local rc=0
+	py verify-times "$WORK" "$WORK/verified.lock" || rc=$?
+	[ "$rc" -eq 0 ] || fail "cooldown" "lock time does not match the proxy (above); regenerate the lines with hack/verify-deps.sh --update"
+	cooldown_ages "$WORK/verified.lock"
+}
+
+# fetch_infos <stage>: download every "<url> <file>" pair in $WORK/fetch.
+fetch_infos() {
+	[ -s "$WORK/fetch" ] || return 0
+	echo "    fetching $(wc -l <"$WORK/fetch" | tr -d ' ') commit times from $PROXY_URL"
+	# shellcheck disable=SC2016
+	xargs -P 8 -n 2 sh -c 'curl -fsS --max-time 30 --retry 2 -o "$2" "$1" || { echo "    could not fetch $1" >&2; exit 1; }' _ \
+		<"$WORK/fetch" ||
+		fail "$1" "network failure reading commit times from $PROXY_URL (a failed fetch is a failure, never a skip)"
 }
 
 # ---- e: malicious-package check ---------------------------------------------
@@ -810,13 +970,15 @@ replace_check() {
 tools_check() {
 	stage "pinned tools"
 	local list="$WORK/tool-files"
+	# Every file under hack/ and the Makefile, plus every Go file in the repo
+	# (only its //go:generate lines are read).
 	if [ -e .git ] && command -v git >/dev/null 2>&1; then
-		git ls-files --cached --others --exclude-standard -- hack Makefile >"$list"
+		git ls-files --cached --others --exclude-standard -- hack Makefile '*.go' >"$list"
 	else
-		{ find hack -type f 2>/dev/null || true; [ ! -f Makefile ] || echo Makefile; } >"$list"
+		{ find hack -type f 2>/dev/null || true; [ ! -f Makefile ] || echo Makefile; find . -name '*.go' -type f | sed 's#^\./##'; } >"$list"
 	fi
-	# Fixtures carry deliberately bad lines; Go sources are not shell.
-	grep -v -e '^hack/testdata/' -e '\.go$' "$list" >"$list.f" || true
+	# Fixtures carry deliberately bad lines.
+	grep -v -e '^hack/testdata/' "$list" | LC_ALL=C sort -u >"$list.f" || true
 	local rc=0
 	py tools "$ROOT" "$list.f" || rc=$?
 	[ "$rc" -eq 0 ] || fail "pinned tools" "pin every remote go install / go run to an exact version"
@@ -829,13 +991,7 @@ update() {
 	stage "lock (update)"
 	current_graph "lock (update)"
 	py update-plan "$LOCK" "$WORK/graph" "$WORK" "$PROXY_URL" || fail "lock (update)" "could not plan the update"
-	if [ -s "$WORK/fetch" ]; then
-		echo "    fetching $(wc -l <"$WORK/fetch" | tr -d ' ') publish times from $PROXY_URL"
-		# shellcheck disable=SC2016
-		xargs -P 8 -n 2 sh -c 'curl -fsS --max-time 30 --retry 2 -o "$2" "$1" || { echo "    could not fetch $1" >&2; exit 1; }' _ \
-			<"$WORK/fetch" ||
-			fail "lock (update)" "network failure reading publish times from $PROXY_URL (a failed fetch is a failure, never a skip)"
-	fi
+	fetch_infos "lock (update)"
 	py update-write "$LOCK" "$WORK" || fail "lock (update)" "could not write $LOCK"
 	cooldown_check "$WORK/delta"
 	malicious_check "$WORK/delta"
@@ -846,7 +1002,7 @@ check() {
 	env_guard
 	mod_verify
 	lock_check
-	cooldown_check "$LOCK"
+	cooldown_verify
 	malicious_check "$LOCK"
 	replace_check
 	tools_check
@@ -876,9 +1032,24 @@ self_test() {
 		mkdir -p "$dir/hack"
 		cp "$SELF" "$dir/hack/verify-deps.sh"
 		local f
-		for f in "$dir/hack/deps.lock" "$dir/stub/info"; do
+		for f in "$dir/hack/deps.lock" "$dir/stub/info" "$dir/base/hack/deps.lock"; do
 			[ ! -f "$f" ] || { sed -e "s/@RECENT@/$recent/g" -e "s/@OLD@/$old/g" "$f" >"$f.s" && mv "$f.s" "$f"; }
 		done
+		# A case with base/hack/deps.lock becomes a git repo whose origin/main
+		# holds that lock, so check mode has a merge base to compare against.
+		if [ -d "$dir/base" ]; then
+			mv "$dir/hack/deps.lock" "$WORK/worklock-$name"
+			mv "$dir/base/hack/deps.lock" "$dir/hack/deps.lock"
+			rm -rf "$dir/base"
+			if ! (cd "$dir" && git init -q && git add -A &&
+				git -c user.name=self-test -c user.email=self-test@example.invalid -c commit.gpgsign=false \
+					commit -q --no-verify -m base &&
+				git update-ref refs/remotes/origin/main HEAD) >/dev/null 2>&1; then
+				echo "  FAIL $name: could not build the base git repo"
+				return 0
+			fi
+			mv "$WORK/worklock-$name" "$dir/hack/deps.lock"
+		fi
 		if [ "$args" = "-" ]; then
 			out="$(cd "$dir" && env -u GONOSUMDB -u GONOSUMCHECK -u GOINSECURE -u GOPRIVATE -u GONOPROXY PATH="$td/bin:$PATH" bash hack/verify-deps.sh 2>&1)" || rc=$?
 		else
@@ -919,14 +1090,22 @@ self_test() {
 	bg env-goprivate - "env guard" "GOPRIVATE="
 	bg env-goinsecure - "env guard" "GOINSECURE="
 	bg env-goflags-mod - "env guard" "-mod=mod"
-	bg env-goproxy-direct - "env guard" "the first proxy must be"
+	bg env-goproxy-direct - "env guard" "GOPROXY='direct': it must be"
+	bg env-goproxy-mirror - "env guard" "GOPROXY='https://proxy.golang.org,https://mirror.example.invalid'"
+	bg env-gosumdb-custom - "env guard" "GOSUMDB='sum.golang.google.cn'"
+	bg env-goflags-modfile - "env guard" "GOFLAGS carries -modfile=alt.mod"
+	bg env-govcs-all - "env guard" "GOVCS='public:all'"
+	bg env-govcs-restrict - pass
 	bg modverify - "go mod verify"
 	bg lock-added - lock "added:   example.com/new v1.0.0"
 	bg lock-removed - lock "removed: example.com/old"
 	bg lock-changed - lock "changed: example.com/old v1.2.3"
-	bg lock-missing-time - lock "no publish time"
-	bg cooldown-fresh - cooldown "example.com/young v0.2.0 was published"
-	bg cooldown-unknown - cooldown "example.com/old v1.2.3: the module proxy reports no publish time"
+	bg lock-missing-time - lock "no commit time"
+	bg cooldown-fresh - cooldown "example.com/young v0.2.0 has a proxy-recorded commit time"
+	bg cooldown-unknown - cooldown "example.com/old v1.2.3: the module proxy records no commit time"
+	bg cooldown-forged - cooldown "example.com/young v0.2.0: lock time"
+	bg cooldown-unchanged - pass "0 lock lines added or changed since the base"
+	bg cooldown-network - cooldown "network failure"
 	bg osv-mal - "malicious-package check" "MAL-2026-0001"
 	bg osv-network - "malicious-package check" "network failure"
 	bg osv-garbled - "malicious-package check" "unreadable response"
@@ -940,8 +1119,14 @@ self_test() {
 	bg tools-main - "pinned tools" "'main'"
 	bg tools-var - "pinned tools" "'master'"
 	bg tools-makefile - "pinned tools" "Makefile:2: go install"
+	bg tools-gogenerate - "pinned tools" "pkg/bad.go:4: go run example.com/evil/gen@latest"
+	bg tools-dash-c - "pinned tools" "go install example.com/evil/cmd@latest"
+	bg tools-make-var - "pinned tools" "Makefile:2: go install example.com/evil/cmd@main"
+	bg tools-brace-var - "pinned tools" "go run example.com/evil/cmd: a remote module without"
+	bg tools-sh-c - "pinned tools" "hack/bad.sh:2: go install example.com/evil/cmd@latest"
+	bg tools-bash-c - "pinned tools" "'master'"
 	bg update-ok --update pass "2 new or changed" "github.com/Upper/New v1.2.0 # "
-	bg update-fresh --update cooldown "example.com/new v1.0.0 was published" "example.com/new v1.0.0 # "
+	bg update-fresh --update cooldown "example.com/new v1.0.0 has a proxy-recorded commit time" "example.com/new v1.0.0 # "
 	bg update-mal --update "malicious-package check" "MAL-2026-0002"
 	bg update-network --update "lock (update)" "network failure"
 	wait

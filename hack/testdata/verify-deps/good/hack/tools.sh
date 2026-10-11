@@ -17,3 +17,7 @@ echo "to install by hand: go install example.com/tool/cmd/hint@latest"
 go install example.com/fixture/cmd/self # a main-module package
 go install k3sm.io/apis/cmd/x
 install_tool() { go install "${1}@${2}"; }
+go -C sub install example.com/tool/cmd/h@v1.0.0
+"${GO:-go}" run example.com/tool/cmd/i@v1.0.0
+sh -c "go install example.com/tool/cmd/j@v1.0.0"
+bash -euc 'cd sub && go run ./local'

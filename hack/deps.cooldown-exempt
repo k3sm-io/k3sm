@@ -1,13 +1,15 @@
 # Cooldown exemptions for hack/verify-deps.sh.
 #
-# The cooldown stage refuses any module version published less than 14 days
-# ago: most malicious releases are found and pulled within days, so waiting
-# them out is a cheap defense. A version that must be adopted sooner (a
-# security fix, say) is listed here after someone has audited it, one per line:
+# The cooldown stage refuses any module version whose age is under 14 days:
+# most malicious releases are found and pulled within days, so waiting them out
+# is a cheap defense. The age is the commit time the module proxy records for
+# the version, not when it was first published, so a backdated commit is not
+# caught. A version that must be adopted sooner (a security fix, say) is listed
+# here after someone has audited it, one per line:
 #
 #   <module> <version> <reason>
 #
 # The reason is required. Delete a line once its version is older than the
 # cooldown; the script prints a note for every line that no longer matches.
-golang.org/x/net v0.60.0 adopted before the cooldown existed; audited clean 2026-10-11
-buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.6-20250425153114-8976f5be98c1.1 the module proxy reports no publish time for this generated-code version; in the graph before the cooldown existed
+golang.org/x/net v0.60.0 x/net v0.60.0 adopted 2026-10-09 for GO-2026-6611/6612/6617; supply-chain audit 2026-10-11 (two blind auditors + per-module third opinion) found it byte-identical to the upstream tag
+buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.6-20250425153114-8976f5be98c1.1 the module proxy records no commit time for this generated-code version; in the graph before the cooldown existed

@@ -1,0 +1,8 @@
+GOSUMDB=sum.golang.org
+GONOSUMDB=
+GOINSECURE=
+GOPRIVATE=
+GONOPROXY=
+GOFLAGS=-trimpath
+GOPROXY=https://proxy.golang.org,direct
+GOVCS=example.com:git,private:all
