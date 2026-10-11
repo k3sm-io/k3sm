@@ -1529,13 +1529,13 @@ phases:
         deliverables:
           - id: M19.3-d1
             done: false
-            desc: "B498 — pkg/runtimeclass as a class list (M19 owns the refactor M15 also planned) plus the `wasm` class (nodeSelector k3sm.io/wasm merged with the darwin selector, no tolerations, overhead.podFixed from the spike's baseline); NodeCapabilities.WasmBackend fed by ConditionWasmBackendAvailable and applyWasmLabel (presence-only, delete-on-loss); the imagePlatformPolicy case and its unservable-platform hint; translate-time refusals with a named Event reason: wasm under require-signed/require-notarized (R3), exec probes and exec lifecycle hooks (R9), a mixed native/wasm pod (R10)."
+            desc: "B499 — pkg/runtimeclass as a class list (M19 owns the refactor M15 also planned) plus the `wasm` class (nodeSelector k3sm.io/wasm merged with the darwin selector, no tolerations, overhead.podFixed from the spike's baseline); NodeCapabilities.WasmBackend fed by ConditionWasmBackendAvailable and applyWasmLabel (presence-only, delete-on-loss); the imagePlatformPolicy case and its unservable-platform hint; translate-time refusals with a named Event reason: wasm under require-signed/require-notarized (R3), exec probes and exec lifecycle hooks (R9), a mixed native/wasm pod (R10)."
           - id: M19.3-d2
             done: false
-            desc: "B499 — k3sm-wasmhost in RequiredSiblings, hack/release/stage.sh build + ad-hoc sign_one (no entitlements, no hardened runtime) + verify_tree assertions + the libwasmtime.a provenance digest check before signing, the .goreleaser.yaml archive member, the formula via hack/sync-formula.sh, the sibling-set consistency test, the k3sm status row (helper present/absent and why the label is unset)."
+            desc: "B500 — k3sm-wasmhost in RequiredSiblings, hack/release/stage.sh build + ad-hoc sign_one (no entitlements, no hardened runtime) + verify_tree assertions + the libwasmtime.a provenance digest check before signing, the .goreleaser.yaml archive member, the formula via hack/sync-formula.sh, the sibling-set consistency test, the k3sm status row (helper present/absent and why the label is unset)."
           - id: M19.3-d3
             done: false
-            desc: "B500 — docs/user/wasm-runtimeclass.md (+ site manifest entry; validation-not-provenance, the ad-hoc-only ceiling, the minimum viable memory limit, the annotation-form gap), what-runs.md and limitations.md sentences, examples/hello-wasm.yaml (runtimeClassName: wasm + the darwin selector only), the docs/privilege-model.md paragraph (R11), and the REAL hack/acceptance/m19.sh composite and hack/lab/m19.sh ladder replacing the skeletons with skeleton flipped to false in the same change."
+            desc: "B501 — docs/user/wasm-runtimeclass.md (+ site manifest entry; validation-not-provenance, the ad-hoc-only ceiling, the minimum viable memory limit, the annotation-form gap), what-runs.md and limitations.md sentences, examples/hello-wasm.yaml (runtimeClassName: wasm + the darwin selector only), the docs/privilege-model.md paragraph (R11), and the REAL hack/acceptance/m19.sh composite and hack/lab/m19.sh ladder replacing the skeletons with skeleton flipped to false in the same change."
         acceptance:
           - id: M19.3-a1
             met: false
