@@ -61,6 +61,24 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
 - Keep the graph minimal. `go mod tidy` before every commit. Pin versions; no `@latest` in committed go.mod.
 - Document every `replace`/`exclude` with a one-line why (e.g. k3sm's `genproto` replace resolves the
   monolith-vs-split ambiguous import).
+- **Write it before you import it.** If you need a narrow slice of a library (roughly 300 lines or
+  less, with tests), write it in the repo after reading reference implementations. A substantially
+  ported function names its upstream file and license in a comment, and the license must be
+  Apache-2.0 compatible. Cryptography, TLS, authentication, password hashing, and parsers or
+  decompressors of untrusted input are the exception: they stay on maintained libraries however
+  little of them you use.
+- **Every dependency change is visible and checked.** `hack/deps.lock` records the full module
+  graph, and `hack/verify-deps.sh` (run by `hack/ci.sh`) fails on any drift until the lock is
+  regenerated with `--update`. A PR that adds or bumps a module explains why the module is needed
+  and why an in-repo implementation will not do.
+- **Fourteen-day cooldown.** A module version published less than 14 days before adoption fails
+  `verify-deps` unless `hack/deps.cooldown-exempt` names it with a reason (an urgent security fix).
+- **Verification stays on.** Never set `GOSUMDB`, `GOPROXY`, `GONOSUMDB`, `GONOSUMCHECK`,
+  `GOINSECURE`, `GOPRIVATE` or `GOFLAGS` in a way that weakens checksum verification.
+  `verify-deps` also fails on any module version with a malicious-package (`MAL-*`) advisory in
+  OSV, and `govulncheck` runs in every repo's `hack/ci.sh`.
+- Pin every `go install`/`go run` of a remote module to an exact version, and verify every
+  downloaded artifact against a pinned digest before use.
 
 ## Darwin / cgo
 - Prefer `golang.org/x/sys/unix` over raw `syscall`. Use **cgo only when necessary** (darwin SPI

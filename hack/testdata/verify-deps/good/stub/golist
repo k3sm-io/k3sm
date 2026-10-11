@@ -1,0 +1,6 @@
+example.com/forked v1.0.0 => example.com/forked-fix v1.0.1
+example.com/fresh v1.1.0
+example.com/old v1.2.3
+github.com/Upper/Case v0.0.0-20240101000000-abcdefabcdef
+k3sm.io/apis v0.0.0-00010101000000-000000000000 => ../apis
+k3sm.io/runtimed v0.0.0-00010101000000-000000000000 => ../runtimed

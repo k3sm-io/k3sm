@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."   # repo root
 
 CGO=1   # k3sm is CGO_ENABLED=1 — it imports runtimed (cgo syscall shims). kine is a child process, not a dependency.
 STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
+GOVULNCHECK_VERSION=v1.8.0   # the govulncheck the gate requires; keep equal across the k3sm repos and hack/etcd-wrapper.sh
 
 echo "==> [k3sm] gofmt"
 fmt=$(gofmt -l .) || true
@@ -28,10 +29,34 @@ if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
 	# The etcd wrapper module (pkg/executor/etcdchild) is not a module of this repo, so
 	# nothing else here verifies its lockfile or scans its dependency graph. It needs
 	# the module proxy or a warm cache, like `go mod tidy` below; there is no offline
-	# skip, for the same reason that stage has none. A missing govulncheck is a named
-	# SKIP inside the script; a finding is RED.
+	# skip, for the same reason that stage has none. A missing or mismatched
+	# govulncheck is RED inside the script, and so is a finding.
 	echo "==> [k3sm] etcd wrapper"
 	hack/etcd-wrapper.sh verify
+
+	# govulncheck, pinned to an exact version like staticcheck: a different release
+	# can report different findings. Each candidate (PATH first, then
+	# $(go env GOPATH)/bin) is probed and the first reporting exactly the pin is
+	# used. A missing or mismatched tool is RED, never a skip, and so is a finding
+	# or a failure to reach the vulnerability database.
+	gv=""; gv_seen=""
+	for c in "$(command -v govulncheck 2>/dev/null || true)" "$(go env GOPATH)/bin/govulncheck"; do
+		[ -n "$c" ] && [ -x "$c" ] || continue
+		gv_ver="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | head -1)" || gv_ver=""
+		gv_seen="${gv_seen}    $c reports ${gv_ver:-no version}"$'\n'
+		if [ "$gv_ver" = "$GOVULNCHECK_VERSION" ]; then gv="$c"; break; fi
+	done
+	if [ -z "$gv" ]; then
+		if [ -z "$gv_seen" ]; then
+			echo "==> [k3sm] govulncheck: not installed; the gate needs ${GOVULNCHECK_VERSION} (go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION})" >&2
+		else
+			echo "==> [k3sm] govulncheck: wrong version; the gate needs ${GOVULNCHECK_VERSION} (go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}). Found:" >&2
+			printf '%s' "$gv_seen" >&2
+		fi
+		exit 1
+	fi
+	echo "==> [k3sm] govulncheck ${GOVULNCHECK_VERSION} ./..."
+	GOWORK=off CGO_ENABLED=$CGO "$gv" ./...
 fi
 
 # Enumerate the Go packages BEFORE deciding to skip anything. Exit 0 with empty
@@ -134,5 +159,20 @@ if [ -n "$(git status --porcelain -- go.mod go.sum 2>/dev/null)" ]; then
 fi
 # Keep the genproto replace (resolves the monolith-vs-split ambiguous import).
 grep -q 'replace google.golang.org/genproto' go.mod || { echo "missing genproto replace in go.mod"; exit 1; }
+
+# The dependency supply-chain check (hack/verify-deps.sh): the go environment
+# cannot weaken verification, go mod verify, the hack/deps.lock module graph,
+# the 14-day cooldown on new versions, the OSV malicious-package query, go.mod
+# replace discipline, and exact pins on every remote go install / go run. It
+# needs proxy.golang.org and api.osv.dev; there is no offline skip, because a
+# network failure there is RED by design. Like the examples gate, it runs only in
+# the real module: hack/acceptance/ci_guard_test.go runs this script in a
+# throwaway module whose graph the lock could never describe.
+if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
+	echo "==> [k3sm] verify-deps (self-test)"
+	hack/verify-deps.sh --self-test
+	echo "==> [k3sm] verify-deps"
+	hack/verify-deps.sh
+fi
 
 echo "OK: k3sm ci green"
