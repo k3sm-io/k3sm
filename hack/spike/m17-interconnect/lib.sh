@@ -91,23 +91,52 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin:$PAT
 in_reserved() { case "$1" in 169.254.0.*|169.254.255.*) return 0 ;; esac; return 1; }
 PREEOF
 
+# IC_NETSTAT_AWK — the one reader of `netstat -rn -f inet` used by the payloads and
+# the driver. It prints "<addr>/<mask> <flags> <netif>" for every entry inside the
+# reserved halves with a mask of /24 or longer (a host entry is /32). netstat
+# abbreviates destinations ("169.254/24" is 169.254.0.0/24, a bare "169.254" is the
+# /16), and macOS link-local routes are interface-scoped, so `route -n get` cannot
+# be trusted to see them; this reader is.
+read -r -d '' IC_NETSTAT_AWK <<'AWKEOF' || true
+{ d = $1; m = -1; a = d
+  if (index(d, "/")) { split(d, p, "/"); a = p[1]; m = p[2] + 0 }
+  n = split(a, o, ".")
+  if (n < 1 || o[1] !~ /^[0-9]+$/) next
+  if (m < 0) m = (n == 4) ? 32 : 8 * n
+  for (i = n + 1; i <= 4; i++) o[i] = 0
+  if (o[1] != 169 || o[2] != 254 || (o[3] != 0 && o[3] != 255) || m < 24) next
+  print o[1] "." o[2] "." o[3] "." o[4] "/" m, $3, $4 }
+AWKEOF
+
 read -r -d '' IC_RESTORE_LIB <<'RESTEOF' || true
 LEDGER="$IC_STATE_DIR/restore.ledger"
-mkdir -p "$IC_STATE_DIR" && chmod 700 "$IC_STATE_DIR" && touch "$LEDGER"
+# CREATED is every alias and route this spike ever added on this Mac, never
+# truncated: the post-restore residue check deletes an entry only when it is listed.
+CREATED="$IC_STATE_DIR/created"
+mkdir -p "$IC_STATE_DIR" && chmod 700 "$IC_STATE_DIR" && touch "$LEDGER" "$CREATED"
 refuse() { echo "RESTORE-LIB REFUSED: $*" >&2; return 1; }
 is_half() { [ "$1" = 169.254.0.0/24 ] || [ "$1" = 169.254.255.0/24 ]; }
 has_alias() { ifconfig bridge0 | awk '$1=="inet"{print $2}' | grep -qxF "$1"; }
-has_half_route() {   # a /24 route for exactly this half exists
-  route -n get -net "$1" 2>/dev/null | awk '/destination:/{d=$2} /mask:/{m=$2} END{exit !(d=="'"${1%/*}"'" && m=="255.255.255.0")}'
+reserved_routes() { netstat -rn -f inet | awk "$IC_NETSTAT_AWK"; }
+has_half_route() {   # a route for exactly this half exists, on any interface
+  reserved_routes | awk -v d="$1" '$1==d' | grep -q .
 }
+created() { grep -qxF "$1" "$CREATED" || echo "$1" >>"$CREATED"; }
 ic_alias() {         # ic_alias <reserved-half ip> <netmask>
   in_reserved "$1" || { refuse "$1 is outside the reserved halves"; return 1; }
   has_alias "$1" && { refuse "$1 is already on bridge0 and not in this spike's ledger"; return 1; }
-  ifconfig bridge0 inet "$1" netmask "$2" alias && echo "alias $1" >>"$LEDGER"
+  ifconfig bridge0 inet "$1" netmask "$2" alias && echo "alias $1" >>"$LEDGER" && created "alias $1"
 }
-ic_route() {         # ic_route <reserved half>
+ic_route() {         # ic_route <reserved half> — the add's own output is printed as ROUTE-ADD
   is_half "$1" || { refuse "$1 is not one of the two reserved halves"; return 1; }
-  route -n add -net "$1" -interface bridge0 >/dev/null && echo "route $1" >>"$LEDGER"
+  local out rc=0
+  out="$(route -n add -net "$1" -interface bridge0 2>&1)" || rc=$?
+  echo "ROUTE-ADD $1 exit=$rc: $out"
+  # Ledgered whatever the exit: route(8) has been seen to print an error and exit 0,
+  # and deleting an absent route for exactly this half on bridge0 is harmless.
+  echo "route $1" >>"$LEDGER"
+  created "route $1"
+  return "$rc"
 }
 ic_restore() {
   [ -s "$LEDGER" ] || return 0
@@ -121,6 +150,47 @@ ic_restore() {
   done < <(tail -r "$LEDGER")
   : >"$LEDGER"
   echo "restore: $n ledger entries undone (reserved-half aliases and routes on bridge0 only)"
+}
+# was_created <addr/mask> — a /32 for an alias the spike added, a route it added, or
+# the connected /24 of a half one of its aliases lived in.
+was_created() {
+  local a="${1%/*}" m="${1#*/}" x
+  [ "$m" = 32 ] && { grep -qxF "alias $a" "$CREATED"; return; }
+  grep -qxF "route $1" "$CREATED" && return 0
+  [ "$m" = 24 ] || return 1
+  for x in $(awk '$1=="alias"{print $2}' "$CREATED"); do
+    [ "${x%.*}.0/24" = "$1" ] && return 0
+  done
+  return 1
+}
+entry_left() { reserved_routes | awk -v d="$1" '$1==d && $2 !~ /L/' | grep -q .; }
+# ic_residue — after a restore, every reserved-half route entry that is not an ARP
+# host entry (flags with L) is residue. On bridge0 and listed in CREATED it is
+# deleted (host or net, reserved halves only); anything else is left alone. Prints
+# RESIDUE-DELETED / RESIDUE-LEFT lines, or RESIDUE-NONE.
+ic_residue() {
+  local dest flags netif try out found=0
+  while read -r dest flags netif; do
+    case "$flags" in *L*) continue ;; esac
+    found=1
+    if [ "$netif" != bridge0 ] || ! was_created "$dest"; then
+      echo "RESIDUE-LEFT $dest $flags $netif (not created by this spike; left alone)"
+      continue
+    fi
+    out=""
+    for try in "-host ${dest%/*} -ifscope bridge0" "-host ${dest%/*}" "-net $dest -ifscope bridge0" "-net $dest -interface bridge0" "-net $dest"; do
+      # shellcheck disable=SC2086
+      out="$out [route -n delete $try: $(route -n delete $try 2>&1)]"
+      entry_left "$dest" || break
+    done
+    if entry_left "$dest"; then
+      echo "RESIDUE-LEFT $dest $flags $netif (created by this spike; every delete failed:$out)"
+    else
+      echo "RESIDUE-DELETED $dest $flags $netif:$out"
+    fi
+  done < <(reserved_routes)
+  [ "$found" = 0 ] && echo "RESIDUE-NONE the reserved halves hold no route entry (ARP host entries aside)"
+  return 0
 }
 trap 'ic_restore; exit 130' HUP INT TERM
 if [ "${IC_HOLD:-0}" != 1 ]; then trap 'ic_restore' EXIT; fi
@@ -138,6 +208,7 @@ payload_file() {
 		echo "# interconnect spike payload '$name' for the $side Mac (hack/spike/m17-interconnect/lib.sh)"
 		echo "set -u"
 		printf 'export SIDE=%q IC_STATE_DIR=%q\n' "$side" "$IC_STATE_DIR"
+		printf 'IC_NETSTAT_AWK=%q\n' "$IC_NETSTAT_AWK"
 		for kv in "$@"; do printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"; done
 		printf '%s\n' "$IC_PREAMBLE"
 		[ "$priv" = 1 ] && printf '%s\n' "$IC_RESTORE_LIB"
@@ -181,11 +252,26 @@ payload() {
 	return "$rc"
 }
 
-# restore_side <side> — replay that Mac's ledger (privileged, idempotent).
+# restore_side <side> — replay that Mac's ledger (privileged, idempotent), then the
+# residue check. RESIDUE lines land in residue-<side>.log; a RESIDUE-LEFT appends to
+# RESIDUE_LEFT, and the caller turns that into "restore left residue" (exit 1).
+RESIDUE_LEFT=""
 restore_side() {
 	payload "$1" restore 1 <<'EOF' || true
 ic_restore
+ic_residue
 EOF
+	local line
+	while IFS= read -r line; do
+		echo "$line" >>"$EVIDENCE_DIR/residue-$1.log"
+		case "$line" in
+		"RESIDUE-LEFT "*)
+			RESIDUE_LEFT="$RESIDUE_LEFT $1:$(echo "$line" | awk '{print $2}')"
+			finding "- FAIL restore left residue on the $1 Mac: ${line#RESIDUE-LEFT }"
+			;;
+		"RESIDUE-DELETED "*) finding "- RECORDED restore residue deleted on the $1 Mac: ${line#RESIDUE-DELETED }" ;;
+		esac
+	done < <(grep '^RESIDUE-' "$PAYLOAD_LOG")
 }
 
 # ---------------------------------------------------------------------------------

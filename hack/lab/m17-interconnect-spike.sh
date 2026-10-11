@@ -11,6 +11,8 @@
 #   hack/lab/m17-interconnect-spike.sh --plan     # the rung plan; no host, nothing contacted
 #   K3SM_LAB=1 PEER_SSH=<ssh target of the other Mac> \
 #     EVIDENCE_DIR=<absolute dir outside any git tree> hack/lab/m17-interconnect-spike.sh
+#   ... hack/lab/m17-interconnect-spike.sh --form B   # only that form; its FAIL is final
+#                                                     # (also valid with --plan)
 #
 # The driver runs on one of the two Macs (the "local" side) and reaches the other
 # (the "peer" side) over ssh. It needs passwordless sudo on the peer, and a sudo
@@ -57,17 +59,42 @@ question (Q1)
   169.254.255.0/24, carry IPv4 across the Thunderbolt cable with the cable ports left
   in the bridge, ARP-resolving to the peer's MAC and never the Mac's own?
 
-address forms, in the pre-decided order (the first that passes is measured)
-  form A  own-half alias: the node address as a /24-netmask alias in its own half
-          (local 169.254.0.1/24, peer 169.254.255.1/24), one -net route to bridge0 for
-          the other half, pod addresses as /32 aliases inside the connected subnet
-  form B  single half: both node addresses in 169.254.0.0/24 with a /24 netmask
-          (local 169.254.0.1, peer 169.254.0.9), no extra route; caps a cluster at 31
-          interconnect nodes (a stated ceiling)
-  form C  /32 aliases (local 169.254.0.1, peer 169.254.255.1) plus both /24 interface
-          routes to bridge0 on each side
-  none crosses -> FAIL: the downstream build halts and the design returns for
-          re-planning (no fallback to enX addressing, which the earlier rig run disproved)
+PLAN
+	if [ -n "$ONLY_FORM" ]; then
+		echo "address form (--form $ONLY_FORM: only this form runs; a FAIL on it is final, no fallthrough)"
+	else
+		echo "address forms, in the pre-decided order (the first that passes is measured)"
+	fi
+	local f
+	for f in $FORMS; do
+		case "$f" in
+		A)
+			echo "  form A  own-half alias: the node address as a /24-netmask alias in its own half"
+			echo "          (local 169.254.0.1/24, peer 169.254.255.1/24), one -net route to bridge0 for"
+			echo "          the other half, pod addresses as /32 aliases inside the connected subnet"
+			;;
+		B)
+			echo "  form B  single half: both node addresses in 169.254.0.0/24 with a /24 netmask"
+			echo "          (local 169.254.0.1, peer 169.254.0.9), no extra route; caps a cluster at 31"
+			echo "          interconnect nodes (a stated ceiling)"
+			;;
+		C)
+			echo "  form C  /32 aliases (local 169.254.0.1, peer 169.254.255.1) plus both /24 interface"
+			echo "          routes to bridge0 on each side"
+			;;
+		esac
+	done
+	if [ -n "$ONLY_FORM" ]; then
+		echo "  it fails -> FAIL, final for this run"
+	else
+		echo "  none crosses -> FAIL: the downstream build halts and the design returns for"
+		echo "          re-planning (no fallback to enX addressing, which the earlier rig run disproved)"
+	fi
+	cat <<'PLAN'
+
+setup evidence  each form's route-add output (stderr included) is saved, and a t0
+                snapshot (ifconfig bridge0, netstat -rn -f inet 169.254 lines, route -n
+                get per half) is taken on both Macs right after setup
 
 checks per form (PASS/FAIL)
   carrier      bridge0 has a Thunderbolt member with carrier, on both Macs
@@ -78,11 +105,16 @@ checks per form (PASS/FAIL)
                member, read over ssh), never the local MAC, never a permanent entry
   pod          a second /32 alias per side as a pod address: ping and tcp across,
                the listener's local address (lsof) is the pod address, ARP as above
+  unscoped     with no -B binding, `route -n get <peer node and pod address>` names
+               bridge0 (otherwise unbound traffic would leave by the LAN interface)
 
 on the passing form
-  configd      after a read-only `scutil --nwi` and a 10 s hold, the aliases and the
-               routes the form added are still present (PASS/FAIL); no network setting
-               is toggled, so a real network change stays RECORDED
+  configd      the aliases and routes the form added, read from ifconfig and netstat
+               (the link routes are interface-scoped, so route -n get cannot see them),
+               at t0 and again after a read-only `scutil --nwi` and a 10 s hold:
+               missing at t0 = FAIL "never visible (setup or check defect)"; present at
+               t0 and missing later = FAIL "removed". No network setting is toggled, so
+               a real network change stays RECORDED
   figures      iperf3 single and -P 4, both directions (-R), RUNS runs each, median and
                p99, over the interconnect, beside the mesh path (the peer's mesh
                address) and the self-assigned bridge0 address; ping RTT per path.
@@ -104,30 +136,52 @@ RECORDED rungs (not exercised here, and the run says so)
 host changes  reserved-half aliases on bridge0 and -net routes for exactly the two
               halves, ledgered and removed by a restore trap; bridge0 membership, the
               LAN interface and the default route are never touched; no pf; no reboot
+residue       after every restore, any reserved-half route entry that is not an ARP
+              host entry is deleted when this spike created it (on bridge0, reserved
+              halves only) and reported; anything still there = FAIL "restore left
+              residue" (exit 1)
 exit          0 PASS · 1 FAIL · 2 RECORDED (never a green)
 rig           K3SM_LAB=1, PEER_SSH, EVIDENCE_DIR (required; no defaults)
 findings      EVIDENCE_DIR/findings.md (with figures.jsonl and every payload transcript)
 PLAN
 }
 
-case "${1:-}" in
---plan | --dry-run)
-	print_plan
-	exit 0
-	;;
--h | --help)
-	echo "usage: $0 [--plan]   (K3SM_LAB=1 PEER_SSH=<ssh target> EVIDENCE_DIR=<dir> for a rig run)"
-	exit 0
-	;;
-"") ;;
+PLAN_ONLY=0
+ONLY_FORM=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	--plan | --dry-run) PLAN_ONLY=1 ;;
+	--form)
+		if [ "$#" -lt 2 ]; then
+			echo "$0: --form needs a value: A, B or C" >&2
+			exit 1
+		fi
+		ONLY_FORM="$2"
+		shift
+		;;
+	--form=*) ONLY_FORM="${1#--form=}" ;;
+	-h | --help)
+		echo "usage: $0 [--plan] [--form A|B|C]   (K3SM_LAB=1 PEER_SSH=<ssh target> EVIDENCE_DIR=<dir> for a rig run)"
+		exit 0
+		;;
+	*)
+		echo "$0: unknown argument: $1 (try --plan)" >&2
+		exit 1
+		;;
+	esac
+	shift
+done
+case "$ONLY_FORM" in
+"" | A | B | C) ;;
 *)
-	echo "$0: unknown argument: $1 (try --plan)" >&2
+	echo "$0: --form must be A, B or C (got '$ONLY_FORM')" >&2
 	exit 1
 	;;
 esac
-if [ "$#" -gt 1 ]; then
-	echo "$0: too many arguments (try --plan)" >&2
-	exit 1
+FORMS="${ONLY_FORM:-A B C}"
+if [ "$PLAN_ONLY" = 1 ]; then
+	print_plan
+	exit 0
 fi
 
 if [ "${K3SM_LAB:-}" != "1" ]; then
@@ -179,7 +233,7 @@ IC_FINDINGS="$EVIDENCE_DIR/findings.md"
 	echo "Two Macs joined by one Thunderbolt cable, cable ports left in bridge0. The Macs are named"
 	echo "by role (local runs the driver, peer is reached over ssh), never by hostname."
 	echo
-	echo "Runs per figure: $RUNS; seconds per iperf3 run: $SECS."
+	echo "Runs per figure: $RUNS; seconds per iperf3 run: $SECS; forms: ${ONLY_FORM:-A B C (pre-decided order)}."
 	echo
 } >"$IC_FINDINGS"
 
@@ -208,6 +262,10 @@ on_exit() {
 		restore_side peer
 	fi
 	[ "$FINAL_MSG" = "interrupted before a verdict: FAIL" ] && FINAL_RC=$((rc == 0 ? 1 : rc))
+	if [ -n "$RESIDUE_LEFT" ]; then
+		FINAL_RC=1
+		FINAL_MSG="FAIL — restore left residue ($RESIDUE_LEFT; see residue-*.log). Before that: $FINAL_MSG"
+	fi
 	{
 		echo
 		echo "## Verdict"
@@ -241,6 +299,7 @@ ARMED=1
 note "replaying any ledger an interrupted earlier run left behind"
 restore_side local
 restore_side peer
+[ -z "$RESIDUE_LEFT" ] || finish 1 "FAIL — restore left residue before the run began ($RESIDUE_LEFT); entries this spike did not record creating are never deleted by it"
 
 # The side-info payload: bridge0, its members, which are Thunderbolt and have
 # carrier, the MACs, MTU, the default-route interface, the self-assigned and mesh
@@ -459,6 +518,47 @@ check_arp() {
 	fi
 }
 
+# snapshot <side> <tag> — the raw state the presence predicate reads, kept as
+# evidence: ifconfig bridge0 inet lines, the netstat 169.254 lines and `route -n get`
+# for each half (shown for comparison; the scoped link routes make it misleading).
+snapshot() {
+	local f="$EVIDENCE_DIR/state-$FORM-$1-$2.txt"
+	on "$1" "echo '== ifconfig'; ifconfig bridge0 | awk '\$1==\"inet\"'; echo '== netstat'; netstat -rn -f inet | grep '^169\.254'; for h in $IC_HALF_LOW $IC_HALF_HIGH; do echo \"== route-get \$h\"; route -n get -net \$h 2>&1; done" >"$f" 2>&1 || true
+}
+
+# presence <side> <tag> <aliases> <routes> — the presence predicate over a snapshot:
+# each alias on bridge0, each route a netstat entry for exactly that half on bridge0
+# that is not an ARP entry. Sets PRES_MISS (empty = all present) and writes
+# presence-<form>-<side>-<tag>.txt.
+PRES_MISS=""
+presence() {
+	local side="$1" tag="$2" f="$EVIDENCE_DIR/state-$FORM-$1-$2.txt" a h
+	PRES_MISS=""
+	for a in $3; do
+		awk '/^== /{sec=$2; next} sec=="ifconfig" && $1=="inet"{print $2}' "$f" | grep -qxF "$a" || PRES_MISS="$PRES_MISS alias:$a"
+	done
+	for h in $4; do
+		awk '/^== /{sec=$2; next} sec=="netstat"' "$f" | awk "$IC_NETSTAT_AWK" |
+			awk -v d="$h" '$1==d && $3=="bridge0" && $2 !~ /L/' | grep -q . || PRES_MISS="$PRES_MISS route:$h"
+	done
+	echo "form $FORM $side $tag: aliases [$3] routes [$4] missing [${PRES_MISS# }]" >"$EVIDENCE_DIR/presence-$FORM-$side-$tag.txt"
+	echo "      presence $side $tag: missing [${PRES_MISS# }]"
+}
+
+# check_unscoped <side> <dst> <label> — with no source binding, the route the kernel
+# picks for dst must leave by bridge0.
+check_unscoped() {
+	local out ifc
+	out="$(on "$1" "route -n get $2" 2>&1)"
+	printf '%s\n' "--- route -n get $2 ($3) on $1" "$out" >>"$EVIDENCE_DIR/form-$FORM.log"
+	ifc="$(printf '%s\n' "$out" | awk '/interface:/{print $2; exit}')"
+	if [ "$ifc" = bridge0 ]; then
+		ok "form $FORM unscoped $3 on $1: route -n get $2 names bridge0"
+	else
+		bad "form $FORM unscoped $3 on $1: route -n get $2 names '${ifc:-no interface}', not bridge0 (an unbound dial would not use the cable)"
+	fi
+}
+
 # run_form <form> — 0 passed, 1 did not pass, 2 refused (foreign state).
 run_form() {
 	FORM="$1"
@@ -472,6 +572,10 @@ run_form() {
 	for side in local peer; do
 		rc=0
 		configure "$side" "$FORM" || rc=$?
+		grep '^ROUTE-ADD' "$PAYLOAD_LOG" >"$EVIDENCE_DIR/route-add-$FORM-$side.log" 2>/dev/null || true
+		while IFS= read -r line; do
+			record "form $FORM route add on the $side Mac: ${line#ROUTE-ADD }"
+		done <"$EVIDENCE_DIR/route-add-$FORM-$side.log"
 		case "$rc" in
 		0) ;;
 		3)
@@ -485,6 +589,12 @@ run_form() {
 		esac
 	done
 	sleep 2
+	snapshot local t0
+	snapshot peer t0
+	presence local t0 "$L_NODE $L_POD" "$L_ROUTES"
+	P0_local="$PRES_MISS"
+	presence peer t0 "$P_NODE $P_POD" "$P_ROUTES"
+	P0_peer="$PRES_MISS"
 	check_carrier local
 	check_carrier peer
 	check_ping local "$L_NODE" "$P_NODE" node
@@ -499,11 +609,15 @@ run_form() {
 	check_tcp local "$L_POD" "$P_POD" 5374 pod lsof
 	check_arp local "$P_POD" pod
 	check_arp peer "$L_POD" pod
+	check_unscoped local "$P_NODE" node
+	check_unscoped peer "$L_NODE" node
+	check_unscoped local "$P_POD" pod
+	check_unscoped peer "$L_POD" pod
 	[ "$FORM_FAILS" = 0 ] && [ "$FORM_PASSES" -gt 0 ]
 }
 
 WINNER=""
-for form in A B C; do
+for form in $FORMS; do
 	rc=0
 	run_form "$form" || rc=$?
 	if [ "$rc" = 0 ]; then
@@ -513,9 +627,13 @@ for form in A B C; do
 	if [ "$rc" = 2 ]; then
 		finish 1 "FAIL — a reserved-half alias or route the spike did not add appeared on bridge0; nothing of it was touched"
 	fi
+	if [ -n "$ONLY_FORM" ]; then
+		finish 1 "FAIL — form $form did not pass ($FORM_FAILS failed checks, above); --form $form runs no other form"
+	fi
 	record "form $form did not cross the cable ($FORM_FAILS failed checks, above); next form in the pre-decided order"
 	restore_side local
 	restore_side peer
+	[ -z "$RESIDUE_LEFT" ] || finish 1 "FAIL — restore left residue after form $form ($RESIDUE_LEFT)"
 done
 if [ -z "$WINNER" ]; then
 	finish 1 "FAIL — no address form crossed the cable (A, B and C all failed). The downstream build halts and the design returns for re-planning; there is no fallback to enX addressing."
@@ -534,22 +652,26 @@ for side in local peer; do
 	on "$side" "scutil --nwi" >"$EVIDENCE_DIR/scutil-nwi-$side.txt" 2>&1 || true
 done
 sleep 10
-present_check() { # present_check <side> <aliases> <routes>
-	local side="$1" a h miss=""
-	for a in $2; do
-		on "$side" "ifconfig bridge0" 2>/dev/null | awk '$1=="inet"{print $2}' | grep -qxF "$a" || miss="$miss alias:$a"
+snapshot local t10
+snapshot peer t10
+# configd_verdict <side> <t0-missing> <aliases> <routes> — compare t0 with t+10 s.
+configd_verdict() {
+	local side="$1" m0="$2" item never="" removed=""
+	presence "$side" t10 "$3" "$4"
+	for item in $m0; do never="$never $item"; done
+	for item in $PRES_MISS; do
+		[[ " $m0 " == *" $item "* ]] || removed="$removed $item"
 	done
-	for h in $3; do
-		on "$side" "route -n get -net $h" 2>/dev/null | awk -v d="${h%/*}" '/destination:/{x=$2} /mask:/{m=$2} /interface:/{i=$2} END{exit !(x==d && m=="255.255.255.0" && i=="bridge0")}' || miss="$miss route:$h"
-	done
-	if [ -z "$miss" ]; then
-		run_pass "configd $side: after scutil --nwi and a 10 s hold, the aliases [$2] and routes [${3}] are still on bridge0"
-	else
-		run_fail "configd $side: missing after scutil --nwi and a 10 s hold:$miss"
+	if [ -z "$never" ] && [ -z "$removed" ]; then
+		run_pass "configd $side: aliases [$3] and routes [$4] present at t0 and still present after scutil --nwi and a 10 s hold"
+		return
 	fi
+	[ -n "$never" ] && run_fail "configd $side: never visible at t0 (setup or check defect):$never"
+	[ -n "$removed" ] && run_fail "configd $side: present at t0, removed by t+10 s:$removed"
+	return 0
 }
-present_check local "$L_NODE $L_POD" "$L_ROUTES"
-present_check peer "$P_NODE $P_POD" "$P_ROUTES"
+configd_verdict local "$P0_local" "$L_NODE $L_POD" "$L_ROUTES"
+configd_verdict peer "$P0_peer" "$P_NODE $P_POD" "$P_ROUTES"
 record "configd across a real network change: not exercised (it needs a human to toggle a network setting; this run only reads configd state)"
 
 # ---------------------------------------------------------------------------------

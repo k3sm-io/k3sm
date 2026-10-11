@@ -134,6 +134,11 @@ func TestInterconnectSpikeRefusals(t *testing.T) {
 		{"K3SM_LAB=1, evidence in a git tree", nil, []string{"K3SM_LAB=1", "PEER_SSH=peer.invalid", "EVIDENCE_DIR=" + inRepo}, 1, "git work tree"},
 		{"K3SM_LAB=1, too few runs", nil, []string{"K3SM_LAB=1", "PEER_SSH=peer.invalid", "EVIDENCE_DIR=" + evidence, "K3SM_INTERCONNECT_RUNS=3"}, 1, ">= 5 runs"},
 		{"unknown argument", []string{"--not-a-flag"}, nil, 1, "unknown argument"},
+		{"--form with a bad value", []string{"--form", "D"}, nil, 1, "--form must be A, B or C"},
+		{"--form= with a bad value", []string{"--form=a"}, nil, 1, "--form must be A, B or C"},
+		{"--form with no value", []string{"--form"}, nil, 1, "--form needs a value"},
+		{"--plan with a bad --form", []string{"--plan", "--form", "X"}, nil, 1, "--form must be A, B or C"},
+		{"--form B, no K3SM_LAB", []string{"--form", "B"}, nil, 0, "PENDING"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -157,5 +162,33 @@ func TestInterconnectSpikeRefusals(t *testing.T) {
 	}
 	if _, err := os.Stat(evidence); err == nil {
 		t.Errorf("a refused run created the evidence directory %s", evidence)
+	}
+}
+
+// TestInterconnectSpikePlanSingleForm pins --form: with --plan it lists only the
+// chosen form, says a FAIL on it is final, and contacts nothing; the flag is parsed
+// in either order and in its --form=X spelling.
+func TestInterconnectSpikePlanSingleForm(t *testing.T) {
+	gate := interconnectSpikeGate(t)
+	for _, args := range [][]string{{"--plan", "--form", "B"}, {"--form", "B", "--plan"}, {"--plan", "--form=B"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			env, marker := interconnectSpikeEnv(t)
+			code, out := runM17Spike(t, env, gate, args...)
+			if code != 0 {
+				t.Fatalf("exit %d, want 0\n%s", code, out)
+			}
+			if !strings.Contains(out, "form B") {
+				t.Errorf("does not list form B\n%s", out)
+			}
+			for _, other := range []string{"form A", "form C"} {
+				if strings.Contains(out, other) {
+					t.Errorf("lists %q although --form B was given\n%s", other, out)
+				}
+			}
+			if !strings.Contains(out, "no fallthrough") {
+				t.Errorf("does not say a FAIL on the chosen form is final (no fallthrough)\n%s", out)
+			}
+			assertNoHostContacted(t, marker)
+		})
 	}
 }
