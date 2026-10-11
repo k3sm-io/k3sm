@@ -51,10 +51,16 @@ const (
 )
 
 // kcmDisabledControllers are the node-side controllers k3sm DROPS because they
-// assume real Linux kubelets / cloud providers and would fight the Virtual
-// Kubelet node or churn against absent infrastructure. Names match k8s v1.36.2's
-// "-controller" suffix convention (kube-controller-manager --help → "All
-// controllers").
+// assume real Linux kubelets and would fight the Virtual Kubelet node or churn
+// against absent infrastructure. Names match k8s v1.37.1's "-controller" suffix
+// convention (kube-controller-manager --help → "All controllers").
+//
+// Every entry must be a registered controller name: kube-controller-manager
+// rejects an unknown --controllers token ("is not in the list of known
+// controllers") and refuses to start. Kubernetes v1.37 removed the no-op cloud
+// controller registrations from the controller-manager (kubernetes#138002), so
+// cloud-node-lifecycle-controller, node-route-controller and service-lb-controller
+// are no longer disabled here: they do not exist at the pinned version.
 //
 // The --controllers value is rendered as "*,-<each>" — enable every
 // on-by-default controller, then disable just these. That is robust across kube
@@ -62,9 +68,6 @@ const (
 // endpointslice-controller ON, which the Service proxy reconciles off.
 var kcmDisabledControllers = []string{
 	"persistentvolume-attach-detach-controller", // attach-detach: no real volumes to (de)attach
-	"cloud-node-lifecycle-controller",           // cloud provider lifecycle: not a cloud node
-	"node-route-controller",                     // route: no cloud routes
-	"service-lb-controller",                     // service load-balancer: no cloud LB
 	"node-ipam-controller",                      // nodeipam: podCIDR is assigned by darwin-net, not here
 }
 
@@ -787,11 +790,11 @@ func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 // every namespace.
 //
 // The DESIGN's --feature-gates=ConsistentListFromCache=false (the kine#577
-// watch-staleness mitigation) is not passed: in the pinned kwok-ci/k8s build
-// (k8s v1.36.2) that gate is GA-locked to true and the apiserver refuses to
-// start if it is set false ("feature is locked to true"). It is left at its
-// locked default; the soak is revisited if k3sm ever pins a kube version where
-// the gate is still settable.
+// watch-staleness mitigation) is not passed: the gate was GA-locked to true
+// through k8s v1.36, and k8s v1.37 removed it outright (kubernetes#138907), so
+// the pinned v1.37.1 apiserver would reject the name. Consistent lists from the
+// watch cache are unconditional at the pin; the soak is revisited if k3sm ever
+// pins a kube version where the behaviour is settable again.
 func (s *Supervised) startAPIServer(ctx context.Context) (*component, error) {
 	return s.spawn(ctx, "kube-apiserver", apiServerArgs(s.cfg)...)
 }
@@ -850,14 +853,14 @@ func apiServerArgs(cfg Config) []string {
 		// objects — the admission half of the Node authorizer. It does not cover CRDs,
 		// so the net.k3sm.io/MeshPeer write stays guarded by bootstrap.AuthorizeMeshPeerWrite.
 		"--enable-admission-plugins=NodeRestriction",
-		// Enable the beta MutatingAdmissionPolicy API + feature gate so the
+		// Enable the MutatingAdmissionPolicy API + feature gate so the
 		// EnsureDaemonSetTolerationMutation policy (which injects the provider toleration
-		// into DaemonSet-owned pods) is actually evaluated. MutatingAdmissionPolicy is
-		// beta and off by default at the pinned k8s (v1.36.2); without both of these the
-		// policy is provisioned but a runtime no-op. Caution: an invalid feature-gate name
-		// or a v1beta1 group the pinned apiserver does not serve makes kube-apiserver
-		// refuse to start — the gate name + v1beta1 serving must be lab-verified against
-		// the kwok-ci v1.36.2 apiserver before a real rollout.
+		// into DaemonSet-owned pods) is actually evaluated. MutatingAdmissionPolicy went
+		// GA (v1, on by default) in k8s v1.36 (kubernetes#136039); the v1.37 changelog
+		// removes neither the gate nor the v1beta1 group, so both flags are carried
+		// unchanged to the v1.37.1 pin. Caution: an invalid feature-gate name or a v1beta1 group
+		// the pinned apiserver does not serve makes kube-apiserver refuse to start — a
+		// kube bump must re-check both against the new apiserver.
 		"--runtime-config=admissionregistration.k8s.io/v1beta1=true",
 		"--feature-gates=MutatingAdmissionPolicy=true",
 		// Audit logging: the shipped policy is structurally
