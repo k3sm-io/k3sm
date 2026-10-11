@@ -3,7 +3,7 @@ repo: k3sm
 schema: phases/v1
 current_phase: M6
 updated: 2026-10-10
-updated_by: M19 encode (docs/m19-plan.md — the wasm RuntimeClass)
+updated_by: M19 Amendment A (docs/m19-plan.md R3 — the opt-in module signature check)
 
 phases:
   - id: M0
@@ -1516,7 +1516,7 @@ phases:
     depends_on:
       - apis:M19
       - runtimed:M19
-    note: "Authoritative input: docs/m19-plan.md (workspace). The named exception covers only cross-node skew between a server that provisions the wasm class and an older worker: the SandboxBackend enum value is additive and runtimed is in-process with the provider, so there is no provider-runtimed window. wasm runs only under the ad-hoc signature policy (R3) and is not a tenant boundary (R11): a guest escape equals a native-pod compromise, so untrusted workloads still go to vm. EXPERIMENTAL until M19-lab is green."
+    note: "Authoritative input: docs/m19-plan.md (workspace). The named exception covers only cross-node skew between a server that provisions the wasm class and an older worker: the SandboxBackend enum value is additive and runtimed is in-process with the provider, so there is no provider-runtimed window. wasm runs only under the ad-hoc signature policy, where a pod may opt into a cosign key-based check of its module image by annotation (R3, Amendment A 2026-10-10; require-signed and require-notarized stay refused because a pod-named key cannot discharge an operator policy), and is not a tenant boundary (R11): a guest escape equals a native-pod compromise, so untrusted workloads still go to vm. EXPERIMENTAL until M19-lab is green."
     subphases:
       - id: M19.3
         title: the wasm class, label and capability; packaging; the user doc; the real M19 gates
@@ -1525,17 +1525,17 @@ phases:
         depends_on:
           - apis:M19.1
           - runtimed:M19.2
-        note: "R1, R9, R10, R12, R15 of docs/m19-plan.md. The class is selected by the k3sm.io/wasm label (presence-only, delete-on-loss) merged with the darwin selector and carries no tolerations; backend loss degrades to refuse, never to unconfined. Refusals are translate-time with a named Event reason: exec probes and exec lifecycle hooks (R9), a mixed native/wasm pod (R10), and wasm under require-signed or require-notarized (R3). k3sm-wasmhost ships ad-hoc signed with no entitlements and no hardened runtime, after a libwasmtime.a provenance digest check (R12). The M19 and M19-lab rows ship as honest skeletons and this sub-phase flips them in the same change (TestNonManualSkeletonsAlwaysRed, TestLabSkeletonHonesty)."
+        note: "R1, R9, R10, R12, R15 of docs/m19-plan.md. The class is selected by the k3sm.io/wasm label (presence-only, delete-on-loss) merged with the darwin selector and carries no tolerations; backend loss degrades to refuse, never to unconfined. Refusals are translate-time with a named Event reason: exec probes and exec lifecycle hooks (R9), a mixed native/wasm pod (R10), and wasm under require-signed or require-notarized (R3). Amendment A: the two k3sm.io/wasm-signature annotations are parsed once at CreatePod, fail closed, into PodBox.wasm_signature (SPKI DER), stamped only when the node's runtimed reports ConditionWasmBackendAvailable; an unannotated wasm pod gets one WasmModuleUnverified Warning Event, a verified one WasmModuleVerified; pullEventFor maps SIGNATURE_REJECTED to FailedWasmSignature / WasmSignatureRejected with the cause message instead of the generic pull failure. k3sm-wasmhost ships ad-hoc signed with no entitlements and no hardened runtime, after a libwasmtime.a provenance digest check (R12). The M19 and M19-lab rows ship as honest skeletons and this sub-phase flips them in the same change (TestNonManualSkeletonsAlwaysRed, TestLabSkeletonHonesty)."
         deliverables:
           - id: M19.3-d1
             done: false
-            desc: "B499 — pkg/runtimeclass as a class list (M19 owns the refactor M15 also planned) plus the `wasm` class (nodeSelector k3sm.io/wasm merged with the darwin selector, no tolerations, overhead.podFixed from the spike's baseline); NodeCapabilities.WasmBackend fed by ConditionWasmBackendAvailable and applyWasmLabel (presence-only, delete-on-loss); the imagePlatformPolicy case and its unservable-platform hint; translate-time refusals with a named Event reason: wasm under require-signed/require-notarized (R3), exec probes and exec lifecycle hooks (R9), a mixed native/wasm pod (R10)."
+            desc: "B499 — pkg/runtimeclass as a class list (M19 owns the refactor M15 also planned) plus the `wasm` class (nodeSelector k3sm.io/wasm merged with the darwin selector, no tolerations, overhead.podFixed from the spike's baseline); NodeCapabilities.WasmBackend fed by ConditionWasmBackendAvailable and applyWasmLabel (presence-only, delete-on-loss); the imagePlatformPolicy case and its unservable-platform hint; translate-time refusals with a named Event reason: wasm under require-signed/require-notarized (R3), exec probes and exec lifecycle hooks (R9), a mixed native/wasm pod (R10); Amendment A (R3): the k3sm.io/wasm-signature and k3sm.io/wasm-signature-key annotations parsed once at CreatePod, fail closed (unknown value, key without required, required without key, trailing PEM blocks, non-P-256, over 4 KiB -> FailedWasmSignature in the CONTAINER_CONFIG class, a bounded message that never echoes the PEM), into PodBox.wasm_signature as SPKI DER, stamped only when GetRuntimeInfo reports ConditionWasmBackendAvailable; the WasmModuleUnverified Warning Event and the WasmModuleVerified Normal Event; the pullEventFor mapping of FAILURE_REASON_SIGNATURE_REJECTED to FailedWasmSignature / waiting reason WasmSignatureRejected on the slow backoff end, an unreachable registry staying a retryable pull failure."
           - id: M19.3-d2
             done: false
             desc: "B500 — k3sm-wasmhost in RequiredSiblings, hack/release/stage.sh build + ad-hoc sign_one (no entitlements, no hardened runtime) + verify_tree assertions + the libwasmtime.a provenance digest check before signing, the .goreleaser.yaml archive member, the formula via hack/sync-formula.sh, the sibling-set consistency test, the k3sm status row (helper present/absent and why the label is unset)."
           - id: M19.3-d3
             done: false
-            desc: "B501 — docs/user/wasm-runtimeclass.md (+ site manifest entry; validation-not-provenance, the ad-hoc-only ceiling, the minimum viable memory limit, the annotation-form gap), what-runs.md and limitations.md sentences, examples/hello-wasm.yaml (runtimeClassName: wasm + the darwin selector only), the docs/privilege-model.md paragraph (R11), and the REAL hack/acceptance/m19.sh composite and hack/lab/m19.sh ladder replacing the skeletons with skeleton flipped to false in the same change."
+            desc: "B501 — docs/user/wasm-runtimeclass.md (+ site manifest entry; validation-not-provenance, the opt-in module check and what it proves and does not (registry substitution and moved tags, not author intent or a leaked key; no revocation, expiry or transparency log; create-time only; one key; loaded images cannot be verified), the require-signed/require-notarized ceiling, a copy-pasteable ValidatingAdmissionPolicy example making the two annotations mandatory and immutable for wasm pods, the minimum viable memory limit, the annotation-form gap), what-runs.md and limitations.md sentences, examples/hello-wasm.yaml (runtimeClassName: wasm + the darwin selector only), the docs/privilege-model.md paragraph (R11), and the REAL hack/acceptance/m19.sh composite and hack/lab/m19.sh ladder replacing the skeletons with skeleton flipped to false in the same change."
         acceptance:
           - id: M19.3-a1
             met: false
@@ -1547,7 +1547,7 @@ phases:
             method: integration
           - id: M19.3-a3
             met: false
-            check: "K3SM_LAB=1 hack/lab/m19.sh exits 0 on the rig (the M19-lab row: hello, http component, the positive wasi/wasm32 pull and the linux/arm64 negative, OOMKilled from the sampler, the confinement and signature-policy negatives, the refusals, logs --previous, attach/port-forward/top, kickstart survival, the skew leg, the rollback leg, footprint)"
+            check: "K3SM_LAB=1 hack/lab/m19.sh exits 0 on the rig (the M19-lab row: hello, http component, the positive wasi/wasm32 pull and the linux/arm64 negative, OOMKilled from the sampler, the confinement negative, the signature rungs (unannotated runs with WasmModuleUnverified, a cosign-signed module runs with WasmModuleVerified, the wrong key is refused with WasmSignatureRejected, the verified pod restarts with the registry blocked, require-signed and require-notarized refuse), the refusals, logs --previous, attach/port-forward/top, kickstart survival, the skew leg, the rollback leg, footprint)"
             method: lab
       - id: M19.4
         title: site and graduation bar
@@ -2235,7 +2235,12 @@ when they export `wasi:http/incoming-handler`, HTTP served on the pod IP.
 
 The honest limits are part of the feature. `wasm` runs only under the default ad-hoc signature
 policy: the engine turns unsigned bytes into native code, so under `require-signed` and
-`require-notarized` the pod is refused with a named reason. It is not a tenant boundary, because a
+`require-notarized` the pod is refused with a named reason, because a key the pod names cannot
+discharge a policy the operator set. Under the default policy a pod may opt in, by annotation, to a
+cosign key-based check of its module image: an unannotated pod runs and carries a Warning Event
+saying the module is unverified; an annotated pod is verified on every start against the digest
+that runs and refused with a named reason when the signature is missing or wrong (Amendment A).
+The check defends against a registry or a moved tag, not against the pod author or a leaked key. It is not a tenant boundary, because a
 guest escape equals a native-pod compromise; untrusted workloads still go to `vm`. There is no
 exec: probes and lifecycle hooks that need a shell are refused. It stays EXPERIMENTAL until M19-lab
 is green.
