@@ -138,8 +138,13 @@ host changes  reserved-half aliases on bridge0 and -net routes for exactly the t
               LAN interface and the default route are never touched; no pf; no reboot
 residue       after every restore, any reserved-half route entry that is not an ARP
               host entry is deleted when this spike created it (on bridge0, reserved
-              halves only) and reported; anything still there = FAIL "restore left
-              residue" (exit 1)
+              halves only) and reported. At preflight whatever remains is RECORDED as
+              a pre-existing entry from an earlier run and becomes the baseline; no
+              alias is added over an address such an entry covers. Later, an entry
+              this run created that is still there = FAIL "restore left residue"
+              (exit 1); a baseline entry with identical flags and gateway is excluded.
+              A removed /32 alias that leaves an undeletable non-static UC entry is a
+              named finding (macOS 27)
 exit          0 PASS · 1 FAIL · 2 RECORDED (never a green)
 rig           K3SM_LAB=1, PEER_SSH, EVIDENCE_DIR (required; no defaults)
 findings      EVIDENCE_DIR/findings.md (with figures.jsonl and every payload transcript)
@@ -297,9 +302,8 @@ on_peer "mkdir -p $IC_REMOTE_DIR && sudo -n true" >/dev/null 2>&1 ||
 	finish 1 "FAIL — the peer is unreachable over ssh as PEER_SSH, or its sudo is not passwordless"
 ARMED=1
 note "replaying any ledger an interrupted earlier run left behind"
-restore_side local
-restore_side peer
-[ -z "$RESIDUE_LEFT" ] || finish 1 "FAIL — restore left residue before the run began ($RESIDUE_LEFT); entries this spike did not record creating are never deleted by it"
+restore_side local preflight
+restore_side peer preflight
 
 # The side-info payload: bridge0, its members, which are Thunderbolt and have
 # carrier, the MACs, MTU, the default-route interface, the self-assigned and mesh
@@ -583,7 +587,11 @@ run_form() {
 			return 2
 			;;
 		*)
-			bad "form $FORM configure $side: the alias or route was refused (payload exit $rc)"
+			if grep -q 'already exists (left by an earlier run)' "$PAYLOAD_LOG"; then
+				bad "form $FORM configure $side: an address of this form is covered by a pre-existing route entry; no alias is added over it"
+			else
+				bad "form $FORM configure $side: the alias or route was refused (payload exit $rc)"
+			fi
 			return 1
 			;;
 		esac

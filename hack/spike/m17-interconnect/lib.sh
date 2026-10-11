@@ -92,7 +92,7 @@ in_reserved() { case "$1" in 169.254.0.*|169.254.255.*) return 0 ;; esac; return
 PREEOF
 
 # IC_NETSTAT_AWK — the one reader of `netstat -rn -f inet` used by the payloads and
-# the driver. It prints "<addr>/<mask> <flags> <netif>" for every entry inside the
+# the driver. It prints "<addr>/<mask> <flags> <netif> <gateway>" for every entry in the
 # reserved halves with a mask of /24 or longer (a host entry is /32). netstat
 # abbreviates destinations ("169.254/24" is 169.254.0.0/24, a bare "169.254" is the
 # /16), and macOS link-local routes are interface-scoped, so `route -n get` cannot
@@ -105,7 +105,7 @@ read -r -d '' IC_NETSTAT_AWK <<'AWKEOF' || true
   if (m < 0) m = (n == 4) ? 32 : 8 * n
   for (i = n + 1; i <= 4; i++) o[i] = 0
   if (o[1] != 169 || o[2] != 254 || (o[3] != 0 && o[3] != 255) || m < 24) next
-  print o[1] "." o[2] "." o[3] "." o[4] "/" m, $3, $4 }
+  print o[1] "." o[2] "." o[3] "." o[4] "/" m, $3, $4, $2 }
 AWKEOF
 
 read -r -d '' IC_RESTORE_LIB <<'RESTEOF' || true
@@ -122,9 +122,13 @@ has_half_route() {   # a route for exactly this half exists, on any interface
   reserved_routes | awk -v d="$1" '$1==d' | grep -q .
 }
 created() { grep -qxF "$1" "$CREATED" || echo "$1" >>"$CREATED"; }
+# covered <ip> — a non-ARP route entry for exactly this address already exists (for
+# example an undeletable entry an earlier run's alias left behind).
+covered() { reserved_routes | awk -v d="$1/32" '$1==d && $2 !~ /L/' | grep -q .; }
 ic_alias() {         # ic_alias <reserved-half ip> <netmask>
   in_reserved "$1" || { refuse "$1 is outside the reserved halves"; return 1; }
   has_alias "$1" && { refuse "$1 is already on bridge0 and not in this spike's ledger"; return 1; }
+  covered "$1" && { refuse "a route entry for $1/32 already exists (left by an earlier run); no alias is added over it"; return 5; }
   ifconfig bridge0 inet "$1" netmask "$2" alias && echo "alias $1" >>"$LEDGER" && created "alias $1"
 }
 ic_route() {         # ic_route <reserved half> — the add's own output is printed as ROUTE-ADD
@@ -165,16 +169,30 @@ was_created() {
 }
 entry_left() { reserved_routes | awk -v d="$1" '$1==d && $2 !~ /L/' | grep -q .; }
 # ic_residue — after a restore, every reserved-half route entry that is not an ARP
-# host entry (flags with L) is residue. On bridge0 and listed in CREATED it is
-# deleted (host or net, reserved halves only); anything else is left alone. Prints
-# RESIDUE-DELETED / RESIDUE-LEFT lines, or RESIDUE-NONE.
+# host entry (flags with L) is residue. IC_RESIDUE_MODE selects the rule:
+#   preflight  an entry this spike recorded creating is deleted; whatever remains
+#              (or was never ours) is RESIDUE-PREEXISTING: recorded, not deleted, and
+#              the driver keeps it as the run's baseline.
+#   post       an entry in IC_BASELINE with identical flags, interface and gateway is
+#              RESIDUE-BASELINE (skipped); otherwise an entry on bridge0 listed in
+#              CREATED is deleted, and anything left is RESIDUE-LEFT.
+# A /32 the spike created that is a non-static cloned entry (C without S) and will
+# not delete carries the tag UNDELETABLE-CLONE.
 ic_residue() {
-  local dest flags netif try out found=0
-  while read -r dest flags netif; do
+  local dest flags netif gw try out found=0 tag
+  while read -r dest flags netif gw; do
     case "$flags" in *L*) continue ;; esac
     found=1
+    if [ "${IC_RESIDUE_MODE:-post}" = post ] && printf '%s\n' "${IC_BASELINE:-}" | grep -qxF "$dest $flags $netif $gw"; then
+      echo "RESIDUE-BASELINE $dest $flags $netif $gw (present at preflight, unchanged)"
+      continue
+    fi
     if [ "$netif" != bridge0 ] || ! was_created "$dest"; then
-      echo "RESIDUE-LEFT $dest $flags $netif (not created by this spike; left alone)"
+      if [ "${IC_RESIDUE_MODE:-post}" = preflight ]; then
+        echo "RESIDUE-PREEXISTING $dest $flags $netif $gw (not created by this spike; not ours to delete)"
+      else
+        echo "RESIDUE-LEFT $dest $flags $netif $gw (not created by this spike; left alone)"
+      fi
       continue
     fi
     out=""
@@ -184,9 +202,15 @@ ic_residue() {
       entry_left "$dest" || break
     done
     if entry_left "$dest"; then
-      echo "RESIDUE-LEFT $dest $flags $netif (created by this spike; every delete failed:$out)"
+      tag=""
+      case "$dest:$flags" in */32:*C*) case "$flags" in *S*) ;; *) tag=" UNDELETABLE-CLONE" ;; esac ;; esac
+      if [ "${IC_RESIDUE_MODE:-post}" = preflight ]; then
+        echo "RESIDUE-PREEXISTING $dest $flags $netif $gw (created by an earlier run of this spike; every delete failed)$tag:$out"
+      else
+        echo "RESIDUE-LEFT $dest $flags $netif $gw (created by this spike; every delete failed)$tag:$out"
+      fi
     else
-      echo "RESIDUE-DELETED $dest $flags $netif:$out"
+      echo "RESIDUE-DELETED $dest $flags $netif $gw:$out"
     fi
   done < <(reserved_routes)
   [ "$found" = 0 ] && echo "RESIDUE-NONE the reserved halves hold no route entry (ARP host entries aside)"
@@ -252,24 +276,50 @@ payload() {
 	return "$rc"
 }
 
-# restore_side <side> — replay that Mac's ledger (privileged, idempotent), then the
-# residue check. RESIDUE lines land in residue-<side>.log; a RESIDUE-LEFT appends to
-# RESIDUE_LEFT, and the caller turns that into "restore left residue" (exit 1).
+# restore_side <side> [preflight] — replay that Mac's ledger (privileged,
+# idempotent), then the residue check. RESIDUE lines land in residue-<side>.log.
+# In preflight mode every remaining entry is RECORDED and kept in BASELINE_<side>;
+# afterwards a RESIDUE-LEFT appends to RESIDUE_LEFT, which the caller turns into
+# "restore left residue" (exit 1).
 RESIDUE_LEFT=""
+BASELINE_local=""
+BASELINE_peer=""
+NAMED_CLONE=0
 restore_side() {
-	payload "$1" restore 1 <<'EOF' || true
+	local side="$1" mode="${2:-post}" base line entry
+	if [ "$side" = local ]; then base="$BASELINE_local"; else base="$BASELINE_peer"; fi
+	payload "$side" restore 1 IC_RESIDUE_MODE="$mode" IC_BASELINE="$base" <<'EOF' || true
 ic_restore
 ic_residue
 EOF
-	local line
 	while IFS= read -r line; do
-		echo "$line" >>"$EVIDENCE_DIR/residue-$1.log"
+		echo "$line" >>"$EVIDENCE_DIR/residue-$side.log"
+		entry="$(echo "$line" | awk '{print $2, $3, $4, $5}')"
 		case "$line" in
-		"RESIDUE-LEFT "*)
-			RESIDUE_LEFT="$RESIDUE_LEFT $1:$(echo "$line" | awk '{print $2}')"
-			finding "- FAIL restore left residue on the $1 Mac: ${line#RESIDUE-LEFT }"
+		"RESIDUE-PREEXISTING "*)
+			record "pre-existing reserved-half entry left by an earlier run, not ours to delete ($side Mac): $entry"
+			if [ "$side" = local ]; then
+				BASELINE_local="$BASELINE_local$entry"$'\n'
+			else
+				BASELINE_peer="$BASELINE_peer$entry"$'\n'
+			fi
 			;;
-		"RESIDUE-DELETED "*) finding "- RECORDED restore residue deleted on the $1 Mac: ${line#RESIDUE-DELETED }" ;;
+		"RESIDUE-LEFT "*)
+			RESIDUE_LEFT="$RESIDUE_LEFT $side:$(echo "$line" | awk '{print $2}')"
+			finding "- FAIL restore left residue on the $side Mac: ${line#RESIDUE-LEFT }"
+			;;
+		"RESIDUE-DELETED "*) finding "- RECORDED restore residue deleted on the $side Mac: ${line#RESIDUE-DELETED }" ;;
+		esac
+		case "$line" in
+		*UNDELETABLE-CLONE*)
+			if [ "$NAMED_CLONE" = 0 ]; then
+				NAMED_CLONE=1
+				finding ""
+				finding "**Named finding: a removed /32 bridge0 alias can leave an undeletable cloned route (macOS 27).** After the alias is removed, a non-static \`UC\` /32 entry for its address stays in the routing table and every \`route delete\` form answers \"not in table\". The node reconcile and the doctor have to live with it: never re-add an alias over it, and report it rather than fail on it."
+				finding ""
+			fi
+			finding "- RECORDED undeletable cloned route on the $side Mac: $entry"
+			;;
 		esac
 	done < <(grep '^RESIDUE-' "$PAYLOAD_LOG")
 }
