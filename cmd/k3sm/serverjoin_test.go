@@ -19,8 +19,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/pbkdf2"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -266,11 +271,43 @@ func (f serverJoinFixture) v2Sealed(t *testing.T) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := bootstrap.SealBundle(f.secret, v2)
+	return sealCheap(t, f.secret, v2)
+}
+
+// sealCheap seals plaintext in the bootstrap envelope format with a 1000-round
+// PBKDF2 instead of the production 600000. OpenBundle reads the round count from the
+// authenticated header, so the import path opens it unchanged; the wait test refetches
+// it dozens of times and the production KDF cost (about 1.4 s per open under -race)
+// would be the whole test. The round trip is asserted so a format change fails here.
+func sealCheap(t *testing.T, secret string, plaintext []byte) []byte {
+	t.Helper()
+	const iters = 1000
+	salt := bytes.Repeat([]byte{0x5a}, 16)
+	nonce := bytes.Repeat([]byte{0xa5}, 12)
+	header := append([]byte("K3SB"), 1, 1)
+	header = binary.BigEndian.AppendUint32(header, iters)
+	header = append(header, byte(len(salt)))
+	header = append(header, salt...)
+	header = append(header, byte(len(nonce)))
+	header = append(header, nonce...)
+	key, err := pbkdf2.Key(sha256.New, secret, salt, iters, 32)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return sealed
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := append(header, gcm.Seal(nil, nonce, plaintext, header)...)
+	got, err := bootstrap.OpenBundle(secret, env)
+	if err != nil || !bytes.Equal(got, plaintext) {
+		t.Fatalf("cheap envelope does not round-trip through OpenBundle: %v", err)
+	}
+	return env
 }
 
 // join runs importServerCABundleVia for workDir over tr, failing the test if the log
