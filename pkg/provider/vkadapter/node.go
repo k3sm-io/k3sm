@@ -30,7 +30,6 @@ import (
 	vklog "github.com/virtual-kubelet/virtual-kubelet/log"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
-	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -310,7 +309,7 @@ func newNode(nodeName string, cfg NodeConfig, timings nodeTimings) (*Node, error
 	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(
 		cfg.Client,
 		informerResyncPeriod,
-		nodeutil.PodInformerFilter(nodeName),
+		podInformerFilter(nodeName),
 	)
 	podInformer := podInformerFactory.Core().V1().Pods()
 	// Lister() registers the pod informer with the factory, so Run's Start
@@ -383,7 +382,7 @@ func newNode(nodeName string, cfg NodeConfig, timings nodeTimings) (*Node, error
 		np,
 		nodeSpec,
 		recordingNodes{NodeInterface: hbNodes, rec: rec},
-		vknode.WithNodeEnableLeaseV1(recordingLeases{LeaseInterface: nodeutil.NodeLeaseV1Client(hbClient), rec: rec}, vknode.DefaultLeaseDuration),
+		vknode.WithNodeEnableLeaseV1(recordingLeases{LeaseInterface: nodeLeaseV1Client(hbClient), rec: rec}, vknode.DefaultLeaseDuration),
 		vknode.WithNodePingInterval(nodePingInterval),
 		vknode.WithNodePingTimeout(nodePingTimeout),
 		vknode.WithNodeStatusUpdateInterval(timings.statusInterval),
