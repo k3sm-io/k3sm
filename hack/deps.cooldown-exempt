@@ -12,4 +12,3 @@
 # The reason is required. Delete a line once its version is older than the
 # cooldown; the script prints a note for every line that no longer matches.
 golang.org/x/net v0.60.0 x/net v0.60.0 adopted 2026-10-09 for GO-2026-6611/6612/6617; supply-chain audit 2026-10-11 (two blind auditors + per-module third opinion) found it byte-identical to the upstream tag
-buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.6-20250425153114-8976f5be98c1.1 the module proxy records no commit time for this generated-code version; in the graph before the cooldown existed

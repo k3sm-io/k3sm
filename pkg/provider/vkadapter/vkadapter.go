@@ -34,26 +34,27 @@ limitations under the License.
 package vkadapter
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
-	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 )
 
 // The VK provider/node contract types, re-exported as aliases so consumers name
 // vkadapter.X in their signatures while keeping VK's exact type identity.
 type (
-	// Provider is the full Virtual Kubelet provider contract (pod lifecycle, logs,
-	// exec/attach/port-forward, stats/metrics) the VK node drives.
-	Provider = nodeutil.Provider
 	// PodLifecycleHandler is the create/update/delete/get pod contract.
 	PodLifecycleHandler = vknode.PodLifecycleHandler
 	// PodNotifier is the async pod-status callback registration contract.
@@ -71,6 +72,30 @@ type (
 	// TermSize is a tty resize event delivered over an AttachIO Resize channel.
 	TermSize = api.TermSize
 )
+
+// Provider is the full Virtual Kubelet provider contract (pod lifecycle, logs,
+// exec/attach/port-forward, stats/metrics) the VK node drives. Its method set
+// matches virtual-kubelet v1.14.0 nodeutil/provider.go (Apache-2.0), so any
+// value satisfying one satisfies the other; the streaming verbs keep VK's own
+// AttachIO and ContainerLogOpts types.
+type Provider interface {
+	PodLifecycleHandler
+
+	// GetContainerLogs returns the logs of the named container of a pod.
+	GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts ContainerLogOpts) (io.ReadCloser, error)
+	// RunInContainer executes cmd in the named container, copying the stdio of
+	// attach to and from it.
+	RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach AttachIO) error
+	// AttachToContainer attaches the stdio of attach to the running process of the
+	// named container.
+	AttachToContainer(ctx context.Context, namespace, podName, containerName string, attach AttachIO) error
+	// GetStatsSummary returns the node's stats summary, running pods included.
+	GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error)
+	// GetMetricsResource returns the node's resource metrics, running pods included.
+	GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily, error)
+	// PortForward forwards stream to port on the pod.
+	PortForward(ctx context.Context, namespace, pod string, port int32, stream io.ReadWriteCloser) error
+}
 
 // NewNaiveNodeProvider returns a NaiveNodeProvider ready to accept UpdateStatus
 // calls. It MUST be built through this constructor: the zero value has no notify
