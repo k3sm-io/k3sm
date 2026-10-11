@@ -85,7 +85,7 @@ func TestKineVersionSinglePin(t *testing.T) {
 // gate red on the old pin and green on the new one. TestKineVersionSinglePin
 // checks the pin's shape; this test checks its value.
 func TestDefaultKineVersionIsPinned(t *testing.T) {
-	const want = "v0.17.1"
+	const want = "v0.17.2"
 	if DefaultKineVersion != want {
 		t.Errorf("DefaultKineVersion = %q, want %q", DefaultKineVersion, want)
 	}
