@@ -127,9 +127,11 @@ require (
 // (the split googleapis modules vs the legacy monolith) that otherwise breaks the build.
 replace google.golang.org/genproto => google.golang.org/genproto v0.0.0-20260622175928-b703f567277d
 
-// Sibling repos are not published; resolve them from the workspace checkout.
+// k3sm.io/apis is not published; resolve it from the sibling checkout.
 replace k3sm.io/apis => ../apis
 
+// k3sm.io/runtimed is not published; resolve it from the sibling checkout.
 replace k3sm.io/runtimed => ../runtimed
 
+// k3sm.io/darwin-net is not published; resolve it from the sibling checkout.
 replace k3sm.io/darwin-net => ../darwin-net

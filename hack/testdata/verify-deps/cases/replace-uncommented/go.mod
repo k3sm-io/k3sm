@@ -13,7 +13,10 @@ require (
 
 replace example.com/forked => example.com/forked-fix v1.0.1
 
-// Sibling repos resolve from their checkouts; one comment explains the run.
+// The apis sibling repo resolves from its checkout.
 replace k3sm.io/apis => ../apis
 
-replace k3sm.io/runtimed => ../runtimed
+replace (
+	// The runtimed sibling repo resolves from its checkout.
+	k3sm.io/runtimed => ../runtimed
+)

@@ -16,8 +16,9 @@
 #   cooldown                 no module version younger than 14 days, unless
 #                            hack/deps.cooldown-exempt names it with a reason
 #   malicious-package check  no module version carries an OSV MAL- advisory
-#   replace discipline       every go.mod replace is explained by a comment, and
-#                            a filesystem replace points only at a sibling repo
+#   replace discipline       every go.mod replace sits directly under its own
+#                            comment line, and a filesystem replace points
+#                            only at a sibling repo
 #   pinned tools             no `go install` / `go run` of a remote module in
 #                            hack/** or a Makefile without an exact version
 #
@@ -393,9 +394,9 @@ def cmd_replace(gomod, allow):
             prev, blank_since = "other", False
             continue
         entry = entry.split("//", 1)[0].strip()
-        # Explained by a comment line directly above it, or the next member of a
-        # run of replaces that a comment directly above the run's first line explains.
-        ok = (prev in ("comment", "open-commented") and not blank_since) or prev == "replace-ok"
+        # Every replace needs its own comment line directly above it (for the
+        # first entry of a block, a comment directly above `replace (` counts).
+        ok = prev in ("comment", "open-commented") and not blank_since
         if not ok:
             bad.append("go.mod:%d: replace is not directly after a // comment explaining it: %s" % (n, s))
         if "=>" not in entry:
@@ -407,7 +408,7 @@ def cmd_replace(gomod, allow):
                 if target.startswith((".", "/")) and target not in allow:
                     bad.append("go.mod:%d: filesystem replace may only name %s: %s"
                                % (n, ", ".join(sorted(allow)), s))
-        prev, blank_since = ("replace-ok" if ok else "replace-bad"), False
+        prev, blank_since = "replace", False
     for b in bad:
         print("  " + b)
     sys.exit(1 if bad else 0)
@@ -932,6 +933,8 @@ self_test() {
 	bg osv-paged - "malicious-package check" "MAL-2026-0003"
 	bg replace-uncommented - "replace discipline" "not directly after a // comment"
 	bg replace-path - "replace discipline" "filesystem replace may only name"
+	bg replace-shared-comment - "replace discipline" "go.mod:20: replace is not directly after"
+	bg replace-block - "replace discipline" "go.mod:20: replace is not directly after"
 	bg tools-latest - "pinned tools" "'latest'"
 	bg tools-noat - "pinned tools" "without an @version"
 	bg tools-main - "pinned tools" "'main'"

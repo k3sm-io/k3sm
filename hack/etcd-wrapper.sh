@@ -26,11 +26,11 @@
 #   verify            materialize the wrapper and run `go mod verify`,
 #                     `go mod tidy -diff` (the committed go.sum is complete),
 #                     the one-pin check (server and etcdutl at one version),
-#                     and `govulncheck` over both programs. A missing
-#                     govulncheck prints a SKIP line and does not fail; every
-#                     real finding or error does. Needs the module proxy (or a
-#                     warm module cache) and, for govulncheck, the
-#                     vulnerability database.
+#                     and `govulncheck` over both programs. govulncheck must
+#                     report exactly GOVULNCHECK_VERSION (below); a missing or
+#                     mismatched tool fails, as does every finding or error.
+#                     Needs the module proxy (or a warm module cache) and, for
+#                     govulncheck, the vulnerability database.
 #
 # Exit status: 0 pass; 1 failure; 2 usage.
 set -euo pipefail
@@ -69,6 +69,10 @@ OVERRIDES=(
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.45.0
 )
+
+# GOVULNCHECK_VERSION is the govulncheck verify requires; keep it equal to the
+# constant of the same name in hack/ci.sh.
+GOVULNCHECK_VERSION=v1.8.0
 
 # ETCDUTL is the restore tool's main package, built from the wrapper module.
 ETCDUTL=go.etcd.io/etcd/etcdutl/v3
@@ -148,19 +152,24 @@ verify() {
 	(cd "$WORK" && GOFLAGS= wgo mod tidy -diff)
 	echo "==> [etcd-wrapper] one pin: etcd server and etcdutl at the same version"
 	onepin
-	local vc=""
+	# The first candidate reporting exactly the pin wins; none is a failure.
+	local vc="" seen="" c v
 	for c in "$(command -v govulncheck || true)" "$(go env GOPATH)/bin/govulncheck"; do
-		if [ -n "$c" ] && [ -x "$c" ]; then
+		[ -n "$c" ] && [ -x "$c" ] || continue
+		v="$("$c" -version 2>/dev/null | sed -n 's/^Scanner: govulncheck@//p' | head -1)" || v=""
+		seen="${seen}    $c reports ${v:-no version}"$'\n'
+		if [ "$v" = "$GOVULNCHECK_VERSION" ]; then
 			vc="$c"
 			break
 		fi
 	done
 	if [ -z "$vc" ]; then
-		echo "==> [etcd-wrapper] SKIP govulncheck: not installed (go install golang.org/x/vuln/cmd/govulncheck@latest)"
-	else
-		echo "==> [etcd-wrapper] govulncheck ./... $ETCDUTL"
-		(cd "$WORK" && GOWORK=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly "$vc" ./... "$ETCDUTL")
+		echo "etcd-wrapper: govulncheck ${GOVULNCHECK_VERSION} is required (go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION})" >&2
+		[ -z "$seen" ] || printf 'found:\n%s' "$seen" >&2
+		exit 1
 	fi
+	echo "==> [etcd-wrapper] govulncheck ${GOVULNCHECK_VERSION} ./... $ETCDUTL"
+	(cd "$WORK" && GOWORK=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly "$vc" ./... "$ETCDUTL")
 	echo "OK: etcd wrapper verified"
 }
 
