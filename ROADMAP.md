@@ -167,6 +167,13 @@ v0.1.1 followed on 2026-09-02; see [CHANGELOG.md](CHANGELOG.md) for what it adds
   first-time setup, updates and uninstall. An optional auto-stop takes the node down when the Mac
   joins a Wi-Fi network you have not marked trusted; it is a convenience, not a security boundary.
   The command-line install stays exactly as it is.
+- **WebAssembly workloads.** `runtimeClassName: wasm` runs a WASI module or component as a native
+  pod inside a small host process that embeds the wasmtime engine. Core modules get WASI preview 1;
+  components get WASI 0.2 and can serve HTTP on the pod IP. Such pods schedule only to Macs that
+  advertise the capability, and they run under the default ad-hoc signature policy only: the module
+  itself is checked for integrity, and its provenance is not. This is a convenience sandbox beside
+  the native path and is no tenant boundary, so untrusted workloads still go to `vm`. There is no
+  shell inside a module, so `kubectl exec` has nothing to reach.
 - **Autoscaling.** Scale-to-zero / activator-fronted model serving.
 
 ### Non-goals

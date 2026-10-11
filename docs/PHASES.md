@@ -3,7 +3,7 @@ repo: k3sm
 schema: phases/v1
 current_phase: M6
 updated: 2026-10-10
-updated_by: M18 encode (docs/m18-plan.md — k3sm.app, the lifecycle CLI, the menu-bar controls)
+updated_by: M19 encode (docs/m19-plan.md — the wasm RuntimeClass)
 
 phases:
   - id: M0
@@ -1050,7 +1050,7 @@ phases:
     strategy: phased (multi-node launchd rolling restart)
     depends_on:
       - runtimed:M15.2
-    note: "Authoritative input: docs/m15-plan.md (workspace) — Phase C encodes ONLY from that doc; the B267 spike's answers are binding. The deploy contract: a pre-M15 node has no container-vm handler row and never sets the k3sm.io/container-vm label, so the scheduler never places a container-vm pod on it and a forced one fails closed (guard #2); the control-plane Mac restarts LAST because it provisions the class; window one release line; rollback = revert + reinstall, a leftover class object is harmless. The M15 gate rows ship in this block's B268 encoding as honest skeletons (TestLabSkeletonHonesty pins them) and M15.3 replaces hack/lab/m15.sh's body with the real ladder, flipping skeleton to false in the same change (m11-plan R27). Merge precondition inherited by M15.2: the operator runs hack/lab/m11.sh --core on the rc artifact first — the GuestBackend generalization's hardware-level vm regression guard is that manual gate."
+    note: "Authoritative input: docs/m15-plan.md (workspace) — Phase C encodes ONLY from that doc; the B267 spike's answers are binding. The deploy contract: a pre-M15 node has no container-vm handler row and never sets the k3sm.io/container-vm label, so the scheduler never places a container-vm pod on it and a forced one fails closed (guard #2); the control-plane Mac restarts LAST because it provisions the class; window one release line; rollback = revert + reinstall, a leftover class object is harmless. The M15 gate rows ship in this block's B268 encoding as honest skeletons (TestLabSkeletonHonesty pins them) and M15.3 replaces hack/lab/m15.sh's body with the real ladder, flipping skeleton to false in the same change (m11-plan R27). Merge precondition inherited by M15.2: the operator runs hack/lab/m11.sh --core on the rc artifact first — the GuestBackend generalization's hardware-level vm regression guard is that manual gate. Amended 2026-10-10: SANDBOX_BACKEND_CONTAINER_VM is 6 and the runtimeclass class-list refactor is owned by M19.3 (docs/m19-plan.md R1)."
     subphases:
       - id: M15.3
         title: the container-vm class, label, capability, status row, user doc, and the real lab ladder
@@ -1508,6 +1508,61 @@ phases:
           - id: M18.6-a1
             met: false
             check: "hack/verify-site-clean.sh --sources is clean over the app pages and the release notes name the notarized disk image."
+            method: e2e
+  - id: M19
+    title: wasm RuntimeClass — WebAssembly workloads as native pods (the class, the node label, packaging, the user doc, the gates)
+    status: todo
+    strategy: "phased (named exception: multi-node launchd rolling restart)"
+    depends_on:
+      - apis:M19
+      - runtimed:M19
+    note: "Authoritative input: docs/m19-plan.md (workspace). The named exception covers only cross-node skew between a server that provisions the wasm class and an older worker: the SandboxBackend enum value is additive and runtimed is in-process with the provider, so there is no provider-runtimed window. wasm runs only under the ad-hoc signature policy (R3) and is not a tenant boundary (R11): a guest escape equals a native-pod compromise, so untrusted workloads still go to vm. EXPERIMENTAL until M19-lab is green."
+    subphases:
+      - id: M19.3
+        title: the wasm class, label and capability; packaging; the user doc; the real M19 gates
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - apis:M19.1
+          - runtimed:M19.2
+        note: "R1, R9, R10, R12, R15 of docs/m19-plan.md. The class is selected by the k3sm.io/wasm label (presence-only, delete-on-loss) merged with the darwin selector and carries no tolerations; backend loss degrades to refuse, never to unconfined. Refusals are translate-time with a named Event reason: exec probes and exec lifecycle hooks (R9), a mixed native/wasm pod (R10), and wasm under require-signed or require-notarized (R3). k3sm-wasmhost ships ad-hoc signed with no entitlements and no hardened runtime, after a libwasmtime.a provenance digest check (R12). The M19 and M19-lab rows ship as honest skeletons and this sub-phase flips them in the same change (TestNonManualSkeletonsAlwaysRed, TestLabSkeletonHonesty)."
+        deliverables:
+          - id: M19.3-d1
+            done: false
+            desc: "B498 — pkg/runtimeclass as a class list (M19 owns the refactor M15 also planned) plus the `wasm` class (nodeSelector k3sm.io/wasm merged with the darwin selector, no tolerations, overhead.podFixed from the spike's baseline); NodeCapabilities.WasmBackend fed by ConditionWasmBackendAvailable and applyWasmLabel (presence-only, delete-on-loss); the imagePlatformPolicy case and its unservable-platform hint; translate-time refusals with a named Event reason: wasm under require-signed/require-notarized (R3), exec probes and exec lifecycle hooks (R9), a mixed native/wasm pod (R10)."
+          - id: M19.3-d2
+            done: false
+            desc: "B499 — k3sm-wasmhost in RequiredSiblings, hack/release/stage.sh build + ad-hoc sign_one (no entitlements, no hardened runtime) + verify_tree assertions + the libwasmtime.a provenance digest check before signing, the .goreleaser.yaml archive member, the formula via hack/sync-formula.sh, the sibling-set consistency test, the k3sm status row (helper present/absent and why the label is unset)."
+          - id: M19.3-d3
+            done: false
+            desc: "B500 — docs/user/wasm-runtimeclass.md (+ site manifest entry; validation-not-provenance, the ad-hoc-only ceiling, the minimum viable memory limit, the annotation-form gap), what-runs.md and limitations.md sentences, examples/hello-wasm.yaml (runtimeClassName: wasm + the darwin selector only), the docs/privilege-model.md paragraph (R11), and the REAL hack/acceptance/m19.sh composite and hack/lab/m19.sh ladder replacing the skeletons with skeleton flipped to false in the same change."
+        acceptance:
+          - id: M19.3-a1
+            met: false
+            check: "go test ./pkg/runtimeclass -run TestProvisionWasmClass and go test ./pkg/install -run TestRequiredSiblingsMatchesConfigDefaults pass"
+            method: unit
+          - id: M19.3-a2
+            met: false
+            check: "go test ./hack/acceptance -run TestM19GatesAreReal passes and hack/acceptance/m19.sh exits 0 on a dev Mac"
+            method: integration
+          - id: M19.3-a3
+            met: false
+            check: "K3SM_LAB=1 hack/lab/m19.sh exits 0 on the rig (the M19-lab row: hello, http component, the positive wasi/wasm32 pull and the linux/arm64 negative, OOMKilled from the sampler, the confinement and signature-policy negatives, the refusals, logs --previous, attach/port-forward/top, kickstart survival, the skew leg, the rollback leg, footprint)"
+            method: lab
+      - id: M19.4
+        title: site and graduation bar
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M19.3
+        deliverables:
+          - id: M19.4-d1
+            done: false
+            desc: "the what-runs fourth path and the compare page after M19-lab is green; the de-EXPERIMENTAL bar in the m11-plan R28 shape; the DESIGN.md §5a paragraph for the fourth execution path."
+        acceptance:
+          - id: M19.4-a1
+            met: false
+            check: "M19-lab green on the recorded rig run and the site pages published"
             method: e2e
 ---
 
@@ -2169,3 +2224,30 @@ and auto-stop on untrusted Wi-Fi as best-effort hygiene.
 
 ### M18.6 — distribution ⬜
 The first signed and notarized release of both channels, the cask, and the closed-source note.
+
+## M19 — wasm RuntimeClass: WebAssembly workloads as native pods ⬜
+`docs/m19-plan.md` is authoritative (encoded 2026-10-10). M19 adds a fourth execution path beside
+native, `vm` and `container-vm`: a Pod that names `runtimeClassName: wasm` runs each container as a
+WebAssembly module or component inside `k3sm-wasmhost`, a sibling helper that embeds the wasmtime
+engine. The host is an ordinary native pod process, confined by Seatbelt, metered by the footprint
+sampler and logged like any other. Core modules get WASI preview 1; components get WASI 0.2 and,
+when they export `wasi:http/incoming-handler`, HTTP served on the pod IP.
+
+The honest limits are part of the feature. `wasm` runs only under the default ad-hoc signature
+policy: the engine turns unsigned bytes into native code, so under `require-signed` and
+`require-notarized` the pod is refused with a named reason. It is not a tenant boundary, because a
+guest escape equals a native-pod compromise; untrusted workloads still go to `vm`. There is no
+exec: probes and lifecycle hooks that need a shell are refused. It stays EXPERIMENTAL until M19-lab
+is green.
+
+**Phased (named exception: multi-node launchd rolling restart)**: only cross-node skew between a
+server that provisions the class and an older worker. The runtime is in-process with the provider.
+
+### M19.3 — the wasm class, label, packaging, user doc and gates ⬜
+The class list refactor and the `wasm` class, the `k3sm.io/wasm` node label and capability, the
+translate-time refusals, `k3sm-wasmhost` in the release set, the user page and example, and the
+real `M19` and `M19-lab` gates replacing the skeletons.
+
+### M19.4 — site and graduation bar ⬜
+The what-runs fourth path and the compare page after M19-lab is green, the de-EXPERIMENTAL bar, and
+the DESIGN.md paragraph for the fourth execution path.
