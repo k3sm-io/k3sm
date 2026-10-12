@@ -18,6 +18,9 @@ package svclb
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,54 +32,48 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/record"
 
 	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
-// IgnoreLabel marks a LoadBalancer Service this controller must SKIP entirely
-// (no listeners, no status). The canonical kube-system/k3sm-ingress Service
-// carries it: the in-process ingress Server owns those listeners, and splicing
-// its selector-less ClusterIP would forward into a void.
+// IgnoreLabel marks a LoadBalancer Service this package must SKIP entirely (no
+// stamp, no listeners, no status). The canonical kube-system/k3sm-ingress
+// Service carries it: the in-process ingress Server owns those listeners, and
+// splicing its selector-less ClusterIP would forward into a void.
 const IgnoreLabel = "svclb.k3sm.io/ignore"
+
+// FieldManager is the field manager of every write this package makes.
+const FieldManager = "k3sm-svclb"
 
 // warnInterval throttles repeated per-key warnings (bind conflicts, UDP
 // deferral) so a persistent conflict does not flood the log on every event.
 const warnInterval = 30 * time.Second
 
-// Config configures the svclb Controller.
-//
-// BindAddr and AdvertiseAddr are DIFFERENT addresses. The listeners bind
-// the wildcard (every interface answers, matching Docker Desktop's vpnkit and
-// k3s' klipper-lb), while the status advertises the node's derived
-// globally-unicast InternalIP. A wildcard bind cannot witness the advertised
-// address, so the assembler — not this package — owns the choice of both.
-type Config struct {
-	// Client is the cluster client the Service informer and status writes use.
+// hosterResync is how often the hoster re-runs its reconcile without an event,
+// which is what retries a report write or a start-of-life reset that failed.
+const hosterResync = 30 * time.Second
+
+// HosterConfig configures a Hoster, the per-node half of svclb.
+type HosterConfig struct {
+	// Client is THIS node's client (system:node:<name> on a joined worker and on
+	// the server's in-process node). It watches Services, watches its own Node,
+	// and merge-patches BoundAnnotation on its own Node. It never writes a
+	// Service.
 	Client kubernetes.Interface
+	// NodeName is this node's Node name: the name the decider stamps into
+	// HostsAnnotation, and the Node the report is written on.
+	NodeName string
 	// BindAddr is the address every LoadBalancer listener binds. It must be
 	// VALID; the WILDCARD (0.0.0.0) is the production choice and is accepted.
 	BindAddr netip.Addr
-	// AdvertiseAddr is the address published in status.loadBalancer.ingress once
-	// every TCP port of a Service is bound. The ZERO Addr is legal and means the
-	// node's advertisable address could not be derived: listeners STILL bind, but
-	// no status is ever written (the Service stays <pending> — never a loopback
-	// or an "invalid IP" EXTERNAL-IP).
-	AdvertiseAddr netip.Addr
-	// PodCIDR is the pod address space whose addresses this controller OWNS in
-	// status and therefore retracts (see Retractable). Pass the CLUSTER pod CIDR,
-	// not this node's /24: a node that re-enrolls moves from e.g. 100.64.0.0/24 to
-	// 100.64.2.0/24, and the entry stranded in status is the PREVIOUS /24's .1 —
-	// which the current /24 does not contain. svclb is the single server-process
-	// frontend (multi-node svclb is a named follow-up), so every pod-CIDR address
-	// in an LB status was written by this controller or a previous life of it.
-	// The zero Prefix disables that arm of the predicate.
-	PodCIDR netip.Prefix
 	// ReservedPorts is the set of ports k3sm's OWN wildcard listeners occupy (the
 	// NodePort range and the kubelet API port — pkg/ports.ReservedSet). bind
 	// REFUSES them outright rather than racing a k3sm listener for the same
@@ -84,12 +81,12 @@ type Config struct {
 	// is the second, datapath-side enforcement point, because the VAP is
 	// failurePolicy: Ignore and may be absent.
 	//
-	// REQUIRED, and New rejects nil. This is a guard whose other two layers (the
-	// VAP's Ignore failure policy, its log-and-continue provisioning) already fail
-	// OPEN, so letting the ZERO VALUE of this field disable the last one would
-	// point all three the same way. A caller that genuinely wants no reservations
-	// — only a test — passes an explicit empty map, which is a visible opt-out
-	// rather than an omission.
+	// REQUIRED, and NewHoster rejects nil. This is a guard whose other two layers
+	// (the VAP's Ignore failure policy, its log-and-continue provisioning) already
+	// fail OPEN, so letting the ZERO VALUE of this field disable the last one
+	// would point all three the same way. A caller that genuinely wants no
+	// reservations — only a test — passes an explicit empty map, which is a
+	// visible opt-out rather than an omission.
 	ReservedPorts map[int32]bool
 	// Binder opens every listener in-process (on Darwin a WILDCARD bind below
 	// 1024 does not require root; it is the SPECIFIC-address bind that returns
@@ -99,10 +96,6 @@ type Config struct {
 	// kube-system/k3sm-ingress Service declares, which is the ingress host's
 	// listener, never a tenant LoadBalancer Service's.
 	Binder netbind.Binder
-	// Recorder records Warning Events on Services (EventReasonSourceRangesInvalid).
-	// Nil means Run builds its own on Client (NewEventRecorder); injectable for
-	// tests.
-	Recorder record.EventRecorder
 	// Logger is the structured log sink; nil means slog.Default.
 	Logger *slog.Logger
 }
@@ -115,37 +108,42 @@ type dialFunc func(ctx context.Context, network, address string) (net.Conn, erro
 // operator-facing warning names the real cause.
 var errReservedPort = errors.New("port is reserved by a k3sm listener")
 
-// Controller reconciles LoadBalancer Services into BindAddr listeners spliced to
-// their ClusterIP VIPs, and writes each Service's LB status ONLY once its
-// listeners are actually bound (see the package doc's honesty contract).
-type Controller struct {
-	cfg Config
+// Hoster binds the LoadBalancer Services the decider stamped onto THIS node,
+// splices them to their ClusterIP VIPs through the node's own L4 proxy, and
+// reports the Services whose every TCP port it holds on its own Node
+// (BoundAnnotation). It writes no Service and no status: the decider advertises
+// a node only when the node is in the stamp AND reports the Service.
+type Hoster struct {
+	cfg HosterConfig
 	log *slog.Logger
 	dir netbind.Binder
 
-	// forwarders is keyed service "ns/name" -> port -> forwarder. It is owned
-	// EXCLUSIVELY by the single reconcile-loop goroutine (Run), so it needs no
-	// lock — do not touch it from any other goroutine.
+	// Every field below is owned EXCLUSIVELY by the goroutine running Run (or,
+	// before Run starts, the caller of Reset), so none needs a lock.
+
+	// forwarders is keyed service "ns/name" -> port -> forwarder.
 	forwarders map[string]map[int32]*forwarder
-	// lastWarn backs the per-key warning throttle; same single-goroutine
-	// ownership as forwarders.
+	// lastWarn backs the per-key warning throttle.
 	lastWarn map[string]time.Time
-	// disclaimed records Services this process has already retracted its own
-	// advertisement from (a foreign loadBalancerClass). One-shot per process, so
-	// declining a Service never becomes a per-reconcile status rewrite that would
-	// fight the implementation that DOES own it. Same single-goroutine ownership.
-	disclaimed map[string]bool
 	// lastRanges is each bound Service's last VALID source-range set, keyed
 	// "ns/name". An edit whose ranges do not parse keeps enforcing this set (the
-	// upstream controller keeps the LB serving while it retries). rangesErr is the
-	// last invalid-ranges message recorded as an Event per Service, so a
-	// persistent error is recorded once, not on every resync. Same
-	// single-goroutine ownership as forwarders.
+	// upstream controller keeps the LB serving while it retries).
 	lastRanges map[string]Ranges
-	rangesErr  map[string]string
-	// recorder records Warning Events on Services; set by New from the config or
-	// by Run before the reconcile loop starts.
-	recorder record.EventRecorder
+	// incarnation names this hoster's current report period: fresh at start and
+	// again whenever this node is seen turning Ready, so the decider can tell a
+	// report written by this process after a Ready transition from a stale one.
+	incarnation string
+	// reset is true once the start-of-life empty report has landed. Nothing is
+	// bound before it: a report left by a previous process must never be read
+	// as vouching for listeners this process has not opened.
+	reset bool
+	// reported is the last BoundAnnotation value written ("" before the first).
+	reported string
+	// ownReady is the last observed Ready state of this node's own Node (nil
+	// before the first observation).
+	ownReady *bool
+	// newIncarnation mints an incarnation (tests replace it).
+	newIncarnation func() string
 	// dial is the backend-dial seam handed to every forwarder; nil means a
 	// segment-clamped tcpseg.Dialer (tests inject a recording fake).
 	dial dialFunc
@@ -153,25 +151,27 @@ type Controller struct {
 	now func() time.Time
 }
 
-// New validates cfg and builds the Controller. It starts nothing; call Run.
-func New(cfg Config) (*Controller, error) {
+// NewHoster validates cfg and builds the Hoster. It starts nothing; call Reset
+// (optional) and then Run.
+func NewHoster(cfg HosterConfig) (*Hoster, error) {
 	if cfg.Client == nil {
-		return nil, errors.New("svclb: config requires a client")
+		return nil, errors.New("svclb: hoster config requires a client")
+	}
+	if cfg.NodeName == "" {
+		return nil, errors.New("svclb: hoster config requires the node name")
 	}
 	// Only VALIDITY is required: the wildcard is the production bind address, so
 	// an IsUnspecified rejection here would refuse the shipped configuration. A
 	// zero Addr stays rejected — it would reach net.Listen as "invalid AddrPort".
-	// AdvertiseAddr is deliberately NOT validated: the zero value is the honest
-	// "derivation failed" signal (bind, never advertise).
 	if !cfg.BindAddr.IsValid() {
-		return nil, fmt.Errorf("svclb: config requires a valid bind address, got %q", cfg.BindAddr)
+		return nil, fmt.Errorf("svclb: hoster config requires a valid bind address, got %q", cfg.BindAddr)
 	}
 	// Fail CLOSED on the zero value of a guard: a nil set would silently disable
 	// the reserved-port refusal, joining the VAP's Ignore failure policy and its
 	// log-and-continue provisioning in failing open. An empty (non-nil) map is the
 	// explicit opt-out.
 	if cfg.ReservedPorts == nil {
-		return nil, errors.New("svclb: config requires a ReservedPorts set (pass ports.ReservedSet(), or an explicit empty map to reserve nothing)")
+		return nil, errors.New("svclb: hoster config requires a ReservedPorts set (pass ports.ReservedSet(), or an explicit empty map to reserve nothing)")
 	}
 	log := cfg.Logger
 	if log == nil {
@@ -181,37 +181,73 @@ func New(cfg Config) (*Controller, error) {
 	if dir == nil {
 		dir = netbind.Direct{}
 	}
-	return &Controller{
-		cfg:        cfg,
-		log:        log,
-		dir:        dir,
-		forwarders: make(map[string]map[int32]*forwarder),
-		lastWarn:   make(map[string]time.Time),
-		disclaimed: make(map[string]bool),
-		lastRanges: make(map[string]Ranges),
-		rangesErr:  make(map[string]string),
-		recorder:   cfg.Recorder,
-		now:        time.Now,
-	}, nil
+	h := &Hoster{
+		cfg:            cfg,
+		log:            log,
+		dir:            dir,
+		forwarders:     make(map[string]map[int32]*forwarder),
+		lastWarn:       make(map[string]time.Time),
+		lastRanges:     make(map[string]Ranges),
+		newIncarnation: randomIncarnation,
+		now:            time.Now,
+	}
+	h.incarnation = h.newIncarnation()
+	return h, nil
 }
 
-// Run watches Services and reconciles listeners + statuses until ctx is
-// cancelled, then drains every forwarder. Reconciles are event-driven and
-// coalesced; the loop goroutine is the sole owner of the listener state.
-func (c *Controller) Run(ctx context.Context) error {
-	// ONE line carrying BOTH addresses: they differ, and every other
-	// log line in this package renders the BIND address (what a listener actually
-	// occupies). Without this line an operator reading "addr=0.0.0.0:8080" has no
-	// way to connect it to the EXTERNAL-IP kubectl shows.
-	c.log.Info("svclb: loadbalancer controller starting",
-		"bind", c.cfg.BindAddr.String(), "advertise", c.advertiseString())
-	if c.recorder == nil {
-		rec, stop := NewEventRecorder(c.cfg.Client, "k3sm-svclb")
-		defer stop()
-		c.recorder = rec
+// randomIncarnation is a fresh 64-bit hex nonce.
+func randomIncarnation() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:]) // crypto/rand.Read never returns an error
+	return hex.EncodeToString(b[:])
+}
+
+// Reset writes this hoster's start-of-life report: a fresh incarnation and NO
+// Services. It must land before anything is bound, so a report a previous
+// process left on the Node never vouches for this process's listeners. Run
+// retries it until it lands; calling it first, before the node starts
+// publishing status, puts the reset ahead of the node's Ready on a restart.
+// It must not be called concurrently with Run.
+func (h *Hoster) Reset(ctx context.Context) error {
+	value, _ := formatBound(h.incarnation, nil)
+	if err := PatchBoundReport(ctx, h.cfg.Client, h.cfg.NodeName, value); err != nil {
+		return err
 	}
-	factory := informers.NewSharedInformerFactory(c.cfg.Client, 30*time.Second)
-	inf := factory.Core().V1().Services().Informer()
+	h.reset = true
+	h.reported = value
+	h.log.Info("svclb: hoster reset its bound report", "node", h.cfg.NodeName, "incarnation", h.incarnation)
+	return nil
+}
+
+// PatchBoundReport merge-patches BoundAnnotation on the named Node to value. It
+// is the hoster's only write, made with the node's own identity on its own
+// Node: no Service write grant is needed or used.
+func PatchBoundReport(ctx context.Context, client kubernetes.Interface, node, value string) error {
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": map[string]any{BoundAnnotation: value}}})
+	if err != nil {
+		return fmt.Errorf("encode the bound report patch: %w", err)
+	}
+	if _, err := client.CoreV1().Nodes().Patch(ctx, node, types.MergePatchType, patch, metav1.PatchOptions{FieldManager: FieldManager}); err != nil {
+		return fmt.Errorf("patch %s on node %s: %w", BoundAnnotation, node, err)
+	}
+	return nil
+}
+
+// Run watches Services and this node's own Node and reconciles listeners and
+// the bound report until ctx is cancelled, then drains every forwarder.
+// Reconciles are event-driven and coalesced; the loop goroutine is the sole
+// owner of the listener state.
+func (h *Hoster) Run(ctx context.Context) error {
+	h.log.Info("svclb: loadbalancer hoster starting", "node", h.cfg.NodeName, "bind", h.cfg.BindAddr.String())
+	svcFactory := informers.NewSharedInformerFactory(h.cfg.Client, hosterResync)
+	svcInf := svcFactory.Core().V1().Services().Informer()
+	// A single-object informer on this node's own Node (a field selector on its
+	// name, which the Node authorizer lets a node watch).
+	nodeFactory := informers.NewSharedInformerFactoryWithOptions(h.cfg.Client, hosterResync,
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+			o.FieldSelector = fields.OneTermEqualSelector("metadata.name", h.cfg.NodeName).String()
+		}))
+	nodeInf := nodeFactory.Core().V1().Nodes().Informer()
 	trigger := make(chan struct{}, 1)
 	kick := func() {
 		select {
@@ -219,27 +255,49 @@ func (c *Controller) Run(ctx context.Context) error {
 		default:
 		}
 	}
-	if _, err := inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	handler := cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { kick() },
 		UpdateFunc: func(_, _ any) { kick() },
 		DeleteFunc: func(any) { kick() },
-	}); err != nil {
+	}
+	if _, err := svcInf.AddEventHandler(handler); err != nil {
 		return fmt.Errorf("svclb: add service handler: %w", err)
 	}
-	factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), inf.HasSynced) {
-		return errors.New("svclb: service informer cache sync failed")
+	if _, err := nodeInf.AddEventHandler(handler); err != nil {
+		return fmt.Errorf("svclb: add node handler: %w", err)
 	}
+	svcFactory.Start(ctx.Done())
+	nodeFactory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), svcInf.HasSynced, nodeInf.HasSynced) {
+		h.closeAll()
+		if ctx.Err() != nil {
+			return nil
+		}
+		return errors.New("svclb: hoster informer cache sync failed")
+	}
+	ticker := time.NewTicker(hosterResync)
+	defer ticker.Stop()
 	kick()
 	for {
 		select {
 		case <-ctx.Done():
-			c.closeAll()
+			h.closeAll()
 			return nil
 		case <-trigger:
-			c.reconcile(ctx, servicesFromStore(inf.GetStore()))
+		case <-ticker.C:
 		}
+		h.step(ctx, servicesFromStore(svcInf.GetStore()), ownNodeFromStore(nodeInf.GetStore(), h.cfg.NodeName))
 	}
+}
+
+// ownNodeFromStore returns this node's Node from a single-object store, or nil.
+func ownNodeFromStore(store cache.Store, name string) *corev1.Node {
+	obj, ok, err := store.GetByKey(name)
+	if err != nil || !ok {
+		return nil
+	}
+	n, _ := obj.(*corev1.Node)
+	return n
 }
 
 // servicesFromStore snapshots the informer cache's Services.
@@ -254,8 +312,45 @@ func servicesFromStore(store cache.Store) []*corev1.Service {
 	return svcs
 }
 
-// Claims reports whether this controller owns svc — the ONE ownership rule, so
-// the register row, the reconcile filter, the retraction and any dependent item
+// step is one hoster pass: rotate the incarnation if this node just turned
+// Ready, land the start-of-life reset if it has not landed yet, then reconcile.
+func (h *Hoster) step(ctx context.Context, svcs []*corev1.Service, own *corev1.Node) {
+	h.observeOwnReady(own)
+	if !h.reset {
+		if err := h.Reset(ctx); err != nil {
+			// The Node may not be registered yet on a first boot: that is the
+			// expected NotFound, retried on the next pass, and nothing is bound
+			// until it lands.
+			if apierrors.IsNotFound(err) {
+				h.log.Debug("svclb: own node not registered yet; bound report reset deferred", "node", h.cfg.NodeName)
+			} else {
+				h.throttledWarn("\x00reset", "svclb: could not reset this node's bound report; binding nothing until it lands", "node", h.cfg.NodeName, "err", err)
+			}
+			return
+		}
+	}
+	h.reconcile(ctx, svcs)
+}
+
+// observeOwnReady rotates the incarnation when this node's Ready condition goes
+// from not-True to True. The decider distrusts the incarnation a node held
+// before such a transition, so a live hoster re-vouches for its listeners with
+// a new one; a stale report left by a dead process cannot.
+func (h *Hoster) observeOwnReady(own *corev1.Node) {
+	if own == nil {
+		return
+	}
+	ready := nodeReady(own)
+	if h.ownReady != nil && !*h.ownReady && ready {
+		h.incarnation = h.newIncarnation()
+		h.reported = "" // force the next report write under the new incarnation
+		h.log.Info("svclb: node turned Ready; bound report re-issued under a new incarnation", "node", h.cfg.NodeName, "incarnation", h.incarnation)
+	}
+	h.ownReady = &ready
+}
+
+// Claims reports whether svclb owns svc — the ONE ownership rule, so the
+// register row, the reconcile filter, the retraction and any dependent item
 // cite one predicate instead of re-deriving it.
 //
 // Three conditions, and the middle one is the API's multi-implementation
@@ -287,25 +382,26 @@ func Claims(svc *corev1.Service) bool {
 	return svc.Labels[IgnoreLabel] != "true"
 }
 
-// reconcile drives the listener set + statuses to match svcs: forwarders for
-// removed/retyped Services (or changed VIPs/ports) are torn down, missing
-// listeners are bound, and each Service's status is written or cleared per the
-// bind-then-advertise honesty rule.
-func (c *Controller) reconcile(ctx context.Context, svcs []*corev1.Service) {
+// reconcile drives the listener set to match the Services stamped onto this
+// node: forwarders for removed, retyped, unstamped Services (or changed VIPs or
+// ports) are torn down, missing listeners are bound, and the bound report is
+// rewritten if the set of fully bound Services changed.
+func (h *Hoster) reconcile(ctx context.Context, svcs []*corev1.Service) {
 	desired := make(map[string]*corev1.Service)
 	for _, s := range svcs {
 		if !Claims(s) {
-			// A Service with a foreign class was possibly claimed by an earlier
-			// k3sm build; retract that stale advertisement exactly once rather
-			// than leaving an EXTERNAL-IP with no listener behind it.
-			c.retractDisclaimed(ctx, s)
+			continue
+		}
+		// An absent stamp (an older server, or a decider that has not decided
+		// yet) binds nothing; only a stamp naming this node binds.
+		if hosts, present := parseHosts(s); !present || !hosts[h.cfg.NodeName] {
 			continue
 		}
 		desired[s.Namespace+"/"+s.Name] = s
 	}
 
 	// Tear down forwarders that no longer match a desired (service, port, VIP).
-	for key, ports := range c.forwarders {
+	for key, ports := range h.forwarders {
 		want := make(map[int32]netip.AddrPort)
 		if svc := desired[key]; svc != nil {
 			if vip, err := netip.ParseAddr(svc.Spec.ClusterIP); err == nil {
@@ -323,105 +419,109 @@ func (c *Controller) reconcile(ctx context.Context, svcs []*corev1.Service) {
 			}
 		}
 		if len(ports) == 0 {
-			delete(c.forwarders, key)
+			delete(h.forwarders, key)
 		}
 	}
-	for key := range c.lastRanges {
-		if len(c.forwarders[key]) == 0 {
-			delete(c.lastRanges, key)
-		}
-	}
-	for key := range c.rangesErr {
-		if desired[key] == nil {
-			delete(c.rangesErr, key)
+	for key := range h.lastRanges {
+		if len(h.forwarders[key]) == 0 {
+			delete(h.lastRanges, key)
 		}
 	}
 
+	var entries []string
 	for key, svc := range desired {
-		c.reconcileService(ctx, key, svc)
+		if h.reconcileService(ctx, key, svc) {
+			entries = append(entries, reportEntry(svc))
+		}
 	}
+	h.report(ctx, entries)
 }
 
-// reconcileService binds the missing TCP listeners for one LoadBalancer
-// Service and settles its status: advertised ONLY when every TCP port is
-// bound; cleared otherwise (a conflict keeps the status empty with a
-// throttled Warn — never a dead address).
-func (c *Controller) reconcileService(ctx context.Context, key string, svc *corev1.Service) {
+// reconcileService binds the missing TCP listeners for one stamped
+// LoadBalancer Service and reports whether EVERY TCP port is bound — the only
+// state in which this node may be advertised for it. A conflict leaves it
+// unreported with a throttled Warn; the decider then keeps this node out of the
+// status and records an Event naming it.
+func (h *Hoster) reconcileService(ctx context.Context, key string, svc *corev1.Service) bool {
 	vip, err := netip.ParseAddr(svc.Spec.ClusterIP)
 	if err != nil {
-		c.throttledWarn(key+"\x00vip", "svclb: loadbalancer service has no dialable clusterIP; no listeners bound",
+		h.throttledWarn(key+"\x00vip", "svclb: loadbalancer service has no dialable clusterIP; no listeners bound",
 			"service", key, "clusterIP", svc.Spec.ClusterIP)
-		c.clearStatus(ctx, svc)
-		return
+		return false
 	}
 	// Source ranges are resolved on EVERY reconcile and pushed into every bound
 	// forwarder, so a live edit applies to the next accept without reopening a
 	// listener. A set that does not parse FAILS CLOSED on first provisioning (no
-	// listener, status stays <pending>); on an edit to an already-bound Service
-	// the last valid set stays in force and the listeners keep serving.
+	// listener, not reported); on an edit to an already-bound Service the last
+	// valid set stays in force and the listeners keep serving.
 	ranges, rerr := SourceRanges(svc)
 	if rerr != nil {
-		c.recordRangesInvalid(svc, key, rerr)
-		if len(c.forwarders[key]) == 0 {
-			c.clearStatus(ctx, svc)
-			return
+		h.logRangesInvalid(svc, key, rerr)
+		if len(h.forwarders[key]) == 0 {
+			return false
 		}
-		ranges = c.lastRanges[key]
+		ranges = h.lastRanges[key]
 	} else {
-		delete(c.rangesErr, key)
-		c.lastRanges[key] = ranges
+		h.lastRanges[key] = ranges
 	}
 	tcpPorts, bound := 0, 0
 	for _, p := range svc.Spec.Ports {
 		if !isTCP(p) {
 			// UDP (or SCTP) LoadBalancer is DEFERRED: the userspace splice is
-			// TCP-only today. Skipped loudly; does not gate the TCP ports' status.
-			c.throttledWarn(fmt.Sprintf("%s\x00proto:%d", key, p.Port),
+			// TCP-only today. Skipped loudly; does not gate the TCP ports' report.
+			h.throttledWarn(fmt.Sprintf("%s\x00proto:%d", key, p.Port),
 				"svclb: non-TCP loadbalancer port skipped (UDP LB deferred)",
 				"service", key, "port", p.Port, "protocol", string(p.Protocol))
 			continue
 		}
 		tcpPorts++
-		if f := c.forwarders[key][p.Port]; f != nil {
+		if f := h.forwarders[key][p.Port]; f != nil {
 			f.setRanges(ranges)
 			bound++
 			continue
 		}
-		f, err := c.bind(ctx, p.Port, netip.AddrPortFrom(vip, uint16(p.Port)), ranges)
+		f, err := h.bind(ctx, p.Port, netip.AddrPortFrom(vip, uint16(p.Port)), ranges)
 		if err != nil {
 			if errors.Is(err, errReservedPort) {
-				c.throttledWarn(fmt.Sprintf("%s\x00reserved:%d", key, p.Port),
-					"svclb: loadbalancer port is RESERVED by a k3sm wildcard listener (the NodePort range or the kubelet API port); no listener bound, status stays empty — pick a different spec.ports[].port",
-					"service", key, "port", p.Port, "bind", c.bindAddrPort(p.Port).String())
+				h.throttledWarn(fmt.Sprintf("%s\x00reserved:%d", key, p.Port),
+					"svclb: loadbalancer port is RESERVED by a k3sm wildcard listener (the NodePort range or the kubelet API port); no listener bound, this node is not advertised — pick a different spec.ports[].port",
+					"service", key, "port", p.Port, "bind", h.bindAddrPort(p.Port).String())
 				continue
 			}
-			c.throttledWarn(fmt.Sprintf("%s\x00bind:%d", key, p.Port),
-				"svclb: listener bind failed; status stays empty. Likely causes: another local process OR POD already listening on this wildcard port (darwin has no network namespaces, so pods share the node's port space); a second LoadBalancer Service declaring the same port; or a k3sm-reserved port",
-				"service", key, "addr", c.bindAddrPort(p.Port).String(),
+			h.throttledWarn(fmt.Sprintf("%s\x00bind:%d", key, p.Port),
+				"svclb: listener bind failed; this node is not advertised for the service. Likely causes: another local process OR POD already listening on this wildcard port (darwin has no network namespaces, so pods share the node's port space); a second LoadBalancer Service declaring the same port; or a k3sm-reserved port",
+				"service", key, "addr", h.bindAddrPort(p.Port).String(),
 				"diagnose", fmt.Sprintf("lsof -nP -iTCP:%d -sTCP:LISTEN", p.Port), "err", err)
 			continue
 		}
-		if c.forwarders[key] == nil {
-			c.forwarders[key] = make(map[int32]*forwarder)
+		if h.forwarders[key] == nil {
+			h.forwarders[key] = make(map[int32]*forwarder)
 		}
-		c.forwarders[key][p.Port] = f
-		c.log.Info("svclb: loadbalancer listener bound",
-			"service", key, "addr", c.bindAddrPort(p.Port).String(), "advertise", c.advertiseString(), "vip", f.dst.String())
+		h.forwarders[key][p.Port] = f
+		h.log.Info("svclb: loadbalancer listener bound",
+			"service", key, "addr", h.bindAddrPort(p.Port).String(), "vip", f.dst.String())
 		bound++
 	}
-	// A derivable advertise address is part of the "can this Service be
-	// advertised" predicate, not merely an input to it. With no derivable
-	// address there is nothing honest to publish, so the Service settles into
-	// the SAME state as an unbound one — status RETRACTED, not merely left
-	// alone. Routing to ensureStatus here and returning early inside it would
-	// mean clearStatus (and therefore Retractable) never runs, stranding a
-	// pre-existing loopback or previous-/24 entry forever. ingresshost.syncStatus
-	// makes the identical decision; Retractable is the one rule both then apply.
-	if tcpPorts > 0 && bound == tcpPorts && c.cfg.AdvertiseAddr.IsValid() {
-		c.ensureStatus(ctx, svc)
-	} else {
-		c.clearStatus(ctx, svc)
+	return tcpPorts > 0 && bound == tcpPorts
+}
+
+// report rewrites this node's bound report when the set changed. A failed write
+// is retried on the next pass (the hoster resyncs on a timer).
+func (h *Hoster) report(ctx context.Context, entries []string) {
+	value, truncated := formatBound(h.incarnation, entries)
+	if truncated {
+		h.throttledWarn("\x00truncated", "svclb: bound report exceeds the annotation cap; the services past the cap are not advertised on this node",
+			"node", h.cfg.NodeName, "services", len(entries), "cap_bytes", maxBoundBytes)
 	}
+	if value == h.reported {
+		return
+	}
+	if err := PatchBoundReport(ctx, h.cfg.Client, h.cfg.NodeName, value); err != nil {
+		h.throttledWarn("\x00report", "svclb: could not write this node's bound report; retrying", "node", h.cfg.NodeName, "err", err)
+		return
+	}
+	h.reported = value
+	h.log.Info("svclb: bound report updated", "node", h.cfg.NodeName, "incarnation", h.incarnation, "services", len(entries))
 }
 
 // bind opens one BindAddr:port listener through the single in-process binder and
@@ -434,11 +534,11 @@ func (c *Controller) reconcileService(ctx context.Context, key string, svc *core
 // NodePort-range or kubelet-API listener for the same wildcard socket would let
 // the winner be decided by start order, and losing :10250 kills logs/exec/
 // `kubectl top` on this node.
-func (c *Controller) bind(ctx context.Context, port int32, dst netip.AddrPort, ranges Ranges) (*forwarder, error) {
-	if c.cfg.ReservedPorts[port] {
+func (h *Hoster) bind(ctx context.Context, port int32, dst netip.AddrPort, ranges Ranges) (*forwarder, error) {
+	if h.cfg.ReservedPorts[port] {
 		return nil, fmt.Errorf("svclb: refusing port %d: %w", port, errReservedPort)
 	}
-	raw, err := c.dir.Listen(ctx, "tcp", c.bindAddrPort(port))
+	raw, err := h.dir.Listen(ctx, "tcp", h.bindAddrPort(port))
 	if err != nil {
 		return nil, err
 	}
@@ -447,98 +547,55 @@ func (c *Controller) bind(ctx context.Context, port int32, dst netip.AddrPort, r
 	// lo0-sized segments onto the mesh if its route moves.
 	ln := tcpseg.WrapListener(raw)
 	fctx, cancel := context.WithCancel(ctx)
-	f := &forwarder{ln: ln, dst: dst, cancel: cancel, done: make(chan struct{}), log: c.log, dial: c.dial}
+	f := &forwarder{ln: ln, dst: dst, cancel: cancel, done: make(chan struct{}), log: h.log, dial: h.dial}
 	f.setRanges(ranges)
 	go f.run(fctx)
 	return f, nil
 }
 
-// recordRangesInvalid reports a source-range parse failure: a throttled Warn
-// every time, and a Warning Event on the Service once per distinct error.
-func (c *Controller) recordRangesInvalid(svc *corev1.Service, key string, err error) {
-	bound := len(c.forwarders[key]) > 0
-	action := "no listener opened; status stays pending"
-	if bound {
+// logRangesInvalid reports a source-range parse failure with a throttled Warn.
+// The Warning Event is the decider's (it holds the server's client; a node
+// identity records no Service Events).
+func (h *Hoster) logRangesInvalid(svc *corev1.Service, key string, err error) {
+	action := "no listener opened; this node is not advertised"
+	if len(h.forwarders[key]) > 0 {
 		action = "listeners keep serving with the last valid source ranges"
 	}
-	c.throttledWarn(key+"\x00ranges", "svclb: loadbalancer source ranges invalid; "+action,
+	h.throttledWarn(key+"\x00ranges", "svclb: loadbalancer source ranges invalid; "+action,
 		"service", key, "err", err)
-	c.log.Debug("svclb: invalid source ranges, raw values", append([]any{"service", key}, SourceRangesLogArgs(svc)...)...)
-	msg := err.Error()
-	if c.rangesErr[key] == msg {
-		return
-	}
-	c.rangesErr[key] = msg
-	if c.recorder != nil {
-		c.recorder.Eventf(svc, corev1.EventTypeWarning, EventReasonSourceRangesInvalid,
-			"loadBalancerSourceRanges invalid (%s): %v", action, err)
-	}
+	h.log.Debug("svclb: invalid source ranges, raw values", append([]any{"service", key}, SourceRangesLogArgs(svc)...)...)
 }
 
 // closeAll drains every forwarder (shutdown).
-func (c *Controller) closeAll() {
-	for key, ports := range c.forwarders {
+func (h *Hoster) closeAll() {
+	for key, ports := range h.forwarders {
 		for _, f := range ports {
 			f.stop()
 		}
-		delete(c.forwarders, key)
+		delete(h.forwarders, key)
 	}
 }
 
 // throttledWarn logs msg at Warn at most once per warnInterval per key.
-func (c *Controller) throttledWarn(key, msg string, args ...any) {
-	now := c.now()
-	if last, ok := c.lastWarn[key]; ok && now.Sub(last) < warnInterval {
+func (h *Hoster) throttledWarn(key, msg string, args ...any) {
+	now := h.now()
+	if last, ok := h.lastWarn[key]; ok && now.Sub(last) < warnInterval {
 		return
 	}
-	c.lastWarn[key] = now
-	c.log.Warn(msg, args...)
+	h.lastWarn[key] = now
+	h.log.Warn(msg, args...)
 }
 
-// bindAddrPort is the AddrPort a listener for port occupies — always rendered
-// from the BIND address, never the advertised one, so a log line names the
-// socket that actually exists.
-func (c *Controller) bindAddrPort(port int32) netip.AddrPort {
-	return netip.AddrPortFrom(c.cfg.BindAddr, uint16(port))
-}
-
-// advertiseString renders the advertised address for logs, naming the derivation
-// failure explicitly rather than letting the zero Addr print as "invalid IP".
-func (c *Controller) advertiseString() string {
-	if !c.cfg.AdvertiseAddr.IsValid() {
-		return "<none: node address not derived; loadbalancer status stays empty>"
-	}
-	return c.cfg.AdvertiseAddr.String()
-}
-
-// ensureStatus advertises this node's derived address on svc's LB status
-// (idempotent). The status is EXACTLY this node's advertised address: the server
-// process is the single frontend (multi-node svclb is the named follow-up
-// alongside multi-node ingress).
-//
-// PRECONDITION, owned by the caller (reconcileService): AdvertiseAddr is valid.
-// The "is there anything honest to advertise" decision lives at exactly ONE
-// place, so a Service that cannot be advertised is routed to clearStatus rather
-// than silently short-circuiting here.
-func (c *Controller) ensureStatus(ctx context.Context, svc *corev1.Service) {
-	ip := c.cfg.AdvertiseAddr.String()
-	for _, lbi := range svc.Status.LoadBalancer.Ingress {
-		if lbi.IP == ip {
-			return
-		}
-	}
-	upd := svc.DeepCopy()
-	upd.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: ip}}
-	if _, err := c.cfg.Client.CoreV1().Services(svc.Namespace).UpdateStatus(ctx, upd, metav1.UpdateOptions{}); err != nil {
-		c.log.Warn("svclb: update loadbalancer status", "service", svc.Namespace+"/"+svc.Name, "err", err)
-	}
+// bindAddrPort is the AddrPort a listener for port occupies.
+func (h *Hoster) bindAddrPort(port int32) netip.AddrPort {
+	return netip.AddrPortFrom(h.cfg.BindAddr, uint16(port))
 }
 
 // Retractable reports whether an existing status.loadBalancer.ingress entry ip
-// must be dropped when this node cannot honestly advertise it. It is the ONE
-// retraction rule, exported so the ingress host applies exactly the same
-// predicate to Ingress and canonical LB Service statuses instead of growing a
-// second, drifting copy.
+// must be dropped when the INGRESS HOST cannot honestly advertise it. svclb no
+// longer calls it: its decider replaces the whole slice on every write, so a
+// previous life's address cannot be stranded there. The ingress host, still a
+// single server-process frontend, keeps this rule.
 //
 // An entry is retractable when it is:
 //
@@ -549,32 +606,23 @@ func (c *Controller) ensureStatus(ctx context.Context, svc *corev1.Service) {
 //   - ANY address inside podCIDR. Assemblers pass the CLUSTER pod aggregate
 //     (100.64.0.0/10), not this node's /24, because the entry that most needs
 //     retracting is a PREVIOUS derived address from before the node's /24 moved
-//     (a re-enrolled agent goes 100.64.0.0/24 → 100.64.2.0/24) — which the
+//     (a re-enrolled node goes 100.64.0.0/24 → 100.64.2.0/24) — which the
 //     current /24 does not contain, and which filtering on the advertise value
-//     alone strands forever, since ensureStatus REPLACES the slice (self-healing)
-//     but clearStatus only filters.
+//     alone strands forever.
 //
 // # What this does NOT guarantee
 //
 // It is NOT "only k3sm's own entries are touched". The third arm is a whole-range
 // test over 100.64.0.0/10, which is public RFC-6598 CGNAT space that other tools
 // allocate from — Tailscale most commonly, and k3sm's own mesh IPs live there
-// too. Any address in that range appearing in an LB status this controller owns
-// WILL be dropped, whoever wrote it. Only addresses OUTSIDE the range and outside
-// loopback (a LAN address, a public address, a hostname) are left alone.
+// too. Any address in that range appearing in a status the ingress host owns
+// WILL be dropped, whoever wrote it.
 //
-// That widening is deliberate and is sound ONLY under one invariant: svclb is the
-// SINGLE server-process frontend for the whole cluster (see the package doc), so
-// every pod-space address in an LB status it manages was written by this
-// controller or by a previous life of it. There is no second writer to collide
-// with.
-//
-// REVISIT THIS ARM when that invariant ends. Multi-node svclb — the named
-// follow-up alongside multi-node ingress — introduces per-node writers whose
-// advertised addresses all live in 100.64.0.0/10, and each would then retract the
-// others' entries on every reconcile. The fix at that point is to scope this arm
-// to the writing node's own /24 plus an explicit record of the /24s it previously
-// held, NOT to keep widening it.
+// That widening is sound ONLY while the ingress host is the single
+// server-process frontend for the Services it owns. When multi-node ingress
+// arrives, scope this arm to the writing node's own /24 plus an explicit record
+// of the /24s it previously held, or move it to a replace-the-slice writer as
+// svclb's decider did.
 func Retractable(podCIDR netip.Prefix, advertise netip.Addr, ip string) bool {
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
@@ -590,73 +638,6 @@ func Retractable(podCIDR netip.Prefix, advertise netip.Addr, ip string) bool {
 		return true
 	}
 	return false
-}
-
-// clearStatus removes this node's advertised address from svc's LB status if
-// present (the listeners are not (all) bound — never advertise a dead address).
-// It applies the shared Retractable predicate, NOT a single-value comparison.
-func (c *Controller) clearStatus(ctx context.Context, svc *corev1.Service) {
-	keep := make([]corev1.LoadBalancerIngress, 0, len(svc.Status.LoadBalancer.Ingress))
-	for _, lbi := range svc.Status.LoadBalancer.Ingress {
-		if !Retractable(c.cfg.PodCIDR, c.cfg.AdvertiseAddr, lbi.IP) {
-			keep = append(keep, lbi)
-		}
-	}
-	if len(keep) == len(svc.Status.LoadBalancer.Ingress) {
-		return
-	}
-	upd := svc.DeepCopy()
-	upd.Status.LoadBalancer.Ingress = keep
-	if _, err := c.cfg.Client.CoreV1().Services(svc.Namespace).UpdateStatus(ctx, upd, metav1.UpdateOptions{}); err != nil {
-		c.log.Warn("svclb: clear loadbalancer status", "service", svc.Namespace+"/"+svc.Name, "err", err)
-	}
-}
-
-// retractDisclaimed removes THIS controller's own advertisement from a Service
-// it no longer claims, exactly once per Service per process.
-//
-// It exists for one reachable state: a Service carrying a foreign
-// loadBalancerClass that an OLDER k3sm build claimed and advertised. The
-// apiserver cannot clean that up — it wipes LB status only on a type change, and
-// it forbids changing the class in place — so without this the filter would
-// unbind the listeners and leave the address published, turning a wrong claim
-// ("k3sm owns this") into a worse one ("k3sm serves this", with nothing
-// listening). Every generic client reads status, not the daemon log.
-//
-// It is deliberately NARROWER than Retractable, which treats the whole pod CIDR
-// as retractable. That breadth is sound only while svclb is the single LB
-// frontend — the exact invariant honouring loadBalancerClass gives up. Here the
-// Service belongs to another implementation, so only an entry equal to THIS
-// node's AdvertiseAddr may be touched; anything else is the other
-// implementation's to manage.
-func (c *Controller) retractDisclaimed(ctx context.Context, svc *corev1.Service) {
-	if svc == nil || !c.cfg.AdvertiseAddr.IsValid() {
-		return
-	}
-	key := svc.Namespace + "/" + svc.Name
-	if c.disclaimed[key] {
-		return // one-shot per process; never a per-reconcile status rewrite
-	}
-	mine := c.cfg.AdvertiseAddr.String()
-	keep := make([]corev1.LoadBalancerIngress, 0, len(svc.Status.LoadBalancer.Ingress))
-	for _, lbi := range svc.Status.LoadBalancer.Ingress {
-		if lbi.IP != mine {
-			keep = append(keep, lbi)
-		}
-	}
-	c.disclaimed[key] = true
-	if len(keep) == len(svc.Status.LoadBalancer.Ingress) {
-		return // nothing of ours to retract
-	}
-	upd := svc.DeepCopy()
-	upd.Status.LoadBalancer.Ingress = keep
-	if _, err := c.cfg.Client.CoreV1().Services(svc.Namespace).UpdateStatus(ctx, upd, metav1.UpdateOptions{}); err != nil {
-		c.log.Warn("svclb: retract advertisement for disclaimed service", "service", key, "err", err)
-		delete(c.disclaimed, key) // allow a retry on the next reconcile
-		return
-	}
-	c.log.Info("svclb: retracted stale advertisement for a service this build does not claim",
-		"service", key, "class", classOf(svc), "address", mine)
 }
 
 // classOf renders a Service's loadBalancerClass for logs ("<none>" when unset).

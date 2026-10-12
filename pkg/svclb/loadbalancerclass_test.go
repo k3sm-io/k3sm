@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 
 	"k3sm.io/k3sm/pkg/ports"
 )
@@ -47,30 +48,43 @@ func strptr(s string) *string { return &s }
 func TestLoadBalancerClassRespected(t *testing.T) {
 	ctx := context.Background()
 
-	newController := func(t *testing.T, binder *fakeBinder, objs ...*corev1.Service) (*Controller, *fake.Clientset) {
+	// newRig seeds the Services and a Ready node-a, and returns a decider
+	// (which advertises node-a at testNodeAddr) and node-a's hoster over one
+	// fake store.
+	newRig := func(t *testing.T, binder *fakeBinder, objs ...*corev1.Service) (*Decider, *Hoster, *fake.Clientset) {
 		t.Helper()
-		cs := fake.NewClientset()
+		cs := fake.NewClientset(testNodeObject(testNode, nil))
 		for _, o := range objs {
 			if _, err := cs.CoreV1().Services(o.Namespace).Create(ctx, o, metav1.CreateOptions{}); err != nil {
 				t.Fatalf("seed %s/%s: %v", o.Namespace, o.Name, err)
 			}
 		}
-		c, err := New(Config{
-			Client:        cs,
-			BindAddr:      testBindAddr,
-			AdvertiseAddr: testAdvertiseAddr,
-			PodCIDR:       testPodCIDR,
-			ReservedPorts: ports.ReservedSet(),
-			Binder:        binder,
-			Logger:        slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		d, err := NewDecider(DeciderConfig{
+			Client:   cs,
+			SelfNode: testNode,
+			SelfAddr: testNodeAddr,
+			Recorder: record.NewFakeRecorder(16),
+			Logger:   slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
 		})
 		if err != nil {
-			t.Fatalf("New: %v", err)
+			t.Fatalf("NewDecider: %v", err)
 		}
-		// Drop the seeding Creates so writeActions observes only what the
-		// controller itself issues.
+		h := newTestHoster(t, cs, testNode, binder, ports.ReservedSet(), nil)
+		// Drop the seeding writes so writeActions observes only what svclb
+		// itself issues.
 		cs.ClearActions()
-		return c, cs
+		return d, h, cs
+	}
+	// pass runs the decider, then the hoster, then the decider again over the
+	// store's current objects: one full stamp, bind, report, advertise cycle.
+	pass := func(t *testing.T, d *Decider, h *Hoster, cs *fake.Clientset) {
+		t.Helper()
+		nodes, svcs := storeSnapshot(t, cs)
+		d.reconcile(ctx, nodes, svcs)
+		_, svcs = storeSnapshot(t, cs)
+		h.reconcile(ctx, svcs)
+		nodes, svcs = storeSnapshot(t, cs)
+		d.reconcile(ctx, nodes, svcs)
 	}
 
 	// writeActions returns every mutating action the controller issued against
@@ -83,6 +97,9 @@ func TestLoadBalancerClassRespected(t *testing.T) {
 				continue
 			}
 			if a.GetResource().Resource != "services" {
+				continue
+			}
+			if p, ok := a.(k8stesting.PatchAction); ok && p.GetName() != name {
 				continue
 			}
 			if u, ok := a.(k8stesting.UpdateAction); ok {
@@ -138,12 +155,13 @@ func TestLoadBalancerClassRespected(t *testing.T) {
 	t.Run("a foreign-class Service is never bound and never written", func(t *testing.T) {
 		binder := &fakeBinder{}
 		svc := lbService("default", "foreign", "10.43.0.20", 8093)
+		delete(svc.Annotations, HostsAnnotation)
 		svc.Spec.LoadBalancerClass = strptr("metallb.universe.tf/metallb")
 		// The other implementation has already published ITS address.
-		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "192.168.7.7"}}
-		c, cs := newController(t, binder, svc)
+		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "192.0.2.7"}}
+		d, h, cs := newRig(t, binder, svc)
 
-		c.reconcile(ctx, []*corev1.Service{svc})
+		pass(t, d, h, cs)
 
 		if n := len(binder.bound); n != 0 {
 			t.Errorf("bound %d listener(s) for a Service with a foreign class; want 0", n)
@@ -151,13 +169,12 @@ func TestLoadBalancerClassRespected(t *testing.T) {
 		if acts := writeActions(cs, "foreign"); len(acts) != 0 {
 			t.Errorf("issued writes %v against a foreign-class Service; upstream never patches one", acts)
 		}
-		// And the other implementation's address must survive verbatim.
 		got, err := cs.CoreV1().Services("default").Get(ctx, "foreign", metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("get: %v", err)
 		}
-		if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP != "192.168.7.7" {
-			t.Errorf("foreign address = %+v, want it untouched at 192.168.7.7", got.Status.LoadBalancer.Ingress)
+		if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP != "192.0.2.7" {
+			t.Errorf("foreign address = %+v, want it untouched at 192.0.2.7", got.Status.LoadBalancer.Ingress)
 		}
 	})
 
@@ -165,30 +182,37 @@ func TestLoadBalancerClassRespected(t *testing.T) {
 		binder := &fakeBinder{}
 		svc := lbService("default", "was-ours", "10.43.0.21", 8094)
 		svc.Spec.LoadBalancerClass = strptr("metallb.universe.tf/metallb")
-		// An older k3sm build claimed it and published THIS node's address,
-		// alongside the real owner's. The apiserver cannot clean this up: it wipes
-		// LB status only on a type change and forbids changing the class in place.
+		// An older k3sm build claimed it, stamped it and published a k3sm node's
+		// address, alongside the real owner's. The apiserver cannot clean this up:
+		// it wipes LB status only on a type change and forbids changing the class
+		// in place.
 		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
-			{IP: testAdvertiseAddr.String()},
-			{IP: "192.168.7.7"},
+			{IP: testNodeAddr.String()},
+			{IP: "192.0.2.7"},
 		}
-		c, cs := newController(t, binder, svc)
+		d, h, cs := newRig(t, binder, svc)
 
-		c.reconcile(ctx, []*corev1.Service{svc})
+		pass(t, d, h, cs)
 
 		got, err := cs.CoreV1().Services("default").Get(ctx, "was-ours", metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("get: %v", err)
 		}
-		if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP != "192.168.7.7" {
-			t.Fatalf("after retraction status = %+v, want ONLY the other implementation's 192.168.7.7",
+		if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP != "192.0.2.7" {
+			t.Fatalf("after retraction status = %+v, want ONLY the other implementation's 192.0.2.7",
 				got.Status.LoadBalancer.Ingress)
 		}
+		if _, stamped := got.Annotations[HostsAnnotation]; stamped {
+			t.Error("the stale stamp must be removed from a Service svclb no longer claims")
+		}
+		if n := len(binder.bound); n != 0 {
+			t.Errorf("bound %d listener(s) for a disclaimed Service; want 0", n)
+		}
 
-		// One-shot: a second reconcile must not write again, or declining a
-		// Service becomes a per-reconcile status fight with its real owner.
+		// One-shot: a further pass must not write again, or declining a Service
+		// becomes a per-reconcile status fight with its real owner.
 		before := len(writeActions(cs, "was-ours"))
-		c.reconcile(ctx, []*corev1.Service{got})
+		pass(t, d, h, cs)
 		if after := len(writeActions(cs, "was-ours")); after != before {
 			t.Errorf("retraction repeated: %d writes then %d; it must be one-shot per process", before, after)
 		}
@@ -196,21 +220,21 @@ func TestLoadBalancerClassRespected(t *testing.T) {
 
 	t.Run("an unclassed Service is still claimed and advertised", func(t *testing.T) {
 		// POSITIVE CONTROL. Without it the table cannot distinguish "the class is
-		// respected" from "every Service is now ignored", which would silently
-		// disable the LoadBalancer implementation entirely.
+		// respected" from "every Service is now ignored".
 		binder := &fakeBinder{}
 		svc := lbService("default", "ours", "10.43.0.22", 8095)
-		c, cs := newController(t, binder, svc)
+		delete(svc.Annotations, HostsAnnotation)
+		d, h, cs := newRig(t, binder, svc)
 
-		c.reconcile(ctx, []*corev1.Service{svc})
+		pass(t, d, h, cs)
 
 		got, err := cs.CoreV1().Services("default").Get(ctx, "ours", metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("get: %v", err)
 		}
-		if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP != testAdvertiseAddr.String() {
+		if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP != testNodeAddr.String() {
 			t.Errorf("unclassed Service status = %+v, want the node address %s",
-				got.Status.LoadBalancer.Ingress, testAdvertiseAddr)
+				got.Status.LoadBalancer.Ingress, testNodeAddr)
 		}
 	})
 }

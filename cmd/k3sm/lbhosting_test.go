@@ -17,6 +17,8 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -26,6 +28,7 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/netbind"
 
 	"k3sm.io/k3sm/pkg/hostnet"
@@ -60,9 +63,9 @@ func gateNodeOptions() nodeOptions {
 // It owns the WIRING and the DERIVATION at the call site — the decision
 // lbHostingConfigs makes — and nothing else. The behavioural halves are
 // partitioned to the packages that can reach their unexported reconcile/status
-// writers: pkg/svclb (TestSvclbStatusHonesty's inverted single-binder and
-// reserved-port subtests, TestSvclbNewValidationAsymmetry,
-// TestSvclbDerivationFailureBindsButNeverAdvertises, TestRetractable),
+// writers: pkg/svclb (TestSvclbBindHonesty's inverted single-binder and
+// reserved-port subtests, TestSvclbNewHosterValidation, TestRetractable, and
+// TestNodePoolSelection's server-held address cases),
 // pkg/ingresshost (TestIngressHostNewValidationAsymmetry,
 // TestIngressHostDerivationFailureServesButNeverAdvertises,
 // TestIngressHostRetractsWhenNotServing), pkg/policy
@@ -73,14 +76,15 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 
 	// (a) THE BIND ADDRESS is the IPv4 wildcard literal.
 	t.Run("both listeners bind the IPv4 wildcard 0.0.0.0", func(t *testing.T) {
-		lb, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 80, 443, log)
+		_, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 80, 443, log)
 		if err != nil {
 			t.Fatalf("lbHostingConfigs: %v", err)
 		}
+		lb := lbHosterConfig(fake.NewClientset(), gateNodeOptions(), log)
 		for _, tc := range []struct {
 			what string
 			got  netip.Addr
-		}{{"svclb", lb.BindAddr}, {"ingresshost", ih.BindAddr}} {
+		}{{"svclb hoster", lb.BindAddr}, {"ingresshost", ih.BindAddr}} {
 			// String()=="0.0.0.0" AND Is4(), deliberately NOT IsUnspecified():
 			// IsUnspecified() is also true for "::", which is exactly the
 			// dual-stack [::] socket (IPV6_V6ONLY=0) the ":port" form would
@@ -101,10 +105,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 		if !opts.netMode.UsesHelper() {
 			t.Fatal("fixture must be in the helper posture or the assertion below is vacuous")
 		}
-		lb, _, err := lbHostingConfigs(fake.NewClientset(), opts, netdSocketFor(opts.netMode), 80, 443, log)
-		if err != nil {
-			t.Fatalf("lbHostingConfigs: %v", err)
-		}
+		lb := lbHosterConfig(fake.NewClientset(), opts, log)
 		// Nil means the package's in-process netbind.Direct default: ONE binder,
 		// taking every port including <1024. (The per-port behavioural proof lives
 		// in pkg/svclb's inverted "single in-process binder takes every port"
@@ -123,13 +124,16 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 			t.Fatalf("lbHostingConfigs: %v", err)
 		}
 		const want = "100.64.0.1"
-		if lb.AdvertiseAddr.String() != want {
-			t.Errorf("svclb AdvertiseAddr = %q, want the derived %q", lb.AdvertiseAddr, want)
+		if lb.SelfAddr.String() != want {
+			t.Errorf("svclb decider SelfAddr = %q, want the derived %q", lb.SelfAddr, want)
+		}
+		if lb.SelfNode != opts.nodeName {
+			t.Errorf("svclb decider SelfNode = %q, want the node's own name %q", lb.SelfNode, opts.nodeName)
 		}
 		if ih.AdvertiseAddr.String() != want {
 			t.Errorf("ingresshost AdvertiseAddr = %q, want the derived %q", ih.AdvertiseAddr, want)
 		}
-		if lb.AdvertiseAddr.IsLoopback() {
+		if lb.SelfAddr.IsLoopback() {
 			t.Error("a loopback EXTERNAL-IP is unreachable from anywhere but this Mac and must never be advertised")
 		}
 		// The two controllers cannot disagree, and neither can disagree with the
@@ -157,7 +161,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 		for _, tc := range []struct {
 			what string
 			got  netip.Addr
-		}{{"svclb", lb.AdvertiseAddr}, {"ingresshost", ih.AdvertiseAddr}} {
+		}{{"svclb decider", lb.SelfAddr}, {"ingresshost", ih.AdvertiseAddr}} {
 			if tc.got.String() != meshIP {
 				t.Errorf("%s AdvertiseAddr = %q, want the mesh IP %q", tc.what, tc.got, meshIP)
 			}
@@ -200,10 +204,10 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 				if err != nil {
 					t.Fatalf("lbHostingConfigs: %v", err)
 				}
-				if lb.AdvertiseAddr.IsValid() || ih.AdvertiseAddr.IsValid() {
-					t.Errorf("AdvertiseAddr must be the ZERO Addr on a derivation failure, got svclb=%q ingress=%q", lb.AdvertiseAddr, ih.AdvertiseAddr)
+				if lb.SelfAddr.IsValid() || ih.AdvertiseAddr.IsValid() {
+					t.Errorf("the advertise address must be the ZERO Addr on a derivation failure, got svclb=%q ingress=%q", lb.SelfAddr, ih.AdvertiseAddr)
 				}
-				if lb.BindAddr.String() != "0.0.0.0" || ih.BindAddr.String() != "0.0.0.0" {
+				if lbHosterConfig(fake.NewClientset(), tc.opts(), log).BindAddr.String() != "0.0.0.0" || ih.BindAddr.String() != "0.0.0.0" {
 					t.Error("listeners must STILL bind the wildcard on a derivation failure (the Service is <pending>, not disabled)")
 				}
 			})
@@ -213,10 +217,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 	// The reserved-port set the datapath refusal uses is the SAME single source
 	// the admission CEL and the apiserver argv derive from.
 	t.Run("the reserved-port set is single-sourced from pkg/ports", func(t *testing.T) {
-		lb, _, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 80, 443, log)
-		if err != nil {
-			t.Fatalf("lbHostingConfigs: %v", err)
-		}
+		lb := lbHosterConfig(fake.NewClientset(), gateNodeOptions(), log)
 		for _, p := range []int32{ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort} {
 			if !lb.ReservedPorts[p] {
 				t.Errorf("ReservedPorts is missing %d", p)
@@ -229,20 +230,16 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 		}
 	})
 
-	// The retraction scope is the CLUSTER pod aggregate, so a node that re-enrolls
-	// into a different /24 still retracts what its previous life advertised.
+	// The ingress host's retraction scope is the CLUSTER pod aggregate, so a node
+	// that re-enrolls into a different /24 still retracts what its previous life
+	// advertised. (svclb's decider replaces its whole status slice instead.)
 	t.Run("the retraction scope covers a previous enrollment's /24", func(t *testing.T) {
-		lb, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 80, 443, log)
+		_, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 80, 443, log)
 		if err != nil {
 			t.Fatalf("lbHostingConfigs: %v", err)
 		}
-		for _, tc := range []struct {
-			what string
-			got  netip.Prefix
-		}{{"svclb", lb.PodCIDR}, {"ingresshost", ih.PodCIDR}} {
-			if !tc.got.Contains(netip.MustParseAddr("100.64.0.1")) || !tc.got.Contains(netip.MustParseAddr("100.64.2.1")) {
-				t.Errorf("%s PodCIDR = %s, want the cluster aggregate containing both this node's /24 and a re-enrolled one", tc.what, tc.got)
-			}
+		if !ih.PodCIDR.Contains(netip.MustParseAddr("100.64.0.1")) || !ih.PodCIDR.Contains(netip.MustParseAddr("100.64.2.1")) {
+			t.Errorf("ingresshost PodCIDR = %s, want the cluster aggregate containing both this node's /24 and a re-enrolled one", ih.PodCIDR)
 		}
 	})
 
@@ -342,11 +339,11 @@ func TestIngressHostBindsThroughNetdWhenPresent(t *testing.T) {
 		{name: "netd configured + a mixed 80/8443 pair splits by port", netdSocket: socket, http: 80, https: 8443, wantSplitByPort: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			lb, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), tc.netdSocket, tc.http, tc.https, log)
+			_, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), tc.netdSocket, tc.http, tc.https, log)
 			if err != nil {
 				t.Fatalf("lbHostingConfigs: %v", err)
 			}
-			if lb.Binder != nil {
+			if lb := lbHosterConfig(fake.NewClientset(), gateNodeOptions(), log); lb.Binder != nil {
 				t.Errorf("svclb Binder = %T, want nil: the netd wildcard grant is the canonical ingress Service's alone", lb.Binder)
 			}
 			if ih.NodeName != gateNodeOptions().nodeName {
@@ -390,4 +387,54 @@ func TestIngressHostBindsThroughNetdWhenPresent(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestLBPeerAddressesFromMeshPeers pins the svclb decider's address source: a
+// node's LoadBalancer address is the mesh address in its MeshPeer record (which
+// only the server's guarded enroll path writes), never anything the node
+// reports about itself, and a record without a usable MeshIP contributes
+// nothing.
+func TestLBPeerAddressesFromMeshPeers(t *testing.T) {
+	list := func(context.Context) ([]netv1.MeshPeerSpec, error) {
+		return []netv1.MeshPeerSpec{
+			{NodeName: "node-a", MeshIP: "100.64.0.1"},
+			{NodeName: "node-b", MeshIP: "100.64.1.1"},
+			{NodeName: "node-c"},                              // no MeshIP: never advertised
+			{NodeName: "node-d", MeshIP: "127.0.0.1"},         // loopback: never advertised
+			{NodeName: "node-e", MeshIP: "not-an-ip"},         // unparsable: never advertised
+			{NodeName: "", MeshIP: "100.64.9.1"},              // no node: dropped
+			{NodeName: "node-f", MeshIP: "::ffff:100.64.5.1"}, // v4-mapped: unmapped
+		}, nil
+	}
+	got, err := lbPeerAddresses(list)(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"node-a": "100.64.0.1", "node-b": "100.64.1.1", "node-f": "100.64.5.1"}
+	if len(got) != len(want) {
+		t.Errorf("addresses = %v, want exactly %v", got, want)
+	}
+	for n, a := range want {
+		if got[n].String() != a {
+			t.Errorf("address of %s = %q, want %q", n, got[n], a)
+		}
+	}
+	if _, err := lbPeerAddresses(func(context.Context) ([]netv1.MeshPeerSpec, error) {
+		return nil, errors.New("apiserver unavailable")
+	})(context.Background()); err == nil {
+		t.Error("a failed MeshPeer list must surface as an error (the decider keeps its last good set)")
+	}
+}
+
+// TestLBHosterNeedsTheDatapath pins that a node with no datapath runs no svclb
+// hoster: the splice needs the node's Service proxy behind the ClusterIP VIP.
+func TestLBHosterNeedsTheDatapath(t *testing.T) {
+	opts := gateNodeOptions()
+	opts.netMode = hostnet.Mode{Backend: hostnet.BackendNone}
+	cs := fake.NewClientset()
+	stop := startLBHoster(context.Background(), opts, cs, slog.New(slog.DiscardHandler))
+	stop()
+	if n := len(cs.Actions()); n != 0 {
+		t.Errorf("a no-datapath node issued %d API actions for svclb, want none", n)
+	}
 }

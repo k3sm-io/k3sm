@@ -23,13 +23,18 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"k3sm.io/darwin-net/pkg/netbind"
 
 	"k3sm.io/k3sm/pkg/ports"
 )
@@ -88,19 +93,23 @@ func (b *fakeBinder) boundPorts() map[uint16]bool {
 	return out
 }
 
-// The B116 fixture addresses. BIND and ADVERTISE are deliberately DIFFERENT
-// values (and the advertised one lives inside testPodCIDR) so an assertion that
-// accidentally reads the wrong field cannot pass by coincidence.
-var (
-	testBindAddr      = netip.AddrFrom4([4]byte{}) // 0.0.0.0
-	testAdvertiseAddr = netip.MustParseAddr("100.64.2.1")
-	testPodCIDR       = netip.MustParsePrefix("100.64.0.0/10")
-)
+// The hoster fixture. testNode is the node under test; lbService stamps every
+// Service onto it so the hoster binds, and a test that needs another stamp (or
+// none) edits the annotation.
+const testNode = "node-a"
 
-// lbService builds a LoadBalancer Service with the given TCP ports.
+var testBindAddr = netip.AddrFrom4([4]byte{}) // 0.0.0.0
+
+// lbService builds a LoadBalancer Service with the given TCP ports, stamped
+// onto testNode.
 func lbService(namespace, name, clusterIP string, ports ...int32) *corev1.Service {
 	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   namespace,
+			Name:        name,
+			UID:         types.UID("uid-" + name),
+			Annotations: map[string]string{HostsAnnotation: testNode},
+		},
 		Spec: corev1.ServiceSpec{
 			Type:      corev1.ServiceTypeLoadBalancer,
 			ClusterIP: clusterIP,
@@ -112,115 +121,153 @@ func lbService(namespace, name, clusterIP string, ports ...int32) *corev1.Servic
 	return svc
 }
 
-// TestSvclbStatusHonesty pins the klipper-lite honesty rule (M10.3/B32):
-// status.loadBalancer.ingress carries the node IP ONLY once every TCP port's
-// listener is actually bound; a bind conflict leaves the status empty with a
-// throttled Warn (and clears a stale IP); the ignore-labeled canonical ingress
+// testNodeObject is a Ready Node named name.
+func testNodeObject(name string, labels map[string]string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+		}},
+	}
+}
+
+// newTestHoster builds a Hoster for node on cs (which must hold the Node) and
+// lands its start-of-life reset, the precondition for binding anything.
+func newTestHoster(t *testing.T, cs *fake.Clientset, node string, binder netbind.Binder, reserved map[int32]bool, log *slog.Logger) *Hoster {
+	t.Helper()
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	h, err := NewHoster(HosterConfig{
+		Client:        cs,
+		NodeName:      node,
+		BindAddr:      testBindAddr,
+		ReservedPorts: reserved,
+		Binder:        binder,
+		Logger:        log,
+	})
+	if err != nil {
+		t.Fatalf("NewHoster: %v", err)
+	}
+	n := 0
+	h.newIncarnation = func() string { n++; return node + "-inc-" + strconv.Itoa(n) }
+	h.incarnation = h.newIncarnation()
+	if err := h.Reset(context.Background()); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	t.Cleanup(h.closeAll)
+	return h
+}
+
+// reportOf reads node's bound report from cs.
+func reportOf(t *testing.T, cs kubernetes.Interface, node string) boundReport {
+	t.Helper()
+	n, err := cs.CoreV1().Nodes().Get(context.Background(), node, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get node %s: %v", node, err)
+	}
+	r, ok := parseBound(n.Annotations[BoundAnnotation])
+	if !ok {
+		t.Fatalf("node %s carries no parsable %s: %q", node, BoundAnnotation, n.Annotations[BoundAnnotation])
+	}
+	return r
+}
+
+// TestSvclbBindHonesty pins the klipper-lite honesty rule on the hoster side: a
+// node reports a Service bound ONLY once every TCP port's listener is actually
+// bound (the decider advertises nothing else); a bind conflict leaves it
+// unreported with a throttled Warn; the ignore-labeled canonical ingress
 // Service is skipped entirely; UDP-only Services get no listeners and no
-// status; and a resolved conflict is advertised on the next reconcile.
-func TestSvclbStatusHonesty(t *testing.T) {
+// report; and a resolved conflict is reported on the next reconcile.
+func TestSvclbBindHonesty(t *testing.T) {
 	ctx := context.Background()
 
-	newController := func(t *testing.T, binder *fakeBinder, objs ...*corev1.Service) (*Controller, *fake.Clientset, *bytes.Buffer) {
+	newHoster := func(t *testing.T, binder *fakeBinder, objs ...*corev1.Service) (*Hoster, *fake.Clientset, *bytes.Buffer) {
 		t.Helper()
-		cs := fake.NewClientset()
+		cs := fake.NewClientset(testNodeObject(testNode, nil))
 		for _, o := range objs {
 			if _, err := cs.CoreV1().Services(o.Namespace).Create(ctx, o, metav1.CreateOptions{}); err != nil {
 				t.Fatalf("seed service %s/%s: %v", o.Namespace, o.Name, err)
 			}
 		}
 		var buf bytes.Buffer
-		c, err := New(Config{
-			Client:        cs,
-			BindAddr:      testBindAddr,
-			AdvertiseAddr: testAdvertiseAddr,
-			PodCIDR:       testPodCIDR,
-			ReservedPorts: ports.ReservedSet(),
-			Binder:        binder,
-			Logger:        slog.New(slog.NewTextHandler(&buf, nil)),
-		})
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
-		return c, cs, &buf
+		h := newTestHoster(t, cs, testNode, binder, ports.ReservedSet(), slog.New(slog.NewTextHandler(&buf, nil)))
+		return h, cs, &buf
 	}
-
-	getStatus := func(t *testing.T, cs *fake.Clientset, namespace, name string) []corev1.LoadBalancerIngress {
+	reported := func(t *testing.T, cs *fake.Clientset, svc *corev1.Service) bool {
 		t.Helper()
-		svc, err := cs.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			t.Fatalf("get service %s/%s: %v", namespace, name, err)
-		}
-		return svc.Status.LoadBalancer.Ingress
+		return reportOf(t, cs, testNode).entries[reportEntry(svc)]
 	}
 
-	t.Run("status written only after the listener binds", func(t *testing.T) {
+	t.Run("reported only after the listener binds", func(t *testing.T) {
 		binder := &fakeBinder{}
 		svc := lbService("default", "web", "10.43.0.5", 8081)
-		c, cs, _ := newController(t, binder, svc)
-		defer c.closeAll()
-
-		c.reconcile(ctx, []*corev1.Service{svc})
+		h, cs, _ := newHoster(t, binder, svc)
+		if reported(t, cs, svc) {
+			t.Fatal("the reset report must list nothing")
+		}
+		h.reconcile(ctx, []*corev1.Service{svc})
 		if !binder.boundPorts()[8081] {
 			t.Fatal("the listener must be bound")
 		}
-		st := getStatus(t, cs, "default", "web")
-		if len(st) != 1 || st[0].IP != testAdvertiseAddr.String() {
-			t.Errorf("status = %+v, want the ADVERTISE address once the listener is bound", st)
+		if !reported(t, cs, svc) {
+			t.Error("the service must be reported once its listener is bound")
 		}
 	})
 
-	t.Run("bind conflict: status stays empty, stale IP cleared, throttled Warn", func(t *testing.T) {
-		binder := &fakeBinder{fail: map[uint16]error{8082: errors.New("address already in use")}}
+	t.Run("bind conflict: not reported, a previous report withdrawn, throttled Warn", func(t *testing.T) {
+		binder := &fakeBinder{}
 		svc := lbService("default", "conflicted", "10.43.0.6", 8082)
-		// A stale advertisement from a previous life must be CLEARED, not kept.
-		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: testAdvertiseAddr.String()}}
-		c, cs, buf := newController(t, binder, svc)
-		defer c.closeAll()
-
-		c.reconcile(ctx, []*corev1.Service{svc})
-		if st := getStatus(t, cs, "default", "conflicted"); len(st) != 0 {
-			t.Errorf("status = %+v, want empty on a bind conflict (never advertise a dead address)", st)
+		h, cs, buf := newHoster(t, binder, svc)
+		h.reconcile(ctx, []*corev1.Service{svc})
+		if !reported(t, cs, svc) {
+			t.Fatal("precondition: reported while bound")
+		}
+		// The listener is lost (a VIP change forces a rebind) and the port is now
+		// taken: the report must be WITHDRAWN, not kept.
+		moved := svc.DeepCopy()
+		moved.Spec.ClusterIP = "10.43.0.66"
+		binder.mu.Lock()
+		binder.fail = map[uint16]error{8082: errors.New("address already in use")}
+		binder.mu.Unlock()
+		h.reconcile(ctx, []*corev1.Service{moved})
+		if reported(t, cs, moved) {
+			t.Error("a bind conflict must leave the service unreported (never vouch for a dead listener)")
 		}
 		if !strings.Contains(buf.String(), "listener bind failed") {
 			t.Error("a bind conflict must Warn")
 		}
-		// The Warn is throttled: an immediate re-reconcile does not double-log.
 		before := strings.Count(buf.String(), "listener bind failed")
-		c.reconcile(ctx, []*corev1.Service{svc})
+		h.reconcile(ctx, []*corev1.Service{moved})
 		if after := strings.Count(buf.String(), "listener bind failed"); after != before {
 			t.Errorf("bind-conflict Warn must be throttled: count went %d -> %d", before, after)
 		}
 	})
 
-	t.Run("a resolved conflict is advertised on the next reconcile", func(t *testing.T) {
+	t.Run("a resolved conflict is reported on the next reconcile", func(t *testing.T) {
 		binder := &fakeBinder{fail: map[uint16]error{8083: errors.New("address already in use")}}
 		svc := lbService("default", "later", "10.43.0.7", 8083)
-		c, cs, _ := newController(t, binder, svc)
-		defer c.closeAll()
-
-		c.reconcile(ctx, []*corev1.Service{svc})
-		if st := getStatus(t, cs, "default", "later"); len(st) != 0 {
-			t.Fatalf("status = %+v, want empty while the port conflicts", st)
+		h, cs, _ := newHoster(t, binder, svc)
+		h.reconcile(ctx, []*corev1.Service{svc})
+		if reported(t, cs, svc) {
+			t.Fatal("must not be reported while the port conflicts")
 		}
 		binder.mu.Lock()
 		delete(binder.fail, 8083)
 		binder.mu.Unlock()
-		c.reconcile(ctx, []*corev1.Service{svc})
-		if st := getStatus(t, cs, "default", "later"); len(st) != 1 || st[0].IP != testAdvertiseAddr.String() {
-			t.Errorf("status = %+v, want the ADVERTISE address once the conflict clears", st)
+		h.reconcile(ctx, []*corev1.Service{svc})
+		if !reported(t, cs, svc) {
+			t.Error("must be reported once the conflict clears")
 		}
 	})
 
-	t.Run("partial bind of a multi-port service is not advertised", func(t *testing.T) {
+	t.Run("partial bind of a multi-port service is not reported", func(t *testing.T) {
 		binder := &fakeBinder{fail: map[uint16]error{8085: errors.New("address already in use")}}
 		svc := lbService("default", "partial", "10.43.0.8", 8084, 8085)
-		c, cs, _ := newController(t, binder, svc)
-		defer c.closeAll()
-
-		c.reconcile(ctx, []*corev1.Service{svc})
-		if st := getStatus(t, cs, "default", "partial"); len(st) != 0 {
-			t.Errorf("status = %+v, want empty until EVERY TCP port is bound", st)
+		h, cs, _ := newHoster(t, binder, svc)
+		h.reconcile(ctx, []*corev1.Service{svc})
+		if reported(t, cs, svc) {
+			t.Error("must not be reported until EVERY TCP port is bound")
 		}
 	})
 
@@ -228,37 +275,27 @@ func TestSvclbStatusHonesty(t *testing.T) {
 		binder := &fakeBinder{}
 		svc := lbService("kube-system", "k3sm-ingress", "10.43.0.9", 80, 443)
 		svc.Labels = map[string]string{IgnoreLabel: "true"}
-		c, cs, _ := newController(t, binder, svc)
-		defer c.closeAll()
-
-		c.reconcile(ctx, []*corev1.Service{svc})
+		h, cs, _ := newHoster(t, binder, svc)
+		h.reconcile(ctx, []*corev1.Service{svc})
 		if ports := binder.boundPorts(); len(ports) != 0 {
 			t.Errorf("bound ports = %v, want none (the ingress server owns these listeners)", ports)
 		}
-		if st := getStatus(t, cs, "kube-system", "k3sm-ingress"); len(st) != 0 {
-			t.Errorf("status = %+v, want untouched (ingresshost writes it, not svclb)", st)
+		if reported(t, cs, svc) {
+			t.Error("an ignore-labelled service must never be reported")
 		}
 	})
 
-	t.Run("UDP-only service: no listener, no status, deferral Warn", func(t *testing.T) {
+	t.Run("UDP-only service: no listener, no report, deferral Warn", func(t *testing.T) {
 		binder := &fakeBinder{}
-		svc := &corev1.Service{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "udp-lb"},
-			Spec: corev1.ServiceSpec{
-				Type:      corev1.ServiceTypeLoadBalancer,
-				ClusterIP: "10.43.0.10",
-				Ports:     []corev1.ServicePort{{Port: 9053, Protocol: corev1.ProtocolUDP}},
-			},
-		}
-		c, cs, buf := newController(t, binder, svc)
-		defer c.closeAll()
-
-		c.reconcile(ctx, []*corev1.Service{svc})
+		svc := lbService("default", "udp-lb", "10.43.0.10")
+		svc.Spec.Ports = []corev1.ServicePort{{Port: 9053, Protocol: corev1.ProtocolUDP}}
+		h, cs, buf := newHoster(t, binder, svc)
+		h.reconcile(ctx, []*corev1.Service{svc})
 		if ports := binder.boundPorts(); len(ports) != 0 {
 			t.Errorf("bound ports = %v, want none (UDP LB is deferred)", ports)
 		}
-		if st := getStatus(t, cs, "default", "udp-lb"); len(st) != 0 {
-			t.Errorf("status = %+v, want empty for a UDP-only service", st)
+		if reported(t, cs, svc) {
+			t.Error("a UDP-only service must not be reported")
 		}
 		if !strings.Contains(buf.String(), "UDP LB deferred") {
 			t.Error("the UDP deferral must Warn (the gap stays observable)")
@@ -266,248 +303,152 @@ func TestSvclbStatusHonesty(t *testing.T) {
 	})
 
 	// INVERTED by B116 (was "privileged port routes through the privileged
-	// binder"): the port-keyed binder selection is DELETED. Same fixture — a
-	// Service declaring both a <1024 and a >=1024 port — now asserting the ONE
-	// configured binder takes both. The <1024 half is the load-bearing one: it is
-	// what a wrong diff that only changes the ADDRESS (leaving the privileged
-	// branch live) would break, since netd refuses the wildcard.
+	// binder"): the port-keyed binder selection is DELETED. A Service declaring
+	// both a <1024 and a >=1024 port goes through the ONE configured binder, on
+	// the WILDCARD.
 	t.Run("the single in-process binder takes every port, privileged ones included", func(t *testing.T) {
 		binder := &fakeBinder{}
-		cs := fake.NewClientset()
 		svc := lbService("default", "www", "10.43.0.11", 80, 8086)
-		if _, err := cs.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
-			t.Fatal(err)
-		}
-		c, err := New(Config{
-			Client:        cs,
-			BindAddr:      testBindAddr,
-			AdvertiseAddr: testAdvertiseAddr,
-			PodCIDR:       testPodCIDR,
-			ReservedPorts: ports.ReservedSet(),
-			Binder:        binder,
-			Logger:        slog.New(slog.DiscardHandler),
-		})
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
-		defer c.closeAll()
-		c.reconcile(ctx, []*corev1.Service{svc})
+		h, _, _ := newHoster(t, binder, svc)
+		h.reconcile(ctx, []*corev1.Service{svc})
 		if !binder.boundPorts()[80] || !binder.boundPorts()[8086] {
 			t.Errorf("bound = %v, want BOTH 80 and 8086 through the one configured binder", binder.boundPorts())
 		}
-		// And every one of them on the WILDCARD, not on the advertised address.
 		binder.mu.Lock()
 		defer binder.mu.Unlock()
 		for _, ap := range binder.bound {
 			if ap.Addr() != testBindAddr {
-				t.Errorf("bound %s, want the BIND address %s (never the advertise address)", ap, testBindAddr)
+				t.Errorf("bound %s, want the BIND address %s", ap, testBindAddr)
 			}
 		}
 	})
 
-	// D2 — a k3sm-reserved port is REFUSED, not raced. This is the datapath half
-	// of the guard (the Deny VAP is the legible half, and it is failurePolicy:
-	// Ignore, so it may be absent).
-	t.Run("a reserved port is refused: no listener, empty status, warn", func(t *testing.T) {
+	// A k3sm-reserved port is REFUSED, not raced: the datapath half of the guard.
+	t.Run("a reserved port is refused: no listener, not reported, warn", func(t *testing.T) {
 		binder := &fakeBinder{}
 		svc := lbService("default", "greedy", "10.43.0.13", 10250)
-		cs := fake.NewClientset()
-		if _, err := cs.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
-			t.Fatal(err)
-		}
+		cs := fake.NewClientset(testNodeObject(testNode, nil))
 		var buf bytes.Buffer
-		c, err := New(Config{
-			Client:        cs,
-			BindAddr:      testBindAddr,
-			AdvertiseAddr: testAdvertiseAddr,
-			PodCIDR:       testPodCIDR,
-			ReservedPorts: map[int32]bool{10250: true, 30500: true},
-			Binder:        binder,
-			Logger:        slog.New(slog.NewTextHandler(&buf, nil)),
-		})
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
-		defer c.closeAll()
-		c.reconcile(ctx, []*corev1.Service{svc})
+		h := newTestHoster(t, cs, testNode, binder, map[int32]bool{10250: true, 30500: true}, slog.New(slog.NewTextHandler(&buf, nil)))
+		h.reconcile(ctx, []*corev1.Service{svc})
 		if ports := binder.boundPorts(); len(ports) != 0 {
 			t.Errorf("bound ports = %v, want NONE: a reserved port must never reach the binder", ports)
 		}
-		svcOut, err := cs.CoreV1().Services("default").Get(ctx, "greedy", metav1.GetOptions{})
+		if reportOf(t, cs, testNode).entries[reportEntry(svc)] {
+			t.Error("a refused reserved port must not be reported")
+		}
+		if !strings.Contains(buf.String(), "RESERVED") || !strings.Contains(buf.String(), "10250") {
+			t.Errorf("the refusal must Warn naming the reservation and the port; log was:\n%s", buf.String())
+		}
+	})
+
+	t.Run("an absent stamp (an older server) binds nothing", func(t *testing.T) {
+		binder := &fakeBinder{}
+		svc := lbService("default", "unstamped", "10.43.0.15", 8090)
+		delete(svc.Annotations, HostsAnnotation)
+		h, cs, _ := newHoster(t, binder, svc)
+		h.reconcile(ctx, []*corev1.Service{svc})
+		if ports := binder.boundPorts(); len(ports) != 0 {
+			t.Errorf("bound ports = %v, want none without a stamp", ports)
+		}
+		if reported(t, cs, svc) {
+			t.Error("an unstamped service must not be reported")
+		}
+	})
+
+	t.Run("a stamp naming another node binds nothing here", func(t *testing.T) {
+		binder := &fakeBinder{}
+		svc := lbService("default", "elsewhere", "10.43.0.16", 8091)
+		svc.Annotations[HostsAnnotation] = "node-b"
+		h, _, _ := newHoster(t, binder, svc)
+		h.reconcile(ctx, []*corev1.Service{svc})
+		if ports := binder.boundPorts(); len(ports) != 0 {
+			t.Errorf("bound ports = %v, want none for a service stamped onto node-b", ports)
+		}
+	})
+
+	t.Run("removed service drains its forwarders and leaves the report", func(t *testing.T) {
+		binder := &fakeBinder{}
+		svc := lbService("default", "gone", "10.43.0.12", 8087)
+		h, cs, _ := newHoster(t, binder, svc)
+		h.reconcile(ctx, []*corev1.Service{svc})
+		if len(h.forwarders) != 1 {
+			t.Fatalf("forwarders = %d, want 1", len(h.forwarders))
+		}
+		h.reconcile(ctx, nil)
+		if len(h.forwarders) != 0 {
+			t.Errorf("forwarders = %d, want 0 after the service is removed", len(h.forwarders))
+		}
+		if reported(t, cs, svc) {
+			t.Error("a removed service must leave the report")
+		}
+	})
+
+	t.Run("nothing binds before the start-of-life reset lands", func(t *testing.T) {
+		binder := &fakeBinder{}
+		svc := lbService("default", "early", "10.43.0.17", 8092)
+		// The Node is not registered yet: the reset cannot land.
+		cs := fake.NewClientset()
+		h, err := NewHoster(HosterConfig{Client: cs, NodeName: testNode, BindAddr: testBindAddr, ReservedPorts: map[int32]bool{}, Binder: binder, Logger: slog.New(slog.DiscardHandler)})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if st := svcOut.Status.LoadBalancer.Ingress; len(st) != 0 {
-			t.Errorf("status = %+v, want empty for a refused reserved port", st)
+		defer h.closeAll()
+		h.step(ctx, []*corev1.Service{svc}, nil)
+		if ports := binder.boundPorts(); len(ports) != 0 {
+			t.Fatalf("bound ports = %v before the reset landed, want none", ports)
 		}
-		if !strings.Contains(buf.String(), "RESERVED") {
-			t.Errorf("the refusal must Warn naming the reservation; log was:\n%s", buf.String())
+		if _, err := cs.CoreV1().Nodes().Create(ctx, testNodeObject(testNode, nil), metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
 		}
-		if !strings.Contains(buf.String(), "10250") {
-			t.Error("the refusal Warn must name the port")
-		}
-	})
-
-	// The stale-entry case the pre-B116 fixture could not catch: it seeded the
-	// stale IP as the node IP, which the mechanical rename would have kept green
-	// whether or not a retraction rule exists. This entry is NEITHER the bind
-	// address NOR the advertise address — it is what a PREVIOUS podCIDR derived —
-	// and it must still be dropped.
-	t.Run("a stale 127.0.0.1 entry is dropped even though it is neither the bind nor the advertise address", func(t *testing.T) {
-		binder := &fakeBinder{fail: map[uint16]error{8088: errors.New("address already in use")}}
-		svc := lbService("default", "upgraded", "10.43.0.14", 8088)
-		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
-			{IP: "127.0.0.1"},  // the pre-B116 default an upgraded cluster carries
-			{IP: "100.64.0.1"}, // a PREVIOUS enrollment's derived .1 (podCIDR moved)
-			{IP: "203.0.113.9"} /* a foreign entry: never ours, never touched */}
-		c, cs, _ := newController(t, binder, svc)
-		defer c.closeAll()
-
-		c.reconcile(ctx, []*corev1.Service{svc})
-		st := getStatus(t, cs, "default", "upgraded")
-		if len(st) != 1 || st[0].IP != "203.0.113.9" {
-			t.Errorf("status = %+v, want ONLY the foreign entry: loopback and the previous derived .1 must both be retracted, a foreign address never", st)
-		}
-	})
-
-	t.Run("removed service drains its forwarders", func(t *testing.T) {
-		binder := &fakeBinder{}
-		svc := lbService("default", "gone", "10.43.0.12", 8087)
-		c, _, _ := newController(t, binder, svc)
-		defer c.closeAll()
-
-		c.reconcile(ctx, []*corev1.Service{svc})
-		if len(c.forwarders) != 1 {
-			t.Fatalf("forwarders = %d, want 1", len(c.forwarders))
-		}
-		c.reconcile(ctx, nil)
-		if len(c.forwarders) != 0 {
-			t.Errorf("forwarders = %d, want 0 after the service is removed", len(c.forwarders))
+		h.step(ctx, []*corev1.Service{svc}, nil)
+		if !binder.boundPorts()[8092] {
+			t.Error("once the reset lands the stamped service binds")
 		}
 	})
 }
 
-// TestSvclbNewValidationAsymmetry pins the B116 construction contract, which had
-// NO test before: BindAddr must be valid but MAY be the wildcard (the production
-// choice — rejecting IsUnspecified here would refuse the shipped configuration),
-// while AdvertiseAddr may be the ZERO Addr, which is the honest "derivation
-// failed" signal rather than an error.
-func TestSvclbNewValidationAsymmetry(t *testing.T) {
+// TestSvclbNewHosterValidation pins the hoster construction contract: BindAddr
+// must be valid but MAY be the wildcard (the production choice), a client and a
+// node name are required, and a nil ReservedPorts is an error (the zero value
+// of a guard must not disable it) while an explicit empty map is the opt-out.
+func TestSvclbNewHosterValidation(t *testing.T) {
+	base := func() HosterConfig {
+		return HosterConfig{
+			Client:        fake.NewClientset(),
+			NodeName:      testNode,
+			BindAddr:      netip.AddrFrom4([4]byte{}),
+			ReservedPorts: ports.ReservedSet(),
+			Logger:        slog.New(slog.DiscardHandler),
+		}
+	}
 	tests := []struct {
-		name      string
-		bind      netip.Addr
-		advertise netip.Addr
-		wantErr   bool
+		name    string
+		mutate  func(*HosterConfig)
+		wantErr bool
 	}{
-		{"wildcard bind accepted", netip.AddrFrom4([4]byte{}), testAdvertiseAddr, false},
-		{"specific bind accepted", netip.MustParseAddr("192.168.7.20"), testAdvertiseAddr, false},
-		{"zero bind rejected", netip.Addr{}, testAdvertiseAddr, true},
-		{"zero advertise accepted (bind, never advertise)", netip.AddrFrom4([4]byte{}), netip.Addr{}, false},
+		{"wildcard bind accepted", func(*HosterConfig) {}, false},
+		{"specific bind accepted", func(c *HosterConfig) { c.BindAddr = netip.MustParseAddr("192.0.2.20") }, false},
+		{"zero bind rejected", func(c *HosterConfig) { c.BindAddr = netip.Addr{} }, true},
+		{"nil client rejected", func(c *HosterConfig) { c.Client = nil }, true},
+		{"empty node name rejected", func(c *HosterConfig) { c.NodeName = "" }, true},
+		{"nil ReservedPorts rejected", func(c *HosterConfig) { c.ReservedPorts = nil }, true},
+		{"explicit empty ReservedPorts accepted", func(c *HosterConfig) { c.ReservedPorts = map[int32]bool{} }, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := New(Config{
-				Client:        fake.NewClientset(),
-				BindAddr:      tt.bind,
-				AdvertiseAddr: tt.advertise,
-				ReservedPorts: ports.ReservedSet(),
-				Logger:        slog.New(slog.DiscardHandler),
-			})
+			cfg := base()
+			tt.mutate(&cfg)
+			_, err := NewHoster(cfg)
 			if gotErr := err != nil; gotErr != tt.wantErr {
-				t.Fatalf("New err = %v, wantErr = %v", err, tt.wantErr)
+				t.Fatalf("NewHoster err = %v, wantErr = %v", err, tt.wantErr)
 			}
 		})
 	}
-	if _, err := New(Config{BindAddr: netip.AddrFrom4([4]byte{}), ReservedPorts: ports.ReservedSet()}); err == nil {
-		t.Error("New must still reject a nil client")
-	}
-
-	// FAIL CLOSED on the zero value of a guard. The reserved-port refusal is the
-	// last of three layers that all fail OPEN (the VAP is failurePolicy: Ignore
-	// and is provisioned log-and-continue), so a nil set must be a construction
-	// ERROR, not a silent "reserve nothing". An explicit empty map is the visible
-	// opt-out.
-	if _, err := New(Config{
-		Client:   fake.NewClientset(),
-		BindAddr: netip.AddrFrom4([4]byte{}),
-		Logger:   slog.New(slog.DiscardHandler),
-	}); err == nil {
-		t.Error("New must REJECT a nil ReservedPorts: the zero value of a guard must not disable it")
-	}
-	if _, err := New(Config{
-		Client:        fake.NewClientset(),
-		BindAddr:      netip.AddrFrom4([4]byte{}),
-		ReservedPorts: map[int32]bool{},
-		Logger:        slog.New(slog.DiscardHandler),
-	}); err != nil {
-		t.Errorf("an EXPLICIT empty ReservedPorts is the sanctioned opt-out, got %v", err)
-	}
 }
 
-// TestSvclbDerivationFailureBindsButNeverAdvertises is gate assert (c) for the
-// svclb half: when the node's advertisable address could NOT be derived, the
-// listeners still bind (the Service is <pending>, not disabled) and the status
-// length is exactly ZERO.
-//
-// It asserts len == 0, deliberately NOT "!= 127.0.0.1": the zero netip.Addr
-// stringifies to "invalid IP", so a controller that published it would satisfy
-// the negative check while advertising an EXTERNAL-IP worse than loopback.
-//
-// The Service is seeded with a STALE entry, not an empty status. An empty seed
-// cannot distinguish "retracted" from "never written", which is exactly how the
-// original version of this code shipped a gap: a fully-bound Service with an
-// underivable advertise address was routed to ensureStatus, which returned early
-// — so clearStatus (and therefore Retractable) never ran and a pre-existing
-// loopback or previous-/24 entry survived forever.
-func TestSvclbDerivationFailureBindsButNeverAdvertises(t *testing.T) {
-	ctx := context.Background()
-	binder := &fakeBinder{}
-	svc := lbService("default", "pending", "10.43.0.15", 8090)
-	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
-		{IP: "127.0.0.1"},   // a pre-B116 entry an upgraded cluster carries
-		{IP: "100.64.0.1"},  // a previous enrollment's derived .1
-		{IP: "203.0.113.9"}, // foreign: outside the pod space and not loopback
-	}
-	cs := fake.NewClientset()
-	if _, err := cs.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	c, err := New(Config{
-		Client:        cs,
-		BindAddr:      testBindAddr,
-		AdvertiseAddr: netip.Addr{}, // the derivation failed
-		PodCIDR:       testPodCIDR,
-		ReservedPorts: ports.ReservedSet(),
-		Binder:        binder,
-		Logger:        slog.New(slog.DiscardHandler),
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer c.closeAll()
-
-	c.reconcile(ctx, []*corev1.Service{svc})
-	if !binder.boundPorts()[8090] {
-		t.Error("listeners must STILL bind when the advertise address is undecidable (the Service is <pending>, not disabled)")
-	}
-	out, err := cs.CoreV1().Services("default").Get(ctx, "pending", metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, lbi := range out.Status.LoadBalancer.Ingress {
-		if lbi.IP == "invalid IP" || lbi.IP == "" {
-			t.Errorf("status carries %q — the zero netip.Addr must never be published", lbi.IP)
-		}
-	}
-	// The retraction MUST have run: a fully-bound Service with no advertisable
-	// address settles into the same state as an unbound one.
-	if len(out.Status.LoadBalancer.Ingress) != 1 || out.Status.LoadBalancer.Ingress[0].IP != "203.0.113.9" {
-		t.Errorf("status = %+v, want ONLY the foreign entry: the stale loopback and previous-/24 entries must be RETRACTED, not merely left unwritten", out.Status.LoadBalancer.Ingress)
-	}
-}
-
-// TestRetractable pins the ONE retraction rule both svclb and ingresshost apply.
-// A single-value comparison against the current advertise address strands both a
+// TestRetractable pins the retraction rule the ingress host applies (svclb's
+// decider replaces the whole slice instead). A single-value comparison against the current advertise address strands both a
 // pre-B116 loopback entry and a previous enrollment's derived .1.
 func TestRetractable(t *testing.T) {
 	podCIDR := netip.MustParsePrefix("100.64.0.0/10")

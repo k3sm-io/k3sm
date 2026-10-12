@@ -14,43 +14,88 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package svclb is k3sm's klipper-lite LoadBalancer implementation: a
-// server-side controller that, for every Service of type
-// LoadBalancer, binds BindAddr:servicePort listeners and splices each accepted
-// connection to the Service's ClusterIP VIP (a plain two-way TCP forward —
-// the L4 Service proxy behind the VIP keeps EndpointSlice tracking, affinity,
-// and mesh-egress discipline). It is DISTINCT from pkg/loadbalancer, the
-// client-side HA apiserver LB.
+// Package svclb is k3sm's klipper-lite LoadBalancer implementation, in two
+// roles. It is DISTINCT from pkg/loadbalancer, the client-side HA apiserver LB.
 //
-// # Bind and advertise are different addresses
+// # Two roles
 //
-// Listeners bind the WILDCARD (0.0.0.0) — every interface answers, matching
-// Docker Desktop's vpnkit and k3s' klipper-lb — while status advertises the
-// node's derived globally-unicast InternalIP. On Darwin a wildcard bind needs
-// NO privilege at any port (it is the SPECIFIC-address privileged bind that
-// returns EACCES — inverted from Linux), so there is ONE in-process binder and
-// the root netd helper is off the LoadBalancer datapath entirely.
+// The Decider runs in the server process on the admin client. For every
+// claimed LoadBalancer Service (Claims) it selects the hosting nodes
+// (selectHosts: the svclb.k3sm.io node-pool labels, k3s' nodePoolAffinity over
+// k3sm-owned keys), stamps them on the Service (HostsAnnotation), and writes
+// the Service's whole status.loadBalancer.ingress (computeIngress). It is the
+// ONLY writer of both.
 //
-// Two consequences the assembler and the operator docs own, not this package:
-// pods share the node's port space (darwin has no network namespaces), so a
-// wildcard LB listener can collide with a pod's own listen(); and the advertised
-// address is reachable over lo0 and the mesh only, while the listener answers on
-// every LAN interface.
+// A Hoster runs in every node process (each joined worker and the server's
+// own node) on that node's own system:node identity. It binds
+// BindAddr:servicePort for each Service whose stamp names it and splices every
+// accepted connection to the Service's ClusterIP VIP (a plain two-way TCP
+// forward; the node's L4 Service proxy behind the VIP keeps EndpointSlice
+// tracking, affinity, and mesh-egress discipline). It writes no Service. It
+// reports the Services whose every TCP port it holds on its OWN Node
+// (BoundAnnotation), a self-write the Node authorizer and NodeRestriction
+// already admit, so the split adds no RBAC.
 //
 // # Status honesty
 //
-// status.loadBalancer.ingress = [{ip: AdvertiseAddr}] is written ONLY once every
-// TCP port's listener is actually bound — never advertise a dead address. An
-// un-bindable port (conflict, or a k3sm-RESERVED port this controller refuses
-// outright) leaves the status empty with a throttled Warn; a Service that loses
-// its listeners has this node's entry retracted (see Retractable). A zero
-// AdvertiseAddr means the node address could not be derived: listeners still
-// bind, and NO status is ever written. UDP
-// LoadBalancer ports are DEFERRED (the userspace splice is TCP-only today):
-// they are skipped with a throttled Warn and do not gate the TCP ports'
-// status. Services carrying IgnoreLabel (the canonical kube-system/
-// k3sm-ingress, whose listeners the in-process ingress Server owns) are
-// skipped entirely.
+// The status lists a node only when the node is in the stamp, is Ready, and
+// its trusted report names this incarnation (uid) of the Service: never
+// advertise a dead address. The decider REPLACES the whole slice on every
+// write and recomputes it on every resync, so a node leaving a pool loses only
+// its own entry, a lost write is repaired, and a previous life's address is
+// never stranded. An empty result is the honest pending state, with a
+// NoEligibleNodes Event when no node qualifies and a HostNotBound Event naming
+// a Ready stamped node that has not bound every port (a port taken by a pod or
+// another Service, a k3sm-RESERVED port the hoster refuses outright, or invalid
+// source ranges). UDP LoadBalancer ports are DEFERRED (the userspace splice is
+// TCP-only today): they are skipped with a throttled Warn and do not gate the
+// TCP ports. Services carrying IgnoreLabel (the canonical
+// kube-system/k3sm-ingress, whose listeners the in-process ingress Server owns)
+// are skipped entirely.
+//
+// Report trust: a hoster writes a fresh incarnation with no Services at start,
+// before binding anything, and re-issues its report under a new incarnation
+// when it sees its own node turn Ready. The decider ignores a report whose
+// incarnation the node already held before turning Ready, until it changes or
+// for at most the hold-down, so a report left by a dead process does not
+// vouch for a restarted one. A newly started decider also defers status
+// changes for a Service for the hold-down unless every stamped host reports
+// it, so a server restart does not retract every LoadBalancer in the cluster.
+//
+// # Addresses
+//
+// Listeners bind the WILDCARD (0.0.0.0): every interface answers, matching
+// Docker Desktop's vpnkit and k3s' klipper-lb. On Darwin a wildcard bind needs
+// NO privilege at any port (it is the SPECIFIC-address privileged bind that
+// returns EACCES, inverted from Linux), so there is ONE in-process binder and
+// the root netd helper is off the LoadBalancer datapath entirely.
+//
+// The status publishes SERVER-HELD addresses only: each node's mesh address
+// from its MeshPeer record (written only through the server's guarded enroll
+// path), and the server's own derived address for its own node. Never
+// Node.status.addresses, which the node writes itself. A node with no
+// server-held address is never selected.
+//
+// Two consequences the assembler and the operator docs own: pods share the
+// node's port space (darwin has no network namespaces), so a wildcard LB
+// listener can collide with a pod's own listen(); and the advertised address
+// is reachable over lo0 and the mesh only, while the listener answers on every
+// LAN interface.
+//
+// # Trust posture
+//
+// The pool and allow-list labels live on Node objects, and NodeRestriction lets
+// a node edit non-kubernetes.io labels on itself. A compromised node can
+// therefore label itself into a pool and attract that pool's traffic, the same
+// posture as k3s ServiceLB. Allow-list mode triggers only on the value "true",
+// so a node cannot starve the others by labelling itself "false". A node's
+// report can only narrow the decider's choice: it never adds the node to a
+// stamp or puts an address it chose into a status.
+//
+// # externalTrafficPolicy: Local
+//
+// Not narrowed: every host splices to the ClusterIP, so a Local Service is
+// hosted like a Cluster one and the client source address is lost.
 //
 // # Source ranges
 //
@@ -59,11 +104,8 @@ limitations under the License.
 // nodePorts, as an accept-time close of a denied peer BEFORE the backend dial.
 // SourceRanges is the one home of the rule; the ingress host applies the same
 // rule to the canonical Service it owns. A set that does not parse fails closed
-// on first provisioning (no listener, status stays pending, a
-// SourceRangesInvalid Warning Event); on an edit the last valid set stays in
-// force and the listeners keep serving.
-//
-// The Events are written with the server process's client. The node-datapath
-// ClusterRole grants no events verb, which matters only if svclb or the
-// ingress host ever run under a node identity (the multi-node follow-up).
+// on first provisioning (no listener, the node is not reported); on an edit the
+// last valid set stays in force and the listeners keep serving. The
+// SourceRangesInvalid Warning Event is the decider's, written with the server
+// process's client: a node identity records no Service Events.
 package svclb
