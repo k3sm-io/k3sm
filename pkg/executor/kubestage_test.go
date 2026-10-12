@@ -328,6 +328,7 @@ func TestEnsureControlPlaneBinariesReportsStagedVersion(t *testing.T) {
 	t.Run("stale marker, gh present: dev fallback re-stages the set", func(t *testing.T) {
 		fakeTool(t, "gh")
 		calls := fakeDownload(t, "downloaded")
+		pinFakeDigests(t, DefaultKubeVersion, "downloaded")
 		work := t.TempDir()
 		stageCPSet(t, binDir(work), "old", staleKubeVersion)
 		if err := ensureControlPlaneBinaries(t.Context(), discardLogger(), work, DefaultKubeVersion); err != nil {
@@ -460,10 +461,11 @@ func TestSeedBinDirRefusesOverMalformedControlPlaneMarker(t *testing.T) {
 func TestRestageFromReleaseReportsATornSet(t *testing.T) {
 	fakeTool(t, "gh")
 	fakeDownload(t, "downloaded")
+	pinFakeDigests(t, DefaultKubeVersion, "downloaded")
 	work := t.TempDir()
 	stageCPSet(t, binDir(work), "old", staleKubeVersion)
-	// kubectl is renamed last; a non-empty directory in its place makes that rename fail
-	// after the other three have landed.
+	// kubectl is renamed third (kube-apiserver goes last); a non-empty directory in its
+	// place makes that rename fail after two others have landed.
 	kubectl := filepath.Join(binDir(work), "kubectl")
 	if err := os.Remove(kubectl); err != nil {
 		t.Fatal(err)
@@ -484,5 +486,8 @@ func TestRestageFromReleaseReportsATornSet(t *testing.T) {
 	}
 	if _, err := os.Stat(kubeMarkerPath(binDir(work))); !os.IsNotExist(err) {
 		t.Error("a torn set carries a version marker")
+	}
+	if got, _ := os.ReadFile(filepath.Join(binDir(work), "kube-apiserver")); string(got) != "old:kube-apiserver" {
+		t.Errorf("kube-apiserver = %q, want the old one: it must be renamed last", got)
 	}
 }
