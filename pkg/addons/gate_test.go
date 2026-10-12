@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -258,4 +259,133 @@ func afterGuardRead(t *testing.T, actions []k8stesting.Action) []k8stesting.Acti
 		t.Fatalf("first action = %v, want a Get of apiservices/v1beta1.metrics.k8s.io", actions[0])
 	}
 	return actions[1:]
+}
+
+// TestMetricsServerAddonRegate is the gate on the post-start re-evaluation. The
+// ticks channel is the fake clock: it is pre-filled and closed, so Regate
+// returns after the last tick and every assertion reads a finished run. The
+// posture is a script, one entry per tick, standing in for the server's node
+// reads.
+func TestMetricsServerAddonRegate(t *testing.T) {
+	var (
+		undecided = Posture{ClusterCAKubeletServing: true, Undecided: "no Node is registered yet"}
+		noVMNode  = Posture{ClusterCAKubeletServing: true} // positive: Nodes exist, none labelled
+		vmNode    = servingPosture
+	)
+	ownedSeed := func(t *testing.T) []*unstructured.Unstructured {
+		t.Helper()
+		objs, errs := (&Reconciler{fsys: FS()}).load()
+		if len(errs) != 0 {
+			t.Fatalf("load: %v", errs)
+		}
+		var seed []*unstructured.Unstructured
+		for _, o := range objs {
+			live := o.DeepCopy()
+			live.SetManagedFields([]metav1.ManagedFieldsEntry{{Manager: FieldManager, Operation: metav1.ManagedFieldsOperationApply}})
+			seed = append(seed, live)
+		}
+		return seed
+	}
+	// run converges at start under startPosture, then regates over len(ticks)
+	// ticks with the scripted postures, and returns the regate's actions, how
+	// many times it read the posture, and its log.
+	run := func(t *testing.T, startPosture Posture, script []Posture, ticks int, seed ...*unstructured.Unstructured) ([]k8stesting.Action, int, string) {
+		t.Helper()
+		dc := newFakeDynamic(t, seed...)
+		var logs bytes.Buffer
+		r := New(FS(), dc, metricsServerMapper()).WithPosture(startPosture)
+		r.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		if err := r.Converge(context.Background()); err != nil {
+			t.Fatalf("converge: %v", err)
+		}
+		dc.ClearActions()
+		reads := 0
+		posture := func(context.Context) Posture {
+			p := script[min(reads, len(script)-1)]
+			reads++
+			return p
+		}
+		ch := make(chan time.Time, ticks)
+		for i := 0; i < ticks; i++ {
+			ch <- time.Unix(int64(i)*int64(RegateInterval/time.Second), 0)
+		}
+		close(ch)
+		r.Regate(context.Background(), posture, ch)
+		return dc.Actions(), reads, logs.String()
+	}
+	count := func(actions []k8stesting.Action, verb string) int {
+		n := 0
+		for _, a := range actions {
+			if a.GetVerb() == verb {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("a labelled node appearing after start is applied on the next tick", func(t *testing.T) {
+		actions, reads, logs := run(t, undecided, []Posture{noVMNode, vmNode}, 3)
+		if got := count(actions, "patch"); got != len(wantMetricsServerObjects) {
+			t.Errorf("%d applies, want %d on the tick that saw the labelled node", got, len(wantMetricsServerObjects))
+		}
+		if got := count(actions, "delete"); got != 0 {
+			t.Errorf("%d deletes; one positive read must not withdraw", got)
+		}
+		if reads != 2 {
+			t.Errorf("posture read %d times, want 2: the loop is done once the file is applied", reads)
+		}
+		if !strings.Contains(logs, "embedded add-on applied after re-evaluation") {
+			t.Errorf("no applied line:\n%s", logs)
+		}
+	})
+
+	t.Run("a file applied at start leaves the loop a no-op", func(t *testing.T) {
+		actions, reads, _ := run(t, vmNode, []Posture{noVMNode}, 3)
+		if len(actions) != 0 || reads != 0 {
+			t.Errorf("regate issued %d actions and %d posture reads after a full start-up apply, want none", len(actions), reads)
+		}
+	})
+
+	t.Run("a single stale read between undecided ones never withdraws", func(t *testing.T) {
+		actions, _, _ := run(t, undecided, []Posture{noVMNode, undecided, noVMNode, undecided}, 4, ownedSeed(t)...)
+		if got := count(actions, "delete"); got != 0 {
+			t.Errorf("%d deletes; non-consecutive positive reads must not withdraw", got)
+		}
+	})
+
+	t.Run("two consecutive positive reads withdraw, once per process", func(t *testing.T) {
+		actions, _, logs := run(t, undecided, []Posture{noVMNode}, 5, ownedSeed(t)...)
+		if got := count(actions, "delete"); got != len(wantMetricsServerObjects) {
+			t.Fatalf("%d deletes, want %d (one withdrawal)", got, len(wantMetricsServerObjects))
+		}
+		if first := actions[0]; first.GetVerb() != "get" {
+			t.Errorf("first regate action %v, want the guard read", first)
+		}
+		// Tick 1: guard read only (one positive read). Tick 2: guard read plus a
+		// Get per object to withdraw. Ticks 3 to 5: guard read only, because the
+		// withdrawal is spent for this process.
+		if got, want := count(actions, "get"), 1+(1+len(wantMetricsServerObjects))+3; got != want {
+			t.Errorf("%d gets, want %d: a second withdrawal was attempted", got, want)
+		}
+		if n := strings.Count(logs, "withdrawn=9"); n != 1 {
+			t.Errorf("%d withdrawal lines, want 1:\n%s", n, logs)
+		}
+	})
+
+	t.Run("it honours ctx", func(t *testing.T) {
+		r := New(FS(), newFakeDynamic(t), metricsServerMapper()).WithPosture(undecided)
+		r.logger = slog.New(slog.DiscardHandler)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			r.Regate(ctx, func(context.Context) Posture { return vmNode }, make(chan time.Time))
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("Regate did not return on a cancelled ctx")
+		}
+	})
 }

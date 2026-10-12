@@ -55,9 +55,10 @@ import (
 // noStop is the stop func of a phase that started nothing.
 func noStop() {}
 
-// provisionServerCluster is steps 3–3c: the cluster-scoped admission policies +
-// the vm RuntimeClass, the fail-closed RBAC graph, and the embedded add-ons.
-func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) error {
+// provisionServerCluster is steps 3–3b: the cluster-scoped admission policies +
+// the vm RuntimeClass, and the fail-closed RBAC graph. Step 3c, the embedded
+// add-ons, is startEmbeddedAddons.
+func provisionServerCluster(ctx context.Context, plan serverPlan, cs kubernetes.Interface, logger *slog.Logger) error {
 	opts := plan.opts
 	// 3. Provision the cluster-scoped admission policies + the vm RuntimeClass.
 	// Extracted so the SET is testable against a fake clientset: what this
@@ -79,27 +80,60 @@ func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.
 		return fmt.Errorf("provision rbac graph: %w", err)
 	}
 	logger.Info("provisioned RBAC graph (node-datapath + in-pod reader + registry-advertisement reader); authorizer is Node,RBAC")
+	return nil
+}
 
-	// 3c. SSA-converge the EMBEDDED add-on manifest set. The manifests are
-	// compiled into this binary (embed.FS), never read from disk: the work dir is
-	// writable by every pod (all pods share the _k3sm uid and it is outside runtimed's
-	// sandbox-protected prefixes) and this client is the system:masters admin, so a
-	// directory ingress would hand cluster-admin to every pod on the node. See
-	// pkg/addons/doc.go. Runs AFTER the fail-closed RBAC graph so a slow or failing
-	// add-on can never delay it. It never lists; its only delete withdraws, by name,
-	// an add-on it applied earlier that can no longer serve here. Log-and-continue like the sibling boot provisioners, by the
-	// repo's one rule for a fault on this process: UNSURVIVABLE faults exit (a dead
-	// control-plane child does, and the crash-loop breaker bounds the respawns);
-	// SURVIVABLE ones continue, and a manifest that will not apply is survivable —
-	// the control plane is up without it. The shipped set is metrics-server
-	// (pkg/addons/manifests/metrics-server.yaml), applied only where it can serve
-	// (addonPosture); elsewhere it is withdrawn and the reason logged.
-	if ar, err := addons.NewFromConfig(addons.FS(), restCfg, addonPosture(ctx, plan, cs.CoreV1().Nodes())); err != nil {
+// startEmbeddedAddons is step 3c: converge the embedded add-on set, then start
+// the re-evaluation of its gated add-ons. It runs right after provisionServerCluster.
+//
+// SSA-converge the EMBEDDED add-on manifest set. The manifests are
+// compiled into this binary (embed.FS), never read from disk: the work dir is
+// writable by every pod (all pods share the _k3sm uid and it is outside runtimed's
+// sandbox-protected prefixes) and this client is the system:masters admin, so a
+// directory ingress would hand cluster-admin to every pod on the node. See
+// pkg/addons/doc.go. Runs AFTER the fail-closed RBAC graph so a slow or failing
+// add-on can never delay it. The reconciler never lists; its only delete withdraws,
+// by name, an add-on it applied earlier that can no longer serve here.
+// Log-and-continue like the sibling boot provisioners, by the repo's one rule for a
+// fault on this process: UNSURVIVABLE faults exit (a dead control-plane child does,
+// and the crash-loop breaker bounds the respawns); SURVIVABLE ones continue, and a
+// manifest that will not apply is survivable: the control plane is up without it.
+// The shipped set is metrics-server (pkg/addons/manifests/metrics-server.yaml),
+// applied only where it can serve (addonPosture).
+//
+// A fresh multi-node cluster has no Node when this first runs, so the gate is
+// undecided then. On the mesh serving posture the gated add-ons are therefore
+// re-evaluated every addons.RegateInterval for the life of the process (Regate),
+// so metrics-server lands once a vm-capable node registers, with no restart. On a
+// single-node server the kubelet-CA fact can never change in-process, so no loop is
+// started. The returned stop cancels the loop and waits for it; runServer defers it
+// so LIFO drains it before the control plane stops. It is never nil.
+func startEmbeddedAddons(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
+	nodes := cs.CoreV1().Nodes()
+	posture := addonPosture(ctx, plan, nodes)
+	ar, err := addons.NewFromConfig(addons.FS(), restCfg, posture)
+	if err != nil {
 		logger.Error("build embedded add-on reconciler", "err", err)
-	} else if err := ar.Converge(ctx); err != nil {
+		return noStop
+	}
+	if err := ar.Converge(ctx); err != nil {
 		logger.Error("converge embedded add-on manifests", "err", err)
 	}
-	return nil
+	if !posture.ClusterCAKubeletServing {
+		return noStop
+	}
+	rgCtx, rgCancel := context.WithCancel(ctx)
+	ticker := time.NewTicker(addons.RegateInterval)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ticker.Stop()
+		ar.Regate(rgCtx, func(c context.Context) addons.Posture { return addonPosture(c, plan, nodes) }, ticker.C)
+	}()
+	return func() {
+		rgCancel()
+		<-done
+	}
 }
 
 // startHelmController launches the HelmChart controller (the k3s
@@ -684,14 +718,15 @@ func repairServerNodeLabels(ctx context.Context, cs kubernetes.Interface, nodeNa
 // RuntimeClass selects on (runtimeclass.LabelVirtualization=LabelTrue, as
 // applyVirtualizationLabel sets it), so every server of an HA pair computes the
 // same answer, and a server without vm does not withdraw an add-on running on a
-// vm-capable worker. It is read once, at this start: a node gaining or losing
-// the label takes effect at the next server start. A read failure leaves the
-// gated add-ons untouched (Posture.Undecided) rather than withdrawing them.
+// vm-capable worker. VMNode false is set only on POSITIVE evidence: a second read
+// shows at least one Node, and the first showed none labelled. A failed read, or
+// a cluster with no Node at all (a stale LIST, or a fresh cluster before any node
+// registers), is Posture.Undecided, which neither applies nor withdraws.
 func addonPosture(ctx context.Context, plan serverPlan, nodes nodeLister) addons.Posture {
 	p := addons.Posture{
 		ClusterCAKubeletServing: plan.opts.meshIP != "" && plan.cfg.ServingCertFile != "" && plan.cfg.ServingKeyFile != "",
 	}
-	list, err := nodes.List(ctx, metav1.ListOptions{
+	labelled, err := nodes.List(ctx, metav1.ListOptions{
 		LabelSelector: runtimeclass.LabelVirtualization + "=" + runtimeclass.LabelTrue,
 		Limit:         1,
 	})
@@ -699,7 +734,17 @@ func addonPosture(ctx context.Context, plan serverPlan, nodes nodeLister) addons
 		p.Undecided = fmt.Sprintf("list nodes labelled %s: %v", runtimeclass.LabelVirtualization, err)
 		return p
 	}
-	p.VMNode = len(list.Items) > 0
+	if len(labelled.Items) > 0 {
+		p.VMNode = true
+		return p
+	}
+	registered, err := nodes.List(ctx, metav1.ListOptions{Limit: 1})
+	switch {
+	case err != nil:
+		p.Undecided = fmt.Sprintf("list nodes: %v", err)
+	case len(registered.Items) == 0:
+		p.Undecided = "no Node is registered yet"
+	}
 	return p
 }
 

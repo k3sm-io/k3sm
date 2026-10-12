@@ -67,6 +67,9 @@ func TestServerPhaseStopsAreNeverNil(t *testing.T) {
 		{"join supervisor disabled (no mesh enroller)", func() func() {
 			return startJoinSupervisor(ctx, serverPlan{}, nil, serverMesh{}, logger)
 		}},
+		{"embedded add-on reconciler failed to build its clients", func() func() {
+			return startEmbeddedAddons(ctx, serverPlan{}, badREST, fake.NewSimpleClientset(), logger)
+		}},
 		{"mlx operator failed to build its clients", func() func() {
 			gpu, stop := startMLXOperator(ctx, serverPlan{}, badREST, nil, logger)
 			if gpu == nil {
@@ -89,7 +92,8 @@ func TestServerPhaseStopsAreNeverNil(t *testing.T) {
 // CA fact is inferred from the mesh-provisioned cluster-CA serving pair (a mesh IP
 // AND that pair); the vm fact is a CLUSTER fact, any Node carrying the vm
 // RuntimeClass label, so a vm-labelled worker counts even when the server itself
-// cannot host guests; and a failed node read is Undecided, never "no vm node".
+// cannot host guests; and a failed node read, or a read showing no Node at all, is
+// Undecided, never "no vm node": only positive evidence may lead to a withdrawal.
 func TestAddonPosture(t *testing.T) {
 	mesh := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
 	mesh.cfg.ServingCertFile, mesh.cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
@@ -115,6 +119,7 @@ func TestAddonPosture(t *testing.T) {
 		{"single-node with a vm-labelled node", serverPlan{}, []runtime.Object{vmWorker}, nil, false, true, false},
 		{"mesh ip but no cluster-CA serving pair", noPair, []runtime.Object{vmWorker}, nil, false, true, false},
 		{"node read fails", mesh, nil, errors.New("connection refused"), true, false, true},
+		{"no Node registered yet is undecided, not 'no vm node'", mesh, nil, nil, true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := fake.NewSimpleClientset(tc.nodes...)

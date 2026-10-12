@@ -120,11 +120,13 @@ limitations under the License.
 //
 // # Converge-only: this reconciler never prunes
 //
-// It converges with one verb, server-side apply (an apply-type PATCH). It never LISTs,
-// and it never prunes. Its one delete is the withdrawal of a gated add-on (§ Gated
-// add-ons), which is the safe shape described below: objects named by the embedded
-// manifest, resolved by Get-by-name, deleted only when managedFields record k3sm's own
-// apply, with a UID precondition.
+// It converges with one verb, server-side apply (an apply-type PATCH), at start and,
+// for the gated add-ons only, on Regate's ticks. It never LISTs (the Node read behind
+// the gate's posture is the server's, in cmd/k3sm, and can only ever decide nothing
+// or a gated withdrawal on positive evidence), and it never prunes. Its one delete is
+// the withdrawal of a gated add-on (§ Gated add-ons), which is the safe shape described
+// below: objects named by the embedded manifest, resolved by Get-by-name, deleted only
+// when managedFields record k3sm's own apply, with a UID precondition.
 //
 // Both halves are deliberate. A prune keyed on the k3sm.io/managed label would be
 // catastrophic — that label is stamped by seven other packages, so a label-selector
@@ -155,14 +157,15 @@ limitations under the License.
 //     applied (so a forced apply never adopts the operator's objects) and nothing is
 //     withdrawn (so no later posture change can delete them). A failed read also
 //     leaves the file untouched.
-//   - Undecided posture. If the server could not read the facts below, the file is
-//     left untouched rather than withdrawn on a transient failure.
-//   - Requirement. If it fails, the file is skipped and any of its objects k3sm applied
-//     earlier are withdrawn, the APIService first, because an APIService with no
-//     serving backend breaks aggregated discovery and wedges namespace deletion. An
-//     object of the same name that k3sm did not apply is the operator's and is left.
+//   - Undecided posture. If the server could not establish the facts below (a failed
+//     read, or a read that shows no Node at all), the file is left untouched.
+//   - Requirement. If it fails on positive evidence, the file is skipped and any of its
+//     objects k3sm applied earlier are withdrawn, the APIService first, because an
+//     APIService with no serving backend breaks aggregated discovery and wedges
+//     namespace deletion. An object of the same name that k3sm did not apply is the
+//     operator's and is left.
 //
-// Every skip logs its reason once at Info.
+// Every skip logs its reason at Info: once in Converge, and in Regate when it changes.
 //
 // metrics-server's requirement is two facts. The kubelet serving certs chain to the CA
 // in kube-root-ca.crt: the mesh serving posture, inferred by the server from its
@@ -170,11 +173,27 @@ limitations under the License.
 // is self-signed and the verified scrape fails). And at least one Node carries the vm
 // RuntimeClass label (k3sm.io/virtualization=true), since the image is Linux; that is
 // a cluster fact, so a server that cannot host guests still applies it for a
-// vm-capable worker. Both are read once per server start, when Converge runs: a node
-// gaining or losing the label, or a cluster changing posture, takes effect at the
-// next server start. The same holds for the first start of a fresh cluster, where no
-// Node is registered yet when Converge runs, so metrics-server first lands on the
-// start after a vm-capable node has registered.
+// vm-capable worker. "No vm node" counts only as positive evidence: the read showed at
+// least one Node and none labelled. Zero Nodes (the first start of a fresh cluster, or
+// a stale LIST) is undecided.
+//
+// # Re-evaluation after start (Regate)
+//
+// Converge runs once, at server start, often before any Node has registered. So on
+// the mesh serving posture the server then runs Regate for the life of its process:
+// every RegateInterval (2 minutes) it re-reads the posture and re-decides the gated
+// files only, applying one as soon as its requirement holds and its guard allows it.
+// A fresh multi-node cluster therefore gets metrics-server within one interval of a
+// vm-capable node registering, with no restart. Everything else stays converge-only.
+//
+//   - A gated file applied in full, at start or by a tick, is done: the loop stops
+//     touching it, and returns when no gated file is left.
+//   - Regate withdraws only after two consecutive ticks, one interval apart, both read
+//     positive evidence, and at most once per process, so a single stale LIST cannot
+//     remove a working add-on. Converge at start withdraws on one positive read.
+//   - A node LOSING the label after the add-on was applied is not acted on until the
+//     next server start, where Converge decides again.
+//   - A single-node server runs no loop: its kubelet-CA fact cannot change in-process.
 //
 // Converge-only additionally makes the reconciler safe under HA with no coordination:
 // k3sm has no in-Go leader-election primitive, and an apply-only reconciler on a second

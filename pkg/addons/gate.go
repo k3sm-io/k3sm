@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -40,13 +41,142 @@ type Posture struct {
 	ClusterCAKubeletServing bool
 	// VMNode reports that at least one Node in the cluster carries the label the
 	// vm RuntimeClass selects on, so a Linux add-on image has somewhere to run.
-	// It is a cluster fact, so every server computes the same answer.
+	// It is a cluster fact, so every server computes the same answer. False is
+	// POSITIVE evidence: the read showed at least one Node and none labelled.
 	VMNode bool
 	// Undecided, when set, says why the server could not establish the facts
-	// above. Every gated add-on is then left exactly as it is: neither applied
-	// nor withdrawn, because a transient read failure must not delete a working
-	// add-on.
+	// above: a failed read, or a read that showed no Node at all (a stale LIST,
+	// or the first start of a fresh cluster). Every gated add-on is then left
+	// exactly as it is: neither applied nor withdrawn, because only positive
+	// evidence may delete a working add-on.
 	Undecided string
+}
+
+// outcome is what decide resolved for one gated file.
+type outcome int
+
+const (
+	// outcomeApply: the guard allows it and the requirement holds; apply the file.
+	outcomeApply outcome = iota
+	// outcomeUntouched: foreign guard, unreadable guard, undecided posture, or a
+	// failed requirement when withdrawal is not allowed this round.
+	outcomeUntouched
+	// outcomeWithdrawn: the requirement failed on positive evidence and k3sm's
+	// objects were withdrawn.
+	outcomeWithdrawn
+)
+
+// decision is decide's verdict, with the reason a skip logs.
+type decision struct {
+	outcome          outcome
+	reason           string
+	deleted, foreign int
+	err              error
+}
+
+// decide resolves a gated file under p, before any of it is applied, in this
+// order: an ownership guard held by someone else leaves it untouched; an
+// Undecided posture leaves it untouched; a failed requirement withdraws what
+// k3sm applied when mayWithdraw, and otherwise leaves it untouched.
+func (r *Reconciler) decide(ctx context.Context, f manifestFile, p Posture, mayWithdraw bool) decision {
+	req := requirements[f.path]
+	foreignOwner, err := r.foreignGuard(ctx, f.path)
+	if err != nil {
+		return decision{outcome: outcomeUntouched, reason: "could not read its ownership guard; left untouched", err: err}
+	}
+	if foreignOwner {
+		return decision{outcome: outcomeUntouched, reason: foreignMetricsReason}
+	}
+	if p.Undecided != "" {
+		return decision{outcome: outcomeUntouched, reason: "serving condition undecided, left untouched: " + p.Undecided}
+	}
+	reason := req(p)
+	if reason == "" {
+		return decision{outcome: outcomeApply}
+	}
+	if !mayWithdraw {
+		return decision{outcome: outcomeUntouched, reason: reason + " (not yet confirmed; left untouched)"}
+	}
+	deleted, foreign, err := r.withdraw(ctx, f.objs)
+	return decision{outcome: outcomeWithdrawn, reason: reason, deleted: deleted, foreign: foreign, err: err}
+}
+
+// RegateInterval is how often a server re-evaluates the gated add-ons after its
+// start-up Converge.
+const RegateInterval = 2 * time.Minute
+
+// Regate re-evaluates the gated add-ons after start-up, once per value received
+// from ticks, until ctx ends; posture is read once per tick. It is the only
+// thing that runs after Converge, and it touches gated files only:
+//
+//   - A file Converge (or an earlier tick) applied in full is done.
+//   - A file whose guard is foreign, or whose posture is undecided, is retried
+//     on the next tick.
+//   - A file whose requirement holds is applied, and is then done.
+//   - A file whose requirement fails is withdrawn only after TWO consecutive
+//     ticks both read positive evidence, and at most once per process, so a
+//     single stale read cannot remove it.
+//
+// It returns when ctx ends or ticks is closed, or at once when no gated file is
+// left to decide. A skip reason is logged when it changes, not on every tick.
+func (r *Reconciler) Regate(ctx context.Context, posture func(context.Context) Posture, ticks <-chan time.Time) {
+	files, _ := r.loadFiles() // decode errors were reported by Converge
+	type state struct {
+		f          manifestFile
+		streak     int // consecutive ticks with positive evidence against it
+		withdrawn  bool
+		lastReason string
+	}
+	var pending []*state
+	r.mu.Lock()
+	for _, f := range files {
+		if _, gated := requirements[f.path]; gated && !r.applied[f.path] {
+			pending = append(pending, &state{f: f})
+		}
+	}
+	r.mu.Unlock()
+	for len(pending) > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-ticks:
+			if !ok {
+				return
+			}
+		}
+		p := posture(ctx)
+		next := pending[:0]
+		for _, st := range pending {
+			if p.Undecided == "" && requirements[st.f.path](p) != "" {
+				st.streak++
+			} else {
+				st.streak = 0
+			}
+			d := r.decide(ctx, st.f, p, !st.withdrawn && st.streak >= 2)
+			if d.err != nil {
+				r.log().WarnContext(ctx, "re-evaluate embedded add-on", "file", st.f.path, "err", d.err)
+			}
+			switch d.outcome {
+			case outcomeApply:
+				_, errs := r.applyFile(ctx, st.f)
+				if err := errors.Join(errs...); err != nil {
+					r.log().WarnContext(ctx, "apply embedded add-on after re-evaluation", "file", st.f.path, "err", err)
+					next = append(next, st)
+					continue
+				}
+				r.log().InfoContext(ctx, "embedded add-on applied after re-evaluation", "file", st.f.path)
+				continue // done
+			case outcomeWithdrawn:
+				st.withdrawn, st.streak = true, 0
+			}
+			if d.reason != st.lastReason {
+				r.logSkip(ctx, st.f.path, d.reason, d.deleted, d.foreign)
+				st.lastReason = d.reason
+			}
+			next = append(next, st)
+		}
+		pending = next
+	}
 }
 
 // requirement returns why an add-on cannot serve under p, or "" when it can.

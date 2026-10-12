@@ -569,16 +569,17 @@ func runServer(args []string) (err error) {
 		return fmt.Errorf("load kubeconfig: %w", err)
 	}
 	// 3–3c. Admission policies, the fail-closed RBAC graph, the embedded add-ons.
-	if err = provisionServerCluster(ctx, plan, restCfg, cs, logger); err != nil {
+	if err = provisionServerCluster(ctx, plan, cs, logger); err != nil {
 		return err
 	}
+	stopAddons := startEmbeddedAddons(ctx, plan, restCfg, cs, logger)
+	defer stopAddons()
 	// 3c''/3c'. Each stop drains before exec.Stop's defer (LIFO runs it first).
 	stopHelm := startHelmController(ctx, plan, restCfg, cs, logger)
 	defer stopHelm()
 	stopManifests := startManifestDir(ctx, restCfg, cs, logger)
 	defer stopManifests()
-	// Can this node host vm guests? Asked before the registry and datapath use it.
-	vmCapable := vmBackendAvailable()
+	vmCapable := vmBackendAvailable() // can this node host vm guests? (3d registry, 4c datapath)
 	// 3d. The ingest registry; torn down BEFORE the control plane (LIFO).
 	stopRegistry, registryPuller := startServerRegistry(ctx, plan, cs, vmCapable, logger)
 	defer stopRegistry()

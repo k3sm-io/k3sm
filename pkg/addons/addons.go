@@ -27,6 +27,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"path"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -84,6 +85,11 @@ type Reconciler struct {
 	mapper  meta.RESTMapper
 	posture Posture
 	logger  *slog.Logger // nil means slog.Default(); a test seam
+
+	// mu guards applied, which Converge writes and the re-evaluation loop
+	// (Regate) reads afterwards from its own goroutine.
+	mu      sync.Mutex
+	applied map[string]bool // gated file path -> every object applied
 }
 
 // New returns a Reconciler that converges the manifests in fsys onto the cluster
@@ -140,54 +146,45 @@ func (r *Reconciler) Converge(ctx context.Context) error {
 	documents, applied := 0, 0
 	for _, f := range files {
 		documents += len(f.objs)
-		if skip, err := r.gate(ctx, f); skip {
-			if err != nil {
-				errs = append(errs, err)
+		if _, gated := requirements[f.path]; gated {
+			d := r.decide(ctx, f, r.posture, true)
+			if d.err != nil {
+				errs = append(errs, d.err)
 			}
-			continue
-		}
-		for _, obj := range f.objs {
-			if err := r.apply(ctx, obj); err != nil {
-				errs = append(errs, err)
+			if d.outcome != outcomeApply {
+				r.logSkip(ctx, f.path, d.reason, d.deleted, d.foreign)
 				continue
 			}
-			applied++
 		}
+		n, applyErrs := r.applyFile(ctx, f)
+		applied += n
+		errs = append(errs, applyErrs...)
 	}
 	slog.DebugContext(ctx, "converged the embedded add-on manifest set",
 		"fieldManager", FieldManager, "documents", documents, "applied", applied, "failed", len(errs))
 	return errors.Join(errs...)
 }
 
-// gate decides a gated file before any of it is applied, in this order: an
-// ownership guard held by someone else skips it untouched; an Undecided posture
-// skips it untouched; a failed requirement skips it and withdraws what k3sm
-// applied. skip false means apply the file. Each skip logs its reason once.
-func (r *Reconciler) gate(ctx context.Context, f manifestFile) (skip bool, err error) {
-	req, gated := requirements[f.path]
-	if !gated {
-		return false, nil
+// applyFile applies every object of f, records whether all of them applied (the
+// re-evaluation loop reads it: an applied gated file needs no further work), and
+// returns the count applied and the per-object failures.
+func (r *Reconciler) applyFile(ctx context.Context, f manifestFile) (int, []error) {
+	var errs []error
+	n := 0
+	for _, obj := range f.objs {
+		if err := r.apply(ctx, obj); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		n++
 	}
-	foreignOwner, err := r.foreignGuard(ctx, f.path)
-	if err != nil {
-		r.logSkip(ctx, f.path, "could not read its ownership guard; left untouched", 0, 0)
-		return true, err
+	r.mu.Lock()
+	if r.applied == nil {
+		r.applied = map[string]bool{}
 	}
-	if foreignOwner {
-		r.logSkip(ctx, f.path, foreignMetricsReason, 0, 0)
-		return true, nil
-	}
-	if r.posture.Undecided != "" {
-		r.logSkip(ctx, f.path, "serving condition undecided, left untouched: "+r.posture.Undecided, 0, 0)
-		return true, nil
-	}
-	reason := req(r.posture)
-	if reason == "" {
-		return false, nil
-	}
-	deleted, foreign, err := r.withdraw(ctx, f.objs)
-	r.logSkip(ctx, f.path, reason, deleted, foreign)
-	return true, err
+	r.applied[f.path] = len(errs) == 0
+	r.mu.Unlock()
+	return n, errs
 }
 
 // manifestFile is one manifest file's decoded objects, keyed by its path in the tree.
