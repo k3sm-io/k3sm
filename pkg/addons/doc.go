@@ -20,9 +20,11 @@ limitations under the License.
 //
 // On every server start it walks a manifest tree, decodes each YAML document into
 // an unstructured object, and server-side-applies it with a stable k3sm field
-// manager. It is the substrate the shipped add-ons (metrics-server first) build on;
-// the production tree ships EMPTY of product manifests today, so a stock server
-// converges an empty set and issues no API calls at all.
+// manager. The production tree holds one add-on today, metrics-server
+// (manifests/metrics-server.yaml: upstream v0.9.0, its RBAC verbatim, the
+// Deployment adapted to run the Linux image as a vm pod on a Darwin node), so a
+// server where it can serve issues one apply per object in that file on every start
+// (§ Gated add-ons).
 //
 // # Why the manifests are compiled in, not read from disk
 //
@@ -116,10 +118,15 @@ limitations under the License.
 // Unschedulable. Such an object is still applied, and a Warning Event
 // (DarwinSchedulingEventReason) naming both fields is recorded on it.
 //
-// # Converge-only: this reconciler never deletes
+// # Converge-only: this reconciler never prunes
 //
-// It issues exactly one verb: server-side apply (an apply-type PATCH). It never
-// DELETEs, and it never LISTs.
+// It converges with one verb, server-side apply (an apply-type PATCH), at start and,
+// for the gated add-ons only, on Regate's ticks. It never LISTs (the Node read behind
+// the gate's posture is the server's, in cmd/k3sm, and can only ever decide nothing
+// or a gated withdrawal on positive evidence), and it never prunes. Its one delete is
+// the withdrawal of a gated add-on (§ Gated add-ons), which is the safe shape described
+// below: objects named by the embedded manifest, resolved by Get-by-name, deleted only
+// when managedFields record k3sm's own apply, with a UID precondition.
 //
 // Both halves are deliberate. A prune keyed on the k3sm.io/managed label would be
 // catastrophic — that label is stamped by seven other packages, so a label-selector
@@ -132,15 +139,66 @@ limitations under the License.
 //
 // The safe form of prune is an ownership record the reconciler itself writes, resolved
 // by authoritative Get-by-name — deletion only for an object the embedded set once
-// contained and no longer does. That is not built here: the production set is empty, so
-// a persistent ownership record would be pure unexercised machinery. Until it is,
+// contained and no longer does. That is not built here: the production set is one add-on
+// that has never dropped an object, so a persistent ownership record would be unexercised
+// machinery. Until it is,
 // removing a manifest from the embedded tree leaves its object in the cluster for an
 // operator to remove. That is also the k3s semantic for a removed FILE, so the divergence
 // is bounded to objects dropped from a still-present file.
 //
+// # Gated add-ons
+//
+// Some add-ons can serve only on some clusters. A gated file is decided before any of
+// it is applied, in this order:
+//
+//   - Ownership guard. metrics-server.yaml's guard is the APIService
+//     v1beta1.metrics.k8s.io, read by name. If it exists and its managedFields carry no
+//     apply by k3sm, the operator runs metrics: the file is skipped whole, nothing is
+//     applied (so a forced apply never adopts the operator's objects) and nothing is
+//     withdrawn (so no later posture change can delete them). A failed read also
+//     leaves the file untouched.
+//   - Undecided posture. If the server could not establish the facts below (a failed
+//     read, or a read that shows no Node at all), the file is left untouched.
+//   - Requirement. If it fails on positive evidence, the file is skipped and any of its
+//     objects k3sm applied earlier are withdrawn, the APIService first, because an
+//     APIService with no serving backend breaks aggregated discovery and wedges
+//     namespace deletion. An object of the same name that k3sm did not apply is the
+//     operator's and is left.
+//
+// Every skip logs its reason at Info: once in Converge, and in Regate when it changes.
+//
+// metrics-server's requirement is two facts. The kubelet serving certs chain to the CA
+// in kube-root-ca.crt: the mesh serving posture, inferred by the server from its
+// mesh-provisioned cluster-CA serving pair (on a single-node server the kubelet cert
+// is self-signed and the verified scrape fails). And at least one Node carries the vm
+// RuntimeClass label (k3sm.io/virtualization=true), since the image is Linux; that is
+// a cluster fact, so a server that cannot host guests still applies it for a
+// vm-capable worker. "No vm node" counts only as positive evidence: the read showed at
+// least one Node and none labelled. Zero Nodes (the first start of a fresh cluster, or
+// a stale LIST) is undecided.
+//
+// # Re-evaluation after start (Regate)
+//
+// Converge runs once, at server start, often before any Node has registered. So on
+// the mesh serving posture the server then runs Regate for the life of its process:
+// every RegateInterval (2 minutes) it re-reads the posture and re-decides the gated
+// files only, applying one as soon as its requirement holds and its guard allows it.
+// A fresh multi-node cluster therefore gets metrics-server within one interval of a
+// vm-capable node registering, with no restart. Everything else stays converge-only.
+//
+//   - A gated file applied in full, at start or by a tick, is done: the loop stops
+//     touching it, and returns when no gated file is left.
+//   - Regate withdraws only after two consecutive ticks, one interval apart, both read
+//     positive evidence, and at most once per process, so a single stale LIST cannot
+//     remove a working add-on. Converge at start withdraws on one positive read.
+//   - A node LOSING the label after the add-on was applied is not acted on until the
+//     next server start, where Converge decides again.
+//   - A single-node server runs no loop: its kubelet-CA fact cannot change in-process.
+//
 // Converge-only additionally makes the reconciler safe under HA with no coordination:
 // k3sm has no in-Go leader-election primitive, and an apply-only reconciler on a second
-// server converges to the same state instead of racing a peer's prune.
+// server converges to the same state instead of racing a peer's prune. The gate keeps
+// that property: its facts are cluster facts every HA server reads alike.
 //
 // # Failure posture: log-and-continue, never fail-closed
 //
@@ -152,11 +210,13 @@ limitations under the License.
 // which the apiserver never stays up long enough to serve the kubectl delete that would fix
 // it. Only pkg/rbac is fail-closed, and it is bounded over a fixed in-binary graph.
 //
-// # Known ceilings (honest, and bounded by the empty production set)
+// # Known ceilings
 //
 //   - Readiness: Converge runs after the executor reports the control plane healthy, not
-//     against /readyz. With an empty set that is unobservable; an add-on that must not race
-//     informer sync needs the readiness probe added first.
+//     against /readyz. The shipped set is built-in kinds only, which the apiserver accepts
+//     as soon as it serves; an add-on that must not race informer sync needs the readiness
+//     probe added first. A discovery failure while building the RESTMapper skips the whole
+//     set for that boot (logged), and the next server start retries it.
 //   - CRDs (the embedded Reconciler only): its RESTMapper is built once from discovery, so
 //     a custom resource applied in the same pass as its own CRD will not map. Applying a CRD
 //     plus its CRs needs an Established wait and a mapper reset; today the set contains

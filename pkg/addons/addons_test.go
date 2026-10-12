@@ -128,7 +128,8 @@ type internalErr struct{ msg string }
 func (e *internalErr) Error() string { return e.msg }
 
 // verifyTrafficShape asserts the invariants that must hold for EVERY converge, whatever
-// the manifest set: the reconciler issues apply patches and NOTHING else.
+// the manifest set on the serving path: the reconciler issues apply patches and NOTHING
+// else. The withdrawal of a gated add-on is asserted on its own in gate_test.go.
 //
 // This is where B170's two BINDING prune constraints are encoded mechanically rather
 // than trusted:
@@ -434,20 +435,6 @@ func TestEmbeddedManifestReconcile(t *testing.T) {
 		}
 	})
 
-	t.Run("the production embedded set ships empty of product manifests", func(t *testing.T) {
-		// The shipped slice: FS() binds the compiled-in tree, which today holds only the
-		// authoring README. Converging it must be a complete no-op — no API traffic at
-		// all — which is what makes wiring it into server bring-up inert until the first
-		// real add-on lands.
-		ctx := context.Background()
-		dc := newFakeDynamic(t)
-		if err := New(FS(), dc, testMapper()).Converge(ctx); err != nil {
-			t.Fatalf("converge the production embedded set: %v", err)
-		}
-		if actions := dc.Actions(); len(actions) != 0 {
-			t.Errorf("the production embedded set issued %d API calls, want 0: %v", len(actions), actions)
-		}
-	})
 }
 
 // checkErr asserts that err carries every wanted substring, or is nil when none are

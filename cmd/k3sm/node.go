@@ -983,11 +983,26 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// adapter refuses a NodeConfig that carries only one of them.
 	var servingTLS *tls.Config
 	var authorizeKubelet func(http.Handler) http.Handler
+	var tokenRoutes []string
 	if opts.serveTLS {
-		auth, aerr := provider.NewKubeletEndpointAuth(opts.kubeletClientCAPEM, slog.Default())
+		certAuth, aerr := provider.NewKubeletEndpointAuth(opts.kubeletClientCAPEM, slog.Default())
 		if aerr != nil {
 			return fmt.Errorf("kubelet endpoint auth: %w", aerr)
 		}
+		// Delegated bearer-token admission on the read-only metrics routes only
+		// (metrics-server's scrape): TokenReview + SubjectAccessReview through the
+		// node's own system:node client, which the Node authorizer already lets
+		// create both reviews. Every other route still admits the apiserver's
+		// client certificate and nothing else.
+		delegated, derr := provider.NewDelegatedAuth(opts.nodeName, cs.AuthenticationV1().TokenReviews(), cs.AuthorizationV1().SubjectAccessReviews())
+		if derr != nil {
+			return fmt.Errorf("kubelet endpoint delegated auth: %w", derr)
+		}
+		auth, aerr := certAuth.WithDelegatedAuth(delegated)
+		if aerr != nil {
+			return fmt.Errorf("kubelet endpoint auth: %w", aerr)
+		}
+		tokenRoutes = auth.TokenRoutes()
 		servingTLS, err = kubeletServingTLS(auth, opts.kubeletServingCertPEM, opts.kubeletServingKeyPEM, opts.nodeName, opts.nodeIP, internalIP)
 		if err != nil {
 			return fmt.Errorf("kubelet serving tls: %w", err)
@@ -1017,8 +1032,9 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		Provider:         prov,
 		HTTPListenAddr:   opts.listen,
 		NumWorkers:       4,
-		TLSConfig:        servingTLS,       // nil = plain HTTP (dev path); set = kubelet-serving TLS + required client cert
+		TLSConfig:        servingTLS,       // nil = plain HTTP (dev path); set = kubelet-serving TLS, every presented client cert verified
 		AuthorizeHandler: authorizeKubelet, // nil iff TLSConfig is nil — the adapter enforces the pairing
+		TokenRoutes:      tokenRoutes,      // the read-only metrics routes the bearer path is confined to; nil with TLSConfig
 		ConfigureNode:    func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, opts.listen, caps) },
 		// The kubelet's own /containerLogs surface, on a subtree pattern that
 		// beats Virtual Kubelet's "/" catch-all. VK's logs route flattens
