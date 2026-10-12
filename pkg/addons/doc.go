@@ -20,9 +20,10 @@ limitations under the License.
 //
 // On every server start it walks a manifest tree, decodes each YAML document into
 // an unstructured object, and server-side-applies it with a stable k3sm field
-// manager. It is the substrate the shipped add-ons (metrics-server first) build on;
-// the production tree ships EMPTY of product manifests today, so a stock server
-// converges an empty set and issues no API calls at all.
+// manager. The production tree holds one add-on today, metrics-server
+// (manifests/metrics-server.yaml: upstream v0.9.0, its RBAC verbatim, the
+// Deployment adapted to run the Linux image as a vm pod on a Darwin node), so a
+// stock server issues one apply per object in that file on every start.
 //
 // # Why the manifests are compiled in, not read from disk
 //
@@ -132,8 +133,9 @@ limitations under the License.
 //
 // The safe form of prune is an ownership record the reconciler itself writes, resolved
 // by authoritative Get-by-name — deletion only for an object the embedded set once
-// contained and no longer does. That is not built here: the production set is empty, so
-// a persistent ownership record would be pure unexercised machinery. Until it is,
+// contained and no longer does. That is not built here: the production set is one add-on
+// that has never dropped an object, so a persistent ownership record would be unexercised
+// machinery. Until it is,
 // removing a manifest from the embedded tree leaves its object in the cluster for an
 // operator to remove. That is also the k3s semantic for a removed FILE, so the divergence
 // is bounded to objects dropped from a still-present file.
@@ -152,11 +154,13 @@ limitations under the License.
 // which the apiserver never stays up long enough to serve the kubectl delete that would fix
 // it. Only pkg/rbac is fail-closed, and it is bounded over a fixed in-binary graph.
 //
-// # Known ceilings (honest, and bounded by the empty production set)
+// # Known ceilings
 //
 //   - Readiness: Converge runs after the executor reports the control plane healthy, not
-//     against /readyz. With an empty set that is unobservable; an add-on that must not race
-//     informer sync needs the readiness probe added first.
+//     against /readyz. The shipped set is built-in kinds only, which the apiserver accepts
+//     as soon as it serves; an add-on that must not race informer sync needs the readiness
+//     probe added first. A discovery failure while building the RESTMapper skips the whole
+//     set for that boot (logged), and the next server start retries it.
 //   - CRDs (the embedded Reconciler only): its RESTMapper is built once from discovery, so
 //     a custom resource applied in the same pass as its own CRD will not map. Applying a CRD
 //     plus its CRs needs an Established wait and a mapper reset; today the set contains
