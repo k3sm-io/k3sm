@@ -259,7 +259,11 @@ func ensureControlPlaneBinariesVerified(ctx context.Context, logger *slog.Logger
 	// byte-identical, and a missing or failing binary refuses the boot. It never
 	// downloads, so the digest-pinned fallback below is dev-only.
 	if !requirePin {
-		if p := resolveSigningPolicy(ctx); p.release {
+		p, err := resolveSigningPolicy(ctx, logger)
+		if err != nil {
+			return err
+		}
+		if p.release {
 			if err := verifyPayloadBinaries(ctx, p, bd, healStamp(kubeMarkerPath(bd)), cpBinaries); err != nil {
 				return err
 			}
@@ -914,7 +918,10 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create bin dir %s: %w", bd, err)
 	}
-	policy := resolveSigningPolicy(ctx)
+	policy, err := resolveSigningPolicy(ctx, logger)
+	if err != nil {
+		return err
+	}
 	// A staged kine whose marker does not vouch for the target is re-seeded from the
 	// payload — but ONLY when the payload's OWN marker vouches for the target. Trusting
 	// an unmarked payload instead would mean stamping "this is the new pin" onto bytes

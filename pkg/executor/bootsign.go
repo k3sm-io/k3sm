@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -32,6 +33,12 @@ import (
 // start rather than run, or re-sign, a binary the signed release did not vouch for.
 var ErrPayloadSignature = errors.New("payload binary fails release signature verification")
 
+// ErrSelfSignatureUnreadable reports that the running k3sm's own signature could
+// not be read or evaluated, so the signing path cannot be decided. The boot
+// refuses rather than guess: the dev path would heal and ad-hoc sign binaries a
+// release node must run untouched.
+var ErrSelfSignatureUnreadable = errors.New("cannot read the running k3sm's own code signature")
+
 // codeSigner is the boot's signing seam: binsign's ad-hoc Signer plus its
 // Inspector, so the identity rule applies wherever it signs.
 type codeSigner interface {
@@ -40,7 +47,8 @@ type codeSigner interface {
 }
 
 // codesignSigner is the production codeSigner: the ad-hoc signer paired with the
-// inspector, which opts every boot signing step into the identity rule.
+// inspector (which runs /usr/bin/codesign by path), opting every boot signing
+// step into the identity rule.
 type codesignSigner struct {
 	binsign.Codesign
 	binsign.CodesignInspector
@@ -61,11 +69,11 @@ var selfExecutable = os.Executable
 // ID Application certificate: the signature verifies, is not ad hoc, and satisfies
 // binsign.DeveloperIDRequirement for the Team ID it names. The Team ID is read from
 // that signature, so no flag or environment variable selects the path. On it, the
-// control-plane binaries are verified in place against binsign.TeamRequirement and
-// used byte-identical, never healed and never re-signed; one that fails is refused.
+// control-plane binaries are verified in place against the same
+// binsign.DeveloperIDRequirement and used byte-identical, never healed and never re-signed; one that fails is refused.
 //
-// Every other k3sm (ad hoc, unsigned, signed by some other certificate, or one
-// whose signature could not be read) is on the DEV path: the binaries are healed
+// A k3sm whose signature reads cleanly as ad hoc, unsigned, or signed by some
+// other certificate is on the DEV path: the binaries are healed
 // once per stamp and ad-hoc signed when they carry no valid signature, as before.
 // On both paths a binary whose signature verifies and is not ad hoc is never
 // re-signed (binsign's identity rule).
@@ -80,38 +88,57 @@ type signingPolicy struct {
 }
 
 // resolveSigningPolicy reads the running k3sm's own signature and returns the
-// path it selects. Only a positive proof selects the release path; any failure to
-// read or match the signature selects the dev path, where the identity rule still
-// keeps every certificate-signed binary untouched.
-func resolveSigningPolicy(ctx context.Context) signingPolicy {
+// path it selects. Only a positive proof selects the release path, and only a
+// clean verdict selects the dev path: an ad-hoc or unsigned binary, or a
+// certificate signature without a Team ID or that fails the Developer ID
+// requirement. A failure to resolve the executable, read its signature, or
+// evaluate the requirement is an ErrSelfSignatureUnreadable, logged here and
+// returned so the boot refuses.
+func resolveSigningPolicy(ctx context.Context, logger *slog.Logger) (signingPolicy, error) {
 	p := signingPolicy{s: bootCodeSigner}
+	refuse := func(what string, err error) (signingPolicy, error) {
+		err = fmt.Errorf("%w: %s: %w", ErrSelfSignatureUnreadable, what, err)
+		logger.Error("refusing to start: the signing path cannot be decided", "err", err,
+			"remedy", "check that /usr/bin/codesign runs and that the k3sm binary is readable")
+		return signingPolicy{}, err
+	}
 	exe, err := selfExecutable()
 	if err != nil {
-		return p
+		return refuse("resolve the k3sm executable", err)
 	}
 	sig, err := p.s.Inspect(ctx, exe)
-	if err != nil || !sig.IdentitySigned() {
-		return p
+	if err != nil {
+		return refuse("inspect "+exe, err)
+	}
+	if !sig.IdentitySigned() || sig.TeamID == "" {
+		return p, nil
 	}
 	req, err := binsign.DeveloperIDRequirement(sig.TeamID)
 	if err != nil {
-		return p
+		// A Team ID that is not an Apple Team ID cannot be a Developer ID.
+		return p, nil
 	}
-	if ok, err := p.s.Satisfies(ctx, exe, req); err != nil || !ok {
-		return p
+	ok, err := p.s.Satisfies(ctx, exe, req)
+	if err != nil {
+		return refuse("evaluate the Developer ID requirement on "+exe, err)
+	}
+	if !ok {
+		return p, nil
 	}
 	p.release, p.teamID = true, sig.TeamID
-	return p
+	return p, nil
 }
 
 // verifyPayloadBinaries is the release path over a staged set: each named binary
-// in dir must be a regular file whose signature satisfies the release requirement
-// for p's Team ID. A pass leaves every binary byte-identical and records it at
+// in dir must be a regular file whose signature satisfies the Developer ID
+// Application requirement for p's Team ID, the one the daemon itself met, so a
+// development certificate of the same team is refused. A pass leaves every binary byte-identical and records it at
 // stamp in the heal marker, so the dev heal never revisits it; any failure,
-// including an absent binary, an ad-hoc signature or another team's, is an
+// including an absent binary, an ad-hoc signature, another team's or a
+// non-Developer ID certificate, is an
 // ErrPayloadSignature naming the binary.
 func verifyPayloadBinaries(ctx context.Context, p signingPolicy, dir, stamp string, names []string) error {
-	req, err := binsign.TeamRequirement(p.teamID)
+	req, err := binsign.DeveloperIDRequirement(p.teamID)
 	if err != nil {
 		return err
 	}
@@ -126,18 +153,18 @@ func verifyPayloadBinaries(ctx context.Context, p signingPolicy, dir, stamp stri
 			return fmt.Errorf("verify the signature of %s: %w", path, err)
 		}
 		if !ok {
-			return fmt.Errorf("%w: %s is not signed by team %s; refusing to start", ErrPayloadSignature, path, p.teamID)
+			return fmt.Errorf("%w: %s is not signed with team %s's Developer ID Application certificate; refusing to start", ErrPayloadSignature, path, p.teamID)
 		}
 	}
 	return binsign.RecordHealed(dir, stamp, names...)
 }
 
 // verifyTempHook is the atomicfile prepare hook for a release-path payload copy:
-// the temp must satisfy the release requirement before it takes name, and is
-// never signed. A refusal leaves the destination untouched.
+// the temp must satisfy the Developer ID requirement before it takes name, and
+// is never signed. A refusal leaves the destination untouched.
 func verifyTempHook(ctx context.Context, p signingPolicy, name string) func(string) error {
 	return func(tmp string) error {
-		req, err := binsign.TeamRequirement(p.teamID)
+		req, err := binsign.DeveloperIDRequirement(p.teamID)
 		if err != nil {
 			return err
 		}
@@ -146,7 +173,7 @@ func verifyTempHook(ctx context.Context, p signingPolicy, name string) func(stri
 			return fmt.Errorf("verify the signature of the %s copy: %w", name, err)
 		}
 		if !ok {
-			return fmt.Errorf("%w: the payload's %s is not signed by team %s", ErrPayloadSignature, name, p.teamID)
+			return fmt.Errorf("%w: the payload's %s is not signed with team %s's Developer ID Application certificate", ErrPayloadSignature, name, p.teamID)
 		}
 		return nil
 	}

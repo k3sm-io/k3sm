@@ -20,9 +20,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"k3sm.io/k3sm/internal/binsign"
@@ -46,9 +48,10 @@ const (
 // fakeCodeSigner is the codeSigner seam with no codesign behind it: it reads the
 // signature from the file's trailer and records every sign.
 type fakeCodeSigner struct {
-	signed      []string // paths passed to Sign, in order
-	inspectErr  error    // returned by Inspect when set
-	satisfiesOn []string // paths passed to Satisfies, in order
+	signed       []string // paths passed to Sign, in order
+	inspectErr   error    // returned by Inspect when set
+	satisfiesErr error    // returned by Satisfies when set
+	satisfiesOn  []string // paths passed to Satisfies, in order
 }
 
 // fakeSignatureOf returns the kind and Team ID the file at path carries.
@@ -97,11 +100,14 @@ func (f *fakeCodeSigner) Inspect(_ context.Context, path string) (binsign.Signat
 	return binsign.Signature{}, nil
 }
 
-// Satisfies evaluates exactly the two requirement texts binsign builds: the
-// team clause binds the leaf's team, and the Developer ID clause (the leaf
-// marker OID) admits only a Developer ID Application signature.
+// Satisfies evaluates the requirement texts binsign builds: the team clause binds
+// the leaf's team, and the Developer ID clause (the leaf marker OID) admits only
+// a Developer ID Application signature.
 func (f *fakeCodeSigner) Satisfies(_ context.Context, path, requirement string) (bool, error) {
 	f.satisfiesOn = append(f.satisfiesOn, path)
+	if f.satisfiesErr != nil {
+		return false, f.satisfiesErr
+	}
 	kind, team := fakeSignatureOf(path)
 	if kind != "devid" && kind != "appledev" {
 		return false, nil
@@ -198,7 +204,10 @@ func assertUntouched(t *testing.T, bd string, before map[string]fileID) {
 //     selects the dev path;
 //   - release path, control-plane binaries signed by that team: left byte-identical
 //     (same inode, same checksum), no heal and no sign, the heal stamp recorded;
-//   - release path, an ad-hoc, unsigned, other-team or missing binary: the boot is
+//   - the daemon's signature cannot be read or evaluated: the boot is refused with
+//     ErrSelfSignatureUnreadable and a log line, never sent down the dev path;
+//   - release path, an ad-hoc, unsigned, other-team, same-team non-Developer ID
+//     or missing binary: the boot is
 //     refused naming it, nothing is downloaded, signed or replaced; a payload copy
 //     is verified before it takes its name in the work dir;
 //   - dev path, unsigned: re-signed on a new inode, through a temp;
@@ -209,27 +218,50 @@ func TestBootVerifiesPayloadWithoutResigning(t *testing.T) {
 	devID := func(string) string { return fakeDevIDPrefix + team }
 
 	t.Run("mode detection reads the daemon's own signature", func(t *testing.T) {
+		readErr := errors.New("codesign could not run")
 		for _, tc := range []struct {
-			name        string
-			self        string
-			inspectErr  error
-			exeErr      bool
-			wantRelease bool
+			name         string
+			self         string
+			inspectErr   error
+			satisfiesErr error
+			exeErr       bool
+			wantRelease  bool
+			wantRefused  bool
 		}{
-			{"Developer ID Application", fakeDevIDPrefix + team, nil, false, true},
-			{"ad hoc", fakeAdHoc, nil, false, false},
-			{"unsigned", "", nil, false, false},
-			{"a team certificate that is not Developer ID", fakeAppleDevPrefix + team, nil, false, false},
-			{"Developer ID with a malformed Team ID", fakeDevIDPrefix + "bad team", nil, false, false},
-			{"the signature cannot be read", fakeDevIDPrefix + team, errors.New("codesign missing"), false, false},
-			{"the executable cannot be resolved", fakeDevIDPrefix + team, nil, true, false},
+			{name: "Developer ID Application", self: fakeDevIDPrefix + team, wantRelease: true},
+			{name: "ad hoc", self: fakeAdHoc},
+			{name: "unsigned", self: ""},
+			{name: "a team certificate that is not Developer ID", self: fakeAppleDevPrefix + team},
+			{name: "Developer ID with a malformed Team ID", self: fakeDevIDPrefix + "bad team"},
+			{name: "the signature cannot be read", self: fakeDevIDPrefix + team, inspectErr: readErr, wantRefused: true},
+			{name: "the requirement cannot be evaluated", self: fakeDevIDPrefix + team, satisfiesErr: readErr, wantRefused: true},
+			{name: "the executable cannot be resolved", self: fakeDevIDPrefix + team, exeErr: true, wantRefused: true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				useFakeSigning(t, &fakeCodeSigner{inspectErr: tc.inspectErr}, tc.self)
+				useFakeSigning(t, &fakeCodeSigner{inspectErr: tc.inspectErr, satisfiesErr: tc.satisfiesErr}, tc.self)
 				if tc.exeErr {
 					selfExecutable = func() (string, error) { return "", errors.New("no executable") }
 				}
-				p := resolveSigningPolicy(t.Context())
+				logger, errorLines := countingLogger()
+				p, err := resolveSigningPolicy(t.Context(), logger)
+				if tc.wantRefused {
+					if !errors.Is(err, ErrSelfSignatureUnreadable) {
+						t.Fatalf("err = %v, want ErrSelfSignatureUnreadable: an unreadable signature must refuse, never pick the dev path", err)
+					}
+					if errorLines() != 1 {
+						t.Errorf("logged %d error lines, want one naming the refusal", errorLines())
+					}
+					if p.release {
+						t.Error("a refusal selected the release path")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("err = %v on a cleanly read signature", err)
+				}
+				if errorLines() != 0 {
+					t.Errorf("logged %d error lines on a clean read", errorLines())
+				}
 				if p.release != tc.wantRelease {
 					t.Fatalf("release = %v, want %v", p.release, tc.wantRelease)
 				}
@@ -240,6 +272,27 @@ func TestBootVerifiesPayloadWithoutResigning(t *testing.T) {
 					t.Errorf("the dev path carries team %q", p.teamID)
 				}
 			})
+		}
+	})
+
+	t.Run("an unreadable daemon signature refuses the boot, touching nothing", func(t *testing.T) {
+		s := &fakeCodeSigner{inspectErr: errors.New("codesign could not run")}
+		useFakeSigning(t, s, fakeAdHoc)
+		forbidDownload(t)
+		bd := stageSet(t, func(string) string { return "" }) // unsigned: the dev path would re-sign it
+		before := ids(t, bd)
+		err := ensureControlPlaneBinariesVerified(t.Context(), discardLogger(), bd, DefaultKubeVersion, false)
+		if !errors.Is(err, ErrSelfSignatureUnreadable) {
+			t.Fatalf("boot err = %v, want ErrSelfSignatureUnreadable", err)
+		}
+		payload, work := t.TempDir(), t.TempDir()
+		writeBin(t, filepath.Join(payload, "kube-apiserver"), "payload")
+		if err := seedBinDir(t.Context(), discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); !errors.Is(err, ErrSelfSignatureUnreadable) {
+			t.Fatalf("seed err = %v, want ErrSelfSignatureUnreadable", err)
+		}
+		assertUntouched(t, bd, before)
+		if len(s.signed) != 0 {
+			t.Errorf("signed %v after the signature could not be read", s.signed)
 		}
 	})
 
@@ -289,6 +342,7 @@ func TestBootVerifiesPayloadWithoutResigning(t *testing.T) {
 			{"ad hoc", "kube-scheduler", fakeAdHoc, false},
 			{"unsigned", "kubectl", "", false},
 			{"another team", "kube-controller-manager", fakeDevIDPrefix + otherTeam, false},
+			{"a development certificate of the same team", "kube-apiserver", fakeAppleDevPrefix + team, false},
 			{"missing", "kube-apiserver", "", true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
@@ -335,6 +389,7 @@ func TestBootVerifiesPayloadWithoutResigning(t *testing.T) {
 		}{
 			{"Developer ID copy is seeded as is", fakeDevIDPrefix + team, false},
 			{"ad-hoc copy is refused", fakeAdHoc, true},
+			{"same-team development-certificate copy is refused", fakeAppleDevPrefix + team, true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				s := &fakeCodeSigner{}
@@ -437,3 +492,22 @@ func TestBootVerifiesPayloadWithoutResigning(t *testing.T) {
 		}
 	})
 }
+
+// countingLogger returns a logger and a func reporting how many Error records it
+// received.
+func countingLogger() (*slog.Logger, func() int) {
+	h := &errorCounter{}
+	return slog.New(h), func() int { return int(h.n.Load()) }
+}
+
+type errorCounter struct{ n atomic.Int64 }
+
+func (h *errorCounter) Enabled(context.Context, slog.Level) bool { return true }
+func (h *errorCounter) Handle(_ context.Context, r slog.Record) error {
+	if r.Level >= slog.LevelError {
+		h.n.Add(1)
+	}
+	return nil
+}
+func (h *errorCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *errorCounter) WithGroup(string) slog.Handler      { return h }
