@@ -18,11 +18,13 @@ package registrysvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"k3sm.io/k3sm/internal/atomicfile"
@@ -243,10 +245,37 @@ func buildZot(ctx context.Context, bd, version string) error {
 // merely unset in our own env) so an ambient GOBIN cannot re-trigger the
 // cross-compile refusal buildZot documents. GOMODCACHE is pinned away from the
 // scratch GOPATH so the pin's modules are fetched once per machine.
+//
+// The Go variables that weaken module verification or redirect the fetch are
+// DROPPED from the ambient environment and the safe values set explicitly, last,
+// so they win: the checksum database stays on, the proxy is the public one, and
+// GOTOOLCHAIN=local keeps a host Go older than zot's go directive from silently
+// fetching a toolchain (see ErrZotGoTooOld).
 func zotBuildEnv(gopath, modCache string) []string {
-	return append(os.Environ(),
-		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache)
+	env := make([]string, 0, len(os.Environ())+10)
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.Contains(zotDroppedEnv, name) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache,
+		"GOSUMDB=sum.golang.org", "GOPROXY=https://proxy.golang.org,direct", "GOTOOLCHAIN=local")
 }
+
+// zotDroppedEnv lists the ambient variables that weaken verification, redirect
+// module fetches or change the toolchain, removed before the pinned values are set.
+var zotDroppedEnv = []string{
+	"GOSUMDB", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOINSECURE", "GOFLAGS",
+	"GOPROXY", "GONOPROXY", "GOVCS", "GOTOOLCHAIN",
+}
+
+// ErrZotGoTooOld marks a zot build refused because the host Go is older than
+// the pinned zot's go directive. The install runs with GOTOOLCHAIN=local, so the
+// toolchain is never fetched; the operator upgrades Go or installs the packaged payload.
+var ErrZotGoTooOld = errors.New("the host Go toolchain is older than the pinned zot requires (GOTOOLCHAIN=local forbids fetching one)")
 
 // hostGoModCache returns the HOST TOOLCHAIN's own module cache (`go env
 // GOMODCACHE`, which already honours an ambient GOMODCACHE or GOPATH).
@@ -284,7 +313,18 @@ func hostGoModCache(ctx context.Context) (string, error) {
 func goInstallZot(ctx context.Context, version, gopath, modCache string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "go", "install", zotModulePath+"@"+version)
 	cmd.Env = zotBuildEnv(gopath, modCache)
-	return cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
+	if err != nil && zotGoTooOld(out) {
+		err = fmt.Errorf("%w: %w", ErrZotGoTooOld, err)
+	}
+	return out, err
+}
+
+// zotGoTooOld reports whether a `go install` diagnostic is the local-toolchain
+// refusal ("requires go >= X (running go Y; GOTOOLCHAIN=local)").
+func zotGoTooOld(out []byte) bool {
+	s := string(out)
+	return strings.Contains(s, "GOTOOLCHAIN=local") && strings.Contains(s, "requires go")
 }
 
 // ensureZotSigned makes sure the staged zot at path carries a valid ad-hoc
