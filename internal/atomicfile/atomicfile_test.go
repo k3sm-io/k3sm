@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -166,4 +168,125 @@ func TestReplaceNeverFollowsALinkAndResetsTheMode(t *testing.T) {
 			t.Fatalf("temp file left behind: %s", e.Name())
 		}
 	}
+}
+
+// TestInstallFileUsesANewInode pins the binary install: the bytes and mode land
+// at dst on a NEW inode, prepare runs on the temp before dst names it, an fd held
+// on the old file still reads the old bytes, a prepare error leaves dst untouched,
+// and no temp survives any return.
+func TestInstallFileUsesANewInode(t *testing.T) {
+	inode := func(t *testing.T, p string) uint64 {
+		t.Helper()
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Sys().(*syscall.Stat_t).Ino
+	}
+	t.Run("replaces on a new inode, prepare on the temp first", func(t *testing.T) {
+		dir := t.TempDir()
+		src, dst := filepath.Join(t.TempDir(), "src"), filepath.Join(dir, "bin")
+		if err := os.WriteFile(src, []byte("new-bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst, []byte("old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		before := inode(t, dst)
+		held, err := os.Open(dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = held.Close() }()
+		var prepared string
+		err = InstallFile(src, dst, 0o755, func(tmp string) error {
+			prepared = tmp
+			if got, _ := os.ReadFile(dst); string(got) != "old" {
+				t.Errorf("dst already reads %q while the temp is prepared", got)
+			}
+			if !isTempOf(filepath.Base(tmp), tempPrefix("bin")) || filepath.Dir(tmp) != dir {
+				t.Errorf("prepare got %s, want a temp beside dst", tmp)
+			}
+			f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_APPEND, 0)
+			if err != nil {
+				return err
+			}
+			_, _ = f.WriteString("+signed")
+			return f.Close()
+		})
+		if err != nil {
+			t.Fatalf("InstallFile: %v", err)
+		}
+		if prepared == "" {
+			t.Fatal("prepare never ran")
+		}
+		if got, _ := os.ReadFile(dst); string(got) != "new-bytes+signed" {
+			t.Errorf("dst = %q, want the prepared bytes", got)
+		}
+		if fi, _ := os.Lstat(dst); fi.Mode().Perm() != 0o755 {
+			t.Errorf("dst mode %v, want 0755", fi.Mode())
+		}
+		if inode(t, dst) == before {
+			t.Error("dst kept its inode: it was rewritten in place")
+		}
+		buf := make([]byte, 16)
+		n, _ := held.ReadAt(buf, 0)
+		if string(buf[:n]) != "old" {
+			t.Errorf("the held old file reads %q, want %q", buf[:n], "old")
+		}
+		if names := dirNames(t, dir); !slices.Equal(names, []string{"bin"}) {
+			t.Errorf("dir holds %v, want [bin]", names)
+		}
+	})
+	t.Run("src == dst re-installs the file's own bytes", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "bin")
+		if err := os.WriteFile(p, []byte("self"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		before := inode(t, p)
+		if err := InstallFile(p, p, 0o700, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(p); string(got) != "self" || inode(t, p) == before {
+			t.Errorf("content %q, same inode %v; want the same bytes on a new inode", got, inode(t, p) == before)
+		}
+	})
+	t.Run("a prepare error leaves dst untouched and no temp", func(t *testing.T) {
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "bin")
+		if err := os.WriteFile(dst, []byte("old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		before := inode(t, dst)
+		boom := errors.New("sign failed")
+		err := InstallReader(strings.NewReader("new"), dst, 0o755, func(string) error { return boom })
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the prepare error", err)
+		}
+		if got, _ := os.ReadFile(dst); string(got) != "old" || inode(t, dst) != before {
+			t.Errorf("dst = %q (inode changed %v), want it untouched", got, inode(t, dst) != before)
+		}
+		if names := dirNames(t, dir); !slices.Equal(names, []string{"bin"}) {
+			t.Errorf("dir holds %v, want [bin]", names)
+		}
+	})
+	t.Run("a symlink at dst is replaced, not followed", func(t *testing.T) {
+		dir := t.TempDir()
+		victim, link := filepath.Join(dir, "victim"), filepath.Join(dir, "bin")
+		if err := os.WriteFile(victim, []byte("victim"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(victim, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := InstallReader(strings.NewReader("new"), link, 0o755, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(victim); string(got) != "victim" {
+			t.Errorf("wrote through the link: victim = %q", got)
+		}
+		if fi, err := os.Lstat(link); err != nil || !fi.Mode().IsRegular() {
+			t.Errorf("dst is %v (%v), want a regular file", fi.Mode(), err)
+		}
+	})
 }

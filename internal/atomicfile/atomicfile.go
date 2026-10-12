@@ -19,6 +19,7 @@ package atomicfile
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -88,6 +89,77 @@ func Replace(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
+// InstallFile installs a copy of the file at src at dst with mode, on a NEW inode. It
+// is InstallReader over src's bytes; src may equal dst, which is how a live file is
+// rewritten (re-signed) without ever being written in place.
+func InstallFile(src, dst string, mode os.FileMode, prepare func(tmpPath string) error) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("atomicfile: open %s: %w", src, err)
+	}
+	defer func() { _ = in.Close() }()
+	return InstallReader(in, dst, mode, prepare)
+}
+
+// InstallReader streams r to a temp file in dst's directory (created 0600), chmods it
+// to mode, runs prepare on the temp's path (nil for none), fsyncs it and renames it
+// over dst; the directory is then fsync'ed. The temp file is removed on every error
+// return, and an error from prepare leaves dst untouched.
+//
+// It is the ONE way k3sm writes an executable or a dylib. macOS caches a Mach-O's
+// code signature per vnode: rewriting a signed file in place (an O_TRUNC write, a
+// copy onto it, or `codesign -f` on it) while any process has it mapped leaves the
+// kernel holding the old signature, and every process that maps the file afterwards
+// is killed (SIGKILL, Code Signature Invalid). rename(2) instead puts the new bytes
+// on a new inode and leaves the old one, and every mapping of it, intact. So any
+// change to a binary's bytes, its signature included, happens on the temp inside
+// prepare (that is where signing goes), and the finished file appears at dst in one
+// step: dst never names an unsigned or half-written binary.
+//
+// Like Replace, an existing symlink at dst is replaced, never followed.
+func InstallReader(r io.Reader, dst string, mode os.FileMode, prepare func(tmpPath string) error) error {
+	dir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dir, tempPrefix(filepath.Base(dst)))
+	if err != nil {
+		return fmt.Errorf("atomicfile: create temp for %s: %w", dst, err)
+	}
+	tmpPath := tmp.Name()
+	installed := false
+	defer func() {
+		if !installed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := io.Copy(tmp, r); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("atomicfile: write temp for %s: %w", dst, err)
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("atomicfile: chmod temp for %s: %w", dst, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("atomicfile: close temp for %s: %w", dst, err)
+	}
+	if prepare != nil {
+		if err := prepare(tmpPath); err != nil {
+			return fmt.Errorf("atomicfile: prepare %s: %w", dst, err)
+		}
+	}
+	// Synced after prepare, which may have rewritten the temp (a signature).
+	if err := syncFile(tmpPath); err != nil {
+		return fmt.Errorf("atomicfile: sync temp for %s: %w", dst, err)
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		return fmt.Errorf("atomicfile: install %s: %w", dst, err)
+	}
+	installed = true
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("atomicfile: sync directory of %s: %w", dst, err)
+	}
+	return nil
+}
+
 // ReapOrphans removes the temp files a killed WriteNew of dir/name may have left: the
 // regular files in dir named ".<name>.tmp-<digits>". Nothing else is touched, and an
 // absent dir is not an error. It must not run concurrently with a WriteNew of the same
@@ -136,6 +208,19 @@ func writeAndSync(f *os.File, data []byte, mode os.FileMode) error {
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncFile fsyncs the file at path.
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
 		return err
 	}
 	if err := f.Sync(); err != nil {
