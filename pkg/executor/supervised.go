@@ -489,7 +489,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// steps below find the binaries present and only re-sign — a launchd _k3sm
 	// daemon has neither gh nor a Go toolchain to fall back on.
 	// etcd is seeded only in the etcd posture: a single-node work dir never stages it.
-	if err := provisionStep("seed-bin", seedBinDir(s.cfg.Logger, s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion, s.cfg.KubeVersion, s.cfg.Etcd != nil)); err != nil {
+	if err := provisionStep("seed-bin", seedBinDir(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion, s.cfg.KubeVersion, s.cfg.Etcd != nil)); err != nil {
 		return err
 	}
 	if err := provisionStep("binaries", ensureControlPlaneBinaries(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KubeVersion)); err != nil {

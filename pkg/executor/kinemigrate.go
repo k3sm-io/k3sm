@@ -29,6 +29,8 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/k3sm/internal/atomicfile"
 )
 
 // The pre-migration datastore snapshot.
@@ -295,13 +297,9 @@ func preserveKineBinary(workDir, targetVersion string) error {
 	if fileExists(dst) {
 		return nil // write-once, like the backup it belongs to
 	}
-	tmp := dst + ".tmp"
-	if err := copyFile(src, tmp, 0o755); err != nil {
-		return fmt.Errorf("preserve pre-migration kine binary: %w", err)
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("install preserved kine binary %s: %w", dst, err)
+	// A binary, so through the one binary writer (a temp + rename, never in place).
+	if err := atomicfile.InstallFile(src, dst, 0o755, nil); err != nil {
+		return fmt.Errorf("preserve pre-migration kine binary %s: %w", dst, err)
 	}
 	return nil
 }

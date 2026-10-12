@@ -128,16 +128,14 @@ func stageHelm(ctx context.Context, bd string, force bool) error {
 	if _, err := tgz.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("rewind helm tarball: %w", err)
 	}
-	tmp := dst + ".tmp"
-	if err := extractMember(tgz, helmchart.HelmTarballMember, tmp); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("install %s: %w", dst, err)
-	}
-	return signBinaries(ctx, bd, []string{helmchart.HelmBinaryName})
+	// Extracted to a temp beside dst, signed THERE, then renamed over dst: dst
+	// never names unsigned bytes, and a helm a Job is running is never rewritten.
+	return extractMember(tgz, helmchart.HelmTarballMember, func(r io.Reader) error {
+		if err := installSignedReader(ctx, CodesignSigner{}, r, dst, 0o755); err != nil {
+			return fmt.Errorf("install %s: %w", dst, err)
+		}
+		return nil
+	})
 }
 
 // downloadHashed streams url into w and returns the lowercase hex sha256 of the
@@ -163,11 +161,12 @@ func downloadHashed(ctx context.Context, w io.Writer, url string) (string, error
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// extractMember writes the regular file member of the gzipped tar r to dst
-// (0755). It is an error when the member is absent, not a regular file, or
-// larger than maxHelmBinaryBytes. Only the one named member is read, so no
-// path in the archive is ever joined onto the file system.
-func extractMember(r io.Reader, member, dst string) error {
+// extractMember hands the content of the regular file member of the gzipped tar r
+// to install, which writes it through the one binary writer. It is an error when
+// the member is absent, not a regular file, or larger than maxHelmBinaryBytes.
+// Only the one named member is read, so no path in the archive is ever joined
+// onto the file system.
+func extractMember(r io.Reader, member string, install func(io.Reader) error) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("open helm tarball: %w", err)
@@ -191,14 +190,9 @@ func extractMember(r io.Reader, member, dst string) error {
 		if hdr.Size > maxHelmBinaryBytes {
 			return fmt.Errorf("helm tarball member %s is %d bytes, over the %d limit", member, hdr.Size, maxHelmBinaryBytes)
 		}
-		out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
-		if err != nil {
-			return fmt.Errorf("create %s: %w", dst, err)
-		}
-		if _, err := io.Copy(out, io.LimitReader(tr, maxHelmBinaryBytes)); err != nil {
-			_ = out.Close()
+		if err := install(io.LimitReader(tr, maxHelmBinaryBytes)); err != nil {
 			return fmt.Errorf("extract %s: %w", member, err)
 		}
-		return out.Close()
+		return nil
 	}
 }
