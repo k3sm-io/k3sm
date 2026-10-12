@@ -18,10 +18,18 @@ package install
 
 import (
 	"context"
+	"errors"
+	"io"
+	"io/fs"
+	"log/slog"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"testing"
+
+	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/netdsvc"
 )
@@ -93,7 +101,7 @@ func TestUninstallFlushesInterconnectAliases(t *testing.T) {
 		if err := Uninstall(context.Background(), f, Config{}); err != nil {
 			t.Fatalf("Uninstall: %v", err)
 		}
-		flush := slices.Index(f.calls, "FlushInterconnectAliases:"+netdsvc.InterconnectStatePath(MeshKeyDir))
+		flush := slices.Index(f.calls, "FlushInterconnectAliases:"+netdsvc.InterconnectStatePath(MeshKeyDir)+":-1")
 		if flush < 0 {
 			t.Fatalf("Uninstall never swept the interconnect ledger %s (calls: %v)", netdsvc.InterconnectStatePath(MeshKeyDir), f.calls)
 		}
@@ -103,22 +111,156 @@ func TestUninstallFlushesInterconnectAliases(t *testing.T) {
 		}
 	})
 
-	t.Run("only owned aliases on bridge0, the node /24 last", func(t *testing.T) {
+	t.Run("only this node's derived aliases on bridge0, the node /24 last", func(t *testing.T) {
 		owned, err := ParseInterconnectLedger([]byte(`{"aliases":[{"slot":0,"address":"169.254.0.9"},{"slot":1,"address":"169.254.0.10"},{"slot":2,"address":"169.254.0.11"}]}`))
 		if err != nil {
 			t.Fatal(err)
 		}
 		present := ParseBridgeIfconfig([]byte(bridgeIfconfig)).Addrs
-		got := interconnectFlushOrder(owned, present)
+		got, skipped := interconnectFlushOrder(owned, present, 1)
 		want := []netip.Addr{netip.MustParseAddr("169.254.0.10"), netip.MustParseAddr("169.254.0.9")}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("flush order = %v, want %v: the slot-2 alias is not on bridge0, 169.254.0.42 and the self-assigned address are not netd's", got, want)
+		if !reflect.DeepEqual(got, want) || len(skipped) != 0 {
+			t.Fatalf("flush order = %v (skipped %v), want %v: the slot-2 alias is not on bridge0, 169.254.0.42 and the self-assigned address are not netd's", got, skipped, want)
+		}
+	})
+
+	t.Run("a crafted entry is not removed", func(t *testing.T) {
+		present := ParseBridgeIfconfig([]byte(bridgeIfconfig)).Addrs
+		for name, ledger := range map[string]string{
+			// Slot 0 naming another in-range address that is on bridge0.
+			"slot 0 with another address": `{"aliases":[{"slot":0,"address":"169.254.0.42"}]}`,
+			// A real address of this node under the wrong slot.
+			"the right address under another slot": `{"aliases":[{"slot":3,"address":"169.254.0.10"}]}`,
+			// Another node's slot-0 address.
+			"another node's address": `{"aliases":[{"slot":0,"address":"169.254.0.1"}]}`,
+		} {
+			owned, err := ParseInterconnectLedger([]byte(ledger))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, skipped := interconnectFlushOrder(owned, present, 1); len(got) != 0 || len(skipped) != 1 {
+				t.Errorf("%s: flush order = %v (skipped %v), want nothing removed and the entry reported", name, got, skipped)
+			}
+		}
+		// The right address with the wrong netmask: a /32 where slot 0's /24 belongs.
+		st := ParseBridgeIfconfig([]byte(bridgeIfconfig)).Addrs
+		st[netip.MustParseAddr("169.254.0.9")] = 32
+		owned, _ := ParseInterconnectLedger([]byte(`{"aliases":[{"slot":0,"address":"169.254.0.9"}]}`))
+		if got, skipped := interconnectFlushOrder(owned, st, 1); len(got) != 0 || len(skipped) != 1 {
+			t.Errorf("slot 0 as a /32 = %v (skipped %v), want nothing removed", got, skipped)
+		}
+		// An unknown node index derives nothing.
+		owned, _ = ParseInterconnectLedger([]byte(`{"aliases":[{"slot":0,"address":"169.254.0.9"}]}`))
+		if got, _ := interconnectFlushOrder(owned, present, -1); len(got) != 0 {
+			t.Errorf("an unknown node index removed %v", got)
 		}
 	})
 
 	t.Run("an empty ledger removes nothing", func(t *testing.T) {
-		if got := interconnectFlushOrder(nil, ParseBridgeIfconfig([]byte(bridgeIfconfig)).Addrs); len(got) != 0 {
+		if got, _ := interconnectFlushOrder(nil, ParseBridgeIfconfig([]byte(bridgeIfconfig)).Addrs, 1); len(got) != 0 {
 			t.Errorf("flush order = %v with no ledger, want nothing", got)
+		}
+	})
+
+	t.Run("uninstall hands the sweep this node's cluster index", func(t *testing.T) {
+		cidr, err := podnet.NodeCIDR(podnet.ClusterPodCIDR, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := &fakeSystem{}
+		f.putFile(netdsvc.NodeIdentityPath(MeshKeyDir), []byte(cidr.String()+"\n"))
+		if err := Uninstall(context.Background(), f, Config{}); err != nil {
+			t.Fatalf("Uninstall: %v", err)
+		}
+		if want := "FlushInterconnectAliases:" + netdsvc.InterconnectStatePath(MeshKeyDir) + ":1"; !slices.Contains(f.calls, want) {
+			t.Errorf("calls %v do not carry %q: the index must be read before the walk removes the identity file", f.calls, want)
+		}
+	})
+}
+
+// writeLedger writes a ledger file in a temp dir with mode perm.
+func writeLedger(t *testing.T, perm os.FileMode, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "interconnect-aliases")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, perm); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestInterconnectSweepRefusesUntrustedLedger pins the ledger file checks: the
+// sweep acts only on a regular file, not a symlink, owned by the expected uid,
+// with no group or other write bit. A refused ledger removes nothing and is
+// not an uninstall error.
+func TestInterconnectSweepRefusesUntrustedLedger(t *testing.T) {
+	const ledger = `{"aliases":[{"slot":0,"address":"169.254.0.9"},{"slot":1,"address":"169.254.0.10"}]}`
+	me := uint32(os.Getuid())
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sweep := func(t *testing.T, path string, owner uint32) []string {
+		t.Helper()
+		var removed []string
+		err := sweepInterconnect(path, 1, owner, func(args ...string) ([]byte, error) {
+			if len(args) == 3 && args[1] == "-alias" {
+				removed = append(removed, args[2])
+				return nil, nil
+			}
+			return []byte(bridgeIfconfig), nil
+		}, log)
+		if err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		return removed
+	}
+
+	t.Run("a trusted ledger is swept and removed", func(t *testing.T) {
+		p := writeLedger(t, 0o600, ledger)
+		if got, want := sweep(t, p, me), []string{"169.254.0.10", "169.254.0.9"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("removed %v, want %v", got, want)
+		}
+		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the ledger survived a complete sweep: %v", err)
+		}
+	})
+
+	t.Run("a symlinked ledger is refused", func(t *testing.T) {
+		target := writeLedger(t, 0o600, ledger)
+		link := filepath.Join(t.TempDir(), "interconnect-aliases")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if got := sweep(t, link, me); len(got) != 0 {
+			t.Errorf("a symlinked ledger removed %v", got)
+		}
+		if _, err := os.Lstat(link); err != nil {
+			t.Errorf("the refused link was removed: %v", err)
+		}
+	})
+
+	t.Run("a group- or world-writable ledger is refused", func(t *testing.T) {
+		for _, perm := range []os.FileMode{0o620, 0o602, 0o666} {
+			p := writeLedger(t, perm, ledger)
+			if got := sweep(t, p, me); len(got) != 0 {
+				t.Errorf("a %s ledger removed %v", perm, got)
+			}
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("the refused %s ledger was removed: %v", perm, err)
+			}
+		}
+	})
+
+	t.Run("a ledger owned by another uid is refused", func(t *testing.T) {
+		p := writeLedger(t, 0o600, ledger)
+		if got := sweep(t, p, me+1); len(got) != 0 {
+			t.Errorf("a ledger owned by uid %d removed %v (want owner %d)", me, got, me+1)
+		}
+	})
+
+	t.Run("a directory is refused", func(t *testing.T) {
+		if got := sweep(t, t.TempDir(), me); len(got) != 0 {
+			t.Errorf("a directory ledger removed %v", got)
 		}
 	})
 }

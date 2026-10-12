@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -2152,49 +2153,21 @@ func (darwinSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 	return errors.Join(errs...)
 }
 
-// FlushInterconnectAliases reads netd's interconnect ownership ledger at
-// ledgerPath, removes each owned alias still on bridge0 (`ifconfig bridge0
-// -alias <ip>`, /32s before the slot-0 /24), and removes the ledger once every
-// removal succeeded. It runs as root after netd is booted out, so nothing can
-// re-add an alias behind it. bridge0's membership is never touched, and an
-// address the ledger does not name is never removed. An absent ledger is
-// nothing owned; a missing bridge0 holds nothing to remove.
-func (darwinSystem) FlushInterconnectAliases(ledgerPath string) error {
-	raw, err := os.ReadFile(ledgerPath)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read the interconnect ownership ledger: %w", err)
-	}
-	owned, err := ParseInterconnectLedger(raw)
-	if err != nil {
-		return err
-	}
-	out, err := exec.Command("ifconfig", InterconnectBridge).CombinedOutput()
-	present := map[netip.Addr]int{}
-	switch {
-	case err == nil:
-		present = ParseBridgeIfconfig(out).Addrs
-	case strings.Contains(string(out), "does not exist"):
-		// No bridge0, so no alias on it to remove.
-	default:
-		return fmt.Errorf("ifconfig %s: %w\n%s", InterconnectBridge, err, out)
-	}
-	var errs []error
-	for _, ip := range interconnectFlushOrder(owned, present) {
-		if rmOut, err := exec.Command("ifconfig", InterconnectBridge, "-alias", ip.String()).CombinedOutput(); err != nil {
-			errs = append(errs, fmt.Errorf("ifconfig %s -alias %s: %w\n%s", InterconnectBridge, ip, err, rmOut))
-		}
-	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-	if err := os.Remove(ledgerPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove the interconnect ownership ledger: %w", err)
-	}
-	return nil
+// FlushInterconnectAliases sweeps the interconnect aliases netd's ownership
+// ledger names (see sweepInterconnect): only a root-owned regular ledger is
+// read, only this node's re-derived aliases with the right netmask are removed
+// (`/sbin/ifconfig bridge0 -alias <ip>`, /32s before the slot-0 /24), and the
+// ledger goes once every removal succeeded. It runs as root after netd is
+// booted out. bridge0's membership is never touched.
+func (darwinSystem) FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error {
+	return sweepInterconnect(ledgerPath, nodeIndex, 0, func(args ...string) ([]byte, error) {
+		return exec.Command(ifconfigPath, args...).CombinedOutput()
+	}, log)
 }
+
+// ifconfigPath is ifconfig by absolute path, so a root uninstall never runs
+// whatever a PATH entry names ifconfig.
+const ifconfigPath = "/sbin/ifconfig"
 
 // FlushMeshPFAnchor flushes every rule in the pf anchor (mesh.PFAnchor,
 // "io.k3sm.mesh") that an older release loaded the mesh MSS clamp into. Nothing

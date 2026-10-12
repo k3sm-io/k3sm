@@ -20,14 +20,23 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
 	"math/bits"
 	"net/netip"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
+	"k3sm.io/darwin-net/pkg/podnet"
+
+	"k3sm.io/k3sm/pkg/netdsvc"
 )
 
 // InterconnectBridge is the interface every interconnect alias lives on: the
@@ -137,22 +146,150 @@ func netmaskBits(s string) int {
 	return n
 }
 
-// interconnectFlushOrder is the uninstall's removal list: every alias the
-// ledger owns that is on bridge0 now and inside the interconnect range, the
-// pod /32s first and slot 0 (the node's connected /24, which they ride) last.
-// An address the ledger does not name is never on the list, whatever range it
-// is in: uninstall removes k3sm's own aliases and nothing else.
-func interconnectFlushOrder(owned []InterconnectAlias, present map[netip.Addr]int) []netip.Addr {
+// interconnectFlushOrder is the uninstall's removal list, re-derived rather
+// than trusted: an entry is removed only when its address is exactly
+// netv1alpha1.InterconnectSlotAddress(nodeIndex, slot) for THIS node's cluster
+// index, it is on bridge0 now, and it carries the netmask netd gives that slot
+// (/24 for slot 0, /32 for the rest). The pod /32s come first and slot 0 (the
+// node's connected /24, which they ride) last. Every entry that fails a check is
+// returned in skipped with the reason, and nothing outside the list is ever
+// removed, so a ledger edited to name another address removes nothing.
+func interconnectFlushOrder(owned []InterconnectAlias, present map[netip.Addr]int, nodeIndex int) (remove []netip.Addr, skipped []string) {
 	keep := make([]InterconnectAlias, 0, len(owned))
 	for _, a := range owned {
-		if _, here := present[a.Address]; here && interconnectCIDR.Contains(a.Address) {
-			keep = append(keep, a)
+		want, err := netv1alpha1.InterconnectSlotAddress(nodeIndex, a.Slot)
+		if err != nil || a.Address != want {
+			skipped = append(skipped, fmt.Sprintf("slot %d address %s is not this node's derived address", a.Slot, a.Address))
+			continue
 		}
+		bits, here := present[a.Address]
+		if !here {
+			continue
+		}
+		wantBits := 32
+		if a.Slot == netv1alpha1.InterconnectSlotNode {
+			wantBits = interconnectCIDR.Bits()
+		}
+		if bits != wantBits {
+			skipped = append(skipped, fmt.Sprintf("slot %d address %s is on %s as /%d, not /%d", a.Slot, a.Address, InterconnectBridge, bits, wantBits))
+			continue
+		}
+		keep = append(keep, a)
 	}
 	slices.SortStableFunc(keep, func(a, b InterconnectAlias) int { return b.Slot - a.Slot })
-	out := make([]netip.Addr, 0, len(keep))
+	remove = make([]netip.Addr, 0, len(keep))
 	for _, a := range keep {
-		out = append(out, a.Address)
+		remove = append(remove, a.Address)
 	}
-	return out
+	return remove, skipped
+}
+
+// errUntrustedLedger reports a ledger file the sweep refuses to act on.
+var errUntrustedLedger = errors.New("untrusted interconnect ownership ledger")
+
+// readTrustedLedger reads the ledger at path through one O_NOFOLLOW
+// descriptor, and only when that descriptor is a regular file owned by
+// ownerUID with no group or other write bit. A symlink (the open fails), a
+// file someone else could have written, or any other file kind returns an error
+// wrapping errUntrustedLedger. An absent file returns fs.ErrNotExist.
+func readTrustedLedger(path string, ownerUID uint32) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: open %s: %v", errUntrustedLedger, path, err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("%w: stat %s: %v", errUntrustedLedger, path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %s is not a regular file", errUntrustedLedger, path)
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return nil, fmt.Errorf("%w: %s is writable by group or others (%s)", errUntrustedLedger, path, fi.Mode().Perm())
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid != ownerUID {
+		return nil, fmt.Errorf("%w: %s is not owned by uid %d", errUntrustedLedger, path, ownerUID)
+	}
+	return io.ReadAll(f)
+}
+
+// sweepInterconnect is FlushInterconnectAliases' body over one seam, ifconfig
+// (run with its arguments, returning its combined output). It reads the
+// ledger only when readTrustedLedger accepts it, removes the
+// interconnectFlushOrder list, and removes the ledger once every removal
+// succeeded. An unknown node index (negative), an untrusted ledger, or an
+// entry that is not this node's derived alias is skipped with a warning, never
+// an error: those leave state in place, which is the safe direction.
+func sweepInterconnect(ledgerPath string, nodeIndex int, ownerUID uint32, ifconfig func(args ...string) ([]byte, error), log *slog.Logger) error {
+	raw, err := readTrustedLedger(ledgerPath, ownerUID)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case errors.Is(err, errUntrustedLedger):
+		log.Warn("interconnect aliases not swept: the ownership ledger is not a root-owned regular file", "err", err,
+			"remedy", "sudo ifconfig "+InterconnectBridge+"   # inspect, then remove k3sm's 169.254.0.x aliases by hand")
+		return nil
+	case err != nil:
+		return fmt.Errorf("read the interconnect ownership ledger: %w", err)
+	}
+	if nodeIndex < 0 {
+		log.Warn("interconnect aliases not swept: this node's cluster index is unknown (no adopted pod range), so no alias can be re-derived",
+			"ledger", ledgerPath)
+		return nil
+	}
+	owned, err := ParseInterconnectLedger(raw)
+	if err != nil {
+		return err
+	}
+	out, err := ifconfig(InterconnectBridge)
+	present := map[netip.Addr]int{}
+	switch {
+	case err == nil:
+		present = ParseBridgeIfconfig(out).Addrs
+	case strings.Contains(string(out), "does not exist"):
+		// No bridge0, so no alias on it to remove.
+	default:
+		return fmt.Errorf("ifconfig %s: %w\n%s", InterconnectBridge, err, out)
+	}
+	remove, skipped := interconnectFlushOrder(owned, present, nodeIndex)
+	for _, why := range skipped {
+		log.Warn("interconnect ledger entry left in place", "reason", why)
+	}
+	var errs []error
+	for _, ip := range remove {
+		if rmOut, err := ifconfig(InterconnectBridge, "-alias", ip.String()); err != nil {
+			errs = append(errs, fmt.Errorf("ifconfig %s -alias %s: %w\n%s", InterconnectBridge, ip, err, rmOut))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	if err := os.Remove(ledgerPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove the interconnect ownership ledger: %w", err)
+	}
+	return nil
+}
+
+// interconnectNodeIndex is this node's cluster index from the pod range netd
+// adopted (the identity file), or -1 when there is none or it does not parse.
+// Uninstall reads it before the manifest walk removes that file.
+func interconnectNodeIndex(sys System) int {
+	raw, err := sys.ReadRegularFile(netdsvc.NodeIdentityPath(MeshKeyDir))
+	if err != nil {
+		return -1
+	}
+	cidr, err := netip.ParsePrefix(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return -1
+	}
+	idx, err := podnet.NodeIndex(podnet.ClusterPodCIDR, cidr.Masked())
+	if err != nil {
+		return -1
+	}
+	return idx
 }

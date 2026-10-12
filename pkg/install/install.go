@@ -1028,12 +1028,16 @@ type System interface {
 	// FlushInterconnectAliases is the uninstall backstop for the interconnect
 	// aliases netd put on bridge0. netd's shutdown removes nothing, so the
 	// aliases its ownership ledger (the file at ledgerPath, netd's own record)
-	// names outlive it. It removes exactly those that are still on bridge0, the
-	// pod /32s before the node's /24, then removes the ledger. It never changes
-	// bridge0's membership and never removes an address the ledger does not
-	// name. An absent ledger, or a host with no bridge0, is a no-op; a removal
-	// that fails keeps the ledger so a re-run can finish the job.
-	FlushInterconnectAliases(ledgerPath string) error
+	// names outlive it. The ledger is read only when it is a root-owned
+	// regular file with no group or other write, and an entry is removed only
+	// when it is this node's derived address for its slot (from nodeIndex, the
+	// cluster index of the pod range netd adopted; negative means unknown, and
+	// nothing is swept), is on bridge0 now, and has its slot's netmask. The pod
+	// /32s go before the node's /24, then the ledger. It never changes
+	// bridge0's membership. An absent ledger, or a host with no bridge0, is a
+	// no-op; a refused ledger or entry is logged and left; a removal that fails
+	// keeps the ledger so a re-run can finish the job.
+	FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error
 	// ReadPodReapRecords returns the pod process groups the runtime recorded in
 	// its reap store under dataRoot (runtime.ReadPodReapRecords). An absent store
 	// holds none.
@@ -2469,6 +2473,10 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// that would leave the operator with a half-installed machine.
 	deregisterServer(ctx, sys, cfg, m)
 	deregisterNode(ctx, cfg, m)
+	// This node's cluster index, read now: the manifest walk below removes
+	// the identity file it comes from, and the interconnect sweep after the
+	// walk re-derives every alias it may remove from it.
+	icIndex := interconnectNodeIndex(sys)
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
 		switch a.disp {
@@ -2551,8 +2559,9 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// Backstop: the interconnect aliases on bridge0 that netd's ledger owns, and
 	// the ledger itself. Like the lo0 aliases they are durable kernel state no
 	// daemon removes on the way out; unlike them they are swept by OWNERSHIP,
-	// not by range, so a 169.254.0.0/24 address k3sm did not put there stays.
-	note(sys.FlushInterconnectAliases(netdsvc.InterconnectStatePath(MeshKeyDir)))
+	// re-derived from this node's cluster index, not by range, so a
+	// 169.254.0.0/24 address that is not this node's derived alias stays.
+	note(sys.FlushInterconnectAliases(netdsvc.InterconnectStatePath(MeshKeyDir), icIndex, cfg.Logger))
 	if firstErr != nil {
 		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}

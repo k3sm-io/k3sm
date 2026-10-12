@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -1572,8 +1573,8 @@ func (f *fakeSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 	return nil
 }
 
-func (f *fakeSystem) FlushInterconnectAliases(ledgerPath string) error {
-	f.calls = append(f.calls, "FlushInterconnectAliases:"+ledgerPath)
+func (f *fakeSystem) FlushInterconnectAliases(ledgerPath string, nodeIndex int, _ *slog.Logger) error {
+	f.calls = append(f.calls, fmt.Sprintf("FlushInterconnectAliases:%s:%d", ledgerPath, nodeIndex))
 	return nil
 }
 
@@ -2089,6 +2090,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		// LogDir: every file in it belongs to a pod that will not exist once k3sm
 		// is uninstalled, and it is a root-equivalent tree of former workloads'
 		// output.
+		// This node's cluster index is read BEFORE the walk removes the
+		// identity file it comes from; the interconnect sweep needs it.
+		"ReadRegularFile:/var/lib/k3sm/keys/node-pod-cidr",
 		"RemoveAll:/var/log/containers",
 		"RemoveAll:/var/log/pods",
 		"Bootout:io.k3sm.server",
@@ -2126,7 +2130,7 @@ func TestUninstallIdempotent(t *testing.T) {
 		"FlushLo0Aliases:100.64.0.0/10,10.43.0.0/16",
 		// The interconnect aliases netd's ledger owns, and the ledger, swept
 		// after netd is gone (it is the ledger's only writer).
-		"FlushInterconnectAliases:/var/lib/k3sm/keys/interconnect-aliases",
+		"FlushInterconnectAliases:/var/lib/k3sm/keys/interconnect-aliases:-1",
 	}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("uninstall calls = %v, want %v", f.calls, want)
