@@ -233,7 +233,21 @@ func TestInterconnectPathSelection(t *testing.T) {
 		if got := h.gangPath(t); got != nw {
 			t.Fatalf("re-placed gang path %q, want network", got)
 		}
-		linksHealthy(t, h, metav1.ConditionTrue, "pod IPs")
+		// The fallback is visible: not a plain LinksUp, and it names when the
+		// limit ends.
+		until := fixedNow.Add(5 * time.Minute).UTC().Format(time.RFC3339)
+		c := condition(t, h.status(t), mlx.ConditionLinksHealthy)
+		if c.Status != metav1.ConditionFalse || c.Reason != mlx.ReasonDegradedToNetwork ||
+			!strings.Contains(c.Message, "interconnect is thunderbolt") || !strings.Contains(c.Message, "until "+until) {
+			t.Errorf("LinksHealthy = %s/%s %q, want False/%s naming thunderbolt and %s", c.Status, c.Reason, c.Message, mlx.ReasonDegradedToNetwork, until)
+		}
+		// Past the limit it stays degraded (no restart for a healthy gang), and
+		// says the limit ended.
+		h.ctrl.now = func() time.Time { return fixedNow.Add(6 * time.Minute) }
+		h.reconcile(t)
+		if c := condition(t, h.status(t), mlx.ConditionLinksHealthy); c.Reason != mlx.ReasonDegradedToNetwork || !strings.Contains(c.Message, "ended at "+until) {
+			t.Errorf("LinksHealthy past the limit = %s %q, want %s saying the limit ended at %s", c.Reason, c.Message, mlx.ReasonDegradedToNetwork, until)
+		}
 	})
 
 	// restartRank deletes rank 1, an unrelated gang restart, and lets the
@@ -276,38 +290,110 @@ func TestInterconnectPathSelection(t *testing.T) {
 		}
 	})
 
-	t.Run("refused_attach_rerenders_once_on_the_network", func(t *testing.T) {
+	// Every way a rank on the thunderbolt path cannot use the interconnect:
+	// each is an interconnect loss with the five-minute limit, never the
+	// generic gang restart that would re-resolve straight back onto the cable.
+	attachCond := func(st corev1.ConditionStatus) []corev1.PodCondition {
+		return []corev1.PodCondition{{
+			Type: netv1alpha1.ConditionInterconnectAttached, Status: st,
+			Reason: netv1alpha1.ReasonInterconnectSlotsExhausted, Message: "slot 1 is taken",
+		}}
+	}
+	exited := func(code int32) []corev1.ContainerStatus {
+		return []corev1.ContainerStatus{{Name: "mlx-serve", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code}}}}
+	}
+	for _, rc := range []struct {
+		name   string
+		conds  []corev1.PodCondition
+		status []corev1.ContainerStatus
+		why    string
+	}{
+		{"attach_refused", attachCond(corev1.ConditionFalse), exited(2), "attach refused, " + netv1alpha1.ReasonInterconnectSlotsExhausted},
+		{"exit_2_with_attach_true", attachCond(corev1.ConditionTrue), exited(2), "exited 2"},
+		{"exit_2_with_no_attach_condition", nil, exited(2), "exited 2"},
+		{"failed_before_any_attach", nil, exited(1), "failed before its interconnect attach"},
+	} {
+		t.Run("rank_cannot_use_the_interconnect/"+rc.name, func(t *testing.T) {
+			h := placeOnCable(t, fbNetwork)
+			pod := h.rankPods(t)[1]
+			pod.Status.Phase = corev1.PodFailed
+			pod.Status.Conditions = rc.conds
+			pod.Status.ContainerStatuses = rc.status
+			if _, err := h.kube.CoreV1().Pods(testNamespace).UpdateStatus(context.Background(), &pod, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			h.reconcile(t)
+			if n := len(h.rankPods(t)); n != 0 {
+				t.Fatalf("%d rank pods survived, want a gang restart", n)
+			}
+			linksHealthy(t, h, metav1.ConditionFalse, "interconnect lost by rank "+pod.Name+" ("+rc.why)
+			if c := condition(t, h.status(t), mlxv1alpha1.MLXModelConditionReady); !strings.Contains(c.Message, "re-rendering the gang on pod IPs") {
+				t.Errorf("Ready = %s %q, want a gang restart onto pod IPs", c.Status, c.Message)
+			}
+			h.reconcile(t)
+			if got := h.gangPath(t); got != nw {
+				t.Fatalf("re-placed on %q, want network", got)
+			}
+			// No thunderbolt attempt inside the limit, however the gang restarts.
+			for _, d := range []time.Duration{time.Minute, 3 * time.Minute, 4*time.Minute + 59*time.Second} {
+				at(h, d)
+				restartRank(t, h)
+				if got := h.gangPath(t); got != nw {
+					t.Fatalf("at +%s the gang was placed on %q, want network inside the limit", d, got)
+				}
+			}
+		})
+	}
+
+	t.Run("an_ordinary_rank_failure_is_the_generic_gang_restart", func(t *testing.T) {
 		h := placeOnCable(t, fbNetwork)
-		// The provider could not attach rank 1's slot-1 address; its rank exits
-		// (k3sm_shard refuses to run without it) and the Pod ends.
 		pod := h.rankPods(t)[1]
 		pod.Status.Phase = corev1.PodFailed
-		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-			Type: netv1alpha1.ConditionInterconnectAttached, Status: corev1.ConditionFalse,
-			Reason: netv1alpha1.ReasonInterconnectSlotsExhausted, Message: "slot 1 is taken",
-		})
+		pod.Status.Conditions = attachCond(corev1.ConditionTrue)
+		pod.Status.ContainerStatuses = exited(1)
 		if _, err := h.kube.CoreV1().Pods(testNamespace).UpdateStatus(context.Background(), &pod, metav1.UpdateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 		h.reconcile(t)
-		if n := len(h.rankPods(t)); n != 0 {
-			t.Fatalf("%d rank pods survived a refused attach, want a gang restart", n)
+		h.reconcile(t)
+		if got := h.gangPath(t); got != tb {
+			t.Errorf("an engine crash after a good attach re-placed on %q, want thunderbolt (no interconnect loss)", got)
 		}
-		linksHealthy(t, h, metav1.ConditionFalse, "interconnect attach refused for "+pod.Name+" ("+netv1alpha1.ReasonInterconnectSlotsExhausted)
-		if c := condition(t, h.status(t), mlxv1alpha1.MLXModelConditionReady); !strings.Contains(c.Message, "re-rendering the gang on pod IPs") {
-			t.Errorf("Ready = %s %q, want a gang restart onto pod IPs", c.Status, c.Message)
+	})
+
+	t.Run("the_limit_survives_an_operator_restart", func(t *testing.T) {
+		h := placeOnCable(t, fbNetwork)
+		cut(t, h, fbNetwork)
+		h.reconcile(t) // the interconnect-driven restart, recorded on the model
+		raw, err := h.dyn.Resource(mlxModelResource).Namespace(testNamespace).Get(context.Background(), testModelName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
 		}
+		if got, want := raw.GetAnnotations()[mlx.AnnotationInterconnectRestartedAt], fixedNow.UTC().Format(time.RFC3339); got != want {
+			t.Fatalf("%s = %q, want %q", mlx.AnnotationInterconnectRestartedAt, got, want)
+		}
+		mend(t, h, fbNetwork)
+		// A fresh controller over the same API state (a restart or an HA
+		// failover) places inside the limit on the network although the cable
+		// is back and the spec asks for thunderbolt.
+		fresh, err := New(Config{
+			Client: h.kube, Dynamic: h.dyn, Options: h.ctrl.opts, ProbeTransport: refusingTransport{},
+			InterconnectIndices: staticIndices(testIndices),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fresh.now = func() time.Time { return fixedNow.Add(4 * time.Minute) }
+		h.ctrl = fresh
 		h.reconcile(t)
 		if got := h.gangPath(t); got != nw {
-			t.Fatalf("re-placed after a refused attach on %q, want network", got)
+			t.Fatalf("a fresh controller placed on %q inside the limit, want network", got)
 		}
-		// No thunderbolt attempt inside the limit, however the gang restarts.
-		for _, d := range []time.Duration{time.Minute, 3 * time.Minute, 4*time.Minute + 59*time.Second} {
-			at(h, d)
-			restartRank(t, h)
-			if got := h.gangPath(t); got != nw {
-				t.Fatalf("at +%s the gang was placed on %q, want network inside the limit", d, got)
-			}
+		// Past it, the next gang restart re-resolves onto the cable.
+		at(h, 5*time.Minute+time.Second)
+		restartRank(t, h)
+		if got := h.gangPath(t); got != tb {
+			t.Errorf("past the limit the gang was placed on %q, want thunderbolt", got)
 		}
 	})
 

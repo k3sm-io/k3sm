@@ -87,6 +87,18 @@ const (
 	// addresses) or network (pod IPs). spec.distributed.interconnect may say
 	// auto; the Pods say what auto became, and LinksHealthy reads it back.
 	AnnotationInterconnect = "k3sm.io/mlx-interconnect"
+	// AnnotationInterconnectFallback marks a gang placed on the network
+	// because an interconnect loss forced it there ("network"), so
+	// LinksHealthy can report it as degraded rather than as a gang that asked
+	// for the network.
+	AnnotationInterconnectFallback = "k3sm.io/mlx-interconnect-fallback"
+	// AnnotationInterconnectRestartedAt is written by the operator on the
+	// MLXModel itself (RFC 3339) when it restarts the gang over an
+	// interconnect loss. For the operator's interconnect restart limit (five minutes) after it, no placement
+	// of the model uses the interconnect. It lives on the model, not in operator
+	// memory, so the limit survives an operator restart and an HA failover
+	// (and MLXModelStatus has no interconnect field to hold it).
+	AnnotationInterconnectRestartedAt = "k3sm.io/interconnect-restarted-at"
 
 	// CollectivePort is the TCP port every rank listens on for the collective
 	// backend: the ring backend's hostfile entries and the jaccl coordinator
@@ -191,6 +203,10 @@ type Placement struct {
 	// Interconnect is the resolved collective path: thunderbolt or network,
 	// never auto. Empty means network.
 	Interconnect mlxv1alpha1.MLXInterconnect
+	// FellBack marks a network placement forced by an interconnect loss
+	// (the restart limit), recorded on the rank Pods as
+	// AnnotationInterconnectFallback. Only valid on the network path.
+	FellBack bool
 }
 
 // Path returns the placement's resolved collective path, network when unset.
@@ -361,6 +377,9 @@ var interconnectPrefix = netip.MustParsePrefix(netv1alpha1.InterconnectCIDR)
 // carries a distinct address inside the interconnect subnet, on the network
 // none does.
 func checkInterconnect(placement Placement) error {
+	if placement.FellBack && placement.Path() != mlxv1alpha1.MLXInterconnectNetwork {
+		return fmt.Errorf("%w: a fallback placement must be on the network, not %s", ErrPlacementMismatch, placement.Path())
+	}
 	switch placement.Path() {
 	case mlxv1alpha1.MLXInterconnectNetwork:
 		for i, r := range placement.Ranks {
@@ -601,6 +620,9 @@ func rankAnnotations(placement Placement, hash string) map[string]string {
 	}
 	if placement.Path() == mlxv1alpha1.MLXInterconnectThunderbolt {
 		a[netv1alpha1.AnnotationInterconnects] = netv1alpha1.MediumThunderbolt
+	}
+	if placement.FellBack {
+		a[AnnotationInterconnectFallback] = string(mlxv1alpha1.MLXInterconnectNetwork)
 	}
 	return a
 }

@@ -55,8 +55,8 @@ type Cable struct {
 	// thunderbolt path.
 	Addresses map[string]netip.Addr
 	// ForceNetwork places on the network whatever spec.distributed.interconnect
-	// asks. The controller sets it for the one re-placement that follows a gang
-	// losing its interconnect under fallback network (plan I10).
+	// asks, and marks the placement FellBack. The controller sets it while the
+	// model's interconnect restart limit runs (plan I10).
 	ForceNetwork bool
 }
 
@@ -183,8 +183,10 @@ func Place(model *mlxv1alpha1.MLXModel, cable Cable, nodes []corev1.Node, held m
 	}
 
 	want := d.Interconnect
-	if cable.ForceNetwork {
-		want = mlxv1alpha1.MLXInterconnectNetwork
+	if cable.ForceNetwork && want != mlxv1alpha1.MLXInterconnectNetwork {
+		p, err := placeBackend(d.Backend, topology.Graph{}, fitting, byName, n)
+		p.FellBack = err == nil
+		return p, err
 	}
 	if want == mlxv1alpha1.MLXInterconnectNetwork {
 		return placeBackend(d.Backend, topology.Graph{}, fitting, byName, n)

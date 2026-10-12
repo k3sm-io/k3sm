@@ -134,9 +134,8 @@ type Config struct {
 // Controller reconciles MLXModels into the objects that serve them.
 //
 // Concurrency: three informers feed ONE workqueue drained by a SINGLE worker, so
-// every reconcile is serialized by model key and no field below needs a lock
-// (icRestarts included: only the worker reads or writes it). No Context is
-// stored — the one Run receives is threaded down.
+// every reconcile is serialized by model key and no field below needs a lock. No
+// Context is stored — the one Run receives is threaded down.
 type Controller struct {
 	client    kubernetes.Interface
 	dyn       dynamic.Interface
@@ -149,11 +148,6 @@ type Controller struct {
 	transport http.RoundTripper
 	queue     workqueue.TypedRateLimitingInterface[string]
 	log       *slog.Logger
-	// icRestarts remembers, per model key, the last interconnect-driven gang
-	// restart (plan I10's one-per-five-minutes limit, and the forced network
-	// re-placement after it). It is in memory: an operator restart forgets it,
-	// which can allow one extra restart, never a missed one.
-	icRestarts map[string]interconnectRestart
 	// now is the clock status derivation reads. It is a field so a test can pin
 	// condition timestamps; production leaves it at time.Now.
 	now func() time.Time
@@ -180,19 +174,18 @@ func New(cfg Config) (*Controller, error) {
 		pullName = DefaultPullSecretName
 	}
 	return &Controller{
-		client:     cfg.Client,
-		dyn:        cfg.Dynamic,
-		crd:        cfg.CRD,
-		gpu:        cfg.GPU,
-		indices:    cfg.InterconnectIndices,
-		opts:       cfg.Options,
-		domain:     cfg.ClusterDomain,
-		pullName:   pullName,
-		transport:  transport,
-		queue:      workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		log:        log,
-		icRestarts: map[string]interconnectRestart{},
-		now:        time.Now,
+		client:    cfg.Client,
+		dyn:       cfg.Dynamic,
+		crd:       cfg.CRD,
+		gpu:       cfg.GPU,
+		indices:   cfg.InterconnectIndices,
+		opts:      cfg.Options,
+		domain:    cfg.ClusterDomain,
+		pullName:  pullName,
+		transport: transport,
+		queue:     workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		log:       log,
+		now:       time.Now,
 	}, nil
 }
 
@@ -407,7 +400,6 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	// derived from a spec that has already changed.
 	raw, err := c.dyn.Resource(mlxModelResource).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		delete(c.icRestarts, key)
 		return nil // gone; the owned objects are garbage-collected
 	}
 	if err != nil {
