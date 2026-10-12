@@ -13,8 +13,9 @@ on.
 
 macOS puts every Thunderbolt port into one bridge interface, `bridge0` (the Thunderbolt Bridge).
 k3sm leaves the ports there and never changes `bridge0`'s members. It adds addresses to `bridge0`
-from `169.254.0.0/24`, a range macOS never assigns to itself, so a k3sm address cannot collide
-with the self-assigned `169.254.x.y` address the bridge already carries.
+from `169.254.0.0/24`. RFC 3927 reserves `169.254.0.0/24` and `169.254.255.0/24` from
+self-assignment, so a k3sm address does not collide with the self-assigned `169.254.x.y` address
+the bridge already carries.
 
 - Every address is derived from the node's cluster index (the index of its Pod `/24`) and a slot:
   `169.254.0.(8 × index + slot + 1)`. Nothing is allocated.
@@ -87,9 +88,10 @@ The Pod's status gets the condition `k3sm.io/InterconnectAttached`: `True` with 
 reason and the address as the message, or `False` with the reason the attach was refused.
 
 A Pod is reached over the cable only on an explicit bind. A listener must bind
-`$K3SM_INTERCONNECT_IP` to accept connections over the cable. A wildcard bind (`0.0.0.0`) stays on
-the Pod IP, the same as for every native Pod, so an ordinary listener is never exposed on the
-cable by the annotation alone. An outgoing connection to an interconnect address that the Pod has
+`$K3SM_INTERCONNECT_IP` to accept connections over the cable. For Pods, a wildcard bind
+(`0.0.0.0`) stays on the Pod IP, the same as for every native Pod, so a Pod's ordinary listener is
+not exposed on the cable by the annotation alone. Host processes are a different case: see
+[Plaintext](#plaintext). An outgoing connection to an interconnect address that the Pod has
 not bound uses the Pod's interconnect address as its source, so the peer can tell which Pod is
 calling.
 
@@ -186,8 +188,11 @@ the traffic is plaintext.
 
 - Disarm with `k3sm interconnect disable`, or exclude a node with `spec.excludedNodes`.
 - `sudo k3sm uninstall` removes the interconnect addresses the root helper recorded, and the record
-  itself. It never changes `bridge0`'s members and never removes an address k3sm did not add.
-- A restart also clears every interconnect address, and no restart is ever needed.
+  itself. It removes an address only when it is this node's own derived address for its slot, with
+  that slot's netmask, and only when the record is a root-owned file no one else can write;
+  anything else is left in place with a warning. It never changes `bridge0`'s members.
+- Restarting the Mac clears every interconnect address, and the cloned routes described below with
+  them; until a restart those routes can stay. No restart is needed to stop using the interconnect.
 
 After an address is removed, macOS can keep a cloned host route for it in the routing table that it
 refuses to delete. It is harmless: `k3sm doctor` reports it as pre-existing state, and k3sm never

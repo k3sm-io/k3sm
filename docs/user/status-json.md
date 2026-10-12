@@ -211,7 +211,7 @@ attached Pod in the row's `wide` keys.
 
 | field | type | notes |
 |---|---|---|
-| `name` | string | stable lowercase token |
+| `name` | string | stable lowercase token; look a row up by its `name`, never by its position, because rows appear only when the thing they describe exists |
 | `state` | string | see the state tables above |
 | `severity` | string | `ok`, `warn`, `fail`, `skip` or `unknown` |
 | `detail` | string | one sentence for a person; do not parse it |
