@@ -79,28 +79,22 @@ func SetEnabled(ctx context.Context, client kubernetes.Interface, store Store, n
 	if enabled {
 		res.ArmedBy = Identity(ctx, client)
 	}
-	specPatch, err := json.Marshal(map[string]any{"spec": map[string]any{"enabled": enabled}})
-	if err != nil {
-		return ArmResult{}, err
-	}
-	_, err = store.Patch(ctx, name, specPatch)
-	if apierrors.IsNotFound(err) {
+	// The object must exist before its status can be written. It is created
+	// disarmed; the spec patch below is what arms it.
+	if _, err := store.Get(ctx, name); apierrors.IsNotFound(err) {
 		_, err = store.Create(ctx, &netv1alpha1.Interconnect{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
 			Spec: netv1alpha1.InterconnectSpec{
 				Medium:   name,
 				Fallback: netv1alpha1.InterconnectFallbackNetwork,
-				Enabled:  enabled,
 			},
 		})
-		if apierrors.IsAlreadyExists(err) {
-			_, err = store.Patch(ctx, name, specPatch)
-		} else if err == nil {
-			res.Created = true
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return ArmResult{}, fmt.Errorf("create interconnect %s: %w", name, err)
 		}
-	}
-	if err != nil {
-		return ArmResult{}, fmt.Errorf("set interconnect %s enabled=%v: %w", name, enabled, err)
+		res.Created = err == nil
+	} else if err != nil {
+		return ArmResult{}, fmt.Errorf("read interconnect %s: %w", name, err)
 	}
 
 	status := map[string]any{"armedBy": nil, "armedAt": nil}
@@ -111,9 +105,32 @@ func SetEnabled(ctx context.Context, client kubernetes.Interface, store Store, n
 	if err != nil {
 		return ArmResult{}, err
 	}
-	ic, err := store.Patch(ctx, name, statusPatch, "status")
+	specPatch, err := json.Marshal(map[string]any{"spec": map[string]any{"enabled": enabled}})
 	if err != nil {
-		return ArmResult{}, fmt.Errorf("record who armed interconnect %s: %w", name, err)
+		return ArmResult{}, err
+	}
+	// Order is load-bearing: on arming the record goes first, so the resolver
+	// never sees enabled with no armedBy (which it reads as an unrecorded
+	// arming); on disarming the spec goes first, so the record is never cleared
+	// while the cable is still armed.
+	steps := []struct {
+		patch []byte
+		sub   []string
+		what  string
+	}{
+		{statusPatch, []string{"status"}, "record who armed"},
+		{specPatch, nil, "set enabled on"},
+	}
+	if !enabled {
+		steps[0], steps[1] = steps[1], steps[0]
+	}
+	var ic *netv1alpha1.Interconnect
+	for _, st := range steps {
+		out, err := store.Patch(ctx, name, st.patch, st.sub...)
+		if err != nil {
+			return ArmResult{}, fmt.Errorf("%s interconnect %s: %w", st.what, name, err)
+		}
+		ic = out
 	}
 
 	reason, typ, msg := EventDisarmed, corev1.EventTypeNormal,

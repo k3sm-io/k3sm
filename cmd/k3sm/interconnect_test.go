@@ -61,6 +61,13 @@ func TestInterconnectIndicesAndPeersUseTheSlotDerivation(t *testing.T) {
 	if want := map[string]int{"studio": 0, "book": 1, "far": 31}; !reflect.DeepEqual(idx, want) {
 		t.Errorf("indices = %v, want %v", idx, want)
 	}
+	set, err := meshPeerIndexSet(list)(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(set.Invalid) != 2 || set.Invalid["garbage"] == "" || set.Invalid["outside"] == "" {
+		t.Errorf("invalid = %v, want garbage and outside reported, never skipped silently", set.Invalid)
+	}
 	peers, err := slot0Peers(meshPeerIndices(list))(context.Background())
 	if err != nil {
 		t.Fatal(err)

@@ -50,6 +50,22 @@ limitations under the License.
 // node identity and accepts nothing but a slot from the client. The apiserver
 // does not enforce it, and nothing here pretends it does.
 //
+// # One writer on an HA control plane
+//
+// The resolver writes only while it holds the kube-system
+// k3sm-interconnect-resolver Lease (client-go leader election, the helm
+// controller's mechanism). A release (on shutdown or cancelled leadership) is
+// sent only after the leading work has stopped and its in-flight reconcile has
+// returned, so no other server can take a released Lease while this one still
+// writes. The residual: when renewals fail and another server takes the Lease
+// after it expires (no release is sent), the leading work is cancelled only
+// when client-go's renew loop gives up (renewDeadline after the last renewal),
+// and the Lease expires leaseDuration after it. Every reconcile is bounded to
+// fit inside that margin, so an overlap needs a clock skew or a stalled write
+// larger than it; the status write is still resourceVersion-guarded and the
+// hysteresis is persisted, so an overlapping write converges on the next
+// reconcile rather than corrupting state.
+//
 // Nodes never read the Interconnect object (that would widen what a node
 // identity may LIST/WATCH); they patch only annotations on their own Node, which
 // the Node authorizer and NodeRestriction already allow.

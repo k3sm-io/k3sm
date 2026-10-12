@@ -46,29 +46,40 @@ import (
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
-// meshPeerIndices returns a lister of every node's cluster index, from the pod
+// meshPeerIndexSet returns a lister of every node's cluster index, from the pod
 // /24 its MeshPeer holds — the index netd derives the node's interconnect
 // address from (podnet.NodeIndex over the cluster pod aggregate), so the server's
-// recomputed address and the helper's alias come from one derivation.
-func meshPeerIndices(list func(context.Context) ([]netv1.MeshPeerSpec, error)) func(context.Context) (map[string]int, error) {
-	return func(ctx context.Context) (map[string]int, error) {
+// recomputed address and the helper's alias come from one derivation. A MeshPeer
+// whose pod /24 yields no index is reported, never skipped silently.
+func meshPeerIndexSet(list func(context.Context) ([]netv1.MeshPeerSpec, error)) func(context.Context) (interconnect.Indices, error) {
+	return func(ctx context.Context) (interconnect.Indices, error) {
 		peers, err := list(ctx)
 		if err != nil {
-			return nil, err
+			return interconnect.Indices{}, err
 		}
-		out := make(map[string]int, len(peers))
+		out := interconnect.Indices{Index: make(map[string]int, len(peers)), Invalid: map[string]string{}}
 		for _, p := range peers {
 			cidr, err := netip.ParsePrefix(p.PodCIDR)
-			if err != nil {
-				continue
+			if err == nil {
+				var idx int
+				if idx, err = podnet.NodeIndex(podnet.ClusterPodCIDR, cidr); err == nil {
+					out.Index[p.NodeName] = idx
+					continue
+				}
 			}
-			idx, err := podnet.NodeIndex(podnet.ClusterPodCIDR, cidr)
-			if err != nil {
-				continue
-			}
-			out[p.NodeName] = idx
+			out.Invalid[p.NodeName] = fmt.Sprintf("pod CIDR %q: %v", p.PodCIDR, err)
 		}
 		return out, nil
+	}
+}
+
+// meshPeerIndices is meshPeerIndexSet's index map alone (the node reporter
+// probes only nodes that have an address).
+func meshPeerIndices(list func(context.Context) ([]netv1.MeshPeerSpec, error)) func(context.Context) (map[string]int, error) {
+	set := meshPeerIndexSet(list)
+	return func(ctx context.Context) (map[string]int, error) {
+		s, err := set(ctx)
+		return s.Index, err
 	}
 }
 
@@ -130,7 +141,7 @@ func startInterconnectResolver(ctx context.Context, plan serverPlan, restCfg *re
 		Client:   cs,
 		Store:    interconnect.Store{Client: dyn},
 		CRD:      crd,
-		Indices:  meshPeerIndices(list),
+		Indices:  meshPeerIndexSet(list),
 		Identity: plan.opts.nodeName,
 		Metrics:  plan.interconnectMetrics,
 		Log:      logger,

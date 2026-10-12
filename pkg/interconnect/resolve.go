@@ -81,6 +81,10 @@ type Result struct {
 	// OutOfRange is the members whose index is beyond MaxInterconnectNodeIndex
 	// (state down, reason ReasonInterconnectIndexOutOfRange), sorted.
 	OutOfRange []string
+	// DuplicateIndex is the nodes that share a cluster index with another Node
+	// (their derived addresses would collide), sorted. Their members stay down
+	// with no address and are never given the desired annotation.
+	DuplicateIndex []string
 	// Rejected maps a node to the reason its report was ignored.
 	Rejected map[string]string
 	// Desired is the set of nodes that must carry the desired annotation. Every
@@ -190,9 +194,28 @@ func Resolve(in Input) Result {
 		isMember[n] = true
 	}
 
+	// Two Nodes holding one cluster index would derive one address; neither is
+	// trusted with it.
+	holders := map[int][]string{}
+	for _, n := range in.Nodes {
+		if n.Index >= 0 {
+			holders[n.Index] = append(holders[n.Index], n.Name)
+		}
+	}
+	dupIndex := map[string]bool{}
+	for _, hs := range holders {
+		if len(hs) > 1 {
+			for _, h := range hs {
+				dupIndex[h] = true
+				res.DuplicateIndex = append(res.DuplicateIndex, h)
+			}
+		}
+	}
+	sort.Strings(res.DuplicateIndex)
+
 	inRange := func(name string) bool {
 		idx := byName[name].Index
-		return idx >= 0 && idx <= netv1alpha1.MaxInterconnectNodeIndex
+		return idx >= 0 && idx <= netv1alpha1.MaxInterconnectNodeIndex && !dupIndex[name]
 	}
 	loops := cableLoops(reports, isMember)
 
@@ -225,10 +248,10 @@ func Resolve(in Input) Result {
 		if r, ok := reports[name]; ok {
 			m.SpeedGbps = r.SpeedGbps
 		}
-		if a, err := netv1alpha1.InterconnectSlotAddress(n.Index, netv1alpha1.InterconnectSlotNode); err == nil {
-			m.Address = a.String()
-		} else {
+		if a, err := netv1alpha1.InterconnectSlotAddress(n.Index, netv1alpha1.InterconnectSlotNode); err != nil {
 			res.OutOfRange = append(res.OutOfRange, name)
+		} else if !dupIndex[name] {
+			m.Address = a.String()
 		}
 
 		p, had := prev[name]
@@ -317,16 +340,21 @@ func segments(members []netv1alpha1.InterconnectMember) []netv1alpha1.Interconne
 }
 
 // cableLoops returns the members that sit in a bridged Thunderbolt loop (plan
-// §2/Q2), from the reported cable graph alone:
+// §2/Q2), from the reported cable graph. Reports are untrusted, so a cable edge
+// between A and B counts only when BOTH ends confirm it: A lists one of B's
+// local domains as a peer AND B lists one of A's. Its multiplicity is the
+// smaller of the two ends' counts. Then:
 //
-//   - a node reporting the same peer domain on two local ports;
-//   - two cables between the same pair of nodes (either end reports the other's
-//     domains twice);
-//   - a cycle in the graph of nodes joined by cables (a component with at least
-//     as many edges as nodes).
+//   - two confirmed cables between one pair, or a cycle among confirmed edges
+//     (a component with at least as many edges as nodes), marks every node of
+//     that component;
+//   - a node listing the same peer domain on two of its own ports marks that
+//     node only.
 //
-// A peer domain no member claims as local (a Mac that is not a cluster node) is
-// not an edge: its loops are invisible here, which the user page states.
+// An unconfirmed claim (a peer domain the owner does not reciprocate, or that no
+// member claims as local) is not an edge and marks nobody, so a lying node can
+// never put honest nodes into loop. Loops through Macs that are not cluster
+// nodes are invisible here, which the user page states.
 func cableLoops(reports map[string]netv1alpha1.InterconnectReport, isMember map[string]bool) map[string]bool {
 	owner := map[string]string{}
 	ambiguous := map[string]bool{}
@@ -341,40 +369,43 @@ func cableLoops(reports map[string]netv1alpha1.InterconnectReport, isMember map[
 			owner[u] = name
 		}
 	}
-	loop := map[string]bool{}
-	type pair struct{ a, b string }
-	counts := map[pair]int{}
+	out := map[string]bool{}
+	// seen[a][b] is how many of a's peer entries name a local domain of b.
+	seen := map[string]map[string]int{}
 	for name, r := range reports {
 		if !isMember[name] {
 			continue
 		}
-		seen := map[string]bool{}
-		perPeer := map[string]int{}
+		dup := map[string]bool{}
 		for _, u := range r.PeerDomainUUIDs {
-			if seen[u] {
-				loop[name] = true
+			if dup[u] {
+				out[name] = true
 			}
-			seen[u] = true
+			dup[u] = true
 			o, ok := owner[u]
 			if !ok || ambiguous[u] || o == name {
 				continue
 			}
-			perPeer[o]++
-		}
-		for o, c := range perPeer {
-			k := pair{name, o}
-			if o < name {
-				k = pair{o, name}
+			if seen[name] == nil {
+				seen[name] = map[string]int{}
 			}
-			counts[k] = max(counts[k], c)
+			seen[name][o]++
+		}
+	}
+	type pair struct{ a, b string }
+	counts := map[pair]int{}
+	for a, peers := range seen {
+		for b, n := range peers {
+			back := seen[b][a]
+			if back == 0 || b < a {
+				continue // unconfirmed, or counted from the other end
+			}
+			counts[pair{a, b}] = min(n, back)
 		}
 	}
 	uf := newUnionFind()
 	for k := range counts {
 		uf.union(k.a, k.b)
-	}
-	for name := range loop {
-		uf.find(name)
 	}
 	vertices := map[string]map[string]bool{}
 	edges := map[string]int{}
@@ -390,17 +421,10 @@ func cableLoops(reports map[string]netv1alpha1.InterconnectReport, isMember map[
 			loopy[root] = true
 		}
 	}
-	for name := range loop {
-		loopy[uf.find(name)] = true
-	}
 	for root, vs := range vertices {
 		if edges[root] >= len(vs) {
 			loopy[root] = true
 		}
-	}
-	out := map[string]bool{}
-	for name := range loop {
-		out[name] = true
 	}
 	for root := range loopy {
 		for v := range vertices[root] {

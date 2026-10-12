@@ -84,7 +84,25 @@ const (
 	eventMemberDown     = "InterconnectMemberDown"
 	eventMemberLoop     = "InterconnectMemberLoop"
 	eventComponent      = "k3sm-interconnect"
+	eventNoClusterIndex = "InterconnectNoClusterIndex"
+	eventUnrecordedArm  = "InterconnectArmedUnrecorded"
+
+	// ConditionIndexUnique is the status condition naming nodes that share a
+	// cluster index.
+	ConditionIndexUnique = "IndexUnique"
+	reasonAllUnique      = "AllIndicesUnique"
+	// ReasonDuplicateClusterIndex marks two Nodes holding one cluster index.
+	ReasonDuplicateClusterIndex = "DuplicateClusterIndex"
 )
+
+// Indices is the cluster index of every node that has one, and why each node
+// that should have one does not.
+type Indices struct {
+	// Index maps a node to its cluster index.
+	Index map[string]int
+	// Invalid maps a node to the reason its pod /24 yields no index.
+	Invalid map[string]string
+}
 
 // ResolverConfig is the server resolver's wiring.
 type ResolverConfig struct {
@@ -94,8 +112,9 @@ type ResolverConfig struct {
 	Store Store
 	// CRD ensures the Interconnect CRD; nil skips the ensure.
 	CRD crdensure.CRDClient
-	// Indices returns every node's cluster index (from its pod /24).
-	Indices func(ctx context.Context) (map[string]int, error)
+	// Indices returns every node's cluster index (from its pod /24), and the
+	// nodes whose pod /24 yields none.
+	Indices func(ctx context.Context) (Indices, error)
 	// Identity names this server in the leader Lease.
 	Identity string
 	// Recorder records Node Events; nil builds one over Client.
@@ -122,6 +141,12 @@ type Resolver struct {
 	// but tests and the lead loop must not race it).
 	mu       sync.Mutex
 	rejected map[string]string
+	invalid  map[string]string
+
+	// ensureCRD and startBackoff are Run's start-up step and its first retry
+	// wait; tests replace them.
+	ensureCRD    func(ctx context.Context) error
+	startBackoff time.Duration
 }
 
 // NewResolver returns a Resolver. Its listers are bound by Run, or by a test
@@ -133,7 +158,59 @@ func NewResolver(cfg ResolverConfig) *Resolver {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Resolver{cfg: cfg, rejected: map[string]string{}}
+	r := &Resolver{cfg: cfg, rejected: map[string]string{}, invalid: map[string]string{}, startBackoff: startBackoffBase}
+	r.ensureCRD = func(ctx context.Context) error {
+		if cfg.CRD == nil {
+			return nil
+		}
+		_, err := crdensure.Ensure(ctx, cfg.CRD, crdconfig.InterconnectCRD(), crdensure.Options{Log: cfg.Log})
+		return err
+	}
+	return r
+}
+
+const (
+	// startBackoffBase and startBackoffMax bound Run's start-up retry: a CRD
+	// the apiserver will not take yet is retried, never a reason to disable the
+	// resolver for the life of the process.
+	startBackoffBase = 2 * time.Second
+	startBackoffMax  = time.Minute
+	// reconcileTimeout bounds one reconcile, so writes started while leading
+	// end inside the margin between a failed renewal (renewDeadline) and the
+	// Lease's expiry (leaseDuration).
+	reconcileTimeout = leaseDuration - renewDeadline - time.Second
+)
+
+// start runs the start-up step until it succeeds or ctx ends, waiting
+// startBackoff, doubling to startBackoffMax, between tries. A failure is
+// warned once per distinct error.
+func (r *Resolver) start(ctx context.Context) error {
+	wait := r.startBackoff
+	var last string
+	for {
+		err := r.ensureCRD(ctx)
+		if err == nil {
+			if last != "" {
+				r.cfg.Log.Info("interconnect resolver: the Interconnect CRD is ensured; starting")
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if msg := err.Error(); msg != last {
+			last = msg
+			r.cfg.Log.Warn("interconnect resolver waiting: ensure the Interconnect CRD", "err", err, "retry", wait)
+		}
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+		wait = min(wait*2, startBackoffMax)
+	}
 }
 
 // SetListers binds the node and node-Lease listers and the sync predicate.
@@ -142,13 +219,12 @@ func (r *Resolver) SetListers(nodes corelisters.NodeLister, leases coordinationl
 }
 
 // Run ensures the Interconnect CRD (on every server; the apply is idempotent),
-// then campaigns for the resolver Lease and reconciles while it leads, until
-// ctx ends. A lost Lease ends one term and the server campaigns again.
+// retrying with capped backoff until it takes, then campaigns for the resolver
+// Lease and reconciles while it leads, until ctx ends. A lost Lease ends one
+// term and the server campaigns again.
 func (r *Resolver) Run(ctx context.Context) error {
-	if r.cfg.CRD != nil {
-		if _, err := crdensure.Ensure(ctx, r.cfg.CRD, crdconfig.InterconnectCRD(), crdensure.Options{Log: r.cfg.Log}); err != nil {
-			return fmt.Errorf("interconnect resolver: ensure the Interconnect CRD: %w", err)
-		}
+	if err := r.start(ctx); err != nil {
+		return nil // ctx ended
 	}
 	if r.cfg.Recorder == nil {
 		b := record.NewBroadcaster()
@@ -169,17 +245,51 @@ func (r *Resolver) Run(ctx context.Context) error {
 	return nil
 }
 
+// drainOnRelease is the Lease lock with one change: a release (the update that
+// clears the holder, which client-go sends from inside its renew loop when
+// leadership is cancelled, BEFORE it cancels the leading callback's context)
+// first stops the leading work and waits for its in-flight reconcile. So this
+// server has stopped writing before another can take the Lease from a release.
+type drainOnRelease struct {
+	resourcelock.Interface
+	drain func()
+}
+
+// Update implements resourcelock.Interface.
+func (d drainOnRelease) Update(ctx context.Context, ler resourcelock.LeaderElectionRecord) error {
+	if ler.HolderIdentity == "" {
+		d.drain()
+	}
+	return d.Interface.Update(ctx, ler)
+}
+
 // campaign runs one leader-election term and returns once the leading work
-// has drained (the helm controller's term shape).
+// has drained (the helm controller's term shape, with the release drained).
 func (r *Resolver) campaign(ctx context.Context, lock resourcelock.Interface) error {
 	var (
-		mu      sync.Mutex
-		started bool
-		stopped bool
-		done    = make(chan struct{})
+		mu        sync.Mutex
+		started   bool
+		stopped   bool
+		stopLead  context.CancelFunc
+		done      = make(chan struct{})
+		drainOnce sync.Once
 	)
+	drain := func() {
+		drainOnce.Do(func() {
+			mu.Lock()
+			stopped = true
+			wait, cancel := started, stopLead
+			mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			if wait {
+				<-done
+			}
+		})
+	}
 	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:            lock,
+		Lock:            drainOnRelease{Interface: lock, drain: drain},
 		Name:            LeaseName,
 		LeaseDuration:   leaseDuration,
 		RenewDeadline:   renewDeadline,
@@ -187,16 +297,18 @@ func (r *Resolver) campaign(ctx context.Context, lock resourcelock.Interface) er
 		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(lctx context.Context) {
+				leadCtx, cancel := context.WithCancel(lctx)
+				defer cancel()
 				mu.Lock()
 				if stopped {
 					mu.Unlock()
 					return
 				}
-				started = true
+				started, stopLead = true, cancel
 				mu.Unlock()
 				defer close(done)
 				r.cfg.Log.Info("interconnect resolver: leading", "lease", LeaseNamespace+"/"+LeaseName, "identity", r.cfg.Identity)
-				r.lead(lctx)
+				r.lead(leadCtx)
 			},
 			OnStoppedLeading: func() {},
 		},
@@ -205,13 +317,7 @@ func (r *Resolver) campaign(ctx context.Context, lock resourcelock.Interface) er
 		return fmt.Errorf("interconnect resolver: leader election: %w", err)
 	}
 	le.Run(ctx)
-	mu.Lock()
-	stopped = true
-	wait := started
-	mu.Unlock()
-	if wait {
-		<-done
-	}
+	drain()
 	return nil
 }
 
@@ -247,7 +353,9 @@ func (r *Resolver) lead(ctx context.Context) {
 	defer tick.Stop()
 	var lastErr string
 	for {
-		err := r.Reconcile(ctx)
+		rctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+		err := r.Reconcile(rctx)
+		cancel()
 		switch {
 		case err == nil:
 			lastErr = ""
@@ -285,10 +393,11 @@ func (r *Resolver) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list node cluster indices: %w", err)
 	}
+	r.recordInvalidIndices(nodes, indices.Invalid)
 	now := r.cfg.Now()
 	in := Input{Now: now}
 	for _, n := range nodes {
-		idx, ok := indices[n.Name]
+		idx, ok := indices.Index[n.Name]
 		if !ok {
 			idx = NoIndex
 		}
@@ -303,12 +412,16 @@ func (r *Resolver) Reconcile(ctx context.Context) error {
 
 	ic, err := r.cfg.Store.Get(ctx, Name)
 	if apierrors.IsNotFound(err) {
+		// A read that SUCCEEDED and found no object (deleted, its CRD deleted,
+		// a datastore restore) means disarmed: no node keeps a desired
+		// annotation. A read error never gets here.
 		res := Resolve(in)
 		r.recordRejections(nodes, res.Rejected)
+		clearErr := r.clearDesired(ctx, nodes)
 		if !res.HasPeer {
-			return nil
+			return clearErr
 		}
-		return r.autoCreate(ctx)
+		return errors.Join(clearErr, r.autoCreate(ctx))
 	}
 	if err != nil {
 		return fmt.Errorf("read interconnect %s: %w", Name, err)
@@ -329,6 +442,40 @@ func (r *Resolver) Reconcile(ctx context.Context) error {
 	statusErr := r.writeStatus(ctx, ic, res, now)
 	desiredErr := r.writeDesired(ctx, nodes, ic, res)
 	return errors.Join(statusErr, desiredErr)
+}
+
+// clearDesired deletes the desired annotation from every Node that carries one.
+func (r *Resolver) clearDesired(ctx context.Context, nodes []*corev1.Node) error {
+	var errs []error
+	for _, n := range nodes {
+		if _, has := n.Annotations[netv1alpha1.AnnotationInterconnectDesired]; has {
+			errs = append(errs, PatchNodeAnnotation(ctx, r.cfg.Client, n.Name, netv1alpha1.AnnotationInterconnectDesired, ""))
+		}
+	}
+	if len(errs) > 0 {
+		r.cfg.Log.Warn("interconnect resolver: no Interconnect object; cleared every desired annotation", "nodes", len(errs))
+	}
+	return errors.Join(errs...)
+}
+
+// recordInvalidIndices warns and records one Node Event per node whose pod /24
+// yields no cluster index, once per change of its reason.
+func (r *Resolver) recordInvalidIndices(nodes []*corev1.Node, invalid map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, n := range nodes {
+		reason, ok := invalid[n.Name]
+		if !ok {
+			delete(r.invalid, n.Name)
+			continue
+		}
+		if r.invalid[n.Name] == reason {
+			continue
+		}
+		r.invalid[n.Name] = reason
+		r.cfg.Log.Warn("interconnect resolver: node has no cluster index; it cannot be an interconnect member", "node", n.Name, "reason", reason)
+		r.event(n.Name, corev1.EventTypeWarning, eventNoClusterIndex, "this node's pod /24 yields no cluster index, so it has no interconnect address: "+reason)
+	}
 }
 
 // fresh reports whether node's heartbeat Lease is current at now.
@@ -432,6 +579,29 @@ func (r *Resolver) writeStatus(ctx context.Context, ic *netv1alpha1.Interconnect
 			netv1alpha1.MaxInterconnectNodeIndex, strings.Join(res.OutOfRange, ", "))
 	}
 	meta.SetStatusCondition(&next.Status.Conditions, cond)
+	uniq := metav1.Condition{
+		Type:               ConditionIndexUnique,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonAllUnique,
+		Message:            "no two nodes share a cluster index",
+		ObservedGeneration: ic.Generation,
+		LastTransitionTime: metav1.NewTime(now),
+	}
+	if len(res.DuplicateIndex) > 0 {
+		uniq.Status = metav1.ConditionFalse
+		uniq.Reason = ReasonDuplicateClusterIndex
+		uniq.Message = "nodes sharing a cluster index would derive one interconnect address and stay down: " + strings.Join(res.DuplicateIndex, ", ")
+	}
+	meta.SetStatusCondition(&next.Status.Conditions, uniq)
+
+	// Armed without a record (kubectl edit or patch rather than
+	// `k3sm interconnect enable`): record that the arming identity is unknown.
+	unrecorded := ic.Spec.Enabled && ic.Status.ArmedBy == ""
+	if unrecorded {
+		next.Status.ArmedBy = UnknownIdentity
+		at := metav1.NewTime(now)
+		next.Status.ArmedAt = &at
+	}
 
 	up := map[string]bool{}
 	for _, m := range res.Members {
@@ -445,6 +615,15 @@ func (r *Resolver) writeStatus(ctx context.Context, ic *netv1alpha1.Interconnect
 	}
 	if _, err := r.cfg.Store.UpdateStatus(ctx, next); err != nil {
 		return fmt.Errorf("write interconnect %s status: %w", ic.Name, err)
+	}
+	if unrecorded {
+		r.cfg.Log.Warn("interconnect armed without a recorded identity (not through `k3sm interconnect enable`); armedBy set to unknown", "interconnect", ic.Name)
+		if r.cfg.Recorder != nil {
+			r.cfg.Recorder.Event(&corev1.ObjectReference{
+				APIVersion: netv1alpha1.SchemeGroupVersion.String(), Kind: "Interconnect", Name: ic.Name, UID: ic.UID,
+			}, corev1.EventTypeWarning, eventUnrecordedArm,
+				"interconnect armed without a recorded identity: opted-in pod traffic crosses the cable in plaintext, and any device on a cabled port can reach and spoof interconnect addresses")
+		}
 	}
 	r.reportTransitions(ic.Status.Members, res.Members)
 	return nil

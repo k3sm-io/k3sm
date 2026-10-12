@@ -28,6 +28,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -190,10 +191,6 @@ func TestResolverSegments(t *testing.T) {
 				node("a", 0, rep(t, []string{"A1", "A2"}, []string{"B1", "B2"}, []string{"b"})),
 				node("b", 1, rep(t, []string{"B1", "B2"}, []string{"A1", "A2"}, []string{"a"})),
 			},
-			"the same peer domain on two ports": {
-				node("a", 0, rep(t, []string{"A1", "A2"}, []string{"B1", "B1"}, []string{"b"})),
-				node("b", 1, rep(t, []string{"B1"}, []string{"A1"}, []string{"a"})),
-			},
 			"a cycle of three": {
 				node("a", 0, rep(t, []string{"A1", "A2"}, []string{"B1", "C2"}, []string{"b", "c"})),
 				node("b", 1, rep(t, []string{"B1", "B2"}, []string{"A1", "C1"}, []string{"a", "c"})),
@@ -214,16 +211,63 @@ func TestResolverSegments(t *testing.T) {
 				}
 			})
 		}
-		// A chain is not a loop.
+		// The same peer domain on two of a node's own ports marks that node
+		// only: the other end may be honest.
 		res := settle(Input{Spec: enabled, Nodes: []NodeInput{
+			node("a", 0, rep(t, []string{"A1", "A2"}, []string{"B1", "B1"}, []string{"b"})),
+			node("b", 1, rep(t, []string{"B1"}, []string{"A1"}, []string{"a"})),
+		}}).Members
+		if res[0].State != netv1alpha1.InterconnectMemberLoop || res[1].State == netv1alpha1.InterconnectMemberLoop {
+			t.Errorf("repeated peer domain: members = %+v, want a loop and b not", res)
+		}
+		// A chain is not a loop.
+		chain := settle(Input{Spec: enabled, Nodes: []NodeInput{
 			node("a", 0, rep(t, []string{"A1"}, []string{"B1"}, []string{"b", "c"})),
 			node("b", 1, rep(t, []string{"B1", "B2"}, []string{"A1", "C1"}, []string{"a", "c"})),
 			node("c", 2, rep(t, []string{"C1"}, []string{"B2"}, []string{"a", "b"})),
 		}})
 		for _, n := range []string{"a", "b", "c"} {
-			if m := member(t, res, n); m.State != netv1alpha1.InterconnectMemberUp {
+			if m := member(t, chain, n); m.State != netv1alpha1.InterconnectMemberUp {
 				t.Errorf("chain member %s = %+v, want up", n, m)
 			}
+		}
+	})
+
+	t.Run("a lying node cannot put honest nodes into loop", func(t *testing.T) {
+		// a and b are cabled to each other once. l claims to be cabled to both
+		// (twice to a, and closing a triangle), but neither lists l's domains.
+		res := settle(Input{Spec: enabled, Nodes: []NodeInput{
+			node("a", 0, rep(t, []string{"A1"}, []string{"B1"}, []string{"b"})),
+			node("b", 1, rep(t, []string{"B1"}, []string{"A1"}, []string{"a"})),
+			node("l", 2, rep(t, []string{"L1", "L2"}, []string{"A1", "A1", "B1"}, []string{"a", "b"})),
+		}})
+		for _, n := range []string{"a", "b"} {
+			if m := member(t, res, n); m.State != netv1alpha1.InterconnectMemberUp || m.Segment != "seg-0" {
+				t.Errorf("honest %s = %+v, want up in seg-0", n, m)
+			}
+		}
+		if m := member(t, res, "l"); m.State == netv1alpha1.InterconnectMemberUp || m.Segment != "" {
+			t.Errorf("liar l = %+v, want not up and in no segment", m)
+		}
+		if got := segIDs(res); !reflect.DeepEqual(got, map[string][]string{"seg-0": {"a", "b"}}) {
+			t.Errorf("segments = %v", got)
+		}
+	})
+
+	t.Run("duplicate cluster indices are down with no address", func(t *testing.T) {
+		res := settle(Input{Spec: enabled, Nodes: []NodeInput{
+			node("a", 0, rep(t, []string{"A1"}, []string{"B1", "C1"}, []string{"b", "c"})),
+			node("b", 1, rep(t, []string{"B1"}, []string{"A1"}, []string{"a"})),
+			node("c", 1, rep(t, []string{"C1"}, []string{"A1"}, []string{"a"})),
+		}})
+		for _, n := range []string{"b", "c"} {
+			m := member(t, res, n)
+			if m.State != netv1alpha1.InterconnectMemberDown || m.Address != "" || res.Desired[n] {
+				t.Errorf("%s = %+v desired=%v, want down, no address, no desired", n, m, res.Desired[n])
+			}
+		}
+		if !reflect.DeepEqual(res.DuplicateIndex, []string{"b", "c"}) {
+			t.Errorf("DuplicateIndex = %v, want [b c]", res.DuplicateIndex)
 		}
 	})
 
@@ -335,6 +379,7 @@ type harness struct {
 	leases  cache.Indexer
 	synced  bool
 	indices map[string]int
+	invalid map[string]string
 	now     time.Time
 	rec     *record.FakeRecorder
 }
@@ -391,7 +436,7 @@ func (h *harness) resolver() *Resolver {
 	r := NewResolver(ResolverConfig{
 		Client:   h.cs,
 		Store:    Store{Client: h.dyn},
-		Indices:  func(context.Context) (map[string]int, error) { return h.indices, nil },
+		Indices:  func(context.Context) (Indices, error) { return Indices{Index: h.indices, Invalid: h.invalid}, nil },
 		Recorder: h.rec,
 		Metrics:  NewMetrics(),
 		Log:      slog.New(slog.DiscardHandler),
@@ -555,12 +600,106 @@ func testResolverController(t *testing.T) {
 			t.Error("a failed Interconnect read cleared a desired annotation")
 		}
 
-		gone := newHarness(t, nodes, nil)
-		if err := gone.resolver().Reconcile(ctx); err != nil {
+	})
+
+	t.Run("a missing object means disarmed", func(t *testing.T) {
+		nodes := cabledPair(t)
+		h := newHarness(t, nodes, interconnect(true))
+		if err := h.resolver().Reconcile(ctx); err != nil {
 			t.Fatalf("Reconcile: %v", err)
 		}
-		if gone.nodePatches() != 0 {
-			t.Error("a missing Interconnect (NotFound is not a successful read) cleared a desired annotation")
+		for _, n := range []string{"a", "b"} {
+			if v, _ := h.annotation(t, n); v != wantDesired {
+				t.Fatalf("armed: %s desired = %q", n, v)
+			}
+		}
+		// The object is deleted; the cache now shows the armed annotations.
+		if err := h.dyn.Resource(GVR).Delete(ctx, Name, metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range []string{"a", "b"} {
+			live, err := h.cs.CoreV1().Nodes().Get(ctx, n, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.nodes.Update(live); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := h.resolver().Reconcile(ctx); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		for _, n := range []string{"a", "b"} {
+			if v, ok := h.annotation(t, n); ok {
+				t.Errorf("%s keeps desired %q after the Interconnect was deleted", n, v)
+			}
+		}
+		if ic := h.object(t); ic.Spec.Enabled {
+			t.Errorf("re-created object is armed: %+v", ic.Spec)
+		}
+	})
+
+	t.Run("an unrecorded arming is recorded as unknown with a Warning", func(t *testing.T) {
+		h := newHarness(t, cabledPair(t), interconnect(true))
+		h.now = t0.Add(time.Minute)
+		h.renewLeases(t, cabledPair(t), h.now)
+		if err := h.resolver().Reconcile(ctx); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		st := h.object(t).Status
+		if st.ArmedBy != UnknownIdentity || st.ArmedAt == nil || !st.ArmedAt.Time.Equal(h.now) {
+			t.Errorf("armedBy=%q armedAt=%v, want unknown at %v", st.ArmedBy, st.ArmedAt, h.now)
+		}
+		if !drained(h.rec, eventUnrecordedArm) {
+			t.Error("no Warning Event for an unrecorded arming")
+		}
+		// A recorded arming is left alone.
+		ic := interconnect(true)
+		ic.Status.ArmedBy = "system:admin"
+		h = newHarness(t, cabledPair(t), ic)
+		if err := h.resolver().Reconcile(ctx); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if got := h.object(t).Status.ArmedBy; got != "system:admin" {
+			t.Errorf("armedBy = %q, want the recorded identity kept", got)
+		}
+		if drained(h.rec, eventUnrecordedArm) {
+			t.Error("a recorded arming raised the unrecorded Warning")
+		}
+	})
+
+	t.Run("duplicate indices and nodes without an index are reported", func(t *testing.T) {
+		nodes := append(cabledPair(t), kubeNode("c", map[string]string{
+			netv1alpha1.AnnotationInterconnectReport: rep(t, []string{"C1"}, []string{"A1"}, []string{"a"}),
+		}), kubeNode("d", nil))
+		h := newHarness(t, nodes, interconnect(true))
+		h.indices["c"] = 1 // b's index
+		delete(h.indices, "d")
+		h.invalid = map[string]string{"d": `pod CIDR "garbage": not a CIDR`}
+		r := h.resolver()
+		for range 2 {
+			if err := r.Reconcile(ctx); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+		}
+		var uniq *metav1.Condition
+		for i, c := range h.object(t).Status.Conditions {
+			if c.Type == ConditionIndexUnique {
+				uniq = &h.object(t).Status.Conditions[i]
+			}
+		}
+		if uniq == nil || uniq.Status != metav1.ConditionFalse || uniq.Reason != ReasonDuplicateClusterIndex ||
+			!strings.Contains(uniq.Message, "b, c") {
+			t.Errorf("IndexUnique = %+v, want False naming b and c", uniq)
+		}
+		events := 0
+		for len(h.rec.Events) > 0 {
+			if strings.Contains(<-h.rec.Events, eventNoClusterIndex) {
+				events++
+			}
+		}
+		if events != 1 {
+			t.Errorf("%d no-index Events over two reconciles, want exactly one", events)
 		}
 	})
 
@@ -577,9 +716,9 @@ func testResolverController(t *testing.T) {
 		if len(st.Members) != 3 || st.Members[0].State != netv1alpha1.InterconnectMemberDown {
 			t.Fatalf("first status = %+v, want three members, held down", st.Members)
 		}
-		cond := st.Conditions
-		if len(cond) != 1 || cond[0].Status != metav1.ConditionFalse || cond[0].Reason != netv1alpha1.ReasonInterconnectIndexOutOfRange || !strings.Contains(cond[0].Message, "z") {
-			t.Errorf("conditions = %+v, want IndexInRange False naming z", cond)
+		cond := meta.FindStatusCondition(st.Conditions, ConditionIndexInRange)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != netv1alpha1.ReasonInterconnectIndexOutOfRange || !strings.Contains(cond.Message, "z") {
+			t.Errorf("conditions = %+v, want IndexInRange False naming z", st.Conditions)
 		}
 		// A new resolver (a restart or a failover) 30 s later keeps holding...
 		h.now = t0.Add(30 * time.Second)
@@ -624,4 +763,16 @@ func testResolverController(t *testing.T) {
 			t.Error("no Event for a rejected report")
 		}
 	})
+}
+
+// drained reports whether any recorded Event so far carries reason, consuming
+// them.
+func drained(rec *record.FakeRecorder, reason string) bool {
+	found := false
+	for len(rec.Events) > 0 {
+		if strings.Contains(<-rec.Events, reason) {
+			found = true
+		}
+	}
+	return found
 }
