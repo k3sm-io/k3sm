@@ -32,7 +32,8 @@ const unpinnedKubeVersion = "v1.98.0"
 
 // pinFakeDigests points the pin table for version at the digests of the bytes
 // fakeDownload(content) writes, for the duration of the test. The real pins would
-// need a sha256 preimage.
+// need a sha256 preimage. It mutates the package-level payloadDigests table, so a
+// test that calls it must never be t.Parallel.
 func pinFakeDigests(t *testing.T, version, content string) {
 	t.Helper()
 	orig, had := payloadDigests[version]

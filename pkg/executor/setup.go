@@ -302,6 +302,10 @@ func downloadControlPlane(ctx context.Context, logger *slog.Logger, dir, kubeVer
 // a dev boot fetched them. Without a pin, requirePin refuses (the packaging path);
 // otherwise the set is accepted with one Warn naming the version, since there is no
 // reviewed digest to compare against and inventing one would be worse.
+//
+// It verifies the bytes in dir at the moment of the call only. On the boot path dir
+// is writable by the invoking user, so the check binds the bytes against a different
+// uid, not against a same-uid process (see restageFromRelease).
 func verifyControlPlaneDownload(logger *slog.Logger, dir, kubeVersion string, requirePin bool) error {
 	if _, pinned := PinnedPayloadDigests(kubeVersion); pinned || requirePin {
 		return VerifyDownloadedDigests(dir, kubeVersion)
@@ -386,6 +390,15 @@ func reportStagedControlPlane(ctx context.Context, logger *slog.Logger, bd, kube
 // That is acceptable only because this branch is dev-shell-only: it downloads with
 // `gh`, which a launchd daemon never has — a packaged install stages and re-stages
 // through seedBinDir from its payload instead.
+//
+// The renames move kube-apiserver last and the marker is written after all four, so
+// a set torn part-way never looks present (presence is keyed on kube-apiserver).
+//
+// Same-uid assumption: the digest check binds the bytes only against a DIFFERENT
+// uid. The scratch dir and the bin dir are writable by the invoking user, so a
+// process running as that user can swap a binary between verify and rename. That is
+// accepted because this path runs only for the dev shell or a user-owned work dir;
+// a packaged install re-stages from its payload through seedBinDir.
 func restageFromRelease(ctx context.Context, logger *slog.Logger, bd, kubeVersion string) error {
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create control-plane dir %s: %w", bd, err)
@@ -406,7 +419,16 @@ func restageFromRelease(ctx context.Context, logger *slog.Logger, bd, kubeVersio
 	if err := clearKubeMarker(bd); err != nil {
 		return err
 	}
+	// kube-apiserver LAST: presence of a set is keyed on it, so a torn set (some of
+	// the four moved, then a failure) must never look present to the next boot.
+	order := make([]string, 0, len(cpBinaries))
 	for _, name := range cpBinaries {
+		if name != "kube-apiserver" {
+			order = append(order, name)
+		}
+	}
+	order = append(order, "kube-apiserver")
+	for _, name := range order {
 		if err := os.Rename(filepath.Join(tmp, name), filepath.Join(bd, name)); err != nil {
 			return fmt.Errorf("%w: install re-staged %s: %w", errTornControlPlaneSet, name, err)
 		}
