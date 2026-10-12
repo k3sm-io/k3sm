@@ -175,9 +175,10 @@ func startInterconnectNode(ctx context.Context, opts nodeOptions, cs kubernetes.
 		return noStop
 	}
 	own := interconnect.NewOwnNode(cs, opts.nodeName)
-	prober := interconnect.NewProber(nil)
+	var rep *interconnect.Reporter
+	prober := interconnect.NewMeshLiveness(func() { rep.Nudge() })
 	nodeRef := &corev1.ObjectReference{Kind: "Node", Name: opts.nodeName, UID: types.UID(opts.nodeName)}
-	rep := interconnect.NewReporter(interconnect.ReporterConfig{
+	rep = interconnect.NewReporter(interconnect.ReporterConfig{
 		Node:       opts.nodeName,
 		Discovery:  interconnect.LinkenumDiscovery{Enum: linkenum.Exec{}},
 		Peers:      slot0Peers(meshPeerIndices(list)),
@@ -202,7 +203,7 @@ func startInterconnectNode(ctx context.Context, opts nodeOptions, cs kubernetes.
 	var wg sync.WaitGroup
 	for _, run := range []func(context.Context){
 		own.Run,
-		func(ctx context.Context) { prober.Run(ctx, rep.Nudge) },
+		prober.Run,
 		rep.Run,
 		func(ctx context.Context) { handler.Run(ctx, own.Changed()) },
 	} {

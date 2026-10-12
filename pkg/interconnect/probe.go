@@ -18,35 +18,32 @@ package interconnect
 
 import (
 	"context"
-	"fmt"
 	"net/netip"
-	"os/exec"
-	"sync"
 	"time"
+
+	"k3sm.io/darwin-net/pkg/mesh"
 )
 
-const (
-	// ProbeInterval is how often each peer's slot-0 address is probed.
-	ProbeInterval = 5 * time.Second
-	// ProbeMisses is how many unanswered probes in a row declare a peer
-	// unreachable (15 s at ProbeInterval).
-	ProbeMisses = 3
-	// probeTimeout bounds one echo's wait for its reply.
-	probeTimeout = 2 * time.Second
-)
+// ProbeInterval is how often each peer's slot-0 address is probed; the
+// darwin-net prober owns the cadence and the three-miss rule.
+const ProbeInterval = mesh.ProbeInterval
+
+// interconnectIface is the interface every interconnect address lives on. It is
+// the prober's target key only; the echo itself is routed by destination.
+const interconnectIface = "bridge0"
 
 // PeerProbe is one peer's liveness as the probe sees it.
 type PeerProbe struct {
 	// Alive reports whether the peer answers.
 	Alive bool
-	// RTT is the last answered probe's round trip. It is diagnostic only and
+	// RTT is the last answered probe's round trip when the probe measures one
+	// (darwin-net's prober does not; it reads zero). It is diagnostic only and
 	// never enters a report, so an RTT change never causes a write.
 	RTT time.Duration
 }
 
 // Liveness is the reporter's probe seam: the set of addresses to probe and
-// their current verdicts. darwin-net's mesh.Prober has the same shape and can
-// stand behind it once it is constructible from this module.
+// their current verdicts.
 type Liveness interface {
 	// SetTargets replaces the probed set. A target that stays keeps its state;
 	// a new one starts unreachable.
@@ -55,147 +52,37 @@ type Liveness interface {
 	Probe(addr netip.Addr) PeerProbe
 }
 
-// Pinger sends one echo to dst and waits for its reply.
-type Pinger interface {
-	Ping(ctx context.Context, dst netip.Addr, timeout time.Duration) error
+// MeshLiveness is the node's Liveness: darwin-net's mesh.Prober (one ICMP echo
+// per target every mesh.ProbeInterval, alive from the first answer, unreachable
+// after mesh.ProbeMisses misses in a row, a new target unreachable until it
+// answers) keyed on bridge0.
+type MeshLiveness struct {
+	p *mesh.Prober
 }
 
-// Prober is the Liveness the node runs: one echo per target every
-// ProbeInterval, alive from the first answered echo, unreachable after
-// ProbeMisses unanswered ones in a row. A new target starts unreachable, so a
-// peer counts only once it has answered over the cable.
-//
-// Locking discipline: mu guards targets; Ping runs without it.
-type Prober struct {
-	ping Pinger
-
-	mu      sync.Mutex
-	targets map[netip.Addr]*probeState
-}
-
-type probeState struct {
-	alive  bool
-	misses int
-	rtt    time.Duration
-}
-
-// NewProber returns a Prober over ping (nil: ExecPinger).
-func NewProber(ping Pinger) *Prober {
-	if ping == nil {
-		ping = ExecPinger{}
-	}
-	return &Prober{ping: ping, targets: map[netip.Addr]*probeState{}}
+// NewMeshLiveness returns a MeshLiveness that calls onChange (when non-nil,
+// outside any lock) on every peer transition.
+func NewMeshLiveness(onChange func()) *MeshLiveness {
+	return &MeshLiveness{p: mesh.NewProber(func(mesh.ProbeTarget, bool) {
+		if onChange != nil {
+			onChange()
+		}
+	})}
 }
 
 // SetTargets implements Liveness.
-func (p *Prober) SetTargets(targets []netip.Addr) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	next := make(map[netip.Addr]*probeState, len(targets))
-	for _, t := range targets {
-		if st, ok := p.targets[t]; ok {
-			next[t] = st
-			continue
-		}
-		next[t] = &probeState{}
+func (l *MeshLiveness) SetTargets(targets []netip.Addr) {
+	ts := make([]mesh.ProbeTarget, 0, len(targets))
+	for _, a := range targets {
+		ts = append(ts, mesh.ProbeTarget{Iface: interconnectIface, Peer: a})
 	}
-	p.targets = next
+	l.p.SetTargets(ts)
 }
 
 // Probe implements Liveness.
-func (p *Prober) Probe(addr netip.Addr) PeerProbe {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	st, ok := p.targets[addr]
-	if !ok {
-		return PeerProbe{}
-	}
-	return PeerProbe{Alive: st.alive, RTT: st.rtt}
+func (l *MeshLiveness) Probe(addr netip.Addr) PeerProbe {
+	return PeerProbe{Alive: l.p.Alive(interconnectIface, addr)}
 }
 
-// Round probes every target once, concurrently, and folds in the results.
-func (p *Prober) Round(ctx context.Context) {
-	p.mu.Lock()
-	targets := make([]netip.Addr, 0, len(p.targets))
-	for t := range p.targets {
-		targets = append(targets, t)
-	}
-	p.mu.Unlock()
-
-	type result struct {
-		addr netip.Addr
-		err  error
-		rtt  time.Duration
-	}
-	results := make(chan result, len(targets))
-	var wg sync.WaitGroup
-	for _, t := range targets {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			start := time.Now()
-			err := p.ping.Ping(ctx, t, probeTimeout)
-			results <- result{addr: t, err: err, rtt: time.Since(start)}
-		}()
-	}
-	wg.Wait()
-	close(results)
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for r := range results {
-		st, ok := p.targets[r.addr]
-		if !ok {
-			continue
-		}
-		if r.err == nil {
-			st.alive, st.misses, st.rtt = true, 0, r.rtt
-			continue
-		}
-		st.misses++
-		if st.misses >= ProbeMisses {
-			st.alive = false
-		}
-	}
-}
-
-// Run probes every target once per ProbeInterval until ctx ends, calling
-// after (when non-nil) after each round.
-func (p *Prober) Run(ctx context.Context, after func()) {
-	t := time.NewTicker(ProbeInterval)
-	defer t.Stop()
-	for {
-		p.Round(ctx)
-		if after != nil {
-			after()
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-	}
-}
-
-// ExecPinger pings with the system ping(8), which needs no privilege. It is
-// the node's production Pinger.
-type ExecPinger struct{}
-
-// pingPath is the system ping binary.
-const pingPath = "/sbin/ping"
-
-// Ping implements Pinger with one echo and a whole-second wait.
-func (ExecPinger) Ping(ctx context.Context, dst netip.Addr, timeout time.Duration) error {
-	if !dst.Is4() {
-		return fmt.Errorf("ping %s: not an IPv4 address", dst)
-	}
-	secs := max(int(timeout/time.Second), 1)
-	ctx, cancel := context.WithTimeout(ctx, timeout+time.Second)
-	defer cancel()
-	// -n numeric, -q quiet, -c 1 one echo, -t the whole wait in seconds.
-	cmd := exec.CommandContext(ctx, pingPath, "-n", "-q", "-c", "1", "-t", fmt.Sprint(secs), dst.String())
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("ping %s: %w", dst, err)
-	}
-	return nil
-}
+// Run probes until ctx ends.
+func (l *MeshLiveness) Run(ctx context.Context) { l.p.Run(ctx) }

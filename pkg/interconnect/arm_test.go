@@ -110,39 +110,17 @@ func TestSetEnabledRecordsTheAuthenticatedIdentity(t *testing.T) {
 	}
 }
 
-type scriptedPinger map[netip.Addr]error
-
-func (p scriptedPinger) Ping(_ context.Context, dst netip.Addr, _ time.Duration) error { return p[dst] }
-
-// TestProberAliveAfterAnswerDeadAfterThreeMisses pins the liveness rule the
-// report's reachable peers rest on.
-func TestProberAliveAfterAnswerDeadAfterThreeMisses(t *testing.T) {
-	ctx := context.Background()
+// TestMeshLivenessKeysOnBridge0 pins the adapter over darwin-net's prober: a
+// new target reads unreachable, and a removed one stays so.
+func TestMeshLivenessKeysOnBridge0(t *testing.T) {
 	a := netip.MustParseAddr("169.254.0.9")
-	ping := scriptedPinger{a: errors.New("timeout")}
-	p := NewProber(ping)
-	p.SetTargets([]netip.Addr{a})
-	if p.Probe(a).Alive {
+	var l Liveness = NewMeshLiveness(nil)
+	l.SetTargets([]netip.Addr{a})
+	if l.Probe(a).Alive {
 		t.Fatal("a new target must start unreachable")
 	}
-	ping[a] = nil
-	p.Round(ctx)
-	if !p.Probe(a).Alive {
-		t.Fatal("an answered echo must mark the peer alive")
-	}
-	ping[a] = errors.New("timeout")
-	for i := 1; i < ProbeMisses; i++ {
-		p.Round(ctx)
-		if !p.Probe(a).Alive {
-			t.Fatalf("dead after %d misses, want %d", i, ProbeMisses)
-		}
-	}
-	p.Round(ctx)
-	if p.Probe(a).Alive {
-		t.Fatalf("still alive after %d misses", ProbeMisses)
-	}
-	p.SetTargets(nil)
-	if p.Probe(a).Alive {
+	l.SetTargets(nil)
+	if l.Probe(a).Alive {
 		t.Fatal("a removed target must read unreachable")
 	}
 }
