@@ -80,6 +80,11 @@ exit 2
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// The inspector runs codesign by absolute path, never through PATH, so it is
+	// pointed at the fake through its Tool seam.
+	origSigner := bootCodeSigner
+	t.Cleanup(func() { bootCodeSigner = origSigner })
+	bootCodeSigner = codesignSigner{CodesignInspector: binsign.CodesignInspector{Tool: filepath.Join(dir, "codesign")}}
 	return func() []signCall {
 		b, err := os.ReadFile(log)
 		if err != nil {

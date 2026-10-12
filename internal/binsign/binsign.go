@@ -139,19 +139,36 @@ func (Codesign) Verify(ctx context.Context, path string) (bool, error) {
 	return image.CodesignTool{}.AdHoc(ctx, path)
 }
 
+// SystemCodesign is the absolute path of the system codesign tool. The
+// inspector runs it by path, never through PATH, so a directory early on the
+// daemon's PATH cannot answer for it.
+const SystemCodesign = "/usr/bin/codesign"
+
 // CodesignInspector is the production Inspector, over the codesign tool. The zero
-// value is usable.
-type CodesignInspector struct{}
+// value is usable and runs SystemCodesign.
+type CodesignInspector struct {
+	// Tool is the codesign binary to run; empty means SystemCodesign. It is a
+	// seam for tests that stand in a fake tool, never set in production.
+	Tool string
+}
+
+// tool returns the codesign binary i runs.
+func (i CodesignInspector) tool() string {
+	if i.Tool == "" {
+		return SystemCodesign
+	}
+	return i.Tool
+}
 
 // Inspect runs `codesign --verify --strict` and, on a valid signature,
 // `codesign -dv` for its kind and Team ID.
-func (CodesignInspector) Inspect(ctx context.Context, path string) (Signature, error) {
-	ok, err := image.CodesignTool{}.Signed(ctx, path)
+func (i CodesignInspector) Inspect(ctx context.Context, path string) (Signature, error) {
+	ok, err := i.run(ctx, "--verify", "--strict", path)
 	if err != nil || !ok {
 		return Signature{}, err
 	}
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "codesign", "-dv", path)
+	cmd := exec.CommandContext(ctx, i.tool(), "-dv", path)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
@@ -161,6 +178,20 @@ func (CodesignInspector) Inspect(ctx context.Context, path string) (Signature, e
 		return Signature{}, fmt.Errorf("display signature of %s: %w", path, err)
 	}
 	return parseDisplay(stderr.String()), nil
+}
+
+// run runs the tool with args and maps its exit to a verdict: exit 0 is true, any
+// other exit false, and only a failure to run the tool at all is an error.
+func (i CodesignInspector) run(ctx context.Context, args ...string) (bool, error) {
+	err := exec.CommandContext(ctx, i.tool(), args...).Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return false, nil
+	}
+	return false, fmt.Errorf("run %s: %w", i.tool(), err)
 }
 
 // parseDisplay reads `codesign -dv` output of a file whose signature verified.
@@ -192,16 +223,12 @@ func parseDisplay(out string) Signature {
 // Satisfies runs `codesign --verify --strict -R=<requirement>`; the leading "="
 // makes codesign read the argument as requirement text, not a file path. Exit 0
 // is true, any other exit false; only a failure to run the tool is an error.
-func (CodesignInspector) Satisfies(ctx context.Context, path, requirement string) (bool, error) {
-	err := exec.CommandContext(ctx, "codesign", "--verify", "--strict", "-R="+requirement, path).Run()
-	if err == nil {
-		return true, nil
+func (i CodesignInspector) Satisfies(ctx context.Context, path, requirement string) (bool, error) {
+	ok, err := i.run(ctx, "--verify", "--strict", "-R="+requirement, path)
+	if err != nil {
+		return false, fmt.Errorf("verify %s against a requirement: %w", path, err)
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		return false, nil
-	}
-	return false, fmt.Errorf("verify %s against a requirement: %w", path, err)
+	return ok, nil
 }
 
 // identitySigned reports whether s can inspect signatures and path carries a
