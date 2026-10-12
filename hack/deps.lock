@@ -586,7 +586,7 @@ google.golang.org/grpc/examples v0.0.0-20250407062114-b368379ef8f6 # 2025-04-07T
 google.golang.org/grpc/gcp/observability v1.0.1 # 2024-02-28T21:41:18Z
 google.golang.org/grpc/security/advancedtls v1.0.0 # 2024-06-28T17:31:02Z
 google.golang.org/grpc/stats/opencensus v1.0.0 # 2023-04-14T22:26:20Z
-google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af # 2026-01-20T15:10:49Z
+google.golang.org/protobuf v1.36.12 # 2026-08-10T13:29:45Z
 gopkg.in/alecthomas/kingpin.v2 v2.2.6 # 2017-12-17T18:08:38Z
 gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c # 2020-11-30T13:44:42Z
 gopkg.in/cheggaaa/pb.v1 v1.0.25 # 2018-05-21T09:56:06Z

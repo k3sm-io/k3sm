@@ -19,7 +19,7 @@ require (
 	golang.org/x/sys v0.48.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d
 	google.golang.org/grpc v1.83.2
-	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
+	google.golang.org/protobuf v1.36.12
 	k3sm.io/apis v0.0.0-00010101000000-000000000000
 	k3sm.io/darwin-net v0.0.0-00010101000000-000000000000
 	k3sm.io/runtimed v0.0.0-00010101000000-000000000000
