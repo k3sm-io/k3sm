@@ -70,12 +70,17 @@ limitations under the License.
 // # Sharded models
 //
 // A model with spec.distributed takes a different path (sharded.go): its fit is
-// checked per rank, its ranks are placed over the direct-link graph (Place, a
-// pure function over a consumer-defined Topology), and it is served by one
+// checked per rank, its collective path is resolved from
+// spec.distributed.interconnect over the thunderbolt Interconnect's segments
+// (Place, a pure function over a Cable), and it is served by one
 // operator-owned Pod per rank instead of a StatefulSet. Rank Pods are a GANG:
 // losing any one deletes the rest and re-places all of them, because MLX's
 // collective init blocks on every rank and a partial gang can never serve.
-// ShardsPlaced and LinksHealthy sit beside Ready, which needs every rank.
+// ShardsPlaced and LinksHealthy sit beside Ready, which needs every rank. A gang
+// on the thunderbolt path that loses a segment member is re-rendered on pod IPs
+// (fallback network, at most once per model per five minutes) or held
+// (fallback none); a gang on the network is never restarted because the cable
+// came back.
 //
 // # What this package deliberately does not do
 //

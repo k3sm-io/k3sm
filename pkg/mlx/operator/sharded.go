@@ -18,9 +18,9 @@ package operator
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,73 +30,79 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/utils/ptr"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
+	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/mlx"
 	"k3sm.io/k3sm/pkg/mlx/topology"
 )
 
 // Sharded requeue cadences. Placement and link health depend on objects this
-// controller does not watch (Nodes, DirectLinks), so a sharded model re-checks
-// itself on a timer instead of waiting for the ten-minute resync.
+// controller does not watch (Nodes, the Interconnect), so a sharded model
+// re-checks itself on a timer instead of waiting for the ten-minute resync.
 const (
 	// placementRetry is how soon a model that could not be placed tries again:
-	// a cable plugged in or a node joining should not wait for a resync.
+	// a cable armed or a node joining should not wait for a resync.
 	placementRetry = 30 * time.Second
 	// gangRetry is how soon a gang restart re-checks whether the survivors are
 	// gone, so the re-placement follows the teardown promptly.
 	gangRetry = 2 * time.Second
-	// linkRecheck is how often a placed gang re-reads the link graph for
-	// LinksHealthy.
+	// linkRecheck is how often a gang placed on the network re-reads its
+	// status. It watches no link, so it has no loss budget to meet.
 	linkRecheck = 30 * time.Second
+	// interconnectRecheck is how often a gang placed on the thunderbolt path
+	// re-reads the Interconnect for LinksHealthy. The resolver marks a dead
+	// member within 20 s, and plan I10 starts the re-render within 30 s, so
+	// this is the remaining 10 s.
+	interconnectRecheck = 10 * time.Second
+	// interconnectRestartLimit is the shortest interval between two
+	// interconnect-driven gang restarts of one model (plan I10). A flapping
+	// cable cannot turn into a restart loop that re-downloads weights.
+	interconnectRestartLimit = 5 * time.Minute
 )
 
-// directLinkResource is the resolver-written DirectLink resource.
-var directLinkResource = netv1alpha1.SchemeGroupVersion.WithResource("directlinks")
-
-// directLinkTopology is the production Topology: the DirectLink objects, read
-// through the dynamic client (apis publishes no clientset for them).
-type directLinkTopology struct {
-	dyn dynamic.Interface
+// interconnectRestart is the controller's memory of a model's last
+// interconnect-driven gang restart.
+type interconnectRestart struct {
+	// at is when the restart was started; the next waits for
+	// interconnectRestartLimit after it.
+	at time.Time
+	// toNetwork means the re-placement that follows has not happened yet, and
+	// must land on the network (fallback network: re-render on pod IPs).
+	toNetwork bool
 }
 
-// Graph lists every DirectLink and builds the up-link graph from their status.
-// A cluster where the DirectLink CRD does not exist yet has no cables, which is
-// an empty graph, not an error.
-func (t directLinkTopology) Graph(ctx context.Context) (topology.Graph, error) {
-	list, err := t.dyn.Resource(directLinkResource).List(ctx, metav1.ListOptions{})
+// readCable reads what interconnect path selection needs: the thunderbolt
+// Interconnect through the operator's own dynamic client, and the node cluster
+// indices through the injected source, turned into slot-1 addresses. A cluster
+// without the Interconnect CRD or object has no cable, which is an empty
+// graph, not an error; the returned object is nil then.
+func (c *Controller) readCable(ctx context.Context) (Cable, *netv1alpha1.Interconnect, error) {
+	ic, err := interconnect.Store{Client: c.dyn}.Get(ctx, interconnect.Name)
 	if apierrors.IsNotFound(err) {
-		return topology.Graph{}, nil
+		ic, err = nil, nil
 	}
 	if err != nil {
-		return topology.Graph{}, fmt.Errorf("list directlinks: %w", err)
+		return Cable{}, nil, fmt.Errorf("read interconnect %s: %w", interconnect.Name, err)
 	}
-	links := make([]netv1alpha1.DirectLink, 0, len(list.Items))
-	for i := range list.Items {
-		dl, err := toDirectLink(&list.Items[i])
-		if err != nil {
-			return topology.Graph{}, err
+	cable := Cable{Graph: topology.FromInterconnect(ic), Addresses: map[string]netip.Addr{}}
+	if c.indices == nil || ic == nil || !ic.Spec.Enabled {
+		return cable, ic, nil
+	}
+	idx, err := c.indices(ctx)
+	if err != nil {
+		return Cable{}, nil, fmt.Errorf("read node cluster indices: %w", err)
+	}
+	for node, i := range idx.Index {
+		// A node beyond the interconnect ceiling has no address and is left
+		// out, never given an improvised one.
+		if a, err := netv1alpha1.InterconnectSlotAddress(i, netv1alpha1.InterconnectSlotMLXRank); err == nil {
+			cable.Addresses[node] = a
 		}
-		links = append(links, *dl)
 	}
-	return topology.FromDirectLinks(links), nil
-}
-
-// toDirectLink decodes an unstructured DirectLink (JSON round trip, like
-// toModel).
-func toDirectLink(u *unstructured.Unstructured) (*netv1alpha1.DirectLink, error) {
-	raw, err := u.MarshalJSON()
-	if err != nil {
-		return nil, fmt.Errorf("encode unstructured directlink %s: %w", u.GetName(), err)
-	}
-	var dl netv1alpha1.DirectLink
-	if err := json.Unmarshal(raw, &dl); err != nil {
-		return nil, fmt.Errorf("decode directlink %s: %w", u.GetName(), err)
-	}
-	return &dl, nil
+	return cable, ic, nil
 }
 
 // reconcileSharded is Reconcile for a model with spec.distributed: GANG
@@ -181,19 +187,24 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 		if err := c.applyService(ctx, clusterIP); err != nil {
 			return err
 		}
-		graph, err := c.topo.Graph(ctx)
+		cable, ic, err := c.readCable(ctx)
 		if err != nil {
-			return fmt.Errorf("read link graph for mlxmodel %s: %w", key, err)
+			return fmt.Errorf("read interconnect for mlxmodel %s: %w", key, err)
 		}
-		c.queue.AddAfter(key, linkRecheck)
-		return c.writeShardedStatus(ctx, raw, model, placedObservation(pods, graph, desired, hash, c.observeRanks(ctx, model, pods)))
+		obs := placedObservation(pods, cable.Graph, desired, hash, c.observeRanks(ctx, model, pods))
+		if obs.Interconnect != mlxv1alpha1.MLXInterconnectThunderbolt {
+			c.queue.AddAfter(key, linkRecheck)
+			return c.writeShardedStatus(ctx, raw, model, obs)
+		}
+		return c.watchInterconnect(ctx, key, raw, model, ic, obs)
 	}
 
 	// No rank exists: place the gang.
-	graph, err := c.topo.Graph(ctx)
+	cable, _, err := c.readCable(ctx)
 	if err != nil {
-		return fmt.Errorf("read link graph for mlxmodel %s: %w", key, err)
+		return fmt.Errorf("read interconnect for mlxmodel %s: %w", key, err)
 	}
+	cable.ForceNetwork = c.icRestarts[key].toNetwork
 	nodes, err := c.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list nodes for mlxmodel %s: %w", key, err)
@@ -204,7 +215,7 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	if err != nil {
 		return fmt.Errorf("list pods for mlxmodel %s gpu slots: %w", key, err)
 	}
-	placement, err := Place(model, graph, nodes.Items, HeldGPUSlots(model, allPods.Items))
+	placement, err := Place(model, cable, nodes.Items, HeldGPUSlots(model, allPods.Items))
 	var refused *PlacementError
 	if errors.As(err, &refused) {
 		c.log.Info("sharded mlxmodel cannot be placed yet; no rank pod created",
@@ -230,12 +241,69 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	if err := c.applySharded(ctx, objs); err != nil {
 		return err
 	}
-	c.log.Info("placed sharded mlxmodel", "mlxmodel", key, "backend", placement.Backend, "nodes", placedNodes(placement))
+	c.log.Info("placed sharded mlxmodel", "mlxmodel", key, "backend", placement.Backend,
+		"interconnect", placement.Path(), "nodes", placedNodes(placement))
+	if r, ok := c.icRestarts[key]; ok && r.toNetwork {
+		r.toNetwork = false
+		c.icRestarts[key] = r
+	}
 	created := make([]corev1.Pod, len(objs.Pods))
 	for i, p := range objs.Pods {
 		created[i] = *p
 	}
-	return c.writeShardedStatus(ctx, raw, model, placedObservation(created, graph, desired, hash, c.observeRanks(ctx, model, created)))
+	if placement.Path() == mlxv1alpha1.MLXInterconnectThunderbolt {
+		c.queue.AddAfter(key, interconnectRecheck)
+	}
+	return c.writeShardedStatus(ctx, raw, model, placedObservation(created, cable.Graph, desired, hash, c.observeRanks(ctx, model, created)))
+}
+
+// watchInterconnect is the whole-gang reconcile for a gang placed on the
+// thunderbolt path: LinksHealthy, and what a lost member costs (plan §4 and
+// I10).
+//
+// A placed member that is no longer up sets LinksHealthy=False. Under the
+// Interconnect's fallback network the gang is re-rendered on pod IPs: every
+// rank is deleted (the gang restart the spec-hash path uses) and the
+// re-placement that follows is forced onto the network. That restart is
+// limited to one per model per interconnectRestartLimit; inside the limit the
+// gang is held and the message says until when. Under fallback none the gang
+// is held and reported. A gang on the network is never restarted because the
+// cable came back: only the next gang restart re-resolves the path.
+func (c *Controller) watchInterconnect(ctx context.Context, key string, raw *unstructured.Unstructured, model *mlxv1alpha1.MLXModel, ic *netv1alpha1.Interconnect, obs mlx.ShardObservation) error {
+	c.queue.AddAfter(key, interconnectRecheck)
+	if len(obs.DownLinks) == 0 {
+		return c.writeShardedStatus(ctx, raw, model, obs)
+	}
+	fallback := netv1alpha1.InterconnectFallbackNetwork
+	if ic != nil {
+		fallback = ic.Spec.EffectiveFallback()
+	}
+	if fallback == netv1alpha1.InterconnectFallbackNone {
+		obs.DownLinkAction = "the Interconnect's fallback is none, so the gang is held on the interconnect until the link is back"
+		c.log.Warn("sharded mlxmodel lost an interconnect link; fallback none, holding the gang",
+			"mlxmodel", key, "down", obs.DownLinks)
+		return c.writeShardedStatus(ctx, raw, model, obs)
+	}
+	now := c.now()
+	if last, ok := c.icRestarts[key]; ok && now.Sub(last.at) < interconnectRestartLimit {
+		next := last.at.Add(interconnectRestartLimit)
+		obs.DownLinkAction = fmt.Sprintf("the Interconnect's fallback is network, but this model had an interconnect-driven gang restart at %s; the re-render on pod IPs waits until %s (at most one per %s)",
+			last.at.UTC().Format(time.RFC3339), next.UTC().Format(time.RFC3339), interconnectRestartLimit)
+		c.queue.AddAfter(key, next.Sub(now))
+		return c.writeShardedStatus(ctx, raw, model, obs)
+	}
+	fault := fmt.Sprintf("interconnect link %s is down; re-rendering the gang on pod IPs (fallback network)", strings.Join(obs.DownLinks, ", "))
+	if err := c.deleteRankPods(ctx, model, fault); err != nil {
+		return err
+	}
+	c.icRestarts[key] = interconnectRestart{at: now, toNetwork: true}
+	c.log.Warn("sharded mlxmodel lost an interconnect link; re-rendering on pod IPs", "mlxmodel", key, "down", obs.DownLinks)
+	c.queue.AddAfter(key, gangRetry)
+	obs.DownLinkAction = "the Interconnect's fallback is network, so the gang is re-rendered on pod IPs"
+	return c.writeShardedStatus(ctx, raw, model, mlx.ShardObservation{
+		Desired: obs.Desired, GangRestart: fault, Pods: obs.Pods, Interconnect: obs.Interconnect,
+		PlacedLinks: obs.PlacedLinks, DownLinks: obs.DownLinks, DownLinkAction: obs.DownLinkAction,
+	})
 }
 
 // applySharded applies the Services, creates the cache claims, then creates the
@@ -398,7 +466,7 @@ func (c *Controller) observeRanks(ctx context.Context, model *mlxv1alpha1.MLXMod
 // placedObservation is the observation of a placed gang: placement facts read
 // back from the rank Pods' own annotations (what the gang was placed for, not
 // what a fresh placement would choose), and the placed links re-checked
-// against the live graph.
+// against the live interconnect graph.
 func placedObservation(pods []corev1.Pod, graph topology.Graph, desired int32, hash string, states []mlx.PodState) mlx.ShardObservation {
 	obs := mlx.ShardObservation{Desired: desired, Placed: true, SpecHash: hash, Pods: states}
 	var nodes []string
@@ -407,6 +475,7 @@ func placedObservation(pods []corev1.Pod, graph topology.Graph, desired int32, h
 	}
 	if len(pods) > 0 {
 		obs.Backend = mlxv1alpha1.MLXDistributedBackend(pods[0].Annotations[mlx.AnnotationBackend])
+		obs.Interconnect = mlx.Placement{Interconnect: mlxv1alpha1.MLXInterconnect(pods[0].Annotations[mlx.AnnotationInterconnect])}.Path()
 		links := mlx.ParsePlacedLinks(pods[0].Annotations[mlx.AnnotationPlacedLinks])
 		obs.PlacedLinks = len(links)
 		for _, l := range links {
@@ -415,7 +484,7 @@ func placedObservation(pods []corev1.Pod, graph topology.Graph, desired int32, h
 			}
 		}
 	}
-	obs.PlacementMessage = fmt.Sprintf("%d ranks placed on %s (%s)", len(pods), strings.Join(nodes, ", "), obs.Backend)
+	obs.PlacementMessage = fmt.Sprintf("%d ranks placed on %s (%s over %s)", len(pods), strings.Join(nodes, ", "), obs.Backend, obs.Interconnect)
 	return obs
 }
 

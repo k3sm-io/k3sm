@@ -14,14 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package topology is the MLX operator's view of the direct-link cable graph:
-// which cluster nodes are joined by an up direct link, over which interfaces and
-// RDMA devices, and the deterministic searches sharded placement runs over it.
+// Package topology is the MLX operator's view of the interconnect: which
+// cluster nodes can reach each other over an up interconnect segment, and the
+// deterministic searches sharded placement runs over that graph.
 //
-// It is a CONSUMER-side value type. The server's link resolver owns the
-// DirectLink objects and their status; this package only reads the resolved
-// status (FromDirectLinks) into a plain graph, so placement and its tests work
+// It is a CONSUMER-side value type. The server's interconnect resolver owns the
+// Interconnect object and its status; this package only reads the resolved
+// status (FromInterconnect) into a plain graph, so placement and its tests work
 // on hand-built graphs with no API server behind them.
+//
+// A bridged interconnect segment is one L2 domain: every member reaches every
+// other member directly. FromInterconnect therefore makes each segment a
+// clique, and Ring and Clique keep working over it unchanged.
 //
 // The searches are brute force on purpose. A cable graph between Macs has a
 // handful of nodes (n <= 5 ranks in practice), so enumerating every subset and
@@ -30,38 +34,33 @@ limitations under the License.
 package topology
 
 import (
-	"cmp"
 	"slices"
 
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 )
 
-// Edge is one direction of an up direct link: the local end on the node that
-// keys it, and the far end on the peer it points to.
+// Edge is one direction of an up link: the local end on the node that keys it,
+// and the far end on the peer it points to.
 type Edge struct {
-	// LocalIface is the local interface carrying the link (e.g. "en2").
-	LocalIface string
-	// LocalRDMA is the local RDMA device on that port ("rdma_en2"), or empty.
+	// Segment is the interconnect segment both ends are up in, or empty for a
+	// hand-built edge.
+	Segment string
+	// LocalRDMA is the local RDMA device on the link ("rdma_en2"), or empty.
+	// The Interconnect status carries no RDMA device, so FromInterconnect
+	// leaves it empty: jaccl over a bridged segment waits on the rig answer to
+	// whether RDMA enumerates on bridged ports.
 	LocalRDMA string
-	// LocalIP is the local end's direct-link address, or empty when unknown.
-	LocalIP string
-	// PeerIface is the peer's interface at the far end.
-	PeerIface string
 	// PeerRDMA is the peer's RDMA device at the far end, or empty.
 	PeerRDMA string
-	// PeerIP is the peer's direct-link address.
-	PeerIP string
-	// SpeedGbps is the negotiated link speed in Gb/s (0 = unknown).
-	SpeedGbps int32
 }
 
 // RDMA reports whether both ends of the link carry an RDMA device.
 func (e Edge) RDMA() bool { return e.LocalRDMA != "" && e.PeerRDMA != "" }
 
-// Graph is the up direct-link graph: Edges[node][peer] is the link node uses to
-// reach peer. A graph built by FromDirectLinks is symmetric (an edge exists only
-// when both directions do); a hand-built graph is read as given, and the
-// searches below treat a pair as connected only when BOTH directions exist.
+// Graph is the up-link graph: Edges[node][peer] is the link node uses to reach
+// peer. A graph built by FromInterconnect is symmetric; a hand-built graph is
+// read as given, and the searches below treat a pair as connected only when
+// BOTH directions exist.
 type Graph struct {
 	Edges map[string]map[string]Edge
 }
@@ -212,73 +211,46 @@ func permutations(items []string, fn func([]string)) {
 	rec(len(a))
 }
 
-// FromDirectLinks builds the up-link graph from the resolver-written DirectLink
-// status. A port contributes an edge only when its resolved state is up and it
-// names its peer node; the local end's address, RDMA device and speed come from
-// the same node's spec port with the same interface. An edge whose reverse
-// direction is not also up is dropped, so the result is symmetric.
-//
-// When two nodes are joined by more than one up cable, one is chosen
-// deterministically per direction: the fastest, then one carrying RDMA at both
-// ends, then the lowest local interface name.
-func FromDirectLinks(links []netv1alpha1.DirectLink) Graph {
+// FromInterconnect builds the up-link graph from the resolver-written
+// Interconnect status: every pair of members that are up in the same segment is
+// joined in both directions, so each segment is a clique. A nil or disabled
+// Interconnect has no links (nothing holds an address on an unarmed cable), and
+// a member that is down, in a loop, unsegmented or excluded joins nothing. A
+// node listed twice keeps its first entry, so a malformed status can never join
+// two segments through one node.
+func FromInterconnect(ic *netv1alpha1.Interconnect) Graph {
 	g := Graph{Edges: map[string]map[string]Edge{}}
-	for i := range links {
-		dl := &links[i]
-		node := dl.Spec.NodeName
-		if node == "" {
-			node = dl.Name
-		}
-		if node == "" {
+	if ic == nil || !ic.Spec.Enabled {
+		return g
+	}
+	excluded := make(map[string]bool, len(ic.Spec.ExcludedNodes))
+	for _, n := range ic.Spec.ExcludedNodes {
+		excluded[n] = true
+	}
+	seen := map[string]bool{}
+	bySegment := map[string][]string{}
+	for _, m := range ic.Status.Members {
+		if m.Node == "" || seen[m.Node] {
 			continue
 		}
-		specPorts := make(map[string]netv1alpha1.DirectLinkPort, len(dl.Spec.Ports))
-		for _, p := range dl.Spec.Ports {
-			specPorts[p.Iface] = p
+		seen[m.Node] = true
+		if m.State != netv1alpha1.InterconnectMemberUp || m.Segment == "" || excluded[m.Node] {
+			continue
 		}
-		for _, st := range dl.Status.Ports {
-			if st.State != netv1alpha1.DirectLinkStateUp || st.PeerNodeName == "" || st.PeerNodeName == node {
-				continue
-			}
-			local := specPorts[st.Iface]
-			e := Edge{
-				LocalIface: st.Iface,
-				LocalRDMA:  local.RDMADevice,
-				LocalIP:    local.LinkIP,
-				PeerIface:  st.PeerIface,
-				PeerRDMA:   st.PeerRDMADevice,
-				PeerIP:     st.PeerLinkIP,
-				SpeedGbps:  local.SpeedGbps,
-			}
-			if g.Edges[node] == nil {
-				g.Edges[node] = map[string]Edge{}
-			}
-			if cur, ok := g.Edges[node][st.PeerNodeName]; !ok || better(e, cur) {
-				g.Edges[node][st.PeerNodeName] = e
-			}
-		}
+		bySegment[m.Segment] = append(bySegment[m.Segment], m.Node)
 	}
-	for node, peers := range g.Edges {
-		for peer := range peers {
-			if _, ok := g.Edges[peer][node]; !ok {
-				delete(peers, peer)
+	for seg, nodes := range bySegment {
+		for _, a := range nodes {
+			for _, b := range nodes {
+				if a == b {
+					continue
+				}
+				if g.Edges[a] == nil {
+					g.Edges[a] = map[string]Edge{}
+				}
+				g.Edges[a][b] = Edge{Segment: seg}
 			}
-		}
-		if len(peers) == 0 {
-			delete(g.Edges, node)
 		}
 	}
 	return g
-}
-
-// better orders two parallel cables between the same pair: faster first, then
-// RDMA-capable, then the lower local interface name.
-func better(a, b Edge) bool {
-	if a.SpeedGbps != b.SpeedGbps {
-		return a.SpeedGbps > b.SpeedGbps
-	}
-	if a.RDMA() != b.RDMA() {
-		return a.RDMA()
-	}
-	return cmp.Less(a.LocalIface, b.LocalIface)
 }

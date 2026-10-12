@@ -18,8 +18,8 @@ package operator
 
 import (
 	"context"
+	"maps"
 	"strings"
-	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,46 +28,61 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/utils/ptr"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
+	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/mlx"
-	"k3sm.io/k3sm/pkg/mlx/topology"
 )
 
-// mutableTopology is a fake Topology a test can re-cable between reconciles.
-type mutableTopology struct {
-	mu sync.Mutex
-	g  topology.Graph
-}
+// testIndices are the fake nodes' cluster indices: slot-1 addresses
+// 169.254.0.2 (mac-a), .10 (mac-b) and .18 (mac-c).
+var testIndices = map[string]int{"mac-a": 0, "mac-b": 1, "mac-c": 2}
 
-func (m *mutableTopology) Graph(context.Context) (topology.Graph, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.g, nil
-}
-
-func (m *mutableTopology) set(g topology.Graph) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.g = g
-}
-
-// shardedHarness wires a controller over a sharded model, the given nodes and
-// a re-cablable topology.
-func shardedHarness(t *testing.T, m *mlxv1alpha1.MLXModel, nodes []corev1.Node, g topology.Graph) (*harness, *mutableTopology) {
+// shardedHarness wires a controller over a sharded model, the given nodes, the
+// thunderbolt Interconnect ic (nil: none exists) and testIndices.
+func shardedHarness(t *testing.T, m *mlxv1alpha1.MLXModel, nodes []corev1.Node, ic *netv1alpha1.Interconnect) *harness {
 	t.Helper()
-	topo := &mutableTopology{g: g}
-	h := newHarness(t, m, func(c *Config) { c.Topology = topo })
+	h := newHarness(t, m, func(c *Config) {
+		c.InterconnectIndices = func(context.Context) (interconnect.Indices, error) {
+			return interconnect.Indices{Index: maps.Clone(testIndices)}, nil
+		}
+	})
 	for i := range nodes {
 		if _, err := h.kube.CoreV1().Nodes().Create(context.Background(), &nodes[i], metav1.CreateOptions{}); err != nil {
 			t.Fatalf("seed node: %v", err)
 		}
 	}
-	return h, topo
+	if ic != nil {
+		h.setInterconnect(t, ic)
+	}
+	return h
+}
+
+// setInterconnect creates or replaces the thunderbolt Interconnect.
+func (h *harness) setInterconnect(t *testing.T, ic *netv1alpha1.Interconnect) {
+	t.Helper()
+	ic = ic.DeepCopy()
+	ic.TypeMeta = metav1.TypeMeta{APIVersion: netv1alpha1.SchemeGroupVersion.String(), Kind: "Interconnect"}
+	ic.Name = interconnect.Name
+	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := &unstructured.Unstructured{Object: obj}
+	res := h.dyn.Resource(interconnect.GVR)
+	cur, err := res.Get(context.Background(), interconnect.Name, metav1.GetOptions{})
+	if err != nil {
+		if _, err := res.Create(context.Background(), u, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create interconnect: %v", err)
+		}
+		return
+	}
+	u.SetResourceVersion(cur.GetResourceVersion())
+	if _, err := res.Update(context.Background(), u, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update interconnect: %v", err)
+	}
 }
 
 func shardedModel(ranks int32, backend mlxv1alpha1.MLXDistributedBackend) *mlxv1alpha1.MLXModel {
@@ -123,8 +138,7 @@ func twoMacs() []corev1.Node {
 // ClusterIP one, NO StatefulSet, and ShardsPlaced=True while Ready waits for
 // every rank.
 func TestShardedReconcilePlacesRankPods(t *testing.T) {
-	h, _ := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(),
-		cable(topology.Graph{}, "mac-a", "mac-b", false))
+	h := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(), nil)
 	h.reconcile(t)
 
 	if h.statefulSet(t) != nil {
@@ -163,7 +177,7 @@ func TestShardedReconcilePlacesRankPods(t *testing.T) {
 // TestShardedReadyNeedsEveryRank: Ready is True only when ALL ranks are ready,
 // and only then is the endpoint published.
 func TestShardedReadyNeedsEveryRank(t *testing.T) {
-	h, _ := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(), topology.Graph{})
+	h := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(), nil)
 	h.reconcile(t)
 
 	// Rank 0 ready, rank 1 still not.
@@ -237,8 +251,8 @@ func TestShardedGangRestart(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h, _ := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing),
-				append(twoMacs(), gpuNode("mac-c", "64Gi", false)), topology.Graph{})
+			h := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing),
+				append(twoMacs(), gpuNode("mac-c", "64Gi", false)), nil)
 			h.reconcile(t)
 			h.markRanks(t, true)
 			h.reconcile(t)
@@ -303,7 +317,7 @@ func TestShardedRefusalsAreStatuses(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h, _ := shardedHarness(t, tc.model, tc.nodes, topology.Graph{})
+			h := shardedHarness(t, tc.model, tc.nodes, nil)
 			h.reconcile(t)
 			if n := len(h.rankPods(t)); n != 0 || h.statefulSet(t) != nil {
 				t.Errorf("objects created for an unplaceable model: %d rank pods, statefulset %v", n, h.statefulSet(t) != nil)
@@ -323,7 +337,7 @@ func TestShardedRefusalsAreStatuses(t *testing.T) {
 	}
 
 	t.Run("gpu_held_by_another_model", func(t *testing.T) {
-		h, _ := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(), topology.Graph{})
+		h := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(), nil)
 		other := gpuPod("elsewhere", "other-model-0", "mac-b", 1)
 		if _, err := h.kube.CoreV1().Pods(other.Namespace).Create(context.Background(), &other, metav1.CreateOptions{}); err != nil {
 			t.Fatalf("seed pod: %v", err)
@@ -345,7 +359,7 @@ func TestShardedRefusalsAreStatuses(t *testing.T) {
 	t.Run("two_replicas_is_an_invalid_spec", func(t *testing.T) {
 		m := shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing)
 		m.Spec.Replicas = ptr.To(int32(2))
-		h, _ := shardedHarness(t, m, twoMacs(), topology.Graph{})
+		h := shardedHarness(t, m, twoMacs(), nil)
 		h.reconcile(t)
 		if r := condition(t, h.status(t), mlxv1alpha1.MLXModelConditionReady); r.Reason != ReasonInvalidSpec {
 			t.Errorf("Ready reason = %s, want %s", r.Reason, ReasonInvalidSpec)
@@ -356,37 +370,10 @@ func TestShardedRefusalsAreStatuses(t *testing.T) {
 	})
 }
 
-// TestShardedLinksHealthy: a placed link going down flips LinksHealthy to
-// LinkDegraded naming the link, while a ring gang keeps serving.
-func TestShardedLinksHealthy(t *testing.T) {
-	h, topo := shardedHarness(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing), twoMacs(),
-		cable(topology.Graph{}, "mac-a", "mac-b", false))
-	h.reconcile(t)
-	h.markRanks(t, true)
-	h.reconcile(t)
-	if c := condition(t, h.status(t), mlx.ConditionLinksHealthy); c.Status != metav1.ConditionTrue || !strings.Contains(c.Message, "all 1 placed") {
-		t.Fatalf("LinksHealthy = %s %q, want True over 1 link", c.Status, c.Message)
-	}
-
-	topo.set(topology.Graph{})
-	h.reconcile(t)
-	s := h.status(t)
-	c := condition(t, s, mlx.ConditionLinksHealthy)
-	if c.Status != metav1.ConditionFalse || c.Reason != mlx.ReasonLinkDegraded || !strings.Contains(c.Message, "mac-a/mac-b") || !strings.Contains(c.Message, "ring keeps serving") {
-		t.Errorf("LinksHealthy = %s/%s %q, want False/LinkDegraded naming mac-a/mac-b", c.Status, c.Reason, c.Message)
-	}
-	if r := condition(t, s, mlxv1alpha1.MLXModelConditionReady); r.Status != metav1.ConditionTrue {
-		t.Errorf("Ready = %s; a ring gang keeps serving over the mesh", r.Status)
-	}
-	if len(h.rankPods(t)) != 2 {
-		t.Error("a degraded link restarted the gang")
-	}
-}
-
 // TestShardedReplacesTheSingleNodeShape: a model that switches to sharded
 // loses its StatefulSet; switching back loses its rank Pods.
 func TestShardedReplacesTheSingleNodeShape(t *testing.T) {
-	h, _ := shardedHarness(t, model(), twoMacs(), topology.Graph{})
+	h := shardedHarness(t, model(), twoMacs(), nil)
 	h.reconcile(t)
 	if h.statefulSet(t) == nil {
 		t.Fatal("precondition: no StatefulSet for the single-node model")
@@ -424,37 +411,5 @@ func TestShardedReplacesTheSingleNodeShape(t *testing.T) {
 	}
 	if h.statefulSet(t) == nil {
 		t.Error("no StatefulSet after the switch back")
-	}
-}
-
-// TestDirectLinkTopologyReadsResolvedStatus: the production Topology lists the
-// DirectLink objects and builds the graph from their up ports; a cluster
-// without the CRD has an empty graph.
-func TestDirectLinkTopologyReadsResolvedStatus(t *testing.T) {
-	gvrs := map[schema.GroupVersionResource]string{directLinkResource: "DirectLinkList"}
-	up := netv1alpha1.DirectLinkStateUp
-	mk := func(node, iface, peer, peerIface string) *unstructured.Unstructured {
-		dl := &netv1alpha1.DirectLink{
-			TypeMeta:   metav1.TypeMeta{APIVersion: netv1alpha1.SchemeGroupVersion.String(), Kind: "DirectLink"},
-			ObjectMeta: metav1.ObjectMeta{Name: node},
-			Spec: netv1alpha1.DirectLinkSpec{SchemaVersion: 1, NodeName: node, Medium: netv1alpha1.MediumThunderbolt,
-				Ports: []netv1alpha1.DirectLinkPort{{Iface: iface, DomainUUID: node + iface, SpeedGbps: 40}}},
-			Status: netv1alpha1.DirectLinkStatus{Ports: []netv1alpha1.DirectLinkPortStatus{
-				{Iface: iface, PeerNodeName: peer, PeerIface: peerIface, State: up}}},
-		}
-		obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(dl)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return &unstructured.Unstructured{Object: obj}
-	}
-	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), gvrs,
-		mk("mac-a", "en2", "mac-b", "en1"), mk("mac-b", "en1", "mac-a", "en2"))
-	g, err := directLinkTopology{dyn: dyn}.Graph(context.Background())
-	if err != nil {
-		t.Fatalf("Graph() error = %v", err)
-	}
-	if e, ok := g.Edge("mac-a", "mac-b"); !ok || e.LocalIface != "en2" || e.PeerIface != "en1" || e.SpeedGbps != 40 {
-		t.Errorf("edge mac-a->mac-b = %+v, %v", e, ok)
 	}
 }

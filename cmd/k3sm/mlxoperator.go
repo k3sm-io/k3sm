@@ -17,12 +17,14 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"log/slog"
 
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
 	"k3sm.io/k3sm/pkg/crdensure"
+	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 )
 
@@ -39,12 +41,19 @@ import (
 // gpu is the live GPU source; it is REQUIRED here even though the operator
 // tolerates nil, because on this path the facts are obtainable — the node this
 // same process is about to bring up holds the runtime that has them.
-func mlxOperatorConfig(cs kubernetes.Interface, dyn dynamic.Interface, crd crdensure.CRDClient, gpu operator.GPUSource, clusterDomain string, log *slog.Logger) operator.Config {
+//
+// indices is the node cluster-index source the interconnect resolver reads
+// (meshPeerIndexSet), so the operator's slot-1 addresses and the resolver's
+// slot-0 recompute come from one derivation. nil is the same silent degrade as
+// a nil GPU (no model ever lands on the thunderbolt path), which the wiring
+// test pins against.
+func mlxOperatorConfig(cs kubernetes.Interface, dyn dynamic.Interface, crd crdensure.CRDClient, gpu operator.GPUSource, indices func(context.Context) (interconnect.Indices, error), clusterDomain string, log *slog.Logger) operator.Config {
 	return operator.Config{
-		Client:  cs,
-		Dynamic: dyn,
-		CRD:     crd,
-		GPU:     gpu,
+		Client:              cs,
+		Dynamic:             dyn,
+		CRD:                 crd,
+		GPU:                 gpu,
+		InterconnectIndices: indices,
 		// mlx.Options is left empty: the pinned serving image and port are release
 		// facts this binary does not yet carry, so a model spec supplies them itself
 		// and one that does not gets an InvalidSpec status naming what is missing —
