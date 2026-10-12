@@ -27,6 +27,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"k3sm.io/k3sm/internal/atomicfile"
 )
 
 // fakeStampLine is the first line of a fake child binary: the (version, variant) the
@@ -305,6 +307,65 @@ func TestShippedKinePreferredOnlyWhenStampMatches(t *testing.T) {
 		}
 	})
 
+	t.Run("release: the work dir an identical copy is trusted in", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			prepare func(t *testing.T, payload, bd string)
+			wantErr error
+		}{
+			{name: "a group- or world-writable bin dir refuses the in-place verify", prepare: func(t *testing.T, payload, bd string) {
+				if err := os.Chmod(bd, 0o777); err != nil {
+					t.Fatal(err)
+				}
+			}, wantErr: atomicfile.ErrUnsafeDir},
+			{name: "a symlinked work-dir kine is replaced, never followed or refused", prepare: func(t *testing.T, payload, bd string) {
+				if err := os.Remove(kinePath(bd)); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(kinePath(payload), kinePath(bd)); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := &fakeCodeSigner{}
+				useFakeSigning(t, s, devID)
+				useChildSeams(t)
+				payload, work := t.TempDir(), t.TempDir()
+				bd := binDir(work)
+				if err := os.MkdirAll(bd, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				shipped := writeChildBin(t, kinePath(payload), kineV, kineVar, "shipped-kine", devID)
+				if err := bootKine(t, work, payload); err != nil {
+					t.Fatal(err)
+				}
+				tc.prepare(t, payload, bd)
+				t.Cleanup(func() { _ = os.Chmod(bd, 0o755) })
+				err := bootKine(t, work, payload)
+				if len(s.signed) != 0 {
+					t.Errorf("signed %v on the release path", s.signed)
+				}
+				if tc.wantErr != nil {
+					if !errors.Is(err, tc.wantErr) {
+						t.Fatalf("err = %v, want %v", err, tc.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				fi, lerr := os.Lstat(kinePath(bd))
+				if lerr != nil || !fi.Mode().IsRegular() {
+					t.Fatalf("work kine is %v (%v), want a regular file", fi, lerr)
+				}
+				if got := readFile(t, kinePath(bd)); got != shipped {
+					t.Errorf("work kine = %q, want the shipped bytes", got)
+				}
+			})
+		}
+	})
+
 	t.Run("etcd", func(t *testing.T) {
 		etcdV, etcdVar := DefaultEtcdVersion, etcdBuildVariant
 		c := etcdChild(etcdV)
@@ -500,6 +561,48 @@ func TestShippedStampReaders(t *testing.T) {
 		missing := strings.Replace(etcdInfo, "dep\tgo.etcd.io/etcd/server/v3\tv3.6.15\th1:x=\n", "", 1)
 		if _, _, err := etcdStampOf(parse(t, missing), etcdWrapperModule, etcdServerModule); err == nil {
 			t.Error("build info without the etcd server module was accepted")
+		}
+	})
+
+	t.Run("a malformed binary is a named ErrPayloadStamp, never a panic", func(t *testing.T) {
+		dir := t.TempDir()
+		garbage := filepath.Join(dir, "garbage")
+		writeBin(t, garbage, "\xcf\xfa\xed\xfe\x0c\x00\x00\x01garbage after a Mach-O magic")
+		truncated := filepath.Join(dir, "truncated")
+		if exe, err := os.Executable(); err == nil {
+			if b, err := os.ReadFile(exe); err == nil && len(b) > 4096 {
+				writeBin(t, truncated, string(b[:4096]))
+			}
+		}
+		readers := map[string]func(string) (string, string, error){
+			"kine":    kineStampFromBinary,
+			"etcd":    etcdChild(DefaultEtcdVersion).readStamp,
+			"etcdutl": etcdutlChild(DefaultEtcdVersion).readStamp,
+		}
+		for name, read := range readers {
+			for _, path := range []string{garbage, truncated} {
+				if _, err := os.Stat(path); err != nil {
+					continue
+				}
+				_, _, err := read(path)
+				if err == nil {
+					t.Errorf("%s reader accepted %s", name, path)
+				}
+			}
+		}
+		_, _, err := recoverStamp(garbage, func() (string, string, error) { panic("index out of range") })
+		if !errors.Is(err, ErrPayloadStamp) || !strings.Contains(err.Error(), garbage) {
+			t.Errorf("a parser panic = %v, want ErrPayloadStamp naming %s", err, garbage)
+		}
+		// Through the release check the refusal stays one named ErrPayloadStamp.
+		const team = "ABCDE12345"
+		devID := fakeDevIDPrefix + team
+		s := &fakeCodeSigner{}
+		useFakeSigning(t, s, devID)
+		writeBin(t, garbage, "\xcf\xfa\xed\xfe garbage"+devID)
+		cerr := kineChild(DefaultKineVersion).checkShipped(t.Context(), signingPolicy{s: s, release: true, teamID: team}, garbage)
+		if !errors.Is(cerr, ErrPayloadStamp) || !strings.Contains(cerr.Error(), garbage) {
+			t.Errorf("checkShipped on garbage = %v, want ErrPayloadStamp naming the binary", cerr)
 		}
 	})
 

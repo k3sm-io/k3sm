@@ -137,8 +137,26 @@ func etcdStampOf(bi *debug.BuildInfo, pkgPath, module string) (version, variant 
 	return m.Version, variant, nil
 }
 
+// recoverStamp runs a stamp read and turns a panic in the binary parsers
+// (debug/buildinfo, debug/macho) into an ErrPayloadStamp naming the binary, so a
+// malformed file refuses the boot cleanly instead of crashing the daemon.
+func recoverStamp(path string, read func() (string, string, error)) (version, variant string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			version, variant = "", ""
+			err = fmt.Errorf("%w: parsing %s panicked: %v", ErrPayloadStamp, path, r)
+		}
+	}()
+	return read()
+}
+
 // kineStampFromBinary is kine's production stamp reader.
-func kineStampFromBinary(path string) (version, variant string, err error) {
+func kineStampFromBinary(path string) (string, string, error) {
+	return recoverStamp(path, func() (string, string, error) { return readKineStamp(path) })
+}
+
+// readKineStamp is kineStampFromBinary without the panic guard.
+func readKineStamp(path string) (version, variant string, err error) {
 	bi, err := buildinfo.ReadFile(path)
 	if err != nil {
 		return "", "", fmt.Errorf("read build info: %w", err)
@@ -154,11 +172,13 @@ func kineStampFromBinary(path string) (version, variant string, err error) {
 // main package is pkgPath, versioned by module.
 func etcdStampReader(pkgPath, module string) func(string) (string, string, error) {
 	return func(path string) (string, string, error) {
-		bi, err := buildinfo.ReadFile(path)
-		if err != nil {
-			return "", "", fmt.Errorf("read build info: %w", err)
-		}
-		return etcdStampOf(bi, pkgPath, module)
+		return recoverStamp(path, func() (string, string, error) {
+			bi, err := buildinfo.ReadFile(path)
+			if err != nil {
+				return "", "", fmt.Errorf("read build info: %w", err)
+			}
+			return etcdStampOf(bi, pkgPath, module)
+		})
 	}
 }
 
@@ -224,9 +244,14 @@ func machoRead(f *macho.File, addr uint64, n int) ([]byte, error) {
 	return nil, fmt.Errorf("no section holds %d bytes at %#x", n, addr)
 }
 
-// sameContent reports whether the files at a and b hold the same bytes. A missing b
-// is false; any other error is returned.
+// sameContent reports whether the files at a and b hold the same bytes. A missing or
+// non-regular b is false; any other error is returned.
 func sameContent(a, b string) (bool, error) {
+	// A non-regular b (a symlink above all) is never "the same": it is replaced,
+	// never followed and never verified in place.
+	if li, err := os.Lstat(b); err == nil && !li.Mode().IsRegular() {
+		return false, nil
+	}
 	fb, err := os.Open(b)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -291,6 +316,11 @@ func (c stagedChild) ensureShipped(ctx context.Context, p signingPolicy, bd, pay
 		return fmt.Errorf("compare the shipped %s with %s: %w", c.name, dst, err)
 	}
 	if same {
+		// Trusting a copy already in the work dir needs the trust atomicfile's
+		// install checks give the copies it makes: nobody else may write there.
+		if err := atomicfile.CheckTrustedDir(bd); err != nil {
+			return fmt.Errorf("verify the shipped %s in place: %w", c.name, err)
+		}
 		if err := c.checkShipped(ctx, p, dst); err != nil {
 			return err
 		}
@@ -333,7 +363,12 @@ func (c stagedChild) checkShipped(ctx context.Context, p signingPolicy, path str
 	if err := verifyReleaseBinary(ctx, p, path); err != nil {
 		return err
 	}
+	// A version-consistency check: the bytes' integrity comes from the Developer ID
+	// verify above and the payload manifest, not from the stamp.
 	v, variant, err := shippedStamp(c, path)
+	if errors.Is(err, ErrPayloadStamp) {
+		return err
+	}
 	if err != nil {
 		return fmt.Errorf("%w: read the build stamp of %s: %w", ErrPayloadStamp, path, err)
 	}
