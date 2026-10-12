@@ -161,6 +161,10 @@ func (r *runtimedRuntime) attachPod(ctx context.Context, a podAttacher, pod *cor
 	// failed attach leaves it registered: the pod still exists on this node,
 	// and its create or delete takes the registration from here.
 	r.refs.RegisterPod(pod)
+	// Rebuild the pod's interconnect slot from its published attach condition
+	// before the box is built, so its env names the same address and no new
+	// create can take the slot. A refused attach releases it with the /32.
+	r.interconnect.restore(ctx, pod)
 	box, err := r.buildBox(ctx, pod, podIP)
 	if err != nil {
 		r.log.Warn("startup re-attachment: cannot translate the pod; it will be created again", "namespace", pod.Namespace, "name", pod.Name, "err", err)

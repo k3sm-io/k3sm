@@ -174,6 +174,12 @@ type runtimedRuntime struct {
 	// and every method tolerates a nil receiver.
 	transport *transportFeed
 
+	// interconnect owns the pod interconnect opt-in (interconnect.go): the
+	// node's pod slots, each attached pod's alias, env and condition. Never nil
+	// after construction; with no root helper or desired annotation wired every
+	// attach is refused under the pod's fallback.
+	interconnect *interconnectAttacher
+
 	// guestArtifacts records whether this node's pinned guest boot artifacts were
 	// ensured and verified at construction — the VMArtifactsAvailable
 	// capability Capabilities reports and cmd/k3sm turns into the
@@ -450,6 +456,10 @@ type RuntimedConfig struct {
 	// installed and every backend is dialed at its published address exactly as a
 	// host-process pod's is.
 	TransportOverrides TransportOverrideSink
+	// Interconnect wires the pod opt-in to an interconnect
+	// (k3sm.io/interconnects): the root helper's alias verbs and this node's
+	// desired annotation. The zero value refuses every attach.
+	Interconnect InterconnectConfig
 	// Client is the apiserver client the provider resolves ConfigMap/Secret data,
 	// SA tokens (volumes/env), and imagePullSecret credentials with —
 	// runtimed never talks to the apiserver. nil disables data-backed
@@ -754,6 +764,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		refs:           refsOf(resolver),
 		network:        cfg.Network,
 		transport:      newTransportFeed(cfg.TransportOverrides, log),
+		interconnect:   newInterconnectAttacher(cfg.Interconnect, recorder, log),
 		guestArtifacts: cfg.GuestArtifacts != nil,
 		client:         cfg.Client,
 		podSource:      newClientPodSource(cfg.Client),
@@ -1389,6 +1400,9 @@ func (r *runtimedRuntime) allocError(pod *corev1.Pod, err error) error {
 // that follows, through here.
 func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
 	id := string(pod.UID)
+	// The interconnect alias and slot go with the pod's network, on every
+	// release path, and do not depend on the pod-network seam.
+	r.interconnect.detach(pod)
 	// Unconditional: the feed (nil-tolerant) holds the override even on a node
 	// whose pod-network seam is absent, and its liveness obligation does not
 	// depend on that seam.
@@ -1562,6 +1576,10 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	if err := resolvePodBoxEnv(ctx, box, facts, r.resolver); err != nil {
 		return nil, err
 	}
+	// The interconnect env goes AFTER the pod's own (resolved) env, so a
+	// pod-supplied K3SM_INTERCONNECT_* value never survives. It reads the
+	// create-time attach outcome; nothing here attaches.
+	r.interconnect.injectEnv(pod, box)
 	// In-pod cluster-DNS visibility: log the FINAL injected state (after
 	// resolvePodBoxEnv) so a "no such host" failure shows whether the getaddrinfo
 	// shim (dyld annotation) and its K3SM_DNS_SERVER env actually landed on the box.
@@ -1623,6 +1641,15 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// Log here (not just return) so the failure reaches server.log — VK's own
 		// create-error log does not, so a pod stuck Pending is otherwise invisible.
 		r.log.Error("CreatePod: allocate podIP", "namespace", pod.Namespace, "name", pod.Name, "err", err)
+		return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	// The interconnect attach (k3sm.io/interconnects) runs once per pod, here
+	// at create and before translation, so the box carries its env. Under
+	// fallback none, or before this node's desired annotation is known, it holds
+	// the create; the slot of a held or refused create is freed with the /32 by
+	// releasePodNetwork.
+	if err := r.interconnect.attach(ctx, pod); err != nil {
+		r.log.Error("CreatePod: interconnect attach", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	box, err := r.buildBox(ctx, pod, podIP)
@@ -2369,6 +2396,9 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 		pod.Status.Conditions = append(pod.Status.Conditions, prior)
 	}
 	st := toPodStatus(pod, rs, r.nodeIP, t.startTime, ps, transport)
+	// The node-owned interconnect attach condition, from the create-time
+	// outcome (excluded from the carry-forward, so it is never duplicated).
+	r.interconnect.applyCondition(string(pod.UID), st)
 	// terminationMessagePolicy: FallbackToLogsOnError, from the terminated
 	// instance's own log file. First, so every overlay below sees the final
 	// message the way a kubelet's status assembly does.
@@ -2471,6 +2501,9 @@ func (r *runtimedRuntime) runBackstop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// A slot-1 pod restored before this node's desired annotation was
+			// readable is verified here, before the status it feeds is built.
+			r.interconnect.recheck(ctx)
 			pods, err := r.GetPods(ctx)
 			if err != nil {
 				continue

@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
@@ -371,9 +372,11 @@ func isProviderOwnedCondition(t corev1.PodConditionType) bool {
 	switch t {
 	case corev1.PodInitialized, corev1.PodReady, corev1.ContainersReady, corev1.PodScheduled:
 		return true
-	case runtimed.ShimInactiveConditionType, runtimed.LogStreamLostConditionType:
+	case runtimed.ShimInactiveConditionType, runtimed.LogStreamLostConditionType,
+		corev1.PodConditionType(netv1alpha1.ConditionInterconnectAttached):
 		// Node-owned: toPodStatus re-reads them from the runtime on every build
-		// (runtimeConditions), so a carried-forward copy would duplicate them.
+		// (runtimeConditions), and buildStatus re-applies the interconnect attach
+		// condition, so a carried-forward copy would duplicate them.
 		return true
 	default:
 		return false
