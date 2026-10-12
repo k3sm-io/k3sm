@@ -244,10 +244,13 @@ func artifactManifest(cfg Config) []artifact {
 	// the next join hands netd its pod CIDR again. The directory, node.key and the
 	// helper key above stay exactly as they are.
 	//
-	// It sits after the key-dir entries and before the daemons, so the reverse
-	// uninstall walk removes it only once netd has been booted out and can no
-	// longer rewrite it. Install never writes it (netd does), so nothing lays it
-	// down; assertExists is false because a node that never adopted has none.
+	// The uninstall walk skips it and removes it after the interconnect sweep,
+	// and only when that sweep completed: the sweep re-derives every alias it
+	// may remove from this node's index in this file, so a sweep that failed
+	// keeps it for the re-run. That is after netd has been booted out, so netd
+	// can no longer rewrite it. Install never writes it (netd does), so nothing
+	// lays it down; assertExists is false because a node that never adopted has
+	// none.
 	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: netdsvc.NodeIdentityPath(MeshKeyDir), assertExists: false})
 	// The node daemon AFTER netd, and it is the ROLE's daemon: io.k3sm.server on
 	// a control plane, io.k3sm.agent on a joining worker. Exactly one of them is

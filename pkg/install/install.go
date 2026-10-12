@@ -1036,7 +1036,9 @@ type System interface {
 	// /32s go before the node's /24, then the ledger. It never changes
 	// bridge0's membership. An absent ledger, or a host with no bridge0, is a
 	// no-op; a refused ledger or entry is logged and left; a removal that fails
-	// keeps the ledger so a re-run can finish the job.
+	// keeps the ledger and returns an error. Uninstall removes the node identity
+	// file nodeIndex comes from only after this returns nil, so a re-run still
+	// has both the ledger and the index and can finish the job.
 	FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error
 	// ReadPodReapRecords returns the pod process groups the runtime recorded in
 	// its reap store under dataRoot (runtime.ReadPodReapRecords). An absent store
@@ -2473,12 +2475,18 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// that would leave the operator with a half-installed machine.
 	deregisterServer(ctx, sys, cfg, m)
 	deregisterNode(ctx, cfg, m)
-	// This node's cluster index, read now: the manifest walk below removes
-	// the identity file it comes from, and the interconnect sweep after the
-	// walk re-derives every alias it may remove from it.
+	// This node's cluster index, from the identity file the interconnect sweep
+	// after the walk re-derives every alias it may remove from. The walk does
+	// NOT remove that file (it is listed as removed, and is): it goes only
+	// after the sweep completes, so a sweep that failed part-way leaves both
+	// the ledger and the index a re-run needs to finish the job.
+	identity := netdsvc.NodeIdentityPath(MeshKeyDir)
 	icIndex := interconnectNodeIndex(sys)
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
+		if a.disp == dispRemove && a.kind == kindFile && a.path == identity {
+			continue
+		}
 		switch a.disp {
 		case dispPreserve:
 			// Deliberately kept — DataRoot, the human kubeconfig, the _k3sm user, LogDir.
@@ -2561,7 +2569,16 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// daemon removes on the way out; unlike them they are swept by OWNERSHIP,
 	// re-derived from this node's cluster index, not by range, so a
 	// 169.254.0.0/24 address that is not this node's derived alias stays.
-	note(sys.FlushInterconnectAliases(netdsvc.InterconnectStatePath(MeshKeyDir), icIndex, cfg.Logger))
+	//
+	// Then the identity file, and only when the sweep completed (an absent
+	// ledger counts): a sweep that failed keeps its ledger for a re-run, and
+	// that re-run can re-derive nothing without this node's index.
+	if err := sys.FlushInterconnectAliases(netdsvc.InterconnectStatePath(MeshKeyDir), icIndex, cfg.Logger); err != nil {
+		note(err)
+		cfg.Logger.Warn("node identity kept so a re-run of uninstall can finish the interconnect sweep", "path", identity)
+	} else if slices.ContainsFunc(m, func(a artifact) bool { return a.disp == dispRemove && a.path == identity }) {
+		note(safeRemove(identity))
+	}
 	if firstErr != nil {
 		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}

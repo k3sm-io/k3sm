@@ -277,7 +277,8 @@ func sweepInterconnect(ledgerPath string, nodeIndex int, ownerUID uint32, ifconf
 
 // interconnectNodeIndex is this node's cluster index from the pod range netd
 // adopted (the identity file), or -1 when there is none or it does not parse.
-// Uninstall reads it before the manifest walk removes that file.
+// Uninstall removes that file only once the interconnect sweep has completed,
+// so a re-run after a failed sweep reads the same index.
 func interconnectNodeIndex(sys System) int {
 	raw, err := sys.ReadRegularFile(netdsvc.NodeIdentityPath(MeshKeyDir))
 	if err != nil {

@@ -19,6 +19,7 @@ package install
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -27,6 +28,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"k3sm.io/darwin-net/pkg/podnet"
@@ -176,6 +178,82 @@ func TestUninstallFlushesInterconnectAliases(t *testing.T) {
 			t.Errorf("calls %v do not carry %q: the index must be read before the walk removes the identity file", f.calls, want)
 		}
 	})
+}
+
+// TestUninstallRetriesAFailedInterconnectSweep pins the retry contract of the
+// interconnect sweep: an alias removal that fails keeps the ledger AND the node
+// identity file the aliases are re-derived from, so running uninstall again
+// removes the aliases and the ledger, and only that successful run removes the
+// identity file.
+func TestUninstallRetriesAFailedInterconnectSweep(t *testing.T) {
+	cidr, err := podnet.NodeCIDR(podnet.ClusterPodCIDR, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := netdsvc.NodeIdentityPath(MeshKeyDir)
+	ledger := writeLedger(t, 0o600, `{"aliases":[{"slot":0,"address":"169.254.0.9"},{"slot":1,"address":"169.254.0.10"}]}`)
+	// bridge0 as ifconfig reports it: this node's slot-0 /24 and slot-1 /32,
+	// and an alias in the range that is not netd's.
+	bridge := map[netip.Addr]string{
+		netip.MustParseAddr("169.254.0.9"):  "0xffffff00",
+		netip.MustParseAddr("169.254.0.10"): "0xffffffff",
+		netip.MustParseAddr("169.254.0.42"): "0xffffffff",
+	}
+	failRemoval := true
+	ifconfig := func(args ...string) ([]byte, error) {
+		if len(args) == 1 {
+			var b strings.Builder
+			b.WriteString("bridge0: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n")
+			for ip, mask := range bridge {
+				fmt.Fprintf(&b, "\tinet %s netmask %s\n", ip, mask)
+			}
+			return []byte(b.String()), nil
+		}
+		ip := netip.MustParseAddr(args[2])
+		if failRemoval && ip == netip.MustParseAddr("169.254.0.10") {
+			return []byte("ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address"), errors.New("exit status 1")
+		}
+		delete(bridge, ip)
+		return nil, nil
+	}
+	f := &fakeSystem{}
+	f.putFile(identity, []byte(cidr.String()+"\n"))
+	f.flushInterconnect = func(nodeIndex int, log *slog.Logger) error {
+		return sweepInterconnect(ledger, nodeIndex, uint32(os.Getuid()), ifconfig, log)
+	}
+
+	if err := Uninstall(context.Background(), f, Config{}); err == nil {
+		t.Fatal("the first Uninstall reported success with an alias removal failing")
+	}
+	if _, ok := f.files[identity]; !ok {
+		t.Fatalf("the failed sweep's uninstall removed the node identity %s: a re-run cannot re-derive the aliases the kept ledger names", identity)
+	}
+	if _, err := os.Stat(ledger); err != nil {
+		t.Fatalf("the failed sweep did not keep the ledger: %v", err)
+	}
+
+	failRemoval = false
+	f.calls = nil
+	if err := Uninstall(context.Background(), f, Config{}); err != nil {
+		t.Fatalf("the re-run Uninstall: %v", err)
+	}
+	if want := "FlushInterconnectAliases:" + netdsvc.InterconnectStatePath(MeshKeyDir) + ":1"; !slices.Contains(f.calls, want) {
+		t.Errorf("the re-run calls %v do not carry %q: the re-run lost this node's cluster index", f.calls, want)
+	}
+	for _, ip := range []string{"169.254.0.9", "169.254.0.10"} {
+		if _, ok := bridge[netip.MustParseAddr(ip)]; ok {
+			t.Errorf("the re-run left this node's alias %s on bridge0", ip)
+		}
+	}
+	if _, ok := bridge[netip.MustParseAddr("169.254.0.42")]; !ok {
+		t.Error("the re-run removed 169.254.0.42, which the ledger does not own")
+	}
+	if _, err := os.Stat(ledger); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the re-run kept the ledger (stat: %v)", err)
+	}
+	if _, ok := f.files[identity]; ok {
+		t.Errorf("the successful re-run kept the node identity %s", identity)
+	}
 }
 
 // writeLedger writes a ledger file in a temp dir with mode perm.

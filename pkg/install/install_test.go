@@ -70,6 +70,10 @@ func TestMain(m *testing.M) {
 // the install orchestration without any real privilege.
 type fakeSystem struct {
 	calls []string
+	// flushInterconnect, when set, is FlushInterconnectAliases' body after the
+	// call is recorded: a test runs the real sweep over a ledger and bridge it
+	// controls. Nil sweeps nothing and succeeds.
+	flushInterconnect func(nodeIndex int, log *slog.Logger) error
 	// podReap is the runtime reap store ReadPodReapRecords answers with, and
 	// podLeaders[pgid] the live leader start of each group (absent: no leader).
 	// podMembers[pgid][pid] the live start of each non-leader member, and
@@ -1573,8 +1577,11 @@ func (f *fakeSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 	return nil
 }
 
-func (f *fakeSystem) FlushInterconnectAliases(ledgerPath string, nodeIndex int, _ *slog.Logger) error {
+func (f *fakeSystem) FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error {
 	f.calls = append(f.calls, fmt.Sprintf("FlushInterconnectAliases:%s:%d", ledgerPath, nodeIndex))
+	if f.flushInterconnect != nil {
+		return f.flushInterconnect(nodeIndex, log)
+	}
 	return nil
 }
 
@@ -2099,11 +2106,6 @@ func TestUninstallIdempotent(t *testing.T) {
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
-		// The pod CIDR netd adopted from this role's join, removed only after
-		// netd is booted out (so it cannot rewrite it) and the one leaf of the
-		// preserved mesh key dir that goes: a role change goes through
-		// uninstall, and the next role's netd must not restore this /24.
-		"RemoveAll:/var/lib/k3sm/keys/node-pod-cidr",
 		// A joining HA server's staged server-class join token, removed in the
 		// same position as the admin token below and for the same reason; on a
 		// server that never joined, removing an absent file is a no-op.
@@ -2131,6 +2133,13 @@ func TestUninstallIdempotent(t *testing.T) {
 		// The interconnect aliases netd's ledger owns, and the ledger, swept
 		// after netd is gone (it is the ledger's only writer).
 		"FlushInterconnectAliases:/var/lib/k3sm/keys/interconnect-aliases:-1",
+		// The pod CIDR netd adopted from this role's join, removed only after
+		// netd is booted out (so it cannot rewrite it) and after the
+		// interconnect sweep that re-derives its aliases from it completed. It
+		// is the one leaf of the preserved mesh key dir that goes: a role
+		// change goes through uninstall, and the next role's netd must not
+		// restore this /24.
+		"RemoveAll:/var/lib/k3sm/keys/node-pod-cidr",
 	}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("uninstall calls = %v, want %v", f.calls, want)
