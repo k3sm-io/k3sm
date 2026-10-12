@@ -20,6 +20,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -81,6 +82,21 @@ func TestRequiredSiblingsRelative(t *testing.T) {
 	for _, w := range want {
 		if !strings.Contains(got, w) {
 			t.Errorf("RequiredSiblings(\"\") = %q, missing %q", got, w)
+		}
+	}
+}
+
+// TestRequiredSiblingsShipsSourceBuiltChildren names the source-built children the
+// install contract must ship by their literal payload paths: kine, etcd and etcdutl.
+// A packaged install, and a GUI install above all, cannot assume a Go toolchain on
+// the Mac, and a Developer ID-signed daemon never builds them, so an archive missing
+// any of the three would install and then refuse to boot. The match is exact, so
+// cp-payload/etcdutl cannot stand in for cp-payload/etcd.
+func TestRequiredSiblingsShipsSourceBuiltChildren(t *testing.T) {
+	got := RequiredSiblings("")
+	for _, name := range []string{"kine", "etcd", "etcdutl"} {
+		if want := filepath.Join(PayloadDirName, name); !slices.Contains(got, want) {
+			t.Errorf("RequiredSiblings(\"\") = %q, missing %q", got, want)
 		}
 	}
 }
