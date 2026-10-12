@@ -290,3 +290,118 @@ func TestInstallFileUsesANewInode(t *testing.T) {
 		}
 	})
 }
+
+// TestInstallReaderKeepsTheOwner pins ownership: running as root the new file
+// takes the owner and group of the regular file it replaces (the temp is chowned
+// before the rename), a first install keeps the euid's, and without root nothing
+// is chowned. Root is faked at the geteuid/lchown seams.
+func TestInstallReaderKeepsTheOwner(t *testing.T) {
+	type chownCall struct {
+		path     string
+		uid, gid int
+	}
+	fake := func(t *testing.T, euid int) *[]chownCall {
+		var calls []chownCall
+		origE, origC := geteuid, lchown
+		t.Cleanup(func() { geteuid, lchown = origE, origC })
+		geteuid = func() int { return euid }
+		lchown = func(p string, uid, gid int) error {
+			if _, err := os.Lstat(p); err != nil {
+				t.Errorf("chown of %s, which does not exist (after the rename?)", p)
+			}
+			calls = append(calls, chownCall{p, uid, gid})
+			return nil
+		}
+		return &calls
+	}
+	t.Run("root, replacing: the old owner and group", func(t *testing.T) {
+		calls := fake(t, 0)
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "bin")
+		if err := os.WriteFile(dst, []byte("old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fi, _ := os.Lstat(dst)
+		st := fi.Sys().(*syscall.Stat_t)
+		if err := InstallReader(strings.NewReader("new"), dst, 0o755, nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("chown calls %v, want one", *calls)
+		}
+		c := (*calls)[0]
+		if c.uid != int(st.Uid) || c.gid != int(st.Gid) || !isTempOf(filepath.Base(c.path), tempPrefix("bin")) {
+			t.Errorf("chown %+v, want the temp to %d:%d", c, st.Uid, st.Gid)
+		}
+	})
+	t.Run("root, first install: the euid's", func(t *testing.T) {
+		calls := fake(t, 0)
+		if err := InstallReader(strings.NewReader("new"), filepath.Join(t.TempDir(), "bin"), 0o755, nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 0 {
+			t.Errorf("chown calls %v on a first install, want none", *calls)
+		}
+	})
+	t.Run("not root: never chowned", func(t *testing.T) {
+		calls := fake(t, os.Geteuid()+1)
+		dst := filepath.Join(t.TempDir(), "bin")
+		if err := os.WriteFile(dst, []byte("old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := InstallReader(strings.NewReader("new"), dst, 0o755, nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 0 {
+			t.Errorf("chown calls %v without root, want none", *calls)
+		}
+	})
+}
+
+// TestInstallReaderRefusesAnUnsafeDir pins the directory check: a group- or
+// world-writable target directory is refused with ErrUnsafeDir before anything is
+// written (another writer could swap the temp between its signing and its rename),
+// unless it is sticky and owned by the euid.
+func TestInstallReaderRefusesAnUnsafeDir(t *testing.T) {
+	me := os.Geteuid()
+	tests := []struct {
+		name string
+		mode os.FileMode
+		euid int
+		ok   bool
+	}{
+		{"private 0755", 0o755, me, true},
+		{"group-writable 0775", 0o775, me, false},
+		{"world-writable 0777", 0o777, me, false},
+		{"sticky world-writable, ours", 0o777 | os.ModeSticky, me, true},
+		{"sticky world-writable, someone else's", 0o777 | os.ModeSticky, me + 1, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			orig := geteuid
+			t.Cleanup(func() { geteuid = orig })
+			geteuid = func() int { return tc.euid }
+			dir := t.TempDir()
+			if err := os.Chmod(dir, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			err := InstallReader(strings.NewReader("new"), filepath.Join(dir, "bin"), 0o755, func(string) error {
+				if !tc.ok {
+					t.Error("prepare ran in a refused directory")
+				}
+				return nil
+			})
+			if tc.ok && err != nil {
+				t.Fatalf("InstallReader: %v", err)
+			}
+			if !tc.ok {
+				if !errors.Is(err, ErrUnsafeDir) {
+					t.Fatalf("err = %v, want ErrUnsafeDir", err)
+				}
+				if names := dirNames(t, dir); len(names) != 0 {
+					t.Errorf("a refused install left %v", names)
+				}
+			}
+		})
+	}
+}

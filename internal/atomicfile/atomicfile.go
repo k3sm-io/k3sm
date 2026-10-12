@@ -24,6 +24,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
+)
+
+// ErrUnsafeDir reports a target directory a less privileged user could write to,
+// where InstallReader refuses to stage: such a writer could swap the temp file
+// between its signing and its rename and have the swapped bytes installed.
+var ErrUnsafeDir = errors.New("atomicfile: target directory is writable by others")
+
+// geteuid and lchown are seams so the owner-preserving and directory checks are
+// testable without root.
+var (
+	geteuid = os.Geteuid
+	lchown  = os.Lchown
 )
 
 // tempInfix is the one definition of the temp-file naming: a temp for target name is
@@ -116,9 +129,16 @@ func InstallFile(src, dst string, mode os.FileMode, prepare func(tmpPath string)
 // prepare (that is where signing goes), and the finished file appears at dst in one
 // step: dst never names an unsigned or half-written binary.
 //
-// Like Replace, an existing symlink at dst is replaced, never followed.
+// Like Replace, an existing symlink at dst is replaced, never followed. Running as
+// root, the new file keeps the owner and group of the regular file it replaces; a
+// first install is owned by the euid. A target directory that is group- or
+// world-writable is refused with ErrUnsafeDir, unless it is sticky and owned by the
+// euid (then no one else can rename or remove the temp).
 func InstallReader(r io.Reader, dst string, mode os.FileMode, prepare func(tmpPath string) error) error {
 	dir := filepath.Dir(dst)
+	if err := checkDir(dir); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(dir, tempPrefix(filepath.Base(dst)))
 	if err != nil {
 		return fmt.Errorf("atomicfile: create temp for %s: %w", dst, err)
@@ -145,6 +165,9 @@ func InstallReader(r io.Reader, dst string, mode os.FileMode, prepare func(tmpPa
 		if err := prepare(tmpPath); err != nil {
 			return fmt.Errorf("atomicfile: prepare %s: %w", dst, err)
 		}
+	}
+	if err := keepOwner(tmpPath, dst); err != nil {
+		return fmt.Errorf("atomicfile: keep the owner of %s: %w", dst, err)
 	}
 	// Synced after prepare, which may have rewritten the temp (a signature).
 	if err := syncFile(tmpPath); err != nil {
@@ -215,6 +238,40 @@ func writeAndSync(f *os.File, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return f.Close()
+}
+
+// checkDir refuses a directory others can write to (see ErrUnsafeDir).
+func checkDir(dir string) error {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("atomicfile: stat %s: %w", dir, err)
+	}
+	if fi.Mode().Perm()&0o022 == 0 {
+		return nil
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if fi.Mode()&os.ModeSticky != 0 && ok && int(st.Uid) == geteuid() {
+		return nil
+	}
+	return fmt.Errorf("%w: %s is %v", ErrUnsafeDir, dir, fi.Mode())
+}
+
+// keepOwner gives tmp the owner and group of the regular file at dst when running
+// as root, so replacing a binary never changes who owns it. Without root a file
+// cannot be given away, and with no file at dst the euid owns the new one.
+func keepOwner(tmp, dst string) error {
+	if geteuid() != 0 {
+		return nil
+	}
+	fi, err := os.Lstat(dst)
+	if err != nil || !fi.Mode().IsRegular() {
+		return nil
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	return lchown(tmp, int(st.Uid), int(st.Gid))
 }
 
 // syncFile fsyncs the file at path.
