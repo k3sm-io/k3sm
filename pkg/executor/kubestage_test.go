@@ -412,7 +412,7 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 	if !kineStaged(dest, DefaultKineVersion) {
 		t.Error("payload kine marker missing")
 	}
-	if !etcdStaged(dest, DefaultEtcdVersion) {
+	if !etcdChild(DefaultEtcdVersion).staged(dest) {
 		t.Error("payload etcd marker missing")
 	}
 	if err := VerifyPayloadSet(dest); err != nil {

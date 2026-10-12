@@ -78,9 +78,13 @@ var selfExecutable = os.Executable
 // On both paths a binary whose signature verifies and is not ad hoc is never
 // re-signed (binsign's identity rule).
 //
-// The staged children kine, etcd and helm are outside the release check on both
-// paths: they are built or fetched at boot and ad-hoc signed, and are not yet part
-// of the signed payload, so they keep the dev signing (signBinaries).
+// The source-built children kine and etcd (and the offline etcdutl) are part of
+// the signed payload: on the release path they are verified the same way and their
+// build stamp, read from the verified bytes, must match the pins
+// (stagedChild.ensureShipped); they are never built or signed there. helm stays
+// outside the release check on both paths: it is fetched at boot and ad-hoc signed,
+// and is not yet part of the signed payload, so it keeps the dev signing
+// (signBinaries).
 type signingPolicy struct {
 	s       codeSigner
 	release bool
@@ -138,25 +142,34 @@ func resolveSigningPolicy(ctx context.Context, logger *slog.Logger) (signingPoli
 // non-Developer ID certificate, is an
 // ErrPayloadSignature naming the binary.
 func verifyPayloadBinaries(ctx context.Context, p signingPolicy, dir, stamp string, names []string) error {
+	for _, n := range names {
+		if err := verifyReleaseBinary(ctx, p, filepath.Join(dir, n)); err != nil {
+			return err
+		}
+	}
+	return binsign.RecordHealed(dir, stamp, names...)
+}
+
+// verifyReleaseBinary is the release check on one path: a regular file whose
+// signature satisfies the Developer ID Application requirement for p's Team ID.
+// Any failure, an absent file included, is an ErrPayloadSignature naming it.
+func verifyReleaseBinary(ctx context.Context, p signingPolicy, path string) error {
 	req, err := binsign.DeveloperIDRequirement(p.teamID)
 	if err != nil {
 		return err
 	}
-	for _, n := range names {
-		path := filepath.Join(dir, n)
-		fi, err := os.Lstat(path)
-		if err != nil || !fi.Mode().IsRegular() {
-			return fmt.Errorf("%w: %s is not staged as a regular file; reinstall from the signed release", ErrPayloadSignature, path)
-		}
-		ok, err := p.s.Satisfies(ctx, path, req)
-		if err != nil {
-			return fmt.Errorf("verify the signature of %s: %w", path, err)
-		}
-		if !ok {
-			return fmt.Errorf("%w: %s is not signed with team %s's Developer ID Application certificate; refusing to start", ErrPayloadSignature, path, p.teamID)
-		}
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return fmt.Errorf("%w: %s is not staged as a regular file; reinstall from the signed release", ErrPayloadSignature, path)
 	}
-	return binsign.RecordHealed(dir, stamp, names...)
+	ok, err := p.s.Satisfies(ctx, path, req)
+	if err != nil {
+		return fmt.Errorf("verify the signature of %s: %w", path, err)
+	}
+	if !ok {
+		return fmt.Errorf("%w: %s is not signed with team %s's Developer ID Application certificate; refusing to start", ErrPayloadSignature, path, p.teamID)
+	}
+	return nil
 }
 
 // verifyTempHook is the atomicfile prepare hook for a release-path payload copy:
@@ -184,7 +197,7 @@ func verifyTempHook(ctx context.Context, p signingPolicy, name string) func(stri
 const helmHealStamp = helmchart.HelmBinaryName
 
 // signHelm gives a staged helm the dev signing (see signingPolicy on why helm is
-// outside the release check). It is the one place helm's heal stamp is chosen.
+// still outside the release check). It is the one place helm's heal stamp is chosen.
 func signHelm(ctx context.Context, bd string) error {
 	return signBinaries(ctx, bd, helmHealStamp, []string{helmchart.HelmBinaryName})
 }

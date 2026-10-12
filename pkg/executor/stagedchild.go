@@ -53,6 +53,10 @@ type stagedChild struct {
 	// removes) and returns its path. It is the only child-specific step, and the
 	// seam a test fakes so nothing is fetched.
 	build func(ctx context.Context, scratch string) (builtPath string, err error)
+	// readStamp reads the (version, variant) a built binary at path was built as from
+	// its bytes, never by running it: the release path's stamp check
+	// (ensureShipped), compared with (version, variant).
+	readStamp func(path string) (version, variant string, err error)
 }
 
 func (c stagedChild) binPath(bd string) string    { return filepath.Join(bd, c.name) }
@@ -105,10 +109,11 @@ func (c stagedChild) writeMarker(bd string) error {
 
 // ensureInto stages the child into bd under the protocol described on stagedChild.
 //
-// A staged child keeps the dev signing on both signing paths (see signingPolicy):
-// it is built at boot and ad-hoc signed, and is not yet part of the signed payload,
-// so the release check does not apply to it. A child binary that is validly signed
-// by a certificate identity is still never re-signed (binsign's identity rule).
+// It is the DEV path and the packaging producer (StagePayload): it builds at boot
+// and ad-hoc signs. The release path never reaches it; a Developer ID-signed k3sm
+// stages the child with ensureShipped, from the signed payload only. A child binary
+// that is validly signed by a certificate identity is still never re-signed here
+// (binsign's identity rule).
 func (c stagedChild) ensureInto(ctx context.Context, bd string) error {
 	if c.staged(bd) {
 		return signBinaries(ctx, bd, strings.TrimSpace(c.markerContent()), []string{c.name})

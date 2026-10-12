@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -407,11 +408,25 @@ func runEtcdutl(ctx context.Context, bin string, args []string) ([]byte, error) 
 	return exec.CommandContext(ctx, bin, args...).CombinedOutput()
 }
 
-// resolveEtcdutl finds a staged etcdutl whose marker vouches for the pin: the
-// packaged install's payload first, then the work dir's bin. A dev shell with
-// neither builds it into the work dir's bin (a packaged install never needs to).
+// resolveEtcdutl finds the etcdutl the restore runs.
+//
+// On the release path (a Developer ID-signed k3sm, see signingPolicy) it is the
+// payload's etcdutl, run in place, only after it verifies against the release
+// requirement and its stamp, read from the verified bytes, matches the pin; the work
+// dir is never consulted and nothing is built. Otherwise it is a staged etcdutl whose
+// marker vouches for the pin: the packaged install's payload first, then the work
+// dir's bin. A dev shell with neither builds it into the work dir's bin (a packaged
+// install never needs to).
 func resolveEtcdutl(ctx context.Context, workDir, payloadDir string) (string, error) {
 	c := etcdutlChild(DefaultEtcdVersion)
+	// The refusal is returned to the caller, which reports it; nothing is logged here.
+	p, err := resolveSigningPolicy(ctx, slog.New(slog.DiscardHandler))
+	if err != nil {
+		return "", err
+	}
+	if p.release {
+		return c.shippedBinary(ctx, p, payloadDir)
+	}
 	for _, d := range []string{payloadDir, binDir(workDir)} {
 		if d != "" && c.staged(d) {
 			return c.binPath(d), nil
