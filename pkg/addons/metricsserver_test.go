@@ -265,7 +265,7 @@ func TestMetricsServerAddonManifest(t *testing.T) {
 
 	t.Run("converging the shipped set issues one apply per object and nothing else", func(t *testing.T) {
 		dc := newFakeDynamic(t)
-		if err := New(FS(), dc, metricsServerMapper()).Converge(context.Background()); err != nil {
+		if err := New(FS(), dc, metricsServerMapper()).WithPosture(servingPosture).Converge(context.Background()); err != nil {
 			t.Fatalf("converge: %v", err)
 		}
 		applies := verifyTrafficShape(t, dc.Actions())

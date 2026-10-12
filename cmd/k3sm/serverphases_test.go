@@ -76,3 +76,31 @@ func TestServerPhaseStopsAreNeverNil(t *testing.T) {
 		})
 	}
 }
+
+// TestAddonPosture pins the server facts the gated embedded add-ons key on: the
+// mesh serving posture (a mesh IP AND the cluster-CA apiserver serving pair the
+// mesh provisioning writes) and the vm probe, each independently.
+func TestAddonPosture(t *testing.T) {
+	mesh := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
+	mesh.cfg.ServingCertFile, mesh.cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
+	noPair := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
+	for _, tc := range []struct {
+		name      string
+		plan      serverPlan
+		vm        bool
+		wantCA    bool
+		wantVMUse bool
+	}{
+		{"mesh with vm", mesh, true, true, true},
+		{"mesh without vm", mesh, false, true, false},
+		{"single-node with vm", serverPlan{}, true, false, true},
+		{"mesh ip but no cluster-CA serving pair", noPair, true, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := addonPosture(tc.plan, tc.vm)
+			if got.ClusterCAKubeletServing != tc.wantCA || got.VMUsable != tc.wantVMUse {
+				t.Errorf("addonPosture = %+v, want ClusterCAKubeletServing=%v VMUsable=%v", got, tc.wantCA, tc.wantVMUse)
+			}
+		})
+	}
+}

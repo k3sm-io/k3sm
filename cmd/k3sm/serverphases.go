@@ -55,7 +55,7 @@ func noStop() {}
 
 // provisionServerCluster is steps 3–3c: the cluster-scoped admission policies +
 // the vm RuntimeClass, the fail-closed RBAC graph, and the embedded add-ons.
-func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) error {
+func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, vmCapable bool, logger *slog.Logger) error {
 	opts := plan.opts
 	// 3. Provision the cluster-scoped admission policies + the vm RuntimeClass.
 	// Extracted so the SET is testable against a fake clientset: what this
@@ -84,14 +84,15 @@ func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.
 	// sandbox-protected prefixes) and this client is the system:masters admin, so a
 	// directory ingress would hand cluster-admin to every pod on the node. See
 	// pkg/addons/doc.go. Runs AFTER the fail-closed RBAC graph so a slow or failing
-	// add-on can never delay it. Converge-only — it issues apply patches and never a
-	// delete or a list. Log-and-continue like the sibling boot provisioners, by the
+	// add-on can never delay it. It never lists; its only delete withdraws, by name,
+	// an add-on it applied earlier that can no longer serve here. Log-and-continue like the sibling boot provisioners, by the
 	// repo's one rule for a fault on this process: UNSURVIVABLE faults exit (a dead
 	// control-plane child does, and the crash-loop breaker bounds the respawns);
 	// SURVIVABLE ones continue, and a manifest that will not apply is survivable —
 	// the control plane is up without it. The shipped set is metrics-server
-	// (pkg/addons/manifests/metrics-server.yaml).
-	if ar, err := addons.NewFromConfig(addons.FS(), restCfg); err != nil {
+	// (pkg/addons/manifests/metrics-server.yaml), applied only where it can serve
+	// (addonPosture); elsewhere it is withdrawn and the reason logged.
+	if ar, err := addons.NewFromConfig(addons.FS(), restCfg, addonPosture(plan, vmCapable)); err != nil {
 		logger.Error("build embedded add-on reconciler", "err", err)
 	} else if err := ar.Converge(ctx); err != nil {
 		logger.Error("converge embedded add-on manifests", "err", err)
@@ -662,4 +663,25 @@ func repairServerNodeLabels(ctx context.Context, cs kubernetes.Interface, nodeNa
 		logger.Info("removed a stale label this node can no longer remove itself under its node identity", "node", nodeName, "label", staleNodeRoleLabel)
 	}
 	return nil
+}
+
+// addonPosture is the server facts the gated embedded add-ons are checked against.
+//
+// ClusterCAKubeletServing is the mesh serving posture, read off the two facts that
+// make it true. plan.cfg.ServingCertFile/ServingKeyFile are set only by the mesh
+// provisioning (serverprovision.go), and they decide the executor's --root-ca-file:
+// the cluster CA, so kube-root-ca.crt is the cluster CA. plan.opts.meshIP is what
+// setServerKubeletServing keys on to issue this node's kubelet serving cert from that
+// same CA, and a worker exists only on a mesh cluster, where its join response
+// carries a cluster-CA-issued serving cert. On a single-node server both are empty:
+// the kubelet cert is self-signed and kube-root-ca.crt is the apiserver's own CA.
+//
+// VMUsable is vmBackendAvailable, the runtimed host probe that also decides this
+// node's k3sm.io/virtualization label, which the vm RuntimeClass's nodeSelector
+// requires.
+func addonPosture(plan serverPlan, vmCapable bool) addons.Posture {
+	return addons.Posture{
+		ClusterCAKubeletServing: plan.opts.meshIP != "" && plan.cfg.ServingCertFile != "" && plan.cfg.ServingKeyFile != "",
+		VMUsable:                vmCapable,
+	}
 }

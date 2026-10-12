@@ -23,7 +23,8 @@ limitations under the License.
 // manager. The production tree holds one add-on today, metrics-server
 // (manifests/metrics-server.yaml: upstream v0.9.0, its RBAC verbatim, the
 // Deployment adapted to run the Linux image as a vm pod on a Darwin node), so a
-// stock server issues one apply per object in that file on every start.
+// server where it can serve issues one apply per object in that file on every start
+// (§ Gated add-ons).
 //
 // # Why the manifests are compiled in, not read from disk
 //
@@ -117,10 +118,13 @@ limitations under the License.
 // Unschedulable. Such an object is still applied, and a Warning Event
 // (DarwinSchedulingEventReason) naming both fields is recorded on it.
 //
-// # Converge-only: this reconciler never deletes
+// # Converge-only: this reconciler never prunes
 //
-// It issues exactly one verb: server-side apply (an apply-type PATCH). It never
-// DELETEs, and it never LISTs.
+// It converges with one verb, server-side apply (an apply-type PATCH). It never LISTs,
+// and it never prunes. Its one delete is the withdrawal of a gated add-on (§ Gated
+// add-ons), which is the safe shape described below: objects named by the embedded
+// manifest, resolved by Get-by-name, deleted only when managedFields record k3sm's own
+// apply, with a UID precondition.
 //
 // Both halves are deliberate. A prune keyed on the k3sm.io/managed label would be
 // catastrophic — that label is stamped by seven other packages, so a label-selector
@@ -140,9 +144,25 @@ limitations under the License.
 // operator to remove. That is also the k3s semantic for a removed FILE, so the divergence
 // is bounded to objects dropped from a still-present file.
 //
+// # Gated add-ons
+//
+// Some add-ons can serve only on some servers. A file listed in requirements is
+// applied only when its requirement holds under the Posture the server passes in;
+// otherwise it is skipped, the reason is logged once at Info, and any of its objects
+// k3sm applied earlier are withdrawn, the APIService first, because an APIService
+// with no serving backend breaks aggregated discovery and wedges namespace deletion.
+// An object of the same name that k3sm did not apply is the operator's and is left.
+//
+// metrics-server is gated on two server facts: the kubelet serving certs chain to the
+// CA in kube-root-ca.crt (the mesh serving posture; on a single-node server they are
+// self-signed and its verified scrape fails), and the vm runtime is usable (its image
+// is Linux).
+//
 // Converge-only additionally makes the reconciler safe under HA with no coordination:
 // k3sm has no in-Go leader-election primitive, and an apply-only reconciler on a second
-// server converges to the same state instead of racing a peer's prune.
+// server converges to the same state instead of racing a peer's prune. The gate is the
+// exception: two HA servers that disagree on a gated add-on's Posture (one can host vm
+// guests, the other cannot) alternately apply and withdraw it, each on its own start.
 //
 // # Failure posture: log-and-continue, never fail-closed
 //

@@ -71,29 +71,42 @@ func FS() fs.FS {
 }
 
 // Reconciler server-side-applies a set of embedded add-on manifests onto the cluster.
-// It is converge-ONLY: it issues apply patches and nothing else — never a delete, never
-// a list (see doc.go for why both bans are load-bearing).
+// It never lists, and it deletes only to withdraw a gated add-on that cannot serve on
+// this server: by name, from the embedded manifest, and only an object it applied
+// itself (withdraw; doc.go explains why both bans are load-bearing and why this
+// exception keeps them).
 //
 // The fs.FS is a test seam. Production binds FS(); tests bind a fixture. It must never
 // be bound to an operator-writable source.
 type Reconciler struct {
-	fsys   fs.FS
-	dyn    dynamic.Interface
-	mapper meta.RESTMapper
+	fsys    fs.FS
+	dyn     dynamic.Interface
+	mapper  meta.RESTMapper
+	posture Posture
+	logger  *slog.Logger // nil means slog.Default(); a test seam
 }
 
 // New returns a Reconciler that converges the manifests in fsys onto the cluster
 // reachable through dyn, mapping each document's GroupVersionKind to its resource with
-// mapper.
+// mapper. Its Posture is the zero value, under which every gated add-on
+// (requirements) is skipped; WithPosture supplies the server's real one.
 func New(fsys fs.FS, dyn dynamic.Interface, mapper meta.RESTMapper) *Reconciler {
 	return &Reconciler{fsys: fsys, dyn: dyn, mapper: mapper}
+}
+
+// WithPosture sets the server facts the gated add-ons are checked against and
+// returns r.
+func (r *Reconciler) WithPosture(p Posture) *Reconciler {
+	r.posture = p
+	return r
 }
 
 // NewFromConfig builds a Reconciler over the cluster cfg addresses, deriving the
 // dynamic client and a discovery-backed RESTMapper from it. The mapper is snapshotted
 // once at construction, which is why a CRD and its own custom resources cannot be
-// applied in the same pass (doc.go § Known ceilings).
-func NewFromConfig(fsys fs.FS, cfg *rest.Config) (*Reconciler, error) {
+// applied in the same pass (doc.go § Known ceilings). posture gates the add-ons
+// that can only serve on some servers (requirements).
+func NewFromConfig(fsys fs.FS, cfg *rest.Config, posture Posture) (*Reconciler, error) {
 	dyn, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build dynamic client: %w", err)
@@ -106,7 +119,7 @@ func NewFromConfig(fsys fs.FS, cfg *rest.Config) (*Reconciler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("discover api group resources: %w", err)
 	}
-	return New(fsys, dyn, restmapper.NewDiscoveryRESTMapper(groups)), nil
+	return New(fsys, dyn, restmapper.NewDiscoveryRESTMapper(groups)).WithPosture(posture), nil
 }
 
 // Converge applies every manifest document in the embedded set, in the tree's lexical
@@ -118,28 +131,61 @@ func NewFromConfig(fsys fs.FS, cfg *rest.Config) (*Reconciler, error) {
 // applied — and the returned error is ADVISORY: the caller logs it and continues
 // bring-up (doc.go § Failure posture). Converge deliberately does not log the errors it
 // returns; the boundary that handles them does.
+//
+// A file gated in requirements is applied only when its requirement holds under the
+// Reconciler's Posture. Otherwise its objects are withdrawn (withdraw) and the reason
+// is logged once at Info.
 func (r *Reconciler) Converge(ctx context.Context) error {
-	objs, errs := r.load()
-	applied := 0
-	for _, obj := range objs {
-		if err := r.apply(ctx, obj); err != nil {
-			errs = append(errs, err)
-			continue
+	files, errs := r.loadFiles()
+	documents, applied := 0, 0
+	for _, f := range files {
+		documents += len(f.objs)
+		if req, gated := requirements[f.path]; gated {
+			if reason := req(r.posture); reason != "" {
+				deleted, foreign, err := r.withdraw(ctx, f.objs)
+				if err != nil {
+					errs = append(errs, err)
+				}
+				r.logSkip(ctx, f.path, reason, deleted, foreign)
+				continue
+			}
 		}
-		applied++
+		for _, obj := range f.objs {
+			if err := r.apply(ctx, obj); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			applied++
+		}
 	}
 	slog.DebugContext(ctx, "converged the embedded add-on manifest set",
-		"fieldManager", FieldManager, "documents", len(objs), "applied", applied, "failed", len(errs))
+		"fieldManager", FieldManager, "documents", documents, "applied", applied, "failed", len(errs))
 	return errors.Join(errs...)
+}
+
+// manifestFile is one manifest file's decoded objects, keyed by its path in the tree.
+type manifestFile struct {
+	path string
+	objs []*unstructured.Unstructured
 }
 
 // load walks the manifest tree in lexical order and decodes every YAML document it
 // finds, returning the decoded objects and the per-document decode failures separately
 // so that one malformed document cannot suppress its siblings.
 func (r *Reconciler) load() ([]*unstructured.Unstructured, []error) {
+	files, errs := r.loadFiles()
+	var objs []*unstructured.Unstructured
+	for _, f := range files {
+		objs = append(objs, f.objs...)
+	}
+	return objs, errs
+}
+
+// loadFiles is load, grouped by manifest file so a gated file can be skipped whole.
+func (r *Reconciler) loadFiles() ([]manifestFile, []error) {
 	var (
-		objs []*unstructured.Unstructured
-		errs []error
+		files []manifestFile
+		errs  []error
 	)
 	// fs.WalkDir visits lexically, which is what makes the applied order — and so the
 	// recorded API traffic — deterministic across boots.
@@ -152,14 +198,14 @@ func (r *Reconciler) load() ([]*unstructured.Unstructured, []error) {
 			return nil
 		}
 		fileObjs, fileErrs := r.loadFile(p)
-		objs = append(objs, fileObjs...)
+		files = append(files, manifestFile{path: p, objs: fileObjs})
 		errs = append(errs, fileErrs...)
 		return nil
 	})
 	if walkErr != nil {
 		errs = append(errs, fmt.Errorf("walk embedded add-on manifests: %w", walkErr))
 	}
-	return objs, errs
+	return files, errs
 }
 
 // isManifest reports whether p names a manifest file. Only .yaml/.yml are manifests, so
@@ -254,21 +300,9 @@ func decodeDocument(raw []byte) (*unstructured.Unstructured, error) {
 // refused outright rather than silently applied into the wrong place.
 func (r *Reconciler) apply(ctx context.Context, obj *unstructured.Unstructured) error {
 	gvk := obj.GroupVersionKind()
-	mapping, err := r.mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	ri, err := r.resourceFor(obj)
 	if err != nil {
-		return fmt.Errorf("map %s %s: %w", gvk, describe(obj), err)
-	}
-	var ri dynamic.ResourceInterface
-	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-		if obj.GetNamespace() == "" {
-			return fmt.Errorf("apply %s %s: namespaced object declares no metadata.namespace", gvk, describe(obj))
-		}
-		ri = r.dyn.Resource(mapping.Resource).Namespace(obj.GetNamespace())
-	} else {
-		if obj.GetNamespace() != "" {
-			return fmt.Errorf("apply %s %s: cluster-scoped object declares a metadata.namespace", gvk, describe(obj))
-		}
-		ri = r.dyn.Resource(mapping.Resource)
+		return fmt.Errorf("apply: %w", err)
 	}
 	if _, err := ri.Apply(ctx, obj.GetName(), obj, metav1.ApplyOptions{FieldManager: FieldManager, Force: true}); err != nil {
 		return fmt.Errorf("apply %s %s: %w", gvk, describe(obj), err)

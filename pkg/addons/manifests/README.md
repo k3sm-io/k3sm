@@ -8,7 +8,9 @@ It holds one add-on today: **`metrics-server.yaml`**, upstream metrics-server v0
 is upstream's verbatim; its Deployment header comment lists the only lines changed to run the
 Linux image as a `vm` pod on a Darwin node. `TestMetricsServerAddonManifest` pins the exact
 object set, the RBAC, the image digest and the scheduling fields, so any change to this file
-is a deliberate change to that test too.
+is a deliberate change to that test too. It is applied only where it can serve (a
+multi-node cluster CA posture and a usable vm runtime on the server); elsewhere it is
+skipped and withdrawn, see `TestMetricsServerAddonGate`.
 
 ## Why the manifests live in the binary and not on disk
 

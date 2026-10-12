@@ -568,8 +568,11 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
 	}
+	// Can this node host vm guests? Asked before the embedded add-ons (3c), the
+	// registry and the datapath use it.
+	vmCapable := vmBackendAvailable()
 	// 3–3c. Admission policies, the fail-closed RBAC graph, the embedded add-ons.
-	if err = provisionServerCluster(ctx, plan, restCfg, cs, logger); err != nil {
+	if err = provisionServerCluster(ctx, plan, restCfg, cs, vmCapable, logger); err != nil {
 		return err
 	}
 	// 3c''/3c'. Each stop drains before exec.Stop's defer (LIFO runs it first).
@@ -577,8 +580,6 @@ func runServer(args []string) (err error) {
 	defer stopHelm()
 	stopManifests := startManifestDir(ctx, restCfg, cs, logger)
 	defer stopManifests()
-	// Can this node host vm guests? Asked before the registry and datapath use it.
-	vmCapable := vmBackendAvailable()
 	// 3d. The ingest registry; torn down BEFORE the control plane (LIFO).
 	stopRegistry, registryPuller := startServerRegistry(ctx, plan, cs, vmCapable, logger)
 	defer stopRegistry()
