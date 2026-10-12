@@ -99,8 +99,12 @@ CODESIGN="${CODESIGN:-codesign}"
 
 MANIFEST_NAME="PAYLOAD-SHA256"
 UPSTREAM_NAME="UPSTREAM-DIGESTS"
-# A tree with fewer Mach-Os than this cannot be a complete install set (k3sm,
-# the exec shim, two DYLD shims, k3sm-vmhost, and the control-plane binaries).
+# A backstop, not the completeness check: verify_tree's required-artifact loop
+# (k3sm install --print-required-artifacts) is what proves the set is complete.
+# The floor only catches a walk that found almost nothing (a wrong directory, a
+# file(1) that stopped saying "Mach-O"). It stays below the five Mach-Os the
+# install contract names (k3sm, the exec shim, two DYLD shims, k3sm-vmhost) so a
+# stub-payload tree, whose control-plane files are not Mach-Os, still passes.
 MACHO_FLOOR=4
 # The hardened-runtime bit of the CodeDirectory flags (CS_RUNTIME) and the
 # ad-hoc bit (CS_ADHOC), tested numerically, never by the parenthesised names.
