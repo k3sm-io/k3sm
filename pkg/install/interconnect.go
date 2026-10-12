@@ -187,6 +187,18 @@ func interconnectFlushOrder(owned []InterconnectAlias, present map[netip.Addr]in
 // errUntrustedLedger reports a ledger file the sweep refuses to act on.
 var errUntrustedLedger = errors.New("untrusted interconnect ownership ledger")
 
+// ReadTrustedInterconnectLedger is readTrustedLedger for `k3sm doctor`: the
+// same checks the uninstall sweep applies, with root as the expected owner. An
+// untrusted file returns an error for which IsUntrustedLedger is true; an
+// absent one returns fs.ErrNotExist; a permission denial also matches
+// fs.ErrPermission so an unprivileged caller can tell it apart.
+func ReadTrustedInterconnectLedger(path string) ([]byte, error) {
+	return readTrustedLedger(path, 0)
+}
+
+// IsUntrustedLedger reports whether err is a refusal by the trust checks.
+func IsUntrustedLedger(err error) bool { return errors.Is(err, errUntrustedLedger) }
+
 // readTrustedLedger reads the ledger at path through one O_NOFOLLOW
 // descriptor, and only when that descriptor is a regular file owned by
 // ownerUID with no group or other write bit. A symlink (the open fails), a
@@ -198,7 +210,7 @@ func readTrustedLedger(path string, ownerUID uint32) ([]byte, error) {
 		return nil, err
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: open %s: %v", errUntrustedLedger, path, err)
+		return nil, fmt.Errorf("%w: open %s: %w", errUntrustedLedger, path, err)
 	}
 	defer f.Close()
 	fi, err := f.Stat()
@@ -222,9 +234,10 @@ func readTrustedLedger(path string, ownerUID uint32) ([]byte, error) {
 // (run with its arguments, returning its combined output). It reads the
 // ledger only when readTrustedLedger accepts it, removes the
 // interconnectFlushOrder list, and removes the ledger once every removal
-// succeeded. An unknown node index (negative), an untrusted ledger, or an
-// entry that is not this node's derived alias is skipped with a warning, never
-// an error: those leave state in place, which is the safe direction.
+// succeeded. An unknown node index (negative) or an entry that is not this
+// node's derived alias is skipped with a warning, never an error. An untrusted
+// ledger is an error that leaves everything in place, so uninstall keeps the
+// node identity and a re-run after the operator fixes the ledger can finish.
 func sweepInterconnect(ledgerPath string, nodeIndex int, ownerUID uint32, ifconfig func(args ...string) ([]byte, error), log *slog.Logger) error {
 	raw, err := readTrustedLedger(ledgerPath, ownerUID)
 	switch {
@@ -233,7 +246,9 @@ func sweepInterconnect(ledgerPath string, nodeIndex int, ownerUID uint32, ifconf
 	case errors.Is(err, errUntrustedLedger):
 		log.Warn("interconnect aliases not swept: the ownership ledger is not a root-owned regular file", "err", err,
 			"remedy", "sudo ifconfig "+InterconnectBridge+"   # inspect, then remove k3sm's 169.254.0.x aliases by hand")
-		return nil
+		// An error, like a failed removal: uninstall keeps the node identity so a
+		// re-run after the operator fixes the ledger can still re-derive the aliases.
+		return err
 	case err != nil:
 		return fmt.Errorf("read the interconnect ownership ledger: %w", err)
 	}
