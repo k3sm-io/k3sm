@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -2151,6 +2152,22 @@ func (darwinSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 	}
 	return errors.Join(errs...)
 }
+
+// FlushInterconnectAliases sweeps the interconnect aliases netd's ownership
+// ledger names (see sweepInterconnect): only a root-owned regular ledger is
+// read, only this node's re-derived aliases with the right netmask are removed
+// (`/sbin/ifconfig bridge0 -alias <ip>`, /32s before the slot-0 /24), and the
+// ledger goes once every removal succeeded. It runs as root after netd is
+// booted out. bridge0's membership is never touched.
+func (darwinSystem) FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error {
+	return sweepInterconnect(ledgerPath, nodeIndex, 0, func(args ...string) ([]byte, error) {
+		return exec.Command(ifconfigPath, args...).CombinedOutput()
+	}, log)
+}
+
+// ifconfigPath is ifconfig by absolute path, so a root uninstall never runs
+// whatever a PATH entry names ifconfig.
+const ifconfigPath = "/sbin/ifconfig"
 
 // FlushMeshPFAnchor flushes every rule in the pf anchor (mesh.PFAnchor,
 // "io.k3sm.mesh") that an older release loaded the mesh MSS clamp into. Nothing

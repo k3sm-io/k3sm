@@ -34,14 +34,16 @@ directory is the front door to the user-facing docs; read them roughly in the jo
     workloads; it boots `linux/arm64` images per Pod today.
 16. [MLX serving](mlx-quickstart.md) walks through serving a model on the Mac's GPU through an
     `/v1/chat/completions` endpoint.
-17. [Limitations](limitations.md) lists the gaps.
-18. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
+17. [Interconnects](interconnects.md) covers a Thunderbolt cable between Macs as an opt-in network
+    for Pods that ask for it, the MLX ranks of a sharded model above all.
+18. [Limitations](limitations.md) lists the gaps.
+19. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
     recovery.
-19. [Status JSON](status-json.md) is the contract for `k3sm status -o json` and the cheap
+20. [Status JSON](status-json.md) is the contract for `k3sm status -o json` and the cheap
     `k3sm status daemons -o json` probe: fields, enums, versioning and exit codes.
-20. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
+21. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
     options, rotation, and how to ship logs off a node.
-21. [FAQ](faq.md) gives short answers to the common questions.
+22. [FAQ](faq.md) gives short answers to the common questions.
 
 ## Before You Build Anything Real
 

@@ -301,6 +301,8 @@ install performs.
 - Services resolve cluster-wide via the userspace Service proxy.
 - Mesh traffic between Pods on different nodes rides the wireguard tunnel with per-peer symmetric
   `AllowedIPs`.
+- Pods that opt in can also reach each other over a Thunderbolt cable between two Macs, once an
+  admin arms it; see [Interconnects](interconnects.md).
 
 ## Caveats
 

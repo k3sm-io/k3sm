@@ -106,10 +106,14 @@ func (c Collector) Collect(ctx context.Context) Report {
 	if hb, ok := c.heartbeatRow(ctx, serving, role, nodes, nodesErr, now()); ok {
 		rows = append(rows, hb)
 	}
-	rows = append(rows,
-		c.workloadsRow(ctx, serving, nodePID, nodes, nodesErr, now()),
-		dataRoot,
-	)
+	rows = append(rows, c.workloadsRow(ctx, serving, nodePID, nodes, nodesErr, now()))
+	// Beside the workloads it carries, and only when the cluster has an
+	// Interconnect: a cluster with no cable never gets a row about one.
+	icRow, icBlock, haveIC := c.interconnectRow(ctx, serving)
+	if haveIC {
+		rows = append(rows, icRow)
+	}
+	rows = append(rows, dataRoot)
 	// Immediately after the data root it sits beside, and only while it is
 	// there: the copy is the operator's rollback from a migration, and the row
 	// is how they learn it is still costing them disk.
@@ -156,6 +160,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 		Summary:       summary,
 		Rows:          rows,
 		Next:          next,
+		Interconnect:  icBlock,
 		Version:       c.Version,
 		Host:          c.Host,
 		Timestamp:     now(),

@@ -947,6 +947,25 @@ datastore operational model.
   reproduced since both are in place. UDP above 1352 bytes has not been exercised under load, so
   avoid sustained large-datagram UDP across the mesh. A panic costs a reboot of the host.
 
+### Thunderbolt Interconnect
+
+The [interconnect](interconnects.md) lets opted-in Pods reach each other over a Thunderbolt cable
+between Macs. It is alpha and off until an admin arms it.
+
+- Traffic on the cable is plaintext. Once armed, any device on a cabled port can reach and spoof
+  interconnect addresses, because nothing on the wire ties an address to the Pod that owns it.
+- NetworkPolicy does not cover interconnect addresses, and k3sm loads no packet filter.
+- A Pod is reached over the cable only when it binds its interconnect address explicitly. A
+  wildcard bind stays on the Pod IP.
+- Only nodes with cluster index 0 to 30 get an address, so at most 31 nodes share the
+  interconnect. A node above that is reported and left out.
+- Each node holds one MLX rank and at most six other interconnect Pods.
+- `vm` and `container-vm` Pods cannot attach.
+- An established connection on a pulled cable hangs until its own timeout, because the interface
+  stays up. Only sharded MLX models move back to the mesh on their own.
+- Cables must not form a loop. Loop members are marked and not used, because k3sm never turns on
+  spanning tree.
+
 ## MLX / Apple-GPU Workloads
 
 MLX and Apple-GPU workloads (the `MLXModel` CRD and the `mlx.k3sm.io/gpu` extended resource) have

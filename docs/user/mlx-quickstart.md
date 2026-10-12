@@ -134,7 +134,9 @@ That removes the serving workload, both Services, and the cache PVC. The underly
 - Sharded serving is experimental: an alpha, for trusted tenancy only, and not yet run on hardware.
   A model may set `spec.distributed` (`ranks`, `backend`, `parallelism`), and the operator places
   the ranks as gang-scheduled rank Pods with per-rank DNS and reports placement and link health in
-  status. The `ring` backend places over the existing mesh. The `jaccl` backend needs RDMA-capable
+  status. The `ring` backend places over the existing mesh, or over a Thunderbolt cable between the
+  Macs when `spec.distributed.interconnect` selects it (see [Interconnects](interconnects.md)). The
+  `jaccl` backend needs RDMA-capable
   direct links between Macs, which are not wired into the node yet, so it reports
   `ShardsPlaced=False`. Without `spec.distributed`, one model serves from one node.
 - The **Apple Neural Engine is not a serving target**. MLX runs on the GPU; Apple publishes no stable

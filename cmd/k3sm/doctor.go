@@ -128,6 +128,9 @@ type doctorEnv struct {
 	daemonInfo   func(label string) status.DaemonInfo
 	reportDir    func(requested string) (string, error)
 	writeReport  func(dir, name string, contents []byte) error
+	// interconnect is the interconnect section's seams (doctorinterconnect.go).
+	// Nil leaves the section out of the report.
+	interconnect *interconnectEnv
 }
 
 // doctorCheck is a registry entry: a stable name and its pure check function. The
@@ -517,6 +520,13 @@ It reports what k3sm needs from the machine — the CPU, the macOS floor, SIP, t
 grant, and (on a worker) the agent daemon and its node credential. Every row
 that is not a pass carries the command that repairs it, collected under ` + "`Next:`" + `.
 
+On a Mac with a Thunderbolt cable to another Mac, or with interconnect state,
+the ic- rows check the interconnect: bridge0 and its Thunderbolt members, the
+netd socket, this node's interconnect address, the peers and their round trip,
+the pods holding an interconnect address, cable loops, stray and leftover
+reserved-range state, and Apple's three power and login settings for
+Thunderbolt clusters. Some of them need sudo to read netd's records.
+
 Flags:
   -work-dir <dir>     control-plane state root (the kine state.db lives here)
   --json              print the report as JSON — the same shape as ` + "`k3sm status -o json`" + `
@@ -604,6 +614,18 @@ func doctorReport(env doctorEnv, ver version.Info, now time.Time) status.Report 
 		rows = append(rows, doctorRow(r))
 	}
 	role, _ := env.nodeRole()
+	// The interconnect section follows the registry: its rows are many and
+	// depend on one another's facts, so it is one function, not registry
+	// entries.
+	for _, r := range interconnectChecks(env.interconnect, role) {
+		switch r.status {
+		case statusPass:
+			passed++
+		case statusSkip:
+			skipped++
+		}
+		rows = append(rows, doctorRow(r))
+	}
 	verdict, summary, next := status.Aggregate(rows, true, role)
 	if verdict == status.VerdictRunning {
 		// Aggregate's healthy summary and its one next step are claims about a
@@ -788,6 +810,7 @@ func realDoctorEnv(workDir string) doctorEnv {
 		daemonInfo:   probeDaemonInfo,
 		reportDir:    makeReportDir,
 		writeReport:  writeReportFile,
+		interconnect: realInterconnectEnv(),
 	}
 }
 

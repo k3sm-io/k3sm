@@ -419,6 +419,26 @@ The node advertises a capability label only when its start-time probe said yes.
 - Confirm the agent can reach the server on `6443` and the wireguard mesh is up. See
   [Multi-node](multi-node.md).
 
+## The Thunderbolt Interconnect Is Not Used
+
+Start with `sudo k3sm doctor` on each cabled Mac. Its rows starting with `ic-` check `bridge0` and
+its Thunderbolt members, the netd socket, the node's interconnect address, the peers, the attached
+Pods, cable loops and stray state, and each row that is not a pass prints the command that fixes
+it. Then:
+
+- Run `k3sm status` on the control plane. A `disabled` interconnect row means nobody armed it; run
+  `k3sm interconnect enable` there. A node named as out of range has a cluster index above 30 and
+  never gets an address.
+- Read the Pod's `k3sm.io/InterconnectAttached` condition
+  (`kubectl get pod <name> -o jsonpath='{.status.conditions}'`). A `False` condition names why the
+  attach was refused, and the Pod's Warning Events say the same.
+- A listener has to bind `$K3SM_INTERCONNECT_IP` to be reached over the cable. A wildcard bind stays
+  on the Pod IP.
+- A peer that stops answering is often asleep. Thunderbolt has no Wake-on-LAN; `k3sm doctor`'s
+  `ic-sleep` row prints the setting that keeps it awake.
+
+See [Interconnects](interconnects.md) for how the cable is armed and used.
+
 ## A Node Went Offline and Pods Are Stuck Terminating
 
 A Mac that goes away while it is running Pods leaves them stuck: `kubectl get pod` shows them

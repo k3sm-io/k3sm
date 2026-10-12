@@ -54,6 +54,7 @@ import (
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -1024,6 +1025,21 @@ type System interface {
 	// is a no-op (pfctl succeeds flushing zero rules), and a pfctl failure is
 	// reported but never stops the rest of uninstall.
 	FlushMeshPFAnchor() error
+	// FlushInterconnectAliases is the uninstall backstop for the interconnect
+	// aliases netd put on bridge0. netd's shutdown removes nothing, so the
+	// aliases its ownership ledger (the file at ledgerPath, netd's own record)
+	// names outlive it. The ledger is read only when it is a root-owned
+	// regular file with no group or other write, and an entry is removed only
+	// when it is this node's derived address for its slot (from nodeIndex, the
+	// cluster index of the pod range netd adopted; negative means unknown, and
+	// nothing is swept), is on bridge0 now, and has its slot's netmask. The pod
+	// /32s go before the node's /24, then the ledger. It never changes
+	// bridge0's membership. An absent ledger, or a host with no bridge0, is a
+	// no-op; a refused ledger or entry is logged and left; a removal that fails
+	// keeps the ledger and returns an error. Uninstall removes the node identity
+	// file nodeIndex comes from only after this returns nil, so a re-run still
+	// has both the ledger and the index and can finish the job.
+	FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error
 	// ReadPodReapRecords returns the pod process groups the runtime recorded in
 	// its reap store under dataRoot (runtime.ReadPodReapRecords). An absent store
 	// holds none.
@@ -2372,6 +2388,9 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 //
 //   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
 //     because no daemon does it.
+//   - the interconnect aliases on bridge0 — SWEPT, by the
+//     FlushInterconnectAliases backstop below, scoped to the ones netd's
+//     ownership ledger names, and the ledger with them.
 //   - the pf anchor an older release loaded the mesh MSS clamp into: SWEPT, by
 //     the FlushMeshPFAnchor backstop below. Nothing loads it now (k3sm loads no
 //     pf rule), but a rule an older release left behind would survive netd,
@@ -2456,8 +2475,18 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// that would leave the operator with a half-installed machine.
 	deregisterServer(ctx, sys, cfg, m)
 	deregisterNode(ctx, cfg, m)
+	// This node's cluster index, from the identity file the interconnect sweep
+	// after the walk re-derives every alias it may remove from. The walk does
+	// NOT remove that file (it is listed as removed, and is): it goes only
+	// after the sweep completes, so a sweep that failed part-way leaves both
+	// the ledger and the index a re-run needs to finish the job.
+	identity := netdsvc.NodeIdentityPath(MeshKeyDir)
+	icIndex := interconnectNodeIndex(sys)
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
+		if a.disp == dispRemove && a.kind == kindFile && a.path == identity {
+			continue
+		}
 		switch a.disp {
 		case dispPreserve:
 			// Deliberately kept — DataRoot, the human kubeconfig, the _k3sm user, LogDir.
@@ -2535,6 +2564,21 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 		flush = append(flush, svc)
 	}
 	note(sys.FlushLo0Aliases(flush))
+	// Backstop: the interconnect aliases on bridge0 that netd's ledger owns, and
+	// the ledger itself. Like the lo0 aliases they are durable kernel state no
+	// daemon removes on the way out; unlike them they are swept by OWNERSHIP,
+	// re-derived from this node's cluster index, not by range, so a
+	// 169.254.0.0/24 address that is not this node's derived alias stays.
+	//
+	// Then the identity file, and only when the sweep completed (an absent
+	// ledger counts): a sweep that failed keeps its ledger for a re-run, and
+	// that re-run can re-derive nothing without this node's index.
+	if err := sys.FlushInterconnectAliases(netdsvc.InterconnectStatePath(MeshKeyDir), icIndex, cfg.Logger); err != nil {
+		note(err)
+		cfg.Logger.Warn("node identity kept so a re-run of uninstall can finish the interconnect sweep", "path", identity)
+	} else if slices.ContainsFunc(m, func(a artifact) bool { return a.disp == dispRemove && a.path == identity }) {
+		note(safeRemove(identity))
+	}
 	if firstErr != nil {
 		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}

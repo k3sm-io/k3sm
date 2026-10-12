@@ -112,14 +112,18 @@ type Report struct {
 	// node-daemon plists on disk (dataroot.RoleFromPlists). It picks the rows
 	// the screens render and the daemon the verdict is about, so it is part of
 	// the machine interface rather than a decoration.
-	Role      dataroot.Role `json:"role"`
-	Summary   string        `json:"summary"`
-	Rows      []Row         `json:"rows"`
-	Next      []string      `json:"next,omitempty"`
-	Peers     []PeerStatus  `json:"peers,omitempty"`
-	Version   version.Info  `json:"version"`
-	Host      string        `json:"host"`
-	Timestamp time.Time     `json:"timestamp"`
+	Role    dataroot.Role `json:"role"`
+	Summary string        `json:"summary"`
+	Rows    []Row         `json:"rows"`
+	Next    []string      `json:"next,omitempty"`
+	Peers   []PeerStatus  `json:"peers,omitempty"`
+	// Interconnect is the cluster's interconnect and the pods attached to it,
+	// present only when the cluster has one this report could read (the
+	// interconnect row carries the same facts as a sentence).
+	Interconnect *Interconnect `json:"interconnect,omitempty"`
+	Version      version.Info  `json:"version"`
+	Host         string        `json:"host"`
+	Timestamp    time.Time     `json:"timestamp"`
 }
 
 // Row returns the named row and whether it was present.

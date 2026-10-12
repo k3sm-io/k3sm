@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 
@@ -160,12 +161,27 @@ func newStatusCollector() status.Collector {
 		CDHash: func(path string) (string, error) {
 			return shadow.CDHash(context.Background(), path)
 		},
-		Paths:      paths,
-		EUID:       euid,
-		ServiceUID: serviceUID,
-		Version:    version.Get(),
-		Host:       macOSVersionOrEmpty(),
-		Hostname:   hostnameOrEmpty(),
+		// The cluster's Interconnect, read over the same client as every other
+		// apiserver row.
+		Interconnect: statusInterconnect(kube),
+		Paths:        paths,
+		EUID:         euid,
+		ServiceUID:   serviceUID,
+		Version:      version.Get(),
+		Host:         macOSVersionOrEmpty(),
+		Hostname:     hostnameOrEmpty(),
+	}
+}
+
+// statusInterconnect is the report's Interconnect reader over kube: one GET of
+// the cluster's Interconnect, nil-with-no-error when there is none. Without a
+// client there is nothing to read, and the row is left out.
+func statusInterconnect(kube status.Kube) func(context.Context) (*netv1alpha1.Interconnect, error) {
+	if kube == nil {
+		return nil
+	}
+	return func(ctx context.Context) (*netv1alpha1.Interconnect, error) {
+		return status.ReadInterconnect(ctx, kube)
 	}
 }
 
