@@ -107,7 +107,7 @@ func stageHelm(ctx context.Context, bd string, force bool) error {
 	// 0755 under the daemon: only root (install and the payload seed) can place
 	// a file under the versioned name.
 	if !force && fileExists(dst) {
-		return signBinaries(ctx, bd, helmchart.HelmBinaryName, []string{helmchart.HelmBinaryName})
+		return signHelm(ctx, bd)
 	}
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create bin dir %s: %w", bd, err)
@@ -132,7 +132,7 @@ func stageHelm(ctx context.Context, bd string, force bool) error {
 	// Extracted to a temp beside dst, signed THERE, then renamed over dst: dst
 	// never names unsigned bytes, and a helm a Job is running is never rewritten.
 	return extractMember(tgz, helmchart.HelmTarballMember, func(r io.Reader) error {
-		if err := binsign.InstallReader(ctx, binsign.Codesign{}, r, dst, 0o755); err != nil {
+		if err := binsign.InstallReader(ctx, bootCodeSigner, r, dst, 0o755); err != nil {
 			return fmt.Errorf("install %s: %w", dst, err)
 		}
 		return nil

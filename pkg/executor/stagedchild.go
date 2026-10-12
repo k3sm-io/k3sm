@@ -104,6 +104,11 @@ func (c stagedChild) writeMarker(bd string) error {
 }
 
 // ensureInto stages the child into bd under the protocol described on stagedChild.
+//
+// A staged child keeps the dev signing on both signing paths (see signingPolicy):
+// it is built at boot and ad-hoc signed, and is not yet part of the signed payload,
+// so the release check does not apply to it. A child binary that is validly signed
+// by a certificate identity is still never re-signed (binsign's identity rule).
 func (c stagedChild) ensureInto(ctx context.Context, bd string) error {
 	if c.staged(bd) {
 		return signBinaries(ctx, bd, strings.TrimSpace(c.markerContent()), []string{c.name})
@@ -140,7 +145,7 @@ func (c stagedChild) ensureInto(ctx context.Context, bd string) error {
 	// target and only then renamed over it, so an interrupted copy cannot leave a
 	// truncated binary at the real path, the real path never names unsigned bytes,
 	// and a running child's mapping of the old binary is never rewritten.
-	if err := binsign.Install(ctx, binsign.Codesign{}, built, c.binPath(bd), 0o755); err != nil {
+	if err := binsign.Install(ctx, bootCodeSigner, built, c.binPath(bd), 0o755); err != nil {
 		return fmt.Errorf("install %s binary: %w", c.name, err)
 	}
 	// LAST: the marker vouches for a staged, signed binary.
