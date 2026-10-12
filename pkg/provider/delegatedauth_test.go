@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,7 +56,13 @@ const (
 	tokenExpired     = "token-expired"         // the apiserver says: not authenticated (expired)
 	tokenNoUsername  = "token-no-username"     // authenticated with an empty username
 	tokenReviewError = "token-tokenreview-err" // the TokenReview call errors
+	tokenAuthErrored = "token-auth-errored"    // authenticated, but the reply carries Status.Error
+	tokenSAREvalErr  = "token-sar-evalerr"     // authenticated; the SAR allows with an EvaluationError
 )
+
+// junkTokenPrefix marks a token the fake answers with a DEFINITIVE rejection
+// (not authenticated, no Status.Error), the one kind of junk the cache stores.
+const junkTokenPrefix = "junk-"
 
 // fakeTokenReviewer answers TokenReviews from a fixed table and counts calls.
 type fakeTokenReviewer struct {
@@ -93,7 +101,15 @@ func (f *fakeTokenReviewer) Create(_ context.Context, tr *authnv1.TokenReview, _
 		out.Status = authnv1.TokenReviewStatus{Authenticated: false, Error: "token has expired"}
 	case tokenReviewError:
 		return nil, errors.New("tokenreviews.authentication.k8s.io: context deadline exceeded")
+	case tokenAuthErrored:
+		out.Status = authnv1.TokenReviewStatus{Authenticated: true, User: user("system:serviceaccount:kube-system:metrics-server"), Error: "webhook authenticator: partial failure"}
+	case tokenSAREvalErr:
+		out.Status = authnv1.TokenReviewStatus{Authenticated: true, User: user("sar-evalerr")}
 	default:
+		if strings.HasPrefix(tr.Spec.Token, junkTokenPrefix) {
+			out.Status = authnv1.TokenReviewStatus{Authenticated: false}
+			return out, nil
+		}
 		out.Status = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid bearer token"}
 	}
 	return out, nil
@@ -123,6 +139,8 @@ func (f *fakeSARReviewer) Create(_ context.Context, sar *authzv1.SubjectAccessRe
 	switch {
 	case sar.Spec.User == "sar-error":
 		return nil, errors.New("subjectaccessreviews.authorization.k8s.io: connection refused")
+	case sar.Spec.User == "sar-evalerr":
+		out.Status = authzv1.SubjectAccessReviewStatus{Allowed: true, EvaluationError: "webhook authorizer: timeout"}
 	case sar.Spec.User == "sar-denied":
 		out.Status = authzv1.SubjectAccessReviewStatus{Allowed: true, Denied: true}
 	case onNode("system:serviceaccount:kube-system:metrics-server", "metrics", delegatedTestNode),
@@ -352,7 +370,7 @@ func TestKubeletDelegatedAuthReviewDiscipline(t *testing.T) {
 	t.Run("the cache is bounded", func(t *testing.T) {
 		d := mustDelegated(t, &fakeTokenReviewer{}, &fakeSARReviewer{})
 		for i := 0; i < delegatedCacheMax*3; i++ {
-			tok := "garbage-" + strings.Repeat("x", i%7) + string(rune('a'+i%26)) + time.Duration(i).String()
+			tok := junkTokenPrefix + strconv.Itoa(i)
 			d.admit(context.Background(), httptest.NewRequest(http.MethodGet, "https://node/metrics/resource", nil), tok)
 		}
 		d.mu.Lock()
@@ -360,6 +378,134 @@ func TestKubeletDelegatedAuthReviewDiscipline(t *testing.T) {
 		d.mu.Unlock()
 		if n > delegatedCacheMax {
 			t.Errorf("cache holds %d entries, want <= %d", n, delegatedCacheMax)
+		}
+		if n < delegatedCacheMax {
+			t.Errorf("cache holds %d entries after %d definitive junk denials, want it full (%d): the flood was not cached at all", n, delegatedCacheMax*3, delegatedCacheMax)
+		}
+	})
+
+	t.Run("an error-carrying review reply is a non-definitive denial", func(t *testing.T) {
+		r := func() *http.Request { return httptest.NewRequest(http.MethodGet, "https://node/metrics/resource", nil) }
+		for _, tc := range []struct {
+			name       string
+			token      string
+			want       int
+			wantTR     int64
+			wantSARs   int64
+			wantCached bool
+		}{
+			// Authenticated with a user, but Status.Error says the answer is partial.
+			{"TokenReview authenticated with Status.Error", tokenAuthErrored, http.StatusUnauthorized, 2, 0, false},
+			// Not authenticated, with Status.Error: upstream's usual rejection shape.
+			{"TokenReview rejected with Status.Error", tokenExpired, http.StatusUnauthorized, 2, 0, false},
+			// Allowed, with an EvaluationError beside it.
+			{"SAR allowed with EvaluationError", tokenSAREvalErr, http.StatusForbidden, 2, 2, false},
+			// The control: a definitive denial without any error IS cached.
+			{"definitive rejection without an error", junkTokenPrefix + "control", http.StatusUnauthorized, 1, 0, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tokens, access := &fakeTokenReviewer{}, &fakeSARReviewer{}
+				d := mustDelegated(t, tokens, access)
+				for i := 0; i < 2; i++ {
+					if got := d.admit(context.Background(), r(), tc.token); got != tc.want {
+						t.Errorf("admit #%d = %d, want %d", i+1, got, tc.want)
+					}
+				}
+				if got := tokens.calls.Load(); got != tc.wantTR {
+					t.Errorf("%d TokenReviews over two admits, want %d", got, tc.wantTR)
+				}
+				if got := access.calls.Load(); got != tc.wantSARs {
+					t.Errorf("%d SARs over two admits, want %d", got, tc.wantSARs)
+				}
+				d.mu.Lock()
+				n := len(d.cache)
+				d.mu.Unlock()
+				if (n != 0) != tc.wantCached {
+					t.Errorf("cache holds %d entries, want cached=%v", n, tc.wantCached)
+				}
+			})
+		}
+	})
+
+	t.Run("in-flight reviews are capped; the overflow is 429 with no review", func(t *testing.T) {
+		gate := &gatedTokenReviewer{entered: make(chan struct{}, delegatedMaxInFlight), release: make(chan struct{})}
+		access := &fakeSARReviewer{}
+		d := mustDelegated(t, gate, access)
+		r := func() *http.Request { return httptest.NewRequest(http.MethodGet, "https://node/metrics/resource", nil) }
+		results := make(chan int, delegatedMaxInFlight)
+		for i := 0; i < delegatedMaxInFlight; i++ {
+			go func(i int) { results <- d.admit(context.Background(), r(), junkTokenPrefix+"held-"+strconv.Itoa(i)) }(i)
+		}
+		for i := 0; i < delegatedMaxInFlight; i++ {
+			select {
+			case <-gate.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("only %d of %d reviews started", i, delegatedMaxInFlight)
+			}
+		}
+		// Every slot is held: further distinct tokens are refused without a review.
+		for i := 0; i < 3*delegatedMaxInFlight; i++ {
+			if got := d.admit(context.Background(), r(), junkTokenPrefix+"flood-"+strconv.Itoa(i)); got != http.StatusTooManyRequests {
+				t.Fatalf("admit with every slot held = %d, want 429", got)
+			}
+		}
+		if got := gate.calls.Load(); got != delegatedMaxInFlight {
+			t.Errorf("%d TokenReviews issued, want exactly %d (the overflow must issue none)", got, delegatedMaxInFlight)
+		}
+		close(gate.release)
+		for i := 0; i < delegatedMaxInFlight; i++ {
+			if got := <-results; got != http.StatusUnauthorized {
+				t.Errorf("held admit = %d, want 401", got)
+			}
+		}
+		// The slots are returned: the next request is reviewed again.
+		if got := d.admit(context.Background(), r(), junkTokenPrefix+"after"); got != http.StatusUnauthorized || gate.calls.Load() != delegatedMaxInFlight+1 {
+			t.Errorf("admit after release = %d with %d TokenReviews, want 401 from a fresh review", got, gate.calls.Load())
+		}
+	})
+
+	t.Run("a full cache evicts expired entries, then the oldest, never a newer allow", func(t *testing.T) {
+		tokens, access := &fakeTokenReviewer{}, &fakeSARReviewer{}
+		d := mustDelegated(t, tokens, access)
+		now := time.Unix(1_800_000_000, 0)
+		d.now = func() time.Time { return now }
+		get := func(tok string) int {
+			return d.admit(context.Background(), httptest.NewRequest(http.MethodGet, "https://node/metrics/resource", nil), tok)
+		}
+		cached := func(tok string) bool {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			_, ok := d.cache[delegatedKey{token: sha256.Sum256([]byte(tok)), path: "/metrics/resource"}]
+			return ok
+		}
+		oldJunk := junkTokenPrefix + "oldest"
+		get(oldJunk)
+		if got := get(tokenMetrics); got != http.StatusOK {
+			t.Fatalf("metrics admit = %d, want 200", got)
+		}
+		for i := 0; len(d.cache) < delegatedCacheMax; i++ {
+			get(junkTokenPrefix + strconv.Itoa(i))
+		}
+		get(junkTokenPrefix + "one-more")
+		if cached(oldJunk) {
+			t.Error("the oldest junk entry survived a full-cache insert")
+		}
+		if !cached(tokenMetrics) {
+			t.Fatal("the live allow was evicted while older junk remained")
+		}
+
+		// Past the deny TTL but inside the allow TTL: every junk entry is expired and
+		// goes first; the allow stays even though it is now the oldest entry.
+		now = now.Add(delegatedDenyTTL)
+		get(junkTokenPrefix + "late")
+		if !cached(tokenMetrics) {
+			t.Error("the live allow was evicted while expired junk was available")
+		}
+		d.mu.Lock()
+		n := len(d.cache)
+		d.mu.Unlock()
+		if n != 2 {
+			t.Errorf("cache holds %d entries after the expired purge, want 2 (the allow and the new junk)", n)
 		}
 	})
 
@@ -400,6 +546,30 @@ func TestKubeletDelegatedAuthReviewDiscipline(t *testing.T) {
 			t.Error("a certificate from a foreign CA completed the handshake")
 		}
 	})
+}
+
+// gatedTokenReviewer answers every review with a definitive rejection, but only
+// after release is closed; it signals entered as each review starts.
+type gatedTokenReviewer struct {
+	calls   atomic.Int64
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedTokenReviewer) Create(ctx context.Context, tr *authnv1.TokenReview, _ metav1.CreateOptions) (*authnv1.TokenReview, error) {
+	g.calls.Add(1)
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	out := tr.DeepCopy()
+	out.Status = authnv1.TokenReviewStatus{Authenticated: false}
+	return out, nil
 }
 
 // blockingTokenReviewer never answers until its context ends.

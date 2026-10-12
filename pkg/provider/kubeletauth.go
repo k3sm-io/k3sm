@@ -256,7 +256,8 @@ func (a *KubeletEndpointAuth) Handler(next http.Handler) http.Handler {
 	})
 }
 
-// deny logs a refusal and answers it with status (401 or 403).
+// deny logs a refusal and answers it with status (401, 403, or 429 from the
+// delegated path's in-flight bound).
 func (a *KubeletEndpointAuth) deny(w http.ResponseWriter, r *http.Request, status int, msg string) {
 	a.log.Warn(msg, "path", r.URL.Path, "method", r.Method, "remote", r.RemoteAddr, "status", status)
 	http.Error(w, http.StatusText(status), status)

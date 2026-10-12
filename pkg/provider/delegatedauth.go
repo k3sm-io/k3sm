@@ -65,6 +65,12 @@ const (
 	// delegatedCacheMax bounds the cache. The legitimate population is one or two
 	// metrics-server replicas, so the bound only matters under abuse.
 	delegatedCacheMax = 256
+	// delegatedMaxInFlight caps the cert-less requests reviewing at once. A
+	// request that finds every slot taken is answered 429 without issuing a
+	// review, so a flood of distinct tokens (which the cache cannot absorb) costs
+	// the apiserver at most this many concurrent TokenReviews from this node.
+	// metrics-server needs one slot per scrape.
+	delegatedMaxInFlight = 8
 )
 
 // DelegatedAuth admits a bearer token on the kubelet endpoint's read-only
@@ -76,8 +82,10 @@ const (
 // as k3s runs it, restricted to the two routes metrics-server scrapes.
 //
 // Every failure denies: a review error, a timeout, an unauthenticated token, an
-// empty username, a SAR that does not allow or that explicitly denies. There is
-// no anonymous access. It is reachable only through KubeletEndpointAuth.Handler,
+// empty username, a TokenReview reporting Status.Error, a SAR that does not
+// allow, explicitly denies, or reports Status.EvaluationError. There is no
+// anonymous access. A request arriving while delegatedMaxInFlight reviews are
+// already running is 429 and issues no review. It is reachable only through KubeletEndpointAuth.Handler,
 // which consults it only when the request presented NO client certificate.
 //
 // The node calls both review APIs with its own system:node:<name> identity. The
@@ -91,10 +99,14 @@ type DelegatedAuth struct {
 	access   SubjectAccessReviewer
 	now      func() time.Time
 
-	// mu guards cache. Reviews run with mu released, so a slow apiserver never
-	// serializes the endpoint.
+	// inFlight holds one token per running review; acquiring never blocks.
+	inFlight chan struct{}
+
+	// mu guards cache and seq. Reviews run with mu released, so a slow apiserver
+	// never serializes the endpoint.
 	mu    sync.Mutex
 	cache map[delegatedKey]delegatedEntry
+	seq   uint64 // insertion counter; the smallest live seq is the oldest entry
 }
 
 // delegatedKey identifies one cached decision: the token (by digest, so the
@@ -108,6 +120,7 @@ type delegatedKey struct {
 type delegatedEntry struct {
 	status  int // http.StatusOK, StatusUnauthorized or StatusForbidden
 	expires time.Time
+	seq     uint64 // insertion order, for oldest-first eviction
 }
 
 // ErrDelegatedAuthIncomplete reports a DelegatedAuth built without a node name or
@@ -125,6 +138,7 @@ func NewDelegatedAuth(nodeName string, tokens TokenReviewer, access SubjectAcces
 		tokens:   tokens,
 		access:   access,
 		now:      time.Now,
+		inFlight: make(chan struct{}, delegatedMaxInFlight),
 		cache:    make(map[delegatedKey]delegatedEntry),
 	}, nil
 }
@@ -142,7 +156,8 @@ func bearerToken(r *http.Request) (string, bool) {
 }
 
 // admit decides one bearer-token request and returns the HTTP status to answer
-// with: http.StatusOK to serve it, else 401 or 403.
+// with: http.StatusOK to serve it, else 401, 403, or 429 when every review slot
+// is taken.
 //
 // The route gate comes first and makes no API call: a path outside
 // vkadapter.TokenRouteSubresource, a non-GET method, or an escaped path is 403
@@ -163,6 +178,12 @@ func (d *DelegatedAuth) admit(ctx context.Context, r *http.Request, token string
 		return status
 	}
 
+	select {
+	case d.inFlight <- struct{}{}:
+		defer func() { <-d.inFlight }()
+	default:
+		return http.StatusTooManyRequests
+	}
 	status, definitive := d.review(ctx, token, subresource)
 	if definitive {
 		d.store(key, status)
@@ -171,8 +192,11 @@ func (d *DelegatedAuth) admit(ctx context.Context, r *http.Request, token string
 }
 
 // review runs the TokenReview then the SubjectAccessReview. definitive is true
-// only when the apiserver ANSWERED both questions it was asked; an error or a
-// timeout is never definitive and so is never cached.
+// only when the apiserver ANSWERED both questions it was asked; an error, a
+// timeout, a TokenReview Status.Error or a SAR Status.EvaluationError is never
+// definitive and so is never cached. Upstream sets Status.Error on many plain
+// rejections too ("invalid bearer token"), so most junk-token denials are not
+// cached: delegatedMaxInFlight, not the cache, is what bounds that traffic.
 func (d *DelegatedAuth) review(ctx context.Context, token, subresource string) (status int, definitive bool) {
 	rctx, cancel := context.WithTimeout(ctx, delegatedReviewTimeout)
 	defer cancel()
@@ -180,7 +204,7 @@ func (d *DelegatedAuth) review(ctx context.Context, token, subresource string) (
 	tr, err := d.tokens.Create(rctx, &authnv1.TokenReview{
 		Spec: authnv1.TokenReviewSpec{Token: token},
 	}, metav1.CreateOptions{})
-	if err != nil || tr == nil {
+	if err != nil || tr == nil || tr.Status.Error != "" {
 		return http.StatusUnauthorized, false
 	}
 	if !tr.Status.Authenticated || tr.Status.User.Username == "" {
@@ -208,7 +232,7 @@ func (d *DelegatedAuth) review(ctx context.Context, token, subresource string) (
 			},
 		},
 	}, metav1.CreateOptions{})
-	if err != nil || sar == nil {
+	if err != nil || sar == nil || sar.Status.EvaluationError != "" {
 		return http.StatusForbidden, false
 	}
 	if !sar.Status.Allowed || sar.Status.Denied {
@@ -234,8 +258,9 @@ func (d *DelegatedAuth) lookup(key delegatedKey) (int, bool) {
 
 // store caches a definitive decision, allows for delegatedAllowTTL and denials
 // for delegatedDenyTTL. At the size bound it first drops expired entries, then,
-// if still full, an arbitrary one, so the map never grows past
-// delegatedCacheMax.
+// if still full, the OLDEST entry by insertion, so the map never grows past
+// delegatedCacheMax and a flood of fresh junk cannot evict a live allow ahead of
+// older junk.
 func (d *DelegatedAuth) store(key delegatedKey, status int) {
 	ttl := delegatedDenyTTL
 	if status == http.StatusOK {
@@ -250,12 +275,18 @@ func (d *DelegatedAuth) store(key delegatedKey, status int) {
 				delete(d.cache, k)
 			}
 		}
-		for k := range d.cache {
-			if len(d.cache) < delegatedCacheMax {
-				break
+		for len(d.cache) >= delegatedCacheMax {
+			var oldest delegatedKey
+			first := true
+			var oldestSeq uint64
+			for k, e := range d.cache {
+				if first || e.seq < oldestSeq {
+					oldest, oldestSeq, first = k, e.seq, false
+				}
 			}
-			delete(d.cache, k)
+			delete(d.cache, oldest)
 		}
 	}
-	d.cache[key] = delegatedEntry{status: status, expires: now.Add(ttl)}
+	d.seq++
+	d.cache[key] = delegatedEntry{status: status, expires: now.Add(ttl), seq: d.seq}
 }
