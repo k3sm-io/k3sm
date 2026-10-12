@@ -1,0 +1,28 @@
+Executable=/fixture/k3sm
+Identifier=io.k3sm.k3sm
+Format=Mach-O thin (arm64)
+CodeDirectory v=20500 size=611046 flags=0x10000(runtime) hashes=19085+7 location=embedded
+VersionPlatform=1
+VersionMin=1703936
+VersionSDK=1703936
+Hash type=sha256 size=32
+CandidateCDHash sha256=0f3c1e4b6a8d2f7091c3e5a7b9d1f3e5a7c9b1d3
+CandidateCDHashFull sha256=0f3c1e4b6a8d2f7091c3e5a7b9d1f3e5a7c9b1d3e5f7a9c1b3d5e7f9a1c3e5b7
+Hash choices=sha256
+CMSDigest=0f3c1e4b6a8d2f7091c3e5a7b9d1f3e5a7c9b1d3e5f7a9c1b3d5e7f9a1c3e5b7
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=40976384
+Executable Segment flags=0x1
+Page size=16384
+CDHash=0f3c1e4b6a8d2f7091c3e5a7b9d1f3e5a7c9b1d3
+Signature size=9056
+Authority=Developer ID Application: Example Corp (ABCDE12345)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=Oct 9, 2026 at 10:15:42 AM
+Info.plist=not bound
+TeamIdentifier=ABCDE12345
+Runtime Version=26.0.0
+Sealed Resources=none
+Internal requirements count=1 size=180
