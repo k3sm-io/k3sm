@@ -18,6 +18,7 @@
 #   hack/release/stage.sh <dir> --verify-only [--binary-name <name>]
 #   hack/release/stage.sh <dir> --verify-release <TEAMID> [--binary-name <name>]
 #   hack/release/stage.sh --from-captured <file> --verify-release <TEAMID>
+#   hack/release/stage.sh --rewrite-manifest <tree>
 #   hack/release/stage.sh --self-test
 #
 #   <out-dir>        directory to assemble into (created; must not be under dist/,
@@ -36,8 +37,16 @@
 #                    plus, for every Mach-O file(1) finds (each slice of a universal
 #                    binary), a Developer ID signature: the hardened-runtime flag,
 #                    a secure timestamp, TeamIdentifier equal to <TEAMID>, and a
-#                    "Developer ID Application" leaf authority. Ad-hoc fails. The
-#                    signing pipeline runs it after it signs.
+#                    "Developer ID Application" leaf authority, checked in the
+#                    display text and as a codesign designated requirement
+#                    anchored at Apple's roots. Ad-hoc fails. It ends by checking
+#                    PAYLOAD-SHA256 (see below) against the tree. The signing
+#                    pipeline runs it after it signs and rewrites the manifest.
+#   --rewrite-manifest <tree>
+#                    recompute PAYLOAD-SHA256 over <tree>, in the tree and beside
+#                    it, keeping its comment lines. Signing rewrites bytes, so the
+#                    signing pipeline runs this after Developer ID signing and
+#                    before --verify-release. Requires an existing manifest.
 #   --from-captured <file>
 #                    with --verify-release: apply the signature policy to captured
 #                    `codesign -dvvv` text instead of a tree (no codesign is run).
@@ -69,7 +78,8 @@
 #                     signing it is the authority for the payload's bytes; check it
 #                     with `shasum -a 256 -c PAYLOAD-SHA256` inside the tree. Also
 #                     written to <out-dir>.PAYLOAD-SHA256. A symlink anywhere in the
-#                     tree is a hard error.
+#                     tree is a hard error. --verify-release requires both copies,
+#                     byte-identical, listing exactly the tree's files.
 #
 # ARCHITECTURE PIN: everything here is darwin/arm64. That is not decoration — a
 # Mac whose Go toolchain runs under Rosetta defaults to GOARCH=amd64, so an
@@ -264,6 +274,37 @@ manifest_write() {
 	chmod 0644 "$tmp"
 	cp "$tmp" "$tree.$MANIFEST_NAME"
 	mv "$tmp" "$tree/$MANIFEST_NAME"
+}
+
+# manifest_rewrite <tree>: recompute the manifest over a tree whose bytes changed
+# (Developer ID signing), keeping the leading comment lines of the old one, which
+# describe the build rather than the host doing the rewrite.
+manifest_rewrite() {
+	local tree="$1" comments
+	[ -f "$tree/$MANIFEST_NAME" ] || { echo "stage: --rewrite-manifest: $tree/$MANIFEST_NAME is missing (stage the tree first)" >&2; return 1; }
+	comments="$(awk '/^# /{sub(/^# /, ""); print; next} {exit}' "$tree/$MANIFEST_NAME")"
+	manifest_write "$tree" "$comments"
+}
+
+# verify_manifest <tree>: both manifest copies exist and are byte-identical,
+# `shasum -a 256 -c` passes inside the tree, and the recorded list is exactly
+# the tree's current file set (shasum -c alone would miss an added file).
+verify_manifest() {
+	local tree="$1" m="$1/$MANIFEST_NAME" beside="$1.$MANIFEST_NAME" now bad=0
+	[ -f "$m" ] || { echo "    manifest: $m is missing"; return 1; }
+	[ -f "$beside" ] || { echo "    manifest: $beside is missing"; return 1; }
+	cmp -s "$m" "$beside" || { echo "    manifest: $m and $beside differ"; bad=1; }
+	if ! now="$( (cd "$tree" && shasum -a 256 -c "$MANIFEST_NAME") 2>&1)"; then
+		printf '%s\n' "$now" | grep -v ': OK$' | sed 's/^/    manifest: /'
+		bad=1
+	fi
+	if ! now="$(manifest_body "$tree")"; then
+		bad=1
+	elif [ "$now" != "$(grep -v '^#' "$m")" ]; then
+		echo "    manifest: the tree's file set or bytes differ from $MANIFEST_NAME (a file added, removed or changed since it was written)"
+		bad=1
+	fi
+	return "$bad"
 }
 
 # manifest_comments: the toolchain and the kine/etcd pins, read from the source
@@ -481,6 +522,29 @@ cat "%s" >&2
 	if ( manifest_write "$m2" "" ) 2>/dev/null; then bad "a symlink in the tree was accepted"; else ok "symlink refused"; fi
 	if ( manifest_write "$tmp/m-empty-$$" "" ) 2>/dev/null; then bad "a missing tree produced a manifest"; else ok "missing tree refused"; fi
 
+	echo "==> manifest rewrite and verification (the release gate's manifest check)"
+	local mt="$tmp/mt"
+	mkdir -p "$mt/cp-payload"
+	printf 'bin\n' >"$mt/k3sm"
+	printf 'cp\n' >"$mt/cp-payload/kine"
+	( manifest_write "$mt" "toolchain: test" ) || bad "manifest_write failed on the verify tree"
+	if out="$(verify_manifest "$mt")"; then ok "a fresh manifest verifies"; else bad "a fresh manifest failed: $out"; fi
+	printf 'signed\n' >>"$mt/k3sm"
+	if out="$(verify_manifest "$mt")"; then bad "a tampered file verified"; elif printf '%s\n' "$out" | grep -q "k3sm: FAILED"; then ok "a tampered file fails, named by shasum -c"; else bad "tamper failure not named: $out"; fi
+	if "$self" --rewrite-manifest "$mt" >/dev/null && out="$(verify_manifest "$mt")"; then ok "--rewrite-manifest after a byte change verifies"; else bad "rewrite then verify failed: $out"; fi
+	if [ "$(head -1 "$mt/$MANIFEST_NAME")" = "# toolchain: test" ]; then ok "the rewrite keeps the comment lines"; else bad "the rewrite dropped the comment lines"; fi
+	printf 'new\n' >"$mt/added"
+	if out="$(verify_manifest "$mt")"; then bad "an added file verified"; elif printf '%s\n' "$out" | grep -q "file set"; then ok "an added file fails"; else bad "added-file failure not named: $out"; fi
+	rm "$mt/added"
+	printf '# edited\n' >>"$mt.$MANIFEST_NAME"
+	if out="$(verify_manifest "$mt")"; then bad "differing manifest copies verified"; elif printf '%s\n' "$out" | grep -q "differ"; then ok "differing in-tree and beside copies fail"; else bad "copy mismatch not named: $out"; fi
+	rm "$mt.$MANIFEST_NAME"
+	if verify_manifest "$mt" >/dev/null; then bad "a missing beside copy verified"; else ok "a missing beside copy fails"; fi
+	"$self" --rewrite-manifest "$mt" >/dev/null
+	rm "$mt/$MANIFEST_NAME"
+	if verify_manifest "$mt" >/dev/null; then bad "a missing manifest verified"; else ok "a missing manifest fails"; fi
+	if "$self" --rewrite-manifest "$mt" >/dev/null 2>&1; then bad "--rewrite-manifest invented a manifest"; else ok "--rewrite-manifest refuses a tree without one"; fi
+
 	echo "==> upstream digests and the release refusal"
 	local rt="$tmp/rel"
 	mkdir -p "$rt/cp-payload"
@@ -514,6 +578,7 @@ VERIFY_ONLY=0
 VERIFY_RELEASE=""
 FROM_CAPTURED=""
 RELEASE=0
+REWRITE_MANIFEST=""
 SELF_TEST=0
 LDFLAGS=""
 OUT=""
@@ -527,8 +592,9 @@ while [ $# -gt 0 ]; do
 	--from-captured) FROM_CAPTURED="${2:?--from-captured needs a file}"; shift 2 ;;
 	--release) RELEASE=1; shift ;;
 	--self-test) SELF_TEST=1; shift ;;
+	--rewrite-manifest) REWRITE_MANIFEST="${2:?--rewrite-manifest needs a tree}"; shift 2 ;;
 	--ldflags) LDFLAGS="${2?--ldflags needs a value}"; shift 2 ;;
-	-h | --help) sed -n '2,82p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 0 ;;
 	-*) die "unknown flag: $1" ;;
 	*)
 		[ -z "$OUT" ] || die "only one output directory may be given (got '$OUT' and '$1')"
@@ -556,6 +622,16 @@ if [ -n "$FROM_CAPTURED" ]; then
 	fi
 	printf '%s\n' "$out" | sed 's/^/    /' >&2
 	die "$FROM_CAPTURED fails the release signature policy"
+fi
+
+if [ -n "$REWRITE_MANIFEST" ]; then
+	[ -z "$OUT" ] && [ -z "$VERIFY_RELEASE" ] && [ "$VERIFY_ONLY" = 0 ] && [ "$RELEASE" = 0 ] && [ "$STUB_PAYLOAD" = 0 ] && [ -z "$LDFLAGS" ] ||
+		die "--rewrite-manifest <tree> takes no other mode or output directory"
+	[ -d "$REWRITE_MANIFEST" ] || die "--rewrite-manifest: $REWRITE_MANIFEST is not a directory"
+	tree="$(cd "$REWRITE_MANIFEST" && pwd)"
+	manifest_rewrite "$tree" || die "could not rewrite the manifest of $tree"
+	echo "==> rewrote $tree/$MANIFEST_NAME and $tree.$MANIFEST_NAME"
+	exit 0
 fi
 
 [ -n "$OUT" ] || die "usage: stage.sh <out-dir> [--binary-name <name>] [--stub-payload] [--release]"
@@ -652,6 +728,8 @@ if [ -n "$VERIFY_RELEASE" ]; then
 	echo "==> verify the Developer ID signature on every Mach-O"
 	verify_release_signatures "$OUT" "$VERIFY_RELEASE" || die "a Mach-O under $OUT fails the release signature policy (above)"
 	verify_tree
+	echo "==> verify $MANIFEST_NAME against the tree"
+	verify_manifest "$OUT" || die "the payload manifest does not match $OUT (run --rewrite-manifest after signing)"
 	echo "==> release-verified $(find "$OUT" -type f | wc -l | tr -d ' ') files in $OUT"
 	exit 0
 fi
