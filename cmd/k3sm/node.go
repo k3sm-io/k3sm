@@ -1081,6 +1081,14 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		return fmt.Errorf("new node: %w", err)
 	}
 
+	// This node's svclb hoster. Started BEFORE the Virtual Kubelet run loop and
+	// the status loop: its synchronous reset of the node's bound report then
+	// lands ahead of this process's first Ready, so a report a previous process
+	// left on the Node never vouches for listeners this one has not opened.
+	// Stopped (listeners drained) on every return path.
+	stopLBHoster := startLBHoster(ctx, opts, cs, slog.Default())
+	defer stopLBHoster()
+
 	errc := make(chan error, 1)
 	// Every loop reports its return through nodeLoops, which is what closes the
 	// nodeExited signal declared above: the exit hook waits on it (bounded) so a

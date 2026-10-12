@@ -615,7 +615,7 @@ func runServer(args []string) (err error) {
 	}
 	// 4g/4h, then 5's label repair (prepareServerNode). The deferred crash check
 	// above names the component on the startNode path too.
-	if err = prepareServerNode(ctx, plan, cs, nodeOpts, logger); err != nil {
+	if err = prepareServerNode(ctx, plan, restCfg, cs, nodeOpts, logger); err != nil {
 		return err
 	}
 	return startNode(ctx, nodeOpts)

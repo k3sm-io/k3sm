@@ -373,14 +373,15 @@ Today at `main`, per port class:
   `30000-32767` and the kubelet API port `10250` are k3sm's own wildcard listeners; Go sets no
   `SO_REUSEPORT`, so a second wildcard listener on the same port simply fails. A `type: LoadBalancer`
   Service declaring one of those ports is **rejected at `kubectl apply`** with a message naming the
-  port, and the controller additionally refuses to bind it. Plain NodePort Services are unaffected,
+  port, and every node additionally refuses to bind it. Plain NodePort Services are unaffected,
   because the apiserver allocates their `nodePort` out of that very range. Ordinary duplicate
-  LoadBalancer ports are **not** arbitrated. Two Services on `8080` are first-come, and the loser
-  stays `<pending>`.
+  LoadBalancer ports are **not** arbitrated. Two Services on `8080` that land on the same node are
+  first-come there, and the loser is left out of its status on that node (a `HostNotBound` Warning
+  Event names the node). Node pools can keep them apart; see [Multi-node](multi-node.md#node-pools).
 
 - A LoadBalancer Service on 80 or 443 can race the ingress host. Those are legitimate LoadBalancer
-  ports, so they are **not** reserved. The ingress listeners are started *before* the
-  LoadBalancer controller, so the ingress host wins in practice, but that is start ordering, not a
+  ports, so they are **not** reserved. The ingress listeners are started *before* the server's
+  own LoadBalancer listeners, so the ingress host wins in practice, but that is start ordering, not a
   guarantee. If a Service claims 80/443 and wins, the ingress host burns its bounded bind retry
   (~155 s) and then logs `ingress bind retries exhausted`, leaving Ingress disabled until the daemon
   restarts.
@@ -415,9 +416,9 @@ The LB/Ingress datapath has two further consequences. The userspace splice **dis
 address** when it dials the backend, so a NetworkPolicy denying a pod does **not** filter traffic
 that arrives via that pod's LoadBalancer or Ingress. That client-address gap is a separate tracked
 item. Upstream behaves similarly for `externalTrafficPolicy: Cluster`, which SNATs the client, so
-only `Local` would preserve the address. And a failed listener bind is not visible to `kubectl`. The
-Service simply stays `<pending>` and the reason is only in the daemon log, because the provider has
-no `EventRecorder` yet; wiring one is planned.
+only `Local` would preserve the address, and k3sm does not narrow a `Local` Service to nodes with a
+local endpoint either. A failed listener bind shows in `kubectl describe service` as a `HostNotBound`
+Warning Event naming the node; the exact cause (the port holder) is in that node's daemon log.
 
 All of this assumes one operator's Mac with trusted namespaces, which is what k3sm supports. Any
 principal who can create a Service can claim a host port, and k3sm does not restrict which ports.

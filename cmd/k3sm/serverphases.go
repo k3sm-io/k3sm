@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 
 	"k3sm.io/k3sm/pkg/addons"
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -620,14 +621,13 @@ func startMLXOperator(ctx context.Context, plan serverPlan, restCfg *rest.Config
 	}
 }
 
-// startServerLBHosting is steps 4g/4h: ingress hosting + svclb, beside the
-// netserve datapath (step 4c) and like it skipped under --network none (they
-// splice/route to ClusterIP VIPs, which need the proxy's datapath).
+// startServerLBHosting is steps 4g/4h: ingress hosting + the svclb decider,
+// beside the netserve datapath (step 4c) and like it skipped under --network
+// none (they splice/route to ClusterIP VIPs, which need the proxy's datapath).
 //
-// Both bind the WILDCARD and both advertise the node's DERIVED
-// globally-unicast InternalIP — see lbHostingConfigs, which owns the
-// whole decision. opts.nodeIP is READ, never written back: it feeds the
-// apiserver's --advertise-address/--bind-address.
+// Both advertise the node's DERIVED globally-unicast InternalIP — see
+// lbHostingConfigs, which owns the whole decision. opts.nodeIP is READ, never
+// written back: it feeds the apiserver's --advertise-address/--bind-address.
 //
 // 4g: darwin-net's L7 ingress (RouteTable + SNI CertStore + class-filtered
 // Watcher + Server) runs IN THIS PROCESS (SERVER-PROCESS-ONLY — multi-node
@@ -637,17 +637,22 @@ func startMLXOperator(ctx context.Context, plan serverPlan, restCfg *rest.Config
 // --ingress-http-port/--ingress-https-port select the explicit high-port
 // integration mode (never a silent fallback).
 //
-// 4h: svclb (klipper-lite) binds *:port listeners for every LoadBalancer
-// Service and splices them to the Service's ClusterIP VIP, advertising
-// status.loadBalancer ONLY once a listener is actually bound.
+// 4h: the svclb decider (admin client) chooses which nodes host each
+// LoadBalancer Service (the svclb.k3sm.io node-pool labels), stamps that set on
+// the Service, and writes the whole status from the hosts that report every
+// port bound on their own Node. The listeners themselves are the hosters':
+// one per node process, started by startNode (this server's own node
+// included), under each node's own identity. On a mesh server each node's
+// address is its MeshPeer mesh address; without a mesh only this server's own
+// node exists to host.
 //
-// ORDER IS LOAD-BEARING: the ingress host is started BEFORE svclb, so the
-// ingress listeners take 80/443 first if a user LoadBalancer Service also
-// claims them (svclb additionally has an apiserver informer cache-sync to
-// complete before its first bind). The reserved-port set deliberately does
-// NOT include 80/443 — those are legitimate LoadBalancer ports — so the
-// residual race is a documented ceiling, not a guarded invariant.
-func startServerLBHosting(ctx context.Context, plan serverPlan, cs kubernetes.Interface, nodeOpts nodeOptions, logger *slog.Logger) {
+// ORDER IS LOAD-BEARING: the ingress host is started here, BEFORE startNode
+// starts this node's hoster, so the ingress listeners take 80/443 first if a
+// user LoadBalancer Service also claims them. The reserved-port set
+// deliberately does NOT include 80/443 — those are legitimate LoadBalancer
+// ports — so the residual race is a documented ceiling, not a guarded
+// invariant.
+func startServerLBHosting(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, nodeOpts nodeOptions, logger *slog.Logger) {
 	opts, mode := plan.opts, plan.mode
 	if !mode.DataPath() {
 		return
@@ -674,25 +679,49 @@ func startServerLBHosting(ctx context.Context, plan serverPlan, cs kubernetes.In
 	} else {
 		logger.Info("ingress hosting disabled (--ingress-http-port 0 --ingress-https-port 0)")
 	}
-	lb, err := svclb.New(lbCfg)
+	// The MeshPeer CRD exists only on a mesh server (ensureMeshPeerCRD); without
+	// one there are no peers to address.
+	// The addresses are served from a watch-backed cache, so a decider
+	// reconcile does not LIST MeshPeers.
+	var peersSynced cache.InformerSynced
+	if opts.meshIP != "" {
+		if lw, err := meshPeerListWatch(restCfg); err != nil {
+			logger.Error("svclb decider: no MeshPeer address source; only this server's own node can be advertised", "err", err)
+		} else {
+			inf, list := meshPeerCache(lw)
+			go inf.Run(ctx.Done())
+			lbCfg.PeerAddresses = lbPeerAddresses(list)
+			peersSynced = inf.HasSynced
+		}
+	}
+	d, err := svclb.NewDecider(lbCfg)
 	if err != nil {
-		logger.Error("svclb disabled", "err", err)
+		logger.Error("svclb decider disabled", "err", err)
 		return
 	}
 	go func() {
-		if err := lb.Run(ctx); err != nil && ctx.Err() == nil {
-			logger.Error("svclb loadbalancer controller", "err", err)
+		if peersSynced != nil {
+			syncCtx, cancel := context.WithTimeout(ctx, meshPeerCacheSyncTimeout)
+			if !cache.WaitForCacheSync(syncCtx.Done(), peersSynced) && ctx.Err() == nil {
+				logger.Warn("svclb decider: the MeshPeer cache did not sync in time; starting with only this server's own node addressable until it does",
+					"timeout", meshPeerCacheSyncTimeout.String())
+			}
+			cancel()
+		}
+		if err := d.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("svclb loadbalancer decider", "err", err)
 		}
 	}()
 }
 
 // prepareServerNode is steps 4g/4h and the first half of 5: ingress hosting +
-// svclb (startServerLBHosting), then the admin client clearing a stale role label
-// the node cannot (repairServerNodeLabels), right before runServer hands the node
-// options to startNode (the Virtual Kubelet node, reusing runNode's bring-up).
-func prepareServerNode(ctx context.Context, plan serverPlan, cs kubernetes.Interface, nodeOpts nodeOptions, logger *slog.Logger) error {
+// the svclb decider (startServerLBHosting), then the admin client clearing a
+// stale role label the node cannot (repairServerNodeLabels), right before
+// runServer hands the node options to startNode (the Virtual Kubelet node,
+// reusing runNode's bring-up, which starts this node's svclb hoster).
+func prepareServerNode(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, nodeOpts nodeOptions, logger *slog.Logger) error {
 	opts := plan.opts
-	startServerLBHosting(ctx, plan, cs, nodeOpts, logger)
+	startServerLBHosting(ctx, plan, restCfg, cs, nodeOpts, logger)
 	if err := repairServerNodeLabels(ctx, cs, opts.nodeName, logger); err != nil {
 		return err
 	}

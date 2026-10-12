@@ -18,13 +18,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
+	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 
+	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/darwin-net/pkg/podnet"
@@ -54,32 +62,31 @@ func statusOwnedPodCIDR() netip.Prefix {
 	return podnet.ClusterPodCIDR
 }
 
-// lbHostingConfigs assembles the svclb + ingress-host configurations for one
-// node. It is a PURE function of the node's already-resolved options: the whole
-// decision — the bind address, the advertise address, the binder selection, the
-// reserved-port set and the retraction scope — is made here rather than inline
-// inside runServer behind exec.Start, where no unit test can reach it.
+// lbHostingConfigs assembles the server-side LoadBalancer configurations: the
+// svclb decider and the ingress host. It is a PURE function of the node's
+// already-resolved options: the whole decision — the bind address, the
+// advertise address, the binder selection and the retraction scope — is made
+// here rather than inline inside runServer behind exec.Start, where no unit test
+// can reach it. The decider's PeerAddresses (the MeshPeer source) needs a REST
+// config and is wired by the caller; the per-node svclb half is lbHosterConfig.
 //
 // The two addresses are DIFFERENT and both are decided here:
 //
-//   - BindAddr is the IPv4 wildcard for both. The BINDER differs, and
-//     ingressBinder owns that choice. svclb keeps the in-process netbind.Direct.
-//     The ingress host's privileged 80/443 listeners go through the root netd
-//     helper when netdSocket names one (the k3s ServiceLB shape): netd already
-//     holds root-owned Service-VIP sockets on those ports, and on Darwin a
-//     wildcard bind by a DIFFERENT uid than an existing specific-address socket
-//     on the same port fails with EADDRINUSE, so an unprivileged 0.0.0.0:80 loses
-//     to netd's VIP:80 for the daemon's whole life. netd grants that wildcard
-//     only for a port the canonical kube-system/k3sm-ingress Service declares
-//     (pkg/netdsvc). The high-port integration mode, and a node with no netd
-//     (root/direct posture), keep netbind.Direct.
-//   - AdvertiseAddr is the node's derived globally-unicast InternalIP —
-//     advertisedNodeIP, the SAME function startNode uses, called on the SAME
-//     nodeOptions value runServer passes to startNode, so the address kubectl shows
-//     as EXTERNAL-IP cannot disagree with the address the Node object carries. When
-//     it does not parse (a derivation failure) the advertise address is left ZERO:
-//     the listeners still bind, and the controllers write no status at all rather
-//     than publishing loopback or the zero Addr's "invalid IP".
+//   - BindAddr is the IPv4 wildcard for the ingress host (and, in
+//     lbHosterConfig, for every svclb hoster). The BINDER differs, and
+//     ingressBinder owns that choice. The ingress host's privileged 80/443
+//     listeners go through the root netd helper when netdSocket names one (the
+//     k3s ServiceLB shape): netd already holds root-owned Service-VIP sockets on
+//     those ports, and on Darwin a wildcard bind by a DIFFERENT uid than an
+//     existing specific-address socket on the same port fails with EADDRINUSE,
+//     so an unprivileged 0.0.0.0:80 loses to netd's VIP:80 for the daemon's
+//     whole life. netd grants that wildcard only for a port the canonical
+//     kube-system/k3sm-ingress Service declares (pkg/netdsvc). The high-port
+//     integration mode, and a node with no netd (root/direct posture), keep
+//     netbind.Direct.
+//   - The advertise address is the node's derived globally-unicast InternalIP
+//     (nodeAdvertiseAddr): the ingress host's AdvertiseAddr and the decider's
+//     SelfAddr, the address the server's own node is published at.
 //
 // It NEVER writes back into the node options: opts is by value, and opts.nodeIP
 // feeds the apiserver's --advertise-address/--bind-address in runServer. One
@@ -92,42 +99,25 @@ func statusOwnedPodCIDR() netip.Prefix {
 //
 // netdSocket is the root netd helper's socket, or "" when this node has none
 // (netdSocketFor derives it from the resolved --network posture).
-func lbHostingConfigs(cs kubernetes.Interface, opts nodeOptions, netdSocket string, httpPort, httpsPort int, log *slog.Logger) (svclb.Config, ingresshost.Config, error) {
+func lbHostingConfigs(cs kubernetes.Interface, opts nodeOptions, netdSocket string, httpPort, httpsPort int, log *slog.Logger) (svclb.DeciderConfig, ingresshost.Config, error) {
 	if httpPort < 0 || httpPort > 65535 {
-		return svclb.Config{}, ingresshost.Config{}, fmt.Errorf("--ingress-http-port %d is out of range (0-65535)", httpPort)
+		return svclb.DeciderConfig{}, ingresshost.Config{}, fmt.Errorf("--ingress-http-port %d is out of range (0-65535)", httpPort)
 	}
 	if httpsPort < 0 || httpsPort > 65535 {
-		return svclb.Config{}, ingresshost.Config{}, fmt.Errorf("--ingress-https-port %d is out of range (0-65535)", httpsPort)
+		return svclb.DeciderConfig{}, ingresshost.Config{}, fmt.Errorf("--ingress-https-port %d is out of range (0-65535)", httpsPort)
 	}
-
-	// The advertise address is DERIVED, and it may fail: a bad/absent podCIDR
-	// yields the raw --node-ip, which may itself be the loopback default on a
-	// no-datapath node. A loopback EXTERNAL-IP is worse than none (nothing off
-	// this Mac can reach it), so it is not advertised either.
-	advertise := netip.Addr{}
-	if addr, err := netip.ParseAddr(advertisedNodeIP(opts)); err == nil && !addr.IsLoopback() {
-		advertise = addr.Unmap()
-	} else {
-		log.Warn("loadbalancer/ingress status will stay EMPTY: no advertisable node address could be derived (Services stay <pending>); listeners still bind",
-			"node-ip", opts.nodeIP, "pod-cidr", opts.podCIDR, "datapath", opts.netMode.DataPath())
-	}
-
-	podCIDR := statusOwnedPodCIDR()
-	lb := svclb.Config{
-		Client:        cs,
-		BindAddr:      wildcardBindAddr,
-		AdvertiseAddr: advertise,
-		PodCIDR:       podCIDR,
-		// The datapath-side half of the reserved-port guard (the admission VAP is
-		// the legible half). Same single source as the CEL and the apiserver argv.
-		ReservedPorts: ports.ReservedSet(),
-		Logger:        log,
+	advertise := nodeAdvertiseAddr(opts, log)
+	lb := svclb.DeciderConfig{
+		Client:   cs,
+		SelfNode: opts.nodeName,
+		SelfAddr: advertise,
+		Logger:   log,
 	}
 	ih := ingresshost.Config{
 		Client:        cs,
 		BindAddr:      wildcardBindAddr,
 		AdvertiseAddr: advertise,
-		PodCIDR:       podCIDR,
+		PodCIDR:       statusOwnedPodCIDR(),
 		HTTPPort:      uint16(httpPort),
 		HTTPSPort:     uint16(httpsPort),
 		NodeName:      opts.nodeName,
@@ -135,6 +125,149 @@ func lbHostingConfigs(cs kubernetes.Interface, opts nodeOptions, netdSocket stri
 		Logger:        log,
 	}
 	return lb, ih, nil
+}
+
+// nodeAdvertiseAddr is the address this node's LoadBalancer and Ingress entries
+// are published at: advertisedNodeIP, the SAME function startNode uses, called
+// on the SAME nodeOptions value runServer passes to startNode, so the address
+// kubectl shows as EXTERNAL-IP cannot disagree with the address the Node object
+// carries.
+//
+// The advertise address is DERIVED, and it may fail: a bad/absent podCIDR
+// yields the raw --node-ip, which may itself be the loopback default on a
+// no-datapath node. A loopback EXTERNAL-IP is worse than none (nothing off this
+// Mac can reach it), so the result is then the ZERO Addr: listeners still bind,
+// and nothing is published for this node.
+func nodeAdvertiseAddr(opts nodeOptions, log *slog.Logger) netip.Addr {
+	if addr, err := netip.ParseAddr(advertisedNodeIP(opts)); err == nil && !addr.IsLoopback() {
+		return addr.Unmap()
+	}
+	log.Warn("loadbalancer/ingress status will not list this node: no advertisable node address could be derived; listeners still bind",
+		"node-ip", opts.nodeIP, "pod-cidr", opts.podCIDR, "datapath", opts.netMode.DataPath())
+	return netip.Addr{}
+}
+
+// lbHosterConfig is the per-node svclb configuration: the hoster every node
+// process runs (each joined worker and the server's own node), on the node's
+// OWN client. Its listeners bind the IPv4 wildcard through the single
+// in-process binder (a nil Binder is netbind.Direct): netd grants a privileged
+// wildcard only to the canonical ingress Service, so a helper binder would fail
+// every tenant listener. ReservedPorts is the datapath-side half of the
+// reserved-port guard (the admission VAP is the legible half), from the same
+// single source as the CEL and the apiserver argv.
+func lbHosterConfig(cs kubernetes.Interface, opts nodeOptions, log *slog.Logger) svclb.HosterConfig {
+	return svclb.HosterConfig{
+		Client:        cs,
+		NodeName:      opts.nodeName,
+		BindAddr:      wildcardBindAddr,
+		ReservedPorts: ports.ReservedSet(),
+		Logger:        log,
+	}
+}
+
+// lbHosterResetTimeout bounds the hoster's synchronous start-of-life reset in
+// startNode. It runs before the node publishes status, so on a restart the
+// reset lands ahead of the node's Ready; a slower apiserver only defers it to
+// the hoster's own retry loop, which binds nothing until it lands.
+const lbHosterResetTimeout = 5 * time.Second
+
+// startLBHoster starts this node's svclb hoster: it lands the start-of-life
+// reset of the node's bound report (bounded, before the caller starts the node's
+// status loop), then runs the hoster until ctx ends. A node with no datapath
+// hosts nothing (the splice needs the node's Service proxy behind the ClusterIP
+// VIP). The returned stop cancels the hoster and waits for its listeners to
+// drain.
+func startLBHoster(ctx context.Context, opts nodeOptions, cs kubernetes.Interface, log *slog.Logger) (stop func()) {
+	if !opts.netMode.DataPath() {
+		log.Info("svclb hoster disabled on this node: no datapath (--network none)", "node", opts.nodeName)
+		return noStop
+	}
+	h, err := svclb.NewHoster(lbHosterConfig(cs, opts, log))
+	if err != nil {
+		log.Error("svclb hoster disabled", "node", opts.nodeName, "err", err)
+		return noStop
+	}
+	resetCtx, cancel := context.WithTimeout(ctx, lbHosterResetTimeout)
+	if err := h.Reset(resetCtx); err != nil && !apierrors.IsNotFound(err) {
+		log.Warn("svclb hoster: bound report reset did not land before the node started; the hoster retries it and binds nothing until it does", "node", opts.nodeName, "err", err)
+	}
+	cancel()
+	hctx, hcancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := h.Run(hctx); err != nil && hctx.Err() == nil {
+			log.Error("svclb hoster", "node", opts.nodeName, "err", err)
+		}
+	}()
+	return func() {
+		hcancel()
+		<-done
+	}
+}
+
+// lbPeerAddresses is the decider's MeshPeer address source: each node's mesh
+// address from its MeshPeer record, which only the server's guarded enroll path
+// writes (never the node itself). A record without a parsable, non-loopback
+// MeshIP contributes nothing, so that node is never advertised.
+func lbPeerAddresses(list func(context.Context) ([]netv1.MeshPeerSpec, error)) func(context.Context) (map[string]netip.Addr, error) {
+	return func(ctx context.Context) (map[string]netip.Addr, error) {
+		peers, err := list(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]netip.Addr, len(peers))
+		for _, p := range peers {
+			a, err := netip.ParseAddr(p.MeshIP)
+			if err != nil || a.IsLoopback() || a.IsUnspecified() || p.NodeName == "" {
+				continue
+			}
+			out[p.NodeName] = a.Unmap()
+		}
+		return out, nil
+	}
+}
+
+// errMeshPeerCacheNotSynced is what the cached MeshPeer lister returns before
+// its informer's first LIST lands; the decider keeps its last good address set.
+var errMeshPeerCacheNotSynced = errors.New("the MeshPeer cache has not synced yet")
+
+// meshPeerCacheSyncTimeout bounds how long the decider's start waits for the
+// MeshPeer cache. Past it the decider runs anyway and advertises only this
+// server's own node until the cache syncs.
+const meshPeerCacheSyncTimeout = 30 * time.Second
+
+// meshPeerCache is the decider's MeshPeer lister, served from a watch-backed
+// informer over lw: one LIST at start, then the watch keeps the store current,
+// so a decider reconcile reads memory instead of issuing a LIST against the
+// apiserver. The caller runs the informer. Before the first LIST lands the
+// lister returns errMeshPeerCacheNotSynced.
+func meshPeerCache(lw cache.ListerWatcher) (cache.SharedIndexInformer, func(context.Context) ([]netv1.MeshPeerSpec, error)) {
+	inf := cache.NewSharedIndexInformer(lw, &netv1.MeshPeer{}, 0, cache.Indexers{})
+	list := func(context.Context) ([]netv1.MeshPeerSpec, error) {
+		if !inf.HasSynced() {
+			return nil, errMeshPeerCacheNotSynced
+		}
+		items := inf.GetStore().List()
+		specs := make([]netv1.MeshPeerSpec, 0, len(items))
+		for _, item := range items {
+			if p, ok := item.(*netv1.MeshPeer); ok {
+				specs = append(specs, p.Spec)
+			}
+		}
+		return specs, nil
+	}
+	return inf, list
+}
+
+// meshPeerListWatch is the MeshPeer list-watch over cfg's identity (the
+// server's admin client), built the same way as the one-shot lister.
+func meshPeerListWatch(cfg *rest.Config) (cache.ListerWatcher, error) {
+	client, err := meshPeerRESTClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return cache.NewListWatchFromClient(client, meshPeerResource, metav1.NamespaceAll, fields.Everything()), nil
 }
 
 // netdSocketFor returns the netd helper socket the ingress host binds through,
