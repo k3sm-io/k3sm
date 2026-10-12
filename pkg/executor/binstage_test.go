@@ -37,7 +37,7 @@ const signedSuffix = "SIGNED"
 // paths it signed and verified, in order. The fake rewrites a file IN PLACE when it
 // signs (an append, keeping the inode), exactly as the real tool does, so a sign at
 // a live path is visible through any fd or mapping held on that file. It runs the
-// production signer (CodesignSigner → runtimed's image package → exec "codesign"),
+// production signer (binsign.Codesign → runtimed's image package → exec "codesign"),
 // so nothing between k3sm and the tool is faked, and no real codesign runs.
 func fakeCodesign(t *testing.T) func() (signed, verified []string) {
 	t.Helper()

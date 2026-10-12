@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"k3sm.io/k3sm/internal/binsign"
 )
 
 // stagedChild declares one control-plane child that is BUILT from source at a pinned
@@ -36,7 +38,7 @@ import (
 //     park leaves the previously staged binary and its marker untouched;
 //   - the stale marker dropped BEFORE the binary is touched;
 //   - the binary installed on a new inode: copied to a temp, ad-hoc signed there,
-//     then renamed over the target (InstallSigned), never written in place;
+//     then renamed over the target (binsign.Install), never written in place;
 //   - the marker written LAST, atomically, so "marker matches" implies "the binary
 //     beside it is finished".
 type stagedChild struct {
@@ -138,7 +140,7 @@ func (c stagedChild) ensureInto(ctx context.Context, bd string) error {
 	// target and only then renamed over it, so an interrupted copy cannot leave a
 	// truncated binary at the real path, the real path never names unsigned bytes,
 	// and a running child's mapping of the old binary is never rewritten.
-	if err := InstallSigned(ctx, CodesignSigner{}, built, c.binPath(bd), 0o755); err != nil {
+	if err := binsign.Install(ctx, binsign.Codesign{}, built, c.binPath(bd), 0o755); err != nil {
 		return fmt.Errorf("install %s binary: %w", c.name, err)
 	}
 	// LAST: the marker vouches for a staged, signed binary.

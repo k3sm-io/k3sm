@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"k3sm.io/k3sm/internal/binsign"
 	"k3sm.io/k3sm/pkg/helmchart"
 )
 
@@ -131,7 +132,7 @@ func stageHelm(ctx context.Context, bd string, force bool) error {
 	// Extracted to a temp beside dst, signed THERE, then renamed over dst: dst
 	// never names unsigned bytes, and a helm a Job is running is never rewritten.
 	return extractMember(tgz, helmchart.HelmTarballMember, func(r io.Reader) error {
-		if err := installSignedReader(ctx, CodesignSigner{}, r, dst, 0o755); err != nil {
+		if err := binsign.InstallReader(ctx, binsign.Codesign{}, r, dst, 0o755); err != nil {
 			return fmt.Errorf("install %s: %w", dst, err)
 		}
 		return nil

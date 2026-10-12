@@ -29,8 +29,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/k3sm/internal/binsign"
 	"k3sm.io/k3sm/pkg/defaults"
-	"k3sm.io/k3sm/pkg/executor"
 )
 
 // The two pod-support DYLD shims `k3sm dev` must stage. Both are resolved by
@@ -155,13 +155,13 @@ type PodShimBuilder interface {
 	// server flag unset rather than pointing every pod's dyld at a dylib that is
 	// not there.
 	Build(ctx context.Context, name, outDir string) error
-	// Sign ad-hoc signs the dylib at path (executor.CodesignSigner), mirroring
+	// Sign ad-hoc signs the dylib at path (binsign.Codesign), mirroring
 	// goExecShimBuilder.Sign. Best-effort — a signing failure must not fail
 	// provisioning. It is only ever given a path no pod can have mapped: a fresh
-	// build, or the temp copy executor.EnsureSigned renames over a cached shim.
+	// build, or the temp copy binsign.EnsureSigned renames over a cached shim.
 	Sign(ctx context.Context, path string) error
 	// Verify reports whether path's signature verifies, so a cached shim that is
-	// already signed is never rewritten (executor.EnsureSigned).
+	// already signed is never rewritten (binsign.EnsureSigned).
 	Verify(ctx context.Context, path string) (bool, error)
 }
 
@@ -192,16 +192,16 @@ func (clangPodShimBuilder) Build(ctx context.Context, name, outDir string) error
 	return nil
 }
 
-// Sign ad-hoc signs path through executor.CodesignSigner, best-effort (mirrors
+// Sign ad-hoc signs path through binsign.Codesign, best-effort (mirrors
 // goExecShimBuilder.Sign).
 func (clangPodShimBuilder) Sign(ctx context.Context, path string) error {
-	_ = executor.CodesignSigner{}.Sign(ctx, path)
+	_ = binsign.Codesign{}.Sign(ctx, path)
 	return nil
 }
 
-// Verify reports whether path's signature verifies (executor.CodesignSigner).
+// Verify reports whether path's signature verifies (binsign.Codesign).
 func (clangPodShimBuilder) Verify(ctx context.Context, path string) (bool, error) {
-	return executor.CodesignSigner{}.Verify(ctx, path)
+	return binsign.Codesign{}.Verify(ctx, path)
 }
 
 // moduleDir resolves a workspace module's source root via `go list -m`, so a
@@ -374,7 +374,7 @@ func (m *Manager) provisionPodShim(ctx context.Context, instance, name string) (
 		// renamed over it: every running pod has this dylib mapped, and an
 		// in-place rewrite would get every NEW pod killed at load (Code
 		// Signature Invalid). Best-effort, as the signature always was.
-		_, _ = executor.EnsureSigned(ctx, m.shimBuilder, shim)
+		_, _ = binsign.EnsureSigned(ctx, m.shimBuilder, shim)
 	}
 	staged, err := m.podReadable(shim)
 	if err != nil || staged == "" {

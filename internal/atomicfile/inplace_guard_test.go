@@ -35,8 +35,8 @@ import (
 //
 // k3sm must never rewrite a binary in place (see InstallReader): every executable
 // or dylib write goes through InstallFile / InstallReader, and every signature
-// through the executor's one signer, which only signs temps. This test scans the
-// non-test Go files under pkg/ and cmd/ and fails on a NEW occurrence of any of
+// through internal/binsign, which only signs temps. This test scans the non-test
+// Go files under pkg/, cmd/ and internal/ and fails on a NEW occurrence of any of
 // three shapes, each the AST of a call:
 //
 //   - codesign-force: a call whose literal arguments include "codesign" and "-f" or
@@ -74,7 +74,7 @@ func TestNoInPlaceBinaryWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	var findings []guardFinding
-	for _, top := range []string{"pkg", "cmd"} {
+	for _, top := range []string{"pkg", "cmd", "internal"} {
 		err := filepath.WalkDir(filepath.Join(root, top), func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -108,7 +108,7 @@ func TestNoInPlaceBinaryWrites(t *testing.T) {
 			used[f.key()] = true
 			continue
 		}
-		t.Errorf("%s: %s in %s: a binary must be written through atomicfile.InstallFile/InstallReader and signed only as a temp (executor.EnsureSigned / InstallSigned); if this is not a binary write, allow-list %q with a reason",
+		t.Errorf("%s: %s in %s: a binary must be written through atomicfile.InstallFile/InstallReader and signed only as a temp (binsign.EnsureSigned / binsign.Install); if this is not a binary write, allow-list %q with a reason",
 			f.pos, f.rule, f.fn, f.key())
 	}
 	var stale []string

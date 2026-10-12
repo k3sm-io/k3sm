@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package executor
+package binsign
 
 import (
 	"context"
@@ -29,19 +29,9 @@ import (
 	"k3sm.io/runtimed/pkg/image"
 )
 
-// Binary staging and signing. This file is k3sm's one code-signing entry point for
-// the binaries it stages (the control plane, kine, etcd, helm, and the dev pod and
-// exec shims through pkg/dev). Its rule: a binary that is, or may be, mapped by a
-// running process is never written in place. macOS caches a Mach-O's signature per
-// vnode, so `codesign -f` on a live file (or any in-place rewrite) leaves the kernel
-// holding the old signature, and every process that maps the file afterwards is
-// killed with Code Signature Invalid. So signing happens on a temp copy that is then
-// renamed over the target (atomicfile.InstallReader), and a binary whose signature
-// already verifies is not touched at all.
-
-// BinarySigner is the code-signing seam: verify a file's signature, or ad-hoc sign
-// it. CodesignSigner is the production implementation; tests fake it.
-type BinarySigner interface {
+// Signer is the code-signing seam: verify a file's signature, or ad-hoc sign it.
+// Codesign is the production implementation; tests fake it.
+type Signer interface {
 	// Verify reports whether path carries a valid code signature.
 	Verify(ctx context.Context, path string) (bool, error)
 	// Sign ad-hoc signs the file at path. It is only ever given a temp path that
@@ -49,19 +39,19 @@ type BinarySigner interface {
 	Sign(ctx context.Context, path string) error
 }
 
-// CodesignSigner is the production BinarySigner over runtimed's image package (the
+// Codesign is the production Signer over runtimed's image package (the
 // same codesign invocations runtimed uses for pulled images): Verify is
 // `codesign --verify --strict`, Sign is image.AdHocSign (`codesign -s - -f`, no
 // hardened runtime, no library validation). The zero value is usable.
-type CodesignSigner struct{}
+type Codesign struct{}
 
 // Verify reports whether path's signature verifies.
-func (CodesignSigner) Verify(ctx context.Context, path string) (bool, error) {
+func (Codesign) Verify(ctx context.Context, path string) (bool, error) {
 	return image.CodesignTool{}.Signed(ctx, path)
 }
 
 // Sign ad-hoc signs path.
-func (CodesignSigner) Sign(ctx context.Context, path string) error {
+func (Codesign) Sign(ctx context.Context, path string) error {
 	return image.AdHocSign(ctx, path)
 }
 
@@ -73,7 +63,7 @@ func (CodesignSigner) Sign(ctx context.Context, path string) error {
 //
 // path must be a regular file; a symlink is refused rather than followed, so the
 // copy's source is the very file that was checked.
-func EnsureSigned(ctx context.Context, s BinarySigner, path string) (bool, error) {
+func EnsureSigned(ctx context.Context, s Signer, path string) (bool, error) {
 	if ok, err := s.Verify(ctx, path); err == nil && ok {
 		return false, nil
 	}
@@ -87,7 +77,7 @@ func EnsureSigned(ctx context.Context, s BinarySigner, path string) (bool, error
 // copy to a temp beside it, sign the temp, rename it over path. It is for bytes that
 // must be signed whatever they carry now (a fresh download whose signature is to be
 // replaced); a live binary is re-signed through EnsureSigned instead.
-func ResignByReplace(ctx context.Context, s BinarySigner, path string) error {
+func ResignByReplace(ctx context.Context, s Signer, path string) error {
 	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("open %s for re-signing: %w", path, err)
@@ -108,33 +98,33 @@ func ResignByReplace(ctx context.Context, s BinarySigner, path string) error {
 	})
 }
 
-// InstallSigned installs a copy of src at dst with mode on a new inode, ad-hoc
+// Install installs a copy of src at dst with mode on a new inode, ad-hoc
 // signing the temp before it is renamed into place, so dst never names unsigned
 // bytes. Signing is best-effort, as it has always been for staged binaries: a host
 // without codesign still installs the bytes, and a binary that truly cannot run
 // fails loudly at exec.
-func InstallSigned(ctx context.Context, s BinarySigner, src, dst string, mode os.FileMode) error {
+func Install(ctx context.Context, s Signer, src, dst string, mode os.FileMode) error {
 	return atomicfile.InstallFile(src, dst, mode, signTemp(ctx, s))
 }
 
-// installSignedReader is InstallSigned over a stream.
-func installSignedReader(ctx context.Context, s BinarySigner, r io.Reader, dst string, mode os.FileMode) error {
+// InstallReader is Install over a stream.
+func InstallReader(ctx context.Context, s Signer, r io.Reader, dst string, mode os.FileMode) error {
 	return atomicfile.InstallReader(r, dst, mode, signTemp(ctx, s))
 }
 
 // signTemp is the atomicfile prepare hook that ad-hoc signs the temp. Best-effort:
-// a signing failure still installs the bytes (see InstallSigned).
-func signTemp(ctx context.Context, s BinarySigner) func(string) error {
+// a signing failure still installs the bytes (see Install).
+func signTemp(ctx context.Context, s Signer) func(string) error {
 	return func(tmp string) error {
 		_ = s.Sign(ctx, tmp)
 		return nil
 	}
 }
 
-// signTempIfInvalid is the prepare hook for bytes that normally arrive signed (a
+// SignIfInvalid returns the atomicfile prepare hook for bytes that normally arrive signed (a
 // payload copy): the temp is signed only when its signature does not verify.
 // Best-effort, like signTemp.
-func signTempIfInvalid(ctx context.Context, s BinarySigner) func(string) error {
+func SignIfInvalid(ctx context.Context, s Signer) func(string) error {
 	return func(tmp string) error {
 		if ok, err := s.Verify(ctx, tmp); err == nil && ok {
 			return nil

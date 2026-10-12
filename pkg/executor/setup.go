@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/internal/atomicfile"
+	"k3sm.io/k3sm/internal/binsign"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/helmchart"
 )
@@ -960,7 +961,7 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		// On a NEW inode, never over the old one: a versioned re-seed replaces a
 		// binary a running child may still have mapped. The copy is signed (only
 		// if its signature does not already verify) before it takes the name.
-		if err := atomicfile.InstallFile(src, dst, 0o755, signTempIfInvalid(ctx, CodesignSigner{})); err != nil {
+		if err := atomicfile.InstallFile(src, dst, 0o755, binsign.SignIfInvalid(ctx, binsign.Codesign{})); err != nil {
 			return fmt.Errorf("seed %s from payload: %w", dst, err)
 		}
 	}
@@ -1028,9 +1029,9 @@ func chmodExec(dir string) error {
 
 // signBinaries makes sure each named binary in dir carries a valid signature so an
 // arm64 Mach-O can exec on macOS. It runs on live work-dir binaries at every boot,
-// so it goes through EnsureSigned: a binary whose signature verifies is left alone,
+// so it goes through binsign.EnsureSigned: a binary whose signature verifies is left alone,
 // and one that needs signing is signed as a temp copy renamed over it, never with
-// `codesign -f` on the live path (see binstage.go). Signing failures are tolerated
+// `codesign -f` on the live path (see package binsign). Signing failures are tolerated
 // (best-effort: a non-macOS CI host should not block bring-up, and a failure leaves
 // the file as it was); the binary fails loudly at exec if it truly cannot run.
 func signBinaries(ctx context.Context, dir string, names []string) error {
@@ -1039,7 +1040,7 @@ func signBinaries(ctx context.Context, dir string, names []string) error {
 		if _, err := os.Lstat(p); err != nil {
 			continue
 		}
-		_, _ = EnsureSigned(ctx, CodesignSigner{}, p)
+		_, _ = binsign.EnsureSigned(ctx, binsign.Codesign{}, p)
 	}
 	return nil
 }
@@ -1053,7 +1054,7 @@ func resignFresh(ctx context.Context, dir string, names []string) {
 		if _, err := os.Lstat(p); err != nil {
 			continue
 		}
-		_ = ResignByReplace(ctx, CodesignSigner{}, p)
+		_ = binsign.ResignByReplace(ctx, binsign.Codesign{}, p)
 	}
 }
 
