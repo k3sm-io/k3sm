@@ -413,11 +413,25 @@ func shardedServices(m *mlxv1alpha1.MLXModel, p prepared) (headless, clusterIP *
 // it: a link going down must not by itself restart a gang that is still
 // serving (the ring backend keeps serving over the mesh), and a gang restart
 // that IS needed re-places anyway.
+//
+// spec.distributed.interconnect is NORMALISED, not excluded: "auto" hashes as
+// the empty value. The CRD defaults the field to auto, so every model stored
+// before the field existed reads back with interconnect: auto, and hashing that
+// literally would restart every sharded gang on the upgrade. Empty and auto
+// mean the same thing, so they hash the same, exactly as the field's absence
+// hashed before. An explicit thunderbolt or network still moves the hash: like
+// any other spec edit, a changed path request re-renders the gang.
 func SpecHash(m *mlxv1alpha1.MLXModel, opts Options) (string, error) {
+	spec := m.Spec
+	if d := spec.Distributed; d != nil && d.Interconnect == mlxv1alpha1.MLXInterconnectAuto {
+		norm := *d
+		norm.Interconnect = ""
+		spec.Distributed = &norm
+	}
 	raw, err := json.Marshal(struct {
 		Spec    mlxv1alpha1.MLXModelSpec `json:"spec"`
 		Options Options                  `json:"options"`
-	}{m.Spec, opts})
+	}{spec, opts})
 	if err != nil {
 		return "", fmt.Errorf("hash spec: %w", err)
 	}
