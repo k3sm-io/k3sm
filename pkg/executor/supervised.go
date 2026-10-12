@@ -35,7 +35,6 @@ import (
 
 	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/certs"
-	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/ports"
 )
 
@@ -504,7 +503,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// helm controller's Jobs can exec it. Best-effort and never fatal: an absent
 	// helm is skipped here, and the helm controller owns that diagnosis (and the
 	// dev-shell download) off the bring-up path.
-	if err := provisionStep("sign-helm", signBinaries(ctx, binDir(s.cfg.WorkDir), helmchart.HelmBinaryName, []string{helmchart.HelmBinaryName})); err != nil {
+	if err := provisionStep("sign-helm", signHelm(ctx, binDir(s.cfg.WorkDir))); err != nil {
 		return err
 	}
 	// The datastore child: kine in the kine posture, the pinned etcd in the etcd

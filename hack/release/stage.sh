@@ -14,11 +14,12 @@
 # and staging fails if anything it names is missing at the end.
 #
 #   hack/release/stage.sh <out-dir> [--binary-name <name>] [--stub-payload]
-#                         [--ldflags <flags>] [--release]
+#                         [--ldflags <flags>] [--release --cp-build <dir>]
 #   hack/release/stage.sh <dir> --verify-only [--binary-name <name>]
 #   hack/release/stage.sh <dir> --verify-release <TEAMID> [--binary-name <name>]
 #   hack/release/stage.sh --from-captured <file> --verify-release <TEAMID>
 #   hack/release/stage.sh --rewrite-manifest <tree>
+#   hack/release/stage.sh --print-pinned-source-files
 #   hack/release/stage.sh --self-test
 #
 #   <out-dir>        directory to assemble into (created; must not be under dist/,
@@ -51,10 +52,20 @@
 #                    with --verify-release: apply the signature policy to captured
 #                    `codesign -dvvv` text instead of a tree (no codesign is run).
 #   --release        release staging: refuse to sign any cp-payload file that was
-#                    not built from pinned upstream source. The pinned-source
-#                    control-plane build (hack/release/build-cp.sh) does not exist
-#                    yet, so today --release always refuses. Without it (the
-#                    default) the ad-hoc lab staging below is unchanged.
+#                    not built from pinned upstream source. Requires --cp-build.
+#                    The control-plane binaries are taken from --cp-build instead
+#                    of the prebuilt download, and every cp-payload file must be
+#                    one of PINNED_SOURCE_FILES, byte-identical to its --cp-build
+#                    copy. kine, etcd, etcdutl, helm and the version markers are
+#                    not on that list yet, so today --release still refuses,
+#                    naming them. Without it (the default) the ad-hoc lab staging
+#                    below is unchanged.
+#   --cp-build <dir> with --release: the output directory of
+#                    hack/release/build-cp.sh <dir>; it must hold exactly the
+#                    files build-cp.sh produces.
+#   --print-pinned-source-files
+#                    print PINNED_SOURCE_FILES, one per line (build-cp.sh's
+#                    self-test compares it with its own output list)
 #   --binary-name    name for the k3sm binary in <out-dir> (default: k3sm)
 #   --stub-payload   write placeholder payload files instead of downloading the
 #                    real ~250 MB control-plane set; for shape/layout checks only,
@@ -365,9 +376,50 @@ upstream_digests_write() {
 
 # ---- the release refusal --------------------------------------------------------
 # Newline-separated cp-payload/<name> entries produced by the pinned-source
-# control-plane build. Nothing produces them yet: hack/release/build-cp.sh does
-# not exist, so the list is empty and --release refuses every payload file.
-PINNED_SOURCE_FILES=""
+# control-plane build, hack/release/build-cp.sh: exactly its outputs, in its
+# order. Written out rather than derived, so the two self-tests comparing this
+# list with `build-cp.sh --print-outputs` catch either side drifting.
+PINNED_SOURCE_FILES="cp-payload/kube-apiserver
+cp-payload/kube-scheduler
+cp-payload/kube-controller-manager
+cp-payload/kubectl"
+
+# cp_build_problems <dir>: non-zero, naming each problem, unless <dir> holds
+# exactly the regular files PINNED_SOURCE_FILES names (by base name), no more.
+cp_build_problems() {
+	local dir="$1" rel name bad=0 f
+	[ -d "$dir" ] || { echo "    --cp-build $dir is not a directory"; return 1; }
+	while IFS= read -r rel; do
+		name="${rel#cp-payload/}"
+		[ -f "$dir/$name" ] && [ ! -L "$dir/$name" ] || { echo "    --cp-build lacks $name"; bad=1; }
+	done <<<"$PINNED_SOURCE_FILES"
+	for f in "$dir"/* "$dir"/.[!.]*; do
+		[ -e "$f" ] || [ -L "$f" ] || continue
+		printf '%s\n' "$PINNED_SOURCE_FILES" | grep -qxF -- "cp-payload/$(basename "$f")" || { echo "    --cp-build holds an unexpected $(basename "$f")"; bad=1; }
+	done
+	return "$bad"
+}
+
+# place_cp_build <cp-build> <payload-dir>: put each pinned-source file into the
+# payload dir as a new file (copy to a temp, then rename), replacing what the
+# payload step staged under that name.
+place_cp_build() {
+	local src="$1" dst="$2" rel name
+	while IFS= read -r rel; do
+		name="${rel#cp-payload/}"
+		cp "$src/$name" "$dst/.$name.cp-build" && chmod 0755 "$dst/.$name.cp-build" && mv -f "$dst/.$name.cp-build" "$dst/$name" || return 1
+	done <<<"$PINNED_SOURCE_FILES"
+}
+
+# pinned_content_problems <tree> <cp-build>: non-zero, naming each, unless every
+# pinned-source file in the tree is byte-identical to its --cp-build copy.
+pinned_content_problems() {
+	local tree="$1" src="$2" rel bad=0
+	while IFS= read -r rel; do
+		cmp -s "$tree/$rel" "$src/${rel#cp-payload/}" || { echo "    NOT THE PINNED-SOURCE BUILD: $rel"; bad=1; }
+	done <<<"$PINNED_SOURCE_FILES"
+	return "$bad"
+}
 
 # refuse_unpinned_payload <tree> <pinned-list>: non-zero, naming each file, if
 # any cp-payload file is absent from the pinned-source list.
@@ -607,11 +659,37 @@ cat "%s" >&2
 	if [ "$out" = "cp-payload/kine cp-payload/kube-apiserver " ]; then ok "upstream digests cover exactly cp-payload"; else bad "upstream digest paths: '$out'"; fi
 	if out="$(refuse_unpinned_payload "$rt" "$PINNED_SOURCE_FILES")"; then
 		bad "release refusal let an unpinned payload through"
-	elif printf '%s\n' "$out" | grep -q "cp-payload/kube-apiserver"; then ok "unpinned payload file named and refused"; else bad "refusal did not name the file: $out"; fi
+	elif printf '%s\n' "$out" | grep -q "cp-payload/kine" && ! printf '%s\n' "$out" | grep -q "cp-payload/kube-apiserver"; then
+		ok "the unpinned kine is refused, the pinned-source kube-apiserver is not"
+	else
+		bad "refusal did not name exactly the unpinned file: $out"
+	fi
 	if refuse_unpinned_payload "$rt" "$(printf 'cp-payload/kine\ncp-payload/kube-apiserver')" >/dev/null; then ok "a fully pinned-source payload passes"; else bad "a pinned-source payload was refused"; fi
+
+	echo "==> the pinned-source list is build-cp.sh's output list"
+	if [ "$PINNED_SOURCE_FILES" = "$("$HERE/build-cp.sh" --print-outputs)" ]; then ok "PINNED_SOURCE_FILES = build-cp.sh --print-outputs"; else bad "PINNED_SOURCE_FILES differs from build-cp.sh --print-outputs"; fi
 	if out="$("$self" "$tmp/release-out" --release 2>&1)"; then
-		bad "--release staging did not refuse"
-	elif printf '%s\n' "$out" | grep -q "build-cp.sh"; then ok "--release refuses, naming the missing pinned-source build"; else bad "--release refused without naming build-cp.sh: $out"; fi
+		bad "--release staging without --cp-build did not refuse"
+	elif printf '%s\n' "$out" | grep -q "build-cp.sh"; then ok "--release without --cp-build refuses, naming build-cp.sh"; else bad "--release refused without naming build-cp.sh: $out"; fi
+	local cb="$tmp/cp-build" rel
+	mkdir -p "$cb"
+	while IFS= read -r rel; do printf 'built-%s\n' "${rel#cp-payload/}" >"$cb/${rel#cp-payload/}"; done <<<"$PINNED_SOURCE_FILES"
+	if cp_build_problems "$cb" >/dev/null; then ok "a complete --cp-build passes"; else bad "a complete --cp-build was refused"; fi
+	printf 'x\n' >"$cb/extra"
+	if out="$(cp_build_problems "$cb")"; then bad "an extra file in --cp-build passed"; elif printf '%s\n' "$out" | grep -q "unexpected extra"; then ok "an extra --cp-build file is refused"; else bad "extra file not named: $out"; fi
+	rm "$cb/extra" "$cb/kubectl"
+	if out="$(cp_build_problems "$cb")"; then bad "a --cp-build missing kubectl passed"; elif printf '%s\n' "$out" | grep -q "lacks kubectl"; then ok "a missing --cp-build file is refused"; else bad "missing file not named: $out"; fi
+	if out="$("$self" "$tmp/release-out2" --release --cp-build "$cb" 2>&1)"; then
+		bad "--release with an incomplete --cp-build did not refuse"
+	elif printf '%s\n' "$out" | grep -q "lacks kubectl"; then ok "--release refuses an incomplete --cp-build before building"; else bad "--release did not name the incomplete --cp-build: $out"; fi
+	printf 'built-kubectl\n' >"$cb/kubectl"
+	local pt="$tmp/placed"
+	mkdir -p "$pt/cp-payload"
+	while IFS= read -r rel; do printf 'downloaded\n' >"$pt/$rel"; done <<<"$PINNED_SOURCE_FILES"
+	if pinned_content_problems "$pt" "$cb" >/dev/null; then bad "downloaded bytes passed as the pinned-source build"; else ok "bytes other than the pinned-source build are refused"; fi
+	place_cp_build "$cb" "$pt/cp-payload" || bad "place_cp_build failed"
+	if pinned_content_problems "$pt" "$cb" >/dev/null; then ok "the placed pinned-source build passes the content check"; else bad "the placed build failed the content check"; fi
+	if refuse_unpinned_payload "$pt" "$PINNED_SOURCE_FILES" >/dev/null; then ok "a payload of exactly build-cp's outputs passes the release refusal"; else bad "build-cp's outputs were refused"; fi
 
 	unset -f ok bad expect_fail
 	echo
@@ -629,6 +707,8 @@ VERIFY_ONLY=0
 VERIFY_RELEASE=""
 FROM_CAPTURED=""
 RELEASE=0
+CP_BUILD=""
+PRINT_PINNED=0
 REWRITE_MANIFEST=""
 SELF_TEST=0
 LDFLAGS=""
@@ -642,6 +722,8 @@ while [ $# -gt 0 ]; do
 	--verify-release) VERIFY_RELEASE="${2:?--verify-release needs a TEAMID}"; shift 2 ;;
 	--from-captured) FROM_CAPTURED="${2:?--from-captured needs a file}"; shift 2 ;;
 	--release) RELEASE=1; shift ;;
+	--cp-build) CP_BUILD="${2:?--cp-build needs a directory}"; shift 2 ;;
+	--print-pinned-source-files) PRINT_PINNED=1; shift ;;
 	--self-test) SELF_TEST=1; shift ;;
 	--rewrite-manifest) REWRITE_MANIFEST="${2:?--rewrite-manifest needs a tree}"; shift 2 ;;
 	--ldflags) LDFLAGS="${2?--ldflags needs a value}"; shift 2 ;;
@@ -657,6 +739,12 @@ if [ "$SELF_TEST" = 1 ]; then
 	self_test
 	exit $?
 fi
+
+if [ "$PRINT_PINNED" = 1 ]; then
+	printf '%s\n' "$PINNED_SOURCE_FILES"
+	exit 0
+fi
+[ -z "$CP_BUILD" ] || [ "$RELEASE" = 1 ] || die "--cp-build is only meaningful with --release"
 
 if [ -n "$VERIFY_RELEASE" ]; then
 	valid_team "$VERIFY_RELEASE" || die "--verify-release: '$VERIFY_RELEASE' is not a 10-character Team ID"
@@ -701,8 +789,14 @@ else
 		# third-party build: the control-plane binaries must come from k3sm's own
 		# pinned-source build, which does not exist yet.
 		[ "$STUB_PAYLOAD" = 0 ] || die "--release cannot stage stub payload files"
-		[ -x "$HERE/build-cp.sh" ] ||
-			die "--release: refusing to sign the control-plane payload — it is not built from pinned source, and the pinned-source build hack/release/build-cp.sh does not exist yet"
+		[ -x "$HERE/build-cp.sh" ] || die "--release: hack/release/build-cp.sh is missing or not executable"
+		[ -n "$CP_BUILD" ] ||
+			die "--release needs --cp-build <dir>, the output of hack/release/build-cp.sh <dir>: the control-plane payload is signed only when built from pinned source"
+		if ! cp_problems="$(cp_build_problems "$CP_BUILD")"; then
+			printf '%s\n' "$cp_problems" >&2
+			die "--release: --cp-build $CP_BUILD is not exactly the output of hack/release/build-cp.sh"
+		fi
+		CP_BUILD="$(cd "$CP_BUILD" && pwd)"
 	fi
 	mkdir -p "$OUT"
 fi
@@ -837,6 +931,11 @@ else
 	echo "==> stage cp-payload (pinned download + digest verify)"
 	"$BIN" payload "$PAYLOAD_DIR"
 	upstream_note="as produced by '$BINARY_NAME payload': downloads checked against their pinned sha256, kine built from its pinned module"
+	if [ "$RELEASE" = 1 ]; then
+		echo "==> replace the control-plane binaries with the pinned-source build ($CP_BUILD)"
+		place_cp_build "$CP_BUILD" "$PAYLOAD_DIR" || die "could not place the pinned-source build into $PAYLOAD_DIR"
+		upstream_note="$upstream_note; the control-plane binaries replaced by hack/release/build-cp.sh output"
+	fi
 fi
 
 # The pre-sign digests, recorded before ANY signing: the pinned digests describe
@@ -847,6 +946,8 @@ upstream_digests_write "$OUT" "$upstream_note" || die "could not write $OUT/$UPS
 # Release staging signs only k3sm's own pinned-source builds (checked again here,
 # per file, right before the first signature).
 if [ "$RELEASE" = 1 ]; then
+	pinned_content_problems "$OUT" "$CP_BUILD" ||
+		die "--release: the staged control-plane binaries are not the pinned-source build in $CP_BUILD"
 	refuse_unpinned_payload "$OUT" "$PINNED_SOURCE_FILES" ||
 		die "--release: refusing to sign cp-payload files not built from pinned source (hack/release/build-cp.sh)"
 fi

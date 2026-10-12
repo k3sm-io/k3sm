@@ -254,6 +254,23 @@ func ensureControlPlaneBinaries(ctx context.Context, logger *slog.Logger, workDi
 // found. A stale set is still a self-consistent control plane, and serving on it
 // beats refusing to serve; see reportStagedControlPlane for the three outcomes.
 func ensureControlPlaneBinariesVerified(ctx context.Context, logger *slog.Logger, bd, kubeVersion string, requirePin bool) error {
+	// The release path (a Developer ID-signed k3sm, see signingPolicy) runs the set
+	// the signed payload staged and nothing else: it is verified in place and used
+	// byte-identical, and a missing or failing binary refuses the boot. It never
+	// downloads, so the digest-pinned fallback below is dev-only.
+	if !requirePin {
+		p, err := resolveSigningPolicy(ctx, logger)
+		if err != nil {
+			return err
+		}
+		if p.release {
+			if err := verifyPayloadBinaries(ctx, p, bd, healStamp(kubeMarkerPath(bd)), cpBinaries); err != nil {
+				return err
+			}
+			reportStagedControlPlane(ctx, logger, bd, kubeVersion)
+			return nil
+		}
+	}
 	if _, err := os.Stat(filepath.Join(bd, "kube-apiserver")); err == nil {
 		if requirePin {
 			// Already-present bytes are already signed, and signing rewrites the
@@ -901,6 +918,10 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create bin dir %s: %w", bd, err)
 	}
+	policy, err := resolveSigningPolicy(ctx, logger)
+	if err != nil {
+		return err
+	}
 	// A staged kine whose marker does not vouch for the target is re-seeded from the
 	// payload — but ONLY when the payload's OWN marker vouches for the target. Trusting
 	// an unmarked payload instead would mean stamping "this is the new pin" onto bytes
@@ -959,9 +980,15 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 			return fmt.Errorf("read payload %s: %w", src, err)
 		}
 		// On a NEW inode, never over the old one: a versioned re-seed replaces a
-		// binary a running child may still have mapped. The copy is signed (only
-		// if its signature does not already verify) before it takes the name.
-		if err := atomicfile.InstallFile(src, dst, 0o755, binsign.SignIfInvalid(ctx, binsign.Codesign{}, name)); err != nil {
+		// binary a running child may still have mapped. On the dev path the copy is
+		// signed (only if its signature does not already verify) before it takes
+		// the name; on the release path a control-plane copy is verified against
+		// the release requirement instead, and never signed.
+		prepare := binsign.SignIfInvalid(ctx, bootCodeSigner, name)
+		if policy.release && isCPBinary(name) {
+			prepare = verifyTempHook(ctx, policy, name)
+		}
+		if err := atomicfile.InstallFile(src, dst, 0o755, prepare); err != nil {
 			return fmt.Errorf("seed %s from payload: %w", dst, err)
 		}
 	}
@@ -1027,27 +1054,33 @@ func chmodExec(dir string) error {
 	return nil
 }
 
-// signBinaries makes sure each named binary in dir carries a valid ad-hoc
-// signature so an arm64 Mach-O can exec on macOS. It runs on live work-dir binaries
-// at every boot, so it never writes one in place (see package binsign):
+// signBinaries is the dev signing: it makes sure each named binary in dir carries a
+// valid signature so an arm64 Mach-O can exec on macOS. It runs on live work-dir
+// binaries at every boot, so it never writes one in place (see package binsign):
 //
 //   - binsign.HealOnce first replaces each binary once per stamp (the content of
 //     the set's version marker, or the versioned name), clearing a vnode an older
 //     k3sm may have left poisoned by its in-place `codesign -f`;
-//   - then binsign.EnsureSigned leaves a validly ad-hoc-signed binary alone and
+//   - then binsign.EnsureSigned leaves a validly signed binary alone and ad-hoc
 //     signs any other as a temp copy renamed over it.
+//
+// Both verify first: a binary whose signature verifies and is not ad hoc (a
+// Developer ID) is never healed or re-signed, on either signing path. The
+// control-plane set takes this path only on the dev path (see signingPolicy); the
+// staged children kine, etcd and helm take it on both paths, because they are
+// built or fetched at boot and are not yet part of the signed payload.
 //
 // Signing failures are tolerated (best-effort: a non-macOS CI host should not block
 // bring-up, and a failure leaves the file as it was); the binary fails loudly at
 // exec if it truly cannot run.
 func signBinaries(ctx context.Context, dir, stamp string, names []string) error {
-	_ = binsign.HealOnce(ctx, binsign.Codesign{}, dir, stamp, names...)
+	_ = binsign.HealOnce(ctx, bootCodeSigner, dir, stamp, names...)
 	for _, n := range names {
 		p := filepath.Join(dir, n)
 		if _, err := os.Lstat(p); err != nil {
 			continue
 		}
-		_, _ = binsign.EnsureSigned(ctx, binsign.Codesign{}, p)
+		_, _ = binsign.EnsureSigned(ctx, bootCodeSigner, p)
 	}
 	return nil
 }
@@ -1088,7 +1121,7 @@ func resignFresh(ctx context.Context, dir string, names []string) {
 		if _, err := os.Lstat(p); err != nil {
 			continue
 		}
-		_ = binsign.ResignByReplace(ctx, binsign.Codesign{}, p)
+		_ = binsign.ResignByReplace(ctx, bootCodeSigner, p)
 	}
 }
 
