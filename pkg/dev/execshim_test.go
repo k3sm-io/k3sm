@@ -37,6 +37,8 @@ type fakeBuilder struct {
 	buildErr   error    // when non-nil, Build fails (drives the hostprocess fallback)
 	built      []string // outPaths passed to Build
 	signed     []string // paths passed to Sign
+	verified   []string // paths passed to Verify
+	valid      bool     // what Verify reports (false: every file needs signing)
 	writeBytes string   // stub Mach-O content Build writes on success
 }
 
@@ -55,6 +57,11 @@ func (f *fakeBuilder) Build(_ context.Context, outPath string) error {
 func (f *fakeBuilder) Sign(_ context.Context, path string) error {
 	f.signed = append(f.signed, path)
 	return nil
+}
+
+func (f *fakeBuilder) Verify(_ context.Context, path string) (bool, error) {
+	f.verified = append(f.verified, path)
+	return f.valid, nil
 }
 
 // newTestManagerWithBuilder builds a Manager over a fake System + fake builder.
@@ -459,8 +466,12 @@ func TestProvisionExecShimKeepsCachedWhenRebuildFails(t *testing.T) {
 	if !ok || dir != m.devBinDir() {
 		t.Fatalf("provisionExecShim = (%q,%v), want the cached helper kept + ok", dir, ok)
 	}
-	if len(b.signed) != 1 || b.signed[0] != shim {
-		t.Errorf("signed = %v, want the cached helper re-signed once", b.signed)
+	// Re-signed once, as a temp copy beside it, never at the live path.
+	if len(b.signed) != 1 || !isTempBeside(b.signed[0], shim) {
+		t.Errorf("signed = %v, want one temp copy of the cached helper signed, never %s", b.signed, shim)
+	}
+	if got, _ := os.ReadFile(shim); string(got) != "cached" {
+		t.Errorf("cached helper = %q, want its bytes kept", got)
 	}
 }
 

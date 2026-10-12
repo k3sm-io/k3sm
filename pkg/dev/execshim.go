@@ -27,6 +27,8 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/k3sm/pkg/executor"
 )
 
 // execShimName is the basename of the ad-hoc-signed Seatbelt helper the detached
@@ -51,15 +53,19 @@ type ExecShimBuilder interface {
 	// hostprocess rather than crashing the dev loop.
 	Build(ctx context.Context, outPath string) error
 	// Sign ad-hoc signs the built Mach-O so it can exec + apply SBPL on macOS
-	// (mirrors executor.signBinaries: codesign -s - -f). Best-effort — a signing
-	// failure must not fail provisioning (the binary fails loudly at exec if it
-	// truly cannot run).
+	// (executor.CodesignSigner). Best-effort — a signing failure must not fail
+	// provisioning (the binary fails loudly at exec if it truly cannot run). It is
+	// only ever given a path no process can have mapped: a fresh build, or the temp
+	// copy executor.EnsureSigned renames over a cached helper.
 	Sign(ctx context.Context, path string) error
+	// Verify reports whether path's signature verifies, so a cached helper that
+	// is already signed is never rewritten (executor.EnsureSigned).
+	Verify(ctx context.Context, path string) (bool, error)
 }
 
 // goExecShimBuilder is the production ExecShimBuilder over `go build` + `codesign`.
-// It mirrors executor.ensureKine (CGO_ENABLED=1 go build) and
-// executor.signBinaries (codesign -s - -f).
+// It mirrors executor.ensureKine (CGO_ENABLED=1 go build) and signs through
+// executor.CodesignSigner, k3sm's one signing entry point.
 type goExecShimBuilder struct{}
 
 // NewExecShimBuilder returns the production ExecShimBuilder.
@@ -79,12 +85,16 @@ func (goExecShimBuilder) Build(ctx context.Context, outPath string) error {
 	return nil
 }
 
-// Sign ad-hoc signs path (codesign -s - -f), best-effort (mirrors
-// executor.signBinaries): a signing miss on an already-valid or non-macOS host
-// must not block provisioning.
+// Sign ad-hoc signs path through executor.CodesignSigner, best-effort: a signing
+// miss on a non-macOS host must not block provisioning.
 func (goExecShimBuilder) Sign(ctx context.Context, path string) error {
-	_ = exec.CommandContext(ctx, "codesign", "-s", "-", "-f", path).Run()
+	_ = executor.CodesignSigner{}.Sign(ctx, path)
 	return nil
+}
+
+// Verify reports whether path's signature verifies (executor.CodesignSigner).
+func (goExecShimBuilder) Verify(ctx context.Context, path string) (bool, error) {
+	return executor.CodesignSigner{}.Verify(ctx, path)
 }
 
 // devBinDir is the shared dev-bin cache holding the provisioned k3sm-execshim
@@ -223,7 +233,10 @@ func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool
 			return "", false, nil
 		}
 		fmt.Fprintf(m.out, "note: could not rebuild %s (%v); reusing the cached helper\n", execShimName, buildErr)
-		_ = m.builder.Sign(ctx, shim)
+		// Re-signed only if its signature does not verify, and then as a copy
+		// renamed over it: a helper a running pod launcher has mapped is never
+		// rewritten in place. Best-effort, as the signature always was.
+		_, _ = executor.EnsureSigned(ctx, m.builder, shim)
 		return m.verifiedBinDir(dir, shim)
 	}
 	// Re-sign so a stale ad-hoc signature from a prior toolchain does not wedge
@@ -296,7 +309,10 @@ func (m *Manager) provisionRootExecShim(ctx context.Context) (string, bool, erro
 			return "", false, nil
 		}
 		fmt.Fprintf(m.out, "note: could not rebuild %s (%v); reusing the cached helper\n", execShimName, buildErr)
-		_ = m.builder.Sign(ctx, shim)
+		// Re-signed only if its signature does not verify, and then as a copy
+		// renamed over it: a helper a running pod launcher has mapped is never
+		// rewritten in place. Best-effort, as the signature always was.
+		_, _ = executor.EnsureSigned(ctx, m.builder, shim)
 		return m.verifiedBinDir(dir, shim)
 	}
 	_ = m.builder.Sign(ctx, built)

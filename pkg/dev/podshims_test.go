@@ -34,6 +34,8 @@ type fakePodShimBuilder struct {
 	buildErr error       // when non-nil, Build fails (drives the degrade paths)
 	built    [][2]string // {name, outDir} pairs passed to Build
 	signed   []string    // paths passed to Sign
+	verified []string    // paths passed to Verify
+	valid    bool        // what Verify reports (false: every file needs signing)
 }
 
 func (f *fakePodShimBuilder) Build(_ context.Context, name, outDir string) error {
@@ -49,6 +51,11 @@ func (f *fakePodShimBuilder) Build(_ context.Context, name, outDir string) error
 func (f *fakePodShimBuilder) Sign(_ context.Context, path string) error {
 	f.signed = append(f.signed, path)
 	return nil
+}
+
+func (f *fakePodShimBuilder) Verify(_ context.Context, path string) (bool, error) {
+	f.verified = append(f.verified, path)
+	return f.valid, nil
 }
 
 // buildNames returns the shim names Build was called with.
@@ -252,10 +259,10 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 		if shim != staged {
 			t.Errorf("provisionPodShim = %q, want the cached shim %q kept", shim, staged)
 		}
-		if len(b2.signed) != 1 || b2.signed[0] != staged {
-			t.Errorf("signed = %v, want the cached shim re-signed once", b2.signed)
+		if len(b2.signed) != 1 || !isTempBeside(b2.signed[0], staged) {
+			t.Errorf("signed = %v, want one temp copy of the cached shim signed, never %s", b2.signed, staged)
 		}
-		// The re-sign rewrites the file and refreshes its mtime, so the notice is
+		// The re-sign replaces the file and refreshes its mtime, so the notice is
 		// the ONLY thing that shows the cached shim may predate the source: it must
 		// say STALE and carry the build error.
 		out := m.out.(*bytes.Buffer).String()
