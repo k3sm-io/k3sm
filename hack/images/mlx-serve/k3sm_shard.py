@@ -159,8 +159,14 @@ def interconnect_hosts(env, rank, world, port):
         raise ShardError(f"{ENV_HOSTS} entry {own!r} for rank {rank} is not <address>:{port}")
     mine = env.get(ENV_INTERCONNECT_IP, "")
     if mine == "":
+        # The provider started the Pod without its slot-1 address (fallback
+        # network) and recorded why in the Pod's k3sm.io/InterconnectAttached
+        # condition. The rank must not run unattributed on another address; it
+        # ends cleanly, and the operator treats the refusal as an interconnect
+        # loss (re-place on pod IPs, or hold under fallback none).
         raise ShardError(f"{ENV_HOSTS} is set but {ENV_INTERCONNECT_IP} is not: this rank holds no interconnect "
-                         f"address to bind its hostfile entry {own!r} on (the interconnect attach did not happen)")
+                         f"address to bind its hostfile entry {own!r} on; the interconnect attach was refused "
+                         f"(see the Pod's k3sm.io/InterconnectAttached condition), exiting so the operator re-places the gang")
     if host != mine:
         raise ShardError(f"{ENV_HOSTS} names {host} for rank {rank}, but this rank's interconnect address "
                          f"({ENV_INTERCONNECT_IP}) is {mine}: it would bind an address it does not hold")
@@ -278,7 +284,7 @@ def main(argv=None):
         files, child_env, child_argv = plan(env, argv)
         write_files(files)
     except ShardError as e:
-        print(f"k3sm-shard: {e}", file=sys.stderr)
+        print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
         return 2
     print(f"k3sm-shard: rank {child_env['MLX_RANK']} of {child_env['MLX_WORLD_SIZE']}, "
           f"backend {env[ENV_BACKEND]}, exec {' '.join(child_argv[1:4])}", file=sys.stderr, flush=True)

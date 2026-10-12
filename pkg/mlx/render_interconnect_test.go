@@ -191,6 +191,8 @@ func TestShardedHostfileUsesInterconnectAddresses(t *testing.T) {
 		var results []struct {
 			Hostfile [][]string `json:"hostfile"`
 			Error    string     `json:"error"`
+			Exit     int        `json:"exit"`
+			Log      string     `json:"log"`
 		}
 		if err := json.Unmarshal(out, &results); err != nil {
 			t.Fatalf("decode driver output %q: %v", out, err)
@@ -207,8 +209,14 @@ func TestShardedHostfileUsesInterconnectAddresses(t *testing.T) {
 		if e := results[len(objs.Pods)].Error; !strings.Contains(e, "does not hold") {
 			t.Errorf("a rank handed another rank's address started (error %q); it must refuse", e)
 		}
-		if e := results[len(objs.Pods)+1].Error; !strings.Contains(e, podnet.EnvInterconnectIP) {
-			t.Errorf("a rank with no interconnect address started (error %q); it must refuse", e)
+		unattachedRun := results[len(objs.Pods)+1]
+		if !strings.Contains(unattachedRun.Error, podnet.EnvInterconnectIP) {
+			t.Errorf("a rank with no interconnect address started (error %q); it must refuse", unattachedRun.Error)
+		}
+		// The refusal is a clean, logged exit (status 2, one k3sm-shard line),
+		// never a traceback and never an exec.
+		if unattachedRun.Exit != 2 || !strings.HasPrefix(unattachedRun.Log, "k3sm-shard: ") || strings.Contains(unattachedRun.Log, "Traceback") {
+			t.Errorf("unattached rank main() = exit %d, log %q; want a clean exit 2 with a k3sm-shard line", unattachedRun.Exit, unattachedRun.Log)
 		}
 	})
 }
@@ -218,7 +226,7 @@ func TestShardedHostfileUsesInterconnectAddresses(t *testing.T) {
 // would write or the ShardError it raised. Name resolution fails loudly: the
 // thunderbolt path must never resolve a name.
 const shardDriver = `
-import json, sys
+import io, json, os, sys
 sys.path.insert(0, sys.argv[1])
 import k3sm_shard as ks
 
@@ -230,8 +238,19 @@ for run in json.load(sys.stdin):
     try:
         files, _, _ = ks.plan(run["env"], [], resolver=no_lookup)
         (content,) = files.values()
-        out.append({"hostfile": json.loads(content), "error": ""})
+        res = {"hostfile": json.loads(content), "error": ""}
     except ks.ShardError as e:
-        out.append({"hostfile": None, "error": str(e)})
+        res = {"hostfile": None, "error": str(e)}
+    if res["error"]:
+        # The entrypoint itself, as the rank runs it: a refusal must exit
+        # cleanly with a logged line (it never reaches the exec).
+        os.environ.clear()
+        os.environ.update(run["env"])
+        err, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            res["exit"] = ks.main([])
+        finally:
+            res["log"], sys.stderr = sys.stderr.getvalue(), err
+    out.append(res)
 print(json.dumps(out))
 `

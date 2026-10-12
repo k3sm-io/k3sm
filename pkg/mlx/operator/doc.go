@@ -78,9 +78,17 @@ limitations under the License.
 // collective init blocks on every rank and a partial gang can never serve.
 // ShardsPlaced and LinksHealthy sit beside Ready, which needs every rank. A gang
 // on the thunderbolt path that loses a segment member is re-rendered on pod IPs
-// (fallback network, at most once per model per five minutes) or held
-// (fallback none); a gang on the network is never restarted because the cable
-// came back.
+// (fallback network) or held (fallback none); a rank whose interconnect attach
+// was refused counts as the same loss. After such a restart the model stays on
+// the network for five minutes, so there is at most one interconnect-driven
+// restart per model per five minutes. A gang on the network is never restarted
+// because the cable came back.
+//
+// The path in use is the k3sm.io/mlx-interconnect annotation on every rank Pod
+// and is named in the ShardsPlaced message ("ring over thunderbolt"). The plan's
+// status.interconnect field is deferred: MLXModelStatus in k3sm.io/apis has no
+// such field, and the CRD's structural schema would prune it, so it is an apis
+// addition still to make.
 //
 // # What this package deliberately does not do
 //

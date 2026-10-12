@@ -66,8 +66,8 @@ const (
 // interconnectRestart is the controller's memory of a model's last
 // interconnect-driven gang restart.
 type interconnectRestart struct {
-	// at is when the restart was started; the next waits for
-	// interconnectRestartLimit after it.
+	// at is when the restart was started. No placement of the model lands on
+	// the thunderbolt path until interconnectRestartLimit after it.
 	at time.Time
 	// toNetwork means the re-placement that follows has not happened yet, and
 	// must land on the network (fallback network: re-render on pod IPs).
@@ -167,6 +167,19 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 		return err
 	}
 	if len(pods) > 0 {
+		// A refused interconnect attach comes BEFORE the generic gang check: the
+		// rank without its address exits, and a plain gang restart would
+		// re-resolve straight back onto the thunderbolt path, a loop with no
+		// limit. Here it is an interconnect loss, with the loss's limit.
+		if refused := attachRefused(pods); len(refused) > 0 {
+			cable, ic, err := c.readCable(ctx)
+			if err != nil {
+				return fmt.Errorf("read interconnect for mlxmodel %s: %w", key, err)
+			}
+			obs := placedObservation(pods, cable.Graph, desired, hash, c.observeRanks(ctx, model, pods))
+			obs.AttachRefused = refused
+			return c.interconnectLost(ctx, key, raw, model, ic, obs)
+		}
 		fault, err := c.gangFault(ctx, model, pods, hash)
 		if err != nil {
 			return err
@@ -204,7 +217,7 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	if err != nil {
 		return fmt.Errorf("read interconnect for mlxmodel %s: %w", key, err)
 	}
-	cable.ForceNetwork = c.icRestarts[key].toNetwork
+	cable.ForceNetwork = c.forceNetwork(key)
 	nodes, err := c.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list nodes for mlxmodel %s: %w", key, err)
@@ -258,52 +271,81 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 }
 
 // watchInterconnect is the whole-gang reconcile for a gang placed on the
-// thunderbolt path: LinksHealthy, and what a lost member costs (plan §4 and
-// I10).
-//
-// A placed member that is no longer up sets LinksHealthy=False. Under the
-// Interconnect's fallback network the gang is re-rendered on pod IPs: every
-// rank is deleted (the gang restart the spec-hash path uses) and the
-// re-placement that follows is forced onto the network. That restart is
-// limited to one per model per interconnectRestartLimit; inside the limit the
-// gang is held and the message says until when. Under fallback none the gang
-// is held and reported. A gang on the network is never restarted because the
-// cable came back: only the next gang restart re-resolves the path.
+// thunderbolt path: LinksHealthy while every placed member is up, and
+// interconnectLost when one is not (plan §4 and I10).
 func (c *Controller) watchInterconnect(ctx context.Context, key string, raw *unstructured.Unstructured, model *mlxv1alpha1.MLXModel, ic *netv1alpha1.Interconnect, obs mlx.ShardObservation) error {
-	c.queue.AddAfter(key, interconnectRecheck)
-	if len(obs.DownLinks) == 0 {
+	if !obs.InterconnectLost() {
+		c.queue.AddAfter(key, interconnectRecheck)
 		return c.writeShardedStatus(ctx, raw, model, obs)
 	}
+	return c.interconnectLost(ctx, key, raw, model, ic, obs)
+}
+
+// interconnectLost handles a gang on the thunderbolt path that lost its
+// interconnect: a placed segment member is down, or a rank's interconnect
+// attach was refused. LinksHealthy goes False naming what was lost.
+//
+// Under the Interconnect's fallback none the gang is held and reported. Under
+// fallback network it is re-rendered on pod IPs: every rank is deleted (the
+// gang restart the spec-hash path uses) and the re-placement is forced onto the
+// network. The limit of one interconnect-driven gang restart per model per
+// interconnectRestartLimit is enforced at placement (forceNetwork): for that
+// long after such a restart no placement of the model lands on the thunderbolt
+// path, so no second loss can arise inside the limit, and a refused attach can
+// never loop back onto the cable. A gang on the network is never restarted
+// because the cable came back; only a gang restart re-resolves the path.
+func (c *Controller) interconnectLost(ctx context.Context, key string, raw *unstructured.Unstructured, model *mlxv1alpha1.MLXModel, ic *netv1alpha1.Interconnect, obs mlx.ShardObservation) error {
+	lost := slices.Concat(obs.DownLinks, obs.AttachRefused)
 	fallback := netv1alpha1.InterconnectFallbackNetwork
 	if ic != nil {
 		fallback = ic.Spec.EffectiveFallback()
 	}
 	if fallback == netv1alpha1.InterconnectFallbackNone {
-		obs.DownLinkAction = "the Interconnect's fallback is none, so the gang is held on the interconnect until the link is back"
-		c.log.Warn("sharded mlxmodel lost an interconnect link; fallback none, holding the gang",
-			"mlxmodel", key, "down", obs.DownLinks)
+		obs.DownLinkAction = "the Interconnect's fallback is none, so the gang is held on the interconnect until it is back"
+		c.log.Warn("sharded mlxmodel lost its interconnect; fallback none, holding the gang", "mlxmodel", key, "lost", lost)
+		c.queue.AddAfter(key, interconnectRecheck)
 		return c.writeShardedStatus(ctx, raw, model, obs)
 	}
-	now := c.now()
-	if last, ok := c.icRestarts[key]; ok && now.Sub(last.at) < interconnectRestartLimit {
-		next := last.at.Add(interconnectRestartLimit)
-		obs.DownLinkAction = fmt.Sprintf("the Interconnect's fallback is network, but this model had an interconnect-driven gang restart at %s; the re-render on pod IPs waits until %s (at most one per %s)",
-			last.at.UTC().Format(time.RFC3339), next.UTC().Format(time.RFC3339), interconnectRestartLimit)
-		c.queue.AddAfter(key, next.Sub(now))
-		return c.writeShardedStatus(ctx, raw, model, obs)
-	}
-	fault := fmt.Sprintf("interconnect link %s is down; re-rendering the gang on pod IPs (fallback network)", strings.Join(obs.DownLinks, ", "))
+	fault := fmt.Sprintf("interconnect lost (%s); re-rendering the gang on pod IPs (fallback network)", strings.Join(lost, ", "))
 	if err := c.deleteRankPods(ctx, model, fault); err != nil {
 		return err
 	}
-	c.icRestarts[key] = interconnectRestart{at: now, toNetwork: true}
-	c.log.Warn("sharded mlxmodel lost an interconnect link; re-rendering on pod IPs", "mlxmodel", key, "down", obs.DownLinks)
+	c.icRestarts[key] = interconnectRestart{at: c.now(), toNetwork: true}
+	c.log.Warn("sharded mlxmodel lost its interconnect; re-rendering on pod IPs", "mlxmodel", key, "lost", lost)
 	c.queue.AddAfter(key, gangRetry)
-	obs.DownLinkAction = "the Interconnect's fallback is network, so the gang is re-rendered on pod IPs"
+	obs.DownLinkAction = fmt.Sprintf("the Interconnect's fallback is network, so the gang is re-rendered on pod IPs, and stays off the interconnect for %s", interconnectRestartLimit)
 	return c.writeShardedStatus(ctx, raw, model, mlx.ShardObservation{
 		Desired: obs.Desired, GangRestart: fault, Pods: obs.Pods, Interconnect: obs.Interconnect,
-		PlacedLinks: obs.PlacedLinks, DownLinks: obs.DownLinks, DownLinkAction: obs.DownLinkAction,
+		PlacedLinks: obs.PlacedLinks, DownLinks: obs.DownLinks, AttachRefused: obs.AttachRefused,
+		DownLinkAction: obs.DownLinkAction,
 	})
+}
+
+// forceNetwork reports whether the model's next placement must land on the
+// network: the re-placement after an interconnect-driven gang restart has not
+// happened yet, or that restart is less than interconnectRestartLimit ago.
+func (c *Controller) forceNetwork(key string) bool {
+	r, ok := c.icRestarts[key]
+	return ok && (r.toNetwork || c.now().Sub(r.at) < interconnectRestartLimit)
+}
+
+// attachRefused lists the rank Pods placed on the thunderbolt path whose
+// k3sm.io/InterconnectAttached condition is False, as "pod (Reason: message)".
+// A gang on the network path carries no attach, so it lists nothing.
+func attachRefused(pods []corev1.Pod) []string {
+	var out []string
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Annotations[mlx.AnnotationInterconnect] != string(mlxv1alpha1.MLXInterconnectThunderbolt) {
+			continue
+		}
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == netv1alpha1.ConditionInterconnectAttached && cond.Status == corev1.ConditionFalse {
+				out = append(out, fmt.Sprintf("%s (%s: %s)", pod.Name, cond.Reason, cond.Message))
+			}
+		}
+	}
+	return out
 }
 
 // applySharded applies the Services, creates the cache claims, then creates the

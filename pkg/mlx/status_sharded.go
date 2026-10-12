@@ -104,7 +104,12 @@ type ShardObservation struct {
 	PlacedLinks int
 	// DownLinks are the placed links ("nodeA/nodeB") that are no longer up.
 	DownLinks []string
-	// DownLinkAction, when DownLinks is not empty, says what the operator is
+	// AttachRefused are the rank Pods on the thunderbolt path whose
+	// k3sm.io/InterconnectAttached condition is False, each as
+	// "pod (Reason: message)". A rank with no interconnect address cannot bind
+	// its hostfile entry, so this is an interconnect loss like a down link.
+	AttachRefused []string
+	// DownLinkAction, when DownLinks or AttachRefused is not empty, says what the operator is
 	// doing about it (re-rendering on pod IPs, waiting out the restart limit,
 	// or holding under fallback none). Empty uses the backend's consequence.
 	DownLinkAction string
@@ -156,7 +161,7 @@ func DeriveShardedStatus(m *mlxv1alpha1.MLXModel, obs ShardObservation, opts Sta
 		// ShardsPlaced keeps its last value: it describes the placement being
 		// torn down until a new one replaces it. LinksHealthy does too, unless
 		// the restart is BECAUSE a link went down, which it then reports.
-		if len(obs.DownLinks) > 0 {
+		if obs.InterconnectLost() {
 			linksOK, linkReason, linkMessage := linksVerdict(obs)
 			set(ConditionLinksHealthy, linksOK, linkReason, linkMessage)
 		}
@@ -192,18 +197,31 @@ func DeriveShardedStatus(m *mlxv1alpha1.MLXModel, obs ShardObservation, opts Sta
 	return status
 }
 
+// InterconnectLost reports whether the observed gang lost its interconnect: a
+// placed link is down or a rank's interconnect attach was refused.
+func (obs ShardObservation) InterconnectLost() bool {
+	return len(obs.DownLinks) > 0 || len(obs.AttachRefused) > 0
+}
+
 // linksVerdict is LinksHealthy for a placed gang.
 func linksVerdict(obs ShardObservation) (ok bool, reason, message string) {
-	if len(obs.DownLinks) == 0 {
+	if !obs.InterconnectLost() {
 		if obs.PlacedLinks == 0 {
 			return true, ReasonLinksUp, "the ranks talk over pod IPs on the cluster network; no interconnect link to watch"
 		}
 		return true, ReasonLinksUp, fmt.Sprintf("the ranks talk over the %s interconnect; all %d placed links are up", obs.Interconnect, obs.PlacedLinks)
 	}
+	var lost []string
+	if len(obs.DownLinks) > 0 {
+		lost = append(lost, fmt.Sprintf("interconnect link %s is down (%d of %d placed links)",
+			strings.Join(obs.DownLinks, ", "), len(obs.DownLinks), obs.PlacedLinks))
+	}
+	if len(obs.AttachRefused) > 0 {
+		lost = append(lost, "interconnect attach refused for "+strings.Join(obs.AttachRefused, ", "))
+	}
 	consequence := obs.DownLinkAction
 	if consequence == "" {
 		consequence = "the ranks are bound to interconnect addresses, so the collective cannot reach that rank until the link is back or the gang restarts"
 	}
-	return false, ReasonLinkDegraded, fmt.Sprintf("interconnect link %s is down (%d of %d placed links); %s",
-		strings.Join(obs.DownLinks, ", "), len(obs.DownLinks), obs.PlacedLinks, consequence)
+	return false, ReasonLinkDegraded, strings.Join(lost, "; ") + "; " + consequence
 }
