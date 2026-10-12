@@ -1343,6 +1343,9 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		// container re-exec, so `kubectl describe pod` on a crash-looping pod
 		// shows the crash loop in its Events table.
 		cfg.Recorder = recorder
+		// The pod interconnect opt-in: the root helper's alias verbs and this
+		// node's desired annotation (zero on a node without the helper).
+		cfg.Interconnect = providerInterconnect(ctx, opts, cs)
 		// Guest boot artifacts, ensured HERE — at daemon start, before the
 		// runtime that boots from them exists — and never lazily on a pod's first
 		// CreateVM. Doing it here is the whole posture: a hundred-megabyte fetch on

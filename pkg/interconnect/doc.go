@@ -50,6 +50,17 @@ limitations under the License.
 // node identity and accepts nothing but a slot from the client. The apiserver
 // does not enforce it, and nothing here pretends it does.
 //
+// # Pod attach and the fallback
+//
+// The server copies the Interconnect's allowedNamespaces and the
+// interconnect-using MLXModels (namespace, name and UID) into the desired
+// annotation, so the node's pod attach (k3sm.io/interconnects, in
+// pkg/provider) can bound which pods attach without reading either object. The
+// fallback rides the same annotation, so fallback none is enforced on armed
+// member nodes only: a node that is not a member carries no desired annotation
+// and cannot know the fallback, so an attach there degrades to network, with a
+// Warning Event on the pod.
+//
 // # One writer on an HA control plane
 //
 // The resolver writes only while it holds the kube-system

@@ -117,6 +117,12 @@ type ResolverConfig struct {
 	Indices func(ctx context.Context) (Indices, error)
 	// Identity names this server in the leader Lease.
 	Identity string
+	// MLXModels lists the MLXModels that use an interconnect (MLXModelLister),
+	// which the desired annotation carries so a node can verify a slot-1 pod's
+	// owner without reading MLXModel. nil means none. A failed read writes no
+	// new or changed desired value (removals still apply), so a node never
+	// loses a model on missing information.
+	MLXModels func(ctx context.Context) ([]netv1alpha1.InterconnectModelRef, error)
 	// Recorder records Node Events; nil builds one over Client.
 	Recorder record.EventRecorder
 	// Metrics receives member and rejection metrics; nil records none.
@@ -142,6 +148,9 @@ type Resolver struct {
 	mu       sync.Mutex
 	rejected map[string]string
 	invalid  map[string]string
+	// dropped is the last count of MLXModels left out of the desired
+	// annotation to fit its bounds, so the warning fires once per change.
+	dropped int
 
 	// ensureCRD and startBackoff are Run's start-up step and its first retry
 	// wait; tests replace them.
@@ -440,8 +449,40 @@ func (r *Resolver) Reconcile(ctx context.Context) error {
 	r.recordRejections(nodes, res.Rejected)
 
 	statusErr := r.writeStatus(ctx, ic, res, now)
-	desiredErr := r.writeDesired(ctx, nodes, ic, res)
-	return errors.Join(statusErr, desiredErr)
+	models, modelErr := r.mlxModels(ctx)
+	desiredErr := r.writeDesired(ctx, nodes, ic, res, models, modelErr == nil)
+	return errors.Join(statusErr, modelErr, desiredErr)
+}
+
+// mlxModels reads the interconnect-using MLXModels, sorted by namespace and
+// name so the desired value compares stably across reconciles. An entry with
+// an empty field, or repeating an earlier namespace/name or UID, is dropped.
+func (r *Resolver) mlxModels(ctx context.Context) ([]netv1alpha1.InterconnectModelRef, error) {
+	if r.cfg.MLXModels == nil {
+		return nil, nil
+	}
+	in, err := r.cfg.MLXModels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list interconnect MLXModels: %w", err)
+	}
+	sort.Slice(in, func(i, j int) bool {
+		if in[i].Namespace != in[j].Namespace {
+			return in[i].Namespace < in[j].Namespace
+		}
+		return in[i].Name < in[j].Name
+	})
+	out := make([]netv1alpha1.InterconnectModelRef, 0, len(in))
+	names := make(map[string]bool, len(in))
+	uids := make(map[string]bool, len(in))
+	for _, m := range in {
+		key := m.Namespace + "/" + m.Name
+		if m.Namespace == "" || m.Name == "" || m.UID == "" || names[key] || uids[m.UID] {
+			continue
+		}
+		names[key], uids[m.UID] = true, true
+		out = append(out, m)
+	}
+	return out, nil
 }
 
 // clearDesired deletes the desired annotation from every Node that carries one.
@@ -660,24 +701,78 @@ func (r *Resolver) reportTransitions(prev, next []netv1alpha1.InterconnectMember
 // writeDesired makes every Node's desired annotation agree with the
 // resolution: the encoded desired value on the nodes that must carry it, no
 // annotation anywhere else. A node-edited value that disagrees is overwritten.
-func (r *Resolver) writeDesired(ctx context.Context, nodes []*corev1.Node, ic *netv1alpha1.Interconnect, res Result) error {
-	want, err := netv1alpha1.InterconnectDesired{
-		Schema:       netv1alpha1.InterconnectAnnotationSchema,
-		Interconnect: ic.Name,
-		Fallback:     ic.Spec.EffectiveFallback(),
-	}.Encode()
-	if err != nil {
-		return fmt.Errorf("encode the desired annotation: %w", err)
+//
+// The value carries the Interconnect's allowedNamespaces and the
+// interconnect-using MLXModels (plan I9: a node reads neither object), so a
+// change in either rewrites it. modelsKnown false (a failed MLXModel read)
+// writes no new or changed value and only removes annotations, so a node never
+// loses a model on missing information.
+func (r *Resolver) writeDesired(ctx context.Context, nodes []*corev1.Node, ic *netv1alpha1.Interconnect, res Result, models []netv1alpha1.InterconnectModelRef, modelsKnown bool) error {
+	var (
+		want    string
+		wantErr error
+	)
+	if modelsKnown {
+		want, wantErr = r.desiredValue(ic, models)
 	}
 	var errs []error
+	if wantErr != nil {
+		errs = append(errs, wantErr)
+	}
+	canWrite := modelsKnown && wantErr == nil
 	for _, n := range nodes {
 		cur, has := n.Annotations[netv1alpha1.AnnotationInterconnectDesired]
 		switch {
-		case res.Desired[n.Name] && cur != want:
+		case res.Desired[n.Name] && canWrite && cur != want:
 			errs = append(errs, PatchNodeAnnotation(ctx, r.cfg.Client, n.Name, netv1alpha1.AnnotationInterconnectDesired, want))
 		case !res.Desired[n.Name] && has:
 			errs = append(errs, PatchNodeAnnotation(ctx, r.cfg.Client, n.Name, netv1alpha1.AnnotationInterconnectDesired, ""))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// desiredValue encodes the desired annotation for ic with models (sorted).
+// When the models do not fit the annotation's bounds (MaxInterconnectListItems,
+// the 4 KiB cap), the tail is left out, warned once per change: a left-out
+// model's rank gets no slot 1, which fails closed. The allowed namespaces are
+// never trimmed, because an empty list means every namespace.
+func (r *Resolver) desiredValue(ic *netv1alpha1.Interconnect, models []netv1alpha1.InterconnectModelRef) (string, error) {
+	d := netv1alpha1.InterconnectDesired{
+		Schema:            netv1alpha1.InterconnectAnnotationSchema,
+		Interconnect:      ic.Name,
+		Fallback:          ic.Spec.EffectiveFallback(),
+		AllowedNamespaces: ic.Spec.AllowedNamespaces,
+	}
+	n := min(len(models), netv1alpha1.MaxInterconnectListItems)
+	for ; n >= 0; n-- {
+		if n > 0 {
+			d.MLXModels = models[:n]
+		} else {
+			d.MLXModels = nil
+		}
+		v, err := d.Encode()
+		if err == nil {
+			r.noteDroppedModels(len(models) - n)
+			return v, nil
+		}
+		if n == 0 {
+			return "", fmt.Errorf("encode the desired annotation: %w", err)
+		}
+	}
+	return "", errors.New("encode the desired annotation: unreachable")
+}
+
+// noteDroppedModels warns when the count of MLXModels left out of the desired
+// annotation changes.
+func (r *Resolver) noteDroppedModels(n int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n == r.dropped {
+		return
+	}
+	r.dropped = n
+	if n > 0 {
+		r.cfg.Log.Warn("interconnect resolver: more interconnect MLXModels than the desired annotation carries; their ranks get no slot 1", "left_out", n, "max", netv1alpha1.MaxInterconnectListItems)
+	}
 }

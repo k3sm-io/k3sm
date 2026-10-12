@@ -43,6 +43,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/interconnect"
+	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
@@ -143,8 +144,11 @@ func startInterconnectResolver(ctx context.Context, plan serverPlan, restCfg *re
 		CRD:      crd,
 		Indices:  meshPeerIndexSet(list),
 		Identity: plan.opts.nodeName,
-		Metrics:  plan.interconnectMetrics,
-		Log:      logger,
+		// The interconnect-using MLXModels, read with the same admin client the
+		// MLX operator uses; the desired annotation carries their references.
+		MLXModels: interconnect.MLXModelLister(dyn),
+		Metrics:   plan.interconnectMetrics,
+		Log:       logger,
 	})
 	rCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -227,6 +231,25 @@ func startInterconnectNode(ctx context.Context, opts nodeOptions, cs kubernetes.
 	return func() {
 		cancel()
 		wg.Wait()
+	}
+}
+
+// providerInterconnect wires the provider's pod interconnect attach: the root
+// helper's alias verbs and this node's own desired annotation, read through a
+// single-object informer on the node's own Node (which the Node authorizer
+// allows) that runs for ctx's life. A node without the helper or without an
+// apiserver client gets the zero config, which refuses every attach under the
+// pod's fallback. The node's own Node need not exist yet: until the informer
+// holds it, an attach is held rather than decided.
+func providerInterconnect(ctx context.Context, opts nodeOptions, cs kubernetes.Interface) provider.InterconnectConfig {
+	if cs == nil || !opts.netMode.UsesHelper() {
+		return provider.InterconnectConfig{}
+	}
+	own := interconnect.NewOwnNode(cs, opts.nodeName)
+	go own.Run(ctx)
+	return provider.InterconnectConfig{
+		Aliases: wire.NewClient(opts.netMode.Socket),
+		Desired: own.For(netv1alpha1.AnnotationInterconnectDesired).Current,
 	}
 }
 
