@@ -28,7 +28,6 @@ import (
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	"k3sm.io/k3sm/pkg/mlx"
-	"k3sm.io/k3sm/pkg/mlx/topology"
 )
 
 // gpuPod builds a pod bound to node that holds gpu units of the MLX GPU
@@ -117,7 +116,7 @@ func TestPlaceRefusesHeldGPU(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := Place(m, topology.Graph{}, tc.nodes, HeldGPUSlots(m, tc.pods))
+			p, err := Place(m, Cable{}, tc.nodes, HeldGPUSlots(m, tc.pods))
 			if tc.wantReason != "" {
 				var pe *PlacementError
 				if !errors.As(err, &pe) {

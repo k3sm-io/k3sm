@@ -39,6 +39,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
@@ -591,7 +592,16 @@ func startMLXOperator(ctx context.Context, plan serverPlan, restCfg *rest.Config
 		logger.Error("build apiextensions client for the mlx operator", "err", err)
 		return mlxGPU, noStop
 	}
-	mlxOp, err := operator.New(mlxOperatorConfig(cs, dynClient, crdClient, mlxGPU, plan.opts.domain, logger))
+	// The node cluster indices for interconnect path selection: the same
+	// MeshPeer-backed source the interconnect resolver reads. Without it the
+	// operator still serves every model, on the network path only.
+	var indices func(context.Context) (interconnect.Indices, error)
+	if list, err := meshPeerListerFor(restCfg); err != nil {
+		logger.Error("mlx operator: no interconnect path (build its MeshPeer client); sharded models use the network", "err", err)
+	} else {
+		indices = meshPeerIndexSet(list)
+	}
+	mlxOp, err := operator.New(mlxOperatorConfig(cs, dynClient, crdClient, mlxGPU, indices, plan.opts.domain, logger))
 	if err != nil {
 		logger.Error("build the mlx operator", "err", err)
 		return mlxGPU, noStop

@@ -280,3 +280,33 @@ func TestSpecHashIgnoresPlacement(t *testing.T) {
 		t.Errorf("placed-links round trip = %v", got)
 	}
 }
+
+// TestSpecHashSurvivesTheInterconnectDefault: installing the binary that
+// honours spec.distributed.interconnect must not restart any gang. A stored
+// model reads back with the CRD default "auto"; it must hash exactly as the
+// same model without the field, and both as the hash pinned in the
+// sharded-ring-2 golden, which was rendered before the field existed.
+func TestSpecHashSurvivesTheInterconnectDefault(t *testing.T) {
+	const preField = "6e7caf4ad6ce7b9b" // testdata/sharded-ring-2.golden.yaml
+	for _, path := range []mlxv1alpha1.MLXInterconnect{"", mlxv1alpha1.MLXInterconnectAuto} {
+		m := shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing, mlxv1alpha1.MLXParallelismPipeline)
+		m.Spec.Distributed.Interconnect = path
+		got, err := SpecHash(m, testOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != preField {
+			t.Errorf("SpecHash(interconnect=%q) = %s, want the pre-field hash %s", path, got, preField)
+		}
+		if path == mlxv1alpha1.MLXInterconnectAuto && m.Spec.Distributed.Interconnect != path {
+			t.Error("SpecHash rewrote the caller's spec")
+		}
+	}
+	for _, path := range []mlxv1alpha1.MLXInterconnect{mlxv1alpha1.MLXInterconnectThunderbolt, mlxv1alpha1.MLXInterconnectNetwork} {
+		m := shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing, mlxv1alpha1.MLXParallelismPipeline)
+		m.Spec.Distributed.Interconnect = path
+		if got, _ := SpecHash(m, testOptions()); got == preField {
+			t.Errorf("SpecHash(interconnect=%q) did not move; an explicit path request must re-render", path)
+		}
+	}
+}

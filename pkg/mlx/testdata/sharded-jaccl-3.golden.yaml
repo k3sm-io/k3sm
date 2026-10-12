@@ -141,6 +141,7 @@ kind: Pod
 metadata:
   annotations:
     k3sm.io/mlx-backend: jaccl
+    k3sm.io/mlx-interconnect: network
     k3sm.io/mlx-placed-links: mac-a/mac-b,mac-a/mac-c,mac-b/mac-c
     k3sm.io/mlx-spec-hash: 09a9740534438cd1
   labels:
@@ -250,6 +251,7 @@ kind: Pod
 metadata:
   annotations:
     k3sm.io/mlx-backend: jaccl
+    k3sm.io/mlx-interconnect: network
     k3sm.io/mlx-placed-links: mac-a/mac-b,mac-a/mac-c,mac-b/mac-c
     k3sm.io/mlx-spec-hash: 09a9740534438cd1
   labels:
@@ -337,6 +339,7 @@ kind: Pod
 metadata:
   annotations:
     k3sm.io/mlx-backend: jaccl
+    k3sm.io/mlx-interconnect: network
     k3sm.io/mlx-placed-links: mac-a/mac-b,mac-a/mac-c,mac-b/mac-c
     k3sm.io/mlx-spec-hash: 09a9740534438cd1
   labels:

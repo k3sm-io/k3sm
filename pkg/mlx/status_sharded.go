@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 )
 
 // The conditions a SHARDED MLXModel carries beside Ready. They are published
@@ -35,8 +36,8 @@ const (
 	// every rank. False means no rank Pod exists, and the reason says what the
 	// cluster lacks.
 	ConditionShardsPlaced = "ShardsPlaced"
-	// ConditionLinksHealthy reports whether every direct link the placement
-	// counted on is still up.
+	// ConditionLinksHealthy reports whether every interconnect link the
+	// placement counted on is still up.
 	ConditionLinksHealthy = "LinksHealthy"
 )
 
@@ -57,17 +58,29 @@ const (
 	// models (or other GPU workloads), so a rank placed there could not get the
 	// extended resource and the gang would restart.
 	ReasonInsufficientGPU = "InsufficientGPU"
+	// ReasonNoInterconnectSegment means spec.distributed.interconnect is
+	// thunderbolt and no one segment of the thunderbolt Interconnect holds every
+	// rank: too few fitting nodes are up in one segment with an interconnect
+	// address. It is the apis reason, re-exported beside the others.
+	ReasonNoInterconnectSegment = netv1alpha1.ReasonNoInterconnectSegment
 )
 
 // Reasons carried by LinksHealthy.
 const (
-	// ReasonLinksUp means every direct link the placement counted on is up (or
-	// the placement counted on none, every hop riding the mesh).
+	// ReasonLinksUp means every interconnect link the placement counted on is
+	// up (or the placement counted on none: the ranks talk over pod IPs).
 	ReasonLinksUp = "LinksUp"
-	// ReasonLinkDegraded means a placed direct link is no longer up. A ring
-	// gang keeps serving, its hop now riding the mesh; a jaccl gang cannot,
-	// because RDMA has no fallback path.
+	// ReasonLinkDegraded means a member of the placed interconnect segment is
+	// no longer up. The ranks bound their collective to interconnect
+	// addresses, so the gang cannot reach that rank over the network; what the
+	// operator does about it (re-render on pod IPs, or hold) is in the message.
 	ReasonLinkDegraded = "LinkDegraded"
+	// ReasonDegradedToNetwork means the gang runs on pod IPs because an
+	// interconnect loss made the operator fall back to the network, although
+	// the spec asks for thunderbolt or auto. It is not a plain LinksUp: the gang
+	// stays on the network until a gang restart after the restart limit
+	// re-resolves the path, and the message says when that limit ends.
+	ReasonDegradedToNetwork = "DegradedToNetwork"
 )
 
 // ShardObservation is the injected state one sharded status derivation reads.
@@ -90,10 +103,30 @@ type ShardObservation struct {
 	GangRestart string
 	// Backend is the resolved backend of the placed gang (ring or jaccl).
 	Backend mlxv1alpha1.MLXDistributedBackend
-	// PlacedLinks is how many direct links the placement counted on.
+	// Interconnect is the resolved collective path of the placed gang
+	// (thunderbolt or network).
+	Interconnect mlxv1alpha1.MLXInterconnect
+	// PlacedLinks is how many interconnect links the placement counted on.
 	PlacedLinks int
 	// DownLinks are the placed links ("nodeA/nodeB") that are no longer up.
 	DownLinks []string
+	// LostRanks are the rank Pods on the thunderbolt path that cannot use the
+	// interconnect, each as "pod (why)": the attach was refused
+	// (k3sm.io/InterconnectAttached False), the rank's entrypoint refused to
+	// start on it (exit 2), or the Pod ended before any attach. A rank that
+	// cannot bind its hostfile entry is an interconnect loss like a down link.
+	LostRanks []string
+	// DegradedFrom, on a gang placed on the network by an interconnect
+	// fallback, is the path the spec asks for (thunderbolt or auto): the gang
+	// runs degraded until a gang restart re-resolves it. Empty otherwise.
+	DegradedFrom mlxv1alpha1.MLXInterconnect
+	// FallbackUntil is when the model's interconnect restart limit ends: no
+	// placement lands on the thunderbolt path before it. Zero when unknown.
+	FallbackUntil time.Time
+	// DownLinkAction, when DownLinks or LostRanks is not empty, says what the operator is
+	// doing about it (re-rendering on pod IPs, waiting out the restart limit,
+	// or holding under fallback none). Empty uses the backend's consequence.
+	DownLinkAction string
 	// Pods are the rank Pods in rank order. Revision carries each Pod's
 	// AnnotationSpecHash; only rank 0 is probed.
 	Pods []PodState
@@ -139,8 +172,13 @@ func DeriveShardedStatus(m *mlxv1alpha1.MLXModel, obs ShardObservation, opts Sta
 		meta.RemoveStatusCondition(&status.Conditions, ConditionLinksHealthy)
 		set(mlxv1alpha1.MLXModelConditionReady, false, ReasonScaledToZero, "spec.replicas is 0: no rank is serving")
 	case obs.GangRestart != "":
-		// ShardsPlaced and LinksHealthy keep their last values: they describe
-		// the placement being torn down until a new one replaces it.
+		// ShardsPlaced keeps its last value: it describes the placement being
+		// torn down until a new one replaces it. LinksHealthy does too, unless
+		// the restart is BECAUSE a link went down, which it then reports.
+		if obs.InterconnectLost() {
+			linksOK, linkReason, linkMessage := linksVerdict(obs, now)
+			set(ConditionLinksHealthy, linksOK, linkReason, linkMessage)
+		}
 		counts.replicas = int32(len(obs.Pods))
 		set(mlxv1alpha1.MLXModelConditionReady, false, ReasonPending, "gang restart: "+obs.GangRestart)
 	case !obs.Placed:
@@ -149,7 +187,7 @@ func DeriveShardedStatus(m *mlxv1alpha1.MLXModel, obs ShardObservation, opts Sta
 		set(mlxv1alpha1.MLXModelConditionReady, false, obs.PlacementReason, obs.PlacementMessage)
 	default:
 		set(ConditionShardsPlaced, true, ReasonPlaced, obs.PlacementMessage)
-		linksOK, linkReason, linkMessage := linksVerdict(obs)
+		linksOK, linkReason, linkMessage := linksVerdict(obs, now)
 		set(ConditionLinksHealthy, linksOK, linkReason, linkMessage)
 		pods := Observation{Pods: obs.Pods, CurrentRevision: obs.SpecHash}
 		ready, c, reason, message := deriveReady(obs.Desired, pods, unitRanks)
@@ -173,18 +211,50 @@ func DeriveShardedStatus(m *mlxv1alpha1.MLXModel, obs ShardObservation, opts Sta
 	return status
 }
 
+// InterconnectLost reports whether the observed gang lost its interconnect: a
+// placed link is down or a rank's interconnect attach was refused.
+func (obs ShardObservation) InterconnectLost() bool {
+	return len(obs.DownLinks) > 0 || len(obs.LostRanks) > 0
+}
+
 // linksVerdict is LinksHealthy for a placed gang.
-func linksVerdict(obs ShardObservation) (ok bool, reason, message string) {
-	if len(obs.DownLinks) == 0 {
-		if obs.PlacedLinks == 0 {
-			return true, ReasonLinksUp, "the placement counts on no direct link; every hop rides the mesh"
+func linksVerdict(obs ShardObservation, now time.Time) (ok bool, reason, message string) {
+	if !obs.InterconnectLost() {
+		if obs.DegradedFrom != "" {
+			return false, ReasonDegradedToNetwork, degradedMessage(obs, now)
 		}
-		return true, ReasonLinksUp, fmt.Sprintf("all %d placed direct links are up", obs.PlacedLinks)
+		if obs.PlacedLinks == 0 {
+			return true, ReasonLinksUp, "the ranks talk over pod IPs on the cluster network; no interconnect link to watch"
+		}
+		return true, ReasonLinksUp, fmt.Sprintf("the ranks talk over the %s interconnect; all %d placed links are up", obs.Interconnect, obs.PlacedLinks)
 	}
-	consequence := "the ring keeps serving with that hop over the mesh"
-	if obs.Backend == mlxv1alpha1.MLXDistributedBackendJACCL {
-		consequence = "jaccl has no fallback path, so the gang cannot serve until the link is back or the gang restarts"
+	var lost []string
+	if len(obs.DownLinks) > 0 {
+		lost = append(lost, fmt.Sprintf("interconnect link %s is down (%d of %d placed links)",
+			strings.Join(obs.DownLinks, ", "), len(obs.DownLinks), obs.PlacedLinks))
 	}
-	return false, ReasonLinkDegraded, fmt.Sprintf("direct link %s is down (%d of %d placed links); %s",
-		strings.Join(obs.DownLinks, ", "), len(obs.DownLinks), obs.PlacedLinks, consequence)
+	if len(obs.LostRanks) > 0 {
+		lost = append(lost, "interconnect lost by rank "+strings.Join(obs.LostRanks, ", "))
+	}
+	consequence := obs.DownLinkAction
+	if consequence == "" {
+		consequence = "the ranks are bound to interconnect addresses, so the collective cannot reach that rank until the link is back or the gang restarts"
+	}
+	return false, ReasonLinkDegraded, strings.Join(lost, "; ") + "; " + consequence
+}
+
+// degradedMessage is the DegradedToNetwork message: the requested path, and
+// when the restart limit ends (or ended).
+func degradedMessage(obs ShardObservation, now time.Time) string {
+	msg := fmt.Sprintf("spec.distributed.interconnect is %s, but the gang runs on pod IPs after an interconnect loss (fallback network)", obs.DegradedFrom)
+	switch {
+	case obs.FallbackUntil.IsZero():
+		return msg + "; the next gang restart re-resolves the path"
+	case now.Before(obs.FallbackUntil):
+		return msg + fmt.Sprintf("; no placement uses the interconnect until %s, and the next gang restart after that re-resolves the path",
+			obs.FallbackUntil.UTC().Format(time.RFC3339))
+	default:
+		return msg + fmt.Sprintf("; the restart limit ended at %s, so the next gang restart re-resolves the path (a healthy gang is not restarted for it)",
+			obs.FallbackUntil.UTC().Format(time.RFC3339))
+	}
 }

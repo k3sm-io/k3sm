@@ -116,6 +116,7 @@ kind: Pod
 metadata:
   annotations:
     k3sm.io/mlx-backend: ring
+    k3sm.io/mlx-interconnect: network
     k3sm.io/mlx-placed-links: mac-a/mac-b
     k3sm.io/mlx-spec-hash: 6e7caf4ad6ce7b9b
   labels:
@@ -223,6 +224,7 @@ kind: Pod
 metadata:
   annotations:
     k3sm.io/mlx-backend: ring
+    k3sm.io/mlx-interconnect: network
     k3sm.io/mlx-placed-links: mac-a/mac-b
     k3sm.io/mlx-spec-hash: 6e7caf4ad6ce7b9b
   labels:

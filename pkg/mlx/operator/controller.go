@@ -43,6 +43,7 @@ import (
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/crdensure"
+	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/mlx"
 )
 
@@ -105,10 +106,14 @@ type Config struct {
 	// GPU supplies the node GPU facts the pre-render fit check reads. nil skips
 	// the fit check — see GPUSource.
 	GPU GPUSource
-	// Topology supplies the direct-link graph sharded placement and the
-	// LinksHealthy condition read. nil means the resolver-written DirectLink
-	// objects, listed through Dynamic.
-	Topology Topology
+	// InterconnectIndices returns every node's cluster index, from its pod /24:
+	// the derivation the interconnect resolver uses (the server wires the same
+	// MeshPeer-backed source into both). Sharded placement turns each index into
+	// the node's slot-1 interconnect address. The thunderbolt Interconnect
+	// itself is read through Dynamic. nil means no node has an index, so no
+	// model is ever placed on the thunderbolt path (auto resolves to network,
+	// thunderbolt reports NoInterconnectSegment).
+	InterconnectIndices func(ctx context.Context) (interconnect.Indices, error)
 	// Options are the operator-level render defaults (the pinned serving image
 	// and port) an MLXModel spec does not have to state. They are also what the
 	// published status endpoint resolves its port through, so the endpoint cannot
@@ -136,7 +141,7 @@ type Controller struct {
 	dyn       dynamic.Interface
 	crd       crdensure.CRDClient
 	gpu       GPUSource
-	topo      Topology
+	indices   func(ctx context.Context) (interconnect.Indices, error)
 	opts      mlx.Options
 	domain    string
 	pullName  string
@@ -168,16 +173,12 @@ func New(cfg Config) (*Controller, error) {
 	if pullName == "" {
 		pullName = DefaultPullSecretName
 	}
-	topo := cfg.Topology
-	if topo == nil {
-		topo = directLinkTopology{dyn: cfg.Dynamic}
-	}
 	return &Controller{
 		client:    cfg.Client,
 		dyn:       cfg.Dynamic,
 		crd:       cfg.CRD,
 		gpu:       cfg.GPU,
-		topo:      topo,
+		indices:   cfg.InterconnectIndices,
 		opts:      cfg.Options,
 		domain:    cfg.ClusterDomain,
 		pullName:  pullName,

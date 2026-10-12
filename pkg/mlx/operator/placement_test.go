@@ -18,6 +18,7 @@ package operator
 
 import (
 	"errors"
+	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
@@ -69,9 +70,24 @@ func cable(g topology.Graph, a, b string, rdma bool) topology.Graph {
 		if g.Edges[d[0]] == nil {
 			g.Edges[d[0]] = map[string]topology.Edge{}
 		}
-		g.Edges[d[0]][d[1]] = topology.Edge{LocalIface: "en1", LocalRDMA: dev(d[0], d[1]), PeerRDMA: dev(d[1], d[0])}
+		g.Edges[d[0]][d[1]] = topology.Edge{Segment: "seg-0", LocalRDMA: dev(d[0], d[1]), PeerRDMA: dev(d[1], d[0])}
 	}
 	return g
+}
+
+// cabled gives every node of g a slot-1 interconnect address (its index is its
+// position in g.Nodes()), so g is a usable thunderbolt cable.
+func cabled(t *testing.T, g topology.Graph) Cable {
+	t.Helper()
+	c := Cable{Graph: g, Addresses: map[string]netip.Addr{}}
+	for i, n := range g.Nodes() {
+		a, err := netv1alpha1.InterconnectSlotAddress(i, netv1alpha1.InterconnectSlotMLXRank)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Addresses[n] = a
+	}
+	return c
 }
 
 func shardSpec(ranks int32, backend mlxv1alpha1.MLXDistributedBackend, mem string) *mlxv1alpha1.MLXModel {
@@ -81,48 +97,52 @@ func shardSpec(ranks int32, backend mlxv1alpha1.MLXDistributedBackend, mem strin
 	})
 }
 
-// TestPlace is the placement table over fake graphs: clique, cycle, any-nodes,
-// memory fit, the node selector, and every named ShardsPlaced reason.
+// TestPlace is the placement table over fake cables: clique, segment,
+// any-nodes, memory fit, the node selector, and every named ShardsPlaced
+// reason. Each cable gives its nodes interconnect addresses, so an auto model
+// lands on the thunderbolt path wherever a segment holds every rank.
 func TestPlace(t *testing.T) {
 	ring, jaccl, auto := mlxv1alpha1.MLXDistributedBackendRing, mlxv1alpha1.MLXDistributedBackendJACCL, mlxv1alpha1.MLXDistributedBackendAuto
-	threeRDMA := cable(cable(cable(topology.Graph{}, "a", "b", true), "b", "c", true), "a", "c", true)
-	threeOneTCP := cable(cable(cable(topology.Graph{}, "a", "b", true), "b", "c", true), "a", "c", false)
-	// a 4-cycle a-b-d-c-a with no chords: a cycle exists, no clique of 3.
-	fourRing := cable(cable(cable(cable(topology.Graph{}, "a", "b", false), "b", "d", false), "d", "c", false), "c", "a", false)
+	tb, nw := mlxv1alpha1.MLXInterconnectThunderbolt, mlxv1alpha1.MLXInterconnectNetwork
+	threeRDMA := cabled(t, cable(cable(cable(topology.Graph{}, "a", "b", true), "b", "c", true), "a", "c", true))
+	threeOneTCP := cabled(t, cable(cable(cable(topology.Graph{}, "a", "b", true), "b", "c", true), "a", "c", false))
+	// a 4-cycle a-b-d-c-a with no chords: no segment holds 4 (or 3) nodes.
+	fourRing := cabled(t, cable(cable(cable(cable(topology.Graph{}, "a", "b", false), "b", "d", false), "d", "c", false), "c", "a", false))
 	nodes3 := []corev1.Node{gpuNode("c", "64Gi", true), gpuNode("a", "64Gi", true), gpuNode("b", "64Gi", true)}
 	nodes4 := append(nodes3[:3:3], gpuNode("d", "64Gi", false))
 
 	cases := []struct {
 		name        string
 		model       *mlxv1alpha1.MLXModel
-		graph       topology.Graph
+		cable       Cable
 		nodes       []corev1.Node
 		wantBackend mlxv1alpha1.MLXDistributedBackend
+		wantPath    mlxv1alpha1.MLXInterconnect
 		wantNodes   []string
 		wantLinks   [][2]string
 		wantReason  string
 		wantMsg     string
 	}{
-		{name: "jaccl_rdma_clique_of_3", model: shardSpec(3, jaccl, "48Gi"), graph: threeRDMA, nodes: nodes3,
-			wantBackend: jaccl, wantNodes: []string{"a", "b", "c"}, wantLinks: [][2]string{{"a", "b"}, {"a", "c"}, {"b", "c"}}},
-		{name: "jaccl_one_tcp_edge_refused", model: shardSpec(3, jaccl, "48Gi"), graph: threeOneTCP, nodes: nodes3,
+		{name: "jaccl_rdma_clique_of_3", model: shardSpec(3, jaccl, "48Gi"), cable: threeRDMA, nodes: nodes3,
+			wantBackend: jaccl, wantPath: tb, wantNodes: []string{"a", "b", "c"}, wantLinks: [][2]string{{"a", "b"}, {"a", "c"}, {"b", "c"}}},
+		{name: "jaccl_one_tcp_edge_refused", model: shardSpec(3, jaccl, "48Gi"), cable: threeOneTCP, nodes: nodes3,
 			wantReason: mlx.ReasonNoDirectLinkTopology, wantMsg: "no rdma clique of 3"},
-		{name: "jaccl_needs_the_rdma_label", model: shardSpec(3, jaccl, "48Gi"), graph: threeRDMA,
+		{name: "jaccl_needs_the_rdma_label", model: shardSpec(3, jaccl, "48Gi"), cable: threeRDMA,
 			nodes:      []corev1.Node{gpuNode("a", "64Gi", true), gpuNode("b", "64Gi", false), gpuNode("c", "64Gi", true)},
 			wantReason: mlx.ReasonNoDirectLinkTopology, wantMsg: "2 fitting nodes carry the label"},
-		{name: "auto_picks_jaccl_on_a_clique", model: shardSpec(3, auto, "48Gi"), graph: threeRDMA, nodes: nodes3,
-			wantBackend: jaccl, wantNodes: []string{"a", "b", "c"}, wantLinks: [][2]string{{"a", "b"}, {"a", "c"}, {"b", "c"}}},
-		{name: "auto_falls_to_ring_without_clique", model: shardSpec(3, auto, "48Gi"), graph: threeOneTCP, nodes: nodes3,
-			wantBackend: ring, wantNodes: []string{"a", "b", "c"}, wantLinks: [][2]string{{"a", "b"}, {"b", "c"}, {"a", "c"}}},
-		{name: "ring_prefers_the_cycle", model: shardSpec(4, ring, "48Gi"), graph: fourRing, nodes: nodes4,
-			wantBackend: ring, wantNodes: []string{"a", "b", "d", "c"}, wantLinks: [][2]string{{"a", "b"}, {"b", "d"}, {"c", "d"}, {"a", "c"}}},
-		{name: "ring_any_nodes_without_cables", model: shardSpec(2, ring, "48Gi"), graph: topology.Graph{}, nodes: nodes3,
-			wantBackend: ring, wantNodes: []string{"a", "b"}},
-		{name: "ring_two_ranks_one_cable", model: shardSpec(2, ring, "48Gi"), graph: cable(topology.Graph{}, "b", "c", false), nodes: nodes3,
-			wantBackend: ring, wantNodes: []string{"b", "c"}, wantLinks: [][2]string{{"b", "c"}}},
-		{name: "too_few_gpu_nodes", model: shardSpec(4, ring, "48Gi"), graph: fourRing, nodes: nodes3,
+		{name: "auto_picks_jaccl_on_a_clique", model: shardSpec(3, auto, "48Gi"), cable: threeRDMA, nodes: nodes3,
+			wantBackend: jaccl, wantPath: tb, wantNodes: []string{"a", "b", "c"}, wantLinks: [][2]string{{"a", "b"}, {"a", "c"}, {"b", "c"}}},
+		{name: "auto_falls_to_ring_without_rdma_clique", model: shardSpec(3, auto, "48Gi"), cable: threeOneTCP, nodes: nodes3,
+			wantBackend: ring, wantPath: tb, wantNodes: []string{"a", "b", "c"}, wantLinks: [][2]string{{"a", "b"}, {"b", "c"}, {"a", "c"}}},
+		{name: "a_cycle_is_not_a_segment", model: shardSpec(4, ring, "48Gi"), cable: fourRing, nodes: nodes4,
+			wantBackend: ring, wantPath: nw, wantNodes: []string{"a", "b", "c", "d"}},
+		{name: "ring_any_nodes_without_cables", model: shardSpec(2, ring, "48Gi"), nodes: nodes3,
+			wantBackend: ring, wantPath: nw, wantNodes: []string{"a", "b"}},
+		{name: "ring_two_ranks_one_segment", model: shardSpec(2, ring, "48Gi"), cable: cabled(t, cable(topology.Graph{}, "b", "c", false)), nodes: nodes3,
+			wantBackend: ring, wantPath: tb, wantNodes: []string{"b", "c"}, wantLinks: [][2]string{{"b", "c"}}},
+		{name: "too_few_gpu_nodes", model: shardSpec(4, ring, "48Gi"), cable: fourRing, nodes: nodes3,
 			wantReason: mlx.ReasonNoDirectLinkTopology, wantMsg: "found 3 (a, b, c)"},
-		{name: "not_ready_node_is_not_a_candidate", model: shardSpec(3, ring, "48Gi"), graph: threeRDMA,
+		{name: "not_ready_node_is_not_a_candidate", model: shardSpec(3, ring, "48Gi"), cable: threeRDMA,
 			nodes: func() []corev1.Node {
 				ns := []corev1.Node{gpuNode("a", "64Gi", true), gpuNode("b", "64Gi", true), gpuNode("c", "64Gi", true)}
 				ns[1].Status.Conditions[0].Status = corev1.ConditionFalse
@@ -133,16 +153,16 @@ func TestPlace(t *testing.T) {
 			m := shardSpec(2, ring, "48Gi")
 			m.Spec.NodeSelector = map[string]string{mlxv1alpha1.LabelChipFamily: "m4"}
 			return m
-		}(), graph: threeRDMA, nodes: nodes3, wantReason: mlx.ReasonNoDirectLinkTopology, wantMsg: "found 0"},
-		{name: "per_rank_share_does_not_fit", model: shardSpec(2, ring, "48Gi"), graph: threeRDMA,
+		}(), cable: threeRDMA, nodes: nodes3, wantReason: mlx.ReasonNoDirectLinkTopology, wantMsg: "found 0"},
+		{name: "per_rank_share_does_not_fit", model: shardSpec(2, ring, "48Gi"), cable: threeRDMA,
 			nodes:      []corev1.Node{gpuNode("a", "16Gi", true), gpuNode("b", "64Gi", true), gpuNode("c", "16Gi", true)},
 			wantReason: mlx.ReasonInsufficientMemory, wantMsg: "1 of 3 candidate nodes have it (b)"},
-		{name: "memory_share_cannot_fund_a_context", model: shardSpec(4, ring, "1Gi"), graph: fourRing, nodes: nodes4,
+		{name: "memory_share_cannot_fund_a_context", model: shardSpec(4, ring, "1Gi"), cable: fourRing, nodes: nodes4,
 			wantReason: mlx.ReasonInsufficientMemory, wantMsg: "per-rank share"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := Place(tc.model, tc.graph, tc.nodes, nil)
+			p, err := Place(tc.model, tc.cable, tc.nodes, nil)
 			if tc.wantReason != "" {
 				var pe *PlacementError
 				if !errors.As(err, &pe) {
@@ -158,6 +178,9 @@ func TestPlace(t *testing.T) {
 			}
 			if p.Backend != tc.wantBackend {
 				t.Errorf("backend = %q, want %q", p.Backend, tc.wantBackend)
+			}
+			if p.Path() != tc.wantPath {
+				t.Errorf("path = %q, want %q", p.Path(), tc.wantPath)
 			}
 			var got []string
 			for i, r := range p.Ranks {
@@ -191,7 +214,7 @@ func withRuntime(m *mlxv1alpha1.MLXModel) *mlxv1alpha1.MLXModel {
 // TestPlaceJACCLDevicesIndexedByPeerRank pins the device matrix: entry j of
 // rank i's list is rank i's local device on the link to rank j, empty for self.
 func TestPlaceJACCLDevicesIndexedByPeerRank(t *testing.T) {
-	g := cable(cable(cable(topology.Graph{}, "a", "b", true), "b", "c", true), "a", "c", true)
+	g := cabled(t, cable(cable(cable(topology.Graph{}, "a", "b", true), "b", "c", true), "a", "c", true))
 	nodes := []corev1.Node{gpuNode("a", "64Gi", true), gpuNode("b", "64Gi", true), gpuNode("c", "64Gi", true)}
 	p, err := Place(shardSpec(3, mlxv1alpha1.MLXDistributedBackendJACCL, "48Gi"), g, nodes, nil)
 	if err != nil {

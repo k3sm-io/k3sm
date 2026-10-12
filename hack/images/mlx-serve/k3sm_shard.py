@@ -10,14 +10,20 @@ It does DNS resolution and exec, nothing else:
 
   1. reads the environment the operator rendered (MLX_RANK, MLX_WORLD_SIZE,
      K3SM_MLX_BACKEND, K3SM_MLX_PARALLELISM, K3SM_MLX_RANKS, K3SM_MLX_PORT,
-     K3SM_MLX_SERVE_PORT, and for jaccl K3SM_MLX_IBV_DEVICES_JSON);
-  2. resolves every rank's per-pod name under the model's headless Service,
-     retrying until all resolve or a bounded deadline passes (a peer's record
-     appears only once its Pod has an IP), and takes its OWN address from
-     K3SM_POD_IP when the runtime set it;
+     K3SM_MLX_SERVE_PORT, for jaccl K3SM_MLX_IBV_DEVICES_JSON, and on the
+     thunderbolt path K3SM_MLX_HOSTS);
+  2. on the network path, resolves every rank's per-pod name under the model's
+     headless Service, retrying until all resolve or a bounded deadline passes
+     (a peer's record appears only once its Pod has an IP), and takes its OWN
+     address from K3SM_POD_IP when the runtime set it. On the thunderbolt path
+     K3SM_MLX_HOSTS already names every rank's interconnect address and port
+     in rank order, so nothing is resolved; the rank refuses to start unless
+     its own entry is K3SM_INTERCONNECT_IP, the address the runtime attached
+     to it, because MLX's ring backend binds its own hostfile entry;
   3. writes MLX's rendezvous files into the pod data volume ($TMPDIR, the one
      writable path under the pod's sandbox profile) and nowhere else:
        ring:  MLX_HOSTFILE    -> [["<podIP>:<port>"], ...], one entry per rank
+              (the K3SM_MLX_HOSTS entries on the thunderbolt path)
        jaccl: MLX_IBV_DEVICES -> the per-rank RDMA device matrix, plus
               MLX_JACCL_COORDINATOR=<rank 0 podIP>:<port>;
   4. execs mlx_lm.server with --host 0.0.0.0, --port <serve port>, --pipeline
@@ -52,6 +58,8 @@ ENV_PORT = "K3SM_MLX_PORT"
 ENV_SERVE_PORT = "K3SM_MLX_SERVE_PORT"
 ENV_IBV_JSON = "K3SM_MLX_IBV_DEVICES_JSON"
 ENV_POD_IP = "K3SM_POD_IP"
+ENV_HOSTS = "K3SM_MLX_HOSTS"
+ENV_INTERCONNECT_IP = "K3SM_INTERCONNECT_IP"
 ENV_DATA_DIR = "TMPDIR"
 
 BACKEND_RING = "ring"
@@ -131,6 +139,40 @@ def _endpoint(ip, port):
     return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
 
 
+def interconnect_hosts(env, rank, world, port):
+    """The thunderbolt path's rank endpoints, or None on the network path.
+
+    K3SM_MLX_HOSTS is "<address>:<port>,..." in rank order. The rank's own entry
+    must be exactly K3SM_INTERCONNECT_IP: the ring backend binds it, and an
+    address the rank does not hold would fail at bind or, worse, listen on the
+    wrong network. Any disagreement ends the rank here, loudly.
+    """
+    raw = env.get(ENV_HOSTS, "")
+    if raw == "":
+        return None
+    hosts = [h for h in raw.split(",") if h]
+    if len(hosts) != world:
+        raise ShardError(f"{ENV_HOSTS} names {len(hosts)} ranks, {ENV_WORLD_SIZE} is {world}")
+    own = hosts[rank]
+    host, sep, own_port = own.rpartition(":")
+    if not sep or host == "" or own_port != str(port):
+        raise ShardError(f"{ENV_HOSTS} entry {own!r} for rank {rank} is not <address>:{port}")
+    mine = env.get(ENV_INTERCONNECT_IP, "")
+    if mine == "":
+        # The provider started the Pod without its slot-1 address (fallback
+        # network) and recorded why in the Pod's k3sm.io/InterconnectAttached
+        # condition. The rank must not run unattributed on another address; it
+        # ends cleanly, and the operator treats the refusal as an interconnect
+        # loss (re-place on pod IPs, or hold under fallback none).
+        raise ShardError(f"{ENV_HOSTS} is set but {ENV_INTERCONNECT_IP} is not: this rank holds no interconnect "
+                         f"address to bind its hostfile entry {own!r} on; the interconnect attach was refused "
+                         f"(see the Pod's k3sm.io/InterconnectAttached condition), exiting so the operator re-places the gang")
+    if host != mine:
+        raise ShardError(f"{ENV_HOSTS} names {host} for rank {rank}, but this rank's interconnect address "
+                         f"({ENV_INTERCONNECT_IP}) is {mine}: it would bind an address it does not hold")
+    return hosts
+
+
 def plan(env, argv, resolver=system_resolver, **resolve_opts):
     """Decide everything this rank does, without doing it.
 
@@ -155,16 +197,19 @@ def plan(env, argv, resolver=system_resolver, **resolve_opts):
         raise ShardError(f"{ENV_DATA_DIR} is unset or relative; the rendezvous files go only into the pod data volume")
     state = os.path.join(data_dir, STATE_SUBDIR)
 
-    known = {}
-    if env.get(ENV_POD_IP):
-        known[rank] = env[ENV_POD_IP]
-    ips = resolve_all(names, resolver, known=known, **resolve_opts)
+    endpoints = interconnect_hosts(env, rank, world, port)
+    if endpoints is None:
+        known = {}
+        if env.get(ENV_POD_IP):
+            known[rank] = env[ENV_POD_IP]
+        ips = resolve_all(names, resolver, known=known, **resolve_opts)
+        endpoints = [_endpoint(ip, port) for ip in ips]
 
     files = {}
     child_env = dict(env)
     if backend == BACKEND_RING:
         hostfile = os.path.join(state, HOSTFILE_NAME)
-        files[hostfile] = json.dumps([[_endpoint(ip, port)] for ip in ips])
+        files[hostfile] = json.dumps([[ep] for ep in endpoints])
         child_env["MLX_HOSTFILE"] = hostfile
     else:
         raw = _require(env, ENV_IBV_JSON)
@@ -178,7 +223,7 @@ def plan(env, argv, resolver=system_resolver, **resolve_opts):
         devices = os.path.join(state, IBV_DEVICES_NAME)
         files[devices] = json.dumps(matrix)
         child_env["MLX_IBV_DEVICES"] = devices
-        child_env["MLX_JACCL_COORDINATOR"] = _endpoint(ips[0], port)
+        child_env["MLX_JACCL_COORDINATOR"] = endpoints[0]
     child_env["MLX_RANK"] = str(rank)
     child_env["MLX_WORLD_SIZE"] = str(world)
 
@@ -239,7 +284,7 @@ def main(argv=None):
         files, child_env, child_argv = plan(env, argv)
         write_files(files)
     except ShardError as e:
-        print(f"k3sm-shard: {e}", file=sys.stderr)
+        print(f"k3sm-shard: {e}", file=sys.stderr, flush=True)
         return 2
     print(f"k3sm-shard: rank {child_env['MLX_RANK']} of {child_env['MLX_WORLD_SIZE']}, "
           f"backend {env[ENV_BACKEND]}, exec {' '.join(child_argv[1:4])}", file=sys.stderr, flush=True)

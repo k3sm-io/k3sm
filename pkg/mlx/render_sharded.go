@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -33,6 +34,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 )
 
 // Sharded render errors. Like the single-node ones, every one is returned
@@ -76,10 +78,27 @@ const (
 	// the gang was placed for. spec.distributed.backend may say auto; the Pods
 	// say what auto became.
 	AnnotationBackend = "k3sm.io/mlx-backend"
-	// AnnotationPlacedLinks records the direct links the placement counted on,
+	// AnnotationPlacedLinks records the interconnect links the placement counted on,
 	// as "nodeA/nodeB" pairs joined by commas. LinksHealthy re-checks exactly
 	// these against the live link graph.
 	AnnotationPlacedLinks = "k3sm.io/mlx-placed-links"
+	// AnnotationInterconnect records the RESOLVED collective path the gang was
+	// placed for: thunderbolt (the ranks talk over their slot-1 interconnect
+	// addresses) or network (pod IPs). spec.distributed.interconnect may say
+	// auto; the Pods say what auto became, and LinksHealthy reads it back.
+	AnnotationInterconnect = "k3sm.io/mlx-interconnect"
+	// AnnotationInterconnectFallback marks a gang placed on the network
+	// because an interconnect loss forced it there ("network"), so
+	// LinksHealthy can report it as degraded rather than as a gang that asked
+	// for the network.
+	AnnotationInterconnectFallback = "k3sm.io/mlx-interconnect-fallback"
+	// AnnotationInterconnectRestartedAt is written by the operator on the
+	// MLXModel itself (RFC 3339) when it restarts the gang over an
+	// interconnect loss. For the operator's interconnect restart limit (five minutes) after it, no placement
+	// of the model uses the interconnect. It lives on the model, not in operator
+	// memory, so the limit survives an operator restart and an HA failover
+	// (and MLXModelStatus has no interconnect field to hold it).
+	AnnotationInterconnectRestartedAt = "k3sm.io/interconnect-restarted-at"
 
 	// CollectivePort is the TCP port every rank listens on for the collective
 	// backend: the ring backend's hostfile entries and the jaccl coordinator
@@ -90,7 +109,8 @@ const (
 	CollectivePort int32 = 29500
 	// collectivePortName names the collective container port. Declared for
 	// legibility (kubectl describe, a connection table); no Service targets it,
-	// because ranks dial each other's pod IPs directly.
+	// because ranks dial each other's pod IPs (or, on the thunderbolt path,
+	// interconnect addresses) directly.
 	collectivePortName = "mlx-collective"
 
 	// shardInterpreter is the serving image's interpreter Mach-O. A rank runs
@@ -124,6 +144,7 @@ const (
 	envCollectivePort   = "K3SM_MLX_PORT"
 	envServePort        = "K3SM_MLX_SERVE_PORT"
 	envIBVDevicesJSON   = "K3SM_MLX_IBV_DEVICES_JSON"
+	envHosts            = "K3SM_MLX_HOSTS"
 	fastSynchEnabled    = "1"
 	placedLinkSeparator = ","
 )
@@ -159,20 +180,41 @@ type RankPlacement struct {
 	// rdma_enX on the up link to rank j's node, and the rank's own entry is
 	// empty. Nil for the ring backend.
 	RDMADevices []string
+	// InterconnectAddr is, on the thunderbolt path, the rank's slot-1
+	// interconnect address on its node (netv1alpha1.InterconnectSlotAddress of
+	// the node's cluster index and InterconnectSlotMLXRank): the address the
+	// provider attaches to the rank Pod and the rank binds its hostfile entry
+	// on. Invalid (the zero Addr) on the network path.
+	InterconnectAddr netip.Addr
 }
 
 // Placement is one decided placement of a sharded model: the resolved backend
-// (never auto), one entry per rank in rank order, and the direct links the
-// placement relies on.
+// (never auto), one entry per rank in rank order, the interconnect links the
+// placement relies on, and the resolved collective path.
 type Placement struct {
 	// Backend is ring or jaccl.
 	Backend mlxv1alpha1.MLXDistributedBackend
 	// Ranks are the rank placements, Ranks[i].Rank == i.
 	Ranks []RankPlacement
-	// Links are the direct links between placed nodes the backend's traffic
+	// Links are the interconnect links between placed nodes the backend's traffic
 	// rides, each as a sorted node pair. For ring, the consecutive hops that
-	// are direct links; for jaccl, every pair.
+	// are interconnect links; for jaccl, every pair. Empty on the network path.
 	Links [][2]string
+	// Interconnect is the resolved collective path: thunderbolt or network,
+	// never auto. Empty means network.
+	Interconnect mlxv1alpha1.MLXInterconnect
+	// FellBack marks a network placement forced by an interconnect loss
+	// (the restart limit), recorded on the rank Pods as
+	// AnnotationInterconnectFallback. Only valid on the network path.
+	FellBack bool
+}
+
+// Path returns the placement's resolved collective path, network when unset.
+func (p Placement) Path() mlxv1alpha1.MLXInterconnect {
+	if p.Interconnect == "" {
+		return mlxv1alpha1.MLXInterconnectNetwork
+	}
+	return p.Interconnect
 }
 
 // ShardedObjects are the API objects that serve one sharded MLXModel. Every one
@@ -325,7 +367,55 @@ func checkPlacement(m *mlxv1alpha1.MLXModel, placement Placement) error {
 			return fmt.Errorf("%w: rank %d has %d rdma devices, want %d", ErrPlacementMismatch, i, len(r.RDMADevices), n)
 		}
 	}
-	return nil
+	return checkInterconnect(placement)
+}
+
+// interconnectPrefix is the one subnet every interconnect address lies in.
+var interconnectPrefix = netip.MustParsePrefix(netv1alpha1.InterconnectCIDR)
+
+// checkInterconnect verifies the placement's path: on thunderbolt every rank
+// carries a distinct address inside the interconnect subnet, on the network
+// none does.
+func checkInterconnect(placement Placement) error {
+	if placement.FellBack && placement.Path() != mlxv1alpha1.MLXInterconnectNetwork {
+		return fmt.Errorf("%w: a fallback placement must be on the network, not %s", ErrPlacementMismatch, placement.Path())
+	}
+	switch placement.Path() {
+	case mlxv1alpha1.MLXInterconnectNetwork:
+		for i, r := range placement.Ranks {
+			if r.InterconnectAddr.IsValid() {
+				return fmt.Errorf("%w: rank %d carries interconnect address %s on the network path", ErrPlacementMismatch, i, r.InterconnectAddr)
+			}
+		}
+		return nil
+	case mlxv1alpha1.MLXInterconnectThunderbolt:
+		seen := map[netip.Addr]bool{}
+		for i, r := range placement.Ranks {
+			a := r.InterconnectAddr
+			if !a.IsValid() || !interconnectPrefix.Contains(a) || seen[a] {
+				return fmt.Errorf("%w: rank %d interconnect address %v is missing, outside %s or already used", ErrPlacementMismatch, i, a, netv1alpha1.InterconnectCIDR)
+			}
+			seen[a] = true
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: interconnect %q is not resolved to %s or %s", ErrPlacementMismatch, placement.Interconnect,
+			mlxv1alpha1.MLXInterconnectThunderbolt, mlxv1alpha1.MLXInterconnectNetwork)
+	}
+}
+
+// InterconnectHosts renders the thunderbolt path's K3SM_MLX_HOSTS value: every
+// rank's slot-1 address and the collective port, in rank order. Empty on the
+// network path, where the ranks resolve each other's pod IPs by name.
+func InterconnectHosts(placement Placement) string {
+	if placement.Path() != mlxv1alpha1.MLXInterconnectThunderbolt {
+		return ""
+	}
+	hosts := make([]string, len(placement.Ranks))
+	for i, r := range placement.Ranks {
+		hosts[i] = netip.AddrPortFrom(r.InterconnectAddr, uint16(CollectivePort)).String()
+	}
+	return strings.Join(hosts, ",")
 }
 
 // shardedServices renders the headless Service unchanged and the ClusterIP
@@ -342,11 +432,25 @@ func shardedServices(m *mlxv1alpha1.MLXModel, p prepared) (headless, clusterIP *
 // it: a link going down must not by itself restart a gang that is still
 // serving (the ring backend keeps serving over the mesh), and a gang restart
 // that IS needed re-places anyway.
+//
+// spec.distributed.interconnect is NORMALISED, not excluded: "auto" hashes as
+// the empty value. The CRD defaults the field to auto, so every model stored
+// before the field existed reads back with interconnect: auto, and hashing that
+// literally would restart every sharded gang on the upgrade. Empty and auto
+// mean the same thing, so they hash the same, exactly as the field's absence
+// hashed before. An explicit thunderbolt or network still moves the hash: like
+// any other spec edit, a changed path request re-renders the gang.
 func SpecHash(m *mlxv1alpha1.MLXModel, opts Options) (string, error) {
+	spec := m.Spec
+	if d := spec.Distributed; d != nil && d.Interconnect == mlxv1alpha1.MLXInterconnectAuto {
+		norm := *d
+		norm.Interconnect = ""
+		spec.Distributed = &norm
+	}
 	raw, err := json.Marshal(struct {
 		Spec    mlxv1alpha1.MLXModelSpec `json:"spec"`
 		Options Options                  `json:"options"`
-	}{m.Spec, opts})
+	}{spec, opts})
 	if err != nil {
 		return "", fmt.Errorf("hash spec: %w", err)
 	}
@@ -477,14 +581,10 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 	return &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Pod"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      RankPodName(m.Name, r.Rank),
-			Namespace: m.Namespace,
-			Labels:    labels,
-			Annotations: map[string]string{
-				AnnotationSpecHash:    hash,
-				AnnotationBackend:     string(placement.Backend),
-				AnnotationPlacedLinks: FormatPlacedLinks(placement.Links),
-			},
+			Name:            RankPodName(m.Name, r.Rank),
+			Namespace:       m.Namespace,
+			Labels:          labels,
+			Annotations:     rankAnnotations(placement, hash),
 			OwnerReferences: []metav1.OwnerReference{p.owner},
 		},
 		Spec: corev1.PodSpec{
@@ -505,6 +605,26 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 			Volumes:       volumes,
 		},
 	}
+}
+
+// rankAnnotations builds a rank Pod's annotations. On the thunderbolt path the
+// Pod also opts into the thunderbolt Interconnect, which is what makes the
+// provider attach the node's slot-1 address to it (the Pod's controller
+// ownerReference to this model is what earns slot 1).
+func rankAnnotations(placement Placement, hash string) map[string]string {
+	a := map[string]string{
+		AnnotationSpecHash:     hash,
+		AnnotationBackend:      string(placement.Backend),
+		AnnotationPlacedLinks:  FormatPlacedLinks(placement.Links),
+		AnnotationInterconnect: string(placement.Path()),
+	}
+	if placement.Path() == mlxv1alpha1.MLXInterconnectThunderbolt {
+		a[netv1alpha1.AnnotationInterconnects] = netv1alpha1.MediumThunderbolt
+	}
+	if placement.FellBack {
+		a[AnnotationInterconnectFallback] = string(mlxv1alpha1.MLXInterconnectNetwork)
+	}
+	return a
 }
 
 // rankEnv builds the per-rank environment the k3sm-shard entrypoint reads.
@@ -530,6 +650,12 @@ func rankEnv(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 	}
 	if ibv != "" {
 		env = append(env, corev1.EnvVar{Name: envIBVDevicesJSON, Value: ibv})
+	}
+	// On the thunderbolt path the entrypoint writes the hostfile from these
+	// addresses directly (no DNS), and refuses to start unless its own entry is
+	// the interconnect address the provider attached (K3SM_INTERCONNECT_IP).
+	if hosts := InterconnectHosts(placement); hosts != "" {
+		env = append(env, corev1.EnvVar{Name: envHosts, Value: hosts})
 	}
 	return env
 }

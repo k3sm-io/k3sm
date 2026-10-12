@@ -70,12 +70,28 @@ limitations under the License.
 // # Sharded models
 //
 // A model with spec.distributed takes a different path (sharded.go): its fit is
-// checked per rank, its ranks are placed over the direct-link graph (Place, a
-// pure function over a consumer-defined Topology), and it is served by one
+// checked per rank, its collective path is resolved from
+// spec.distributed.interconnect over the thunderbolt Interconnect's segments
+// (Place, a pure function over a Cable), and it is served by one
 // operator-owned Pod per rank instead of a StatefulSet. Rank Pods are a GANG:
 // losing any one deletes the rest and re-places all of them, because MLX's
 // collective init blocks on every rank and a partial gang can never serve.
-// ShardsPlaced and LinksHealthy sit beside Ready, which needs every rank.
+// ShardsPlaced and LinksHealthy sit beside Ready, which needs every rank. A gang
+// on the thunderbolt path that loses a segment member is re-rendered on pod IPs
+// (fallback network) or held (fallback none); a rank that
+// cannot use the interconnect (attach refused, k3sm-shard's exit 2, or a
+// failure before any attach) counts as the same loss. The restart time is
+// recorded on the MLXModel (k3sm.io/interconnect-restarted-at), and for five
+// minutes after it the model stays on the network, so there is at most one
+// interconnect-driven restart per model per five minutes, across operator
+// restarts and failovers. Such a gang reports LinksHealthy=DegradedToNetwork. A
+// gang on the network is never restarted because the cable came back.
+//
+// The path in use is the k3sm.io/mlx-interconnect annotation on every rank Pod
+// and is named in the ShardsPlaced message ("ring over thunderbolt"). The plan's
+// status.interconnect field is deferred: MLXModelStatus in k3sm.io/apis has no
+// such field, and the CRD's structural schema would prune it, so it is an apis
+// addition still to make.
 //
 // # What this package deliberately does not do
 //

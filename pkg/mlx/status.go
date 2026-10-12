@@ -271,7 +271,7 @@ func PhaseFromConditions(conds []metav1.Condition) mlxv1alpha1.MLXModelPhase {
 		return mlxv1alpha1.MLXModelPhaseReady
 	}
 	switch c.Reason {
-	case ReasonPending, ReasonScaledToZero, ReasonNoDirectLinkTopology, ReasonInsufficientMemory, ReasonInsufficientGPU:
+	case ReasonPending, ReasonScaledToZero, ReasonNoDirectLinkTopology, ReasonNoInterconnectSegment, ReasonInsufficientMemory, ReasonInsufficientGPU:
 		// The sharded placement refusals read as Pending, not Failed: the
 		// operator re-places on its own when nodes or cables appear, so the
 		// model is waiting on the cluster, not dead.

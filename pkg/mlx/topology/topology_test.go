@@ -38,11 +38,7 @@ func link(g Graph, a, b string, rdma bool) Graph {
 		if g.Edges[x] == nil {
 			g.Edges[x] = map[string]Edge{}
 		}
-		g.Edges[x][y] = Edge{
-			LocalIface: "en" + x, LocalRDMA: dev(x),
-			PeerIface: "en" + y, PeerRDMA: dev(y),
-			SpeedGbps: 40,
-		}
+		g.Edges[x][y] = Edge{LocalRDMA: dev(x), PeerRDMA: dev(y)}
 	}
 	add(a, b)
 	add(b, a)
@@ -57,7 +53,7 @@ func TestGraphSearches(t *testing.T) {
 	// A 4-cycle a-b-c-d-a with no chords: a ring of 4, no clique of 3 or 4.
 	fourRing := link(link(link(link(Graph{}, "a", "b", false), "b", "c", false), "c", "d", false), "d", "a", false)
 	// One direction only: not an edge.
-	oneWay := Graph{Edges: map[string]map[string]Edge{"a": {"b": {LocalIface: "en1"}}}}
+	oneWay := Graph{Edges: map[string]map[string]Edge{"a": {"b": {Segment: "seg-0"}}}}
 
 	cases := []struct {
 		name        string
@@ -118,62 +114,56 @@ func TestRingIsDeterministic(t *testing.T) {
 	}
 }
 
-// directLink builds one node's DirectLink with the given spec ports and
-// resolved status ports.
-func directLink(node string, spec []netv1alpha1.DirectLinkPort, status []netv1alpha1.DirectLinkPortStatus) netv1alpha1.DirectLink {
-	dl := netv1alpha1.DirectLink{}
-	dl.Name = node
-	dl.Spec = netv1alpha1.DirectLinkSpec{SchemaVersion: 1, NodeName: node, Medium: netv1alpha1.MediumThunderbolt, Ports: spec}
-	dl.Status = netv1alpha1.DirectLinkStatus{Ports: status}
-	return dl
+// member is one Interconnect status member.
+func member(node string, state netv1alpha1.InterconnectMemberState, segment string) netv1alpha1.InterconnectMember {
+	return netv1alpha1.InterconnectMember{Node: node, State: state, Segment: segment}
 }
 
-// TestFromDirectLinks pins the status-to-graph join: only up ports with a named
-// peer become edges, the local end comes from the spec port of the same
-// interface, a one-sided up is dropped, and parallel cables resolve to the
-// fastest.
-func TestFromDirectLinks(t *testing.T) {
-	up := netv1alpha1.DirectLinkStateUp
-	links := []netv1alpha1.DirectLink{
-		directLink("studio",
-			[]netv1alpha1.DirectLinkPort{
-				{Iface: "en2", DomainUUID: "s2", PeerDomainUUID: "b1", SpeedGbps: 40, RDMADevice: "rdma_en2", LinkIP: "169.254.0.2"},
-				{Iface: "en3", DomainUUID: "s3", PeerDomainUUID: "b2", SpeedGbps: 20, LinkIP: "169.254.0.3"},
-				{Iface: "en4", DomainUUID: "s4", PeerDomainUUID: "x1", SpeedGbps: 40},
-				{Iface: "en5", DomainUUID: "s5", PeerDomainUUID: "c1", SpeedGbps: 40},
-			},
-			[]netv1alpha1.DirectLinkPortStatus{
-				{Iface: "en2", PeerNodeName: "book", PeerIface: "en1", PeerLinkIP: "169.254.255.1", PeerRDMADevice: "rdma_en1", State: up},
-				{Iface: "en3", PeerNodeName: "book", PeerIface: "en7", PeerLinkIP: "169.254.255.7", State: up},
-				{Iface: "en4", State: netv1alpha1.DirectLinkStatePeerUnknown},
-				{Iface: "en5", PeerNodeName: "mini", PeerIface: "en1", State: up},
-			}),
-		directLink("book",
-			[]netv1alpha1.DirectLinkPort{
-				{Iface: "en1", DomainUUID: "b1", PeerDomainUUID: "s2", SpeedGbps: 40, RDMADevice: "rdma_en1", LinkIP: "169.254.255.1"},
-				{Iface: "en7", DomainUUID: "b2", PeerDomainUUID: "s3", SpeedGbps: 20, LinkIP: "169.254.255.7"},
-			},
-			[]netv1alpha1.DirectLinkPortStatus{
-				{Iface: "en1", PeerNodeName: "studio", PeerIface: "en2", PeerLinkIP: "169.254.0.2", PeerRDMADevice: "rdma_en2", State: up},
-				{Iface: "en7", PeerNodeName: "studio", PeerIface: "en3", PeerLinkIP: "169.254.0.3", State: netv1alpha1.DirectLinkStateDown},
-			}),
-		// mini reports its side down, so studio->mini is one-sided and dropped.
-		directLink("mini",
-			[]netv1alpha1.DirectLinkPort{{Iface: "en1", DomainUUID: "c1", PeerDomainUUID: "s5"}},
-			[]netv1alpha1.DirectLinkPortStatus{{Iface: "en1", PeerNodeName: "studio", State: netv1alpha1.DirectLinkStateDown}}),
+// TestFromInterconnect pins the status-to-graph join: members up in one
+// segment form a clique, two segments never join, and a down, looped,
+// unsegmented, excluded or repeated member joins nothing; a nil or disabled
+// Interconnect has no links.
+func TestFromInterconnect(t *testing.T) {
+	up, down, loop := netv1alpha1.InterconnectMemberUp, netv1alpha1.InterconnectMemberDown, netv1alpha1.InterconnectMemberLoop
+	ic := &netv1alpha1.Interconnect{
+		Spec: netv1alpha1.InterconnectSpec{Medium: netv1alpha1.MediumThunderbolt, Enabled: true, ExcludedNodes: []string{"banned"}},
+		Status: netv1alpha1.InterconnectStatus{Members: []netv1alpha1.InterconnectMember{
+			member("a", up, "seg-0"), member("b", up, "seg-0"), member("c", up, "seg-0"),
+			member("x", up, "seg-1"), member("y", up, "seg-1"),
+			member("dead", down, "seg-0"), member("looped", loop, "seg-0"), member("lonely", up, ""),
+			member("banned", up, "seg-0"),
+			// A repeated node keeps its first entry and never bridges seg-0 to seg-1.
+			member("a", up, "seg-1"),
+		}},
 	}
-	g := FromDirectLinks(links)
-	want := Graph{Edges: map[string]map[string]Edge{
-		"studio": {"book": {LocalIface: "en2", LocalRDMA: "rdma_en2", LocalIP: "169.254.0.2", PeerIface: "en1", PeerRDMA: "rdma_en1", PeerIP: "169.254.255.1", SpeedGbps: 40}},
-		"book":   {"studio": {LocalIface: "en1", LocalRDMA: "rdma_en1", LocalIP: "169.254.255.1", PeerIface: "en2", PeerRDMA: "rdma_en2", PeerIP: "169.254.0.2", SpeedGbps: 40}},
-	}}
-	if !reflect.DeepEqual(g, want) {
-		t.Errorf("FromDirectLinks() =\n%#v\nwant\n%#v", g, want)
+	g := FromInterconnect(ic)
+	if got, want := g.Nodes(), []string{"a", "b", "c", "x", "y"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Nodes() = %v, want %v", got, want)
 	}
-	if got := g.Clique(2, true); !reflect.DeepEqual(got, [][]string{{"book", "studio"}}) {
-		t.Errorf("Clique(2, rdma) = %v, want [[book studio]]", got)
+	if got, want := g.Clique(3, false), [][]string{{"a", "b", "c"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Clique(3) = %v, want %v", got, want)
 	}
-	if got := FromDirectLinks(nil); len(got.Edges) != 0 {
-		t.Errorf("FromDirectLinks(nil) has %d nodes, want 0", len(got.Edges))
+	if got, want := g.Clique(2, false), [][]string{{"a", "b"}, {"a", "c"}, {"b", "c"}, {"x", "y"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Clique(2) = %v, want %v", got, want)
+	}
+	if got, want := g.Ring(3), [][]string{{"a", "b", "c"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Ring(3) = %v, want %v (a segment is a clique)", got, want)
+	}
+	if e, ok := g.Edge("a", "c"); !ok || e.Segment != "seg-0" || e.RDMA() {
+		t.Errorf("edge a->c = %+v, %v; want seg-0 without rdma", e, ok)
+	}
+	if _, ok := g.Edge("a", "x"); ok {
+		t.Error("two segments are joined")
+	}
+	if got := g.Clique(2, true); got != nil {
+		t.Errorf("Clique(2, rdma) = %v; the interconnect carries no rdma device", got)
+	}
+
+	disabled := ic.DeepCopy()
+	disabled.Spec.Enabled = false
+	for name, in := range map[string]*netv1alpha1.Interconnect{"nil": nil, "disabled": disabled} {
+		if got := FromInterconnect(in); len(got.Edges) != 0 {
+			t.Errorf("FromInterconnect(%s) has %d nodes, want 0", name, len(got.Edges))
+		}
 	}
 }

@@ -17,8 +17,8 @@ limitations under the License.
 package operator
 
 import (
-	"context"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 
@@ -39,24 +39,25 @@ type Placement = mlx.Placement
 // RankPlacement is where one rank runs (see mlx.RankPlacement).
 type RankPlacement = mlx.RankPlacement
 
-// Topology supplies the direct-link graph placement and LinksHealthy read. It
-// is defined here, at the consumer, so the controller's tests hand it a fake
-// graph; the production source lists the resolver-written DirectLink objects.
-type Topology interface {
-	// Graph returns the current up-link graph. An empty graph is a valid
-	// answer (no cables), never an error.
-	Graph(ctx context.Context) (topology.Graph, error)
-}
-
-// TopologyFunc adapts a plain function to Topology.
-type TopologyFunc func(ctx context.Context) (topology.Graph, error)
-
-// Graph calls f.
-func (f TopologyFunc) Graph(ctx context.Context) (topology.Graph, error) { return f(ctx) }
-
-// StaticTopology returns a Topology that always reports g.
-func StaticTopology(g topology.Graph) Topology {
-	return TopologyFunc(func(context.Context) (topology.Graph, error) { return g, nil })
+// Cable is what interconnect path selection reads: the up-link graph of the
+// thunderbolt Interconnect and every node's slot-1 interconnect address. The
+// controller builds it from the Interconnect object and the node cluster
+// indices; a test builds it by hand.
+type Cable struct {
+	// Graph is topology.FromInterconnect over the thunderbolt Interconnect:
+	// every segment a clique of its up members. Empty when no Interconnect
+	// exists or it is not enabled.
+	Graph topology.Graph
+	// Addresses maps a node to its slot-1 interconnect address
+	// (netv1alpha1.InterconnectSlotAddress of the node's cluster index and
+	// InterconnectSlotMLXRank). A node absent here has no interconnect address
+	// (no cluster index, or one beyond the ceiling) and is never placed on the
+	// thunderbolt path.
+	Addresses map[string]netip.Addr
+	// ForceNetwork places on the network whatever spec.distributed.interconnect
+	// asks, and marks the placement FellBack. The controller sets it while the
+	// model's interconnect restart limit runs (plan I10).
+	ForceNetwork bool
 }
 
 // PlacementError is a placement that could not be made. It is a STATUS, not a
@@ -66,8 +67,8 @@ func StaticTopology(g topology.Graph) Topology {
 // a single-node fallback: a sharding request served on one node would look
 // like success.
 type PlacementError struct {
-	// Reason is mlx.ReasonNoDirectLinkTopology, mlx.ReasonInsufficientGPU or
-	// mlx.ReasonInsufficientMemory.
+	// Reason is mlx.ReasonNoDirectLinkTopology, mlx.ReasonNoInterconnectSegment,
+	// mlx.ReasonInsufficientGPU or mlx.ReasonInsufficientMemory.
 	Reason string
 	// Message names what was missing.
 	Message string
@@ -76,9 +77,10 @@ type PlacementError struct {
 // Error returns the message prefixed by the reason.
 func (e *PlacementError) Error() string { return e.Reason + ": " + e.Message }
 
-// Place decides where a sharded model's ranks run. It is pure: the graph, the
-// nodes and the held GPU slots are inputs, nothing is read or written, and the
-// same inputs always give the same placement.
+// Place decides where a sharded model's ranks run and over which path they
+// talk. It is pure: the cable, the nodes and the held GPU slots are inputs,
+// nothing is read or written, and the same inputs always give the same
+// placement.
 //
 // held is the number of mlx.k3sm.io/gpu units already requested on each node by
 // pods that are not this model's own ranks (see HeldGPUSlots); a missing node
@@ -100,17 +102,27 @@ func (e *PlacementError) Error() string { return e.Reason + ": " + e.Message }
 //     nodes.
 //   - Fewer than ranks free candidates whose allocatable memory holds the
 //     per-rank share is InsufficientMemory.
+//   - The path comes from spec.distributed.interconnect (plan §4). network
+//     places on pod IPs over the cluster network and reads no cable.
+//     thunderbolt needs ONE segment of the thunderbolt Interconnect holding
+//     ranks fitting nodes that have an interconnect address, else
+//     NoInterconnectSegment. auto (the default) is thunderbolt when such a
+//     segment exists, else network. Cable.ForceNetwork overrides all three.
+//   - On the thunderbolt path the ranks go to fitting nodes of one segment and
+//     each rank carries its node's slot-1 address; the backend is chosen
+//     over the segment graph. On the network path the graph is empty.
 //   - jaccl needs a CLIQUE of ranks fitting nodes, every one labelled
-//     k3sm.io/rdma, with RDMA at both ends of every link.
-//   - ring prefers a CYCLE of ranks fitting nodes in the cable graph, so every
-//     hop is a direct route; failing that it takes the first ranks fitting
-//     nodes by name, and the hops without a cable ride the mesh.
+//     k3sm.io/rdma, with RDMA at both ends of every link. The Interconnect
+//     carries no RDMA device, so jaccl waits on the rig answer to whether RDMA
+//     enumerates on bridged ports.
+//   - ring takes a CYCLE of ranks nodes in the graph (on a segment, the first
+//     by name); on the network path, the first ranks fitting nodes by name.
 //   - auto is jaccl when a jaccl placement exists, else ring.
 //
 // Among equal choices the lexicographically first wins (the topology searches
 // are ordered), so a gang restart over an unchanged cluster lands every rank
 // where it was.
-func Place(model *mlxv1alpha1.MLXModel, graph topology.Graph, nodes []corev1.Node, held map[string]int64) (Placement, error) {
+func Place(model *mlxv1alpha1.MLXModel, cable Cable, nodes []corev1.Node, held map[string]int64) (Placement, error) {
 	d := model.Spec.Distributed
 	if d == nil || d.Ranks < 2 {
 		return Placement{}, &PlacementError{Reason: mlx.ReasonNoDirectLinkTopology, Message: "spec.distributed.ranks must be at least 2"}
@@ -170,7 +182,48 @@ func Place(model *mlxv1alpha1.MLXModel, graph topology.Graph, nodes []corev1.Nod
 		}
 	}
 
-	switch d.Backend {
+	want := d.Interconnect
+	if cable.ForceNetwork && want != mlxv1alpha1.MLXInterconnectNetwork {
+		p, err := placeBackend(d.Backend, topology.Graph{}, fitting, byName, n)
+		p.FellBack = err == nil
+		return p, err
+	}
+	if want == mlxv1alpha1.MLXInterconnectNetwork {
+		return placeBackend(d.Backend, topology.Graph{}, fitting, byName, n)
+	}
+	// thunderbolt or auto (and the empty value the CRD defaults to auto): look
+	// for one segment holding every rank.
+	var addressed []string
+	for _, name := range fitting {
+		if _, ok := cable.Addresses[name]; ok {
+			addressed = append(addressed, name)
+		}
+	}
+	if !hasSegment(cable.Graph, addressed, n) {
+		if want == mlxv1alpha1.MLXInterconnectThunderbolt {
+			return Placement{}, &PlacementError{
+				Reason: mlx.ReasonNoInterconnectSegment,
+				Message: fmt.Sprintf("interconnect thunderbolt: %d ranks need %d fitting nodes up in one segment of the %s Interconnect, each with an interconnect address; nodes sharing an up segment%s; fitting nodes with an address%s",
+					n, n, netv1alpha1.MediumThunderbolt, nameListOrNone(cable.Graph.Nodes()), nameListOrNone(addressed)),
+			}
+		}
+		return placeBackend(d.Backend, topology.Graph{}, fitting, byName, n)
+	}
+	p, err := placeBackend(d.Backend, cable.Graph, addressed, byName, n)
+	if err != nil {
+		return Placement{}, err
+	}
+	p.Interconnect = mlxv1alpha1.MLXInterconnectThunderbolt
+	for i := range p.Ranks {
+		p.Ranks[i].InterconnectAddr = cable.Addresses[p.Ranks[i].Node]
+	}
+	return p, nil
+}
+
+// placeBackend resolves the backend over graph and the candidate nodes. The
+// placement's path is left unset (network); the thunderbolt caller marks it.
+func placeBackend(backend mlxv1alpha1.MLXDistributedBackend, graph topology.Graph, fitting []string, byName map[string]*corev1.Node, n int) (Placement, error) {
+	switch backend {
 	case mlxv1alpha1.MLXDistributedBackendJACCL:
 		return placeJACCL(graph, fitting, byName, n)
 	case mlxv1alpha1.MLXDistributedBackendRing:
@@ -181,6 +234,17 @@ func Place(model *mlxv1alpha1.MLXModel, graph topology.Graph, nodes []corev1.Nod
 		}
 		return placeRing(graph, fitting, n), nil
 	}
+}
+
+// hasSegment reports whether n of the candidate nodes are pairwise joined in
+// graph: on an interconnect graph, up together in one segment.
+func hasSegment(graph topology.Graph, candidates []string, n int) bool {
+	for _, clique := range graph.Clique(n, false) {
+		if subset(clique, candidates) {
+			return true
+		}
+	}
+	return false
 }
 
 // placeJACCL finds the first RDMA clique of n fitting nodes that all carry the
@@ -221,7 +285,8 @@ func placeJACCL(graph topology.Graph, fitting []string, byName map[string]*corev
 }
 
 // placeRing takes the first cycle of n fitting nodes, else the first n fitting
-// nodes by name. It cannot fail: Place has already checked there are n.
+// nodes by name. It cannot fail: Place has already checked there are n. On the
+// network path graph is empty, so it is always the first n by name.
 func placeRing(graph topology.Graph, fitting []string, n int) Placement {
 	order := fitting[:n]
 	for _, cycle := range graph.Ring(n) {
@@ -357,4 +422,12 @@ func nameList(names []string) string {
 		return ""
 	}
 	return " (" + strings.Join(names, ", ") + ")"
+}
+
+// nameListOrNone is nameList, with an empty list rendered as " (none)".
+func nameListOrNone(names []string) string {
+	if len(names) == 0 {
+		return " (none)"
+	}
+	return nameList(names)
 }

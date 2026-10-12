@@ -433,6 +433,23 @@ try:
 except ks.ShardError as e:
     check("resolve.bounded  a peer that never resolves ends the rank", "nope.svc" in str(e))
 
+# thunderbolt path: K3SM_MLX_HOSTS is the hostfile, no lookup, own entry == K3SM_INTERCONNECT_IP
+tb_hosts = "169.254.0.2:29500,169.254.0.10:29500"
+def no_lookup(name):
+    raise AssertionError("the thunderbolt path resolved " + name)
+files, cenv, _ = ks.plan(env(K3SM_MLX_HOSTS=tb_hosts, K3SM_INTERCONNECT_IP="169.254.0.10"), [], resolver=no_lookup)
+check("tb.hostfile  K3SM_MLX_HOSTS becomes the hostfile in rank order, with no name lookup",
+      json.loads(next(iter(files.values()))) == [["169.254.0.2:29500"], ["169.254.0.10:29500"]])
+for label, e in (("tb.mismatch  refuses an own entry that is not K3SM_INTERCONNECT_IP",
+                  env(K3SM_MLX_HOSTS=tb_hosts, K3SM_INTERCONNECT_IP="169.254.0.18")),
+                 ("tb.unattached  refuses K3SM_MLX_HOSTS without K3SM_INTERCONNECT_IP",
+                  env(K3SM_MLX_HOSTS=tb_hosts))):
+    try:
+        ks.plan(e, [], resolver=no_lookup)
+        check(label, False)
+    except ks.ShardError:
+        check(label, True)
+
 # refusals: no pod data volume, a rank list that disagrees with the world size
 for label, e in (("nodatavolume  refuses to write anywhere but the pod data volume", env(TMPDIR=None)),
                  ("worldsize  refuses a rank list that disagrees with MLX_WORLD_SIZE", env(MLX_WORLD_SIZE="3"))):
@@ -480,10 +497,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 16 ]; then
+if [ "$SHARD_CHECKS" -ge 19 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 16 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 19 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 

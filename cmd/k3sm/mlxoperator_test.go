@@ -27,6 +27,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 
+	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
@@ -57,10 +58,19 @@ func TestServerMLXOperatorConfigWiresALiveGPUSource(t *testing.T) {
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{{Group: "mlx.k3sm.io", Version: "v1alpha1", Resource: "mlxmodels"}: "MLXModelList"})
 
-	cfg := mlxOperatorConfig(fake.NewClientset(), dyn, nil, gpu, "cluster.local", log)
+	indices := meshPeerIndexSet(func(context.Context) ([]netv1.MeshPeerSpec, error) {
+		return []netv1.MeshPeerSpec{{NodeName: "mac-b", PodCIDR: "100.64.1.0/24"}}, nil
+	})
+	cfg := mlxOperatorConfig(fake.NewClientset(), dyn, nil, gpu, indices, "cluster.local", log)
 
 	if cfg.GPU == nil {
 		t.Fatal("the server path's MLX operator Config carries no GPU source; the pre-render fit check would be skipped in production")
+	}
+	if cfg.InterconnectIndices == nil {
+		t.Fatal("the server path's MLX operator Config carries no interconnect index source; no model would ever use the thunderbolt path")
+	}
+	if got, err := cfg.InterconnectIndices(t.Context()); err != nil || got.Index["mac-b"] != 1 {
+		t.Errorf("InterconnectIndices = %+v, %v; want mac-b at index 1 from its pod /24", got, err)
 	}
 	if cfg.Client == nil || cfg.Dynamic == nil {
 		t.Fatal("the Config is missing a required client")
