@@ -54,7 +54,7 @@ const icNetstat = `Routing tables
 
 Internet:
 Destination        Gateway            Flags               Netif Expire
-default            192.168.0.1        UGScg                 en0
+default            192.0.2.1          UGScg                 en0
 169.254            link#30            UCS               bridge0      !
 169.254.0/24       link#30            UCS               bridge0      !
 169.254.0.1        36:a1:2b:0:0:2     UHLWIi            bridge0   1190
@@ -70,7 +70,7 @@ func icNodeCIDR(t *testing.T) netip.Prefix {
 	return p
 }
 
-// healthyIC is a cabled worker-to-studio node, armed, with one MLX rank pod
+// healthyIC is a cabled node cabled to one peer, armed, with one MLX rank pod
 // attached: every row passes. Each case overrides the one seam under test.
 func healthyIC(t *testing.T) *interconnectEnv {
 	t.Helper()
@@ -78,7 +78,7 @@ func healthyIC(t *testing.T) *interconnectEnv {
 	return &interconnectEnv{
 		ports: func() ([]linkenum.Port, error) {
 			return []linkenum.Port{
-				{Iface: "en1", PortOrdinal: 0, DomainUUID: "local-1", PeerDomainUUID: "studio-3", SpeedGbps: 40},
+				{Iface: "en1", PortOrdinal: 0, DomainUUID: "local-1", PeerDomainUUID: "peer-3", SpeedGbps: 40},
 				{Iface: "en2", PortOrdinal: 1, DomainUUID: "local-2"},
 			}, nil
 		},
@@ -100,13 +100,13 @@ func healthyIC(t *testing.T) *interconnectEnv {
 		},
 		identity: func() (netip.Prefix, error) { return cidr, nil },
 		cluster: func() (icCluster, error) {
-			return icCluster{Node: "mikobook", Desired: true, MemberState: netv1alpha1.InterconnectMemberUp,
-				Pods: []status.InterconnectPod{{Namespace: "mlx", Pod: "llama-1", Node: "mikobook", Address: "169.254.0.10"}}}, nil
+			return icCluster{Node: "node-b", Desired: true, MemberState: netv1alpha1.InterconnectMemberUp,
+				Pods: []status.InterconnectPod{{Namespace: "mlx", Pod: "llama-1", Node: "node-b", Address: "169.254.0.10"}}}, nil
 		},
 		power: func() (powerSettings, error) {
 			return parsePmset(" sleep                0\n displaysleep         10\n autorestart          1\n"), nil
 		},
-		autoLogin: func() (string, error) { return "miko", nil },
+		autoLogin: func() (string, error) { return "admin", nil },
 	}
 }
 
@@ -208,7 +208,7 @@ func TestDoctorInterconnectSection(t *testing.T) {
 		// The same absence on a node that is not an armed member is the
 		// default, not a fault.
 		ic.ledger = func() ([]install.InterconnectAlias, error) { return nil, nil }
-		ic.cluster = func() (icCluster, error) { return icCluster{Node: "mikobook"}, nil }
+		ic.cluster = func() (icCluster, error) { return icCluster{Node: "node-b"}, nil }
 		_, by = icRows(t, ic, install.RoleAgent)
 		if r := mustRow(t, by, icAddress); r.status != statusSkip {
 			t.Errorf("an unarmed node's address row = %v %q, want SKIP", r.status, r.detail)
@@ -232,8 +232,8 @@ func TestDoctorInterconnectSection(t *testing.T) {
 		ic.identity = func() (netip.Prefix, error) { return podnet.NodeCIDR(podnet.ClusterPodCIDR, 31) }
 		_, by := icRows(t, ic, install.RoleAgent)
 		r := mustRow(t, by, icAddress)
-		if r.status != statusWarn || !strings.Contains(r.detail, "cluster index is 31, above 30") || !strings.Contains(r.remedy, `"excludedNodes":["mikobook"]`) {
-			t.Errorf("address = %v %q (remedy %q), want WARN naming index 31 and excluding mikobook", r.status, r.detail, r.remedy)
+		if r.status != statusWarn || !strings.Contains(r.detail, "cluster index is 31, above 30") || !strings.Contains(r.remedy, `"excludedNodes":["node-b"]`) {
+			t.Errorf("address = %v %q (remedy %q), want WARN naming index 31 and excluding node-b", r.status, r.detail, r.remedy)
 		}
 	})
 
@@ -312,8 +312,8 @@ func TestDoctorInterconnectSection(t *testing.T) {
 		ic := healthyIC(t)
 		ic.ports = func() ([]linkenum.Port, error) {
 			return []linkenum.Port{
-				{Iface: "en1", PortOrdinal: 0, DomainUUID: "local-1", PeerDomainUUID: "studio-3"},
-				{Iface: "en2", PortOrdinal: 1, DomainUUID: "local-2", PeerDomainUUID: "studio-3"},
+				{Iface: "en1", PortOrdinal: 0, DomainUUID: "local-1", PeerDomainUUID: "peer-3"},
+				{Iface: "en2", PortOrdinal: 1, DomainUUID: "local-2", PeerDomainUUID: "peer-3"},
 			}, nil
 		}
 		_, by := icRows(t, ic, install.RoleAgent)
@@ -324,7 +324,7 @@ func TestDoctorInterconnectSection(t *testing.T) {
 
 		ic = healthyIC(t)
 		ic.cluster = func() (icCluster, error) {
-			return icCluster{Node: "mikobook", Desired: true, MemberState: netv1alpha1.InterconnectMemberLoop}, nil
+			return icCluster{Node: "node-b", Desired: true, MemberState: netv1alpha1.InterconnectMemberLoop}, nil
 		}
 		_, by = icRows(t, ic, install.RoleAgent)
 		if r := mustRow(t, by, icLoop); r.status != statusWarn || !strings.Contains(r.detail, "server marked this node a loop member") {
@@ -336,9 +336,9 @@ func TestDoctorInterconnectSection(t *testing.T) {
 		for _, tc := range []struct {
 			name, row, pmset, user, remedy string
 		}{
-			{"idle sleep", icSleep, " sleep                10\n autorestart          1\n", "miko", "sudo pmset -a sleep 0"},
+			{"idle sleep", icSleep, " sleep                10\n autorestart          1\n", "admin", "sudo pmset -a sleep 0"},
 			{"auto-login", icAutoLogin, " sleep                0\n autorestart          1\n", "", "Automatically log in as"},
-			{"start after power failure", icPower, " sleep                0\n autorestart          0\n", "miko", "sudo pmset -a autorestart 1"},
+			{"start after power failure", icPower, " sleep                0\n autorestart          0\n", "admin", "sudo pmset -a autorestart 1"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				ic := healthyIC(t)

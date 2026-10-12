@@ -158,12 +158,12 @@ func TestStatusInterconnectRow(t *testing.T) {
 	t.Run("armed with members and pods", func(t *testing.T) {
 		ic := armedInterconnect(
 			netv1alpha1.InterconnectMember{Node: "k3sm-mac", Index: 0, Address: "169.254.0.1", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
-			netv1alpha1.InterconnectMember{Node: "studio", Index: 1, Address: "169.254.0.9", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
+			netv1alpha1.InterconnectMember{Node: "node-a", Index: 1, Address: "169.254.0.9", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
 		)
 		pods := []corev1.Pod{
 			icPod("mlx", "llama-0", "k3sm-mac", "169.254.0.2"),
-			icPod("mlx", "llama-1", "studio", "169.254.0.10"),
-			icPod("default", "bench", "studio", "169.254.0.11"),
+			icPod("mlx", "llama-1", "node-a", "169.254.0.10"),
+			icPod("default", "bench", "node-a", "169.254.0.11"),
 			// Not attached: no condition, and a False one.
 			{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}, Spec: corev1.PodSpec{NodeName: "k3sm-mac"}},
 			func() corev1.Pod {
@@ -185,9 +185,9 @@ func TestStatusInterconnectRow(t *testing.T) {
 			t.Errorf("detail = %q, want %q", row.Detail, want)
 		}
 		wantPods := []status.InterconnectPod{
-			{Namespace: "default", Pod: "bench", Node: "studio", Address: "169.254.0.11"},
+			{Namespace: "default", Pod: "bench", Node: "node-a", Address: "169.254.0.11"},
 			{Namespace: "mlx", Pod: "llama-0", Node: "k3sm-mac", Address: "169.254.0.2"},
-			{Namespace: "mlx", Pod: "llama-1", Node: "studio", Address: "169.254.0.10"},
+			{Namespace: "mlx", Pod: "llama-1", Node: "node-a", Address: "169.254.0.10"},
 		}
 		want := &status.Interconnect{Name: "thunderbolt", Armed: true, ArmedBy: "alice", Plaintext: true, Members: 2, Up: 2, Segments: 1, Pods: wantPods}
 		if !reflect.DeepEqual(rep.Interconnect, want) {
@@ -220,7 +220,7 @@ func TestStatusInterconnectRow(t *testing.T) {
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			t.Fatal(err)
 		}
-		if !doc.Interconnect.Plaintext || len(doc.Interconnect.Pods) != 3 || doc.Interconnect.Pods[0]["address"] != "169.254.0.11" || doc.Interconnect.Pods[0]["node"] != "studio" {
+		if !doc.Interconnect.Plaintext || len(doc.Interconnect.Pods) != 3 || doc.Interconnect.Pods[0]["address"] != "169.254.0.11" || doc.Interconnect.Pods[0]["node"] != "node-a" {
 			t.Errorf("JSON interconnect block = %s", raw)
 		}
 	})
@@ -228,7 +228,7 @@ func TestStatusInterconnectRow(t *testing.T) {
 	t.Run("an out-of-range node", func(t *testing.T) {
 		ic := armedInterconnect(
 			netv1alpha1.InterconnectMember{Node: "k3sm-mac", Index: 0, Address: "169.254.0.1", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
-			netv1alpha1.InterconnectMember{Node: "studio", Index: 1, Address: "169.254.0.9", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
+			netv1alpha1.InterconnectMember{Node: "node-a", Index: 1, Address: "169.254.0.9", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
 			netv1alpha1.InterconnectMember{Node: "far-mac", Index: 31, State: netv1alpha1.InterconnectMemberDown},
 		)
 		rep, _ := collectInterconnect(t, ic, nil, nil)

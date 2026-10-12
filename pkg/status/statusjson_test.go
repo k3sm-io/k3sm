@@ -181,10 +181,10 @@ func contractInterconnect(t *testing.T) Collector {
 		Status: netv1alpha1.InterconnectStatus{
 			Members: []netv1alpha1.InterconnectMember{
 				{Node: "my-mac", Index: 0, Address: "169.254.0.1", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
-				{Node: "studio", Index: 1, Address: "169.254.0.9", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
+				{Node: "node-a", Index: 1, Address: "169.254.0.9", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
 				{Node: "far", Index: 40, State: netv1alpha1.InterconnectMemberDown},
 			},
-			Segments: []netv1alpha1.InterconnectSegment{{ID: "s0", Nodes: []string{"my-mac", "studio"}}},
+			Segments: []netv1alpha1.InterconnectSegment{{ID: "s0", Nodes: []string{"my-mac", "node-a"}}},
 			ArmedBy:  "kubernetes-admin",
 			ArmedAt:  &armedAt,
 		},
@@ -196,7 +196,7 @@ func contractInterconnect(t *testing.T) Collector {
 	kube.raw[interconnectPath] = raw
 	kube.pods = append(kube.pods,
 		attachedPod("mlx", "llama-0", "my-mac", "169.254.0.2"),
-		attachedPod("default", "bench", "studio", "169.254.0.11"))
+		attachedPod("default", "bench", "node-a", "169.254.0.11"))
 	c := contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", kube, nil)
 	c.Interconnect = func(ctx context.Context) (*netv1alpha1.Interconnect, error) { return ReadInterconnect(ctx, kube) }
 	return c

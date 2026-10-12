@@ -91,7 +91,7 @@
       "remedy": "k3sm kubectl patch interconnect thunderbolt --type merge -p '{\"spec\":{\"excludedNodes\":[\"far\"]}}'   # or cable only nodes with cluster index 0..30",
       "wide": {
         "armed-at": "2026-09-05T08:30:00Z",
-        "pod default/bench": "studio 169.254.0.11",
+        "pod default/bench": "node-a 169.254.0.11",
         "pod mlx/llama-0": "my-mac 169.254.0.2"
       }
     },
@@ -146,7 +146,7 @@
       {
         "namespace": "default",
         "pod": "bench",
-        "node": "studio",
+        "node": "node-a",
         "address": "169.254.0.11"
       },
       {

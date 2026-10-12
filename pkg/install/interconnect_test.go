@@ -73,7 +73,7 @@ func TestParseInterconnectLedger(t *testing.T) {
 	got, err := ParseInterconnectLedger([]byte(`{"aliases":[
 		{"slot":0,"address":"169.254.0.9"},
 		{"slot":1,"address":"169.254.0.10"},
-		{"slot":2,"address":"192.168.0.50"},
+		{"slot":2,"address":"192.0.2.50"},
 		{"slot":9,"address":"169.254.0.11"},
 		{"slot":3,"address":"not an address"}]}`))
 	if err != nil {

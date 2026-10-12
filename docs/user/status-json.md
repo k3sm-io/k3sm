@@ -185,7 +185,7 @@ The `interconnect` object describes the cluster's [interconnect](interconnects.m
   "up": 2,
   "segments": 1,
   "outOfRange": [ "far-mac" ],
-  "pods": [ { "namespace": "mlx", "pod": "llama-0", "node": "studio", "address": "169.254.0.2" } ]
+  "pods": [ { "namespace": "mlx", "pod": "llama-0", "node": "node-a", "address": "169.254.0.2" } ]
 }
 ```
 
