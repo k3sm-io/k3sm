@@ -55,7 +55,7 @@ const (
 // verdict.
 var serverOverviewRows = []string{
 	RowInstall, RowNetd, RowServer, RowServerArgs, RowAPIServer,
-	RowNode, RowWorkloads, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
+	RowNode, RowWorkloads, RowInterconnect, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
 }
 
 // agentOverviewRows are the same screen on a joining worker: the agent row
@@ -63,7 +63,7 @@ var serverOverviewRows = []string{
 // with the daemon it described.
 var agentOverviewRows = []string{
 	RowInstall, RowNetd, RowAgent, RowAPIServer,
-	RowNode, RowWorkloads, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
+	RowNode, RowWorkloads, RowInterconnect, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
 }
 
 // serverDaemonViewRows are the rows `k3sm status daemons` expands on a control
@@ -99,7 +99,7 @@ func daemonViewRows(role dataroot.Role) []string {
 // child seam this report does not have, and inventing one to print four names
 // the apiserver row already answers for would add a probe that can fail for a
 // fact nothing depends on.
-var clusterViewRows = []string{RowAPIServer, RowNode, RowWorkloads, RowDatastore, RowRuntimed}
+var clusterViewRows = []string{RowAPIServer, RowNode, RowWorkloads, RowInterconnect, RowDatastore, RowRuntimed}
 
 // Render returns the overview screen: the verdict line with the binary's
 // provenance right-aligned beside it, one line per subsystem, the server's last

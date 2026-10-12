@@ -88,7 +88,12 @@ const (
 // mesh-claims is one too: an abandoned pod-range claim keeps a range reserved for a
 // server that never joined, which is the safe direction — nothing routes to it and
 // no node is denied an address it holds. The row warns with its remedy.
-var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, RowShadowShells: true, RowMeshClaims: true}
+//
+// interconnect is one as well: the cable is an opt-in network beside the mesh,
+// and a member that is down or a node beyond the index ceiling leaves every pod
+// on the mesh, which is where it would be without the cable. The row warns with
+// its remedy.
+var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, RowShadowShells: true, RowMeshClaims: true, RowInterconnect: true}
 
 // workerAdvisoryRows are the rows that are advisory ON A WORKER, because they
 // describe a control plane this Mac does not run.
