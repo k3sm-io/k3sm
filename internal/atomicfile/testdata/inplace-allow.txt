@@ -1,0 +1,18 @@
+# Allowed findings of TestNoInPlaceBinaryWrites (inplace_guard_test.go).
+# One per line: <file> <func> <rule>  # reason. A line matching nothing fails the test.
+
+# The one signer. It is only ever handed a temp path (EnsureSigned, ResignByReplace,
+# InstallSigned in the same file).
+pkg/executor/binstage.go CodesignSigner.Sign adhocsign  # k3sm's single signing entry point; callers sign temps only
+
+# k3sm install builds a whole staged tree and swaps it in with one rename, so the
+# shadow copies it signs are fresh clones nothing has mapped yet.
+pkg/install/shadow.go makeShadowSet adhocsign  # signs a fresh clone inside the staged tree, before the swap
+pkg/install/shadow_darwin.go darwinSystem.AdHocSign adhocsign  # the install System seam over image.AdHocSign; only makeShadowSet calls it
+
+# KNOWN AT-RISK, outside this change's scope: zot is re-signed with codesign -f on
+# the live work-dir path at every start, and signed after its rename. Needs the
+# same treatment as the executor (EnsureSigned / InstallSigned) in a follow-up.
+pkg/registrysvc/pin.go signBinary codesign-force  # KNOWN AT-RISK: live re-sign of zot; follow-up owed
+pkg/registrysvc/pin.go seedZot exec-write  # copy to a .tmp then rename (new inode); signing after the rename is the follow-up
+pkg/registrysvc/pin.go buildZot exec-write  # copy to a .tmp then rename (new inode); signing after the rename is the follow-up
