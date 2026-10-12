@@ -612,6 +612,33 @@ func TestNodePoolSelection(t *testing.T) {
 		}
 	})
 
+	t.Run("a clean hoster shutdown withdraws its report", func(t *testing.T) {
+		cs := fake.NewClientset(testNodeObject(testNode, nil))
+		svc := lbService("default", "lb1", "10.43.1.1", 18080)
+		if _, err := cs.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		h := newTestHoster(t, cs, testNode, &fakeBinder{}, map[int32]bool{}, nil)
+		runCtx, cancel := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() { done <- h.Run(runCtx) }()
+		deadline := time.Now().Add(10 * time.Second)
+		for !reportOf(t, cs, testNode).entries[reportEntry(svc)] {
+			if time.Now().After(deadline) {
+				cancel()
+				t.Fatal("the running hoster never reported lb1 bound")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if r := reportOf(t, cs, testNode); len(r.entries) != 0 {
+			t.Errorf("after a clean stop the report lists %v, want no entries (the node must not stay advertised)", r.entries)
+		}
+	})
+
 	t.Run("a stale uid after Service recreation is not advertised", func(t *testing.T) {
 		r := newPoolRig(t, twoNodes, poolService("lb1", 18080, nil))
 		r.converge()

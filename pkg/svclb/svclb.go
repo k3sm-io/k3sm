@@ -61,6 +61,9 @@ const warnInterval = 30 * time.Second
 // which is what retries a report write or a start-of-life reset that failed.
 const hosterResync = 30 * time.Second
 
+// withdrawTimeout bounds the best-effort write of the empty report on shutdown.
+const withdrawTimeout = 5 * time.Second
+
 // HosterConfig configures a Hoster, the per-node half of svclb.
 type HosterConfig struct {
 	// Client is THIS node's client (system:node:<name> on a joined worker and on
@@ -234,7 +237,8 @@ func PatchBoundReport(ctx context.Context, client kubernetes.Interface, node, va
 }
 
 // Run watches Services and this node's own Node and reconciles listeners and
-// the bound report until ctx is cancelled, then drains every forwarder.
+// the bound report until ctx is cancelled, then drains every forwarder and
+// withdraws the report (withdraw).
 // Reconciles are event-driven and coalesced; the loop goroutine is the sole
 // owner of the listener state.
 func (h *Hoster) Run(ctx context.Context) error {
@@ -282,6 +286,7 @@ func (h *Hoster) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			h.closeAll()
+			h.withdraw(ctx)
 			return nil
 		case <-trigger:
 		case <-ticker.C:
@@ -574,6 +579,28 @@ func (h *Hoster) closeAll() {
 		}
 		delete(h.forwarders, key)
 	}
+}
+
+// withdraw is the clean-shutdown half of the report: once every listener is
+// closed it writes an empty report under the current incarnation, so a stopped
+// or restarting node is not advertised for the node-monitor grace period that
+// would otherwise pass before it turns NotReady. It is best effort on a fresh
+// context bounded by withdrawTimeout (ctx is already cancelled); a write that
+// fails leaves the old report, which the decider then drops when the node turns
+// NotReady, and a restarted hoster resets it anyway.
+func (h *Hoster) withdraw(ctx context.Context) {
+	value, _ := formatBound(h.incarnation, nil)
+	if value == h.reported {
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), withdrawTimeout)
+	defer cancel()
+	if err := PatchBoundReport(wctx, h.cfg.Client, h.cfg.NodeName, value); err != nil {
+		h.log.Warn("svclb: could not withdraw this node's bound report on shutdown; it is dropped when the node turns NotReady", "node", h.cfg.NodeName, "err", err)
+		return
+	}
+	h.reported = value
+	h.log.Info("svclb: hoster withdrew its bound report on shutdown", "node", h.cfg.NodeName)
 }
 
 // throttledWarn logs msg at Warn at most once per warnInterval per key.
