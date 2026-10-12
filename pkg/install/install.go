@@ -54,6 +54,7 @@ import (
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -1024,6 +1025,15 @@ type System interface {
 	// is a no-op (pfctl succeeds flushing zero rules), and a pfctl failure is
 	// reported but never stops the rest of uninstall.
 	FlushMeshPFAnchor() error
+	// FlushInterconnectAliases is the uninstall backstop for the interconnect
+	// aliases netd put on bridge0. netd's shutdown removes nothing, so the
+	// aliases its ownership ledger (the file at ledgerPath, netd's own record)
+	// names outlive it. It removes exactly those that are still on bridge0, the
+	// pod /32s before the node's /24, then removes the ledger. It never changes
+	// bridge0's membership and never removes an address the ledger does not
+	// name. An absent ledger, or a host with no bridge0, is a no-op; a removal
+	// that fails keeps the ledger so a re-run can finish the job.
+	FlushInterconnectAliases(ledgerPath string) error
 	// ReadPodReapRecords returns the pod process groups the runtime recorded in
 	// its reap store under dataRoot (runtime.ReadPodReapRecords). An absent store
 	// holds none.
@@ -2372,6 +2382,9 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 //
 //   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
 //     because no daemon does it.
+//   - the interconnect aliases on bridge0 — SWEPT, by the
+//     FlushInterconnectAliases backstop below, scoped to the ones netd's
+//     ownership ledger names, and the ledger with them.
 //   - the pf anchor an older release loaded the mesh MSS clamp into: SWEPT, by
 //     the FlushMeshPFAnchor backstop below. Nothing loads it now (k3sm loads no
 //     pf rule), but a rule an older release left behind would survive netd,
@@ -2535,6 +2548,11 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 		flush = append(flush, svc)
 	}
 	note(sys.FlushLo0Aliases(flush))
+	// Backstop: the interconnect aliases on bridge0 that netd's ledger owns, and
+	// the ledger itself. Like the lo0 aliases they are durable kernel state no
+	// daemon removes on the way out; unlike them they are swept by OWNERSHIP,
+	// not by range, so a 169.254.0.0/24 address k3sm did not put there stays.
+	note(sys.FlushInterconnectAliases(netdsvc.InterconnectStatePath(MeshKeyDir)))
 	if firstErr != nil {
 		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}

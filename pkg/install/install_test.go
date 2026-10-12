@@ -1572,6 +1572,11 @@ func (f *fakeSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 	return nil
 }
 
+func (f *fakeSystem) FlushInterconnectAliases(ledgerPath string) error {
+	f.calls = append(f.calls, "FlushInterconnectAliases:"+ledgerPath)
+	return nil
+}
+
 func (f *fakeSystem) FlushMeshPFAnchor() error {
 	f.calls = append(f.calls, "FlushMeshPFAnchor")
 	return nil
@@ -2119,6 +2124,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		// pod /32s, the API/DNS VIPs, and the node mesh-egress .1 (which the pod
 		// stale-sweep deliberately never touches) all fall inside these two.
 		"FlushLo0Aliases:100.64.0.0/10,10.43.0.0/16",
+		// The interconnect aliases netd's ledger owns, and the ledger, swept
+		// after netd is gone (it is the ledger's only writer).
+		"FlushInterconnectAliases:/var/lib/k3sm/keys/interconnect-aliases",
 	}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("uninstall calls = %v, want %v", f.calls, want)
