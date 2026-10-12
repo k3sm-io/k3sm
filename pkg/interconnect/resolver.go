@@ -1,0 +1,504 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package interconnect
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	coordinationlisters "k8s.io/client-go/listers/coordination/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/client-go/tools/record"
+
+	crdconfig "k3sm.io/apis/config/crd"
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
+
+	"k3sm.io/k3sm/pkg/crdensure"
+)
+
+const (
+	// LeaseName is the coordination Lease that elects the one server whose
+	// resolver writes, the k3sm-helm-controller mechanism reused: on an HA
+	// control plane two resolvers would otherwise race the status and the
+	// desired annotations.
+	LeaseName = "k3sm-interconnect-resolver"
+	// LeaseNamespace is the Lease's namespace.
+	LeaseNamespace = "kube-system"
+
+	// ResyncInterval is the resolver's periodic reconcile, which is also what
+	// promotes a held member once UpHold has passed.
+	ResyncInterval = 10 * time.Second
+
+	// nodeLeaseNamespace holds every node's heartbeat Lease.
+	nodeLeaseNamespace = corev1.NamespaceNodeLease
+	// defaultNodeLeaseSeconds is the kubelet lease duration when a Lease
+	// carries none.
+	defaultNodeLeaseSeconds = 40
+
+	leaseDuration = 15 * time.Second
+	renewDeadline = 10 * time.Second
+	retryPeriod   = 2 * time.Second
+
+	// ConditionIndexInRange is the status condition naming members whose
+	// cluster index is beyond the interconnect ceiling.
+	ConditionIndexInRange = "IndexInRange"
+	reasonAllInRange      = "AllMembersInRange"
+
+	eventReportRejected = "InterconnectReportRejected"
+	eventMemberUp       = "InterconnectMemberUp"
+	eventMemberDown     = "InterconnectMemberDown"
+	eventMemberLoop     = "InterconnectMemberLoop"
+	eventComponent      = "k3sm-interconnect"
+)
+
+// ResolverConfig is the server resolver's wiring.
+type ResolverConfig struct {
+	// Client is the server's in-process admin client.
+	Client kubernetes.Interface
+	// Store reads and writes the Interconnect object.
+	Store Store
+	// CRD ensures the Interconnect CRD; nil skips the ensure.
+	CRD crdensure.CRDClient
+	// Indices returns every node's cluster index (from its pod /24).
+	Indices func(ctx context.Context) (map[string]int, error)
+	// Identity names this server in the leader Lease.
+	Identity string
+	// Recorder records Node Events; nil builds one over Client.
+	Recorder record.EventRecorder
+	// Metrics receives member and rejection metrics; nil records none.
+	Metrics *Metrics
+	// Log is the logger; nil uses slog.Default.
+	Log *slog.Logger
+	// Now is the clock; nil uses time.Now.
+	Now func() time.Time
+}
+
+// Resolver is the server-side reconcile of the Interconnect: it validates the
+// node reports, writes status, auto-creates the object disabled, and owns the
+// desired annotation on every Node.
+type Resolver struct {
+	cfg ResolverConfig
+
+	nodes  corelisters.NodeLister
+	leases coordinationlisters.LeaseLister
+	synced func() bool
+
+	// mu guards the event dedup state below (Reconcile runs on one goroutine,
+	// but tests and the lead loop must not race it).
+	mu       sync.Mutex
+	rejected map[string]string
+}
+
+// NewResolver returns a Resolver. Its listers are bound by Run, or by a test
+// through SetListers.
+func NewResolver(cfg ResolverConfig) *Resolver {
+	if cfg.Log == nil {
+		cfg.Log = slog.Default()
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	return &Resolver{cfg: cfg, rejected: map[string]string{}}
+}
+
+// SetListers binds the node and node-Lease listers and the sync predicate.
+func (r *Resolver) SetListers(nodes corelisters.NodeLister, leases coordinationlisters.LeaseLister, synced func() bool) {
+	r.nodes, r.leases, r.synced = nodes, leases, synced
+}
+
+// Run ensures the Interconnect CRD (on every server; the apply is idempotent),
+// then campaigns for the resolver Lease and reconciles while it leads, until
+// ctx ends. A lost Lease ends one term and the server campaigns again.
+func (r *Resolver) Run(ctx context.Context) error {
+	if r.cfg.CRD != nil {
+		if _, err := crdensure.Ensure(ctx, r.cfg.CRD, crdconfig.InterconnectCRD(), crdensure.Options{Log: r.cfg.Log}); err != nil {
+			return fmt.Errorf("interconnect resolver: ensure the Interconnect CRD: %w", err)
+		}
+	}
+	if r.cfg.Recorder == nil {
+		b := record.NewBroadcaster()
+		b.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: r.cfg.Client.CoreV1().Events("")})
+		defer b.Shutdown()
+		r.cfg.Recorder = b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: eventComponent})
+	}
+	lock := &resourcelock.LeaseLock{
+		LeaseMeta:  metav1.ObjectMeta{Name: LeaseName, Namespace: LeaseNamespace},
+		Client:     r.cfg.Client.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{Identity: r.cfg.Identity},
+	}
+	for ctx.Err() == nil {
+		if err := r.campaign(ctx, lock); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// campaign runs one leader-election term and returns once the leading work
+// has drained (the helm controller's term shape).
+func (r *Resolver) campaign(ctx context.Context, lock resourcelock.Interface) error {
+	var (
+		mu      sync.Mutex
+		started bool
+		stopped bool
+		done    = make(chan struct{})
+	)
+	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+		Lock:            lock,
+		Name:            LeaseName,
+		LeaseDuration:   leaseDuration,
+		RenewDeadline:   renewDeadline,
+		RetryPeriod:     retryPeriod,
+		ReleaseOnCancel: true,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(lctx context.Context) {
+				mu.Lock()
+				if stopped {
+					mu.Unlock()
+					return
+				}
+				started = true
+				mu.Unlock()
+				defer close(done)
+				r.cfg.Log.Info("interconnect resolver: leading", "lease", LeaseNamespace+"/"+LeaseName, "identity", r.cfg.Identity)
+				r.lead(lctx)
+			},
+			OnStoppedLeading: func() {},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("interconnect resolver: leader election: %w", err)
+	}
+	le.Run(ctx)
+	mu.Lock()
+	stopped = true
+	wait := started
+	mu.Unlock()
+	if wait {
+		<-done
+	}
+	return nil
+}
+
+// lead runs the Node and node-Lease informers and reconciles on every Node
+// change and every ResyncInterval until ctx ends.
+func (r *Resolver) lead(ctx context.Context) {
+	nf := informers.NewSharedInformerFactory(r.cfg.Client, 0)
+	lf := informers.NewSharedInformerFactoryWithOptions(r.cfg.Client, 0, informers.WithNamespace(nodeLeaseNamespace))
+	nodeInf := nf.Core().V1().Nodes()
+	leaseInf := lf.Coordination().V1().Leases()
+	kick := make(chan struct{}, 1)
+	nudge := func() {
+		select {
+		case kick <- struct{}{}:
+		default:
+		}
+	}
+	_, _ = nodeInf.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { nudge() },
+		UpdateFunc: func(_, _ any) { nudge() },
+		DeleteFunc: func(any) { nudge() },
+	})
+	r.SetListers(nodeInf.Lister(), leaseInf.Lister(), func() bool {
+		return nodeInf.Informer().HasSynced() && leaseInf.Informer().HasSynced()
+	})
+	nf.Start(ctx.Done())
+	lf.Start(ctx.Done())
+	defer nf.Shutdown()
+	defer lf.Shutdown()
+	cache.WaitForCacheSync(ctx.Done(), nodeInf.Informer().HasSynced, leaseInf.Informer().HasSynced)
+
+	tick := time.NewTicker(ResyncInterval)
+	defer tick.Stop()
+	var lastErr string
+	for {
+		err := r.Reconcile(ctx)
+		switch {
+		case err == nil:
+			lastErr = ""
+		case ctx.Err() != nil:
+			return
+		case err.Error() != lastErr:
+			lastErr = err.Error()
+			r.cfg.Log.Warn("interconnect resolver: reconcile", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-kick:
+		case <-tick.C:
+		}
+	}
+}
+
+// Reconcile resolves one snapshot and writes the result. It acts only on a
+// synced, non-empty node cache and only after reading the Interconnect object
+// successfully: an unsynced or empty cache, a failed index listing or a failed
+// read changes nothing, so nothing is ever cleared on missing information.
+func (r *Resolver) Reconcile(ctx context.Context) error {
+	if r.synced == nil || !r.synced() {
+		return nil
+	}
+	nodes, err := r.nodes.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("list nodes: %w", err)
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+	indices, err := r.cfg.Indices(ctx)
+	if err != nil {
+		return fmt.Errorf("list node cluster indices: %w", err)
+	}
+	now := r.cfg.Now()
+	in := Input{Now: now}
+	for _, n := range nodes {
+		idx, ok := indices[n.Name]
+		if !ok {
+			idx = NoIndex
+		}
+		in.Nodes = append(in.Nodes, NodeInput{
+			Name:   n.Name,
+			Index:  idx,
+			Fresh:  r.fresh(n.Name, now),
+			Report: n.Annotations[netv1alpha1.AnnotationInterconnectReport],
+		})
+	}
+	sort.Slice(in.Nodes, func(i, j int) bool { return in.Nodes[i].Name < in.Nodes[j].Name })
+
+	ic, err := r.cfg.Store.Get(ctx, Name)
+	if apierrors.IsNotFound(err) {
+		res := Resolve(in)
+		r.recordRejections(nodes, res.Rejected)
+		if !res.HasPeer {
+			return nil
+		}
+		return r.autoCreate(ctx)
+	}
+	if err != nil {
+		return fmt.Errorf("read interconnect %s: %w", Name, err)
+	}
+
+	spec := ic.Spec
+	if err := ic.Validate(); err != nil {
+		// The CRD schema should make this unreachable; if it is not, the safe
+		// reading of a spec this binary cannot trust is "disabled".
+		r.cfg.Log.Warn("interconnect resolver: the Interconnect spec is invalid; treating it as disabled", "err", err)
+		spec.Enabled = false
+	}
+	in.Spec = spec
+	in.Prev = ic.Status.Members
+	res := Resolve(in)
+	r.recordRejections(nodes, res.Rejected)
+
+	statusErr := r.writeStatus(ctx, ic, res, now)
+	desiredErr := r.writeDesired(ctx, nodes, ic, res)
+	return errors.Join(statusErr, desiredErr)
+}
+
+// fresh reports whether node's heartbeat Lease is current at now.
+func (r *Resolver) fresh(node string, now time.Time) bool {
+	if r.leases == nil {
+		return false
+	}
+	l, err := r.leases.Leases(nodeLeaseNamespace).Get(node)
+	if err != nil {
+		return false
+	}
+	return leaseFresh(l, now)
+}
+
+func leaseFresh(l *coordinationv1.Lease, now time.Time) bool {
+	if l.Spec.RenewTime == nil {
+		return false
+	}
+	secs := int32(defaultNodeLeaseSeconds)
+	if l.Spec.LeaseDurationSeconds != nil && *l.Spec.LeaseDurationSeconds > 0 {
+		secs = *l.Spec.LeaseDurationSeconds
+	}
+	return now.Before(l.Spec.RenewTime.Add(time.Duration(secs) * time.Second))
+}
+
+// autoCreate creates the Interconnect with its defaults and enabled false
+// (plan I1): nothing gets an address until an admin arms it.
+func (r *Resolver) autoCreate(ctx context.Context) error {
+	ic := &netv1alpha1.Interconnect{
+		ObjectMeta: metav1.ObjectMeta{Name: Name},
+		Spec: netv1alpha1.InterconnectSpec{
+			Medium:   netv1alpha1.MediumThunderbolt,
+			Fallback: netv1alpha1.InterconnectFallbackNetwork,
+			Enabled:  false,
+		},
+	}
+	if _, err := r.cfg.Store.Create(ctx, ic); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("auto-create interconnect %s: %w", Name, err)
+	}
+	r.cfg.Log.Info("interconnect resolver: a node reported a cabled Thunderbolt peer; created the Interconnect disabled (an admin arms it with `k3sm interconnect enable`)", "interconnect", Name)
+	return nil
+}
+
+// recordRejections counts and reports each newly rejected report once: the
+// counter and the Node Event fire when a node's rejection reason changes, not
+// on every resync.
+func (r *Resolver) recordRejections(nodes []*corev1.Node, rejected map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	present := map[string]bool{}
+	for _, n := range nodes {
+		present[n.Name] = true
+		reason, ok := rejected[n.Name]
+		if !ok {
+			delete(r.rejected, n.Name)
+			continue
+		}
+		if r.rejected[n.Name] == reason {
+			continue
+		}
+		r.rejected[n.Name] = reason
+		r.cfg.Metrics.Rejected(reason)
+		r.cfg.Log.Warn("interconnect resolver: ignored a node's interconnect report", "node", n.Name, "reason", reason)
+		r.event(n.Name, corev1.EventTypeWarning, eventReportRejected, "the server ignored this node's interconnect report: "+reason)
+	}
+	for n := range r.rejected {
+		if !present[n] {
+			delete(r.rejected, n)
+		}
+	}
+}
+
+func (r *Resolver) event(node, typ, reason, msg string) {
+	if r.cfg.Recorder == nil {
+		return
+	}
+	ref := &corev1.ObjectReference{Kind: "Node", Name: node, UID: types.UID(node)}
+	r.cfg.Recorder.Event(ref, typ, reason, msg)
+}
+
+// writeStatus writes the resolved members, segments and the index condition,
+// keeping the fields other writers own (armedBy, armedAt, attachedPods). A
+// conflict is returned and retried by the next reconcile; the persisted
+// lastTransition makes the retry compute the same hysteresis.
+func (r *Resolver) writeStatus(ctx context.Context, ic *netv1alpha1.Interconnect, res Result, now time.Time) error {
+	next := ic.DeepCopy()
+	next.Status.Members = res.Members
+	next.Status.Segments = res.Segments
+	cond := metav1.Condition{
+		Type:               ConditionIndexInRange,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonAllInRange,
+		Message:            "every member has a cluster index within the interconnect range",
+		ObservedGeneration: ic.Generation,
+		LastTransitionTime: metav1.NewTime(now),
+	}
+	if len(res.OutOfRange) > 0 {
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = netv1alpha1.ReasonInterconnectIndexOutOfRange
+		cond.Message = fmt.Sprintf("members with a cluster index above %d have no interconnect address and stay down: %s",
+			netv1alpha1.MaxInterconnectNodeIndex, strings.Join(res.OutOfRange, ", "))
+	}
+	meta.SetStatusCondition(&next.Status.Conditions, cond)
+
+	up := map[string]bool{}
+	for _, m := range res.Members {
+		up[m.Node] = m.State == netv1alpha1.InterconnectMemberUp
+	}
+	r.cfg.Metrics.SetMembers(up)
+	r.cfg.Metrics.SetAttachedPods(ic.Status.AttachedPods)
+
+	if equality.Semantic.DeepEqual(ic.Status, next.Status) {
+		return nil
+	}
+	if _, err := r.cfg.Store.UpdateStatus(ctx, next); err != nil {
+		return fmt.Errorf("write interconnect %s status: %w", ic.Name, err)
+	}
+	r.reportTransitions(ic.Status.Members, res.Members)
+	return nil
+}
+
+// reportTransitions turns every member state change into a Node Event, a Warn
+// line and a transitions count.
+func (r *Resolver) reportTransitions(prev, next []netv1alpha1.InterconnectMember) {
+	was := map[string]netv1alpha1.InterconnectMemberState{}
+	for _, m := range prev {
+		was[m.Node] = m.State
+	}
+	for _, m := range next {
+		old, ok := was[m.Node]
+		if ok && old == m.State {
+			continue
+		}
+		if !ok && m.State == netv1alpha1.InterconnectMemberDown {
+			continue
+		}
+		r.cfg.Metrics.Transition(m.Node)
+		reason := eventMemberDown
+		switch m.State {
+		case netv1alpha1.InterconnectMemberUp:
+			reason = eventMemberUp
+		case netv1alpha1.InterconnectMemberLoop:
+			reason = eventMemberLoop
+		}
+		r.cfg.Log.Warn("interconnect member state changed", "node", m.Node, "from", string(old), "to", string(m.State), "segment", m.Segment)
+		r.event(m.Node, corev1.EventTypeWarning, reason, fmt.Sprintf("interconnect member %s: %s -> %s", Name, old, m.State))
+	}
+}
+
+// writeDesired makes every Node's desired annotation agree with the
+// resolution: the encoded desired value on the nodes that must carry it, no
+// annotation anywhere else. A node-edited value that disagrees is overwritten.
+func (r *Resolver) writeDesired(ctx context.Context, nodes []*corev1.Node, ic *netv1alpha1.Interconnect, res Result) error {
+	want, err := netv1alpha1.InterconnectDesired{
+		Schema:       netv1alpha1.InterconnectAnnotationSchema,
+		Interconnect: ic.Name,
+		Fallback:     ic.Spec.EffectiveFallback(),
+	}.Encode()
+	if err != nil {
+		return fmt.Errorf("encode the desired annotation: %w", err)
+	}
+	var errs []error
+	for _, n := range nodes {
+		cur, has := n.Annotations[netv1alpha1.AnnotationInterconnectDesired]
+		switch {
+		case res.Desired[n.Name] && cur != want:
+			errs = append(errs, PatchNodeAnnotation(ctx, r.cfg.Client, n.Name, netv1alpha1.AnnotationInterconnectDesired, want))
+		case !res.Desired[n.Name] && has:
+			errs = append(errs, PatchNodeAnnotation(ctx, r.cfg.Client, n.Name, netv1alpha1.AnnotationInterconnectDesired, ""))
+		}
+	}
+	return errors.Join(errs...)
+}
