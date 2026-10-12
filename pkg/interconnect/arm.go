@@ -83,9 +83,9 @@ func SetEnabled(ctx context.Context, client kubernetes.Interface, store Store, n
 	if err != nil {
 		return ArmResult{}, err
 	}
-	ic, err := store.Patch(ctx, name, specPatch)
+	_, err = store.Patch(ctx, name, specPatch)
 	if apierrors.IsNotFound(err) {
-		ic, err = store.Create(ctx, &netv1alpha1.Interconnect{
+		_, err = store.Create(ctx, &netv1alpha1.Interconnect{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
 			Spec: netv1alpha1.InterconnectSpec{
 				Medium:   name,
@@ -94,7 +94,7 @@ func SetEnabled(ctx context.Context, client kubernetes.Interface, store Store, n
 			},
 		})
 		if apierrors.IsAlreadyExists(err) {
-			ic, err = store.Patch(ctx, name, specPatch)
+			_, err = store.Patch(ctx, name, specPatch)
 		} else if err == nil {
 			res.Created = true
 		}
@@ -111,7 +111,8 @@ func SetEnabled(ctx context.Context, client kubernetes.Interface, store Store, n
 	if err != nil {
 		return ArmResult{}, err
 	}
-	if ic, err = store.Patch(ctx, name, statusPatch, "status"); err != nil {
+	ic, err := store.Patch(ctx, name, statusPatch, "status")
+	if err != nil {
 		return ArmResult{}, fmt.Errorf("record who armed interconnect %s: %w", name, err)
 	}
 
