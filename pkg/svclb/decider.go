@@ -273,7 +273,13 @@ func (d *Decider) trustedReports(nodes []*corev1.Node) map[string]boundReport {
 		}
 		seen[n.Name] = true
 		ready := nodeReady(n)
-		rep, ok := parseBound(n.Annotations[BoundAnnotation])
+		raw, has := n.Annotations[BoundAnnotation]
+		rep, ok := parseBound(raw)
+		if has && !ok {
+			// Only the length is logged: the value is node-written and unbounded.
+			d.throttledWarn("\x00badreport\x00"+n.Name, "svclb: ignoring a malformed or oversized bound report; the node is treated as reporting nothing",
+				"node", n.Name, "bytes", len(raw))
+		}
 		prev, had := d.nodes[n.Name]
 		obs := nodeObs{ready: ready, lastReadyInc: prev.lastReadyInc}
 		if had && !prev.ready && ready {

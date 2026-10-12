@@ -67,6 +67,11 @@ const (
 // rather than advertising a listener nobody vouched for.
 const maxBoundBytes = 64 << 10
 
+// maxIncarnationLen caps a report's incarnation on the read side. A hoster
+// writes 16 hex characters; the cap leaves room for a different minting scheme
+// while keeping a node-supplied string short enough to log.
+const maxIncarnationLen = 64
+
 // allowListMode reports whether any Node carries EnableLBLabel=true.
 func allowListMode(nodes []*corev1.Node) bool {
 	for _, n := range nodes {
@@ -182,11 +187,18 @@ func formatBound(incarnation string, entries []string) (value string, truncated 
 	return b.String(), false
 }
 
-// parseBound decodes a BoundAnnotation value. ok is false for a value without
-// the incarnation separator, which no hoster writes; it is treated as no report.
+// parseBound decodes a BoundAnnotation value. ok is false for a value no hoster
+// writes: one without the incarnation separator, one longer than maxBoundBytes
+// (the writer's cap), or one whose incarnation is empty or longer than
+// maxIncarnationLen. Such a value is treated as no report. The value is written
+// by the node, so these bounds are what keep a node from making the decider
+// parse, hold or log an arbitrarily large string.
 func parseBound(v string) (boundReport, bool) {
+	if len(v) > maxBoundBytes {
+		return boundReport{}, false
+	}
 	inc, list, found := strings.Cut(v, ";")
-	if !found || inc == "" {
+	if !found || inc == "" || len(inc) > maxIncarnationLen {
 		return boundReport{}, false
 	}
 	r := boundReport{incarnation: inc, entries: make(map[string]bool)}

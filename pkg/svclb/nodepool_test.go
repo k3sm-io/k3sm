@@ -428,9 +428,15 @@ func TestNodePoolSelection(t *testing.T) {
 		if r, ok := parseBound("inc2;"); !ok || len(r.entries) != 0 {
 			t.Errorf("a reset report must parse to no entries, got %+v %v", r, ok)
 		}
-		for _, bad := range []string{"", "no-separator", ";ns/a:u1"} {
+		// The value is node-written: the reader bounds it to what a hoster writes.
+		if _, ok := parseBound(strings.Repeat("i", maxIncarnationLen) + ";ns/a:u1"); !ok {
+			t.Error("an incarnation at the cap must parse")
+		}
+		oversized := "inc;" + strings.Repeat("x", maxBoundBytes)
+		longInc := strings.Repeat("i", maxIncarnationLen+1) + ";ns/a:u1"
+		for _, bad := range []string{"", "no-separator", ";ns/a:u1", oversized, longInc} {
 			if _, ok := parseBound(bad); ok {
-				t.Errorf("parseBound(%q) must be no report", bad)
+				t.Errorf("parseBound(%.40q... len %d) must be no report", bad, len(bad))
 			}
 		}
 		var many []string
