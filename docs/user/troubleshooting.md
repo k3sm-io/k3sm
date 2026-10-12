@@ -79,7 +79,7 @@ log show --predicate 'subsystem BEGINSWITH "io.k3sm"' --last 10m
 launchctl print system/io.k3sm.server     # daemon state (label may differ per role)
 ```
 
-Not everything lands there. The server process's own structured logs (the LoadBalancer controller, the
+Not everything lands there. The server process's own structured logs (the LoadBalancer decider, the
 ingress host, the control-plane supervisor) go to **stderr**, which launchd routes to
 **`/var/log/k3sm/server.log`**. The unified-log predicate above shows none of them.
 
@@ -292,20 +292,36 @@ See [Limitations](limitations.md).
 
 ## LoadBalancer Stuck `<pending>`
 
-Do not look in the unified log for this one. The LoadBalancer controller and the ingress host log
+Start with the Service's Events, which name the cause when k3sm knows it:
+
+```sh
+kubectl describe service <name>
+```
+
+- **`NoEligibleNodes`**. No node may host the Service: its `svclb.k3sm.io/lbpool` label names a pool
+  no node is in, or allow-list mode is on (some node carries `svclb.k3sm.io/enablelb=true`) and no
+  node in the pool is enabled. See [Multi-node](multi-node.md#node-pools).
+- **`HostNotBound`**. The named node was chosen but could not bind every port of the Service. Read
+  that node's log for the reason below.
+
+Do not look in the unified log for the rest. The LoadBalancer decider and the ingress host log
 through `slog` to **stderr**, which the launchd job routes to a file, so the
 `log show --predicate 'subsystem BEGINSWITH "io.k3sm"'` command at the top of this page shows **nothing**
-for them. Read the file instead:
+for them. Read the file instead: `server.log` on the server, `agent.log` on a joined worker, which
+is where that node's listeners log:
 
 ```sh
 grep svclb /var/log/k3sm/server.log | tail -50
+grep svclb /var/log/k3sm/agent.log | tail -50
 grep ingress /var/log/k3sm/server.log | tail -50
 ```
 
-The controller emits one line at start carrying **both** addresses, which are different:
+The server logs one line at start naming its own node and the address it publishes for it, and every
+node logs one line when its listeners start:
 
 ```
-svclb: loadbalancer controller starting bind=0.0.0.0 advertise=100.64.0.1
+svclb: loadbalancer decider starting self=node-a self_addr=100.64.0.1 hold_down=30s mesh_peers=true
+svclb: loadbalancer hoster starting node=node-a bind=0.0.0.0
 ```
 
 Then look for one of these:
@@ -327,9 +343,10 @@ Then look for one of these:
   The usual culprits are another process on the Mac, a **pod** (macOS has no network namespaces, so pods
   share the node's port space; see [Limitations](limitations.md)), or a second LoadBalancer Service
   declaring the same port. k3sm never picks a different port for you.
-- **`loadbalancer/ingress status will stay EMPTY: no advertisable node address could be derived`**. The
-  listeners are bound and serving, but there is no address that would be correct to publish, so nothing is written
-  rather than advertising an unreachable one. Check `kubectl get node -o wide` shows a non-loopback
+- **`loadbalancer/ingress status will not list this node: no advertisable node address could be derived`**.
+  The listeners are bound and serving, but there is no address that would be correct to publish, so
+  the server's node is left out rather than advertised at an unreachable address. A worker is listed
+  at the mesh address the server recorded when it joined. Check `kubectl get node -o wide` shows a non-loopback
   `INTERNAL-IP`, and that you did not start the server with `--network none`.
 - **`ingress bind retries exhausted`**. The ingress listeners gave up (bounded retry, no port
   fallback). Free the port and restart the daemon.

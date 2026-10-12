@@ -296,6 +296,81 @@ Editing the installed launchd plists does not change a role, and neither does a 
 `launchctl kickstart` never re-reads a plist, only a bootout and bootstrap does, which is what
 install performs.
 
+## LoadBalancer Services Across Nodes
+
+In a multi-node cluster every node can host `type: LoadBalancer` Services. The server decides which
+nodes host each Service, and each chosen node binds the Service's ports and forwards connections to
+its ClusterIP. `status.loadBalancer.ingress` lists one address per hosting node, and a node is listed
+only while it is Ready and holds every TCP port of the Service. With no labels at all, every node
+hosts every LoadBalancer Service.
+
+The addresses are the nodes' mesh addresses, for example `100.64.0.1` and `100.64.1.1`. They are
+reachable from cluster nodes and pods, not from your LAN; see
+[Limitations](limitations.md#which-addresses-your-services-answer-on).
+
+To see which nodes were chosen for a Service and which addresses are published:
+
+```sh
+kubectl get service web -o jsonpath='{.metadata.annotations.svclb\.k3sm\.io/hosts}{"\n"}'
+kubectl get service web
+```
+
+### Node Pools
+
+| Label | On | Effect |
+|---|---|---|
+| `svclb.k3sm.io/enablelb=true` | Node | Allow-list mode. Once any node carries this label with the value `true`, only nodes labelled `true` host LoadBalancer Services. Any other value does not turn the mode on. |
+| `svclb.k3sm.io/lbpool=<pool>` | Service | Host the Service only on nodes in `<pool>`. |
+| `svclb.k3sm.io/lbpool=<pool>` | Node | Put the node in one pool. |
+| `lbpool.svclb.k3sm.io/<pool>=true` | Node | Put the node in `<pool>`. A node can carry several of these, and they combine with the single-pool label. |
+
+Keep LoadBalancer traffic off one Mac:
+
+```sh
+kubectl label node node-a svclb.k3sm.io/enablelb=true
+```
+
+Now only `node-a` hosts LoadBalancer Services. Remove the label from every node to return to "every
+node hosts".
+
+Split two Services across two pools, so both can use the same port:
+
+```sh
+kubectl label node node-a lbpool.svclb.k3sm.io/blue=true
+kubectl label node node-b svclb.k3sm.io/lbpool=green
+kubectl label service web-blue svclb.k3sm.io/lbpool=blue
+kubectl label service web-green svclb.k3sm.io/lbpool=green
+```
+
+A Service whose pool no node is in stays `<pending>`, with a `NoEligibleNodes` Warning Event on it.
+
+### Coming From k3s
+
+k3sm reads its own keys only. Relabel when you move a workload over:
+
+| k3s ServiceLB | k3sm |
+|---|---|
+| `svccontroller.k3s.cattle.io/enablelb` (Node) | `svclb.k3sm.io/enablelb` |
+| `svccontroller.k3s.cattle.io/lbpool` (Node and Service) | `svclb.k3sm.io/lbpool` |
+| the multi-pool Node label form | `lbpool.svclb.k3sm.io/<pool>=true` |
+
+There are no per-node `svclb-*` pods. Each node's k3sm process holds the listeners itself.
+
+### LoadBalancer Caveats
+
+- Pool and allow-list labels live on Node objects, which a node may edit on itself. A compromised
+  node can label itself into a pool and attract that pool's traffic, the same posture as k3s
+  ServiceLB. Treat pools as placement, not isolation.
+- Two Services on the same port can share a node only if they never land on it together. On one
+  node the second bind fails, that node stays out of the second Service's status, and a
+  `HostNotBound` Warning Event on the Service names the node. A pod already listening on the port
+  has the same effect.
+- `externalTrafficPolicy: Local` is not narrowed to nodes with a local endpoint. Every hosting node
+  forwards to the ClusterIP, so the client source address is lost.
+- Upgrade agents first and the server last. An agent older than its server hosts nothing until it is
+  upgraded, and a newer agent under an older server leaves LoadBalancer hosting on the server alone,
+  as before.
+
 ## What Crosses Nodes
 
 - Services resolve cluster-wide via the userspace Service proxy.
