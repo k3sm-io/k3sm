@@ -17,6 +17,7 @@ limitations under the License.
 package svclb
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -571,6 +572,43 @@ func TestNodePoolSelection(t *testing.T) {
 		r.decide()
 		if ev := r.events(); len(ev) != 0 {
 			t.Errorf("the HostNotBound Event must be recorded once, got %q", ev)
+		}
+	})
+
+	t.Run("P8 a host that never wrote a report is logged, not evented", func(t *testing.T) {
+		r := newPoolRig(t, twoNodes, poolService("lb1", 18080, nil))
+		var buf bytes.Buffer
+		r.d.log = slog.New(slog.NewTextHandler(&buf, nil))
+		// node-b runs an agent from before the report existed: no annotation, and
+		// its hoster never runs.
+		r.mutateNode("node-b", func(n *corev1.Node) { delete(n.Annotations, BoundAnnotation) })
+		r.decide()
+		r.host(testNode)
+		r.decide()
+		r.clock.advance(DefaultHoldDown)
+		r.decide()
+		r.decide()
+		if got := r.ingress("lb1"); !slices.Equal(got, []string{r.addr(testNode)}) {
+			t.Errorf("ingress = %v, want only node-a", got)
+		}
+		if ev := r.events(); len(ev) != 0 {
+			t.Errorf("events = %q, want none for a host that has never reported", ev)
+		}
+		if n := strings.Count(buf.String(), "has not reported any bound services"); n != 1 || !strings.Contains(buf.String(), "node=node-b") {
+			t.Errorf("want one Info line naming node-b, got %d in %q", n, buf.String())
+		}
+		// Once node-b's hoster runs and fails to bind, the Event fires after the
+		// hold-down as usual.
+		r.binders["node-b"].fail = map[uint16]error{18080: errBusy}
+		if err := r.hosters["node-b"].Reset(ctx); err != nil {
+			t.Fatal(err)
+		}
+		r.host("node-b")
+		r.decide()
+		r.clock.advance(DefaultHoldDown)
+		r.decide()
+		if ev := r.events(); len(ev) != 1 || !strings.Contains(ev[0], EventReasonHostNotBound) {
+			t.Errorf("events = %q, want one HostNotBound once node-b reports", ev)
 		}
 	})
 

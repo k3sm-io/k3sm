@@ -45,7 +45,9 @@ const (
 	// EventReasonHostNotBound: a Ready node in the Service's stamp has not
 	// reported every TCP port bound (a port conflict with a pod or another
 	// Service, a reserved port, or invalid source ranges). The message names
-	// the node; that node is left out of the status.
+	// the node; that node is left out of the status. A node that has never
+	// written a bound report at all (an older agent during a rolling restart, or
+	// a hoster not started yet) is not evented: the decider logs it at Info.
 	EventReasonHostNotBound = "HostNotBound"
 )
 
@@ -135,6 +137,9 @@ type Decider struct {
 	unbound map[string]time.Time
 	// lastWarn backs the per-key warning throttle.
 	lastWarn map[string]time.Time
+	// unreported names the stamped Ready nodes already logged as carrying no
+	// bound report at all, so the Info line is written once per node.
+	unreported map[string]bool
 }
 
 // NewDecider validates cfg and builds the Decider. It starts nothing; call Run.
@@ -164,6 +169,7 @@ func NewDecider(cfg DeciderConfig) (*Decider, error) {
 		events:     map[string]string{},
 		unbound:    map[string]time.Time{},
 		lastWarn:   map[string]time.Time{},
+		unreported: map[string]bool{},
 	}, nil
 }
 
@@ -305,6 +311,7 @@ func (d *Decider) trustedReports(nodes []*corev1.Node) map[string]boundReport {
 		if !seen[name] {
 			delete(d.nodes, name)
 			delete(d.distrusted, name)
+			delete(d.unreported, name)
 		}
 	}
 	return out
@@ -391,7 +398,8 @@ func (d *Decider) decide(ctx context.Context, key string, svc *corev1.Service, n
 
 // noteUnbound records an Event once a Ready stamped host has gone a hold-down
 // without reporting the Service. A host that is not Ready is already out of the
-// status for that reason and is not evented.
+// status for that reason and is not evented, and neither is a host carrying no
+// bound report at all (logged once at Info instead).
 func (d *Decider) noteUnbound(svc *corev1.Service, key, host string, nodes []*corev1.Node) {
 	uk := key + "\x00" + host
 	var n *corev1.Node
@@ -405,6 +413,19 @@ func (d *Decider) noteUnbound(svc *corev1.Service, key, host string, nodes []*co
 		delete(d.unbound, uk)
 		return
 	}
+	if _, has := n.Annotations[BoundAnnotation]; !has {
+		// No hoster has ever written a report on this node: an agent from before
+		// the report existed (the rolling restart's skew window) or one whose
+		// hoster has not started. Nothing failed to bind, so there is no Event.
+		delete(d.unbound, uk)
+		if !d.unreported[host] {
+			d.unreported[host] = true
+			d.log.Info("svclb: a stamped host has not reported any bound services (an older agent during a rolling restart, or its hoster has not started); it stays out of the status",
+				"node", host)
+		}
+		return
+	}
+	delete(d.unreported, host)
 	first, ok := d.unbound[uk]
 	if !ok {
 		d.unbound[uk] = d.now()
