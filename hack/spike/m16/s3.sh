@@ -352,8 +352,13 @@ if ! spike_pip "$VM" vllm-metal; then
   recorded "s3.5 control  the alternative engine did not install on this rig — recorded, not gating: it is the negative space around the engine choice, never a criterion"
   exit 0
 fi
+# vllm-metal serves its OpenAI endpoint from the `vllm-metal` console script. The
+# `vllm.entrypoints.openai.api_server` module exists only under its [vllm] extra, which
+# would pull an unpinned dependency tree into the control venv.
+SERVER="$PREFIX/venv-metal/bin/vllm-metal"
+[ -x "$SERVER" ] || { recorded "s3.5 control  the alternative engine installed without its vllm-metal console script — recorded, not gating"; exit 0; }
 MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
-nohup "$VM" -m vllm.entrypoints.openai.api_server --model "$MP" --port 8103 > "$W/metal.log" 2>&1 &
+nohup "$SERVER" --model "$MP" --port 8103 > "$W/metal.log" 2>&1 &
 PID=$!
 UP=no
 for i in $(seq 1 60); do
