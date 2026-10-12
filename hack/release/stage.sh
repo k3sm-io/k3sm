@@ -238,19 +238,42 @@ verify_release_signatures() {
 }
 
 # ---- the payload manifest -----------------------------------------------------
+# tree_shape_problems <tree>: the tree holds only regular files and directories
+# (a symlink is refused: every walk here uses `find -type f`, which would step
+# past a symlinked Mach-O unverified), and no name carries a newline or a
+# backslash (both break the line-oriented walks and shasum's output format).
+# Run first by the manifest and by both verify modes.
+tree_shape_problems() {
+	local tree="$1" odd bad=0
+	[ -d "$tree" ] || { echo "stage: $tree is not a directory"; return 1; }
+	odd="$(cd "$tree" && find . ! -type f ! -type d)"
+	[ -z "$odd" ] || { echo "stage: refusing non-regular entries (symlinks are not allowed in the tree):"; printf '%s\n' "$odd" | sed 's/^/    /'; bad=1; }
+	odd="$(cd "$tree" && find . -name "*"$'\n'"*" -o -name '*\\*')"
+	[ -z "$odd" ] || { echo "stage: refusing names with a newline or backslash:"; printf '%s\n' "$odd" | sed 's/^/    /'; bad=1; }
+	return "$bad"
+}
+
 # manifest_body <tree>  ->  `<sha256>  <relpath>` lines on stdout.
 # Regular files only; a symlink (or any other non-regular, non-directory entry)
 # is a hard error, as is a name shasum would escape (newline, backslash).
+# A .DS_Store is skipped only when it is not a Mach-O: the name is Finder's, but
+# a binary under that name is still code in the payload and stays hashed.
 manifest_body() {
-	local tree="$1" odd
-	odd="$(cd "$tree" && find . ! -type f ! -type d)"
-	[ -z "$odd" ] || { echo "stage: manifest: refusing non-regular entries (symlinks are not allowed in the tree):" >&2; printf '    %s\n' "$odd" >&2; return 1; }
-	odd="$(cd "$tree" && find . -name "*"$'\n'"*" -o -name '*\\*')"
-	[ -z "$odd" ] || { echo "stage: manifest: refusing names with a newline or backslash: $odd" >&2; return 1; }
+	local tree="$1"
+	tree_shape_problems "$tree" >&2 || return 1
 	(
 		cd "$tree"
-		find . -type f ! -name .DS_Store ! -path "./$MANIFEST_NAME" | sed 's|^\./||' | LC_ALL=C sort |
-			tr '\n' '\0' | xargs -0 shasum -a 256 --
+		find . -type f ! -path "./$MANIFEST_NAME" | sed 's|^\./||' | LC_ALL=C sort |
+			while IFS= read -r p; do
+				case "${p##*/}" in
+				.DS_Store)
+					case "$(file -b "$p" 2>/dev/null || echo '?')" in
+					*Mach-O*) ;;
+					*) continue ;;
+					esac ;;
+				esac
+				printf '%s\0' "$p"
+			done | xargs -0 shasum -a 256 --
 	)
 }
 
@@ -522,6 +545,30 @@ cat "%s" >&2
 	if ( manifest_write "$m2" "" ) 2>/dev/null; then bad "a symlink in the tree was accepted"; else ok "symlink refused"; fi
 	if ( manifest_write "$tmp/m-empty-$$" "" ) 2>/dev/null; then bad "a missing tree produced a manifest"; else ok "missing tree refused"; fi
 
+	echo "==> .DS_Store exclusion is for non-Mach-O files only"
+	local ds="$tmp/ds"
+	mkdir -p "$ds/sub"
+	printf 'finder\n' >"$ds/.DS_Store"
+	cp "$tree/k3sm" "$ds/sub/.DS_Store"
+	( manifest_write "$ds" "" ) || bad "manifest_write failed on the .DS_Store tree"
+	out="$(grep -v '^#' "$ds/$MANIFEST_NAME" | sed 's/^[0-9a-f]\{64\}  //' | tr '\n' ' ')"
+	if [ "$out" = "sub/.DS_Store " ]; then ok "a Mach-O named .DS_Store is hashed, a Finder .DS_Store is not"; else bad "unexpected .DS_Store handling: '$out'"; fi
+
+	echo "==> both verify modes refuse a symlink or an odd name before anything else"
+	local st="$tmp/shape-link" sn="$tmp/shape-name" sb="$tmp/shape-bslash" mode
+	mkdir -p "$st" "$sn" "$sb"
+	ln -s /usr/bin/true "$st/k3sm"
+	printf 'x\n' >"$sn/bad"$'\n'"name"
+	printf 'x\n' >"$sb/bad\\name"
+	for mode in --verify-only "--verify-release $team"; do
+		# shellcheck disable=SC2086 # mode is two words on purpose
+		if out="$("$self" "$st" $mode 2>&1)"; then bad "$mode accepted a symlink"; elif printf '%s\n' "$out" | grep -q "symlinks are not allowed"; then ok "$mode refuses a symlink"; else bad "$mode symlink refusal not named: $out"; fi
+		# shellcheck disable=SC2086
+		if out="$("$self" "$sn" $mode 2>&1)"; then bad "$mode accepted a newline name"; elif printf '%s\n' "$out" | grep -q "newline or backslash"; then ok "$mode refuses a newline in a name"; else bad "$mode newline refusal not named: $out"; fi
+		# shellcheck disable=SC2086
+		if out="$("$self" "$sb" $mode 2>&1)"; then bad "$mode accepted a backslash name"; elif printf '%s\n' "$out" | grep -q "newline or backslash"; then ok "$mode refuses a backslash in a name"; else bad "$mode backslash refusal not named: $out"; fi
+	done
+
 	echo "==> manifest rewrite and verification (the release gate's manifest check)"
 	local mt="$tmp/mt"
 	mkdir -p "$mt/cp-payload"
@@ -725,6 +772,7 @@ verify_tree() {
 
 if [ -n "$VERIFY_RELEASE" ]; then
 	echo "==> verify-release over $OUT for team $VERIFY_RELEASE (inspection only: nothing built, downloaded or signed)"
+	tree_shape_problems "$OUT" || die "$OUT is not a plain tree of regular files"
 	echo "==> verify the Developer ID signature on every Mach-O"
 	verify_release_signatures "$OUT" "$VERIFY_RELEASE" || die "a Mach-O under $OUT fails the release signature policy (above)"
 	verify_tree
@@ -736,6 +784,7 @@ fi
 
 if [ "$VERIFY_ONLY" = 1 ]; then
 	echo "==> verify-only over $OUT (nothing built, nothing downloaded, nothing signed)"
+	tree_shape_problems "$OUT" || die "$OUT is not a plain tree of regular files"
 	verify_tree
 	echo "==> verified $(find "$OUT" -type f | wc -l | tr -d ' ') files in $OUT"
 	exit 0
