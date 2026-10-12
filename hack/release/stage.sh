@@ -193,10 +193,15 @@ valid_team() { printf '%s' "$1" | grep -Eq '^[A-Z0-9]{10}$'; }
 
 # verify_release_signatures <dir> <TEAMID>
 # The Developer ID policy over every Mach-O under <dir>, every slice of a
-# universal binary separately. Reports every problem, then returns non-zero if
-# there was any (including fewer than MACHO_FLOOR Mach-Os).
+# universal binary separately. Two checks per slice: the display text through
+# release_sig_problems, and the chain of trust, which the text alone cannot
+# prove (anyone can print "Authority=Developer ID Application"): codesign must
+# validate the signature against a designated requirement anchored at Apple's
+# roots whose leaf certificate's OU is <TEAMID>. Reports every problem, then
+# returns non-zero if there was any (including fewer than MACHO_FLOOR Mach-Os).
 verify_release_signatures() {
 	local dir="$1" team="$2" f a archs out probs n=0 bad=0
+	local req="anchor apple generic and certificate leaf[subject.OU] = \"$team\""
 	while IFS= read -r f; do
 		n=$((n + 1))
 		archs="$(lipo -archs "$f" 2>/dev/null || true)"
@@ -207,6 +212,10 @@ verify_release_signatures() {
 			out="$("$CODESIGN" -dvvv --arch "$a" "$f" 2>&1 >/dev/null || true)"
 			if ! probs="$(printf '%s\n' "$out" | release_sig_problems "$team")"; then
 				printf '%s\n' "$probs" | sed "s|^|    $f [$a]: |"
+				bad=1
+			fi
+			if ! "$CODESIGN" --verify --strict -R="$req" --arch "$a" "$f" >/dev/null 2>&1; then
+				echo "    $f [$a]: chain: codesign --verify --strict -R='$req' fails"
 				bad=1
 			fi
 		done
@@ -312,10 +321,14 @@ refuse_unpinned_payload() {
 #                               rewritten to /fixture/<name>).
 #   codesign-devid-synthetic.txt SYNTHETIC text in codesign's documented
 #                               Developer ID display format. The positive path
-#                               of the parser is therefore TEXT-PROVEN ONLY: its
-#                               first run against a real Developer ID signature
-#                               is the signing pipeline's post-sign
-#                               --verify-release.
+#                               of the parser, and of the chain-of-trust check
+#                               (via a CODESIGN override), is therefore
+#                               TEXT-PROVEN ONLY here. Outside the self-test,
+#                               verify_release_signatures was run once by hand
+#                               over standalone third-party Developer ID
+#                               binaries on a dev Mac and accepted them; the
+#                               first run against a k3sm signature is the
+#                               signing pipeline's post-sign --verify-release.
 self_test() {
 	local td="$HERE/testdata" self="$HERE/stage.sh" tmp fails=0 out
 	local team=ABCDE12345 pos="$HERE/testdata/codesign-devid-synthetic.txt"
@@ -392,7 +405,7 @@ self_test() {
 	cp "$tree/k3sm" "$tree/cp-payload/kube-apiserver"
 	clang -arch arm64 -arch x86_64 -o "$tree/universal" "$tmp/m.c"
 	printf 'not a Mach-O\n' >"$tree/README"
-	local f
+	local f n
 	for f in "$tree/k3sm" "$tree/cp-payload/kube-apiserver" "$tree/universal"; do
 		codesign -s - -f "$f" >/dev/null 2>&1 || die "self-test: ad-hoc codesign failed for $f"
 	done
@@ -410,6 +423,10 @@ self_test() {
 		else
 			ok "runtime-signed ad-hoc binary fails on the other fields only"
 		fi
+		# The real codesign, not an override: every ad-hoc slice (3 thin + 2
+		# universal) must fail the designated-requirement check.
+		n="$(printf '%s\n' "$out" | grep -c ": chain: " || true)"
+		if [ "$n" = 5 ]; then ok "ad-hoc tree: the chain-of-trust requirement fails on all 5 slices"; else bad "ad-hoc tree: chain failure on $n of 5 slices"; fi
 	fi
 	if out="$("$self" "$tree" --verify-release "$team" 2>&1)"; then
 		bad "stage.sh <ad-hoc tree> --verify-release exited 0"
@@ -422,7 +439,19 @@ self_test() {
 	echo "==> the walk accepts a tree whose every slice reads as the positive fixture"
 	printf '#!/bin/sh\ncat "%s" >&2\n' "$pos" >"$tmp/fake-codesign"
 	chmod +x "$tmp/fake-codesign"
-	if out="$(CODESIGN="$tmp/fake-codesign" verify_release_signatures "$tree" "$team")"; then ok "walk + parser accept (5 slices over 4 Mach-Os)"; else bad "walk rejected the positive text: $out"; fi
+	# In this self-test the chain-of-trust check's positive path is proven only
+	# through this override (it exits 0 for --verify too): a hermetic test has
+	# no real Developer ID signature. See the fixture note above self_test.
+	if out="$(CODESIGN="$tmp/fake-codesign" verify_release_signatures "$tree" "$team")"; then ok "walk + parser + chain accept (5 slices over 4 Mach-Os, override)"; else bad "walk rejected the positive text: $out"; fi
+	# Perfect display text but a failing chain must still fail.
+	printf '#!/bin/sh
+case "$1" in --verify) exit 1 ;; esac
+cat "%s" >&2
+' "$pos" >"$tmp/fake-codesign-badchain"
+	chmod +x "$tmp/fake-codesign-badchain"
+	if out="$(CODESIGN="$tmp/fake-codesign-badchain" verify_release_signatures "$tree" "$team")"; then
+		bad "a failing chain-of-trust check was ignored"
+	elif printf '%s\n' "$out" | grep -q ": chain: "; then ok "a failing chain-of-trust check fails the walk"; else bad "chain failure not named: $out"; fi
 	rm "$tree/universal"
 	if out="$(CODESIGN="$tmp/fake-codesign" verify_release_signatures "$tree" "$team")"; then
 		bad "a 3-Mach-O tree passed the floor"
