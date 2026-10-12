@@ -33,6 +33,14 @@ import (
 // start rather than run, or re-sign, a binary the signed release did not vouch for.
 var ErrPayloadSignature = errors.New("payload binary fails release signature verification")
 
+// PayloadSignatureRemedy is the operator's fix for ErrPayloadSignature and
+// ErrPayloadStamp: the staged payload is not the one this signed k3sm was released
+// with, and only a reinstall from that release puts the right bytes in place.
+const PayloadSignatureRemedy = "reinstall k3sm from a correctly signed release (`sudo k3sm install` from the release's own payload); the daemon runs only payload binaries signed with its own Developer ID and built at its pins, and never re-signs or rebuilds them"
+
+// SelfSignatureRemedy is the operator's fix for ErrSelfSignatureUnreadable.
+const SelfSignatureRemedy = "check that /usr/bin/codesign runs and that the installed k3sm binary is readable; if its signature is damaged, reinstall k3sm from a correctly signed release"
+
 // ErrSelfSignatureUnreadable reports that the running k3sm's own signature could
 // not be read or evaluated, so the signing path cannot be decided. The boot
 // refuses rather than guess: the dev path would heal and ad-hoc sign binaries a
