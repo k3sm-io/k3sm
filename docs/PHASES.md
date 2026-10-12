@@ -1665,6 +1665,18 @@ milestone. Sub-phases:
   blackholed over the mesh (with darwin-net:M3.3).
 Exit (§9 M3): two Macs, one cluster, cross-node pod-to-pod + ClusterIP + a NodePort + a persistent StatefulSet.
 
+**Follow-on (backlog, not an M3 deliverable): multi-node ServiceLB with node pools.** `pkg/svclb` is split
+into a server-side **decider** (admin client: selects hosts by the `svclb.k3sm.io/enablelb` /
+`svclb.k3sm.io/lbpool` / `lbpool.svclb.k3sm.io/<pool>` labels, stamps `svclb.k3sm.io/hosts` on the Service,
+and writes the whole replaced `status.loadBalancer.ingress`) and a per-node **hoster** in every node process
+(binds the stamped Services and reports them on its OWN Node, `svclb.k3sm.io/bound`; no RBAC change).
+Addresses are server-held (MeshPeer mesh address, the server's own derived address for its node), allow-list
+mode needs `enablelb=true`, reports are trusted per incarnation across a Ready transition, and a new decider
+holds status changes down for 30 s. Deploy: **phased (named exception: multi-node launchd rolling restart)**,
+agents first, server last. Gate `pkg/svclb::TestNodePoolSelection` (unit + fake-clientset leg); the
+report-channel authorization against a real apiserver is `e2e/TestNodePoolSelection` (integration tier of
+`hack/lab/b416.sh`); the two-Mac rig leg is the `K3SM_LAB=1` tier of the same script, owed.
+
 ## M4 — Install/launchd, packaging, Homebrew, hardening 🟡
 - 🪦 **M4.0** — **DESCOPED 2026-07 → k3sm:M7.1** (release-engineering pipeline). The single-server packaging/launchd/
   install + codesign/notarize/`.pkg` + goreleaser → `k3sm-io/homebrew-tap` + admin-kubeconfig-to-`~/.kube/config`
