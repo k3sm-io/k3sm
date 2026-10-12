@@ -25,6 +25,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -193,6 +194,62 @@ func (g *countingGetter) ConfigMap(_ context.Context, ns, name string) (*corev1.
 	return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}, nil
 }
 
+// vkCanaryDecision decides whether the Virtual Kubelet canary can run. An
+// empty dependency list means the test binary carries no dependency
+// information (Go 1.25/1.26 test binaries; Go 1.27 ones list them), so the
+// version cannot be confirmed and the canary skips. A non-empty list is
+// authoritative: a missing or different virtual-kubelet is an error.
+func vkCanaryDecision(deps []*debug.Module, pinned string) (skip bool, reason string, err error) {
+	if len(deps) == 0 {
+		return true, "build info lists no dependencies (Go 1.25/1.26 test binaries omit them; Go 1.27 and later carry the list): cannot confirm the Virtual Kubelet version", nil
+	}
+	var vkVersion string
+	for _, d := range deps {
+		if d.Path == "github.com/virtual-kubelet/virtual-kubelet" {
+			vkVersion = d.Version
+			if d.Replace != nil {
+				vkVersion = d.Replace.Version
+			}
+		}
+	}
+	if vkVersion != pinned {
+		return false, "", fmt.Errorf("Virtual Kubelet is %q, this canary was written against %s: re-read node/podcontroller.go and node/pod.go for any use of the Secret/ConfigMap/Service informers or listers, then update pinnedVKVersion", vkVersion, pinned)
+	}
+	return false, "", nil
+}
+
+func TestVKCanaryDecision(t *testing.T) {
+	const vk = "github.com/virtual-kubelet/virtual-kubelet"
+	tests := []struct {
+		name     string
+		deps     []*debug.Module
+		wantSkip bool
+		wantErr  bool
+	}{
+		{name: "nil deps skip", deps: nil, wantSkip: true},
+		{name: "empty deps skip", deps: []*debug.Module{}, wantSkip: true},
+		{name: "at pin runs", deps: []*debug.Module{{Path: vk, Version: pinnedVKVersion}}},
+		{name: "other version fails", deps: []*debug.Module{{Path: vk, Version: "v1.15.0"}}, wantErr: true},
+		{name: "absent from non-empty list fails", deps: []*debug.Module{{Path: "example.com/x", Version: "v1.0.0"}}, wantErr: true},
+		{name: "replace version is used", deps: []*debug.Module{{Path: vk, Version: "v0.0.1", Replace: &debug.Module{Path: "example.com/fork", Version: pinnedVKVersion}}}},
+		{name: "replace to other version fails", deps: []*debug.Module{{Path: vk, Version: pinnedVKVersion, Replace: &debug.Module{Path: "example.com/fork", Version: "v9.9.9"}}}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skip, reason, err := vkCanaryDecision(tt.deps, pinnedVKVersion)
+			if skip != tt.wantSkip {
+				t.Errorf("skip = %v, want %v", skip, tt.wantSkip)
+			}
+			if skip && reason == "" {
+				t.Error("skip without a reason")
+			}
+			if (err != nil) != tt.wantErr {
+				t.Errorf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // TestSCMAdaptersInformerNeverCalled is the canary on the Virtual Kubelet
 // version: through a full pod create/delete cycle VK must never ask the node's
 // Secret/ConfigMap/Service adapters for their informer, and never read a
@@ -205,17 +262,12 @@ func TestSCMAdaptersInformerNeverCalled(t *testing.T) {
 	if !ok {
 		t.Fatal("no build info: cannot confirm the Virtual Kubelet version this canary was written against")
 	}
-	var vkVersion string
-	for _, d := range bi.Deps {
-		if d.Path == "github.com/virtual-kubelet/virtual-kubelet" {
-			vkVersion = d.Version
-			if d.Replace != nil {
-				vkVersion = d.Replace.Version
-			}
-		}
+	skip, reason, err := vkCanaryDecision(bi.Deps, pinnedVKVersion)
+	if skip {
+		t.Skip(reason)
 	}
-	if vkVersion != pinnedVKVersion {
-		t.Fatalf("Virtual Kubelet is %q, this canary was written against %s: re-read node/podcontroller.go and node/pod.go for any use of the Secret/ConfigMap/Service informers or listers, then update pinnedVKVersion", vkVersion, pinnedVKVersion)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	const name = "k3sm-canary"
