@@ -603,9 +603,8 @@ func runServer(args []string) (err error) {
 	// 4e/4f. Each stop drains before exec.Stop's defer (LIFO runs it first).
 	stopProvisioner := startProvisioner(ctx, plan, cs, logger)
 	defer stopProvisioner()
-	mlxGPU, stopMLX := startMLXOperator(ctx, plan, restCfg, cs, logger)
-	defer stopMLX()
-	defer startInterconnectResolver(ctx, plan, restCfg, cs, logger)()
+	mlxGPU, stopOperators := startServerOperators(ctx, plan, restCfg, cs, logger)
+	defer stopOperators()
 	if sm.dataPathRefused != nil { // this server's pod range is not its own
 		return parkServerDataPath(ctx, opts, sm.dataPathRefused, logger)
 	}
