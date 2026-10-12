@@ -193,19 +193,10 @@ type manifestFile struct {
 	objs []*unstructured.Unstructured
 }
 
-// load walks the manifest tree in lexical order and decodes every YAML document it
-// finds, returning the decoded objects and the per-document decode failures separately
-// so that one malformed document cannot suppress its siblings.
-func (r *Reconciler) load() ([]*unstructured.Unstructured, []error) {
-	files, errs := r.loadFiles()
-	var objs []*unstructured.Unstructured
-	for _, f := range files {
-		objs = append(objs, f.objs...)
-	}
-	return objs, errs
-}
-
-// loadFiles is load, grouped by manifest file so a gated file can be skipped whole.
+// loadFiles walks the manifest tree in lexical order and decodes every YAML document
+// it finds, grouped by manifest file so a gated file can be decided whole. It returns
+// the per-document decode failures separately so that one malformed document cannot
+// suppress its siblings.
 func (r *Reconciler) loadFiles() ([]manifestFile, []error) {
 	var (
 		files []manifestFile

@@ -280,6 +280,16 @@ func TestMetricsServerAddonManifest(t *testing.T) {
 	})
 }
 
+// load is loadFiles flattened into one object list, in tree order.
+func (r *Reconciler) load() ([]*unstructured.Unstructured, []error) {
+	files, errs := r.loadFiles()
+	var objs []*unstructured.Unstructured
+	for _, f := range files {
+		objs = append(objs, f.objs...)
+	}
+	return objs, errs
+}
+
 // metricsServerMapper maps every kind the shipped set uses.
 func metricsServerMapper() meta.RESTMapper {
 	m := meta.NewDefaultRESTMapper(nil)
