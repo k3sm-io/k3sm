@@ -242,7 +242,7 @@ func TestPayloadSetIncludesEtcd(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "etcdctl")); err != nil {
 		t.Fatal(err)
 	}
-	if err := seedBinDir(discardLogger(), work, dir, DefaultKineVersion, DefaultKubeVersion, true); err != nil {
+	if err := seedBinDir(t.Context(), discardLogger(), work, dir, DefaultKineVersion, DefaultKubeVersion, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(binDir(work), etcdutlBinaryName)); !os.IsNotExist(err) {
@@ -280,7 +280,7 @@ func TestSeedBinDirReseedsEtcdUnderMarker(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, true); err != nil {
+			if err := seedBinDir(t.Context(), discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, true); err != nil {
 				t.Fatal(err)
 			}
 			if got, _ := os.ReadFile(marked.binPath(bd)); string(got) != tc.want {

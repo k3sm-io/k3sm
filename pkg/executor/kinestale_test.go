@@ -65,7 +65,7 @@ func TestKineVariantUpgradeOnAPackagedNode(t *testing.T) {
 			stage(t, bd, "unpatched-kine", old)
 			stage(t, payload, "payload-kine", tc.payloadMarker)
 
-			if err := seedBinDir(slog.New(slog.DiscardHandler), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
+			if err := seedBinDir(t.Context(), slog.New(slog.DiscardHandler), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 				t.Fatalf("seedBinDir: %v", err)
 			}
 			err := ensureKine(t.Context(), work, payload, DefaultKineVersion)

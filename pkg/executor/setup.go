@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/internal/atomicfile"
+	"k3sm.io/k3sm/internal/binsign"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/helmchart"
 )
@@ -261,7 +262,7 @@ func ensureControlPlaneBinariesVerified(ctx context.Context, logger *slog.Logger
 			return fmt.Errorf("%w: %s already contains control-plane binaries; stage into a clean directory so downloads can be digest-verified before signing",
 				ErrPayloadDigestUnpinned, bd)
 		}
-		if err := signBinaries(ctx, bd, cpBinaries); err != nil { // already acquired; ensure signed
+		if err := signBinaries(ctx, bd, healStamp(kubeMarkerPath(bd)), cpBinaries); err != nil { // already acquired; ensure signed
 			return err
 		}
 		reportStagedControlPlane(ctx, logger, bd, kubeVersion)
@@ -293,7 +294,8 @@ func downloadControlPlane(ctx context.Context, logger *slog.Logger, dir, kubeVer
 	if err := verifyControlPlaneDownload(logger, dir, kubeVersion, requirePin); err != nil {
 		return err
 	}
-	return signBinaries(ctx, dir, cpBinaries)
+	resignFresh(ctx, dir, cpBinaries)
+	return nil
 }
 
 // verifyControlPlaneDownload checks a freshly downloaded set against the pinned
@@ -863,8 +865,9 @@ func StageKine(ctx context.Context, destDir string) error {
 }
 
 // seedBinDir copies every payload binary present in payloadDir and absent from
-// the workdir bin into it (0755), so the subsequent ensure* steps find them
-// present and only re-sign — never shelling out to gh/go. A missing payloadDir
+// the workdir bin into it (0755, each on a new inode through atomicfile.InstallFile,
+// signed before it takes its name), so the subsequent ensure* steps find them
+// present and signed — never shelling out to gh/go. A missing payloadDir
 // or missing individual binary is NOT an error here: the ensure* fallbacks
 // still run and fail with their own actionable errors (dev shells keep working
 // with no payload at all).
@@ -890,7 +893,7 @@ func StageKine(ctx context.Context, destDir string) error {
 // withEtcd is the posture: etcd is seeded (and re-seeded under its marker) only in
 // the etcd posture. A kine-posture work dir never receives an etcd binary, even though
 // every payload carries one.
-func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersion string, withEtcd bool) error {
+func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersion string, withEtcd bool) error {
 	if payloadDir == "" {
 		return nil
 	}
@@ -949,14 +952,16 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 			continue // already present (a prior boot seeded/acquired it)
 		}
 		src := filepath.Join(payloadDir, name)
-		data, err := os.ReadFile(src)
-		if err != nil {
+		if _, err := os.Stat(src); err != nil {
 			if os.IsNotExist(err) {
 				continue // not staged; the ensure* fallback owns the error
 			}
 			return fmt.Errorf("read payload %s: %w", src, err)
 		}
-		if err := os.WriteFile(dst, data, 0o755); err != nil {
+		// On a NEW inode, never over the old one: a versioned re-seed replaces a
+		// binary a running child may still have mapped. The copy is signed (only
+		// if its signature does not already verify) before it takes the name.
+		if err := atomicfile.InstallFile(src, dst, 0o755, binsign.SignIfInvalid(ctx, binsign.Codesign{}, name)); err != nil {
 			return fmt.Errorf("seed %s from payload: %w", dst, err)
 		}
 	}
@@ -973,7 +978,7 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 	if restageKube {
 		// LAST, after the whole set. The payload's bytes were signed when it was
 		// staged and the ad-hoc signature is embedded in each Mach-O, so the copies
-		// are signed already; the ensure step re-signs them regardless.
+		// are signed already; the seed signed any that were not.
 		if err := writeKubeMarker(bd, kubeVersion); err != nil {
 			return err
 		}
@@ -1022,20 +1027,69 @@ func chmodExec(dir string) error {
 	return nil
 }
 
-// signBinaries ad-hoc signs (codesign -s - -f) each named binary so an arm64
-// Mach-O can exec on macOS — the same codesign-on-pull discipline k3sm uses for
-// pulled images. Signing failures are tolerated (best-effort: an already-valid
-// signature or a non-macOS CI host should not block bring-up); the binary fails
-// loudly at exec if it truly cannot run.
-func signBinaries(ctx context.Context, dir string, names []string) error {
+// signBinaries makes sure each named binary in dir carries a valid ad-hoc
+// signature so an arm64 Mach-O can exec on macOS. It runs on live work-dir binaries
+// at every boot, so it never writes one in place (see package binsign):
+//
+//   - binsign.HealOnce first replaces each binary once per stamp (the content of
+//     the set's version marker, or the versioned name), clearing a vnode an older
+//     k3sm may have left poisoned by its in-place `codesign -f`;
+//   - then binsign.EnsureSigned leaves a validly ad-hoc-signed binary alone and
+//     signs any other as a temp copy renamed over it.
+//
+// Signing failures are tolerated (best-effort: a non-macOS CI host should not block
+// bring-up, and a failure leaves the file as it was); the binary fails loudly at
+// exec if it truly cannot run.
+func signBinaries(ctx context.Context, dir, stamp string, names []string) error {
+	_ = binsign.HealOnce(ctx, binsign.Codesign{}, dir, stamp, names...)
 	for _, n := range names {
 		p := filepath.Join(dir, n)
-		if _, err := os.Stat(p); err != nil {
+		if _, err := os.Lstat(p); err != nil {
 			continue
 		}
-		_ = exec.CommandContext(ctx, "codesign", "-s", "-", "-f", p).Run()
+		_, _ = binsign.EnsureSigned(ctx, binsign.Codesign{}, p)
 	}
 	return nil
+}
+
+// reapStagingTemps removes the ".<name>.tmp-<digits>" files a killed atomicfile
+// install left in bd, for every binary the executor stages there and for the
+// binsign heal marker. It must run before any staging step of this boot, so no
+// live install's temp is removed.
+func reapStagingTemps(bd string) error {
+	for _, name := range append(PayloadBinaries(), binsign.HealMarkerName) {
+		if err := atomicfile.ReapOrphans(bd, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// healStamp is the HealOnce stamp for a set guarded by the version marker at
+// path: its content on one line, or "unmarked".
+func healStamp(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "unmarked"
+	}
+	s := strings.Join(strings.Fields(string(b)), " ")
+	if s == "" {
+		return "unmarked"
+	}
+	return s
+}
+
+// resignFresh ad-hoc signs each named, freshly downloaded binary in dir whatever
+// signature it carries (a downloaded set is always re-signed ad hoc), each through
+// a temp copy renamed over it. Best-effort, like signBinaries.
+func resignFresh(ctx context.Context, dir string, names []string) {
+	for _, n := range names {
+		p := filepath.Join(dir, n)
+		if _, err := os.Lstat(p); err != nil {
+			continue
+		}
+		_ = binsign.ResignByReplace(ctx, binsign.Codesign{}, p)
+	}
 }
 
 // writeServiceAccountKeys generates the SA RSA keypair (used by apiserver to

@@ -14,10 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package atomicfile installs a file at a path that must not already exist, so a
-// reader sees either no file or all of it, and an existing file is never replaced.
-// It is the one home of k3sm's temp-file + fsync + link(2) + directory-fsync install,
-// used for CA keypairs and the server-bootstrap secret.
+// Package atomicfile installs a file at a path through a temp file beside it, so a
+// reader sees either the old file or all of the new one. It is the one home of
+// k3sm's temp-file + fsync + link(2)/rename(2) + directory-fsync install: WriteNew
+// (never replaces; CA keypairs and the server-bootstrap secret), Replace (re-issued
+// material), and InstallFile / InstallReader, through which every executable or
+// dylib k3sm writes goes, so a binary is never rewritten in place (see
+// InstallReader for why that kills processes on macOS). The one other binary
+// writer is `k3sm install`, which builds a whole staged tree and swaps it in with
+// one rename, so it too never rewrites a live inode. TestNoInPlaceBinaryWrites
+// guards the rule.
 //
 // A temp file lives beside its target as ".<name>.tmp-<digits>". WriteNew removes it
 // on every return; only a hard kill between its creation and that removal can leave

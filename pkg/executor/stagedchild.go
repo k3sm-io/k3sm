@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"k3sm.io/k3sm/internal/binsign"
 )
 
 // stagedChild declares one control-plane child that is BUILT from source at a pinned
@@ -29,12 +31,14 @@ import (
 // The declaration names the child; ensureInto owns the staging choreography, so every
 // such child gets the same guarantees without copying them:
 //
-//   - a no-op (re-sign only) when, and only when, the marker vouches for exactly
-//     (version, variant) and the binary is present;
+//   - a no-op (a re-sign only if the signature does not verify) when, and only
+//     when, the marker vouches for exactly (version, variant) and the binary is
+//     present;
 //   - the ErrNoGoToolchain preflight BEFORE anything is dropped, so a toolchain-less
 //     park leaves the previously staged binary and its marker untouched;
 //   - the stale marker dropped BEFORE the binary is touched;
-//   - the binary installed through a temp name + rename, then ad-hoc signed;
+//   - the binary installed on a new inode: copied to a temp, ad-hoc signed there,
+//     then renamed over the target (binsign.Install), never written in place;
 //   - the marker written LAST, atomically, so "marker matches" implies "the binary
 //     beside it is finished".
 type stagedChild struct {
@@ -102,7 +106,7 @@ func (c stagedChild) writeMarker(bd string) error {
 // ensureInto stages the child into bd under the protocol described on stagedChild.
 func (c stagedChild) ensureInto(ctx context.Context, bd string) error {
 	if c.staged(bd) {
-		return signBinaries(ctx, bd, []string{c.name})
+		return signBinaries(ctx, bd, strings.TrimSpace(c.markerContent()), []string{c.name})
 	}
 	// Preflight the toolchain BEFORE anything runs `go` (the module-cache probe is the
 	// first). Its absence is the one build failure that is deterministic: a launchd
@@ -132,17 +136,12 @@ func (c stagedChild) ensureInto(ctx context.Context, bd string) error {
 	if err != nil {
 		return err
 	}
-	// Stage through a temp name + rename so an interrupted copy cannot leave a
-	// truncated binary at the real path.
-	bin := c.binPath(bd)
-	if err := copyFile(built, bin+".tmp", 0o755); err != nil {
-		return fmt.Errorf("stage %s binary: %w", c.name, err)
-	}
-	if err := os.Rename(bin+".tmp", bin); err != nil {
+	// Stage on a new inode: the copy is written and signed as a temp beside the
+	// target and only then renamed over it, so an interrupted copy cannot leave a
+	// truncated binary at the real path, the real path never names unsigned bytes,
+	// and a running child's mapping of the old binary is never rewritten.
+	if err := binsign.Install(ctx, binsign.Codesign{}, built, c.binPath(bd), 0o755); err != nil {
 		return fmt.Errorf("install %s binary: %w", c.name, err)
-	}
-	if err := signBinaries(ctx, bd, []string{c.name}); err != nil {
-		return err
 	}
 	// LAST: the marker vouches for a staged, signed binary.
 	return c.writeMarker(bd)

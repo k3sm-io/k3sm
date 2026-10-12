@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -165,5 +167,241 @@ func TestReplaceNeverFollowsALinkAndResetsTheMode(t *testing.T) {
 		if isTempOf(e.Name(), tempPrefix("client.key")) || isTempOf(e.Name(), tempPrefix("linked.key")) {
 			t.Fatalf("temp file left behind: %s", e.Name())
 		}
+	}
+}
+
+// TestInstallFileUsesANewInode pins the binary install: the bytes and mode land
+// at dst on a NEW inode, prepare runs on the temp before dst names it, an fd held
+// on the old file still reads the old bytes, a prepare error leaves dst untouched,
+// and no temp survives any return.
+func TestInstallFileUsesANewInode(t *testing.T) {
+	inode := func(t *testing.T, p string) uint64 {
+		t.Helper()
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Sys().(*syscall.Stat_t).Ino
+	}
+	t.Run("replaces on a new inode, prepare on the temp first", func(t *testing.T) {
+		dir := t.TempDir()
+		src, dst := filepath.Join(t.TempDir(), "src"), filepath.Join(dir, "bin")
+		if err := os.WriteFile(src, []byte("new-bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst, []byte("old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		before := inode(t, dst)
+		held, err := os.Open(dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = held.Close() }()
+		var prepared string
+		err = InstallFile(src, dst, 0o755, func(tmp string) error {
+			prepared = tmp
+			if got, _ := os.ReadFile(dst); string(got) != "old" {
+				t.Errorf("dst already reads %q while the temp is prepared", got)
+			}
+			if !isTempOf(filepath.Base(tmp), tempPrefix("bin")) || filepath.Dir(tmp) != dir {
+				t.Errorf("prepare got %s, want a temp beside dst", tmp)
+			}
+			f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_APPEND, 0)
+			if err != nil {
+				return err
+			}
+			_, _ = f.WriteString("+signed")
+			return f.Close()
+		})
+		if err != nil {
+			t.Fatalf("InstallFile: %v", err)
+		}
+		if prepared == "" {
+			t.Fatal("prepare never ran")
+		}
+		if got, _ := os.ReadFile(dst); string(got) != "new-bytes+signed" {
+			t.Errorf("dst = %q, want the prepared bytes", got)
+		}
+		if fi, _ := os.Lstat(dst); fi.Mode().Perm() != 0o755 {
+			t.Errorf("dst mode %v, want 0755", fi.Mode())
+		}
+		if inode(t, dst) == before {
+			t.Error("dst kept its inode: it was rewritten in place")
+		}
+		buf := make([]byte, 16)
+		n, _ := held.ReadAt(buf, 0)
+		if string(buf[:n]) != "old" {
+			t.Errorf("the held old file reads %q, want %q", buf[:n], "old")
+		}
+		if names := dirNames(t, dir); !slices.Equal(names, []string{"bin"}) {
+			t.Errorf("dir holds %v, want [bin]", names)
+		}
+	})
+	t.Run("src == dst re-installs the file's own bytes", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "bin")
+		if err := os.WriteFile(p, []byte("self"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		before := inode(t, p)
+		if err := InstallFile(p, p, 0o700, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(p); string(got) != "self" || inode(t, p) == before {
+			t.Errorf("content %q, same inode %v; want the same bytes on a new inode", got, inode(t, p) == before)
+		}
+	})
+	t.Run("a prepare error leaves dst untouched and no temp", func(t *testing.T) {
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "bin")
+		if err := os.WriteFile(dst, []byte("old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		before := inode(t, dst)
+		boom := errors.New("sign failed")
+		err := InstallReader(strings.NewReader("new"), dst, 0o755, func(string) error { return boom })
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the prepare error", err)
+		}
+		if got, _ := os.ReadFile(dst); string(got) != "old" || inode(t, dst) != before {
+			t.Errorf("dst = %q (inode changed %v), want it untouched", got, inode(t, dst) != before)
+		}
+		if names := dirNames(t, dir); !slices.Equal(names, []string{"bin"}) {
+			t.Errorf("dir holds %v, want [bin]", names)
+		}
+	})
+	t.Run("a symlink at dst is replaced, not followed", func(t *testing.T) {
+		dir := t.TempDir()
+		victim, link := filepath.Join(dir, "victim"), filepath.Join(dir, "bin")
+		if err := os.WriteFile(victim, []byte("victim"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(victim, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := InstallReader(strings.NewReader("new"), link, 0o755, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(victim); string(got) != "victim" {
+			t.Errorf("wrote through the link: victim = %q", got)
+		}
+		if fi, err := os.Lstat(link); err != nil || !fi.Mode().IsRegular() {
+			t.Errorf("dst is %v (%v), want a regular file", fi.Mode(), err)
+		}
+	})
+}
+
+// TestInstallReaderKeepsTheOwner pins ownership: running as root the new file
+// takes the owner and group of the regular file it replaces (the temp is chowned
+// before the rename), a first install keeps the euid's, and without root nothing
+// is chowned. Root is faked at the geteuid/lchown seams.
+func TestInstallReaderKeepsTheOwner(t *testing.T) {
+	type chownCall struct {
+		path     string
+		uid, gid int
+	}
+	fake := func(t *testing.T, euid int) *[]chownCall {
+		var calls []chownCall
+		origE, origC := geteuid, lchown
+		t.Cleanup(func() { geteuid, lchown = origE, origC })
+		geteuid = func() int { return euid }
+		lchown = func(p string, uid, gid int) error {
+			if _, err := os.Lstat(p); err != nil {
+				t.Errorf("chown of %s, which does not exist (after the rename?)", p)
+			}
+			calls = append(calls, chownCall{p, uid, gid})
+			return nil
+		}
+		return &calls
+	}
+	t.Run("root, replacing: the old owner and group", func(t *testing.T) {
+		calls := fake(t, 0)
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "bin")
+		if err := os.WriteFile(dst, []byte("old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fi, _ := os.Lstat(dst)
+		st := fi.Sys().(*syscall.Stat_t)
+		if err := InstallReader(strings.NewReader("new"), dst, 0o755, nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("chown calls %v, want one", *calls)
+		}
+		c := (*calls)[0]
+		if c.uid != int(st.Uid) || c.gid != int(st.Gid) || !isTempOf(filepath.Base(c.path), tempPrefix("bin")) {
+			t.Errorf("chown %+v, want the temp to %d:%d", c, st.Uid, st.Gid)
+		}
+	})
+	t.Run("root, first install: the euid's", func(t *testing.T) {
+		calls := fake(t, 0)
+		if err := InstallReader(strings.NewReader("new"), filepath.Join(t.TempDir(), "bin"), 0o755, nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 0 {
+			t.Errorf("chown calls %v on a first install, want none", *calls)
+		}
+	})
+	t.Run("not root: never chowned", func(t *testing.T) {
+		calls := fake(t, os.Geteuid()+1)
+		dst := filepath.Join(t.TempDir(), "bin")
+		if err := os.WriteFile(dst, []byte("old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := InstallReader(strings.NewReader("new"), dst, 0o755, nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(*calls) != 0 {
+			t.Errorf("chown calls %v without root, want none", *calls)
+		}
+	})
+}
+
+// TestInstallReaderRefusesAnUnsafeDir pins the directory check: a group- or
+// world-writable target directory is refused with ErrUnsafeDir before anything is
+// written (another writer could swap the temp between its signing and its rename),
+// unless it is sticky and owned by the euid.
+func TestInstallReaderRefusesAnUnsafeDir(t *testing.T) {
+	me := os.Geteuid()
+	tests := []struct {
+		name string
+		mode os.FileMode
+		euid int
+		ok   bool
+	}{
+		{"private 0755", 0o755, me, true},
+		{"group-writable 0775", 0o775, me, false},
+		{"world-writable 0777", 0o777, me, false},
+		{"sticky world-writable, ours", 0o777 | os.ModeSticky, me, true},
+		{"sticky world-writable, someone else's", 0o777 | os.ModeSticky, me + 1, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			orig := geteuid
+			t.Cleanup(func() { geteuid = orig })
+			geteuid = func() int { return tc.euid }
+			dir := t.TempDir()
+			if err := os.Chmod(dir, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			err := InstallReader(strings.NewReader("new"), filepath.Join(dir, "bin"), 0o755, func(string) error {
+				if !tc.ok {
+					t.Error("prepare ran in a refused directory")
+				}
+				return nil
+			})
+			if tc.ok && err != nil {
+				t.Fatalf("InstallReader: %v", err)
+			}
+			if !tc.ok {
+				if !errors.Is(err, ErrUnsafeDir) {
+					t.Fatalf("err = %v, want ErrUnsafeDir", err)
+				}
+				if names := dirNames(t, dir); len(names) != 0 {
+					t.Errorf("a refused install left %v", names)
+				}
+			}
+		})
 	}
 }

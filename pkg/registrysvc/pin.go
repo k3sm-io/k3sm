@@ -19,12 +19,14 @@ package registrysvc
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"k3sm.io/k3sm/internal/atomicfile"
+	"k3sm.io/k3sm/internal/binsign"
 )
 
 // The zot pin and its staging contract. The binary is accompanied by a VERSION
@@ -132,8 +134,12 @@ func EnsureZot(ctx context.Context, bd, payloadDir, version string) error {
 	if version == "" {
 		version = DefaultZotVersion
 	}
+	// Remove the temps a killed install left; nothing is staging zot yet.
+	if err := atomicfile.ReapOrphans(bd, ZotBinaryName); err != nil {
+		return fmt.Errorf("reap zot staging temps: %w", err)
+	}
 	if zotStaged(bd, version) {
-		return signBinary(ctx, ZotPath(bd))
+		return ensureZotSigned(ctx, bd)
 	}
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create bin dir %s: %w", bd, err)
@@ -145,16 +151,10 @@ func EnsureZot(ctx context.Context, bd, payloadDir, version string) error {
 	if err := os.Remove(zotMarkerPath(bd)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("clear zot version marker: %w", err)
 	}
-	if seedZot(bd, payloadDir, version) {
-		if err := signBinary(ctx, ZotPath(bd)); err != nil {
-			return err
-		}
+	if seedZot(ctx, bd, payloadDir, version) {
 		return writeZotMarker(bd, version)
 	}
 	if err := buildZot(ctx, bd, version); err != nil {
-		return err
-	}
-	if err := signBinary(ctx, ZotPath(bd)); err != nil {
 		return err
 	}
 	// LAST: the marker vouches for a staged, signed binary.
@@ -169,14 +169,15 @@ func EnsureZot(ctx context.Context, bd, payloadDir, version string) error {
 // the previous release's payload staged, and the lie would leave it serving the
 // old registry while claiming the new one. Every failure reads as "not seeded",
 // so the build path — which reports a real error — owns the diagnosis.
-func seedZot(bd, payloadDir, version string) bool {
+//
+// The copy is installed on a new inode and signed as a temp before it takes the
+// name (binsign.Install), so a zot the registry is still running is never
+// rewritten in place.
+func seedZot(ctx context.Context, bd, payloadDir, version string) bool {
 	if payloadDir == "" || !zotStaged(payloadDir, version) {
 		return false
 	}
-	if err := copyFile(ZotPath(payloadDir), ZotPath(bd)+".tmp", 0o755); err != nil {
-		return false
-	}
-	return os.Rename(ZotPath(bd)+".tmp", ZotPath(bd)) == nil
+	return binsign.Install(ctx, binsign.Codesign{}, ZotPath(payloadDir), ZotPath(bd), 0o755) == nil
 }
 
 // zotModuleCacheDir resolves the stable module cache the build downloads into,
@@ -225,12 +226,10 @@ func buildZot(ctx context.Context, bd, version string) error {
 	if _, statErr := os.Stat(built); statErr != nil {
 		built = filepath.Join(gopath, "bin", ZotBinaryName) // native
 	}
-	// Stage through a temp name + rename so an interrupted copy cannot leave a
-	// truncated binary at the real path.
-	if err := copyFile(built, ZotPath(bd)+".tmp", 0o755); err != nil {
-		return fmt.Errorf("stage zot binary: %w", err)
-	}
-	if err := os.Rename(ZotPath(bd)+".tmp", ZotPath(bd)); err != nil {
+	// Stage on a new inode, signed as a temp before the rename: an interrupted
+	// copy cannot leave a truncated binary at the real path, the real path never
+	// names unsigned bytes, and a running zot's mapping is never rewritten.
+	if err := binsign.Install(ctx, binsign.Codesign{}, built, ZotPath(bd), 0o755); err != nil {
 		return fmt.Errorf("install zot binary: %w", err)
 	}
 	return nil
@@ -288,32 +287,27 @@ func goInstallZot(ctx context.Context, version, gopath, modCache string) ([]byte
 	return cmd.CombinedOutput()
 }
 
-// signBinary ad-hoc signs (codesign -s - -f) a staged binary so an arm64 Mach-O
-// can exec on macOS. Signing failures are tolerated — an already-valid signature
-// or a non-macOS CI host must not block bring-up, and a binary that truly cannot
+// ensureZotSigned makes sure the staged zot at path carries a valid ad-hoc
+// signature so an arm64 Mach-O can exec on macOS. It runs at every start on the
+// live binary, so it never writes it in place (see package binsign): HealOnce
+// first replaces it once per staged version, clearing a vnode an older k3sm may
+// have left poisoned by its in-place `codesign -f`, and EnsureSigned then leaves
+// a validly ad-hoc-signed zot alone and signs any other as a temp copy renamed
+// over it. Signing failures are tolerated (a non-macOS CI host must not block
+// bring-up, and a failure leaves the file as it was); a binary that truly cannot
 // run fails loudly at exec.
-func signBinary(ctx context.Context, path string) error {
-	if _, err := os.Stat(path); err != nil {
+func ensureZotSigned(ctx context.Context, bd string) error {
+	path := ZotPath(bd)
+	if _, err := os.Lstat(path); err != nil {
 		return fmt.Errorf("stage zot: %s is absent after staging: %w", path, err)
 	}
-	_ = exec.CommandContext(ctx, "codesign", "-s", "-", "-f", path).Run()
+	stamp := "unmarked"
+	if b, err := os.ReadFile(zotMarkerPath(bd)); err == nil {
+		if f := strings.Join(strings.Fields(string(b)), " "); f != "" {
+			stamp = f
+		}
+	}
+	_ = binsign.HealOnce(ctx, binsign.Codesign{}, bd, stamp, ZotBinaryName)
+	_, _ = binsign.EnsureSigned(ctx, binsign.Codesign{}, path)
 	return nil
-}
-
-// copyFile copies src to dst with the given mode, replacing dst if present.
-func copyFile(src, dst string, mode os.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	return out.Close()
 }

@@ -29,6 +29,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"k3sm.io/k3sm/internal/binsign"
 	"k3sm.io/k3sm/pkg/defaults"
 )
 
@@ -154,10 +155,15 @@ type PodShimBuilder interface {
 	// server flag unset rather than pointing every pod's dyld at a dylib that is
 	// not there.
 	Build(ctx context.Context, name, outDir string) error
-	// Sign ad-hoc signs the built dylib (codesign -s - -f), mirroring
+	// Sign ad-hoc signs the dylib at path (binsign.Codesign), mirroring
 	// goExecShimBuilder.Sign. Best-effort — a signing failure must not fail
-	// provisioning.
-	Sign(ctx context.Context, path string) error
+	// provisioning. It is only ever given a path no pod can have mapped: a fresh
+	// build, or the temp copy binsign.EnsureSigned renames over a cached shim.
+	// identifier is the shim's final base name, the code identifier it carries.
+	Sign(ctx context.Context, path, identifier string) error
+	// Verify reports whether path carries a valid ad-hoc signature, so a cached
+	// shim that already does is never rewritten (binsign.EnsureSigned).
+	Verify(ctx context.Context, path string) (bool, error)
 }
 
 // clangPodShimBuilder is the production PodShimBuilder over the owning modules'
@@ -187,11 +193,16 @@ func (clangPodShimBuilder) Build(ctx context.Context, name, outDir string) error
 	return nil
 }
 
-// Sign ad-hoc signs path (codesign -s - -f), best-effort (mirrors
+// Sign ad-hoc signs path through binsign.Codesign, best-effort (mirrors
 // goExecShimBuilder.Sign).
-func (clangPodShimBuilder) Sign(ctx context.Context, path string) error {
-	_ = exec.CommandContext(ctx, "codesign", "-s", "-", "-f", path).Run()
+func (clangPodShimBuilder) Sign(ctx context.Context, path, identifier string) error {
+	_ = binsign.Codesign{}.Sign(ctx, path, identifier)
 	return nil
+}
+
+// Verify reports whether path's signature verifies (binsign.Codesign).
+func (clangPodShimBuilder) Verify(ctx context.Context, path string) (bool, error) {
+	return binsign.Codesign{}.Verify(ctx, path)
 }
 
 // moduleDir resolves a workspace module's source root via `go list -m`, so a
@@ -308,7 +319,7 @@ func (m *Manager) stagePodShims(ctx context.Context, instance string, datapath b
 // the source is available (never trusted on existence alone), and a cached
 // artifact is reused ONLY when the rebuild FAILS, only when it passes
 // helperProblem (a regular file this euid owns that nobody else can write), and
-// then with a STALE warning naming the build error, because the re-sign rewrites
+// then with a STALE warning naming the build error, because a re-sign replaces
 // the file and refreshes its mtime, so nothing else would show that the cached
 // shim may predate the source.
 //
@@ -348,8 +359,8 @@ func (m *Manager) provisionPodShim(ctx context.Context, instance, name string) (
 			return "", nil
 		}
 		// The failed build may have taken a while; re-check the target right
-		// before codesign rewrites it in place, so a link planted meanwhile is
-		// refused rather than followed.
+		// before it is re-signed, so a link planted meanwhile is refused rather
+		// than followed.
 		if err := refuseSymlink(shim); err != nil {
 			return "", err
 		}
@@ -360,7 +371,11 @@ func (m *Manager) provisionPodShim(ctx context.Context, instance, name string) (
 			return "", nil
 		}
 		fmt.Fprintf(m.out, "WARNING: %s is STALE: rebuild failed (%v); reusing the cached shim from an earlier build, which may predate the current source\n", name, buildErr)
-		_ = m.shimBuilder.Sign(ctx, shim)
+		// Re-signed only if its signature does not verify, and then as a copy
+		// renamed over it: every running pod has this dylib mapped, and an
+		// in-place rewrite would get every NEW pod killed at load (Code
+		// Signature Invalid). Best-effort, as the signature always was.
+		_, _ = binsign.EnsureSigned(ctx, m.shimBuilder, shim)
 	}
 	staged, err := m.podReadable(shim)
 	if err != nil || staged == "" {
@@ -494,7 +509,7 @@ func (m *Manager) buildPodShim(ctx context.Context, name, dir, shim string) (bui
 	// Re-sign so a stale ad-hoc signature from a prior toolchain does not wedge the
 	// load (mirrors provisionExecShim). Signed before the rename so codesign never
 	// writes at the shared stage path.
-	_ = m.shimBuilder.Sign(ctx, built)
+	_ = m.shimBuilder.Sign(ctx, built, name)
 	if err := os.Rename(built, shim); err != nil {
 		return nil, fmt.Errorf("stage %s: %w", shim, err)
 	}

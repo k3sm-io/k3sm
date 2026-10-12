@@ -37,6 +37,9 @@ type fakeBuilder struct {
 	buildErr   error    // when non-nil, Build fails (drives the hostprocess fallback)
 	built      []string // outPaths passed to Build
 	signed     []string // paths passed to Sign
+	signedIDs  []string // identifiers passed to Sign
+	verified   []string // paths passed to Verify
+	valid      bool     // what Verify reports (false: every file needs signing)
 	writeBytes string   // stub Mach-O content Build writes on success
 }
 
@@ -52,9 +55,15 @@ func (f *fakeBuilder) Build(_ context.Context, outPath string) error {
 	return os.WriteFile(outPath, []byte(content), 0o755)
 }
 
-func (f *fakeBuilder) Sign(_ context.Context, path string) error {
+func (f *fakeBuilder) Sign(_ context.Context, path, identifier string) error {
 	f.signed = append(f.signed, path)
+	f.signedIDs = append(f.signedIDs, identifier)
 	return nil
+}
+
+func (f *fakeBuilder) Verify(_ context.Context, path string) (bool, error) {
+	f.verified = append(f.verified, path)
+	return f.valid, nil
 }
 
 // newTestManagerWithBuilder builds a Manager over a fake System + fake builder.
@@ -86,6 +95,9 @@ func TestProvisionExecShimBuildsWhenAbsent(t *testing.T) {
 	// Signed where it was built (before the rename), never at the cache path.
 	if len(b.signed) != 1 || b.signed[0] != b.built[0] {
 		t.Errorf("signed = %v, want the staged build %v signed once", b.signed, b.built)
+	}
+	if len(b.signedIDs) != 1 || b.signedIDs[0] != execShimName {
+		t.Errorf("signed as %v, want the identifier %q", b.signedIDs, execShimName)
 	}
 	if got, readErr := os.ReadFile(shim); readErr != nil || string(got) != "stub-execshim" {
 		t.Errorf("helper at %s = %q, %v; want the fresh build installed", shim, got, readErr)
@@ -459,8 +471,12 @@ func TestProvisionExecShimKeepsCachedWhenRebuildFails(t *testing.T) {
 	if !ok || dir != m.devBinDir() {
 		t.Fatalf("provisionExecShim = (%q,%v), want the cached helper kept + ok", dir, ok)
 	}
-	if len(b.signed) != 1 || b.signed[0] != shim {
-		t.Errorf("signed = %v, want the cached helper re-signed once", b.signed)
+	// Re-signed once, as a temp copy beside it, never at the live path.
+	if len(b.signed) != 1 || !isTempBeside(b.signed[0], shim) {
+		t.Errorf("signed = %v, want one temp copy of the cached helper signed, never %s", b.signed, shim)
+	}
+	if got, _ := os.ReadFile(shim); string(got) != "cached" {
+		t.Errorf("cached helper = %q, want its bytes kept", got)
 	}
 }
 
