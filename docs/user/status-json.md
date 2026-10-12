@@ -144,6 +144,7 @@ four.
 | `rows` | array of rows | one per subsystem, in display order |
 | `next` | array of strings | the commands to run next, most urgent first; omitted when empty |
 | `peers` | array | reserved for mesh peers (`name`, `state`, `detail`); not emitted yet |
+| `interconnect` | object | the cluster's interconnect and its attached Pods (see [Interconnect](#interconnect)); omitted when the cluster has none, or the report could not read it |
 | `version` | object | the build that produced the report; `modules` is omitted when unknown |
 | `host` | string | the macOS version, empty when it could not be read |
 | `timestamp` | string | RFC 3339 |
@@ -151,7 +152,7 @@ four.
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig` and `runtimed`; some rows appear only when the
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
-`mesh-claims`, `node-resolver`, `shadow-shells`, `request-header`). Besides the daemon states above, a row's `state` may
+`mesh-claims`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
 `skip`, `drift`, `healthy`, `unhealthy` or `stale`.
 
@@ -168,6 +169,43 @@ snapshot it also carries `last-scheduled-snapshot-error` (the last failure) and
 `last-scheduled-snapshot-skipped` (when a snapshot was skipped and why: not enough free space, or
 the free space could not be read). Like every `wide` key, these are informational and not part of
 the contract.
+
+## Interconnect
+
+The `interconnect` object describes the cluster's [interconnect](interconnects.md), read from the
+`Interconnect` named `thunderbolt`. The `interconnect` row says the same thing as a sentence.
+
+```json
+"interconnect": {
+  "name": "thunderbolt",
+  "armed": true,
+  "armedBy": "alice",
+  "plaintext": true,
+  "members": 3,
+  "up": 2,
+  "segments": 1,
+  "outOfRange": [ "far-mac" ],
+  "pods": [ { "namespace": "mlx", "pod": "llama-0", "node": "studio", "address": "169.254.0.2" } ]
+}
+```
+
+| field | type | notes |
+|---|---|---|
+| `name` | string | the interconnect's name, its medium |
+| `armed` | boolean | whether an admin enabled it; nothing has an interconnect address until one does |
+| `armedBy` | string | the identity recorded when it was armed; omitted when none is recorded |
+| `plaintext` | boolean | `true` whenever it is armed: opted-in Pod traffic crosses the cable unencrypted |
+| `members` | number | the cabled nodes the server resolved |
+| `up` | number | the members that are usable |
+| `segments` | number | the groups of members that reach each other over cables |
+| `outOfRange` | array of strings | cabled nodes whose cluster index is above 30, which get no interconnect address; omitted when empty |
+| `pods` | array | every Pod whose `k3sm.io/InterconnectAttached` condition is `True`, sorted by namespace and name: `namespace`, `pod`, `node`, `address`; omitted when empty |
+
+The row's `state` is `disabled` (severity `skip`) while the interconnect is disarmed, `ok` when every
+member is up, and `partial` or `down` (severity `warn`) when a member is not up or a cabled node is
+out of range. The row never moves `verdict`. On a worker, whose node credential may not read the
+`Interconnect`, the row is `skip` and the object is omitted. `k3sm status cluster` lists each
+attached Pod in the row's `wide` keys.
 
 ## Rows
 
