@@ -241,6 +241,29 @@ func writeAndSync(f *os.File, data []byte, mode os.FileMode) error {
 }
 
 // checkDir refuses a directory others can write to (see ErrUnsafeDir).
+// CheckTrustedDir refuses a directory a less privileged user could write to or
+// owns: checkDir's test (group- or world-writable without the owner-held sticky
+// bit is ErrUnsafeDir), plus an owner that is neither root nor this process's
+// effective user. It is for a caller that trusts a file already in dir without
+// reinstalling it, the case InstallReader's own check never sees.
+func CheckTrustedDir(dir string) error {
+	if err := checkDir(dir); err != nil {
+		return err
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("atomicfile: stat %s: %w", dir, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%w: cannot read the owner of %s", ErrUnsafeDir, dir)
+	}
+	if st.Uid != 0 && int(st.Uid) != geteuid() {
+		return fmt.Errorf("%w: %s is owned by uid %d, neither root nor this process", ErrUnsafeDir, dir, st.Uid)
+	}
+	return nil
+}
+
 func checkDir(dir string) error {
 	fi, err := os.Stat(dir)
 	if err != nil {

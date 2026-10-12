@@ -405,3 +405,35 @@ func TestInstallReaderRefusesAnUnsafeDir(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckTrustedDir: a directory others may write to, or one owned by a uid that
+// is neither root nor this process, is refused; this process's own 0755 directory
+// passes. The owner is faked at the geteuid seam.
+func TestCheckTrustedDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckTrustedDir(dir); err != nil {
+		t.Fatalf("own 0755 dir refused: %v", err)
+	}
+	for _, mode := range []os.FileMode{0o775, 0o777} {
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckTrustedDir(dir); !errors.Is(err, ErrUnsafeDir) {
+			t.Errorf("mode %v: err = %v, want ErrUnsafeDir", mode, err)
+		}
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orig := geteuid
+	t.Cleanup(func() { geteuid = orig })
+	geteuid = func() int { return os.Geteuid() + 4242 } // the dir's owner is now "someone else"
+	if os.Geteuid() != 0 {
+		if err := CheckTrustedDir(dir); !errors.Is(err, ErrUnsafeDir) {
+			t.Errorf("a dir owned by another non-root uid: err = %v, want ErrUnsafeDir", err)
+		}
+	}
+}
