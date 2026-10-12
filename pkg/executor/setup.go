@@ -235,20 +235,26 @@ func ensureControlPlaneBinaries(ctx context.Context, logger *slog.Logger, workDi
 	return ensureControlPlaneBinariesVerified(ctx, logger, binDir(workDir), kubeVersion, false)
 }
 
-// ensureControlPlaneBinariesVerified is the acquisition path, optionally gated on
-// the pinned digests. verify is true for the packaging producer (StagePayload),
-// whose output is about to be archived and published, and false for the dev boot
-// fallback, which may legitimately run at an unpinned kubeVersion.
+// ensureControlPlaneBinariesVerified is the acquisition path. Every download is
+// verified against the pinned digests whenever kubeVersion has a pin (see
+// verifyControlPlaneDownload). requirePin is true for the packaging producer
+// (StagePayload), whose output is about to be archived and published, so an
+// unpinned version is refused there; it is false for the boot path, where a dev may
+// legitimately run an unpinned kubeVersion and gets a Warn instead.
+//
+// The boot path downloads into a scratch dir beside the set (restageFromRelease), so
+// a refused download never leaves bytes in the working set that a later boot would
+// sign and run. The packaging path downloads straight into its clean destination, so
+// VerifyPayloadSet still sees every asset the release carried.
 //
 // A PRESENT set is never re-acquired on the packaging path and never fails the boot
 // path: the boot checks the set's version marker (one small file read, never a hash
-// of the binaries — VerifyDownloadedDigests is packaging-only, because signing has
-// already rewritten the bytes) and reports what it found. A stale set is still a
-// self-consistent control plane, and serving on it beats refusing to serve; see
-// reportStagedControlPlane for the three outcomes.
-func ensureControlPlaneBinariesVerified(ctx context.Context, logger *slog.Logger, bd, kubeVersion string, verify bool) error {
+// of the binaries — signing has already rewritten the bytes) and reports what it
+// found. A stale set is still a self-consistent control plane, and serving on it
+// beats refusing to serve; see reportStagedControlPlane for the three outcomes.
+func ensureControlPlaneBinariesVerified(ctx context.Context, logger *slog.Logger, bd, kubeVersion string, requirePin bool) error {
 	if _, err := os.Stat(filepath.Join(bd, "kube-apiserver")); err == nil {
-		if verify {
+		if requirePin {
 			// Already-present bytes are already signed, and signing rewrites the
 			// Mach-O, so their digests can no longer be compared against upstream.
 			// A publishable payload must be built from a clean directory.
@@ -261,19 +267,20 @@ func ensureControlPlaneBinariesVerified(ctx context.Context, logger *slog.Logger
 		reportStagedControlPlane(ctx, logger, bd, kubeVersion)
 		return nil
 	}
-	if err := downloadControlPlane(ctx, bd, kubeVersion, verify); err != nil {
+	if !requirePin {
+		return restageFromRelease(ctx, logger, bd, kubeVersion)
+	}
+	if err := downloadControlPlane(ctx, logger, bd, kubeVersion, true); err != nil {
 		return err
 	}
-	// LAST: the marker vouches for a downloaded (and, on the packaging path,
-	// digest-verified) and signed set.
+	// LAST: the marker vouches for a downloaded, digest-verified and signed set.
 	return writeKubeMarker(bd, kubeVersion)
 }
 
 // downloadControlPlane fetches the kubeVersion release into dir, makes it
-// executable, verifies the pinned digests when verify is set, and signs the set.
-// It does not write the marker: each caller writes it once the set is where it
-// belongs.
-func downloadControlPlane(ctx context.Context, dir, kubeVersion string, verify bool) error {
+// executable, verifies it (verifyControlPlaneDownload), and signs the set. It does
+// not write the marker: each caller writes it once the set is where it belongs.
+func downloadControlPlane(ctx context.Context, logger *slog.Logger, dir, kubeVersion string, requirePin bool) error {
 	tag := kubeVersion + "-kwok.0-darwin-arm64"
 	if out, err := runControlPlaneDownload(ctx, tag, dir); err != nil {
 		return fmt.Errorf("download control-plane binaries %s: %w: %s", tag, err, out)
@@ -283,12 +290,25 @@ func downloadControlPlane(ctx context.Context, dir, kubeVersion string, verify b
 	}
 	// BEFORE signing: codesign rewrites the binary, so this is the only moment the
 	// downloaded bytes can be compared against the digests upstream published.
-	if verify {
-		if err := VerifyDownloadedDigests(dir, kubeVersion); err != nil {
-			return err
-		}
+	if err := verifyControlPlaneDownload(logger, dir, kubeVersion, requirePin); err != nil {
+		return err
 	}
 	return signBinaries(ctx, dir, cpBinaries)
+}
+
+// verifyControlPlaneDownload checks a freshly downloaded set against the pinned
+// digests whenever kubeVersion has a pin, on every path: the kwok-ci/k8s tag is
+// mutable, and these bytes become the cluster's apiserver whether a packaging run or
+// a dev boot fetched them. Without a pin, requirePin refuses (the packaging path);
+// otherwise the set is accepted with one Warn naming the version, since there is no
+// reviewed digest to compare against and inventing one would be worse.
+func verifyControlPlaneDownload(logger *slog.Logger, dir, kubeVersion string, requirePin bool) error {
+	if _, pinned := PinnedPayloadDigests(kubeVersion); pinned || requirePin {
+		return VerifyDownloadedDigests(dir, kubeVersion)
+	}
+	logger.Warn("control-plane binaries for an unpinned kube version were downloaded without digest verification",
+		"unpinned", kubeVersion, "dir", dir)
+	return nil
 }
 
 // runControlPlaneDownload runs the release download. It is a var so a test can stand
@@ -339,7 +359,7 @@ func reportStagedControlPlane(ctx context.Context, logger *slog.Logger, bd, kube
 	}
 	attrs := []any{"staged", staged, "pinned", kubeVersion, "dir", bd, "remedy", StaleControlPlaneRemedy}
 	if _, err := lookPathGh(); err == nil {
-		dlErr := restageFromRelease(ctx, bd, kubeVersion)
+		dlErr := restageFromRelease(ctx, logger, bd, kubeVersion)
 		if dlErr == nil {
 			logger.Info("control-plane binaries re-staged from the release (dev-shell fallback)",
 				"from", staged, "to", kubeVersion, "dir", bd)
@@ -356,22 +376,26 @@ func reportStagedControlPlane(ctx context.Context, logger *slog.Logger, bd, kube
 		attrs...)
 }
 
-// restageFromRelease is the dev-shell fallback for a stale set: download into a
-// scratch dir beside the set, so a failed or partial download never touches the
-// working binaries, then move the four into place and write the marker last.
+// restageFromRelease is the boot path's download, used for an absent set and as the
+// dev-shell fallback for a stale one: download into a scratch dir beside the set, so
+// a failed, partial or digest-refused download never touches the working binaries,
+// then move the four into place and write the marker last.
 //
 // The four renames are NOT shadow-staged (no swap of a whole directory), so a
 // failure between them leaves a torn set; it is reported as errTornControlPlaneSet.
-// That is acceptable only because this branch is dev-shell-only: it runs when `gh`
-// is on PATH, which a launchd daemon never has — a packaged install re-stages
+// That is acceptable only because this branch is dev-shell-only: it downloads with
+// `gh`, which a launchd daemon never has — a packaged install stages and re-stages
 // through seedBinDir from its payload instead.
-func restageFromRelease(ctx context.Context, bd, kubeVersion string) error {
+func restageFromRelease(ctx context.Context, logger *slog.Logger, bd, kubeVersion string) error {
+	if err := os.MkdirAll(bd, 0o755); err != nil {
+		return fmt.Errorf("create control-plane dir %s: %w", bd, err)
+	}
 	tmp, err := os.MkdirTemp(bd, ".kube-restage-")
 	if err != nil {
 		return fmt.Errorf("control-plane re-stage scratch dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(tmp) }()
-	if err := downloadControlPlane(ctx, tmp, kubeVersion, false); err != nil {
+	if err := downloadControlPlane(ctx, logger, tmp, kubeVersion, false); err != nil {
 		return err
 	}
 	for _, name := range cpBinaries {
@@ -780,10 +804,10 @@ func StagePayload(ctx context.Context, destDir string) error {
 	// Fail closed on the packaging path: these bytes are about to be archived and
 	// published, so a third-party tag that moved (or an extra asset riding along)
 	// must stop the release rather than ship. The digest check happens INSIDE the
-	// download, before ad-hoc signing rewrites the Mach-O. The boot-path callers
-	// are deliberately not gated — a dev fallback download is not a published
-	// artifact, and may run at an unpinned version. The logger is unused on this
-	// path: a present set is refused before anything would be reported.
+	// download, before ad-hoc signing rewrites the Mach-O. The boot path verifies
+	// too whenever a pin exists; only this path also refuses an unpinned version.
+	// The logger is unused on this path: a present set is refused before anything
+	// would be reported, and an unpinned version is refused rather than warned.
 	if err := ensureControlPlaneBinariesVerified(ctx, slog.New(slog.DiscardHandler), destDir, DefaultKubeVersion, true); err != nil {
 		return err
 	}

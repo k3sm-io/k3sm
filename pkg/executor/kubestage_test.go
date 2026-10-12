@@ -328,6 +328,7 @@ func TestEnsureControlPlaneBinariesReportsStagedVersion(t *testing.T) {
 	t.Run("stale marker, gh present: dev fallback re-stages the set", func(t *testing.T) {
 		fakeTool(t, "gh")
 		calls := fakeDownload(t, "downloaded")
+		pinFakeDigests(t, DefaultKubeVersion, "downloaded")
 		work := t.TempDir()
 		stageCPSet(t, binDir(work), "old", staleKubeVersion)
 		if err := ensureControlPlaneBinaries(t.Context(), discardLogger(), work, DefaultKubeVersion); err != nil {
@@ -460,6 +461,7 @@ func TestSeedBinDirRefusesOverMalformedControlPlaneMarker(t *testing.T) {
 func TestRestageFromReleaseReportsATornSet(t *testing.T) {
 	fakeTool(t, "gh")
 	fakeDownload(t, "downloaded")
+	pinFakeDigests(t, DefaultKubeVersion, "downloaded")
 	work := t.TempDir()
 	stageCPSet(t, binDir(work), "old", staleKubeVersion)
 	// kubectl is renamed last; a non-empty directory in its place makes that rename fail
