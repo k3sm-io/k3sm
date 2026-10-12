@@ -509,10 +509,10 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// The datastore child: kine in the kine posture, the pinned etcd in the etcd
 	// posture. Neither posture stages the other's.
 	if s.cfg.Etcd != nil {
-		if err := provisionStep("etcd", ensureEtcdInto(ctx, binDir(s.cfg.WorkDir), DefaultEtcdVersion)); err != nil {
+		if err := provisionStep("etcd", ensureEtcd(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.PayloadBinDir)); err != nil {
 			return err
 		}
-	} else if err := provisionStep("kine", ensureKine(ctx, s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion)); err != nil {
+	} else if err := provisionStep("kine", ensureKine(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion)); err != nil {
 		return err
 	}
 	if err := provisionStep("sa-keys", writeServiceAccountKeys(ctx, s.cfg.WorkDir)); err != nil {

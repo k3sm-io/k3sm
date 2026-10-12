@@ -47,6 +47,51 @@ func TestStaleKinePayloadParksWithTheInstallRemedy(t *testing.T) {
 	}
 }
 
+// TestPayloadSignatureRefusalParksImmediately: a release-path boot that refuses its
+// payload (a binary not signed with the daemon's Developer ID, a binary not built at
+// its pins) or cannot read its own signature fails the same way on every lap, so it
+// parks on the first failure, classified through BringUpError and extra wrapping,
+// and the record names the reinstall remedy. A codesign that failed to run while
+// verifying (no sentinel) still takes the full threshold.
+func TestPayloadSignatureRefusalParksImmediately(t *testing.T) {
+	bringUp := func(err error) error {
+		return fmt.Errorf("start control plane: %w", &executor.BringUpError{Component: "provision/kine", Phase: executor.PhaseProvision, Err: err})
+	}
+	for _, tc := range []struct {
+		name      string
+		err       error
+		tripAfter int
+		remedy    string
+	}{
+		{"an unverified payload binary", bringUp(fmt.Errorf("%w: /Library/k3sm/bin/kine is not signed with team ABCDE12345's Developer ID Application certificate", executor.ErrPayloadSignature)), 1, executor.PayloadSignatureRemedy},
+		{"a payload binary at another pin", bringUp(fmt.Errorf("%w: /Library/k3sm/bin/kine is v0.16.0 nocgo+p1", executor.ErrPayloadStamp)), 1, executor.PayloadSignatureRemedy},
+		{"an unreadable own signature", bringUp(fmt.Errorf("%w: inspect /Library/k3sm/k3sm: exit 1", executor.ErrSelfSignatureUnreadable)), 1, executor.SelfSignatureRemedy},
+		{"codesign could not run while verifying", bringUp(errors.New("verify the signature of /Library/k3sm/bin/kine: signal: killed")), executor.CrashLoopThreshold, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for i := 1; i <= tc.tripAfter; i++ {
+				noteBringUpFailure(newCrashBreaker(dir, quietLogger()), quietLogger(), tc.err)
+				rec, err := executor.ReadCrashRecord(executor.CrashLoopPath(dir))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, want := rec.Tripped(), i == tc.tripAfter; got != want {
+					t.Fatalf("after %d failure(s): tripped = %v, want %v", i, got, want)
+				}
+			}
+			rec, _ := executor.ReadCrashRecord(executor.CrashLoopPath(dir))
+			last, _ := rec.Last()
+			if last.Permanent != (tc.remedy != "") || last.Remedy != tc.remedy {
+				t.Errorf("last entry %+v, want permanent=%v with remedy %q", last, tc.remedy != "", tc.remedy)
+			}
+			if tc.remedy != "" && !strings.Contains(last.Remedy, "reinstall k3sm from a correctly signed release") {
+				t.Errorf("remedy %q does not name the reinstall", last.Remedy)
+			}
+		})
+	}
+}
+
 // TestPermanentBringUpFailureParksImmediately is the two-tier breaker's gate
 // (B393). A kine pin bump on a daemon whose launchd PATH has no `go` used to
 // burn CrashLoopThreshold identical bring-up failures before parking, though
