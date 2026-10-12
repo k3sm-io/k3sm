@@ -33,7 +33,11 @@ const (
 	// with the value "true"; then only Nodes labelled "true" host. Any other
 	// value, on any number of Nodes, leaves allow-list mode off: a node cannot
 	// flip the whole cluster into allow-list mode (and starve every other host)
-	// by labelling itself "false".
+	// by labelling itself "false". A node CAN label itself "true" (NodeRestriction
+	// admits the self-edit): that turns allow-list mode on cluster-wide and, when
+	// no other Node carries the label, makes it the only host of every Service
+	// without a pool. k3s ServiceLB has the same posture; like the pool labels,
+	// this is placement, not isolation.
 	EnableLBLabel = "svclb.k3sm.io/enablelb"
 	// LBPoolLabel on a Service restricts its hosts to the Nodes in pool <value>.
 	// On a Node it is the single-pool membership form.

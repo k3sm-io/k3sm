@@ -361,6 +361,9 @@ There are no per-node `svclb-*` pods. Each node's k3sm process holds the listene
 - Pool and allow-list labels live on Node objects, which a node may edit on itself. A compromised
   node can label itself into a pool and attract that pool's traffic, the same posture as k3s
   ServiceLB. Treat pools as placement, not isolation.
+- The same applies to allow-list mode. A node that labels itself `svclb.k3sm.io/enablelb=true`
+  turns allow-list mode on for the whole cluster, and if no other node carries the label it becomes
+  the only host of every Service without a pool. k3s ServiceLB behaves the same way.
 - Two Services on the same port can share a node only if they never land on it together. On one
   node the second bind fails, that node stays out of the second Service's status, and a
   `HostNotBound` Warning Event on the Service names the node. A pod already listening on the port

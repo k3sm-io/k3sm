@@ -62,6 +62,17 @@ limitations under the License.
 // changes for a Service for the hold-down unless every stamped host reports
 // it, so a server restart does not retract every LoadBalancer in the cluster.
 //
+// Two known limits of the report trust. A restarted decider has no memory of
+// any node's previous Ready period, so it trusts an existing report
+// immediately, apart from the start-up hold-down; a report a since-restarted
+// node process left behind is normally cleared by that process's own
+// start-of-life reset. And the distrust keys on an observed NotReady to Ready
+// transition: a NotReady period short enough that an informer relist coalesces
+// it into one Ready update is never seen, by the decider or by the hoster, so
+// the incarnation does not rotate. A hoster that shuts down cleanly withdraws its report (an empty
+// report under its incarnation); a hoster that never wrote one (an agent older
+// than the server) is logged at Info, not evented.
+//
 // # Addresses
 //
 // Listeners bind the WILDCARD (0.0.0.0): every interface answers, matching
@@ -88,7 +99,10 @@ limitations under the License.
 // a node edit non-kubernetes.io labels on itself. A compromised node can
 // therefore label itself into a pool and attract that pool's traffic, the same
 // posture as k3s ServiceLB. Allow-list mode triggers only on the value "true",
-// so a node cannot starve the others by labelling itself "false". A node's
+// so a node cannot starve the others by labelling itself "false"; but a node
+// that labels ITSELF "true" turns allow-list mode on cluster-wide and, when no
+// other node carries the label, becomes the only host of every Service without
+// a pool (again as in k3s). A node's
 // report can only narrow the decider's choice: it never adds the node to a
 // stamp or puts an address it chose into a status.
 //
