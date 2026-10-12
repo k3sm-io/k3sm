@@ -52,9 +52,9 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # refuses before it downloads anything.
 PLACEHOLDER="UNPINNED-copy-from-upstream-for-the-tag"
 KUBE_TAG="v1.37.1"
-KUBE_SRC_SHA512="$PLACEHOLDER"
-KUBE_TAG_COMMIT="$PLACEHOLDER"
-KUBE_TAG_EPOCH="$PLACEHOLDER"
+KUBE_SRC_SHA512="0bf390bf277b36767b8ad494f7f65ae5e3658a5ab2c62061ec4074cac6a26270f4c6beb08d828d3c2323c44e230d04769fdfa532806925333a64d6fcf130f2f4"
+KUBE_TAG_COMMIT="f78e722310e50bcaca9276be22276d9e91d91308"
+KUBE_TAG_EPOCH="1790183182"
 KUBE_SRC_URL="https://dl.k8s.io/release/${KUBE_TAG}/kubernetes-src.tar.gz"
 
 # The binaries, in payload order; each is built from ./cmd/<name>.
