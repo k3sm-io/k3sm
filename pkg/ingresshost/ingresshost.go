@@ -115,8 +115,8 @@ type Config struct {
 	// (never loopback, never the zero Addr's "invalid IP" rendering).
 	AdvertiseAddr netip.Addr
 	// PodCIDR is the pod address space whose status entries this host owns and
-	// therefore retracts — the same contract, and the same predicate, as
-	// svclb.Config.PodCIDR (pass the CLUSTER pod CIDR).
+	// therefore retracts, through the same predicate as svclb's
+	// (svclb.Retractable); pass the CLUSTER pod CIDR.
 	PodCIDR netip.Prefix
 	// HTTPPort / HTTPSPort are the listener ports; 0 disables that listener.
 	// 80/443 is the production posture (netd-authorized via the canonical LB

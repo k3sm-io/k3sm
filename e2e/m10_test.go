@@ -417,10 +417,12 @@ func TestM10_PerPodIP(t *testing.T) {
 // ingress (darwin-net pkg/ingress behind pkg/ingresshost) routes by host+path
 // to a backend Service's ClusterIP VIP, the k3sm IngressClass exists, statuses
 // are honest (written only once the listeners are bound), and svclb (B32)
-// advertises a plain LoadBalancer Service the same way. The unit-level
-// contracts are pinned by pkg/ingresshost TestIngressHostingSecretDiscipline /
-// TestIngressClassAndStatus and pkg/svclb TestSvclbStatusHonesty; the shell
-// gate is hack/acceptance/m10-ingress.sh.
+// advertises a plain LoadBalancer Service only once a host reports it bound
+// (each node's hoster binds and reports on its own Node; the server's decider
+// writes the status). The unit-level contracts are pinned by pkg/ingresshost
+// TestIngressHostingSecretDiscipline / TestIngressClassAndStatus and pkg/svclb
+// TestSvclbBindHonesty / TestNodePoolSelection; the shell gate is
+// hack/acceptance/m10-ingress.sh.
 func TestM10_Ingress(t *testing.T) {
 	t.Skip("TODO(M10.3): against a live `k3sm server` started with the HIGH-PORT ingress listener (--ingress-http-port 8080 --ingress-https-port 8443 — the integration tier; the privileged :80/:443 netd-authorized leg is the LAB slice): (1) assert the IngressClass k3sm (controller k3sm.io/ingress) and the canonical kube-system/k3sm-ingress LoadBalancer Service (ports 80+443, selector-less, svclb-ignored) are provisioned; (2) run a hello-http backend pod + ClusterIP Service, apply an Ingress (class k3sm, host ingress.test, path /) and GET http://<nodeIP>:8080/ with Host: ingress.test → the backend identity, plus a wrong-Host negative → 404; (3) assert the Ingress status.loadBalancer.ingress carries the node InternalIP only AFTER the listener answers (bind-then-advertise); (4) create a plain type=LoadBalancer Service on a free high port fronting the same pod, assert svclb splices <nodeIP>:port → backend AND writes the status IP, then create a CONFLICTING LoadBalancer on the same port and assert its status stays empty (honesty negative); (5) apply an Ingress tls[] block with a kubernetes.io/tls Secret and assert SNI termination on :8443 serves that certificate and a rotated Secret is re-served after the next reconcile — M10.3 (closes the live leg of B32)")
 }

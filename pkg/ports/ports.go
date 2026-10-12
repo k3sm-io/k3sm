@@ -73,8 +73,8 @@ func Reserved(port int) bool {
 }
 
 // ReservedSet materializes Reserved as an explicit set keyed by the int32 a
-// corev1.ServicePort carries — the shape svclb.Config.ReservedPorts takes, so
-// the controller holds the reserved policy as DATA the assembler injected rather
+// corev1.ServicePort carries — the shape svclb.HosterConfig.ReservedPorts takes,
+// so the hoster holds the reserved policy as DATA the assembler injected rather
 // than importing this package and re-deciding it.
 func ReservedSet() map[int32]bool {
 	set := make(map[int32]bool, NodePortRangeMax-NodePortRangeMin+2)
