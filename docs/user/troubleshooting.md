@@ -302,7 +302,9 @@ kubectl describe service <name>
   no node is in, or allow-list mode is on (some node carries `svclb.k3sm.io/enablelb=true`) and no
   node in the pool is enabled. See [Multi-node](multi-node.md#node-pools).
 - **`HostNotBound`**. The named node was chosen but could not bind every port of the Service. Read
-  that node's log for the reason below.
+  that node's log for the reason below. A chosen node that has never reported at all, such as a
+  worker still running an older k3sm during an upgrade, raises no event: the server logs that the
+  node has not reported, and leaves it out of the Service's status until it does.
 
 Do not look in the unified log for the rest. The LoadBalancer decider and the ingress host log
 through `slog` to **stderr**, which the launchd job routes to a file, so the
