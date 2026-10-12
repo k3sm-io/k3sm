@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -51,6 +51,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", 
               (--report writes a redacted bug-report bundle)
   snapshot    back up and restore the kine SQLite datastore (snapshot save|restore)
   secrets-encrypt  report secrets encryption at rest (secrets-encrypt status)
+  interconnect     arm or disarm the Thunderbolt cable as an opt-in network (interconnect enable|disable)
   version     print version
 
 See docs/DESIGN.md for the roadmap.
@@ -126,6 +127,11 @@ func main() {
 		// The exit code is the verdict: a refused or unreadable state is
 		// non-zero, so a script can gate on it.
 		os.Exit(runSecretsEncrypt(os.Args[2:], os.Stdout, os.Stderr))
+	case "interconnect":
+		if err := runInterconnect(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm interconnect:", err)
+			os.Exit(1)
+		}
 	case "kubectl":
 		if err := runKubectl(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm kubectl:", err)

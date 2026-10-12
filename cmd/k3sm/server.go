@@ -605,6 +605,7 @@ func runServer(args []string) (err error) {
 	defer stopProvisioner()
 	mlxGPU, stopMLX := startMLXOperator(ctx, plan, restCfg, cs, logger)
 	defer stopMLX()
+	defer startInterconnectResolver(ctx, plan, restCfg, cs, logger)()
 	if sm.dataPathRefused != nil { // this server's pod range is not its own
 		return parkServerDataPath(ctx, opts, sm.dataPathRefused, logger)
 	}
@@ -798,6 +799,9 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		// port, not address (Seatbelt cannot filter by IP), so a Service that
 		// reuses this port number is also unreachable from confined pods.
 		deniedLocalPorts: opts.deniedLocalPorts(),
+		// The resolver's metrics, so the node's kubelet endpoint serves the
+		// server-side counters beside its own.
+		interconnectMetrics: plan.interconnectMetrics,
 	}
 
 	// 4f-bis. The control-plane node's OWN kubelet serving cert.

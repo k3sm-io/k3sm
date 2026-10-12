@@ -58,6 +58,7 @@ import (
 	"k3sm.io/k3sm/pkg/clustermirror"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/ports"
@@ -237,6 +238,11 @@ type nodeOptions struct {
 	// executor kine port; a standalone `k3sm node`/`k3sm agent` runs no kine on
 	// this node and sets nothing.
 	deniedLocalPorts []int
+
+	// interconnectMetrics is the process's interconnect metrics, served on the
+	// kubelet endpoint at interconnect.MetricsPath. `k3sm server` shares the
+	// resolver's value; nil (agent, `k3sm node`) makes startNode create its own.
+	interconnectMetrics *interconnect.Metrics
 
 	// attachRuntimeInfo, when non-nil, is called ONCE with the node's in-process
 	// runtime as soon as it is built, so a consumer started EARLIER in the same
@@ -868,6 +874,10 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	mirrors.Start(ctx)
 	opts.imageMirrors = mirrors
 
+	if opts.interconnectMetrics == nil {
+		opts.interconnectMetrics = interconnect.NewMetrics()
+	}
+
 	prov, netAdapter, runtimeLabel, caps, err := buildProvider(ctx, opts, cs, recorder)
 	if err != nil {
 		return err
@@ -1042,8 +1052,10 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		// distinguish it from "no tail at all"; this handler decodes
 		// v1.PodLogOptions the way a kubelet does and reads the file with the
 		// pointer intact. Empty when the runtime keeps no CRI log tree (the
-		// hostprocess node), in which case VK's route stands.
-		ExtraRoutes: containerLogRoutes(prov),
+		// hostprocess node), in which case VK's route stands. The interconnect
+		// metrics ride the same authenticated endpoint at
+		// interconnect.MetricsPath.
+		ExtraRoutes: append(containerLogRoutes(prov), interconnectRoutes(opts.interconnectMetrics)...),
 		Objects:     objects,
 		// Replace VK's auto-Ready naive node provider with the real one: it samples
 		// this Mac for memory/disk/PID pressure and debounces the runtime's health
@@ -1121,6 +1133,11 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// the log GC: it acts on the provider's pod set, which is not the cluster's
 	// until the node is ready.
 	eviction.open()
+	// The interconnect reporter and desired handler start once the Node exists,
+	// because both act on this node's own Node annotations. They are stopped
+	// before the runtime closes (defers are LIFO).
+	stopInterconnect := startInterconnectNode(ctx, opts, cs, restCfg, recorder, opts.interconnectMetrics, slog.Default())
+	defer stopInterconnect()
 	slog.Default().Info(fmt.Sprintf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir))
 
 	return awaitNodeExit(ctx, errc, stopRuntime)

@@ -70,6 +70,9 @@ func TestServerPhaseStopsAreNeverNil(t *testing.T) {
 		{"embedded add-on reconciler failed to build its clients", func() func() {
 			return startEmbeddedAddons(ctx, serverPlan{}, badREST, fake.NewSimpleClientset(), logger)
 		}},
+		{"interconnect resolver failed to build its clients", func() func() {
+			return startInterconnectResolver(ctx, serverPlan{}, badREST, nil, logger)
+		}},
 		{"mlx operator failed to build its clients", func() func() {
 			gpu, stop := startMLXOperator(ctx, serverPlan{}, badREST, nil, logger)
 			if gpu == nil {
