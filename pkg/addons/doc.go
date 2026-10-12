@@ -146,23 +146,40 @@ limitations under the License.
 //
 // # Gated add-ons
 //
-// Some add-ons can serve only on some servers. A file listed in requirements is
-// applied only when its requirement holds under the Posture the server passes in;
-// otherwise it is skipped, the reason is logged once at Info, and any of its objects
-// k3sm applied earlier are withdrawn, the APIService first, because an APIService
-// with no serving backend breaks aggregated discovery and wedges namespace deletion.
-// An object of the same name that k3sm did not apply is the operator's and is left.
+// Some add-ons can serve only on some clusters. A gated file is decided before any of
+// it is applied, in this order:
 //
-// metrics-server is gated on two server facts: the kubelet serving certs chain to the
-// CA in kube-root-ca.crt (the mesh serving posture; on a single-node server they are
-// self-signed and its verified scrape fails), and the vm runtime is usable (its image
-// is Linux).
+//   - Ownership guard. metrics-server.yaml's guard is the APIService
+//     v1beta1.metrics.k8s.io, read by name. If it exists and its managedFields carry no
+//     apply by k3sm, the operator runs metrics: the file is skipped whole, nothing is
+//     applied (so a forced apply never adopts the operator's objects) and nothing is
+//     withdrawn (so no later posture change can delete them). A failed read also
+//     leaves the file untouched.
+//   - Undecided posture. If the server could not read the facts below, the file is
+//     left untouched rather than withdrawn on a transient failure.
+//   - Requirement. If it fails, the file is skipped and any of its objects k3sm applied
+//     earlier are withdrawn, the APIService first, because an APIService with no
+//     serving backend breaks aggregated discovery and wedges namespace deletion. An
+//     object of the same name that k3sm did not apply is the operator's and is left.
+//
+// Every skip logs its reason once at Info.
+//
+// metrics-server's requirement is two facts. The kubelet serving certs chain to the CA
+// in kube-root-ca.crt: the mesh serving posture, inferred by the server from its
+// mesh-provisioned cluster-CA serving pair (on a single-node server the kubelet cert
+// is self-signed and the verified scrape fails). And at least one Node carries the vm
+// RuntimeClass label (k3sm.io/virtualization=true), since the image is Linux; that is
+// a cluster fact, so a server that cannot host guests still applies it for a
+// vm-capable worker. Both are read once per server start, when Converge runs: a node
+// gaining or losing the label, or a cluster changing posture, takes effect at the
+// next server start. The same holds for the first start of a fresh cluster, where no
+// Node is registered yet when Converge runs, so metrics-server first lands on the
+// start after a vm-capable node has registered.
 //
 // Converge-only additionally makes the reconciler safe under HA with no coordination:
 // k3sm has no in-Go leader-election primitive, and an apply-only reconciler on a second
-// server converges to the same state instead of racing a peer's prune. The gate is the
-// exception: two HA servers that disagree on a gated add-on's Posture (one can host vm
-// guests, the other cannot) alternately apply and withdraw it, each on its own start.
+// server converges to the same state instead of racing a peer's prune. The gate keeps
+// that property: its facts are cluster facts every HA server reads alike.
 //
 // # Failure posture: log-and-continue, never fail-closed
 //

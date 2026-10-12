@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
@@ -42,6 +43,7 @@ import (
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/k3sm/pkg/runtimeclass"
 	"k3sm.io/k3sm/pkg/svclb"
 )
 
@@ -55,7 +57,7 @@ func noStop() {}
 
 // provisionServerCluster is steps 3–3c: the cluster-scoped admission policies +
 // the vm RuntimeClass, the fail-closed RBAC graph, and the embedded add-ons.
-func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, vmCapable bool, logger *slog.Logger) error {
+func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) error {
 	opts := plan.opts
 	// 3. Provision the cluster-scoped admission policies + the vm RuntimeClass.
 	// Extracted so the SET is testable against a fake clientset: what this
@@ -92,7 +94,7 @@ func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.
 	// the control plane is up without it. The shipped set is metrics-server
 	// (pkg/addons/manifests/metrics-server.yaml), applied only where it can serve
 	// (addonPosture); elsewhere it is withdrawn and the reason logged.
-	if ar, err := addons.NewFromConfig(addons.FS(), restCfg, addonPosture(plan, vmCapable)); err != nil {
+	if ar, err := addons.NewFromConfig(addons.FS(), restCfg, addonPosture(ctx, plan, cs.CoreV1().Nodes())); err != nil {
 		logger.Error("build embedded add-on reconciler", "err", err)
 	} else if err := ar.Converge(ctx); err != nil {
 		logger.Error("converge embedded add-on manifests", "err", err)
@@ -665,23 +667,44 @@ func repairServerNodeLabels(ctx context.Context, cs kubernetes.Interface, nodeNa
 	return nil
 }
 
-// addonPosture is the server facts the gated embedded add-ons are checked against.
+// addonPosture is the facts the gated embedded add-ons are checked against.
 //
-// ClusterCAKubeletServing is the mesh serving posture, read off the two facts that
-// make it true. plan.cfg.ServingCertFile/ServingKeyFile are set only by the mesh
-// provisioning (serverprovision.go), and they decide the executor's --root-ca-file:
-// the cluster CA, so kube-root-ca.crt is the cluster CA. plan.opts.meshIP is what
-// setServerKubeletServing keys on to issue this node's kubelet serving cert from that
-// same CA, and a worker exists only on a mesh cluster, where its join response
-// carries a cluster-CA-issued serving cert. On a single-node server both are empty:
-// the kubelet cert is self-signed and kube-root-ca.crt is the apiserver's own CA.
+// ClusterCAKubeletServing is INFERRED, not observed: it is read off the
+// mesh-provisioned cluster-CA serving pair, not off any kubelet's certificate.
+// plan.cfg.ServingCertFile/ServingKeyFile are set only by the mesh provisioning
+// (serverprovision.go), and they decide the executor's --root-ca-file, so
+// kube-root-ca.crt is the cluster CA. plan.opts.meshIP is what
+// setServerKubeletServing keys on to issue this node's kubelet serving cert from
+// that same CA, and a worker exists only on a mesh cluster, where its join
+// response carries a cluster-CA-issued serving cert. On a single-node server both
+// are empty: the kubelet cert is self-signed and kube-root-ca.crt is the
+// apiserver's own CA. TestAddonPosture pins the inference.
 //
-// VMUsable is vmBackendAvailable, the runtimed host probe that also decides this
-// node's k3sm.io/virtualization label, which the vm RuntimeClass's nodeSelector
-// requires.
-func addonPosture(plan serverPlan, vmCapable bool) addons.Posture {
-	return addons.Posture{
+// VMNode is a cluster fact: at least one Node carries the label the vm
+// RuntimeClass selects on (runtimeclass.LabelVirtualization=LabelTrue, as
+// applyVirtualizationLabel sets it), so every server of an HA pair computes the
+// same answer, and a server without vm does not withdraw an add-on running on a
+// vm-capable worker. It is read once, at this start: a node gaining or losing
+// the label takes effect at the next server start. A read failure leaves the
+// gated add-ons untouched (Posture.Undecided) rather than withdrawing them.
+func addonPosture(ctx context.Context, plan serverPlan, nodes nodeLister) addons.Posture {
+	p := addons.Posture{
 		ClusterCAKubeletServing: plan.opts.meshIP != "" && plan.cfg.ServingCertFile != "" && plan.cfg.ServingKeyFile != "",
-		VMUsable:                vmCapable,
 	}
+	list, err := nodes.List(ctx, metav1.ListOptions{
+		LabelSelector: runtimeclass.LabelVirtualization + "=" + runtimeclass.LabelTrue,
+		Limit:         1,
+	})
+	if err != nil {
+		p.Undecided = fmt.Sprintf("list nodes labelled %s: %v", runtimeclass.LabelVirtualization, err)
+		return p
+	}
+	p.VMNode = len(list.Items) > 0
+	return p
+}
+
+// nodeLister is the one call addonPosture makes: the clientset's
+// CoreV1().Nodes() satisfies it.
+type nodeLister interface {
+	List(ctx context.Context, opts metav1.ListOptions) (*corev1.NodeList, error)
 }

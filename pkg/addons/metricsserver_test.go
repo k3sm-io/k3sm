@@ -268,7 +268,7 @@ func TestMetricsServerAddonManifest(t *testing.T) {
 		if err := New(FS(), dc, metricsServerMapper()).WithPosture(servingPosture).Converge(context.Background()); err != nil {
 			t.Fatalf("converge: %v", err)
 		}
-		applies := verifyTrafficShape(t, dc.Actions())
+		applies := verifyTrafficShape(t, afterGuardRead(t, dc.Actions()))
 		if len(applies) != len(wantMetricsServerObjects) {
 			t.Fatalf("%d applies, want %d: %v", len(applies), len(wantMetricsServerObjects), applies)
 		}

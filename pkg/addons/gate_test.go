@@ -32,13 +32,14 @@ import (
 )
 
 // servingPosture is a server where metrics-server can serve: mesh serving certs
-// and a usable vm runtime.
-var servingPosture = Posture{ClusterCAKubeletServing: true, VMUsable: true}
+// and a vm-labelled node in the cluster.
+var servingPosture = Posture{ClusterCAKubeletServing: true, VMNode: true}
 
 // TestMetricsServerAddonGate is the gate on WHERE the metrics-server add-on is
 // applied. Applied where it cannot serve, its APIService stays unavailable,
 // which breaks aggregated discovery and wedges namespace deletion, so it is
-// applied only on the mesh serving posture with a usable vm runtime. Elsewhere
+// applied only on the mesh serving posture with a vm-labelled node, and never
+// over an operator's own metrics.k8s.io APIService. Elsewhere
 // it is skipped with one Info line naming the reason, and objects k3sm applied
 // earlier are withdrawn, the APIService first.
 func TestMetricsServerAddonGate(t *testing.T) {
@@ -67,7 +68,7 @@ func TestMetricsServerAddonGate(t *testing.T) {
 
 	t.Run("applied when both conditions hold", func(t *testing.T) {
 		actions, logs := converge(t, servingPosture)
-		if applies := verifyTrafficShape(t, actions); len(applies) != len(wantMetricsServerObjects) {
+		if applies := verifyTrafficShape(t, afterGuardRead(t, actions)); len(applies) != len(wantMetricsServerObjects) {
 			t.Errorf("%d applies, want %d", len(applies), len(wantMetricsServerObjects))
 		}
 		if logs != "" {
@@ -80,8 +81,8 @@ func TestMetricsServerAddonGate(t *testing.T) {
 		posture Posture
 		reason  string
 	}{
-		{"skipped on the single-node posture", Posture{VMUsable: true}, "single-node posture"},
-		{"skipped without a usable vm runtime", Posture{ClusterCAKubeletServing: true}, "vm runtime is not usable"},
+		{"skipped on the single-node posture", Posture{VMNode: true}, "single-node posture"},
+		{"skipped with no vm-labelled node", Posture{ClusterCAKubeletServing: true}, "no node carries the vm RuntimeClass label"},
 		{"skipped when neither holds", Posture{}, "single-node posture"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -118,7 +119,7 @@ func TestMetricsServerAddonGate(t *testing.T) {
 			live.SetManagedFields([]metav1.ManagedFieldsEntry{{Manager: manager, Operation: metav1.ManagedFieldsOperationApply, APIVersion: live.GetAPIVersion()}})
 			seed = append(seed, live)
 		}
-		actions, logs := converge(t, Posture{VMUsable: true}, seed...)
+		actions, logs := converge(t, Posture{VMNode: true}, seed...)
 
 		var deletes []k8stesting.DeleteActionImpl
 		for _, a := range actions {
@@ -147,6 +148,56 @@ func TestMetricsServerAddonGate(t *testing.T) {
 		}
 		if !strings.Contains(logs, "withdrawn=8") || !strings.Contains(logs, "leftNotAppliedByK3sm=1") {
 			t.Errorf("skip line does not count the withdrawal:\n%s", logs)
+		}
+	})
+
+	t.Run("a foreign metrics.k8s.io APIService is never adopted nor deleted", func(t *testing.T) {
+		objs, errs := (&Reconciler{fsys: FS()}).load()
+		if len(errs) != 0 {
+			t.Fatalf("load: %v", errs)
+		}
+		// The operator runs metrics-server: its APIService carries only its own
+		// manager. The other objects are seeded as k3sm-applied, the worst case
+		// for a withdrawal that must still not happen.
+		var seed []*unstructured.Unstructured
+		for _, o := range objs {
+			live := o.DeepCopy()
+			manager := FieldManager
+			if live.GetKind() == apiServiceKind {
+				manager = "kubectl-client-side-apply"
+			}
+			live.SetManagedFields([]metav1.ManagedFieldsEntry{{Manager: manager, Operation: metav1.ManagedFieldsOperationApply}})
+			seed = append(seed, live)
+		}
+		for _, p := range []Posture{servingPosture, {VMNode: true}, {ClusterCAKubeletServing: true}, {}} {
+			actions, logs := converge(t, p, seed...)
+			got := verbs(actions)
+			if got["patch"] != 0 || got["delete"] != 0 || got["list"] != 0 {
+				t.Errorf("posture %+v: verbs %v, want only the guard read", p, got)
+			}
+			if got["get"] != 1 {
+				t.Errorf("posture %+v: %d gets, want exactly the one guard read", p, got["get"])
+			}
+			if !strings.Contains(logs, foreignMetricsReason) {
+				t.Errorf("posture %+v: skip line does not name the foreign APIService:\n%s", p, logs)
+			}
+		}
+	})
+
+	t.Run("an undecided posture neither applies nor withdraws", func(t *testing.T) {
+		objs, _ := (&Reconciler{fsys: FS()}).load()
+		var seed []*unstructured.Unstructured
+		for _, o := range objs {
+			live := o.DeepCopy()
+			live.SetManagedFields([]metav1.ManagedFieldsEntry{{Manager: FieldManager, Operation: metav1.ManagedFieldsOperationApply}})
+			seed = append(seed, live)
+		}
+		actions, logs := converge(t, Posture{ClusterCAKubeletServing: true, Undecided: "list nodes: connection refused"}, seed...)
+		if got := verbs(actions); got["patch"] != 0 || got["delete"] != 0 {
+			t.Errorf("verbs %v, want no apply and no delete", got)
+		}
+		if !strings.Contains(logs, "connection refused") {
+			t.Errorf("skip line does not carry the undecided reason:\n%s", logs)
 		}
 	})
 
@@ -192,4 +243,19 @@ func TestMetricsServerAddonGate(t *testing.T) {
 		}
 		t.Fatal("no delete issued")
 	})
+}
+
+// afterGuardRead asserts that a gated metrics-server converge opened with exactly
+// one read, the Get of the ownership guard APIService by name, and returns the
+// actions after it.
+func afterGuardRead(t *testing.T, actions []k8stesting.Action) []k8stesting.Action {
+	t.Helper()
+	if len(actions) == 0 {
+		t.Fatal("no API traffic; want the ownership guard read first")
+	}
+	g, ok := actions[0].(k8stesting.GetActionImpl)
+	if !ok || g.GetResource().Resource != "apiservices" || g.GetName() != "v1beta1.metrics.k8s.io" {
+		t.Fatalf("first action = %v, want a Get of apiservices/v1beta1.metrics.k8s.io", actions[0])
+	}
+	return actions[1:]
 }

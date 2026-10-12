@@ -38,9 +38,15 @@ type Posture struct {
 	// certs and is the controller-manager's --root-ca-file. On a single-node
 	// server the kubelet cert is self-signed and it does not hold.
 	ClusterCAKubeletServing bool
-	// VMUsable reports that this server can host vm guests, the runtime a Linux
-	// add-on image runs in.
-	VMUsable bool
+	// VMNode reports that at least one Node in the cluster carries the label the
+	// vm RuntimeClass selects on, so a Linux add-on image has somewhere to run.
+	// It is a cluster fact, so every server computes the same answer.
+	VMNode bool
+	// Undecided, when set, says why the server could not establish the facts
+	// above. Every gated add-on is then left exactly as it is: neither applied
+	// nor withdrawn, because a transient read failure must not delete a working
+	// add-on.
+	Undecided string
 }
 
 // requirement returns why an add-on cannot serve under p, or "" when it can.
@@ -61,10 +67,53 @@ func metricsServerRequirement(p Posture) string {
 	switch {
 	case !p.ClusterCAKubeletServing:
 		return "kubelet serving certs do not chain to the in-cluster CA (single-node posture), so metrics-server's verified kubelet scrape cannot succeed"
-	case !p.VMUsable:
-		return "the vm runtime is not usable on this server, so the Linux metrics-server pod cannot run"
+	case !p.VMNode:
+		return "no node carries the vm RuntimeClass label (k3sm.io/virtualization), so the Linux metrics-server pod cannot run"
 	}
 	return ""
+}
+
+// ownershipGuard names, per gated file, the object whose presence under another
+// owner means the operator already runs that add-on. If it exists and k3sm did
+// not apply it, the whole file is skipped: nothing is applied (so a forced
+// apply never adopts the operator's objects) and nothing is withdrawn (so a
+// later posture change can never delete them).
+var ownershipGuard = map[string]*unstructured.Unstructured{
+	"metrics-server.yaml": guardObject("apiregistration.k8s.io/v1", apiServiceKind, "v1beta1.metrics.k8s.io"),
+}
+
+// foreignMetricsReason is the skip reason when the guard object is foreign.
+const foreignMetricsReason = "an existing metrics.k8s.io APIService not applied by k3sm"
+
+func guardObject(apiVersion, kind, name string) *unstructured.Unstructured {
+	o := &unstructured.Unstructured{}
+	o.SetAPIVersion(apiVersion)
+	o.SetKind(kind)
+	o.SetName(name)
+	return o
+}
+
+// foreignGuard reports whether file's guard object exists without a k3sm
+// apply in its managedFields. An absent guard, or one k3sm applied, is not
+// foreign. A read failure is returned, and the caller then leaves the file
+// alone.
+func (r *Reconciler) foreignGuard(ctx context.Context, file string) (bool, error) {
+	g, ok := ownershipGuard[file]
+	if !ok {
+		return false, nil
+	}
+	ri, err := r.resourceFor(g)
+	if err != nil {
+		return false, fmt.Errorf("ownership guard for %s: %w", file, err)
+	}
+	live, err := ri.Get(ctx, g.GetName(), metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("ownership guard for %s: get %s %s: %w", file, g.GetKind(), g.GetName(), err)
+	}
+	return !appliedByK3sm(live), nil
 }
 
 // apiServiceKind is the kind withdrawn first: an APIService whose backend is
@@ -178,10 +227,15 @@ func (r *Reconciler) resourceFor(obj *unstructured.Unstructured) (dynamic.Resour
 
 // logSkip records, once per Converge, why a gated add-on was not applied.
 func (r *Reconciler) logSkip(ctx context.Context, file, reason string, deleted, foreign int) {
+	r.log().InfoContext(ctx, "embedded add-on not applied",
+		"file", file, "reason", reason, "withdrawn", deleted, "leftNotAppliedByK3sm", foreign)
+}
+
+// log is the Reconciler's logger: the test seam when set, else slog.Default().
+func (r *Reconciler) log() *slog.Logger {
 	logger := r.logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger.InfoContext(ctx, "embedded add-on not applied: its serving condition does not hold",
-		"file", file, "reason", reason, "withdrawn", deleted, "leftNotAppliedByK3sm", foreign)
+	return logger
 }

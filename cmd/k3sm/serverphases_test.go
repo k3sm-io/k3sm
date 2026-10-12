@@ -18,11 +18,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	k8stesting "k8s.io/client-go/testing"
+
+	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
 // TestServerPhaseStopsAreNeverNil pins the contract runServer's unconditional
@@ -77,29 +85,45 @@ func TestServerPhaseStopsAreNeverNil(t *testing.T) {
 	}
 }
 
-// TestAddonPosture pins the server facts the gated embedded add-ons key on: the
-// mesh serving posture (a mesh IP AND the cluster-CA apiserver serving pair the
-// mesh provisioning writes) and the vm probe, each independently.
+// TestAddonPosture pins the facts the gated embedded add-ons key on. The kubelet
+// CA fact is inferred from the mesh-provisioned cluster-CA serving pair (a mesh IP
+// AND that pair); the vm fact is a CLUSTER fact, any Node carrying the vm
+// RuntimeClass label, so a vm-labelled worker counts even when the server itself
+// cannot host guests; and a failed node read is Undecided, never "no vm node".
 func TestAddonPosture(t *testing.T) {
 	mesh := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
 	mesh.cfg.ServingCertFile, mesh.cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
 	noPair := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
+	node := func(name string, labels map[string]string) *corev1.Node {
+		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
+	}
+	vmWorker := node("k3sm-worker", map[string]string{runtimeclass.LabelVirtualization: runtimeclass.LabelTrue})
+	plainServer := node("k3sm-server", map[string]string{"kubernetes.io/os": "darwin"})
+	falseLabel := node("k3sm-odd", map[string]string{runtimeclass.LabelVirtualization: "false"})
 	for _, tc := range []struct {
 		name      string
 		plan      serverPlan
-		vm        bool
+		nodes     []runtime.Object
+		listErr   error
 		wantCA    bool
-		wantVMUse bool
+		wantVM    bool
+		undecided bool
 	}{
-		{"mesh with vm", mesh, true, true, true},
-		{"mesh without vm", mesh, false, true, false},
-		{"single-node with vm", serverPlan{}, true, false, true},
-		{"mesh ip but no cluster-CA serving pair", noPair, true, false, true},
+		{"mesh, a vm-labelled worker and a non-vm server", mesh, []runtime.Object{plainServer, vmWorker}, nil, true, true, false},
+		{"mesh, no labelled node", mesh, []runtime.Object{plainServer}, nil, true, false, false},
+		{"mesh, a label with any other value does not count", mesh, []runtime.Object{plainServer, falseLabel}, nil, true, false, false},
+		{"single-node with a vm-labelled node", serverPlan{}, []runtime.Object{vmWorker}, nil, false, true, false},
+		{"mesh ip but no cluster-CA serving pair", noPair, []runtime.Object{vmWorker}, nil, false, true, false},
+		{"node read fails", mesh, nil, errors.New("connection refused"), true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := addonPosture(tc.plan, tc.vm)
-			if got.ClusterCAKubeletServing != tc.wantCA || got.VMUsable != tc.wantVMUse {
-				t.Errorf("addonPosture = %+v, want ClusterCAKubeletServing=%v VMUsable=%v", got, tc.wantCA, tc.wantVMUse)
+			cs := fake.NewSimpleClientset(tc.nodes...)
+			if tc.listErr != nil {
+				cs.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) { return true, nil, tc.listErr })
+			}
+			got := addonPosture(context.Background(), tc.plan, cs.CoreV1().Nodes())
+			if got.ClusterCAKubeletServing != tc.wantCA || got.VMNode != tc.wantVM || (got.Undecided != "") != tc.undecided {
+				t.Errorf("addonPosture = %+v, want ClusterCAKubeletServing=%v VMNode=%v undecided=%v", got, tc.wantCA, tc.wantVM, tc.undecided)
 			}
 		})
 	}

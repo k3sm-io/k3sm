@@ -140,15 +140,11 @@ func (r *Reconciler) Converge(ctx context.Context) error {
 	documents, applied := 0, 0
 	for _, f := range files {
 		documents += len(f.objs)
-		if req, gated := requirements[f.path]; gated {
-			if reason := req(r.posture); reason != "" {
-				deleted, foreign, err := r.withdraw(ctx, f.objs)
-				if err != nil {
-					errs = append(errs, err)
-				}
-				r.logSkip(ctx, f.path, reason, deleted, foreign)
-				continue
+		if skip, err := r.gate(ctx, f); skip {
+			if err != nil {
+				errs = append(errs, err)
 			}
+			continue
 		}
 		for _, obj := range f.objs {
 			if err := r.apply(ctx, obj); err != nil {
@@ -161,6 +157,37 @@ func (r *Reconciler) Converge(ctx context.Context) error {
 	slog.DebugContext(ctx, "converged the embedded add-on manifest set",
 		"fieldManager", FieldManager, "documents", documents, "applied", applied, "failed", len(errs))
 	return errors.Join(errs...)
+}
+
+// gate decides a gated file before any of it is applied, in this order: an
+// ownership guard held by someone else skips it untouched; an Undecided posture
+// skips it untouched; a failed requirement skips it and withdraws what k3sm
+// applied. skip false means apply the file. Each skip logs its reason once.
+func (r *Reconciler) gate(ctx context.Context, f manifestFile) (skip bool, err error) {
+	req, gated := requirements[f.path]
+	if !gated {
+		return false, nil
+	}
+	foreignOwner, err := r.foreignGuard(ctx, f.path)
+	if err != nil {
+		r.logSkip(ctx, f.path, "could not read its ownership guard; left untouched", 0, 0)
+		return true, err
+	}
+	if foreignOwner {
+		r.logSkip(ctx, f.path, foreignMetricsReason, 0, 0)
+		return true, nil
+	}
+	if r.posture.Undecided != "" {
+		r.logSkip(ctx, f.path, "serving condition undecided, left untouched: "+r.posture.Undecided, 0, 0)
+		return true, nil
+	}
+	reason := req(r.posture)
+	if reason == "" {
+		return false, nil
+	}
+	deleted, foreign, err := r.withdraw(ctx, f.objs)
+	r.logSkip(ctx, f.path, reason, deleted, foreign)
+	return true, err
 }
 
 // manifestFile is one manifest file's decoded objects, keyed by its path in the tree.
