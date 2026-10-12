@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 
 	"k3sm.io/k3sm/pkg/addons"
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -680,11 +681,17 @@ func startServerLBHosting(ctx context.Context, plan serverPlan, restCfg *rest.Co
 	}
 	// The MeshPeer CRD exists only on a mesh server (ensureMeshPeerCRD); without
 	// one there are no peers to address.
+	// The addresses are served from a watch-backed cache, so a decider
+	// reconcile does not LIST MeshPeers.
+	var peersSynced cache.InformerSynced
 	if opts.meshIP != "" {
-		if list, err := meshPeerListerFor(restCfg); err != nil {
+		if lw, err := meshPeerListWatch(restCfg); err != nil {
 			logger.Error("svclb decider: no MeshPeer address source; only this server's own node can be advertised", "err", err)
 		} else {
+			inf, list := meshPeerCache(lw)
+			go inf.Run(ctx.Done())
 			lbCfg.PeerAddresses = lbPeerAddresses(list)
+			peersSynced = inf.HasSynced
 		}
 	}
 	d, err := svclb.NewDecider(lbCfg)
@@ -693,6 +700,14 @@ func startServerLBHosting(ctx context.Context, plan serverPlan, restCfg *rest.Co
 		return
 	}
 	go func() {
+		if peersSynced != nil {
+			syncCtx, cancel := context.WithTimeout(ctx, meshPeerCacheSyncTimeout)
+			if !cache.WaitForCacheSync(syncCtx.Done(), peersSynced) && ctx.Err() == nil {
+				logger.Warn("svclb decider: the MeshPeer cache did not sync in time; starting with only this server's own node addressable until it does",
+					"timeout", meshPeerCacheSyncTimeout.String())
+			}
+			cancel()
+		}
 		if err := d.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("svclb loadbalancer decider", "err", err)
 		}

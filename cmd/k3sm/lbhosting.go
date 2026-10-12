@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -25,7 +26,11 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/netbind"
@@ -221,6 +226,48 @@ func lbPeerAddresses(list func(context.Context) ([]netv1.MeshPeerSpec, error)) f
 		}
 		return out, nil
 	}
+}
+
+// errMeshPeerCacheNotSynced is what the cached MeshPeer lister returns before
+// its informer's first LIST lands; the decider keeps its last good address set.
+var errMeshPeerCacheNotSynced = errors.New("the MeshPeer cache has not synced yet")
+
+// meshPeerCacheSyncTimeout bounds how long the decider's start waits for the
+// MeshPeer cache. Past it the decider runs anyway and advertises only this
+// server's own node until the cache syncs.
+const meshPeerCacheSyncTimeout = 30 * time.Second
+
+// meshPeerCache is the decider's MeshPeer lister, served from a watch-backed
+// informer over lw: one LIST at start, then the watch keeps the store current,
+// so a decider reconcile reads memory instead of issuing a LIST against the
+// apiserver. The caller runs the informer. Before the first LIST lands the
+// lister returns errMeshPeerCacheNotSynced.
+func meshPeerCache(lw cache.ListerWatcher) (cache.SharedIndexInformer, func(context.Context) ([]netv1.MeshPeerSpec, error)) {
+	inf := cache.NewSharedIndexInformer(lw, &netv1.MeshPeer{}, 0, cache.Indexers{})
+	list := func(context.Context) ([]netv1.MeshPeerSpec, error) {
+		if !inf.HasSynced() {
+			return nil, errMeshPeerCacheNotSynced
+		}
+		items := inf.GetStore().List()
+		specs := make([]netv1.MeshPeerSpec, 0, len(items))
+		for _, item := range items {
+			if p, ok := item.(*netv1.MeshPeer); ok {
+				specs = append(specs, p.Spec)
+			}
+		}
+		return specs, nil
+	}
+	return inf, list
+}
+
+// meshPeerListWatch is the MeshPeer list-watch over cfg's identity (the
+// server's admin client), built the same way as the one-shot lister.
+func meshPeerListWatch(cfg *rest.Config) (cache.ListerWatcher, error) {
+	client, err := meshPeerRESTClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return cache.NewListWatchFromClient(client, meshPeerResource, metav1.NamespaceAll, fields.Everything()), nil
 }
 
 // netdSocketFor returns the netd helper socket the ingress host binds through,

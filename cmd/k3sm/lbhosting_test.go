@@ -24,9 +24,15 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/netbind"
@@ -425,6 +431,69 @@ func TestLBPeerAddressesFromMeshPeers(t *testing.T) {
 		t.Error("a failed MeshPeer list must surface as an error (the decider keeps its last good set)")
 	}
 }
+
+// TestLBPeerAddressCache pins that the decider's MeshPeer addresses come from a
+// watch-backed cache: many reconciles cost one LIST, a MeshPeer change arrives
+// through the watch, and before the first LIST lands the source reports an
+// error (the decider keeps its last good set) instead of an empty set.
+func TestLBPeerAddressCache(t *testing.T) {
+	var lists atomic.Int32
+	w := watch.NewFake()
+	lw := listOnlyLW{&cache.ListWatch{
+		ListFunc: func(metav1.ListOptions) (runtime.Object, error) {
+			lists.Add(1)
+			return &netv1.MeshPeerList{
+				ListMeta: metav1.ListMeta{ResourceVersion: "1"},
+				Items: []netv1.MeshPeer{
+					{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}, Spec: netv1.MeshPeerSpec{NodeName: "node-a", MeshIP: "100.64.0.1"}},
+				},
+			}, nil
+		},
+		WatchFunc: func(metav1.ListOptions) (watch.Interface, error) { return w, nil },
+	}}
+	inf, list := meshPeerCache(lw)
+	addrs := lbPeerAddresses(list)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := addrs(ctx); !errors.Is(err, errMeshPeerCacheNotSynced) {
+		t.Fatalf("before the first LIST, err = %v, want errMeshPeerCacheNotSynced", err)
+	}
+	go inf.Run(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), inf.HasSynced) {
+		t.Fatal("the MeshPeer cache never synced")
+	}
+	for range 5 {
+		got, err := addrs(ctx)
+		if err != nil || got["node-a"].String() != "100.64.0.1" {
+			t.Fatalf("addresses = %v, %v, want node-a at 100.64.0.1", got, err)
+		}
+	}
+	w.Add(&netv1.MeshPeer{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-b", ResourceVersion: "2"},
+		Spec:       netv1.MeshPeerSpec{NodeName: "node-b", MeshIP: "100.64.1.1"},
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, err := addrs(ctx)
+		if err == nil && got["node-b"].String() == "100.64.1.1" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a watched MeshPeer add never reached the addresses: %v, %v", got, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := lists.Load(); n != 1 {
+		t.Errorf("the address source issued %d MeshPeer LISTs across 6+ reads, want 1 (served from the watch cache)", n)
+	}
+}
+
+// listOnlyLW is a fake list-watch that declines watch-list semantics, so the
+// reflector LISTs then WATCHes instead of waiting for a streamed initial-events
+// bookmark the fake never sends.
+type listOnlyLW struct{ *cache.ListWatch }
+
+func (listOnlyLW) IsWatchListSemanticsUnSupported() bool { return true }
 
 // TestLBHosterNeedsTheDatapath pins that a node with no datapath runs no svclb
 // hoster: the splice needs the node's Service proxy behind the ClusterIP VIP.
