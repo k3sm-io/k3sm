@@ -320,3 +320,39 @@ func TestKineBuildReusesModuleCache(t *testing.T) {
 		}
 	})
 }
+
+// TestKineBuildEnvPinsVerification proves the pinned verification values win over, and
+// the weakening variables are absent despite, a hostile ambient environment.
+func TestKineBuildEnvPinsVerification(t *testing.T) {
+	for _, k := range []string{"GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOINSECURE", "GOFLAGS", "GONOPROXY"} {
+		t.Setenv(k, "hostile")
+	}
+	t.Setenv("GOSUMDB", "off")
+	t.Setenv("GOPROXY", "https://evil.example")
+	t.Setenv("GOTOOLCHAIN", "auto")
+
+	env := kineBuildEnv(t.TempDir(), t.TempDir())
+	last := func(key string) (string, int) {
+		v, n := "", 0
+		for _, kv := range env {
+			if name, val, ok := strings.Cut(kv, "="); ok && name == key {
+				v, n = val, n+1
+			}
+		}
+		return v, n
+	}
+	for key, want := range map[string]string{
+		"GOSUMDB":     "sum.golang.org",
+		"GOPROXY":     "https://proxy.golang.org,direct",
+		"GOTOOLCHAIN": "local",
+	} {
+		if v, n := last(key); v != want || n != 1 {
+			t.Errorf("%s = %q (%d entries), want exactly %q", key, v, n, want)
+		}
+	}
+	for _, key := range []string{"GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOINSECURE", "GOFLAGS", "GONOPROXY"} {
+		if _, n := last(key); n != 0 {
+			t.Errorf("%s is present in the kine build env; it must be dropped", key)
+		}
+	}
+}

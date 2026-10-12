@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -753,9 +754,31 @@ func buildKine(ctx context.Context, kineVersion, gopath string) (string, error) 
 // boot — a per-boot network round trip long enough to outlast a bring-up deadline,
 // masquerading as a one-time cold-cache cost. Pinned, the pin's modules are fetched
 // once per machine and every later boot builds offline from the warmed cache.
+//
+// Module verification is pinned, not inherited: the ambient GOSUMDB, GONOSUMDB,
+// GONOSUMCHECK, GOPRIVATE, GOINSECURE, GOFLAGS and GOPROXY are dropped, and the checksum
+// database, the public proxy and GOTOOLCHAIN=local are set last. A shell that ran the
+// daemon with GOSUMDB=off would otherwise build kine from unverified modules. GOFLAGS is
+// left unset for each command to set for itself.
 func kineBuildEnv(gopath, modCache string) []string {
-	return append(os.Environ(),
-		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache)
+	env := make([]string, 0, len(os.Environ())+9)
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.Contains(goVerificationEnv, name) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache,
+		"GOSUMDB=sum.golang.org", "GOPROXY=https://proxy.golang.org,direct", "GOTOOLCHAIN=local")
+}
+
+// goVerificationEnv lists the ambient variables that weaken or redirect Go module
+// verification or toolchain selection; kineBuildEnv never passes them through.
+var goVerificationEnv = []string{
+	"GOSUMDB", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOINSECURE", "GOFLAGS",
+	"GOPROXY", "GONOPROXY", "GOTOOLCHAIN",
 }
 
 // ErrNoGoToolchain marks a re-stage of a source-built control-plane child (kine, and
