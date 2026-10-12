@@ -472,6 +472,11 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := provisionStep("workdirs", ensureWorkDirs(s.cfg.WorkDir)); err != nil {
 		return err
 	}
+	// Before any staging step: remove the temp files a killed install left in the
+	// bin dir. Nothing else stages there yet, so none of them can be in use.
+	if err := provisionStep("reap-temps", reapStagingTemps(binDir(s.cfg.WorkDir))); err != nil {
+		return err
+	}
 	// Before anything replaces the staged kine binary or lets the new pin touch the
 	// database: take the verified pre-migration snapshot if this boot moves an existing
 	// datastore onto a kine pin that has not opened it before. It is a no-op on a fresh
@@ -499,7 +504,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// helm controller's Jobs can exec it. Best-effort and never fatal: an absent
 	// helm is skipped here, and the helm controller owns that diagnosis (and the
 	// dev-shell download) off the bring-up path.
-	if err := provisionStep("sign-helm", signBinaries(ctx, binDir(s.cfg.WorkDir), []string{helmchart.HelmBinaryName})); err != nil {
+	if err := provisionStep("sign-helm", signBinaries(ctx, binDir(s.cfg.WorkDir), helmchart.HelmBinaryName, []string{helmchart.HelmBinaryName})); err != nil {
 		return err
 	}
 	// The datastore child: kine in the kine posture, the pinned etcd in the etcd

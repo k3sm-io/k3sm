@@ -107,7 +107,7 @@ func stageHelm(ctx context.Context, bd string, force bool) error {
 	// 0755 under the daemon: only root (install and the payload seed) can place
 	// a file under the versioned name.
 	if !force && fileExists(dst) {
-		return signBinaries(ctx, bd, []string{helmchart.HelmBinaryName})
+		return signBinaries(ctx, bd, helmchart.HelmBinaryName, []string{helmchart.HelmBinaryName})
 	}
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create bin dir %s: %w", bd, err)

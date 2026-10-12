@@ -106,7 +106,7 @@ func (c stagedChild) writeMarker(bd string) error {
 // ensureInto stages the child into bd under the protocol described on stagedChild.
 func (c stagedChild) ensureInto(ctx context.Context, bd string) error {
 	if c.staged(bd) {
-		return signBinaries(ctx, bd, []string{c.name})
+		return signBinaries(ctx, bd, strings.TrimSpace(c.markerContent()), []string{c.name})
 	}
 	// Preflight the toolchain BEFORE anything runs `go` (the module-cache probe is the
 	// first). Its absence is the one build failure that is deterministic: a launchd

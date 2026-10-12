@@ -262,7 +262,7 @@ func ensureControlPlaneBinariesVerified(ctx context.Context, logger *slog.Logger
 			return fmt.Errorf("%w: %s already contains control-plane binaries; stage into a clean directory so downloads can be digest-verified before signing",
 				ErrPayloadDigestUnpinned, bd)
 		}
-		if err := signBinaries(ctx, bd, cpBinaries); err != nil { // already acquired; ensure signed
+		if err := signBinaries(ctx, bd, healStamp(kubeMarkerPath(bd)), cpBinaries); err != nil { // already acquired; ensure signed
 			return err
 		}
 		reportStagedControlPlane(ctx, logger, bd, kubeVersion)
@@ -961,7 +961,7 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		// On a NEW inode, never over the old one: a versioned re-seed replaces a
 		// binary a running child may still have mapped. The copy is signed (only
 		// if its signature does not already verify) before it takes the name.
-		if err := atomicfile.InstallFile(src, dst, 0o755, binsign.SignIfInvalid(ctx, binsign.Codesign{})); err != nil {
+		if err := atomicfile.InstallFile(src, dst, 0o755, binsign.SignIfInvalid(ctx, binsign.Codesign{}, name)); err != nil {
 			return fmt.Errorf("seed %s from payload: %w", dst, err)
 		}
 	}
@@ -1027,14 +1027,21 @@ func chmodExec(dir string) error {
 	return nil
 }
 
-// signBinaries makes sure each named binary in dir carries a valid signature so an
-// arm64 Mach-O can exec on macOS. It runs on live work-dir binaries at every boot,
-// so it goes through binsign.EnsureSigned: a binary whose signature verifies is left alone,
-// and one that needs signing is signed as a temp copy renamed over it, never with
-// `codesign -f` on the live path (see package binsign). Signing failures are tolerated
-// (best-effort: a non-macOS CI host should not block bring-up, and a failure leaves
-// the file as it was); the binary fails loudly at exec if it truly cannot run.
-func signBinaries(ctx context.Context, dir string, names []string) error {
+// signBinaries makes sure each named binary in dir carries a valid ad-hoc
+// signature so an arm64 Mach-O can exec on macOS. It runs on live work-dir binaries
+// at every boot, so it never writes one in place (see package binsign):
+//
+//   - binsign.HealOnce first replaces each binary once per stamp (the content of
+//     the set's version marker, or the versioned name), clearing a vnode an older
+//     k3sm may have left poisoned by its in-place `codesign -f`;
+//   - then binsign.EnsureSigned leaves a validly ad-hoc-signed binary alone and
+//     signs any other as a temp copy renamed over it.
+//
+// Signing failures are tolerated (best-effort: a non-macOS CI host should not block
+// bring-up, and a failure leaves the file as it was); the binary fails loudly at
+// exec if it truly cannot run.
+func signBinaries(ctx context.Context, dir, stamp string, names []string) error {
+	_ = binsign.HealOnce(ctx, binsign.Codesign{}, dir, stamp, names...)
 	for _, n := range names {
 		p := filepath.Join(dir, n)
 		if _, err := os.Lstat(p); err != nil {
@@ -1043,6 +1050,33 @@ func signBinaries(ctx context.Context, dir string, names []string) error {
 		_, _ = binsign.EnsureSigned(ctx, binsign.Codesign{}, p)
 	}
 	return nil
+}
+
+// reapStagingTemps removes the ".<name>.tmp-<digits>" files a killed atomicfile
+// install left in bd, for every binary the executor stages there and for the
+// binsign heal marker. It must run before any staging step of this boot, so no
+// live install's temp is removed.
+func reapStagingTemps(bd string) error {
+	for _, name := range append(PayloadBinaries(), binsign.HealMarkerName) {
+		if err := atomicfile.ReapOrphans(bd, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// healStamp is the HealOnce stamp for a set guarded by the version marker at
+// path: its content on one line, or "unmarked".
+func healStamp(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "unmarked"
+	}
+	s := strings.Join(strings.Fields(string(b)), " ")
+	if s == "" {
+		return "unmarked"
+	}
+	return s
 }
 
 // resignFresh ad-hoc signs each named, freshly downloaded binary in dir whatever

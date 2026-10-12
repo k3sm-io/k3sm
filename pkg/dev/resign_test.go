@@ -67,9 +67,9 @@ type mutatingExecBuilder struct {
 	t *testing.T
 }
 
-func (b mutatingExecBuilder) Sign(ctx context.Context, path string) error {
+func (b mutatingExecBuilder) Sign(ctx context.Context, path, identifier string) error {
 	mutatingSign(b.t, path)
-	return b.fakeBuilder.Sign(ctx, path)
+	return b.fakeBuilder.Sign(ctx, path, identifier)
 }
 
 type mutatingPodShimBuilder struct {
@@ -77,9 +77,9 @@ type mutatingPodShimBuilder struct {
 	t *testing.T
 }
 
-func (b mutatingPodShimBuilder) Sign(ctx context.Context, path string) error {
+func (b mutatingPodShimBuilder) Sign(ctx context.Context, path, identifier string) error {
 	mutatingSign(b.t, path)
-	return b.fakePodShimBuilder.Sign(ctx, path)
+	return b.fakePodShimBuilder.Sign(ctx, path, identifier)
 }
 
 // TestCachedShimResignNeverRewritesALiveInode is the pkg/dev half of the B544
@@ -99,6 +99,7 @@ func TestCachedShimResignNeverRewritesALiveInode(t *testing.T) {
 		shim      string
 		provision func() error
 		signed    func() []string
+		ids       func() []string
 	}
 	setups := map[string]func(t *testing.T, valid bool) fixture{
 		"execshim/rootless": func(t *testing.T, valid bool) fixture {
@@ -117,7 +118,7 @@ func TestCachedShimResignNeverRewritesALiveInode(t *testing.T) {
 					err = errors.New("the cached helper was not kept")
 				}
 				return err
-			}, func() []string { return fb.signed }}
+			}, func() []string { return fb.signed }, func() []string { return fb.signedIDs }}
 		},
 		"execshim/root": func(t *testing.T, valid bool) fixture {
 			fb := &fakeBuilder{buildErr: errors.New("no workspace source"), valid: valid}
@@ -137,7 +138,7 @@ func TestCachedShimResignNeverRewritesALiveInode(t *testing.T) {
 					err = errors.New("the cached helper was not kept")
 				}
 				return err
-			}, func() []string { return fb.signed }}
+			}, func() []string { return fb.signed }, func() []string { return fb.signedIDs }}
 		},
 		"podshim": func(t *testing.T, valid bool) fixture {
 			fb := &fakePodShimBuilder{buildErr: errors.New("no clang"), valid: valid}
@@ -156,7 +157,7 @@ func TestCachedShimResignNeverRewritesALiveInode(t *testing.T) {
 					err = errors.New("the cached shim was not kept")
 				}
 				return err
-			}, func() []string { return fb.signed }}
+			}, func() []string { return fb.signed }, func() []string { return fb.ids }}
 		},
 	}
 
@@ -180,6 +181,9 @@ func TestCachedShimResignNeverRewritesALiveInode(t *testing.T) {
 			signed := fx.signed()
 			if len(signed) != 1 || !isTempBeside(signed[0], fx.shim) {
 				t.Errorf("signed %v; want exactly one temp copy beside %s, never the live path", signed, fx.shim)
+			}
+			if ids := fx.ids(); len(ids) != 1 || ids[0] != filepath.Base(fx.shim) {
+				t.Errorf("signed as %v, want the shim's own name %q as the identifier", ids, filepath.Base(fx.shim))
 			}
 			if got, _ := os.ReadFile(fx.shim); string(got) != cached+"+signed" {
 				t.Errorf("shim = %q, want the signed copy", got)

@@ -159,9 +159,10 @@ type PodShimBuilder interface {
 	// goExecShimBuilder.Sign. Best-effort — a signing failure must not fail
 	// provisioning. It is only ever given a path no pod can have mapped: a fresh
 	// build, or the temp copy binsign.EnsureSigned renames over a cached shim.
-	Sign(ctx context.Context, path string) error
-	// Verify reports whether path's signature verifies, so a cached shim that is
-	// already signed is never rewritten (binsign.EnsureSigned).
+	// identifier is the shim's final base name, the code identifier it carries.
+	Sign(ctx context.Context, path, identifier string) error
+	// Verify reports whether path carries a valid ad-hoc signature, so a cached
+	// shim that already does is never rewritten (binsign.EnsureSigned).
 	Verify(ctx context.Context, path string) (bool, error)
 }
 
@@ -194,8 +195,8 @@ func (clangPodShimBuilder) Build(ctx context.Context, name, outDir string) error
 
 // Sign ad-hoc signs path through binsign.Codesign, best-effort (mirrors
 // goExecShimBuilder.Sign).
-func (clangPodShimBuilder) Sign(ctx context.Context, path string) error {
-	_ = binsign.Codesign{}.Sign(ctx, path)
+func (clangPodShimBuilder) Sign(ctx context.Context, path, identifier string) error {
+	_ = binsign.Codesign{}.Sign(ctx, path, identifier)
 	return nil
 }
 
@@ -508,7 +509,7 @@ func (m *Manager) buildPodShim(ctx context.Context, name, dir, shim string) (bui
 	// Re-sign so a stale ad-hoc signature from a prior toolchain does not wedge the
 	// load (mirrors provisionExecShim). Signed before the rename so codesign never
 	// writes at the shared stage path.
-	_ = m.shimBuilder.Sign(ctx, built)
+	_ = m.shimBuilder.Sign(ctx, built, name)
 	if err := os.Rename(built, shim); err != nil {
 		return nil, fmt.Errorf("stage %s: %w", shim, err)
 	}

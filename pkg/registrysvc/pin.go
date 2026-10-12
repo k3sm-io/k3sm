@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"strings"
 
+	"k3sm.io/k3sm/internal/atomicfile"
 	"k3sm.io/k3sm/internal/binsign"
 )
 
@@ -133,8 +134,12 @@ func EnsureZot(ctx context.Context, bd, payloadDir, version string) error {
 	if version == "" {
 		version = DefaultZotVersion
 	}
+	// Remove the temps a killed install left; nothing is staging zot yet.
+	if err := atomicfile.ReapOrphans(bd, ZotBinaryName); err != nil {
+		return fmt.Errorf("reap zot staging temps: %w", err)
+	}
 	if zotStaged(bd, version) {
-		return ensureZotSigned(ctx, ZotPath(bd))
+		return ensureZotSigned(ctx, bd)
 	}
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create bin dir %s: %w", bd, err)
@@ -282,17 +287,27 @@ func goInstallZot(ctx context.Context, version, gopath, modCache string) ([]byte
 	return cmd.CombinedOutput()
 }
 
-// ensureZotSigned makes sure the staged zot at path carries a valid signature
-// so an arm64 Mach-O can exec on macOS. It runs at every start on the live
-// binary, so it goes through binsign.EnsureSigned: a valid signature leaves the
-// file alone, and one that needs signing is signed as a temp copy renamed over
-// it, never with `codesign -f` on the live path. Signing failures are tolerated
-// (a non-macOS CI host must not block bring-up, and a failure leaves the file as
-// it was); a binary that truly cannot run fails loudly at exec.
-func ensureZotSigned(ctx context.Context, path string) error {
+// ensureZotSigned makes sure the staged zot at path carries a valid ad-hoc
+// signature so an arm64 Mach-O can exec on macOS. It runs at every start on the
+// live binary, so it never writes it in place (see package binsign): HealOnce
+// first replaces it once per staged version, clearing a vnode an older k3sm may
+// have left poisoned by its in-place `codesign -f`, and EnsureSigned then leaves
+// a validly ad-hoc-signed zot alone and signs any other as a temp copy renamed
+// over it. Signing failures are tolerated (a non-macOS CI host must not block
+// bring-up, and a failure leaves the file as it was); a binary that truly cannot
+// run fails loudly at exec.
+func ensureZotSigned(ctx context.Context, bd string) error {
+	path := ZotPath(bd)
 	if _, err := os.Lstat(path); err != nil {
 		return fmt.Errorf("stage zot: %s is absent after staging: %w", path, err)
 	}
+	stamp := "unmarked"
+	if b, err := os.ReadFile(zotMarkerPath(bd)); err == nil {
+		if f := strings.Join(strings.Fields(string(b)), " "); f != "" {
+			stamp = f
+		}
+	}
+	_ = binsign.HealOnce(ctx, binsign.Codesign{}, bd, stamp, ZotBinaryName)
 	_, _ = binsign.EnsureSigned(ctx, binsign.Codesign{}, path)
 	return nil
 }

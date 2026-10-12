@@ -34,6 +34,7 @@ type fakePodShimBuilder struct {
 	buildErr error       // when non-nil, Build fails (drives the degrade paths)
 	built    [][2]string // {name, outDir} pairs passed to Build
 	signed   []string    // paths passed to Sign
+	ids      []string    // identifiers passed to Sign
 	verified []string    // paths passed to Verify
 	valid    bool        // what Verify reports (false: every file needs signing)
 }
@@ -48,8 +49,9 @@ func (f *fakePodShimBuilder) Build(_ context.Context, name, outDir string) error
 	return os.WriteFile(filepath.Join(outDir, name), []byte("stub-dylib"), 0o600)
 }
 
-func (f *fakePodShimBuilder) Sign(_ context.Context, path string) error {
+func (f *fakePodShimBuilder) Sign(_ context.Context, path, identifier string) error {
 	f.signed = append(f.signed, path)
+	f.ids = append(f.ids, identifier)
 	return nil
 }
 

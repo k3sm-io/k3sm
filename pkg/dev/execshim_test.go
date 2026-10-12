@@ -37,6 +37,7 @@ type fakeBuilder struct {
 	buildErr   error    // when non-nil, Build fails (drives the hostprocess fallback)
 	built      []string // outPaths passed to Build
 	signed     []string // paths passed to Sign
+	signedIDs  []string // identifiers passed to Sign
 	verified   []string // paths passed to Verify
 	valid      bool     // what Verify reports (false: every file needs signing)
 	writeBytes string   // stub Mach-O content Build writes on success
@@ -54,8 +55,9 @@ func (f *fakeBuilder) Build(_ context.Context, outPath string) error {
 	return os.WriteFile(outPath, []byte(content), 0o755)
 }
 
-func (f *fakeBuilder) Sign(_ context.Context, path string) error {
+func (f *fakeBuilder) Sign(_ context.Context, path, identifier string) error {
 	f.signed = append(f.signed, path)
+	f.signedIDs = append(f.signedIDs, identifier)
 	return nil
 }
 
@@ -93,6 +95,9 @@ func TestProvisionExecShimBuildsWhenAbsent(t *testing.T) {
 	// Signed where it was built (before the rename), never at the cache path.
 	if len(b.signed) != 1 || b.signed[0] != b.built[0] {
 		t.Errorf("signed = %v, want the staged build %v signed once", b.signed, b.built)
+	}
+	if len(b.signedIDs) != 1 || b.signedIDs[0] != execShimName {
+		t.Errorf("signed as %v, want the identifier %q", b.signedIDs, execShimName)
 	}
 	if got, readErr := os.ReadFile(shim); readErr != nil || string(got) != "stub-execshim" {
 		t.Errorf("helper at %s = %q, %v; want the fresh build installed", shim, got, readErr)
