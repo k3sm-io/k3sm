@@ -31,8 +31,10 @@
 #   1. the pins below must be real (a placeholder refuses before any network);
 #   2. kubernetes-src.tar.gz is downloaded from dl.k8s.io for KUBE_TAG and its
 #      sha512 compared with KUBE_SRC_SHA512 BEFORE anything is extracted;
-#   3. the source's own .go-version names the toolchain: the build runs with
-#      GOTOOLCHAIN=local and refuses unless `go env GOVERSION` equals it;
+#   3. the source's own .go-version names the toolchain: every go command runs
+#      under `env -i` with an explicit minimal environment (GOTOOLCHAIN=local,
+#      private HOME and caches, GOENV=off), so no caller GOFLAGS, GOENV, GOROOT
+#      or GOTOOLCHAIN reaches it, and refuses unless `go env GOVERSION` equals it;
 #   4. each binary is built CGO_ENABLED=0 for darwin/arm64 with -trimpath
 #      -buildvcs=false from the vendored source, SOURCE_DATE_EPOCH set to the
 #      tag's commit time, and the version stamped through k8s.io/component-base/version.
@@ -92,14 +94,39 @@ ldflags() {
 	printf '%s' " -X $p.gitCommit=$KUBE_TAG_COMMIT -X $p.gitTreeState=archive -X $p.buildDate=$(build_date "$KUBE_TAG_EPOCH")"
 }
 
-# build_env <src>: the environment of every go build, one VAR=value per line.
-# GOWORK names the source's own workspace file (k/k builds as a workspace over
-# its staging modules); without one, workspace mode is off. Either way the
-# caller's go.work (this repo's lane or workspace) is never used.
+# The extractor: the system bsdtar by absolute path, which refuses absolute and
+# ".." member paths by default (no -P). A GNU tar earlier on PATH is never used.
+TAR=/usr/bin/tar
+
+# is_bsdtar [tar]: zero iff the tar (default TAR) is bsdtar.
+is_bsdtar() { "${1:-$TAR}" --version 2>/dev/null | head -n 1 | grep -q '^bsdtar '; }
+
+# go_dir: the directory of the go on the caller's PATH, the toolchain the build
+# runs (assert_toolchain proves it is the one the source pins). Empty if none.
+go_dir() {
+	local g
+	g="$(command -v go 2>/dev/null)" || return 0
+	(cd "$(dirname "$g")" && pwd -P)
+}
+
+# build_env <src> <work> <godir>: the WHOLE environment of every go command the
+# build runs, one VAR=value per line, applied with `env -i` so nothing the caller
+# exported (GOFLAGS, GOENV, GOROOT, GOTOOLCHAIN, GOPROXY, ...) can steer it. HOME,
+# the caches and TMPDIR live in the build's own work dir, so no go env file or
+# cache of the caller's is read either; GOENV=off makes that explicit. GOWORK
+# names the source's own workspace file (k/k builds as a workspace over its
+# staging modules); without one, workspace mode is off.
 build_env() {
-	local src="$1" gowork="off"
+	local src="$1" work="$2" godir="$3" gowork="off"
 	[ -f "$src/go.work" ] && gowork="$src/go.work"
 	cat <<-EOF
+		PATH=$godir:/usr/bin:/bin
+		HOME=$work/home
+		GOCACHE=$work/gocache
+		GOPATH=$work/gopath
+		GOMODCACHE=$work/gopath/pkg/mod
+		TMPDIR=$work/tmp
+		GOENV=off
 		GOTOOLCHAIN=local
 		GOOS=darwin
 		GOARCH=arm64
@@ -109,24 +136,37 @@ build_env() {
 	EOF
 }
 
-# build_argv <out> <name>: the go build argv for one binary, one word per line.
-# -mod=vendor builds from the archive's vendor tree and never fetches a module.
+# prepare_work <work>: create the directories build_env points into.
+prepare_work() { mkdir -p "$1/home" "$1/gocache" "$1/gopath" "$1/tmp"; }
+
+# build_argv <godir> <out> <name>: the go build argv for one binary, one word per
+# line. go is named by absolute path. -mod=vendor builds from the archive's vendor
+# tree and never fetches a module.
 build_argv() {
-	local out="$1" name="$2"
-	printf '%s\n' go build -trimpath -buildvcs=false -mod=vendor -ldflags "$(ldflags)" -o "$out/$name" "./cmd/$name"
+	local godir="$1" out="$2" name="$3"
+	printf '%s\n' "$godir/go" build -trimpath -buildvcs=false -mod=vendor -ldflags "$(ldflags)" -o "$out/$name" "./cmd/$name"
+}
+
+# plan_line <src> <work> <godir> <out> <name>: the exact command for one binary:
+# env -i, the environment, the argv.
+plan_line() {
+	local src="$1" work="$2" godir="$3" out="$4" name="$5" w
+	printf 'env -i'
+	while IFS= read -r w; do printf ' %q' "$w"; done < <(build_env "$src" "$work" "$godir")
+	while IFS= read -r w; do printf ' %q' "$w"; done < <(build_argv "$godir" "$out" "$name")
+	echo
 }
 
 print_plan() {
-	local src="${1:-<src>}" out="${2:-<out-dir>}" name
+	local src="<src>" work="<work>" out="<out-dir>" godir name
+	godir="$(go_dir)"
+	[ -n "$godir" ] || godir="<go-dir>"
 	echo "# build-cp plan for $KUBE_TAG from $KUBE_SRC_URL (sha512 $KUBE_SRC_SHA512)"
-	echo "# toolchain: GOTOOLCHAIN=local, go env GOVERSION must equal go\$(cat <src>/.go-version)"
-	echo "# run in: $src"
+	echo "# toolchain: $godir/go; under the same env, go env GOVERSION must equal go\$(cat <src>/.go-version)"
+	echo "# run in: $src (the extracted source); <work> is the build's private temp dir"
 	for name in "${OUTPUTS[@]}"; do
 		echo "## $name"
-		build_env "$src" | sed 's/^/env /'
-		printf 'argv'
-		while IFS= read -r w; do printf ' %q' "$w"; done < <(build_argv "$out" "$name")
-		echo
+		plan_line "$src" "$work" "$godir" "$out" "$name"
 	done
 }
 
@@ -145,8 +185,8 @@ verify_and_extract() {
 	got="$(shasum -a 512 "$tgz" | awk '{print $1}')"
 	[ "$got" = "$want" ] || { echo "build-cp: refusing to extract: sha512 of $tgz is $got, pinned $want" >&2; return 1; }
 	[ -d "$dest" ] && [ -z "$(ls -A "$dest")" ] || { echo "build-cp: refusing to extract into non-empty $dest" >&2; return 1; }
-	# bsdtar refuses absolute and ".." member paths by default (no -P).
-	tar -xzf "$tgz" -C "$dest" --no-same-owner || { echo "build-cp: extraction of $tgz failed" >&2; return 1; }
+	is_bsdtar || { echo "build-cp: refusing to extract: $TAR is not bsdtar" >&2; return 1; }
+	"$TAR" -xzf "$tgz" -C "$dest" --no-same-owner || { echo "build-cp: extraction of $tgz failed" >&2; return 1; }
 }
 
 # source_root <dest>: the extracted tree's root, the directory holding go.mod and
@@ -162,17 +202,21 @@ source_root() {
 	return 1
 }
 
-# assert_toolchain <src>: refuse unless the local toolchain is exactly the one the
-# source's .go-version names (GOTOOLCHAIN=local, so go never switches itself).
+# assert_toolchain <src> <work> <godir>: refuse unless <godir>/go, run under the
+# build's own env -i environment (GOTOOLCHAIN=local, so go never switches
+# itself), is exactly the toolchain the source's .go-version names.
 assert_toolchain() {
-	local src="$1" want got
+	local src="$1" work="$2" godir="$3" want got e
+	local -a envv=()
+	[ -x "$godir/go" ] || { echo "build-cp: no go toolchain found on PATH" >&2; return 1; }
 	want="go$(tr -d '[:space:]' <"$src/.go-version")"
-	got="$(cd "$src" && GOTOOLCHAIN=local GOWORK=off go env GOVERSION)" || { echo "build-cp: go env GOVERSION failed" >&2; return 1; }
+	while IFS= read -r e; do envv+=("$e"); done < <(build_env "$src" "$work" "$godir")
+	got="$(cd "$src" && env -i "${envv[@]}" "$godir/go" env GOVERSION)" || { echo "build-cp: go env GOVERSION failed" >&2; return 1; }
 	[ "$got" = "$want" ] || { echo "build-cp: toolchain is $got, the source pins $want (.go-version); install $want and put it first on PATH" >&2; return 1; }
 }
 
 build() {
-	local out="$1" work tgz src name
+	local out="$1" work tgz src name godir
 	local -a envv argv
 	echo "==> build-cp $KUBE_TAG"
 	if ! problems="$(require_pins)"; then
@@ -189,21 +233,23 @@ build() {
 	trap "rm -rf '$work'" EXIT
 	tgz="$work/kubernetes-src.tar.gz"
 	mkdir "$work/src"
+	prepare_work "$work"
+	godir="$(go_dir)"
 
 	echo "==> download $KUBE_SRC_URL"
 	curl --proto '=https' --tlsv1.2 -fsSL -o "$tgz" "$KUBE_SRC_URL" || die "download of $KUBE_SRC_URL failed"
 	echo "==> verify sha512, then extract"
 	verify_and_extract "$tgz" "$KUBE_SRC_SHA512" "$work/src" || die "the source archive failed verification"
 	src="$(source_root "$work/src")" || die "unrecognised source layout"
-	assert_toolchain "$src" || die "toolchain mismatch"
+	assert_toolchain "$src" "$work" "$godir" || die "toolchain mismatch"
 
 	for name in "${OUTPUTS[@]}"; do
 		echo "==> go build $name"
 		envv=()
-		while IFS= read -r e; do envv+=("$e"); done < <(build_env "$src")
+		while IFS= read -r e; do envv+=("$e"); done < <(build_env "$src" "$work" "$godir")
 		argv=()
-		while IFS= read -r w; do argv+=("$w"); done < <(build_argv "$out" "$name")
-		(cd "$src" && env "${envv[@]}" "${argv[@]}") || die "go build $name failed"
+		while IFS= read -r w; do argv+=("$w"); done < <(build_argv "$godir" "$out" "$name")
+		(cd "$src" && env -i "${envv[@]}" "${argv[@]}") || die "go build $name failed"
 	done
 	echo "==> built from $KUBE_TAG (sha512 $KUBE_SRC_SHA512):"
 	(cd "$out" && shasum -a 256 -- "${OUTPUTS[@]}")
@@ -245,23 +291,32 @@ self_test() {
 	if is_sha512 "$(printf 'A%.0s' $(seq 1 128))"; then bad "an uppercase sha512 passed the shape check"; else ok "an uppercase sha512 fails the shape check"; fi
 	if (KUBE_SRC_SHA512="$PLACEHOLDER"; require_pins >/dev/null); then bad "require_pins accepted a placeholder"; else ok "require_pins refuses a placeholder"; fi
 
-	echo "==> the plan carries the required flags"
+	echo "==> the plan runs every build under env -i with the required flags"
 	plan="$(print_plan)"
 	for name in "${OUTPUTS[@]}"; do
 		printf '%s\n' "$plan" | grep -q "^## $name\$" || bad "plan has no entry for $name"
 	done
+	local n
+	n="$(printf '%s\n' "$plan" | grep -c '^env -i ' || true)"
+	if [ "$n" -eq "${#OUTPUTS[@]}" ]; then ok "every build line starts with env -i"; else bad "$n build lines start with env -i, want ${#OUTPUTS[@]}"; fi
+	if printf '%s\n' "$plan" | grep -q 'GOFLAGS'; then bad "the plan names GOFLAGS"; else ok "no GOFLAGS in the plan"; fi
+	if printf '%s\n' "$plan" | grep -q 'GOROOT'; then bad "the plan sets GOROOT"; else ok "no GOROOT in the plan (go finds its own)"; fi
 	local flag
-	for flag in "env GOTOOLCHAIN=local" "env CGO_ENABLED=0" "env GOOS=darwin" "env GOARCH=arm64" "env SOURCE_DATE_EPOCH=$KUBE_TAG_EPOCH" \
+	for flag in " PATH=" " HOME=" " GOCACHE=" " GOPATH=" " GOMODCACHE=" " TMPDIR=" " GOENV=off " \
+		" GOTOOLCHAIN=local " " CGO_ENABLED=0 " " GOOS=darwin " " GOARCH=arm64 " " GOWORK=" " SOURCE_DATE_EPOCH=$KUBE_TAG_EPOCH " \
 		" -trimpath " " -buildvcs=false " " -mod=vendor " "k8s.io/component-base/version.gitVersion=$KUBE_TAG" \
 		"k8s.io/component-base/version.gitMajor=1" "k8s.io/component-base/version.gitMinor=$(tag_minor)" \
 		"k8s.io/component-base/version.buildDate=" "k8s.io/component-base/version.gitCommit="; do
-		local n
-		n="$(printf '%s\n' "$plan" | grep -cF -- "$flag" || true)"
-		if [ "$n" -eq "${#OUTPUTS[@]}" ]; then ok "every build carries '$flag'"; else bad "'$flag' appears $n times, want ${#OUTPUTS[@]}"; fi
+		n="$(printf '%s\n' "$plan" | grep '^env -i ' | grep -cF -- "$flag" || true)"
+		if [ "$n" -eq "${#OUTPUTS[@]}" ]; then ok "every build carries '$flag'"; else bad "'$flag' appears in $n build lines, want ${#OUTPUTS[@]}"; fi
 	done
-	if printf '%s\n' "$plan" | grep -q "GOWORK=off"; then ok "a source without go.work builds with workspace mode off"; else bad "the plan does not isolate GOWORK"; fi
+	if build_env "<src>" "<work>" "<go-dir>" | grep -qx "GOWORK=off"; then ok "a source without go.work builds with workspace mode off"; else bad "the plan does not isolate GOWORK"; fi
 	mkdir -p "$tmp/wsrc" && : >"$tmp/wsrc/go.work"
-	if build_env "$tmp/wsrc" | grep -qx "GOWORK=$tmp/wsrc/go.work"; then ok "a source with go.work builds as its own workspace"; else bad "GOWORK does not name the source's go.work"; fi
+	if build_env "$tmp/wsrc" "$tmp/w" "/g" | grep -qx "GOWORK=$tmp/wsrc/go.work"; then ok "a source with go.work builds as its own workspace"; else bad "GOWORK does not name the source's go.work"; fi
+
+	echo "==> the extractor is the system bsdtar"
+	if [ "$TAR" = /usr/bin/tar ] && is_bsdtar; then ok "$TAR is bsdtar"; else bad "$TAR is not bsdtar"; fi
+	if is_bsdtar /usr/bin/false; then bad "a non-bsdtar extractor passed the check"; else ok "a non-bsdtar extractor is refused"; fi
 
 	echo "==> no floating versions"
 	local floating="@""latest"
@@ -272,7 +327,7 @@ self_test() {
 	mkdir -p "$fix/kubernetes/cmd/kubectl"
 	printf 'module k8s.io/kubernetes\n' >"$fix/kubernetes/go.mod"
 	printf '1.0.0\n' >"$fix/kubernetes/.go-version"
-	(cd "$fix" && COPYFILE_DISABLE=1 tar -czf "$tmp/src.tar.gz" kubernetes)
+	(cd "$fix" && COPYFILE_DISABLE=1 "$TAR" -czf "$tmp/src.tar.gz" kubernetes)
 	good="$(shasum -a 512 "$tmp/src.tar.gz" | awk '{print $1}')"
 	dest="$tmp/x-missing" && mkdir "$dest"
 	if verify_and_extract "$tmp/src.tar.gz" "$PLACEHOLDER" "$dest" 2>/dev/null; then bad "extracted with no pinned digest"; else ok "a missing digest refuses"; fi
@@ -291,29 +346,40 @@ self_test() {
 		bad "the pinned digest did not extract the fixture"
 	fi
 
-	echo "==> the toolchain assert"
-	if assert_toolchain "$dest/kubernetes" 2>/dev/null; then bad "go 1.0.0 was accepted as the local toolchain"; else ok "a .go-version the local go is not refuses"; fi
-	local cur
-	cur="$(GOTOOLCHAIN=local GOWORK=off go env GOVERSION)"
+	echo "==> the toolchain assert, under the build's own env -i environment"
+	local gd wk="$tmp/work" cur
+	gd="$(go_dir)"
+	prepare_work "$wk"
+	if assert_toolchain "$dest/kubernetes" "$wk" "$gd" 2>/dev/null; then bad "go 1.0.0 was accepted as the local toolchain"; else ok "a .go-version the local go is not refuses"; fi
+	cur="$(env -i PATH="$gd:/usr/bin:/bin" HOME="$wk/home" GOENV=off GOTOOLCHAIN=local GOWORK=off "$gd/go" env GOVERSION)"
 	printf '%s\n' "${cur#go}" >"$dest/kubernetes/.go-version"
-	if assert_toolchain "$dest/kubernetes"; then ok "the matching local toolchain passes"; else bad "the matching toolchain $cur was refused"; fi
+	if assert_toolchain "$dest/kubernetes" "$wk" "$gd"; then ok "the matching local toolchain passes"; else bad "the matching toolchain $cur was refused"; fi
+	# A hostile caller environment must not steer the go commands the build runs.
+	if (export GOFLAGS=-mod=mod GOTOOLCHAIN=go1.0.0 GOROOT=/nonexistent GOENV="$tmp/hostile.env"
+		printf 'GOTOOLCHAIN=go1.0.0\n' >"$GOENV"
+		assert_toolchain "$dest/kubernetes" "$wk" "$gd"); then
+		ok "caller GOFLAGS, GOTOOLCHAIN, GOROOT and GOENV do not reach the build"
+	else
+		bad "a caller environment variable steered the toolchain check"
+	fi
 
 	echo "==> a pin-less build refuses before any network"
-	mkdir -p "$tmp/bin"
+	# A copy of this script with the digest pin reset to the placeholder, so the
+	# refusal is exercised whatever the real pins hold.
+	mkdir -p "$tmp/bin" "$tmp/pinless"
 	printf '#!/bin/sh\necho called >>"%s"\nexit 1\n' "$tmp/curl.log" >"$tmp/bin/curl"
 	chmod 0755 "$tmp/bin/curl"
-	if ! require_pins >/dev/null; then
-		if out="$(PATH="$tmp/bin:$PATH" "$self" "$tmp/out" 2>&1)"; then
-			bad "build ran with placeholder pins"
-		elif printf '%s\n' "$out" | grep -q "placeholders"; then
-			ok "build refuses, naming the placeholder pins"
-		else
-			bad "build refused without naming the pins: $out"
-		fi
-		if [ ! -e "$tmp/curl.log" ]; then ok "nothing was downloaded"; else bad "curl ran before the pins were checked"; fi
+	# shellcheck disable=SC2016 # the copy must read the literal "$PLACEHOLDER"
+	sed 's/^KUBE_SRC_SHA512=.*/KUBE_SRC_SHA512="$PLACEHOLDER"/' "$self" >"$tmp/pinless/build-cp.sh"
+	chmod 0755 "$tmp/pinless/build-cp.sh"
+	if out="$(PATH="$tmp/bin:$PATH" "$tmp/pinless/build-cp.sh" "$tmp/out" 2>&1)"; then
+		bad "build ran with a placeholder digest"
+	elif printf '%s\n' "$out" | grep -q "KUBE_SRC_SHA512 is not a pinned sha512"; then
+		ok "build refuses, naming the placeholder digest"
 	else
-		ok "pins are real; the pin-less refusal is covered by require_pins above"
+		bad "build refused without naming the digest pin: $out"
 	fi
+	if [ ! -e "$tmp/curl.log" ]; then ok "nothing was downloaded"; else bad "curl ran before the pins were checked"; fi
 
 	echo "==> outputs equal stage.sh's pinned-source list"
 	local mine theirs
