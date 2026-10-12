@@ -143,8 +143,11 @@ func startInterconnectResolver(ctx context.Context, plan serverPlan, restCfg *re
 		CRD:      crd,
 		Indices:  meshPeerIndexSet(list),
 		Identity: plan.opts.nodeName,
-		Metrics:  plan.interconnectMetrics,
-		Log:      logger,
+		// The interconnect-using MLXModels, read with the same admin client the
+		// MLX operator uses; the desired annotation carries their references.
+		MLXModels: interconnect.MLXModelLister(dyn),
+		Metrics:   plan.interconnectMetrics,
+		Log:       logger,
 	})
 	rCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
