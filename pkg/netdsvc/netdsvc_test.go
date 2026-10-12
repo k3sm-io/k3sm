@@ -220,6 +220,13 @@ func TestBuildConfig(t *testing.T) {
 		if filepath.Dir(cfg.IdentityPath) != dir {
 			t.Errorf("IdentityPath must live INSIDE the root-only mesh key dir %q, got %q — a directory an unprivileged writer can reach would let it dictate the pod-alias policy boundary at the next start", dir, cfg.IdentityPath)
 		}
+		wantIC := filepath.Join(dir, InterconnectStateFileName)
+		if cfg.InterconnectStatePath != wantIC {
+			t.Errorf("InterconnectStatePath = %q, want %q — netd records the bridge0 aliases it owns there, so a restart removes only aliases it did not create", cfg.InterconnectStatePath, wantIC)
+		}
+		if filepath.Dir(cfg.InterconnectStatePath) != filepath.Dir(cfg.IdentityPath) {
+			t.Errorf("InterconnectStatePath %q must sit beside IdentityPath %q in the root-only mesh key dir", cfg.InterconnectStatePath, cfg.IdentityPath)
+		}
 	})
 
 	t.Run("missing service CIDR errors", func(t *testing.T) {
@@ -249,6 +256,9 @@ func TestBuildConfig(t *testing.T) {
 		}
 		if got := NodeIdentityPath(""); got != "" {
 			t.Errorf("NodeIdentityPath(\"\") = %q, want \"\"", got)
+		}
+		if cfg.InterconnectStatePath != "" || InterconnectStatePath("") != "" {
+			t.Errorf("an unset MeshKeyDir must leave InterconnectStatePath empty, got %q", cfg.InterconnectStatePath)
 		}
 	})
 }

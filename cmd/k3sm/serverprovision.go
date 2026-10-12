@@ -34,6 +34,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/interconnect"
 )
 
 // serverPKI is the mesh path's provisioned trust material; zero single-node.
@@ -61,6 +62,10 @@ type serverPlan struct {
 	mode hostnet.Mode
 	cfg  executor.Config
 	serverPKI
+	// interconnectMetrics is the process's interconnect metrics, shared by the
+	// resolver (startInterconnectResolver) and the in-process node's reporter
+	// so one kubelet-endpoint route serves both.
+	interconnectMetrics *interconnect.Metrics
 }
 
 // errServerTokenAsAdmin refuses a server-class join token on a start where it
@@ -633,7 +638,7 @@ func startControlPlane(ctx context.Context, opts serverOptions, mode hostnet.Mod
 		noteEtcdMemberRouteFailure(breaker, logger, err)
 		return serverPlan{}, nil, fmt.Errorf("HA server-join: %w", err)
 	}
-	plan := serverPlan{opts: opts, mode: mode, cfg: cfg, serverPKI: pki}
+	plan := serverPlan{opts: opts, mode: mode, cfg: cfg, serverPKI: pki, interconnectMetrics: interconnect.NewMetrics()}
 	exec := executor.NewSupervised(plan.cfg)
 	// Before Start, so the exit handler can ask about any child it is told of.
 	probe.set(exec)

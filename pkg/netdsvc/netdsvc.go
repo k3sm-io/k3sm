@@ -120,8 +120,9 @@ type Options struct {
 // BuildConfig validates opts and assembles the netd.Config: it pins the node pod
 // /24 and the Service CIDR (so the proxy's VIP aliases are admitted), the service
 // uid (peer auth), the PortAuthorizer (privileged-port confirmation against the
-// Service set), the MeshKeyResolver (root-only key path) and the adopted-identity
-// file beside it (NodeIdentityPath). The cluster aggregate and NodePort range
+// Service set), the MeshKeyResolver (root-only key path), and the adopted-identity
+// file (NodeIdentityPath) and interconnect ownership ledger
+// (InterconnectStatePath) beside it. The cluster aggregate and NodePort range
 // keep their darwin-net defaults.
 func BuildConfig(opts Options) (netd.Config, error) {
 	if !opts.NodePodCIDR.IsValid() {
@@ -148,6 +149,7 @@ func BuildConfig(opts Options) (netd.Config, error) {
 	if opts.MeshKeyDir != "" {
 		cfg.MeshKeyResolver = MeshKeyResolver(opts.MeshKeyDir)
 		cfg.IdentityPath = NodeIdentityPath(opts.MeshKeyDir)
+		cfg.InterconnectStatePath = InterconnectStatePath(opts.MeshKeyDir)
 	}
 	return cfg, nil
 }
@@ -203,6 +205,25 @@ func NodeIdentityPath(meshKeyDir string) string {
 		return ""
 	}
 	return filepath.Join(meshKeyDir, NodeIdentityFileName)
+}
+
+// InterconnectStateFileName is the leaf name of the file netd persists the
+// interconnect aliases it owns on bridge0 to, inside the mesh key dir. Named once
+// for the reason NodeIdentityFileName is: the daemon that writes it and the
+// restarted daemon that reads it back must agree on one path, and a second
+// spelling would silently degrade to "owns nothing", whose startup reconcile
+// removes every derived interconnect alias.
+const InterconnectStateFileName = "interconnect-aliases"
+
+// InterconnectStatePath returns the interconnect ownership ledger inside
+// meshKeyDir, or "" for an empty dir: the same root-only directory contract as
+// NodeIdentityPath, for the same reason (the ledger decides which reserved-half
+// aliases the root helper may remove).
+func InterconnectStatePath(meshKeyDir string) string {
+	if meshKeyDir == "" {
+		return ""
+	}
+	return filepath.Join(meshKeyDir, InterconnectStateFileName)
 }
 
 // ServiceRef identifies a Service by namespace and name. It is the

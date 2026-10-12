@@ -548,6 +548,19 @@ func startProvisioner(ctx context.Context, plan serverPlan, cs kubernetes.Interf
 	}
 }
 
+// startServerOperators is steps 4f and 4f': the MLX operator, then the
+// interconnect resolver. Its stop drains them in reverse order (the resolver
+// first), before exec.Stop tears the control plane down, exactly as two
+// separate defers in runServer would.
+func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (mlxGPU *operator.RuntimeGPU, stop func()) {
+	mlxGPU, stopMLX := startMLXOperator(ctx, plan, restCfg, cs, logger)
+	stopInterconnect := startInterconnectResolver(ctx, plan, restCfg, cs, logger)
+	return mlxGPU, func() {
+		stopInterconnect()
+		stopMLX()
+	}
+}
+
 // startMLXOperator is step 4f: the MLX operator, which ensures the MLXModel CRD,
 // then reconciles each MLXModel into a StatefulSet plus its headless and ClusterIP
 // Services. Same lifetime and the same reasoning as the provisioner — started
