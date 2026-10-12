@@ -37,28 +37,48 @@ import (
 // or dylib write goes through InstallFile / InstallReader, and every signature
 // through internal/binsign, which only signs temps. This test scans the non-test
 // Go files under pkg/, cmd/ and internal/ and fails on a NEW occurrence of any of
-// three shapes, each the AST of a call:
+// these call shapes:
 //
 //   - codesign-force: a call whose literal arguments include "codesign" and "-f" or
 //     "--force" (a forced re-sign, the in-place rewrite that killed every new pod);
+//   - codesign: any call with a literal "codesign" argument outside internal/binsign
+//     (read-only inspections elsewhere are allow-listed one by one);
+//   - sign-call: any method call named Sign with two or more arguments outside
+//     internal/binsign (the seam's
+//     callers, and unrelated crypto signers, are allow-listed one by one);
 //   - adhocsign: a call of AdHocSign (runtimed's image.AdHocSign, `codesign -f`);
 //   - exec-write: os.WriteFile with a literal mode carrying an execute bit,
 //     os.OpenFile with O_TRUNC and such a mode, or any function whose name contains
-//     "copy" called with such a mode as its last argument (a truncating copy of a
-//     binary onto a path).
+//     "copy" called with such a mode as its last argument;
+//   - bin-write: os.WriteFile, or os.OpenFile with O_TRUNC, whose path argument is
+//     built by a known bin-dir helper (binDir, ZotPath, HelmPath, ...), whatever the
+//     mode;
+//   - truncate: os.Create (which always truncates), or unix.Open / syscall.Open
+//     with O_TRUNC.
 //
 // A finding is allowed only by a line in testdata/inplace-allow.txt naming its
 // file, enclosing function and shape, with a reason. An allow line that matches
 // nothing fails too, so the list cannot rot.
 //
-// LIMITS, stated so nobody reads more into a green than it holds: the scan is
-// syntactic. It does not see a mode passed in a variable, a codesign argv built in
-// a slice, an exec of cp/ditto/install, an io.Copy into a file opened elsewhere,
-// or a write into a path that only becomes live later (pkg/install's staged tree,
-// swapped in by one rename, is allowed by function for that reason). An allowed
-// function stays allowed for any new call of the same shape inside it. It catches
-// the shapes the 2026-10-12 audit found and the obvious ways to re-add them;
-// review still owns the rest.
+// THIS IS A REGRESSION TRIPWIRE FOR KNOWN SHAPES, NOT PROOF. It is syntactic: it
+// does not see a mode or a path passed through a variable it does not recognise, a
+// codesign argv built in a slice, an exec of cp/ditto/install, an io.Copy into a
+// file opened elsewhere, or a write into a path that only becomes live later. An
+// allowed function stays allowed for any new call of the same shape inside it. A
+// green run means none of these shapes was added, nothing more; review owns the
+// rest, and the behavioural tests (TestBinaryStagingNeverRewritesALiveInode and
+// its siblings) own the guarantee.
+
+// signHome is the one package allowed to invoke codesign and call Sign.
+const signHome = "internal/binsign/"
+
+// binDirHelpers are the functions and fields that name a binary directory or a
+// staged binary path; a write whose path mentions one is a bin-write.
+var binDirHelpers = map[string]bool{
+	"binDir": true, "BinDir": true, "binPath": true, "kinePath": true, "ZotPath": true,
+	"HelmPath": true, "devBinDir": true, "freshBinDir": true, "rootExecShimDir": true,
+	"podShimDir": true, "stagedShadowDir": true,
+}
 
 // guardFinding is one flagged call.
 type guardFinding struct {
@@ -141,7 +161,7 @@ func scanFile(path, rel string) ([]guardFinding, error) {
 			if !ok {
 				return true
 			}
-			if rule := classify(call); rule != "" {
+			if rule := classify(call, strings.HasPrefix(rel, signHome)); rule != "" {
 				out = append(out, guardFinding{file: rel, fn: fn, rule: rule, pos: fset.Position(call.Pos())})
 			}
 			return true
@@ -150,8 +170,10 @@ func scanFile(path, rel string) ([]guardFinding, error) {
 	return out, nil
 }
 
-// classify returns the guard shape call matches, or "".
-func classify(call *ast.CallExpr) string {
+// classify returns the guard shape call matches, or "". inSignHome exempts the
+// sanctioned signer from the codesign and sign-call shapes (never from
+// codesign-force).
+func classify(call *ast.CallExpr, inSignHome bool) string {
 	var hasCodesign, hasForce bool
 	for _, a := range call.Args {
 		switch stringLit(a) {
@@ -164,16 +186,33 @@ func classify(call *ast.CallExpr) string {
 	if hasCodesign && hasForce {
 		return "codesign-force"
 	}
+	if hasCodesign && !inSignHome {
+		return "codesign"
+	}
 	name := calleeName(call.Fun)
+	// Two or more arguments: a signer takes at least a context and a path, and
+	// that keeps a numeric Sign() (resource.Quantity) out of it.
+	if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Sign" && len(call.Args) >= 2 && !inSignHome {
+		return "sign-call"
+	}
+	nargs := len(call.Args)
 	switch {
 	case name == "AdHocSign":
 		return "adhocsign"
-	case name == "os.WriteFile" && len(call.Args) == 3 && execMode(call.Args[2]):
+	case name == "os.WriteFile" && nargs == 3 && execMode(call.Args[2]):
 		return "exec-write"
-	case name == "os.OpenFile" && len(call.Args) == 3 && mentions(call.Args[1], "O_TRUNC") && execMode(call.Args[2]):
+	case name == "os.OpenFile" && nargs == 3 && mentions(call.Args[1], "O_TRUNC") && execMode(call.Args[2]):
 		return "exec-write"
-	case strings.Contains(strings.ToLower(name), "copy") && len(call.Args) > 0 && execMode(call.Args[len(call.Args)-1]):
+	case strings.Contains(strings.ToLower(name), "copy") && nargs > 0 && execMode(call.Args[nargs-1]):
 		return "exec-write"
+	case name == "os.WriteFile" && nargs == 3 && mentionsAny(call.Args[0], binDirHelpers):
+		return "bin-write"
+	case name == "os.OpenFile" && nargs == 3 && mentions(call.Args[1], "O_TRUNC") && mentionsAny(call.Args[0], binDirHelpers):
+		return "bin-write"
+	case name == "os.Create":
+		return "truncate"
+	case (name == "unix.Open" || name == "syscall.Open") && nargs >= 2 && mentions(call.Args[1], "O_TRUNC"):
+		return "truncate"
 	}
 	return ""
 }
@@ -200,8 +239,8 @@ func calleeName(e ast.Expr) string {
 	case *ast.Ident:
 		return f.Name
 	case *ast.SelectorExpr:
-		if id, ok := f.X.(*ast.Ident); ok && id.Name == "os" {
-			return "os." + f.Sel.Name
+		if id, ok := f.X.(*ast.Ident); ok && (id.Name == "os" || id.Name == "unix" || id.Name == "syscall") {
+			return id.Name + "." + f.Sel.Name
 		}
 		return f.Sel.Name
 	}
@@ -243,6 +282,18 @@ func mentions(e ast.Expr, name string) bool {
 	return found
 }
 
+// mentionsAny reports whether e contains an identifier in names.
+func mentionsAny(e ast.Expr, names map[string]bool) bool {
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && names[id.Name] {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
 // readAllowList reads "<file> <func> <rule>  # reason" lines. A line without a
 // reason is refused: an exception nobody explained is one nobody can review.
 func readAllowList(t *testing.T, path string) map[string]string {
@@ -270,4 +321,46 @@ func readAllowList(t *testing.T, path string) map[string]string {
 		t.Fatal(err)
 	}
 	return allow
+}
+
+// TestGuardClassifies proves every shape fires on a minimal call, and that the
+// exemptions hold, so a green TestNoInPlaceBinaryWrites is not vacuous.
+func TestGuardClassifies(t *testing.T) {
+	tests := []struct {
+		src        string
+		inSignHome bool
+		want       string
+	}{
+		{`exec.Command("codesign", "-s", "-", "-f", p)`, false, "codesign-force"},
+		{`exec.Command("codesign", "-s", "-", "-f", p)`, true, "codesign-force"},
+		{`exec.Command("codesign", "-dv", p)`, false, "codesign"},
+		{`exec.Command("codesign", "-dv", p)`, true, ""},
+		{`s.Sign(ctx, tmp, id)`, false, "sign-call"},
+		{`s.Sign(ctx, tmp, id)`, true, ""},
+		{`q.Sign()`, false, ""},
+		{`image.AdHocSign(ctx, p)`, false, "adhocsign"},
+		{`os.WriteFile(p, b, 0o755)`, false, "exec-write"},
+		{`os.WriteFile(p, b, 0o644)`, false, ""},
+		{`os.OpenFile(p, os.O_WRONLY|os.O_TRUNC, 0o700)`, false, "exec-write"},
+		{`copyFile(a, b, 0o755)`, false, "exec-write"},
+		{`os.WriteFile(filepath.Join(binDir(w), n), b, mode)`, false, "bin-write"},
+		{`os.OpenFile(ZotPath(bd), os.O_WRONLY|os.O_TRUNC, m)`, false, "bin-write"},
+		{`os.Create(p)`, false, "truncate"},
+		{`unix.Open(p, unix.O_WRONLY|unix.O_TRUNC, 0o644)`, false, "truncate"},
+		{`syscall.Open(p, syscall.O_TRUNC, 0)`, false, "truncate"},
+		{`unix.Open(p, unix.O_RDONLY, 0)`, false, ""},
+	}
+	for _, tc := range tests {
+		e, err := parser.ParseExpr(tc.src)
+		if err != nil {
+			t.Fatalf("parse %s: %v", tc.src, err)
+		}
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			t.Fatalf("%s is not a call", tc.src)
+		}
+		if got := classify(call, tc.inSignHome); got != tc.want {
+			t.Errorf("classify(%s, signHome=%v) = %q, want %q", tc.src, tc.inSignHome, got, tc.want)
+		}
+	}
 }

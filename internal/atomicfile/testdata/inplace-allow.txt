@@ -1,9 +1,26 @@
 # Allowed findings of TestNoInPlaceBinaryWrites (inplace_guard_test.go).
 # One per line: <file> <func> <rule>  # reason. A line matching nothing fails the test.
 
-# The one signer. It is only ever handed a temp path (EnsureSigned, ResignByReplace,
-# Install and InstallReader in the same package).
-internal/binsign/binsign.go Codesign.Sign adhocsign  # k3sm's single signing entry point; callers sign temps only
+# The one signer. Its codesign -f only ever runs on a temp path (EnsureSigned,
+# ResignByReplace, Install, InstallReader and HealOnce in the same package).
+internal/binsign/binsign.go Codesign.Sign codesign-force  # k3sm's single signing entry point; callers sign temps only
+
+# The dev builders' Sign seam: it delegates to binsign.Codesign, and pkg/dev calls
+# it only on a fresh build in a private temp dir (renamed afterwards) or through
+# binsign.EnsureSigned.
+pkg/dev/execshim.go goExecShimBuilder.Sign sign-call  # delegates to binsign.Codesign.Sign
+pkg/dev/podshims.go clangPodShimBuilder.Sign sign-call  # delegates to binsign.Codesign.Sign
+pkg/dev/execshim.go Manager.provisionExecShim sign-call  # signs the fresh build in a private temp dir, before the rename
+pkg/dev/execshim.go Manager.provisionRootExecShim sign-call  # signs the fresh build in a private temp dir, before the rename
+pkg/dev/podshims.go Manager.buildPodShim sign-call  # signs the fresh build in a private temp dir, before the rename
+
+# Read-only codesign inspections: they read signatures and entitlements, never write.
+pkg/install/install_darwin.go darwinSystem.VerifyVirtualizationEntitlement codesign  # codesign -d --entitlements, read-only
+pkg/shadow/shadow.go CDHash codesign  # codesign -dvvv, read-only
+pkg/shadow/verify.go VerifySignature codesign  # codesign -dvvv and -d --entitlements, read-only
+
+# Not a binary.
+pkg/provider/hostprocess.go HostProcess.startPod truncate  # a container log file
 
 # k3sm install builds a whole staged tree and swaps it in with one rename, so the
 # shadow copies it signs are fresh clones nothing has mapped yet.
