@@ -86,7 +86,7 @@ func realInterconnectEnv() *interconnectEnv {
 		rtt:    pingAll,
 		helper: dialNetd,
 		ledger: func() ([]install.InterconnectAlias, error) {
-			raw, err := os.ReadFile(netdsvc.InterconnectStatePath(install.MeshKeyDir))
+			raw, err := install.ReadTrustedInterconnectLedger(netdsvc.InterconnectStatePath(install.MeshKeyDir))
 			if errors.Is(err, fs.ErrNotExist) {
 				return nil, nil
 			}

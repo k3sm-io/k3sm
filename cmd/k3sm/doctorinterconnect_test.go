@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io/fs"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -466,5 +468,31 @@ func TestDoctorInterconnectParsers(t *testing.T) {
 		"? (169.254.0.1) at 36:a1:2b:0:0:5 on bridge0 [bridge]\n")
 	if want := []netip.Addr{netip.MustParseAddr("169.254.0.1")}; !slices.Equal(got, want) {
 		t.Errorf("ARP neighbors = %v, want %v", got, want)
+	}
+}
+
+// TestInterconnectDoctorRefusesUntrustedLedger pins that doctor reads netd's
+// ownership record through the trust checks the uninstall sweep uses: a file
+// root does not own (a test's temp file) is refused and the row says why.
+func TestInterconnectDoctorRefusesUntrustedLedger(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("the temp file would be root-owned and trusted")
+	}
+	path := filepath.Join(t.TempDir(), "interconnect-aliases")
+	if err := os.WriteFile(path, []byte(`{"aliases":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ic := healthyIC(t)
+	ic.ledger = func() ([]install.InterconnectAlias, error) {
+		raw, err := install.ReadTrustedInterconnectLedger(path)
+		if err != nil {
+			return nil, err
+		}
+		return install.ParseInterconnectLedger(raw)
+	}
+	_, by := icRows(t, ic, install.RoleAgent)
+	r := mustRow(t, by, icAddress)
+	if r.status != statusFail || !strings.Contains(r.detail, "not owned by uid 0") || !strings.Contains(r.detail, "not trusted") {
+		t.Errorf("untrusted ledger row = %v %q, want FAIL naming the ownership refusal", r.status, r.detail)
 	}
 }
