@@ -1,0 +1,12 @@
+/fixture/etcdutl: go1.27.2
+	path	go.etcd.io/etcd/etcdutl/v3
+	mod	go.etcd.io/etcd/etcdutl/v3	v3.6.15	h1:ADNOV2EjHgbsmWyQvIvoOxYEph1nNGJrFSvbriC3kjU=
+	dep	go.etcd.io/etcd/server/v3	v3.6.15	h1:IFlqNq0ia29PAcT73gfZjaYO/R+QCOavhenkAP4Y1N0=
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	-trimpath=true
+	build	DefaultGODEBUG=tracebacklabels=0,x509sslcertoverrideplatform=0
+	build	CGO_ENABLED=0
+	build	GOARCH=arm64
+	build	GOOS=darwin
+	build	GOARM64=v8.0
