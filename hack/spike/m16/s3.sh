@@ -337,7 +337,14 @@ PY
 
 MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
 [ -n "$MP" ] || { verdict FAIL "s3.0 setup  no model snapshot under $PREFIX/hf — run s0.sh first"; exit 0; }
+# The scoreboard reads the drive's VERDICT lines; its exit status is not the payload's.
+# Under pipefail a non-zero drive would also earn a second FAIL from the driver for
+# the same criterion, so the payload ends 0 once a verdict has been written and only
+# a drive that wrote none is turned into one here.
 MODEL_PATH="$MP" MAX_KV_SIZE=4096 MAX_NUM_SEQS=4 "$V" "$W/drive.py" 2>&1 | tee "$W/drive.log"
+rc=${PIPESTATUS[0]}
+grep -q '^VERDICT ' "$W/drive.log" || verdict FAIL "s3.1 in-process  drive.py exited $rc without reporting a verdict (see $W/drive.log)"
+exit 0
 EOF
 
 note "S3(2) — the alternative engine, as a recorded control"
@@ -371,7 +378,10 @@ if [ "$UP" = yes ] && [ -r "$PREFIX/s0/load.py" ]; then
 else
   recorded "s3.5 control  the alternative engine did not serve on this rig (see $W/metal.log) — recorded, not gating"
 fi
-kill "$PID" 2>/dev/null
+# A server that already exited makes kill non-zero, and the payload's last status is its
+# exit status: the control is recorded, never failed, so neither may turn into a FAIL.
+kill "$PID" 2>/dev/null || true
+exit 0
 EOF
 
 spike_verdict "$RUNG"
