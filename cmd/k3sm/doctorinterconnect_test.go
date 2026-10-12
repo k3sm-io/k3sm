@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/netip"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -449,5 +450,21 @@ func TestDoctorInterconnectParsers(t *testing.T) {
 	}
 	if _, ok := parsePingRTT("1 packets transmitted, 0 packets received, 100.0% packet loss\n"); ok {
 		t.Error("a ping with no answer parsed a round trip")
+	}
+	for _, avg := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "-0.5"} {
+		if d, ok := parsePingRTT("round-trip min/avg/max/stddev = 0.1/" + avg + "/0.2/0.0 ms\n"); ok {
+			t.Errorf("an average of %q parsed as %v", avg, d)
+		}
+	}
+	// Only complete entries inside the interconnect subnet count: an option
+	// echoed in parentheses, an address outside the subnet, and an incomplete
+	// entry are dropped.
+	got := parseARPNeighbors("? (-f) at 36:a1:2b:0:0:2 on bridge0 [bridge]\n" +
+		"? (8.8.8.8) at 36:a1:2b:0:0:3 on bridge0 [bridge]\n" +
+		"? (169.254.9.209) at 36:a1:2b:0:0:4 on bridge0 [bridge]\n" +
+		"? (169.254.0.17) at (incomplete) on bridge0 [bridge]\n" +
+		"? (169.254.0.1) at 36:a1:2b:0:0:5 on bridge0 [bridge]\n")
+	if want := []netip.Addr{netip.MustParseAddr("169.254.0.1")}; !slices.Equal(got, want) {
+		t.Errorf("ARP neighbors = %v, want %v", got, want)
 	}
 }

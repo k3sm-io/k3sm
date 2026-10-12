@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/netip"
 	"slices"
 	"sort"
@@ -692,7 +693,9 @@ func parseARPNeighbors(out string) []netip.Addr {
 }
 
 // parsePingRTT reads the average round trip from `ping -c 1` output
-// ("round-trip min/avg/max/stddev = 0.612/0.640/0.700/0.020 ms").
+// ("round-trip min/avg/max/stddev = 0.612/0.640/0.700/0.020 ms"). A value that
+// is not a finite, non-negative number (ParseFloat accepts "NaN" and "Inf") is
+// no round trip.
 func parsePingRTT(out string) (time.Duration, bool) {
 	_, rest, ok := strings.Cut(out, "min/avg/max")
 	if !ok {
@@ -711,7 +714,7 @@ func parsePingRTT(out string) (time.Duration, bool) {
 		return 0, false
 	}
 	ms, err := strconv.ParseFloat(f[1], 64)
-	if err != nil {
+	if err != nil || math.IsNaN(ms) || math.IsInf(ms, 0) || ms < 0 {
 		return 0, false
 	}
 	return time.Duration(ms * float64(time.Millisecond)), true

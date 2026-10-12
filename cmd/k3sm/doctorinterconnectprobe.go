@@ -42,6 +42,17 @@ import (
 // port enumeration) is the slow one.
 const icProbeTimeout = 20 * time.Second
 
+// The executables the probes run, by absolute path, so a PATH entry can never
+// stand in for one (`sudo k3sm doctor` runs them as root).
+const (
+	ifconfigPath = "/sbin/ifconfig"
+	pingPath     = "/sbin/ping"
+	arpPath      = "/usr/sbin/arp"
+	netstatPath  = "/usr/sbin/netstat"
+	pmsetPath    = "/usr/bin/pmset"
+	defaultsPath = "/usr/bin/defaults"
+)
+
 // icPingTimeout bounds one peer ping, in whole seconds as `ping -t` takes it.
 const icPingTimeout = 2
 
@@ -59,14 +70,14 @@ func realInterconnectEnv() *interconnectEnv {
 		},
 		bridge: probeBridge,
 		routes: func() ([]icRoute, error) {
-			out, err := icCommand("netstat", "-rn", "-f", "inet")
+			out, err := icCommand(netstatPath, "-rn", "-f", "inet")
 			if err != nil {
 				return nil, err
 			}
 			return parseNetstatRoutes(out), nil
 		},
 		neighbors: func() ([]netip.Addr, error) {
-			out, err := icCommand("arp", "-an", "-i", install.InterconnectBridge)
+			out, err := icCommand(arpPath, "-an", "-i", install.InterconnectBridge)
 			if err != nil {
 				return nil, err
 			}
@@ -97,7 +108,7 @@ func realInterconnectEnv() *interconnectEnv {
 		},
 		cluster: probeICCluster,
 		power: func() (powerSettings, error) {
-			out, err := icCommand("pmset", "-g")
+			out, err := icCommand(pmsetPath, "-g")
 			if err != nil {
 				return powerSettings{}, err
 			}
@@ -106,7 +117,7 @@ func realInterconnectEnv() *interconnectEnv {
 		autoLogin: func() (string, error) {
 			// `defaults read` exits non-zero when the key is unset, which is the
 			// ordinary "automatic login is off".
-			out, err := icCommand("defaults", "read", "/Library/Preferences/com.apple.loginwindow", "autoLoginUser")
+			out, err := icCommand(defaultsPath, "read", "/Library/Preferences/com.apple.loginwindow", "autoLoginUser")
 			if err != nil {
 				return "", nil
 			}
@@ -115,8 +126,8 @@ func realInterconnectEnv() *interconnectEnv {
 	}
 }
 
-// icCommand runs one read-only command under icProbeTimeout and returns its
-// standard output.
+// icCommand runs one read-only command (an absolute path) under icProbeTimeout
+// and returns its standard output.
 func icCommand(name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), icProbeTimeout)
 	defer cancel()
@@ -132,7 +143,7 @@ func icCommand(name string, args ...string) (string, error) {
 func probeBridge() (install.BridgeState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), icProbeTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "ifconfig", install.InterconnectBridge).CombinedOutput()
+	out, err := exec.CommandContext(ctx, ifconfigPath, install.InterconnectBridge).CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(out), "does not exist") {
 			return install.BridgeState{}, errNoBridge
@@ -154,7 +165,7 @@ func pingAll(addrs []netip.Addr) map[netip.Addr]time.Duration {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), (icPingTimeout+1)*time.Second)
 			defer cancel()
-			raw, err := exec.CommandContext(ctx, "ping", "-c", "1", "-t", fmt.Sprint(icPingTimeout), "-q", a.String()).Output()
+			raw, err := exec.CommandContext(ctx, pingPath, "-c", "1", "-t", fmt.Sprint(icPingTimeout), "-q", a.String()).Output()
 			if err != nil {
 				return
 			}
