@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,7 +77,13 @@ type HosterConfig struct {
 	NodeName string
 	// BindAddr is the address every LoadBalancer listener binds. It must be
 	// VALID; the WILDCARD (0.0.0.0) is the production choice and is accepted.
+	// BindAddrs, when set, takes its place.
 	BindAddr netip.Addr
+	// BindAddrs is the address SET every LoadBalancer listener binds, each
+	// port on every address of it (EffectiveBindAddrs). Empty means BindAddr
+	// alone. It is the initial set: PrepareBindAddrs swaps it while the hoster
+	// runs. Every address must be valid.
+	BindAddrs []netip.Addr
 	// ReservedPorts is the set of ports k3sm's OWN listeners occupy (the
 	// NodePort range and the kubelet API port — pkg/ports.ReservedSet). bind
 	// REFUSES them outright rather than racing a k3sm listener for the port (a
@@ -112,6 +119,13 @@ type dialFunc func(ctx context.Context, network, address string) (net.Conn, erro
 // listeners own. It is distinguished from an ordinary bind failure so the
 // operator-facing warning names the real cause.
 var errReservedPort = errors.New("port is reserved by a k3sm listener")
+
+// ErrPrivilegedPortNotWildcard is the sentinel for a LoadBalancer port below
+// 1024 under a specific address set: macOS lets only root bind a specific
+// address there, and the hoster binds in-process, unprivileged (the wildcard
+// needs no privilege). Such a Service is not served on this node while the
+// set is specific; it is a refusal, not a failure of the set.
+var ErrPrivilegedPortNotWildcard = errors.New("a LoadBalancer port below 1024 binds only on every interface")
 
 // Hoster binds the LoadBalancer Services the decider stamped onto THIS node,
 // splices them to their ClusterIP VIPs through the node's own L4 proxy, and
@@ -154,6 +168,21 @@ type Hoster struct {
 	dial dialFunc
 	// now is the clock seam for the throttle (tests).
 	now func() time.Time
+	// addrs is the address set every listener binds (HosterConfig.BindAddrs,
+	// swapped by PrepareBindAddrs).
+	addrs []netip.Addr
+	// entries is each fully bound Service's report entry, keyed "ns/name", as
+	// the last reconcile computed it; a rebind withdraws from it.
+	entries map[string]string
+	// draining holds the forwarders a rebind took off the air: their listeners
+	// are closed and their accepted connections run to completion. closeAll
+	// cancels them; reconcile reaps the ones with nothing left in flight.
+	draining []*forwarder
+
+	// rebind carries PrepareBindAddrs requests to the Run goroutine, which
+	// alone touches the listener state; stopped is closed when Run returns.
+	rebind  chan rebindRequest
+	stopped chan struct{}
 }
 
 // NewHoster validates cfg and builds the Hoster. It starts nothing; call Reset
@@ -168,8 +197,14 @@ func NewHoster(cfg HosterConfig) (*Hoster, error) {
 	// Only VALIDITY is required: the wildcard is the production bind address, so
 	// an IsUnspecified rejection here would refuse the shipped configuration. A
 	// zero Addr stays rejected — it would reach net.Listen as "invalid AddrPort".
-	if !cfg.BindAddr.IsValid() {
-		return nil, fmt.Errorf("svclb: hoster config requires a valid bind address, got %q", cfg.BindAddr)
+	addrs := cfg.BindAddrs
+	if len(addrs) == 0 {
+		addrs = []netip.Addr{cfg.BindAddr}
+	}
+	for _, a := range addrs {
+		if !a.IsValid() {
+			return nil, fmt.Errorf("svclb: hoster config requires a valid bind address, got %q", a)
+		}
 	}
 	// Fail CLOSED on the zero value of a guard: a nil set would silently disable
 	// the reserved-port refusal, joining the VAP's Ignore failure policy and its
@@ -195,6 +230,10 @@ func NewHoster(cfg HosterConfig) (*Hoster, error) {
 		lastRanges:     make(map[string]Ranges),
 		newIncarnation: randomIncarnation,
 		now:            time.Now,
+		addrs:          slices.Clone(addrs),
+		entries:        make(map[string]string),
+		rebind:         make(chan rebindRequest),
+		stopped:        make(chan struct{}),
 	}
 	h.incarnation = h.newIncarnation()
 	return h, nil
@@ -244,7 +283,8 @@ func PatchBoundReport(ctx context.Context, client kubernetes.Interface, node, va
 // Reconciles are event-driven and coalesced; the loop goroutine is the sole
 // owner of the listener state.
 func (h *Hoster) Run(ctx context.Context) error {
-	h.log.Info("svclb: loadbalancer hoster starting", "node", h.cfg.NodeName, "bind", h.cfg.BindAddr.String())
+	defer close(h.stopped)
+	h.log.Info("svclb: loadbalancer hoster starting", "node", h.cfg.NodeName, "bind", addrsString(h.addrs))
 	svcFactory := informers.NewSharedInformerFactory(h.cfg.Client, hosterResync)
 	svcInf := svcFactory.Core().V1().Services().Informer()
 	// A single-object informer on this node's own Node (a field selector on its
@@ -274,12 +314,24 @@ func (h *Hoster) Run(ctx context.Context) error {
 	}
 	svcFactory.Start(ctx.Done())
 	nodeFactory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), svcInf.HasSynced, nodeInf.HasSynced) {
-		h.closeAll()
-		if ctx.Err() != nil {
-			return nil
+	// The sync is waited for beside the rebind requests: a swap of the address
+	// set that arrives before anything is bound only changes the set.
+	synced := make(chan bool, 1)
+	go func() { synced <- cache.WaitForCacheSync(ctx.Done(), svcInf.HasSynced, nodeInf.HasSynced) }()
+	for waiting := true; waiting; {
+		select {
+		case ok := <-synced:
+			if !ok {
+				h.closeAll()
+				if ctx.Err() != nil {
+					return nil
+				}
+				return errors.New("svclb: hoster informer cache sync failed")
+			}
+			waiting = false
+		case req := <-h.rebind:
+			h.handleRebind(ctx, req)
 		}
-		return errors.New("svclb: hoster informer cache sync failed")
 	}
 	ticker := time.NewTicker(hosterResync)
 	defer ticker.Stop()
@@ -292,6 +344,8 @@ func (h *Hoster) Run(ctx context.Context) error {
 			return nil
 		case <-trigger:
 		case <-ticker.C:
+		case req := <-h.rebind:
+			h.handleRebind(ctx, req)
 		}
 		h.step(ctx, servicesFromStore(svcInf.GetStore()), ownNodeFromStore(nodeInf.GetStore(), h.cfg.NodeName))
 	}
@@ -435,10 +489,14 @@ func (h *Hoster) reconcile(ctx context.Context, svcs []*corev1.Service) {
 		}
 	}
 
+	h.reapDraining()
+	clear(h.entries)
 	var entries []string
 	for key, svc := range desired {
 		if h.reconcileService(ctx, key, svc) {
-			entries = append(entries, reportEntry(svc))
+			e := reportEntry(svc)
+			h.entries[key] = e
+			entries = append(entries, e)
 		}
 	}
 	h.report(ctx, entries)
@@ -489,15 +547,21 @@ func (h *Hoster) reconcileService(ctx context.Context, key string, svc *corev1.S
 		}
 		f, err := h.bind(ctx, p.Port, netip.AddrPortFrom(vip, uint16(p.Port)), ranges)
 		if err != nil {
+			if errors.Is(err, ErrPrivilegedPortNotWildcard) {
+				h.throttledWarn(fmt.Sprintf("%s\x00privileged:%d", key, p.Port),
+					"svclb: loadbalancer port below 1024 is not served on this node while its listeners are limited to this Mac and the cluster mesh (LAN access off): macOS lets only root bind a specific address below 1024. Use a port of 1024 or above, or turn LAN access on",
+					"service", key, "port", p.Port, "bind", addrsString(h.addrs))
+				continue
+			}
 			if errors.Is(err, errReservedPort) {
 				h.throttledWarn(fmt.Sprintf("%s\x00reserved:%d", key, p.Port),
 					"svclb: loadbalancer port is RESERVED by a k3sm wildcard listener (the NodePort range or the kubelet API port); no listener bound, this node is not advertised — pick a different spec.ports[].port",
-					"service", key, "port", p.Port, "bind", h.bindAddrPort(p.Port).String())
+					"service", key, "port", p.Port, "bind", addrsString(h.addrs))
 				continue
 			}
 			h.throttledWarn(fmt.Sprintf("%s\x00bind:%d", key, p.Port),
 				"svclb: listener bind failed; this node is not advertised for the service. Likely causes: another local process OR POD already listening on this wildcard port (darwin has no network namespaces, so pods share the node's port space); a second LoadBalancer Service declaring the same port; or a k3sm-reserved port",
-				"service", key, "addr", h.bindAddrPort(p.Port).String(),
+				"service", key, "addr", addrsString(h.addrs), "port", p.Port,
 				"diagnose", fmt.Sprintf("lsof -nP -iTCP:%d -sTCP:LISTEN", p.Port), "err", err)
 			continue
 		}
@@ -506,7 +570,7 @@ func (h *Hoster) reconcileService(ctx context.Context, key string, svc *corev1.S
 		}
 		h.forwarders[key][p.Port] = f
 		h.log.Info("svclb: loadbalancer listener bound",
-			"service", key, "addr", h.bindAddrPort(p.Port).String(), "vip", f.dst.String())
+			"service", key, "addr", addrsString(f.set.Addrs()), "port", p.Port, "vip", f.dst.String())
 		bound++
 	}
 	return tcpPorts > 0 && bound == tcpPorts
@@ -546,16 +610,16 @@ func (h *Hoster) bind(ctx context.Context, port int32, dst netip.AddrPort, range
 	if h.cfg.ReservedPorts[port] {
 		return nil, fmt.Errorf("svclb: refusing port %d: %w", port, errReservedPort)
 	}
-	raw, err := h.dir.Listen(ctx, "tcp", h.bindAddrPort(port))
+	set, err := ListenAddrSet(ctx, h.dir.Listen, h.addrs, uint16(port))
 	if err != nil {
-		return nil, err
+		return nil, h.classifyBindErr(port, err)
 	}
 	// Clamp every accepted connection's TCP segment size: a local pod reaches a
 	// LoadBalancer address over lo0, and that connection must not carry
 	// lo0-sized segments onto the mesh if its route moves.
-	ln := tcpseg.WrapListener(raw)
+	ln := tcpseg.WrapListener(set)
 	fctx, cancel := context.WithCancel(ctx)
-	f := &forwarder{ln: ln, dst: dst, cancel: cancel, done: make(chan struct{}), log: h.log, dial: h.dial}
+	f := &forwarder{ln: ln, set: set, dst: dst, cancel: cancel, done: make(chan struct{}), log: h.log, dial: h.dial}
 	f.setRanges(ranges)
 	go f.run(fctx)
 	return f, nil
@@ -574,7 +638,7 @@ func (h *Hoster) logRangesInvalid(svc *corev1.Service, key string, err error) {
 	h.log.Debug("svclb: invalid source ranges, raw values", append([]any{"service", key}, SourceRangesLogArgs(svc)...)...)
 }
 
-// closeAll drains every forwarder (shutdown).
+// closeAll drains every forwarder, the draining ones included (shutdown).
 func (h *Hoster) closeAll() {
 	for key, ports := range h.forwarders {
 		for _, f := range ports {
@@ -582,6 +646,10 @@ func (h *Hoster) closeAll() {
 		}
 		delete(h.forwarders, key)
 	}
+	for _, f := range h.draining {
+		f.stop()
+	}
+	h.draining = nil
 }
 
 // withdraw is the clean-shutdown half of the report: once every listener is
@@ -614,11 +682,6 @@ func (h *Hoster) throttledWarn(key, msg string, args ...any) {
 	}
 	h.lastWarn[key] = now
 	h.log.Warn(msg, args...)
-}
-
-// bindAddrPort is the AddrPort a listener for port occupies.
-func (h *Hoster) bindAddrPort(port int32) netip.AddrPort {
-	return netip.AddrPortFrom(h.cfg.BindAddr, uint16(port))
 }
 
 // Retractable reports whether an existing status.loadBalancer.ingress entry ip
@@ -687,7 +750,9 @@ func isTCP(p corev1.ServicePort) bool {
 // its Service's ClusterIP VIP. Its lifetime is bounded by the context bind
 // derived it from; stop cancels and waits for the accept loop to exit.
 type forwarder struct {
-	ln     net.Listener
+	ln net.Listener
+	// set is the address-set listener under ln, which a rebind swaps.
+	set    *AddrSetListener
 	dst    netip.AddrPort
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -700,6 +765,11 @@ type forwarder struct {
 	// swaps the whole set and the next accept sees it, with no lock on the
 	// accept path. A nil pointer or empty set allows every peer.
 	ranges atomic.Pointer[Ranges]
+	// retired is set before a rebind closes the listener under a live
+	// forwarder, so the accept loop ends quietly; active counts its splices in
+	// flight, so a drained forwarder can be reaped.
+	retired atomic.Bool
+	active  atomic.Int64
 }
 
 // setRanges installs r as the enforced source-range set.
@@ -730,7 +800,7 @@ func (f *forwarder) run(ctx context.Context) {
 	for {
 		conn, err := f.ln.Accept()
 		if err != nil {
-			if ctx.Err() == nil {
+			if ctx.Err() == nil && !f.retired.Load() {
 				f.log.Warn("svclb: accept failed; listener stopped", "addr", f.ln.Addr().String(), "err", err)
 			}
 			return
@@ -745,7 +815,11 @@ func (f *forwarder) run(ctx context.Context) {
 			_ = conn.Close()
 			continue
 		}
-		go f.splice(ctx, conn)
+		f.active.Add(1)
+		go func() {
+			defer f.active.Add(-1)
+			f.splice(ctx, conn)
+		}()
 	}
 }
 
