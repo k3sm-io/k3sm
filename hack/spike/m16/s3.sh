@@ -255,17 +255,21 @@ async def main():
                 ended = "ended with finish=%s %.1fs after the abort" % (getattr(out, "finish_reason", None), time.time() - t_abort)
                 break
             after += 1
-        record("s3.2 abort_request(%r) returned %r in %.3fs; %d token events after the abort; the stream %s; "
-               "cache stats: %s" % (rid2, accepted, took, after, ended, cache_stats(core)))
-        if accepted and after <= 1:
-            verdict("PASS", "s3.2 abort",
-                    "abort_request was accepted mid-stream after 8 events and generation stopped (%d in-flight event after it, "
-                    "then the stream %s); a worker owns ending the stream it handed out" % (after, ended))
+        record("s3.2 abort_request(%r) returned %r in %.3fs; %d token events after the abort; cache stats: %s"
+               % (rid2, accepted, took, after, cache_stats(core)))
+        if accepted and after == 0:
+            verdict("PASS", "s3.2 abort", "abort_request was accepted mid-stream after 8 events and generation stopped: "
+                    "no token event followed it within %.0fs" % ABORT_GRACE)
         elif accepted:
-            verdict("FAIL", "s3.2 abort", "abort_request returned True but %d token events followed it - the engine kept generating"
+            verdict("FAIL", "s3.2 abort", "abort_request returned True but %d token event(s) followed it - the engine kept generating"
                     % after)
         else:
             verdict("FAIL", "s3.2 abort", "abort_request returned %r for a live request" % (accepted,))
+        # The stream's own ending is a separate fact for the plan to judge, never part of the PASS:
+        # a worker whose engine leaves the stream open must end it itself.
+        record("s3.2-stream after the abort the stream %s; the worker %s"
+               % (ended, "can rely on the engine to end the stream" if ended.startswith("ended") else "must end the stream itself"))
+
     await stream.close()
 
     # ---- s3.3 the routing metadata: block hashes behind the scheduler ---------------
