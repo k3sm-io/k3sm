@@ -157,6 +157,30 @@ func TestInstallRecordsEtcdSnapshotFlags(t *testing.T) {
 		}
 	})
 
+	t.Run("compression is recorded, replaces a carried value, and parses back", func(t *testing.T) {
+		opts, err := parseInstallFlags(append(base, "--etcd-snapshot-compress"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := opts.installConfig("/tmp/k3sm", nil, logger)
+		cfg.ExtraServerArgs = []string{"--etcd-snapshot-compress=false"}
+		want := []string{"--cluster-init", "--etcd-peer-ip", "192.0.2.10", "--etcd-snapshot-compress=true"}
+		got := install.RecordedServerArgs(cfg)
+		if !slices.Equal(got, want) {
+			t.Fatalf("recorded = %q, want %q", got, want)
+		}
+		fs := flag.NewFlagSet("server", flag.ContinueOnError)
+		so := serverOptions{}
+		_ = registerServerFlags(fs, &so)
+		if err := fs.Parse(got); err != nil {
+			t.Fatalf("the daemon cannot parse the recorded arguments: %v", err)
+		}
+		so.nodeName = "server-a"
+		if snap := so.etcdConfig().Snapshots; snap == nil || !snap.Compress {
+			t.Fatalf("the daemon reads the schedule as %+v, want compressed", snap)
+		}
+	})
+
 	t.Run("a passed flag replaces the carried one; an unpassed one is carried", func(t *testing.T) {
 		opts, err := parseInstallFlags(append(base, "--etcd-snapshot-retention", "2"))
 		if err != nil {

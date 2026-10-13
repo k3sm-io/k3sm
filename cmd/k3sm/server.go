@@ -127,8 +127,10 @@ type serverOptions struct {
 	etcdSnapshotCron      string
 	etcdSnapshotRetention int
 	etcdDisableSnapshots  bool
-	joinServer            string // an existing server's LAN address: the CA bundle and the etcd member route (HA server-join)
-	token                 string // static admin bearer token (standalone) or the server-class join token (HA server-join)
+	// etcdSnapshotCompress writes each scheduled snapshot as a zip archive.
+	etcdSnapshotCompress bool
+	joinServer           string // an existing server's LAN address: the CA bundle and the etcd member route (HA server-join)
+	token                string // static admin bearer token (standalone) or the server-class join token (HA server-join)
 	// tokenFile is a file holding that token, read once at start. It is how the
 	// INSTALLED daemon is given its static admin token: the value never appears
 	// on the argv a plist publishes. See resolveTokenFile.
@@ -236,13 +238,13 @@ func (opts serverOptions) etcdSnapshotSchedule() *executor.EtcdSnapshotSchedule 
 	if err != nil {
 		return nil
 	}
-	return &executor.EtcdSnapshotSchedule{Cron: cron, Retention: opts.etcdSnapshotRetention}
+	return &executor.EtcdSnapshotSchedule{Cron: cron, Retention: opts.etcdSnapshotRetention, Compress: opts.etcdSnapshotCompress}
 }
 
 // etcdSnapshotFlagsChanged reports whether any scheduled-snapshot flag differs from
 // its default.
 func (opts serverOptions) etcdSnapshotFlagsChanged() bool {
-	return opts.etcdDisableSnapshots ||
+	return opts.etcdDisableSnapshots || opts.etcdSnapshotCompress ||
 		opts.etcdSnapshotRetention != executor.DefaultEtcdSnapshotRetention ||
 		strings.Join(strings.Fields(opts.etcdSnapshotCron), " ") != executor.DefaultEtcdSnapshotCron
 }
@@ -422,6 +424,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.StringVar(&opts.etcdSnapshotCron, "etcd-snapshot-schedule-cron", executor.DefaultEtcdSnapshotCron, "when to take a scheduled etcd snapshot, as a five-field cron expression in local time (embedded etcd HA only)")
 	fs.IntVar(&opts.etcdSnapshotRetention, "etcd-snapshot-retention", executor.DefaultEtcdSnapshotRetention, "how many of this server's scheduled etcd snapshots to keep; manual snapshots are never removed (embedded etcd HA only)")
 	fs.BoolVar(&opts.etcdDisableSnapshots, "etcd-disable-snapshots", false, "take no scheduled etcd snapshots (embedded etcd HA only)")
+	fs.BoolVar(&opts.etcdSnapshotCompress, "etcd-snapshot-compress", false, "write each scheduled etcd snapshot as a zip archive named <name>.zip; retention counts compressed and plain snapshots alike (embedded etcd HA only)")
 	// HA server-join: a SECOND control-plane server reconstructs the identical
 	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).

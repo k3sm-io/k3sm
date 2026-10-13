@@ -128,6 +128,9 @@ type EtcdRestoreResult struct {
 	MemberName, PeerURL, ClusterToken string
 	// RevisionBump is EtcdRestoreRevisionBump.
 	RevisionBump uint64
+	// Compressed reports that Snapshot was a zip archive, inflated before it was
+	// verified and restored.
+	Compressed bool
 	// Warnings are advisories about the input that did not stop the restore.
 	Warnings []string
 }
@@ -213,21 +216,39 @@ func restoreEtcdSnapshot(ctx context.Context, opts EtcdRestoreOptions, seams etc
 		return nil, fmt.Errorf("%w: %s", ErrEtcdRestoreOverSQLite, StateDBPath(opts.WorkDir))
 	}
 
+	ofi, err := os.Stat(opts.Snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrSnapshotNotFound, opts.Snapshot, err)
+	}
+	if !ofi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %s is not a regular file", ErrSnapshotNotFound, opts.Snapshot)
+	}
+	// A compressed snapshot is inflated (capped) into a temporary file in the work
+	// dir, and every check below, and etcdutl itself, reads those plain bytes.
+	in, err := openSnapshotInput(opts.Snapshot, opts.WorkDir)
+	if err != nil {
+		return nil, err
+	}
+	defer in.cleanup()
+	original := opts.Snapshot
+	opts.Snapshot = in.path
+
 	fi, kind, err := sniffSnapshot(opts.Snapshot)
 	if err != nil {
 		return nil, err
 	}
-	res := &EtcdRestoreResult{Snapshot: opts.Snapshot, Bytes: fi.Size(), DataDir: EtcdDataDir(opts.WorkDir),
-		MemberName: opts.Name, PeerURL: etcdPeerURL(opts.PeerIP, opts.PeerPort), RevisionBump: EtcdRestoreRevisionBump}
+	res := &EtcdRestoreResult{Snapshot: original, Bytes: ofi.Size(), DataDir: EtcdDataDir(opts.WorkDir),
+		MemberName: opts.Name, PeerURL: etcdPeerURL(opts.PeerIP, opts.PeerPort), RevisionBump: EtcdRestoreRevisionBump,
+		Compressed: in.compressed}
 	switch kind {
 	case snapshotSQLite:
-		return nil, fmt.Errorf("%w: %s", ErrKineSnapshotForEtcd, opts.Snapshot)
+		return nil, fmt.Errorf("%w: %s", ErrKineSnapshotForEtcd, original)
 	case snapshotBoltNoTrailer:
-		return nil, fmt.Errorf("%w: %s (%d bytes)", ErrEtcdSnapshotNoTrailer, opts.Snapshot, fi.Size())
+		return nil, fmt.Errorf("%w: %s (%d bytes)", ErrEtcdSnapshotNoTrailer, original, fi.Size())
 	case snapshotUnknown:
-		return nil, fmt.Errorf("%w: %s is neither an etcd snapshot nor a kine SQLite database", ErrEtcdSnapshotVerify, opts.Snapshot)
+		return nil, fmt.Errorf("%w: %s is neither an etcd snapshot nor a kine SQLite database", ErrEtcdSnapshotVerify, original)
 	}
-	if w := snapshotModeWarning(opts.Snapshot, fi); w != "" {
+	if w := snapshotModeWarning(original, ofi); w != "" {
 		res.Warnings = append(res.Warnings, w)
 	}
 

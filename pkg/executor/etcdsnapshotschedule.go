@@ -112,6 +112,11 @@ type EtcdSnapshotSchedule struct {
 	Cron *CronSchedule
 	// Retention is how many of this node's scheduled snapshots are kept. At least 1.
 	Retention int
+	// Compress writes each scheduled snapshot as a one-member zip archive named
+	// <name>.zip (k3s's --etcd-snapshot-compress). Retention counts compressed and
+	// plain snapshots of this node alike, so turning it on or off keeps the newest
+	// Retention of either kind.
+	Compress bool
 }
 
 // validate checks the schedule's own fields.
@@ -132,9 +137,10 @@ func ScheduledEtcdSnapshotName(node string, t time.Time) string {
 }
 
 // parseScheduledEtcdSnapshot reports whether name is a scheduled snapshot of node,
-// and when it was taken. Nothing else matches: not another node's, not a manual
-// save's, not a .tmp a failed write left.
+// plain or compressed (<name>.zip), and when it was taken. Nothing else matches: not
+// another node's, not a manual save's, not a .tmp a failed write left.
 func parseScheduledEtcdSnapshot(node, name string) (time.Time, bool) {
+	name = strings.TrimSuffix(name, compressedSnapshotExt)
 	rest, ok := strings.CutPrefix(name, scheduledSnapshotPrefix+node+"-")
 	if !ok || rest == "" {
 		return time.Time{}, false
@@ -176,13 +182,15 @@ type etcdSnapshotState struct {
 type etcdSnapshotScheduler struct {
 	cron      *CronSchedule
 	retention int
+	compress  bool
 	dir       string
 	node      string
 	// loc is the zone the cron expression is read in: the server's local time.
 	loc   *time.Location
 	clock clock
-	// save writes a verified snapshot to dst (saveEtcdSnapshot in production).
-	save func(ctx context.Context, dst string) error
+	// save writes a verified snapshot to dst, compressed when compress is set
+	// (saveEtcdSnapshot in production).
+	save func(ctx context.Context, dst string, compress bool) error
 	// space refuses a directory with less than want bytes free.
 	space func(dir string, want uint64) error
 	// dbSize, when non-nil, sizes the floor before the schedule has a snapshot of
@@ -205,12 +213,15 @@ func (s *Supervised) newEtcdSnapshotScheduler(m etcdMembers) *etcdSnapshotSchedu
 	sc := &etcdSnapshotScheduler{
 		cron:      cfg.Cron,
 		retention: cfg.Retention,
+		compress:  cfg.Compress,
 		dir:       SnapshotDir(s.cfg.WorkDir),
 		node:      s.cfg.Etcd.Name,
 		loc:       time.Local,
 		clock:     s.etcd.clock,
-		save:      func(ctx context.Context, dst string) error { return saveEtcdSnapshot(ctx, m, dst) },
-		space:     requireSnapshotSpace,
+		save: func(ctx context.Context, dst string, compress bool) error {
+			return saveEtcdSnapshot(ctx, m, dst, compress)
+		},
+		space: requireSnapshotSpace,
 		dbSize: func(ctx context.Context) (int64, error) {
 			st, err := m.Status(ctx)
 			return st.DBSize, err
@@ -390,9 +401,12 @@ func (sc *etcdSnapshotScheduler) tick(ctx context.Context) {
 	sc.mu.Lock()
 	basis := sc.lastSize
 	sc.mu.Unlock()
-	if basis <= 0 && sc.dbSize != nil {
+	// A compressed tick stages the plain snapshot before compressing it, so the last
+	// archive's size understates what it needs: the member's backend size is asked
+	// for too, and the larger of the two sizes the floor.
+	if (basis <= 0 || sc.compress) && sc.dbSize != nil {
 		cctx, cancel := context.WithTimeout(ctx, etcdCallTimeout)
-		if n, err := sc.dbSize(cctx); err == nil {
+		if n, err := sc.dbSize(cctx); err == nil && n > basis {
 			basis = n
 		}
 		cancel()
@@ -410,8 +424,11 @@ func (sc *etcdSnapshotScheduler) tick(ctx context.Context) {
 
 	taken := sc.clock.Now()
 	path := filepath.Join(sc.dir, ScheduledEtcdSnapshotName(sc.node, taken))
+	if sc.compress {
+		path += compressedSnapshotExt
+	}
 	sctx, cancel := context.WithTimeout(ctx, etcdScheduledSnapshotTimeout)
-	err := sc.save(sctx, path)
+	err := sc.save(sctx, path, sc.compress)
 	cancel()
 	if err != nil {
 		if ctx.Err() != nil {
@@ -472,7 +489,7 @@ func (s *Supervised) startEtcdSnapshotSchedule(ctx context.Context, sc *etcdSnap
 	s.etcdSnap, s.etcdSnapStop, s.etcdSnapDone = sc, cancel, done
 	s.mu.Unlock()
 	s.cfg.Logger.Info("scheduled etcd snapshots are on", "component", etcdComponent, "schedule", sc.cron.String(),
-		"retention", sc.retention, "dir", sc.dir)
+		"retention", sc.retention, "compress", sc.compress, "dir", sc.dir)
 	go func() {
 		defer close(done)
 		sc.run(sctx)

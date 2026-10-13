@@ -191,12 +191,13 @@ func describeMembers(ms []etcdMember) string {
 //
 // The member is found through the status record the running server keeps (its
 // loopback client URL); only a loopback https URL is accepted. The file holds every
-// Secret in plaintext — keep it 0600 and off shared storage.
-func SnapshotEtcd(ctx context.Context, workDir, dst string) error {
-	return snapshotEtcd(ctx, workDir, dst, dialEtcdAdmin)
+// Secret in plaintext — keep it 0600 and off shared storage. With compress, dst is a
+// one-member zip archive of the verified snapshot (snapshotcompress.go).
+func SnapshotEtcd(ctx context.Context, workDir, dst string, compress bool) error {
+	return snapshotEtcd(ctx, workDir, dst, compress, dialEtcdAdmin)
 }
 
-func snapshotEtcd(ctx context.Context, workDir, dst string, dial func(context.Context, string, string) (etcdAdmin, error)) error {
+func snapshotEtcd(ctx context.Context, workDir, dst string, compress bool, dial func(context.Context, string, string) (etcdAdmin, error)) error {
 	st, err := ReadEtcdStatus(workDir)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrNoEtcdClient, err)
@@ -210,20 +211,32 @@ func snapshotEtcd(ctx context.Context, workDir, dst string, dial func(context.Co
 		return err
 	}
 	defer func() { _ = admin.Close() }()
-	return saveEtcdSnapshot(ctx, admin, dst)
+	return saveEtcdSnapshot(ctx, admin, dst, compress)
 }
 
 // saveEtcdSnapshot streams the member's snapshot to dst through
 // writeVerifiedEtcdSnapshot. It is the one save path: `k3sm snapshot save` and the
 // scheduled snapshots both write through it, so both get the same verification and
-// the same 0600 file.
-func saveEtcdSnapshot(ctx context.Context, m etcdMembers, dst string) error {
+// the same 0600 file. With compress the verified plain snapshot is staged at
+// plainStagingPath(dst) and only those bytes are compressed into dst.
+func saveEtcdSnapshot(ctx context.Context, m etcdMembers, dst string, compress bool) error {
 	rc, err := m.Snapshot(ctx)
 	if err != nil {
 		return fmt.Errorf("stream the etcd snapshot: %w", err)
 	}
 	defer func() { _ = rc.Close() }()
-	return writeVerifiedEtcdSnapshot(rc, dst)
+	if !compress {
+		return writeVerifiedEtcdSnapshot(rc, dst)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("create snapshot directory: %w", err)
+	}
+	plain := plainStagingPath(dst)
+	if err := writeVerifiedEtcdSnapshotAt(rc, plain); err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(plain) }()
+	return compressSnapshotFile(plain, dst)
 }
 
 // writeVerifiedEtcdSnapshot writes the stream to dst.tmp (0600, O_EXCL), verifies
@@ -234,6 +247,20 @@ func writeVerifiedEtcdSnapshot(r io.Reader, dst string) error {
 		return fmt.Errorf("create snapshot directory: %w", err)
 	}
 	tmp := dst + ".tmp"
+	if err := writeVerifiedEtcdSnapshotAt(r, tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("install snapshot %s: %w", dst, err)
+	}
+	return nil
+}
+
+// writeVerifiedEtcdSnapshotAt writes the stream to tmp (0600, O_EXCL) and verifies
+// it. On any failure tmp is removed; on success it is left for the caller to rename
+// or compress.
+func writeVerifiedEtcdSnapshotAt(r io.Reader, tmp string) error {
 	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("clear stale partial snapshot %s: %w", tmp, err)
 	}
@@ -259,10 +286,6 @@ func writeVerifiedEtcdSnapshot(r io.Reader, dst string) error {
 	if err := os.Chmod(tmp, 0o600); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("restrict %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("install snapshot %s: %w", dst, err)
 	}
 	return nil
 }

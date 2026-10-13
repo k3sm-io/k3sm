@@ -250,7 +250,7 @@ func TestEtcdSnapshotSaveVerifies(t *testing.T) {
 			var dialed string
 			dial := func(_ context.Context, _, endpoint string) (etcdAdmin, error) { dialed = endpoint; return fake, nil }
 			dst := filepath.Join(t.TempDir(), "snaps", "etcd.snap")
-			err := snapshotEtcd(t.Context(), wd, dst, dial)
+			err := snapshotEtcd(t.Context(), wd, dst, false, dial)
 			if dialed != "https://127.0.0.1:2379" {
 				t.Errorf("dialed %q, want the recorded loopback client URL", dialed)
 			}
@@ -284,14 +284,14 @@ func TestEtcdSnapshotSaveVerifies(t *testing.T) {
 			t.Error("dialed with no recorded member")
 			return nil, errors.New("unreachable")
 		}
-		if err := snapshotEtcd(t.Context(), t.TempDir(), filepath.Join(t.TempDir(), "s"), dial); !errors.Is(err, ErrNoEtcdClient) {
+		if err := snapshotEtcd(t.Context(), t.TempDir(), filepath.Join(t.TempDir(), "s"), false, dial); !errors.Is(err, ErrNoEtcdClient) {
 			t.Errorf("no status record: save = %v, want ErrNoEtcdClient", err)
 		}
 		wd := t.TempDir()
 		if err := writeEtcdStatus(wd, EtcdStatus{ClientURL: "https://192.0.2.10:2379"}); err != nil {
 			t.Fatal(err)
 		}
-		if err := snapshotEtcd(t.Context(), wd, filepath.Join(t.TempDir(), "s"), dial); !errors.Is(err, ErrNoEtcdClient) {
+		if err := snapshotEtcd(t.Context(), wd, filepath.Join(t.TempDir(), "s"), false, dial); !errors.Is(err, ErrNoEtcdClient) {
 			t.Errorf("non-loopback client URL: save = %v, want ErrNoEtcdClient", err)
 		}
 	})

@@ -24,6 +24,7 @@ every backup and snapshot: neither contains the key, and without it the Secrets 
 ```sh
 k3sm snapshot save                      # -> <work-dir>/db/snapshots/k3sm-snapshot-<UTC>.db
 k3sm snapshot save --out /Volumes/backups/k3sm.db
+k3sm snapshot save --compress           # -> <work-dir>/db/snapshots/k3sm-snapshot-<UTC>.zip
 ```
 
 It is safe to run **while the control plane is serving**, because SQLite takes the copy inside a read
@@ -37,6 +38,13 @@ transaction and a concurrent write cannot tear it. What it does, in order:
 
 The work directory is owned by the `_k3sm` service user, so run it under `sudo` (or pass
 `--work-dir`) when your shell user cannot read it. The snapshot is written `0600`.
+
+`--compress` writes the snapshot as a zip archive holding one file, the same snapshot a plain save
+writes, which is the format k3s uses for compressed snapshots. The snapshot is checked before it is
+compressed, and the archive is read back before it takes its name. A generated name ends in `.zip`;
+a file named with `--out` keeps the name you gave it. Compression applies to the file on disk only:
+a restore decompresses it, and the datastore it puts in place is byte for byte what a plain snapshot
+restores. It works the same way on an etcd server.
 
 **Copy it off the node.** The default location is the same volume as the cluster it protects, which
 does not survive losing that volume. `--out` onto another disk or host is the better habit.
@@ -58,6 +66,10 @@ The restore is built to be survivable when it goes wrong:
   corruption, not a restore, because kine keeps writing to the file it already holds open.
 - It **verifies the snapshot before touching anything**. A snapshot that fails `integrity_check`
   costs you an error and nothing else; your current datastore is untouched.
+- It **recognizes a compressed snapshot by its content**, not its name, so a renamed file restores
+  either way. A compressed snapshot is decompressed into a temporary file beside the datastore and
+  checked there before anything is replaced. An archive that is truncated, fails its checksum, holds
+  more than one file, or would decompress to more than 8 GiB is refused, and nothing is changed.
 - It **preserves what it replaces**. The superseded `state.db` is moved to
   `state.db.restore-<UTC>.bak` and never deleted, and its `-wal`/`-shm` sidecars and kine pin stamp
   go with it, because a stale sidecar left beside a restored database is exactly how a "successful"
@@ -70,7 +82,7 @@ is for.
 ## Scheduled etcd Snapshots
 
 A server installed with `--cluster-init` or `--server-join` snapshots its etcd member on a schedule,
-the way k3s does. Three flags control it, on both `k3sm install` and `k3sm server`, with the k3s
+the way k3s does. Four flags control it, on both `k3sm install` and `k3sm server`, with the k3s
 names and defaults:
 
 | flag | default | meaning |
@@ -78,6 +90,7 @@ names and defaults:
 | `--etcd-snapshot-schedule-cron` | `0 */12 * * *` | when to take a snapshot: a five-field cron expression (minute, hour, day of month, month, day of week) in the server's local time; the default is midnight and noon |
 | `--etcd-snapshot-retention` | `5` | how many of this server's scheduled snapshots to keep |
 | `--etcd-disable-snapshots` | `false` | take no scheduled snapshots |
+| `--etcd-snapshot-compress` | `false` | write each scheduled snapshot as a zip archive, named `etcd-snapshot-<node>-<unix seconds>.zip` |
 
 ```sh
 sudo k3sm install --cluster-init --node-ip 192.0.2.10 \
@@ -107,13 +120,17 @@ What the schedule does:
   deletes older ones. It runs only after a new snapshot was written and checked, so a failing
   schedule never deletes the snapshots it already has. It never deletes a snapshot taken with
   `k3sm snapshot save` (those are named `k3sm-etcd-snapshot-<UTC>.db`) or one named for another
-  node. Snapshots are ordered by the earlier of the time in the name and the file's modification
+  node. Compressed and plain snapshots count alike, so turning `--etcd-snapshot-compress` on or off
+  still keeps the newest `--etcd-snapshot-retention` of this server's snapshots of either kind.
+  Snapshots are ordered by the earlier of the time in the name and the file's modification
   time, and one dated in the future (taken while the clock was wrong) counts as the oldest. If you
   rename a server, its snapshots under the old name are left for you to remove.
 - When the schedule starts it removes the partial `.tmp` files an interrupted snapshot of this
   server left behind, and nothing else.
 - A snapshot is **skipped** when the snapshot directory's volume has less than twice the last
-  snapshot's size free, so the schedule does not fill the disk the datastore lives on.
+  snapshot's size free, so the schedule does not fill the disk the datastore lives on. With
+  compression on, the etcd database's own size is used when it is larger, because the snapshot is
+  written and checked uncompressed before it is compressed.
 - Each snapshot taken and each one removed is an `INFO` line in the server log; a failed or skipped
   snapshot is a `WARN` line. `k3sm status -o wide` shows, on the `etcd` row, the schedule, when the
   newest scheduled snapshot was taken, how many are kept, and, until the next snapshot succeeds,
