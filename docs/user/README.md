@@ -43,7 +43,9 @@ directory is the front door to the user-facing docs; read them roughly in the jo
     `k3sm status daemons -o json` probe: fields, enums, versioning and exit codes.
 21. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
     options, rotation, and how to ship logs off a node.
-22. [FAQ](faq.md) gives short answers to the common questions.
+22. [Stopping and starting](stop-start.md) covers `k3sm stop`, `start` and `restart`, what a stop does
+    to pods and the cluster, and how a stop survives a reboot.
+23. [FAQ](faq.md) gives short answers to the common questions.
 
 ## Before You Build Anything Real
 

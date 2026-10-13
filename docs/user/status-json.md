@@ -197,7 +197,7 @@ asked for it.
 
 The object is omitted when there is no stop marker, and also when the marker cannot be read or
 parsed: a damaged marker never fails the report. Readers must treat a missing `stoppedBy` as
-"no recorded stop", not as "running".
+"no recorded stop", not as "running". [Stopping and starting](stop-start.md) covers the verbs that write it.
 
 ## Interconnect
 
