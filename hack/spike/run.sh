@@ -14,6 +14,7 @@
 set -euo pipefail
 
 KUBE_VERSION="${KUBE_VERSION:-v1.36.2}"          # latest darwin-arm64 on kwok-ci/k8s
+KUBE_PINNED_VERSION=v1.36.2
 KINE_VERSION="${KINE_VERSION:-v1.14.2}"
 WORKDIR="${K3SM_SPIKE_WORKDIR:-/tmp/k3sm-spike}"
 APISERVER_PORT="${APISERVER_PORT:-6444}"         # NOT 6443 — Docker Desktop's k8s squats on 6443
@@ -36,17 +37,63 @@ case "${1:-up}" in
   kubectl) shift; kc "$@"; exit $? ;;
 esac
 
+# Control-plane binary pins, one per release asset, for $KUBE_PINNED_VERSION only.
+# kwok-ci/k8s publishes no checksums file for its releases (none among the
+# assets, none in the release notes), so each digest is the `digest` field the
+# GitHub release-asset API reports for the uploaded asset
+# (GET /repos/kwok-ci/k8s/releases/tags/v1.36.2-kwok.0-darwin-arm64): GitHub's
+# own hash of the bytes it serves, NOT a vendor-signed checksum. It binds every
+# run to the bytes uploaded at release time; it cannot vouch for those bytes.
+# Another KUBE_VERSION must supply all four K3SM_SPIKE_*_SHA256 overrides, or
+# the download fails closed.
+if [ "$KUBE_VERSION" = "$KUBE_PINNED_VERSION" ]; then
+  _pin_apiserver=1afff09280a70553c72561e4c2d55ec95f8c979fa5933dba770aade5a3a93ca5          # GitHub asset API digest
+  _pin_controller_manager=a2ad45b40d8a367022cd545d390469913aeef3c3b83300477e629c6af1bd2dad # GitHub asset API digest
+  _pin_scheduler=c46f96dd961607a325482bd46f7e53fd78cf6106fcbac48315506f37a417f6ba          # GitHub asset API digest
+  _pin_kubectl=112ed6605c8a68d5d3e6abef5f1beb5c087309e3979dc18d7c38b018cd7758a9            # GitHub asset API digest
+else
+  _pin_apiserver= _pin_controller_manager= _pin_scheduler= _pin_kubectl=
+fi
+KUBE_APISERVER_SHA256="${K3SM_SPIKE_KUBE_APISERVER_SHA256:-$_pin_apiserver}"
+KUBE_CONTROLLER_MANAGER_SHA256="${K3SM_SPIKE_KUBE_CONTROLLER_MANAGER_SHA256:-$_pin_controller_manager}"
+KUBE_SCHEDULER_SHA256="${K3SM_SPIKE_KUBE_SCHEDULER_SHA256:-$_pin_scheduler}"
+KUBECTL_SHA256="${K3SM_SPIKE_KUBECTL_SHA256:-$_pin_kubectl}"
+
+# kube_pin ASSET — the pinned sha256 of one release asset; empty if unpinned.
+kube_pin() {
+  case "$1" in
+    kube-apiserver)          echo "$KUBE_APISERVER_SHA256" ;;
+    kube-controller-manager) echo "$KUBE_CONTROLLER_MANAGER_SHA256" ;;
+    kube-scheduler)          echo "$KUBE_SCHEDULER_SHA256" ;;
+    kubectl)                 echo "$KUBECTL_SHA256" ;;
+    *)                       echo "" ;;
+  esac
+}
+
 echo "==> work dir: $WORKDIR"; mkdir -p "$BIN"; cd "$WORKDIR"; down || true
 
 # 1. control-plane binaries — prebuilt darwin/arm64 (upstream refuses to ship these: k/k#118359).
-if [ ! -x "$BIN/kube-apiserver" ]; then
-  echo "==> downloading control-plane binaries ($KUBE_VERSION darwin-arm64) from kwok-ci/k8s"
-  gh release download "${KUBE_VERSION}-kwok.0-darwin-arm64" --repo kwok-ci/k8s --dir "$BIN" --clobber
-  chmod +x "$BIN"/*
-fi
-# arm64 Mach-O must be at least ad-hoc signed to exec — the same codesign-on-pull k3sm will use.
-for b in "$BIN"/kube-apiserver "$BIN"/kube-scheduler "$BIN"/kube-controller-manager "$BIN"/kubectl; do
-  codesign -s - -f "$b" >/dev/null 2>&1 || true
+# Each asset is downloaded by name into a private staging dir and kept there
+# UNSIGNED: codesign -f rewrites the Mach-O, so the pin can only ever be checked
+# against the staged copy. The staged copy is re-verified on EVERY run (a warm
+# cache included) before it is copied into $BIN and signed there.
+STAGE="$WORKDIR/stage"
+mkdir -m 0700 -p "$STAGE"; chmod 0700 "$STAGE"
+KUBE_TAG="${KUBE_VERSION}-kwok.0-darwin-arm64"
+for asset in kube-apiserver kube-controller-manager kube-scheduler kubectl; do
+  want=$(kube_pin "$asset")
+  [ -n "$want" ] || { echo "no sha256 pin for $asset at $KUBE_VERSION (set K3SM_SPIKE_*_SHA256)"; exit 1; }
+  if [ ! -f "$STAGE/$asset" ]; then
+    echo "==> downloading $asset ($KUBE_TAG) from kwok-ci/k8s"
+    gh release download "$KUBE_TAG" --repo kwok-ci/k8s --pattern "$asset" --dir "$STAGE" --clobber
+  fi
+  printf '%s  %s\n' "$want" "$STAGE/$asset" | shasum -a 256 -c - >/dev/null \
+    || { echo "sha256 mismatch for $asset (pinned $want); removed the staged copy"; rm -f "$STAGE/$asset"; exit 1; }
+  rm -f "$BIN/$asset"
+  cp "$STAGE/$asset" "$BIN/$asset"
+  chmod 0755 "$BIN/$asset"
+  # arm64 Mach-O must be at least ad-hoc signed to exec — the same codesign-on-pull k3sm will use.
+  codesign -s - -f "$BIN/$asset" >/dev/null 2>&1 || true
 done
 
 # 2. kine — REQUIRES CGO (mattn/go-sqlite3). The no-cgo build *disables* sqlite. (Spike finding.)
