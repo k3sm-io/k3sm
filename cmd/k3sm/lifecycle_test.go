@@ -61,7 +61,7 @@ func TestLifecycleVerbsRefuseWithoutRoot(t *testing.T) {
 // server stop bound and the exit-code table.
 func TestStopHelpStatesTheTimeBound(t *testing.T) {
 	help := stopUsage()
-	for _, want := range []string{install.StopTimeBound().String(), "64+N", "exit codes"} {
+	for _, want := range []string{install.StopTimeBound().String(), "32+N", "exit codes"} {
 		if !strings.Contains(strings.ToLower(help), strings.ToLower(want)) {
 			t.Errorf("stop help lacks %q:\n%s", want, help)
 		}
@@ -78,8 +78,16 @@ func TestLifecycleExitMapsLeftovers(t *testing.T) {
 		{Kind: install.LeftoverMesh, Err: errors.New("netd refused")},
 		{Kind: install.LeftoverLo0, Err: errors.New("ifconfig failed")},
 	}}
-	if code := lifecycleExit("stop", err, &stderr); code != install.StopExitLeftoverBase|4|8 {
-		t.Errorf("exit = %d, want %d", code, install.StopExitLeftoverBase|4|8)
+	if code := lifecycleExit("stop", err, &stderr); code != install.StopExitLeftoverBase+4+8 {
+		t.Errorf("exit = %d, want %d", code, install.StopExitLeftoverBase+4+8)
+	}
+	// Every class at once stays below the shell's reserved 126 and 127.
+	var all []install.LeftoverItem
+	for _, k := range []install.Leftover{install.LeftoverNodeDaemon, install.LeftoverPods, install.LeftoverMesh, install.LeftoverLo0, install.LeftoverNetd, install.LeftoverMarker} {
+		all = append(all, install.LeftoverItem{Kind: k, Err: errors.New("x")})
+	}
+	if code := (&install.StopIncompleteError{Left: all}).ExitCode(); code != 95 {
+		t.Errorf("every leftover class exits %d, want 95 (never 126 or 127)", code)
 	}
 	if !strings.Contains(stderr.String(), "mesh") || !strings.Contains(stderr.String(), "lo0-aliases") {
 		t.Errorf("stderr does not name the leftovers: %q", stderr.String())
@@ -144,4 +152,45 @@ func TestMarkNodeObject(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestServiceCredentialDropsRootGroups pins the RemoveMesh child's identity:
+// the service uid and gid, and a supplementary list of only that gid, set
+// explicitly so none of root's groups is inherited.
+func TestServiceCredentialDropsRootGroups(t *testing.T) {
+	c := serviceCredential(271, 20)
+	if c.Uid != 271 || c.Gid != 20 || c.NoSetGroups || len(c.Groups) != 1 || c.Groups[0] != 20 {
+		t.Errorf("credential = %+v, want uid 271, gid 20, Groups [20], NoSetGroups false", c)
+	}
+	for _, g := range c.Groups {
+		if g == 0 {
+			t.Errorf("credential carries root's group 0: %+v", c)
+		}
+	}
+}
+
+// TestCountJoinedWorkers counts every Node but the server's own.
+func TestCountJoinedWorkers(t *testing.T) {
+	cs := fake.NewClientset(
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "k3sm-studio"}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "k3sm-book"}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "k3sm-mini"}},
+	)
+	if n, err := countJoinedWorkers(context.Background(), cs, "k3sm-studio"); err != nil || n != 2 {
+		t.Errorf("countJoinedWorkers = %d, %v; want 2", n, err)
+	}
+}
+
+// TestLifecycleContextIsBounded pins that a stop or start runs under a
+// deadline of its bound plus the margin.
+func TestLifecycleContextIsBounded(t *testing.T) {
+	ctx, cancel := lifecycleContext(time.Minute)
+	defer cancel()
+	dl, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("the lifecycle context has no deadline")
+	}
+	if left := time.Until(dl); left > time.Minute+lifecycleMargin || left < time.Minute {
+		t.Errorf("deadline in %s, want about %s", left, time.Minute+lifecycleMargin)
+	}
 }

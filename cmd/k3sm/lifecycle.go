@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -95,14 +96,16 @@ until 'sudo k3sm start'.
 
 Time bound: at most %s on a server (cordon 15s, the node daemon's 60s
 ExitTimeOut plus 15s for launchd, RemoveMesh 15s, pod grace 10s, vm helpers
-5s, netd 30s); a worker's is no longer.
+5s, netd 30s); a worker's is no longer. The stop is cut off at that bound
+plus 30s, or by SIGINT, SIGTERM or SIGHUP; it then exits naming what it left
+behind, and re-running it converges.
 
 Exit codes:
   0      stopped, or already stopped
   1      refused or failed before anything was stopped
   2      usage
   3      not run as root (nothing was done)
-  64+N   stopped part-way: the node stays marked stopping and N names what was
+  32+N   stopped part-way: the node stays marked stopping and N names what was
          left behind, one bit each: 1 the node daemon, 2 pods or vm helpers or
          control-plane processes, 4 the mesh, 8 lo0/interconnect/pf state,
          16 netd, 32 the stop marker. Re-run 'sudo k3sm stop' to converge.
@@ -166,17 +169,66 @@ func runStop(args []string, stderr io.Writer) int {
 		return exitNeedsRoot
 	}
 	sys := install.NewDarwinSystem()
-	return lifecycleExit("stop", install.Stop(context.Background(), sys, lifecycleConfig(sys, stderr), actor, reason), stderr)
+	ctx, cancel := lifecycleContext(install.StopTimeBound())
+	defer cancel()
+	return lifecycleExit("stop", install.Stop(ctx, sys, lifecycleConfig(sys, stderr), actor, reason), stderr)
 }
 
-// lifecycleConfig wires a lifecycle verb's Config: the logger and the two
+// lifecycleConfig wires a lifecycle verb's Config: the logger and the
 // cluster-facing calls.
 func lifecycleConfig(sys install.System, stderr io.Writer) install.Config {
 	return install.Config{
-		Logger:     newDaemonLogger(stderr, slog.LevelInfo),
-		MarkNode:   nodeMarker(sys, install.DefaultDataRoot),
-		RemoveMesh: netdRemoveMesh(install.DefaultNetdSocket),
+		Logger:        newDaemonLogger(stderr, slog.LevelInfo),
+		MarkNode:      nodeMarker(sys, install.DefaultDataRoot),
+		RemoveMesh:    netdRemoveMesh(install.DefaultNetdSocket),
+		JoinedWorkers: joinedWorkers(sys, install.DefaultDataRoot),
 	}
+}
+
+// joinedWorkers returns the Config.JoinedWorkers call a server stop makes:
+// the Nodes the control plane knows, through the admin kubeconfig, other
+// than this server's own.
+func joinedWorkers(sys install.System, dataRoot string) func(ctx context.Context) (int, error) {
+	return func(ctx context.Context) (int, error) {
+		kubeconfig, self, err := lifecycleNodeIdentity(sys, dataRoot)
+		if err != nil {
+			return 0, err
+		}
+		_, cs, err := kubeclient.FromPath(kubeconfig)
+		if err != nil {
+			return 0, fmt.Errorf("load kubeconfig %s: %w", kubeconfig, err)
+		}
+		return countJoinedWorkers(ctx, cs, self)
+	}
+}
+
+// countJoinedWorkers counts the Nodes other than self.
+func countJoinedWorkers(ctx context.Context, cs kubernetes.Interface, self string) (int, error) {
+	nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("list nodes: %w", err)
+	}
+	n := 0
+	for _, node := range nodes.Items {
+		if node.Name != self {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// lifecycleMargin is the slack the overall deadline of a stop or start adds
+// to its computed bound, for the launchctl and file calls no budget counts.
+const lifecycleMargin = 30 * time.Second
+
+// lifecycleContext is the context a stop or start runs under: cancelled by
+// SIGINT, SIGTERM or SIGHUP, and by a deadline of bound plus lifecycleMargin,
+// so the bound the help states is enforced. An interrupted stop leaves its
+// marker at stopping, and a rerun converges.
+func lifecycleContext(bound time.Duration) (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	ctx, cancel := context.WithTimeout(ctx, bound+lifecycleMargin)
+	return ctx, func() { cancel(); stop() }
 }
 
 // nodeMarker returns the Config.MarkNode call: it finds this Mac's Node and
@@ -282,8 +334,8 @@ func markNodeObject(ctx context.Context, cs kubernetes.Interface, name string, s
 
 // netdRemoveMesh returns the Config.RemoveMesh call. netd's peer verifier
 // admits only the k3sm service user, so the root stop runs this binary's
-// hidden netdRemoveMeshVerb as that user, with an empty environment, and the
-// child sends the RPC. The child's output is the error text on failure.
+// hidden netdRemoveMeshVerb as that user (serviceCredential: none of root's
+// groups), from /, with an empty environment, and the child sends the RPC. The child's output is the error text on failure.
 func netdRemoveMesh(socket string) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
 		u, err := user.Lookup(install.DefaultServiceUser)
@@ -304,12 +356,21 @@ func netdRemoveMesh(socket string) func(ctx context.Context) error {
 		}
 		cmd := exec.CommandContext(ctx, self, netdRemoveMeshVerb, "--socket", socket)
 		cmd.Env = []string{}
-		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), NoSetGroups: true}}
+		cmd.Dir = "/"
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: serviceCredential(uint32(uid), uint32(gid))}
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 		}
 		return nil
 	}
+}
+
+// serviceCredential is the identity the RemoveMesh child runs as: the
+// service user's uid, its own primary gid, and a supplementary group list of
+// exactly that gid. NoSetGroups stays false so the child does NOT inherit
+// root's supplementary groups (wheel, admin and the rest).
+func serviceCredential(uid, gid uint32) *syscall.Credential {
+	return &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{gid}, NoSetGroups: false}
 }
 
 // runNetdRemoveMesh is the hidden netdRemoveMeshVerb: one RemoveMesh RPC to
@@ -332,15 +393,18 @@ func runNetdRemoveMesh(args []string, stderr io.Writer) int {
 }
 
 // startUsage is `k3sm start --help`.
-const startUsage = `Usage: sudo k3sm start [--reason TEXT] [--actor user|auto]
+var startUsage = fmt.Sprintf(`Usage: sudo k3sm start [--reason TEXT] [--actor user|auto]
 
 Start k3sm on this Mac after 'k3sm stop': clear what a stop may have left
 (finishing an interrupted one), remove the stop marker, enable and start netd
 and then the node daemon, and uncordon the node (best effort). On a node that
 is already running it does nothing.
 
+It is cut off after %s, or by SIGINT, SIGTERM or SIGHUP; the stop marker
+stays until the daemons are up, so re-running it is safe.
+
 Exit codes: 0 started or already running; 1 failed; 2 usage; 3 not run as root.
-`
+`, install.StartTimeBound()+lifecycleMargin)
 
 // restartUsage is `k3sm restart --help`.
 const restartUsage = `Usage: sudo k3sm restart [--start] [--reason TEXT] [--actor user|auto]
@@ -361,7 +425,9 @@ func runStart(args []string, stderr io.Writer) int {
 		return exitNeedsRoot
 	}
 	sys := install.NewDarwinSystem()
-	return lifecycleExit("start", install.Start(context.Background(), sys, lifecycleConfig(sys, stderr), actor, reason), stderr)
+	ctx, cancel := lifecycleContext(install.StartTimeBound())
+	defer cancel()
+	return lifecycleExit("start", install.Start(ctx, sys, lifecycleConfig(sys, stderr), actor, reason), stderr)
 }
 
 // runRestart is `k3sm restart`.
