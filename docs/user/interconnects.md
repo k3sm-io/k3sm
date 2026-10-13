@@ -97,7 +97,8 @@ calling.
 
 The provider refuses an attach, with the reason on the condition, when:
 
-- the Pod runs in the `vm` or `container-vm` RuntimeClass (`InterconnectUnsupportedRuntime`);
+- the Pod runs in the `vm` RuntimeClass, or in `container-vm`, a planned RuntimeClass (one
+  lightweight Linux VM per container) that no release includes yet (`InterconnectUnsupportedRuntime`);
 - every slot on the node is taken (`InterconnectSlotsExhausted`);
 - the Pod's namespace is not allowed (`InterconnectNamespaceNotAllowed`, see below);
 - the node is not an armed member, or the root helper is missing or too old.

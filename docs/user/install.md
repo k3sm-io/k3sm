@@ -118,7 +118,8 @@ k3sm's distribution ships in three generations, listed in shipping order:
    provenance (Developer ID + notarization) arrives with gen 3. Environment variables set the
    options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
    unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
-   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=vX.Y.Z sh`.
+   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh` (v0.1.7 is the current
+   release; the [releases page](https://k3sm.io/releases/) lists every version you can pin).
    `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
    one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
@@ -290,8 +291,8 @@ sudo k3sm install                                            # renders the stock
 
 That discards the flags the file lists, and nothing else. Your cluster data is untouched. An
 install refuses a carried `--datastore-endpoint` or `--datastore-endpoint-file`, because v0.1.6
-removed external-datastore HA. A multi-server control plane is not available in v0.1.6; see
-[High availability](ha.md).
+removed external-datastore HA. The experimental two-server control plane uses embedded etcd
+instead; see [High availability](ha.md).
 
 Install warns when it finds neither source on a data root that already holds cluster state, which is
 what a Mac uninstalled by an older version looks like. The flags are gone on such a Mac, and install
