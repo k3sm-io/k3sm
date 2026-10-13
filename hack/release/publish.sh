@@ -162,13 +162,21 @@ upload() {
 
 # ---- self-test ------------------------------------------------------------------
 self_test() {
-	local fails=0 T log out rc sign="$HERE/sign.sh" tag=v0.0.0 repo=example/k3sm
+	local fails=0 passes=0 skips=0 T log out rc sign="$HERE/sign.sh" tag=v0.0.0 repo=example/k3sm
+	# A case that gets PAST a refusal runs only when this self-test was itself
+	# started attended (neither variable set). The self-test never unsets or
+	# overrides CLAUDECODE or K3SM_AUTO to get past a refusal; under automation
+	# such a case prints a SKIP line and counts as neither a pass nor a fail.
+	# Every refusal case runs everywhere.
+	local attended=0
+	if [ -z "${CLAUDECODE+x}" ] && [ -z "${K3SM_AUTO+x}" ]; then attended=1; fi
 	T="$(mktemp -d)"
 	SELFTEST_TMP="$T"
 	trap 'rm -rf "$SELFTEST_TMP"' EXIT
 	log="$T/tool.log"
-	ok() { echo "  ok   $1"; }
+	ok() { echo "  ok   $1"; passes=$((passes + 1)); }
 	bad() { echo "  FAIL $1"; fails=$((fails + 1)); }
+	skip_attended() { echo "  SKIP (attended only): $1"; skips=$((skips + 1)); }
 
 	# Fakes: record argv and exit 97. gh answers `release view` from
 	# $FAKE_GH_VIEW and, with FAKE_GH_CREATE_OK=1, accepts `release create`.
@@ -238,11 +246,18 @@ EOF
 	# Positive control: with the right answer the guard passes and the script
 	# stops at its first post-guard check (no manifest), still before any tool.
 	# Without this, every refusal above could be passing for an unrelated reason.
-	rc=0; out="$(on_pty "$TEAM" env -u CLAUDECODE -u K3SM_AUTO PATH="$FPATH" bash "$sign" --identity "$ID" --team-id "$TEAM" "$T/tree")" || rc=$?
-	if [ "$rc" -ne 0 ] && ! grep -q REFUSE <<<"$out" && grep -q "has no PAYLOAD-SHA256" <<<"$out" && [ ! -s "$log" ]; then
-		ok "control: the typed Team ID passes the guard, which then stops before any tool"
+	# It runs past the refusal, so it runs attended only, with the environment
+	# exactly as the self-test inherited it.
+	local control="control: the typed Team ID passes the guard, which then stops before any tool"
+	if [ "$attended" = 1 ]; then
+		rc=0; out="$(on_pty "$TEAM" env PATH="$FPATH" bash "$sign" --identity "$ID" --team-id "$TEAM" "$T/tree")" || rc=$?
+		if [ "$rc" -ne 0 ] && ! grep -q REFUSE <<<"$out" && grep -q "has no PAYLOAD-SHA256" <<<"$out" && [ ! -s "$log" ]; then
+			ok "$control"
+		else
+			bad "$control (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+		fi
 	else
-		bad "control: guard pass (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+		skip_attended "$control"
 	fi
 	: >"$log"
 
@@ -353,9 +368,10 @@ EOF
 		echo "  skip shellcheck (not installed)"
 	fi
 
-	unset -f ok bad on_pty no_tty expect_refusal draft_json promote_case
+	unset -f ok bad skip_attended on_pty no_tty expect_refusal draft_json promote_case
 	unset FAKE_TOOL_LOG
 	echo
+	echo "publish self-test: $passes passed, $fails failed, $skips skipped (attended only)"
 	if [ "$fails" -ne 0 ]; then
 		echo "publish self-test: $fails FAILED"
 		return 1
