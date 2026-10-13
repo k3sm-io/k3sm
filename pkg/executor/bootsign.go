@@ -110,14 +110,6 @@ var signingMemo struct {
 	p    signingPolicy
 }
 
-// resetSigningMemo forgets the memoised decision. Only a test that swaps the
-// bootCodeSigner or selfExecutable seams calls it.
-func resetSigningMemo() {
-	signingMemo.mu.Lock()
-	defer signingMemo.mu.Unlock()
-	signingMemo.done, signingMemo.p = false, signingPolicy{}
-}
-
 // resolveSigningPolicy returns the running k3sm's signing path, probing its own
 // signature (probeSigningPolicy) on the first call and returning that same
 // decision to every later caller in the process: the daemon's signature does not
