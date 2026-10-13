@@ -147,6 +147,7 @@ four.
 | `peers` | array | reserved for mesh peers (`name`, `state`, `detail`); not emitted yet |
 | `interconnect` | object | the cluster's interconnect and its attached Pods (see [Interconnect](#interconnect)); omitted when the cluster has none, or the report could not read it |
 | `stoppedBy` | object | who stopped k3sm on this Mac (see [Stopped by](#stopped-by)); omitted when no stop is recorded |
+| `network` | object | this node's LAN access setting (see [Network](#network)); omitted when k3sm is not installed or the setting cannot be read |
 | `version` | object | the build that produced the report; `modules` is omitted when unknown |
 | `host` | string | the macOS version, empty when it could not be read |
 | `timestamp` | string | RFC 3339 |
@@ -198,6 +199,30 @@ asked for it.
 The object is omitted when there is no stop marker, and also when the marker cannot be read or
 parsed: a damaged marker never fails the report. Readers must treat a missing `stoppedBy` as
 "no recorded stop", not as "running". [Stopping and starting](stop-start.md) covers the verbs that write it.
+
+## Network
+
+The full report carries an optional `network` object on an installed Mac: the LAN access setting
+`k3sm network lan` and `k3sm install --lan` record. It is additive: `schemaVersion` stays `1`, and it
+adds no `verdict` or row `state` word. The daemons probe does not carry it.
+
+```json
+"network": {
+  "lan": "off",
+  "covers": ["nodeports", "loadbalancers", "ingress"],
+  "alwaysOn": ["apiserver", "join", "mesh"]
+}
+```
+
+| field | type | notes |
+|---|---|---|
+| `lan` | string | `on` (the covered listeners answer on every interface) or `off` (only on this Mac and the cluster mesh); an install with no recorded setting reads `on` |
+| `covers` | array of strings | the listener families the setting controls: `nodeports`, `loadbalancers`, and `ingress` on a server |
+| `alwaysOn` | array of strings | the network-facing listeners it does not control: `apiserver`, `join` and `mesh` on a server, `mesh` on a worker |
+
+The object reports the recorded setting. `sudo k3sm network lan status` also says when the node
+daemon is still serving a different one. Readers must treat a missing `network` as "unknown", not as
+either value.
 
 ## Interconnect
 

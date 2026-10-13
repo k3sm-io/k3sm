@@ -304,15 +304,19 @@ cooperative, and run workloads you do not trust on the [`vm` RuntimeClass](vm-ru
 
 Today at `main`, per port class:
 
-- **NodePort** binds the **wildcard** `*:30000-32767` in-process. Every interface on the Mac
-  answers, including `127.0.0.1` and your LAN address. This has always been the case; it is what
-  NodePort means upstream.
-- **LoadBalancer / Ingress** binds the **wildcard** `*:<port>`, matching k3s and the desktop
-  container tools, which publish LoadBalancer ports on all interfaces.
+- **NodePort** binds the **wildcard** `*:30000-32767` in-process while LAN access is on. Every
+  interface on the Mac answers, including `127.0.0.1` and your LAN address; it is what NodePort means
+  upstream. With LAN access off (the default for a new install) it binds `127.0.0.1` and the node's
+  own address only. See [LAN access](install.md#lan-access).
+- **LoadBalancer / Ingress** binds the **wildcard** `*:<port>` while LAN access is on, matching k3s
+  and the desktop container tools, which publish LoadBalancer ports on all interfaces. With LAN
+  access off it binds the node's own address (and `127.0.0.1` from port 1024 up), and a LoadBalancer
+  port below 1024 is not served.
 
   **The bind address and the advertised address are different.** Read them separately.
-  The **port** is reachable on every interface the Mac has, including its LAN address, so treat a
-  LoadBalancer Service as publishing to the local network rather than to the host alone. The
+  With LAN access on, the **port** is reachable on every interface the Mac has, including its LAN
+  address, so treat a LoadBalancer Service as publishing to the local network rather than to the
+  host alone. The
   **advertised `EXTERNAL-IP`** is the node's InternalIP, an RFC-6598 (`100.64.0.0/10`) alias on
   `lo0`. It is reachable from this Mac, from local pods, and from mesh peers over WireGuard, but
   **not routable from your LAN**. A LAN client has no route to `100.64/10`, so `curl <EXTERNAL-IP>`
