@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"k3sm.io/k3sm/internal/binsign"
 	"k3sm.io/k3sm/pkg/helmchart"
@@ -99,14 +100,53 @@ type signingPolicy struct {
 	teamID  string
 }
 
-// resolveSigningPolicy reads the running k3sm's own signature and returns the
+// signingMemo holds the process's one signing decision once a probe has read it
+// cleanly. mu guards both fields and is held across the probe, so concurrent
+// first callers wait for one probe rather than racing two. A probe error is never
+// stored: the next caller probes again and sees its own error.
+var signingMemo struct {
+	mu   sync.Mutex
+	done bool
+	p    signingPolicy
+}
+
+// resetSigningMemo forgets the memoised decision. Only a test that swaps the
+// bootCodeSigner or selfExecutable seams calls it.
+func resetSigningMemo() {
+	signingMemo.mu.Lock()
+	defer signingMemo.mu.Unlock()
+	signingMemo.done, signingMemo.p = false, signingPolicy{}
+}
+
+// resolveSigningPolicy returns the running k3sm's signing path, probing its own
+// signature (probeSigningPolicy) on the first call and returning that same
+// decision to every later caller in the process: the daemon's signature does not
+// change while it runs, and one decision means no two steps of a boot can
+// disagree on it. A probe that fails is returned to its caller (logged with that
+// caller's logger) and not remembered, so it can never be mistaken for the dev
+// path later.
+func resolveSigningPolicy(ctx context.Context, logger *slog.Logger) (signingPolicy, error) {
+	signingMemo.mu.Lock()
+	defer signingMemo.mu.Unlock()
+	if signingMemo.done {
+		return signingMemo.p, nil
+	}
+	p, err := probeSigningPolicy(ctx, logger)
+	if err != nil {
+		return signingPolicy{}, err
+	}
+	signingMemo.done, signingMemo.p = true, p
+	return p, nil
+}
+
+// probeSigningPolicy reads the running k3sm's own signature and returns the
 // path it selects. Only a positive proof selects the release path, and only a
 // clean verdict selects the dev path: an ad-hoc or unsigned binary, or a
 // certificate signature without a Team ID or that fails the Developer ID
 // requirement. A failure to resolve the executable, read its signature, or
 // evaluate the requirement is an ErrSelfSignatureUnreadable, logged here and
 // returned so the boot refuses.
-func resolveSigningPolicy(ctx context.Context, logger *slog.Logger) (signingPolicy, error) {
+func probeSigningPolicy(ctx context.Context, logger *slog.Logger) (signingPolicy, error) {
 	p := signingPolicy{s: bootCodeSigner}
 	refuse := func(what string, err error) (signingPolicy, error) {
 		err = fmt.Errorf("%w: %s: %w", ErrSelfSignatureUnreadable, what, err)

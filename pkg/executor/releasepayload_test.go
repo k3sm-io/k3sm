@@ -272,3 +272,57 @@ func TestReleaseInstallNeverResignsHelmOrZot(t *testing.T) {
 		}
 	})
 }
+
+// TestSigningPolicyResolvedOncePerProcess pins the memo behind
+// resolveSigningPolicy: every caller in the process (the boot steps, EnsureHelm,
+// the registry's ResolveReleaseVerifier) sees the decision the first clean probe
+// made, and a probe error is returned to each caller and never remembered as the
+// dev path.
+func TestSigningPolicyResolvedOncePerProcess(t *testing.T) {
+	const team = "ABCDE12345"
+
+	t.Run("every caller sees the first clean decision", func(t *testing.T) {
+		s := &fakeCodeSigner{}
+		useFakeSigning(t, s, fakeDevIDPrefix+team)
+		first, err := resolveSigningPolicy(t.Context(), discardLogger())
+		if err != nil || !first.release {
+			t.Fatalf("first = %+v, %v; want the release path", first, err)
+		}
+		// The executable now reads as ad hoc; a second probe would pick dev.
+		adhoc := filepath.Join(t.TempDir(), "k3sm")
+		writeBin(t, adhoc, "k3sm"+fakeAdHoc)
+		selfExecutable = func() (string, error) { return adhoc, nil }
+		again, err := resolveSigningPolicy(t.Context(), discardLogger())
+		if err != nil || again.release != first.release || again.teamID != first.teamID {
+			t.Errorf("second caller = %+v, %v; want the memoised %+v", again, err, first)
+		}
+		if _, release, err := ResolveReleaseVerifier(t.Context(), discardLogger()); err != nil || !release {
+			t.Errorf("ResolveReleaseVerifier = %v, %v; want the memoised release path", release, err)
+		}
+		if len(s.satisfiesOn) != 1 {
+			t.Errorf("the daemon's signature was evaluated %d times, want once per process", len(s.satisfiesOn))
+		}
+	})
+
+	t.Run("a probe error is not memoised as dev", func(t *testing.T) {
+		s := &fakeCodeSigner{inspectErr: errors.New("codesign could not run")}
+		useFakeSigning(t, s, fakeDevIDPrefix+team)
+		for i := range 2 {
+			logger, errorLines := countingLogger()
+			if p, err := resolveSigningPolicy(t.Context(), logger); !errors.Is(err, ErrSelfSignatureUnreadable) {
+				t.Fatalf("call %d = %+v, %v; want ErrSelfSignatureUnreadable every time", i, p, err)
+			}
+			if errorLines() != 1 {
+				t.Errorf("call %d logged %d error lines, want its own refusal", i, errorLines())
+			}
+		}
+		if _, _, err := ResolveReleaseVerifier(t.Context(), discardLogger()); !errors.Is(err, ErrSelfSignatureUnreadable) {
+			t.Errorf("ResolveReleaseVerifier err = %v, want ErrSelfSignatureUnreadable", err)
+		}
+		s.inspectErr = nil
+		p, err := resolveSigningPolicy(t.Context(), discardLogger())
+		if err != nil || !p.release {
+			t.Errorf("after the error cleared = %+v, %v; want a fresh probe choosing release", p, err)
+		}
+	})
+}

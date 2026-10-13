@@ -89,7 +89,7 @@ var ErrHelmNotStaged = errors.New("helm is not staged and this process does not 
 // ID requirement and used byte-identical, and an absent or failing one is an
 // ErrPayloadSignature. It is never downloaded or signed there.
 func EnsureHelm(ctx context.Context, binDir string) (string, error) {
-	p, err := resolveSigningPolicy(ctx, slog.New(slog.DiscardHandler))
+	p, err := resolveSigningPolicy(ctx, slog.Default())
 	if err != nil {
 		return "", err
 	}

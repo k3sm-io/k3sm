@@ -222,9 +222,12 @@ func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	cfg := registryConfig(opts, plan.cfg.PayloadBinDir, logger)
 	// The boot's one signing decision: a release-signed daemon runs only the zot
 	// its signed payload ships, verified and never re-signed.
+	// An undecidable signing path fails closed: no registry rather than a zot
+	// nothing verified.
 	verifier, release, err := executor.ResolveReleaseVerifier(ctx, logger)
 	if err != nil {
-		logger.Error("ingest registry disabled", "err", err)
+		logger.Error("ingest registry disabled: the signing path cannot be decided, so the payload's zot cannot be verified",
+			"err", err, "remedy", executor.SelfSignatureRemedy)
 		return noStop, puller
 	}
 	if release {

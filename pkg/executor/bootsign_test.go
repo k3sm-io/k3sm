@@ -131,9 +131,10 @@ func useFakeSigning(t *testing.T, s *fakeCodeSigner, selfTrailer string) {
 		t.Fatal(err)
 	}
 	origSigner, origExe := bootCodeSigner, selfExecutable
-	t.Cleanup(func() { bootCodeSigner, selfExecutable = origSigner, origExe })
+	t.Cleanup(func() { bootCodeSigner, selfExecutable = origSigner, origExe; resetSigningMemo() })
 	bootCodeSigner = s
 	selfExecutable = func() (string, error) { return exe, nil }
+	resetSigningMemo()
 }
 
 // forbidDownload fails the test if anything tries to fetch the control plane.
