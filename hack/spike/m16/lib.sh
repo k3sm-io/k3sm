@@ -214,6 +214,51 @@ spike_pip() {
   return 1
 }
 
+# spike_fetch_pinned <url> <sha256> <dest> — download a release artifact and check
+# it against the vendor-published digest pinned at the call site. Fails closed: a
+# fetch error or a mismatch removes <dest> and returns non-zero. Never a pipe into a
+# shell, which would run whatever the remote end serves that day.
+spike_fetch_pinned() {
+  local url="$1" want="$2" dest="$3"
+  rm -f "$dest"
+  curl -fsSL -o "$dest" "$url" || { echo "spike_fetch_pinned: fetch failed: $url"; rm -f "$dest"; return 1; }
+  if ! printf '%s  %s\n' "$want" "$dest" | shasum -a 256 -c - >/dev/null 2>&1; then
+    echo "spike_fetch_pinned: sha256 mismatch for $url (pinned $want, got $(shasum -a 256 "$dest" | awk '{print $1}'))"
+    rm -f "$dest"
+    return 1
+  fi
+}
+
+# spike_install_uv — install a pinned uv into $PREFIX/bin. The digest is the one
+# published beside the release asset (uv-aarch64-apple-darwin.tar.gz.sha256, and
+# the release's sha256.sum).
+spike_install_uv() {
+  local ver="0.12.18"
+  local sha="cf40e0c6a202190ccd9e0406dcfdd5b2d6668a9a5c779b17948963df32aafe5b"
+  local dl="$PREFIX/dl"
+  mkdir -m 0700 -p "$dl"
+  mkdir -p "$PREFIX/bin"
+  spike_fetch_pinned "https://github.com/astral-sh/uv/releases/download/$ver/uv-aarch64-apple-darwin.tar.gz" \
+    "$sha" "$dl/uv-$ver.tar.gz" || return 1
+  rm -rf "$dl/uv-aarch64-apple-darwin"
+  tar xzf "$dl/uv-$ver.tar.gz" -C "$dl" || return 1
+  install -m 0755 "$dl/uv-aarch64-apple-darwin/uv" "$dl/uv-aarch64-apple-darwin/uvx" "$PREFIX/bin/"
+}
+
+# spike_install_rustup <toolchain> — install rustup from a pinned rustup-init and
+# the given default toolchain, honouring CARGO_HOME/RUSTUP_HOME. The digest is the
+# one rustup publishes beside the binary (rustup-init.sha256).
+spike_install_rustup() {
+  local ver="1.29.1"
+  local sha="ec1b9233e7f72990ecd8e62063fa7f6c3dfc2bec8e97f88bff165f9100ac696a"
+  local dl="$PREFIX/dl"
+  mkdir -m 0700 -p "$dl"
+  spike_fetch_pinned "https://static.rust-lang.org/rustup/archive/$ver/aarch64-apple-darwin/rustup-init" \
+    "$sha" "$dl/rustup-init-$ver" || return 1
+  chmod 0755 "$dl/rustup-init-$ver"
+  "$dl/rustup-init-$ver" -y --no-modify-path --default-toolchain "$1"
+}
+
 kc() { kubectl --kubeconfig "$KUBECONFIG_RIG" --request-timeout=30s "$@"; }
 
 spike_preflight() {

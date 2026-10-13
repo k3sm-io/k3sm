@@ -29,11 +29,15 @@ set -euo pipefail
 HOST="${K3SM_SPIKE_HOST:?set K3SM_SPIKE_HOST to the lab host}"   # ssh target; no default
 PREFIX="${K3SM_SPIKE_PREFIX:-\$HOME/k3sm-spike-m11}"       # expanded lab-side, deliberately
 
-# The throwaway kernel. S1 deliberately does NOT use a pinned artifact: the
-# pinned kernel is B111's job, and making a design-invalidating spike wait on a
-# human-gated producer would invert the dependency. Any bootable uncompressed
-# arm64 Image answers S1's questions.
-KERNEL_URL="${K3SM_SPIKE_KERNEL_URL:-https://cloud-images.ubuntu.com/releases/24.04/release/unpacked/ubuntu-24.04-server-cloudimg-arm64-vmlinuz-generic}"
+# The throwaway kernel. It is NOT the shipped guest kernel: any bootable arm64
+# Image answers S1's questions, and making a design-invalidating spike wait on
+# the shipping kernel's producer would invert the dependency. It is still a
+# pinned artifact: a dated Ubuntu 24.04 cloud-image release (the undated
+# "release/" path moves with every refresh) and the sha256 of the gzipped
+# vmlinuz as published in that release's unpacked/SHA256SUMS. s1.sh verifies
+# it on every run. Overriding the URL requires overriding the digest with it.
+KERNEL_URL="${K3SM_SPIKE_KERNEL_URL:-https://cloud-images.ubuntu.com/releases/24.04/release-20260926/unpacked/ubuntu-24.04-server-cloudimg-arm64-vmlinuz-generic}"
+KERNEL_SHA256="${K3SM_SPIKE_KERNEL_SHA256:-71fe6776ef591ea452661a5933e11d2044c5df6aaf76cf39b8d9655fa4e47904}"
 
 # LAB-SIDE PREAMBLE. Injected ahead of every heredoc, because a non-interactive
 # ssh gets neither a login PATH nor GNU coreutils, and both bit this harness
@@ -73,5 +77,5 @@ spike_preflight() {
 PREEOF
 
 # lab <<'EOF' — run a heredoc script on the lab Mac, with the preamble in scope.
-lab() { { printf '%s\n' "$LAB_PREAMBLE"; cat; } | ssh "$HOST" "PREFIX=$PREFIX KERNEL_URL=$KERNEL_URL bash -s"; }
+lab() { { printf '%s\n' "$LAB_PREAMBLE"; cat; } | ssh "$HOST" "PREFIX=$PREFIX KERNEL_URL=$KERNEL_URL KERNEL_SHA256=$KERNEL_SHA256 bash -s"; }
 note() { printf '\n==> %s\n' "$*"; }
