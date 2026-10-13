@@ -179,18 +179,60 @@ async def main():
         await stop(core)
         return 0
     echoed = {k: getattr(cfg, k, None) for k in wanted}
+    block = getattr(cfg, "paged_cache_block_size", None)
+    record("s3.1 constructor: AsyncEngineCore(model, tokenizer, EngineConfig(scheduler_config=SchedulerConfig(%s))); "
+           "the scheduler holds %s, block_size=%s; continuous batching is the engine-core path itself "
+           "(the CLI's --continuous-batching selects this engine; in-process there is no flag to forget)"
+           % (", ".join("%s=%s" % kv for kv in wanted.items()), json.dumps(echoed), block))
     if echoed != wanted:
-        verdict("FAIL", "s3.1 invariants", "the scheduler does not echo the pinned invariants: wanted %s, got %s"
+        verdict("FAIL", "s3.1 invariants", "the scheduler did not keep the pinned values: wanted %s, got %s"
                 % (json.dumps(wanted), json.dumps(echoed)))
         await stop(core)
         return 0
-    block = getattr(cfg, "paged_cache_block_size", None)
-    record("s3.1 constructor: AsyncEngineCore(model, tokenizer, EngineConfig(scheduler_config=SchedulerConfig(%s))); "
-           "the scheduler echoes them, block_size=%s; continuous batching is the engine-core path itself "
-           "(the CLI's --continuous-batching selects this engine; in-process there is no flag to forget)"
-           % (", ".join("%s=%s" % kv for kv in wanted.items()), block))
 
+    # The config is what the drive handed over; what the engine APPLIED is read from the live
+    # scheduler: with MAX_SEQS + 3 requests queued at once, the running count must never exceed
+    # MAX_SEQS and must sit at MAX_SEQS while others wait. max_kv_size is read from a running
+    # request's cache object when that cache exposes a size; otherwise its absence is recorded.
     ids = list(tok.encode("Explain, at length, how a filesystem journal works."))
+    burst = [await core.add_request(ids, SamplingParams(max_tokens=24, temperature=0.0), request_id="s3-cap-%d" % i)
+             for i in range(MAX_SEQS + 3)]
+    most, capped, kv_seen, t_cap = 0, False, None, time.time()
+    while time.time() - t_cap < STREAM_BUDGET:
+        await asyncio.sleep(0.05)
+        nr, nw = sched.get_num_running(), sched.get_num_waiting()
+        most = max(most, nr)
+        if nr == MAX_SEQS and nw > 0:
+            capped = True
+        if nr > 0 and kv_seen is None:
+            for req in list(getattr(sched, "running", {}).values()):
+                pc = getattr(req, "prompt_cache", None)
+                layers = pc if isinstance(pc, (list, tuple)) else ([pc] if pc is not None else [])
+                sizes = [getattr(l, "max_size", None) for l in layers if getattr(l, "max_size", None) is not None]
+                if sizes:
+                    kv_seen = sizes[0]
+                elif layers:
+                    kv_seen = "no max_size on %s" % type(layers[0]).__name__
+        if nr == 0 and nw == 0 and time.time() - t_cap > 0.5:
+            break
+    drains = [Pump(core.stream_outputs(r, timeout=STREAM_BUDGET)) for r in burst]
+    for d in drains:
+        while await d.next(STREAM_BUDGET) not in (None, "quiet"):
+            pass
+        await d.close()
+    record("s3.1 applied: %d requests queued at once, running never exceeded %d of max_num_seqs=%d, cap reached with a queue: %s; "
+           "max_kv_size on a running request's cache: %s"
+           % (len(burst), most, MAX_SEQS, capped, kv_seen if kv_seen is not None else "not observable on the paged path"))
+    if most <= MAX_SEQS and capped:
+        verdict("PASS", "s3.1 invariants", "the scheduler applied max_num_seqs=%d (running peaked at %d with others waiting)%s"
+                % (MAX_SEQS, most, "; max_kv_size=%s read from a running request's cache" % kv_seen if isinstance(kv_seen, int) and kv_seen == MAX_KV
+                   else "; max_kv_size is held by the scheduler but not observable on a paged-cache request in-process, so the image's own tests must pin it"))
+    else:
+        verdict("FAIL", "s3.1 invariants", "the scheduler did not apply max_num_seqs=%d: running peaked at %d, cap with a queue seen: %s"
+                % (MAX_SEQS, most, capped))
+        await stop(core)
+        return 0
+
     try:
         rid = await asyncio.wait_for(
             core.add_request(ids, SamplingParams(max_tokens=64, temperature=0.0), request_id="s3-1"), STREAM_BUDGET)
@@ -213,16 +255,22 @@ async def main():
         if getattr(out, "finished", False) or events >= 64:
             break
     await stream.close()
+    tokens = len(getattr(last, "output_token_ids", None) or [])
+    finish = getattr(last, "finish_reason", None)
     if not events:
         verdict("FAIL", "s3.1 in-process", "the in-process stream yielded nothing within %.0fs - the plan's R3 sidecar shape applies"
                 % STREAM_BUDGET)
         await stop(core)
         return 0
+    # the count is checked, not claimed: one token per event, and a length finish means all 64
+    if tokens != events or (finish == "length" and tokens != 64):
+        verdict("FAIL", "s3.1 in-process", "the stream's token count does not add up: %d events, %d output tokens, finish=%s (64 asked for)"
+                % (events, tokens, finish))
+        await stop(core)
+        return 0
     verdict("PASS", "s3.1 in-process",
-            "the engine generated %d tokens over %d stream events from TOKEN IDS in-process with the KV cache pinned at %d "
-            "and %d sequences (TTFT %.3fs, finish=%s)"
-            % (len(getattr(last, "output_token_ids", None) or []), events, MAX_KV, MAX_SEQS, first or 0.0,
-               getattr(last, "finish_reason", None)))
+            "the engine generated %d tokens over %d stream events from TOKEN IDS in-process, one token per event, finish=%s "
+            "(TTFT %.3fs)" % (tokens, events, finish, first or 0.0))
 
     # ---- s3.2 abort mid-stream, the wait after it bounded ---------------------------
     rid2 = await core.add_request(ids, SamplingParams(max_tokens=256, temperature=0.0), request_id="s3-2")
@@ -269,7 +317,6 @@ async def main():
         # a worker whose engine leaves the stream open must end it itself.
         record("s3.2-stream after the abort the stream %s; the worker %s"
                % (ended, "can rely on the engine to end the stream" if ended.startswith("ended") else "must end the stream itself"))
-
     await stream.close()
 
     # ---- s3.3 the routing metadata: block hashes behind the scheduler ---------------
@@ -354,7 +401,6 @@ if [ "$rc" != 0 ]; then
   exit "$rc"
 fi
 grep -q '^VERDICT ' "$W/drive.log" || { verdict FAIL "s3.0 drive  drive.py finished without reporting a verdict (see $W/drive.log)"; exit 1; }
-
 EOF
 
 note "S3(2) — the alternative engine, as a recorded control"
