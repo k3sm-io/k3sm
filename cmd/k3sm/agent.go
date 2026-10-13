@@ -84,6 +84,9 @@ type agentOptions struct {
 	network   string // host-network backend: auto (default) | none | direct | helper
 	clusterIP string // DNS VIP the per-node resolver serves on + pods resolve against
 	domain    string // cluster DNS domain
+	// nodePortAddresses is --nodeport-addresses: where this worker's NodePort
+	// listeners bind (empty = every interface).
+	nodePortAddresses string
 }
 
 // registerAgentFlags binds `k3sm agent`'s flags onto fs. It is a function rather
@@ -107,6 +110,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver serves on and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
+	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
 }
 
 // agentTerminalBackoff is how long runAgent waits before returning a start
@@ -188,6 +192,9 @@ func runAgent(args []string) error {
 	// allocator knows.
 	if opts.server == "" {
 		return fmt.Errorf("--server is required")
+	}
+	if err := validateNodePortAddresses(opts.nodePortAddresses); err != nil {
+		return err
 	}
 
 	// Before anything is joined, written or recorded: a Mac installed as a
@@ -1368,6 +1375,11 @@ func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.
 	// verdict the node will later advertise (see vmBackendAvailable).
 	cfg := workerNetserveConfig(opts, res, mode, vmBackendAvailable(), logger)
 	cfg.Client = cs
+	// Resolved once, here, against this Mac's addresses and the assigned mesh
+	// address the preset names; fixed for this process's life.
+	if cfg.NodePortAddresses, err = resolveNodePortAddresses(opts.nodePortAddresses, cfg.NodeAddress); err != nil {
+		return nil, err
+	}
 	srv := netserve.New(cfg)
 	go func() {
 		if err := srv.Run(ctx); err != nil && ctx.Err() == nil {

@@ -447,6 +447,10 @@ func setMeshIPArg(args []string, meshIP string) []string {
 	return append(dropValueArg(args, "mesh-ip"), "--mesh-ip", meshIP)
 }
 
+// nodePortAddressesFlag is the node daemon flag (`k3sm server` and `k3sm agent`)
+// that carries `k3sm install --nodeport-addresses`.
+const nodePortAddressesFlag = "nodeport-addresses"
+
 // setKubeconfigNameArg returns args with any --kubeconfig-name entry replaced by
 // name. The default name is recorded as no flag at all, so choosing it again is
 // how an operator returns to the default.
