@@ -188,7 +188,8 @@ func (r *runtimedRuntime) evictionCandidates(ctx context.Context) []evictionCand
 // evictedPodStatus derives the evicted pod's terminal status from its last
 // status: phase Failed, reason Evicted, message msg; every container not already
 // terminated becomes terminated with exit 137 and reason Error; Ready and
-// ContainersReady False with the kubelet's terminal-phase reason; and the
+// ContainersReady False with the kubelet's terminal-phase reason;
+// PodReadyToStartContainers False (the sandbox is gone); and the
 // DisruptionTarget condition True with reason TerminationByKubelet and the same
 // message (the kubelet's eviction manager sets it; Job podFailurePolicy and
 // disruption accounting key off it).
@@ -223,6 +224,13 @@ func evictedPodStatus(prior corev1.PodStatus, msg string, now metav1.Time) *core
 	terminate(st.InitContainerStatuses)
 	setPodCondition(st, corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: podCompletedReason, LastTransitionTime: now})
 	setPodCondition(st, corev1.PodCondition{Type: corev1.ContainersReady, Status: corev1.ConditionFalse, Reason: podCompletedReason, LastTransitionTime: now})
+	// The eviction tears the sandbox down. A condition already False keeps its
+	// transition time.
+	toStart := corev1.PodCondition{Type: corev1.PodReadyToStartContainers, Status: corev1.ConditionFalse, LastTransitionTime: now}
+	if c := findPodCondition(st.Conditions, corev1.PodReadyToStartContainers); c != nil && c.Status == corev1.ConditionFalse {
+		toStart.LastTransitionTime = c.LastTransitionTime
+	}
+	setPodCondition(st, toStart)
 	setPodCondition(st, corev1.PodCondition{
 		Type:               corev1.DisruptionTarget,
 		Status:             corev1.ConditionTrue,

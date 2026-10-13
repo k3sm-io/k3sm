@@ -213,6 +213,9 @@ func TestVMPodReadyWaitsForTransportOverride(t *testing.T) {
 			{corev1.PodReady, corev1.ConditionTrue},
 			{corev1.ContainersReady, corev1.ConditionTrue},
 			{corev1.PodScheduled, corev1.ConditionTrue},
+			// False only because this fake reports no pod_ip (leaseStatus);
+			// TestPodReadyToStartContainersCondition owns the condition.
+			{corev1.PodReadyToStartContainers, corev1.ConditionFalse},
 		}
 		conds := n.conditions(id)
 		if len(conds) != len(want) {

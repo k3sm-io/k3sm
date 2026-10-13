@@ -39,7 +39,8 @@ func protoTime(ts *timestamppb.Timestamp) metav1.Time {
 
 // toPodStatus translates a runtime PodStatus into the corev1.PodStatus VK
 // publishes, deriving the fields runtimed's renderer omits (it is lossy):
-//   - the four Pod Conditions (Initialized/Ready/ContainersReady/PodScheduled),
+//   - the four Pod Conditions (Initialized/Ready/ContainersReady/PodScheduled)
+//     plus PodReadyToStartContainers (computeReadyToStartContainers),
 //   - phase Running when any container runs and none has failed,
 //   - a stable StartTime (passed in from CreatePod, not the per-snapshot value
 //     runtimed regenerates),
@@ -121,6 +122,7 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 		computeReadiness(pod, containersReady, transport),
 		{Type: corev1.ContainersReady, Status: crStatus},
 		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+		computeReadyToStartContainers(pod, rs, phase),
 	}
 	out.Conditions = append(out.Conditions, runtimeConditions(rs)...)
 	out.Conditions = append(out.Conditions, carryForwardExternalConditions(pod)...)
@@ -353,24 +355,95 @@ func findPodCondition(conds []corev1.PodCondition, t corev1.PodConditionType) *c
 }
 
 // readyTransitionTime returns the LastTransitionTime for a PodReady condition
-// flipping to newStatus: the pod's existing PodReady LastTransitionTime when the
-// status is unchanged, else metav1.Now() (the flip instant).
+// flipping to newStatus (conditionTransitionTime for PodReady).
 func readyTransitionTime(pod *corev1.Pod, newStatus corev1.ConditionStatus) metav1.Time {
+	return conditionTransitionTime(pod, corev1.PodReady, newStatus)
+}
+
+// conditionTransitionTime returns the LastTransitionTime for a condition of type
+// t flipping to newStatus: the pod's existing LastTransitionTime for t when the
+// status is unchanged, else metav1.Now() (the flip instant).
+func conditionTransitionTime(pod *corev1.Pod, t corev1.PodConditionType, newStatus corev1.ConditionStatus) metav1.Time {
 	if pod != nil {
-		if cur := findPodCondition(pod.Status.Conditions, corev1.PodReady); cur != nil && cur.Status == newStatus {
+		if cur := findPodCondition(pod.Status.Conditions, t); cur != nil && cur.Status == newStatus {
 			return cur.LastTransitionTime
 		}
 	}
 	return metav1.Now()
 }
 
-// isProviderOwnedCondition reports whether t is one of the four Pod conditions the
+// computeReadyToStartContainers derives the PodReadyToStartContainers condition
+// (GA and locked on since Kubernetes v1.37). The kubelet sets it True once the
+// pod's sandbox exists with its networking configured, and False while the
+// sandbox is being created or after it has been torn down. The sandbox analog
+// here (sandboxReady) is read from the runtime status alone, so every publish
+// path agrees. Like the kubelet's, the condition carries no reason or message.
+//
+// LastTransitionTime is stable across status writes: it is the prior condition's
+// when the status is unchanged (the pod's own conditions, which buildStatus seeds
+// from the track the same way it seeds PodReady), else the flip instant.
+func computeReadyToStartContainers(pod *corev1.Pod, rs *runtimev1.PodStatus, phase corev1.PodPhase) corev1.PodCondition {
+	st := corev1.ConditionFalse
+	if sandboxReady(pod, rs, phase) {
+		st = corev1.ConditionTrue
+	}
+	return corev1.PodCondition{
+		Type:               corev1.PodReadyToStartContainers,
+		Status:             st,
+		LastTransitionTime: conditionTransitionTime(pod, corev1.PodReadyToStartContainers, st),
+	}
+}
+
+// sandboxReady reports whether the pod's sandbox analog is up, given the runtime
+// status and the pod phase being published:
+//   - runtimed reports a pod only once it has created it, and every created pod
+//     carries an address (its allocated /32; the node IP for hostNetwork and
+//     --network none). An empty pod_ip is therefore a pod runtimed does not hold:
+//     the create is in flight, it was parked on an image failure, or the runtime
+//     lost it (the provider synthesizes those statuses with no address).
+//   - a vm pod's guest is assembled only after it booted, but it is networked
+//     only once the guest reports its DHCP lease (guest_transport_address); until
+//     then, and after a lease is lost, nothing can reach its containers.
+//   - a terminal phase (Succeeded/Failed) is a torn-down sandbox, as the kubelet
+//     kills a terminal pod's sandbox; a runtime phase of Unknown is a sandbox the
+//     runtime cannot vouch for.
+func sandboxReady(pod *corev1.Pod, rs *runtimev1.PodStatus, phase corev1.PodPhase) bool {
+	if phase == corev1.PodSucceeded || phase == corev1.PodFailed {
+		return false
+	}
+	if rs.GetPhase() == runtimev1.PodPhase_POD_PHASE_UNKNOWN || rs.GetPodIp() == "" {
+		return false
+	}
+	if pod != nil {
+		if backend, err := podSandboxBackend(pod); err == nil && backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+			return rs.GetGuestTransportAddress() != ""
+		}
+	}
+	return true
+}
+
+// refreshReadyToStartContainers re-derives PodReadyToStartContainers in place
+// from st's (possibly overlaid) phase. An overlay that lifts a terminal phase
+// back to Running after toPodStatus derived the conditions (the restart overlay:
+// a restarting pod keeps its sandbox) would otherwise publish a Running pod
+// whose sandbox reads torn down.
+func refreshReadyToStartContainers(pod *corev1.Pod, rs *runtimev1.PodStatus, st *corev1.PodStatus) {
+	for i := range st.Conditions {
+		if st.Conditions[i].Type == corev1.PodReadyToStartContainers {
+			st.Conditions[i] = computeReadyToStartContainers(pod, rs, st.Phase)
+			return
+		}
+	}
+}
+
+// isProviderOwnedCondition reports whether t is one of the Pod conditions the
 // provider computes on every status write (Initialized/Ready/ContainersReady/
-// PodScheduled). Any OTHER condition is external (e.g. a readinessGate condition)
+// PodScheduled/PodReadyToStartContainers). Any OTHER condition is external (e.g. a readinessGate condition)
 // and is carried forward by carryForwardExternalConditions.
 func isProviderOwnedCondition(t corev1.PodConditionType) bool {
 	switch t {
-	case corev1.PodInitialized, corev1.PodReady, corev1.ContainersReady, corev1.PodScheduled:
+	case corev1.PodInitialized, corev1.PodReady, corev1.ContainersReady, corev1.PodScheduled,
+		corev1.PodReadyToStartContainers:
 		return true
 	case runtimed.ShimInactiveConditionType, runtimed.LogStreamLostConditionType,
 		corev1.PodConditionType(netv1alpha1.ConditionInterconnectAttached):
