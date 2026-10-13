@@ -1994,6 +1994,10 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if err := checkServerMeshIP(cfg, serverArgs); err != nil {
 		return err
 	}
+	// 0b‴. A --nodeport-addresses beside a carried --network none is refused.
+	if err := checkNodePortPosture(sys, cfg, serverArgs); err != nil {
+		return err
+	}
 	// 0b′. Secrets encryption, decided from reads alone and before the first
 	//      write that follows: it needs the carried arguments above (a carried
 	//      --cluster-init or --server-join refuses it) and the data root as the

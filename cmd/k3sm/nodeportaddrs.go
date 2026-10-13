@@ -22,6 +22,8 @@ import (
 	"strings"
 
 	"k3sm.io/darwin-net/pkg/proxy"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // nodePortAddressesFlag is the k3s-style flag (`--nodeport-addresses`, kube-proxy's
@@ -54,6 +56,19 @@ func resolveNodePortAddresses(spec, nodeAddress string) ([]netip.Addr, error) {
 		return nil, fmt.Errorf("--%s: %w", nodePortAddressesFlag, err)
 	}
 	return addrs, nil
+}
+
+// checkNodePortAddresses is the `k3sm server` and `k3sm agent` entry check:
+// it normalises *spec in place (trimmed, so whitespace-only is unset), checks
+// its syntax, and refuses a non-empty value beside --network none
+// (install.ErrNodePortAddressesWithoutDatapath), where no Service proxy runs
+// and the setting would be silently ignored.
+func checkNodePortAddresses(spec *string, network string) error {
+	*spec = strings.TrimSpace(*spec)
+	if err := validateNodePortAddresses(*spec); err != nil {
+		return err
+	}
+	return install.CheckNodePortPosture(network, *spec)
 }
 
 // validateNodePortAddresses checks a --nodeport-addresses spec's syntax at flag

@@ -193,7 +193,7 @@ func runAgent(args []string) error {
 	if opts.server == "" {
 		return fmt.Errorf("--server is required")
 	}
-	if err := validateNodePortAddresses(opts.nodePortAddresses); err != nil {
+	if err := checkNodePortAddresses(&opts.nodePortAddresses, opts.network); err != nil {
 		return err
 	}
 

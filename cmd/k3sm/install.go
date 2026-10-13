@@ -259,6 +259,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 			return installFlags{}, fmt.Errorf("--kubeconfig-name: %w", err)
 		}
 	}
+	o.nodePortAddresses = strings.TrimSpace(o.nodePortAddresses) // whitespace-only clears, like ""
 	if err := validateNodePortAddresses(o.nodePortAddresses); err != nil {
 		return installFlags{}, err
 	}

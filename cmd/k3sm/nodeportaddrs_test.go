@@ -95,6 +95,45 @@ func TestNodePortAddressesFlag(t *testing.T) {
 		}
 	})
 
+	t.Run("a setting beside --network none is refused at entry", func(t *testing.T) {
+		spec := "local"
+		if err := checkNodePortAddresses(&spec, "none"); !errors.Is(err, install.ErrNodePortAddressesWithoutDatapath) {
+			t.Errorf("server/agent entry check = %v, want ErrNodePortAddressesWithoutDatapath", err)
+		}
+		err := runAgent([]string{"--server", "192.0.2.10", "--network", "none", "--nodeport-addresses", "local"})
+		if !errors.Is(err, install.ErrNodePortAddressesWithoutDatapath) {
+			t.Errorf("k3sm agent = %v, want ErrNodePortAddressesWithoutDatapath", err)
+		}
+		blank := "   "
+		if err := checkNodePortAddresses(&blank, "none"); err != nil || blank != "" {
+			t.Errorf("a whitespace-only setting = %q, %v; want it normalised to unset and accepted", blank, err)
+		}
+		padded := " local "
+		if err := checkNodePortAddresses(&padded, "auto"); err != nil || padded != "local" {
+			t.Errorf("a padded setting = %q, %v; want %q", padded, err, "local")
+		}
+	})
+
+	t.Run("install trims; whitespace-only clears the recorded value", func(t *testing.T) {
+		o, err := parseInstallFlags([]string{"--user", "alice", "--nodeport-addresses", "  "})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := o.installConfig("", nil, nil)
+		cfg.ExtraServerArgs = []string{"--nodeport-addresses", "local"}
+		if got := install.RecordedServerArgs(cfg); slices.Contains(got, "--nodeport-addresses") {
+			t.Errorf("a whitespace-only --nodeport-addresses kept the carried value: %q", got)
+		}
+		o, err = parseInstallFlags([]string{"--user", "alice", "--nodeport-addresses", " local "})
+		if err != nil {
+			t.Fatal(err)
+		}
+		args := install.RecordedServerArgs(o.installConfig("", nil, nil))
+		if i := slices.Index(args, "--nodeport-addresses"); i < 0 || args[i+1] != "local" {
+			t.Errorf("recorded args %q, want the trimmed value", args)
+		}
+	})
+
 	t.Run("an unusable spec is refused at parse", func(t *testing.T) {
 		if _, err := parseInstallFlags([]string{"--user", "alice", "--nodeport-addresses", "lan"}); !errors.Is(err, proxy.ErrNodePortAddresses) {
 			t.Errorf("install accepted --nodeport-addresses lan: %v", err)

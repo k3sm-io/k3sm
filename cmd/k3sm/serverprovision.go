@@ -193,7 +193,7 @@ func preflightServer(opts *serverOptions, workDirErr error, logger *slog.Logger)
 	if err := validateServerOptions(opts, workDirErr, logger); err != nil {
 		return nil, mode, true, err
 	}
-	if err := validateNodePortAddresses(opts.nodePortAddresses); err != nil {
+	if err := checkNodePortAddresses(&opts.nodePortAddresses, opts.network); err != nil {
 		return nil, mode, true, err
 	}
 	// The snapshot schedule, refused before anything is written when it cannot

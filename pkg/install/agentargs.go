@@ -310,20 +310,6 @@ func (c Config) resolvedExtraAgentArgs() []string {
 	return c.setNodePortAddressesArg(c.ExtraAgentArgs)
 }
 
-// setNodePortAddressesArg applies c.NodePortAddresses to args: nil leaves them
-// as carried, an empty value drops any --nodeport-addresses, and any other value
-// replaces it.
-func (c Config) setNodePortAddressesArg(args []string) []string {
-	if c.NodePortAddresses == nil {
-		return args
-	}
-	out := dropValueArg(args, nodePortAddressesFlag)
-	if *c.NodePortAddresses == "" {
-		return out
-	}
-	return append(out, "--"+nodePortAddressesFlag, *c.NodePortAddresses)
-}
-
 // RecordedAgentArgs returns the operator `k3sm agent` arguments an install with
 // cfg renders after the managed set AND writes to the agent arguments record.
 func RecordedAgentArgs(cfg Config) []string { return cfg.resolvedExtraAgentArgs() }
