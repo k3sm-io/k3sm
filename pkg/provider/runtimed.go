@@ -234,10 +234,14 @@ type runtimedRuntime struct {
 	// nil (a test double) disables the refresh loop.
 	refresher projectedRefresher
 
-	mu      sync.Mutex
-	track   map[string]*podTrack  // pod id -> bookkeeping
-	probers map[string]*podProber // pod id -> provider-served probe runner
-	notify  func(*corev1.Pod)
+	mu    sync.Mutex
+	track map[string]*podTrack // pod id -> bookkeeping
+	// retained holds the TERMINATED pods of this node a restarted daemon found
+	// in the apiserver and does not track, keyed by pod UID: their log trees are
+	// still owed to `kubectl logs` (runtimed_retained.go). Guarded by mu.
+	retained map[string]*corev1.Pod
+	probers  map[string]*podProber // pod id -> provider-served probe runner
+	notify   func(*corev1.Pod)
 	// compensating is the set of pod ids with a compensating delete owed and in
 	// flight — a guest a parked pod's retry built after the pod was deleted, which
 	// nothing but this provider knows about (runtimed_pull.go). It is
@@ -2027,6 +2031,7 @@ func (r *runtimedRuntime) dispatchCurrent(ctx context.Context, id string) {
 // wall-time (floored at 1s), since runtimed treats a 0 grace as immediate-kill.
 func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
+	r.forgetRetained(id)
 	// Cancel every in-flight provider worker FIRST, BEFORE the RPC. A postStart
 	// hook must not outlive the pod and termination must not wait on one —
 	// upstream tears the pod worker's context down on delete, which aborts a

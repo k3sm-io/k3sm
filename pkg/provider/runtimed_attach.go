@@ -86,7 +86,9 @@ const attachListTimeout = orphanAPITimeout
 // degrade to the create-everything behavior.
 func (r *runtimedRuntime) adoptNodePods(ctx context.Context, a podAttacher) {
 	attached, left := 0, 0
-	pods := r.listPodsToAttach(ctx)
+	listed := r.listNodePodsAtStartup(ctx)
+	r.retainTerminatedPods(listed)
+	pods := podsToAttach(listed)
 	for i := range pods {
 		if r.attachPod(ctx, a, &pods[i]) {
 			attached++
@@ -103,11 +105,10 @@ func (r *runtimedRuntime) adoptNodePods(ctx context.Context, a podAttacher) {
 	}
 }
 
-// listPodsToAttach returns the pods bound to this node that an attach may
-// apply to: in the Running phase, not being deleted, and native (a vm pod's
-// helper never survives its daemon). A node without an apiserver client, or a
-// list that fails, yields none.
-func (r *runtimedRuntime) listPodsToAttach(ctx context.Context) []corev1.Pod {
+// listNodePodsAtStartup returns every pod bound to this node, read once at
+// startup. A node without an apiserver client, or a list that fails, yields
+// none: nothing is attached and nothing is retained.
+func (r *runtimedRuntime) listNodePodsAtStartup(ctx context.Context) []corev1.Pod {
 	if r.podSource == nil {
 		return nil
 	}
@@ -118,6 +119,13 @@ func (r *runtimedRuntime) listPodsToAttach(ctx context.Context) []corev1.Pod {
 		r.log.Warn("startup pod re-attachment skipped: cannot list this node's pods; surviving pod processes will be reaped and the pods created again", "err", err)
 		return nil
 	}
+	return listed
+}
+
+// podsToAttach returns the listed pods an attach may apply to: in the Running
+// phase, not being deleted, and native (a vm pod's helper never survives its
+// daemon).
+func podsToAttach(listed []corev1.Pod) []corev1.Pod {
 	var out []corev1.Pod
 	for i := range listed {
 		p := &listed[i]

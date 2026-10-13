@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -270,9 +271,6 @@ func (w *logWriter) write(msg *logMessage, addPrefix bool) error {
 // read sees the new, empty one, which is upstream's behaviour and upstream's
 // documented limitation. `kubectl logs` has never read a rotated file.
 func ReadLogs(ctx context.Context, path string, opts *Options, isRunning RunningFunc, log *slog.Logger, stdout, stderr io.Writer) error {
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
-	}
 	// Resolve symlinks up front: filesystem watchers differ on whether they
 	// follow one, and the whole tree is written by this node, so there is no
 	// second principal whose symlink could be followed into.
@@ -280,10 +278,23 @@ func ReadLogs(ctx context.Context, path string, opts *Options, isRunning Running
 	if err != nil {
 		return fmt.Errorf("failed to try resolving symlinks in path %q: %v", path, err)
 	}
-	path = evaluated
-	f, err := os.Open(path)
+	return ReadLogsWith(ctx, evaluated, os.Open, opts, isRunning, log, stdout, stderr)
+}
+
+// Opener opens a log file for reading.
+type Opener func(path string) (*os.File, error)
+
+// ReadLogsWith is ReadLogs with the open step supplied by the caller: open is
+// the ONLY way the file is opened, both at the start and when a followed file is
+// recreated, and path is used exactly as given (no symlink resolution). A caller
+// that must not follow a symlink passes OpenNoFollow.
+func ReadLogsWith(ctx context.Context, path string, open Opener, opts *Options, isRunning RunningFunc, log *slog.Logger, stdout, stderr io.Writer) error {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	f, err := open(path)
 	if err != nil {
-		return fmt.Errorf("failed to open log file %q: %v", path, err)
+		return fmt.Errorf("failed to open log file %q: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -357,12 +368,12 @@ func ReadLogs(ctx context.Context, path string, opts *Options, isRunning Running
 					return err
 				}
 				if recreated {
-					newF, err := os.Open(path)
+					newF, err := open(path)
 					if err != nil {
-						if os.IsNotExist(err) {
+						if errors.Is(err, fs.ErrNotExist) {
 							continue
 						}
-						return fmt.Errorf("failed to open log file %q: %v", path, err)
+						return fmt.Errorf("failed to open log file %q: %w", path, err)
 					}
 					_ = f.Close()
 					f = newF
