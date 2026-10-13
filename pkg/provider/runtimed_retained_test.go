@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -232,6 +233,68 @@ func TestLogsOfTerminatedVMPodSurviveRestart(t *testing.T) {
 		src.mu.Unlock()
 		if _, err := read(t, "twin", &corev1.PodLogOptions{}); !vkadapter.IsNotFound(err) {
 			t.Errorf("err = %v, want NotFound for an ambiguous name", err)
+		}
+	})
+
+	// The retained read path is derived from names, so it must not follow a link
+	// planted in the tree: neither a symlinked instance file nor a symlinked
+	// container directory may redirect it, even to a readable log.
+	t.Run("symlinks in the retained tree are refused", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "secret.log")
+		if err := os.WriteFile(outside, []byte(criLine(started, "stdout", "F", "outside the tree")), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		linkFile := terminated("linkfile", corev1.PodSucceeded)
+		fileDir := podlogs.BuildContainerLogsDirectory(logsDir, "default", "linkfile", string(linkFile.UID), "c0")
+		if err := os.MkdirAll(fileDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(fileDir, "0.log")); err != nil {
+			t.Fatal(err)
+		}
+
+		linkDir := terminated("linkdir", corev1.PodSucceeded)
+		outsideDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outsideDir, "0.log"), []byte(criLine(started, "stdout", "F", "outside the tree")), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		podDir := podlogs.BuildPodLogsDirectory(logsDir, "default", "linkdir", string(linkDir.UID))
+		if err := os.MkdirAll(podDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideDir, filepath.Join(podDir, "c0")); err != nil {
+			t.Fatal(err)
+		}
+
+		r.retainTerminatedPods([]corev1.Pod{linkFile, linkDir})
+		src.mu.Lock()
+		src.got["default/linkfile"] = linkFile.DeepCopy()
+		src.got["default/linkdir"] = linkDir.DeepCopy()
+		src.mu.Unlock()
+
+		got, err := read(t, "linkfile", &corev1.PodLogOptions{})
+		if !vkadapter.IsNotFound(err) {
+			t.Errorf("symlinked instance file: logs = %q, err = %v, want NotFound", got, err)
+		}
+		got, err = read(t, "linkdir", &corev1.PodLogOptions{})
+		if err == nil || !errors.Is(err, errUnsafeLogDir) {
+			t.Errorf("symlinked container directory: logs = %q, err = %v, want a refusal", got, err)
+		}
+	})
+
+	t.Run("a name that is not one path segment is refused", func(t *testing.T) {
+		p := terminated("trav", corev1.PodSucceeded)
+		if _, err := r.retainedLogPath(&p, "../../etc", false); err == nil {
+			t.Error("retainedLogPath accepted a container name outside the declared set")
+		}
+		p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: "../x"})
+		if _, err := r.retainedLogPath(&p, "../x", false); err == nil || vkadapter.IsNotFound(err) {
+			t.Errorf("err = %v, want a refusal of a multi-segment name", err)
+		}
+		p.Spec.Containers[0].Name = ".."
+		if _, err := r.retainedLogPath(&p, "..", false); err == nil || vkadapter.IsNotFound(err) {
+			t.Errorf("err = %v, want a refusal of a dot-dot name", err)
 		}
 	})
 }

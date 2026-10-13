@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -139,7 +140,9 @@ func (r *runtimedRuntime) retainedContainerLogs(ctx context.Context, pod *corev1
 		return err
 	}
 	notRunning := func(context.Context) (bool, error) { return false, nil }
-	return podlogs.ReadLogs(ctx, path, r.readOptions(opts), notRunning, r.log, stdout, stderr)
+	// The path is DERIVED from names, not reported by the runtime, so the open
+	// follows no symlink and accepts only a regular file.
+	return podlogs.ReadLogsWith(ctx, path, podlogs.OpenNoFollow, r.readOptions(opts), notRunning, r.log, stdout, stderr)
 }
 
 // retainedLogPath resolves a retained pod's container instance file from disk.
@@ -155,7 +158,10 @@ func (r *runtimedRuntime) retainedLogPath(pod *corev1.Pod, containerName string,
 	if !declaresContainer(pod, containerName) {
 		return "", fmt.Errorf("container %q in pod %q is not available", containerName, pod.Name)
 	}
-	dir := podlogs.BuildContainerLogsDirectory(r.podLogsDir, pod.Namespace, pod.Name, string(pod.UID), containerName)
+	dir, err := r.retainedContainerDir(pod, containerName)
+	if err != nil {
+		return "", err
+	}
 	nums, err := instanceLogNumbers(dir)
 	if err != nil {
 		return "", fmt.Errorf("read container log directory %q: %w", dir, err)
@@ -171,6 +177,52 @@ func (r *runtimedRuntime) retainedLogPath(pod *corev1.Pod, containerName string,
 	}
 	return podlogs.BuildContainerLogsPath(r.podLogsDir, pod.Namespace, pod.Name, string(pod.UID), containerName, nums[0]), nil
 }
+
+// retainedContainerDir returns a retained pod's container log directory after
+// proving it is safe to list and read from, locally rather than on the strength
+// of apiserver name validation alone:
+//
+//   - every name joined into the path is a single path segment;
+//   - the joined, cleaned path stays under the pod logs root;
+//   - the pod directory and the container directory are real directories, not
+//     symlinks, so a planted link cannot redirect the read outside the tree.
+//
+// The root itself is not checked: on macOS /var is a symlink to /private/var,
+// and the root is node configuration, not derived from a pod.
+//
+// A directory that does not exist is NotFound (no log was written); a symlink or
+// a non-directory is refused.
+func (r *runtimedRuntime) retainedContainerDir(pod *corev1.Pod, containerName string) (string, error) {
+	for _, seg := range []string{pod.Namespace, pod.Name, string(pod.UID), containerName} {
+		if seg == "" || seg == "." || seg == ".." || strings.ContainsRune(seg, filepath.Separator) {
+			return "", fmt.Errorf("refusing container log path: %q is not a single path segment", seg)
+		}
+	}
+	root := filepath.Clean(r.podLogsDir)
+	podDir := podlogs.BuildPodLogsDirectory(root, pod.Namespace, pod.Name, string(pod.UID))
+	dir := filepath.Join(podDir, containerName)
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("refusing container log path %q: it is not under %q", dir, root)
+	}
+	for _, d := range []string{podDir, dir} {
+		fi, err := os.Lstat(d)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return "", vkadapter.NotFoundf("container %q in pod %q has no log file", containerName, pod.Name)
+			}
+			return "", fmt.Errorf("stat container log path %q: %w", d, err)
+		}
+		if !fi.IsDir() || fi.Mode()&fs.ModeSymlink != 0 {
+			return "", fmt.Errorf("refusing container log path %q: %w", d, errUnsafeLogDir)
+		}
+	}
+	return dir, nil
+}
+
+// errUnsafeLogDir is the refusal of a log directory that is a symlink or not a
+// directory.
+var errUnsafeLogDir = errors.New("not a real directory")
 
 // instanceLogNumbers returns the instance numbers of the plain <n>.log files in
 // dir, highest first. A missing directory has none.
