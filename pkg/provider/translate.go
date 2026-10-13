@@ -768,7 +768,11 @@ func podQOSClass(pod *corev1.Pod) runtimev1.QOSClass {
 }
 
 // computePodQOS reproduces the kubelet's v1qos.GetPodQOS classification over the
-// pod's init + regular containers, considering only the CPU and memory resources:
+// pod's init + regular containers, considering only the CPU and memory resources.
+// Pod-level resources (spec.resources) take over from the containers only when they
+// carry at least one request or limit (the v1.37 rule: empty {}, {requests:{}} and
+// {limits:{}} do not affect QoS); the pod-level branch is ported from
+// k8s.io/kubernetes pkg/apis/core/v1/helper/qos/qos.go (Apache-2.0). Otherwise:
 //   - Guaranteed: every container sets non-zero CPU AND memory limits, and every
 //     resource's summed request equals its summed limit;
 //   - BestEffort: no container sets any CPU/memory request or limit;
@@ -814,11 +818,31 @@ func computePodQOS(pod *corev1.Pod) corev1.PodQOSClass {
 			isGuaranteed = false
 		}
 	}
-	for i := range pod.Spec.InitContainers {
-		accumulate(&pod.Spec.InitContainers[i])
-	}
-	for i := range pod.Spec.Containers {
-		accumulate(&pod.Spec.Containers[i])
+	if pr := pod.Spec.Resources; pr != nil && (len(pr.Requests) > 0 || len(pr.Limits) > 0) {
+		for name, q := range pr.Requests {
+			if isQOSComputeResource(name) && q.Sign() == 1 {
+				requests[name] = q.DeepCopy()
+			}
+		}
+		for name, q := range pr.Limits {
+			if isQOSComputeResource(name) && q.Sign() == 1 {
+				limits[name] = q.DeepCopy()
+			}
+		}
+		if len(pr.Limits) > 0 {
+			_, hasCPU := limits[corev1.ResourceCPU]
+			_, hasMem := limits[corev1.ResourceMemory]
+			if !hasCPU || !hasMem {
+				isGuaranteed = false
+			}
+		}
+	} else {
+		for i := range pod.Spec.InitContainers {
+			accumulate(&pod.Spec.InitContainers[i])
+		}
+		for i := range pod.Spec.Containers {
+			accumulate(&pod.Spec.Containers[i])
+		}
 	}
 
 	if len(requests) == 0 && len(limits) == 0 {
