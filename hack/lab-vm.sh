@@ -113,7 +113,11 @@ CLONE_PREFIX="k3sm-lab-"
 
 # The pinned base family. See the HARD PRECONDITION block above.
 PINNED_BASE_GLOB="ghcr.io/cirruslabs/macos-*"
-BASE_IMAGE="${K3SM_LAB_VM_BASE:-ghcr.io/cirruslabs/macos-sequoia-base:latest}"
+# The default base is pinned by digest (what the `latest` tag resolved to on
+# 2026-10-13), so every run boots the same bytes. It carries no tag because a tart
+# reference takes either a `:tag` or an `@digest`, and `tart list` names a
+# digest-pulled image by `<repo>@sha256:…`, which base_present matches.
+BASE_IMAGE="${K3SM_LAB_VM_BASE:-ghcr.io/cirruslabs/macos-sequoia-base@sha256:eee659985b01e4df2a6c0754bd8d25e54969933c43fdcd4edef8bea337b3d354}"
 GUEST_USER="${K3SM_LAB_VM_USER:-admin}"
 
 # The single tart resolution seam. EVERY tart call site goes through tart_cli,
@@ -649,7 +653,7 @@ self_test() {
 printf 'tart %s\n' "$*" >>"${LABVM_TEST_LOG:?}"
 case "${1:-}" in
 list) printf 'Source Name Disk Size State\n'
-      printf 'oci %s 50 20 stopped\n' "${LABVM_TEST_BASE:-ghcr.io/cirruslabs/macos-sequoia-base:latest}"
+      printf 'oci %s 50 20 stopped\n' "${LABVM_TEST_BASE:-ghcr.io/cirruslabs/macos-sequoia-base@sha256:eee659985b01e4df2a6c0754bd8d25e54969933c43fdcd4edef8bea337b3d354}"
       cat "${LABVM_TEST_CLONES:-/dev/null}" 2>/dev/null || true ;;
 ip)   [ "${LABVM_TEST_NO_IP:-0}" = 1 ] && exit 1
       printf '192.0.2.10\n' ;;
