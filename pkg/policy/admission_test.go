@@ -22,7 +22,6 @@ import (
 	"testing"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
-	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -577,7 +576,7 @@ func TestDaemonSetTolerationInjectedNotNodeSelector(t *testing.T) {
 		t.Fatalf("EnsureDaemonSetTolerationMutation: %v", err)
 	}
 
-	pol, err := cs.AdmissionregistrationV1beta1().MutatingAdmissionPolicies().Get(ctx, dsTolerationPolicyName, metav1.GetOptions{})
+	pol, err := cs.AdmissionregistrationV1().MutatingAdmissionPolicies().Get(ctx, dsTolerationPolicyName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get mutating policy: %v", err)
 	}
@@ -591,16 +590,16 @@ func TestDaemonSetTolerationInjectedNotNodeSelector(t *testing.T) {
 	if !containsStr(rule.Resources, "pods") {
 		t.Errorf("policy must match pods, got %v", rule.Resources)
 	}
-	if !sameOps(rule.Operations, []admissionregistrationv1beta1.OperationType{admissionregistrationv1beta1.Create}) {
+	if !sameOps(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Create}) {
 		t.Errorf("policy operations = %v, want exactly [CREATE]", rule.Operations)
 	}
-	if pol.Spec.ReinvocationPolicy != admissionregistrationv1beta1.IfNeededReinvocationPolicy {
+	if pol.Spec.ReinvocationPolicy != admissionregistrationv1.IfNeededReinvocationPolicy {
 		t.Errorf("reinvocationPolicy = %q, want IfNeeded", pol.Spec.ReinvocationPolicy)
 	}
 	// A convenience injector must fail OPEN: with an all-Pods/CREATE MatchConstraints,
 	// FailurePolicy Fail would turn any CEL error into a cluster-wide Pod-CREATE denial.
 	// Ignore degrades to Unschedulable (no guard bypass — the Deny VAP + taint hold).
-	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionregistrationv1beta1.Ignore {
+	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionregistrationv1.Ignore {
 		t.Errorf("failurePolicy = %v, want Ignore (fail open — this is a convenience injector, not a guard)", pol.Spec.FailurePolicy)
 	}
 
@@ -612,7 +611,7 @@ func TestDaemonSetTolerationInjectedNotNodeSelector(t *testing.T) {
 		t.Fatalf("want exactly one mutation, got %d", len(pol.Spec.Mutations))
 	}
 	mut := pol.Spec.Mutations[0]
-	if mut.PatchType != admissionregistrationv1beta1.PatchTypeJSONPatch {
+	if mut.PatchType != admissionregistrationv1.PatchTypeJSONPatch {
 		t.Errorf("patchType = %q, want JSONPatch (ApplyConfiguration would replace the atomic tolerations list)", mut.PatchType)
 	}
 	if mut.JSONPatch == nil {
@@ -653,7 +652,7 @@ func TestDaemonSetTolerationInjectedNotNodeSelector(t *testing.T) {
 	}
 
 	// The binding points at the policy (mutations are not validated, so no ValidationActions).
-	bind, err := cs.AdmissionregistrationV1beta1().MutatingAdmissionPolicyBindings().Get(ctx, dsTolerationBindingName, metav1.GetOptions{})
+	bind, err := cs.AdmissionregistrationV1().MutatingAdmissionPolicyBindings().Get(ctx, dsTolerationBindingName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get mutating binding: %v", err)
 	}
@@ -664,5 +663,56 @@ func TestDaemonSetTolerationInjectedNotNodeSelector(t *testing.T) {
 	// Idempotent on server restart.
 	if err := EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
 		t.Errorf("second provision must be idempotent: %v", err)
+	}
+}
+
+// TestMutatingAdmissionPolicyEnsuredAsV1 is the B504 gate: the toleration injector's
+// policy and binding are created, then updated on drift, through
+// admissionregistration.k8s.io/v1 and never through v1beta1.
+func TestMutatingAdmissionPolicyEnsuredAsV1(t *testing.T) {
+	cs := fake.NewClientset()
+	ctx := context.Background()
+
+	if err := EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
+		t.Fatalf("first ensure: %v", err)
+	}
+	pol, err := cs.AdmissionregistrationV1().MutatingAdmissionPolicies().Get(ctx, dsTolerationPolicyName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get v1 policy: %v", err)
+	}
+	if pol.Labels[managedLabel] != "true" || pol.Spec.FailurePolicy == nil ||
+		*pol.Spec.FailurePolicy != admissionregistrationv1.Ignore ||
+		pol.Spec.ReinvocationPolicy != admissionregistrationv1.IfNeededReinvocationPolicy ||
+		len(pol.Spec.MatchConditions) != 2 || len(pol.Spec.Mutations) != 1 {
+		t.Errorf("policy content drifted: %+v", pol)
+	}
+	bind, err := cs.AdmissionregistrationV1().MutatingAdmissionPolicyBindings().Get(ctx, dsTolerationBindingName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get v1 binding: %v", err)
+	}
+	if bind.Spec.PolicyName != dsTolerationPolicyName || bind.Labels[managedLabel] != "true" {
+		t.Errorf("binding content drifted: %+v", bind)
+	}
+
+	pol.Spec.MatchConditions = nil
+	if _, err := cs.AdmissionregistrationV1().MutatingAdmissionPolicies().Update(ctx, pol, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	cs.ClearActions()
+	if err := EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
+		t.Fatalf("second ensure: %v", err)
+	}
+	updated := false
+	for _, a := range cs.Actions() {
+		gvr := a.GetResource()
+		if gvr.Group == "admissionregistration.k8s.io" && gvr.Version != "v1" {
+			t.Errorf("action %s %s used version %s, want v1", a.GetVerb(), gvr.Resource, gvr.Version)
+		}
+		if a.GetVerb() == "update" && gvr.Resource == "mutatingadmissionpolicies" {
+			updated = true
+		}
+	}
+	if !updated {
+		t.Errorf("drifted policy was not updated; actions: %v", cs.Actions())
 	}
 }

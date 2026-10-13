@@ -48,8 +48,8 @@ limitations under the License.
 //     preserve client source IP — only Cluster).
 //   - UDP Service ports have no datapath yet (the proxy opens no UDP listener).
 //
-// One is a MUTATING policy — a MutatingAdmissionPolicy (beta,
-// admissionregistration.k8s.io/v1beta1), which unlike the Deny/Warn VAPs above CHANGES
+// One is a MUTATING policy — a MutatingAdmissionPolicy
+// (admissionregistration.k8s.io/v1), which unlike the Deny/Warn VAPs above CHANGES
 // the stored object:
 //   - daemonset-provider-toleration: a DaemonSet-owned pod is created by the DS
 //     controller (in the kube-controller-manager), so the CREATE-Warn advisory never
