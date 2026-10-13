@@ -1395,7 +1395,7 @@ phases:
             done: true
             desc: "B481 — `k3sm stop` per L1, with the Uninstall teardown extracted into one function both verbs call, the await barriers from pkg/install/restart.go, the two-phase marker (stopping, stopped) 0644 in a root-owned directory, best-effort cordon and annotation, and actor/reason/result logged to slog and os_log."
           - id: M18.1-d2
-            done: false
+            done: true
             desc: "B482 — `k3sm start` (markers removed, enable, netd then node daemon, the shared flush as a precondition, best-effort uncordon) and `k3sm restart` (pods keep running); install, in-app update and uninstall form one state machine: install and update honour the marker unless --start, uninstall clears the disable override and the markers."
           - id: M18.1-d3
             done: false

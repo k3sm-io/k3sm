@@ -39,7 +39,9 @@ func TestLifecycleVerbsRefuseWithoutRoot(t *testing.T) {
 	lifecycleGeteuid = func() int { return 501 }
 	t.Cleanup(func() { lifecycleGeteuid = orig })
 	for verb, run := range map[string]func([]string, *bytes.Buffer) int{
-		"stop": func(a []string, w *bytes.Buffer) int { return runStop(a, w) },
+		"stop":    func(a []string, w *bytes.Buffer) int { return runStop(a, w) },
+		"start":   func(a []string, w *bytes.Buffer) int { return runStart(a, w) },
+		"restart": func(a []string, w *bytes.Buffer) int { return runRestart(a, w) },
 	} {
 		var stderr bytes.Buffer
 		if code := run(nil, &stderr); code != exitNeedsRoot {

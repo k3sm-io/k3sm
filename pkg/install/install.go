@@ -1400,10 +1400,14 @@ type Config struct {
 	// StopMarker is the path of the user-stop marker `k3sm stop` writes and
 	// `k3sm start` removes (see lifecycle.go). Empty means DefaultStopMarkerPath.
 	StopMarker string
+	// Start is `--start`: an install or a restart on a node the user stopped
+	// starts it again. Without it, a stopped node is updated and left stopped
+	// (no label is enabled or bootstrapped while a stop marker is present).
+	Start bool
 	// MarkNode cordons this node and sets the k3sm.io/stopped-by-user
 	// annotation (stopped true), or undoes what a stop did (stopped false).
-	// It is called by Stop before the node daemon goes down (stopped true);
-	// stopped false undoes it once a node is started again. Nil skips
+	// It is called by Stop before the node daemon goes down, and by Start (and
+	// an install or restart with Start) once the daemons are back. Nil skips
 	// it. BEST EFFORT: the call is bounded by markNodeTimeout and a failure is
 	// one warning, never a stop or start failure.
 	MarkNode func(ctx context.Context, stopped bool, actor, reason string) error
@@ -1440,6 +1444,20 @@ type Config struct {
 	// manifest, and Install and Uninstall each set it from the record before
 	// they build that manifest.
 	dataVolumeDeclared bool
+	// stayStopped is set by Install when a stop marker is present and Start
+	// is not: the install lays the new tree down and restarts nothing.
+	stayStopped bool
+	// userStop is the stop marker Install found (nil: none), carried to the
+	// restart step, where an install with Start runs the start precondition
+	// and removes it.
+	userStop *userStopState
+}
+
+// userStopState is a stop marker as Install read it: the content, or the
+// error that made it unreadable (an unreadable marker still means stopped).
+type userStopState struct {
+	marker StopMarker
+	err    error
 }
 
 func (c Config) withDefaults() Config {
@@ -1944,6 +1962,21 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     already applies the root row of the ownership table. See
 	//     stopRunningDaemons; on a first install nothing is loaded and nothing
 	//     is booted out.
+	//
+	//     A node the user stopped is updated and stays stopped unless Start:
+	//     the marker is read here, before anything is booted out or restarted,
+	//     and step 4 honours it (see restartDaemons and publishedWiring).
+	if marker, present, merr := readStopMarker(sys, cfg); present {
+		cfg.userStop = &userStopState{marker: marker, err: merr}
+		if merr != nil {
+			cfg.Logger.Warn("the stop marker is unreadable; treating this node as stopped by the user", "err", merr)
+		}
+		if !cfg.Start {
+			cfg.stayStopped = true
+			cfg.Logger.Info("this node was stopped by the user; the install updates it and leaves it stopped (pass --start to start it)",
+				"stopped-by", marker.Actor, "reason", marker.Reason, "phase", marker.Phase)
+		}
+	}
 	stopped, err := stopRunningDaemons(ctx, sys, m, cfg.Logger)
 	// Until step 4 takes over restarting them, a failure leaves the stopped
 	// daemons stopped, and the error says so rather than leaving the operator
@@ -2390,8 +2423,25 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	//    removed the label, so an immediate bootstrap races the teardown and loses.
 	//    restart.go sequences them — see its file comment for the failure this cost
 	//    in the field, the transient errnos, and the rollback on a mid-loop failure.
+	//    On a node the user stopped, with --start, the start's precondition
+	//    runs first and the marker goes, exactly as `k3sm start` does it; without
+	//    --start restartDaemons leaves every long-running label alone.
+	if cfg.userStop != nil && cfg.Start {
+		d, err := readInstalledDaemons(sys, cfg)
+		if err != nil {
+			return fmt.Errorf("install: %w", err)
+		}
+		startPrecondition(ctx, sys, cfg, d, cfg.userStop.marker, cfg.userStop.err)
+		if err := sys.RemoveStopMarker(cfg.StopMarker); err != nil {
+			return fmt.Errorf("install: --start: remove the stop marker %s: %w", cfg.StopMarker, err)
+		}
+	}
 	if err := restartDaemons(ctx, sys, cfg, m); err != nil {
 		return fmt.Errorf("install: %w", err)
+	}
+	if cfg.stayStopped {
+		cfg.Logger.Info("updated, still stopped: the new release is installed and the node stays stopped; run `sudo k3sm start` to start it")
+		return nil
 	}
 	for _, n := range limitNotices {
 		cfg.Logger.Info("the daemon's open-file limit changed; this install booted it out and bootstrapped it again, which is what binds a new SoftResourceLimits/HardResourceLimits NumberOfFiles (launchctl kickstart -k alone would NOT: it respawns the job with the limit captured at its last bootstrap)",
@@ -2404,6 +2454,9 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	//     else entirely (a cluster whose DNS stopped answering).
 	if err := verifyDaemons(ctx, sys, cfg, m, startedAt); err != nil {
 		return fmt.Errorf("install: %w", err)
+	}
+	if cfg.userStop != nil {
+		markNode(ctx, cfg, false, ActorUser, "k3sm install --start")
 	}
 	return nil
 }
@@ -2554,6 +2607,8 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 				// The walk never touches the label's enabled/disabled bit
 				// (no launchctl enable or disable): it removes only what
 				// install created, and a disable is the operator's own act.
+				// The one disable k3sm itself makes, a user stop's, is
+				// cleared after the teardown (clearUserStop).
 				//
 				// Bootout then remove the plist — binding them so a booted-out label
 				// can never leave a leaked KeepAlive plist. But if
@@ -2608,6 +2663,12 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	} else if slices.ContainsFunc(m, func(a artifact) bool { return a.disp == dispRemove && a.path == identity }) {
 		note(safeRemove(identity))
 	}
+	// A user stop leaves the labels disabled in launchd's override database and
+	// its marker on disk. Both are cleared: the labels have no plist any more,
+	// and a later install must not find this Mac "stopped" by a node that no
+	// longer exists. An operator's own disable, with no stop marker, is not
+	// touched (uninstall removes only what k3sm created).
+	note(clearUserStop(sys, cfg, m))
 	if firstErr != nil {
 		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}

@@ -330,3 +330,51 @@ func runNetdRemoveMesh(args []string, stderr io.Writer) int {
 	}
 	return 0
 }
+
+// startUsage is `k3sm start --help`.
+const startUsage = `Usage: sudo k3sm start [--reason TEXT] [--actor user|auto]
+
+Start k3sm on this Mac after 'k3sm stop': clear what a stop may have left
+(finishing an interrupted one), remove the stop marker, enable and start netd
+and then the node daemon, and uncordon the node (best effort). On a node that
+is already running it does nothing.
+
+Exit codes: 0 started or already running; 1 failed; 2 usage; 3 not run as root.
+`
+
+// restartUsage is `k3sm restart --help`.
+const restartUsage = `Usage: sudo k3sm restart [--start] [--reason TEXT] [--actor user|auto]
+
+Restart the k3sm daemons; pods keep running. On a node stopped with 'k3sm stop'
+it refuses, unless --start is given, which starts the node instead.
+
+Exit codes: 0 restarted; 1 failed or refused; 2 usage; 3 not run as root.
+`
+
+// runStart is `k3sm start`.
+func runStart(args []string, stderr io.Writer) int {
+	actor, reason, _, ok := lifecycleFlags("start", args, stderr, startUsage, false)
+	if !ok {
+		return exitLifecycleUsage
+	}
+	if !requireRoot("start", stderr) {
+		return exitNeedsRoot
+	}
+	sys := install.NewDarwinSystem()
+	return lifecycleExit("start", install.Start(context.Background(), sys, lifecycleConfig(sys, stderr), actor, reason), stderr)
+}
+
+// runRestart is `k3sm restart`.
+func runRestart(args []string, stderr io.Writer) int {
+	actor, reason, start, ok := lifecycleFlags("restart", args, stderr, restartUsage, true)
+	if !ok {
+		return exitLifecycleUsage
+	}
+	if !requireRoot("restart", stderr) {
+		return exitNeedsRoot
+	}
+	sys := install.NewDarwinSystem()
+	cfg := lifecycleConfig(sys, stderr)
+	cfg.Start = start
+	return lifecycleExit("restart", install.Restart(context.Background(), sys, cfg, actor, reason), stderr)
+}

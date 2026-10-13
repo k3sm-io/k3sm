@@ -86,7 +86,11 @@ func runInstall(args []string) error {
 
 	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 	ctx := context.Background()
-	return install.Install(ctx, install.NewDarwinSystem(), opts.installConfig(self, volume, logger))
+	sys := install.NewDarwinSystem()
+	cfg := opts.installConfig(self, volume, logger)
+	// Only an install --start over a stopped node calls it: the uncordon.
+	cfg.MarkNode = nodeMarker(sys, install.DefaultDataRoot)
+	return install.Install(ctx, sys, cfg)
 }
 
 // installConfig is the install package's Config these flags describe. It is
@@ -108,6 +112,7 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 		MeshIP:            o.meshIP,
 		SecretsEncryption: o.secretsEncryption,
 		EtcdSnapshots:     o.etcdSnapshotFlags(),
+		Start:             o.start,
 		Logger:            logger,
 	}
 }
@@ -183,6 +188,8 @@ type installFlags struct {
 	etcdSnapshotCron      string
 	etcdSnapshotRetention int
 	etcdDisableSnapshots  bool
+	// start is --start: start a node the user stopped (install.Config.Start).
+	start bool
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
@@ -198,6 +205,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.StringVar(&o.server, "server", "", "with --agent: the control-plane host to join; with --server-join: an existing server's LAN address (the --node-ip it was installed with). Either way an UNDERLAY address (a LAN IP or DNS name, no scheme, no port), because the join dials <host>:9345 before this node has any mesh")
 	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: optional; the join assigns this Mac's mesh address, pass it only to assert the expected value (a value that differs from the assignment fails the join instead of minting a certificate for an address this node does not hold). With --cluster-init or --server-join: required; this Mac's LAN address, which the etcd peer listener binds and every other server dials (not loopback). The server daemon receives it as --etcd-peer-ip; the node itself advertises its --mesh-ip")
 	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token (a joined node needs none). With --server-join: required; a file holding the server token `k3sm token create --server` printed on an existing server. Read once by this install and copied for the daemon; it must not be group- or world-readable, and it is yours to delete afterwards")
+	fs.BoolVar(&o.start, "start", false, "on a node stopped with 'k3sm stop', start it after installing (without it the node is updated and stays stopped)")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")
 	fs.StringVar(&o.dataVolumeName, "data-volume-name", defaultDataVolumeName, "the APFS volume label to create or adopt")
