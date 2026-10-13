@@ -112,6 +112,11 @@ type EtcdSnapshotSchedule struct {
 	Cron *CronSchedule
 	// Retention is how many of this node's scheduled snapshots are kept. At least 1.
 	Retention int
+	// Compress writes each scheduled snapshot as a one-member zip archive named
+	// <name>.zip (k3s's --etcd-snapshot-compress). Retention counts compressed and
+	// plain snapshots of this node alike, so turning it on or off keeps the newest
+	// Retention of either kind.
+	Compress bool
 }
 
 // validate checks the schedule's own fields.
@@ -132,9 +137,10 @@ func ScheduledEtcdSnapshotName(node string, t time.Time) string {
 }
 
 // parseScheduledEtcdSnapshot reports whether name is a scheduled snapshot of node,
-// and when it was taken. Nothing else matches: not another node's, not a manual
-// save's, not a .tmp a failed write left.
+// plain or compressed (<name>.zip), and when it was taken. Nothing else matches: not
+// another node's, not a manual save's, not a .tmp a failed write left.
 func parseScheduledEtcdSnapshot(node, name string) (time.Time, bool) {
+	name = strings.TrimSuffix(name, compressedSnapshotExt)
 	rest, ok := strings.CutPrefix(name, scheduledSnapshotPrefix+node+"-")
 	if !ok || rest == "" {
 		return time.Time{}, false
@@ -176,13 +182,18 @@ type etcdSnapshotState struct {
 type etcdSnapshotScheduler struct {
 	cron      *CronSchedule
 	retention int
+	compress  bool
 	dir       string
-	node      string
+	// workDir is swept at start for decompressed snapshot copies a crashed restore
+	// left (sweepInflateDebris).
+	workDir string
+	node    string
 	// loc is the zone the cron expression is read in: the server's local time.
 	loc   *time.Location
 	clock clock
-	// save writes a verified snapshot to dst (saveEtcdSnapshot in production).
-	save func(ctx context.Context, dst string) error
+	// save writes a verified snapshot to dst, compressed when compress is set
+	// (saveEtcdSnapshot in production).
+	save func(ctx context.Context, dst string, compress bool) error
 	// space refuses a directory with less than want bytes free.
 	space func(dir string, want uint64) error
 	// dbSize, when non-nil, sizes the floor before the schedule has a snapshot of
@@ -190,10 +201,13 @@ type etcdSnapshotScheduler struct {
 	dbSize func(ctx context.Context) (int64, error)
 	log    *slog.Logger
 
-	// mu guards state and lastSize; collectEtcdStatus reads state.
+	// mu guards state, lastSize and lastPath; collectEtcdStatus reads state.
 	mu       sync.Mutex
 	state    etcdSnapshotState
 	lastSize int64
+	// lastPath is the newest scheduled snapshot, whose format sizes the free-space
+	// floor (floorBasis).
+	lastPath string
 }
 
 // newEtcdSnapshotScheduler builds the scheduler for this server's member: it
@@ -205,12 +219,16 @@ func (s *Supervised) newEtcdSnapshotScheduler(m etcdMembers) *etcdSnapshotSchedu
 	sc := &etcdSnapshotScheduler{
 		cron:      cfg.Cron,
 		retention: cfg.Retention,
+		compress:  cfg.Compress,
 		dir:       SnapshotDir(s.cfg.WorkDir),
+		workDir:   s.cfg.WorkDir,
 		node:      s.cfg.Etcd.Name,
 		loc:       time.Local,
 		clock:     s.etcd.clock,
-		save:      func(ctx context.Context, dst string) error { return saveEtcdSnapshot(ctx, m, dst) },
-		space:     requireSnapshotSpace,
+		save: func(ctx context.Context, dst string, compress bool) error {
+			return saveEtcdSnapshot(ctx, m, dst, compress)
+		},
+		space: requireSnapshotSpace,
 		dbSize: func(ctx context.Context) (int64, error) {
 			st, err := m.Status(ctx)
 			return st.DBSize, err
@@ -226,6 +244,15 @@ func (s *Supervised) newEtcdSnapshotScheduler(m etcdMembers) *etcdSnapshotSchedu
 // snapshots. Failures are logged; none of them stops the schedule.
 func (sc *etcdSnapshotScheduler) prepare() {
 	log := sc.log
+	if sc.workDir != "" {
+		removed, err := sweepInflateDebris(sc.workDir)
+		for _, p := range removed {
+			log.Info("removed a decompressed snapshot copy an interrupted restore left", "component", etcdComponent, "path", p)
+		}
+		if err != nil {
+			log.Warn("could not remove a decompressed snapshot copy an interrupted restore left", "component", etcdComponent, "err", err)
+		}
+	}
 	if err := os.MkdirAll(sc.dir, 0o700); err != nil {
 		log.Warn("could not create the etcd snapshot directory", "component", etcdComponent, "dir", sc.dir, "err", err)
 		return
@@ -312,7 +339,7 @@ func (sc *etcdSnapshotScheduler) refresh() {
 	sc.state.kept = len(snaps)
 	sc.state.last = time.Time{}
 	if len(snaps) > 0 && !snaps[0].order.IsZero() {
-		sc.state.last, sc.lastSize = snaps[0].taken, snaps[0].size
+		sc.state.last, sc.lastSize, sc.lastPath = snaps[0].taken, snaps[0].size, snaps[0].path
 	}
 }
 
@@ -387,16 +414,7 @@ func (sc *etcdSnapshotScheduler) tick(ctx context.Context) {
 		sc.fail("scheduled etcd snapshot failed: cannot create the snapshot directory", sc.dir, err)
 		return
 	}
-	sc.mu.Lock()
-	basis := sc.lastSize
-	sc.mu.Unlock()
-	if basis <= 0 && sc.dbSize != nil {
-		cctx, cancel := context.WithTimeout(ctx, etcdCallTimeout)
-		if n, err := sc.dbSize(cctx); err == nil {
-			basis = n
-		}
-		cancel()
-	}
+	basis := sc.floorBasis(ctx)
 	if basis > 0 {
 		if err := sc.space(sc.dir, uint64(basis)*snapshotFreeSpaceFactor); err != nil {
 			reason := EtcdSnapshotSkipError
@@ -410,8 +428,11 @@ func (sc *etcdSnapshotScheduler) tick(ctx context.Context) {
 
 	taken := sc.clock.Now()
 	path := filepath.Join(sc.dir, ScheduledEtcdSnapshotName(sc.node, taken))
+	if sc.compress {
+		path += compressedSnapshotExt
+	}
 	sctx, cancel := context.WithTimeout(ctx, etcdScheduledSnapshotTimeout)
-	err := sc.save(sctx, path)
+	err := sc.save(sctx, path, sc.compress)
 	cancel()
 	if err != nil {
 		if ctx.Err() != nil {
@@ -428,11 +449,46 @@ func (sc *etcdSnapshotScheduler) tick(ctx context.Context) {
 	}
 	sc.log.Info("took a scheduled etcd snapshot", "component", etcdComponent, "path", path, "bytes", size)
 	sc.mu.Lock()
-	sc.lastSize = size
+	sc.lastSize, sc.lastPath = size, path
 	sc.state.lastErr, sc.state.skipped = "", nil
 	sc.mu.Unlock()
 	sc.retain(path)
 	sc.refresh()
+}
+
+// floorBasis is the snapshot size the free-space floor is a multiple of.
+//
+// A plain newest snapshot with compression off sizes it alone. Otherwise its size
+// understates what a tick needs: a compressed tick stages the plain snapshot before
+// compressing it, and an archive's own size is not the snapshot's. The member's backend
+// size is then asked for, and the larger of it and the last size is used; when that
+// call fails, the larger of the newest archive's declared uncompressed size and the
+// last size.
+func (sc *etcdSnapshotScheduler) floorBasis(ctx context.Context) int64 {
+	sc.mu.Lock()
+	basis, last := sc.lastSize, sc.lastPath
+	sc.mu.Unlock()
+	lastZipped := false
+	if last != "" {
+		lastZipped, _ = isCompressedSnapshot(last)
+	}
+	if basis > 0 && !sc.compress && !lastZipped {
+		return basis
+	}
+	if sc.dbSize != nil {
+		cctx, cancel := context.WithTimeout(ctx, etcdCallTimeout)
+		n, err := sc.dbSize(cctx)
+		cancel()
+		if err == nil {
+			return max(basis, n)
+		}
+	}
+	if lastZipped {
+		if n, err := declaredSnapshotSize(last); err == nil && int64(n) > basis {
+			return int64(n)
+		}
+	}
+	return basis
 }
 
 // retain deletes this node's scheduled snapshots past the newest sc.retention,
@@ -472,7 +528,7 @@ func (s *Supervised) startEtcdSnapshotSchedule(ctx context.Context, sc *etcdSnap
 	s.etcdSnap, s.etcdSnapStop, s.etcdSnapDone = sc, cancel, done
 	s.mu.Unlock()
 	s.cfg.Logger.Info("scheduled etcd snapshots are on", "component", etcdComponent, "schedule", sc.cron.String(),
-		"retention", sc.retention, "dir", sc.dir)
+		"retention", sc.retention, "compress", sc.compress, "dir", sc.dir)
 	go func() {
 		defer close(done)
 		sc.run(sctx)

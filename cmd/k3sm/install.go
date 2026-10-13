@@ -167,6 +167,10 @@ func (o installFlags) etcdSnapshotFlags() install.EtcdSnapshotFlags {
 		v := o.etcdDisableSnapshots
 		f.Disable = &v
 	}
+	if o.set["etcd-snapshot-compress"] {
+		v := o.etcdSnapshotCompress
+		f.Compress = &v
+	}
 	return f
 }
 
@@ -227,6 +231,7 @@ type installFlags struct {
 	etcdSnapshotCron      string
 	etcdSnapshotRetention int
 	etcdDisableSnapshots  bool
+	etcdSnapshotCompress  bool
 	// start is --start: start a node the user stopped (install.Config.Start).
 	start bool
 }
@@ -259,6 +264,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.StringVar(&o.etcdSnapshotCron, "etcd-snapshot-schedule-cron", executor.DefaultEtcdSnapshotCron, "when the server takes a scheduled etcd snapshot, as a five-field cron expression in local time (embedded etcd HA servers only); written into the server daemon's arguments when passed")
 	fs.IntVar(&o.etcdSnapshotRetention, "etcd-snapshot-retention", executor.DefaultEtcdSnapshotRetention, "how many of this server's scheduled etcd snapshots to keep (embedded etcd HA servers only); written into the server daemon's arguments when passed")
 	fs.BoolVar(&o.etcdDisableSnapshots, "etcd-disable-snapshots", false, "take no scheduled etcd snapshots on this server (embedded etcd HA servers only); written into the server daemon's arguments when passed")
+	fs.BoolVar(&o.etcdSnapshotCompress, "etcd-snapshot-compress", false, "write this server's scheduled etcd snapshots as zip archives (embedded etcd HA servers only); written into the server daemon's arguments when passed")
 	if err := fs.Parse(args); err != nil {
 		return installFlags{}, err
 	}
@@ -348,6 +354,7 @@ var serverOnlyInstallFlags = []string{
 	"etcd-snapshot-schedule-cron",
 	"etcd-snapshot-retention",
 	"etcd-disable-snapshots",
+	"etcd-snapshot-compress",
 }
 
 // role is the install role these flags select.

@@ -351,7 +351,7 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 		streaming := make(chan struct{})
 		var once atomic.Bool
 		// A snapshot in flight when the server stops: it ends only with its context.
-		sc2.save = func(ctx context.Context, _ string) error {
+		sc2.save = func(ctx context.Context, _ string, _ bool) error {
 			if once.CompareAndSwap(false, true) {
 				close(streaming)
 			}

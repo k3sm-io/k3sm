@@ -1372,8 +1372,9 @@ type Config struct {
 	SecretsEncryption bool
 	// EtcdSnapshots are the scheduled etcd snapshot flags this install was given
 	// (`k3sm install --etcd-snapshot-schedule-cron`, `--etcd-snapshot-retention`,
-	// `--etcd-disable-snapshots`). Each one given REPLACES the carried flag of the
-	// same name in resolvedExtraServerArgs; the zero value changes nothing.
+	// `--etcd-disable-snapshots`, `--etcd-snapshot-compress`). Each one given
+	// REPLACES the carried flag of the same name in resolvedExtraServerArgs; the
+	// zero value changes nothing.
 	EtcdSnapshots EtcdSnapshotFlags
 	// KeyEntropy is where a minted secrets-encryption key is read from. Nil is
 	// crypto/rand.Reader; a test injects a placeholder reader so no real key

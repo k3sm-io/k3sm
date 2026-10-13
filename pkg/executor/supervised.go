@@ -476,6 +476,18 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := provisionStep("reap-temps", reapStagingTemps(binDir(s.cfg.WorkDir))); err != nil {
 		return err
 	}
+	// The decompressed snapshot copies a crashed `k3sm snapshot restore` left: each is
+	// a plaintext copy of the cluster's Secrets. A restore refuses while a server runs,
+	// so none of them can be in use now.
+	for _, dir := range []string{dbDir(s.cfg.WorkDir), s.cfg.WorkDir} {
+		removed, err := sweepInflateDebris(dir)
+		for _, p := range removed {
+			s.cfg.Logger.Info("removed a decompressed snapshot copy an interrupted restore left", "path", p)
+		}
+		if err != nil {
+			return provisionStep("reap-temps", err)
+		}
+	}
 	// Before anything replaces the staged kine binary or lets the new pin touch the
 	// database: take the verified pre-migration snapshot if this boot moves an existing
 	// datastore onto a kine pin that has not opened it before. It is a no-op on a fresh

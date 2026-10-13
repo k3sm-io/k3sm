@@ -44,6 +44,9 @@ func TestSetEtcdSnapshotArgs(t *testing.T) {
 		{"the boolean takes no separate value", []string{"--etcd-disable-snapshots", "--cluster-init"}, EtcdSnapshotFlags{Disable: &off},
 			[]string{"--cluster-init", "--etcd-disable-snapshots=false"}},
 		{"an explicit disable", nil, EtcdSnapshotFlags{Disable: &on}, []string{"--etcd-disable-snapshots=true"}},
+		{"compression takes no separate value and replaces the carried one", []string{"--etcd-snapshot-compress", "--cluster-init"},
+			EtcdSnapshotFlags{Compress: &off}, []string{"--cluster-init", "--etcd-snapshot-compress=false"}},
+		{"an explicit compress", nil, EtcdSnapshotFlags{Compress: &on}, []string{"--etcd-snapshot-compress=true"}},
 		{"an unpassed flag is carried", []string{"--etcd-snapshot-schedule-cron", "0 1 * * *"}, EtcdSnapshotFlags{Retention: 2},
 			[]string{"--etcd-snapshot-schedule-cron", "0 1 * * *", "--etcd-snapshot-retention", "2"}},
 	} {
