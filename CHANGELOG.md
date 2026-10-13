@@ -10,9 +10,54 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Breaking
+
+- **`k3sm status -o json` is versioned.** The report carries `schemaVersion: 1`, and the keys under `version` are now lowerCamel. `k3sm doctor --json` carries the same field. See [status JSON](https://k3sm.io/docs/status-json/).
+- **HA servers move to a request-header CA for the aggregation layer.** The join bundle a server hands to another server changes shape, so upgrade the server installed with `--cluster-init` first and then each joined server, one at a time. Workers restart in any order. See [high availability](https://k3sm.io/docs/ha/).
+
+### Added
+
+- **`sudo k3sm stop`, `start` and `restart`.** `stop` takes the node down fully, Pods included, and the node stays stopped across a reboot and across `sudo k3sm install` until you run `start` or `install --start`. `restart` restarts the daemons and keeps Pods running. `--reason` records why in the logs, and `k3sm status` shows who stopped the node (`stoppedBy` in the JSON). See [stopping and starting](https://k3sm.io/docs/stop-start/).
+- **metrics-server ships as an add-on.** A server installed with `--mesh-ip` applies it once a node in the cluster can run `vm` Pods, so `kubectl top pod` works there. The node's metrics endpoints admit metrics-server's ServiceAccount token, and only on those two read-only routes.
+- **The aggregation layer is on.** The apiserver trusts a request-header CA, so extension apiservers such as metrics-server can serve through it.
+- **LoadBalancer Services are hosted on every node.** The server picks the hosting nodes from node labels (`svclb.k3sm.io/enablelb`, `svclb.k3sm.io/lbpool` and per-pool labels, mapped one to one from k3s), and a Service that no node could bind gets a `NoEligibleNodes` or `HostNotBound` Warning Event. See [multi-node](https://k3sm.io/docs/multi-node/).
+- **`--nodeport-addresses` on `k3sm install`, `server` and `agent`.** It binds NodePorts to a list of IPv4 CIDRs, or to `local` (loopback and the node's own address). Empty keeps every interface.
+- **`k3sm install --kubeconfig-name`.** Merges the admin context into your kubeconfig under a name of your choice instead of `k3sm`.
+- **Scheduled etcd snapshots and restore on HA servers.** A server on embedded etcd snapshots its own member every 12 hours and keeps 5 by default (`--etcd-snapshot-schedule-cron`, `--etcd-snapshot-retention`, `--etcd-disable-snapshots`), and `k3sm snapshot restore` puts a snapshot back as a new single-member cluster. See [backup and restore](https://k3sm.io/docs/backup-restore/).
+- **`k3sm status daemons -o json`** reads launchd only, never the apiserver, so it is cheap to poll. `k3sm status` also gains a `heartbeat` row for the node's last status post and Lease renewal.
+- **Pods report `PodReadyToStartContainers`**, and pod-level `resources` count toward a Pod's QoS class.
+
+### Experimental
+
+- **Thunderbolt interconnect (alpha).** `k3sm interconnect enable` arms a Thunderbolt cable between Macs as an opt-in network. Pods opt in with the `k3sm.io/interconnects` annotation, and a sharded `MLXModel` can place its ranks on it with `spec.distributed.interconnect`. `k3sm doctor` gains interconnect rows and `k3sm status` an interconnect row. Sharded models no longer read the `DirectLink` graph. See [interconnects](https://k3sm.io/docs/interconnects/).
+
+### Changed
+
+- **The control plane runs Kubernetes v1.37.1**, and the `k8s.io` client libraries are v0.37.1.
+- **kine, etcd and etcdutl ship in the release payload**, and the node runs those copies instead of building them at boot. The bundled kine is v0.17.2 and the bundled buildx is v0.38.0.
+
+### Security
+
+- **The kubelet API binds the node's own address only**, not every interface, so port 10250 is no longer reachable from the LAN. A joined agent under `--network none` holds no mesh address and now refuses to start.
+- **Control-plane downloads are checked against their pinned digests** on the boot path, and a Developer ID-signed k3sm verifies its control-plane binaries in place and never re-signs them.
+- **The kine, etcd and registry builds pin Go's module verification settings**, so an ambient `GOSUMDB=off` or similar no longer weakens them.
+- **`k3sm status` strips control characters** from cluster-supplied text on a terminal.
+
 ### Fixed
 
 - **The single-node datastore's write-ahead log is checkpointed again.** kine held a read transaction open from its start, so SQLite could never checkpoint, and `state.db-wal` grew by gigabytes a day until the data volume filled. The first boot after the upgrade folds the old log into `state.db`, which takes longer in proportion to its size and needs room for the database to grow; see [upgrade](https://k3sm.io/docs/upgrade/). Rolling back to an earlier release brings the growth back.
+- **A finished Pod's logs are readable after a node-daemon restart.** Before, `kubectl logs` answered that the Pod did not exist and the log tree could be removed as an orphan.
+- **A worker on lossy Wi-Fi keeps posting its status and Lease.** Those writes now use their own connection with a short timeout and a health check, so a connection that went half-open after a roam is replaced.
+- **An HA server no longer counts a lost leader lease as a crash.** A controller manager or scheduler that exits on losing its lease restarts the daemon without moving toward the crash-loop park; a lease that keeps being lost still parks the server, with a reason that names it.
+- **Rewriting a signed binary no longer kills new Pods.** Every binary k3sm stages or signs is written to a new file and renamed into place, because macOS kills a process that maps a signed file rewritten in place.
+- **The log directories are repaired when the root network helper starts**, so a macOS upgrade that removes `/var/log/pods` no longer keeps the node from starting.
+- **Sharded MLX placement counts GPU slots other Pods hold**, and reports `InsufficientGPU` instead of restarting the gang on a full node.
+
+### Upgrade Notes
+
+- Upgrade with `sudo k3sm install`, never by replacing the binary alone.
+- On a cluster using LoadBalancer Services, upgrade the agents before the server.
+- A node stopped with `k3sm stop` stays stopped across an upgrade; pass `--start` to start it.
 
 ## v0.1.7 — 2026-10-05
 
