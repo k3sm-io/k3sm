@@ -42,10 +42,10 @@ export UV_CACHE_DIR=$PREFIX/cache UV_PYTHON_INSTALL_DIR=$PREFIX/pyinstall
 if [ ! -x "$PREFIX/bin/uv" ]; then
   UV_VERSION=0.12.18
   UV_SHA256=cf40e0c6a202190ccd9e0406dcfdd5b2d6668a9a5c779b17948963df32aafe5b
-  mkdir -p "$PREFIX/dl"
+  mkdir -m 0700 -p "$PREFIX/dl"
   UV_TGZ="$PREFIX/dl/uv-$UV_VERSION.tar.gz"
   curl -fsSL -o "$UV_TGZ" "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-aarch64-apple-darwin.tar.gz"
-  echo "$UV_SHA256  $UV_TGZ" | shasum -a 256 -c - \
+  printf '%s  %s\n' "$UV_SHA256" "$UV_TGZ" | shasum -a 256 -c - \
     || { echo "S1 SETUP FAIL: uv sha256 mismatch (pinned $UV_SHA256)"; rm -f "$UV_TGZ"; exit 1; }
   rm -rf "$PREFIX/dl/uv-aarch64-apple-darwin"
   tar xzf "$UV_TGZ" -C "$PREFIX/dl"

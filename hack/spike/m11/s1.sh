@@ -29,7 +29,8 @@ note "S1 — staging the lab-side harness on $HOST"
 lab <<'LABEOF'
 set -euo pipefail
 PREFIX_EXPANDED="$PREFIX"
-mkdir -p "$PREFIX_EXPANDED"/{bin,guest,out}
+mkdir -p "$PREFIX_EXPANDED"/{bin,out}
+mkdir -m 0700 -p "$PREFIX_EXPANDED/guest"      # the kernel download dir
 cd "$PREFIX_EXPANDED"
 
 spike_preflight
@@ -49,8 +50,8 @@ if [ ! -f guest/vmlinuz.gz ]; then
   echo "== fetching a throwaway arm64 kernel =="
   curl -fsSL -o guest/vmlinuz.gz "$KERNEL_URL" || { echo "S1 SETUP FAIL: kernel fetch"; exit 1; }
 fi
-echo "$KERNEL_SHA256  guest/vmlinuz.gz" | shasum -a 256 -c - >/dev/null \
-  || { echo "S1 SETUP FAIL: kernel sha256 mismatch (pinned $KERNEL_SHA256)"; exit 1; }
+printf '%s  %s\n' "$KERNEL_SHA256" "guest/vmlinuz.gz" | shasum -a 256 -c - >/dev/null \
+  || { echo "S1 SETUP FAIL: kernel sha256 mismatch (pinned $KERNEL_SHA256)"; rm -f guest/vmlinuz.gz; exit 1; }
 echo "kernel url:    $KERNEL_URL"
 echo "kernel pinned: $KERNEL_SHA256 (verified)"
 cp guest/vmlinuz.gz guest/Image.gz              # keep the gzipped control

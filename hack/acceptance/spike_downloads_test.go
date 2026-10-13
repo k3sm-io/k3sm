@@ -35,9 +35,14 @@ import (
 //  1. no curl/wget piped into sh, bash, zsh or python*, unless every URL on
 //     the line is a loopback one (127.0.0.1, localhost, [::1]);
 //  2. a curl/wget that writes a file from a non-loopback URL (a URL held in a
-//     variable counts as non-loopback) needs a sha256 check in the same
-//     script: `shasum -a 256 -c`, `sha256sum -c`, or a digest captured into a
-//     variable (`got=$(shasum -a 256 f ...)`) for comparison.
+//     variable counts as non-loopback) needs a sha256 check OF THAT FILE in
+//     the same script: a line running `shasum -a 256 -c`, `sha256sum -c`, or
+//     capturing a digest into a variable (`got=$(shasum -a 256 f ...)`) for
+//     comparison, which names the download's output path (the -o/-O/redirect
+//     target, literal or variable, as spelled at the download) as a whole
+//     word. One check therefore never covers a second download. The helper
+//     spike_fetch_pinned passes the same way: its curl and its check both
+//     name "$dest", and its callers contain no curl at all.
 //
 // A line carrying `# unpinned: <reason>` (on the line itself or the line
 // directly above it) is exempt from both rules. The reason is required: a
@@ -52,7 +57,7 @@ var (
 	urlRE       = regexp.MustCompile(`[a-z]+://[^\s"'|)]+`)
 	// shaCheck is a digest verification: a -c/--check run, or a digest
 	// captured into a variable for an explicit comparison.
-	shaCheck = regexp.MustCompile(`(?m)(?:(?:shasum\s+-a\s*256|sha256sum)\b[^\n]*\s(?:-c|--check)\b|=\$\(\s*(?:shasum\s+-a\s*256|sha256sum)\b)`)
+	shaCheck = regexp.MustCompile(`(?:(?:shasum\s+-a\s*256|sha256sum)\b[^\n]*\s(?:-c|--check)\b|=\$\(\s*(?:shasum\s+-a\s*256|sha256sum)\b)`)
 	// unpinnedRE matches the exemption marker; group 1 is the reason.
 	unpinnedRE = regexp.MustCompile(`#\s*unpinned:(.*)$`)
 	// redirectRE is a stdout redirect to something other than /dev/null.
@@ -120,18 +125,22 @@ func allLoopback(s string) bool {
 	return true
 }
 
-// writesFile reports whether the curl/wget command in seg (the text after the
-// command word, up to the end of its pipeline stage) writes to a file.
-func writesFile(tool, seg string) bool {
+// downloadTarget reports whether the curl/wget command in seg (the text after
+// the command word, up to the end of its pipeline stage) writes to a file, and
+// the path it writes as spelled in the script (quotes stripped). A remote-name
+// download (curl -O, wget without -O) targets the URL's last path segment. An
+// empty target with writes set means the path could not be derived, so no
+// check can be bound to it.
+func downloadTarget(tool, seg string) (target string, writes bool) {
 	if m := redirectRE.FindStringSubmatch(seg); m != nil && m[1] != "/dev/null" {
-		return true
+		return strings.Trim(m[1], `"'`), true
 	}
 	toks := strings.Fields(seg)
 	outFlag := 'o'
 	if tool == "wget" {
 		outFlag = 'O'
 	}
-	wgetToFile := tool == "wget"
+	remoteName := tool == "wget"
 	for i, tok := range toks {
 		var arg string
 		switch {
@@ -143,13 +152,14 @@ func writesFile(tool, seg string) bool {
 			arg = tok[strings.Index(tok, "=")+1:]
 		case tok == "--remote-name" || tok == "--remote-name-all":
 			if tool == "curl" {
-				return true
+				remoteName = true
 			}
 			continue
 		case strings.HasPrefix(tok, "-") && !strings.HasPrefix(tok, "--") && len(tok) > 1:
 			flags := tok[1:]
 			if tool == "curl" && strings.ContainsRune(flags, 'O') {
-				return true
+				remoteName = true
+				continue
 			}
 			j := strings.IndexRune(flags, outFlag)
 			if j < 0 {
@@ -165,12 +175,48 @@ func writesFile(tool, seg string) bool {
 		}
 		arg = strings.Trim(arg, `"'`)
 		if arg == "-" || arg == "/dev/null" || arg == "/dev/stdout" {
-			wgetToFile = false
+			remoteName = false
 			continue
 		}
-		return true
+		return arg, true
 	}
-	return wgetToFile
+	if !remoteName {
+		return "", false
+	}
+	u := urlRE.FindString(seg)
+	if u == "" {
+		return "", true
+	}
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		u = u[:i]
+	}
+	return u[strings.LastIndex(u, "/")+1:], true
+}
+
+// normVar spells ${name} as $name so either spelling binds to the other.
+var normVar = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// pathChar reports whether c can continue a path or variable name, so a
+// target matched next to one is part of a longer, different word.
+func pathChar(c byte) bool {
+	return c == '_' || c == '.' || c == '-' || c == '/' ||
+		(c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// mentions reports whether line names target as a whole word.
+func mentions(line, target string) bool {
+	for off := 0; ; {
+		i := strings.Index(line[off:], target)
+		if i < 0 {
+			return false
+		}
+		i += off
+		j := i + len(target)
+		if (i == 0 || !pathChar(line[i-1])) && (j == len(line) || !pathChar(line[j])) {
+			return true
+		}
+		off = i + 1
+	}
 }
 
 // stageAfter returns the text following the command word at idx, cut at the
@@ -186,6 +232,9 @@ func stageAfter(s string, idx int) string {
 	return rest
 }
 
+// unchecked is the rule-2 finding.
+const unchecked = "non-local download whose output is not sha256-checked in the script"
+
 // downloadFinding is one rule violation.
 type downloadFinding struct {
 	line int
@@ -196,8 +245,26 @@ type downloadFinding struct {
 // non-loopback file-writing downloads seen (checked or not), so a caller can
 // prove the scan saw the downloads it is meant to police.
 func scanDownloads(src string) (findings []downloadFinding, remote int) {
-	hasCheck := shaCheck.MatchString(src)
-	for _, ll := range logicalLines(src) {
+	lines := logicalLines(src)
+	var checks []string
+	for _, ll := range lines {
+		if shaCheck.MatchString(ll.text) {
+			checks = append(checks, normVar.ReplaceAllString(ll.text, "$$$1"))
+		}
+	}
+	checked := func(target string) bool {
+		target = normVar.ReplaceAllString(target, "$$$1")
+		if target == "" {
+			return false
+		}
+		for _, c := range checks {
+			if mentions(c, target) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, ll := range lines {
 		trimmed := strings.TrimSpace(ll.text)
 		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
 			continue
@@ -224,12 +291,16 @@ func scanDownloads(src string) (findings []downloadFinding, remote int) {
 		for _, loc := range locs {
 			tool := ll.text[loc[2]:loc[3]]
 			seg := stageAfter(ll.text, loc[3])
-			if allLoopback(seg) || !writesFile(tool, seg) {
+			if allLoopback(seg) {
+				continue
+			}
+			target, writes := downloadTarget(tool, seg)
+			if !writes {
 				continue
 			}
 			remote++
-			if !hasCheck {
-				findings = append(findings, downloadFinding{ll.n, "non-local download with no sha256 check in the script"})
+			if !checked(target) {
+				findings = append(findings, downloadFinding{ll.n, unchecked})
 			}
 		}
 	}
@@ -295,13 +366,19 @@ func TestSpikeScriptsVerifyDownloads(t *testing.T) {
 			{"curl piped to python3", "curl -fsSL https://example.com/get.py | python3 -\n", []string{"download piped into a shell"}},
 			{"continued pipe", "curl -fsSL \\\n  https://example.com/i.sh \\\n  | bash\n", []string{"download piped into a shell"}},
 			{"guarded pipe", "command -v uv || curl -LsSf https://example.com/uv.sh | sh >/dev/null 2>&1\n", []string{"download piped into a shell"}},
-			{"curl -o unchecked", "curl -fsSL -o k.gz https://example.com/k.gz\n", []string{"non-local download with no sha256 check in the script"}},
-			{"curl -O unchecked", "curl -fsSLO https://example.com/k.gz\n", []string{"non-local download with no sha256 check in the script"}},
-			{"curl variable url unchecked", `curl -fsSL -o "$D/k" "$URL"` + "\n", []string{"non-local download with no sha256 check in the script"}},
-			{"curl redirect unchecked", "curl -fsSL https://example.com/k > k\n", []string{"non-local download with no sha256 check in the script"}},
-			{"wget default unchecked", "wget https://example.com/k.gz\n", []string{"non-local download with no sha256 check in the script"}},
-			{"continued -o unchecked", "curl -fsSL \\\n  -o k.gz \\\n  https://example.com/k.gz\n", []string{"non-local download with no sha256 check in the script"}},
-			{"echo of a digest is not a check", "curl -fsSL -o k https://example.com/k\necho \"sha: $(shasum -a 256 k)\"\n", []string{"non-local download with no sha256 check in the script"}},
+			{"curl -o unchecked", "curl -fsSL -o k.gz https://example.com/k.gz\n", []string{unchecked}},
+			{"curl -O unchecked", "curl -fsSLO https://example.com/k.gz\n", []string{unchecked}},
+			{"curl variable url unchecked", `curl -fsSL -o "$D/k" "$URL"` + "\n", []string{unchecked}},
+			{"curl redirect unchecked", "curl -fsSL https://example.com/k > k\n", []string{unchecked}},
+			{"wget default unchecked", "wget https://example.com/k.gz\n", []string{unchecked}},
+			{"continued -o unchecked", "curl -fsSL \\\n  -o k.gz \\\n  https://example.com/k.gz\n", []string{unchecked}},
+			{"echo of a digest is not a check", "curl -fsSL -o k https://example.com/k\necho \"sha: $(shasum -a 256 k)\"\n", []string{unchecked}},
+			{"second download unchecked", "curl -fsSL -o k https://example.com/k\necho \"$SHA  k\" | shasum -a 256 -c -\ncurl -fsSL -o other https://example.com/other\n", []string{unchecked}},
+			{"check names a different file", "curl -fsSL -o k https://example.com/k\necho \"$SHA  j\" | shasum -a 256 -c -\n", []string{unchecked}},
+			{"capture of a different file", "curl -fsSL -o k https://example.com/k\ngot=$(shasum -a 256 other | awk '{print $1}')\n", []string{unchecked}},
+			{"longer variable is not the target", "curl -fsSL -o \"$dest\" \"$url\"\necho \"$want  $destination\" | shasum -a 256 -c -\n", []string{unchecked}},
+			{"suffix path is not the target", "curl -fsSL -o k.gz https://example.com/k.gz\necho \"$want  old-k.gz\" | shasum -a 256 -c -\n", []string{unchecked}},
+			{"remote name without a url", "curl -fsSLO \"$URL\"\necho \"$S  k.gz\" | shasum -a 256 -c -\n", []string{unchecked}},
 			{"empty unpinned marker", "curl -fsSL https://example.com/i | sh # unpinned:\n", []string{"unpinned marker without a reason"}},
 			{"empty unpinned marker above", "# unpinned:   \ncurl -fsSL -o k https://example.com/k\n", []string{"unpinned marker without a reason"}},
 
@@ -313,7 +390,11 @@ func TestSpikeScriptsVerifyDownloads(t *testing.T) {
 			{"or-or is not a pipe", "curl -fsS https://example.com/x >/dev/null || sh -c 'exit 1'\n", nil},
 			{"pipe to shasum is not a shell", "curl -fsSL https://example.com/x | shasum -a 256\n", nil},
 			{"checked with -c", "curl -fsSL -o k https://example.com/k\necho \"$SHA  k\" | shasum -a 256 -c -\n", nil},
-			{"checked with sha256sum --check", "curl -fsSL -o k https://example.com/k\nsha256sum --check sums\n", nil},
+			{"checked with sha256sum --check", "curl -fsSL -o k https://example.com/k\necho \"$SHA  k\" | sha256sum --check\n", nil},
+			{"remote name checked", "curl -fsSLO https://example.com/d/k.gz\necho \"$S  k.gz\" | shasum -a 256 -c -\n", nil},
+			{"variable target checked", "curl -fsSL -o \"$dest\" \"$url\"\nprintf '%s  %s\\n' \"$want\" \"$dest\" | shasum -a 256 -c -\n", nil},
+			{"braced variable target checked", "curl -fsSL -o \"${dest}\" \"$url\"\necho \"$want  $dest\" | shasum -a 256 -c -\n", nil},
+			{"helper call is not a download", "spike_fetch_pinned \"$URL\" \"$SHA\" \"$D/k\"\n", nil},
 			{"checked by capture", "curl -fsSL -o k \"$URL\"\ngot=$(shasum -a 256 k | awk '{print $1}')\n[ \"$got\" = \"$want\" ]\n", nil},
 			{"unpinned marker with reason", "curl -fsSL https://example.com/i | sh # unpinned: vendor publishes no checksum\n", nil},
 			{"unpinned marker above with reason", "# unpinned: moving nightly, no published digest\ncurl -fsSL -o k https://example.com/k\n", nil},

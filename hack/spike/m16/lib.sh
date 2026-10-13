@@ -222,7 +222,7 @@ spike_fetch_pinned() {
   local url="$1" want="$2" dest="$3"
   rm -f "$dest"
   curl -fsSL -o "$dest" "$url" || { echo "spike_fetch_pinned: fetch failed: $url"; rm -f "$dest"; return 1; }
-  if ! echo "$want  $dest" | shasum -a 256 -c - >/dev/null 2>&1; then
+  if ! printf '%s  %s\n' "$want" "$dest" | shasum -a 256 -c - >/dev/null 2>&1; then
     echo "spike_fetch_pinned: sha256 mismatch for $url (pinned $want, got $(shasum -a 256 "$dest" | awk '{print $1}'))"
     rm -f "$dest"
     return 1
@@ -236,7 +236,8 @@ spike_install_uv() {
   local ver="0.12.18"
   local sha="cf40e0c6a202190ccd9e0406dcfdd5b2d6668a9a5c779b17948963df32aafe5b"
   local dl="$PREFIX/dl"
-  mkdir -p "$dl" "$PREFIX/bin"
+  mkdir -m 0700 -p "$dl"
+  mkdir -p "$PREFIX/bin"
   spike_fetch_pinned "https://github.com/astral-sh/uv/releases/download/$ver/uv-aarch64-apple-darwin.tar.gz" \
     "$sha" "$dl/uv-$ver.tar.gz" || return 1
   rm -rf "$dl/uv-aarch64-apple-darwin"
@@ -251,7 +252,7 @@ spike_install_rustup() {
   local ver="1.29.1"
   local sha="ec1b9233e7f72990ecd8e62063fa7f6c3dfc2bec8e97f88bff165f9100ac696a"
   local dl="$PREFIX/dl"
-  mkdir -p "$dl"
+  mkdir -m 0700 -p "$dl"
   spike_fetch_pinned "https://static.rust-lang.org/rustup/archive/$ver/aarch64-apple-darwin/rustup-init" \
     "$sha" "$dl/rustup-init-$ver" || return 1
   chmod 0755 "$dl/rustup-init-$ver"
