@@ -1471,7 +1471,7 @@ phases:
             check: "go test ./pkg/install -run TestFromStagingRefusesOutsideStagingRoot passes."
             method: integration
       - id: M18.5
-        title: lifecycle helper and auto-stop — password-free stop and start for the app, auto-stop on untrusted Wi-Fi
+        title: lifecycle helper and local-only switching — password-free stop and start for the app, local-only network access on untrusted Wi-Fi
         status: todo
         strategy: hard cut
         depends_on:
@@ -1484,7 +1484,7 @@ phases:
             desc: "B487 — the root-owned lifecycle helper per L9, installed and removed by install and uninstall, excluded from the stop sequence, with docs/privilege-model.md amended in the same change."
           - id: M18.5-d2
             done: false
-            desc: "B488 (out of tree) — auto-stop on untrusted Wi-Fi per L10."
+            desc: "B554 (out of tree) — switch to local-only network access on new or untrusted Wi-Fi per L10 as amended 2026-10-12 (replaces auto-stop, B488 superseded); depends on B552, the CLI switch."
         acceptance:
           - id: M18.5-a1
             met: false
@@ -2230,9 +2230,9 @@ The status item, the menu, the window and the login item (out of tree).
 ### M18.4 — install side ⬜
 `install --from-staging`, the staging path and lock, the token-file join.
 
-### M18.5 — lifecycle helper and auto-stop ⬜
+### M18.5 — lifecycle helper and local-only switching ⬜
 Password-free stop and start for the app through a root-owned helper with a strict caller policy,
-and auto-stop on untrusted Wi-Fi as best-effort hygiene.
+and switching to local-only network access on untrusted Wi-Fi as best-effort hygiene.
 
 ### M18.6 — distribution ⬜
 The first signed and notarized release of both channels, the cask, and the closed-source note.

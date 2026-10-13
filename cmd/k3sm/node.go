@@ -549,9 +549,9 @@ func defaultNodePodCIDR() string {
 const loopbackNodeIP = "127.0.0.1"
 
 // isLoopbackDefault reports whether nodeIP is the shipped --node-ip default, i.e.
-// the operator did not choose an address. It is the ONE value predicate all four
-// call sites share (server.go's mesh rewrite and its apiserver-VIP-backend pin,
-// node.go's advertise derivation, and the LB/ingress config assembly) — a
+// the operator did not choose an address. It is the ONE value predicate its call
+// sites share (server.go's mesh rewrite, node.go's advertise derivation, and the
+// LB/ingress config assembly) — a
 // flag.Visit-style "was it set?" predicate would diverge from it the moment a
 // caller passes 127.0.0.1 explicitly, and a bare "127.0.0.1" literal (which one
 // site carried) diverges from the const the moment the default moves.

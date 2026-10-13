@@ -775,16 +775,17 @@ func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 // --kubelet-preferred-address-types=InternalIP so kubectl logs/exec reach the node by
 // IP.
 //
-// In-pod API reachability: the apiserver binds 127.0.0.1 and the
-// auto-created kubernetes.default.svc endpoint advertises --advertise-address,
-// which is NodeIP — defaulting to 127.0.0.1 for a single node (see cmd/k3sm
-// --node-ip). So on a single node the endpoint resolves to the loopback the
-// apiserver actually listens on, and the in-process Service proxy (same host)
-// reaches it; a pod's projected SA token + the kube-root-ca.crt CA then complete
-// a working in-cluster config. When NodeIP is a routable address (multi-node),
-// the kubernetes endpoint must be rewritten to a node-local address per node so
-// infra VIPs are not blackholed over the mesh — that is the node-local resolver's
-// job, not this one's.
+// In-pod API reachability: a single loopback server (NodeIP 127.0.0.1, the
+// default and both `k3sm dev` tiers) binds and advertises the loopback it listens
+// on, but upstream's lease endpoint reconciler rejects a loopback advertise
+// address, so apiServerArgs sets --endpoint-reconciler-type=none there and the
+// kubernetes.default endpoint is left unreconciled. A pod still reaches the API
+// VIP: cmd/k3sm pins the node proxy's kubernetes backend to the loopback
+// listener (netserve APIServerEndpoint -> proxy.WithStaticBackends), which
+// overrides any EndpointSlice; a pod's projected SA token + the kube-root-ca.crt
+// CA then complete a working in-cluster config. When NodeIP is a routable or
+// mesh address the lease reconciler runs as usual and publishes the real
+// endpoint.
 //
 // The ServiceAccount admission plugin (in the default enabled set —
 // --enable-admission-plugins=NodeRestriction is additive, so ServiceAccount stays
@@ -893,6 +894,15 @@ func apiServerArgs(cfg Config) []string {
 		"--kubelet-preferred-address-types", "InternalIP",
 		"--allow-privileged",
 	)
+	// The lease endpoint reconciler rejects a loopback --advertise-address (the
+	// apiserver fails to start at kubernetes v1.37.1), so a loopback NodeIP turns
+	// reconciliation off. "none" is correct ONLY for a single loopback server: any
+	// server with a peer advertises a mesh IP and keeps the lease reconciler. The
+	// decision is IsLoopbackNodeIP, the same predicate cmd/k3sm uses to pin the
+	// proxy's static API backend, so the two cannot disagree.
+	if IsLoopbackNodeIP(cfg.NodeIP) {
+		args = append(args, "--endpoint-reconciler-type=none")
+	}
 	// --client-ca-file is UNCONDITIONAL (never mesh-gated): the
 	// apiserver must trust the cluster client-CA so the per-component client certs
 	// (system:kube-scheduler / system:kube-controller-manager) AND joined workers'
@@ -1574,4 +1584,13 @@ func tcpReady(port int) func(context.Context) bool {
 		_ = conn.Close()
 		return true
 	}
+}
+
+// IsLoopbackNodeIP reports whether nodeIP parses as a loopback address
+// (127.0.0.0/8 or ::1). It is the one predicate for "this apiserver advertises a
+// loopback": apiServerArgs keys --endpoint-reconciler-type=none on it, and
+// cmd/k3sm keys the proxy's static kubernetes-VIP backend pin on it.
+func IsLoopbackNodeIP(nodeIP string) bool {
+	ip := net.ParseIP(nodeIP)
+	return ip != nil && ip.IsLoopback()
 }
