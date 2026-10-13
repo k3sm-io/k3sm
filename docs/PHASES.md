@@ -1393,10 +1393,10 @@ phases:
         deliverables:
           - id: M18.1-d1
             done: false
-            desc: "B481 — `k3sm stop` per L1, with the Uninstall teardown extracted into one function both verbs call, the await barriers from pkg/install/restart.go, the two-phase marker (stopping, stopped) 0644 in a root-owned directory, best-effort cordon and annotation, and actor/reason/result logged to slog and os_log."
+            desc: "B481 — `k3sm stop` per L1, with the Uninstall teardown extracted into one function both verbs call, the await barriers from pkg/install/restart.go, the two-phase marker (stopping, stopped) 0644 in a root-owned directory, best-effort cordon and annotation, and actor/reason/result logged to slog and os_log. Code and the named unit gate landed; owed before done: the rig leg (stop and start on both roles, worker and server; reboot survival excluded per B35)."
           - id: M18.1-d2
             done: false
-            desc: "B482 — `k3sm start` (markers removed, enable, netd then node daemon, the shared flush as a precondition, best-effort uncordon) and `k3sm restart` (pods keep running); install, in-app update and uninstall form one state machine: install and update honour the marker unless --start, uninstall clears the disable override and the markers."
+            desc: "B482 — `k3sm start` (markers removed, enable, netd then node daemon, the shared flush as a precondition, best-effort uncordon) and `k3sm restart` (pods keep running); install, in-app update and uninstall form one state machine: install and update honour the marker unless --start, uninstall clears the disable override and the markers. Code and the named unit gate landed; owed before done: the rig leg (stop and start on both roles, worker and server; reboot survival excluded per B35)."
           - id: M18.1-d3
             done: false
             desc: "B483 — an additive omitempty `stoppedBy {actor, reason, at, phase}` on both status shapes, no new verdict or state enum, golden fixtures extended, docs/user/status-json.md updated."

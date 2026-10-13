@@ -136,9 +136,22 @@ func restartDaemons(ctx context.Context, sys System, cfg Config, m []artifact) e
 		states, _ := daemonStates(sys, longRunningDaemonLabels(m))
 		return fmt.Errorf("%w; %s; daemon state: %s", err, recovery, strings.Join(states, ", "))
 	}
+	// A node the user stopped stays stopped: while a stop marker is present (in
+	// either phase) no long-running label is enabled or bootstrapped, unless
+	// the caller was asked to --start. This is the one place every path that
+	// starts daemons goes through (install, an install's rollback, start,
+	// restart), so the rule cannot be skipped by one of them. A oneshot (the
+	// data-volume mount) is not a daemon a stop disables and still restarts.
+	stop, userStopped, _ := readStopMarker(sys, cfg)
+	holdStopped := userStopped && !cfg.Start
 	netdRestarted := false
 	for _, a := range m {
 		if a.kind != kindDaemon {
+			continue
+		}
+		if holdStopped && !a.oneshot {
+			logger.Warn("left stopped: this node was stopped by the user, so its daemon is neither enabled nor started (pass --start to start it)",
+				append([]any{"label", a.label}, stopAttrs(stop, cfg)...)...)
 			continue
 		}
 		// The node daemon dials netd before it does anything else, so it does not
@@ -232,7 +245,9 @@ func restartDaemon(ctx context.Context, sys System, label string, oneshot bool, 
 	if err := awaitUnloaded(ctx, sys, label, b); err != nil {
 		return err
 	}
-	// Enable before bootstrap, every time. launchd refuses to bootstrap a label
+	// Enable before bootstrap, every time. restartDaemons, the only caller, has
+	// already refused to come here for a label a user stop disabled (unless
+	// asked to --start), so the enable below never undoes a stop. launchd refuses to bootstrap a label
 	// disabled in the system domain with EIO, the same errno it returns while a
 	// booted-out label drains, so the retry below cannot tell the two apart and
 	// would spend its whole budget on a refusal that never clears. Enabling first
