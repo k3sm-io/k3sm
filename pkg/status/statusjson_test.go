@@ -37,6 +37,7 @@ import (
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -48,7 +49,9 @@ var (
 	// reportRequired and reportOptional are the top-level keys of `k3sm status
 	// -o json`. The optional ones are omitted when empty.
 	reportRequired = []string{"schemaVersion", "verdict", "role", "summary", "rows", "version", "host", "timestamp"}
-	reportOptional = []string{"next", "peers", "interconnect"}
+	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy"}
+	// stoppedByRequired are the keys of the optional stoppedBy object.
+	stoppedByRequired = []string{"actor", "reason", "at", "phase"}
 	// interconnectRequired and interconnectOptional are the keys of the
 	// report's interconnect block, and interconnectPodRequired those of each
 	// attached pod in it.
@@ -57,6 +60,7 @@ var (
 	interconnectPodRequired = []string{"namespace", "pod", "node", "address"}
 	// daemonsRequired is the whole of `k3sm status daemons -o json`.
 	daemonsRequired = []string{"schemaVersion", "verdict", "role", "summary", "daemons"}
+	daemonsOptional = []string{"stoppedBy"}
 	rowRequired     = []string{"name", "state", "severity", "detail"}
 	rowOptional     = []string{"remedy", "wide"}
 	versionRequired = []string{"version", "commit", "dirty", "date", "goVersion", "platform", "kubeVersion", "kineVersion"}
@@ -245,6 +249,11 @@ func contractScenarios() map[string]contractScenario {
 			}
 			return c
 		}},
+		"stopped-by-user": {verdict: VerdictStopped, collector: func(t *testing.T) Collector {
+			c := contractServer(t, "launchctl_failed_once.txt", "launchctl_stopped_clean.txt", downKube(), nil)
+			c.StopMarker = fakeStopMarker(userStopMarker(goldenTime.Add(-90*time.Second), install.StopPhaseStopped))
+			return c
+		}},
 		"not-installed": {verdict: VerdictNotInstalled, collector: func(t *testing.T) Collector {
 			c := contractServer(t, "launchctl_not_loaded.txt", "launchctl_not_loaded.txt", nil, errors.New("no k3sm context in ~/.kube/config"))
 			notLoaded := errors.New("exit status 113")
@@ -387,7 +396,8 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			want []string
 		}{
 			{reflect.TypeOf(Report{}), sortedUnion(reportRequired, reportOptional)},
-			{reflect.TypeOf(DaemonsReport{}), sortedUnion(daemonsRequired)},
+			{reflect.TypeOf(DaemonsReport{}), sortedUnion(daemonsRequired, daemonsOptional)},
+			{reflect.TypeOf(StoppedBy{}), sortedUnion(stoppedByRequired)},
 			{reflect.TypeOf(Row{}), sortedUnion(rowRequired, rowOptional)},
 			{reflect.TypeOf(PeerStatus{}), sortedUnion(peerRequired)},
 			{reflect.TypeOf(Interconnect{}), sortedUnion(interconnectRequired, interconnectOptional)},
@@ -435,7 +445,12 @@ func TestStatusJSONContractGolden(t *testing.T) {
 					}
 				}
 			}
-			checkKeys(t, daemonsPath, probeGeneric, daemonsRequired, nil, nil)
+			checkKeys(t, daemonsPath, probeGeneric, daemonsRequired, daemonsOptional, optionalSeen)
+			for _, g := range []map[string]any{fullGeneric, probeGeneric} {
+				if sb, ok := g["stoppedBy"]; ok {
+					checkKeys(t, name+" stoppedBy", sb, stoppedByRequired, nil, nil)
+				}
+			}
 			checkRows(t, daemonsPath+" daemons", probeGeneric["daemons"], optionalSeen)
 		})
 
@@ -542,7 +557,7 @@ func TestStatusJSONContractGolden(t *testing.T) {
 		// Every optional key appears in some golden, so a rename of a key that
 		// one fixture omits still fails in another. peers is the exception: it
 		// is reserved, and no posture emits it yet (the struct check covers it).
-		for _, k := range append(append(append([]string{"next", "interconnect"}, rowOptional...), versionOptional...), interconnectOptional...) {
+		for _, k := range append(append(append([]string{"next", "interconnect", "stoppedBy"}, rowOptional...), versionOptional...), interconnectOptional...) {
 			if !optionalSeen[k] {
 				t.Errorf("no golden carries the optional key %q", k)
 			}

@@ -184,6 +184,13 @@ func readStopMarker(sys System, cfg Config) (StopMarker, bool, error) {
 	return m, true, nil
 }
 
+// ReadStopMarker reads the stop marker at path through sys, for a reader that
+// only reports it (`k3sm status`). It is the same read and parse the
+// lifecycle uses; present is false only when there is no marker at all.
+func ReadStopMarker(sys System, path string) (StopMarker, bool, error) {
+	return readStopMarker(sys, Config{StopMarker: path})
+}
+
 // stopAttrs are the log attributes that say who stopped the node, why, and
 // how long ago, for every path that leaves a stopped node stopped.
 func stopAttrs(m StopMarker, cfg Config) []any {

@@ -161,6 +161,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 		Rows:          rows,
 		Next:          next,
 		Interconnect:  icBlock,
+		StoppedBy:     c.stoppedBy(),
 		Version:       c.Version,
 		Host:          c.Host,
 		Timestamp:     now(),

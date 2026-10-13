@@ -121,9 +121,12 @@ type Report struct {
 	// present only when the cluster has one this report could read (the
 	// interconnect row carries the same facts as a sentence).
 	Interconnect *Interconnect `json:"interconnect,omitempty"`
-	Version      version.Info  `json:"version"`
-	Host         string        `json:"host"`
-	Timestamp    time.Time     `json:"timestamp"`
+	// StoppedBy is who stopped k3sm on this Mac, present only while a readable
+	// stop marker exists. It adds no verdict or state word.
+	StoppedBy *StoppedBy   `json:"stoppedBy,omitempty"`
+	Version   version.Info `json:"version"`
+	Host      string       `json:"host"`
+	Timestamp time.Time    `json:"timestamp"`
 }
 
 // Row returns the named row and whether it was present.
