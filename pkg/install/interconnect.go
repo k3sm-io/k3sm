@@ -19,7 +19,6 @@ package install
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -54,24 +53,15 @@ type InterconnectAlias struct {
 	Address netip.Addr
 }
 
-// interconnectLedgerFile is the shape netd persists its owned aliases in (the
-// file at netdsvc.InterconnectStatePath). netd is the only writer; this is a
-// read of that file's documented fields, nothing more.
-type interconnectLedgerFile struct {
-	Aliases []struct {
-		Slot    int    `json:"slot"`
-		Address string `json:"address"`
-	} `json:"aliases"`
-}
-
-// ParseInterconnectLedger decodes netd's interconnect ownership ledger and
-// returns the entries that are interconnect aliases: an address inside
+// ParseInterconnectLedger decodes netd's interconnect ownership ledger (the
+// file at netdsvc.InterconnectStatePath; netd is the only writer) and returns
+// the entries that are interconnect aliases: an address inside
 // netv1alpha1.InterconnectCIDR and a slot within 0..MaxInterconnectSlot. Any
 // other entry is dropped, so nothing outside the interconnect range can ever be
 // treated as k3sm-owned. Only malformed JSON is an error.
 func ParseInterconnectLedger(raw []byte) ([]InterconnectAlias, error) {
-	var l interconnectLedgerFile
-	if err := json.Unmarshal(raw, &l); err != nil {
+	l, err := netv1alpha1.ParseInterconnectLedger(raw)
+	if err != nil {
 		return nil, fmt.Errorf("parse the interconnect ownership ledger: %w", err)
 	}
 	out := make([]InterconnectAlias, 0, len(l.Aliases))
