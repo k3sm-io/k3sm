@@ -136,12 +136,12 @@ func (r *runtimedRuntime) removePodLogs(pod *corev1.Pod) {
 // --- podlogs.Backend (the /containerLogs HTTP surface) ---
 
 // GetPodByName returns a tracked pod, comma-ok. It is podlogs.Backend's 404.
-func (r *runtimedRuntime) GetPodByName(_ context.Context, namespace, name string) (*corev1.Pod, bool) {
+func (r *runtimedRuntime) GetPodByName(ctx context.Context, namespace, name string) (*corev1.Pod, bool) {
 	_, _, pod, ok := r.lookup(namespace, name)
 	if !ok {
 		// A terminated pod a restarted daemon retained, so its logs stay
 		// readable (runtimed_retained.go).
-		return r.retainedPod(namespace, name)
+		return r.retainedPod(ctx, namespace, name)
 	}
 	return pod.DeepCopy(), true
 }

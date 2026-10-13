@@ -105,7 +105,10 @@ func TestLogsOfTerminatedVMPodSurviveRestart(t *testing.T) {
 			},
 		},
 	}}
-	src := &fakePodSource{listed: []corev1.Pod{vmJob, nativeJob, web, silent}}
+	src := &fakePodSource{listed: []corev1.Pod{vmJob, nativeJob, web, silent}, got: map[string]*corev1.Pod{}}
+	for _, p := range src.listed {
+		src.got[p.Namespace+"/"+p.Name] = p.DeepCopy()
+	}
 	r := newRuntimedWith(rt, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: logsDir}, nil, nil)
 	r.podSource = src
 	ctx := context.Background()
@@ -185,6 +188,7 @@ func TestLogsOfTerminatedVMPodSurviveRestart(t *testing.T) {
 	t.Run("a retained pod deleted from the apiserver is dropped", func(t *testing.T) {
 		src.mu.Lock()
 		src.listed = []corev1.Pod{nativeJob, web, silent}
+		delete(src.got, "default/vmjob")
 		src.mu.Unlock()
 		r.reapOrphans(ctx)
 		if _, ok := r.GetPodByName(ctx, "default", "vmjob"); ok {
@@ -196,6 +200,38 @@ func TestLogsOfTerminatedVMPodSurviveRestart(t *testing.T) {
 		}
 		if _, ok := r.GetPodByName(ctx, "default", "nativejob"); !ok {
 			t.Error("GetPodByName(nativejob) lost a pod the apiserver still holds")
+		}
+	})
+
+	// A name is not an identity. Once the apiserver's object for a name carries a
+	// different UID, the retained incarnation is not that pod, and serving its
+	// files would show the new pod another workload's output.
+	t.Run("a recreated pod with the same name is not served the old logs", func(t *testing.T) {
+		successor := nativeJob.DeepCopy()
+		successor.UID = "uid-nativejob-successor"
+		src.mu.Lock()
+		src.got["default/nativejob"] = successor
+		src.mu.Unlock()
+		if _, ok := r.GetPodByName(ctx, "default", "nativejob"); ok {
+			t.Error("GetPodByName(nativejob) returned the retained predecessor of a recreated pod")
+		}
+		if _, err := read(t, "nativejob", &corev1.PodLogOptions{}); !vkadapter.IsNotFound(err) {
+			t.Errorf("logs of a recreated pod: err = %v, want NotFound (never the predecessor's file)", err)
+		}
+	})
+
+	t.Run("two retained pods with one name are ambiguous", func(t *testing.T) {
+		a := attachTestPod("twin", corev1.PodSucceeded, "", started)
+		b := attachTestPod("twin", corev1.PodSucceeded, "", started)
+		b.UID = "uid-twin-2"
+		writeInstance(t, &a, "c0", 0, "twin a")
+		writeInstance(t, &b, "c0", 0, "twin b")
+		r.retainTerminatedPods([]corev1.Pod{a, b})
+		src.mu.Lock()
+		src.got["default/twin"] = a.DeepCopy()
+		src.mu.Unlock()
+		if _, err := read(t, "twin", &corev1.PodLogOptions{}); !vkadapter.IsNotFound(err) {
+			t.Errorf("err = %v, want NotFound for an ambiguous name", err)
 		}
 	})
 }

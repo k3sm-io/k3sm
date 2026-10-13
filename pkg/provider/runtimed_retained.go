@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
@@ -69,16 +70,45 @@ func (r *runtimedRuntime) retainTerminatedPods(listed []corev1.Pod) {
 	}
 }
 
-// retainedPod returns a copy of the retained pod named namespace/name, comma-ok.
-func (r *runtimedRuntime) retainedPod(namespace, name string) (*corev1.Pod, bool) {
+// retainedPod returns a copy of the retained pod named namespace/name, comma-ok,
+// and only when it is the CURRENT incarnation of that name.
+//
+// A name is not an identity: the pod a restarted daemon retained may since have
+// been deleted and a new pod created under the same name, and serving the new
+// pod's `kubectl logs` from the old one's files would show one workload another's
+// output. So exactly one retained entry must carry the name, and a bounded live
+// read of the apiserver's object for that name must report the SAME UID. Two
+// entries, a different UID, a pod that is gone, or an apiserver that does not
+// answer are all "not found". A different UID or a definitive NotFound also
+// drops the stale entry: that incarnation is deleted, so its logs are no longer
+// owed.
+func (r *runtimedRuntime) retainedPod(ctx context.Context, namespace, name string) (*corev1.Pod, bool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var matches []*corev1.Pod
 	for _, p := range r.retained {
 		if p.Namespace == namespace && p.Name == name {
-			return p.DeepCopy(), true
+			matches = append(matches, p)
 		}
 	}
-	return nil, false
+	r.mu.Unlock()
+	if len(matches) != 1 || r.podSource == nil {
+		return nil, false
+	}
+	p := matches[0]
+	getCtx, cancel := context.WithTimeout(ctx, orphanAPITimeout)
+	live, err := r.podSource.getPod(getCtx, namespace, name)
+	cancel()
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			r.forgetRetained(string(p.UID))
+		}
+		return nil, false
+	}
+	if live.UID != p.UID {
+		r.forgetRetained(string(p.UID))
+		return nil, false
+	}
+	return p.DeepCopy(), true
 }
 
 // forgetRetained drops a retained pod by UID; a pod that is not retained is a

@@ -53,7 +53,7 @@ func (r *runtimedRuntime) ContainerLogs(ctx context.Context, namespace, podName,
 		opts = &corev1.PodLogOptions{}
 	}
 	if _, _, _, tracked := r.lookup(namespace, podName); !tracked {
-		if pod, ok := r.retainedPod(namespace, podName); ok {
+		if pod, ok := r.retainedPod(ctx, namespace, podName); ok {
 			return r.retainedContainerLogs(ctx, pod, containerName, opts, stdout, stderr)
 		}
 	}
