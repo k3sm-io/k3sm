@@ -13,8 +13,8 @@
 # Requires: macOS 26+ arm64, Go (brew install go), Xcode CLT (clang), gh, curl, openssl.
 set -euo pipefail
 
-KUBE_VERSION="${KUBE_VERSION:-v1.36.2}"          # latest darwin-arm64 on kwok-ci/k8s
-KUBE_PINNED_VERSION=v1.36.2
+KUBE_PINNED_VERSION=v1.36.2                      # latest darwin-arm64 on kwok-ci/k8s; the pins below are for it
+KUBE_VERSION="${KUBE_VERSION:-$KUBE_PINNED_VERSION}"
 KINE_VERSION="${KINE_VERSION:-v1.14.2}"
 WORKDIR="${K3SM_SPIKE_WORKDIR:-/tmp/k3sm-spike}"
 APISERVER_PORT="${APISERVER_PORT:-6444}"         # NOT 6443 — Docker Desktop's k8s squats on 6443
@@ -41,7 +41,8 @@ esac
 # kwok-ci/k8s publishes no checksums file for its releases (none among the
 # assets, none in the release notes), so each digest is the `digest` field the
 # GitHub release-asset API reports for the uploaded asset
-# (GET /repos/kwok-ci/k8s/releases/tags/v1.36.2-kwok.0-darwin-arm64): GitHub's
+# (GET /repos/kwok-ci/k8s/releases/tags/v1.36.2-kwok.0-darwin-arm64, read on
+# 2026-10-13; the release was published 2026-06-13): GitHub's
 # own hash of the bytes it serves, NOT a vendor-signed checksum. It binds every
 # run to the bytes uploaded at release time; it cannot vouch for those bytes.
 # Another KUBE_VERSION must supply all four K3SM_SPIKE_*_SHA256 overrides, or
@@ -70,15 +71,28 @@ kube_pin() {
   esac
 }
 
-echo "==> work dir: $WORKDIR"; mkdir -p "$BIN"; cd "$WORKDIR"; down || true
+# owned_dir DIR — refuse a directory that is a symlink or not owned by us: the
+# verified binaries are staged, signed and run from here.
+owned_dir() {
+  if [ -L "$1" ] || [ ! -d "$1" ] || [ "$(stat -f %u "$1")" != "$(id -u)" ]; then
+    echo "refusing $1: a symlink, not a directory, or not owned by uid $(id -u)"; exit 1
+  fi
+}
+
+echo "==> work dir: $WORKDIR"; mkdir -p "$BIN"; owned_dir "$WORKDIR"; owned_dir "$BIN"
+cd "$WORKDIR"; down || true
 
 # 1. control-plane binaries — prebuilt darwin/arm64 (upstream refuses to ship these: k/k#118359).
 # Each asset is downloaded by name into a private staging dir and kept there
 # UNSIGNED: codesign -f rewrites the Mach-O, so the pin can only ever be checked
-# against the staged copy. The staged copy is re-verified on EVERY run (a warm
-# cache included) before it is copied into $BIN and signed there.
+# before signing. The staged copy is re-verified on EVERY run (a warm cache
+# included); it is then copied once into a private temp file in $BIN, which is
+# verified AGAIN (closing the window between the first check and the copy),
+# signed, and renamed over $BIN/$asset. A signed Mach-O is never overwritten in
+# place; the temp file is removed on any failure.
 STAGE="$WORKDIR/stage"
-mkdir -m 0700 -p "$STAGE"; chmod 0700 "$STAGE"
+[ -L "$STAGE" ] && { echo "refusing $STAGE: a symlink"; exit 1; }
+mkdir -m 0700 -p "$STAGE"; owned_dir "$STAGE"; chmod 0700 "$STAGE"
 KUBE_TAG="${KUBE_VERSION}-kwok.0-darwin-arm64"
 for asset in kube-apiserver kube-controller-manager kube-scheduler kubectl; do
   want=$(kube_pin "$asset")
@@ -89,11 +103,14 @@ for asset in kube-apiserver kube-controller-manager kube-scheduler kubectl; do
   fi
   printf '%s  %s\n' "$want" "$STAGE/$asset" | shasum -a 256 -c - >/dev/null \
     || { echo "sha256 mismatch for $asset (pinned $want); removed the staged copy"; rm -f "$STAGE/$asset"; exit 1; }
-  rm -f "$BIN/$asset"
-  cp "$STAGE/$asset" "$BIN/$asset"
-  chmod 0755 "$BIN/$asset"
+  tmp=$(mktemp "$BIN/.$asset.XXXXXX") || { echo "mktemp in $BIN failed for $asset"; exit 1; }
+  cp "$STAGE/$asset" "$tmp" || { rm -f "$tmp"; echo "copy of $asset failed"; exit 1; }
+  printf '%s  %s\n' "$want" "$tmp" | shasum -a 256 -c - >/dev/null \
+    || { rm -f "$tmp"; echo "sha256 mismatch for the $asset copy (pinned $want)"; exit 1; }
+  chmod 0755 "$tmp" || { rm -f "$tmp"; echo "chmod of $asset failed"; exit 1; }
   # arm64 Mach-O must be at least ad-hoc signed to exec — the same codesign-on-pull k3sm will use.
-  codesign -s - -f "$BIN/$asset" >/dev/null 2>&1 || true
+  codesign -s - -f "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "ad-hoc codesign of $asset failed"; exit 1; }
+  mv -f "$tmp" "$BIN/$asset" || { rm -f "$tmp"; echo "install of $asset failed"; exit 1; }
 done
 
 # 2. kine — REQUIRES CGO (mattn/go-sqlite3). The no-cgo build *disables* sqlite. (Spike finding.)
