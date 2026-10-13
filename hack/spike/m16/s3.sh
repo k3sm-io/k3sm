@@ -355,7 +355,7 @@ export UV_CACHE_DIR="$PREFIX/cache" UV_PYTHON_INSTALL_DIR="$PREFIX/pyinstall" HF
 export PATH="$PREFIX/bin:$PATH"
 spike_venv "$PREFIX/venv-metal" "s3.5 control"
 VM="$PREFIX/venv-metal/bin/python"
-if ! spike_pip "$VM" vllm-metal; then
+if ! spike_pip "$VM" "vllm-metal==0.1.0"; then
   recorded "s3.5 control  the alternative engine did not install on this rig — recorded, not gating: it is the negative space around the engine choice, never a criterion"
   exit 0
 fi
@@ -365,8 +365,11 @@ fi
 SERVER="$PREFIX/venv-metal/bin/vllm-metal"
 [ -x "$SERVER" ] || { recorded "s3.5 control  the alternative engine installed without its vllm-metal console script — recorded, not gating"; exit 0; }
 MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
-nohup "$SERVER" --model "$MP" --port 8103 > "$W/metal.log" 2>&1 &
+nohup "$SERVER" --model "$MP" --host 127.0.0.1 --port 8103 > "$W/metal.log" 2>&1 &
 PID=$!
+# the control never outlives the payload, interrupted or not; a server that already
+# exited makes kill non-zero, which must not become the payload's status
+trap 'kill "$PID" 2>/dev/null || true' EXIT
 UP=no
 for i in $(seq 1 60); do
   curl -fsS -m 3 http://127.0.0.1:8103/v1/models >/dev/null 2>&1 && { UP=yes; break; }
@@ -378,10 +381,6 @@ if [ "$UP" = yes ] && [ -r "$PREFIX/s0/load.py" ]; then
 else
   recorded "s3.5 control  the alternative engine did not serve on this rig (see $W/metal.log) — recorded, not gating"
 fi
-# A server that already exited makes kill non-zero, and the payload's last status is its
-# exit status: the control is recorded, never failed, so neither may turn into a FAIL.
-kill "$PID" 2>/dev/null || true
-exit 0
 EOF
 
 spike_verdict "$RUNG"
