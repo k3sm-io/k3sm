@@ -96,6 +96,21 @@ func (f *lanFakeSys) RemoveAll(path string) error {
 
 func (f *lanFakeSys) ReadStopMarker(path string) ([]byte, error) { return f.ReadFile(path) }
 
+// Owner describes every file the fake holds as WriteRootOnlyFile leaves it:
+// a root-owned regular file at its written mode.
+func (f *lanFakeSys) Owner(path string) (install.OwnedEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.files[path]; !ok {
+		return install.OwnedEntry{}, fmt.Errorf("lstat %s: %w", path, fs.ErrNotExist)
+	}
+	mode, ok := f.modes[path]
+	if !ok {
+		mode = 0o644
+	}
+	return install.OwnedEntry{Path: path, Mode: mode, Kind: install.EntryRegular}, nil
+}
+
 func (f *lanFakeSys) LaunchctlServicePID(string) (int, error) {
 	if !f.running {
 		return 0, errors.New("not loaded")
@@ -106,7 +121,7 @@ func (f *lanFakeSys) LaunchctlServicePID(string) (int, error) {
 // recordedLAN reads the record back.
 func (f *lanFakeSys) recordedLAN(t *testing.T, path string) (install.LAN, bool) {
 	t.Helper()
-	rec, present, err := install.ReadNetworkRecord(f.ReadFile, path)
+	rec, present, err := install.ReadNetworkRecord(install.SystemNetworkRecordReader(f), path)
 	if err != nil {
 		t.Fatalf("read the record: %v", err)
 	}
@@ -116,12 +131,14 @@ func (f *lanFakeSys) recordedLAN(t *testing.T, path string) (install.LAN, bool) 
 // fakeFamily records every set it is asked to move to, and can refuse one
 // LAN state.
 type fakeFamily struct {
-	fam     string
-	failOn  install.LAN
-	mu      sync.Mutex
-	current []netip.Addr
-	ports   []netip.Addr
-	events  []string
+	fam    string
+	failOn install.LAN
+	// commitFailOn makes the commit (not the prepare) of that state fail.
+	commitFailOn install.LAN
+	mu           sync.Mutex
+	current      []netip.Addr
+	ports        []netip.Addr
+	events       []string
 }
 
 func (f *fakeFamily) name() string { return f.fam }
@@ -138,6 +155,10 @@ func (f *fakeFamily) prepare(_ context.Context, sets lanSets) (lanStep, error) {
 		commit: func() error {
 			f.mu.Lock()
 			defer f.mu.Unlock()
+			if f.commitFailOn == sets.lan {
+				f.events = append(f.events, "commit-failed:"+string(sets.lan))
+				return errors.New("the hoster abandoned the swap")
+			}
 			f.current, f.ports = sets.listeners, sets.nodePorts
 			f.events = append(f.events, "commit:"+string(sets.lan))
 			return nil
@@ -165,6 +186,9 @@ var (
 // lanRig is a daemon-side switch over a fake filesystem plus the CLI
 // environment that drives it: Signal runs the daemon's apply, as SIGHUP does.
 type lanRig struct {
+	// forged, when set, is what the socket lister reports instead of the
+	// sockets the daemon's state implies.
+	forged []netip.AddrPort
 	sys    *lanFakeSys
 	sw     *lanSwitch
 	env    networkEnv
@@ -186,13 +210,11 @@ func newLANRig(t *testing.T, role install.Role) *lanRig {
 	sw := &lanSwitch{
 		recordPath:  record,
 		appliedPath: install.NetworkAppliedPath(dataRoot, role),
-		readFile:    sys.ReadFile,
+		readRecord:  install.SystemNetworkRecordReader(sys),
 		writeFile:   func(p string, b []byte) error { sys.put(p, b); return nil },
-		hostAddrs: func() ([]netip.Addr, error) {
-			return []netip.Addr{netip.MustParseAddr("192.168.1.20"), netip.MustParseAddr("127.0.0.1")}, nil
-		},
-		log:  slog.New(slog.DiscardHandler),
-		node: lanNode,
+		hostAddrs:   lanRigHost,
+		log:         slog.New(slog.DiscardHandler),
+		node:        lanNode,
 	}
 	sw.load()
 	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
@@ -210,13 +232,42 @@ func newLANRig(t *testing.T, role install.Role) *lanRig {
 			_ = sw.apply(ctx)
 			return nil
 		},
-		Restart: func(context.Context) error { return errors.New("no restart expected") },
-		Wait:    2 * time.Second,
-		Poll:    time.Millisecond,
-		Stdout:  out,
-		Stderr:  errOut,
+		Restart:    func(context.Context) error { return errors.New("no restart expected") },
+		ReadRecord: install.SystemNetworkRecordReader(sys),
+		Sockets: func(context.Context, int) ([]netip.AddrPort, error) {
+			if rig.forged != nil {
+				return rig.forged, nil
+			}
+			return socketsFor(rig.sw.state(), role), nil
+		},
+		HostAddrs: lanRigHost,
+		NodeArgs:  func(install.Role) ([]string, error) { return nil, nil },
+		Wait:      2 * time.Second,
+		Poll:      time.Millisecond,
+		Stdout:    out,
+		Stderr:    errOut,
 	}
 	return rig
+}
+
+// lanRigHost is the rig Mac's interface addresses: a Wi-Fi address,
+// loopback and the mesh address on its utun.
+func lanRigHost() ([]netip.Addr, error) {
+	return []netip.Addr{netip.MustParseAddr("192.168.1.20"), netip.MustParseAddr("127.0.0.1"), lanNode}, nil
+}
+
+// socketsFor is what a node daemon of role in state lan listens on: one
+// NodePort, the kubelet API on the node address and, on a server, the join
+// port on every interface.
+func socketsFor(lan install.LAN, role install.Role) []netip.AddrPort {
+	socks := []netip.AddrPort{netip.AddrPortFrom(lanNode, 10250)}
+	if role != install.RoleAgent {
+		socks = append(socks, netip.MustParseAddrPort("0.0.0.0:9345"))
+	}
+	if lan == install.LANOff {
+		return append(socks, netip.MustParseAddrPort("127.0.0.1:30090"), netip.AddrPortFrom(lanNode, 30090))
+	}
+	return append(socks, netip.MustParseAddrPort("0.0.0.0:30090"))
 }
 
 func (r *lanRig) run(args ...string) int {
@@ -373,7 +424,7 @@ func TestNetworkLanToggle(t *testing.T) {
 		if code := rig.run("lan", "status"); code != 0 {
 			t.Fatalf("status exit %d: %s", code, rig.errOut)
 		}
-		for _, want := range []string{"LAN access is off", "Covers: nodeports, loadbalancers, ingress", "Always on: apiserver, join, mesh"} {
+		for _, want := range []string{"Recorded: LAN access is off", "Covers: nodeports, loadbalancers, ingress", "Always on: apiserver, join, mesh", "Applied: the node daemon reports LAN access off"} {
 			if !strings.Contains(rig.out.String(), want) {
 				t.Errorf("status lacks %q:\n%s", want, rig.out)
 			}
@@ -616,6 +667,139 @@ func TestNetworkLanToggle(t *testing.T) {
 		}
 	})
 
+	t.Run("a forged report is not proof: the sockets decide", func(t *testing.T) {
+		rig := newLANRig(t, install.RoleServer)
+		rig.sys.put(rig.record, mustRecord(t, install.LANOn))
+		// The daemon reports off, but its NodePort still listens on every
+		// interface.
+		rig.forged = []netip.AddrPort{netip.MustParseAddrPort("0.0.0.0:30090"), netip.AddrPortFrom(lanNode, 10250)}
+		if code := rig.run("lan", "off"); code != exitLifecycleFailed {
+			t.Fatalf("exit %d, want %d: %s", code, exitLifecycleFailed, rig.errOut)
+		}
+		for _, want := range []string{"listening sockets do not match", "port 30090 listens on every interface", "stays on"} {
+			if !strings.Contains(rig.errOut.String(), want) {
+				t.Errorf("the error lacks %q: %s", want, rig.errOut)
+			}
+		}
+		if lan, _ := rig.sys.recordedLAN(t, rig.record); lan != install.LANOn {
+			t.Errorf("record left at %s, want on restored", lan)
+		}
+		if rig.sw.state() != install.LANOn {
+			t.Errorf("daemon state %s, want on re-applied", rig.sw.state())
+		}
+	})
+
+	t.Run("a family that fails to commit fails the apply", func(t *testing.T) {
+		rig := newLANRig(t, install.RoleServer)
+		rig.sys.put(rig.record, mustRecord(t, install.LANOn))
+		ok1, bad, ok2 := &fakeFamily{fam: "nodeports"}, &fakeFamily{fam: "loadbalancers", commitFailOn: install.LANOff}, &fakeFamily{fam: "ingress"}
+		for _, f := range []*fakeFamily{ok1, bad, ok2} {
+			if err := rig.sw.attach("", "", func(lanSets) (lanFamily, error) { return f, nil }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rig.sys.put(rig.record, mustRecord(t, install.LANOff))
+		if err := rig.sw.apply(context.Background()); err == nil || !strings.Contains(err.Error(), "loadbalancers did not commit") {
+			t.Fatalf("apply = %v, want the failed commit reported", err)
+		}
+		if rig.sw.state() != install.LANOn {
+			t.Errorf("state advanced to %s past a failed commit", rig.sw.state())
+		}
+		data, _ := rig.sys.ReadFile(install.NetworkAppliedPath(rig.env.DataRoot, install.RoleServer))
+		a, err := install.DecodeNetworkApplied(data)
+		if err != nil || a.Error == "" || a.LAN != install.LANOn {
+			t.Errorf("applied report = %+v, %v; want lan on with the error", a, err)
+		}
+		if code := rig.run("lan", "status"); code != 0 || !strings.Contains(rig.out.String(), "Its last change was refused") {
+			t.Errorf("status (exit %d) does not show the refusal:\n%s", code, rig.out)
+		}
+		// Through the verb: a failure, and on is restored on every family.
+		rig.sys.put(rig.record, mustRecord(t, install.LANOn))
+		if code := rig.run("lan", "off"); code != exitLifecycleFailed {
+			t.Fatalf("lan off with a failing commit: exit %d", code)
+		}
+		if lan, _ := rig.sys.recordedLAN(t, rig.record); lan != install.LANOn {
+			t.Errorf("record left at %s, want on", lan)
+		}
+		if !slices.Equal(ok1.current, lanWildcard) || ok1.ports != nil {
+			t.Errorf("a family that committed off was not brought back to on: %v", ok1.ports)
+		}
+	})
+
+	t.Run("a restore that fails is loud and exits 4", func(t *testing.T) {
+		rig := newLANRig(t, install.RoleServer)
+		rig.sys.put(rig.record, mustRecord(t, install.LANOn))
+		rig.forged = []netip.AddrPort{netip.MustParseAddrPort("0.0.0.0:30090")}
+		calls := 0
+		apply := rig.env.Signal
+		rig.env.Signal = func(ctx context.Context, label string) error {
+			calls++
+			if calls > 1 {
+				return errors.New("launchctl: no such process")
+			}
+			return apply(ctx, label)
+		}
+		if code := rig.run("lan", "off"); code != exitNetworkRestoreFailed {
+			t.Fatalf("exit %d, want %d: %s", code, exitNetworkRestoreFailed, rig.errOut)
+		}
+		if !strings.Contains(rig.errOut.String(), "COULD NOT BE RESTORED") {
+			t.Errorf("the restore failure is not loud: %s", rig.errOut)
+		}
+	})
+
+	t.Run("status says when on is only the no-record default", func(t *testing.T) {
+		rig := newLANRig(t, install.RoleAgent)
+		if code := rig.run("lan", "status"); code != 0 {
+			t.Fatalf("exit %d: %s", code, rig.errOut)
+		}
+		for _, want := range []string{"Recorded: LAN access is on", "LAN access is on because no setting is recorded", "Covers: nodeports, loadbalancers\n", "Applied: unknown"} {
+			if !strings.Contains(rig.out.String(), want) {
+				t.Errorf("status lacks %q:\n%s", want, rig.out)
+			}
+		}
+	})
+
+	t.Run("the socket check", func(t *testing.T) {
+		host := []netip.Addr{netip.MustParseAddr("192.168.1.20"), netip.MustParseAddr("127.0.0.1"), lanNode, netip.MustParseAddr("192.168.64.1")}
+		ap := netip.MustParseAddrPort
+		cases := []struct {
+			name  string
+			want  install.LAN
+			role  install.Role
+			args  []string
+			socks []netip.AddrPort
+			ok    bool
+		}{
+			{"off: local listeners, kubelet, ClusterIP, the join wildcard", install.LANOff, install.RoleServer, nil,
+				[]netip.AddrPort{ap("127.0.0.1:30090"), ap("100.64.0.1:30090"), ap("100.64.0.1:10250"), ap("10.43.0.10:53"), ap("0.0.0.0:9345"), ap("100.64.0.1:443")}, true},
+			{"off: a wildcard NodePort", install.LANOff, install.RoleServer, nil, []netip.AddrPort{ap("0.0.0.0:30090")}, false},
+			{"off: a LoadBalancer on the Wi-Fi address", install.LANOff, install.RoleServer, nil, []netip.AddrPort{ap("192.168.1.20:8080")}, false},
+			{"off: the join wildcard on a worker is not allowed", install.LANOff, install.RoleAgent, nil, []netip.AddrPort{ap("0.0.0.0:9345")}, false},
+			{"off: the vm NAT gateway relay is not the LAN", install.LANOff, install.RoleServer, []string{"--registry-port", "5000"}, []netip.AddrPort{ap("192.168.64.1:5000")}, true},
+			{"on: wildcard NodePort, LoadBalancer and ingress", install.LANOn, install.RoleServer, nil,
+				[]netip.AddrPort{ap("0.0.0.0:30090"), ap("0.0.0.0:8080"), ap("0.0.0.0:80"), ap("0.0.0.0:443"), ap("100.64.0.1:10250"), ap("10.43.0.1:443")}, true},
+			{"on: a NodePort left on the local set", install.LANOn, install.RoleServer, nil, []netip.AddrPort{ap("127.0.0.1:30090"), ap("100.64.0.1:30090")}, false},
+			{"on: an ingress port left on the node address", install.LANOn, install.RoleServer, nil, []netip.AddrPort{ap("100.64.0.1:443")}, false},
+			{"on: a LoadBalancer left on loopback", install.LANOn, install.RoleAgent, nil, []netip.AddrPort{ap("127.0.0.1:8080"), ap("100.64.0.1:8080")}, false},
+			{"on: an explicit --nodeport-addresses narrows NodePorts", install.LANOn, install.RoleAgent, []string{"--nodeport-addresses", "local"}, []netip.AddrPort{ap("127.0.0.1:30090")}, true},
+			{"on: the registry on loopback is not covered", install.LANOn, install.RoleServer, []string{"--registry-port", "5000"}, []netip.AddrPort{ap("127.0.0.1:5000")}, true},
+		}
+		for _, tc := range cases {
+			err := verifyLANSockets(lanPolicyFor(tc.want, tc.role, tc.args, host), tc.socks)
+			if (err == nil) != tc.ok {
+				t.Errorf("%s: err = %v, want ok=%v", tc.name, err, tc.ok)
+			}
+			if err != nil && !errors.Is(err, errLANMismatch) {
+				t.Errorf("%s: err = %v, want errLANMismatch", tc.name, err)
+			}
+		}
+		socks, err := parseLsofListeners([]byte("p4242\nf7\nn*:30090\nf8\nn127.0.0.1:8080\nf9\nn[::1]:6060\nf10\nn100.64.0.1:10250\n"))
+		want := []netip.AddrPort{ap("0.0.0.0:30090"), ap("127.0.0.1:8080"), ap("[::1]:6060"), ap("100.64.0.1:10250")}
+		if err != nil || !slices.Equal(socks, want) {
+			t.Errorf("parseLsofListeners = %v, %v; want %v", socks, err, want)
+		}
+	})
+
 	t.Run("status JSON gains an additive network block", func(t *testing.T) {
 		r := status.Report{SchemaVersion: status.SchemaVersion, Role: install.RoleServer}
 		plain, err := json.Marshal(r)
@@ -630,7 +814,7 @@ func TestNetworkLanToggle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Contains(withBlock, []byte(`"network":{"lan":"off","covers":["nodeports","loadbalancers","ingress"],"alwaysOn":["apiserver","join","mesh"]}`)) {
+		if !bytes.Contains(withBlock, []byte(`"network":{"lan":"off","recorded":false,"covers":["nodeports","loadbalancers","ingress"],"alwaysOn":["apiserver","join","mesh"]}`)) {
 			t.Errorf("network block = %s", withBlock)
 		}
 		// The shipped goldens carry no network key: the contract is additive.

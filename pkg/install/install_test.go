@@ -1862,7 +1862,7 @@ func TestInstallOrchestration(t *testing.T) {
 		// again, before the plist that will not survive the next uninstall.
 		"WriteServerArgsRecord:" + dataroot.DefaultServerArgsRecordPath,
 		// The LAN switch: none recorded, so it is written, beside the record.
-		"ReadFile:" + DefaultNetworkRecordPath,
+		"Owner:" + DefaultNetworkRecordPath,
 		"WriteRootOnlyFile:" + DefaultNetworkRecordPath + ":0644",
 		// The trust anchor for the endpoint the admin kubeconfig will name, read
 		// AFTER the arguments are resolved (they decide the posture, so they decide

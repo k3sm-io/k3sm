@@ -23,9 +23,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"k3sm.io/k3sm/pkg/version"
@@ -52,6 +55,10 @@ const (
 	LANFamilyLoadBalancers = "loadbalancers"
 	LANFamilyIngress       = "ingress"
 )
+
+// JoinBootstrapPort is the worker join port a server listens on, on every
+// interface, whatever the LAN switch says.
+const JoinBootstrapPort = joinBootstrapPort
 
 // The listeners that face the network whatever the switch says.
 const (
@@ -156,13 +163,24 @@ func EncodeNetworkRecord(r NetworkRecord) ([]byte, error) {
 	return append(data, '\n'), nil
 }
 
-// DecodeNetworkRecord parses a record, refusing an unknown version or value
-// with ErrNetworkRecord.
+// MaxNetworkRecordBytes bounds a record read. A real record is a few hundred
+// bytes; anything larger is not one k3sm wrote.
+const MaxNetworkRecordBytes = 4096
+
+// DecodeNetworkRecord parses a record, refusing an unknown version or value,
+// an oversized record, and anything after the one JSON value, with
+// ErrNetworkRecord.
 func DecodeNetworkRecord(data []byte) (NetworkRecord, error) {
+	if len(data) > MaxNetworkRecordBytes {
+		return NetworkRecord{}, fmt.Errorf("%w: larger than %d bytes", ErrNetworkRecord, MaxNetworkRecordBytes)
+	}
 	var r NetworkRecord
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&r); err != nil {
 		return NetworkRecord{}, fmt.Errorf("%w: %v", ErrNetworkRecord, err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return NetworkRecord{}, fmt.Errorf("%w: data after the record", ErrNetworkRecord)
 	}
 	if r.Version != NetworkRecordVersion {
 		return NetworkRecord{}, fmt.Errorf("%w: unknown version %d, this k3sm understands %d", ErrNetworkRecord, r.Version, NetworkRecordVersion)
@@ -175,19 +193,108 @@ func DecodeNetworkRecord(data []byte) (NetworkRecord, error) {
 	return r, nil
 }
 
+// NetworkRecordFile is a record file as read: its bytes (at most
+// MaxNetworkRecordBytes+1 of them) and what an lstat says about it.
+type NetworkRecordFile struct {
+	Data []byte
+	UID  int
+	Mode fs.FileMode
+	Kind EntryKind
+}
+
+// NetworkRecordReader reads the record file at path. A missing file has
+// ReadFile's fs.ErrNotExist contract.
+type NetworkRecordReader func(path string) (NetworkRecordFile, error)
+
+// ReadNetworkRecordFile is the production NetworkRecordReader for a reader
+// with no install seam (the node daemon, `k3sm status`, the network verb):
+// an lstat that refuses to follow a symlink, an O_NOFOLLOW open, and a read
+// bounded to one byte past MaxNetworkRecordBytes.
+func ReadNetworkRecordFile(path string) (NetworkRecordFile, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return NetworkRecordFile{}, err
+	}
+	out := NetworkRecordFile{Mode: fi.Mode().Perm(), Kind: kindOf(fi.Mode())}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		out.UID = int(st.Uid)
+	} else {
+		out.UID = -1
+	}
+	if out.Kind != EntryRegular {
+		return out, nil
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return NetworkRecordFile{}, err
+	}
+	defer f.Close()
+	out.Data, err = io.ReadAll(io.LimitReader(f, MaxNetworkRecordBytes+1))
+	if err != nil {
+		return NetworkRecordFile{}, err
+	}
+	return out, nil
+}
+
+// kindOf classifies a file mode.
+func kindOf(m fs.FileMode) EntryKind {
+	switch {
+	case m.IsRegular():
+		return EntryRegular
+	case m.IsDir():
+		return EntryDir
+	case m&fs.ModeSymlink != 0:
+		return EntrySymlink
+	}
+	return EntryOther
+}
+
+// SystemNetworkRecordReader reads the record through an install System: the
+// lstat-style Owner first, then the bytes. For the root callers that already
+// hold one (install, the network verb's tests).
+func SystemNetworkRecordReader(sys System) NetworkRecordReader {
+	return func(path string) (NetworkRecordFile, error) {
+		e, err := sys.Owner(path)
+		if err != nil {
+			return NetworkRecordFile{}, err
+		}
+		out := NetworkRecordFile{UID: e.UID, Mode: e.Mode.Perm(), Kind: e.Kind}
+		if e.Kind != EntryRegular {
+			return out, nil
+		}
+		if out.Data, err = sys.ReadFile(path); err != nil {
+			return NetworkRecordFile{}, err
+		}
+		return out, nil
+	}
+}
+
 // ReadNetworkRecord reads the record at path through read. A missing record
 // is (record of LANOn, false, nil): a node installed before the switch
 // existed served every interface, and keeps doing so until someone decides
-// otherwise. Any other read failure or an unusable record is an error.
-func ReadNetworkRecord(read func(string) ([]byte, error), path string) (NetworkRecord, bool, error) {
-	data, err := read(path)
+// otherwise.
+//
+// A record is trusted only when it is a regular file (never a symlink) owned
+// by root and writable by no one else, and decodes as exactly one record of
+// at most MaxNetworkRecordBytes. Anything else is (present, ErrNetworkRecord):
+// the daemon then serves off, the narrower exposure.
+func ReadNetworkRecord(read NetworkRecordReader, path string) (NetworkRecord, bool, error) {
+	f, err := read(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return NetworkRecord{Version: NetworkRecordVersion, LAN: LANOn}, false, nil
 	}
 	if err != nil {
 		return NetworkRecord{}, false, fmt.Errorf("read the network record %s: %w", path, err)
 	}
-	r, err := DecodeNetworkRecord(data)
+	switch {
+	case f.Kind != EntryRegular:
+		return NetworkRecord{}, true, fmt.Errorf("network record %s: %w: not a regular file", path, ErrNetworkRecord)
+	case f.UID != 0:
+		return NetworkRecord{}, true, fmt.Errorf("network record %s: %w: owned by uid %d, not root", path, ErrNetworkRecord, f.UID)
+	case f.Mode&0o022 != 0:
+		return NetworkRecord{}, true, fmt.Errorf("network record %s: %w: mode %#o lets others write it", path, ErrNetworkRecord, f.Mode)
+	}
+	r, err := DecodeNetworkRecord(f.Data)
 	if err != nil {
 		return NetworkRecord{}, true, fmt.Errorf("network record %s: %w", path, err)
 	}
@@ -283,7 +390,7 @@ func priorInstall(sys System, cfg Config) (bool, error) {
 // DecideInstallLAN). An unusable record on disk is refused with
 // ErrNetworkRecord unless --lan replaces it.
 func writeInstallNetworkRecord(sys System, cfg Config, prior bool) error {
-	rec, present, err := ReadNetworkRecord(sys.ReadFile, cfg.NetworkRecord)
+	rec, present, err := ReadNetworkRecord(SystemNetworkRecordReader(sys), cfg.NetworkRecord)
 	if err != nil && cfg.LAN == nil {
 		return fmt.Errorf("install: %w (pass --lan on or --lan off to replace it)", err)
 	}
@@ -297,4 +404,17 @@ func writeInstallNetworkRecord(sys System, cfg Config, prior bool) error {
 	}
 	cfg.Logger.Info("LAN access recorded", "lan", string(lan), "record", cfg.NetworkRecord, "explicit", cfg.LAN != nil, "earlier_install", prior)
 	return nil
+}
+
+// InstalledNodeArgs returns the operator arguments the installed node daemon
+// of role runs with, from its plist (or, with no plist, its arguments
+// record): the same reads a reinstall makes. The network verb reads the
+// ports and the --nodeport-addresses it checks the daemon's listeners
+// against from them.
+func InstalledNodeArgs(sys System, role Role) ([]string, error) {
+	cfg := Config{Role: role}.withDefaults()
+	if role == RoleAgent {
+		return installedAgentArgs(sys, cfg)
+	}
+	return InstalledServerArgs(sys.ReadFile, cfg.plistPath(ServerLabel), cfg.ServerArgsRecord)
 }

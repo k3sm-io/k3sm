@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,6 +69,7 @@ func TestInstallRecordsLANAccess(t *testing.T) {
 			}
 			if tc.existing != "" {
 				f.putFile(record, []byte(tc.existing))
+				putRootRecordOwner(f, record)
 			}
 			err := Install(context.Background(), f, cfg)
 			if tc.wantErr != nil {
@@ -79,7 +81,8 @@ func TestInstallRecordsLANAccess(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Install: %v", err)
 			}
-			rec, present, err := ReadNetworkRecord(f.ReadFile, record)
+			putRootRecordOwner(f, record)
+			rec, present, err := ReadNetworkRecord(SystemNetworkRecordReader(f), record)
 			if err != nil || !present {
 				t.Fatalf("read back the record: present=%v err=%v", present, err)
 			}
@@ -103,9 +106,79 @@ func TestInstallRecordsLANAccess(t *testing.T) {
 
 	t.Run("an absent record reads as on", func(t *testing.T) {
 		t.Parallel()
-		rec, present, err := ReadNetworkRecord(func(string) ([]byte, error) { return nil, fs.ErrNotExist }, "/nonexistent")
+		absent := func(string) (NetworkRecordFile, error) { return NetworkRecordFile{}, fs.ErrNotExist }
+		rec, present, err := ReadNetworkRecord(absent, "/nonexistent")
 		if err != nil || present || rec.LAN != LANOn {
 			t.Fatalf("absent record = %+v present=%v err=%v, want on, absent, no error", rec, present, err)
+		}
+	})
+}
+
+// putRootRecordOwner describes path to the fake's lstat as a root-owned 0644
+// regular file, the shape WriteNetworkRecord leaves.
+func putRootRecordOwner(f *fakeSystem, path string) {
+	if f.owners == nil {
+		f.owners = map[string]OwnedEntry{}
+	}
+	f.owners[path] = OwnedEntry{Path: path, UID: 0, GID: 0, Mode: 0o644, Kind: EntryRegular}
+}
+
+// TestNetworkRecordTrust pins what a record must be before anyone acts on
+// it: a regular file, owned by root, writable by no one else, at most
+// MaxNetworkRecordBytes, exactly one JSON value. Anything else is unusable
+// (ErrNetworkRecord), which the node daemon serves as off.
+func TestNetworkRecordTrust(t *testing.T) {
+	t.Parallel()
+	good := []byte(`{"version":1,"lan":"on","serial":"s"}`)
+	file := func(mut func(*NetworkRecordFile)) NetworkRecordReader {
+		return func(string) (NetworkRecordFile, error) {
+			f := NetworkRecordFile{Data: good, UID: 0, Mode: 0o644, Kind: EntryRegular}
+			mut(&f)
+			return f, nil
+		}
+	}
+	if rec, present, err := ReadNetworkRecord(file(func(*NetworkRecordFile) {}), "r"); err != nil || !present || rec.LAN != LANOn {
+		t.Fatalf("a good record = %+v, %v, %v", rec, present, err)
+	}
+	for name, mut := range map[string]func(*NetworkRecordFile){
+		"a symlink":       func(f *NetworkRecordFile) { f.Kind = EntrySymlink; f.Data = nil },
+		"owned by a user": func(f *NetworkRecordFile) { f.UID = 501 },
+		"group-writable":  func(f *NetworkRecordFile) { f.Mode = 0o664 },
+		"world-writable":  func(f *NetworkRecordFile) { f.Mode = 0o646 },
+		"trailing data":   func(f *NetworkRecordFile) { f.Data = append(append([]byte{}, good...), []byte(` {"lan":"off"}`)...) },
+		"oversized": func(f *NetworkRecordFile) {
+			f.Data = append(append([]byte{}, good...), make([]byte, MaxNetworkRecordBytes)...)
+		},
+		"not JSON":            func(f *NetworkRecordFile) { f.Data = []byte("lan=on") },
+		"an unknown lan word": func(f *NetworkRecordFile) { f.Data = []byte(`{"version":1,"lan":"both"}`) },
+	} {
+		if _, present, err := ReadNetworkRecord(file(mut), "r"); !errors.Is(err, ErrNetworkRecord) || !present {
+			t.Errorf("%s: present=%v err=%v, want present and ErrNetworkRecord", name, present, err)
+		}
+	}
+
+	t.Run("the production reader refuses a symlink and bounds the read", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		if err := os.WriteFile(target, good, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, "link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		f, err := ReadNetworkRecordFile(link)
+		if err != nil || f.Kind != EntrySymlink || f.Data != nil {
+			t.Fatalf("symlink read = %+v, %v; want kind symlink, no data", f, err)
+		}
+		big := filepath.Join(dir, "big")
+		if err := os.WriteFile(big, make([]byte, 3*MaxNetworkRecordBytes), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f, err = ReadNetworkRecordFile(big)
+		if err != nil || len(f.Data) != MaxNetworkRecordBytes+1 {
+			t.Fatalf("big read = %d bytes, %v; want %d", len(f.Data), err, MaxNetworkRecordBytes+1)
 		}
 	})
 }

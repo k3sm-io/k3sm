@@ -80,7 +80,7 @@ type lanStep struct {
 type lanSwitch struct {
 	recordPath  string
 	appliedPath string
-	readFile    func(string) ([]byte, error)
+	readRecord  install.NetworkRecordReader
 	writeFile   func(path string, data []byte) error
 	hostAddrs   func() ([]netip.Addr, error)
 	log         *slog.Logger
@@ -101,7 +101,7 @@ func newLANSwitch(recordPath, appliedPath string, log *slog.Logger) *lanSwitch {
 	s := &lanSwitch{
 		recordPath:  recordPath,
 		appliedPath: appliedPath,
-		readFile:    os.ReadFile,
+		readRecord:  install.ReadNetworkRecordFile,
 		writeFile:   func(path string, data []byte) error { return atomicfile.Replace(path, data, 0o644) },
 		hostAddrs:   nodePortHostAddrs,
 		log:         log,
@@ -112,7 +112,7 @@ func newLANSwitch(recordPath, appliedPath string, log *slog.Logger) *lanSwitch {
 
 // load reads the record into the switch's state (startup only).
 func (s *lanSwitch) load() {
-	rec, _, err := install.ReadNetworkRecord(s.readFile, s.recordPath)
+	rec, _, err := install.ReadNetworkRecord(s.readRecord, s.recordPath)
 	if err != nil {
 		s.log.Error("the LAN access record cannot be used; serving workload listeners on this Mac and the mesh only until it is fixed (sudo k3sm network lan on|off)", "err", err)
 		s.lan = install.LANOff
@@ -194,7 +194,7 @@ func parseNodeAddr(node string) netip.Addr {
 func (s *lanSwitch) apply(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, _, err := install.ReadNetworkRecord(s.readFile, s.recordPath)
+	rec, _, err := install.ReadNetworkRecord(s.readRecord, s.recordPath)
 	if err != nil {
 		s.report(rec.Serial, err)
 		return err
@@ -218,10 +218,20 @@ func (s *lanSwitch) apply(ctx context.Context) error {
 		}
 		steps = append(steps, st)
 	}
+	// Every family is committed even after one fails, so the ones that can
+	// move do; a failed commit leaves the state in force at the OLD value and
+	// is reported, so the CLI restores the old record and the re-apply brings
+	// every family back to one state.
+	var failed []error
 	for i, st := range steps {
 		if err := st.commit(); err != nil {
-			s.log.Warn("a listener family did not take the new LAN access state", "family", s.families[i].name(), "err", err)
+			failed = append(failed, fmt.Errorf("%s did not commit: %w", s.families[i].name(), err))
 		}
+	}
+	if len(failed) > 0 {
+		err := fmt.Errorf("LAN access %s was applied only in part (the listener families may now disagree): %w", rec.LAN, errors.Join(failed...))
+		s.report(rec.Serial, err)
+		return err
 	}
 	s.lan, s.serial = rec.LAN, rec.Serial
 	s.report(rec.Serial, nil)

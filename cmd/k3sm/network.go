@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -34,7 +35,7 @@ import (
 const networkUsage = `Usage:
   sudo k3sm network lan on       answer on every network this Mac is on
   sudo k3sm network lan off      answer only on this Mac and the cluster mesh
-  k3sm network lan status        show the setting (no root needed)
+  k3sm network lan status        show the setting (the applied state needs root)
 
 LAN access decides where this node's workload listeners answer: NodePort
 Services, LoadBalancer Services and, on a server, the ingress host (80, 443).
@@ -44,9 +45,10 @@ or Ethernet reaches them. With it on they bind every interface.
 
 The change is applied live: the node daemon binds the new addresses first, then
 closes the old ones. Connections already open finish; new connections from
-the LAN are refused. If any listener cannot move, nothing changes and the
-previous setting is restored. If the daemon does not apply it live, k3sm
-restarts the node daemon in place instead (pods keep running) and says so.
+the LAN are refused. k3sm then checks the daemon's listening sockets itself.
+If any listener cannot move, or the sockets do not match, the previous setting
+is restored and checked the same way. If the daemon does not apply it live,
+k3sm restarts the node daemon in place instead (pods keep running) and says so.
 
 With LAN access off, a LoadBalancer port below 1024 is not served (macOS lets
 only root bind a specific address there), and the ingress answers on the
@@ -59,8 +61,9 @@ token) and the wireguard mesh port (it answers only cluster peers).
 New installs start with LAN access off; an existing install keeps LAN access
 on across an upgrade. 'sudo k3sm install --lan on|off' sets it at install.
 
-Exit codes: 0 done; 1 failed (the previous setting is restored); 2 usage;
-3 on/off not run as root.
+Exit codes: 0 done; 1 failed (the previous setting is restored and checked);
+2 usage; 3 on/off not run as root; 4 failed and the previous setting could not
+be restored either (check 'sudo k3sm network lan status').
 `
 
 // networkEnv is what the network verb touches, so a test can fake every
@@ -77,6 +80,17 @@ type networkEnv struct {
 	// Restart restarts the node daemon in place (k3sm restart: pods keep
 	// running).
 	Restart func(ctx context.Context) error
+	// ReadRecord reads the record file with its ownership (an lstat, a
+	// bounded read); an untrusted record is unusable.
+	ReadRecord install.NetworkRecordReader
+	// Sockets lists the TCP listening sockets of the node daemon's pid, as
+	// root (lsof). It is the proof an apply took effect; the daemon's own
+	// report is only a progress signal.
+	Sockets func(ctx context.Context, pid int) ([]netip.AddrPort, error)
+	// HostAddrs is this Mac's interface addresses.
+	HostAddrs func() ([]netip.Addr, error)
+	// NodeArgs reads the installed node daemon's operator arguments.
+	NodeArgs func(role install.Role) ([]string, error)
 	// Wait bounds how long the verb waits for the daemon's applied report;
 	// Poll is the interval it re-reads it at.
 	Wait   time.Duration
@@ -95,6 +109,10 @@ func defaultNetworkEnv(stdout, stderr io.Writer) networkEnv {
 		StopMarker: install.DefaultStopMarkerPath,
 		Geteuid:    os.Geteuid,
 		Signal:     launchctlHUP,
+		ReadRecord: install.ReadNetworkRecordFile,
+		Sockets:    lsofListeners,
+		HostAddrs:  nodePortHostAddrs,
+		NodeArgs:   func(role install.Role) ([]string, error) { return install.InstalledNodeArgs(sys, role) },
 		Restart: func(ctx context.Context) error {
 			return install.Restart(ctx, sys, lifecycleConfig(sys, stderr), install.ActorUser, "k3sm network lan")
 		},
@@ -139,6 +157,9 @@ func runNetworkEnv(ctx context.Context, args []string, env networkEnv) int {
 		}
 		if err := setNetworkLAN(ctx, env, install.LAN(args[1])); err != nil {
 			fmt.Fprintf(env.Stderr, "k3sm network lan %s: %v\n", args[1], err)
+			if errors.Is(err, errLANRestoreFailed) {
+				return exitNetworkRestoreFailed
+			}
 			return exitLifecycleFailed
 		}
 		return 0
@@ -182,16 +203,24 @@ func lanSentence(lan install.LAN, role install.Role) string {
 	return fmt.Sprintf("LAN access is on: %s answer on every network this Mac is on", what)
 }
 
+// exitNetworkRestoreFailed is a failed change whose previous setting could not
+// be put back either: the node may be in neither state.
+const exitNetworkRestoreFailed = 4
+
+// errLANRestoreFailed marks a failed change whose restore failed too.
+var errLANRestoreFailed = errors.New("THE PREVIOUS SETTING COULD NOT BE RESTORED")
+
 // setNetworkLAN records want and has the node daemon apply it: write the
 // record atomically, signal the daemon, wait for its report naming this
-// write. A refused apply restores the previous record (and has the daemon
-// apply that); a daemon that does not answer is restarted in place.
+// write, then check the daemon's actual listening sockets. A refused apply or
+// a socket mismatch restores the previous record (and has the daemon apply
+// and prove that); a daemon that does not answer is restarted in place.
 func setNetworkLAN(ctx context.Context, env networkEnv, want install.LAN) error {
 	role, err := installedNodeRole(env.Sys)
 	if err != nil {
 		return fmt.Errorf("%w; nothing to switch (choose it at install with 'sudo k3sm install --lan %s')", err, want)
 	}
-	prev, prevPresent, prevErr := install.ReadNetworkRecord(env.Sys.ReadFile, env.RecordPath)
+	prev, prevPresent, prevErr := install.ReadNetworkRecord(env.ReadRecord, env.RecordPath)
 	rec := install.NewNetworkRecord(want, "k3sm network lan")
 	if err := install.WriteNetworkRecord(env.Sys, env.RecordPath, rec); err != nil {
 		return err
@@ -207,54 +236,90 @@ func setNetworkLAN(ctx context.Context, env networkEnv, want install.LAN) error 
 	}
 	applied, how, err := applyNetworkRecord(ctx, env, role, label, rec.Serial)
 	if err == nil && applied.Error == "" && applied.LAN == want {
-		fmt.Fprintf(env.Stdout, "%s%s.\n", lanSentence(want, role), how)
-		return nil
+		if err = verifyDaemonSockets(ctx, env, role, label, want); err == nil {
+			fmt.Fprintf(env.Stdout, "%s%s.\n", lanSentence(want, role), how)
+			return nil
+		}
 	}
 	reason := err
 	if reason == nil {
-		reason = errors.New(applied.Error)
+		reason = fmt.Errorf("it reported: %s", applied.Error)
+		if applied.Error == "" {
+			reason = fmt.Errorf("it reported LAN access %s", applied.LAN)
+		}
 	}
-	restoreNetworkRecord(ctx, env, role, label, prev, prevPresent, prevErr)
-	return fmt.Errorf("the node daemon could not apply it: %w; %s", reason, restoredSentence(prev, prevPresent, prevErr))
+	if rerr := restoreNetworkRecord(ctx, env, role, label, prev, prevPresent, prevErr); rerr != nil {
+		return fmt.Errorf("the change did not take effect: %w; and %w: %v. Check 'sudo k3sm network lan status' and set it again", reason, errLANRestoreFailed, rerr)
+	}
+	return fmt.Errorf("the change did not take effect: %w; %s", reason, restoredSentence(prev, prevPresent, prevErr))
+}
+
+// verifyDaemonSockets checks the node daemon's own TCP listening sockets
+// against want (verifyLANSockets), as root.
+func verifyDaemonSockets(ctx context.Context, env networkEnv, role install.Role, label string, want install.LAN) error {
+	pid, err := env.Sys.LaunchctlServicePID(label)
+	if err != nil {
+		return fmt.Errorf("find the node daemon's pid to check its sockets: %w", err)
+	}
+	args, err := env.NodeArgs(role)
+	if err != nil {
+		return fmt.Errorf("read the node daemon's arguments to check its sockets: %w", err)
+	}
+	host, err := env.HostAddrs()
+	if err != nil {
+		return fmt.Errorf("read this Mac's addresses to check the daemon's sockets: %w", err)
+	}
+	socks, err := env.Sockets(ctx, pid)
+	if err != nil {
+		return fmt.Errorf("list the node daemon's listening sockets: %w", err)
+	}
+	return verifyLANSockets(lanPolicyFor(want, role, args, host), socks)
 }
 
 // restoredSentence says what the failed change left in force.
 func restoredSentence(prev install.NetworkRecord, present bool, readErr error) string {
 	switch {
 	case readErr != nil:
-		return "the record it replaced was unusable, which the daemon reads as off, so off is recorded instead"
+		return "the record it replaced was unusable, which the daemon reads as off, so off is recorded and in force instead"
 	case !present:
-		return "no record is kept, so LAN access stays on"
+		return "no record is kept, so LAN access stays on (restored and checked)"
 	}
-	return fmt.Sprintf("LAN access stays %s (restored)", prev.LAN)
+	return fmt.Sprintf("LAN access stays %s (restored and checked)", prev.LAN)
 }
 
 // restoreNetworkRecord puts the previous setting back and has the daemon
-// apply it, best effort: the previous value under a fresh serial, no record
-// when there was none, or off when the previous record was unusable (what
-// the daemon made of it).
-func restoreNetworkRecord(ctx context.Context, env networkEnv, role install.Role, label string, prev install.NetworkRecord, present bool, readErr error) {
-	kick := func() error { return env.Signal(ctx, label) }
-	if present || readErr != nil {
-		lan := prev.LAN
-		if readErr != nil {
-			lan = install.LANOff
-		}
+// apply it, then checks the daemon's sockets for it: the previous value under
+// a fresh serial, no record when there was none, or off when the previous
+// record was unusable (what the daemon made of it). Any failure is returned.
+func restoreNetworkRecord(ctx context.Context, env networkEnv, role install.Role, label string, prev install.NetworkRecord, present bool, readErr error) error {
+	lan := prev.LAN
+	var serial string
+	switch {
+	case readErr != nil:
+		lan = install.LANOff
+		fallthrough
+	case present:
 		back := install.NewNetworkRecord(lan, "k3sm network lan (restore)")
 		if err := install.WriteNetworkRecord(env.Sys, env.RecordPath, back); err != nil {
-			fmt.Fprintf(env.Stderr, "k3sm network lan: could not restore the previous setting in %s: %v\n", env.RecordPath, err)
-			return
+			return fmt.Errorf("write the previous setting back to %s: %w", env.RecordPath, err)
 		}
-		if _, ok, err := waitNetworkApplied(ctx, env, role, back.Serial, kick); err != nil || !ok {
-			fmt.Fprintf(env.Stderr, "k3sm network lan: the previous setting is recorded again, but the node daemon did not confirm it (%v); check 'k3sm network lan status'\n", err)
+		serial = back.Serial
+	default:
+		lan = install.LANOn
+		if err := env.Sys.RemoveAll(env.RecordPath); err != nil {
+			return fmt.Errorf("remove the record %s again: %w", env.RecordPath, err)
 		}
-		return
 	}
-	if err := env.Sys.RemoveAll(env.RecordPath); err != nil {
-		fmt.Fprintf(env.Stderr, "k3sm network lan: could not remove the record %s again: %v\n", env.RecordPath, err)
-		return
+	a, ok, err := waitNetworkApplied(ctx, env, role, serial, func() error { return env.Signal(ctx, label) })
+	switch {
+	case err != nil:
+		return fmt.Errorf("signal the node daemon: %w", err)
+	case !ok:
+		return fmt.Errorf("the node daemon did not confirm LAN access %s within %s", lan, env.Wait)
+	case a.Error != "" || a.LAN != lan:
+		return fmt.Errorf("the node daemon reports LAN access %s (%s)", a.LAN, a.Error)
 	}
-	_ = kick()
+	return verifyDaemonSockets(ctx, env, role, label, lan)
 }
 
 // applyNetworkRecord signals the daemon and waits for its report on serial;
@@ -303,41 +368,49 @@ func waitNetworkApplied(ctx context.Context, env networkEnv, role install.Role, 
 	}
 }
 
-// networkLANStatus is `k3sm network lan status`: the recorded setting, what
-// it covers and what it does not, and (as root) what the daemon applied.
+// networkLANStatus is `k3sm network lan status`: the recorded setting (and
+// that it is the no-record default when it is), what it covers and what it
+// does not, and the state the node daemon reports applying, which only root
+// can read.
 func networkLANStatus(env networkEnv) int {
 	role, err := installedNodeRole(env.Sys)
 	if err != nil {
 		fmt.Fprintf(env.Stderr, "k3sm network lan status: %v\n", err)
 		return exitLifecycleFailed
 	}
-	rec, present, err := install.ReadNetworkRecord(env.Sys.ReadFile, env.RecordPath)
+	rec, present, err := install.ReadNetworkRecord(env.ReadRecord, env.RecordPath)
 	if err != nil {
-		fmt.Fprintf(env.Stderr, "k3sm network lan status: %v\n", err)
+		fmt.Fprintf(env.Stderr, "k3sm network lan status: %v (the node daemon serves LAN access off while the record is unusable)\n", err)
 		return exitLifecycleFailed
 	}
-	fmt.Fprintf(env.Stdout, "%s.\n", lanSentence(rec.LAN, role))
+	fmt.Fprintf(env.Stdout, "Recorded: %s.\n", lanSentence(rec.LAN, role))
 	if !present {
-		fmt.Fprintln(env.Stdout, "No setting is recorded (an install from before the switch), which is on.")
+		fmt.Fprintf(env.Stdout, "LAN access is on because no setting is recorded (an install from before the switch). Run 'sudo k3sm network lan off' to limit it.\n")
 	}
 	fmt.Fprintf(env.Stdout, "Covers: %s\n", strings.Join(install.LANCovers(role), ", "))
 	fmt.Fprintf(env.Stdout, "Always on: %s\n", strings.Join(install.LANAlwaysOn(role), ", "))
-	data, err := env.Sys.ReadFile(install.NetworkAppliedPath(env.DataRoot, role))
-	switch {
-	case err == nil:
-		a, derr := install.DecodeNetworkApplied(data)
-		if derr != nil {
-			break
-		}
-		if a.LAN != rec.LAN {
-			fmt.Fprintf(env.Stdout, "The node daemon still serves LAN access %s; run 'sudo k3sm network lan %s' to apply the setting.\n", a.LAN, rec.LAN)
-		}
-		if a.Error != "" {
-			fmt.Fprintf(env.Stdout, "Its last change was refused: %s\n", a.Error)
-		}
-	case errors.Is(err, fs.ErrPermission):
-		// The daemon's report is in its own work dir; as a user the recorded
-		// setting is the answer.
-	}
+	fmt.Fprintln(env.Stdout, appliedLine(env.Sys.ReadFile(install.NetworkAppliedPath(env.DataRoot, role))))
 	return 0
+}
+
+// appliedLine describes the node daemon's applied report (data, err from
+// reading it) for a person.
+func appliedLine(data []byte, err error) string {
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return "Applied: unknown to this user (the node daemon's report is readable by root: run 'sudo k3sm network lan status')."
+	case errors.Is(err, fs.ErrNotExist):
+		return "Applied: unknown (the node daemon has not reported yet)."
+	case err != nil:
+		return fmt.Sprintf("Applied: unknown (%v).", err)
+	}
+	a, derr := install.DecodeNetworkApplied(data)
+	if derr != nil {
+		return fmt.Sprintf("Applied: unknown (%v).", derr)
+	}
+	line := fmt.Sprintf("Applied: the node daemon reports LAN access %s.", a.LAN)
+	if a.Error != "" {
+		line += " Its last change was refused: " + a.Error
+	}
+	return line
 }
