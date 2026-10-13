@@ -203,26 +203,32 @@ parsed: a damaged marker never fails the report. Readers must treat a missing `s
 ## Network
 
 The full report carries an optional `network` object on an installed Mac: the LAN access setting
-`k3sm network lan` and `k3sm install --lan` record. It is additive: `schemaVersion` stays `1`, and it
-adds no `verdict` or row `state` word. The daemons probe does not carry it.
+`k3sm network lan` and `k3sm install --lan` record, and, when the caller can read it, what the node
+daemon reports applying. It is additive: `schemaVersion` stays `1`, and it adds no `verdict` or row
+`state` word. The daemons probe does not carry it.
 
 ```json
 "network": {
   "lan": "off",
+  "recorded": true,
   "covers": ["nodeports", "loadbalancers", "ingress"],
-  "alwaysOn": ["apiserver", "join", "mesh"]
+  "alwaysOn": ["apiserver", "join", "mesh"],
+  "applied": { "lan": "off", "serial": "4f0c2a9e1b7d3c55" }
 }
 ```
 
 | field | type | notes |
 |---|---|---|
-| `lan` | string | `on` (the covered listeners answer on every interface) or `off` (only on this Mac and the cluster mesh); an install with no recorded setting reads `on` |
+| `lan` | string | the recorded setting: `on` (the covered listeners answer on every interface) or `off` (only on this Mac and the cluster mesh) |
+| `recorded` | boolean | `false` when no setting is recorded (an install from before the switch), in which case `lan` is `on` |
 | `covers` | array of strings | the listener families the setting controls: `nodeports`, `loadbalancers`, and `ingress` on a server |
 | `alwaysOn` | array of strings | the network-facing listeners it does not control: `apiserver`, `join` and `mesh` on a server, `mesh` on a worker |
+| `applied` | object | the node daemon's own report: `lan` (what it serves), `serial` (the write it acted on) and `error` (why its last change was refused, omitted when none); omitted when the caller cannot read the report, which is in the daemon's work dir and readable by root |
 
-The object reports the recorded setting. `sudo k3sm network lan status` also says when the node
-daemon is still serving a different one. Readers must treat a missing `network` as "unknown", not as
-either value.
+When `applied.lan` differs from `lan`, or `applied.error` is set, the node is not serving the recorded
+setting; the human view says so on its own line, and also says when the applied state is readable by
+root only. `sudo k3sm network lan on|off` checks the daemon's listening sockets itself before it
+reports success. Readers must treat a missing `network` as "unknown", not as either value.
 
 ## Interconnect
 

@@ -242,9 +242,16 @@ nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
   install time.
 - The change applies live, without restarting pods: the node daemon binds the new addresses first
   and only then closes the old ones. Connections already open finish; new connections from the LAN
-  are refused. If any listener cannot move, nothing changes, the previous setting is restored, and
-  the command says why. If the node daemon does not apply it live, the command restarts the daemon
-  in place instead (pods keep running) and says so.
+  are refused. The command then checks the node daemon's listening sockets itself (with `lsof`, as
+  root) rather than taking the daemon's word for it. If any listener cannot move, or the sockets do
+  not match, the previous setting is restored and checked the same way, and the command says why. If
+  even the restore fails, it says so and exits `4`. If the node daemon does not apply it live, the
+  command restarts the daemon in place instead (pods keep running) and says so.
+- `k3sm network lan status` and `k3sm status` show the recorded setting and, run as root, the state
+  the node daemon reports serving, and say when the two differ. With no setting recorded they say
+  that LAN access is on because nothing is recorded.
+- The record must be a regular file owned by root and writable by no one else. Anything else is
+  treated as unusable, and the node daemon serves LAN access off until it is set again.
 - On a stopped node the setting is recorded and applies at `sudo k3sm start`.
 - With LAN access off, a LoadBalancer port below 1024 is not served on that node, because macOS
   lets only root bind a specific address below 1024; use a port of 1024 or above, or turn LAN
