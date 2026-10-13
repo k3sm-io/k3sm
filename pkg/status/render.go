@@ -250,7 +250,7 @@ func renderRow(row Row, s Style) string {
 	return "  " + glyph +
 		pad(row.Name, nameWidth) + " " +
 		colorize(pad(string(row.State), stateWidth), severityColor(row.Severity), s) + " " +
-		strings.TrimRight(row.Detail, " ") + "\n"
+		strings.TrimRight(stripControls(row.Detail), " ") + "\n"
 }
 
 // wideLine renders a row's extra columns as sorted key=value pairs.
@@ -264,7 +264,7 @@ func wideLine(row Row) string {
 		if k == "log" || k == "log-repeats" {
 			continue // already printed on its own line
 		}
-		pairs = append(pairs, k+"="+row.Wide[k])
+		pairs = append(pairs, stripControls(k)+"="+stripControls(row.Wide[k]))
 	}
 	if len(pairs) == 0 {
 		return ""
@@ -349,4 +349,18 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// stripControls removes C0 and C1 control characters and DEL from text that
+// came from the cluster (apiserver errors, node names), so a hostile apiserver
+// or proxy cannot put terminal escape sequences on the operator's TTY. Printable
+// Unicode is kept. Only the human renderer calls it; the JSON output carries
+// the value as data and its encoder already escapes controls.
+func stripControls(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, s)
 }

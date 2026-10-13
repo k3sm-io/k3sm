@@ -287,7 +287,7 @@ func TestInterconnectSweepRefusesUntrustedLedger(t *testing.T) {
 			}
 			return []byte(bridgeIfconfig), nil
 		}, log)
-		if err != nil {
+		if err != nil && !errors.Is(err, errUntrustedLedger) {
 			t.Fatalf("sweep: %v", err)
 		}
 		return removed
@@ -341,4 +341,27 @@ func TestInterconnectSweepRefusesUntrustedLedger(t *testing.T) {
 			t.Errorf("a directory ledger removed %v", got)
 		}
 	})
+}
+
+// TestUninstallKeepsIdentityWhenLedgerRefused pins that a ledger the sweep
+// refuses as untrusted fails the sweep like a failed removal does: uninstall
+// reports it and keeps the node identity, so a re-run after the operator fixes
+// the ledger can still re-derive the aliases it names.
+func TestUninstallKeepsIdentityWhenLedgerRefused(t *testing.T) {
+	identity := netdsvc.NodeIdentityPath(MeshKeyDir)
+	ledger := writeLedger(t, 0o666, `{"aliases":[{"slot":0,"address":"169.254.0.9"}]}`)
+	f := &fakeSystem{}
+	f.putFile(identity, []byte("10.42.1.0/24\n"))
+	f.flushInterconnect = func(nodeIndex int, log *slog.Logger) error {
+		return sweepInterconnect(ledger, nodeIndex, uint32(os.Getuid()), func(...string) ([]byte, error) {
+			t.Error("ifconfig ran against a refused ledger")
+			return nil, nil
+		}, log)
+	}
+	if err := Uninstall(context.Background(), f, Config{}); err == nil {
+		t.Fatal("uninstall reported success with an untrusted ledger left in place")
+	}
+	if _, ok := f.files[identity]; !ok {
+		t.Fatalf("uninstall removed the node identity %s after refusing the ledger", identity)
+	}
 }

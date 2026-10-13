@@ -33,6 +33,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/status"
 )
 
@@ -310,6 +311,10 @@ func checkICAddress(f icFacts, role install.Role) (checkResult, netip.Addr) {
 	case f.identErr != nil:
 		return checkResult{name: icAddress, status: statusWarn,
 			detail: fmt.Sprintf("could not read the pod range netd adopted: %v", f.identErr), remedy: "sudo launchctl kickstart -k system/" + install.NetdLabel}, netip.Addr{}
+	case install.IsUntrustedLedger(f.ledgerErr):
+		return checkResult{name: icAddress, status: statusFail,
+			detail: fmt.Sprintf("netd's interconnect record is not trusted, so it was not read (uninstall refuses it the same way): %v", f.ledgerErr),
+			remedy: "sudo ls -l " + netdsvc.InterconnectStatePath(install.MeshKeyDir) + "   # it must be a root-owned regular file, not writable by group or others"}, netip.Addr{}
 	case f.ledgerErr != nil:
 		return checkResult{name: icAddress, status: statusWarn,
 			detail: fmt.Sprintf("could not read netd's interconnect record: %v", f.ledgerErr), remedy: "sudo launchctl kickstart -k system/" + install.NetdLabel}, netip.Addr{}

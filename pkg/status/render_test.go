@@ -332,3 +332,23 @@ func TestRenderRowsKeepsTheCallersRows(t *testing.T) {
 		t.Errorf("Render rendered a row that is in no screen's vocabulary:\n%s", overview)
 	}
 }
+
+// TestRowDetailStripsControlCharacters pins that cluster-sourced row text
+// cannot put terminal control sequences on the operator's TTY: C0, C1 and DEL
+// are removed from the human output while printable Unicode is kept.
+func TestRowDetailStripsControlCharacters(t *testing.T) {
+	row := Row{Name: "interconnect", State: "degraded", Detail: "node \x1b[2Jé世\x1b]0;pwned\x07 x\u009b31m y\x7f z\r\n\x00end"}
+	row.Wide = map[string]string{"node": "n\x1b[31m1"}
+	out := renderRow(row, Style{}) + wideLine(row)
+	for _, r := range out {
+		if r != '\n' && (r < 0x20 || (r >= 0x7f && r <= 0x9f)) {
+			t.Fatalf("control character %U survived in %q", r, out)
+		}
+	}
+	if !strings.Contains(out, "é世") {
+		t.Errorf("printable Unicode was dropped: %q", out)
+	}
+	if strings.Count(out, "\n") != 2 {
+		t.Errorf("stripped text still breaks the row across lines: %q", out)
+	}
+}
