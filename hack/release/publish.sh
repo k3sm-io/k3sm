@@ -26,21 +26,41 @@
 #                 fake on PATH (no network, no credentials, no keychain)
 #
 # The flow, each step refusing to continue on any failure:
+#   0. the k3sm worktree is clean and the tag's commit is HEAD, so what is
+#      built is exactly what the tag names
 #   1. hack/release/stage.sh <stage-dir> --release --cp-build <dir> --ldflags ...
 #   2. hack/release/sign.sh --identity ... --team-id ... <stage-dir>
-#      (prompts for the Team ID at the terminal; signs and notarizes)
+#      (prompts for the Team ID at the terminal; signs and notarizes), then the
+#      entitlements of every signed Mach-O are read back against an exact
+#      allowlist: k3sm-vmhost carries com.apple.security.virtualization and
+#      nothing else, every other binary carries none
 #   3. hack/release/stage.sh --rewrite-manifest <stage-dir>
 #      (signing changed the bytes; the manifest is recomputed over them)
 #   4. hack/release/stage.sh <stage-dir> --verify-release <TEAMID>
 #   5. package <stage-dir>.assets: the tarball of exactly the verified tree plus
 #      LICENSE and NOTICE, the tree's PAYLOAD-SHA256 manifest, and a checksums
-#      file over both
-#   6. gh release create <tag> --draft --verify-tag with those assets
+#      file over both; then the tarball is extracted into a private directory
+#      and every file in it is checked against PAYLOAD-SHA256, so the bytes that
+#      ship are the bytes that were verified
+#   6. the stage tree is checked against PAYLOAD-SHA256 once more, then
+#      gh release create <tag> --draft --verify-tag with those assets
+#      (--prerelease for an -rc.N tag)
 #   7. read the draft back (gh release view --json) and check it: still a draft,
 #      exactly the expected asset names, each fully uploaded, with the local
 #      size and SHA-256 (the asset digest GitHub reports, or a download when it
 #      reports none)
-#   8. only then promote: gh release edit <tag> --draft=false
+#   8. only then promote: gh release edit <tag> --draft=false, with --latest
+#      for a final version and --latest=false for a release candidate
+#
+# THE TARBALL'S SHAPE is the one install.sh (at the repo root) consumes: the
+# assets k3sm_<version>_darwin_arm64.tar.gz and k3sm_<version>_checksums.txt
+# (the version without its leading v), a checksums line `<sha256>  <name>`
+# whose second field is exactly the archive name, and `k3sm` at the archive
+# root, which install.sh runs as `k3sm install`. This is also the naming the
+# goreleaser config uses. Two differences from the goreleaser archive: there is
+# no k3sm-netd copy, because the install contract (`k3sm install
+# --print-required-artifacts`) does not name one, and the checksums file also
+# lists the PAYLOAD-SHA256 asset, which install.sh's exact-field match ignores.
 #
 # A draft whose assets fail step 7 is never promoted, so a failed or partial
 # upload of a large asset cannot become the latest release that an install
@@ -68,6 +88,103 @@ refuse() {
 die() { echo "publish: $*" >&2; exit 1; }
 
 valid_version() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; }
+is_rc() { [[ "$1" =~ -rc\.[0-9]+$ ]]; }
+
+# tag_binding_problems <repo-dir> <ref>: zero when the worktree is clean
+# (untracked files included) and <ref>'s commit is HEAD. Called with
+# refs/tags/<version>; the ref is a parameter only so the self-test can drive
+# it with a fixture branch instead of creating a tag.
+tag_binding_problems() {
+	local repo="$1" ref="$2" dirty want head
+	dirty="$(git -C "$repo" status --porcelain 2>/dev/null)" || { echo "    $repo is not a git worktree"; return 1; }
+	[ -z "$dirty" ] || { echo "    the worktree at $repo is not clean:"; printf '%s\n' "$dirty" | sed 's/^/      /'; return 1; }
+	want="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")" || { echo "    $ref does not exist"; return 1; }
+	head="$(git -C "$repo" rev-parse --verify HEAD)" || { echo "    no HEAD in $repo"; return 1; }
+	[ "$want" = "$head" ] || { echo "    $ref is $want but HEAD is $head"; return 1; }
+}
+
+# tree_manifest_problems <dir> <manifest> [extra-allowed...]: zero when the
+# regular files under <dir> are exactly the manifest's paths (plus the manifest
+# itself, .DS_Store, and any extra-allowed top-level names) with the manifest's
+# SHA-256 each, and nothing in <dir> is a symlink. Prints every problem.
+tree_manifest_problems() {
+	local dir="$1" manifest="$2" problems=0 want got sum rel line extra
+	shift 2
+	[ -f "$manifest" ] || { echo "    no manifest $manifest"; return 1; }
+	if [ -n "$(cd "$dir" && find . -type l | head -1)" ]; then
+		echo "    $dir holds a symlink"; problems=1
+	fi
+	want="$(grep -v '^#' "$manifest" | sed '/^$/d' | sed 's/^[0-9a-f]\{64\}  //' | LC_ALL=C sort)"
+	got="$(cd "$dir" && find . -type f ! -name .DS_Store | sed 's|^\./||' | LC_ALL=C sort)"
+	got="$(printf '%s\n' "$got" | grep -vxF "PAYLOAD-SHA256" || true)"
+	for extra in "$@"; do got="$(printf '%s\n' "$got" | grep -vxF "$extra" || true)"; done
+	if [ "$want" != "$got" ]; then
+		echo "    the file set of $dir differs from the manifest:"
+		diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed -n 's/^\([<>]\)/      \1/p'
+		problems=1
+	fi
+	while IFS= read -r line; do
+		case "$line" in '#'* | '') continue ;; esac
+		sum="${line%%  *}"
+		rel="${line#*  }"
+		[ -f "$dir/$rel" ] || continue
+		[ "$(shasum -a 256 "$dir/$rel" | cut -d' ' -f1)" = "$sum" ] || { echo "    $rel: sha256 differs from the manifest"; problems=1; }
+	done <"$manifest"
+	return "$problems"
+}
+
+# tarball_problems <tarball> <manifest>: extract into a private directory and
+# check the payload against the manifest; LICENSE and NOTICE are the only
+# extra files allowed, and the archived manifest must be byte-identical.
+tarball_problems() {
+	local tarball="$1" manifest="$2" x rc=0
+	x="$(mktemp -d)"
+	chmod 700 "$x"
+	if ! tar -xzf "$tarball" -C "$x" 2>/dev/null; then
+		echo "    cannot extract $tarball"; rm -rf "$x"; return 1
+	fi
+	cmp -s "$x/PAYLOAD-SHA256" "$manifest" || { echo "    the archived PAYLOAD-SHA256 differs from the staged one"; rc=1; }
+	tree_manifest_problems "$x" "$manifest" LICENSE NOTICE || rc=1
+	rm -rf "$x"
+	return "$rc"
+}
+
+# entitlement_problems <relpath> <entitlements-xml>: the decision over one
+# signed Mach-O's `codesign -d --entitlements - --xml` output. k3sm-vmhost must
+# carry exactly com.apple.security.virtualization = true; every other binary
+# must carry no entitlement at all. Empty output means none.
+entitlement_problems() {
+	local rel="$1" xml="$2" got want=""
+	[ "$(basename "$rel")" = "k3sm-vmhost" ] && want="com.apple.security.virtualization=true"
+	if [ -z "$xml" ]; then
+		got=""
+	else
+		got="$(plutil -convert json -o - - <<<"$xml" 2>/dev/null | jq -r 'if type == "object" then to_entries[] | "\(.key)=\(.value | tojson)" else error("not a dictionary") end' 2>/dev/null)" ||
+			{ echo "    $rel: unreadable entitlements"; return 1; }
+		got="$(printf '%s' "$got" | LC_ALL=C sort)"
+	fi
+	[ "$got" = "$want" ] || {
+		echo "    $rel: entitlements [${got//$'\n'/, }] are not exactly [${want}]"
+		return 1
+	}
+}
+
+# entitlements_problems <tree>: read back every manifest-listed Mach-O's
+# entitlements and apply entitlement_problems to each.
+entitlements_problems() {
+	local tree="$1" line rel xml rc=0 seen=0
+	while IFS= read -r line; do
+		case "$line" in '#'* | '') continue ;; esac
+		rel="${line#*  }"
+		case "$(file -b "$tree/$rel")" in *Mach-O*) ;; *) continue ;; esac
+		seen=1
+		xml="$(codesign -d --entitlements - --xml "$tree/$rel" 2>/dev/null)" ||
+			{ echo "    $rel: codesign could not read its entitlements"; rc=1; continue; }
+		entitlement_problems "$rel" "$xml" || rc=1
+	done <"$tree/PAYLOAD-SHA256"
+	[ "$seen" = 1 ] || { echo "    the manifest of $tree names no Mach-O"; return 1; }
+	return "$rc"
+}
 
 # asset names for a tag; the checksums file lists the other two
 asset_base() { printf 'k3sm_%s_darwin_arm64' "${1#v}"; }
@@ -87,6 +204,11 @@ package_assets() {
 	cp "$tree.PAYLOAD-SHA256" "$out/$base.PAYLOAD-SHA256"
 	(cd "$out" && shasum -a 256 "$base.tar.gz" "$base.PAYLOAD-SHA256" >"$(checksums_name "$tag")") ||
 		die "could not write the checksums file"
+	local problems
+	if ! problems="$(tarball_problems "$out/$base.tar.gz" "$tree/PAYLOAD-SHA256")"; then
+		printf '%s\n' "$problems" >&2
+		refuse tarball-mismatch "the packaged tarball does not hold exactly the verified tree; nothing was uploaded."
+	fi
 }
 
 # expected_assets <tag> <assetdir>: the asset names a complete draft carries,
@@ -146,16 +268,26 @@ promote() {
 			"Inspect it on GitHub, delete it (gh release delete $tag --repo $repo), and publish again."
 	fi
 	echo "==> draft $tag verified; promoting"
-	gh release edit "$tag" --repo "$repo" --draft=false || die "promoting $tag failed; the verified draft is still in place"
+	# A release candidate must never become the latest release install.sh
+	# resolves; a final version always does.
+	local latest="--latest"
+	is_rc "$tag" && latest="--latest=false"
+	gh release edit "$tag" --repo "$repo" --draft=false "$latest" || die "promoting $tag failed; the verified draft is still in place"
 }
 
-# upload <tag> <repo> <notes> <assetdir>: create the draft, then promote.
+# upload <tag> <repo> <notes> <assetdir> <stage-tree>: re-check the stage tree
+# against its manifest, create the draft, then promote.
 upload() {
-	local tag="$1" repo="$2" notes="$3" dir="$4" names=() n
+	local tag="$1" repo="$2" notes="$3" dir="$4" tree="$5" names=() n problems pre=()
+	if ! problems="$(tree_manifest_problems "$tree" "$tree/PAYLOAD-SHA256")"; then
+		printf '%s\n' "$problems" >&2
+		refuse tree-changed "the stage tree no longer matches its PAYLOAD-SHA256; nothing was uploaded."
+	fi
 	while IFS= read -r n; do names+=("$dir/$n"); done < <(expected_assets "$tag" "$dir")
 	[ "${#names[@]}" -eq 3 ] || die "expected three assets in $dir"
+	is_rc "$tag" && pre=(--prerelease)
 	echo "==> create the draft release $tag on $repo"
-	gh release create "$tag" --repo "$repo" --draft --verify-tag --title "$tag" --notes-file "$notes" "${names[@]}" ||
+	gh release create "$tag" --repo "$repo" --draft ${pre[@]+"${pre[@]}"} --verify-tag --title "$tag" --notes-file "$notes" "${names[@]}" ||
 		die "creating the draft failed; any partial draft is left unpublished for inspection"
 	promote "$tag" "$repo" "$dir"
 }
@@ -269,32 +401,151 @@ EOF
 	rc=0; out="$(no_tty env -u CLAUDECODE -u K3SM_AUTO PATH="$FPATH" bash "$HERE/publish.sh" --version "$tag")" || rc=$?
 	expect_refusal "no controlling terminal refuses" no-tty "$out" "$rc"
 
+	# ---- the shipped bytes against the verified tree ----
+	echo "tarball and tree against PAYLOAD-SHA256"
+	# mk_payload <tree>: a small tree, its manifest inside, and the copy beside it
+	mk_payload() {
+		local d="$1"
+		mkdir -p "$d/cp-payload"
+		printf 'k3sm binary\n' >"$d/k3sm"
+		printf 'apiserver binary\n' >"$d/cp-payload/kube-apiserver"
+		{
+			echo "# go1.0 (fixture)"
+			(cd "$d" && find . -type f ! -name PAYLOAD-SHA256 | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done)
+		} >"$d.manifest.tmp"
+		mv "$d.manifest.tmp" "$d/PAYLOAD-SHA256"
+		cp "$d/PAYLOAD-SHA256" "$d.PAYLOAD-SHA256"
+	}
+	# package_case <name> <tree> <tag> <outdir> <want: pass|refuse>
+	package_case() {
+		rc=0
+		out="$( (PATH="$FPATH" package_assets "$2" "$3" "$4") 2>&1)" || rc=$?
+		if [ "$5" = pass ]; then
+			if [ "$rc" -eq 0 ] && [ "$(find "$4" -type f | wc -l | tr -d ' ')" = 3 ]; then ok "$1"; else
+				bad "$1 (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+			fi
+		elif [ "$rc" -ne 0 ] && grep -q "REFUSE: tarball-mismatch" <<<"$out"; then ok "$1"; else
+			bad "$1 (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+		fi
+	}
+	local P="$T/payload/tree" Q
+	mk_payload "$P"
+	package_case "control: a tarball of the verified tree passes the extract-and-compare" "$P" "$tag" "$T/assets" pass
+	Q="$T/tampered/tree"; mk_payload "$Q"; printf 'changed\n' >"$Q/k3sm"
+	package_case "a file changed after the manifest refuses" "$Q" "$tag" "$T/tampered.assets" refuse
+	Q="$T/extra/tree"; mk_payload "$Q"; printf 'stray\n' >"$Q/cp-payload/unlisted"
+	package_case "a file the manifest does not list refuses" "$Q" "$tag" "$T/extra.assets" refuse
+	Q="$T/missing/tree"; mk_payload "$Q"; rm "$Q/cp-payload/kube-apiserver"
+	package_case "a manifest-listed file missing from the tree refuses" "$Q" "$tag" "$T/missing.assets" refuse
+	Q="$T/link/tree"; mk_payload "$Q"; ln -s k3sm "$Q/k3sm-link"
+	package_case "a symlink in the tree refuses" "$Q" "$tag" "$T/link.assets" refuse
+	# A tree changed after packaging is caught again right before upload,
+	# before any gh call.
+	Q="$T/late/tree"; mk_payload "$Q"
+	(PATH="$FPATH" package_assets "$Q" "$tag" "$T/late.assets") >/dev/null 2>&1
+	printf 'changed late\n' >"$Q/cp-payload/kube-apiserver"
+	printf 'notes\n' >"$T/notes.md"
+	: >"$log"
+	rc=0
+	out="$( (PATH="$FPATH" FAKE_GH_CREATE_OK=1 upload "$tag" "$repo" "$T/notes.md" "$T/late.assets" "$Q") 2>&1)" || rc=$?
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: tree-changed" <<<"$out" && [ ! -s "$log" ]; then
+		ok "a stage tree changed after packaging refuses before any upload"
+	else
+		bad "late tree change (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+
+	# ---- entitlements, against canned codesign output ----
+	echo "entitlements allowlist"
+	local plist_head='<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>'
+	local virt='<key>com.apple.security.virtualization</key><true/>'
+	# ent_case <name> <relpath> <dict-body|-none-|raw:<text>> <want: pass|refuse>
+	ent_case() {
+		local xml
+		case "$3" in
+		-none-) xml="" ;;
+		raw:*) xml="${3#raw:}" ;;
+		*) xml="$plist_head$3</dict></plist>" ;;
+		esac
+		rc=0
+		out="$(entitlement_problems "$2" "$xml")" || rc=$?
+		if { [ "$4" = pass ] && [ "$rc" -eq 0 ]; } || { [ "$4" = refuse ] && [ "$rc" -ne 0 ]; }; then ok "$1"; else
+			bad "$1 (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+		fi
+	}
+	ent_case "control: k3sm-vmhost with exactly the virtualization entitlement passes" k3sm-vmhost "$virt" pass
+	ent_case "k3sm-vmhost without it refuses" k3sm-vmhost -none- refuse
+	ent_case "k3sm-vmhost with an extra entitlement refuses" k3sm-vmhost "$virt<key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>" refuse
+	ent_case "k3sm-vmhost with virtualization false refuses" k3sm-vmhost '<key>com.apple.security.virtualization</key><false/>' refuse
+	ent_case "control: k3sm with no entitlements passes" k3sm -none- pass
+	ent_case "control: a dylib with an empty entitlement dictionary passes" libk3sm_getaddrinfo_shim.dylib "" pass
+	ent_case "k3sm with the virtualization entitlement refuses" k3sm "$virt" refuse
+	ent_case "a cp-payload binary with library validation disabled refuses" cp-payload/kube-apiserver '<key>com.apple.security.cs.disable-library-validation</key><true/>' refuse
+	ent_case "unreadable entitlements output refuses" k3sm "raw:not a plist <" refuse
+	# The walk fails closed when codesign cannot read a Mach-O's entitlements
+	# (the fake codesign exits 97). A copy of bash stands in for a Mach-O.
+	Q="$T/ent/tree"; mkdir -p "$Q"
+	cp "$(command -v bash)" "$Q/k3sm"
+	(cd "$Q" && shasum -a 256 k3sm >PAYLOAD-SHA256)
+	: >"$log"
+	rc=0
+	out="$( (PATH="$FPATH" entitlements_problems "$Q") 2>&1)" || rc=$?
+	if [ "$rc" -ne 0 ] && grep -q "could not read its entitlements" <<<"$out" && grep -q "^codesign -d --entitlements - --xml $Q/k3sm\$" "$log"; then
+		ok "a failed entitlements read-back refuses"
+	else
+		bad "entitlements walk (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	: >"$log"
+
+	# ---- the tag binding, against a fixture repository ----
+	echo "tag binding"
+	local G="$T/repo"
+	gitf() { git -C "$G" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false "$@"; }
+	git init -q "$G"
+	printf 'one\n' >"$G/f"
+	gitf add f && gitf commit -q -m one
+	gitf branch fixture
+	# bind_case <name> <ref> <want: pass|refuse>
+	bind_case() {
+		rc=0
+		out="$(tag_binding_problems "$G" "$2")" || rc=$?
+		if { [ "$3" = pass ] && [ "$rc" -eq 0 ]; } || { [ "$3" = refuse ] && [ "$rc" -ne 0 ]; }; then ok "$1"; else
+			bad "$1 (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+		fi
+	}
+	bind_case "control: a clean worktree with the ref at HEAD passes" refs/heads/fixture pass
+	bind_case "a ref that does not exist refuses" refs/heads/no-such-ref refuse
+	printf 'untracked\n' >"$G/new"
+	bind_case "an untracked file refuses" refs/heads/fixture refuse
+	rm "$G/new"
+	printf 'edited\n' >"$G/f"
+	bind_case "a modified tracked file refuses" refs/heads/fixture refuse
+	gitf commit -q -am two
+	bind_case "a ref behind HEAD refuses" refs/heads/fixture refuse
+
 	# ---- the draft check and promote, against canned gh JSON ----
 	echo "draft-then-promote"
-	local A="$T/assets" base sums
-	base="$(asset_base "$tag")"; sums="$(checksums_name "$tag")"
-	mkdir "$A"
-	printf 'tarball bytes\n' >"$A/$base.tar.gz"
-	printf 'manifest bytes\n' >"$A/$base.PAYLOAD-SHA256"
-	(cd "$A" && shasum -a 256 "$base.tar.gz" "$base.PAYLOAD-SHA256" >"$sums")
-	# good_json [jq filter applied to the good draft]
+	local A="$T/assets" rctag=v0.0.1-rc.1 A2="$T/rc.assets"
+	(PATH="$FPATH" package_assets "$P" "$rctag" "$A2") >/dev/null 2>&1
+	# draft_json <assetdir> <tag> [jq filter applied to the good draft]
 	draft_json() {
-		local n f=()
-		for n in "$base.tar.gz" "$base.PAYLOAD-SHA256" "$sums"; do
-			f+=("{\"name\":\"$n\",\"state\":\"uploaded\",\"size\":$(stat -f %z "$A/$n"),\"digest\":\"sha256:$(shasum -a 256 "$A/$n" | cut -d' ' -f1)\"}")
+		local d="$1" t="$2" n f=() b s
+		b="$(asset_base "$t")"; s="$(checksums_name "$t")"
+		for n in "$b.tar.gz" "$b.PAYLOAD-SHA256" "$s"; do
+			f+=("{\"name\":\"$n\",\"state\":\"uploaded\",\"size\":$(stat -f %z "$d/$n"),\"digest\":\"sha256:$(shasum -a 256 "$d/$n" | cut -d' ' -f1)\"}")
 		done
 		local IFS=,
-		jq -c "${1:-.}" <<<"{\"isDraft\":true,\"assets\":[${f[*]}]}"
+		jq -c "${3:-.}" <<<"{\"isDraft\":true,\"assets\":[${f[*]}]}"
 	}
-	# promote_case <name> <json> <want: pass|refuse>
+	# promote_case <name> <json> <want: pass|refuse> [tag] [assetdir] [expected latest flag]
 	promote_case() {
+		local t="${4:-$tag}" d="${5:-$A}" latest="${6:---latest}"
 		printf '%s\n' "$2" >"$T/view.json"
 		: >"$log"
 		rc=0
-		out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" FAKE_GH_EDIT_OK=1 promote "$tag" "$repo" "$A") 2>&1)" || rc=$?
+		out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" FAKE_GH_EDIT_OK=1 promote "$t" "$repo" "$d") 2>&1)" || rc=$?
 		if [ "$3" = pass ]; then
-			if [ "$rc" -eq 0 ] && grep -q -- "^gh release edit $tag --repo $repo --draft=false\$" "$log"; then ok "$1"; else
-				bad "$1 (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+			if [ "$rc" -eq 0 ] && grep -qx -- "gh release edit $t --repo $repo --draft=false $latest" "$log"; then ok "$1"; else
+				bad "$1 (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
 			fi
 		else
 			if [ "$rc" -ne 0 ] && grep -q "REFUSE: draft-unverified" <<<"$out" && ! grep -q -- '--draft=false' "$log" &&
@@ -303,37 +554,56 @@ EOF
 			fi
 		fi
 	}
-	promote_case "control: a complete, matching draft is promoted" "$(draft_json)" pass
-	promote_case "a wrong asset digest refuses" "$(draft_json '.assets[0].digest = "sha256:0000"')" refuse
-	promote_case "a missing asset refuses" "$(draft_json 'del(.assets[1])')" refuse
-	promote_case "an extra asset refuses" "$(draft_json '.assets += [.assets[0] | .name = "extra.bin"]')" refuse
-	promote_case "a partially uploaded asset refuses" "$(draft_json '.assets[0].state = "starter"')" refuse
-	promote_case "a size mismatch refuses" "$(draft_json '.assets[2].size = 1')" refuse
-	promote_case "a release that is no longer a draft refuses" "$(draft_json '.isDraft = false')" refuse
-	promote_case "no digest and a failed download refuses" "$(draft_json 'del(.assets[0].digest)')" refuse
+	promote_case "control: a complete, matching final draft is promoted with --latest" "$(draft_json "$A" "$tag")" pass
+	promote_case "a release candidate is promoted with --latest=false" "$(draft_json "$A2" "$rctag")" pass "$rctag" "$A2" --latest=false
+	promote_case "a wrong asset digest refuses" "$(draft_json "$A" "$tag" '.assets[0].digest = "sha256:0000"')" refuse
+	promote_case "a missing asset refuses" "$(draft_json "$A" "$tag" 'del(.assets[1])')" refuse
+	promote_case "an extra asset refuses" "$(draft_json "$A" "$tag" '.assets += [.assets[0] | .name = "extra.bin"]')" refuse
+	promote_case "a partially uploaded asset refuses" "$(draft_json "$A" "$tag" '.assets[0].state = "starter"')" refuse
+	promote_case "a size mismatch refuses" "$(draft_json "$A" "$tag" '.assets[2].size = 1')" refuse
+	promote_case "a release that is no longer a draft refuses" "$(draft_json "$A" "$tag" '.isDraft = false')" refuse
+	promote_case "no digest and a failed download refuses" "$(draft_json "$A" "$tag" 'del(.assets[0].digest)')" refuse
 	if grep -q "^gh release download $tag" "$log"; then ok "a missing digest falls back to downloading the asset"; else bad "no download fallback"; fi
 	promote_case "unreadable JSON refuses" "not json" refuse
 
+	# upload_case <name> <tag> <assetdir> <view-json> -> sets rc, out; log holds the gh calls
+	upload_case() {
+		printf '%s\n' "$4" >"$T/view.json"
+		: >"$log"
+		rc=0
+		out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" FAKE_GH_CREATE_OK=1 FAKE_GH_EDIT_OK=1 upload "$2" "$repo" "$T/notes.md" "$3" "$P") 2>&1)" || rc=$?
+	}
 	# The full upload: the create succeeds, the draft read back is bad.
-	printf '%s\n' "$(draft_json '.assets[0].digest = "sha256:0000"')" >"$T/view.json"
-	printf 'notes\n' >"$T/notes.md"
-	: >"$log"
-	rc=0
-	out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" FAKE_GH_CREATE_OK=1 FAKE_GH_EDIT_OK=1 upload "$tag" "$repo" "$T/notes.md" "$A") 2>&1)" || rc=$?
+	upload_case x "$tag" "$A" "$(draft_json "$A" "$tag" '.assets[0].digest = "sha256:0000"')"
 	if [ "$rc" -ne 0 ] && grep -q -- "^gh release create $tag .*--draft" "$log" &&
 		! grep '^gh release create' "$log" | grep -qv -- ' --draft ' && ! grep -q -- '--draft=false' "$log"; then
 		ok "upload creates only a draft and does not promote a bad one"
 	else
 		bad "upload with a bad draft (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
 	fi
+	upload_case x "$tag" "$A" "$(draft_json "$A" "$tag")"
+	if [ "$rc" -eq 0 ] && grep -q "^gh release create $tag .* --draft --verify-tag " "$log" && ! grep -q -- '--prerelease' "$log" &&
+		grep -qx -- "gh release edit $tag --repo $repo --draft=false --latest" "$log"; then
+		ok "a final version is created without --prerelease and promoted with --latest"
+	else
+		bad "final upload (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	upload_case x "$rctag" "$A2" "$(draft_json "$A2" "$rctag")"
+	if [ "$rc" -eq 0 ] && grep -q "^gh release create $rctag .* --draft --prerelease --verify-tag " "$log" &&
+		grep -qx -- "gh release edit $rctag --repo $repo --draft=false --latest=false" "$log"; then
+		ok "a release candidate is created with --prerelease and promoted with --latest=false"
+	else
+		bad "rc upload (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
 	: >"$log"
 	rc=0
-	out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" upload "$tag" "$repo" "$T/notes.md" "$A") 2>&1)" || rc=$?
+	out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" upload "$tag" "$repo" "$T/notes.md" "$A" "$P") 2>&1)" || rc=$?
 	if [ "$rc" -ne 0 ] && [ "$(grep -c . "$log")" -eq 1 ] && grep -q '^gh release create' "$log"; then
 		ok "a failed create stops before any read-back or promote"
 	else
 		bad "failed create (rc=$rc, log: $(tr '\n' ';' <"$log"))"
 	fi
+	: >"$log"
 
 	# ---- static checks ----
 	echo "static"
@@ -368,7 +638,7 @@ EOF
 		echo "  skip shellcheck (not installed)"
 	fi
 
-	unset -f ok bad skip_attended on_pty no_tty expect_refusal draft_json promote_case
+	unset -f ok bad skip_attended on_pty no_tty expect_refusal draft_json promote_case mk_payload package_case ent_case gitf bind_case upload_case
 	unset FAKE_TOOL_LOG
 	echo
 	echo "publish self-test: $passes passed, $fails failed, $skips skipped (attended only)"
@@ -422,6 +692,12 @@ STAGE="${STAGE%/}"
 ASSETS="$STAGE.assets"
 [ ! -e "$ASSETS" ] || die "$ASSETS already exists"
 
+echo "==> 0/6 bind the build to the tag"
+if ! problems="$(tag_binding_problems "$REPO_ROOT" "refs/tags/$VERSION")"; then
+	printf '%s\n' "$problems" >&2
+	refuse tag-binding "the release must be built from a clean worktree at exactly the commit $VERSION names."
+fi
+
 echo "==> 1/6 stage (release)"
 "$HERE/stage.sh" "$STAGE" --release --cp-build "$CP_BUILD" --ldflags "$LDFLAGS"
 STAGE="$(cd "$STAGE" && pwd)"
@@ -429,6 +705,10 @@ ASSETS="$STAGE.assets"
 
 echo "==> 2/6 sign and notarize"
 "$HERE/sign.sh" --identity "$IDENTITY" --team-id "$TEAM_ID" "$STAGE"
+if ! problems="$(entitlements_problems "$STAGE")"; then
+	printf '%s\n' "$problems" >&2
+	refuse entitlements "a signed Mach-O carries entitlements outside the allowlist; nothing was uploaded."
+fi
 
 echo "==> 3/6 rewrite the manifest over the signed bytes"
 "$HERE/stage.sh" --rewrite-manifest "$STAGE"
@@ -443,5 +723,5 @@ echo "==> 5/6 package the assets into $ASSETS"
 package_assets "$STAGE" "$VERSION" "$ASSETS"
 
 echo "==> 6/6 upload: draft, verify, promote"
-upload "$VERSION" "$REPO" "$NOTES" "$ASSETS"
+upload "$VERSION" "$REPO" "$NOTES" "$ASSETS" "$STAGE"
 echo "==> released $VERSION on $REPO"
