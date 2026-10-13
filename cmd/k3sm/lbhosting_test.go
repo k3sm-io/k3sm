@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -37,6 +38,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/netbind"
 
+	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/ports"
 )
@@ -261,35 +263,25 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 	})
 }
 
-// TestServerKubeletListenOnRenumbersOnlyThePort pins the ONE property that makes
+// TestServerKubeletPortRenumbersOnlyThePort pins the ONE property that makes
 // `k3sm server --kubelet-port` a port change and not an exposure change: the
-// derivation substitutes the port into the SAME wildcard form serverKubeletListen
-// has always had, and touches nothing else.
-//
-// The listener it addresses serves logs/exec/stats, and its identity rests on
-// serving TLS plus network reach rather than on the address it binds. So a
-// derivation that also moved the host part would alter that surface's exposure
-// while presenting as a renumbering — which is exactly the substitution this test
-// exists to red.
-func TestServerKubeletListenOnRenumbersOnlyThePort(t *testing.T) {
-	// The default reproduces today's address EXACTLY, so a server that passes no
-	// --kubelet-port is byte-for-byte where it was.
-	if got := serverKubeletListenOn(ports.KubeletAPIPort); got != serverKubeletListen {
-		t.Errorf("serverKubeletListenOn(default) = %q, want the unchanged %q", got, serverKubeletListen)
-	}
+// derived listen address keeps the node's own address as its host and changes
+// only the port. The address is resolveKubeletEndpoint's to decide, never the
+// port flag's.
+func TestServerKubeletPortRenumbersOnlyThePort(t *testing.T) {
+	stubLocalAddrs(t, "127.0.0.1", "100.64.0.1")
 	for _, port := range []int{ports.KubeletAPIPort, 10450, 10961} {
-		got := serverKubeletListenOn(port)
-		if want := ":" + strconv.Itoa(port); got != want {
-			t.Errorf("serverKubeletListenOn(%d) = %q, want %q", port, got, want)
+		ep, err := resolveKubeletEndpoint(nodeOptions{
+			nodeIP:      loopbackNodeIP,
+			kubeletPort: port,
+			podCIDR:     "100.64.0.0/24",
+			netMode:     hostnet.Mode{Backend: hostnet.BackendDirect},
+		})
+		if err != nil {
+			t.Fatalf("resolveKubeletEndpoint(port %d): %v", port, err)
 		}
-		// Same wildcard posture at every port: the node-proxy substitution in
-		// proxyableNodeIP gates on exactly this predicate.
-		if !wildcardListen(got) {
-			t.Errorf("serverKubeletListenOn(%d) = %q, which is not the wildcard bind the in-process node has always used", port, got)
-		}
-		host, _, err := net.SplitHostPort(got)
-		if err != nil || host != "" {
-			t.Errorf("serverKubeletListenOn(%d) = %q, want an EMPTY host: renumbering must not name an interface", port, got)
+		if want := net.JoinHostPort("100.64.0.1", strconv.Itoa(port)); ep.listen != want {
+			t.Errorf("--kubelet-port %d listens on %q, want %q: renumbering must move the port and nothing else", port, ep.listen, want)
 		}
 	}
 }
@@ -301,18 +293,20 @@ func TestServerKubeletListenOnRenumbersOnlyThePort(t *testing.T) {
 // strings.
 func TestKubeletListenAddressesUsePortsConstant(t *testing.T) {
 	suffix := ":" + strconv.Itoa(ports.KubeletAPIPort)
-	for _, tc := range []struct{ name, addr string }{
-		{"server/agent in-process node", serverKubeletListen},
-		{"standalone `k3sm node` default", nodeKubeletListen},
-	} {
-		if !strings.HasSuffix(tc.addr, suffix) {
-			t.Errorf("%s listen = %q, want the %q suffix from ports.KubeletAPIPort", tc.name, tc.addr, suffix)
-		}
+	if !strings.HasSuffix(nodeKubeletListen, suffix) {
+		t.Errorf("standalone `k3sm node` listen = %q, want the %q suffix from ports.KubeletAPIPort", nodeKubeletListen, suffix)
 	}
-	// The server/agent node listens on the WILDCARD so the apiserver node-proxy
-	// reaches it at the address the node advertises.
-	if serverKubeletListen != suffix {
-		t.Errorf("serverKubeletListen = %q, want the wildcard form %q", serverKubeletListen, suffix)
+	agent := agentNodeOptions(agentOptions{}, &bootstrap.JoinResult{MeshIP: "100.64.1.1"}, "", hostnet.Mode{Backend: hostnet.BackendDirect}, nil)
+	if agent.kubeletPort != ports.KubeletAPIPort {
+		t.Errorf("agent kubelet port = %d, want ports.KubeletAPIPort %d", agent.kubeletPort, ports.KubeletAPIPort)
+	}
+	var opts serverOptions
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	if err := registerServerFlags(fs, &opts); err != nil {
+		t.Fatalf("registerServerFlags: %v", err)
+	}
+	if opts.kubeletPort != ports.KubeletAPIPort {
+		t.Errorf("server --kubelet-port default = %d, want ports.KubeletAPIPort %d", opts.kubeletPort, ports.KubeletAPIPort)
 	}
 	if !ports.Reserved(ports.KubeletAPIPort) {
 		t.Error("the kubelet API port must be in the reserved set: losing it to a LoadBalancer Service kills logs/exec/top on this node")

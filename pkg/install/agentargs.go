@@ -145,7 +145,7 @@ func writeArgsRecord(sys System, cfg Config) error {
 func writeAgentArgsRecord(sys System, cfg Config) error {
 	path := cfg.AgentArgsRecord
 	rec := dataroot.AgentArgsRecord{
-		Args:      cfg.ExtraAgentArgs,
+		Args:      cfg.resolvedExtraAgentArgs(),
 		CreatedBy: "k3sm " + version.Get().Version,
 		CreatedAt: time.Now().UTC(),
 	}
@@ -301,3 +301,15 @@ func operatorJoinToken(sys System, cfg Config) (string, bootstrap.Token, error) 
 // cannot import each other, and they are the same number because the question
 // is the same one asked of the same kind of file.
 const tokenFileMask fs.FileMode = 0o077
+
+// resolvedExtraAgentArgs returns ExtraAgentArgs with this install's
+// --nodeport-addresses merged in, the agent counterpart of
+// resolvedExtraServerArgs: AgentPlist and writeAgentArgsRecord both read it,
+// so the rendered argv and the record cannot disagree.
+func (c Config) resolvedExtraAgentArgs() []string {
+	return c.setNodePortAddressesArg(c.ExtraAgentArgs)
+}
+
+// RecordedAgentArgs returns the operator `k3sm agent` arguments an install with
+// cfg renders after the managed set AND writes to the agent arguments record.
+func RecordedAgentArgs(cfg Config) []string { return cfg.resolvedExtraAgentArgs() }

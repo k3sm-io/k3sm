@@ -50,6 +50,7 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/netserve"
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // meshKeyRef is the file name (under both this node's work dir and the root-only
@@ -83,6 +84,9 @@ type agentOptions struct {
 	network   string // host-network backend: auto (default) | none | direct | helper
 	clusterIP string // DNS VIP the per-node resolver serves on + pods resolve against
 	domain    string // cluster DNS domain
+	// nodePortAddresses is --nodeport-addresses: where this worker's NodePort
+	// listeners bind (empty = every interface).
+	nodePortAddresses string
 }
 
 // registerAgentFlags binds `k3sm agent`'s flags onto fs. It is a function rather
@@ -106,6 +110,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver serves on and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
+	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
 }
 
 // agentTerminalBackoff is how long runAgent waits before returning a start
@@ -187,6 +192,9 @@ func runAgent(args []string) error {
 	// allocator knows.
 	if opts.server == "" {
 		return fmt.Errorf("--server is required")
+	}
+	if err := checkNodePortAddresses(&opts.nodePortAddresses, opts.network); err != nil {
+		return err
 	}
 
 	// Before anything is joined, written or recorded: a Mac installed as a
@@ -520,7 +528,7 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 		}
 	} else {
 		logger.Info("network datapath disabled (--network none): skipping wireguard mesh + node-local datapath")
-		warnNoDatapathInternalIP(logger, mode, agentInternalIP(opts.nodeIP, res))
+		warnNoDatapathInternalIP(logger, mode, agentInternalIP(res))
 	}
 
 	// Everything that can terminally fail has now succeeded: this node holds a
@@ -742,10 +750,12 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 	return nodeOptions{
 		kubeconfig: kubeconfigPath,
 		nodeName:   opts.nodeName,
-		listen:     serverKubeletListen,
-		podRoot:    opts.podRoot,
-		logs:       opts.logs,
-		nodeIP:     agentInternalIP(opts.nodeIP, res),
+		// The kubelet API binds the assigned mesh address on this port
+		// (resolveKubeletEndpoint), never the wildcard.
+		kubeletPort: ports.KubeletAPIPort,
+		podRoot:     opts.podRoot,
+		logs:        opts.logs,
+		nodeIP:      agentInternalIP(res),
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,
 		runtime:     opts.rtName,
@@ -762,8 +772,8 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		// cert against. It is the SAME CA that issued this node's own system:node
 		// credential, so a worker that joined successfully always has it; an empty
 		// value (a server predating the field) makes startNode refuse, which is the
-		// intended failure — a worker's kubelet endpoint is LAN-reachable on the
-		// wildcard bind and is never served unauthenticated.
+		// intended failure — a worker's kubelet endpoint is reachable over the mesh
+		// and is never served unauthenticated.
 		kubeletClientCAPEM: res.ClientCAPEM,
 
 		// The CLUSTER-CA-issued kubelet SERVING pair, also from the join
@@ -804,33 +814,36 @@ func requireJoinedServingPair(res *bootstrap.JoinResult) error {
 }
 
 // agentInternalIP is the address this worker holds inside the cluster: the one
-// its Node object advertises, its kubelet serving certificate is bound to, and
-// its Service proxy sources cross-node dials from.
+// its Node object advertises, its kubelet API listener binds, its kubelet
+// serving certificate is bound to, and its Service proxy sources cross-node
+// dials from.
 //
-// It comes from the JOIN, not from --node-ip, and the order is the point. The
-// server assigns the address and issues the certificates for it, so the join
-// result (or, on a restart, the stored assignment it was rebuilt from) is the
-// only value that is guaranteed to match what this node's certificates say. The
-// flag is an assertion the server has already checked for equality — a
-// mismatching one never gets this far — so it is the last resort here, kept for
-// the one server that cannot answer: one that predates the response field.
+// It is the mesh address the control plane ASSIGNED and nothing else: the join
+// response's MeshIP (a server that assigns none refuses the join), or on a
+// restart the stored assignment the result was rebuilt from (joinResultFrom).
+// It never falls back to the --node-ip flag, nor to JoinResult.NodeIP, which
+// carries the flag's value against a server that predates that field: both are
+// assertions, and binding the kubelet API to an asserted address (often a LAN
+// address) is the exposure the listener derivation exists to stop. A stored
+// assignment is not guaranteed to carry a meshIP (the credential loader
+// requires only the podCIDR), so an empty result is possible; startNode then
+// refuses to serve the kubelet API with errKubeletAddress.
 //
 // It is pure so the wiring it decides is unit-tested without a live join.
-func agentInternalIP(flagIP string, res *bootstrap.JoinResult) string {
-	if res != nil {
-		if res.NodeIP != "" {
-			return res.NodeIP
-		}
-		if res.MeshIP != "" {
-			return res.MeshIP
-		}
+func agentInternalIP(res *bootstrap.JoinResult) string {
+	if res == nil {
+		return ""
 	}
-	return flagIP
+	return res.MeshIP
 }
 
-// credInternalIP is agentInternalIP for the restart path, where the stored
-// assignment stands in for the join response: the mesh-egress /32 the server
-// assigned IS the address its certificates name.
+// credInternalIP is the mesh address a RESUMING node excludes from the
+// wireguard endpoint candidates it advertises (underlayMeshEndpoint): the
+// stored assignment's meshIP. It does not feed the kubelet listener, the Node
+// object or any certificate; those read agentInternalIP. The flagIP fallback is
+// used only when the stored assignment carries no meshIP, which the
+// credential loader permits (it requires only the podCIDR); there it merely
+// widens the exclusion to an address the operator asserted.
 func credInternalIP(cred *nodeCredential, flagIP string) string {
 	if cred != nil && cred.Assignment.MeshIP != "" {
 		return cred.Assignment.MeshIP
@@ -854,17 +867,14 @@ func credInternalIP(cred *nodeCredential, flagIP string) string {
 //
 // It logs at ERROR and the agent STILL STARTS, because refusing would take a
 // running worker down over a fault it has carried since its join. That is a
-// trade, not a safe state, and the log says so: the kubelet API listens on the
-// WILDCARD *:10250 (serverKubeletListen — see the security note on
-// nodeAddressForListen in node.go), so until the rejoin the stale certificate
-// is still a live TLS identity for the address it was wrongly issued for, on
-// every interface this Mac answers on. The asserted address is often a real LAN
-// address rather than a mesh one, which is exactly the case where something
-// else can reach that port. What holds the door is the client certificate the
-// provider routes require (provider.KubeletEndpointAuth), not this certificate
-// and not the mismatch. So the line reads "rejoin soon", `k3sm status` reports
-// the node degraded until it does (pkg/status's address-mismatch credential
-// row), and the operator chooses when.
+// trade, not a safe state, and the log says so: until the rejoin, logs and exec
+// against this node fail. The kubelet API binds only the ASSIGNED mesh address
+// (resolveKubeletEndpoint), so the stale certificate is no longer served on the
+// asserted address (often a LAN address); what holds the door on the mesh is
+// the client certificate the provider routes require
+// (provider.KubeletEndpointAuth). So the line reads "rejoin soon", `k3sm
+// status` reports the node degraded until it does (pkg/status's
+// address-mismatch credential row), and the operator chooses when.
 //
 // A start that is about to run a TOKEN JOIN says nothing: that join re-issues
 // this node's certificates for whatever address the server assigns, so the
@@ -899,17 +909,16 @@ func credentialRejoinRemedy(server, tokenFile string) string {
 // has just registered, on the one backend that plumbs nothing to reach it with.
 //
 // Every other backend brings the wireguard mesh up, so the InternalIP a node
-// advertises is an address that exists on this Mac. Under `--network none`
-// (control-plane-only / CI joins) it is the assigned mesh address and nothing
-// on this Mac holds or routes it: the apiserver's :10250 dial and cross-node
-// Service traffic both arrive over a tunnel this process did not start. The
-// node still registers, which is what the mode is for, so this is a WARN
-// naming the address rather than a refusal.
+// advertises is an address that exists on this Mac. Under `--network none` it
+// is the assigned mesh address and nothing on this Mac holds it, so the
+// kubelet API, which binds exactly that address, cannot be served: startNode
+// refuses with errKubeletAddress. This WARN names the address first, so the
+// refusal that follows is legible.
 func warnNoDatapathInternalIP(logger *slog.Logger, mode hostnet.Mode, internalIP string) {
 	if mode.DataPath() {
 		return
 	}
-	logger.Warn("this node registers its assigned MESH address as its InternalIP, and --network none brings up no mesh: that address is reachable only over the wireguard tunnel this process is not running, so the apiserver's :10250 dial (kubectl logs/exec) and cross-node Service traffic do not arrive here",
+	logger.Warn("this node's InternalIP is its assigned MESH address, and --network none brings up no mesh: nothing on this Mac holds that address, so the kubelet API cannot bind it and the node will refuse to start; join with a network backend that brings the mesh up",
 		"internalIP", internalIP, "network", "none")
 }
 
@@ -1369,6 +1378,11 @@ func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.
 	// verdict the node will later advertise (see vmBackendAvailable).
 	cfg := workerNetserveConfig(opts, res, mode, vmBackendAvailable(), logger)
 	cfg.Client = cs
+	// Resolved once, here, against this Mac's addresses and the assigned mesh
+	// address the preset names; fixed for this process's life.
+	if cfg.NodePortAddresses, err = resolveNodePortAddresses(opts.nodePortAddresses, cfg.NodeAddress); err != nil {
+		return nil, err
+	}
 	srv := netserve.New(cfg)
 	go func() {
 		if err := srv.Run(ctx); err != nil && ctx.Err() == nil {
@@ -1390,8 +1404,8 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 		WorkDir:           opts.workDir,
 		DNSVIP:            opts.clusterIP,
 		ClusterDomain:     opts.domain,
-		NodeIP:            agentInternalIP(opts.nodeIP, res),
-		NodeAddress:       agentInternalIP(opts.nodeIP, res),
+		NodeIP:            agentInternalIP(res),
+		NodeAddress:       agentInternalIP(res),
 		PodCIDR:           res.PodCIDR,
 		MeshEgressIP:      res.MeshIP,
 		PeerMeshEgressIPs: peerMeshEgressIPs(res.Peers),

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -87,8 +88,9 @@ type serverOptions struct {
 	// kubeletPort is the port the in-process node serves the kubelet HTTP API
 	// (logs/exec/stats) on. Per-server for the same reason kinePort is: it is a
 	// singleton listener, so two control planes on one Mac cannot both have the
-	// default. Only the PORT is configurable — the bind stays the wildcard
-	// serverKubeletListenOn builds, and the API's auth posture is untouched.
+	// default. Only the PORT is configurable: the address is the node's own
+	// InternalIP (resolveKubeletEndpoint), never the wildcard, and the API's
+	// auth posture is untouched.
 	kubeletPort int
 	// schedulerPort / controllerManagerPort are the two co-located control-plane
 	// components' secure-serving ports. Per-server for the same reason as the
@@ -101,6 +103,9 @@ type serverOptions struct {
 	clusterIP             string // DNS VIP the per-node resolver binds + pods resolve against
 	domain                string
 	network               string // host-network backend: auto (default) | none | direct | helper
+	// nodePortAddresses is --nodeport-addresses: where this server's NodePort
+	// listeners bind (empty = every interface).
+	nodePortAddresses string
 
 	// clusterInit / serverJoin select the embedded-etcd HA posture (see
 	// etcdPosture): --cluster-init forms a new etcd cluster on this server,
@@ -361,6 +366,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// a healthy control plane and then a node that dies with "listen tcp :10250:
 	// bind: address already in use". This renumbers the LISTENER ONLY; it does not
 	// change the bind address or the API's authn posture.
+	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
 	fs.IntVar(&opts.kubeletPort, "kubelet-port", ports.KubeletAPIPort, "kubelet HTTP API (logs/exec/stats) listen port — every node on a host needs its own")
 	// The scheduler's and controller-manager's secure ports, the last two fixed
 	// singletons in a server's listener set. A second server on the defaults gets
@@ -497,8 +503,7 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	// 1b. The mesh IP must answer on this host before the apiserver binds it.
-	// FAIL-FAST, unlike the log-and-continue mesh bring-up at 4b.
+	// 1b. The mesh IP must answer here before the apiserver binds it (fail-fast, unlike 4b).
 	if err = ensureMeshIPAlias(ctx, opts.meshIP, mode, logger); err != nil {
 		return err
 	}
@@ -596,8 +601,10 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	// 4c. The node-local datapath (Service proxy + per-node DNS resolver).
-	net, nodeAddressing := startServerDatapath(ctx, plan, cs, sm, vmCapable, logger)
+	net, nodeAddressing, err := startServerDatapath(ctx, plan, cs, sm, vmCapable, logger) // 4c. Service proxy + DNS
+	if err != nil {
+		return err
+	}
 	// 4d. The worker-join supervisor; its stop closes the HA etcd admin client.
 	closeEtcdAdmin := startJoinSupervisor(ctx, plan, cs, sm, logger)
 	defer closeEtcdAdmin()
@@ -614,8 +621,7 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	// 4g/4h, then 5's label repair (prepareServerNode). The deferred crash check
-	// above names the component on the startNode path too.
+	// 4g/4h, then 5's label repair (prepareServerNode); the crash check above covers startNode.
 	if err = prepareServerNode(ctx, plan, restCfg, cs, nodeOpts, logger); err != nil {
 		return err
 	}
@@ -639,9 +645,13 @@ func runServer(args []string) (err error) {
 //
 // A server whose pod range is not its own (sm.dataPathRefused) starts NO datapath
 // and returns zero values: runServerNode parks it before anything reads them.
-func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions) {
+//
+// --nodeport-addresses is resolved here, once, against this Mac's addresses and
+// the address the node advertises; an unusable or empty-selecting spec is the
+// error, and the server refuses to start rather than serve NodePorts nowhere.
+func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions, error) {
 	if sm.dataPathRefused != nil {
-		return nil, nodeOptions{}
+		return nil, nodeOptions{}, nil
 	}
 	opts, mode := plan.opts, plan.mode
 	// The kubernetes-VIP backend: ONLY the loopback-advertise posture (single
@@ -662,6 +672,13 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	// this point. So the addressing half is built once here and nodeOpts
 	// copies it, rather than a second literal restating the same fields.
 	nodeAddressing := nodeOptions{nodeIP: opts.nodeIP, podCIDR: sm.podCIDR, netMode: mode}
+	var nodePortAddrs []netip.Addr
+	if mode.DataPath() {
+		var err error
+		if nodePortAddrs, err = resolveNodePortAddresses(opts.nodePortAddresses, advertisedNodeIP(nodeAddressing)); err != nil {
+			return nil, nodeOptions{}, err
+		}
+	}
 	net := netserve.New(netserve.Config{
 		Client:            cs,
 		WorkDir:           opts.workDir,
@@ -674,6 +691,7 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		// addressing fields from, so both read one value.
 		NodeAddress:       advertisedNodeIP(nodeAddressing),
 		PodCIDR:           sm.podCIDR,
+		NodePortAddresses: nodePortAddrs,
 		MeshEgressIP:      sm.egressIP,
 		PeerMeshEgressIPs: sm.peerEgress,
 		VMBackend:         vmCapable,
@@ -692,7 +710,7 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 			logger.Error("darwin-net services", "err", err)
 		}
 	}()
-	return net, nodeAddressing
+	return net, nodeAddressing, nil
 }
 
 // serverNodeWiring is what the in-process node's options take from the phases
@@ -754,10 +772,12 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 	nodeOpts := nodeOptions{
 		restConfig: nodeRESTCfg,
 		nodeName:   opts.nodeName,
-		listen:     serverKubeletListenOn(opts.kubeletPort),
-		podRoot:    opts.podRoot,
-		logs:       opts.logs,
-		nodeIP:     nodeAddressing.nodeIP,
+		// The kubelet API binds this node's own InternalIP on this port
+		// (resolveKubeletEndpoint), never the wildcard.
+		kubeletPort: opts.kubeletPort,
+		podRoot:     opts.podRoot,
+		logs:        opts.logs,
+		nodeIP:      nodeAddressing.nodeIP,
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,
 		runtime:     opts.rtName,
@@ -1004,9 +1024,10 @@ func clientCertIdentity(certPEM []byte) (string, time.Time, error) {
 //     same broken logs/exec with a less legible error;
 //   - 127.0.0.1 — the same-host dial.
 //
-// A superset is the safe direction here: every address in the set is one this node
-// already serves on (the listen is the wildcard), so naming it in a SAN grants no
-// reach that did not exist. Omitting one silently breaks logs/exec.
+// A superset is the safe direction here: a SAN names addresses the certificate may
+// be presented for, it opens no listener, and the kubelet API binds only the
+// registered InternalIP (resolveKubeletEndpoint). Omitting the registered address
+// silently breaks logs/exec.
 func serverKubeletServingIPs(nodeOpts nodeOptions, meshIP string) []net.IP {
 	advertised := nodeOpts
 	advertised.nodeIP = advertisedNodeIP(nodeOpts)

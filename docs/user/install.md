@@ -197,6 +197,60 @@ present without its fingerprint, when the fingerprint is present without the con
 when the two do not match. Restore both files from the backup taken with `state.db`. `k3sm
 uninstall` keeps both files with the rest of your cluster data.
 
+## Network Exposure
+
+Every listener a node opens, and the addresses it binds:
+
+| Listener | Port | Binds |
+|---|---|---|
+| kubelet API (logs, exec, metrics) | `10250` (`--kubelet-port` on a server) | the node's own address only: its mesh address once joined, its pod-range address on a single node, `127.0.0.1` on a single node under `--network none` |
+| NodePort Services | `30000-32767` | every interface by default, or only the `--nodeport-addresses` set |
+| LoadBalancer Services | each Service's `port` | every interface |
+| Ingress host (server) | `80`, `443` (`--ingress-http-port`, `--ingress-https-port`) | every interface |
+| wireguard mesh | `51820/udp` | every interface; it answers only peers holding a cluster key |
+| apiserver (server) | `6444` (`--api-port`) | `127.0.0.1` on a single server; the mesh address only on a server with `--mesh-ip` |
+| worker join (server with `--mesh-ip`) | `9345` | every interface, because a joining worker has no mesh yet; every request needs the cluster join token |
+| embedded etcd peer (HA servers) | `--etcd-peer-port` | the `--etcd-peer-ip` address you name; peers need a peer certificate |
+| ingest registry (opt-in, `--registry-port`) | the chosen port | `127.0.0.1`, plus a relay on the mesh address and the `vm` NAT gateway |
+| cluster DNS and ClusterIP Services | Service ports | their virtual IPs, aliased on `lo0` |
+| datastore, scheduler, controller-manager (server) | their own ports | `127.0.0.1` |
+
+The kubelet API binds exactly the address the node registers as its `InternalIP`, never every
+interface. If that address is missing when the node starts (a joined worker under `--network
+none`, for example), the node refuses to start and names the address. The standalone `k3sm node`
+command is the exception: its `--listen` address is the operator's choice and may still be the
+wildcard.
+
+NodePorts follow upstream and bind every interface by default. `--nodeport-addresses` narrows the
+NodePorts and nothing else: LoadBalancer Service ports, the ingress host and the worker join port
+still answer on every interface, so a node with this setting is not reachable on loopback and the
+mesh alone. A later switch is planned to cover LoadBalancer and Ingress. See
+[Limitations](limitations.md) for the reserved ports and the other networking caveats.
+
+On a network you do not trust, set `--nodeport-addresses local`:
+
+```sh
+sudo k3sm install --nodeport-addresses local
+sudo k3sm install --agent --server <control-plane> --token-file <file> --nodeport-addresses local
+```
+
+`local` is loopback (`127.0.0.1`) plus the node's own address, so a NodePort answers on the Mac
+itself and from the other nodes over the mesh, and on no Wi-Fi or Ethernet address. The value can
+also be a comma-separated list of IPv4 CIDRs, the kube-proxy `--nodeport-addresses` shape, mixed
+with `local` if you like (`local,10.0.0.0/8`). Each NodePort then binds every matching address of
+this Mac, or none of them if any bind fails.
+
+- The setting is IPv4 only. An IPv6 range is refused.
+- It needs the node datapath. A non-empty value beside `--network none` is refused, on `k3sm
+  install`, `k3sm server` and `k3sm agent` alike.
+- It is resolved once, when the daemon starts, against the addresses this Mac has then. A value that
+  matches no address refuses the start. An address that appears later (a new network) is used after
+  the next restart.
+- It is recorded with the other install arguments and kept across a reinstall and an uninstall.
+  Surrounding spaces are ignored. `sudo k3sm install --nodeport-addresses ""` (or a value of only
+  spaces) returns to every interface.
+- `k3sm server` and `k3sm agent` take the same flag directly.
+
 ## Uninstalling
 
 ```sh

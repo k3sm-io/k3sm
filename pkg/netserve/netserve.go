@@ -105,6 +105,11 @@ type Config struct {
 	NodeAddress string
 	// PodCIDR is the node pod CIDR; empty uses defaultPodCIDR.
 	PodCIDR string
+	// NodePortAddresses is the address set every NodePort listener binds
+	// (proxy.WithNodePortAddresses), resolved once by the caller from the
+	// --nodeport-addresses spec (proxy.ResolveNodePortAddresses). Empty keeps
+	// the wildcard, the upstream default.
+	NodePortAddresses []netip.Addr
 	// MeshEgressIP, when set, is the node's reserved mesh-egress /32
 	// (podnet.MeshEgressIP) the Service proxy's backend dialer sources cross-node
 	// dials from, so a dial that egresses the wireguard utun carries a source
@@ -300,6 +305,11 @@ func New(cfg Config) *Server {
 	} else if vmnet.IsValid() {
 		log.Info("NetworkPolicy table scoped to the node's vm NAT segment (unknown sources inside it fail closed)", "vmnet_subnet", vmnet.String())
 	}
+	if len(cfg.NodePortAddresses) > 0 {
+		opts = append(opts, proxy.WithNodePortAddresses(cfg.NodePortAddresses...))
+		log.Info("NodePort listeners bind a configured address set instead of every interface", "nodeport_addresses", cfg.NodePortAddresses)
+	}
+
 	s.policy = proxy.NewPolicyTableVMNet(vmnet, seeds...)
 	opts = append(opts, proxy.WithPolicyTable(s.policy))
 

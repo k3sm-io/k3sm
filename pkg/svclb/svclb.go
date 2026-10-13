@@ -77,10 +77,12 @@ type HosterConfig struct {
 	// BindAddr is the address every LoadBalancer listener binds. It must be
 	// VALID; the WILDCARD (0.0.0.0) is the production choice and is accepted.
 	BindAddr netip.Addr
-	// ReservedPorts is the set of ports k3sm's OWN wildcard listeners occupy (the
+	// ReservedPorts is the set of ports k3sm's OWN listeners occupy (the
 	// NodePort range and the kubelet API port — pkg/ports.ReservedSet). bind
-	// REFUSES them outright rather than racing a k3sm listener for the same
-	// wildcard socket. Admission rejects such a Service first (pkg/policy) — this
+	// REFUSES them outright rather than racing a k3sm listener for the port (a
+	// wildcard NodePort fails the bind by start order; a NodePort or kubelet API
+	// listener on a specific address coexists with the wildcard LB listener and
+	// splits the port's addresses between two owners). Admission rejects such a Service first (pkg/policy) — this
 	// is the second, datapath-side enforcement point, because the VAP is
 	// failurePolicy: Ignore and may be absent.
 	//
@@ -535,10 +537,11 @@ func (h *Hoster) report(ctx context.Context, entries []string) {
 // privileged wildcard only for the canonical ingress Service, so it stays off
 // the tenant LoadBalancer datapath.
 //
-// It REFUSES a reserved port before touching the binder: racing k3sm's own
-// NodePort-range or kubelet-API listener for the same wildcard socket would let
-// the winner be decided by start order, and losing :10250 kills logs/exec/
-// `kubectl top` on this node.
+// It REFUSES a reserved port before touching the binder: against a wildcard
+// NodePort listener the winner would be decided by start order, and against
+// the kubelet API (bound on the node address) or a NodePort bound on a
+// configured address set the wildcard LB listener would coexist and answer
+// every other address on the same port. A port keeps one owner on a node.
 func (h *Hoster) bind(ctx context.Context, port int32, dst netip.AddrPort, ranges Ranges) (*forwarder, error) {
 	if h.cfg.ReservedPorts[port] {
 		return nil, fmt.Errorf("svclb: refusing port %d: %w", port, errReservedPort)

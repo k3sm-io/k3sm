@@ -1302,6 +1302,10 @@ type Config struct {
 	// kubeconfig` and `uninstall --purge` read it back. Empty keeps a carried
 	// name; DefaultKubeconfigName clears it. Control plane only.
 	KubeconfigName string
+	// NodePortAddresses is `k3sm install --nodeport-addresses`, carried in the
+	// node daemon's arguments for its Role (setNodePortAddressesArg). Nil keeps
+	// a carried value; an empty value removes it.
+	NodePortAddresses *string
 	// ExtraAgentArgs are operator-supplied `k3sm agent` arguments appended to the
 	// fixed set AgentPlist renders (--mesh-port, --dns-vip, …). Install
 	// populates it exactly as it populates ExtraServerArgs: from the agent plist
@@ -1609,6 +1613,7 @@ func (c Config) resolvedExtraServerArgs() []string {
 	if c.KubeconfigName != "" {
 		args = setKubeconfigNameArg(args, c.KubeconfigName)
 	}
+	args = c.setNodePortAddressesArg(args)
 	if c.etcdRequested() {
 		args = setEtcdArgs(args, c)
 	}
@@ -1987,6 +1992,10 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//      and an address that names no range would leave netd refusing the
 	//      server's own mesh alias at every start.
 	if err := checkServerMeshIP(cfg, serverArgs); err != nil {
+		return err
+	}
+	// 0b‴. A --nodeport-addresses beside a carried --network none is refused.
+	if err := checkNodePortPosture(sys, cfg, serverArgs); err != nil {
 		return err
 	}
 	// 0b′. Secrets encryption, decided from reads alone and before the first

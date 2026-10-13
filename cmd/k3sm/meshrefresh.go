@@ -179,7 +179,7 @@ func newWorkerEndpointRefresher(opts agentOptions, res *bootstrap.JoinResult, jo
 			// The mesh address the candidates are filtered against is the
 			// ASSIGNED one (agentInternalIP), so a node that passed no --node-ip
 			// still excludes its own mesh /32 from the endpoints it advertises.
-			return underlayMeshEndpoint(d.localIP(), agentInternalIP(opts.nodeIP, res), opts.meshPort)
+			return underlayMeshEndpoint(d.localIP(), agentInternalIP(res), opts.meshPort)
 		},
 		publish: func(ctx context.Context, endpoint string) error {
 			return bootstrap.RefreshMeshEndpoint(ctx, client, serverURL, opts.nodeName, endpoint)
