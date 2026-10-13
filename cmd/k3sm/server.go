@@ -341,7 +341,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.StringVar(&opts.workDir, "work-dir", defaultWorkDir, "control-plane state root (binaries, kine DB, certs, kubeconfig); posture-aware default")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.BoolVar(&opts.clearCrashLoop, "clear-crashloop", false, "clear the crash-loop record under --work-dir and exit 0 instead of serving; a parked daemon then exits and launchd starts a clean boot")
-	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise; a non-loopback value is aliased on lo0 by the pod network, so it must lie in this node's pod range (leave it at the default on a mesh server: the node then advertises --mesh-ip). Never the etcd peer address: that is --etcd-peer-ip")
+	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise (the default loopback runs a single server with the apiserver endpoint reconciler off); a non-loopback value is aliased on lo0 by the pod network, so it must lie in this node's pod range (leave it at the default on a mesh server: the node then advertises --mesh-ip). Never the etcd peer address: that is --etcd-peer-ip")
 	fs.StringVar(&opts.meshIP, "mesh-ip", "", "wireguard mesh IP to bind the apiserver + worker-join supervisor on (enables multi-node join; empty = single-node)")
 	fs.String("kubeconfig-name", "", "the name k3sm install --kubeconfig-name merged the admin kubeconfig under; recorded in the daemon's arguments for k3sm kubectl and uninstall --purge, and unused by the server itself")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
@@ -646,13 +646,14 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	opts, mode := plan.opts, plan.mode
 	// The kubernetes-VIP backend: ONLY the loopback-advertise posture (single
 	// node) pins the static proxy backend at the apiserver's real loopback listen
-	// address — upstream validation rejects loopback endpoint addresses, so no
-	// kubernetes EndpointSlice can exist there. A mesh apiserver binds/advertises
-	// the mesh IP, publishes its OWN valid endpoints, and the proxy must follow
-	// that real slice (a static loopback pin would route the VIP at a
-	// non-listening address).
+	// address — the executor runs that apiserver with --endpoint-reconciler-type=none
+	// (the lease reconciler rejects a loopback advertise address), so no kubernetes
+	// EndpointSlice exists there. A mesh apiserver binds/advertises the mesh IP,
+	// publishes its OWN valid endpoints, and the proxy must follow that real slice
+	// (a static loopback pin would route the VIP at a non-listening address). The
+	// decision is apiServerLoopback, the same one the executor flag keys on.
 	apiServerEndpoint := ""
-	if isLoopbackDefault(opts.nodeIP) {
+	if apiServerLoopback(opts) {
 		apiServerEndpoint = "127.0.0.1:" + strconv.Itoa(opts.apiPort)
 	}
 	// nodeAddressing holds the only inputs advertisedNodeIP reads. The full
@@ -1193,4 +1194,18 @@ func canonicalServerNodeName(given string) (string, error) {
 		return "", fmt.Errorf("--node-name %q is not in canonical form; pass --node-name %s", given, name)
 	}
 	return name, nil
+}
+
+// apiServerLoopback reports whether the apiserver this server runs advertises a
+// loopback address: the address the executor hands kube-apiserver as
+// --advertise-address (the mesh IP on a mesh server, else --node-ip) tested with
+// executor.IsLoopbackNodeIP. It is the ONE decision behind both the executor's
+// --endpoint-reconciler-type=none and the proxy's static kubernetes-VIP backend
+// pin, so the two cannot disagree. Only a single loopback server qualifies; a
+// server with a peer uses a mesh IP and the lease reconciler.
+func apiServerLoopback(opts serverOptions) bool {
+	if opts.meshIP != "" {
+		return executor.IsLoopbackNodeIP(opts.meshIP)
+	}
+	return executor.IsLoopbackNodeIP(opts.nodeIP)
 }
