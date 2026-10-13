@@ -1392,11 +1392,11 @@ phases:
         note: "L1-L4, L11, L12. Stop is the full stop (the k3s-killall analog) that stays stopped across reboot until start: an intent marker first, best-effort cordon and the k3sm.io/stopped-by-user annotation, disable plus bootout of the node daemon with awaitUnloaded, ONE shared teardown extracted from Uninstall (pod groups SIGTERM then 10 s then SIGKILL, RemoveMesh, FlushLo0Aliases from the persisted record), netd disable plus bootout, the completion marker last; plists stay; every step idempotent. netd does NOT tear down on SIGTERM (L12): launchd sends SIGTERM for every restart and upgrade. Install and update honour a user stop unless --start (L3)."
         deliverables:
           - id: M18.1-d1
-            done: true
-            desc: "B481 — `k3sm stop` per L1, with the Uninstall teardown extracted into one function both verbs call, the await barriers from pkg/install/restart.go, the two-phase marker (stopping, stopped) 0644 in a root-owned directory, best-effort cordon and annotation, and actor/reason/result logged to slog and os_log."
+            done: false
+            desc: "B481 — `k3sm stop` per L1, with the Uninstall teardown extracted into one function both verbs call, the await barriers from pkg/install/restart.go, the two-phase marker (stopping, stopped) 0644 in a root-owned directory, best-effort cordon and annotation, and actor/reason/result logged to slog and os_log. Code and the named unit gate landed; owed before done: the rig leg (stop and start on both roles, worker and server; reboot survival excluded per B35)."
           - id: M18.1-d2
-            done: true
-            desc: "B482 — `k3sm start` (markers removed, enable, netd then node daemon, the shared flush as a precondition, best-effort uncordon) and `k3sm restart` (pods keep running); install, in-app update and uninstall form one state machine: install and update honour the marker unless --start, uninstall clears the disable override and the markers."
+            done: false
+            desc: "B482 — `k3sm start` (markers removed, enable, netd then node daemon, the shared flush as a precondition, best-effort uncordon) and `k3sm restart` (pods keep running); install, in-app update and uninstall form one state machine: install and update honour the marker unless --start, uninstall clears the disable override and the markers. Code and the named unit gate landed; owed before done: the rig leg (stop and start on both roles, worker and server; reboot survival excluded per B35)."
           - id: M18.1-d3
             done: false
             desc: "B483 — an additive omitempty `stoppedBy {actor, reason, at, phase}` on both status shapes, no new verdict or state enum, golden fixtures extended, docs/user/status-json.md updated."
