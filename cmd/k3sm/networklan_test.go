@@ -253,7 +253,7 @@ func newLANRig(t *testing.T, role install.Role) *lanRig {
 // lanRigHost is the rig Mac's interface addresses: a Wi-Fi address,
 // loopback and the mesh address on its utun.
 func lanRigHost() ([]netip.Addr, error) {
-	return []netip.Addr{netip.MustParseAddr("192.168.1.20"), netip.MustParseAddr("127.0.0.1"), lanNode}, nil
+	return []netip.Addr{netip.MustParseAddr("192.0.2.20"), netip.MustParseAddr("127.0.0.1"), lanNode}, nil
 }
 
 // socketsFor is what a node daemon of role in state lan listens on: one
@@ -455,8 +455,8 @@ func TestNetworkLanToggle(t *testing.T) {
 	t.Run("each family rebinds to the resolved set, NodePorts keep an explicit spec when on", func(t *testing.T) {
 		rig := newLANRig(t, install.RoleServer)
 		f := &fakeFamily{fam: "nodeports"}
-		if err := rig.sw.attach("192.168.0.0/16", lanNode.String(), func(sets lanSets) (lanFamily, error) {
-			if want := []netip.Addr{netip.MustParseAddr("192.168.1.20")}; !slices.Equal(sets.nodePorts, want) {
+		if err := rig.sw.attach("192.0.2.0/24", lanNode.String(), func(sets lanSets) (lanFamily, error) {
+			if want := []netip.Addr{netip.MustParseAddr("192.0.2.20")}; !slices.Equal(sets.nodePorts, want) {
 				t.Errorf("initial (upgraded, no record: on) NodePort set = %v, want the spec's %v", sets.nodePorts, want)
 			}
 			return f, nil
@@ -474,7 +474,7 @@ func TestNetworkLanToggle(t *testing.T) {
 		if err := rig.sw.apply(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if want := []netip.Addr{netip.MustParseAddr("192.168.1.20")}; !slices.Equal(f.ports, want) {
+		if want := []netip.Addr{netip.MustParseAddr("192.0.2.20")}; !slices.Equal(f.ports, want) {
 			t.Errorf("on: NodePorts on %v, want the spec's %v", f.ports, want)
 		}
 	})
@@ -760,7 +760,7 @@ func TestNetworkLanToggle(t *testing.T) {
 	})
 
 	t.Run("the socket check", func(t *testing.T) {
-		host := []netip.Addr{netip.MustParseAddr("192.168.1.20"), netip.MustParseAddr("127.0.0.1"), lanNode, netip.MustParseAddr("192.168.64.1")}
+		host := []netip.Addr{netip.MustParseAddr("192.0.2.20"), netip.MustParseAddr("127.0.0.1"), lanNode, netip.MustParseAddr("192.168.64.1")}
 		ap := netip.MustParseAddrPort
 		cases := []struct {
 			name  string
@@ -773,7 +773,7 @@ func TestNetworkLanToggle(t *testing.T) {
 			{"off: local listeners, kubelet, ClusterIP, the join wildcard", install.LANOff, install.RoleServer, nil,
 				[]netip.AddrPort{ap("127.0.0.1:30090"), ap("100.64.0.1:30090"), ap("100.64.0.1:10250"), ap("10.43.0.10:53"), ap("0.0.0.0:9345"), ap("100.64.0.1:443")}, true},
 			{"off: a wildcard NodePort", install.LANOff, install.RoleServer, nil, []netip.AddrPort{ap("0.0.0.0:30090")}, false},
-			{"off: a LoadBalancer on the Wi-Fi address", install.LANOff, install.RoleServer, nil, []netip.AddrPort{ap("192.168.1.20:8080")}, false},
+			{"off: a LoadBalancer on the Wi-Fi address", install.LANOff, install.RoleServer, nil, []netip.AddrPort{ap("192.0.2.20:8080")}, false},
 			{"off: the join wildcard on a worker is not allowed", install.LANOff, install.RoleAgent, nil, []netip.AddrPort{ap("0.0.0.0:9345")}, false},
 			{"off: the vm NAT gateway relay is not the LAN", install.LANOff, install.RoleServer, []string{"--registry-port", "5000"}, []netip.AddrPort{ap("192.168.64.1:5000")}, true},
 			{"on: wildcard NodePort, LoadBalancer and ingress", install.LANOn, install.RoleServer, nil,
