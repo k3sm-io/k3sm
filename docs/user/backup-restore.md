@@ -69,7 +69,10 @@ The restore is built to be survivable when it goes wrong:
 - It **recognizes a compressed snapshot by its content**, not its name, so a renamed file restores
   either way. A compressed snapshot is decompressed into a temporary file beside the datastore and
   checked there before anything is replaced. An archive that is truncated, fails its checksum, holds
-  more than one file, or would decompress to more than 8 GiB is refused, and nothing is changed.
+  more than one file, decompresses to more than its header declares, or would decompress to more
+  than 8 GiB is refused, and nothing is changed. The temporary copy holds every Secret in plaintext,
+  so it is removed when the restore ends, and a copy left by an interrupted restore is removed by
+  the next restore or the next start of the server.
 - It **preserves what it replaces**. The superseded `state.db` is moved to
   `state.db.restore-<UTC>.bak` and never deleted, and its `-wal`/`-shm` sidecars and kine pin stamp
   go with it, because a stale sidecar left beside a restored database is exactly how a "successful"
@@ -129,8 +132,9 @@ What the schedule does:
   server left behind, and nothing else.
 - A snapshot is **skipped** when the snapshot directory's volume has less than twice the last
   snapshot's size free, so the schedule does not fill the disk the datastore lives on. With
-  compression on, the etcd database's own size is used when it is larger, because the snapshot is
-  written and checked uncompressed before it is compressed.
+  compression on, or when the newest snapshot is compressed, the etcd database's own size is used
+  when it is larger, because the snapshot is written and checked uncompressed before it is
+  compressed.
 - Each snapshot taken and each one removed is an `INFO` line in the server log; a failed or skipped
   snapshot is a `WARN` line. `k3sm status -o wide` shows, on the `etcd` row, the schedule, when the
   newest scheduled snapshot was taken, how many are kept, and, until the next snapshot succeeds,

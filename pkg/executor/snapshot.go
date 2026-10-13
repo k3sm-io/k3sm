@@ -300,6 +300,11 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 	if err := os.MkdirAll(dbd, 0o755); err != nil {
 		return nil, fmt.Errorf("create datastore dir: %w", err)
 	}
+	// A decompressed copy a crashed restore left is a plaintext copy of the cluster's
+	// Secrets; no control plane is running (checked above), so none is in use.
+	if _, err := sweepInflateDebris(dbd); err != nil {
+		return nil, err
+	}
 	// A compressed snapshot is inflated (capped) into a temporary file beside the
 	// datastore, and everything below runs on those bytes: the restored datastore is
 	// the plain snapshot exactly, whichever form the file was kept in.

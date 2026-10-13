@@ -19,8 +19,10 @@ package executor
 import (
 	"archive/zip"
 	"bytes"
+	"compress/flate"
 	"context"
 	"errors"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"os"
@@ -419,5 +421,212 @@ func TestCompressedSnapshotArchiveShape(t *testing.T) {
 		if got := plainStagingPath(in); got != want {
 			t.Errorf("plainStagingPath(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// forgedZip is a one-member archive whose header declares declared bytes while the
+// deflated member inflates to all of real, with real's own CRC-32: only the size lies.
+func forgedZip(t *testing.T, name string, real []byte, declared uint64) []byte {
+	t.Helper()
+	var deflated bytes.Buffer
+	fw, err := flate.NewWriter(&deflated, flate.DefaultCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(real); err != nil {
+		t.Fatal(err)
+	}
+	if err := fw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.CreateRaw(&zip.FileHeader{
+		Name: name, Method: zip.Deflate, CRC32: crc32.ChecksumIEEE(real),
+		CompressedSize64: uint64(deflated.Len()), UncompressedSize64: declared,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(deflated.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestSnapshotForgedSizeHeader: a member that declares 1 KiB (which is what the
+// free-space check is sized from) but inflates to more is refused as a bad archive,
+// with the datastore untouched and no decompressed copy left, in both postures.
+func TestSnapshotForgedSizeHeader(t *testing.T) {
+	forged := forgedZip(t, "k3sm-snapshot.db", bytes.Repeat([]byte("k3sm"), 64<<10), 1024)
+	snap := filepath.Join(t.TempDir(), "forged.zip")
+	mustWrite(t, snap, forged)
+
+	n, err := inflateSnapshot(snap, io.Discard, maxDecompressedSnapshotBytes)
+	if !errors.Is(err, ErrSnapshotArchive) || n > 1025 {
+		t.Fatalf("inflateSnapshot(forged) = %d, %v; want ErrSnapshotArchive after at most the declared size", n, err)
+	}
+
+	work := snapshotFixture(t, 5, 0)
+	before := digestOf(t, StateDBPath(work))
+	if _, err := RestoreSnapshot(context.Background(), SnapshotRestoreOptions{WorkDir: work, Snapshot: snap, Running: noServer}); !errors.Is(err, ErrSnapshotArchive) {
+		t.Fatalf("kine restore(forged) = %v, want ErrSnapshotArchive", err)
+	}
+	if digestOf(t, StateDBPath(work)) != before {
+		t.Fatal("the forged archive changed the datastore")
+	}
+	noInflateDebris(t, dbDir(work))
+
+	f := newRestoreFixture(t, true)
+	entries := workDirEntries(t, f.wd)
+	if _, err := restoreEtcdSnapshot(t.Context(), f.opts(snap), fakeRestoreSeams(t, nil)); !errors.Is(err, ErrSnapshotArchive) {
+		t.Fatalf("etcd restore(forged) = %v, want ErrSnapshotArchive", err)
+	}
+	if got := workDirEntries(t, f.wd); !slices.Equal(got, entries) {
+		t.Errorf("the refused etcd restore changed the work dir: %v -> %v", entries, got)
+	}
+}
+
+// TestSnapshotInflateDebrisSwept: a decompressed copy a crashed restore left (a
+// plaintext copy of every Secret) is removed by the next restore in either posture and
+// by the snapshot schedule's start-up sweep; a symlink of the same shape is not
+// followed or removed.
+func TestSnapshotInflateDebrisSwept(t *testing.T) {
+	plant := func(t *testing.T, dir string) (stale, link, target string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		stale = filepath.Join(dir, ".k3sm-snapshot-inflate-123.tmp")
+		mustWrite(t, stale, []byte("plaintext secrets"))
+		target = filepath.Join(t.TempDir(), "elsewhere")
+		mustWrite(t, target, []byte("not a restore's"))
+		link = filepath.Join(dir, ".k3sm-snapshot-inflate-456.tmp")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		return stale, link, target
+	}
+	check := func(t *testing.T, stale, link, target string) {
+		t.Helper()
+		if fileExists(stale) {
+			t.Errorf("the stale decompressed copy %s survived", stale)
+		}
+		if _, err := os.Lstat(link); err != nil {
+			t.Errorf("a symlink of the debris shape was removed: %v", err)
+		}
+		if b, err := os.ReadFile(target); err != nil || string(b) != "not a restore's" {
+			t.Errorf("the symlink's target was touched: %q %v", b, err)
+		}
+	}
+
+	t.Run("kine restore", func(t *testing.T) {
+		work := snapshotFixture(t, 5, 0)
+		res, err := SaveSnapshot(context.Background(), SnapshotSaveOptions{WorkDir: work, Out: filepath.Join(t.TempDir(), "s.db")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale, link, target := plant(t, dbDir(work))
+		if _, err := RestoreSnapshot(context.Background(), SnapshotRestoreOptions{WorkDir: work, Snapshot: res.Path, Running: noServer}); err != nil {
+			t.Fatal(err)
+		}
+		check(t, stale, link, target)
+	})
+
+	t.Run("etcd restore", func(t *testing.T) {
+		f := newRestoreFixture(t, true)
+		stale, link, target := plant(t, f.wd)
+		if _, err := restoreEtcdSnapshot(t.Context(), f.opts(f.good), fakeRestoreSeams(t, nil)); err != nil {
+			t.Fatal(err)
+		}
+		check(t, stale, link, target)
+	})
+
+	t.Run("schedule start-up", func(t *testing.T) {
+		cron, err := ParseCron(DefaultEtcdSnapshotCron)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wd := t.TempDir()
+		stale, link, target := plant(t, wd)
+		s := NewSupervised(Config{
+			WorkDir: wd,
+			Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP,
+				Snapshots: &EtcdSnapshotSchedule{Cron: cron, Retention: 1}},
+			Logger: slog.New(slog.DiscardHandler),
+		})
+		s.etcd.clock = newFakeClock(0)
+		_ = s.newEtcdSnapshotScheduler(healthyFake())
+		check(t, stale, link, target)
+	})
+}
+
+// TestEtcdSnapshotFloorSizing: the schedule's free-space floor is sized from the
+// member's backend whenever the newest snapshot is an archive or compression is on,
+// and, when the backend size cannot be read, from the larger of the archive's
+// declared uncompressed size and its own size, never from the archive alone.
+func TestEtcdSnapshotFloorSizing(t *testing.T) {
+	const backend = 5 << 20
+	plain := withTrailer(etcdBackendBytes(t, "key", "meta"))
+	big := append(bytes.Clone(plain), make([]byte, 2<<20)...) // deflates to far less than it holds
+	for _, tc := range []struct {
+		name     string
+		compress bool
+		newest   []byte // the newest scheduled snapshot's bytes
+		dbErr    error
+		want     int64
+	}{
+		{"plain newest, compression off: the last size", false, plain, nil, int64(len(plain))},
+		{"archive newest, compression off: the backend", false, zipOf(t, "m", big), nil, backend},
+		{"plain newest, compression on: the backend", true, plain, nil, backend},
+		{"archive newest, backend unreadable: the declared size", false, zipOf(t, "m", big), errors.New("no member"), int64(len(big))},
+		{"plain newest, compression on, backend unreadable: the last size", true, plain, errors.New("no member"), int64(len(plain))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cron, err := ParseCron(DefaultEtcdSnapshotCron)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wd := t.TempDir()
+			s := NewSupervised(Config{
+				WorkDir: wd,
+				Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP,
+					Snapshots: &EtcdSnapshotSchedule{Cron: cron, Retention: 3, Compress: tc.compress}},
+				Logger: slog.New(slog.DiscardHandler),
+			})
+			clk := newFakeClock(0)
+			s.etcd.clock = clk
+			dir := SnapshotDir(wd)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			name := ScheduledEtcdSnapshotName("server-a", clk.Now().Add(-time.Hour))
+			if isZipBytes := bytes.HasPrefix(tc.newest, zipLocalHeaderMagic); isZipBytes {
+				name += compressedSnapshotExt
+			}
+			p := filepath.Join(dir, name)
+			mustWrite(t, p, tc.newest)
+			if err := os.Chtimes(p, clk.Now().Add(-time.Hour), clk.Now().Add(-time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			sc := s.newEtcdSnapshotScheduler(healthyFake())
+			sc.dbSize = func(context.Context) (int64, error) { return backend, tc.dbErr }
+			var asked uint64
+			sc.space = func(_ string, want uint64) error {
+				asked = want
+				return &snapshotSpaceError{dir: dir, want: want}
+			}
+			sc.save = func(context.Context, string, bool) error {
+				t.Error("a tick below the floor streamed a snapshot")
+				return nil
+			}
+			sc.tick(t.Context())
+			if want := uint64(tc.want) * snapshotFreeSpaceFactor; asked != want {
+				t.Fatalf("floor asked for %d bytes, want %d (%dx %d)", asked, want, snapshotFreeSpaceFactor, tc.want)
+			}
+		})
 	}
 }

@@ -47,6 +47,11 @@ import (
 // is replaced. A truncated archive has no central directory and is refused by the zip
 // reader; a corrupt member fails the CRC-32 check at its end. Either way the datastore
 // is untouched.
+//
+// The temporary copy is a plaintext copy of every Secret in the snapshot. A restore
+// removes it on every return, and because a crash cannot, every restore and every
+// control-plane start first sweeps the copies an earlier one left
+// (sweepInflateDebris).
 
 // zipLocalHeaderMagic opens every zip archive that has at least one member
 // (PK\x03\x04, the local file header signature).
@@ -180,10 +185,13 @@ func writeSnapshotZip(w io.Writer, r io.Reader, name string, mod time.Time) erro
 }
 
 // inflateSnapshot copies the single member of the archive at path into w, reading at
-// most limit bytes of it, and returns how many bytes it wrote. It refuses an archive
-// that does not hold exactly one regular member, a member that declares or inflates to
-// more than limit, and a member whose CRC-32 does not match (which archive/zip reports
-// at the member's end, so the whole member is always read).
+// most min(the member's declared size, limit) bytes of it, and returns how many bytes
+// it wrote. It refuses an archive that does not hold exactly one regular member, a
+// member that declares more than limit (ErrSnapshotTooLarge), a member that inflates
+// past its declared size (ErrSnapshotArchive: the header the free-space check was
+// sized from lied), and a member whose CRC-32 does not match (which archive/zip
+// reports at the member's end, so the whole member is always read). archive/zip also
+// refuses a member that outgrows its declared size; the bound here does not rely on it.
 func inflateSnapshot(path string, w io.Writer, limit int64) (int64, error) {
 	zr, err := zip.OpenReader(path)
 	if err != nil {
@@ -205,14 +213,15 @@ func inflateSnapshot(path string, w io.Writer, limit int64) (int64, error) {
 		return 0, fmt.Errorf("%w: %s: %w", ErrSnapshotArchive, path, err)
 	}
 	defer func() { _ = rc.Close() }()
-	// One byte past the limit is read so an over-long member is told apart from one
-	// that ends exactly at it; the header is not trusted for this.
-	n, err := io.Copy(w, io.LimitReader(rc, limit+1))
+	bound := int64(m.UncompressedSize64) // <= limit, checked above
+	// One byte past the bound is read so an over-long member is told apart from one
+	// that ends exactly at it.
+	n, err := io.Copy(w, io.LimitReader(rc, bound+1))
 	if err != nil {
 		return n, fmt.Errorf("%w: %s: %w", ErrSnapshotArchive, path, err)
 	}
-	if n > limit {
-		return n, fmt.Errorf("%w: %s inflates past %d bytes", ErrSnapshotTooLarge, path, limit)
+	if n > bound {
+		return n, fmt.Errorf("%w: %s inflates past the %d bytes its header declares", ErrSnapshotArchive, path, bound)
 	}
 	return n, nil
 }
@@ -268,6 +277,35 @@ func openSnapshotInput(path, dir string) (*decompressedSnapshot, error) {
 		return nil, fmt.Errorf("%w — nothing was changed", ierr)
 	}
 	return &decompressedSnapshot{path: tmp, compressed: true, cleanup: cleanup}, nil
+}
+
+// inflateDebrisPattern matches the temporary decompressed copies openSnapshotInput
+// creates.
+const inflateDebrisPattern = ".k3sm-snapshot-inflate-*.tmp"
+
+// sweepInflateDebris removes the temporary decompressed snapshot copies a crashed
+// restore left in dir: regular files of inflateDebrisPattern only, never through a
+// symlink. It returns what it removed; a file it could not remove is an error, and the
+// rest are still tried.
+func sweepInflateDebris(dir string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, inflateDebrisPattern))
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	var errs []error
+	for _, p := range matches {
+		fi, err := os.Lstat(p)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove the stale decompressed snapshot %s: %w", p, err))
+			continue
+		}
+		removed = append(removed, p)
+	}
+	return removed, errors.Join(errs...)
 }
 
 // declaredSnapshotSize is the uncompressed size the archive's single member declares,

@@ -216,6 +216,18 @@ func restoreEtcdSnapshot(ctx context.Context, opts EtcdRestoreOptions, seams etc
 		return nil, fmt.Errorf("%w: %s", ErrEtcdRestoreOverSQLite, StateDBPath(opts.WorkDir))
 	}
 
+	// The work-dir lock is taken before anything is written into the work dir (the
+	// decompressed copy of a compressed snapshot, the sweep of a crashed restore's
+	// copies): a running server, or a second restore, holds it.
+	unlock, err := lockWorkDir(opts.WorkDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = unlock() }()
+	if _, err := sweepInflateDebris(opts.WorkDir); err != nil {
+		return nil, err
+	}
+
 	ofi, err := os.Stat(opts.Snapshot)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrSnapshotNotFound, opts.Snapshot, err)
@@ -252,11 +264,6 @@ func restoreEtcdSnapshot(ctx context.Context, opts EtcdRestoreOptions, seams etc
 		res.Warnings = append(res.Warnings, w)
 	}
 
-	unlock, err := lockWorkDir(opts.WorkDir)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = unlock() }()
 	if err := refuseRunningEtcd(ctx, opts, seams); err != nil {
 		return nil, err
 	}
