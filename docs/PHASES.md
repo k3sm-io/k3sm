@@ -1392,7 +1392,7 @@ phases:
         note: "L1-L4, L11, L12. Stop is the full stop (the k3s-killall analog) that stays stopped across reboot until start: an intent marker first, best-effort cordon and the k3sm.io/stopped-by-user annotation, disable plus bootout of the node daemon with awaitUnloaded, ONE shared teardown extracted from Uninstall (pod groups SIGTERM then 10 s then SIGKILL, RemoveMesh, FlushLo0Aliases from the persisted record), netd disable plus bootout, the completion marker last; plists stay; every step idempotent. netd does NOT tear down on SIGTERM (L12): launchd sends SIGTERM for every restart and upgrade. Install and update honour a user stop unless --start (L3)."
         deliverables:
           - id: M18.1-d1
-            done: false
+            done: true
             desc: "B481 — `k3sm stop` per L1, with the Uninstall teardown extracted into one function both verbs call, the await barriers from pkg/install/restart.go, the two-phase marker (stopping, stopped) 0644 in a root-owned directory, best-effort cordon and annotation, and actor/reason/result logged to slog and os_log."
           - id: M18.1-d2
             done: false

@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -38,6 +38,8 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", 
   install     install the netd + server launchd daemons (run as root via sudo)
   uninstall   remove the k3sm daemons, keeping cluster data (run as root via sudo;
               --purge --yes also removes the data, logs and _k3sm user)
+  stop        stop k3sm completely and keep it stopped across reboots (run as root
+              via sudo; see k3sm stop --help for what it does and its exit codes)
   datavol     the APFS volume the data root lives on (datavol mount|status|delete)
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
@@ -97,6 +99,14 @@ func main() {
 		if err := runPayload(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm payload:", err)
 			os.Exit(1)
+		}
+	case "stop":
+		if code := runStop(os.Args[2:], os.Stderr); code != 0 {
+			os.Exit(code)
+		}
+	case netdRemoveMeshVerb:
+		if code := runNetdRemoveMesh(os.Args[2:], os.Stderr); code != 0 {
+			os.Exit(code)
 		}
 	case "uninstall":
 		if err := runUninstall(os.Args[2:]); err != nil {

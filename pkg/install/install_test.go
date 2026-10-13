@@ -269,6 +269,15 @@ type fakeSystem struct {
 	// changes beyond the plain uninstall: markers, path stats, the service user
 	// record, the processes it runs, launchd's loaded list. See purge_fake_test.go.
 	purge fakePurge
+	// life is the fake's model of what `k3sm stop` and `k3sm start` read and
+	// change beyond launchd: the stop marker, the vm helper records, the
+	// unified log. See lifecycle_fake_test.go.
+	life fakeLifecycle
+	// failures[call] is an error the seam named by call returns (after
+	// recording the call) instead of succeeding, keyed by the call string as
+	// recorded ("ReapOrphans:<prefix>" is keyed "ReapOrphans"; see each
+	// method). The zero value fails nothing.
+	failures map[string]error
 }
 
 // delayedFile is one file of the fake root filesystem that CHANGES part-way
@@ -765,7 +774,7 @@ func (f *fakeSystem) EnsureVMRunDir(dir string, uid uint32) error {
 
 func (f *fakeSystem) ReapOrphans(binPrefix string) error {
 	f.calls = append(f.calls, "ReapOrphans:"+binPrefix)
-	return nil
+	return f.failures["ReapOrphans"]
 }
 
 // CloneToOwned records the clone with its owner and mode, and fails with
@@ -1574,11 +1583,14 @@ func (f *fakeSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 		strs[i] = p.String()
 	}
 	f.calls = append(f.calls, "FlushLo0Aliases:"+strings.Join(strs, ","))
-	return nil
+	return f.failures["FlushLo0Aliases"]
 }
 
 func (f *fakeSystem) FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error {
 	f.calls = append(f.calls, fmt.Sprintf("FlushInterconnectAliases:%s:%d", ledgerPath, nodeIndex))
+	if err := f.failures["FlushInterconnectAliases"]; err != nil {
+		return err
+	}
 	if f.flushInterconnect != nil {
 		return f.flushInterconnect(nodeIndex, log)
 	}
@@ -1587,7 +1599,7 @@ func (f *fakeSystem) FlushInterconnectAliases(ledgerPath string, nodeIndex int, 
 
 func (f *fakeSystem) FlushMeshPFAnchor() error {
 	f.calls = append(f.calls, "FlushMeshPFAnchor")
-	return nil
+	return f.failures["FlushMeshPFAnchor"]
 }
 
 func (f *fakeSystem) ReadPodReapRecords(dataRoot string) ([]runtimed.PodReapRecord, error) {
@@ -1607,8 +1619,9 @@ func (f *fakeSystem) ProcessGroupMemberStart(pgid, pid int) (int64, bool) {
 
 func (f *fakeSystem) SignalProcessGroup(pgid int, sig syscall.Signal) error {
 	name := map[syscall.Signal]string{syscall.SIGTERM: "TERM", syscall.SIGKILL: "KILL"}[sig]
-	f.calls = append(f.calls, fmt.Sprintf("Signal:%d:%s", pgid, name))
-	return nil
+	call := fmt.Sprintf("Signal:%d:%s", pgid, name)
+	f.calls = append(f.calls, call)
+	return f.failures[call]
 }
 
 func (f *fakeSystem) WaitProcessGroupsGone(_ context.Context, pgids []int, timeout time.Duration) []int {
@@ -2100,6 +2113,10 @@ func TestUninstallIdempotent(t *testing.T) {
 		// This node's cluster index is read BEFORE the walk removes the
 		// identity file it comes from; the interconnect sweep needs it.
 		"ReadRegularFile:/var/lib/k3sm/keys/node-pod-cidr",
+		// The lo0 flush scope, read from the installed netd plist's
+		// --service-cidr before the walk removes it (absent here, so the
+		// uninstall configuration's default stands in at the flush below).
+		"ReadFile:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"RemoveAll:/var/log/containers",
 		"RemoveAll:/var/log/pods",
 		"Bootout:io.k3sm.server",
@@ -2122,6 +2139,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		// Every recorded pod process group is read once the daemons are gone
 		// (this node recorded none).
 		"ReadPodReapRecords:/var/lib/k3sm",
+		// ...and every k3sm-vmhost helper the runtime recorded (none here):
+		// one that outlived its daemon is killed by its recorded identity.
+		"ReadVMHostRecords:/var/lib/k3sm",
 		"ReapOrphans:/var/lib/k3sm/server/bin",
 		// The mesh pf anchor flush (B274) is the uninstall backstop for the
 		// MSS-clamp rule netd's own shutdown path never reaches.
