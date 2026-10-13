@@ -25,6 +25,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // Digest pinning for the downloaded control-plane payload.
@@ -169,6 +171,8 @@ func VerifyPayloadSet(dir string) error {
 	// digest-verified and signed, and it is what lets the workdir seed replace a stale
 	// set. Allowed, not required, for the same back-compat reason.
 	allowed[KubeMarkerName] = true
+	// zot's version marker rides beside the registry binary on kine's terms.
+	allowed[registrysvc.ZotMarkerName] = true
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read payload dir %s: %w", dir, err)

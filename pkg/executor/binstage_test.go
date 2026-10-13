@@ -83,8 +83,9 @@ exit 2
 	// The inspector runs codesign by absolute path, never through PATH, so it is
 	// pointed at the fake through its Tool seam.
 	origSigner := bootCodeSigner
-	t.Cleanup(func() { bootCodeSigner = origSigner })
+	t.Cleanup(func() { bootCodeSigner = origSigner; resetSigningMemo() })
 	bootCodeSigner = codesignSigner{CodesignInspector: binsign.CodesignInspector{Tool: filepath.Join(dir, "codesign")}}
+	resetSigningMemo()
 	return func() []signCall {
 		b, err := os.ReadFile(log)
 		if err != nil {
@@ -451,7 +452,7 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 		dst := helmchart.HelmPath(bd)
 		writeBin(t, dst, "old-helm"+signedSuffix)
 		h := hold(t, dst)
-		if err := stageHelm(t.Context(), bd, true); err != nil {
+		if err := stageHelm(t.Context(), signingPolicy{s: bootCodeSigner}, bd, true); err != nil {
 			t.Fatal(err)
 		}
 		signed := calls()

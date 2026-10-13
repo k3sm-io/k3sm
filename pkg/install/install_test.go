@@ -1837,6 +1837,7 @@ func TestInstallOrchestration(t *testing.T) {
 		// The pinned helm the helm controller's Jobs run, a payload binary like
 		// kubectl.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + helmchart.HelmBinaryName,
+		"CopyToRootOwned:/Library/k3sm.staging/bin/zot",
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KineMarkerName,

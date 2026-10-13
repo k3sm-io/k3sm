@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -78,27 +79,40 @@ var ErrHelmDigestMismatch = errors.New("helm tarball digest mismatch")
 var ErrHelmNotStaged = errors.New("helm is not staged and this process does not download it (no `gh` on PATH: not a dev shell)")
 
 // EnsureHelm returns the path of a staged helm in binDir. A staged copy is used
-// as is (see the note above on why presence suffices) and re-signed. When none
-// is staged it downloads and verifies the pinned release only in a dev shell
-// (`gh` on PATH, the same gate as the control plane's re-stage); otherwise it
-// returns ErrHelmNotStaged without touching the network.
+// as is (see the note above on why presence suffices) and re-signed on the dev
+// path. When none is staged it downloads and verifies the pinned release only in
+// a dev shell (`gh` on PATH, the same gate as the control plane's re-stage);
+// otherwise it returns ErrHelmNotStaged without touching the network.
+//
+// On the release path (a Developer ID-signed k3sm, see signingPolicy) helm comes
+// from the signed payload only: a staged copy is verified against the Developer
+// ID requirement and used byte-identical, and an absent or failing one is an
+// ErrPayloadSignature. It is never downloaded or signed there.
 func EnsureHelm(ctx context.Context, binDir string) (string, error) {
+	p, err := resolveSigningPolicy(ctx, slog.Default())
+	if err != nil {
+		return "", err
+	}
+	if p.release && !fileExists(helmchart.HelmPath(binDir)) {
+		return "", fmt.Errorf("%w: %s is not staged; a release-signed k3sm runs only the helm its signed payload ships", ErrPayloadSignature, helmchart.HelmPath(binDir))
+	}
 	if !fileExists(helmchart.HelmPath(binDir)) {
 		if _, err := lookPathGh(); err != nil {
 			return "", fmt.Errorf("%w: %s", ErrHelmNotStaged, helmchart.HelmPath(binDir))
 		}
 	}
-	if err := stageHelm(ctx, binDir, false); err != nil {
+	if err := stageHelm(ctx, p, binDir, false); err != nil {
 		return "", err
 	}
 	return helmchart.HelmPath(binDir), nil
 }
 
 // stageHelm places a verified, signed helmchart.HelmBinaryName in bd. With
-// force false an existing copy is kept; with force true (the packaging path,
-// whose bytes are about to be published) it is always re-downloaded and
-// re-verified.
-func stageHelm(ctx context.Context, bd string, force bool) error {
+// force false an existing copy is kept (and made runnable under p, see
+// signHelm); with force true (the packaging path, whose bytes are about to be
+// published) it is always re-downloaded and re-verified. The release path never
+// reaches the download: EnsureHelm refuses an absent helm there first.
+func stageHelm(ctx context.Context, p signingPolicy, bd string, force bool) error {
 	if err := helmchart.ValidateHelmPin(); err != nil {
 		return err
 	}
@@ -107,7 +121,10 @@ func stageHelm(ctx context.Context, bd string, force bool) error {
 	// 0755 under the daemon: only root (install and the payload seed) can place
 	// a file under the versioned name.
 	if !force && fileExists(dst) {
-		return signHelm(ctx, bd)
+		return signHelm(ctx, p, bd)
+	}
+	if p.release {
+		return fmt.Errorf("%w: %s is not staged and a release-signed k3sm never downloads it", ErrPayloadSignature, dst)
 	}
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create bin dir %s: %w", bd, err)

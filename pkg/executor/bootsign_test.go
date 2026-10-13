@@ -121,6 +121,15 @@ func (f *fakeCodeSigner) Satisfies(_ context.Context, path, requirement string) 
 	return true, nil
 }
 
+// resetSigningMemo forgets the memoised signing decision. A test that swaps the
+// bootCodeSigner or selfExecutable seams calls it, so the next resolve probes the
+// new seams.
+func resetSigningMemo() {
+	signingMemo.mu.Lock()
+	defer signingMemo.mu.Unlock()
+	signingMemo.done, signingMemo.p = false, signingPolicy{}
+}
+
 // useFakeSigning installs s as the boot's signer and a k3sm executable carrying
 // selfTrailer as the daemon's own binary, for the duration of the test. It mutates
 // package seams, so a test that calls it must never be t.Parallel.
@@ -131,9 +140,10 @@ func useFakeSigning(t *testing.T, s *fakeCodeSigner, selfTrailer string) {
 		t.Fatal(err)
 	}
 	origSigner, origExe := bootCodeSigner, selfExecutable
-	t.Cleanup(func() { bootCodeSigner, selfExecutable = origSigner, origExe })
+	t.Cleanup(func() { bootCodeSigner, selfExecutable = origSigner, origExe; resetSigningMemo() })
 	bootCodeSigner = s
 	selfExecutable = func() (string, error) { return exe, nil }
+	resetSigningMemo()
 }
 
 // forbidDownload fails the test if anything tries to fetch the control plane.

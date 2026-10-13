@@ -56,12 +56,15 @@
 #                    The control-plane binaries are taken from --cp-build instead
 #                    of the prebuilt download, and every cp-payload file must be
 #                    one of PINNED_SOURCE_FILES, byte-identical to its --cp-build
-#                    copy. kine, etcd and etcdutl and their version markers are
-#                    accepted too (K3SM_BUILT_FILES): k3sm builds them itself from
-#                    pinned module source in `k3sm payload`, with the toolchain
-#                    PAYLOAD_GO_VERSION pins, and staging proves each is the pinned
-#                    build. helm and kube.version are not on either list yet, so
-#                    today --release still refuses, naming them. Signing any of
+#                    copy. kine, etcd, etcdutl and zot and their version markers
+#                    are accepted too (K3SM_BUILT_FILES): k3sm builds them itself
+#                    from pinned module source in `k3sm payload`, with the
+#                    toolchain PAYLOAD_GO_VERSION pins, and staging proves each is
+#                    the pinned build. helm is accepted as the pinned upstream
+#                    release (PINNED_DIGEST_FILES): `k3sm payload` verifies its
+#                    tarball against the pinned sha256 before extracting it.
+#                    kube.version is not on any list yet, so today --release
+#                    still refuses, naming it. Signing any of
 #                    this with a Developer ID is the attended signing pipeline's
 #                    job, never this script's. Without --release (the default)
 #                    the ad-hoc lab staging below is unchanged.
@@ -92,9 +95,10 @@
 #   PAYLOAD-SHA256    written AFTER signing: `<sha256>  <relpath>` for every
 #                     regular file in the tree (LC_ALL=C order, no ./ prefix, the
 #                     manifest itself and .DS_Store excluded), after `#` comment
-#                     lines recording the pinned toolchain and, for kine, etcd and
-#                     etcdutl, the module version, the patch-set id, the build
-#                     variant and the build flags. After
+#                     lines recording the pinned toolchain and, for kine, etcd,
+#                     etcdutl and zot, the module version, the patch-set id, the
+#                     build variant and the build flags, and for helm its pinned
+#                     release asset and digest. After
 #                     signing it is the authority for the payload's bytes; check it
 #                     with `shasum -a 256 -c PAYLOAD-SHA256` inside the tree. Also
 #                     written to <out-dir>.PAYLOAD-SHA256. A symlink anywhere in the
@@ -355,9 +359,10 @@ verify_manifest() {
 }
 
 # ---- the source-built children: pins, toolchain, build stamps ------------------
-# kine, etcd and etcdutl are k3sm's own builds from pinned module source: the
+# kine, etcd, etcdutl and zot are k3sm's own builds from pinned module source: the
 # staged k3sm builds them in `k3sm payload` (pkg/executor StagePayload, the same
-# patched kine build and etcd wrapper the daemon would otherwise run on demand).
+# patched kine build, etcd wrapper and zot build the daemon would otherwise run on
+# demand). helm is the pinned upstream release `k3sm payload` digest-verifies.
 # This script pins the toolchain that build runs under, proves the staged binaries
 # are the pinned builds, and records how they were built in the manifest header.
 
@@ -371,10 +376,11 @@ PAYLOAD_GO_VERSION="go1.27.2"
 GO="${GO:-go}"
 
 # read_pins: KINE_VERSION, ETCD_VERSION, KINE_VARIANT, ETCD_VARIANT and KINE_PATCH
-# (the patch-set id, "none" without one), read from the executor source the staged
-# k3sm is built from, so the checks below compare against that build's own pins.
+# (the patch-set id, "none" without one), ZOT_VERSION and ZOT_VARIANT, and
+# HELM_VERSION, HELM_SHA256 and HELM_BINARY, read from the source the staged k3sm
+# is built from, so the checks below compare against that build's own pins.
 read_pins() {
-	local ex="$REPO_ROOT/pkg/executor"
+	local ex="$REPO_ROOT/pkg/executor" rs="$REPO_ROOT/pkg/registrysvc/pin.go" hc="$REPO_ROOT/pkg/helmchart/pin.go"
 	KINE_VERSION="$(sed -n 's/^[[:space:]]*DefaultKineVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/executor.go")"
 	ETCD_VERSION="$(sed -n 's/^[[:space:]]*DefaultEtcdVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/executor.go")"
 	KINE_VARIANT="$(sed -n 's/^[[:space:]]*kineBuildVariant[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/setup.go")"
@@ -385,6 +391,13 @@ read_pins() {
 	*+*) KINE_PATCH="${KINE_VARIANT#*+}" ;;
 	*) KINE_PATCH=none ;;
 	esac
+	ZOT_VERSION="$(sed -n 's/^[[:space:]]*DefaultZotVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$rs")"
+	ZOT_VARIANT="$(sed -n 's/^[[:space:]]*zotBuildVariant[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$rs")"
+	HELM_VERSION="$(sed -n 's/^[[:space:]]*HelmVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$hc")"
+	HELM_SHA256="$(sed -n 's/^[[:space:]]*HelmSHA256[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$hc")"
+	[ -n "$ZOT_VERSION" ] && [ -n "$ZOT_VARIANT" ] && [ -n "$HELM_VERSION" ] && [ -n "$HELM_SHA256" ] ||
+		die "cannot read the zot and helm pins from $rs and $hc"
+	HELM_BINARY="helm-$HELM_VERSION"
 }
 
 # toolchain_problems <pin>: non-zero, naming the problem, unless `go env GOVERSION`
@@ -398,10 +411,11 @@ toolchain_problems() {
 # buildinfo_problems <kind> <want-version> <go-pin>  (stdin: `go version -m` text)
 # The build stamp of one staged child, from the build info Go records in the binary
 # (read, never executed): the toolchain, the main package, the pinned module version
-# (etcd: the server module; etcdutl: its own; kine: built from patched source, so its
-# version is the marker's and the stamped string's), no replaced module, and the
-# build settings: CGO_ENABLED=0, -trimpath, darwin/arm64. Prints one line per
-# problem; returns 0 only when there are none.
+# (etcd: the server module; etcdutl and zot: their own; kine: built from patched
+# source, so its version is the marker's and the stamped string's), no replaced
+# module, and the build settings: CGO_ENABLED=0, darwin/arm64, and -trimpath for
+# all but zot (registrysvc builds it with a plain `go install`). Prints one line
+# per problem; returns 0 only when there are none.
 buildinfo_problems() {
 	local kind="$1" want="$2" pin="$3" text path mod gov bad=0
 	text="$(cat)"
@@ -409,8 +423,11 @@ buildinfo_problems() {
 	kine) path="github.com/k3s-io/kine"; mod="" ;;
 	etcd) path="k3sm.io/etcd-child"; mod="go.etcd.io/etcd/server/v3" ;;
 	etcdutl) path="go.etcd.io/etcd/etcdutl/v3"; mod="go.etcd.io/etcd/etcdutl/v3" ;;
+	zot) path="zotregistry.dev/zot/v2/cmd/zot"; mod="zotregistry.dev/zot/v2" ;;
 	*) echo "unknown child $kind"; return 1 ;;
 	esac
+	local settings="CGO_ENABLED=0 -trimpath=true GOOS=darwin GOARCH=arm64"
+	[ "$kind" = zot ] && settings="CGO_ENABLED=0 GOOS=darwin GOARCH=arm64"
 	problem() { echo "$kind: $*"; bad=1; }
 	gov="$(printf '%s\n' "$text" | sed -n '1s/^.*: \(go[0-9][^[:space:]]*\)$/\1/p')"
 	[ "$gov" = "$pin" ] || problem "built with '${gov:-?}', the payload pins $pin"
@@ -420,7 +437,7 @@ buildinfo_problems() {
 		printf '%s\n' "$text" | grep -Eq "^[[:space:]]*=>" && problem "a module is replaced"
 	fi
 	local setting
-	for setting in CGO_ENABLED=0 -trimpath=true GOOS=darwin GOARCH=arm64; do
+	for setting in $settings; do
 		printf '%s\n' "$text" | grep -qx "[[:space:]]*build[[:space:]]$setting" || problem "build setting $setting is missing"
 	done
 	unset -f problem
@@ -433,15 +450,17 @@ buildinfo_settings() {
 	sed -n 's/^[[:space:]]*build[[:space:]]\(.*\)$/\1/p' | tr '\n' ' ' | sed 's/ $//'
 }
 
-# child_problems <payload-dir> <go-pin>: the staged kine, etcd and etcdutl are the
-# pinned builds: each marker names the pin and variant, each build info passes
+# child_problems <payload-dir> <go-pin>: the staged kine, etcd, etcdutl and zot are
+# the pinned builds: each marker names the pin and variant, each build info passes
 # buildinfo_problems against <go-pin>, and kine carries its stamped version (pin+patch set) in its
-# bytes. Prints one line per problem; returns 0 only when there are none.
+# bytes. The pinned helm release is staged under its versioned name. Prints one
+# line per problem; returns 0 only when there are none.
 child_problems() {
 	local dir="$1" pin="$2" bad=0 kind want variant
-	for kind in kine etcd etcdutl; do
+	for kind in kine etcd etcdutl zot; do
 		case "$kind" in
 		kine) want="$KINE_VERSION"; variant="$KINE_VARIANT" ;;
+		zot) want="$ZOT_VERSION"; variant="$ZOT_VARIANT" ;;
 		*) want="$ETCD_VERSION"; variant="$ETCD_VARIANT" ;;
 		esac
 		[ -f "$dir/$kind" ] || { echo "$kind: not staged in $dir"; bad=1; continue; }
@@ -452,6 +471,7 @@ child_problems() {
 	if [ -f "$dir/kine" ] && [ "$KINE_PATCH" != none ] && ! grep -aqF -- "$KINE_VERSION+$KINE_PATCH" "$dir/kine"; then
 		echo "kine: the stamped version $KINE_VERSION+$KINE_PATCH is not in the binary"; bad=1
 	fi
+	[ -f "$dir/$HELM_BINARY" ] || { echo "$HELM_BINARY: not staged in $dir"; bad=1; }
 	return "$bad"
 }
 
@@ -497,11 +517,13 @@ manifest_comments() {
 	printf 'kine: github.com/k3s-io/kine %s patch-set %s variant %s (stamped %s+%s)\n' "$KINE_VERSION" "$KINE_PATCH" "$KINE_VARIANT" "$KINE_VERSION" "$KINE_PATCH"
 	printf 'etcd: go.etcd.io/etcd/server/v3 %s patch-set none variant %s\n' "$ETCD_VERSION" "$ETCD_VARIANT"
 	printf 'etcdutl: go.etcd.io/etcd/etcdutl/v3 %s patch-set none variant %s\n' "$ETCD_VERSION" "$ETCD_VARIANT"
+	printf 'zot: zotregistry.dev/zot/v2 %s patch-set none variant %s\n' "$ZOT_VERSION" "$ZOT_VARIANT"
+	printf 'helm: %s from the helm %s release tarball, sha256 %s (verified before extraction)\n' "$HELM_BINARY" "$HELM_VERSION" "$HELM_SHA256"
 	if [ "$stub" = stub ]; then
 		echo "build: STUB payload, the source-built children were not built"
 		return 0
 	fi
-	for kind in kine etcd etcdutl; do
+	for kind in kine etcd etcdutl zot; do
 		printf '%s build: %s' "$kind" "$("$GO" version -m "$dir/$kind" | buildinfo_settings)"
 		[ "$kind" = kine ] && printf ' -ldflags=-X github.com/k3s-io/kine/pkg/version.Version=%s+%s' "$KINE_VERSION" "$KINE_PATCH"
 		printf '\n'
@@ -543,9 +565,17 @@ cp-payload/kine.version
 cp-payload/etcd
 cp-payload/etcd.version
 cp-payload/etcdutl
-cp-payload/etcdutl.version"
-RELEASE_PAYLOAD_FILES="$PINNED_SOURCE_FILES
-$K3SM_BUILT_FILES"
+cp-payload/etcdutl.version
+cp-payload/zot
+cp-payload/zot.version"
+
+# release_payload_files: every cp-payload entry release staging accepts, one per
+# line: PINNED_SOURCE_FILES, K3SM_BUILT_FILES, and PINNED_DIGEST_FILES, the pinned
+# upstream releases `k3sm payload` verifies against a pinned sha256 before it
+# extracts them (helm, under its versioned name). Needs read_pins.
+release_payload_files() {
+	printf '%s\n%s\ncp-payload/%s\n' "$PINNED_SOURCE_FILES" "$K3SM_BUILT_FILES" "$HELM_BINARY"
+}
 
 # cp_build_problems <dir>: non-zero, naming each problem, unless <dir> holds
 # exactly the regular files PINNED_SOURCE_FILES names (by base name), no more.
@@ -854,17 +884,24 @@ cat "%s" >&2
 	if pinned_content_problems "$pt" "$cb" >/dev/null; then ok "the placed pinned-source build passes the content check"; else bad "the placed build failed the content check"; fi
 	if refuse_unpinned_payload "$pt" "$PINNED_SOURCE_FILES" >/dev/null; then ok "a payload of exactly build-cp's outputs passes the release refusal"; else bad "build-cp's outputs were refused"; fi
 
-	echo "==> --release accepts k3sm's own kine/etcd/etcdutl builds, still refuses helm"
-	local kb="$tmp/k3sm-built"
+	echo "==> --release accepts k3sm's own kine/etcd/etcdutl/zot builds and the pinned helm, still refuses kube.version"
+	read_pins
+	local kb="$tmp/k3sm-built" rpf
+	rpf="$(release_payload_files)"
 	mkdir -p "$kb/cp-payload"
-	while IFS= read -r rel; do printf 'x\n' >"$kb/$rel"; done <<<"$RELEASE_PAYLOAD_FILES"
-	if out="$(refuse_unpinned_payload "$kb" "$RELEASE_PAYLOAD_FILES")"; then ok "kine, etcd, etcdutl and their markers pass the release refusal"; else bad "k3sm's own builds were refused: $out"; fi
-	printf 'x\n' >"$kb/cp-payload/helm-v4.3.0"
+	while IFS= read -r rel; do printf 'x\n' >"$kb/$rel"; done <<<"$rpf"
+	if printf '%s\n' "$rpf" | grep -qxF "cp-payload/$HELM_BINARY" && printf '%s\n' "$rpf" | grep -qxF cp-payload/zot && printf '%s\n' "$rpf" | grep -qxF cp-payload/zot.version; then
+		ok "the release list names $HELM_BINARY, zot and zot.version"
+	else
+		bad "the release list lacks helm or zot: $rpf"
+	fi
+	if out="$(refuse_unpinned_payload "$kb" "$rpf")"; then ok "kine, etcd, etcdutl, zot, helm and their markers pass the release refusal"; else bad "k3sm's own builds or the pinned helm were refused: $out"; fi
 	printf 'x\n' >"$kb/cp-payload/kube.version"
-	if out="$(refuse_unpinned_payload "$kb" "$RELEASE_PAYLOAD_FILES")"; then
-		bad "helm passed the release refusal"
-	elif printf '%s\n' "$out" | grep -q "helm-v4.3.0" && printf '%s\n' "$out" | grep -q "kube.version" && ! printf '%s\n' "$out" | grep -Eq "cp-payload/(kine|etcd)"; then
-		ok "helm and kube.version are still refused, the source-built children are not"
+	printf 'x\n' >"$kb/cp-payload/helm-v0.0.0"
+	if out="$(refuse_unpinned_payload "$kb" "$rpf")"; then
+		bad "kube.version or an unpinned helm passed the release refusal"
+	elif printf '%s\n' "$out" | grep -q "kube.version" && printf '%s\n' "$out" | grep -q "helm-v0.0.0" && ! printf '%s\n' "$out" | grep -Eq "cp-payload/(kine|etcd|zot|$HELM_BINARY)\$"; then
+		ok "kube.version and a helm at another version are refused, the pinned set is not"
 	else
 		bad "release refusal named the wrong files: $out"
 	fi
@@ -876,6 +913,11 @@ cat "%s" >&2
 			echo "  ok    read_pins: kine $KINE_VERSION $KINE_VARIANT (patch set $KINE_PATCH), etcd $ETCD_VERSION $ETCD_VARIANT"
 		else
 			echo "  FAIL  read_pins: kine '$KINE_VERSION' '$KINE_VARIANT' '$KINE_PATCH', etcd '$ETCD_VERSION' '$ETCD_VARIANT'"; exit 1
+		fi
+		if printf '%s' "$ZOT_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' && [ "$ZOT_VARIANT" = minimal ] && [ "$HELM_BINARY" = "helm-$HELM_VERSION" ] && printf '%s' "$HELM_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+			echo "  ok    read_pins: zot $ZOT_VERSION $ZOT_VARIANT, $HELM_BINARY sha256 $HELM_SHA256"
+		else
+			echo "  FAIL  read_pins: zot '$ZOT_VERSION' '$ZOT_VARIANT', helm '$HELM_BINARY' '$HELM_SHA256'"; exit 1
 		fi
 	) || fails=$((fails + 1))
 	if printf '%s\n' "$PAYLOAD_GO_VERSION" | grep -Eq '^go[0-9]+\.[0-9]+\.[0-9]+$'; then ok "PAYLOAD_GO_VERSION is an exact release ($PAYLOAD_GO_VERSION)"; else bad "PAYLOAD_GO_VERSION '$PAYLOAD_GO_VERSION' is not an exact goX.Y.Z"; fi
@@ -904,20 +946,23 @@ FAKE
 		bad "staging with a non-pinned go did not refuse before building: $out"
 	fi
 
-	echo "==> the build stamp of kine, etcd and etcdutl (go version -m captures; dep lists trimmed)"
+	echo "==> the build stamp of kine, etcd, etcdutl and zot (go version -m captures; dep lists trimmed)"
 	local kind want fx2
-	for kind in kine etcd etcdutl; do
-		case "$kind" in kine) want=v0.17.2 ;; *) want=v3.6.15 ;; esac
+	for kind in kine etcd etcdutl zot; do
+		case "$kind" in kine) want=v0.17.2 ;; zot) want=v2.1.20 ;; *) want=v3.6.15 ;; esac
 		fx2="$td/goversion-$kind.txt"
 		if out="$(buildinfo_problems "$kind" "$want" go1.27.2 <"$fx2")"; then ok "$kind capture passes"; else bad "$kind capture rejected: $out"; fi
 		if out="$(buildinfo_problems "$kind" "$want" go1.27.9 <"$fx2")"; then bad "$kind: another toolchain passed"; elif printf '%s\n' "$out" | grep -q "built with 'go1.27.2'"; then ok "$kind: another toolchain is refused"; else bad "$kind: toolchain not named: $out"; fi
 		if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.2)"; then bad "$kind: a cgo build passed"; elif printf '%s\n' "$out" | grep -q "CGO_ENABLED=0"; then ok "$kind: a cgo build is refused"; else bad "$kind: cgo not named: $out"; fi
-		if out="$(grep -v -- '-trimpath' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.2)"; then bad "$kind: a build without -trimpath passed"; else ok "$kind: a build without -trimpath is refused"; fi
+		if [ "$kind" != zot ]; then
+			if out="$(grep -v -- '-trimpath' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.2)"; then bad "$kind: a build without -trimpath passed"; else ok "$kind: a build without -trimpath is refused"; fi
+		fi
 		if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.2)"; then bad "$kind: an amd64 build passed"; else ok "$kind: an amd64 build is refused"; fi
 		if out="$(sed 's/^\([[:space:]]*path[[:space:]]\).*/\1example.com\/other/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.2)"; then bad "$kind: another main package passed"; else ok "$kind: another main package is refused"; fi
 	done
 	if out="$(buildinfo_problems etcd v3.6.14 go1.27.2 <"$td/goversion-etcd.txt")"; then bad "etcd at another version passed"; elif printf '%s\n' "$out" | grep -q "server/v3 is not at v3.6.14"; then ok "etcd at another version is refused"; else bad "etcd version not named: $out"; fi
 	if out="$(buildinfo_problems etcd v3.6.15 go1.27.2 <"$td/goversion-etcdutl.txt")"; then bad "etcdutl passed as etcd"; else ok "etcdutl does not pass as etcd"; fi
+	if out="$(buildinfo_problems zot v2.1.21 go1.27.2 <"$td/goversion-zot.txt")"; then bad "zot at another version passed"; elif printf '%s\n' "$out" | grep -q "zot/v2 is not at v2.1.21"; then ok "zot at another version is refused"; else bad "zot version not named: $out"; fi
 	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$td/goversion-etcd.txt")" | buildinfo_problems etcd v3.6.15 go1.27.2)"; then bad "a replaced module passed"; elif printf '%s\n' "$out" | grep -q "replaced"; then ok "a replaced module is refused"; else bad "replace not named: $out"; fi
 	if [ "$(buildinfo_settings <"$td/goversion-kine.txt" | tr ' ' '\n' | grep -c .)" = 8 ]; then ok "the build settings are recorded from the build info"; else bad "buildinfo_settings: $(buildinfo_settings <"$td/goversion-kine.txt")"; fi
 
@@ -926,6 +971,9 @@ FAKE
 	mkdir -p "$cpd"
 	(
 		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p1 KINE_PATCH=p1 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
+		ZOT_VERSION=v2.1.20 ZOT_VARIANT=minimal HELM_BINARY=helm-v4.3.0
+		printf 'zot\n' >"$cpd/zot"; echo "v2.1.20 minimal" >"$cpd/zot.version"
+		printf 'helm\n' >"$cpd/helm-v4.3.0"
 		printf 'mach-o...v0.17.2+p1...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p1" >"$cpd/kine.version"
 		printf 'etcd\n' >"$cpd/etcd"; echo "v3.6.15 nocgo" >"$cpd/etcd.version"
 		printf 'etcdutl\n' >"$cpd/etcdutl"; echo "v3.6.15 nocgo" >"$cpd/etcdutl.version"
@@ -939,6 +987,12 @@ FAKE
 		printf 'mach-o...v0.17.2+p1...\n' >"$cpd/kine"
 		rm "$cpd/etcdutl"
 		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif printf '%s\n' "$o" | grep -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
+		printf 'etcdutl\n' >"$cpd/etcdutl"
+		echo "v2.1.19 minimal" >"$cpd/zot.version"
+		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
+		echo "v2.1.20 minimal" >"$cpd/zot.version"
+		rm "$cpd/zot" "$cpd/helm-v4.3.0"
+		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a payload without zot and helm passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot: not staged" && printf '%s\n' "$o" | grep -q "helm-v4.3.0: not staged"; then echo "  ok    a missing zot and a missing helm are refused"; else echo "  FAIL  missing zot or helm not named: $o"; r=1; fi
 		exit "$r"
 	) || fails=$((fails + 1))
 
@@ -1211,7 +1265,7 @@ if [ "$STUB_PAYLOAD" = 1 ]; then
 	done
 	upstream_note="STUB payload: placeholder bytes, never publish this tree"
 else
-	echo "==> stage cp-payload (pinned download + digest verify; kine, etcd and etcdutl built from pinned source)"
+	echo "==> stage cp-payload (pinned download + digest verify; kine, etcd, etcdutl and zot built from pinned source)"
 	payload_log="$(mktemp -t k3sm-payload)"
 	if ! "$BIN" payload "$PAYLOAD_DIR" 2>&1 | tee "$payload_log"; then
 		missing="$(needs_network_modules <"$payload_log")"
@@ -1223,12 +1277,12 @@ else
 		die "'$BINARY_NAME payload' failed (output above)"
 	fi
 	rm -f "$payload_log"
-	echo "==> verify kine, etcd and etcdutl are the pinned builds"
+	echo "==> verify kine, etcd, etcdutl and zot are the pinned builds, and helm is staged"
 	if ! child_out="$(child_problems "$PAYLOAD_DIR" "$PAYLOAD_GO_VERSION")"; then
 		printf '%s\n' "$child_out" | sed 's/^/    /' >&2
 		die "the staged source-built children are not the pinned builds (above)"
 	fi
-	upstream_note="as produced by '$BINARY_NAME payload': downloads checked against their pinned sha256, kine, etcd and etcdutl built from their pinned modules with $PAYLOAD_GO_VERSION"
+	upstream_note="as produced by '$BINARY_NAME payload': downloads checked against their pinned sha256, kine, etcd, etcdutl and zot built from their pinned modules with $PAYLOAD_GO_VERSION"
 	if [ "$RELEASE" = 1 ]; then
 		echo "==> replace the control-plane binaries with the pinned-source build ($CP_BUILD)"
 		place_cp_build "$CP_BUILD" "$PAYLOAD_DIR" || die "could not place the pinned-source build into $PAYLOAD_DIR"
@@ -1246,8 +1300,8 @@ upstream_digests_write "$OUT" "$upstream_note" || die "could not write $OUT/$UPS
 if [ "$RELEASE" = 1 ]; then
 	pinned_content_problems "$OUT" "$CP_BUILD" ||
 		die "--release: the staged control-plane binaries are not the pinned-source build in $CP_BUILD"
-	refuse_unpinned_payload "$OUT" "$RELEASE_PAYLOAD_FILES" ||
-		die "--release: refusing to sign cp-payload files not built from pinned source (hack/release/build-cp.sh, or k3sm's own kine/etcd build)"
+	refuse_unpinned_payload "$OUT" "$(release_payload_files)" ||
+		die "--release: refusing to sign cp-payload files not built from pinned source (hack/release/build-cp.sh, or k3sm's own kine/etcd/zot build) or pinned by digest (helm)"
 fi
 
 # Ad-hoc sign every Mach-O. The signature is load-bearing even without a
