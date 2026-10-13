@@ -174,14 +174,35 @@ func usableUnderlayIP(ip net.IP, meshIP string) string {
 	return ip.String()
 }
 
+// firstProxyableIP returns the first address in ips that satisfies the upstream
+// node-proxy predicate (net.IP.IsGlobalUnicast — the SAME stdlib call
+// isProxyableHostname makes), preferring IPv4 because that is what a dual-stack
+// Mac's clients dial. It returns "" when no address qualifies, which is the
+// caller's fail-soft signal. Interface order is net.Interfaces' index order, so
+// the choice is stable across restarts. The mesh endpoint derivations use it to
+// pick the underlay address a peer dials.
+func firstProxyableIP(ips []net.IP) string {
+	var v6 string
+	for _, ip := range ips {
+		if ip == nil || !ip.IsGlobalUnicast() {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String()
+		}
+		if v6 == "" {
+			v6 = ip.String()
+		}
+	}
+	return v6
+}
+
 // underlayInterfaceIPs reports this host's UNDERLAY addresses: those of its up,
 // non-loopback, non-tunnel interfaces.
 //
-// It is deliberately distinct from node.go's hostInterfaceIPs, which does not
-// exclude tunnels. For advertising a node address a utun address is merely
-// unhelpful; for advertising a wireguard endpoint it is the exact defect this file
-// prevents, because the mesh's own utun carries the address no un-joined peer can
-// route to. Package var so the selection is unit-testable on a host whose
+// It excludes tunnels deliberately: for advertising a wireguard endpoint a utun
+// address is the exact defect this file prevents, because the mesh's own utun
+// carries the address no un-joined peer can route to. Package var so the selection is unit-testable on a host whose
 // interfaces a test cannot change.
 var underlayInterfaceIPs = func() []net.IP {
 	ifaces, err := net.Interfaces()

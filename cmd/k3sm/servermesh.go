@@ -180,8 +180,8 @@ var selfBindRetryBase = 2 * time.Second
 // mesh until this handshake completes, so an endpoint inside the mesh would be
 // unreachable at exactly the moment it is needed. The derivation is therefore
 // the agent's — underlayInterfaceIPs (which EXCLUDES tunnels) filtered by
-// usableUnderlayIP and reduced by firstProxyableIP — and not node.go's
-// hostInterfaceIPs, which does not exclude them.
+// usableUnderlayIP and reduced by firstProxyableIP — and not a scan that
+// includes tunnels.
 //
 // That difference is the whole reason this function changed. At bring-up the
 // mesh utun does not exist yet, so a tunnel-including scan happened to be

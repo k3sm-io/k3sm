@@ -87,8 +87,9 @@ type serverOptions struct {
 	// kubeletPort is the port the in-process node serves the kubelet HTTP API
 	// (logs/exec/stats) on. Per-server for the same reason kinePort is: it is a
 	// singleton listener, so two control planes on one Mac cannot both have the
-	// default. Only the PORT is configurable — the bind stays the wildcard
-	// serverKubeletListenOn builds, and the API's auth posture is untouched.
+	// default. Only the PORT is configurable: the address is the node's own
+	// InternalIP (resolveKubeletEndpoint), never the wildcard, and the API's
+	// auth posture is untouched.
 	kubeletPort int
 	// schedulerPort / controllerManagerPort are the two co-located control-plane
 	// components' secure-serving ports. Per-server for the same reason as the
@@ -753,10 +754,12 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 	nodeOpts := nodeOptions{
 		restConfig: nodeRESTCfg,
 		nodeName:   opts.nodeName,
-		listen:     serverKubeletListenOn(opts.kubeletPort),
-		podRoot:    opts.podRoot,
-		logs:       opts.logs,
-		nodeIP:     nodeAddressing.nodeIP,
+		// The kubelet API binds this node's own InternalIP on this port
+		// (resolveKubeletEndpoint), never the wildcard.
+		kubeletPort: opts.kubeletPort,
+		podRoot:     opts.podRoot,
+		logs:        opts.logs,
+		nodeIP:      nodeAddressing.nodeIP,
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,
 		runtime:     opts.rtName,
@@ -1003,9 +1006,10 @@ func clientCertIdentity(certPEM []byte) (string, time.Time, error) {
 //     same broken logs/exec with a less legible error;
 //   - 127.0.0.1 — the same-host dial.
 //
-// A superset is the safe direction here: every address in the set is one this node
-// already serves on (the listen is the wildcard), so naming it in a SAN grants no
-// reach that did not exist. Omitting one silently breaks logs/exec.
+// A superset is the safe direction here: a SAN names addresses the certificate may
+// be presented for, it opens no listener, and the kubelet API binds only the
+// registered InternalIP (resolveKubeletEndpoint). Omitting the registered address
+// silently breaks logs/exec.
 func serverKubeletServingIPs(nodeOpts nodeOptions, meshIP string) []net.IP {
 	advertised := nodeOpts
 	advertised.nodeIP = advertisedNodeIP(nodeOpts)

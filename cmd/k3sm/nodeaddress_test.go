@@ -20,12 +20,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"net"
+	"net/netip"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/provider"
 )
 
@@ -76,8 +78,8 @@ func upstreamProxyable(address string) bool {
 // InternalIP the Node object carries.
 func registeredInternalIP(t *testing.T, opts nodeOptions) string {
 	t.Helper()
-	// startNode's own two-tier sequence: the datapath derivation first, then the
-	// proxyable substitution. Keep them in this order — see advertisedNodeIP.
+	// startNode's own sequence: the advertise derivation, then the registered
+	// address, which is the same value (proxyableNodeIP).
 	opts.nodeIP = advertisedNodeIP(opts)
 	n := &corev1.Node{}
 	configureNode(n, opts.nodeName, proxyableNodeIP(opts), opts.listen, provider.NodeCapabilities{})
@@ -90,66 +92,57 @@ func registeredInternalIP(t *testing.T, opts nodeOptions) string {
 	return ""
 }
 
-// stubHostIPs replaces the host-interface seam for one test.
-func stubHostIPs(t *testing.T, addrs ...string) {
+// stubLocalAddrs replaces the interface-address seam the kubelet endpoint's
+// presence check reads, for one test.
+func stubLocalAddrs(t *testing.T, addrs ...string) {
 	t.Helper()
-	ips := make([]net.IP, 0, len(addrs))
+	out := make([]netip.Addr, 0, len(addrs))
 	for _, a := range addrs {
-		ip := net.ParseIP(a)
-		if ip == nil {
-			t.Fatalf("stubHostIPs: %q is not an IP", a)
-		}
-		ips = append(ips, ip)
+		out = append(out, netip.MustParseAddr(a))
 	}
-	saved := hostInterfaceIPs
-	hostInterfaceIPs = func() []net.IP { return ips }
-	t.Cleanup(func() { hostInterfaceIPs = saved })
+	saved := localInterfaceAddrs
+	localInterfaceAddrs = func() ([]netip.Addr, error) { return out, nil }
+	t.Cleanup(func() { localInterfaceAddrs = saved })
 }
 
-// TestNodeAddressProxyable is B174's gate: the address the VK node registers as
-// its NodeInternalIP must satisfy the upstream apiserver node-proxy predicate, in
-// every posture where the node's kubelet API listener can actually answer at it.
-// A loopback InternalIP — what `k3sm dev` (--network none) registered — makes
-// every GET /api/v1/nodes/<n>/proxy/... fail with HTTP 400 "address not allowed",
-// which is `kubectl top node`, `kubectl top pod`, and metrics-server.
+// TestNodeAddressProxyable is B174's gate, narrowed by the kubelet listener
+// derivation: the address the VK node registers as its NodeInternalIP is the
+// address its kubelet API binds, so on the pod network it satisfies the
+// upstream apiserver node-proxy predicate, and with no pod network it is
+// loopback. It is never a host LAN address the operator did not name: serving
+// the kubelet API there is what put it on untrusted networks. The cost is
+// stated: a `--network none` node (the rootless `k3sm dev` tier) answers GET
+// /api/v1/nodes/<n>/proxy/... with HTTP 400 "address not allowed" again.
 func TestNodeAddressProxyable(t *testing.T) {
-	const (
-		devPodCIDR = "100.64.0.0/24"
-		hostLAN    = "192.168.1.42"
-	)
+	const devPodCIDR = "100.64.0.0/24"
 	noDatapath := hostnet.Mode{Backend: hostnet.BackendNone}
 	datapath := hostnet.Mode{Backend: hostnet.BackendDirect}
 
-	t.Run("dev rootless registers a proxyable address", func(t *testing.T) {
-		stubHostIPs(t, "169.254.10.1", hostLAN)
+	t.Run("dev rootless registers loopback, never a host address", func(t *testing.T) {
 		got := registeredInternalIP(t, nodeOptions{
-			nodeName: "k3sm-dev",
-			nodeIP:   loopbackNodeIP,
-			listen:   serverKubeletListen,
-			podCIDR:  devPodCIDR,
-			netMode:  noDatapath,
+			nodeName:    "k3sm-dev",
+			nodeIP:      loopbackNodeIP,
+			kubeletPort: ports.KubeletAPIPort,
+			podCIDR:     devPodCIDR,
+			netMode:     noDatapath,
 		})
-		if !upstreamProxyable(got) {
-			t.Fatalf("InternalIP %q fails the apiserver node-proxy predicate; the proxy answers 400 %q and kubectl top is dead", got, "address not allowed")
-		}
-		if got != hostLAN {
-			t.Errorf("InternalIP = %q, want the host's globally-unicast interface address %q", got, hostLAN)
+		if got != loopbackNodeIP {
+			t.Errorf("InternalIP = %q, want %q: with no pod network nothing else is the node's own", got, loopbackNodeIP)
 		}
 	})
 
-	t.Run("datapath derivation still wins", func(t *testing.T) {
-		stubHostIPs(t, hostLAN)
+	t.Run("datapath derivation is proxyable", func(t *testing.T) {
 		got := registeredInternalIP(t, nodeOptions{
-			nodeName: "k3sm-node",
-			nodeIP:   loopbackNodeIP,
-			listen:   serverKubeletListen,
-			podCIDR:  devPodCIDR,
-			netMode:  datapath,
+			nodeName:    "k3sm-node",
+			nodeIP:      loopbackNodeIP,
+			kubeletPort: ports.KubeletAPIPort,
+			podCIDR:     devPodCIDR,
+			netMode:     datapath,
 		})
 		if !upstreamProxyable(got) {
 			t.Fatalf("InternalIP %q fails the apiserver node-proxy predicate", got)
 		}
-		// The mesh-egress .1 the podnet adapter aliases on lo0 — NOT the host LAN
+		// The mesh-egress .1 the podnet adapter aliases on lo0 — NOT a host LAN
 		// address, which nothing on the datapath answers for.
 		if want := nodeInternalIP(devPodCIDR); got != want {
 			t.Errorf("InternalIP = %q, want the derived mesh-egress address %q", got, want)
@@ -157,24 +150,19 @@ func TestNodeAddressProxyable(t *testing.T) {
 	})
 
 	t.Run("explicit node-ip is honored", func(t *testing.T) {
-		stubHostIPs(t, hostLAN)
 		got := registeredInternalIP(t, nodeOptions{
-			nodeName: "k3sm-node",
-			nodeIP:   "10.9.8.7",
-			listen:   serverKubeletListen,
-			podCIDR:  devPodCIDR,
-			netMode:  noDatapath,
+			nodeName:    "k3sm-node",
+			nodeIP:      "10.9.8.7",
+			kubeletPort: ports.KubeletAPIPort,
+			podCIDR:     devPodCIDR,
+			netMode:     noDatapath,
 		})
 		if got != "10.9.8.7" {
 			t.Errorf("InternalIP = %q, want the operator's --node-ip %q", got, "10.9.8.7")
 		}
 	})
 
-	t.Run("loopback-scoped listener is not readvertised", func(t *testing.T) {
-		// Standalone `k3sm node` binds 127.0.0.1:10250. Advertising a host address
-		// there would trade HTTP 400 for a refused connection — bind before you
-		// advertise.
-		stubHostIPs(t, hostLAN)
+	t.Run("standalone loopback listener registers loopback", func(t *testing.T) {
 		got := registeredInternalIP(t, nodeOptions{
 			nodeName: "k3sm-node",
 			nodeIP:   loopbackNodeIP,
@@ -187,30 +175,14 @@ func TestNodeAddressProxyable(t *testing.T) {
 		}
 	})
 
-	t.Run("no proxyable host address keeps the loopback default", func(t *testing.T) {
-		// Fail-soft: an offline Mac with nothing but link-local still registers.
-		stubHostIPs(t, "169.254.10.1", "fe80::1")
-		got := registeredInternalIP(t, nodeOptions{
-			nodeName: "k3sm-node",
-			nodeIP:   loopbackNodeIP,
-			listen:   serverKubeletListen,
-			podCIDR:  devPodCIDR,
-			netMode:  noDatapath,
-		})
-		if got != loopbackNodeIP {
-			t.Errorf("InternalIP = %q, want the %q fail-soft default", got, loopbackNodeIP)
-		}
-	})
-
 	t.Run("serving cert SANs cover the registered address", func(t *testing.T) {
 		// The apiserver dials the InternalIP by IP; the cert must verify at it.
-		stubHostIPs(t, hostLAN)
 		opts := nodeOptions{
-			nodeName: "k3sm-dev",
-			nodeIP:   loopbackNodeIP,
-			listen:   serverKubeletListen,
-			podCIDR:  devPodCIDR,
-			netMode:  noDatapath,
+			nodeName:    "k3sm-dev",
+			nodeIP:      loopbackNodeIP,
+			kubeletPort: ports.KubeletAPIPort,
+			podCIDR:     devPodCIDR,
+			netMode:     datapath,
 		}
 		opts.nodeIP = advertisedNodeIP(opts)
 		internalIP := proxyableNodeIP(opts)
@@ -283,30 +255,6 @@ func TestNodeAddressProxyable(t *testing.T) {
 					t.Errorf("fixture %q does not satisfy the upstream predicate", tc.want)
 				}
 			})
-		}
-	})
-
-	t.Run("wildcardListen", func(t *testing.T) {
-		cases := map[string]bool{
-			":10250":            true,
-			"0.0.0.0:10250":     true,
-			"[::]:10250":        true,
-			"127.0.0.1:10250":   false,
-			"192.168.1.42:1025": false,
-			"localhost:10250":   false,
-			"nonsense":          false,
-			"":                  false,
-		}
-		for listen, want := range cases {
-			if got := wildcardListen(listen); got != want {
-				t.Errorf("wildcardListen(%q) = %v, want %v", listen, got, want)
-			}
-		}
-		if !wildcardListen(serverKubeletListen) {
-			t.Errorf("serverKubeletListen %q must be wildcard", serverKubeletListen)
-		}
-		if wildcardListen(nodeKubeletListen) {
-			t.Errorf("nodeKubeletListen %q must be scoped", nodeKubeletListen)
 		}
 	})
 }

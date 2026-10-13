@@ -29,6 +29,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // The B213 unit ladder: the kubelet endpoint's SERVING half.
@@ -239,8 +240,7 @@ func TestAgentNodeOptionsCarriesServingPair(t *testing.T) {
 // pair and it must mint its own — which is exactly where the defect was observed.
 //
 // The SAN set is the sharp part. It must cover every address the apiserver may dial
-// this node at, INCLUDING the registered InternalIP in the no-datapath posture,
-// where it legitimately diverges from the advertised address: a narrowed list would
+// this node at, INCLUDING the registered InternalIP: a narrowed list would
 // reproduce the same broken logs/exec as a SAN mismatch rather than an issuer one.
 func TestServerMeshNodeOptionsMintFromClusterCA(t *testing.T) {
 	ca := testClusterCA(t)
@@ -252,11 +252,11 @@ func TestServerMeshNodeOptionsMintFromClusterCA(t *testing.T) {
 			nodeLAN = "192.168.1.42"
 		)
 		nodeOpts := nodeOptions{
-			nodeName: "k3sm-cp",
-			nodeIP:   nodeLAN, // an explicit --node-ip, distinct from --mesh-ip
-			listen:   serverKubeletListen,
-			podCIDR:  "100.64.0.0/24",
-			netMode:  hostnet.Mode{Backend: hostnet.BackendDirect},
+			nodeName:    "k3sm-cp",
+			nodeIP:      nodeLAN, // an explicit --node-ip, distinct from --mesh-ip
+			kubeletPort: ports.KubeletAPIPort,
+			podCIDR:     "100.64.0.0/24",
+			netMode:     hostnet.Mode{Backend: hostnet.BackendDirect},
 		}
 		if err := setServerKubeletServing(&nodeOpts, hierarchy, meshIP); err != nil {
 			t.Fatalf("setServerKubeletServing: %v", err)
@@ -280,22 +280,20 @@ func TestServerMeshNodeOptionsMintFromClusterCA(t *testing.T) {
 		}
 	})
 
-	// The no-datapath divergent case: --mesh-ip 127.0.0.1 --network none. The
-	// advertised address stays loopback while the REGISTERED InternalIP becomes a
-	// host interface address — and that is the address the apiserver dials.
-	t.Run("no-datapath: the SANs cover the divergent registered InternalIP", func(t *testing.T) {
-		const hostLAN = "192.168.1.42"
-		stubHostIPs(t, hostLAN)
+	// The no-datapath case: --mesh-ip 127.0.0.1 --network none. The registered
+	// InternalIP is the address the kubelet API binds (resolveKubeletEndpoint) —
+	// loopback here, never a host LAN address — and the SANs cover it.
+	t.Run("no-datapath: the SANs cover the registered loopback InternalIP", func(t *testing.T) {
 		nodeOpts := nodeOptions{
-			nodeName: "k3sm-cp",
-			nodeIP:   loopbackNodeIP,
-			listen:   serverKubeletListen,
-			podCIDR:  "100.64.0.0/24",
-			netMode:  hostnet.Mode{Backend: hostnet.BackendNone},
+			nodeName:    "k3sm-cp",
+			nodeIP:      loopbackNodeIP,
+			kubeletPort: ports.KubeletAPIPort,
+			podCIDR:     "100.64.0.0/24",
+			netMode:     hostnet.Mode{Backend: hostnet.BackendNone},
 		}
 		internalIP := proxyableNodeIP(nodeOpts)
-		if internalIP == nodeOpts.nodeIP {
-			t.Fatalf("test setup: InternalIP %s did not diverge from the advertised address; this case proves nothing", internalIP)
+		if internalIP != loopbackNodeIP {
+			t.Fatalf("InternalIP = %s, want %s: with no pod network the node registers loopback, not a host address", internalIP, loopbackNodeIP)
 		}
 		if err := setServerKubeletServing(&nodeOpts, hierarchy, loopbackNodeIP); err != nil {
 			t.Fatalf("setServerKubeletServing: %v", err)
@@ -304,13 +302,10 @@ func TestServerMeshNodeOptionsMintFromClusterCA(t *testing.T) {
 		if !hasIPSAN(leaf, internalIP) {
 			t.Errorf("IP SANs %v missing the REGISTERED InternalIP %s — the apiserver dials that address (--kubelet-preferred-address-types=InternalIP), so logs/exec would fail on a SAN mismatch", leaf.IPAddresses, internalIP)
 		}
-		if !hasIPSAN(leaf, "127.0.0.1") {
-			t.Errorf("IP SANs %v missing the loopback same-host dial", leaf.IPAddresses)
-		}
 	})
 
 	t.Run("single node: no pair, so the self-signed dev default stands", func(t *testing.T) {
-		nodeOpts := nodeOptions{nodeName: "k3sm-solo", nodeIP: loopbackNodeIP, listen: serverKubeletListen}
+		nodeOpts := nodeOptions{nodeName: "k3sm-solo", nodeIP: loopbackNodeIP, kubeletPort: ports.KubeletAPIPort}
 		if err := setServerKubeletServing(&nodeOpts, hierarchy, ""); err != nil {
 			t.Fatalf("setServerKubeletServing on the single-node path: %v", err)
 		}
@@ -337,7 +332,7 @@ func TestServerMeshMintFailsClosedWithoutCA(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			nodeOpts := nodeOptions{nodeName: "k3sm-cp", nodeIP: "100.64.0.1", listen: serverKubeletListen}
+			nodeOpts := nodeOptions{nodeName: "k3sm-cp", nodeIP: "100.64.0.1", kubeletPort: ports.KubeletAPIPort}
 			err := setServerKubeletServing(&nodeOpts, tc.hierarchy, "100.64.0.1")
 			if err == nil {
 				t.Fatal("a mesh server minted nothing and reported success — bring-up would continue with a self-signed cert the apiserver refuses")
