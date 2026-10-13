@@ -400,7 +400,7 @@ func planPurge(ctx context.Context, sys System, cfg Config, m []artifact, st dat
 	// role's plist is on disk, so a purge re-run after a partial one (plists
 	// gone) would otherwise leave a record behind for the next install to
 	// carry over.
-	for _, f := range []string{cfg.ServerArgsRecord, cfg.AgentArgsRecord} {
+	for _, f := range []string{cfg.ServerArgsRecord, cfg.AgentArgsRecord, cfg.NetworkRecord} {
 		if f != "" {
 			files = append(files, f)
 		}

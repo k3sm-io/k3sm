@@ -1732,6 +1732,10 @@ func TestInstallOrchestration(t *testing.T) {
 		// over step below, rather than repeated.
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"ReadFile:" + dataroot.DefaultServerArgsRecordPath,
+		// Did k3sm run here before? A read, before any write: it decides the
+		// LAN switch an install with neither --lan nor a record writes (the
+		// fake reports every path present, so this answers at the first one).
+		"PathExists:/Library/LaunchDaemons/io.k3sm.server.plist",
 		// The upgrade check: is any daemon an earlier install left running?
 		// Read-only probes, node daemon first; on this first install neither is
 		// loaded, so nothing is booted out before the state tree is re-owned.
@@ -1857,6 +1861,9 @@ func TestInstallOrchestration(t *testing.T) {
 		// And whatever was carried — nothing, on a first install — is recorded
 		// again, before the plist that will not survive the next uninstall.
 		"WriteServerArgsRecord:" + dataroot.DefaultServerArgsRecordPath,
+		// The LAN switch: none recorded, so it is written, beside the record.
+		"ReadFile:" + DefaultNetworkRecordPath,
+		"WriteRootOnlyFile:" + DefaultNetworkRecordPath + ":0644",
 		// The trust anchor for the endpoint the admin kubeconfig will name, read
 		// AFTER the arguments are resolved (they decide the posture, so they decide
 		// which certificate the apiserver serves) and BEFORE the daemons restart, so
@@ -1979,8 +1986,8 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			// The FIRST privileged call — the refuse-before-write probes ahead of
 			// it (the cross-role plist read, the launcher-directory trust read,
 			// the staged vmhost helper's entitlement, the carried server
-			// arguments' retired-flag check and the free-space
-			// estimate) are all reads, the install-wide lock creates no state
+			// arguments' retired-flag check, the earlier-install probe and the
+			// free-space estimate) are all reads, the install-wide lock creates no state
 			// the install owns, and install performs nothing else before the
 			// service user exists: the data root is its home, and every later
 			// step writes into it.
@@ -1988,7 +1995,8 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			var first string
 			for _, c := range f.calls {
 				if strings.HasPrefix(c, "ReadFile:") || strings.HasPrefix(c, "LinkDirTrust:") || strings.HasPrefix(c, "VerifyVirtualizationEntitlement:") ||
-					strings.HasPrefix(c, "InstallSpace:") || strings.HasPrefix(c, "LockInstall:") || strings.HasPrefix(c, "ServicePID:") {
+					strings.HasPrefix(c, "InstallSpace:") || strings.HasPrefix(c, "LockInstall:") || strings.HasPrefix(c, "ServicePID:") ||
+					strings.HasPrefix(c, "PathExists:") {
 					continue
 				}
 				first = c
