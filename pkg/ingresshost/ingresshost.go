@@ -24,6 +24,10 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -109,6 +113,11 @@ type Config struct {
 	// the WILDCARD (0.0.0.0) is the production choice and is accepted. Which
 	// process makes the bind is Binder's concern, not this field's.
 	BindAddr netip.Addr
+	// BindAddrs, when set, is the address SET the listeners bind instead of
+	// BindAddr alone: each port on every address of it
+	// (svclb.EffectiveBindAddrs, which leaves loopback out below port 1024).
+	// It is the initial set; PrepareBindAddrs swaps it while the host runs.
+	BindAddrs []netip.Addr
 	// AdvertiseAddr is the address written into Ingress and canonical-LB-Service
 	// statuses. The ZERO Addr is legal and means the node's advertisable address
 	// could not be derived: the listeners still serve, but NO status is written
@@ -196,6 +205,15 @@ type Host struct {
 	// recorder records Warning Events on the canonical Service; set by New from
 	// the config or by Run before the watch starts.
 	recorder record.EventRecorder
+
+	// setMu guards addrs and sets. A prepared swap (PrepareBindAddrs) holds it
+	// until its Commit or Abort, so no listener opens on a set about to be
+	// replaced; a bind that starts meanwhile waits.
+	setMu sync.Mutex
+	// addrs is the address set the listeners bind.
+	addrs []netip.Addr
+	// sets is every live listener's address set, so a swap reaches them all.
+	sets map[*svclb.AddrSetListener]struct{}
 }
 
 // New validates cfg and builds the Host. It starts nothing; call Run.
@@ -211,6 +229,15 @@ func New(cfg Config) (*Host, error) {
 	// stays rejected: it would reach net.Listen as the literal "invalid AddrPort".
 	if !cfg.BindAddr.IsValid() {
 		return nil, fmt.Errorf("ingresshost: config requires a valid bind address, got %q", cfg.BindAddr)
+	}
+	addrs := cfg.BindAddrs
+	if len(addrs) == 0 {
+		addrs = []netip.Addr{cfg.BindAddr}
+	}
+	for _, a := range addrs {
+		if !a.IsValid() {
+			return nil, fmt.Errorf("ingresshost: config requires valid bind addresses, got %q", a)
+		}
 	}
 	if cfg.HTTPPort == 0 && cfg.HTTPSPort == 0 {
 		return nil, errors.New("ingresshost: config enables no listener (both ports zero)")
@@ -230,6 +257,8 @@ func New(cfg Config) (*Host, error) {
 		statusKick:  make(chan struct{}, 1),
 		rangesReady: make(chan struct{}),
 		recorder:    cfg.Recorder,
+		addrs:       slices.Clone(addrs),
+		sets:        make(map[*svclb.AddrSetListener]struct{}),
 	}, nil
 }
 
@@ -302,17 +331,129 @@ func (h *Host) listenerCount() int {
 // the status IP is only ever written for live listeners).
 type countingBinder struct{ h *Host }
 
-// Listen binds through the Host's binder and counts the success.
-func (b countingBinder) Listen(ctx context.Context, network string, addr netip.AddrPort) (net.Listener, error) {
-	ln, err := b.h.binder().Listen(ctx, network, addr)
+// Listen binds addr's port on every address of the Host's current set
+// through the Host's binder (all or nothing) and counts the success. The
+// address in addr is ignored: the set is the Host's, so a swap can move it.
+func (b countingBinder) Listen(ctx context.Context, _ string, addr netip.AddrPort) (net.Listener, error) {
+	h := b.h
+	h.setMu.Lock()
+	set, err := svclb.ListenAddrSet(ctx, h.binder().Listen, h.addrs, addr.Port())
+	if err == nil {
+		h.sets[set] = struct{}{}
+	}
+	h.setMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
+	ln := trackedSet{AddrSetListener: set, h: h}
 	if int(b.h.boundCount.Add(1)) >= b.h.listenerCount() {
 		b.h.serving.Store(true)
 		b.h.kickStatus()
 	}
 	return rangedListener{Listener: ln, h: b.h}, nil
+}
+
+// trackedSet is a live listener's address set, unregistered from the Host
+// when it closes.
+type trackedSet struct {
+	*svclb.AddrSetListener
+	h *Host
+}
+
+// Close unregisters the set and closes every address of it.
+func (t trackedSet) Close() error {
+	t.h.setMu.Lock()
+	delete(t.h.sets, t.AddrSetListener)
+	t.h.setMu.Unlock()
+	return t.AddrSetListener.Close()
+}
+
+// IngressRebind is a prepared swap of the ingress listeners' address set:
+// every live listener already listens on the new addresses beside the old.
+// Exactly one of Commit and Abort must be called, promptly: the swap holds
+// the Host's set lock.
+type IngressRebind struct {
+	h     *Host
+	addrs []netip.Addr
+	sets  []*svclb.AddrSetListener
+	once  sync.Once
+}
+
+// PrepareBindAddrs starts swapping the address set the HTTP/HTTPS listeners
+// bind for addrs. Each live listener binds the addresses it does not yet
+// listen on, all or nothing across the listeners: a failure closes what was
+// opened, keeps the old set and is returned. A host with no listener bound
+// yet only takes the new set at the commit.
+func (h *Host) PrepareBindAddrs(ctx context.Context, addrs []netip.Addr) (*IngressRebind, error) {
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("ingresshost: %w", svclb.ErrNoBindAddress)
+	}
+	for _, a := range addrs {
+		if !a.IsValid() {
+			return nil, fmt.Errorf("ingresshost: invalid bind address %q", a)
+		}
+	}
+	h.setMu.Lock()
+	rb := &IngressRebind{h: h, addrs: slices.Clone(addrs)}
+	for set := range h.sets {
+		if err := set.Prepare(ctx, addrs); err != nil {
+			for _, p := range rb.sets {
+				p.Abort()
+			}
+			h.setMu.Unlock()
+			return nil, fmt.Errorf("ingresshost: listener on port %s: %w", portOf(set), err)
+		}
+		rb.sets = append(rb.sets, set)
+	}
+	return rb, nil
+}
+
+// Commit makes the prepared set the one in force: every listener closes the
+// addresses outside it (connections already accepted keep running) and a
+// listener opened from now on binds it.
+func (rb *IngressRebind) Commit() {
+	rb.once.Do(func() {
+		defer rb.h.setMu.Unlock()
+		for _, set := range rb.sets {
+			set.Commit(rb.addrs)
+		}
+		rb.h.addrs = rb.addrs
+		rb.h.log.Info("ingress listeners moved to a new address set", "bind", addrsString(rb.addrs))
+	})
+}
+
+// Abort drops the prepared set; the old one stays in force.
+func (rb *IngressRebind) Abort() {
+	rb.once.Do(func() {
+		defer rb.h.setMu.Unlock()
+		for _, set := range rb.sets {
+			set.Abort()
+		}
+	})
+}
+
+// BindAddrs returns a copy of the address set in force.
+func (h *Host) BindAddrs() []netip.Addr {
+	h.setMu.Lock()
+	defer h.setMu.Unlock()
+	return slices.Clone(h.addrs)
+}
+
+// portOf renders a listener's port for an error.
+func portOf(set *svclb.AddrSetListener) string {
+	if ta, ok := set.Addr().(*net.TCPAddr); ok {
+		return strconv.Itoa(ta.Port)
+	}
+	return set.Addr().String()
+}
+
+// addrsString renders an address set for a log line.
+func addrsString(addrs []netip.Addr) string {
+	parts := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		parts = append(parts, a.String())
+	}
+	return strings.Join(parts, ",")
 }
 
 // rangedListener enforces the canonical Service's loadBalancerSourceRanges at
@@ -469,7 +610,7 @@ func (h *Host) serveLoop(ctx context.Context) {
 		h.log.Error("ingress server construction (misconfiguration, not retried)", "err", err)
 		return
 	}
-	h.log.Info("ingress host starting", "bind", h.cfg.BindAddr.String(), "advertise", h.advertiseString(),
+	h.log.Info("ingress host starting", "bind", addrsString(h.BindAddrs()), "advertise", h.advertiseString(),
 		"http-port", h.cfg.HTTPPort, "https-port", h.cfg.HTTPSPort)
 	for attempt := 0; ; {
 		h.boundCount.Store(0)
