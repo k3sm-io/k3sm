@@ -818,29 +818,32 @@ func requireJoinedServingPair(res *bootstrap.JoinResult) error {
 // serving certificate is bound to, and its Service proxy sources cross-node
 // dials from.
 //
-// It is the mesh address the control plane ASSIGNED: the join response's
-// MeshIP, or on a restart the stored assignment the result was rebuilt from
-// (joinResultFrom). The server issues the certificates for that address, so it
-// is the only value guaranteed to match them. It is never the --node-ip flag:
-// the flag is an assertion, and binding the kubelet API to an asserted address
-// (often a LAN address) is the exposure the listener derivation exists to stop.
-// NodeIP is consulted only when a response carries no MeshIP. Empty means the
-// join named no address, and startNode then refuses to serve the kubelet API.
+// It is the mesh address the control plane ASSIGNED and nothing else: the join
+// response's MeshIP (a server that assigns none refuses the join), or on a
+// restart the stored assignment the result was rebuilt from (joinResultFrom).
+// It never falls back to the --node-ip flag, nor to JoinResult.NodeIP, which
+// carries the flag's value against a server that predates that field: both are
+// assertions, and binding the kubelet API to an asserted address (often a LAN
+// address) is the exposure the listener derivation exists to stop. A stored
+// assignment is not guaranteed to carry a meshIP (the credential loader
+// requires only the podCIDR), so an empty result is possible; startNode then
+// refuses to serve the kubelet API with errKubeletAddress.
 //
 // It is pure so the wiring it decides is unit-tested without a live join.
 func agentInternalIP(res *bootstrap.JoinResult) string {
 	if res == nil {
 		return ""
 	}
-	if res.MeshIP != "" {
-		return res.MeshIP
-	}
-	return res.NodeIP
+	return res.MeshIP
 }
 
-// credInternalIP is agentInternalIP for the restart path, where the stored
-// assignment stands in for the join response: the mesh-egress /32 the server
-// assigned IS the address its certificates name.
+// credInternalIP is the mesh address a RESUMING node excludes from the
+// wireguard endpoint candidates it advertises (underlayMeshEndpoint): the
+// stored assignment's meshIP. It does not feed the kubelet listener, the Node
+// object or any certificate; those read agentInternalIP. The flagIP fallback is
+// used only when the stored assignment carries no meshIP, which the
+// credential loader permits (it requires only the podCIDR); there it merely
+// widens the exclusion to an address the operator asserted.
 func credInternalIP(cred *nodeCredential, flagIP string) string {
 	if cred != nil && cred.Assignment.MeshIP != "" {
 		return cred.Assignment.MeshIP

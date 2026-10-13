@@ -135,6 +135,23 @@ func TestKubeletListensOnNodeAddress(t *testing.T) {
 			opts:  agentNodeOptions(agentOptions{nodeName: "worker"}, &bootstrap.JoinResult{}, "/k", direct, nil),
 		},
 		{
+			// The credential loader requires only the podCIDR, so a stored
+			// assignment can lack a meshIP: the asserted --node-ip, present on
+			// this Mac, must still never become the kubelet's address.
+			name:  "a stored assignment with no meshIP",
+			addrs: []string{"127.0.0.1", lanAddr, asserted},
+			opts: agentNodeOptions(agentOptions{nodeName: "worker", nodeIP: asserted},
+				joinResultFrom(&nodeCredential{Assignment: nodecred.Assignment{PodCIDR: "100.64.3.0/24"}}, "worker", "", ""), "/k", direct, nil),
+		},
+		{
+			// A server that predates the NodeIP field echoes the asserted value
+			// back in JoinResult.NodeIP; it is not an assignment.
+			name:  "a join result whose only address is the asserted one",
+			addrs: []string{"127.0.0.1", lanAddr, asserted},
+			opts: agentNodeOptions(agentOptions{nodeName: "worker", nodeIP: asserted},
+				&bootstrap.JoinResult{NodeIP: asserted, PodCIDR: "100.64.3.0/24"}, "/k", direct, nil),
+		},
+		{
 			name:  "an unspecified node address",
 			addrs: []string{"127.0.0.1", lanAddr},
 			opts:  nodeOptions{nodeIP: "0.0.0.0", kubeletPort: ports.KubeletAPIPort, netMode: none},
@@ -151,5 +168,25 @@ func TestKubeletListensOnNodeAddress(t *testing.T) {
 				t.Errorf("a refusal still produced a listen address %q", ep.listen)
 			}
 		})
+	}
+}
+
+// TestCredInternalIPFallback pins when credInternalIP's flag fallback is used:
+// only when the stored assignment carries no meshIP, which the credential loader
+// permits. It feeds the wireguard endpoint exclusion, never the kubelet listener.
+func TestCredInternalIPFallback(t *testing.T) {
+	withMesh := &nodeCredential{Assignment: nodecred.Assignment{PodCIDR: "100.64.3.0/24", MeshIP: "100.64.3.1"}}
+	if got := credInternalIP(withMesh, "192.0.2.60"); got != "100.64.3.1" {
+		t.Errorf("credInternalIP with a stored meshIP = %q, want the assignment", got)
+	}
+	noMesh := &nodeCredential{Assignment: nodecred.Assignment{PodCIDR: "100.64.3.0/24"}}
+	if got := credInternalIP(noMesh, "192.0.2.60"); got != "192.0.2.60" {
+		t.Errorf("credInternalIP without a stored meshIP = %q, want the flag fallback", got)
+	}
+	if got := credInternalIP(nil, ""); got != "" {
+		t.Errorf("credInternalIP(nil) = %q, want empty", got)
+	}
+	if got := agentInternalIP(joinResultFrom(noMesh, "worker", "", "")); got != "" {
+		t.Errorf("agentInternalIP for a stored assignment with no meshIP = %q, want empty (the kubelet then refuses)", got)
 	}
 }
