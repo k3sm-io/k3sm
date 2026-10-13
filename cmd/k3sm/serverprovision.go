@@ -66,6 +66,10 @@ type serverPlan struct {
 	// resolver (startInterconnectResolver) and the in-process node's reporter
 	// so one kubelet-endpoint route serves both.
 	interconnectMetrics *interconnect.Metrics
+	// lan is the daemon's LAN switch (startDaemonLAN): the datapath, the
+	// ingress host and the node's svclb hoster attach to it, and SIGHUP moves
+	// them all.
+	lan *lanSwitch
 }
 
 // errServerTokenAsAdmin refuses a server-class join token on a start where it
@@ -641,7 +645,8 @@ func startControlPlane(ctx context.Context, opts serverOptions, mode hostnet.Mod
 		noteEtcdMemberRouteFailure(breaker, logger, err)
 		return serverPlan{}, nil, fmt.Errorf("HA server-join: %w", err)
 	}
-	plan := serverPlan{opts: opts, mode: mode, cfg: cfg, serverPKI: pki, interconnectMetrics: interconnect.NewMetrics()}
+	plan := serverPlan{opts: opts, mode: mode, cfg: cfg, serverPKI: pki, interconnectMetrics: interconnect.NewMetrics(),
+		lan: startDaemonLAN(ctx, opts.workDir, logger)}
 	exec := executor.NewSupervised(plan.cfg)
 	// Before Start, so the exit handler can ask about any child it is told of.
 	probe.set(exec)

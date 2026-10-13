@@ -666,7 +666,15 @@ func startServerLBHosting(ctx context.Context, plan serverPlan, restCfg *rest.Co
 	// advertises it (the wildcard listener cannot witness it).
 	ensureAdvertisedNodeAlias(ctx, nodeOpts, logger)
 	if ingressCfg.HTTPPort != 0 || ingressCfg.HTTPSPort != 0 {
-		ih, err := ingresshost.New(ingressCfg)
+		var ih *ingresshost.Host
+		err := plan.lan.attach("", advertisedNodeIP(nodeOpts), func(sets lanSets) (lanFamily, error) {
+			ingressCfg.BindAddrs = sets.listeners
+			var err error
+			if ih, err = ingresshost.New(ingressCfg); err != nil {
+				return nil, err
+			}
+			return ingressLANFamily{h: ih}, nil
+		})
 		if err != nil {
 			logger.Error("ingress hosting disabled", "err", err)
 		} else {

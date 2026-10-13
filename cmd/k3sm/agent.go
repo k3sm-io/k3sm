@@ -87,6 +87,9 @@ type agentOptions struct {
 	// nodePortAddresses is --nodeport-addresses: where this worker's NodePort
 	// listeners bind (empty = every interface).
 	nodePortAddresses string
+	// lan is the daemon's LAN switch (startDaemonLAN), set by agentStart; not
+	// a flag. The datapath and the node's svclb hoster attach to it.
+	lan *lanSwitch
 }
 
 // registerAgentFlags binds `k3sm agent`'s flags onto fs. It is a function rather
@@ -208,6 +211,7 @@ func runAgent(args []string) error {
 	defer stop()
 
 	breaker := newCrashBreaker(opts.workDir, logger)
+	opts.lan = startDaemonLAN(ctx, opts.workDir, logger)
 	err := agentStart(ctx, opts, breaker, logger)
 	// The terminal paths record BEFORE they back off (agentTerminal), so an
 	// installer polling the record sees the reason within its own join budget
@@ -748,6 +752,7 @@ func agentResumeFromCredential(ctx context.Context, opts agentOptions, cred *nod
 // cannot acquire a second resolution idiom.
 func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPath string, mode hostnet.Mode, datapath *netserve.Server) nodeOptions {
 	return nodeOptions{
+		lan:        opts.lan,
 		kubeconfig: kubeconfigPath,
 		nodeName:   opts.nodeName,
 		// The kubelet API binds the assigned mesh address on this port
@@ -1378,12 +1383,15 @@ func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.
 	// verdict the node will later advertise (see vmBackendAvailable).
 	cfg := workerNetserveConfig(opts, res, mode, vmBackendAvailable(), logger)
 	cfg.Client = cs
-	// Resolved once, here, against this Mac's addresses and the assigned mesh
-	// address the preset names; fixed for this process's life.
-	if cfg.NodePortAddresses, err = resolveNodePortAddresses(opts.nodePortAddresses, cfg.NodeAddress); err != nil {
+	// Resolved here from the LAN switch against this Mac's addresses and the
+	// assigned mesh address the preset names; SIGHUP re-resolves it.
+	srv, err := attachDatapath(opts.lan, opts.nodePortAddresses, cfg.NodeAddress, true, func(nodePorts []netip.Addr) *netserve.Server {
+		cfg.NodePortAddresses = nodePorts
+		return netserve.New(cfg)
+	})
+	if err != nil {
 		return nil, err
 	}
-	srv := netserve.New(cfg)
 	go func() {
 		if err := srv.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("node-local datapath (Service proxy + cluster DNS)", "err", err)

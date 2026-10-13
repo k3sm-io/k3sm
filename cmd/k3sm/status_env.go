@@ -165,6 +165,7 @@ func newStatusCollector() status.Collector {
 		// apiserver row.
 		Interconnect: statusInterconnect(kube),
 		StopMarker:   statusStopMarker,
+		Network:      statusNetwork,
 		Paths:        paths,
 		EUID:         euid,
 		ServiceUID:   serviceUID,
@@ -177,6 +178,12 @@ func newStatusCollector() status.Collector {
 // statusStopMarker reads the stop marker through the installer's own reader.
 func statusStopMarker() (install.StopMarker, bool, error) {
 	return install.ReadStopMarker(install.NewDarwinSystem(), install.DefaultStopMarkerPath)
+}
+
+// statusNetwork reads the LAN access record through the installer's own
+// reader; the record is world-readable, so this works for any user.
+func statusNetwork() (install.NetworkRecord, bool, error) {
+	return install.ReadNetworkRecord(os.ReadFile, install.DefaultNetworkRecordPath)
 }
 
 // statusInterconnect is the report's Interconnect reader over kube: one GET of

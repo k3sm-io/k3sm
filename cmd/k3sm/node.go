@@ -279,6 +279,10 @@ type nodeOptions struct {
 	// standalone `k3sm node` leave it nil, which is exactly the behaviour they had
 	// before the hook existed.
 	onExitBegin func()
+	// lan is the daemon's LAN switch; the node's svclb hoster attaches to it
+	// (startLBHoster). Nil (the standalone `k3sm node`) binds on every
+	// interface and attaches nothing.
+	lan *lanSwitch
 }
 
 // nodeKubeletListen is the standalone `k3sm node` --listen default

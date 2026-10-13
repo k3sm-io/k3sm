@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -43,6 +43,8 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   start       start k3sm again after a stop (run as root via sudo)
   restart     restart the k3sm daemons, pods keep running (run as root via sudo;
               --start also starts a stopped node)
+  network     LAN access for this node's NodePort, LoadBalancer and ingress
+              listeners (network lan on|off|status; on/off run as root via sudo)
   datavol     the APFS volume the data root lives on (datavol mount|status|delete)
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
@@ -113,6 +115,10 @@ func main() {
 		}
 	case "restart":
 		if code := runRestart(os.Args[2:], os.Stderr); code != 0 {
+			os.Exit(code)
+		}
+	case "network":
+		if code := runNetwork(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
 			os.Exit(code)
 		}
 	case netdRemoveMeshVerb:

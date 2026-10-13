@@ -646,9 +646,11 @@ func runServer(args []string) (err error) {
 // A server whose pod range is not its own (sm.dataPathRefused) starts NO datapath
 // and returns zero values: runServerNode parks it before anything reads them.
 //
-// --nodeport-addresses is resolved here, once, against this Mac's addresses and
-// the address the node advertises; an unusable or empty-selecting spec is the
-// error, and the server refuses to start rather than serve NodePorts nowhere.
+// The NodePort address set is resolved here from the LAN switch (off: this Mac
+// and the mesh; on: --nodeport-addresses, empty being every interface) against
+// this Mac's addresses and the address the node advertises; an unusable or
+// empty-selecting spec is the error, and the server refuses to start rather
+// than serve NodePorts nowhere. SIGHUP re-resolves it (attachServerProxy).
 func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions, error) {
 	if sm.dataPathRefused != nil {
 		return nil, nodeOptions{}, nil
@@ -672,45 +674,60 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	// this point. So the addressing half is built once here and nodeOpts
 	// copies it, rather than a second literal restating the same fields.
 	nodeAddressing := nodeOptions{nodeIP: opts.nodeIP, podCIDR: sm.podCIDR, netMode: mode}
-	var nodePortAddrs []netip.Addr
-	if mode.DataPath() {
-		var err error
-		if nodePortAddrs, err = resolveNodePortAddresses(opts.nodePortAddresses, advertisedNodeIP(nodeAddressing)); err != nil {
-			return nil, nodeOptions{}, err
-		}
-	}
-	net := netserve.New(netserve.Config{
-		Client:            cs,
-		WorkDir:           opts.workDir,
-		DNSVIP:            opts.clusterIP,
-		ClusterDomain:     opts.domain,
-		APIServerEndpoint: apiServerEndpoint,
-		NodeIP:            opts.nodeIP,
-		// The address the in-process node and the ingress host advertise. It is
-		// derived from nodeAddressing, which nodeOpts copies its three
-		// addressing fields from, so both read one value.
-		NodeAddress:       advertisedNodeIP(nodeAddressing),
-		PodCIDR:           sm.podCIDR,
-		NodePortAddresses: nodePortAddrs,
-		MeshEgressIP:      sm.egressIP,
-		PeerMeshEgressIPs: sm.peerEgress,
-		VMBackend:         vmCapable,
-		VMNetSubnet:       netserve.DefaultVMNetSubnet,
-		// cs is the admin client (exec.Kubeconfig()), so the policy watcher's
-		// cluster-wide NetworkPolicies, Pods and Namespaces reads are allowed
-		// and PodScopeNode stays empty. TestServerNetservePolicyClientIsAdmin
-		// pins both.
-		EnforceNetworkPolicy: true,
-		NetdSocket:           mode.Socket,
-		Disabled:             !mode.DataPath(),
-		Logger:               logger,
+	net, err := attachDatapath(plan.lan, opts.nodePortAddresses, advertisedNodeIP(nodeAddressing), mode.DataPath(), func(nodePorts []netip.Addr) *netserve.Server {
+		return netserve.New(netserve.Config{
+			Client:            cs,
+			WorkDir:           opts.workDir,
+			DNSVIP:            opts.clusterIP,
+			ClusterDomain:     opts.domain,
+			APIServerEndpoint: apiServerEndpoint,
+			NodeIP:            opts.nodeIP,
+			// The address the in-process node and the ingress host advertise. It is
+			// derived from nodeAddressing, which nodeOpts copies its three
+			// addressing fields from, so both read one value.
+			NodeAddress:       advertisedNodeIP(nodeAddressing),
+			PodCIDR:           sm.podCIDR,
+			NodePortAddresses: nodePorts,
+			MeshEgressIP:      sm.egressIP,
+			PeerMeshEgressIPs: sm.peerEgress,
+			VMBackend:         vmCapable,
+			VMNetSubnet:       netserve.DefaultVMNetSubnet,
+			// cs is the admin client (exec.Kubeconfig()), so the policy watcher's
+			// cluster-wide NetworkPolicies, Pods and Namespaces reads are allowed
+			// and PodScopeNode stays empty. TestServerNetservePolicyClientIsAdmin
+			// pins both.
+			EnforceNetworkPolicy: true,
+			NetdSocket:           mode.Socket,
+			Disabled:             !mode.DataPath(),
+			Logger:               logger,
+		})
 	})
+	if err != nil {
+		return nil, nodeOptions{}, err
+	}
 	go func() {
 		if err := net.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("darwin-net services", "err", err)
 		}
 	}()
 	return net, nodeAddressing, nil
+}
+
+// attachDatapath builds the datapath Server with build, handing it the
+// NodePort address set the LAN switch resolves (the switch's state, the
+// --nodeport-addresses spec and node, the address the node advertises), and
+// attaches its Service proxy to the switch so SIGHUP moves the NodePorts. A
+// node with no datapath builds with no set and attaches nothing.
+func attachDatapath(lan *lanSwitch, spec, node string, dataPath bool, build func(nodePorts []netip.Addr) *netserve.Server) (*netserve.Server, error) {
+	if !dataPath {
+		return build(nil), nil
+	}
+	var srv *netserve.Server
+	err := lan.attach(spec, node, func(sets lanSets) (lanFamily, error) {
+		srv = build(sets.nodePorts)
+		return proxyLANFamily{srv: srv}, nil
+	})
+	return srv, err
 }
 
 // serverNodeWiring is what the in-process node's options take from the phases
@@ -770,6 +787,7 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 	}
 
 	nodeOpts := nodeOptions{
+		lan:        plan.lan,
 		restConfig: nodeRESTCfg,
 		nodeName:   opts.nodeName,
 		// The kubelet API binds this node's own InternalIP on this port
