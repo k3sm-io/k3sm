@@ -1,0 +1,11 @@
+/fixture/zot: go1.27.2
+	path	zotregistry.dev/zot/v2/cmd/zot
+	mod	zotregistry.dev/zot/v2	v2.1.20	h1:XIJg37yCMrnm4PpKyyCKjeESMNGew77Lp+YS6l0lqgg=
+	dep	cel.dev/expr	v0.25.2	h1:K6j46C81hXtZQfuX60cVWQFBJahKSE2gfRbNuvr5bFs=
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	DefaultGODEBUG=tracebacklabels=0,x509sslcertoverrideplatform=0
+	build	CGO_ENABLED=0
+	build	GOARCH=arm64
+	build	GOOS=darwin
+	build	GOARM64=v8.0
