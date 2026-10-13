@@ -31,26 +31,26 @@ import (
 const nodePortAddressesFlag = "nodeport-addresses"
 
 // nodePortAddressesUsage is that flag's help text, one string for all three commands.
-const nodePortAddressesUsage = "the addresses NodePort listeners bind, as a comma-separated IPv4 CIDR list (the kube-proxy --nodeport-addresses shape) and/or the preset \"local\" (127.0.0.1 plus this node's own address: its mesh address when joined). Empty, the default, binds every interface. Resolved against this Mac's addresses when the daemon starts and fixed until it restarts. On an untrusted network use \"local\""
+const nodePortAddressesUsage = "the addresses NodePort listeners bind, as a comma-separated IPv4 CIDR list (the kube-proxy --nodeport-addresses shape) and/or the preset \"local\" (127.0.0.1 plus this node's own address: its mesh address when joined). Empty, the default, binds every interface. It applies while LAN access is on; with LAN access off (k3sm network lan off) NodePorts bind \"local\" whatever this says. Resolved against this Mac's addresses when the daemon starts and again at every LAN access change"
 
 // nodePortHostAddrs is the host-address seam the resolution reads
 // (proxy.HostAddrs). A package var so a test can name the host's addresses.
 var nodePortHostAddrs = proxy.HostAddrs
 
-// resolveNodePortAddresses resolves a --nodeport-addresses spec for this node
-// once, at datapath start, against this Mac's addresses and nodeAddress (the
-// address the node advertises, which the preset names). An empty spec is the
-// wildcard (nil). An unusable spec, or one that selects nothing, is an error,
-// so the node refuses to start rather than serving NodePorts nowhere.
-func resolveNodePortAddresses(spec, nodeAddress string) ([]netip.Addr, error) {
+// resolveNodePortAddresses resolves a --nodeport-addresses spec for this node,
+// at datapath start and at every LAN access change (lanSwitch.resolve),
+// against this Mac's addresses (hostAddrs, normally nodePortHostAddrs) and
+// node (the address the node advertises, which the preset names). An empty
+// spec is the wildcard (nil). An unusable spec, or one that selects nothing,
+// is an error, so the node refuses rather than serving NodePorts nowhere.
+func resolveNodePortAddresses(spec string, node netip.Addr, hostAddrs func() ([]netip.Addr, error)) ([]netip.Addr, error) {
 	if strings.TrimSpace(spec) == "" {
 		return nil, nil
 	}
-	host, err := nodePortHostAddrs()
+	host, err := hostAddrs()
 	if err != nil {
 		return nil, fmt.Errorf("--%s: %w", nodePortAddressesFlag, err)
 	}
-	node, _ := netip.ParseAddr(nodeAddress) // an unparseable address leaves the preset loopback-only
 	addrs, err := proxy.ResolveNodePortAddresses(spec, node, host)
 	if err != nil {
 		return nil, fmt.Errorf("--%s: %w", nodePortAddressesFlag, err)

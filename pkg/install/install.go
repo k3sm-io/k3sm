@@ -1306,6 +1306,11 @@ type Config struct {
 	// node daemon's arguments for its Role (setNodePortAddressesArg). Nil keeps
 	// a carried value; an empty value removes it.
 	NodePortAddresses *string
+	// LAN is `k3sm install --lan`; nil keeps the recorded value, or decides
+	// by whether k3sm ran here before (DecideInstallLAN).
+	LAN *LAN
+	// NetworkRecord is where LAN is recorded; empty is DefaultNetworkRecordPath.
+	NetworkRecord string
 	// ExtraAgentArgs are operator-supplied `k3sm agent` arguments appended to the
 	// fixed set AgentPlist renders (--mesh-port, --dns-vip, …). Install
 	// populates it exactly as it populates ExtraServerArgs: from the agent plist
@@ -1528,6 +1533,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.AgentArgsRecord == "" {
 		c.AgentArgsRecord = dataroot.DefaultAgentArgsRecordPath
+	}
+	if c.NetworkRecord == "" {
+		c.NetworkRecord = DefaultNetworkRecordPath
 	}
 	if c.Role == "" {
 		c.Role = RoleServer
@@ -2007,6 +2015,11 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if err != nil {
 		return err
 	}
+	// 0b⁗. Did k3sm run here before? It decides the LAN switch 2d′ records.
+	prior, err := priorInstall(sys, cfg)
+	if err != nil {
+		return err
+	}
 
 	// 0c. An UPGRADE stops the daemons the previous install left running before
 	//     anything under the data root changes owner: EnsureServiceUser below
@@ -2330,6 +2343,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//      `k3sm uninstall`; the record lives in the preserved data root and
 	//      does.
 	if err := writeArgsRecord(sys, cfg); err != nil {
+		return err
+	}
+	if err := writeInstallNetworkRecord(sys, cfg, prior); err != nil {
 		return err
 	}
 

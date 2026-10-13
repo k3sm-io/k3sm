@@ -112,6 +112,7 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 		MeshIP:            o.meshIP,
 		KubeconfigName:    o.recordedKubeconfigName(),
 		NodePortAddresses: o.recordedNodePortAddresses(),
+		LAN:               o.recordedLAN(),
 		SecretsEncryption: o.secretsEncryption,
 		EtcdSnapshots:     o.etcdSnapshotFlags(),
 		Start:             o.start,
@@ -137,6 +138,17 @@ func (o installFlags) recordedNodePortAddresses() *string {
 		return nil
 	}
 	v := o.nodePortAddresses
+	return &v
+}
+
+// recordedLAN is the install package's request for --lan: the passed value,
+// or nil when the flag was not passed (keep the recorded value, or decide by
+// whether k3sm ran here before).
+func (o installFlags) recordedLAN() *install.LAN {
+	if !o.set["lan"] {
+		return nil
+	}
+	v := o.lan
 	return &v
 }
 
@@ -206,6 +218,8 @@ type installFlags struct {
 	meshIP            string
 	kubeconfigName    string
 	nodePortAddresses string
+	lan               install.LAN
+	lanRaw            string
 	secretsEncryption bool
 	// etcdSnapshotCron, etcdSnapshotRetention and etcdDisableSnapshots are the
 	// scheduled etcd snapshot flags, rendered into the server daemon's arguments
@@ -240,6 +254,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.StringVar(&o.meshIP, "mesh-ip", "", "this node's wireguard mesh address, written into the server daemon's arguments; needed on every Mac that serves the control plane in a multi-node cluster")
 	fs.StringVar(&o.kubeconfigName, "kubeconfig-name", install.DefaultKubeconfigName, "the cluster, user and context name the admin kubeconfig is merged under in your ~/.kube/config (the k3s --write-kubeconfig-name analog). It is recorded with the other install arguments, so k3sm kubectl, k3sm kubeconfig and uninstall --purge use it; a name already used by an entry k3sm did not create is refused")
 	fs.StringVar(&o.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage+". Written into the node daemon's arguments and kept across reinstalls; pass an empty value to go back to every interface")
+	fs.StringVar(&o.lanRaw, "lan", "", "LAN access for this node's NodePort, LoadBalancer and ingress listeners: off answers only on this Mac and the cluster mesh, on answers on every network this Mac is on. Not passed, a new install records off and an existing install keeps what it has (on, if it predates the setting). Change it later with 'sudo k3sm network lan on|off'. The apiserver, the worker join port and the mesh port do not follow it")
 	fs.BoolVar(&o.secretsEncryption, "secrets-encryption", false, "encrypt Secrets at rest with a key generated on this Mac; a new single-server cluster only (back up <data root>/server/cred with every datastore backup)")
 	fs.StringVar(&o.etcdSnapshotCron, "etcd-snapshot-schedule-cron", executor.DefaultEtcdSnapshotCron, "when the server takes a scheduled etcd snapshot, as a five-field cron expression in local time (embedded etcd HA servers only); written into the server daemon's arguments when passed")
 	fs.IntVar(&o.etcdSnapshotRetention, "etcd-snapshot-retention", executor.DefaultEtcdSnapshotRetention, "how many of this server's scheduled etcd snapshots to keep (embedded etcd HA servers only); written into the server daemon's arguments when passed")
@@ -258,6 +273,13 @@ func parseInstallFlags(args []string) (installFlags, error) {
 		if err := install.ValidateKubeconfigName(o.kubeconfigName); err != nil {
 			return installFlags{}, fmt.Errorf("--kubeconfig-name: %w", err)
 		}
+	}
+	if o.set["lan"] {
+		lan, err := install.ParseLAN(o.lanRaw)
+		if err != nil {
+			return installFlags{}, fmt.Errorf("--lan: %w", err)
+		}
+		o.lan = lan
 	}
 	o.nodePortAddresses = strings.TrimSpace(o.nodePortAddresses) // whitespace-only clears, like ""
 	if err := validateNodePortAddresses(o.nodePortAddresses); err != nil {

@@ -146,7 +146,7 @@ func TestNodePortAddressesFlag(t *testing.T) {
 			return []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("192.0.2.10")}, nil
 		}
 		t.Cleanup(func() { nodePortHostAddrs = saved })
-		got, err := resolveNodePortAddresses("local", "100.64.0.1")
+		got, err := resolveNodePortAddresses("local", netip.MustParseAddr("100.64.0.1"), nodePortHostAddrs)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -154,7 +154,7 @@ func TestNodePortAddressesFlag(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Errorf("resolved %v, want %v (never the LAN address)", got, want)
 		}
-		if got, err := resolveNodePortAddresses("", "100.64.0.1"); got != nil || err != nil {
+		if got, err := resolveNodePortAddresses("", netip.MustParseAddr("100.64.0.1"), nodePortHostAddrs); got != nil || err != nil {
 			t.Errorf("an empty spec resolved to %v, %v; want the wildcard (nil)", got, err)
 		}
 	})

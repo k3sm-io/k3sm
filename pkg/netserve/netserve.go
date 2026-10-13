@@ -18,6 +18,7 @@ package netserve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -392,6 +393,18 @@ func vmnetPolicyPrefix(vmBackend bool, natSubnet string) netip.Prefix {
 // keyed on the published identity.
 func (s *Server) SetTransportOverrides(overrides map[netip.Addr]proxy.VMPodTransport) {
 	s.table.SetTransportOverrides(overrides)
+}
+
+// PrepareNodePortAddresses starts swapping the address set every NodePort
+// listener binds while the proxy runs (proxy.PrepareNodePortAddresses: bind
+// the new addresses beside the old, all or nothing; the returned swap's Commit
+// closes the addresses that left the set, Abort keeps the old set). Empty is
+// the wildcard. A disabled datapath has no NodePort and returns an error.
+func (s *Server) PrepareNodePortAddresses(addrs ...netip.Addr) (*proxy.NodePortSwap, error) {
+	if s.cfg.Disabled || s.proxy == nil {
+		return nil, errors.New("netserve: no Service proxy runs on this node (--network none)")
+	}
+	return s.proxy.PrepareNodePortAddresses(addrs...)
 }
 
 // Run runs the Service proxy and its watcher until ctx is cancelled. Both the

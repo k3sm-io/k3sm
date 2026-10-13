@@ -123,7 +123,10 @@ type Report struct {
 	Interconnect *Interconnect `json:"interconnect,omitempty"`
 	// StoppedBy is who stopped k3sm on this Mac, present only while a readable
 	// stop marker exists. It adds no verdict or state word.
-	StoppedBy *StoppedBy   `json:"stoppedBy,omitempty"`
+	StoppedBy *StoppedBy `json:"stoppedBy,omitempty"`
+	// Network is this node's LAN access switch, present on an installed Mac
+	// whose record could be read. It adds no verdict or state word.
+	Network   *Network     `json:"network,omitempty"`
 	Version   version.Info `json:"version"`
 	Host      string       `json:"host"`
 	Timestamp time.Time    `json:"timestamp"`

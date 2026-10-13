@@ -205,9 +205,9 @@ Every listener a node opens, and the addresses it binds:
 | Listener | Port | Binds |
 |---|---|---|
 | kubelet API (logs, exec, metrics) | `10250` (`--kubelet-port` on a server) | the node's own address only: its mesh address once joined, its pod-range address on a single node, `127.0.0.1` on a single node under `--network none` |
-| NodePort Services | `30000-32767` | every interface by default, or only the `--nodeport-addresses` set |
-| LoadBalancer Services | each Service's `port` | every interface |
-| Ingress host (server) | `80`, `443` (`--ingress-http-port`, `--ingress-https-port`) | every interface |
+| NodePort Services | `30000-32767` | follows LAN access: every interface (or the `--nodeport-addresses` set) when on, `127.0.0.1` and the node's own address when off |
+| LoadBalancer Services | each Service's `port` | follows LAN access: every interface when on, `127.0.0.1` and the node's own address when off |
+| Ingress host (server) | `80`, `443` (`--ingress-http-port`, `--ingress-https-port`) | follows LAN access: every interface when on, the node's own address when off |
 | wireguard mesh | `51820/udp` | every interface; it answers only peers holding a cluster key |
 | apiserver (server) | `6444` (`--api-port`) | `127.0.0.1` on a single server; the mesh address only on a server with `--mesh-ip` |
 | worker join (server with `--mesh-ip`) | `9345` | every interface, because a joining worker has no mesh yet; every request needs the cluster join token |
@@ -222,31 +222,72 @@ none`, for example), the node refuses to start and names the address. The standa
 command is the exception: its `--listen` address is the operator's choice and may still be the
 wildcard.
 
-NodePorts follow upstream and bind every interface by default. `--nodeport-addresses` narrows the
-NodePorts and nothing else: LoadBalancer Service ports, the ingress host and the worker join port
-still answer on every interface, so a node with this setting is not reachable on loopback and the
-mesh alone. A later switch is planned to cover LoadBalancer and Ingress. See
-[Limitations](limitations.md) for the reserved ports and the other networking caveats.
+### LAN access
 
-On a network you do not trust, set `--nodeport-addresses local`:
+One switch decides whether the workload listeners (NodePort, LoadBalancer and the ingress host)
+answer on the networks this Mac is attached to:
+
+```sh
+sudo k3sm network lan off      # only this Mac and the cluster mesh
+sudo k3sm network lan on       # every network this Mac is on
+k3sm network lan status        # the setting, what it covers, what it does not
+```
+
+With LAN access off, those listeners bind `127.0.0.1` and the node's own address (its mesh address
+once joined, its pod-range address on a single node), so other nodes reach them over the mesh and
+nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
+
+- New installs start with LAN access off. An existing install keeps LAN access on across an upgrade,
+  so nothing it serves stops answering. `sudo k3sm install --lan on` or `--lan off` sets it at
+  install time.
+- The change applies live, without restarting pods: the node daemon binds the new addresses first
+  and only then closes the old ones. Connections already open finish; new connections from the LAN
+  are refused. The command then checks the node daemon's listening sockets itself (with `lsof`, as
+  root) rather than taking the daemon's word for it. If any listener cannot move, or the sockets do
+  not match, the previous setting is restored and checked the same way, and the command says why. If
+  even the restore fails, it says so and exits `4`. If the node daemon does not apply it live, the
+  command restarts the daemon in place instead (pods keep running) and says so.
+- `k3sm network lan status` and `k3sm status` show the recorded setting and, run as root, the state
+  the node daemon reports serving, and say when the two differ. With no setting recorded they say
+  that LAN access is on because nothing is recorded.
+- The record must be a regular file owned by root and writable by no one else. Anything else is
+  treated as unusable, and the node daemon serves LAN access off until it is set again.
+- On a stopped node the setting is recorded and applies at `sudo k3sm start`.
+- With LAN access off, a LoadBalancer port below 1024 is not served on that node, because macOS
+  lets only root bind a specific address below 1024; use a port of 1024 or above, or turn LAN
+  access on. The ingress host still serves `80` and `443` on the node's own address, but not on
+  `127.0.0.1`.
+- The switch does not cover the apiserver (loopback, or the mesh address), the wireguard mesh port
+  (it answers only cluster peers) or the worker join port. A new worker joins over the LAN, so the
+  join port stays reachable with LAN access off, and every request to it needs the cluster join
+  token.
+- The setting is kept in `/Library/Preferences/io.k3sm.network.json`, beside the other install
+  arguments, and survives a reinstall and an uninstall. `k3sm status` shows it, and `k3sm status -o
+  json` carries it as `network` (see [Status JSON](status-json.md#network)).
+
+### NodePort addresses
+
+With LAN access on, NodePorts follow upstream and bind every interface unless
+`--nodeport-addresses` narrows them. With LAN access off, NodePorts bind `127.0.0.1` and the node's
+own address whatever `--nodeport-addresses` says.
 
 ```sh
 sudo k3sm install --nodeport-addresses local
 sudo k3sm install --agent --server <control-plane> --token-file <file> --nodeport-addresses local
 ```
 
-`local` is loopback (`127.0.0.1`) plus the node's own address, so a NodePort answers on the Mac
-itself and from the other nodes over the mesh, and on no Wi-Fi or Ethernet address. The value can
-also be a comma-separated list of IPv4 CIDRs, the kube-proxy `--nodeport-addresses` shape, mixed
-with `local` if you like (`local,10.0.0.0/8`). Each NodePort then binds every matching address of
-this Mac, or none of them if any bind fails.
+`local` is loopback (`127.0.0.1`) plus the node's own address, the same set LAN access off uses.
+The value can also be a comma-separated list of IPv4 CIDRs, the kube-proxy `--nodeport-addresses`
+shape, mixed with `local` if you like (`local,10.0.0.0/8`). Each NodePort then binds every matching
+address of this Mac, or none of them if any bind fails. See [Limitations](limitations.md) for the
+reserved ports and the other networking caveats.
 
 - The setting is IPv4 only. An IPv6 range is refused.
 - It needs the node datapath. A non-empty value beside `--network none` is refused, on `k3sm
   install`, `k3sm server` and `k3sm agent` alike.
-- It is resolved once, when the daemon starts, against the addresses this Mac has then. A value that
-  matches no address refuses the start. An address that appears later (a new network) is used after
-  the next restart.
+- It is resolved when the daemon starts and again at every LAN access change, against the addresses
+  this Mac has then. A value that matches no address refuses the start. An address that appears
+  later (a new network) is used after the next restart or LAN access change.
 - It is recorded with the other install arguments and kept across a reinstall and an uninstall.
   Surrounding spaces are ignored. `sudo k3sm install --nodeport-addresses ""` (or a value of only
   spaces) returns to every interface.

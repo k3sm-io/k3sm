@@ -163,20 +163,34 @@ func newStatusCollector() status.Collector {
 		},
 		// The cluster's Interconnect, read over the same client as every other
 		// apiserver row.
-		Interconnect: statusInterconnect(kube),
-		StopMarker:   statusStopMarker,
-		Paths:        paths,
-		EUID:         euid,
-		ServiceUID:   serviceUID,
-		Version:      version.Get(),
-		Host:         macOSVersionOrEmpty(),
-		Hostname:     hostnameOrEmpty(),
+		Interconnect:   statusInterconnect(kube),
+		StopMarker:     statusStopMarker,
+		Network:        statusNetwork,
+		NetworkApplied: statusNetworkApplied,
+		Paths:          paths,
+		EUID:           euid,
+		ServiceUID:     serviceUID,
+		Version:        version.Get(),
+		Host:           macOSVersionOrEmpty(),
+		Hostname:       hostnameOrEmpty(),
 	}
 }
 
 // statusStopMarker reads the stop marker through the installer's own reader.
 func statusStopMarker() (install.StopMarker, bool, error) {
 	return install.ReadStopMarker(install.NewDarwinSystem(), install.DefaultStopMarkerPath)
+}
+
+// statusNetwork reads the LAN access record through the installer's own
+// reader; the record is world-readable, so this works for any user.
+func statusNetwork() (install.NetworkRecord, bool, error) {
+	return install.ReadNetworkRecord(install.ReadNetworkRecordFile, install.DefaultNetworkRecordPath)
+}
+
+// statusNetworkApplied reads the node daemon's applied report; it is in the
+// daemon's own work dir, so only root (and the service user) can read it.
+func statusNetworkApplied(role install.Role) ([]byte, error) {
+	return os.ReadFile(install.NetworkAppliedPath(install.DefaultDataRoot, role))
 }
 
 // statusInterconnect is the report's Interconnect reader over kube: one GET of

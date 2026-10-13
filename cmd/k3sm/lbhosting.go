@@ -182,7 +182,16 @@ func startLBHoster(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		log.Info("svclb hoster disabled on this node: no datapath (--network none)", "node", opts.nodeName)
 		return noStop
 	}
-	h, err := svclb.NewHoster(lbHosterConfig(cs, opts, log))
+	var h *svclb.Hoster
+	err := opts.lan.attach("", advertisedNodeIP(opts), func(sets lanSets) (lanFamily, error) {
+		cfg := lbHosterConfig(cs, opts, log)
+		cfg.BindAddrs = sets.listeners
+		var err error
+		if h, err = svclb.NewHoster(cfg); err != nil {
+			return nil, err
+		}
+		return hosterLANFamily{h: h}, nil
+	})
 	if err != nil {
 		log.Error("svclb hoster disabled", "node", opts.nodeName, "err", err)
 		return noStop
