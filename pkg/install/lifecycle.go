@@ -106,9 +106,10 @@ type StopIncompleteError struct {
 	Left []LeftoverItem
 }
 
-// StopExitLeftoverBase is the exit code a stop that left something behind
-// starts from; each leftover class adds its bit (see ExitCode).
-const StopExitLeftoverBase = 64
+// StopExitLeftoverBase is what a stop that left something behind adds its
+// leftover bits to (see ExitCode). With six bits the code runs 33..95, clear
+// of the shell's 126 (not executable), 127 (not found) and 128+N (signals).
+const StopExitLeftoverBase = 32
 
 // Error names every leftover and why.
 func (e *StopIncompleteError) Error() string {
@@ -130,16 +131,16 @@ func (e *StopIncompleteError) Leftovers() []Leftover {
 	return out
 }
 
-// ExitCode is StopExitLeftoverBase plus one bit per leftover class: 1 the node
-// daemon, 2 workloads (pods, vm helpers, control-plane processes), 4 the mesh,
-// 8 host network state (pf anchor, lo0 or interconnect aliases), 16 netd,
-// 32 the stop marker.
+// ExitCode is StopExitLeftoverBase plus one bit per leftover class: 1 the
+// node daemon, 2 workloads (pods, vm helpers, control-plane processes), 4 the
+// mesh, 8 host network state (pf anchor, lo0 or interconnect aliases), 16
+// netd, 32 the stop marker. The result is always in 33..95.
 func (e *StopIncompleteError) ExitCode() int {
-	code := StopExitLeftoverBase
+	mask := 0
 	for _, item := range e.Left {
-		code |= item.Kind.exitBit()
+		mask |= item.Kind.exitBit()
 	}
-	return code
+	return StopExitLeftoverBase + mask
 }
 
 // lifecycleIdentity validates the actor and cleans the reason: control
@@ -181,6 +182,16 @@ func readStopMarker(sys System, cfg Config) (StopMarker, bool, error) {
 		return m, true, fmt.Errorf("the stop marker %s has unknown phase %q", cfg.StopMarker, m.Phase)
 	}
 	return m, true, nil
+}
+
+// stopAttrs are the log attributes that say who stopped the node, why, and
+// how long ago, for every path that leaves a stopped node stopped.
+func stopAttrs(m StopMarker, cfg Config) []any {
+	age := "unknown"
+	if !m.At.IsZero() {
+		age = time.Since(m.At).Round(time.Second).String()
+	}
+	return []any{"stopped-by", m.Actor, "reason", m.Reason, "phase", m.Phase, "stopped-ago", age, "marker", cfg.StopMarker}
 }
 
 // writeStopMarker writes m (with the schema version) to the marker path.
@@ -274,6 +285,27 @@ func markNode(ctx context.Context, cfg Config, stopped bool, actor, reason strin
 	cfg.Logger.Info("did " + what)
 }
 
+// joinedWorkersTimeout bounds the joined-worker count a server stop makes. A
+// var so a test can shrink it.
+var joinedWorkersTimeout = 5 * time.Second
+
+// warnJoinedWorkers runs cfg.JoinedWorkers, bounded and best effort, and warns
+// when the server being stopped has workers joined to it.
+func warnJoinedWorkers(ctx context.Context, cfg Config) {
+	if cfg.JoinedWorkers == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, joinedWorkersTimeout)
+	defer cancel()
+	n, err := cfg.JoinedWorkers(ctx)
+	switch {
+	case err != nil:
+		cfg.Logger.Warn("could not count the workers joined to this server; if any are, stopping it cuts them off from the control plane until `sudo k3sm start`", "err", err)
+	case n > 0:
+		cfg.Logger.Warn(fmt.Sprintf("stopping this server halts the cluster's control plane: %d joined worker(s) lose it until `sudo k3sm start`", n), "workers", n)
+	}
+}
+
 // stopDaemon disables label, confirms the disable by reading it back, boots
 // it out and waits for launchd to unload it. Every failure is a leftover of
 // kind; a failed disable does not stop the bootout (the daemon still goes down
@@ -322,20 +354,26 @@ func removeMesh(ctx context.Context, sys System, cfg Config, netdInstalled bool)
 	return nil
 }
 
-// Stop is `k3sm stop`: the full stop, in this order.
+// Stop is `k3sm stop`: the full stop, in this order (docs/m18-plan.md L1).
 //
+//  0. On a server, best effort and bounded: count the joined workers and warn
+//     that stopping the control plane cuts them off. Never a prompt (the app
+//     and the auto actor are unattended).
 //  1. The stop marker, phase stopping (actor, reason, time). If it cannot be
 //     written nothing else is done.
 //  2. Best effort, bounded: cordon the Node and annotate it
 //     k3sm.io/stopped-by-user. This goes before the node daemon, because on a
 //     server the node daemon IS the apiserver.
 //  3. The node daemon: disable (read back), bootout, await unloaded.
-//  4. RemoveMesh to netd, while netd still serves.
-//  5. The shared teardown (teardown.go): pods, vm helpers, control-plane
-//     orphans, pf anchor, lo0 aliases (scope from the installed netd plist),
-//     interconnect aliases. The node identity file is kept.
-//  6. netd: disable (read back), bootout, await unloaded.
-//  7. The marker, phase stopped, only when nothing was left behind.
+//  4. The workload half of the shared teardown (teardownWorkloads): pods
+//     (SIGTERM, 10 s, SIGKILL), vm helpers, control-plane orphans, while the
+//     mesh is still up.
+//  5. RemoveMesh to netd, while netd still serves.
+//  6. The network half of the shared teardown (flushHostNetwork): pf anchor,
+//     lo0 aliases (scope from the installed netd plist), interconnect
+//     aliases. The node identity file is kept.
+//  7. netd: disable (read back), bootout, await unloaded.
+//  8. The marker, phase stopped, only when nothing was left behind.
 //
 // The plists stay, so the node stays stopped across a reboot. Every step is
 // idempotent: a rerun over a `stopping` marker converges, and a rerun over a
@@ -361,6 +399,10 @@ func Stop(ctx context.Context, sys System, cfg Config, actor, reason string) err
 			"actor", actor, "reason", reason, "result", "already-stopped", "stopped-by", prev.Actor, "stopped-at", prev.At.UTC().Format(time.RFC3339))
 		return nil
 	}
+	// 0.
+	if d.role == RoleServer {
+		warnJoinedWorkers(ctx, cfg)
+	}
 	at := time.Now().UTC()
 	lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm stop: starting", "actor", actor, "reason", reason, "phase", StopPhaseStopping)
 
@@ -377,15 +419,17 @@ func Stop(ctx context.Context, sys System, cfg Config, actor, reason string) err
 		left = append(left, stopDaemon(ctx, sys, label, LeftoverNodeDaemon, cfg.Logger)...)
 	}
 	// 4.
-	left = append(left, removeMesh(ctx, sys, cfg, d.netd)...)
+	left = append(left, teardownWorkloads(ctx, sys, cfg)...)
 	// 5.
-	tail := teardownTail(ctx, sys, cfg, recordedFlushPrefixes(sys, cfg), interconnectNodeIndex(sys))
-	left = append(left, tail.left...)
+	left = append(left, removeMesh(ctx, sys, cfg, d.netd)...)
 	// 6.
+	hostLeft, _ := flushHostNetwork(sys, cfg, recordedFlushPrefixes(sys, cfg), interconnectNodeIndex(sys))
+	left = append(left, hostLeft...)
+	// 7.
 	if d.netd {
 		left = append(left, stopDaemon(ctx, sys, NetdLabel, LeftoverNetd, cfg.Logger)...)
 	}
-	// 7.
+	// 8.
 	if len(left) == 0 {
 		if err := writeStopMarker(sys, cfg, StopMarker{Phase: StopPhaseStopped, Actor: actor, Reason: reason, At: at}); err != nil {
 			left = append(left, LeftoverItem{Kind: LeftoverMarker, Err: fmt.Errorf("write the stopped marker: %w", err)})

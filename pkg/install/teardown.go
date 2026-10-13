@@ -17,6 +17,7 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -242,28 +244,46 @@ func teardownTail(ctx context.Context, sys System, cfg Config, fp flushPrefixes,
 }
 
 // killVMHostSurvivors SIGKILLs every k3sm-vmhost helper the runtime recorded
-// whose process group is still led by exactly the recorded instance, then
-// waits for them to go.
+// that is provably still that helper, then waits for them to go.
 //
-// The identity rule is runtimed's own (sandbox.vmReapDecision): a group is
-// signalled only while its leader (pid == pgid) is alive with exactly the
-// recorded start time. A pgid recycled to another process has a different
-// immutable start and is left alone, and so is a group whose leader is gone.
+// A record authorizes a root SIGKILL of a process group, so it is believed only
+// as far as it can be checked:
+//
+//   - the store directory and the record file must be trusted: not a symlink,
+//     owned by root or the service user, and not group- or world-writable
+//     (readVMHostRecords). An untrusted record is never read as a kill order;
+//   - the group's leader (pid == pgid) must be alive with exactly the recorded
+//     start time, runtimed's own exact-instance rule (sandbox.vmReapDecision).
+//     A leader that is gone, or a recycled pgid with a different immutable
+//     start, means nothing of ours is there: skipped, and not a leftover;
+//   - the leader must be the installed k3sm-vmhost (its executable path) and
+//     run as the service user. A start-time match on any other process is a
+//     forged or corrupted record: never killed, and reported.
+//
 // Nothing is ever matched by process name. SIGKILL with no grace is the
 // runtime's choice for an orphaned helper too: the graceful path runs inside
 // the daemon that is already gone.
 //
-// It returns an error when the records cannot be read (a survivor cannot be
-// ruled out) or when a killed helper is still there after vmHostKillWait.
+// It returns an error naming every record it could not act on or rule out,
+// and every killed helper still alive after vmHostKillWait.
 func killVMHostSurvivors(ctx context.Context, sys System, cfg Config) error {
-	recs, err := sys.ReadVMHostRecords(cfg.DataRoot)
+	svcUID, err := sys.ServiceUID(cfg.ServiceUser)
+	if err != nil {
+		return fmt.Errorf("look up the service user %s, which vm helpers run as: %w", cfg.ServiceUser, err)
+	}
+	store, err := sys.ReadVMHostRecords(cfg.DataRoot, []uint32{0, svcUID})
 	if err != nil {
 		cfg.Logger.Warn("could not read the vm helper records; a k3sm-vmhost process may survive", "data-root", cfg.DataRoot, "err", err)
 		return fmt.Errorf("read the vm helper records: %w", err)
 	}
-	var killed []int
 	var errs error
-	for _, rec := range recs {
+	for _, name := range store.Rejected {
+		cfg.Logger.Warn("untrusted vm helper record skipped, never acted on", "record", name)
+		errs = errors.Join(errs, fmt.Errorf("untrusted vm helper record %s (not acted on)", name))
+	}
+	want := cfg.installedVMHost()
+	var killed []int
+	for _, rec := range store.Records {
 		if rec.Pgid <= 1 || rec.StartUnixNano == 0 {
 			continue
 		}
@@ -273,6 +293,16 @@ func killVMHostSurvivors(ctx context.Context, sys System, cfg Config) error {
 		}
 		if start != rec.StartUnixNano {
 			cfg.Logger.Info("vm helper process group id now belongs to another process; not signalled", "pod", rec.PodID, "pgid", rec.Pgid)
+			continue
+		}
+		exe, uid, perr := sys.ProcessExecutable(rec.Pgid)
+		switch {
+		case perr != nil:
+			errs = errors.Join(errs, fmt.Errorf("vm helper group %d: cannot read its executable, not killed: %w", rec.Pgid, perr))
+			continue
+		case filepath.Clean(exe) != want || uid != svcUID:
+			cfg.Logger.Warn("a vm helper record names a process that is not this install's k3sm-vmhost; not killed", "pod", rec.PodID, "pgid", rec.Pgid, "exe", exe, "uid", uid)
+			errs = errors.Join(errs, fmt.Errorf("vm helper record for group %d names %s (uid %d), not %s (uid %d); not killed", rec.Pgid, exe, uid, want, svcUID))
 			continue
 		}
 		cfg.Logger.Warn("a k3sm-vmhost helper outlived its daemon; killing it (SIGKILL)", "pod", rec.PodID, "pgid", rec.Pgid)
@@ -299,43 +329,87 @@ func killVMHostSurvivors(ctx context.Context, sys System, cfg Config) error {
 // hundred bytes; anything larger is not one.
 const maxVMHostRecordSize = 64 << 10
 
+// VMHostStore is what ReadVMHostRecords found: the usable records, and the
+// names of record files it refused to trust.
+type VMHostStore struct {
+	Records  []VMHostRecord
+	Rejected []string
+}
+
 // readVMHostRecords reads the runtime's vm reap store under dataRoot
-// (<dataRoot>/vmreap, sandbox.VMReapSubdir): every regular *.json file that
-// parses with a pgid above 1. It is a narrow reader of runtimed's record
-// shape, because runtimed exports no reader for this store. It never writes
-// or removes anything (the store is the runtime's), never follows a symlink,
-// and skips a file it cannot read or parse rather than failing the teardown;
-// only an unreadable store directory is an error. An absent store holds none.
-func readVMHostRecords(dataRoot string) ([]VMHostRecord, error) {
+// (<dataRoot>/vmreap, sandbox.VMReapSubdir). It is a narrow reader of
+// runtimed's record shape, because runtimed exports no reader for this store,
+// and it never writes or removes anything (the store is the runtime's).
+//
+// Trust comes first, because a record drives a root kill. The directory must
+// be a real directory (not a symlink), owned by one of owners, and not group-
+// or world-writable; otherwise it is an error and nothing is read. Each *.json
+// entry is opened without following a symlink and must be a regular file
+// owned by one of owners and not group- or world-writable; one that is not is
+// listed in Rejected and not parsed. A trusted file that does not parse, or
+// has a pgid of 1 or less, is skipped. An absent store holds none.
+func readVMHostRecords(dataRoot string, owners []uint32) (VMHostStore, error) {
+	var st VMHostStore
 	root := filepath.Join(dataRoot, sandbox.VMReapSubdir)
-	entries, err := os.ReadDir(root)
+	fi, err := os.Lstat(root)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return st, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read the vm reap store %s: %w", root, err)
+		return st, fmt.Errorf("stat the vm reap store %s: %w", root, err)
 	}
-	var recs []VMHostRecord
+	if err := trustedEntry(fi, true, owners); err != nil {
+		return st, fmt.Errorf("the vm reap store %s is not trusted: %w", root, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return st, fmt.Errorf("read the vm reap store %s: %w", root, err)
+	}
 	for _, e := range entries {
-		if !e.Type().IsRegular() || filepath.Ext(e.Name()) != ".json" {
+		if filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		data, err := readRegularBounded(filepath.Join(root, e.Name()), maxVMHostRecordSize)
+		data, err := readTrustedRecord(filepath.Join(root, e.Name()), owners)
 		if err != nil {
+			st.Rejected = append(st.Rejected, e.Name())
 			continue
 		}
 		var rec VMHostRecord
 		if json.Unmarshal(data, &rec) != nil || rec.Pgid <= 1 {
 			continue
 		}
-		recs = append(recs, rec)
+		st.Records = append(st.Records, rec)
 	}
-	return recs, nil
+	return st, nil
 }
 
-// readRegularBounded reads at most limit bytes of the regular file at path,
-// refusing a symlink (O_NOFOLLOW) and anything that is not a regular file.
-func readRegularBounded(path string, limit int64) ([]byte, error) {
+// trustedEntry checks a file's lstat/fstat result: the expected type (a
+// directory when dir, else a regular file; a symlink is neither), an owner in
+// owners, and no group or world write.
+func trustedEntry(fi fs.FileInfo, dir bool, owners []uint32) error {
+	switch {
+	case fi.Mode()&fs.ModeSymlink != 0:
+		return errors.New("it is a symlink")
+	case dir && !fi.IsDir():
+		return errors.New("it is not a directory")
+	case !dir && !fi.Mode().IsRegular():
+		return ErrNotRegularFile
+	case fi.Mode().Perm()&0o022 != 0:
+		return fmt.Errorf("it is group- or world-writable (%v)", fi.Mode().Perm())
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("its owner cannot be read")
+	}
+	if !slices.Contains(owners, st.Uid) {
+		return fmt.Errorf("it is owned by uid %d", st.Uid)
+	}
+	return nil
+}
+
+// readTrustedRecord reads one record file: opened O_NOFOLLOW, checked on the
+// descriptor (trustedEntry), and bounded to maxVMHostRecordSize.
+func readTrustedRecord(path string, owners []uint32) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
@@ -345,11 +419,25 @@ func readRegularBounded(path string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s: %w", path, ErrNotRegularFile)
+	if err := trustedEntry(fi, false, owners); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if fi.Size() > limit {
+	if fi.Size() > maxVMHostRecordSize {
 		return nil, fmt.Errorf("%s is %d bytes, larger than a record can be", path, fi.Size())
 	}
-	return io.ReadAll(io.LimitReader(f, limit))
+	return io.ReadAll(io.LimitReader(f, maxVMHostRecordSize))
+}
+
+// procargsExecPath extracts the exec path from a kern.procargs2 buffer: a
+// native-endian int32 argc followed by the NUL-terminated path.
+func procargsExecPath(raw []byte) (string, error) {
+	if len(raw) < 5 {
+		return "", errors.New("kern.procargs2 is too short")
+	}
+	rest := raw[4:]
+	end := bytes.IndexByte(rest, 0)
+	if end <= 0 {
+		return "", errors.New("kern.procargs2 carries no exec path")
+	}
+	return string(rest[:end]), nil
 }

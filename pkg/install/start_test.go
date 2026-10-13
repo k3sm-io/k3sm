@@ -85,8 +85,10 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		if m, ok := f.stopMarker(DefaultStopMarkerPath); !ok || m.Phase != StopPhaseStopped {
 			t.Errorf("marker after the install = %+v (present %v), want it kept at stopped", m, ok)
 		}
-		if !strings.Contains(logs.String(), "updated, still stopped") {
-			t.Errorf("the install does not say the node is still stopped:\n%s", logs.String())
+		for _, want := range []string{"level=WARN msg=\"updated, still stopped", "stopped-by=user", "stopped-ago="} {
+			if !strings.Contains(logs.String(), want) {
+				t.Errorf("the install's still-stopped warning lacks %q:\n%s", want, logs.String())
+			}
 		}
 	})
 
@@ -102,9 +104,9 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		}
 		before(t, f.calls,
 			"FlushLo0Aliases:100.64.0.0/10,"+stopTestServiceCIDR, // the start precondition
-			"RemoveStopMarker",
 			"Enable:"+NetdLabel, "Bootstrap:"+NetdLabel,
 			"Enable:"+ServerLabel, "Bootstrap:"+ServerLabel,
+			"RemoveStopMarker", // only once the daemons are up
 			"MarkNode:false:user")
 		for _, l := range []string{ServerLabel, NetdLabel} {
 			if _, isLoaded := f.loaded[l]; !isLoaded || f.disabled[l] {
@@ -157,9 +159,9 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		}
 		before(t, f.calls,
 			"FlushMeshPFAnchor", "FlushLo0Aliases:100.64.0.0/10,"+stopTestServiceCIDR,
-			"RemoveStopMarker",
 			"Enable:"+NetdLabel, "Bootstrap:"+NetdLabel, "ProbeNetd:"+DefaultNetdSocket,
 			"Enable:"+ServerLabel, "Bootstrap:"+ServerLabel,
+			"RemoveStopMarker",
 			"MarkNode:false:user")
 		if slices.ContainsFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, "Signal:") }) {
 			t.Errorf("start after a clean stop signalled a process: %q", f.calls)
@@ -177,6 +179,32 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		}
 	})
 
+	t.Run("a start that fails keeps the marker", func(t *testing.T) {
+		f, cfg, _ := stoppableNode(t)
+		if err := Stop(ctx, f, cfg, ActorUser, "test"); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+		f.putBootstrapAlways(ServerLabel, errors.New("bootstrap: malformed plist"))
+		f.calls = nil
+		if err := Start(ctx, f, cfg, ActorUser, "test"); err == nil {
+			t.Fatal("Start succeeded with a node daemon that never bootstraps")
+		}
+		if idx(f.calls, "RemoveStopMarker") >= 0 {
+			t.Errorf("a failed start removed the stop marker: %q", f.calls)
+		}
+		if _, ok := f.stopMarker(DefaultStopMarkerPath); !ok {
+			t.Error("the stop marker is gone after a failed start; status would say running")
+		}
+		// Once the fault is gone, start converges.
+		delete(f.bootstrapAlways, ServerLabel)
+		if err := Start(ctx, f, cfg, ActorUser, "test"); err != nil {
+			t.Fatalf("Start after the fault cleared: %v", err)
+		}
+		if _, ok := f.stopMarker(DefaultStopMarkerPath); ok {
+			t.Error("the stop marker survived a successful start")
+		}
+	})
+
 	t.Run("start after an interrupted stop converges", func(t *testing.T) {
 		f, cfg, _ := stoppableNode(t)
 		// The stop got as far as its intent marker and was killed: both daemons
@@ -189,8 +217,8 @@ func TestInstallHonoursUserStop(t *testing.T) {
 			"Bootout:"+ServerLabel, "Bootout:"+NetdLabel,
 			fmt.Sprintf("Signal:%d:TERM", stopTestPodPgid),
 			"FlushLo0Aliases:100.64.0.0/10,"+stopTestServiceCIDR,
-			"RemoveStopMarker",
-			"Bootstrap:"+NetdLabel, "Bootstrap:"+ServerLabel)
+			"Bootstrap:"+NetdLabel, "Bootstrap:"+ServerLabel,
+			"RemoveStopMarker")
 		for _, l := range []string{ServerLabel, NetdLabel} {
 			if _, isLoaded := f.loaded[l]; !isLoaded {
 				t.Errorf("%s is not running after start", l)

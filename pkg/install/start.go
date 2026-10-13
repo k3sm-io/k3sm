@@ -62,10 +62,10 @@ func startPrecondition(ctx context.Context, sys System, cfg Config, d installedD
 
 // Start is `k3sm start`: on a stopped node it re-runs the stop's host flush
 // (and, after an interrupted stop, its workload teardown) as a precondition,
-// removes the stop marker, enables and bootstraps netd and then the node
-// daemon through the restart sequence (await unloaded, retrying bootstrap,
-// await running, netd answering before the node daemon goes), and uncordons
-// the node, best effort. A node with no marker and every daemon running is
+// enables and bootstraps netd and then the node daemon through the restart
+// sequence (await unloaded, retrying bootstrap, await running, netd answering
+// before the node daemon goes), removes the stop marker only once they are
+// up, and uncordons the node, best effort. A node with no marker and every daemon running is
 // already started, and Start does nothing.
 func Start(ctx context.Context, sys System, cfg Config, actor, reason string) error {
 	cfg = cfg.withDefaults()
@@ -92,14 +92,20 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 			cfg.Logger.Warn("the stop marker is unreadable; treating the node as stopped part-way", "err", merr)
 		}
 		startPrecondition(ctx, sys, cfg, d, marker, merr)
-		if err := sys.RemoveStopMarker(cfg.StopMarker); err != nil {
-			lifecycleLog(ctx, sys, cfg, slog.LevelError, "k3sm start: failed", "actor", actor, "reason", reason, "result", "failed", "err", err)
-			return fmt.Errorf("start: remove the stop marker %s (nothing was started): %w", cfg.StopMarker, err)
-		}
+		// The explicit override past the marker: the marker itself stays until
+		// the daemons are up, so a start that fails leaves the node reported
+		// as stopped, which is what it is.
+		cfg.Start = true
 	}
 	if err := restartDaemons(ctx, sys, cfg, d.manifest(cfg)); err != nil {
 		lifecycleLog(ctx, sys, cfg, slog.LevelError, "k3sm start: failed", "actor", actor, "reason", reason, "result", "failed", "err", err)
-		return fmt.Errorf("start: %w", err)
+		return fmt.Errorf("start: %w (the stop marker is kept, so the node still reads as stopped; re-run `sudo k3sm start`)", err)
+	}
+	if present {
+		if err := sys.RemoveStopMarker(cfg.StopMarker); err != nil {
+			lifecycleLog(ctx, sys, cfg, slog.LevelError, "k3sm start: failed", "actor", actor, "reason", reason, "result", "failed", "err", err)
+			return fmt.Errorf("start: the daemons are running but the stop marker %s could not be removed (re-run `sudo k3sm start`): %w", cfg.StopMarker, err)
+		}
 	}
 	markNode(ctx, cfg, false, actor, reason)
 	lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm start: started", "actor", actor, "reason", reason, "result", "started")
@@ -170,4 +176,15 @@ func (d installedDaemons) manifest(cfg Config) []artifact {
 		m = append(m, artifact{kind: kindDaemon, label: l, path: cfg.plistPath(l), disp: dispRemove})
 	}
 	return m
+}
+
+// StartTimeBound is the longest a server start can take: booting out what an
+// interrupted stop left loaded, that stop's workload teardown, then the
+// restart sequence for netd (await unloaded, retrying bootstrap, await
+// running, then answering) and for the node daemon, and the uncordon.
+func StartTimeBound() time.Duration {
+	precondition := serverRestartBudget.unload + netdRestartBudget.unload + podGroupStopGrace + vmHostKillWait
+	netd := 2*netdRestartBudget.unload + 2*netdRestartBudget.running
+	node := 2*serverRestartBudget.unload + serverRestartBudget.running
+	return precondition + netd + node + markNodeTimeout
 }

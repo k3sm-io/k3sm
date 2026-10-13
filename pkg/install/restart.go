@@ -142,7 +142,7 @@ func restartDaemons(ctx context.Context, sys System, cfg Config, m []artifact) e
 	// starts daemons goes through (install, an install's rollback, start,
 	// restart), so the rule cannot be skipped by one of them. A oneshot (the
 	// data-volume mount) is not a daemon a stop disables and still restarts.
-	_, userStopped, _ := readStopMarker(sys, cfg)
+	stop, userStopped, _ := readStopMarker(sys, cfg)
 	holdStopped := userStopped && !cfg.Start
 	netdRestarted := false
 	for _, a := range m {
@@ -150,7 +150,8 @@ func restartDaemons(ctx context.Context, sys System, cfg Config, m []artifact) e
 			continue
 		}
 		if holdStopped && !a.oneshot {
-			logger.Info("left stopped: this node was stopped by the user, so its daemon is neither enabled nor started (pass --start to start it)", "label", a.label, "marker", cfg.StopMarker)
+			logger.Warn("left stopped: this node was stopped by the user, so its daemon is neither enabled nor started (pass --start to start it)",
+				append([]any{"label", a.label}, stopAttrs(stop, cfg)...)...)
 			continue
 		}
 		// The node daemon dials netd before it does anything else, so it does not

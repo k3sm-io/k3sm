@@ -1061,9 +1061,16 @@ type System interface {
 	WaitProcessGroupsGone(ctx context.Context, pgids []int, timeout time.Duration) []int
 	// ReadVMHostRecords returns the k3sm-vmhost helpers the runtime recorded in
 	// its vm reap store under dataRoot (<dataRoot>/vmreap/<pgid>.json): each
-	// helper's process group and its leader's start time. An absent store holds
-	// none. It never changes the store, which the runtime owns.
-	ReadVMHostRecords(dataRoot string) ([]VMHostRecord, error)
+	// helper's process group and its leader's start time. Only a store and
+	// record files owned by one of owners, not group- or world-writable and not
+	// symlinks, are read (see readVMHostRecords). An absent store holds none.
+	// It never changes the store, which the runtime owns.
+	ReadVMHostRecords(dataRoot string, owners []uint32) (VMHostStore, error)
+	// ServiceUID returns the uid of the named service user. Read-only.
+	ServiceUID(name string) (uint32, error)
+	// ProcessExecutable returns the executable path pid was started from
+	// (the exec path the kernel recorded) and its effective uid. Read-only.
+	ProcessExecutable(pid int) (path string, uid uint32, err error)
 
 	// The methods below serve `k3sm stop` and `k3sm start`.
 
@@ -1416,6 +1423,11 @@ type Config struct {
 	// while netd still serves; nothing else does. Nil skips it, and a stop
 	// that skips it reports the mesh as left behind whenever netd is loaded.
 	RemoveMesh func(ctx context.Context) error
+	// JoinedWorkers counts the worker nodes joined to this server. A server
+	// Stop calls it first, bounded by joinedWorkersTimeout, to warn that
+	// stopping the control plane cuts them off. Nil skips it; an error is a
+	// warning that the count is unknown.
+	JoinedWorkers func(ctx context.Context) (int, error)
 	// Purge makes Uninstall also remove everything it otherwise keeps: the data
 	// root (and the data volume under it), the daemon log dir, the arguments
 	// records, the k3sm context in TargetUser's kubeconfig and the service user.
@@ -1973,8 +1985,8 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 		}
 		if !cfg.Start {
 			cfg.stayStopped = true
-			cfg.Logger.Info("this node was stopped by the user; the install updates it and leaves it stopped (pass --start to start it)",
-				"stopped-by", marker.Actor, "reason", marker.Reason, "phase", marker.Phase)
+			cfg.Logger.Warn("this node was stopped by the user; the install updates it and leaves it stopped (pass --start to start it)",
+				stopAttrs(marker, cfg)...)
 		}
 	}
 	stopped, err := stopRunningDaemons(ctx, sys, m, cfg.Logger)
@@ -2424,23 +2436,22 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	//    restart.go sequences them — see its file comment for the failure this cost
 	//    in the field, the transient errnos, and the rollback on a mid-loop failure.
 	//    On a node the user stopped, with --start, the start's precondition
-	//    runs first and the marker goes, exactly as `k3sm start` does it; without
-	//    --start restartDaemons leaves every long-running label alone.
+	//    runs first and the marker goes once the daemons are verified, exactly
+	//    as `k3sm start` does it; without --start restartDaemons leaves every
+	//    long-running label alone.
 	if cfg.userStop != nil && cfg.Start {
 		d, err := readInstalledDaemons(sys, cfg)
 		if err != nil {
 			return fmt.Errorf("install: %w", err)
 		}
 		startPrecondition(ctx, sys, cfg, d, cfg.userStop.marker, cfg.userStop.err)
-		if err := sys.RemoveStopMarker(cfg.StopMarker); err != nil {
-			return fmt.Errorf("install: --start: remove the stop marker %s: %w", cfg.StopMarker, err)
-		}
 	}
 	if err := restartDaemons(ctx, sys, cfg, m); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 	if cfg.stayStopped {
-		cfg.Logger.Info("updated, still stopped: the new release is installed and the node stays stopped; run `sudo k3sm start` to start it")
+		cfg.Logger.Warn("updated, still stopped: the new release is installed and the node stays stopped; run `sudo k3sm start` to start it",
+			stopAttrs(cfg.userStop.marker, cfg)...)
 		return nil
 	}
 	for _, n := range limitNotices {
@@ -2456,6 +2467,9 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 		return fmt.Errorf("install: %w", err)
 	}
 	if cfg.userStop != nil {
+		if err := sys.RemoveStopMarker(cfg.StopMarker); err != nil {
+			return fmt.Errorf("install: --start: the daemons are running but the stop marker %s could not be removed (run `sudo k3sm start`): %w", cfg.StopMarker, err)
+		}
 		markNode(ctx, cfg, false, ActorUser, "k3sm install --start")
 	}
 	return nil

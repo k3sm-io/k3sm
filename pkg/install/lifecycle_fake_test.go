@@ -35,8 +35,18 @@ type fakeLifecycle struct {
 	// disableIgnored are labels whose LaunchctlDisable succeeds and changes
 	// nothing: the read-back then says enabled.
 	disableIgnored map[string]bool
+	// vmRejected are record files ReadVMHostRecords refused to trust.
+	vmRejected []string
+	// procs is what ProcessExecutable answers, by pid.
+	procs map[int]fakeProc
 	// oslog is every line OSLog was handed, as "<LEVEL> <msg>".
 	oslog []string
+}
+
+// fakeProc is one process's executable and effective uid.
+type fakeProc struct {
+	exe string
+	uid uint32
 }
 
 // putStopMarker seeds a stop marker in phase, as an earlier stop wrote it.
@@ -135,12 +145,31 @@ func (f *fakeSystem) RemoveStopMarker(path string) error {
 	return nil
 }
 
-func (f *fakeSystem) ReadVMHostRecords(dataRoot string) ([]VMHostRecord, error) {
+func (f *fakeSystem) ReadVMHostRecords(dataRoot string, owners []uint32) (VMHostStore, error) {
 	f.calls = append(f.calls, "ReadVMHostRecords:"+dataRoot)
 	if err := f.failures["ReadVMHostRecords"]; err != nil {
-		return nil, err
+		return VMHostStore{}, err
 	}
-	return slices.Clone(f.life.vmhosts), nil
+	if !slices.Contains(owners, fakeServiceUID) {
+		return VMHostStore{}, fmt.Errorf("fake: owners %v do not include the service uid", owners)
+	}
+	return VMHostStore{Records: slices.Clone(f.life.vmhosts), Rejected: slices.Clone(f.life.vmRejected)}, nil
+}
+
+// fakeServiceUID is the uid the fake's service user has (the purge fake's).
+const fakeServiceUID = 271
+
+// ServiceUID is a directory lookup, not recorded in calls.
+func (f *fakeSystem) ServiceUID(string) (uint32, error) { return fakeServiceUID, nil }
+
+// ProcessExecutable answers from life.procs and is not recorded in calls. A
+// pid with no entry cannot be read.
+func (f *fakeSystem) ProcessExecutable(pid int) (string, uint32, error) {
+	p, ok := f.life.procs[pid]
+	if !ok {
+		return "", 0, fmt.Errorf("fake: no process %d", pid)
+	}
+	return p.exe, p.uid, nil
 }
 
 func (f *fakeSystem) OSLog(level slog.Level, msg string) {

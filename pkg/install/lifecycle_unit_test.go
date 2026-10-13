@@ -19,6 +19,7 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -51,27 +52,34 @@ func TestParsePrintDisabled(t *testing.T) {
 	}
 }
 
-// TestReadVMHostRecords reads runtimed's vm reap store shape, skipping what is
-// not a usable record and never following a symlink.
+// TestReadVMHostRecords reads runtimed's vm reap store shape, trusting only a
+// store and records owned by an allowed uid, not group/world-writable and not
+// symlinks: an untrusted record is listed as rejected and never parsed.
 func TestReadVMHostRecords(t *testing.T) {
+	me := []uint32{uint32(os.Geteuid())}
 	root := t.TempDir()
-	if recs, err := readVMHostRecords(root); err != nil || len(recs) != 0 {
-		t.Fatalf("absent store = %v, %v; want none", recs, err)
+	if st, err := readVMHostRecords(root, me); err != nil || len(st.Records)+len(st.Rejected) != 0 {
+		t.Fatalf("absent store = %+v, %v; want none", st, err)
 	}
 	store := filepath.Join(root, "vmreap")
 	if err := os.MkdirAll(store, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	write := func(name, body string) {
-		if err := os.WriteFile(filepath.Join(store, name), []byte(body), 0o600); err != nil {
+	write := func(name, body string, mode os.FileMode) {
+		p := filepath.Join(store, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// The exact shape runtimed writes (sandbox.vmProcRecord).
-	write("601.json", `{"podId":"linux","pgid":601,"startUnixNano":22,"agentSocket":"/x/agent.sock","runDir":"/x"}`)
-	write("1.json", `{"podId":"bad","pgid":1,"startUnixNano":5}`)
-	write("junk.json", `not json`)
-	write("602.json.tmp", `{"podId":"tmp","pgid":602,"startUnixNano":7}`)
+	write("601.json", `{"podId":"linux","pgid":601,"startUnixNano":22,"agentSocket":"/x/agent.sock","runDir":"/x"}`, 0o600)
+	write("1.json", `{"podId":"bad","pgid":1,"startUnixNano":5}`, 0o600)
+	write("junk.json", `not json`, 0o600)
+	write("602.json.tmp", `{"podId":"tmp","pgid":602,"startUnixNano":7}`, 0o600)
+	write("603.json", `{"podId":"forged","pgid":603,"startUnixNano":7}`, 0o666)
 	outside := filepath.Join(root, "outside.json")
 	if err := os.WriteFile(outside, []byte(`{"podId":"evil","pgid":777,"startUnixNano":9}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -79,12 +87,47 @@ func TestReadVMHostRecords(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(store, "777.json")); err != nil {
 		t.Fatal(err)
 	}
-	recs, err := readVMHostRecords(root)
+	st, err := readVMHostRecords(root, me)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(recs) != 1 || recs[0] != (VMHostRecord{PodID: "linux", Pgid: 601, StartUnixNano: 22}) {
-		t.Errorf("records = %+v, want only the well-formed 601", recs)
+	if len(st.Records) != 1 || st.Records[0] != (VMHostRecord{PodID: "linux", Pgid: 601, StartUnixNano: 22}) {
+		t.Errorf("records = %+v, want only the well-formed trusted 601", st.Records)
+	}
+	if !slices.Equal(st.Rejected, []string{"603.json", "777.json"}) {
+		t.Errorf("rejected = %q, want the world-writable and the symlinked record", st.Rejected)
+	}
+	// A store owned by another uid is not read at all.
+	if _, err := readVMHostRecords(root, []uint32{uint32(os.Geteuid()) + 1}); err == nil {
+		t.Error("a store owned by an untrusted uid was read")
+	}
+	// Nor is a world-writable store.
+	if err := os.Chmod(store, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readVMHostRecords(root, me); err == nil {
+		t.Error("a world-writable store was read")
+	}
+	// Nor a symlinked one.
+	other := t.TempDir()
+	if err := os.Symlink(store, filepath.Join(other, "vmreap")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readVMHostRecords(other, me); err == nil {
+		t.Error("a symlinked store was read")
+	}
+}
+
+// TestProcargsExecPath pins the kern.procargs2 parse: argc, then the path.
+func TestProcargsExecPath(t *testing.T) {
+	raw := append([]byte{2, 0, 0, 0}, []byte("/Library/k3sm/k3sm-vmhost\x00\x00k3sm-vmhost\x00")...)
+	if got, err := procargsExecPath(raw); err != nil || got != "/Library/k3sm/k3sm-vmhost" {
+		t.Errorf("procargsExecPath = %q, %v", got, err)
+	}
+	for _, bad := range [][]byte{nil, {1, 0, 0, 0}, {1, 0, 0, 0, 0}} {
+		if _, err := procargsExecPath(bad); err == nil {
+			t.Errorf("procargsExecPath(%v) accepted a buffer with no path", bad)
+		}
 	}
 }
 

@@ -58,6 +58,7 @@ func stoppableNode(t *testing.T) (*fakeSystem, Config, *bytes.Buffer) {
 	f.podReap = []runtimed.PodReapRecord{{PodID: "web", Container: "app", Pgid: stopTestPodPgid, StartUnixNano: 11}}
 	f.podLeaders = map[int]int64{stopTestPodPgid: 11, stopTestVMPgid: 22}
 	f.life.vmhosts = []VMHostRecord{{PodID: "linux", Pgid: stopTestVMPgid, StartUnixNano: 22}}
+	f.life.procs = map[int]fakeProc{stopTestVMPgid: {exe: DefaultInstallDir + "/" + VMHostName, uid: fakeServiceUID}}
 	f.putFile(netdsvc.NodeIdentityPath(MeshKeyDir), []byte("100.64.3.0/24\n"))
 	cfg.MarkNode = func(_ context.Context, stopped bool, actor, _ string) error {
 		f.calls = append(f.calls, fmt.Sprintf("MarkNode:%t:%s", stopped, actor))
@@ -81,6 +82,7 @@ func lifecycleCalls(calls []string) []string {
 
 // wantCleanStop is the whole stop, in order.
 var wantCleanStop = []string{
+	// 0. (A server's joined-worker count is a read; no seam call.)
 	// 1. The intent marker, before anything is touched.
 	"WriteStopMarker:stopping",
 	// 2. Cordon + annotate, while the server's own apiserver still answers.
@@ -89,12 +91,9 @@ var wantCleanStop = []string{
 	"Disable:" + ServerLabel,
 	"Disabled:" + ServerLabel,
 	"Bootout:" + ServerLabel,
-	// 4. RemoveMesh, while netd still serves.
-	"RemoveMesh",
-	// 5. The shared teardown: pods (SIGTERM, the grace), the surviving vm
-	//    helper (SIGKILL by its recorded identity), control-plane orphans,
-	//    the pf anchor, lo0 with the RECORDED Service CIDR, the interconnect
-	//    sweep with this node's index.
+	// 4. The workload half of the shared teardown, while the mesh is still
+	//    up: pods (SIGTERM, the grace), the surviving vm helper (SIGKILL by
+	//    its recorded identity), control-plane orphans.
 	"ReadPodReapRecords:" + DefaultDataRoot,
 	fmt.Sprintf("Signal:%d:TERM", stopTestPodPgid),
 	fmt.Sprintf("WaitGone:%d:%s", stopTestPodPgid, podGroupStopGrace),
@@ -102,14 +101,18 @@ var wantCleanStop = []string{
 	fmt.Sprintf("Signal:%d:KILL", stopTestVMPgid),
 	fmt.Sprintf("WaitGone:%d:%s", stopTestVMPgid, vmHostKillWait),
 	"ReapOrphans:" + DefaultDataRoot + "/server/bin",
+	// 5. RemoveMesh, while netd still serves.
+	"RemoveMesh",
+	// 6. The network half: the pf anchor, lo0 with the RECORDED Service
+	//    CIDR, the interconnect sweep with this node's index.
 	"FlushMeshPFAnchor",
 	"FlushLo0Aliases:100.64.0.0/10," + stopTestServiceCIDR,
 	"FlushInterconnectAliases:" + netdsvc.InterconnectStatePath(MeshKeyDir) + ":3",
-	// 6. netd: disable, read back, bootout.
+	// 7. netd: disable, read back, bootout.
 	"Disable:" + NetdLabel,
 	"Disabled:" + NetdLabel,
 	"Bootout:" + NetdLabel,
-	// 7. Done, with nothing left behind.
+	// 8. Done, with nothing left behind.
 	"WriteStopMarker:stopped",
 }
 
@@ -179,11 +182,48 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 		if !errors.As(err, &serr) || !slices.Equal(serr.Leftovers(), []Leftover{LeftoverMesh}) {
 			t.Fatalf("Stop = %v, want a StopIncompleteError naming only the mesh", err)
 		}
-		if got := serr.ExitCode(); got != StopExitLeftoverBase|4 {
-			t.Errorf("exit code = %d, want %d", got, StopExitLeftoverBase|4)
+		if got := serr.ExitCode(); got != StopExitLeftoverBase+4 {
+			t.Errorf("exit code = %d, want %d", got, StopExitLeftoverBase+4)
 		}
 		if i, j := idx(f.calls, "RemoveMesh"), idx(f.calls, "Bootout:"+NetdLabel); i < 0 || j < 0 || i > j {
 			t.Errorf("RemoveMesh (%d) must come before netd's bootout (%d), and the stop must go on to it: %q", i, j, f.calls)
+		}
+	})
+
+	t.Run("a forged vm record is never killed", func(t *testing.T) {
+		for name, proc := range map[string]fakeProc{
+			"wrong executable": {exe: "/usr/sbin/sshd", uid: fakeServiceUID},
+			"wrong uid":        {exe: DefaultInstallDir + "/" + VMHostName, uid: 0},
+		} {
+			f, cfg, _ := stoppableNode(t)
+			f.life.procs[stopTestVMPgid] = proc
+			err := Stop(ctx, f, cfg, ActorUser, "test")
+			var serr *StopIncompleteError
+			if !errors.As(err, &serr) || !slices.Contains(serr.Leftovers(), LeftoverVMHelpers) {
+				t.Errorf("%s: Stop = %v, want the vm record reported", name, err)
+			}
+			if idx(f.calls, fmt.Sprintf("Signal:%d:KILL", stopTestVMPgid)) >= 0 {
+				t.Errorf("%s: a process the record does not prove is k3sm-vmhost was killed", name)
+			}
+		}
+	})
+
+	t.Run("a server stop warns about joined workers", func(t *testing.T) {
+		f, cfg, logs := stoppableNode(t)
+		cfg.JoinedWorkers = func(context.Context) (int, error) { return 2, nil }
+		if err := Stop(ctx, f, cfg, ActorUser, "test"); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+		if !strings.Contains(logs.String(), "2 joined worker(s)") {
+			t.Errorf("no joined-worker warning:\n%s", logs.String())
+		}
+		g, gcfg, glogs := stoppableNode(t)
+		gcfg.JoinedWorkers = func(context.Context) (int, error) { return 0, errors.New("apiserver unreachable") }
+		if err := Stop(ctx, g, gcfg, ActorUser, "test"); err != nil {
+			t.Fatalf("Stop with the count unknown: %v", err)
+		}
+		if !strings.Contains(glogs.String(), "could not count the workers") {
+			t.Errorf("an unknown count is not warned:\n%s", glogs.String())
 		}
 	})
 
@@ -251,6 +291,14 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 		{"the vm helper survives SIGKILL", LeftoverVMHelpers,
 			func(f *fakeSystem) { f.podLingering = map[int]bool{stopTestVMPgid: true} },
 			func(f *fakeSystem) { f.podLingering = nil }},
+		{"a vm record names another executable", LeftoverVMHelpers,
+			func(f *fakeSystem) { f.life.procs[stopTestVMPgid] = fakeProc{exe: "/usr/sbin/sshd", uid: 0} },
+			func(f *fakeSystem) {
+				f.life.procs[stopTestVMPgid] = fakeProc{exe: DefaultInstallDir + "/" + VMHostName, uid: fakeServiceUID}
+			}},
+		{"a vm record is untrusted", LeftoverVMHelpers,
+			func(f *fakeSystem) { f.life.vmRejected = []string{"666.json"} },
+			func(f *fakeSystem) { f.life.vmRejected = nil }},
 		{"control-plane orphans cannot be reaped", LeftoverControlPlane,
 			func(f *fakeSystem) { f.failOn("ReapOrphans", errors.New("kill failed")) },
 			func(f *fakeSystem) { delete(f.failures, "ReapOrphans") }},
@@ -287,7 +335,7 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 			if !slices.Contains(serr.Leftovers(), tc.want) || !strings.Contains(err.Error(), string(tc.want)) {
 				t.Errorf("leftovers = %v (%v), want %s named", serr.Leftovers(), err, tc.want)
 			}
-			if code := serr.ExitCode(); code == 0 || code&tc.want.exitBit() == 0 {
+			if code := serr.ExitCode(); code <= StopExitLeftoverBase || code > 125 || (code-StopExitLeftoverBase)&tc.want.exitBit() == 0 {
 				t.Errorf("exit code %d does not carry the %s bit %d", code, tc.want, tc.want.exitBit())
 			}
 			if m, ok := f.stopMarker(DefaultStopMarkerPath); !ok || m.Phase != StopPhaseStopping {

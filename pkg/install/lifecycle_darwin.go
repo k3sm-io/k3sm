@@ -23,8 +23,12 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 
 	"k3sm.io/k3sm/internal/atomicfile"
 	"k3sm.io/k3sm/internal/oslog"
@@ -104,8 +108,43 @@ func (darwinSystem) RemoveStopMarker(path string) error {
 }
 
 // ReadVMHostRecords reads the runtime's vm reap store (readVMHostRecords).
-func (darwinSystem) ReadVMHostRecords(dataRoot string) ([]VMHostRecord, error) {
-	return readVMHostRecords(dataRoot)
+func (darwinSystem) ReadVMHostRecords(dataRoot string, owners []uint32) (VMHostStore, error) {
+	return readVMHostRecords(dataRoot, owners)
+}
+
+// ServiceUID looks the service user up in the directory service.
+func (darwinSystem) ServiceUID(name string) (uint32, error) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		return 0, err
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("uid of %s: %w", name, err)
+	}
+	return uint32(uid), nil
+}
+
+// ProcessExecutable reads pid's exec path from sysctl kern.procargs2 (an int32
+// argc, then the NUL-terminated path the kernel exec'd) and its effective uid
+// from kern.proc.pid. Root may read both for any process.
+func (darwinSystem) ProcessExecutable(pid int) (string, uint32, error) {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return "", 0, fmt.Errorf("sysctl kern.proc.pid %d: %w", pid, err)
+	}
+	if int(kp.Proc.P_pid) != pid {
+		return "", 0, fmt.Errorf("process %d not found", pid)
+	}
+	raw, err := unix.SysctlRaw("kern.procargs2", pid)
+	if err != nil {
+		return "", 0, fmt.Errorf("sysctl kern.procargs2 %d: %w", pid, err)
+	}
+	path, err := procargsExecPath(raw)
+	if err != nil {
+		return "", 0, fmt.Errorf("process %d: %w", pid, err)
+	}
+	return path, kp.Eproc.Ucred.Uid, nil
 }
 
 // OSLog writes msg to the unified log, subsystem io.k3sm, category lifecycle.
