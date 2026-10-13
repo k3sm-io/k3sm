@@ -162,6 +162,9 @@ func (r *runtimedRuntime) reapOrphans(ctx context.Context) {
 	for i := range listed {
 		present[string(listed[i].UID)] = true
 	}
+	// A retained terminated pod the apiserver no longer holds owes no logs: drop
+	// it, and the log GC removes its tree on its next sweep.
+	r.pruneRetained(present)
 
 	r.mu.Lock()
 	tracked := make(map[string]orphanCandidate, len(r.track))

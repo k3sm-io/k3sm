@@ -139,7 +139,9 @@ func (r *runtimedRuntime) removePodLogs(pod *corev1.Pod) {
 func (r *runtimedRuntime) GetPodByName(_ context.Context, namespace, name string) (*corev1.Pod, bool) {
 	_, _, pod, ok := r.lookup(namespace, name)
 	if !ok {
-		return nil, false
+		// A terminated pod a restarted daemon retained, so its logs stay
+		// readable (runtimed_retained.go).
+		return r.retainedPod(namespace, name)
 	}
 	return pod.DeepCopy(), true
 }
@@ -226,7 +228,7 @@ func (r *runtimedRuntime) trackedIDs() []string {
 
 // --- podlogs.PodStateSource (the garbage collector) ---
 
-// KnownPodUIDs returns the UIDs of every pod the provider tracks, and whether
+// KnownPodUIDs returns the UIDs of every pod the provider tracks or retains, and whether
 // the provider has SYNCED — that is, whether Virtual Kubelet's pod informer has
 // delivered the cluster's view of this node at least once.
 //
@@ -239,8 +241,14 @@ func (r *runtimedRuntime) KnownPodUIDs(_ context.Context) (map[string]struct{}, 
 	if !r.podsSynced {
 		return nil, false
 	}
-	uids := make(map[string]struct{}, len(r.track))
+	uids := make(map[string]struct{}, len(r.track)+len(r.retained))
 	for id := range r.track {
+		uids[id] = struct{}{}
+	}
+	// A retained terminated pod still exists in the apiserver, so its log tree
+	// is still owed: the kubelet keeps a terminated pod's logs until the pod is
+	// deleted, and so does this node across its own restart.
+	for id := range r.retained {
 		uids[id] = struct{}{}
 	}
 	return uids, true
