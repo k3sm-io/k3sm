@@ -160,6 +160,21 @@ Two things follow from that list.
   *replaces* the bounded default outright, which is how you ask for a bigger one. A Pod that mounts
   over `/dev` itself gets its mount and no private `devpts`.
 
+### The First Lease After a New Bridge
+
+A `vm` Pod's guest leases its address on the node's NAT bridge. When that bridge already exists,
+the guest's first network lease arrives within milliseconds of boot: the guest's first request
+reaches the bridge about 1 ms after it is sent.
+
+When the first `vm` Pod after the bridge was gone creates the bridge, the guest sees link up 40 to
+120 ms before its port joins the bridge. The host holds the guest's first DHCP request and delivers
+it late, 42 to 119 ms in the measured boots, rather than dropping it. That first Pod's lease can
+therefore arrive slightly later than usual: 89 to 178 ms from the guest opening its link, against
+2 to 5 ms with the bridge in place.
+
+This is expected and needs no action. The guest's short wait for link and its DHCP retry cover it,
+and later `vm` Pods on the same bridge are not affected.
+
 ## Trade-Offs
 
 - Isolation is a genuine boundary, at the cost of VM startup and overhead versus a native process.
