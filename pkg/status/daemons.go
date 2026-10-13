@@ -51,6 +51,8 @@ type DaemonsReport struct {
 	Role          dataroot.Role `json:"role"`
 	Summary       string        `json:"summary"`
 	Daemons       []Row         `json:"daemons"`
+	// StoppedBy is the full report's field of the same name.
+	StoppedBy *StoppedBy `json:"stoppedBy,omitempty"`
 }
 
 // CollectDaemons is the cheap probe behind DaemonsReport. It reads launchd
@@ -73,6 +75,7 @@ func (c Collector) CollectDaemons() DaemonsReport {
 		Role:          role,
 		Summary:       summary,
 		Daemons:       []Row{ld.netd, ld.node},
+		StoppedBy:     c.stoppedBy(),
 	}
 }
 

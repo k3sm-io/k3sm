@@ -29,6 +29,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -277,12 +278,16 @@ type Collector struct {
 	// Kube in production): nil with no error means the cluster has none.
 	// OPTIONAL: nil leaves the interconnect row and block out.
 	Interconnect func(ctx context.Context) (*netv1alpha1.Interconnect, error)
-	Paths        Paths
-	EUID         int
-	ServiceUID   int
-	Now          func() time.Time
-	Version      version.Info
-	Host         string
+	// StopMarker reads the stop marker `k3sm stop` leaves (install.ReadStopMarker
+	// in production). OPTIONAL: nil, an absent marker or an unreadable one
+	// leaves the report's stoppedBy field out.
+	StopMarker func() (install.StopMarker, bool, error)
+	Paths      Paths
+	EUID       int
+	ServiceUID int
+	Now        func() time.Time
+	Version    version.Info
+	Host       string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

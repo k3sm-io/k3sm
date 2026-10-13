@@ -91,6 +91,7 @@ that joined one). A Mac with no install reports `server`.
 | `role` | string | `server` or `agent` |
 | `summary` | string | one sentence for a person; do not parse it |
 | `daemons` | array of rows | always two: `netd`, then the node daemon (`server` on a control plane, `agent` on a worker) |
+| `stoppedBy` | object | who stopped k3sm on this Mac (see [Stopped by](#stopped-by)); omitted when no stop is recorded |
 
 The rows are the same rows, built the same way, as the full report's rows of the same names. The
 verdict comes from the same function as the full report's, fed the install check and these two
@@ -145,6 +146,7 @@ four.
 | `next` | array of strings | the commands to run next, most urgent first; omitted when empty |
 | `peers` | array | reserved for mesh peers (`name`, `state`, `detail`); not emitted yet |
 | `interconnect` | object | the cluster's interconnect and its attached Pods (see [Interconnect](#interconnect)); omitted when the cluster has none, or the report could not read it |
+| `stoppedBy` | object | who stopped k3sm on this Mac (see [Stopped by](#stopped-by)); omitted when no stop is recorded |
 | `version` | object | the build that produced the report; `modules` is omitted when unknown |
 | `host` | string | the macOS version, empty when it could not be read |
 | `timestamp` | string | RFC 3339 |
@@ -169,6 +171,33 @@ snapshot it also carries `last-scheduled-snapshot-error` (the last failure) and
 `last-scheduled-snapshot-skipped` (when a snapshot was skipped and why: not enough free space, or
 the free space could not be read). Like every `wide` key, these are informational and not part of
 the contract.
+
+## Stopped by
+
+Both shapes carry an optional `stoppedBy` object while `k3sm stop` has recorded a stop on this Mac.
+It is additive: `schemaVersion` stays `1`, and the `verdict` and every row `state` keep their
+words (a stopped Mac still reports `stopped`, or a daemon `disabled`). `stoppedBy` only says who
+asked for it.
+
+```json
+"stoppedBy": {
+  "actor": "user",
+  "reason": "maintenance window",
+  "at": "2026-09-05T09:28:30Z",
+  "phase": "stopped"
+}
+```
+
+| field | type | notes |
+|---|---|---|
+| `actor` | string | `user` for a person's `k3sm stop`, `auto` for a stop k3sm itself made |
+| `reason` | string | the reason given at the stop; may be empty |
+| `at` | string | RFC 3339, when the stop began |
+| `phase` | string | `stopping` while a stop has left something behind (re-run `sudo k3sm stop` to converge), `stopped` once nothing was left |
+
+The object is omitted when there is no stop marker, and also when the marker cannot be read or
+parsed: a damaged marker never fails the report. Readers must treat a missing `stoppedBy` as
+"no recorded stop", not as "running".
 
 ## Interconnect
 

@@ -164,6 +164,7 @@ func newStatusCollector() status.Collector {
 		// The cluster's Interconnect, read over the same client as every other
 		// apiserver row.
 		Interconnect: statusInterconnect(kube),
+		StopMarker:   statusStopMarker,
 		Paths:        paths,
 		EUID:         euid,
 		ServiceUID:   serviceUID,
@@ -171,6 +172,11 @@ func newStatusCollector() status.Collector {
 		Host:         macOSVersionOrEmpty(),
 		Hostname:     hostnameOrEmpty(),
 	}
+}
+
+// statusStopMarker reads the stop marker through the installer's own reader.
+func statusStopMarker() (install.StopMarker, bool, error) {
+	return install.ReadStopMarker(install.NewDarwinSystem(), install.DefaultStopMarkerPath)
 }
 
 // statusInterconnect is the report's Interconnect reader over kube: one GET of
@@ -198,6 +204,7 @@ func newDaemonsCollector() status.Collector {
 		FS:         osStatusFS{},
 		Procs:      procTable{},
 		DataRoot:   dataRootFS{},
+		StopMarker: statusStopMarker,
 		Paths:      statusPaths(statusWorkDir(euid, serviceUID)),
 		EUID:       euid,
 		ServiceUID: serviceUID,
