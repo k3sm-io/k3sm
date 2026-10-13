@@ -59,9 +59,9 @@ export PATH="$CARGO_HOME/bin:$PREFIX/bin:$PATH"
 for t in cmake protoc git curl; do
   command -v "$t" >/dev/null || { verdict FAIL "s1.1 toolchain  $t is not on the rig (brew install cmake protobuf)"; exit 0; }
 done
-command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$PREFIX/bin" sh >/dev/null 2>&1
+command -v uv >/dev/null || spike_install_uv || { verdict FAIL "s1.1 toolchain  the pinned uv did not install"; exit 0; }
 if ! command -v rustup >/dev/null; then
-  curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain "$RUST_TOOLCHAIN" >/dev/null 2>&1
+  spike_install_rustup "$RUST_TOOLCHAIN" >/dev/null 2>&1 || { verdict FAIL "s1.1 toolchain  the pinned rustup-init did not install"; exit 0; }
 fi
 rustup toolchain install "$RUST_TOOLCHAIN" >/dev/null 2>&1
 rustup default "$RUST_TOOLCHAIN" >/dev/null 2>&1

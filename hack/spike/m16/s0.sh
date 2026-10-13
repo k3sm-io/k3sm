@@ -349,8 +349,8 @@ set -uo pipefail
 W="$PREFIX/s0"; mkdir -p "$W/logs"
 export UV_CACHE_DIR="$PREFIX/cache" UV_PYTHON_INSTALL_DIR="$PREFIX/pyinstall" HF_HOME="$PREFIX/hf"
 
-command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$PREFIX/bin" sh >/dev/null 2>&1
 export PATH="$PREFIX/bin:$PATH"
+command -v uv >/dev/null || spike_install_uv || { verdict FAIL "s0.2-setup  the pinned uv did not install"; exit 0; }
 spike_venv "$PREFIX/venv" "s0.2-setup"
 V="$PREFIX/venv/bin/python"
 "$V" -c 'import vllm_mlx' 2>/dev/null || spike_pip "$V" "vllm-mlx==$ENGINE_VERSION"
