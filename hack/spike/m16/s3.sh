@@ -177,13 +177,13 @@ async def main():
         verdict("FAIL", "s3.1 invariants", "the core exposes no engine.scheduler.config to read the invariants back from. %s"
                 % surface(core, "core"))
         await stop(core)
-        return 1
+        return 0
     echoed = {k: getattr(cfg, k, None) for k in wanted}
     if echoed != wanted:
         verdict("FAIL", "s3.1 invariants", "the scheduler does not echo the pinned invariants: wanted %s, got %s"
                 % (json.dumps(wanted), json.dumps(echoed)))
         await stop(core)
-        return 1
+        return 0
     block = getattr(cfg, "paged_cache_block_size", None)
     record("s3.1 constructor: AsyncEngineCore(model, tokenizer, EngineConfig(scheduler_config=SchedulerConfig(%s))); "
            "the scheduler echoes them, block_size=%s; continuous batching is the engine-core path itself "
@@ -197,7 +197,7 @@ async def main():
     except Exception as exc:
         verdict("FAIL", "s3.1 token-ids", "add_request did not accept a token-id list: %r. %s" % (exc, surface(core, "core")))
         await stop(core)
-        return 1
+        return 0
     record("s3.1 add_request accepted %d token ids -> %r" % (len(ids), rid))
 
     stream = Pump(core.stream_outputs(rid, timeout=STREAM_BUDGET))
@@ -217,7 +217,7 @@ async def main():
         verdict("FAIL", "s3.1 in-process", "the in-process stream yielded nothing within %.0fs - the plan's R3 sidecar shape applies"
                 % STREAM_BUDGET)
         await stop(core)
-        return 1
+        return 0
     verdict("PASS", "s3.1 in-process",
             "the engine generated %d tokens over %d stream events from TOKEN IDS in-process with the KV cache pinned at %d "
             "and %d sequences (TTFT %.3fs, finish=%s)"
@@ -323,6 +323,7 @@ async def main():
 
 
 async def run():
+    """Exit 0 once the drive has finished, whatever its verdicts say; exit 1 only when it died."""
     try:
         return await main()
     except Exception:
@@ -337,14 +338,19 @@ PY
 
 MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
 [ -n "$MP" ] || { verdict FAIL "s3.0 setup  no model snapshot under $PREFIX/hf — run s0.sh first"; exit 0; }
-# The scoreboard reads the drive's VERDICT lines; its exit status is not the payload's.
-# Under pipefail a non-zero drive would also earn a second FAIL from the driver for
-# the same criterion, so the payload ends 0 once a verdict has been written and only
-# a drive that wrote none is turned into one here.
+# The scoreboard reads the drive's VERDICT lines. The drive exits 0 whenever it finished,
+# whatever those lines say, so a finished drive never earns a second FAIL from the driver;
+# a drive that died (a crash, a signal, an unhandled error) exits non-zero, which is turned
+# into one FAIL that names the status and keeps the payload non-zero, so a crash after an
+# earlier PASS can never read as green.
 MODEL_PATH="$MP" MAX_KV_SIZE=4096 MAX_NUM_SEQS=4 "$V" "$W/drive.py" 2>&1 | tee "$W/drive.log"
 rc=${PIPESTATUS[0]}
-grep -q '^VERDICT ' "$W/drive.log" || verdict FAIL "s3.1 in-process  drive.py exited $rc without reporting a verdict (see $W/drive.log)"
-exit 0
+if [ "$rc" != 0 ]; then
+  verdict FAIL "s3.0 drive  drive.py died with status $rc after its last verdict line (see $W/drive.log)"
+  exit "$rc"
+fi
+grep -q '^VERDICT ' "$W/drive.log" || { verdict FAIL "s3.0 drive  drive.py finished without reporting a verdict (see $W/drive.log)"; exit 1; }
+
 EOF
 
 note "S3(2) — the alternative engine, as a recorded control"
