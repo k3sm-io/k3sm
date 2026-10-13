@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -48,7 +49,7 @@ func runKubectl(args []string) error {
 		workDir:         workDir,
 		kubeconfigEnv:   os.Getenv("KUBECONFIG"),
 		home:            home,
-		contextName:     installedContextName,
+		contextName:     installedKubeconfigName(),
 		exists:          fileExists,
 	})
 	if err != nil {
@@ -79,7 +80,19 @@ func runKubectl(args []string) error {
 // into the invoking user's kubeconfig (install.AdminKubeconfig), and therefore
 // the context `k3sm kubectl` selects when it falls back to that kubeconfig. It
 // is also the `k3sm kubeconfig --context-name` default.
-const installedContextName = "k3sm"
+const installedContextName = install.DefaultKubeconfigName
+
+// installedKubeconfigName is the context name the installed control plane's
+// admin kubeconfig was merged under (`k3sm install --kubeconfig-name`), read
+// from the installed server plist, else the arguments record. The record is
+// root-only, so an ordinary user with no plist to read gets the default.
+func installedKubeconfigName() string {
+	name, err := install.InstalledKubeconfigName(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath)
+	if err != nil {
+		return installedContextName
+	}
+	return name
+}
 
 // kubectlInputs is everything resolveKubectlConfig reads, injected so the
 // resolution is a pure function of the environment rather than of this process.

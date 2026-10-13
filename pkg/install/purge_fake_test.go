@@ -86,6 +86,8 @@ type fakePurge struct {
 	// directory the fake knows is empty, which only matters once its marker
 	// is gone (a marked tree is walked, never asked).
 	nonEmpty map[string]bool
+	// kubeNameRemoved is the context name the last RemoveAdminKubeconfigContext got.
+	kubeNameRemoved string
 	// kubeErr is what RemoveAdminKubeconfigContext returns; kubeAbsent makes
 	// it report that the kubeconfig carried no k3sm context.
 	kubeErr    error
@@ -289,8 +291,9 @@ func (f *fakeSystem) DisableServiceUser(_ context.Context, name string) error {
 	return nil
 }
 
-func (f *fakeSystem) RemoveAdminKubeconfigContext(targetUser string) (bool, error) {
+func (f *fakeSystem) RemoveAdminKubeconfigContext(targetUser, name string) (bool, error) {
 	f.calls = append(f.calls, "RemoveAdminKubeconfigContext:"+targetUser)
+	f.purge.kubeNameRemoved = name
 	if f.purge.kubeErr != nil {
 		return false, f.purge.kubeErr
 	}

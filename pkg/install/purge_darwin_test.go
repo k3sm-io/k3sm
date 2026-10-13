@@ -247,11 +247,11 @@ func TestPurgeKubeconfigFileKeepsOwnerModeAndOtherEntries(t *testing.T) {
 	if err := os.WriteFile(path, kubeFixture(t, true), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if removed, err := removeUserKubeconfigContext(home); err != nil || !removed {
+	if removed, err := removeUserKubeconfigContext(home, adminContextName); err != nil || !removed {
 		t.Fatalf("remove = %v, %v; want removed", removed, err)
 	}
 	// Once more: the context is gone, so nothing is reported removed.
-	if removed, err := removeUserKubeconfigContext(home); err != nil || removed {
+	if removed, err := removeUserKubeconfigContext(home, adminContextName); err != nil || removed {
 		t.Fatalf("second remove = %v, %v; want nothing removed", removed, err)
 	}
 	fi, err := os.Stat(path)
@@ -271,7 +271,7 @@ func TestPurgeKubeconfigFileKeepsOwnerModeAndOtherEntries(t *testing.T) {
 	}
 
 	// Absent ~/.kube: a no-op.
-	if removed, err := removeUserKubeconfigContext(t.TempDir()); err != nil || removed {
+	if removed, err := removeUserKubeconfigContext(t.TempDir(), adminContextName); err != nil || removed {
 		t.Fatalf("absent ~/.kube = %v, %v; want a no-op", removed, err)
 	}
 	// Symlinked ~/.kube: refused, the target untouched.
@@ -282,7 +282,7 @@ func TestPurgeKubeconfigFileKeepsOwnerModeAndOtherEntries(t *testing.T) {
 	if err := os.WriteFile(path, kubeFixture(t, true), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := removeUserKubeconfigContext(evil); !errors.Is(err, errSymlinkRefused) {
+	if _, err := removeUserKubeconfigContext(evil, adminContextName); !errors.Is(err, errSymlinkRefused) {
 		t.Fatalf("symlinked ~/.kube = %v, want errSymlinkRefused", err)
 	}
 	if b2, _ := os.ReadFile(path); string(b2) != string(kubeFixture(t, true)) {

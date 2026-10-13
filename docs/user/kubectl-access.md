@@ -37,6 +37,12 @@ kubectl config get-contexts    # the k3sm context is there
 kubectl get nodes
 ```
 
+The context is named `k3sm` by default. `sudo k3sm install --kubeconfig-name <name>` merges it under
+`<name>` instead (as the cluster, user and context name); the name is remembered, so `k3sm kubectl`,
+`k3sm kubeconfig` and `uninstall --purge` use it. A name that already belongs to an entry k3sm did
+not create is refused. `k3sm kubeconfig --write --target-name <name>` merges under a different name
+than the one it reads.
+
 To get the kubeconfig somewhere else, onto a second machine, into a CI secret, or into a file of its
 own, use **`k3sm kubeconfig`**, which prints the admin kubeconfig on stdout, or merges it into a file
 you name:

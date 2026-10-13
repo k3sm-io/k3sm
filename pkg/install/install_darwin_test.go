@@ -993,7 +993,7 @@ func TestEnsureHelpersRefuseASymlink(t *testing.T) {
 				home := filepath.Join(root, "home")
 				mkdir(t, home, 0o755)
 				symlinkT(t, elsewhere, filepath.Join(home, ".kube"))
-				return writeUserKubeconfig(home, uid, gid, []byte(adminKube))
+				return writeUserKubeconfig(home, uid, gid, adminContextName, []byte(adminKube))
 			},
 			victimMode: 0o755,
 			untouched:  assertEmptyDir,
@@ -1079,7 +1079,7 @@ func TestOwnedWritesUseTheOpenDescriptor(t *testing.T) {
 					return filepath.Dir(name) == kubeDir && strings.HasPrefix(filepath.Base(name), ".k3sm-kubeconfig-")
 				}, victim)
 
-				err := writeUserKubeconfig(home, uid, gid, []byte(adminKube))
+				err := writeUserKubeconfig(home, uid, gid, adminContextName, []byte(adminKube))
 				if !errors.Is(err, errTempSwapped) {
 					t.Errorf("write = %v, want the swapped-temp refusal", err)
 				}
@@ -1112,7 +1112,7 @@ func TestOwnedWritesUseTheOpenDescriptor(t *testing.T) {
 					return true
 				}, victim)
 
-				if err := writeUserKubeconfig(home, uid, gid, []byte(adminKube)); err != nil {
+				if err := writeUserKubeconfig(home, uid, gid, adminContextName, []byte(adminKube)); err != nil {
 					t.Fatalf("write: %v", err)
 				}
 				if !published {

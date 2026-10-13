@@ -343,6 +343,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.BoolVar(&opts.clearCrashLoop, "clear-crashloop", false, "clear the crash-loop record under --work-dir and exit 0 instead of serving; a parked daemon then exits and launchd starts a clean boot")
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise; a non-loopback value is aliased on lo0 by the pod network, so it must lie in this node's pod range (leave it at the default on a mesh server: the node then advertises --mesh-ip). Never the etcd peer address: that is --etcd-peer-ip")
 	fs.StringVar(&opts.meshIP, "mesh-ip", "", "wireguard mesh IP to bind the apiserver + worker-join supervisor on (enables multi-node join; empty = single-node)")
+	fs.String("kubeconfig-name", "", "the name k3sm install --kubeconfig-name merged the admin kubeconfig under; recorded in the daemon's arguments for k3sm kubectl and uninstall --purge, and unused by the server itself")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
 	registerContainerLogFlags(fs, &opts.logs)
 	addRuntimeFlag(fs, &opts.rtName)

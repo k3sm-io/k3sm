@@ -110,11 +110,21 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 		DataVolume:        volume,
 		RemoveOldDataRoot: o.removeOldDataRoot,
 		MeshIP:            o.meshIP,
+		KubeconfigName:    o.recordedKubeconfigName(),
 		SecretsEncryption: o.secretsEncryption,
 		EtcdSnapshots:     o.etcdSnapshotFlags(),
 		Start:             o.start,
 		Logger:            logger,
 	}
+}
+
+// recordedKubeconfigName is --kubeconfig-name when the operator passed it, and
+// "" otherwise so an unpassed flag keeps the carried name.
+func (o installFlags) recordedKubeconfigName() string {
+	if o.set["kubeconfig-name"] {
+		return o.kubeconfigName
+	}
+	return ""
 }
 
 // etcdSnapshotFlags is the install package's request for the scheduled-snapshot
@@ -181,6 +191,7 @@ type installFlags struct {
 	dataVolumeEncrypt bool
 	removeOldDataRoot bool
 	meshIP            string
+	kubeconfigName    string
 	secretsEncryption bool
 	// etcdSnapshotCron, etcdSnapshotRetention and etcdDisableSnapshots are the
 	// scheduled etcd snapshot flags, rendered into the server daemon's arguments
@@ -213,6 +224,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.dataVolumeEncrypt, "data-volume-encrypt", false, "encrypt the data volume with a random passphrase kept in the System keychain (a volume k3sm creates only)")
 	fs.BoolVar(&o.removeOldDataRoot, "remove-old-data-root", false, "after a verified migration, delete the .pre-volume copy of the old data root instead of keeping it")
 	fs.StringVar(&o.meshIP, "mesh-ip", "", "this node's wireguard mesh address, written into the server daemon's arguments; needed on every Mac that serves the control plane in a multi-node cluster")
+	fs.StringVar(&o.kubeconfigName, "kubeconfig-name", install.DefaultKubeconfigName, "the cluster, user and context name the admin kubeconfig is merged under in your ~/.kube/config (the k3s --write-kubeconfig-name analog). It is recorded with the other install arguments, so k3sm kubectl, k3sm kubeconfig and uninstall --purge use it; a name already used by an entry k3sm did not create is refused")
 	fs.BoolVar(&o.secretsEncryption, "secrets-encryption", false, "encrypt Secrets at rest with a key generated on this Mac; a new single-server cluster only (back up <data root>/server/cred with every datastore backup)")
 	fs.StringVar(&o.etcdSnapshotCron, "etcd-snapshot-schedule-cron", executor.DefaultEtcdSnapshotCron, "when the server takes a scheduled etcd snapshot, as a five-field cron expression in local time (embedded etcd HA servers only); written into the server daemon's arguments when passed")
 	fs.IntVar(&o.etcdSnapshotRetention, "etcd-snapshot-retention", executor.DefaultEtcdSnapshotRetention, "how many of this server's scheduled etcd snapshots to keep (embedded etcd HA servers only); written into the server daemon's arguments when passed")
@@ -227,6 +239,11 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	}
 	o.set = map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { o.set[f.Name] = true })
+	if o.set["kubeconfig-name"] {
+		if err := install.ValidateKubeconfigName(o.kubeconfigName); err != nil {
+			return installFlags{}, fmt.Errorf("--kubeconfig-name: %w", err)
+		}
+	}
 	if err := o.validateRole(); err != nil {
 		return installFlags{}, err
 	}
@@ -280,6 +297,7 @@ var serverOnlyInstallFlags = []string{
 	"server-join",
 	"service-cidr",
 	"mesh-ip",
+	"kubeconfig-name",
 	"data-volume",
 	"data-volume-name",
 	"data-volume-size",

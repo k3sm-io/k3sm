@@ -542,7 +542,7 @@ func statusKubeconfig(in statusKubeInputs) (kubectlConfig, error) {
 		workDir:         in.workDir,
 		kubeconfigEnv:   in.kubeconfigEnv,
 		home:            in.home,
-		contextName:     installedContextName,
+		contextName:     installedKubeconfigName(),
 		exists:          in.exists,
 	})
 }
