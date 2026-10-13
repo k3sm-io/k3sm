@@ -106,11 +106,11 @@ until the daemons are up, so a start that fails leaves the node reported as stop
 ## Starting a Node an Older k3sm Does Not Know About
 
 Releases before `k3sm stop` do not read the stop record, and they have no `start` verb. If you
-stop a node with a newer k3sm and then install an older release over it, the older install has no
-way to know the node was meant to stay stopped, and nothing in it clears the record. The record
-stays on disk and `k3sm status` from a newer binary keeps reporting it. Run `sudo k3sm start` with
-the newer `k3sm` before you install the older release, so the record is cleared and the node is
-running when the older install begins.
+stop a node with a newer k3sm and then install an older release over it, the older install starts
+the node again, because it always re-enables and starts the k3sm services. It does not clear the
+record, so `k3sm status` from a newer binary would still report the node as stopped while it runs.
+Run `sudo k3sm start` with the newer `k3sm` before you install the older release, so the record is
+cleared first.
 
 ## Next
 
