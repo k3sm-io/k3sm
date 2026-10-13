@@ -451,7 +451,7 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 		dst := helmchart.HelmPath(bd)
 		writeBin(t, dst, "old-helm"+signedSuffix)
 		h := hold(t, dst)
-		if err := stageHelm(t.Context(), bd, true); err != nil {
+		if err := stageHelm(t.Context(), signingPolicy{s: bootCodeSigner}, bd, true); err != nil {
 			t.Fatal(err)
 		}
 		signed := calls()

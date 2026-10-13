@@ -86,6 +86,11 @@ type Config struct {
 	BindAddress string
 	// ZotVersion is the zot module version to stage. Empty means DefaultZotVersion.
 	ZotVersion string
+	// ReleaseVerifier is the boot's release signing decision (pkg/executor's
+	// ReleaseVerifier, set only when the daemon is on the release path). Nil is the
+	// dev path: zot is seeded or built and ad-hoc signed. Non-nil, zot is the
+	// payload's copy, verified and never built or signed (EnsureZotWith).
+	ReleaseVerifier PayloadVerifier
 	// Logger receives bring-up and teardown events. Empty means slog.Default.
 	Logger *slog.Logger
 }
@@ -202,7 +207,7 @@ func (s *Service) Start(ctx context.Context) error {
 // startOnce is one bring-up attempt: stage the binary, write the state, preflight
 // the port, spawn, and wait for the listener.
 func (s *Service) startOnce(ctx context.Context) error {
-	if err := EnsureZot(ctx, s.cfg.BinDir, s.cfg.PayloadBinDir, s.cfg.ZotVersion); err != nil {
+	if err := EnsureZotWith(ctx, s.cfg.ReleaseVerifier, s.cfg.BinDir, s.cfg.PayloadBinDir, s.cfg.ZotVersion); err != nil {
 		return err
 	}
 	if err := s.provision(); err != nil {

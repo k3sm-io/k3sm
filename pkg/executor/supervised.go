@@ -499,11 +499,17 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := provisionStep("binaries", ensureControlPlaneBinaries(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KubeVersion)); err != nil {
 		return err
 	}
-	// The payload-seeded helm is ad-hoc signed like the control-plane set, so the
-	// helm controller's Jobs can exec it. Best-effort and never fatal: an absent
-	// helm is skipped here, and the helm controller owns that diagnosis (and the
-	// dev-shell download) off the bring-up path.
-	if err := provisionStep("sign-helm", signHelm(ctx, binDir(s.cfg.WorkDir))); err != nil {
+	// The payload-seeded helm is made runnable under the boot's signing path, so
+	// the helm controller's Jobs can exec it: ad-hoc signed on the dev path
+	// (best-effort, never fatal), verified in place and left byte-identical on the
+	// release path, where a helm that fails verification refuses the boot. An
+	// absent helm is skipped here on both paths, and the helm controller owns that
+	// diagnosis (and the dev-shell download) off the bring-up path.
+	policy, err := resolveSigningPolicy(ctx, s.cfg.Logger)
+	if err := provisionStep("sign-helm", err); err != nil {
+		return err
+	}
+	if err := provisionStep("sign-helm", signHelm(ctx, policy, binDir(s.cfg.WorkDir))); err != nil {
 		return err
 	}
 	// The datastore child: kine in the kine posture, the pinned etcd in the etcd

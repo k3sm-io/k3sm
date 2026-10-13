@@ -38,6 +38,7 @@ import (
 	"k3sm.io/k3sm/internal/binsign"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/helmchart"
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // ComponentCertValidity is the lifetime of a per-component client cert (the scheduler /
@@ -863,7 +864,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // helm.go). The single source for `k3sm payload`, `k3sm install`, and
 // the boot-time seed, so the three can never disagree on the set.
 func PayloadBinaries() []string {
-	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, etcdutlBinaryName, helmchart.HelmBinaryName)
+	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, etcdutlBinaryName, helmchart.HelmBinaryName, registrysvc.ZotBinaryName)
 }
 
 // StagePayload acquires the full control-plane payload into destDir using the
@@ -905,10 +906,23 @@ func StagePayload(ctx context.Context, destDir string) error {
 	// helm is re-downloaded and re-verified even if present (force): these bytes
 	// are about to be published, and a copy already in the directory may have been
 	// signed, which rewrites it past any digest comparison.
-	if err := stageHelm(ctx, destDir, true); err != nil {
+	// The packaging producer runs no signing decision: what it stages is ad-hoc
+	// signed, and the attended pipeline re-signs the release copy.
+	if err := stageHelm(ctx, signingPolicy{s: bootCodeSigner}, destDir, true); err != nil {
+		return err
+	}
+	// The ingest registry's zot, built from its pinned module with its marker, so a
+	// packaged install never builds it (pkg/registrysvc stages it from the payload).
+	if err := stageZot(ctx, destDir); err != nil {
 		return err
 	}
 	return VerifyPayloadSet(destDir)
+}
+
+// stageZot builds the pinned zot and its version marker into a payload dir. A var
+// so a test of StagePayload stands in for the build.
+var stageZot = func(ctx context.Context, destDir string) error {
+	return registrysvc.EnsureZot(ctx, destDir, "", registrysvc.DefaultZotVersion)
 }
 
 // StageKine stages the pinned, patched kine (and its version marker) into destDir
@@ -1031,9 +1045,24 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		if policy.release && (name == kineBinaryName || name == etcdBinaryName) {
 			continue
 		}
+		// zot is staged by the registry (pkg/registrysvc) from the payload directory
+		// itself, under its own version marker, on both paths.
+		if name == registrysvc.ZotBinaryName {
+			continue
+		}
 		dst := filepath.Join(bd, name)
 		versioned := (name == kineBinaryName && restageKine) || (name == etcdBinaryName && restageEtcd) ||
 			(restageKube && isCPBinary(name))
+		// On the release path the work dir runs the payload's helm and no other: a
+		// copy that differs from it (an earlier dev install's ad-hoc build of the same
+		// pin) is replaced, verified, rather than refused at signHelm.
+		if policy.release && name == helmchart.HelmBinaryName {
+			same, err := sameContent(filepath.Join(payloadDir, name), dst)
+			if err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("compare the shipped %s with %s: %w", name, dst, err)
+			}
+			versioned = err == nil && !same
+		}
 		if _, err := os.Stat(dst); err == nil && !versioned {
 			continue // already present (a prior boot seeded/acquired it)
 		}
@@ -1050,7 +1079,7 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		// the name; on the release path a control-plane copy is verified against
 		// the release requirement instead, and never signed.
 		prepare := binsign.SignIfInvalid(ctx, bootCodeSigner, name)
-		if policy.release && isCPBinary(name) {
+		if policy.release && (isCPBinary(name) || name == helmchart.HelmBinaryName) {
 			prepare = verifyTempHook(ctx, policy, name)
 		}
 		if err := atomicfile.InstallFile(src, dst, 0o755, prepare); err != nil {
@@ -1148,9 +1177,8 @@ func chmodExec(dir string) error {
 //
 // Both verify first: a binary whose signature verifies and is not ad hoc (a
 // Developer ID) is never healed or re-signed, on either signing path. The
-// control-plane set and the source-built children kine and etcd take this path
-// only on the dev path (see signingPolicy); helm takes it on both paths, because it
-// is fetched at boot and is not yet part of the signed payload.
+// control-plane set, the source-built children kine and etcd, and helm take this
+// path only on the dev path (see signingPolicy).
 //
 // Signing failures are tolerated (best-effort: a non-macOS CI host should not block
 // bring-up, and a failure leaves the file as it was); the binary fails loudly at
@@ -1173,6 +1201,11 @@ func signBinaries(ctx context.Context, dir, stamp string, names []string) error 
 // live install's temp is removed.
 func reapStagingTemps(bd string) error {
 	for _, name := range append(PayloadBinaries(), binsign.HealMarkerName) {
+		// zot's temps belong to the registry, which reaps them itself before it
+		// stages (registrysvc.EnsureZotWith); it may be staging one now.
+		if name == registrysvc.ZotBinaryName {
+			continue
+		}
 		if err := atomicfile.ReapOrphans(bd, name); err != nil {
 			return err
 		}

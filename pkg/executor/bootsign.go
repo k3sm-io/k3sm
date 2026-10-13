@@ -89,10 +89,10 @@ var selfExecutable = os.Executable
 // The source-built children kine and etcd (and the offline etcdutl) are part of
 // the signed payload: on the release path they are verified the same way and their
 // build stamp, read from the verified bytes, must match the pins
-// (stagedChild.ensureShipped); they are never built or signed there. helm stays
-// outside the release check on both paths: it is fetched at boot and ad-hoc signed,
-// and is not yet part of the signed payload, so it keeps the dev signing
-// (signBinaries).
+// (stagedChild.ensureShipped); they are never built or signed there. helm and the
+// registry's zot are part of the signed payload too: on the release path they are
+// verified against the same requirement and used byte-identical (signHelm, and
+// ReleaseVerifier for pkg/registrysvc), never downloaded, built or signed.
 type signingPolicy struct {
 	s       codeSigner
 	release bool
@@ -204,8 +204,55 @@ func verifyTempHook(ctx context.Context, p signingPolicy, name string) func(stri
 // exactly when the pin does.
 const helmHealStamp = helmchart.HelmBinaryName
 
-// signHelm gives a staged helm the dev signing (see signingPolicy on why helm is
-// still outside the release check). It is the one place helm's heal stamp is chosen.
-func signHelm(ctx context.Context, bd string) error {
-	return signBinaries(ctx, bd, helmHealStamp, []string{helmchart.HelmBinaryName})
+// signHelm makes a staged helm runnable under p, and is the one place helm's heal
+// stamp is chosen. On the dev path it is the dev signing (signBinaries). On the
+// release path a staged helm is verified in place against the Developer ID
+// requirement and left byte-identical; a helm that fails is an
+// ErrPayloadSignature and is never signed. An absent helm is skipped on both
+// paths: the helm controller owns that diagnosis (EnsureHelm).
+func signHelm(ctx context.Context, p signingPolicy, bd string) error {
+	names := []string{helmchart.HelmBinaryName}
+	if !p.release {
+		return signBinaries(ctx, bd, helmHealStamp, names)
+	}
+	if _, err := os.Lstat(helmchart.HelmPath(bd)); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return verifyPayloadBinaries(ctx, p, bd, helmHealStamp, names)
+}
+
+// ReleaseVerifier is the release path's payload check, handed to the packages
+// that stage their own payload binary (pkg/registrysvc's zot) so they apply the
+// boot's one signing decision instead of probing the daemon's signature again.
+// Obtain it from ResolveReleaseVerifier; the zero value refuses every binary.
+type ReleaseVerifier struct {
+	p signingPolicy
+}
+
+// VerifyPayloadBinary returns nil when path is a regular file whose signature
+// satisfies the Developer ID Application requirement for the daemon's own Team
+// ID, and an ErrPayloadSignature naming it otherwise. It never signs and never
+// changes the file.
+func (v ReleaseVerifier) VerifyPayloadBinary(ctx context.Context, path string) error {
+	if !v.p.release || v.p.s == nil {
+		return fmt.Errorf("%w: %s: no release signing decision was resolved", ErrPayloadSignature, path)
+	}
+	return verifyReleaseBinary(ctx, v.p, path)
+}
+
+// ResolveReleaseVerifier reads the running k3sm's own signature (the same
+// decision every boot step makes, see signingPolicy) and reports whether it is
+// on the release path. When it is, the returned verifier checks payload binaries
+// against the daemon's Developer ID requirement; on the dev path release is
+// false and the verifier must not be used. An unreadable signature is an
+// ErrSelfSignatureUnreadable, as at boot.
+func ResolveReleaseVerifier(ctx context.Context, logger *slog.Logger) (v ReleaseVerifier, release bool, err error) {
+	p, err := resolveSigningPolicy(ctx, logger)
+	if err != nil {
+		return ReleaseVerifier{}, false, err
+	}
+	if !p.release {
+		return ReleaseVerifier{}, false, nil
+	}
+	return ReleaseVerifier{p: p}, true, nil
 }
