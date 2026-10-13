@@ -197,6 +197,42 @@ present without its fingerprint, when the fingerprint is present without the con
 when the two do not match. Restore both files from the backup taken with `state.db`. `k3sm
 uninstall` keeps both files with the rest of your cluster data.
 
+## Network Exposure
+
+What a node listens on, and where:
+
+| Listener | Port | Address |
+|---|---|---|
+| kubelet API (logs, exec, metrics) | `10250` | the node's own address only: its mesh address when it has joined a cluster, its pod-range address on a single node, `127.0.0.1` under `--network none` |
+| NodePort Services | `30000-32767` | every interface, unless `--nodeport-addresses` is set |
+| wireguard mesh | `51820/udp` | every interface; it answers only peers holding a cluster key |
+
+The kubelet API binds exactly the address the node registers as its `InternalIP`, never every
+interface. If that address is missing when the node starts (a joined worker under `--network
+none`, for example), the node refuses to start and names the address.
+
+NodePorts follow upstream and bind every interface by default. On a network you do not trust, set
+`--nodeport-addresses local`:
+
+```sh
+sudo k3sm install --nodeport-addresses local
+sudo k3sm install --agent --server <control-plane> --token-file <file> --nodeport-addresses local
+```
+
+`local` is loopback (`127.0.0.1`) plus the node's own address, so a NodePort answers on the Mac
+itself and from the other nodes over the mesh, and on no Wi-Fi or Ethernet address. The value can
+also be a comma-separated list of IPv4 CIDRs, the kube-proxy `--nodeport-addresses` shape, mixed
+with `local` if you like (`local,10.0.0.0/8`). Each NodePort then binds every matching address of
+this Mac, or none of them if any bind fails.
+
+- The setting is IPv4 only. An IPv6 range is refused.
+- It is resolved once, when the daemon starts, against the addresses this Mac has then. A value that
+  matches no address refuses the start. An address that appears later (a new network) is used after
+  the next restart.
+- It is recorded with the other install arguments and kept across a reinstall and an uninstall.
+  `sudo k3sm install --nodeport-addresses ""` returns to every interface.
+- `k3sm server` and `k3sm agent` take the same flag directly.
+
 ## Uninstalling
 
 ```sh

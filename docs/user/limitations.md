@@ -370,8 +370,9 @@ Today at `main`, per port class:
   not a substitute for NetworkPolicy.
 
 - k3sm reserves some ports, and rejects LoadBalancer Services that claim them. The NodePort range
-  `30000-32767` and the kubelet API port `10250` are k3sm's own wildcard listeners; Go sets no
-  `SO_REUSEPORT`, so a second wildcard listener on the same port simply fails. A `type: LoadBalancer`
+  `30000-32767` and the kubelet API port `10250` are k3sm's own listeners (see
+  [Network exposure](install.md#network-exposure) for the addresses they bind), and a LoadBalancer
+  listener on the same port would either fail or split the port with them. A `type: LoadBalancer`
   Service declaring one of those ports is **rejected at `kubectl apply`** with a message naming the
   port, and every node additionally refuses to bind it. Plain NodePort Services are unaffected,
   because the apiserver allocates their `nodePort` out of that very range. Ordinary duplicate
