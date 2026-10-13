@@ -258,7 +258,7 @@ func TestPodPoliciesHaveEphemeralContainersVerdict(t *testing.T) {
 			podPolicies[p.Name] = pp
 		}
 	}
-	maps, err := cs.AdmissionregistrationV1beta1().MutatingAdmissionPolicies().List(ctx, managed)
+	maps, err := cs.AdmissionregistrationV1().MutatingAdmissionPolicies().List(ctx, managed)
 	if err != nil {
 		t.Fatalf("list MAPs: %v", err)
 	}

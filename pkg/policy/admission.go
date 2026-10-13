@@ -22,7 +22,6 @@ import (
 	"strings"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
-	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -644,8 +643,8 @@ const daemonSetTolerationPatchExpr = `[JSONPatch{op: "add", path: "/spec/tolerat
 // nodeSelector. Safe to call on every server start (create-or-update; an unchanged
 // spec is not rewritten).
 //
-// This provisions objects for a beta API (admissionregistration.k8s.io/v1beta1,
-// MutatingAdmissionPolicy) — the executor must enable the v1beta1 runtime-config and the
+// This provisions objects for a API (admissionregistration.k8s.io/v1,
+// MutatingAdmissionPolicy) — the executor must enable the admissionregistration runtime-config and the
 // MutatingAdmissionPolicy feature gate on the apiserver (see executor.apiServerArgs) or
 // this policy is a runtime no-op.
 func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interface) error {
@@ -656,19 +655,19 @@ func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interf
 	// without the toleration and stays Unschedulable — visible and recoverable, no
 	// guard bypass: the os=darwin Deny VAP and the provider taint still hold). Mirrors
 	// the advisory Warn VAP's Ignore.
-	ignore := admissionregistrationv1beta1.Ignore
-	policy := &admissionregistrationv1beta1.MutatingAdmissionPolicy{
+	ignore := admissionregistrationv1.Ignore
+	policy := &admissionregistrationv1.MutatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   dsTolerationPolicyName,
 			Labels: map[string]string{managedLabel: "true"},
 		},
-		Spec: admissionregistrationv1beta1.MutatingAdmissionPolicySpec{
+		Spec: admissionregistrationv1.MutatingAdmissionPolicySpec{
 			FailurePolicy: &ignore,
-			MatchConstraints: &admissionregistrationv1beta1.MatchResources{
-				ResourceRules: []admissionregistrationv1beta1.NamedRuleWithOperations{{
-					RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
-						Operations: []admissionregistrationv1beta1.OperationType{admissionregistrationv1beta1.Create},
-						Rule: admissionregistrationv1beta1.Rule{
+			MatchConstraints: &admissionregistrationv1.MatchResources{
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
+					RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+						Rule: admissionregistrationv1.Rule{
 							APIGroups:   []string{""},
 							APIVersions: []string{"v1"},
 							Resources:   []string{"pods"},
@@ -679,27 +678,27 @@ func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interf
 			// Both conditions must hold: the pod is DS-owned (group-qualified) and it does
 			// not already tolerate the taint (the negation of the single-sourced
 			// providerTolerationExpr — never a second, drifting ToleratesTaint CEL).
-			MatchConditions: []admissionregistrationv1beta1.MatchCondition{
+			MatchConditions: []admissionregistrationv1.MatchCondition{
 				{Name: "is-daemonset-pod", Expression: daemonSetOwnedExpr},
 				{Name: "not-already-tolerating", Expression: "!(" + providerTolerationExpr + ")"},
 			},
-			Mutations: []admissionregistrationv1beta1.Mutation{{
-				PatchType: admissionregistrationv1beta1.PatchTypeJSONPatch,
-				JSONPatch: &admissionregistrationv1beta1.JSONPatch{Expression: daemonSetTolerationPatchExpr},
+			Mutations: []admissionregistrationv1.Mutation{{
+				PatchType: admissionregistrationv1.PatchTypeJSONPatch,
+				JSONPatch: &admissionregistrationv1.JSONPatch{Expression: daemonSetTolerationPatchExpr},
 			}},
-			ReinvocationPolicy: admissionregistrationv1beta1.IfNeededReinvocationPolicy,
+			ReinvocationPolicy: admissionregistrationv1.IfNeededReinvocationPolicy,
 		},
 	}
 	if err := ensureMutatingAdmissionPolicy(ctx, cs, policy); err != nil {
 		return fmt.Errorf("daemonset-toleration mutating policy: %w", err)
 	}
 
-	binding := &admissionregistrationv1beta1.MutatingAdmissionPolicyBinding{
+	binding := &admissionregistrationv1.MutatingAdmissionPolicyBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   dsTolerationBindingName,
 			Labels: map[string]string{managedLabel: "true"},
 		},
-		Spec: admissionregistrationv1beta1.MutatingAdmissionPolicyBindingSpec{
+		Spec: admissionregistrationv1.MutatingAdmissionPolicyBindingSpec{
 			PolicyName: dsTolerationPolicyName,
 		},
 	}
