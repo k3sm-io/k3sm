@@ -8,54 +8,50 @@
 > processes** on Apple Silicon with none of those substrates, so it does not pass
 > `[Conformance]`, and this document does **not** claim it does.
 >
-> This document maps k3sm's **targeted feature classes** to a **green synthetic-conformance
-> criterion** (a k3sm-authored test in `hack/lib/conformance.sh`, static, run in `hack/ci.sh`,
-> **NOT** the CNCF suite) **or** a documented ceiling. A green criterion here means
+> This document maps k3sm's **targeted feature classes** to a **synthetic-conformance criterion**
+> (a k3sm-authored test, **NOT** the CNCF suite) **or** a documented ceiling. A criterion here means
 > "k3sm's own test asserts this behavior," not "upstream's e2e passed."
 
-## Canonical "why we can't pass"
+## Why k3sm Cannot Pass `[Conformance]`
 
-The authoritative explanation of **which upstream areas k3sm cannot conform to and why**
-lives in k3sm's internal full-surface conformance register (one row per feature × verdict, with a
-canonical §By-design non-conformance summary). This profile summarizes that assessment; it does not
-restate the full register. User-facing tradeoff guidance (what an operator should do about each ceiling)
-is owned by **[Limitations](user/limitations.md)**.
+This profile is k3sm's whole public statement of which upstream areas it cannot conform to and why.
+User-facing tradeoff guidance (what an operator should do about each ceiling) is owned by
+**[Limitations](user/limitations.md)**.
 
 ## Terms
 
-- **synthetic-conformance criterion**: a k3sm-authored Go test in a `hack/lib/conformance.sh`
-  criterion slice, static and hermetic-or-integration-tiered, run by `hack/ci.sh`. Promoted into a
-  criterion set **only in the PR that lands it green** (never regress a green gate).
-- **ceiling**: a behavior the macOS substrate forbids (`honest-limitation` in the register) or that
-  routes to the `vm` RuntimeClass for correctness. It is documented rather than chased.
-- **🟡 planned**: achievable-as-wiring and scheduled (tracked internally against the
-  conformance-hardening work); green criterion owed, not yet landed.
+- **criterion**: a k3sm-authored Go test that asserts the behavior. It is either a unit test, run by
+  `go test ./...`, or an end-to-end test in `e2e/` (build tag `e2e`) that k3sm's acceptance scripts
+  run against a live server.
+- **live criterion owed**: the behavior ships and its unit tests pass, but the end-to-end test
+  against a live cluster is not written yet.
+- **ceiling**: a behavior the macOS substrate forbids, or one that routes to the `vm` RuntimeClass
+  for correctness. It is documented rather than chased.
+- **🟡 planned**: the behavior does not ship yet.
 
 ## Feature classes → criterion or ceiling
 
-| feature class | k3sm posture | criterion or ceiling | register §home |
-|---|---|---|---|
-| **API machinery** (apiserver, RBAC, VAP admission, APF, CRD/aggregated-API, SSA, webhook delivery) | embedded real kube-apiserver | **criterion** (`Node,RBAC`; webhook-delivery e2e owed) | §1 |
-| **Admission config** (audit logging, PSA cluster default, default LimitRange) | argv + config additions | **🟡 planned** audit-log level / PSA cluster default / memory-only LimitRange criteria (integration-tiered) | §1 |
-| **Pod lifecycle** (phase/conditions, probes, graceful stop, OOMKill, restartPolicy, hooks) | provider reconstructs the kubelet surface | **criterion** + **🟡 planned** native sidecars, subPath | §2 |
-| **Workload controllers** (Deployment/RS/StatefulSet/DaemonSet/Job/CronJob, GC/finalizers, preemption) | embedded real KCM + scheduler | **criterion** (free-because-embedded) + **🟡 planned** Job/CronJob fidelity, DaemonSet toleration, rolling-update readiness | §10 |
-| **Services** (ClusterIP/NodePort TCP, EndpointSlices, sessionAffinity, iTP:Local) | userspace Service proxy | **criterion** | §3 |
-| **DNS** (search/ndots/A, ExternalName, in-pod wiring) | in-process resolver + getaddrinfo shim | **criterion** + **🟡 planned** headless/SRV/PTR/pod-A | §3/§4 |
-| **Per-pod network identity** (headless, SRV, PTR, StatefulSet identity) | `/32` allocator + SBPL bind-discipline exist, **unwired today** | **🟡 planned** (achievable-as-wiring, **not** a ceiling) | §3 |
-| **Ingress / IngressClass / LoadBalancer** | own userspace L7 proxy (`pkg/ingress`) | **🟡 planned** (`hack/acceptance/m10-ingress.sh`) | §12 |
-| **NetworkPolicy** | userspace-proxy dst-VIP allow/deny | **🟡 planned** L4 *hint* / **ceiling** as tenant isolation → `vm` | §12 |
-| **Scheduling** (nodeSelector/affinity/taints, topology labels) | real upstream scheduler | **criterion** | §6 |
-| **Resource model** (QoS, memory→OOMKill) | `proc_pid_rusage` sampler | **criterion** memory / **ceiling** CPU CFS-millicore limits | §7 |
-| **Observability** (`/stats/summary`, `/metrics/resource`, lifecycle Events) | runtimed working-set surface | **criterion** summary + **🟡 planned** `/metrics/resource`, node Events | §5/§7 |
-| **Config & storage** (ConfigMap/Secret, emptyDir/projected, PVC/PV local-path) | apiserver-served + runtimed materialization | **criterion** + **🟡 planned** resize/snapshot/ephemeral | §11 |
-| **Auth & supply chain** (bootstrap triad, apiserver↔node TLS, code-signing) | k3s-style join + notarized binary | **criterion** | §8 |
-| **Datastore** (kine→SQLite WAL, KCM scoping) | bundled kine (child process) | **criterion** | §9 |
+| feature class | k3sm posture | criterion or ceiling |
+|---|---|---|
+| **API machinery** (apiserver, RBAC, VAP admission, APF, CRD/aggregated-API, SSA, webhook delivery) | embedded real kube-apiserver | **criterion** (`Node,RBAC`; admission and conversion webhook delivery through the Service proxy) |
+| **Admission config** (audit logging, PSA cluster default, default LimitRange) | argv + config written at provision | **criterion** (audit-log level, PSA warn default and its enforce cutover, memory-only default LimitRange) |
+| **Pod lifecycle** (phase/conditions, probes, graceful stop, OOMKill, restartPolicy, native sidecars, hooks) | provider reconstructs the kubelet surface | **criterion**; live criterion owed for native sidecars and CrashLoopBackOff |
+| **Workload controllers** (Deployment/RS/StatefulSet/DaemonSet/Job/CronJob, GC/finalizers, preemption) | embedded real KCM + scheduler | **criterion** (the controllers are upstream's), with DaemonSet toleration injection and Job completion and backoff accounting unit-tested; live criterion owed for Job completion |
+| **Services** (ClusterIP/NodePort TCP, EndpointSlices, sessionAffinity, `internalTrafficPolicy: Local`) | userspace Service proxy | **criterion**; `externalTrafficPolicy: Local` is a **ceiling** (admitted, behaves as `Cluster`) |
+| **DNS** (search/ndots/A, ExternalName, in-pod wiring, headless, SRV, PTR, pod A) | in-process resolver + getaddrinfo shim | **criterion** (headless, SRV, PTR and per-pod A answers unit-tested in the resolver) |
+| **Per-pod network identity** (per-pod IP, headless, StatefulSet identity) | a distinct `/32` per Pod on the node's range | **criterion** (distinct pod IP per Pod, unit-tested); live criterion owed. Addressing only, never isolation |
+| **Ingress / IngressClass / LoadBalancer** | own userspace L7 proxy; LoadBalancer Services hosted on every node by node pool | **criterion** (unit-tested ingress hosting, IngressClass status and LoadBalancer bind reporting); live criterion owed |
+| **NetworkPolicy** | Service-VIP-mediated ingress allow/deny at the proxy | policy hint on the server node; **ceiling** as tenant isolation → `vm` |
+| **Scheduling** (nodeSelector/affinity/taints, topology labels) | real upstream scheduler | **criterion** |
+| **Resource model** (QoS, memory→OOMKill) | `proc_pid_rusage` sampler | **criterion** memory / **ceiling** CPU CFS-millicore limits |
+| **Observability** (`/stats/summary`, `/metrics/resource`, lifecycle Events) | runtimed usage samples; provider EventRecorder | **criterion** (summary, `/metrics/resource` joint CPU and memory emission, Pulled/Created/Started/Killing Events) |
+| **Config & storage** (ConfigMap/Secret, emptyDir/projected, PVC/PV local-path) | apiserver-served + runtimed materialization | **criterion** + **🟡 planned** resize/snapshot/generic ephemeral volumes |
+| **Auth & supply chain** (bootstrap triad, apiserver↔node TLS, code-signing) | k3s-style join token pinned to the cluster CA; release binaries are ad-hoc signed and not notarized | **criterion** |
+| **Datastore** (kine→SQLite WAL, KCM scoping) | bundled kine (child process); embedded etcd on an experimental two-server control plane | **criterion** |
 
 ## Hard ceilings (documented, never chased)
 
-Per the internal §By-design summary, summarized rather than restated:
-
-- No Linux containers / cgroups / CNI / netns / device-plugins / hugepages (`not-applicable`).
+- No Linux containers / cgroups / CNI / netns / device-plugins / hugepages.
 - No per-pod uid isolation, because same-node pods share one `_k3sm` trust domain. Untrusted tenancy
   is destined for `vm` (`linux/arm64`, single-node).
 - Absolute-path volume mounts resolve for **native workloads** (a `DYLD_INSERT` path-rebase shim; no
@@ -67,9 +63,9 @@ Per the internal §By-design summary, summarized rather than restated:
 
 ## Scope of these claims
 
-- Criteria are **k3sm's own tests**, static. A green row is "asserted by a k3sm test," never a
+- Criteria are **k3sm's own tests**. A criterion row is "asserted by a k3sm test," never a
   `[Conformance]` pass. Re-derive any row against current `main`.
-- A `🟡 planned` row's criterion is **owed**, not present; it names the behaviour still to be
-  asserted.
-- A live `[Conformance]` run against the *adapted* subset remains an explicit future lab goal
-  (DESIGN §9), out of scope for this static profile.
+- A `🟡 planned` row names behavior that does not ship yet, and a "live criterion owed" row names an
+  end-to-end test still to be written.
+- A live `[Conformance]` run against the *adapted* subset remains a future goal, out of scope for
+  this profile.

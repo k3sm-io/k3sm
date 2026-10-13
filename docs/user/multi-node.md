@@ -2,9 +2,8 @@
 
 Joining more than one Mac into a single k3sm cluster.
 
-> **Status: EXPERIMENTAL.** Multi-node ships as documented **EXPERIMENTAL** and is **not**
-> launch-blocking; its de-EXPERIMENTAL graduation is the **v0.3** milestone. Treat it as
-> preview-quality until then. See [Limitations](limitations.md).
+> **Status: EXPERIMENTAL.** Multi-node ships as documented **EXPERIMENTAL**. Treat it as
+> preview-quality until it graduates in a later release. See [Limitations](limitations.md).
 
 ## Mesh Model
 
@@ -386,8 +385,9 @@ There are no per-node `svclb-*` pods. Each node's k3sm process holds the listene
 
 - Cross-node Pod traffic has been shown to pass only on the two-Mac lab rig the
   [roadmap](https://github.com/k3sm-io/k3sm/blob/main/ROADMAP.md) records (2026-09-01), not by a
-  shipped acceptance gate, and cross-node traffic to or from a `vm` Pod is out of scope for this
-  release ([Limitations](limitations.md)).
+  shipped acceptance gate. Since v0.1.7 a `vm` Pod answers on its pod IP from every node, for TCP on
+  the ports it declares and the ports a Service targets on it; UDP to a `vm` Pod's IP is not relayed
+  ([Limitations](limitations.md#vm-pods-services-and-direct-pod-ips)).
 - Per-pod IP identity and headless/StatefulSet DNS records are present, but multi-node as a whole is
   EXPERIMENTAL. Validate cross-node resolution for your own workload rather than assuming it. See
   [Limitations](limitations.md).

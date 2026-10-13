@@ -380,5 +380,5 @@ possible and its **soak** validation is still pending. Factor that into recovery
 ## Next
 
 - [Upgrade](upgrade.md) covers what happens to the datastore across a version move.
-- [HA](ha.md) describes the multi-server control plane being built, which v0.1.6 does not offer.
+- [HA](ha.md) describes the experimental two-server control plane and its etcd snapshots.
 - [Storage](storage.md) covers backing up PV data separately.

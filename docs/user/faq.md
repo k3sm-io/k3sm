@@ -57,9 +57,9 @@ Not by uid. Same-node Pods share one `_k3sm` trust domain. Untrusted workloads b
 
 ## Is Multi-Node / HA Production-Ready?
 
-No. Multi-node ships **EXPERIMENTAL**; see [Multi-node](multi-node.md). A multi-server (HA) control
-plane is not available in v0.1.6: a cluster runs one server, and a second server cannot join yet.
-See [HA](ha.md).
+No. Multi-node ships **EXPERIMENTAL**; see [Multi-node](multi-node.md). A two-server (HA) control
+plane over embedded etcd is experimental from v0.1.7, and two servers tolerate no failure. See
+[HA](ha.md).
 
 ## Which Kubernetes Version Does k3sm Track?
 
