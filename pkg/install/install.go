@@ -997,8 +997,10 @@ type System interface {
 	// verdict this seam interprets: the caller decides whether to keep waiting.
 	ProbeNetd(path string) error
 	// WriteUserKubeconfig writes the admin kubeconfig into targetUser's
-	// ~/.kube/config, owned by targetUser (not root).
-	WriteUserKubeconfig(targetUser string, contents []byte) error
+	// ~/.kube/config, owned by targetUser (not root), keyed under name as its
+	// cluster, user and context. A non-default name that already keys an entry
+	// k3sm did not write is refused (CheckAdminNameFree).
+	WriteUserKubeconfig(targetUser, name string, contents []byte) error
 	// RemoveAll removes a path tree (the install dir on uninstall).
 	RemoveAll(path string) error
 	// ReapOrphans SIGKILLs any lingering process whose executable path is under
@@ -1153,11 +1155,11 @@ type System interface {
 	// it by hand (serviceUserDisabledRealName). It changes attributes only,
 	// none of which needs the approval a deletion does.
 	DisableServiceUser(ctx context.Context, name string) error
-	// RemoveAdminKubeconfigContext removes the k3sm context (and the cluster
+	// RemoveAdminKubeconfigContext removes the context keyed name (and the cluster
 	// and user it alone references) from targetUser's ~/.kube/config, keeping
 	// every other entry, the file's owner and its mode. An absent file or
 	// context is a no-op success, reported as removed=false.
-	RemoveAdminKubeconfigContext(targetUser string) (removed bool, err error)
+	RemoveAdminKubeconfigContext(targetUser, name string) (removed bool, err error)
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -1292,6 +1294,14 @@ type Config struct {
 	// ServerArgsRecord can never disagree. The CLI parses and refuses the
 	// unspecified, loopback and multicast forms before Install ever sees it.
 	MeshIP string
+	// KubeconfigName is the cluster, user and context name the admin kubeconfig
+	// is merged under in TargetUser's kubeconfig (the k3s
+	// --write-kubeconfig-name analog). It rides the server arguments as
+	// --kubeconfig-name (ignored by the daemon) so the same record that carries
+	// --mesh-ip carries it across an uninstall, and `k3sm kubectl`, `k3sm
+	// kubeconfig` and `uninstall --purge` read it back. Empty keeps a carried
+	// name; DefaultKubeconfigName clears it. Control plane only.
+	KubeconfigName string
 	// ExtraAgentArgs are operator-supplied `k3sm agent` arguments appended to the
 	// fixed set AgentPlist renders (--mesh-port, --dns-vip, …). Install
 	// populates it exactly as it populates ExtraServerArgs: from the agent plist
@@ -1596,10 +1606,22 @@ func (c Config) resolvedExtraServerArgs() []string {
 	if c.MeshIP != "" {
 		args = setMeshIPArg(args, c.MeshIP)
 	}
+	if c.KubeconfigName != "" {
+		args = setKubeconfigNameArg(args, c.KubeconfigName)
+	}
 	if c.etcdRequested() {
 		args = setEtcdArgs(args, c)
 	}
 	return setEtcdSnapshotArgs(args, c.EtcdSnapshots)
+}
+
+// kubeconfigName is the effective admin kubeconfig name: the recorded
+// --kubeconfig-name, else DefaultKubeconfigName.
+func (c Config) kubeconfigName() string {
+	if n := flagValue(c.resolvedExtraServerArgs(), kubeconfigNameFlag); n != "" {
+		return n
+	}
+	return DefaultKubeconfigName
 }
 
 // RecordedServerArgs returns the operator `k3sm server` arguments an install
@@ -1824,6 +1846,14 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// Refusing here costs an operator one command and nothing else.
 	if err := refuseCrossRole(sys, cfg); err != nil {
 		return err
+	}
+	if cfg.Role == RoleAgent && cfg.KubeconfigName != "" {
+		return fmt.Errorf("install: KubeconfigName applies to a control-plane install; a worker writes no admin kubeconfig")
+	}
+	if cfg.Role != RoleAgent {
+		if err := ValidateKubeconfigName(cfg.kubeconfigName()); err != nil {
+			return fmt.Errorf("install: %w", err)
+		}
 	}
 	// The HA request's own shape, from the Config alone: the same validator
 	// the CLI ran at parse time.
@@ -2372,7 +2402,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//    cluster. An operator administers a k3sm cluster from the server's
 	//    kubeconfig (or a copy of it), never from the worker's.
 	if cfg.Role != RoleAgent {
-		if err := sys.WriteUserKubeconfig(cfg.TargetUser, AdminKubeconfig(cfg)); err != nil {
+		if err := sys.WriteUserKubeconfig(cfg.TargetUser, cfg.kubeconfigName(), AdminKubeconfig(cfg)); err != nil {
 			return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
 		}
 	}

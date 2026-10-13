@@ -1234,7 +1234,7 @@ func (f *fakeSystem) putWedgedSocket(path string) {
 	f.wedgedSockets[path] = true
 }
 
-func (f *fakeSystem) WriteUserKubeconfig(targetUser string, contents []byte) error {
+func (f *fakeSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) error {
 	f.calls = append(f.calls, "WriteUserKubeconfig:"+targetUser)
 	f.kubeUser = targetUser
 	f.kubeContent = string(contents)

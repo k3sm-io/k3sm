@@ -1940,14 +1940,14 @@ func (darwinSystem) LaunchctlServicePID(label string) (int, error) {
 // sudo. Any pre-existing clusters/contexts are preserved — install must never
 // clobber a developer's other kubeconfigs (uninstall likewise leaves the file).
 // The write is atomic (temp + rename) so a crash mid-write can't corrupt the file.
-func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) error {
+func (darwinSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) error {
 	u, err := user.Lookup(targetUser)
 	if err != nil {
 		return fmt.Errorf("lookup target user %s: %w", targetUser, err)
 	}
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
-	if err := writeUserKubeconfig(u.HomeDir, uid, gid, contents); err != nil {
+	if err := writeUserKubeconfig(u.HomeDir, uid, gid, name, contents); err != nil {
 		return fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
 	}
 	return nil
@@ -1963,7 +1963,7 @@ func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) erro
 // belongs to the target user, who can replace the published config with a
 // symlink the instant the rename lands; a chown by path after it would follow
 // that link and hand whatever it names to the target user, so there is none.
-func writeUserKubeconfig(homeDir string, uid, gid int, contents []byte) error {
+func writeUserKubeconfig(homeDir string, uid, gid int, name string, contents []byte) error {
 	kubeDir := filepath.Join(homeDir, ".kube")
 	if err := os.MkdirAll(kubeDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", kubeDir, err)
@@ -1980,7 +1980,7 @@ func writeUserKubeconfig(homeDir string, uid, gid int, contents []byte) error {
 	if rerr != nil && !os.IsNotExist(rerr) {
 		return fmt.Errorf("read existing kubeconfig %s: %w", path, rerr)
 	}
-	merged, err := mergeAdminKubeconfig(existing, contents, adminContextName)
+	merged, err := mergeAdminKubeconfig(existing, contents, name)
 	if err != nil {
 		return fmt.Errorf("merge admin kubeconfig into %s: %w", path, err)
 	}
@@ -2585,14 +2585,14 @@ func (darwinSystem) BootoutUserDomain(ctx context.Context, uid uint32) error {
 	return nil
 }
 
-// RemoveAdminKubeconfigContext removes the k3sm context from targetUser's
+// RemoveAdminKubeconfigContext removes the context keyed name from targetUser's
 // ~/.kube/config. See the System interface.
-func (darwinSystem) RemoveAdminKubeconfigContext(targetUser string) (bool, error) {
+func (darwinSystem) RemoveAdminKubeconfigContext(targetUser, name string) (bool, error) {
 	u, err := user.Lookup(targetUser)
 	if err != nil {
 		return false, fmt.Errorf("lookup target user %s: %w", targetUser, err)
 	}
-	removed, err := removeUserKubeconfigContext(u.HomeDir)
+	removed, err := removeUserKubeconfigContext(u.HomeDir, name)
 	if err != nil {
 		return false, fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
 	}
@@ -2607,7 +2607,7 @@ func (darwinSystem) RemoveAdminKubeconfigContext(targetUser string) (bool, error
 // owner and mode are bound to its open descriptor before the rename — here
 // the ORIGINAL file's owner and mode, read off the descriptor the content was
 // read from. A symlinked ~/.kube or ~/.kube/config is refused, not followed.
-func removeUserKubeconfigContext(homeDir string) (bool, error) {
+func removeUserKubeconfigContext(homeDir, name string) (bool, error) {
 	kubeDir := filepath.Join(homeDir, ".kube")
 	if _, err := os.Lstat(kubeDir); errors.Is(err, fs.ErrNotExist) {
 		return false, nil
@@ -2639,7 +2639,7 @@ func removeUserKubeconfigContext(homeDir string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("read %s: %w", path, err)
 	}
-	out, changed, err := unmergeAdminKubeconfig(existing, adminContextName)
+	out, changed, err := unmergeAdminKubeconfig(existing, name)
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", path, err)
 	}

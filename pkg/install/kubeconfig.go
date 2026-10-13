@@ -18,6 +18,8 @@ package install
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -27,6 +29,65 @@ import (
 // carries (see AdminKubeconfig) and the name the merged context is keyed under in
 // the user's ~/.kube/config.
 const adminContextName = "k3sm"
+
+// DefaultKubeconfigName is the cluster/user/context name the admin kubeconfig is
+// merged under when `k3sm install` is not given --kubeconfig-name.
+const DefaultKubeconfigName = adminContextName
+
+// kubeconfigNameFlag is the `k3sm install` flag, and the server-argument name
+// the chosen value is recorded under (the daemon ignores it; see
+// Config.KubeconfigName).
+const kubeconfigNameFlag = "kubeconfig-name"
+
+var kubeconfigNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+
+// ValidateKubeconfigName reports why name cannot key a kubeconfig cluster, user
+// and context, or nil. The shape is narrow on purpose: the value is recorded in
+// a root-owned argument record and rendered into a LaunchDaemon argv.
+func ValidateKubeconfigName(name string) error {
+	if !kubeconfigNamePattern.MatchString(name) {
+		return fmt.Errorf("kubeconfig name %q is not valid: use 1 to 63 letters, digits, '.', '_' or '-', starting with a letter or digit", name)
+	}
+	return nil
+}
+
+// CheckAdminNameFree refuses a non-default name that already keys an entry in
+// cfg that k3sm did not write. The default name keeps its historical behaviour
+// (a merge replaces it). A custom name is ours only when the context, cluster
+// and user all exist under it, the context wires them together, and the user
+// carries a k3sm admin token; anything else, including a lone cluster or user
+// of that name, belongs to someone else and is never overwritten or removed.
+func CheckAdminNameFree(cfg *clientcmdapi.Config, name string) error {
+	if name == DefaultKubeconfigName {
+		return nil
+	}
+	kctx, cl, au := cfg.Contexts[name], cfg.Clusters[name], cfg.AuthInfos[name]
+	if kctx == nil && cl == nil && au == nil {
+		return nil
+	}
+	if ownedAdminEntry(cfg, name) {
+		return nil
+	}
+	var kinds []string
+	if kctx != nil {
+		kinds = append(kinds, "context")
+	}
+	if cl != nil {
+		kinds = append(kinds, "cluster")
+	}
+	if au != nil {
+		kinds = append(kinds, "user")
+	}
+	return fmt.Errorf("the kubeconfig already has a %s named %q that k3sm did not create; choose another --kubeconfig-name", strings.Join(kinds, "/"), name)
+}
+
+// ownedAdminEntry reports whether name keys a complete admin entry k3sm wrote.
+func ownedAdminEntry(cfg *clientcmdapi.Config, name string) bool {
+	kctx, cl, au := cfg.Contexts[name], cfg.Clusters[name], cfg.AuthInfos[name]
+	return kctx != nil && cl != nil && au != nil &&
+		kctx.Cluster == name && kctx.AuthInfo == name &&
+		strings.HasPrefix(au.Token, "k3sm-")
+}
 
 // mergeAdminKubeconfig merges the sole cluster/user/context from the k3sm admin
 // kubeconfig `incoming` into `existing` (the user's ~/.kube/config, which may
@@ -48,6 +109,9 @@ func mergeAdminKubeconfig(existing, incoming []byte, name string) ([]byte, error
 			return nil, fmt.Errorf("parse existing kubeconfig: %w", lerr)
 		}
 		dst = d
+	}
+	if err := CheckAdminNameFree(dst, name); err != nil {
+		return nil, err
 	}
 	merged, err := mergeContext(dst, src, name)
 	if err != nil {
@@ -136,6 +200,9 @@ func unmergeAdminKubeconfig(existing []byte, name string) (out []byte, changed b
 	}
 	kctx, ok := cfg.Contexts[name]
 	if !ok {
+		return nil, false, nil
+	}
+	if name != DefaultKubeconfigName && !ownedAdminEntry(cfg, name) {
 		return nil, false, nil
 	}
 	delete(cfg.Contexts, name)
