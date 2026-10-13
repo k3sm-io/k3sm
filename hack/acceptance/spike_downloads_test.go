@@ -42,7 +42,13 @@ import (
 //     target, literal or variable, as spelled at the download) as a whole
 //     word. One check therefore never covers a second download. The helper
 //     spike_fetch_pinned passes the same way: its curl and its check both
-//     name "$dest", and its callers contain no curl at all.
+//     name "$dest", and its callers contain no curl at all;
+//  3. `gh release download` is a download verb too. It must name each asset
+//     it fetches (-p/--pattern, no glob characters) or write one file with
+//     -O/--output, and each file it writes (the --dir/-D directory joined with
+//     the pattern, or the pattern alone without --dir) must appear in a sha256
+//     check as in rule 2. A gh download with no named asset, a glob pattern,
+//     or --archive cannot be bound to a check and is a finding.
 //
 // A line carrying `# unpinned: <reason>` (on the line itself or the line
 // directly above it) is exempt from both rules. The reason is required: a
@@ -51,6 +57,8 @@ import (
 var (
 	// fetchCmd finds curl or wget used as a command word.
 	fetchCmd = regexp.MustCompile("(?:^|[\\s;&|(`\"'/])(curl|wget)(?:\\s|$)")
+	// ghDownloadCmd finds `gh release download` used as a command.
+	ghDownloadCmd = regexp.MustCompile("(?:^|[\\s;&|(`\"'/])gh\\s+release\\s+download(?:\\s|$)")
 	// pipeToShell is a single pipe (not ||) into a shell or python, optionally
 	// through sudo or env VAR=value assignments.
 	pipeToShell = regexp.MustCompile(`[^|]\|\s*(?:sudo\s+)?(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)?(?:\S*/)?(?:sh|bash|zsh|python[0-9.]*)(?:["'\s;)]|$)`)
@@ -193,6 +201,65 @@ func downloadTarget(tool, seg string) (target string, writes bool) {
 	return u[strings.LastIndex(u, "/")+1:], true
 }
 
+// ghValueFlags are the gh release download flags that take a value.
+var ghValueFlags = map[string]bool{
+	"-p": true, "--pattern": true, "-D": true, "--dir": true, "-O": true, "--output": true,
+	"-A": true, "--archive": true, "-R": true, "--repo": true,
+}
+
+// ghDownloadTargets parses the arguments of one `gh release download` stage
+// and returns the files it writes, as spelled in the script (quotes
+// stripped). bound is false when the download cannot be tied to named files:
+// no pattern, a glob pattern, or --archive without -O. stdout is true for
+// -O -, which writes no file.
+func ghDownloadTargets(seg string) (targets []string, bound, stdout bool) {
+	toks := strings.Fields(seg)
+	var patterns []string
+	var dir, output string
+	archive := false
+	for i := 0; i < len(toks); i++ {
+		tok := toks[i]
+		name, val, hasEq := strings.Cut(tok, "=")
+		if !strings.HasPrefix(tok, "--") || !hasEq {
+			name, val = tok, ""
+			if ghValueFlags[tok] && i+1 < len(toks) {
+				val = toks[i+1]
+				i++
+			}
+		}
+		val = strings.Trim(val, `"'`)
+		switch name {
+		case "-p", "--pattern":
+			patterns = append(patterns, val)
+		case "-D", "--dir":
+			dir = val
+		case "-O", "--output":
+			output = val
+		case "-A", "--archive":
+			archive = true
+		}
+	}
+	switch {
+	case output == "-" || output == "/dev/stdout":
+		return nil, true, true
+	case output != "":
+		return []string{output}, true, false
+	case archive || len(patterns) == 0:
+		return nil, false, false
+	}
+	for _, p := range patterns {
+		if p == "" || strings.ContainsAny(p, "*?[") {
+			return nil, false, false
+		}
+		if dir == "" || dir == "." {
+			targets = append(targets, p)
+		} else {
+			targets = append(targets, strings.TrimSuffix(dir, "/")+"/"+p)
+		}
+	}
+	return targets, true, false
+}
+
 // normVar spells ${name} as $name so either spelling binds to the other.
 var normVar = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
@@ -234,6 +301,9 @@ func stageAfter(s string, idx int) string {
 
 // unchecked is the rule-2 finding.
 const unchecked = "non-local download whose output is not sha256-checked in the script"
+
+// unnamedAsset is the rule-3 finding for a gh download no check can bind to.
+const unnamedAsset = "gh release download without an explicitly named asset"
 
 // downloadFinding is one rule violation.
 type downloadFinding struct {
@@ -278,6 +348,25 @@ func scanDownloads(src string) (findings []downloadFinding, remote int) {
 				findings = append(findings, downloadFinding{ll.n, "unpinned marker without a reason"})
 			}
 			continue
+		}
+		for _, loc := range ghDownloadCmd.FindAllStringIndex(ll.text, -1) {
+			targets, bound, stdout := ghDownloadTargets(stageAfter(ll.text, loc[1]))
+			if stdout {
+				if pipeToShell.MatchString(ll.text[loc[0]:]) {
+					findings = append(findings, downloadFinding{ll.n, "download piped into a shell"})
+				}
+				continue
+			}
+			remote++
+			if !bound {
+				findings = append(findings, downloadFinding{ll.n, unnamedAsset})
+				continue
+			}
+			for _, t := range targets {
+				if !checked(t) {
+					findings = append(findings, downloadFinding{ll.n, unchecked})
+				}
+			}
 		}
 		locs := fetchCmd.FindAllStringSubmatchIndex(ll.text, -1)
 		if len(locs) == 0 {
@@ -380,6 +469,15 @@ func TestSpikeScriptsVerifyDownloads(t *testing.T) {
 			{"suffix path is not the target", "curl -fsSL -o k.gz https://example.com/k.gz\necho \"$want  old-k.gz\" | shasum -a 256 -c -\n", []string{unchecked}},
 			{"remote name without a url", "curl -fsSLO \"$URL\"\necho \"$S  k.gz\" | shasum -a 256 -c -\n", []string{unchecked}},
 			{"empty unpinned marker", "curl -fsSL https://example.com/i | sh # unpinned:\n", []string{"unpinned marker without a reason"}},
+			{"gh download with no check", `gh release download v1 --repo o/r --pattern kubectl --dir "$D"` + "\n", []string{unchecked}},
+			{"gh check names a different asset", `gh release download v1 --repo o/r --pattern kubectl --dir "$D"` + "\n" + `echo "$S  $D/kube-apiserver" | shasum -a 256 -c -` + "\n", []string{unchecked}},
+			{"gh check names the asset outside the dir", `gh release download v1 -p kubectl -D "$D"` + "\n" + `echo "$S  kubectl" | shasum -a 256 -c -` + "\n", []string{unchecked}},
+			{"gh dir download with no pattern", `gh release download v1 --repo o/r --dir "$BIN" --clobber` + "\n", []string{unnamedAsset}},
+			{"gh download of every asset", "gh release download v1 --repo o/r\n", []string{unnamedAsset}},
+			{"gh glob pattern", `gh release download v1 --pattern '*.tar.gz' --dir "$D"` + "\n" + `echo "$S  $D/*.tar.gz" | shasum -a 256 -c -` + "\n", []string{unnamedAsset}},
+			{"gh archive download", "gh release download v1 --archive zip\n", []string{unnamedAsset}},
+			{"gh second pattern unchecked", `gh release download v1 -p a -p b -D "$D"` + "\n" + `echo "$S  $D/a" | shasum -a 256 -c -` + "\n", []string{unchecked}},
+			{"gh piped to sh", "gh release download v1 -p i.sh -O - | sh\n", []string{"download piped into a shell"}},
 			{"empty unpinned marker above", "# unpinned:   \ncurl -fsSL -o k https://example.com/k\n", []string{"unpinned marker without a reason"}},
 
 			{"loopback pipe to python", `curl -s "http://127.0.0.1:$port/v1/models" | "$V/bin/python" -c 'print(1)'` + "\n", nil},
@@ -398,6 +496,11 @@ func TestSpikeScriptsVerifyDownloads(t *testing.T) {
 			{"checked by capture", "curl -fsSL -o k \"$URL\"\ngot=$(shasum -a 256 k | awk '{print $1}')\n[ \"$got\" = \"$want\" ]\n", nil},
 			{"unpinned marker with reason", "curl -fsSL https://example.com/i | sh # unpinned: vendor publishes no checksum\n", nil},
 			{"unpinned marker above with reason", "# unpinned: moving nightly, no published digest\ncurl -fsSL -o k https://example.com/k\n", nil},
+			{"gh pattern in dir checked", `gh release download "$TAG" --repo o/r --pattern "$asset" --dir "$STAGE" --clobber` + "\n" + `printf '%s  %s\n' "$want" "$STAGE/$asset" | shasum -a 256 -c -` + "\n", nil},
+			{"gh short flags checked", "gh release download v1 -R o/r -p kubectl -D \"${D}\"\ngot=$(shasum -a 256 \"$D/kubectl\" | awk '{print $1}')\n", nil},
+			{"gh pattern without dir checked", "gh release download v1 --pattern=kubectl\necho \"$S  kubectl\" | shasum -a 256 -c -\n", nil},
+			{"gh output file checked", "gh release download v1 -p k -O out.bin\necho \"$S  out.bin\" | shasum -a 256 -c -\n", nil},
+			{"gh unpinned marker with reason", "# unpinned: moving nightly, no published digest\ngh release download v1 --dir d\n", nil},
 			{"comment line", "# curl -fsSL https://example.com/i | sh\n", nil},
 			{"preflight probe", "command -v curl >/dev/null || { echo \"curl not found\"; missing=1; }\n", nil},
 		}
