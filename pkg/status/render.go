@@ -140,6 +140,9 @@ func renderScreen(r Report, rows []Row, s Style) string {
 	if line := stoppedByLine(r); line != "" {
 		b.WriteString(line + "\n\n")
 	}
+	if line := networkLine(r); line != "" {
+		b.WriteString(line + "\n\n")
+	}
 	for _, row := range rows {
 		b.WriteString(renderRow(row, s))
 		if log := row.Wide["log"]; log != "" {

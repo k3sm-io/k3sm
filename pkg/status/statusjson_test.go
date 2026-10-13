@@ -49,7 +49,9 @@ var (
 	// reportRequired and reportOptional are the top-level keys of `k3sm status
 	// -o json`. The optional ones are omitted when empty.
 	reportRequired = []string{"schemaVersion", "verdict", "role", "summary", "rows", "version", "host", "timestamp"}
-	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy"}
+	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy", "network"}
+	// networkRequired are the keys of the optional network object.
+	networkRequired = []string{"lan", "covers", "alwaysOn"}
 	// stoppedByRequired are the keys of the optional stoppedBy object.
 	stoppedByRequired = []string{"actor", "reason", "at", "phase"}
 	// interconnectRequired and interconnectOptional are the keys of the
@@ -398,6 +400,7 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			{reflect.TypeOf(Report{}), sortedUnion(reportRequired, reportOptional)},
 			{reflect.TypeOf(DaemonsReport{}), sortedUnion(daemonsRequired, daemonsOptional)},
 			{reflect.TypeOf(StoppedBy{}), sortedUnion(stoppedByRequired)},
+			{reflect.TypeOf(Network{}), sortedUnion(networkRequired)},
 			{reflect.TypeOf(Row{}), sortedUnion(rowRequired, rowOptional)},
 			{reflect.TypeOf(PeerStatus{}), sortedUnion(peerRequired)},
 			{reflect.TypeOf(Interconnect{}), sortedUnion(interconnectRequired, interconnectOptional)},
@@ -444,6 +447,9 @@ func TestStatusJSONContractGolden(t *testing.T) {
 						checkKeys(t, fmt.Sprintf("%s interconnect.pods[%d]", fullPath, i), p, interconnectPodRequired, nil, nil)
 					}
 				}
+			}
+			if nw, ok := fullGeneric["network"]; ok {
+				checkKeys(t, fullPath+" network", nw, networkRequired, nil, nil)
 			}
 			checkKeys(t, daemonsPath, probeGeneric, daemonsRequired, daemonsOptional, optionalSeen)
 			for _, g := range []map[string]any{fullGeneric, probeGeneric} {
@@ -556,7 +562,9 @@ func TestStatusJSONContractGolden(t *testing.T) {
 		}
 		// Every optional key appears in some golden, so a rename of a key that
 		// one fixture omits still fails in another. peers is the exception: it
-		// is reserved, and no posture emits it yet (the struct check covers it).
+		// is reserved, and no posture emits it yet (the struct check covers it);
+		// network is read from a record no golden posture wires, so the
+		// struct check and TestStatusNetworkBlock cover it.
 		for _, k := range append(append(append([]string{"next", "interconnect", "stoppedBy"}, rowOptional...), versionOptional...), interconnectOptional...) {
 			if !optionalSeen[k] {
 				t.Errorf("no golden carries the optional key %q", k)

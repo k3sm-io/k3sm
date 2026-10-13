@@ -282,6 +282,10 @@ type Collector struct {
 	// in production). OPTIONAL: nil, an absent marker or an unreadable one
 	// leaves the report's stoppedBy field out.
 	StopMarker func() (install.StopMarker, bool, error)
+	// Network reads the LAN access record (install.ReadNetworkRecord in
+	// production; an absent record reads as on). OPTIONAL: nil or a failed
+	// read leaves the report's network field out.
+	Network    func() (install.NetworkRecord, bool, error)
 	Paths      Paths
 	EUID       int
 	ServiceUID int

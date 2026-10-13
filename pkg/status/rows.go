@@ -162,6 +162,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 		Next:          next,
 		Interconnect:  icBlock,
 		StoppedBy:     c.stoppedBy(),
+		Network:       c.network(role, installed),
 		Version:       c.Version,
 		Host:          c.Host,
 		Timestamp:     now(),
