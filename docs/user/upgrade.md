@@ -280,6 +280,7 @@ does **not** revert them; you have to.
 
 ## Next
 
+- [Stopping and starting](stop-start.md) explains why an upgrade leaves a stopped node stopped, and `--start`.
 - [Backup & restore](backup-restore.md) covers backing up before an upgrade, and the automatic
   pre-migration copy.
 - [Versions](versions.md) describes the version you are moving to.

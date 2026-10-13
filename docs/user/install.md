@@ -292,6 +292,7 @@ k3sm kubectl get nodes
 
 ## Next
 
+- [Stopping and starting](stop-start.md) covers `k3sm stop` and `start`, and how a reinstall treats a stopped node.
 - [Quickstart](quickstart.md) runs your first Pod.
 - [kubectl access](kubectl-access.md) covers kubeconfig details.
 - [Upgrade](upgrade.md) explains how upgrades restart the daemon.

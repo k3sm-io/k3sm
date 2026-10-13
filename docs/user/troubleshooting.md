@@ -506,6 +506,7 @@ Work through this in order.
 
 ## Next
 
+- [Stopping and starting](stop-start.md) covers a node that reads as stopped on purpose, and a stop that left something behind.
 - [FAQ](faq.md) has quick answers.
 - [Limitations](limitations.md) answers whether something is a bug or a documented gap.
 - [Backup & restore](backup-restore.md) covers recovering the datastore.
