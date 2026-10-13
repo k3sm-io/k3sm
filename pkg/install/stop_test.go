@@ -116,7 +116,7 @@ var wantCleanStop = []string{
 	"WriteStopMarker:stopped",
 }
 
-// TestStopTearsDownPodsAndKeepsPlists is the B481 gate: `k3sm stop` is the
+// TestStopTearsDownPodsAndKeepsPlists is the stop gate: `k3sm stop` is the
 // full stop, in its exact order, keeps every plist (so the node stays stopped
 // across reboot) and the node identity, kills a surviving vm helper by its
 // recorded identity, flushes the Service CIDR the node was installed with,

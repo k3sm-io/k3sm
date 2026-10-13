@@ -57,7 +57,7 @@ func before(t *testing.T, calls []string, order ...string) {
 	}
 }
 
-// TestInstallHonoursUserStop is the B482 gate: a user stop is one state every
+// TestInstallHonoursUserStop is the start-side gate: a user stop is one state every
 // transition honours. An install (or in-app update) on a stopped node updates
 // it and leaves it stopped, never enabling a label; install --start starts it;
 // uninstall clears the stop's disable and its marker; start converges after a

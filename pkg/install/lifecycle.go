@@ -354,7 +354,7 @@ func removeMesh(ctx context.Context, sys System, cfg Config, netdInstalled bool)
 	return nil
 }
 
-// Stop is `k3sm stop`: the full stop, in this order (docs/m18-plan.md L1).
+// Stop is `k3sm stop`: the full stop, in this order.
 //
 //  0. On a server, best effort and bounded: count the joined workers and warn
 //     that stopping the control plane cuts them off. Never a prompt (the app
