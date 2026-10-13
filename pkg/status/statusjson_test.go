@@ -51,7 +51,12 @@ var (
 	reportRequired = []string{"schemaVersion", "verdict", "role", "summary", "rows", "version", "host", "timestamp"}
 	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy", "network"}
 	// networkRequired are the keys of the optional network object.
-	networkRequired = []string{"lan", "covers", "alwaysOn"}
+	networkRequired = []string{"lan", "recorded", "covers", "alwaysOn"}
+	// networkOptional are the optional keys of the network object.
+	networkOptional = []string{"applied"}
+	// networkAppliedRequired / Optional are the keys of network.applied.
+	networkAppliedRequired = []string{"lan", "serial"}
+	networkAppliedOptional = []string{"error"}
 	// stoppedByRequired are the keys of the optional stoppedBy object.
 	stoppedByRequired = []string{"actor", "reason", "at", "phase"}
 	// interconnectRequired and interconnectOptional are the keys of the
@@ -365,6 +370,9 @@ func checkRows(t *testing.T, where string, rows any, seen map[string]bool) {
 func jsonKeys(typ reflect.Type) []string {
 	var keys []string
 	for i := 0; i < typ.NumField(); i++ {
+		if !typ.Field(i).IsExported() {
+			continue // never encoded
+		}
 		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
 		keys = append(keys, name)
 	}
@@ -400,7 +408,8 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			{reflect.TypeOf(Report{}), sortedUnion(reportRequired, reportOptional)},
 			{reflect.TypeOf(DaemonsReport{}), sortedUnion(daemonsRequired, daemonsOptional)},
 			{reflect.TypeOf(StoppedBy{}), sortedUnion(stoppedByRequired)},
-			{reflect.TypeOf(Network{}), sortedUnion(networkRequired)},
+			{reflect.TypeOf(Network{}), sortedUnion(networkRequired, networkOptional)},
+			{reflect.TypeOf(NetworkApplied{}), sortedUnion(networkAppliedRequired, networkAppliedOptional)},
 			{reflect.TypeOf(Row{}), sortedUnion(rowRequired, rowOptional)},
 			{reflect.TypeOf(PeerStatus{}), sortedUnion(peerRequired)},
 			{reflect.TypeOf(Interconnect{}), sortedUnion(interconnectRequired, interconnectOptional)},
@@ -449,7 +458,7 @@ func TestStatusJSONContractGolden(t *testing.T) {
 				}
 			}
 			if nw, ok := fullGeneric["network"]; ok {
-				checkKeys(t, fullPath+" network", nw, networkRequired, nil, nil)
+				checkKeys(t, fullPath+" network", nw, networkRequired, networkOptional, nil)
 			}
 			checkKeys(t, daemonsPath, probeGeneric, daemonsRequired, daemonsOptional, optionalSeen)
 			for _, g := range []map[string]any{fullGeneric, probeGeneric} {

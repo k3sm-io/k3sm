@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"reflect"
 	"strings"
 	"testing"
@@ -61,6 +62,9 @@ func TestStatusNetworkBlock(t *testing.T) {
 		if nw["lan"] != "off" {
 			t.Errorf("network.lan = %v, want off", nw["lan"])
 		}
+		if nw["recorded"] != true {
+			t.Errorf("network.recorded = %v, want true", nw["recorded"])
+		}
 		want := map[string][]any{
 			"covers":   {"nodeports", "loadbalancers", "ingress"},
 			"alwaysOn": {"apiserver", "join", "mesh"},
@@ -73,6 +77,49 @@ func TestStatusNetworkBlock(t *testing.T) {
 		screen := Render(r, Style{})
 		if !strings.Contains(screen, "LAN access off (nodeports, loadbalancers, ingress); always on: apiserver, join, mesh") {
 			t.Errorf("the human view does not carry the LAN line:\n%s", screen)
+		}
+	})
+
+	t.Run("recorded and applied are both shown, and their difference", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name    string
+			network func() (install.NetworkRecord, bool, error)
+			applied func(install.Role) ([]byte, error)
+			json    string
+			line    string
+		}{
+			{"applied agrees", off, func(install.Role) ([]byte, error) { return []byte(`{"lan":"off","serial":"s1"}`), nil },
+				`"applied":{"lan":"off","serial":"s1"}`, ""},
+			{"applied differs", off, func(install.Role) ([]byte, error) { return []byte(`{"lan":"on","serial":"s0"}`), nil },
+				`"applied":{"lan":"on","serial":"s0"}`, "the node daemon still serves LAN access on, not the recorded off"},
+			{"applied refused", off, func(install.Role) ([]byte, error) {
+				return []byte(`{"lan":"on","serial":"s1","error":"ingress: bind refused"}`), nil
+			}, `"error":"ingress: bind refused"`, "its last change was refused: ingress: bind refused"},
+			{"applied unknown to a user", off, func(install.Role) ([]byte, error) { return nil, fs.ErrPermission },
+				`"recorded":true`, "readable by root only"},
+			{"no record reads on, visibly", func() (install.NetworkRecord, bool, error) {
+				return install.NetworkRecord{Version: install.NetworkRecordVersion, LAN: install.LANOn}, false, nil
+			}, nil, `"lan":"on","recorded":false`, "LAN access is on because no setting is recorded"},
+		}
+		for _, tc := range cases {
+			c := running(t)
+			c.Network, c.NetworkApplied = tc.network, tc.applied
+			r := c.Collect(context.Background())
+			raw, err := json.Marshal(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(raw), tc.json) {
+				t.Errorf("%s: JSON lacks %s: %s", tc.name, tc.json, raw)
+			}
+			screen := Render(r, Style{})
+			if tc.line != "" && !strings.Contains(screen, tc.line) {
+				t.Errorf("%s: the human view lacks %q:\n%s", tc.name, tc.line, screen)
+			}
+			if tc.line == "" && (strings.Contains(screen, "still serves") || strings.Contains(screen, "refused")) {
+				t.Errorf("%s: the human view reports a difference that is not there:\n%s", tc.name, screen)
+			}
 		}
 	})
 
