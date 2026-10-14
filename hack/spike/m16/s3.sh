@@ -62,12 +62,25 @@ Every probe reports its own VERDICT/RECORD line, and every failure prints the AP
 surface it actually found. A spike that dies on an AttributeError tells you nothing;
 one that prints the names it looked for and the names that exist tells you what to
 write next.
+
+The surface driven here is the engine's own in-process API, as the supplementary run
+in findings-s3.md recorded it: `mlx_lm.load` yields the model and tokenizer; the
+invariants travel in `SchedulerConfig` inside `EngineConfig`, and the scheduler is
+read back to prove it took them; a request is `add_request(token_ids, SamplingParams,
+request_id=...)`; its stream is `stream_outputs(request_id, timeout=...)`; and the
+prefix cache sits behind the scheduler as `paged_cache_manager`, which exists only
+with `use_paged_cache=True` (the default `PrefixCacheManager` has no block-hash
+function). Every wait is bounded: a stream that stays open after an abort is the
+expected shape, not a hang.
 """
-import asyncio, importlib, inspect, json, os, statistics, sys, time
+import asyncio, inspect, json, os, statistics, sys, time, traceback
 
 MODEL = os.environ["MODEL_PATH"]
 MAX_KV = int(os.environ.get("MAX_KV_SIZE", "4096"))
 MAX_SEQS = int(os.environ.get("MAX_NUM_SEQS", "4"))
+STREAM_BUDGET = float(os.environ.get("STREAM_BUDGET", "90"))  # one request, start to finish
+ABORT_GRACE = float(os.environ.get("ABORT_GRACE", "5"))      # quiet time after an abort that counts as "stopped"
+SAMPLES = 200
 
 
 def surface(obj, hint=""):
@@ -75,153 +88,322 @@ def surface(obj, hint=""):
     return "%s exposes: %s" % (hint or type(obj).__name__, ", ".join(sorted(names))[:600])
 
 
-def find_core():
-    """Locate the async engine core without assuming one module path."""
-    last = None
-    for mod in ("vllm_mlx.engine.async_engine_core", "vllm_mlx.engine", "vllm_mlx"):
+def verdict(state, crit, text):
+    print("VERDICT %s %s  %s" % (state, crit, text), flush=True)
+
+
+def record(text):
+    print("RECORD %s" % text, flush=True)
+
+
+def version(dist):
+    try:
+        import importlib.metadata as md
+        return md.version(dist)
+    except Exception:
+        return "?"
+
+
+def cache_stats(core):
+    try:
+        return json.dumps(core.get_cache_stats(), default=str)[:400]
+    except Exception as exc:
+        return "unreadable (%r)" % (exc,)
+
+
+class Pump:
+    """Reads a stream into a queue from its own task, so a bounded wait on the queue never
+    cancels the engine's generator mid-step: "quiet" then means the stream is open and
+    silent, and "ended" means the engine closed it."""
+
+    def __init__(self, stream):
+        self.q = asyncio.Queue()
+        self.task = asyncio.ensure_future(self._run(stream))
+
+    async def _run(self, stream):
         try:
-            m = importlib.import_module(mod)
-        except Exception as exc:  # a missing module is data, not a crash
-            last = exc
-            continue
-        for attr in ("AsyncEngineCore", "AsyncLLMEngine", "EngineCore"):
-            if hasattr(m, attr):
-                return getattr(m, attr), mod + "." + attr
-    raise RuntimeError("no engine core found (last import error: %r)" % (last,))
+            async for out in stream:
+                await self.q.put(out)
+        except Exception as exc:
+            await self.q.put(exc)
+        finally:
+            await self.q.put(None)
+
+    async def next(self, budget):
+        """The next event; None once the stream ended; "quiet" when budget passed without one."""
+        try:
+            return await asyncio.wait_for(self.q.get(), budget)
+        except asyncio.TimeoutError:
+            return "quiet"
+
+    async def close(self):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+
+async def stop(core):
+    try:
+        maybe = core.stop()
+        if inspect.isawaitable(maybe):
+            await maybe
+    except Exception as exc:
+        record("engine stop raised %r" % (exc,))
 
 
 async def main():
     try:
-        Core, where = find_core()
+        from mlx_lm import load
+        import vllm_mlx.engine_core as engine_core
+        from vllm_mlx.request import SamplingParams
     except Exception as exc:
-        print("VERDICT FAIL s3.1 in-process  %s" % exc)
+        verdict("FAIL", "s3.1 in-process", "the engine's in-process modules do not import: %r" % (exc,))
         return 1
-    print("RECORD s3.1 engine core: %s" % where)
+    record("s3.1 engine core: vllm_mlx.engine_core.AsyncEngineCore (vllm-mlx %s, mlx-lm %s)"
+           % (version("vllm-mlx"), version("mlx-lm")))
 
-    sig = inspect.signature(Core.__init__)
-    kwargs = {}
-    for name, value in (("max_kv_size", MAX_KV), ("max_num_seqs", MAX_SEQS),
-                        ("continuous_batching", True)):
-        if name in sig.parameters:
-            kwargs[name] = value
-    missing = [n for n in ("max_kv_size", "max_num_seqs", "continuous_batching") if n not in kwargs]
-    if missing:
-        print("VERDICT FAIL s3.1 invariants  the engine core does not accept %s in-process — the CLI flags that carry the M8 invariants have no in-process equivalent. %s"
-              % (", ".join(missing), "constructor: " + str(sig)))
-        return 1
-    print("RECORD s3.1 constructor: %s(%s)" % (where, json.dumps(kwargs)))
-
+    # ---- s3.1 the invariants pinned in-process, then token IDs in, tokens out -----
     t0 = time.time()
-    core = Core(MODEL, **kwargs)
-    if hasattr(core, "start"):
-        maybe = core.start()
-        if inspect.isawaitable(maybe):
-            await maybe
-    print("RECORD s3.1 load: %.1fs" % (time.time() - t0))
+    model, tok = load(MODEL)
+    record("s3.1 load (mlx_lm.load): %.1fs" % (time.time() - t0))
+    wanted = {"max_num_seqs": MAX_SEQS, "max_kv_size": MAX_KV, "use_paged_cache": True}
+    core = engine_core.AsyncEngineCore(
+        model, tok, engine_core.EngineConfig(model_name=MODEL, scheduler_config=engine_core.SchedulerConfig(**wanted)))
+    core.start()
+    await asyncio.sleep(0.2)
 
-    tok = getattr(core, "tokenizer", None)
-    if tok is None:
-        print("VERDICT FAIL s3.1 token-ids  the core exposes no tokenizer, so a caller cannot hand it token IDs. %s" % surface(core, "core"))
-        return 1
-    ids = tok.encode("Explain, at length, how a filesystem journal works.")
-    if not isinstance(ids, list):
-        ids = list(ids)
+    sched = getattr(getattr(core, "engine", None), "scheduler", None)
+    cfg = getattr(sched, "config", None)
+    if cfg is None:
+        verdict("FAIL", "s3.1 invariants", "the core exposes no engine.scheduler.config to read the invariants back from. %s"
+                % surface(core, "core"))
+        await stop(core)
+        return 0
+    echoed = {k: getattr(cfg, k, None) for k in wanted}
+    block = getattr(cfg, "paged_cache_block_size", None)
+    record("s3.1 constructor: AsyncEngineCore(model, tokenizer, EngineConfig(scheduler_config=SchedulerConfig(%s))); "
+           "the scheduler holds %s, block_size=%s; continuous batching is the engine-core path itself "
+           "(the CLI's --continuous-batching selects this engine; in-process there is no flag to forget)"
+           % (", ".join("%s=%s" % kv for kv in wanted.items()), json.dumps(echoed), block))
+    if echoed != wanted:
+        verdict("FAIL", "s3.1 invariants", "the scheduler did not keep the pinned values: wanted %s, got %s"
+                % (json.dumps(wanted), json.dumps(echoed)))
+        await stop(core)
+        return 0
 
-    add = getattr(core, "add_request", None)
-    stream = getattr(core, "stream_outputs", None)
-    if add is None or stream is None:
-        print("VERDICT FAIL s3.1 in-process  add_request/stream_outputs are not both present. %s" % surface(core, "core"))
-        return 1
+    # The config is what the drive handed over; what the engine APPLIED is read from the live
+    # scheduler: with MAX_SEQS + 3 requests queued at once, the running count must never exceed
+    # MAX_SEQS and must sit at MAX_SEQS while others wait. max_kv_size is read from a running
+    # request's cache object when that cache exposes a size; otherwise its absence is recorded.
+    ids = list(tok.encode("Explain, at length, how a filesystem journal works."))
+    burst = [await core.add_request(ids, SamplingParams(max_tokens=24, temperature=0.0), request_id="s3-cap-%d" % i)
+             for i in range(MAX_SEQS + 3)]
+    most, capped, kv_seen, t_cap = 0, False, None, time.time()
+    while time.time() - t_cap < STREAM_BUDGET:
+        await asyncio.sleep(0.05)
+        nr, nw = sched.get_num_running(), sched.get_num_waiting()
+        most = max(most, nr)
+        if nr == MAX_SEQS and nw > 0:
+            capped = True
+        if nr > 0 and kv_seen is None:
+            for req in list(getattr(sched, "running", {}).values()):
+                pc = getattr(req, "prompt_cache", None)
+                layers = pc if isinstance(pc, (list, tuple)) else ([pc] if pc is not None else [])
+                sizes = [getattr(l, "max_size", None) for l in layers if getattr(l, "max_size", None) is not None]
+                if sizes:
+                    kv_seen = sizes[0]
+                elif layers:
+                    kv_seen = "no max_size on %s" % type(layers[0]).__name__
+        if nr == 0 and nw == 0 and time.time() - t_cap > 0.5:
+            break
+    drains = [Pump(core.stream_outputs(r, timeout=STREAM_BUDGET)) for r in burst]
+    for d in drains:
+        while await d.next(STREAM_BUDGET) not in (None, "quiet"):
+            pass
+        await d.close()
+    record("s3.1 applied: %d requests queued at once, running never exceeded %d of max_num_seqs=%d, cap reached with a queue: %s; "
+           "max_kv_size on a running request's cache: %s"
+           % (len(burst), most, MAX_SEQS, capped, kv_seen if kv_seen is not None else "not observable on the paged path"))
+    if most <= MAX_SEQS and capped:
+        verdict("PASS", "s3.1 invariants", "the scheduler applied max_num_seqs=%d (running peaked at %d with others waiting)%s"
+                % (MAX_SEQS, most, "; max_kv_size=%s read from a running request's cache" % kv_seen if isinstance(kv_seen, int) and kv_seen == MAX_KV
+                   else "; max_kv_size is held by the scheduler but not observable on a paged-cache request in-process, so the image's own tests must pin it"))
+    else:
+        verdict("FAIL", "s3.1 invariants", "the scheduler did not apply max_num_seqs=%d: running peaked at %d, cap with a queue seen: %s"
+                % (MAX_SEQS, most, capped))
+        await stop(core)
+        return 0
 
-    rid = "s3-1"
-    maybe = add(rid, ids) if len(inspect.signature(add).parameters) >= 2 else add(ids)
-    if inspect.isawaitable(maybe):
-        await maybe
-    n = 0
-    first = None
-    t1 = time.time()
-    async for _out in stream():
-        n += 1
+    try:
+        rid = await asyncio.wait_for(
+            core.add_request(ids, SamplingParams(max_tokens=64, temperature=0.0), request_id="s3-1"), STREAM_BUDGET)
+    except Exception as exc:
+        verdict("FAIL", "s3.1 token-ids", "add_request did not accept a token-id list: %r. %s" % (exc, surface(core, "core")))
+        await stop(core)
+        return 0
+    record("s3.1 add_request accepted %d token ids -> %r" % (len(ids), rid))
+
+    stream = Pump(core.stream_outputs(rid, timeout=STREAM_BUDGET))
+    events, first, last, t1 = 0, None, None, time.time()
+    while True:
+        out = await stream.next(STREAM_BUDGET)
+        if out is None or out == "quiet" or isinstance(out, Exception):
+            break
+        events += 1
+        last = out
         if first is None:
             first = time.time() - t1
-        if n >= 64:
+        if getattr(out, "finished", False) or events >= 64:
             break
-    if n:
-        print("VERDICT PASS s3.1 in-process  the engine generated %d tokens from TOKEN IDS in-process with the KV cache pinned at %d and %d sequences (TTFT %.3fs)"
-              % (n, MAX_KV, MAX_SEQS, first or 0.0))
-    else:
-        print("VERDICT FAIL s3.1 in-process  the in-process stream yielded nothing — the plan's R3 sidecar shape applies")
-        return 1
+    await stream.close()
+    tokens = len(getattr(last, "output_token_ids", None) or [])
+    finish = getattr(last, "finish_reason", None)
+    if not events:
+        verdict("FAIL", "s3.1 in-process", "the in-process stream yielded nothing within %.0fs - the plan's R3 sidecar shape applies"
+                % STREAM_BUDGET)
+        await stop(core)
+        return 0
+    # the count is checked, not claimed: one token per event, and a length finish means all 64.
+    # This assumes the engine emits one token per stream event. An engine that batches
+    # several tokens into one event makes tokens != events and reads as a FAIL here, never
+    # as a false PASS; adjust the check if a later engine version does that.
+    if tokens != events or (finish == "length" and tokens != 64):
+        verdict("FAIL", "s3.1 in-process", "the stream's token count does not add up: %d events, %d output tokens, finish=%s (64 asked for)"
+                % (events, tokens, finish))
+        await stop(core)
+        return 0
+    verdict("PASS", "s3.1 in-process",
+            "the engine generated %d tokens over %d stream events from TOKEN IDS in-process, one token per event, finish=%s "
+            "(TTFT %.3fs)" % (tokens, events, finish, first or 0.0))
 
-    # ---- s3.2 abort mid-stream ---------------------------------------------------
-    abort = getattr(core, "abort_request", None)
-    if abort is None:
-        print("VERDICT FAIL s3.2 abort  the core exposes no abort_request; a client disconnect would waste GPU until the sequence finishes")
+    # ---- s3.2 abort mid-stream, the wait after it bounded ---------------------------
+    rid2 = await core.add_request(ids, SamplingParams(max_tokens=256, temperature=0.0), request_id="s3-2")
+    stream = Pump(core.stream_outputs(rid2, timeout=STREAM_BUDGET))
+    seen = 0
+    while seen < 8:
+        out = await stream.next(STREAM_BUDGET)
+        if out is None or out == "quiet" or isinstance(out, Exception):
+            break
+        seen += 1
+    if seen < 8:
+        verdict("FAIL", "s3.2 abort", "the second stream gave %d events and then nothing, before an abort could be sent" % seen)
     else:
-        rid2 = "s3-2"
-        maybe = add(rid2, ids) if len(inspect.signature(add).parameters) >= 2 else add(ids)
-        if inspect.isawaitable(maybe):
-            await maybe
-        seen = 0
-        async for _out in stream():
-            seen += 1
-            if seen == 8:
-                maybe = abort(rid2)
-                if inspect.isawaitable(maybe):
-                    await maybe
-            if seen > 8:
+        t_abort = time.time()
+        accepted = await core.abort_request(rid2)
+        took = time.time() - t_abort
+        after, ended = 0, "kept streaming"
+        while True:
+            out = await stream.next(ABORT_GRACE)
+            if out is None:
+                ended = "ended %.1fs after the abort" % (time.time() - t_abort)
                 break
-        print("VERDICT PASS s3.2 abort  abort_request was accepted mid-stream after %d tokens" % seen)
-
-    # ---- s3.3 the routing metadata ----------------------------------------------
-    cache = None
-    for attr in ("prefix_cache", "block_cache", "kv_cache"):
-        if hasattr(core, attr):
-            cache = getattr(core, attr)
-            break
-    if cache is None:
-        print("VERDICT FAIL s3.3 block-hashes  no prefix cache is reachable from the core, so there is no routing metadata to publish. %s" % surface(core, "core"))
-    else:
-        hashfn = getattr(cache, "compute_block_hash", None)
-        blocks = getattr(cache, "block_size", None) or getattr(cache, "tokens_per_block", None)
-        print("RECORD s3.3 prefix cache: %s block_size=%s %s" % (type(cache).__name__, blocks, surface(cache, "cache")))
-        if hashfn is None:
-            print("VERDICT FAIL s3.3 block-hashes  the prefix cache exposes no block-hash function")
+            if out == "quiet":
+                ended = "stayed open, silent for %.0fs" % ABORT_GRACE
+                break
+            if isinstance(out, Exception):
+                ended = "raised %r" % (out,)
+                break
+            if getattr(out, "finished", False):
+                ended = "ended with finish=%s %.1fs after the abort" % (getattr(out, "finish_reason", None), time.time() - t_abort)
+                break
+            after += 1
+        record("s3.2 abort_request(%r) returned %r in %.3fs; %d token events after the abort; cache stats: %s"
+               % (rid2, accepted, took, after, cache_stats(core)))
+        if accepted and after == 0:
+            verdict("PASS", "s3.2 abort", "abort_request was accepted mid-stream after 8 events and generation stopped: "
+                    "no token event followed it within %.0fs" % ABORT_GRACE)
+        elif accepted:
+            verdict("FAIL", "s3.2 abort", "abort_request returned True but %d token event(s) followed it - the engine kept generating"
+                    % after)
         else:
-            # ---- s3.4 the publish cost, sync vs async -----------------------------
-            chunk = ids[:int(blocks or 64)]
-            sync_times = []
-            for _ in range(200):
-                t = time.perf_counter()
-                hashfn(chunk)
-                sync_times.append((time.perf_counter() - t) * 1e6)
+            verdict("FAIL", "s3.2 abort", "abort_request returned %r for a live request" % (accepted,))
+        # The stream's own ending is a separate fact for the plan to judge, never part of the PASS:
+        # a worker whose engine leaves the stream open must end it itself.
+        record("s3.2-stream after the abort the stream %s; the worker %s"
+               % (ended, "can rely on the engine to end the stream" if ended.startswith("ended") else "must end the stream itself"))
+    await stream.close()
 
-            async def publish(h):
-                return h
+    # ---- s3.3 the routing metadata: block hashes behind the scheduler ---------------
+    pcm = getattr(sched, "paged_cache_manager", None)
+    if pcm is None:
+        verdict("FAIL", "s3.3 block-hashes",
+                "no paged cache manager is reachable behind the scheduler (use_paged_cache=%s), so there is no routing "
+                "metadata to publish. %s" % (echoed["use_paged_cache"], surface(sched, "scheduler")))
+    else:
+        hashfn = getattr(pcm, "compute_block_hash", None)
+        block = getattr(pcm, "block_size", None) or block or 64
+        present = [n for n in ("compute_block_hash", "register_block_hash", "get_computed_blocks", "evict_lru_blocks", "get_stats")
+                   if hasattr(pcm, n)]
+        record("s3.3 prefix cache: %s block_size=%s; present: %s" % (type(pcm).__name__, block, ", ".join(present)))
+        if hashfn is None:
+            verdict("FAIL", "s3.3 block-hashes", "the paged cache exposes no compute_block_hash. %s" % surface(pcm, "cache"))
+        else:
+            chunk = (ids * (block // len(ids) + 1))[:block]   # one full block, so s3.4 prices a block and not a fragment
+            try:
+                sample = hashfn(chunk)
+            except TypeError as exc:
+                sample = None
+                verdict("FAIL", "s3.3 block-hashes", "compute_block_hash did not take a token list: %r (signature %s)"
+                        % (exc, inspect.signature(hashfn)))
+            if sample is not None:
+                verdict("PASS", "s3.3 block-hashes",
+                        "block hashes are computable from the scheduler's paged cache (block size %s, sample %r); stored "
+                        "blocks are readable from its stats; eviction is exposed as evict_lru_blocks and was not exercised "
+                        "here (it needs more than max_cache_blocks=%s resident blocks)"
+                        % (block, str(sample)[:16], getattr(cfg, "max_cache_blocks", None)))
 
-            async_times = []
-            for _ in range(200):
-                t = time.perf_counter()
-                await publish(hashfn(chunk))
-                async_times.append((time.perf_counter() - t) * 1e6)
-            print("VERDICT PASS s3.3 block-hashes  block hashes are computable from the core's own prefix cache (block size %s)" % blocks)
-            print("RECORD s3.4 publish cost per block: sync median %.1fus p99 %.1fus; via an await median %.1fus p99 %.1fus (200 samples each)"
-                  % (statistics.median(sync_times), sorted(sync_times)[197],
-                     statistics.median(async_times), sorted(async_times)[197]))
+                # ---- s3.4 the publish cost, sync vs async --------------------------------
+                sync_us = []
+                for _ in range(SAMPLES):
+                    t = time.perf_counter()
+                    hashfn(chunk)
+                    sync_us.append((time.perf_counter() - t) * 1e6)
 
-    if hasattr(core, "cleanup"):
-        maybe = core.cleanup()
-        if inspect.isawaitable(maybe):
-            await maybe
+                async def publish(h):
+                    return h
+
+                async_us = []
+                for _ in range(SAMPLES):
+                    t = time.perf_counter()
+                    await publish(hashfn(chunk))
+                    async_us.append((time.perf_counter() - t) * 1e6)
+                p99 = int(SAMPLES * 0.99) - 1
+                record("s3.4 publish cost per %d-token block: sync median %.1fus p99 %.1fus; via an await median %.1fus p99 %.1fus "
+                       "(%d samples each)" % (block, statistics.median(sync_us), sorted(sync_us)[p99],
+                                              statistics.median(async_us), sorted(async_us)[p99], SAMPLES))
+        record("s3.3 cache stats at the end: %s" % cache_stats(core))
+
+    await stop(core)
     return 0
 
 
-sys.exit(asyncio.run(main()))
+async def run():
+    """Exit 0 once the drive has finished, whatever its verdicts say; exit 1 only when it died."""
+    try:
+        return await main()
+    except Exception:
+        tb = traceback.format_exc()
+        verdict("FAIL", "s3.0 drive", "the drive raised before it finished: %s" % tb.strip().splitlines()[-1])
+        print(tb[-1500:], file=sys.stderr, flush=True)
+        return 1
+
+
+sys.exit(asyncio.run(run()))
 PY
 
 MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
 [ -n "$MP" ] || { verdict FAIL "s3.0 setup  no model snapshot under $PREFIX/hf — run s0.sh first"; exit 0; }
+# The scoreboard reads the drive's VERDICT lines. The drive exits 0 whenever it finished,
+# whatever those lines say, so a finished drive never earns a second FAIL from the driver;
+# a drive that died (a crash, a signal, an unhandled error) exits non-zero, which is turned
+# into one FAIL that names the status and keeps the payload non-zero, so a crash after an
+# earlier PASS can never read as green.
 MODEL_PATH="$MP" MAX_KV_SIZE=4096 MAX_NUM_SEQS=4 "$V" "$W/drive.py" 2>&1 | tee "$W/drive.log"
+rc=${PIPESTATUS[0]}
+if [ "$rc" != 0 ]; then
+  verdict FAIL "s3.0 drive  drive.py died with status $rc after its last verdict line (see $W/drive.log)"
+  exit "$rc"
+fi
+grep -q '^VERDICT ' "$W/drive.log" || { verdict FAIL "s3.0 drive  drive.py finished without reporting a verdict (see $W/drive.log)"; exit 1; }
 EOF
 
 note "S3(2) — the alternative engine, as a recorded control"
@@ -232,13 +414,21 @@ export UV_CACHE_DIR="$PREFIX/cache" UV_PYTHON_INSTALL_DIR="$PREFIX/pyinstall" HF
 export PATH="$PREFIX/bin:$PATH"
 spike_venv "$PREFIX/venv-metal" "s3.5 control"
 VM="$PREFIX/venv-metal/bin/python"
-if ! spike_pip "$VM" vllm-metal; then
+if ! spike_pip "$VM" "vllm-metal==0.1.0"; then
   recorded "s3.5 control  the alternative engine did not install on this rig — recorded, not gating: it is the negative space around the engine choice, never a criterion"
   exit 0
 fi
+# vllm-metal serves its OpenAI endpoint from the `vllm-metal` console script. The
+# `vllm.entrypoints.openai.api_server` module exists only under its [vllm] extra, which
+# would pull an unpinned dependency tree into the control venv.
+SERVER="$PREFIX/venv-metal/bin/vllm-metal"
+[ -x "$SERVER" ] || { recorded "s3.5 control  the alternative engine installed without its vllm-metal console script — recorded, not gating"; exit 0; }
 MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
-nohup "$VM" -m vllm.entrypoints.openai.api_server --model "$MP" --port 8103 > "$W/metal.log" 2>&1 &
+nohup "$SERVER" --model "$MP" --host 127.0.0.1 --port 8103 > "$W/metal.log" 2>&1 &
 PID=$!
+# the control never outlives the payload, interrupted or not; a server that already
+# exited makes kill non-zero, which must not become the payload's status
+trap 'kill "$PID" 2>/dev/null || true' EXIT
 UP=no
 for i in $(seq 1 60); do
   curl -fsS -m 3 http://127.0.0.1:8103/v1/models >/dev/null 2>&1 && { UP=yes; break; }
@@ -250,7 +440,6 @@ if [ "$UP" = yes ] && [ -r "$PREFIX/s0/load.py" ]; then
 else
   recorded "s3.5 control  the alternative engine did not serve on this rig (see $W/metal.log) — recorded, not gating"
 fi
-kill "$PID" 2>/dev/null
 EOF
 
 spike_verdict "$RUNG"
