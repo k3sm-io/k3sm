@@ -104,12 +104,15 @@
 #   - xcrun stapler validate, and spctl -a -t open
 #     --context context:primary-signature, accept the image
 #   - hdiutil attach -readonly -nobrowse at a private mount point, detached on
-#     every exit; the image root holds only k3sm.app and an Applications
-#     symlink to /Applications
+#     every exit; the image root holds only k3sm.app, an Applications
+#     symlink to /Applications, and at most a .fseventsd directory (the
+#     filesystem metadata an APFS image can carry); any other entry, hidden
+#     or not, refuses
 #   - k3sm.app/Contents/Resources/payload holds exactly the files
 #     PAYLOAD-SHA256 lists, with its hashes, and the manifest itself, unchanged
 #     (no .DS_Store, no symlink)
-#   - CFBundleShortVersionString equals the tag's version
+#   - CFBundleShortVersionString equals the tag's version: X.Y.Z for vX.Y.Z,
+#     and the X.Y.Z core for vX.Y.Z-rc.N (the key takes only a plain x.y.z)
 #   - codesign --verify --strict --deep against the Developer ID Application
 #     requirement for the Team ID, and xcrun stapler validate, accept the app
 # Then this script computes the image's SHA-256 and appends `<sha256>  <name>`
@@ -500,8 +503,15 @@ image_root_problems() {
 	local root="$1" tag="$2" team="$3" manifest="$4" app payload entries v rc=0
 	app="$root/k3sm.app"
 	entries="$(cd "$root" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | LC_ALL=C sort)"
+	# .fseventsd is the one extra entry allowed, and only as a real directory.
+	if [ -e "$root/.fseventsd" ] || [ -L "$root/.fseventsd" ]; then
+		if [ -L "$root/.fseventsd" ] || [ ! -d "$root/.fseventsd" ]; then
+			echo "    .fseventsd in the image is not a directory"; rc=1
+		fi
+		entries="$(printf '%s\n' "$entries" | grep -vxF .fseventsd || true)"
+	fi
 	[ "$entries" = $'Applications\nk3sm.app' ] ||
-		{ echo "    the image root holds [${entries//$'\n'/, }], not exactly [Applications, k3sm.app]"; rc=1; }
+		{ echo "    the image root holds [${entries//$'\n'/, }], not exactly [Applications, k3sm.app] (and at most .fseventsd)"; rc=1; }
 	if [ ! -L "$root/Applications" ] || [ "$(readlink "$root/Applications")" != /Applications ]; then
 		echo "    Applications in the image is not a symlink to /Applications"; rc=1
 	fi
@@ -520,8 +530,12 @@ image_root_problems() {
 			{ echo "    k3sm.app's payload holds a .DS_Store"; rc=1; }
 		tree_manifest_problems "$payload" "$manifest" || rc=1
 	fi
+	# CFBundleShortVersionString is a plain x.y.z, so a release candidate's app
+	# carries the tag's core version; a final tag compares exactly.
+	local want="${tag#v}"
+	want="${want%-rc.*}"
 	v="$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist" 2>/dev/null || true)"
-	[ "$v" = "${tag#v}" ] || { echo "    the app's CFBundleShortVersionString is '$v', not '${tag#v}'"; rc=1; }
+	[ "$v" = "$want" ] || { echo "    the app's CFBundleShortVersionString is '$v', not '$want'"; rc=1; }
 	codesign --verify --strict --deep -R="$(developer_id_requirement "$team")" "$app" >/dev/null 2>&1 ||
 		{ echo "    codesign --verify --strict --deep rejects k3sm.app against the Developer ID requirement for $team"; rc=1; }
 	xcrun stapler validate "$app" >/dev/null 2>&1 || { echo "    stapler validate rejects k3sm.app"; rc=1; }
@@ -1163,6 +1177,15 @@ EOF
 	fresh; mk_image "$W/img" "$W/tree"; printf 'readme\n' >"$W/img/root/README"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
 	up_refuses "an image holding more than k3sm.app and the Applications link refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"; mkdir "$W/img/root/.fseventsd"; printf 'log\n' >"$W/img/root/.fseventsd/fseventsd-uuid"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_promoted "an image root with a .fseventsd directory is accepted" 4
+	fresh; mk_image "$W/img" "$W/tree"; printf 'hidden\n' >"$W/img/root/.hidden"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an image root with another hidden entry refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"; printf 'not a directory\n' >"$W/img/root/.fseventsd"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an image root whose .fseventsd is not a directory refuses" image-unverified
 	fresh; mk_image "$W/img" "$W/tree"; rm "$W/img/root/Applications"; ln -s /tmp "$W/img/root/Applications"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
 	up_refuses "an Applications link that is not /Applications refuses" image-unverified
@@ -1183,6 +1206,22 @@ EOF
 	else
 		bad "image missing from the read-back (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
 	fi
+
+	# A release candidate's app carries the tag's x.y.z core. The version
+	# check runs on a mounted root directly, with the signature fakes accepting.
+	# rc_root_case <name> <app-version> <want: pass|refuse>
+	rc_root_case() {
+		fresh; mk_image "$W/img" "$W/tree" "$2"
+		rc=0
+		out="$(PATH="$FPATH" FAKE_CODESIGN_VERIFY_OK=1 FAKE_STAPLER_OK=1 image_root_problems "$W/img/root" "$rctag" "$TEAM" "$W/tree/PAYLOAD-SHA256")" || rc=$?
+		if { [ "$3" = pass ] && [ "$rc" -eq 0 ]; } || { [ "$3" = refuse ] && [ "$rc" -ne 0 ] && grep -q CFBundleShortVersionString <<<"$out"; }; then ok "$1"; else
+			bad "$1 (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+		fi
+		: >"$log"
+	}
+	rc_root_case "a release candidate's app with the tag's x.y.z core passes" "$(printf '%s' "${rctag#v}" | sed 's/-rc\.[0-9]*$//')" pass
+	rc_root_case "a release candidate's app carrying the -rc.N suffix refuses" "${rctag#v}" refuse
+	rc_root_case "a release candidate's app with another x.y.z refuses" 0.0.2 refuse
 
 	# The one-shot run uploads three assets and never an image: its upload
 	# refuses a checksums file that names a fourth.
@@ -1280,7 +1319,7 @@ EOF
 	fi
 
 	unset -f ok bad skip_attended on_pty no_tty expect_refusal draft_json promote_case mk_payload package_case ent_case gitf bind_case upload_case \
-		mk_sealed mk_image run_up up_refuses up_promoted fresh install_case
+		mk_sealed mk_image run_up up_refuses up_promoted fresh install_case rc_root_case
 	unset FAKE_TOOL_LOG
 	echo
 	echo "publish self-test: $passes passed, $fails failed, $skips skipped (attended only)"
