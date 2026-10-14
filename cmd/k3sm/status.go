@@ -315,7 +315,15 @@ type statusRunner struct {
 	// installed as. An empty list means the control-plane default, so a runner
 	// assembled without one still tails something rather than nothing.
 	logTargets []string
+	// appPresent reports whether k3sm.app is installed. When it reports
+	// false, the human output ends with appHint; the JSON never carries it.
+	// Nil prints no hint.
+	appPresent func() bool
 }
+
+// appHint is the fixed line the human status output ends with when k3sm.app
+// is not in /Applications.
+const appHint = "Hint: k3sm.app is not installed in /Applications. The app shows k3sm in the menu bar and can update or uninstall it.\n"
 
 // run executes a parsed command and returns the process exit code.
 func (r statusRunner) run(ctx context.Context, o statusOptions) int {
@@ -373,7 +381,11 @@ func (r statusRunner) emit(rep status.Report, o statusOptions) int {
 	if o.format == "json" {
 		return r.emitJSON(rep, rep.Verdict)
 	}
-	if _, err := io.WriteString(r.out, r.render(rep, o)); err != nil {
+	text := r.render(rep, o)
+	if r.appPresent != nil && !r.appPresent() {
+		text += appHint
+	}
+	if _, err := io.WriteString(r.out, text); err != nil {
 		fmt.Fprintln(r.errOut, "k3sm status: write report:", err)
 		return exitInternalError
 	}
