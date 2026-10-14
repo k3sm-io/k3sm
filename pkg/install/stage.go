@@ -190,7 +190,7 @@ func stagingSources(cfg Config) []string {
 // closing of a live hole. It costs one lstat.
 func stagingTrustVerdict(path string, e OwnedEntry) error {
 	refuse := func(reason string) error {
-		return fmt.Errorf("refusing to remove the install staging path %s as root: it %s — move it aside by hand and re-run the install", path, reason)
+		return fmt.Errorf("refusing to remove the install staging path %s as root: it %s — move it aside by hand and run the command again", path, reason)
 	}
 	switch {
 	case e.Kind == EntrySymlink:

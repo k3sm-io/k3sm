@@ -253,19 +253,28 @@ func operatorJoinToken(sys System, cfg Config) (string, bootstrap.Token, error) 
 	// twice with no window closed between them — the confused-deputy read
 	// ReadRegularFile's own doc comment describes, applied to this file's mode
 	// as well as its type.
-	raw, perm, err := sys.ReadRegularFileWithMode(cfg.TokenFile)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is not there: write the token `k3sm token create` printed on the server into it, or drop --token-file on a node that has already joined", cfg.TokenFile)
-	case errors.Is(err, ErrNotRegularFile):
-		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is not a regular file (%w): a join token is a credential and belongs in an ordinary file, mode 600", cfg.TokenFile, err)
-	case err != nil:
-		return "", bootstrap.Token{}, fmt.Errorf("install: read the join token file %s: %w (it is read once, by root, and copied to %s for the daemon to present)", cfg.TokenFile, err, cfg.stagedJoinTokenPath())
-	}
-	// The mode BEFORE the bytes are trusted: a credential this Mac should not
-	// have accepted is refused before anything below parses raw.
-	if perm&tokenFileMask != 0 {
-		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is mode %#o: a join token is a credential, so the file must not be readable by its group or by other accounts — `chmod 600 %s`, and mint a fresh token if it has been exposed", cfg.TokenFile, perm, cfg.TokenFile)
+	var raw []byte
+	if cfg.stagedToken != nil {
+		// An install from a k3sm.app staging directory already read the file,
+		// once and under stricter rules, and unlinked it (readStagedToken).
+		raw = []byte(*cfg.stagedToken)
+	} else {
+		var perm fs.FileMode
+		var err error
+		raw, perm, err = sys.ReadRegularFileWithMode(cfg.TokenFile)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is not there: write the token `k3sm token create` printed on the server into it, or drop --token-file on a node that has already joined", cfg.TokenFile)
+		case errors.Is(err, ErrNotRegularFile):
+			return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is not a regular file (%w): a join token is a credential and belongs in an ordinary file, mode 600", cfg.TokenFile, err)
+		case err != nil:
+			return "", bootstrap.Token{}, fmt.Errorf("install: read the join token file %s: %w (it is read once, by root, and copied to %s for the daemon to present)", cfg.TokenFile, err, cfg.stagedJoinTokenPath())
+		}
+		// The mode BEFORE the bytes are trusted: a credential this Mac should not
+		// have accepted is refused before anything below parses raw.
+		if perm&tokenFileMask != 0 {
+			return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is mode %#o: a join token is a credential, so the file must not be readable by its group or by other accounts — `chmod 600 %s`, and mint a fresh token if it has been exposed", cfg.TokenFile, perm, cfg.TokenFile)
+		}
 	}
 	token := strings.TrimSpace(string(raw))
 	if token == "" {

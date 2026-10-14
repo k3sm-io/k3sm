@@ -138,6 +138,26 @@ Every channel manages the same `/Library/k3sm`. Once more than one has shipped, 
 `sudo k3sm install` after switching so the daemons run the newly delivered binary, or run
 `sudo k3sm uninstall` first for a clean cutover.
 
+### Installing From k3sm.app
+
+The k3sm app installs, updates and uninstalls with the same `/Library/k3sm`. It never runs k3sm
+from its own bundle as root: it copies the bundle into a new directory under
+`/Library/k3sm.staging`, checks the copy's signature, and runs
+`k3sm install --from-staging <dir>` from that copy. The install refuses to run unless:
+
+- the directory sits directly inside `/Library/k3sm.staging`, both are owned by `root:wheel` with
+  mode `0700`, and no part of the path is a symlink;
+- every file in the directory is owned by `root`, writable by nobody else, and none is a symlink,
+  a special file, or setuid or setgid;
+- the running `k3sm` and every file it installs come from that directory;
+- a `--token-file` sits directly inside the directory, owned by `root` with mode `600` and one
+  link (it is removed as soon as it is read);
+- the version is a release version no older than the installed one;
+- on an update, the new `k3sm` is signed by the same Developer ID team as the installed one.
+
+Pass `--allow-downgrade` to install an older version on purpose (or over an install whose version
+cannot be read). A plain `sudo k3sm install` makes none of these checks and is unchanged.
+
 ## Secrets Encryption at Rest
 
 Secrets are stored unencrypted in the datastore by default. To encrypt them at rest, ask for it
@@ -309,6 +329,9 @@ reinstall picks up where you left off; to remove those too, see
 mints a new one. The command prints the full list of what it kept. If you
 installed a data volume, it stays mounted and declared; the command prints `sudo k3sm install
 --data-volume` to reinstall onto it and `sudo k3sm datavol delete --yes` to remove it for good.
+
+Uninstall also removes `/Library/k3sm.staging`, the directory the k3sm app copies itself into, and
+refuses to run while the app is in the middle of an install.
 
 ### Server Flags Across A Reinstall
 

@@ -852,6 +852,25 @@ func (f *fakeSystem) LockInstall(path string) (func() error, error) {
 	}, nil
 }
 
+// LockStaging models the staging lock exactly as LockInstall models the
+// install lock, in the same held-lock table, so a test pre-seeds a lock the
+// copy-out holds by setting f.locked[path].
+func (f *fakeSystem) LockStaging(path string) (func() error, error) {
+	f.calls = append(f.calls, "LockStaging:"+path)
+	if f.locked[path] {
+		return nil, fmt.Errorf("%w (its lock is held at %s)", ErrStagingBusy, path)
+	}
+	if f.locked == nil {
+		f.locked = map[string]bool{}
+	}
+	f.locked[path] = true
+	return func() error {
+		f.calls = append(f.calls, "UnlockStaging:"+path)
+		delete(f.locked, path)
+		return nil
+	}, nil
+}
+
 // SwapInstallRoot exchanges the two trees in the fake's own model and reports
 // which branch the real seam would have taken, in the recorded call itself:
 // `:swap` when the destination held a tree, `:rename` when it did not.
@@ -2110,6 +2129,10 @@ func TestUninstallIdempotent(t *testing.T) {
 		t.Fatalf("Uninstall: %v", err)
 	}
 	want := []string{
+		// Both locks first, in the one fixed order: the k3sm.app staging lock
+		// (outer), then the install lock (inner).
+		"LockStaging:/Library/k3sm.staging.lock",
+		"LockInstall:/Library/k3sm.lock",
 		// Uninstall asks the disk which roles are installed before it tears
 		// anything down, so a Mac that was installed as a worker has its agent
 		// daemon swept by the same run.
@@ -2169,6 +2192,13 @@ func TestUninstallIdempotent(t *testing.T) {
 		// change goes through uninstall, and the next role's netd must not
 		// restore this /24.
 		"RemoveAll:/var/lib/k3sm/keys/node-pod-cidr",
+		// The staging sweep: the k3sm.app staging root and the install swap
+		// dir, each judged by lstat (absent here, so nothing is removed).
+		"Owner:/Library/k3sm.staging",
+		"Owner:/Library/k3sm.swap",
+		// The locks released in reverse.
+		"UnlockInstall:/Library/k3sm.lock",
+		"UnlockStaging:/Library/k3sm.staging.lock",
 	}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("uninstall calls = %v, want %v", f.calls, want)

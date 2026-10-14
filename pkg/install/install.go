@@ -757,6 +757,9 @@ type System interface {
 	// the reap. Its file lives BESIDE the install root, never inside it: a lock
 	// on a file in the tree being swapped would travel with that tree.
 	LockInstall(path string) (unlock func() error, err error)
+	// LockStaging is LockInstall for the k3sm.app staging lock (ErrStagingBusy
+	// when held), the OUTER lock of the two: see lockStagingThenInstall.
+	LockStaging(path string) (unlock func() error, err error)
 	// SwapInstallRoot publishes the staged install tree by exchanging it with
 	// whatever is at live, in ONE filesystem operation, and reports whether
 	// there was a previous tree.
@@ -1203,6 +1206,7 @@ type Config struct {
 	// --token-file stages nothing and leaves whatever is already there. A
 	// ServerJoin install requires it.
 	TokenFile       string
+	StagingOptions         // `install --from-staging` and the staging root (fromstaging.go)
 	ServiceUser     string // _k3sm
 	InstallDir      string // /Library/k3sm
 	LinkDir         string // /usr/local/bin
@@ -1846,6 +1850,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// verification: it is what separates a failure THIS install caused from one
 	// the machine was already living with (see verifyServerNotParked).
 	startedAt := time.Now()
+	if err := preflightFromStaging(&cfg); err != nil {
+		return err
+	}
 	if cfg.BinarySource == "" {
 		return fmt.Errorf("install: BinarySource (the k3sm binary to install) is required")
 	}
@@ -1938,15 +1945,11 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// serialised — and it is held until this function returns, which is past the
 	// reap. See System.LockInstall for why two concurrent installs are the one
 	// hazard the staging below cannot contain by itself.
-	unlock, err := sys.LockInstall(cfg.installLockPath())
+	release, err := lockForInstall(sys, cfg)
 	if err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
-	defer func() {
-		if err := unlock(); err != nil {
-			cfg.Logger.Warn("could not release the install lock", "path", cfg.installLockPath(), "err", err)
-		}
-	}()
+	defer release()
 
 	if cfg.AdminToken == "" {
 		tok, err := generateToken()
@@ -2257,6 +2260,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//      can therefore only fail on an I/O error, not on the entitlement.
 	if err := sys.CopyToRootOwned(cfg.VMHostSource, cfg.stagedVMHost()); err != nil {
 		return fmt.Errorf("install: copy k3sm-vmhost to %s: %w (build k3sm.io/runtimed/cmd/k3sm-vmhost, ad-hoc sign it with the com.apple.security.virtualization entitlement, and place it next to the k3sm binary — vm-RuntimeClass pods cannot boot without it)", cfg.stagedVMHost(), err)
+	}
+	if err := recordTeamID(sys, cfg); err != nil {
+		return err
 	}
 	// 2c. Stage the control-plane payload into InstallDir/bin. Fail fast when a
 	//     payload binary is absent: the daemon boot otherwise falls back to
@@ -2578,12 +2584,7 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 // With cfg.Purge set it is `k3sm uninstall --purge`: the same teardown, then
 // every artifact this one keeps (see purge).
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
-	cfg = cfg.withDefaults()
-	if cfg.Purge {
-		return purge(ctx, sys, cfg)
-	}
-	_, err := uninstall(ctx, sys, cfg, nil)
-	return err
+	return uninstallLocked(ctx, sys, cfg.withDefaults())
 }
 
 // uninstall is Uninstall's teardown, and returns the manifest it walked so a
