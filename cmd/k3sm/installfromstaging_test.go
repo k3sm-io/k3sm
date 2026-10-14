@@ -38,7 +38,7 @@ func TestInstallFromStagingFlags(t *testing.T) {
 		want string // "" = accepted
 	}{
 		{name: "the app's server and update argv", args: []string{"--user", "admin", "--from-staging", stage}},
-		{name: "the app's join argv", args: []string{"--user", "admin", "--from-staging", stage, "--agent", "--server", "192.168.0.50", "--token-file", stage + "/join-token"}},
+		{name: "the app's join argv", args: []string{"--user", "admin", "--from-staging", stage, "--agent", "--server", "192.0.2.10", "--token-file", stage + "/join-token"}},
 		{name: "downgrade allowed beside --from-staging", args: []string{"--user", "admin", "--from-staging", stage, "--allow-downgrade"}},
 		{name: "--allow-downgrade alone is refused", args: []string{"--user", "admin", "--allow-downgrade"}, want: "--allow-downgrade needs --from-staging"},
 		{name: "a relative --from-staging is refused", args: []string{"--user", "admin", "--from-staging", "k3sm.staging/x"}, want: "must be a clean absolute path"},
@@ -79,7 +79,7 @@ func TestInstallFromStagingFlags(t *testing.T) {
 func TestInstallEarlyRefusalDiscardsToken(t *testing.T) {
 	t.Parallel()
 	agent := func(extra ...string) []string {
-		return append([]string{"--agent", "--server", "192.168.0.50"}, extra...)
+		return append([]string{"--agent", "--server", "192.0.2.10"}, extra...)
 	}
 	cases := []struct {
 		name     string
@@ -95,7 +95,7 @@ func TestInstallEarlyRefusalDiscardsToken(t *testing.T) {
 		{name: "no human --user", staging: true, euid: 0, args: agent("--user", "root"), wantErr: "non-root human", wantGone: true},
 		{name: "the executable cannot be resolved", staging: true, euid: 0, exeErr: true, args: agent("--user", "admin"), wantErr: "no executable", wantGone: true},
 		{name: "a bad data-volume flag", staging: true, euid: 0, wantErr: "--data-volume-encrypt needs --data-volume", wantGone: true,
-			args: []string{"--user", "admin", "--server-join", "--server", "192.168.0.50", "--node-ip", "192.168.0.51", "--data-volume-encrypt"}},
+			args: []string{"--user", "admin", "--server-join", "--server", "192.0.2.10", "--node-ip", "192.0.2.11", "--data-volume-encrypt"}},
 		{name: "no refusal leaves the token for the install", staging: true, euid: 0, args: agent("--user", "admin")},
 		{name: "a plain --token-file is never discarded", euid: 501, args: agent("--user", "admin"), wantErr: "must run as root"},
 	}
