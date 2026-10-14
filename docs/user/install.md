@@ -153,7 +153,8 @@ from its own bundle as root: it copies the bundle into a new directory under
 - a `--token-file` sits directly inside the directory, owned by `root` with mode `600` and one
   link (it is removed as soon as it is read);
 - the version is a release version no older than the installed one;
-- on an update, the new `k3sm` is signed by the same Developer ID team as the installed one.
+- every program in the directory is signed with a Developer ID Application certificate from one
+  team, and on an update the installed `k3sm` is signed by that same team.
 
 Pass `--allow-downgrade` to install an older version on purpose (or over an install whose version
 cannot be read). A plain `sudo k3sm install` makes none of these checks and is unchanged.
@@ -332,6 +333,9 @@ installed a data volume, it stays mounted and declared; the command prints `sudo
 
 Uninstall also removes `/Library/k3sm.staging`, the directory the k3sm app copies itself into, and
 refuses to run while the app is in the middle of an install.
+If an upgrade by an older version of k3sm was interrupted, it can leave a `/Library/k3sm.staging`
+directory behind. Install never uses or removes it; `sudo k3sm uninstall` (no `--purge` needed)
+clears it, and a reinstall afterwards keeps your cluster data.
 
 ### Server Flags Across A Reinstall
 

@@ -17,6 +17,7 @@ limitations under the License.
 package install
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -110,13 +111,82 @@ func TestDarwinStagingFSOnDisk(t *testing.T) {
 	if v, err := sfs.BinaryVersion(self); err != nil || v == "" {
 		t.Errorf("BinaryVersion(test binary) = %q, %v, want a version string", v, err)
 	}
+	if ok, err := sfs.MachO(self); err != nil || !ok {
+		t.Errorf("MachO(test binary) = %v, %v, want true", ok, err)
+	}
+	if ok, err := sfs.MachO(token); err != nil || ok {
+		t.Errorf("MachO(text file) = %v, %v, want false", ok, err)
+	}
+	if _, err := sfs.MachO(link); err == nil {
+		t.Errorf("MachO followed a symlink")
+	}
+	short := filepath.Join(dir, "short")
+	if err := os.WriteFile(short, []byte{0xcf}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := sfs.MachO(short); err != nil || ok {
+		t.Errorf("MachO(one byte) = %v, %v, want false", ok, err)
+	}
+}
+
+// TestDiscardStagedTokenOnDisk runs the best-effort unlink against the real
+// seam in a scratch staging root: a regular file inside a direct child goes,
+// unread; a symlink in its place is left alone, and so is its target.
+func TestDiscardStagedTokenOnDisk(t *testing.T) {
+	t.Parallel()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, "k3sm.staging")
+	stage := filepath.Join(root, "0.4.0.AbCdEfGh")
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	token := filepath.Join(stage, "join-token")
+	if err := os.WriteFile(token, []byte("tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	DiscardStagedToken(NewDarwinStagingFS(), root, token)
+	if _, err := os.Lstat(token); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the token survived: %v", err)
+	}
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, token); err != nil {
+		t.Fatal(err)
+	}
+	DiscardStagedToken(NewDarwinStagingFS(), root, token)
+	if _, err := os.Lstat(token); err != nil {
+		t.Errorf("a symlink at the token path was removed: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("the symlink's target was touched: %v", err)
+	}
+}
+
+// TestMachOMagic pins the magic numbers.
+func TestMachOMagic(t *testing.T) {
+	t.Parallel()
+	for _, m := range [][4]byte{{0xcf, 0xfa, 0xed, 0xfe}, {0xfe, 0xed, 0xfa, 0xcf}, {0xce, 0xfa, 0xed, 0xfe}, {0xca, 0xfe, 0xba, 0xbe}, {0xca, 0xfe, 0xba, 0xbf}} {
+		if !isMachOMagic(m) {
+			t.Errorf("isMachOMagic(% x) = false", m)
+		}
+	}
+	for _, m := range [][4]byte{{'#', '!', '/', 'b'}, {'<', '?', 'x', 'm'}, {0, 0, 0, 0}} {
+		if isMachOMagic(m) {
+			t.Errorf("isMachOMagic(% x) = true", m)
+		}
+	}
 }
 
 // TestCodesignTeamIDMissing pins the absent-file contract without running
 // codesign on anything.
 func TestCodesignTeamIDMissing(t *testing.T) {
 	t.Parallel()
-	if _, err := (CodesignTeamID{}).TeamID(filepath.Join(t.TempDir(), "missing")); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := (CodesignTeamID{}).TeamID(context.Background(), filepath.Join(t.TempDir(), "missing")); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("TeamID(missing) = %v, want fs.ErrNotExist", err)
 	}
 }

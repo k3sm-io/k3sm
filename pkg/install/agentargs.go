@@ -257,7 +257,7 @@ func operatorJoinToken(sys System, cfg Config) (string, bootstrap.Token, error) 
 	if cfg.stagedToken != nil {
 		// An install from a k3sm.app staging directory already read the file,
 		// once and under stricter rules, and unlinked it (readStagedToken).
-		raw = []byte(*cfg.stagedToken)
+		raw = []byte(cfg.stagedToken.value)
 	} else {
 		var perm fs.FileMode
 		var err error

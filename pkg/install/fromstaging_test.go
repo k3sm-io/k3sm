@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"path/filepath"
 	"runtime/debug"
 	"slices"
@@ -36,6 +37,7 @@ type fakeStagingFS struct {
 	content  map[string][]byte
 	versions map[string]string
 	verErr   map[string]error
+	macho    map[string]bool
 	calls    []string
 }
 
@@ -110,13 +112,24 @@ func (f *fakeStagingFS) BinaryVersion(path string) (string, error) {
 	return "", fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 }
 
-// fakeSigner answers TeamID from a table; a path with no entry is absent.
-type fakeSigner struct {
-	ids  map[string]string
-	errs map[string]error
+func (f *fakeStagingFS) MachO(path string) (bool, error) {
+	f.calls = append(f.calls, "MachO:"+path)
+	return f.macho[path], nil
 }
 
-func (s fakeSigner) TeamID(path string) (string, error) {
+// fakeSigner answers TeamID from a table (a path with no entry is absent) and
+// DeveloperID true unless the path is in notDevID.
+type fakeSigner struct {
+	ids      map[string]string
+	errs     map[string]error
+	notDevID map[string]bool
+}
+
+func (s fakeSigner) DeveloperID(_ context.Context, path, _ string) (bool, error) {
+	return !s.notDevID[path], nil
+}
+
+func (s fakeSigner) TeamID(_ context.Context, path string) (string, error) {
 	if err := s.errs[path]; err != nil {
 		return "", err
 	}
@@ -138,6 +151,28 @@ const (
 	testTokenText = "K10" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" + "::node:SECRETMARKER"
 )
 
+// stagedMachOs are the Mach-O files of the fixture tree: the staged k3sm, its
+// helpers, a payload binary, and the app's own executable.
+func stagedMachOs() []string {
+	var out []string
+	for _, f := range []string{"k3sm", ExecShimName, PathShimName, DNSShimName, VMHostName, "bin/kine"} {
+		out = append(out, filepath.Join(testPayloadDir, f))
+	}
+	return append(out, testStagedApp+"/Contents/MacOS/k3sm")
+}
+
+// signedTree maps every fixture Mach-O to testTeamID, then applies over.
+func signedTree(over map[string]string) map[string]string {
+	ids := map[string]string{}
+	for _, f := range stagedMachOs() {
+		ids[f] = testTeamID
+	}
+	for k, v := range over {
+		ids[k] = v
+	}
+	return ids
+}
+
 // stagedFixture is a staging tree that passes the predicate, and the Config
 // that installs from it. Each test case breaks one thing.
 func stagedFixture() (*fakeStagingFS, Config) {
@@ -145,12 +180,16 @@ func stagedFixture() (*fakeStagingFS, Config) {
 	sfs.put("/Library", 0, 0, fs.ModeDir|0o755)
 	sfs.put(testStagingRoot, 0, 0, fs.ModeDir|0o700)
 	sfs.put(testStagedDir, 0, 0, fs.ModeDir|0o700)
-	for _, d := range []string{testStagedApp, testStagedApp + "/Contents", testStagedApp + "/Contents/Resources", testPayloadDir, testPayloadDir + "/bin"} {
+	for _, d := range []string{testStagedApp, testStagedApp + "/Contents", testStagedApp + "/Contents/MacOS", testStagedApp + "/Contents/Resources", testPayloadDir, testPayloadDir + "/bin"} {
 		sfs.put(d, 0, 0, fs.ModeDir|0o755)
 	}
-	for _, f := range []string{"k3sm", ExecShimName, PathShimName, DNSShimName, VMHostName, "bin/kine"} {
-		sfs.put(filepath.Join(testPayloadDir, f), 0, 0, 0o755)
+	sfs.macho = map[string]bool{}
+	for _, f := range stagedMachOs() {
+		sfs.put(f, 0, 0, 0o755)
+		sfs.macho[f] = true
 	}
+	// A plain file in the bundle is not a Mach-O and needs no signature.
+	sfs.put(testStagedApp+"/Contents/Info.plist", 0, 0, 0o644)
 	cfg := Config{
 		BinarySource: testStagedExe,
 		TargetUser:   "admin",
@@ -159,7 +198,7 @@ func stagedFixture() (*fakeStagingFS, Config) {
 			Executable:     testStagedExe,
 			StagedVersion:  "v0.4.0",
 			StagingFS:      sfs,
-			Signer:         fakeSigner{ids: map[string]string{testStagedExe: testTeamID}},
+			Signer:         fakeSigner{ids: signedTree(nil)},
 		},
 	}
 	return sfs, cfg.withDefaults()
@@ -242,7 +281,7 @@ func TestFromStagingRefusesOutsideStagingRoot(t *testing.T) {
 			t.Parallel()
 			sfs, cfg := stagedFixture()
 			tc.break_(sfs, &cfg)
-			err := preflightFromStaging(&cfg)
+			err := preflightFromStaging(context.Background(), &cfg)
 			if tc.want == "" {
 				if err != nil {
 					t.Fatalf("preflightFromStaging = %v, want the fixture accepted", err)
@@ -276,7 +315,7 @@ func TestFromStagingRefusesOutsideStagingRoot(t *testing.T) {
 		t.Parallel()
 		_, cfg := stagedFixture()
 		cfg.StagingFS = nil
-		if err := preflightFromStaging(&cfg); err == nil {
+		if err := preflightFromStaging(context.Background(), &cfg); err == nil {
 			t.Fatal("preflightFromStaging accepted a Config with no StagingFS")
 		}
 	})
@@ -330,7 +369,7 @@ func TestFromStagingTokenFileRules(t *testing.T) {
 				sfs.content[tc.path] = []byte(testTokenText + "\n")
 			}
 			cfg.TokenFile = tc.path
-			err := preflightFromStaging(&cfg)
+			err := preflightFromStaging(context.Background(), &cfg)
 			removed := slices.Contains(sfs.calls, "RemoveFile:"+tc.path)
 			if removed != tc.wantRemove {
 				t.Errorf("token file removed = %v, want %v (calls %v)", removed, tc.wantRemove, sfs.calls)
@@ -339,7 +378,7 @@ func TestFromStagingTokenFileRules(t *testing.T) {
 				if err != nil {
 					t.Fatalf("preflightFromStaging = %v, want accepted", err)
 				}
-				if cfg.stagedToken == nil || *cfg.stagedToken != testTokenText {
+				if cfg.stagedToken == nil || cfg.stagedToken.value != testTokenText {
 					t.Fatalf("staged token not carried on the Config")
 				}
 				read := idx(sfs.calls, "ReadTokenFile:"+tc.path)
@@ -367,8 +406,8 @@ func TestFromStagingTokenFileRules(t *testing.T) {
 		sfs.put(testTokenPath, 0, 0, 0o600)
 		sfs.content[testTokenPath] = []byte(testTokenText)
 		cfg.TokenFile = testTokenPath
-		cfg.Signer = fakeSigner{ids: map[string]string{testStagedExe: testTeamID, cfg.installedBinary(): "ZZZZZ99999"}}
-		if err := preflightFromStaging(&cfg); !errors.Is(err, ErrTeamIDMismatch) {
+		cfg.Signer = fakeSigner{ids: signedTree(map[string]string{cfg.installedBinary(): "ZZZZZ99999"})}
+		if err := preflightFromStaging(context.Background(), &cfg); !errors.Is(err, ErrTeamIDMismatch) {
 			t.Fatalf("preflightFromStaging = %v, want ErrTeamIDMismatch", err)
 		}
 		if _, ok := sfs.entries[testTokenPath]; ok {
@@ -384,7 +423,7 @@ func TestOperatorJoinTokenUsesTheStagedRead(t *testing.T) {
 	t.Parallel()
 	token := testTokenText
 	cfg := Config{TokenFile: testTokenPath, Role: RoleAgent}.withDefaults()
-	cfg.stagedToken = &token
+	cfg.stagedToken = &secretToken{value: token}
 	f := &fakeSystem{}
 	text, _, err := operatorJoinToken(f, cfg)
 	if err != nil {
@@ -445,12 +484,12 @@ func TestFromStagingDowngradeRefusal(t *testing.T) {
 			cfg.StagedVersion, cfg.AllowDowngrade = tc.staged, tc.allow
 			if tc.installed != "" {
 				sfs.versions[cfg.installedBinary()] = tc.installed
-				cfg.Signer = fakeSigner{ids: map[string]string{testStagedExe: testTeamID, cfg.installedBinary(): testTeamID}}
+				cfg.Signer = fakeSigner{ids: signedTree(map[string]string{cfg.installedBinary(): testTeamID})}
 			}
 			if tc.readErr != nil {
 				sfs.verErr[cfg.installedBinary()] = tc.readErr
 			}
-			err := preflightFromStaging(&cfg)
+			err := preflightFromStaging(context.Background(), &cfg)
 			if tc.want == nil {
 				if err != nil {
 					t.Fatalf("preflightFromStaging = %v, want accepted", err)
@@ -494,103 +533,69 @@ func TestReleaseVersionOrder(t *testing.T) {
 	}
 }
 
-// TestFromStagingTeamIDContinuity pins the signing continuity check: a first
-// install records the staged Team ID, an update needs the installed binary's
-// Team ID to match, and an ad-hoc or unsigned binary on either side refuses.
+// TestFromStagingTeamIDContinuity pins the signing continuity check: the
+// staged k3sm and every other Mach-O in the staged tree carry a Developer ID
+// Application signature from one team, an update needs the installed binary to
+// carry the same, and an ad-hoc, other-team or non-Developer ID signature
+// anywhere refuses. A non-Mach-O file needs no signature.
 func TestFromStagingTeamIDContinuity(t *testing.T) {
 	t.Parallel()
 	installed := Config{}.withDefaults().installedBinary()
+	helper := filepath.Join(testPayloadDir, VMHostName)
+	appExe := testStagedApp + "/Contents/MacOS/k3sm"
 	cases := []struct {
 		name   string
 		signer fakeSigner
 		want   error
 	}{
-		{name: "first install records the Team ID", signer: fakeSigner{ids: map[string]string{testStagedExe: testTeamID}}},
-		{name: "update by the same team", signer: fakeSigner{ids: map[string]string{testStagedExe: testTeamID, installed: testTeamID}}},
-		{name: "update by another team refused", want: ErrTeamIDMismatch,
-			signer: fakeSigner{ids: map[string]string{testStagedExe: testTeamID, installed: "ZZZZZ99999"}}},
+		{name: "first install", signer: fakeSigner{ids: signedTree(nil)}},
+		{name: "update by the same team", signer: fakeSigner{ids: signedTree(map[string]string{installed: testTeamID})}},
+		{name: "update over another team refused", want: ErrTeamIDMismatch,
+			signer: fakeSigner{ids: signedTree(map[string]string{installed: "ZZZZZ99999"})}},
 		{name: "ad-hoc installed binary refused", want: ErrTeamIDMismatch,
-			signer: fakeSigner{ids: map[string]string{testStagedExe: testTeamID}, errs: map[string]error{installed: ErrNoTeamID}}},
-		{name: "ad-hoc staged binary refused", want: ErrNoTeamID,
-			signer: fakeSigner{errs: map[string]error{testStagedExe: ErrNoTeamID}}},
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{installed: ErrNoTeamID}}},
+		{name: "installed binary signed Apple Development by the same team refused", want: ErrNotDeveloperID,
+			signer: fakeSigner{ids: signedTree(map[string]string{installed: testTeamID}), notDevID: map[string]bool{installed: true}}},
+		{name: "ad-hoc staged k3sm refused", want: ErrNoTeamID,
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{testStagedExe: ErrNoTeamID}}},
+		{name: "staged k3sm signed Apple Development by the same team refused", want: ErrNotDeveloperID,
+			signer: fakeSigner{ids: signedTree(nil), notDevID: map[string]bool{testStagedExe: true}}},
+		{name: "a helper signed by another team refused", want: ErrTeamIDMismatch,
+			signer: fakeSigner{ids: signedTree(map[string]string{helper: "ZZZZZ99999"})}},
+		{name: "an ad-hoc helper refused", want: ErrTeamIDMismatch,
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{helper: ErrNoTeamID}}},
+		{name: "a helper signed Apple Development by the same team refused", want: ErrNotDeveloperID,
+			signer: fakeSigner{ids: signedTree(nil), notDevID: map[string]bool{helper: true}}},
+		{name: "an unsigned Mach-O anywhere in the tree refused", want: ErrTeamIDMismatch,
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{appExe: ErrNoTeamID}}},
 		{name: "unreadable installed signature refused", want: errSignatureUnreadable,
-			signer: fakeSigner{ids: map[string]string{testStagedExe: testTeamID}, errs: map[string]error{installed: errSignatureUnreadable}}},
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{installed: errSignatureUnreadable}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, cfg := stagedFixture()
+			sfs, cfg := stagedFixture()
 			cfg.Signer = tc.signer
-			err := preflightFromStaging(&cfg)
+			err := preflightFromStaging(context.Background(), &cfg)
 			if tc.want != nil {
 				if !errors.Is(err, tc.want) {
 					t.Fatalf("preflightFromStaging = %v, want %v", err, tc.want)
-				}
-				if cfg.stagedTeamID != "" {
-					t.Errorf("a refused install carried Team ID %q forward", cfg.stagedTeamID)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("preflightFromStaging = %v, want accepted", err)
 			}
-			if cfg.stagedTeamID != testTeamID {
-				t.Fatalf("stagedTeamID = %q, want %q", cfg.stagedTeamID, testTeamID)
-			}
-			f := &fakeSystem{}
-			if err := recordTeamID(f, cfg); err != nil {
-				t.Fatalf("recordTeamID: %v", err)
-			}
-			want := fmt.Sprintf("WriteRootOnlyFile:%s:%#o", cfg.swapDir()+"/"+TeamIDRecordName, teamIDRecordMode)
-			if !slices.Contains(f.calls, want) {
-				t.Errorf("record not staged into the swap tree: %v, want %s", f.calls, want)
+			for _, f := range stagedMachOs() {
+				if f != testStagedExe && !slices.Contains(sfs.calls, "MachO:"+f) {
+					t.Errorf("%s was never checked for a Mach-O header", f)
+				}
 			}
 		})
 	}
-	t.Run("a plain install records nothing", func(t *testing.T) {
-		t.Parallel()
-		f := &fakeSystem{}
-		if err := recordTeamID(f, Config{}.withDefaults()); err != nil || len(f.calls) != 0 {
-			t.Errorf("recordTeamID on a plain install = %v, calls %v", err, f.calls)
-		}
-	})
 }
 
 var errSignatureUnreadable = errors.New("codesign failed")
-
-// TestParseTeamIdentifier pins the codesign output parsing.
-func TestParseTeamIdentifier(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name, out, want string
-		wantErr         error
-	}{
-		{name: "developer id", out: "Executable=/x/k3sm\nIdentifier=io.k3sm.k3sm\nAuthority=Developer ID Application: k3sm (ABCDE12345)\nTeamIdentifier=ABCDE12345\n", want: "ABCDE12345"},
-		{name: "ad-hoc", out: "Executable=/x/k3sm\nSignature=adhoc\nTeamIdentifier=not set\n", wantErr: ErrNoTeamID},
-		{name: "no line", out: "Executable=/x/k3sm\n", wantErr: ErrNoTeamID},
-		{name: "malformed", out: "TeamIdentifier=abc\n"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got, err := parseTeamIdentifier(tc.out)
-			switch {
-			case tc.want != "":
-				if err != nil || got != tc.want {
-					t.Fatalf("parseTeamIdentifier = %q, %v, want %q", got, err, tc.want)
-				}
-			case tc.wantErr != nil:
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("parseTeamIdentifier = %q, %v, want %v", got, err, tc.wantErr)
-				}
-			default:
-				if err == nil {
-					t.Fatalf("parseTeamIdentifier accepted %q", tc.out)
-				}
-			}
-		})
-	}
-}
 
 // TestStampedVersion pins how a binary's version is read from its build info.
 func TestStampedVersion(t *testing.T) {
@@ -796,6 +801,171 @@ func TestSweepStaging(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("sweepStaging = %v, want it to name %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestFromStagingEarlyRefusalUnlinksToken pins the token on the refusals that
+// come before it can be read: the staged directory failing its own checks,
+// and a --token-file that is not a direct child of the staged directory. The
+// file is unlinked, and never read, whenever it is a regular file inside a
+// direct child of the staging root.
+func TestFromStagingEarlyRefusalUnlinksToken(t *testing.T) {
+	t.Parallel()
+	other := testStagingRoot + "/0.3.0.ZzZzZzZz"
+	cases := []struct {
+		name       string
+		token      string
+		seed       func(*fakeStagingFS, *Config)
+		want       error
+		wantRemove bool
+	}{
+		{name: "the staged directory fails its own checks", token: testTokenPath, want: ErrStagingUntrusted, wantRemove: true,
+			seed: func(s *fakeStagingFS, _ *Config) { s.put(testStagedDir, 0, 0, fs.ModeDir|0o755) }},
+		{name: "the staged directory is outside the root", token: testTokenPath, want: ErrStagingUntrusted, wantRemove: true,
+			seed: func(_ *fakeStagingFS, c *Config) { c.FromStagingDir = "/Library/k3sm" }},
+		{name: "a token in another staged directory", token: other + "/join-token", want: ErrStagedTokenUntrusted, wantRemove: true,
+			seed: func(s *fakeStagingFS, _ *Config) { s.put(other, 0, 0, fs.ModeDir|0o700) }},
+		{name: "a token nested deeper is left alone", token: testStagedApp + "/join-token", want: ErrStagedTokenUntrusted},
+		{name: "a token outside the staging root is left alone", token: "/var/root/join-token", want: ErrStagedTokenUntrusted,
+			seed: func(s *fakeStagingFS, _ *Config) {
+				s.put("/var", 0, 0, fs.ModeDir|0o755)
+				s.put("/var/root", 0, 0, fs.ModeDir|0o750)
+			}},
+		{name: "a symlink at the token path is left alone", token: testTokenPath, want: ErrStagingUntrusted,
+			seed: func(s *fakeStagingFS, _ *Config) {
+				s.put(testStagedDir, 0, 0, fs.ModeDir|0o755)
+				s.put(testTokenPath, 0, 0, fs.ModeSymlink|0o777)
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			sfs, cfg := stagedFixture()
+			sfs.put(tc.token, 0, 0, 0o600)
+			sfs.content[tc.token] = []byte(testTokenText)
+			if tc.seed != nil {
+				tc.seed(sfs, &cfg)
+			}
+			cfg.TokenFile = tc.token
+			err := preflightFromStaging(context.Background(), &cfg)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("preflightFromStaging = %v, want %v", err, tc.want)
+			}
+			if slices.Contains(sfs.calls, "ReadTokenFile:"+tc.token) {
+				t.Errorf("an early refusal read the token: %v", sfs.calls)
+			}
+			removed := slices.Contains(sfs.calls, "RemoveFile:"+tc.token)
+			if removed != tc.wantRemove {
+				t.Errorf("token removed = %v, want %v (calls %v)", removed, tc.wantRemove, sfs.calls)
+			}
+		})
+	}
+}
+
+// TestSecretTokenRedacts pins that no print or log of the staged token, or of
+// a Config holding it, carries the token.
+func TestSecretTokenRedacts(t *testing.T) {
+	t.Parallel()
+	tok := &secretToken{value: testTokenText}
+	cfg := Config{StagingOptions: StagingOptions{stagedToken: tok}}
+	var buf strings.Builder
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	logger.Info("dump", "token", tok, "value", *tok, "cfg", cfg)
+	logger.Info("text", "cfg", fmt.Sprintf("%+v", cfg))
+	outs := []string{
+		fmt.Sprint(tok), fmt.Sprintf("%v %+v %#v %s %q %x", *tok, *tok, *tok, *tok, *tok, *tok),
+		fmt.Sprintf("%v %+v %#v", cfg, cfg, cfg), buf.String(),
+	}
+	for _, out := range outs {
+		if strings.Contains(out, "SECRETMARKER") {
+			t.Errorf("the token leaked: %s", out)
+		}
+	}
+	if !strings.Contains(fmt.Sprint(*tok), redacted) {
+		t.Errorf("the token does not print as the redaction")
+	}
+}
+
+// TestOldNameSwapTreeIsOnlyRemovedByUninstall pins the rename's migration: a
+// tree an older build left at <InstallDir>.staging is neither trusted, reused
+// nor removed by an install or an update, and uninstall's staging sweep is
+// what removes it.
+func TestOldNameSwapTreeIsOnlyRemovedByUninstall(t *testing.T) {
+	shrinkRestartBudgets(t)
+	tmp := t.TempDir()
+	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", InstallDir: filepath.Join(tmp, "k3sm")}
+	old := cfg.InstallDir + ".staging"
+	f := &fakeSystem{}
+	f.putOwned(old, 0, 0, fs.ModeDir|0o755, EntryDir)
+	f.putFile(old+"/k3sm", []byte("an older build"))
+	for _, run := range []string{"install", "update"} {
+		f.calls = nil
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("%s: %v", run, err)
+		}
+		for _, c := range f.calls {
+			if strings.Contains(c, old) {
+				t.Errorf("%s touched the old-name swap tree: %s", run, c)
+			}
+		}
+		if _, ok := f.owners[old]; !ok {
+			t.Fatalf("%s removed the old-name swap tree", run)
+		}
+	}
+	f.calls = nil
+	if err := Uninstall(context.Background(), f, cfg); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	if !slices.Contains(f.calls, "RemoveTree:"+old) {
+		t.Errorf("uninstall did not sweep the old-name swap tree: %v", f.calls)
+	}
+}
+
+// TestDiscardStagedToken pins where the best-effort unlink acts: only on a
+// regular file inside a direct child of the staging root, with no symlink on
+// the way, and never by reading it.
+func TestDiscardStagedToken(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		path       string
+		seed       func(*fakeStagingFS)
+		wantRemove bool
+	}{
+		{name: "a regular file in a staged directory", path: testTokenPath, wantRemove: true,
+			seed: func(s *fakeStagingFS) { s.put(testTokenPath, 0, 0, 0o600) }},
+		{name: "a symlink", path: testTokenPath, seed: func(s *fakeStagingFS) { s.put(testTokenPath, 0, 0, fs.ModeSymlink|0o777) }},
+		{name: "a directory", path: testTokenPath, seed: func(s *fakeStagingFS) { s.put(testTokenPath, 0, 0, fs.ModeDir|0o700) }},
+		{name: "absent", path: testTokenPath, seed: func(*fakeStagingFS) {}},
+		{name: "nested deeper", path: testStagedApp + "/join-token", seed: func(s *fakeStagingFS) { s.put(testStagedApp+"/join-token", 0, 0, 0o600) }},
+		{name: "directly in the root", path: testStagingRoot + "/join-token", seed: func(s *fakeStagingFS) { s.put(testStagingRoot+"/join-token", 0, 0, 0o600) }},
+		{name: "outside the root", path: "/Library/join-token", seed: func(s *fakeStagingFS) { s.put("/Library/join-token", 0, 0, 0o600) }},
+		{name: "a relative path", path: "join-token", seed: func(*fakeStagingFS) {}},
+		{name: "the staging root is a symlink", path: testTokenPath, seed: func(s *fakeStagingFS) {
+			s.put(testTokenPath, 0, 0, 0o600)
+			s.put(testStagingRoot, 0, 0, fs.ModeSymlink|0o755)
+		}},
+		{name: "the staged directory is a symlink", path: testTokenPath, seed: func(s *fakeStagingFS) {
+			s.put(testTokenPath, 0, 0, 0o600)
+			s.put(testStagedDir, 0, 0, fs.ModeSymlink|0o755)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			sfs, _ := stagedFixture()
+			tc.seed(sfs)
+			DiscardStagedToken(sfs, testStagingRoot, tc.path)
+			removed := slices.Contains(sfs.calls, "RemoveFile:"+tc.path)
+			if removed != tc.wantRemove {
+				t.Errorf("removed = %v, want %v (calls %v)", removed, tc.wantRemove, sfs.calls)
+			}
+			for _, c := range sfs.calls {
+				if strings.HasPrefix(c, "ReadTokenFile:") {
+					t.Errorf("the discard read the file: %s", c)
+				}
 			}
 		})
 	}

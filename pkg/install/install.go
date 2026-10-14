@@ -1850,7 +1850,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// verification: it is what separates a failure THIS install caused from one
 	// the machine was already living with (see verifyServerNotParked).
 	startedAt := time.Now()
-	if err := preflightFromStaging(&cfg); err != nil {
+	if err := preflightFromStaging(ctx, &cfg); err != nil {
 		return err
 	}
 	if cfg.BinarySource == "" {
@@ -2260,9 +2260,6 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//      can therefore only fail on an I/O error, not on the entitlement.
 	if err := sys.CopyToRootOwned(cfg.VMHostSource, cfg.stagedVMHost()); err != nil {
 		return fmt.Errorf("install: copy k3sm-vmhost to %s: %w (build k3sm.io/runtimed/cmd/k3sm-vmhost, ad-hoc sign it with the com.apple.security.virtualization entitlement, and place it next to the k3sm binary — vm-RuntimeClass pods cannot boot without it)", cfg.stagedVMHost(), err)
-	}
-	if err := recordTeamID(sys, cfg); err != nil {
-		return err
 	}
 	// 2c. Stage the control-plane payload into InstallDir/bin. Fail fast when a
 	//     payload binary is absent: the daemon boot otherwise falls back to

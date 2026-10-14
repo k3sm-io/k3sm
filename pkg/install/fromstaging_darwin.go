@@ -17,19 +17,19 @@ limitations under the License.
 package install
 
 import (
-	"bytes"
+	"context"
 	"debug/buildinfo"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/k3sm/internal/binsign"
 )
 
 // maxStagedTokenBytes bounds the staged token read. A join token is well under
@@ -153,35 +153,63 @@ func (DarwinStagingFS) BinaryVersion(path string) (string, error) {
 	return stampedVersion(bi), nil
 }
 
-// CodesignTeamID is the real TeamIDReader. It verifies the signature with
-// `codesign --verify --strict` and reads the TeamIdentifier from `codesign
-// -dv --verbose=2`. It never signs anything.
-type CodesignTeamID struct{}
+// MachO reports whether the regular file at path starts with a Mach-O magic
+// number (thin, either byte order, 32- or 64-bit) or a universal-binary one.
+// It opens path with O_NOFOLLOW and reads four bytes. A file shorter than
+// that is not a Mach-O.
+func (DarwinStagingFS) MachO(path string) (bool, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer func() { _ = f.Close() }() // read-only; nothing to flush
+	var magic [4]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read %s: %w", path, err)
+	}
+	return isMachOMagic(magic), nil
+}
+
+// CodesignTeamID is the real TeamIDReader, over internal/binsign's codesign
+// inspector: TeamID reads a valid identity signature's Team ID, and
+// DeveloperID checks the binary against binsign's Developer ID Application
+// requirement. It never signs anything. The zero value is usable.
+type CodesignTeamID struct {
+	// Inspector runs codesign; the zero value runs the system tool by path.
+	Inspector binsign.CodesignInspector
+}
 
 // TeamID returns path's signing Team ID.
-func (CodesignTeamID) TeamID(path string) (string, error) {
+func (c CodesignTeamID) TeamID(ctx context.Context, path string) (string, error) {
 	if _, err := os.Lstat(path); err != nil {
 		return "", err
 	}
-	var verifyErr bytes.Buffer
-	verify := exec.Command("/usr/bin/codesign", "--verify", "--strict", path)
-	verify.Stderr = &verifyErr
-	if err := verify.Run(); err != nil {
-		if strings.Contains(verifyErr.String(), "not signed at all") {
-			return "", fmt.Errorf("%s: %w", path, ErrNoTeamID)
-		}
-		return "", fmt.Errorf("codesign --verify --strict %s: %w: %s", path, err, strings.TrimSpace(verifyErr.String()))
-	}
-	var out bytes.Buffer
-	display := exec.Command("/usr/bin/codesign", "-dv", "--verbose=2", path)
-	display.Stderr = &out
-	display.Stdout = &out
-	if err := display.Run(); err != nil {
-		return "", fmt.Errorf("codesign -dv %s: %w: %s", path, err, strings.TrimSpace(out.String()))
-	}
-	id, err := parseTeamIdentifier(out.String())
+	sig, err := c.Inspector.Inspect(ctx, path)
 	if err != nil {
-		return "", fmt.Errorf("%s: %w", path, err)
+		return "", fmt.Errorf("inspect the signature of %s: %w", path, err)
 	}
-	return id, nil
+	if !sig.IdentitySigned() || sig.TeamID == "" {
+		return "", fmt.Errorf("%s: %w", path, ErrNoTeamID)
+	}
+	if !binsign.ValidTeamID(sig.TeamID) {
+		return "", fmt.Errorf("%s: codesign reported TeamIdentifier %q, which is not a Team ID", path, sig.TeamID)
+	}
+	return sig.TeamID, nil
+}
+
+// DeveloperID reports whether path verifies against the Developer ID
+// Application requirement for teamID: an Apple-anchored chain through the
+// Developer ID intermediate to a Developer ID Application leaf issued to that
+// team. An Apple Development or Mac App Store signature from the same team
+// fails it.
+func (c CodesignTeamID) DeveloperID(ctx context.Context, path, teamID string) (bool, error) {
+	req, err := binsign.DeveloperIDRequirement(teamID)
+	if err != nil {
+		return false, err
+	}
+	return c.Inspector.Satisfies(ctx, path, req)
 }
