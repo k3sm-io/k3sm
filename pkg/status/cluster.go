@@ -18,6 +18,7 @@ package status
 
 import (
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,8 +44,10 @@ type Worker struct {
 	Role dataroot.Role `json:"role"`
 	// Version is Node.Status.NodeInfo.KubeletVersion as the node reports it:
 	// the Kubernetes version with the k3sm release as semver build metadata
-	// (version.Info.NodeVersion), for example v1.36.2+k3sm.0.1.7.
-	Version string `json:"version"`
+	// (version.Info.NodeVersion), for example v1.36.2+k3sm.0.1.7. It is the
+	// node's own claim, not an attestation, and it is omitted while the
+	// kubelet has reported none: a reader treats a missing version as unknown.
+	Version string `json:"version,omitempty"`
 }
 
 // workers lists every node of nodes except this Mac's own, sorted by name.
@@ -53,21 +56,20 @@ type Worker struct {
 // key is omitted) means "not known", and a pointer to an empty slice (encoded
 // as []) means the read succeeded and this server has no other nodes. It is
 // nil on an agent, when the node list was not read (no client, an apiserver
-// that is not serving), when the read failed, and when this Mac's own node
-// cannot be picked out of a non-empty list, because a list that might include
-// this server itself is not a list of the others.
+// that is not serving), when the read failed, and whenever this Mac's own node
+// is not in the list BY NAME. It deliberately does not use PickNode's
+// single-node fallback: a lone node that does not carry this Mac's name may be
+// another Mac's, and reporting "no other nodes" then would be a false success
+// an update client acts on.
 func (c Collector) workers(role dataroot.Role, read bool, nodes []corev1.Node, nodesErr error) *[]Worker {
 	if role == dataroot.RoleAgent || !read || nodesErr != nil {
 		return nil
 	}
-	out := []Worker{}
-	if len(nodes) == 0 {
-		return &out
-	}
-	mine, ok := PickNode(nodes, c.Hostname)
+	mine, ok := matchNodeByName(nodes, c.Hostname)
 	if !ok {
 		return nil
 	}
+	out := []Worker{}
 	for i := range nodes {
 		n := &nodes[i]
 		if n.Name == mine.Name {
@@ -89,8 +91,8 @@ func (c Collector) workers(role dataroot.Role, read bool, nodes []corev1.Node, n
 // The host comes from the AgentJoinServer seam, which returns ONLY the --server
 // value of the installed agent's argv; no other argument (the token-file path
 // among them) ever reaches this function. The port is the fixed bootstrap port
-// the join dials. A value that is not a bare host is refused rather than
-// reported, so a malformed argv never reaches the JSON.
+// the join dials. Only a host joinHostValid accepts is reported, so a malformed
+// argv never reaches the JSON.
 func (c Collector) joinTarget(role dataroot.Role) string {
 	if role != dataroot.RoleAgent || c.AgentJoinServer == nil {
 		return ""
@@ -99,12 +101,43 @@ func (c Collector) joinTarget(role dataroot.Role) string {
 	if err != nil {
 		return ""
 	}
-	host = strings.TrimSpace(host)
-	if host == "" || strings.ContainsAny(host, " \t/@[]") {
+	if !joinHostValid(host) {
 		return ""
 	}
-	if _, _, err := net.SplitHostPort(host); err == nil {
-		return "" // already carries a port: not the bare host the join dials
-	}
 	return net.JoinHostPort(host, strconv.Itoa(install.JoinBootstrapPort))
+}
+
+// maxHostLen is the longest DNS name, in its dotted text form.
+const maxHostLen = 253
+
+// joinHostValid reports whether host is one this report will print as a join
+// target: an IPv4 address, or a DNS name of letters, digits, '-' and '.' with
+// no empty label, no label over 63 bytes, no label that starts or ends with
+// '-', and not made of digits and dots alone. Everything else is refused,
+// which covers control characters, spaces, '?', '#', '/', '@', a value that
+// already carries a port, and IPv6 literals (the join's own preflight accepts
+// those, but the report keeps one strict shape rather than a second address
+// grammar).
+func joinHostValid(host string) bool {
+	if host == "" || len(host) > maxHostLen {
+		return false
+	}
+	if a, err := netip.ParseAddr(host); err == nil {
+		return a.Is4()
+	}
+	if strings.Trim(host, "0123456789.") == "" {
+		return false // dotted digits that are not an IPv4 address
+	}
+	for _, label := range strings.Split(strings.TrimSuffix(host, "."), ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			ch := label[i]
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }

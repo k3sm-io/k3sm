@@ -749,6 +749,20 @@ func PickNode(nodes []corev1.Node, hostname string) (corev1.Node, bool) {
 	if len(nodes) == 0 {
 		return corev1.Node{}, false
 	}
+	if n, ok := matchNodeByName(nodes, hostname); ok {
+		return n, true
+	}
+	if len(nodes) == 1 {
+		return nodes[0], true
+	}
+	return corev1.Node{}, false
+}
+
+// matchNodeByName is PickNode's name match alone: the node named after this
+// Mac's short host name, or one whose name ends in "-<short name>". It has no
+// single-node fallback, so a caller that must not mistake another Mac's node
+// for this one (Collector.workers) can fail closed.
+func matchNodeByName(nodes []corev1.Node, hostname string) (corev1.Node, bool) {
 	short := strings.ToLower(strings.TrimSpace(hostname))
 	if i := strings.IndexByte(short, '.'); i > 0 {
 		short = short[:i]
@@ -764,9 +778,6 @@ func PickNode(nodes []corev1.Node, hostname string) (corev1.Node, bool) {
 				return nodes[i], true
 			}
 		}
-	}
-	if len(nodes) == 1 {
-		return nodes[0], true
 	}
 	return corev1.Node{}, false
 }

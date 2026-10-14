@@ -251,16 +251,20 @@ the `node` row reads:
 |---|---|---|
 | `name` | string | the node's name |
 | `role` | string | `server` when the node carries the `node-role.kubernetes.io/control-plane` label, `agent` otherwise |
-| `version` | string | the kubelet version the node reports: the Kubernetes version, then `+k3sm.` and the k3sm release as semver build metadata |
+| `version` | string | the kubelet version the node reports: the Kubernetes version, then `+k3sm.` and the k3sm release as semver build metadata; omitted while the node has reported none |
 
 A node cannot set the `node-role.kubernetes.io/control-plane` label on itself; only a cluster admin
 can. k3sm does not set it, so in a cluster with more than one server the other servers report `agent`
 unless an admin has labelled them.
 
-An empty list means the server read its nodes and there are no others. A missing `workers` means
-the answer is unknown: this Mac is a worker, the apiserver did not answer, the node list could not be
-read, or this server could not find its own node in the list. Readers must not treat a missing
-`workers` as "no workers".
+`version` is the node's own report of its kubelet version. It is advisory, not an attestation: the
+node writes it, and nothing verifies it against the binary the node runs. A missing `version` means
+unknown, and a reader comparing versions must treat it as not satisfying any minimum.
+
+An empty list means the server read its nodes, found its own node by name, and there are no others.
+A missing `workers` means the answer is unknown: this Mac is a worker, the apiserver did not answer,
+the node list could not be read, or no node in the list carries this server's name (even when the
+list holds a single node). Readers must not treat a missing `workers` as "no workers".
 
 On a worker, `joinTarget` is the bootstrap endpoint of the server this Mac was installed to join, as
 `host:port`:
@@ -270,8 +274,10 @@ On a worker, `joinTarget` is the bootstrap endpoint of the server this Mac was i
 ```
 
 It is the `--server` host of the installed worker daemon with the join port, and nothing else from
-that daemon's arguments. It is omitted on a server, and on a worker whose daemon configuration cannot
-be read.
+that daemon's arguments. The host is reported only when it is an IPv4 address or a DNS name made of
+letters, digits, `-` and `.`, at most 253 characters long. `joinTarget` is omitted on a server, on a
+worker whose daemon configuration cannot be read, and when the `--server` value is anything else:
+an IPv6 address, a value that already carries a port, or one with any other character.
 
 ## Interconnect
 

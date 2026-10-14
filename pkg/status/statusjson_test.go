@@ -50,8 +50,11 @@ var (
 	// -o json`. The optional ones are omitted when empty.
 	reportRequired = []string{"schemaVersion", "verdict", "role", "summary", "rows", "version", "host", "timestamp"}
 	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy", "network", "workers", "joinTarget"}
-	// workerRequired are the keys of each entry of the optional workers list.
-	workerRequired = []string{"name", "role", "version"}
+	// workerRequired and workerOptional are the keys of each entry of the
+	// optional workers list; version is omitted while a kubelet has reported
+	// none.
+	workerRequired = []string{"name", "role"}
+	workerOptional = []string{"version"}
 	// networkRequired are the keys of the optional network object.
 	networkRequired = []string{"lan", "recorded", "covers", "alwaysOn"}
 	// networkOptional are the optional keys of the network object.
@@ -428,7 +431,7 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			{reflect.TypeOf(NetworkApplied{}), sortedUnion(networkAppliedRequired, networkAppliedOptional)},
 			{reflect.TypeOf(Row{}), sortedUnion(rowRequired, rowOptional)},
 			{reflect.TypeOf(PeerStatus{}), sortedUnion(peerRequired)},
-			{reflect.TypeOf(Worker{}), sortedUnion(workerRequired)},
+			{reflect.TypeOf(Worker{}), sortedUnion(workerRequired, workerOptional)},
 			{reflect.TypeOf(Interconnect{}), sortedUnion(interconnectRequired, interconnectOptional)},
 			{reflect.TypeOf(InterconnectPod{}), sortedUnion(interconnectPodRequired)},
 			{reflect.TypeOf(version.Info{}), sortedUnion(versionRequired, versionOptional)},
@@ -480,7 +483,7 @@ func TestStatusJSONContractGolden(t *testing.T) {
 					t.Errorf("%s workers is %T, want an array", fullPath, ws)
 				}
 				for i, w := range list {
-					checkKeys(t, fmt.Sprintf("%s workers[%d]", fullPath, i), w, workerRequired, nil, nil)
+					checkKeys(t, fmt.Sprintf("%s workers[%d]", fullPath, i), w, workerRequired, workerOptional, nil)
 					if role, _ := w.(map[string]any)["role"].(string); !contains(contractRoles, role) {
 						t.Errorf("%s workers[%d] role %q is outside the contract", fullPath, i, role)
 					}

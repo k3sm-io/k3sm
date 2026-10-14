@@ -156,6 +156,37 @@ func TestStatusReportsWorkerVersionsAndJoinTarget(t *testing.T) {
 		}
 	})
 
+	for name, nodes := range map[string][]corev1.Node{
+		// PickNode's single-node fallback would call this node "mine" and
+		// report no workers; workers must not.
+		"a single node that is not this Mac's": {workerNode("node-a", "v1.36.2+k3sm.0.1.7")},
+		"an empty node list":                   {},
+	} {
+		t.Run(name+": workers is absent, never empty", func(t *testing.T) {
+			t.Parallel()
+			kube := healthyKube()
+			kube.nodes = nodes
+			rep := serverWith(t, kube).Collect(context.Background())
+			if rep.Workers != nil {
+				t.Fatalf("workers = %+v, want absent when this server's own node is not in the list by name", *rep.Workers)
+			}
+		})
+	}
+
+	t.Run("a worker that has reported no version omits the key", func(t *testing.T) {
+		t.Parallel()
+		kube := healthyKube()
+		kube.nodes = append(kube.nodes, workerNode("node-a", ""))
+		rep := serverWith(t, kube).Collect(context.Background())
+		want := []Worker{{Name: "node-a", Role: dataroot.RoleAgent}}
+		if rep.Workers == nil || !reflect.DeepEqual(*rep.Workers, want) {
+			t.Fatalf("workers = %+v, want %+v", deref(rep.Workers), want)
+		}
+		if raw := marshal(t, rep); !strings.Contains(raw, `"workers":[{"name":"node-a","role":"agent"}]`) {
+			t.Errorf("JSON does not omit the missing version: %s", raw)
+		}
+	})
+
 	t.Run("own node not identifiable: workers is absent", func(t *testing.T) {
 		t.Parallel()
 		kube := healthyKube()
@@ -200,12 +231,21 @@ func TestStatusReportsWorkerVersionsAndJoinTarget(t *testing.T) {
 		}
 	})
 
-	t.Run("agent joinTarget brackets an IPv6 host", func(t *testing.T) {
+	t.Run("agent joinTarget accepts a DNS name", func(t *testing.T) {
+		t.Parallel()
+		sys := agentPlistSystem("k3sm-server.example.com")
+		rep := agent(t, func() (string, error) { return install.AgentJoinServer(sys, install.Config{}) }).Collect(context.Background())
+		if rep.JoinTarget != "k3sm-server.example.com:9345" {
+			t.Fatalf("joinTarget = %q, want k3sm-server.example.com:9345", rep.JoinTarget)
+		}
+	})
+
+	t.Run("an IPv6 --server in a real plist leaves joinTarget absent", func(t *testing.T) {
 		t.Parallel()
 		sys := agentPlistSystem("2001:db8::10")
 		rep := agent(t, func() (string, error) { return install.AgentJoinServer(sys, install.Config{}) }).Collect(context.Background())
-		if rep.JoinTarget != "[2001:db8::10]:9345" {
-			t.Fatalf("joinTarget = %q", rep.JoinTarget)
+		if rep.JoinTarget != "" {
+			t.Fatalf("joinTarget = %q, want absent for an IPv6 literal", rep.JoinTarget)
 		}
 	})
 
@@ -215,7 +255,26 @@ func TestStatusReportsWorkerVersionsAndJoinTarget(t *testing.T) {
 		},
 		"unreadable":                         func() (string, error) { return "", os.ErrPermission },
 		"a host that already carries a port": func() (string, error) { return "192.0.2.10:6443", nil },
+		"a name that already carries a port": func() (string, error) { return "server.example.com:9345", nil },
 		"not a bare host":                    func() (string, error) { return "https://192.0.2.10", nil },
+		"an IPv6 literal":                    func() (string, error) { return "2001:db8::10", nil },
+		"a bracketed IPv6 literal":           func() (string, error) { return "[2001:db8::10]", nil },
+		"an IPv4-mapped IPv6 literal":        func() (string, error) { return "::ffff:192.0.2.10", nil },
+		"a query character":                  func() (string, error) { return "server.example.com?x", nil },
+		"a fragment character":               func() (string, error) { return "server.example.com#x", nil },
+		"a NUL":                              func() (string, error) { return "server\x00.example.com", nil },
+		"a newline":                          func() (string, error) { return "server.example.com\nX-Injected: 1", nil },
+		"an escape sequence":                 func() (string, error) { return "server\x1b[31m.example.com", nil },
+		"a space":                            func() (string, error) { return "server example.com", nil },
+		"userinfo":                           func() (string, error) { return "user@server.example.com", nil },
+		"an empty label":                     func() (string, error) { return "server..example.com", nil },
+		"a label starting with a hyphen":     func() (string, error) { return "-server.example.com", nil },
+		"a label over 63 bytes":              func() (string, error) { return strings.Repeat("a", 64) + ".example.com", nil },
+		"a name over 253 bytes":              func() (string, error) { return strings.Repeat("a.", 127), nil },
+		"dotted digits that are not IPv4":    func() (string, error) { return "192.0.2", nil },
+		"an IPv4 octet out of range":         func() (string, error) { return "192.0.2.256", nil },
+		"non-ASCII":                          func() (string, error) { return "sérver.example.com", nil },
+		"empty":                              func() (string, error) { return "", nil },
 	} {
 		t.Run("agent joinTarget is absent: "+name, func(t *testing.T) {
 			t.Parallel()
