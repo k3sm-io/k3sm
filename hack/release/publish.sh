@@ -189,7 +189,8 @@ tree_manifest_problems() {
 		diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed -n 's/^\([<>]\)/      \1/p'
 		problems=1
 	fi
-	while IFS= read -r line; do
+	# `|| [ -n "$line" ]` keeps a last line that has no trailing newline.
+	while IFS= read -r line || [ -n "$line" ]; do
 		case "$line" in '#'* | '') continue ;; esac
 		sum="${line%%  *}"
 		rel="${line#*  }"
@@ -239,7 +240,7 @@ entitlement_problems() {
 # entitlements and apply entitlement_problems to each.
 entitlements_problems() {
 	local tree="$1" line rel xml rc=0 seen=0
-	while IFS= read -r line; do
+	while IFS= read -r line || [ -n "$line" ]; do
 		case "$line" in '#'* | '') continue ;; esac
 		rel="${line#*  }"
 		case "$(file -b "$tree/$rel")" in *Mach-O*) ;; *) continue ;; esac
@@ -941,6 +942,21 @@ EOF
 		ok "a stage tree changed after packaging refuses before any upload"
 	else
 		bad "late tree change (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	# A manifest whose last line has no trailing newline still has that line
+	# checked: an edited last file refuses.
+	E="$T/eol"; mkdir -p "$E"
+	printf 'first\n' >"$E/a"; printf 'last\n' >"$E/b"
+	printf '%s  a\n%s  b' "$(sha256_of "$E/a")" "$(sha256_of "$E/b")" >"$T/eol.manifest"
+	if tree_manifest_problems "$E" "$T/eol.manifest" >/dev/null 2>&1; then
+		printf 'edited\n' >"$E/b"
+		if ! tree_manifest_problems "$E" "$T/eol.manifest" >/dev/null 2>&1; then
+			ok "a manifest without a trailing newline still checks its last file"
+		else
+			bad "an edited last file passed a manifest without a trailing newline"
+		fi
+	else
+		bad "an untouched tree failed a manifest without a trailing newline"
 	fi
 
 	# ---- entitlements, against canned codesign output ----
