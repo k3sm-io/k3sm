@@ -98,8 +98,9 @@
 #
 # THE DISK IMAGE (--upload --disk-image). The file is copied into the assets
 # directory and that copy is what is checked, hashed and uploaded:
-#   - its basename is exactly k3sm_<version>_darwin_arm64.dmg (no other extra
-#     asset is accepted)
+#   - its basename is exactly k3sm_<version>_darwin_arm64.dmg, checked before
+#     anything else (no other extra asset is accepted, and --disk-image is
+#     given at most once)
 #   - xcrun stapler validate, and spctl -a -t open
 #     --context context:primary-signature, accept the image
 #   - hdiutil attach -readonly -nobrowse at a private mount point, detached on
@@ -107,6 +108,7 @@
 #     symlink to /Applications
 #   - k3sm.app/Contents/Resources/payload holds exactly the files
 #     PAYLOAD-SHA256 lists, with its hashes, and the manifest itself, unchanged
+#     (no .DS_Store, no symlink)
 #   - CFBundleShortVersionString equals the tag's version
 #   - codesign --verify --strict --deep against the Developer ID Application
 #     requirement for the Team ID, and xcrun stapler validate, accept the app
@@ -268,7 +270,8 @@ package_assets() {
 # expected_assets <tag> <assetdir>: the asset names a complete draft carries,
 # read from the local checksums file, plus that file itself.
 expected_assets() {
-	local sums="$2/$(checksums_name "$1")"
+	local sums
+	sums="$2/$(checksums_name "$1")"
 	[ -f "$sums" ] || return 1
 	{ sed 's/^[0-9a-f]*  //' "$sums"; checksums_name "$1"; echo; } | sed '/^$/d' | LC_ALL=C sort
 }
@@ -425,7 +428,7 @@ reset_checksums() {
 	local tag="$1" dir="$2" sums img
 	sums="$dir/$(checksums_name "$tag")"
 	img="$(image_name "$tag")"
-	awk -v f="$img" '$2 != f' "$sums" >"$sums.tmp" && mv "$sums.tmp" "$sums" || die "could not rewrite $sums"
+	if ! { awk -v f="$img" '$2 != f' "$sums" >"$sums.tmp" && mv "$sums.tmp" "$sums"; }; then die "could not rewrite $sums"; fi
 	rm -f "$dir/$img"
 }
 
@@ -511,6 +514,10 @@ image_root_problems() {
 	else
 		cmp -s "$payload/PAYLOAD-SHA256" "$manifest" ||
 			{ echo "    the app's payload/PAYLOAD-SHA256 differs from the stage tree's manifest"; rc=1; }
+		# tree_manifest_problems tolerates a Finder .DS_Store in a stage tree; the
+		# app's payload is a sealed copy and must hold exactly the manifest's files.
+		[ -z "$(find "$payload" -name .DS_Store | head -1)" ] ||
+			{ echo "    k3sm.app's payload holds a .DS_Store"; rc=1; }
 		tree_manifest_problems "$payload" "$manifest" || rc=1
 	fi
 	v="$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist" 2>/dev/null || true)"
@@ -562,13 +569,13 @@ disk_image_problems() {
 add_disk_image() {
 	local src="$1" tag="$2" team="$3" manifest="$4" dir="$5" name problems
 	name="$(image_name "$tag")"
-	[ "$(basename "$src")" = "$name" ] ||
-		refuse image-name "the disk image must be named exactly $name, not $(basename "$src"); nothing was uploaded."
+	check_image_name "$src" "$tag"
 	if [ -L "$src" ] || [ ! -f "$src" ]; then die "--disk-image $src is not a regular file"; fi
 	[ ! "$src" -ef "$dir/$name" ] || die "pass the disk image from outside $dir"
 	[ ! -e "$dir/$name" ] || die "$dir/$name already exists"
-	cp "$src" "$dir/$name.tmp" && mv "$dir/$name.tmp" "$dir/$name" && chmod 644 "$dir/$name" ||
+	if ! { cp "$src" "$dir/$name.tmp" && mv "$dir/$name.tmp" "$dir/$name" && chmod 644 "$dir/$name"; }; then
 		die "could not copy the disk image into $dir"
+	fi
 	if ! problems="$(disk_image_problems "$dir/$name" "$tag" "$team" "$manifest")"; then
 		printf '%s\n' "$problems" >&2
 		rm -f "$dir/$name"
@@ -576,6 +583,32 @@ add_disk_image() {
 	fi
 	printf '%s  %s\n' "$(sha256_of "$dir/$name")" "$name" >>"$dir/$(checksums_name "$tag")" ||
 		die "could not append the disk image to the checksums file"
+}
+
+# check_image_name <file> <tag>: the closed name, checked before anything else.
+check_image_name() {
+	local name
+	name="$(image_name "$2")"
+	[ "$(basename "$1")" = "$name" ] ||
+		refuse image-name "the disk image must be named exactly $name, not $(basename "$1"); nothing was uploaded."
+}
+
+# run_upload <repo-dir> <ref> <tag> <team> <stage-tree> <repo> <notes> [image]:
+# the whole --upload phase. <ref> is refs/tags/<tag> outside the self-test.
+run_upload() {
+	local rdir="$1" ref="$2" tag="$3" team="$4" tree="$5" repo="$6" notes="$7" img="${8:-}" assets count=3
+	assets="$tree.assets"
+	[ -z "$img" ] || check_image_name "$img" "$tag"
+	echo "==> check the seal, the tag binding, the tree and the assets"
+	upload_checks "$rdir" "$ref" "$tag" "$team" "$tree" "$assets" "$tree.seal"
+	reset_checksums "$tag" "$assets"
+	if [ -n "$img" ]; then
+		echo "==> check the disk image and add it to the assets"
+		add_disk_image "$img" "$tag" "$team" "$tree/PAYLOAD-SHA256" "$assets"
+		count=4
+	fi
+	echo "==> upload: draft, verify, promote"
+	upload "$tag" "$repo" "$notes" "$assets" "$tree" "$count"
 }
 
 # ---- self-test ------------------------------------------------------------------
@@ -604,6 +637,7 @@ self_test() {
 	# `FIXTURE <dir>` by copying <dir> to the mount point; detach empties it.
 	mkdir "$T/fakes"
 	for tool in notarytool security ditto; do
+		# shellcheck disable=SC2016 # the $* and $FAKE_TOOL_LOG belong to the fake
 		printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s $*" >>"$FAKE_TOOL_LOG"\nexit 97\n' "$tool" >"$T/fakes/$tool"
 	done
 	cat >"$T/fakes/codesign" <<'EOF'
@@ -648,12 +682,34 @@ detach)
 esac
 exit 97
 EOF
+	# With FAKE_GH_UPLOADED set, `release create` records the asset files it was
+	# given there, and `release view` (when FAKE_GH_VIEW is unset) answers with
+	# exactly those assets, filtered through the jq program FAKE_GH_VIEW_JQ.
 	cat >"$T/fakes/gh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "gh $*" >>"$FAKE_TOOL_LOG"
 case "$1 $2" in
-"release view") [ -n "${FAKE_GH_VIEW:-}" ] && cat "$FAKE_GH_VIEW" && exit 0 ;;
-"release create") [ "${FAKE_GH_CREATE_OK:-}" = 1 ] && exit 0 ;;
+"release view")
+	[ -n "${FAKE_GH_VIEW:-}" ] && cat "$FAKE_GH_VIEW" && exit 0
+	if [ -n "${FAKE_GH_UPLOADED:-}" ] && [ -f "$FAKE_GH_UPLOADED" ]; then
+		a="[]"
+		while IFS= read -r f; do
+			a="$(jq -c --arg n "$(basename "$f")" --argjson s "$(stat -f %z "$f")" --arg d "sha256:$(shasum -a 256 "$f" | cut -d' ' -f1)" \
+				'. + [{name: $n, state: "uploaded", size: $s, digest: $d}]' <<<"$a")"
+		done <"$FAKE_GH_UPLOADED"
+		jq -c "${FAKE_GH_VIEW_JQ:-.}" <<<"{\"isDraft\":true,\"assets\":$a}" && exit 0
+	fi
+	;;
+"release create")
+	if [ "${FAKE_GH_CREATE_OK:-}" = 1 ]; then
+		prev=""
+		for a in "$@"; do
+			[ "$prev" != --notes-file ] && [ -f "$a" ] && [ -n "${FAKE_GH_UPLOADED:-}" ] && printf '%s\n' "$a" >>"$FAKE_GH_UPLOADED"
+			prev="$a"
+		done
+		exit 0
+	fi
+	;;
 "release edit") [ "${FAKE_GH_EDIT_OK:-}" = 1 ] && exit 0 ;;
 esac
 exit 97
@@ -732,6 +788,15 @@ EOF
 	expect_refusal "K3SM_AUTO set but empty refuses" automation-env "$out" "$rc"
 	rc=0; out="$(no_tty env -u CLAUDECODE -u K3SM_AUTO PATH="$FPATH" bash "$HERE/publish.sh" --version "$tag")" || rc=$?
 	expect_refusal "no controlling terminal refuses" no-tty "$out" "$rc"
+	local phase
+	for phase in --through-verify --upload; do
+		rc=0; out="$(env -u K3SM_AUTO CLAUDECODE=1 PATH="$FPATH" bash "$HERE/publish.sh" "$phase" --version "$tag" 2>&1)" || rc=$?
+		expect_refusal "$phase: CLAUDECODE=1 refuses" automation-env "$out" "$rc"
+		rc=0; out="$(env -u CLAUDECODE K3SM_AUTO=1 PATH="$FPATH" bash "$HERE/publish.sh" "$phase" --version "$tag" 2>&1)" || rc=$?
+		expect_refusal "$phase: K3SM_AUTO=1 refuses" automation-env "$out" "$rc"
+		rc=0; out="$(no_tty env -u CLAUDECODE -u K3SM_AUTO PATH="$FPATH" bash "$HERE/publish.sh" "$phase" --version "$tag")" || rc=$?
+		expect_refusal "$phase: no controlling terminal refuses" no-tty "$out" "$rc"
+	done
 
 	# ---- the shipped bytes against the verified tree ----
 	echo "tarball and tree against PAYLOAD-SHA256"
@@ -936,6 +1001,250 @@ EOF
 	fi
 	: >"$log"
 
+	# ---- the two phases: the seal, --upload, and the disk image ----
+	echo "two phases: the seal, --upload and the disk image"
+	# A fresh fixture repository, clean, with the fixture ref at HEAD; it stands
+	# in for the tag as in the tag binding cases.
+	local G2="$T/repo2" ref2=refs/heads/fixture head2
+	git init -q "$G2"
+	printf 'one\n' >"$G2/f"
+	git -C "$G2" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false add f
+	git -C "$G2" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false commit -q -m one
+	git -C "$G2" branch fixture
+	head2="$(git -C "$G2" rev-parse HEAD)"
+	# mk_sealed <dir>: what --through-verify leaves: <dir>/tree, its assets and seal
+	mk_sealed() {
+		mk_payload "$1/tree"
+		(PATH="$FPATH" package_assets "$1/tree" "$tag" "$1/tree.assets") >/dev/null 2>&1
+		write_seal "$1/tree.seal" "$tag" "$head2" "$1/tree/PAYLOAD-SHA256" "$1/tree.assets/$(asset_base "$tag").tar.gz" "$TEAM"
+	}
+	# mk_image <dir> <tree> [version]: a fixture image of k3sm.app around <tree>,
+	# at <dir>/out/<the closed name>; the fake hdiutil mounts <dir>/root
+	mk_image() {
+		local r="$1/root" v="${3:-${tag#v}}"
+		mkdir -p "$r/k3sm.app/Contents/Resources" "$1/out"
+		cp -R "$2" "$r/k3sm.app/Contents/Resources/payload"
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>%s</string></dict></plist>\n' "$v" >"$r/k3sm.app/Contents/Info.plist"
+		ln -s /Applications "$r/Applications"
+		printf 'FIXTURE %s\n' "$r" >"$1/out/$(image_name "$tag")"
+	}
+	# run_up <tree> [image]: the whole --upload phase, every fake accepting
+	# unless the caller sets cs=0, st=0 or sp=0; vr=real runs stage.sh's own
+	# --verify-release, otherwise a stand-in accepts. view_jq filters the
+	# read-back. Sets rc and out; log holds the tool calls.
+	run_up() {
+		: >"$log"; rm -f "$T/uploaded"
+		rc=0
+		out="$( (
+			if [ "${vr:-}" != real ]; then verify_release() { :; }; fi
+			PATH="$FPATH" FAKE_GH_UPLOADED="$T/uploaded" FAKE_GH_VIEW_JQ="${view_jq:-.}" FAKE_GH_CREATE_OK=1 FAKE_GH_EDIT_OK=1 \
+				FAKE_CODESIGN_VERIFY_OK="${cs:-1}" FAKE_STAPLER_OK="${st:-1}" FAKE_SPCTL_OK="${sp:-1}" \
+				run_upload "$G2" "$ref2" "$tag" "${team:-$TEAM}" "$1" "$repo" "$T/notes.md" "${2:-}"
+		) 2>&1)" || rc=$?
+	}
+	# up_refuses <name> <token>: the last run_up refused with <token> and made no gh call
+	up_refuses() {
+		if [ "$rc" -ne 0 ] && grep -q "REFUSE: $2" <<<"$out" && ! grep -q '^gh ' "$log"; then ok "$1"; else
+			bad "$1 (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+		fi
+	}
+	# up_promoted <name> <asset-count>: the last run_up created a draft of exactly
+	# that many assets and promoted it
+	up_promoted() {
+		if [ "$rc" -eq 0 ] && [ "$(grep -c . "$T/uploaded" 2>/dev/null)" = "$2" ] &&
+			grep -qx -- "gh release edit $tag --repo $repo --draft=false --latest" "$log"; then ok "$1"; else
+			bad "$1 (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+		fi
+	}
+	local W n=0 k img mnt
+	# fresh <var>: a new sealed fixture directory in <var>
+	fresh() { n=$((n + 1)); W="$T/ph$n"; mk_sealed "$W"; }
+
+	fresh
+	if [ -z "$(seal_problems "$W/tree.seal")" ] && [ "$(seal_value "$W/tree.seal" tag)" = "$tag" ] &&
+		[ "$(seal_value "$W/tree.seal" head)" = "$head2" ] && [ "$(seal_value "$W/tree.seal" team_id)" = "$TEAM" ] &&
+		[ "$(seal_value "$W/tree.seal" payload_manifest_sha256)" = "$(sha256_of "$W/tree/PAYLOAD-SHA256")" ] &&
+		[ "$(seal_value "$W/tree.seal" tarball_sha256)" = "$(sha256_of "$W/tree.assets/$(asset_base "$tag").tar.gz")" ]; then
+		ok "control: the seal holds the tag, HEAD, manifest hash, tarball hash and Team ID"
+	else
+		bad "seal contents: $(tr '\n' ';' <"$W/tree.seal")"
+	fi
+	run_up "$W/tree"
+	up_promoted "control: --upload without an image uploads three assets and promotes" 3
+
+	fresh; mk_image "$W/img" "$W/tree"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_promoted "control: --upload with a good image uploads four assets and promotes" 4
+	img="$W/tree.assets/$(image_name "$tag")"
+	if [ "$(grep -c . "$W/tree.assets/$(checksums_name "$tag")")" = 3 ] &&
+		grep -qx "$(sha256_of "$img")  $(image_name "$tag")" "$W/tree.assets/$(checksums_name "$tag")" &&
+		grep -qxF "$img" "$T/uploaded"; then
+		ok "the image's checksums line is computed by publish.sh and the image is uploaded"
+	else
+		bad "image checksums line: $(tr '\n' ';' <"$W/tree.assets/$(checksums_name "$tag")")"
+	fi
+	mnt="$(sed -n 's/^hdiutil attach -readonly -nobrowse -mountpoint \([^ ]*\) .*/\1/p' "$log")"
+	if [ -n "$mnt" ] && grep -qx "hdiutil attach -readonly -nobrowse -mountpoint $mnt $img" "$log" &&
+		grep -qx "hdiutil detach $mnt" "$log" && [ ! -e "$mnt" ]; then
+		ok "the image is attached read-only without browsing at a private mount point, then detached and removed"
+	else
+		bad "hdiutil calls (mnt=$mnt, log: $(tr '\n' ';' <"$log"))"
+	fi
+	if grep -qxF "codesign --verify --strict --deep -R=$(developer_id_requirement "$TEAM") $mnt/k3sm.app" "$log" &&
+		grep -qxF "xcrun stapler validate $mnt/k3sm.app" "$log" && grep -qxF "xcrun stapler validate $img" "$log" &&
+		grep -qxF "spctl -a -t open --context context:primary-signature $img" "$log"; then
+		ok "codesign checks the app against the Developer ID requirement for the Team ID; stapler and spctl check app and image"
+	else
+		bad "signature checks (log: $(tr '\n' ';' <"$log"))"
+	fi
+
+	fresh; mk_image "$W/img" "$W/tree"
+	mv "$W/img/out/$(image_name "$tag")" "$W/img/out/k3sm.dmg"
+	run_up "$W/tree" "$W/img/out/k3sm.dmg"
+	up_refuses "an image not named k3sm_<version>_darwin_arm64.dmg refuses" image-name
+	grep -q '^hdiutil ' "$log" && bad "a misnamed image was mounted"
+
+	fresh; rm "$W/tree.seal"
+	run_up "$W/tree"
+	up_refuses "a missing seal refuses" seal
+	fresh; echo "team_id=$TEAM" >>"$W/tree.seal"
+	run_up "$W/tree"
+	up_refuses "a seal with a duplicate key refuses" seal
+	for k in $SEAL_KEYS; do
+		fresh
+		sed "s/^$k=.*/$k=0000000000/" "$W/tree.seal" >"$W/seal.tmp" && mv "$W/seal.tmp" "$W/tree.seal"
+		run_up "$W/tree"
+		up_refuses "a seal whose $k differs refuses" seal-mismatch
+	done
+	fresh
+	team=ZYXWV98765 run_up "$W/tree"
+	up_refuses "an --upload with another Team ID than the sealed one refuses" seal-mismatch
+
+	fresh; printf 'changed between the phases\n' >"$W/tree/k3sm"
+	run_up "$W/tree"
+	up_refuses "a stage tree changed between the phases refuses" tree-changed
+	fresh; printf 'changed in step\n' >"$W/tree/k3sm"
+	(cd "$W/tree" && find . -type f ! -name PAYLOAD-SHA256 | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done) >"$W/m.tmp"
+	mv "$W/m.tmp" "$W/tree/PAYLOAD-SHA256"
+	run_up "$W/tree"
+	up_refuses "a stage tree edited in step with its manifest refuses" seal-mismatch
+	fresh
+	vr=real run_up "$W/tree"
+	up_refuses "an unsigned tree fails the re-run of stage.sh --verify-release" verify-release
+	fresh; printf 'dirty\n' >"$G2/untracked"
+	run_up "$W/tree"
+	up_refuses "a dirty worktree fails the re-run of the tag binding" tag-binding
+	rm "$G2/untracked"
+	fresh; printf 'stray\n' >"$W/tree.assets/stray.bin"
+	run_up "$W/tree"
+	up_refuses "a file in the assets that is not a release asset refuses" checksums
+	fresh; echo "$(printf '0%.0s' $(seq 64))  extra.bin" >>"$W/tree.assets/$(checksums_name "$tag")"
+	run_up "$W/tree"
+	up_refuses "a checksums line added after packaging refuses" checksums
+	# An image dropped into the assets with its line after --through-verify is
+	# discarded, never uploaded: only --disk-image adds one, and checks it.
+	fresh; printf 'unchecked image\n' >"$W/tree.assets/$(image_name "$tag")"
+	(cd "$W/tree.assets" && shasum -a 256 "$(image_name "$tag")" >>"$(checksums_name "$tag")")
+	run_up "$W/tree"
+	up_promoted "an image added to the assets after the checksums were written is not uploaded" 3
+
+	fresh; mk_image "$W/img" "$W/tree"; printf 'stray\n' >"$W/img/root/k3sm.app/Contents/Resources/payload/extra"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an image whose app payload holds an extra file refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"; printf 'changed\n' >"$W/img/root/k3sm.app/Contents/Resources/payload/cp-payload/kube-apiserver"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an image whose app payload holds a changed file refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"; printf 'finder\n' >"$W/img/root/k3sm.app/Contents/Resources/payload/.DS_Store"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an image whose app payload holds a .DS_Store refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree" 9.9.9
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an image whose app version differs from the tag refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"; printf 'readme\n' >"$W/img/root/README"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an image holding more than k3sm.app and the Applications link refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"; rm "$W/img/root/Applications"; ln -s /tmp "$W/img/root/Applications"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an Applications link that is not /Applications refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"
+	cs=0 run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an app codesign rejects refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"
+	st=0 run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an image stapler rejects refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"
+	sp=0 run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_refuses "an image spctl rejects refuses" image-unverified
+	fresh; mk_image "$W/img" "$W/tree"
+	view_jq='.assets |= map(select(.name | endswith(".dmg") | not))' run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: draft-unverified" <<<"$out" && grep -q '^gh release create' "$log" &&
+		! grep -q '^gh release edit' "$log"; then
+		ok "an image missing from the draft read-back refuses before promote"
+	else
+		bad "image missing from the read-back (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+
+	# The one-shot run uploads three assets and never an image: its upload
+	# refuses a checksums file that names a fourth.
+	fresh; printf 'image\n' >"$W/tree.assets/$(image_name "$tag")"
+	(cd "$W/tree.assets" && shasum -a 256 "$(image_name "$tag")" >>"$(checksums_name "$tag")")
+	: >"$log"; rc=0
+	out="$( (PATH="$FPATH" FAKE_GH_CREATE_OK=1 upload "$tag" "$repo" "$T/notes.md" "$W/tree.assets" "$W/tree") 2>&1)" || rc=$?
+	if [ "$rc" -ne 0 ] && grep -q "expected 3 assets" <<<"$out" && ! grep -q '^gh ' "$log"; then
+		ok "the one-shot upload ships exactly three assets"
+	else
+		bad "one-shot asset count (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	: >"$log"
+
+	# ---- install.sh selects its checksums line by the archive's exact name ----
+	echo "install.sh and the image's checksums line"
+	local I="$T/install" iv=0.0.0
+	mkdir -p "$I/fakes" "$I/srv" "$I/cwd"
+	for tool in uname sysctl sw_vers sudo curl; do
+		cat >"$I/fakes/$tool" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$(basename "$0") $*" >>"$FAKE_TOOL_LOG"
+case "$(basename "$0")" in
+uname) echo Darwin ;;
+sysctl) echo 1 ;;
+sw_vers) echo 26.0 ;;
+curl)
+	o="" u=""
+	while [ $# -gt 0 ]; do case "$1" in -o) o="$2"; shift 2 ;; -*) shift ;; *) u="$1"; shift ;; esac; done
+	f="$FAKE_SRV/${u##*/}"
+	[ -n "$o" ] && [ -f "$f" ] && cp "$f" "$o" && exit 0
+	exit 22
+	;;
+esac
+exit 97
+EOF
+	done
+	chmod +x "$I/fakes/"*
+	mkdir "$I/pkg"; printf 'k3sm fixture\n' >"$I/pkg/k3sm"; chmod +x "$I/pkg/k3sm"
+	tar -czf "$I/srv/k3sm_${iv}_darwin_arm64.tar.gz" -C "$I/pkg" k3sm
+	printf 'not served\n' >"$I/image.dmg"
+	# install_case <name> <checksums-file-content> <want: pass|refuse>
+	install_case() {
+		printf '%s\n' "$2" >"$I/srv/k3sm_${iv}_checksums.txt"
+		rm -f "$I/cwd/"*; : >"$log"; rc=0
+		out="$(cd "$I/cwd" && PATH="$I/fakes:$PATH" FAKE_SRV="$I/srv" TMPDIR="$I" K3SM_INSTALL_VERSION="v$iv" \
+			K3SM_INSTALL_BASE_URL=https://example.invalid/releases K3SM_INSTALL_DOWNLOAD_ONLY=1 sh "$REPO_ROOT/install.sh" 2>&1)" || rc=$?
+		if [ "$3" = pass ]; then
+			if [ "$rc" -eq 0 ] && [ -f "$I/cwd/k3sm_${iv}_darwin_arm64.tar.gz" ] && ! grep -q '\.dmg' "$log" && ! grep -q '^sudo' "$log"; then ok "$1"; else
+				bad "$1 (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+			fi
+		elif [ "$rc" -ne 0 ] && grep -q "no entry for k3sm_${iv}_darwin_arm64.tar.gz" <<<"$out"; then ok "$1"; else
+			bad "$1 (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+		fi
+	}
+	local tarline imgline
+	tarline="$(cd "$I/srv" && shasum -a 256 "k3sm_${iv}_darwin_arm64.tar.gz")"
+	imgline="$(sha256_of "$I/image.dmg")  k3sm_${iv}_darwin_arm64.dmg"
+	install_case "install.sh verifies the tarball and ignores the image's checksums line" "$imgline"$'\n'"$tarline" pass
+	install_case "control: install.sh does not take the image's line for the tarball's" "$imgline" refuse
+	: >"$log"
+
 	# ---- static checks ----
 	echo "static"
 	local s
@@ -957,6 +1266,7 @@ EOF
 	else
 		bad "sign.sh guard order (guard=$guard_line parse=$parse_line)"
 	fi
+	# shellcheck disable=SC2016 # a literal line of sign.sh, not an expansion
 	if grep -q -- 'codesign --force --sign "$IDENTITY" --options runtime --timestamp' "$sign" &&
 		grep -q -- 'notarytool submit .* --keychain-profile k3sm-notary --wait' "$sign"; then
 		ok "sign.sh signs with the hardened runtime and a timestamp, and notarizes with the k3sm-notary profile"
@@ -969,7 +1279,8 @@ EOF
 		echo "  skip shellcheck (not installed)"
 	fi
 
-	unset -f ok bad skip_attended on_pty no_tty expect_refusal draft_json promote_case mk_payload package_case ent_case gitf bind_case upload_case
+	unset -f ok bad skip_attended on_pty no_tty expect_refusal draft_json promote_case mk_payload package_case ent_case gitf bind_case upload_case \
+		mk_sealed mk_image run_up up_refuses up_promoted fresh install_case
 	unset FAKE_TOOL_LOG
 	echo
 	echo "publish self-test: $passes passed, $fails failed, $skips skipped (attended only)"
@@ -1010,7 +1321,7 @@ while [ $# -gt 0 ]; do
 	--team-id) TEAM_ID="${2:?--team-id needs a value}"; shift 2 ;;
 	--notes-file) NOTES="${2:?--notes-file needs a value}"; shift 2 ;;
 	--repo) REPO="${2:?--repo needs a value}"; shift 2 ;;
-	--disk-image) DISK_IMAGE="${2:?--disk-image needs a value}"; shift 2 ;;
+	--disk-image) [ -z "$DISK_IMAGE" ] || die "--disk-image is given once"; DISK_IMAGE="${2:?--disk-image needs a value}"; shift 2 ;;
 	-h | --help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 0 ;;
 	*) die "unknown argument: $1" ;;
 	esac
@@ -1037,17 +1348,7 @@ if [ "$MODE" = upload ]; then
 	STAGE="$(cd "$STAGE" && pwd)"
 	ASSETS="$STAGE.assets"
 	[ -d "$ASSETS" ] || die "$ASSETS is not a directory; --through-verify leaves it"
-	echo "==> check the seal, the tag binding, the tree and the assets"
-	upload_checks "$REPO_ROOT" "refs/tags/$VERSION" "$VERSION" "$TEAM_ID" "$STAGE" "$ASSETS" "$STAGE.seal"
-	reset_checksums "$VERSION" "$ASSETS"
-	count=3
-	if [ -n "$DISK_IMAGE" ]; then
-		echo "==> check the disk image and add it to the assets"
-		add_disk_image "$DISK_IMAGE" "$VERSION" "$TEAM_ID" "$STAGE/PAYLOAD-SHA256" "$ASSETS"
-		count=4
-	fi
-	echo "==> upload: draft, verify, promote"
-	upload "$VERSION" "$REPO" "$NOTES" "$ASSETS" "$STAGE" "$count"
+	run_upload "$REPO_ROOT" "refs/tags/$VERSION" "$VERSION" "$TEAM_ID" "$STAGE" "$REPO" "$NOTES" "$DISK_IMAGE"
 	echo "==> released $VERSION on $REPO"
 	exit 0
 fi
