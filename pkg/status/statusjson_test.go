@@ -58,7 +58,7 @@ var (
 	// networkRequired are the keys of the optional network object.
 	networkRequired = []string{"lan", "recorded", "covers", "alwaysOn"}
 	// networkOptional are the optional keys of the network object.
-	networkOptional = []string{"applied"}
+	networkOptional = []string{"recordState", "applied", "appliedReadable"}
 	// networkAppliedRequired / Optional are the keys of network.applied.
 	networkAppliedRequired = []string{"lan", "serial"}
 	networkAppliedOptional = []string{"error"}
@@ -72,7 +72,7 @@ var (
 	interconnectPodRequired = []string{"namespace", "pod", "node", "address"}
 	// daemonsRequired is the whole of `k3sm status daemons -o json`.
 	daemonsRequired = []string{"schemaVersion", "verdict", "role", "summary", "daemons"}
-	daemonsOptional = []string{"stoppedBy"}
+	daemonsOptional = []string{"stoppedBy", "network"}
 	rowRequired     = []string{"name", "state", "severity", "detail"}
 	rowOptional     = []string{"remedy", "wide"}
 	versionRequired = []string{"version", "commit", "dirty", "date", "goVersion", "platform", "kubeVersion", "kineVersion"}
@@ -169,6 +169,20 @@ func contractServer(t *testing.T, netd, server string, kube Kube, kubeErr error)
 		Host:       goldenHost,
 		Hostname:   "my-mac",
 	}
+}
+
+// contractRecordOff is a readable LAN record that says off.
+func contractRecordOff() (install.NetworkRecord, bool, error) {
+	return install.NetworkRecord{Version: install.NetworkRecordVersion, LAN: install.LANOff, Serial: "4f0c2a9e1b7d3c55"}, true, nil
+}
+
+// contractNetwork is the running control plane with the LAN record and the
+// node daemon's applied report read through the given seams.
+func contractNetwork(t *testing.T, record func() (install.NetworkRecord, bool, error), applied func(install.Role) ([]byte, error)) Collector {
+	t.Helper()
+	c := contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", heartbeatingKube(goldenTime), nil)
+	c.Network, c.NetworkApplied = record, applied
+	return c
 }
 
 // contractAgent is a worker Mac with both daemons running and the credential
@@ -287,6 +301,26 @@ func contractScenarios() map[string]contractScenario {
 			peer.Labels = map[string]string{controlPlaneNodeLabel: ""}
 			kube.nodes = append(kube.nodes, older, peer)
 			return contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", kube, nil)
+		}},
+		"network-recorded": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			return contractNetwork(t, contractRecordOff, func(install.Role) ([]byte, error) {
+				return []byte(`{"lan":"off","serial":"4f0c2a9e1b7d3c55"}`), nil
+			})
+		}},
+		"network-absent": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			return contractNetwork(t, func() (install.NetworkRecord, bool, error) {
+				return install.NetworkRecord{Version: install.NetworkRecordVersion, LAN: install.LANOn}, false, nil
+			}, nil)
+		}},
+		"network-unreadable": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			return contractNetwork(t, func() (install.NetworkRecord, bool, error) {
+				return install.NetworkRecord{}, true, fmt.Errorf("network record /Library/k3sm/network.json: %w: owned by uid 501, not root", install.ErrNetworkRecord)
+			}, func(install.Role) ([]byte, error) {
+				return []byte(`{"lan":"off","serial":"","error":"read the network record: network record unusable"}`), nil
+			})
+		}},
+		"network-applied-unreadable": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			return contractNetwork(t, contractRecordOff, func(install.Role) ([]byte, error) { return nil, os.ErrPermission })
 		}},
 		"agent-join-target": {verdict: VerdictDegraded, collector: func(t *testing.T) Collector {
 			c := contractAgent(t, func(_ *testing.T, _ Paths, fsys fakeFS) fakeFS { return fsys })
@@ -493,7 +527,21 @@ func TestStatusJSONContractGolden(t *testing.T) {
 				t.Errorf("%s carries joinTarget %v on a %s", fullPath, jt, full.Role)
 			}
 			if nw, ok := fullGeneric["network"]; ok {
-				checkKeys(t, fullPath+" network", nw, networkRequired, networkOptional, nil)
+				checkKeys(t, fullPath+" network", nw, networkRequired, networkOptional, optionalSeen)
+			}
+			if nw, ok := probeGeneric["network"]; ok {
+				checkKeys(t, daemonsPath+" network", nw, networkRequired, networkOptional, optionalSeen)
+				for _, k := range []string{"applied", "appliedReadable"} {
+					if _, has := nw.(map[string]any)[k]; has {
+						t.Errorf("%s network carries %q, which the probe never reads", daemonsPath, k)
+					}
+				}
+			}
+			for _, g := range []map[string]any{fullGeneric, probeGeneric} {
+				nw, _ := g["network"].(map[string]any)
+				if rs, ok := nw["recordState"]; ok && rs != NetworkRecordUnreadable {
+					t.Errorf("%s network.recordState %v is outside the contract", name, rs)
+				}
 			}
 			checkKeys(t, daemonsPath, probeGeneric, daemonsRequired, daemonsOptional, optionalSeen)
 			for _, g := range []map[string]any{fullGeneric, probeGeneric} {
@@ -557,6 +605,15 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			if probe.Verdict != full.Verdict {
 				t.Errorf("verdict: probe %v, full %v; this posture's cause is a daemon, which both read", probe.Verdict, full.Verdict)
 			}
+			var want *Network
+			if full.Network != nil {
+				n := *full.Network
+				n.Applied, n.AppliedReadable = nil, nil
+				want = &n
+			}
+			if !reflect.DeepEqual(probe.Network, want) {
+				t.Errorf("network: probe %+v, want the full report's without applied %+v", networkOf(probe.Network), networkOf(want))
+			}
 		})
 
 		t.Run(name+"/exit code", func(t *testing.T) {
@@ -593,6 +650,12 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			if !reflect.DeepEqual(gotFull.Workers, full.Workers) {
 				t.Errorf("workers: collected %v, golden %v", deref(gotFull.Workers), deref(full.Workers))
 			}
+			if !reflect.DeepEqual(gotFull.Network, full.Network) {
+				t.Errorf("network: collected %+v, golden %+v", networkOf(gotFull.Network), networkOf(full.Network))
+			}
+			if !reflect.DeepEqual(gotProbe.Network, probe.Network) {
+				t.Errorf("probe network: collected %+v, golden %+v", networkOf(gotProbe.Network), networkOf(probe.Network))
+			}
 			if gotFull.JoinTarget != full.JoinTarget {
 				t.Errorf("joinTarget: collected %q, golden %q", gotFull.JoinTarget, full.JoinTarget)
 			}
@@ -612,10 +675,8 @@ func TestStatusJSONContractGolden(t *testing.T) {
 		}
 		// Every optional key appears in some golden, so a rename of a key that
 		// one fixture omits still fails in another. peers is the exception: it
-		// is reserved, and no posture emits it yet (the struct check covers it);
-		// network is read from a record no golden posture wires, so the
-		// struct check and TestStatusNetworkBlock cover it.
-		for _, k := range append(append(append([]string{"next", "interconnect", "stoppedBy", "workers", "joinTarget"}, rowOptional...), versionOptional...), interconnectOptional...) {
+		// is reserved, and no posture emits it yet (the struct check covers it).
+		for _, k := range append(append(append(append([]string{"next", "interconnect", "stoppedBy", "workers", "joinTarget", "network"}, rowOptional...), versionOptional...), interconnectOptional...), networkOptional...) {
 			if !optionalSeen[k] {
 				t.Errorf("no golden carries the optional key %q", k)
 			}
@@ -708,6 +769,8 @@ func TestDaemonsProbeNeverReachesTheAPIServer(t *testing.T) {
 	c.NodeResolverPresent = func() (bool, error) { optionalCalls.Add(1); return true, nil }
 	c.CDHash = func(string) (string, error) { optionalCalls.Add(1); return "", nil }
 	c.EtcdMetrics = func(context.Context, string) ([]byte, error) { optionalCalls.Add(1); return nil, nil }
+	c.Network = contractRecordOff // so a reached NetworkApplied would be called
+	c.NetworkApplied = func(install.Role) ([]byte, error) { optionalCalls.Add(1); return nil, nil }
 
 	probe := c
 	probe.Volumes = fatalVolumes{t: t}

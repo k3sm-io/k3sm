@@ -127,7 +127,9 @@ type Report struct {
 	// stop marker exists. It adds no verdict or state word.
 	StoppedBy *StoppedBy `json:"stoppedBy,omitempty"`
 	// Network is this node's LAN access switch, present on an installed Mac
-	// whose record could be read. It adds no verdict or state word.
+	// whose report wired the record reader; an unusable record is present
+	// and marked (Network.RecordState). Absent means not installed, or a k3sm
+	// older than the switch. It adds no verdict or state word.
 	Network *Network `json:"network,omitempty"`
 	// Workers is, on a server, every other node of the cluster with the
 	// version its kubelet reports, read from the same node list the node row

@@ -32,11 +32,17 @@ import (
 // verdict or state word.
 type Network struct {
 	// LAN is the RECORDED setting: "on" (workload listeners answer on every
-	// interface) or "off" (only on this Mac and the cluster mesh).
+	// interface) or "off" (only on this Mac and the cluster mesh). When the
+	// record exists but cannot be used it is "off", which is what the node
+	// daemon serves in that case.
 	LAN string `json:"lan"`
 	// Recorded is false when no setting is recorded (an install from before
 	// the switch), which reads as on.
 	Recorded bool `json:"recorded"`
+	// RecordState is NetworkRecordUnreadable when a record exists but could
+	// not be used (refused or undecodable); empty, and omitted, otherwise.
+	// It carries no error text: the reason names paths and uids.
+	RecordState string `json:"recordState,omitempty"`
 	// Covers is the listener families the switch controls on this node.
 	Covers []string `json:"covers"`
 	// AlwaysOn is the network-facing listeners the switch does not control.
@@ -44,10 +50,15 @@ type Network struct {
 	// Applied is the node daemon's own report of what it serves, present
 	// only when this caller could read it (root).
 	Applied *NetworkApplied `json:"applied,omitempty"`
-	// appliedUnknown is set when the report exists but this caller may not
-	// read it; it only changes the human line.
-	appliedUnknown bool
+	// AppliedReadable is false when the daemon's report exists but this
+	// caller may not read it; nil, and omitted, otherwise (read, absent, or
+	// not looked at, as in the daemons probe).
+	AppliedReadable *bool `json:"appliedReadable,omitempty"`
 }
+
+// NetworkRecordUnreadable is Network.RecordState for a LAN record that exists
+// but could not be used.
+const NetworkRecordUnreadable = "unreadable"
 
 // NetworkApplied is the node daemon's report of the LAN state it applied.
 type NetworkApplied struct {
@@ -57,17 +68,20 @@ type NetworkApplied struct {
 }
 
 // network reads the LAN switch through the Network seam on an installed
-// Mac, and the daemon's report through NetworkApplied when wired. No seam,
-// no install, or an unreadable record yields nil and never fails the report.
+// Mac, and the daemon's report through NetworkApplied when wired. No seam or
+// no install yields nil. A record that exists but cannot be used is reported
+// as the node daemon treats it: off, recorded, and marked unreadable. It never
+// fails the report.
 func (c Collector) network(role dataroot.Role, installed bool) *Network {
 	if c.Network == nil || !installed {
 		return nil
 	}
-	rec, present, err := c.Network()
-	if err != nil {
-		return nil
+	n := &Network{Covers: install.LANCovers(role), AlwaysOn: install.LANAlwaysOn(role)}
+	if rec, present, err := c.Network(); err != nil {
+		n.LAN, n.Recorded, n.RecordState = string(install.LANOff), true, NetworkRecordUnreadable
+	} else {
+		n.LAN, n.Recorded = string(rec.LAN), present
 	}
-	n := &Network{LAN: string(rec.LAN), Recorded: present, Covers: install.LANCovers(role), AlwaysOn: install.LANAlwaysOn(role)}
 	if c.NetworkApplied != nil {
 		data, err := c.NetworkApplied(role)
 		switch {
@@ -76,7 +90,8 @@ func (c Collector) network(role dataroot.Role, installed bool) *Network {
 				n.Applied = &NetworkApplied{LAN: string(a.LAN), Serial: a.Serial, Error: a.Error}
 			}
 		case errors.Is(err, fs.ErrPermission):
-			n.appliedUnknown = true
+			unreadable := false
+			n.AppliedReadable = &unreadable
 		}
 	}
 	return n
@@ -89,7 +104,10 @@ func networkLine(r Report) string {
 		return ""
 	}
 	line := fmt.Sprintf("LAN access %s (%s); always on: %s", n.LAN, strings.Join(n.Covers, ", "), strings.Join(n.AlwaysOn, ", "))
-	if !n.Recorded {
+	switch {
+	case n.RecordState == NetworkRecordUnreadable:
+		line += "\nthe LAN access record cannot be used, so the node daemon serves LAN access off until it is fixed (sudo k3sm network lan on|off)"
+	case !n.Recorded:
 		line += "\nLAN access is on because no setting is recorded (an install from before the switch)"
 	}
 	switch {
@@ -97,7 +115,7 @@ func networkLine(r Report) string {
 		line += fmt.Sprintf("\nthe node daemon serves LAN access %s; its last change was refused: %s", n.Applied.LAN, n.Applied.Error)
 	case n.Applied != nil && n.Applied.LAN != n.LAN:
 		line += fmt.Sprintf("\nthe node daemon still serves LAN access %s, not the recorded %s", n.Applied.LAN, n.LAN)
-	case n.appliedUnknown:
+	case n.AppliedReadable != nil && !*n.AppliedReadable:
 		line += "\nthe applied state is readable by root only (sudo k3sm network lan status)"
 	}
 	return line

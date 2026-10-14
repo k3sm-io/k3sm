@@ -92,6 +92,7 @@ that joined one). A Mac with no install reports `server`.
 | `summary` | string | one sentence for a person; do not parse it |
 | `daemons` | array of rows | always two: `netd`, then the node daemon (`server` on a control plane, `agent` on a worker) |
 | `stoppedBy` | object | who stopped k3sm on this Mac (see [Stopped by](#stopped-by)); omitted when no stop is recorded |
+| `network` | object | this node's LAN access setting (see [Network](#network)), without `applied` and `appliedReadable`; omitted when k3sm is not installed, or by a k3sm older than the setting |
 
 The rows are the same rows, built the same way, as the full report's rows of the same names. The
 verdict comes from the same function as the full report's, fed the install check and these two
@@ -147,7 +148,7 @@ four.
 | `peers` | array | reserved for mesh peers (`name`, `state`, `detail`); not emitted yet |
 | `interconnect` | object | the cluster's interconnect and its attached Pods (see [Interconnect](#interconnect)); omitted when the cluster has none, or the report could not read it |
 | `stoppedBy` | object | who stopped k3sm on this Mac (see [Stopped by](#stopped-by)); omitted when no stop is recorded |
-| `network` | object | this node's LAN access setting (see [Network](#network)); omitted when k3sm is not installed or the setting cannot be read |
+| `network` | object | this node's LAN access setting (see [Network](#network)); omitted when k3sm is not installed, or by a k3sm older than the setting |
 | `workers` | array | on a server, the cluster's other nodes and their versions (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
 | `joinTarget` | string | on a worker, the server endpoint it joined (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
 | `version` | object | the build that produced the report; `modules` is omitted when unknown |
@@ -207,7 +208,8 @@ parsed: a damaged marker never fails the report. Readers must treat a missing `s
 The full report carries an optional `network` object on an installed Mac: the LAN access setting
 `k3sm network lan` and `k3sm install --lan` record, and, when the caller can read it, what the node
 daemon reports applying. It is additive: `schemaVersion` stays `1`, and it adds no `verdict` or row
-`state` word. The daemons probe does not carry it.
+`state` word. The daemons probe carries the same object, built the same way, except `applied` and
+`appliedReadable`: the daemon's report is readable by root only, and the probe never reads it.
 
 ```json
 "network": {
@@ -221,16 +223,23 @@ daemon reports applying. It is additive: `schemaVersion` stays `1`, and it adds 
 
 | field | type | notes |
 |---|---|---|
-| `lan` | string | the recorded setting: `on` (the covered listeners answer on every interface) or `off` (only on this Mac and the cluster mesh) |
+| `lan` | string | the recorded setting: `on` (the covered listeners answer on every interface) or `off` (only on this Mac and the cluster mesh); `off` when the record cannot be used, which is what the node daemon serves then |
 | `recorded` | boolean | `false` when no setting is recorded (an install from before the switch), in which case `lan` is `on` |
+| `recordState` | string | `unreadable` when a record exists but cannot be used (it is damaged, or its owner or mode is wrong); omitted when the record was read or there is none. The reason is not included: run `sudo k3sm network lan status` to see it |
 | `covers` | array of strings | the listener families the setting controls: `nodeports`, `loadbalancers`, and `ingress` on a server |
 | `alwaysOn` | array of strings | the network-facing listeners it does not control: `apiserver`, `join` and `mesh` on a server, `mesh` on a worker |
 | `applied` | object | the node daemon's own report: `lan` (what it serves), `serial` (the write it acted on) and `error` (why its last change was refused, omitted when none); omitted when the caller cannot read the report, which is in the daemon's work dir and readable by root |
+| `appliedReadable` | boolean | `false` when the daemon's report exists but the caller may not read it; omitted otherwise |
 
 When `applied.lan` differs from `lan`, or `applied.error` is set, the node is not serving the recorded
 setting; the human view says so on its own line, and also says when the applied state is readable by
 root only. `sudo k3sm network lan on|off` checks the daemon's listening sockets itself before it
-reports success. Readers must treat a missing `network` as "unknown", not as either value.
+reports success.
+
+A missing `network` means k3sm is not installed on this Mac, or the k3sm that wrote the report is
+older than the LAN access setting. Readers must treat it as "unknown", not as either value. A record
+that cannot be read is never left out: it is reported as `lan` `off`, `recorded` `true` and
+`recordState` `unreadable`. A `recordState` word a reader does not know means the setting is unknown.
 
 ## Workers and join target
 
