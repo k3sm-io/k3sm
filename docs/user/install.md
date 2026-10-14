@@ -143,9 +143,9 @@ Every channel manages the same `/Library/k3sm`. Once more than one has shipped, 
 k3sm.app is closed source and free to use; the rest of k3sm is Apache-2.0, and the command-line
 install needs nothing from the app.
 
-The k3sm app installs, updates and uninstalls with the same `/Library/k3sm`. It asks for an
-administrator password once. That one step copies the app's bundled files into a root-owned
-staging folder, checks the copy, and then runs the install from that copy. It never runs k3sm
+The k3sm app installs, updates and uninstalls with the same `/Library/k3sm`. Each of those
+actions asks for an administrator password once. That step copies the app's bundled files into a
+root-owned staging folder, checks the copy, and then runs the install from that copy. It never runs k3sm
 from its own bundle as root: it copies the bundle into a new directory under
 `/Library/k3sm.staging`, checks the copy's signature, and runs
 `k3sm install --from-staging <dir>` from that copy. The install refuses to run unless:
