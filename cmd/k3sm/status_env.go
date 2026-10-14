@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 
@@ -88,8 +89,12 @@ func newStatusRunner(o statusOptions) statusRunner {
 			"agent":  install.AgentLogPath(),
 		},
 		logTargets: defaultLogTargets(role),
+		appPresent: func() bool { return fileExists(appBundlePath) },
 	}
 }
+
+// appBundlePath is where k3sm.app is installed.
+const appBundlePath = "/Applications/k3sm.app"
 
 // installedRole reports which node THIS Mac is installed as, read from the two
 // node-daemon plists on disk, plus whether it is installed at all.
@@ -160,12 +165,57 @@ func newStatusCollector() status.Collector {
 		CDHash: func(path string) (string, error) {
 			return shadow.CDHash(context.Background(), path)
 		},
-		Paths:      paths,
-		EUID:       euid,
-		ServiceUID: serviceUID,
-		Version:    version.Get(),
-		Host:       macOSVersionOrEmpty(),
-		Hostname:   hostnameOrEmpty(),
+		// The cluster's Interconnect, read over the same client as every other
+		// apiserver row.
+		Interconnect:   statusInterconnect(kube),
+		StopMarker:     statusStopMarker,
+		Network:        statusNetwork,
+		NetworkApplied: statusNetworkApplied,
+		// The join target of a worker, through the installer's one reader of
+		// the agent plist's --server (the agent arguments record does not carry
+		// it, and the plist is world-readable, so this works without sudo).
+		AgentJoinServer: statusAgentJoinServer,
+		Paths:           paths,
+		EUID:            euid,
+		ServiceUID:      serviceUID,
+		Version:         version.Get(),
+		Host:            macOSVersionOrEmpty(),
+		Hostname:        hostnameOrEmpty(),
+	}
+}
+
+// statusAgentJoinServer returns the --server value of the installed agent
+// plist, and nothing else from its argv.
+func statusAgentJoinServer() (string, error) {
+	return install.AgentJoinServer(install.NewDarwinSystem(), install.Config{})
+}
+
+// statusStopMarker reads the stop marker through the installer's own reader.
+func statusStopMarker() (install.StopMarker, bool, error) {
+	return install.ReadStopMarker(install.NewDarwinSystem(), install.DefaultStopMarkerPath)
+}
+
+// statusNetwork reads the LAN access record through the installer's own
+// reader; the record is world-readable, so this works for any user.
+func statusNetwork() (install.NetworkRecord, bool, error) {
+	return install.ReadNetworkRecord(install.ReadNetworkRecordFile, install.DefaultNetworkRecordPath)
+}
+
+// statusNetworkApplied reads the node daemon's applied report; it is in the
+// daemon's own work dir, so only root (and the service user) can read it.
+func statusNetworkApplied(role install.Role) ([]byte, error) {
+	return os.ReadFile(install.NetworkAppliedPath(install.DefaultDataRoot, role))
+}
+
+// statusInterconnect is the report's Interconnect reader over kube: one GET of
+// the cluster's Interconnect, nil-with-no-error when there is none. Without a
+// client there is nothing to read, and the row is left out.
+func statusInterconnect(kube status.Kube) func(context.Context) (*netv1alpha1.Interconnect, error) {
+	if kube == nil {
+		return nil
+	}
+	return func(ctx context.Context) (*netv1alpha1.Interconnect, error) {
+		return status.ReadInterconnect(ctx, kube)
 	}
 }
 
@@ -182,6 +232,7 @@ func newDaemonsCollector() status.Collector {
 		FS:         osStatusFS{},
 		Procs:      procTable{},
 		DataRoot:   dataRootFS{},
+		StopMarker: statusStopMarker,
 		Paths:      statusPaths(statusWorkDir(euid, serviceUID)),
 		EUID:       euid,
 		ServiceUID: serviceUID,
@@ -519,7 +570,7 @@ func statusKubeconfig(in statusKubeInputs) (kubectlConfig, error) {
 		workDir:         in.workDir,
 		kubeconfigEnv:   in.kubeconfigEnv,
 		home:            in.home,
-		contextName:     installedContextName,
+		contextName:     installedKubeconfigName(),
 		exists:          in.exists,
 	})
 }

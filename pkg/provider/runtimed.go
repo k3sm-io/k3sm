@@ -234,10 +234,14 @@ type runtimedRuntime struct {
 	// nil (a test double) disables the refresh loop.
 	refresher projectedRefresher
 
-	mu      sync.Mutex
-	track   map[string]*podTrack  // pod id -> bookkeeping
-	probers map[string]*podProber // pod id -> provider-served probe runner
-	notify  func(*corev1.Pod)
+	mu    sync.Mutex
+	track map[string]*podTrack // pod id -> bookkeeping
+	// retained holds the TERMINATED pods of this node a restarted daemon found
+	// in the apiserver and does not track, keyed by pod UID: their log trees are
+	// still owed to `kubectl logs` (runtimed_retained.go). Guarded by mu.
+	retained map[string]*corev1.Pod
+	probers  map[string]*podProber // pod id -> provider-served probe runner
+	notify   func(*corev1.Pod)
 	// compensating is the set of pod ids with a compensating delete owed and in
 	// flight — a guest a parked pod's retry built after the pod was deleted, which
 	// nothing but this provider knows about (runtimed_pull.go). It is
@@ -287,8 +291,12 @@ type podTrack struct {
 	// object) never carries the computed PodReady, so without this the LTT would reset
 	// to Now() every resync tick (see buildStatus). readyMu is separate from r.mu
 	// because GetPods reconstructs status OUTSIDE r.mu.
-	readyMu   sync.Mutex
-	lastReady corev1.PodCondition
+	//
+	// readyMu also guards lastReadyToStart, the same prior for the
+	// PodReadyToStartContainers condition (computeReadyToStartContainers).
+	readyMu          sync.Mutex
+	lastReady        corev1.PodCondition
+	lastReadyToStart corev1.PodCondition
 
 	// restartMu guards restarts — the per-container exit-driven restart
 	// bookkeeping (runtimed_restart.go): the termination
@@ -2023,6 +2031,7 @@ func (r *runtimedRuntime) dispatchCurrent(ctx context.Context, id string) {
 // wall-time (floored at 1s), since runtimed treats a 0 grace as immediate-kill.
 func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
+	r.forgetRetained(id)
 	// Cancel every in-flight provider worker FIRST, BEFORE the RPC. A postStart
 	// hook must not outlive the pod and termination must not wait on one —
 	// upstream tears the pod worker's context down on delete, which aborts a
@@ -2388,12 +2397,17 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	transport := r.transportGateFor(pod)
 	t.readyMu.Lock()
 	prior := t.lastReady
+	priorToStart := t.lastReadyToStart
 	t.readyMu.Unlock()
 	if prior.Type == corev1.PodReady {
 		// Seed the desired-spec copy's conditions with the last PodReady so
 		// readyTransitionTime finds its prior status+LTT. PodReady is provider-owned,
 		// so toPodStatus's carry-forward excludes it — no duplication.
 		pod.Status.Conditions = append(pod.Status.Conditions, prior)
+	}
+	if priorToStart.Type == corev1.PodReadyToStartContainers {
+		// The same seed for PodReadyToStartContainers (also provider-owned).
+		pod.Status.Conditions = append(pod.Status.Conditions, priorToStart)
 	}
 	st := toPodStatus(pod, rs, r.nodeIP, t.startTime, ps, transport)
 	// The node-owned interconnect attach condition, from the create-time
@@ -2404,6 +2418,9 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	// message the way a kubelet's status assembly does.
 	r.applyTerminationMessageOverlay(pod, rs, st)
 	r.applyRestartOverlay(pod, t, st)
+	// The restart overlay may lift a terminal phase back to Running; the sandbox
+	// condition follows the phase actually published.
+	refreshReadyToStartContainers(pod, rs, st)
 	// The ErrImagePull ↔ ImagePullBackOff flip, which only the provider's own
 	// schedule can decide (translate.go maps the typed cause and nothing else).
 	r.applyPullOverlay(pod, t, st)
@@ -2411,11 +2428,14 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	// container whose postStart has not completed is NotReady, and the pod's
 	// ContainersReady/PodReady follow.
 	r.applyPostStartOverlay(pod, t, st, transport)
+	t.readyMu.Lock()
 	if c := findPodCondition(st.Conditions, corev1.PodReady); c != nil {
-		t.readyMu.Lock()
 		t.lastReady = *c
-		t.readyMu.Unlock()
 	}
+	if c := findPodCondition(st.Conditions, corev1.PodReadyToStartContainers); c != nil {
+		t.lastReadyToStart = *c
+	}
+	t.readyMu.Unlock()
 	return *st
 }
 

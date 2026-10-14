@@ -25,6 +25,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // Digest pinning for the downloaded control-plane payload.
@@ -42,11 +44,16 @@ import (
 // So each binary is pinned to the sha256 the release published, verified after
 // download, and the pipeline FAILS CLOSED on a mismatch or an unknown file.
 //
-// kine is deliberately absent: it is not downloaded but built from source
-// (buildPatchedKine): the module source `go mod download` fetches, which the Go
-// module checksum database already authenticates, plus k3sm's own reviewed
-// patches (kinePatches). Pinning a digest for a locally compiled binary would pin
-// the toolchain, not the source.
+// kine, etcd and etcdutl are deliberately absent: they are not downloaded but
+// built by k3sm from pinned module source (buildPatchedKine, buildEtcdWrapper),
+// which the Go module checksum database already authenticates, plus k3sm's own
+// reviewed kine patches (kinePatches). Pinning a digest for a locally compiled
+// binary would pin the toolchain, not the source. The release staging builds them
+// into the payload with a pinned toolchain and records the module versions, the
+// patch-set id and the toolchain in the payload manifest, whose post-signing
+// sha256 lines are the authority for those bytes; at boot a Developer ID-signed
+// k3sm verifies each one's signature and reads its build stamp from the verified
+// bytes (stagedChild.ensureShipped) instead of comparing a digest.
 //
 // Refreshing a pin (a DefaultKubeVersion bump) means recording the digests the
 // new release publishes. They are readable without downloading the assets:
@@ -164,6 +171,8 @@ func VerifyPayloadSet(dir string) error {
 	// digest-verified and signed, and it is what lets the workdir seed replace a stale
 	// set. Allowed, not required, for the same back-compat reason.
 	allowed[KubeMarkerName] = true
+	// zot's version marker rides beside the registry binary on kine's terms.
+	allowed[registrysvc.ZotMarkerName] = true
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read payload dir %s: %w", dir, err)

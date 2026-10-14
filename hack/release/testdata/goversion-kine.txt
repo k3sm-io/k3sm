@@ -1,0 +1,12 @@
+/fixture/kine: go1.27.2
+	path	github.com/k3s-io/kine
+	mod	github.com/k3s-io/kine	(devel)	
+	dep	go.etcd.io/etcd/server/v3	v3.7.2	h1:gfnwItZwsDFKUqCJocsBVMNNtWYGTl7/dHc+83qeYVo=
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	-trimpath=true
+	build	DefaultGODEBUG=tracebacklabels=0,x509sslcertoverrideplatform=0
+	build	CGO_ENABLED=0
+	build	GOARCH=arm64
+	build	GOOS=darwin
+	build	GOARM64=v8.0

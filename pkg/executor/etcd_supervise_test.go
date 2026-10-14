@@ -958,7 +958,7 @@ func TestSingleNodeNeverStagesEtcd(t *testing.T) {
 			if b, _ := os.ReadFile(filepath.Join(binDir(wd), etcdBinaryName)); string(b) != tc.wantBytes {
 				t.Errorf("staged etcd = %q, want %q", b, tc.wantBytes)
 			}
-			if !etcdStaged(binDir(wd), DefaultEtcdVersion) {
+			if !etcdChild(DefaultEtcdVersion).staged(binDir(wd)) {
 				t.Error("etcd not staged under its marker")
 			}
 			assertEtcdPKI(t, wd)

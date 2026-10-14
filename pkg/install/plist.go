@@ -383,7 +383,7 @@ func AgentPlist(cfg Config) []byte {
 	if cfg.NodeIP != "" {
 		args = append(args, "--node-ip", cfg.NodeIP)
 	}
-	args = append(args, cfg.ExtraAgentArgs...)
+	args = append(args, cfg.resolvedExtraAgentArgs()...)
 	return renderPlist(launchdPlist{
 		Label:            AgentLabel,
 		UserName:         cfg.ServiceUser,

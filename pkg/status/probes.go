@@ -25,9 +25,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -272,12 +274,34 @@ type Collector struct {
 	// WAL fsync p99. OPTIONAL: nil is a plain HTTP GET with a short timeout, and an
 	// error only leaves the p99 unknown.
 	EtcdMetrics func(ctx context.Context, url string) ([]byte, error)
-	Paths       Paths
-	EUID        int
-	ServiceUID  int
-	Now         func() time.Time
-	Version     version.Info
-	Host        string
+	// Interconnect reads the cluster's Interconnect (ReadInterconnect over
+	// Kube in production): nil with no error means the cluster has none.
+	// OPTIONAL: nil leaves the interconnect row and block out.
+	Interconnect func(ctx context.Context) (*netv1alpha1.Interconnect, error)
+	// StopMarker reads the stop marker `k3sm stop` leaves (install.ReadStopMarker
+	// in production). OPTIONAL: nil, an absent marker or an unreadable one
+	// leaves the report's stoppedBy field out.
+	StopMarker func() (install.StopMarker, bool, error)
+	// Network reads the LAN access record (install.ReadNetworkRecord in
+	// production; an absent record reads as on). OPTIONAL: nil or a failed
+	// read leaves the report's network field out.
+	Network func() (install.NetworkRecord, bool, error)
+	// NetworkApplied reads the node daemon's applied report for role
+	// (install.NetworkAppliedPath). OPTIONAL: nil leaves network.applied out;
+	// a permission error says the applied state is known to root only.
+	NetworkApplied func(role install.Role) ([]byte, error)
+	// AgentJoinServer returns the control-plane host the installed agent
+	// joins: ONLY the --server value of the agent LaunchDaemon's argv
+	// (install.AgentJoinServer in production). OPTIONAL: nil, or an error,
+	// leaves the report's joinTarget field out. It is consulted on an agent
+	// only.
+	AgentJoinServer func() (string, error)
+	Paths           Paths
+	EUID            int
+	ServiceUID      int
+	Now             func() time.Time
+	Version         version.Info
+	Host            string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

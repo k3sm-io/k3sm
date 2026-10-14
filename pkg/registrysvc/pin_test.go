@@ -288,3 +288,47 @@ func writeFakeBinary(path, version string) error {
 	}
 	return os.WriteFile(path, []byte("#!/bin/sh\n# zot "+version+"\n"), 0o755)
 }
+
+// TestZotInstallEnvPinsVerification pins that a hostile ambient Go environment
+// cannot weaken the zot install: weakening variables are dropped, the safe
+// values are set last, and the toolchain is never fetched.
+func TestZotInstallEnvPinsVerification(t *testing.T) {
+	for k, v := range map[string]string{
+		"GOSUMDB": "off", "GONOSUMDB": "*", "GONOSUMCHECK": "1", "GOPRIVATE": "*",
+		"GOINSECURE": "*", "GOFLAGS": "-insecure", "GOPROXY": "https://evil.example", "GOTOOLCHAIN": "auto",
+	} {
+		t.Setenv(k, v)
+	}
+	env := zotBuildEnv("/g", "/m")
+	last := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		last[k] = v
+	}
+	for k, want := range map[string]string{
+		"GOSUMDB": "sum.golang.org", "GOPROXY": "https://proxy.golang.org,direct", "GOTOOLCHAIN": "local",
+	} {
+		if last[k] != want {
+			t.Errorf("%s = %q, want %q", k, last[k], want)
+		}
+	}
+	for _, k := range []string{"GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOINSECURE", "GOFLAGS"} {
+		if _, ok := last[k]; ok {
+			t.Errorf("%s survived into the install env", k)
+		}
+	}
+	for _, k := range []string{"GOSUMDB", "GOPROXY", "GOTOOLCHAIN"} {
+		n := 0
+		for _, kv := range env {
+			if strings.HasPrefix(kv, k+"=") {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("%s appears %d times, want 1", k, n)
+		}
+	}
+	if !zotGoTooOld([]byte("go: zotregistry.dev/zot/v2@v2 requires go >= 1.99 (running go 1.20; GOTOOLCHAIN=local)")) {
+		t.Error("the local-toolchain refusal is not recognised")
+	}
+}

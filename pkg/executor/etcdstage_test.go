@@ -286,8 +286,8 @@ func TestSeedBinDirReseedsEtcdUnderMarker(t *testing.T) {
 			if got, _ := os.ReadFile(marked.binPath(bd)); string(got) != tc.want {
 				t.Errorf("workdir etcd = %q, want %q", got, tc.want)
 			}
-			if got := etcdStaged(bd, DefaultEtcdVersion); got != tc.payloadMarked {
-				t.Errorf("etcdStaged after seed = %v, want %v", got, tc.payloadMarked)
+			if got := etcdChild(DefaultEtcdVersion).staged(bd); got != tc.payloadMarked {
+				t.Errorf("etcd staged after seed = %v, want %v", got, tc.payloadMarked)
 			}
 		})
 	}

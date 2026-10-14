@@ -22,7 +22,6 @@ import (
 	"log/slog"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
-	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -143,31 +142,31 @@ func ensureValidatingAdmissionPolicyBinding(ctx context.Context, cs kubernetes.I
 	}.ensure(ctx)
 }
 
-// ensureMutatingAdmissionPolicy create-or-updates the v1beta1 MutatingAdmissionPolicy.
-func ensureMutatingAdmissionPolicy(ctx context.Context, cs kubernetes.Interface, p *admissionregistrationv1beta1.MutatingAdmissionPolicy) error {
-	c := cs.AdmissionregistrationV1beta1().MutatingAdmissionPolicies()
-	return managedObject[*admissionregistrationv1beta1.MutatingAdmissionPolicy]{
+// ensureMutatingAdmissionPolicy create-or-updates the v1 MutatingAdmissionPolicy.
+func ensureMutatingAdmissionPolicy(ctx context.Context, cs kubernetes.Interface, p *admissionregistrationv1.MutatingAdmissionPolicy) error {
+	c := cs.AdmissionregistrationV1().MutatingAdmissionPolicies()
+	return managedObject[*admissionregistrationv1.MutatingAdmissionPolicy]{
 		kind: "mutatingadmissionpolicy", desired: p,
 		get: c.Get, create: c.Create, update: c.Update,
-		specEqual: func(stored, desired *admissionregistrationv1beta1.MutatingAdmissionPolicy) bool {
+		specEqual: func(stored, desired *admissionregistrationv1.MutatingAdmissionPolicy) bool {
 			return apiequality.Semantic.DeepEqual(stored.Spec, desired.Spec)
 		},
-		setSpec: func(stored, desired *admissionregistrationv1beta1.MutatingAdmissionPolicy) {
+		setSpec: func(stored, desired *admissionregistrationv1.MutatingAdmissionPolicy) {
 			stored.Spec = desired.Spec
 		},
 	}.ensure(ctx)
 }
 
-// ensureMutatingAdmissionPolicyBinding create-or-updates the v1beta1 binding.
-func ensureMutatingAdmissionPolicyBinding(ctx context.Context, cs kubernetes.Interface, b *admissionregistrationv1beta1.MutatingAdmissionPolicyBinding) error {
-	c := cs.AdmissionregistrationV1beta1().MutatingAdmissionPolicyBindings()
-	return managedObject[*admissionregistrationv1beta1.MutatingAdmissionPolicyBinding]{
+// ensureMutatingAdmissionPolicyBinding create-or-updates the v1 binding.
+func ensureMutatingAdmissionPolicyBinding(ctx context.Context, cs kubernetes.Interface, b *admissionregistrationv1.MutatingAdmissionPolicyBinding) error {
+	c := cs.AdmissionregistrationV1().MutatingAdmissionPolicyBindings()
+	return managedObject[*admissionregistrationv1.MutatingAdmissionPolicyBinding]{
 		kind: "mutatingadmissionpolicybinding", desired: b,
 		get: c.Get, create: c.Create, update: c.Update,
-		specEqual: func(stored, desired *admissionregistrationv1beta1.MutatingAdmissionPolicyBinding) bool {
+		specEqual: func(stored, desired *admissionregistrationv1.MutatingAdmissionPolicyBinding) bool {
 			return apiequality.Semantic.DeepEqual(stored.Spec, desired.Spec)
 		},
-		setSpec: func(stored, desired *admissionregistrationv1beta1.MutatingAdmissionPolicyBinding) {
+		setSpec: func(stored, desired *admissionregistrationv1.MutatingAdmissionPolicyBinding) {
 			stored.Spec = desired.Spec
 		},
 	}.ensure(ctx)

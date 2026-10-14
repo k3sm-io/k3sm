@@ -116,8 +116,16 @@ type nodeOptions struct {
 	kubeconfig string
 	restConfig *rest.Config
 	nodeName   string
-	listen     string
-	podRoot    string
+	// listen is the standalone `k3sm node`'s --listen: the kubelet API address
+	// the operator chose. `k3sm server` and `k3sm agent` leave it empty and set
+	// kubeletPort instead, so the address is derived (resolveKubeletEndpoint) and
+	// is never the wildcard.
+	listen string
+	// kubeletPort is the kubelet API port of a `k3sm server` or `k3sm agent`
+	// node. Non-zero makes startNode derive the listen address from the node's
+	// own address, the same value it registers as NodeInternalIP.
+	kubeletPort int
+	podRoot     string
 	// logs is the container-log flag group (--pod-logs-dir and the four rotation
 	// knobs), carried through every bring-up path so `k3sm server`, `k3sm agent`
 	// and `k3sm node` configure the node's logs identically.
@@ -271,35 +279,111 @@ type nodeOptions struct {
 	// standalone `k3sm node` leave it nil, which is exactly the behaviour they had
 	// before the hook existed.
 	onExitBegin func()
+	// lan is the daemon's LAN switch; the node's svclb hoster attaches to it
+	// (startLBHoster). Nil (the standalone `k3sm node`) binds on every
+	// interface and attaches nothing.
+	lan *lanSwitch
 }
 
-// serverKubeletListen is the kubelet HTTP API listen address the in-process node
-// of `k3sm server` and `k3sm agent` uses: the WILDCARD on the kubelet API port,
-// so the apiserver node-proxy reaches it at whatever address the node advertises.
-// nodeKubeletListen is the standalone `k3sm node` default (loopback-scoped).
-//
-// Both are built from ports.KubeletAPIPort — the port was two bare literals inside
-// address strings, with no constant anywhere, while it is one of the
-// two wildcard listeners the reserved-port guard exists to protect.
-var (
-	serverKubeletListen = serverKubeletListenOn(ports.KubeletAPIPort)
-	nodeKubeletListen   = loopbackNodeIP + ":" + strconv.Itoa(ports.KubeletAPIPort)
-)
+// nodeKubeletListen is the standalone `k3sm node` --listen default
+// (loopback-scoped), built from ports.KubeletAPIPort.
+var nodeKubeletListen = loopbackNodeIP + ":" + strconv.Itoa(ports.KubeletAPIPort)
 
-// serverKubeletListenOn is serverKubeletListen at a caller-chosen PORT — the one
-// derivation `k3sm server --kubelet-port` goes through, so a second control plane
-// on one host can give its node a listener of its own instead of contending for
-// the single fixed default.
-//
-// It substitutes the port and NOTHING else. The result is the same wildcard form
-// serverKubeletListen has always had, because the address is not the port's to
-// move: the kubelet API's identity rests on serving TLS plus network reach (see
-// proxyableNodeIP and vkadapter.NewNode), so a derivation that also touched the
-// host part would change that surface's exposure while claiming to renumber a
-// port.
-func serverKubeletListenOn(port int) string { return ":" + strconv.Itoa(port) }
+// errKubeletAddress is the NAMED refusal to serve the kubelet API of a
+// `k3sm server` or `k3sm agent` node: the address it must bind (its own
+// InternalIP) is not a usable IP, or is not on any interface of this Mac when
+// the node starts. There is no wildcard fallback: binding every interface is
+// exactly what puts the kubelet API on an untrusted network.
+var errKubeletAddress = errors.New("kubelet API address unavailable")
 
-// kubeletEndpointPort is the INVERSE of serverKubeletListenOn: the port number the
+// kubeletEndpoint is where a node's kubelet API is: the address its listener
+// binds and the address the node registers as NodeInternalIP (the one the
+// apiserver dials with --kubelet-preferred-address-types=InternalIP).
+type kubeletEndpoint struct {
+	listen     string
+	internalIP string
+}
+
+// resolveKubeletEndpoint is the ONE derivation of the kubelet API's address on a
+// `k3sm server` or `k3sm agent` node (opts.kubeletPort set): the listener binds
+// exactly the address the node registers as its InternalIP, which is
+// proxyableNodeIP, which is advertisedNodeIP. Per posture that is:
+//
+//   - a joined node (an agent, or a server with --mesh-ip): its mesh address, from
+//     the control plane's assignment, never an asserted --node-ip (agentInternalIP,
+//     meshNodeIP);
+//   - a single node on the pod network: the pod range's .1, which the pod network
+//     aliases on lo0 for the node (derivedNodeAdvertiseIP);
+//   - a single node with no pod network (`--network none`, the rootless `k3sm
+//     dev` tier) and the loopback --node-ip default: 127.0.0.1;
+//   - an explicit --node-ip: that address.
+//
+// The address must be on an interface of this Mac when the node starts (the pod
+// network has aliased it by then); if it is not, the result is errKubeletAddress
+// and the node refuses to start. It is never the wildcard and never a LAN
+// address the operator did not name, so on an untrusted network the kubelet
+// API answers only on loopback, the lo0 node address and the mesh.
+//
+// The standalone `k3sm node` (kubeletPort 0) keeps its operator-chosen --listen.
+func resolveKubeletEndpoint(opts nodeOptions) (kubeletEndpoint, error) {
+	ip := proxyableNodeIP(opts)
+	if opts.kubeletPort == 0 {
+		return kubeletEndpoint{listen: opts.listen, internalIP: ip}, nil
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || addr.IsUnspecified() {
+		return kubeletEndpoint{}, fmt.Errorf("%w: the node address %q is not a usable IP, and the kubelet API never binds the wildcard", errKubeletAddress, ip)
+	}
+	addr = addr.Unmap()
+	present, err := localAddressPresent(addr)
+	if err != nil {
+		return kubeletEndpoint{}, fmt.Errorf("%w: list this Mac's addresses to find %s: %v", errKubeletAddress, addr, err)
+	}
+	if !present {
+		return kubeletEndpoint{}, fmt.Errorf("%w: %s, the address this node registers as its InternalIP, is on no interface of this Mac, so the kubelet API (logs, exec, metrics) cannot bind it; a joined node needs its mesh up (it is absent under --network none), and a single node needs the pod network to alias it on lo0", errKubeletAddress, addr)
+	}
+	return kubeletEndpoint{
+		listen:     kubeletListenOn(addr.String(), opts.kubeletPort),
+		internalIP: addr.String(),
+	}, nil
+}
+
+// kubeletListenOn is the kubelet API listen address for a node address and a
+// port: the host part is always the node's address, never empty.
+func kubeletListenOn(ip string, port int) string {
+	return net.JoinHostPort(ip, strconv.Itoa(port))
+}
+
+// localInterfaceAddrs reports every address on this host's interfaces, lo0's
+// aliases and the mesh utun included. It is a package var so the presence check
+// is unit-testable: a test cannot add or remove an address on the machine
+// running it.
+var localInterfaceAddrs = func() ([]netip.Addr, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]netip.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok {
+			if ip, ok := netip.AddrFromSlice(n.IP); ok {
+				out = append(out, ip.Unmap())
+			}
+		}
+	}
+	return out, nil
+}
+
+// localAddressPresent reports whether addr is on one of this host's interfaces.
+func localAddressPresent(addr netip.Addr) (bool, error) {
+	addrs, err := localInterfaceAddrs()
+	if err != nil {
+		return false, err
+	}
+	return slices.Contains(addrs, addr), nil
+}
+
+// kubeletEndpointPort is the INVERSE of the kubelet listen derivation: the port number the
 // node advertises in .status.daemonEndpoints.kubeletEndpoint, read back off the very
 // address its kubelet HTTP API listener binds. That endpoint is what the apiserver
 // node-proxy dials for `kubectl logs`/`exec`/`top node`, so advertising anything but
@@ -469,9 +553,9 @@ func defaultNodePodCIDR() string {
 const loopbackNodeIP = "127.0.0.1"
 
 // isLoopbackDefault reports whether nodeIP is the shipped --node-ip default, i.e.
-// the operator did not choose an address. It is the ONE value predicate all four
-// call sites share (server.go's mesh rewrite and its apiserver-VIP-backend pin,
-// node.go's advertise derivation, and the LB/ingress config assembly) — a
+// the operator did not choose an address. It is the ONE value predicate its call
+// sites share (server.go's mesh rewrite, node.go's advertise derivation, and the
+// LB/ingress config assembly) — a
 // flag.Visit-style "was it set?" predicate would diverge from it the moment a
 // caller passes 127.0.0.1 explicitly, and a bare "127.0.0.1" literal (which one
 // site carried) diverges from the const the moment the default moves.
@@ -522,120 +606,25 @@ func advertisedNodeIP(opts nodeOptions) string {
 }
 
 // proxyableNodeIP returns the address the node REGISTERS as its NodeInternalIP —
-// the one address the apiserver node-proxy will dial. It runs STRICTLY AFTER
-// advertisedNodeIP, as the second tier of the same decision:
+// the one address the apiserver node-proxy dials, and the one the kubelet API
+// listener binds (resolveKubeletEndpoint). It is advertisedNodeIP and nothing
+// else: there is no second source, so the listener, the Node object and the
+// kubelet serving certificate cannot name different addresses.
 //
-//	tier 1 (datapath):  the derived mesh-egress .1, aliased on lo0 by the podnet
-//	                    adapter — advertisedNodeIP already returned it;
-//	tier 2 (here):      no datapath, so nothing aliases an address for us — take
-//	                    one the host ALREADY answers on, i.e. a globally-unicast
-//	                    address of one of its own up interfaces;
-//	tier 3 (fail-soft): no such address — keep the loopback default. `kubectl top`
-//	                    stays broken, but the node still registers. A metrics
-//	                    nicety never costs a node its registration.
+// On the pod network that is a globally-unicast address (the lo0-aliased pod
+// range .1, or the mesh address), which passes the upstream node-proxy
+// predicate (isProxyableHostname: net.IP.IsGlobalUnicast). With no pod network
+// and the loopback --node-ip default it is 127.0.0.1: `kubectl logs` and `exec`
+// work, and GET /api/v1/nodes/<n>/proxy/... answers HTTP 400 "address not
+// allowed", because the only other candidate is a LAN address, and serving the
+// kubelet API on a LAN address is what this derivation exists not to do.
 //
-// Without it a `k3sm dev` node (--network none, so DataPath()==false) registers
-// InternalIP=127.0.0.1, and every GET /api/v1/nodes/<n>/proxy/... is refused
-// with HTTP 400 "address not allowed": upstream's node-proxy ResourceLocation
-// calls isProxyableHostname, which resolves the address and requires
-// net.IP.IsGlobalUnicast() on EVERY result — loopback, unspecified, link-local
-// and multicast all fail it (k8s v1.36.2 pkg/registry/core/node/strategy.go:256
-// and :275-291; the address itself is picked by GetPreferredNodeAddress under
-// the executor's --kubelet-preferred-address-types=InternalIP).
-//
-// It is DELIBERATELY not written back to opts.nodeIP. In the no-datapath posture
-// that value is also the POD-facing address (podIP ≈ nodeIP — see buildProvider
-// and runtimedConfig), and moving pod IPs is a different change with a different
-// blast radius. The two values coincide in every other posture.
-//
-// SECURITY: this opens no port and widens no bind. `k3sm server`/`k3sm agent`
-// already listen on the WILDCARD serverKubeletListen (*:10250), so the kubelet
-// API is reachable at the host's interface addresses with or without this. All
-// that changes is which of those addresses the Node object names. The
-// substitution is therefore gated on wildcardListen: a listener scoped to
-// loopback (standalone `k3sm node`) is never re-advertised at an address it does
-// not serve.
-//
-// Reaching the port is not the same as being able to use it: the
-// provider routes (logs, exec, attach, port-forward) require the apiserver's
-// client certificate, verified against the cluster's client-identity CA
-// (provider.KubeletEndpointAuth). Identity rests on that certificate, not on
-// network reach.
+// Reaching the port is not the same as being able to use it: the provider
+// routes (logs, exec, attach, port-forward) require the apiserver's client
+// certificate, verified against the cluster's client-identity CA
+// (provider.KubeletEndpointAuth).
 func proxyableNodeIP(opts nodeOptions) string {
-	if !isLoopbackDefault(opts.nodeIP) || !wildcardListen(opts.listen) {
-		return opts.nodeIP
-	}
-	if ip := firstProxyableIP(hostInterfaceIPs()); ip != "" {
-		return ip
-	}
-	return opts.nodeIP
-}
-
-// hostInterfaceIPs reports the addresses of this host's own up, non-loopback
-// interfaces. It is a package var so proxyableNodeIP's selection is unit-testable:
-// a test cannot add or remove an address on the machine running it.
-var hostInterfaceIPs = func() []net.IP {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	var ips []net.IP
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			// One unreadable interface must not hide the rest.
-			continue
-		}
-		for _, a := range addrs {
-			if n, ok := a.(*net.IPNet); ok {
-				ips = append(ips, n.IP)
-			}
-		}
-	}
-	return ips
-}
-
-// firstProxyableIP returns the first address in ips that satisfies the upstream
-// node-proxy predicate (net.IP.IsGlobalUnicast — the SAME stdlib call
-// isProxyableHostname makes), preferring IPv4 because that is what a dual-stack
-// Mac's clients dial. It returns "" when no address qualifies, which is the
-// caller's fail-soft signal. Interface order is net.Interfaces' index order, so
-// the choice is stable across restarts.
-func firstProxyableIP(ips []net.IP) string {
-	var v6 string
-	for _, ip := range ips {
-		if ip == nil || !ip.IsGlobalUnicast() {
-			continue
-		}
-		if v4 := ip.To4(); v4 != nil {
-			return v4.String()
-		}
-		if v6 == "" {
-			v6 = ip.String()
-		}
-	}
-	return v6
-}
-
-// wildcardListen reports whether listen binds EVERY local address (":10250",
-// "0.0.0.0:10250", "[::]:10250") rather than one scoped address. It is the
-// bind-then-advertise check proxyableNodeIP gates on: the node may only name an
-// address its kubelet API listener actually answers on. An unparseable value is
-// treated as scoped — the conservative direction, since a wrong "yes" advertises
-// an address that refuses the connection.
-func wildcardListen(listen string) bool {
-	host, _, err := net.SplitHostPort(listen)
-	if err != nil {
-		return false
-	}
-	if host == "" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsUnspecified()
+	return advertisedNodeIP(opts)
 }
 
 // nodeInternalIP derives the globally-unicast address the VK node advertises as
@@ -819,18 +808,6 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// explicit --node-ip (e.g. --mesh-ip, already globally-unicast) is honored.
 	opts.nodeIP = advertisedNodeIP(opts)
 
-	// Second tier of the same decision, for the postures the derivation above does
-	// not cover (`k3sm dev` rootless: --network none, so no adapter aliases a /32
-	// for us). It yields the ONE address registered as NodeInternalIP — the address
-	// the apiserver node-proxy dials — and is deliberately kept OUT of opts.nodeIP,
-	// which in a no-datapath posture is also the pod-facing address. See
-	// proxyableNodeIP for the upstream predicate and the security note.
-	internalIP := proxyableNodeIP(opts)
-	if internalIP != opts.nodeIP {
-		slog.Info("registering a host interface address as NodeInternalIP so the apiserver node-proxy can dial this node (kubectl top/logs/exec); the kubelet API listener is already wildcard-bound, so no new port is opened",
-			"internal_ip", internalIP, "node_ip", opts.nodeIP, "listen", opts.listen)
-	}
-
 	restCfg, err := nodeClientConfig(opts)
 	if err != nil {
 		return err
@@ -987,6 +964,17 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	stopRuntime = teardownWithConcurrentExit(opts.onExitBegin, func() <-chan struct{} { return nodeExited }, nodeDrainGrace, stopRuntime)
 	defer stopRuntime()
 
+	// Where the kubelet API listens and what the node registers as its InternalIP:
+	// one derivation, one value (resolveKubeletEndpoint). Resolved HERE, after the
+	// startup reconcile above has aliased the node's address on lo0 and with the
+	// runtime's teardown already deferred, so a refusal stops the node cleanly.
+	ep, err := resolveKubeletEndpoint(opts)
+	if err != nil {
+		return err
+	}
+	opts.listen = ep.listen
+	internalIP := ep.internalIP
+
 	// The kubelet HTTP API's TLS + auth posture. Both halves are built together and
 	// handed to the adapter together, because serving the provider routes
 	// (logs/exec/attach/port-forward) without either one is a wide-open endpoint; the
@@ -1080,6 +1068,14 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	if err != nil {
 		return fmt.Errorf("new node: %w", err)
 	}
+
+	// This node's svclb hoster. Started BEFORE the Virtual Kubelet run loop and
+	// the status loop: its synchronous reset of the node's bound report then
+	// lands ahead of this process's first Ready, so a report a previous process
+	// left on the Node never vouches for listeners this one has not opened.
+	// Stopped (listeners drained) on every return path.
+	stopLBHoster := startLBHoster(ctx, opts, cs, slog.Default())
+	defer stopLBHoster()
 
 	errc := make(chan error, 1)
 	// Every loop reports its return through nodeLoops, which is what closes the

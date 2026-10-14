@@ -28,6 +28,7 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // runKubeconfig implements `k3sm kubeconfig`: print the admin kubeconfig, or
@@ -52,15 +53,23 @@ func runKubeconfig(args []string) error {
 		server  string
 		caFile  string
 		name    string
+		target  string
 		setCurr bool
 	)
 	fs.BoolVar(&write, "write", false, "merge into an existing kubeconfig instead of printing to stdout")
 	fs.StringVar(&path, "path", defaultKubeconfigDest(), "kubeconfig to merge into (with --write)")
 	fs.StringVar(&server, "server", "", "override the apiserver URL (e.g. for remote access)")
 	fs.StringVar(&caFile, "certificate-authority", "", "PEM CA bundle to embed (required when --server is non-loopback)")
-	fs.StringVar(&name, "context-name", installedContextName, "name of the k3sm cluster/user/context (looked up in your kubeconfig, and used for the merge)")
+	fs.StringVar(&name, "context-name", installedKubeconfigName(), "name of the k3sm cluster/user/context to look up in your kubeconfig (default: the name k3sm install --kubeconfig-name recorded); also the merge name unless --target-name is given")
+	fs.StringVar(&target, "target-name", "", "name to merge the context under with --write (default: --context-name); a name already used by an entry k3sm did not create is refused")
 	fs.BoolVar(&setCurr, "set-current", true, "set the merged context as current-context (with --write)")
 	_ = fs.Parse(args)
+	if target == "" {
+		target = name
+	}
+	if err := install.ValidateKubeconfigName(target); err != nil {
+		return err
+	}
 
 	src, err := loadKubeconfigSource(name)
 	if err != nil {
@@ -85,12 +94,12 @@ func runKubeconfig(args []string) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("load %s: %w", path, err)
 	}
-	merged, err := mergeKubeconfig(dst, src, name, setCurr)
+	merged, err := mergeKubeconfig(dst, src, target, setCurr)
 	if err != nil {
 		return err
 	}
-	if cl := merged.Clusters[name]; cl != nil && cl.InsecureSkipTLSVerify {
-		fmt.Fprintf(os.Stderr, "warning: merged context %q has insecure-skip-tls-verify (loopback dev posture) — do not use it off loopback\n", name)
+	if cl := merged.Clusters[target]; cl != nil && cl.InsecureSkipTLSVerify {
+		fmt.Fprintf(os.Stderr, "warning: merged context %q has insecure-skip-tls-verify (loopback dev posture) — do not use it off loopback\n", target)
 	}
 	data, err := clientcmd.Write(*merged)
 	if err != nil {
@@ -99,7 +108,7 @@ func runKubeconfig(args []string) error {
 	if err := atomicWriteWithBackup(path, data); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "merged k3sm context %q into %s\n", name, path)
+	fmt.Fprintf(os.Stderr, "merged k3sm context %q into %s\n", target, path)
 	return nil
 }
 
@@ -189,6 +198,9 @@ func retarget(src *clientcmdapi.Config, server, caFile string) error {
 // is pure (no IO) so it is unit-testable. With setCurrent, dst's current-context
 // becomes name.
 func mergeKubeconfig(dst, src *clientcmdapi.Config, name string, setCurrent bool) (*clientcmdapi.Config, error) {
+	if err := install.CheckAdminNameFree(dst, name); err != nil {
+		return nil, err
+	}
 	cl, user, kctx := soleCluster(src), soleAuthInfo(src), soleContext(src)
 	if cl == nil || user == nil || kctx == nil {
 		return nil, fmt.Errorf("k3sm kubeconfig is missing a cluster, user, or context")

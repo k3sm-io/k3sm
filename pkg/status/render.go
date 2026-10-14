@@ -55,7 +55,7 @@ const (
 // verdict.
 var serverOverviewRows = []string{
 	RowInstall, RowNetd, RowServer, RowServerArgs, RowAPIServer,
-	RowNode, RowWorkloads, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
+	RowNode, RowWorkloads, RowInterconnect, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
 }
 
 // agentOverviewRows are the same screen on a joining worker: the agent row
@@ -63,7 +63,7 @@ var serverOverviewRows = []string{
 // with the daemon it described.
 var agentOverviewRows = []string{
 	RowInstall, RowNetd, RowAgent, RowAPIServer,
-	RowNode, RowWorkloads, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
+	RowNode, RowWorkloads, RowInterconnect, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
 }
 
 // serverDaemonViewRows are the rows `k3sm status daemons` expands on a control
@@ -99,7 +99,7 @@ func daemonViewRows(role dataroot.Role) []string {
 // child seam this report does not have, and inventing one to print four names
 // the apiserver row already answers for would add a probe that can fail for a
 // fact nothing depends on.
-var clusterViewRows = []string{RowAPIServer, RowNode, RowWorkloads, RowDatastore, RowRuntimed}
+var clusterViewRows = []string{RowAPIServer, RowNode, RowWorkloads, RowInterconnect, RowDatastore, RowRuntimed}
 
 // Render returns the overview screen: the verdict line with the binary's
 // provenance right-aligned beside it, one line per subsystem, the server's last
@@ -137,6 +137,12 @@ func renderScreen(r Report, rows []Row, s Style) string {
 	var b strings.Builder
 	b.WriteString(headline(r, s))
 	b.WriteString("\n\n")
+	if line := stoppedByLine(r); line != "" {
+		b.WriteString(line + "\n\n")
+	}
+	if line := networkLine(r); line != "" {
+		b.WriteString(line + "\n\n")
+	}
 	for _, row := range rows {
 		b.WriteString(renderRow(row, s))
 		if log := row.Wide["log"]; log != "" {
@@ -250,7 +256,7 @@ func renderRow(row Row, s Style) string {
 	return "  " + glyph +
 		pad(row.Name, nameWidth) + " " +
 		colorize(pad(string(row.State), stateWidth), severityColor(row.Severity), s) + " " +
-		strings.TrimRight(row.Detail, " ") + "\n"
+		strings.TrimRight(stripControls(row.Detail), " ") + "\n"
 }
 
 // wideLine renders a row's extra columns as sorted key=value pairs.
@@ -264,7 +270,7 @@ func wideLine(row Row) string {
 		if k == "log" || k == "log-repeats" {
 			continue // already printed on its own line
 		}
-		pairs = append(pairs, k+"="+row.Wide[k])
+		pairs = append(pairs, stripControls(k)+"="+stripControls(row.Wide[k]))
 	}
 	if len(pairs) == 0 {
 		return ""
@@ -349,4 +355,18 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// stripControls removes C0 and C1 control characters and DEL from text that
+// came from the cluster (apiserver errors, node names), so a hostile apiserver
+// or proxy cannot put terminal escape sequences on the operator's TTY. Printable
+// Unicode is kept. Only the human renderer calls it; the JSON output carries
+// the value as data and its encoder already escapes controls.
+func stripControls(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, s)
 }

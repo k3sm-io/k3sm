@@ -76,7 +76,8 @@ func (c Collector) Collect(ctx context.Context) Report {
 	// clusters are a handful of Macs, so a single page always holds them all.
 	var nodes []corev1.Node
 	var nodesErr error
-	if c.Kube != nil && serving {
+	nodesRead := c.Kube != nil && serving
+	if nodesRead {
 		nodes, nodesErr = c.Kube.Nodes(ctx)
 	}
 
@@ -106,10 +107,14 @@ func (c Collector) Collect(ctx context.Context) Report {
 	if hb, ok := c.heartbeatRow(ctx, serving, role, nodes, nodesErr, now()); ok {
 		rows = append(rows, hb)
 	}
-	rows = append(rows,
-		c.workloadsRow(ctx, serving, nodePID, nodes, nodesErr, now()),
-		dataRoot,
-	)
+	rows = append(rows, c.workloadsRow(ctx, serving, nodePID, nodes, nodesErr, now()))
+	// Beside the workloads it carries, and only when the cluster has an
+	// Interconnect: a cluster with no cable never gets a row about one.
+	icRow, icBlock, haveIC := c.interconnectRow(ctx, serving)
+	if haveIC {
+		rows = append(rows, icRow)
+	}
+	rows = append(rows, dataRoot)
 	// Immediately after the data root it sits beside, and only while it is
 	// there: the copy is the operator's rollback from a migration, and the row
 	// is how they learn it is still costing them disk.
@@ -156,6 +161,11 @@ func (c Collector) Collect(ctx context.Context) Report {
 		Summary:       summary,
 		Rows:          rows,
 		Next:          next,
+		Interconnect:  icBlock,
+		StoppedBy:     c.stoppedBy(),
+		Network:       c.network(role, installed),
+		Workers:       c.workers(role, nodesRead, nodes, nodesErr),
+		JoinTarget:    c.joinTarget(role),
 		Version:       c.Version,
 		Host:          c.Host,
 		Timestamp:     now(),
@@ -739,6 +749,20 @@ func PickNode(nodes []corev1.Node, hostname string) (corev1.Node, bool) {
 	if len(nodes) == 0 {
 		return corev1.Node{}, false
 	}
+	if n, ok := matchNodeByName(nodes, hostname); ok {
+		return n, true
+	}
+	if len(nodes) == 1 {
+		return nodes[0], true
+	}
+	return corev1.Node{}, false
+}
+
+// matchNodeByName is PickNode's name match alone: the node named after this
+// Mac's short host name, or one whose name ends in "-<short name>". It has no
+// single-node fallback, so a caller that must not mistake another Mac's node
+// for this one (Collector.workers) can fail closed.
+func matchNodeByName(nodes []corev1.Node, hostname string) (corev1.Node, bool) {
 	short := strings.ToLower(strings.TrimSpace(hostname))
 	if i := strings.IndexByte(short, '.'); i > 0 {
 		short = short[:i]
@@ -754,9 +778,6 @@ func PickNode(nodes []corev1.Node, hostname string) (corev1.Node, bool) {
 				return nodes[i], true
 			}
 		}
-	}
-	if len(nodes) == 1 {
-		return nodes[0], true
 	}
 	return corev1.Node{}, false
 }

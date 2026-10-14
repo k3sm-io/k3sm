@@ -80,6 +80,12 @@ exit 2
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// The inspector runs codesign by absolute path, never through PATH, so it is
+	// pointed at the fake through its Tool seam.
+	origSigner := bootCodeSigner
+	t.Cleanup(func() { bootCodeSigner = origSigner; resetSigningMemo() })
+	bootCodeSigner = codesignSigner{CodesignInspector: binsign.CodesignInspector{Tool: filepath.Join(dir, "codesign")}}
+	resetSigningMemo()
 	return func() []signCall {
 		b, err := os.ReadFile(log)
 		if err != nil {
@@ -236,8 +242,8 @@ func writeBin(t *testing.T, path, content string) {
 //     control-plane download.
 //
 // For each it asserts the target's inode changes when its content or signature
-// changes, an already-valid ad-hoc binary is left untouched (same inode, no sign
-// call) while a valid non-ad-hoc one is replaced, codesign only ever sees temp
+// changes, an already-valid binary, ad hoc or not, is left untouched (same inode,
+// no sign call), codesign only ever sees temp
 // paths and always signs under the final name (-i), no unsigned bytes are left at
 // a final name, and an fd and a mapping held on the old file still read the old
 // bytes. The one-time heal replaces every staged binary once per version stamp.
@@ -287,7 +293,7 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 		}
 	})
 
-	t.Run("boot re-sign: a valid ad-hoc binary is untouched, any other is replaced", func(t *testing.T) {
+	t.Run("boot re-sign: a validly signed binary is untouched, an unsigned one is replaced", func(t *testing.T) {
 		calls := fakeCodesign(t)
 		bd := t.TempDir()
 		valid := filepath.Join(bd, "kube-scheduler")
@@ -298,21 +304,27 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 		writeBin(t, devID, "controller-manager"+devIDSuffix)
 		// Already healed once at this stamp, so only the signature check acts.
 		markHealed(t, bd, healStamp(kubeMarkerPath(bd)), cpBinaries...)
-		validIno := inode(t, valid)
-		hInvalid, hDevID := hold(t, invalid), hold(t, devID)
+		validIno, devIDIno := inode(t, valid), inode(t, devID)
+		hInvalid := hold(t, invalid)
 
 		if err := signBinaries(t.Context(), bd, healStamp(kubeMarkerPath(bd)), cpBinaries); err != nil {
 			t.Fatal(err)
 		}
 		signed := calls()
-		assertSignedOnlyTemps(t, signed, invalid, devID)
-		if len(signed) != 2 {
-			t.Errorf("signed %v, want one temp copy each of the unsigned and the non-ad-hoc binary", signed)
+		assertSignedOnlyTemps(t, signed, invalid)
+		if len(signed) != 1 {
+			t.Errorf("signed %v, want one temp copy of the unsigned binary", signed)
 		}
 		hInvalid.assertReplaced(t)
-		hDevID.assertReplaced(t)
 		assertSignedAt(t, invalid)
-		assertSignedAt(t, devID)
+		// A valid non-ad-hoc signature (a Developer ID) is never replaced by an
+		// ad-hoc one: that would strip its provenance (B480).
+		if got := inode(t, devID); got != devIDIno {
+			t.Errorf("the Developer ID-signed %s was replaced (inode %d -> %d)", filepath.Base(devID), devIDIno, got)
+		}
+		if got, _ := os.ReadFile(devID); string(got) != "controller-manager"+devIDSuffix {
+			t.Errorf("the Developer ID-signed binary changed to %q", got)
+		}
 		if got := inode(t, valid); got != validIno {
 			t.Errorf("the validly signed %s was replaced (inode %d -> %d)", filepath.Base(valid), validIno, got)
 		}
@@ -440,7 +452,7 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 		dst := helmchart.HelmPath(bd)
 		writeBin(t, dst, "old-helm"+signedSuffix)
 		h := hold(t, dst)
-		if err := stageHelm(t.Context(), bd, true); err != nil {
+		if err := stageHelm(t.Context(), signingPolicy{s: bootCodeSigner}, bd, true); err != nil {
 			t.Fatal(err)
 		}
 		signed := calls()

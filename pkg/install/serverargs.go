@@ -444,10 +444,51 @@ func splitFlag(arg string) (name, value string, inline bool) {
 // explicit `k3sm install --mesh-ip` replace whatever address a carried plist or
 // ServerArgsRecord held.
 func setMeshIPArg(args []string, meshIP string) []string {
+	return append(dropValueArg(args, "mesh-ip"), "--mesh-ip", meshIP)
+}
+
+// nodePortAddressesFlag is the node daemon flag (`k3sm server` and `k3sm agent`)
+// that carries `k3sm install --nodeport-addresses`.
+const nodePortAddressesFlag = "nodeport-addresses"
+
+// setKubeconfigNameArg returns args with any --kubeconfig-name entry replaced by
+// name. The default name is recorded as no flag at all, so choosing it again is
+// how an operator returns to the default.
+func setKubeconfigNameArg(args []string, name string) []string {
+	out := dropValueArg(args, kubeconfigNameFlag)
+	if name == DefaultKubeconfigName {
+		return out
+	}
+	return append(out, "--"+kubeconfigNameFlag, name)
+}
+
+// InstalledKubeconfigName returns the cluster/user/context name the admin
+// kubeconfig was merged under, read from the same two sources as
+// InstalledMeshIP (the installed server plist, else the arguments record). No
+// recorded name is DefaultKubeconfigName; a recorded name that is not valid is
+// an error.
+func InstalledKubeconfigName(read func(path string) ([]byte, error), plistPath, recordPath string) (string, error) {
+	args, err := InstalledServerArgs(read, plistPath, recordPath)
+	if err != nil {
+		return "", err
+	}
+	name := flagValue(args, kubeconfigNameFlag)
+	if name == "" {
+		return DefaultKubeconfigName, nil
+	}
+	if err := ValidateKubeconfigName(name); err != nil {
+		return "", fmt.Errorf("the installed server arguments carry --%s: %w", kubeconfigNameFlag, err)
+	}
+	return name, nil
+}
+
+// dropValueArg returns a copy of args without the valued flag name (either
+// spelling, inline or separate).
+func dropValueArg(args []string, flagName string) []string {
 	out := make([]string, 0, len(args)+2)
 	for i := 0; i < len(args); i++ {
 		name, _, inline := splitFlag(args[i])
-		if name == "mesh-ip" {
+		if name == flagName {
 			if !inline {
 				i++ // drop the separate value too
 			}
@@ -455,7 +496,7 @@ func setMeshIPArg(args []string, meshIP string) []string {
 		}
 		out = append(out, args[i])
 	}
-	return append(out, "--mesh-ip", meshIP)
+	return out
 }
 
 // retiredDatastoreFlags are the `k3sm server` flags of the external-datastore HA

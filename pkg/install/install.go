@@ -48,12 +48,12 @@ import (
 	"syscall"
 	"time"
 
-	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -757,6 +757,9 @@ type System interface {
 	// the reap. Its file lives BESIDE the install root, never inside it: a lock
 	// on a file in the tree being swapped would travel with that tree.
 	LockInstall(path string) (unlock func() error, err error)
+	// LockStaging is LockInstall for the k3sm.app staging lock (ErrStagingBusy
+	// when held), the OUTER lock of the two: see lockStagingThenInstall.
+	LockStaging(path string) (unlock func() error, err error)
 	// SwapInstallRoot publishes the staged install tree by exchanging it with
 	// whatever is at live, in ONE filesystem operation, and reports whether
 	// there was a previous tree.
@@ -997,8 +1000,10 @@ type System interface {
 	// verdict this seam interprets: the caller decides whether to keep waiting.
 	ProbeNetd(path string) error
 	// WriteUserKubeconfig writes the admin kubeconfig into targetUser's
-	// ~/.kube/config, owned by targetUser (not root).
-	WriteUserKubeconfig(targetUser string, contents []byte) error
+	// ~/.kube/config, owned by targetUser (not root), keyed under name as its
+	// cluster, user and context. A non-default name that already keys an entry
+	// k3sm did not write is refused (CheckAdminNameFree).
+	WriteUserKubeconfig(targetUser, name string, contents []byte) error
 	// RemoveAll removes a path tree (the install dir on uninstall).
 	RemoveAll(path string) error
 	// ReapOrphans SIGKILLs any lingering process whose executable path is under
@@ -1024,6 +1029,21 @@ type System interface {
 	// is a no-op (pfctl succeeds flushing zero rules), and a pfctl failure is
 	// reported but never stops the rest of uninstall.
 	FlushMeshPFAnchor() error
+	// FlushInterconnectAliases is the uninstall backstop for the interconnect
+	// aliases netd put on bridge0. netd's shutdown removes nothing, so the
+	// aliases its ownership ledger (the file at ledgerPath, netd's own record)
+	// names outlive it. The ledger is read only when it is a root-owned
+	// regular file with no group or other write, and an entry is removed only
+	// when it is this node's derived address for its slot (from nodeIndex, the
+	// cluster index of the pod range netd adopted; negative means unknown, and
+	// nothing is swept), is on bridge0 now, and has its slot's netmask. The pod
+	// /32s go before the node's /24, then the ledger. It never changes
+	// bridge0's membership. An absent ledger, or a host with no bridge0, is a
+	// no-op; a refused ledger or entry is logged and left; a removal that fails
+	// keeps the ledger and returns an error. Uninstall removes the node identity
+	// file nodeIndex comes from only after this returns nil, so a re-run still
+	// has both the ledger and the index and can finish the job.
+	FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error
 	// ReadPodReapRecords returns the pod process groups the runtime recorded in
 	// its reap store under dataRoot (runtime.ReadPodReapRecords). An absent store
 	// holds none.
@@ -1044,6 +1064,42 @@ type System interface {
 	// WaitProcessGroupsGone waits up to timeout for every group in pgids to
 	// have no members, and returns the groups that still have one.
 	WaitProcessGroupsGone(ctx context.Context, pgids []int, timeout time.Duration) []int
+	// ReadVMHostRecords returns the k3sm-vmhost helpers the runtime recorded in
+	// its vm reap store under dataRoot (<dataRoot>/vmreap/<pgid>.json): each
+	// helper's process group and its leader's start time. Only a store and
+	// record files owned by one of owners, not group- or world-writable and not
+	// symlinks, are read (see readVMHostRecords). An absent store holds none.
+	// It never changes the store, which the runtime owns.
+	ReadVMHostRecords(dataRoot string, owners []uint32) (VMHostStore, error)
+	// ServiceUID returns the uid of the named service user. Read-only.
+	ServiceUID(name string) (uint32, error)
+	// ProcessExecutable returns the executable path pid was started from
+	// (the exec path the kernel recorded) and its effective uid. Read-only.
+	ProcessExecutable(pid int) (path string, uid uint32, err error)
+
+	// The methods below serve `k3sm stop` and `k3sm start`.
+
+	// LaunchctlDisable sets the labelled daemon's disabled bit in the system
+	// domain (launchctl disable system/<label>), so launchd does not load it at
+	// boot even though its plist stays. Idempotent.
+	LaunchctlDisable(label string) error
+	// LaunchctlDisabled reports whether the label is disabled in the system
+	// domain, read back from `launchctl print-disabled system`. A label with no
+	// override is not disabled. Output it cannot classify is an error.
+	LaunchctlDisabled(label string) (bool, error)
+	// ReadStopMarker returns the bytes of the stop marker at path, opened
+	// without following a symlink. Missing has ReadFile's fs.ErrNotExist
+	// contract.
+	ReadStopMarker(path string) ([]byte, error)
+	// WriteStopMarker installs data at path, mode 0644, through a temp file,
+	// fsync, rename and a directory fsync. It refuses a parent directory that
+	// is a symlink, is not owned by root, or is group- or world-writable.
+	WriteStopMarker(path string, data []byte) error
+	// RemoveStopMarker removes the stop marker at path. Absent is success.
+	RemoveStopMarker(path string) error
+	// OSLog writes msg to the unified log (subsystem io.k3sm, category
+	// lifecycle) at level. It never fails; a host without os_log drops it.
+	OSLog(level slog.Level, msg string)
 
 	// The methods below serve `k3sm uninstall --purge` only.
 
@@ -1102,11 +1158,13 @@ type System interface {
 	// it by hand (serviceUserDisabledRealName). It changes attributes only,
 	// none of which needs the approval a deletion does.
 	DisableServiceUser(ctx context.Context, name string) error
-	// RemoveAdminKubeconfigContext removes the k3sm context (and the cluster
+	// RemoveAdminKubeconfigContext removes the context keyed name (and the cluster
 	// and user it alone references) from targetUser's ~/.kube/config, keeping
 	// every other entry, the file's owner and its mode. An absent file or
-	// context is a no-op success, reported as removed=false.
-	RemoveAdminKubeconfigContext(targetUser string) (removed bool, err error)
+	// context is a no-op success, reported as removed=false. homeDir is the
+	// validated, resolved home the purge guard protected; the edit lands under
+	// it. Only an empty homeDir falls back to looking targetUser up.
+	RemoveAdminKubeconfigContext(targetUser, homeDir, name string) (removed bool, err error)
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -1150,6 +1208,7 @@ type Config struct {
 	// --token-file stages nothing and leaves whatever is already there. A
 	// ServerJoin install requires it.
 	TokenFile       string
+	StagingOptions         // `install --from-staging` and the staging root (fromstaging.go)
 	ServiceUser     string // _k3sm
 	InstallDir      string // /Library/k3sm
 	LinkDir         string // /usr/local/bin
@@ -1241,6 +1300,23 @@ type Config struct {
 	// ServerArgsRecord can never disagree. The CLI parses and refuses the
 	// unspecified, loopback and multicast forms before Install ever sees it.
 	MeshIP string
+	// KubeconfigName is the cluster, user and context name the admin kubeconfig
+	// is merged under in TargetUser's kubeconfig (the k3s
+	// --write-kubeconfig-name analog). It rides the server arguments as
+	// --kubeconfig-name (ignored by the daemon) so the same record that carries
+	// --mesh-ip carries it across an uninstall, and `k3sm kubectl`, `k3sm
+	// kubeconfig` and `uninstall --purge` read it back. Empty keeps a carried
+	// name; DefaultKubeconfigName clears it. Control plane only.
+	KubeconfigName string
+	// NodePortAddresses is `k3sm install --nodeport-addresses`, carried in the
+	// node daemon's arguments for its Role (setNodePortAddressesArg). Nil keeps
+	// a carried value; an empty value removes it.
+	NodePortAddresses *string
+	// LAN is `k3sm install --lan`; nil keeps the recorded value, or decides
+	// by whether k3sm ran here before (DecideInstallLAN).
+	LAN *LAN
+	// NetworkRecord is where LAN is recorded; empty is DefaultNetworkRecordPath.
+	NetworkRecord string
 	// ExtraAgentArgs are operator-supplied `k3sm agent` arguments appended to the
 	// fixed set AgentPlist renders (--mesh-port, --dns-vip, …). Install
 	// populates it exactly as it populates ExtraServerArgs: from the agent plist
@@ -1302,8 +1378,9 @@ type Config struct {
 	SecretsEncryption bool
 	// EtcdSnapshots are the scheduled etcd snapshot flags this install was given
 	// (`k3sm install --etcd-snapshot-schedule-cron`, `--etcd-snapshot-retention`,
-	// `--etcd-disable-snapshots`). Each one given REPLACES the carried flag of the
-	// same name in resolvedExtraServerArgs; the zero value changes nothing.
+	// `--etcd-disable-snapshots`, `--etcd-snapshot-compress`). Each one given
+	// REPLACES the carried flag of the same name in resolvedExtraServerArgs; the
+	// zero value changes nothing.
 	EtcdSnapshots EtcdSnapshotFlags
 	// KeyEntropy is where a minted secrets-encryption key is read from. Nil is
 	// crypto/rand.Reader; a test injects a placeholder reader so no real key
@@ -1353,6 +1430,30 @@ type Config struct {
 	// is one warning with the remedy for the servers that stay, and the teardown
 	// continues. A purge the preflight refuses makes no call.
 	DeregisterServer func(ctx context.Context) error
+	// StopMarker is the path of the user-stop marker `k3sm stop` writes and
+	// `k3sm start` removes (see lifecycle.go). Empty means DefaultStopMarkerPath.
+	StopMarker string
+	// Start is `--start`: an install or a restart on a node the user stopped
+	// starts it again. Without it, a stopped node is updated and left stopped
+	// (no label is enabled or bootstrapped while a stop marker is present).
+	Start bool
+	// MarkNode cordons this node and sets the k3sm.io/stopped-by-user
+	// annotation (stopped true), or undoes what a stop did (stopped false).
+	// It is called by Stop before the node daemon goes down, and by Start (and
+	// an install or restart with Start) once the daemons are back. Nil skips
+	// it. BEST EFFORT: the call is bounded by markNodeTimeout and a failure is
+	// one warning, never a stop or start failure.
+	MarkNode func(ctx context.Context, stopped bool, actor, reason string) error
+	// RemoveMesh asks the running netd to tear the wireguard mesh down (the
+	// netd RemoveMesh RPC). Stop calls it after the node daemon is gone and
+	// while netd still serves; nothing else does. Nil skips it, and a stop
+	// that skips it reports the mesh as left behind whenever netd is loaded.
+	RemoveMesh func(ctx context.Context) error
+	// JoinedWorkers counts the worker nodes joined to this server. A server
+	// Stop calls it first, bounded by joinedWorkersTimeout, to warn that
+	// stopping the control plane cuts them off. Nil skips it; an error is a
+	// warning that the count is unknown.
+	JoinedWorkers func(ctx context.Context) (int, error)
 	// Purge makes Uninstall also remove everything it otherwise keeps: the data
 	// root (and the data volume under it), the daemon log dir, the arguments
 	// records, the k3sm context in TargetUser's kubeconfig and the service user.
@@ -1381,9 +1482,26 @@ type Config struct {
 	// manifest, and Install and Uninstall each set it from the record before
 	// they build that manifest.
 	dataVolumeDeclared bool
+	// stayStopped is set by Install when a stop marker is present and Start
+	// is not: the install lays the new tree down and restarts nothing.
+	stayStopped bool
+	// userStop is the stop marker Install found (nil: none), carried to the
+	// restart step, where an install with Start runs the start precondition
+	// and removes it.
+	userStop *userStopState
+}
+
+// userStopState is a stop marker as Install read it: the content, or the
+// error that made it unreadable (an unreadable marker still means stopped).
+type userStopState struct {
+	marker StopMarker
+	err    error
 }
 
 func (c Config) withDefaults() Config {
+	if c.StopMarker == "" {
+		c.StopMarker = DefaultStopMarkerPath
+	}
 	if c.ServiceUser == "" {
 		c.ServiceUser = DefaultServiceUser
 	}
@@ -1422,6 +1540,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.AgentArgsRecord == "" {
 		c.AgentArgsRecord = dataroot.DefaultAgentArgsRecordPath
+	}
+	if c.NetworkRecord == "" {
+		c.NetworkRecord = DefaultNetworkRecordPath
 	}
 	if c.Role == "" {
 		c.Role = RoleServer
@@ -1504,10 +1625,23 @@ func (c Config) resolvedExtraServerArgs() []string {
 	if c.MeshIP != "" {
 		args = setMeshIPArg(args, c.MeshIP)
 	}
+	if c.KubeconfigName != "" {
+		args = setKubeconfigNameArg(args, c.KubeconfigName)
+	}
+	args = c.setNodePortAddressesArg(args)
 	if c.etcdRequested() {
 		args = setEtcdArgs(args, c)
 	}
 	return setEtcdSnapshotArgs(args, c.EtcdSnapshots)
+}
+
+// kubeconfigName is the effective admin kubeconfig name: the recorded
+// --kubeconfig-name, else DefaultKubeconfigName.
+func (c Config) kubeconfigName() string {
+	if n := flagValue(c.resolvedExtraServerArgs(), kubeconfigNameFlag); n != "" {
+		return n
+	}
+	return DefaultKubeconfigName
 }
 
 // RecordedServerArgs returns the operator `k3sm server` arguments an install
@@ -1718,6 +1852,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// verification: it is what separates a failure THIS install caused from one
 	// the machine was already living with (see verifyServerNotParked).
 	startedAt := time.Now()
+	if err := preflightFromStaging(ctx, &cfg); err != nil {
+		return err
+	}
 	if cfg.BinarySource == "" {
 		return fmt.Errorf("install: BinarySource (the k3sm binary to install) is required")
 	}
@@ -1732,6 +1869,14 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// Refusing here costs an operator one command and nothing else.
 	if err := refuseCrossRole(sys, cfg); err != nil {
 		return err
+	}
+	if cfg.Role == RoleAgent && cfg.KubeconfigName != "" {
+		return fmt.Errorf("install: KubeconfigName applies to a control-plane install; a worker writes no admin kubeconfig")
+	}
+	if cfg.Role != RoleAgent {
+		if err := ValidateKubeconfigName(cfg.kubeconfigName()); err != nil {
+			return fmt.Errorf("install: %w", err)
+		}
 	}
 	// The HA request's own shape, from the Config alone: the same validator
 	// the CLI ran at parse time.
@@ -1802,15 +1947,11 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// serialised — and it is held until this function returns, which is past the
 	// reap. See System.LockInstall for why two concurrent installs are the one
 	// hazard the staging below cannot contain by itself.
-	unlock, err := sys.LockInstall(cfg.installLockPath())
+	release, err := lockForInstall(sys, cfg)
 	if err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
-	defer func() {
-		if err := unlock(); err != nil {
-			cfg.Logger.Warn("could not release the install lock", "path", cfg.installLockPath(), "err", err)
-		}
-	}()
+	defer release()
 
 	if cfg.AdminToken == "" {
 		tok, err := generateToken()
@@ -1867,6 +2008,10 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if err := checkServerMeshIP(cfg, serverArgs); err != nil {
 		return err
 	}
+	// 0b‴. A --nodeport-addresses beside a carried --network none is refused.
+	if err := checkNodePortPosture(sys, cfg, serverArgs); err != nil {
+		return err
+	}
 	// 0b′. Secrets encryption, decided from reads alone and before the first
 	//      write that follows: it needs the carried arguments above (a carried
 	//      --cluster-init or --server-join refuses it) and the data root as the
@@ -1876,12 +2021,32 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if err != nil {
 		return err
 	}
+	// 0b⁗. Did k3sm run here before? It decides the LAN switch 2d′ records.
+	prior, err := priorInstall(sys, cfg)
+	if err != nil {
+		return err
+	}
 
 	// 0c. An UPGRADE stops the daemons the previous install left running before
 	//     anything under the data root changes owner: EnsureServiceUser below
 	//     already applies the root row of the ownership table. See
 	//     stopRunningDaemons; on a first install nothing is loaded and nothing
 	//     is booted out.
+	//
+	//     A node the user stopped is updated and stays stopped unless Start:
+	//     the marker is read here, before anything is booted out or restarted,
+	//     and step 4 honours it (see restartDaemons and publishedWiring).
+	if marker, present, merr := readStopMarker(sys, cfg); present {
+		cfg.userStop = &userStopState{marker: marker, err: merr}
+		if merr != nil {
+			cfg.Logger.Warn("the stop marker is unreadable; treating this node as stopped by the user", "err", merr)
+		}
+		if !cfg.Start {
+			cfg.stayStopped = true
+			cfg.Logger.Warn("this node was stopped by the user; the install updates it and leaves it stopped (pass --start to start it)",
+				stopAttrs(marker, cfg)...)
+		}
+	}
 	stopped, err := stopRunningDaemons(ctx, sys, m, cfg.Logger)
 	// Until step 4 takes over restarting them, a failure leaves the stopped
 	// daemons stopped, and the error says so rather than leaving the operator
@@ -2044,7 +2209,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	}
 
 	// 2. THE STAGED INSTALL ROOT BEGINS HERE. Every artifact below lands in
-	//    <InstallDir>.staging, not in the live tree, and the whole set is
+	//    <InstallDir>.swap, not in the live tree, and the whole set is
 	//    published in one step at 2f. See stage.go for the hazard that buys: the
 	//    copies used to go straight into /Library/k3sm one after another, so any
 	//    fault part-way through left the new binary beside old helpers while
@@ -2186,6 +2351,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if err := writeArgsRecord(sys, cfg); err != nil {
 		return err
 	}
+	if err := writeInstallNetworkRecord(sys, cfg, prior); err != nil {
+		return err
+	}
 
 	// 2e. Read the trust anchor for the endpoint the admin kubeconfig is about to
 	//     name. WHICH certificate that endpoint presents is decided by the posture
@@ -2265,7 +2433,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//    cluster. An operator administers a k3sm cluster from the server's
 	//    kubeconfig (or a copy of it), never from the worker's.
 	if cfg.Role != RoleAgent {
-		if err := sys.WriteUserKubeconfig(cfg.TargetUser, AdminKubeconfig(cfg)); err != nil {
+		if err := sys.WriteUserKubeconfig(cfg.TargetUser, cfg.kubeconfigName(), AdminKubeconfig(cfg)); err != nil {
 			return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
 		}
 	}
@@ -2328,8 +2496,24 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	//    removed the label, so an immediate bootstrap races the teardown and loses.
 	//    restart.go sequences them — see its file comment for the failure this cost
 	//    in the field, the transient errnos, and the rollback on a mid-loop failure.
+	//    On a node the user stopped, with --start, the start's precondition
+	//    runs first and the marker goes once the daemons are verified, exactly
+	//    as `k3sm start` does it; without --start restartDaemons leaves every
+	//    long-running label alone.
+	if cfg.userStop != nil && cfg.Start {
+		d, err := readInstalledDaemons(sys, cfg)
+		if err != nil {
+			return fmt.Errorf("install: %w", err)
+		}
+		startPrecondition(ctx, sys, cfg, d, cfg.userStop.marker, cfg.userStop.err)
+	}
 	if err := restartDaemons(ctx, sys, cfg, m); err != nil {
 		return fmt.Errorf("install: %w", err)
+	}
+	if cfg.stayStopped {
+		cfg.Logger.Warn("updated, still stopped: the new release is installed and the node stays stopped; run `sudo k3sm start` to start it",
+			stopAttrs(cfg.userStop.marker, cfg)...)
+		return nil
 	}
 	for _, n := range limitNotices {
 		cfg.Logger.Info("the daemon's open-file limit changed; this install booted it out and bootstrapped it again, which is what binds a new SoftResourceLimits/HardResourceLimits NumberOfFiles (launchctl kickstart -k alone would NOT: it respawns the job with the limit captured at its last bootstrap)",
@@ -2342,6 +2526,12 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	//     else entirely (a cluster whose DNS stopped answering).
 	if err := verifyDaemons(ctx, sys, cfg, m, startedAt); err != nil {
 		return fmt.Errorf("install: %w", err)
+	}
+	if cfg.userStop != nil {
+		if err := sys.RemoveStopMarker(cfg.StopMarker); err != nil {
+			return fmt.Errorf("install: --start: the daemons are running but the stop marker %s could not be removed (run `sudo k3sm start`): %w", cfg.StopMarker, err)
+		}
+		markNode(ctx, cfg, false, ActorUser, "k3sm install --start")
 	}
 	return nil
 }
@@ -2372,6 +2562,9 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 //
 //   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
 //     because no daemon does it.
+//   - the interconnect aliases on bridge0 — SWEPT, by the
+//     FlushInterconnectAliases backstop below, scoped to the ones netd's
+//     ownership ledger names, and the ledger with them.
 //   - the pf anchor an older release loaded the mesh MSS clamp into: SWEPT, by
 //     the FlushMeshPFAnchor backstop below. Nothing loads it now (k3sm loads no
 //     pf rule), but a rule an older release left behind would survive netd,
@@ -2390,12 +2583,7 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 // With cfg.Purge set it is `k3sm uninstall --purge`: the same teardown, then
 // every artifact this one keeps (see purge).
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
-	cfg = cfg.withDefaults()
-	if cfg.Purge {
-		return purge(ctx, sys, cfg)
-	}
-	_, err := uninstall(ctx, sys, cfg, nil)
-	return err
+	return uninstallLocked(ctx, sys, cfg.withDefaults())
 }
 
 // uninstall is Uninstall's teardown, and returns the manifest it walked so a
@@ -2456,8 +2644,26 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// that would leave the operator with a half-installed machine.
 	deregisterServer(ctx, sys, cfg, m)
 	deregisterNode(ctx, cfg, m)
+	// This node's cluster index, from the identity file the interconnect sweep
+	// after the walk re-derives every alias it may remove from. The walk does
+	// NOT remove that file (it is listed as removed, and is): it goes only
+	// after the sweep completes, so a sweep that failed part-way leaves both
+	// the ledger and the index a re-run needs to finish the job.
+	identity := netdsvc.NodeIdentityPath(MeshKeyDir)
+	icIndex := interconnectNodeIndex(sys)
+	// The lo0 flush scope, read from the installed netd plist BEFORE the walk
+	// removes it, so a non-default --service-cidr is flushed. With the plist
+	// already gone (a partial earlier uninstall) the uninstall configuration's
+	// scope stands in: uninstall is the last chance to clear these aliases.
+	flush := recordedFlushPrefixes(sys, cfg)
+	if flush.err != nil {
+		flush = configFlushPrefixes(cfg)
+	}
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
+		if a.disp == dispRemove && a.kind == kindFile && a.path == identity {
+			continue
+		}
 		switch a.disp {
 		case dispPreserve:
 			// Deliberately kept — DataRoot, the human kubeconfig, the _k3sm user, LogDir.
@@ -2468,9 +2674,11 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 			continue
 		case dispRemove:
 			if a.kind == kindDaemon {
-				// Uninstall never touches the label's enabled/disabled bit
+				// The walk never touches the label's enabled/disabled bit
 				// (no launchctl enable or disable): it removes only what
 				// install created, and a disable is the operator's own act.
+				// The one disable k3sm itself makes, a user stop's, is
+				// cleared after the teardown (clearUserStop).
 				//
 				// Bootout then remove the plist — binding them so a booted-out label
 				// can never leave a leaked KeepAlive plist. But if
@@ -2506,35 +2714,31 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 			}
 		}
 	}
-	// Stop every pod process group the runtime recorded. The node daemon's own
-	// shutdown leaves native pods running on purpose (a restart re-attaches to
-	// them), so after its bootout above they are the one thing still running
-	// k3sm workloads, and a reinstall would re-attach to them. It runs here,
-	// after every daemon is booted out (none is left to start a replacement),
-	// and reads the records from the data root, which uninstall preserves.
-	note(teardownPodGroups(ctx, sys, cfg))
-	// Backstop: reap any control-plane children that outlived the booted-out
-	// server daemon (a Stop() cut short by launchd's SIGKILL, or a crash). They
-	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
-	// kine ports + the SQLite DB, breaking the next install.
-	note(sys.ReapOrphans(filepath.Join(cfg.serverWorkDir(), "bin")))
-	// Backstop: flush the pf anchor an older release loaded the mesh MSS clamp
-	// into. Nothing loads it now, so this only clears what an older release left
-	// behind, which would outlive netd scoped to a utun that is gone.
-	note(sys.FlushMeshPFAnchor())
-	// Backstop: flush the k3sm-owned lo0 aliases. They are durable kernel state
-	// no daemon removes on the way out — netd tracks per-connection alias caps
-	// (not cleanup), the server's pod teardown misses anything a failed run
-	// leaked, the Service VIP aliases (API + DNS VIPs) live for the daemon's
-	// lifetime, and the node's own mesh-egress .1 is outside the pod
-	// stale-sweep range. Scope: the pinned cluster pod aggregate + the Service
-	// CIDR — exactly the address space k3sm ever aliases (never the host's own
-	// addresses). Uninstall runs as root, so this is direct ifconfig, no helper.
-	flush := []netip.Prefix{podnet.ClusterPodCIDR}
-	if svc, err := netip.ParsePrefix(cfg.ServiceCIDR); err == nil {
-		flush = append(flush, svc)
+	// The shared post-bootout teardown (teardown.go), the same one `k3sm stop`
+	// runs: the recorded pod process groups, any k3sm-vmhost survivor, the
+	// control-plane orphans, then the pf anchor, the lo0 aliases and the
+	// interconnect aliases. It runs here, after every daemon is booted out (none
+	// is left to start a replacement), and reads the pod and vm records from the
+	// data root, which uninstall preserves. The lo0 scope was read from the
+	// installed netd plist before the walk removed it.
+	tail := teardownTail(ctx, sys, cfg, flush, icIndex)
+	for _, item := range tail.left {
+		note(item.Err)
 	}
-	note(sys.FlushLo0Aliases(flush))
+	// Then the identity file, and only when the interconnect sweep completed (an
+	// absent ledger counts): a sweep that failed keeps its ledger for a re-run,
+	// and that re-run can re-derive nothing without this node's index.
+	if !tail.interconnectSwept {
+		cfg.Logger.Warn("node identity kept so a re-run of uninstall can finish the interconnect sweep", "path", identity)
+	} else if slices.ContainsFunc(m, func(a artifact) bool { return a.disp == dispRemove && a.path == identity }) {
+		note(safeRemove(identity))
+	}
+	// A user stop leaves the labels disabled in launchd's override database and
+	// its marker on disk. Both are cleared: the labels have no plist any more,
+	// and a later install must not find this Mac "stopped" by a node that no
+	// longer exists. An operator's own disable, with no stop marker, is not
+	// touched (uninstall removes only what k3sm created).
+	note(clearUserStop(sys, cfg, m))
 	if firstErr != nil {
 		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}

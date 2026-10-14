@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -87,8 +88,9 @@ type serverOptions struct {
 	// kubeletPort is the port the in-process node serves the kubelet HTTP API
 	// (logs/exec/stats) on. Per-server for the same reason kinePort is: it is a
 	// singleton listener, so two control planes on one Mac cannot both have the
-	// default. Only the PORT is configurable — the bind stays the wildcard
-	// serverKubeletListenOn builds, and the API's auth posture is untouched.
+	// default. Only the PORT is configurable: the address is the node's own
+	// InternalIP (resolveKubeletEndpoint), never the wildcard, and the API's
+	// auth posture is untouched.
 	kubeletPort int
 	// schedulerPort / controllerManagerPort are the two co-located control-plane
 	// components' secure-serving ports. Per-server for the same reason as the
@@ -101,6 +103,9 @@ type serverOptions struct {
 	clusterIP             string // DNS VIP the per-node resolver binds + pods resolve against
 	domain                string
 	network               string // host-network backend: auto (default) | none | direct | helper
+	// nodePortAddresses is --nodeport-addresses: where this server's NodePort
+	// listeners bind (empty = every interface).
+	nodePortAddresses string
 
 	// clusterInit / serverJoin select the embedded-etcd HA posture (see
 	// etcdPosture): --cluster-init forms a new etcd cluster on this server,
@@ -122,8 +127,10 @@ type serverOptions struct {
 	etcdSnapshotCron      string
 	etcdSnapshotRetention int
 	etcdDisableSnapshots  bool
-	joinServer            string // an existing server's LAN address: the CA bundle and the etcd member route (HA server-join)
-	token                 string // static admin bearer token (standalone) or the server-class join token (HA server-join)
+	// etcdSnapshotCompress writes each scheduled snapshot as a zip archive.
+	etcdSnapshotCompress bool
+	joinServer           string // an existing server's LAN address: the CA bundle and the etcd member route (HA server-join)
+	token                string // static admin bearer token (standalone) or the server-class join token (HA server-join)
 	// tokenFile is a file holding that token, read once at start. It is how the
 	// INSTALLED daemon is given its static admin token: the value never appears
 	// on the argv a plist publishes. See resolveTokenFile.
@@ -231,13 +238,13 @@ func (opts serverOptions) etcdSnapshotSchedule() *executor.EtcdSnapshotSchedule 
 	if err != nil {
 		return nil
 	}
-	return &executor.EtcdSnapshotSchedule{Cron: cron, Retention: opts.etcdSnapshotRetention}
+	return &executor.EtcdSnapshotSchedule{Cron: cron, Retention: opts.etcdSnapshotRetention, Compress: opts.etcdSnapshotCompress}
 }
 
 // etcdSnapshotFlagsChanged reports whether any scheduled-snapshot flag differs from
 // its default.
 func (opts serverOptions) etcdSnapshotFlagsChanged() bool {
-	return opts.etcdDisableSnapshots ||
+	return opts.etcdDisableSnapshots || opts.etcdSnapshotCompress ||
 		opts.etcdSnapshotRetention != executor.DefaultEtcdSnapshotRetention ||
 		strings.Join(strings.Fields(opts.etcdSnapshotCron), " ") != executor.DefaultEtcdSnapshotCron
 }
@@ -341,8 +348,9 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.StringVar(&opts.workDir, "work-dir", defaultWorkDir, "control-plane state root (binaries, kine DB, certs, kubeconfig); posture-aware default")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.BoolVar(&opts.clearCrashLoop, "clear-crashloop", false, "clear the crash-loop record under --work-dir and exit 0 instead of serving; a parked daemon then exits and launchd starts a clean boot")
-	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise; a non-loopback value is aliased on lo0 by the pod network, so it must lie in this node's pod range (leave it at the default on a mesh server: the node then advertises --mesh-ip). Never the etcd peer address: that is --etcd-peer-ip")
+	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise (the default loopback runs a single server with the apiserver endpoint reconciler off); a non-loopback value is aliased on lo0 by the pod network, so it must lie in this node's pod range (leave it at the default on a mesh server: the node then advertises --mesh-ip). Never the etcd peer address: that is --etcd-peer-ip")
 	fs.StringVar(&opts.meshIP, "mesh-ip", "", "wireguard mesh IP to bind the apiserver + worker-join supervisor on (enables multi-node join; empty = single-node)")
+	fs.String("kubeconfig-name", "", "the name k3sm install --kubeconfig-name merged the admin kubeconfig under; recorded in the daemon's arguments for k3sm kubectl and uninstall --purge, and unused by the server itself")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
 	registerContainerLogFlags(fs, &opts.logs)
 	addRuntimeFlag(fs, &opts.rtName)
@@ -360,6 +368,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// a healthy control plane and then a node that dies with "listen tcp :10250:
 	// bind: address already in use". This renumbers the LISTENER ONLY; it does not
 	// change the bind address or the API's authn posture.
+	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
 	fs.IntVar(&opts.kubeletPort, "kubelet-port", ports.KubeletAPIPort, "kubelet HTTP API (logs/exec/stats) listen port — every node on a host needs its own")
 	// The scheduler's and controller-manager's secure ports, the last two fixed
 	// singletons in a server's listener set. A second server on the defaults gets
@@ -415,6 +424,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.StringVar(&opts.etcdSnapshotCron, "etcd-snapshot-schedule-cron", executor.DefaultEtcdSnapshotCron, "when to take a scheduled etcd snapshot, as a five-field cron expression in local time (embedded etcd HA only)")
 	fs.IntVar(&opts.etcdSnapshotRetention, "etcd-snapshot-retention", executor.DefaultEtcdSnapshotRetention, "how many of this server's scheduled etcd snapshots to keep; manual snapshots are never removed (embedded etcd HA only)")
 	fs.BoolVar(&opts.etcdDisableSnapshots, "etcd-disable-snapshots", false, "take no scheduled etcd snapshots (embedded etcd HA only)")
+	fs.BoolVar(&opts.etcdSnapshotCompress, "etcd-snapshot-compress", false, "write each scheduled etcd snapshot as a zip archive named <name>.zip; retention counts compressed and plain snapshots alike (embedded etcd HA only)")
 	// HA server-join: a SECOND control-plane server reconstructs the identical
 	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
@@ -496,8 +506,7 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	// 1b. The mesh IP must answer on this host before the apiserver binds it.
-	// FAIL-FAST, unlike the log-and-continue mesh bring-up at 4b.
+	// 1b. The mesh IP must answer here before the apiserver binds it (fail-fast, unlike 4b).
 	if err = ensureMeshIPAlias(ctx, opts.meshIP, mode, logger); err != nil {
 		return err
 	}
@@ -595,8 +604,10 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	// 4c. The node-local datapath (Service proxy + per-node DNS resolver).
-	net, nodeAddressing := startServerDatapath(ctx, plan, cs, sm, vmCapable, logger)
+	net, nodeAddressing, err := startServerDatapath(ctx, plan, cs, sm, vmCapable, logger) // 4c. Service proxy + DNS
+	if err != nil {
+		return err
+	}
 	// 4d. The worker-join supervisor; its stop closes the HA etcd admin client.
 	closeEtcdAdmin := startJoinSupervisor(ctx, plan, cs, sm, logger)
 	defer closeEtcdAdmin()
@@ -613,9 +624,8 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	// 4g/4h, then 5's label repair (prepareServerNode). The deferred crash check
-	// above names the component on the startNode path too.
-	if err = prepareServerNode(ctx, plan, cs, nodeOpts, logger); err != nil {
+	// 4g/4h, then 5's label repair (prepareServerNode); the crash check above covers startNode.
+	if err = prepareServerNode(ctx, plan, restCfg, cs, nodeOpts, logger); err != nil {
 		return err
 	}
 	return startNode(ctx, nodeOpts)
@@ -638,20 +648,27 @@ func runServer(args []string) (err error) {
 //
 // A server whose pod range is not its own (sm.dataPathRefused) starts NO datapath
 // and returns zero values: runServerNode parks it before anything reads them.
-func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions) {
+//
+// The NodePort address set is resolved here from the LAN switch (off: this Mac
+// and the mesh; on: --nodeport-addresses, empty being every interface) against
+// this Mac's addresses and the address the node advertises; an unusable or
+// empty-selecting spec is the error, and the server refuses to start rather
+// than serve NodePorts nowhere. SIGHUP re-resolves it (attachServerProxy).
+func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions, error) {
 	if sm.dataPathRefused != nil {
-		return nil, nodeOptions{}
+		return nil, nodeOptions{}, nil
 	}
 	opts, mode := plan.opts, plan.mode
 	// The kubernetes-VIP backend: ONLY the loopback-advertise posture (single
 	// node) pins the static proxy backend at the apiserver's real loopback listen
-	// address — upstream validation rejects loopback endpoint addresses, so no
-	// kubernetes EndpointSlice can exist there. A mesh apiserver binds/advertises
-	// the mesh IP, publishes its OWN valid endpoints, and the proxy must follow
-	// that real slice (a static loopback pin would route the VIP at a
-	// non-listening address).
+	// address — the executor runs that apiserver with --endpoint-reconciler-type=none
+	// (the lease reconciler rejects a loopback advertise address), so no kubernetes
+	// EndpointSlice exists there. A mesh apiserver binds/advertises the mesh IP,
+	// publishes its OWN valid endpoints, and the proxy must follow that real slice
+	// (a static loopback pin would route the VIP at a non-listening address). The
+	// decision is apiServerLoopback, the same one the executor flag keys on.
 	apiServerEndpoint := ""
-	if isLoopbackDefault(opts.nodeIP) {
+	if apiServerLoopback(opts) {
 		apiServerEndpoint = "127.0.0.1:" + strconv.Itoa(opts.apiPort)
 	}
 	// nodeAddressing holds the only inputs advertisedNodeIP reads. The full
@@ -660,37 +677,60 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	// this point. So the addressing half is built once here and nodeOpts
 	// copies it, rather than a second literal restating the same fields.
 	nodeAddressing := nodeOptions{nodeIP: opts.nodeIP, podCIDR: sm.podCIDR, netMode: mode}
-	net := netserve.New(netserve.Config{
-		Client:            cs,
-		WorkDir:           opts.workDir,
-		DNSVIP:            opts.clusterIP,
-		ClusterDomain:     opts.domain,
-		APIServerEndpoint: apiServerEndpoint,
-		NodeIP:            opts.nodeIP,
-		// The address the in-process node and the ingress host advertise. It is
-		// derived from nodeAddressing, which nodeOpts copies its three
-		// addressing fields from, so both read one value.
-		NodeAddress:       advertisedNodeIP(nodeAddressing),
-		PodCIDR:           sm.podCIDR,
-		MeshEgressIP:      sm.egressIP,
-		PeerMeshEgressIPs: sm.peerEgress,
-		VMBackend:         vmCapable,
-		VMNetSubnet:       netserve.DefaultVMNetSubnet,
-		// cs is the admin client (exec.Kubeconfig()), so the policy watcher's
-		// cluster-wide NetworkPolicies, Pods and Namespaces reads are allowed
-		// and PodScopeNode stays empty. TestServerNetservePolicyClientIsAdmin
-		// pins both.
-		EnforceNetworkPolicy: true,
-		NetdSocket:           mode.Socket,
-		Disabled:             !mode.DataPath(),
-		Logger:               logger,
+	net, err := attachDatapath(plan.lan, opts.nodePortAddresses, advertisedNodeIP(nodeAddressing), mode.DataPath(), func(nodePorts []netip.Addr) *netserve.Server {
+		return netserve.New(netserve.Config{
+			Client:            cs,
+			WorkDir:           opts.workDir,
+			DNSVIP:            opts.clusterIP,
+			ClusterDomain:     opts.domain,
+			APIServerEndpoint: apiServerEndpoint,
+			NodeIP:            opts.nodeIP,
+			// The address the in-process node and the ingress host advertise. It is
+			// derived from nodeAddressing, which nodeOpts copies its three
+			// addressing fields from, so both read one value.
+			NodeAddress:       advertisedNodeIP(nodeAddressing),
+			PodCIDR:           sm.podCIDR,
+			NodePortAddresses: nodePorts,
+			MeshEgressIP:      sm.egressIP,
+			PeerMeshEgressIPs: sm.peerEgress,
+			VMBackend:         vmCapable,
+			VMNetSubnet:       netserve.DefaultVMNetSubnet,
+			// cs is the admin client (exec.Kubeconfig()), so the policy watcher's
+			// cluster-wide NetworkPolicies, Pods and Namespaces reads are allowed
+			// and PodScopeNode stays empty. TestServerNetservePolicyClientIsAdmin
+			// pins both.
+			EnforceNetworkPolicy: true,
+			NetdSocket:           mode.Socket,
+			Disabled:             !mode.DataPath(),
+			Logger:               logger,
+		})
 	})
+	if err != nil {
+		return nil, nodeOptions{}, err
+	}
 	go func() {
 		if err := net.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("darwin-net services", "err", err)
 		}
 	}()
-	return net, nodeAddressing
+	return net, nodeAddressing, nil
+}
+
+// attachDatapath builds the datapath Server with build, handing it the
+// NodePort address set the LAN switch resolves (the switch's state, the
+// --nodeport-addresses spec and node, the address the node advertises), and
+// attaches its Service proxy to the switch so SIGHUP moves the NodePorts. A
+// node with no datapath builds with no set and attaches nothing.
+func attachDatapath(lan *lanSwitch, spec, node string, dataPath bool, build func(nodePorts []netip.Addr) *netserve.Server) (*netserve.Server, error) {
+	if !dataPath {
+		return build(nil), nil
+	}
+	var srv *netserve.Server
+	err := lan.attach(spec, node, func(sets lanSets) (lanFamily, error) {
+		srv = build(sets.nodePorts)
+		return proxyLANFamily{srv: srv}, nil
+	})
+	return srv, err
 }
 
 // serverNodeWiring is what the in-process node's options take from the phases
@@ -750,12 +790,15 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 	}
 
 	nodeOpts := nodeOptions{
+		lan:        plan.lan,
 		restConfig: nodeRESTCfg,
 		nodeName:   opts.nodeName,
-		listen:     serverKubeletListenOn(opts.kubeletPort),
-		podRoot:    opts.podRoot,
-		logs:       opts.logs,
-		nodeIP:     nodeAddressing.nodeIP,
+		// The kubelet API binds this node's own InternalIP on this port
+		// (resolveKubeletEndpoint), never the wildcard.
+		kubeletPort: opts.kubeletPort,
+		podRoot:     opts.podRoot,
+		logs:        opts.logs,
+		nodeIP:      nodeAddressing.nodeIP,
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,
 		runtime:     opts.rtName,
@@ -1002,9 +1045,10 @@ func clientCertIdentity(certPEM []byte) (string, time.Time, error) {
 //     same broken logs/exec with a less legible error;
 //   - 127.0.0.1 — the same-host dial.
 //
-// A superset is the safe direction here: every address in the set is one this node
-// already serves on (the listen is the wildcard), so naming it in a SAN grants no
-// reach that did not exist. Omitting one silently breaks logs/exec.
+// A superset is the safe direction here: a SAN names addresses the certificate may
+// be presented for, it opens no listener, and the kubelet API binds only the
+// registered InternalIP (resolveKubeletEndpoint). Omitting the registered address
+// silently breaks logs/exec.
 func serverKubeletServingIPs(nodeOpts nodeOptions, meshIP string) []net.IP {
 	advertised := nodeOpts
 	advertised.nodeIP = advertisedNodeIP(nodeOpts)
@@ -1192,4 +1236,18 @@ func canonicalServerNodeName(given string) (string, error) {
 		return "", fmt.Errorf("--node-name %q is not in canonical form; pass --node-name %s", given, name)
 	}
 	return name, nil
+}
+
+// apiServerLoopback reports whether the apiserver this server runs advertises a
+// loopback address: the address the executor hands kube-apiserver as
+// --advertise-address (the mesh IP on a mesh server, else --node-ip) tested with
+// executor.IsLoopbackNodeIP. It is the ONE decision behind both the executor's
+// --endpoint-reconciler-type=none and the proxy's static kubernetes-VIP backend
+// pin, so the two cannot disagree. Only a single loopback server qualifies; a
+// server with a peer uses a mesh IP and the lease reconciler.
+func apiServerLoopback(opts serverOptions) bool {
+	if opts.meshIP != "" {
+		return executor.IsLoopbackNodeIP(opts.meshIP)
+	}
+	return executor.IsLoopbackNodeIP(opts.nodeIP)
 }

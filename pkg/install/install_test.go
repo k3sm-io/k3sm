@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -69,6 +70,10 @@ func TestMain(m *testing.M) {
 // the install orchestration without any real privilege.
 type fakeSystem struct {
 	calls []string
+	// flushInterconnect, when set, is FlushInterconnectAliases' body after the
+	// call is recorded: a test runs the real sweep over a ledger and bridge it
+	// controls. Nil sweeps nothing and succeeds.
+	flushInterconnect func(nodeIndex int, log *slog.Logger) error
 	// podReap is the runtime reap store ReadPodReapRecords answers with, and
 	// podLeaders[pgid] the live leader start of each group (absent: no leader).
 	// podMembers[pgid][pid] the live start of each non-leader member, and
@@ -264,6 +269,15 @@ type fakeSystem struct {
 	// changes beyond the plain uninstall: markers, path stats, the service user
 	// record, the processes it runs, launchd's loaded list. See purge_fake_test.go.
 	purge fakePurge
+	// life is the fake's model of what `k3sm stop` and `k3sm start` read and
+	// change beyond launchd: the stop marker, the vm helper records, the
+	// unified log. See lifecycle_fake_test.go.
+	life fakeLifecycle
+	// failures[call] is an error the seam named by call returns (after
+	// recording the call) instead of succeeding, keyed by the call string as
+	// recorded ("ReapOrphans:<prefix>" is keyed "ReapOrphans"; see each
+	// method). The zero value fails nothing.
+	failures map[string]error
 }
 
 // delayedFile is one file of the fake root filesystem that CHANGES part-way
@@ -760,7 +774,7 @@ func (f *fakeSystem) EnsureVMRunDir(dir string, uid uint32) error {
 
 func (f *fakeSystem) ReapOrphans(binPrefix string) error {
 	f.calls = append(f.calls, "ReapOrphans:"+binPrefix)
-	return nil
+	return f.failures["ReapOrphans"]
 }
 
 // CloneToOwned records the clone with its owner and mode, and fails with
@@ -833,6 +847,25 @@ func (f *fakeSystem) LockInstall(path string) (func() error, error) {
 	f.locked[path] = true
 	return func() error {
 		f.calls = append(f.calls, "UnlockInstall:"+path)
+		delete(f.locked, path)
+		return nil
+	}, nil
+}
+
+// LockStaging models the staging lock exactly as LockInstall models the
+// install lock, in the same held-lock table, so a test pre-seeds a lock the
+// copy-out holds by setting f.locked[path].
+func (f *fakeSystem) LockStaging(path string) (func() error, error) {
+	f.calls = append(f.calls, "LockStaging:"+path)
+	if f.locked[path] {
+		return nil, fmt.Errorf("%w (its lock is held at %s)", ErrStagingBusy, path)
+	}
+	if f.locked == nil {
+		f.locked = map[string]bool{}
+	}
+	f.locked[path] = true
+	return func() error {
+		f.calls = append(f.calls, "UnlockStaging:"+path)
 		delete(f.locked, path)
 		return nil
 	}, nil
@@ -1220,7 +1253,7 @@ func (f *fakeSystem) putWedgedSocket(path string) {
 	f.wedgedSockets[path] = true
 }
 
-func (f *fakeSystem) WriteUserKubeconfig(targetUser string, contents []byte) error {
+func (f *fakeSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) error {
 	f.calls = append(f.calls, "WriteUserKubeconfig:"+targetUser)
 	f.kubeUser = targetUser
 	f.kubeContent = string(contents)
@@ -1289,7 +1322,7 @@ func (f *fakeSystem) RemoveAll(path string) error {
 // staging path's trust check then reads), and really creates it.
 //
 // A permission error from the real mkdir is tolerated, and only that one: an
-// unprivileged unit test legitimately asks for /Library/k3sm.staging, which it
+// unprivileged unit test legitimately asks for /Library/k3sm.swap, which it
 // cannot create and does not need to — the ownership table above is the model
 // those tests assert against. A test that needs a real directory (the data-root
 // migration, which really copies trees) names one under its own t.TempDir(),
@@ -1569,12 +1602,23 @@ func (f *fakeSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 		strs[i] = p.String()
 	}
 	f.calls = append(f.calls, "FlushLo0Aliases:"+strings.Join(strs, ","))
+	return f.failures["FlushLo0Aliases"]
+}
+
+func (f *fakeSystem) FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error {
+	f.calls = append(f.calls, fmt.Sprintf("FlushInterconnectAliases:%s:%d", ledgerPath, nodeIndex))
+	if err := f.failures["FlushInterconnectAliases"]; err != nil {
+		return err
+	}
+	if f.flushInterconnect != nil {
+		return f.flushInterconnect(nodeIndex, log)
+	}
 	return nil
 }
 
 func (f *fakeSystem) FlushMeshPFAnchor() error {
 	f.calls = append(f.calls, "FlushMeshPFAnchor")
-	return nil
+	return f.failures["FlushMeshPFAnchor"]
 }
 
 func (f *fakeSystem) ReadPodReapRecords(dataRoot string) ([]runtimed.PodReapRecord, error) {
@@ -1594,8 +1638,9 @@ func (f *fakeSystem) ProcessGroupMemberStart(pgid, pid int) (int64, bool) {
 
 func (f *fakeSystem) SignalProcessGroup(pgid int, sig syscall.Signal) error {
 	name := map[syscall.Signal]string{syscall.SIGTERM: "TERM", syscall.SIGKILL: "KILL"}[sig]
-	f.calls = append(f.calls, fmt.Sprintf("Signal:%d:%s", pgid, name))
-	return nil
+	call := fmt.Sprintf("Signal:%d:%s", pgid, name)
+	f.calls = append(f.calls, call)
+	return f.failures[call]
 }
 
 func (f *fakeSystem) WaitProcessGroupsGone(_ context.Context, pgids []int, timeout time.Duration) []int {
@@ -1706,6 +1751,10 @@ func TestInstallOrchestration(t *testing.T) {
 		// over step below, rather than repeated.
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"ReadFile:" + dataroot.DefaultServerArgsRecordPath,
+		// Did k3sm run here before? A read, before any write: it decides the
+		// LAN switch an install with neither --lan nor a record writes (the
+		// fake reports every path present, so this answers at the first one).
+		"PathExists:/Library/LaunchDaemons/io.k3sm.server.plist",
 		// The upgrade check: is any daemon an earlier install left running?
 		// Read-only probes, node daemon first; on this first install neither is
 		// loaded, so nothing is booted out before the state tree is re-owned.
@@ -1785,45 +1834,46 @@ func TestInstallOrchestration(t *testing.T) {
 		// a first install, so nothing is removed) and created, and every
 		// artifact below lands in it rather than in the tree the daemons are
 		// executing out of.
-		"Owner:/Library/k3sm.staging",
-		"EnsureRootDir:/Library/k3sm.staging",
-		"CopyToRootOwned:/Library/k3sm.staging/k3sm",
-		"CopyToRootOwned:/Library/k3sm.staging/k3sm-execshim",
-		"CopyToRootOwned:/Library/k3sm.staging/libk3sm_pathrebase_shim.dylib",
-		"CopyToRootOwned:/Library/k3sm.staging/libk3sm_getaddrinfo_shim.dylib",
+		"Owner:/Library/k3sm.swap",
+		"EnsureRootDir:/Library/k3sm.swap",
+		"CopyToRootOwned:/Library/k3sm.swap/k3sm",
+		"CopyToRootOwned:/Library/k3sm.swap/k3sm-execshim",
+		"CopyToRootOwned:/Library/k3sm.swap/libk3sm_pathrebase_shim.dylib",
+		"CopyToRootOwned:/Library/k3sm.swap/libk3sm_getaddrinfo_shim.dylib",
 		// The helper's entitlement was already verified, in the preflight block
 		// before any of these copies ran (see above) — this copy can now only
 		// fail on an I/O error.
-		"CopyToRootOwned:/Library/k3sm.staging/k3sm-vmhost",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-apiserver",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-scheduler",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-controller-manager",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kubectl",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kine",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/etcd",
+		"CopyToRootOwned:/Library/k3sm.swap/k3sm-vmhost",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kube-apiserver",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kube-scheduler",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kube-controller-manager",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kubectl",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kine",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/etcd",
 		// etcdutl, built from the etcd wrapper: `k3sm snapshot restore` runs it
 		// offline on an etcd server.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/etcdutl",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/etcdutl",
 		// The pinned helm the helm controller's Jobs run, a payload binary like
 		// kubectl.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + helmchart.HelmBinaryName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + helmchart.HelmBinaryName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/zot",
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KineMarkerName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KineMarkerName,
 		// The etcd version marker, staged the same best-effort way.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.EtcdMarkerName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.EtcdMarkerName,
 		// The etcdutl version marker, staged the same best-effort way.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.EtcdutlMarkerName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.EtcdutlMarkerName,
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KubeMarkerName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KubeMarkerName,
 		// The shadow binary set, staged with the binary that uses it: each copy
 		// in the shared list cloned root:wheel 0755, re-signed ad hoc, verified,
 		// its source's cdhash read, then the manifest (TestShadowSetIsMadeAtInstall
 		// owns the detail).
-		"EnsureRootDir:/Library/k3sm.staging/shadow",
-	}, shadowSetCalls("/Library/k3sm.staging/shadow", nil), []string{
-		"WriteRootOnlyFile:/Library/k3sm.staging/shadow/sources.json:0644",
+		"EnsureRootDir:/Library/k3sm.swap/shadow",
+	}, shadowSetCalls("/Library/k3sm.swap/shadow", nil), []string{
+		"WriteRootOnlyFile:/Library/k3sm.swap/shadow/sources.json:0644",
 		// The installed server plist and args record were already read, in the
 		// preflight block before any of these copies ran (see above); the carry-
 		// over below reuses that answer — nothing, on a first install — rather
@@ -1831,6 +1881,9 @@ func TestInstallOrchestration(t *testing.T) {
 		// And whatever was carried — nothing, on a first install — is recorded
 		// again, before the plist that will not survive the next uninstall.
 		"WriteServerArgsRecord:" + dataroot.DefaultServerArgsRecordPath,
+		// The LAN switch: none recorded, so it is written, beside the record.
+		"Owner:" + DefaultNetworkRecordPath,
+		"WriteRootOnlyFile:" + DefaultNetworkRecordPath + ":0644",
 		// The trust anchor for the endpoint the admin kubeconfig will name, read
 		// AFTER the arguments are resolved (they decide the posture, so they decide
 		// which certificate the apiserver serves) and BEFORE the daemons restart, so
@@ -1842,7 +1895,7 @@ func TestInstallOrchestration(t *testing.T) {
 		// PUBLISH. One operation makes the whole staged tree live; `:rename` is
 		// the first-install branch (there was no tree at /Library/k3sm to
 		// exchange with), so there is nothing to reap afterwards.
-		"SwapInstallRoot:/Library/k3sm.staging<->/Library/k3sm:rename",
+		"SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename",
 		// The launcher link and the plists come AFTER it, and only after it:
 		// each names a fixed absolute path inside the install root, and that
 		// path holds this install's binary only now. Copying into /Library/k3sm
@@ -1953,8 +2006,8 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			// The FIRST privileged call — the refuse-before-write probes ahead of
 			// it (the cross-role plist read, the launcher-directory trust read,
 			// the staged vmhost helper's entitlement, the carried server
-			// arguments' retired-flag check and the free-space
-			// estimate) are all reads, the install-wide lock creates no state
+			// arguments' retired-flag check, the earlier-install probe and the
+			// free-space estimate) are all reads, the install-wide lock creates no state
 			// the install owns, and install performs nothing else before the
 			// service user exists: the data root is its home, and every later
 			// step writes into it.
@@ -1962,7 +2015,8 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			var first string
 			for _, c := range f.calls {
 				if strings.HasPrefix(c, "ReadFile:") || strings.HasPrefix(c, "LinkDirTrust:") || strings.HasPrefix(c, "VerifyVirtualizationEntitlement:") ||
-					strings.HasPrefix(c, "InstallSpace:") || strings.HasPrefix(c, "LockInstall:") || strings.HasPrefix(c, "ServicePID:") {
+					strings.HasPrefix(c, "InstallSpace:") || strings.HasPrefix(c, "LockInstall:") || strings.HasPrefix(c, "ServicePID:") ||
+					strings.HasPrefix(c, "PathExists:") {
 					continue
 				}
 				first = c
@@ -1998,7 +2052,7 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// `k3sm-m2` would arrive under the live root under that same wrong name.
 	// The head is therefore stated as the staged counterpart of each fixed
 	// installed path, which is exactly what the swap then republishes.
-	stage := "/Library/k3sm" + installStagingSuffix
+	stage := "/Library/k3sm" + installSwapSuffix
 	fixedHead := []string{stage + "/k3sm", stage + "/k3sm-execshim", stage + "/" + PathShimName, stage + "/" + DNSShimName, stage + "/" + VMHostName}
 	if len(dsts) < len(fixedHead) {
 		t.Fatalf("only %d copies %v, want at least the fixed head %v (never the source basename)", len(dsts), dsts, fixedHead)
@@ -2075,6 +2129,10 @@ func TestUninstallIdempotent(t *testing.T) {
 		t.Fatalf("Uninstall: %v", err)
 	}
 	want := []string{
+		// Both locks first, in the one fixed order: the k3sm.app staging lock
+		// (outer), then the install lock (inner).
+		"LockStaging:/Library/k3sm.staging.lock",
+		"LockInstall:/Library/k3sm.lock",
 		// Uninstall asks the disk which roles are installed before it tears
 		// anything down, so a Mac that was installed as a worker has its agent
 		// daemon swept by the same run.
@@ -2084,17 +2142,19 @@ func TestUninstallIdempotent(t *testing.T) {
 		// LogDir: every file in it belongs to a pod that will not exist once k3sm
 		// is uninstalled, and it is a root-equivalent tree of former workloads'
 		// output.
+		// This node's cluster index is read BEFORE the walk removes the
+		// identity file it comes from; the interconnect sweep needs it.
+		"ReadRegularFile:/var/lib/k3sm/keys/node-pod-cidr",
+		// The lo0 flush scope, read from the installed netd plist's
+		// --service-cidr before the walk removes it (absent here, so the
+		// uninstall configuration's default stands in at the flush below).
+		"ReadFile:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"RemoveAll:/var/log/containers",
 		"RemoveAll:/var/log/pods",
 		"Bootout:io.k3sm.server",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
-		// The pod CIDR netd adopted from this role's join, removed only after
-		// netd is booted out (so it cannot rewrite it) and the one leaf of the
-		// preserved mesh key dir that goes: a role change goes through
-		// uninstall, and the next role's netd must not restore this /24.
-		"RemoveAll:/var/lib/k3sm/keys/node-pod-cidr",
 		// A joining HA server's staged server-class join token, removed in the
 		// same position as the admin token below and for the same reason; on a
 		// server that never joined, removing an absent file is a no-op.
@@ -2111,6 +2171,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		// Every recorded pod process group is read once the daemons are gone
 		// (this node recorded none).
 		"ReadPodReapRecords:/var/lib/k3sm",
+		// ...and every k3sm-vmhost helper the runtime recorded (none here):
+		// one that outlived its daemon is killed by its recorded identity.
+		"ReadVMHostRecords:/var/lib/k3sm",
 		"ReapOrphans:/var/lib/k3sm/server/bin",
 		// The mesh pf anchor flush (B274) is the uninstall backstop for the
 		// MSS-clamp rule netd's own shutdown path never reaches.
@@ -2119,6 +2182,23 @@ func TestUninstallIdempotent(t *testing.T) {
 		// pod /32s, the API/DNS VIPs, and the node mesh-egress .1 (which the pod
 		// stale-sweep deliberately never touches) all fall inside these two.
 		"FlushLo0Aliases:100.64.0.0/10,10.43.0.0/16",
+		// The interconnect aliases netd's ledger owns, and the ledger, swept
+		// after netd is gone (it is the ledger's only writer).
+		"FlushInterconnectAliases:/var/lib/k3sm/keys/interconnect-aliases:-1",
+		// The pod CIDR netd adopted from this role's join, removed only after
+		// netd is booted out (so it cannot rewrite it) and after the
+		// interconnect sweep that re-derives its aliases from it completed. It
+		// is the one leaf of the preserved mesh key dir that goes: a role
+		// change goes through uninstall, and the next role's netd must not
+		// restore this /24.
+		"RemoveAll:/var/lib/k3sm/keys/node-pod-cidr",
+		// The staging sweep: the k3sm.app staging root and the install swap
+		// dir, each judged by lstat (absent here, so nothing is removed).
+		"Owner:/Library/k3sm.staging",
+		"Owner:/Library/k3sm.swap",
+		// The locks released in reverse.
+		"UnlockInstall:/Library/k3sm.lock",
+		"UnlockStaging:/Library/k3sm.staging.lock",
 	}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("uninstall calls = %v, want %v", f.calls, want)
@@ -2484,7 +2564,7 @@ func fileDispByPath(m []artifact, path string) (disposition, bool) {
 // ever disagree, the manifest coverage gate goes red, which is the outcome you
 // want from a drifting redirection.
 func publishedPath(cfg Config, p string) string {
-	prefix := cfg.stagingDir() + "/"
+	prefix := cfg.swapDir() + "/"
 	if !strings.HasPrefix(p, prefix) {
 		return p
 	}
@@ -2800,8 +2880,8 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 		// Under staging that means after the PUBLISH, not merely after the copy:
 		// the copy puts the binary in the sibling tree, and /Library/k3sm/k3sm
 		// (the path this link names) exists only once the publish has run.
-		publish := idx(f.calls, "SwapInstallRoot:/Library/k3sm.staging<->/Library/k3sm:rename")
-		if binary := idx(f.calls, "CopyToRootOwned:/Library/k3sm.staging/k3sm"); binary < 0 || link < binary {
+		publish := idx(f.calls, "SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename")
+		if binary := idx(f.calls, "CopyToRootOwned:/Library/k3sm.swap/k3sm"); binary < 0 || link < binary {
 			t.Errorf("link (%d) must be laid down after the binary copy (%d)", link, binary)
 		}
 		if publish < 0 || link < publish {

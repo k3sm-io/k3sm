@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -1262,14 +1263,33 @@ func (darwinSystem) RemoveTree(path string) error {
 // it is empty, it is the lock's name, and removing it would race the next
 // acquirer onto a different inode.
 func (darwinSystem) LockInstall(path string) (func() error, error) {
+	return flockNoWait(path, "the install lock", func() error {
+		return fmt.Errorf("%w (its lock is held at %s; wait for it to finish, or check for a stopped `k3sm install`)", ErrInstallInProgress, path)
+	})
+}
+
+// LockStaging takes the k3sm.app staging lock at path. It is LockInstall's
+// mechanism on a different file, and the copy-out takes the same lock with
+// lockf(1), which on macOS is an flock(2) on the same file, so the two
+// exclude each other.
+func (darwinSystem) LockStaging(path string) (func() error, error) {
+	return flockNoWait(path, "the staging lock", func() error {
+		return fmt.Errorf("%w (its lock is held at %s)", ErrStagingBusy, path)
+	})
+}
+
+// flockNoWait opens (creating) path and takes an exclusive flock on it without
+// waiting. busy builds the error for a lock another process holds. The lock
+// file is left on disk on release: see LockInstall.
+func flockNoWait(path, what string, busy func() error) (func() error, error) {
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, uint32(installLockMode))
 	if err != nil {
-		return nil, fmt.Errorf("open the install lock %s: %w", path, err)
+		return nil, fmt.Errorf("open %s %s: %w", what, path, err)
 	}
 	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = unix.Close(fd)
 		if errors.Is(err, unix.EWOULDBLOCK) {
-			return nil, fmt.Errorf("%w (its lock is held at %s; wait for it to finish, or check for a stopped `k3sm install`)", ErrInstallInProgress, path)
+			return nil, busy()
 		}
 		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}
@@ -1282,7 +1302,7 @@ func (darwinSystem) LockInstall(path string) (func() error, error) {
 			return fmt.Errorf("unlock %s: %w", path, err)
 		}
 		if err := unix.Close(fd); err != nil {
-			return fmt.Errorf("close the install lock %s: %w", path, err)
+			return fmt.Errorf("close %s %s: %w", what, path, err)
 		}
 		return nil
 	}, nil
@@ -1939,14 +1959,14 @@ func (darwinSystem) LaunchctlServicePID(label string) (int, error) {
 // sudo. Any pre-existing clusters/contexts are preserved — install must never
 // clobber a developer's other kubeconfigs (uninstall likewise leaves the file).
 // The write is atomic (temp + rename) so a crash mid-write can't corrupt the file.
-func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) error {
+func (darwinSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) error {
 	u, err := user.Lookup(targetUser)
 	if err != nil {
 		return fmt.Errorf("lookup target user %s: %w", targetUser, err)
 	}
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
-	if err := writeUserKubeconfig(u.HomeDir, uid, gid, contents); err != nil {
+	if err := writeUserKubeconfig(u.HomeDir, uid, gid, name, contents); err != nil {
 		return fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
 	}
 	return nil
@@ -1962,7 +1982,7 @@ func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) erro
 // belongs to the target user, who can replace the published config with a
 // symlink the instant the rename lands; a chown by path after it would follow
 // that link and hand whatever it names to the target user, so there is none.
-func writeUserKubeconfig(homeDir string, uid, gid int, contents []byte) error {
+func writeUserKubeconfig(homeDir string, uid, gid int, name string, contents []byte) error {
 	kubeDir := filepath.Join(homeDir, ".kube")
 	if err := os.MkdirAll(kubeDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", kubeDir, err)
@@ -1979,7 +1999,7 @@ func writeUserKubeconfig(homeDir string, uid, gid int, contents []byte) error {
 	if rerr != nil && !os.IsNotExist(rerr) {
 		return fmt.Errorf("read existing kubeconfig %s: %w", path, rerr)
 	}
-	merged, err := mergeAdminKubeconfig(existing, contents, adminContextName)
+	merged, err := mergeAdminKubeconfig(existing, contents, name)
 	if err != nil {
 		return fmt.Errorf("merge admin kubeconfig into %s: %w", path, err)
 	}
@@ -2151,6 +2171,22 @@ func (darwinSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 	}
 	return errors.Join(errs...)
 }
+
+// FlushInterconnectAliases sweeps the interconnect aliases netd's ownership
+// ledger names (see sweepInterconnect): only a root-owned regular ledger is
+// read, only this node's re-derived aliases with the right netmask are removed
+// (`/sbin/ifconfig bridge0 -alias <ip>`, /32s before the slot-0 /24), and the
+// ledger goes once every removal succeeded. It runs as root after netd is
+// booted out. bridge0's membership is never touched.
+func (darwinSystem) FlushInterconnectAliases(ledgerPath string, nodeIndex int, log *slog.Logger) error {
+	return sweepInterconnect(ledgerPath, nodeIndex, 0, func(args ...string) ([]byte, error) {
+		return exec.Command(ifconfigPath, args...).CombinedOutput()
+	}, log)
+}
+
+// ifconfigPath is ifconfig by absolute path, so a root uninstall never runs
+// whatever a PATH entry names ifconfig.
+const ifconfigPath = "/sbin/ifconfig"
 
 // FlushMeshPFAnchor flushes every rule in the pf anchor (mesh.PFAnchor,
 // "io.k3sm.mesh") that an older release loaded the mesh MSS clamp into. Nothing
@@ -2568,14 +2604,17 @@ func (darwinSystem) BootoutUserDomain(ctx context.Context, uid uint32) error {
 	return nil
 }
 
-// RemoveAdminKubeconfigContext removes the k3sm context from targetUser's
+// RemoveAdminKubeconfigContext removes the context keyed name from targetUser's
 // ~/.kube/config. See the System interface.
-func (darwinSystem) RemoveAdminKubeconfigContext(targetUser string) (bool, error) {
-	u, err := user.Lookup(targetUser)
-	if err != nil {
-		return false, fmt.Errorf("lookup target user %s: %w", targetUser, err)
+func (darwinSystem) RemoveAdminKubeconfigContext(targetUser, homeDir, name string) (bool, error) {
+	if homeDir == "" {
+		u, err := user.Lookup(targetUser)
+		if err != nil {
+			return false, fmt.Errorf("lookup target user %s: %w", targetUser, err)
+		}
+		homeDir = u.HomeDir
 	}
-	removed, err := removeUserKubeconfigContext(u.HomeDir)
+	removed, err := removeUserKubeconfigContext(homeDir, name)
 	if err != nil {
 		return false, fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
 	}
@@ -2590,7 +2629,7 @@ func (darwinSystem) RemoveAdminKubeconfigContext(targetUser string) (bool, error
 // owner and mode are bound to its open descriptor before the rename — here
 // the ORIGINAL file's owner and mode, read off the descriptor the content was
 // read from. A symlinked ~/.kube or ~/.kube/config is refused, not followed.
-func removeUserKubeconfigContext(homeDir string) (bool, error) {
+func removeUserKubeconfigContext(homeDir, name string) (bool, error) {
 	kubeDir := filepath.Join(homeDir, ".kube")
 	if _, err := os.Lstat(kubeDir); errors.Is(err, fs.ErrNotExist) {
 		return false, nil
@@ -2622,7 +2661,7 @@ func removeUserKubeconfigContext(homeDir string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("read %s: %w", path, err)
 	}
-	out, changed, err := unmergeAdminKubeconfig(existing, adminContextName)
+	out, changed, err := unmergeAdminKubeconfig(existing, name)
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", path, err)
 	}

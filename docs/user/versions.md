@@ -19,13 +19,13 @@ updates the register. Treat that pin, and `k3sm version`, as the source of truth
 
 ## Current Skew (Point-in-Time)
 
-At the time of writing:
+On `main` at the time of writing (the v0.1.7 release pins v1.36.5 and v0.36.5):
 
-- **Control plane** (embedded kube-apiserver / KCM / scheduler): `DefaultKubeVersion` **v1.36.2**.
-- **Client libraries** (`k8s.io/api`, `k8s.io/client-go`): **v0.35.0**.
+- **Control plane** (embedded kube-apiserver / KCM / scheduler): `DefaultKubeVersion` **v1.37.1**.
+- **Client libraries** (`k8s.io/api`, `k8s.io/client-go`): **v0.37.1**.
 
-The one-minor skew between the control-plane pin and the client-go line is expected. If the numbers here
-disagree with `k3sm version`, **the live output wins**. A future pin bump moves the register and the
+The client libraries match the control-plane minor. If the numbers here disagree with `k3sm version`,
+**the live output wins**. A future pin bump moves the register and the
 binary before this prose catches up.
 
 ## Compatibility

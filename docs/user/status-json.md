@@ -91,6 +91,7 @@ that joined one). A Mac with no install reports `server`.
 | `role` | string | `server` or `agent` |
 | `summary` | string | one sentence for a person; do not parse it |
 | `daemons` | array of rows | always two: `netd`, then the node daemon (`server` on a control plane, `agent` on a worker) |
+| `stoppedBy` | object | who stopped k3sm on this Mac (see [Stopped by](#stopped-by)); omitted when no stop is recorded |
 
 The rows are the same rows, built the same way, as the full report's rows of the same names. The
 verdict comes from the same function as the full report's, fed the install check and these two
@@ -144,6 +145,11 @@ four.
 | `rows` | array of rows | one per subsystem, in display order |
 | `next` | array of strings | the commands to run next, most urgent first; omitted when empty |
 | `peers` | array | reserved for mesh peers (`name`, `state`, `detail`); not emitted yet |
+| `interconnect` | object | the cluster's interconnect and its attached Pods (see [Interconnect](#interconnect)); omitted when the cluster has none, or the report could not read it |
+| `stoppedBy` | object | who stopped k3sm on this Mac (see [Stopped by](#stopped-by)); omitted when no stop is recorded |
+| `network` | object | this node's LAN access setting (see [Network](#network)); omitted when k3sm is not installed or the setting cannot be read |
+| `workers` | array | on a server, the cluster's other nodes and their versions (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
+| `joinTarget` | string | on a worker, the server endpoint it joined (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
 | `version` | object | the build that produced the report; `modules` is omitted when unknown |
 | `host` | string | the macOS version, empty when it could not be read |
 | `timestamp` | string | RFC 3339 |
@@ -151,7 +157,7 @@ four.
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig` and `runtimed`; some rows appear only when the
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
-`mesh-claims`, `node-resolver`, `shadow-shells`, `request-header`). Besides the daemon states above, a row's `state` may
+`mesh-claims`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
 `skip`, `drift`, `healthy`, `unhealthy` or `stale`.
 
@@ -169,11 +175,152 @@ snapshot it also carries `last-scheduled-snapshot-error` (the last failure) and
 the free space could not be read). Like every `wide` key, these are informational and not part of
 the contract.
 
+## Stopped by
+
+Both shapes carry an optional `stoppedBy` object while `k3sm stop` has recorded a stop on this Mac.
+It is additive: `schemaVersion` stays `1`, and the `verdict` and every row `state` keep their
+words (a stopped Mac still reports `stopped`, or a daemon `disabled`). `stoppedBy` only says who
+asked for it.
+
+```json
+"stoppedBy": {
+  "actor": "user",
+  "reason": "maintenance window",
+  "at": "2026-09-05T09:28:30Z",
+  "phase": "stopped"
+}
+```
+
+| field | type | notes |
+|---|---|---|
+| `actor` | string | `user` for a person's `k3sm stop`, `auto` for a stop k3sm itself made |
+| `reason` | string | the reason given at the stop; may be empty |
+| `at` | string | RFC 3339, when the stop began |
+| `phase` | string | `stopping` while a stop has left something behind (re-run `sudo k3sm stop` to converge), `stopped` once nothing was left |
+
+The object is omitted when there is no stop marker, and also when the marker cannot be read or
+parsed: a damaged marker never fails the report. Readers must treat a missing `stoppedBy` as
+"no recorded stop", not as "running". [Stopping and starting](stop-start.md) covers the verbs that write it.
+
+## Network
+
+The full report carries an optional `network` object on an installed Mac: the LAN access setting
+`k3sm network lan` and `k3sm install --lan` record, and, when the caller can read it, what the node
+daemon reports applying. It is additive: `schemaVersion` stays `1`, and it adds no `verdict` or row
+`state` word. The daemons probe does not carry it.
+
+```json
+"network": {
+  "lan": "off",
+  "recorded": true,
+  "covers": ["nodeports", "loadbalancers", "ingress"],
+  "alwaysOn": ["apiserver", "join", "mesh"],
+  "applied": { "lan": "off", "serial": "4f0c2a9e1b7d3c55" }
+}
+```
+
+| field | type | notes |
+|---|---|---|
+| `lan` | string | the recorded setting: `on` (the covered listeners answer on every interface) or `off` (only on this Mac and the cluster mesh) |
+| `recorded` | boolean | `false` when no setting is recorded (an install from before the switch), in which case `lan` is `on` |
+| `covers` | array of strings | the listener families the setting controls: `nodeports`, `loadbalancers`, and `ingress` on a server |
+| `alwaysOn` | array of strings | the network-facing listeners it does not control: `apiserver`, `join` and `mesh` on a server, `mesh` on a worker |
+| `applied` | object | the node daemon's own report: `lan` (what it serves), `serial` (the write it acted on) and `error` (why its last change was refused, omitted when none); omitted when the caller cannot read the report, which is in the daemon's work dir and readable by root |
+
+When `applied.lan` differs from `lan`, or `applied.error` is set, the node is not serving the recorded
+setting; the human view says so on its own line, and also says when the applied state is readable by
+root only. `sudo k3sm network lan on|off` checks the daemon's listening sockets itself before it
+reports success. Readers must treat a missing `network` as "unknown", not as either value.
+
+## Workers and join target
+
+Two optional fields describe the cluster around this Mac. Both are additive: `schemaVersion` stays
+`1`, and neither adds a `verdict` or row `state` word. The daemons probe carries neither.
+
+On a server, `workers` lists every other node in the cluster, sorted by name, from the same node list
+the `node` row reads:
+
+```json
+"workers": [
+  { "name": "node-a", "role": "server", "version": "v1.36.2+k3sm.0.1.7" },
+  { "name": "node-b", "role": "agent", "version": "v1.36.2+k3sm.0.1.6" }
+]
+```
+
+| field | type | notes |
+|---|---|---|
+| `name` | string | the node's name |
+| `role` | string | `server` when the node carries the `node-role.kubernetes.io/control-plane` label, `agent` otherwise |
+| `version` | string | the kubelet version the node reports: the Kubernetes version, then `+k3sm.` and the k3sm release as semver build metadata; omitted while the node has reported none |
+
+A node cannot set the `node-role.kubernetes.io/control-plane` label on itself; only a cluster admin
+can. k3sm does not set it, so in a cluster with more than one server the other servers report `agent`
+unless an admin has labelled them.
+
+`version` is the node's own report of its kubelet version. It is advisory, not an attestation: the
+node writes it, and nothing verifies it against the binary the node runs. A missing `version` means
+unknown, and a reader comparing versions must treat it as not satisfying any minimum.
+
+An empty list means the server read its nodes, found its own node by name, and there are no others.
+A missing `workers` means the answer is unknown: this Mac is a worker, the apiserver did not answer,
+the node list could not be read, or no node in the list carries this server's name (even when the
+list holds a single node). Readers must not treat a missing `workers` as "no workers".
+
+On a worker, `joinTarget` is the bootstrap endpoint of the server this Mac was installed to join, as
+`host:port`:
+
+```json
+"joinTarget": "192.0.2.10:9345"
+```
+
+It is the `--server` host of the installed worker daemon with the join port, and nothing else from
+that daemon's arguments. The host is reported only when it is an IPv4 address or a DNS name made of
+letters, digits, `-` and `.`, at most 253 characters long. `joinTarget` is omitted on a server, on a
+worker whose daemon configuration cannot be read, and when the `--server` value is anything else:
+an IPv6 address, a value that already carries a port, or one with any other character.
+
+## Interconnect
+
+The `interconnect` object describes the cluster's [interconnect](interconnects.md), read from the
+`Interconnect` named `thunderbolt`. The `interconnect` row says the same thing as a sentence.
+
+```json
+"interconnect": {
+  "name": "thunderbolt",
+  "armed": true,
+  "armedBy": "alice",
+  "plaintext": true,
+  "members": 3,
+  "up": 2,
+  "segments": 1,
+  "outOfRange": [ "far-mac" ],
+  "pods": [ { "namespace": "mlx", "pod": "llama-0", "node": "node-a", "address": "169.254.0.2" } ]
+}
+```
+
+| field | type | notes |
+|---|---|---|
+| `name` | string | the interconnect's name, its medium |
+| `armed` | boolean | whether an admin enabled it; nothing has an interconnect address until one does |
+| `armedBy` | string | the identity recorded when it was armed; omitted when none is recorded |
+| `plaintext` | boolean | `true` whenever it is armed: opted-in Pod traffic crosses the cable unencrypted |
+| `members` | number | the cabled nodes the server resolved |
+| `up` | number | the members that are usable |
+| `segments` | number | the groups of members that reach each other over cables |
+| `outOfRange` | array of strings | cabled nodes whose cluster index is above 30, which get no interconnect address; omitted when empty |
+| `pods` | array | every Pod whose `k3sm.io/InterconnectAttached` condition is `True`, sorted by namespace and name: `namespace`, `pod`, `node`, `address`; omitted when empty |
+
+The row's `state` is `disabled` (severity `skip`) while the interconnect is disarmed, `ok` when every
+member is up, and `partial` or `down` (severity `warn`) when a member is not up or a cabled node is
+out of range. The row never moves `verdict`. On a worker, whose node credential may not read the
+`Interconnect`, the row is `skip` and the object is omitted. `k3sm status cluster` lists each
+attached Pod in the row's `wide` keys.
+
 ## Rows
 
 | field | type | notes |
 |---|---|---|
-| `name` | string | stable lowercase token |
+| `name` | string | stable lowercase token; look a row up by its `name`, never by its position, because rows appear only when the thing they describe exists |
 | `state` | string | see the state tables above |
 | `severity` | string | `ok`, `warn`, `fail`, `skip` or `unknown` |
 | `detail` | string | one sentence for a person; do not parse it |

@@ -32,9 +32,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -46,9 +49,30 @@ var (
 	// reportRequired and reportOptional are the top-level keys of `k3sm status
 	// -o json`. The optional ones are omitted when empty.
 	reportRequired = []string{"schemaVersion", "verdict", "role", "summary", "rows", "version", "host", "timestamp"}
-	reportOptional = []string{"next", "peers"}
+	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy", "network", "workers", "joinTarget"}
+	// workerRequired and workerOptional are the keys of each entry of the
+	// optional workers list; version is omitted while a kubelet has reported
+	// none.
+	workerRequired = []string{"name", "role"}
+	workerOptional = []string{"version"}
+	// networkRequired are the keys of the optional network object.
+	networkRequired = []string{"lan", "recorded", "covers", "alwaysOn"}
+	// networkOptional are the optional keys of the network object.
+	networkOptional = []string{"applied"}
+	// networkAppliedRequired / Optional are the keys of network.applied.
+	networkAppliedRequired = []string{"lan", "serial"}
+	networkAppliedOptional = []string{"error"}
+	// stoppedByRequired are the keys of the optional stoppedBy object.
+	stoppedByRequired = []string{"actor", "reason", "at", "phase"}
+	// interconnectRequired and interconnectOptional are the keys of the
+	// report's interconnect block, and interconnectPodRequired those of each
+	// attached pod in it.
+	interconnectRequired    = []string{"name", "armed", "plaintext", "members", "up", "segments"}
+	interconnectOptional    = []string{"armedBy", "outOfRange", "pods"}
+	interconnectPodRequired = []string{"namespace", "pod", "node", "address"}
 	// daemonsRequired is the whole of `k3sm status daemons -o json`.
 	daemonsRequired = []string{"schemaVersion", "verdict", "role", "summary", "daemons"}
+	daemonsOptional = []string{"stoppedBy"}
 	rowRequired     = []string{"name", "state", "severity", "detail"}
 	rowOptional     = []string{"remedy", "wide"}
 	versionRequired = []string{"version", "commit", "dirty", "date", "goVersion", "platform", "kubeVersion", "kineVersion"}
@@ -159,6 +183,55 @@ func contractAgent(t *testing.T, stage func(*testing.T, Paths, fakeFS) fakeFS) C
 	return c
 }
 
+// contractInterconnect is the running control plane with an armed
+// interconnect: two cabled members up in one segment, one cabled node beyond
+// the index ceiling, and two pods attached. The Interconnect is served at its
+// apiserver path and read through ReadInterconnect, the production reader.
+func contractInterconnect(t *testing.T) Collector {
+	t.Helper()
+	kube := heartbeatingKube(goldenTime)
+	armedAt := metav1.NewTime(goldenTime.Add(-time.Hour))
+	ic := netv1alpha1.Interconnect{
+		ObjectMeta: metav1.ObjectMeta{Name: netv1alpha1.MediumThunderbolt},
+		Spec:       netv1alpha1.InterconnectSpec{Medium: netv1alpha1.MediumThunderbolt, Enabled: true},
+		Status: netv1alpha1.InterconnectStatus{
+			Members: []netv1alpha1.InterconnectMember{
+				{Node: "my-mac", Index: 0, Address: "169.254.0.1", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
+				{Node: "node-a", Index: 1, Address: "169.254.0.9", State: netv1alpha1.InterconnectMemberUp, Segment: "s0"},
+				{Node: "far", Index: 40, State: netv1alpha1.InterconnectMemberDown},
+			},
+			Segments: []netv1alpha1.InterconnectSegment{{ID: "s0", Nodes: []string{"my-mac", "node-a"}}},
+			ArmedBy:  "kubernetes-admin",
+			ArmedAt:  &armedAt,
+		},
+	}
+	raw, err := json.Marshal(ic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kube.raw[interconnectPath] = raw
+	kube.pods = append(kube.pods,
+		attachedPod("mlx", "llama-0", "my-mac", "169.254.0.2"),
+		attachedPod("default", "bench", "node-a", "169.254.0.11"))
+	c := contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", kube, nil)
+	c.Interconnect = func(ctx context.Context) (*netv1alpha1.Interconnect, error) { return ReadInterconnect(ctx, kube) }
+	return c
+}
+
+// attachedPod is a running pod on node whose k3sm.io/InterconnectAttached
+// condition is True with addr, the way the provider records it.
+func attachedPod(ns, name, node, addr string) corev1.Pod {
+	p := podIn(corev1.PodRunning)
+	p.Namespace, p.Name, p.Spec.NodeName = ns, name, node
+	p.Status.Conditions = []corev1.PodCondition{{
+		Type:    corev1.PodConditionType(netv1alpha1.ConditionInterconnectAttached),
+		Status:  corev1.ConditionTrue,
+		Reason:  netv1alpha1.MediumThunderbolt,
+		Message: addr,
+	}}
+	return p
+}
+
 // contractScenarios are the postures the goldens record. Every verdict is
 // here, and every daemon-row state appears in at least one of them. Each
 // cause is one the probe can see, so the two shapes agree on the verdict.
@@ -188,6 +261,11 @@ func contractScenarios() map[string]contractScenario {
 			}
 			return c
 		}},
+		"stopped-by-user": {verdict: VerdictStopped, collector: func(t *testing.T) Collector {
+			c := contractServer(t, "launchctl_failed_once.txt", "launchctl_stopped_clean.txt", downKube(), nil)
+			c.StopMarker = fakeStopMarker(userStopMarker(goldenTime.Add(-90*time.Second), install.StopPhaseStopped))
+			return c
+		}},
 		"not-installed": {verdict: VerdictNotInstalled, collector: func(t *testing.T) Collector {
 			c := contractServer(t, "launchctl_not_loaded.txt", "launchctl_not_loaded.txt", nil, errors.New("no k3sm context in ~/.kube/config"))
 			notLoaded := errors.New("exit status 113")
@@ -198,6 +276,23 @@ func contractScenarios() map[string]contractScenario {
 		}},
 		"unknown": {verdict: VerdictUnknown, collector: func(t *testing.T) Collector {
 			return contractServer(t, "launchctl_format_drift.txt", "launchctl_format_drift.txt", nil, errors.New("no k3sm context in ~/.kube/config"))
+		}},
+		"running-interconnect": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			return contractInterconnect(t)
+		}},
+		"server-with-workers": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			kube := heartbeatingKube(goldenTime)
+			older := workerNode("node-b", "v1.36.2+k3sm.0.1.6")
+			peer := workerNode("node-a", "v1.36.2+k3sm.0.1.7")
+			peer.Labels = map[string]string{controlPlaneNodeLabel: ""}
+			kube.nodes = append(kube.nodes, older, peer)
+			return contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", kube, nil)
+		}},
+		"agent-join-target": {verdict: VerdictDegraded, collector: func(t *testing.T) Collector {
+			c := contractAgent(t, func(_ *testing.T, _ Paths, fsys fakeFS) fakeFS { return fsys })
+			sys := agentPlistSystem("192.0.2.10")
+			c.AgentJoinServer = func() (string, error) { return install.AgentJoinServer(sys, install.Config{}) }
+			return c
 		}},
 		"agent-waiting": {verdict: VerdictDegraded, collector: func(t *testing.T) Collector {
 			return contractAgent(t, func(_ *testing.T, _ Paths, fsys fakeFS) fakeFS { return fsys })
@@ -294,6 +389,9 @@ func checkRows(t *testing.T, where string, rows any, seen map[string]bool) {
 func jsonKeys(typ reflect.Type) []string {
 	var keys []string
 	for i := 0; i < typ.NumField(); i++ {
+		if !typ.Field(i).IsExported() {
+			continue // never encoded
+		}
 		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
 		keys = append(keys, name)
 	}
@@ -327,9 +425,15 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			want []string
 		}{
 			{reflect.TypeOf(Report{}), sortedUnion(reportRequired, reportOptional)},
-			{reflect.TypeOf(DaemonsReport{}), sortedUnion(daemonsRequired)},
+			{reflect.TypeOf(DaemonsReport{}), sortedUnion(daemonsRequired, daemonsOptional)},
+			{reflect.TypeOf(StoppedBy{}), sortedUnion(stoppedByRequired)},
+			{reflect.TypeOf(Network{}), sortedUnion(networkRequired, networkOptional)},
+			{reflect.TypeOf(NetworkApplied{}), sortedUnion(networkAppliedRequired, networkAppliedOptional)},
 			{reflect.TypeOf(Row{}), sortedUnion(rowRequired, rowOptional)},
 			{reflect.TypeOf(PeerStatus{}), sortedUnion(peerRequired)},
+			{reflect.TypeOf(Worker{}), sortedUnion(workerRequired, workerOptional)},
+			{reflect.TypeOf(Interconnect{}), sortedUnion(interconnectRequired, interconnectOptional)},
+			{reflect.TypeOf(InterconnectPod{}), sortedUnion(interconnectPodRequired)},
 			{reflect.TypeOf(version.Info{}), sortedUnion(versionRequired, versionOptional)},
 			{reflect.TypeOf(version.ModuleRef{}), sortedUnion(moduleRequired)},
 		} {
@@ -365,7 +469,38 @@ func TestStatusJSONContractGolden(t *testing.T) {
 					checkKeys(t, fullPath+" version.modules", m, moduleRequired, nil, nil)
 				}
 			}
-			checkKeys(t, daemonsPath, probeGeneric, daemonsRequired, nil, nil)
+			if ic, ok := fullGeneric["interconnect"]; ok {
+				checkKeys(t, fullPath+" interconnect", ic, interconnectRequired, interconnectOptional, optionalSeen)
+				if pods, ok := ic.(map[string]any)["pods"].([]any); ok {
+					for i, p := range pods {
+						checkKeys(t, fmt.Sprintf("%s interconnect.pods[%d]", fullPath, i), p, interconnectPodRequired, nil, nil)
+					}
+				}
+			}
+			if ws, ok := fullGeneric["workers"]; ok {
+				list, isList := ws.([]any)
+				if !isList {
+					t.Errorf("%s workers is %T, want an array", fullPath, ws)
+				}
+				for i, w := range list {
+					checkKeys(t, fmt.Sprintf("%s workers[%d]", fullPath, i), w, workerRequired, workerOptional, nil)
+					if role, _ := w.(map[string]any)["role"].(string); !contains(contractRoles, role) {
+						t.Errorf("%s workers[%d] role %q is outside the contract", fullPath, i, role)
+					}
+				}
+			}
+			if jt, ok := fullGeneric["joinTarget"]; ok && full.Role != "agent" {
+				t.Errorf("%s carries joinTarget %v on a %s", fullPath, jt, full.Role)
+			}
+			if nw, ok := fullGeneric["network"]; ok {
+				checkKeys(t, fullPath+" network", nw, networkRequired, networkOptional, nil)
+			}
+			checkKeys(t, daemonsPath, probeGeneric, daemonsRequired, daemonsOptional, optionalSeen)
+			for _, g := range []map[string]any{fullGeneric, probeGeneric} {
+				if sb, ok := g["stoppedBy"]; ok {
+					checkKeys(t, name+" stoppedBy", sb, stoppedByRequired, nil, nil)
+				}
+			}
 			checkRows(t, daemonsPath+" daemons", probeGeneric["daemons"], optionalSeen)
 		})
 
@@ -452,6 +587,15 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			if got, want := stateTable(gotFull.Rows), stateTable(full.Rows); got != want {
 				t.Errorf("full rows: collected %s, golden %s", got, want)
 			}
+			if !reflect.DeepEqual(gotFull.Interconnect, full.Interconnect) {
+				t.Errorf("interconnect block: collected %+v, golden %+v", gotFull.Interconnect, full.Interconnect)
+			}
+			if !reflect.DeepEqual(gotFull.Workers, full.Workers) {
+				t.Errorf("workers: collected %v, golden %v", deref(gotFull.Workers), deref(full.Workers))
+			}
+			if gotFull.JoinTarget != full.JoinTarget {
+				t.Errorf("joinTarget: collected %q, golden %q", gotFull.JoinTarget, full.JoinTarget)
+			}
 		})
 	}
 
@@ -468,8 +612,10 @@ func TestStatusJSONContractGolden(t *testing.T) {
 		}
 		// Every optional key appears in some golden, so a rename of a key that
 		// one fixture omits still fails in another. peers is the exception: it
-		// is reserved, and no posture emits it yet (the struct check covers it).
-		for _, k := range append(append([]string{"next"}, rowOptional...), versionOptional...) {
+		// is reserved, and no posture emits it yet (the struct check covers it);
+		// network is read from a record no golden posture wires, so the
+		// struct check and TestStatusNetworkBlock cover it.
+		for _, k := range append(append(append([]string{"next", "interconnect", "stoppedBy", "workers", "joinTarget"}, rowOptional...), versionOptional...), interconnectOptional...) {
 			if !optionalSeen[k] {
 				t.Errorf("no golden carries the optional key %q", k)
 			}

@@ -118,7 +118,8 @@ k3sm's distribution ships in three generations, listed in shipping order:
    provenance (Developer ID + notarization) arrives with gen 3. Environment variables set the
    options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
    unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
-   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=vX.Y.Z sh`.
+   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh` (v0.1.7 is the current
+   release; the [releases page](https://k3sm.io/releases/) lists every version you can pin).
    `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
    one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
@@ -136,6 +137,27 @@ k3sm's distribution ships in three generations, listed in shipping order:
 Every channel manages the same `/Library/k3sm`. Once more than one has shipped, run
 `sudo k3sm install` after switching so the daemons run the newly delivered binary, or run
 `sudo k3sm uninstall` first for a clean cutover.
+
+### Installing From k3sm.app
+
+The k3sm app installs, updates and uninstalls with the same `/Library/k3sm`. It never runs k3sm
+from its own bundle as root: it copies the bundle into a new directory under
+`/Library/k3sm.staging`, checks the copy's signature, and runs
+`k3sm install --from-staging <dir>` from that copy. The install refuses to run unless:
+
+- the directory sits directly inside `/Library/k3sm.staging`, both are owned by `root:wheel` with
+  mode `0700`, and no part of the path is a symlink;
+- every file in the directory is owned by `root`, writable by nobody else, and none is a symlink,
+  a special file, or setuid or setgid;
+- the running `k3sm` and every file it installs come from that directory;
+- a `--token-file` sits directly inside the directory, owned by `root` with mode `600` and one
+  link (it is removed as soon as it is read);
+- the version is a release version no older than the installed one;
+- every program in the directory is signed with a Developer ID Application certificate from one
+  team, and on an update the installed `k3sm` is signed by that same team.
+
+Pass `--allow-downgrade` to install an older version on purpose (or over an install whose version
+cannot be read). A plain `sudo k3sm install` makes none of these checks and is unchanged.
 
 ## Secrets Encryption at Rest
 
@@ -197,6 +219,101 @@ present without its fingerprint, when the fingerprint is present without the con
 when the two do not match. Restore both files from the backup taken with `state.db`. `k3sm
 uninstall` keeps both files with the rest of your cluster data.
 
+## Network Exposure
+
+Every listener a node opens, and the addresses it binds:
+
+| Listener | Port | Binds |
+|---|---|---|
+| kubelet API (logs, exec, metrics) | `10250` (`--kubelet-port` on a server) | the node's own address only: its mesh address once joined, its pod-range address on a single node, `127.0.0.1` on a single node under `--network none` |
+| NodePort Services | `30000-32767` | follows LAN access: every interface (or the `--nodeport-addresses` set) when on, `127.0.0.1` and the node's own address when off |
+| LoadBalancer Services | each Service's `port` | follows LAN access: every interface when on, `127.0.0.1` and the node's own address when off |
+| Ingress host (server) | `80`, `443` (`--ingress-http-port`, `--ingress-https-port`) | follows LAN access: every interface when on, the node's own address when off |
+| wireguard mesh | `51820/udp` | every interface; it answers only peers holding a cluster key |
+| apiserver (server) | `6444` (`--api-port`) | `127.0.0.1` on a single server; the mesh address only on a server with `--mesh-ip` |
+| worker join (server with `--mesh-ip`) | `9345` | every interface, because a joining worker has no mesh yet; every request needs the cluster join token |
+| embedded etcd peer (HA servers) | `--etcd-peer-port` | the `--etcd-peer-ip` address you name; peers need a peer certificate |
+| ingest registry (opt-in, `--registry-port`) | the chosen port | `127.0.0.1`, plus a relay on the mesh address and the `vm` NAT gateway |
+| cluster DNS and ClusterIP Services | Service ports | their virtual IPs, aliased on `lo0` |
+| datastore, scheduler, controller-manager (server) | their own ports | `127.0.0.1` |
+
+The kubelet API binds exactly the address the node registers as its `InternalIP`, never every
+interface. If that address is missing when the node starts (a joined worker under `--network
+none`, for example), the node refuses to start and names the address. The standalone `k3sm node`
+command is the exception: its `--listen` address is the operator's choice and may still be the
+wildcard.
+
+### LAN access
+
+One switch decides whether the workload listeners (NodePort, LoadBalancer and the ingress host)
+answer on the networks this Mac is attached to:
+
+```sh
+sudo k3sm network lan off      # only this Mac and the cluster mesh
+sudo k3sm network lan on       # every network this Mac is on
+k3sm network lan status        # the setting, what it covers, what it does not
+```
+
+With LAN access off, those listeners bind `127.0.0.1` and the node's own address (its mesh address
+once joined, its pod-range address on a single node), so other nodes reach them over the mesh and
+nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
+
+- New installs start with LAN access off. An existing install keeps LAN access on across an upgrade,
+  so nothing it serves stops answering. `sudo k3sm install --lan on` or `--lan off` sets it at
+  install time.
+- The change applies live, without restarting pods: the node daemon binds the new addresses first
+  and only then closes the old ones. Connections already open finish; new connections from the LAN
+  are refused. The command then checks the node daemon's listening sockets itself (with `lsof`, as
+  root) rather than taking the daemon's word for it. If any listener cannot move, or the sockets do
+  not match, the previous setting is restored and checked the same way, and the command says why. If
+  even the restore fails, it says so and exits `4`. If the node daemon does not apply it live, the
+  command restarts the daemon in place instead (pods keep running) and says so.
+- `k3sm network lan status` and `k3sm status` show the recorded setting and, run as root, the state
+  the node daemon reports serving, and say when the two differ. With no setting recorded they say
+  that LAN access is on because nothing is recorded.
+- The record must be a regular file owned by root and writable by no one else. Anything else is
+  treated as unusable, and the node daemon serves LAN access off until it is set again.
+- On a stopped node the setting is recorded and applies at `sudo k3sm start`.
+- With LAN access off, a LoadBalancer port below 1024 is not served on that node, because macOS
+  lets only root bind a specific address below 1024; use a port of 1024 or above, or turn LAN
+  access on. The ingress host still serves `80` and `443` on the node's own address, but not on
+  `127.0.0.1`.
+- The switch does not cover the apiserver (loopback, or the mesh address), the wireguard mesh port
+  (it answers only cluster peers) or the worker join port. A new worker joins over the LAN, so the
+  join port stays reachable with LAN access off, and every request to it needs the cluster join
+  token.
+- The setting is kept in `/Library/Preferences/io.k3sm.network.json`, beside the other install
+  arguments, and survives a reinstall and an uninstall. `k3sm status` shows it, and `k3sm status -o
+  json` carries it as `network` (see [Status JSON](status-json.md#network)).
+
+### NodePort addresses
+
+With LAN access on, NodePorts follow upstream and bind every interface unless
+`--nodeport-addresses` narrows them. With LAN access off, NodePorts bind `127.0.0.1` and the node's
+own address whatever `--nodeport-addresses` says.
+
+```sh
+sudo k3sm install --nodeport-addresses local
+sudo k3sm install --agent --server <control-plane> --token-file <file> --nodeport-addresses local
+```
+
+`local` is loopback (`127.0.0.1`) plus the node's own address, the same set LAN access off uses.
+The value can also be a comma-separated list of IPv4 CIDRs, the kube-proxy `--nodeport-addresses`
+shape, mixed with `local` if you like (`local,10.0.0.0/8`). Each NodePort then binds every matching
+address of this Mac, or none of them if any bind fails. See [Limitations](limitations.md) for the
+reserved ports and the other networking caveats.
+
+- The setting is IPv4 only. An IPv6 range is refused.
+- It needs the node datapath. A non-empty value beside `--network none` is refused, on `k3sm
+  install`, `k3sm server` and `k3sm agent` alike.
+- It is resolved when the daemon starts and again at every LAN access change, against the addresses
+  this Mac has then. A value that matches no address refuses the start. An address that appears
+  later (a new network) is used after the next restart or LAN access change.
+- It is recorded with the other install arguments and kept across a reinstall and an uninstall.
+  Surrounding spaces are ignored. `sudo k3sm install --nodeport-addresses ""` (or a value of only
+  spaces) returns to every interface.
+- `k3sm server` and `k3sm agent` take the same flag directly.
+
 ## Uninstalling
 
 ```sh
@@ -213,6 +330,12 @@ reinstall picks up where you left off; to remove those too, see
 mints a new one. The command prints the full list of what it kept. If you
 installed a data volume, it stays mounted and declared; the command prints `sudo k3sm install
 --data-volume` to reinstall onto it and `sudo k3sm datavol delete --yes` to remove it for good.
+
+Uninstall also removes `/Library/k3sm.staging`, the directory the k3sm app copies itself into, and
+refuses to run while the app is in the middle of an install.
+If an upgrade by an older version of k3sm was interrupted, it can leave a `/Library/k3sm.staging`
+directory behind. Install never uses or removes it; `sudo k3sm uninstall` (no `--purge` needed)
+clears it, and a reinstall afterwards keeps your cluster data.
 
 ### Server Flags Across A Reinstall
 
@@ -236,8 +359,8 @@ sudo k3sm install                                            # renders the stock
 
 That discards the flags the file lists, and nothing else. Your cluster data is untouched. An
 install refuses a carried `--datastore-endpoint` or `--datastore-endpoint-file`, because v0.1.6
-removed external-datastore HA. A multi-server control plane is not available in v0.1.6; see
-[High availability](ha.md).
+removed external-datastore HA. The experimental two-server control plane uses embedded etcd
+instead; see [High availability](ha.md).
 
 Install warns when it finds neither source on a data root that already holds cluster state, which is
 what a Mac uninstalled by an older version looks like. The flags are gone on such a Mac, and install
@@ -271,6 +394,8 @@ It cannot be undone. Without `--yes` the command changes nothing and lists what 
 k3s's `k3s-uninstall.sh` removes everything with no prompt; k3sm asks for `--yes` on purpose,
 because this deletes a user account and the cluster's datastore.
 
+The purge learns whose `~/.kube/config` to clean from `sudo`. When there is no `sudo` environment, name the account with `--user <name>`; it wins over `sudo`'s own record, and root, system and service accounts are refused.
+
 Run it before `brew uninstall k3sm`: the `k3sm` binary is what performs the purge.
 
 Before deleting anything it checks that the data directories are the ones install created, and it
@@ -292,6 +417,7 @@ k3sm kubectl get nodes
 
 ## Next
 
+- [Stopping and starting](stop-start.md) covers `k3sm stop` and `start`, and how a reinstall treats a stopped node.
 - [Quickstart](quickstart.md) runs your first Pod.
 - [kubectl access](kubectl-access.md) covers kubeconfig details.
 - [Upgrade](upgrade.md) explains how upgrades restart the daemon.

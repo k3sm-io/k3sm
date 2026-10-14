@@ -113,6 +113,9 @@ type SnapshotSaveOptions struct {
 	// naming an existing DIRECTORY writes a generated name inside it; anything else is
 	// taken as the exact file to write.
 	Out string
+	// Compress writes the snapshot as a one-member zip archive (snapshotcompress.go).
+	// A generated name then ends in .zip; an exact Out is used as given.
+	Compress bool
 }
 
 // SnapshotSaveResult is what a save produced.
@@ -129,6 +132,8 @@ type SnapshotSaveResult struct {
 	// carries why, for the report.
 	Checkpointed   bool
 	CheckpointNote string
+	// Compressed reports that Path is a zip archive of the snapshot.
+	Compressed bool
 }
 
 // SnapshotRestoreOptions parametrizes RestoreSnapshot.
@@ -154,6 +159,9 @@ type SnapshotRestoreResult struct {
 	// and the kine pin stamp, which describes a database that is no longer there.
 	PreviousDB string
 	MovedAside []string
+	// Compressed reports that Snapshot was a zip archive, inflated before it was
+	// verified and installed.
+	Compressed bool
 }
 
 // SaveSnapshot writes a consistent, integrity-verified copy of this node's kine SQLite
@@ -178,7 +186,7 @@ func SaveSnapshot(ctx context.Context, opts SnapshotSaveOptions) (*SnapshotSaveR
 	}
 
 	takenAt := time.Now().UTC()
-	out, err := resolveSnapshotOut(opts.WorkDir, opts.Out, takenAt)
+	out, err := resolveSnapshotOut(opts.WorkDir, opts.Out, takenAt, opts.Compress)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +199,7 @@ func SaveSnapshot(ctx context.Context, opts SnapshotSaveOptions) (*SnapshotSaveR
 		return nil, err
 	}
 
-	res := &SnapshotSaveResult{Path: out, SourceDB: db, TakenAt: takenAt}
+	res := &SnapshotSaveResult{Path: out, SourceDB: db, TakenAt: takenAt, Compressed: opts.Compress}
 	// Best-effort drain: exact on a stopped control plane, declined by a live writer.
 	// Either way VACUUM INTO below reads the WAL, so this decides the source's tidiness,
 	// never the snapshot's completeness.
@@ -203,7 +211,12 @@ func SaveSnapshot(ctx context.Context, opts SnapshotSaveOptions) (*SnapshotSaveR
 		res.Checkpointed = true
 	}
 
+	// A compressed save builds and verifies the plain snapshot at its own staging
+	// name, and only the verified bytes are compressed into the destination.
 	tmp := out + ".tmp"
+	if opts.Compress {
+		tmp = plainStagingPath(out)
+	}
 	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("clear stale partial snapshot %s: %w", tmp, err)
 	}
@@ -222,6 +235,17 @@ func SaveSnapshot(ctx context.Context, opts SnapshotSaveOptions) (*SnapshotSaveR
 	if err := os.Chmod(tmp, 0o600); err != nil {
 		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("tighten snapshot permissions: %w", err)
+	}
+	if opts.Compress {
+		err := compressSnapshotFile(tmp, out)
+		_ = os.Remove(tmp)
+		if err != nil {
+			return nil, err
+		}
+		if sfi, err := os.Stat(out); err == nil {
+			res.Bytes = sfi.Size()
+		}
+		return res, nil
 	}
 	if err := os.Rename(tmp, out); err != nil {
 		_ = os.Remove(tmp)
@@ -272,28 +296,46 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%w: %s is not a regular file", ErrSnapshotNotFound, opts.Snapshot)
 	}
+	dbd := dbDir(opts.WorkDir)
+	if err := os.MkdirAll(dbd, 0o755); err != nil {
+		return nil, fmt.Errorf("create datastore dir: %w", err)
+	}
+	// A decompressed copy a crashed restore left is a plaintext copy of the cluster's
+	// Secrets; no control plane is running (checked above), so none is in use.
+	if _, err := sweepInflateDebris(dbd); err != nil {
+		return nil, err
+	}
+	// A compressed snapshot is inflated (capped) into a temporary file beside the
+	// datastore, and everything below runs on those bytes: the restored datastore is
+	// the plain snapshot exactly, whichever form the file was kept in.
+	in, err := openSnapshotInput(opts.Snapshot, dbd)
+	if err != nil {
+		return nil, err
+	}
+	defer in.cleanup()
+	plain := in.path
+	pfi, err := os.Stat(plain)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrSnapshotNotFound, plain, err)
+	}
 	// The posture preflight shared with the etcd restore: an etcd snapshot is never
 	// handed to SQLite, whose integrity_check would only say "not a database".
-	if err := refuseEtcdSnapshotForKine(opts.Snapshot); err != nil {
+	if err := refuseEtcdSnapshotForKine(plain); err != nil {
 		return nil, err
 	}
 	// VERIFY FIRST — before the datastore is touched. A restore that discovers the
 	// snapshot is corrupt only after moving the live database aside has destroyed the
 	// one copy of the state that was still good.
-	if err := integrityCheck(ctx, opts.Snapshot); err != nil {
+	if err := integrityCheck(ctx, plain); err != nil {
 		return nil, fmt.Errorf("%w: %s — nothing was changed: %w", ErrSnapshotIntegrity, opts.Snapshot, err)
 	}
 
-	dbd := dbDir(opts.WorkDir)
-	if err := os.MkdirAll(dbd, 0o755); err != nil {
-		return nil, fmt.Errorf("create datastore dir: %w", err)
-	}
-	if err := requireSnapshotSpace(dbd, uint64(fi.Size())*snapshotFreeSpaceFactor); err != nil {
+	if err := requireSnapshotSpace(dbd, uint64(pfi.Size())*snapshotFreeSpaceFactor); err != nil {
 		return nil, err
 	}
 
 	db := StateDBPath(opts.WorkDir)
-	res := &SnapshotRestoreResult{Snapshot: opts.Snapshot, Bytes: fi.Size(), RestoredDB: db}
+	res := &SnapshotRestoreResult{Snapshot: opts.Snapshot, Bytes: fi.Size(), RestoredDB: db, Compressed: in.compressed}
 
 	// Stage the replacement first: copy, verify the COPY (the same rule the snapshot
 	// itself was written under — the bytes that take the final name are the bytes that
@@ -303,7 +345,7 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("clear stale partial restore %s: %w", tmp, err)
 	}
-	if err := copyFile(opts.Snapshot, tmp, 0o600); err != nil {
+	if err := copyFile(plain, tmp, 0o600); err != nil {
 		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("copy snapshot into the datastore dir: %w", err)
 	}
@@ -414,8 +456,11 @@ func requireLocalDatastore(workDir, etcdAction string) error {
 
 // resolveSnapshotOut decides where a save writes: the default snapshots dir, inside a
 // directory the operator named, or the exact file they named.
-func resolveSnapshotOut(workDir, out string, at time.Time) (string, error) {
+func resolveSnapshotOut(workDir, out string, at time.Time, compress bool) (string, error) {
 	name := "k3sm-snapshot-" + at.Format(snapshotNameLayout) + ".db"
+	if compress {
+		name = compressedSnapshotName(name)
+	}
 	if out == "" {
 		return filepath.Join(SnapshotDir(workDir), name), nil
 	}

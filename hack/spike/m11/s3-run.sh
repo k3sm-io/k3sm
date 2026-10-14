@@ -53,11 +53,30 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # vermagic mismatch and finit_module fails — so the deb's version string is
 # derived from the same source pin as the kernel, and the guest re-reports
 # /proc/version so the pairing is visible in the log.
+#
+# Kernel: the dated release-20260114 folder (the undated "release/" path moves
+# with every refresh), whose manifest lists linux-image-6.14.0-37-generic
+# 6.14.0-37.37. Digest: as published in that folder's unpacked/SHA256SUMS.
+#
+# Modules: the linux-modules .deb for that same 6.14.0-37.37 build. Digest: the
+# SHA256 field of its stanza in the published plucky-updates (and
+# plucky-security) main/binary-arm64 Packages index on ports.ubuntu.com, fetched
+# over https. The index's own archive signature was not checked when the pin was
+# taken.
+#
+# Overriding a URL requires overriding its digest with it; a URL override alone
+# fails closed below rather than running under the default digest.
 PLUCKY_KVER="${K3SM_SPIKE_S3_KVER:-6.14.0-37-generic}"
-PLUCKY_VMLINUZ_URL="${K3SM_SPIKE_S3_KERNEL_URL:-https://cloud-images.ubuntu.com/releases/25.04/release/unpacked/ubuntu-25.04-server-cloudimg-arm64-vmlinuz-generic}"
+PLUCKY_VMLINUZ_URL="${K3SM_SPIKE_S3_KERNEL_URL:-https://cloud-images.ubuntu.com/releases/25.04/release-20260114/unpacked/ubuntu-25.04-server-cloudimg-arm64-vmlinuz-generic}"
 PLUCKY_VMLINUZ_SHA256="${K3SM_SPIKE_S3_KERNEL_SHA256:-d2e9d1adff7ac3d40672ad9d2c2b3215cfa8b0982ad61886844e2439b11e7e6c}"
-PLUCKY_MODULES_URL="${K3SM_SPIKE_S3_MODULES_URL:-http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-6.14.0-37-generic_6.14.0-37.37_arm64.deb}"
+PLUCKY_MODULES_URL="${K3SM_SPIKE_S3_MODULES_URL:-https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-6.14.0-37-generic_6.14.0-37.37_arm64.deb}"
 PLUCKY_MODULES_SHA256="${K3SM_SPIKE_S3_MODULES_SHA256:-303be0928f375883f67f9739327036dcb5680df648769b08eb88b1a58b645a13}"
+if [ -n "${K3SM_SPIKE_S3_KERNEL_URL:-}" ] && [ -z "${K3SM_SPIKE_S3_KERNEL_SHA256:-}" ]; then
+  echo "S3 SETUP FAIL: K3SM_SPIKE_S3_KERNEL_URL is set without K3SM_SPIKE_S3_KERNEL_SHA256"; exit 1
+fi
+if [ -n "${K3SM_SPIKE_S3_MODULES_URL:-}" ] && [ -z "${K3SM_SPIKE_S3_MODULES_SHA256:-}" ]; then
+  echo "S3 SETUP FAIL: K3SM_SPIKE_S3_MODULES_URL is set without K3SM_SPIKE_S3_MODULES_SHA256"; exit 1
+fi
 
 # The guest userland: the SAME pinned Alpine minirootfs the S5 sitting used, so
 # the two spikes' guests are comparable and only the kernel differs.

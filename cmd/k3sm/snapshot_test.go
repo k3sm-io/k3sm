@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -219,12 +220,12 @@ func TestSnapshotSaveDispatchesByPosture(t *testing.T) {
 	newSavers := func(member bool, calls *[]string, etcdErr error) snapshotSavers {
 		return snapshotSavers{
 			etcdMember: func(string) bool { return member },
-			etcd: func(_ context.Context, _ string, dst string) error {
-				*calls = append(*calls, "etcd "+dst)
+			etcd: func(_ context.Context, _ string, dst string, compress bool) error {
+				*calls = append(*calls, fmt.Sprintf("etcd %s compress=%t", dst, compress))
 				return etcdErr
 			},
 			sqlite: func(_ context.Context, opts executor.SnapshotSaveOptions) (*executor.SnapshotSaveResult, error) {
-				*calls = append(*calls, "sqlite "+opts.Out)
+				*calls = append(*calls, fmt.Sprintf("sqlite %s compress=%t", opts.Out, opts.Compress))
 				return &executor.SnapshotSaveResult{Path: "x", SourceDB: "y", Checkpointed: true}, nil
 			},
 			now: func() time.Time { return at },
@@ -235,11 +236,11 @@ func TestSnapshotSaveDispatchesByPosture(t *testing.T) {
 		wd := t.TempDir()
 		var calls []string
 		var out strings.Builder
-		if err := saveSnapshot(context.Background(), &out, wd, "", newSavers(true, &calls, nil)); err != nil {
+		if err := saveSnapshot(context.Background(), &out, wd, "", false, newSavers(true, &calls, nil)); err != nil {
 			t.Fatalf("save: %v", err)
 		}
 		want := filepath.Join(executor.SnapshotDir(wd), "k3sm-etcd-snapshot-20261002T120000Z.db")
-		if len(calls) != 1 || calls[0] != "etcd "+want {
+		if len(calls) != 1 || calls[0] != "etcd "+want+" compress=false" {
 			t.Fatalf("calls = %v, want one etcd save to %s", calls, want)
 		}
 		if fi, err := os.Stat(executor.SnapshotDir(wd)); err != nil || fi.Mode().Perm() != 0o700 {
@@ -253,17 +254,17 @@ func TestSnapshotSaveDispatchesByPosture(t *testing.T) {
 	t.Run("etcd member, --out file", func(t *testing.T) {
 		var calls []string
 		dst := filepath.Join(t.TempDir(), "snap.db")
-		if err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), dst, newSavers(true, &calls, nil)); err != nil {
+		if err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), dst, false, newSavers(true, &calls, nil)); err != nil {
 			t.Fatalf("save: %v", err)
 		}
-		if len(calls) != 1 || calls[0] != "etcd "+dst {
+		if len(calls) != 1 || calls[0] != "etcd "+dst+" compress=false" {
 			t.Errorf("calls = %v, want one etcd save to %s", calls, dst)
 		}
 	})
 
 	t.Run("etcd failure keeps its sentinel", func(t *testing.T) {
 		var calls []string
-		err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), "", newSavers(true, &calls, executor.ErrNoEtcdClient))
+		err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), "", false, newSavers(true, &calls, executor.ErrNoEtcdClient))
 		if !errors.Is(err, executor.ErrNoEtcdClient) || !strings.Contains(err.Error(), "start the server") {
 			t.Errorf("err = %v, want ErrNoEtcdClient with the remedy", err)
 		}
@@ -271,11 +272,37 @@ func TestSnapshotSaveDispatchesByPosture(t *testing.T) {
 
 	t.Run("kine posture", func(t *testing.T) {
 		var calls []string
-		if err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), "/x/out.db", newSavers(false, &calls, nil)); err != nil {
+		if err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), "/x/out.db", false, newSavers(false, &calls, nil)); err != nil {
 			t.Fatalf("save: %v", err)
 		}
-		if len(calls) != 1 || calls[0] != "sqlite /x/out.db" {
+		if len(calls) != 1 || calls[0] != "sqlite /x/out.db compress=false" {
 			t.Errorf("calls = %v, want one SQLite save", calls)
+		}
+	})
+
+	t.Run("compressed: etcd member, default destination ends in .zip", func(t *testing.T) {
+		wd := t.TempDir()
+		var calls []string
+		var out strings.Builder
+		if err := saveSnapshot(context.Background(), &out, wd, "", true, newSavers(true, &calls, nil)); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		want := filepath.Join(executor.SnapshotDir(wd), "k3sm-etcd-snapshot-20261002T120000Z.zip")
+		if len(calls) != 1 || calls[0] != "etcd "+want+" compress=true" {
+			t.Fatalf("calls = %v, want one compressed etcd save to %s", calls, want)
+		}
+		if !strings.Contains(out.String(), "zip archive") {
+			t.Errorf("the report does not say the snapshot is compressed:\n%s", out.String())
+		}
+	})
+
+	t.Run("compressed: kine posture passes the option through", func(t *testing.T) {
+		var calls []string
+		if err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), "/x/out.db", true, newSavers(false, &calls, nil)); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if len(calls) != 1 || calls[0] != "sqlite /x/out.db compress=true" {
+			t.Errorf("calls = %v, want one compressed SQLite save", calls)
 		}
 	})
 }

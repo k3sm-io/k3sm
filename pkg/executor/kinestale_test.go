@@ -68,7 +68,7 @@ func TestKineVariantUpgradeOnAPackagedNode(t *testing.T) {
 			if err := seedBinDir(t.Context(), slog.New(slog.DiscardHandler), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 				t.Fatalf("seedBinDir: %v", err)
 			}
-			err := ensureKine(t.Context(), work, payload, DefaultKineVersion)
+			err := ensureKine(t.Context(), discardLogger(), work, payload, DefaultKineVersion)
 			body, _ := os.ReadFile(kinePath(bd))
 			if !tc.wantStale {
 				if err != nil {

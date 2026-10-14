@@ -172,7 +172,10 @@ func TestLoadBalancerSourceRangesEnforced(t *testing.T) {
 	withRanges := func(svc *corev1.Service, spec []string, annotation string) *corev1.Service {
 		svc.Spec.LoadBalancerSourceRanges = spec
 		if annotation != "" {
-			svc.Annotations = map[string]string{SourceRangesAnnotation: annotation}
+			if svc.Annotations == nil {
+				svc.Annotations = map[string]string{}
+			}
+			svc.Annotations[SourceRangesAnnotation] = annotation
 		}
 		return svc
 	}
@@ -238,7 +241,8 @@ func TestLoadBalancerSourceRangesEnforced(t *testing.T) {
 	})
 
 	type rig struct {
-		c      *Controller
+		h      *Hoster
+		d      *Decider
 		cs     *fake.Clientset
 		binder *acceptBinder
 		dialer *recordingDialer
@@ -246,31 +250,35 @@ func TestLoadBalancerSourceRangesEnforced(t *testing.T) {
 	}
 	newRig := func(t *testing.T, svc *corev1.Service) *rig {
 		t.Helper()
-		cs := fake.NewClientset()
+		cs := fake.NewClientset(testNodeObject(testNode, nil))
 		if _, err := cs.CoreV1().Services(svc.Namespace).Create(ctx, svc, metav1.CreateOptions{}); err != nil {
 			t.Fatalf("seed service: %v", err)
 		}
 		r := &rig{cs: cs, binder: &acceptBinder{}, dialer: &recordingDialer{}, rec: record.NewFakeRecorder(16)}
-		c, err := New(Config{
-			Client:        cs,
-			BindAddr:      testBindAddr,
-			AdvertiseAddr: testAdvertiseAddr,
-			PodCIDR:       testPodCIDR,
-			ReservedPorts: map[int32]bool{},
-			Binder:        r.binder,
-			Recorder:      r.rec,
-			Logger:        slog.New(slog.DiscardHandler),
-		})
+		r.h = newTestHoster(t, cs, testNode, r.binder, map[int32]bool{}, nil)
+		r.h.dial = r.dialer.dial
+		d, err := NewDecider(DeciderConfig{Client: cs, SelfNode: testNode, SelfAddr: testNodeAddr, Recorder: r.rec, Logger: slog.New(slog.DiscardHandler)})
 		if err != nil {
-			t.Fatalf("New: %v", err)
+			t.Fatalf("NewDecider: %v", err)
 		}
-		c.dial = r.dialer.dial
-		r.c = c
-		t.Cleanup(func() {
-			c.closeAll()
-			r.dialer.close()
-		})
+		r.d = d
+		t.Cleanup(r.dialer.close)
 		return r
+	}
+	// reconcile runs the hoster over svc, then the decider over the store with
+	// svc's spec (the Event and the status are the decider's).
+	reconcile := func(t *testing.T, r *rig, svc *corev1.Service) {
+		t.Helper()
+		r.h.reconcile(ctx, []*corev1.Service{svc})
+		nodes, _ := storeSnapshot(t, r.cs)
+		live, err := r.cs.CoreV1().Services(svc.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		cur := svc.DeepCopy()
+		cur.Annotations = live.Annotations
+		cur.Status = live.Status
+		r.d.reconcile(ctx, nodes, []*corev1.Service{cur})
 	}
 	status := func(t *testing.T, cs *fake.Clientset) []corev1.LoadBalancerIngress {
 		t.Helper()
@@ -314,7 +322,7 @@ func TestLoadBalancerSourceRangesEnforced(t *testing.T) {
 			t.Run(tt.name, func(t *testing.T) {
 				svc := withRanges(lbService("default", "web", "10.43.0.5", 8081), tt.spec, tt.annotation)
 				r := newRig(t, svc)
-				r.c.reconcile(ctx, []*corev1.Service{svc})
+				reconcile(t, r, svc)
 				l := r.binder.listener(8081)
 				if l == nil {
 					t.Fatal("the listener must be bound for a valid range set")
@@ -332,7 +340,7 @@ func TestLoadBalancerSourceRangesEnforced(t *testing.T) {
 	t.Run("unparsable set on first provisioning: no listener, pending status, event", func(t *testing.T) {
 		svc := withRanges(lbService("default", "web", "10.43.0.5", 8081), []string{"10.0.0.0/8", "bogus"}, "")
 		r := newRig(t, svc)
-		r.c.reconcile(ctx, []*corev1.Service{svc})
+		reconcile(t, r, svc)
 		if r.binder.openCount() != 0 {
 			t.Fatalf("fail closed: %d listeners opened for an unparsable set", r.binder.openCount())
 		}
@@ -344,7 +352,7 @@ func TestLoadBalancerSourceRangesEnforced(t *testing.T) {
 			t.Fatalf("events = %q, want one Warning %s", ev, EventReasonSourceRangesInvalid)
 		}
 		// A persistent error is recorded once, not on every resync.
-		r.c.reconcile(ctx, []*corev1.Service{svc})
+		reconcile(t, r, svc)
 		if ev := events(r.rec); len(ev) != 0 {
 			t.Errorf("a repeated identical error must not re-record: %q", ev)
 		}
@@ -353,14 +361,14 @@ func TestLoadBalancerSourceRangesEnforced(t *testing.T) {
 	t.Run("edit-time unparsable set keeps the listener and the last-good ranges", func(t *testing.T) {
 		svc := withRanges(lbService("default", "web", "10.43.0.5", 8081), []string{"10.0.0.0/8"}, "")
 		r := newRig(t, svc)
-		r.c.reconcile(ctx, []*corev1.Service{svc})
+		reconcile(t, r, svc)
 		l := r.binder.listener(8081)
 		if l == nil {
 			t.Fatal("listener must bind")
 		}
 		bad := svc.DeepCopy()
 		bad.Spec.LoadBalancerSourceRanges = []string{"0.0.0.0/0", "300.0.0.0/8"}
-		r.c.reconcile(ctx, []*corev1.Service{bad})
+		reconcile(t, r, bad)
 		if r.binder.openCount() != 1 || r.binder.listener(8081) != l {
 			t.Fatal("an edit-time parse failure must not reopen or tear down the listener")
 		}
@@ -387,14 +395,14 @@ func TestLoadBalancerSourceRangesEnforced(t *testing.T) {
 	t.Run("a live range edit applies to the next accept", func(t *testing.T) {
 		svc := withRanges(lbService("default", "web", "10.43.0.5", 8081), []string{"10.0.0.0/8"}, "")
 		r := newRig(t, svc)
-		r.c.reconcile(ctx, []*corev1.Service{svc})
+		reconcile(t, r, svc)
 		l := r.binder.listener(8081)
 		if connect(t, l, r.dialer, "198.51.100.7") {
 			t.Fatal("198.51.100.7 must be denied before the edit")
 		}
 		edited := svc.DeepCopy()
 		edited.Spec.LoadBalancerSourceRanges = []string{"198.51.100.0/24"}
-		r.c.reconcile(ctx, []*corev1.Service{edited})
+		reconcile(t, r, edited)
 		if r.binder.openCount() != 1 {
 			t.Fatalf("an edit must not reopen the listener: %d opens", r.binder.openCount())
 		}
@@ -406,7 +414,7 @@ func TestLoadBalancerSourceRangesEnforced(t *testing.T) {
 		}
 		cleared := edited.DeepCopy()
 		cleared.Spec.LoadBalancerSourceRanges = nil
-		r.c.reconcile(ctx, []*corev1.Service{cleared})
+		reconcile(t, r, cleared)
 		if !connect(t, l, r.dialer, "10.1.2.3") {
 			t.Error("clearing the ranges must restore allow-all")
 		}

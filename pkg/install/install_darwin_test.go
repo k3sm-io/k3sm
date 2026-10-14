@@ -993,7 +993,7 @@ func TestEnsureHelpersRefuseASymlink(t *testing.T) {
 				home := filepath.Join(root, "home")
 				mkdir(t, home, 0o755)
 				symlinkT(t, elsewhere, filepath.Join(home, ".kube"))
-				return writeUserKubeconfig(home, uid, gid, []byte(adminKube))
+				return writeUserKubeconfig(home, uid, gid, adminContextName, []byte(adminKube))
 			},
 			victimMode: 0o755,
 			untouched:  assertEmptyDir,
@@ -1079,7 +1079,7 @@ func TestOwnedWritesUseTheOpenDescriptor(t *testing.T) {
 					return filepath.Dir(name) == kubeDir && strings.HasPrefix(filepath.Base(name), ".k3sm-kubeconfig-")
 				}, victim)
 
-				err := writeUserKubeconfig(home, uid, gid, []byte(adminKube))
+				err := writeUserKubeconfig(home, uid, gid, adminContextName, []byte(adminKube))
 				if !errors.Is(err, errTempSwapped) {
 					t.Errorf("write = %v, want the swapped-temp refusal", err)
 				}
@@ -1112,7 +1112,7 @@ func TestOwnedWritesUseTheOpenDescriptor(t *testing.T) {
 					return true
 				}, victim)
 
-				if err := writeUserKubeconfig(home, uid, gid, []byte(adminKube)); err != nil {
+				if err := writeUserKubeconfig(home, uid, gid, adminContextName, []byte(adminKube)); err != nil {
 					t.Fatalf("write: %v", err)
 				}
 				if !published {
@@ -1444,7 +1444,7 @@ func TestSwapInstallRootOnDisk(t *testing.T) {
 
 	t.Run("a destination that exists is EXCHANGED, in one step", func(t *testing.T) {
 		root := t.TempDir()
-		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.staging")
+		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.swap")
 		mustTree(t, live, map[string]string{"k3sm": "old binary", "bin/kine": "old kine"})
 		mustTree(t, staging, map[string]string{"k3sm": "new binary", "bin/kine": "new kine", "k3sm-vmhost": "new helper"})
 
@@ -1482,7 +1482,7 @@ func TestSwapInstallRootOnDisk(t *testing.T) {
 
 	t.Run("an absent destination is a first install and takes a plain rename", func(t *testing.T) {
 		root := t.TempDir()
-		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.staging")
+		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.swap")
 		mustTree(t, staging, map[string]string{"k3sm": "new binary"})
 
 		previous, err := sys.SwapInstallRoot(staging, live)
@@ -1503,7 +1503,7 @@ func TestSwapInstallRootOnDisk(t *testing.T) {
 
 	t.Run("a missing staged tree fails and leaves the live one alone", func(t *testing.T) {
 		root := t.TempDir()
-		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.staging")
+		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.swap")
 		mustTree(t, live, map[string]string{"k3sm": "old binary"})
 
 		if _, err := sys.SwapInstallRoot(staging, live); err == nil {

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -127,6 +128,9 @@ type EtcdRestoreResult struct {
 	MemberName, PeerURL, ClusterToken string
 	// RevisionBump is EtcdRestoreRevisionBump.
 	RevisionBump uint64
+	// Compressed reports that Snapshot was a zip archive, inflated before it was
+	// verified and restored.
+	Compressed bool
 	// Warnings are advisories about the input that did not stop the restore.
 	Warnings []string
 }
@@ -212,29 +216,54 @@ func restoreEtcdSnapshot(ctx context.Context, opts EtcdRestoreOptions, seams etc
 		return nil, fmt.Errorf("%w: %s", ErrEtcdRestoreOverSQLite, StateDBPath(opts.WorkDir))
 	}
 
-	fi, kind, err := sniffSnapshot(opts.Snapshot)
-	if err != nil {
-		return nil, err
-	}
-	res := &EtcdRestoreResult{Snapshot: opts.Snapshot, Bytes: fi.Size(), DataDir: EtcdDataDir(opts.WorkDir),
-		MemberName: opts.Name, PeerURL: etcdPeerURL(opts.PeerIP, opts.PeerPort), RevisionBump: EtcdRestoreRevisionBump}
-	switch kind {
-	case snapshotSQLite:
-		return nil, fmt.Errorf("%w: %s", ErrKineSnapshotForEtcd, opts.Snapshot)
-	case snapshotBoltNoTrailer:
-		return nil, fmt.Errorf("%w: %s (%d bytes)", ErrEtcdSnapshotNoTrailer, opts.Snapshot, fi.Size())
-	case snapshotUnknown:
-		return nil, fmt.Errorf("%w: %s is neither an etcd snapshot nor a kine SQLite database", ErrEtcdSnapshotVerify, opts.Snapshot)
-	}
-	if w := snapshotModeWarning(opts.Snapshot, fi); w != "" {
-		res.Warnings = append(res.Warnings, w)
-	}
-
+	// The work-dir lock is taken before anything is written into the work dir (the
+	// decompressed copy of a compressed snapshot, the sweep of a crashed restore's
+	// copies): a running server, or a second restore, holds it.
 	unlock, err := lockWorkDir(opts.WorkDir)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = unlock() }()
+	if _, err := sweepInflateDebris(opts.WorkDir); err != nil {
+		return nil, err
+	}
+
+	ofi, err := os.Stat(opts.Snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrSnapshotNotFound, opts.Snapshot, err)
+	}
+	if !ofi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %s is not a regular file", ErrSnapshotNotFound, opts.Snapshot)
+	}
+	// A compressed snapshot is inflated (capped) into a temporary file in the work
+	// dir, and every check below, and etcdutl itself, reads those plain bytes.
+	in, err := openSnapshotInput(opts.Snapshot, opts.WorkDir)
+	if err != nil {
+		return nil, err
+	}
+	defer in.cleanup()
+	original := opts.Snapshot
+	opts.Snapshot = in.path
+
+	fi, kind, err := sniffSnapshot(opts.Snapshot)
+	if err != nil {
+		return nil, err
+	}
+	res := &EtcdRestoreResult{Snapshot: original, Bytes: ofi.Size(), DataDir: EtcdDataDir(opts.WorkDir),
+		MemberName: opts.Name, PeerURL: etcdPeerURL(opts.PeerIP, opts.PeerPort), RevisionBump: EtcdRestoreRevisionBump,
+		Compressed: in.compressed}
+	switch kind {
+	case snapshotSQLite:
+		return nil, fmt.Errorf("%w: %s", ErrKineSnapshotForEtcd, original)
+	case snapshotBoltNoTrailer:
+		return nil, fmt.Errorf("%w: %s (%d bytes)", ErrEtcdSnapshotNoTrailer, original, fi.Size())
+	case snapshotUnknown:
+		return nil, fmt.Errorf("%w: %s is neither an etcd snapshot nor a kine SQLite database", ErrEtcdSnapshotVerify, original)
+	}
+	if w := snapshotModeWarning(original, ofi); w != "" {
+		res.Warnings = append(res.Warnings, w)
+	}
+
 	if err := refuseRunningEtcd(ctx, opts, seams); err != nil {
 		return nil, err
 	}
@@ -407,11 +436,25 @@ func runEtcdutl(ctx context.Context, bin string, args []string) ([]byte, error) 
 	return exec.CommandContext(ctx, bin, args...).CombinedOutput()
 }
 
-// resolveEtcdutl finds a staged etcdutl whose marker vouches for the pin: the
-// packaged install's payload first, then the work dir's bin. A dev shell with
-// neither builds it into the work dir's bin (a packaged install never needs to).
+// resolveEtcdutl finds the etcdutl the restore runs.
+//
+// On the release path (a Developer ID-signed k3sm, see signingPolicy) it is the
+// payload's etcdutl, run in place, only after it verifies against the release
+// requirement and its stamp, read from the verified bytes, matches the pin; the work
+// dir is never consulted and nothing is built. Otherwise it is a staged etcdutl whose
+// marker vouches for the pin: the packaged install's payload first, then the work
+// dir's bin. A dev shell with neither builds it into the work dir's bin (a packaged
+// install never needs to).
 func resolveEtcdutl(ctx context.Context, workDir, payloadDir string) (string, error) {
 	c := etcdutlChild(DefaultEtcdVersion)
+	// The refusal is returned to the caller, which reports it; nothing is logged here.
+	p, err := resolveSigningPolicy(ctx, slog.New(slog.DiscardHandler))
+	if err != nil {
+		return "", err
+	}
+	if p.release {
+		return c.shippedBinary(ctx, p, payloadDir)
+	}
 	for _, d := range []string{payloadDir, binDir(workDir)} {
 		if d != "" && c.staged(d) {
 			return c.binPath(d), nil

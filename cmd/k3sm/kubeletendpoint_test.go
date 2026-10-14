@@ -67,13 +67,13 @@ func TestNodeKubeletEndpointMatchesTheListener(t *testing.T) {
 			// THE REGRESSION: a per-instance allocation, exactly as
 			// `k3sm server --kubelet-port` derives its listen address.
 			name:   "per-instance allocation advertises the allocated port",
-			listen: serverKubeletListenOn(devKubeletPort),
+			listen: kubeletListenOn("100.64.0.1", devKubeletPort),
 			want:   devKubeletPort,
 		},
 		{
-			// The root/default server posture — the real *:10250 — is unchanged.
+			// The root/default server posture — the node address on :10250.
 			name:   "server default posture still advertises the kubelet API port",
-			listen: serverKubeletListen,
+			listen: kubeletListenOn("100.64.0.1", ports.KubeletAPIPort),
 			want:   int32(ports.KubeletAPIPort),
 		},
 		{
@@ -133,12 +133,12 @@ func TestNodeKubeletEndpointMatchesTheListener(t *testing.T) {
 	// The listen address the node ADVERTISES from and the one it BINDS are the same
 	// value in production: startNode hands opts.listen to both vkadapter.NodeConfig.
 	// HTTPListenAddr and configureNode. Assert the derivation over the server
-	// command's own port→address mapping so a change to serverKubeletListenOn that
+	// command's own port→address mapping so a change to kubeletListenOn that
 	// stopped round-tripping the port is caught here too.
 	t.Run("the derivation round-trips every port the server command can be given", func(t *testing.T) {
 		for _, port := range []int{ports.KubeletAPIPort, devKubeletPort, 10450, 10961, 65535, 1} {
-			if got := kubeletEndpointPort(serverKubeletListenOn(port)); got != int32(port) {
-				t.Errorf("kubeletEndpointPort(serverKubeletListenOn(%d)) = %d, want %d", port, got, port)
+			if got := kubeletEndpointPort(kubeletListenOn("100.64.0.1", port)); got != int32(port) {
+				t.Errorf("kubeletEndpointPort(kubeletListenOn(%d)) = %d, want %d", port, got, port)
 			}
 		}
 	})

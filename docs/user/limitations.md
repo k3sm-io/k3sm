@@ -4,17 +4,13 @@ k3sm runs Kubernetes Pods as **native Darwin processes** on Apple Silicon. That 
 zero-Linux, zero-VM developer experience, but it also means several standard Kubernetes behaviors
 **diverge by design** or are **not yet wired**. This page is the full inventory.
 
-## Where the Full Truth Lives (Cite, Don't Trust This Page Alone)
+## Conformance Profile
 
-The authoritative source of "what k3sm cannot conform to and why" is
-[**Conformance profile**](../conformance-profile.md), the self-assessment that maps
-targeted feature classes to a green synthetic-conformance criterion **or** a documented ceiling. It is
-backed by a maintainer-facing full-surface conformance register (one row per standard Kubernetes
-feature × verdict, with a canonical §By-design non-conformance summary) kept internal to the project.
-
-That profile is authoritative, and it wins wherever the two disagree. The summaries below restate the
-user-visible consequences so this page stands on its own; they are **not** more optimistic than the
-profile.
+The public statement of what k3sm cannot conform to and why is the
+[**Conformance profile**](../conformance-profile.md), the self-assessment that maps targeted feature
+classes to a k3sm-authored test **or** a documented ceiling. It wins wherever this page disagrees with
+it. The summaries below restate the user-visible consequences so this page stands on its own; they
+are **not** more optimistic than the profile.
 
 ## Headline Divergences
 
@@ -25,13 +21,19 @@ profile.
   path, so CPU `limits` are not enforced and `HPA`-on-CPU is **unservable**. Memory is sampled
   (`proc_pid_rusage`) and can drive OOMKill, but this is best-effort, not cgroup enforcement. Under
   node memory pressure k3sm evicts one Pod at a time, ranked as the kubelet ranks them (see
-  [Memory Pressure and Eviction](#memory-pressure-and-eviction)). `kubectl top` always needs an
-  **operator-installed metrics-server**, which k3sm does not ship.
+  [Memory Pressure and Eviction](#memory-pressure-and-eviction)).
   The **`vm` RuntimeClass differs**. A guest is a real Linux kernel, so each container gets a cgroup2
-  leaf and the node publishes genuine per-container CPU **and** memory for `vm` Pods on the
-  `metrics.k8s.io` scrape target. Native Pods publish neither, because that endpoint emits the
-  CPU/memory pair jointly or not at all. A `vm` Pod's memory ceiling is still the guest's whole-VM
-  size rather than a per-container limit. See [`vm` RuntimeClass](vm-runtimeclass.md).
+  leaf, and a `vm` Pod's CPU and memory figures come from it. A `vm` Pod's memory ceiling is still the
+  guest's whole-VM size rather than a per-container limit. See [`vm` RuntimeClass](vm-runtimeclass.md).
+- `kubectl top pod` reads the `metrics.k8s.io` API, which metrics-server serves. k3sm ships
+  metrics-server as an add-on and applies it on a server installed with `--mesh-ip` once a node in the
+  cluster can run `vm` Pods, because metrics-server is a Linux image and its scrape verifies the
+  kubelet certificate the cluster CA issues. A single-node server without `--mesh-ip` does not run
+  it, so `kubectl top` has no data there. Where it runs, a native Pod's figures are the CPU time and
+  memory footprint its processes used, read with `proc_pid_rusage`. These are usage figures, and k3sm
+  enforces no CPU quota against them.
+  `kubectl top node` has no figures, because a node publishes no node-wide sample. If a
+  metrics-server you installed yourself already serves the API, k3sm leaves it alone.
 - Workloads must be adapted. A raw upstream `[Conformance]` Pod, one that assumes a Linux image,
   bind mounts, or Linux-only fields, is rejected at admission or stranded. Images are the k3sm native
   image model (see [Images](images.md)), not arbitrary OCI Linux images.
@@ -302,15 +304,19 @@ cooperative, and run workloads you do not trust on the [`vm` RuntimeClass](vm-ru
 
 Today at `main`, per port class:
 
-- **NodePort** binds the **wildcard** `*:30000-32767` in-process. Every interface on the Mac
-  answers, including `127.0.0.1` and your LAN address. This has always been the case; it is what
-  NodePort means upstream.
-- **LoadBalancer / Ingress** binds the **wildcard** `*:<port>`, matching k3s and the desktop
-  container tools, which publish LoadBalancer ports on all interfaces.
+- **NodePort** binds the **wildcard** `*:30000-32767` in-process while LAN access is on. Every
+  interface on the Mac answers, including `127.0.0.1` and your LAN address; it is what NodePort means
+  upstream. With LAN access off (the default for a new install) it binds `127.0.0.1` and the node's
+  own address only. See [LAN access](install.md#lan-access).
+- **LoadBalancer / Ingress** binds the **wildcard** `*:<port>` while LAN access is on, matching k3s
+  and the desktop container tools, which publish LoadBalancer ports on all interfaces. With LAN
+  access off it binds the node's own address (and `127.0.0.1` from port 1024 up), and a LoadBalancer
+  port below 1024 is not served.
 
   **The bind address and the advertised address are different.** Read them separately.
-  The **port** is reachable on every interface the Mac has, including its LAN address, so treat a
-  LoadBalancer Service as publishing to the local network rather than to the host alone. The
+  With LAN access on, the **port** is reachable on every interface the Mac has, including its LAN
+  address, so treat a LoadBalancer Service as publishing to the local network rather than to the
+  host alone. The
   **advertised `EXTERNAL-IP`** is the node's InternalIP, an RFC-6598 (`100.64.0.0/10`) alias on
   `lo0`. It is reachable from this Mac, from local pods, and from mesh peers over WireGuard, but
   **not routable from your LAN**. A LAN client has no route to `100.64/10`, so `curl <EXTERNAL-IP>`
@@ -370,17 +376,19 @@ Today at `main`, per port class:
   not a substitute for NetworkPolicy.
 
 - k3sm reserves some ports, and rejects LoadBalancer Services that claim them. The NodePort range
-  `30000-32767` and the kubelet API port `10250` are k3sm's own wildcard listeners; Go sets no
-  `SO_REUSEPORT`, so a second wildcard listener on the same port simply fails. A `type: LoadBalancer`
+  `30000-32767` and the kubelet API port `10250` are k3sm's own listeners (see
+  [Network exposure](install.md#network-exposure) for the addresses they bind), and a LoadBalancer
+  listener on the same port would either fail or split the port with them. A `type: LoadBalancer`
   Service declaring one of those ports is **rejected at `kubectl apply`** with a message naming the
-  port, and the controller additionally refuses to bind it. Plain NodePort Services are unaffected,
+  port, and every node additionally refuses to bind it. Plain NodePort Services are unaffected,
   because the apiserver allocates their `nodePort` out of that very range. Ordinary duplicate
-  LoadBalancer ports are **not** arbitrated. Two Services on `8080` are first-come, and the loser
-  stays `<pending>`.
+  LoadBalancer ports are **not** arbitrated. Two Services on `8080` that land on the same node are
+  first-come there, and the loser is left out of its status on that node (a `HostNotBound` Warning
+  Event names the node). Node pools can keep them apart; see [Multi-node](multi-node.md#node-pools).
 
 - A LoadBalancer Service on 80 or 443 can race the ingress host. Those are legitimate LoadBalancer
-  ports, so they are **not** reserved. The ingress listeners are started *before* the
-  LoadBalancer controller, so the ingress host wins in practice, but that is start ordering, not a
+  ports, so they are **not** reserved. The ingress listeners are started *before* the server's
+  own LoadBalancer listeners, so the ingress host wins in practice, but that is start ordering, not a
   guarantee. If a Service claims 80/443 and wins, the ingress host burns its bounded bind retry
   (~155 s) and then logs `ingress bind retries exhausted`, leaving Ingress disabled until the daemon
   restarts.
@@ -415,9 +423,9 @@ The LB/Ingress datapath has two further consequences. The userspace splice **dis
 address** when it dials the backend, so a NetworkPolicy denying a pod does **not** filter traffic
 that arrives via that pod's LoadBalancer or Ingress. That client-address gap is a separate tracked
 item. Upstream behaves similarly for `externalTrafficPolicy: Cluster`, which SNATs the client, so
-only `Local` would preserve the address. And a failed listener bind is not visible to `kubectl`. The
-Service simply stays `<pending>` and the reason is only in the daemon log, because the provider has
-no `EventRecorder` yet; wiring one is planned.
+only `Local` would preserve the address, and k3sm does not narrow a `Local` Service to nodes with a
+local endpoint either. A failed listener bind shows in `kubectl describe service` as a `HostNotBound`
+Warning Event naming the node; the exact cause (the port holder) is in that node's daemon log.
 
 All of this assumes one operator's Mac with trusted namespaces, which is what k3sm supports. Any
 principal who can create a Service can claim a host port, and k3sm does not restrict which ports.
@@ -526,7 +534,9 @@ service FQDN and connecting to the returned ClusterIP both work.
 Two caveats remain. A guest's musl resolver may ignore `options ndots`, so prefer a **fully qualified**
 service name (`svc.ns.svc.cluster.local`) from inside a `vm` Pod rather than relying on the search
 list to complete a short name. And a guest's link MTU is 1500 and the link will not lower it, so
-cross-node `vm` traffic is not claimed in this release.
+traffic a guest sends straight to an address on another node is not claimed. Connections from another
+node to a `vm` Pod's pod IP go through a relay on its node; see
+[`vm` Pods: Services and Direct Pod IPs](#vm-pods-services-and-direct-pod-ips).
 
 ### `externalTrafficPolicy: Local` Is Not Honored
 
@@ -534,11 +544,17 @@ The userspace Service proxy splices each connection, so the client's source addr
 to the backend and the node cannot tell a local endpoint apart from a remote one. A Service that sets
 `externalTrafficPolicy: Local` is admitted with a warning and then behaves as `Cluster`.
 
-### UDP Services (Non-DNS) Are Deferred
+### UDP Services: ClusterIP Only
 
-Only **cluster DNS on `:53`** uses UDP today (the DNS VIP binds 53 directly). General **UDP Services are
-unimplemented**, and that covers **both ClusterIP UDP and NodePort UDP**, not just NodePort. If your
-workload depends on a UDP ClusterIP or NodePort Service, it will not work yet.
+**UDP ClusterIP Services work on ports 1024 and above.** The Service proxy relays each client flow to
+one backend and keeps it there until the flow goes idle, including to a `vm` Pod backend on the
+client's own node. A UDP ClusterIP Service on a port below 1024 fails to bind, because the proxy runs
+unprivileged and the root network helper opens privileged ports for TCP only. Cluster DNS on `:53` is
+the exception, because the DNS VIP binds 53 directly. A `vm` Pod backend on another node is not
+reachable over UDP, because the node holding its pod IP relays TCP only.
+
+**NodePort UDP is not implemented.** A reply sent from a wildcard socket on a Mac with more than one
+address can leave from the wrong source address, and the client drops it.
 
 ### `restartPolicy` Is Honored on the Default Runtime, Not on the `hostprocess` Opt-Out
 
@@ -669,13 +685,13 @@ Runbook:
   **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for a later
   release), and it passes against the release build. See
   [`vm` RuntimeClass](vm-runtimeclass.md).
-- **Multi-node** ships as documented **EXPERIMENTAL** and is not launch-blocking; its
-  de-EXPERIMENTAL graduation is the **v0.3** milestone. See [Multi-node](multi-node.md).
-- **A multi-server (HA) control plane is not available in v0.1.6.** `k3sm server` carries
-  `--cluster-init` and `--server-join` for an embedded etcd cluster, but a second server cannot
-  join yet, and `k3sm install` does not expose the flags. External-datastore HA and its flags were
-  removed in v0.1.6, and there is no conversion from an existing single-node SQLite cluster to etcd.
-  See [HA](ha.md).
+- **Multi-node** ships as documented **EXPERIMENTAL**, preview-quality until it graduates in a
+  later release. See [Multi-node](multi-node.md).
+- **A two-server (HA) control plane is experimental, from v0.1.7.** `sudo k3sm install
+  --cluster-init` forms an embedded etcd control plane on the first server and
+  `sudo k3sm install --server-join` adds a second. Two servers tolerate no failure: losing either one
+  stops writes until it returns. External-datastore HA and its flags were removed in v0.1.6, and there
+  is no conversion from an existing single-node SQLite cluster to etcd. See [HA](ha.md).
 
 ### `vm` Pods: Node Selection and Security-Context Admission
 
@@ -784,8 +800,9 @@ The relay covers each TCP `containerPort` the Pod declares and each port a Servi
 so a peer on the same node, the node itself, or another node can dial the pod IP on those ports, and
 headless-Service and per-pod DNS names reach the Pod on them too. What it does not do:
 
-- **TCP only.** UDP to a `vm` Pod's pod IP is not relayed. Reach a `vm` Pod over UDP through its
-  Service's ClusterIP.
+- **TCP only.** UDP to a `vm` Pod's pod IP is not relayed. A client on the Pod's own node reaches it
+  over UDP through a ClusterIP Service on a port of 1024 or above; see
+  [UDP Services: ClusterIP Only](#udp-services-clusterip-only).
 - **Undeclared ports are refused.** A dial to a port the Pod does not declare and no Service targets
   is refused. A native Pod has no such limit. A Pod whose declared and Service-targeted ports together
   exceed the relay's per-pod port ceiling is not relayed at all, rather than relayed on some of them.
@@ -946,6 +963,26 @@ datastore operational model.
   connection stays on loopback and its segments are dropped until it times out. No panic has been
   reproduced since both are in place. UDP above 1352 bytes has not been exercised under load, so
   avoid sustained large-datagram UDP across the mesh. A panic costs a reboot of the host.
+
+### Thunderbolt Interconnect
+
+The [interconnect](interconnects.md) lets opted-in Pods reach each other over a Thunderbolt cable
+between Macs. It is alpha and off until an admin arms it.
+
+- Traffic on the cable is plaintext. Once armed, any device on a cabled port can reach and spoof
+  interconnect addresses, because nothing on the wire ties an address to the Pod that owns it.
+- NetworkPolicy does not cover interconnect addresses, and k3sm loads no packet filter.
+- A Pod is reached over the cable only when it binds its interconnect address explicitly. A
+  wildcard bind stays on the Pod IP.
+- Only nodes with cluster index 0 to 30 get an address, so at most 31 nodes share the
+  interconnect. A node above that is reported and left out.
+- Each node holds one MLX rank and at most six other interconnect Pods.
+- `vm` Pods cannot attach. Neither can `container-vm` Pods once that RuntimeClass ships; it is a
+  planned RuntimeClass, one lightweight Linux VM per container, and no release includes it yet.
+- An established connection on a pulled cable hangs until its own timeout, because the interface
+  stays up. Only sharded MLX models move back to the mesh on their own.
+- Cables must not form a loop. Loop members are marked and not used, because k3sm never turns on
+  spanning tree.
 
 ## MLX / Apple-GPU Workloads
 

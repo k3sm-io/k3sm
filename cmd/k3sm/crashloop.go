@@ -142,7 +142,10 @@ func (b *crashBreaker) write(add func(*executor.CrashRecord, time.Time) bool) (t
 //
 // A PERMANENT failure — executor.ErrNoGoToolchain, matched with errors.Is
 // through BringUpError's chain — trips the breaker on this one failure: the
-// launchd PATH that lacked `go` this lap lacks it on every lap. (The joining
+// launchd PATH that lacked `go` this lap lacks it on every lap. The release-path
+// payload refusals (executor.ErrPayloadSignature, executor.ErrPayloadStamp,
+// executor.ErrSelfSignatureUnreadable) are permanent for the same reason: the
+// signed bytes on disk are the same on every lap, and the remedy is a reinstall. (The joining
 // server's permanent member-route refusal is the other permanent class; it fails
 // before the executor starts, so noteEtcdMemberRouteFailure records it.)
 func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
@@ -182,6 +185,26 @@ func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 				"path", b.path)
 		}
 		return
+	}
+	// A release-path payload refusal reproduces on every lap: the bytes on disk, and
+	// the daemon's own signature, do not change between respawns.
+	for _, sig := range []struct {
+		err          error
+		what, remedy string
+	}{
+		{executor.ErrSelfSignatureUnreadable, "the k3sm binary's own code signature cannot be read, so the signing path cannot be decided", executor.SelfSignatureRemedy},
+		{executor.ErrPayloadSignature, "a payload binary is missing or not signed with this k3sm's Developer ID", executor.PayloadSignatureRemedy},
+		{executor.ErrPayloadStamp, "a payload binary is not the build this k3sm pins", executor.PayloadSignatureRemedy},
+	} {
+		if errors.Is(err, sig.err) {
+			logger.Error("the control plane did not come up: "+sig.what+"; parking on this failure",
+				"component", component, "err", err, "remedy", sig.remedy)
+			if b.recordBringUpPermanent(component, err.Error(), sig.remedy) {
+				logger.Error("crash-loop breaker tripped on a permanent fault; the next start will park until an operator clears the record",
+					"path", b.path)
+			}
+			return
+		}
 	}
 	if errors.Is(err, executor.ErrNoGoToolchain) {
 		logger.Error("the control plane did not come up with a fault that cannot heal on retry; parking on this failure",

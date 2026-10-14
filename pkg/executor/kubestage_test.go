@@ -30,6 +30,7 @@ import (
 	"testing"
 
 	"k3sm.io/k3sm/pkg/helmchart"
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // The control-plane version marker (B395). The four kwok-ci/k8s binaries used to be
@@ -401,6 +402,14 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 	}
 
 	fakeHelmRelease(t, helmTarball(t, map[string]string{helmchart.HelmTarballMember: "pretend-helm"}), "")
+	origZot := stageZot
+	t.Cleanup(func() { stageZot = origZot })
+	stageZot = func(_ context.Context, dir string) error {
+		if err := os.WriteFile(registrysvc.ZotPath(dir), []byte("pretend-zot"), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dir, registrysvc.ZotMarkerName), []byte(registrysvc.DefaultZotVersion+" minimal\n"), 0o644)
+	}
 
 	dest := filepath.Join(t.TempDir(), "payload")
 	if err := StagePayload(t.Context(), dest); err != nil {
@@ -412,7 +421,7 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 	if !kineStaged(dest, DefaultKineVersion) {
 		t.Error("payload kine marker missing")
 	}
-	if !etcdStaged(dest, DefaultEtcdVersion) {
+	if !etcdChild(DefaultEtcdVersion).staged(dest) {
 		t.Error("payload etcd marker missing")
 	}
 	if err := VerifyPayloadSet(dest); err != nil {

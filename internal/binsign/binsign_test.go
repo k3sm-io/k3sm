@@ -128,3 +128,129 @@ func TestHealOnce(t *testing.T) {
 		t.Error("a stamp with a tab was accepted")
 	}
 }
+
+// inspectingSigner is fakeSigner plus Inspector: a file ending in "DEVID" carries
+// a valid Developer ID signature of team ABCDE12345.
+type inspectingSigner struct{ fakeSigner }
+
+func (f *inspectingSigner) Inspect(_ context.Context, path string) (Signature, error) {
+	b, err := os.ReadFile(path)
+	switch {
+	case err != nil:
+		return Signature{}, nil
+	case strings.HasSuffix(string(b), "SIGNED"):
+		return Signature{Valid: true, AdHoc: true}, nil
+	case strings.HasSuffix(string(b), "DEVID"):
+		return Signature{Valid: true, TeamID: "ABCDE12345"}, nil
+	}
+	return Signature{}, nil
+}
+
+func (f *inspectingSigner) Satisfies(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+// TestIdentityRule pins the identity rule: with an Inspector behind the Signer, a
+// binary whose signature verifies and is not ad hoc is never re-signed or
+// replaced by EnsureSigned, SignIfInvalid or HealOnce (which still records it);
+// without one, the old behaviour stands.
+func TestIdentityRule(t *testing.T) {
+	dir := t.TempDir()
+	devID := filepath.Join(dir, "kube-apiserver")
+	if err := os.WriteFile(devID, []byte("xDEVID"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := &inspectingSigner{}
+	before := ino(t, devID)
+	if err := HealOnce(t.Context(), s, dir, "v1", "kube-apiserver"); err != nil {
+		t.Fatal(err)
+	}
+	if replaced, err := EnsureSigned(t.Context(), s, devID); err != nil || replaced {
+		t.Errorf("EnsureSigned: replaced=%v err=%v, want untouched", replaced, err)
+	}
+	if err := SignIfInvalid(t.Context(), s, "kube-apiserver")(devID); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.paths) != 0 || ino(t, devID) != before {
+		t.Errorf("signed %v: a Developer ID binary was touched", s.paths)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, HealMarkerName)); string(b) != "kube-apiserver\tv1\n" {
+		t.Errorf("marker = %q, want the kept binary recorded", b)
+	}
+	// A plain Signer cannot tell, so it re-signs as before.
+	plain := &fakeSigner{}
+	if replaced, err := EnsureSigned(t.Context(), plain, devID); err != nil || !replaced {
+		t.Errorf("plain signer: replaced=%v err=%v, want the old re-sign", replaced, err)
+	}
+}
+
+// TestRecordHealed pins the marker-only record: present names are recorded at the
+// stamp without touching them, absent names are skipped, other lines are kept.
+func TestRecordHealed(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, HealMarkerName), []byte("z\told\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := ino(t, filepath.Join(dir, "a"))
+	if err := RecordHealed(dir, "v1", "a", "absent"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, HealMarkerName)); string(b) != "a\tv1\nz\told\n" {
+		t.Errorf("marker = %q", b)
+	}
+	if ino(t, filepath.Join(dir, "a")) != before {
+		t.Error("RecordHealed replaced a binary")
+	}
+	if err := RecordHealed(dir, "", "a"); err == nil {
+		t.Error("an empty stamp was accepted")
+	}
+}
+
+// TestParseDisplay pins the read of `codesign -dv` output.
+func TestParseDisplay(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+		want Signature
+	}{
+		{"ad hoc", "Executable=/x\nCodeDirectory v=20400 size=1 flags=0x2(adhoc) hashes=1+0\nSignature=adhoc\nTeamIdentifier=not set\n",
+			Signature{Valid: true, AdHoc: true}},
+		{"linker-signed", "CodeDirectory v=20400 size=1 flags=0x20002(adhoc,linker-signed) hashes=1+0\nSignature=adhoc\n",
+			Signature{Valid: true, AdHoc: true}},
+		{"Developer ID", "CodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0\nAuthority=Developer ID Application: K (ABCDE12345)\nTeamIdentifier=ABCDE12345\n",
+			Signature{Valid: true, TeamID: "ABCDE12345"}},
+		{"platform binary", "CodeDirectory v=20400 size=1 flags=0x0(none) hashes=5+2\nTeamIdentifier=not set\n",
+			Signature{Valid: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseDisplay(tc.out); got != tc.want {
+				t.Errorf("parseDisplay = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRequirements pins the requirement texts and the Team ID gate in front of
+// them: a malformed id is refused, never spliced into the text.
+func TestRequirements(t *testing.T) {
+	for _, id := range []string{"", "abcde12345", "ABCDE1234", `ABCDE1234"`, "ABCDE12345 or anchor apple"} {
+		if _, err := TeamRequirement(id); err == nil {
+			t.Errorf("TeamRequirement accepted %q", id)
+		}
+		if _, err := DeveloperIDRequirement(id); err == nil {
+			t.Errorf("DeveloperIDRequirement accepted %q", id)
+		}
+	}
+	req, err := TeamRequirement("ABCDE12345")
+	if err != nil || req != `anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345"` {
+		t.Errorf("TeamRequirement = %q, %v", req, err)
+	}
+	dev, err := DeveloperIDRequirement("ABCDE12345")
+	if err != nil || !strings.Contains(dev, "certificate leaf[field.1.2.840.113635.100.6.1.13]") ||
+		!strings.Contains(dev, "certificate 1[field.1.2.840.113635.100.6.2.6]") || !strings.HasSuffix(dev, `= "ABCDE12345"`) {
+		t.Errorf("DeveloperIDRequirement = %q, %v", dev, err)
+	}
+}

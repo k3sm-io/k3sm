@@ -35,7 +35,7 @@ import (
 // snapshotUsage is the `k3sm snapshot` help text. It states the single-node scope up
 // front: an operator on the etcd HA posture must be told what this command does not
 // cover before they run it, not after.
-const snapshotUsage = `Usage: k3sm snapshot save    [--out <path>] [--work-dir <dir>]
+const snapshotUsage = `Usage: k3sm snapshot save    [--out <path>] [--compress] [--work-dir <dir>]
        k3sm snapshot restore <snapshot> [--work-dir <dir>]
                              [--node-name <name>] [--etcd-peer-ip <ip>] [--etcd-peer-port <port>]
 
@@ -54,6 +54,10 @@ Flags:
   --work-dir <dir>        control-plane state root (default: this posture's work dir)
   --out <path>            save: the snapshot file, or a directory to name one in
                           (default: %s under the work dir)
+  --compress              save: write the snapshot as a zip archive (one member,
+                          deflated); a generated name then ends in .zip. Restore
+                          recognizes a compressed snapshot by its content, whatever
+                          the file is called
   --node-name <name>      restore, etcd: this server's member name
   --etcd-peer-ip <ip>     restore, etcd: this server's etcd peer address
   --etcd-peer-port <port> restore, etcd: this server's etcd peer port
@@ -109,20 +113,21 @@ func runSnapshotSave(args []string) error {
 	fs := flag.NewFlagSet("snapshot save", flag.ExitOnError)
 	workDir := snapshotWorkDirFlag(fs)
 	out := fs.String("out", "", "snapshot destination: a file, or a directory to name one in (default: db/snapshots under the work dir)")
+	compress := fs.Bool("compress", false, "write the snapshot as a zip archive; restore detects it by content")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, snapshotHelp()) }
 	_ = fs.Parse(args)
 	if fs.NArg() > 0 {
 		return fmt.Errorf("snapshot save takes no positional arguments (got %q); the destination is --out", fs.Arg(0))
 	}
 
-	return saveSnapshot(context.Background(), os.Stdout, *workDir, *out, defaultSnapshotSavers())
+	return saveSnapshot(context.Background(), os.Stdout, *workDir, *out, *compress, defaultSnapshotSavers())
 }
 
 // snapshotSavers are the two save paths and the posture test that picks one; seams so
 // the dispatch is testable without a datastore.
 type snapshotSavers struct {
 	etcdMember func(workDir string) bool
-	etcd       func(ctx context.Context, workDir, dst string) error
+	etcd       func(ctx context.Context, workDir, dst string, compress bool) error
 	sqlite     func(ctx context.Context, opts executor.SnapshotSaveOptions) (*executor.SnapshotSaveResult, error)
 	now        func() time.Time
 }
@@ -138,20 +143,20 @@ func defaultSnapshotSavers() snapshotSavers {
 
 // saveSnapshot takes the snapshot the work dir's posture calls for: an online,
 // verified etcd snapshot when the work dir holds an etcd member, the kine SQLite
-// snapshot otherwise.
-func saveSnapshot(ctx context.Context, w io.Writer, workDir, out string, s snapshotSavers) error {
+// snapshot otherwise. compress writes either one as a zip archive.
+func saveSnapshot(ctx context.Context, w io.Writer, workDir, out string, compress bool, s snapshotSavers) error {
 	if s.etcdMember(workDir) {
-		dst, err := etcdSnapshotDest(workDir, out, s.now().UTC())
+		dst, err := etcdSnapshotDest(workDir, out, s.now().UTC(), compress)
 		if err != nil {
 			return err
 		}
-		if err := s.etcd(ctx, workDir, dst); err != nil {
+		if err := s.etcd(ctx, workDir, dst, compress); err != nil {
 			return annotateSnapshotError(err, workDir)
 		}
-		renderEtcdSnapshotSave(w, dst)
+		renderEtcdSnapshotSave(w, dst, compress)
 		return nil
 	}
-	res, err := s.sqlite(ctx, executor.SnapshotSaveOptions{WorkDir: workDir, Out: out})
+	res, err := s.sqlite(ctx, executor.SnapshotSaveOptions{WorkDir: workDir, Out: out, Compress: compress})
 	if err != nil {
 		return annotateSnapshotError(err, workDir)
 	}
@@ -164,8 +169,12 @@ const etcdSnapshotLayout = "20060102T150405Z"
 
 // etcdSnapshotDest decides where an etcd save writes: the default snapshots dir
 // (created 0700), inside a directory the operator named, or the exact file named.
-func etcdSnapshotDest(workDir, out string, at time.Time) (string, error) {
+// A compressed snapshot's generated name ends in .zip instead of .db.
+func etcdSnapshotDest(workDir, out string, at time.Time, compress bool) (string, error) {
 	name := "k3sm-etcd-snapshot-" + at.Format(etcdSnapshotLayout) + ".db"
+	if compress {
+		name = "k3sm-etcd-snapshot-" + at.Format(etcdSnapshotLayout) + ".zip"
+	}
 	if out == "" {
 		dir := executor.SnapshotDir(workDir)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -184,11 +193,14 @@ func etcdSnapshotDest(workDir, out string, at time.Time) (string, error) {
 }
 
 // renderEtcdSnapshotSave prints what an etcd save produced.
-func renderEtcdSnapshotSave(w io.Writer, path string) {
+func renderEtcdSnapshotSave(w io.Writer, path string, compressed bool) {
 	fmt.Fprintf(w, "k3sm snapshot save — embedded etcd member\n\n")
 	fmt.Fprintf(w, "  snapshot   %s\n", path)
 	if fi, err := os.Stat(path); err == nil {
 		fmt.Fprintf(w, "  size       %d bytes\n", fi.Size())
+	}
+	if compressed {
+		fmt.Fprint(w, "  format     zip archive (compressed)\n")
 	}
 	fmt.Fprint(w, `
 Taken online from this server's etcd member and verified. It holds every Secret in
@@ -345,6 +357,9 @@ func renderEtcdSnapshotRestore(w io.Writer, res *executor.EtcdRestoreResult) {
 		fmt.Fprintf(w, "  WARNING    %s\n", warn)
 	}
 	fmt.Fprintf(w, "  restored   %s (%d bytes of snapshot)\n", res.DataDir, res.Bytes)
+	if res.Compressed {
+		fmt.Fprint(w, "  format     zip archive, decompressed and verified before the rebuild\n")
+	}
 	fmt.Fprintf(w, "  member     %s at %s, the only member of a NEW cluster\n", res.MemberName, res.PeerURL)
 	fmt.Fprintf(w, "  revision   raised by %d and marked compacted, so every watcher relists\n", res.RevisionBump)
 	if res.PreviousDataDir != "" {
@@ -446,6 +461,9 @@ func renderSnapshotSave(w io.Writer, res *executor.SnapshotSaveResult) {
 	fmt.Fprintf(w, "k3sm snapshot save — %s\n\n", res.SourceDB)
 	fmt.Fprintf(w, "  snapshot   %s\n", res.Path)
 	fmt.Fprintf(w, "  size       %d bytes\n", res.Bytes)
+	if res.Compressed {
+		fmt.Fprint(w, "  format     zip archive (compressed)\n")
+	}
 	fmt.Fprintf(w, "  taken at   %s\n", res.TakenAt.Format("2006-01-02 15:04:05 UTC"))
 	if res.Checkpointed {
 		fmt.Fprint(w, "  source     write-ahead log checkpointed and drained\n")
@@ -472,6 +490,9 @@ PersistentVolume data is NOT in this snapshot — see docs/user/storage.md.
 func renderSnapshotRestore(w io.Writer, res *executor.SnapshotRestoreResult) {
 	fmt.Fprintf(w, "k3sm snapshot restore — %s\n\n", res.Snapshot)
 	fmt.Fprintf(w, "  restored   %s (%d bytes)\n", res.RestoredDB, res.Bytes)
+	if res.Compressed {
+		fmt.Fprint(w, "  format     zip archive, decompressed and verified before it was installed\n")
+	}
 	if res.PreviousDB != "" {
 		fmt.Fprintf(w, "  preserved  %s (the datastore you replaced — NOT deleted)\n", res.PreviousDB)
 	} else {

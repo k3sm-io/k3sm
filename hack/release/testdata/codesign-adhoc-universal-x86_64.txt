@@ -1,0 +1,18 @@
+Executable=/fixture/u
+Identifier=u-55554944ed60157d0a2030c9b4881921b5b603d2
+Format=Mach-O thin (x86_64)
+CodeDirectory v=20400 size=259 flags=0x2(adhoc) hashes=2+2 location=embedded
+Hash type=sha256 size=32
+CandidateCDHash sha256=736cf3d66e63b20d4b462fa0bee31deaf5f57aa7
+CandidateCDHashFull sha256=736cf3d66e63b20d4b462fa0bee31deaf5f57aa7bac4799a39ca218fa2be6914
+Hash choices=sha256
+CMSDigest=736cf3d66e63b20d4b462fa0bee31deaf5f57aa7bac4799a39ca218fa2be6914
+CMSDigestType=2
+CDHash=736cf3d66e63b20d4b462fa0bee31deaf5f57aa7
+Signature=adhoc
+Info.plist=not bound
+TeamIdentifier=not set
+Sealed Resources=none
+Internal requirements count=0 size=12
+Total signatures=1
+Chosen signature=1

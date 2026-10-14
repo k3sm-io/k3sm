@@ -54,7 +54,7 @@ func liveWrites(calls []string, cfg Config) []string {
 
 // stagedWrites are the copies into the staging tree, in order.
 func stagedWrites(calls []string, cfg Config) []string {
-	prefix := "CopyToRootOwned:" + cfg.stagingDir() + "/"
+	prefix := "CopyToRootOwned:" + cfg.swapDir() + "/"
 	var out []string
 	for _, c := range calls {
 		if strings.HasPrefix(c, prefix) {
@@ -86,7 +86,7 @@ func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 		t.Fatalf("reinstall: %v", err)
 	}
 	calls := f.calls
-	swap := fmt.Sprintf("SwapInstallRoot:%s<->%s:swap", cfg.stagingDir(), cfg.InstallDir)
+	swap := fmt.Sprintf("SwapInstallRoot:%s<->%s:swap", cfg.swapDir(), cfg.InstallDir)
 
 	t.Run("no artifact is written into the live install root", func(t *testing.T) {
 		if got := liveWrites(calls, cfg); len(got) > 0 {
@@ -143,7 +143,7 @@ func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 	})
 
 	t.Run("the reap runs only after the verification succeeded", func(t *testing.T) {
-		reap := idx(calls, "RemoveTree:"+cfg.stagingDir())
+		reap := idx(calls, "RemoveTree:"+cfg.swapDir())
 		if reap < 0 {
 			t.Fatalf("the previous install root was never reaped; calls =\n%s", strings.Join(calls, "\n"))
 		}
@@ -161,7 +161,7 @@ func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 		if len(live) != len(firstTree) {
 			t.Errorf("the live root holds %d artifacts, want the %d this install staged", len(live), len(firstTree))
 		}
-		if got := f.treeUnder(cfg.stagingDir()); len(got) != 0 {
+		if got := f.treeUnder(cfg.swapDir()); len(got) != 0 {
 			t.Errorf("the staging path still holds %v after the reap", got)
 		}
 	})
@@ -172,10 +172,10 @@ func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 		if lock < 0 || unlock < 0 {
 			t.Fatalf("the install lock was not taken and released; calls =\n%s", strings.Join(calls, "\n"))
 		}
-		if lock > idx(calls, "EnsureRootDir:"+cfg.stagingDir()) {
+		if lock > idx(calls, "EnsureRootDir:"+cfg.swapDir()) {
 			t.Error("the lock was taken after the staging directory was created")
 		}
-		if unlock < idx(calls, "RemoveTree:"+cfg.stagingDir()) {
+		if unlock < idx(calls, "RemoveTree:"+cfg.swapDir()) {
 			t.Error("the lock was released before the reap")
 		}
 	})
@@ -212,7 +212,7 @@ func TestInstallStagingFailureLeavesTheLiveRootUntouched(t *testing.T) {
 	if got := liveWrites(f.calls, cfg); len(got) > 0 {
 		t.Errorf("a failed install wrote into the LIVE root: %v", got)
 	}
-	if idx(f.calls, fmt.Sprintf("SwapInstallRoot:%s<->%s:swap", cfg.stagingDir(), cfg.InstallDir)) >= 0 {
+	if idx(f.calls, fmt.Sprintf("SwapInstallRoot:%s<->%s:swap", cfg.swapDir(), cfg.InstallDir)) >= 0 {
 		t.Error("a failed install published its partial tree")
 	}
 	if !maps.Equal(f.treeUnder(cfg.InstallDir), before) {
@@ -241,10 +241,10 @@ func TestInstallFirstInstallRenamesTheStagedRootIntoPlace(t *testing.T) {
 	if err := Install(context.Background(), f, stageCfg()); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	if at := idx(f.calls, fmt.Sprintf("SwapInstallRoot:%s<->%s:rename", cfg.stagingDir(), cfg.InstallDir)); at < 0 {
+	if at := idx(f.calls, fmt.Sprintf("SwapInstallRoot:%s<->%s:rename", cfg.swapDir(), cfg.InstallDir)); at < 0 {
 		t.Fatalf("a first install did not take the plain-rename publish; calls =\n%s", strings.Join(f.calls, "\n"))
 	}
-	if at := idx(f.calls, "RemoveTree:"+cfg.stagingDir()); at >= 0 {
+	if at := idx(f.calls, "RemoveTree:"+cfg.swapDir()); at >= 0 {
 		t.Error("a first install reaped a previous tree it never had")
 	}
 	if got := f.treeUnder(cfg.InstallDir); len(got) == 0 {
@@ -275,14 +275,14 @@ func TestInstallRevertsTheSwapWhenTheWiringFails(t *testing.T) {
 		t.Fatal("Install succeeded with a daemon that never came up")
 	}
 	// Twice: the publish, then the reverse that puts the previous tree back.
-	swap := fmt.Sprintf("SwapInstallRoot:%s<->%s:swap", cfg.stagingDir(), cfg.InstallDir)
+	swap := fmt.Sprintf("SwapInstallRoot:%s<->%s:swap", cfg.swapDir(), cfg.InstallDir)
 	if n := countCalls(f, swap); n != 2 {
 		t.Fatalf("the install root was swapped %d times, want 2 (publish then revert); calls =\n%s", n, strings.Join(f.calls, "\n"))
 	}
 	if !maps.Equal(f.treeUnder(cfg.InstallDir), before) {
 		t.Errorf("after the revert the live root is %v, want the original tree %v", f.treeUnder(cfg.InstallDir), before)
 	}
-	if at := idx(f.calls, "RemoveTree:"+cfg.stagingDir()); at >= 0 {
+	if at := idx(f.calls, "RemoveTree:"+cfg.swapDir()); at >= 0 {
 		t.Error("a failed install reaped the tree it had just rolled back to")
 	}
 	// One sentence, in restartDaemons' existing shape: the cause, the rollback,
@@ -342,23 +342,23 @@ func TestInstallRefusesAnUntrustedStagingPath(t *testing.T) {
 		{
 			name: "a symlink",
 			seed: func(f *fakeSystem) {
-				f.putOwned(cfg.stagingDir(), 0, 0, 0o755|fs.ModeSymlink, EntrySymlink)
+				f.putOwned(cfg.swapDir(), 0, 0, 0o755|fs.ModeSymlink, EntrySymlink)
 			},
 			want: "is a symlink",
 		},
 		{
 			name: "a regular file",
-			seed: func(f *fakeSystem) { f.putOwned(cfg.stagingDir(), 0, 0, 0o644, EntryRegular) },
+			seed: func(f *fakeSystem) { f.putOwned(cfg.swapDir(), 0, 0, 0o644, EntryRegular) },
 			want: "not a directory",
 		},
 		{
 			name: "owned by somebody else",
-			seed: func(f *fakeSystem) { f.putOwned(cfg.stagingDir(), 501, 0, 0o755|fs.ModeDir, EntryDir) },
+			seed: func(f *fakeSystem) { f.putOwned(cfg.swapDir(), 501, 0, 0o755|fs.ModeDir, EntryDir) },
 			want: "owned by uid 501, not root",
 		},
 		{
 			name: "group-writable",
-			seed: func(f *fakeSystem) { f.putOwned(cfg.stagingDir(), 0, 0, 0o775|fs.ModeDir, EntryDir) },
+			seed: func(f *fakeSystem) { f.putOwned(cfg.swapDir(), 0, 0, 0o775|fs.ModeDir, EntryDir) },
 			want: "group- or world-writable",
 		},
 	} {
@@ -372,7 +372,7 @@ func TestInstallRefusesAnUntrustedStagingPath(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error = %v, want it to name %q", err, tc.want)
 			}
-			if at := idx(f.calls, "RemoveTree:"+cfg.stagingDir()); at >= 0 {
+			if at := idx(f.calls, "RemoveTree:"+cfg.swapDir()); at >= 0 {
 				t.Error("root removed the untrusted path instead of refusing it")
 			}
 			if at := idx(f.calls, "CopyToRootOwned:"+cfg.stagedBinary()); at >= 0 {
@@ -390,13 +390,13 @@ func TestStaleStagingTreeIsRemovedBeforeStaging(t *testing.T) {
 	shrinkRestartBudgets(t)
 	cfg := stageCfg().withDefaults()
 	f := &fakeSystem{}
-	f.putOwned(cfg.stagingDir(), 0, 0, 0o755|fs.ModeDir, EntryDir)
+	f.putOwned(cfg.swapDir(), 0, 0, 0o755|fs.ModeDir, EntryDir)
 	f.putTree(cfg.stagedBinary(), "/tmp/an-older-run/k3sm")
 	if err := Install(context.Background(), f, stageCfg()); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	remove := idx(f.calls, "RemoveTree:"+cfg.stagingDir())
-	create := idx(f.calls, "EnsureRootDir:"+cfg.stagingDir())
+	remove := idx(f.calls, "RemoveTree:"+cfg.swapDir())
+	create := idx(f.calls, "EnsureRootDir:"+cfg.swapDir())
 	stage := idx(f.calls, "CopyToRootOwned:"+cfg.stagedBinary())
 	if remove < 0 || create < remove || stage < create {
 		t.Fatalf("the stale tree was not removed before the staging directory was created and filled; calls =\n%s", strings.Join(f.calls, "\n"))
@@ -408,7 +408,7 @@ func TestStaleStagingTreeIsRemovedBeforeStaging(t *testing.T) {
 // volume's own staging mount point is a real transient APFS mount NESTED in the
 // install root, it runs and tears down at step 0 before the install root is
 // staged at all, and it must never be routed through the redirection — a
-// migration mounted inside <InstallDir>.staging would be published into the
+// migration mounted inside <InstallDir>.swap would be published into the
 // install root by the swap, or unmounted out from under itself.
 func TestDataVolumeStagingIsNeverRedirected(t *testing.T) {
 	cfg := stageCfg().withDefaults()
@@ -421,7 +421,7 @@ func TestDataVolumeStagingIsNeverRedirected(t *testing.T) {
 	if cfg.datavolStaging() != DefaultInstallDir+"/"+datavolStagingName {
 		t.Errorf("datavolStaging() = %s, want the nested mount point %s", cfg.datavolStaging(), DatavolStagingDir)
 	}
-	if strings.HasPrefix(cfg.datavolStaging(), cfg.stagingDir()) {
+	if strings.HasPrefix(cfg.datavolStaging(), cfg.swapDir()) {
 		t.Error("the data-volume mount point lives inside the install root's staging tree")
 	}
 }
@@ -431,9 +431,9 @@ func TestDataVolumeStagingIsNeverRedirected(t *testing.T) {
 func TestStagedPath(t *testing.T) {
 	cfg := Config{InstallDir: "/Library/k3sm"}.withDefaults()
 	for _, tc := range []struct{ in, want string }{
-		{"/Library/k3sm/k3sm", "/Library/k3sm.staging/k3sm"},
-		{"/Library/k3sm/bin/kine", "/Library/k3sm.staging/bin/kine"},
-		{"/Library/k3sm", "/Library/k3sm.staging"},
+		{"/Library/k3sm/k3sm", "/Library/k3sm.swap/k3sm"},
+		{"/Library/k3sm/bin/kine", "/Library/k3sm.swap/bin/kine"},
+		{"/Library/k3sm", "/Library/k3sm.swap"},
 		// Outside the install root: written where it says it is. The plists and
 		// the launcher depend on this — redirecting either would move them out
 		// from under launchd and off the operator's PATH.
@@ -442,7 +442,7 @@ func TestStagedPath(t *testing.T) {
 		{"/var/lib/k3sm/server/token", "/var/lib/k3sm/server/token"},
 		// The sibling is NOT under the install root, even though its name shares
 		// the prefix — the check is path-segment-wise, not string-wise.
-		{"/Library/k3sm.staging/k3sm", "/Library/k3sm.staging/k3sm"},
+		{"/Library/k3sm.swap/k3sm", "/Library/k3sm.swap/k3sm"},
 		{"/Library/k3sm-other/k3sm", "/Library/k3sm-other/k3sm"},
 	} {
 		if got := cfg.stagedPath(tc.in); got != tc.want {
@@ -451,8 +451,8 @@ func TestStagedPath(t *testing.T) {
 	}
 	// The staging directory is a SIBLING, never a child: the kernel cannot
 	// exchange a directory with its own parent.
-	if strings.HasPrefix(cfg.stagingDir(), cfg.InstallDir+"/") {
-		t.Errorf("stagingDir() = %s is inside the install root", cfg.stagingDir())
+	if strings.HasPrefix(cfg.swapDir(), cfg.InstallDir+"/") {
+		t.Errorf("swapDir() = %s is inside the install root", cfg.swapDir())
 	}
 	// ...and so is the lock, for the same reason: a lock held on a file in the
 	// tree being swapped would travel with that tree.
@@ -464,7 +464,7 @@ func TestStagedPath(t *testing.T) {
 // TestStagingTrustVerdict states every arm of the refusal in a table, including
 // the ones no unprivileged filesystem can reach.
 func TestStagingTrustVerdict(t *testing.T) {
-	const path = "/Library/k3sm.staging"
+	const path = "/Library/k3sm.swap"
 	for _, tc := range []struct {
 		name  string
 		entry OwnedEntry

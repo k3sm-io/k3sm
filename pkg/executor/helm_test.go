@@ -193,7 +193,7 @@ func TestStageHelm(t *testing.T) {
 		if err := os.WriteFile(helmchart.HelmPath(bd), []byte("signed-earlier"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := stageHelm(t.Context(), bd, true); err != nil {
+		if err := stageHelm(t.Context(), signingPolicy{s: bootCodeSigner}, bd, true); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := os.ReadFile(helmchart.HelmPath(bd)); string(got) != "the-helm-binary" || *calls != 1 {

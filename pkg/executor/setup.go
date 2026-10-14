@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,7 @@ import (
 	"k3sm.io/k3sm/internal/binsign"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/helmchart"
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // ComponentCertValidity is the lifetime of a per-component client cert (the scheduler /
@@ -254,6 +256,23 @@ func ensureControlPlaneBinaries(ctx context.Context, logger *slog.Logger, workDi
 // found. A stale set is still a self-consistent control plane, and serving on it
 // beats refusing to serve; see reportStagedControlPlane for the three outcomes.
 func ensureControlPlaneBinariesVerified(ctx context.Context, logger *slog.Logger, bd, kubeVersion string, requirePin bool) error {
+	// The release path (a Developer ID-signed k3sm, see signingPolicy) runs the set
+	// the signed payload staged and nothing else: it is verified in place and used
+	// byte-identical, and a missing or failing binary refuses the boot. It never
+	// downloads, so the digest-pinned fallback below is dev-only.
+	if !requirePin {
+		p, err := resolveSigningPolicy(ctx, logger)
+		if err != nil {
+			return err
+		}
+		if p.release {
+			if err := verifyPayloadBinaries(ctx, p, bd, healStamp(kubeMarkerPath(bd)), cpBinaries); err != nil {
+				return err
+			}
+			reportStagedControlPlane(ctx, logger, bd, kubeVersion)
+			return nil
+		}
+	}
 	if _, err := os.Stat(filepath.Join(bd, "kube-apiserver")); err == nil {
 		if requirePin {
 			// Already-present bytes are already signed, and signing rewrites the
@@ -619,18 +638,34 @@ func kineStaged(bd, version string) bool { return kineChild(version).staged(bd) 
 // killed boot can never leave a half-written marker vouching for the wrong bytes.
 func writeKineMarker(bd, version string) error { return kineChild(version).writeMarker(bd) }
 
-// ensureKine builds kine from source CGO_ENABLED=0 (kine's pure-Go
-// modernc.org/sqlite backend) into the workdir bin, ad-hoc signs it, and records the
-// version marker. It is a no-op only when the marker already vouches for the wanted
-// version+variant — never on mere presence.
+// ensureKine stages the kine the boot runs into the workdir bin.
+//
+// On the RELEASE path (a Developer ID-signed k3sm, see signingPolicy) it is the
+// payload's kine and nothing else: verified, its stamp read from the verified bytes
+// and matched against (kineVersion, kineBuildVariant), then used byte-identical
+// (stagedChild.ensureShipped). A missing, unverified or mismatched shipped kine
+// refuses the boot; it never falls through to a build.
+//
+// On the DEV path seedBinDir has already preferred the payload's kine when its marker
+// vouches for the pins; what is left here builds kine from source CGO_ENABLED=0
+// (kine's pure-Go modernc.org/sqlite backend) into the workdir bin, ad-hoc signs it,
+// and records the version marker. It is a no-op only when the marker already vouches
+// for the wanted version+variant — never on mere presence.
 //
 // payloadDir is the staged install payload seedBinDir seeds from ("" for none). When
 // neither the work dir nor that payload vouches for the target build and there is no
 // Go toolchain to make one, the k3sm binary was replaced without the payload that
 // ships beside it (a swapped binary, then a kickstart): that is ErrKinePayloadStale,
 // named as such rather than as a missing toolchain, because the fix is the install.
-func ensureKine(ctx context.Context, workDir, payloadDir, kineVersion string) error {
+func ensureKine(ctx context.Context, logger *slog.Logger, workDir, payloadDir, kineVersion string) error {
 	bd := binDir(workDir)
+	p, err := resolveSigningPolicy(ctx, logger)
+	if err != nil {
+		return err
+	}
+	if p.release {
+		return kineChild(kineVersion).ensureShipped(ctx, p, bd, payloadDir)
+	}
 	if err := kinePayloadStale(bd, payloadDir, kineVersion); err != nil {
 		return err
 	}
@@ -684,6 +719,7 @@ func kineChild(kineVersion string) stagedChild {
 		build: func(ctx context.Context, gopath string) (string, error) {
 			return buildKine(ctx, kineVersion, gopath)
 		},
+		readStamp: kineStampFromBinary,
 	}
 }
 
@@ -719,9 +755,31 @@ func buildKine(ctx context.Context, kineVersion, gopath string) (string, error) 
 // boot — a per-boot network round trip long enough to outlast a bring-up deadline,
 // masquerading as a one-time cold-cache cost. Pinned, the pin's modules are fetched
 // once per machine and every later boot builds offline from the warmed cache.
+//
+// Module verification is pinned, not inherited: the ambient GOSUMDB, GONOSUMDB,
+// GONOSUMCHECK, GOPRIVATE, GOINSECURE, GOFLAGS and GOPROXY are dropped, and the checksum
+// database, the public proxy and GOTOOLCHAIN=local are set last. A shell that ran the
+// daemon with GOSUMDB=off would otherwise build kine from unverified modules. GOFLAGS is
+// left unset for each command to set for itself.
 func kineBuildEnv(gopath, modCache string) []string {
-	return append(os.Environ(),
-		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache)
+	env := make([]string, 0, len(os.Environ())+9)
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.Contains(goVerificationEnv, name) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache,
+		"GOSUMDB=sum.golang.org", "GOPROXY=https://proxy.golang.org,direct", "GOTOOLCHAIN=local")
+}
+
+// goVerificationEnv lists the ambient variables that weaken or redirect Go module
+// verification or toolchain selection; kineBuildEnv never passes them through.
+var goVerificationEnv = []string{
+	"GOSUMDB", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOINSECURE", "GOFLAGS",
+	"GOPROXY", "GONOPROXY", "GOTOOLCHAIN",
 }
 
 // ErrNoGoToolchain marks a re-stage of a source-built control-plane child (kine, and
@@ -737,8 +795,9 @@ var ErrNoGoToolchain = errors.New("no Go toolchain on PATH to build the pinned c
 const NoGoToolchainRemedy = "a packaged install has no Go toolchain; re-run `sudo k3sm install` so the staged payload carries this pin"
 
 // lookPathGo resolves the toolchain the child builds need. It reads PATH at call time,
-// so a test drives it with t.Setenv rather than a seam.
-func lookPathGo() (string, error) { return exec.LookPath("go") }
+// so a test drives it with t.Setenv; it is a var only so a release-path test can
+// prove it is never consulted.
+var lookPathGo = func() (string, error) { return exec.LookPath("go") }
 
 // kineModuleCacheDir resolves the stable module cache the kine build downloads into,
 // and runKineBuild runs the build itself. Both are vars so a test can assert the build
@@ -805,7 +864,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // helm.go). The single source for `k3sm payload`, `k3sm install`, and
 // the boot-time seed, so the three can never disagree on the set.
 func PayloadBinaries() []string {
-	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, etcdutlBinaryName, helmchart.HelmBinaryName)
+	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, etcdutlBinaryName, helmchart.HelmBinaryName, registrysvc.ZotBinaryName)
 }
 
 // StagePayload acquires the full control-plane payload into destDir using the
@@ -847,10 +906,23 @@ func StagePayload(ctx context.Context, destDir string) error {
 	// helm is re-downloaded and re-verified even if present (force): these bytes
 	// are about to be published, and a copy already in the directory may have been
 	// signed, which rewrites it past any digest comparison.
-	if err := stageHelm(ctx, destDir, true); err != nil {
+	// The packaging producer runs no signing decision: what it stages is ad-hoc
+	// signed, and the attended pipeline re-signs the release copy.
+	if err := stageHelm(ctx, signingPolicy{s: bootCodeSigner}, destDir, true); err != nil {
+		return err
+	}
+	// The ingest registry's zot, built from its pinned module with its marker, so a
+	// packaged install never builds it (pkg/registrysvc stages it from the payload).
+	if err := stageZot(ctx, destDir); err != nil {
 		return err
 	}
 	return VerifyPayloadSet(destDir)
+}
+
+// stageZot builds the pinned zot and its version marker into a payload dir. A var
+// so a test of StagePayload stands in for the build.
+var stageZot = func(ctx context.Context, destDir string) error {
+	return registrysvc.EnsureZot(ctx, destDir, "", registrysvc.DefaultZotVersion)
 }
 
 // StageKine stages the pinned, patched kine (and its version marker) into destDir
@@ -901,6 +973,10 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create bin dir %s: %w", bd, err)
 	}
+	policy, err := resolveSigningPolicy(ctx, logger)
+	if err != nil {
+		return err
+	}
 	// A staged kine whose marker does not vouch for the target is re-seeded from the
 	// payload — but ONLY when the payload's OWN marker vouches for the target. Trusting
 	// an unmarked payload instead would mean stamping "this is the new pin" onto bytes
@@ -908,9 +984,28 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 	// previous release's payload staged, and the lie would leave it running the old
 	// datastore engine while claiming the new one. An unmarked payload therefore falls
 	// through to ensureKineInto, which rebuilds or reports.
-	restageKine := !kineStaged(bd, kineVersion) && kineStaged(payloadDir, kineVersion)
+	//
+	// A payload kine whose marker does vouch for the target is PREFERRED: it replaces
+	// a work-dir kine whose bytes differ even when that one's marker vouches too (an
+	// earlier on-demand build), so the shipped binary is never shadowed.
+	//
+	// On the release path neither kine nor etcd is seeded here: ensureKine and
+	// ensureEtcd install the payload's copy only after verifying it and reading its
+	// stamp from the verified bytes (stagedChild.ensureShipped).
+	restageKine, err := preferShipped(kineChild(kineVersion), bd, payloadDir)
+	if err != nil {
+		return err
+	}
 	// etcd follows kine's rule exactly, at the one version the wrapper pins.
-	restageEtcd := withEtcd && !etcdStaged(bd, DefaultEtcdVersion) && etcdStaged(payloadDir, DefaultEtcdVersion)
+	restageEtcd := false
+	if withEtcd {
+		if restageEtcd, err = preferShipped(etcdChild(DefaultEtcdVersion), bd, payloadDir); err != nil {
+			return err
+		}
+	}
+	if policy.release {
+		restageKine, restageEtcd = false, false
+	}
 	// The control-plane set follows the same rule, with one refusal kine does not need
 	// here (kine's own migration path owns its downgrade story): when the workdir's
 	// marker names a NEWER version than the payload vouches for, the re-seed would
@@ -945,9 +1040,29 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		if name == etcdutlBinaryName {
 			continue
 		}
+		// On the release path kine and etcd are installed by their ensure step,
+		// verified and stamp-checked, never filled in here.
+		if policy.release && (name == kineBinaryName || name == etcdBinaryName) {
+			continue
+		}
+		// zot is staged by the registry (pkg/registrysvc) from the payload directory
+		// itself, under its own version marker, on both paths.
+		if name == registrysvc.ZotBinaryName {
+			continue
+		}
 		dst := filepath.Join(bd, name)
 		versioned := (name == kineBinaryName && restageKine) || (name == etcdBinaryName && restageEtcd) ||
 			(restageKube && isCPBinary(name))
+		// On the release path the work dir runs the payload's helm and no other: a
+		// copy that differs from it (an earlier dev install's ad-hoc build of the same
+		// pin) is replaced, verified, rather than refused at signHelm.
+		if policy.release && name == helmchart.HelmBinaryName {
+			same, err := sameContent(filepath.Join(payloadDir, name), dst)
+			if err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("compare the shipped %s with %s: %w", name, dst, err)
+			}
+			versioned = err == nil && !same
+		}
 		if _, err := os.Stat(dst); err == nil && !versioned {
 			continue // already present (a prior boot seeded/acquired it)
 		}
@@ -959,9 +1074,15 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 			return fmt.Errorf("read payload %s: %w", src, err)
 		}
 		// On a NEW inode, never over the old one: a versioned re-seed replaces a
-		// binary a running child may still have mapped. The copy is signed (only
-		// if its signature does not already verify) before it takes the name.
-		if err := atomicfile.InstallFile(src, dst, 0o755, binsign.SignIfInvalid(ctx, binsign.Codesign{}, name)); err != nil {
+		// binary a running child may still have mapped. On the dev path the copy is
+		// signed (only if its signature does not already verify) before it takes
+		// the name; on the release path a control-plane copy is verified against
+		// the release requirement instead, and never signed.
+		prepare := binsign.SignIfInvalid(ctx, bootCodeSigner, name)
+		if policy.release && (isCPBinary(name) || name == helmchart.HelmBinaryName) {
+			prepare = verifyTempHook(ctx, policy, name)
+		}
+		if err := atomicfile.InstallFile(src, dst, 0o755, prepare); err != nil {
 			return fmt.Errorf("seed %s from payload: %w", dst, err)
 		}
 	}
@@ -989,6 +1110,23 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 			"from", previousKube, "to", kubeVersion, "dir", bd)
 	}
 	return nil
+}
+
+// preferShipped reports whether the dev seed must (re)place c's work-dir binary
+// from the payload: the payload's marker vouches for c's pins, and the work dir does
+// not already hold those very bytes under a vouching marker.
+func preferShipped(c stagedChild, bd, payloadDir string) (bool, error) {
+	if !c.staged(payloadDir) {
+		return false, nil
+	}
+	if !c.staged(bd) {
+		return true, nil
+	}
+	same, err := sameContent(c.binPath(payloadDir), c.binPath(bd))
+	if err != nil {
+		return false, fmt.Errorf("compare the payload %s with the work dir's: %w", c.name, err)
+	}
+	return !same, nil
 }
 
 // isCPBinary reports whether name is one of the control-plane set the kube marker
@@ -1027,27 +1165,32 @@ func chmodExec(dir string) error {
 	return nil
 }
 
-// signBinaries makes sure each named binary in dir carries a valid ad-hoc
-// signature so an arm64 Mach-O can exec on macOS. It runs on live work-dir binaries
-// at every boot, so it never writes one in place (see package binsign):
+// signBinaries is the dev signing: it makes sure each named binary in dir carries a
+// valid signature so an arm64 Mach-O can exec on macOS. It runs on live work-dir
+// binaries at every boot, so it never writes one in place (see package binsign):
 //
 //   - binsign.HealOnce first replaces each binary once per stamp (the content of
 //     the set's version marker, or the versioned name), clearing a vnode an older
 //     k3sm may have left poisoned by its in-place `codesign -f`;
-//   - then binsign.EnsureSigned leaves a validly ad-hoc-signed binary alone and
+//   - then binsign.EnsureSigned leaves a validly signed binary alone and ad-hoc
 //     signs any other as a temp copy renamed over it.
+//
+// Both verify first: a binary whose signature verifies and is not ad hoc (a
+// Developer ID) is never healed or re-signed, on either signing path. The
+// control-plane set, the source-built children kine and etcd, and helm take this
+// path only on the dev path (see signingPolicy).
 //
 // Signing failures are tolerated (best-effort: a non-macOS CI host should not block
 // bring-up, and a failure leaves the file as it was); the binary fails loudly at
 // exec if it truly cannot run.
 func signBinaries(ctx context.Context, dir, stamp string, names []string) error {
-	_ = binsign.HealOnce(ctx, binsign.Codesign{}, dir, stamp, names...)
+	_ = binsign.HealOnce(ctx, bootCodeSigner, dir, stamp, names...)
 	for _, n := range names {
 		p := filepath.Join(dir, n)
 		if _, err := os.Lstat(p); err != nil {
 			continue
 		}
-		_, _ = binsign.EnsureSigned(ctx, binsign.Codesign{}, p)
+		_, _ = binsign.EnsureSigned(ctx, bootCodeSigner, p)
 	}
 	return nil
 }
@@ -1058,6 +1201,11 @@ func signBinaries(ctx context.Context, dir, stamp string, names []string) error 
 // live install's temp is removed.
 func reapStagingTemps(bd string) error {
 	for _, name := range append(PayloadBinaries(), binsign.HealMarkerName) {
+		// zot's temps belong to the registry, which reaps them itself before it
+		// stages (registrysvc.EnsureZotWith); it may be staging one now.
+		if name == registrysvc.ZotBinaryName {
+			continue
+		}
 		if err := atomicfile.ReapOrphans(bd, name); err != nil {
 			return err
 		}
@@ -1088,7 +1236,7 @@ func resignFresh(ctx context.Context, dir string, names []string) {
 		if _, err := os.Lstat(p); err != nil {
 			continue
 		}
-		_ = binsign.ResignByReplace(ctx, binsign.Codesign{}, p)
+		_ = binsign.ResignByReplace(ctx, bootCodeSigner, p)
 	}
 }
 

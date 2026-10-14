@@ -29,7 +29,8 @@ note "S1 — staging the lab-side harness on $HOST"
 lab <<'LABEOF'
 set -euo pipefail
 PREFIX_EXPANDED="$PREFIX"
-mkdir -p "$PREFIX_EXPANDED"/{bin,guest,out}
+mkdir -p "$PREFIX_EXPANDED"/{bin,out}
+mkdir -m 0700 -p "$PREFIX_EXPANDED/guest"      # the kernel download dir
 cd "$PREFIX_EXPANDED"
 
 spike_preflight
@@ -38,16 +39,23 @@ echo "== rig =="
 sw_vers -productVersion; uname -m; sysctl -n hw.model
 
 # ---------------------------------------------------------------- the kernel
-# Throwaway, not pinned: B111 owns the shipping artifact. VZLinuxBootLoader
-# rejects a gzipped Image, so BOTH forms are kept — the gzipped one is the
-# control for criterion 2b, which turns that constraint from a first-boot
-# discovery into a recorded fact costing one boot attempt.
-if [ ! -f guest/Image ]; then
+# Throwaway (not the shipping kernel) but pinned: lib.sh names a dated release
+# and its published sha256. The digest is checked on EVERY run, not only the
+# first fetch, and both boot forms are re-derived from the verified file, so a
+# cached kernel that no longer matches the pin can never be booted.
+# VZLinuxBootLoader rejects a gzipped Image, so BOTH forms are kept — the
+# gzipped one is the control for criterion 2b, which turns that constraint from
+# a first-boot discovery into a recorded fact costing one boot attempt.
+if [ ! -f guest/vmlinuz.gz ]; then
   echo "== fetching a throwaway arm64 kernel =="
   curl -fsSL -o guest/vmlinuz.gz "$KERNEL_URL" || { echo "S1 SETUP FAIL: kernel fetch"; exit 1; }
-  cp guest/vmlinuz.gz guest/Image.gz            # keep the gzipped control
-  gunzip -c guest/vmlinuz.gz > guest/Image || { echo "S1 SETUP FAIL: gunzip"; exit 1; }
 fi
+printf '%s  %s\n' "$KERNEL_SHA256" "guest/vmlinuz.gz" | shasum -a 256 -c - >/dev/null \
+  || { echo "S1 SETUP FAIL: kernel sha256 mismatch (pinned $KERNEL_SHA256)"; rm -f guest/vmlinuz.gz; exit 1; }
+echo "kernel url:    $KERNEL_URL"
+echo "kernel pinned: $KERNEL_SHA256 (verified)"
+cp guest/vmlinuz.gz guest/Image.gz              # keep the gzipped control
+gunzip -c guest/vmlinuz.gz > guest/Image || { echo "S1 SETUP FAIL: gunzip"; exit 1; }
 echo "kernel sha256: $(shasum -a 256 guest/Image | awk '{print $1}')"
 echo "kernel bytes:  $(stat -f%z guest/Image)"
 

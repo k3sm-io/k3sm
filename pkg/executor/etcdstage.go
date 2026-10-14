@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +48,12 @@ const (
 	// wrapper module.
 	etcdServerPackage = "."
 	etcdutlPackage    = "go.etcd.io/etcd/etcdutl/v3"
+	// etcdWrapperModule is the wrapper's module path (etcdchild/go.mod.txt): the
+	// main package of the built etcd server, as its build info records it.
+	etcdWrapperModule = "k3sm.io/etcd-child"
+	// etcdServerModule is the module whose version the etcd server's build info
+	// carries as the etcd pin; etcdutl's is etcdutlPackage's own module.
+	etcdServerModule = "go.etcd.io/etcd/server/v3"
 	// etcdBuildVariant records HOW the binary was built: CGO_ENABLED=0. etcd needs no
 	// cgo, and a cgo build would pull a C toolchain into the release stage.
 	etcdBuildVariant = "nocgo"
@@ -57,10 +64,6 @@ const (
 // so any other version cannot be built hash-checked.
 var ErrEtcdVersionUnpinned = errors.New("etcd version is not the one the embedded wrapper pins")
 
-// etcdStaged reports whether bd holds an etcd binary whose marker vouches for exactly
-// (version, etcdBuildVariant).
-func etcdStaged(bd, version string) bool { return etcdChild(version).staged(bd) }
-
 // ensureEtcdInto stages the pinned etcd into bd under the stagedChild protocol. A
 // version other than DefaultEtcdVersion is refused before anything is touched.
 func ensureEtcdInto(ctx context.Context, bd, version string) error {
@@ -68,6 +71,21 @@ func ensureEtcdInto(ctx context.Context, bd, version string) error {
 		return fmt.Errorf("stage etcd %s: %w (%s)", version, ErrEtcdVersionUnpinned, DefaultEtcdVersion)
 	}
 	return etcdChild(version).ensureInto(ctx, bd)
+}
+
+// ensureEtcd stages the etcd the boot runs into the workdir bin. On the release path
+// it is the payload's etcd, verified and stamp-checked and used byte-identical, and
+// never a build (stagedChild.ensureShipped); on the dev path seedBinDir has already
+// preferred a vouching payload copy and ensureEtcdInto builds whatever is left.
+func ensureEtcd(ctx context.Context, logger *slog.Logger, workDir, payloadDir string) error {
+	p, err := resolveSigningPolicy(ctx, logger)
+	if err != nil {
+		return err
+	}
+	if p.release {
+		return etcdChild(DefaultEtcdVersion).ensureShipped(ctx, p, binDir(workDir), payloadDir)
+	}
+	return ensureEtcdInto(ctx, binDir(workDir), DefaultEtcdVersion)
 }
 
 // etcdChild is etcd's stagedChild declaration at the given pin.
@@ -80,6 +98,7 @@ func etcdChild(version string) stagedChild {
 		build: func(ctx context.Context, scratch string) (string, error) {
 			return buildEtcdWrapper(ctx, version, scratch, etcdServerPackage, etcdBinaryName)
 		},
+		readStamp: etcdStampReader(etcdWrapperModule, etcdServerModule),
 	}
 }
 
@@ -94,6 +113,7 @@ func etcdutlChild(version string) stagedChild {
 		build: func(ctx context.Context, scratch string) (string, error) {
 			return buildEtcdWrapper(ctx, version, scratch, etcdutlPackage, etcdutlBinaryName)
 		},
+		readStamp: etcdStampReader(etcdutlPackage, etcdutlPackage),
 	}
 }
 

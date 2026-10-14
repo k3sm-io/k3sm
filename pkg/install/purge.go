@@ -342,8 +342,14 @@ type purgePlan struct {
 	roots []string
 	// files are the preserved files outside every root.
 	files []string
+	// kubeHome is the validated home the kubeconfig edit lands under, so the
+	// edit cannot reach a home the guard never checked.
+	kubeHome string
 	// kubeUsers are the humans whose kubeconfig carries the k3sm context.
 	kubeUsers []string
+	// kubeName is the name that context is keyed under, read from the installed
+	// arguments before the purge removes them.
+	kubeName string
 	// serviceUsers are the service-user records to delete.
 	serviceUsers []string
 	// volume is the recorded k3sm data volume of the data root, nil if none.
@@ -364,6 +370,7 @@ type purgePlan struct {
 func planPurge(ctx context.Context, sys System, cfg Config, m []artifact, st dataroot.State) (purgePlan, error) {
 	var plan purgePlan
 	plan.homes = []string{cfg.TargetHome}
+	plan.kubeHome = cfg.TargetHome
 	if cfg.TargetHome != "" {
 		if r, err := sys.ResolvePath(cfg.TargetHome); err == nil && r != cfg.TargetHome {
 			plan.homes = append(plan.homes, r)
@@ -397,7 +404,7 @@ func planPurge(ctx context.Context, sys System, cfg Config, m []artifact, st dat
 	// role's plist is on disk, so a purge re-run after a partial one (plists
 	// gone) would otherwise leave a record behind for the next install to
 	// carry over.
-	for _, f := range []string{cfg.ServerArgsRecord, cfg.AgentArgsRecord} {
+	for _, f := range []string{cfg.ServerArgsRecord, cfg.AgentArgsRecord, cfg.NetworkRecord} {
 		if f != "" {
 			files = append(files, f)
 		}
@@ -427,6 +434,15 @@ func planPurge(ctx context.Context, sys System, cfg Config, m []artifact, st dat
 	// After the guards, so a path the rules refuse is refused for that reason.
 	if st.Mounted && st.Volume == nil {
 		return plan, fmt.Errorf("%s is a mounted filesystem with no k3sm data-volume record; unmount it yourself first: %w", cfg.DataRoot, ErrPurgeRefused)
+	}
+	plan.kubeName = DefaultKubeconfigName
+	if len(plan.kubeUsers) > 0 {
+		// Before the arguments records go: the name lives in them.
+		if n, err := InstalledKubeconfigName(sys.ReadFile, cfg.plistPath(ServerLabel), cfg.ServerArgsRecord); err != nil {
+			cfg.Logger.Warn("could not read the recorded kubeconfig name; removing the default one", "default", DefaultKubeconfigName, "err", err)
+		} else {
+			plan.kubeName = n
+		}
 	}
 	for _, u := range plan.kubeUsers {
 		if u == "" {
@@ -581,13 +597,13 @@ func purge(ctx context.Context, sys System, cfg Config) error {
 		}
 	}
 	for _, u := range plan.kubeUsers {
-		had, err := sys.RemoveAdminKubeconfigContext(u)
+		had, err := sys.RemoveAdminKubeconfigContext(u, plan.kubeHome, plan.kubeName)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("remove the %s context from %s's kubeconfig: %w (remedy: kubectl config delete-context %s)", adminContextName, u, err, adminContextName))
+			errs = append(errs, fmt.Errorf("remove the %s context from %s's kubeconfig: %w (remedy: kubectl config delete-context %s)", plan.kubeName, u, err, plan.kubeName))
 			continue
 		}
 		if had {
-			removed = append(removed, "the "+adminContextName+" context in "+u+"'s kubeconfig")
+			removed = append(removed, "the "+plan.kubeName+" context in "+u+"'s kubeconfig")
 		}
 	}
 	if len(errs) > 0 {

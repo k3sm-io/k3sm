@@ -74,7 +74,7 @@ You do not have to do anything for this, but you should know what it does.
   of the database.
 
 A server started with `--cluster-init` keeps its state in an embedded etcd member instead, and none
-of this applies there. A multi-server control plane is not available in v0.1.6; see [HA](ha.md).
+of this applies there. See [HA](ha.md) for the experimental two-server control plane.
 
 ## Upgrading Into the Checkpointing kine
 
@@ -166,8 +166,8 @@ Anything listed has two ways out:
 One limit: the policy is a single cluster-scoped object carrying the ports of the server that
 provisioned it, while `--kine-port` is per server. A control plane whose servers used different
 datastore ports would have a policy that names one of them, and a Service on another server's port
-would be admitted by the API and still unreachable from the pods on that server's node. A
-multi-server control plane is not available in v0.1.6 (see [HA](ha.md)).
+would be admitted by the API and still unreachable from the pods on that server's node. That case
+needs more than one server (see [HA](ha.md)).
 
 ## Rollback
 
@@ -280,6 +280,7 @@ does **not** revert them; you have to.
 
 ## Next
 
+- [Stopping and starting](stop-start.md) explains why an upgrade leaves a stopped node stopped, and `--start`.
 - [Backup & restore](backup-restore.md) covers backing up before an upgrade, and the automatic
   pre-migration copy.
 - [Versions](versions.md) describes the version you are moving to.

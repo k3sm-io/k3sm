@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package ports single-sources the TCP ports k3sm's own server process binds on
-// the WILDCARD address, and the reserved set derived from them.
+// Package ports single-sources the TCP ports k3sm's own node listeners bind (the
+// NodePort range and the kubelet API port), and the reserved set derived from
+// them.
 //
 // It is a LEAF: it depends on nothing else in this repo, so the apiserver argv
 // (pkg/executor), the kubelet API listen addresses (cmd/k3sm), the svclb bind
@@ -28,10 +29,17 @@ package ports
 
 import "strconv"
 
-// The wildcard listeners k3sm's server process owns. Go sets SO_REUSEADDR but
-// NOT SO_REUSEPORT, so wildcard-vs-wildcard on the same port fails EADDRINUSE
-// (wildcard-vs-specific coexists — that is why the ClusterIP/DNS VIPs, which
+// The listeners k3sm's node process owns on these ports. Go sets SO_REUSEADDR but
+// NOT SO_REUSEPORT, so wildcard-vs-wildcard on the same port fails EADDRINUSE,
+// while wildcard-vs-specific coexists (that is why the ClusterIP/DNS VIPs, which
 // bind SPECIFIC addresses, are deliberately absent from this set).
+//
+// The kubelet API binds the node's own address, never the wildcard, and the
+// NodePorts bind either the wildcard (the default) or a configured address set.
+// A wildcard LoadBalancer listener on one of these ports would therefore no
+// longer always fail: beside a specific bind it coexists, answers every OTHER
+// address on the port, and splits one port between two owners. The set stays
+// reserved, conservatively, so a port number keeps a single meaning on a node.
 const (
 	// NodePortRangeMin / NodePortRangeMax are the apiserver's
 	// --service-node-port-range bounds — the standard upstream default, pinned
@@ -41,8 +49,8 @@ const (
 	// NodePortRangeMax is the inclusive upper bound of the NodePort range.
 	NodePortRangeMax = 32767
 	// KubeletAPIPort is the kubelet HTTP API port the VK node serves logs/exec/
-	// stats on (`k3sm server`/`k3sm agent` listen on *:10250). Losing it to a
-	// LoadBalancer Service kills logs/exec/`kubectl top` on that node.
+	// stats on (`k3sm server`/`k3sm agent` listen on <node address>:10250).
+	// Sharing it with a LoadBalancer Service is refused (see Reserved).
 	KubeletAPIPort = 10250
 )
 
@@ -63,18 +71,18 @@ func NodePortRange() string {
 	return strconv.Itoa(NodePortRangeMin) + "-" + strconv.Itoa(NodePortRangeMax)
 }
 
-// Reserved reports whether port belongs to a wildcard listener k3sm's own server
-// process owns: the NodePort range, or the kubelet API port. A LoadBalancer
-// Service declaring such a port would race a k3sm listener for the same wildcard
-// socket, so admission rejects it (pkg/policy) and svclb refuses to bind it
-// (pkg/svclb) rather than letting the race decide.
+// Reserved reports whether port belongs to a listener k3sm's own node process
+// owns: the NodePort range, or the kubelet API port. A LoadBalancer Service
+// declaring such a port would race or share a k3sm listener's port, so
+// admission rejects it (pkg/policy) and svclb refuses to bind it (pkg/svclb)
+// rather than letting start order decide.
 func Reserved(port int) bool {
 	return port == KubeletAPIPort || (port >= NodePortRangeMin && port <= NodePortRangeMax)
 }
 
 // ReservedSet materializes Reserved as an explicit set keyed by the int32 a
-// corev1.ServicePort carries — the shape svclb.Config.ReservedPorts takes, so
-// the controller holds the reserved policy as DATA the assembler injected rather
+// corev1.ServicePort carries — the shape svclb.HosterConfig.ReservedPorts takes,
+// so the hoster holds the reserved policy as DATA the assembler injected rather
 // than importing this package and re-deciding it.
 func ReservedSet() map[int32]bool {
 	set := make(map[int32]bool, NodePortRangeMax-NodePortRangeMin+2)

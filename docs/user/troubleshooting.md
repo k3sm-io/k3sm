@@ -79,7 +79,7 @@ log show --predicate 'subsystem BEGINSWITH "io.k3sm"' --last 10m
 launchctl print system/io.k3sm.server     # daemon state (label may differ per role)
 ```
 
-Not everything lands there. The server process's own structured logs (the LoadBalancer controller, the
+Not everything lands there. The server process's own structured logs (the LoadBalancer decider, the
 ingress host, the control-plane supervisor) go to **stderr**, which launchd routes to
 **`/var/log/k3sm/server.log`**. The unified-log predicate above shows none of them.
 
@@ -292,20 +292,38 @@ See [Limitations](limitations.md).
 
 ## LoadBalancer Stuck `<pending>`
 
-Do not look in the unified log for this one. The LoadBalancer controller and the ingress host log
+Start with the Service's Events, which name the cause when k3sm knows it:
+
+```sh
+kubectl describe service <name>
+```
+
+- **`NoEligibleNodes`**. No node may host the Service: its `svclb.k3sm.io/lbpool` label names a pool
+  no node is in, or allow-list mode is on (some node carries `svclb.k3sm.io/enablelb=true`) and no
+  node in the pool is enabled. See [Multi-node](multi-node.md#node-pools).
+- **`HostNotBound`**. The named node was chosen but could not bind every port of the Service. Read
+  that node's log for the reason below. A chosen node that has never reported at all, such as a
+  worker still running an older k3sm during an upgrade, raises no event: the server logs that the
+  node has not reported, and leaves it out of the Service's status until it does.
+
+Do not look in the unified log for the rest. The LoadBalancer decider and the ingress host log
 through `slog` to **stderr**, which the launchd job routes to a file, so the
 `log show --predicate 'subsystem BEGINSWITH "io.k3sm"'` command at the top of this page shows **nothing**
-for them. Read the file instead:
+for them. Read the file instead: `server.log` on the server, `agent.log` on a joined worker, which
+is where that node's listeners log:
 
 ```sh
 grep svclb /var/log/k3sm/server.log | tail -50
+grep svclb /var/log/k3sm/agent.log | tail -50
 grep ingress /var/log/k3sm/server.log | tail -50
 ```
 
-The controller emits one line at start carrying **both** addresses, which are different:
+The server logs one line at start naming its own node and the address it publishes for it, and every
+node logs one line when its listeners start:
 
 ```
-svclb: loadbalancer controller starting bind=0.0.0.0 advertise=100.64.0.1
+svclb: loadbalancer decider starting self=node-a self_addr=100.64.0.1 hold_down=30s mesh_peers=true
+svclb: loadbalancer hoster starting node=node-a bind=0.0.0.0
 ```
 
 Then look for one of these:
@@ -327,9 +345,10 @@ Then look for one of these:
   The usual culprits are another process on the Mac, a **pod** (macOS has no network namespaces, so pods
   share the node's port space; see [Limitations](limitations.md)), or a second LoadBalancer Service
   declaring the same port. k3sm never picks a different port for you.
-- **`loadbalancer/ingress status will stay EMPTY: no advertisable node address could be derived`**. The
-  listeners are bound and serving, but there is no address that would be correct to publish, so nothing is written
-  rather than advertising an unreachable one. Check `kubectl get node -o wide` shows a non-loopback
+- **`loadbalancer/ingress status will not list this node: no advertisable node address could be derived`**.
+  The listeners are bound and serving, but there is no address that would be correct to publish, so
+  the server's node is left out rather than advertised at an unreachable address. A worker is listed
+  at the mesh address the server recorded when it joined. Check `kubectl get node -o wide` shows a non-loopback
   `INTERNAL-IP`, and that you did not start the server with `--network none`.
 - **`ingress bind retries exhausted`**. The ingress listeners gave up (bounded retry, no port
   fallback). Free the port and restart the daemon.
@@ -345,8 +364,20 @@ this path yet (the event pipeline is planned). The log file is the only place th
 
 ## `kubectl top` Returns No Metrics
 
-k3sm ships no metrics-server and has no CPU accounting; install a metrics-server operator if you need the
-`metrics.k8s.io` verb. See [kubectl access](kubectl-access.md) and [Limitations](limitations.md).
+k3sm ships metrics-server as an add-on, and the server applies it only on a server installed with
+`--mesh-ip` once a node in the cluster can run `vm` Pods. Until then `kubectl top` has no data. Check
+which case you are in:
+
+```sh
+kubectl get apiservice v1beta1.metrics.k8s.io
+kubectl get nodes -l k3sm.io/virtualization=true
+```
+
+No APIService means the add-on was not applied: the server is single-node without `--mesh-ip`, or no
+node can run `vm` Pods. A server installed with `--mesh-ip` re-checks every two minutes and applies it
+once a `vm`-capable node appears. An APIService that is not `Available` means the metrics-server Pod in `kube-system` is not
+Ready yet. `kubectl top node` has no figures in any case. See [kubectl access](kubectl-access.md) and
+[Limitations](limitations.md#headline-divergences).
 
 ## `kubectl exec -it` or `attach` Into a Linux Pod Is Refused
 
@@ -419,6 +450,26 @@ The node advertises a capability label only when its start-time probe said yes.
 - Confirm the agent can reach the server on `6443` and the wireguard mesh is up. See
   [Multi-node](multi-node.md).
 
+## The Thunderbolt Interconnect Is Not Used
+
+Start with `sudo k3sm doctor` on each cabled Mac. Its rows starting with `ic-` check `bridge0` and
+its Thunderbolt members, the netd socket, the node's interconnect address, the peers, the attached
+Pods, cable loops and stray state, and each row that is not a pass prints the command that fixes
+it. Then:
+
+- Run `k3sm status` on the control plane. A `disabled` interconnect row means nobody armed it; run
+  `k3sm interconnect enable` there. A node named as out of range has a cluster index above 30 and
+  never gets an address.
+- Read the Pod's `k3sm.io/InterconnectAttached` condition
+  (`kubectl get pod <name> -o jsonpath='{.status.conditions}'`). A `False` condition names why the
+  attach was refused, and the Pod's Warning Events say the same.
+- A listener has to bind `$K3SM_INTERCONNECT_IP` to be reached over the cable. A wildcard bind stays
+  on the Pod IP.
+- A peer that stops answering is often asleep. Thunderbolt has no Wake-on-LAN; `k3sm doctor`'s
+  `ic-sleep` row prints the setting that keeps it awake.
+
+See [Interconnects](interconnects.md) for how the cable is armed and used.
+
 ## A Node Went Offline and Pods Are Stuck Terminating
 
 A Mac that goes away while it is running Pods leaves them stuck: `kubectl get pod` shows them
@@ -467,6 +518,7 @@ Work through this in order.
 
 ## Next
 
+- [Stopping and starting](stop-start.md) covers a node that reads as stopped on purpose, and a stop that left something behind.
 - [FAQ](faq.md) has quick answers.
 - [Limitations](limitations.md) answers whether something is a bug or a documented gap.
 - [Backup & restore](backup-restore.md) covers recovering the datastore.

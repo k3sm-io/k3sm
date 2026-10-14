@@ -1393,10 +1393,10 @@ phases:
         deliverables:
           - id: M18.1-d1
             done: false
-            desc: "B481 — `k3sm stop` per L1, with the Uninstall teardown extracted into one function both verbs call, the await barriers from pkg/install/restart.go, the two-phase marker (stopping, stopped) 0644 in a root-owned directory, best-effort cordon and annotation, and actor/reason/result logged to slog and os_log."
+            desc: "B481 — `k3sm stop` per L1, with the Uninstall teardown extracted into one function both verbs call, the await barriers from pkg/install/restart.go, the two-phase marker (stopping, stopped) 0644 in a root-owned directory, best-effort cordon and annotation, and actor/reason/result logged to slog and os_log. Code and the named unit gate landed; owed before done: the rig leg (stop and start on both roles, worker and server; reboot survival excluded per B35)."
           - id: M18.1-d2
             done: false
-            desc: "B482 — `k3sm start` (markers removed, enable, netd then node daemon, the shared flush as a precondition, best-effort uncordon) and `k3sm restart` (pods keep running); install, in-app update and uninstall form one state machine: install and update honour the marker unless --start, uninstall clears the disable override and the markers."
+            desc: "B482 — `k3sm start` (markers removed, enable, netd then node daemon, the shared flush as a precondition, best-effort uncordon) and `k3sm restart` (pods keep running); install, in-app update and uninstall form one state machine: install and update honour the marker unless --start, uninstall clears the disable override and the markers. Code and the named unit gate landed; owed before done: the rig leg (stop and start on both roles, worker and server; reboot survival excluded per B35)."
           - id: M18.1-d3
             done: false
             desc: "B483 — an additive omitempty `stoppedBy {actor, reason, at, phase}` on both status shapes, no new verdict or state enum, golden fixtures extended, docs/user/status-json.md updated."
@@ -1471,7 +1471,7 @@ phases:
             check: "go test ./pkg/install -run TestFromStagingRefusesOutsideStagingRoot passes."
             method: integration
       - id: M18.5
-        title: lifecycle helper and auto-stop — password-free stop and start for the app, auto-stop on untrusted Wi-Fi
+        title: lifecycle helper and local-only switching — password-free stop and start for the app, local-only network access on untrusted Wi-Fi
         status: todo
         strategy: hard cut
         depends_on:
@@ -1484,7 +1484,7 @@ phases:
             desc: "B487 — the root-owned lifecycle helper per L9, installed and removed by install and uninstall, excluded from the stop sequence, with docs/privilege-model.md amended in the same change."
           - id: M18.5-d2
             done: false
-            desc: "B488 (out of tree) — auto-stop on untrusted Wi-Fi per L10."
+            desc: "B554 (out of tree) — switch to local-only network access on new or untrusted Wi-Fi per L10 as amended 2026-10-12 (replaces auto-stop, B488 superseded); depends on B552, the CLI switch."
         acceptance:
           - id: M18.5-a1
             met: false
@@ -1664,6 +1664,18 @@ milestone. Sub-phases:
 - ⬜ **M3.3** — per-node CoreDNS bound to the DNS VIP + node-local `kubernetes` endpoint so infra VIPs aren't
   blackholed over the mesh (with darwin-net:M3.3).
 Exit (§9 M3): two Macs, one cluster, cross-node pod-to-pod + ClusterIP + a NodePort + a persistent StatefulSet.
+
+**Follow-on (backlog, not an M3 deliverable): multi-node ServiceLB with node pools.** `pkg/svclb` is split
+into a server-side **decider** (admin client: selects hosts by the `svclb.k3sm.io/enablelb` /
+`svclb.k3sm.io/lbpool` / `lbpool.svclb.k3sm.io/<pool>` labels, stamps `svclb.k3sm.io/hosts` on the Service,
+and writes the whole replaced `status.loadBalancer.ingress`) and a per-node **hoster** in every node process
+(binds the stamped Services and reports them on its OWN Node, `svclb.k3sm.io/bound`; no RBAC change).
+Addresses are server-held (MeshPeer mesh address, the server's own derived address for its node), allow-list
+mode needs `enablelb=true`, reports are trusted per incarnation across a Ready transition, and a new decider
+holds status changes down for 30 s. Deploy: **phased (named exception: multi-node launchd rolling restart)**,
+agents first, server last. Gate `pkg/svclb::TestNodePoolSelection` (unit + fake-clientset leg); the
+report-channel authorization against a real apiserver is `e2e/TestNodePoolSelection` (integration tier of
+`hack/lab/b416.sh`); the two-Mac rig leg is the `K3SM_LAB=1` tier of the same script, owed.
 
 ## M4 — Install/launchd, packaging, Homebrew, hardening 🟡
 - 🪦 **M4.0** — **DESCOPED 2026-07 → k3sm:M7.1** (release-engineering pipeline). The single-server packaging/launchd/
@@ -2218,9 +2230,9 @@ The status item, the menu, the window and the login item (out of tree).
 ### M18.4 — install side ⬜
 `install --from-staging`, the staging path and lock, the token-file join.
 
-### M18.5 — lifecycle helper and auto-stop ⬜
+### M18.5 — lifecycle helper and local-only switching ⬜
 Password-free stop and start for the app through a root-owned helper with a strict caller policy,
-and auto-stop on untrusted Wi-Fi as best-effort hygiene.
+and switching to local-only network access on untrusted Wi-Fi as best-effort hygiene.
 
 ### M18.6 — distribution ⬜
 The first signed and notarized release of both channels, the cask, and the closed-source note.

@@ -189,6 +189,7 @@ Almost all of it:
 | `FROM <linux image>` | Yes, for a Linux build. `k3sm build --platform linux/arm64` resolves the base on the engine. On the native darwin path the base must be `darwin/arm64`. |
 | `linux/arm64` images | Yes. `runtimeClassName: vm`, one line in the Pod spec. |
 | `kubectl logs` | Yes, with every option: `--tail`, `--since`, `--timestamps`, `--limit-bytes`, `-f`, `--previous`, and `-c` for a named container. Output is written and rotated the way a kubelet writes and rotates it. See [Container logs](logs.md). |
+| `kubectl top` | `kubectl top pod` works where k3sm's metrics-server add-on runs: a server installed with `--mesh-ip`, with a node that can run `vm` Pods. `kubectl top node` has no figures. See [Limitations](limitations.md#headline-divergences). |
 | `amd64` images | Not yet, on either path. An `amd64`-only image does not start; a multi-arch image with an `arm64` variant runs under `vm` by selecting that variant. |
 
 The apiserver defaults a `:latest` tag to `imagePullPolicy: Always`, so a `:latest` image you

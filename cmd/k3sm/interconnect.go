@@ -296,7 +296,7 @@ func interconnectClients(kubeconfig string) (kubernetes.Interface, dynamic.Inter
 			workDir:         workDirFromEnv(),
 			kubeconfigEnv:   os.Getenv("KUBECONFIG"),
 			home:            home,
-			contextName:     installedContextName,
+			contextName:     installedKubeconfigName(),
 			exists:          fileExists,
 		})
 		if err != nil {

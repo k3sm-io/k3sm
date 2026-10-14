@@ -37,6 +37,12 @@ kubectl config get-contexts    # the k3sm context is there
 kubectl get nodes
 ```
 
+The context is named `k3sm` by default. `sudo k3sm install --kubeconfig-name <name>` merges it under
+`<name>` instead (as the cluster, user and context name); the name is remembered, so `k3sm kubectl`,
+`k3sm kubeconfig` and `uninstall --purge` use it. A name that already belongs to an entry k3sm did
+not create is refused. `k3sm kubeconfig --write --target-name <name>` merges under a different name
+than the one it reads.
+
 To get the kubeconfig somewhere else, onto a second machine, into a CI secret, or into a file of its
 own, use **`k3sm kubeconfig`**, which prints the admin kubeconfig on stdout, or merges it into a file
 you name:
@@ -66,9 +72,11 @@ The bootstrap/join credentials for adding nodes are separate; see [Multi-node](m
 
 ## Things That Behave Differently Through kubectl
 
-- **`kubectl top`** needs an **operator-installed metrics-server**. k3sm does not ship one and has no
-  CPU accounting, so `top` and HPA-on-CPU do not work out of the box. See
-  [Limitations](limitations.md).
+- **`kubectl top pod`** works where k3sm's metrics-server add-on runs: on a server installed with
+  `--mesh-ip` once a node in the cluster can run `vm` Pods. A single-node server without `--mesh-ip`
+  does not run it. Native Pods report the CPU time and memory their processes used, `kubectl top node`
+  has no figures, and HPA on CPU is not servable because no CPU limit is enforced. See
+  [Limitations](limitations.md#headline-divergences).
 - **`kubectl exec` / `logs` / `port-forward`** target native processes via the node; behavior tracks the
   Virtual Kubelet surface.
 

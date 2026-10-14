@@ -18,6 +18,7 @@ package netserve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -105,6 +106,11 @@ type Config struct {
 	NodeAddress string
 	// PodCIDR is the node pod CIDR; empty uses defaultPodCIDR.
 	PodCIDR string
+	// NodePortAddresses is the address set every NodePort listener binds
+	// (proxy.WithNodePortAddresses), resolved once by the caller from the
+	// --nodeport-addresses spec (proxy.ResolveNodePortAddresses). Empty keeps
+	// the wildcard, the upstream default.
+	NodePortAddresses []netip.Addr
 	// MeshEgressIP, when set, is the node's reserved mesh-egress /32
 	// (podnet.MeshEgressIP) the Service proxy's backend dialer sources cross-node
 	// dials from, so a dial that egresses the wireguard utun carries a source
@@ -300,6 +306,11 @@ func New(cfg Config) *Server {
 	} else if vmnet.IsValid() {
 		log.Info("NetworkPolicy table scoped to the node's vm NAT segment (unknown sources inside it fail closed)", "vmnet_subnet", vmnet.String())
 	}
+	if len(cfg.NodePortAddresses) > 0 {
+		opts = append(opts, proxy.WithNodePortAddresses(cfg.NodePortAddresses...))
+		log.Info("NodePort listeners bind a configured address set instead of every interface", "nodeport_addresses", cfg.NodePortAddresses)
+	}
+
 	s.policy = proxy.NewPolicyTableVMNet(vmnet, seeds...)
 	opts = append(opts, proxy.WithPolicyTable(s.policy))
 
@@ -382,6 +393,18 @@ func vmnetPolicyPrefix(vmBackend bool, natSubnet string) netip.Prefix {
 // keyed on the published identity.
 func (s *Server) SetTransportOverrides(overrides map[netip.Addr]proxy.VMPodTransport) {
 	s.table.SetTransportOverrides(overrides)
+}
+
+// PrepareNodePortAddresses starts swapping the address set every NodePort
+// listener binds while the proxy runs (proxy.PrepareNodePortAddresses: bind
+// the new addresses beside the old, all or nothing; the returned swap's Commit
+// closes the addresses that left the set, Abort keeps the old set). Empty is
+// the wildcard. A disabled datapath has no NodePort and returns an error.
+func (s *Server) PrepareNodePortAddresses(addrs ...netip.Addr) (*proxy.NodePortSwap, error) {
+	if s.cfg.Disabled || s.proxy == nil {
+		return nil, errors.New("netserve: no Service proxy runs on this node (--network none)")
+	}
+	return s.proxy.PrepareNodePortAddresses(addrs...)
 }
 
 // Run runs the Service proxy and its watcher until ctx is cancelled. Both the

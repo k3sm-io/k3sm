@@ -22,11 +22,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/netip"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,15 +47,22 @@ import (
 // them. The Homebrew formula that invokes this and the notarize/signing pipeline
 // are the packaging follow-up.
 func runInstall(args []string) error {
-	opts, err := parseInstallFlags(args)
+	env := installEnv{
+		euid:        os.Geteuid(),
+		executable:  install.Executable,
+		stagingFS:   install.NewDarwinStagingFS(),
+		stagingRoot: install.DefaultStagingRoot,
+	}
+	opts, self, volume, err := env.prepare(args)
 	if err != nil {
 		return err
 	}
 
 	// Read-only introspection of the layout contract, deliberately BEFORE the
-	// root check: the release tooling asserts an extracted archive's member set
-	// against this output, and must be able to do so unprivileged. Paths are
-	// printed relative so the caller can join them onto any directory.
+	// root check (prepare returns before it): the release tooling asserts an
+	// extracted archive's member set against this output, and must be able to
+	// do so unprivileged. Paths are printed relative so the caller can join
+	// them onto any directory.
 	if opts.printRequired {
 		for _, p := range install.RequiredSiblings("") {
 			fmt.Println(p)
@@ -61,21 +70,6 @@ func runInstall(args []string) error {
 		return nil
 	}
 
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("k3sm install must run as root — use 'sudo k3sm install'")
-	}
-	if opts.targetUser == "" || opts.targetUser == "root" {
-		return fmt.Errorf("--user (or $SUDO_USER) must be a non-root human so the kubeconfig is not root-owned; run via 'sudo k3sm install'")
-	}
-	self, err := install.Executable()
-	if err != nil {
-		return err
-	}
-
-	volume, err := opts.dataVolumeOptions(version.Get().Version)
-	if err != nil {
-		return err
-	}
 	// Said once, at the one moment it can still be acted on. The volume is
 	// hardware-encrypted by the SEP either way; what --data-volume-encrypt adds
 	// is a passphrase, and on a FileVault Mac an operator reasonably assumes
@@ -86,7 +80,61 @@ func runInstall(args []string) error {
 
 	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 	ctx := context.Background()
-	return install.Install(ctx, install.NewDarwinSystem(), opts.installConfig(self, volume, logger))
+	sys := install.NewDarwinSystem()
+	cfg := opts.installConfig(self, volume, logger)
+	if opts.fromStaging != "" {
+		// The seams the --from-staging predicate and the signing continuity
+		// check read through, and the version the downgrade rule compares.
+		cfg.StagingFS = install.NewDarwinStagingFS()
+		cfg.Signer = install.CodesignTeamID{}
+		cfg.StagedVersion = version.Get().Version
+	}
+	// Only an install --start over a stopped node calls it: the uncordon.
+	cfg.MarkNode = nodeMarker(sys, install.DefaultDataRoot)
+	return install.Install(ctx, sys, cfg)
+}
+
+// installEnv is what runInstall reads from the process before it builds the
+// install's Config: the effective uid, the resolved executable, and the
+// staging seams a refused --from-staging run uses to discard its token file.
+// It is a struct so those refusals are testable without root.
+type installEnv struct {
+	euid        int
+	executable  func() (string, error)
+	stagingFS   install.StagingFS
+	stagingRoot string
+}
+
+// prepare parses the flags and makes every refusal that comes before the
+// install itself: a flag that fails validation, the root check, the --user
+// check, an unresolvable executable and the data-volume flags. Under
+// --from-staging with --token-file, each of those refusals also discards the
+// staged token file, unread (install.DiscardStagedToken), so a refused run
+// never leaves a token behind. --print-required-artifacts returns before the
+// root check.
+func (e installEnv) prepare(args []string) (opts installFlags, self string, volume *datavol.Options, err error) {
+	defer func() {
+		if err != nil && opts.fromStaging != "" && opts.tokenFile != "" {
+			install.DiscardStagedToken(e.stagingFS, e.stagingRoot, opts.tokenFile)
+		}
+	}()
+	opts, err = parseInstallFlags(args)
+	if err != nil || opts.printRequired {
+		return opts, "", nil, err
+	}
+	if e.euid != 0 {
+		return opts, "", nil, fmt.Errorf("k3sm install must run as root — use 'sudo k3sm install'")
+	}
+	if opts.targetUser == "" || opts.targetUser == "root" {
+		return opts, "", nil, fmt.Errorf("--user (or $SUDO_USER) must be a non-root human so the kubeconfig is not root-owned; run via 'sudo k3sm install'")
+	}
+	if self, err = e.executable(); err != nil {
+		return opts, "", nil, err
+	}
+	if volume, err = opts.dataVolumeOptions(version.Get().Version); err != nil {
+		return opts, "", nil, err
+	}
+	return opts, self, volume, nil
 }
 
 // installConfig is the install package's Config these flags describe. It is
@@ -106,10 +154,51 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 		DataVolume:        volume,
 		RemoveOldDataRoot: o.removeOldDataRoot,
 		MeshIP:            o.meshIP,
+		KubeconfigName:    o.recordedKubeconfigName(),
+		NodePortAddresses: o.recordedNodePortAddresses(),
+		LAN:               o.recordedLAN(),
 		SecretsEncryption: o.secretsEncryption,
 		EtcdSnapshots:     o.etcdSnapshotFlags(),
+		Start:             o.start,
 		Logger:            logger,
+		StagingOptions: install.StagingOptions{
+			FromStagingDir: o.fromStaging,
+			AllowDowngrade: o.allowDowngrade,
+			Executable:     self,
+		},
 	}
+}
+
+// recordedKubeconfigName is --kubeconfig-name when the operator passed it, and
+// "" otherwise so an unpassed flag keeps the carried name.
+func (o installFlags) recordedKubeconfigName() string {
+	if o.set["kubeconfig-name"] {
+		return o.kubeconfigName
+	}
+	return ""
+}
+
+// recordedNodePortAddresses is the install package's request for
+// --nodeport-addresses: the passed value (an empty one clears a carried
+// setting back to every interface), or nil when the flag was not passed so a
+// carried value is kept.
+func (o installFlags) recordedNodePortAddresses() *string {
+	if !o.set[nodePortAddressesFlag] {
+		return nil
+	}
+	v := o.nodePortAddresses
+	return &v
+}
+
+// recordedLAN is the install package's request for --lan: the passed value,
+// or nil when the flag was not passed (keep the recorded value, or decide by
+// whether k3sm ran here before).
+func (o installFlags) recordedLAN() *install.LAN {
+	if !o.set["lan"] {
+		return nil
+	}
+	v := o.lan
+	return &v
 }
 
 // etcdSnapshotFlags is the install package's request for the scheduled-snapshot
@@ -126,6 +215,10 @@ func (o installFlags) etcdSnapshotFlags() install.EtcdSnapshotFlags {
 	if o.set["etcd-disable-snapshots"] {
 		v := o.etcdDisableSnapshots
 		f.Disable = &v
+	}
+	if o.set["etcd-snapshot-compress"] {
+		v := o.etcdSnapshotCompress
+		f.Compress = &v
 	}
 	return f
 }
@@ -176,6 +269,10 @@ type installFlags struct {
 	dataVolumeEncrypt bool
 	removeOldDataRoot bool
 	meshIP            string
+	kubeconfigName    string
+	nodePortAddresses string
+	lan               install.LAN
+	lanRaw            string
 	secretsEncryption bool
 	// etcdSnapshotCron, etcdSnapshotRetention and etcdDisableSnapshots are the
 	// scheduled etcd snapshot flags, rendered into the server daemon's arguments
@@ -183,10 +280,20 @@ type installFlags struct {
 	etcdSnapshotCron      string
 	etcdSnapshotRetention int
 	etcdDisableSnapshots  bool
+	etcdSnapshotCompress  bool
+	// start is --start: start a node the user stopped (install.Config.Start).
+	start bool
+	// fromStaging is --from-staging: the k3sm.app staging directory this
+	// binary runs from (install.StagingOptions.FromStagingDir).
+	fromStaging string
+	// allowDowngrade is --allow-downgrade, with --from-staging only.
+	allowDowngrade bool
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
-// rather than exiting, so the caller (and a test) sees it.
+// rather than exiting, so the caller (and a test) sees it. A validation error
+// after a successful parse comes back with the parsed flags, so the caller can
+// still discard a staged token file (installEnv.prepare).
 func parseInstallFlags(args []string) (installFlags, error) {
 	var o installFlags
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
@@ -198,6 +305,9 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.StringVar(&o.server, "server", "", "with --agent: the control-plane host to join; with --server-join: an existing server's LAN address (the --node-ip it was installed with). Either way an UNDERLAY address (a LAN IP or DNS name, no scheme, no port), because the join dials <host>:9345 before this node has any mesh")
 	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: optional; the join assigns this Mac's mesh address, pass it only to assert the expected value (a value that differs from the assignment fails the join instead of minting a certificate for an address this node does not hold). With --cluster-init or --server-join: required; this Mac's LAN address, which the etcd peer listener binds and every other server dials (not loopback). The server daemon receives it as --etcd-peer-ip; the node itself advertises its --mesh-ip")
 	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token (a joined node needs none). With --server-join: required; a file holding the server token `k3sm token create --server` printed on an existing server. Read once by this install and copied for the daemon; it must not be group- or world-readable, and it is yours to delete afterwards")
+	fs.StringVar(&o.fromStaging, "from-staging", "", "install from a k3sm.app staging directory: the directory directly inside "+install.DefaultStagingRoot+" that this k3sm runs from. Every file is installed from that directory, which must be owned by root and writable by nobody else. A --token-file must sit directly inside it, owned by root with mode 600, and is removed once read. Refuses an older version than the installed one, and a build signed by a different team")
+	fs.BoolVar(&o.allowDowngrade, "allow-downgrade", false, "with --from-staging: install even when the installed k3sm is newer, or its version cannot be read")
+	fs.BoolVar(&o.start, "start", false, "on a node stopped with 'k3sm stop', start it after installing (without it the node is updated and stays stopped)")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")
 	fs.StringVar(&o.dataVolumeName, "data-volume-name", defaultDataVolumeName, "the APFS volume label to create or adopt")
@@ -205,27 +315,66 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.dataVolumeEncrypt, "data-volume-encrypt", false, "encrypt the data volume with a random passphrase kept in the System keychain (a volume k3sm creates only)")
 	fs.BoolVar(&o.removeOldDataRoot, "remove-old-data-root", false, "after a verified migration, delete the .pre-volume copy of the old data root instead of keeping it")
 	fs.StringVar(&o.meshIP, "mesh-ip", "", "this node's wireguard mesh address, written into the server daemon's arguments; needed on every Mac that serves the control plane in a multi-node cluster")
+	fs.StringVar(&o.kubeconfigName, "kubeconfig-name", install.DefaultKubeconfigName, "the cluster, user and context name the admin kubeconfig is merged under in your ~/.kube/config (the k3s --write-kubeconfig-name analog). It is recorded with the other install arguments, so k3sm kubectl, k3sm kubeconfig and uninstall --purge use it; a name already used by an entry k3sm did not create is refused")
+	fs.StringVar(&o.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage+". Written into the node daemon's arguments and kept across reinstalls; pass an empty value to go back to every interface")
+	fs.StringVar(&o.lanRaw, "lan", "", "LAN access for this node's NodePort, LoadBalancer and ingress listeners: off answers only on this Mac and the cluster mesh, on answers on every network this Mac is on. Not passed, a new install records off and an existing install keeps what it has (on, if it predates the setting). Change it later with 'sudo k3sm network lan on|off'. The apiserver, the worker join port and the mesh port do not follow it")
 	fs.BoolVar(&o.secretsEncryption, "secrets-encryption", false, "encrypt Secrets at rest with a key generated on this Mac; a new single-server cluster only (back up <data root>/server/cred with every datastore backup)")
 	fs.StringVar(&o.etcdSnapshotCron, "etcd-snapshot-schedule-cron", executor.DefaultEtcdSnapshotCron, "when the server takes a scheduled etcd snapshot, as a five-field cron expression in local time (embedded etcd HA servers only); written into the server daemon's arguments when passed")
 	fs.IntVar(&o.etcdSnapshotRetention, "etcd-snapshot-retention", executor.DefaultEtcdSnapshotRetention, "how many of this server's scheduled etcd snapshots to keep (embedded etcd HA servers only); written into the server daemon's arguments when passed")
 	fs.BoolVar(&o.etcdDisableSnapshots, "etcd-disable-snapshots", false, "take no scheduled etcd snapshots on this server (embedded etcd HA servers only); written into the server daemon's arguments when passed")
+	fs.BoolVar(&o.etcdSnapshotCompress, "etcd-snapshot-compress", false, "write this server's scheduled etcd snapshots as zip archives (embedded etcd HA servers only); written into the server daemon's arguments when passed")
 	if err := fs.Parse(args); err != nil {
 		return installFlags{}, err
 	}
 	if o.meshIP != "" {
 		if err := validateMeshIP(o.meshIP); err != nil {
-			return installFlags{}, err
+			return o, err
 		}
 	}
 	o.set = map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { o.set[f.Name] = true })
+	if o.set["kubeconfig-name"] {
+		if err := install.ValidateKubeconfigName(o.kubeconfigName); err != nil {
+			return o, fmt.Errorf("--kubeconfig-name: %w", err)
+		}
+	}
+	if o.set["lan"] {
+		lan, err := install.ParseLAN(o.lanRaw)
+		if err != nil {
+			return o, fmt.Errorf("--lan: %w", err)
+		}
+		o.lan = lan
+	}
+	o.nodePortAddresses = strings.TrimSpace(o.nodePortAddresses) // whitespace-only clears, like ""
+	if err := validateNodePortAddresses(o.nodePortAddresses); err != nil {
+		return o, err
+	}
 	if err := o.validateRole(); err != nil {
-		return installFlags{}, err
+		return o, err
+	}
+	if err := o.validateFromStaging(); err != nil {
+		return o, err
 	}
 	if err := o.validateEtcdSnapshotFlags(); err != nil {
-		return installFlags{}, err
+		return o, err
 	}
 	return o, nil
+}
+
+// validateFromStaging is the flag-level half of --from-staging: an absolute,
+// clean directory, and --allow-downgrade only beside it. The install package
+// judges the directory itself on disk, before anything is written.
+func (o installFlags) validateFromStaging() error {
+	if o.fromStaging == "" {
+		if o.allowDowngrade {
+			return fmt.Errorf("--allow-downgrade needs --from-staging: it relaxes the version check of an install from a k3sm.app staging directory, and a plain install makes none")
+		}
+		return nil
+	}
+	if !filepath.IsAbs(o.fromStaging) || filepath.Clean(o.fromStaging) != o.fromStaging {
+		return fmt.Errorf("--from-staging %q must be a clean absolute path", o.fromStaging)
+	}
+	return nil
 }
 
 // validateMeshIP refuses a --mesh-ip this install can never serve from: an
@@ -272,6 +421,7 @@ var serverOnlyInstallFlags = []string{
 	"server-join",
 	"service-cidr",
 	"mesh-ip",
+	"kubeconfig-name",
 	"data-volume",
 	"data-volume-name",
 	"data-volume-size",
@@ -281,6 +431,7 @@ var serverOnlyInstallFlags = []string{
 	"etcd-snapshot-schedule-cron",
 	"etcd-snapshot-retention",
 	"etcd-disable-snapshots",
+	"etcd-snapshot-compress",
 }
 
 // role is the install role these flags select.
@@ -412,6 +563,7 @@ func runUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
 	purgeFlag := fs.Bool("purge", false, "also remove everything a plain uninstall keeps: the cluster data (and the data volume with its keychain item), the daemon logs, the _k3sm user, the k3sm context in your kubeconfig, the /etc/fstab line and the recorded arguments. Irreversible; requires --yes")
 	yes := fs.Bool("yes", false, "confirm --purge")
+	purgeUser := fs.String("user", "", "with --purge, the human whose ~/.kube/config holds the k3sm context, for a caller with no sudo environment (looked up by name; root and service accounts are refused). Default: $SUDO_USER")
 	_ = fs.Parse(args)
 	if err := checkPurgeFlags(*purgeFlag, *yes); err != nil {
 		return err
@@ -421,6 +573,13 @@ func runUninstall(args []string) error {
 		return fmt.Errorf("k3sm uninstall must run as root — use 'sudo k3sm uninstall'")
 	}
 	cfg := uninstallConfig(os.Stdout, os.Stderr)
+	// Who is running: the k3sm.app root step runs a staged copy of this
+	// binary while its copy-out holds the staging lock, and the uninstall
+	// tells that case from a copy-out it would race by this path.
+	if self, err := install.Executable(); err == nil {
+		cfg.Executable = self
+	}
+	cfg.StagingFS = install.NewDarwinStagingFS()
 	logger := cfg.Logger
 	sys := install.NewDarwinSystem()
 	deregister, why := agentDeregister(sys, install.DefaultDataRoot, time.Now())
@@ -433,7 +592,7 @@ func runUninstall(args []string) error {
 	// whether the installed plist is one; see uninstalletcd.go).
 	cfg.DeregisterServer = serverMemberDeregister(filepath.Join(install.DefaultDataRoot, "server"), dialLocalEtcdAdmin, logger)
 	if *purgeFlag {
-		human, home, err := purgeTarget(os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
+		human, home, err := resolvePurgeTarget(*purgeUser, os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
 		if err != nil {
 			return err
 		}
@@ -476,6 +635,60 @@ func checkPurgeFlags(purge, yes bool) error {
 	return nil
 }
 
+// lookupUser resolves an account by name; tests replace it.
+var lookupUser = user.Lookup
+
+// minHumanUID is the first uid macOS gives a human account; below it are
+// root and the system and service accounts.
+const minHumanUID = 501
+
+// resolvePurgeTarget picks the purge's human: an explicit --user wins over
+// the sudo environment, which is consulted only when --user is empty.
+func resolvePurgeTarget(userFlag, sudoUser, sudoUID string) (name, home string, err error) {
+	if userFlag != "" {
+		return explicitPurgeTarget(userFlag)
+	}
+	return purgeTarget(sudoUser, sudoUID)
+}
+
+// explicitPurgeTarget resolves --user. The uid and home come only from the
+// account lookup, never from SUDO_UID. It refuses root, a uid below 501, a
+// service account (a leading underscore, nobody, daemon; nobody's uid is
+// above any human range, so it is named), and a home that is "/" or a prefix of the data root,
+// which the purge could not protect. The returned home is symlink-resolved.
+func explicitPurgeTarget(name string) (string, string, error) {
+	if name == "" || name == "root" || name == "nobody" || name == "daemon" || strings.HasPrefix(name, "_") {
+		return "", "", fmt.Errorf("--user %q is not a human account; name the account whose kubeconfig holds the k3sm context", name)
+	}
+	u, err := lookupUser(name)
+	if err != nil {
+		return "", "", fmt.Errorf("look up --user %s: %w", name, err)
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return "", "", fmt.Errorf("--user %s has uid %q, which is not a 32-bit number: %w", name, u.Uid, err)
+	}
+	if uid < minHumanUID || uid > math.MaxInt32 {
+		return "", "", fmt.Errorf("--user %s has uid %s, below %d: refusing a system or service account", name, u.Uid, minHumanUID)
+	}
+	if u.HomeDir == "" {
+		return "", "", fmt.Errorf("--user %s has no home directory", name)
+	}
+	home, err := filepath.EvalSymlinks(u.HomeDir)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve the home of --user %s: %w", name, err)
+	}
+	home = filepath.Clean(home)
+	dataRoot := filepath.Clean(install.DefaultDataRoot)
+	if resolved, err := filepath.EvalSymlinks(dataRoot); err == nil {
+		dataRoot = resolved
+	}
+	if home == "/" || dataRoot == home || strings.HasPrefix(dataRoot, home+"/") {
+		return "", "", fmt.Errorf("--user %s has home %s, which contains the cluster data; refusing", name, home)
+	}
+	return u.Username, home, nil
+}
+
 // purgeTarget is the human a purge cleans the kubeconfig of, and that
 // human's home, which the purge never deletes into. It must be a real,
 // non-root account: run through sudo from it.
@@ -492,7 +705,7 @@ func purgeTarget(sudoUser, sudoUID string) (name, home string, err error) {
 	if sudoUID == "" {
 		return "", "", fmt.Errorf("SUDO_USER is set but SUDO_UID is not; run 'sudo k3sm uninstall --purge --yes' through sudo")
 	}
-	u, err := user.Lookup(sudoUser)
+	u, err := lookupUser(sudoUser)
 	if err != nil {
 		return "", "", fmt.Errorf("look up %s: %w", sudoUser, err)
 	}

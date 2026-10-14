@@ -18,11 +18,15 @@ package registrysvc
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"k3sm.io/k3sm/internal/atomicfile"
@@ -122,21 +126,44 @@ func writeZotMarker(bd, version string) error {
 // pkg/executor.PayloadBinaries already established.
 func PayloadBinaries() []string { return []string{ZotBinaryName} }
 
+// PayloadVerifier is the release signing path as zot staging consumes it: the
+// daemon's one signing decision, resolved by the caller (pkg/executor's
+// ReleaseVerifier), never probed here. VerifyPayloadBinary returns nil when path
+// is a regular file carrying the release signature, and an error otherwise; it
+// never signs or changes the file.
+type PayloadVerifier interface {
+	VerifyPayloadBinary(ctx context.Context, path string) error
+}
+
 // EnsureZot builds the pinned zot into bd, ad-hoc signs it, and records the
 // version marker. It is a no-op only when the marker already vouches for the
-// wanted version+variant — never on mere presence.
+// wanted version+variant — never on mere presence. It is the dev path:
+// EnsureZotWith with no release verifier.
 //
 // payloadDir, when non-empty, is a packaged install's staged payload: a marked
 // binary there is COPIED rather than built, because a launchd daemon has no Go
 // toolchain and building is not an option it has. An unmarked or absent payload
 // falls through to the build, which reports its own actionable error.
 func EnsureZot(ctx context.Context, bd, payloadDir, version string) error {
+	return EnsureZotWith(ctx, nil, bd, payloadDir, version)
+}
+
+// EnsureZotWith is EnsureZot under the caller's signing decision. A nil release
+// is the dev path, exactly EnsureZot. A non-nil release is the release path (a
+// Developer ID-signed k3sm): zot is the payload's copy and nothing else, verified
+// with release and used byte-identical. It is never built and never signed, and a
+// copy that fails verification refuses with release's error, with no fall-through
+// to the dev path.
+func EnsureZotWith(ctx context.Context, release PayloadVerifier, bd, payloadDir, version string) error {
 	if version == "" {
 		version = DefaultZotVersion
 	}
 	// Remove the temps a killed install left; nothing is staging zot yet.
 	if err := atomicfile.ReapOrphans(bd, ZotBinaryName); err != nil {
 		return fmt.Errorf("reap zot staging temps: %w", err)
+	}
+	if release != nil {
+		return ensureShippedZot(ctx, release, bd, payloadDir, version)
 	}
 	if zotStaged(bd, version) {
 		return ensureZotSigned(ctx, bd)
@@ -178,6 +205,102 @@ func seedZot(ctx context.Context, bd, payloadDir, version string) bool {
 		return false
 	}
 	return binsign.Install(ctx, binsign.Codesign{}, ZotPath(payloadDir), ZotPath(bd), 0o755) == nil
+}
+
+// ensureShippedZot is the release path. The source is the payload's zot (the work
+// dir's own copy when no payload is staged), and it must pass release before
+// anything else happens. A work-dir copy with identical bytes in a trusted
+// directory is verified in place and left on its inode; anything else there is
+// replaced on a new inode through atomicfile, the temp verified again before it
+// takes the name. The version marker is written for the verified bytes, and zot is
+// recorded as healed so a later dev heal at that marker never rewrites it.
+func ensureShippedZot(ctx context.Context, release PayloadVerifier, bd, payloadDir, version string) error {
+	dst := ZotPath(bd)
+	src := dst
+	if payloadDir != "" {
+		src = ZotPath(payloadDir)
+	}
+	if err := release.VerifyPayloadBinary(ctx, src); err != nil {
+		return fmt.Errorf("stage zot: %w", err)
+	}
+	same := src == dst
+	if !same {
+		var err error
+		if same, err = sameBytes(src, dst); err != nil {
+			return fmt.Errorf("stage zot: compare %s with %s: %w", src, dst, err)
+		}
+	}
+	if same {
+		// Trusting a copy already in bd needs the trust atomicfile's install checks
+		// give the copies it makes: nobody else may write there.
+		if err := atomicfile.CheckTrustedDir(bd); err != nil {
+			return fmt.Errorf("stage zot: verify %s in place: %w", dst, err)
+		}
+		if src != dst {
+			if err := release.VerifyPayloadBinary(ctx, dst); err != nil {
+				return fmt.Errorf("stage zot: %w", err)
+			}
+		}
+	} else {
+		if err := os.MkdirAll(bd, 0o755); err != nil {
+			return fmt.Errorf("create bin dir %s: %w", bd, err)
+		}
+		if err := os.Remove(zotMarkerPath(bd)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("clear zot version marker: %w", err)
+		}
+		if err := atomicfile.InstallFile(src, dst, 0o755, func(tmp string) error {
+			return release.VerifyPayloadBinary(ctx, tmp)
+		}); err != nil {
+			return fmt.Errorf("stage zot: install the shipped %s: %w", ZotBinaryName, err)
+		}
+	}
+	if !zotStaged(bd, version) {
+		if err := writeZotMarker(bd, version); err != nil {
+			return err
+		}
+	}
+	return binsign.RecordHealed(bd, strings.TrimSpace(zotMarkerContent(version)), ZotBinaryName)
+}
+
+// sameBytes reports whether the regular file b holds exactly a's bytes. An absent
+// or non-regular b (a symlink above all) is never the same: it is replaced, never
+// followed and never verified in place.
+func sameBytes(a, b string) (bool, error) {
+	li, err := os.Lstat(b)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !li.Mode().IsRegular() {
+		return false, nil
+	}
+	ha, err := fileSHA256(a)
+	if err != nil {
+		return false, err
+	}
+	hb, err := fileSHA256(b)
+	if err != nil {
+		return false, err
+	}
+	return ha == hb, nil
+}
+
+// fileSHA256 returns the sha256 of the file at path.
+func fileSHA256(path string) ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return sum, err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return sum, err
+	}
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
 }
 
 // zotModuleCacheDir resolves the stable module cache the build downloads into,
@@ -243,10 +366,37 @@ func buildZot(ctx context.Context, bd, version string) error {
 // merely unset in our own env) so an ambient GOBIN cannot re-trigger the
 // cross-compile refusal buildZot documents. GOMODCACHE is pinned away from the
 // scratch GOPATH so the pin's modules are fetched once per machine.
+//
+// The Go variables that weaken module verification or redirect the fetch are
+// DROPPED from the ambient environment and the safe values set explicitly, last,
+// so they win: the checksum database stays on, the proxy is the public one, and
+// GOTOOLCHAIN=local keeps a host Go older than zot's go directive from silently
+// fetching a toolchain (see ErrZotGoTooOld).
 func zotBuildEnv(gopath, modCache string) []string {
-	return append(os.Environ(),
-		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache)
+	env := make([]string, 0, len(os.Environ())+10)
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.Contains(zotDroppedEnv, name) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache,
+		"GOSUMDB=sum.golang.org", "GOPROXY=https://proxy.golang.org,direct", "GOTOOLCHAIN=local")
 }
+
+// zotDroppedEnv lists the ambient variables that weaken verification, redirect
+// module fetches or change the toolchain, removed before the pinned values are set.
+var zotDroppedEnv = []string{
+	"GOSUMDB", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOINSECURE", "GOFLAGS",
+	"GOPROXY", "GONOPROXY", "GOVCS", "GOTOOLCHAIN",
+}
+
+// ErrZotGoTooOld marks a zot build refused because the host Go is older than
+// the pinned zot's go directive. The install runs with GOTOOLCHAIN=local, so the
+// toolchain is never fetched; the operator upgrades Go or installs the packaged payload.
+var ErrZotGoTooOld = errors.New("the host Go toolchain is older than the pinned zot requires (GOTOOLCHAIN=local forbids fetching one)")
 
 // hostGoModCache returns the HOST TOOLCHAIN's own module cache (`go env
 // GOMODCACHE`, which already honours an ambient GOMODCACHE or GOPATH).
@@ -284,7 +434,18 @@ func hostGoModCache(ctx context.Context) (string, error) {
 func goInstallZot(ctx context.Context, version, gopath, modCache string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "go", "install", zotModulePath+"@"+version)
 	cmd.Env = zotBuildEnv(gopath, modCache)
-	return cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
+	if err != nil && zotGoTooOld(out) {
+		err = fmt.Errorf("%w: %w", ErrZotGoTooOld, err)
+	}
+	return out, err
+}
+
+// zotGoTooOld reports whether a `go install` diagnostic is the local-toolchain
+// refusal ("requires go >= X (running go Y; GOTOOLCHAIN=local)").
+func zotGoTooOld(out []byte) bool {
+	s := string(out)
+	return strings.Contains(s, "GOTOOLCHAIN=local") && strings.Contains(s, "requires go")
 }
 
 // ensureZotSigned makes sure the staged zot at path carries a valid ad-hoc

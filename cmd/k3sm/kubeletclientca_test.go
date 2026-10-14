@@ -24,13 +24,14 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // TestWorkerKubeletClientCAThreads proves the B176 anchor survives the one hop
 // that is easy to drop: `k3sm agent` receives the cluster's client-identity CA in
 // its join response and must hand it to the in-process node, because a joined
-// worker binds :10250 on the WILDCARD and is therefore the most exposed instance
-// of this endpoint in the whole product.
+// worker serves :10250 on its mesh address, reachable from every peer, and is
+// therefore the most exposed instance of this endpoint in the whole product.
 //
 // serveTLS is asserted alongside it: the two travel together by construction —
 // serving TLS is exactly the condition under which the provider routes
@@ -57,8 +58,8 @@ func TestWorkerKubeletClientCAThreads(t *testing.T) {
 	if !bytes.Equal(nodeOpts.kubeletClientCAPEM, ca.CertPEM) {
 		t.Error("the join response's client-identity CA did not reach the worker's in-process node; its :10250 would have no anchor to authenticate the apiserver against")
 	}
-	if !wildcardListen(nodeOpts.listen) {
-		t.Errorf("worker kubelet listen = %q — expected the wildcard bind this anchor exists to protect", nodeOpts.listen)
+	if nodeOpts.kubeletPort != ports.KubeletAPIPort || nodeOpts.listen != "" {
+		t.Errorf("worker kubelet port = %d, listen = %q — expected the derived bind on the kubelet API port this anchor exists to protect", nodeOpts.kubeletPort, nodeOpts.listen)
 	}
 }
 

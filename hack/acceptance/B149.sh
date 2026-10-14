@@ -72,7 +72,7 @@ cat >"$BIN/tart" <<'FAKE'
 printf 'tart %s\n' "$*" >>"${B149_LOG:?}"
 case "${1:-}" in
 list)  printf 'Source Name Disk Size State\n'
-       printf 'oci %s 50 20 stopped\n' 'ghcr.io/cirruslabs/macos-sequoia-base:latest'
+       printf 'oci %s 50 20 stopped\n' 'ghcr.io/cirruslabs/macos-sequoia-base@sha256:eee659985b01e4df2a6c0754bd8d25e54969933c43fdcd4edef8bea337b3d354'
        cat "${B149_CLONES:?}" 2>/dev/null || true ;;
 ip)    printf '192.0.2.10\n' ;;
 clone) printf 'oci %s 50 20 stopped\n' "${2:-}" >>"${B149_CLONES:?}" ;;

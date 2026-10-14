@@ -725,7 +725,7 @@ func TestEtcdChildBootsWithTLSAndServesKV(t *testing.T) {
 	// An online snapshot through the production path, verified, and openable as bbolt
 	// with the KV write in its key bucket.
 	dst := filepath.Join(t.TempDir(), "etcd.snapshot")
-	if err := SnapshotEtcd(t.Context(), a.wd, dst); err != nil {
+	if err := SnapshotEtcd(t.Context(), a.wd, dst, false); err != nil {
 		t.Fatalf("SnapshotEtcd: %v", err)
 	}
 	db, err := bolt.Open(dst, 0o400, &bolt.Options{ReadOnly: true, Timeout: time.Second})
@@ -1023,7 +1023,7 @@ func TestEtcdSnapshotRestoreSingleMember(t *testing.T) {
 	cli := itClient(t, a.wd, a.clientURL(), b.clientURL(), c.clientURL())
 	putEventually(t, cli, "/k3sm-it/K1", "before-snapshot")
 	snap := filepath.Join(t.TempDir(), "k3sm-etcd-snapshot.db")
-	if err := SnapshotEtcd(t.Context(), a.wd, snap); err != nil {
+	if err := SnapshotEtcd(t.Context(), a.wd, snap, false); err != nil {
 		t.Fatalf("SnapshotEtcd: %v", err)
 	}
 	putEventually(t, cli, "/k3sm-it/K2", "after-snapshot")
