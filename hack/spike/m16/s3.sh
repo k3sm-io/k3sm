@@ -262,7 +262,10 @@ async def main():
                 % STREAM_BUDGET)
         await stop(core)
         return 0
-    # the count is checked, not claimed: one token per event, and a length finish means all 64
+    # the count is checked, not claimed: one token per event, and a length finish means all 64.
+    # This assumes the engine emits one token per stream event. An engine that batches
+    # several tokens into one event makes tokens != events and reads as a FAIL here, never
+    # as a false PASS; adjust the check if a later engine version does that.
     if tokens != events or (finish == "length" and tokens != 64):
         verdict("FAIL", "s3.1 in-process", "the stream's token count does not add up: %d events, %d output tokens, finish=%s (64 asked for)"
                 % (events, tokens, finish))
