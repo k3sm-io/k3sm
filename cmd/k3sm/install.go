@@ -22,11 +22,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/netip"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -561,6 +563,7 @@ func runUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
 	purgeFlag := fs.Bool("purge", false, "also remove everything a plain uninstall keeps: the cluster data (and the data volume with its keychain item), the daemon logs, the _k3sm user, the k3sm context in your kubeconfig, the /etc/fstab line and the recorded arguments. Irreversible; requires --yes")
 	yes := fs.Bool("yes", false, "confirm --purge")
+	purgeUser := fs.String("user", "", "with --purge, the human whose ~/.kube/config holds the k3sm context, for a caller with no sudo environment (looked up by name; root and service accounts are refused). Default: $SUDO_USER")
 	_ = fs.Parse(args)
 	if err := checkPurgeFlags(*purgeFlag, *yes); err != nil {
 		return err
@@ -589,7 +592,7 @@ func runUninstall(args []string) error {
 	// whether the installed plist is one; see uninstalletcd.go).
 	cfg.DeregisterServer = serverMemberDeregister(filepath.Join(install.DefaultDataRoot, "server"), dialLocalEtcdAdmin, logger)
 	if *purgeFlag {
-		human, home, err := purgeTarget(os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
+		human, home, err := resolvePurgeTarget(*purgeUser, os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
 		if err != nil {
 			return err
 		}
@@ -632,6 +635,60 @@ func checkPurgeFlags(purge, yes bool) error {
 	return nil
 }
 
+// lookupUser resolves an account by name; tests replace it.
+var lookupUser = user.Lookup
+
+// minHumanUID is the first uid macOS gives a human account; below it are
+// root and the system and service accounts.
+const minHumanUID = 501
+
+// resolvePurgeTarget picks the purge's human: an explicit --user wins over
+// the sudo environment, which is consulted only when --user is empty.
+func resolvePurgeTarget(userFlag, sudoUser, sudoUID string) (name, home string, err error) {
+	if userFlag != "" {
+		return explicitPurgeTarget(userFlag)
+	}
+	return purgeTarget(sudoUser, sudoUID)
+}
+
+// explicitPurgeTarget resolves --user. The uid and home come only from the
+// account lookup, never from SUDO_UID. It refuses root, a uid below 501, a
+// service account (a leading underscore, nobody, daemon; nobody's uid is
+// above any human range, so it is named), and a home that is "/" or a prefix of the data root,
+// which the purge could not protect. The returned home is symlink-resolved.
+func explicitPurgeTarget(name string) (string, string, error) {
+	if name == "" || name == "root" || name == "nobody" || name == "daemon" || strings.HasPrefix(name, "_") {
+		return "", "", fmt.Errorf("--user %q is not a human account; name the account whose kubeconfig holds the k3sm context", name)
+	}
+	u, err := lookupUser(name)
+	if err != nil {
+		return "", "", fmt.Errorf("look up --user %s: %w", name, err)
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return "", "", fmt.Errorf("--user %s has uid %q, which is not a 32-bit number: %w", name, u.Uid, err)
+	}
+	if uid < minHumanUID || uid > math.MaxInt32 {
+		return "", "", fmt.Errorf("--user %s has uid %s, below %d: refusing a system or service account", name, u.Uid, minHumanUID)
+	}
+	if u.HomeDir == "" {
+		return "", "", fmt.Errorf("--user %s has no home directory", name)
+	}
+	home, err := filepath.EvalSymlinks(u.HomeDir)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve the home of --user %s: %w", name, err)
+	}
+	home = filepath.Clean(home)
+	dataRoot := filepath.Clean(install.DefaultDataRoot)
+	if resolved, err := filepath.EvalSymlinks(dataRoot); err == nil {
+		dataRoot = resolved
+	}
+	if home == "/" || dataRoot == home || strings.HasPrefix(dataRoot, home+"/") {
+		return "", "", fmt.Errorf("--user %s has home %s, which contains the cluster data; refusing", name, home)
+	}
+	return u.Username, home, nil
+}
+
 // purgeTarget is the human a purge cleans the kubeconfig of, and that
 // human's home, which the purge never deletes into. It must be a real,
 // non-root account: run through sudo from it.
@@ -648,7 +705,7 @@ func purgeTarget(sudoUser, sudoUID string) (name, home string, err error) {
 	if sudoUID == "" {
 		return "", "", fmt.Errorf("SUDO_USER is set but SUDO_UID is not; run 'sudo k3sm uninstall --purge --yes' through sudo")
 	}
-	u, err := user.Lookup(sudoUser)
+	u, err := lookupUser(sudoUser)
 	if err != nil {
 		return "", "", fmt.Errorf("look up %s: %w", sudoUser, err)
 	}

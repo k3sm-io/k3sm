@@ -88,6 +88,8 @@ type fakePurge struct {
 	nonEmpty map[string]bool
 	// kubeNameRemoved is the context name the last RemoveAdminKubeconfigContext got.
 	kubeNameRemoved string
+	// kubeHome is the home the last RemoveAdminKubeconfigContext got.
+	kubeHome string
 	// kubeErr is what RemoveAdminKubeconfigContext returns; kubeAbsent makes
 	// it report that the kubeconfig carried no k3sm context.
 	kubeErr    error
@@ -291,8 +293,9 @@ func (f *fakeSystem) DisableServiceUser(_ context.Context, name string) error {
 	return nil
 }
 
-func (f *fakeSystem) RemoveAdminKubeconfigContext(targetUser, name string) (bool, error) {
+func (f *fakeSystem) RemoveAdminKubeconfigContext(targetUser, homeDir, name string) (bool, error) {
 	f.calls = append(f.calls, "RemoveAdminKubeconfigContext:"+targetUser)
+	f.purge.kubeHome = homeDir
 	f.purge.kubeNameRemoved = name
 	if f.purge.kubeErr != nil {
 		return false, f.purge.kubeErr

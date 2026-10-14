@@ -1161,8 +1161,10 @@ type System interface {
 	// RemoveAdminKubeconfigContext removes the context keyed name (and the cluster
 	// and user it alone references) from targetUser's ~/.kube/config, keeping
 	// every other entry, the file's owner and its mode. An absent file or
-	// context is a no-op success, reported as removed=false.
-	RemoveAdminKubeconfigContext(targetUser, name string) (removed bool, err error)
+	// context is a no-op success, reported as removed=false. homeDir is the
+	// validated, resolved home the purge guard protected; the edit lands under
+	// it. Only an empty homeDir falls back to looking targetUser up.
+	RemoveAdminKubeconfigContext(targetUser, homeDir, name string) (removed bool, err error)
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.

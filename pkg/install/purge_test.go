@@ -871,3 +871,21 @@ func TestPurgeRemovesBothArgsRecordsWithoutTheManifest(t *testing.T) {
 		}
 	}
 }
+
+// TestPurgeKubeconfigEditUsesTargetHome proves the kubeconfig edit is handed
+// the validated cfg.TargetHome, not a home looked up again by name.
+func TestPurgeKubeconfigEditUsesTargetHome(t *testing.T) {
+	r := newPurgeRig(t, RoleServer, false)
+	if r.cfg.TargetHome == "" {
+		t.Fatal("the rig carries no TargetHome; the test would be vacuous")
+	}
+	if err := r.run(); err != nil {
+		t.Fatalf("purge = %v\ncalls:\n%s", err, strings.Join(r.f.calls, "\n"))
+	}
+	if !r.called("RemoveAdminKubeconfigContext:alice") {
+		t.Fatal("the kubeconfig edit never ran")
+	}
+	if r.f.purge.kubeHome != r.cfg.TargetHome {
+		t.Fatalf("kubeconfig edit home = %q, want cfg.TargetHome %q", r.f.purge.kubeHome, r.cfg.TargetHome)
+	}
+}

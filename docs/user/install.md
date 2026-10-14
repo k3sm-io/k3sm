@@ -394,6 +394,8 @@ It cannot be undone. Without `--yes` the command changes nothing and lists what 
 k3s's `k3s-uninstall.sh` removes everything with no prompt; k3sm asks for `--yes` on purpose,
 because this deletes a user account and the cluster's datastore.
 
+The purge learns whose `~/.kube/config` to clean from `sudo`. When there is no `sudo` environment, name the account with `--user <name>`; it wins over `sudo`'s own record, and root, system and service accounts are refused.
+
 Run it before `brew uninstall k3sm`: the `k3sm` binary is what performs the purge.
 
 Before deleting anything it checks that the data directories are the ones install created, and it
