@@ -111,6 +111,7 @@
     "sudo launchctl kickstart -k system/io.k3sm.netd",
     "sudo launchctl kickstart -k system/io.k3sm.server"
   ],
+  "workers": [],
   "version": {
     "version": "v0.1.7",
     "commit": "0123456789abcdef0123456789abcdef01234567",

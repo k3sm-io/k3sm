@@ -171,13 +171,23 @@ func newStatusCollector() status.Collector {
 		StopMarker:     statusStopMarker,
 		Network:        statusNetwork,
 		NetworkApplied: statusNetworkApplied,
-		Paths:          paths,
-		EUID:           euid,
-		ServiceUID:     serviceUID,
-		Version:        version.Get(),
-		Host:           macOSVersionOrEmpty(),
-		Hostname:       hostnameOrEmpty(),
+		// The join target of a worker, through the installer's one reader of
+		// the agent plist's --server (the agent arguments record does not carry
+		// it, and the plist is world-readable, so this works without sudo).
+		AgentJoinServer: statusAgentJoinServer,
+		Paths:           paths,
+		EUID:            euid,
+		ServiceUID:      serviceUID,
+		Version:         version.Get(),
+		Host:            macOSVersionOrEmpty(),
+		Hostname:        hostnameOrEmpty(),
 	}
+}
+
+// statusAgentJoinServer returns the --server value of the installed agent
+// plist, and nothing else from its argv.
+func statusAgentJoinServer() (string, error) {
+	return install.AgentJoinServer(install.NewDarwinSystem(), install.Config{})
 }
 
 // statusStopMarker reads the stop marker through the installer's own reader.

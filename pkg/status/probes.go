@@ -290,12 +290,18 @@ type Collector struct {
 	// (install.NetworkAppliedPath). OPTIONAL: nil leaves network.applied out;
 	// a permission error says the applied state is known to root only.
 	NetworkApplied func(role install.Role) ([]byte, error)
-	Paths          Paths
-	EUID           int
-	ServiceUID     int
-	Now            func() time.Time
-	Version        version.Info
-	Host           string
+	// AgentJoinServer returns the control-plane host the installed agent
+	// joins: ONLY the --server value of the agent LaunchDaemon's argv
+	// (install.AgentJoinServer in production). OPTIONAL: nil, or an error,
+	// leaves the report's joinTarget field out. It is consulted on an agent
+	// only.
+	AgentJoinServer func() (string, error)
+	Paths           Paths
+	EUID            int
+	ServiceUID      int
+	Now             func() time.Time
+	Version         version.Info
+	Host            string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

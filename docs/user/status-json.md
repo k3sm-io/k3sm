@@ -148,6 +148,8 @@ four.
 | `interconnect` | object | the cluster's interconnect and its attached Pods (see [Interconnect](#interconnect)); omitted when the cluster has none, or the report could not read it |
 | `stoppedBy` | object | who stopped k3sm on this Mac (see [Stopped by](#stopped-by)); omitted when no stop is recorded |
 | `network` | object | this node's LAN access setting (see [Network](#network)); omitted when k3sm is not installed or the setting cannot be read |
+| `workers` | array | on a server, the cluster's other nodes and their versions (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
+| `joinTarget` | string | on a worker, the server endpoint it joined (see [Workers and join target](#workers-and-join-target)); omitted when unknown |
 | `version` | object | the build that produced the report; `modules` is omitted when unknown |
 | `host` | string | the macOS version, empty when it could not be read |
 | `timestamp` | string | RFC 3339 |
@@ -229,6 +231,53 @@ When `applied.lan` differs from `lan`, or `applied.error` is set, the node is no
 setting; the human view says so on its own line, and also says when the applied state is readable by
 root only. `sudo k3sm network lan on|off` checks the daemon's listening sockets itself before it
 reports success. Readers must treat a missing `network` as "unknown", not as either value.
+
+## Workers and join target
+
+Two optional fields describe the cluster around this Mac. Both are additive: `schemaVersion` stays
+`1`, and neither adds a `verdict` or row `state` word. The daemons probe carries neither.
+
+On a server, `workers` lists every other node in the cluster, sorted by name, from the same node list
+the `node` row reads:
+
+```json
+"workers": [
+  { "name": "node-a", "role": "server", "version": "v1.36.2+k3sm.0.1.7" },
+  { "name": "node-b", "role": "agent", "version": "v1.36.2+k3sm.0.1.6" }
+]
+```
+
+| field | type | notes |
+|---|---|---|
+| `name` | string | the node's name |
+| `role` | string | `server` when the node carries the `node-role.kubernetes.io/control-plane` label, `agent` otherwise |
+| `version` | string | the kubelet version the node reports: the Kubernetes version, then `+k3sm.` and the k3sm release as semver build metadata; omitted while the node has reported none |
+
+A node cannot set the `node-role.kubernetes.io/control-plane` label on itself; only a cluster admin
+can. k3sm does not set it, so in a cluster with more than one server the other servers report `agent`
+unless an admin has labelled them.
+
+`version` is the node's own report of its kubelet version. It is advisory, not an attestation: the
+node writes it, and nothing verifies it against the binary the node runs. A missing `version` means
+unknown, and a reader comparing versions must treat it as not satisfying any minimum.
+
+An empty list means the server read its nodes, found its own node by name, and there are no others.
+A missing `workers` means the answer is unknown: this Mac is a worker, the apiserver did not answer,
+the node list could not be read, or no node in the list carries this server's name (even when the
+list holds a single node). Readers must not treat a missing `workers` as "no workers".
+
+On a worker, `joinTarget` is the bootstrap endpoint of the server this Mac was installed to join, as
+`host:port`:
+
+```json
+"joinTarget": "192.0.2.10:9345"
+```
+
+It is the `--server` host of the installed worker daemon with the join port, and nothing else from
+that daemon's arguments. The host is reported only when it is an IPv4 address or a DNS name made of
+letters, digits, `-` and `.`, at most 253 characters long. `joinTarget` is omitted on a server, on a
+worker whose daemon configuration cannot be read, and when the `--server` value is anything else:
+an IPv6 address, a value that already carries a port, or one with any other character.
 
 ## Interconnect
 
