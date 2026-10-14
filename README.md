@@ -76,6 +76,9 @@ sudo ./k3sm install
 ./k3sm kubectl get nodes
 ```
 
+To install from the k3sm app instead, see
+[Installing From k3sm.app](docs/user/install.md#installing-from-k3smapp).
+
 See [docs/user/install.md](docs/user/install.md) for what the install step does and
 [docs/user/quickstart.md](docs/user/quickstart.md) for running a first Pod.
 
