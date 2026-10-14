@@ -342,6 +342,9 @@ type purgePlan struct {
 	roots []string
 	// files are the preserved files outside every root.
 	files []string
+	// kubeHome is the validated home the kubeconfig edit lands under, so the
+	// edit cannot reach a home the guard never checked.
+	kubeHome string
 	// kubeUsers are the humans whose kubeconfig carries the k3sm context.
 	kubeUsers []string
 	// kubeName is the name that context is keyed under, read from the installed
@@ -367,6 +370,7 @@ type purgePlan struct {
 func planPurge(ctx context.Context, sys System, cfg Config, m []artifact, st dataroot.State) (purgePlan, error) {
 	var plan purgePlan
 	plan.homes = []string{cfg.TargetHome}
+	plan.kubeHome = cfg.TargetHome
 	if cfg.TargetHome != "" {
 		if r, err := sys.ResolvePath(cfg.TargetHome); err == nil && r != cfg.TargetHome {
 			plan.homes = append(plan.homes, r)
@@ -593,7 +597,7 @@ func purge(ctx context.Context, sys System, cfg Config) error {
 		}
 	}
 	for _, u := range plan.kubeUsers {
-		had, err := sys.RemoveAdminKubeconfigContext(u, plan.kubeName)
+		had, err := sys.RemoveAdminKubeconfigContext(u, plan.kubeHome, plan.kubeName)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("remove the %s context from %s's kubeconfig: %w (remedy: kubectl config delete-context %s)", plan.kubeName, u, err, plan.kubeName))
 			continue

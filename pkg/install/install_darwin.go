@@ -2606,12 +2606,15 @@ func (darwinSystem) BootoutUserDomain(ctx context.Context, uid uint32) error {
 
 // RemoveAdminKubeconfigContext removes the context keyed name from targetUser's
 // ~/.kube/config. See the System interface.
-func (darwinSystem) RemoveAdminKubeconfigContext(targetUser, name string) (bool, error) {
-	u, err := user.Lookup(targetUser)
-	if err != nil {
-		return false, fmt.Errorf("lookup target user %s: %w", targetUser, err)
+func (darwinSystem) RemoveAdminKubeconfigContext(targetUser, homeDir, name string) (bool, error) {
+	if homeDir == "" {
+		u, err := user.Lookup(targetUser)
+		if err != nil {
+			return false, fmt.Errorf("lookup target user %s: %w", targetUser, err)
+		}
+		homeDir = u.HomeDir
 	}
-	removed, err := removeUserKubeconfigContext(u.HomeDir, name)
+	removed, err := removeUserKubeconfigContext(homeDir, name)
 	if err != nil {
 		return false, fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
 	}

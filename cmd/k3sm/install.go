@@ -664,8 +664,11 @@ func explicitPurgeTarget(name string) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("look up --user %s: %w", name, err)
 	}
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil || uid < minHumanUID || uid > math.MaxInt32 {
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return "", "", fmt.Errorf("--user %s has uid %q, which is not a 32-bit number: %w", name, u.Uid, err)
+	}
+	if uid < minHumanUID || uid > math.MaxInt32 {
 		return "", "", fmt.Errorf("--user %s has uid %s, below %d: refusing a system or service account", name, u.Uid, minHumanUID)
 	}
 	if u.HomeDir == "" {
