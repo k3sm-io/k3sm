@@ -817,19 +817,33 @@ func TestNetworkLanToggle(t *testing.T) {
 		if !bytes.Contains(withBlock, []byte(`"network":{"lan":"off","recorded":false,"covers":["nodeports","loadbalancers","ingress"],"alwaysOn":["apiserver","join","mesh"]}`)) {
 			t.Errorf("network block = %s", withBlock)
 		}
-		// The shipped goldens carry no network key: the contract is additive.
+		// The goldens from before the block carry no network key, and still
+		// decode: the contract is additive. Only the network-* postures,
+		// added with it, carry one.
 		goldens, err := filepath.Glob(filepath.Join("..", "..", "pkg", "status", "testdata", "status_*json_*.json"))
 		if err != nil || len(goldens) == 0 {
 			t.Fatalf("no status goldens found: %v", err)
 		}
+		withNetwork := 0
 		for _, g := range goldens {
 			data, err := os.ReadFile(g)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if bytes.Contains(data, []byte(`"network"`)) {
+			has := bytes.Contains(data, []byte(`"network"`))
+			if strings.Contains(filepath.Base(g), "_network-") {
+				if !has {
+					t.Errorf("golden %s carries no network key", g)
+				}
+				withNetwork++
+				continue
+			}
+			if has {
 				t.Errorf("golden %s carries a network key", g)
 			}
+		}
+		if withNetwork == 0 {
+			t.Error("no network-* golden found; the block's goldens are missing")
 		}
 	})
 }

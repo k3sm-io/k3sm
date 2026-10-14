@@ -283,12 +283,14 @@ type Collector struct {
 	// leaves the report's stoppedBy field out.
 	StopMarker func() (install.StopMarker, bool, error)
 	// Network reads the LAN access record (install.ReadNetworkRecord in
-	// production; an absent record reads as on). OPTIONAL: nil or a failed
-	// read leaves the report's network field out.
+	// production; an absent record reads as on). OPTIONAL: nil leaves the
+	// report's network field out; a failed read reports off, the way the node
+	// daemon serves it, marked network.recordState "unreadable".
 	Network func() (install.NetworkRecord, bool, error)
 	// NetworkApplied reads the node daemon's applied report for role
 	// (install.NetworkAppliedPath). OPTIONAL: nil leaves network.applied out;
-	// a permission error says the applied state is known to root only.
+	// a permission error sets network.appliedReadable false. The daemons
+	// probe never calls it.
 	NetworkApplied func(role install.Role) ([]byte, error)
 	// AgentJoinServer returns the control-plane host the installed agent
 	// joins: ONLY the --server value of the agent LaunchDaemon's argv

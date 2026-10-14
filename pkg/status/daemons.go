@@ -53,14 +53,19 @@ type DaemonsReport struct {
 	Daemons       []Row         `json:"daemons"`
 	// StoppedBy is the full report's field of the same name.
 	StoppedBy *StoppedBy `json:"stoppedBy,omitempty"`
+	// Network is the full report's field of the same name, built by the same
+	// method, without Applied: the daemon's applied report is root-only and
+	// this probe never reads it.
+	Network *Network `json:"network,omitempty"`
 }
 
 // CollectDaemons is the cheap probe behind DaemonsReport. It reads launchd
 // (through the Launchd seam), the install's files, the crash-loop record and
-// the node credential store (through the FS seam) and the data-volume record
-// (through the DataRoot seam). It never touches Kube, Runtimed, Volumes,
-// ServerArgs, NodeResolverPresent, CDHash or EtcdMetrics, so a caller may leave
-// them nil, and a test pins that a wired one is never reached.
+// the node credential store (through the FS seam), the data-volume record
+// (through the DataRoot seam) and the LAN access record (through the Network
+// seam). It never touches Kube, Runtimed, Volumes, ServerArgs,
+// NodeResolverPresent, CDHash, EtcdMetrics or NetworkApplied, so a caller may
+// leave them nil, and a test pins that a wired one is never reached.
 func (c Collector) CollectDaemons() DaemonsReport {
 	now := time.Now
 	if c.Now != nil {
@@ -69,6 +74,8 @@ func (c Collector) CollectDaemons() DaemonsReport {
 	role, _, bothRoles := c.installedRole()
 	ld := c.launchdRows(now(), role, bothRoles, c.dataVolume() != nil)
 	verdict, summary, _ := Aggregate([]Row{ld.install, ld.netd, ld.node}, ld.installed, role)
+	record := c
+	record.NetworkApplied = nil
 	return DaemonsReport{
 		SchemaVersion: SchemaVersion,
 		Verdict:       verdict,
@@ -76,6 +83,7 @@ func (c Collector) CollectDaemons() DaemonsReport {
 		Summary:       summary,
 		Daemons:       []Row{ld.netd, ld.node},
 		StoppedBy:     c.stoppedBy(),
+		Network:       record.network(role, ld.installed),
 	}
 }
 

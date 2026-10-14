@@ -233,6 +233,9 @@ func newDaemonsCollector() status.Collector {
 		Procs:      procTable{},
 		DataRoot:   dataRootFS{},
 		StopMarker: statusStopMarker,
+		// The LAN access record is world-readable; the daemon's applied
+		// report is root-only, so the probe leaves it out.
+		Network:    statusNetwork,
 		Paths:      statusPaths(statusWorkDir(euid, serviceUID)),
 		EUID:       euid,
 		ServiceUID: serviceUID,

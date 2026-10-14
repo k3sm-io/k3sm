@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"k3sm.io/k3sm/pkg/install"
@@ -123,28 +124,168 @@ func TestStatusNetworkBlock(t *testing.T) {
 		}
 	})
 
-	t.Run("absent seam, failed read and no install leave the key out", func(t *testing.T) {
+	t.Run("absent seam and no install leave the key out", func(t *testing.T) {
 		t.Parallel()
-		for name, mutate := range map[string]func(*Collector){
-			"no seam": func(*Collector) {},
-			"failed read": func(c *Collector) {
-				c.Network = func() (install.NetworkRecord, bool, error) {
-					return install.NetworkRecord{}, true, errors.New("bad record")
-				}
-			},
-		} {
-			c := running(t)
-			mutate(&c)
-			raw, err := json.Marshal(c.Collect(context.Background()))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if strings.Contains(string(raw), `"network"`) {
-				t.Errorf("%s: the report carries a network key: %s", name, raw)
-			}
+		c := running(t)
+		raw, err := json.Marshal(c.Collect(context.Background()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), `"network"`) {
+			t.Errorf("no seam: the report carries a network key: %s", raw)
 		}
 		if got := (Collector{Network: off}).network("", false); got != nil {
 			t.Errorf("a Mac with no install reported %+v, want no network block", got)
 		}
 	})
+}
+
+// TestNetworkLANInDaemonsProbeAndUnreadableMarker pins the two markers that
+// tell the LAN states apart and the probe's copy of the block. A record that
+// exists but cannot be used reports lan off (what the node daemon serves),
+// recorded true and recordState unreadable, in both shapes and without the
+// error text; an absent record carries no recordState; an applied report the
+// caller may not read gives appliedReadable false; and the daemons probe
+// carries network, from the full report's own method, without applied and
+// without ever calling the applied reader.
+func TestNetworkLANInDaemonsProbeAndUnreadableMarker(t *testing.T) {
+	t.Parallel()
+	running := func(t *testing.T) Collector {
+		return contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", heartbeatingKube(goldenTime), nil)
+	}
+	const secret = "/Library/k3sm/network.json: owned by uid 501"
+	unreadable := func() (install.NetworkRecord, bool, error) {
+		return install.NetworkRecord{}, true, errors.New("network record " + secret + ": " + install.ErrNetworkRecord.Error())
+	}
+	absent := func() (install.NetworkRecord, bool, error) {
+		return install.NetworkRecord{Version: install.NetworkRecordVersion, LAN: install.LANOn}, false, nil
+	}
+	recordedOn := func() (install.NetworkRecord, bool, error) {
+		return install.NetworkRecord{Version: install.NetworkRecordVersion, LAN: install.LANOn}, true, nil
+	}
+	appliedOff := func(install.Role) ([]byte, error) { return []byte(`{"lan":"off","serial":"s1"}`), nil }
+	appliedDenied := func(install.Role) ([]byte, error) { return nil, fs.ErrPermission }
+	no := false
+
+	cases := []struct {
+		name    string
+		record  func() (install.NetworkRecord, bool, error)
+		applied func(install.Role) ([]byte, error)
+		full    *Network
+		line    string
+	}{
+		{
+			name: "an unreadable record reads off, recorded, marked", record: unreadable, applied: appliedOff,
+			full: &Network{LAN: "off", Recorded: true, RecordState: NetworkRecordUnreadable,
+				Covers: install.LANCovers("server"), AlwaysOn: install.LANAlwaysOn("server"),
+				Applied: &NetworkApplied{LAN: "off", Serial: "s1"}},
+			line: "the LAN access record cannot be used, so the node daemon serves LAN access off",
+		},
+		{
+			name: "an absent record carries no recordState", record: absent,
+			full: &Network{LAN: "on", Recorded: false,
+				Covers: install.LANCovers("server"), AlwaysOn: install.LANAlwaysOn("server")},
+			line: "LAN access is on because no setting is recorded",
+		},
+		{
+			name: "applied unreadable says so", record: recordedOn, applied: appliedDenied,
+			full: &Network{LAN: "on", Recorded: true,
+				Covers: install.LANCovers("server"), AlwaysOn: install.LANAlwaysOn("server"), AppliedReadable: &no},
+			line: "the applied state is readable by root only",
+		},
+		{
+			name: "a readable applied report leaves appliedReadable out", record: recordedOn, applied: appliedOff,
+			full: &Network{LAN: "on", Recorded: true,
+				Covers: install.LANCovers("server"), AlwaysOn: install.LANAlwaysOn("server"),
+				Applied: &NetworkApplied{LAN: "off", Serial: "s1"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var appliedCalls atomic.Int32
+			c := running(t)
+			c.Network = tc.record
+			if tc.applied != nil {
+				c.NetworkApplied = func(r install.Role) ([]byte, error) { appliedCalls.Add(1); return tc.applied(r) }
+			}
+
+			full := c.Collect(context.Background())
+			if !reflect.DeepEqual(full.Network, tc.full) {
+				t.Errorf("full report network = %+v, want %+v", networkOf(full.Network), networkOf(tc.full))
+			}
+			if tc.line != "" {
+				if screen := Render(full, Style{}); !strings.Contains(screen, tc.line) {
+					t.Errorf("the human view lacks %q:\n%s", tc.line, screen)
+				}
+			}
+
+			before := appliedCalls.Load()
+			probe := c.CollectDaemons()
+			if n := appliedCalls.Load() - before; n != 0 {
+				t.Errorf("the daemons probe read the applied report %d times, want 0", n)
+			}
+			want := *tc.full
+			want.Applied, want.AppliedReadable = nil, nil
+			if probe.Network == nil || !reflect.DeepEqual(*probe.Network, want) {
+				t.Errorf("daemons probe network = %+v, want %+v", networkOf(probe.Network), want)
+			}
+
+			for shape, v := range map[string]any{"full": full, "probe": probe} {
+				raw, err := json.Marshal(v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var generic map[string]any
+				if err := json.Unmarshal(raw, &generic); err != nil {
+					t.Fatal(err)
+				}
+				nw, ok := generic["network"].(map[string]any)
+				if !ok {
+					t.Fatalf("%s JSON has no network object: %s", shape, raw)
+				}
+				rs, hasRS := nw["recordState"]
+				if tc.full.RecordState == "" && hasRS {
+					t.Errorf("%s: recordState = %v, want it absent", shape, rs)
+				}
+				if tc.full.RecordState != "" && rs != "unreadable" {
+					t.Errorf("%s: recordState = %v, want unreadable", shape, rs)
+				}
+				ar, hasAR := nw["appliedReadable"]
+				if shape == "full" && tc.full.AppliedReadable != nil && ar != false {
+					t.Errorf("full: appliedReadable = %v, want false", ar)
+				}
+				if (shape == "probe" || tc.full.AppliedReadable == nil) && hasAR {
+					t.Errorf("%s: appliedReadable = %v, want it absent", shape, ar)
+				}
+				if _, has := nw["applied"]; shape == "probe" && has {
+					t.Errorf("probe: carries applied, which is root-only: %s", raw)
+				}
+				if strings.Contains(string(raw), secret) || strings.Contains(string(raw), "uid 501") {
+					t.Errorf("%s: the JSON carries the record's error text: %s", shape, raw)
+				}
+			}
+		})
+	}
+
+	t.Run("no install and no seam leave the probe's key out", func(t *testing.T) {
+		t.Parallel()
+		c := running(t)
+		if got := c.CollectDaemons().Network; got != nil {
+			t.Errorf("no seam: probe network = %+v, want nil", *got)
+		}
+		c.Network = unreadable
+		c.FS = fakeFS{}
+		if got := c.CollectDaemons().Network; got != nil {
+			t.Errorf("no install: probe network = %+v, want nil", *got)
+		}
+	})
+}
+
+// networkOf prints a network block, or nil, for a test failure.
+func networkOf(n *Network) any {
+	if n == nil {
+		return nil
+	}
+	return *n
 }
