@@ -140,7 +140,12 @@ Every channel manages the same `/Library/k3sm`. Once more than one has shipped, 
 
 ### Installing From k3sm.app
 
-The k3sm app installs, updates and uninstalls with the same `/Library/k3sm`. It never runs k3sm
+k3sm.app is closed source and free to use; the rest of k3sm is Apache-2.0, and the command-line
+install needs nothing from the app.
+
+The k3sm app installs, updates and uninstalls with the same `/Library/k3sm`. It asks for an
+administrator password once. That one step copies the app's bundled files into a root-owned
+staging folder, checks the copy, and then runs the install from that copy. It never runs k3sm
 from its own bundle as root: it copies the bundle into a new directory under
 `/Library/k3sm.staging`, checks the copy's signature, and runs
 `k3sm install --from-staging <dir>` from that copy. The install refuses to run unless:
@@ -158,6 +163,9 @@ from its own bundle as root: it copies the bundle into a new directory under
 
 Pass `--allow-downgrade` to install an older version on purpose (or over an install whose version
 cannot be read). A plain `sudo k3sm install` makes none of these checks and is unchanged.
+
+To remove an install made from the app, run `sudo k3sm uninstall`, or use Uninstall in the app's
+window. Dragging the app to the Trash does not remove k3sm: the cluster keeps running.
 
 ## Secrets Encryption at Rest
 
