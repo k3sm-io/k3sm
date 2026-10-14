@@ -91,7 +91,9 @@ type Row struct {
 
 // PeerStatus is one mesh peer's line. The multi-node mesh does not report here
 // yet, so Report.Peers is always empty; the field exists so the JSON shape a
-// consumer parses today is the shape it parses when peers arrive.
+// consumer parses today is the shape it parses when peers arrive. The cluster's
+// other nodes and their versions are Report.Workers, not peers: a mesh peer is
+// a tunnel with a state, a worker is a Node with a version.
 type PeerStatus struct {
 	Name   string `json:"name"`
 	State  string `json:"state"`
@@ -126,10 +128,19 @@ type Report struct {
 	StoppedBy *StoppedBy `json:"stoppedBy,omitempty"`
 	// Network is this node's LAN access switch, present on an installed Mac
 	// whose record could be read. It adds no verdict or state word.
-	Network   *Network     `json:"network,omitempty"`
-	Version   version.Info `json:"version"`
-	Host      string       `json:"host"`
-	Timestamp time.Time    `json:"timestamp"`
+	Network *Network `json:"network,omitempty"`
+	// Workers is, on a server, every other node of the cluster with the
+	// version its kubelet reports, read from the same node list the node row
+	// uses. Absent (nil) means unknown: an agent, an apiserver that did not
+	// answer, or a failed read. Present and empty means the read succeeded and
+	// there are no other nodes. It adds no verdict or state word.
+	Workers *[]Worker `json:"workers,omitempty"`
+	// JoinTarget is, on an agent, the bootstrap endpoint (host:port) of the
+	// server this Mac was installed to join. Empty when it cannot be read.
+	JoinTarget string       `json:"joinTarget,omitempty"`
+	Version    version.Info `json:"version"`
+	Host       string       `json:"host"`
+	Timestamp  time.Time    `json:"timestamp"`
 }
 
 // Row returns the named row and whether it was present.

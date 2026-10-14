@@ -49,7 +49,9 @@ var (
 	// reportRequired and reportOptional are the top-level keys of `k3sm status
 	// -o json`. The optional ones are omitted when empty.
 	reportRequired = []string{"schemaVersion", "verdict", "role", "summary", "rows", "version", "host", "timestamp"}
-	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy", "network"}
+	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy", "network", "workers", "joinTarget"}
+	// workerRequired are the keys of each entry of the optional workers list.
+	workerRequired = []string{"name", "role", "version"}
 	// networkRequired are the keys of the optional network object.
 	networkRequired = []string{"lan", "recorded", "covers", "alwaysOn"}
 	// networkOptional are the optional keys of the network object.
@@ -275,6 +277,20 @@ func contractScenarios() map[string]contractScenario {
 		"running-interconnect": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
 			return contractInterconnect(t)
 		}},
+		"server-with-workers": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			kube := heartbeatingKube(goldenTime)
+			older := workerNode("node-b", "v1.36.2+k3sm.0.1.6")
+			peer := workerNode("node-a", "v1.36.2+k3sm.0.1.7")
+			peer.Labels = map[string]string{controlPlaneNodeLabel: ""}
+			kube.nodes = append(kube.nodes, older, peer)
+			return contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", kube, nil)
+		}},
+		"agent-join-target": {verdict: VerdictDegraded, collector: func(t *testing.T) Collector {
+			c := contractAgent(t, func(_ *testing.T, _ Paths, fsys fakeFS) fakeFS { return fsys })
+			sys := agentPlistSystem("192.0.2.10")
+			c.AgentJoinServer = func() (string, error) { return install.AgentJoinServer(sys, install.Config{}) }
+			return c
+		}},
 		"agent-waiting": {verdict: VerdictDegraded, collector: func(t *testing.T) Collector {
 			return contractAgent(t, func(_ *testing.T, _ Paths, fsys fakeFS) fakeFS { return fsys })
 		}},
@@ -412,6 +428,7 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			{reflect.TypeOf(NetworkApplied{}), sortedUnion(networkAppliedRequired, networkAppliedOptional)},
 			{reflect.TypeOf(Row{}), sortedUnion(rowRequired, rowOptional)},
 			{reflect.TypeOf(PeerStatus{}), sortedUnion(peerRequired)},
+			{reflect.TypeOf(Worker{}), sortedUnion(workerRequired)},
 			{reflect.TypeOf(Interconnect{}), sortedUnion(interconnectRequired, interconnectOptional)},
 			{reflect.TypeOf(InterconnectPod{}), sortedUnion(interconnectPodRequired)},
 			{reflect.TypeOf(version.Info{}), sortedUnion(versionRequired, versionOptional)},
@@ -456,6 +473,21 @@ func TestStatusJSONContractGolden(t *testing.T) {
 						checkKeys(t, fmt.Sprintf("%s interconnect.pods[%d]", fullPath, i), p, interconnectPodRequired, nil, nil)
 					}
 				}
+			}
+			if ws, ok := fullGeneric["workers"]; ok {
+				list, isList := ws.([]any)
+				if !isList {
+					t.Errorf("%s workers is %T, want an array", fullPath, ws)
+				}
+				for i, w := range list {
+					checkKeys(t, fmt.Sprintf("%s workers[%d]", fullPath, i), w, workerRequired, nil, nil)
+					if role, _ := w.(map[string]any)["role"].(string); !contains(contractRoles, role) {
+						t.Errorf("%s workers[%d] role %q is outside the contract", fullPath, i, role)
+					}
+				}
+			}
+			if jt, ok := fullGeneric["joinTarget"]; ok && full.Role != "agent" {
+				t.Errorf("%s carries joinTarget %v on a %s", fullPath, jt, full.Role)
 			}
 			if nw, ok := fullGeneric["network"]; ok {
 				checkKeys(t, fullPath+" network", nw, networkRequired, networkOptional, nil)
@@ -555,6 +587,12 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			if !reflect.DeepEqual(gotFull.Interconnect, full.Interconnect) {
 				t.Errorf("interconnect block: collected %+v, golden %+v", gotFull.Interconnect, full.Interconnect)
 			}
+			if !reflect.DeepEqual(gotFull.Workers, full.Workers) {
+				t.Errorf("workers: collected %v, golden %v", deref(gotFull.Workers), deref(full.Workers))
+			}
+			if gotFull.JoinTarget != full.JoinTarget {
+				t.Errorf("joinTarget: collected %q, golden %q", gotFull.JoinTarget, full.JoinTarget)
+			}
 		})
 	}
 
@@ -574,7 +612,7 @@ func TestStatusJSONContractGolden(t *testing.T) {
 		// is reserved, and no posture emits it yet (the struct check covers it);
 		// network is read from a record no golden posture wires, so the
 		// struct check and TestStatusNetworkBlock cover it.
-		for _, k := range append(append(append([]string{"next", "interconnect", "stoppedBy"}, rowOptional...), versionOptional...), interconnectOptional...) {
+		for _, k := range append(append(append([]string{"next", "interconnect", "stoppedBy", "workers", "joinTarget"}, rowOptional...), versionOptional...), interconnectOptional...) {
 			if !optionalSeen[k] {
 				t.Errorf("no golden carries the optional key %q", k)
 			}

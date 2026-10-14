@@ -76,7 +76,8 @@ func (c Collector) Collect(ctx context.Context) Report {
 	// clusters are a handful of Macs, so a single page always holds them all.
 	var nodes []corev1.Node
 	var nodesErr error
-	if c.Kube != nil && serving {
+	nodesRead := c.Kube != nil && serving
+	if nodesRead {
 		nodes, nodesErr = c.Kube.Nodes(ctx)
 	}
 
@@ -163,6 +164,8 @@ func (c Collector) Collect(ctx context.Context) Report {
 		Interconnect:  icBlock,
 		StoppedBy:     c.stoppedBy(),
 		Network:       c.network(role, installed),
+		Workers:       c.workers(role, nodesRead, nodes, nodesErr),
+		JoinTarget:    c.joinTarget(role),
 		Version:       c.Version,
 		Host:          c.Host,
 		Timestamp:     now(),
