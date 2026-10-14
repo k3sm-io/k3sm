@@ -2204,7 +2204,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	}
 
 	// 2. THE STAGED INSTALL ROOT BEGINS HERE. Every artifact below lands in
-	//    <InstallDir>.staging, not in the live tree, and the whole set is
+	//    <InstallDir>.swap, not in the live tree, and the whole set is
 	//    published in one step at 2f. See stage.go for the hazard that buys: the
 	//    copies used to go straight into /Library/k3sm one after another, so any
 	//    fault part-way through left the new binary beside old helpers while

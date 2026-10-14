@@ -475,7 +475,7 @@ func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact
 	if !previous {
 		return fmt.Errorf("%w; the install root %s is this install's tree and there is no previous one to roll back to (first install); daemon state: %s", cause, cfg.InstallDir, states())
 	}
-	staging := cfg.stagingDir()
+	staging := cfg.swapDir()
 	if _, err := sys.SwapInstallRoot(staging, filepath.Clean(cfg.InstallDir)); err != nil {
 		return fmt.Errorf("%w; ROLLBACK FAILED, the install root %s still holds the NEW tree and the previous one is at %s: %v; daemon state: %s", cause, cfg.InstallDir, staging, err, states())
 	}

@@ -1444,7 +1444,7 @@ func TestSwapInstallRootOnDisk(t *testing.T) {
 
 	t.Run("a destination that exists is EXCHANGED, in one step", func(t *testing.T) {
 		root := t.TempDir()
-		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.staging")
+		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.swap")
 		mustTree(t, live, map[string]string{"k3sm": "old binary", "bin/kine": "old kine"})
 		mustTree(t, staging, map[string]string{"k3sm": "new binary", "bin/kine": "new kine", "k3sm-vmhost": "new helper"})
 
@@ -1482,7 +1482,7 @@ func TestSwapInstallRootOnDisk(t *testing.T) {
 
 	t.Run("an absent destination is a first install and takes a plain rename", func(t *testing.T) {
 		root := t.TempDir()
-		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.staging")
+		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.swap")
 		mustTree(t, staging, map[string]string{"k3sm": "new binary"})
 
 		previous, err := sys.SwapInstallRoot(staging, live)
@@ -1503,7 +1503,7 @@ func TestSwapInstallRootOnDisk(t *testing.T) {
 
 	t.Run("a missing staged tree fails and leaves the live one alone", func(t *testing.T) {
 		root := t.TempDir()
-		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.staging")
+		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.swap")
 		mustTree(t, live, map[string]string{"k3sm": "old binary"})
 
 		if _, err := sys.SwapInstallRoot(staging, live); err == nil {

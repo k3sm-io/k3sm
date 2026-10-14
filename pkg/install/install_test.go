@@ -1303,7 +1303,7 @@ func (f *fakeSystem) RemoveAll(path string) error {
 // staging path's trust check then reads), and really creates it.
 //
 // A permission error from the real mkdir is tolerated, and only that one: an
-// unprivileged unit test legitimately asks for /Library/k3sm.staging, which it
+// unprivileged unit test legitimately asks for /Library/k3sm.swap, which it
 // cannot create and does not need to — the ownership table above is the model
 // those tests assert against. A test that needs a real directory (the data-root
 // migration, which really copies trees) names one under its own t.TempDir(),
@@ -1815,46 +1815,46 @@ func TestInstallOrchestration(t *testing.T) {
 		// a first install, so nothing is removed) and created, and every
 		// artifact below lands in it rather than in the tree the daemons are
 		// executing out of.
-		"Owner:/Library/k3sm.staging",
-		"EnsureRootDir:/Library/k3sm.staging",
-		"CopyToRootOwned:/Library/k3sm.staging/k3sm",
-		"CopyToRootOwned:/Library/k3sm.staging/k3sm-execshim",
-		"CopyToRootOwned:/Library/k3sm.staging/libk3sm_pathrebase_shim.dylib",
-		"CopyToRootOwned:/Library/k3sm.staging/libk3sm_getaddrinfo_shim.dylib",
+		"Owner:/Library/k3sm.swap",
+		"EnsureRootDir:/Library/k3sm.swap",
+		"CopyToRootOwned:/Library/k3sm.swap/k3sm",
+		"CopyToRootOwned:/Library/k3sm.swap/k3sm-execshim",
+		"CopyToRootOwned:/Library/k3sm.swap/libk3sm_pathrebase_shim.dylib",
+		"CopyToRootOwned:/Library/k3sm.swap/libk3sm_getaddrinfo_shim.dylib",
 		// The helper's entitlement was already verified, in the preflight block
 		// before any of these copies ran (see above) — this copy can now only
 		// fail on an I/O error.
-		"CopyToRootOwned:/Library/k3sm.staging/k3sm-vmhost",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-apiserver",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-scheduler",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-controller-manager",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kubectl",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/kine",
-		"CopyToRootOwned:/Library/k3sm.staging/bin/etcd",
+		"CopyToRootOwned:/Library/k3sm.swap/k3sm-vmhost",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kube-apiserver",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kube-scheduler",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kube-controller-manager",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kubectl",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/kine",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/etcd",
 		// etcdutl, built from the etcd wrapper: `k3sm snapshot restore` runs it
 		// offline on an etcd server.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/etcdutl",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/etcdutl",
 		// The pinned helm the helm controller's Jobs run, a payload binary like
 		// kubectl.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + helmchart.HelmBinaryName,
-		"CopyToRootOwned:/Library/k3sm.staging/bin/zot",
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + helmchart.HelmBinaryName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/zot",
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KineMarkerName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KineMarkerName,
 		// The etcd version marker, staged the same best-effort way.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.EtcdMarkerName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.EtcdMarkerName,
 		// The etcdutl version marker, staged the same best-effort way.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.EtcdutlMarkerName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.EtcdutlMarkerName,
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
-		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KubeMarkerName,
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KubeMarkerName,
 		// The shadow binary set, staged with the binary that uses it: each copy
 		// in the shared list cloned root:wheel 0755, re-signed ad hoc, verified,
 		// its source's cdhash read, then the manifest (TestShadowSetIsMadeAtInstall
 		// owns the detail).
-		"EnsureRootDir:/Library/k3sm.staging/shadow",
-	}, shadowSetCalls("/Library/k3sm.staging/shadow", nil), []string{
-		"WriteRootOnlyFile:/Library/k3sm.staging/shadow/sources.json:0644",
+		"EnsureRootDir:/Library/k3sm.swap/shadow",
+	}, shadowSetCalls("/Library/k3sm.swap/shadow", nil), []string{
+		"WriteRootOnlyFile:/Library/k3sm.swap/shadow/sources.json:0644",
 		// The installed server plist and args record were already read, in the
 		// preflight block before any of these copies ran (see above); the carry-
 		// over below reuses that answer — nothing, on a first install — rather
@@ -1876,7 +1876,7 @@ func TestInstallOrchestration(t *testing.T) {
 		// PUBLISH. One operation makes the whole staged tree live; `:rename` is
 		// the first-install branch (there was no tree at /Library/k3sm to
 		// exchange with), so there is nothing to reap afterwards.
-		"SwapInstallRoot:/Library/k3sm.staging<->/Library/k3sm:rename",
+		"SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename",
 		// The launcher link and the plists come AFTER it, and only after it:
 		// each names a fixed absolute path inside the install root, and that
 		// path holds this install's binary only now. Copying into /Library/k3sm
@@ -2033,7 +2033,7 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// `k3sm-m2` would arrive under the live root under that same wrong name.
 	// The head is therefore stated as the staged counterpart of each fixed
 	// installed path, which is exactly what the swap then republishes.
-	stage := "/Library/k3sm" + installStagingSuffix
+	stage := "/Library/k3sm" + installSwapSuffix
 	fixedHead := []string{stage + "/k3sm", stage + "/k3sm-execshim", stage + "/" + PathShimName, stage + "/" + DNSShimName, stage + "/" + VMHostName}
 	if len(dsts) < len(fixedHead) {
 		t.Fatalf("only %d copies %v, want at least the fixed head %v (never the source basename)", len(dsts), dsts, fixedHead)
@@ -2534,7 +2534,7 @@ func fileDispByPath(m []artifact, path string) (disposition, bool) {
 // ever disagree, the manifest coverage gate goes red, which is the outcome you
 // want from a drifting redirection.
 func publishedPath(cfg Config, p string) string {
-	prefix := cfg.stagingDir() + "/"
+	prefix := cfg.swapDir() + "/"
 	if !strings.HasPrefix(p, prefix) {
 		return p
 	}
@@ -2850,8 +2850,8 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 		// Under staging that means after the PUBLISH, not merely after the copy:
 		// the copy puts the binary in the sibling tree, and /Library/k3sm/k3sm
 		// (the path this link names) exists only once the publish has run.
-		publish := idx(f.calls, "SwapInstallRoot:/Library/k3sm.staging<->/Library/k3sm:rename")
-		if binary := idx(f.calls, "CopyToRootOwned:/Library/k3sm.staging/k3sm"); binary < 0 || link < binary {
+		publish := idx(f.calls, "SwapInstallRoot:/Library/k3sm.swap<->/Library/k3sm:rename")
+		if binary := idx(f.calls, "CopyToRootOwned:/Library/k3sm.swap/k3sm"); binary < 0 || link < binary {
 			t.Errorf("link (%d) must be laid down after the binary copy (%d)", link, binary)
 		}
 		if publish < 0 || link < publish {

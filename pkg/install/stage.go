@@ -38,7 +38,7 @@ import (
 //
 // So the whole tree is built at a SIBLING path first and published in one step:
 //
-//	stage  → every artifact is copied into <InstallDir>.staging
+//	stage  → every artifact is copied into <InstallDir>.swap
 //	swap   → the staged tree and the live tree exchange places (SwapInstallRoot)
 //	plists → rendered and written, naming the same fixed live paths as before
 //	restart + verify → the daemons come up on the new tree and are proven healthy
@@ -68,14 +68,20 @@ import (
 // sweeps the whole directory.
 
 const (
-	// installStagingSuffix makes the staging directory a SIBLING of the install
+	// installSwapSuffix makes the staging directory a SIBLING of the install
 	// root rather than a child of it. Sibling is structural, not stylistic: the
 	// publish step exchanges the two paths, which the kernel will only do within
 	// one filesystem, and /Library is a firmlink onto the Data volume, so a
 	// sibling under /Library is guaranteed to be on the same filesystem as
 	// /Library/k3sm. A child of the install root could not be swapped with its
 	// own parent at all.
-	installStagingSuffix = ".staging"
+	//
+	// The name is ".swap", not ".staging", because /Library/k3sm.staging is the
+	// k3sm.app copy-out's staging root (DefaultStagingRoot): two owners of one
+	// path would let this install remove or publish the app's staged bundle. A
+	// tree left at the old name by an earlier build is never trusted or reused
+	// here; only uninstall's staging sweep removes it.
+	installSwapSuffix = ".swap"
 	// installLockSuffix names the install-wide lock file, likewise beside the
 	// install root rather than inside it — a lock held on a file in the tree
 	// being swapped would follow the tree out of the way mid-install.
@@ -101,15 +107,15 @@ var ErrInstallInProgress = errors.New("another k3sm install is already running o
 // root are on different filesystems, which no rename can cross.
 //
 // It is named explicitly even though the default layout makes it unreachable —
-// /Library is a firmlink onto the Data volume, so <InstallDir>.staging is always
+// /Library is a firmlink onto the Data volume, so <InstallDir>.swap is always
 // the install root's filesystem — because Config.InstallDir is a public field and
 // a caller may point it somewhere else. An EXDEV reported as a bare errno would
 // read as a permissions problem; this one names the cause.
 var ErrInstallRootCrossDevice = errors.New("the staging directory and the install root are on different filesystems, so the staged tree cannot be published with a rename")
 
-// stagingDir is the sibling directory this install builds the whole install root
+// swapDir is the sibling directory this install builds the whole install root
 // in before publishing it. See the file comment for why it is a sibling.
-func (c Config) stagingDir() string { return filepath.Clean(c.InstallDir) + installStagingSuffix }
+func (c Config) swapDir() string { return filepath.Clean(c.InstallDir) + installSwapSuffix }
 
 // installLockPath is the install-wide lock file guarding the staging tree and
 // the publish. See System.LockInstall.
@@ -132,7 +138,7 @@ func (c Config) stagedPath(p string) string {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return p
 	}
-	return filepath.Join(c.stagingDir(), rel)
+	return filepath.Join(c.swapDir(), rel)
 }
 
 // The staged counterpart of each installed* path. They exist so no call site
@@ -225,7 +231,7 @@ func trustedStagingPath(sys System, path string) (present bool, err error) {
 	return true, nil
 }
 
-// prepareStagingDir makes <InstallDir>.staging an empty, root-owned directory
+// prepareStagingDir makes <InstallDir>.swap an empty, root-owned directory
 // ready to receive the whole install root.
 //
 // A tree left there by an install that died mid-flight is REMOVED rather than
@@ -235,7 +241,7 @@ func trustedStagingPath(sys System, path string) (present bool, err error) {
 // the check is the only thing standing between "clean up after a crash" and "root
 // deletes whatever is at this path".
 func prepareStagingDir(sys System, cfg Config) error {
-	staging := cfg.stagingDir()
+	staging := cfg.swapDir()
 	present, err := trustedStagingPath(sys, staging)
 	if err != nil {
 		return fmt.Errorf("install: %w", err)
@@ -261,7 +267,7 @@ func prepareStagingDir(sys System, cfg Config) error {
 // which side of the swap the Mac is on: it names the path that is live now and
 // the path holding the tree that is about to be removed.
 func publishStagedRoot(sys System, cfg Config) (previous bool, err error) {
-	staging, live := cfg.stagingDir(), filepath.Clean(cfg.InstallDir)
+	staging, live := cfg.swapDir(), filepath.Clean(cfg.InstallDir)
 	previous, err = sys.SwapInstallRoot(staging, live)
 	if err != nil {
 		return false, fmt.Errorf("install: publish the staged install root at %s: %w", live, err)
@@ -284,7 +290,7 @@ func publishStagedRoot(sys System, cfg Config) (previous bool, err error) {
 // not be deleted would turn a healthy Mac into a failed install. The next install
 // removes it (prepareStagingDir), and the trust check runs there too.
 func reapPreviousRoot(sys System, cfg Config) {
-	staging := cfg.stagingDir()
+	staging := cfg.swapDir()
 	present, err := trustedStagingPath(sys, staging)
 	if err != nil {
 		cfg.Logger.Warn("the previous install root was left in place", "path", staging, "err", err)
