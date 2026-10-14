@@ -26,6 +26,11 @@ pin, its date, and the tarball's sha256.
 - **Scheduled etcd snapshots and restore on HA servers.** A server on embedded etcd snapshots its own member every 12 hours and keeps 5 by default (`--etcd-snapshot-schedule-cron`, `--etcd-snapshot-retention`, `--etcd-disable-snapshots`), and `k3sm snapshot restore` puts a snapshot back as a new single-member cluster. See [backup and restore](https://k3sm.io/docs/backup-restore/).
 - **`k3sm status daemons -o json`** reads launchd only, never the apiserver, so it is cheap to poll. `k3sm status` also gains a `heartbeat` row for the node's last status post and Lease renewal.
 - **Pods report `PodReadyToStartContainers`**, and pod-level `resources` count toward a Pod's QoS class.
+- **`sudo k3sm network lan on|off` and `k3sm network lan status`.** One switch decides whether the NodePort, LoadBalancer and ingress listeners answer on the networks this Mac is attached to, or only on this Mac and the cluster mesh. It applies live without restarting Pods, checks the listening sockets itself, and restores the previous setting if the change cannot be made. `sudo k3sm install --lan on|off` sets it at install time. See [install](https://k3sm.io/docs/install/).
+- **`k3sm snapshot save --compress`** writes the snapshot as a zip archive holding one file, the format k3s uses for compressed snapshots, checked before it is compressed and read back before it takes its name. See [backup and restore](https://k3sm.io/docs/backup-restore/).
+- **`k3sm install --from-staging` and `--allow-downgrade`.** The macOS app installs through `--from-staging`, which runs only from a root-owned staging folder whose files are all root-owned and signed by one Developer ID team, and which refuses an older version unless `--allow-downgrade` is given. See [install](https://k3sm.io/docs/install/).
+- **`k3sm uninstall --purge --user <name>`** names whose `~/.kube/config` the purge cleans when there is no `sudo` environment.
+- **`k3sm status -o json` reports joined workers and the join target.** A server lists every other node with the version its kubelet reports (`workers`), and an agent reports the server it joined (`joinTarget`). The LAN access setting appears as `network`, also in `k3sm status daemons -o json`, and an unusable setting record is reported as such instead of being left out. See [status JSON](https://k3sm.io/docs/status-json/).
 
 ### Experimental
 
@@ -35,6 +40,8 @@ pin, its date, and the tarball's sha256.
 
 - **The control plane runs Kubernetes v1.37.1**, and the `k8s.io` client libraries are v0.37.1.
 - **kine, etcd and etcdutl ship in the release payload**, and the node runs those copies instead of building them at boot. The bundled kine is v0.17.2 and the bundled buildx is v0.38.0.
+- **New installs start with LAN access off**, so a NodePort or LoadBalancer on a fresh install answers on this Mac and the cluster mesh only. An existing install keeps LAN access on across an upgrade. Turn it on with `sudo k3sm network lan on`.
+- **The install swap folder moved to `/Library/k3sm.swap`**, so it never shares a path with the macOS app's staging folder, `/Library/k3sm.staging`.
 
 ### Security
 
@@ -42,6 +49,8 @@ pin, its date, and the tarball's sha256.
 - **Control-plane downloads are checked against their pinned digests** on the boot path, and a Developer ID-signed k3sm verifies its control-plane binaries in place and never re-signs them.
 - **The kine, etcd and registry builds pin Go's module verification settings**, so an ambient `GOSUMDB=off` or similar no longer weakens them.
 - **`k3sm status` strips control characters** from cluster-supplied text on a terminal.
+- **helm and the image registry ship in the release payload and are verified, never re-signed**, on a release install, like every other bundled binary.
+- **Example and lab images are pinned by digest**, and the spike and lab downloads are checked against pinned digests before use.
 
 ### Fixed
 
@@ -58,6 +67,7 @@ pin, its date, and the tarball's sha256.
 - Upgrade with `sudo k3sm install`, never by replacing the binary alone.
 - On a cluster using LoadBalancer Services, upgrade the agents before the server.
 - A node stopped with `k3sm stop` stays stopped across an upgrade; pass `--start` to start it.
+- A node built from source needs the registry in its payload: restage with `k3sm payload` before `sudo k3sm install`.
 
 ## v0.1.7 — 2026-10-05
 
