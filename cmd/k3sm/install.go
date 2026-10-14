@@ -45,15 +45,22 @@ import (
 // them. The Homebrew formula that invokes this and the notarize/signing pipeline
 // are the packaging follow-up.
 func runInstall(args []string) error {
-	opts, err := parseInstallFlags(args)
+	env := installEnv{
+		euid:        os.Geteuid(),
+		executable:  install.Executable,
+		stagingFS:   install.NewDarwinStagingFS(),
+		stagingRoot: install.DefaultStagingRoot,
+	}
+	opts, self, volume, err := env.prepare(args)
 	if err != nil {
 		return err
 	}
 
 	// Read-only introspection of the layout contract, deliberately BEFORE the
-	// root check: the release tooling asserts an extracted archive's member set
-	// against this output, and must be able to do so unprivileged. Paths are
-	// printed relative so the caller can join them onto any directory.
+	// root check (prepare returns before it): the release tooling asserts an
+	// extracted archive's member set against this output, and must be able to
+	// do so unprivileged. Paths are printed relative so the caller can join
+	// them onto any directory.
 	if opts.printRequired {
 		for _, p := range install.RequiredSiblings("") {
 			fmt.Println(p)
@@ -61,21 +68,6 @@ func runInstall(args []string) error {
 		return nil
 	}
 
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("k3sm install must run as root — use 'sudo k3sm install'")
-	}
-	if opts.targetUser == "" || opts.targetUser == "root" {
-		return fmt.Errorf("--user (or $SUDO_USER) must be a non-root human so the kubeconfig is not root-owned; run via 'sudo k3sm install'")
-	}
-	self, err := install.Executable()
-	if err != nil {
-		return err
-	}
-
-	volume, err := opts.dataVolumeOptions(version.Get().Version)
-	if err != nil {
-		return err
-	}
 	// Said once, at the one moment it can still be acted on. The volume is
 	// hardware-encrypted by the SEP either way; what --data-volume-encrypt adds
 	// is a passphrase, and on a FileVault Mac an operator reasonably assumes
@@ -89,7 +81,7 @@ func runInstall(args []string) error {
 	sys := install.NewDarwinSystem()
 	cfg := opts.installConfig(self, volume, logger)
 	if opts.fromStaging != "" {
-		// The seams the --from-staging predicate and the Team ID continuity
+		// The seams the --from-staging predicate and the signing continuity
 		// check read through, and the version the downgrade rule compares.
 		cfg.StagingFS = install.NewDarwinStagingFS()
 		cfg.Signer = install.CodesignTeamID{}
@@ -98,6 +90,49 @@ func runInstall(args []string) error {
 	// Only an install --start over a stopped node calls it: the uncordon.
 	cfg.MarkNode = nodeMarker(sys, install.DefaultDataRoot)
 	return install.Install(ctx, sys, cfg)
+}
+
+// installEnv is what runInstall reads from the process before it builds the
+// install's Config: the effective uid, the resolved executable, and the
+// staging seams a refused --from-staging run uses to discard its token file.
+// It is a struct so those refusals are testable without root.
+type installEnv struct {
+	euid        int
+	executable  func() (string, error)
+	stagingFS   install.StagingFS
+	stagingRoot string
+}
+
+// prepare parses the flags and makes every refusal that comes before the
+// install itself: a flag that fails validation, the root check, the --user
+// check, an unresolvable executable and the data-volume flags. Under
+// --from-staging with --token-file, each of those refusals also discards the
+// staged token file, unread (install.DiscardStagedToken), so a refused run
+// never leaves a token behind. --print-required-artifacts returns before the
+// root check.
+func (e installEnv) prepare(args []string) (opts installFlags, self string, volume *datavol.Options, err error) {
+	defer func() {
+		if err != nil && opts.fromStaging != "" && opts.tokenFile != "" {
+			install.DiscardStagedToken(e.stagingFS, e.stagingRoot, opts.tokenFile)
+		}
+	}()
+	opts, err = parseInstallFlags(args)
+	if err != nil || opts.printRequired {
+		return opts, "", nil, err
+	}
+	if e.euid != 0 {
+		return opts, "", nil, fmt.Errorf("k3sm install must run as root — use 'sudo k3sm install'")
+	}
+	if opts.targetUser == "" || opts.targetUser == "root" {
+		return opts, "", nil, fmt.Errorf("--user (or $SUDO_USER) must be a non-root human so the kubeconfig is not root-owned; run via 'sudo k3sm install'")
+	}
+	if self, err = e.executable(); err != nil {
+		return opts, "", nil, err
+	}
+	if volume, err = opts.dataVolumeOptions(version.Get().Version); err != nil {
+		return opts, "", nil, err
+	}
+	return opts, self, volume, nil
 }
 
 // installConfig is the install package's Config these flags describe. It is
@@ -254,7 +289,9 @@ type installFlags struct {
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
-// rather than exiting, so the caller (and a test) sees it.
+// rather than exiting, so the caller (and a test) sees it. A validation error
+// after a successful parse comes back with the parsed flags, so the caller can
+// still discard a staged token file (installEnv.prepare).
 func parseInstallFlags(args []string) (installFlags, error) {
 	var o installFlags
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
@@ -289,35 +326,35 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	}
 	if o.meshIP != "" {
 		if err := validateMeshIP(o.meshIP); err != nil {
-			return installFlags{}, err
+			return o, err
 		}
 	}
 	o.set = map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { o.set[f.Name] = true })
 	if o.set["kubeconfig-name"] {
 		if err := install.ValidateKubeconfigName(o.kubeconfigName); err != nil {
-			return installFlags{}, fmt.Errorf("--kubeconfig-name: %w", err)
+			return o, fmt.Errorf("--kubeconfig-name: %w", err)
 		}
 	}
 	if o.set["lan"] {
 		lan, err := install.ParseLAN(o.lanRaw)
 		if err != nil {
-			return installFlags{}, fmt.Errorf("--lan: %w", err)
+			return o, fmt.Errorf("--lan: %w", err)
 		}
 		o.lan = lan
 	}
 	o.nodePortAddresses = strings.TrimSpace(o.nodePortAddresses) // whitespace-only clears, like ""
 	if err := validateNodePortAddresses(o.nodePortAddresses); err != nil {
-		return installFlags{}, err
+		return o, err
 	}
 	if err := o.validateRole(); err != nil {
-		return installFlags{}, err
+		return o, err
 	}
 	if err := o.validateFromStaging(); err != nil {
-		return installFlags{}, err
+		return o, err
 	}
 	if err := o.validateEtcdSnapshotFlags(); err != nil {
-		return installFlags{}, err
+		return o, err
 	}
 	return o, nil
 }
