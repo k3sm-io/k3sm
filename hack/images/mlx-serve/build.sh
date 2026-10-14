@@ -62,6 +62,8 @@ HF_HOME_PATH="/models"
 # mlx_lm.server, which the engine's closure already carries.
 SHARD_MODULE="k3sm_shard"
 
+# The tag this script builds and pushes. A build output has no digest until it is built,
+# so it stays a tag here; consumers pin the digest the registry reports for it.
 DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.4.1"
 
 # ---- options ----------------------------------------------------------------

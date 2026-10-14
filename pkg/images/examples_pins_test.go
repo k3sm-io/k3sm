@@ -32,12 +32,7 @@ import (
 // each with the reason. An entry is a visible gap, not a waiver: the test fails when an
 // entry matches nothing or when the reference it names has since been pinned, so the list
 // can only shrink by deleting lines.
-var unpinnedAllowed = map[string]string{
-	// The registry does not serve this package to an anonymous pull, so its digest could
-	// not be read from the registry and is not invented here. Pin it to the digest the
-	// registry reports once the package is publicly readable.
-	"ghcr.io/k3sm-io/mlx-serve:0.4.1": "digest not readable anonymously from ghcr.io",
-}
+var unpinnedAllowed = map[string]string{}
 
 // expectedRepos are the references the scan must find. They make the test non-vacuous in
 // a stronger sense than "found at least one": a scanner that silently stops matching a
