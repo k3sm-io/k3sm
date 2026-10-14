@@ -65,13 +65,18 @@
 #      file over both; then the tarball is extracted into a private directory
 #      and every file in it is checked against PAYLOAD-SHA256, so the bytes that
 #      ship are the bytes that were verified
-#   6. the stage tree is checked against PAYLOAD-SHA256 once more, then
+#   6. immediately before the draft, every file about to be uploaded is
+#      checked again: the stage tree and the tarball against PAYLOAD-SHA256,
+#      the tarball's SHA-256 against the one step 5 checked (the seal's under
+#      --upload), the disk image copy against the hash taken at its checks,
+#      and the checksums file against all of them; then
 #      gh release create <tag> --draft --verify-tag with those assets
 #      (--prerelease for an -rc.N tag)
 #   7. read the draft back (gh release view --json) and check it: still a draft,
 #      exactly the expected asset names, each fully uploaded, with the local
 #      size and SHA-256 (the asset digest GitHub reports, or a download when it
-#      reports none)
+#      reports none), and the tarball's and image's digests also equal the
+#      hashes checked before the upload
 #   8. only then promote: gh release edit <tag> --draft=false, with --latest
 #      for a final version and --latest=false for a release candidate
 #
@@ -96,18 +101,20 @@
 # and manifest assets. An unsigned rehearsal tree, or a tree edited in step
 # with its manifest, therefore never reaches gh.
 #
-# THE DISK IMAGE (--upload --disk-image). The file is copied into the assets
-# directory and that copy is what is checked, hashed and uploaded:
+# THE DISK IMAGE (--upload --disk-image). The file is copied, mode 0444, into
+# a private 0700 directory, <stage-dir>.assets/disk-image, and that copy is
+# what is checked, hashed once, re-hashed right before the draft, and uploaded:
 #   - its basename is exactly k3sm_<version>_darwin_arm64.dmg, checked before
 #     anything else (no other extra asset is accepted, and --disk-image is
 #     given at most once)
-#   - xcrun stapler validate, and spctl -a -t open
+#   - codesign --verify --strict against the Developer ID Application
+#     requirement for the Team ID, xcrun stapler validate, and spctl -a -t open
 #     --context context:primary-signature, accept the image
-#   - hdiutil attach -readonly -nobrowse at a private mount point, detached on
-#     every exit; the image root holds only k3sm.app, an Applications
-#     symlink to /Applications, and at most a .fseventsd directory (the
-#     filesystem metadata an APFS image can carry); any other entry, hidden
-#     or not, refuses
+#   - hdiutil attach -readonly -nobrowse -noautoopen at a private mount point,
+#     detached on every exit (EXIT, HUP, INT, TERM); the image root holds only
+#     k3sm.app, an Applications symlink to /Applications, and at most a
+#     .fseventsd directory (the filesystem metadata an APFS image can carry);
+#     any other entry, hidden or not, refuses
 #   - k3sm.app/Contents/Resources/payload holds exactly the files
 #     PAYLOAD-SHA256 lists, with its hashes, and the manifest itself, unchanged
 #     (no .DS_Store, no symlink)
@@ -270,6 +277,14 @@ package_assets() {
 	fi
 }
 
+# The disk image's private directory under the assets (0700, the image 0444).
+IMAGE_DIR_NAME=disk-image
+
+# asset_path <assetdir> <tag> <name>: the local file behind an asset name.
+asset_path() {
+	if [ "$3" = "$(image_name "$2")" ]; then printf '%s/%s/%s' "$1" "$IMAGE_DIR_NAME" "$3"; else printf '%s/%s' "$1" "$3"; fi
+}
+
 # expected_assets <tag> <assetdir>: the asset names a complete draft carries,
 # read from the local checksums file, plus that file itself.
 expected_assets() {
@@ -279,11 +294,14 @@ expected_assets() {
 	{ sed 's/^[0-9a-f]*  //' "$sums"; checksums_name "$1"; echo; } | sed '/^$/d' | LC_ALL=C sort
 }
 
-# verify_draft <tag> <repo> <assetdir>: zero only when the release is still a
-# draft and its assets are exactly the local ones, fully uploaded, byte for byte.
+# verify_draft <tag> <repo> <assetdir> [tarball-sha256] [image-sha256]: zero
+# only when the release is still a draft and its assets are exactly the local
+# ones, fully uploaded, byte for byte. A given tarball or image hash (the
+# sealed one, the one computed at the image's check) must also equal the
+# read-back digest, so a local file swapped after it was checked is caught too.
 # Prints every problem it finds.
 verify_draft() {
-	local tag="$1" repo="$2" dir="$3" json want got n problems=0 state size digest local_sum tmp
+	local tag="$1" repo="$2" dir="$3" tsha="${4:-}" isha="${5:-}" json want got n problems=0 state size digest local_sum tmp f pinned
 	json="$(gh release view "$tag" --repo "$repo" --json isDraft,assets)" || { echo "    cannot read the release $tag"; return 1; }
 	jq -e 'type == "object" and (.assets | type == "array")' >/dev/null 2>&1 <<<"$json" ||
 		{ echo "    the release JSON is not readable"; return 1; }
@@ -302,9 +320,10 @@ verify_draft() {
 		state="$(jq -r --arg n "$n" 'first(.assets[] | select(.name == $n)) | .state // ""' <<<"$json")"
 		size="$(jq -r --arg n "$n" 'first(.assets[] | select(.name == $n)) | .size // ""' <<<"$json")"
 		digest="$(jq -r --arg n "$n" 'first(.assets[] | select(.name == $n)) | .digest // ""' <<<"$json")"
-		local_sum="sha256:$(shasum -a 256 "$dir/$n" | cut -d' ' -f1)"
+		f="$(asset_path "$dir" "$tag" "$n")"
+		local_sum="sha256:$(shasum -a 256 "$f" | cut -d' ' -f1)"
 		[ "$state" = "uploaded" ] || { echo "    $n: upload state '$state', not uploaded"; problems=1; }
-		[ "$size" = "$(stat -f %z "$dir/$n")" ] || { echo "    $n: size $size differs from the local file"; problems=1; }
+		[ "$size" = "$(stat -f %z "$f")" ] || { echo "    $n: size $size differs from the local file"; problems=1; }
 		if [ -z "$digest" ]; then
 			if gh release download "$tag" --repo "$repo" --pattern "$n" --dir "$tmp" >/dev/null 2>&1 && [ -f "$tmp/$n" ]; then
 				digest="sha256:$(shasum -a 256 "$tmp/$n" | cut -d' ' -f1)"
@@ -313,15 +332,22 @@ verify_draft() {
 			fi
 		fi
 		[ "$digest" = "$local_sum" ] || { echo "    $n: digest $digest differs from the local $local_sum"; problems=1; }
+		pinned=""
+		[ "$n" = "$(asset_base "$tag").tar.gz" ] && pinned="$tsha"
+		[ "$n" = "$(image_name "$tag")" ] && pinned="$isha"
+		if [ -n "$pinned" ] && [ "$digest" != "sha256:$pinned" ]; then
+			echo "    $n: digest $digest differs from the checked sha256:$pinned"; problems=1
+		fi
 	done <<<"$want"
 	rm -rf "$tmp"
 	return "$problems"
 }
 
-# promote <tag> <repo> <assetdir>: publish the draft, only if verify_draft passes.
+# promote <tag> <repo> <assetdir> [tarball-sha256] [image-sha256]: publish the
+# draft, only if verify_draft passes.
 promote() {
-	local tag="$1" repo="$2" dir="$3" out
-	if ! out="$(verify_draft "$tag" "$repo" "$dir")"; then
+	local tag="$1" repo="$2" dir="$3" tsha="${4:-}" isha="${5:-}" out
+	if ! out="$(verify_draft "$tag" "$repo" "$dir" "$tsha" "$isha")"; then
 		printf '%s\n' "$out" >&2
 		refuse draft-unverified \
 			"the draft release $tag does not match the staged assets; it was NOT promoted." \
@@ -335,22 +361,44 @@ promote() {
 	gh release edit "$tag" --repo "$repo" --draft=false "$latest" || die "promoting $tag failed; the verified draft is still in place"
 }
 
-# upload <tag> <repo> <notes> <assetdir> <stage-tree> [asset-count]: re-check
-# the stage tree against its manifest, create the draft, then promote. The
-# count is 3 (tarball, manifest, checksums) or 4 with the disk image.
+# upload <tag> <repo> <notes> <assetdir> <stage-tree> <tarball-sha256>
+# [image-sha256]: immediately before the draft is created, re-check every file
+# about to be uploaded: the stage tree and the tarball against PAYLOAD-SHA256,
+# the tarball against the expected hash (the seal's under --upload), the image
+# copy against the hash taken when it was checked, and the checksums file
+# against all of them. Then create the draft and promote. Three assets
+# (tarball, manifest, checksums), or four with the image.
 upload() {
-	local tag="$1" repo="$2" notes="$3" dir="$4" tree="$5" count="${6:-3}" names=() n problems pre=()
+	local tag="$1" repo="$2" notes="$3" dir="$4" tree="$5" tsha="$6" isha="${7:-}" count=3 names=() n problems pre=() base img
+	base="$(asset_base "$tag")"
+	[ -n "$tsha" ] || die "upload needs the expected tarball hash"
+	[ -z "$isha" ] || count=4
 	if ! problems="$(tree_manifest_problems "$tree" "$tree/PAYLOAD-SHA256")"; then
 		printf '%s\n' "$problems" >&2
 		refuse tree-changed "the stage tree no longer matches its PAYLOAD-SHA256; nothing was uploaded."
 	fi
-	while IFS= read -r n; do names+=("$dir/$n"); done < <(expected_assets "$tag" "$dir")
+	if ! problems="$(tarball_problems "$dir/$base.tar.gz" "$tree/PAYLOAD-SHA256")"; then
+		printf '%s\n' "$problems" >&2
+		refuse tarball-mismatch "the tarball does not hold exactly the verified tree; nothing was uploaded."
+	fi
+	[ "$(sha256_of "$dir/$base.tar.gz")" = "$tsha" ] ||
+		refuse tarball-changed "the tarball is not the one that was verified (sha256 $tsha); nothing was uploaded."
+	if [ -n "$isha" ]; then
+		img="$(asset_path "$dir" "$tag" "$(image_name "$tag")")"
+		[ -f "$img" ] && [ ! -L "$img" ] && [ "$(sha256_of "$img")" = "$isha" ] ||
+			refuse image-changed "the disk image changed after its checks (sha256 $isha); nothing was uploaded."
+	fi
+	if ! problems="$(checksums_problems "$tag" "$dir" "$isha")"; then
+		printf '%s\n' "$problems" >&2
+		refuse checksums "the checksums file or the assets directory changed after the checks; nothing was uploaded."
+	fi
+	while IFS= read -r n; do names+=("$(asset_path "$dir" "$tag" "$n")"); done < <(expected_assets "$tag" "$dir")
 	[ "${#names[@]}" -eq "$count" ] || die "expected $count assets in $dir, the checksums file names ${#names[@]}"
 	is_rc "$tag" && pre=(--prerelease)
 	echo "==> create the draft release $tag on $repo"
 	gh release create "$tag" --repo "$repo" --draft ${pre[@]+"${pre[@]}"} --verify-tag --title "$tag" --notes-file "$notes" "${names[@]}" ||
 		die "creating the draft failed; any partial draft is left unpublished for inspection"
-	promote "$tag" "$repo" "$dir"
+	promote "$tag" "$repo" "$dir" "$tsha" "$isha"
 }
 
 # ---- the two phases: --through-verify seals, --upload checks ---------------------
@@ -399,40 +447,46 @@ seal_problems() {
 }
 seal_value() { sed -n "s/^$2=//p" "$1"; }
 
-# checksums_problems <tag> <assetdir>: zero when the checksums file holds
-# exactly the lines shasum writes for the tarball and manifest assets now,
-# plus at most one line for the disk image name (left by an earlier --upload
-# and recomputed by this one), and the directory holds nothing but those
-# assets.
+# checksums_problems <tag> <assetdir> [image-sha256]: zero when the checksums
+# file holds exactly the lines shasum writes for the tarball and manifest
+# assets now, followed, when an image hash is given, by exactly that image's
+# line; and the directory holds nothing but those assets (the image only in
+# its private directory, and only when a hash is given).
 checksums_problems() {
-	local tag="$1" dir="$2" base sums img want got extra
+	local tag="$1" dir="$2" isha="${3:-}" base sums img want got extra allowed
 	base="$(asset_base "$tag")"
 	sums="$(checksums_name "$tag")"
 	img="$(image_name "$tag")"
 	[ -f "$dir/$sums" ] || { echo "    no checksums file $dir/$sums"; return 1; }
 	want="$(cd "$dir" && shasum -a 256 "$base.tar.gz" "$base.PAYLOAD-SHA256" 2>/dev/null)" ||
 		{ echo "    the tarball or manifest asset is missing from $dir"; return 1; }
-	got="$(awk -v f="$img" '$2 != f' "$dir/$sums")"
+	[ -z "$isha" ] || want="$want"$'\n'"$isha  $img"
+	got="$(cat "$dir/$sums")"
 	if [ "$want" != "$got" ]; then
-		echo "    $sums does not hold exactly the tarball and manifest lines:"
+		echo "    $sums does not hold exactly the expected lines:"
 		diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed -n 's/^\([<>]\)/      \1/p'
 		return 1
 	fi
-	[ "$(awk -v f="$img" '$2 == f' "$dir/$sums" | wc -l | tr -d ' ')" -le 1 ] ||
-		{ echo "    $sums lists $img more than once"; return 1; }
-	extra="$(cd "$dir" && find . -mindepth 1 | sed 's|^\./||' |
-		grep -vxF -e "$base.tar.gz" -e "$base.PAYLOAD-SHA256" -e "$sums" -e "$img" || true)"
+	allowed=(-e "$base.tar.gz" -e "$base.PAYLOAD-SHA256" -e "$sums")
+	[ -z "$isha" ] || allowed+=(-e "$IMAGE_DIR_NAME" -e "$IMAGE_DIR_NAME/$img")
+	extra="$(cd "$dir" && find . -mindepth 1 | sed 's|^\./||' | grep -vxF "${allowed[@]}" || true)"
 	[ -z "$extra" ] || { echo "    $dir holds files that are not release assets:"; printf '%s\n' "$extra" | sed 's/^/      /'; return 1; }
+	if [ -n "$isha" ] && { [ -L "$dir/$IMAGE_DIR_NAME" ] || [ ! -d "$dir/$IMAGE_DIR_NAME" ]; }; then
+		echo "    $dir/$IMAGE_DIR_NAME is not a directory"; return 1
+	fi
 }
 
-# reset_checksums <tag> <assetdir>: drop a disk image line and copy an earlier
-# --upload left, so the file again holds only the sealed two lines.
+# reset_checksums <tag> <assetdir>: drop any disk image line and image copy an
+# earlier --upload (or anyone else) left, so the file again holds only the
+# sealed two lines. An image reaches the upload only through --disk-image.
 reset_checksums() {
 	local tag="$1" dir="$2" sums img
 	sums="$dir/$(checksums_name "$tag")"
 	img="$(image_name "$tag")"
+	[ -f "$sums" ] || return 0
 	if ! { awk -v f="$img" '$2 != f' "$sums" >"$sums.tmp" && mv "$sums.tmp" "$sums"; }; then die "could not rewrite $sums"; fi
 	rm -f "$dir/$img"
+	rm -rf "${dir:?}/$IMAGE_DIR_NAME"
 }
 
 # verify_release <tree> <team>: stage.sh's Developer ID policy over the tree.
@@ -482,6 +536,9 @@ upload_checks() {
 		printf '%s\n' "$problems" >&2
 		refuse tarball-mismatch "the tarball does not hold exactly the verified tree; nothing was uploaded."
 	fi
+	# An image line or copy left by an earlier run is never trusted: dropped
+	# here, and only --disk-image adds one back, after its checks.
+	reset_checksums "$tag" "$dir"
 	if ! problems="$(checksums_problems "$tag" "$dir")"; then
 		printf '%s\n' "$problems" >&2
 		refuse checksums "the assets directory is not the one --through-verify packaged; nothing was uploaded."
@@ -500,6 +557,9 @@ developer_id_requirement() {
 # image_root_problems <mount> <tag> <team> <manifest>: the checks on the
 # mounted image's contents. Prints every problem.
 image_root_problems() {
+	# set -e is inert here by design: callers run this in a command
+	# substitution and test its status, so every check runs and reports, and
+	# each failure fails closed through rc.
 	local root="$1" tag="$2" team="$3" manifest="$4" app payload entries v rc=0
 	app="$root/k3sm.app"
 	entries="$(cd "$root" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | LC_ALL=C sort)"
@@ -556,46 +616,57 @@ detach_image() {
 
 # disk_image_problems <image> <tag> <team> <manifest>: the image-level checks,
 # then the contents mounted read-only at a private mount point. Call it only
-# inside a command substitution: it sets EXIT, INT and TERM traps that detach
-# the image, and those must not replace the caller's.
+# inside a command substitution: it sets EXIT, HUP, INT and TERM traps that
+# detach the image, and those must not replace the caller's.
 disk_image_problems() {
+	# set -e is inert here by design (the caller tests this function's status
+	# from a command substitution): every check runs, and each failure fails
+	# closed through rc.
 	local img="$1" tag="$2" team="$3" manifest="$4" rc=0
+	codesign --verify --strict -R="$(developer_id_requirement "$team")" "$img" >/dev/null 2>&1 ||
+		{ echo "    codesign --verify --strict rejects the image against the Developer ID requirement for $team"; rc=1; }
 	xcrun stapler validate "$img" >/dev/null 2>&1 || { echo "    stapler validate rejects the image"; rc=1; }
 	spctl -a -t open --context context:primary-signature "$img" >/dev/null 2>&1 ||
 		{ echo "    spctl -a -t open --context context:primary-signature rejects the image"; rc=1; }
 	IMAGE_MNT="$(mktemp -d)"
 	chmod 700 "$IMAGE_MNT"
 	trap detach_image EXIT
+	trap 'detach_image; exit 129' HUP
 	trap 'detach_image; exit 130' INT TERM
-	if hdiutil attach -readonly -nobrowse -mountpoint "$IMAGE_MNT" "$img" >/dev/null 2>&1; then
+	if hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$IMAGE_MNT" "$img" >/dev/null 2>&1; then
 		IMAGE_ATTACHED=1
 		image_root_problems "$IMAGE_MNT" "$tag" "$team" "$manifest" || rc=1
 	else
 		echo "    hdiutil cannot attach $img read-only"; rc=1
 	fi
 	detach_image
-	trap - EXIT INT TERM
+	trap - EXIT HUP INT TERM
 	return "$rc"
 }
 
-# add_disk_image <file> <tag> <team> <manifest> <assetdir>: copy the image into
-# the assets, check the copy, and append its checksums line.
+# add_disk_image <file> <tag> <team> <manifest> <assetdir>: copy the image,
+# mode 0444, into a private 0700 directory under the assets, run every check
+# on that copy, hash it once into IMAGE_SHA256, and append its checksums line.
+# upload re-hashes the same copy right before the draft and uploads exactly it.
+IMAGE_SHA256=""
 add_disk_image() {
-	local src="$1" tag="$2" team="$3" manifest="$4" dir="$5" name problems
+	local src="$1" tag="$2" team="$3" manifest="$4" dir="$5" name idir copy problems
 	name="$(image_name "$tag")"
 	check_image_name "$src" "$tag"
 	if [ -L "$src" ] || [ ! -f "$src" ]; then die "--disk-image $src is not a regular file"; fi
-	[ ! "$src" -ef "$dir/$name" ] || die "pass the disk image from outside $dir"
-	[ ! -e "$dir/$name" ] || die "$dir/$name already exists"
-	if ! { cp "$src" "$dir/$name.tmp" && mv "$dir/$name.tmp" "$dir/$name" && chmod 644 "$dir/$name"; }; then
-		die "could not copy the disk image into $dir"
+	idir="$dir/$IMAGE_DIR_NAME"
+	copy="$idir/$name"
+	[ ! -e "$idir" ] || die "$idir already exists"
+	if ! { mkdir -m 700 "$idir" && cp "$src" "$copy.tmp" && chmod 444 "$copy.tmp" && mv "$copy.tmp" "$copy"; }; then
+		die "could not copy the disk image into $idir"
 	fi
-	if ! problems="$(disk_image_problems "$dir/$name" "$tag" "$team" "$manifest")"; then
+	if ! problems="$(disk_image_problems "$copy" "$tag" "$team" "$manifest")"; then
 		printf '%s\n' "$problems" >&2
-		rm -f "$dir/$name"
+		rm -rf "$idir"
 		refuse image-unverified "the disk image failed its checks; nothing was uploaded."
 	fi
-	printf '%s  %s\n' "$(sha256_of "$dir/$name")" "$name" >>"$dir/$(checksums_name "$tag")" ||
+	IMAGE_SHA256="$(sha256_of "$copy")"
+	printf '%s  %s\n' "$IMAGE_SHA256" "$name" >>"$dir/$(checksums_name "$tag")" ||
 		die "could not append the disk image to the checksums file"
 }
 
@@ -610,19 +681,18 @@ check_image_name() {
 # run_upload <repo-dir> <ref> <tag> <team> <stage-tree> <repo> <notes> [image]:
 # the whole --upload phase. <ref> is refs/tags/<tag> outside the self-test.
 run_upload() {
-	local rdir="$1" ref="$2" tag="$3" team="$4" tree="$5" repo="$6" notes="$7" img="${8:-}" assets count=3
+	local rdir="$1" ref="$2" tag="$3" team="$4" tree="$5" repo="$6" notes="$7" img="${8:-}" assets
 	assets="$tree.assets"
 	[ -z "$img" ] || check_image_name "$img" "$tag"
 	echo "==> check the seal, the tag binding, the tree and the assets"
 	upload_checks "$rdir" "$ref" "$tag" "$team" "$tree" "$assets" "$tree.seal"
-	reset_checksums "$tag" "$assets"
+	IMAGE_SHA256=""
 	if [ -n "$img" ]; then
 		echo "==> check the disk image and add it to the assets"
 		add_disk_image "$img" "$tag" "$team" "$tree/PAYLOAD-SHA256" "$assets"
-		count=4
 	fi
 	echo "==> upload: draft, verify, promote"
-	upload "$tag" "$repo" "$notes" "$assets" "$tree" "$count"
+	upload "$tag" "$repo" "$notes" "$assets" "$tree" "$(seal_value "$tree.seal" tarball_sha256)" "$IMAGE_SHA256"
 }
 
 # ---- self-test ------------------------------------------------------------------
@@ -646,7 +716,8 @@ self_test() {
 	# Fakes: record argv and exit 97. gh answers `release view` from
 	# $FAKE_GH_VIEW and, with FAKE_GH_CREATE_OK=1, accepts `release create`.
 	# codesign --verify, xcrun stapler validate and spctl succeed only with
-	# FAKE_CODESIGN_VERIFY_OK, FAKE_STAPLER_OK and FAKE_SPCTL_OK set to 1.
+	# FAKE_CODESIGN_VERIFY_OK, FAKE_STAPLER_OK and FAKE_SPCTL_OK set to 1, and
+	# codesign only against a -R requirement naming its fake signer's team.
 	# hdiutil attach "mounts" an image file whose first line is
 	# `FIXTURE <dir>` by copying <dir> to the mount point; detach empties it.
 	mkdir "$T/fakes"
@@ -657,8 +728,15 @@ self_test() {
 	cat >"$T/fakes/codesign" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "codesign $*" >>"$FAKE_TOOL_LOG"
-[ "$1" = --verify ] && [ "${FAKE_CODESIGN_VERIFY_OK:-}" = 1 ] && exit 0
-exit 97
+{ [ "$1" = --verify ] && [ "${FAKE_CODESIGN_VERIFY_OK:-}" = 1 ]; } || exit 97
+# The fake signer's Team ID: FAKE_CODESIGN_TEAM, or FAKE_CODESIGN_IMAGE_TEAM
+# for a .dmg; a -R requirement naming another team fails as codesign does.
+signer="${FAKE_CODESIGN_TEAM:-ABCDE12345}"
+case "${!#}" in *.dmg) signer="${FAKE_CODESIGN_IMAGE_TEAM:-$signer}" ;; esac
+for a in "$@"; do
+	case "$a" in -R=*) [[ "$a" == *"subject.OU] = \"$signer\""* ]] || exit 3 ;; esac
+done
+exit 0
 EOF
 	cat >"$T/fakes/xcrun" <<'EOF'
 #!/usr/bin/env bash
@@ -858,7 +936,7 @@ EOF
 	printf 'notes\n' >"$T/notes.md"
 	: >"$log"
 	rc=0
-	out="$( (PATH="$FPATH" FAKE_GH_CREATE_OK=1 upload "$tag" "$repo" "$T/notes.md" "$T/late.assets" "$Q") 2>&1)" || rc=$?
+	out="$( (PATH="$FPATH" FAKE_GH_CREATE_OK=1 upload "$tag" "$repo" "$T/notes.md" "$T/late.assets" "$Q" "$(sha256_of "$T/late.assets/$(asset_base "$tag").tar.gz")") 2>&1)" || rc=$?
 	if [ "$rc" -ne 0 ] && grep -q "REFUSE: tree-changed" <<<"$out" && [ ! -s "$log" ]; then
 		ok "a stage tree changed after packaging refuses before any upload"
 	else
@@ -941,7 +1019,7 @@ EOF
 	draft_json() {
 		local d="$1" t="$2" n f=()
 		while IFS= read -r n; do
-			f+=("{\"name\":\"$n\",\"state\":\"uploaded\",\"size\":$(stat -f %z "$d/$n"),\"digest\":\"sha256:$(shasum -a 256 "$d/$n" | cut -d' ' -f1)\"}")
+			f+=("{\"name\":\"$n\",\"state\":\"uploaded\",\"size\":$(stat -f %z "$(asset_path "$d" "$t" "$n")"),\"digest\":\"sha256:$(shasum -a 256 "$(asset_path "$d" "$t" "$n")" | cut -d' ' -f1)\"}")
 		done < <(expected_assets "$t" "$d")
 		local IFS=,
 		jq -c "${3:-.}" <<<"{\"isDraft\":true,\"assets\":[${f[*]}]}"
@@ -981,7 +1059,7 @@ EOF
 		printf '%s\n' "$4" >"$T/view.json"
 		: >"$log"
 		rc=0
-		out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" FAKE_GH_CREATE_OK=1 FAKE_GH_EDIT_OK=1 upload "$2" "$repo" "$T/notes.md" "$3" "$P") 2>&1)" || rc=$?
+		out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" FAKE_GH_CREATE_OK=1 FAKE_GH_EDIT_OK=1 upload "$2" "$repo" "$T/notes.md" "$3" "$P" "$(sha256_of "$3/$(asset_base "$2").tar.gz")") 2>&1)" || rc=$?
 	}
 	# The full upload: the create succeeds, the draft read back is bad.
 	upload_case x "$tag" "$A" "$(draft_json "$A" "$tag" '.assets[0].digest = "sha256:0000"')"
@@ -1007,7 +1085,7 @@ EOF
 	fi
 	: >"$log"
 	rc=0
-	out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" upload "$tag" "$repo" "$T/notes.md" "$A" "$P") 2>&1)" || rc=$?
+	out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" upload "$tag" "$repo" "$T/notes.md" "$A" "$P" "$(sha256_of "$A/$(asset_base "$tag").tar.gz")") 2>&1)" || rc=$?
 	if [ "$rc" -ne 0 ] && [ "$(grep -c . "$log")" -eq 1 ] && grep -q '^gh release create' "$log"; then
 		ok "a failed create stops before any read-back or promote"
 	else
@@ -1089,7 +1167,12 @@ EOF
 	fresh; mk_image "$W/img" "$W/tree"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
 	up_promoted "control: --upload with a good image uploads four assets and promotes" 4
-	img="$W/tree.assets/$(image_name "$tag")"
+	img="$W/tree.assets/$IMAGE_DIR_NAME/$(image_name "$tag")"
+	if [ "$(stat -f %Lp "$W/tree.assets/$IMAGE_DIR_NAME")" = 700 ] && [ "$(stat -f %Lp "$img")" = 444 ]; then
+		ok "the image is checked and uploaded from a mode 0444 copy in a private 0700 directory"
+	else
+		bad "image copy modes: dir $(stat -f %Lp "$W/tree.assets/$IMAGE_DIR_NAME" 2>&1), file $(stat -f %Lp "$img" 2>&1)"
+	fi
 	if [ "$(grep -c . "$W/tree.assets/$(checksums_name "$tag")")" = 3 ] &&
 		grep -qx "$(sha256_of "$img")  $(image_name "$tag")" "$W/tree.assets/$(checksums_name "$tag")" &&
 		grep -qxF "$img" "$T/uploaded"; then
@@ -1097,17 +1180,18 @@ EOF
 	else
 		bad "image checksums line: $(tr '\n' ';' <"$W/tree.assets/$(checksums_name "$tag")")"
 	fi
-	mnt="$(sed -n 's/^hdiutil attach -readonly -nobrowse -mountpoint \([^ ]*\) .*/\1/p' "$log")"
-	if [ -n "$mnt" ] && grep -qx "hdiutil attach -readonly -nobrowse -mountpoint $mnt $img" "$log" &&
+	mnt="$(sed -n 's/^hdiutil attach -readonly -nobrowse -noautoopen -mountpoint \([^ ]*\) .*/\1/p' "$log")"
+	if [ -n "$mnt" ] && grep -qx "hdiutil attach -readonly -nobrowse -noautoopen -mountpoint $mnt $img" "$log" &&
 		grep -qx "hdiutil detach $mnt" "$log" && [ ! -e "$mnt" ]; then
-		ok "the image is attached read-only without browsing at a private mount point, then detached and removed"
+		ok "the image is attached read-only, -nobrowse -noautoopen, at a private mount point, then detached and removed"
 	else
 		bad "hdiutil calls (mnt=$mnt, log: $(tr '\n' ';' <"$log"))"
 	fi
 	if grep -qxF "codesign --verify --strict --deep -R=$(developer_id_requirement "$TEAM") $mnt/k3sm.app" "$log" &&
+		grep -qxF "codesign --verify --strict -R=$(developer_id_requirement "$TEAM") $img" "$log" &&
 		grep -qxF "xcrun stapler validate $mnt/k3sm.app" "$log" && grep -qxF "xcrun stapler validate $img" "$log" &&
 		grep -qxF "spctl -a -t open --context context:primary-signature $img" "$log"; then
-		ok "codesign checks the app against the Developer ID requirement for the Team ID; stapler and spctl check app and image"
+		ok "codesign checks app and image against the Developer ID requirement for the Team ID; stapler and spctl too"
 	else
 		bad "signature checks (log: $(tr '\n' ';' <"$log"))"
 	fi
@@ -1223,13 +1307,84 @@ EOF
 	rc_root_case "a release candidate's app carrying the -rc.N suffix refuses" "${rctag#v}" refuse
 	rc_root_case "a release candidate's app with another x.y.z refuses" 0.0.2 refuse
 
+	# ---- re-verified right before the irreversible step ----
+	# between <tree> <image|""> <mutation>: run upload_checks (and the image's
+	# checks) as run_upload does, then the mutation function (given the tree
+	# and the assets directory), then upload. Sets rc, out.
+	between_body() {
+		local tr="$1" a="$1.assets"
+		verify_release() { :; }
+		upload_checks "$G2" "$ref2" "$tag" "$TEAM" "$tr" "$a" "$tr.seal"
+		IMAGE_SHA256=""
+		[ -z "$2" ] || add_disk_image "$2" "$tag" "$TEAM" "$tr/PAYLOAD-SHA256" "$a"
+		"$3" "$tr" "$a"
+		upload "$tag" "$repo" "$T/notes.md" "$a" "$tr" "$(seal_value "$tr.seal" tarball_sha256)" "$IMAGE_SHA256"
+	}
+	between() {
+		: >"$log"; rm -f "$T/uploaded"
+		rc=0
+		out="$( (PATH="$FPATH" FAKE_GH_UPLOADED="$T/uploaded" FAKE_GH_CREATE_OK=1 FAKE_GH_EDIT_OK=1 \
+			FAKE_CODESIGN_VERIFY_OK=1 FAKE_STAPLER_OK=1 FAKE_SPCTL_OK=1 between_body "$@") 2>&1)" || rc=$?
+	}
+	# The swapped tarball holds the same verified tree (repacked after a touch,
+	# so its bytes differ) and the checksums file is rewritten to match it, so
+	# only the comparison with the sealed hash can catch it.
+	# shellcheck disable=SC2329 # invoked by name through between
+	swap_tarball() {
+		local b
+		b="$(asset_base "$tag")"
+		touch -t 200001010000 "$1/k3sm"
+		(cd "$1" && COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$2/$b.tar.gz" k3sm cp-payload PAYLOAD-SHA256 -C "$REPO_ROOT" LICENSE NOTICE)
+		(cd "$2" && shasum -a 256 "$b.tar.gz" "$b.PAYLOAD-SHA256" >"$(checksums_name "$tag")")
+	}
+	# shellcheck disable=SC2329 # invoked by name through between
+	change_image() {
+		local f
+		f="$2/$IMAGE_DIR_NAME/$(image_name "$tag")"
+		chmod u+w "$f"
+		printf 'x' >>"$f"
+	}
+	fresh
+	between "$W/tree" "" swap_tarball
+	up_refuses "a tarball swapped after the upload checks, with a matching checksums line, refuses before create" tarball-changed
+	fresh; mk_image "$W/img" "$W/tree"
+	between "$W/tree" "$W/img/out/$(image_name "$tag")" change_image
+	up_refuses "an image copy changed after its checks refuses before upload" image-changed
+	fresh; mk_image "$W/img" "$W/tree"
+	FAKE_CODESIGN_IMAGE_TEAM=ZYXWV98765 run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: image-unverified" <<<"$out" && grep -q "codesign --verify --strict rejects the image" <<<"$out" &&
+		! grep -q '^gh ' "$log"; then
+		ok "an image signed by another team refuses"
+	else
+		bad "image of another team (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	# The read-back digest is compared with the sealed tarball hash too, not
+	# only with the local file.
+	promote_seal_case() {
+		printf '%s\n' "$(draft_json "$A" "$tag")" >"$T/view.json"
+		: >"$log"; rc=0
+		out="$( (PATH="$FPATH" FAKE_GH_VIEW="$T/view.json" FAKE_GH_EDIT_OK=1 promote "$tag" "$repo" "$A" "$1") 2>&1)" || rc=$?
+	}
+	promote_seal_case "$(sha256_of "$A/$(asset_base "$tag").tar.gz")"
+	if [ "$rc" -eq 0 ] && grep -q '^gh release edit' "$log"; then ok "control: a read-back tarball digest equal to the sealed hash is promoted"; else
+		bad "read-back with the sealed hash (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	promote_seal_case "$(printf '0%.0s' $(seq 64))"
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: draft-unverified" <<<"$out" && grep -q "differs from the checked" <<<"$out" &&
+		! grep -q '^gh release edit' "$log"; then
+		ok "a read-back tarball digest that differs from the sealed hash refuses"
+	else
+		bad "read-back against the sealed hash (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	: >"$log"
+
 	# The one-shot run uploads three assets and never an image: its upload
-	# refuses a checksums file that names a fourth.
+	# refuses, before any gh call, a checksums file that names a fourth.
 	fresh; printf 'image\n' >"$W/tree.assets/$(image_name "$tag")"
 	(cd "$W/tree.assets" && shasum -a 256 "$(image_name "$tag")" >>"$(checksums_name "$tag")")
 	: >"$log"; rc=0
-	out="$( (PATH="$FPATH" FAKE_GH_CREATE_OK=1 upload "$tag" "$repo" "$T/notes.md" "$W/tree.assets" "$W/tree") 2>&1)" || rc=$?
-	if [ "$rc" -ne 0 ] && grep -q "expected 3 assets" <<<"$out" && ! grep -q '^gh ' "$log"; then
+	out="$( (PATH="$FPATH" FAKE_GH_CREATE_OK=1 upload "$tag" "$repo" "$T/notes.md" "$W/tree.assets" "$W/tree" "$(seal_value "$W/tree.seal" tarball_sha256)") 2>&1)" || rc=$?
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: checksums" <<<"$out" && ! grep -q '^gh ' "$log"; then
 		ok "the one-shot upload ships exactly three assets"
 	else
 		bad "one-shot asset count (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
@@ -1319,7 +1474,7 @@ EOF
 	fi
 
 	unset -f ok bad skip_attended on_pty no_tty expect_refusal draft_json promote_case mk_payload package_case ent_case gitf bind_case upload_case \
-		mk_sealed mk_image run_up up_refuses up_promoted fresh install_case rc_root_case
+		mk_sealed mk_image run_up up_refuses up_promoted fresh install_case rc_root_case between between_body swap_tarball change_image promote_seal_case
 	unset FAKE_TOOL_LOG
 	echo
 	echo "publish self-test: $passes passed, $fails failed, $skips skipped (attended only)"
@@ -1427,6 +1582,8 @@ got_version="$("$STAGE/k3sm" version | head -1 | awk '{print $2}')"
 
 echo "==> 5/6 package the assets into $ASSETS"
 package_assets "$STAGE" "$VERSION" "$ASSETS"
+# The tarball step 5 checked; upload refuses if the file is any other by then.
+TARBALL_SHA256="$(sha256_of "$ASSETS/$(asset_base "$VERSION").tar.gz")"
 
 if [ "$MODE" = through-verify ]; then
 	write_seal "$STAGE.seal" "$VERSION" "$HEAD_SHA" "$STAGE/PAYLOAD-SHA256" "$ASSETS/$(asset_base "$VERSION").tar.gz" "$TEAM_ID"
@@ -1437,5 +1594,5 @@ if [ "$MODE" = through-verify ]; then
 fi
 
 echo "==> 6/6 upload: draft, verify, promote"
-upload "$VERSION" "$REPO" "$NOTES" "$ASSETS" "$STAGE"
+upload "$VERSION" "$REPO" "$NOTES" "$ASSETS" "$STAGE" "$TARBALL_SHA256"
 echo "==> released $VERSION on $REPO"
