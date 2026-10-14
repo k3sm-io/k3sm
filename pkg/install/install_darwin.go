@@ -1263,14 +1263,33 @@ func (darwinSystem) RemoveTree(path string) error {
 // it is empty, it is the lock's name, and removing it would race the next
 // acquirer onto a different inode.
 func (darwinSystem) LockInstall(path string) (func() error, error) {
+	return flockNoWait(path, "the install lock", func() error {
+		return fmt.Errorf("%w (its lock is held at %s; wait for it to finish, or check for a stopped `k3sm install`)", ErrInstallInProgress, path)
+	})
+}
+
+// LockStaging takes the k3sm.app staging lock at path. It is LockInstall's
+// mechanism on a different file, and the copy-out takes the same lock with
+// lockf(1), which on macOS is an flock(2) on the same file, so the two
+// exclude each other.
+func (darwinSystem) LockStaging(path string) (func() error, error) {
+	return flockNoWait(path, "the staging lock", func() error {
+		return fmt.Errorf("%w (its lock is held at %s)", ErrStagingBusy, path)
+	})
+}
+
+// flockNoWait opens (creating) path and takes an exclusive flock on it without
+// waiting. busy builds the error for a lock another process holds. The lock
+// file is left on disk on release: see LockInstall.
+func flockNoWait(path, what string, busy func() error) (func() error, error) {
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, uint32(installLockMode))
 	if err != nil {
-		return nil, fmt.Errorf("open the install lock %s: %w", path, err)
+		return nil, fmt.Errorf("open %s %s: %w", what, path, err)
 	}
 	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = unix.Close(fd)
 		if errors.Is(err, unix.EWOULDBLOCK) {
-			return nil, fmt.Errorf("%w (its lock is held at %s; wait for it to finish, or check for a stopped `k3sm install`)", ErrInstallInProgress, path)
+			return nil, busy()
 		}
 		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}
@@ -1283,7 +1302,7 @@ func (darwinSystem) LockInstall(path string) (func() error, error) {
 			return fmt.Errorf("unlock %s: %w", path, err)
 		}
 		if err := unix.Close(fd); err != nil {
-			return fmt.Errorf("close the install lock %s: %w", path, err)
+			return fmt.Errorf("close %s %s: %w", what, path, err)
 		}
 		return nil
 	}, nil

@@ -89,8 +89,12 @@ func newStatusRunner(o statusOptions) statusRunner {
 			"agent":  install.AgentLogPath(),
 		},
 		logTargets: defaultLogTargets(role),
+		appPresent: func() bool { return fileExists(appBundlePath) },
 	}
 }
+
+// appBundlePath is where k3sm.app is installed.
+const appBundlePath = "/Applications/k3sm.app"
 
 // installedRole reports which node THIS Mac is installed as, read from the two
 // node-daemon plists on disk, plus whether it is installed at all.
