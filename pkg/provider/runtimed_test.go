@@ -53,6 +53,9 @@ type fakeRuntimeServer struct {
 	restartCalls int               // RestartContainer RPC invocations (M2.2 swap)
 	lastRestart  restartRecord     // args of the last RestartContainer RPC
 	restartErr   error             // when set, RestartContainer fails (the B26 retry path)
+	// restartResp, when set, is the response every RestartContainer answers: a
+	// typed refusal (a vm guest without the verb, a pod being stopped).
+	restartResp *runtimev1.RestartContainerResponse
 
 	// The StopContainer seam of the terminal postStart kill: a call tally, the
 	// last call's arguments, a transport error (stopErr, e.g. an old runtimed's
@@ -148,6 +151,14 @@ func (f *fakeRuntimeServer) setRestartErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.restartErr = err
+}
+
+// setRestartResp makes every subsequent RestartContainer RPC answer resp (nil
+// restores success), so a typed refusal reaches the restart worker.
+func (f *fakeRuntimeServer) setRestartResp(resp *runtimev1.RestartContainerResponse) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restartResp = resp
 }
 
 // restartRecord captures the arguments of a RestartContainer RPC so the probe
@@ -265,6 +276,9 @@ func (f *fakeRuntimeServer) RestartContainer(_ context.Context, req *runtimev1.R
 	f.lastRestart = restartRecord{podID: req.GetPodId(), container: req.GetContainer(), reason: req.GetReason()}
 	if f.restartErr != nil {
 		return nil, f.restartErr
+	}
+	if f.restartResp != nil {
+		return f.restartResp, nil
 	}
 	return &runtimev1.RestartContainerResponse{Status: &runtimev1.ContainerStatus{Name: req.GetContainer()}}, nil
 }

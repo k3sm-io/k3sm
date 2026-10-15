@@ -18,8 +18,12 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
@@ -180,6 +184,11 @@ type containerRestart struct {
 	// delay is the backoff wait of the in-flight (or most recent) re-exec — the
 	// value the CrashLoopBackOff message reports.
 	delay time.Duration
+	// refusal is the text of the last failed re-exec (runtimed's message, plus
+	// the remedy for a permanent refusal), appended to the CrashLoopBackOff
+	// message so a container that never restarts says why. Empty once a re-exec
+	// succeeds or the container is observed running.
+	refusal string
 	// lastTerm/hasLastTerm is the terminated state that triggered the restart,
 	// surfaced as lastState.terminated by the overlay. A liveness-driven restart
 	// has none at decision time (the container has not exited yet), so the
@@ -236,6 +245,7 @@ func (cr *containerRestart) endAttempt(gen uint64) {
 func (cr *containerRestart) observeRunning() {
 	cr.restarting = false
 	cr.hasLastTerm = false
+	cr.refusal = ""
 }
 
 // abort cancels any in-flight re-exec and closes the window — the pod is being
@@ -482,6 +492,14 @@ func (r *runtimedRuntime) startRestartWorkerLocked(t *podTrack, cr *containerRes
 // which is what keeps the CrashLoopBackOff surface and the Running phase hold stable
 // across the swap.
 //
+// A failed attempt is never silent: each one records the kubelet's Warning
+// Failed Event for a container that could not be started (msgFailedRestart) and
+// puts runtimed's text on the CrashLoopBackOff waiting message, so a container
+// whose restart runtimed refuses outright (a vm guest without the verb) shows
+// the cause and the remedy in `kubectl get` and `kubectl describe` instead of
+// only a restartCount that never moves. The backoff spaces the attempts, so it
+// spaces the Events too.
+//
 // The Warning BackOff Event is emitted only when the attempt actually waited
 // (delay > 0). A liveness kill on a container that is not already looping is
 // immediate by kubelet parity (restartForLiveness), and upstream surfaces that
@@ -506,6 +524,7 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 			// The container has been started again, so its postStart hook fires
 			// again: upstream runs the hook inside startContainer, which is
 			// the same path a restart takes.
+			r.clearRefusal(t, cr, gen)
 			r.rerunPostStart(t, podID, name)
 			return
 		}
@@ -514,7 +533,9 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 		}
 		r.log.Warn("container re-exec failed; retrying under the CrashLoopBackOff schedule",
 			"pod", podID, "container", name, "err", err)
-		next, ok := r.advanceBackoff(t, cr, gen)
+		refusal := restartFailureCause(name, err)
+		r.recordPodEvent(podID, podEvent{corev1.EventTypeWarning, reasonFailed, msgFailedRestart(name, refusal)})
+		next, ok := r.advanceBackoff(t, cr, gen, refusal)
 		if !ok {
 			return // the claim was aborted or superseded; this worker is stale
 		}
@@ -557,18 +578,85 @@ func (r *runtimedRuntime) finishAttempt(t *podTrack, cr *containerRestart, gen u
 	cr.endAttempt(gen)
 }
 
+// restartFailureCause is the cause a failed re-exec of container surfaces, in
+// the Failed Event (msgFailedRestart) and after the CrashLoopBackOff waiting
+// message: runtimed's own message, with the remedy for a permanent refusal, when
+// the RestartContainer call failed; the error itself otherwise (the
+// StartContainer arm of respawn).
+//
+// runtimed's message can carry text a vm guest wrote, so control characters are
+// stripped before it is rendered, and the message alone is cut so the whole
+// Event message fits the apiserver's Event message limit with the container
+// prefix and the remedy intact.
+func restartFailureCause(container string, err error) string {
+	message, suffix := err.Error(), ""
+	var f *restartFailure
+	if errors.As(err, &f) {
+		message = f.message
+		if f.unsupported {
+			suffix = " (" + msgRestartUnsupported + ")"
+		}
+	}
+	budget := maxEventMessageLen - len(msgFailedRestart(container, "")) - len(suffix)
+	return truncateText(stripControlKeepTab(message), budget) + suffix
+}
+
+// maxEventMessageLen is the apiserver's limit on an Event message, in bytes.
+const maxEventMessageLen = 1024
+
+// stripControlKeepTab drops the C0 control characters except tab, DEL and the C1
+// range, so text from a guest cannot inject terminal escapes or line breaks into
+// `kubectl describe` output.
+func stripControlKeepTab(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r != '\t' && unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// truncateText cuts s to at most n bytes on a rune boundary, marking a cut with
+// "...". When n leaves no room for the marker a cut yields "".
+func truncateText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	const marker = "..."
+	if n <= len(marker) {
+		return ""
+	}
+	cut := n - len(marker)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + marker
+}
+
+// clearRefusal drops the last failure's text once a re-exec succeeded, for the
+// worker that still holds claim gen.
+func (r *runtimedRuntime) clearRefusal(t *podTrack, cr *containerRestart, gen uint64) {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if cr.holdsAttempt(gen) {
+		cr.refusal = ""
+	}
+}
+
 // advanceBackoff advances the container's shared CrashLoopBackOff schedule after
-// a failed re-exec and publishes the new delay onto the bookkeeping the status
-// overlay renders, so a retried attempt surfaces its true back-off. It reports
+// a failed re-exec and publishes the new delay, and the failure's text, onto the
+// bookkeeping the status overlay renders, so a retried attempt surfaces its true
+// back-off and why the last one failed. It reports
 // false when the calling worker no longer holds the claim (aborted by DeletePod
 // / the terminal gate / a CreatePod replace, or superseded) — the worker then
 // stops rather than advancing a schedule it does not own.
-func (r *runtimedRuntime) advanceBackoff(t *podTrack, cr *containerRestart, gen uint64) (time.Duration, bool) {
+func (r *runtimedRuntime) advanceBackoff(t *podTrack, cr *containerRestart, gen uint64, refusal string) (time.Duration, bool) {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
 	if !cr.holdsAttempt(gen) {
 		return 0, false
 	}
+	cr.refusal = refusal
 	cr.delay = cr.backoff.Next()
 	return cr.delay, true
 }
@@ -655,10 +743,14 @@ func overlayCrashLoop(pod *corev1.Pod, cs []corev1.ContainerStatus, restarts map
 			cs[i].LastTerminationState = corev1.ContainerState{Terminated: &term}
 		}
 		if cr.delay > 0 {
+			msg := fmt.Sprintf("back-off %s restarting failed container=%s pod=%s_%s(%s)",
+				cr.delay, cs[i].Name, pod.Name, pod.Namespace, pod.UID)
+			if cr.refusal != "" {
+				msg += ": " + cr.refusal
+			}
 			cs[i].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
-				Reason: reasonCrashLoopBackOff,
-				Message: fmt.Sprintf("back-off %s restarting failed container=%s pod=%s_%s(%s)",
-					cr.delay, cs[i].Name, pod.Name, pod.Namespace, pod.UID),
+				Reason:  reasonCrashLoopBackOff,
+				Message: msg,
 			}}
 		}
 		cs[i].Ready = false

@@ -174,6 +174,15 @@ func msgBackOffRestarting(container string, pod *corev1.Pod) string {
 		container, pod.Name, pod.Namespace, pod.UID)
 }
 
+// msgFailedRestart is the Failed-event message for a container re-exec that
+// runtimed did not perform. It is the kubelet's shape for a container that
+// failed to start ("Error: " and the cause), naming the verb and the container,
+// with the failure's text (runtimed's message, plus the remedy for a permanent
+// refusal) as the cause.
+func msgFailedRestart(container, cause string) string {
+	return fmt.Sprintf("Error: restart container %s: %s", container, cause)
+}
+
 // msgFailedPullImage is the Failed-event message for an image that could not be
 // pulled. Unlike msgFailedStart it DOES carry the error text, and the reason is
 // the same one that lets msgFailedImagePlatform carry its own: this string is the

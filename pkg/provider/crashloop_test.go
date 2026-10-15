@@ -23,7 +23,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -739,4 +742,223 @@ func TestDeletePodCancelsRestartWorker(t *testing.T) {
 	}
 	clk.Step(600 * time.Second) // long past every back-off step
 	settleRestartCalls(t, f, 0)
+}
+
+// TestRefusedRestartIsVisible pins the surface of a re-exec runtimed refuses. A
+// refused restart never bumps restartCount, so without it a crash-looping
+// container shows restartCount 0 and an unexplained CrashLoopBackOff forever.
+// Every refused attempt must record the kubelet's Warning Failed Event and put
+// runtimed's text on the waiting message, the backoff must keep advancing (the
+// loop never gives up), and the permanent refusal (the typed UNSUPPORTED, or an
+// older daemon's Unimplemented) must name the remedy while a transient one
+// (NOT_UPDATABLE) must not.
+func TestRefusedRestartIsVisible(t *testing.T) {
+	const guestMsg = "restart c0: this pod's guest predates per-container restart; a recreated pod boots one that has it"
+	for _, tc := range []struct {
+		name       string
+		resp       *runtimev1.RestartContainerResponse
+		wantText   string
+		wantRemedy bool
+	}{
+		{
+			name: "a guest without the verb (FailedPrecondition + UNSUPPORTED)",
+			resp: &runtimev1.RestartContainerResponse{
+				Error:         &rpcstatus.Status{Code: int32(codes.FailedPrecondition), Message: guestMsg},
+				FailureReason: runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED,
+			},
+			wantText:   guestMsg,
+			wantRemedy: true,
+		},
+		{
+			name: "an older daemon (embedded Unimplemented)",
+			resp: &runtimev1.RestartContainerResponse{
+				Error:         &rpcstatus.Status{Code: int32(codes.Unimplemented), Message: "guest/v1 defines no per-container restart; recreate the pod"},
+				FailureReason: runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED,
+			},
+			wantText:   "guest/v1 defines no per-container restart; recreate the pod",
+			wantRemedy: true,
+		},
+		{
+			name: "a transient refusal (FailedPrecondition + NOT_UPDATABLE)",
+			resp: &runtimev1.RestartContainerResponse{
+				Error:         &rpcstatus.Status{Code: int32(codes.FailedPrecondition), Message: "container c0 has not started; use StartContainer"},
+				FailureReason: runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE,
+			},
+			wantText: "container c0 has not started; use StartContainer",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := crashPod("refused", corev1.RestartPolicyAlways)
+			r, f, clk, tr, rec := newCrashFake(t, pod)
+			f.setRestartResp(tc.resp)
+			crash := &runtimev1.PodStatus{
+				PodId:             string(pod.UID),
+				Phase:             runtimev1.PodPhase_POD_PHASE_FAILED,
+				ContainerStatuses: []*runtimev1.ContainerStatus{rtTerminatedFull("c0", 1, 0, time.Unix(5000, 0), time.Unix(6000, 0))},
+			}
+
+			r.buildStatus(pod.DeepCopy(), tr, crash, nil)
+			waitRestart(t, "backoff timer armed", clk.HasWaiters)
+			clk.Step(11 * time.Second)
+			waitRestart(t, "the first (refused) RestartContainer call", func() bool { n, _ := f.restartState(); return n == 1 })
+
+			wantSurface := tc.wantText
+			if tc.wantRemedy {
+				wantSurface += " (" + msgRestartUnsupported + ")"
+			}
+			wantEvent := corev1.EventTypeWarning + " " + reasonFailed + " Error: restart container c0: " + wantSurface
+			waitRestart(t, "the Failed Event", func() bool {
+				for {
+					select {
+					case e := <-rec.Events:
+						if e == wantEvent {
+							return true
+						}
+					default:
+						return false
+					}
+				}
+			})
+
+			// The loop never gives up: the refusal advanced the shared schedule.
+			waitRestart(t, "the retry rescheduled at the doubled back-off", func() bool {
+				tr.restartMu.Lock()
+				defer tr.restartMu.Unlock()
+				cr := tr.restarts["c0"]
+				return cr != nil && cr.delay == 20*time.Second
+			})
+
+			st := r.buildStatus(pod.DeepCopy(), tr, crash, nil)
+			cs := st.ContainerStatuses[0]
+			if cs.RestartCount != 0 {
+				t.Errorf("restartCount = %d, want runtimed's 0 (a refused restart bumps nothing)", cs.RestartCount)
+			}
+			w := cs.State.Waiting
+			if w == nil || w.Reason != reasonCrashLoopBackOff {
+				t.Fatalf("state = %+v, want Waiting{CrashLoopBackOff}", cs.State)
+			}
+			wantMsg := fmt.Sprintf("back-off 20s restarting failed container=c0 pod=%s_%s(%s): %s",
+				pod.Name, pod.Namespace, pod.UID, wantSurface)
+			if w.Message != wantMsg {
+				t.Errorf("waiting message = %q, want %q", w.Message, wantMsg)
+			}
+			if hasRemedy := strings.Contains(w.Message, "delete the pod"); hasRemedy != tc.wantRemedy {
+				t.Errorf("waiting message names the delete-the-pod remedy = %v, want %v", hasRemedy, tc.wantRemedy)
+			}
+
+			// A second refused attempt records a second Event: one per attempt.
+			waitRestart(t, "the retry timer armed", clk.HasWaiters)
+			clk.Step(21 * time.Second)
+			waitRestart(t, "the second (refused) RestartContainer call", func() bool { n, _ := f.restartState(); return n == 2 })
+			waitRestart(t, "the second Failed Event", func() bool {
+				for {
+					select {
+					case e := <-rec.Events:
+						if e == wantEvent {
+							return true
+						}
+					default:
+						return false
+					}
+				}
+			})
+
+			// Once runtimed restarts it, the refusal text is gone from the surface.
+			f.setRestartResp(nil)
+			clk.Step(60 * time.Second)
+			waitRestart(t, "the successful RestartContainer call", func() bool {
+				tr.restartMu.Lock()
+				defer tr.restartMu.Unlock()
+				cr := tr.restarts["c0"]
+				return cr != nil && !cr.attempt
+			})
+			st = r.buildStatus(pod.DeepCopy(), tr, crash, nil)
+			if w := st.ContainerStatuses[0].State.Waiting; w == nil || strings.Contains(w.Message, tc.wantText) {
+				t.Errorf("waiting after a successful re-exec = %+v, want CrashLoopBackOff without the refusal", st.ContainerStatuses[0].State)
+			}
+		})
+	}
+}
+
+// TestIsUnsupportedRefusal pins the one classification of a permanent refusal
+// both per-container kill verbs share: the typed reason or the embedded
+// Unimplemented, never any other code.
+func TestIsUnsupportedRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		code   codes.Code
+		reason runtimev1.FailureReason
+		want   bool
+	}{
+		{"a guest without the verb", codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED, true},
+		{"an older daemon", codes.Unimplemented, runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED, true},
+		{"embedded Unimplemented without a reason", codes.Unimplemented, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, true},
+		{"UNSUPPORTED without a code", codes.OK, runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED, true},
+		{"a container that never started", codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE, false},
+		{"a pod being stopped", codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, false},
+		{"an unknown container", codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, false},
+		{"no refusal", codes.OK, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isUnsupportedRefusal(int32(tc.code), tc.reason); got != tc.want {
+				t.Errorf("isUnsupportedRefusal(%s, %s) = %v, want %v", tc.code, tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRefusedRestartCauseIsSanitizedAndBounded pins what reaches the Event and
+// the waiting message from runtimed's refusal text, which can embed text a
+// guest wrote: control characters (C0 except tab, DEL, C1) are stripped, and a
+// long cause is cut so the whole Event message stays within the apiserver's
+// Event message limit with the container prefix and the remedy kept.
+func TestRefusedRestartCauseIsSanitizedAndBounded(t *testing.T) {
+	refusal := func(msg string, unsupported bool) error {
+		return &restartFailure{podID: "p", container: "c0", message: msg, refused: true, unsupported: unsupported}
+	}
+
+	t.Run("control characters are stripped, tab kept", func(t *testing.T) {
+		got := restartFailureCause("c0", refusal("guest\x1b[31m said\r\nno\tthanks\x7f\u0085\u009b2J", false))
+		if want := "guest[31m saidno\tthanks2J"; got != want {
+			t.Errorf("cause = %q, want %q", got, want)
+		}
+	})
+
+	for _, unsupported := range []bool{false, true} {
+		t.Run(fmt.Sprintf("a 2000-byte cause is bounded (unsupported=%v)", unsupported), func(t *testing.T) {
+			name := strings.Repeat("n", 63) // the longest container name
+			cause := restartFailureCause(name, refusal(strings.Repeat("é", 1000), unsupported))
+			msg := msgFailedRestart(name, cause)
+			if len(msg) > maxEventMessageLen {
+				t.Errorf("Event message is %d bytes, want at most %d", len(msg), maxEventMessageLen)
+			}
+			if len(msg) < maxEventMessageLen-4 {
+				t.Errorf("Event message is %d bytes, want the cut to use the budget", len(msg))
+			}
+			if !strings.HasPrefix(msg, "Error: restart container "+name+": ") {
+				t.Errorf("Event message lost its container prefix: %q", msg[:64])
+			}
+			if !utf8.ValidString(msg) {
+				t.Error("the cut split a rune")
+			}
+			if !strings.Contains(msg, "...") {
+				t.Error("the cut is not marked")
+			}
+			if remedy := strings.HasSuffix(msg, " ("+msgRestartUnsupported+")"); remedy != unsupported {
+				t.Errorf("Event message ends with the remedy = %v, want %v", remedy, unsupported)
+			}
+		})
+	}
+
+	t.Run("a short cause is untouched", func(t *testing.T) {
+		if got := restartFailureCause("c0", refusal("pod is stopping", false)); got != "pod is stopping" {
+			t.Errorf("cause = %q", got)
+		}
+	})
+
+	t.Run("a non-refusal error is sanitized too", func(t *testing.T) {
+		if got := restartFailureCause("c0", errors.New("start\nfailed")); got != "startfailed" {
+			t.Errorf("cause = %q", got)
+		}
+	})
 }
