@@ -557,9 +557,17 @@ node to a `vm` Pod's pod IP go through a relay on its node; see
 A `vm` Pod's kernel hostname follows the kubelet rules: `spec.hostnameOverride` when present, else
 `spec.hostname`, else the Pod name, with `spec.subdomain` and `setHostnameAsFQDN` shaping the name
 when `hostnameOverride` is unset. Every container in the Pod reads it from `/etc/hostname` and from
-`hostname`. Two gaps remain in `vm` Pods: the guest `/etc/hosts` carries the short name but no FQDN
-alias, and `HOSTNAME` is not set in the container environment. The `container-vm` RuntimeClass does
-not honour the field yet. The 63-character truncation of a long name, and the refusal of a Pod whose
+`hostname`. `HOSTNAME` is set to the same name in every container's environment, beneath the image's
+own environment, so a value from the image or from the Pod spec wins. The `container-vm` RuntimeClass
+does not honour the field yet.
+
+The guest `/etc/hosts` does not list the Pod's own name yet, so a lookup of that name from inside a
+`vm` Pod goes to the cluster DNS, which has no record for a bare Pod name. The next guest image adds
+the line, with two differences from the kubelet's file. The line maps the name to the guest's own
+address on the node's NAT segment, not to the Pod IP the cluster DNS returns, and keeps that address
+if the guest's lease ever changes. And for a Pod with `spec.subdomain` (and no `hostnameOverride`),
+the FQDN `<hostname>.<subdomain>.<namespace>.svc.<cluster domain>` is listed before the short name,
+as the kubelet lists it. The 63-character truncation of a long name, and the refusal of a Pod whose
 name would exceed 64 characters, apply to `vm` Pods only.
 
 A native Pod is a host process, and macOS has no per-process hostname. Inside a native Pod,

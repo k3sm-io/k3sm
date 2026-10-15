@@ -55,10 +55,26 @@ func (e *podHostnameError) Error() string { return e.err.Error() }
 
 func (e *podHostnameError) Unwrap() error { return e.err }
 
-// podHostname returns the kernel hostname for pod: the value PodBox.hostname
-// carries. It is THE SINGLE DERIVATION SITE: no other module derives a pod
-// hostname, and a consumer (runtimed, the vm guest, any future /etc/hosts or
-// HOSTNAME work) reads PodBox.hostname rather than re-deriving it.
+// podNames is what podHostname derives for one pod.
+type podNames struct {
+	// hostname is the kernel hostname, the value PodBox.hostname carries.
+	hostname string
+	// fqdn is the value PodBox.pod_fqdn carries; see podHostname.
+	fqdn string
+	// truncated reports that hostname was cut to 63 characters.
+	truncated bool
+	// fqdnSkipped, when non-empty, says why a pod with a kubelet domain got no
+	// fqdn, and fqdnLen is the length of the name that was not used. The
+	// caller logs it where the name is observable; it never refuses the pod.
+	fqdnSkipped string
+	fqdnLen     int
+}
+
+// podHostname returns the kernel hostname for pod (the value PodBox.hostname
+// carries) and the pod's FQDN (the value PodBox.pod_fqdn carries). It is THE
+// SINGLE DERIVATION SITE: no other module derives a pod hostname or FQDN, and a
+// consumer (runtimed, the vm guest's /etc/hosts, HOSTNAME) reads the box fields
+// rather than re-deriving them.
 //
 // The rules, in the kubelet's order:
 //  1. A hostNetwork pod gets "" (the kubelet sets no sandbox hostname for it),
@@ -72,54 +88,78 @@ func (e *podHostnameError) Unwrap() error { return e.err }
 //     <subdomain>.<namespace>.svc.<clusterDomain>; with setHostnameAsFQDN the
 //     result is <hostname>.<domain>, refused above 64 characters.
 //
+// fqdn is <short>.<domain>, the name the kubelet's managed /etc/hosts lists
+// before the short name, where short is the (truncated) hostname before
+// setHostnameAsFQDN applies, so under setHostnameAsFQDN a non-empty fqdn and
+// hostname are the same string. It is "" whenever the kubelet's domain is empty
+// (hostNetwork, an override, no subdomain). The kubelet applies no length check
+// to it outside setHostnameAsFQDN, so a name it would still write is never a
+// derivation error here: an empty clusterDomain (which would give a
+// trailing-dot name) or a result that is not a DNS-1123 subdomain (longer than
+// 253 bytes) leaves fqdn "" and sets fqdnSkipped, and hostname is unaffected.
+//
 // truncated reports that the name was cut to 63 characters, so the caller can
 // log it at the level its backend warrants; it is never raised as an Event,
 // matching upstream.
-func podHostname(pod *corev1.Pod, clusterDomain string) (hostname string, truncated bool, err error) {
+func podHostname(pod *corev1.Pod, clusterDomain string) (podNames, error) {
 	if pod.Spec.HostNetwork {
-		return "", false, nil
+		return podNames{}, nil
 	}
 	if pod.Spec.HostnameOverride != nil {
 		override := *pod.Spec.HostnameOverride
 		if msgs := validation.IsDNS1123Subdomain(override); len(msgs) != 0 {
-			return "", false, &podHostnameError{field: "spec.hostnameOverride", length: len(override),
+			return podNames{}, &podHostnameError{field: "spec.hostnameOverride", length: len(override),
 				err: fmt.Errorf("pod HostnameOverride %q is not a valid DNS subdomain: %s", override, strings.Join(msgs, ";"))}
 		}
-		return truncatePodHostname(pod, "spec.hostnameOverride", override)
+		hostname, truncated, err := truncatePodHostname(pod, "spec.hostnameOverride", override)
+		if err != nil {
+			return podNames{}, err
+		}
+		return podNames{hostname: hostname, truncated: truncated}, nil
 	}
 
 	field := "metadata.name"
-	hostname = pod.Name
+	hostname := pod.Name
 	if len(pod.Spec.Hostname) > 0 {
 		if msgs := validation.IsDNS1123Label(pod.Spec.Hostname); len(msgs) != 0 {
-			return "", false, &podHostnameError{field: "spec.hostname", length: len(pod.Spec.Hostname),
+			return podNames{}, &podHostnameError{field: "spec.hostname", length: len(pod.Spec.Hostname),
 				err: fmt.Errorf("pod Hostname %q is not a valid DNS label: %s", pod.Spec.Hostname, strings.Join(msgs, ";"))}
 		}
 		field, hostname = "spec.hostname", pod.Spec.Hostname
 	}
-	hostname, truncated, err = truncatePodHostname(pod, field, hostname)
+	hostname, truncated, err := truncatePodHostname(pod, field, hostname)
 	if err != nil {
-		return "", false, err
+		return podNames{}, err
+	}
+	n := podNames{hostname: hostname, truncated: truncated}
+
+	if len(pod.Spec.Subdomain) == 0 {
+		return n, nil
+	}
+	if msgs := validation.IsDNS1123Label(pod.Spec.Subdomain); len(msgs) != 0 {
+		return podNames{}, &podHostnameError{field: "spec.subdomain", length: len(pod.Spec.Subdomain),
+			err: fmt.Errorf("pod Subdomain %q is not a valid DNS label: %s", pod.Spec.Subdomain, strings.Join(msgs, ";"))}
+	}
+	domain := fmt.Sprintf("%s.%s.svc.%s", pod.Spec.Subdomain, pod.Namespace, clusterDomain)
+	composed := fmt.Sprintf("%s.%s", hostname, domain)
+	switch {
+	case clusterDomain == "":
+		n.fqdnSkipped, n.fqdnLen = "no cluster domain configured", len(composed)
+	case len(validation.IsDNS1123Subdomain(composed)) != 0:
+		n.fqdnSkipped, n.fqdnLen = "the pod FQDN is not a valid DNS subdomain", len(composed)
+	default:
+		n.fqdn = composed
 	}
 
-	domain := ""
-	if len(pod.Spec.Subdomain) > 0 {
-		if msgs := validation.IsDNS1123Label(pod.Spec.Subdomain); len(msgs) != 0 {
-			return "", false, &podHostnameError{field: "spec.subdomain", length: len(pod.Spec.Subdomain),
-				err: fmt.Errorf("pod Subdomain %q is not a valid DNS label: %s", pod.Spec.Subdomain, strings.Join(msgs, ";"))}
-		}
-		domain = fmt.Sprintf("%s.%s.svc.%s", pod.Spec.Subdomain, pod.Namespace, clusterDomain)
+	if pod.Spec.SetHostnameAsFQDN == nil || !*pod.Spec.SetHostnameAsFQDN {
+		return n, nil
 	}
-
-	if domain == "" || pod.Spec.SetHostnameAsFQDN == nil || !*pod.Spec.SetHostnameAsFQDN {
-		return hostname, truncated, nil
+	if len(composed) > podFQDNMaxLen {
+		return podNames{}, &podHostnameError{field: "spec.setHostnameAsFQDN", length: len(composed),
+			err: fmt.Errorf("failed to construct FQDN from pod hostname and cluster domain, FQDN %s is too long (%d characters is the max, %d characters requested)", composed, podFQDNMaxLen, len(composed))}
 	}
-	fqdn := fmt.Sprintf("%s.%s", hostname, domain)
-	if len(fqdn) > podFQDNMaxLen {
-		return "", false, &podHostnameError{field: "spec.setHostnameAsFQDN", length: len(fqdn),
-			err: fmt.Errorf("failed to construct FQDN from pod hostname and cluster domain, FQDN %s is too long (%d characters is the max, %d characters requested)", fqdn, podFQDNMaxLen, len(fqdn))}
-	}
-	return fqdn, truncated, nil
+	n.hostname = composed
+	return n, nil
 }
 
 // truncatePodHostname cuts hostname to 63 characters and trims a trailing '-'
