@@ -7,7 +7,7 @@ node out of a cluster without uninstalling it. All three verbs need root.
 | Command | What it does |
 |---|---|
 | `sudo k3sm stop` | Stops every k3sm daemon, pod and network change on this Mac, and records the stop. The node stays stopped until you start it. |
-| `sudo k3sm start` | Undoes a stop: brings the network helper and the node daemon back and clears the record. On a node that is already running it does nothing. |
+| `sudo k3sm start` | Undoes a stop: brings the network helper and the node daemon back and clears the record. On a node that is already running it restarts nothing: it finishes an uncordon an earlier start ran out of time for, or makes one uncordon attempt. |
 | `sudo k3sm restart` | Restarts the k3sm daemons. Pods keep running. On a stopped node it refuses; add `--start` to start the node instead. |
 
 Each verb takes `--reason TEXT`, which is recorded in the stop record and in the logs.
@@ -44,7 +44,9 @@ On a worker, a stop affects only that Mac. The control plane keeps running and s
 cordoned. A worker uses its own node credential for the cordon.
 
 `k3sm start` removes the annotation and uncordons the Node, but only when the stop did the cordon.
-A Node you had already cordoned for another reason stays cordoned.
+A Node you had already cordoned for another reason stays cordoned. The start retries the uncordon
+until the apiserver answers, for up to 90 seconds. If it exits 1 saying the node is still cordoned,
+the daemons are up but the Node is not schedulable yet: run `sudo k3sm start` again to uncordon it.
 
 ## A Stop Survives Reboot
 
@@ -99,7 +101,7 @@ removal (15), pod grace (10), VM helpers (5) and the network helper (30). A work
 longer. The command is cut off 30 seconds after that bound, or by `SIGINT`, `SIGTERM` or `SIGHUP`,
 and then exits naming what it left. Re-running it converges.
 
-`k3sm start` is cut off after about eight minutes, or by the same signals. The stop record stays
+`k3sm start` is cut off after about nine and a half minutes, or by the same signals. The stop record stays
 until the daemons are up, so a start that fails leaves the node reported as stopped, and running
 `sudo k3sm start` again is safe.
 
