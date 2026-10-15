@@ -1584,14 +1584,6 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	// (podServiceAccount) so the downward API and the token binding can never
 	// disagree about the account a pod with an unset spec runs as.
 	facts := podFacts{nodeName: r.nodeName, nodeIP: r.nodeIP, serviceAccount: podServiceAccount(pod), apiServerVIP: r.apiServerVIP, serviceLinks: links}
-	if r.apiServerVIP == "" {
-		// Without a VIP the kubernetes service environment is not injected
-		// (apiServerEnv). That is correct on a rootless dev tier, which publishes
-		// no API Service, and a defect on a server whose publisher is broken; the
-		// line separates the two for whoever reads "KUBERNETES_SERVICE_HOST must
-		// be defined" out of a container.
-		r.log.Debug("no API Service VIP on this node; injecting no kubernetes service environment", "namespace", pod.Namespace, "pod", pod.Name)
-	}
 	if err := resolvePodBoxEnv(ctx, box, facts, r.resolver); err != nil {
 		return nil, err
 	}
