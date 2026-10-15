@@ -16,28 +16,35 @@
 #     KUBECTL                 kubectl binary (default kubectl)
 #     K3SM_LAB_TOLERATE_KEYS  extra taint keys every lab pod tolerates (hack/lab/lib/tolerations.sh)
 #     K3SM_LAB_PRINT_MANIFESTS=1  print the pod manifest and exit; contacts nothing
+#   An ssh destination whose first label is this Mac's short hostname runs locally
+#   (the driver runs on the worker, which holds no host key for itself).
 #
 # Steps (every dial is the 2x2 matrix {server, worker} -> {server, worker} mesh
 # address, so the worker's own proxy and the server's proxy are both exercised):
+#   s.00 the pod server, a tiny C HTTP server (b572-serve.c below: bind the pod
+#        IP on 8080, answer HTTP/1.0 200 with the body, one request per accept),
+#        is shipped to EACH node and built there with clang into
+#        /private/var/tmp/k3sm-b572/ (the rig's b476 ship-and-build flow: scp, or
+#        cp on the Mac the driver runs on, then a build script). No platform
+#        binary serves, so the pod bind shim question does not arise.
 #   s.0  per pod: Ready, and (s0b) its 8080 listener is bound to its own pod IP,
-#        not the wildcard. The server is Homebrew python3 (a non-platform binary
-#        the pod bind shim wraps) bound to POD_IP from the downward API; a
-#        platform binary such as /usr/bin/nc binds *:8080, where a dial to any
-#        pod IP on the node lands on whichever wildcard socket the kernel picks,
-#        so a regression there is this named red, not a scrambled dial.
+#        not the wildcard: a server that binds *:8080 makes a dial to any pod IP
+#        on the node land on whichever wildcard socket the kernel picks, so that
+#        regression is this named red, not a scrambled dial.
 #   s.1  ns b572-a: native pod on the worker answering "A" on 8080, NodePort p1;
 #        ns b572-b: the same answering "B", NodePort p2. p1 -> A and p2 -> B.
 #   s.2  ns b572-a deleted (--wait): within 60 s p1 answers nothing from either
 #        node and neither node holds a listener on p1; no process of pod A
-#        (its serve.sh, serve.py and their children, recorded just before the
-#        delete)
-#        is still running on the worker.
+#        (the _k3sm-owned processes whose argv carries the pod's marker, and
+#        their children, recorded just before the delete) is still running on
+#        the worker.
 #   s.3  ns b572-c: "C" on p1. Five rounds: p1 -> C and p2 -> B, every dial.
 #   Recorded, not asserted: the pod IPs of A and C (reuse is expected) and
 #   whether A's IP is still a lo0 alias after the delete. Dumps (NodePort and
-#   8080 listeners, the nc, serve.sh and serve.py
-#   processes, the k3sm status rows naming the ports) are taken at every step
-#   and at every failing check.
+#   8080 listeners, the nc and b572-serve processes, the k3sm status rows
+#   naming the ports) are taken at every step and at every failing check; a
+#   failing check also saves each live b572 pod's `logs --previous` and its
+#   namespace's latest events into the evidence dir.
 #
 # Exit: 0 every assertion passed, 1 an assertion failed, 2 a lab precondition
 # refused the run, 3 K3SM_LAB unset (nothing was run).
@@ -81,6 +88,14 @@ listen_addrs() {
 	printf '%s\n' "$1" | awk -v p=":$2" '/\(LISTEN\)/ { a = $(NF-1); if (substr(a, length(a) - length(p) + 1) == p) print a }' | sort | xargs
 }
 
+# same_host <ssh-dest> <short-hostname>: 0 iff the destination's first label
+# (after any user@) is that hostname, any case.
+same_host() {
+	local h="${1##*@}"
+	h="${h%%.*}"
+	[ -n "$2" ] && [ "$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" ]
+}
+
 # bound_to_ip <listen-addrs> <ip>: 0 iff the listeners are exactly <ip>:8080
 # (one or more sockets, none on the wildcard or another address).
 bound_to_ip() {
@@ -117,34 +132,98 @@ port_rows() {
 
 LAB_TOLERATIONS="$(lab_tolerations_yaml "")" || exit 2
 
-# backend <ns> <node> <body> <nodePort>: the ConfigMap, a native pod answering
-# exactly <body> on 8080 and a NodePort Service selecting it. The server is
-# Homebrew python3 (not a platform binary, so the pod bind shim loads) bound to
-# the pod's own IP from the downward API. The argv of serve.sh and serve.py
-# carries the namespace as a tag so the pod's processes are findable; the
-# scripts ride a ConfigMap (a native pod cannot read files under /tmp).
+SERVE_DIR=/private/var/tmp/k3sm-b572
+SERVE_BIN="$SERVE_DIR/b572-serve"
+
+# serve_source: the pod server. argv: <pod-ip|-> <body> <marker>; "-" reads the
+# pod IP from POD_IP (the downward API), since the pod command is the binary
+# itself and no shell expands it. The marker only makes the process findable.
+serve_source() {
+	cat <<'C'
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int write_all(int fd, const char *p, size_t n) {
+	while (n > 0) {
+		ssize_t w = write(fd, p, n);
+		if (w <= 0) return -1;
+		p += w;
+		n -= (size_t)w;
+	}
+	return 0;
+}
+
+int main(int argc, char **argv) {
+	if (argc < 3) {
+		fprintf(stderr, "usage: b572-serve <pod-ip|-> <body> [marker]\n");
+		return 2;
+	}
+	const char *ip = argv[1];
+	if (strcmp(ip, "-") == 0) ip = getenv("POD_IP");
+	if (ip == NULL || *ip == '\0') {
+		fprintf(stderr, "b572-serve: no pod IP (argv[1] '-' and POD_IP unset)\n");
+		return 2;
+	}
+	signal(SIGPIPE, SIG_IGN);
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof a);
+	a.sin_family = AF_INET;
+	a.sin_port = htons(8080);
+	if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) {
+		fprintf(stderr, "b572-serve: bad pod IP '%s'\n", ip);
+		return 2;
+	}
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0) { perror("b572-serve: socket"); return 1; }
+	int one = 1;
+	(void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+	if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) { perror("b572-serve: bind"); return 1; }
+	if (listen(s, 16) < 0) { perror("b572-serve: listen"); return 1; }
+	printf("b572-serve: listening on %s:8080, body '%s'\n", ip, argv[2]);
+	fflush(stdout);
+	char hdr[160];
+	size_t blen = strlen(argv[2]);
+	int hlen = snprintf(hdr, sizeof hdr, "HTTP/1.0 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", blen);
+	for (;;) {
+		int c = accept(s, NULL, NULL);
+		if (c < 0) continue;
+		char req[2048];
+		(void)read(c, req, sizeof req);
+		if (write_all(c, hdr, (size_t)hlen) == 0) (void)write_all(c, argv[2], blen);
+		close(c);
+	}
+}
+C
+}
+
+# build_script: builds b572-serve in SERVE_DIR on the node; signs a temp file and
+# renames it over the old binary (a signed Mach-O is never overwritten in place).
+build_script() {
+	cat <<SCRIPT
+set -e
+D=$SERVE_DIR
+chmod 755 "\$D"
+xcrun clang -O1 -Werror=implicit-function-declaration -o "\$D/b572-serve.new" "\$D/b572-serve.c"
+codesign -s - -f "\$D/b572-serve.new"
+chmod 755 "\$D/b572-serve.new"
+mv -f "\$D/b572-serve.new" "\$D/b572-serve"
+ls -l "\$D"
+SCRIPT
+}
+
+# backend <ns> <node> <body> <nodePort>: a native pod running b572-serve, which
+# answers exactly <body> on its own pod IP:8080 (POD_IP from the downward API),
+# and a NodePort Service selecting it. The argv ends in the namespace as the
+# pod's marker.
 backend() {
 	local ns="$1" node="$2" body="$3" port="$4"
 	cat <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata: {name: b572-script, namespace: $ns}
-data:
-  serve.sh: |
-    /opt/homebrew/bin/python3 /cfg/serve.py "\$1" "\$2"
-  serve.py: |
-    import http.server, os, sys
-    BODY = sys.argv[2].encode()
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(BODY)))
-            self.end_headers()
-            self.wfile.write(BODY)
-        def log_message(self, *args):
-            pass
-    http.server.HTTPServer((os.environ["POD_IP"], 8080), Handler).serve_forever()
----
 apiVersion: v1
 kind: Pod
 metadata: {name: b572-web, namespace: $ns, labels: {app: b572-web}}
@@ -155,11 +234,9 @@ spec:
   containers:
   - name: web
     image: native
-    command: ["/bin/sh", "/cfg/serve.sh", "$ns", "$body"]
+    command: ["$SERVE_BIN", "-", "$body", "$ns"]
     env: [{name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}]
     ports: [{containerPort: 8080}]
-    volumeMounts: [{name: cfg, mountPath: /cfg}]
-  volumes: [{name: cfg, configMap: {name: b572-script}}]
 ---
 apiVersion: v1
 kind: Service
@@ -224,10 +301,27 @@ nc     91200 _k3sm    3u  IPv4 0x967312696460f780      0t0  TCP *:8080 (LISTEN)'
 	case "$m" in *"{key: k3sm.io/provider, operator: Exists}"*) check ok "manifest: provider toleration (keyed)" ;; *) check no "manifest: provider toleration (keyed)" ;; esac
 	case "$m" in *"{operator"*) check no "manifest: no key-less toleration" ;; *) check ok "manifest: no key-less toleration" ;; esac
 	case "$m" in *"nodePort: 31520"*) check ok "manifest: NodePort" ;; *) check no "manifest: NodePort" ;; esac
-	case "$m" in *'"/cfg/serve.sh", "b572-a", "A"'*) check ok "manifest: tagged argv carries the body" ;; *) check no "manifest: tagged argv carries the body" ;; esac
+	case "$m" in *'command: ["/private/var/tmp/k3sm-b572/b572-serve", "-", "A", "b572-a"]'*) check ok "manifest: the node-built server, body and marker in argv" ;; *) check no "manifest: the node-built server, body and marker in argv" ;; esac
 	case "$m" in *"fieldPath: status.podIP"*) check ok "manifest: POD_IP from the downward API" ;; *) check no "manifest: POD_IP from the downward API" ;; esac
-	case "$m" in *"/opt/homebrew/bin/python3 /cfg/serve.py"*) check ok "manifest: a non-platform server" ;; *) check no "manifest: a non-platform server" ;; esac
-	case "$m" in *"/usr/bin/nc"*) check no "manifest: no platform-binary nc" ;; *) check ok "manifest: no platform-binary nc" ;; esac
+	case "$m" in *"/usr/bin/"*|*python*) check no "manifest: no platform binary or interpreter" ;; *) check ok "manifest: no platform binary or interpreter" ;; esac
+
+	check "$(t same_host MikoBook.local mikobook)" "same_host: first label, any case"
+	check "$(t same_host miko@mikobook mikobook)" "same_host: user@ ignored"
+	check "$([ "$(t same_host miko-studio.example.com mikobook)" = no ] && echo ok)" "same_host: another Mac"
+	check "$([ "$(t same_host mikobook '')" = no ] && echo ok)" "same_host: no hostname is never local"
+
+	# shellcheck disable=SC2016 # the build script's literal $D, not an expansion
+	case "$(build_script)" in *'-o "$D/b572-serve.new"'*'codesign -s - -f "$D/b572-serve.new"'*'mv -f "$D/b572-serve.new" "$D/b572-serve"'*) check ok "build: sign a temp file, then rename" ;; *) check no "build: sign a temp file, then rename" ;; esac
+	# Compile-check only (writes nothing, runs nothing); skipped without xcrun.
+	if command -v xcrun >/dev/null 2>&1; then
+		if serve_source | xcrun clang -fsyntax-only -Werror=implicit-function-declaration -Wall -x c - 2>&1; then
+			check ok "serve source: compiles (syntax only)"
+		else
+			check no "serve source: compiles (syntax only)"
+		fi
+	else
+		echo "skip  serve source compile (no xcrun)"
+	fi
 
 	if [ "$bad" = 0 ]; then echo "b572 self-test: green"; else echo "b572 self-test: RED"; fi
 	return "$bad"
@@ -265,7 +359,11 @@ EVIDENCE="${K3SM_B572_EVIDENCE:-$(mktemp -d -t b572-evidence)}"
 mkdir -p "$EVIDENCE"
 kc() { "$KUBECTL" "$@"; }
 # Remote commands need a login shell on the rig Macs.
-on() { local host="$1"; shift; ssh -o BatchMode=yes "$host" "zsh -lc $(printf '%q' "$*")"; }
+ME="$(hostname -s 2>/dev/null || true)"
+on() {
+	local host="$1"; shift
+	if same_host "$host" "$ME"; then /bin/zsh -lc "$*"; else ssh -o BatchMode=yes "$host" "zsh -lc $(printf '%q' "$*")"; fi
+}
 ssh_of() { if [ "$1" = "$SERVER" ]; then echo "$K3SM_B572_SERVER_SSH"; else echo "$K3SM_B572_WORKER_SSH"; fi; }
 
 kc get --raw /healthz >/dev/null || { echo "the cluster at \$KUBECONFIG is not serving" >&2; exit 2; }
@@ -282,25 +380,53 @@ lab_tolerations_header
 
 PASS=0; FAIL=0
 STEP=start
+NAMESPACES="b572-a b572-b b572-c"
 ladder() {
 	if [ "$1" = ok ]; then
 		echo "PASS  $2"; PASS=$((PASS + 1))
 	else
 		echo "FAIL  $2"; FAIL=$((FAIL + 1))
 		dump "failed: $2"
+		pod_diag
 	fi
 }
 obs() { echo "OBS   $*"; }
 
+# pod_diag: each live b572 namespace's pod log (current and --previous) and its
+# latest events, into the evidence dir (a server that dies in the sandbox shows here).
+pod_diag() {
+	local ns f
+	for ns in $NAMESPACES; do
+		kc get namespace "$ns" >/dev/null 2>&1 || continue
+		f="$EVIDENCE/diag-$DUMPN-$ns.txt"
+		{
+			echo "== diag $DUMPN [$STEP] $ns"
+			echo "## kubectl logs b572-web"; kc -n "$ns" logs b572-web 2>&1 | tail -40
+			echo "## kubectl logs b572-web --previous"; kc -n "$ns" logs b572-web --previous 2>&1 | tail -40
+			echo "## events"; kc -n "$ns" get events --sort-by=.lastTimestamp 2>&1 | tail -8
+		} >"$f" 2>&1
+		echo "      diag saved: $f"
+	done
+}
+
 # lsof_on <node> <ports>: the LISTEN rows on those ports (root: the proxy runs as _k3sm).
 lsof_on() { on "$(ssh_of "$1")" "sudo -n lsof -nP -iTCP:$2 -sTCP:LISTEN 2>/dev/null || true"; }
-# procs_on <node>: pid ppid pgid user command of every nc on 8080 and every b572
-# serve.sh / serve.py.
-procs_on() { on "$(ssh_of "$1")" "sudo -n ps -axo pid=,ppid=,pgid=,user=,command= | grep -E '[n]c -l 8080|[s]erve[.](sh|py) b572-' || true"; }
+# procs_on <node>: pid ppid pgid user command of every nc on 8080 and every b572-serve.
+procs_on() { on "$(ssh_of "$1")" "sudo -n ps -axo pid=,ppid=,pgid=,user=,command= | grep -E '[n]c -l 8080|[b]572-serve ' || true"; }
+# pod_pids <node> <ns>: the _k3sm-owned processes whose argv ends in the pod's
+# marker (the namespace), and their _k3sm-owned children.
+pod_pids() {
+	local h top p all
+	h="$(ssh_of "$1")"
+	top="$(on "$h" "sudo -n pgrep -u _k3sm -f 'b572-serve .* $2\$' || true" | xargs)"
+	all="$top"
+	for p in $top; do all="$all $(on "$h" "sudo -n pgrep -u _k3sm -P $p || true" | xargs)"; done
+	echo "$all" | tr ' ' '\n' | sort -un | xargs
+}
 # status_on <node>: the node daemon's status JSON (no root needed for the read).
 status_on() { on "$(ssh_of "$1")" "k=\$(command -v k3sm || echo /Library/k3sm/k3sm); \$k status -o json 2>/dev/null || true"; }
 
-# dump <label>: every node's NodePort and 8080 listeners, the nc/serve processes
+# dump <label>: every node's NodePort and 8080 listeners, the nc/b572-serve processes
 # processes and the k3sm status rows naming the ports, into the log and evidence.
 DUMPN=0
 dump() {
@@ -312,7 +438,7 @@ dump() {
 			echo "== dump $DUMPN [$STEP] $1: $n"
 			echo "## NodePort listeners ($DUMP_PORTS)"; lsof_on "$n" "$DUMP_PORTS" | sed 's/^/  /'
 			echo "## 8080 listeners"; lsof_on "$n" 8080 | sed 's/^/  /'
-			echo "## nc / serve.sh / serve.py processes (pid ppid pgid user command)"; procs_on "$n" | sed 's/^/  /'
+			echo "## nc / b572-serve processes (pid ppid pgid user command)"; procs_on "$n" | sed 's/^/  /'
 			echo "## k3sm status rows naming $P1 $P2 $((P2 + 1))"; port_rows "$(status_on "$n")" "$P1" "$P2" "$((P2 + 1))" | sed 's/^/  /'
 		} 2>&1 | tee "$f"
 	done
@@ -344,7 +470,6 @@ matrix() {
 	return "$rc"
 }
 
-NAMESPACES="b572-a b572-b b572-c"
 cleanup() {
 	set +e
 	STEP=cleanup
@@ -373,6 +498,32 @@ done
 trap cleanup EXIT
 STEP=preflight; dump "before any b572 object"
 
+# s.00: ship b572-serve.c and its build script to each node and build there (on
+# the Mac the driver runs on, cp instead of scp).
+SRC="$EVIDENCE/b572-src"
+mkdir -p "$SRC"
+serve_source >"$SRC/b572-serve.c"
+build_script >"$SRC/b572-build.sh"
+STEP=s00
+for node in "$SERVER" "$WORKER"; do
+	h="$(ssh_of "$node")"
+	echo "== $node: build b572-serve with clang on the node into $SERVE_DIR"
+	built=no
+	if same_host "$h" "$ME"; then
+		if mkdir -p "$SERVE_DIR" && cp "$SRC/b572-serve.c" "$SRC/b572-build.sh" "$SERVE_DIR/" &&
+			/bin/bash "$SERVE_DIR/b572-build.sh"; then built=yes; fi
+	else
+		if on "$h" "mkdir -p $SERVE_DIR" && scp -q -o BatchMode=yes "$SRC/b572-serve.c" "$SRC/b572-build.sh" "$h:$SERVE_DIR/" &&
+			on "$h" "/bin/bash $SERVE_DIR/b572-build.sh"; then built=yes; fi
+	fi
+	if [ "$built" = yes ]; then
+		ladder ok "b572.s00 $node built $SERVE_BIN"
+	else
+		ladder no "b572.s00 $node built $SERVE_BIN (compiler output above)"
+		exit 1
+	fi
+done
+
 # create <ns> <body> <port>: the namespace and backend; FAIL + exit 1 if not Ready.
 create() {
 	kc create namespace "$1" >/dev/null
@@ -385,7 +536,7 @@ create() {
 	ladder ok "b572.s0a $1 backend pod Ready on $WORKER (pod IP $(pod_ip "$1"))"
 	local ip pids p addrs=""
 	ip="$(pod_ip "$1")"
-	pids="$(on "$K3SM_B572_WORKER_SSH" "sudo -n pgrep -f 'serve.py $1 ' || true" | xargs)"
+	pids="$(pod_pids "$WORKER" "$1")"
 	for p in $pids; do
 		addrs="$addrs $(listen_addrs "$(on "$K3SM_B572_WORKER_SSH" "sudo -n lsof -nP -a -p $p -iTCP -sTCP:LISTEN 2>/dev/null || true")" 8080)"
 	done
@@ -393,7 +544,7 @@ create() {
 	if bound_to_ip "$addrs" "$ip"; then
 		ladder ok "b572.s0b $1 listener bound to its pod IP ($addrs)"
 	else
-		ladder no "b572.s0b $1 listener bound to its pod IP $ip:8080, not * (got '${addrs:-no listener}' from serve.py pid(s) [${pids:-none}])"
+		ladder no "b572.s0b $1 listener bound to its pod IP $ip:8080, not * (got '${addrs:-no listener}' from _k3sm pid(s) [${pids:-none}])"
 	fi
 }
 pod_ip() { kc get pod b572-web -n "$1" -o jsonpath='{.status.podIP}'; }
@@ -407,12 +558,9 @@ if got="$(matrix "$P1" A)"; then ladder ok "b572.s1a p1 $P1 -> A from both nodes
 if got="$(matrix "$P2" B)"; then ladder ok "b572.s1b p2 $P2 -> B from both nodes ($got)"; else ladder no "b572.s1b p2 $P2 -> B from both nodes ($got)"; fi
 dump "A and B live"
 
-# Pod A's processes, recorded just before the delete: its serve.sh, serve.py and
-# their children.
-A_TOP="$(on "$K3SM_B572_WORKER_SSH" "sudo -n pgrep -f 'serve[.](sh|py) b572-a ' || true" | xargs)"
-A_PIDS="$A_TOP"
-for p in $A_TOP; do A_PIDS="$A_PIDS $(on "$K3SM_B572_WORKER_SSH" "sudo -n pgrep -P $p || true" | xargs)"; done
-A_PIDS="$(echo "$A_PIDS" | tr ' ' '\n' | sort -un | xargs)"
+# Pod A's processes, recorded just before the delete: _k3sm-owned, matched by
+# the pod's marker in argv, plus their children.
+A_PIDS="$(pod_pids "$WORKER" b572-a)"
 obs "pod A pod IP $IP_A, processes [$A_PIDS]"
 
 # s.2 -----------------------------------------------------------------------------
@@ -441,7 +589,7 @@ if [ "$lis_ok" = yes ]; then
 else
 	ladder no "b572.s2b no listener on p1 $P1 on either node, within 60 s ($lis)"
 fi
-left="$(survivors "$(on "$K3SM_B572_WORKER_SSH" "ps -axo pid=")" "$A_PIDS")"
+left="$(survivors "$(on "$K3SM_B572_WORKER_SSH" "ps -axo pid=,user=" | awk '$2 == "_k3sm" { print $1 }')" "$A_PIDS")"
 if [ -z "$left" ]; then
 	ladder ok "b572.s2c no process of pod A survives on $WORKER (recorded [$A_PIDS])"
 else
