@@ -232,7 +232,8 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 	// Event); any other backend logs and sends "", because no native process can
 	// observe the value and refusing the pod would refuse it for nothing.
 	vm := backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
-	hostname, truncated, err := podHostname(pod, dnsCfg.ClusterDomain)
+	names, err := podHostname(pod, dnsCfg.ClusterDomain)
+	hostname, truncated := names.hostname, names.truncated
 	if err != nil {
 		if vm {
 			return nil, fmt.Errorf("pod hostname: %w", err)
@@ -255,6 +256,18 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 			"hostnameMaxLen", podHostnameMaxLen, "hostname", hostname)
 	}
 	box.Hostname = hostname
+	// The FQDN for the guest /etc/hosts alias, vm only: no native process has an
+	// /etc/hosts of its own, so a native box carries none. "" when the kubelet's
+	// domain is empty (an override, no subdomain, hostNetwork). A name podHostname
+	// could not use (no cluster domain, or not a DNS-1123 subdomain) is worth a
+	// Warn because the guest then lists only the short name; the pod still runs.
+	if vm {
+		box.PodFqdn = names.fqdn
+		if names.fqdnSkipped != "" && log != nil {
+			log.Warn("pod gets no FQDN alias: "+names.fqdnSkipped,
+				"namespace", pod.Namespace, "name", pod.Name, "fqdnLen", names.fqdnLen)
+		}
+	}
 	return box, nil
 }
 
