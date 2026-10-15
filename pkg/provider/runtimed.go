@@ -1663,6 +1663,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	box, err := r.buildBox(ctx, pod, podIP)
 	if err != nil {
 		r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
+		r.recordPodHostnameRefusal(pod, err)
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	// Refuse a pod this node cannot honestly run BEFORE the RPC, and before any

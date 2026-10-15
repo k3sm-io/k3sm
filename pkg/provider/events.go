@@ -87,6 +87,13 @@ const (
 	// No upstream analogue, for the FailedEmptyDirMedium reason: a kubelet that
 	// cannot serve a projected source is not a state upstream models.
 	reasonFailedProjectedSource = "FailedProjectedSource"
+	// reasonFailedCreatePodSandBox is recorded when a vm pod is refused BEFORE
+	// the CreatePod RPC because its kernel hostname cannot be derived from the
+	// spec (podHostname): an invalid hostnameOverride, hostname or subdomain, or
+	// a setHostnameAsFQDN name over 64 characters. It is the kubelet's own reason
+	// for a sandbox it could not configure, so `kubectl describe pod` reads as
+	// upstream does.
+	reasonFailedCreatePodSandBox = "FailedCreatePodSandBox"
 	// reasonFailedGPUFit is recorded when a pod requesting the GPU extended
 	// resource does not fit in this node's GPU memory beside the GPU pods already
 	// admitted, so the pod is refused BEFORE the CreatePod RPC.
@@ -320,6 +327,13 @@ func msgFailedEmptyDirMedium(volume, medium string) string {
 		"ordinary disk-backed directory, or schedule the pod with runtimeClassName: %s, whose "+
 		"Linux guest honours medium: Memory as a tmpfs.",
 		volume, medium, runtimeclass.Name)
+}
+
+// msgFailedPodHostname is the message for reasonFailedCreatePodSandBox when a
+// vm pod's hostname cannot be derived. It keeps the kubelet's prefix and error
+// text and names the spec field and the length of the offending value.
+func msgFailedPodHostname(e *podHostnameError) string {
+	return fmt.Sprintf("Failed to create pod sandbox: %s (%d characters): %v", e.field, e.length, e.err)
 }
 
 // msgFailedProjectedSource is the FailedProjectedSource-event message for a pod
