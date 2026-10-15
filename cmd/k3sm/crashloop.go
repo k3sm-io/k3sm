@@ -148,7 +148,10 @@ func (b *crashBreaker) write(add func(*executor.CrashRecord, time.Time) bool) (t
 // signed bytes on disk are the same on every lap, and the remedy is a reinstall. (The joining
 // server's permanent member-route refusal is the other permanent class; it fails
 // before the executor starts, so noteEtcdMemberRouteFailure records it.)
-func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
+//
+// A bring-up this daemon's own stop cancelled is not recorded at all
+// (cancelledByStop). ctx is the context the bring-up ran under.
+func noteBringUpFailure(ctx context.Context, b *crashBreaker, logger *slog.Logger, err error) {
 	component := "control-plane"
 	var bu *executor.BringUpError
 	if errors.As(err, &bu) {
@@ -215,12 +218,38 @@ func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 		}
 		return
 	}
+	if cancelledByStop(ctx, err) {
+		// Checked after every permanent class: a permanent fault that happened to
+		// surface during a stop is still the fault, and still parks.
+		logger.Info("bring-up cancelled by stop; not recorded", "component", component, "err", err)
+		return
+	}
 	logger.Error("the control plane did not come up; recording it on the crash-loop breaker",
 		"component", component, "err", err)
 	if b.recordBringUp(component, err.Error()) {
 		logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
 			"path", b.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
 	}
+}
+
+// cancelledByStop reports whether err is a bring-up that this daemon's own stop
+// cut short: the context the bring-up ran under is done AND err's chain carries
+// context.Canceled. Such an error is not a fault of the daemon. A bootout or a
+// kickstart -k sends SIGTERM, the signal context cancels, and the health wait in
+// progress returns "apiserver not healthy: context canceled". Recorded, that
+// entry was dated after the in-place install that sent the stop had begun, and
+// the install's verification counted it as the NEW daemon's failure and rolled
+// the tree back over a control plane that was coming up.
+//
+// Both halves are required. context.Canceled with the context still live is a
+// cancellation from somewhere else (a client, an inner timeout) and is a real
+// failure; a done context with any other error (context.DeadlineExceeded, an
+// exit during bring-up) is a real failure too. A component crash also cancels
+// the server's bring-up context, but componentExitHandler has already recorded
+// that crash, so leaving the bring-up error out avoids counting it twice.
+// Classification is by errors.Is only, never by the error text.
+func cancelledByStop(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && errors.Is(err, context.Canceled)
 }
 
 // noteEtcdMemberRouteFailure records a joining server's member-route failure on the
@@ -273,7 +302,14 @@ const agentComponent = "agent"
 //     redacted from pkg/executor; an agent's start error is this command's own
 //     text and can quote a token it was handed, so it passes through
 //     pkg/status's redactor on its way into a file an operator will read.
-func noteAgentStartFailure(b *crashBreaker, logger *slog.Logger, err error) {
+//
+// A start this daemon's own stop cancelled is not recorded (cancelledByStop),
+// for the reason noteBringUpFailure gives. ctx is the context the start ran under.
+func noteAgentStartFailure(ctx context.Context, b *crashBreaker, logger *slog.Logger, err error) {
+	if cancelledByStop(ctx, err) {
+		logger.Info("bring-up cancelled by stop; not recorded", "component", agentComponent, "err", err)
+		return
+	}
 	logger.Error("this agent did not start; recording it on the crash-loop record",
 		"component", agentComponent, "path", b.path, "err", err)
 	if b.recordBringUp(agentComponent, status.Redact(err.Error())) {

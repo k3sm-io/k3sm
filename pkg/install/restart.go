@@ -125,9 +125,13 @@ func restartBudgetFor(label string) restartBudget {
 // every such label best-effort and names the outcome in the error, so an operator
 // reading one sentence knows which daemons are running — the state-honesty the old
 // mid-loop return had none of.
-func restartDaemons(ctx context.Context, sys System, cfg Config, m []artifact) error {
+//
+// It returns the bootstrap fence of every label it started (restartDaemon), which
+// the install's verification counts bring-up failures from.
+func restartDaemons(ctx context.Context, sys System, cfg Config, m []artifact) (bootstrapFences, error) {
 	logger := cfg.Logger
 	var touched []string
+	fences := bootstrapFences{}
 	// stateHonestly turns any failure in this sequence into the one-sentence
 	// report the whole function exists for: what went wrong, what was
 	// re-bootstrapped, and which daemons are up right now.
@@ -159,7 +163,7 @@ func restartDaemons(ctx context.Context, sys System, cfg Config, m []artifact) e
 		// check was verifyDaemons', which runs after both daemons are already up.
 		if netdRestarted && isNodeDaemon(a.label) {
 			if err := awaitNetdServing(ctx, sys, cfg.NetdSocket, a.label, restartBudgetFor(NetdLabel)); err != nil {
-				return stateHonestly(err)
+				return nil, stateHonestly(err)
 			}
 			logger.Info("netd answered on the helper socket; starting the node daemon", "socket", cfg.NetdSocket, "label", a.label)
 		}
@@ -167,14 +171,52 @@ func restartDaemons(ctx context.Context, sys System, cfg Config, m []artifact) e
 		// does, so a failure anywhere in the sequence — including in the bootout
 		// itself — can have left this label down.
 		touched = append(touched, a.label)
-		if err := restartDaemon(ctx, sys, a.label, a.oneshot, logger); err != nil {
-			return stateHonestly(err)
+		fence, err := restartDaemon(ctx, sys, a.label, a.oneshot, logger)
+		if err != nil {
+			return nil, stateHonestly(err)
 		}
+		fences[a.label] = fence
 		if a.label == NetdLabel {
 			netdRestarted = true
 		}
 	}
-	return nil
+	return fences, nil
+}
+
+// bootstrapFences maps each label restartDaemons started to its bootstrap fence:
+// the instant, read from System.Now, between the old process leaving the domain
+// and the new one being bootstrapped (restartDaemon).
+type bootstrapFences map[string]time.Time
+
+// bringUpWindow is where the post-restart verification starts counting a
+// daemon's bring-up failures as this install's own.
+//
+// It is the label's bootstrap fence, not the moment the install began. On an
+// in-place install the running daemon is still alive between the two: it is the
+// install's own bootout that stops it, and a daemon stopped during its bring-up
+// used to record the bring-up it cancelled ("apiserver not healthy: context
+// canceled"), dated after the install began. Counted from startedAt, that entry
+// was read as the NEW daemon's failure and the install rolled itself back over a
+// control plane that was coming up. Every entry the new daemon writes is dated at
+// or after the fence, and every entry the old one wrote is dated before it,
+// because awaitUnloaded has seen the old process gone before the fence is read.
+// The daemon no longer records a stop-cancelled bring-up at all (cmd/k3sm); the
+// fence is what keeps a record written by an older binary, or by any other
+// stop-time path, out of the count.
+//
+// startedAt is the fallback for a label this install did not bootstrap, which
+// verifyDaemons does not reach today: a held-stopped install returns before it.
+type bringUpWindow struct {
+	startedAt time.Time
+	fences    bootstrapFences
+}
+
+// since returns the instant label's bring-up failures are counted from.
+func (w bringUpWindow) since(label string) time.Time {
+	if t, ok := w.fences[label]; ok {
+		return t
+	}
+	return w.startedAt
 }
 
 // isNodeDaemon reports whether label is the role's node daemon — the one that
@@ -237,13 +279,18 @@ func awaitNetdServing(ctx context.Context, sys System, socket, label string, b r
 // starts, and the install would fail on a job that did exactly what it was asked
 // to do. Loaded is the whole claim install makes about it -- the mount itself was
 // performed, synchronously and with its own retry, before any of this ran.
-func restartDaemon(ctx context.Context, sys System, label string, oneshot bool, logger *slog.Logger) error {
+//
+// It returns the label's bootstrap FENCE: System.Now read after awaitUnloaded and
+// immediately before the first bootstrap attempt. The old process is gone by then
+// and the new one does not exist yet, so a crash-record entry dated before the
+// fence cannot be the new daemon's (bringUpWindow).
+func restartDaemon(ctx context.Context, sys System, label string, oneshot bool, logger *slog.Logger) (fence time.Time, err error) {
 	b := restartBudgetFor(label)
 	if err := sys.LaunchctlBootout(label); err != nil {
-		return fmt.Errorf("bootout stale %s before (re)bootstrap: %w", label, err)
+		return time.Time{}, fmt.Errorf("bootout stale %s before (re)bootstrap: %w", label, err)
 	}
 	if err := awaitUnloaded(ctx, sys, label, b); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	// Enable before bootstrap, every time. restartDaemons, the only caller, has
 	// already refused to come here for a label a user stop disabled (unless
@@ -255,25 +302,26 @@ func restartDaemon(ctx context.Context, sys System, label string, oneshot bool, 
 	// enabled label; on a disabled one it overrides an earlier operator disable,
 	// because running k3sm install is the newer statement of intent.
 	if err := sys.LaunchctlEnable(label); err != nil {
-		return fmt.Errorf("enable %s in the system domain before bootstrapping it (to clear it by hand, run: sudo launchctl enable system/%s): %w", label, label, err)
+		return time.Time{}, fmt.Errorf("enable %s in the system domain before bootstrapping it (to clear it by hand, run: sudo launchctl enable system/%s): %w", label, label, err)
 	}
 	logger.Info("ensured the label is enabled in the system domain before bootstrap (an earlier operator disable, if any, is overridden: k3sm install is the newer intent)", "label", label)
+	fence = sys.Now()
 	if err := bootstrapWithRetry(ctx, sys, label, b); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if oneshot {
 		if err := awaitLoaded(ctx, sys, label, b); err != nil {
-			return err
+			return time.Time{}, err
 		}
 		logger.Info("oneshot daemon loaded on the freshly installed binary", "label", label)
-		return nil
+		return fence, nil
 	}
 	pid, err := awaitRunning(ctx, sys, label, b)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	logger.Info("daemon restarted on the freshly installed binary", "label", label, "pid", pid)
-	return nil
+	return fence, nil
 }
 
 // bootoutDaemons stops the long-running daemons, in REVERSE manifest order --
@@ -484,7 +532,7 @@ func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact
 	// was, this install may have booted a label out, or bootstrapped it onto the
 	// tree that has just been swapped away; only a restart makes the running
 	// processes agree with the tree on disk again.
-	if err := restartDaemons(ctx, sys, cfg, m); err != nil {
+	if _, err := restartDaemons(ctx, sys, cfg, m); err != nil {
 		return fmt.Errorf("%w; rolled back to the previous install root (the failed tree is at %s), but restarting the daemons on it also failed: %v; daemon state: %s", cause, staging, err, states())
 	}
 	return fmt.Errorf("%w; rolled back to the previous install root and restarted the daemons on it (the failed tree is at %s, remove it with `sudo rm -rf %s`); daemon state: %s", cause, staging, staging, states())
@@ -543,7 +591,10 @@ func recoverBootedOut(sys System, labels []string) string {
 // startup, so a single read immediately after the bootstrap tests the wrong thing.
 // The error names the state of EVERY component, not just the first bad one — an
 // operator needs to know what IS running as much as what is not.
-func verifyDaemons(ctx context.Context, sys System, cfg Config, m []artifact, startedAt time.Time) error {
+//
+// window says, per label, from when a recorded bring-up failure is this
+// install's own (bringUpWindow).
+func verifyDaemons(ctx context.Context, sys System, cfg Config, m []artifact, window bringUpWindow) error {
 	states, healthy := daemonStates(sys, longRunningDaemonLabels(m))
 	switch err := awaitPath(ctx, sys, cfg.NetdSocket, "netd is not serving the helper socket the control plane dials", restartBudgetFor(NetdLabel)); {
 	case err == nil:
@@ -557,10 +608,10 @@ func verifyDaemons(ctx context.Context, sys System, cfg Config, m []artifact, st
 	}
 	// A live pid is not the whole claim on the server role either: a daemon whose
 	// crash-loop breaker has tripped is resident, idle, and serving nothing.
-	if err := verifyServerNotParked(sys, cfg, m, startedAt); err != nil {
+	if err := verifyServerNotParked(sys, cfg, m, window.since(ServerLabel)); err != nil {
 		return err
 	}
-	if err := verifyAgentJoined(ctx, sys, cfg, startedAt); err != nil {
+	if err := verifyAgentJoined(ctx, sys, cfg, window.since(AgentLabel)); err != nil {
 		return err
 	}
 	cfg.Logger.Info("verified the daemons after the restart", "state", strings.Join(states, "; "))
@@ -599,9 +650,9 @@ var ErrServerNotComingUp = errors.New("the k3sm server daemon did not bring the 
 // exactly the persistent fault it exists to catch, and the daemon would give up
 // unattended some minutes later with nobody watching. Hence the second, stricter
 // question: has the control plane failed to come up AT ALL since this install
-// began? One bring-up failure dated at or after startedAt fails the install,
-// tripped or not — this install restarted that daemon, so that failure is this
-// install's to report.
+// bootstrapped it? One bring-up failure dated at or after since — the server
+// label's bootstrap fence (bringUpWindow) — fails the install, tripped or not:
+// this install started that daemon, so that failure is this install's to report.
 //
 // The timestamp is what keeps a reinstall honest in the other direction: an
 // OLDER record, from the very fault an operator may be reinstalling to fix, does
@@ -614,7 +665,7 @@ var ErrServerNotComingUp = errors.New("the k3sm server daemon did not bring the 
 // an unreadable or malformed one is bookkeeping, not a verdict — refusing an
 // install over a corrupt marker would be a second way to lose a control plane,
 // the same reason the daemon treats it as empty.
-func verifyServerNotParked(sys System, cfg Config, m []artifact, startedAt time.Time) error {
+func verifyServerNotParked(sys System, cfg Config, m []artifact, since time.Time) error {
 	if !slices.Contains(longRunningDaemonLabels(m), ServerLabel) {
 		return nil // an agent-only install runs no control plane of its own
 	}
@@ -638,9 +689,9 @@ func verifyServerNotParked(sys System, cfg Config, m []artifact, startedAt time.
 			ErrServerParked, parkedSummary(last), rec.TrippedAt.Format(time.RFC3339), last.Origin, last.Component, path)
 	}
 	// The daemon and this process read the same machine's clock, so comparing
-	// the record's timestamps with this install's start compares a clock with
+	// the record's timestamps with the bootstrap fence compares a clock with
 	// itself.
-	fresh, last := freshBringUpFailures(rec, startedAt)
+	fresh, last := freshBringUpFailures(rec, since)
 	if fresh == 0 {
 		return nil
 	}
@@ -649,7 +700,8 @@ func verifyServerNotParked(sys System, cfg Config, m []artifact, startedAt time.
 }
 
 // freshBringUpFailures counts the bring-up failures dated at or after since, and
-// returns the last of them.
+// returns the last of them. It is the one counting rule both role verifiers use;
+// an entry dated strictly before since is not counted.
 func freshBringUpFailures(rec executor.CrashRecord, since time.Time) (int, executor.Crash) {
 	n := 0
 	var last executor.Crash
@@ -748,8 +800,11 @@ func parkedSummary(last executor.Crash) string {
 // holds a credential, in which case the pid IS the whole claim, or it holds none
 // and the daemon is backing off with an error the log names, which is not
 // something this install caused and not something it can fix.
-func verifyAgentJoined(ctx context.Context, sys System, cfg Config, startedAt time.Time) error {
-	return verifyAgentJoinedOn(ctx, sys, cfg, startedAt, wallClock())
+//
+// since is the agent label's bootstrap fence (bringUpWindow): the "this install"
+// above means the daemon this install bootstrapped.
+func verifyAgentJoined(ctx context.Context, sys System, cfg Config, since time.Time) error {
+	return verifyAgentJoinedOn(ctx, sys, cfg, since, wallClock())
 }
 
 // agentJoinClock is the time verifyAgentJoinedOn reads and the way it waits
@@ -785,7 +840,7 @@ func wallClock() agentJoinClock {
 	}
 }
 
-func verifyAgentJoinedOn(ctx context.Context, sys System, cfg Config, startedAt time.Time, clk agentJoinClock) error {
+func verifyAgentJoinedOn(ctx context.Context, sys System, cfg Config, since time.Time, clk agentJoinClock) error {
 	if cfg.Role != RoleAgent || cfg.TokenFile == "" {
 		return nil
 	}
@@ -804,7 +859,7 @@ func verifyAgentJoinedOn(ctx context.Context, sys System, cfg Config, startedAt 
 		loggedState nodecred.State
 	)
 	for {
-		rec, fresh := readAgentFailures(sys, cfg, startedAt)
+		rec, fresh := readAgentFailures(sys, cfg, since)
 		if rec.Tripped() {
 			return fmt.Errorf("the agent daemon is not joining the cluster: its crash-loop breaker tripped at %s after %d start failures inside %s (last: %s), so this is a loop rather than a start that is about to recover. The reason is the last lines of %s; the agent's own record is %s",
 				rec.TrippedAt.Format(time.RFC3339), executor.CrashLoopThreshold, executor.CrashLoopWindow, agentFailureDetail(lastCrash(rec)), AgentLogPath(), record)
@@ -905,14 +960,15 @@ func (w agentFailureWitness) newerThan(prev agentFailureWitness) bool {
 }
 
 // readAgentFailures reads the agent's crash-loop record and reports it together
-// with the bring-up failures dated at or after this install began.
+// with the bring-up failures dated at or after since, the agent label's
+// bootstrap fence.
 //
 // It is FAIL-OPEN on everything that is not a failure the daemon recorded — an
 // absent record is the ordinary case, and an unreadable or malformed one is
 // bookkeeping rather than a verdict, for the same reason the daemon treats a
 // corrupt record as empty: refusing an install over a marker nobody can parse
 // would be a second way to lose a node.
-func readAgentFailures(sys System, cfg Config, startedAt time.Time) (executor.CrashRecord, agentFailureWitness) {
+func readAgentFailures(sys System, cfg Config, since time.Time) (executor.CrashRecord, agentFailureWitness) {
 	path := executor.CrashLoopPath(cfg.agentWorkDir())
 	raw, err := sys.ReadFile(path)
 	switch {
@@ -928,9 +984,9 @@ func readAgentFailures(sys System, cfg Config, startedAt time.Time) (executor.Cr
 		return executor.CrashRecord{}, agentFailureWitness{}
 	}
 	// The daemon and this process read the same machine's clock, so comparing
-	// the record's timestamps with this install's start compares a clock with
+	// the record's timestamps with the bootstrap fence compares a clock with
 	// itself.
-	n, last := freshBringUpFailures(rec, startedAt)
+	n, last := freshBringUpFailures(rec, since)
 	return rec, agentFailureWitness{count: n, last: last}
 }
 

@@ -720,7 +720,7 @@ func startControlPlane(ctx context.Context, opts serverOptions, mode hostnet.Mod
 		// took it, and noteBringUpFailure skips that). The recording happens here
 		// rather than in pkg/executor because the breaker is the daemon's memory,
 		// not the executor's.
-		noteBringUpFailure(breaker, logger, err)
+		noteBringUpFailure(ctx, breaker, logger, err)
 		return plan, nil, fmt.Errorf("start control plane: %w", err)
 	}
 	return plan, exec, nil

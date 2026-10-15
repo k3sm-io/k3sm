@@ -944,6 +944,10 @@ type System interface {
 	// ceiling sits below the requested limit (see warnKernelFDCap).
 	// An error is never a reason to refuse an install.
 	MaxFilesPerProc() (uint64, error)
+	// Now reads the wall clock. It is the one clock the restart sequence dates
+	// a daemon's bootstrap with (restartDaemon), so a test can pin the fence the
+	// post-restart verification counts bring-up failures from.
+	Now() time.Time
 	// LaunchctlBootstrap loads the labelled daemon into the system domain.
 	LaunchctlBootstrap(label string) error
 	// LaunchctlBootout unloads the labelled daemon (idempotent: a not-loaded
@@ -1833,9 +1837,11 @@ func (c Config) plistPath(label string) string {
 // the admin kubeconfig to the human's home. The caller has already verified root.
 func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	cfg = cfg.withDefaults()
-	// Taken before anything is written, and carried to the post-restart
-	// verification: it is what separates a failure THIS install caused from one
-	// the machine was already living with (see verifyServerNotParked).
+	// Taken before anything is written. The post-restart verification counts a
+	// daemon's bring-up failures from that daemon's own bootstrap fence instead
+	// (bringUpWindow), because the old daemon is still running, and can still
+	// record, between this instant and its bootout; startedAt is only the
+	// window's fallback there.
 	startedAt := time.Now()
 	if err := preflightFromStaging(ctx, &cfg); err != nil {
 		return err
@@ -2504,7 +2510,8 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 		}
 		startPrecondition(ctx, sys, cfg, d, cfg.userStop.marker, cfg.userStop.err)
 	}
-	if err := restartDaemons(ctx, sys, cfg, m); err != nil {
+	fences, err := restartDaemons(ctx, sys, cfg, m)
+	if err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 	if cfg.stayStopped {
@@ -2521,7 +2528,7 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	//     reports success having left a daemon down is worse than one that fails:
 	//     the operator walks away, and the breakage surfaces later as something
 	//     else entirely (a cluster whose DNS stopped answering).
-	if err := verifyDaemons(ctx, sys, cfg, m, startedAt); err != nil {
+	if err := verifyDaemons(ctx, sys, cfg, m, bringUpWindow{startedAt: startedAt, fences: fences}); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 	if cfg.userStop != nil {

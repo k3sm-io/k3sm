@@ -113,7 +113,7 @@ func TestVerifyDaemonsFailsWhenTheServerIsParked(t *testing.T) {
 			cfg := installCfg().withDefaults()
 			path := seedCrashRecord(t, f, cfg, tc.rec)
 
-			err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), installStart)
+			err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), bringUpWindow{fences: bootstrapFences{ServerLabel: installStart}})
 			if err == nil {
 				t.Fatal("verifyDaemons passed over a server that did not bring the control plane up")
 			}
@@ -167,7 +167,7 @@ func TestVerifyDaemonsPassesWithoutAFreshFailure(t *testing.T) {
 			f := reinstallFake()
 			cfg := installCfg().withDefaults()
 			tc.seed(t, f, cfg)
-			if err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), installStart); err != nil {
+			if err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), bringUpWindow{fences: bootstrapFences{ServerLabel: installStart}}); err != nil {
 				t.Fatalf("verifyDaemons: %v", err)
 			}
 		})
@@ -222,5 +222,130 @@ func TestInstallFailsWhenTheServerIsParked(t *testing.T) {
 	}
 	if f.kubeUser != "" {
 		t.Errorf("kubeconfig written to %q for a control plane that is parked", f.kubeUser)
+	}
+}
+
+// TestBringUpWindowStartsAtTheDaemonBootstrap is the install half of B577. An
+// in-place install booted out a server whose apiserver was still in bring-up; the
+// stop cancelled it and the old daemon recorded "apiserver not healthy: context
+// canceled", dated after the install began but before the new daemon existed.
+// Counted from the install's start, that entry failed the install and rolled the
+// tree back. The window now starts at each label's bootstrap fence, read from
+// the System clock after the old process left the domain and immediately before
+// the bootstrap: an entry strictly before it is not the new daemon's, an entry at
+// or after it is. The same rule holds for the server and the agent, which share
+// the one counting function.
+func TestBringUpWindowStartsAtTheDaemonBootstrap(t *testing.T) {
+	base := time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC)
+	cancelled := func(at time.Time, comp string) executor.Crash {
+		return executor.Crash{At: at, Origin: executor.CrashOriginBringUp, Component: comp, Detail: "apiserver not healthy: context canceled"}
+	}
+	genuine := func(at time.Time, comp string) executor.Crash {
+		return executor.Crash{At: at, Origin: executor.CrashOriginBringUp, Component: comp, Detail: "kine not listening"}
+	}
+	roles := []struct {
+		name      string
+		cfg       func(t *testing.T) Config
+		label     string
+		component string
+	}{
+		{"server", func(*testing.T) Config { return installCfg() }, ServerLabel, "kube-apiserver"},
+		{"agent", func(t *testing.T) Config { return agentCfg(t) }, AgentLabel, "agent"},
+	}
+	rows := []struct {
+		name      string
+		entries   func(fence time.Time, comp string) []executor.Crash
+		wantCount int
+		wantLast  string // the Detail of the last counted entry
+	}{
+		{
+			name: "an entry just before the fence is the old daemon's",
+			entries: func(fence time.Time, comp string) []executor.Crash {
+				return []executor.Crash{cancelled(fence.Add(-time.Nanosecond), comp)}
+			},
+		},
+		{
+			name: "an entry at the fence is the new daemon's",
+			entries: func(fence time.Time, comp string) []executor.Crash {
+				return []executor.Crash{genuine(fence, comp)}
+			},
+			wantCount: 1, wantLast: "kine not listening",
+		},
+		{
+			name: "an entry after the fence is the new daemon's",
+			entries: func(fence time.Time, comp string) []executor.Crash {
+				return []executor.Crash{genuine(fence.Add(2*time.Second), comp)}
+			},
+			wantCount: 1, wantLast: "kine not listening",
+		},
+		{
+			// The paired row: the two entries differ only in their timestamps
+			// relative to the fence, and both are after the install began.
+			name: "the old daemon's cancelled bring-up is ignored and the new daemon's failure counted",
+			entries: func(fence time.Time, comp string) []executor.Crash {
+				return []executor.Crash{cancelled(fence.Add(-500*time.Millisecond), comp), genuine(fence.Add(3*time.Second), comp)}
+			},
+			wantCount: 1, wantLast: "kine not listening",
+		},
+	}
+	for _, r := range roles {
+		for _, row := range rows {
+			t.Run(r.name+": "+row.name, func(t *testing.T) {
+				shrinkRestartBudgets(t)
+				cfg := r.cfg(t).withDefaults()
+				f := &fakeSystem{}
+				f.putLoaded(NetdLabel, r.label) // an in-place reinstall over a running pair
+				// Every recorded call moves the clock on a second, so the fence a
+				// label gets says WHERE in the call sequence it was read.
+				f.now = func() time.Time { return base.Add(time.Duration(len(f.calls)) * time.Second) }
+
+				fences, err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg))
+				if err != nil {
+					t.Fatalf("restartDaemons: %v", err)
+				}
+				fence, ok := fences[r.label]
+				if !ok {
+					t.Fatalf("restartDaemons returned no fence for %s: %v", r.label, fences)
+				}
+				bootstrap := firstCall(f, "Bootstrap:"+r.label)
+				bootout := firstCall(f, "Bootout:"+r.label)
+				if want := base.Add(time.Duration(bootstrap) * time.Second); !fence.Equal(want) {
+					t.Fatalf("fence for %s = %s, want %s: it must be read immediately before the bootstrap (call %d; calls %v)", r.label, fence, want, bootstrap, f.calls)
+				}
+				if bootout < 0 || bootout >= bootstrap {
+					t.Fatalf("bootout of %s at call %d is not before its bootstrap at %d", r.label, bootout, bootstrap)
+				}
+				// The install began before any of this, so every entry below is
+				// after startedAt: a window keyed on it would count them all.
+				window := bringUpWindow{startedAt: base, fences: fences}
+				rec := executor.CrashRecord{Crashes: row.entries(fence, r.component)}
+
+				if r.label == AgentLabel {
+					seedAgentCrashRecord(t, f, cfg, rec)
+					_, got := readAgentFailures(f, cfg, window.since(AgentLabel))
+					if got.count != row.wantCount {
+						t.Fatalf("counted %d agent failures from the fence, want %d (entries %+v)", got.count, row.wantCount, rec.Crashes)
+					}
+					if row.wantCount > 0 && got.last.Detail != row.wantLast {
+						t.Errorf("last counted %q, want %q", got.last.Detail, row.wantLast)
+					}
+					return
+				}
+				seedCrashRecord(t, f, cfg, rec)
+				err = verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), window)
+				if row.wantCount == 0 {
+					if err != nil {
+						t.Fatalf("verifyDaemons counted an entry from before the server's bootstrap: %v", err)
+					}
+					return
+				}
+				if !errors.Is(err, ErrServerNotComingUp) {
+					t.Fatalf("verifyDaemons = %v, want ErrServerNotComingUp", err)
+				}
+				if want := "failed to come up 1 times"; !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must carry %q: only the new daemon's entry counts", err, want)
+				}
+			})
+		}
 	}
 }

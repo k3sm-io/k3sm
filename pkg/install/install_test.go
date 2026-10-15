@@ -132,6 +132,9 @@ type fakeSystem struct {
 	// transient) until LaunchctlEnable clears it. The zero value disables
 	// nothing, so no pre-existing test has to say anything about it.
 	disabled map[string]bool
+	// now is the clock Now answers with. Nil reads the wall clock, so no
+	// pre-existing test has to say anything about it.
+	now func() time.Time
 	// enableErrs[label] is a queue of errors LaunchctlEnable returns for label
 	// before it succeeds, consumed one per call. The zero value enables
 	// everything.
@@ -1121,6 +1124,14 @@ func (f *fakeSystem) WriteLaunchDaemon(plistPath string, contents []byte, mode f
 	f.plistModes[plistPath] = mode
 	f.putFile(plistPath, contents)
 	return nil
+}
+
+// Now answers from the test's clock, or the wall clock when none is set.
+func (f *fakeSystem) Now() time.Time {
+	if f.now != nil {
+		return f.now()
+	}
+	return time.Now()
 }
 
 // LaunchctlBootstrap loads the label, unless the test queued a failure for it. A

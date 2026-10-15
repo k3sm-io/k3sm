@@ -69,7 +69,7 @@ func TestBringUpFailureRecordsOnTheCrashLoopBreaker(t *testing.T) {
 		if err == nil {
 			t.Fatal("Start must fail against a work dir it cannot create")
 		}
-		noteBringUpFailure(newCrashBreaker(recordDir, quietLogger()), quietLogger(), err)
+		noteBringUpFailure(context.Background(), newCrashBreaker(recordDir, quietLogger()), quietLogger(), err)
 	}
 
 	boot(t)

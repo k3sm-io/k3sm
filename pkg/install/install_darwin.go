@@ -1724,6 +1724,9 @@ func (darwinSystem) ReadFile(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
+// Now reads the wall clock.
+func (darwinSystem) Now() time.Time { return time.Now() }
+
 // LaunchctlBootstrap loads the daemon into the system domain. A failure launchd
 // attributes to the domain still settling is wrapped with ErrLaunchctlTransient so
 // the caller can retry exactly that class — see transientLaunchctlOutput. This is
