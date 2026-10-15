@@ -37,6 +37,18 @@
 #                                    stages on the modules that changed
 #   hack/verify-deps.sh --self-test  hermetic fixtures (hack/testdata/verify-deps),
 #                                    stubbed go and curl, no network
+#   hack/verify-deps.sh --modules <file>
+#                                    run the env guard, the cooldown and the
+#                                    malicious-package check over a module list
+#                                    that is NOT this repo's graph: one
+#                                    "<module> <version>" per line (a relative
+#                                    path is read from the caller's directory).
+#                                    For binaries k3sm builds from a pinned
+#                                    module outside its own go.mod, whose full
+#                                    list comes from `go version -m`
+#                                    (hack/images/metrics-server/build.sh).
+#                                    The exemptions in hack/deps.cooldown-exempt
+#                                    apply to it too.
 #
 # Network: the malicious-package stage queries https://api.osv.dev; the cooldown
 # stage and --update read commit times from https://proxy.golang.org. A network
@@ -48,6 +60,7 @@
 set -euo pipefail
 
 SELF="$0"
+CALLER_PWD="$PWD"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export GOWORK=off
@@ -998,6 +1011,25 @@ update() {
 	echo "OK: [verify-deps] $LOCK updated; review the diff and commit it"
 }
 
+# ---- --modules -----------------------------------------------------------------
+# modules <file>: the cooldown and the malicious-package check over a module list
+# from outside this repo's graph. Every commit time is read from the proxy (the
+# list carries none), so the age cannot be forged by the caller.
+modules() {
+	local list="$1"
+	case "$list" in /*) ;; *) list="$CALLER_PWD/$list" ;; esac
+	env_guard
+	stage "modules ($list)"
+	[ -s "$list" ] || fail "modules" "no module list at $list (want one '<module> <version>' per line)"
+	py graph-clean <"$list" >"$WORK/graph"
+	py update-plan "$WORK/none.lock" "$WORK/graph" "$WORK" "$PROXY_URL" || fail "modules" "could not read $list"
+	fetch_infos "modules"
+	py update-write "$WORK/modules.lock" "$WORK" >/dev/null || fail "modules" "could not record the commit times"
+	cooldown_check "$WORK/modules.lock"
+	malicious_check "$WORK/modules.lock"
+	echo "OK: [verify-deps] $(grep -vc '^#' "$WORK/modules.lock") modules from $list pass the cooldown and the malicious-package check"
+}
+
 check() {
 	env_guard
 	mod_verify
@@ -1053,7 +1085,9 @@ self_test() {
 		if [ "$args" = "-" ]; then
 			out="$(cd "$dir" && env -u GONOSUMDB -u GONOSUMCHECK -u GOINSECURE -u GOPRIVATE -u GONOPROXY PATH="$td/bin:$PATH" bash hack/verify-deps.sh 2>&1)" || rc=$?
 		else
-			out="$(cd "$dir" && env -u GONOSUMDB -u GONOSUMCHECK -u GOINSECURE -u GOPRIVATE -u GONOPROXY PATH="$td/bin:$PATH" bash hack/verify-deps.sh "$args" 2>&1)" || rc=$?
+			# Word-split on purpose: a case may pass a flag and its operand.
+			# shellcheck disable=SC2086
+			out="$(cd "$dir" && env -u GONOSUMDB -u GONOSUMCHECK -u GOINSECURE -u GOPRIVATE -u GONOPROXY PATH="$td/bin:$PATH" bash hack/verify-deps.sh $args 2>&1)" || rc=$?
 		fi
 		if [ "$want" = pass ]; then
 			[ "$rc" -eq 0 ] || verdict="want pass, exit $rc"
@@ -1128,6 +1162,11 @@ self_test() {
 	bg update-ok --update pass "2 new or changed" "github.com/Upper/New v1.2.0 # "
 	bg update-fresh --update cooldown "example.com/new v1.0.0 has a proxy-recorded commit time" "example.com/new v1.0.0 # "
 	bg update-mal --update "malicious-package check" "MAL-2026-0002"
+	bg modules-ok "--modules modules.txt" pass "OK: [verify-deps] 2 modules"
+	bg modules-exempt "--modules modules.txt" pass "exempt: example.com/fresh v1.1.0"
+	bg modules-fresh "--modules modules.txt" cooldown "example.com/young v0.2.0 has a proxy-recorded commit time"
+	bg modules-mal "--modules modules.txt" "malicious-package check" "MAL-2026-0004"
+	bg modules-missing "--modules absent.txt" modules "no module list"
 	bg update-network --update "lock (update)" "network failure"
 	wait
 	for ((i = 1; i <= seq; i++)); do
@@ -1140,6 +1179,7 @@ self_test() {
 
 case "${1:-}" in
 "") mkwork; check ;;
+--modules) [ $# -eq 2 ] || { echo "usage: hack/verify-deps.sh [--update | --self-test | --modules <file>]" >&2; exit 2; }; mkwork; modules "$2" ;;
 --update) [ $# -eq 1 ] || { echo "usage: hack/verify-deps.sh [--update | --self-test]" >&2; exit 2; }; mkwork; update ;;
 --self-test) [ $# -eq 1 ] || { echo "usage: hack/verify-deps.sh [--update | --self-test]" >&2; exit 2; }; self_test ;;
 *) echo "usage: hack/verify-deps.sh [--update | --self-test]" >&2; exit 2 ;;

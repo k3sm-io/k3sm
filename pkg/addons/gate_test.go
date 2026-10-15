@@ -32,14 +32,14 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
-// servingPosture is a server where metrics-server can serve: mesh serving certs
-// and a vm-labelled node in the cluster.
-var servingPosture = Posture{ClusterCAKubeletServing: true, VMNode: true}
+// servingPosture is a server where metrics-server can serve: mesh serving certs.
+// The add-on is a native pod, so no node capability is part of it.
+var servingPosture = Posture{ClusterCAKubeletServing: true}
 
 // TestMetricsServerAddonGate is the gate on WHERE the metrics-server add-on is
 // applied. Applied where it cannot serve, its APIService stays unavailable,
 // which breaks aggregated discovery and wedges namespace deletion, so it is
-// applied only on the mesh serving posture with a vm-labelled node, and never
+// applied only on the mesh serving posture, and never
 // over an operator's own metrics.k8s.io APIService. Elsewhere
 // it is skipped with one Info line naming the reason, and objects k3sm applied
 // earlier are withdrawn, the APIService first.
@@ -67,7 +67,7 @@ func TestMetricsServerAddonGate(t *testing.T) {
 		return n
 	}
 
-	t.Run("applied when both conditions hold", func(t *testing.T) {
+	t.Run("applied on the mesh serving posture", func(t *testing.T) {
 		actions, logs := converge(t, servingPosture)
 		if applies := verifyTrafficShape(t, afterGuardRead(t, actions)); len(applies) != len(wantMetricsServerObjects) {
 			t.Errorf("%d applies, want %d", len(applies), len(wantMetricsServerObjects))
@@ -82,9 +82,7 @@ func TestMetricsServerAddonGate(t *testing.T) {
 		posture Posture
 		reason  string
 	}{
-		{"skipped on the single-node posture", Posture{VMNode: true}, "single-node posture"},
-		{"skipped with no vm-labelled node", Posture{ClusterCAKubeletServing: true}, "no node carries the vm RuntimeClass label"},
-		{"skipped when neither holds", Posture{}, "single-node posture"},
+		{"skipped on the single-node posture", Posture{}, "single-node posture"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			actions, logs := converge(t, tc.posture)
@@ -120,7 +118,7 @@ func TestMetricsServerAddonGate(t *testing.T) {
 			live.SetManagedFields([]metav1.ManagedFieldsEntry{{Manager: manager, Operation: metav1.ManagedFieldsOperationApply, APIVersion: live.GetAPIVersion()}})
 			seed = append(seed, live)
 		}
-		actions, logs := converge(t, Posture{VMNode: true}, seed...)
+		actions, logs := converge(t, Posture{}, seed...)
 
 		var deletes []k8stesting.DeleteActionImpl
 		for _, a := range actions {
@@ -170,7 +168,7 @@ func TestMetricsServerAddonGate(t *testing.T) {
 			live.SetManagedFields([]metav1.ManagedFieldsEntry{{Manager: manager, Operation: metav1.ManagedFieldsOperationApply}})
 			seed = append(seed, live)
 		}
-		for _, p := range []Posture{servingPosture, {VMNode: true}, {ClusterCAKubeletServing: true}, {}} {
+		for _, p := range []Posture{servingPosture, {}} {
 			actions, logs := converge(t, p, seed...)
 			got := verbs(actions)
 			if got["patch"] != 0 || got["delete"] != 0 || got["list"] != 0 {
@@ -232,7 +230,7 @@ func TestMetricsServerAddonGate(t *testing.T) {
 			seed = append(seed, live)
 		}
 		fsys := fstest.MapFS{"metrics-server.yaml": &fstest.MapFile{Data: []byte(doc.String())}}
-		actions, _ := convergeFS(t, fsys, Posture{ClusterCAKubeletServing: true}, seed...)
+		actions, _ := convergeFS(t, fsys, Posture{}, seed...)
 		for _, a := range actions {
 			if a.GetVerb() != "delete" {
 				continue
@@ -269,8 +267,8 @@ func afterGuardRead(t *testing.T, actions []k8stesting.Action) []k8stesting.Acti
 func TestMetricsServerAddonRegate(t *testing.T) {
 	var (
 		undecided = Posture{ClusterCAKubeletServing: true, Undecided: "no Node is registered yet"}
-		noVMNode  = Posture{ClusterCAKubeletServing: true} // positive: Nodes exist, none labelled
-		vmNode    = servingPosture
+		failing   = Posture{} // positive: Nodes exist, and the requirement fails
+		serving   = servingPosture
 	)
 	ownedSeed := func(t *testing.T) []*unstructured.Unstructured {
 		t.Helper()
@@ -323,10 +321,10 @@ func TestMetricsServerAddonRegate(t *testing.T) {
 		return n
 	}
 
-	t.Run("a labelled node appearing after start is applied on the next tick", func(t *testing.T) {
-		actions, reads, logs := run(t, undecided, []Posture{noVMNode, vmNode}, 3)
+	t.Run("a requirement that holds after start is applied on the next tick", func(t *testing.T) {
+		actions, reads, logs := run(t, undecided, []Posture{failing, serving}, 3)
 		if got := count(actions, "patch"); got != len(wantMetricsServerObjects) {
-			t.Errorf("%d applies, want %d on the tick that saw the labelled node", got, len(wantMetricsServerObjects))
+			t.Errorf("%d applies, want %d on the tick that saw the requirement hold", got, len(wantMetricsServerObjects))
 		}
 		if got := count(actions, "delete"); got != 0 {
 			t.Errorf("%d deletes; one positive read must not withdraw", got)
@@ -340,21 +338,21 @@ func TestMetricsServerAddonRegate(t *testing.T) {
 	})
 
 	t.Run("a file applied at start leaves the loop a no-op", func(t *testing.T) {
-		actions, reads, _ := run(t, vmNode, []Posture{noVMNode}, 3)
+		actions, reads, _ := run(t, serving, []Posture{failing}, 3)
 		if len(actions) != 0 || reads != 0 {
 			t.Errorf("regate issued %d actions and %d posture reads after a full start-up apply, want none", len(actions), reads)
 		}
 	})
 
 	t.Run("a single stale read between undecided ones never withdraws", func(t *testing.T) {
-		actions, _, _ := run(t, undecided, []Posture{noVMNode, undecided, noVMNode, undecided}, 4, ownedSeed(t)...)
+		actions, _, _ := run(t, undecided, []Posture{failing, undecided, failing, undecided}, 4, ownedSeed(t)...)
 		if got := count(actions, "delete"); got != 0 {
 			t.Errorf("%d deletes; non-consecutive positive reads must not withdraw", got)
 		}
 	})
 
 	t.Run("two consecutive positive reads withdraw, once per process", func(t *testing.T) {
-		actions, _, logs := run(t, undecided, []Posture{noVMNode}, 5, ownedSeed(t)...)
+		actions, _, logs := run(t, undecided, []Posture{failing}, 5, ownedSeed(t)...)
 		if got := count(actions, "delete"); got != len(wantMetricsServerObjects) {
 			t.Fatalf("%d deletes, want %d (one withdrawal)", got, len(wantMetricsServerObjects))
 		}
@@ -380,7 +378,7 @@ func TestMetricsServerAddonRegate(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			r.Regate(ctx, func(context.Context) Posture { return vmNode }, make(chan time.Time))
+			r.Regate(ctx, func(context.Context) Posture { return serving }, make(chan time.Time))
 		}()
 		select {
 		case <-done:

@@ -398,19 +398,21 @@ this path yet (the event pipeline is planned). The log file is the only place th
 ## `kubectl top` Returns No Metrics
 
 k3sm ships metrics-server as an add-on, and the server applies it only on a server installed with
-`--mesh-ip` once a node in the cluster can run `vm` Pods. Until then `kubectl top` has no data. Check
-which case you are in:
+`--mesh-ip`. Until then `kubectl top` has no data. Check which case you are in:
 
 ```sh
 kubectl get apiservice v1beta1.metrics.k8s.io
-kubectl get nodes -l k3sm.io/virtualization=true
+kubectl get nodes -l node-role.kubernetes.io/control-plane=true
+kubectl -n kube-system get pods -l k8s-app=metrics-server -o wide
 ```
 
-No APIService means the add-on was not applied: the server is single-node without `--mesh-ip`, or no
-node can run `vm` Pods. A server installed with `--mesh-ip` re-checks every two minutes and applies it
-once a `vm`-capable node appears. An APIService that is not `Available` means the metrics-server Pod in `kube-system` is not
-Ready yet. `kubectl top node` shows host-wide figures for the server node and `<unknown>` for a worker. See [kubectl access](kubectl-access.md) and
-[Limitations](limitations.md#headline-divergences).
+No APIService means the add-on was not applied: the server is single-node without `--mesh-ip`. A
+server installed with `--mesh-ip` re-checks every two minutes and applies it once the first node has
+registered. An APIService that is not `Available` means the metrics-server Pod in `kube-system` is not
+Ready yet. The Pod runs only on a server node, so a Pod left `Pending` with no server node listed by
+the second command means no server has labelled its Node yet; each server does that at start.
+`kubectl top node` shows host-wide figures for every Ready node. See
+[kubectl access](kubectl-access.md) and [Limitations](limitations.md#headline-divergences).
 
 ## `kubectl exec -it` or `attach` Into a Linux Pod Is Refused
 

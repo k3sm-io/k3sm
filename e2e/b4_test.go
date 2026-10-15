@@ -540,7 +540,8 @@ func b4LegUpgrade(t *testing.T, c *Cluster, node string) {
 			if err != nil {
 				return err
 			}
-			delete(n.Labels, b4ControlPlaneLabel)
+			// The control-plane label stays: the server sets it on its own
+			// Node at every start, so it is k3sm's, not the seed's.
 			n.Spec.Taints = slices.DeleteFunc(n.Spec.Taints, func(x corev1.Taint) bool { return x.Key == b4OperatorTaintKey })
 			_, err = nodes.Update(context.Background(), n, metav1.UpdateOptions{})
 			return err

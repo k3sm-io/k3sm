@@ -387,9 +387,9 @@ the `node` row reads:
 | `role` | string | `server` when the node carries the `node-role.kubernetes.io/control-plane` label, `agent` otherwise |
 | `version` | string | the kubelet version the node reports: the Kubernetes version, then `+k3sm.` and the k3sm release as semver build metadata; omitted while the node has reported none |
 
-A node cannot set the `node-role.kubernetes.io/control-plane` label on itself; only a cluster admin
-can. k3sm does not set it, so in a cluster with more than one server the other servers report `agent`
-unless an admin has labelled them.
+A node cannot set the `node-role.kubernetes.io/control-plane` label on itself. Each server sets it
+to `true` on its own Node at start with its admin credentials, as k3s does, so every server reports
+`server`. A worker never carries the label.
 
 `version` is the node's own report of its kubelet version. It is advisory, not an attestation: the
 node writes it, and nothing verifies it against the binary the node runs. A missing `version` means
