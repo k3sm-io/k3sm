@@ -279,6 +279,8 @@ func (f serverJoinFixture) v2Sealed(t *testing.T) []byte {
 // authenticated header, so the import path opens it unchanged; the wait test refetches
 // it dozens of times and the production KDF cost (about 1.4 s per open under -race)
 // would be the whole test. The round trip is asserted so a format change fails here.
+// The 1000 is exactly the lowest count OpenBundle accepts (bundleMinPBKDF2Iters in
+// pkg/bootstrap); lowering it here makes every open fail with ErrBundleIterations.
 func sealCheap(t *testing.T, secret string, plaintext []byte) []byte {
 	t.Helper()
 	const iters = 1000
