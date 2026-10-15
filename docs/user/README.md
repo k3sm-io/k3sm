@@ -7,6 +7,15 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 > These pages describe user-visible behavior. The authoritative product design lives in
 > [the design document](../DESIGN.md).
 
+## Experimental and Alpha
+<a id="what-experimental-means"></a>
+
+Pages and features labeled **experimental** share one meaning. There is no upgrade-compatibility
+promise between releases, so a release may change or drop the feature and its data. Keep datastore
+backups (see [Backup and restore](backup-restore.md)) and do not use it for production. **Alpha**
+marks an API version (`v1alpha1`) with the same terms. Where a page also says an alpha is not yet
+run on hardware, that is an added caveat: nobody has exercised it on real Macs yet.
+
 ## Read in Order
 
 1. [Quickstart](quickstart.md) brings up one node and runs your first Pod in a few minutes.

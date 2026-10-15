@@ -131,7 +131,7 @@ That removes the serving workload, both Services, and the cache PVC. The underly
 - Weights never live in the image. They are downloaded on first start into the cache volume, so give
   that volume room for the model you are serving. A pinned `revision` is loaded from that volume rather
   than downloaded into it (see step 2).
-- Sharded serving is experimental: an alpha, for trusted tenancy only, and not yet run on hardware.
+- Sharded serving is [experimental](README.md#what-experimental-means): an alpha, for trusted tenancy only, and not yet run on hardware.
   A model may set `spec.distributed` (`ranks`, `backend`, `parallelism`), and the operator places
   the ranks as gang-scheduled rank Pods with per-rank DNS and reports placement and link health in
   status. The `ring` backend places over the existing mesh, or over a Thunderbolt cable between the

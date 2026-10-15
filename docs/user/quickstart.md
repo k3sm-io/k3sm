@@ -15,7 +15,8 @@ curl -fsSL https://k3sm.io/install.sh | sh
 The script checks that this is an Apple silicon Mac on macOS 26+, downloads the release tarball and
 its checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do, and
 then runs `sudo k3sm install`. It installs the newest published release. Until the first stable
-version is tagged, that means the newest pre-release. To pin a particular one, put the variable after
+version is tagged, that means the newest pre-release. To pin a particular one (the example names the release you are on today, so change it to the
+version you want), put the variable after
 the pipe so it reaches `sh`:
 
 ```sh
@@ -53,8 +54,8 @@ k3sm status         # one screen: daemons, apiserver, node, workloads, data root
 kubectl get nodes   # one Ready darwin node
 ```
 
-The `install` row names the two LaunchDaemons. They are what makes the cluster survive a reboot, and
-`k3sm status` is how you check they came back. Its exit code is the verdict, so a script can branch
+In that output, the `install` row of `k3sm status` names the two LaunchDaemons. They are what makes
+the cluster survive a reboot, and `k3sm status` is how you check they came back. Its exit code is the verdict, so a script can branch
 on it; `k3sm status --help` lists the codes.
 
 Install merged an admin context into your `~/.kube/config`, so your own `kubectl` reaches the cluster

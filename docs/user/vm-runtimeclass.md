@@ -18,8 +18,8 @@ Virtualization.framework.
 > still not wired.
 >
 > It ships **`linux/arm64` only** (`linux/amd64` needs in-guest translation
-> and is held for a later release); it passes against the release
-> build. This path is single-node.
+> and is held for a later release); its acceptance script
+> (`hack/acceptance/m11.sh`) runs against the release build. This path is single-node.
 
 ## When to Use It
 
