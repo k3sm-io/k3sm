@@ -876,16 +876,12 @@ func apiServerArgs(cfg Config) []string {
 		// objects — the admission half of the Node authorizer. It does not cover CRDs,
 		// so the net.k3sm.io/MeshPeer write stays guarded by bootstrap.AuthorizeMeshPeerWrite.
 		"--enable-admission-plugins=NodeRestriction",
-		// Enable the MutatingAdmissionPolicy API + feature gate so the
-		// EnsureDaemonSetTolerationMutation policy (which injects the provider toleration
-		// into DaemonSet-owned pods) is actually evaluated. MutatingAdmissionPolicy went
-		// GA (v1, on by default) in k8s v1.36 (kubernetes#136039); the v1.37 changelog
-		// removes neither the gate nor the v1beta1 group, so both flags are carried
-		// unchanged to the v1.37.1 pin. Caution: an invalid feature-gate name or a v1beta1 group
-		// the pinned apiserver does not serve makes kube-apiserver refuse to start — a
-		// kube bump must re-check both against the new apiserver.
-		"--runtime-config=admissionregistration.k8s.io/v1beta1=true",
-		"--feature-gates=MutatingAdmissionPolicy=true",
+		// No MutatingAdmissionPolicy flag: MAP is GA at the pin and served at
+		// admissionregistration.k8s.io/v1 by default (kubernetes#136039, GA in v1.36),
+		// which is the version EnsureDaemonSetTolerationMutation writes. A runtime-config
+		// or feature-gate entry the pinned apiserver no longer knows makes kube-apiserver
+		// refuse to start, so none is carried; a kube bump must re-check that v1 stays
+		// served by default.
 		// Audit logging: the shipped policy is structurally
 		// Metadata/None-only (see auditPolicyDoc — no Secret cleartext at rest),
 		// the log lands in the 0700 <workDir>/audit dir, and rotation is bounded

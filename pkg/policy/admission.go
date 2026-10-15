@@ -643,14 +643,14 @@ const daemonSetTolerationPatchExpr = `[JSONPatch{op: "add", path: "/spec/tolerat
 // nodeSelector. Safe to call on every server start (create-or-update; an unchanged
 // spec is not rewritten).
 //
-// This provisions objects for a API (admissionregistration.k8s.io/v1,
-// MutatingAdmissionPolicy) — the executor must enable the admissionregistration runtime-config and the
-// MutatingAdmissionPolicy feature gate on the apiserver (see executor.apiServerArgs) or
-// this policy is a runtime no-op.
+// This provisions objects for an API (admissionregistration.k8s.io/v1,
+// MutatingAdmissionPolicy) that the apiserver must serve, or this policy is a runtime
+// no-op. MAP is GA and v1 is served by default at the pinned kube version, so the
+// executor passes no runtime-config or feature gate for it (see executor.apiServerArgs).
 func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interface) error {
 	// Ignore — not Fail — because this is a scheduling-convenience injector, not a
 	// guard: MatchConstraints is all Pods/Create, so a Fail policy would turn any
-	// CEL/beta-machinery evaluation error into a cluster-wide denial of Pod create.
+	// CEL evaluation error into a cluster-wide denial of Pod create.
 	// Failing open instead degrades to the un-mutated status quo (the DS pod is created
 	// without the toleration and stays Unschedulable — visible and recoverable, no
 	// guard bypass: the os=darwin Deny VAP and the provider taint still hold). Mirrors
