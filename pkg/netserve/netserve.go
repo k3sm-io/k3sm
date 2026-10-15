@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"time"
 
@@ -215,6 +216,10 @@ type Server struct {
 	// binder plumbs the DNS VIP alias + binds 53/UDP+TCP through the selected
 	// host-network backend (netd helper when unprivileged, direct as root).
 	binder dnsBinder
+	// static are the backends of the Services pinned through
+	// proxy.WithStaticBackends rather than derived from EndpointSlices, keyed
+	// "namespace/name". Set in New, read-only afterwards.
+	static map[string][]netv1.Endpoint
 }
 
 // New builds the network Server: a proxy.Proxy over a routing table keyed by the
@@ -327,6 +332,7 @@ func New(cfg Config) *Server {
 			log.Warn("api-server endpoint did not parse; kubernetes VIP has no backend (in-pod kubectl degraded)", "endpoint", s.cfg.APIServerEndpoint, "err", err)
 		} else {
 			watchOpts = append(watchOpts, proxy.WithStaticBackends(static))
+			s.static = static
 		}
 	}
 	s.watch = proxy.NewWatcher(cfg.Client, s.proxy, log, watchOpts...)
@@ -334,6 +340,42 @@ func New(cfg Config) *Server {
 		s.policyWatch = proxy.NewPolicyWatcher(cfg.Client, s.policy, log, proxy.WithPodNodeScope(cfg.PodScopeNode))
 	}
 	return s
+}
+
+// VIPStates returns the Service proxy's routing table: one entry per routed
+// Service port with the Ready backends it routes to (proxy.Proxy.VIPStates).
+func (s *Server) VIPStates() []proxy.VIPState { return s.proxy.VIPStates() }
+
+// Synced reports whether the Service proxy's table has been built from synced
+// informers (proxy.Proxy.Synced).
+func (s *Server) Synced() bool { return s.proxy.Synced() }
+
+// PinnedBackends returns the backends this Server pins for Services instead of
+// deriving them from EndpointSlices (see Config.APIServerEndpoint), keyed
+// "namespace/name", each rendered "ip:port". It is what the proxy must route
+// those Services to, so a status check compares the table against it. The
+// result is owned by the caller.
+func (s *Server) PinnedBackends() map[string][]string {
+	out := make(map[string][]string, len(s.static))
+	for key, eps := range s.static {
+		addrs := make([]string, 0, len(eps))
+		for _, ep := range eps {
+			addrs = append(addrs, net.JoinHostPort(ep.IP, strconv.Itoa(int(ep.Port))))
+		}
+		slices.Sort(addrs)
+		out[key] = addrs
+	}
+	return out
+}
+
+// UnproxiedClusterIPs returns the ClusterIPs the proxy deliberately leaves to
+// another listener on this node: the cluster DNS VIP, which the in-process
+// resolver owns. Empty when the DNS VIP did not parse.
+func (s *Server) UnproxiedClusterIPs() []string {
+	if !s.dnsVIP.IsValid() {
+		return nil
+	}
+	return []string{s.dnsVIP.String()}
 }
 
 // staticAPIServerBackends renders the proxy static-backend map for the

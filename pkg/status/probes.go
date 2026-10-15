@@ -302,12 +302,17 @@ type Collector struct {
 	// leaves the report's joinTarget field out. It is consulted on an agent
 	// only.
 	AgentJoinServer func() (string, error)
-	Paths           Paths
-	EUID            int
-	ServiceUID      int
-	Now             func() time.Time
-	Version         version.Info
-	Host            string
+	// Services compares the server's Service proxy record with the API's
+	// Services and EndpointSlices (svcstatus.Comparer in production).
+	// OPTIONAL: nil leaves the services row out. It is consulted on a server
+	// only, and only once the record has been read.
+	Services   ServicesComparer
+	Paths      Paths
+	EUID       int
+	ServiceUID int
+	Now        func() time.Time
+	Version    version.Info
+	Host       string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

@@ -145,6 +145,10 @@ func (c Collector) Collect(ctx context.Context) Report {
 		if r, ok := c.meshClaimsRow(now()); ok {
 			rows = append(rows, r)
 		}
+		// The Service proxy's backend sets against the API's Ready endpoints.
+		if r, ok := c.servicesRow(ctx, serving, now()); ok {
+			rows = append(rows, r)
+		}
 	}
 	rows = append(rows,
 		c.kubeconfigRow(),
