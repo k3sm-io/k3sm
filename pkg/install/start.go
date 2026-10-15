@@ -65,8 +65,12 @@ func startPrecondition(ctx context.Context, sys System, cfg Config, d installedD
 // enables and bootstraps netd and then the node daemon through the restart
 // sequence (await unloaded, retrying bootstrap, await running, netd answering
 // before the node daemon goes), removes the stop marker only once they are
-// up, and uncordons the node, best effort. A node with no marker and every daemon running is
-// already started, and Start does nothing.
+// up, and uncordons the node, retrying until the apiserver answers within
+// uncordonBudget (ErrNodeStillCordoned, and the uncordon-pending marker, when
+// it does not). A node with no stop marker and every daemon running is
+// already started: Start restarts nothing. With the uncordon-pending marker
+// it re-runs the full uncordon (the repair); without it, one best-effort
+// attempt, which changes nothing on a node no stop annotated.
 func Start(ctx context.Context, sys System, cfg Config, actor, reason string) error {
 	cfg = cfg.withDefaults()
 	actor, reason, err := lifecycleIdentity(actor, reason)
@@ -83,6 +87,18 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 		pid, err := sys.LaunchctlServicePID(l)
 		return err != nil || pid == 0
 	}) {
+		// A start whose uncordon ran out of budget left the running node
+		// cordoned and recorded it; re-running the start is the repair, with
+		// the full budget. Otherwise one bounded, best-effort attempt: on a
+		// node no stop annotated it changes nothing, and an apiserver that is
+		// down must not turn a harmless re-run into a failure.
+		if uncordonPendingPresent(sys, cfg) {
+			if err := uncordonAfterStart(ctx, sys, cfg, actor, reason); err != nil {
+				return fmt.Errorf("start: %w", err)
+			}
+		} else {
+			markNode(ctx, cfg, false, actor, reason)
+		}
 		lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm start: already running, nothing to do", "actor", actor, "reason", reason, "result", "already-running")
 		return nil
 	}
@@ -107,9 +123,35 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 			return fmt.Errorf("start: the daemons are running but the stop marker %s could not be removed (re-run `sudo k3sm start`): %w", cfg.StopMarker, err)
 		}
 	}
-	markNode(ctx, cfg, false, actor, reason)
+	if err := uncordonAfterStart(ctx, sys, cfg, actor, reason); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
 	lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm start: started", "actor", actor, "reason", reason, "result", "started")
 	return nil
+}
+
+// uncordonAfterStart undoes what a stop did to the Node (awaitMarkNode within
+// uncordonBudget), for Start and for install --start. Success removes the
+// uncordon-pending marker. Running out of budget writes it, so a later
+// `k3sm start` on the running node repairs the cordon. A failure is one Error
+// line naming the last error's class, and is returned: the daemons are up,
+// but a node left cordoned is not started.
+func uncordonAfterStart(ctx context.Context, sys System, cfg Config, actor, reason string) error {
+	err := awaitMarkNode(ctx, cfg, false, actor, reason, uncordonBudget)
+	if err == nil {
+		if cerr := clearUncordonPending(sys, cfg); cerr != nil {
+			cfg.Logger.Warn("the node is uncordoned, but the uncordon-pending marker stays; the next start retries an uncordon that is already done", "err", cerr)
+		}
+		return nil
+	}
+	if errors.Is(err, ErrNodeStillCordoned) {
+		if werr := writeUncordonPending(sys, cfg, actor, time.Now()); werr != nil {
+			err = errors.Join(err, werr)
+		}
+	}
+	class, _ := markNodeErrorClass(err)
+	lifecycleLog(ctx, sys, cfg, slog.LevelError, "k3sm start: the node is still cordoned", "actor", actor, "reason", reason, "result", "still-cordoned", "class", class, "err", err)
+	return err
 }
 
 // Restart is `k3sm restart`: the daemons are restarted through the restart
@@ -178,13 +220,17 @@ func (d installedDaemons) manifest(cfg Config) []artifact {
 	return m
 }
 
+// UncordonBound is the longest a start retries the uncordon for.
+func UncordonBound() time.Duration { return uncordonBudget.running }
+
 // StartTimeBound is the longest a server start can take: booting out what an
 // interrupted stop left loaded, that stop's workload teardown, then the
 // restart sequence for netd (await unloaded, retrying bootstrap, await
-// running, then answering) and for the node daemon, and the uncordon.
+// running, then answering) and for the node daemon, and the uncordon's whole
+// retry window (uncordonBudget, which bounds every attempt inside it).
 func StartTimeBound() time.Duration {
 	precondition := serverRestartBudget.unload + netdRestartBudget.unload + podGroupStopGrace + vmHostKillWait
 	netd := 2*netdRestartBudget.unload + 2*netdRestartBudget.running
 	node := 2*serverRestartBudget.unload + serverRestartBudget.running
-	return precondition + netd + node + markNodeTimeout
+	return precondition + netd + node + uncordonBudget.running
 }

@@ -37,6 +37,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 
 	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/k3sm/pkg/dataroot"
@@ -243,7 +244,8 @@ func nodeMarker(sys install.System, dataRoot string) func(ctx context.Context, s
 	return func(ctx context.Context, stopped bool, actor, reason string) error {
 		kubeconfig, name, err := lifecycleNodeIdentity(sys, dataRoot)
 		if err != nil {
-			return err
+			// Read from local files, so a start's uncordon does not retry it.
+			return fmt.Errorf("%w: %w", install.ErrNodeIdentity, err)
 		}
 		_, cs, err := kubeclient.FromPath(kubeconfig)
 		if err != nil {
@@ -287,7 +289,19 @@ func lifecycleNodeIdentity(sys install.System, dataRoot string) (kubeconfig, nam
 // or removes the annotation and uncordons the Node if, and only if, the stop
 // did the cordon (!stopped). A start on a Node with no annotation changes
 // nothing. A rerun of a stop keeps the first stop's Cordoned answer.
+//
+// The patch carries the resourceVersion the decision was made on, so a
+// concurrent writer (the node daemon's own status updates, an administrator's
+// cordon) turns it into a 409 instead of a patch over a Node the decision no
+// longer describes; the Get-decide-Patch is then re-run.
 func markNodeObject(ctx context.Context, cs kubernetes.Interface, name string, stopped bool, actor, reason string, now time.Time) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		return markNodeOnce(ctx, cs, name, stopped, actor, reason, now)
+	})
+}
+
+// markNodeOnce is one Get-decide-Patch of markNodeObject.
+func markNodeOnce(ctx context.Context, cs kubernetes.Interface, name string, stopped bool, actor, reason string, now time.Time) error {
 	node, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get node %s: %w", name, err)
@@ -310,14 +324,20 @@ func markNodeObject(ctx context.Context, cs kubernetes.Interface, name string, s
 			return err
 		}
 		patch = map[string]any{
-			"metadata": map[string]any{"annotations": map[string]any{StoppedByUserAnnotation: string(value)}},
-			"spec":     map[string]any{"unschedulable": true},
+			"metadata": map[string]any{
+				"resourceVersion": node.ResourceVersion,
+				"annotations":     map[string]any{StoppedByUserAnnotation: string(value)},
+			},
+			"spec": map[string]any{"unschedulable": true},
 		}
 	} else {
 		if _, ok := node.Annotations[StoppedByUserAnnotation]; !ok {
 			return nil
 		}
-		patch = map[string]any{"metadata": map[string]any{"annotations": map[string]any{StoppedByUserAnnotation: nil}}}
+		patch = map[string]any{"metadata": map[string]any{
+			"resourceVersion": node.ResourceVersion,
+			"annotations":     map[string]any{StoppedByUserAnnotation: nil},
+		}}
 		if prior != nil && prior.Cordoned {
 			patch["spec"] = map[string]any{"unschedulable": false}
 		}
@@ -397,14 +417,18 @@ var startUsage = fmt.Sprintf(`Usage: sudo k3sm start [--reason TEXT] [--actor us
 
 Start k3sm on this Mac after 'k3sm stop': clear what a stop may have left
 (finishing an interrupted one), remove the stop marker, enable and start netd
-and then the node daemon, and uncordon the node (best effort). On a node that
-is already running it does nothing.
+and then the node daemon, and uncordon the node a stop cordoned, retrying
+until the apiserver answers (at most %s). On a node that is already running
+it restarts nothing: it finishes an uncordon an earlier start ran out of time
+for, and otherwise makes one best-effort uncordon attempt.
 
 It is cut off after %s, or by SIGINT, SIGTERM or SIGHUP; the stop marker
 stays until the daemons are up, so re-running it is safe.
 
-Exit codes: 0 started or already running; 1 failed; 2 usage; 3 not run as root.
-`, install.StartTimeBound()+lifecycleMargin)
+Exit codes: 0 started or already running; 1 failed, or the daemons are up but
+the node is still cordoned (the error says "still cordoned"; re-run
+'sudo k3sm start' to uncordon it); 2 usage; 3 not run as root.
+`, install.UncordonBound(), install.StartTimeBound()+lifecycleMargin)
 
 // restartUsage is `k3sm restart --help`.
 const restartUsage = `Usage: sudo k3sm restart [--start] [--reason TEXT] [--actor user|auto]
@@ -442,5 +466,13 @@ func runRestart(args []string, stderr io.Writer) int {
 	sys := install.NewDarwinSystem()
 	cfg := lifecycleConfig(sys, stderr)
 	cfg.Start = start
-	return lifecycleExit("restart", install.Restart(context.Background(), sys, cfg, actor, reason), stderr)
+	ctx := context.Background()
+	if start {
+		// --start may be a start: the same bound, and the same signals, as
+		// `k3sm start`, so its help and its behaviour agree.
+		var cancel context.CancelFunc
+		ctx, cancel = lifecycleContext(install.StartTimeBound())
+		defer cancel()
+	}
+	return lifecycleExit("restart", install.Restart(ctx, sys, cfg, actor, reason), stderr)
 }

@@ -55,6 +55,7 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- **`sudo k3sm start` no longer leaves a node cordoned when the apiserver answers late.** The uncordon is retried for up to 90 seconds, which covers a worker whose mesh comes up after its node daemon and a server whose control plane starts cold. If it still cannot land, `start` exits 1 saying the node is still cordoned, and running `sudo k3sm start` again uncordons it.
 - **The single-node datastore's write-ahead log is checkpointed again.** kine held a read transaction open from its start, so SQLite could never checkpoint, and `state.db-wal` grew by gigabytes a day until the data volume filled. The first boot after the upgrade folds the old log into `state.db`, which takes longer in proportion to its size and needs room for the database to grow; see [upgrade](https://k3sm.io/docs/upgrade/). Rolling back to an earlier release brings the growth back.
 - **A finished Pod's logs are readable after a node-daemon restart.** Before, `kubectl logs` answered that the Pod did not exist and the log tree could be removed as an orphan.
 - **A worker on lossy Wi-Fi keeps posting its status and Lease.** Those writes now use their own connection with a short timeout and a health check, so a connection that went half-open after a roam is replaced.

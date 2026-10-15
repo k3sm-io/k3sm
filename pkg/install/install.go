@@ -1437,6 +1437,10 @@ type Config struct {
 	// StopMarker is the path of the user-stop marker `k3sm stop` writes and
 	// `k3sm start` removes (see lifecycle.go). Empty means DefaultStopMarkerPath.
 	StopMarker string
+	// UncordonPendingMarker is the marker a start writes when its uncordon ran
+	// out of budget (see lifecycle.go). Empty means DefaultUncordonPendingName
+	// beside StopMarker.
+	UncordonPendingMarker string
 	// Start is `--start`: an install or a restart on a node the user stopped
 	// starts it again. Without it, a stopped node is updated and left stopped
 	// (no label is enabled or bootstrapped while a stop marker is present).
@@ -1445,8 +1449,8 @@ type Config struct {
 	// annotation (stopped true), or undoes what a stop did (stopped false).
 	// It is called by Stop before the node daemon goes down, and by Start (and
 	// an install or restart with Start) once the daemons are back. Nil skips
-	// it. BEST EFFORT: the call is bounded by markNodeTimeout and a failure is
-	// one warning, never a stop or start failure.
+	// it. The cordon is best effort (one warning); a start's uncordon retries
+	// (uncordonAfterStart in start.go).
 	MarkNode func(ctx context.Context, stopped bool, actor, reason string) error
 	// RemoveMesh asks the running netd to tear the wireguard mesh down (the
 	// netd RemoveMesh RPC). Stop calls it after the node daemon is gone and
@@ -1505,6 +1509,9 @@ type userStopState struct {
 func (c Config) withDefaults() Config {
 	if c.StopMarker == "" {
 		c.StopMarker = DefaultStopMarkerPath
+	}
+	if c.UncordonPendingMarker == "" {
+		c.UncordonPendingMarker = filepath.Join(filepath.Dir(c.StopMarker), DefaultUncordonPendingName)
 	}
 	if c.ServiceUser == "" {
 		c.ServiceUser = DefaultServiceUser
@@ -2519,7 +2526,9 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 		if err := sys.RemoveStopMarker(cfg.StopMarker); err != nil {
 			return fmt.Errorf("install: --start: the daemons are running but the stop marker %s could not be removed (run `sudo k3sm start`): %w", cfg.StopMarker, err)
 		}
-		markNode(ctx, cfg, false, ActorUser, "k3sm install --start")
+		if err := uncordonAfterStart(ctx, sys, cfg, ActorUser, "k3sm install --start"); err != nil {
+			return fmt.Errorf("install: --start: %w", err)
+		}
 	}
 	return nil
 }
@@ -2727,6 +2736,7 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// longer exists. An operator's own disable, with no stop marker, is not
 	// touched (uninstall removes only what k3sm created).
 	note(clearUserStop(sys, cfg, m))
+	note(clearUncordonPending(sys, cfg))
 	if firstErr != nil {
 		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}
