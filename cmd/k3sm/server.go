@@ -1182,8 +1182,8 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	// controller (KCM), so the CREATE-Warn advisory above never reaches its author and
 	// the pod sits Unschedulable against the provider taint. Inject the provider
 	// toleration (never the os=darwin nodeSelector — Res.7) so DS pods schedule.
-	// CHANGES the stored object, unlike the Warn/Deny VAPs. Log-and-continue; requires
-	// the executor's v1beta1 runtime-config + MutatingAdmissionPolicy feature gate.
+	// CHANGES the stored object, unlike the Warn/Deny VAPs. Log-and-continue; writes
+	// admissionregistration.k8s.io/v1, which the pinned apiserver serves by default.
 	if err := policy.EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
 		logger.Error("provision daemonset-toleration mutating policy", "err", err)
 	}
