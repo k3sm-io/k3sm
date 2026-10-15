@@ -29,10 +29,12 @@ Two alternatives:
 
 - **Homebrew** is planned, and the `k3sm-io/tap` is not published yet. When it ships, run
   `brew install k3sm-io/tap/k3sm && sudo k3sm install`.
-- **From source**, if you would rather build it yourself: clone the four `k3sm.io` repositories side
-  by side, build with `CGO_ENABLED=1 go build -o k3sm ./cmd/k3sm`, then run `sudo ./k3sm install`.
-  The full steps are in the
-  [repository README](https://github.com/k3sm-io/k3sm#quick-start).
+- **From source**, if you would rather build it yourself: clone `apis`, `runtimed`, `darwin-net`
+  and `k3sm` side by side, run `go work init ./apis ./runtimed ./darwin-net ./k3sm`, build with
+  `CGO_ENABLED=1 go build -o k3sm ./cmd/k3sm` inside `k3sm`, assemble the install set with
+  `hack/release/stage.sh ../stage`, then run `sudo ../stage/k3sm install`. The staging script
+  needs the Command Line Tools, a signed-in `gh` and the Go release it pins. The full steps are
+  in the [repository README](https://github.com/k3sm-io/k3sm#quick-start).
 
 The one-time admin step (`sudo k3sm install`, which the script runs for you after printing what it
 is about to do) creates the unprivileged `_k3sm` user, installs the LaunchDaemons, and writes an

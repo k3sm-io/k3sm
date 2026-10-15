@@ -140,8 +140,8 @@ Every channel manages the same `/Library/k3sm`. Once more than one has shipped, 
 
 ### Installing From k3sm.app
 
-k3sm.app is closed source and free to use; the rest of k3sm is Apache-2.0, and the command-line
-install needs nothing from the app.
+k3sm.app is built from its own public repository, [k3sm-io/app](https://github.com/k3sm-io/app),
+a separate SwiftPM package. The command-line install needs nothing from the app.
 
 The k3sm app installs, updates and uninstalls with the same `/Library/k3sm`. Each of those
 actions asks for an administrator password once. That step copies the app's bundled files into a
