@@ -25,6 +25,9 @@ import "errors"
 // there is nothing to degrade to; production runs on darwin with cgo enabled.
 var errHostSampleUnsupported = errors.New("node host sampling requires darwin with cgo")
 
+// readHostMemory is unsupported off darwin/cgo.
+func readHostMemory() (hostMemory, error) { return hostMemory{}, errHostSampleUnsupported }
+
 // sampleHostMemory is unsupported off darwin/cgo.
 func sampleHostMemory(int64) (int64, error) { return 0, errHostSampleUnsupported }
 

@@ -32,7 +32,10 @@ are **not** more optimistic than the profile.
   it, so `kubectl top` has no data there. Where it runs, a native Pod's figures are the CPU time and
   memory footprint its processes used, read with `proc_pid_rusage`. These are usage figures, and k3sm
   enforces no CPU quota against them.
-  `kubectl top node` has no figures, because a node publishes no node-wide sample. If a
+  `kubectl top node` reports host-wide usage, so a node's figures include processes k3sm did not
+  start and can exceed its allocatable. On a multi-node cluster a worker's row shows `<unknown>` in
+  every column, because metrics-server, running in a `vm` Pod, cannot reach another node over the
+  mesh. If a
   metrics-server you installed yourself already serves the API, k3sm leaves it alone.
 - Workloads must be adapted. A raw upstream `[Conformance]` Pod, one that assumes a Linux image,
   bind mounts, or Linux-only fields, is rejected at admission or stranded. Images are the k3sm native

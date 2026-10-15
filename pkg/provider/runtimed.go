@@ -67,11 +67,14 @@ const resyncInterval = 10 * time.Second
 // last-seen Pod spec keyed by pod id). The wrapped runtime is itself
 // concurrency-safe. The status callback set by Watch runs OUTSIDE mu.
 type runtimedRuntime struct {
-	rt       runtimev1.RuntimeServer
-	nodeName string
-	nodeIP   string
-	rootfs   string
-	dyldShim string
+	rt runtimev1.RuntimeServer
+	// nodeSampler reads the host for the stats summary's node row; nil uses
+	// defaultHostSampler. Set only before use (tests), never mutated after.
+	nodeSampler hostSampler
+	nodeName    string
+	nodeIP      string
+	rootfs      string
+	dyldShim    string
 	// pathShim is the path-rebase DYLD shim runtimed injects into every pod
 	// (RuntimedConfig.PathShim). The provider does not inject it itself — it
 	// keeps it only to name the file in each pod's Seatbelt read allow alongside
@@ -2704,7 +2707,7 @@ func (r *runtimedRuntime) GetPod(ctx context.Context, namespace, name string) (*
 // to give (a host-process pod whose sampler was never armed, or a vm pod whose
 // guest agent answered with none).
 func (r *runtimedRuntime) StatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
-	summary := &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: r.nodeName}}
+	summary := &statsv1alpha1.Summary{Node: nodeStats(r.nodeSampler, r.nodeName, time.Now())}
 	resp, err := r.rt.ListPodStats(ctx, &runtimev1.ListPodStatsRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("runtimed list pod stats: %w", err)
