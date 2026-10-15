@@ -51,8 +51,9 @@ type ServicesComparison struct {
 	// although nothing about them changed after the record was written.
 	Diverging []ServicePortDivergence
 	// Settling are the Service ports that differ and whose Service or
-	// EndpointSlices changed after the record was written (or whose Service is
-	// gone), so the record cannot have seen the change yet.
+	// EndpointSlices changed after the record's UpdatedAt (or whose Service is
+	// gone), so the record cannot have seen the change yet. Any settling port
+	// makes the row unknown.
 	Settling []ServicePortDivergence
 }
 
@@ -111,44 +112,71 @@ func (c Collector) servicesRow(ctx context.Context, serving bool, now time.Time)
 	return servicesRowFrom(row, rec, cmp), true
 }
 
+// The bounds on how much of a comparison the row's text names. A cluster with
+// many diverging ports would otherwise turn one row into a page.
+const (
+	servicesMaxPorts = 8
+	servicesMaxAddrs = 4
+)
+
 // servicesRowFrom renders the verdict of a comparison onto row. Pure.
+//
+// A settling port makes the row unknown, never ok: it differs from the API, and
+// the record is older than the change that may explain it, so nothing has shown
+// that it routes correctly. A Service held in a changing state would otherwise
+// keep a wrong backend set reading as healthy.
 func servicesRowFrom(row Row, rec ServicesRecord, cmp ServicesComparison) Row {
 	row.Wide["ports"] = fmt.Sprint(len(rec.VIPs))
 	if len(cmp.Settling) > 0 {
 		row.Wide["settling"] = describeDivergences(cmp.Settling)
 	}
-	if len(cmp.Diverging) == 0 {
+	switch {
+	case len(cmp.Diverging) > 0:
+		row.State, row.Severity = StateUnhealthy, SeverityWarn
+		row.Detail = fmt.Sprintf("%d Service port(s) route to backends that differ from the API's Ready endpoints: %s",
+			len(cmp.Diverging), describeDivergences(cmp.Diverging))
+		row.Remedy = ServicesRemedy
+	case len(cmp.Settling) > 0:
+		row.State, row.Severity = StateUnknown, SeverityUnknown
+		row.Detail = fmt.Sprintf("%d Service port(s) differ from the API and changed after the record was written, or their Service is gone, so they cannot be compared yet: %s",
+			len(cmp.Settling), describeDivergences(cmp.Settling))
+	default:
 		row.State, row.Severity = StateOK, SeverityOK
 		row.Detail = fmt.Sprintf("%d Service port(s) route to the API's Ready endpoints", len(rec.VIPs))
-		if n := len(cmp.Settling); n > 0 {
-			row.Detail += fmt.Sprintf("; %d changed since the record and are not compared yet", n)
-		}
-		return row
 	}
-	row.State, row.Severity = StateUnhealthy, SeverityWarn
-	row.Detail = fmt.Sprintf("%d Service port(s) route to backends that differ from the API's Ready endpoints: %s",
-		len(cmp.Diverging), describeDivergences(cmp.Diverging))
-	row.Remedy = ServicesRemedy
 	return row
 }
 
 // describeDivergences renders each port as "ns/name ip:port/proto missing a, b
-// extra c", joined with "; ".
+// extra c", joined with "; ", naming at most servicesMaxPorts ports and
+// servicesMaxAddrs addresses per list.
 func describeDivergences(ds []ServicePortDivergence) string {
-	parts := make([]string, 0, len(ds))
-	for _, d := range ds {
+	parts := make([]string, 0, min(len(ds), servicesMaxPorts)+1)
+	for i, d := range ds {
+		if i == servicesMaxPorts {
+			parts = append(parts, fmt.Sprintf("and %d more", len(ds)-servicesMaxPorts))
+			break
+		}
 		owner := "(no Service)"
 		if d.Name != "" {
 			owner = d.Namespace + "/" + d.Name
 		}
 		p := owner + " " + d.Port
 		if len(d.Missing) > 0 {
-			p += " missing " + strings.Join(d.Missing, ", ")
+			p += " missing " + clipAddrs(d.Missing)
 		}
 		if len(d.Extra) > 0 {
-			p += " extra " + strings.Join(d.Extra, ", ")
+			p += " extra " + clipAddrs(d.Extra)
 		}
 		parts = append(parts, p)
 	}
 	return strings.Join(parts, "; ")
+}
+
+// clipAddrs joins at most servicesMaxAddrs addresses, then counts the rest.
+func clipAddrs(addrs []string) string {
+	if len(addrs) <= servicesMaxAddrs {
+		return strings.Join(addrs, ", ")
+	}
+	return fmt.Sprintf("%s (+%d more)", strings.Join(addrs[:servicesMaxAddrs], ", "), len(addrs)-servicesMaxAddrs)
 }

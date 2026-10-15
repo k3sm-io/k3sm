@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -43,7 +44,7 @@ func (f fakeServicesComparer) CompareServices(context.Context, ServicesRecord) (
 // TestServicesRowNamesADivergingVIP pins the services row: matching sets are ok
 // with the port count; a Service port the proxy routes without a Ready backend
 // the API has is a warning naming the Service, the VIP and the missing backend,
-// and it moves the verdict; a change newer than the record is not a warning; an
+// and it moves the verdict; a change newer than the record is unknown, never ok; an
 // unreadable record is unknown with the sudo remedy and costs no LIST; an absent
 // or stale record is unknown; a failed LIST is unknown.
 func TestServicesRowNamesADivergingVIP(t *testing.T) {
@@ -82,7 +83,7 @@ func TestServicesRowNamesADivergingVIP(t *testing.T) {
 			detail: []string{"web/front", "10.43.0.20:80/TCP", "missing 100.64.0.9:8080"}, remedy: ServicesRemedy, wantCalls: 1},
 		{name: "settling", fs: fakeFS{contents: map[string][]byte{path: encode(fresh)}}, serving: true,
 			cmp:     ServicesComparison{Settling: []ServicePortDivergence{diverging}},
-			wantSev: SeverityOK, wantState: StateOK, detail: []string{"1 changed since the record"}, wantCalls: 1},
+			wantSev: SeverityUnknown, wantState: StateUnknown, detail: []string{"cannot be compared yet", "web/front", "missing 100.64.0.9:8080"}, wantCalls: 1},
 		{name: "unreadable", fs: fakeFS{unreadable: map[string]bool{path: true}}, serving: true,
 			wantSev: SeverityUnknown, wantState: StateUnknown, detail: []string{"unreadable as this user"}, remedy: "sudo k3sm status"},
 		{name: "absent", fs: fakeFS{}, serving: true,
@@ -127,4 +128,33 @@ func TestServicesRowNamesADivergingVIP(t *testing.T) {
 			t.Error("a report with no comparer carries a services row")
 		}
 	})
+}
+
+// TestServicesRowClipsItsText pins the bounds on the row's text: at most eight
+// ports named, then a count, and at most four addresses per list, then a count.
+func TestServicesRowClipsItsText(t *testing.T) {
+	var ds []ServicePortDivergence
+	for i := range 10 {
+		d := ServicePortDivergence{Namespace: "web", Name: fmt.Sprintf("svc%d", i), Port: fmt.Sprintf("10.43.0.%d:80/TCP", i)}
+		for j := range 6 {
+			d.Missing = append(d.Missing, fmt.Sprintf("100.64.0.%d:80", j))
+		}
+		ds = append(ds, d)
+	}
+	row := servicesRowFrom(Row{Name: RowServices, Wide: map[string]string{}}, ServicesRecord{},
+		ServicesComparison{Diverging: ds, Settling: ds})
+	for _, text := range []string{row.Detail, row.Wide["settling"]} {
+		if !strings.Contains(text, "web/svc7 ") || strings.Contains(text, "web/svc8 ") {
+			t.Errorf("text names other than the first eight ports: %q", text)
+		}
+		if !strings.Contains(text, "and 2 more") {
+			t.Errorf("text does not count the unnamed ports: %q", text)
+		}
+		if strings.Contains(text, "100.64.0.4:80") || !strings.Contains(text, "100.64.0.3:80 (+2 more)") {
+			t.Errorf("text does not clip each port's addresses at four: %q", text)
+		}
+	}
+	if row.Severity != SeverityWarn {
+		t.Errorf("a diverging port with settling ones reported %v, want warn", row.Severity)
+	}
 }
