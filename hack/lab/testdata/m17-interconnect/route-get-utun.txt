@@ -1,0 +1,5 @@
+   route to: 10.42.1.7
+destination: 10.42.1.0
+       mask: 255.255.255.0
+  interface: utun3
+      flags: <UP,DONE,STATIC>

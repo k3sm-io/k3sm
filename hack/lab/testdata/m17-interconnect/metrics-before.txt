@@ -1,0 +1,9 @@
+# HELP k3sm_interconnect_member_transitions_total Member state transitions, per node.
+# TYPE k3sm_interconnect_member_transitions_total counter
+k3sm_interconnect_member_transitions_total{node="node-a"} 3
+k3sm_interconnect_member_transitions_total{node="node-b"} 1
+# TYPE k3sm_interconnect_attached_pods gauge
+k3sm_interconnect_attached_pods 2
+# TYPE k3sm_interconnect_netd_verb_results_total counter
+k3sm_interconnect_netd_verb_results_total{result="ok",verb="EnsureInterconnectAlias"} 7
+k3sm_interconnect_netd_verb_results_total{result="ok",verb="RemoveInterconnectAlias"} 1

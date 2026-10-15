@@ -1,0 +1,2 @@
+? (192.0.2.1) at 0:11:22:33:44:55 on en0 ifscope [ethernet]
+? (169.254.0.10) at 36:a1:5c:0:0:2 on bridge0 ifscope [bridge]

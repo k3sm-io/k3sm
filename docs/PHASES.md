@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-10-10
-updated_by: M19 Amendment A (docs/m19-plan.md R3 — the opt-in module signature check)
+updated: 2026-10-15
+updated_by: B528 (B451 BI10, the two-Mac interconnect ladder authored; the cable run owed)
 
 phases:
   - id: M0
@@ -1277,7 +1277,7 @@ phases:
             done: false
             desc: "User docs, same change: docs/user/direct-links.md (the plug-and-join walkthrough, the cable-only cluster with one server, the TRUST STATEMENT in its own section — plaintext on the cable, every cable device can send as any pod, vm guest traffic rides the route, rank ports are reachable by every pod, the beacon discloses the pin and node name to every cable neighbour — the arming window and --cluster with the no-pin limitation stated, the sharded MLXModel example, the Thunderbolt 5 / RDMA ceiling, what unplugging does as facts with reasons including cable-only NotReady and the eviction timing, and what a mixed-version roll looks like), with cross-links and sections in multi-node.md, limitations.md, troubleshooting.md and the user-docs README. Figures name the Mac models and macOS build, never a hostname; EXPERIMENTAL as an attribute."
           - id: M17.3-d8
-            done: false
+            done: false  # 2026-10-15 — superseded by the B451 amendment (BI10): the two-Mac interconnect ladder landed as hack/lab/m17-interconnect.sh (r0-disarmed..r9-downgrade, --plan, --self-test, --verify-twice), hack/lab/m17.sh execs it, and the M17-lab row reads skeleton:false. The direct-link rungs below (pairing, the /25 route, the Wi-Fi pair, the zone golden, the mixed-version cable rung) left with DirectLink (BI5/BI11). The cable run on the rig is owed (M17.3-a3), so this stays open
             desc: "hack/lab/m17.sh: the REAL ladder replacing the skeleton, flipping the phases.json M17-lab skeleton flag to false IN THE SAME CHANGE (the M11.5 / M15.3 precedent), with the M11 run-log header (gate, artifact sha256, per-repo git SHA, result). Rungs: cable-only join via pairing; the direct route up; the R15 figures recorded; LAN pulled → the cluster stays; cable pulled under load with the LAN present → fallback measured; peer asleep with the cable intact → fallback within 20 s; cable-only unplug → NotReady, replug → reconverges; pairing from Wi-Fi refused; the real-socket zone value matches the golden; the mixed-version rung (one Mac old, one new, cable live); downgrade with a live cable leaves no stale enX state; the sharded ring model (M17.4) serves through rank 0 with its tokens/s beside the single-Mac figure."
         acceptance:
           - id: M17.3-a1

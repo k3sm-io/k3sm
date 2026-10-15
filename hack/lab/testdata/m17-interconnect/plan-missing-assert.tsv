@@ -1,0 +1,3 @@
+# a rung whose assertion function does not exist
+r0-disarmed|disarmed after the join|crd,bridge|assert_r0_disarmed|r0-disarmed/|BI6
+r10-extra|a rung with no assertion|crd|assert_r10_extra|r10-extra/|BI10

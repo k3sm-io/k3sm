@@ -1,0 +1,2 @@
+k3sm_interconnect_netd_verb_results_total{result="ok",verb="EnsureInterconnectAlias"} 9
+k3sm_interconnect_netd_verb_results_total{result="ok",verb="EnsureAlias"} 1

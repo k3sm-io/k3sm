@@ -1,0 +1,16 @@
+# k3sm lab run log
+gate: m17-lab
+mode: ladder
+rc_tag: v0.4.0-rc.1
+artifact_sha256: aaaa000000000000000000000000000000000000000000000000000000000001
+git_sha.apis: 1111111111111111111111111111111111111111
+git_sha.runtimed: 2222222222222222222222222222222222222222
+git_sha.darwin-net: 3333333333333333333333333333333333333333
+git_sha.k3sm: 4444444444444444444444444444444444444444
+started_utc: 2026-10-20T10:00:00Z
+result: FAIL (provisional; the final result line below is the verdict, and a log that ends here did not finish)
+RUNG r0-disarmed PASS
+RUNG r5-ring PASS
+gate: m17-lab
+finished_utc: 2026-10-20T10:00:00Z
+result: PASS

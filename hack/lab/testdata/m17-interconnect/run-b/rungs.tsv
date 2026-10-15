@@ -1,0 +1,10 @@
+r0-disarmed	PASS
+r1-arm	PASS
+r2-attach	PASS
+r3-cable-path	PASS
+r4-mesh-traffic	PASS
+r5-ring	PASS
+r6-unplug	PASS
+r7-desired-forge	PASS
+r8-killswitch	PASS
+r9-downgrade	PASS

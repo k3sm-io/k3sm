@@ -1,0 +1,6 @@
+64 bytes from 100.64.0.1: icmp_seq=0 ttl=64 time=1.2 ms
+64 bytes from 100.64.0.1: icmp_seq=1 ttl=64 time=1.2 ms
+64 bytes from 100.64.0.1: icmp_seq=2 ttl=64 time=1.2 ms
+64 bytes from 100.64.0.1: icmp_seq=6 ttl=64 time=1.2 ms
+64 bytes from 100.64.0.1: icmp_seq=7 ttl=64 time=1.2 ms
+64 bytes from 100.64.0.1: icmp_seq=8 ttl=64 time=1.2 ms
