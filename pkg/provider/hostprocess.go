@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
@@ -62,6 +63,10 @@ type HostProcess struct {
 	// mutated (set before any goroutine starts → race-free without a lock); a nil
 	// injection is replaced with a no-op so the hot pod path never nil-panics.
 	recorder record.EventRecorder
+
+	// nodeSampler reads the host for the stats summary's node row; nil uses
+	// defaultHostSampler. Set only before use (tests), never mutated after.
+	nodeSampler hostSampler
 
 	mu     sync.Mutex
 	pods   map[string]*podRec
@@ -374,12 +379,11 @@ func (p *HostProcess) GetContainerLogs(ctx context.Context, ns, podName, contain
 	return os.Open(pr.logPath)
 }
 
-// GetStatsSummary returns the kubelet stats Summary for this node. It IS
-// implemented — the summary is what GetMetricsResource transcodes — but the
-// HostProcess provider meters nothing, so it carries the node identity and no CPU
-// or memory sample.
+// GetStatsSummary returns the kubelet stats Summary for this node. The
+// HostProcess provider meters no pods, so the summary carries only the node row:
+// host-wide CPU and memory from nodeStats.
 func (p *HostProcess) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
-	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: p.nodeName}}, nil
+	return &statsv1alpha1.Summary{Node: nodeStats(p.nodeSampler, p.nodeName, time.Now())}, nil
 }
 
 // --- not implemented on this provider ---
@@ -403,11 +407,8 @@ func (p *HostProcess) PortForward(ctx context.Context, ns, podName string, port 
 }
 
 // GetMetricsResource transcodes this provider's Summary into the kubelet
-// resource-metrics families. The HostProcess provider meters nothing, so its
-// node-only Summary carries no CPU or memory sample and the transcode yields an
-// EMPTY scrape target — the same honest answer the old stub gave, now produced by
-// the one shared builder rather than a second hard-coded nil (so a future
-// HostProcess that does meter lights up without touching this method).
+// resource-metrics families. The HostProcess provider meters no pods, so the
+// transcode carries the node families only, through the one shared builder.
 func (p *HostProcess) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily, error) {
 	summary, err := p.GetStatsSummary(ctx)
 	if err != nil {

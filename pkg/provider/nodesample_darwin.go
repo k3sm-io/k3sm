@@ -35,6 +35,7 @@ typedef struct {
 	uint64_t internal;
 	uint64_t purgeable;
 	uint64_t compressor;
+	uint64_t free;
 } k3sm_vmstat;
 
 // k3sm_required_vm_count is the number of natural_t units host_statistics64 must
@@ -75,6 +76,7 @@ static int k3sm_vmstat_read(mach_port_t host, k3sm_vmstat *out) {
 	out->internal = (uint64_t)st.internal_page_count;
 	out->purgeable = (uint64_t)st.purgeable_count;
 	out->compressor = (uint64_t)st.compressor_page_count;
+	out->free = (uint64_t)st.free_count;
 	return 0;
 }
 
@@ -113,25 +115,24 @@ import (
 // samples, which is until it exits.
 var machHostPort = sync.OnceValue(func() C.mach_port_t { return C.mach_host_self() })
 
-// sampleHostMemory returns available and total physical memory in bytes.
-//
-// available = capacity - workingSet, with
+// readHostMemory takes one host_statistics64 reading and returns the host
+// working set and free bytes, with
 //
 //	workingSet = (wire + internal - purgeable + compressor) * pageSize
+//	free       = free_count * pageSize
 //
 // See hostStats.MemAvailableBytes for why speculative and inactive pages are
-// absent from that sum; this function is the sole producer of that contract.
-// capacity is supplied by the caller (hw.memsize) rather than re-derived from the
-// page classes, so the minuend is the same host fact the node advertises as
-// Capacity.
-func sampleHostMemory(capacityBytes int64) (int64, error) {
+// absent from the working-set sum; this function is the sole producer of that
+// formula, shared by the MemoryPressure condition (sampleHostMemory) and the
+// node stats summary (nodeStats).
+func readHostMemory() (hostMemory, error) {
 	var st C.k3sm_vmstat
 	if rc := C.k3sm_vmstat_read(machHostPort(), &st); rc != 0 {
-		return 0, fmt.Errorf("host_statistics64: rc %d", int(rc))
+		return hostMemory{}, fmt.Errorf("host_statistics64: rc %d", int(rc))
 	}
 	pageSize := int64(st.page_size)
 	if pageSize <= 0 {
-		return 0, fmt.Errorf("host_page_size reported %d", pageSize)
+		return hostMemory{}, fmt.Errorf("host_page_size reported %d", pageSize)
 	}
 	// purgeable pages are a SUBSET of internal ones, so the subtraction cannot
 	// take the page total negative on a coherent reading; clamp anyway rather
@@ -140,8 +141,23 @@ func sampleHostMemory(capacityBytes int64) (int64, error) {
 	if pages < 0 {
 		pages = 0
 	}
-	workingSet := pages * pageSize
-	available := capacityBytes - workingSet
+	return hostMemory{
+		workingSetBytes: pages * pageSize,
+		freeBytes:       int64(st.free) * pageSize,
+	}, nil
+}
+
+// sampleHostMemory returns available physical memory in bytes:
+// available = capacity - workingSet (readHostMemory), floored at zero.
+// capacity is supplied by the caller (hw.memsize) rather than re-derived from the
+// page classes, so the minuend is the same host fact the node advertises as
+// Capacity.
+func sampleHostMemory(capacityBytes int64) (int64, error) {
+	m, err := readHostMemory()
+	if err != nil {
+		return 0, err
+	}
+	available := capacityBytes - m.workingSetBytes
 	if available < 0 {
 		available = 0
 	}

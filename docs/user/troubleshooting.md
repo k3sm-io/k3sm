@@ -376,7 +376,7 @@ kubectl get nodes -l k3sm.io/virtualization=true
 No APIService means the add-on was not applied: the server is single-node without `--mesh-ip`, or no
 node can run `vm` Pods. A server installed with `--mesh-ip` re-checks every two minutes and applies it
 once a `vm`-capable node appears. An APIService that is not `Available` means the metrics-server Pod in `kube-system` is not
-Ready yet. `kubectl top node` has no figures in any case. See [kubectl access](kubectl-access.md) and
+Ready yet. `kubectl top node` shows host-wide figures for the server node and `<unknown>` for a worker. See [kubectl access](kubectl-access.md) and
 [Limitations](limitations.md#headline-divergences).
 
 ## `kubectl exec -it` or `attach` Into a Linux Pod Is Refused

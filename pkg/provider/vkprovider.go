@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"io"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,9 @@ import (
 type VKProvider struct {
 	rt       Runtime
 	nodeName string
+	// nodeSampler reads the host for the node row of a StatsSource-less
+	// summary; nil uses defaultHostSampler. Set only before use (tests).
+	nodeSampler hostSampler
 }
 
 // NewVKProvider returns a VKProvider over rt. nodeName is reported in the stats
@@ -253,12 +257,12 @@ func (v *VKProvider) PortForward(ctx context.Context, namespace, podName string,
 // GetStatsSummary returns the kubelet Summary API snapshot kubectl top reads.
 // When the backing Runtime implements StatsSource (the runtimed runtime does, via
 // runtimed's proc_pid_rusage footprint), it produces real per-pod memory stats;
-// otherwise (HostProcess) the node-only summary is returned.
+// otherwise the node-only summary (host-wide CPU and memory, nodeStats) is returned.
 func (v *VKProvider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
 	if s, ok := v.rt.(StatsSource); ok {
 		return s.StatsSummary(ctx)
 	}
-	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: v.nodeName}}, nil
+	return &statsv1alpha1.Summary{Node: nodeStats(v.nodeSampler, v.nodeName, time.Now())}, nil
 }
 
 // GetMetricsResource serves the VK /metrics/resource endpoint — the kubelet

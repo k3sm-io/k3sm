@@ -19,6 +19,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"math"
 	"strings"
@@ -435,11 +436,14 @@ func TestGetMetricsResourceZeroCPUIsTreatedAsMissing(t *testing.T) {
 }
 
 // TestGetMetricsResourceWithoutStatsSource keeps the honest empty case honest: a
-// Runtime that reports no stats at all (the M0 HostProcess path) serves an EMPTY
-// scrape target, which is what an unimplemented metering surface should look like —
-// not a set of families full of zeroes.
+// Runtime that reports no pod stats, on a node whose host sample is unavailable,
+// serves an EMPTY scrape target, which is what an unimplemented metering surface
+// should look like — not a set of families full of zeroes.
 func TestGetMetricsResourceWithoutStatsSource(t *testing.T) {
 	p := NewVKProvider(&statsLessRuntime{}, "k3sm-node")
+	fake := newFakeHostSampler()
+	fake.err = errors.New("host sample unavailable")
+	p.nodeSampler = fake
 	families, err := p.GetMetricsResource(context.Background())
 	if err != nil {
 		t.Fatalf("GetMetricsResource: %v", err)

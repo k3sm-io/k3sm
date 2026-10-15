@@ -19,6 +19,7 @@ pin, its date, and the tarball's sha256.
 ### Added
 
 - **`sudo k3sm stop`, `start` and `restart`.** `stop` takes the node down fully, Pods included, and the node stays stopped across a reboot and across `sudo k3sm install` until you run `start` or `install --start`. `restart` restarts the daemons and keeps Pods running. `--reason` records why in the logs, and `k3sm status` shows who stopped the node (`stoppedBy` in the JSON). See [stopping and starting](https://k3sm.io/docs/stop-start/).
+- **`kubectl top node` has figures.** Each node reports host-wide CPU and memory in its stats summary and on `/metrics/resource`, so the figures include processes k3sm did not start. On a multi-node cluster a worker's row shows `<unknown>`. See [limitations](https://k3sm.io/docs/limitations/).
 - **metrics-server ships as an add-on.** A server installed with `--mesh-ip` applies it once a node in the cluster can run `vm` Pods, so `kubectl top pod` works there. The node's metrics endpoints admit metrics-server's ServiceAccount token, and only on those two read-only routes.
 - **The aggregation layer is on.** The apiserver trusts a request-header CA, so extension apiservers such as metrics-server can serve through it.
 - **LoadBalancer Services are hosted on every node.** The server picks the hosting nodes from node labels (`svclb.k3sm.io/enablelb`, `svclb.k3sm.io/lbpool` and per-pool labels, mapped one to one from k3s), and a Service that no node could bind gets a `NoEligibleNodes` or `HostNotBound` Warning Event. See [multi-node](https://k3sm.io/docs/multi-node/).
