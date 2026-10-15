@@ -46,6 +46,17 @@ const (
 	// bundleHeaderFixed is the header byte count before the variable salt/nonce:
 	// magic(4) + version(1) + kdfID(1) + iters(4) + saltLen(1).
 	bundleHeaderFixed = 4 + 1 + 1 + 4 + 1
+
+	// bundleMinPBKDF2Iters is the lowest iteration count OpenBundle accepts. It is
+	// format strictness, NOT a security bound: the count sits in the GCM-authenticated
+	// header, so an attacker without the secret cannot lower it on a genuine envelope
+	// without failing the tag. It only rejects nonsense counts before any KDF work.
+	bundleMinPBKDF2Iters = 1_000
+	// bundleMaxPBKDF2Iters is the highest iteration count OpenBundle accepts. The count
+	// is read from the envelope and drives PBKDF2 BEFORE the tag can be checked, so an
+	// unbounded uint32 would let a forged envelope pin a CPU for hours; this is the DoS
+	// bound. Four times the pinned count leaves room for a future raise.
+	bundleMaxPBKDF2Iters = 4 * bundlePBKDF2Iters
 )
 
 // bundleMagic prefixes every envelope ("K3Sm Bootstrap").
@@ -60,6 +71,10 @@ var (
 	// ciphertext, or ANY tampered authenticated-header byte (the GCM tag is verified
 	// before any plaintext is returned — fail closed).
 	ErrBundleOpen = errors.New("bootstrap: CA bootstrap bundle authentication failed (wrong secret or tampered envelope)")
+	// ErrBundleIterations is returned by OpenBundle for an envelope whose stored PBKDF2
+	// iteration count lies outside the accepted window, refused before any key
+	// derivation. It wraps ErrBundleFormat, so errors.Is(err, ErrBundleFormat) holds.
+	ErrBundleIterations = fmt.Errorf("%w: PBKDF2 iteration count out of range", ErrBundleFormat)
 )
 
 // SealBundle AES-256-GCM-seals plaintext (the certs.Hierarchy.Marshal bytes) under a
@@ -145,14 +160,21 @@ func parseBundle(envelope []byte) (salt, nonce, ciphertext, header []byte, iters
 		return nil, nil, nil, nil, 0, fmt.Errorf("%w: unsupported kdf id %d", ErrBundleFormat, envelope[off])
 	}
 	off++
-	iters = int(binary.BigEndian.Uint32(envelope[off:]))
+	// Bound the unauthenticated count on the uint32 BEFORE converting it or deriving a
+	// key: the KDF runs before the GCM tag can reject a forged header.
+	rawIters := binary.BigEndian.Uint32(envelope[off:])
 	off += 4
-	if iters <= 0 {
-		return nil, nil, nil, nil, 0, fmt.Errorf("%w: non-positive iteration count", ErrBundleFormat)
+	if rawIters < bundleMinPBKDF2Iters || rawIters > bundleMaxPBKDF2Iters {
+		return nil, nil, nil, nil, 0, fmt.Errorf("%w: %d not in [%d, %d]",
+			ErrBundleIterations, rawIters, bundleMinPBKDF2Iters, bundleMaxPBKDF2Iters)
 	}
+	iters = int(rawIters)
 	saltLen := int(envelope[off])
 	off++
-	if saltLen == 0 || len(envelope) < off+saltLen+1 {
+	if saltLen != bundleSaltLen {
+		return nil, nil, nil, nil, 0, fmt.Errorf("%w: salt length %d, want %d", ErrBundleFormat, saltLen, bundleSaltLen)
+	}
+	if len(envelope) < off+saltLen+1 {
 		return nil, nil, nil, nil, 0, fmt.Errorf("%w: truncated salt", ErrBundleFormat)
 	}
 	salt = envelope[off : off+saltLen]
