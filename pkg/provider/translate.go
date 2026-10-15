@@ -225,6 +225,36 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 		box.SandboxProfile.VmVcpus = podVMVCPUs(pod)
 		box.SandboxProfile.VmMemoryBytes = podVMMemoryBytes(pod)
 	}
+	// The kernel hostname, derived once in podHostname (the single derivation
+	// site) and set for every backend; the backend decides whether it can honour
+	// it. A derivation error is the backend's call too. A vm pod fails here (the
+	// guest's kernel hostname is observable, and CreatePod records the Warning
+	// Event); any other backend logs and sends "", because no native process can
+	// observe the value and refusing the pod would refuse it for nothing.
+	vm := backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
+	hostname, truncated, err := podHostname(pod, dnsCfg.ClusterDomain)
+	if err != nil {
+		if vm {
+			return nil, fmt.Errorf("pod hostname: %w", err)
+		}
+		if log != nil {
+			log.Warn("pod hostname cannot be derived; sending none (the native backend cannot honour it)",
+				"namespace", pod.Namespace, "name", pod.Name, "err", err)
+		}
+		// "" means "no hostname" by the runtimed contract, the same value a hostNetwork pod sends.
+		hostname = ""
+	}
+	// A truncation matters only where the name is observable: Warn for a vm pod,
+	// Debug for a backend that ignores the field.
+	if truncated && log != nil {
+		logAt := log.Debug
+		if vm {
+			logAt = log.Warn
+		}
+		logAt("pod hostname too long, truncated it", "namespace", pod.Namespace, "name", pod.Name,
+			"hostnameMaxLen", podHostnameMaxLen, "hostname", hostname)
+	}
+	box.Hostname = hostname
 	return box, nil
 }
 

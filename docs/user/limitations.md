@@ -541,6 +541,22 @@ traffic a guest sends straight to an address on another node is not claimed. Con
 node to a `vm` Pod's pod IP go through a relay on its node; see
 [`vm` Pods: Services and Direct Pod IPs](#vm-pods-services-and-direct-pod-ips).
 
+### Pod Hostname: Set in `vm` Pods, the Mac's Name on the Native Path
+
+A `vm` Pod's kernel hostname follows the kubelet rules: `spec.hostnameOverride` when present, else
+`spec.hostname`, else the Pod name, with `spec.subdomain` and `setHostnameAsFQDN` shaping the name
+when `hostnameOverride` is unset. Every container in the Pod reads it from `/etc/hostname` and from
+`hostname`. Two gaps remain in `vm` Pods: the guest `/etc/hosts` carries the short name but no FQDN
+alias, and `HOSTNAME` is not set in the container environment. The `container-vm` RuntimeClass does
+not honour the field yet. The 63-character truncation of a long name, and the refusal of a Pod whose
+name would exceed 64 characters, apply to `vm` Pods only.
+
+A native Pod is a host process, and macOS has no per-process hostname. Inside a native Pod,
+`hostname`, `uname -n` and `$HOSTNAME` return the Mac's own name, whatever the Pod spec says, and
+`spec.hostnameOverride`, `spec.hostname` and `setHostnameAsFQDN` change nothing a process can see.
+The Pod's DNS records are not affected: those come from the cluster resolver, not from the
+process. If a workload needs its own hostname, run it in the `vm` RuntimeClass.
+
 ### `externalTrafficPolicy: Local` Is Not Honored
 
 The userspace Service proxy splices each connection, so the client's source address does not survive
