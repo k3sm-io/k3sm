@@ -23,7 +23,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -290,41 +289,21 @@ func (sc *etcdSnapshotScheduler) prepare() {
 	}
 }
 
-// list returns this node's scheduled snapshots, newest first by order. A snapshot
-// whose order is after now (taken under a clock that was ahead) sorts last: its
-// real age is unknown, and it must not outrank real snapshots in retention.
+// list returns this node's scheduled snapshots, newest first by order, through
+// ListSnapshots: a snapshot whose order is after now (taken under a clock that was
+// ahead) sorts last, so it cannot outrank real snapshots in retention.
 func (sc *etcdSnapshotScheduler) list(now time.Time) ([]scheduledSnapshot, error) {
-	entries, err := os.ReadDir(sc.dir)
+	infos, err := ListSnapshots(sc.dir, sc.node, now)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	var out []scheduledSnapshot
-	for _, e := range entries {
-		taken, ok := parseScheduledEtcdSnapshot(sc.node, e.Name())
-		if !ok || !e.Type().IsRegular() {
+	for _, in := range infos {
+		if in.Kind != SnapshotScheduled {
 			continue
 		}
-		snap := scheduledSnapshot{path: filepath.Join(sc.dir, e.Name()), taken: taken, order: taken}
-		if fi, err := e.Info(); err == nil {
-			snap.size = fi.Size()
-			if mt := fi.ModTime(); mt.Before(snap.order) {
-				snap.order = mt
-			}
-		}
-		if snap.order.After(now.Add(etcdSnapshotWakeEvery)) {
-			snap.order = time.Time{}
-		}
-		out = append(out, snap)
+		out = append(out, scheduledSnapshot{path: filepath.Join(sc.dir, in.Name), taken: in.stamp, order: in.Created, size: in.Size})
 	}
-	slices.SortFunc(out, func(a, b scheduledSnapshot) int {
-		if c := b.order.Compare(a.order); c != 0 {
-			return c
-		}
-		return strings.Compare(b.path, a.path)
-	})
 	return out, nil
 }
 
@@ -492,30 +471,24 @@ func (sc *etcdSnapshotScheduler) floorBasis(ctx context.Context) int64 {
 }
 
 // retain deletes this node's scheduled snapshots past the newest sc.retention,
-// never the one just taken.
+// never the one just taken. The selection is SelectScheduledPrune, the one
+// `k3sm snapshot prune` uses.
 func (sc *etcdSnapshotScheduler) retain(justTaken string) {
-	snaps, err := sc.list(sc.clock.Now())
+	infos, err := ListSnapshots(sc.dir, sc.node, sc.clock.Now())
 	if err != nil {
 		sc.log.Warn("could not list the scheduled etcd snapshots for retention; none were removed",
 			"component", etcdComponent, "dir", sc.dir, "err", err)
 		return
 	}
-	keep := sc.retention
-	for _, snap := range snaps {
-		if snap.path == justTaken {
-			continue
-		}
-		if keep > 1 {
-			keep-- // the slot the just-taken snapshot does not use
-			continue
-		}
-		if err := os.Remove(snap.path); err != nil {
+	for _, snap := range SelectScheduledPrune(infos, sc.retention, filepath.Base(justTaken)) {
+		path := filepath.Join(sc.dir, snap.Name)
+		if err := os.Remove(path); err != nil {
 			sc.log.Warn("could not remove a scheduled etcd snapshot past the retention", "component", etcdComponent,
-				"path", snap.path, "err", err)
+				"path", path, "err", err)
 			continue
 		}
 		sc.log.Info("removed a scheduled etcd snapshot past the retention", "component", etcdComponent,
-			"path", snap.path, "retention", sc.retention)
+			"path", path, "retention", sc.retention)
 	}
 }
 
