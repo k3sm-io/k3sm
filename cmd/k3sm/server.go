@@ -73,6 +73,9 @@ type serverOptions struct {
 	// and must never be aliased on lo0.
 	nodeIP string
 	meshIP string // wireguard mesh IP; set => multi-node worker-join supervisor
+	// tlsSANs are the --tls-san extra apiserver serving-certificate names,
+	// validated by checkServerTLSSANs at start (multi-node servers only).
+	tlsSANs tlsSANList
 	// etcdPeerIP is the embedded-etcd member's peer address (--etcd-peer-ip): this
 	// server's LAN address, which the peer listener binds and every other server
 	// dials. Required in the etcd posture and by --cluster-reset; unused otherwise.
@@ -350,6 +353,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.BoolVar(&opts.clearCrashLoop, "clear-crashloop", false, "clear the crash-loop record under --work-dir and exit 0 instead of serving; a parked daemon then exits and launchd starts a clean boot")
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise (the default loopback runs a single server with the apiserver endpoint reconciler off); a non-loopback value is aliased on lo0 by the pod network, so it must lie in this node's pod range (leave it at the default on a mesh server: the node then advertises --mesh-ip). Never the etcd peer address: that is --etcd-peer-ip")
 	fs.StringVar(&opts.meshIP, "mesh-ip", "", "wireguard mesh IP to bind the apiserver + worker-join supervisor on (enables multi-node join; empty = single-node)")
+	fs.Var(&opts.tlsSANs, install.TLSSANFlag, tlsSANUsage)
 	fs.String("kubeconfig-name", "", "the name k3sm install --kubeconfig-name merged the admin kubeconfig under; recorded in the daemon's arguments for k3sm kubectl and uninstall --purge, and unused by the server itself")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
 	registerContainerLogFlags(fs, &opts.logs)
@@ -1072,15 +1076,16 @@ func serverKubeletServingIPs(nodeOpts nodeOptions, meshIP string) []net.IP {
 
 // writeAPIServerServingCert issues the apiserver's serving cert from the cluster CA
 // (so a joining node that pinned the cluster CA verifies the apiserver via its
-// kubeconfig) with SANs covering the mesh IP, loopback, the kubernetes service IP,
-// and the in-cluster DNS names. It writes the cert 0644 and the key 0600 under the
-// PKI dir and returns their paths for --tls-cert-file / --tls-private-key-file.
-func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP string) (certFile, keyFile string, err error) {
-	dnsNames := []string{
-		"kubernetes", "kubernetes.default", "kubernetes.default.svc",
-		"kubernetes.default.svc.cluster.local", "localhost",
+// kubeconfig) with the names apiServerServingSANs assembles: the mesh IP, loopback,
+// the kubernetes service IP, the in-cluster DNS names, and the operator's --tls-san
+// extras. An invalid extra is refused before anything is written. It writes the cert
+// 0644 and the key 0600 under the PKI dir and returns their paths for
+// --tls-cert-file / --tls-private-key-file. The CA is only read.
+func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP string, extraSANs []string) (certFile, keyFile string, err error) {
+	dnsNames, ips, err := apiServerServingSANs(meshIP, extraSANs)
+	if err != nil {
+		return "", "", err
 	}
-	ips := []net.IP{net.ParseIP(meshIP), net.ParseIP("127.0.0.1"), net.ParseIP("10.43.0.1")}
 	certPEM, keyPEM, err := clusterCA.IssueServing("kube-apiserver", dnsNames, ips, 365*24*time.Hour)
 	if err != nil {
 		return "", "", fmt.Errorf("issue apiserver serving cert: %w", err)
