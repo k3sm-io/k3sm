@@ -147,7 +147,7 @@ var agentTerminalDelay = agentTerminalBackoff
 // between attempts. A record written after the sleep would arrive after the
 // install had already given up with nothing to say about why.
 func agentTerminal(ctx context.Context, b *crashBreaker, logger *slog.Logger, err error) error {
-	noteAgentStartFailure(b, logger, err)
+	noteAgentStartFailure(ctx, b, logger, err)
 	logger.Error("this agent cannot start", "err", err, "backoff", agentTerminalDelay)
 	t := time.NewTimer(agentTerminalDelay)
 	defer t.Stop()
@@ -219,7 +219,7 @@ func runAgent(args []string) error {
 	// could not be persisted, a join the server refused, a mesh that would not
 	// come up — is recorded here, once, on the way out.
 	if err != nil && !breaker.noted() {
-		noteAgentStartFailure(breaker, logger, err)
+		noteAgentStartFailure(ctx, breaker, logger, err)
 	}
 	return err
 }

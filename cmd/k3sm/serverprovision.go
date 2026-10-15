@@ -689,7 +689,10 @@ func fatalLine(l string) bool {
 // executor from that plan's Config and brings it up, returning once every
 // component is healthy. The plan is returned BY VALUE and only after the
 // member route's Config reassignment, so nothing downstream reads a stale cfg.
-func startControlPlane(ctx context.Context, opts serverOptions, mode hostnet.Mode, cfg executor.Config, pki serverPKI, breaker *crashBreaker, probe *supervisedProbe, logger *slog.Logger) (serverPlan, *executor.Supervised, error) {
+//
+// ctx is the crash-cancellable bring-up context; stop is the daemon's signal
+// context, which only the bring-up recorder reads (noteBringUpFailure).
+func startControlPlane(ctx, stop context.Context, opts serverOptions, mode hostnet.Mode, cfg executor.Config, pki serverPKI, breaker *crashBreaker, probe *supervisedProbe, logger *slog.Logger) (serverPlan, *executor.Supervised, error) {
 	// On a joining HA server's first boot the etcd member route runs here, before the
 	// executor (serveretcd.go): the member starts with the route's initial cluster.
 	// A transient answer is retried in-process and never counted; a PERMANENT refusal
@@ -720,7 +723,9 @@ func startControlPlane(ctx context.Context, opts serverOptions, mode hostnet.Mod
 		// took it, and noteBringUpFailure skips that). The recording happens here
 		// rather than in pkg/executor because the breaker is the daemon's memory,
 		// not the executor's.
-		noteBringUpFailure(breaker, logger, err)
+		// stop, not ctx: a component crash cancels ctx too, and that bring-up
+		// failure must still be recorded (cancelledByStop).
+		noteBringUpFailure(stop, breaker, logger, err)
 		return plan, nil, fmt.Errorf("start control plane: %w", err)
 	}
 	return plan, exec, nil

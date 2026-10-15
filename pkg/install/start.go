@@ -113,7 +113,7 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 		// as stopped, which is what it is.
 		cfg.Start = true
 	}
-	if err := restartDaemons(ctx, sys, cfg, d.manifest(cfg)); err != nil {
+	if _, err := restartDaemons(ctx, sys, cfg, d.manifest(cfg)); err != nil {
 		lifecycleLog(ctx, sys, cfg, slog.LevelError, "k3sm start: failed", "actor", actor, "reason", reason, "result", "failed", "err", err)
 		return fmt.Errorf("start: %w (the stop marker is kept, so the node still reads as stopped; re-run `sudo k3sm start`)", err)
 	}
@@ -176,7 +176,7 @@ func Restart(ctx context.Context, sys System, cfg Config, actor, reason string) 
 		return fmt.Errorf("restart: %w", err)
 	}
 	cfg.Role = d.role
-	if err := restartDaemons(ctx, sys, cfg, d.manifest(cfg)); err != nil {
+	if _, err := restartDaemons(ctx, sys, cfg, d.manifest(cfg)); err != nil {
 		return fmt.Errorf("restart: %w", err)
 	}
 	return nil

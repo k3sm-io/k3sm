@@ -195,7 +195,7 @@ func TestInstallReportsWhichDaemonIsDown(t *testing.T) {
 		f := &fakeSystem{}
 		f.putLoaded(NetdLabel) // the server never came up
 		cfg := installCfg().withDefaults()
-		err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), time.Now())
+		err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), bringUpWindow{startedAt: time.Now()})
 		if err == nil {
 			t.Fatal("verifyDaemons must fail when a daemon is down")
 		}
@@ -338,7 +338,7 @@ func TestAgentRestartWaitsForTheNetdSocket(t *testing.T) {
 			// probes after its bootstrap are refused.
 			f.putNetdRefusals(cfg.NetdSocket, 3)
 
-			if err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg)); err != nil {
+			if _, err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg)); err != nil {
 				t.Fatalf("restartDaemons: %v", err)
 			}
 
@@ -374,7 +374,7 @@ func TestAgentRestartWaitsForTheNetdSocket(t *testing.T) {
 			// reports as healthy, and the node daemon would be started into it.
 			f.putWedgedSocket(cfg.NetdSocket)
 
-			err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg))
+			_, err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg))
 			if err == nil {
 				t.Fatal("restartDaemons must fail on a socket that accepts and never answers: a connect proves the kernel queued it, not that netd is serving")
 			}
@@ -395,7 +395,7 @@ func TestAgentRestartWaitsForTheNetdSocket(t *testing.T) {
 			f.putLoaded(NetdLabel, r.label)
 			f.putMissingPath(cfg.NetdSocket) // bootstrapped, never serving
 
-			err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg))
+			_, err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg))
 			if err == nil {
 				t.Fatal("restartDaemons must fail rather than start the node daemon against a helper that never came up")
 			}

@@ -498,27 +498,27 @@ func runServer(args []string) (err error) {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM) // never rebound (cancelledByStop)
 	defer stop()
 	// Secrets encryption and a tripped breaker PARK here (admitServerStart).
-	encryptionConfig, done, err := admitServerStart(ctx, opts, breaker, mode, logger)
+	encryptionConfig, done, err := admitServerStart(stopCtx, opts, breaker, mode, logger)
 	if done || err != nil {
 		return err
 	}
 
 	// 1. Control plane (child-process executor). Stop tears it down in reverse.
-	cfg, pki, err := provisionControlPlane(ctx, &opts, encryptionConfig, logger)
+	cfg, pki, err := provisionControlPlane(stopCtx, &opts, encryptionConfig, logger)
 	if err != nil {
 		return err
 	}
 	// 1b. The mesh IP must answer here before the apiserver binds it (fail-fast, unlike 4b).
-	if err = ensureMeshIPAlias(ctx, opts.meshIP, mode, logger); err != nil {
+	if err = ensureMeshIPAlias(stopCtx, opts.meshIP, mode, logger); err != nil {
 		return err
 	}
 
 	// A control-plane child that dies after bring-up must take this process with
 	// it, or launchd's restart-on-EXIT KeepAlive never fires (componentExitHandler).
-	ctx, crashCancel := context.WithCancel(ctx)
+	ctx, crashCancel := context.WithCancel(stopCtx)
 	defer crashCancel()
 	var crashedComponent atomic.Pointer[string]
 	var cpProbe supervisedProbe // filled by startControlPlane once the executor exists
@@ -550,7 +550,7 @@ func runServer(args []string) (err error) {
 	defer func() { meshTeardownOnExit(ctx, meshDown, logger) }()
 
 	// The HA etcd member route, then the supervised executor (startControlPlane).
-	plan, exec, err := startControlPlane(ctx, opts, mode, cfg, pki, breaker, &cpProbe, logger)
+	plan, exec, err := startControlPlane(ctx, stopCtx, opts, mode, cfg, pki, breaker, &cpProbe, logger)
 	if err != nil {
 		return err
 	}
