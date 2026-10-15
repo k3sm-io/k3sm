@@ -6,7 +6,7 @@ wireguard mesh over your LAN. A Pod that asks for the interconnect gets a second
 cable, and traffic it sends to another interconnect address crosses the cable instead of the LAN.
 The main use is the collective traffic between the ranks of a sharded [MLX model](mlx-quickstart.md).
 
-The interconnect is alpha (`net.k3sm.io/v1alpha1`), and it is off until a cluster admin turns it
+The interconnect is alpha ([what that means](README.md#what-experimental-means); `net.k3sm.io/v1alpha1`), and it is off until a cluster admin turns it
 on.
 
 ## How It Works

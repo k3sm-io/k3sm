@@ -8,7 +8,7 @@ node out of a cluster without uninstalling it. All three verbs need root.
 |---|---|
 | `sudo k3sm stop` | Stops every k3sm daemon, pod and network change on this Mac, and records the stop. The node stays stopped until you start it. |
 | `sudo k3sm start` | Undoes a stop: brings the network helper and the node daemon back and clears the record. On a node that is already running it restarts nothing: it finishes an uncordon an earlier start ran out of time for, or makes one uncordon attempt. |
-| `sudo k3sm restart` | Restarts the k3sm daemons. Pods keep running. On a stopped node it refuses; add `--start` to start the node instead. |
+| `sudo k3sm restart` | Restarts the k3sm daemons. Native Pods keep running, but a `vm` Pod is recreated and a container whose shim died loses its logs and exec (see [what survives a restart](limitations.md#what-survives-a-node-daemon-restart)). On a stopped node it refuses; add `--start` to start the node instead. |
 
 Each verb takes `--reason TEXT`, which is recorded in the stop record and in the logs.
 

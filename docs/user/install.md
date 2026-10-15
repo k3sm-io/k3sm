@@ -118,8 +118,8 @@ k3sm's distribution ships in three generations, listed in shipping order:
    provenance (Developer ID + notarization) arrives with gen 3. Environment variables set the
    options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
    unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
-   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh` (v0.1.7 is the current
-   release; the [releases page](https://k3sm.io/releases/) lists every version you can pin).
+   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh` (v0.1.7 is the release you are on
+   today, so a repair pins the newest tag and never an older one; the [releases page](https://k3sm.io/releases/) lists every version you can pin).
    `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
    one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
@@ -269,13 +269,13 @@ nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
 - New installs start with LAN access off. An existing install keeps LAN access on across an upgrade,
   so nothing it serves stops answering. `sudo k3sm install --lan on` or `--lan off` sets it at
   install time.
-- The change applies live, without restarting pods: the node daemon binds the new addresses first
+- The change applies live, without restarting pods (a restart of the daemon itself recreates `vm` pods and, after a binary upgrade, every pod; see [what survives a restart](limitations.md#what-survives-a-node-daemon-restart)): the node daemon binds the new addresses first
   and only then closes the old ones. Connections already open finish; new connections from the LAN
   are refused. The command then checks the node daemon's listening sockets itself (with `lsof`, as
   root) rather than taking the daemon's word for it. If any listener cannot move, or the sockets do
   not match, the previous setting is restored and checked the same way, and the command says why. If
   even the restore fails, it says so and exits `4`. If the node daemon does not apply it live, the
-  command restarts the daemon in place instead (pods keep running) and says so.
+  command restarts the daemon in place instead (native pods keep running; `vm` pods are recreated, and a binary upgrade recreates every pod, see [what survives a restart](limitations.md#what-survives-a-node-daemon-restart)) and says so.
 - `k3sm network lan status` and `k3sm status` show the recorded setting and, run as root, the state
   the node daemon reports serving, and say when the two differ. With no setting recorded they say
   that LAN access is on because nothing is recorded.

@@ -2,7 +2,7 @@
 
 Running the k3sm control plane so a single Mac is not a single point of failure.
 
-> **Status: EXPERIMENTAL.** `k3sm install --cluster-init` forms an embedded etcd control plane on
+> **Status: EXPERIMENTAL** (what that means: [Experimental and alpha](README.md#what-experimental-means)). `k3sm install --cluster-init` forms an embedded etcd control plane on
 > the first server, and `k3sm install --server-join` adds a second one. Treat it as preview quality
 > and keep datastore backups. A controller manager or scheduler that exits because it lost its leader
 > lease, while etcd and the apiserver keep running, takes the server daemon down for launchd to restart,
