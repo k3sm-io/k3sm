@@ -134,6 +134,10 @@ LAB_TOLERATIONS="$(lab_tolerations_yaml "")" || exit 2
 
 SERVE_DIR=/private/var/tmp/k3sm-b572
 SERVE_BIN="$SERVE_DIR/b572-serve"
+# SERVE_DIR_PREP: the node command that creates the build directory private (700)
+# and fails unless the invoking user owns it, so nothing is copied into, or built
+# from, a directory another user planted.
+SERVE_DIR_PREP="mkdir -p -m 700 $SERVE_DIR && [ \"\$(stat -f %u $SERVE_DIR)\" = \"\$(id -u)\" ] || { echo \"$SERVE_DIR is not owned by \$(id -un); refusing to build there\" >&2; exit 1; }"
 
 # serve_source: the pod server. argv: <pod-ip|-> <body> <marker>; "-" reads the
 # pod IP from POD_IP (the downward API), since the pod command is the binary
@@ -204,15 +208,17 @@ C
 
 # build_script: builds b572-serve in SERVE_DIR on the node; signs a temp file and
 # renames it over the old binary (a signed Mach-O is never overwritten in place).
+# The directory stays 700 (see SERVE_DIR_PREP) until the binary is in place, then
+# opens to 755 so the pod's user can exec it.
 build_script() {
 	cat <<SCRIPT
 set -e
 D=$SERVE_DIR
-chmod 755 "\$D"
 xcrun clang -O1 -Werror=implicit-function-declaration -o "\$D/b572-serve.new" "\$D/b572-serve.c"
 codesign -s - -f "\$D/b572-serve.new"
 chmod 755 "\$D/b572-serve.new"
 mv -f "\$D/b572-serve.new" "\$D/b572-serve"
+chmod 755 "\$D"
 ls -l "\$D"
 SCRIPT
 }
@@ -305,11 +311,13 @@ nc     91200 _k3sm    3u  IPv4 0x967312696460f780      0t0  TCP *:8080 (LISTEN)'
 	case "$m" in *"fieldPath: status.podIP"*) check ok "manifest: POD_IP from the downward API" ;; *) check no "manifest: POD_IP from the downward API" ;; esac
 	case "$m" in *"/usr/bin/"*|*python*) check no "manifest: no platform binary or interpreter" ;; *) check ok "manifest: no platform binary or interpreter" ;; esac
 
-	check "$(t same_host MikoBook.local mikobook)" "same_host: first label, any case"
-	check "$(t same_host miko@mikobook mikobook)" "same_host: user@ ignored"
-	check "$([ "$(t same_host miko-studio.example.com mikobook)" = no ] && echo ok)" "same_host: another Mac"
-	check "$([ "$(t same_host mikobook '')" = no ] && echo ok)" "same_host: no hostname is never local"
+	check "$(t same_host Node-A.local node-a)" "same_host: first label, any case"
+	check "$(t same_host user@node-a node-a)" "same_host: user@ ignored"
+	check "$([ "$(t same_host node-b.example.com node-a)" = no ] && echo ok)" "same_host: another Mac"
+	check "$([ "$(t same_host node-a '')" = no ] && echo ok)" "same_host: no hostname is never local"
 
+	# shellcheck disable=SC2016 # the node command's literal $(...), not an expansion
+	case "$SERVE_DIR_PREP" in 'mkdir -p -m 700 /private/var/tmp/k3sm-b572 && [ "$(stat -f %u /private/var/tmp/k3sm-b572)" = "$(id -u)" ] ||'*) check ok "build dir: created 700, owner checked" ;; *) check no "build dir: created 700, owner checked" ;; esac
 	# shellcheck disable=SC2016 # the build script's literal $D, not an expansion
 	case "$(build_script)" in *'-o "$D/b572-serve.new"'*'codesign -s - -f "$D/b572-serve.new"'*'mv -f "$D/b572-serve.new" "$D/b572-serve"'*) check ok "build: sign a temp file, then rename" ;; *) check no "build: sign a temp file, then rename" ;; esac
 	# Compile-check only (writes nothing, runs nothing); skipped without xcrun.
@@ -510,10 +518,10 @@ for node in "$SERVER" "$WORKER"; do
 	echo "== $node: build b572-serve with clang on the node into $SERVE_DIR"
 	built=no
 	if same_host "$h" "$ME"; then
-		if mkdir -p "$SERVE_DIR" && cp "$SRC/b572-serve.c" "$SRC/b572-build.sh" "$SERVE_DIR/" &&
+		if /bin/bash -c "$SERVE_DIR_PREP" && cp "$SRC/b572-serve.c" "$SRC/b572-build.sh" "$SERVE_DIR/" &&
 			/bin/bash "$SERVE_DIR/b572-build.sh"; then built=yes; fi
 	else
-		if on "$h" "mkdir -p $SERVE_DIR" && scp -q -o BatchMode=yes "$SRC/b572-serve.c" "$SRC/b572-build.sh" "$h:$SERVE_DIR/" &&
+		if on "$h" "$SERVE_DIR_PREP" && scp -q -o BatchMode=yes "$SRC/b572-serve.c" "$SRC/b572-build.sh" "$h:$SERVE_DIR/" &&
 			on "$h" "/bin/bash $SERVE_DIR/b572-build.sh"; then built=yes; fi
 	fi
 	if [ "$built" = yes ]; then
