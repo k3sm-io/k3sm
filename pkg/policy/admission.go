@@ -66,6 +66,14 @@ const (
 	dsTolerationBindingName = "k3sm-inject-daemonset-provider-toleration-binding"
 )
 
+// dsTemplateTolerationPolicyName / dsTemplateTolerationBindingName name the mutating
+// policy that injects the provider toleration into a DaemonSet's pod template, which
+// is what the DaemonSet controller reads when it decides where daemon pods go.
+const (
+	dsTemplateTolerationPolicyName  = "k3sm-inject-daemonset-template-provider-toleration"
+	dsTemplateTolerationBindingName = "k3sm-inject-daemonset-template-provider-toleration-binding"
+)
+
 // etpLocalPolicyName / etpLocalBindingName name the Warn policy that surfaces the
 // externalTrafficPolicy: Local divergence (no client source-IP preservation).
 const (
@@ -582,10 +590,11 @@ const darwinSelectorExpr = `has(object.spec.nodeSelector) && ` +
 	`'kubernetes.io/os' in object.spec.nodeSelector && ` +
 	`object.spec.nodeSelector['kubernetes.io/os'] == 'darwin'`
 
-// providerTolerationExpr is the CEL the provider-toleration Warn policy enforces on
-// Pod create. It evaluates true when the pod tolerates the provider taint
-// (ProviderTaintKey:NoSchedule, value "") — no warning — and false otherwise, when
-// the scheduler would leave the pod Unschedulable and the binding warns.
+// providerTolerationExprAt returns the CEL that evaluates true when the PodSpec at
+// root (a CEL path: object.spec for a Pod, object.spec.template.spec for a
+// DaemonSet's pod template) tolerates the provider taint (ProviderTaintKey:NoSchedule,
+// value ""), and false otherwise, when the scheduler (or the DaemonSet controller's
+// own node predicate) would leave the pod off every node.
 //
 // It is the faithful CEL transcription of Kubernetes' Toleration.ToleratesTaint
 // (k8s.io/api/core/v1): a toleration tolerates the taint iff its effect matches (or
@@ -599,13 +608,57 @@ const darwinSelectorExpr = `has(object.spec.nodeSelector) && ` +
 // auto-injects NoExecute tolerations (node.kubernetes.io/not-ready, …) into nearly
 // every Pod, so an emptiness test would see a non-empty list and never warn; and a
 // pod carrying a different-key toleration is still Unschedulable here.
-// ProviderTaintKey is interpolated (a const concat) so the taint key lives in
-// exactly one place.
-const providerTolerationExpr = `has(object.spec.tolerations) && object.spec.tolerations.exists(t, ` +
-	`(!has(t.effect) || t.effect == 'NoSchedule') && ` +
-	`(!has(t.key) || t.key == '` + ProviderTaintKey + `') && ` +
-	`((has(t.operator) && t.operator == 'Exists') || ` +
-	`((!has(t.operator) || t.operator == 'Equal') && (!has(t.value) || t.value == ''))))`
+// ProviderTaintKey is interpolated so the taint key lives in exactly one place, and
+// the root is a parameter so the Pod and DaemonSet-template policies share one
+// expression instead of two drifting copies.
+func providerTolerationExprAt(root string) string {
+	list := root + ".tolerations"
+	return `has(` + list + `) && ` + list + `.exists(t, ` +
+		`(!has(t.effect) || t.effect == 'NoSchedule') && ` +
+		`(!has(t.key) || t.key == '` + ProviderTaintKey + `') && ` +
+		`((has(t.operator) && t.operator == 'Exists') || ` +
+		`((!has(t.operator) || t.operator == 'Equal') && (!has(t.value) || t.value == ''))))`
+}
+
+// podSpecRoot and daemonSetTemplateSpecRoot are the two PodSpec roots the
+// provider-toleration CEL is instantiated at.
+const (
+	podSpecRoot               = "object.spec"
+	daemonSetTemplateSpecRoot = "object.spec.template.spec"
+)
+
+// providerTolerationExpr is the provider-toleration CEL at the Pod root: the Warn
+// policy's validation, and (negated) the pod-level injector's matchCondition.
+var providerTolerationExpr = providerTolerationExprAt(podSpecRoot)
+
+// daemonSetTemplateTolerationExpr is the same CEL at the DaemonSet pod-template root.
+var daemonSetTemplateTolerationExpr = providerTolerationExprAt(daemonSetTemplateSpecRoot)
+
+// fieldPathOf strips the CEL `object.` variable from root, leaving the field path
+// ("spec.template.spec"). The MutatingAdmissionPolicy typed constructor names a
+// nested type by exactly that path ("Object.spec.template.spec.tolerations"), and
+// the JSON pointer is the same path with slashes.
+func fieldPathOf(root string) string { return strings.TrimPrefix(root, "object.") }
+
+// providerTolerationValueAt is the typed CEL constructor of the one injected
+// toleration (key ProviderTaintKey, operator Exists, effect NoSchedule) for the
+// tolerations list under root.
+func providerTolerationValueAt(root string) string {
+	return `Object.` + fieldPathOf(root) + `.tolerations{key: "` + ProviderTaintKey +
+		`", operator: "Exists", effect: "NoSchedule"}`
+}
+
+// tolerationsPointerAt is the JSON pointer of the tolerations list under root.
+func tolerationsPointerAt(root string) string {
+	return "/" + strings.ReplaceAll(fieldPathOf(root), ".", "/") + "/tolerations"
+}
+
+// appendProviderTolerationPatchAt is the single JSONPatch operation that appends the
+// provider toleration to an EXISTING tolerations list under root (`/-`).
+func appendProviderTolerationPatchAt(root string) string {
+	return `JSONPatch{op: "add", path: "` + tolerationsPointerAt(root) + `/-", ` +
+		`value: ` + providerTolerationValueAt(root) + `}`
+}
 
 // daemonSetOwnedExpr is the matchCondition CEL that fires the mutating policy
 // only for a pod created by the DaemonSet controller. It is group-qualified
@@ -627,36 +680,59 @@ const daemonSetOwnedExpr = `object.metadata.ownerReferences.exists(o, ` +
 // lets the mutation run when the pod does not already tolerate the taint. Only the
 // toleration is injected — never the kubernetes.io/os=darwin nodeSelector: a DaemonSet
 // declares its own placement intent, and overriding it here would defeat the DS's
-// nodeSelector/affinity. ProviderTaintKey is interpolated so the taint key
-// lives in exactly one place (single-sourced with the taint the node stamps).
-const daemonSetTolerationPatchExpr = `[JSONPatch{op: "add", path: "/spec/tolerations/-", ` +
-	`value: Object.spec.tolerations{key: "` + ProviderTaintKey + `", operator: "Exists", effect: "NoSchedule"}}]`
+// nodeSelector/affinity.
+var daemonSetTolerationPatchExpr = `[` + appendProviderTolerationPatchAt(podSpecRoot) + `]`
 
-// EnsureDaemonSetTolerationMutation idempotently provisions the
-// MutatingAdmissionPolicy (+ binding) that injects the provider toleration into
-// DaemonSet-owned pods. A DS pod is created by the DaemonSet controller in the
-// kube-controller-manager, so the create-Warn advisory never reaches its author and
-// the pod would sit Unschedulable against the k3sm.io/provider:NoSchedule taint; this
-// policy mutates the pod to tolerate it. Unlike the Deny/Warn ValidatingAdmissionPolicies
-// it changes the stored object. Both matchConditions must hold (DS-owned and not already
-// tolerating); the mutation appends exactly one toleration and never a
-// nodeSelector. Safe to call on every server start (create-or-update; an unchanged
-// spec is not rewritten).
+// daemonSetTemplateTolerationPatchExpr is the JSONPatch-mutation CEL that gives a
+// DaemonSet's pod TEMPLATE exactly one provider toleration. It branches on has():
+// a template with a tolerations list (even an empty one) gets the toleration
+// appended with `/-`, so the template's own tolerations are kept; a template with
+// no list gets the whole one-element list added. JSONPatch, not an
+// ApplyConfiguration, for the same atomic-list reason as the pod-level patch.
+var daemonSetTemplateTolerationPatchExpr = `has(` + daemonSetTemplateSpecRoot + `.tolerations) ? ` +
+	`[` + appendProviderTolerationPatchAt(daemonSetTemplateSpecRoot) + `] : ` +
+	`[JSONPatch{op: "add", path: "` + tolerationsPointerAt(daemonSetTemplateSpecRoot) + `", ` +
+	`value: [` + providerTolerationValueAt(daemonSetTemplateSpecRoot) + `]}]`
+
+// EnsureDaemonSetTolerationMutation idempotently provisions the two
+// MutatingAdmissionPolicies (+ bindings) that let a DaemonSet schedule onto k3sm
+// nodes, every one of which carries the k3sm.io/provider:NoSchedule taint. Unlike the
+// Deny/Warn ValidatingAdmissionPolicies they change the stored object, and each
+// injects only the provider toleration, never a nodeSelector.
+//
+//   - The TEMPLATE policy (apps/v1 daemonsets, CREATE and UPDATE) adds the toleration
+//     to spec.template.spec. This is the one that makes a DaemonSet work: the
+//     DaemonSet controller decides which nodes should run a daemon pod from the
+//     template (nodeShouldRunDaemonPod checks the template's tolerations against the
+//     node's taints), so a template without the toleration leaves
+//     desiredNumberScheduled at 0 and no pod is ever created for the pod-level policy
+//     to mutate. It matches only a template that does not already tolerate the taint,
+//     so an UPDATE of a tolerating DaemonSet is not mutated and its generation and
+//     controller revision do not move. A DaemonSet stored before this policy existed
+//     gets the toleration on its first UPDATE, which bumps its generation and
+//     controller revision and rolls its pods once.
+//   - The POD policy (pods, CREATE) adds the toleration to a DaemonSet-owned pod. It
+//     now covers only DaemonSets stored before the template policy existed (until
+//     their next update) and pods created directly with a DaemonSet controller
+//     ownerReference.
+//
+// Safe to call on every server start (create-or-update; an unchanged spec is not
+// rewritten).
 //
 // This provisions objects for an API (admissionregistration.k8s.io/v1,
-// MutatingAdmissionPolicy) that the apiserver must serve, or this policy is a runtime
-// no-op. MAP is GA and v1 is served by default at the pinned kube version, so the
-// executor passes no runtime-config or feature gate for it (see executor.apiServerArgs).
+// MutatingAdmissionPolicy) that the apiserver must serve, or these policies are a
+// runtime no-op. MAP is GA and v1 is served by default at the pinned kube version, so
+// the executor passes no runtime-config or feature gate for it (see
+// executor.apiServerArgs).
 func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interface) error {
-	// Ignore — not Fail — because this is a scheduling-convenience injector, not a
-	// guard: MatchConstraints is all Pods/Create, so a Fail policy would turn any
-	// CEL evaluation error into a cluster-wide denial of Pod create.
-	// Failing open instead degrades to the un-mutated status quo (the DS pod is created
-	// without the toleration and stays Unschedulable — visible and recoverable, no
+	// Ignore — not Fail — because these are scheduling-convenience injectors, not
+	// guards: a Fail policy would turn any CEL evaluation error into a denial of every
+	// Pod (or DaemonSet) write it matches. Failing open instead degrades to the
+	// un-mutated status quo (no daemon pod is scheduled — visible and recoverable, no
 	// guard bypass: the os=darwin Deny VAP and the provider taint still hold). Mirrors
 	// the advisory Warn VAP's Ignore.
 	ignore := admissionregistrationv1.Ignore
-	policy := &admissionregistrationv1.MutatingAdmissionPolicy{
+	podPolicy := &admissionregistrationv1.MutatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   dsTolerationPolicyName,
 			Labels: map[string]string{managedLabel: "true"},
@@ -689,11 +765,10 @@ func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interf
 			ReinvocationPolicy: admissionregistrationv1.IfNeededReinvocationPolicy,
 		},
 	}
-	if err := ensureMutatingAdmissionPolicy(ctx, cs, policy); err != nil {
+	if err := ensureMutatingAdmissionPolicy(ctx, cs, podPolicy); err != nil {
 		return fmt.Errorf("daemonset-toleration mutating policy: %w", err)
 	}
-
-	binding := &admissionregistrationv1.MutatingAdmissionPolicyBinding{
+	podBinding := &admissionregistrationv1.MutatingAdmissionPolicyBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   dsTolerationBindingName,
 			Labels: map[string]string{managedLabel: "true"},
@@ -702,8 +777,59 @@ func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interf
 			PolicyName: dsTolerationPolicyName,
 		},
 	}
-	if err := ensureMutatingAdmissionPolicyBinding(ctx, cs, binding); err != nil {
+	if err := ensureMutatingAdmissionPolicyBinding(ctx, cs, podBinding); err != nil {
 		return fmt.Errorf("daemonset-toleration mutating binding: %w", err)
+	}
+
+	// A separate policy, not a second rule on the pod one: a policy's mutations are
+	// not scoped by rule, so one policy cannot apply the pod path to pods and the
+	// template path to daemonsets. daemonsets only — never daemonsets/status, whose
+	// writes cannot change the template.
+	templatePolicy := &admissionregistrationv1.MutatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   dsTemplateTolerationPolicyName,
+			Labels: map[string]string{managedLabel: "true"},
+		},
+		Spec: admissionregistrationv1.MutatingAdmissionPolicySpec{
+			FailurePolicy: &ignore,
+			MatchConstraints: &admissionregistrationv1.MatchResources{
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
+					RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.Create, admissionregistrationv1.Update,
+						},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"apps"},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"daemonsets"},
+						},
+					},
+				}},
+			},
+			MatchConditions: []admissionregistrationv1.MatchCondition{
+				{Name: "not-already-tolerating", Expression: "!(" + daemonSetTemplateTolerationExpr + ")"},
+			},
+			Mutations: []admissionregistrationv1.Mutation{{
+				PatchType: admissionregistrationv1.PatchTypeJSONPatch,
+				JSONPatch: &admissionregistrationv1.JSONPatch{Expression: daemonSetTemplateTolerationPatchExpr},
+			}},
+			ReinvocationPolicy: admissionregistrationv1.IfNeededReinvocationPolicy,
+		},
+	}
+	if err := ensureMutatingAdmissionPolicy(ctx, cs, templatePolicy); err != nil {
+		return fmt.Errorf("daemonset-template-toleration mutating policy: %w", err)
+	}
+	templateBinding := &admissionregistrationv1.MutatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   dsTemplateTolerationBindingName,
+			Labels: map[string]string{managedLabel: "true"},
+		},
+		Spec: admissionregistrationv1.MutatingAdmissionPolicyBindingSpec{
+			PolicyName: dsTemplateTolerationPolicyName,
+		},
+	}
+	if err := ensureMutatingAdmissionPolicyBinding(ctx, cs, templateBinding); err != nil {
+		return fmt.Errorf("daemonset-template-toleration mutating binding: %w", err)
 	}
 	return nil
 }
