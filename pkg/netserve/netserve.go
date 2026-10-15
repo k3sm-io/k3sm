@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"time"
 
@@ -215,6 +216,9 @@ type Server struct {
 	// binder plumbs the DNS VIP alias + binds 53/UDP+TCP through the selected
 	// host-network backend (netd helper when unprivileged, direct as root).
 	binder dnsBinder
+	// static are the "namespace/name" keys of the Services whose backends are
+	// pinned (proxy.WithStaticBackends) rather than derived from EndpointSlices.
+	static []string
 }
 
 // New builds the network Server: a proxy.Proxy over a routing table keyed by the
@@ -327,6 +331,10 @@ func New(cfg Config) *Server {
 			log.Warn("api-server endpoint did not parse; kubernetes VIP has no backend (in-pod kubectl degraded)", "endpoint", s.cfg.APIServerEndpoint, "err", err)
 		} else {
 			watchOpts = append(watchOpts, proxy.WithStaticBackends(static))
+			for key := range static {
+				s.static = append(s.static, key)
+			}
+			slices.Sort(s.static)
 		}
 	}
 	s.watch = proxy.NewWatcher(cfg.Client, s.proxy, log, watchOpts...)
@@ -334,6 +342,25 @@ func New(cfg Config) *Server {
 		s.policyWatch = proxy.NewPolicyWatcher(cfg.Client, s.policy, log, proxy.WithPodNodeScope(cfg.PodScopeNode))
 	}
 	return s
+}
+
+// VIPStates returns the Service proxy's routing table: one entry per routed
+// Service port with the Ready backends it routes to (proxy.Proxy.VIPStates).
+func (s *Server) VIPStates() []proxy.VIPState { return s.proxy.VIPStates() }
+
+// StaticServices returns the "namespace/name" keys of the Services whose
+// backends this Server pins instead of deriving them from EndpointSlices (see
+// Config.APIServerEndpoint), sorted. The result is owned by the caller.
+func (s *Server) StaticServices() []string { return slices.Clone(s.static) }
+
+// UnproxiedClusterIPs returns the ClusterIPs the proxy deliberately leaves to
+// another listener on this node: the cluster DNS VIP, which the in-process
+// resolver owns. Empty when the DNS VIP did not parse.
+func (s *Server) UnproxiedClusterIPs() []string {
+	if !s.dnsVIP.IsValid() {
+		return nil
+	}
+	return []string{s.dnsVIP.String()}
 }
 
 // staticAPIServerBackends renders the proxy static-backend map for the

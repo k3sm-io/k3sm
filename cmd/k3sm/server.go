@@ -718,6 +718,11 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 			logger.Error("darwin-net services", "err", err)
 		}
 	}()
+	// With no datapath the proxy routes nothing, and a record of that empty
+	// table would read as every Service missing its backends.
+	if mode.DataPath() {
+		go runServicesRecorder(ctx, net, opts.workDir, logger)
+	}
 	return net, nodeAddressing, nil
 }
 
