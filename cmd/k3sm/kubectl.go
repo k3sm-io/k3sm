@@ -17,20 +17,26 @@ limitations under the License.
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 )
 
-// runKubectl is the `k3sm kubectl` passthrough: it execs a kubectl binary
-// against this cluster and forwards every argument and the child's exit code
-// (mirrors `k3s kubectl`).
+// kubectlExec replaces the current process image with kubectl. It is a seam so
+// a test can record the call instead of losing the test binary to it.
+var kubectlExec func(bin string, argv []string, env []string) error = syscall.Exec
+
+// runKubectl is the `k3sm kubectl` passthrough: it replaces this process with a
+// kubectl binary aimed at this cluster, forwarding every argument (mirrors
+// `k3s kubectl`). There is no child process: a signal sent to `k3sm kubectl`
+// reaches kubectl itself, and the exit status is kubectl's own.
 //
 // Which credentials it uses depends on who runs it. Root and the _k3sm service
 // user get the control-plane work dir's admin kubeconfig (KUBECONFIG preset),
@@ -59,21 +65,31 @@ func runKubectl(args []string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(bin, cfg.argv(args)...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.Env = os.Environ()
-	if cfg.kubeconfig != "" {
-		cmd.Env = append(cmd.Env, "KUBECONFIG="+cfg.kubeconfig)
-	}
-	if err := cmd.Run(); err != nil {
-		// Forward kubectl's own exit code so scripts see the real status.
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			os.Exit(ee.ExitCode())
-		}
+	argv := append([]string{bin}, cfg.argv(args)...)
+	// Open files need no handling here: Go opens every descriptor O_CLOEXEC,
+	// so kubectl inherits only stdin, stdout and stderr.
+	if err := kubectlExec(bin, argv, envWithKubeconfig(os.Environ(), cfg.kubeconfig)); err != nil {
 		return fmt.Errorf("exec kubectl: %w", err)
 	}
 	return nil
+}
+
+// envWithKubeconfig returns env with KUBECONFIG set to path. Every existing
+// KUBECONFIG entry is dropped first: execve passes the slice verbatim and
+// getenv returns the FIRST match, so an appended entry would lose to the
+// caller's own. An empty path leaves env as it is, so kubectl's own loading
+// rules still see the caller's KUBECONFIG.
+func envWithKubeconfig(env []string, path string) []string {
+	if path == "" {
+		return env
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "KUBECONFIG=") {
+			out = append(out, kv)
+		}
+	}
+	return append(out, "KUBECONFIG="+path)
 }
 
 // installedContextName is the cluster/user/context name `k3sm install` merges
@@ -118,13 +134,13 @@ type kubectlInputs struct {
 // kubeconfig path exported as KUBECONFIG, or kubectl's own loading rules with a
 // context pinned.
 type kubectlConfig struct {
-	// kubeconfig, when non-empty, is exported as KUBECONFIG for the child.
+	// kubeconfig, when non-empty, is exported as KUBECONFIG for kubectl.
 	kubeconfig string
-	// context, when non-empty, is prepended to the child's argv as --context.
+	// context, when non-empty, is prepended to kubectl's argv as --context.
 	context string
 }
 
-// argv returns the child's arguments: the pinned context (when there is one)
+// argv returns kubectl's arguments: the pinned context (when there is one)
 // ahead of the caller's own. It goes FIRST because kubectl honors the LAST
 // occurrence of a repeated flag, so a user's explicit `--context` still wins.
 func (c kubectlConfig) argv(args []string) []string {
