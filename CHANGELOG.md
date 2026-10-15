@@ -26,6 +26,7 @@ pin, its date, and the tarball's sha256.
 - **`--nodeport-addresses` on `k3sm install`, `server` and `agent`.** It binds NodePorts to a list of IPv4 CIDRs, or to `local` (loopback and the node's own address). Empty keeps every interface.
 - **`k3sm install --kubeconfig-name`.** Merges the admin context into your kubeconfig under a name of your choice instead of `k3sm`.
 - **Scheduled etcd snapshots and restore on HA servers.** A server on embedded etcd snapshots its own member every 12 hours and keeps 5 by default (`--etcd-snapshot-schedule-cron`, `--etcd-snapshot-retention`, `--etcd-disable-snapshots`), and `k3sm snapshot restore` puts a snapshot back as a new single-member cluster. See [backup and restore](https://k3sm.io/docs/backup-restore/).
+- **`k3sm status` checks the Service proxy.** On a server, the `services` row compares the backends the proxy routes each Service port to with the cluster's Ready endpoints and names any Service whose sets differ. Run it with `sudo`. See [status JSON](https://k3sm.io/docs/status-json/).
 - **`k3sm status daemons -o json`** reads launchd only, never the apiserver, so it is cheap to poll. `k3sm status` also gains a `heartbeat` row for the node's last status post and Lease renewal.
 - **`HOSTNAME` is set in `vm` Pods.** Every container sees the Pod's hostname in `HOSTNAME`, and a value from the image or the Pod spec still wins. See [limitations](https://k3sm.io/docs/limitations/).
 - **Pods report `PodReadyToStartContainers`**, and pod-level `resources` count toward a Pod's QoS class.

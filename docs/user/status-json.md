@@ -158,7 +158,7 @@ four.
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig` and `runtimed`; some rows appear only when the
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
-`mesh-claims`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
+`mesh-claims`, `services`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
 `skip`, `drift`, `healthy`, `unhealthy` or `stale`.
 
@@ -167,6 +167,26 @@ Lease, as the apiserver holds them. It appears when the apiserver answered and t
 identified. Its `state` is `ok`, or `stale` (severity `warn`) when the Lease renewal is older than 40
 seconds or the status post is older than 100 seconds. `detail` gives both ages; `wide` carries them
 as `leaseAgeSeconds` and `statusAgeSeconds` when known.
+
+The `services` row appears on a server. It compares the backends the server's Service proxy routes
+each Service port to with the Ready endpoints in the cluster's EndpointSlices. The server records
+its proxy every 30 seconds in a file in its work dir that only root can read, so run `sudo k3sm
+status` to see the row's verdict; as any other user the row is `unknown` with that remedy. Its
+`state` is:
+
+- `ok` when every compared port matches. `detail` gives the port count.
+- `unhealthy` (severity `warn`) when a port's backends differ. `detail` names each such Service
+  (`namespace/name`), its port (`clusterIP:port/protocol`), the Ready endpoints the proxy does not
+  route (`missing`) and the backends it routes that are not Ready (`extra`).
+- `unknown` when the record is absent (a server records it 30 seconds after it starts), older than
+  60 seconds, or unreadable, or when the apiserver is not serving or the list fails.
+
+A port whose Service or EndpointSlices changed after the record was written, or whose Service has
+been deleted, is not counted as differing; `wide.settling` lists those. The cluster DNS address and
+the `kubernetes` Service of a single-node server are not compared, because the server serves them
+without an EndpointSlice. Each report lists every Service and every EndpointSlice once from the
+apiserver, so a script that polls the full report pays for those two lists on every poll; poll the
+daemons probe when that is all you need.
 
 The `etcd` row's `wide` carries the scheduled etcd snapshots: `snapshot-schedule` (the cron
 expression, or `off`), and when a schedule is set, `last-scheduled-snapshot` (RFC 3339, or

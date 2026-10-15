@@ -48,6 +48,7 @@ import (
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/shadow"
 	"k3sm.io/k3sm/pkg/status"
+	"k3sm.io/k3sm/pkg/svcstatus"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -175,12 +176,15 @@ func newStatusCollector() status.Collector {
 		// the agent plist's --server (the agent arguments record does not carry
 		// it, and the plist is world-readable, so this works without sudo).
 		AgentJoinServer: statusAgentJoinServer,
-		Paths:           paths,
-		EUID:            euid,
-		ServiceUID:      serviceUID,
-		Version:         version.Get(),
-		Host:            macOSVersionOrEmpty(),
-		Hostname:        hostnameOrEmpty(),
+		// The Service proxy's record against one uncached Services and
+		// EndpointSlices LIST, over the same client as every apiserver row.
+		Services:   statusServices(kube),
+		Paths:      paths,
+		EUID:       euid,
+		ServiceUID: serviceUID,
+		Version:    version.Get(),
+		Host:       macOSVersionOrEmpty(),
+		Hostname:   hostnameOrEmpty(),
 	}
 }
 
@@ -217,6 +221,16 @@ func statusInterconnect(kube status.Kube) func(context.Context) (*netv1alpha1.In
 	return func(ctx context.Context) (*netv1alpha1.Interconnect, error) {
 		return status.ReadInterconnect(ctx, kube)
 	}
+}
+
+// statusServices is the services row's comparer over kube's clientset, or nil
+// (no row) when there is no client.
+func statusServices(kube status.Kube) status.ServicesComparer {
+	rk, ok := kube.(restKube)
+	if !ok || rk.client == nil {
+		return nil
+	}
+	return svcstatus.Comparer{Client: rk.client, Timeout: statusAPITimeout}
 }
 
 // newDaemonsCollector assembles the collector for the launchd-only daemons
