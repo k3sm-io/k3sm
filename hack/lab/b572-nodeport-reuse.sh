@@ -22,17 +22,24 @@
 # Steps (every dial is the 2x2 matrix {server, worker} -> {server, worker} mesh
 # address, so the worker's own proxy and the server's proxy are both exercised):
 #   s.00 the pod server, a tiny C HTTP server (b572-serve.c below: bind the pod
-#        IP on 8080, answer HTTP/1.0 200 with the body, one request per accept),
-#        is shipped to EACH node and built there with clang into
+#        IP on 8080, answer HTTP/1.0 200 with the body, one request per accept,
+#        exit after SERVE_MAX_REQUESTS requests or SERVE_LIFETIME seconds), is
+#        shipped to EACH node and built there with clang into
 #        /private/var/tmp/k3sm-b572/ (the rig's b476 ship-and-build flow: scp, or
 #        cp on the Mac the driver runs on, then a build script). No platform
 #        binary serves, so the pod bind shim question does not arise.
+#        The pod's command is `/bin/sh /cfg/serve.sh`, which re-runs the server
+#        in a loop (no exec), so the server is a CHILD of the pod's init, the
+#        shape of the original sh + nc pods: a teardown that signals only the
+#        init leaves the server orphaned, which s2c catches.
 #   s.0  per pod: Ready, and (s0b) its 8080 listener is bound to its own pod IP,
 #        not the wildcard: a server that binds *:8080 makes a dial to any pod IP
 #        on the node land on whichever wildcard socket the kernel picks, so that
 #        regression is this named red, not a scrambled dial.
 #   s.1  ns b572-a: native pod on the worker answering "A" on 8080, NodePort p1;
 #        ns b572-b: the same answering "B", NodePort p2. p1 -> A and p2 -> B.
+#        (s1c) pod A's server runs as a child of its serve.sh, so s2c is not
+#        vacuous.
 #   s.2  ns b572-a deleted (--wait): within 60 s p1 answers nothing from either
 #        node and neither node holds a listener on p1; no process of pod A
 #        (the _k3sm-owned processes whose argv carries the pod's marker, and
@@ -105,6 +112,15 @@ bound_to_ip() {
 	return 0
 }
 
+# server_is_child <ps "pid ppid user command" rows> <marker>: 0 iff a b572-serve
+# row carrying the marker has as its parent a serve.sh row carrying the marker.
+server_is_child() {
+	printf '%s\n' "$1" | awk -v m="$2" '
+		$0 ~ ("/cfg/serve[.]sh " m "( |$)") { sh[$1] = 1 }
+		$0 ~ ("b572-serve [^ ]+ [^ ]+ " m "( |$)") { srv[$1] = $2 }
+		END { for (p in srv) if (srv[p] in sh) exit 0; exit 1 }'
+}
+
 # ip_aliased <ifconfig-lo0-output> <ip>: 0 iff an "inet <ip> " line is present
 # (an exact match: 100.64.1.2 never matches 100.64.1.29).
 ip_aliased() {
@@ -139,9 +155,15 @@ SERVE_BIN="$SERVE_DIR/b572-serve"
 # from, a directory another user planted.
 SERVE_DIR_PREP="mkdir -p -m 700 $SERVE_DIR && [ \"\$(stat -f %u $SERVE_DIR)\" = \"\$(id -u)\" ] || { echo \"$SERVE_DIR is not owned by \$(id -un); refusing to build there\" >&2; exit 1; }"
 
-# serve_source: the pod server. argv: <pod-ip|-> <body> <marker>; "-" reads the
-# pod IP from POD_IP (the downward API), since the pod command is the binary
-# itself and no shell expands it. The marker only makes the process findable.
+# The server's bounds: it exits after this many requests or seconds, so the
+# serve.sh loop really re-runs it. The lifetime is long enough that an orphan
+# left by the delete in s.2 is still running when s2c looks (a few minutes).
+SERVE_MAX_REQUESTS=25
+SERVE_LIFETIME=900
+
+# serve_source: the pod server. argv: <pod-ip|-> <body> <marker> [max-requests]
+# [lifetime-seconds]; "-" reads the pod IP from POD_IP. The marker only makes
+# the process findable.
 serve_source() {
 	cat <<'C'
 #include <arpa/inet.h>
@@ -150,7 +172,9 @@ serve_source() {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 static int write_all(int fd, const char *p, size_t n) {
@@ -165,7 +189,7 @@ static int write_all(int fd, const char *p, size_t n) {
 
 int main(int argc, char **argv) {
 	if (argc < 3) {
-		fprintf(stderr, "usage: b572-serve <pod-ip|-> <body> [marker]\n");
+		fprintf(stderr, "usage: b572-serve <pod-ip|-> <body> [marker] [max-requests] [lifetime-seconds]\n");
 		return 2;
 	}
 	const char *ip = argv[1];
@@ -194,14 +218,22 @@ int main(int argc, char **argv) {
 	char hdr[160];
 	size_t blen = strlen(argv[2]);
 	int hlen = snprintf(hdr, sizeof hdr, "HTTP/1.0 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", blen);
-	for (;;) {
+	long max = argc > 4 ? atol(argv[4]) : 25;
+	long life = argc > 5 ? atol(argv[5]) : 900;
+	time_t end = time(NULL) + life;
+	for (long served = 0; served < max && time(NULL) < end;) {
+		struct pollfd pf = { .fd = s, .events = POLLIN };
+		if (poll(&pf, 1, 1000) <= 0) continue;
 		int c = accept(s, NULL, NULL);
 		if (c < 0) continue;
 		char req[2048];
 		(void)read(c, req, sizeof req);
 		if (write_all(c, hdr, (size_t)hlen) == 0) (void)write_all(c, argv[2], blen);
 		close(c);
+		served++;
 	}
+	close(s);
+	return 0;
 }
 C
 }
@@ -223,13 +255,22 @@ ls -l "\$D"
 SCRIPT
 }
 
-# backend <ns> <node> <body> <nodePort>: a native pod running b572-serve, which
-# answers exactly <body> on its own pod IP:8080 (POD_IP from the downward API),
-# and a NodePort Service selecting it. The argv ends in the namespace as the
-# pod's marker.
+# backend <ns> <node> <body> <nodePort>: the serve.sh ConfigMap, a native pod
+# whose init is /bin/sh running serve.sh, which loops b572-serve (a child, no
+# exec) answering exactly <body> on the pod's own IP:8080 (POD_IP from the
+# downward API), and a NodePort Service selecting it. Both argvs carry the
+# namespace as the pod's marker. The script rides a ConfigMap (a native pod
+# cannot read files under /tmp).
 backend() {
 	local ns="$1" node="$2" body="$3" port="$4"
 	cat <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: b572-script, namespace: $ns}
+data:
+  serve.sh: |
+    while true; do $SERVE_BIN "\$POD_IP" "\$2" "\$1" $SERVE_MAX_REQUESTS $SERVE_LIFETIME; sleep 0.2; done
+---
 apiVersion: v1
 kind: Pod
 metadata: {name: b572-web, namespace: $ns, labels: {app: b572-web}}
@@ -240,9 +281,11 @@ spec:
   containers:
   - name: web
     image: native
-    command: ["$SERVE_BIN", "-", "$body", "$ns"]
+    command: ["/bin/sh", "/cfg/serve.sh", "$ns", "$body"]
     env: [{name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}]
     ports: [{containerPort: 8080}]
+    volumeMounts: [{name: cfg, mountPath: /cfg}]
+  volumes: [{name: cfg, configMap: {name: b572-script}}]
 ---
 apiVersion: v1
 kind: Service
@@ -307,9 +350,21 @@ nc     91200 _k3sm    3u  IPv4 0x967312696460f780      0t0  TCP *:8080 (LISTEN)'
 	case "$m" in *"{key: k3sm.io/provider, operator: Exists}"*) check ok "manifest: provider toleration (keyed)" ;; *) check no "manifest: provider toleration (keyed)" ;; esac
 	case "$m" in *"{operator"*) check no "manifest: no key-less toleration" ;; *) check ok "manifest: no key-less toleration" ;; esac
 	case "$m" in *"nodePort: 31520"*) check ok "manifest: NodePort" ;; *) check no "manifest: NodePort" ;; esac
-	case "$m" in *'command: ["/private/var/tmp/k3sm-b572/b572-serve", "-", "A", "b572-a"]'*) check ok "manifest: the node-built server, body and marker in argv" ;; *) check no "manifest: the node-built server, body and marker in argv" ;; esac
+	case "$m" in *'command: ["/bin/sh", "/cfg/serve.sh", "b572-a", "A"]'*) check ok "manifest: init is sh running serve.sh, marker and body in argv" ;; *) check no "manifest: init is sh running serve.sh, marker and body in argv" ;; esac
+	# shellcheck disable=SC2016 # the script's literal $POD_IP/$1/$2, not expansions
+	case "$m" in *'while true; do /private/var/tmp/k3sm-b572/b572-serve "$POD_IP" "$2" "$1" 25 900; sleep 0.2; done'*) check ok "manifest: serve.sh loops the node-built server as a child" ;; *) check no "manifest: serve.sh loops the node-built server as a child" ;; esac
+	case "$m" in *"exec "*) check no "manifest: no exec (the server stays a child)" ;; *) check ok "manifest: no exec (the server stays a child)" ;; esac
 	case "$m" in *"fieldPath: status.podIP"*) check ok "manifest: POD_IP from the downward API" ;; *) check no "manifest: POD_IP from the downward API" ;; esac
 	case "$m" in *"/usr/bin/"*|*python*) check no "manifest: no platform binary or interpreter" ;; *) check ok "manifest: no platform binary or interpreter" ;; esac
+
+	ps1='  4101     1 _k3sm /bin/sh /cfg/serve.sh b572-a A
+  4120  4101 _k3sm /private/var/tmp/k3sm-b572/b572-serve 100.64.1.5 A b572-a 25 900'
+	ps2='  4120     1 _k3sm /private/var/tmp/k3sm-b572/b572-serve 100.64.1.5 A b572-a 25 900'
+	ps3='  4101     1 _k3sm /bin/sh /cfg/serve.sh b572-a A
+  4120  4101 _k3sm /private/var/tmp/k3sm-b572/b572-serve 100.64.1.5 A b572-ab 25 900'
+	check "$(t server_is_child "$ps1" b572-a)" "server_is_child: the server under its serve.sh"
+	check "$([ "$(t server_is_child "$ps2" b572-a)" = no ] && echo ok)" "server_is_child: an orphan (ppid 1) is not"
+	check "$([ "$(t server_is_child "$ps3" b572-a)" = no ] && echo ok)" "server_is_child: another pod's marker is not"
 
 	check "$(t same_host Node-A.local node-a)" "same_host: first label, any case"
 	check "$(t same_host user@node-a node-a)" "same_host: user@ ignored"
@@ -419,14 +474,16 @@ pod_diag() {
 
 # lsof_on <node> <ports>: the LISTEN rows on those ports (root: the proxy runs as _k3sm).
 lsof_on() { on "$(ssh_of "$1")" "sudo -n lsof -nP -iTCP:$2 -sTCP:LISTEN 2>/dev/null || true"; }
-# procs_on <node>: pid ppid pgid user command of every nc on 8080 and every b572-serve.
-procs_on() { on "$(ssh_of "$1")" "sudo -n ps -axo pid=,ppid=,pgid=,user=,command= | grep -E '[n]c -l 8080|[b]572-serve ' || true"; }
-# pod_pids <node> <ns>: the _k3sm-owned processes whose argv ends in the pod's
-# marker (the namespace), and their _k3sm-owned children.
+# procs_on <node>: pid ppid pgid user command of every nc on 8080, every
+# b572-serve and every b572 serve.sh.
+procs_on() { on "$(ssh_of "$1")" "sudo -n ps -axo pid=,ppid=,pgid=,user=,command= | grep -E '[n]c -l 8080|[b]572-serve |[s]erve[.]sh b572-' || true"; }
+# pod_pids <node> <ns>: the _k3sm-owned processes carrying the pod's marker (the
+# namespace) in argv: its serve.sh and every b572-serve it started, plus their
+# _k3sm-owned children.
 pod_pids() {
 	local h top p all
 	h="$(ssh_of "$1")"
-	top="$(on "$h" "sudo -n pgrep -u _k3sm -f 'b572-serve .* $2\$' || true" | xargs)"
+	top="$(on "$h" "sudo -n pgrep -u _k3sm -f '/cfg/serve[.]sh $2 |b572-serve [^ ]+ [^ ]+ $2 ' || true" | xargs)"
 	all="$top"
 	for p in $top; do all="$all $(on "$h" "sudo -n pgrep -u _k3sm -P $p || true" | xargs)"; done
 	echo "$all" | tr ' ' '\n' | sort -un | xargs
@@ -570,6 +627,13 @@ dump "A and B live"
 # the pod's marker in argv, plus their children.
 A_PIDS="$(pod_pids "$WORKER" b572-a)"
 obs "pod A pod IP $IP_A, processes [$A_PIDS]"
+a_tree="$(on "$K3SM_B572_WORKER_SSH" "sudo -n ps -axo pid=,ppid=,user=,command=" | awk -v pids=" $A_PIDS " 'index(pids, " " $1 " ")')"
+printf '%s\n' "$a_tree" | sed 's/^/      /'
+if server_is_child "$a_tree" b572-a; then
+	ladder ok "b572.s1c pod A's b572-serve is a child of its serve.sh (s2c is not vacuous)"
+else
+	ladder no "b572.s1c pod A's b572-serve is a child of its serve.sh (s2c would be vacuous)"
+fi
 
 # s.2 -----------------------------------------------------------------------------
 STEP=s2
@@ -598,6 +662,9 @@ else
 	ladder no "b572.s2b no listener on p1 $P1 on either node, within 60 s ($lis)"
 fi
 left="$(survivors "$(on "$K3SM_B572_WORKER_SSH" "ps -axo pid=,user=" | awk '$2 == "_k3sm" { print $1 }')" "$A_PIDS")"
+# Also any _k3sm process carrying pod A's marker now (a server the loop started
+# after the record above).
+left="$(echo "$left $(pod_pids "$WORKER" b572-a)" | tr ' ' '\n' | sort -un | xargs)"
 if [ -z "$left" ]; then
 	ladder ok "b572.s2c no process of pod A survives on $WORKER (recorded [$A_PIDS])"
 else
