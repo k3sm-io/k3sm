@@ -35,7 +35,7 @@ hack/lab/runs/<gate>-<rc-tag>-<UTCdate>.log
 ## Header
 
 Every log opens with the header emitted by the gate script itself (see
-`emit_run_log_header` in `hack/lab/m11.sh`). Four fields are **required**; a log
+`emit_run_log_header` in `hack/lab/lib/runlog.sh`). Four fields are **required**; a log
 missing any of them is not evidence:
 
 | Field | Why it is required |

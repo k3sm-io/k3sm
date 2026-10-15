@@ -444,6 +444,15 @@ func TestM11CoreGateDeclaresCoreMode(t *testing.T) {
 			t.Fatalf("read %s: %v", core.Gate, err)
 		}
 		src := string(body)
+		// The emitter lives in the run-log library the gate sources (B575), so the
+		// library's text counts as the gate's own when, and only when, it is sourced.
+		if sourcesRunlogRE.MatchString(src) {
+			lib, err := os.ReadFile(filepath.Join(repoRoot(t), filepath.FromSlash(runlogLib)))
+			if err != nil {
+				t.Fatalf("read %s: %v", runlogLib, err)
+			}
+			src += string(lib)
+		}
 		for _, want := range []struct{ field, token string }{
 			{"gate name", "gate: "},
 			{"artifact sha256", "artifact_sha256: "},

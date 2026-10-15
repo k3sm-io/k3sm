@@ -62,18 +62,24 @@
 #
 # Evidence: the run log is hack/lab/runs/m17-lab-<rc-tag>-<UTCdate>.log (gitignored;
 # hack/lab/runs/README.md) and EVIDENCE_DIR/run.log, with the M11 run-log header
-# (gate, artifact_sha256, git_sha.<repo>, result) emitted by hack/lab/m11.sh's own
-# functions; per-rung transcripts, counters and figures sit under EVIDENCE_DIR/<rung>/;
+# (gate, artifact_sha256, git_sha.<repo>, result) emitted by hack/lab/lib/runlog.sh;
+# per-rung transcripts, counters and figures sit under EVIDENCE_DIR/<rung>/;
 # EVIDENCE_DIR/rungs.tsv is the per-rung verdict --verify-twice reads.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck disable=SC2034 # REPO_ROOT, GATE_NAME and MODE are read by m11.sh's header functions (load_header)
+# shellcheck disable=SC2034 # REPO_ROOT, GATE_NAME and MODE are read by the header functions (lib/runlog.sh)
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 SELF="$HERE/m17-interconnect.sh"
 # shellcheck source-path=SCRIPTDIR source=lib/m17-interconnect-predicates.sh
 . "$HERE/lib/m17-interconnect-predicates.sh"
 # shellcheck source-path=SCRIPTDIR source=lib/tolerations.sh
 . "$HERE/lib/tolerations.sh"
+[ -r "$HERE/lib/runlog.sh" ] || {
+	echo "preflight: run-log library missing or unreadable: $HERE/lib/runlog.sh" >&2
+	exit 2
+}
+# shellcheck source-path=SCRIPTDIR source=lib/runlog.sh
+. "$HERE/lib/runlog.sh" || exit 2
 LAB_TOLERATIONS="$(lab_tolerations_yaml NoSchedule)" || exit 2
 
 # shellcheck disable=SC2034 # see REPO_ROOT
@@ -1110,6 +1116,35 @@ gate_run() {
 	}
 }
 
+# runlog_missing_refuses <dir> — a copy of this ladder whose lib/ lacks runlog.sh
+# (the other sourced files laid out as in the tree), started as a rig run, must
+# print only the preflight refusal and exit 2.
+runlog_missing_refuses() {
+	local d="$1" rc=0 out want
+	mkdir -p "$d/lab/lib" "$d/spike/m17-interconnect" || return 1
+	cp "$SELF" "$d/lab/m17-interconnect.sh" || return 1
+	cp "$HERE/lib/m17-interconnect-predicates.sh" "$HERE/lib/tolerations.sh" "$d/lab/lib/" || return 1
+	cp "$HERE/../spike/m17-interconnect/lib.sh" "$d/spike/m17-interconnect/" || return 1
+	want="preflight: run-log library missing or unreadable: $d/lab/lib/runlog.sh"
+	out="$(env -u K3SM_LAB_PRINT_MANIFESTS K3SM_LAB=1 PEER_SSH=self-test.invalid EVIDENCE_DIR="$d/ev" bash "$d/lab/m17-interconnect.sh" 2>&1)" || rc=$?
+	[ "$rc" = 2 ] || {
+		echo "exit $rc, want 2: $(printf '%s' "$out" | tail -3)"
+		return 1
+	}
+	printf '%s' "$out" | grep -qxF -- "$want" || {
+		echo "output lacks '$want': $(printf '%s' "$out" | tail -3)"
+		return 1
+	}
+	[ "$(printf '%s\n' "$out" | grep -c .)" = 1 ] || {
+		echo "output beyond the refusal (a rung or preflight ran): $(printf '%s' "$out" | head -3)"
+		return 1
+	}
+	[ ! -e "$d/ev" ] || {
+		echo "the evidence directory was created"
+		return 1
+	}
+}
+
 # st_driver <r3|r4> <profile> <want 0|1> — run the real r3 or r4 assertion with the
 # host and cluster helpers stubbed over fixture outputs (driver/<profile>/), so a
 # swapped argument between the rung glue and its predicates reds without a rig.
@@ -1281,8 +1316,9 @@ self_test_body() {
 	st "--verify-twice mode exits 0 on the green pair" 0 gate_run 0 PASS -- --verify-twice "$F/run-a" "$F/run-b"
 	st "--verify-twice mode exits 1 on a copy" 0 gate_run 1 - -- --verify-twice "$F/run-a" "$F/run-a"
 
-	st "the M11 run-log header loads from hack/lab/m11.sh" 0 load_header
-	if load_header 2>/dev/null; then
+	st "the M11 run-log header loads from hack/lab/lib/runlog.sh" 0 declare -F emit_run_log_header emit_run_log_verdict artifact_sha256 repo_git_sha
+	st "a missing run-log library refuses (exit 2) before any rung" 0 runlog_missing_refuses "$tmp/nolib"
+	if declare -F emit_run_log_header emit_run_log_verdict artifact_sha256 repo_git_sha >/dev/null; then
 		# A fixture stands in for the artifact so artifact_sha256 is a real value.
 		K3SM_ARTIFACT="$F/hello-minor2.json" K3SM_RC_TAG="" emit_run_log_header "FAIL (provisional)" >"$tmp/header.txt" 2>&1
 		for r in "gate: m17-lab" "artifact_sha256: local:$(shasum -a 256 "$F/hello-minor2.json" | cut -d' ' -f1)" "git_sha.apis: " "git_sha.runtimed: " "git_sha.darwin-net: " "git_sha.k3sm: " "started_utc: " "tolerate_keys: " "result: FAIL"; do
@@ -1321,27 +1357,6 @@ self_test() {
 		return 1
 	fi
 	return "$rc"
-}
-
-# load_header — the run-log header and verdict functions, taken from
-# hack/lab/m11.sh where the convention defines them (hack/lab/runs/README.md).
-# m11.sh is a gate, not a library, so the four function bodies are read out of it
-# and evaluated rather than copied here; a change there reaches this ladder, and
-# the self-test emits a header from them and checks its keys, so a change that
-# breaks them reds the self-test rather than a rig run. Hoisting the four
-# functions into hack/lab/lib, shared by m11.sh, B46.sh and this ladder, is a
-# filed follow-up.
-load_header() {
-	local src f
-	src="$(sed -n -e '/^emit_run_log_header() {$/,/^}$/p' -e '/^emit_run_log_verdict() {$/,/^}$/p' \
-		-e '/^artifact_sha256() {$/,/^}$/p' -e '/^repo_git_sha() {$/,/^}$/p' "$HERE/m11.sh")"
-	eval "$src"
-	for f in emit_run_log_header emit_run_log_verdict artifact_sha256 repo_git_sha; do
-		declare -F "$f" >/dev/null || {
-			echo "hack/lab/m11.sh no longer defines $f()"
-			return 1
-		}
-	done
 }
 
 # ── Arguments ───────────────────────────────────────────────────────────────────
@@ -1420,7 +1435,6 @@ MLX_MEMORY="${K3SM_M17_MLX_MEMORY:-4Gi}"
 MLX_READY_TIMEOUT="${K3SM_M17_MLX_READY_TIMEOUT:-1800}"
 REINSTALL_ARGS="${K3SM_M17_REINSTALL_ARGS:-}"
 mkdir -p "$EVIDENCE_DIR" || refuse_run preflight "cannot create $EVIDENCE_DIR (BI10)"
-load_header || refuse_run preflight "the run-log header cannot be loaded from hack/lab/m11.sh (BI10)"
 
 RUN_LOG="$HERE/runs/m17-lab-${K3SM_RC_TAG:-local}-$(date -u +%Y-%m-%d).log"
 mkdir -p "$HERE/runs"
