@@ -1,0 +1,5 @@
+{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}
+{key: k3sm.io/provider, operator: Exists}
+{"key": "k3sm.io/provider", "operator": "Exists", "effect": "NoSchedule"}
+{"key": "k3sm.io/provider", "operator": "Exists"}
+tolerate_keys: none

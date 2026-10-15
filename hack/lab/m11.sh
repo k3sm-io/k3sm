@@ -86,9 +86,14 @@
 #                           observed Apple NAT default — netserve.DefaultVMNetSubnet)
 #   K3SM_M11_READY_TIMEOUT  seconds to wait for a vm pod to go Ready (default 600)
 #   K3SM_M11_VMHOST_KILL    command that kills one pod's k3sm-vmhost helper
+#   K3SM_LAB_TOLERATE_KEYS  extra taint keys every lab pod tolerates, space-separated
+#                           (hack/lab/lib/tolerations.sh)
+#   K3SM_LAB_PRINT_MANIFESTS=1  print the five pod manifests and exit; contacts nothing
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# shellcheck source-path=SCRIPTDIR source=lib/tolerations.sh
+. "$HERE/lib/tolerations.sh"
 
 # ── Mode parsing: --core selects the launch subset; bare selects the full ledger. ──
 # An unknown flag is REJECTED rather than ignored, so a typo ("--cores") can never be
@@ -139,6 +144,7 @@ emit_run_log_header() {
 		echo "git_sha.${repo}: $(repo_git_sha "$repo")"
 	done
 	echo "started_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	lab_tolerations_header
 	echo "result: ${result}"
 }
 
@@ -186,18 +192,6 @@ repo_git_sha() {
 	echo "unknown"
 }
 
-# ── Lab guard: only run under K3SM_LAB=1 (a real VZ-capable macOS host). ───────────
-if [ "${K3SM_LAB:-}" != "1" ]; then
-	if [ "$MODE" = "core" ]; then
-		echo "${GATE_NAME} gate: PENDING (dev-mac + vz + network). The launch subset of the vm path (--core) needs K3SM_LAB=1 + a real VZ-capable Mac; this is NOT a pass."
-	else
-		echo "${GATE_NAME} gate: PENDING (vz + network). The FULL B109 vm-path ledger needs K3SM_LAB=1 + a real VZ-capable Mac; a --core green does not satisfy it. This is NOT a pass."
-	fi
-	exit 0
-fi
-
-emit_run_log_header "FAIL (provisional — the final result line below is the verdict; a log that ends here did not finish)"
-
 # ── Knobs ──────────────────────────────────────────────────────────────────────────
 NS="${K3SM_M11_NAMESPACE:-k3sm-m11}"
 IMAGE_LINUX="${K3SM_M11_IMAGE:-alpine:3.20}"
@@ -227,6 +221,160 @@ PVC=m11-data
 MARKER="m11-marker-$$"
 MARKER_A="store-a-$$"
 MARKER_B="store-b-$$"
+
+# ── The pod manifests ─────────────────────────────────────────────────────────────
+# One function per pod, each printing its manifest; the rungs below pipe them to
+# kubectl. They read the knobs above and VM_NODE (chosen at m11.1).
+LAB_TOLERATIONS="$(lab_tolerations_yaml NoSchedule)" || exit 2
+
+# boot_pod: the long-lived m11.2 pod (see m11.2 below).
+boot_pod() {
+	cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $POD_BOOT
+  namespace: $NS
+  labels: {app: $POD_BOOT}
+spec:
+  runtimeClassName: vm
+  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
+  tolerations: [$LAB_TOLERATIONS]
+  containers:
+    - name: app
+      image: $IMAGE_LINUX
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          mkdir -p /www
+          echo "$MARKER" > /www/index.html
+          i=1
+          while [ \$i -le $LOG_LINES ]; do echo "m11-log-\$i $MARKER"; i=\$((i + 1)); done
+          if command -v httpd >/dev/null 2>&1; then exec httpd -f -p $LISTEN_PORT -h /www; fi
+          while true; do
+            printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n$MARKER\n' | nc -l -p $LISTEN_PORT >/dev/null 2>&1 || sleep 1
+          done
+EOF
+}
+
+# workload_pod: the m11.5 real-image pod.
+workload_pod() {
+	cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $POD_WORKLOAD
+  namespace: $NS
+  labels: {app: $POD_WORKLOAD}
+spec:
+  runtimeClassName: vm
+  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
+  tolerations: [$LAB_TOLERATIONS]
+  containers:
+    - name: nats
+      image: $IMAGE_WORKLOAD
+EOF
+}
+
+# store_pod_manifest <marker>: the m11.6 PVC-backed pod, appending <marker>.
+store_pod_manifest() {
+	cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $POD_STORE
+  namespace: $NS
+  labels: {app: $POD_STORE}
+spec:
+  runtimeClassName: vm
+  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
+  tolerations: [$LAB_TOLERATIONS]
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: $PVC
+  containers:
+    - name: app
+      image: $IMAGE_LINUX
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "$1" >> /data/markers
+          sync
+          while true; do sleep 5; done
+      volumeMounts:
+        - {name: data, mountPath: /data}
+EOF
+}
+
+# amd64_pod: the m11.8 amd64-only pod.
+amd64_pod() {
+	cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $POD_AMD64
+  namespace: $NS
+spec:
+  runtimeClassName: vm
+  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
+  tolerations: [$LAB_TOLERATIONS]
+  containers:
+    - name: app
+      image: $IMAGE_AMD64
+      command: ["/bin/sh", "-c", "sleep 3600"]
+EOF
+}
+
+# follow_pod: the m11.11 logs -f pod.
+follow_pod() {
+	cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $POD_FOLLOW
+  namespace: $NS
+spec:
+  runtimeClassName: vm
+  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
+  tolerations: [$LAB_TOLERATIONS]
+  containers:
+    - name: app
+      image: $IMAGE_LINUX
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          i=1
+          while true; do echo "m11-beat-\$i"; i=\$((i + 1)); sleep 1; done
+EOF
+}
+
+if [ "${K3SM_LAB_PRINT_MANIFESTS:-}" = 1 ]; then
+	VM_NODE="<vm-node>"
+	lab_tolerations_header
+	boot_pod
+	echo "---"
+	workload_pod
+	echo "---"
+	store_pod_manifest "$MARKER_A"
+	echo "---"
+	amd64_pod
+	echo "---"
+	follow_pod
+	exit 0
+fi
+
+# ── Lab guard: only run under K3SM_LAB=1 (a real VZ-capable macOS host). ───────────
+if [ "${K3SM_LAB:-}" != "1" ]; then
+	if [ "$MODE" = "core" ]; then
+		echo "${GATE_NAME} gate: PENDING (dev-mac + vz + network). The launch subset of the vm path (--core) needs K3SM_LAB=1 + a real VZ-capable Mac; this is NOT a pass."
+	else
+		echo "${GATE_NAME} gate: PENDING (vz + network). The FULL B109 vm-path ledger needs K3SM_LAB=1 + a real VZ-capable Mac; a --core green does not satisfy it. This is NOT a pass."
+	fi
+	exit 0
+fi
+
+emit_run_log_header "FAIL (provisional — the final result line below is the verdict; a log that ends here did not finish)"
 
 PASS=0; FAIL=0; REC=0
 ladder() {
@@ -349,7 +497,9 @@ except Exception:
 #   nodeSelector kubernetes.io/os: darwin       k3sm's os=darwin Deny VAP rejects a pod
 #                                               that does not declare it (the intent guard)
 #   toleration k3sm.io/provider:NoSchedule      the VK node taint (the placement guard);
-#                                               without it the pod sits Unschedulable
+#                                               without it the pod sits Unschedulable.
+#                                               Rendered by hack/lab/lib/tolerations.sh,
+#                                               with K3SM_LAB_TOLERATE_KEYS added
 
 # ── m11.1 preflight ───────────────────────────────────────────────────────────────
 # Every pod is PINNED to one named vm-capable node, and THIS host's node is preferred.
@@ -419,32 +569,7 @@ fi
 # One long-lived pod carries m11.2/3/4/7/9 and, in the full run, m11.10/12: it echoes a
 # fixed number of marker lines (so --tail=N is exact) and then serves the marker over
 # HTTP from the guest, which is what the host->guest and Service legs dial.
-kn apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: $POD_BOOT
-  namespace: $NS
-  labels: {app: $POD_BOOT}
-spec:
-  runtimeClassName: vm
-  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
-  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
-  containers:
-    - name: app
-      image: $IMAGE_LINUX
-      command: ["/bin/sh", "-c"]
-      args:
-        - |
-          mkdir -p /www
-          echo "$MARKER" > /www/index.html
-          i=1
-          while [ \$i -le $LOG_LINES ]; do echo "m11-log-\$i $MARKER"; i=\$((i + 1)); done
-          if command -v httpd >/dev/null 2>&1; then exec httpd -f -p $LISTEN_PORT -h /www; fi
-          while true; do
-            printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n$MARKER\n' | nc -l -p $LISTEN_PORT >/dev/null 2>&1 || sleep 1
-          done
-EOF
+boot_pod | kn apply -f - >/dev/null
 
 BOOT_OK=0
 if wait_ready "$POD_BOOT" "$READY_TIMEOUT"; then
@@ -613,21 +738,7 @@ fi
 # ── m11.5 real-image workload ─────────────────────────────────────────────────────
 # nats:2.10-alpine's entrypoint is the BARE NAME docker-entrypoint.sh, so it exercises
 # execvp-style PATH resolution in the guest, not just an absolute-path spawn.
-kn apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: $POD_WORKLOAD
-  namespace: $NS
-  labels: {app: $POD_WORKLOAD}
-spec:
-  runtimeClassName: vm
-  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
-  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
-  containers:
-    - name: nats
-      image: $IMAGE_WORKLOAD
-EOF
+workload_pod | kn apply -f - >/dev/null
 
 if wait_ready "$POD_WORKLOAD" "$READY_TIMEOUT"; then
 	found=0
@@ -669,35 +780,7 @@ spec:
       storage: 1Gi
 EOF
 
-store_pod() {
-	kn apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: $POD_STORE
-  namespace: $NS
-  labels: {app: $POD_STORE}
-spec:
-  runtimeClassName: vm
-  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
-  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
-  volumes:
-    - name: data
-      persistentVolumeClaim:
-        claimName: $PVC
-  containers:
-    - name: app
-      image: $IMAGE_LINUX
-      command: ["/bin/sh", "-c"]
-      args:
-        - |
-          echo "$1" >> /data/markers
-          sync
-          while true; do sleep 5; done
-      volumeMounts:
-        - {name: data, mountPath: /data}
-EOF
-}
+store_pod() { store_pod_manifest "$1" | kn apply -f - >/dev/null; }
 
 STORE_OK=0
 store_pod "$MARKER_A"
@@ -775,21 +858,7 @@ else
 fi
 
 # ── m11.8 amd64 fail-closed (NEGATIVE assertion) ──────────────────────────────────
-kn apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: $POD_AMD64
-  namespace: $NS
-spec:
-  runtimeClassName: vm
-  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
-  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
-  containers:
-    - name: app
-      image: $IMAGE_AMD64
-      command: ["/bin/sh", "-c", "sleep 3600"]
-EOF
+amd64_pod | kn apply -f - >/dev/null
 
 matched=0
 ran=0
@@ -872,25 +941,7 @@ fi
 # Its own pod, because the leg ENDS by deleting the pod: a follower that keeps running
 # after its subject is gone is the failure this rung exists to catch, and proving that
 # requires being allowed to delete the subject.
-kn apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: $POD_FOLLOW
-  namespace: $NS
-spec:
-  runtimeClassName: vm
-  nodeSelector: {kubernetes.io/os: darwin, kubernetes.io/hostname: $VM_NODE}
-  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
-  containers:
-    - name: app
-      image: $IMAGE_LINUX
-      command: ["/bin/sh", "-c"]
-      args:
-        - |
-          i=1
-          while true; do echo "m11-beat-\$i"; i=\$((i + 1)); sleep 1; done
-EOF
+follow_pod | kn apply -f - >/dev/null
 
 if wait_ready "$POD_FOLLOW" "$READY_TIMEOUT"; then
 	FOLLOW_OUT="$(mktemp -t m11-follow)"
