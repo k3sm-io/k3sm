@@ -85,7 +85,7 @@ func TestStartClaimsTheBootExactlyOnce(t *testing.T) {
 		return nil
 	})
 
-	s := NewSupervised(Config{WorkDir: t.TempDir(), APIServerPort: freePort(t)})
+	s := NewSupervised(withServingPair(Config{WorkDir: t.TempDir(), APIServerPort: freePort(t)}))
 
 	ctx := context.Background()
 	pollersDone := make(chan struct{})
@@ -162,7 +162,7 @@ func TestStartReleasesTheClaimAfterAFailedBoot(t *testing.T) {
 		return nil
 	})
 
-	s := NewSupervised(Config{WorkDir: t.TempDir(), APIServerPort: freePort(t)})
+	s := NewSupervised(withServingPair(Config{WorkDir: t.TempDir(), APIServerPort: freePort(t)}))
 
 	if err := s.Start(context.Background()); !errors.Is(err, boom) {
 		t.Fatalf("first Start = %v, want the provision error", err)

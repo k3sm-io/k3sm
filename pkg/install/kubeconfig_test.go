@@ -17,6 +17,7 @@ limitations under the License.
 package install
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"k8s.io/client-go/tools/clientcmd"
@@ -127,4 +128,45 @@ func TestMergeAdminKubeconfig(t *testing.T) {
 			t.Error("expected an error on a malformed admin kubeconfig")
 		}
 	})
+}
+
+// TestMergeRewritesBothOldAnchorShapes pins the upgrade half of the admin
+// kubeconfig contract: a ~/.kube/config an earlier release wrote carries the k3sm
+// cluster either pinned to the apiserver's legacy self-signed certificate or with
+// insecure-skip-tls-verify. Merging the new admin kubeconfig must replace that
+// whole cluster entry, so the result pins the cluster CA and keeps no skip-verify.
+func TestMergeRewritesBothOldAnchorShapes(t *testing.T) {
+	clusterCA := []byte("-----BEGIN CERTIFICATE-----\nclusterca\n-----END CERTIFICATE-----\n")
+	selfSigned := []byte("-----BEGIN CERTIFICATE-----\nselfsigned\n-----END CERTIFICATE-----\n")
+	incoming, err := AdminKubeconfig(Config{AdminToken: "k3sm-tok", ClusterCA: clusterCA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, oldTLS := range map[string]string{
+		"a self-signed pin": "    certificate-authority-data: " + base64.StdEncoding.EncodeToString(selfSigned),
+		"skip-verify":       "    insecure-skip-tls-verify: true",
+	} {
+		t.Run(name, func(t *testing.T) {
+			old := "apiVersion: v1\nkind: Config\ncurrent-context: k3sm\nclusters:\n- name: k3sm\n  cluster:\n    server: https://127.0.0.1:6444\n" + oldTLS +
+				"\ncontexts:\n- name: k3sm\n  context:\n    cluster: k3sm\n    user: k3sm\nusers:\n- name: k3sm\n  user:\n    token: k3sm-old\n"
+			out, err := mergeAdminKubeconfig([]byte(old), incoming, adminContextName)
+			if err != nil {
+				t.Fatalf("merge: %v", err)
+			}
+			cfg, err := clientcmd.Load(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cl := cfg.Clusters[adminContextName]
+			if cl == nil {
+				t.Fatalf("no %s cluster after the merge:\n%s", adminContextName, out)
+			}
+			if cl.InsecureSkipTLSVerify {
+				t.Errorf("the merged cluster still skips verification:\n%s", out)
+			}
+			if string(cl.CertificateAuthorityData) != string(clusterCA) {
+				t.Errorf("the merged cluster does not pin the cluster CA:\n%s", out)
+			}
+		})
+	}
 }

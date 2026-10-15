@@ -26,6 +26,8 @@ import (
 	"testing"
 
 	"k8s.io/client-go/tools/clientcmd"
+
+	"k3sm.io/k3sm/pkg/certs"
 )
 
 // hostOf returns the host of a kubeconfig/probe server URL, failing the test if it
@@ -164,6 +166,9 @@ func TestAdminKubeconfigServerFollowsEffectiveBind(t *testing.T) {
 			cfg := tc.cfg
 			cfg.WorkDir = t.TempDir()
 			cfg = cfg.withDefaults()
+			if _, err := certs.EnsureHierarchy(cfg.WorkDir, certs.RoleMintAuthority, certs.PostureKine); err != nil {
+				t.Fatalf("ensure the CA hierarchy the kubeconfig pins: %v", err)
+			}
 			if err := writeKubeconfig(cfg, "k3sm-testtoken"); err != nil {
 				t.Fatalf("write kubeconfig: %v", err)
 			}

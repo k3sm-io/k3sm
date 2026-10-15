@@ -111,6 +111,12 @@ type RotateOptions struct {
 	// (DefaultRotateHealthPoll).
 	HealthTimeout time.Duration
 	HealthPoll    time.Duration
+	// MeshServer reports whether the installed server runs with --mesh-ip. The
+	// caller reads it from the installed server plist (the argv launchd runs) and
+	// aborts the rotation when that read fails, so a topology is never defaulted. It
+	// decides only whether the kubelet serving pair, minted on a mesh boot alone, is
+	// reported present.
+	MeshServer bool
 }
 
 // RotationArtifact is one on-disk credential a rotation report names.
@@ -208,7 +214,7 @@ func RotateCertificates(ctx context.Context, opts RotateOptions) (*RotationRepor
 		ClusterCAPin:       pins.cluster,
 		SigningCAPin:       pins.signing,
 		RequestHeaderCAPin: pins.requestHeader,
-		Reissued:           reissuedArtifacts(opts.WorkDir),
+		Reissued:           reissuedArtifacts(opts.WorkDir, opts.MeshServer),
 		OutOfScope:         outOfScopeArtifacts(opts.WorkDir),
 	}
 	if !opts.Restart {
@@ -339,8 +345,8 @@ func awaitRestartedInstance(ctx context.Context, opts RotateOptions, priorPID in
 }
 
 // reissuedArtifacts lists the CA-signed leaf credentials the control-plane boot
-// re-issues — the actual content of a rotation.
-func reissuedArtifacts(workDir string) []RotationArtifact {
+// re-issues — the actual content of a rotation. meshServer is RotateOptions.MeshServer.
+func reissuedArtifacts(workDir string, meshServer bool) []RotationArtifact {
 	return []RotationArtifact{
 		artifact(SchedulerKubeconfigPath(workDir),
 			"client cert CN="+schedulerCN+", issued by the signing CA — re-issued on every boot"),
@@ -355,10 +361,10 @@ func reissuedArtifacts(workDir string) []RotationArtifact {
 		artifact(ProxyClientKeyPath(workDir),
 			"front-proxy client key for the cert above"),
 		artifact(certs.APIServerServingCertPath(workDir),
-			"apiserver serving cert, issued by the cluster CA — multi-node (--mesh-ip) servers only; re-issued on every boot"),
+			"apiserver serving cert, issued by the cluster CA — re-issued on every boot"),
 		artifact(certs.APIServerServingKeyPath(workDir),
-			"apiserver serving key for the cert above — multi-node servers only"),
-		kubeletServingArtifact(workDir),
+			"apiserver serving key for the cert above"),
+		kubeletServingArtifact(meshServer),
 		serverNodeClientArtifact(),
 	}
 }
@@ -390,16 +396,16 @@ func serverNodeClientArtifact() RotationArtifact {
 // rotation just as badly as claiming an artifact that is not re-issued.
 //
 // It has no path: the pair is held in memory for the life of the server process and
-// deliberately never written (no new private key on disk). Present is therefore read
-// off the mesh posture's on-disk WITNESS — the apiserver serving cert, minted in the
-// same --mesh-ip branch — so a single-node work dir reports it absent, which is
-// true: nothing mints it there.
-func kubeletServingArtifact(workDir string) RotationArtifact {
-	_, err := os.Stat(certs.APIServerServingCertPath(workDir))
+// deliberately never written (no new private key on disk). Present is therefore the
+// installed topology, meshServer (RotateOptions.MeshServer, read from the installed
+// server plist): only a --mesh-ip boot mints it, so a single-node server reports it
+// absent, which is true. The apiserver serving cert is no witness: every topology
+// issues it.
+func kubeletServingArtifact(meshServer bool) RotationArtifact {
 	return RotationArtifact{
 		Path:    "(in memory — never written to disk)",
-		Detail:  "kubelet serving cert+key for this node's :10250, issued by the cluster CA — multi-node (--mesh-ip) servers only; re-minted into memory on every boot, so its presence is read off " + certs.APIServerServingCertPath(workDir),
-		Present: err == nil,
+		Detail:  "kubelet serving cert+key for this node's :10250, issued by the cluster CA — multi-node (--mesh-ip) servers only; re-minted into memory on every boot, so its presence is read off the installed server's --mesh-ip",
+		Present: meshServer,
 	}
 }
 
@@ -425,7 +431,7 @@ func outOfScopeArtifacts(workDir string) []RotationArtifact {
 		artifact(ServiceAccountPubPath(workDir),
 			"service-account verification key for the signing key above"),
 		artifact(APIServerCertDir(workDir),
-			"the apiserver's own self-signed cert dir — also the controller-manager --root-ca-file and the source of every pod's projected kube-root-ca.crt; replacing it is a cluster-wide trust event"),
+			"the legacy apiserver self-signed cert dir — neither read nor written now (the apiserver serves a cluster-CA leaf); kept one release as the rollback artifact"),
 	}
 }
 

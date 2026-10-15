@@ -264,7 +264,7 @@ func TestOnComponentExitFiresWhenAComponentCrashes(t *testing.T) {
 	crash := writeHeldChild(t, wd, "crasher", "echo boom-detail-line\nexit 7\n")
 
 	rec := newExitRecorder()
-	s := NewSupervised(Config{WorkDir: wd, OnComponentExit: rec.fn})
+	s := NewSupervised(withServingPair(Config{WorkDir: wd, OnComponentExit: rec.fn}))
 
 	var child *component
 	stubBoot(t, func(s *Supervised, ctx context.Context) error {
@@ -330,7 +330,7 @@ func TestOnComponentExitFiresForACrashWhileALaterComponentComesUp(t *testing.T) 
 	writeChild(t, wd, "late", "#!/bin/sh\nsleep 30\n")
 
 	rec := newExitRecorder()
-	s := NewSupervised(Config{WorkDir: wd, OnComponentExit: rec.fn})
+	s := NewSupervised(withServingPair(Config{WorkDir: wd, OnComponentExit: rec.fn}))
 
 	var early *component
 	stubBoot(t, func(s *Supervised, ctx context.Context) error {
@@ -403,7 +403,7 @@ func TestHeldChildReleaseFailureIsBounded(t *testing.T) {
 	starved := writeStarvedChild(t, wd, "early", "echo early-boom\nexit 9\n", b)
 
 	rec := newExitRecorder()
-	s := NewSupervised(Config{WorkDir: wd, OnComponentExit: rec.fn})
+	s := NewSupervised(withServingPair(Config{WorkDir: wd, OnComponentExit: rec.fn}))
 
 	var pid int
 	stubBoot(t, func(s *Supervised, ctx context.Context) error {
@@ -467,7 +467,7 @@ func TestBringUpReportsAComponentThatDiesBeforeItsMark(t *testing.T) {
 	writeChild(t, wd, "crasher", "#!/bin/sh\necho boom-before-the-mark\nexit 7\n")
 
 	rec := newExitRecorder()
-	s := NewSupervised(Config{WorkDir: wd, OnComponentExit: rec.fn})
+	s := NewSupervised(withServingPair(Config{WorkDir: wd, OnComponentExit: rec.fn}))
 
 	var child *component
 	stubBoot(t, func(s *Supervised, ctx context.Context) error {
@@ -534,7 +534,7 @@ func TestStartAndAwaitListeningMarksTheComponentSupervised(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewSupervised(Config{WorkDir: wd})
+	s := NewSupervised(withServingPair(Config{WorkDir: wd}))
 	ctx := context.Background()
 	defer func() { _ = s.Stop(ctx) }()
 
@@ -665,7 +665,7 @@ func TestOnComponentExitStaysSilentDuringStop(t *testing.T) {
 	writeChild(t, wd, "sleeper", "#!/bin/sh\nsleep 30\n")
 
 	rec := newExitRecorder()
-	s := NewSupervised(Config{WorkDir: wd, OnComponentExit: rec.fn})
+	s := NewSupervised(withServingPair(Config{WorkDir: wd, OnComponentExit: rec.fn}))
 
 	var comps []*component
 	stubBoot(t, func(s *Supervised, ctx context.Context) error {
@@ -715,7 +715,7 @@ func TestOnComponentExitStaysSilentDuringBringUp(t *testing.T) {
 	writeChild(t, wd, "crasher", "#!/bin/sh\nexit 3\n")
 
 	rec := newExitRecorder()
-	s := NewSupervised(Config{WorkDir: wd, OnComponentExit: rec.fn})
+	s := NewSupervised(withServingPair(Config{WorkDir: wd, OnComponentExit: rec.fn}))
 
 	var child *component
 	stubBoot(t, func(s *Supervised, ctx context.Context) error {

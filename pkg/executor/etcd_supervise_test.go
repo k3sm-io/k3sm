@@ -178,14 +178,14 @@ func etcdTestSupervised(t *testing.T, role EtcdRole, fake *fakeEtcd, clk *fakeCl
 	wd := t.TempDir()
 	logs := &lockedBuffer{}
 	sink := &crashSink{}
-	s := NewSupervised(Config{
+	s := NewSupervised(withServingPair(Config{
 		WorkDir:  wd,
 		KinePort: freePort(t),
 		Etcd: &EtcdConfig{Role: role, Name: "server-a", PeerIP: testPeerIP,
 			InitialCluster: "server-b=https://192.0.2.11:2380,server-a=" + testOwnPeer},
 		Logger:          slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		OnComponentExit: sink.record,
-	})
+	}))
 	s.etcd = etcdSeams{
 		clock:    clk,
 		dial:     func(context.Context, string, string) (etcdAdmin, error) { return fake, nil },
@@ -338,7 +338,7 @@ func TestEtcdQuorumWaitNeverTripsBreaker(t *testing.T) {
 // claims the report (the reaper then stays silent) and returns the plain error.
 func TestEtcdDeathReportedOnce(t *testing.T) {
 	t.Run("the claim decides which observer reports", func(t *testing.T) {
-		s := NewSupervised(Config{WorkDir: t.TempDir()})
+		s := NewSupervised(withServingPair(Config{WorkDir: t.TempDir()}))
 		for _, reaperFirst := range []bool{true, false} {
 			c := &component{name: etcdComponent, exited: make(chan struct{}), supervised: true, reported: reaperFirst}
 			close(c.exited)
@@ -914,7 +914,7 @@ func TestSingleNodeNeverStagesEtcd(t *testing.T) {
 		builds = 0
 		wd := t.TempDir()
 		presetSAKeys(t, wd)
-		s := NewSupervised(Config{WorkDir: wd, PayloadBinDir: stageTestPayload(t, true), Token: "tok"})
+		s := NewSupervised(withServingPair(Config{WorkDir: wd, PayloadBinDir: stageTestPayload(t, true), Token: "tok"}))
 		if err := s.provision(t.Context()); err != nil {
 			t.Fatalf("provision = %v", err)
 		}
@@ -947,8 +947,8 @@ func TestSingleNodeNeverStagesEtcd(t *testing.T) {
 			builds = 0
 			wd := t.TempDir()
 			presetSAKeys(t, wd)
-			s := NewSupervised(Config{WorkDir: wd, PayloadBinDir: stageTestPayload(t, tc.payloadEtcd), Token: "tok",
-				Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}})
+			s := NewSupervised(withServingPair(Config{WorkDir: wd, PayloadBinDir: stageTestPayload(t, tc.payloadEtcd), Token: "tok",
+				Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}}))
 			if err := s.provision(t.Context()); err != nil {
 				t.Fatalf("provision = %v", err)
 			}
@@ -1012,7 +1012,7 @@ func TestJoiningMemberNeedsImportedEtcdCAs(t *testing.T) {
 // member. The lock goes once the child is reaped.
 func TestStopKeepsWorkDirLockUntilReaped(t *testing.T) {
 	wd := t.TempDir()
-	s := NewSupervised(Config{WorkDir: wd, Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}})
+	s := NewSupervised(withServingPair(Config{WorkDir: wd, Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}}))
 	unlock, err := lockWorkDir(wd)
 	if err != nil {
 		t.Fatal(err)
@@ -1062,14 +1062,14 @@ func TestEtcdPostureHoldsWorkDirLock(t *testing.T) {
 	supervisedBringUp = func(*Supervised, context.Context) error { return nil }
 
 	wd := t.TempDir()
-	s := NewSupervised(Config{WorkDir: wd, Token: "tok", Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}})
+	s := NewSupervised(withServingPair(Config{WorkDir: wd, Token: "tok", Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}}))
 	if err := s.Start(t.Context()); err != nil {
 		t.Fatalf("Start = %v", err)
 	}
 	if _, err := lockWorkDir(wd); !errors.Is(err, ErrWorkDirLocked) {
 		t.Errorf("lock while the etcd posture runs = %v, want ErrWorkDirLocked", err)
 	}
-	second := NewSupervised(Config{WorkDir: wd, Token: "tok", Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}})
+	second := NewSupervised(withServingPair(Config{WorkDir: wd, Token: "tok", Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}}))
 	if err := second.Start(t.Context()); !errors.Is(err, ErrWorkDirLocked) {
 		t.Errorf("a second etcd-posture server on the same work dir: Start = %v, want ErrWorkDirLocked", err)
 	}
@@ -1083,7 +1083,7 @@ func TestEtcdPostureHoldsWorkDirLock(t *testing.T) {
 	_ = unlock()
 
 	kineWD := t.TempDir()
-	k := NewSupervised(Config{WorkDir: kineWD, Token: "tok"})
+	k := NewSupervised(withServingPair(Config{WorkDir: kineWD, Token: "tok"}))
 	if err := k.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}

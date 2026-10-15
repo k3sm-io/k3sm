@@ -106,6 +106,12 @@ type ServerArgsRecord struct {
 	// an operator can tell a record from the install they remember from one an
 	// older binary left behind.
 	CreatedAt time.Time `json:"createdAt"`
+	// AdminKubeconfig is the path of the admin kubeconfig `k3sm install` last
+	// wrote (the target user's ~/.kube/config), so a root `k3sm status` can check
+	// its anchor against the cluster CA without guessing a home directory. Empty
+	// when no install has written one since the field was added. Additive: an
+	// older binary ignores it.
+	AdminKubeconfig string `json:"adminKubeconfig,omitempty"`
 }
 
 // ValidateServerArgs reports why args may not be rendered into a server

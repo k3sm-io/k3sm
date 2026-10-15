@@ -101,6 +101,10 @@ func TestAddonPosture(t *testing.T) {
 	mesh := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
 	mesh.cfg.ServingCertFile, mesh.cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
 	noPair := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
+	// A single-node server holds the cluster-CA serving pair too (every topology
+	// issues it), and its kubelet serving cert is still self-signed: false.
+	singleNode := serverPlan{}
+	singleNode.cfg.ServingCertFile, singleNode.cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
 	node := func(name string, labels map[string]string) *corev1.Node {
 		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
 	}
@@ -119,7 +123,7 @@ func TestAddonPosture(t *testing.T) {
 		{"mesh, a vm-labelled worker and a non-vm server", mesh, []runtime.Object{plainServer, vmWorker}, nil, true, true, false},
 		{"mesh, no labelled node", mesh, []runtime.Object{plainServer}, nil, true, false, false},
 		{"mesh, a label with any other value does not count", mesh, []runtime.Object{plainServer, falseLabel}, nil, true, false, false},
-		{"single-node with a vm-labelled node", serverPlan{}, []runtime.Object{vmWorker}, nil, false, true, false},
+		{"single-node with the serving pair and a vm-labelled node", singleNode, []runtime.Object{vmWorker}, nil, false, true, false},
 		{"mesh ip but no cluster-CA serving pair", noPair, []runtime.Object{vmWorker}, nil, false, true, false},
 		{"node read fails", mesh, nil, errors.New("connection refused"), true, false, true},
 		{"no Node registered yet is undecided, not 'no vm node'", mesh, nil, nil, true, false, true},

@@ -37,72 +37,60 @@ func flagValues(args []string, name string) []string {
 	return out
 }
 
-// TestControllerManagerRootCAFollowsServingPosture is the B223 (lab defect D2) guard.
+// TestControllerManagerRootCAFollowsServingPosture is the B223 (lab defect D2) guard,
+// extended to the single-node serving leaf.
 //
 // --root-ca-file is the CA the controller-manager's root-ca-cert-publisher republishes
 // into every namespace's kube-root-ca.crt ConfigMap — every Pod's trust anchor for the
-// in-cluster API. It was PINNED at the apiserver's self-signed --cert-dir file, which is
-// correct single-node and wrong on the mesh path: there cmd/k3sm issues a
-// CLUSTER-CA-signed serving leaf and the apiserver presents THAT (--tls-cert-file), never
-// self-signing. Observed on a `--mesh-ip 127.0.0.1` boot before the fix: the file does not
-// exist at all, and the controller-manager dies at startup with "error parsing
-// root-ca-file at <workdir>/apiserver-certs/apiserver.crt: no such file or directory"
-// (and, on a work dir that once booted single-node, comes up publishing a stale CA that
-// anchors nothing the apiserver serves).
+// in-cluster API. It was once PINNED at the apiserver's self-signed --cert-dir file,
+// which killed a mesh boot ("error parsing root-ca-file ... no such file or
+// directory"). The apiserver now presents a cluster-CA-issued leaf on every topology,
+// so every row, single-node included, must publish the cluster CA and never a file
+// under the legacy cert dir.
 //
-// The table asserts BOTH branches and, for every row, the CROSS-FLAG INVARIANT: the CA
-// named by --root-ca-file and the serving cert named by --tls-cert-file always come from
-// the same posture. Deliberately built from the PRE-EXISTING Config fields only
-// (ServingCertFile/ServingKeyFile), so it is a red-before-green assertion failure against
-// the unfixed renderer rather than a compile error.
+// For every row the CROSS-FLAG INVARIANT holds: the CA named by --root-ca-file is the
+// one under the PKI dir that issued the leaf named by --tls-cert-file.
 func TestControllerManagerRootCAFollowsServingPosture(t *testing.T) {
 	const wd = "/wd"
+	pair := func(c Config) Config {
+		c.ServingCertFile = certs.APIServerServingCertPath(c.WorkDir)
+		c.ServingKeyFile = certs.APIServerServingKeyPath(c.WorkDir)
+		return c
+	}
 	for _, tc := range []struct {
-		name string
-		cfg  Config
-		// wantRootCA is spelled as a LITERAL for the single-node rows: the shipped path
-		// must stay byte-for-byte what it has always been, so a change to certDir is a
-		// failure here rather than a silently-agreeing derivation.
+		name       string
+		cfg        Config
 		wantRootCA string
-		wantMesh   bool
 	}{
 		{
-			name:       "single-node self-signs into --cert-dir",
-			cfg:        Config{WorkDir: wd, KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"},
-			wantRootCA: "/wd/apiserver-certs/apiserver.crt",
+			name:       "single-node presents a cluster-CA-issued leaf",
+			cfg:        pair(Config{WorkDir: wd, KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}),
+			wantRootCA: "/wd/tls/cluster-ca.crt",
 		},
 		{
 			name:       "single-node through withDefaults",
-			cfg:        Config{WorkDir: wd}.withDefaults(),
-			wantRootCA: "/wd/apiserver-certs/apiserver.crt",
+			cfg:        pair(Config{WorkDir: wd}.withDefaults()),
+			wantRootCA: "/wd/tls/cluster-ca.crt",
 		},
 		{
 			name:       "single-node on the shipped default work dir",
-			cfg:        Config{}.withDefaults(),
-			wantRootCA: "/var/lib/k3sm/server/apiserver-certs/apiserver.crt",
+			cfg:        pair(Config{}.withDefaults()),
+			wantRootCA: "/var/lib/k3sm/server/tls/cluster-ca.crt",
 		},
 		{
 			name: "mesh presents a cluster-CA-issued leaf",
-			cfg: Config{
+			cfg: pair(Config{
 				WorkDir: wd, KinePort: 2379, APIServerPort: 6444,
 				NodeIP: "100.64.0.1", BindAddress: "100.64.0.1",
-				ClientCAFile:    certs.SigningCACertPath(wd),
-				KubeletCAFile:   certs.ClusterCACertPath(wd),
-				ServingCertFile: certs.APIServerServingCertPath(wd),
-				ServingKeyFile:  certs.APIServerServingKeyPath(wd),
-			},
+				ClientCAFile:  certs.SigningCACertPath(wd),
+				KubeletCAFile: certs.ClusterCACertPath(wd),
+			}),
 			wantRootCA: certs.ClusterCACertPath(wd),
-			wantMesh:   true,
 		},
 		{
-			name: "mesh through withDefaults",
-			cfg: Config{
-				WorkDir:         wd,
-				ServingCertFile: certs.APIServerServingCertPath(wd),
-				ServingKeyFile:  certs.APIServerServingKeyPath(wd),
-			}.withDefaults(),
+			name:       "mesh through withDefaults",
+			cfg:        pair(Config{WorkDir: wd}).withDefaults(),
 			wantRootCA: certs.ClusterCACertPath(wd),
-			wantMesh:   true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -117,32 +105,20 @@ func TestControllerManagerRootCAFollowsServingPosture(t *testing.T) {
 				t.Errorf("--root-ca-file = %q, want %q", got[0], tc.wantRootCA)
 			}
 
-			// The invariant, asserted from the ARGV rather than from the Config: whichever
-			// serving cert the apiserver is told to present, the published root CA must be
-			// the one that can anchor it. Never the other posture's directory.
+			// The invariant, asserted from the ARGV rather than from the Config: the
+			// published root CA is the PKI-dir CA that issued the presented leaf, never
+			// the legacy self-signed directory.
 			serving := flagValues(api, "--tls-cert-file")
 			certDirPrefix := APIServerCertDir(tc.cfg.WorkDir) + "/"
 			pkiPrefix := certs.PKIDir(tc.cfg.WorkDir) + "/"
-			if tc.wantMesh {
-				if len(serving) != 1 || serving[0] != tc.cfg.ServingCertFile {
-					t.Fatalf("mesh row rendered --tls-cert-file %v, want exactly [%q] (the table's posture claim is wrong)", serving, tc.cfg.ServingCertFile)
-				}
-				if !strings.HasPrefix(got[0], pkiPrefix) {
-					t.Errorf("mesh --root-ca-file = %q, want a CA under the PKI dir %q — the apiserver presents a cluster-CA-issued leaf from there", got[0], pkiPrefix)
-				}
-				if strings.HasPrefix(got[0], certDirPrefix) {
-					t.Errorf("mesh --root-ca-file = %q points into the apiserver's SELF-SIGNED --cert-dir; on the mesh path the apiserver never self-signs, so that file anchors nothing (and does not exist on a fresh work dir)", got[0])
-				}
-			} else {
-				if len(serving) != 0 {
-					t.Fatalf("single-node row rendered --tls-cert-file %v, want none (the table's posture claim is wrong)", serving)
-				}
-				if !strings.HasPrefix(got[0], certDirPrefix) {
-					t.Errorf("single-node --root-ca-file = %q, want the apiserver's self-signed cert under %q — it is the only anchor for what the apiserver serves", got[0], certDirPrefix)
-				}
-				if strings.HasPrefix(got[0], pkiPrefix) {
-					t.Errorf("single-node --root-ca-file = %q publishes a cluster CA that anchors NOTHING the apiserver presents (it self-signs into --cert-dir); in-pod API TLS would fail on the most-exercised path", got[0])
-				}
+			if len(serving) != 1 || serving[0] != tc.cfg.ServingCertFile {
+				t.Fatalf("rendered --tls-cert-file %v, want exactly [%q]", serving, tc.cfg.ServingCertFile)
+			}
+			if !strings.HasPrefix(got[0], pkiPrefix) {
+				t.Errorf("--root-ca-file = %q, want a CA under the PKI dir %q — the apiserver presents a cluster-CA-issued leaf from there", got[0], pkiPrefix)
+			}
+			if strings.HasPrefix(got[0], certDirPrefix) {
+				t.Errorf("--root-ca-file = %q points into the legacy self-signed --cert-dir, which nothing writes now", got[0])
 			}
 
 			// The security-relevant NEIGHBOUR rendered by the same function: the scoped

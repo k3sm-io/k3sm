@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/executor"
 )
 
@@ -56,6 +57,10 @@ func TestBringUpFailureRecordsOnTheCrashLoopBreaker(t *testing.T) {
 		t.Helper()
 		exec := executor.NewSupervised(executor.Config{
 			WorkDir: failingWorkDir,
+			// The serving pair every started server carries (provisionServingLeaf);
+			// without it Validate refuses before provision is reached.
+			ServingCertFile: certs.APIServerServingCertPath(failingWorkDir),
+			ServingKeyFile:  certs.APIServerServingKeyPath(failingWorkDir),
 			OnComponentExit: func(string, error, string, string) {
 				callbackFired.Add(1)
 			},

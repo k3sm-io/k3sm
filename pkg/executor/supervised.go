@@ -291,8 +291,8 @@ func NewSupervised(cfg Config) *Supervised {
 		cfg:   cfg,
 		token: cfg.Token,
 		etcd:  defaultEtcdSeams(),
-		// The apiserver self-signs its serving cert single-node; skip verification on the
-		// healthz probe (the kubeconfig does the same). The probe dials the apiserver's
+		// The healthz probe is token-less and carries no credential, so it does not yet
+		// verify the apiserver's cluster-CA serving leaf (a filed follow-up). The probe dials the apiserver's
 		// bind host, which is the node or mesh address on a multi-node server, so its
 		// dialer clamps the TCP segment size like every other node-address connection.
 		client: &http.Client{
@@ -540,9 +540,6 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := provisionStep("token-file", writeTokenFile(s.cfg.WorkDir, token)); err != nil {
 		return err
 	}
-	if err := provisionStep("kubeconfig", writeKubeconfig(s.cfg, token)); err != nil {
-		return err
-	}
 	// The audit policy + admission-control config the apiserver argv
 	// references must exist before startAPIServer — a missing file would wedge
 	// bring-up opaquely until the healthz timeout. Overwritten every boot (the
@@ -551,6 +548,11 @@ func (s *Supervised) provision(ctx context.Context) error {
 		return err
 	}
 	if err := provisionStep("certs", s.provisionComponentCerts()); err != nil {
+		return err
+	}
+	// After the certs step: the bearer-token kubeconfig pins the cluster CA, which
+	// provisionComponentCerts has just ensured.
+	if err := provisionStep("kubeconfig", writeKubeconfig(s.cfg, token)); err != nil {
 		return err
 	}
 	if s.cfg.Etcd != nil {
@@ -581,17 +583,13 @@ func (s *Supervised) provisionComponentCerts() error {
 	if err != nil {
 		return fmt.Errorf("ensure CA hierarchy: %w", err)
 	}
-	// The apiserver presents a cluster-CA-signed serving cert only when one was supplied
-	// (the mesh path sets ServingCertFile); single-node it self-signs into --cert-dir, so
-	// the co-located loopback components skip server verification (matching the admin
-	// kubeconfig's single-node insecure-skip posture) while still presenting their
-	// client-cert identity. The identity — not the loopback server-auth — is the
-	// load-bearing change.
-	verifyClusterCA := s.cfg.meshServingCert()
-	if err := writeComponentKubeconfig(s.cfg, schedulerKubeconfigPath(s.cfg.WorkDir), schedulerCN, h, verifyClusterCA); err != nil {
+	// The apiserver presents a cluster-CA-issued serving leaf on every topology, so
+	// each component kubeconfig pins the cluster CA and presents its own client-cert
+	// identity.
+	if err := writeComponentKubeconfig(s.cfg, schedulerKubeconfigPath(s.cfg.WorkDir), schedulerCN, h); err != nil {
 		return err
 	}
-	if err := writeComponentKubeconfig(s.cfg, controllerManagerKubeconfigPath(s.cfg.WorkDir), controllerManagerCN, h, verifyClusterCA); err != nil {
+	if err := writeComponentKubeconfig(s.cfg, controllerManagerKubeconfigPath(s.cfg.WorkDir), controllerManagerCN, h); err != nil {
 		return err
 	}
 	// The client identity the apiserver PRESENTS to a node's kubelet endpoint.
@@ -904,7 +902,6 @@ func apiServerArgs(cfg Config) []string {
 		"--bind-address", bind,
 		"--advertise-address", cfg.NodeIP,
 		"--secure-port", strconv.Itoa(cfg.APIServerPort),
-		"--cert-dir", certDir(wd),
 		"--kubelet-preferred-address-types", "InternalIP",
 		"--allow-privileged",
 	)
@@ -966,7 +963,9 @@ func apiServerArgs(cfg Config) []string {
 	if cfg.AnonymousAuth != nil {
 		args = append(args, fmt.Sprintf("--anonymous-auth=%t", *cfg.AnonymousAuth))
 	}
-	if cfg.meshServingCert() {
+	// The cluster-CA-issued serving leaf, on every topology (Validate requires the
+	// pair before Start; there is no --cert-dir and the apiserver never self-signs).
+	if cfg.clusterSignedServing() {
 		args = append(args, "--tls-cert-file", cfg.ServingCertFile, "--tls-private-key-file", cfg.ServingKeyFile)
 	}
 	// Secrets encryption at rest: present only when the start accepted the
@@ -1039,11 +1038,9 @@ func (s *Supervised) startControllerManager(ctx context.Context) (*component, er
 // without it the deployment/endpointslice/etc. controllers would be RBAC-denied. The
 // KCM signs those SA tokens locally with --service-account-private-key-file (no
 // TokenRequest round-trip), so --service-account-private-key-file stays as-is.
-// --root-ca-file is POSTURE-DERIVED (Config.rootCAFile) rather than pinned at the
-// self-signed --cert-dir file: it is the CA republished to every Pod as
-// kube-root-ca.crt, so it must anchor whatever serving cert the apiserver presents,
-// which on the mesh path is a cluster-CA-issued leaf. It derives off the same
-// predicate as --tls-cert-file so the two cannot disagree.
+// --root-ca-file is Config.rootCAFile: the CA republished to every Pod as
+// kube-root-ca.crt, which is the cluster CA that issued the apiserver's serving leaf
+// on every topology.
 // Pure so the leader-election posture is table-tested alongside the scoped
 // --controllers set: --leader-elect is false single-node and true in HA so only ONE
 // server's KCM is active (two active KCMs double-reconcile every object).

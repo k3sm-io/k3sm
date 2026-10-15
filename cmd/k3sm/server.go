@@ -43,6 +43,7 @@ import (
 	crdconfig "k3sm.io/apis/config/crd"
 	"k3sm.io/darwin-net/pkg/dns"
 
+	"k3sm.io/k3sm/internal/atomicfile"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/crdensure"
@@ -74,7 +75,7 @@ type serverOptions struct {
 	nodeIP string
 	meshIP string // wireguard mesh IP; set => multi-node worker-join supervisor
 	// tlsSANs are the --tls-san extra apiserver serving-certificate names,
-	// validated by checkServerTLSSANs at start (multi-node servers only).
+	// validated by checkServerTLSSANs at start, on every topology.
 	tlsSANs tlsSANList
 	// etcdPeerIP is the embedded-etcd member's peer address (--etcd-peer-ip): this
 	// server's LAN address, which the peer listener binds and every other server
@@ -1075,14 +1076,21 @@ func serverKubeletServingIPs(nodeOpts nodeOptions, meshIP string) []net.IP {
 }
 
 // writeAPIServerServingCert issues the apiserver's serving cert from the cluster CA
-// (so a joining node that pinned the cluster CA verifies the apiserver via its
-// kubeconfig) with the names apiServerServingSANs assembles: the mesh IP, loopback,
-// the kubernetes service IP, the in-cluster DNS names, and the operator's --tls-san
-// extras. An invalid extra is refused before anything is written. It writes the cert
-// 0644 and the key 0600 under the PKI dir and returns their paths for
-// --tls-cert-file / --tls-private-key-file. The CA is only read.
-func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP string, extraSANs []string) (certFile, keyFile string, err error) {
-	dnsNames, ips, err := apiServerServingSANs(meshIP, extraSANs)
+// on every topology (so any client that pinned the cluster CA verifies the
+// apiserver via its kubeconfig) with the names apiServerServingSANs assembles:
+// loopback, the kubernetes Service IP, the in-cluster DNS names, the canonical node
+// name, the mesh IP when there is one, and the operator's --tls-san extras. An
+// invalid extra is refused before anything is written; a node name that cannot be
+// a SAN is logged at Warn and left out. The key (0600) is written before the cert
+// (0644), each with atomicfile.Replace (temp file, fsync, rename), so a crash
+// mid-write leaves the previous file or the new one, never a torn one, and the
+// next boot re-issues the pair. It returns their paths for --tls-cert-file /
+// --tls-private-key-file. The CA is only read.
+func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP, nodeName string, extraSANs []string, logger *slog.Logger) (certFile, keyFile string, err error) {
+	if _, nerr := nodeNameSAN(nodeName); nerr != nil {
+		logger.Warn("leaving the node name out of the apiserver serving certificate", "err", nerr)
+	}
+	dnsNames, ips, err := apiServerServingSANs(meshIP, nodeName, extraSANs)
 	if err != nil {
 		return "", "", err
 	}
@@ -1092,11 +1100,11 @@ func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP strin
 	}
 	certFile = certs.APIServerServingCertPath(workDir)
 	keyFile = certs.APIServerServingKeyPath(workDir)
-	if err := os.WriteFile(certFile, certPEM, 0o644); err != nil {
-		return "", "", fmt.Errorf("write apiserver serving cert: %w", err)
+	if err := atomicfile.Replace(keyFile, keyPEM, 0o600); err != nil {
+		return "", "", fmt.Errorf("write apiserver serving key %s: %w", keyFile, err)
 	}
-	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
-		return "", "", fmt.Errorf("write apiserver serving key: %w", err)
+	if err := atomicfile.Replace(certFile, certPEM, 0o644); err != nil {
+		return "", "", fmt.Errorf("write apiserver serving cert %s: %w", certFile, err)
 	}
 	return certFile, keyFile, nil
 }

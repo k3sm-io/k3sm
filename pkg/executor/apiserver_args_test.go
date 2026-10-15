@@ -151,19 +151,27 @@ func TestApiserverArgsNodeRBAC(t *testing.T) {
 	}
 }
 
-// TestApiserverArgsSingleNodeDefault confirms the M1/M2 single-node path: with the new
-// fields zero, the apiserver binds loopback (via NodeIP) and the kubelet-CA /
-// anonymous-auth flags are omitted. --client-ca-file is NO LONGER omitted single-node —
+// TestApiserverArgsSingleNodeDefault confirms the single-node path: the apiserver binds
+// loopback (via NodeIP), the kubelet-CA / anonymous-auth flags are omitted, and it
+// serves the cluster-CA-issued leaf (--tls-cert-file) with no --cert-dir: it never
+// self-signs, on this topology or any other. --client-ca-file is NO LONGER omitted single-node —
 // it is unconditional now (TestClientCAFileAlwaysSet covers it) so the per-component +
 // system:node client certs authenticate.
 func TestApiserverArgsSingleNodeDefault(t *testing.T) {
-	cfg := Config{WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}
+	cfg := Config{
+		WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1",
+		ServingCertFile: certs.APIServerServingCertPath("/wd"),
+		ServingKeyFile:  certs.APIServerServingKeyPath("/wd"),
+	}
 	args := apiServerArgs(cfg)
 	if got := flagValue(args, "--bind-address"); got != "127.0.0.1" {
 		t.Errorf("single-node --bind-address = %q, want 127.0.0.1", got)
 	}
+	if got := flagValue(args, "--tls-cert-file"); got != cfg.ServingCertFile {
+		t.Errorf("single-node --tls-cert-file = %q, want the cluster-CA leaf %q", got, cfg.ServingCertFile)
+	}
 	joined := strings.Join(args, " ")
-	for _, absent := range []string{"--kubelet-certificate-authority", "--anonymous-auth"} {
+	for _, absent := range []string{"--kubelet-certificate-authority", "--anonymous-auth", "--cert-dir"} {
 		if strings.Contains(joined, absent) {
 			t.Errorf("single-node path must not set %s, args=%v", absent, args)
 		}

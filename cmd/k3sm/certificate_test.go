@@ -395,10 +395,26 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 			wantLabels: nil,
 		},
 		{
+			// Inverted from the self-signed single-node posture, where the serving pair
+			// was "multi-node only": a single-node server issues the cluster-CA leaf
+			// too, so its rotation reports the pair re-issued with no topology caveat.
+			name: "single-node rotation reports the serving pair re-issued",
+			seed: func(t *testing.T, dir string) {
+				writeCertFile(t, certs.APIServerServingCertPath(dir), "kube-apiserver")
+				writeSentinel(t, certs.APIServerServingKeyPath(dir), 0o600)
+			},
+			restart:    true,
+			wantLabels: []string{install.ServerLabel},
+			wantHealth: true,
+			wantOutHas: []string{
+				certs.APIServerServingCertPath(""),
+				"apiserver serving cert, issued by the cluster CA — re-issued on every boot",
+			},
+		},
+		{
 			// 7: the scope fence — rotation never touches the admin kubeconfig, the
-			// static token file, the service-account keypair, or the apiserver's own
-			// self-signed cert dir (also the KCM --root-ca-file and every pod's
-			// projected kube-root-ca.crt).
+			// static token file, the service-account keypair, or the legacy
+			// self-signed cert dir (kept one release as the rollback artifact).
 			name: "scope fence leaves out-of-scope material byte-identical",
 			seed: func(t *testing.T, dir string) {
 				writeSentinel(t, executor.KubeconfigPath(dir), 0o600)
@@ -917,9 +933,10 @@ func TestProbeAPIServerServing(t *testing.T) {
 	}
 }
 
-// TestAPIServerTrustAnchor pins which certificate the probe anchors on in each server
-// posture, and that an absent anchor is a REFUSAL — never a silent fallback to an
-// unverified probe.
+// TestAPIServerTrustAnchor pins the certificate the probe anchors on: the cluster CA,
+// on every topology (inverted from the self-signed single-node posture, where the
+// legacy --cert-dir file was the anchor), and that an absent anchor is a REFUSAL —
+// never a silent fallback to an unverified probe.
 func TestAPIServerTrustAnchor(t *testing.T) {
 	t.Parallel()
 
@@ -934,22 +951,21 @@ func TestAPIServerTrustAnchor(t *testing.T) {
 			name: "multi-node server anchors on the cluster CA",
 			seed: func(t *testing.T, dir string) {
 				seedHierarchy(t, dir)
-				// A cluster-CA-signed serving cert in the PKI dir IS the mesh posture.
 				writeCertFile(t, certs.APIServerServingCertPath(dir), "kube-apiserver")
 			},
 			wantPath: certs.ClusterCACertPath,
 		},
 		{
-			name: "single-node server anchors on the apiserver's own self-signed cert",
+			name: "single-node server anchors on the cluster CA, never the legacy self-signed cert",
 			seed: func(t *testing.T, dir string) {
 				seedHierarchy(t, dir)
-				writeCertFile(t, apiServerSelfSignedCertPath(dir), "kube-apiserver-self-signed")
+				writeCertFile(t, filepath.Join(executor.APIServerCertDir(dir), "apiserver.crt"), "kube-apiserver-self-signed")
 			},
-			wantPath: apiServerSelfSignedCertPath,
+			wantPath: certs.ClusterCACertPath,
 		},
 		{
 			name:      "no anchor at all fails closed",
-			seed:      seedHierarchy,
+			seed:      func(*testing.T, string) {},
 			wantErr:   true,
 			errSubstr: "refusing to restart without it",
 		},
@@ -957,10 +973,7 @@ func TestAPIServerTrustAnchor(t *testing.T) {
 			name: "an anchor file holding no certificate fails closed",
 			seed: func(t *testing.T, dir string) {
 				seedHierarchy(t, dir)
-				if err := os.MkdirAll(executor.APIServerCertDir(dir), 0o755); err != nil {
-					t.Fatalf("mkdir cert dir: %v", err)
-				}
-				if err := os.WriteFile(apiServerSelfSignedCertPath(dir), []byte("not a PEM\n"), 0o644); err != nil {
+				if err := os.WriteFile(certs.ClusterCACertPath(dir), []byte("not a PEM\n"), 0o644); err != nil {
 					t.Fatalf("write anchor: %v", err)
 				}
 			},

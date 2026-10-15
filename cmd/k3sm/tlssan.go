@@ -36,7 +36,7 @@ const maxTLSSANs = 32
 
 // tlsSANUsage is the --tls-san help text, shared by `k3sm server` and
 // `k3sm install` so the two cannot describe the flag differently.
-const tlsSANUsage = "an extra hostname or IP address the apiserver's serving certificate is valid for (repeat the flag, one name each; multi-node servers with --mesh-ip only). " +
+const tlsSANUsage = "an extra hostname or IP address the apiserver's serving certificate is valid for (repeat the flag, one name each). " +
 	"An IP must be an address this Mac holds (an interface, its mesh IP, or loopback); a hostname is checked for syntax only and is never resolved, " +
 	"because a load balancer or public DNS name legitimately points elsewhere. On install, passing it replaces the recorded list and omitting it keeps the list"
 
@@ -47,10 +47,6 @@ var ErrTLSSANInvalid = errors.New("invalid --tls-san")
 // ErrTLSSANNotLocal is the install-time refusal of an IP --tls-san that no
 // interface of this Mac holds. Compare with errors.Is.
 var ErrTLSSANNotLocal = errors.New("--tls-san IP address is not held by this Mac")
-
-// ErrTLSSANSingleNode refuses --tls-san on a server without --mesh-ip. Compare
-// with errors.Is.
-var ErrTLSSANSingleNode = errors.New("--tls-san needs a multi-node server (--mesh-ip): a single-node apiserver self-signs its serving certificate in its own --cert-dir, and serving a cluster-CA-signed certificate on a single-node server is a separate change")
 
 // tlsSANList is the repeatable --tls-san flag: each occurrence appends one
 // name, verbatim. Validation is validateTLSSANs, not Set, so the install and
@@ -262,14 +258,11 @@ func nonLocalTLSSANIPs(sans tlsSANs, meshIP string) ([]net.IP, error) {
 }
 
 // checkInstallTLSSANs is `k3sm install --tls-san`'s refusal, made before
-// anything is written. meshIP is the server's effective --mesh-ip and
-// serviceCIDR the install's --service-cidr. It refuses a single-node server,
-// any invalid name, and an IP this Mac does not hold, and returns the list in
-// canonical spelling for the arguments record.
+// anything is written. meshIP is the server's effective --mesh-ip ("" on a
+// single-node server, which issues the same cluster-CA leaf) and serviceCIDR the
+// install's --service-cidr. It refuses any invalid name and an IP this Mac does
+// not hold, and returns the list in canonical spelling for the arguments record.
 func checkInstallTLSSANs(raw []string, meshIP, serviceCIDR string) ([]string, error) {
-	if meshIP == "" {
-		return nil, ErrTLSSANSingleNode
-	}
 	sans, err := validateTLSSANs(raw, meshIP, serviceCIDR)
 	if err != nil {
 		return nil, err
@@ -285,18 +278,13 @@ func checkInstallTLSSANs(raw []string, meshIP, serviceCIDR string) ([]string, er
 }
 
 // checkServerTLSSANs is the server-start judgement of --tls-san, against the
-// server's Service range serviceCIDR. An invalid name is refused. On a server
-// with no --mesh-ip the list is ignored with a Warn (its apiserver self-signs
-// and issues no cluster-CA leaf), and an IP this Mac no longer holds (DHCP
-// moved it) is a Warn and still issued: a recorded operator choice must never
-// crash-loop the control plane. The final set is logged once at Info.
-func checkServerTLSSANs(raw []string, meshIP, serviceCIDR string, logger *slog.Logger) error {
+// server's Service range serviceCIDR, on every topology (meshIP is "" on a
+// single-node server). An invalid name is refused. An IP this Mac no longer holds
+// (DHCP moved it) is a Warn and still issued: a recorded operator choice must
+// never crash-loop the control plane. The final set, with nodeName, is logged
+// once at Info.
+func checkServerTLSSANs(raw []string, meshIP, nodeName, serviceCIDR string, logger *slog.Logger) error {
 	if len(raw) == 0 {
-		return nil
-	}
-	if meshIP == "" {
-		logger.Warn("ignoring --tls-san on a server without --mesh-ip: a single-node apiserver self-signs its serving certificate, so these names are not issued",
-			"tls-san", strings.Join(raw, ","))
 		return nil
 	}
 	sans, err := validateTLSSANs(raw, meshIP, serviceCIDR)
@@ -310,7 +298,7 @@ func checkServerTLSSANs(raw []string, meshIP, serviceCIDR string, logger *slog.L
 	for _, ip := range foreign {
 		logger.Warn("--tls-san names an address this Mac does not hold now; issuing it anyway, so clients dialling it reach nothing until it returns", "tls-san", ip.String())
 	}
-	dns, ips, err := apiServerServingSANs(meshIP, raw)
+	dns, ips, err := apiServerServingSANs(meshIP, nodeName, raw)
 	if err != nil {
 		return err
 	}
@@ -322,19 +310,47 @@ func checkServerTLSSANs(raw []string, meshIP, serviceCIDR string, logger *slog.L
 	return nil
 }
 
+// nodeNameSAN is the DNS name the serving certificate carries for the server's
+// canonical node name: the name lowercased, when it passes validateTLSSANName.
+// A name that fails syntax or collides with a reserved in-cluster name is an
+// error, which the issuer logs at Warn and skips: a node name never crash-loops
+// the control plane.
+func nodeNameSAN(nodeName string) (string, error) {
+	v := strings.ToLower(nodeName)
+	if err := validateTLSSANName(v); err != nil {
+		return "", fmt.Errorf("node name %q is not issued as a serving-certificate name: %s", nodeName, err)
+	}
+	return v, nil
+}
+
 // apiServerServingSANs is the one assembly of the apiserver serving
-// certificate's names: the fixed in-cluster set (apiServerFixedDNS, the mesh
-// IP, loopback and the kubernetes Service IP of the server's Service range,
-// install.DefaultServiceCIDR, which `k3sm server` always runs with) unioned
-// with the validated --tls-san extras. An empty extra list yields exactly the
-// fixed set.
-func apiServerServingSANs(meshIP string, extra []string) (dns []string, ips []net.IP, err error) {
+// certificate's names, on every topology. DNS: the fixed in-cluster set
+// (apiServerFixedDNS) and the canonical node name (nodeNameSAN; a name it
+// refuses is left out). IPs: the mesh IP only when meshIP parses (a single-node
+// server has none, and a nil IP is never appended), loopback, and the
+// kubernetes Service IP of the server's Service range,
+// install.DefaultServiceCIDR, which `k3sm server` always runs with. Unioned with
+// the --tls-san extras, validated by validateTLSSANs unchanged.
+func apiServerServingSANs(meshIP, nodeName string, extra []string) (dns []string, ips []net.IP, err error) {
 	svc, err := parseServiceCIDR(install.DefaultServiceCIDR)
 	if err != nil {
 		return nil, nil, err
 	}
 	dns = slices.Clone(apiServerFixedDNS)
-	ips = append([]net.IP{net.ParseIP(meshIP)}, reservedTLSSANIPs(svc)...)
+	if name, nerr := nodeNameSAN(nodeName); nerr == nil && !slices.Contains(dns, name) {
+		dns = append(dns, name)
+	}
+	if mesh := net.ParseIP(meshIP); mesh != nil {
+		if mesh4 := mesh.To4(); mesh4 != nil {
+			mesh = mesh4
+		}
+		ips = append(ips, mesh)
+	}
+	for _, ip := range reservedTLSSANIPs(svc) {
+		if ip != nil && !slices.ContainsFunc(ips, ip.Equal) {
+			ips = append(ips, ip)
+		}
+	}
 	if len(extra) == 0 {
 		return dns, ips, nil
 	}

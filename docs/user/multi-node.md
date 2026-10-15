@@ -37,9 +37,9 @@ the new one. Leaving `--mesh-ip` off a later reinstall keeps whatever address wa
 
 ## Extra Names for the Apiserver Certificate
 
-A server with `--mesh-ip` serves the apiserver with a certificate signed by the cluster CA. It is
-valid for the in-cluster names (`kubernetes`, `kubernetes.default` and the rest), `localhost`, the
-mesh address, `127.0.0.1` and the `kubernetes` Service address. To reach the apiserver by another
+Every server serves the apiserver with a certificate signed by the cluster CA. It is valid for the
+in-cluster names (`kubernetes`, `kubernetes.default` and the rest), `localhost`, the node name,
+`127.0.0.1`, the `kubernetes` Service address and, on a server with `--mesh-ip`, the mesh address. To reach the apiserver by another
 name, such as a DNS name for this Mac or a load balancer in front of it, add the name with
 `--tls-san`, once per name:
 
@@ -60,10 +60,7 @@ the server starts, so a changed list takes effect when the server restarts, whic
 you. If an address in the list later leaves this Mac (a DHCP lease moved it, for example), the server
 logs a warning at start and still issues the name.
 
-`--tls-san` needs `--mesh-ip`. A single-node server's apiserver signs its own certificate in its
-certificate directory, so install refuses `--tls-san` there, and a server started without
-`--mesh-ip` logs a warning and ignores the list. A certificate signed by the cluster CA on a
-single-node server is not available yet.
+`--tls-san` works the same way on a single-node server, which has no mesh address to add.
 
 ## Joining an Agent
 

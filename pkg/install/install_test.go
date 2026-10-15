@@ -70,6 +70,12 @@ func TestMain(m *testing.M) {
 // the install orchestration without any real privilege.
 type fakeSystem struct {
 	calls []string
+	// serverBooted is set once the fake launchd starts the server label; from then
+	// on a read of any work dir's tls/cluster-ca.crt answers with fakeBootClusterCA,
+	// modelling the control plane minting its CA on first boot. noBootCA keeps the
+	// file absent instead (a control plane that never mints it).
+	serverBooted bool
+	noBootCA     bool
 	// flushInterconnect, when set, is FlushInterconnectAliases' body after the
 	// call is recorded: a test runs the real sweep over a ledger and bridge it
 	// controls. Nil sweeps nothing and succeeds.
@@ -600,10 +606,13 @@ func shrinkRestartBudgets(t *testing.T) {
 	agentRecoveryObservation = time.Millisecond
 	uncordonOrig := uncordonBudget
 	uncordonBudget = tiny
+	caWaitOrig := clusterCAWaitBudget
+	clusterCAWaitBudget = tiny
 	t.Cleanup(func() {
 		netdRestartBudget, serverRestartBudget, agentJoinBudget = netdOrig, serverOrig, joinOrig
 		agentRecoveryObservation = observationOrig
 		uncordonBudget = uncordonOrig
+		clusterCAWaitBudget = caWaitOrig
 	})
 }
 
@@ -747,8 +756,15 @@ func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 	if content, ok := f.files[path]; ok {
 		return content, nil
 	}
+	if f.serverBooted && !f.noBootCA && strings.HasSuffix(path, "/tls/cluster-ca.crt") {
+		return fakeBootClusterCA, nil
+	}
 	return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 }
+
+// fakeBootClusterCA is the cluster CA the fake control plane "mints" on its first
+// boot (see fakeSystem.serverBooted). It need not parse: install only pins it.
+var fakeBootClusterCA = []byte("-----BEGIN CERTIFICATE-----\nbootca\n-----END CERTIFICATE-----\n")
 
 func (f *fakeSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 	f.calls = append(f.calls, "EnsureServiceUser:"+name+":"+dataRoot)
@@ -1112,6 +1128,9 @@ func (f *fakeSystem) WriteLaunchDaemon(plistPath string, contents []byte, mode f
 // once, then succeeds" — the racing-bootstrap shape.
 func (f *fakeSystem) LaunchctlBootstrap(label string) error {
 	f.calls = append(f.calls, "Bootstrap:"+label)
+	if label == ServerLabel {
+		f.serverBooted = true
+	}
 	if f.disabled[label] {
 		return fmt.Errorf("launchctl bootstrap %s: %w: exit status 5: Bootstrap failed: 5: Input/output error", label, ErrLaunchctlTransient)
 	}
@@ -1164,6 +1183,9 @@ func (f *fakeSystem) LaunchctlEnable(label string) error {
 
 func (f *fakeSystem) LaunchctlKickstart(label string) error {
 	f.calls = append(f.calls, "Kickstart:"+label)
+	if label == ServerLabel {
+		f.serverBooted = true
+	}
 	// A kickstart replaces the running instance, so the fake's reported pid moves —
 	// the discriminator `k3sm certificate rotate` uses to tell the NEW control plane
 	// from the old one still draining its listeners.
@@ -1256,11 +1278,11 @@ func (f *fakeSystem) putWedgedSocket(path string) {
 	f.wedgedSockets[path] = true
 }
 
-func (f *fakeSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) error {
+func (f *fakeSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) (string, error) {
 	f.calls = append(f.calls, "WriteUserKubeconfig:"+targetUser)
 	f.kubeUser = targetUser
 	f.kubeContent = string(contents)
-	return nil
+	return "/Users/" + targetUser + "/.kube/config", nil
 }
 
 // RemoveAll records the call and REALLY removes the path from the fake root
@@ -1887,14 +1909,11 @@ func TestInstallOrchestration(t *testing.T) {
 		// The LAN switch: none recorded, so it is written, beside the record.
 		"Owner:" + DefaultNetworkRecordPath,
 		"WriteRootOnlyFile:" + DefaultNetworkRecordPath + ":0644",
-		// The trust anchor for the endpoint the admin kubeconfig will name, read
-		// AFTER the arguments are resolved (they decide the posture, so they decide
-		// which certificate the apiserver serves) and BEFORE the daemons restart, so
-		// this install pins what the PREVIOUS boot left on disk rather than racing
-		// the one it is about to start. Single-node here, so it is the certificate
-		// the apiserver self-signs into its own --cert-dir; a first install finds
-		// nothing and the kubeconfig keeps skip-verify.
-		"ReadFile:/var/lib/k3sm/server/apiserver-certs/apiserver.crt",
+		// The trust anchor for the admin kubeconfig: the cluster CA, on every
+		// topology (the apiserver serves a cluster-CA leaf single-node too). An
+		// upgrade finds it here; a first install finds nothing yet and waits for
+		// it after the daemon bootstrap (below).
+		"ReadFile:/var/lib/k3sm/server/tls/cluster-ca.crt",
 		// PUBLISH. One operation makes the whole staged tree live; `:rename` is
 		// the first-install branch (there was no tree at /Library/k3sm to
 		// exchange with), so there is nothing to reap afterwards.
@@ -1947,7 +1966,13 @@ func TestInstallOrchestration(t *testing.T) {
 		// and there is no previous tree at the staging path. A reinstall has
 		// one, and removes it HERE and not a step earlier
 		// (TestInstallStagesTheRootAndPublishesItOnce).
+		//
+		// The cluster CA the first boot minted, waited for AFTER the bootstrap and
+		// outside the publish, then pinned in the admin kubeconfig.
+		"ReadFile:/var/lib/k3sm/server/tls/cluster-ca.crt",
 		"WriteUserKubeconfig:alice",
+		// The path it wrote, recorded for a root `k3sm status` anchor check.
+		"WriteServerArgsRecord:" + dataroot.DefaultServerArgsRecordPath,
 		"UnlockInstall:/Library/k3sm.lock",
 	})
 	if len(f.calls) != len(want) {

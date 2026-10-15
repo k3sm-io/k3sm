@@ -23,60 +23,58 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 )
 
-// TestRootCAFileIsPostureLocked pins the half of B223 that makes the two flags
-// STRUCTURALLY unable to disagree: Config.RootCAFile is the mesh call site's explicit
-// statement of which CA anchors the serving leaf it just issued, but it is resolved
-// through the SAME predicate that gates --tls-cert-file. So a RootCAFile can never
-// reach argv on the self-signed single-node path, where it would publish a trust anchor
-// for a cert the apiserver does not present.
+// TestRootCAFileIsPostureLocked pins --root-ca-file to the cluster CA on every
+// topology. Inverted from the self-signed single-node posture: the apiserver no longer
+// self-signs into --cert-dir on any topology, so the published kube-root-ca.crt is
+// always the cluster CA that issued the serving leaf (or an explicit RootCAFile), and
+// never a file under the legacy cert dir.
 func TestRootCAFileIsPostureLocked(t *testing.T) {
 	const wd = "/wd"
-	mesh := Config{
+	pair := Config{
 		WorkDir:         wd,
 		ServingCertFile: certs.APIServerServingCertPath(wd),
 		ServingKeyFile:  certs.APIServerServingKeyPath(wd),
 	}
 
-	t.Run("mesh honors an explicit RootCAFile", func(t *testing.T) {
-		cfg := mesh
+	t.Run("an explicit RootCAFile is honored", func(t *testing.T) {
+		cfg := pair
 		cfg.RootCAFile = "/wd/tls/some-other-ca.crt"
 		if got := flagValue(controllerManagerArgs(cfg), "--root-ca-file"); got != cfg.RootCAFile {
 			t.Errorf("--root-ca-file = %q, want the explicit %q (honored verbatim, as ClientCAFile is)", got, cfg.RootCAFile)
 		}
 	})
 
-	t.Run("mesh defaults to the cluster CA", func(t *testing.T) {
-		if got := flagValue(controllerManagerArgs(mesh), "--root-ca-file"); got != certs.ClusterCACertPath(wd) {
+	t.Run("defaults to the cluster CA", func(t *testing.T) {
+		if got := flagValue(controllerManagerArgs(pair), "--root-ca-file"); got != certs.ClusterCACertPath(wd) {
 			t.Errorf("--root-ca-file = %q, want the cluster CA %q — the CA that issued the serving leaf", got, certs.ClusterCACertPath(wd))
 		}
 	})
 
-	t.Run("single-node ignores a stray RootCAFile", func(t *testing.T) {
-		cfg := Config{WorkDir: wd, RootCAFile: certs.ClusterCACertPath(wd)}
-		want := "/wd/apiserver-certs/apiserver.crt"
-		if got := flagValue(controllerManagerArgs(cfg), "--root-ca-file"); got != want {
-			t.Errorf("single-node --root-ca-file = %q, want the self-signed %q: the renderer is posture-locked so the flag pair can never come from two modes", got, want)
+	t.Run("never the legacy self-signed cert dir", func(t *testing.T) {
+		for _, cfg := range []Config{
+			{WorkDir: wd},
+			{WorkDir: wd, ServingCertFile: certs.APIServerServingCertPath(wd)},
+		} {
+			got := flagValue(controllerManagerArgs(cfg), "--root-ca-file")
+			if got != certs.ClusterCACertPath(wd) {
+				t.Errorf("--root-ca-file = %q for %+v, want the cluster CA %q; the legacy %s is never read", got, cfg, certs.ClusterCACertPath(wd), APIServerCertDir(wd))
+			}
 		}
 	})
 
-	t.Run("a half-supplied serving keypair is not mesh", func(t *testing.T) {
-		// Only ServingCertFile: apiServerArgs renders NO --tls-cert-file (it needs both),
-		// so the posture is still self-signed and --root-ca-file must agree.
+	t.Run("a half-supplied serving keypair renders no --tls-cert-file", func(t *testing.T) {
 		cfg := Config{WorkDir: wd, ServingCertFile: certs.APIServerServingCertPath(wd)}
 		if got := flagValue(apiServerArgs(cfg), "--tls-cert-file"); got != "" {
-			t.Fatalf("--tls-cert-file = %q, want none: the apiserver needs BOTH cert and key", got)
-		}
-		want := "/wd/apiserver-certs/apiserver.crt"
-		if got := flagValue(controllerManagerArgs(cfg), "--root-ca-file"); got != want {
-			t.Errorf("--root-ca-file = %q, want %q — it must track --tls-cert-file's own predicate, not a looser one", got, want)
+			t.Fatalf("--tls-cert-file = %q, want none: the apiserver needs BOTH cert and key (and Validate refuses this Config)", got)
 		}
 	})
 }
 
-// TestValidateRejectsRootCAWithoutServingCert pins the loud half of the posture lock:
-// the renderer ignoring a stray RootCAFile keeps argv correct, but silently ignoring
-// configuration is how a wrong belief survives. Validate (called at the top of Start)
-// fails the bring-up closed instead.
+// TestValidateRejectsRootCAWithoutServingCert pins Validate's serving-pair guard.
+// Inverted from the self-signed single-node posture, where a Config without the pair
+// was valid: the apiserver now serves the cluster-CA leaf on every topology, so any
+// Config missing either half of the pair (with or without a RootCAFile) fails with
+// ErrNoServingCert, and a Config with the pair passes whatever its topology.
 func TestValidateRejectsRootCAWithoutServingCert(t *testing.T) {
 	const wd = "/wd"
 	for _, tc := range []struct {
@@ -85,13 +83,24 @@ func TestValidateRejectsRootCAWithoutServingCert(t *testing.T) {
 		want error
 	}{
 		{
-			name: "single-node with no RootCAFile",
+			name: "no serving keypair and no RootCAFile",
 			cfg:  Config{WorkDir: wd},
+			want: ErrNoServingCert,
+		},
+		{
+			name: "single-node with both and the default RootCAFile",
+			cfg: Config{
+				WorkDir:         wd,
+				NodeIP:          "127.0.0.1",
+				ServingCertFile: certs.APIServerServingCertPath(wd),
+				ServingKeyFile:  certs.APIServerServingKeyPath(wd),
+			},
 		},
 		{
 			name: "mesh with both",
 			cfg: Config{
 				WorkDir:         wd,
+				NodeIP:          "100.64.0.1",
 				ServingCertFile: certs.APIServerServingCertPath(wd),
 				ServingKeyFile:  certs.APIServerServingKeyPath(wd),
 				RootCAFile:      certs.ClusterCACertPath(wd),
@@ -100,7 +109,7 @@ func TestValidateRejectsRootCAWithoutServingCert(t *testing.T) {
 		{
 			name: "RootCAFile without a serving keypair",
 			cfg:  Config{WorkDir: wd, RootCAFile: certs.ClusterCACertPath(wd)},
-			want: ErrRootCAWithoutServingCert,
+			want: ErrNoServingCert,
 		},
 		{
 			name: "RootCAFile with only half a serving keypair",
@@ -109,7 +118,7 @@ func TestValidateRejectsRootCAWithoutServingCert(t *testing.T) {
 				ServingCertFile: certs.APIServerServingCertPath(wd),
 				RootCAFile:      certs.ClusterCACertPath(wd),
 			},
-			want: ErrRootCAWithoutServingCert,
+			want: ErrNoServingCert,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
