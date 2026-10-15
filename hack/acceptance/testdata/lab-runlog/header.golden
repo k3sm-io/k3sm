@@ -1,0 +1,22 @@
+# k3sm lab run log
+gate: M11-lab
+mode: full
+rc_tag: none
+artifact_sha256: local:c312ae30a2cd77a9b9099dab119cbf5e315eeb81a90481749f898226e64d4e48
+git_sha.apis: 1111111111111111111111111111111111111111
+git_sha.runtimed: 2222222222222222222222222222222222222222
+git_sha.darwin-net: unknown
+git_sha.k3sm: 4444444444444444444444444444444444444444
+started_utc: 2026-10-15T12:00:00Z
+tolerate_keys: none
+result: FAIL (provisional; the final result line below is the verdict, and a log that ends here did not finish)
+gate: M11-lab
+finished_utc: 2026-10-15T12:00:00Z
+result: PASS
+c312ae30a2cd77a9b9099dab119cbf5e315eeb81a90481749f898226e64d4e48
+unknown
+unknown
+1111111111111111111111111111111111111111
+2222222222222222222222222222222222222222
+unknown
+4444444444444444444444444444444444444444
