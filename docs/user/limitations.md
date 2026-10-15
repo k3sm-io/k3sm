@@ -274,6 +274,9 @@ ConfigMap and a Pod that mounts it sees the new value within roughly a minute, w
   `ProjectedVolumeRefreshWarning` Warning Event naming the volume and the cleanup error instead.
   Each Event is recorded once per volume per kind of failure, and again if the volume recovers and
   then fails.
+- **`clusterTrustBundle` and `podCertificate` sources are refused.** On every runtime, a Pod whose
+  `projected` volume uses either source is not started and gets a `FailedProjectedSource` Warning
+  Event naming the volume.
 
 ### NetworkPolicy Is a Policy Hint, Not a Security Boundary
 

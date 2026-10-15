@@ -1238,6 +1238,7 @@ func toVolumeProjection(p *corev1.VolumeProjection) *runtimev1.VolumeProjection 
 			Path:              p.ServiceAccountToken.Path,
 		}
 	default:
+		// Unreachable for an admitted pod: preflightProjectedSources refuses every unmodeled source.
 		return nil
 	}
 	return out
