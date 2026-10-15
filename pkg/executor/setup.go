@@ -56,7 +56,9 @@ func binDir(workDir string) string { return filepath.Join(workDir, "bin") }
 // dbDir is the kine SQLite directory (WAL state.db lives here).
 func dbDir(workDir string) string { return filepath.Join(workDir, "db") }
 
-// certDir is where the apiserver writes its self-signed serving certs.
+// certDir is the legacy apiserver --cert-dir, where releases before the
+// cluster-CA serving leaf let the apiserver self-sign. It is neither read nor
+// written now; it is kept on disk one release as the rollback artifact.
 func certDir(workDir string) string { return filepath.Join(workDir, "apiserver-certs") }
 
 // kubeconfigPath is the admin kubeconfig the executor writes.
@@ -167,19 +169,13 @@ func TokenFilePath(workDir string) string { return tokenFilePath(workDir) }
 func ServiceAccountKeyPath(workDir string) string { return saKeyPath(workDir) }
 func ServiceAccountPubPath(workDir string) string { return saPubPath(workDir) }
 
-// APIServerCertDir returns the apiserver's own --cert-dir (<workDir>/apiserver-certs),
-// where it self-signs its serving cert. On the SINGLE-NODE posture that directory is
-// ALSO the controller-manager's --root-ca-file source and therefore the origin of every
-// pod's projected kube-root-ca.crt, so replacing it is a cluster-wide trust event —
-// exported so the rotation scope fence can name it explicitly. On the MESH posture the
-// apiserver presents a cluster-CA-issued leaf and never self-signs, so this directory
-// is empty and the published trust anchor is the cluster CA instead (Config.rootCAFile).
-//
-// Its apiserver.crt shares a basename with — and has the OPPOSITE rotation semantics
-// of — certs.APIServerServingCertPath (<workDir>/tls/apiserver.crt), which is a leaf
-// re-issued from the cluster CA on every mesh boot. This one is self-signed, is the
-// single-node server's serving material, and is never rotated. Read one another's docs
-// before touching either.
+// APIServerCertDir returns the legacy apiserver --cert-dir (<workDir>/apiserver-certs),
+// where releases before the cluster-CA serving leaf let a single-node apiserver
+// self-sign. Nothing reads or writes it now: the apiserver serves
+// certs.APIServerServingCertPath on every topology and --root-ca-file is the cluster
+// CA. It is kept one release, untouched, as the rollback artifact (the previous
+// release's install pins its apiserver.crt), so rotation lists it out of scope and
+// the server start logs it as legacy. Exported so both can name it.
 func APIServerCertDir(workDir string) string { return certDir(workDir) }
 
 // loopbackAPIServerHost is the apiserver bind of last resort — the single-node
@@ -219,9 +215,9 @@ func apiServerURL(cfg Config) string {
 	return "https://" + net.JoinHostPort(apiServerHost(cfg), strconv.Itoa(cfg.APIServerPort))
 }
 
-// ensureWorkDirs creates the workdir subtree (bin, db, certs).
+// ensureWorkDirs creates the workdir subtree (bin, db).
 func ensureWorkDirs(workDir string) error {
-	for _, d := range []string{binDir(workDir), dbDir(workDir), certDir(workDir)} {
+	for _, d := range []string{binDir(workDir), dbDir(workDir)} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
@@ -1269,20 +1265,25 @@ func writeTokenFile(workDir, token string) error {
 }
 
 // writeKubeconfig writes an admin kubeconfig pointing at the apiserver with the
-// static token and TLS verification skipped (the apiserver self-signs its
-// serving cert single-node).
+// static token, verifying the server against the cluster CA (read from the PKI dir),
+// which issued the apiserver's serving leaf on every topology. It runs after
+// provisionComponentCerts has ensured that CA.
 //
 // It takes the whole Config, not a work dir and a port, because the server URL needs
 // the effective BIND HOST as well (apiServerHost): a mesh server binds its wireguard
 // IP only, so a loopback URL here would hand every in-process client a dead address.
 func writeKubeconfig(cfg Config, token string) error {
+	caPEM, err := os.ReadFile(certs.ClusterCACertPath(cfg.WorkDir))
+	if err != nil {
+		return fmt.Errorf("read the cluster CA for the kubeconfig: %w", err)
+	}
 	content := fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:
 - name: k3sm
   cluster:
     server: %q
-    insecure-skip-tls-verify: true
+    certificate-authority-data: %s
 contexts:
 - name: k3sm
   context:
@@ -1293,7 +1294,7 @@ users:
 - name: admin
   user:
     token: %s
-`, apiServerURL(cfg), token)
+`, apiServerURL(cfg), base64.StdEncoding.EncodeToString(caPEM), token)
 	if err := os.WriteFile(kubeconfigPath(cfg.WorkDir), []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write kubeconfig: %w", err)
 	}
@@ -1309,22 +1310,15 @@ users:
 // system:kube-controller-manager ClusterRoleBindings) constrains it — the k3s
 // per-component-identity model, replacing the shared system:masters admin token.
 //
-// verifyClusterCA selects the server-trust posture: when the apiserver presents a
-// cluster-CA-signed serving cert (the mesh path) the kubeconfig pins
-// certificate-authority-data to the cluster CA; single-node the apiserver self-signs, so
-// the co-located loopback component skips verification (insecure-skip-tls-verify, the
-// same posture the single-node admin kubeconfig uses) while still presenting its
-// client-cert identity.
-func writeComponentKubeconfig(cfg Config, path, cn string, h *certs.Hierarchy, verifyClusterCA bool) error {
+// The kubeconfig pins certificate-authority-data to the cluster CA, which issued the
+// apiserver's serving leaf on every topology; it never skips server verification.
+func writeComponentKubeconfig(cfg Config, path, cn string, h *certs.Hierarchy) error {
 	certPEM, keyPEM, err := h.Signing.IssueClient(cn, nil, ComponentCertValidity)
 	if err != nil {
 		return fmt.Errorf("issue %s client cert: %w", cn, err)
 	}
 	b64 := base64.StdEncoding.EncodeToString
-	clusterTLS := "    insecure-skip-tls-verify: true"
-	if verifyClusterCA {
-		clusterTLS = "    certificate-authority-data: " + b64(h.Cluster.CertPEM)
-	}
+	clusterTLS := "    certificate-authority-data: " + b64(h.Cluster.CertPEM)
 	content := fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:

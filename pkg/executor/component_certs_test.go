@@ -93,10 +93,13 @@ func TestSchedulerKubeconfigSystemSchedulerIdentity(t *testing.T) {
 	if !hasClientAuthEKU(leaf) {
 		t.Errorf("scheduler client cert must carry ExtKeyUsageClientAuth, got %v", leaf.ExtKeyUsage)
 	}
-	// Single-node (no ServingCertFile): the co-located loopback component skips server
-	// verification, matching the admin kubeconfig's single-node posture.
-	if !cl.InsecureSkipTLSVerify {
-		t.Errorf("single-node scheduler kubeconfig should use insecure-skip-tls-verify (self-signed loopback apiserver)")
+	// Single-node too: the apiserver serves a cluster-CA-issued leaf on every topology,
+	// so the co-located component pins the cluster CA and never skips verification.
+	if cl.InsecureSkipTLSVerify {
+		t.Errorf("single-node scheduler kubeconfig must not use insecure-skip-tls-verify; the apiserver serves a cluster-CA leaf")
+	}
+	if string(cl.CertificateAuthorityData) != string(h.Cluster.CertPEM) {
+		t.Errorf("single-node scheduler kubeconfig must pin the cluster CA for server verification")
 	}
 
 	// The scheduler is actually WIRED to its own kubeconfig, not the admin one.
@@ -155,10 +158,10 @@ func TestKCMKubeconfigSystemKCMIdentity(t *testing.T) {
 	}
 }
 
-// TestComponentKubeconfigClusterCAVerifiedWhenServingCertSet proves the mesh posture:
-// when the apiserver presents a cluster-CA-signed serving cert (ServingCertFile set), the
-// per-component kubeconfig pins the cluster CA (certificate-authority-data) instead of
-// insecure-skip — so the component verifies the apiserver, not just authenticates to it.
+// TestComponentKubeconfigClusterCAVerifiedWhenServingCertSet proves the per-component
+// kubeconfig pins the cluster CA (certificate-authority-data), never insecure-skip, so
+// the component verifies the apiserver's cluster-CA serving leaf, not just
+// authenticates to it.
 func TestComponentKubeconfigClusterCAVerifiedWhenServingCertSet(t *testing.T) {
 	t.Parallel()
 	wd := t.TempDir()

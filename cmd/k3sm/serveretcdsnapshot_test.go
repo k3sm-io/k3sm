@@ -56,7 +56,10 @@ func TestServerEtcdSnapshotFlags(t *testing.T) {
 		if snap == nil || snap.Cron.String() != executor.DefaultEtcdSnapshotCron || snap.Retention != executor.DefaultEtcdSnapshotRetention {
 			t.Fatalf("etcd block snapshots = %+v", snap)
 		}
-		if err := opts.executorConfig(nil).Validate(); err != nil {
+		cfg := opts.executorConfig(nil)
+		// The serving pair provisionServingLeaf sets before Start on every topology.
+		cfg.ServingCertFile, cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
+		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate = %v", err)
 		}
 	})

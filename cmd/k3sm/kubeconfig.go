@@ -99,7 +99,7 @@ func runKubeconfig(args []string) error {
 		return err
 	}
 	if cl := merged.Clusters[target]; cl != nil && cl.InsecureSkipTLSVerify {
-		fmt.Fprintf(os.Stderr, "warning: merged context %q has insecure-skip-tls-verify (loopback dev posture) — do not use it off loopback\n", target)
+		fmt.Fprintf(os.Stderr, "warning: merged context %q has insecure-skip-tls-verify — k3sm never writes it; pin the cluster CA instead\n", target)
 	}
 	data, err := clientcmd.Write(*merged)
 	if err != nil {

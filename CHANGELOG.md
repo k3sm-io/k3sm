@@ -43,6 +43,7 @@ pin, its date, and the tarball's sha256.
 - **The control plane runs Kubernetes v1.37.1**, and the `k8s.io` client libraries are v0.37.1.
 - **kine, etcd and etcdutl ship in the release payload**, and the node runs those copies instead of building them at boot. The bundled kine is v0.17.2 and the bundled buildx is v0.38.0.
 - **New installs start with LAN access off**, so a NodePort or LoadBalancer on a fresh install answers on this Mac and the cluster mesh only. An existing install keeps LAN access on across an upgrade. Turn it on with `sudo k3sm network lan on`.
+- **A single-node server's apiserver certificate is signed by the cluster CA**, as a server with `--mesh-ip` already was. The admin kubeconfig pins the cluster CA and never skips verification, every namespace's `kube-root-ca.crt` becomes the cluster CA, and `--tls-san` works without `--mesh-ip`. The certificate also names the node. A first install waits up to two minutes for the control plane to create the cluster CA and exits non-zero, writing no kubeconfig, if it does not. `k3sm status` gains a `serving-cert` row, and run as root an `admin-kubeconfig` row that checks the kubeconfig install recorded against the cluster CA. See [certificates](https://k3sm.io/docs/certificates/).
 - **The install swap folder moved to `/Library/k3sm.swap`**, so it never shares a path with the macOS app's staging folder, `/Library/k3sm.staging`.
 
 ### Security
@@ -69,6 +70,11 @@ pin, its date, and the tarball's sha256.
 ### Upgrade Notes
 
 - Upgrade with `sudo k3sm install`, never by replacing the binary alone.
+- Before upgrading a single-node server, back up its PKI directories, which a rollback to the previous release relies on: `sudo cp -a /var/lib/k3sm/server/tls /var/lib/k3sm/server/apiserver-certs <backup-dir>`.
+- On a single-node server, upgrade with `sudo k3sm install`, not a bare restart of the daemon: the apiserver now presents a certificate signed by the cluster CA, and install rewrites the admin kubeconfig to trust it. Until then the old kubeconfig fails with "unknown authority".
+- Every namespace's `kube-root-ca.crt` becomes the cluster CA. A Pod that read its `ca.crt` at start fails with "unknown authority" against the apiserver until it is restarted.
+- Rolling back by reinstalling the previous release publishes its self-signed certificate in `kube-root-ca.crt` again and rewrites the admin kubeconfig, so a Pod that read the cluster CA fails with "unknown authority" until it is restarted.
+- Copy every kubeconfig you took off the node again after the upgrade, for example with `kubectl config view --minify --flatten --context k3sm --raw`.
 - On a cluster using LoadBalancer Services, upgrade the agents before the server.
 - A node stopped with `k3sm stop` stays stopped across an upgrade; pass `--start` to start it.
 - A node built from source needs the registry in its payload: restage with `k3sm payload` before `sudo k3sm install`.

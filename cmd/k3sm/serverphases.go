@@ -777,16 +777,16 @@ func repairServerNodeLabels(ctx context.Context, cs kubernetes.Interface, nodeNa
 
 // addonPosture is the facts the gated embedded add-ons are checked against.
 //
-// ClusterCAKubeletServing is INFERRED, not observed: it is read off the
-// mesh-provisioned cluster-CA serving pair, not off any kubelet's certificate.
-// plan.cfg.ServingCertFile/ServingKeyFile are set only by the mesh provisioning
-// (serverprovision.go), and they decide the executor's --root-ca-file, so
-// kube-root-ca.crt is the cluster CA. plan.opts.meshIP is what
-// setServerKubeletServing keys on to issue this node's kubelet serving cert from
-// that same CA, and a worker exists only on a mesh cluster, where its join
-// response carries a cluster-CA-issued serving cert. On a single-node server both
-// are empty: the kubelet cert is self-signed and kube-root-ca.crt is the
-// apiserver's own CA. TestAddonPosture pins the inference.
+// ClusterCAKubeletServing is INFERRED, not observed: it is read off the mesh IP and
+// the cluster-CA serving pair, not off any kubelet's certificate. Every topology
+// sets plan.cfg.ServingCertFile/ServingKeyFile (provisionServingLeaf), so
+// kube-root-ca.crt is the cluster CA everywhere; the pair alone therefore says
+// nothing about the kubelet. plan.opts.meshIP is what setServerKubeletServing
+// keys on to issue this node's kubelet serving cert from that same CA, and a
+// worker exists only on a mesh cluster, where its join response carries a
+// cluster-CA-issued serving cert. On a single-node server the mesh IP is empty:
+// the kubelet serving cert stays self-signed, so the posture is false even with
+// the pair set. TestAddonPosture pins the inference.
 //
 // VMNode is a cluster fact: at least one Node carries the label the vm
 // RuntimeClass selects on (runtimeclass.LabelVirtualization=LabelTrue, as

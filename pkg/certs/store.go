@@ -159,19 +159,17 @@ func SigningCACertPath(workDir string) string { return filepath.Join(PKIDir(work
 func ClusterCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), clusterCAKey) }
 func SigningCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), signingCAKey) }
 
-// APIServerServingCertPath / APIServerServingKeyPath are the multi-node apiserver's
+// APIServerServingCertPath / APIServerServingKeyPath are the apiserver's
 // cluster-CA-signed serving keypair under the PKI dir (--tls-cert-file /
-// --tls-private-key-file). The mesh server re-issues them on every boot; a
-// single-node server self-signs into its own cert dir instead, so these need not exist.
+// --tls-private-key-file). Every server, single-node or mesh, re-issues them on
+// every boot; the apiserver never self-signs.
 //
 // NOT to be confused with the file of the same basename under executor's
 // APIServerCertDir (<workDir>/apiserver-certs/apiserver.crt): that one is the
-// apiserver's OWN self-signed material, is also the controller-manager's
-// --root-ca-file and every pod's projected kube-root-ca.crt, and is deliberately
-// OUT of rotation scope (replacing it is a cluster-wide trust event). This one is a
-// leaf re-issued from the cluster CA on every boot — rotating it is routine. The two
-// resolve to different directories; the presence of THIS file is what distinguishes a
-// mesh server from a single-node one.
+// legacy self-signed material a release before this leaf wrote, kept one release as
+// the rollback artifact and read by nothing. This one is a leaf re-issued from the
+// cluster CA on every boot; rotating it is routine. Its presence says nothing about
+// the topology.
 func APIServerServingCertPath(workDir string) string {
 	return filepath.Join(PKIDir(workDir), apiServerCert)
 }

@@ -28,7 +28,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -41,10 +40,9 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 )
 
-// certificateUsage is the `k3sm certificate` help text. It states the three honesty
-// caveats up front, because "rotate" invites all three wrong readings: that superseded
-// certs stop working, that worker nodes are covered, and that the apiserver's own
-// self-signed material is included.
+// certificateUsage is the `k3sm certificate` help text. It states the two honesty
+// caveats up front, because "rotate" invites both wrong readings: that superseded
+// certs stop working, and that worker nodes are covered.
 const certificateUsage = `Usage: k3sm certificate rotate [--restart|--yes] [--work-dir <dir>]
 
 Re-issue the control plane's CA-signed LEAF credentials over the EXISTING CA
@@ -69,8 +67,6 @@ Caveats:
     an agent REUSES the credential it stored at join instead of re-joining. A node
     client cert is issued for one year, so rotating one means forcing a rejoin before
     it expires (a fresh join token, or remove the agent's stored credential files).
-  * The apiserver's own self-signed cert dir is not rotated (it is also the
-    controller-manager --root-ca-file and every pod's projected kube-root-ca.crt).
 `
 
 // runCertificate dispatches the `k3sm certificate` subcommands.
@@ -115,43 +111,72 @@ func runCertificateRotate(args []string) error {
 	fs.Usage = func() { fmt.Fprintf(os.Stderr, certificateUsage, executor.DefaultAPIServerPort) }
 	_ = fs.Parse(args)
 
-	opts := executor.RotateOptions{
-		WorkDir:   *workDir,
-		Restart:   *restart || *yes,
-		Restarter: install.NewDarwinSystem(),
+	return rotateInstalled(context.Background(), os.Stdout, os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath,
+		*workDir, *restart || *yes, *port, install.NewDarwinSystem())
+}
+
+// rotateInstalled is runCertificateRotate past flag parsing: it builds the options
+// from the installed server (rotateOptions) and only then runs the rotation, so a
+// failed read returns before restarter is ever asked to kickstart anything.
+func rotateInstalled(ctx context.Context, out io.Writer, read func(string) ([]byte, error), plistPath, recordPath, workDir string, restart bool, port int, restarter executor.DaemonRestarter) error {
+	opts, addr, err := rotateOptions(read, plistPath, recordPath, workDir, restart, port)
+	if err != nil {
+		return err
 	}
-	if opts.Restart {
-		// Resolve the probe's trust anchor BEFORE the restart: a probe that cannot
-		// tell the real apiserver from any other process holding the port is not a
-		// verification, and finding that out after the blast radius is incurred is
-		// the wrong order (same fail-closed reasoning as ErrNoHealthProbe).
-		anchor, anchorPath, err := apiServerTrustAnchor(*workDir)
-		if err != nil {
+	opts.Restarter = restarter
+	return certificateRotate(ctx, out, opts, addr)
+}
+
+// rotateOptions builds the rotation's options from the installed server, every
+// read BEFORE the restart: a rotation that cannot tell what it restarted, or
+// verify that it came back, must not incur the blast radius.
+//
+// MeshServer is the installed topology, read from the installed server plist
+// (else the server-arguments record; install.InstalledMeshIP) — the same read the
+// probe address uses. A failed read aborts the rotation here, with or without
+// --restart, and never defaults a topology. With restart it also resolves the
+// probe's trust anchor (the cluster CA), the probe address, and the recorded
+// --tls-san names, and wires the health check; addr is "" on a dry run. The
+// caller supplies the Restarter.
+func rotateOptions(read func(string) ([]byte, error), plistPath, recordPath, workDir string, restart bool, port int) (executor.RotateOptions, string, error) {
+	opts := executor.RotateOptions{WorkDir: workDir, Restart: restart}
+	meshIP, err := install.InstalledMeshIP(read, plistPath, recordPath)
+	if err != nil {
+		return opts, "", fmt.Errorf("read the installed server plist %s (or the arguments record %s) for its --mesh-ip, which decides what the rotation re-issues; refusing to rotate, dry run included, without it: %w", plistPath, recordPath, err)
+	}
+	opts.MeshServer = meshIP != ""
+	if !restart {
+		return opts, "", nil
+	}
+	// Resolve the probe's trust anchor BEFORE the restart: a probe that cannot
+	// tell the real apiserver from any other process holding the port is not a
+	// verification, and finding that out after the blast radius is incurred is
+	// the wrong order (same fail-closed reasoning as ErrNoHealthProbe).
+	anchor, anchorPath, err := apiServerTrustAnchor(workDir)
+	if err != nil {
+		return opts, "", err
+	}
+	// Same pre-restart ordering for the address: a probe aimed where the
+	// apiserver does not listen would report a completed rotation as failed.
+	addr, err := apiServerProbeAddr(read, plistPath, recordPath, port)
+	if err != nil {
+		return opts, "", err
+	}
+	// The restarted server reissues the apiserver leaf from its own argv, which
+	// carries the recorded --tls-san names; the rotation checks the new leaf
+	// still names every one, so a rotation can never silently drop them.
+	sans, err := install.InstalledTLSSANs(read, plistPath, recordPath)
+	if err != nil {
+		return opts, "", fmt.Errorf("read the recorded --%s names (needed to verify the reissued apiserver certificate keeps them): %w", install.TLSSANFlag, err)
+	}
+	opts.Health = func(ctx context.Context) error {
+		if err := probeAPIServerServing(ctx, addr, anchor, anchorPath); err != nil {
 			return err
 		}
-		// Same pre-restart ordering for the address: a probe aimed where the
-		// apiserver does not listen would report a completed rotation as failed.
-		addr, err := apiServerProbeAddr(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath, *port)
-		if err != nil {
-			return err
-		}
-		// The restarted server reissues the apiserver leaf from its own argv, which
-		// carries the recorded --tls-san names; the rotation checks the new leaf
-		// still names every one, so a rotation can never silently drop them.
-		sans, err := install.InstalledTLSSANs(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath)
-		if err != nil {
-			return fmt.Errorf("read the recorded --%s names (needed to verify the reissued apiserver certificate keeps them): %w", install.TLSSANFlag, err)
-		}
-		opts.Health = func(ctx context.Context) error {
-			if err := probeAPIServerServing(ctx, addr, anchor, anchorPath); err != nil {
-				return err
-			}
-			return servingCertCarriesSANs(certs.APIServerServingCertPath(*workDir), sans)
-		}
-		opts.HealthTimeout = rotateProbeDeadline
-		return certificateRotate(context.Background(), os.Stdout, opts, addr)
+		return servingCertCarriesSANs(certs.APIServerServingCertPath(workDir), sans)
 	}
-	return certificateRotate(context.Background(), os.Stdout, opts, "")
+	opts.HealthTimeout = rotateProbeDeadline
+	return opts, addr, nil
 }
 
 // apiServerProbeAddr is the host:port the post-restart health probe dials: the
@@ -183,14 +208,11 @@ func apiServerProbeAddr(read func(string) ([]byte, error), plistPath, recordPath
 	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
-// servingCertCarriesSANs reports an error naming the first of sans (the
-// recorded --tls-san names) the apiserver serving certificate at certPath does
-// not carry. No names is nil without reading the file: a server without
-// --tls-san may have no cluster-CA-signed leaf at all (single-node).
+// servingCertCarriesSANs reports an error when the reissued apiserver serving
+// certificate at certPath is unreadable or does not parse, or names the first of
+// sans (the recorded --tls-san names) it does not carry. Every topology issues
+// that leaf, so it is read on every rotation, with or without names.
 func servingCertCarriesSANs(certPath string, sans []string) error {
-	if len(sans) == 0 {
-		return nil
-	}
 	raw, err := os.ReadFile(certPath)
 	if err != nil {
 		return fmt.Errorf("read the reissued apiserver serving certificate: %w", err)
@@ -355,33 +377,15 @@ func writeArtifacts(w io.Writer, arts []executor.RotationArtifact) {
 	}
 }
 
-// apiServerSelfSignedCertPath is the serving certificate the SINGLE-NODE apiserver
-// self-signs into its own --cert-dir. The basename is kube-apiserver's own fixed
-// choice; the executor names the same file as the controller-manager's --root-ca-file
-// (see executor.APIServerCertDir). The file holds the leaf followed by the self-signed
-// CA that issued it, which is what makes it usable as a trust anchor.
-func apiServerSelfSignedCertPath(workDir string) string {
-	return filepath.Join(executor.APIServerCertDir(workDir), "apiserver.crt")
-}
-
 // apiServerTrustAnchor returns the pool the health probe verifies the local
-// apiserver's certificate against, and the path it came from. Which anchor applies is
-// decided by the server's posture:
-//
-//   - multi-node (--mesh-ip): the boot issues a CLUSTER-CA-signed serving cert into
-//     the PKI dir, so the cluster CA is the anchor;
-//   - single-node: the apiserver self-signs into its own --cert-dir, so that file
-//     (leaf + its self-signed CA) is the anchor.
-//
-// Both are 0644 PUBLIC certificates; reading one is not a credential read, and the
-// rotation's write-nothing rule forbids MODIFYING the work dir, never reading it.
-// An absent anchor is a hard failure: an unverified probe accepts any local TLS
-// listener, so falling back to one would be worse than refusing to restart.
+// apiserver's certificate against, and the path it came from: the cluster CA, which
+// issues the apiserver's serving leaf on every topology. It is a 0644 PUBLIC
+// certificate; reading it is not a credential read, and the rotation's
+// write-nothing rule forbids MODIFYING the work dir, never reading it. An absent
+// anchor is a hard failure: an unverified probe accepts any local TLS listener, so
+// falling back to one would be worse than refusing to restart.
 func apiServerTrustAnchor(workDir string) (*x509.CertPool, string, error) {
-	path := apiServerSelfSignedCertPath(workDir)
-	if fileExists(certs.APIServerServingCertPath(workDir)) {
-		path = certs.ClusterCACertPath(workDir)
-	}
+	path := certs.ClusterCACertPath(workDir)
 	pem, err := os.ReadFile(path)
 	if err != nil {
 		return nil, "", fmt.Errorf("read the apiserver's trust anchor %s (needed to verify the control plane came back; refusing to restart without it): %w", path, err)

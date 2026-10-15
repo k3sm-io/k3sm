@@ -159,11 +159,15 @@ type Paths struct {
 	// production record; `k3sm status --datavol-record` sets it so a scratch
 	// volume can be reported on without touching the real one.
 	DatavolRecord string
-	DataRoot      string
-	WorkDir       string
-	NetdSocket    string
-	NetdLog       string
-	ServerLog     string
+	// ServerArgsRecord is the server arguments record, which carries the path of
+	// the admin kubeconfig install wrote. Empty means
+	// dataroot.DefaultServerArgsRecordPath.
+	ServerArgsRecord string
+	DataRoot         string
+	WorkDir          string
+	NetdSocket       string
+	NetdLog          string
+	ServerLog        string
 	// ShadowManifest is the shadow binary set's manifest (pkg/shadow), read by
 	// the shadow-shells row.
 	ShadowManifest string

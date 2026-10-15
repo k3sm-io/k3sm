@@ -480,7 +480,7 @@ func TestValidateRefusesEncryptionWithHA(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.cfg.Validate(); !errors.Is(err, tc.want) && !(tc.want == nil && err == nil) {
+			if err := withServingPair(tc.cfg).Validate(); !errors.Is(err, tc.want) && !(tc.want == nil && err == nil) {
 				t.Fatalf("Validate = %v, want %v", err, tc.want)
 			}
 		})

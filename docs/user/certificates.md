@@ -14,7 +14,7 @@ k3sm stands up two independent self-signed CAs under the server work dir's `tls/
 
 | CA | File | Role |
 |---|---|---|
-| **cluster CA** | `tls/cluster-ca.crt` | The serving anchor. A join token embeds `K10<sha256(cluster CA)>`; a joining node pins it. Issues kubelet-serving certs and the multi-node apiserver serving cert. |
+| **cluster CA** | `tls/cluster-ca.crt` | The serving anchor. A join token embeds `K10<sha256(cluster CA)>`; a joining node pins it. Issues kubelet-serving certs and the apiserver serving cert, on a single-node server as on a multi-node one. |
 | **signing CA** | `tls/signing-ca.crt` | The apiserver's `--client-ca-file`. Issues the `system:node:<name>` client certs and the scheduler / controller-manager client certs. |
 
 **Neither CA is ever re-minted.** Re-minting the cluster CA would invalidate the pin in every
@@ -58,9 +58,8 @@ Step 5 is stricter than it looks. `launchctl kickstart -k` returns as soon as th
 its components down, so "the apiserver answers" alone would be satisfied by the instance that is
 going away, and a daemon that never came back would be reported as a success. The wait therefore
 requires a **changed launchd pid** as well as a healthy answer, and the answer must come from a TLS
-peer whose certificate chains to a CA k3sm already holds on disk (the cluster CA on a multi-node
-server, the apiserver's own self-signed cert on a single-node one). A different process holding the
-port is not the control plane coming back, and is reported as a failure.
+peer whose certificate chains to the cluster CA k3sm already holds on disk. A different process
+holding the port is not the control plane coming back, and is reported as a failure.
 
 It writes **nothing** into the work dir, because the daemon runs as the unprivileged `_k3sm` user:
 a root-written file there would make the *next* boot fail with EACCES, and launchd's `KeepAlive`
@@ -110,11 +109,33 @@ restart model applied to a version bump.
 | Not rotated | Why |
 |---|---|
 | The cluster, signing and request-header CAs | Re-minting either orphans every node; see above. |
-| `apiserver-certs/` | The apiserver's own self-signed serving material. It is also the controller-manager's `--root-ca-file` and therefore the source of every pod's projected `kube-root-ca.crt`; replacing it is a cluster-wide trust event. Out of scope. |
+| `apiserver-certs/` | The self-signed serving material of releases before the apiserver's certificate came from the cluster CA. Nothing reads it now. It is kept for one release so a rollback to the previous release still finds it, and a later release removes it. |
 | The admin kubeconfig and `tokens.csv` | The admin credential is a static bearer token set at install time, not a CA-signed identity. Re-run `sudo k3sm install` to change it. |
 | `sa.key` / `sa.pub` | The service-account signing keypair. Replacing it invalidates every issued ServiceAccount token. |
 | Join tokens (`k3sm token create`) and the HA server-join secret | Separate credentials with their own lifecycle. Worker tokens are TTL-bounded; mint a new one when you need one. |
 | **Worker / agent node certificates** | A node's client and kubelet-serving certs are re-issued when the **agent** restarts and re-runs its join, which needs a fresh join token. Rotating the server does not touch them. |
+
+## Upgrading a Single-Node Server
+
+Releases before this one let a single-node apiserver sign its own certificate in
+`apiserver-certs/`. This release serves a certificate signed by the cluster CA instead, so the
+trust anchor changes.
+
+Back up both directories before you upgrade, because a rollback to the previous release relies on
+the old files:
+
+```sh
+sudo cp -a /var/lib/k3sm/server/tls /var/lib/k3sm/server/apiserver-certs <backup-dir>
+```
+
+Upgrade with `sudo k3sm install`. It rewrites the admin kubeconfig to pin the cluster CA, and every
+namespace's `kube-root-ca.crt` becomes the cluster CA. A Pod that read its `ca.crt` at start fails
+with "unknown authority" until it is restarted. `sudo k3sm status` shows whether the admin
+kubeconfig still pins the cluster CA on its `admin-kubeconfig` row.
+
+Rolling back works the other way round. Reinstalling the previous release publishes its self-signed
+certificate in `kube-root-ca.crt` again and rewrites the admin kubeconfig, so a Pod that read the
+cluster CA fails with "unknown authority" until it is restarted.
 
 ## Rotation Does Not Revoke
 

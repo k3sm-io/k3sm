@@ -226,9 +226,9 @@ func preflightServer(opts *serverOptions, workDirErr error, logger *slog.Logger)
 		return nil, mode, true, runClusterReset(*opts, logger)
 	}
 	// --tls-san: an invalid name is refused here, after the maintenance exits
-	// above so a bad name never blocks them; a single-node server and an IP this
-	// Mac no longer holds are only warned about (checkServerTLSSANs).
-	if err := checkServerTLSSANs(opts.tlsSANs, opts.meshIP, install.DefaultServiceCIDR, logger); err != nil {
+	// above so a bad name never blocks them, on every topology; an IP this Mac no
+	// longer holds is only warned about (checkServerTLSSANs).
+	if err := checkServerTLSSANs(opts.tlsSANs, opts.meshIP, opts.nodeName, install.DefaultServiceCIDR, logger); err != nil {
 		return nil, mode, true, err
 	}
 	// runtimed's on-disk root is the work-dir's parent (so the SBPL Posture.WorkDir
@@ -283,8 +283,10 @@ func admitServerStart(ctx context.Context, opts serverOptions, breaker *crashBre
 }
 
 // provisionControlPlane builds the executor Config, runs the HA server-join CA
-// import, and on the mesh path ensures the CA hierarchy and the apiserver's
-// mesh-bound serving posture (provisionMeshPKI). It may rewrite opts.nodeIP.
+// import, on the mesh path ensures the CA hierarchy and the apiserver's
+// mesh-bound posture (provisionMeshPKI), and on every topology issues the
+// apiserver's cluster-CA serving leaf (provisionServingLeaf). It may rewrite
+// opts.nodeIP.
 func provisionControlPlane(ctx context.Context, opts *serverOptions, encryptionConfig string, logger *slog.Logger) (cfg executor.Config, pki serverPKI, err error) {
 	cfg = serverExecutorConfig(*opts, encryptionConfig, logger)
 	// HA server-join: a SECOND control-plane server reconstructs the IDENTICAL
@@ -306,15 +308,75 @@ func provisionControlPlane(ctx context.Context, opts *serverOptions, encryptionC
 
 	// Multi-node: bind the apiserver + the worker-join supervisor on the mesh
 	// interface ONLY, serve a cluster-CA-signed cert, wire --client-ca-file +
-	// --kubelet-certificate-authority + --anonymous-auth=false. Empty --mesh-ip keeps
-	// the single-node loopback/self-signed path unchanged.
+	// --kubelet-certificate-authority + --anonymous-auth=false. Single-node: the
+	// same cluster-CA-signed serving leaf, on loopback.
 	if opts.meshIP != "" {
 		pki.hierarchy, pki.serverSecret, err = provisionMeshPKI(opts, &cfg, logger)
 		if err != nil {
 			return cfg, serverPKI{}, err
 		}
+		return cfg, pki, nil
+	}
+	if err := provisionServingLeaf(*opts, &cfg, logger); err != nil {
+		return cfg, serverPKI{}, err
 	}
 	return cfg, pki, nil
+}
+
+// ensureHierarchy is certs.EnsureHierarchy, a seam so a test can see the role
+// and posture provisionServingLeaf passes.
+var ensureHierarchy = certs.EnsureHierarchy
+
+// provisionServingLeaf is the one issuance path of the apiserver serving leaf,
+// on every topology, run after the HA CA import and before the executor starts.
+// It ensures the CA hierarchy with exactly the arguments the executor's own
+// provisionComponentCerts passes (the server's CARole and certs.PostureKine:
+// a joined server loads what its import installed and never mints), issues the
+// leaf from the cluster CA (writeAPIServerServingCert), and sets
+// ServingCertFile, ServingKeyFile and RootCAFile on cfg. It runs in the
+// _k3sm server process, which already holds the CA key; it never mints a CA
+// anywhere else.
+//
+// It is re-run on every boot, so a pair a crash left half-written is replaced
+// by the next start. A failure is logged at Error naming the leaf's path and
+// the recovery, and stops the start: there is no self-signed fallback.
+func provisionServingLeaf(opts serverOptions, cfg *executor.Config, logger *slog.Logger) error {
+	certFile := certs.APIServerServingCertPath(opts.workDir)
+	fail := func(err error) error {
+		logger.Error("could not issue the apiserver serving certificate from the cluster CA; the control plane will not start without it",
+			"path", certFile, "err", err,
+			"recover-with", "sudo launchctl kickstart -k system/"+install.ServerLabel+" (or remove "+certFile+" and "+certs.APIServerServingKeyPath(opts.workDir)+", then kickstart)")
+		return fmt.Errorf("apiserver serving certificate %s: %w", certFile, err)
+	}
+	h, err := ensureHierarchy(opts.workDir, cfg.CARole(), certs.PostureKine)
+	if err != nil {
+		return fail(fmt.Errorf("ensure CA hierarchy: %w", err))
+	}
+	servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP, opts.nodeName, opts.tlsSANs, logger)
+	if err != nil {
+		return fail(err)
+	}
+	cfg.ServingCertFile = servingCert
+	cfg.ServingKeyFile = servingKey
+	// The CA that ISSUED that serving leaf is what the controller-manager must
+	// republish as every namespace's kube-root-ca.crt — the anchor every Pod uses to
+	// verify the apiserver. Set beside the serving pair because the two are one
+	// posture.
+	cfg.RootCAFile = certs.ClusterCACertPath(opts.workDir)
+	logLegacyCertDir(opts.workDir, logger)
+	return nil
+}
+
+// logLegacyCertDir logs, once per boot, that the work dir still holds the
+// apiserver's self-signed --cert-dir from a release before the cluster-CA
+// serving leaf. Nothing reads or removes it: it is kept one release as the
+// rollback artifact, because the previous release's install pins its
+// apiserver.crt.
+func logLegacyCertDir(workDir string, logger *slog.Logger) {
+	dir := executor.APIServerCertDir(workDir)
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		logger.Info("legacy apiserver self-signed cert dir is kept one release as the rollback artifact; nothing reads it", "path", dir)
+	}
 }
 
 // serverExecutorConfig is the control plane's executor Config before the mesh
@@ -356,8 +418,9 @@ func serverExecutorConfig(opts serverOptions, encryptionConfig string, logger *s
 
 // provisionMeshPKI is the mesh path's half of control-plane provisioning: the CA
 // hierarchy (plus the etcd CAs in HA), the server-bootstrap secret, the HA admin
-// kubeconfig, the mesh nodeIP rewrite, and the apiserver's mesh-bound,
-// cluster-CA-served posture written into cfg.
+// kubeconfig, the mesh nodeIP rewrite, the cluster-CA serving leaf
+// (provisionServingLeaf, the same path a single-node server takes), and the
+// apiserver's mesh-bound posture written into cfg.
 func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Logger) (*certs.Hierarchy, string, error) {
 	// The posture's CAs (in HA the etcd server + peer CAs too, which ride the same
 	// bootstrap bundle). A joined server (--server-join) LOADS what its import
@@ -395,8 +458,7 @@ func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Lo
 	// two HA servers no longer share a pod /24; the rewrite still keeps the
 	// advertised address the one the peers route to.)
 	opts.nodeIP = meshNodeIP(*opts)
-	servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP, opts.tlsSANs)
-	if err != nil {
+	if err := provisionServingLeaf(*opts, cfg, logger); err != nil {
 		return nil, "", err
 	}
 	anonFalse := false
@@ -405,18 +467,6 @@ func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Lo
 	cfg.ClientCAFile = certs.SigningCACertPath(opts.workDir)
 	cfg.KubeletCAFile = certs.ClusterCACertPath(opts.workDir)
 	cfg.AnonymousAuth = &anonFalse
-	cfg.ServingCertFile = servingCert
-	cfg.ServingKeyFile = servingKey
-	// The CA that ISSUED that serving leaf is what the controller-manager must
-	// republish as every namespace's kube-root-ca.crt — the anchor every Pod uses to
-	// verify the apiserver. Set here, beside the serving cert, because the two are one
-	// posture: the executor derives --root-ca-file off the same predicate as
-	// --tls-cert-file, so they cannot name CAs from different modes. Without it the
-	// KCM would be pointed at the apiserver's SELF-SIGNED --cert-dir file, which on a
-	// mesh boot the apiserver never writes (bring-up dies on "error parsing
-	// root-ca-file"), and which on a work dir that once booted single-node is a stale
-	// CA that anchors nothing — in-pod API TLS then fails cluster-wide.
-	cfg.RootCAFile = certs.ClusterCACertPath(opts.workDir)
 	// The supervisor is deliberately NOT mesh-bound: a joining worker reaches
 	// it over the underlay, having no mesh until that join completes (see
 	// bootstrapListenAddr).

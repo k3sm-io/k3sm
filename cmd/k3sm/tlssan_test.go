@@ -43,12 +43,16 @@ import (
 // tlsSANTestMesh is the mesh IP the gate's server runs with.
 const tlsSANTestMesh = "100.64.0.1"
 
+// tlsSANTestLogger discards the writer's node-name warning; these tests issue
+// with no node name.
+var tlsSANTestLogger = slog.New(slog.DiscardHandler)
+
 // fixedServingSANs is the fixed apiserver serving set, derived from its one
 // owner (apiServerServingSANs with no extras); an empty list must yield it
 // exactly.
 func fixedServingSANs(t *testing.T) (dns, ips []string) {
 	t.Helper()
-	d, i, err := apiServerServingSANs(tlsSANTestMesh, nil)
+	d, i, err := apiServerServingSANs(tlsSANTestMesh, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,10 +178,11 @@ func recordFor(t *testing.T, cfg install.Config) (read func(string) ([]byte, err
 
 // TestAPIServerServingCertTLSSAN is the --tls-san gate: the real serving-cert
 // writer issues every validated extra name beside the fixed set from the
-// existing cluster CA, which is never changed; invalid, colliding, non-local
-// and single-node requests are refused before anything is written; the install
-// record keeps and replaces the list; and a rotation checks the reissued leaf
-// still carries the recorded names.
+// existing cluster CA, which is never changed, on a mesh and a single-node server
+// alike (inverted from the refusal a single-node server used to get, when it
+// self-signed); invalid, colliding and non-local requests are refused before
+// anything is written; the install record keeps and replaces the list; and a
+// rotation checks the reissued leaf still carries the recorded names.
 func TestAPIServerServingCertTLSSAN(t *testing.T) {
 	stubLocalAddrs(t, "192.0.2.50", "fe80::1", tlsSANTestMesh)
 
@@ -204,7 +209,7 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 			if tc.extra != nil && err != nil {
 				t.Fatalf("install check refused %v: %v", tc.extra, err)
 			}
-			if _, _, err := writeAPIServerServingCert(dir, ca, tlsSANTestMesh, canon); err != nil {
+			if _, _, err := writeAPIServerServingCert(dir, ca, tlsSANTestMesh, "", canon, tlsSANTestLogger); err != nil {
 				t.Fatal(err)
 			}
 			leaf := readServingLeaf(t, dir)
@@ -246,7 +251,7 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 		{name: "a last label of digits", extra: []string{"1.2.3"}, mesh: tlsSANTestMesh, target: ErrTLSSANInvalid},
 		{name: "a two-label legacy IPv4 form", extra: []string{"10.1"}, mesh: tlsSANTestMesh, target: ErrTLSSANInvalid},
 		{name: "more than 32 names", extra: manyTLSSANs(33), mesh: tlsSANTestMesh, target: ErrTLSSANInvalid},
-		{name: "a single-node server", extra: []string{"api.example.com"}, mesh: "", target: ErrTLSSANSingleNode},
+		{name: "an invalid name on a single-node server", extra: []string{"*.example.com"}, mesh: "", target: ErrTLSSANInvalid},
 	}
 	for _, tc := range refused {
 		t.Run("refused: "+tc.name, func(t *testing.T) {
@@ -256,12 +261,12 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 				t.Fatalf("install check = %v, want %v", err, tc.target)
 			}
 			if tc.target == ErrTLSSANInvalid {
-				if err := checkServerTLSSANs(tc.extra, tc.mesh, install.DefaultServiceCIDR, slog.New(slog.DiscardHandler)); !errors.Is(err, tc.target) {
+				if err := checkServerTLSSANs(tc.extra, tc.mesh, "", install.DefaultServiceCIDR, slog.New(slog.DiscardHandler)); !errors.Is(err, tc.target) {
 					t.Errorf("server start check = %v, want %v", err, tc.target)
 				}
 			}
 			if tc.target == ErrTLSSANInvalid {
-				if _, _, err := writeAPIServerServingCert(dir, ca, tc.mesh, tc.extra); !errors.Is(err, ErrTLSSANInvalid) {
+				if _, _, err := writeAPIServerServingCert(dir, ca, tc.mesh, "", tc.extra, tlsSANTestLogger); !errors.Is(err, ErrTLSSANInvalid) {
 					t.Errorf("writer = %v, want %v", err, ErrTLSSANInvalid)
 				}
 			}
@@ -276,14 +281,14 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 		var logs bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&logs, nil))
 		extra := []string{"203.0.113.7", "api.example.com"}
-		if err := checkServerTLSSANs(extra, tlsSANTestMesh, install.DefaultServiceCIDR, logger); err != nil {
+		if err := checkServerTLSSANs(extra, tlsSANTestMesh, "", install.DefaultServiceCIDR, logger); err != nil {
 			t.Fatalf("server start refused a recorded IP that moved: %v", err)
 		}
 		if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "203.0.113.7") {
 			t.Errorf("no warning naming the moved address: %s", logs.String())
 		}
 		dir, ca := tlsSANWorkDir(t)
-		if _, _, err := writeAPIServerServingCert(dir, ca, tlsSANTestMesh, extra); err != nil {
+		if _, _, err := writeAPIServerServingCert(dir, ca, tlsSANTestMesh, "", extra, tlsSANTestLogger); err != nil {
 			t.Fatal(err)
 		}
 		if !slices.Contains(leafIPs(readServingLeaf(t, dir)), "203.0.113.7") {
@@ -291,14 +296,31 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 		}
 	})
 
-	t.Run("at server start a recorded list without --mesh-ip is a warning, not a refusal", func(t *testing.T) {
-		var logs bytes.Buffer
-		logger := slog.New(slog.NewTextHandler(&logs, nil))
-		if err := checkServerTLSSANs([]string{"api.example.com", "*.bad"}, "", install.DefaultServiceCIDR, logger); err != nil {
-			t.Fatalf("a single-node server refused to start on a recorded list: %v", err)
+	t.Run("a single-node server issues the extras with no mesh IP", func(t *testing.T) {
+		extra := []string{"api.example.com", "192.0.2.50"}
+		canon, err := checkInstallTLSSANs(extra, "", install.DefaultServiceCIDR)
+		if err != nil {
+			t.Fatalf("install refused --tls-san on a single-node server: %v", err)
 		}
-		if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "api.example.com") {
-			t.Errorf("no warning naming the ignored list: %s", logs.String())
+		var logs bytes.Buffer
+		if err := checkServerTLSSANs(canon, "", "", install.DefaultServiceCIDR, slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
+			t.Fatalf("server start refused the list on a single-node server: %v", err)
+		}
+		if strings.Contains(logs.String(), "level=WARN") {
+			t.Errorf("a valid single-node list was warned about: %s", logs.String())
+		}
+		dir, ca := tlsSANWorkDir(t)
+		if _, _, err := writeAPIServerServingCert(dir, ca, "", "", canon, tlsSANTestLogger); err != nil {
+			t.Fatal(err)
+		}
+		leaf := readServingLeaf(t, dir)
+		if !slices.Contains(leaf.DNSNames, "api.example.com") || !slices.Contains(leafIPs(leaf), "192.0.2.50") {
+			t.Errorf("single-node leaf SANs = %v %v, want the extras issued", leaf.DNSNames, leafIPs(leaf))
+		}
+		for _, ip := range leaf.IPAddresses {
+			if len(ip) == 0 || ip.IsUnspecified() {
+				t.Errorf("single-node leaf carries a nil or unspecified IP: %v", leaf.IPAddresses)
+			}
 		}
 	})
 
@@ -348,8 +370,8 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 			t.Errorf("resolved = %v, %v", sans, err)
 		}
 		none := func(string) ([]byte, error) { return nil, fs.ErrNotExist }
-		if _, err := o.resolveTLSSANs(none, "/p", "/r"); !errors.Is(err, ErrTLSSANSingleNode) {
-			t.Errorf("no recorded mesh IP = %v, want %v", err, ErrTLSSANSingleNode)
+		if sans, err := o.resolveTLSSANs(none, "/p", "/r"); err != nil || !slices.Equal(sans, []string{"api.example.com", "192.0.2.50"}) {
+			t.Errorf("no recorded mesh IP (single-node) = %v, %v; want the list resolved", sans, err)
 		}
 		if _, err := parseInstallFlags([]string{"--agent", "--server", "10.0.0.1", "--tls-san", "a.example.com"}); err == nil {
 			t.Error("--tls-san accepted on a worker install")
@@ -365,14 +387,14 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 		dir, ca := tlsSANWorkDir(t)
 		pin := ca.PinHash()
 		// A leaf without the names is what a rotation that dropped them leaves.
-		if _, _, err := writeAPIServerServingCert(dir, ca, tlsSANTestMesh, nil); err != nil {
+		if _, _, err := writeAPIServerServingCert(dir, ca, tlsSANTestMesh, "", nil, tlsSANTestLogger); err != nil {
 			t.Fatal(err)
 		}
 		if err := servingCertCarriesSANs(certs.APIServerServingCertPath(dir), sans); err == nil {
 			t.Error("a leaf missing the recorded names passed the rotation check")
 		}
 		// The restarted server reissues from its argv, which carries the names.
-		if _, _, err := writeAPIServerServingCert(dir, ca, tlsSANTestMesh, sans); err != nil {
+		if _, _, err := writeAPIServerServingCert(dir, ca, tlsSANTestMesh, "", sans, tlsSANTestLogger); err != nil {
 			t.Fatal(err)
 		}
 		if err := servingCertCarriesSANs(certs.APIServerServingCertPath(dir), sans); err != nil {

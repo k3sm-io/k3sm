@@ -179,7 +179,8 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 // kept), else the list in canonical spelling, which replaces the recorded one.
 // The server's effective mesh IP is --mesh-ip when passed, else the installed
 // one (read the way install.InstalledMeshIP reads it); without one the server
-// is single-node and --tls-san is refused (checkInstallTLSSANs).
+// is single-node, which issues the same cluster-CA leaf, so the list is judged
+// the same way with no mesh IP (checkInstallTLSSANs).
 func (o installFlags) resolveTLSSANs(read func(string) ([]byte, error), plistPath, recordPath string) ([]string, error) {
 	if len(o.tlsSANs) == 0 {
 		return nil, nil

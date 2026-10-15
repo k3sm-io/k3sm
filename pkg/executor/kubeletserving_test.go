@@ -82,14 +82,15 @@ func TestApiserverKubeletCAFlagIffConfigured(t *testing.T) {
 // badly as one that is listed but never re-issued.
 //
 // The pair is deliberately held in memory (no key file), so it is reported with a
-// non-filesystem locator and its presence is read off the mesh posture's on-disk
-// witness — which is why this test drives two real work dirs rather than asserting a
-// constant.
+// non-filesystem locator and its presence follows the installed topology
+// (RotateOptions.MeshServer), never the apiserver serving cert: every topology now
+// issues that leaf, so a single-node work dir holding it must still report the pair
+// absent.
 func TestRotationReportsTheKubeletServingPair(t *testing.T) {
 	t.Parallel()
-	find := func(t *testing.T, wd string) RotationArtifact {
+	find := func(t *testing.T, wd string, mesh bool) RotationArtifact {
 		t.Helper()
-		for _, a := range reissuedArtifacts(wd) {
+		for _, a := range reissuedArtifacts(wd, mesh) {
 			if strings.Contains(a.Detail, "kubelet serving cert+key") {
 				return a
 			}
@@ -97,28 +98,32 @@ func TestRotationReportsTheKubeletServingPair(t *testing.T) {
 		t.Fatalf("reissuedArtifacts does not report the node's kubelet serving pair, which every --mesh-ip boot re-mints")
 		return RotationArtifact{}
 	}
-
-	t.Run("mesh work dir: reported present", func(t *testing.T) {
+	withLeaf := func(t *testing.T) string {
+		t.Helper()
 		wd := t.TempDir()
 		if err := os.MkdirAll(filepath.Dir(certs.APIServerServingCertPath(wd)), 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
-		if err := os.WriteFile(certs.APIServerServingCertPath(wd), []byte("witness"), 0o644); err != nil {
-			t.Fatalf("write witness: %v", err)
+		if err := os.WriteFile(certs.APIServerServingCertPath(wd), []byte("leaf"), 0o644); err != nil {
+			t.Fatalf("write leaf: %v", err)
 		}
-		a := find(t, wd)
+		return wd
+	}
+
+	t.Run("mesh server: reported present", func(t *testing.T) {
+		a := find(t, withLeaf(t), true)
 		if !a.Present {
-			t.Error("a mesh work dir must report the kubelet serving pair as re-issued")
+			t.Error("a mesh server must report the kubelet serving pair as re-issued")
 		}
 		if strings.HasPrefix(a.Path, "/") {
 			t.Errorf("Path = %q — the pair is held in memory and must not claim a file an operator could go read", a.Path)
 		}
 	})
 
-	t.Run("single-node work dir: reported absent", func(t *testing.T) {
-		a := find(t, t.TempDir())
+	t.Run("single-node server with the serving leaf: reported absent", func(t *testing.T) {
+		a := find(t, withLeaf(t), false)
 		if a.Present {
-			t.Error("a single-node work dir mints no cluster-CA kubelet serving pair, so reporting it present would overstate the rotation")
+			t.Error("a single-node server mints no cluster-CA kubelet serving pair, so reporting it present would overstate the rotation")
 		}
 	})
 }
@@ -139,7 +144,7 @@ func TestRotationReportsTheServerNodeClientIdentity(t *testing.T) {
 	for name, wd := range map[string]string{"single-node": t.TempDir(), "mesh": mesh} {
 		t.Run(name, func(t *testing.T) {
 			var found []RotationArtifact
-			for _, a := range reissuedArtifacts(wd) {
+			for _, a := range reissuedArtifacts(wd, name == "mesh") {
 				if strings.Contains(a.Detail, "CN=system:node:") && strings.Contains(a.Detail, "O=system:nodes") {
 					found = append(found, a)
 				}

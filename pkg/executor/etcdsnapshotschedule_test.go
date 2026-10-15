@@ -47,12 +47,12 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 	const retention = 3
 	wd := t.TempDir()
 	logs := &lockedBuffer{}
-	s := NewSupervised(Config{
+	s := NewSupervised(withServingPair(Config{
 		WorkDir: wd,
 		Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP,
 			Snapshots: &EtcdSnapshotSchedule{Cron: cron, Retention: retention}},
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-	})
+	}))
 	if err := s.cfg.Validate(); err != nil {
 		t.Fatalf("Validate = %v", err)
 	}
@@ -333,12 +333,12 @@ func TestEtcdSnapshotScheduleRetains(t *testing.T) {
 	t.Run("Stop ends the loop before the etcd member is signalled", func(t *testing.T) {
 		wd2 := t.TempDir()
 		logs2 := &lockedBuffer{}
-		s2 := NewSupervised(Config{
+		s2 := NewSupervised(withServingPair(Config{
 			WorkDir: wd2,
 			Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP,
 				Snapshots: &EtcdSnapshotSchedule{Cron: cron, Retention: retention}},
 			Logger: slog.New(slog.NewTextHandler(logs2, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		})
+		}))
 		s2.etcd.clock = newFakeClock(0) // every wait fires at once
 		member := startFakeChild(t, etcdComponent)
 		s2.mu.Lock()
@@ -419,12 +419,12 @@ func TestEtcdSnapshotScheduleCatchesUpOnce(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := &lockedBuffer{}
-			s := NewSupervised(Config{
+			s := NewSupervised(withServingPair(Config{
 				WorkDir: t.TempDir(),
 				Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP,
 					Snapshots: &EtcdSnapshotSchedule{Cron: cron, Retention: 10}},
 				Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-			})
+			}))
 			start := time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)
 			// After the jump the run ends one hour before the next cron minute, so
 			// every snapshot counted is the catch-up.

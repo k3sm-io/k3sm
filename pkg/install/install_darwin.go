@@ -1959,17 +1959,17 @@ func (darwinSystem) LaunchctlServicePID(label string) (int, error) {
 // sudo. Any pre-existing clusters/contexts are preserved — install must never
 // clobber a developer's other kubeconfigs (uninstall likewise leaves the file).
 // The write is atomic (temp + rename) so a crash mid-write can't corrupt the file.
-func (darwinSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) error {
+func (darwinSystem) WriteUserKubeconfig(targetUser, name string, contents []byte) (string, error) {
 	u, err := user.Lookup(targetUser)
 	if err != nil {
-		return fmt.Errorf("lookup target user %s: %w", targetUser, err)
+		return "", fmt.Errorf("lookup target user %s: %w", targetUser, err)
 	}
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
 	if err := writeUserKubeconfig(u.HomeDir, uid, gid, name, contents); err != nil {
-		return fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
+		return "", fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
 	}
-	return nil
+	return filepath.Join(u.HomeDir, ".kube", "config"), nil
 }
 
 // writeUserKubeconfig is the method above with the home directory and owner

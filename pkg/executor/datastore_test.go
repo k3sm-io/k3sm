@@ -134,8 +134,8 @@ func TestEtcdRoleMakesIllegalStatesUnrepresentable(t *testing.T) {
 	if (Config{}).isHA() {
 		t.Error("the zero Config must be the single-node posture, not HA")
 	}
-	if err := (Config{}).Validate(); err != nil {
-		t.Errorf("the zero Config must validate, got %v", err)
+	if err := withServingPair(Config{}).Validate(); err != nil {
+		t.Errorf("the zero Config with the serving pair must validate, got %v", err)
 	}
 	cases := []struct {
 		name string
@@ -151,7 +151,7 @@ func TestEtcdRoleMakesIllegalStatesUnrepresentable(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			etcd := tc.etcd
-			cfg := Config{Etcd: &etcd}
+			cfg := withServingPair(Config{Etcd: &etcd})
 			if !cfg.isHA() {
 				t.Error("a Config carrying Etcd must be HA")
 			}

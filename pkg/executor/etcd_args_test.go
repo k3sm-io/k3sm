@@ -241,17 +241,17 @@ func TestApiserverEtcdServersTLS(t *testing.T) {
 func TestEtcdNeedsNonLoopbackNodeIP(t *testing.T) {
 	for _, ip := range []string{"", "127.0.0.1", "::1", "not-an-ip", "0.0.0.0"} {
 		for _, role := range []EtcdRole{EtcdInit, EtcdJoin} {
-			cfg := Config{Etcd: &EtcdConfig{Role: role, Name: "n", PeerIP: ip}}
+			cfg := withServingPair(Config{Etcd: &EtcdConfig{Role: role, Name: "n", PeerIP: ip}})
 			if err := cfg.Validate(); !errors.Is(err, ErrEtcdNeedsNodeIP) {
 				t.Errorf("role %v PeerIP %q: Validate = %v, want ErrEtcdNeedsNodeIP", role, ip, err)
 			}
 		}
 	}
-	ok := Config{Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.0.2.10"}}
+	ok := withServingPair(Config{Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.0.2.10"}})
 	if err := ok.Validate(); err != nil {
 		t.Errorf("a LAN peer IP must validate, got %v", err)
 	}
-	if err := (Config{Etcd: &EtcdConfig{Name: "n", PeerIP: "192.0.2.10"}}).Validate(); !errors.Is(err, ErrEtcdRole) {
+	if err := withServingPair(Config{Etcd: &EtcdConfig{Name: "n", PeerIP: "192.0.2.10"}}).Validate(); !errors.Is(err, ErrEtcdRole) {
 		t.Errorf("a role-less etcd posture: Validate = %v, want ErrEtcdRole", err)
 	}
 }
@@ -260,10 +260,10 @@ func TestEtcdNeedsNonLoopbackNodeIP(t *testing.T) {
 // both etcd roles are HA.
 func TestEncryptionRefusedWithEtcdRole(t *testing.T) {
 	for _, role := range []EtcdRole{EtcdInit, EtcdJoin} {
-		cfg := Config{
+		cfg := withServingPair(Config{
 			EncryptionProviderConfig: "/wd/encryption-config.yaml",
 			Etcd:                     &EtcdConfig{Role: role, Name: "n", PeerIP: "192.0.2.10"},
-		}
+		})
 		if err := cfg.Validate(); !errors.Is(err, ErrEncryptionHA) {
 			t.Errorf("role %v + encryption: Validate = %v, want ErrEncryptionHA", role, err)
 		}

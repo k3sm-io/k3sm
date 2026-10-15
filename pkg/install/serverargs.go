@@ -363,8 +363,9 @@ func writeServerArgsRecord(sys System, cfg Config) error {
 		// "k3sm <version>", the same one-line provenance the data-volume record
 		// carries. Info.String() is the multi-line `k3sm version` screen and would
 		// put a paragraph in a json field.
-		CreatedBy: "k3sm " + version.Get().Version,
-		CreatedAt: time.Now().UTC(),
+		CreatedBy:       "k3sm " + version.Get().Version,
+		CreatedAt:       time.Now().UTC(),
+		AdminKubeconfig: cfg.AdminKubeconfigPath,
 	}
 	if err := sys.WriteServerArgsRecord(path, rec); err != nil {
 		return fmt.Errorf("install: write the server arguments record %s: %w", path, err)
