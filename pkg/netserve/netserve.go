@@ -216,9 +216,10 @@ type Server struct {
 	// binder plumbs the DNS VIP alias + binds 53/UDP+TCP through the selected
 	// host-network backend (netd helper when unprivileged, direct as root).
 	binder dnsBinder
-	// static are the "namespace/name" keys of the Services whose backends are
-	// pinned (proxy.WithStaticBackends) rather than derived from EndpointSlices.
-	static []string
+	// static are the backends of the Services pinned through
+	// proxy.WithStaticBackends rather than derived from EndpointSlices, keyed
+	// "namespace/name". Set in New, read-only afterwards.
+	static map[string][]netv1.Endpoint
 }
 
 // New builds the network Server: a proxy.Proxy over a routing table keyed by the
@@ -331,10 +332,7 @@ func New(cfg Config) *Server {
 			log.Warn("api-server endpoint did not parse; kubernetes VIP has no backend (in-pod kubectl degraded)", "endpoint", s.cfg.APIServerEndpoint, "err", err)
 		} else {
 			watchOpts = append(watchOpts, proxy.WithStaticBackends(static))
-			for key := range static {
-				s.static = append(s.static, key)
-			}
-			slices.Sort(s.static)
+			s.static = static
 		}
 	}
 	s.watch = proxy.NewWatcher(cfg.Client, s.proxy, log, watchOpts...)
@@ -348,10 +346,27 @@ func New(cfg Config) *Server {
 // Service port with the Ready backends it routes to (proxy.Proxy.VIPStates).
 func (s *Server) VIPStates() []proxy.VIPState { return s.proxy.VIPStates() }
 
-// StaticServices returns the "namespace/name" keys of the Services whose
-// backends this Server pins instead of deriving them from EndpointSlices (see
-// Config.APIServerEndpoint), sorted. The result is owned by the caller.
-func (s *Server) StaticServices() []string { return slices.Clone(s.static) }
+// Synced reports whether the Service proxy's table has been built from synced
+// informers (proxy.Proxy.Synced).
+func (s *Server) Synced() bool { return s.proxy.Synced() }
+
+// PinnedBackends returns the backends this Server pins for Services instead of
+// deriving them from EndpointSlices (see Config.APIServerEndpoint), keyed
+// "namespace/name", each rendered "ip:port". It is what the proxy must route
+// those Services to, so a status check compares the table against it. The
+// result is owned by the caller.
+func (s *Server) PinnedBackends() map[string][]string {
+	out := make(map[string][]string, len(s.static))
+	for key, eps := range s.static {
+		addrs := make([]string, 0, len(eps))
+		for _, ep := range eps {
+			addrs = append(addrs, net.JoinHostPort(ep.IP, strconv.Itoa(int(ep.Port))))
+		}
+		slices.Sort(addrs)
+		out[key] = addrs
+	}
+	return out
+}
 
 // UnproxiedClusterIPs returns the ClusterIPs the proxy deliberately leaves to
 // another listener on this node: the cluster DNS VIP, which the in-process

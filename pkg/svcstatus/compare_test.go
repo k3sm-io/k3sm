@@ -69,8 +69,9 @@ func slice(ns, svc string, port int32, written time.Time, ready map[string]bool)
 // TestCompareServicesNamesTheMissingBackend drives the comparer over a fake
 // clientset: a Service port whose record lacks a Ready endpoint the LIST has is
 // diverging and names it; an unready endpoint is not expected; the cluster DNS
-// VIP and a pinned Service are not compared; a Service changed after the record,
-// or gone from the API, is settling rather than diverging.
+// VIP is not compared; a pinned Service matching its pinned backend is not a
+// divergence; a Service changed after the record, or gone from the API, is
+// settling rather than diverging.
 func TestCompareServicesNamesTheMissingBackend(t *testing.T) {
 	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 	old := now.Add(-time.Hour)
@@ -88,8 +89,9 @@ func TestCompareServicesNamesTheMissingBackend(t *testing.T) {
 	rec := status.ServicesRecord{
 		UpdatedAt: now.Add(-20 * time.Second),
 		Unproxied: []string{"10.43.0.10"},
+		Pinned:    []status.PinnedService{{Namespace: "default", Name: "kubernetes", Backends: []string{"127.0.0.1:6443"}}},
 		VIPs: []status.VIPEntry{
-			{ClusterIP: "10.43.0.1", Port: 443, Protocol: "TCP", Namespace: "default", Name: "kubernetes", Backends: []string{"127.0.0.1:6443"}, Static: true},
+			{ClusterIP: "10.43.0.1", Port: 443, Protocol: "TCP", Namespace: "default", Name: "kubernetes", Backends: []string{"127.0.0.1:6443"}},
 			{ClusterIP: "10.43.0.20", Port: 80, Protocol: "TCP", Namespace: "web", Name: "front", Backends: []string{"100.64.0.7:8080"}},
 			{ClusterIP: "10.43.0.21", Port: 80, Protocol: "TCP", Namespace: "web", Name: "fresh", Backends: []string{}},
 			{ClusterIP: "10.43.0.22", Port: 80, Protocol: "TCP", Namespace: "web", Name: "same", Backends: []string{"100.64.0.12:8080"}},
@@ -114,5 +116,100 @@ func TestCompareServicesNamesTheMissingBackend(t *testing.T) {
 	}
 	if !slices.Equal(settling, []string{"web/fresh", "web/deleted"}) {
 		t.Errorf("settling = %v, want [web/fresh web/deleted]", settling)
+	}
+}
+
+// TestComparePinnedAPIServerVIP pins the comparison for the kubernetes Service
+// of a loopback single-node server, which no EndpointSlice describes: the want
+// set is the pinned backend the record carries, never the table's own, so an
+// entry that lost its backend or left the table diverges naming that backend;
+// a healthy one matches. With no pin (a mesh apiserver) the Service is
+// slice-driven like any other.
+func TestComparePinnedAPIServerVIP(t *testing.T) {
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Hour)
+	pinned := []status.PinnedService{{Namespace: "default", Name: "kubernetes", Backends: []string{"127.0.0.1:6444"}}}
+	entry := func(backends ...string) status.VIPEntry {
+		if backends == nil {
+			backends = []string{}
+		}
+		return status.VIPEntry{ClusterIP: "10.43.0.1", Port: 443, Protocol: "TCP", Namespace: "default", Name: "kubernetes", Policy: "Cluster", Backends: backends}
+	}
+	cases := []struct {
+		name        string
+		pinned      []status.PinnedService
+		vips        []status.VIPEntry
+		objs        []*discoveryv1.EndpointSlice
+		wantMissing []string
+		wantExtra   []string
+	}{
+		{name: "healthy", pinned: pinned, vips: []status.VIPEntry{entry("127.0.0.1:6444")}},
+		{name: "lost its backend", pinned: pinned, vips: []status.VIPEntry{entry()}, wantMissing: []string{"127.0.0.1:6444"}},
+		{name: "absent from the table", pinned: pinned, wantMissing: []string{"127.0.0.1:6444"}},
+		{name: "wrong backend", pinned: pinned, vips: []status.VIPEntry{entry("127.0.0.1:9999")},
+			wantMissing: []string{"127.0.0.1:6444"}, wantExtra: []string{"127.0.0.1:9999"}},
+		{name: "mesh apiserver, slice-driven", vips: []status.VIPEntry{entry()},
+			objs:        []*discoveryv1.EndpointSlice{slice("default", "kubernetes", 6444, old, map[string]bool{"100.64.0.1": true})},
+			wantMissing: []string{"100.64.0.1:6444"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			objs := []runtime.Object{service("default", "kubernetes", "10.43.0.1", 443, old)}
+			for _, sl := range tc.objs {
+				objs = append(objs, sl)
+			}
+			rec := status.ServicesRecord{UpdatedAt: now.Add(-10 * time.Second), Pinned: tc.pinned, VIPs: tc.vips}
+			got, err := Comparer{Client: fake.NewClientset(objs...)}.CompareServices(context.Background(), rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Settling) != 0 {
+				t.Errorf("settling = %+v, want none", got.Settling)
+			}
+			if tc.wantMissing == nil && tc.wantExtra == nil {
+				if len(got.Diverging) != 0 {
+					t.Errorf("diverging = %+v, want none", got.Diverging)
+				}
+				return
+			}
+			if len(got.Diverging) != 1 {
+				t.Fatalf("diverging = %+v, want default/kubernetes", got.Diverging)
+			}
+			d := got.Diverging[0]
+			if d.Name != "kubernetes" || d.Port != "10.43.0.1:443/TCP" || !slices.Equal(d.Missing, tc.wantMissing) || !slices.Equal(d.Extra, tc.wantExtra) {
+				t.Errorf("divergence = %+v, want missing %v extra %v", d, tc.wantMissing, tc.wantExtra)
+			}
+		})
+	}
+}
+
+// TestCompareSettlesOnlyAfterTheRecord pins the settling cutoff: a change at or
+// before the record's UpdatedAt is one the record saw, so a divergence then is
+// diverging; only a change after it settles.
+func TestCompareSettlesOnlyAfterTheRecord(t *testing.T) {
+	recAt := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		written  time.Time
+		settling bool
+	}{
+		{name: "a second before", written: recAt.Add(-time.Second)},
+		{name: "at the record", written: recAt},
+		{name: "a second after", written: recAt.Add(time.Second), settling: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svcs := []corev1.Service{*service("web", "front", "10.43.0.20", 80, recAt.Add(-time.Hour))}
+			eps := []discoveryv1.EndpointSlice{*slice("web", "front", 8080, tc.written, map[string]bool{"100.64.0.7": true})}
+			rec := status.ServicesRecord{UpdatedAt: recAt, VIPs: []status.VIPEntry{
+				{ClusterIP: "10.43.0.20", Port: 80, Protocol: "TCP", Namespace: "web", Name: "front", Backends: []string{}},
+			}}
+			got := compare(rec, svcs, eps)
+			if gotSettling := len(got.Settling) == 1 && len(got.Diverging) == 0; gotSettling != tc.settling {
+				t.Errorf("comparison = %+v, want settling=%v", got, tc.settling)
+			}
+			if !tc.settling && len(got.Diverging) != 1 {
+				t.Errorf("diverging = %+v, want web/front", got.Diverging)
+			}
+		})
 	}
 }

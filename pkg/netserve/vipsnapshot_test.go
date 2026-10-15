@@ -17,6 +17,7 @@ limitations under the License.
 package netserve
 
 import (
+	"maps"
 	"slices"
 	"testing"
 
@@ -24,25 +25,25 @@ import (
 )
 
 // TestSnapshotAccessorsNameThePinnedAndUnproxiedVIPs pins what the services
-// record carries beside the table: the pinned kubernetes Service only when the
-// apiserver endpoint is static, and the DNS VIP only when it parses.
+// record carries beside the table: the pinned kubernetes Service and its backend
+// only when the apiserver endpoint is static, and the DNS VIP only when it parses.
 func TestSnapshotAccessorsNameThePinnedAndUnproxiedVIPs(t *testing.T) {
 	cases := []struct {
 		name          string
 		dnsVIP, apiEP string
-		wantStatic    []string
+		wantPinned    map[string][]string
 		wantUnproxied []string
 	}{
 		{name: "single node", dnsVIP: "10.43.0.10", apiEP: "127.0.0.1:6444",
-			wantStatic: []string{"default/kubernetes"}, wantUnproxied: []string{"10.43.0.10"}},
+			wantPinned: map[string][]string{"default/kubernetes": {"127.0.0.1:6444"}}, wantUnproxied: []string{"10.43.0.10"}},
 		{name: "mesh apiserver", dnsVIP: "10.43.0.10", wantUnproxied: []string{"10.43.0.10"}},
 		{name: "no DNS VIP", dnsVIP: "not-an-ip"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := New(Config{Client: fake.NewClientset(), WorkDir: t.TempDir(), DNSVIP: tc.dnsVIP, APIServerEndpoint: tc.apiEP})
-			if got := s.StaticServices(); !slices.Equal(got, tc.wantStatic) {
-				t.Errorf("StaticServices = %v, want %v", got, tc.wantStatic)
+			if got := s.PinnedBackends(); !maps.EqualFunc(got, tc.wantPinned, slices.Equal) {
+				t.Errorf("PinnedBackends = %v, want %v", got, tc.wantPinned)
 			}
 			if got := s.UnproxiedClusterIPs(); !slices.Equal(got, tc.wantUnproxied) {
 				t.Errorf("UnproxiedClusterIPs = %v, want %v", got, tc.wantUnproxied)

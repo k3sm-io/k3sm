@@ -19,6 +19,7 @@ package svcstatus
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -26,16 +27,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/proxy"
 
 	"k3sm.io/k3sm/pkg/status"
 )
-
-// settleAllowance is how long before a record's UpdatedAt an API change still
-// counts as one the record may not have seen: the proxy applies a watch event
-// within a second or so, and the allowance covers that plus clock skew between
-// the API's managed-field timestamps and the server's clock.
-const settleAllowance = 5 * time.Second
 
 // Comparer is the services row's status.ServicesComparer over a cluster client.
 type Comparer struct {
@@ -69,10 +65,15 @@ func (c Comparer) CompareServices(ctx context.Context, rec status.ServicesRecord
 //
 // The want side is proxy.APIBackendSets, the one derivation of a Service port's
 // Ready backends (the Watcher installs the same sets), so this row and the proxy
-// cannot disagree on what Ready means. Two kinds of port are taken out of the
-// comparison because the API cannot describe them: a ClusterIP the proxy leaves
-// to another listener (rec.Unproxied), and a Service whose backends the server
-// pins (VIPEntry.Static).
+// cannot disagree on what Ready means. A Service the server pins is derived by
+// the same function from the pinned backends the record carries, never from the
+// table itself, so a pinned port that lost its backend, or left the table, is a
+// divergence naming the pinned backends. A ClusterIP the proxy leaves to another
+// listener (rec.Unproxied) is not compared.
+//
+// A diverging port is settling, not diverging, when its Service is gone from the
+// API or the Service or one of its EndpointSlices changed after the record was
+// written: the record cannot have seen that change.
 func compare(rec status.ServicesRecord, svcs []corev1.Service, eps []discoveryv1.EndpointSlice) status.ServicesComparison {
 	svcPtrs := make([]*corev1.Service, len(svcs))
 	owners := make(map[string]*corev1.Service, len(svcs))
@@ -95,9 +96,7 @@ func compare(rec status.ServicesRecord, svcs []corev1.Service, eps []discoveryv1
 			changed[key] = lastChange(sl.ObjectMeta, changed[key])
 		}
 	}
-	// No static override is passed: the pinned endpoints live in the server, and
-	// the record marks the pinned ports instead (handled below).
-	want := proxy.APIBackendSets(svcPtrs, slicePtrs, nil)
+	want := proxy.APIBackendSets(svcPtrs, slicePtrs, pinnedEndpoints(rec.Pinned))
 
 	states := make([]proxy.VIPState, 0, len(rec.VIPs))
 	recOwner := make(map[proxy.PortKey]status.VIPEntry, len(rec.VIPs))
@@ -117,14 +116,8 @@ func compare(rec status.ServicesRecord, svcs []corev1.Service, eps []discoveryv1
 			delete(want, k)
 		}
 	}
-	for k, e := range recOwner {
-		if e.Static {
-			want[k] = have[k]
-		}
-	}
 
 	var out status.ServicesComparison
-	cutoff := rec.UpdatedAt.Add(-settleAllowance)
 	for _, d := range proxy.DiffBackendSets(want, have) {
 		pd := status.ServicePortDivergence{Port: d.Key.String(), Missing: d.Missing, Extra: d.Extra}
 		inAPI := false
@@ -133,13 +126,33 @@ func compare(rec status.ServicesRecord, svcs []corev1.Service, eps []discoveryv1
 		} else if e, ok := recOwner[d.Key]; ok {
 			pd.Namespace, pd.Name = e.Namespace, e.Name
 		}
-		// A port whose Service is gone, or whose Service or slices changed after
-		// the record was taken, may simply be newer than the record.
-		if !inAPI || !changed[pd.Namespace+"/"+pd.Name].Before(cutoff) {
+		if !inAPI || changed[pd.Namespace+"/"+pd.Name].After(rec.UpdatedAt) {
 			out.Settling = append(out.Settling, pd)
 			continue
 		}
 		out.Diverging = append(out.Diverging, pd)
+	}
+	return out
+}
+
+// pinnedEndpoints renders the record's pinned Services as the static override
+// proxy.APIBackendSets takes, each backend Ready. A backend that does not parse
+// is left out, which reads as that backend missing from the table's view.
+func pinnedEndpoints(pinned []status.PinnedService) map[string][]netv1.Endpoint {
+	if len(pinned) == 0 {
+		return nil
+	}
+	out := make(map[string][]netv1.Endpoint, len(pinned))
+	for _, p := range pinned {
+		eps := []netv1.Endpoint{}
+		for _, b := range p.Backends {
+			ap, err := netip.ParseAddrPort(b)
+			if err != nil {
+				continue
+			}
+			eps = append(eps, netv1.Endpoint{IP: ap.Addr().String(), Port: int32(ap.Port()), Ready: true})
+		}
+		out[p.Namespace+"/"+p.Name] = eps
 	}
 	return out
 }

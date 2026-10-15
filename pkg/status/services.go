@@ -32,6 +32,20 @@ type ServicesRecord struct {
 	// another listener on the node owns them (the cluster DNS address). Their
 	// Services have no entry in VIPs, and the row does not expect one.
 	Unproxied []string `json:"unproxied,omitempty"`
+	// Pinned are the Services whose backends the server pins rather than
+	// derives from EndpointSlices (the kubernetes Service of a single-node
+	// server, whose loopback endpoint no EndpointSlice may carry), with the
+	// backends pinned. They are what the proxy must route those ports to, and no
+	// API object can say so.
+	Pinned []PinnedService `json:"pinned,omitempty"`
+}
+
+// PinnedService is one Service the server pins to fixed backends.
+type PinnedService struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	// Backends are the pinned addresses ("ip:port"), sorted.
+	Backends []string `json:"backends"`
 }
 
 // VIPEntry is one routed Service port as the proxy holds it.
@@ -53,10 +67,6 @@ type VIPEntry struct {
 	// Generation numbers the distinct backend sets the proxy has installed for
 	// the port.
 	Generation uint64 `json:"generation"`
-	// Static is true for a Service whose backends are pinned by the server
-	// rather than derived from EndpointSlices (the kubernetes Service of a
-	// single-node server, whose loopback endpoint no EndpointSlice may carry).
-	Static bool `json:"static,omitempty"`
 }
 
 // ServicesRecordInterval is how often a server refreshes its ServicesRecord.

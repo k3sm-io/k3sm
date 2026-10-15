@@ -58,6 +58,7 @@ import (
 	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/runtimeclass"
+	"k3sm.io/k3sm/pkg/status"
 )
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
@@ -660,6 +661,9 @@ func runServer(args []string) (err error) {
 // empty-selecting spec is the error, and the server refuses to start rather
 // than serve NodePorts nowhere. SIGHUP re-resolves it (attachServerProxy).
 func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions, error) {
+	// Before any datapath decision: the previous process's Service proxy record
+	// describes a proxy that is gone, whether or not this one starts a datapath.
+	removeServicesRecord(plan.opts.workDir, logger)
 	if sm.dataPathRefused != nil {
 		return nil, nodeOptions{}, nil
 	}
@@ -721,7 +725,7 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	// With no datapath the proxy routes nothing, and a record of that empty
 	// table would read as every Service missing its backends.
 	if mode.DataPath() {
-		go runServicesRecorder(ctx, net, opts.workDir, logger)
+		go runServicesRecorder(ctx, net, opts.workDir, status.ServicesRecordInterval, servicesSyncPoll, logger)
 	}
 	return net, nodeAddressing, nil
 }

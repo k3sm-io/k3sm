@@ -24,42 +24,71 @@ import (
 	"os"
 	"time"
 
-	"k3sm.io/k3sm/pkg/netserve"
+	"k3sm.io/darwin-net/pkg/proxy"
+
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/svcstatus"
 )
 
-// runServicesRecorder publishes the Service proxy's routing table for `k3sm
-// status` (the services row) every status.ServicesRecordInterval until ctx ends.
-//
-// A record left by an earlier server process describes a proxy that is gone, so
-// it is removed first. The first record is written one interval after start, not
-// at once: the proxy's informers sync and install the table in the meantime, and
-// a table recorded before that would read as every Service missing its backends.
-// Every failure is logged and survivable; the record is a report, never a reason
-// to stop a server.
-func runServicesRecorder(ctx context.Context, srv *netserve.Server, workDir string, logger *slog.Logger) {
+// servicesSource is what the services recorder reads from the datapath
+// (netserve.Server in production).
+type servicesSource interface {
+	VIPStates() []proxy.VIPState
+	PinnedBackends() map[string][]string
+	UnproxiedClusterIPs() []string
+	// Synced reports whether the proxy's table has been built from synced
+	// informers; a table recorded before that would read as every Service
+	// missing its backends.
+	Synced() bool
+}
+
+// servicesSyncPoll is how often the recorder checks Synced before its first
+// record.
+const servicesSyncPoll = time.Second
+
+// removeServicesRecord removes the record an earlier server process left. It
+// describes a proxy that is gone, and runs whether or not this server has a
+// datapath, so a server restarted without one leaves no record behind.
+func removeServicesRecord(workDir string, logger *slog.Logger) {
 	path := status.ServicesPath(workDir)
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		logger.Warn("could not remove the previous Service proxy record", "path", path, "err", err)
 	}
-	t := time.NewTicker(status.ServicesRecordInterval)
+}
+
+// runServicesRecorder publishes src's routing table for `k3sm status` (the
+// services row): first as soon as src reports Synced, then every interval, until
+// ctx ends. Every failure is logged and survivable; the record is a report, never
+// a reason to stop a server.
+func runServicesRecorder(ctx context.Context, src servicesSource, workDir string, interval, syncPoll time.Duration, logger *slog.Logger) {
+	path := status.ServicesPath(workDir)
+	poll := time.NewTicker(syncPoll)
+	for !src.Synced() {
+		select {
+		case <-ctx.Done():
+			poll.Stop()
+			return
+		case <-poll.C:
+		}
+	}
+	poll.Stop()
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
+		if err := recordServices(src, path, time.Now()); err != nil && ctx.Err() == nil {
+			logger.Warn("could not record the Service proxy for `k3sm status`", "path", path, "err", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
-		if err := recordServices(srv, path, time.Now()); err != nil && ctx.Err() == nil {
-			logger.Warn("could not record the Service proxy for `k3sm status`", "path", path, "err", err)
-		}
 	}
 }
 
-// recordServices writes srv's routing table to path through writeFileAtomic,
+// recordServices writes src's routing table to path through writeFileAtomic,
 // which creates the file 0600 like the other records beside it.
-func recordServices(srv *netserve.Server, path string, now time.Time) error {
-	rec := svcstatus.Record(srv.VIPStates(), srv.StaticServices(), srv.UnproxiedClusterIPs(), now)
+func recordServices(src servicesSource, path string, now time.Time) error {
+	rec := svcstatus.Record(src.VIPStates(), src.PinnedBackends(), src.UnproxiedClusterIPs(), now)
 	return writeFileAtomic(path, rec)
 }
