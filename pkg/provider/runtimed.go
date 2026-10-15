@@ -1670,9 +1670,12 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// it had never been created. Each preflight logs and records its own Warning
 	// Event; the error comes back already wrapped.
 	//
-	// The emptyDir-medium check runs first because it is pure spec inspection,
-	// while the platform check may cost a node-capability RPC.
+	// The emptyDir-medium and projected-source checks run first because they are
+	// pure spec inspection, while the platform check may cost a node-capability RPC.
 	if err := r.preflightEmptyDirMedium(pod, box); err != nil {
+		return err
+	}
+	if err := r.preflightProjectedSources(pod); err != nil {
 		return err
 	}
 	if err := r.preflightImagePlatform(ctx, pod, box); err != nil {

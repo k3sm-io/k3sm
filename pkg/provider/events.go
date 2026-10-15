@@ -79,6 +79,14 @@ const (
 	// to mirror, and borrowing `Failed` would place the failure at container start,
 	// a stage this pod never reaches.
 	reasonFailedEmptyDirMedium = "FailedEmptyDirMedium"
+	// reasonFailedProjectedSource is recorded when a pod's projected volume names
+	// a source this node cannot materialize (clusterTrustBundle, podCertificate,
+	// or any source the translation does not model), so the pod is refused BEFORE
+	// the CreatePod RPC (preflightProjectedSources).
+	//
+	// No upstream analogue, for the FailedEmptyDirMedium reason: a kubelet that
+	// cannot serve a projected source is not a state upstream models.
+	reasonFailedProjectedSource = "FailedProjectedSource"
 	// reasonFailedGPUFit is recorded when a pod requesting the GPU extended
 	// resource does not fit in this node's GPU memory beside the GPU pods already
 	// admitted, so the pod is refused BEFORE the CreatePod RPC.
@@ -312,6 +320,20 @@ func msgFailedEmptyDirMedium(volume, medium string) string {
 		"ordinary disk-backed directory, or schedule the pod with runtimeClassName: %s, whose "+
 		"Linux guest honours medium: Memory as a tmpfs.",
 		volume, medium, runtimeclass.Name)
+}
+
+// msgFailedProjectedSource is the FailedProjectedSource-event message for a pod
+// whose projected volume names a source this node cannot materialize.
+//
+// It carries the volume name, which is the pod's own spec, and a FIXED kind token
+// (clusterTrustBundle, podCertificate or unmodeled). It never carries a bundle
+// name, a signer name or a selector: those are user strings, and naming the kind
+// is enough to find the source inside the named volume.
+func msgFailedProjectedSource(volume, kind string) string {
+	return fmt.Sprintf("Error: projected volume %q has a source of kind %s, which this node "+
+		"cannot provide: the file would be missing from the volume with no notice. Remove the source "+
+		"from spec.volumes[].projected.sources, or deliver its content through a configMap or "+
+		"secret source.", volume, kind)
 }
 
 // msgFailedGPUFit is the FailedGPUFit-event message for a GPU pod refused for
