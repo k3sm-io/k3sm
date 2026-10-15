@@ -116,6 +116,7 @@ func TestCABundleTamperedAADRejected(t *testing.T) {
 		"first salt":   4 + 1 + 1 + 4 + 1,          // start of salt
 		"last salt":    4 + 1 + 1 + 4 + 1 + 15,     // end of salt (saltLen=16)
 		"first nonce":  4 + 1 + 1 + 4 + 1 + 16 + 1, // after nonceLen, start of nonce
+		"iters low":    4 + 1 + 1 + 3,              // low byte of iters: 600000 -> 600001, still in window, so the tag must catch it
 	}
 	for name, idx := range cases {
 		t.Run(name, func(t *testing.T) {
