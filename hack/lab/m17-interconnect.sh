@@ -56,6 +56,9 @@
 #   K3SM_M17_MLX_MODEL, K3SM_M17_MLX_MEMORY, K3SM_M17_MLX_READY_TIMEOUT  r5's model
 #   K3SM_M17_PREVIOUS_ARTIFACT the previous k3sm binary for r9 (absent -> REFUSED)
 #   K3SM_M17_REINSTALL_ARGS    extra arguments for the r9 `k3sm install` re-runs
+#   K3SM_LAB_TOLERATE_KEYS     extra taint keys every lab pod tolerates, space-separated
+#                              (hack/lab/lib/tolerations.sh)
+#   K3SM_LAB_PRINT_MANIFESTS=1 print the pod manifests and exit; contacts nothing
 #
 # Evidence: the run log is hack/lab/runs/m17-lab-<rc-tag>-<UTCdate>.log (gitignored;
 # hack/lab/runs/README.md) and EVIDENCE_DIR/run.log, with the M11 run-log header
@@ -69,6 +72,9 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 SELF="$HERE/m17-interconnect.sh"
 # shellcheck source-path=SCRIPTDIR source=lib/m17-interconnect-predicates.sh
 . "$HERE/lib/m17-interconnect-predicates.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/tolerations.sh
+. "$HERE/lib/tolerations.sh"
+LAB_TOLERATIONS="$(lab_tolerations_yaml NoSchedule)" || exit 2
 
 # shellcheck disable=SC2034 # see REPO_ROOT
 GATE_NAME="m17-lab"
@@ -293,12 +299,13 @@ EOF
 	cp "$PAYLOAD_LOG" "$RUNG_DIR/doctor-$1.json"
 }
 
-# ic_pod <name> <node> <annotated 0|1> <shell command> — a native pod pinned to
-# a node (nodeName AND the darwin selector; the provider toleration only).
-ic_pod() {
+# ic_pod_manifest <name> <node> <annotated 0|1> <shell command> — a native pod
+# pinned to a node (nodeName AND the darwin selector; the provider toleration plus
+# K3SM_LAB_TOLERATE_KEYS, never a blanket one). ic_pod applies it.
+ic_pod_manifest() {
 	local ann=""
 	[ "$3" = 1 ] && ann="annotations: {k3sm.io/interconnects: $IC_NAME}"
-	kc apply -f - >/dev/null <<EOF
+	cat <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -309,7 +316,7 @@ metadata:
 spec:
   nodeName: $2
   nodeSelector: {kubernetes.io/os: darwin}
-  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
+  tolerations: [$LAB_TOLERATIONS]
   restartPolicy: Never
   containers:
   - name: c
@@ -317,6 +324,7 @@ spec:
     command: ["/bin/sh", "-c", $(python3 -I -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$4")]
 EOF
 }
+ic_pod() { ic_pod_manifest "$@" | kc apply -f - >/dev/null; }
 pod_ready() { [ "$(kc get pod -n "$NS" "$1" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]; }
 pod_done() { case "$(kc get pod -n "$NS" "$1" -o jsonpath='{.status.phase}' 2>/dev/null)" in Succeeded | Failed) return 0 ;; esac; return 1; }
 pod_log_value() { kc logs -n "$NS" "$1" 2>/dev/null | awk -v k="$2" 'index($0, k)==1{v=substr($0, length(k)+1)} END{print v}'; }
@@ -1091,7 +1099,7 @@ gate_run() {
 		shift
 	done
 	shift
-	out="$(env -u K3SM_LAB -u PEER_SSH -u EVIDENCE_DIR ${envs[@]+"${envs[@]}"} bash "$SELF" "$@" 2>&1)" || rc=$?
+	out="$(env -u K3SM_LAB -u PEER_SSH -u EVIDENCE_DIR -u K3SM_LAB_PRINT_MANIFESTS ${envs[@]+"${envs[@]}"} bash "$SELF" "$@" 2>&1)" || rc=$?
 	[ "$rc" = "$want" ] || {
 		echo "exit $rc, want $want: $(printf '%s' "$out" | tail -3)"
 		return 1
@@ -1277,7 +1285,7 @@ self_test_body() {
 	if load_header 2>/dev/null; then
 		# A fixture stands in for the artifact so artifact_sha256 is a real value.
 		K3SM_ARTIFACT="$F/hello-minor2.json" K3SM_RC_TAG="" emit_run_log_header "FAIL (provisional)" >"$tmp/header.txt" 2>&1
-		for r in "gate: m17-lab" "artifact_sha256: local:$(shasum -a 256 "$F/hello-minor2.json" | cut -d' ' -f1)" "git_sha.apis: " "git_sha.runtimed: " "git_sha.darwin-net: " "git_sha.k3sm: " "started_utc: " "result: FAIL"; do
+		for r in "gate: m17-lab" "artifact_sha256: local:$(shasum -a 256 "$F/hello-minor2.json" | cut -d' ' -f1)" "git_sha.apis: " "git_sha.runtimed: " "git_sha.darwin-net: " "git_sha.k3sm: " "started_utc: " "tolerate_keys: " "result: FAIL"; do
 			st "the m11 header emitted over a fixture carries '$r'" 0 grep -qF -- "$r" "$tmp/header.txt"
 		done
 	fi
@@ -1376,6 +1384,13 @@ case "${1:-}" in
 esac
 
 # ── The run ─────────────────────────────────────────────────────────────────────
+if [ "${K3SM_LAB_PRINT_MANIFESTS:-}" = 1 ]; then
+	lab_tolerations_header
+	ic_pod_manifest ic-l-local "<local-node>" 1 "$LISTENER_CMD"
+	echo "---"
+	ic_pod_manifest ic-flow "<local-node>" 0 "echo flow"
+	exit 0
+fi
 if [ "${K3SM_LAB:-}" != "1" ]; then
 	echo "$PENDING_TEXT"
 	echo "$ROW gate: the interconnect ladder needs K3SM_LAB=1, two Macs joined by a Thunderbolt cable, PEER_SSH and EVIDENCE_DIR."

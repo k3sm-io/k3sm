@@ -26,6 +26,9 @@
 #   Optional:
 #     K3SM_B416_EVIDENCE      evidence directory (default: a new mktemp dir)
 #     KUBECTL                 kubectl binary (default kubectl)
+#     K3SM_LAB_TOLERATE_KEYS  extra taint keys every lab pod tolerates, space-separated
+#                             (hack/lab/lib/tolerations.sh)
+#     K3SM_LAB_PRINT_MANIFESTS=1  print the pod manifests and exit; contacts nothing
 #   Legs (every Service in namespace default, every label removed at the end):
 #     l.3  Service lb-a (port 18080, no labels): ingress lists both nodes' mesh
 #          addresses, and each address serves the backend from the OTHER Mac;
@@ -49,6 +52,36 @@
 #           hack/lab/b416.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source-path=SCRIPTDIR source=lib/tolerations.sh
+. "$HERE/lib/tolerations.sh"
+# The backend tolerates the provider taint of every effect (no effect: field).
+LAB_TOLERATIONS="$(lab_tolerations_yaml "")" || exit 2
+
+# backend_pod <namespace> <node>: the backend's manifest. A native pod pinned to
+# the server, answering "b416" on 8080; the responder ships inline (a native pod
+# cannot read files under /tmp).
+backend_pod() {
+	cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: b416-backend, namespace: $1, labels: {app: b416-backend}}
+spec:
+  nodeName: $2
+  nodeSelector: {kubernetes.io/os: darwin}
+  tolerations: [$LAB_TOLERATIONS]
+  containers:
+  - name: web
+    image: native
+    command: ["/bin/sh", "-c", "while true; do printf 'HTTP/1.0 200 OK\\\\r\\\\nContent-Length: 5\\\\r\\\\n\\\\r\\\\nb416\\\\n' | /usr/bin/nc -l 8080 >/dev/null; done"]
+    ports: [{containerPort: 8080}]
+EOF
+}
+
+if [ "${K3SM_LAB_PRINT_MANIFESTS:-}" = 1 ]; then
+	lab_tolerations_header
+	backend_pod default "<server-node>"
+	exit 0
+fi
 
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
@@ -115,6 +148,7 @@ SERVER_IP="$(mesh_ip "$SERVER")"
 WORKER_IP="$(mesh_ip "$WORKER")"
 [ -n "$SERVER_IP" ] && [ -n "$WORKER_IP" ] || { echo "B416 lab tier: a MeshPeer mesh address is missing (server '$SERVER_IP', worker '$WORKER_IP')" >&2; exit 2; }
 echo "==> k3sm B416 lab tier (server $SERVER @ $SERVER_IP, worker $WORKER @ $WORKER_IP; evidence $EVIDENCE)"
+lab_tolerations_header
 
 PORT_HOLDER_PID=""
 cleanup() {
@@ -128,22 +162,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The backend: a native pod pinned to the server, answering "b416" on 8080. The
-# responder ships inline (a native pod cannot read files under /tmp).
-kc apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Pod
-metadata: {name: b416-backend, namespace: $NS, labels: {app: b416-backend}}
-spec:
-  nodeName: $SERVER
-  nodeSelector: {kubernetes.io/os: darwin}
-  tolerations: [{key: k3sm.io/provider, operator: Exists}]
-  containers:
-  - name: web
-    image: native
-    command: ["/bin/sh", "-c", "while true; do printf 'HTTP/1.0 200 OK\\\\r\\\\nContent-Length: 5\\\\r\\\\n\\\\r\\\\nb416\\\\n' | /usr/bin/nc -l 8080 >/dev/null; done"]
-    ports: [{containerPort: 8080}]
-EOF
+# The backend (backend_pod above).
+backend_pod "$NS" "$SERVER" | kc apply -f - >/dev/null
 kc wait --for=condition=Ready pod/b416-backend -n "$NS" --timeout=180s >/dev/null
 
 lb_service() { # name port [label=value]

@@ -1,0 +1,5 @@
+{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}, {key: estate.example.com/off, operator: Exists}, {key: example.com/lab_hold.v2, operator: Exists}
+{key: k3sm.io/provider, operator: Exists}, {key: estate.example.com/off, operator: Exists}, {key: example.com/lab_hold.v2, operator: Exists}
+{"key": "k3sm.io/provider", "operator": "Exists", "effect": "NoSchedule"}, {"key": "estate.example.com/off", "operator": "Exists"}, {"key": "example.com/lab_hold.v2", "operator": "Exists"}
+{"key": "k3sm.io/provider", "operator": "Exists"}, {"key": "estate.example.com/off", "operator": "Exists"}, {"key": "example.com/lab_hold.v2", "operator": "Exists"}
+tolerate_keys: estate.example.com/off example.com/lab_hold.v2
