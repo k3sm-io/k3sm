@@ -207,6 +207,11 @@ container is restarted in place with an upstream-shaped `CrashLoopBackOff` backo
   to get the default runtime back.
 - Is the Pod's policy `Never`, or is it a `Job` that has already succeeded? Both are working as
   specified.
+- Restart count stuck at 0 on a `vm` Pod? Run `kubectl describe pod`. When the node refuses the
+  restart, each attempt records a Warning `Failed` Event, `Error: restart container <name>: <cause>`,
+  and the cause follows the `CrashLoopBackOff` message in the container's state. If it says
+  restarting a container in place is not supported by the guest this Pod booted, delete the Pod: its
+  replacement boots a guest that supports it. The node keeps retrying under the backoff until then.
 - Stuck rather than exiting? Check the Pod was **adapted** to the native image model, because a raw
   Linux image cannot run as a Darwin process (see [Images](images.md)).
 
