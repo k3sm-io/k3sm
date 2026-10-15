@@ -18,6 +18,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -202,6 +203,141 @@ func TestResolveKubectlIn(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("resolveKubectlIn = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestKubectlExecsInPlace drives `k3sm kubectl` end to end through the exec
+// seam: the wrapper must hand its process image to the resolved kubectl, with
+// argv[0] the binary, the caller's arguments after it and the resolved
+// KUBECONFIG in the environment, rather than fork a child and wait on it. The
+// staged kubectl is a script that leaves a marker when run, so a child spawned
+// past the seam is caught.
+func TestKubectlExecsInPlace(t *testing.T) {
+	workDir := t.TempDir()
+	kubeconfig := executor.KubeconfigPath(workDir)
+	bin := executor.KubectlPath(workDir)
+	marker := filepath.Join(t.TempDir(), "child-ran")
+	for path, body := range map[string]string{
+		kubeconfig: "apiVersion: v1\nkind: Config\n",
+		bin:        "#!/bin/sh\ntouch '" + marker + "'\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("K3SM_WORK_DIR", workDir)
+	t.Setenv("KUBECONFIG", "/elsewhere")
+
+	var (
+		calls   int
+		gotBin  string
+		gotArgv []string
+		gotEnv  []string
+	)
+	prev := kubectlExec
+	kubectlExec = func(bin string, argv, env []string) error {
+		calls++
+		gotBin, gotArgv, gotEnv = bin, argv, env
+		return nil
+	}
+	t.Cleanup(func() { kubectlExec = prev })
+
+	if err := runKubectl([]string{"get", "pods", "-A"}); err != nil {
+		t.Fatalf("runKubectl: %v", err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("kubectl ran as a child process; want the wrapper to exec it in place")
+	}
+	if calls != 1 {
+		t.Fatalf("exec called %d times, want 1", calls)
+	}
+	if gotBin != bin {
+		t.Errorf("exec binary = %q, want %q", gotBin, bin)
+	}
+	if want := []string{bin, "get", "pods", "-A"}; !reflect.DeepEqual(gotArgv, want) {
+		t.Errorf("exec argv = %q, want %q", gotArgv, want)
+	}
+	var kubeconfigs []string
+	for _, kv := range gotEnv {
+		if strings.HasPrefix(kv, "KUBECONFIG=") {
+			kubeconfigs = append(kubeconfigs, kv)
+		}
+	}
+	if want := []string{"KUBECONFIG=" + kubeconfig}; !reflect.DeepEqual(kubeconfigs, want) {
+		t.Errorf("exec env KUBECONFIG entries = %q, want exactly %q", kubeconfigs, want)
+	}
+}
+
+// TestKubectlExecFailure returns the exec error wrapped, so a kubectl that
+// cannot be started is reported rather than swallowed.
+func TestKubectlExecFailure(t *testing.T) {
+	workDir := t.TempDir()
+	for _, path := range []string{executor.KubeconfigPath(workDir), executor.KubectlPath(workDir)} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("K3SM_WORK_DIR", workDir)
+	prev := kubectlExec
+	kubectlExec = func(string, []string, []string) error { return os.ErrPermission }
+	t.Cleanup(func() { kubectlExec = prev })
+
+	err := runKubectl(nil)
+	if !errors.Is(err, os.ErrPermission) || !strings.Contains(err.Error(), "exec kubectl") {
+		t.Fatalf("runKubectl error = %v, want a wrapped exec failure", err)
+	}
+}
+
+func TestEnvWithKubeconfig(t *testing.T) {
+	tests := []struct {
+		name string
+		env  []string
+		path string
+		want []string
+	}{
+		{
+			name: "no ambient entry gains the resolved one",
+			env:  []string{"HOME=/Users/alice", "PATH=/usr/bin"},
+			path: "/var/lib/k3sm/server/kubeconfig",
+			want: []string{"HOME=/Users/alice", "PATH=/usr/bin", "KUBECONFIG=/var/lib/k3sm/server/kubeconfig"},
+		},
+		{
+			name: "one ambient entry is replaced",
+			env:  []string{"KUBECONFIG=/elsewhere", "HOME=/Users/alice"},
+			path: "/var/lib/k3sm/server/kubeconfig",
+			want: []string{"HOME=/Users/alice", "KUBECONFIG=/var/lib/k3sm/server/kubeconfig"},
+		},
+		{
+			name: "two ambient entries are both dropped",
+			env:  []string{"KUBECONFIG=/a", "HOME=/Users/alice", "KUBECONFIG=/b"},
+			path: "/var/lib/k3sm/server/kubeconfig",
+			want: []string{"HOME=/Users/alice", "KUBECONFIG=/var/lib/k3sm/server/kubeconfig"},
+		},
+		{
+			name: "empty resolved path keeps the ambient entry",
+			env:  []string{"KUBECONFIG=/elsewhere", "HOME=/Users/alice"},
+			path: "",
+			want: []string{"KUBECONFIG=/elsewhere", "HOME=/Users/alice"},
+		},
+		{
+			name: "a lookalike key is kept",
+			env:  []string{"KUBECONFIG_EXTRA=/x"},
+			path: "/k",
+			want: []string{"KUBECONFIG_EXTRA=/x", "KUBECONFIG=/k"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := envWithKubeconfig(tt.env, tt.path); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("envWithKubeconfig = %q, want %q", got, tt.want)
 			}
 		})
 	}
