@@ -26,8 +26,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -139,6 +143,89 @@ func TestMarkNodeObject(t *testing.T) {
 		}
 		if n := get(t, cs); !n.Spec.Unschedulable {
 			t.Error("start uncordoned a node the stop did not cordon")
+		}
+	})
+	t.Run("a concurrent writer's 409 re-runs the Get-decide-Patch", func(t *testing.T) {
+		stopped, err := json.Marshal(stopAnnotation{Actor: "user", Reason: "plane", At: now, Cordoned: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cs := fake.NewClientset(&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "k3sm-mac", ResourceVersion: "7", Annotations: map[string]string{StoppedByUserAnnotation: string(stopped)}},
+			Spec:       corev1.NodeSpec{Unschedulable: true},
+		})
+		var bodies []string
+		cs.PrependReactor("patch", "nodes", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			bodies = append(bodies, string(a.(k8stesting.PatchAction).GetPatch()))
+			if len(bodies) == 1 {
+				return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "nodes"}, "k3sm-mac", errors.New("the object has been modified"))
+			}
+			return false, nil, nil
+		})
+		if err := markNodeObject(ctx, cs, "k3sm-mac", false, "user", "home", now); err != nil {
+			t.Fatalf("markNodeObject after one conflict: %v", err)
+		}
+		if len(bodies) != 2 {
+			t.Fatalf("patched %d times, want 2 (a 409, then the retry): %q", len(bodies), bodies)
+		}
+		gets := 0
+		for _, a := range cs.Actions() {
+			if a.GetVerb() == "get" {
+				gets++
+			}
+		}
+		if gets != 2 {
+			t.Errorf("read the node %d times, want 2: the retry must decide on a fresh Get", gets)
+		}
+		for _, b := range bodies {
+			if !strings.Contains(b, `"resourceVersion":"7"`) {
+				t.Errorf("patch body lacks the resourceVersion the decision was made on: %s", b)
+			}
+		}
+		if n := get(t, cs); n.Spec.Unschedulable {
+			t.Error("the node is still cordoned after the retried uncordon")
+		}
+	})
+	t.Run("a 409 whose re-read finds the annotation gone re-decides to a no-op", func(t *testing.T) {
+		stopped, err := json.Marshal(stopAnnotation{Actor: "user", Reason: "plane", At: now, Cordoned: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cs := fake.NewClientset(&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "k3sm-mac", ResourceVersion: "7", Annotations: map[string]string{StoppedByUserAnnotation: string(stopped)}},
+			Spec:       corev1.NodeSpec{Unschedulable: true},
+		})
+		gets := 0
+		cs.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+			gets++
+			if gets == 1 {
+				return false, nil, nil
+			}
+			// A concurrent writer (an earlier start) already removed the
+			// annotation; the node is cordoned for some other reason now.
+			return true, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "k3sm-mac", ResourceVersion: "8"}, Spec: corev1.NodeSpec{Unschedulable: true}}, nil
+		})
+		var bodies []string
+		cs.PrependReactor("patch", "nodes", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			bodies = append(bodies, string(a.(k8stesting.PatchAction).GetPatch()))
+			return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "nodes"}, "k3sm-mac", errors.New("the object has been modified"))
+		})
+		if err := markNodeObject(ctx, cs, "k3sm-mac", false, "user", "home", now); err != nil {
+			t.Fatalf("markNodeObject: %v", err)
+		}
+		if gets != 2 {
+			t.Errorf("read the node %d times, want 2 (the 409 re-runs the Get)", gets)
+		}
+		if len(bodies) != 1 {
+			t.Fatalf("patched %d times, want 1: the re-read has no annotation, so the retry must not patch: %q", len(bodies), bodies)
+		}
+		var patch struct {
+			Metadata struct {
+				ResourceVersion string `json:"resourceVersion"`
+			} `json:"metadata"`
+		}
+		if err := json.Unmarshal([]byte(bodies[0]), &patch); err != nil || patch.Metadata.ResourceVersion != "7" {
+			t.Errorf("patch body metadata.resourceVersion = %q (%v), want \"7\": %s", patch.Metadata.ResourceVersion, err, bodies[0])
 		}
 	})
 	t.Run("start with no annotation changes nothing", func(t *testing.T) {

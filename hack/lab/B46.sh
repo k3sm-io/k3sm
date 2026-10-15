@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2029,SC2329 # the remote commands expand on the client by design; the EXIT trap calls cleanup and the verdict
 # k3sm B46 lab gate: real memory pressure on the control-plane Mac, two legs.
 #
 #   Leg 1 (eviction acts first): a BestEffort native pod fills incompressible
@@ -55,6 +56,9 @@
 #                               (default "kine kube-apiserver kube-controller-manager
 #                               kube-scheduler zot")
 #   K3SM_ARTIFACT, K3SM_RC_TAG  the binary under test, for the run-log header
+#   K3SM_LAB_TOLERATE_KEYS      extra taint keys every lab pod tolerates, space-separated
+#                               (hack/lab/lib/tolerations.sh)
+#   K3SM_LAB_PRINT_MANIFESTS=1  print the fill pod manifests and exit; contacts nothing
 #
 # Workload delivery: the fill and the pcontrol reader are tiny C programs
 # compiled on the server with cc into K3SM_B46_REMOTE_DIR, ad-hoc signed, and
@@ -81,7 +85,7 @@ while [ $# -gt 0 ]; do
 		LEG="$2"; shift 2 ;;
 	--leg=*) LEG="${1#--leg=}"; shift ;;
 	--self-test) SELF_TEST=yes; shift ;;
-	-h|--help) sed -n '2,60p' "$SELF"; exit 0 ;;
+	-h|--help) sed -n '3,64p' "$SELF"; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -97,7 +101,7 @@ if [ "$SELF_TEST" = yes ]; then
 	for args in "" "--leg 1" "--leg 2"; do
 		rc=0
 		# shellcheck disable=SC2086
-		out="$(env -u K3SM_LAB bash "$SELF" $args 2>&1)" || rc=$?
+		out="$(env -u K3SM_LAB -u K3SM_LAB_PRINT_MANIFESTS bash "$SELF" $args 2>&1)" || rc=$?
 		if [ "$rc" -ne 3 ]; then
 			echo "self-test: '$args' with K3SM_LAB unset exited $rc, want 3" >&2; bad=1
 		fi
@@ -110,6 +114,41 @@ if [ "$SELF_TEST" = yes ]; then
 		echo "B46 self-test: FAIL"; exit 1
 	fi
 	echo "B46 self-test: PASS (unset K3SM_LAB -> exit 3 + '$PENDING_TEXT')"
+	exit 0
+fi
+
+# ── The fill pod manifest ─────────────────────────────────────────────────────────
+# shellcheck source-path=SCRIPTDIR source=lib/tolerations.sh
+. "$HERE/lib/tolerations.sh"
+LAB_TOLERATIONS="$(lab_tolerations_yaml NoSchedule)" || exit 2
+
+# fill_pod_manifest <namespace> <name> <priority line>: the fill pod, pinned to the
+# server node. It reads NODE, WALL, RDIR, RATE_MIB, CEILING_BYTES and RUN_TOKEN.
+fill_pod_manifest() {
+	cat <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: $2, namespace: $1, labels: {k3sm.io/lab: b46}}
+spec:
+  nodeName: $NODE
+  nodeSelector: {kubernetes.io/os: darwin}
+  tolerations: [$LAB_TOLERATIONS]
+  restartPolicy: Never
+  activeDeadlineSeconds: $WALL
+$3
+  containers:
+  - name: fill
+    image: native
+    command: ["$RDIR/b46-fill", "$RATE_MIB", "$CEILING_BYTES", "95", "$WALL", "$RUN_TOKEN-$2"]
+EOF
+}
+
+if [ "${K3SM_LAB_PRINT_MANIFESTS:-}" = 1 ]; then
+	NODE="<server-node>" WALL=1200 RDIR=/var/tmp/k3sm-b46 RATE_MIB=256 CEILING_BYTES="<ceiling>" RUN_TOKEN=b46-print
+	lab_tolerations_header
+	fill_pod_manifest default b46-fill-1 ""
+	echo "---"
+	fill_pod_manifest kube-system b46-fill-2 "  priorityClassName: system-node-critical"
 	exit 0
 fi
 
@@ -169,6 +208,7 @@ emit_run_log_header() {
 	for r in apis runtimed darwin-net k3sm; do echo "git_sha.$r: $(repo_git_sha "$r")"; done
 	echo "started_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	echo "evidence_dir: $EV"
+	lab_tolerations_header
 	echo "result: FAIL (provisional; the final result line below is the verdict, and a log that ends here did not finish)"
 }
 emit_run_log_verdict() {
@@ -468,25 +508,10 @@ nohup '$RDIR/b46-deadman-$leg' $((WALL + 300)) >/dev/null 2>&1 &" >/dev/null 2>&
 disarm_deadman() { rsudo "disarm-$1" "pkill -f '[b]46-deadman-$1' || true" >/dev/null 2>&1 || true; }
 
 # ── The fill pod ──────────────────────────────────────────────────────────────────
+# make_fill_pod <namespace> <name> <priority line>: apply fill_pod_manifest.
 make_fill_pod() {
-	local ns="$1" name="$2" prio_line="$3"
-	kc apply -f - >/dev/null <<EOF
-apiVersion: v1
-kind: Pod
-metadata: {name: $name, namespace: $ns, labels: {k3sm.io/lab: b46}}
-spec:
-  nodeName: $NODE
-  nodeSelector: {kubernetes.io/os: darwin}
-  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
-  restartPolicy: Never
-  activeDeadlineSeconds: $WALL
-$prio_line
-  containers:
-  - name: fill
-    image: native
-    command: ["$RDIR/b46-fill", "$RATE_MIB", "$CEILING_BYTES", "95", "$WALL", "$RUN_TOKEN-$name"]
-EOF
-	FILL_PODS="$FILL_PODS $ns/$name"
+	fill_pod_manifest "$1" "$2" "$3" | kc apply -f - >/dev/null
+	FILL_PODS="$FILL_PODS $1/$2"
 }
 wait_running() {
 	local ns="$1" name="$2"

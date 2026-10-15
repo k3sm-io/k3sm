@@ -598,9 +598,12 @@ func shrinkRestartBudgets(t *testing.T) {
 	// window the budget cannot contain.
 	observationOrig := agentRecoveryObservation
 	agentRecoveryObservation = time.Millisecond
+	uncordonOrig := uncordonBudget
+	uncordonBudget = tiny
 	t.Cleanup(func() {
 		netdRestartBudget, serverRestartBudget, agentJoinBudget = netdOrig, serverOrig, joinOrig
 		agentRecoveryObservation = observationOrig
+		uncordonBudget = uncordonOrig
 	})
 }
 

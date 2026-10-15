@@ -23,10 +23,14 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // The node lifecycle: `k3sm stop`, `k3sm start`, `k3sm restart`, and how
@@ -47,6 +51,18 @@ import (
 // 0644 so an unprivileged `k3sm status` can read it. It is a var so tests can
 // point it elsewhere.
 var DefaultStopMarkerPath = "/Library/Preferences/io.k3sm.stop.json"
+
+// DefaultUncordonPendingName is the file name of the uncordon-pending marker,
+// beside the stop marker (same directory, same 0644 write path): a start
+// whose uncordon ran out of budget writes it, and a later start on the
+// running node, which finds it, runs the full uncordon budget again.
+const DefaultUncordonPendingName = "io.k3sm.uncordon-pending.json"
+
+// uncordonPending is the uncordon-pending marker's content.
+type uncordonPending struct {
+	Actor string    `json:"actor"`
+	At    time.Time `json:"at"`
+}
 
 // StopPhase is the stop marker's phase.
 type StopPhase string
@@ -292,6 +308,144 @@ func markNode(ctx context.Context, cfg Config, stopped bool, actor, reason strin
 	cfg.Logger.Info("did " + what)
 }
 
+// uncordonBudget bounds the start-time uncordon: running is the whole retry
+// window, poll the pause between attempts; each attempt is still bounded by
+// markNodeTimeout. 90s covers a worker whose mesh comes up some 20s after its
+// node daemon and a server whose cold kine and apiserver take longer than one
+// attempt. A var so a test can shrink it.
+var uncordonBudget = restartBudget{running: 90 * time.Second, poll: 2 * time.Second}
+
+// ErrNodeStillCordoned is returned by Start when the daemons are up but the
+// uncordon did not land within uncordonBudget. Re-running `k3sm start`
+// repairs it: a start on a running node still runs the uncordon.
+var ErrNodeStillCordoned = errors.New("the daemons are up but the node is still cordoned; re-run `sudo k3sm start` to uncordon it")
+
+// ErrNodeIdentity marks a Config.MarkNode failure to work out which Node this
+// Mac is or which credential reaches it (for example, a worker holding no
+// usable credential). It is read from local files, so retrying cannot fix it.
+var ErrNodeIdentity = errors.New("cannot determine this node's cluster identity")
+
+// awaitMarkNode runs cfg.MarkNode until it succeeds, retrying the failures
+// that mean the apiserver is not answering yet (see markNodeErrorClass), and
+// stopping at once on one that a retry cannot fix. The whole wait is bounded
+// by b.running on top of ctx, so a caller holding context.Background (`k3sm
+// restart --start`) is bounded too; each attempt is bounded by
+// markNodeTimeout. Exhausting the budget returns ErrNodeStillCordoned
+// wrapping the last error. It logs nothing above Debug: the caller owns the
+// one line that reports the outcome.
+func awaitMarkNode(ctx context.Context, cfg Config, stopped bool, actor, reason string, b restartBudget) error {
+	if cfg.MarkNode == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.running)
+	defer cancel()
+	for attempt := 1; ; attempt++ {
+		actx, acancel := context.WithTimeout(ctx, markNodeTimeout)
+		err := cfg.MarkNode(actx, stopped, actor, reason)
+		acancel()
+		if err == nil {
+			return nil
+		}
+		class, retry := markNodeErrorClass(err)
+		if !retry {
+			return fmt.Errorf("the node was not uncordoned (%s, not retried): %w", class, err)
+		}
+		cfg.Logger.Debug("the uncordon did not land yet; retrying", "attempt", attempt, "class", class, "err", err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w (gave up after %d attempts within %s; last error, %s: %w)", ErrNodeStillCordoned, attempt, b.running, class, err)
+		case <-time.After(b.poll):
+		}
+	}
+}
+
+// uncordonPendingPresent reports whether the uncordon-pending marker is on
+// disk. A marker that cannot be read counts as present: the cost of a wrong
+// yes is one bounded retry, of a wrong no a node left cordoned.
+func uncordonPendingPresent(sys System, cfg Config) bool {
+	_, err := sys.ReadStopMarker(cfg.UncordonPendingMarker)
+	return err == nil || !errors.Is(err, fs.ErrNotExist)
+}
+
+// writeUncordonPending records that the uncordon ran out of budget.
+func writeUncordonPending(sys System, cfg Config, actor string, now time.Time) error {
+	data, err := json.Marshal(uncordonPending{Actor: actor, At: now.UTC()})
+	if err != nil {
+		return err
+	}
+	if err := sys.WriteStopMarker(cfg.UncordonPendingMarker, data); err != nil {
+		return fmt.Errorf("write the uncordon-pending marker %s: %w", cfg.UncordonPendingMarker, err)
+	}
+	return nil
+}
+
+// clearUncordonPending removes the uncordon-pending marker when it is there.
+func clearUncordonPending(sys System, cfg Config) error {
+	if !uncordonPendingPresent(sys, cfg) {
+		return nil
+	}
+	if err := sys.RemoveStopMarker(cfg.UncordonPendingMarker); err != nil {
+		return fmt.Errorf("remove the uncordon-pending marker %s: %w", cfg.UncordonPendingMarker, err)
+	}
+	return nil
+}
+
+// markNodeErrorClass names the class of a Config.MarkNode error and says
+// whether a retry can fix it. A rejected identity (Forbidden, Unauthorized,
+// ErrNodeIdentity) cannot. The classes that mean the apiserver is not ready
+// yet are retried: a timeout or deadline, a refused or reset connection, a
+// DNS failure (the mesh name is not up), NotFound (the Node's registration is
+// still pending), ServiceUnavailable, TooManyRequests, and Conflict (a
+// concurrent writer won the update). Any other 4xx status is a definitive
+// rejection from a live apiserver and is not retried. Anything else (a 5xx,
+// a transport error) is retried within the budget too, because a starting apiserver fails in more transport shapes
+// (EOF, a TLS handshake cut short) than are worth enumerating.
+func markNodeErrorClass(err error) (class string, retry bool) {
+	var dnsErr *net.DNSError
+	var netErr net.Error
+	switch {
+	case errors.Is(err, ErrNodeIdentity):
+		return "identity", false
+	case apierrors.IsForbidden(err):
+		return "forbidden", false
+	case apierrors.IsUnauthorized(err):
+		return "unauthorized", false
+	case apierrors.IsNotFound(err):
+		return "not-found", true
+	case apierrors.IsConflict(err):
+		return "conflict", true
+	case apierrors.IsServiceUnavailable(err):
+		return "unavailable", true
+	case apierrors.IsTooManyRequests(err):
+		return "too-many-requests", true
+	case rejectedByAPIServer(err):
+		return "rejected", false
+	case apierrors.IsTimeout(err), apierrors.IsServerTimeout(err), errors.Is(err, context.DeadlineExceeded):
+		return "timeout", true
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection-refused", true
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection-reset", true
+	case errors.As(err, &dnsErr):
+		return "dns", true
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout", true
+	}
+	return "other", true
+}
+
+// rejectedByAPIServer reports whether err is a 4xx status other than 404, 409
+// and 429 (BadRequest, Invalid, MethodNotSupported and the like): a definitive
+// answer from a live apiserver, which the same request will get again.
+func rejectedByAPIServer(err error) bool {
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+	code := status.Status().Code
+	return code >= 400 && code < 500 && code != 404 && code != 409 && code != 429
+}
+
 // joinedWorkersTimeout bounds the joined-worker count a server stop makes. A
 // var so a test can shrink it.
 var joinedWorkersTimeout = 5 * time.Second
@@ -420,6 +574,11 @@ func Stop(ctx context.Context, sys System, cfg Config, actor, reason string) err
 	}
 	// 2.
 	markNode(ctx, cfg, true, actor, reason)
+	// A stop supersedes any uncordon a start left pending: the next start
+	// uncordons from the stop's own annotation.
+	if err := clearUncordonPending(sys, cfg); err != nil {
+		cfg.Logger.Warn("could not remove the uncordon-pending marker", "err", err)
+	}
 	// 3.
 	var left []LeftoverItem
 	for _, label := range d.node {
