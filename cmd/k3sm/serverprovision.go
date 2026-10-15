@@ -225,6 +225,12 @@ func preflightServer(opts *serverOptions, workDirErr error, logger *slog.Logger)
 	if opts.clusterReset {
 		return nil, mode, true, runClusterReset(*opts, logger)
 	}
+	// --tls-san: an invalid name is refused here, after the maintenance exits
+	// above so a bad name never blocks them; a single-node server and an IP this
+	// Mac no longer holds are only warned about (checkServerTLSSANs).
+	if err := checkServerTLSSANs(opts.tlsSANs, opts.meshIP, install.DefaultServiceCIDR, logger); err != nil {
+		return nil, mode, true, err
+	}
 	// runtimed's on-disk root is the work-dir's parent (so the SBPL Posture.WorkDir
 	// resides under the daemon home and its containment check is active).
 	if opts.podRoot == "" {
@@ -389,7 +395,7 @@ func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Lo
 	// two HA servers no longer share a pod /24; the rewrite still keeps the
 	// advertised address the one the peers route to.)
 	opts.nodeIP = meshNodeIP(*opts)
-	servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP)
+	servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP, opts.tlsSANs)
 	if err != nil {
 		return nil, "", err
 	}

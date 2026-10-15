@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,7 +29,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -132,8 +135,18 @@ func runCertificateRotate(args []string) error {
 		if err != nil {
 			return err
 		}
+		// The restarted server reissues the apiserver leaf from its own argv, which
+		// carries the recorded --tls-san names; the rotation checks the new leaf
+		// still names every one, so a rotation can never silently drop them.
+		sans, err := install.InstalledTLSSANs(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath)
+		if err != nil {
+			return fmt.Errorf("read the recorded --%s names (needed to verify the reissued apiserver certificate keeps them): %w", install.TLSSANFlag, err)
+		}
 		opts.Health = func(ctx context.Context) error {
-			return probeAPIServerServing(ctx, addr, anchor, anchorPath)
+			if err := probeAPIServerServing(ctx, addr, anchor, anchorPath); err != nil {
+				return err
+			}
+			return servingCertCarriesSANs(certs.APIServerServingCertPath(*workDir), sans)
 		}
 		opts.HealthTimeout = rotateProbeDeadline
 		return certificateRotate(context.Background(), os.Stdout, opts, addr)
@@ -168,6 +181,40 @@ func apiServerProbeAddr(read func(string) ([]byte, error), plistPath, recordPath
 		host = ip.String()
 	}
 	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
+// servingCertCarriesSANs reports an error naming the first of sans (the
+// recorded --tls-san names) the apiserver serving certificate at certPath does
+// not carry. No names is nil without reading the file: a server without
+// --tls-san may have no cluster-CA-signed leaf at all (single-node).
+func servingCertCarriesSANs(certPath string, sans []string) error {
+	if len(sans) == 0 {
+		return nil
+	}
+	raw, err := os.ReadFile(certPath)
+	if err != nil {
+		return fmt.Errorf("read the reissued apiserver serving certificate: %w", err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return fmt.Errorf("apiserver serving certificate %s holds no certificate", certPath)
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse the apiserver serving certificate %s: %w", certPath, err)
+	}
+	for _, san := range sans {
+		if ip := net.ParseIP(san); ip != nil {
+			if !slices.ContainsFunc(leaf.IPAddresses, ip.Equal) {
+				return fmt.Errorf("the reissued apiserver serving certificate %s does not carry the recorded --%s %s", certPath, install.TLSSANFlag, san)
+			}
+			continue
+		}
+		if !slices.Contains(leaf.DNSNames, strings.ToLower(san)) {
+			return fmt.Errorf("the reissued apiserver serving certificate %s does not carry the recorded --%s %s", certPath, install.TLSSANFlag, san)
+		}
+	}
+	return nil
 }
 
 // certificateRotate runs the rotation and renders its report to out. It binds the
