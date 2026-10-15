@@ -17,10 +17,14 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	runtimed "k3sm.io/runtimed/pkg/runtime"
@@ -168,6 +172,167 @@ func TestTeardownPodGroupsUsesTheChildIdentity(t *testing.T) {
 			}
 			if !slices.Equal(got, tt.want) {
 				t.Fatalf("pod teardown = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// survivorFake is fakeSystem plus the per-process seam (survivorProcs): starts
+// and sids are the live process table by pid, the sweeper runs as pid
+// sweeperPid in session sweeperSid, and every single-process signal is
+// recorded as "Kill:<pid>:<sig>" in the same call log as the group signals.
+type survivorFake struct {
+	*fakeSystem
+	starts map[int]int64
+	sids   map[int]int
+}
+
+const sweeperPid, sweeperSid = 90, 90
+
+func (s survivorFake) ProcessSession(pid int) (int, bool) {
+	sid, ok := s.sids[pid]
+	return sid, ok
+}
+
+func (s survivorFake) Self() (int, int) { return sweeperPid, sweeperSid }
+
+func (s survivorFake) ProcessStart(pid int) (int64, bool) {
+	start, ok := s.starts[pid]
+	return start, ok
+}
+
+func (s survivorFake) SignalProcess(pid int, sig syscall.Signal) error {
+	name := map[syscall.Signal]string{syscall.SIGTERM: "TERM", syscall.SIGKILL: "KILL"}[sig]
+	s.calls = append(s.calls, fmt.Sprintf("Kill:%d:%s", pid, name))
+	return nil
+}
+
+// TestPodGroupSweepKillsRecordedSurvivors pins that the stop/uninstall pod
+// sweep finishes what the runtime's teardown could not: a record's Survivors
+// (processes of the container's tree that outlived its kill, a setsid escapee
+// among them) are SIGKILLed while each pid still reports exactly its recorded
+// start time and its live session is the recorded one (never the sweeper's),
+// even though the record's leader and group are gone. A survivor that leads
+// its own session is killed with its group under the same guard. A recycled
+// pid, a session mismatch, the sweeper's own pid and pid 1 are never
+// signalled, the leader path is unchanged beside them, and a record written
+// before the field existed decodes with none.
+func TestPodGroupSweepKillsRecordedSurvivors(t *testing.T) {
+	gone := runtimed.PodReapRecord{PodID: "uid-a", Container: "c0", Pgid: 601, StartUnixNano: 111}
+	withSurvivors := func(rec runtimed.PodReapRecord, ss ...runtimed.ReapSurvivor) runtimed.PodReapRecord {
+		rec.Survivors = ss
+		return rec
+	}
+	var old runtimed.PodReapRecord
+	if err := json.Unmarshal([]byte(`{"podId":"uid-a","container":"c0","pgid":601,"startUnixNano":111}`), &old); err != nil {
+		t.Fatalf("decode a record without survivors: %v", err)
+	}
+	tests := []struct {
+		name       string
+		recs       []runtimed.PodReapRecord
+		leaders    map[int]int64
+		starts     map[int]int64
+		sids       map[int]int
+		want       []string
+		wantKilled string
+	}{
+		{
+			name:       "survivor alive with its recorded start: killed and counted",
+			recs:       []runtimed.PodReapRecord{withSurvivors(gone, runtimed.ReapSurvivor{Pid: 700, StartUnixNano: 222, Sid: 601})},
+			starts:     map[int]int64{700: 222},
+			sids:       map[int]int{700: 601},
+			want:       []string{"Kill:700:KILL"},
+			wantKilled: "killed=1",
+		},
+		{
+			name:       "survivor leading its own session: its group is killed under the same guard",
+			recs:       []runtimed.PodReapRecord{withSurvivors(gone, runtimed.ReapSurvivor{Pid: 800, StartUnixNano: 333, Sid: 800})},
+			leaders:    map[int]int64{800: 333},
+			starts:     map[int]int64{800: 333},
+			sids:       map[int]int{800: 800},
+			want:       []string{"Signal:800:KILL"},
+			wantKilled: "killed=1",
+		},
+		{
+			name:    "survivor pid recycled to another process: skipped, not signalled",
+			recs:    []runtimed.PodReapRecord{withSurvivors(gone, runtimed.ReapSurvivor{Pid: 700, StartUnixNano: 222, Sid: 700})},
+			leaders: map[int]int64{700: 999},
+			starts:  map[int]int64{700: 999},
+		},
+		{
+			name:   "survivor start matches but its session is not the recorded one: skipped",
+			recs:   []runtimed.PodReapRecord{withSurvivors(gone, runtimed.ReapSurvivor{Pid: 700, StartUnixNano: 222, Sid: 601})},
+			starts: map[int]int64{700: 222},
+			sids:   map[int]int{700: 650},
+		},
+		{
+			name:   "survivor in the sweeper's own session: skipped",
+			recs:   []runtimed.PodReapRecord{withSurvivors(gone, runtimed.ReapSurvivor{Pid: 700, StartUnixNano: 222, Sid: sweeperSid})},
+			starts: map[int]int64{700: 222},
+			sids:   map[int]int{700: sweeperSid},
+		},
+		{
+			name:   "survivor naming the sweeper's own pid: skipped",
+			recs:   []runtimed.PodReapRecord{withSurvivors(gone, runtimed.ReapSurvivor{Pid: sweeperPid, StartUnixNano: 222, Sid: 601})},
+			starts: map[int]int64{sweeperPid: 222},
+			sids:   map[int]int{sweeperPid: 601},
+		},
+		{
+			name:    "survivor naming pid 1: skipped",
+			recs:    []runtimed.PodReapRecord{withSurvivors(gone, runtimed.ReapSurvivor{Pid: 1, StartUnixNano: 222, Sid: 1})},
+			leaders: map[int]int64{1: 222},
+			starts:  map[int]int64{1: 222},
+			sids:    map[int]int{1: 1},
+		},
+		{
+			name:   "survivor already gone: not signalled",
+			recs:   []runtimed.PodReapRecord{withSurvivors(gone, runtimed.ReapSurvivor{Pid: 700, StartUnixNano: 222})},
+			starts: map[int]int64{},
+		},
+		{
+			name: "a live leader beside a survivor record: the leader path is unchanged",
+			recs: []runtimed.PodReapRecord{
+				{PodID: "uid-b", Container: "c0", Pgid: 501, StartUnixNano: 444},
+				withSurvivors(gone, runtimed.ReapSurvivor{Pid: 700, StartUnixNano: 222, Sid: 601}, runtimed.ReapSurvivor{Pid: 701, StartUnixNano: 555, Sid: 601}),
+			},
+			leaders:    map[int]int64{501: 444},
+			starts:     map[int]int64{700: 222, 701: 556},
+			sids:       map[int]int{700: 601, 701: 601},
+			want:       []string{"Kill:700:KILL", "Signal:501:TERM", "WaitGone:501:10s"},
+			wantKilled: "killed=1",
+		},
+		{
+			name:   "a record written before the field existed: decodes with none, no-op",
+			recs:   []runtimed.PodReapRecord{old},
+			starts: map[int]int64{601: 111},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			f := survivorFake{
+				fakeSystem: &fakeSystem{podReap: tt.recs, podLeaders: tt.leaders},
+				starts:     tt.starts,
+				sids:       tt.sids,
+			}
+			cfg := Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			if err := teardownPodGroups(context.Background(), f, cfg); err != nil {
+				t.Fatalf("teardownPodGroups: %v", err)
+			}
+			var got []string
+			for _, c := range f.calls {
+				if strings.HasPrefix(c, "Signal:") || strings.HasPrefix(c, "WaitGone:") || strings.HasPrefix(c, "Kill:") {
+					got = append(got, c)
+				}
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("pod sweep = %v, want %v", got, tt.want)
+			}
+			if tt.wantKilled != "" && !strings.Contains(logs.String(), tt.wantKilled) {
+				t.Errorf("no %q in the sweep's log:\n%s", tt.wantKilled, logs.String())
+			}
+			if tt.wantKilled == "" && strings.Contains(logs.String(), "killed=") {
+				t.Errorf("a survivor kill was logged with nothing to kill:\n%s", logs.String())
 			}
 		})
 	}
