@@ -325,11 +325,19 @@ func (r *runtimedRuntime) restartContainerReason(ctx context.Context, podID, con
 			// FAILURE_REASON_UNSUPPORTED. Both are the same permanent condition for
 			// this pod. Any other refusal (a pod being stopped, NOT_UPDATABLE) is
 			// transient and keeps the plain retry.
-			unsupported: e.GetCode() == int32(codes.Unimplemented) ||
-				resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED,
+			unsupported: isUnsupportedRefusal(e.GetCode(), resp.GetFailureReason()),
 		}
 	}
 	return nil
+}
+
+// isUnsupportedRefusal reports whether a typed refusal in a runtimed response is
+// the permanent "this pod's backend cannot do that" answer: the embedded
+// codes.Unimplemented an older daemon gives a vm pod, or FAILURE_REASON_UNSUPPORTED
+// whatever the code. It is the one classification both per-container kill verbs
+// use; the text of the refusal never decides it.
+func isUnsupportedRefusal(code int32, reason runtimev1.FailureReason) bool {
+	return code == int32(codes.Unimplemented) || reason == runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED
 }
 
 // msgRestartUnsupported is the remedy appended to runtimed's text when it refuses
@@ -358,15 +366,6 @@ func (f *restartFailure) Error() string {
 }
 
 func (f *restartFailure) Unwrap() error { return f.cause }
-
-// surface is the text the Failed Event and the CrashLoopBackOff waiting message
-// carry: runtimed's message, plus the remedy for a permanent refusal.
-func (f *restartFailure) surface() string {
-	if f.unsupported {
-		return f.message + " (" + msgRestartUnsupported + ")"
-	}
-	return f.message
-}
 
 // startDiedContainer is the StartContainer RPC for a container of a re-attached
 // pod that died while the node daemon was down (respawn). The request carries no
@@ -416,7 +415,7 @@ func (r *runtimedRuntime) stopContainerReason(ctx context.Context, podID, contai
 		return fmt.Errorf("runtimed stop container %s/%s: %w", podID, container, err)
 	}
 	e := resp.GetError()
-	if e.GetCode() == int32(codes.Unimplemented) || resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED {
+	if isUnsupportedRefusal(e.GetCode(), resp.GetFailureReason()) {
 		return fmt.Errorf("runtimed stop container %s/%s: %w: %s", podID, container, errStopUnsupported, e.GetMessage())
 	}
 	if e != nil && e.GetCode() != 0 {

@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
@@ -877,4 +878,87 @@ func TestRefusedRestartIsVisible(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIsUnsupportedRefusal pins the one classification of a permanent refusal
+// both per-container kill verbs share: the typed reason or the embedded
+// Unimplemented, never any other code.
+func TestIsUnsupportedRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		code   codes.Code
+		reason runtimev1.FailureReason
+		want   bool
+	}{
+		{"a guest without the verb", codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED, true},
+		{"an older daemon", codes.Unimplemented, runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED, true},
+		{"embedded Unimplemented without a reason", codes.Unimplemented, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, true},
+		{"UNSUPPORTED without a code", codes.OK, runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED, true},
+		{"a container that never started", codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE, false},
+		{"a pod being stopped", codes.FailedPrecondition, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, false},
+		{"an unknown container", codes.NotFound, runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, false},
+		{"no refusal", codes.OK, runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isUnsupportedRefusal(int32(tc.code), tc.reason); got != tc.want {
+				t.Errorf("isUnsupportedRefusal(%s, %s) = %v, want %v", tc.code, tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRefusedRestartCauseIsSanitizedAndBounded pins what reaches the Event and
+// the waiting message from runtimed's refusal text, which can embed text a
+// guest wrote: control characters (C0 except tab, DEL, C1) are stripped, and a
+// long cause is cut so the whole Event message stays within the apiserver's
+// Event message limit with the container prefix and the remedy kept.
+func TestRefusedRestartCauseIsSanitizedAndBounded(t *testing.T) {
+	refusal := func(msg string, unsupported bool) error {
+		return &restartFailure{podID: "p", container: "c0", message: msg, refused: true, unsupported: unsupported}
+	}
+
+	t.Run("control characters are stripped, tab kept", func(t *testing.T) {
+		got := restartFailureCause("c0", refusal("guest\x1b[31m said\r\nno\tthanks\x7f\u0085\u009b2J", false))
+		if want := "guest[31m saidno\tthanks2J"; got != want {
+			t.Errorf("cause = %q, want %q", got, want)
+		}
+	})
+
+	for _, unsupported := range []bool{false, true} {
+		t.Run(fmt.Sprintf("a 2000-byte cause is bounded (unsupported=%v)", unsupported), func(t *testing.T) {
+			name := strings.Repeat("n", 63) // the longest container name
+			cause := restartFailureCause(name, refusal(strings.Repeat("é", 1000), unsupported))
+			msg := msgFailedRestart(name, cause)
+			if len(msg) > maxEventMessageLen {
+				t.Errorf("Event message is %d bytes, want at most %d", len(msg), maxEventMessageLen)
+			}
+			if len(msg) < maxEventMessageLen-4 {
+				t.Errorf("Event message is %d bytes, want the cut to use the budget", len(msg))
+			}
+			if !strings.HasPrefix(msg, "Error: restart container "+name+": ") {
+				t.Errorf("Event message lost its container prefix: %q", msg[:64])
+			}
+			if !utf8.ValidString(msg) {
+				t.Error("the cut split a rune")
+			}
+			if !strings.Contains(msg, "...") {
+				t.Error("the cut is not marked")
+			}
+			if remedy := strings.HasSuffix(msg, " ("+msgRestartUnsupported+")"); remedy != unsupported {
+				t.Errorf("Event message ends with the remedy = %v, want %v", remedy, unsupported)
+			}
+		})
+	}
+
+	t.Run("a short cause is untouched", func(t *testing.T) {
+		if got := restartFailureCause("c0", refusal("pod is stopping", false)); got != "pod is stopping" {
+			t.Errorf("cause = %q", got)
+		}
+	})
+
+	t.Run("a non-refusal error is sanitized too", func(t *testing.T) {
+		if got := restartFailureCause("c0", errors.New("start\nfailed")); got != "startfailed" {
+			t.Errorf("cause = %q", got)
+		}
+	})
 }

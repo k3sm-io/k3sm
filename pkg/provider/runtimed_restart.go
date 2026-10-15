@@ -20,7 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
@@ -530,7 +533,7 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 		}
 		r.log.Warn("container re-exec failed; retrying under the CrashLoopBackOff schedule",
 			"pod", podID, "container", name, "err", err)
-		refusal := restartFailureText(err)
+		refusal := restartFailureCause(name, err)
 		r.recordPodEvent(podID, podEvent{corev1.EventTypeWarning, reasonFailed, msgFailedRestart(name, refusal)})
 		next, ok := r.advanceBackoff(t, cr, gen, refusal)
 		if !ok {
@@ -575,15 +578,59 @@ func (r *runtimedRuntime) finishAttempt(t *podTrack, cr *containerRestart, gen u
 	cr.endAttempt(gen)
 }
 
-// restartFailureText is the text a failed re-exec surfaces: runtimed's own
-// message (with the remedy for a permanent refusal) when the RestartContainer
-// call failed, the error itself otherwise (the StartContainer arm of respawn).
-func restartFailureText(err error) string {
+// restartFailureCause is the cause a failed re-exec of container surfaces, in
+// the Failed Event (msgFailedRestart) and after the CrashLoopBackOff waiting
+// message: runtimed's own message, with the remedy for a permanent refusal, when
+// the RestartContainer call failed; the error itself otherwise (the
+// StartContainer arm of respawn).
+//
+// runtimed's message can carry text a vm guest wrote, so control characters are
+// stripped before it is rendered, and the message alone is cut so the whole
+// Event message fits the apiserver's Event message limit with the container
+// prefix and the remedy intact.
+func restartFailureCause(container string, err error) string {
+	message, suffix := err.Error(), ""
 	var f *restartFailure
 	if errors.As(err, &f) {
-		return f.surface()
+		message = f.message
+		if f.unsupported {
+			suffix = " (" + msgRestartUnsupported + ")"
+		}
 	}
-	return err.Error()
+	budget := maxEventMessageLen - len(msgFailedRestart(container, "")) - len(suffix)
+	return truncateText(stripControlKeepTab(message), budget) + suffix
+}
+
+// maxEventMessageLen is the apiserver's limit on an Event message, in bytes.
+const maxEventMessageLen = 1024
+
+// stripControlKeepTab drops the C0 control characters except tab, DEL and the C1
+// range, so text from a guest cannot inject terminal escapes or line breaks into
+// `kubectl describe` output.
+func stripControlKeepTab(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r != '\t' && unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// truncateText cuts s to at most n bytes on a rune boundary, marking a cut with
+// "...". When n leaves no room for the marker a cut yields "".
+func truncateText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	const marker = "..."
+	if n <= len(marker) {
+		return ""
+	}
+	cut := n - len(marker)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + marker
 }
 
 // clearRefusal drops the last failure's text once a re-exec succeeded, for the
