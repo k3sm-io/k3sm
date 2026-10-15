@@ -56,7 +56,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   status      show what is running (daemons, apiserver, node, workloads, data root) — the exit code is the verdict, see k3sm status --help
   doctor      run preflight environment + datastore-posture checks
               (--report writes a redacted bug-report bundle)
-  snapshot    back up and restore the kine SQLite datastore (snapshot save|restore)
+  snapshot    back up, restore, list and prune datastore snapshots (snapshot save|restore|ls|delete|prune)
   secrets-encrypt  report secrets encryption at rest (secrets-encrypt status)
   interconnect     arm or disarm the Thunderbolt cable as an opt-in network (interconnect enable|disable)
   version     print version

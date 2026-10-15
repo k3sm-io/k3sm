@@ -18,14 +18,23 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
+	"syscall"
+	"text/tabwriter"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
@@ -38,6 +47,9 @@ import (
 const snapshotUsage = `Usage: k3sm snapshot save    [--out <path>] [--compress] [--work-dir <dir>]
        k3sm snapshot restore <snapshot> [--work-dir <dir>]
                              [--node-name <name>] [--etcd-peer-ip <ip>] [--etcd-peer-port <port>]
+       k3sm snapshot ls      [-o text|json] [--node-name <name>] [--work-dir <dir>]
+       k3sm snapshot delete  <name>... [--work-dir <dir>]
+       k3sm snapshot prune   [--snapshot-retention <n>] [--dry-run] [--node-name <name>] [--work-dir <dir>]
 
 Back up and restore this node's datastore — the control plane's state of record:
 the kine SQLite datastore on a single server, the embedded etcd member on an HA
@@ -49,6 +61,15 @@ server.
   restore  replace the datastore with a snapshot. REFUSES while a control plane is
            running, and verifies the snapshot BEFORE touching anything; the datastore
            it supersedes is preserved beside it as a .bak, never deleted.
+  ls       list the snapshots in the snapshots directory: name, size, created, kind
+           (scheduled for this node, manual, or other) and whether compressed. Reads
+           file metadata only; a missing directory is an empty list.
+  delete   remove the named snapshots from the snapshots directory, by the bare names
+           ls prints. IRREVERSIBLE: a deleted snapshot cannot be recovered. Only
+           regular files are removed, never a symlink, directory or partial .tmp file.
+  prune    remove this node's scheduled snapshots past the newest --snapshot-retention,
+           the selection the schedule's own retention makes. Manual saves and other
+           nodes' snapshots are never pruned (remove those with delete). IRREVERSIBLE.
 
 Flags:
   --work-dir <dir>        control-plane state root (default: this posture's work dir)
@@ -62,6 +83,13 @@ Flags:
   --etcd-peer-ip <ip>     restore, etcd: this server's etcd peer address
   --etcd-peer-port <port> restore, etcd: this server's etcd peer port
                           (all three default to the installed server's own flags)
+  -o text|json            ls: output format (default text)
+  --snapshot-retention <n> prune: how many scheduled snapshots to keep (default %d)
+  --dry-run               prune: print what would be removed and remove nothing
+
+delete and prune refuse a snapshots directory that is group- or world-writable or
+owned by anyone but root, the %s service user or you, and run under sudo on
+an installed server.
 
 On an embedded etcd HA server, save streams an online snapshot of this server's
 etcd member (no member is stopped and no quorum is spent), verifies it, and writes
@@ -84,17 +112,23 @@ func runSnapshot(args []string) error {
 		return runSnapshotSave(args[1:])
 	case "restore":
 		return runSnapshotRestore(args[1:])
+	case "ls":
+		return runSnapshotLs(args[1:], os.Stdout)
+	case "delete":
+		return runSnapshotDelete(args[1:], os.Stdout)
+	case "prune":
+		return runSnapshotPrune(args[1:], os.Stdout)
 	case "-h", "--help", "help":
 		fmt.Print(snapshotHelp())
 		return nil
 	default:
-		return fmt.Errorf("unknown snapshot subcommand %q (want: save, restore)", args[0])
+		return fmt.Errorf("unknown snapshot subcommand %q (want: save, restore, ls, delete, prune)", args[0])
 	}
 }
 
 // snapshotHelp renders the usage with the default snapshot location filled in.
 func snapshotHelp() string {
-	return fmt.Sprintf(snapshotUsage, filepath.Join("db", "snapshots"))
+	return fmt.Sprintf(snapshotUsage, filepath.Join("db", "snapshots"), executor.DefaultEtcdSnapshotRetention, install.DefaultServiceUser)
 }
 
 // snapshotWorkDirFlag registers the posture-aware --work-dir on fs. A resolve failure
@@ -522,4 +556,356 @@ Next:
 3. If objects are missing or the datastore check reports a non-WAL journal, stop and
    keep %s — it is the state you replaced, and the only copy of it.
 `, filepath.Join(install.DefaultLaunchDaemonDir, install.ServerLabel+".plist"), kept)
+}
+
+// Errors the snapshot management verbs return.
+var (
+	// errSnapshotName is a delete argument that is not a bare snapshot file name.
+	errSnapshotName = errors.New("not a snapshot name (give the bare file name `k3sm snapshot ls` prints)")
+	// errSnapshotUnrecognised is a delete argument whose name is not a snapshot name
+	// k3sm writes (the scheduled or manual shapes ls reports).
+	errSnapshotUnrecognised = errors.New("not a name k3sm gives a snapshot (scheduled or manual); remove it by hand if it must go")
+	// errSnapshotNotRemovable is a delete target that is not a regular, final-name file.
+	errSnapshotNotRemovable = errors.New("not removable as a snapshot")
+	// errSnapshotDirUnsafe is a snapshots directory delete and prune refuse to work in.
+	errSnapshotDirUnsafe = errors.New("refusing to remove anything from the snapshots directory")
+)
+
+// snapshotManager is what ls, delete and prune need besides their flags; seams so
+// the verbs are testable against a fake snapshots directory.
+type snapshotManager struct {
+	// owners are the uids besides euid the snapshots directory may be owned by: root
+	// and the service user.
+	owners []uint32
+	// euid is the invoking user, who may also own it (a rootless `k3sm dev` cluster).
+	euid uint32
+	now  func() time.Time
+}
+
+// defaultSnapshotManager allows root, the service user and the invoking user to own
+// the directory.
+func defaultSnapshotManager() snapshotManager {
+	owners := []uint32{0}
+	if u, err := user.Lookup(install.DefaultServiceUser); err == nil {
+		if uid, err := strconv.ParseUint(u.Uid, 10, 32); err == nil {
+			owners = append(owners, uint32(uid))
+		}
+	}
+	return snapshotManager{owners: owners, euid: uint32(os.Geteuid()), now: time.Now}
+}
+
+// snapshotNodeName resolves the node whose scheduled snapshots ls and prune mean, the
+// way a restore resolves its member name: --node-name, else the installed server's
+// --node-name, else this host's default node name. An unreadable installed server is
+// an error only when the flag was not given.
+func snapshotNodeName(flagName string, installed func() ([]string, error)) (string, error) {
+	if flagName != "" {
+		return flagName, nil
+	}
+	args, err := installed()
+	if err != nil {
+		return "", fmt.Errorf("read the installed server's --node-name (or pass --node-name): %w", err)
+	}
+	if n := install.ServerArgValue(args, "node-name"); n != "" {
+		return n, nil
+	}
+	return defaultNodeName(), nil
+}
+
+// installedServerArgs reads the installed server's operator flags.
+func installedServerArgs() ([]string, error) {
+	return install.InstalledServerArgs(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath)
+}
+
+// runSnapshotLs parses the flags and lists the snapshots.
+func runSnapshotLs(args []string, w io.Writer) error {
+	fs := flag.NewFlagSet("snapshot ls", flag.ContinueOnError)
+	workDir := snapshotWorkDirFlag(fs)
+	nodeName := fs.String("node-name", "", "the node whose scheduled snapshots are kind scheduled (default: the installed server's --node-name, else this host's node name)")
+	format := fs.String("o", "text", "output format: text or json")
+	fs.Usage = func() { fmt.Fprint(os.Stderr, snapshotHelp()) }
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("snapshot ls takes no positional arguments (got %q)", fs.Arg(0))
+	}
+	node, err := snapshotNodeName(*nodeName, installedServerArgs)
+	if err != nil {
+		// Listing is read-only; an unknown node only makes this node's files "other".
+		node = defaultNodeName()
+	}
+	return listSnapshots(w, executor.SnapshotDir(*workDir), node, *format, defaultSnapshotManager())
+}
+
+// listSnapshots prints the snapshots in dir. It reads metadata only: no snapshot is
+// opened, so nothing derived from a snapshot's bytes can reach the output.
+func listSnapshots(w io.Writer, dir, node, format string, m snapshotManager) error {
+	if format != "text" && format != "json" {
+		return fmt.Errorf("unknown output format %q, want text or json", format)
+	}
+	infos, err := executor.ListSnapshots(dir, node, m.now())
+	if err != nil {
+		return fmt.Errorf("list %s: %w", dir, err)
+	}
+	if format == "json" {
+		if infos == nil {
+			infos = []executor.SnapshotInfo{}
+		}
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(infos)
+	}
+	if len(infos) == 0 {
+		fmt.Fprintf(w, "No snapshots in %s.\n", sanitizeSnapshotName(dir))
+		return nil
+	}
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tSIZE\tCREATED\tKIND\tCOMPRESSED")
+	for _, in := range infos {
+		created := "unknown (dated in the future)"
+		if !in.Created.IsZero() {
+			created = in.Created.UTC().Format(time.RFC3339)
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%t\n", sanitizeSnapshotName(in.Name), in.Size, created, in.Kind, in.Compressed)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "\n%d snapshots in %s; scheduled means scheduled for node %s.\n", len(infos), sanitizeSnapshotName(dir), sanitizeSnapshotName(node))
+	return nil
+}
+
+// sanitizeSnapshotName makes a file name safe to print to a terminal: a name with a
+// control, format or invalid byte is printed quoted with escapes, never raw.
+func sanitizeSnapshotName(name string) string {
+	if utf8.ValidString(name) && !strings.ContainsFunc(name, func(r rune) bool { return !unicode.IsPrint(r) }) {
+		return name
+	}
+	return strconv.QuoteToASCII(name)
+}
+
+// checkSnapshotName refuses a delete argument that is not a bare file name, before
+// anything touches the filesystem.
+func checkSnapshotName(name string) error {
+	switch {
+	case name == "", name == ".", name == "..", strings.HasPrefix(name, "-"),
+		strings.ContainsAny(name, "/\x00"), name != filepath.Base(name):
+		return fmt.Errorf("%w: %s", errSnapshotName, sanitizeSnapshotName(name))
+	}
+	return nil
+}
+
+// openSnapshotRoot opens dir as an os.Root, which confines every later lookup to it,
+// and refuses a directory another user could have planted files in: one that is
+// group- or world-writable, or owned by anyone but m's owners or its euid.
+func openSnapshotRoot(dir string, m snapshotManager) (*os.Root, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := root.Stat(".")
+	if err != nil {
+		_ = root.Close() // the stat error is the one to report
+		return nil, fmt.Errorf("stat %s: %w", dir, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	switch {
+	case !ok:
+		err = fmt.Errorf("%w: cannot read the owner of %s", errSnapshotDirUnsafe, dir)
+	case fi.Mode().Perm()&0o022 != 0:
+		err = fmt.Errorf("%w: %s is group- or world-writable (mode %v)", errSnapshotDirUnsafe, dir, fi.Mode().Perm())
+	case st.Uid != m.euid && !slices.Contains(m.owners, st.Uid):
+		err = fmt.Errorf("%w: %s is owned by uid %d, not root, the %s service user or you", errSnapshotDirUnsafe, dir, st.Uid, install.DefaultServiceUser)
+	}
+	if err != nil {
+		_ = root.Close() // the refusal is the error to report
+		return nil, err
+	}
+	return root, nil
+}
+
+// removeSnapshotFile unlinks name inside root when it is a regular, final-name file.
+// gone reports a file that was already absent. Every error names the file sanitized
+// and never carries the raw *fs.PathError, whose name a hostile file could have set.
+func removeSnapshotFile(root *os.Root, name string) (gone bool, err error) {
+	fi, err := root.Lstat(name)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return true, nil
+	case err != nil:
+		return false, snapshotFileError(name, err)
+	case !fi.Mode().IsRegular():
+		return false, fmt.Errorf("%w: %s is a %s, not a regular file", errSnapshotNotRemovable, sanitizeSnapshotName(name), fileKind(fi.Mode()))
+	case executor.IsPartialSnapshotName(name):
+		return false, fmt.Errorf("%w: %s is a partial write, not a snapshot", errSnapshotNotRemovable, sanitizeSnapshotName(name))
+	}
+	if err := root.Remove(name); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return true, nil
+		}
+		return false, snapshotFileError(name, err)
+	}
+	return false, nil
+}
+
+// snapshotFileError reports err about name with the name sanitized: a *fs.PathError
+// is replaced by its underlying error, so the raw name never reaches the terminal.
+func snapshotFileError(name string, err error) error {
+	if pe, ok := errors.AsType[*fs.PathError](err); ok {
+		err = pe.Err
+	}
+	return fmt.Errorf("%s: %w", sanitizeSnapshotName(name), err)
+}
+
+// fileKind names a non-regular file's type for a refusal.
+func fileKind(m fs.FileMode) string {
+	switch {
+	case m&fs.ModeSymlink != 0:
+		return "symlink"
+	case m.IsDir():
+		return "directory"
+	case m&fs.ModeNamedPipe != 0:
+		return "named pipe"
+	case m&(fs.ModeDevice|fs.ModeCharDevice) != 0:
+		return "device"
+	case m&fs.ModeSocket != 0:
+		return "socket"
+	}
+	return "special file"
+}
+
+// runSnapshotDelete parses the flags and removes the named snapshots.
+func runSnapshotDelete(args []string, w io.Writer) error {
+	fs := flag.NewFlagSet("snapshot delete", flag.ContinueOnError)
+	workDir := snapshotWorkDirFlag(fs)
+	fs.Usage = func() { fmt.Fprint(os.Stderr, snapshotHelp()) }
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return deleteSnapshots(w, executor.SnapshotDir(*workDir), fs.Args(), defaultSnapshotManager())
+}
+
+// deleteSnapshots removes each named snapshot from dir. Every name is checked first,
+// and one bad name refuses the whole command before the filesystem is touched.
+func deleteSnapshots(w io.Writer, dir string, names []string, m snapshotManager) error {
+	if len(names) == 0 {
+		return errors.New("snapshot delete needs at least one snapshot name (see `k3sm snapshot ls`)")
+	}
+	for _, n := range names {
+		if err := checkSnapshotName(n); err != nil {
+			return err
+		}
+		if !executor.IsSnapshotName(n) {
+			return fmt.Errorf("%w: %s", errSnapshotUnrecognised, sanitizeSnapshotName(n))
+		}
+	}
+	root, err := openSnapshotRoot(dir, m)
+	if err != nil {
+		return fmt.Errorf("open the snapshots directory %s: %w", dir, err)
+	}
+	defer func() { _ = root.Close() }() // read-only handle; nothing to flush
+
+	var errs []error
+	for _, n := range names {
+		gone, err := removeSnapshotFile(root, n)
+		switch {
+		case err != nil:
+			fmt.Fprintf(w, "not removed  %v\n", err)
+			errs = append(errs, err)
+		case gone:
+			fmt.Fprintf(w, "already gone %s\n", sanitizeSnapshotName(n))
+		default:
+			fmt.Fprintf(w, "removed      %s\n", sanitizeSnapshotName(n))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%d of %d snapshots not removed: %w", len(errs), len(names), errors.Join(errs...))
+	}
+	return nil
+}
+
+// runSnapshotPrune parses the flags and prunes this node's scheduled snapshots.
+func runSnapshotPrune(args []string, w io.Writer) error {
+	fs := flag.NewFlagSet("snapshot prune", flag.ContinueOnError)
+	workDir := snapshotWorkDirFlag(fs)
+	nodeName := fs.String("node-name", "", "the node whose scheduled snapshots are pruned (default: the installed server's --node-name, else this host's node name)")
+	retention := fs.Int("snapshot-retention", executor.DefaultEtcdSnapshotRetention, "how many of this node's scheduled snapshots to keep")
+	dryRun := fs.Bool("dry-run", false, "print what would be removed and remove nothing")
+	fs.Usage = func() { fmt.Fprint(os.Stderr, snapshotHelp()) }
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("snapshot prune takes no positional arguments (got %q)", fs.Arg(0))
+	}
+	if *retention < 1 {
+		return fmt.Errorf("%w (got %d)", executor.ErrEtcdSnapshotRetention, *retention)
+	}
+	node, err := snapshotNodeName(*nodeName, installedServerArgs)
+	if err != nil {
+		return err
+	}
+	return pruneSnapshots(w, executor.SnapshotDir(*workDir), node, *retention, *dryRun, defaultSnapshotManager())
+}
+
+// pruneSnapshots removes node's scheduled snapshots in dir past the newest retention,
+// selected by executor.SelectScheduledPrune (the schedule's own retention), so only
+// this node's scheduled snapshots are ever candidates.
+func pruneSnapshots(w io.Writer, dir, node string, retention int, dryRun bool, m snapshotManager) error {
+	if retention < 1 {
+		return fmt.Errorf("%w (got %d)", executor.ErrEtcdSnapshotRetention, retention)
+	}
+	pnode := sanitizeSnapshotName(node)
+	root, err := openSnapshotRoot(dir, m)
+	if errors.Is(err, fs.ErrNotExist) {
+		fmt.Fprintf(w, "0 scheduled snapshots for node %s, 0 pruned (no snapshots directory %s)\n", pnode, sanitizeSnapshotName(dir))
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open the snapshots directory %s: %w", dir, err)
+	}
+	defer func() { _ = root.Close() }() // read-only handle; nothing to flush
+
+	// Listed now, immediately before anything is unlinked, through the same root the
+	// removals go through, so selecting and removing resolve one directory.
+	infos, err := executor.ListSnapshotsFS(root.FS(), node, m.now())
+	if err != nil {
+		return fmt.Errorf("list %s: %w", dir, err)
+	}
+	scheduled := 0
+	for _, in := range infos {
+		if in.Kind == executor.SnapshotScheduled {
+			scheduled++
+		}
+	}
+	victims := executor.SelectScheduledPrune(infos, retention, "")
+	if dryRun {
+		for _, v := range victims {
+			fmt.Fprintf(w, "would remove %s\n", sanitizeSnapshotName(v.Name))
+		}
+		fmt.Fprintf(w, "%d scheduled snapshots for node %s, %d would be pruned (dry run, nothing removed)\n", scheduled, pnode, len(victims))
+		return nil
+	}
+	var errs []error
+	pruned := 0
+	for _, v := range victims {
+		gone, err := removeSnapshotFile(root, v.Name)
+		switch {
+		case err != nil:
+			fmt.Fprintf(w, "not removed  %v\n", err)
+			errs = append(errs, err)
+		case !gone:
+			fmt.Fprintf(w, "removed      %s\n", sanitizeSnapshotName(v.Name))
+			pruned++
+		}
+	}
+	fmt.Fprintf(w, "%d scheduled snapshots for node %s, %d pruned\n", scheduled, pnode, pruned)
+	if scheduled == 0 {
+		fmt.Fprint(w, "Scheduled snapshots are an embedded etcd feature; a kine/SQLite server has none to prune.\n")
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%d of %d snapshots past the retention not removed: %w", len(errs), len(victims), errors.Join(errs...))
+	}
+	return nil
 }

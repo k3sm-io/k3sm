@@ -127,7 +127,8 @@ What the schedule does:
   still keeps the newest `--etcd-snapshot-retention` of this server's snapshots of either kind.
   Snapshots are ordered by the earlier of the time in the name and the file's modification
   time, and one dated in the future (taken while the clock was wrong) counts as the oldest. If you
-  rename a server, its snapshots under the old name are left for you to remove.
+  rename a server, its snapshots under the old name are left for you to remove with
+  `k3sm snapshot delete`.
 - When the schedule starts it removes the partial `.tmp` files an interrupted snapshot of this
   server left behind, and nothing else.
 - A snapshot is **skipped** when the snapshot directory's volume has less than twice the last
@@ -151,6 +152,46 @@ does not contain PersistentVolume data. Copy the snapshots you want to keep off 
 single-server control plane (no `--cluster-init` or `--server-join`) the flags are accepted and
 ignored with one log line, as in k3s, which takes no scheduled snapshot of a SQLite datastore; use
 `k3sm snapshot save` there.
+
+## Listing, Deleting and Pruning Snapshots
+
+```sh
+k3sm snapshot ls                                  # name, size, created, kind, compressed
+k3sm snapshot ls -o json
+k3sm snapshot delete k3sm-etcd-snapshot-20261001T000000Z.db
+k3sm snapshot prune --snapshot-retention 3 --dry-run
+k3sm snapshot prune --snapshot-retention 3
+```
+
+These work on the snapshots directory under the work directory
+(`/var/lib/k3sm/server/db/snapshots` on an installed server), so run them under `sudo` there. They
+match `k3s etcd-snapshot ls`, `delete` and `prune`.
+
+`ls` lists every snapshot in the directory with its size, when it was created, and its kind:
+`scheduled` (taken by this server's schedule), `manual` (taken with `k3sm snapshot save`), or
+`other` (another node's scheduled snapshot, or a file k3sm did not name). The created time is the
+one retention orders by: the earlier of the time in the name and the file's modification time. A
+snapshot dated in the future shows as unknown. `ls` reads file metadata only and never opens a
+snapshot. Partial `.tmp` files, symlinks and directories are not listed. A missing directory is an
+empty list.
+
+`delete` removes the snapshots you name, by the bare file names `ls` prints. It removes only names
+k3sm gives a snapshot (scheduled or manual, for any node), and only from the snapshots directory.
+It refuses a path, a name starting with `-`, any other file name, a symlink, a directory and a
+partial `.tmp` file; remove another file by hand if it must go. Deleting a name that is already gone succeeds. **A deleted snapshot cannot be
+recovered.**
+
+`prune` removes this server's scheduled snapshots past the newest `--snapshot-retention` (default
+`5`), with the same selection the schedule's own retention makes. It never removes a manual
+snapshot or one named for another node; use `delete` for those. It prints how many scheduled
+snapshots it found for the node and how many it removed, so on a single server with a kine/SQLite
+datastore, which takes no scheduled snapshots, it reports `0 scheduled snapshots` and removes
+nothing. `--dry-run` prints what it would remove. The node is `--node-name`, else the installed
+server's `--node-name`, else this host's default node name.
+
+`delete` and `prune` refuse to remove anything from a snapshots directory that is group- or
+world-writable, or that is owned by anyone other than root, the `_k3sm` service user or the user
+running the command.
 
 ## Restoring an HA Server (Embedded etcd)
 
