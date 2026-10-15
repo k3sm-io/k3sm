@@ -19,10 +19,14 @@ package install
 import (
 	"context"
 	"errors"
+	"os"
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	runtimed "k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // Uninstall's pod teardown.
@@ -52,6 +56,17 @@ import (
 // or that left the group, and a record with no child identity, prove nothing,
 // so those groups are left alone (the runtime's recovery runbook for leaked
 // process groups covers them).
+//
+// A record can also name Survivors: processes of the container's tree that
+// outlived the runtime's own teardown kill (a setsid escapee among them) and
+// that it could not see gone within its budget. Their group is usually empty
+// and their leader gone, so the group rules above never reach them. Each one is
+// SIGKILLed by pid only while its live start time equals the recorded one, the
+// rule the runtime's startup reap applies to the same list, and only while its
+// live session is the recorded one and not the sweeper's own; a survivor that
+// led its own session leads its own group too, and that group is killed under
+// the same guard. A pid whose start or session differs was recycled and is
+// skipped, and the sweeper's own pid and pid 1 are never signalled.
 
 // podGroupStopGrace is how long the recorded pod groups get to exit after
 // SIGTERM before they are sent SIGKILL: the kubelet's default
@@ -68,6 +83,7 @@ func teardownPodGroups(ctx context.Context, sys System, cfg Config) error {
 	if err != nil {
 		cfg.Logger.Warn("could not read the pod process records; a pod process may survive the uninstall", "data-root", cfg.DataRoot, "err", err)
 	}
+	err = errors.Join(err, killRecordedSurvivors(sys, cfg, recs))
 	var stopping []runtimed.PodReapRecord
 	for _, rec := range recs {
 		if rec.Pgid <= 1 || rec.StartUnixNano == 0 {
@@ -137,4 +153,96 @@ func podGroupIsRecorded(sys System, cfg Config, rec runtimed.PodReapRecord) bool
 	}
 	cfg.Logger.Info("pod process group leader (its shim) is gone; the container is verified by its own identity", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid, "pid", rec.ChildPid)
 	return true
+}
+
+// survivorProcs is the per-process seam the survivor kill needs: a process's
+// kernel start time and session, the sweeper's own pid and session, and a
+// signal to one process. A System that does not provide it is served by
+// runtimeProcs.
+type survivorProcs interface {
+	ProcessStart(pid int) (startUnixNano int64, alive bool)
+	ProcessSession(pid int) (sid int, ok bool)
+	Self() (pid, sid int)
+	SignalProcess(pid int, sig syscall.Signal) error
+}
+
+// runtimeProcs is survivorProcs over the runtime's exported primitives
+// (supervisor.ProcStartTimeNano, supervisor.KillPID: the pair its startup reap
+// kills recorded survivors with) and getsid(2).
+type runtimeProcs struct{}
+
+func (runtimeProcs) ProcessStart(pid int) (int64, bool) { return supervisor.ProcStartTimeNano(pid) }
+
+func (runtimeProcs) ProcessSession(pid int) (int, bool) {
+	sid, err := unix.Getsid(pid)
+	return sid, err == nil
+}
+
+func (runtimeProcs) Self() (int, int) {
+	sid, err := unix.Getsid(0)
+	if err != nil {
+		sid = -1 // unknown: no recorded session equals it, so nothing is spared by it
+	}
+	return os.Getpid(), sid
+}
+
+func (runtimeProcs) SignalProcess(pid int, sig syscall.Signal) error {
+	return supervisor.KillPID(pid, sig)
+}
+
+// survivorIsRecorded reports whether s is still exactly the recorded process
+// and safe for the sweeper to kill: not pid 1 or below, not the sweeper
+// itself, alive with exactly the recorded start time, and in exactly the
+// recorded session, which is not the sweeper's own. It mirrors the identity
+// rule of the runtime's startup reap of the same list
+// (runtime.(*Runtime).reapRecordedSurvivors), which exports no helper for it,
+// and adds the session match on top.
+func survivorIsRecorded(procs survivorProcs, s runtimed.ReapSurvivor) bool {
+	selfPid, selfSid := procs.Self()
+	if s.Pid <= 1 || s.Pid == selfPid || s.StartUnixNano == 0 {
+		return false
+	}
+	if start, alive := procs.ProcessStart(s.Pid); !alive || start != s.StartUnixNano {
+		return false
+	}
+	sid, ok := procs.ProcessSession(s.Pid)
+	return ok && sid == s.Sid && sid != selfSid
+}
+
+// killRecordedSurvivors SIGKILLs every recorded survivor still alive as exactly
+// its recorded instance (survivorIsRecorded). A survivor that leads its own
+// session (Sid == Pid) leads its own group, which is killed whole while that
+// group's leader is the same instance; any other survivor is killed alone. A
+// survivor that fails the identity check is skipped without a signal. The
+// count killed is logged per record; the first signal error is returned.
+func killRecordedSurvivors(sys System, cfg Config, recs []runtimed.PodReapRecord) error {
+	procs, ok := sys.(survivorProcs)
+	if !ok {
+		procs = runtimeProcs{}
+	}
+	var err error
+	for _, rec := range recs {
+		killed := 0
+		for _, s := range rec.Survivors {
+			if !survivorIsRecorded(procs, s) {
+				continue
+			}
+			var serr error
+			if lstart, alive := sys.ProcessGroupLeaderStart(s.Pid); s.Sid == s.Pid && alive && lstart == s.StartUnixNano {
+				serr = sys.SignalProcessGroup(s.Pid, syscall.SIGKILL)
+			} else {
+				serr = procs.SignalProcess(s.Pid, syscall.SIGKILL)
+			}
+			if serr != nil {
+				cfg.Logger.Warn("could not kill a recorded pod survivor", "pod", rec.PodID, "container", rec.Container, "pid", s.Pid, "err", serr)
+				err = errors.Join(err, serr)
+				continue
+			}
+			killed++
+		}
+		if killed > 0 {
+			cfg.Logger.Info("killed the recorded survivors of a pod's process tree (SIGKILL)", "pod", rec.PodID, "container", rec.Container, "killed", killed)
+		}
+	}
+	return err
 }
