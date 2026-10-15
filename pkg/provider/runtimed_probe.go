@@ -301,9 +301,10 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 // authority's worker (runtimed_restart.go's runRestart, through respawn), whichever TRIGGER
 // scheduled it. runtimed bumps ContainerStatus.restart_count on this RPC: that
 // count is the single restart authority the provider surfaces verbatim.
-// grace_period_seconds is left 0 so runtimed applies its own default window. A
-// typed failure in the response (e.g. the pod is gone) surfaces as an error the
-// caller logs without aborting its loop.
+// grace_period_seconds is left 0 so runtimed applies its own default window.
+// Every failure, a transport error or a typed refusal in the response, comes
+// back as a *restartFailure, so the worker can surface runtimed's own text and
+// tell a permanent refusal from a transient one by the typed reason.
 func (r *runtimedRuntime) restartContainerReason(ctx context.Context, podID, container, reason string) error {
 	resp, err := r.rt.RestartContainer(ctx, &runtimev1.RestartContainerRequest{
 		PodId:     podID,
@@ -311,12 +312,60 @@ func (r *runtimedRuntime) restartContainerReason(ctx context.Context, podID, con
 		Reason:    reason,
 	})
 	if err != nil {
-		return fmt.Errorf("runtimed restart container %s/%s: %w", podID, container, err)
+		return &restartFailure{podID: podID, container: container, message: status.Convert(err).Message(), cause: err}
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
-		return fmt.Errorf("runtimed restart container %s/%s rejected: %s", podID, container, e.GetMessage())
+		return &restartFailure{
+			podID:     podID,
+			container: container,
+			message:   e.GetMessage(),
+			refused:   true,
+			// An older daemon answers a vm pod with the embedded Unimplemented; a
+			// newer one answers a guest without the verb with FailedPrecondition and
+			// FAILURE_REASON_UNSUPPORTED. Both are the same permanent condition for
+			// this pod. Any other refusal (a pod being stopped, NOT_UPDATABLE) is
+			// transient and keeps the plain retry.
+			unsupported: e.GetCode() == int32(codes.Unimplemented) ||
+				resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED,
+		}
 	}
 	return nil
+}
+
+// msgRestartUnsupported is the remedy appended to runtimed's text when it refuses
+// a restart as unsupported: restartCount 0 and a crash loop that never re-execs
+// otherwise leave the operator nothing to act on.
+const msgRestartUnsupported = "restarting a container in place is not supported by the guest this pod booted; " +
+	"delete the pod to recreate it with a guest that supports it"
+
+// restartFailure is a RestartContainer attempt that did not re-exec the
+// container. message is runtimed's own text (the refusal's message, or the
+// transport status message); refused marks a typed refusal in the response and
+// unsupported the permanent one a recreated pod is the remedy for.
+type restartFailure struct {
+	podID, container string
+	message          string
+	refused          bool
+	unsupported      bool
+	cause            error // the transport error, when there is one
+}
+
+func (f *restartFailure) Error() string {
+	if f.refused {
+		return fmt.Sprintf("runtimed restart container %s/%s rejected: %s", f.podID, f.container, f.message)
+	}
+	return fmt.Sprintf("runtimed restart container %s/%s: %v", f.podID, f.container, f.cause)
+}
+
+func (f *restartFailure) Unwrap() error { return f.cause }
+
+// surface is the text the Failed Event and the CrashLoopBackOff waiting message
+// carry: runtimed's message, plus the remedy for a permanent refusal.
+func (f *restartFailure) surface() string {
+	if f.unsupported {
+		return f.message + " (" + msgRestartUnsupported + ")"
+	}
+	return f.message
 }
 
 // startDiedContainer is the StartContainer RPC for a container of a re-attached
