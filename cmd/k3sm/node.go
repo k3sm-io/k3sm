@@ -1939,6 +1939,10 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	// report a foreign arch to every generic client.
 	n.Status.NodeInfo.Architecture = arch
 	n.Status.NodeInfo.KubeletVersion = version.Get().NodeVersion()
+	// declaredFeatures comes from the one computed set. It is nil today (the field is
+	// absent, never an explicit empty list), and the status loop republishes a deep
+	// copy of this object, so every status write carries the same set.
+	n.Status.DeclaredFeatures = provider.DeclaredFeatures(caps)
 
 	// Advertise REAL host memory (hw.memsize) as node capacity. A failed read, or
 	// an implausible value (0, or one above math.MaxInt64 that would convert to a
