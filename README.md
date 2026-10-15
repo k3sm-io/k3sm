@@ -86,9 +86,11 @@ CGO_ENABLED=1 go build -o k3sm ./cmd/k3sm
 ```
 
 An install needs more than the binary: the Seatbelt exec helper, two DYLD shims, the VM host
-helper and the control-plane payload sit beside it. `hack/release/stage.sh` builds and assembles
-that whole set (it needs the Go toolchain, the Command Line Tools and the GitHub CLI, and
-downloads about 250 MB of pinned control-plane binaries).
+helper and the control-plane payload sit beside it. `hack/release/stage.sh` builds the binary
+again and assembles that whole set, ad-hoc signed, into the folder you name. It needs the Command
+Line Tools, a signed-in GitHub CLI (`gh`), and the exact Go release the script pins
+(`PAYLOAD_GO_VERSION` in the script) first on your `PATH`, and the staged folder comes to about
+700 MB.
 
 Install runs once, as root, and sets up an unprivileged `_k3sm` user and daemon that everything
 else runs under. Day-to-day use after that needs no `sudo`:
