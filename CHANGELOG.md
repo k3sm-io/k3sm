@@ -55,6 +55,7 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- **DaemonSets schedule on k3sm nodes without a hand-added toleration.** The DaemonSet controller picks nodes from the Pod template, and every k3sm node carries the `k3sm.io/provider:NoSchedule` taint, so a DaemonSet that did not tolerate it reported `desiredNumberScheduled: 0` and created no Pods. A mutating admission policy now adds the provider toleration to the template on create and update, and leaves a template that already tolerates the taint unchanged. It never adds a `nodeSelector`; the DaemonSet's own placement still decides where it runs. An existing DaemonSet picks the toleration up on its next update.
 - **The single-node datastore's write-ahead log is checkpointed again.** kine held a read transaction open from its start, so SQLite could never checkpoint, and `state.db-wal` grew by gigabytes a day until the data volume filled. The first boot after the upgrade folds the old log into `state.db`, which takes longer in proportion to its size and needs room for the database to grow; see [upgrade](https://k3sm.io/docs/upgrade/). Rolling back to an earlier release brings the growth back.
 - **A finished Pod's logs are readable after a node-daemon restart.** Before, `kubectl logs` answered that the Pod did not exist and the log tree could be removed as an orphan.
 - **A worker on lossy Wi-Fi keeps posting its status and Lease.** Those writes now use their own connection with a short timeout and a health check, so a connection that went half-open after a roam is replaced.

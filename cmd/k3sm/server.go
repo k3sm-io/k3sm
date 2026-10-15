@@ -1183,12 +1183,13 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := policy.EnsureXcodeToolchainAnnotationWarn(ctx, cs); err != nil {
 		logger.Error("provision hand-set-xcode-toolchain warn policy", "err", err)
 	}
-	// MUTATING policy on Pods: a DaemonSet-owned pod is created by the DS
-	// controller (KCM), so the CREATE-Warn advisory above never reaches its author and
-	// the pod sits Unschedulable against the provider taint. Inject the provider
-	// toleration (never the os=darwin nodeSelector — Res.7) so DS pods schedule.
+	// MUTATING policies on DaemonSet templates and DaemonSet-owned Pods: the DS
+	// controller picks nodes from the template, and the CREATE-Warn advisory above
+	// never reaches a DS pod's author, so without the provider toleration a DaemonSet
+	// schedules nowhere. Inject it (never the os=darwin nodeSelector — Res.7).
 	// CHANGES the stored object, unlike the Warn/Deny VAPs. Log-and-continue; writes
 	// admissionregistration.k8s.io/v1, which the pinned apiserver serves by default.
+	// Runs before startEmbeddedAddons, so an add-on DaemonSet is admitted with it.
 	if err := policy.EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
 		logger.Error("provision daemonset-toleration mutating policy", "err", err)
 	}
