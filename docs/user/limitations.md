@@ -363,6 +363,14 @@ Today at `main`, per port class:
     freed. That behaviour is inherited rather than introduced here, and it is the same leak the old
     shared wildcard had.
 
+  An Apple platform binary run inside a native pod (for example `/usr/bin/nc`, or the system `python3`
+  or `ruby`) ignores `DYLD_INSERT_LIBRARIES`, so the per-pod bind shim never loads and a listener it opens
+  binds every address on the node rather than the pod's own. Because every native pod shares the node's
+  loopback /24, that listener answers connections meant for other pods, including a later pod that reuses
+  the address. The shim is a correctness discipline, not a boundary. Ship the server binary in the image
+  instead of calling a platform binary, or use the `vm` RuntimeClass for a workload that needs a real
+  network boundary.
+
   Pods using the `vm` RuntimeClass have their own network stack behind VZNAT, unaffected by all of the
   above. See [`vm` RuntimeClass](vm-runtimeclass.md). What a guest can reach was measured rather than
   assumed:
