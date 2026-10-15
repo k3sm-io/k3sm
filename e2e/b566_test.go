@@ -29,6 +29,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 
 	"k3sm.io/k3sm/pkg/policy"
 )
@@ -102,7 +103,17 @@ func TestDaemonSetTolerationReachesTheController(t *testing.T) {
 		if stored.Generation != 1 {
 			t.Errorf("generation after create = %d, want 1", stored.Generation)
 		}
-		updated, err := dss.Update(ctx, stored, metav1.UpdateOptions{})
+		// Re-read before the no-op UPDATE: the DaemonSet controller writes status
+		// after create, so the created object's resourceVersion is already stale.
+		var updated *appsv1.DaemonSet
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh, err := dss.Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			updated, err = dss.Update(ctx, fresh, metav1.UpdateOptions{})
+			return err
+		})
 		if err != nil {
 			t.Fatalf("no-op update: %v", err)
 		}
