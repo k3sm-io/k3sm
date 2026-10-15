@@ -1,0 +1,15 @@
+bridge0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=63<RXCSUM,TXCSUM,TSO4,TSO6>
+	ether 36:a1:5c:00:00:01
+	inet 169.254.9.209 netmask 0xffff0000 broadcast 169.254.255.255
+	inet 169.254.0.25 netmask 0xffffff00 broadcast 169.254.0.255
+	inet 169.254.0.26 netmask 0xffffffff
+	inet 169.254.0.27 netmask 0xffffffff
+	Configuration:
+		id 0:0:0:0:0:0 priority 0 hellotime 0 fwddelay 0
+	member: en1 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 9 priority 0 path cost 0
+	member: en2 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 10 priority 0 path cost 0
+	media: <unknown type>
+	status: active

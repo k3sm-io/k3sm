@@ -24,7 +24,9 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -184,12 +186,48 @@ func TestPhasesGatePathsResolve(t *testing.T) {
 					t.Fatalf("rel of %s under %s: %v", abs, root, err)
 				}
 				rel = filepath.ToSlash(rel)
-				if !referenced[rel] {
-					t.Errorf("gate script %s exists on disk but is not referenced by any phases.json row (orphan)", rel)
+				if referenced[rel] {
+					continue
 				}
+				if target, ok := gateShimTarget(t, abs); ok && referenced[target] {
+					continue // a kept path that only execs a referenced gate
+				}
+				t.Errorf("gate script %s exists on disk but is not referenced by any phases.json row (orphan)", rel)
 			}
 		}
 	})
+}
+
+// gateShimMarker names, in a kept gate path that now only hands over to another
+// gate, the repo-relative gate it execs. The orphan check accepts such a script
+// only when the named gate is itself a manifest row, so a shim can never stand in
+// for a gate the manifest does not carry.
+const gateShimMarker = "# K3SM-GATE-SHIM: "
+
+// gateShimTarget returns the gate a shim script names with gateShimMarker, after
+// checking structurally that the script execs exactly that gate: a line of its
+// own reading `exec "$(<dir>)/<target base>" "$@"`.
+func gateShimTarget(t *testing.T, abs string) (string, bool) {
+	t.Helper()
+	body, err := os.ReadFile(abs)
+	if err != nil {
+		t.Fatalf("read %s: %v", abs, err)
+	}
+	src := string(body)
+	for _, line := range strings.Split(src, "\n") {
+		target, ok := strings.CutPrefix(line, gateShimMarker)
+		if !ok {
+			continue
+		}
+		target = filepath.ToSlash(filepath.Clean(strings.TrimSpace(target)))
+		execLine := regexp.MustCompile(`(?m)^exec "\$\(.*\)/` + regexp.QuoteMeta(path.Base(target)) + `" "\$@"$`)
+		if !execLine.MatchString(src) {
+			t.Errorf("%s declares itself a shim for %s but has no line `exec \"$(...)/%s\" \"$@\"`", abs, target, path.Base(target))
+			return "", false
+		}
+		return target, true
+	}
+	return "", false
 }
 
 // TestLabSkeletonHonesty pins the load-bearing honesty contract of the lab
@@ -447,5 +485,105 @@ func runGateArgs(t *testing.T, path, k3smLab string, args ...string) (int, strin
 		}
 		t.Fatalf("run %s %v (K3SM_LAB=%q): %v", path, args, k3smLab, err)
 		return -1, string(out)
+	}
+}
+
+// TestM17InterconnectLadderContract pins the M17-lab row now that its gate is the
+// real two-Mac interconnect ladder rather than a skeleton, so TestLabSkeletonHonesty
+// no longer selects it. Every invocation is hermetic: none contacts a host. The
+// row must be manual, lab-tier, non-skeleton, with the ladder as its gate; then:
+//
+//   - K3SM_LAB truly unset (absent from the environment, not empty) exits 3 with
+//     the exact line "LAB-PENDING: not a pass" (the B46 shape: a distinct code, so
+//     no wrapper reads the skip as a pass), through the ladder and the kept
+//     hack/lab/m17.sh shim alike;
+//   - K3SM_LAB=1 with no PEER_SSH/EVIDENCE_DIR exits 2, a refusal;
+//   - --plan exits 0 and lists every rung r0..r9;
+//   - --self-test exits 0 (the predicates and the r3/r4 rung drivers over their
+//     green and red fixtures, and the watchdog).
+func TestM17InterconnectLadderContract(t *testing.T) {
+	const (
+		gate    = "hack/lab/m17-interconnect.sh"
+		shim    = "hack/lab/m17.sh"
+		pending = "LAB-PENDING: not a pass"
+	)
+	root := repoRoot(t)
+	rows := loadGateRows(t)
+	row, ok := rows["M17-lab"]
+	if !ok {
+		t.Fatal("phases.json declares no M17-lab row")
+	}
+	if row.Gate != gate || !row.Manual || row.Skeleton || row.Tier != "lab" {
+		t.Fatalf("M17-lab = {gate %q, tier %q, manual %v, skeleton %v}, want {%q, lab, true, false}", row.Gate, row.Tier, row.Manual, row.Skeleton, gate)
+	}
+	rungs := []string{"r0-disarmed", "r1-arm", "r2-attach", "r3-cable-path", "r4-mesh-traffic", "r5-ring", "r6-unplug", "r7-desired-forge", "r8-killswitch", "r9-downgrade"}
+
+	for _, tc := range []struct {
+		name   string
+		script string
+		lab    *string // nil: K3SM_LAB absent from the environment
+		args   []string
+		code   int
+		check  func(t *testing.T, out string)
+	}{
+		{name: "ladder K3SM_LAB unset", script: gate, code: 3, check: hasLine(pending)},
+		{name: "shim K3SM_LAB unset", script: shim, code: 3, check: hasLine(pending)},
+		{name: "REFUSED preflight", script: gate, lab: ptr("1"), code: 2, check: func(t *testing.T, out string) {
+			t.Helper()
+			if !strings.Contains(out, "REFUSED(preflight): ") {
+				t.Errorf("no REFUSED(preflight) line; output:\n%s", out)
+			}
+		}},
+		{name: "plan", script: gate, args: []string{"--plan"}, code: 0, check: func(t *testing.T, out string) {
+			t.Helper()
+			for _, id := range rungs {
+				if !strings.Contains(out, "\n"+id+" | ") {
+					t.Errorf("--plan does not list rung %s; output:\n%s", id, out)
+				}
+			}
+		}},
+		{name: "self-test", script: gate, args: []string{"--self-test"}, code: 0, check: hasLine("M17-lab self-test: PASS")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("bash", append([]string{filepath.Join(root, filepath.FromSlash(tc.script))}, tc.args...)...)
+			for _, kv := range os.Environ() {
+				switch k, _, _ := strings.Cut(kv, "="); k {
+				case "K3SM_LAB", "PEER_SSH", "EVIDENCE_DIR":
+				default:
+					cmd.Env = append(cmd.Env, kv)
+				}
+			}
+			if tc.lab != nil {
+				cmd.Env = append(cmd.Env, "K3SM_LAB="+*tc.lab)
+			}
+			raw, err := cmd.CombinedOutput()
+			out, code := string(raw), 0
+			if err != nil {
+				var ee *exec.ExitError
+				if !errors.As(err, &ee) {
+					t.Fatalf("run %s %v: %v", tc.script, tc.args, err)
+				}
+				code = ee.ExitCode()
+			}
+			if code != tc.code {
+				t.Fatalf("%s %v: exit %d, want %d; output:\n%s", tc.script, tc.args, code, tc.code, out)
+			}
+			tc.check(t, out)
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }
+
+// hasLine returns a check that the output carries want as a whole line.
+func hasLine(want string) func(t *testing.T, out string) {
+	return func(t *testing.T, out string) {
+		t.Helper()
+		for _, l := range strings.Split(out, "\n") {
+			if l == want {
+				return
+			}
+		}
+		t.Errorf("no line exactly %q; output:\n%s", want, out)
 	}
 }

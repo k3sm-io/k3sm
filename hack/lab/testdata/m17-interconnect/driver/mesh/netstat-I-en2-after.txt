@@ -1,0 +1,2 @@
+Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+en2        1500  <Link#12>   36:a1:5c:00:00:12   1100     0   10020000   2100     0   10000000     0

@@ -1,0 +1,1 @@
+{"schemaVersion":1,"verdict":"degraded","rows":[{"name":"ic-bridge","state":"ok","severity":"ok","detail":"bridge0 members: en1 en2"},{"name":"ic-stray","state":"warn","severity":"warn","detail":"a stray alias 169.254.0.25 on bridge0","remedy":"sudo k3sm uninstall"},{"name":"ic-residue","state":"warn","severity":"warn","detail":"a leftover route","remedy":"sudo k3sm uninstall"}]}

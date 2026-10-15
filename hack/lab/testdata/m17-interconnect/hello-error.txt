@@ -1,0 +1,1 @@
+dial unix /var/lib/k3sm/run/netd.sock: connect: no such file or directory

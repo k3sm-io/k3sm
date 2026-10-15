@@ -1,0 +1,2 @@
+Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+utun3      1420  <Link#20>                         9000     0    6000000    96000     0  140000000     0

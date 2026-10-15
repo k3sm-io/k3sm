@@ -1,0 +1,1 @@
+{"schemaVersion":1,"verdict":"running","rows":[{"name":"ic-bridge","state":"ok","severity":"ok","detail":"bridge0 members: en1 en2"},{"name":"ic-stray","state":"ok","severity":"ok","detail":"no stray reserved-range alias or route on bridge0"},{"name":"ic-residue","state":"ok","severity":"ok","detail":"no residue"}]}

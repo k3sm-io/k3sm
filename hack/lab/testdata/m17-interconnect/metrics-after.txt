@@ -1,0 +1,5 @@
+k3sm_interconnect_member_transitions_total{node="node-a"} 5
+k3sm_interconnect_member_transitions_total{node="node-b"} 3
+k3sm_interconnect_attached_pods 0
+k3sm_interconnect_netd_verb_results_total{result="ok",verb="EnsureInterconnectAlias"} 9
+k3sm_interconnect_netd_verb_results_total{result="HelperTooOld",verb="EnsureInterconnectAlias"} 1
