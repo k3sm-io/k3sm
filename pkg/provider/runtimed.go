@@ -1580,7 +1580,10 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	if err != nil {
 		return nil, err
 	}
-	facts := podFacts{nodeName: r.nodeName, nodeIP: r.nodeIP, serviceAccount: pod.Spec.ServiceAccountName, apiServerVIP: r.apiServerVIP, serviceLinks: links}
+	// The service-account fact goes through the package's one resolver
+	// (podServiceAccount) so the downward API and the token binding can never
+	// disagree about the account a pod with an unset spec runs as.
+	facts := podFacts{nodeName: r.nodeName, nodeIP: r.nodeIP, serviceAccount: podServiceAccount(pod), apiServerVIP: r.apiServerVIP, serviceLinks: links}
 	if err := resolvePodBoxEnv(ctx, box, facts, r.resolver); err != nil {
 		return nil, err
 	}
