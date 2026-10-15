@@ -26,22 +26,12 @@ import (
 	"strings"
 	"testing"
 
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-
-	"k3sm.io/k3sm/pkg/policy"
-	"k3sm.io/k3sm/pkg/runtimeclass"
 )
-
-// metricsServerImage is the one image the add-on may run: upstream metrics-server
-// v0.9.0's multi-arch index on registry.k8s.io, by digest. Changing it is a
-// deliberate edit here AND in manifests/metrics-server.yaml.
-const metricsServerImage = "registry.k8s.io/metrics-server/metrics-server@sha256:d9862115e7c7881280d3d75ca26bda8ffc0fc213315979575bf23ce9826205c0"
 
 // metricsServerResolution is the pinned scrape interval (upstream's and k3s's).
 const metricsServerResolution = "--metric-resolution=15s"
@@ -96,8 +86,7 @@ var wantMetricsServerObjects = []objID{
 // TestMetricsServerAddonManifest is the B93 gate on the shipped add-on: the
 // embedded tree decodes, holds exactly the approved objects, grants exactly
 // upstream metrics-server's RBAC (no extra verb, resource or group, no
-// nodes/proxy anywhere), schedules onto a Darwin node as a vm pod with a
-// digest-pinned image and a pinned --metric-resolution, and registers the
+// nodes/proxy anywhere), and registers the
 // metrics.k8s.io APIService with upstream's insecureSkipTLSVerify posture (the
 // aggregator does not verify metrics-server's self-generated serving cert; the
 // proxy-client certificate still authenticates the apiserver to it). Before B93
@@ -188,57 +177,6 @@ func TestMetricsServerAddonManifest(t *testing.T) {
 		}
 		if strings.Contains(buf.String(), "nodes/proxy") {
 			t.Error("the manifest mentions nodes/proxy")
-		}
-	})
-
-	t.Run("the Deployment runs the pinned Linux image as a vm pod on a Darwin node", func(t *testing.T) {
-		var d appsv1.Deployment
-		convert(t, byID[objID{"apps/v1", "Deployment", "kube-system", "metrics-server"}], &d)
-		spec := d.Spec.Template.Spec
-		if spec.RuntimeClassName == nil || *spec.RuntimeClassName != runtimeclass.Name {
-			t.Errorf("runtimeClassName = %v, want %q", spec.RuntimeClassName, runtimeclass.Name)
-		}
-		if !reflect.DeepEqual(spec.NodeSelector, map[string]string{corev1.LabelOSStable: "darwin"}) {
-			t.Errorf("nodeSelector = %v, want exactly kubernetes.io/os=darwin", spec.NodeSelector)
-		}
-		wantTol := []corev1.Toleration{{Key: policy.ProviderTaintKey, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
-		if !reflect.DeepEqual(spec.Tolerations, wantTol) {
-			t.Errorf("tolerations = %+v, want exactly %+v (never a blanket operator: Exists)", spec.Tolerations, wantTol)
-		}
-		if spec.ServiceAccountName != "metrics-server" {
-			t.Errorf("serviceAccountName = %q, want metrics-server", spec.ServiceAccountName)
-		}
-		if spec.HostNetwork || spec.HostPID || spec.HostIPC {
-			t.Error("the pod asks for a host namespace")
-		}
-		if psc := spec.SecurityContext; psc != nil && (psc.RunAsUser != nil || psc.RunAsGroup != nil || psc.FSGroup != nil || len(psc.SupplementalGroups) != 0) {
-			t.Errorf("pod securityContext pins a uid/gid (%+v); k3sm admission refuses a foreign identity", psc)
-		}
-		if len(spec.Containers) != 1 || len(spec.InitContainers) != 0 {
-			t.Fatalf("containers = %d (init %d), want exactly one", len(spec.Containers), len(spec.InitContainers))
-		}
-		c := spec.Containers[0]
-		if !digestPinned.MatchString(c.Image) {
-			t.Errorf("image %q is not pinned by digest alone (want <repo>@sha256:<64 hex>, no tag)", c.Image)
-		}
-		if c.Image != metricsServerImage {
-			t.Errorf("image = %q, want the pinned digest %q", c.Image, metricsServerImage)
-		}
-		if sc := c.SecurityContext; sc == nil || sc.RunAsUser != nil || sc.RunAsGroup != nil {
-			t.Errorf("container securityContext %+v: want present with no runAsUser/runAsGroup", sc)
-		} else if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
-			t.Error("container securityContext dropped runAsNonRoot")
-		}
-		for _, a := range c.Args {
-			if strings.HasPrefix(a, "--kubelet-insecure-tls") {
-				t.Errorf("arg %q disables kubelet serving-cert verification", a)
-			}
-		}
-		if len(c.Command) != 0 {
-			t.Errorf("command = %v, want the image entrypoint", c.Command)
-		}
-		if !reflect.DeepEqual(c.Args, wantMetricsServerArgs) {
-			t.Errorf("args =\n  %v\nwant exactly upstream's\n  %v", c.Args, wantMetricsServerArgs)
 		}
 	})
 

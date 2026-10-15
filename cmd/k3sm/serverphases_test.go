@@ -29,8 +29,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
-
-	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
 // TestServerPhaseStopsAreNeverNil pins the contract runServer's unconditional
@@ -93,10 +91,9 @@ func TestServerPhaseStopsAreNeverNil(t *testing.T) {
 
 // TestAddonPosture pins the facts the gated embedded add-ons key on. The kubelet
 // CA fact is inferred from the mesh-provisioned cluster-CA serving pair (a mesh IP
-// AND that pair); the vm fact is a CLUSTER fact, any Node carrying the vm
-// RuntimeClass label, so a vm-labelled worker counts even when the server itself
-// cannot host guests; and a failed node read, or a read showing no Node at all, is
-// Undecided, never "no vm node": only positive evidence may lead to a withdrawal.
+// AND that pair); no node capability is read, because the add-on is a native pod;
+// and a failed node read, or a read showing no Node at all, is Undecided: only
+// positive evidence may lead to a withdrawal.
 func TestAddonPosture(t *testing.T) {
 	mesh := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
 	mesh.cfg.ServingCertFile, mesh.cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
@@ -108,25 +105,22 @@ func TestAddonPosture(t *testing.T) {
 	node := func(name string, labels map[string]string) *corev1.Node {
 		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
 	}
-	vmWorker := node("k3sm-worker", map[string]string{runtimeclass.LabelVirtualization: runtimeclass.LabelTrue})
 	plainServer := node("k3sm-server", map[string]string{"kubernetes.io/os": "darwin"})
-	falseLabel := node("k3sm-odd", map[string]string{runtimeclass.LabelVirtualization: "false"})
+	worker := node("k3sm-worker", map[string]string{"kubernetes.io/os": "darwin"})
 	for _, tc := range []struct {
 		name      string
 		plan      serverPlan
 		nodes     []runtime.Object
 		listErr   error
 		wantCA    bool
-		wantVM    bool
 		undecided bool
 	}{
-		{"mesh, a vm-labelled worker and a non-vm server", mesh, []runtime.Object{plainServer, vmWorker}, nil, true, true, false},
-		{"mesh, no labelled node", mesh, []runtime.Object{plainServer}, nil, true, false, false},
-		{"mesh, a label with any other value does not count", mesh, []runtime.Object{plainServer, falseLabel}, nil, true, false, false},
-		{"single-node with the serving pair and a vm-labelled node", singleNode, []runtime.Object{vmWorker}, nil, false, true, false},
-		{"mesh ip but no cluster-CA serving pair", noPair, []runtime.Object{vmWorker}, nil, false, true, false},
-		{"node read fails", mesh, nil, errors.New("connection refused"), true, false, true},
-		{"no Node registered yet is undecided, not 'no vm node'", mesh, nil, nil, true, false, true},
+		{"mesh, a server and a worker", mesh, []runtime.Object{plainServer, worker}, nil, true, false},
+		{"mesh, a single server node still decides", mesh, []runtime.Object{plainServer}, nil, true, false},
+		{"single-node with the serving pair", singleNode, []runtime.Object{plainServer}, nil, false, false},
+		{"mesh ip but no cluster-CA serving pair", noPair, []runtime.Object{worker}, nil, false, false},
+		{"node read fails", mesh, nil, errors.New("connection refused"), true, true},
+		{"no Node registered yet is undecided", mesh, nil, nil, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := fake.NewSimpleClientset(tc.nodes...)
@@ -134,8 +128,17 @@ func TestAddonPosture(t *testing.T) {
 				cs.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) { return true, nil, tc.listErr })
 			}
 			got := addonPosture(context.Background(), tc.plan, cs.CoreV1().Nodes())
-			if got.ClusterCAKubeletServing != tc.wantCA || got.VMNode != tc.wantVM || (got.Undecided != "") != tc.undecided {
-				t.Errorf("addonPosture = %+v, want ClusterCAKubeletServing=%v VMNode=%v undecided=%v", got, tc.wantCA, tc.wantVM, tc.undecided)
+			if got.ClusterCAKubeletServing != tc.wantCA || (got.Undecided != "") != tc.undecided {
+				t.Errorf("addonPosture = %+v, want ClusterCAKubeletServing=%v undecided=%v", got, tc.wantCA, tc.undecided)
+			}
+			lists := 0
+			for _, a := range cs.Actions() {
+				if a.GetVerb() == "list" {
+					lists++
+				}
+			}
+			if lists != 1 {
+				t.Errorf("%d node reads, want exactly one", lists)
 			}
 		})
 	}

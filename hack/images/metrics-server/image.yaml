@@ -1,0 +1,28 @@
+# The metrics-server add-on image: the ONE record of its digest. The embedded
+# manifest (pkg/addons/manifests/metrics-server.yaml) carries a checked copy of
+# image.ref; pkg/addons TestMetricsServerImageLockstep reds on any difference,
+# and `build.sh --live` resolves image.ref anonymously in the registry.
+#
+# Produced by build.sh (README.md). `k3sm build` writes one darwin/arm64 image
+# manifest and `k3sm image push` publishes it as is, so there is no image index:
+# image.index is empty and image.ref pins the darwin/arm64 manifest.
+#
+# published: false means these digests are a LOCAL build's. The operator pushes
+# the layout, makes the package public, re-derives the digest from the
+# published artifact by an anonymous fetch, records it here and sets
+# published: true; only then may the manifest change merge.
+image:
+  ref: ghcr.io/k3sm-io/metrics-server@sha256:2334cdb7df40b9efea2af2dc7444f16b715f6ee025fb849070e424f6900ad743
+  tag: ghcr.io/k3sm-io/metrics-server:v0.9.0
+  index: ""
+  platforms:
+    darwin/arm64: sha256:2334cdb7df40b9efea2af2dc7444f16b715f6ee025fb849070e424f6900ad743
+source:
+  module: sigs.k8s.io/metrics-server
+  version: v0.9.0
+  commit: df0ca06314dd3b367974d01bf3f9f6f3921256bf
+  sum: h1:nlqqZ2H0Xfko8eJC/1qaNVVT17hu4rxndkOi22KTZ4w=
+build:
+  toolchain: go1.27.2
+  binarySHA256: bbcb4d15e9b6b4b47f8344f97abf78afbf5700d47deb2e7d3bc241be1665d7ce
+published: false

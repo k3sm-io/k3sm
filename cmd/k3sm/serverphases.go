@@ -45,7 +45,6 @@ import (
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
 	"k3sm.io/k3sm/pkg/registrysvc"
-	"k3sm.io/k3sm/pkg/runtimeclass"
 	"k3sm.io/k3sm/pkg/svclb"
 )
 
@@ -100,13 +99,15 @@ func provisionServerCluster(ctx context.Context, plan serverPlan, cs kubernetes.
 // fault on this process: UNSURVIVABLE faults exit (a dead control-plane child does,
 // and the crash-loop breaker bounds the respawns); SURVIVABLE ones continue, and a
 // manifest that will not apply is survivable: the control plane is up without it.
-// The shipped set is metrics-server (pkg/addons/manifests/metrics-server.yaml),
-// applied only where it can serve (addonPosture).
+// The shipped set is metrics-server (pkg/addons/manifests/metrics-server.yaml), a
+// native pod pinned to server nodes (the control-plane role label
+// labelServerNode sets), applied only where it can serve (addonPosture): on the
+// mesh posture, whose kubelet serving certs chain to the in-cluster CA.
 //
 // A fresh multi-node cluster has no Node when this first runs, so the gate is
 // undecided then. On the mesh serving posture the gated add-ons are therefore
 // re-evaluated every addons.RegateInterval for the life of the process (Regate),
-// so metrics-server lands once a vm-capable node registers, with no restart. On a
+// so metrics-server lands once the first node registers, with no restart. On a
 // single-node server the kubelet-CA fact can never change in-process, so no loop is
 // started. The returned stop cancels the loop and waits for it; runServer defers it
 // so LIFO drains it before the control plane stops. It is never nil.
@@ -738,15 +739,19 @@ func startServerLBHosting(ctx context.Context, plan serverPlan, restCfg *rest.Co
 
 // prepareServerNode is steps 4g/4h and the first half of 5: ingress hosting +
 // the svclb decider (startServerLBHosting), then the admin client clearing a
-// stale role label the node cannot (repairServerNodeLabels), right before
-// runServer hands the node options to startNode (the Virtual Kubelet node,
-// reusing runNode's bring-up, which starts this node's svclb hoster).
+// stale role label the node cannot (repairServerNodeLabels) and setting the
+// control-plane role label the node may not set on itself (labelServerNode, in
+// its own goroutine bound to ctx, because on a first boot the Node registers only
+// after this returns), right before runServer hands the node options to startNode
+// (the Virtual Kubelet node, reusing runNode's bring-up, which starts this node's
+// svclb hoster).
 func prepareServerNode(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, nodeOpts nodeOptions, logger *slog.Logger) error {
 	opts := plan.opts
 	startServerLBHosting(ctx, plan, restCfg, cs, nodeOpts, logger)
 	if err := repairServerNodeLabels(ctx, cs, opts.nodeName, logger); err != nil {
 		return err
 	}
+	go labelServerNode(ctx, cs.CoreV1().Nodes(), opts.nodeName, controlPlaneLabelRetry, logger)
 	logger.Info(fmt.Sprintf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName))
 	return nil
 }
@@ -788,29 +793,13 @@ func repairServerNodeLabels(ctx context.Context, cs kubernetes.Interface, nodeNa
 // the kubelet serving cert stays self-signed, so the posture is false even with
 // the pair set. TestAddonPosture pins the inference.
 //
-// VMNode is a cluster fact: at least one Node carries the label the vm
-// RuntimeClass selects on (runtimeclass.LabelVirtualization=LabelTrue, as
-// applyVirtualizationLabel sets it), so every server of an HA pair computes the
-// same answer, and a server without vm does not withdraw an add-on running on a
-// vm-capable worker. VMNode false is set only on POSITIVE evidence: a second read
-// shows at least one Node, and the first showed none labelled. A failed read, or
-// a cluster with no Node at all (a stale LIST, or a fresh cluster before any node
-// registers), is Posture.Undecided, which neither applies nor withdraws.
+// The Node read is the undecided guard: a failed read, or a cluster with no Node
+// at all (a stale LIST, or a fresh cluster before any node registers), is
+// Posture.Undecided, which neither applies nor withdraws, because only positive
+// evidence may withdraw a working add-on. One Node is enough to decide.
 func addonPosture(ctx context.Context, plan serverPlan, nodes nodeLister) addons.Posture {
 	p := addons.Posture{
 		ClusterCAKubeletServing: plan.opts.meshIP != "" && plan.cfg.ServingCertFile != "" && plan.cfg.ServingKeyFile != "",
-	}
-	labelled, err := nodes.List(ctx, metav1.ListOptions{
-		LabelSelector: runtimeclass.LabelVirtualization + "=" + runtimeclass.LabelTrue,
-		Limit:         1,
-	})
-	if err != nil {
-		p.Undecided = fmt.Sprintf("list nodes labelled %s: %v", runtimeclass.LabelVirtualization, err)
-		return p
-	}
-	if len(labelled.Items) > 0 {
-		p.VMNode = true
-		return p
 	}
 	registered, err := nodes.List(ctx, metav1.ListOptions{Limit: 1})
 	switch {

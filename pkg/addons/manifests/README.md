@@ -4,14 +4,16 @@ Every `*.yaml` / `*.yml` file in this directory is **compiled into the `k3sm` bi
 (`//go:embed manifests` in `../addons.go`) and server-side-applied onto the cluster on every
 server start by `addons.Reconciler.Converge`.
 
-It holds one add-on today: **`metrics-server.yaml`**, upstream metrics-server v0.9.0. Its RBAC
-is upstream's verbatim; its Deployment header comment lists the only lines changed to run the
-Linux image as a `vm` pod on a Darwin node. `TestMetricsServerAddonManifest` pins the exact
-object set, the RBAC, the image digest and the scheduling fields, so any change to this file
-is a deliberate change to that test too. It is applied only where it can serve (a
-multi-node cluster CA posture and at least one Node labelled for the `vm` RuntimeClass);
-elsewhere it is skipped and withdrawn. It is never applied over an operator's own
-metrics.k8s.io APIService. See `TestMetricsServerAddonGate`.
+It holds one add-on today: **`metrics-server.yaml`**, upstream metrics-server v0.9.0. Its RBAC,
+Service and APIService are upstream's bytes; its header comment lists the only Deployment lines
+changed to run k3sm's native darwin/arm64 build (`hack/images/metrics-server/`) as a native pod
+on a server node. `TestMetricsServerAddonManifest` pins the exact object set and the RBAC;
+`TestMetricsServerAddonRunsNative` pins the scheduling fields, the args and the upstream bytes;
+`TestMetricsServerImageLockstep` binds the image line to `hack/images/metrics-server/image.yaml`,
+its one digest record. Any change to this file is a deliberate change to those tests too. It is
+applied only where it can serve (the multi-node cluster CA posture); elsewhere it is skipped and
+withdrawn. It is never applied over an operator's own metrics.k8s.io APIService. See
+`TestMetricsServerAddonGate`.
 
 ## Why the manifests live in the binary and not on disk
 

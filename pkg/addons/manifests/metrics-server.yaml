@@ -7,18 +7,26 @@
 #   sha256 1cec29a5267809306a2c6ec74a3e449abbb705b4a8beed0c8a1963910f72c79b
 # The ServiceAccount, both ClusterRoles, all three bindings, the Service and the
 # APIService are byte-for-byte that release (upstream RBAC verbatim, nothing
-# wider). The Deployment differs ONLY in these lines, each needed to run the
-# upstream Linux image on a Darwin node:
-#   - runtimeClassName: vm             the image is linux; it runs in a vm pod
+# wider). The Deployment differs ONLY in these lines, each needed to run
+# metrics-server as a native pod on a Darwin server node:
+#   - image pinned by digest           k3sm's native darwin/arm64 build of the
+#                                      same v0.9.0 source, built from the pinned
+#                                      module by hack/images/metrics-server/
+#                                      (image.yaml is the one digest record)
 #   - nodeSelector kubernetes.io/os: darwin (was linux; k3sm nodes are darwin)
 #   - toleration k3sm.io/provider      the NoSchedule taint on every k3sm node
-#   - image pinned by digest           the v0.9.0 multi-arch index from
-#                                      registry.k8s.io (linux/arm64 and
-#                                      linux/amd64 inside; the vm path selects)
+#   - node affinity on node-role.kubernetes.io/control-plane=true: server nodes
+#     only, the label each server sets on its own Node (keeps the token off workers)
+#   - automountServiceAccountToken: true, explicit: the scrape authenticates
+#     with this ServiceAccount's token
 #   - securityContext runAsUser removed: k3sm admission refuses a foreign uid on
-#     every pod; the image's own USER 65534 still satisfies runAsNonRoot.
-# The args are upstream's, unchanged: --metric-resolution stays at 15s, and there
-# is no --kubelet-insecure-tls.
+#     every pod.
+#   - securityContext runAsNonRoot removed: a native pod runs as the node's fixed
+#     _k3sm uid by construction, and a FROM-scratch image carries no numeric USER
+#     for the kubelet-side check to read.
+# No runtimeClassName: the pod is native, not a vm pod. The args are upstream's,
+# unchanged: --metric-resolution stays at 15s, and there is no
+# --kubelet-insecure-tls.
 #
 # The kubelet scrape authenticates with this ServiceAccount's token: the k3sm
 # kubelet endpoint admits a bearer token on /metrics/resource only after a
@@ -160,7 +168,16 @@ spec:
       labels:
         k8s-app: metrics-server
     spec:
-      runtimeClassName: vm
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: In
+                values:
+                - "true"
+      automountServiceAccountToken: true
       containers:
       - args:
         - --cert-dir=/tmp
@@ -168,7 +185,7 @@ spec:
         - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
         - --kubelet-use-node-status-port
         - --metric-resolution=15s
-        image: registry.k8s.io/metrics-server/metrics-server@sha256:d9862115e7c7881280d3d75ca26bda8ffc0fc213315979575bf23ce9826205c0
+        image: ghcr.io/k3sm-io/metrics-server@sha256:2334cdb7df40b9efea2af2dc7444f16b715f6ee025fb849070e424f6900ad743
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 3
@@ -200,7 +217,7 @@ spec:
             drop:
             - ALL
           readOnlyRootFilesystem: true
-          runAsNonRoot: true
+          # runAsNonRoot omitted: native pods run as the fixed _k3sm uid; the scratch image has no USER.
           seccompProfile:
             type: RuntimeDefault
         volumeMounts:

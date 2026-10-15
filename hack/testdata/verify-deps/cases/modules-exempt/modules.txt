@@ -1,0 +1,2 @@
+example.com/old v1.2.3
+example.com/fresh v1.1.0

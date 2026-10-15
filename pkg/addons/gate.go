@@ -39,11 +39,6 @@ type Posture struct {
 	// certs and is the controller-manager's --root-ca-file. On a single-node
 	// server the kubelet cert is self-signed and it does not hold.
 	ClusterCAKubeletServing bool
-	// VMNode reports that at least one Node in the cluster carries the label the
-	// vm RuntimeClass selects on, so a Linux add-on image has somewhere to run.
-	// It is a cluster fact, so every server computes the same answer. False is
-	// POSITIVE evidence: the read showed at least one Node and none labelled.
-	VMNode bool
 	// Undecided, when set, says why the server could not establish the facts
 	// above: a failed read, or a read that showed no Node at all (a stale LIST,
 	// or the first start of a fresh cluster). Every gated add-on is then left
@@ -192,13 +187,11 @@ var requirements = map[string]requirement{
 // metricsServerRequirement is metrics-server's serving condition. Applied
 // without it, the pod never becomes Ready, so the v1beta1.metrics.k8s.io
 // APIService stays unavailable, which breaks aggregated discovery and wedges
-// namespace deletion cluster-wide.
+// namespace deletion cluster-wide. The add-on is a native darwin pod, so it needs
+// no particular node capability: only the verified kubelet scrape.
 func metricsServerRequirement(p Posture) string {
-	switch {
-	case !p.ClusterCAKubeletServing:
+	if !p.ClusterCAKubeletServing {
 		return "kubelet serving certs do not chain to the in-cluster CA (single-node posture), so metrics-server's verified kubelet scrape cannot succeed"
-	case !p.VMNode:
-		return "no node carries the vm RuntimeClass label (k3sm.io/virtualization), so the Linux metrics-server pod cannot run"
 	}
 	return ""
 }
