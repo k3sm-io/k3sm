@@ -179,7 +179,7 @@ func recordFor(t *testing.T, cfg install.Config) (read func(string) ([]byte, err
 // record keeps and replaces the list; and a rotation checks the reissued leaf
 // still carries the recorded names.
 func TestAPIServerServingCertTLSSAN(t *testing.T) {
-	stubLocalAddrs(t, "192.168.0.50", "fe80::1", tlsSANTestMesh)
+	stubLocalAddrs(t, "192.0.2.50", "fe80::1", tlsSANTestMesh)
 
 	issued := []struct {
 		name    string
@@ -190,9 +190,9 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 		{name: "no extras is exactly the fixed set", extra: nil},
 		{
 			name:    "hostnames and local IPs are added, canonicalised and deduplicated",
-			extra:   []string{"API.Example.com", "lb.example.net", "api.example.com", "192.168.0.50", "::ffff:192.168.0.50", "::1"},
+			extra:   []string{"API.Example.com", "lb.example.net", "api.example.com", "192.0.2.50", "::ffff:192.0.2.50", "::1"},
 			wantDNS: []string{"api.example.com", "lb.example.net"},
-			wantIPs: []string{"192.168.0.50", "::1"},
+			wantIPs: []string{"192.0.2.50", "::1"},
 		},
 		{name: "the mesh IP named again adds nothing", extra: []string{tlsSANTestMesh}},
 	}
@@ -318,7 +318,7 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 	})
 
 	t.Run("the install record keeps the list and a new list replaces it", func(t *testing.T) {
-		first := install.Config{Role: install.RoleServer, MeshIP: tlsSANTestMesh, TLSSANs: []string{"api.example.com", "192.168.0.50"}}
+		first := install.Config{Role: install.RoleServer, MeshIP: tlsSANTestMesh, TLSSANs: []string{"api.example.com", "192.0.2.50"}}
 		read, rec := recordFor(t, first)
 		got, err := install.InstalledTLSSANs(read, "/no-plist", rec)
 		if err != nil || !slices.Equal(got, first.TLSSANs) {
@@ -339,12 +339,12 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 			t.Errorf("reinstall with a new list recorded %v, %v; want [lb.example.net]", got, err)
 		}
 		// The install flag resolves against the recorded mesh IP.
-		o, err := parseInstallFlags([]string{"--user", "alice", "--tls-san", "API.example.com", "--tls-san=192.168.0.50"})
+		o, err := parseInstallFlags([]string{"--user", "alice", "--tls-san", "API.example.com", "--tls-san=192.0.2.50"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		sans, err := o.resolveTLSSANs(read, "/no-plist", rec)
-		if err != nil || !slices.Equal(sans, []string{"api.example.com", "192.168.0.50"}) {
+		if err != nil || !slices.Equal(sans, []string{"api.example.com", "192.0.2.50"}) {
 			t.Errorf("resolved = %v, %v", sans, err)
 		}
 		none := func(string) ([]byte, error) { return nil, fs.ErrNotExist }
@@ -357,7 +357,7 @@ func TestAPIServerServingCertTLSSAN(t *testing.T) {
 	})
 
 	t.Run("rotation reissues a leaf that keeps the recorded names", func(t *testing.T) {
-		read, rec := recordFor(t, install.Config{Role: install.RoleServer, MeshIP: tlsSANTestMesh, TLSSANs: []string{"api.example.com", "192.168.0.50"}})
+		read, rec := recordFor(t, install.Config{Role: install.RoleServer, MeshIP: tlsSANTestMesh, TLSSANs: []string{"api.example.com", "192.0.2.50"}})
 		sans, err := install.InstalledTLSSANs(read, "/no-plist", rec)
 		if err != nil {
 			t.Fatal(err)
@@ -435,10 +435,10 @@ func TestTLSSANFlagRegistered(t *testing.T) {
 	var opts serverOptions
 	fsys := flag.NewFlagSet("server", flag.ContinueOnError)
 	_ = registerServerFlags(fsys, &opts)
-	if err := fsys.Parse([]string{"--tls-san", "a.example.com", "--tls-san=192.168.0.50"}); err != nil {
+	if err := fsys.Parse([]string{"--tls-san", "a.example.com", "--tls-san=192.0.2.50"}); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal([]string(opts.tlsSANs), []string{"a.example.com", "192.168.0.50"}) {
+	if !slices.Equal([]string(opts.tlsSANs), []string{"a.example.com", "192.0.2.50"}) {
 		t.Errorf("tlsSANs = %v", opts.tlsSANs)
 	}
 }
