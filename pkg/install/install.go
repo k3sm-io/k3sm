@@ -1308,6 +1308,10 @@ type Config struct {
 	// kubeconfig` and `uninstall --purge` read it back. Empty keeps a carried
 	// name; DefaultKubeconfigName clears it. Control plane only.
 	KubeconfigName string
+	// TLSSANs is `k3sm install --tls-san`: extra names for the apiserver's
+	// serving certificate, validated by the CLI. A non-empty list REPLACES the
+	// carried --tls-san set and nil keeps it (setTLSSANArgs). Control plane only.
+	TLSSANs []string
 	// NodePortAddresses is `k3sm install --nodeport-addresses`, carried in the
 	// node daemon's arguments for its Role (setNodePortAddressesArg). Nil keeps
 	// a carried value; an empty value removes it.
@@ -1632,24 +1636,8 @@ func (c Config) resolvedExtraServerArgs() []string {
 	if c.etcdRequested() {
 		args = setEtcdArgs(args, c)
 	}
-	return setEtcdSnapshotArgs(args, c.EtcdSnapshots)
+	return setEtcdSnapshotArgs(setTLSSANArgs(args, c.TLSSANs), c.EtcdSnapshots)
 }
-
-// kubeconfigName is the effective admin kubeconfig name: the recorded
-// --kubeconfig-name, else DefaultKubeconfigName.
-func (c Config) kubeconfigName() string {
-	if n := flagValue(c.resolvedExtraServerArgs(), kubeconfigNameFlag); n != "" {
-		return n
-	}
-	return DefaultKubeconfigName
-}
-
-// RecordedServerArgs returns the operator `k3sm server` arguments an install
-// with cfg renders after the managed set AND writes to the server-arguments
-// record: the carried arguments with this install's --mesh-ip and HA request
-// merged in. It is exported so the CLI can assert, without root, that what
-// its flags ask for is what a later reinstall carries forward.
-func RecordedServerArgs(cfg Config) []string { return cfg.resolvedExtraServerArgs() }
 
 // meshIP returns the effective --mesh-ip value (resolvedExtraServerArgs), or ""
 // when the server runs single-node. It is the discriminator between the two

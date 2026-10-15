@@ -32,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
@@ -82,6 +83,9 @@ func runInstall(args []string) error {
 	ctx := context.Background()
 	sys := install.NewDarwinSystem()
 	cfg := opts.installConfig(self, volume, logger)
+	if cfg.TLSSANs, err = opts.resolveTLSSANs(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath); err != nil {
+		return err
+	}
 	if opts.fromStaging != "" {
 		// The seams the --from-staging predicate and the signing continuity
 		// check read through, and the version the downgrade rule compares.
@@ -154,6 +158,7 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 		DataVolume:        volume,
 		RemoveOldDataRoot: o.removeOldDataRoot,
 		MeshIP:            o.meshIP,
+		TLSSANs:           o.tlsSANs,
 		KubeconfigName:    o.recordedKubeconfigName(),
 		NodePortAddresses: o.recordedNodePortAddresses(),
 		LAN:               o.recordedLAN(),
@@ -167,6 +172,27 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 			Executable:     self,
 		},
 	}
+}
+
+// resolveTLSSANs is the install-time judgement of --tls-san, made before
+// anything is written: nil when the flag was not passed (the recorded list is
+// kept), else the list in canonical spelling, which replaces the recorded one.
+// The server's effective mesh IP is --mesh-ip when passed, else the installed
+// one (read the way install.InstalledMeshIP reads it); without one the server
+// is single-node and --tls-san is refused (checkInstallTLSSANs).
+func (o installFlags) resolveTLSSANs(read func(string) ([]byte, error), plistPath, recordPath string) ([]string, error) {
+	if len(o.tlsSANs) == 0 {
+		return nil, nil
+	}
+	meshIP := o.meshIP
+	if meshIP == "" {
+		installed, err := install.InstalledMeshIP(read, plistPath, recordPath)
+		if err != nil {
+			return nil, fmt.Errorf("--%s: read the installed --mesh-ip: %w", install.TLSSANFlag, err)
+		}
+		meshIP = installed
+	}
+	return checkInstallTLSSANs(o.tlsSANs, meshIP, o.serviceCIDR)
 }
 
 // recordedKubeconfigName is --kubeconfig-name when the operator passed it, and
@@ -269,6 +295,9 @@ type installFlags struct {
 	dataVolumeEncrypt bool
 	removeOldDataRoot bool
 	meshIP            string
+	// tlsSANs is --tls-san, as passed; resolveTLSSANs validates it against
+	// the effective mesh IP and this Mac's addresses.
+	tlsSANs           tlsSANList
 	kubeconfigName    string
 	nodePortAddresses string
 	lan               install.LAN
@@ -315,6 +344,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.dataVolumeEncrypt, "data-volume-encrypt", false, "encrypt the data volume with a random passphrase kept in the System keychain (a volume k3sm creates only)")
 	fs.BoolVar(&o.removeOldDataRoot, "remove-old-data-root", false, "after a verified migration, delete the .pre-volume copy of the old data root instead of keeping it")
 	fs.StringVar(&o.meshIP, "mesh-ip", "", "this node's wireguard mesh address, written into the server daemon's arguments; needed on every Mac that serves the control plane in a multi-node cluster")
+	fs.Var(&o.tlsSANs, install.TLSSANFlag, tlsSANUsage)
 	fs.StringVar(&o.kubeconfigName, "kubeconfig-name", install.DefaultKubeconfigName, "the cluster, user and context name the admin kubeconfig is merged under in your ~/.kube/config (the k3s --write-kubeconfig-name analog). It is recorded with the other install arguments, so k3sm kubectl, k3sm kubeconfig and uninstall --purge use it; a name already used by an entry k3sm did not create is refused")
 	fs.StringVar(&o.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage+". Written into the node daemon's arguments and kept across reinstalls; pass an empty value to go back to every interface")
 	fs.StringVar(&o.lanRaw, "lan", "", "LAN access for this node's NodePort, LoadBalancer and ingress listeners: off answers only on this Mac and the cluster mesh, on answers on every network this Mac is on. Not passed, a new install records off and an existing install keeps what it has (on, if it predates the setting). Change it later with 'sudo k3sm network lan on|off'. The apiserver, the worker join port and the mesh port do not follow it")
@@ -421,6 +451,7 @@ var serverOnlyInstallFlags = []string{
 	"server-join",
 	"service-cidr",
 	"mesh-ip",
+	install.TLSSANFlag,
 	"kubeconfig-name",
 	"data-volume",
 	"data-volume-name",

@@ -35,6 +35,36 @@ bootout and bootstrap does, which is what install performs).
 Running `sudo k3sm install --mesh-ip <new-address>` again later replaces the stored address with
 the new one. Leaving `--mesh-ip` off a later reinstall keeps whatever address was set before.
 
+## Extra Names for the Apiserver Certificate
+
+A server with `--mesh-ip` serves the apiserver with a certificate signed by the cluster CA. It is
+valid for the in-cluster names (`kubernetes`, `kubernetes.default` and the rest), `localhost`, the
+mesh address, `127.0.0.1` and the `kubernetes` Service address. To reach the apiserver by another
+name, such as a DNS name for this Mac or a load balancer in front of it, add the name with
+`--tls-san`, once per name:
+
+```sh
+sudo k3sm install --mesh-ip 100.64.0.1 --tls-san api.example.com --tls-san <this-macs-lan-address>
+```
+
+Each name is a hostname or an IP address. An IP address must be one this Mac holds: an address on
+one of its interfaces, its mesh address, or a loopback address. A hostname is checked for spelling
+only and is never looked up, because a load balancer or a public DNS name legitimately points
+somewhere else. Install refuses wildcards, a trailing dot, a port, a URL, an IPv6 zone, a name whose
+last label is all digits (some resolvers read `10.1` as an address), the names the certificate
+already carries, and addresses inside the pod or Service ranges. A server takes at most 32 names.
+
+The list is stored with the other server flags. Passing `--tls-san` on a later install replaces the
+whole list; leaving it off keeps the list you set before. The certificate is issued again every time
+the server starts, so a changed list takes effect when the server restarts, which install does for
+you. If an address in the list later leaves this Mac (a DHCP lease moved it, for example), the server
+logs a warning at start and still issues the name.
+
+`--tls-san` needs `--mesh-ip`. A single-node server's apiserver signs its own certificate in its
+certificate directory, so install refuses `--tls-san` there, and a server started without
+`--mesh-ip` logs a warning and ignores the list. A certificate signed by the cluster CA on a
+single-node server is not available yet.
+
 ## Joining an Agent
 
 On the server, mint a join token:

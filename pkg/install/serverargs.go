@@ -447,6 +447,94 @@ func setMeshIPArg(args []string, meshIP string) []string {
 	return append(dropValueArg(args, "mesh-ip"), "--mesh-ip", meshIP)
 }
 
+// kubeconfigName is the effective admin kubeconfig name: the recorded
+// --kubeconfig-name, else DefaultKubeconfigName.
+func (c Config) kubeconfigName() string {
+	if n := flagValue(c.resolvedExtraServerArgs(), kubeconfigNameFlag); n != "" {
+		return n
+	}
+	return DefaultKubeconfigName
+}
+
+// RecordedServerArgs returns the operator `k3sm server` arguments an install
+// with cfg renders after the managed set AND writes to the server-arguments
+// record: the carried arguments with this install's --mesh-ip and HA request
+// merged in. It is exported so the CLI can assert, without root, that what
+// its flags ask for is what a later reinstall carries forward.
+func RecordedServerArgs(cfg Config) []string { return cfg.resolvedExtraServerArgs() }
+
+// TLSSANFlag is the repeatable `k3sm server` flag that carries one extra
+// apiserver serving-certificate name (`k3sm install --tls-san`).
+const TLSSANFlag = "tls-san"
+
+// setTLSSANArgs merges Config.TLSSANs, the extra names the apiserver's serving
+// certificate carries (`k3sm install --tls-san`, validated by the CLI). An
+// empty list returns args unchanged, keeping the carried set. Otherwise every
+// carried --tls-san entry (either spelling, inline or separate value) is
+// removed and one "--tls-san=<name>" per name appended: the passed list
+// replaces the carried set as a whole. The inline form keeps each name one
+// argument, so a list counts once per name against dataroot.MaxServerArgs.
+func setTLSSANArgs(args, sans []string) []string {
+	if len(sans) == 0 {
+		return args
+	}
+	out := dropValueArg(args, TLSSANFlag)
+	for _, s := range sans {
+		out = append(out, "--"+TLSSANFlag+"="+s)
+	}
+	return out
+}
+
+// ServerArgValues returns every value of the repeatable valued flag name in
+// args (either spelling, inline or separate), in order.
+func ServerArgValues(args []string, name string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		n, v, inline := splitFlag(args[i])
+		if n != name {
+			continue
+		}
+		if inline {
+			out = append(out, v)
+			continue
+		}
+		if i+1 < len(args) {
+			out = append(out, args[i+1])
+			i++
+		}
+	}
+	return out
+}
+
+// InstalledTLSSANs returns the --tls-san names the installed control plane
+// runs with, read from the same two sources and in the same precedence as
+// InstalledMeshIP (the installed server plist, else the arguments record).
+// None recorded is nil with no error. It is exported for `k3sm certificate
+// rotate`, which checks that the reissued apiserver leaf still carries them.
+func InstalledTLSSANs(read func(path string) ([]byte, error), plistPath, recordPath string) ([]string, error) {
+	args, err := InstalledServerArgs(read, plistPath, recordPath)
+	if err != nil {
+		return nil, err
+	}
+	return ServerArgValues(args, TLSSANFlag), nil
+}
+
+// checkServerArgsBounds refuses, before anything is written, a control-plane
+// install whose rendered operator arguments the server-arguments record would
+// refuse (dataroot.ValidateServerArgs): too many, or one too long. Only an
+// install that passes --tls-san is checked here, the one request that can grow
+// the set by many arguments at once.
+func checkServerArgsBounds(cfg Config, carried []string) error {
+	if len(cfg.TLSSANs) == 0 {
+		return nil
+	}
+	cfg.ExtraServerArgs = carried
+	if err := dataroot.ValidateServerArgs(cfg.resolvedExtraServerArgs()); err != nil {
+		return fmt.Errorf("install: --%s: %w. Nothing has been written", TLSSANFlag, err)
+	}
+	return nil
+}
+
 // nodePortAddressesFlag is the node daemon flag (`k3sm server` and `k3sm agent`)
 // that carries `k3sm install --nodeport-addresses`.
 const nodePortAddressesFlag = "nodeport-addresses"
@@ -541,6 +629,11 @@ func preflightServerArgs(sys System, cfg Config) ([]string, error) {
 	}
 	cfg.ExtraServerArgs = extra
 	if err := refuseRetiredDatastoreFlags(cfg); err != nil {
+		return nil, err
+	}
+	// The rendered arguments must fit the record's bounds, which a long
+	// --tls-san list is the one way to approach; refusing here writes nothing.
+	if err := checkServerArgsBounds(cfg, extra); err != nil {
 		return nil, err
 	}
 	return extra, nil

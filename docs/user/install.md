@@ -353,6 +353,10 @@ records them in `/Library/Preferences/io.k3sm.server-args.json`, so they survive
 That file is root-owned and root-readable only, because a flag can carry a credential. `k3sm status`
 shows what the installed server is running with, on the `server-args` row.
 
+`--tls-san`, the extra names for the apiserver certificate on a server with `--mesh-ip`, is recorded
+the same way. Passing it on an install replaces the recorded list, and leaving it off keeps that
+list. See [Multi-node](multi-node.md#extra-names-for-the-apiserver-certificate).
+
 The record is written at install time. A flag you edit directly into the daemon's plist is picked up
 by the next `sudo k3sm install`, and until then it exists only in the plist, so an uninstall before
 that install loses it. Running `sudo k3sm install` after an edit is what makes it durable.

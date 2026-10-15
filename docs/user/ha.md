@@ -63,6 +63,10 @@ IP. That address is reachable from every Mac on the mesh, so either server's kub
 any of them. kubectl takes a single server address and does not fail over, so when one server is
 down, use the other server's kubeconfig.
 
+Each server issues its own apiserver certificate, so each carries its own `--tls-san` list. To reach
+every server by one load-balancer name, give that name to each of them when you install it. See
+[Multi-node](multi-node.md#extra-names-for-the-apiserver-certificate).
+
 A worker that joins receives a list of apiserver endpoints: the server it joined through first, then
 every other server whose node is Ready. Workers stay attached to the server they joined through;
 there is no client-side failover between servers yet.
