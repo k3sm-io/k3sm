@@ -947,6 +947,9 @@ type System interface {
 	// Now reads the wall clock. It is the one clock the restart sequence dates
 	// a daemon's bootstrap with (restartDaemon), so a test can pin the fence the
 	// post-restart verification counts bring-up failures from.
+	// It is a System method rather than the agentJoinClock restart.go already
+	// has because the fence must be read by the same object that sequences the
+	// bootout and the bootstrap, so a fake can pin it by call position.
 	Now() time.Time
 	// LaunchctlBootstrap loads the labelled daemon into the system domain.
 	LaunchctlBootstrap(label string) error

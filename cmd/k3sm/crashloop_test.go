@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/types"
 	"os"
 	"strings"
 	"testing"
@@ -272,5 +274,154 @@ func TestStopDuringBringUpRecordsNoCrash(t *testing.T) {
 				t.Errorf("entry %+v, want a bring-up entry with Permanent=%v", c, tc.wantPermanent)
 			}
 		})
+	}
+}
+
+// TestBringUpExemptionKeysOnTheSignalContext pins the context shape runServer
+// builds: the signal context, and a crash-cancellable child the bring-up runs
+// under. A component crash cancels only the child (componentExitHandler calls
+// crashCancel), and the bring-up then fails with context.Canceled. That bring-up
+// failed for real and must record, because the install's verification counts
+// only bring-up entries. The recorder is handed the signal context, so only the
+// daemon's own stop is exempt.
+func TestBringUpExemptionKeysOnTheSignalContext(t *testing.T) {
+	cancelledHealthWait := fmt.Errorf("start control plane: %w", &executor.BringUpError{Component: "kube-apiserver", Phase: executor.PhaseBringUp,
+		Err: fmt.Errorf("apiserver not healthy: %w", context.Canceled)})
+	for _, tc := range []struct {
+		name       string
+		crash      bool // cancel the child only, as crashCancel does
+		signal     bool // cancel the signal context, as SIGTERM does
+		wantRecord bool
+	}{
+		{name: "a component crash cancelled the bring-up while the stop context is live", crash: true, wantRecord: true},
+		{name: "the daemon's stop cancelled the bring-up", signal: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The shape runServer builds: stopCtx, then ctx derived from it.
+			stopCtx, stop := context.WithCancel(context.Background())
+			defer stop()
+			ctx, crashCancel := context.WithCancel(stopCtx)
+			defer crashCancel()
+			if tc.crash {
+				crashCancel()
+			}
+			if tc.signal {
+				stop()
+			}
+			if ctx.Err() == nil {
+				t.Fatal("the bring-up context must be done in every row; the row tests nothing")
+			}
+			dir := t.TempDir()
+			noteBringUpFailure(stopCtx, newCrashBreaker(dir, quietLogger()), quietLogger(), cancelledHealthWait)
+			path := executor.CrashLoopPath(dir)
+			rec, err := executor.ReadCrashRecord(path)
+			if !tc.wantRecord {
+				if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("a bring-up the daemon's own stop cancelled left a record: %+v (stat err %v)", rec.Crashes, statErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a crash-cancelled bring-up left no readable record at %s: %v", path, err)
+			}
+			if len(rec.Crashes) != 1 || rec.Crashes[0].Origin != executor.CrashOriginBringUp {
+				t.Fatalf("record %+v, want exactly one bring-up entry", rec.Crashes)
+			}
+		})
+	}
+}
+
+// TestRunServerHandsTheSignalContextToTheRecorder pins the wiring the test above
+// models: runServer passes the signal context (the one bound from
+// signal.NotifyContext, never rebound) to startControlPlane as its stop
+// argument, and startControlPlane hands that stop, not its crash-cancellable
+// ctx, to noteBringUpFailure.
+func TestRunServerHandsTheSignalContextToTheRecorder(t *testing.T) {
+	tr := runServerTrace(t)
+	run := tr.funcs["runServer"]
+	// The identifier the signal context is bound to.
+	var signalName string
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 || len(as.Lhs) == 0 {
+			return true
+		}
+		if call, ok := as.Rhs[0].(*ast.CallExpr); ok {
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "NotifyContext" {
+				if id, ok := as.Lhs[0].(*ast.Ident); ok {
+					signalName = id.Name
+				}
+			}
+		}
+		return true
+	})
+	if signalName == "" {
+		t.Fatal("runServer no longer binds a signal.NotifyContext result; this gate has stopped checking anything")
+	}
+	// It is never rebound, so it stays the signal context wherever it is read.
+	assigns := 0
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		if as, ok := n.(*ast.AssignStmt); ok {
+			for _, l := range as.Lhs {
+				if id, ok := l.(*ast.Ident); ok && id.Name == signalName {
+					assigns++
+				}
+			}
+		}
+		return true
+	})
+	if assigns != 1 {
+		t.Errorf("runServer assigns %s %d times; the signal context must be bound once and never rebound", signalName, assigns)
+	}
+	// runServer -> startControlPlane(ctx, <signal>, ...).
+	var cpCall *ast.CallExpr
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "startControlPlane" {
+				cpCall = call
+			}
+		}
+		return true
+	})
+	if cpCall == nil || len(cpCall.Args) < 2 {
+		t.Fatal("runServer no longer calls startControlPlane with a stop argument")
+	}
+	if id, ok := cpCall.Args[1].(*ast.Ident); !ok || id.Name != signalName {
+		t.Errorf("runServer passes %s as startControlPlane's stop context at %s, want the signal context %s: a crash-cancellable context makes a component crash look like a stop",
+			types.ExprString(cpCall.Args[1]), tr.where(cpCall), signalName)
+	}
+	// startControlPlane -> noteBringUpFailure(<its stop parameter>, ...).
+	cp := tr.funcs["startControlPlane"]
+	if cp == nil {
+		t.Fatal("no startControlPlane function")
+	}
+	params := []string{}
+	for _, f := range cp.Type.Params.List {
+		for _, n := range f.Names {
+			params = append(params, n.Name)
+		}
+	}
+	if len(params) < 2 {
+		t.Fatal("startControlPlane has no stop parameter")
+	}
+	stopParam := params[1]
+	found := false
+	ast.Inspect(cp.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if id, ok := call.Fun.(*ast.Ident); !ok || id.Name != "noteBringUpFailure" || len(call.Args) == 0 {
+			return true
+		}
+		found = true
+		if arg, ok := call.Args[0].(*ast.Ident); !ok || arg.Name != stopParam {
+			t.Errorf("startControlPlane hands %s to noteBringUpFailure at %s, want its stop parameter %s",
+				types.ExprString(call.Args[0]), tr.where(call), stopParam)
+		}
+		return true
+	})
+	if !found {
+		t.Error("startControlPlane no longer calls noteBringUpFailure")
 	}
 }
