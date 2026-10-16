@@ -16,9 +16,10 @@
 #   toolchain   the go on PATH is PAYLOAD_GO_VERSION.
 #   graph       go.mod and go.sum beside this script: upstream's module graph
 #               with golang.org/x/net at MS_XNET (an HTTP/2 server fix upstream
-#               has not released), so the build is upstream's source over a
-#               reviewed graph. It must require the pinned module, and its go.sum
-#               must hold MS_H1 for it.
+#               has not released) and the MS_FIXES security fixes, so the build
+#               is upstream's source over a reviewed graph. It must require the
+#               pinned module and each fix, and its go.sum must hold MS_H1 for
+#               the pinned module.
 #   build       `go build -mod=readonly` of the upstream main package from that
 #               graph: CGO_ENABLED=0 darwin/arm64 -trimpath, upstream's ldflags
 #               (-w and the client-go version stamps), buildDate from MS_EPOCH,
@@ -40,7 +41,8 @@
 #                                    rewrite buildinfo.lock from this build
 #   hack/images/metrics-server/build.sh --work <dir> --regen-graph
 #                                    regenerate go.mod and go.sum (the pinned
-#                                    module, then golang.org/x/net at MS_XNET);
+#                                    module, then golang.org/x/net at MS_XNET,
+#                                    then the MS_FIXES security fixes);
 #                                    review the diff as a dependency change
 #   hack/images/metrics-server/build.sh --live                anonymous resolve
 #                                    of image.yaml's ref in the registry
@@ -75,6 +77,13 @@ MS_EPOCH="2026-07-13T09:28:19Z"
 # The x/net the graph moves to: upstream v0.9.0 links v0.56.0, which carries
 # HTTP/2 server advisories reachable on the serving port.
 MS_XNET="v0.60.0"
+# The security fixes the graph also takes, each at the lowest version that fixes
+# every advisory open against upstream v0.9.0's own version: grpc for
+# GHSA-hrxh-6v49-42gf, GHSA-2v4p-qf9q-27wj, GHSA-vp52-pcj8-j9qc and
+# GHSA-qc2q-p7wx-3px3; cel-go for GHSA-gcjh-h69q-9w9g; otel/sdk and the two
+# otlptrace exporters for GHSA-8wmf-6v46-5gfg. Minimal version selection moves
+# otel, otel/metric, otel/trace, otlp proto, go-logr/logr and genproto with them.
+MS_FIXES="google.golang.org/grpc@v1.83.2 github.com/google/cel-go@v0.29.0 go.opentelemetry.io/otel/sdk@v1.45.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.45.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.45.0"
 # The version marker's variant: a pure-Go build over the patched graph.
 MS_VARIANT="nocgo+xnet-$MS_XNET"
 # The tag the operator pushes; consumers pin the digest image.yaml records.
@@ -138,12 +147,16 @@ PY
 }
 
 # graph_problems <dir>: go.mod and go.sum in <dir> are a graph this recipe may
-# build: they require the pinned module at MS_VERSION and x/net at MS_XNET,
-# carry no replace, and go.sum holds MS_H1 for the pinned module's zip.
+# build: they require the pinned module at MS_VERSION, x/net at MS_XNET and
+# every MS_FIXES module at its version, carry no replace, and go.sum holds MS_H1
+# for the pinned module's zip.
 graph_problems() {
-	local dir="$1" bad=0
+	local dir="$1" bad=0 fix
 	grep -Eq "^[[:space:]]+$MS_MODULE $MS_VERSION( |\$)" "$dir/go.mod" || { echo "go.mod does not require $MS_MODULE $MS_VERSION"; bad=1; }
 	grep -Eq "^[[:space:]]+golang.org/x/net $MS_XNET( |\$)" "$dir/go.mod" || { echo "go.mod does not require golang.org/x/net $MS_XNET"; bad=1; }
+	for fix in $MS_FIXES; do
+		grep -Eq "^[[:space:]]+${fix%@*} ${fix#*@}( |\$)" "$dir/go.mod" || { echo "go.mod does not require ${fix%@*} ${fix#*@}"; bad=1; }
+	done
 	grep -Eq '^[[:space:]]*replace([[:space:]]|\()' "$dir/go.mod" && { echo "go.mod carries a replace"; bad=1; }
 	grep -qxF "$MS_MODULE $MS_VERSION $MS_H1" "$dir/go.sum" || { echo "go.sum does not hold $MS_H1 for $MS_MODULE $MS_VERSION"; bad=1; }
 	return "$bad"
@@ -339,14 +352,16 @@ goenv "$GO" mod download -json "$MS_MODULE@$MS_VERSION" >"$WORK/download.json" |
 p="$(download_problems "$WORK/download.json")" || die "$p"
 echo "  Sum $MS_H1, commit $MS_COMMIT"
 
-echo "==> graph: $MS_MODULE $MS_VERSION with golang.org/x/net $MS_XNET"
+echo "==> graph: $MS_MODULE $MS_VERSION with golang.org/x/net $MS_XNET and $MS_FIXES"
 rm -rf "${WORK:?}/graph"
 mkdir -p "$WORK/graph"
 if [ "$REGEN" = 1 ]; then
 	(cd "$WORK/graph" &&
 		goenv "$GO" mod init k3sm.io/metrics-server-image &&
 		goenv "$GO" get "$MS_PACKAGE@$MS_VERSION" &&
-		goenv "$GO" get "golang.org/x/net@$MS_XNET") || die "could not regenerate the graph"
+		goenv "$GO" get "golang.org/x/net@$MS_XNET" &&
+		# shellcheck disable=SC2086 # MS_FIXES is a space-separated list
+		goenv "$GO" get $MS_FIXES) || die "could not regenerate the graph"
 	{ sed -n '/^\/\//p' "$HERE/go.mod"; cat "$WORK/graph/go.mod"; } >"$WORK/graph/go.mod.new"
 	mv "$WORK/graph/go.mod.new" "$WORK/graph/go.mod"
 	cp "$WORK/graph/go.mod" "$WORK/graph/go.sum" "$HERE/"

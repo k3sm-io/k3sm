@@ -11,7 +11,7 @@ the workers.
 | `build.sh` | the recipe: pinned module source, pinned toolchain, checks, `k3sm build` |
 | `selftest.sh` | the recipe's hermetic checks; `hack/ci.sh` runs it |
 | `image.yaml` | the one record of the image's digest; the manifest carries a checked copy |
-| `go.mod`, `go.sum` | the build's module graph: upstream's, with `golang.org/x/net` moved to v0.60.0 |
+| `go.mod`, `go.sum` | the build's module graph: upstream's, with `golang.org/x/net` moved to v0.60.0 and the security fixes in `MS_FIXES` |
 | `buildinfo.lock` | `go version -m` of the pinned build; a differing rebuild is refused |
 | `govulncheck.accepted` | govulncheck findings accepted one advisory at a time, each with a reason and an expiry |
 
@@ -27,6 +27,11 @@ the workers.
    v0.9.0 links x/net v0.56.0, whose HTTP/2 server advisories are reachable on
    metrics-server's serving port. Minimal version selection moves `x/crypto`,
    `x/sync`, `x/sys`, `x/term` and `x/text` with it, to the versions k3sm itself ships.
+   The graph also requires each module in `MS_FIXES` at its pinned version, the lowest
+   that fixes every advisory open against upstream's own version: `google.golang.org/grpc`
+   v1.83.2, `github.com/google/cel-go` v0.29.0, and `go.opentelemetry.io/otel/sdk` and the
+   two `otlptrace` exporters at v1.45.0. They move `otel`, `otel/metric`, `otel/trace`,
+   `go.opentelemetry.io/proto/otlp`, `go-logr/logr` and `genproto` with them.
    `--regen-graph` regenerates the two files; review that diff as a dependency change.
 4. Builds `cmd/metrics-server` from that graph (`go build -mod=readonly`) with the pinned Go (`PAYLOAD_GO_VERSION` in
    `hack/release/lib/gochild.sh`, the same pin the release payload uses):
@@ -66,12 +71,12 @@ so there is no image index. The pinned reference names the darwin/arm64 manifest
 | GO-2026-6617, 6612, 6611, 6603 | golang.org/x/net v0.56.0 | yes, on the serve path | `SecureServingInfo.Serve` calls `http2.ConfigureServer` for the secure port, and HTTP/2 framing runs before authentication. Fixed by the x/net v0.60.0 graph. |
 | GO-2026-6610 | golang.org/x/net v0.56.0 | client side only | fixed by the same graph |
 | GO-2026-5970 | golang.org/x/text v0.38.0 | not on attacker input | `idna` on the apiserver host name; fixed by the x/text the graph moves to |
-| GO-2026-6505 | go.opentelemetry.io/otel and its exporters | package init only | no tracing is configured; accepted |
-| GO-2026-6443 | google.golang.org/grpc | not reachable | package level only; no gRPC server runs; accepted |
-| GO-2026-6348, 6061 | google.golang.org/grpc | client transport only | every trace is `http2Client`, used by an otel exporter that is not configured; accepted |
+| GO-2026-6505 | go.opentelemetry.io/otel and its exporters | package init only | no tracing is configured; fixed by otel v1.45.0 in `MS_FIXES` |
+| GO-2026-6443 | google.golang.org/grpc | not reachable | package level only; no gRPC server runs; fixed by grpc v1.83.2 in `MS_FIXES` (v1.83.0 and v1.83.1 are still affected) |
+| GO-2026-6348, 6061 | google.golang.org/grpc | client transport only | every trace is `http2Client`, used by an otel exporter that is not configured; fixed by grpc v1.83.2 |
 
-Over the patched graph, source mode reports only GO-2026-6505, 6348 and 6061 as
-called, and every grpc trace is the client transport.
+Over the patched graph, `govulncheck -mode=binary` reports no finding, so
+`govulncheck.accepted` accepts nothing.
 
 ## Reproducibility
 
@@ -101,5 +106,7 @@ APIService unavailable.
 ## Bumping
 
 Change the pins at the top of `build.sh` together with the manifest header's vendored
-version, rebuild with `--update-lock`, review the `buildinfo.lock` diff as a dependency
-change, prune `govulncheck.accepted`, and publish as above.
+version, re-check every `MS_FIXES` pin against the new release's own graph (drop a fix
+upstream now carries), rebuild with `--regen-graph --update-lock`, review the `go.mod`,
+`go.sum` and `buildinfo.lock` diff as a dependency change, prune `govulncheck.accepted`,
+and publish as above.
