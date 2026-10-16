@@ -209,6 +209,8 @@ directory, so a dial from any other user is refused by the operating system befo
 sends anything. Pods are fenced off it separately, by the sandbox profile every Pod carries. They
 share the daemon's account, so file permissions alone would not keep them out.
 
+Without the socket, `kubectl get node <name> -o json` shows the node's images under `status.images`, the 50 largest, as a kubelet reports them.
+
 If a command reports that it cannot dial the socket, the node is not running, or it is running with
 a different runtime root. `k3sm doctor` reports the former in its daemon rows, with the command that
 repairs it under `Next:`; the latter is a `--socket` away.

@@ -61,6 +61,10 @@ type NodeStatusConfig struct {
 	// Ready is never contradicted — a runtime that cannot answer the question must
 	// not be allowed to answer it "no".
 	RuntimeHealthy func(ctx context.Context) bool
+	// Images lists the runtime's image store for Node.status.images. A nil value
+	// means the runtime keeps no image store (the host-process runtime), and the
+	// node reports no images.
+	Images ImageInventory
 	// Interval overrides the status recompute period; zero uses
 	// defaultNodeStatusInterval.
 	Interval time.Duration
@@ -76,7 +80,7 @@ type NodeStatusConfig struct {
 // surface goes wrong:
 //
 //   - It publishes a DEEP COPY of the node it was handed at bootstrap, with ONLY
-//     .Status.Conditions (and .Status.Phase) replaced. The node controller assigns
+//     .Status.Conditions (and .Status.Phase and .Status.Images) replaced. The node controller assigns
 //     the published Status, Labels and Annotations WHOLESALE over its own copy, so
 //     a provider that sends a conditions-only Node erases Capacity, Allocatable,
 //     the InternalIP the apiserver dials for logs/exec, the DaemonEndpoints port
@@ -110,6 +114,7 @@ type NodeStatusProvider struct {
 	dataRoot  string
 	interval  time.Duration
 	health    func(ctx context.Context) bool
+	inventory ImageInventory
 
 	// Seams, defaulted by the constructor. Tests replace them to drive the loop
 	// hermetically — no Mach, no statfs, no apiserver. sample is the HOST
@@ -118,12 +123,15 @@ type NodeStatusProvider struct {
 	now     func() time.Time
 	publish func(ctx context.Context, node *corev1.Node) error
 
-	// mu guards ready and prev. It is held only across the pure recompute, never
+	// mu guards ready, prev and images. It is held only across the pure recompute, never
 	// across publish (which can block on the node controller's update channel).
 	// Run is the single caller of publishOnce in production.
 	mu    sync.Mutex
 	ready *probeGauge
 	prev  []corev1.NodeCondition
+	// images is the last image list the runtime answered, carried across a
+	// failed listing so a transient error never publishes an empty list.
+	images []corev1.ContainerImage
 
 	// monitor owns the host sample (see the type doc).
 	monitor *pressureMonitor
@@ -159,6 +167,7 @@ func NewNodeStatusProvider(cfg NodeStatusConfig) (*NodeStatusProvider, error) {
 		dataRoot:  cfg.DataRoot,
 		interval:  interval,
 		health:    cfg.RuntimeHealthy,
+		inventory: cfg.Images,
 		sample:    sampleHostStats,
 		now:       time.Now,
 		publish:   naive.UpdateStatus,
@@ -260,8 +269,46 @@ func (p *NodeStatusProvider) publishOnce(ctx context.Context) error {
 	if p.health != nil {
 		healthy = p.health(ctx)
 	}
+	images := p.refreshImages(ctx)
 	node := p.recompute(s, sampled, healthy, metav1.NewTime(p.now()))
+	node.Status.Images = images
 	return p.publish(ctx, node)
+}
+
+// refreshImages lists the runtime's images for this publication, as a kubelet
+// does on every node status update, under ctx's deadline. On a listing error it
+// logs once at Warn and returns the previous list: a runtime that failed one
+// call still holds its images, and publishing an empty list would tell the
+// scheduler the node holds nothing. Before the first successful listing there is
+// no previous list and the field is omitted.
+func (p *NodeStatusProvider) refreshImages(ctx context.Context) []corev1.ContainerImage {
+	if p.inventory == nil {
+		return nil
+	}
+	entries, err := p.inventory.ImageIndexSnapshot(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err != nil {
+		if ctx.Err() == nil {
+			p.log.Warn("list node images failed; keeping the previous Node.status.images", "error", err)
+		}
+		return copyContainerImages(p.images)
+	}
+	p.images = nodeImages(entries, nodeStatusMaxImages)
+	return copyContainerImages(p.images)
+}
+
+// copyContainerImages deep-copies an image list, so the published node never
+// shares a backing array with the list the provider keeps.
+func copyContainerImages(in []corev1.ContainerImage) []corev1.ContainerImage {
+	if in == nil {
+		return nil
+	}
+	out := make([]corev1.ContainerImage, len(in))
+	for i := range in {
+		in[i].DeepCopyInto(&out[i])
+	}
+	return out
 }
 
 // recompute builds the node object to publish. It is the whole decision: pure
