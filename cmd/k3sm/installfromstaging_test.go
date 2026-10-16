@@ -27,8 +27,8 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 )
 
-// TestInstallFromStagingFlags pins the flag contract of --from-staging and
-// --allow-downgrade, including the exact argv the k3sm.app root step emits.
+// TestInstallFromStagingFlags pins the flag contract of --from-staging,
+// --allow-downgrade and --require-team-signature, including the exact argv the k3sm.app root step emits.
 func TestInstallFromStagingFlags(t *testing.T) {
 	t.Parallel()
 	const stage = "/Library/k3sm.staging/0.4.0.AbCdEfGh"
@@ -40,6 +40,8 @@ func TestInstallFromStagingFlags(t *testing.T) {
 		{name: "the app's server and update argv", args: []string{"--user", "admin", "--from-staging", stage}},
 		{name: "the app's join argv", args: []string{"--user", "admin", "--from-staging", stage, "--agent", "--server", "192.0.2.10", "--token-file", stage + "/join-token"}},
 		{name: "downgrade allowed beside --from-staging", args: []string{"--user", "admin", "--from-staging", stage, "--allow-downgrade"}},
+		{name: "both update flags beside --from-staging", args: []string{"--user", "admin", "--from-staging", stage, "--allow-downgrade", "--require-team-signature"}},
+		{name: "--require-team-signature alone is refused", args: []string{"--user", "admin", "--require-team-signature"}, want: "--require-team-signature needs --from-staging"},
 		{name: "--allow-downgrade alone is refused", args: []string{"--user", "admin", "--allow-downgrade"}, want: "--allow-downgrade needs --from-staging"},
 		{name: "a relative --from-staging is refused", args: []string{"--user", "admin", "--from-staging", "k3sm.staging/x"}, want: "must be a clean absolute path"},
 		{name: "an unclean --from-staging is refused", args: []string{"--user", "admin", "--from-staging", stage + "/../y"}, want: "must be a clean absolute path"},
@@ -66,6 +68,9 @@ func TestInstallFromStagingFlags(t *testing.T) {
 			}
 			if cfg.AllowDowngrade != o.set["allow-downgrade"] {
 				t.Errorf("AllowDowngrade = %v, want %v", cfg.AllowDowngrade, o.set["allow-downgrade"])
+			}
+			if cfg.RequireTeamSignature != o.set["require-team-signature"] {
+				t.Errorf("RequireTeamSignature = %v, want %v", cfg.RequireTeamSignature, o.set["require-team-signature"])
 			}
 		})
 	}

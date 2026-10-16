@@ -69,6 +69,19 @@ func checkStagedVersion(cfg Config) error {
 	return fmt.Errorf("install: %w: %s; pass --allow-downgrade to install it anyway", ErrDowngrade, reason)
 }
 
+// CompareReleaseVersions orders the release versions a and b by semver
+// precedence (-1, 0 or 1), the order the --from-staging downgrade check uses.
+// ok is false when either is not a release version ("dev", a Go
+// pseudo-version, anything that is not semver).
+func CompareReleaseVersions(a, b string) (cmp int, ok bool) {
+	va, okA := parseReleaseVersion(a)
+	vb, okB := parseReleaseVersion(b)
+	if !okA || !okB {
+		return 0, false
+	}
+	return va.compare(vb), true
+}
+
 // releaseVersion is a parsed semantic version. Build metadata is dropped, as
 // semver orders it.
 type releaseVersion struct {

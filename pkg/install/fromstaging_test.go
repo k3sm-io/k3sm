@@ -970,3 +970,81 @@ func TestDiscardStagedToken(t *testing.T) {
 		})
 	}
 }
+
+// TestRequireTeamSignature pins --require-team-signature: every Mach-O in the
+// staged tree, the staged k3sm included, must carry a Developer ID team
+// signature of its own; the installed binary is never consulted for it; and
+// the flag is refused on a plain install.
+func TestRequireTeamSignature(t *testing.T) {
+	t.Parallel()
+	helper := filepath.Join(testPayloadDir, VMHostName)
+	cases := []struct {
+		name   string
+		signer fakeSigner
+		want   error
+	}{
+		{name: "a fully signed tree is accepted", signer: fakeSigner{ids: signedTree(nil)}},
+		{name: "an ad-hoc staged k3sm is refused", want: ErrNoTeamID,
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{testStagedExe: ErrNoTeamID}}},
+		{name: "an ad-hoc helper is refused", want: ErrNoTeamID,
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{helper: ErrNoTeamID}}},
+		{name: "a helper signed Apple Development is refused", want: ErrNotDeveloperID,
+			signer: fakeSigner{ids: signedTree(nil), notDevID: map[string]bool{helper: true}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, cfg := stagedFixture()
+			cfg.RequireTeamSignature = true
+			cfg.Signer = tc.signer
+			entries, err := checkStagingTree(cfg.StagingFS, cfg.FromStagingDir)
+			if err != nil {
+				t.Fatalf("checkStagingTree = %v", err)
+			}
+			err = requireTeamSignatures(context.Background(), cfg, entries)
+			if tc.want != nil {
+				if !errors.Is(err, tc.want) || !strings.Contains(err.Error(), "--require-team-signature") {
+					t.Fatalf("requireTeamSignatures = %v, want %v naming the flag", err, tc.want)
+				}
+				if err := preflightFromStaging(context.Background(), &cfg); !errors.Is(err, tc.want) {
+					t.Fatalf("preflightFromStaging = %v, want %v", err, tc.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("requireTeamSignatures = %v, want accepted", err)
+			}
+			if err := preflightFromStaging(context.Background(), &cfg); err != nil {
+				t.Fatalf("preflightFromStaging = %v, want accepted", err)
+			}
+		})
+	}
+	t.Run("refused on a plain install", func(t *testing.T) {
+		t.Parallel()
+		cfg := Config{StagingOptions: StagingOptions{RequireTeamSignature: true}}.withDefaults()
+		if err := preflightFromStaging(context.Background(), &cfg); err == nil {
+			t.Fatal("preflightFromStaging accepted RequireTeamSignature without a staging directory")
+		}
+	})
+}
+
+// TestCompareReleaseVersions pins the exported comparator the managed update
+// uses for its downgrade check.
+func TestCompareReleaseVersions(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		a, b string
+		cmp  int
+		ok   bool
+	}{
+		{"v0.2.0", "0.2.0", 0, true},
+		{"v0.1.9", "v0.2.0", -1, true},
+		{"v0.2.0", "v0.2.0-rc.1", 1, true},
+		{"dev", "v0.2.0", 0, false},
+	} {
+		cmp, ok := CompareReleaseVersions(tc.a, tc.b)
+		if cmp != tc.cmp || ok != tc.ok {
+			t.Errorf("CompareReleaseVersions(%q, %q) = %d, %v; want %d, %v", tc.a, tc.b, cmp, ok, tc.cmp, tc.ok)
+		}
+	}
+}

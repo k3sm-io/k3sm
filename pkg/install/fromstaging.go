@@ -47,7 +47,10 @@ import (
 //     (unless --allow-downgrade; releaseversion.go);
 //   - the staged k3sm and every other Mach-O in the tree carry a Developer ID
 //     Application signature from one team, and on an update the installed
-//     /Library/k3sm/k3sm carries the same.
+//     /Library/k3sm/k3sm carries the same;
+//   - with --require-team-signature, every Mach-O in the tree, the staged k3sm
+//     included, carries a valid Developer ID Application signature of its own
+//     team, judged on its own and not against the installed build.
 //
 // Any doubt refuses. The copy-out removes its staging directory on every exit
 // path, so a refusal costs one re-run and leaves nothing behind. The two locks
@@ -153,6 +156,12 @@ type StagingOptions struct {
 	StagedVersion string
 	// AllowDowngrade is --allow-downgrade (with --from-staging only).
 	AllowDowngrade bool
+	// RequireTeamSignature is --require-team-signature (with --from-staging
+	// only): refuse the tree unless every Mach-O in it carries a Developer ID
+	// Application team signature, whatever the installed build carries. The
+	// managed update passes it for the required signature policy. The
+	// same-team continuity check runs as well.
+	RequireTeamSignature bool
 	// StagingFS and Signer are the read-only seams the --from-staging
 	// predicate and the signing continuity check judge through. Install
 	// refuses --from-staging when either is nil.
@@ -305,6 +314,9 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 		if cfg.AllowDowngrade {
 			return fmt.Errorf("install: AllowDowngrade applies only to an install from a k3sm.app staging directory")
 		}
+		if cfg.RequireTeamSignature {
+			return fmt.Errorf("install: RequireTeamSignature applies only to an install from a k3sm.app staging directory")
+		}
 		return nil
 	}
 	if cfg.StagingFS == nil || cfg.Signer == nil {
@@ -338,7 +350,43 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 	if err := checkStagedVersion(*cfg); err != nil {
 		return err
 	}
+	if cfg.RequireTeamSignature {
+		if err := requireTeamSignatures(ctx, *cfg, entries); err != nil {
+			return err
+		}
+	}
 	return checkSigningContinuity(ctx, *cfg, entries)
+}
+
+// requireTeamSignatures is --require-team-signature: the staged k3sm and every
+// other Mach-O in the staged tree must carry a valid identity signature whose
+// certificate is a Developer ID Application certificate of the team it names.
+// It never consults the installed binary, so an ad-hoc signed installed build
+// does not relax it.
+func requireTeamSignatures(ctx context.Context, cfg Config, entries []StagedEntry) error {
+	paths := []string{cfg.Executable}
+	for _, e := range entries {
+		if !e.Mode.IsRegular() || e.Path == cfg.Executable {
+			continue
+		}
+		macho, err := cfg.StagingFS.MachO(e.Path)
+		if err != nil {
+			return fmt.Errorf("install: %w", untrusted("read %s: %v", e.Path, err))
+		}
+		if macho {
+			paths = append(paths, e.Path)
+		}
+	}
+	for _, p := range paths {
+		team, err := cfg.Signer.TeamID(ctx, p)
+		if err != nil {
+			return fmt.Errorf("install: --require-team-signature: %s: %w", p, err)
+		}
+		if err := requireDeveloperID(ctx, cfg.Signer, p, team); err != nil {
+			return fmt.Errorf("--require-team-signature: %w", err)
+		}
+	}
+	return nil
 }
 
 // discardToken is DiscardStagedToken for cfg's --token-file.

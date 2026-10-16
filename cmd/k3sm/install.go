@@ -167,9 +167,10 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 		Start:             o.start,
 		Logger:            logger,
 		StagingOptions: install.StagingOptions{
-			FromStagingDir: o.fromStaging,
-			AllowDowngrade: o.allowDowngrade,
-			Executable:     self,
+			FromStagingDir:       o.fromStaging,
+			AllowDowngrade:       o.allowDowngrade,
+			RequireTeamSignature: o.requireTeamSignature,
+			Executable:           self,
 		},
 	}
 }
@@ -318,6 +319,9 @@ type installFlags struct {
 	fromStaging string
 	// allowDowngrade is --allow-downgrade, with --from-staging only.
 	allowDowngrade bool
+	// requireTeamSignature is --require-team-signature, with --from-staging
+	// only (install.StagingOptions.RequireTeamSignature).
+	requireTeamSignature bool
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
@@ -337,6 +341,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token (a joined node needs none). With --server-join: required; a file holding the server token `k3sm token create --server` printed on an existing server. Read once by this install and copied for the daemon; it must not be group- or world-readable, and it is yours to delete afterwards")
 	fs.StringVar(&o.fromStaging, "from-staging", "", "install from a k3sm.app staging directory: the directory directly inside "+install.DefaultStagingRoot+" that this k3sm runs from. Every file is installed from that directory, which must be owned by root and writable by nobody else. A --token-file must sit directly inside it, owned by root with mode 600, and is removed once read. Refuses an older version than the installed one, and a build signed by a different team")
 	fs.BoolVar(&o.allowDowngrade, "allow-downgrade", false, "with --from-staging: install even when the installed k3sm is newer, or its version cannot be read")
+	fs.BoolVar(&o.requireTeamSignature, "require-team-signature", false, "with --from-staging: refuse the install unless every Mach-O in the staging directory carries a Developer ID team signature, whatever the installed k3sm is signed with")
 	fs.BoolVar(&o.start, "start", false, "on a node stopped with 'k3sm stop', start it after installing (without it the node is updated and stays stopped)")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")
@@ -393,12 +398,16 @@ func parseInstallFlags(args []string) (installFlags, error) {
 }
 
 // validateFromStaging is the flag-level half of --from-staging: an absolute,
-// clean directory, and --allow-downgrade only beside it. The install package
+// clean directory, and --allow-downgrade and --require-team-signature only
+// beside it. The install package
 // judges the directory itself on disk, before anything is written.
 func (o installFlags) validateFromStaging() error {
 	if o.fromStaging == "" {
 		if o.allowDowngrade {
 			return fmt.Errorf("--allow-downgrade needs --from-staging: it relaxes the version check of an install from a k3sm.app staging directory, and a plain install makes none")
+		}
+		if o.requireTeamSignature {
+			return fmt.Errorf("--require-team-signature needs --from-staging: it tightens the signature check of an install from a staging directory, and a plain install makes none")
 		}
 		return nil
 	}
