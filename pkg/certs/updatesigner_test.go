@@ -72,6 +72,72 @@ func TestIssueUpdateSigner(t *testing.T) {
 	}
 }
 
+// TestCAClockMintsTheSigner pins the clock seam: a CA made on an injected
+// clock issues its signer on that clock, so the pair verifies at a time on it
+// whether that time is before or after the wall clock, and not an hour before it.
+func TestCAClockMintsTheSigner(t *testing.T) {
+	t.Parallel()
+	for name, at := range map[string]time.Time{
+		"a year before the wall clock": time.Now().AddDate(-1, 0, 0),
+		"a year after the wall clock":  time.Now().AddDate(1, 0, 0),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ca, err := NewCAWithClock("k3sm-cluster-ca", func() time.Time { return at })
+			if err != nil {
+				t.Fatal(err)
+			}
+			s, err := ca.IssueUpdateSigner()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range []*x509.Certificate{ca.Cert, s.Cert} {
+				if !c.NotBefore.Equal(at.Add(-time.Hour).Truncate(time.Second)) {
+					t.Errorf("%s NotBefore = %v, want an hour before %v", c.Subject.CommonName, c.NotBefore, at)
+				}
+			}
+			roots := x509.NewCertPool()
+			roots.AddCert(ca.Cert)
+			opts := x509.VerifyOptions{Roots: roots, CurrentTime: at, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning}}
+			if _, err := s.Cert.Verify(opts); err != nil {
+				t.Errorf("the signer does not verify on the clock it was minted on: %v", err)
+			}
+			opts.CurrentTime = at.Add(-2 * time.Hour)
+			if _, err := s.Cert.Verify(opts); err == nil {
+				t.Error("the signer verifies two hours before the clock it was minted on")
+			}
+		})
+	}
+}
+
+// TestLoadCAUsesTheRealClock pins that no injected clock survives a load: a CA
+// minted on a clock a year back, persisted and reloaded with LoadCA, issues on
+// the wall clock.
+func TestLoadCAUsesTheRealClock(t *testing.T) {
+	t.Parallel()
+	ca, err := NewCAWithClock("k3sm-cluster-ca", func() time.Time { return time.Now().AddDate(-1, 0, 0) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadCA(ca.CertPEM, ca.KeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.now != nil {
+		t.Fatal("LoadCA kept a clock; a loaded CA must be on time.Now")
+	}
+	before := time.Now()
+	s, err := loaded.IssueUpdateSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	nb := s.Cert.NotBefore
+	if lo, hi := before.Add(-time.Hour).Truncate(time.Second), after.Add(-time.Hour); nb.Before(lo) || nb.After(hi) {
+		t.Errorf("signer NotBefore = %v, want an hour before the wall clock (%v..%v)", nb, lo, hi)
+	}
+}
+
 // TestNoOtherPathMintsTheUpdateSigner proves the update signer has one issuer.
 // Every exported issuing path refuses its subject, none produces the
 // code-signing usage, issueLeaf (the guard-free core) is called only by
