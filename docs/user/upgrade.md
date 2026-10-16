@@ -2,6 +2,37 @@
 
 Moving a k3sm node or cluster to a new release.
 
+## Checking for an Update
+
+```sh
+k3sm update check          # or: k3sm update check -o json
+```
+
+`k3sm update check` finds the latest release the way the install script does: the newest stable
+release, or, before the first stable release exists, the newest release of any kind. It prints the
+release tag, when it was published, the Kubernetes version it ships when its release notes say, the
+version of the `k3sm` binary you ran, and every node of the cluster with the version its kubelet
+reports, marked `current`, `behind`, or `ahead` (newer than the latest release, such as a build of
+a tag not yet published). A node whose kubelet reports no tagged k3sm release (no k3sm version, a
+development build, or a build from a modified tree) is `unknown`. It
+only reads; it downloads and installs nothing. It exits 0 when the check finished and 1 when it
+could not (GitHub unreachable, for example), with the reason on stderr.
+
+The same check feeds the `update` row of `k3sm status` on a server. The server runs it at most once
+an hour and records the result; `k3sm status` reads that record and never contacts GitHub itself.
+The row is `ok` when every node runs the latest release, `behind` (severity `warn`) naming each node
+on an older one, `ahead` when a node runs a newer one and none is behind, and `unknown` when the last
+check could not reach GitHub, when no check is recorded, or when the record is more than 24 hours
+old. An update never makes the verdict `degraded`.
+
+The row is a convenience signal, not an attestation. Each node's version is what that node reports
+of itself in `status.nodeInfo.kubeletVersion`, so a node can claim any version; use it to see what
+needs upgrading, never as proof of what a node runs.
+
+The record is `/var/lib/k3sm/status/update.json`, mode 0644, so `k3sm status` reads it without
+`sudo`. Run `sudo k3sm update check` to refresh it on demand: the directory belongs to the k3sm
+service user, so a check run without `sudo` prints its result but cannot record it.
+
 ## Single Node
 
 For script (gen-1) installs, re-run the one-liner:

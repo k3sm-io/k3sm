@@ -2208,6 +2208,7 @@ func TestUninstallIdempotent(t *testing.T) {
 		// no use on a Mac that is no longer a k3sm server, and it goes AFTER the
 		// daemon that reads it has been booted out.
 		"RemoveAll:/var/lib/k3sm/server/token",
+		"RemoveAll:/var/lib/k3sm/status/update.json",
 		"RemoveAll:/var/lib/k3sm/status/endpoints.json",
 		// The launcher link is judged BEFORE the sweep deletes its target: after
 		// the sweep it is a dangling link whose identity can no longer be read.
@@ -2826,6 +2827,9 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		// exact paths.
 		if toSet(recorded(installCalls, "Bootstrap:"))[daemonLabel(dc.Role)] {
 			created[filepath.Join(StateStatus.Path(dc.DataRoot), EndpointsRecordName)] = true
+			// The update record: the server daemon's hourly check, or a
+			// `sudo k3sm update check` on either role, writes it there.
+			created[filepath.Join(StateStatus.Path(dc.DataRoot), UpdateRecordName)] = true
 		}
 		if dc.Role == RoleServer && toSet(recorded(installCalls, "Bootstrap:"))[ServerLabel] {
 			for _, name := range []string{MeshClaimsRecordName, ServicesRecordName} {

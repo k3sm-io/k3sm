@@ -104,6 +104,16 @@
       }
     },
     {
+      "name": "update",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "no update check is recorded yet (the server checks once an hour)",
+      "remedy": "sudo k3sm update check",
+      "wide": {
+        "record": "/nonexistent/k3sm-status-contract/status/update.json"
+      }
+    },
+    {
       "name": "kubeconfig",
       "state": "ok",
       "severity": "ok",

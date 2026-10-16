@@ -121,6 +121,10 @@ const (
 	// cluster's apiserver, which an unprivileged `k3sm status` anchors its
 	// kubeconfig against.
 	EndpointsRecordName = "endpoints.json"
+	// UpdateRecordName is the fourth, written only in StatusSubdir by the
+	// server's hourly update check and by `k3sm update check`: the latest
+	// release and each node's version against it.
+	UpdateRecordName = "update.json"
 )
 
 // manifestsSubdir is the manifest directory's leaf name, spelled once.

@@ -19,6 +19,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -29,7 +30,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "kubectl", "kubeconfig", "status", "update", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -54,6 +55,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
   status      show what is running (daemons, apiserver, node, workloads, data root) — the exit code is the verdict, see k3sm status --help
+  update      check for a newer k3sm release and which nodes are behind it (update check)
   doctor      run preflight environment + datastore-posture checks
               (--report writes a redacted bug-report bundle)
   snapshot    back up, restore, list and prune datastore snapshots (snapshot save|restore|ls|delete|prune)
@@ -174,6 +176,8 @@ func main() {
 		// stopped, degraded, not-installed, unknown), so the generic exit-1
 		// wrapper the other verbs use would throw the answer away.
 		os.Exit(runStatus(os.Args[2:]))
+	case "update":
+		os.Exit(runUpdate(context.Background(), os.Args[2:], newUpdateEnv()))
 	case "doctor":
 		// doctor returns its own exit code for the same reason status does: the
 		// code is the verdict (1 for a failed check, 4 for a WARN-only run),

@@ -46,6 +46,7 @@ import (
 	"k3sm.io/k3sm/pkg/rbac"
 	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/k3sm/pkg/runtimeclass"
+	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/svclb"
 )
 
@@ -567,10 +568,12 @@ func startProvisioner(ctx context.Context, plan serverPlan, cs kubernetes.Interf
 // startServerOperators is steps 4f and 4f': the MLX operator, then the
 // interconnect resolver. Its stop drains them in reverse order (the resolver
 // first), before exec.Stop tears the control plane down, exactly as two
-// separate defers in runServer would.
+// separate defers in runServer would. It also starts the hourly update check
+// for `k3sm status`, which ends with ctx.
 func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (mlxGPU *operator.RuntimeGPU, stop func()) {
 	mlxGPU, stopMLX := startMLXOperator(ctx, plan, restCfg, cs, logger)
 	stopInterconnect := startInterconnectResolver(ctx, plan, restCfg, cs, logger)
+	go runUpdateRecorder(ctx, plan.opts.workDir, cs, status.UpdateRecordInterval, logger)
 	return mlxGPU, func() {
 		stopInterconnect()
 		stopMLX()
