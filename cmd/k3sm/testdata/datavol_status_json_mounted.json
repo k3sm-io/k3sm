@@ -1,0 +1,24 @@
+{
+  "record": {
+    "version": 1,
+    "uuid": "6DEAE471-6CDE-4A4E-88A1-6A7B4DEF2DDD",
+    "name": "k3sm",
+    "mountpoint": "/var/lib/k3sm",
+    "quotaBytes": 107374182400,
+    "encrypted": false,
+    "createdBy": "k3sm 0.1.7",
+    "createdAt": "2026-09-13T00:00:00Z",
+    "adopted": false
+  },
+  "mounted": true,
+  "statfs": {
+    "totalBytes": 107374182400,
+    "availBytes": 69793218560,
+    "usedBytes": 37580963840,
+    "usedSource": "apfs"
+  },
+  "preVolume": {
+    "present": true,
+    "bytes": 4096
+  }
+}

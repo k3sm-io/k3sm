@@ -70,7 +70,11 @@ Three commands manage the volume directly:
 - `sudo k3sm datavol mount` mounts the recorded volume; it is what `io.k3sm.datavol` runs at boot,
   and it is safe to run by hand at any time.
 - `k3sm datavol status` reports the volume, its quota, its usage, and any leftover pre-migration
-  copy, without privilege.
+  copy, without privilege. `-o json` prints the same report as `record` (the declaration, or
+  `null`), `mounted`, `statfs` (present only while mounted: `totalBytes`, `availBytes`, `usedBytes`
+  and `usedSource`, which is `statfs`, `apfs` or `unknown`; read `usedSource` before trusting
+  `usedBytes`, which is absent when no probe could measure it) and `preVolume` (`present`,
+  `bytes`). Scripts and the k3sm app read this shape.
 - `sudo k3sm datavol delete --yes` destroys the volume and every declaration of it. It never
   touches a `.pre-volume` copy.
 
