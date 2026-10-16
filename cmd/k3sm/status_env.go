@@ -167,6 +167,13 @@ func newStatusCollector() status.Collector {
 		// netd's node resolver entry, read from the dynamic store (no
 		// privilege needed to read a State: key).
 		NodeResolverPresent: nodeResolverPresent,
+		// One query to the node resolver at the DNS VIP, over UDP (and TCP
+		// when UDP is silent), and the node daemon's arguments for the VIP it
+		// serves on. The VIP is a lo0 alias, so this needs no privilege.
+		DNS: status.NetDNS{},
+		NodeArgs: func(role install.Role) ([]string, error) {
+			return install.InstalledNodeArgs(install.NewDarwinSystem(), role)
+		},
 		// The live host binaries' cdhashes, for the shadow binary drift check.
 		CDHash: func(path string) (string, error) {
 			return shadow.CDHash(context.Background(), path)

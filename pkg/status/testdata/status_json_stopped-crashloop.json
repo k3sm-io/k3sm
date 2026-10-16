@@ -115,6 +115,12 @@
       "severity": "skip",
       "detail": "needs sudo: the runtime daemon's socket is owner-only",
       "remedy": "sudo k3sm status"
+    },
+    {
+      "name": "dns",
+      "state": "skip",
+      "severity": "skip",
+      "detail": "io.k3sm.server is crash-loop, so there is no node resolver to ask"
     }
   ],
   "next": [

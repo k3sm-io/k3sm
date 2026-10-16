@@ -125,6 +125,17 @@
       "severity": "skip",
       "detail": "needs sudo: the runtime daemon's socket is owner-only",
       "remedy": "sudo k3sm status"
+    },
+    {
+      "name": "dns",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "10.43.0.10 answered 10.43.0.1 over UDP for kubernetes.default.svc.cluster.local",
+      "wide": {
+        "answer": "10.43.0.1",
+        "name": "kubernetes.default.svc.cluster.local",
+        "vip": "10.43.0.10"
+      }
     }
   ],
   "next": [

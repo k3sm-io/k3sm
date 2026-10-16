@@ -271,6 +271,14 @@ type Collector struct {
 	// seam because the read is a SystemConfiguration call (cgo) that pkg/status,
 	// a reporting leaf, does not make itself.
 	NodeResolverPresent func() (bool, error)
+	// DNS sends the dns row's query to the node resolver (NetDNS in
+	// production). OPTIONAL: nil leaves the dns row out.
+	DNS DNSQuerier
+	// NodeArgs returns the operator arguments the installed node daemon of
+	// role runs with (install.InstalledNodeArgs in production), which the dns
+	// row reads --dns-vip from. OPTIONAL: nil, or an error, takes the
+	// daemon's default VIP.
+	NodeArgs func(role install.Role) ([]string, error)
 	// CDHash reads a binary's code directory hash, for the shadow-shells row's
 	// drift check. OPTIONAL: nil leaves the row out.
 	CDHash func(path string) (string, error)
