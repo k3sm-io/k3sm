@@ -105,6 +105,19 @@ and then exits naming what it left. Re-running it converges.
 until the daemons are up, so a start that fails leaves the node reported as stopped, and running
 `sudo k3sm start` again is safe.
 
+## Starting a Stopped Node From a Script
+
+A script that runs `sudo k3sm start`, for example after an upgrade, needs to know how long to
+wait. `k3sm start --print-time-bound` prints the start's cut-off as a whole number of seconds and
+exits 0. It needs no root and does nothing else. The value is the start's
+time bound, which includes the uncordon's 90-second retry window, plus a 30-second margin: 570
+seconds today. Wait at least that long before treating a start as stuck.
+
+`sudo k3sm start` exits 1 both when it fails and when the daemons are up but the Node is still
+cordoned. In the second case stderr carries a line that begins with the fixed token
+`k3sm: node is still cordoned`, beside the sentence a person reads. Match that token, not the
+sentence, and run `sudo k3sm start` again to uncordon the node.
+
 ## Starting a Node an Older k3sm Does Not Know About
 
 Releases before `k3sm stop` do not read the stop record, and they have no `start` verb. If you

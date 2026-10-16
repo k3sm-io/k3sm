@@ -263,3 +263,14 @@ func TestInstallHonoursUserStop(t *testing.T) {
 		}
 	})
 }
+
+// TestStillCordonedMarkerIsStable pins the stderr token the k3sm app matches
+// on a still-cordoned start; changing it breaks that caller.
+func TestStillCordonedMarkerIsStable(t *testing.T) {
+	if StillCordonedMarker != "k3sm: node is still cordoned" {
+		t.Errorf("StillCordonedMarker = %q; the app matches the exact token", StillCordonedMarker)
+	}
+	if got, want := StartCutoff(), StartTimeBound()+LifecycleMargin; got != want {
+		t.Errorf("StartCutoff = %s, want %s", got, want)
+	}
+}

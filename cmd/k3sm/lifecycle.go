@@ -117,25 +117,26 @@ Flags:
 `, install.StopTimeBound())
 }
 
-// lifecycleFlags parses the flags every lifecycle verb shares, plus --start
-// when withStart. A parse failure has already been printed.
-func lifecycleFlags(verb string, args []string, stderr io.Writer, usage string, withStart bool) (actor, reason string, start bool, ok bool) {
+// lifecycleFlags parses the flags every lifecycle verb shares, plus the
+// verb's own flags, which extra (when non-nil) registers. A parse failure has
+// already been printed.
+func lifecycleFlags(verb string, args []string, stderr io.Writer, usage string, extra func(fs *flag.FlagSet)) (actor, reason string, ok bool) {
 	fs := flag.NewFlagSet(verb, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() { fmt.Fprint(stderr, usage) }
 	fs.StringVar(&reason, "reason", "k3sm "+verb, "why, recorded in the logs")
 	fs.StringVar(&actor, "actor", install.ActorUser, "user or auto")
-	if withStart {
-		fs.BoolVar(&start, "start", false, "start the node if the user stopped it")
+	if extra != nil {
+		extra(fs)
 	}
 	if err := fs.Parse(args); err != nil {
-		return "", "", false, false
+		return "", "", false
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintf(stderr, "k3sm %s: unexpected arguments %q\n", verb, fs.Args())
-		return "", "", false, false
+		return "", "", false
 	}
-	return actor, reason, start, true
+	return actor, reason, true
 }
 
 // lifecycleExit prints err and maps it to the verb's exit code.
@@ -144,6 +145,9 @@ func lifecycleExit(verb string, err error, stderr io.Writer) int {
 		return 0
 	}
 	fmt.Fprintf(stderr, "k3sm %s: %v\n", verb, err)
+	if errors.Is(err, install.ErrNodeStillCordoned) {
+		fmt.Fprintf(stderr, "%s: the daemons are up; re-run 'sudo k3sm start' to uncordon it\n", install.StillCordonedMarker)
+	}
 	var serr *install.StopIncompleteError
 	if errors.As(err, &serr) {
 		return serr.ExitCode()
@@ -162,7 +166,7 @@ func requireRoot(verb string, stderr io.Writer) bool {
 
 // runStop is `k3sm stop`.
 func runStop(args []string, stderr io.Writer) int {
-	actor, reason, _, ok := lifecycleFlags("stop", args, stderr, stopUsage(), false)
+	actor, reason, ok := lifecycleFlags("stop", args, stderr, stopUsage(), nil)
 	if !ok {
 		return exitLifecycleUsage
 	}
@@ -218,17 +222,14 @@ func countJoinedWorkers(ctx context.Context, cs kubernetes.Interface, self strin
 	return n, nil
 }
 
-// lifecycleMargin is the slack the overall deadline of a stop or start adds
-// to its computed bound, for the launchctl and file calls no budget counts.
-const lifecycleMargin = 30 * time.Second
-
 // lifecycleContext is the context a stop or start runs under: cancelled by
-// SIGINT, SIGTERM or SIGHUP, and by a deadline of bound plus lifecycleMargin,
+// SIGINT, SIGTERM or SIGHUP, and by a deadline of bound plus
+// install.LifecycleMargin,
 // so the bound the help states is enforced. An interrupted stop leaves its
 // marker at stopping, and a rerun converges.
 func lifecycleContext(bound time.Duration) (context.Context, context.CancelFunc) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	ctx, cancel := context.WithTimeout(ctx, bound+lifecycleMargin)
+	ctx, cancel := context.WithTimeout(ctx, bound+install.LifecycleMargin)
 	return ctx, func() { cancel(); stop() }
 }
 
@@ -414,6 +415,7 @@ func runNetdRemoveMesh(args []string, stderr io.Writer) int {
 
 // startUsage is `k3sm start --help`.
 var startUsage = fmt.Sprintf(`Usage: sudo k3sm start [--reason TEXT] [--actor user|auto]
+       k3sm start --print-time-bound
 
 Start k3sm on this Mac after 'k3sm stop': clear what a stop may have left
 (finishing an interrupted one), remove the stop marker, enable and start netd
@@ -425,10 +427,14 @@ for, and otherwise makes one best-effort uncordon attempt.
 It is cut off after %s, or by SIGINT, SIGTERM or SIGHUP; the stop marker
 stays until the daemons are up, so re-running it is safe.
 
+--print-time-bound prints that cut-off as a whole number of seconds and
+exits 0, without root and without doing anything else, so a caller can wait
+on a start for exactly as long as the start itself runs.
+
 Exit codes: 0 started or already running; 1 failed, or the daemons are up but
-the node is still cordoned (the error says "still cordoned"; re-run
-'sudo k3sm start' to uncordon it); 2 usage; 3 not run as root.
-`, install.UncordonBound(), install.StartTimeBound()+lifecycleMargin)
+the node is still cordoned (stderr then carries the line "%s: ...";
+re-run 'sudo k3sm start' to uncordon it); 2 usage; 3 not run as root.
+`, install.UncordonBound(), install.StartCutoff(), install.StillCordonedMarker)
 
 // restartUsage is `k3sm restart --help`.
 const restartUsage = `Usage: sudo k3sm restart [--start] [--reason TEXT] [--actor user|auto]
@@ -439,11 +445,28 @@ it refuses, unless --start is given, which starts the node instead.
 Exit codes: 0 restarted; 1 failed or refused; 2 usage; 3 not run as root.
 `
 
+// startTimeBoundSeconds is what `k3sm start --print-time-bound` prints:
+// install.StartCutoff, the deadline lifecycleContext enforces on a start, in
+// whole seconds rounded up.
+func startTimeBoundSeconds() int64 {
+	return int64((install.StartCutoff() + time.Second - 1) / time.Second)
+}
+
 // runStart is `k3sm start`.
-func runStart(args []string, stderr io.Writer) int {
-	actor, reason, _, ok := lifecycleFlags("start", args, stderr, startUsage, false)
+func runStart(args []string, stdout, stderr io.Writer) int {
+	var printBound bool
+	actor, reason, ok := lifecycleFlags("start", args, stderr, startUsage, func(fs *flag.FlagSet) {
+		fs.BoolVar(&printBound, "print-time-bound", false, "print the start's cut-off in seconds and exit")
+	})
 	if !ok {
 		return exitLifecycleUsage
+	}
+	if printBound {
+		// Before the root check, and nothing after it: no daemon is contacted.
+		if _, err := fmt.Fprintf(stdout, "%d\n", startTimeBoundSeconds()); err != nil {
+			return exitLifecycleFailed
+		}
+		return 0
 	}
 	if !requireRoot("start", stderr) {
 		return exitNeedsRoot
@@ -456,7 +479,10 @@ func runStart(args []string, stderr io.Writer) int {
 
 // runRestart is `k3sm restart`.
 func runRestart(args []string, stderr io.Writer) int {
-	actor, reason, start, ok := lifecycleFlags("restart", args, stderr, restartUsage, true)
+	var start bool
+	actor, reason, ok := lifecycleFlags("restart", args, stderr, restartUsage, func(fs *flag.FlagSet) {
+		fs.BoolVar(&start, "start", false, "start the node if the user stopped it")
+	})
 	if !ok {
 		return exitLifecycleUsage
 	}

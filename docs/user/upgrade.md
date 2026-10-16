@@ -278,6 +278,9 @@ does **not** revert them; you have to.
    every pod sandbox, deleting the policy only hides the problem: the Service is created, its endpoints
    go Ready, and no pod can reach it.
 
+An upgrade leaves a stopped node stopped. To start it from a script, see
+[starting a stopped node from a script](stop-start.md#starting-a-stopped-node-from-a-script).
+
 ## Next
 
 - [Stopping and starting](stop-start.md) explains why an upgrade leaves a stopped node stopped, and `--start`.

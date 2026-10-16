@@ -320,6 +320,12 @@ var uncordonBudget = restartBudget{running: 90 * time.Second, poll: 2 * time.Sec
 // repairs it: a start on a running node still runs the uncordon.
 var ErrNodeStillCordoned = errors.New("the daemons are up but the node is still cordoned; re-run `sudo k3sm start` to uncordon it")
 
+// StillCordonedMarker is the fixed token `k3sm start` (and `k3sm restart
+// --start`) writes to stderr, beside the human sentence, when it exits 1
+// because the daemons are up but the node is still cordoned
+// (ErrNodeStillCordoned). A caller matches this token, never the sentence.
+const StillCordonedMarker = "k3sm: node is still cordoned"
+
 // ErrNodeIdentity marks a Config.MarkNode failure to work out which Node this
 // Mac is or which credential reaches it (for example, a worker holding no
 // usable credential). It is read from local files, so retrying cannot fix it.
