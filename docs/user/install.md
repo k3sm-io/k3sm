@@ -2,6 +2,34 @@
 
 How k3sm installs, and why it needs admin rights only once.
 
+## Install With The App
+
+On a Mac you sit at, install with the desktop app:
+
+1. Download the disk image from the [releases page](https://k3sm.io/releases/).
+2. Drag **k3sm.app** to Applications.
+3. Open it and follow the first run. The window asks one question: start a cluster on this Mac, or
+   join one. Joining takes the server's address and a join token from `k3sm token create` on the
+   server. The app asks for an administrator password once, installs and starts k3sm, and then
+   shows its state.
+
+The disk image is signed and notarized. Its checksum is in the release's checksums file, beside
+the command-line tarball.
+
+The app installs the same k3sm as the command line, into the same `/Library/k3sm`. A Mac installed
+either way can be managed the other way. See [Installing From k3sm.app](#installing-from-k3smapp)
+for what the administrator step does.
+
+## Install From The Command Line
+
+On a headless Mac or over SSH, use the install script:
+
+```sh
+curl -fsSL https://k3sm.io/install.sh | sh
+```
+
+The script's checks and options are under [Install Channels](#install-channels).
+
 ## One-Time Admin Step
 
 k3sm runs **without per-command `sudo`**. A single privileged install creates the accounts and
@@ -35,8 +63,7 @@ and one residual limitation remains (no per-pod uid isolation).
 
 - The `k3sm` binary in **`/Library/k3sm`** (`root:wheel`), whichever channel delivered it (with the
   script, pin `K3SM_INSTALL_VERSION` to reinstall a prior release, since the assets stay on GitHub
-  Releases; the planned Homebrew channel will retain the previous version, so rollback there will
-  not need a rebuild).
+  Releases).
 - The launcher, a symlink **`/usr/local/bin/k3sm` → `/Library/k3sm/k3sm`**. `/usr/local/bin` is
   the first entry in `/etc/paths`, so every terminal opened after the install finds `k3sm` with no
   profile edit; a terminal that was already open may need `hash -r` or simply a new window. Because
@@ -103,39 +130,21 @@ write into it.
 
 ## Install Channels
 
-k3sm's distribution ships in three generations, listed in shipping order:
+The install script preflights (Apple silicon, macOS 26+), downloads the release tarball and its
+checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do,
+and then runs `sudo k3sm install`. The verification checks **same-origin integrity**, meaning
+the tarball matches the checksums published beside it. It does not check publisher identity.
+Environment variables set the options. `K3SM_INSTALL_VERSION` pins a release, and it is also the
+repair path, since an unpinned re-run jumps to latest. The variable must reach `sh`, so it goes
+after the pipe:
+`curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh` (v0.1.7 is the release you are on
+today, so a repair pins the newest tag and never an older one; the [releases page](https://k3sm.io/releases/) lists every version you can pin).
+`K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
+the current directory without ever running `sudo`, so you can inspect first. Re-running the
+one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
 
-1. **The install script (gen 1, first to ship):**
-
-   ```sh
-   curl -fsSL https://k3sm.io/install.sh | sh
-   ```
-
-   The script preflights (Apple silicon, macOS 26+), downloads the release tarball and its
-   checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do,
-   and then runs `sudo k3sm install`. The verification checks **same-origin integrity**, meaning
-   the tarball matches the checksums published beside it. It does not check publisher identity;
-   provenance (Developer ID + notarization) arrives with gen 3. Environment variables set the
-   options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
-   unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
-   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh` (v0.1.7 is the release you are on
-   today, so a repair pins the newest tag and never an older one; the [releases page](https://k3sm.io/releases/) lists every version you can pin).
-   `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
-   the current directory without ever running `sudo`, so you can inspect first. Re-running the
-   one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
-
-2. **Homebrew (gen 2)** is planned, and the `k3sm-io/tap` is not published yet. When it ships, run
-   `brew install k3sm-io/tap/k3sm`, then `sudo k3sm install`.
-
-3. **Notarized `.pkg` (gen 3)** is a signed, stapled installer package for offline and managed
-   installs.
-
-> **Status:** pre-release builds are published; the script resolves the newest one, and a pin
-> via `K3SM_INSTALL_VERSION` always wins. The `k3sm-io/tap` is not published yet. The Homebrew
-> channel and the `.pkg` arrive with the first stable release.
-
-Every channel manages the same `/Library/k3sm`. Once more than one has shipped, run
-`sudo k3sm install` after switching so the daemons run the newly delivered binary, or run
+The script and the app manage the same `/Library/k3sm`. After switching from one to the
+other, run `sudo k3sm install` so the daemons run the newly delivered binary, or run
 `sudo k3sm uninstall` first for a clean cutover.
 
 ### Installing From k3sm.app
@@ -421,8 +430,6 @@ k3s's `k3s-uninstall.sh` removes everything with no prompt; k3sm asks for `--yes
 because this deletes a user account and the cluster's datastore.
 
 The purge learns whose `~/.kube/config` to clean from `sudo`. When there is no `sudo` environment, name the account with `--user <name>`; it wins over `sudo`'s own record, and root, system and service accounts are refused.
-
-Run it before `brew uninstall k3sm`: the `k3sm` binary is what performs the purge.
 
 Before deleting anything it checks that the data directories are the ones install created, and it
 stops without removing anything if a check fails. Install marks each directory with a

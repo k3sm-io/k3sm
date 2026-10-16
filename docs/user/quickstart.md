@@ -8,6 +8,11 @@ path; [Install](install.md) explains what happens underneath.
 
 ## 1. Install
 
+On a Mac you sit at, download the disk image from the [releases page](https://k3sm.io/releases/),
+drag k3sm.app to Applications, open it, and follow the first run: start a cluster on this Mac, give
+an administrator password once, and the app installs and starts k3sm. On a headless Mac or over
+SSH, use the script:
+
 ```sh
 curl -fsSL https://k3sm.io/install.sh | sh
 ```
@@ -26,10 +31,8 @@ curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh
 Set `K3SM_INSTALL_DOWNLOAD_ONLY=1` the same way to download and verify into the current directory
 without running anything as root.
 
-Two alternatives:
+One alternative:
 
-- **Homebrew** is planned, and the `k3sm-io/tap` is not published yet. When it ships, run
-  `brew install k3sm-io/tap/k3sm && sudo k3sm install`.
 - **From source**, if you would rather build it yourself: clone `apis`, `runtimed`, `darwin-net`
   and `k3sm` side by side, run `go work init ./apis ./runtimed ./darwin-net ./k3sm`, build with
   `CGO_ENABLED=1 go build -o k3sm ./cmd/k3sm` inside `k3sm`, assemble the install set with
@@ -40,7 +43,7 @@ Two alternatives:
 The one-time admin step (`sudo k3sm install`, which the script runs for you after printing what it
 is about to do) creates the unprivileged `_k3sm` user, installs the LaunchDaemons, and writes an
 admin kubeconfig to your home directory. After that, day-to-day use needs **no `sudo`**. See
-[Install](install.md) for the install-channel generations and the script's options.
+[Install](install.md) for the app, the script and its options.
 
 ## 2. Confirm the Cluster Is Up
 
