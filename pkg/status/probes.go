@@ -306,13 +306,18 @@ type Collector struct {
 	// Services and EndpointSlices (svcstatus.Comparer in production).
 	// OPTIONAL: nil leaves the services row out. It is consulted on a server
 	// only, and only once the record has been read.
-	Services   ServicesComparer
-	Paths      Paths
-	EUID       int
-	ServiceUID int
-	Now        func() time.Time
-	Version    version.Info
-	Host       string
+	Services ServicesComparer
+	// ServingChain reads the certificate chain the apiserver presents in its
+	// TLS handshake, with the CA the reader's kubeconfig pins. OPTIONAL: nil
+	// leaves the serving-cert row unknown for an account that cannot read the
+	// certificate file. It is consulted on a server only, and only then.
+	ServingChain func(ctx context.Context) (PresentedChain, error)
+	Paths        Paths
+	EUID         int
+	ServiceUID   int
+	Now          func() time.Time
+	Version      version.Info
+	Host         string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

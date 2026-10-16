@@ -178,6 +178,10 @@ Other rows read what your account can, through the apiserver, instead of a file 
 - `datastore`: `ok` with `detail` `answers (the apiserver's readiness check reached it)` when the
   apiserver is ready, because its readiness check includes the datastore. `wide.source` is
   `apiserver readyz`. It is `unknown` only when the apiserver did not answer.
+- `serving-cert`: reads the certificate the apiserver presents when it is reached with your
+  kubeconfig, and checks it as root checks the file: in date, issued by the cluster CA your
+  kubeconfig pins, and naming the host you reached it by. `wide.source` is `handshake`. It is
+  `unknown` when the handshake fails or your kubeconfig pins no CA.
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was

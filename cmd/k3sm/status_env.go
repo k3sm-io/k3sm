@@ -19,10 +19,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -178,13 +181,16 @@ func newStatusCollector() status.Collector {
 		AgentJoinServer: statusAgentJoinServer,
 		// The Service proxy's record against one uncached Services and
 		// EndpointSlices LIST, over the same client as every apiserver row.
-		Services:   statusServices(kube),
-		Paths:      paths,
-		EUID:       euid,
-		ServiceUID: serviceUID,
-		Version:    version.Get(),
-		Host:       macOSVersionOrEmpty(),
-		Hostname:   hostnameOrEmpty(),
+		Services: statusServices(kube),
+		// The certificate the apiserver presents, for the serving-cert row of
+		// an account that cannot read the certificate file.
+		ServingChain: statusServingChain(kube),
+		Paths:        paths,
+		EUID:         euid,
+		ServiceUID:   serviceUID,
+		Version:      version.Get(),
+		Host:         macOSVersionOrEmpty(),
+		Hostname:     hostnameOrEmpty(),
 	}
 }
 
@@ -231,6 +237,63 @@ func statusServices(kube status.Kube) status.ServicesComparer {
 		return nil
 	}
 	return svcstatus.Comparer{Client: rk.client, Timeout: statusAPITimeout}
+}
+
+// statusServingChain reads the certificate chain the apiserver behind kube
+// presents in a TLS handshake, with the CA kube's kubeconfig pins, or is nil
+// (the row stays unknown) when there is no client.
+//
+// The handshake skips verification ONLY to read the presented chain: nothing is
+// sent over the connection, and the row verifies the chain against the pinned CA
+// itself, so that it can say which check failed rather than only that one did.
+func statusServingChain(kube status.Kube) func(context.Context) (status.PresentedChain, error) {
+	rk, ok := kube.(restKube)
+	if !ok || rk.cfg == nil {
+		return nil
+	}
+	cfg := rk.cfg
+	return func(ctx context.Context) (status.PresentedChain, error) {
+		u, err := url.Parse(cfg.Host)
+		if err != nil {
+			return status.PresentedChain{}, fmt.Errorf("parse the apiserver URL %q: %w", cfg.Host, err)
+		}
+		pc := status.PresentedChain{Server: cfg.Host, Host: u.Hostname()}
+		if cfg.TLSClientConfig.ServerName != "" {
+			pc.Host = cfg.TLSClientConfig.ServerName
+		}
+		pc.CA = cfg.TLSClientConfig.CAData
+		if len(pc.CA) == 0 && cfg.TLSClientConfig.CAFile != "" {
+			if pc.CA, err = os.ReadFile(cfg.TLSClientConfig.CAFile); err != nil {
+				return pc, fmt.Errorf("read the kubeconfig's CA file: %w", err)
+			}
+		}
+		addr := u.Host
+		if u.Port() == "" {
+			addr = net.JoinHostPort(u.Hostname(), "443")
+		}
+		dialer := tls.Dialer{
+			NetDialer: &net.Dialer{Timeout: statusAPITimeout},
+			Config: &tls.Config{
+				ServerName: pc.Host,
+				MinVersion: tls.VersionTLS12,
+				// Read-only: the chain is verified against pc.CA by the row.
+				InsecureSkipVerify: true,
+			},
+		}
+		ctx, cancel := context.WithTimeout(ctx, statusAPITimeout)
+		defer cancel()
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return pc, err
+		}
+		defer func() { _ = conn.Close() }()
+		tc, ok := conn.(*tls.Conn)
+		if !ok {
+			return pc, errors.New("the dial did not return a TLS connection")
+		}
+		pc.Chain = tc.ConnectionState().PeerCertificates
+		return pc, nil
+	}
 }
 
 // newDaemonsCollector assembles the collector for the launchd-only daemons
@@ -462,6 +525,9 @@ type restKube struct {
 	client *kubernetes.Clientset
 	server string
 	tls    string
+	// cfg is the rest config the client was built from, which the serving-cert
+	// row's handshake reads the URL and the pinned CA from.
+	cfg *rest.Config
 }
 
 // RawGet performs an unstructured GET against an absolute apiserver path.
@@ -624,7 +690,7 @@ func newStatusKube(in statusKubeInputs) (status.Kube, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	return restKube{client: cs, server: restCfg.Host, tls: tlsPosture(restCfg)}, kubeSource(cfg, rules), nil
+	return restKube{client: cs, server: restCfg.Host, tls: tlsPosture(restCfg), cfg: restCfg}, kubeSource(cfg, rules), nil
 }
 
 // tlsPosture describes how a rest config trusts the apiserver, in the two words

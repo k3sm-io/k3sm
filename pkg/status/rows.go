@@ -129,7 +129,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 			rows = append(rows, r)
 		}
 		// The apiserver serving certificate: present, issued by the cluster CA, in date.
-		if r, ok := c.servingCertRow(now()); ok {
+		if r, ok := c.servingCertRow(ctx, now()); ok {
 			rows = append(rows, r)
 		}
 		// The admin kubeconfig install wrote, checked against that cluster CA.

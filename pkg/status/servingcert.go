@@ -18,6 +18,7 @@ package status
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -40,8 +41,10 @@ const RowServingCert = "serving-cert"
 
 // servingCertRow reports RowServingCert. It exists on a server whose work dir holds
 // a cluster CA (a control plane has booted there); it reports ok=false elsewhere.
-// An unreadable work dir (a plain-user run) is an unknown row, not a failure.
-func (c Collector) servingCertRow(now time.Time) (Row, bool) {
+// An unreadable work dir (a plain-user run) reads the certificate the apiserver
+// presents in its TLS handshake instead (servingCertFromHandshake), and is an
+// unknown row, not a failure, when that cannot be read either.
+func (c Collector) servingCertRow(ctx context.Context, now time.Time) (Row, bool) {
 	wd := c.Paths.WorkDir
 	if wd == "" || c.FS == nil {
 		return Row{}, false
@@ -52,6 +55,8 @@ func (c Collector) servingCertRow(now time.Time) (Row, bool) {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return Row{}, false
+	case errors.Is(err, fs.ErrPermission) && c.ServingChain != nil:
+		return c.servingCertFromHandshake(ctx, row, now), true
 	case err != nil:
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "the apiserver serving certificate is unreadable as this user: " + leafPath
@@ -94,6 +99,90 @@ func (c Collector) servingCertRow(now time.Time) (Row, bool) {
 	row.State, row.Severity = StateOK, SeverityOK
 	row.Detail = "issued by the cluster CA, valid until " + leaf.NotAfter.UTC().Format("2006-01-02")
 	return row, true
+}
+
+// PresentedChain is what an apiserver presented in a TLS handshake, read the way
+// kubectl reaches it: the chain it sent, the name it was reached by, and the CA
+// the reader's kubeconfig pins for it.
+type PresentedChain struct {
+	// Server is the apiserver URL that was dialled.
+	Server string
+	// Host is the name the leaf must carry: the kubeconfig's TLS server name
+	// when it sets one, else the URL's host.
+	Host string
+	// Chain is the certificates the apiserver sent, leaf first.
+	Chain []*x509.Certificate
+	// CA is the PEM the kubeconfig pins; empty when it pins none.
+	CA []byte
+}
+
+// servingCertFromHandshake fills the serving-cert row from the chain the
+// apiserver presents, for an account that may not read the certificate file.
+// It runs the file path's checks on that certificate: in date, issued by the
+// cluster CA (the one the reader's kubeconfig pins, the trust kubectl uses), and
+// naming the host it was reached by.
+func (c Collector) servingCertFromHandshake(ctx context.Context, row Row, now time.Time) Row {
+	row.Wide["source"] = "handshake"
+	pc, err := c.ServingChain(ctx)
+	if pc.Server != "" {
+		row.Wide["server"] = pc.Server
+	}
+	if err == nil && len(pc.Chain) == 0 {
+		err = errors.New("the apiserver presented no certificate")
+	}
+	if err != nil {
+		row.State, row.Severity = StateUnknown, SeverityUnknown
+		row.Detail = "the serving certificate file is unreadable as this user, and the apiserver's TLS handshake could not be read: " + errText(err)
+		row.Remedy = "sudo k3sm status"
+		return row
+	}
+	leaf := pc.Chain[0]
+	row.Wide["not-after"] = leaf.NotAfter.UTC().Format(time.RFC3339)
+	if now.After(leaf.NotAfter) {
+		row.State, row.Severity = StateExpired, SeverityFail
+		row.Detail = "the certificate the apiserver presents expired " + leaf.NotAfter.UTC().Format(time.RFC3339)
+		row.Remedy = "sudo k3sm status"
+		return row
+	}
+	roots := x509.NewCertPool()
+	if len(pc.CA) == 0 || !roots.AppendCertsFromPEM(pc.CA) {
+		row.State, row.Severity = StateUnknown, SeverityUnknown
+		row.Detail = "the apiserver presents a certificate valid until " + leaf.NotAfter.UTC().Format("2006-01-02") +
+			", and your kubeconfig pins no cluster CA to check its issuer against"
+		row.Remedy = "k3sm kubeconfig --write\nsudo k3sm status"
+		return row
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range pc.Chain[1:] {
+		intermediates.AddCert(cert)
+	}
+	_, err = leaf.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: intermediates,
+		DNSName:       pc.Host,
+		CurrentTime:   now,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	var hostErr x509.HostnameError
+	var authErr x509.UnknownAuthorityError
+	switch {
+	case errors.As(err, &hostErr):
+		row.State, row.Severity = StateCorrupt, SeverityFail
+		row.Detail = fmt.Sprintf("the certificate the apiserver presents does not name %s, the host it was reached by", pc.Host)
+		row.Remedy = "sudo k3sm status"
+	case errors.As(err, &authErr):
+		row.State, row.Severity = StateCorrupt, SeverityFail
+		row.Detail = "the certificate the apiserver presents is not issued by the cluster CA your kubeconfig pins"
+		row.Remedy = "sudo k3sm status"
+	case err != nil:
+		row.State, row.Severity = StateCorrupt, SeverityFail
+		row.Detail = "the certificate the apiserver presents does not verify against the cluster CA: " + errText(err)
+		row.Remedy = "sudo k3sm status"
+	default:
+		row.State, row.Severity = StateOK, SeverityOK
+		row.Detail = "issued by the cluster CA, valid until " + leaf.NotAfter.UTC().Format("2006-01-02") + " (read from the TLS handshake)"
+	}
+	return row
 }
 
 // parseFirstCert parses the first CERTIFICATE block of a PEM file.
