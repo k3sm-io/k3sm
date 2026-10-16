@@ -121,7 +121,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	if pre, ok := c.preVolumeRow(); ok {
 		rows = append(rows, pre)
 	}
-	rows = append(rows, c.datastoreRow(role))
+	rows = append(rows, c.datastoreRow(role, apiserver))
 	// The embedded etcd member, on an etcd-posture server only: quorum, alarms,
 	// size against quota and WAL fsync latency, beside the datastore row it details.
 	if role != dataroot.RoleAgent {
@@ -1467,7 +1467,12 @@ const WorkerDatastoreDetail = "not this node's: the control plane's datastore li
 // On an embedded etcd HA server the datastore is the etcd member, not a state.db,
 // so an initialized member (executor.EtcdMemberExists) is reported as such rather
 // than as "no state.db yet" — which would read as a server that never came up.
-func (c Collector) datastoreRow(role dataroot.Role) Row {
+//
+// An account that cannot read the db asks the apiserver instead, the way kubectl
+// would: the apiserver's readiness check includes its etcd check, which kine
+// answers, so a ready apiserver proves the datastore answers. apiserver is the
+// row Collect already built from that probe; the db is never opened for it.
+func (c Collector) datastoreRow(role dataroot.Role, apiserver Row) Row {
 	row := Row{Name: RowDatastore}
 	if role == dataroot.RoleAgent {
 		row.State, row.Severity = StateSkip, SeveritySkip
@@ -1485,9 +1490,7 @@ func (c Collector) datastoreRow(role dataroot.Role) Row {
 	present, uv, jm, err := DatastorePosture(path)
 	switch {
 	case errors.Is(err, fs.ErrPermission):
-		row.State, row.Severity = StateUnknown, SeverityUnknown
-		row.Detail = "state.db not readable as this user (re-run with sudo)"
-		row.Remedy = "sudo k3sm status"
+		datastoreThroughAPIServer(&row, apiserver)
 	case err != nil:
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "could not read " + path + ": " + errText(err)
@@ -1504,6 +1507,27 @@ func (c Collector) datastoreRow(role dataroot.Role) Row {
 		row.Detail = fmt.Sprintf("kine sqlite, wal, user_version %d", uv)
 	}
 	return row
+}
+
+// DatastoreAnswersDetail is the datastore row's detail when an account that
+// cannot read the db learned from the apiserver's readiness check that the
+// datastore answers.
+const DatastoreAnswersDetail = "answers (the apiserver's readiness check reached it)"
+
+// datastoreThroughAPIServer fills the datastore row of an account that may not
+// read the db from the apiserver row: ok when the apiserver is ready (its
+// readiness includes the etcd check kine answers), unknown when it did not
+// answer, since nothing then reached the datastore.
+func datastoreThroughAPIServer(row *Row, apiserver Row) {
+	row.Wide["source"] = "apiserver readyz"
+	if apiserver.State == StateReady {
+		row.State, row.Severity = StateOK, SeverityOK
+		row.Detail = DatastoreAnswersDetail
+		return
+	}
+	row.State, row.Severity = StateUnknown, SeverityUnknown
+	row.Detail = "state.db is not readable as this user and the apiserver did not answer its readiness check, so nothing reached the datastore"
+	row.Remedy = "sudo k3sm status"
 }
 
 // kubeconfigRow reports the credentials this command found, and where.

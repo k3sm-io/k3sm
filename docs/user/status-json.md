@@ -173,6 +173,12 @@ checked rather than as a fault. Run as any account other than root, these rows r
 | `server-args` | the server's LaunchDaemon plist is readable by root only; severity `skip` |
 | `pre-volume` | the size is a lower bound because part of the copy is root-only; severity stays `warn`, because the copy is there whoever reads it |
 
+Other rows read what your account can, through the apiserver, instead of a file only root can read:
+
+- `datastore`: `ok` with `detail` `answers (the apiserver's readiness check reached it)` when the
+  apiserver is ready, because its readiness check includes the datastore. `wide.source` is
+  `apiserver readyz`. It is `unknown` only when the apiserver did not answer.
+
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was
 identified. Its `state` is `ok`, or `stale` (severity `warn`) when the Lease renewal is older than 40
