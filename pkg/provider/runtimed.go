@@ -1273,6 +1273,21 @@ func (r *runtimedRuntime) ServableRuntime() (*runtimed.Runtime, bool) {
 	return rt, ok
 }
 
+// errNoImageIndex is returned by ImageIndexSnapshot when the runtime behind
+// this provider keeps no image index (a test double).
+var errNoImageIndex = errors.New("runtime keeps no image index")
+
+// ImageIndexSnapshot implements the optional ImageInventory capability: the
+// image index of the in-process runtime, which is what the runtime's
+// ListImages RPC serves, read without a socket round trip.
+func (r *runtimedRuntime) ImageIndexSnapshot(ctx context.Context) ([]image.IndexEntry, error) {
+	inv, ok := r.rt.(ImageInventory)
+	if !ok {
+		return nil, errNoImageIndex
+	}
+	return inv.ImageIndexSnapshot(ctx)
+}
+
 // Compile-time check that runtimedRuntime satisfies the Runtime seam and the
 // optional StatsSource capability (the Summary API surface).
 var (
@@ -1280,6 +1295,7 @@ var (
 	_ StatsSource         = (*runtimedRuntime)(nil)
 	_ HealthReporter      = (*runtimedRuntime)(nil)
 	_ ControlSocketSource = (*runtimedRuntime)(nil)
+	_ ImageInventory      = (*runtimedRuntime)(nil)
 )
 
 // podIP resolves the pod's IP BEFORE translation — the ordering rule: the

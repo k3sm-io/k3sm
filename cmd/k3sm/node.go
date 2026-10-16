@@ -1056,6 +1056,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 				Node:           nd,
 				DataRoot:       opts.podRoot,
 				RuntimeHealthy: runtimeHealthProbe(prov),
+				Images:         nodeImageInventory(prov),
 				Log:            slog.Default(),
 			})
 			if nerr != nil {
@@ -1238,6 +1239,27 @@ func runtimeHealthProbe(prov vkadapter.Provider) func(context.Context) bool {
 		return nil
 	}
 	return h.RuntimeHealthy
+}
+
+// imageInventorySource is the optional provider capability the node-status loop
+// reads for Node.status.images, declared at this consumer like
+// runtimeHealthReporter.
+type imageInventorySource interface {
+	ImageInventory() (provider.ImageInventory, bool)
+}
+
+// nodeImageInventory returns prov's image inventory, or nil when its runtime
+// keeps no image store; a nil inventory publishes no images.
+func nodeImageInventory(prov vkadapter.Provider) provider.ImageInventory {
+	s, ok := prov.(imageInventorySource)
+	if !ok {
+		return nil
+	}
+	inv, ok := s.ImageInventory()
+	if !ok {
+		return nil
+	}
+	return inv
 }
 
 // evictionManagerRunner is the optional provider capability that runs the

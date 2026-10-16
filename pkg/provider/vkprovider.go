@@ -115,6 +115,14 @@ func (v *VKProvider) RuntimeHealthy(ctx context.Context) bool {
 	return h.Healthy(ctx)
 }
 
+// ImageInventory returns the backing Runtime's optional ImageInventory
+// capability, comma-ok. A Runtime without an image store (HostProcess) reports
+// false, and the node publishes no Node.status.images.
+func (v *VKProvider) ImageInventory() (ImageInventory, bool) {
+	inv, ok := v.rt.(ImageInventory)
+	return inv, ok
+}
+
 // ServableRuntime returns the in-process runtimed runtime the backing Runtime
 // drives, comma-ok, delegating to its optional ControlSocketSource capability. A
 // Runtime without that capability reports false and the node binds no runtimed

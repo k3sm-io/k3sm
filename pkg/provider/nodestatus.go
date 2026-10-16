@@ -61,6 +61,10 @@ type NodeStatusConfig struct {
 	// Ready is never contradicted — a runtime that cannot answer the question must
 	// not be allowed to answer it "no".
 	RuntimeHealthy func(ctx context.Context) bool
+	// Images lists the runtime's image store for Node.status.images. A nil value
+	// means the runtime keeps no image store (the host-process runtime), and the
+	// node reports no images.
+	Images ImageInventory
 	// Interval overrides the status recompute period; zero uses
 	// defaultNodeStatusInterval.
 	Interval time.Duration
@@ -76,7 +80,7 @@ type NodeStatusConfig struct {
 // surface goes wrong:
 //
 //   - It publishes a DEEP COPY of the node it was handed at bootstrap, with ONLY
-//     .Status.Conditions (and .Status.Phase) replaced. The node controller assigns
+//     .Status.Conditions (and .Status.Phase and .Status.Images) replaced. The node controller assigns
 //     the published Status, Labels and Annotations WHOLESALE over its own copy, so
 //     a provider that sends a conditions-only Node erases Capacity, Allocatable,
 //     the InternalIP the apiserver dials for logs/exec, the DaemonEndpoints port
@@ -110,6 +114,7 @@ type NodeStatusProvider struct {
 	dataRoot  string
 	interval  time.Duration
 	health    func(ctx context.Context) bool
+	inventory ImageInventory
 
 	// Seams, defaulted by the constructor. Tests replace them to drive the loop
 	// hermetically — no Mach, no statfs, no apiserver. sample is the HOST
@@ -118,12 +123,24 @@ type NodeStatusProvider struct {
 	now     func() time.Time
 	publish func(ctx context.Context, node *corev1.Node) error
 
-	// mu guards ready and prev. It is held only across the pure recompute, never
-	// across publish (which can block on the node controller's update channel).
+	// mu guards ready, prev and the image cache below. It is held only across
+	// the pure recompute and the cache's read and write: never across the image
+	// listing, and never across publish (which can block on the node
+	// controller's update channel).
 	// Run is the single caller of publishOnce in production.
 	mu    sync.Mutex
 	ready *probeGauge
 	prev  []corev1.NodeCondition
+	// images is the last image list the runtime answered, carried across a
+	// failed listing so a transient error never publishes an empty list.
+	// imagesFailing records that the last listing failed, so a persistent
+	// failure warns once rather than every cycle. imagesInFlight is true while
+	// a listing goroutine runs; at most one runs at a time.
+	images         []corev1.ContainerImage
+	imagesFailing  bool
+	imagesInFlight bool
+	// imagesWG counts the in-flight listing goroutine; tests wait on it.
+	imagesWG sync.WaitGroup
 
 	// monitor owns the host sample (see the type doc).
 	monitor *pressureMonitor
@@ -159,6 +176,7 @@ func NewNodeStatusProvider(cfg NodeStatusConfig) (*NodeStatusProvider, error) {
 		dataRoot:  cfg.DataRoot,
 		interval:  interval,
 		health:    cfg.RuntimeHealthy,
+		inventory: cfg.Images,
 		sample:    sampleHostStats,
 		now:       time.Now,
 		publish:   naive.UpdateStatus,
@@ -260,8 +278,97 @@ func (p *NodeStatusProvider) publishOnce(ctx context.Context) error {
 	if p.health != nil {
 		healthy = p.health(ctx)
 	}
+	p.startImageRefresh(ctx)
 	node := p.recompute(s, sampled, healthy, metav1.NewTime(p.now()))
+	node.Status.Images = p.cachedImages()
 	return p.publish(ctx, node)
+}
+
+// nodeImagesListTimeout bounds one listing of the runtime's images. The
+// listing runs off the publish path, so the bound protects the next refresh,
+// not the heartbeat.
+const nodeImagesListTimeout = 5 * time.Second
+
+// startImageRefresh starts a listing of the runtime's images in its own
+// goroutine, unless one is already running. A kubelet lists images on every
+// node status update; here the listing refreshes a cache that each publication
+// reads, so a slow or stuck listing never delays a heartbeat — the node
+// publishes whatever the cache holds and the next tick picks up the answer.
+//
+// The goroutine's lifetime is the listing call: it holds no lock while
+// listing, exits when the listing returns, and the listing is bounded by
+// nodeImagesListTimeout under ctx. Run does not wait for it on return, because
+// a listing that ignores its deadline must not hold up the node's shutdown
+// either.
+func (p *NodeStatusProvider) startImageRefresh(ctx context.Context) {
+	if p.inventory == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.imagesInFlight {
+		p.mu.Unlock()
+		return
+	}
+	p.imagesInFlight = true
+	p.imagesWG.Add(1)
+	p.mu.Unlock()
+	go func() {
+		defer p.imagesWG.Done()
+		p.refreshImages(ctx)
+	}()
+}
+
+// refreshImages lists the runtime's images once and updates the cache.
+//
+// On a listing error the cache keeps the previous list: a runtime that failed
+// one call still holds its images, and publishing an empty list would tell the
+// scheduler the node holds nothing. A failure warns on the transition from a
+// good listing to a failing one, and the recovery is logged once at Info, so a
+// persistent failure (a damaged index record) is one line, not one a minute.
+// A listing cut short by ctx itself (the node shutting down) changes nothing.
+func (p *NodeStatusProvider) refreshImages(ctx context.Context) {
+	lctx, cancel := context.WithTimeout(ctx, nodeImagesListTimeout)
+	entries, err := p.inventory.ImageIndexSnapshot(lctx)
+	cancel()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.imagesInFlight = false
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if !p.imagesFailing {
+			p.imagesFailing = true
+			p.log.Warn("list node images failed; Node.status.images keeps the previous list until a listing succeeds", "error", err)
+		}
+		return
+	}
+	p.images = nodeImages(entries, nodeStatusMaxImages)
+	if p.imagesFailing {
+		p.imagesFailing = false
+		p.log.Info("list node images recovered; Node.status.images is current again")
+	}
+}
+
+// cachedImages returns a copy of the image cache for one publication. Before
+// the first successful listing it is nil and the field is omitted.
+func (p *NodeStatusProvider) cachedImages() []corev1.ContainerImage {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return copyContainerImages(p.images)
+}
+
+// copyContainerImages deep-copies an image list, so the published node never
+// shares a backing array with the list the provider keeps.
+func copyContainerImages(in []corev1.ContainerImage) []corev1.ContainerImage {
+	if in == nil {
+		return nil
+	}
+	out := make([]corev1.ContainerImage, len(in))
+	for i := range in {
+		in[i].DeepCopyInto(&out[i])
+	}
+	return out
 }
 
 // recompute builds the node object to publish. It is the whole decision: pure

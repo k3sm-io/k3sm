@@ -213,6 +213,8 @@ If a command reports that it cannot dial the socket, the node is not running, or
 a different runtime root. `k3sm doctor` reports the former in its daemon rows, with the command that
 repairs it under `Next:`; the latter is a `--socket` away.
 
+`kubectl get node <name> -o json` lists the node's 50 largest images under `status.images`; anyone who can read nodes can read the names. The node refreshes the list with its status, and keeps the last list it read when its image index cannot be read, so the list can go stale until the index reads again.
+
 ## Working With the Store: `pull`, `tag`, `untag`, `inspect`, `save`
 
 These five verbs are the store's day-to-day surface. Each one is a client of the node's runtime
