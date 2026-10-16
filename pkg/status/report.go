@@ -80,6 +80,9 @@ const (
 	// StateBehind is the update row's word for a cluster with at least one
 	// node that does not run the latest k3sm release.
 	StateBehind RowState = "behind"
+	// StateAhead is the update row's word for a cluster with a node newer than
+	// the latest release and none behind it.
+	StateAhead RowState = "ahead"
 )
 
 // Row is one subsystem's line in the report.

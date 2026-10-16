@@ -100,7 +100,7 @@ var (
 		StateOK, StateRunning, StateReady, StateCrashLoop, StateFailed, StateStopped, StateNotLoaded,
 		StateDisabled, StateDown, StateNotReady, StateWrongOwner, StateNotMounted, StateAbsent, StatePartial,
 		StateMissing, StateSkip, StateWaiting, StateExpired, StateCorrupt, StateAddressMismatch, StateDrift,
-		StateUnknown, StateHealthy, StateUnhealthy, StateStale, StateNeedsAdmin, StateBehind,
+		StateUnknown, StateHealthy, StateUnhealthy, StateStale, StateNeedsAdmin, StateBehind, StateAhead,
 	}
 )
 
