@@ -1165,7 +1165,15 @@ st_driver_run() {
 	mtu_of() { echo 1500; }
 	measure_rtt() { echo 0.7; }
 	ic_pod() { :; }
-	pod_done() { :; }
+	# The source-pin dialer is done only once the peer listener has logged the dial:
+	# r4 backgrounds that listener (into BG_PIDS) and reads its output after
+	# pod_done, so waiting on the job makes the read ordered, not timed (sleep is
+	# a no-op here). The job only prints, so the wait is bounded by its exit.
+	pod_done() {
+		local p
+		[ "$1" = ic-pin ] || return 0
+		for p in $BG_PIDS; do wait "$p"; done
+	}
 	pod_ip() { echo 10.42.1.7; }
 	kc() { case "$*" in *clusterIP*) echo 10.43.0.10 ;; esac; }
 	pod_log_value() { case "$2" in RECV*) echo $((PAYLOAD_MB * 1048576)) ;; ICIP=) echo 169.254.0.12 ;; esac; }
