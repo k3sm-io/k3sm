@@ -116,11 +116,20 @@ func newImageStatusHarness(t *testing.T, inv ImageInventory, log *slog.Logger) *
 
 // refreshThenStep runs one cycle, which starts an image listing, waits for
 // that listing to finish, then runs the cycle that publishes its answer.
+//
+// Every cycle starts a listing, so the publishing cycle starts one too; the
+// helper waits for that one as well before it returns. Otherwise it is still in
+// flight when the caller changes the fake or reads the log: on a loaded host it
+// may read the fake before the change, the next cycle then finds it in flight,
+// waits on it and publishes its stale answer, and its log line races the
+// caller's read of the buffer.
 func refreshThenStep(h *nodeStatusHarness) *corev1.Node {
 	h.t.Helper()
 	h.step()
 	h.p.imagesWG.Wait()
-	return h.step()
+	n := h.step()
+	h.p.imagesWG.Wait()
+	return n
 }
 
 // TestNodeStatusListsImages is the gate: the published node carries
@@ -248,7 +257,9 @@ func TestNodeStatusImageListingIsOffThePublishPath(t *testing.T) {
 	if deadline <= 0 || deadline > nodeImagesListTimeout || nodeImagesListTimeout != 5*time.Second {
 		t.Errorf("listing context deadline %v (bound %v), want a bound of at most 5s", deadline, nodeImagesListTimeout)
 	}
-	if got := h.step().Status.Images; len(got) != 1 || got[0].SizeBytes != 7 {
+	got := h.step().Status.Images
+	h.p.imagesWG.Wait()
+	if len(got) != 1 || got[0].SizeBytes != 7 {
 		t.Errorf("after the listing returned Status.Images = %+v, want the one listed image", got)
 	}
 }
