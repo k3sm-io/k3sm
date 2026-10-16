@@ -348,15 +348,17 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 			return fmt.Errorf("install: %w", untrusted("%s is not inside %s, and an install from a staging directory copies nothing from anywhere else", src, dir))
 		}
 	}
-	if err := checkStagedVersion(*cfg); err != nil {
-		return err
-	}
 	if cfg.RequireTeamSignature {
 		if err := requireTeamSignatures(ctx, *cfg, entries); err != nil {
 			return err
 		}
 	}
-	return checkSigningContinuity(ctx, *cfg, entries)
+	if err := checkSigningContinuity(ctx, *cfg, entries); err != nil {
+		return err
+	}
+	// Last, because it runs the installed binary: only a tree that passed
+	// every signing check gets that far.
+	return checkStagedVersion(*cfg)
 }
 
 // requireTeamSignatures is --require-team-signature: the staged k3sm and every

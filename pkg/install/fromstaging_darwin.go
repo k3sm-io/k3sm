@@ -17,6 +17,7 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
 	"context"
 	"debug/buildinfo"
 	"errors"
@@ -24,8 +25,10 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -140,17 +143,95 @@ func (DarwinStagingFS) RemoveFile(path string) error {
 	return nil
 }
 
-// BinaryVersion reads the release version stamped into the k3sm binary at
-// path from its embedded build information, without running it.
+// BinaryVersion is the release version of the k3sm binary at path (the
+// installed one, root-owned under the install dir), as it reports itself
+// (readBinaryVersion): it runs `version --short` with a minimal environment
+// and falls back to the build information only when that run gives no
+// answer.
+//
+// It runs the binary as the installing (root) user, so it first refuses
+// anything that is not a root-owned regular file nobody else can write: the
+// path is opened O_NOFOLLOW (a symlink is refused), fstat'd, and must be a
+// regular file owned by uid 0 with no group or other write bit.
 func (DarwinStagingFS) BinaryVersion(path string) (string, error) {
-	if _, err := os.Lstat(path); err != nil {
+	return binaryVersionOwnedBy(path, 0)
+}
+
+// binaryVersionOwnedBy is BinaryVersion with the required owner uid a
+// parameter, so tests can use files they own.
+//
+// Accepted residue: the binary is executed by path after the Fstat, so a swap
+// between the two is possible; it needs write access to the root-owned
+// install directory, which already confers everything this check protects.
+// The signing checks that precede it are path-based in the same way.
+func binaryVersionOwnedBy(path string, uid uint32) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return "", fmt.Errorf("%s is a symbolic link; refusing to run it", path)
+		}
 		return "", err
 	}
-	bi, err := buildinfo.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read the build information of %s: %w", path, err)
+	defer f.Close()
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		return "", fmt.Errorf("stat %s: %w", path, err)
 	}
-	return stampedVersion(bi), nil
+	switch {
+	case st.Mode&unix.S_IFMT != unix.S_IFREG:
+		return "", fmt.Errorf("%s is not a regular file; refusing to run it", path)
+	case st.Uid != uid:
+		return "", fmt.Errorf("%s is owned by uid %d, not %d; refusing to run it", path, st.Uid, uid)
+	case st.Mode&(unix.S_IWGRP|unix.S_IWOTH) != 0:
+		return "", fmt.Errorf("%s is group or world writable; refusing to run it", path)
+	}
+	return readBinaryVersion(path, execVersion, buildinfo.ReadFile)
+}
+
+// execVersion is the production versionRunner: the binary at path run as
+// `version --short` in /, with only a system PATH in its environment, its
+// stderr discarded and its stdout capped at maxVersionOutput.
+func execVersion(ctx context.Context, path string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, path, "version", "--short")
+	cmd.Dir = "/"
+	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
+	out := &cappedBuffer{max: maxVersionOutput}
+	cmd.Stdout = out
+	cmd.Stderr = io.Discard
+	cmd.WaitDelay = 2 * time.Second
+	// Its own process group, killed whole on timeout and after the run, so a
+	// binary that forks cannot outlive the bound.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	err := cmd.Run()
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // reaps stragglers; ESRCH when none
+	}
+	if err != nil {
+		return nil, fmt.Errorf("run %s version --short: %w", path, err)
+	}
+	if out.over {
+		return nil, fmt.Errorf("%s version --short printed more than %d bytes", path, maxVersionOutput)
+	}
+	return out.buf.Bytes(), nil
+}
+
+// cappedBuffer keeps at most max bytes and records that more were written.
+type cappedBuffer struct {
+	buf  bytes.Buffer
+	max  int
+	over bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := c.max - c.buf.Len(); len(p) > room {
+		c.over = true
+		if room > 0 {
+			c.buf.Write(p[:room])
+		}
+		return len(p), nil
+	}
+	return c.buf.Write(p)
 }
 
 // MachO reports whether the regular file at path starts with a Mach-O magic
