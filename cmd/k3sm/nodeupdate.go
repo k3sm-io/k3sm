@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/url"
 	"path/filepath"
 	"sync"
 
@@ -30,6 +31,29 @@ import (
 	"k3sm.io/k3sm/pkg/update"
 	"k3sm.io/k3sm/pkg/version"
 )
+
+// releaseBaseUsage is the --update-release-base help, shared by `k3sm
+// install`, `k3sm server` and `k3sm agent`.
+const releaseBaseUsage = "the release index the managed update reads instead of GitHub's, for a mirror or a lab rig: an https URL, or http only on a loopback or private (RFC 1918) address. The archive's sha256 is always verified. Recorded with the other install arguments and kept by later installs"
+
+// releaseBase validates a --update-release-base value; empty is nil (GitHub's
+// index).
+func releaseBase(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	return update.ParseReleaseBase(raw)
+}
+
+// releaseBaseURL is the base the resolver and the check read: the validated
+// --update-release-base, or "" for their GitHub default.
+func releaseBaseURL(raw string) string {
+	u, err := releaseBase(raw)
+	if err != nil || u == nil {
+		return ""
+	}
+	return u.String()
+}
 
 // updateSubdir is the directory of the data root the managed update downloads
 // and unpacks a release in (<data root>/updates).
@@ -48,6 +72,8 @@ type nodeUpdateDeps struct {
 	fetcher update.Fetcher
 	netd    update.Netd
 	running version.Info
+	// releaseBase is the node's recorded --update-release-base, or nil.
+	releaseBase *url.URL
 	// ready reports whether the node's pod runtime answers; nil is always.
 	ready func(context.Context) bool
 }
@@ -56,11 +82,13 @@ type nodeUpdateDeps struct {
 // k3sm-netd socket, and holds Done until ready (the provider's runtime-health
 // probe) says the pod runtime answers.
 func productionUpdateDeps(opts nodeOptions, ready func(context.Context) bool) nodeUpdateDeps {
+	base, _ := releaseBase(opts.updateReleaseBase) // validated when the daemon's flags parsed
 	return nodeUpdateDeps{
-		fetcher: update.HTTPFetcher{},
-		netd:    wire.NewClient(opts.netMode.Socket),
-		running: version.Get(),
-		ready:   ready,
+		releaseBase: base,
+		fetcher:     update.HTTPFetcher{Pin: update.HostPin{Base: base}},
+		netd:        wire.NewClient(opts.netMode.Socket),
+		running:     version.Get(),
+		ready:       ready,
 	}
 }
 
@@ -73,14 +101,15 @@ func newNodeUpdater(opts nodeOptions, cs kubernetes.Interface, deps nodeUpdateDe
 		return nil, nil
 	}
 	return update.New(update.Config{
-		Node:    opts.nodeName,
-		Client:  cs,
-		Running: deps.running,
-		Root:    opts.updateRoot,
-		Fetcher: deps.fetcher,
-		Netd:    deps.netd,
-		Ready:   deps.ready,
-		Log:     logger,
+		Node:        opts.nodeName,
+		Client:      cs,
+		Running:     deps.running,
+		Root:        opts.updateRoot,
+		Fetcher:     deps.fetcher,
+		Netd:        deps.netd,
+		Ready:       deps.ready,
+		ReleaseBase: deps.releaseBase,
+		Log:         logger,
 	})
 }
 

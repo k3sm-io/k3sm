@@ -48,7 +48,7 @@ type Payload struct {
 }
 
 // ParsePayload decodes and checks the payload annotation: a known signature
-// policy, a lowercase hex sha256 and an archive URL CheckURL accepts.
+// policy and a lowercase hex sha256. The archive URL is the HostPin's to judge.
 func ParsePayload(raw string) (Payload, error) {
 	var p Payload
 	dec := json.NewDecoder(strings.NewReader(raw))
@@ -66,9 +66,6 @@ func ParsePayload(raw string) (Payload, error) {
 	}
 	if !isSHA256Hex(p.SHA256) {
 		return Payload{}, fmt.Errorf("%w: the payload sha256 is not a lowercase hex sha256", ErrRefused)
-	}
-	if err := CheckURL(p.URL); err != nil {
-		return Payload{}, err
 	}
 	return p, nil
 }

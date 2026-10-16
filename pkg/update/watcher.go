@@ -26,6 +26,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,6 +87,9 @@ type Config struct {
 	Fetcher Fetcher
 	// Netd installs the build set.
 	Netd Netd
+	// ReleaseBase is the node's recorded --update-release-base, nil for
+	// GitHub's index: the HostPin admits its host for the archive URL.
+	ReleaseBase *url.URL
 	// Ready reports whether this daemon is fully up (its pod runtime
 	// answering). Done is written only once it returns true, because the
 	// controller counts a node complete on Done, its kubeletVersion and a
@@ -235,6 +239,9 @@ func (w *Watcher) attempt(ctx context.Context, tag, raw string) error {
 	if err != nil {
 		return w.fail(ctx, log, err, "")
 	}
+	if err := (HostPin{Base: w.cfg.ReleaseBase}).CheckRaw(p.URL); err != nil {
+		return w.fail(ctx, log, err, "")
+	}
 	if cmp, ok := install.CompareReleaseVersions(tag, w.cfg.Running.Version); ok && cmp < 0 && !p.AllowDowngrade {
 		return w.fail(ctx, log, fmt.Errorf("%w: %s is older than the running %s and the update does not allow a downgrade", ErrRefused, tag, w.cfg.Running.Version), "")
 	}
@@ -361,15 +368,15 @@ func (w *Watcher) setPhase(ctx context.Context, phase updatesv1alpha1.UpdateNode
 	return nil
 }
 
-// download fetches url into the new file at dst, at most MaxArchiveBytes and
+// download fetches rawURL into the new file at dst, at most MaxArchiveBytes and
 // within DownloadTimeout, and returns the sha256 of the bytes written.
-func (w *Watcher) download(ctx context.Context, url, dst string) (string, error) {
+func (w *Watcher) download(ctx context.Context, rawURL, dst string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, DownloadTimeout)
 	defer cancel()
-	if err := CheckURL(url); err != nil {
+	if err := (HostPin{Base: w.cfg.ReleaseBase}).CheckRaw(rawURL); err != nil {
 		return "", err
 	}
-	body, err := w.cfg.Fetcher.Fetch(ctx, url)
+	body, err := w.cfg.Fetcher.Fetch(ctx, rawURL)
 	if err != nil {
 		return "", err
 	}

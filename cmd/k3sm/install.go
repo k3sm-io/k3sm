@@ -38,6 +38,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/k3sm/pkg/update"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -220,6 +221,7 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 		NodePortAddresses: o.recordedNodePortAddresses(),
 		LAN:               o.recordedLAN(),
 		SecretsEncryption: o.secretsEncryption,
+		UpdateReleaseBase: o.updateReleaseBase,
 		EtcdSnapshots:     o.etcdSnapshotFlags(),
 		Start:             o.start,
 		Logger:            logger,
@@ -379,6 +381,9 @@ type installFlags struct {
 	// requireTeamSignature is --require-team-signature, with --from-staging
 	// only (install.StagingOptions.RequireTeamSignature).
 	requireTeamSignature bool
+	// updateReleaseBase is --update-release-base, validated by
+	// update.ParseReleaseBase and normalized (install.Config.UpdateReleaseBase).
+	updateReleaseBase string
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
@@ -398,6 +403,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token (a joined node needs none). With --server-join: required; a file holding the server token `k3sm token create --server` printed on an existing server. Read once by this install and copied for the daemon; it must not be group- or world-readable, and it is yours to delete afterwards")
 	fs.StringVar(&o.fromStaging, "from-staging", "", "install from a k3sm.app staging directory: the directory directly inside "+install.DefaultStagingRoot+" that this k3sm runs from. Every file is installed from that directory, which must be owned by root and writable by nobody else. A --token-file must sit directly inside it, owned by root with mode 600, and is removed once read. Without --agent, --server-join and --token-file it updates whatever is installed in place: the role, the join target and every configured argument are read from the installed daemon, and nothing installed is refused unless --user names a first install. Refuses an older version than the installed one; a build signed by another team than a team-signed install, or ad-hoc over a team-signed install; and a first install without a Developer ID team signature")
 	fs.BoolVar(&o.allowDowngrade, "allow-downgrade", false, "with --from-staging: install even when the installed k3sm is newer, or its version cannot be read")
+	fs.StringVar(&o.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
 	fs.BoolVar(&o.requireTeamSignature, "require-team-signature", false, "with --from-staging: refuse the install unless every Mach-O in the staging directory carries a Developer ID team signature, whatever the installed k3sm is signed with")
 	fs.BoolVar(&o.start, "start", false, "on a node stopped with 'k3sm stop', start it after installing (without it the node is updated and stays stopped)")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
@@ -447,6 +453,13 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	}
 	if err := o.validateFromStaging(); err != nil {
 		return o, err
+	}
+	if o.updateReleaseBase != "" {
+		u, err := update.ParseReleaseBase(o.updateReleaseBase)
+		if err != nil {
+			return o, err
+		}
+		o.updateReleaseBase = u.String()
 	}
 	if err := o.validateEtcdSnapshotFlags(); err != nil {
 		return o, err

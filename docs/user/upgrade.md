@@ -143,7 +143,7 @@ node:
    (following redirects only to `objects.githubusercontent.com` and
    `release-assets.githubusercontent.com`, each one checked), at most 512 MiB and within 10
    minutes, into a fresh directory under `/var/lib/k3sm/updates` that only the `_k3sm` user can
-   read.
+   read. A node installed with `--update-release-base` also accepts that base's own host (below).
 2. Writes `Verifying` and checks the archive's sha256 against the release's published checksum
    before anything is unpacked. It then unpacks the build set (`k3sm`, `k3sm-execshim`,
    `k3sm-vmhost`, the two shim dylibs and `cp-payload/`) as regular files only. A link, an
@@ -168,6 +168,25 @@ with the reason (`kubectl get node <name> -o jsonpath='{.metadata.annotations.k3
 and the download directory stays for diagnosis until the next update attempt or the next daemon
 start removes it. A node without the `k3sm-netd` helper, such as a standalone `k3sm node`, does not
 take part.
+
+### Release Base for a Mirror or a Lab
+
+By default the server resolves a release, and each node downloads it, from GitHub. A mirror, or a
+lab that serves its own builds, sets another release index at install:
+
+```sh
+sudo k3sm install --update-release-base https://mirror.example.com/k3sm/releases
+sudo k3sm install --agent --server <server> --update-release-base https://mirror.example.com/k3sm/releases
+```
+
+The index must have GitHub's layout: `<base>/download/<tag>/k3sm_<version>_darwin_arm64.tar.gz` and
+`<base>/download/<tag>/k3sm_<version>_checksums.txt`. The server reads the release, its checksum and
+the update check from it. Each node downloads the archive from it, from the base's own host and port
+and from GitHub's hosts, and still verifies the archive's sha256. The base must be `https`, or `http`
+only on a loopback or private (RFC 1918) address such as a lab network; plain `http` on any other
+host is refused. Set it on every node of the cluster, the server and each worker. The setting is
+recorded with the other install arguments, so later installs, managed updates included, keep it;
+install again with another `--update-release-base` to change it.
 
 ## Before You Upgrade
 

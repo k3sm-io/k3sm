@@ -200,6 +200,9 @@ func preflightServer(opts *serverOptions, workDirErr error, logger *slog.Logger)
 	if err := checkNodePortAddresses(&opts.nodePortAddresses, opts.network); err != nil {
 		return nil, mode, true, err
 	}
+	if _, err := releaseBase(opts.updateReleaseBase); err != nil {
+		return nil, mode, true, err
+	}
 	// The snapshot schedule, refused before anything is written when it cannot
 	// run, and said once when it is not read.
 	if err := opts.validateEtcdSnapshotFlags(); err != nil {

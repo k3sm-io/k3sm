@@ -45,6 +45,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+
+	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/update"
 	"k3sm.io/k3sm/pkg/updatectl"
@@ -132,7 +135,7 @@ func newUpdateEnv() updateEnv {
 	env := updateEnv{
 		out:     os.Stdout,
 		errOut:  os.Stderr,
-		inputs:  update.Inputs{BaseURL: update.DefaultBaseURL, Installed: version.Get()},
+		inputs:  update.Inputs{BaseURL: checkBase(installedReleaseBase(role)), Installed: version.Get()},
 		workDir: workDir,
 		in:      os.Stdin,
 	}
@@ -351,13 +354,37 @@ type updateRecorder struct {
 	logger              *slog.Logger
 }
 
+// checkBase is the release index a check reads: the validated release base,
+// or GitHub's when there is none.
+func checkBase(baseURL string) string {
+	if baseURL == "" {
+		return update.DefaultBaseURL
+	}
+	return baseURL
+}
+
+// installedReleaseBase is the --update-release-base recorded on the installed
+// server, read the way the server's other arguments are (the plist, else the
+// arguments record), or "" when there is none or it cannot be read.
+func installedReleaseBase(role install.Role) string {
+	if role != install.RoleServer {
+		return ""
+	}
+	args, err := install.InstalledServerArgs(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath)
+	if err != nil {
+		return ""
+	}
+	return releaseBaseURL(install.ServerArgValue(args, update.ReleaseBaseFlag))
+}
+
 // runUpdateRecorder starts the server's update recorder: the hourly check
-// against the release index and the Update poll over dyn.
-func runUpdateRecorder(ctx context.Context, workDir string, cs kubernetes.Interface, dyn dynamic.Interface, logger *slog.Logger) {
+// against the release index (baseURL, the recorded --update-release-base, or
+// GitHub's when empty) and the Update poll over dyn.
+func runUpdateRecorder(ctx context.Context, workDir, baseURL string, cs kubernetes.Interface, dyn dynamic.Interface, logger *slog.Logger) {
 	updateRecorder{
 		workDir: workDir,
 		check: func(ctx context.Context) (update.Report, error) {
-			return update.Check(ctx, update.Inputs{BaseURL: update.DefaultBaseURL, Kube: cs, Installed: version.Get()})
+			return update.Check(ctx, update.Inputs{BaseURL: checkBase(baseURL), Kube: cs, Installed: version.Get()})
 		},
 		dyn:       dyn,
 		interval:  status.UpdateRecordInterval,

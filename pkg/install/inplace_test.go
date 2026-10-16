@@ -166,3 +166,59 @@ func TestResolveInPlace(t *testing.T) {
 		}
 	})
 }
+
+// TestUpdateReleaseBaseIsRecordedAndCarried pins --update-release-base: it
+// is rendered into the role's daemon arguments, replaced by a later value,
+// and kept by an in-place update, which names none.
+func TestUpdateReleaseBaseIsRecordedAndCarried(t *testing.T) {
+	const base = "http://192.168.0.50:8080/releases"
+	want := "--" + UpdateReleaseBaseFlag + "=" + base
+	t.Run("server", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		first := testConfig(t)
+		first.UpdateReleaseBase = "http://192.168.0.9/old"
+		if err := Install(context.Background(), f, first); err != nil {
+			t.Fatalf("first install: %v", err)
+		}
+		second := testConfig(t)
+		second.DataRoot, second.ServerArgsRecord = first.DataRoot, first.ServerArgsRecord
+		second.UpdateReleaseBase = base
+		if err := Install(context.Background(), f, second); err != nil {
+			t.Fatalf("second install: %v", err)
+		}
+		req := inPlaceRequest()
+		req.DataRoot, req.ServerArgsRecord = first.DataRoot, first.ServerArgsRecord
+		cfg, err := ResolveInPlace(f, req, func(string) (string, error) { return "alice", nil })
+		if err != nil {
+			t.Fatalf("ResolveInPlace = %v", err)
+		}
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("in-place install: %v", err)
+		}
+		args := serverArgsOf(t, f, cfg)
+		if !slices.Contains(args, want) || strings.Contains(strings.Join(args, " "), "/old") {
+			t.Errorf("server arguments %v, want exactly %s", args, want)
+		}
+	})
+	t.Run("agent", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		seedJoinedAgent(t, f)
+		first := agentCfg(t)
+		first.UpdateReleaseBase = base
+		if err := Install(context.Background(), f, first); err != nil {
+			t.Fatalf("first agent install: %v", err)
+		}
+		cfg, err := ResolveInPlace(f, inPlaceRequest(), nil)
+		if err != nil {
+			t.Fatalf("ResolveInPlace = %v", err)
+		}
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("in-place agent install: %v", err)
+		}
+		if args := installedArgs(t, f, AgentLabel); !slices.Contains(args, want) {
+			t.Errorf("agent arguments %v, want %s carried over", args, want)
+		}
+	})
+}

@@ -27,6 +27,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -236,6 +237,11 @@ func runUpdateSync(t *testing.T, node *corev1.Node, archive []byte, running stri
 
 func runUpdateSyncReady(t *testing.T, node *corev1.Node, archive []byte, running string, netd *fakeNetd, ready func(context.Context) bool) updateRun {
 	t.Helper()
+	return runUpdateSyncBase(t, node, archive, running, netd, ready, "")
+}
+
+func runUpdateSyncBase(t *testing.T, node *corev1.Node, archive []byte, running string, netd *fakeNetd, ready func(context.Context) bool, base string) updateRun {
+	t.Helper()
 	cs := fake.NewClientset(node)
 	ff := &fakeFetcher{archive: archive}
 	if netd == nil {
@@ -249,10 +255,11 @@ func runUpdateSyncReady(t *testing.T, node *corev1.Node, archive []byte, running
 		updateRoot: root,
 	}
 	w, err := newNodeUpdater(opts, cs, nodeUpdateDeps{
-		fetcher: ff,
-		netd:    netd,
-		running: version.Info{Version: running, KubeVersion: updTestKube},
-		ready:   ready,
+		fetcher:     ff,
+		netd:        netd,
+		running:     version.Info{Version: running, KubeVersion: updTestKube},
+		ready:       ready,
+		releaseBase: mustReleaseBase(t, base),
 	}, slog.New(slog.DiscardHandler))
 	if err != nil || w == nil {
 		t.Fatalf("newNodeUpdater = %v, %v", w, err)
@@ -273,6 +280,15 @@ func runUpdateSyncReady(t *testing.T, node *corev1.Node, archive []byte, running
 		}
 	}
 	return updateRun{cs: cs, fetch: ff, netd: netd, root: root}
+}
+
+func mustReleaseBase(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := releaseBase(raw)
+	if err != nil {
+		t.Fatalf("releaseBase(%q) = %v", raw, err)
+	}
+	return u
 }
 
 // extractedFiles lists the regular files under every attempt's set directory.
@@ -429,6 +445,27 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 		}
 		if dirs, _ := filepath.Glob(filepath.Join(r.root, "attempt-*")); len(dirs) != 1 {
 			t.Errorf("attempt directories after a failure = %v, want the one kept for diagnosis", dirs)
+		}
+	})
+
+	t.Run("a recorded release base admits its host and nothing more", func(t *testing.T) {
+		t.Parallel()
+		const base = "http://192.168.0.50:8080/releases"
+		p := goodPayload
+		p.URL = base + "/download/v0.2.0/k3sm_0.2.0_darwin_arm64.tar.gz"
+		r := runUpdateSyncBase(t, handedOverNode(p, nil), good, updTestRunning, nil, nil, base)
+		if len(r.netd.calls) != 1 || !slices.Equal(r.fetch.urls, []string{p.URL}) {
+			t.Fatalf("lab base: fetched %v, ApplyUpdate calls %d; want the archive fetched and installed", r.fetch.urls, len(r.netd.calls))
+		}
+		p.URL = "https://example.com/k3sm_0.2.0_darwin_arm64.tar.gz"
+		r = runUpdateSyncBase(t, handedOverNode(p, nil), good, updTestRunning, nil, nil, base)
+		if got := phaseNames(phasesWritten(t, r.cs)); !slices.Equal(got, []string{"Failed"}) || len(r.fetch.urls) != 0 {
+			t.Fatalf("foreign host beside a recorded base: phases %v, fetched %v; want Failed and no fetch", got, r.fetch.urls)
+		}
+		p.URL = base + "/download/v0.2.0/k3sm_0.2.0_darwin_arm64.tar.gz"
+		r = runUpdateSyncBase(t, handedOverNode(p, nil), good, updTestRunning, nil, nil, "")
+		if got := phaseNames(phasesWritten(t, r.cs)); !slices.Equal(got, []string{"Failed"}) || len(r.fetch.urls) != 0 {
+			t.Fatalf("lab host with no recorded base: phases %v, fetched %v; want Failed and no fetch", got, r.fetch.urls)
 		}
 	})
 

@@ -287,6 +287,9 @@ type nodeOptions struct {
 	// (updateRootFor). `k3sm server` and `k3sm agent` set it; empty (the
 	// standalone `k3sm node`) runs no update watcher.
 	updateRoot string
+	// updateReleaseBase is the daemon's --update-release-base (validated), the
+	// extra host the update watcher's pin admits; empty is GitHub's only.
+	updateReleaseBase string
 }
 
 // nodeKubeletListen is the standalone `k3sm node` --listen default

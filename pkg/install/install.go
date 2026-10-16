@@ -1314,6 +1314,10 @@ type Config struct {
 	// kubeconfig` and `uninstall --purge` read it back. Empty keeps a carried
 	// name; DefaultKubeconfigName clears it. Control plane only.
 	KubeconfigName string
+	// UpdateReleaseBase is `k3sm install --update-release-base`, already
+	// validated: rendered into the role's daemon arguments, replacing a
+	// carried value. Empty keeps the carried one (GitHub's index when none).
+	UpdateReleaseBase string
 	// TLSSANs is `k3sm install --tls-san`: extra names for the apiserver's
 	// serving certificate, validated by the CLI. A non-empty list REPLACES the
 	// carried --tls-san set and nil keeps it (setTLSSANArgs). Control plane only.
@@ -1639,6 +1643,7 @@ func (c Config) resolvedExtraServerArgs() []string {
 		args = setKubeconfigNameArg(args, c.KubeconfigName)
 	}
 	args = c.setNodePortAddressesArg(args)
+	args = setReleaseBaseArg(args, c.UpdateReleaseBase)
 	if c.etcdRequested() {
 		args = setEtcdArgs(args, c)
 	}

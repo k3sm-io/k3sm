@@ -41,9 +41,11 @@ type Fetcher interface {
 }
 
 // HTTPFetcher is the production Fetcher: a plain GET that follows at most
-// five redirects, every one of them to a URL CheckURL accepts, and refuses a
+// five redirects, every one of them to a URL its Pin admits, and refuses a
 // response that is not 200 or announces more than MaxArchiveBytes.
 type HTTPFetcher struct {
+	// Pin judges the URL and every redirect; the zero pin is AllowedHosts.
+	Pin HostPin
 	// Client is the HTTP client; nil uses a fresh client with the redirect
 	// policy and a DownloadTimeout bound. A supplied client's own redirect
 	// policy is replaced for the fetch.
@@ -52,7 +54,7 @@ type HTTPFetcher struct {
 
 // Fetch implements Fetcher.
 func (f HTTPFetcher) Fetch(ctx context.Context, rawURL string) (io.ReadCloser, error) {
-	if err := CheckURL(rawURL); err != nil {
+	if err := f.Pin.CheckRaw(rawURL); err != nil {
 		return nil, err
 	}
 	c := http.Client{Timeout: DownloadTimeout}
@@ -63,7 +65,7 @@ func (f HTTPFetcher) Fetch(ctx context.Context, rawURL string) (io.ReadCloser, e
 		if len(via) >= maxRedirects {
 			return fmt.Errorf("%w: more than %d redirects", ErrRefused, maxRedirects)
 		}
-		return checkURL(req.URL)
+		return f.Pin.Check(req.URL)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -81,7 +83,7 @@ func (f HTTPFetcher) Fetch(ctx context.Context, rawURL string) (io.ReadCloser, e
 	}
 	// The redirect policy judged every hop; this binds the bytes to the last.
 	if resp.Request != nil && resp.Request.URL != nil {
-		if err := checkURL(resp.Request.URL); err != nil {
+		if err := f.Pin.Check(resp.Request.URL); err != nil {
 			_ = resp.Body.Close()
 			return nil, err
 		}

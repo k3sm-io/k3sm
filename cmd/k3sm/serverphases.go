@@ -582,7 +582,7 @@ func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Co
 	} else {
 		dyn = d
 	}
-	go runUpdateRecorder(ctx, plan.opts.workDir, cs, dyn, logger)
+	go runUpdateRecorder(ctx, plan.opts.workDir, releaseBaseURL(plan.opts.updateReleaseBase), cs, dyn, logger)
 	stopUpdates := startUpdateController(ctx, plan, restCfg, cs, logger)
 	return mlxGPU, func() {
 		stopUpdates()
@@ -598,6 +598,12 @@ func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Co
 // own Lease, so one server of an HA control plane rolls at a time. Same
 // lifetime as the MLX operator: drained before the control plane stops. A
 // client or controller that cannot be built is logged and stop is noStop.
+// updateResolver is the controller's release resolver, reading the recorded
+// --update-release-base when set and GitHub's index otherwise.
+func updateResolver(rawBase string) updatectl.HTTPResolver {
+	return updatectl.HTTPResolver{Base: releaseBaseURL(rawBase)}
+}
+
 func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
 	dyn, err := dynamic.NewForConfig(restCfg)
 	if err != nil {
@@ -614,6 +620,7 @@ func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.C
 		Dynamic:    dyn,
 		CRD:        crd,
 		ServerNode: plan.opts.nodeName,
+		Resolver:   updateResolver(plan.opts.updateReleaseBase),
 		Log:        logger,
 	})
 	if err != nil {
