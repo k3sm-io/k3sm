@@ -63,9 +63,35 @@ mkdir -p "$tmp/graph"
 for f in go.mod go.sum; do cp "$HERE/$f" "$tmp/graph/"; done
 sed -i.bak "s/^\(sigs.k8s.io\/metrics-server $MS_VERSION \)h1:.*/\1h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=/" "$tmp/graph/go.sum"
 if "$BUILD" --check-graph "$tmp/graph" >/dev/null; then bad "a go.sum with another Sum passed"; else ok "a go.sum with another Sum for the pinned module is refused"; fi
-for f in go.mod go.sum; do cp "$HERE/$f" "$tmp/graph/"; done
-sed -i.bak 's#^\([[:space:]]*google.golang.org/grpc\) v[^ ]*#\1 v1.81.1#' "$tmp/graph/go.mod"
-if out="$("$BUILD" --check-graph "$tmp/graph")"; then bad "a go.mod without the grpc fix passed"; elif printf '%s\n' "$out" | grep -q "google.golang.org/grpc"; then ok "a go.mod that drops a security fix is refused, naming it"; else bad "dropped fix not named: $out"; fi
+MS_FIXES="$(pin MS_FIXES)"
+[ -n "$MS_FIXES" ] || bad "build.sh pins no MS_FIXES"
+# Each fix in turn: downgraded in the require block; present only as a literal
+# lookalike path (each dot a different byte, which a regex dot would match); and
+# present at its version only inside an exclude block. Every one is refused,
+# naming the module.
+for fix in $MS_FIXES; do
+	fmod="${fix%@*}" fver="${fix#*@}"
+	look="$(printf '%s' "$fmod" | tr . X)"
+	for variant in downgraded lookalike exclude-only; do
+		cp "$HERE/go.mod" "$HERE/go.sum" "$tmp/graph/"
+		awk -v mod="$fmod" -v ver="$fver" -v look="$look" -v how="$variant" '
+			$1 == mod && $2 == ver {
+				if (how == "downgraded") { sub(ver, "v0.0.0") }
+				else if (how == "lookalike") { $1 = "\t" look; sub(/^ /, "") }
+				else { next }
+			}
+			{ print }
+			END { if (how == "exclude-only") printf "exclude (\n\t%s %s\n)\n", mod, ver }
+		' "$HERE/go.mod" >"$tmp/graph/go.mod"
+		if out="$("$BUILD" --check-graph "$tmp/graph")"; then
+			bad "a go.mod with $fmod $variant passed"
+		elif printf '%s\n' "$out" | grep -qF "require $fmod $fver"; then
+			ok "a go.mod with $fmod $variant is refused, naming it"
+		else
+			bad "$fmod $variant not named: $out"
+		fi
+	done
+done
 cp "$HERE/go.mod" "$HERE/go.sum" "$tmp/graph/"
 printf 'replace golang.org/x/net => example.com/net v0.0.1\n' >>"$tmp/graph/go.mod"
 if "$BUILD" --check-graph "$tmp/graph" >/dev/null; then bad "a go.mod with a replace passed"; else ok "a go.mod with a replace is refused"; fi

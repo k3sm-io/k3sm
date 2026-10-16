@@ -29,7 +29,7 @@ the workers.
    `x/sync`, `x/sys`, `x/term` and `x/text` with it, to the versions k3sm itself ships.
    The graph also requires each module in `MS_FIXES` at its pinned version, the lowest
    that fixes every advisory open against upstream's own version: `google.golang.org/grpc`
-   v1.83.2, `github.com/google/cel-go` v0.29.0, and `go.opentelemetry.io/otel/sdk` and the
+   v1.83.2, `github.com/google/cel-go` v0.30.0, and `go.opentelemetry.io/otel/sdk` and the
    two `otlptrace` exporters at v1.45.0. They move `otel`, `otel/metric`, `otel/trace`,
    `go.opentelemetry.io/proto/otlp`, `go-logr/logr` and `genproto` with them.
    `--regen-graph` regenerates the two files; review that diff as a dependency change.

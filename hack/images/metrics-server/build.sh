@@ -80,10 +80,11 @@ MS_XNET="v0.60.0"
 # The security fixes the graph also takes, each at the lowest version that fixes
 # every advisory open against upstream v0.9.0's own version: grpc for
 # GHSA-hrxh-6v49-42gf, GHSA-2v4p-qf9q-27wj, GHSA-vp52-pcj8-j9qc and
-# GHSA-qc2q-p7wx-3px3; cel-go for GHSA-gcjh-h69q-9w9g; otel/sdk and the two
+# GHSA-qc2q-p7wx-3px3; cel-go for GHSA-gcjh-h69q-9w9g (GO-2026-6094, fixed only
+# in v0.30.0; v0.29.x is still affected); otel/sdk and the two
 # otlptrace exporters for GHSA-8wmf-6v46-5gfg. Minimal version selection moves
 # otel, otel/metric, otel/trace, otlp proto, go-logr/logr and genproto with them.
-MS_FIXES="google.golang.org/grpc@v1.83.2 github.com/google/cel-go@v0.29.0 go.opentelemetry.io/otel/sdk@v1.45.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.45.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.45.0"
+MS_FIXES="google.golang.org/grpc@v1.83.2 github.com/google/cel-go@v0.30.0 go.opentelemetry.io/otel/sdk@v1.45.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.45.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.45.0"
 # The version marker's variant: a pure-Go build over the patched graph.
 MS_VARIANT="nocgo+xnet-$MS_XNET"
 # The tag the operator pushes; consumers pin the digest image.yaml records.
@@ -146,16 +147,31 @@ sys.exit(1 if bad else 0)
 PY
 }
 
+# go_mod_requires <go.mod> <module> <version>: the go.mod requires <module> at
+# <version>, in a require block or a one-line require. The path and version are
+# compared as literal fields, never as a pattern, and exclude and retract
+# directives do not count.
+go_mod_requires() {
+	awk -v mod="$2" -v ver="$3" '
+		{ sub(/\/\/.*/, "") }
+		inreq && $1 == ")" { inreq = 0; next }
+		inreq && $1 == mod && $2 == ver { found = 1 }
+		!inreq && $1 == "require" && $2 == "(" { inreq = 1; next }
+		!inreq && $1 == "require" && $2 == mod && $3 == ver { found = 1 }
+		END { exit found ? 0 : 1 }
+	' "$1"
+}
+
 # graph_problems <dir>: go.mod and go.sum in <dir> are a graph this recipe may
 # build: they require the pinned module at MS_VERSION, x/net at MS_XNET and
 # every MS_FIXES module at its version, carry no replace, and go.sum holds MS_H1
 # for the pinned module's zip.
 graph_problems() {
 	local dir="$1" bad=0 fix
-	grep -Eq "^[[:space:]]+$MS_MODULE $MS_VERSION( |\$)" "$dir/go.mod" || { echo "go.mod does not require $MS_MODULE $MS_VERSION"; bad=1; }
-	grep -Eq "^[[:space:]]+golang.org/x/net $MS_XNET( |\$)" "$dir/go.mod" || { echo "go.mod does not require golang.org/x/net $MS_XNET"; bad=1; }
+	go_mod_requires "$dir/go.mod" "$MS_MODULE" "$MS_VERSION" || { echo "go.mod does not require $MS_MODULE $MS_VERSION"; bad=1; }
+	go_mod_requires "$dir/go.mod" golang.org/x/net "$MS_XNET" || { echo "go.mod does not require golang.org/x/net $MS_XNET"; bad=1; }
 	for fix in $MS_FIXES; do
-		grep -Eq "^[[:space:]]+${fix%@*} ${fix#*@}( |\$)" "$dir/go.mod" || { echo "go.mod does not require ${fix%@*} ${fix#*@}"; bad=1; }
+		go_mod_requires "$dir/go.mod" "${fix%@*}" "${fix#*@}" || { echo "go.mod does not require ${fix%@*} ${fix#*@}"; bad=1; }
 	done
 	grep -Eq '^[[:space:]]*replace([[:space:]]|\()' "$dir/go.mod" && { echo "go.mod carries a replace"; bad=1; }
 	grep -qxF "$MS_MODULE $MS_VERSION $MS_H1" "$dir/go.sum" || { echo "go.sum does not hold $MS_H1 for $MS_MODULE $MS_VERSION"; bad=1; }
