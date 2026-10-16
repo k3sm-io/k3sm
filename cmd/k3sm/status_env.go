@@ -43,6 +43,7 @@ import (
 
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 
 	"k3sm.io/k3sm/pkg/datavol"
@@ -274,25 +275,21 @@ func statusServingChain(kube status.Kube) func(context.Context) (status.Presente
 		if u.Port() == "" {
 			addr = net.JoinHostPort(u.Hostname(), "443")
 		}
-		dialer := tls.Dialer{
-			NetDialer: &net.Dialer{Timeout: statusAPITimeout},
-			Config: &tls.Config{
-				ServerName: pc.Host,
-				MinVersion: tls.VersionTLS12,
-				// Read-only: the chain is verified against pc.CA by the row.
-				InsecureSkipVerify: true,
-			},
-		}
 		ctx, cancel := context.WithTimeout(ctx, statusAPITimeout)
 		defer cancel()
-		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		raw, err := (&tcpseg.Dialer{Timeout: statusAPITimeout}).DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return pc, err
 		}
-		defer func() { _ = conn.Close() }()
-		tc, ok := conn.(*tls.Conn)
-		if !ok {
-			return pc, errors.New("the dial did not return a TLS connection")
+		tc := tls.Client(raw, &tls.Config{
+			ServerName: pc.Host,
+			MinVersion: tls.VersionTLS12,
+			// Read-only: the chain is verified against pc.CA by the row.
+			InsecureSkipVerify: true,
+		})
+		defer func() { _ = tc.Close() }()
+		if err := tc.HandshakeContext(ctx); err != nil {
+			return pc, err
 		}
 		pc.Chain = tc.ConnectionState().PeerCertificates
 		return pc, nil
