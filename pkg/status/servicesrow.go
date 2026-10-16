@@ -79,20 +79,22 @@ func (c Collector) servicesRow(ctx context.Context, serving bool, now time.Time)
 	if wd == "" || c.FS == nil || c.Services == nil {
 		return Row{}, false
 	}
-	path := ServicesPath(wd)
-	row := Row{Name: RowServices, State: StateUnknown, Severity: SeverityUnknown, Wide: map[string]string{"record": path}}
-	raw, err := c.FS.ReadFile(path)
+	rr := c.readRecord(ServicesPath(wd))
+	row := Row{Name: RowServices, State: StateUnknown, Severity: SeverityUnknown, Wide: map[string]string{"record": rr.path}}
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
+	case errors.Is(rr.err, fs.ErrNotExist):
 		row.Detail = "the server has not recorded its Service proxy yet (it does 30 seconds after it starts)"
 		return row, true
-	case err != nil:
-		row.Detail, row.Remedy = "unreadable as this user: "+path, "sudo k3sm status"
+	case errors.Is(rr.err, fs.ErrPermission):
+		needsAdmin(&row, c.recordNeedsAdminDetail(rr.path))
+		return row, true
+	case rr.err != nil:
+		row.Detail, row.Remedy = "could not read "+rr.path+": "+errText(rr.err), "sudo k3sm status"
 		return row, true
 	}
 	var rec ServicesRecord
-	if err := json.Unmarshal(raw, &rec); err != nil {
-		row.Detail = "the Service proxy record does not parse: " + path
+	if err := json.Unmarshal(rr.raw, &rec); err != nil {
+		row.Detail = "the Service proxy record does not parse: " + rr.path
 		return row, true
 	}
 	row.Wide["recorded"] = rec.UpdatedAt.UTC().Format(time.RFC3339)

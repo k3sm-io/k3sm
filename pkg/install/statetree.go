@@ -92,6 +92,19 @@ const serviceTreePrivateMode fs.FileMode = 0o700
 // that uid) the manifest reconciler's grant.
 const ManifestDirMode fs.FileMode = 0o755
 
+// StatusDirMode is the status directory's mode: the service user's, 0755, so
+// the server can write into it and any account can read what it publishes
+// there. Nothing in it is a secret by contract (see StatusSubdir).
+const StatusDirMode fs.FileMode = 0o755
+
+// StatusSubdir is the status directory's leaf name under the data root: where
+// the server publishes, world-readable, the records `k3sm status` reads (the
+// mesh-claim and Service proxy records), beside the 0600 copies in its own
+// work dir. They hold cluster-internal names and addresses, never a credential,
+// so an ordinary account may read them; pods cannot write here, because their
+// sandbox scopes writes to the pod's own volume.
+const StatusSubdir = "status"
+
 // manifestsSubdir is the manifest directory's leaf name, spelled once.
 const manifestsSubdir = "manifests"
 
@@ -155,6 +168,9 @@ const (
 	// StateLibrary is the service user's home-Library (<home>/Library): the
 	// data root is _k3sm's home, and macOS writes per-user state there.
 	StateLibrary StateLevel = "Library"
+	// StateStatus is the service user's world-readable status directory
+	// (StatusSubdir).
+	StateStatus StateLevel = StatusSubdir
 )
 
 // Path joins the level onto a data root.
@@ -195,6 +211,9 @@ var stateTree = func() []stateLevel {
 		// the first time a framework running as that user asks for it; the
 		// home-Library convention is the user's own 0700.
 		{StateLibrary, svc(LibraryMode)},
+		// The records the server publishes for `k3sm status`, readable by any
+		// account (StatusSubdir).
+		{StateStatus, svc(StatusDirMode)},
 		{StateLevel(sandbox.ServerSubdir), svc(ServerTokenDirMode)},
 		{StateLevel(agentWorkSubdir), svc(AgentTokenDirMode)},
 		// The per-pod rootfs parent and the PersistentVolume parent.

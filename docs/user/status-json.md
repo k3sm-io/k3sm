@@ -182,6 +182,11 @@ Other rows read what your account can, through the apiserver, instead of a file 
   kubeconfig, and checks it as root checks the file: in date, issued by the cluster CA your
   kubeconfig pins, and naming the host you reached it by. `wide.source` is `handshake`. It is
   `unknown` when the handshake fails or your kubeconfig pins no CA.
+- `mesh-claims` and `services`: a server writes each record twice, mode 0600 in its own work dir
+  and mode 0644 in `/var/lib/k3sm/status/`, which any account can read. The records hold
+  cluster-internal names and addresses, never a credential. The rows read the second copy when the
+  first is not readable, and `wide.record` names the file read. A server older than the status
+  directory writes no second copy, and then the rows say `needs-admin`.
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was
@@ -191,9 +196,8 @@ as `leaseAgeSeconds` and `statusAgeSeconds` when known.
 
 The `services` row appears on a server. It compares the backends the server's Service proxy routes
 each Service port to with the Ready endpoints in the cluster's EndpointSlices. The server records
-its proxy in a file in its work dir that only root can read, once the proxy has loaded every Service
-and then every 30 seconds, so run `sudo k3sm status` to see the row's verdict; as any other user the
-row is `unknown` with that remedy. Its `state` is:
+its proxy in a file in its work dir, once the proxy has loaded every Service and then every 30
+seconds, with a copy any account can read in `/var/lib/k3sm/status/`. Its `state` is:
 
 - `ok` when every compared port matches. `detail` gives the port count.
 - `unhealthy` (severity `warn`) when a port's backends differ. `detail` names each such Service

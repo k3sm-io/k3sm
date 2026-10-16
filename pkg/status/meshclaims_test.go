@@ -17,6 +17,7 @@ limitations under the License.
 package status
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -57,4 +58,46 @@ func TestMeshClaimsRowFrom(t *testing.T) {
 			t.Errorf("a stale record reported %v, want unknown", row.Severity)
 		}
 	})
+}
+
+// TestMeshClaimsRowReadsTheUserReadableCopy pins the account that cannot read
+// the work dir: the row reads the copy the server publishes in Dir, is absent
+// when Dir holds none (the server has recorded nothing), and needs admin only
+// when there is no status directory to read from.
+func TestMeshClaimsRowReadsTheUserReadableCopy(t *testing.T) {
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	wd := "/var/lib/k3sm/server"
+	path := MeshClaimsPath(wd)
+	rec, err := json.Marshal(MeshClaimsRecord{UpdatedAt: now.Add(-time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		fs     fakeFS
+		wantOK bool
+		state  RowState
+		record string
+	}{
+		{"the user-readable copy", fakeFS{unreadable: map[string]bool{path: true}, contents: map[string][]byte{UserReadablePath(wd, path): rec}}, true, StateOK, UserReadablePath(wd, path)},
+		{"a status dir with no copy: no record", fakeFS{unreadable: map[string]bool{path: true}, present: map[string]bool{Dir(wd): true}}, false, "", ""},
+		{"no status dir: needs admin", fakeFS{unreadable: map[string]bool{path: true}}, true, StateNeedsAdmin, path},
+		{"root reads the work-dir copy", fakeFS{contents: map[string][]byte{path: rec}}, true, StateOK, path},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row, ok := Collector{FS: tc.fs, Paths: Paths{WorkDir: wd}}.meshClaimsRow(now)
+			if ok != tc.wantOK {
+				t.Fatalf("row present = %v, want %v (%+v)", ok, tc.wantOK, row)
+			}
+			if !ok {
+				return
+			}
+			if row.State != tc.state || row.Wide["record"] != tc.record {
+				t.Errorf("row = %s from %q, want %s from %q", row.State, row.Wide["record"], tc.state, tc.record)
+			}
+		})
+	}
+	if got := Dir(wd); got != "/var/lib/k3sm/status" {
+		t.Errorf("Dir(%q) = %q, want /var/lib/k3sm/status", wd, got)
+	}
 }

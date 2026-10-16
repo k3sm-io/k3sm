@@ -1805,6 +1805,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureOwnedDir:/var/lib/k3sm/manifests:0:0:0755",
 		"EnsureOwnedDir:/var/lib/k3sm/run:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/Library:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/status:271:20:0755",
 		"EnsureOwnedDir:/var/lib/k3sm/pods:271:20:0750",
 		"EnsureOwnedDir:/var/lib/k3sm/storage:271:20:0750",
 		"EnsureOwnedDir:/var/lib/k3sm/blobs:271:20:0750",

@@ -81,21 +81,26 @@ func (c Collector) meshClaimsRow(now time.Time) (Row, bool) {
 	if wd == "" || c.FS == nil {
 		return Row{}, false
 	}
-	path := MeshClaimsPath(wd)
-	raw, err := c.FS.ReadFile(path)
+	rr := c.readRecord(MeshClaimsPath(wd))
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
+	case errors.Is(rr.err, fs.ErrNotExist):
 		return Row{}, false
-	case err != nil:
+	case errors.Is(rr.err, fs.ErrPermission):
+		row := Row{Name: RowMeshClaims, Wide: map[string]string{"record": rr.path}}
+		needsAdmin(&row, c.recordNeedsAdminDetail(rr.path))
+		return row, true
+	case rr.err != nil:
 		return Row{Name: RowMeshClaims, State: StateUnknown, Severity: SeverityUnknown,
-			Detail: "unreadable as this user: " + path, Remedy: "sudo k3sm status"}, true
+			Detail: "could not read " + rr.path + ": " + errText(rr.err), Remedy: "sudo k3sm status"}, true
 	}
 	var rec MeshClaimsRecord
-	if err := json.Unmarshal(raw, &rec); err != nil {
+	if err := json.Unmarshal(rr.raw, &rec); err != nil {
 		return Row{Name: RowMeshClaims, State: StateUnknown, Severity: SeverityUnknown,
-			Detail: "the mesh claim record does not parse: " + path}, true
+			Detail: "the mesh claim record does not parse: " + rr.path}, true
 	}
-	return meshClaimsRowFrom(rec, now), true
+	row := meshClaimsRowFrom(rec, now)
+	row.Wide["record"] = rr.path
+	return row, true
 }
 
 // meshClaimsRowFrom renders the row from a record. Pure.
