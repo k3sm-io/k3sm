@@ -93,6 +93,9 @@ node-local storage is never silently bound to a volume that pins its Pod to one 
 Every PVC therefore needs **`storageClassName: local-path`**. A claim that omits it matches no class,
 stays `Pending` indefinitely, and the Pod that mounts it reports
 `pod has unbound immediate PersistentVolumeClaims`, which names the symptom rather than this cause.
+A Pod placed with `nodeName` skips the scheduler, so it waits on the node instead: it stays
+`ContainerCreating` with a `FailedMount` Event that ends in `PVC is not bound`, and starts once the
+claim binds.
 
 ```sh
 kubectl get storageclass    # local-path, with no (default) marker, by design

@@ -336,6 +336,11 @@ type podTrack struct {
 	// surface from this record while the create is retried; see createFailure
 	// for why the refusal is not returned to virtual-kubelet.
 	parked *createFailure
+	// claims, when non-nil, marks a pod held because a PersistentVolumeClaim it
+	// mounts does not resolve to a bound volume (claimwait.go). The runtime
+	// holds nothing for it; its re-check worker runs the create once the claims
+	// resolve. Guarded by restartMu.
+	claims *claimWait
 	// deleting is set the instant DeletePod begins, BEFORE it cancels a single
 	// worker, and is never cleared (the track is discarded moments later, and an
 	// idempotent CreatePod installs a fresh one). It is the fence a late create
@@ -1661,6 +1666,18 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	id := string(pod.UID)
 	start := metav1.Now()
 	r.log.Info("CreatePod", "namespace", pod.Namespace, "name", pod.Name)
+	// A pod starts only once every claim it mounts is Bound to a volume this
+	// node can mount, as the kubelet's WaitForAttachAndMount requires
+	// (claimwait.go). Checked BEFORE the address is allocated, since a held pod
+	// has no sandbox to give one to. A pod the provider already runs is not
+	// re-checked: an idempotent re-create must not stop a running pod whose
+	// claim has since changed, which upstream does not do either.
+	if prior := r.trackByID(id); prior == nil || prior.claimWaiting() {
+		if msg := r.unresolvedClaims(ctx, pod); msg != "" {
+			r.holdForClaims(pod, msg)
+			return nil
+		}
+	}
 	// Ordering (BINDING): allocate the pod's /32 BEFORE translation/env
 	// resolution so box.PodIp and the status.podIP downward-API env carry it. A
 	// translate failure below does NOT release it here (an idempotent retry or
@@ -1985,6 +2002,12 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 		// the old reference's schedule and attempt the new one now. This is the
 		// only recovery an InvalidImageName container has (runtimed_pull.go).
 		r.retryPullsForChangedImages(t, previous, pod)
+		if t.claimWaiting() {
+			// A pod held for its claims has nothing in the runtime to update,
+			// exactly as a parked one: the replaced spec above is the update,
+			// and the held create builds the pod from it.
+			return nil
+		}
 		if t.parkedFailure() != nil {
 			// A parked pod exists on the provider side only: runtimed refused its
 			// create, so there is no guest to update in place and the RPC would be
@@ -2069,6 +2092,13 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	t := r.trackByID(id)
 	if t != nil {
 		t.quiesce()
+		// quiesce waited out a held pod's create worker, which may have
+		// installed the pod's real track meanwhile; that one is quiesced too,
+		// so nothing the create started outlives the delete.
+		if live := r.trackByID(id); live != nil && live != t {
+			live.quiesce()
+			t = live
+		}
 	}
 	// An evicted pod's processes are already gone (evictPod stopped them), so
 	// there is nothing for a preStop hook to run in: finish the teardown it left
@@ -2173,6 +2203,10 @@ func (t *podTrack) quiesce() {
 	// than by whichever goroutine happens to run next. The create then
 	// compensates itself (retryParkedCreate).
 	t.markDeleting()
+	// A held pod's claim worker is stopped and WAITED for: a create it already
+	// began must land before the delete's own RPC, or the runtime could build
+	// the pod after the delete removed it.
+	t.stopClaimWait()
 	t.cancelPostStart()
 	t.cancelRestarts()
 	t.cancelPulls()
