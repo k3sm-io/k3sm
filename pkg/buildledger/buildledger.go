@@ -22,11 +22,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -61,7 +64,13 @@ const (
 	// MaxErrorBytes bounds a failed record's error text. Build engine errors can
 	// carry a whole log tail, and the ledger is a listing, not a log store.
 	MaxErrorBytes = 1024
+	// maxRecordBytes bounds how much of one record file is read. A record is a
+	// few hundred bytes; anything past this is not one.
+	maxRecordBytes = 64 << 10
 )
+
+// geteuid is a seam so the ownership checks are testable without root.
+var geteuid = os.Geteuid
 
 // Record is one build. Its JSON form is what `k3sm build ls -o json` prints.
 type Record struct {
@@ -103,24 +112,54 @@ type Ledger struct {
 	dir string
 	now func() time.Time
 	max int
+	// remove deletes a pruned record; a seam so a failing prune is testable.
+	remove func(string) error
 }
 
 // New returns the ledger rooted at dir. Nothing is created until a write.
 func New(dir string) *Ledger {
-	return &Ledger{dir: dir, now: time.Now, max: MaxRecords}
+	return &Ledger{dir: dir, now: time.Now, max: MaxRecords, remove: os.Remove}
 }
 
 // DefaultDir is <home>/.k3sm/builds, under the home of the user running the
-// build, so the history is that user's own.
+// build, so the history is that user's own. It refuses a home this process's
+// effective user does not own: under sudo the home is usually still the
+// operator's, and records written there as root would be files the operator
+// cannot remove.
 func DefaultDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir for the build ledger: %w", err)
 	}
+	return defaultDir(home, geteuid())
+}
+
+// defaultDir is DefaultDir for a given home and effective uid.
+func defaultDir(home string, euid int) (string, error) {
 	if home == "" {
 		return "", errors.New("resolve home dir for the build ledger: empty home")
 	}
+	uid, err := ownerOf(home, os.Stat)
+	if err != nil {
+		return "", fmt.Errorf("build ledger: %w", err)
+	}
+	if uid != euid {
+		return "", fmt.Errorf("build ledger: home %s is owned by uid %d, not this user (uid %d)", home, uid, euid)
+	}
 	return filepath.Join(home, ".k3sm", "builds"), nil
+}
+
+// ownerOf is the uid that owns path, as stat reports it.
+func ownerOf(path string, stat func(string) (os.FileInfo, error)) (int, error) {
+	fi, err := stat(path)
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("cannot read the owner of %s", path)
+	}
+	return int(st.Uid), nil
 }
 
 // Dir is the directory the ledger reads and writes.
@@ -149,7 +188,7 @@ func (l *Ledger) Finish(r Record, digest string, buildErr error) (Record, error)
 	r.FinishedAt = &t
 	if buildErr != nil {
 		r.Status = StatusFailed
-		r.Error = clip(buildErr.Error(), MaxErrorBytes)
+		r.Error = clip(redact(buildErr.Error()), MaxErrorBytes)
 		r.ImageDigest = ""
 	} else {
 		r.Status = StatusSucceeded
@@ -160,18 +199,14 @@ func (l *Ledger) Finish(r Record, digest string, buildErr error) (Record, error)
 }
 
 // Write installs r as <dir>/<id>.json (0600, in a 0700 directory), then removes
-// the oldest records past the bound.
+// the oldest records past the bound. The record is what Write reports on: a
+// prune that fails once the record is installed is a warning, not an error.
 func (l *Ledger) Write(r Record) error {
 	if !recordName.MatchString(r.ID + ".json") {
 		return fmt.Errorf("build ledger: invalid record id %q", r.ID)
 	}
-	if err := os.MkdirAll(l.dir, 0o700); err != nil {
-		return fmt.Errorf("build ledger: create %s: %w", l.dir, err)
-	}
-	// MkdirAll leaves an existing directory's mode alone, and the records name
-	// the operator's paths, so the directory is narrowed on every write.
-	if err := os.Chmod(l.dir, 0o700); err != nil {
-		return fmt.Errorf("build ledger: restrict %s: %w", l.dir, err)
+	if err := l.ensureDir(); err != nil {
+		return err
 	}
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
@@ -181,7 +216,50 @@ func (l *Ledger) Write(r Record) error {
 	if err := atomicfile.Replace(filepath.Join(l.dir, r.ID+".json"), data, 0o600); err != nil {
 		return fmt.Errorf("build ledger: %w", err)
 	}
-	return l.prune()
+	if err := l.prune(); err != nil {
+		slog.Warn("build ledger: remove old records", "dir", l.dir, "err", err)
+	}
+	return nil
+}
+
+// ensureDir makes the ledger directory ready to write. It creates it 0700, or
+// accepts an existing one only when it is a real directory (never a symlink,
+// which would send the records wherever it points) owned by this user, and
+// narrows that one to 0700: the records name the operator's paths.
+func (l *Ledger) ensureDir() error {
+	fi, err := os.Lstat(l.dir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(l.dir), 0o700); err != nil {
+			return fmt.Errorf("build ledger: create %s: %w", filepath.Dir(l.dir), err)
+		}
+		if err := os.Mkdir(l.dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("build ledger: create %s: %w", l.dir, err)
+		}
+		if fi, err = os.Lstat(l.dir); err != nil {
+			return fmt.Errorf("build ledger: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("build ledger: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("build ledger: %s is a symlink; refusing to write through it", l.dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("build ledger: %s is not a directory", l.dir)
+	}
+	uid, err := ownerOf(l.dir, os.Lstat)
+	if err != nil {
+		return fmt.Errorf("build ledger: %w", err)
+	}
+	if uid != geteuid() {
+		return fmt.Errorf("build ledger: %s is owned by uid %d, not this user", l.dir, uid)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		if err := os.Chmod(l.dir, 0o700); err != nil {
+			return fmt.Errorf("build ledger: restrict %s: %w", l.dir, err)
+		}
+	}
+	return nil
 }
 
 // List returns the records, newest first. A missing directory is an empty
@@ -225,20 +303,30 @@ func (l *Ledger) read() ([]entry, error) {
 			continue
 		}
 		e := entry{name: de.Name()}
-		if data, err := os.ReadFile(filepath.Join(l.dir, de.Name())); err == nil {
+		if data, err := readRecord(filepath.Join(l.dir, de.Name())); err == nil {
 			e.ok = json.Unmarshal(data, &e.rec) == nil && e.rec.ID+".json" == de.Name()
 		}
 		out = append(out, e)
 	}
+	now := l.now()
+	// A start time in the future is not one this ledger wrote (Start stamps
+	// now), so it sorts as the oldest: a hand-edited date must not keep a record
+	// at the top, and out of the prune, forever.
+	key := func(e entry) time.Time {
+		if !e.ok || e.rec.StartedAt.After(now) {
+			return time.Time{}
+		}
+		return e.rec.StartedAt
+	}
 	slices.SortStableFunc(out, func(a, b entry) int {
+		if c := key(b).Compare(key(a)); c != 0 {
+			return c
+		}
 		if a.ok != b.ok {
 			if a.ok {
 				return -1
 			}
 			return 1
-		}
-		if c := b.rec.StartedAt.Compare(a.rec.StartedAt); c != 0 {
-			return c
 		}
 		return strings.Compare(b.name, a.name)
 	})
@@ -256,7 +344,7 @@ func (l *Ledger) prune() error {
 	}
 	var errs []error
 	for _, e := range entries[l.max:] {
-		if err := os.Remove(filepath.Join(l.dir, e.name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := l.remove(filepath.Join(l.dir, e.name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}
@@ -264,6 +352,23 @@ func (l *Ledger) prune() error {
 		return fmt.Errorf("build ledger: prune: %w", errors.Join(errs...))
 	}
 	return nil
+}
+
+// readRecord reads one record file, refusing one past maxRecordBytes.
+func readRecord(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxRecordBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxRecordBytes {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxRecordBytes)
+	}
+	return data, nil
 }
 
 // newID is a short random id: 12 hex characters.
