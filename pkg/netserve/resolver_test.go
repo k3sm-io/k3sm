@@ -134,7 +134,7 @@ func TestM3_3_ResolverAnswersClusterAndForwards(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	udpDone := make(chan error, 1)
 	tcpDone := make(chan error, 1)
-	go func() { udpDone <- r.serveUDP(ctx, udp) }()
+	go func() { udpDone <- r.serveUDP(ctx, udp, nil) }()
 	go func() { tcpDone <- r.serveTCP(ctx, ln) }()
 	t.Cleanup(func() {
 		cancel()
@@ -210,7 +210,7 @@ func TestNewClusterResolverDefaultsDomain(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	udpDone := make(chan error, 1)
-	go func() { udpDone <- r.serveUDP(ctx, udp) }()
+	go func() { udpDone <- r.serveUDP(ctx, udp, nil) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-udpDone; err != nil {
@@ -681,7 +681,7 @@ func TestOversizedUDPResponseTruncatesToTCP(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	udpDone := make(chan error, 1)
 	tcpDone := make(chan error, 1)
-	go func() { udpDone <- r.serveUDP(ctx, udp) }()
+	go func() { udpDone <- r.serveUDP(ctx, udp, nil) }()
 	go func() { tcpDone <- r.serveTCP(ctx, ln) }()
 	t.Cleanup(func() {
 		cancel()
