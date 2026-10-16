@@ -135,7 +135,7 @@ func TestM3_3_ResolverAnswersClusterAndForwards(t *testing.T) {
 	udpDone := make(chan error, 1)
 	tcpDone := make(chan error, 1)
 	go func() { udpDone <- r.serveUDP(ctx, udp, nil) }()
-	go func() { tcpDone <- r.serveTCP(ctx, ln) }()
+	go func() { tcpDone <- r.serveTCP(ctx, ln, nil) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-udpDone; err != nil {
@@ -682,7 +682,7 @@ func TestOversizedUDPResponseTruncatesToTCP(t *testing.T) {
 	udpDone := make(chan error, 1)
 	tcpDone := make(chan error, 1)
 	go func() { udpDone <- r.serveUDP(ctx, udp, nil) }()
-	go func() { tcpDone <- r.serveTCP(ctx, ln) }()
+	go func() { tcpDone <- r.serveTCP(ctx, ln, nil) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-udpDone; err != nil {

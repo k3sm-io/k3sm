@@ -598,11 +598,13 @@ func (s *Server) runResolver(ctx context.Context) {
 	s.log.Info("per-node cluster DNS resolver listening", "vip", ap.String(), "domain", resolver.domain)
 
 	rg, rctx := errgroup.WithContext(ctx)
-	// A UDP socket that stops receiving is closed and replaced through the same
-	// retry the first bind used; TCP keeps its listener.
-	rebind := func(ctx context.Context) (net.PacketConn, error) { return s.rebindDNSUDP(ctx, ap) }
-	rg.Go(func() error { return resolver.serveUDP(rctx, udp, rebind) })
-	rg.Go(func() error { return resolver.serveTCP(rctx, tcp) })
+	// A UDP socket that stops receiving, or a TCP listener whose Accept fails for
+	// good, is closed and replaced through the same retry the first bind used; each
+	// side re-binds alone and the other keeps serving.
+	rebindUDP := func(ctx context.Context) (net.PacketConn, error) { return s.rebindDNSUDP(ctx, ap) }
+	rebindTCP := func(ctx context.Context) (net.Listener, error) { return s.rebindDNSTCP(ctx, ap) }
+	rg.Go(func() error { return resolver.serveUDP(rctx, udp, rebindUDP) })
+	rg.Go(func() error { return resolver.serveTCP(rctx, tcp, rebindTCP) })
 	if err := rg.Wait(); err != nil && ctx.Err() == nil {
 		s.log.Error("per-node cluster DNS resolver stopped", "err", err)
 	}
@@ -680,6 +682,26 @@ func (s *Server) rebindDNSUDP(ctx context.Context, ap netip.AddrPort) (net.Packe
 	return udp, nil
 }
 
+// rebindDNSTCP binds a fresh 53/TCP listener on the DNS VIP after the resolver
+// closed one whose Accept failed for good, on bindDNSVIP's retry schedule (the first
+// attempt at once). The UDP socket is untouched: it is a separate socket and keeps
+// serving.
+func (s *Server) rebindDNSTCP(ctx context.Context, ap netip.AddrPort) (net.Listener, error) {
+	var tcp net.Listener
+	err := s.retryDNSBind(ctx, ap, "tcp", func() error {
+		if err := s.binder.ensureAlias(ctx, s.dnsVIP); err != nil {
+			return fmt.Errorf("ensure DNS VIP lo0 alias: %w", err)
+		}
+		var err error
+		tcp, err = s.listenDNSTCPOnce(ctx, ap)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return tcp, nil
+}
+
 // retryDNSBind runs once until it succeeds or ctx is cancelled, the only two ways it
 // returns, with capped exponential backoff between attempts and a Warn line per
 // failed attempt. The first attempt runs at once.
@@ -709,15 +731,25 @@ func (s *Server) bindDNSVIPOnce(ctx context.Context, ap netip.AddrPort) (net.Pac
 	if err != nil {
 		return nil, nil, err
 	}
-	tcp, err := s.binder.listenTCP(ctx, ap)
+	tcp, err := s.listenDNSTCPOnce(ctx, ap)
 	if err != nil {
 		_ = udp.Close()
-		return nil, nil, fmt.Errorf("bind 53/TCP: %w", err)
+		return nil, nil, err
+	}
+	return udp, tcp, nil
+}
+
+// listenDNSTCPOnce performs a single 53/TCP bind attempt on the DNS VIP, whose lo0
+// alias the caller has ensured.
+func (s *Server) listenDNSTCPOnce(ctx context.Context, ap netip.AddrPort) (net.Listener, error) {
+	tcp, err := s.binder.listenTCP(ctx, ap)
+	if err != nil {
+		return nil, fmt.Errorf("bind 53/TCP: %w", err)
 	}
 	// Pods reach the DNS VIP over lo0, so the TCP listener clamps each accepted
 	// connection's segment size (whichever binder opened it): a connection that
 	// re-routes onto the mesh must not carry lo0-sized segments.
-	return udp, tcpseg.WrapListener(tcp), nil
+	return tcpseg.WrapListener(tcp), nil
 }
 
 // bindDNSUDPOnce performs a single alias + 53/UDP bind attempt.

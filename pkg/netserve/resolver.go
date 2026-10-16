@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -371,30 +372,153 @@ func (r *clusterResolver) answerUDP(ctx context.Context, pc net.PacketConn, quer
 	}
 }
 
+// errTCPListenerDead marks the end of serving one TCP listener because Accept
+// failed for good (the listener closed under the resolver, a bad or invalid
+// descriptor, or tcpAcceptFailLimit errors that are not temporary) rather than
+// because the resolver is shutting down.
+var errTCPListenerDead = errors.New("dns tcp listener stopped accepting")
+
+// tcpRebinder returns a fresh TCP listener on the DNS VIP. It retries until it has
+// one or ctx is done; an error means ctx is done.
+type tcpRebinder func(ctx context.Context) (net.Listener, error)
+
+// tcpAcceptFailLimit non-temporary accept errors with no successful accept between
+// them mark the listener dead. A temporary error (a connection aborted before it
+// was accepted, a full descriptor table) never counts: the listener is fine and
+// the next Accept can succeed.
+const tcpAcceptFailLimit = 3
+
+// tcpAcceptRetryInitial and tcpAcceptRetryMax bound the backoff between accept
+// attempts after an error that does not end the listener, the schedule net/http's
+// Server uses for the same case. A successful accept resets it. They are vars so a
+// unit test can shorten them; nothing in the product replaces them.
+var (
+	tcpAcceptRetryInitial = 5 * time.Millisecond
+	tcpAcceptRetryMax     = time.Second
+)
+
 // serveTCP answers length-prefixed DNS-over-TCP queries on ln until ctx is
 // cancelled. Each connection gets its own goroutine bounded by ctx (a watcher
 // closes the conn on cancellation) and an idle read deadline; serveTCP drains
 // in-flight connections before returning.
-func (r *clusterResolver) serveTCP(ctx context.Context, ln net.Listener) error {
-	go func() { <-ctx.Done(); _ = ln.Close() }()
-
+//
+// A listener whose Accept fails for good is replaced, not left to stop the
+// resolver: serveTCP logs it once at Warn with the listener's state, closes it,
+// and takes a fresh one from rebind (the DNS-VIP bind retry, whose first attempt
+// is immediate). The UDP socket is a separate socket and keeps serving. With a nil
+// rebind it returns the errTCPListenerDead error instead. It returns nil on a
+// clean shutdown.
+func (r *clusterResolver) serveTCP(ctx context.Context, ln net.Listener, rebind tcpRebinder) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
 	for {
+		state, err := r.serveTCPListener(ctx, ln, &wg)
+		if err == nil || ctx.Err() != nil {
+			_ = ln.Close()
+			return nil
+		}
+		r.log.Warn("cluster DNS TCP listener stopped accepting; closing it and re-binding the DNS VIP",
+			"addr", ln.Addr(), "state", state, "reason", err)
+		_ = ln.Close()
+		if rebind == nil {
+			return err
+		}
+		next, rerr := rebind(ctx)
+		if rerr != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("re-bind dns tcp listener: %w", rerr)
+		}
+		r.log.Info("cluster DNS TCP listener re-bound", "addr", next.Addr())
+		ln = next
+	}
+}
+
+// serveTCPListener accepts connections on one listener until ctx is cancelled
+// (nil) or Accept fails for good (an errTCPListenerDead error, with the listener's
+// state for the log line). An accept error that does not end the listener is
+// retried after a short backoff. It never closes ln except on cancellation; the
+// caller owns that.
+func (r *clusterResolver) serveTCPListener(ctx context.Context, ln net.Listener, wg *sync.WaitGroup) (string, error) {
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = ln.Close()
+		case <-stop:
+		}
+	}()
+
+	var failures int
+	var delay time.Duration
+	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil // clean shutdown (ln closed)
+				return "", nil // clean shutdown (ln closed)
 			}
-			return fmt.Errorf("dns tcp accept: %w", err)
+			if state, dead := acceptErrorEndsListener(err); dead {
+				return state, fmt.Errorf("%w: accept: %w", errTCPListenerDead, err)
+			}
+			if !isTemporaryAcceptError(err) {
+				failures++
+				if failures >= tcpAcceptFailLimit {
+					return fmt.Sprintf("%d accept errors in a row", failures),
+						fmt.Errorf("%w: %d accept errors, the last: %w", errTCPListenerDead, failures, err)
+				}
+			}
+			delay = min(max(2*delay, tcpAcceptRetryInitial), tcpAcceptRetryMax)
+			r.log.Debug("dns tcp accept failed; retrying", "err", err, "retry-in", delay)
+			select {
+			case <-ctx.Done():
+				return "", nil
+			case <-time.After(delay):
+			}
+			continue
 		}
+		failures, delay = 0, 0
 		wg.Add(1)
 		go func(conn net.Conn) {
 			defer wg.Done()
 			r.handleTCPConn(ctx, conn)
 		}(conn)
 	}
+}
+
+// acceptErrorEndsListener reports whether err from Accept means the listener can
+// never accept again, and names its state: closed under the resolver, a descriptor
+// the kernel no longer knows (EBADF), or one that is not a listening socket
+// (EINVAL).
+func acceptErrorEndsListener(err error) (string, bool) {
+	switch {
+	case errors.Is(err, net.ErrClosed):
+		return "closed", true
+	case errors.Is(err, syscall.EBADF):
+		return "bad descriptor (EBADF)", true
+	case errors.Is(err, syscall.EINVAL):
+		return "not listening (EINVAL)", true
+	}
+	return "", false
+}
+
+// isTemporaryAcceptError reports whether err from Accept is about one connection
+// or a passing resource shortage (ECONNABORTED, EMFILE, a timeout) rather than the
+// listener. A connection reset or aborted before it was accepted is named
+// outright (net.OpError calls it temporary only when the errno is unwrapped);
+// syscall.Errno classifies the rest itself.
+func isTemporaryAcceptError(err error) bool {
+	if errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var te interface{ Temporary() bool }
+	if errors.As(err, &te) && te.Temporary() {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // handleTCPConn serves one or more length-prefixed messages on conn until EOF, an

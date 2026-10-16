@@ -562,7 +562,7 @@ func TestTCPOversizedResponseServfail(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
-		go func() { done <- r.serveTCP(ctx, ln) }()
+		go func() { done <- r.serveTCP(ctx, ln, nil) }()
 		t.Cleanup(func() {
 			cancel()
 			if err := <-done; err != nil {
