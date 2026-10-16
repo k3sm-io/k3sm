@@ -33,6 +33,60 @@ The record is `/var/lib/k3sm/status/update.json`, mode 0644, so `k3sm status` re
 `sudo`. Run `sudo k3sm update check` to refresh it on demand: the directory belongs to the k3sm
 service user, so a check run without `sudo` prints its result but cannot record it.
 
+## Managed Update
+
+A server can roll the whole cluster to a release for you, one node at a time, workers first and
+the server last. Five subcommands drive it; every one but `check` reaches the cluster with the
+credentials `k3sm status` uses (the server's admin kubeconfig under `sudo`, the `k3sm` context of
+`~/.kube/config` otherwise), so run them on a server or from a Mac with the cluster's admin
+kubeconfig. A worker's own node credential may not create an update.
+
+```sh
+k3sm update check                       # what is behind
+k3sm update apply                       # plan, confirm, start
+k3sm update status --watch              # follow it
+k3sm update cancel                      # stop after the current node
+k3sm update abort                       # recover from a failed step
+```
+
+`k3sm update apply [--version <tag>] [--drain] [--allow-downgrade] [--signature if-signed|required] [--yes]`
+moves the cluster to the latest release, or to the tag `--version` names. It prints the plan
+first: the nodes in the order they will be updated with the version each runs, the target, whether
+nodes are drained, and the signature policy. It then asks for confirmation; `--yes` skips the
+question, and without `--yes` a stdin that is not a terminal is refused (exit 2). Confirmed, it
+creates the `Update` named `current` that the server's update controller rolls.
+
+- `--drain` evicts each node's pods before that node is updated, through the eviction API, so
+  PodDisruptionBudgets hold. The server is never drained, and a one-node cluster cannot drain.
+- `--allow-downgrade` permits a release older than a node runs; without it such an update is
+  refused before any node is touched.
+- `--signature if-signed` (the default) holds the release to the installed build's signer: a
+  Developer ID build accepts only the same team's signature, an ad-hoc build accepts an ad-hoc
+  release. `required` refuses any release without a Developer ID signature. The release's
+  checksum is verified under either policy.
+
+While an update is in progress, `apply` refuses and names its phase. A finished update
+(`Succeeded`, `Failed` or `Cancelled`) is removed and replaced, so a retry is a new update.
+
+`k3sm update status [-o text|json] [--watch]` prints the update's phase, the release it resolved
+(tag and digest), one row per node (name, from, to, phase, message, and the time of its last
+progress) and the conditions. `--watch` prints again on every change and returns when the update
+finishes. With no update, it says so and exits 0.
+
+`k3sm update cancel` stops the roll: the node being updated finishes its update, the nodes not yet
+started are left on the release they run, and the update ends `Cancelled`. A cancel is not a
+rollback; nodes already moved stay on the new release.
+
+A failed step stops the roll and leaves its node as it was: cordoned, with its `k3sm.io/update-*`
+annotations. `k3sm update abort` is the recovery. It marks the update `Cancelled`, then on every
+node removes the `k3sm.io/update-*` annotations and lifts the cordon only where the update
+controller set it; a node you cordoned yourself stays cordoned. It prints each step. Run `k3sm
+update status` to see which node failed and why before you abort, and fix that node before the
+next `apply`.
+
+The k3sm app offers the same update as a menu item and a button, both of which run
+`k3sm update apply`.
+
 ## Single Node
 
 For script (gen-1) installs, re-run the one-liner:

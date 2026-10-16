@@ -29,12 +29,20 @@ import (
 	"testing"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
+	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/update"
+	"k3sm.io/k3sm/pkg/updatectl"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -204,7 +212,11 @@ func TestUpdateCheckUnreachableIsRecorded(t *testing.T) {
 
 // TestUpdateUsage pins the verb's usage exits.
 func TestUpdateUsage(t *testing.T) {
-	for _, args := range [][]string{nil, {"bogus"}, {"check", "-o", "yaml"}, {"check", "extra"}} {
+	for _, args := range [][]string{
+		nil, {"bogus"}, {"check", "-o", "yaml"}, {"check", "extra"},
+		{"apply", "extra"}, {"apply", "--signature", "none"}, {"apply", "--version", "v1;rm"},
+		{"status", "-o", "yaml"}, {"status", "extra"}, {"cancel", "extra"}, {"abort", "extra"},
+	} {
 		var out, errOut bytes.Buffer
 		if code := runUpdate(context.Background(), args, updateEnv{out: &out, errOut: &errOut}); code != exitUsage {
 			t.Errorf("k3sm update %v: exit %d, want %d", args, code, exitUsage)
@@ -313,4 +325,277 @@ func TestUpdateRecordRefusesAnUnsafeStatusDir(t *testing.T) {
 			t.Errorf("record %v, err %v; want a 0644 file", fi, err)
 		}
 	})
+}
+
+// updateCluster is a fake cluster for the managed-update subcommands: a
+// clientset with its Nodes and the controller's Lease, and a dynamic client
+// that stores the Updates as unstructured, as the apiserver serves them.
+type updateCluster struct {
+	cs  *fake.Clientset
+	dyn *dynamicfake.FakeDynamicClient
+}
+
+func newUpdateCluster(objs ...runtime.Object) updateCluster {
+	return updateCluster{
+		cs:  fake.NewClientset(objs...),
+		dyn: dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{updateGVR: "UpdateList"}),
+	}
+}
+
+// run runs `k3sm update <args>` against the cluster, with --yes or not.
+func (c updateCluster) run(t *testing.T, args ...string) (code int, out, errOut string) {
+	t.Helper()
+	var o, e bytes.Buffer
+	env := updateEnv{
+		out:    &o,
+		errOut: &e,
+		inputs: update.Inputs{
+			BaseURL:   fakeIndexURL,
+			HTTP:      fakeReleaseIndex("v0.2.0", "2026-10-01T00:00:00Z", ""),
+			Kube:      c.cs,
+			Installed: version.Info{Version: "0.1.7"},
+			Now:       func() time.Time { return time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC) },
+		},
+		dyn:        c.dyn,
+		in:         strings.NewReader(""),
+		watchEvery: time.Millisecond,
+	}
+	code = runUpdate(context.Background(), args, env)
+	return code, o.String(), e.String()
+}
+
+func (c updateCluster) get(t *testing.T) *updatesv1alpha1.Update {
+	t.Helper()
+	u, err := getUpdate(context.Background(), c.dyn)
+	if err != nil || u == nil {
+		t.Fatalf("get current: %v, %v", u, err)
+	}
+	return u
+}
+
+// setStatus replaces the current Update's status, as the controller would.
+func (c updateCluster) setStatus(t *testing.T, st updatesv1alpha1.UpdateStatus) {
+	t.Helper()
+	u := c.get(t)
+	u.Status = st
+	if err := writeUpdateStatus(context.Background(), c.dyn, u); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (c updateCluster) node(t *testing.T, name string) *corev1.Node {
+	t.Helper()
+	n, err := c.cs.CoreV1().Nodes().Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// progressing is a Progressing condition with the given status and reason.
+func progressing(st metav1.ConditionStatus, reason string) metav1.Condition {
+	return metav1.Condition{Type: updatectl.ConditionProgressing, Status: st, Reason: reason, Message: reason, LastTransitionTime: metav1.Now()}
+}
+
+// TestUpdateApplyCreatesThePlan is the managed-update verb end to end against
+// a fake cluster: a worker and the server that holds the controller's Lease,
+// both on v0.1.7, and a release index whose latest is v0.2.0.
+func TestUpdateApplyCreatesThePlan(t *testing.T) {
+	behind := version.Info{KubeVersion: "v1.36.2", Version: "0.1.7"}.NodeVersion()
+	server := kubeletNode("studio", behind)
+	server.Labels = map[string]string{"node-role.kubernetes.io/control-plane": "true"}
+	worker := kubeletNode("laptop", behind)
+	holder := "studio"
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: updatectl.LeaseName, Namespace: updatectl.LeaseNamespace},
+		Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder},
+	}
+	c := newUpdateCluster(server, worker, lease)
+
+	// Without --yes, a stdin that is not a terminal refuses and creates nothing.
+	if code, _, errOut := c.run(t, "apply"); code != exitUsage || !strings.Contains(errOut, "pass --yes") {
+		t.Fatalf("apply without --yes: exit %d, stderr %q", code, errOut)
+	}
+	if u, _ := getUpdate(context.Background(), c.dyn); u != nil {
+		t.Fatalf("apply without --yes created %+v", u)
+	}
+
+	// apply --yes prints the plan, the worker first, and creates current.
+	code, out, errOut := c.run(t, "apply", "--yes", "--drain", "--signature", "required")
+	if code != 0 {
+		t.Fatalf("apply: exit %d, stderr %s", code, errOut)
+	}
+	for _, want := range []string{"target            v0.2.0", "drain             yes", "signature         required", "1       laptop", "2       studio", "Created the Update current to v0.2.0"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("apply output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Index(out, "laptop") > strings.Index(out, "studio") {
+		t.Errorf("the server is not last:\n%s", out)
+	}
+	wantSpec := updatesv1alpha1.UpdateSpec{
+		Version:  "v0.2.0",
+		Strategy: updatesv1alpha1.UpdateStrategy{Drain: true},
+		Verify:   updatesv1alpha1.UpdateVerify{Signature: updatesv1alpha1.UpdateSignatureRequired},
+	}
+	if got := c.get(t).Spec; got != wantSpec {
+		t.Errorf("spec = %+v, want %+v", got, wantSpec)
+	}
+
+	// A second apply while the first is Rolling refuses, naming the phase.
+	c.setStatus(t, updatesv1alpha1.UpdateStatus{
+		Phase:    updatesv1alpha1.UpdatePhaseRolling,
+		Resolved: &updatesv1alpha1.UpdateResolved{Version: "v0.2.0", Digest: "sha256:abc"},
+		Nodes: []updatesv1alpha1.UpdateNodeStatus{
+			{Name: "laptop", From: "v0.1.7", To: "v0.2.0", Phase: updatesv1alpha1.UpdateNodePhaseInstalling, Message: "installing; last progress 2026-10-15T11:59:00Z"},
+			{Name: "studio", From: "v0.1.7", To: "v0.2.0", Phase: updatesv1alpha1.UpdateNodePhasePending, Message: "last progress 2026-10-15T11:58:00Z"},
+		},
+		Conditions: []metav1.Condition{progressing(metav1.ConditionTrue, updatectl.ReasonRolling)},
+	})
+	if code, _, errOut := c.run(t, "apply", "--yes", "--version", "v0.2.1"); code != exitInternalError || !strings.Contains(errOut, "is Rolling") {
+		t.Errorf("apply while Rolling: exit %d, stderr %q", code, errOut)
+	}
+	if got := c.get(t).Spec.Version; got != "v0.2.0" {
+		t.Errorf("apply while Rolling changed the version to %s", got)
+	}
+
+	// status -o json renders the per-node table.
+	code, out, errOut = c.run(t, "status", "-o", "json")
+	if code != 0 {
+		t.Fatalf("status: exit %d, stderr %s", code, errOut)
+	}
+	var v updateStatusView
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("status json %q: %v", out, err)
+	}
+	wantNodes := []updateStatusNode{
+		{Name: "laptop", From: "v0.1.7", To: "v0.2.0", Phase: "Installing", Message: "installing", LastProgress: "2026-10-15T11:59:00Z"},
+		{Name: "studio", From: "v0.1.7", To: "v0.2.0", Phase: "Pending", LastProgress: "2026-10-15T11:58:00Z"},
+	}
+	if !v.Present || v.Phase != "Rolling" || v.Finished || v.Version != "v0.2.0" || !v.Drain || v.Signature != "required" ||
+		v.Resolved == nil || v.Resolved.Digest != "sha256:abc" || len(v.Conditions) != 1 {
+		t.Errorf("status view = %+v", v)
+	}
+	if len(v.Nodes) != 2 || v.Nodes[0] != wantNodes[0] || v.Nodes[1] != wantNodes[1] {
+		t.Errorf("status nodes = %+v, want %+v", v.Nodes, wantNodes)
+	}
+	// The text form carries the same table.
+	if _, out, _ := c.run(t, "status"); !strings.Contains(out, "laptop   v0.1.7   v0.2.0   Installing   2026-10-15T11:59:00Z   installing") {
+		t.Errorf("status text:\n%s", out)
+	}
+
+	// cancel sets the flag and says what it means.
+	code, out, errOut = c.run(t, "cancel")
+	if code != 0 || !c.get(t).Spec.Cancel || !strings.Contains(out, "The node being updated finishes") {
+		t.Errorf("cancel: exit %d, cancel %v, out %q, stderr %q", code, c.get(t).Spec.Cancel, out, errOut)
+	}
+
+	// A terminal current is replaced: a retry is a new current.
+	c.setStatus(t, updatesv1alpha1.UpdateStatus{Phase: updatesv1alpha1.UpdatePhaseCancelled, Conditions: []metav1.Condition{progressing(metav1.ConditionFalse, updatectl.ReasonCancelled)}})
+	code, out, errOut = c.run(t, "apply", "--yes", "--version", "v0.2.1")
+	if code != 0 || !strings.Contains(out, "Removed the finished Update current to v0.2.0 (Cancelled)") {
+		t.Fatalf("apply over a finished Update: exit %d, out %q, stderr %q", code, out, errOut)
+	}
+	if u := c.get(t); u.Spec.Version != "v0.2.1" || u.Spec.Cancel || u.Spec.Strategy.Drain || u.Spec.Verify.Signature != updatesv1alpha1.UpdateSignatureIfSigned {
+		t.Errorf("replaced spec = %+v", u.Spec)
+	}
+
+	// abort after a failed server step: the annotations go on every node, only
+	// the controller's cordon is lifted, and the Update ends Cancelled.
+	c.setStatus(t, updatesv1alpha1.UpdateStatus{
+		Phase: updatesv1alpha1.UpdatePhaseFailed,
+		Nodes: []updatesv1alpha1.UpdateNodeStatus{
+			{Name: "laptop", Phase: updatesv1alpha1.UpdateNodePhaseDone},
+			{Name: "studio", Phase: updatesv1alpha1.UpdateNodePhaseFailed, Message: "install failed"},
+		},
+		Conditions: []metav1.Condition{
+			progressing(metav1.ConditionFalse, updatectl.ReasonFailed),
+			{Type: updatectl.ConditionFailed, Status: metav1.ConditionTrue, Reason: updatectl.ReasonFailed, Message: "node studio: install failed", LastTransitionTime: metav1.Now()},
+		},
+	})
+	all := map[string]string{
+		updatesv1alpha1.AnnotationUpdateVersion: "v0.2.1",
+		updatesv1alpha1.AnnotationUpdatePayload: "{}",
+		updatesv1alpha1.AnnotationUpdatePhase:   "Failed: install failed",
+		updatectl.CordonedAnnotation:            "true",
+		updatectl.HandedOverAnnotation:          "2026-10-15T11:00:00Z",
+		updatectl.ReadyAtAnnotation:             "2026-10-15T11:05:00Z",
+		"k3sm.io/other":                         "kept",
+	}
+	controllerCordoned := c.node(t, "studio")
+	controllerCordoned.Annotations, controllerCordoned.Spec.Unschedulable = all, true
+	operatorCordoned := c.node(t, "laptop")
+	operatorCordoned.Annotations = map[string]string{updatesv1alpha1.AnnotationUpdateVersion: "v0.2.1", "k3sm.io/other": "kept"}
+	operatorCordoned.Spec.Unschedulable = true
+	for _, n := range []*corev1.Node{controllerCordoned, operatorCordoned} {
+		if _, err := c.cs.CoreV1().Nodes().Update(context.Background(), n, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out, errOut = c.run(t, "abort")
+	if code != 0 {
+		t.Fatalf("abort: exit %d, stderr %s", code, errOut)
+	}
+	for _, want := range []string{"Marked the Update current to v0.2.1 Cancelled (it was Failed)", "Node studio: uncordoned", "Node laptop: left cordoned"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("abort output lacks %q:\n%s", want, out)
+		}
+	}
+	for name, cordoned := range map[string]bool{"studio": false, "laptop": true} {
+		n := c.node(t, name)
+		if n.Spec.Unschedulable != cordoned {
+			t.Errorf("node %s unschedulable = %v, want %v", name, n.Spec.Unschedulable, cordoned)
+		}
+		for k := range n.Annotations {
+			if strings.HasPrefix(k, "k3sm.io/update-") {
+				t.Errorf("node %s keeps %s", name, k)
+			}
+		}
+		if n.Annotations["k3sm.io/other"] != "kept" {
+			t.Errorf("node %s lost an unrelated annotation: %v", name, n.Annotations)
+		}
+	}
+	u := c.get(t)
+	if u.Status.Phase != updatesv1alpha1.UpdatePhaseCancelled || !updateEndedAs(u, updatectl.ReasonCancelled) ||
+		!meta.IsStatusConditionTrue(u.Status.Conditions, updatectl.ConditionFailed) {
+		t.Errorf("aborted status = %+v", u.Status)
+	}
+}
+
+// TestUpdateStatusWatchStopsWhenFinished pins --watch: it prints each change
+// once and returns when the Update finishes.
+func TestUpdateStatusWatchStopsWhenFinished(t *testing.T) {
+	c := newUpdateCluster()
+	// Each get answers the next state; the reactor builds the object itself,
+	// since the fake holds its lock while a reactor runs.
+	states := []updatesv1alpha1.UpdateStatus{
+		{},
+		{},
+		{Phase: updatesv1alpha1.UpdatePhaseRolling, Conditions: []metav1.Condition{progressing(metav1.ConditionTrue, updatectl.ReasonRolling)}},
+		{Phase: updatesv1alpha1.UpdatePhaseRolling, Conditions: []metav1.Condition{progressing(metav1.ConditionTrue, updatectl.ReasonRolling)}},
+		{Phase: updatesv1alpha1.UpdatePhaseSucceeded, Conditions: []metav1.Condition{progressing(metav1.ConditionFalse, updatectl.ReasonSucceeded)}},
+	}
+	gets := 0
+	c.dyn.PrependReactor("get", "updates", func(k8stesting.Action) (bool, runtime.Object, error) {
+		st := states[min(gets, len(states)-1)]
+		gets++
+		obj, err := newUpdateObject(updatesv1alpha1.UpdateSpec{Version: "v0.2.0"})
+		if err != nil {
+			return true, nil, err
+		}
+		raw, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&st)
+		if err != nil {
+			return true, nil, err
+		}
+		obj.Object["status"] = raw
+		return true, obj, nil
+	})
+	code, out, errOut := c.run(t, "status", "--watch")
+	if code != 0 {
+		t.Fatalf("watch: exit %d, stderr %s", code, errOut)
+	}
+	if strings.Count(out, "update   current to v0.2.0") != 3 || strings.Count(out, "phase    Rolling") != 1 ||
+		!strings.Contains(out, "phase    not yet reconciled") || strings.LastIndex(out, "phase    Succeeded") < strings.LastIndex(out, "Rolling") {
+		t.Errorf("watch output:\n%s", out)
+	}
 }
