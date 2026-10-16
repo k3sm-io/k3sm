@@ -379,18 +379,33 @@ const buildxStopGrace = 30 * time.Second
 // notice the dropped session on its own. buildx that has not exited
 // buildxStopGrace after the interrupt is killed.
 func RunBuildxTo(ctx context.Context, bin string, args, env []string, stdout, stderr io.Writer) error {
+	cmd := buildxCommand(ctx, bin, args, env)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	return buildxRunErr(ctx, cmd.Run())
+}
+
+// buildxCommand is the buildx process RunBuildxTo and RunBuildxPTY start:
+// stdin inherited, and cancellation an interrupt with a kill after
+// buildxStopGrace.
+func buildxCommand(ctx context.Context, bin string, args, env []string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, stderr
+	cmd.Stdin = os.Stdin
 	cmd.Env = env
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 	cmd.WaitDelay = buildxStopGrace
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("exec buildx: %w (%w)", ctx.Err(), err)
-		}
-		return fmt.Errorf("exec buildx: %w", err)
+	return cmd
+}
+
+// buildxRunErr wraps a buildx run's error, naming the cancellation when ctx
+// ended it and keeping an *exec.ExitError in the chain.
+func buildxRunErr(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
 	}
-	return nil
+	if ctx.Err() != nil {
+		return fmt.Errorf("exec buildx: %w (%w)", ctx.Err(), err)
+	}
+	return fmt.Errorf("exec buildx: %w", err)
 }
 
 // buildxRunner runs one buildx subcommand and returns its combined output. It is

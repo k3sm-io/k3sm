@@ -136,7 +136,10 @@ store on success, and the error text on failure, clipped to 1 KiB. A build inter
 finished stays `running`. If the history cannot be written, the build prints a warning and goes on.
 
 Each build also keeps its output, the build engine's progress included, beside its record. The log
-is capped at 16 MiB and goes when its record goes.
+is capped at 16 MiB and goes when its record goes. It holds plain text: in a terminal the engine's
+interactive progress view still draws as usual, and the log keeps the same output with the terminal
+control sequences removed, so a build run in a terminal records each redraw of the view one after
+another.
 
 ```sh
 k3sm build logs <id>      # print a build's stored output

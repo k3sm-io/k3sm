@@ -108,8 +108,18 @@ func startBuildRecord(l *buildledger.Ledger, o buildOptions) *buildRecord {
 // the same log its stdout reaches without widening the engineBuilder seam.
 type teeOutput struct {
 	io.Writer
+	// stderr is the error stream copied into the log, for a stderr that is not
+	// a terminal.
 	stderr io.Writer
+	// term is the process's stderr when it is a terminal, and log the log's
+	// error-stream input: the engine runs buildx on a pseudo-terminal then, so
+	// its interactive progress still draws, and copies it to both.
+	term *os.File
+	log  io.Writer
 }
+
+// processStderr is the process's own error stream; a seam for the tests.
+var processStderr io.Writer = os.Stderr
 
 // stderrOf is the error stream that belongs with out: the tee's when out is
 // one, the process's otherwise.
@@ -117,19 +127,47 @@ func stderrOf(out io.Writer) io.Writer {
 	if t, ok := out.(*teeOutput); ok {
 		return t.stderr
 	}
-	return os.Stderr
+	return processStderr
+}
+
+// stderrTerminal is the process's stderr when it is a terminal, else nil. A
+// seam so the tee's choice is testable without a terminal.
+var stderrTerminal = func() *os.File {
+	if builder.IsTerminal(os.Stderr) {
+		return os.Stderr
+	}
+	return nil
 }
 
 // tee returns out, and the process's stderr, each copied into the build's
-// log. Without a log, out is returned unchanged.
+// log. Each stream reaches the log through its own PlainWriter, so the log
+// holds text and not terminal control. Without a log, out is returned
+// unchanged.
 func (tr *buildRecord) tee(out io.Writer) io.Writer {
 	if tr.log == nil {
 		return out
 	}
-	return &teeOutput{
-		Writer: io.MultiWriter(out, tr.log),
-		stderr: io.MultiWriter(stderrOf(out), tr.log),
+	errLog := buildledger.NewPlainWriter(tr.log)
+	t := &teeOutput{
+		Writer: io.MultiWriter(out, buildledger.NewPlainWriter(tr.log)),
+		stderr: io.MultiWriter(stderrOf(out), errLog),
+		log:    errLog,
 	}
+	if _, nested := out.(*teeOutput); !nested {
+		t.term = stderrTerminal()
+	}
+	return t
+}
+
+// runEngineBuildx runs buildx for an engine build, its output going where out
+// says: on a pseudo-terminal when the build's stderr is a terminal and the
+// build is logged, so buildx draws its interactive progress, and with a plain
+// copy to stderrOf(out) otherwise.
+func runEngineBuildx(ctx context.Context, bin string, args, env []string, out io.Writer) error {
+	if t, ok := out.(*teeOutput); ok && t.term != nil {
+		return builder.RunBuildxPTY(ctx, bin, args, env, out, t.term, t.log)
+	}
+	return builder.RunBuildxTo(ctx, bin, args, env, out, stderrOf(out))
 }
 
 // run runs job, cancellable through `k3sm build cancel` when the build is

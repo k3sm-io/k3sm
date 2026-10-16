@@ -148,14 +148,26 @@ func TestCancelRefusesANonSocketAndStillBuilds(t *testing.T) {
 func TestRunBuildxInterruptsOnCancel(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "interrupted")
 	script := filepath.Join(t.TempDir(), "fake-buildx")
-	body := "#!/bin/sh\ntrap 'echo int > " + marker + "; exit 130' INT\nwhile :; do sleep 0.05; done\n"
+	ready := marker + ".ready"
+	body := "#!/bin/sh\ntrap 'echo int > " + marker + "; exit 130' INT\n: > " + ready + "\nwhile :; do sleep 0.05; done\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- RunBuildxTo(ctx, script, nil, nil, nil, nil) }()
-	time.Sleep(200 * time.Millisecond)
+	// Cancel only once the trap is set: an interrupt before it would kill the
+	// shell, which proves nothing about what buildx receives.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the fake buildx never started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	cancel()
 	select {
 	case err := <-done:

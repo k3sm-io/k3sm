@@ -138,7 +138,7 @@ func engineBuildRecorded(ctx context.Context, o buildOptions, out io.Writer, rec
 	// The build itself is unbounded: it is the operator's to interrupt, and a
 	// guessed deadline that fires mid-build discards every layer it earned.
 	args := builder.BuildxArgs(engineBuildArgs(o, platform, layoutDir))
-	if err := builder.RunBuildxTo(ctx, sess.bin, args, sess.env, out, stderrOf(out)); err != nil {
+	if err := runEngineBuildx(ctx, sess.bin, args, sess.env, out); err != nil {
 		return fmt.Errorf("build through the k3sm build engine at %s: %w", sess.endpoint, err)
 	}
 
