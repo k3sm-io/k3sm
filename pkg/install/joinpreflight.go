@@ -48,7 +48,9 @@ const joinProbeTimeout = 3 * time.Second
 // rather than quietly pretending the list was complete.
 const joinProbeAddressCap = 4
 
-// preflightJoinEndpoint refuses an agent install whose --server cannot be
+// preflightJoinEndpoint returns the operator's join token and, when there is
+// one, the cluster CA the endpoint served and the token's pin verified (the
+// CA the agent's root helper is given; provisionAgentClusterCA). It refuses an agent install whose --server cannot be
 // reached, or which would join a DIFFERENT cluster than the operator's token
 // pins — before a single byte is written.
 //
@@ -93,14 +95,14 @@ const joinProbeAddressCap = 4
 // daemon fetches the cluster CAs from the same listener on every start, and an
 // unreachable or foreign endpoint would otherwise surface as a daemon that never
 // comes up.
-func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
+func preflightJoinEndpoint(sys System, cfg Config) (string, []byte, error) {
 	if cfg.Role != RoleAgent && !cfg.serverJoining() {
-		return "", nil
+		return "", nil, nil
 	}
 	// A --server-join install's --server and --token-file were already
 	// required by ValidateHARequest; this is the agent's own requirement.
 	if strings.TrimSpace(cfg.JoinServer) == "" {
-		return "", fmt.Errorf("install: --server (the control-plane host this worker joins) is required with --agent")
+		return "", nil, fmt.Errorf("install: --server (the control-plane host this worker joins) is required with --agent")
 	}
 	// The pin FIRST, because reading it is the one step that can fail on this
 	// Mac alone: a token file that is missing, exposed or malformed is refused
@@ -110,7 +112,7 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 	if cfg.TokenFile != "" {
 		text, tok, err := operatorJoinToken(sys, cfg)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		// Normalised ONCE, here at the boundary where the token becomes a pin, so
 		// the comparison below is a plain string equality: a case-insensitive
@@ -122,10 +124,10 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 	host := strings.TrimSpace(cfg.JoinServer)
 	addrs, err := sys.ResolveJoinHost(host, joinProbeTimeout)
 	if err != nil {
-		return "", fmt.Errorf("install: %s (the --server this node would join) does not resolve: %w — name the control-plane Mac's LAN address (an underlay address: the join must reach <host>:%d before this node has any mesh)", host, err, joinBootstrapPort)
+		return "", nil, fmt.Errorf("install: %s (the --server this node would join) does not resolve: %w — name the control-plane Mac's LAN address (an underlay address: the join must reach <host>:%d before this node has any mesh)", host, err, joinBootstrapPort)
 	}
 	if len(addrs) == 0 {
-		return "", fmt.Errorf("install: %s (the --server this node would join) resolves to no address at all — name the control-plane Mac's LAN address (an underlay address: the join must reach <host>:%d before this node has any mesh)", host, joinBootstrapPort)
+		return "", nil, fmt.Errorf("install: %s (the --server this node would join) resolves to no address at all — name the control-plane Mac's LAN address (an underlay address: the join must reach <host>:%d before this node has any mesh)", host, joinBootstrapPort)
 	}
 
 	untried := 0
@@ -151,7 +153,7 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 		if untried > 0 {
 			tried += fmt.Sprintf("; %d more addresses not tried", untried)
 		}
-		return "", fmt.Errorf("install: the control plane at %s cannot be reached, so this node could not join it: %s. Nothing has been written. Use the control-plane Mac's LAN address, check that its firewall lets %d through, and check that io.k3sm.server is running there (`sudo launchctl print system/%s` on that Mac); if that Mac was installed only moments ago, its join listener may still be starting, so wait a minute and run this install again",
+		return "", nil, fmt.Errorf("install: the control plane at %s cannot be reached, so this node could not join it: %s. Nothing has been written. Use the control-plane Mac's LAN address, check that its firewall lets %d through, and check that io.k3sm.server is running there (`sudo launchctl print system/%s` on that Mac); if that Mac was installed only moments ago, its join listener may still be starting, so wait a minute and run this install again",
 			host, tried, joinBootstrapPort, ServerLabel)
 	}
 	if len(refusals) > 0 {
@@ -161,17 +163,17 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 	if pin == "" {
 		cfg.Logger.Info("no --token-file was given, so the join endpoint's cluster was not compared: this node starts from the credential it already holds",
 			"server", reached)
-		return "", nil
+		return "", nil, nil
 	}
 
 	caPEM, err := sys.FetchJoinCA(reached, joinProbeTimeout)
 	if err != nil {
-		return "", fmt.Errorf("install: the control plane at %s answered, but its cluster CA could not be read (%w), so this install cannot tell whether it is the cluster your token names. Nothing has been written. Check that io.k3sm.server — not some other service — is what answers on port %d there",
+		return "", nil, fmt.Errorf("install: the control plane at %s answered, but its cluster CA could not be read (%w), so this install cannot tell whether it is the cluster your token names. Nothing has been written. Check that io.k3sm.server — not some other service — is what answers on port %d there",
 			reached, err, joinBootstrapPort)
 	}
 	servedPin, err := certs.CertPin(caPEM)
 	if err != nil {
-		return "", fmt.Errorf("install: the endpoint at %s served something that is not a cluster CA certificate (%w), so it is not a k3sm control plane. Nothing has been written. Check that port %d there belongs to io.k3sm.server",
+		return "", nil, fmt.Errorf("install: the endpoint at %s served something that is not a cluster CA certificate (%w), so it is not a k3sm control plane. Nothing has been written. Check that port %d there belongs to io.k3sm.server",
 			reached, err, joinBootstrapPort)
 	}
 	served := strings.ToLower(strings.TrimSpace(servedPin))
@@ -180,11 +182,11 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 		if cfg.serverJoining() {
 			mint = "k3sm token create --server"
 		}
-		return "", fmt.Errorf("install: the control plane at %s belongs to a DIFFERENT cluster than the join token in %s pins (that endpoint's cluster CA is %s…; the token pins %s…), so this node would have joined the wrong cluster. Nothing has been written. Either point --server at the Mac the token came from, or mint a token there with `%s` and write it into %s",
+		return "", nil, fmt.Errorf("install: the control plane at %s belongs to a DIFFERENT cluster than the join token in %s pins (that endpoint's cluster CA is %s…; the token pins %s…), so this node would have joined the wrong cluster. Nothing has been written. Either point --server at the Mac the token came from, or mint a token there with `%s` and write it into %s",
 			reached, cfg.TokenFile, shortPin(served), shortPin(pin), mint, cfg.TokenFile)
 	}
 	cfg.Logger.Info("the control plane answered and is the cluster this token pins", "server", reached, "cluster-ca", shortPin(served)+"…")
-	return token, nil
+	return token, caPEM, nil
 }
 
 // shortPin is how much of a cluster-CA hash an operator is shown: enough to tell

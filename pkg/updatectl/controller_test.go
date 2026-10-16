@@ -40,6 +40,8 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/update"
 )
 
 const (
@@ -159,10 +161,30 @@ func newRig(t *testing.T, nodes ...*corev1.Node) *rig {
 	return r
 }
 
+// testSigning is one cluster CA and the update signer it issued, shared by
+// every controller the tests build.
+var testSigning = sync.OnceValue(func() struct {
+	ca     *certs.CA
+	signer *certs.UpdateSigner
+} {
+	ca, err := certs.NewCA("k3sm-cluster-ca")
+	if err != nil {
+		panic(err)
+	}
+	s, err := ca.IssueUpdateSigner()
+	if err != nil {
+		panic(err)
+	}
+	return struct {
+		ca     *certs.CA
+		signer *certs.UpdateSigner
+	}{ca, s}
+})
+
 func (r *rig) controller() *Controller {
 	r.t.Helper()
 	c, err := New(Config{
-		Client: r.cs, Dynamic: r.dyn, Resolver: r.resolver, ServerNode: serverName,
+		Client: r.cs, Dynamic: r.dyn, Resolver: r.resolver, ServerNode: serverName, IssueSigner: func() (*certs.UpdateSigner, error) { return testSigning().signer, nil },
 		Now: func() time.Time { return r.now }, Recorder: r.recorder,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -343,10 +365,17 @@ func TestRollingOrderWorkersThenServer(t *testing.T) {
 		if err := json.Unmarshal([]byte(r.node("w1").Annotations[updatesv1alpha1.AnnotationUpdatePayload]), &p); err != nil {
 			t.Fatal(err)
 		}
-		wantP := Payload{URL: "https://example.test/releases/download/v0.2.0/k3sm_0.2.0_darwin_arm64.tar.gz",
+		wantP := Payload{Version: target, URL: "https://example.test/releases/download/v0.2.0/k3sm_0.2.0_darwin_arm64.tar.gz",
 			SHA256: targetSum, Signature: updatesv1alpha1.UpdateSignatureIfSigned}
 		if p != wantP {
 			t.Fatalf("payload %+v, want %+v", p, wantP)
+		}
+		// The handover is signed: the node verifies it against the cluster CA.
+		ann := r.node("w1").Annotations
+		signed, err := update.VerifySignedPayload(update.CAPool(testSigning().ca.CertPEM), []byte(ann[update.AnnotationUpdatePayload]),
+			ann[update.AnnotationUpdatePayloadSig], ann[update.AnnotationUpdateSigner], r.now)
+		if err != nil || signed.Payload != wantP {
+			t.Fatalf("the handed-over payload does not verify: %v (%+v)", err, signed.Payload)
 		}
 		for _, n := range []string{"w1", "w2", serverName} {
 			if nd := r.node(n); nd.Spec.Unschedulable || nd.Annotations[CordonedAnnotation] != "" {
@@ -504,4 +533,63 @@ func podNode() *corev1.Node { return node("w0", oldKubelet, false) }
 
 func tooManyRequests() error {
 	return apierrors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0)
+}
+
+// TestNewRequiresAnUpdateSigner: a controller that could not sign would hand
+// nodes payloads their root helper refuses, so it is not built at all.
+func TestNewRequiresAnUpdateSigner(t *testing.T) {
+	t.Parallel()
+	r := newRig(t)
+	if _, err := New(Config{Client: r.cs, Dynamic: r.dyn, ServerNode: serverName}); err == nil || !strings.Contains(err.Error(), "signer") {
+		t.Fatalf("New without a signer = %v, want refused", err)
+	}
+}
+
+// TestUpdateSignerIsShortLived pins the signer's renewal on a fake clock: a
+// signer is reused while it has at least certs.UpdateSignerRenewBefore left,
+// and replaced by a fresh one-day signer once it has less, so no payload the
+// controller signs authorises anything for more than a day.
+func TestUpdateSignerIsShortLived(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	issued := 0
+	r := newRig(t)
+	c, err := New(Config{
+		Client: r.cs, Dynamic: r.dyn, ServerNode: serverName,
+		Now: func() time.Time { return now },
+		IssueSigner: func() (*certs.UpdateSigner, error) {
+			issued++
+			s := *testSigning().signer
+			cert := *s.Cert
+			cert.NotAfter = now.Add(certs.UpdateSignerValidity)
+			s.Cert = &cert
+			return &s, nil
+		},
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := func(d time.Duration, wantIssued int) {
+		t.Helper()
+		now = now.Add(d)
+		s, err := c.currentSigner()
+		if err != nil {
+			t.Fatalf("currentSigner = %v", err)
+		}
+		if issued != wantIssued {
+			t.Fatalf("after +%v: %d signers issued, want %d", d, issued, wantIssued)
+		}
+		if left := s.Cert.NotAfter.Sub(now); left < certs.UpdateSignerRenewBefore || left > certs.UpdateSignerValidity {
+			t.Fatalf("after +%v: the signer used has %v left", d, left)
+		}
+	}
+	step(0, 1)            // the first handover mints one
+	step(11*time.Hour, 1) // 13 h left: reused
+	step(2*time.Hour, 2)  // 11 h left: replaced
+	step(time.Minute, 2)  // the fresh one is reused
+	step(48*time.Hour, 3) // long expired: replaced
+	if certs.UpdateSignerValidity != 24*time.Hour {
+		t.Errorf("UpdateSignerValidity = %v, want a day", certs.UpdateSignerValidity)
+	}
 }

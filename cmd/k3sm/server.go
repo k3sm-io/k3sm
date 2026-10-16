@@ -60,6 +60,7 @@ import (
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 	"k3sm.io/k3sm/pkg/status"
+	"k3sm.io/k3sm/pkg/update"
 )
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
@@ -112,6 +113,10 @@ type serverOptions struct {
 	// nodePortAddresses is --nodeport-addresses: where this server's NodePort
 	// listeners bind (empty = every interface).
 	nodePortAddresses string
+	// updateReleaseBase is --update-release-base: the release index the
+	// managed update reads instead of GitHub's (a mirror, a lab rig). Empty is
+	// GitHub's; it is validated after the flags parse (releaseBaseFlag).
+	updateReleaseBase string
 
 	// clusterInit / serverJoin select the embedded-etcd HA posture (see
 	// etcdPosture): --cluster-init forms a new etcd cluster on this server,
@@ -376,6 +381,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// bind: address already in use". This renumbers the LISTENER ONLY; it does not
 	// change the bind address or the API's authn posture.
 	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
+	fs.StringVar(&opts.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
 	fs.IntVar(&opts.kubeletPort, "kubelet-port", ports.KubeletAPIPort, "kubelet HTTP API (logs/exec/stats) listen port — every node on a host needs its own")
 	// The scheduler's and controller-manager's secure ports, the last two fixed
 	// singletons in a server's listener set. A second server on the defaults gets
@@ -821,8 +827,13 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		// (resolveKubeletEndpoint), never the wildcard.
 		kubeletPort: opts.kubeletPort,
 		podRoot:     opts.podRoot,
-		logs:        opts.logs,
-		nodeIP:      nodeAddressing.nodeIP,
+		updateRoot:  updateRootFor(opts.workDir),
+		// The recorded release base, which the update watcher's pin admits.
+		updateReleaseBase: opts.updateReleaseBase,
+		// The server's own cluster CA: the update signer it mints chains to it.
+		updateClusterCAPEM: nodeHierarchy.Cluster.CertPEM,
+		logs:               opts.logs,
+		nodeIP:             nodeAddressing.nodeIP,
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,
 		runtime:     opts.rtName,

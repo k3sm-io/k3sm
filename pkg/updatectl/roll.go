@@ -31,6 +31,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/update"
 )
 
 // The controller's own Node annotations. They are private to the controller:
@@ -81,20 +83,9 @@ const (
 	ReasonResolved  = "Resolved"
 )
 
-// Payload is the JSON value of the k3sm.io/update-payload Node annotation: what
-// the node-side downloads and the proof it must check before installing.
-type Payload struct {
-	// URL is the darwin/arm64 release archive.
-	URL string `json:"url"`
-	// SHA256 is the archive's lowercase hex sha256, from the release's
-	// checksums file.
-	SHA256 string `json:"sha256"`
-	// Signature is the code-signature policy (Spec.Verify.Signature, defaulted
-	// to if-signed).
-	Signature updatesv1alpha1.UpdateSignaturePolicy `json:"signature"`
-	// AllowDowngrade is Spec.AllowDowngrade.
-	AllowDowngrade bool `json:"allowDowngrade,omitempty"`
-}
+// Payload is the JSON value of the k3sm.io/update-payload Node annotation, the
+// one pkg/update defines, encodes (update.EncodePayload) and verifies.
+type Payload = update.Payload
 
 // rollFailure is a definitive failure that ends the roll before the current
 // node is touched.
@@ -534,44 +525,72 @@ func (c *Controller) ensureResolved(ctx context.Context, u *updatesv1alpha1.Upda
 	return nil
 }
 
-// payload is the node annotation value, rebuilt from status.resolved.
-func (c *Controller) payload(u *updatesv1alpha1.Update) (string, error) {
+// payload is the canonical node annotation value, rebuilt from
+// status.resolved.
+func (c *Controller) payload(u *updatesv1alpha1.Update) ([]byte, error) {
 	r := u.Status.Resolved
 	if r == nil || !strings.HasPrefix(r.Digest, "sha256:") {
-		return "", errors.New("the release has not been resolved")
+		return nil, errors.New("the release has not been resolved")
 	}
 	url, err := c.cfg.Resolver.AssetURL(u.Spec.Version)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	sig := u.Spec.Verify.Signature
 	if sig == "" {
 		sig = updatesv1alpha1.UpdateSignatureIfSigned
 	}
-	b, err := json.Marshal(Payload{
-		URL: url, SHA256: strings.TrimPrefix(r.Digest, "sha256:"), Signature: sig, AllowDowngrade: u.Spec.AllowDowngrade,
+	return update.EncodePayload(Payload{
+		Version: u.Spec.Version, URL: url, SHA256: strings.TrimPrefix(r.Digest, "sha256:"), Signature: sig, AllowDowngrade: u.Spec.AllowDowngrade,
 	})
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
 }
 
-// handover asks the node for the release: the version and payload annotations
-// are set, any earlier phase report and settle mark are cleared, and the
-// handover time is recorded (the node timeout counts from it), in one patch.
+// handover asks the node for the release: the version, the payload, its
+// signature and the signer certificate are set, any earlier phase report and
+// settle mark are cleared, and the handover time is recorded (the node timeout
+// counts from it), in one patch. The signature is what authorises the node's
+// root helper to install: a node can write its own annotations, but not sign.
 func (c *Controller) handover(ctx context.Context, u *updatesv1alpha1.Update, n *corev1.Node, now time.Time) (*corev1.Node, error) {
 	p, err := c.payload(u)
 	if err != nil {
 		return nil, err
 	}
+	signer, err := c.currentSigner()
+	if err != nil {
+		return nil, err
+	}
+	sig, err := update.SignPayload(signer, p)
+	if err != nil {
+		return nil, err
+	}
 	return c.patchNode(ctx, n.Name, annotations(map[string]any{
 		updatesv1alpha1.AnnotationUpdateVersion: u.Spec.Version,
-		updatesv1alpha1.AnnotationUpdatePayload: p,
+		update.AnnotationUpdatePayload:          string(p),
+		update.AnnotationUpdatePayloadSig:       sig,
+		update.AnnotationUpdateSigner:           string(signer.CertPEM),
 		updatesv1alpha1.AnnotationUpdatePhase:   nil,
 		HandedOverAnnotation:                    now.Format(time.RFC3339),
 		ReadyAtAnnotation:                       nil,
 	}))
+}
+
+// currentSigner is the signer for the next handover: the one held while it
+// has at least certs.UpdateSignerRenewBefore left at the controller's clock,
+// else a freshly issued one.
+func (c *Controller) currentSigner() (*certs.UpdateSigner, error) {
+	if s := c.signer; s != nil && s.Cert != nil && s.Cert.NotAfter.Sub(c.cfg.Now()) >= certs.UpdateSignerRenewBefore {
+		return s, nil
+	}
+	s, err := c.cfg.IssueSigner()
+	if err != nil {
+		return nil, fmt.Errorf("issue the update signer: %w", err)
+	}
+	if s == nil || s.Key == nil || s.Cert == nil || len(s.CertPEM) == 0 {
+		return nil, errors.New("issue the update signer: an incomplete signer")
+	}
+	c.signer = s
+	c.log.Info("issued a fresh update signer", "not-after", s.Cert.NotAfter.UTC().Format(time.RFC3339))
+	return s, nil
 }
 
 // annotations is a merge patch of Node annotations (a nil value removes one).

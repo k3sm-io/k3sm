@@ -176,9 +176,13 @@ func TestBuildConfig(t *testing.T) {
 			NodeAddressService: canonicalIngress,
 			NodeIP:             netip.MustParseAddr("192.168.7.20"),
 			MeshKeyDir:         t.TempDir(),
+			ClusterCAPath:      "/var/lib/k3sm/server/tls/cluster-ca.crt",
 		})
 		if err != nil {
 			t.Fatalf("BuildConfig: %v", err)
+		}
+		if cfg.ClusterCAPath != "/var/lib/k3sm/server/tls/cluster-ca.crt" {
+			t.Errorf("ClusterCAPath = %q, want the --cluster-ca the managed update's signer chains to", cfg.ClusterCAPath)
 		}
 		if cfg.ServiceCIDR != svcCIDR {
 			t.Errorf("ServiceCIDR = %v, want %v (proxy VIP aliases depend on it)", cfg.ServiceCIDR, svcCIDR)

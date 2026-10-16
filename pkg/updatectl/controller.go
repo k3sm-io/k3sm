@@ -43,6 +43,7 @@ import (
 
 	crdconfig "k3sm.io/apis/config/crd"
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/crdensure"
 )
 
@@ -84,6 +85,12 @@ type Config struct {
 	CRD crdensure.CRDClient
 	// Resolver resolves the target release. nil means HTTPResolver{}.
 	Resolver Resolver
+	// IssueSigner mints a fresh update signer in memory from the cluster CA
+	// (certs.CA.IssueUpdateSigner). The controller calls it for its first
+	// handover and again whenever the signer it holds has less than
+	// certs.UpdateSignerRenewBefore of its one-day validity left, so every
+	// payload it signs stays authorising for at most a day. Required.
+	IssueSigner func() (*certs.UpdateSigner, error)
 	// ServerNode is the Node this controller runs on. It is updated last.
 	// Required.
 	ServerNode string
@@ -109,11 +116,15 @@ type Config struct {
 // Controller reconciles the singleton Update.
 //
 // Concurrency: one loop goroutine runs every reconcile; the informers only
-// signal kick. No field is written after Run starts, so none needs a lock.
+// signal kick. No field is written after Run starts but signer, which only
+// that loop goroutine reads and writes, so none needs a lock.
 type Controller struct {
 	cfg  Config
 	log  *slog.Logger
 	kick chan struct{}
+	// signer is the update signer the last handover used, replaced by
+	// currentSigner when it nears its end. Only the loop goroutine touches it.
+	signer *certs.UpdateSigner
 }
 
 // New builds a Controller from cfg. Call Run to start it.
@@ -126,6 +137,9 @@ func New(cfg Config) (*Controller, error) {
 	}
 	if cfg.ServerNode == "" {
 		return nil, errors.New("update controller: no server node name")
+	}
+	if cfg.IssueSigner == nil {
+		return nil, errors.New("update controller: no update signer, so no payload could be authorised")
 	}
 	if cfg.Resolver == nil {
 		cfg.Resolver = HTTPResolver{}

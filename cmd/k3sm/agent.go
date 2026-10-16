@@ -51,6 +51,7 @@ import (
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/ports"
+	"k3sm.io/k3sm/pkg/update"
 )
 
 // meshKeyRef is the file name (under both this node's work dir and the root-only
@@ -87,6 +88,10 @@ type agentOptions struct {
 	// nodePortAddresses is --nodeport-addresses: where this worker's NodePort
 	// listeners bind (empty = every interface).
 	nodePortAddresses string
+	// updateReleaseBase is --update-release-base: the release index the
+	// managed update reads instead of GitHub's (a mirror, a lab rig). Empty is
+	// GitHub's; it is validated after the flags parse (releaseBaseFlag).
+	updateReleaseBase string
 	// lan is the daemon's LAN switch (startDaemonLAN), set by agentStart; not
 	// a flag. The datapath and the node's svclb hoster attach to it.
 	lan *lanSwitch
@@ -114,6 +119,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver serves on and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
+	fs.StringVar(&opts.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
 }
 
 // agentTerminalBackoff is how long runAgent waits before returning a start
@@ -184,6 +190,9 @@ func runAgent(args []string) error {
 	opts := agentOptions{}
 	registerAgentFlags(fs, &opts)
 	_ = fs.Parse(args)
+	if _, err := releaseBase(opts.updateReleaseBase); err != nil {
+		return err
+	}
 
 	// --token is deliberately NOT required. A join token is TTL-bounded, so an
 	// agent that re-ran its join on every start stopped being able to start a day
@@ -780,8 +789,14 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		// (resolveKubeletEndpoint), never the wildcard.
 		kubeletPort: ports.KubeletAPIPort,
 		podRoot:     opts.podRoot,
-		logs:        opts.logs,
-		nodeIP:      agentInternalIP(res),
+		updateRoot:  updateRootFor(opts.workDir),
+		// The recorded release base, which the update watcher's pin admits.
+		updateReleaseBase: opts.updateReleaseBase,
+		// The cluster CA this worker's credential pins: an update's signer
+		// must chain to it.
+		updateClusterCAPEM: res.ClusterCAPEM,
+		logs:               opts.logs,
+		nodeIP:             agentInternalIP(res),
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,
 		runtime:     opts.rtName,

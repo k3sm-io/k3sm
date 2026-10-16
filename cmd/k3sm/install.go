@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"k3sm.io/k3sm/pkg/dataroot"
@@ -37,6 +38,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/k3sm/pkg/update"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -93,9 +95,63 @@ func runInstall(args []string) error {
 		cfg.Signer = install.CodesignTeamID{}
 		cfg.StagedVersion = version.Get().Version
 	}
+	if cfg, err = opts.resolveInPlace(cfg, func(c install.Config) (install.Config, error) {
+		return install.ResolveInPlace(sys, c, kubeconfigOwner)
+	}); err != nil {
+		return err
+	}
 	// Only an install --start over a stopped node calls it: the uncordon.
 	cfg.MarkNode = nodeMarker(sys, install.DefaultDataRoot)
 	return install.Install(ctx, sys, cfg)
+}
+
+// inPlace reports the in-place update shape: --from-staging with no role flag
+// (--agent, --server-join) and no --token-file, the argv the k3sm-netd root
+// helper runs for a managed update. The role comes from the disk
+// (install.ResolveInPlace).
+func (o installFlags) inPlace() bool {
+	return o.fromStaging != "" && !o.agent && !o.serverJoin && o.tokenFile == ""
+}
+
+// resolveInPlace runs resolve (install.ResolveInPlace in production) for an
+// in-place update, and returns cfg unchanged otherwise. A worker resolved from
+// the disk refuses the control-plane flags, as an explicit --agent install
+// does.
+func (o installFlags) resolveInPlace(cfg install.Config, resolve func(install.Config) (install.Config, error)) (install.Config, error) {
+	if !o.inPlace() {
+		return cfg, nil
+	}
+	cfg, err := resolve(cfg)
+	if err != nil {
+		return cfg, err
+	}
+	if cfg.Role == install.RoleAgent {
+		for _, name := range serverOnlyInstallFlags {
+			if o.set[name] {
+				return cfg, fmt.Errorf("--%s cannot be used to update this Mac in place: it is installed as a worker, which runs no control plane", name)
+			}
+		}
+	}
+	return cfg, nil
+}
+
+// kubeconfigOwner is the production install.FileOwner: the user name owning
+// the regular file at path (the recorded admin kubeconfig), never through a
+// symlink.
+func kubeconfigOwner(path string) (string, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", path)
+	}
+	u, err := user.LookupId(strconv.FormatUint(uint64(st.Uid), 10))
+	if err != nil {
+		return "", err
+	}
+	return u.Username, nil
 }
 
 // installEnv is what runInstall reads from the process before it builds the
@@ -129,7 +185,9 @@ func (e installEnv) prepare(args []string) (opts installFlags, self string, volu
 	if e.euid != 0 {
 		return opts, "", nil, fmt.Errorf("k3sm install must run as root — use 'sudo k3sm install'")
 	}
-	if opts.targetUser == "" || opts.targetUser == "root" {
+	// An in-place update may name no user: the root helper runs it with no
+	// $SUDO_USER, and install.ResolveInPlace finds the kubeconfig's owner.
+	if (opts.targetUser == "" && !opts.inPlace()) || opts.targetUser == "root" {
 		return opts, "", nil, fmt.Errorf("--user (or $SUDO_USER) must be a non-root human so the kubeconfig is not root-owned; run via 'sudo k3sm install'")
 	}
 	if self, err = e.executable(); err != nil {
@@ -163,13 +221,15 @@ func (o installFlags) installConfig(self string, volume *datavol.Options, logger
 		NodePortAddresses: o.recordedNodePortAddresses(),
 		LAN:               o.recordedLAN(),
 		SecretsEncryption: o.secretsEncryption,
+		UpdateReleaseBase: o.updateReleaseBase,
 		EtcdSnapshots:     o.etcdSnapshotFlags(),
 		Start:             o.start,
 		Logger:            logger,
 		StagingOptions: install.StagingOptions{
-			FromStagingDir: o.fromStaging,
-			AllowDowngrade: o.allowDowngrade,
-			Executable:     self,
+			FromStagingDir:       o.fromStaging,
+			AllowDowngrade:       o.allowDowngrade,
+			RequireTeamSignature: o.requireTeamSignature,
+			Executable:           self,
 		},
 	}
 }
@@ -318,6 +378,12 @@ type installFlags struct {
 	fromStaging string
 	// allowDowngrade is --allow-downgrade, with --from-staging only.
 	allowDowngrade bool
+	// requireTeamSignature is --require-team-signature, with --from-staging
+	// only (install.StagingOptions.RequireTeamSignature).
+	requireTeamSignature bool
+	// updateReleaseBase is --update-release-base, validated by
+	// update.ParseReleaseBase and normalized (install.Config.UpdateReleaseBase).
+	updateReleaseBase string
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
@@ -335,8 +401,10 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.StringVar(&o.server, "server", "", "with --agent: the control-plane host to join; with --server-join: an existing server's LAN address (the --node-ip it was installed with). Either way an UNDERLAY address (a LAN IP or DNS name, no scheme, no port), because the join dials <host>:9345 before this node has any mesh")
 	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: optional; the join assigns this Mac's mesh address, pass it only to assert the expected value (a value that differs from the assignment fails the join instead of minting a certificate for an address this node does not hold). With --cluster-init or --server-join: required; this Mac's LAN address, which the etcd peer listener binds and every other server dials (not loopback). The server daemon receives it as --etcd-peer-ip; the node itself advertises its --mesh-ip")
 	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token (a joined node needs none). With --server-join: required; a file holding the server token `k3sm token create --server` printed on an existing server. Read once by this install and copied for the daemon; it must not be group- or world-readable, and it is yours to delete afterwards")
-	fs.StringVar(&o.fromStaging, "from-staging", "", "install from a k3sm.app staging directory: the directory directly inside "+install.DefaultStagingRoot+" that this k3sm runs from. Every file is installed from that directory, which must be owned by root and writable by nobody else. A --token-file must sit directly inside it, owned by root with mode 600, and is removed once read. Refuses an older version than the installed one, and a build signed by a different team")
+	fs.StringVar(&o.fromStaging, "from-staging", "", "install from a k3sm.app staging directory: the directory directly inside "+install.DefaultStagingRoot+" that this k3sm runs from. Every file is installed from that directory, which must be owned by root and writable by nobody else. A --token-file must sit directly inside it, owned by root with mode 600, and is removed once read. Without --agent, --server-join and --token-file it updates whatever is installed in place: the role, the join target and every configured argument are read from the installed daemon, and nothing installed is refused unless --user names a first install. Refuses an older version than the installed one; a build signed by another team than a team-signed install, or ad-hoc over a team-signed install; and a first install without a Developer ID team signature")
 	fs.BoolVar(&o.allowDowngrade, "allow-downgrade", false, "with --from-staging: install even when the installed k3sm is newer, or its version cannot be read")
+	fs.StringVar(&o.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
+	fs.BoolVar(&o.requireTeamSignature, "require-team-signature", false, "with --from-staging: refuse the install unless every Mach-O in the staging directory carries a Developer ID team signature, whatever the installed k3sm is signed with")
 	fs.BoolVar(&o.start, "start", false, "on a node stopped with 'k3sm stop', start it after installing (without it the node is updated and stays stopped)")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")
@@ -386,6 +454,13 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	if err := o.validateFromStaging(); err != nil {
 		return o, err
 	}
+	if o.updateReleaseBase != "" {
+		u, err := update.ParseReleaseBase(o.updateReleaseBase)
+		if err != nil {
+			return o, err
+		}
+		o.updateReleaseBase = u.String()
+	}
 	if err := o.validateEtcdSnapshotFlags(); err != nil {
 		return o, err
 	}
@@ -393,12 +468,16 @@ func parseInstallFlags(args []string) (installFlags, error) {
 }
 
 // validateFromStaging is the flag-level half of --from-staging: an absolute,
-// clean directory, and --allow-downgrade only beside it. The install package
+// clean directory, and --allow-downgrade and --require-team-signature only
+// beside it. The install package
 // judges the directory itself on disk, before anything is written.
 func (o installFlags) validateFromStaging() error {
 	if o.fromStaging == "" {
 		if o.allowDowngrade {
 			return fmt.Errorf("--allow-downgrade needs --from-staging: it relaxes the version check of an install from a k3sm.app staging directory, and a plain install makes none")
+		}
+		if o.requireTeamSignature {
+			return fmt.Errorf("--require-team-signature needs --from-staging: it tightens the signature check of an install from a staging directory, and a plain install makes none")
 		}
 		return nil
 	}

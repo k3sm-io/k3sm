@@ -316,7 +316,7 @@ const tokenFileMask fs.FileMode = 0o077
 // resolvedExtraServerArgs: AgentPlist and writeAgentArgsRecord both read it,
 // so the rendered argv and the record cannot disagree.
 func (c Config) resolvedExtraAgentArgs() []string {
-	return c.setNodePortAddressesArg(c.ExtraAgentArgs)
+	return setReleaseBaseArg(c.setNodePortAddressesArg(c.ExtraAgentArgs), c.UpdateReleaseBase)
 }
 
 // RecordedAgentArgs returns the operator `k3sm agent` arguments an install with

@@ -1314,6 +1314,10 @@ type Config struct {
 	// kubeconfig` and `uninstall --purge` read it back. Empty keeps a carried
 	// name; DefaultKubeconfigName clears it. Control plane only.
 	KubeconfigName string
+	// UpdateReleaseBase is `k3sm install --update-release-base`, already
+	// validated: rendered into the role's daemon arguments, replacing a
+	// carried value. Empty keeps the carried one (GitHub's index when none).
+	UpdateReleaseBase string
 	// TLSSANs is `k3sm install --tls-san`: extra names for the apiserver's
 	// serving certificate, validated by the CLI. A non-empty list REPLACES the
 	// carried --tls-san set and nil keeps it (setTLSSANArgs). Control plane only.
@@ -1639,6 +1643,7 @@ func (c Config) resolvedExtraServerArgs() []string {
 		args = setKubeconfigNameArg(args, c.KubeconfigName)
 	}
 	args = c.setNodePortAddressesArg(args)
+	args = setReleaseBaseArg(args, c.UpdateReleaseBase)
 	if c.etcdRequested() {
 		args = setEtcdArgs(args, c)
 	}
@@ -1852,7 +1857,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if cfg.BinarySource == "" {
 		return fmt.Errorf("install: BinarySource (the k3sm binary to install) is required")
 	}
-	if cfg.TargetUser == "" {
+	// A worker writes no admin kubeconfig (step 5), so only a control plane
+	// needs its owner; an in-place agent update (ResolveInPlace) names none.
+	if cfg.TargetUser == "" && cfg.Role != RoleAgent {
 		return fmt.Errorf("install: TargetUser (the kubeconfig owner, e.g. $SUDO_USER) is required")
 	}
 	// BEFORE anything is written, and before a single byte is copied: a Mac
@@ -1902,7 +1909,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// It returns the operator's join token — the exact bytes it validated and
 	// compared against the endpoint's cluster — so staging writes those and the
 	// file is read once, with no privileged write between the check and the copy.
-	joinToken, err := preflightJoinEndpoint(sys, cfg)
+	joinToken, joinCA, err := preflightJoinEndpoint(sys, cfg)
 	if err != nil {
 		return err
 	}
@@ -2199,6 +2206,12 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     could not place for itself), and after the state tree at 1a because the
 	//     root-only key dir is carved directly under the root-owned data root.
 	if err := provisionMeshKey(sys, cfg, uid); err != nil {
+		return err
+	}
+	// 1g′. On a worker, the root-only copy of the cluster CA its netd checks a
+	//      managed update's signer against (--cluster-ca), beside the mesh key
+	//      in the root-only directory 1g has just ensured.
+	if err := provisionAgentClusterCA(sys, cfg, joinCA); err != nil {
 		return err
 	}
 

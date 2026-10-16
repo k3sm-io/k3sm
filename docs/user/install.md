@@ -158,11 +158,24 @@ from its own bundle as root: it copies the bundle into a new directory under
 - a `--token-file` sits directly inside the directory, owned by `root` with mode `600` and one
   link (it is removed as soon as it is read);
 - the version is a release version no older than the installed one;
-- every program in the directory is signed with a Developer ID Application certificate from one
-  team, and on an update the installed `k3sm` is signed by that same team.
+- the programs in the directory are signed the way the installed `k3sm` allows:
+  - a first install needs every program signed with a Developer ID Application certificate from one
+    team;
+  - an install signed by a Developer ID team takes only programs signed by that same team, never
+    ad-hoc signed ones;
+  - an ad-hoc signed install takes programs signed by one Developer ID team, or programs that are all
+    ad-hoc signed.
 
 Pass `--allow-downgrade` to install an older version on purpose (or over an install whose version
-cannot be read). A plain `sudo k3sm install` makes none of these checks and is unchanged.
+cannot be read). Pass `--require-team-signature` to refuse any program without a Developer ID team
+signature, whatever the installed `k3sm` is signed with.
+
+Without `--agent`, `--server-join` or `--token-file`, `k3sm install --from-staging <dir>` updates
+whatever is installed, in place. It reads the role from the installed daemon and keeps every
+argument it was configured with. A worker keeps the server it joined and rejoins with its stored
+node credential. A server rewrites the admin kubeconfig for `--user`, or without it for the owner of
+the kubeconfig the last install wrote. With nothing installed and no `--user`, it refuses: there is
+nothing to update in place. A plain `sudo k3sm install` makes none of these checks and is unchanged.
 
 To remove an install made from the app, run `sudo k3sm uninstall`, or use Uninstall in the app's
 window. Dragging the app to the Trash does not remove k3sm: the cluster keeps running.

@@ -301,7 +301,20 @@ func (c *CA) SignServingCSR(csr *x509.CertificateRequest, subject pkix.Name, dns
 // signLeaf is the shared leaf-issuance core: build the template, set the extended
 // key usages, and sign with the CA key. Every caller but IssueServerClient passes
 // exactly one EKU; ekus is copied so a caller's slice never aliases the template.
+//
+// It refuses the update signer's identity (refuseUpdateSignerIdentity): every
+// issuing path but IssueUpdateSigner, which calls issueLeaf directly, reaches
+// the CA key through here, so no join, CSR approval or component certificate
+// can mint a certificate a node would accept as authorising an update.
 func (c *CA) signLeaf(pub any, subject pkix.Name, dnsSANs []string, ipSANs []net.IP, ekus []x509.ExtKeyUsage, validFor time.Duration) ([]byte, error) {
+	if err := refuseUpdateSignerIdentity(subject, ekus); err != nil {
+		return nil, err
+	}
+	return c.issueLeaf(pub, subject, dnsSANs, ipSANs, ekus, validFor)
+}
+
+// issueLeaf is signLeaf without the update-signer refusal.
+func (c *CA) issueLeaf(pub any, subject pkix.Name, dnsSANs []string, ipSANs []net.IP, ekus []x509.ExtKeyUsage, validFor time.Duration) ([]byte, error) {
 	if len(ekus) == 0 {
 		return nil, errors.New("certs: sign leaf: at least one extended key usage is required")
 	}

@@ -37,6 +37,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/addons"
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
@@ -582,7 +583,7 @@ func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Co
 	} else {
 		dyn = d
 	}
-	go runUpdateRecorder(ctx, plan.opts.workDir, cs, dyn, logger)
+	go runUpdateRecorder(ctx, plan.opts.workDir, releaseBaseURL(plan.opts.updateReleaseBase), cs, dyn, logger)
 	stopUpdates := startUpdateController(ctx, plan, restCfg, cs, logger)
 	return mlxGPU, func() {
 		stopUpdates()
@@ -598,6 +599,27 @@ func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Co
 // own Lease, so one server of an HA control plane rolls at a time. Same
 // lifetime as the MLX operator: drained before the control plane stops. A
 // client or controller that cannot be built is logged and stop is noStop.
+// updateSignerIssuer loads the cluster CA once, the way the server node's
+// identity does (EnsureHierarchy loads the existing CAs in every posture), and
+// returns the controller's IssueSigner: each call mints a fresh one-day update
+// signer from it, in memory.
+func updateSignerIssuer(opts serverOptions) (func() (*certs.UpdateSigner, error), error) {
+	h, err := certs.EnsureHierarchy(opts.workDir, opts.role(), opts.posture())
+	if err != nil {
+		return nil, fmt.Errorf("load the CA hierarchy: %w", err)
+	}
+	if h.Cluster == nil || h.Cluster.Key == nil {
+		return nil, errors.New("this server holds no cluster CA key")
+	}
+	return h.Cluster.IssueUpdateSigner, nil
+}
+
+// updateResolver is the controller's release resolver, reading the recorded
+// --update-release-base when set and GitHub's index otherwise.
+func updateResolver(rawBase string) updatectl.HTTPResolver {
+	return updatectl.HTTPResolver{Base: releaseBaseURL(rawBase)}
+}
+
 func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
 	dyn, err := dynamic.NewForConfig(restCfg)
 	if err != nil {
@@ -609,12 +631,19 @@ func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.C
 		logger.Error("update controller disabled: build its apiextensions client", "err", err)
 		return noStop
 	}
+	issueSigner, err := updateSignerIssuer(plan.opts)
+	if err != nil {
+		logger.Error("update controller disabled: no update signer", "err", err)
+		return noStop
+	}
 	c, err := updatectl.New(updatectl.Config{
-		Client:     cs,
-		Dynamic:    dyn,
-		CRD:        crd,
-		ServerNode: plan.opts.nodeName,
-		Log:        logger,
+		Client:      cs,
+		Dynamic:     dyn,
+		CRD:         crd,
+		ServerNode:  plan.opts.nodeName,
+		Resolver:    updateResolver(plan.opts.updateReleaseBase),
+		IssueSigner: issueSigner,
+		Log:         logger,
 	})
 	if err != nil {
 		logger.Error("update controller disabled", "err", err)

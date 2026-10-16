@@ -533,11 +533,12 @@ func TestReleaseVersionOrder(t *testing.T) {
 	}
 }
 
-// TestFromStagingTeamIDContinuity pins the signing continuity check: the
-// staged k3sm and every other Mach-O in the staged tree carry a Developer ID
-// Application signature from one team, an update needs the installed binary to
-// carry the same, and an ad-hoc, other-team or non-Developer ID signature
-// anywhere refuses. A non-Mach-O file needs no signature.
+// TestFromStagingTeamIDContinuity pins the signing continuity check, which
+// follows the installed build: a first install and a team-signed install take
+// only a tree whose every Mach-O carries one Developer ID team's signature (the
+// installed team on an update), so an ad-hoc tree never replaces a team-signed
+// install; an ad-hoc install takes an ad-hoc tree or a team-signed one, but not
+// a tree mixing the two. A non-Mach-O file needs no signature.
 func TestFromStagingTeamIDContinuity(t *testing.T) {
 	t.Parallel()
 	installed := Config{}.withDefaults().installedBinary()
@@ -552,8 +553,14 @@ func TestFromStagingTeamIDContinuity(t *testing.T) {
 		{name: "update by the same team", signer: fakeSigner{ids: signedTree(map[string]string{installed: testTeamID})}},
 		{name: "update over another team refused", want: ErrTeamIDMismatch,
 			signer: fakeSigner{ids: signedTree(map[string]string{installed: "ZZZZZ99999"})}},
-		{name: "ad-hoc installed binary refused", want: ErrTeamIDMismatch,
+		{name: "an ad-hoc install takes a team-signed tree",
 			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{installed: ErrNoTeamID}}},
+		{name: "an ad-hoc install takes an ad-hoc tree",
+			signer: fakeSigner{errs: adHocTree(installed)}},
+		{name: "an ad-hoc install refuses a tree mixing ad-hoc and team signatures", want: ErrTeamIDMismatch,
+			signer: fakeSigner{ids: map[string]string{helper: testTeamID}, errs: without(adHocTree(installed), helper)}},
+		{name: "a team-signed install refuses an ad-hoc tree", want: ErrTeamIDMismatch,
+			signer: fakeSigner{ids: map[string]string{installed: testTeamID}, errs: adHocTree()}},
 		{name: "installed binary signed Apple Development by the same team refused", want: ErrNotDeveloperID,
 			signer: fakeSigner{ids: signedTree(map[string]string{installed: testTeamID}), notDevID: map[string]bool{installed: true}}},
 		{name: "ad-hoc staged k3sm refused", want: ErrNoTeamID,
@@ -596,6 +603,22 @@ func TestFromStagingTeamIDContinuity(t *testing.T) {
 }
 
 var errSignatureUnreadable = errors.New("codesign failed")
+
+// without returns m less key.
+func without(m map[string]error, key string) map[string]error {
+	delete(m, key)
+	return m
+}
+
+// adHocTree reports every fixture Mach-O, and each extra path, as carrying no
+// Team ID: an ad-hoc signed tree.
+func adHocTree(extra ...string) map[string]error {
+	errs := map[string]error{}
+	for _, f := range append(stagedMachOs(), extra...) {
+		errs[f] = ErrNoTeamID
+	}
+	return errs
+}
 
 // TestStampedVersion pins how a binary's version is read from its build info.
 func TestStampedVersion(t *testing.T) {
@@ -968,5 +991,85 @@ func TestDiscardStagedToken(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRequireTeamSignature pins --require-team-signature: every Mach-O in the
+// staged tree, the staged k3sm included, must carry a Developer ID team
+// signature of its own; the installed binary is never consulted for it; and
+// the flag is refused on a plain install.
+func TestRequireTeamSignature(t *testing.T) {
+	t.Parallel()
+	helper := filepath.Join(testPayloadDir, VMHostName)
+	cases := []struct {
+		name   string
+		signer fakeSigner
+		want   error
+	}{
+		{name: "a fully signed tree is accepted", signer: fakeSigner{ids: signedTree(nil)}},
+		{name: "an ad-hoc staged k3sm is refused", want: ErrNoTeamID,
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{testStagedExe: ErrNoTeamID}}},
+		{name: "an ad-hoc helper is refused", want: ErrNoTeamID,
+			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{helper: ErrNoTeamID}}},
+		{name: "a helper signed Apple Development is refused", want: ErrNotDeveloperID,
+			signer: fakeSigner{ids: signedTree(nil), notDevID: map[string]bool{helper: true}}},
+		{name: "an ad-hoc tree over an ad-hoc install is refused", want: ErrNoTeamID,
+			signer: fakeSigner{errs: adHocTree(Config{}.withDefaults().installedBinary())}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, cfg := stagedFixture()
+			cfg.RequireTeamSignature = true
+			cfg.Signer = tc.signer
+			entries, err := checkStagingTree(cfg.StagingFS, cfg.FromStagingDir)
+			if err != nil {
+				t.Fatalf("checkStagingTree = %v", err)
+			}
+			err = requireTeamSignatures(context.Background(), cfg, entries)
+			if tc.want != nil {
+				if !errors.Is(err, tc.want) || !strings.Contains(err.Error(), "--require-team-signature") {
+					t.Fatalf("requireTeamSignatures = %v, want %v naming the flag", err, tc.want)
+				}
+				if err := preflightFromStaging(context.Background(), &cfg); !errors.Is(err, tc.want) {
+					t.Fatalf("preflightFromStaging = %v, want %v", err, tc.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("requireTeamSignatures = %v, want accepted", err)
+			}
+			if err := preflightFromStaging(context.Background(), &cfg); err != nil {
+				t.Fatalf("preflightFromStaging = %v, want accepted", err)
+			}
+		})
+	}
+	t.Run("refused on a plain install", func(t *testing.T) {
+		t.Parallel()
+		cfg := Config{StagingOptions: StagingOptions{RequireTeamSignature: true}}.withDefaults()
+		if err := preflightFromStaging(context.Background(), &cfg); err == nil {
+			t.Fatal("preflightFromStaging accepted RequireTeamSignature without a staging directory")
+		}
+	})
+}
+
+// TestCompareReleaseVersions pins the exported comparator the managed update
+// uses for its downgrade check.
+func TestCompareReleaseVersions(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		a, b string
+		cmp  int
+		ok   bool
+	}{
+		{"v0.2.0", "0.2.0", 0, true},
+		{"v0.1.9", "v0.2.0", -1, true},
+		{"v0.2.0", "v0.2.0-rc.1", 1, true},
+		{"dev", "v0.2.0", 0, false},
+	} {
+		cmp, ok := CompareReleaseVersions(tc.a, tc.b)
+		if cmp != tc.cmp || ok != tc.ok {
+			t.Errorf("CompareReleaseVersions(%q, %q) = %d, %v; want %d, %v", tc.a, tc.b, cmp, ok, tc.cmp, tc.ok)
+		}
 	}
 }

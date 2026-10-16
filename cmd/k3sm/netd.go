@@ -61,7 +61,10 @@ type netdOptions struct {
 	serviceUID  int
 	meshKeyDir  string
 	kubeconfig  string
-	nodeIP      string
+	// clusterCA is --cluster-ca, the CA a managed update's signer must chain
+	// to (netdsvc.Options.ClusterCAPath).
+	clusterCA string
+	nodeIP    string
 	// dnsVIP and clusterDomain are the node resolver entry's server and
 	// cluster match domain. Their defaults are the same constants the server
 	// and agent --dns-vip/--cluster-domain flags default to, and the installed
@@ -91,6 +94,7 @@ func netdFlags(opts *netdOptions) *flag.FlagSet {
 	fs.StringVar(&opts.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR (REQUIRED so the proxy's ClusterIP VIP aliases are admitted)")
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
 	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
+	fs.StringVar(&opts.clusterCA, "cluster-ca", "", "the cluster CA certificate a managed update's signer must chain to; empty refuses every managed update")
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer reads with: Services (VIP and ingress binds), and this node's Pods and EndpointSlices (relay binds on published vm pod addresses) — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the node resolver entry routes svc and the cluster domain to")
 	fs.StringVar(&opts.clusterDomain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the node resolver entry registers as a match domain")
@@ -156,6 +160,7 @@ func runNetd(args []string) error {
 		NodeIP:             nodeIP,
 		VMPodPorts:         buildVMPodSet(ctx, opts.kubeconfig, logger),
 		MeshKeyDir:         opts.meshKeyDir,
+		ClusterCAPath:      opts.clusterCA,
 		Logger:             logger,
 	})
 	if err != nil {
