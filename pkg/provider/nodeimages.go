@@ -78,7 +78,7 @@ func nodeImages(entries []image.IndexEntry, limit int) []corev1.ContainerImage {
 	var order []string
 	for _, e := range entries {
 		ref := e.Reference
-		if ref == "" {
+		if ref == "" || !publishableReference(ref) {
 			continue
 		}
 		digest := e.Manifest.GetIndexDigest()
@@ -100,7 +100,7 @@ func nodeImages(entries []image.IndexEntry, limit int) []corev1.ContainerImage {
 		} else {
 			g.tags[ref] = true
 		}
-		if digest != "" {
+		if wellFormedDigest(digest) {
 			g.digests[referenceRepository(ref)+"@"+digest] = true
 		}
 		g.size = max(g.size, e.TotalSize())
@@ -125,6 +125,45 @@ func nodeImages(entries []image.IndexEntry, limit int) []corev1.ContainerImage {
 		out = out[:limit]
 	}
 	return out
+}
+
+// publishableReference reports whether ref may be published in
+// Node.status.images, which anyone who can read nodes can read.
+//
+// The index keys are references the go-containerregistry parser accepted
+// (name.ParseReference) at pull or load, recorded as the caller spelled them,
+// not rewritten to a canonical form: a short "alpine@sha256:…" stays short. The
+// parser refuses credentials in a reference, so this is defence in depth for
+// a record written by any other path. An '@' in an image reference may only
+// introduce a digest at its end, so a reference whose text after its first
+// '@' is not a well-formed sha256 or sha512 digest carries userinfo
+// ("user:pass@registry/app") and is dropped, never published.
+func publishableReference(ref string) bool {
+	at := strings.IndexByte(ref, '@')
+	if at < 0 {
+		return true
+	}
+	return wellFormedDigest(ref[at+1:])
+}
+
+// wellFormedDigest reports whether d is "sha256:" with 64 lowercase hex digits
+// or "sha512:" with 128, the two algorithms the OCI image spec registers.
+func wellFormedDigest(d string) bool {
+	alg, hex, ok := strings.Cut(d, ":")
+	if !ok {
+		return false
+	}
+	switch {
+	case alg == "sha256" && len(hex) == 64, alg == "sha512" && len(hex) == 128:
+	default:
+		return false
+	}
+	for _, c := range hex {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // referenceRepository strips the tag and any digest from an image reference,
