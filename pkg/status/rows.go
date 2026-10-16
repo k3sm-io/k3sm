@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,7 +34,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"golang.org/x/sys/unix"
 
@@ -1496,7 +1494,7 @@ func (c Collector) datastoreRow(role dataroot.Role, apiserver Row) Row {
 	present, uv, jm, err := DatastorePosture(path)
 	switch {
 	case errors.Is(err, fs.ErrPermission):
-		datastoreThroughAPIServer(&row, apiserver)
+		datastoreThroughAPIServer(&row, apiserver, c.anchored(apiserver.Wide["server"]))
 	case err != nil:
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "could not read " + path + ": " + errText(err)
@@ -1516,24 +1514,37 @@ func (c Collector) datastoreRow(role dataroot.Role, apiserver Row) Row {
 }
 
 // DatastoreAnswersDetail is the datastore row's detail when an account that
-// cannot read the db learned from the apiserver's readiness check that the
-// datastore answers.
-const DatastoreAnswersDetail = "answers (the apiserver's readiness check reached it)"
+// cannot read the db learned from this server's apiserver readiness check that
+// the datastore answers.
+const DatastoreAnswersDetail = "answers (the apiserver's readiness check reached it); the WAL and user_version checks run only as root"
+
+// NotThisServerDetail is the reason an unprivileged row does not vouch for an
+// endpoint ServerAnchor did not accept.
+const NotThisServerDetail = "the kubeconfig does not point at this server"
 
 // datastoreThroughAPIServer fills the datastore row of an account that may not
 // read the db from the apiserver row: ok when the apiserver is ready (its
-// readiness includes the etcd check kine answers), unknown when it did not
-// answer, since nothing then reached the datastore.
-func datastoreThroughAPIServer(row *Row, apiserver Row) {
+// readiness includes the etcd check kine answers) AND anchored says the
+// endpoint is this server's own; unknown otherwise, with the reason.
+func datastoreThroughAPIServer(row *Row, apiserver Row, anchored bool) {
 	row.Wide["source"] = "apiserver readyz"
-	if apiserver.State == StateReady {
-		row.State, row.Severity = StateOK, SeverityOK
-		row.Detail = DatastoreAnswersDetail
-		return
-	}
-	row.State, row.Severity = StateUnknown, SeverityUnknown
-	row.Detail = "state.db is not readable as this user and the apiserver did not answer its readiness check, so nothing reached the datastore"
 	row.Remedy = "sudo k3sm status"
+	row.State, row.Severity = StateUnknown, SeverityUnknown
+	switch {
+	case apiserver.State != StateReady:
+		row.Detail = "state.db is not readable as this user and the apiserver did not answer its readiness check, so nothing reached the datastore"
+	case !anchored:
+		row.Detail = "state.db is not readable as this user, and " + NotThisServerDetail + " (" + apiserver.Wide["server"] + ")"
+	default:
+		row.State, row.Severity, row.Remedy = StateOK, SeverityOK, ""
+		row.Detail = DatastoreAnswersDetail
+	}
+}
+
+// anchored reports whether ServerAnchor accepts server as this Mac's own
+// control plane.
+func (c Collector) anchored(server string) bool {
+	return c.ServerAnchor != nil && server != "" && c.ServerAnchor(server)
 }
 
 // withUserKube adopts the invoking account's own kubeconfig (UserKube) as the
@@ -1580,51 +1591,6 @@ func (c Collector) kubeconfigRow() Row {
 		row.Wide = map[string]string{"source": "user-kubeconfig"}
 	}
 	return row
-}
-
-// UserKubeContext picks the context of the invoking account's kubeconfig that
-// an agent's report reads the cluster with: the context named name (the
-// installed admin context, k3sm unless install was told otherwise) when the
-// file has one, else the current context when its cluster's server is on the
-// host this Mac joined (joinServer, the agent's --server: a host, host:port or
-// URL). ok is false when neither holds, because reading some other cluster and
-// calling it this one would be worse than reading none.
-func UserKubeContext(cfg *clientcmdapi.Config, name, joinServer string) (string, bool) {
-	if cfg == nil {
-		return "", false
-	}
-	if _, ok := cfg.Contexts[name]; ok && name != "" {
-		return name, true
-	}
-	cur, ok := cfg.Contexts[cfg.CurrentContext]
-	if !ok || cur == nil {
-		return "", false
-	}
-	cluster, ok := cfg.Clusters[cur.Cluster]
-	if !ok || cluster == nil {
-		return "", false
-	}
-	join := serverHost(joinServer)
-	if join == "" || serverHost(cluster.Server) != join {
-		return "", false
-	}
-	return cfg.CurrentContext, true
-}
-
-// serverHost is the host of a server named as a URL, host:port or bare host.
-func serverHost(s string) string {
-	s = strings.TrimSpace(s)
-	if strings.Contains(s, "://") {
-		u, err := url.Parse(s)
-		if err != nil {
-			return ""
-		}
-		return strings.ToLower(u.Hostname())
-	}
-	if h, _, err := net.SplitHostPort(s); err == nil {
-		return strings.ToLower(h)
-	}
-	return strings.ToLower(strings.Trim(s, "[]"))
 }
 
 // runtimedRow reports the native runtime daemon's health. It is rendered only by

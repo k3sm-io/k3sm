@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -90,12 +91,13 @@ func TestUnprivilegedStatusReadsWhatTheUserCan(t *testing.T) {
 		ServingChain: func(context.Context) (PresentedChain, error) {
 			return PresentedChain{Server: kube.server, Host: "127.0.0.1", Chain: []*x509.Certificate{leaf}, CA: ca.CertPEM}, nil
 		},
-		Paths:      p,
-		EUID:       501,
-		ServiceUID: 250,
-		Now:        func() time.Time { return now },
-		Version:    goldenVersion,
-		Hostname:   "my-mac",
+		ServerAnchor: ServerAnchor(6444, nil),
+		Paths:        p,
+		EUID:         501,
+		ServiceUID:   250,
+		Now:          func() time.Time { return now },
+		Version:      goldenVersion,
+		Hostname:     "my-mac",
 	}
 	rep := c.Collect(context.Background())
 
@@ -106,7 +108,7 @@ func TestUnprivilegedStatusReadsWhatTheUserCan(t *testing.T) {
 		detail string
 	}{
 		{RowDatastore, StateOK, SeverityOK, DatastoreAnswersDetail},
-		{RowServingCert, StateOK, SeverityOK, "issued by the cluster CA, valid until " + leaf.NotAfter.UTC().Format("2006-01-02") + " (read from the TLS handshake)"},
+		{RowServingCert, StateOK, SeverityOK, "issued by the CA your kubeconfig pins, valid until " + leaf.NotAfter.UTC().Format("2006-01-02") + " (read from the TLS handshake)"},
 		{RowMeshClaims, StateOK, SeverityOK, "no abandoned pod-range claims"},
 		{RowServices, StateOK, SeverityOK, "1 Service port(s) route to the API's Ready endpoints"},
 		{RowRuntimed, StateNeedsAdmin, SeveritySkip, RuntimedNeedsAdminDetail},
@@ -215,8 +217,9 @@ func TestUnprivilegedAgentReadsThroughTheUserKubeconfig(t *testing.T) {
 }
 
 // TestUserKubeContext pins which context of the invoking account's kubeconfig
-// an agent's report reads: the installed admin context when there is one, else
-// the current context only when it points at the host this Mac joined.
+// a report reads: the installed admin context, else the current context, and
+// either only when it points at the anchored endpoint. A context named k3sm
+// is anchored like any other, never trusted by its name.
 func TestUserKubeContext(t *testing.T) {
 	cfg := func(current string, contexts map[string]string) *clientcmdapi.Config {
 		c := clientcmdapi.NewConfig()
@@ -234,7 +237,9 @@ func TestUserKubeContext(t *testing.T) {
 		want string
 		ok   bool
 	}{
-		{"the k3sm context wins", cfg("other", map[string]string{"k3sm": "https://100.64.0.1:6444", "other": "https://192.168.0.50:6444"}), "192.168.0.50", "k3sm", true},
+		{"the k3sm context on the joined host wins", cfg("other", map[string]string{"k3sm": "https://192.168.0.50:6444", "other": "https://192.168.0.50:6445"}), "192.168.0.50", "k3sm", true},
+		{"a k3sm context pointing at another host yields no context", cfg("k3sm", map[string]string{"k3sm": "https://10.0.0.9:6444"}), "192.168.0.50", "", false},
+		{"a k3sm context elsewhere falls to an anchored current context", cfg("lab", map[string]string{"k3sm": "https://10.0.0.9:6444", "lab": "https://192.168.0.50:6444"}), "192.168.0.50", "lab", true},
 		{"the current context on the joined host", cfg("lab", map[string]string{"lab": "https://192.168.0.50:6444"}), "192.168.0.50:9345", "lab", true},
 		{"a join server given as a URL", cfg("lab", map[string]string{"lab": "https://studio.example:6444"}), "https://Studio.example:9345", "lab", true},
 		{"the current context on another cluster", cfg("work", map[string]string{"work": "https://10.0.0.9:6443"}), "192.168.0.50", "", false},
@@ -242,10 +247,33 @@ func TestUserKubeContext(t *testing.T) {
 		{"no kubeconfig", nil, "192.168.0.50", "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := UserKubeContext(tc.cfg, "k3sm", tc.join)
+			got, ok := UserKubeContext(tc.cfg, "k3sm", JoinAnchor(tc.join))
 			if got != tc.want || ok != tc.ok {
 				t.Errorf("UserKubeContext = %q, %v, want %q, %v", got, ok, tc.want, tc.ok)
 			}
 		})
+	}
+}
+
+// TestServerAnchor pins what proves an endpoint is this server's own control
+// plane: a loopback host or one of this Mac's addresses, at the apiserver port.
+func TestServerAnchor(t *testing.T) {
+	anchor := ServerAnchor(6444, []netip.Addr{netip.MustParseAddr("100.64.0.1")})
+	for server, want := range map[string]bool{
+		"https://127.0.0.1:6444":    true,
+		"https://localhost:6444":    true,
+		"https://[::1]:6444":        true,
+		"https://100.64.0.1:6444":   true,
+		"https://127.0.0.1:6443":    false,
+		"https://100.64.0.1:443":    false,
+		"https://100.64.0.1":        false,
+		"https://100.64.0.9:6444":   false,
+		"https://studio.lan:6444":   false,
+		"https://192.168.0.50:6444": false,
+		"":                          false,
+	} {
+		if got := anchor(server); got != want {
+			t.Errorf("ServerAnchor(%q) = %v, want %v", server, got, want)
+		}
 	}
 }

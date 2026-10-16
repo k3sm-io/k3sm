@@ -28,9 +28,12 @@ import (
 
 // TestStatusUserKubeReadsTheInvokingAccountsKubeconfig pins the agent fallback's
 // reader: it exists on an agent only, builds the client from the k3sm context
-// of the account's own kubeconfig, and names that file and context.
+// of the account's own kubeconfig when that context points at the host this
+// Mac joined, names that file and context, and refuses a k3sm context that
+// points anywhere else.
 func TestStatusUserKubeReadsTheInvokingAccountsKubeconfig(t *testing.T) {
-	if statusUserKubeFor(install.RoleServer) != nil {
+	join := func() (string, error) { return "100.64.0.1:9345", nil }
+	if statusUserKubeFor(install.RoleServer, join) != nil {
 		t.Error("a server got the agent's kubeconfig fallback")
 	}
 	path := filepath.Join(t.TempDir(), "config")
@@ -47,7 +50,7 @@ func TestStatusUserKubeReadsTheInvokingAccountsKubeconfig(t *testing.T) {
 	if installedKubeconfigName() != installedContextName {
 		t.Skip("this Mac's install names its own kubeconfig context")
 	}
-	kube, source, err := statusUserKubeFor(install.RoleAgent)()
+	kube, source, err := statusUserKubeFor(install.RoleAgent, join)()
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -56,5 +59,9 @@ func TestStatusUserKubeReadsTheInvokingAccountsKubeconfig(t *testing.T) {
 	}
 	if want := path + ` context "k3sm"`; source != want {
 		t.Errorf("source = %q, want %q", source, want)
+	}
+	elsewhere := func() (string, error) { return "192.168.0.50", nil }
+	if _, _, err := statusUserKubeFor(install.RoleAgent, elsewhere)(); err == nil {
+		t.Error("a k3sm context on another host was used for this worker's cluster")
 	}
 }

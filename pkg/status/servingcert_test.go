@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -232,10 +233,11 @@ func TestServingCertRowFromHandshake(t *testing.T) {
 		sev    Severity
 		detail string
 	}{
-		{"issued by the cluster CA, in date", presented("127.0.0.1", ca.CertPEM, good), now, StateOK, SeverityOK, "issued by the cluster CA, valid until " + good.NotAfter.UTC().Format("2006-01-02") + " (read from the TLS handshake)"},
+		{"issued by the cluster CA, in date", presented("127.0.0.1", ca.CertPEM, good), now, StateOK, SeverityOK, "issued by the CA your kubeconfig pins, valid until " + good.NotAfter.UTC().Format("2006-01-02") + " (read from the TLS handshake)"},
 		{"expired", presented("127.0.0.1", ca.CertPEM, good), now.Add(2 * time.Hour), StateExpired, SeverityFail, "expired"},
-		{"another CA's certificate", presented("127.0.0.1", ca.CertPEM, handshakeLeaf(t, other, time.Hour)), now, StateCorrupt, SeverityFail, "not issued by the cluster CA your kubeconfig pins"},
+		{"another CA's certificate", presented("127.0.0.1", ca.CertPEM, handshakeLeaf(t, other, time.Hour)), now, StateCorrupt, SeverityFail, "not issued by the CA your kubeconfig pins"},
 		{"a host the certificate does not name", presented("100.64.0.9", ca.CertPEM, good), now, StateCorrupt, SeverityFail, "does not name 100.64.0.9"},
+		{"an endpoint that is not this server", presented("10.0.0.9", ca.CertPEM, good), now, StateUnknown, SeverityUnknown, NotThisServerDetail},
 		{"a kubeconfig that pins no CA", presented("127.0.0.1", nil, good), now, StateUnknown, SeverityUnknown, "pins no cluster CA"},
 		{"no handshake", func(context.Context) (PresentedChain, error) {
 			return PresentedChain{}, errors.New("connection refused")
@@ -246,7 +248,8 @@ func TestServingCertRowFromHandshake(t *testing.T) {
 				present:    map[string]bool{certs.ClusterCACertPath(wd): true},
 				unreadable: map[string]bool{certs.ClusterCACertPath(wd): true, certs.APIServerServingCertPath(wd): true},
 			}
-			c := Collector{FS: fsys, ServingChain: tc.chain, Paths: Paths{WorkDir: wd, ServerLabel: "io.k3sm.server"}}
+			c := Collector{FS: fsys, ServingChain: tc.chain, Paths: Paths{WorkDir: wd, ServerLabel: "io.k3sm.server"},
+				ServerAnchor: ServerAnchor(6444, []netip.Addr{netip.MustParseAddr("100.64.0.9")})}
 			row, ok := c.servingCertRow(context.Background(), tc.now)
 			if !ok {
 				t.Fatal("no serving-cert row")

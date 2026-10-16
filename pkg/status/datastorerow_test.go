@@ -73,7 +73,13 @@ func unreadableWorkDir(t *testing.T) string {
 // the row asks the apiserver's readiness check, which includes the datastore,
 // and is unknown only when the apiserver did not answer.
 func TestDatastoreRowThroughAPIServer(t *testing.T) {
-	c := Collector{Paths: testPaths(unreadableWorkDir(t))}
+	c := Collector{Paths: testPaths(unreadableWorkDir(t)), ServerAnchor: ServerAnchor(6444, nil)}
+	at := func(state RowState, server string) Row {
+		return Row{State: state, Wide: map[string]string{"server": server}}
+	}
+	if (Collector{Paths: c.Paths}).datastoreRow(dataroot.RoleServer, at(StateReady, "https://127.0.0.1:6444")).State != StateUnknown {
+		t.Error("with no anchor wired the row vouched for an endpoint")
+	}
 	for _, tc := range []struct {
 		name      string
 		apiserver Row
@@ -81,12 +87,17 @@ func TestDatastoreRowThroughAPIServer(t *testing.T) {
 		sev       Severity
 		detail    string
 	}{
-		{"a ready apiserver proves the datastore answers", Row{State: StateReady}, StateOK, SeverityOK, DatastoreAnswersDetail},
-		{"an apiserver that did not answer leaves it unknown", Row{State: StateDown}, StateUnknown, SeverityUnknown, "the apiserver did not answer"},
+		{"this server's ready apiserver proves the datastore answers", at(StateReady, "https://127.0.0.1:6444"), StateOK, SeverityOK, DatastoreAnswersDetail},
+		{"a ready apiserver elsewhere proves nothing", at(StateReady, "https://10.0.0.9:6444"), StateUnknown, SeverityUnknown, NotThisServerDetail},
+		{"a ready apiserver on another port proves nothing", at(StateReady, "https://127.0.0.1:6443"), StateUnknown, SeverityUnknown, NotThisServerDetail},
+		{"an apiserver that did not answer leaves it unknown", at(StateDown, "https://127.0.0.1:6444"), StateUnknown, SeverityUnknown, "the apiserver did not answer"},
 		{"no apiserver probe at all leaves it unknown", Row{State: StateUnknown}, StateUnknown, SeverityUnknown, "the apiserver did not answer"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			row := c.datastoreRow(dataroot.RoleServer, tc.apiserver)
+			if tc.state == StateOK && !strings.Contains(row.Detail, "run only as root") {
+				t.Errorf("detail %q does not say the WAL and user_version checks need root", row.Detail)
+			}
 			if row.State != tc.state || row.Severity != tc.sev || !strings.Contains(row.Detail, tc.detail) {
 				t.Errorf("row = %s/%s %q, want %s/%s containing %q", row.State, row.Severity, row.Detail, tc.state, tc.sev, tc.detail)
 			}

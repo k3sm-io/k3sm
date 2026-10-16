@@ -319,13 +319,19 @@ type Collector struct {
 	// rows then read the cluster the way kubectl would, and the kubeconfig row
 	// names that context. Which context is UserKubeContext's decision.
 	// OPTIONAL: nil leaves those rows to the node credential.
-	UserKube   func() (Kube, string, error)
-	Paths      Paths
-	EUID       int
-	ServiceUID int
-	Now        func() time.Time
-	Version    version.Info
-	Host       string
+	UserKube func() (Kube, string, error)
+	// ServerAnchor proves, on a server, that the apiserver URL the report's
+	// client dials is this Mac's own control plane (ServerAnchor in
+	// production). The datastore and serving-cert rows of an account that
+	// cannot read the work dir vouch for what that endpoint answers only when
+	// it passes. OPTIONAL: nil anchors nothing, and those rows stay unknown.
+	ServerAnchor Anchor
+	Paths        Paths
+	EUID         int
+	ServiceUID   int
+	Now          func() time.Time
+	Version      version.Info
+	Host         string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

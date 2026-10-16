@@ -118,9 +118,10 @@ type PresentedChain struct {
 
 // servingCertFromHandshake fills the serving-cert row from the chain the
 // apiserver presents, for an account that may not read the certificate file.
-// It runs the file path's checks on that certificate: in date, issued by the
-// cluster CA (the one the reader's kubeconfig pins, the trust kubectl uses), and
-// naming the host it was reached by.
+// It runs the file path's checks on that certificate: in date, issued by the CA
+// the reader's kubeconfig pins (the trust kubectl uses), and naming the host it
+// was reached by. It vouches for nothing unless ServerAnchor accepts the
+// endpoint as this server's own control plane.
 func (c Collector) servingCertFromHandshake(ctx context.Context, row Row, now time.Time) Row {
 	row.Wide["source"] = "handshake"
 	pc, err := c.ServingChain(ctx)
@@ -133,6 +134,12 @@ func (c Collector) servingCertFromHandshake(ctx context.Context, row Row, now ti
 	if err != nil {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "the serving certificate file is unreadable as this user, and the apiserver's TLS handshake could not be read: " + errText(err)
+		row.Remedy = "sudo k3sm status"
+		return row
+	}
+	if !c.anchored(pc.Server) {
+		row.State, row.Severity = StateUnknown, SeverityUnknown
+		row.Detail = "the serving certificate file is unreadable as this user, and " + NotThisServerDetail + " (" + pc.Server + ")"
 		row.Remedy = "sudo k3sm status"
 		return row
 	}
@@ -172,15 +179,15 @@ func (c Collector) servingCertFromHandshake(ctx context.Context, row Row, now ti
 		row.Remedy = "sudo k3sm status"
 	case errors.As(err, &authErr):
 		row.State, row.Severity = StateCorrupt, SeverityFail
-		row.Detail = "the certificate the apiserver presents is not issued by the cluster CA your kubeconfig pins"
+		row.Detail = "the certificate the apiserver presents is not issued by the CA your kubeconfig pins"
 		row.Remedy = "sudo k3sm status"
 	case err != nil:
 		row.State, row.Severity = StateCorrupt, SeverityFail
-		row.Detail = "the certificate the apiserver presents does not verify against the cluster CA: " + errText(err)
+		row.Detail = "the certificate the apiserver presents does not verify against the CA your kubeconfig pins: " + errText(err)
 		row.Remedy = "sudo k3sm status"
 	default:
 		row.State, row.Severity = StateOK, SeverityOK
-		row.Detail = "issued by the cluster CA, valid until " + leaf.NotAfter.UTC().Format("2006-01-02") + " (read from the TLS handshake)"
+		row.Detail = "issued by the CA your kubeconfig pins, valid until " + leaf.NotAfter.UTC().Format("2006-01-02") + " (read from the TLS handshake)"
 	}
 	return row
 }

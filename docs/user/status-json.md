@@ -175,13 +175,17 @@ checked rather than as a fault. Run as any account other than root, these rows r
 
 Other rows read what your account can, through the apiserver, instead of a file only root can read:
 
-- `datastore`: `ok` with `detail` `answers (the apiserver's readiness check reached it)` when the
-  apiserver is ready, because its readiness check includes the datastore. `wide.source` is
-  `apiserver readyz`. It is `unknown` only when the apiserver did not answer.
+- `datastore`: `ok` with `detail` `answers (the apiserver's readiness check reached it); the WAL and
+  user_version checks run only as root` when the apiserver is ready, because its readiness check
+  includes the datastore. `wide.source` is `apiserver readyz`. The row counts the answer only when
+  your kubeconfig's server is this Mac: a loopback address or one of its own addresses, at port
+  6444. Otherwise it is `unknown`, saying the kubeconfig does not point at this server. It is also
+  `unknown` when the apiserver did not answer.
 - `serving-cert`: reads the certificate the apiserver presents when it is reached with your
-  kubeconfig, and checks it as root checks the file: in date, issued by the cluster CA your
-  kubeconfig pins, and naming the host you reached it by. `wide.source` is `handshake`. It is
-  `unknown` when the handshake fails or your kubeconfig pins no CA.
+  kubeconfig, and checks it as root checks the file: in date, issued by the CA your kubeconfig
+  pins, and naming the host you reached it by. `wide.source` is `handshake`. The same test of the
+  server applies as for `datastore`. It is `unknown` when that test fails, the handshake fails, or
+  your kubeconfig pins no CA.
 - `mesh-claims` and `services`: a server writes each record twice, mode 0600 in its own work dir
   and mode 0644 in `/var/lib/k3sm/status/`, which any account can read. The records hold
   cluster-internal names and addresses, never a credential. The rows read the second copy when the
@@ -189,8 +193,9 @@ Other rows read what your account can, through the apiserver, instead of a file 
   directory writes no second copy, and then the rows say `needs-admin`.
 - On a worker whose node credential your account cannot read, `apiserver`, `node` and `workloads`
   read the cluster with your own kubeconfig: its `k3sm` context (or the name given to `k3sm install
-  --kubeconfig-name`), else the current context when its server is on the host the worker joined.
-  The `kubeconfig` row then names that file and context, with `wide.source` `user-kubeconfig`.
+  --kubeconfig-name`), else the current context, and either only when its server is on the host
+  the worker joined (the `--server` it was installed with). A context is never used by its name
+  alone. The `kubeconfig` row then names that file and context, with `wide.source` `user-kubeconfig`.
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was

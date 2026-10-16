@@ -25,6 +25,7 @@ import (
 	"io"
 	"io/fs"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -188,13 +189,18 @@ func newStatusCollector() status.Collector {
 		ServingChain: statusServingChain(kube),
 		// On an agent, the invoking account's own kubeconfig, for when the
 		// node credential is not readable from this account.
-		UserKube:   statusUserKubeFor(role),
-		Paths:      paths,
-		EUID:       euid,
-		ServiceUID: serviceUID,
-		Version:    version.Get(),
-		Host:       macOSVersionOrEmpty(),
-		Hostname:   hostnameOrEmpty(),
+		UserKube: statusUserKubeFor(role, statusAgentJoinServer),
+		// What proves, on a server, that the apiserver the report dials is
+		// this Mac's own: loopback or one of its addresses, at the apiserver
+		// port. A server installed with a non-default --api-port fails it, and
+		// those rows then stay unknown as an ordinary account.
+		ServerAnchor: status.ServerAnchor(executor.DefaultAPIServerPort, localAddrs()),
+		Paths:        paths,
+		EUID:         euid,
+		ServiceUID:   serviceUID,
+		Version:      version.Get(),
+		Host:         macOSVersionOrEmpty(),
+		Hostname:     hostnameOrEmpty(),
 	}
 }
 
@@ -673,11 +679,30 @@ func newStatusKube(in statusKubeInputs) (status.Kube, string, error) {
 	return buildStatusKube(cfg)
 }
 
+// localAddrs lists this Mac's interface addresses, for the server anchor. A
+// failed read lists none, which leaves loopback as the only anchor.
+func localAddrs() []netip.Addr {
+	ifaddrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, a := range ifaddrs {
+		if p, err := netip.ParsePrefix(a.String()); err == nil {
+			out = append(out, p.Addr())
+		}
+	}
+	return out
+}
+
 // statusUserKubeFor returns, on an agent, the reader of the invoking account's
 // own kubeconfig the report falls back to when the node credential is not
 // readable (status.Collector.UserKube); nil on a server, which resolves the
 // user's kubeconfig already.
-func statusUserKubeFor(role install.Role) func() (status.Kube, string, error) {
+//
+// joinServer reads the agent's --server, which anchors the context: only a
+// context whose server is on that host is used.
+func statusUserKubeFor(role install.Role, joinServer func() (string, error)) func() (status.Kube, string, error) {
 	if role != install.RoleAgent {
 		return nil
 	}
@@ -687,11 +712,14 @@ func statusUserKubeFor(role install.Role) func() (status.Kube, string, error) {
 		if err != nil {
 			return nil, "", err
 		}
-		join, _ := statusAgentJoinServer()
+		join, err := joinServer()
+		if err != nil {
+			return nil, "", fmt.Errorf("the server this Mac joined is unknown, so no context can be shown to point at it: %w", err)
+		}
 		name := installedKubeconfigName()
-		ctxName, ok := status.UserKubeContext(raw, name, join)
+		ctxName, ok := status.UserKubeContext(raw, name, status.JoinAnchor(join))
 		if !ok {
-			return nil, "", fmt.Errorf("no %q context, and the current context does not point at the server this Mac joined", name)
+			return nil, "", fmt.Errorf("neither the %q context nor the current one points at the server this Mac joined", name)
 		}
 		return buildStatusKube(kubectlConfig{context: ctxName})
 	}
