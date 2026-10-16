@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -32,6 +31,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/connrotation"
 	"k8s.io/utils/clock"
+
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // RotatingCredential is the datapath's client certificate held so it can be
@@ -52,10 +53,11 @@ type RotatingCredential struct {
 }
 
 // NewRotatingCredential holds the pair certPEM/keyPEM. dial opens the client's
-// connections; nil uses a net.Dialer with client-go's usual timeouts.
+// connections; nil uses the segment-clamped tcpseg.Dialer with client-go's usual
+// timeouts, since the apiserver a worker dials sits behind the mesh tunnel.
 func NewRotatingCredential(certPEM, keyPEM []byte, dial connrotation.DialFunc) (*RotatingCredential, error) {
 	if dial == nil {
-		dial = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+		dial = (&tcpseg.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	}
 	c := &RotatingCredential{dialer: connrotation.NewDialer(dial)}
 	if err := c.set(certPEM, keyPEM); err != nil {
