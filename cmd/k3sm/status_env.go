@@ -95,8 +95,40 @@ func newStatusRunner(o statusOptions) statusRunner {
 			"agent":  install.AgentLogPath(),
 		},
 		logTargets: defaultLogTargets(role),
+		top:        lazyTop(newTopCollector),
 		appPresent: func() bool { return fileExists(appBundlePath) },
 	}
+}
+
+// lazyTop builds the top collector on the first frame and keeps it for every
+// later one, so the other views never resolve its client and a --watch loop
+// keeps one metrics sample between frames.
+func lazyTop(build func() *status.TopCollector) func(context.Context, status.TopOptions) status.TopReport {
+	var c *status.TopCollector
+	return func(ctx context.Context, o status.TopOptions) status.TopReport {
+		if c == nil {
+			c = build()
+		}
+		return c.Collect(ctx, o)
+	}
+}
+
+// newTopCollector resolves the apiserver client the full report would use: the
+// role's credentials, and on a worker whose node credential this account cannot
+// read, the account's own kubeconfig context for the server it joined.
+func newTopCollector() *status.TopCollector {
+	euid := os.Geteuid()
+	role, _ := installedRole()
+	paths := statusPaths(statusWorkDir(euid, lookupServiceUID()))
+	kube, _, err := newStatusKube(statusKubeInputsFor(role, paths))
+	if kube == nil {
+		if user := statusUserKubeFor(role, statusAgentJoinServer, installedStatusDir()); user != nil {
+			if k, _, uerr := user(); uerr == nil {
+				kube, err = k, nil
+			}
+		}
+	}
+	return &status.TopCollector{Kube: kube, KubeErr: err, Now: time.Now}
 }
 
 // appBundlePath is where k3sm.app is installed.

@@ -65,6 +65,27 @@ k3sm status --wait           # poll until the cluster is running, or --timeout e
 
 Both JSON shapes are versioned; [Status JSON](status-json.md) is their contract.
 
+### CPU and memory: `k3sm status top`
+
+`k3sm status top` lists each node's CPU and memory use against what it can allocate, with its pod
+count and the age of the sample, then the busiest pods by CPU and then memory:
+
+```sh
+k3sm status top                       # one screen
+k3sm status top --watch=2s            # re-render every 2 seconds
+k3sm status top --sort memory -n default --limit 10
+k3sm status top -o json               # the same rows, for scripts
+```
+
+The figures come from metrics-server (the `metrics.k8s.io` API, the same source as `kubectl top`).
+metrics-server samples every 15 seconds, so `--watch` reads it at most every 5 seconds whatever the
+interval; the age column shows how old each node's sample is. A node it has not sampled yet says
+`no metrics yet`. When the metrics API is not available, the first line gives the reason and
+message from the `v1beta1.metrics.k8s.io` APIService, and the tables list nodes and pods without
+usage. `--sort`, `-n` and `--limit` shape the pod table only; the node table always covers the
+whole cluster. The view exits 0 when it read the cluster, with or without metrics, and 6 when it
+could not.
+
 The exit code is the verdict, so a script can branch on it. `k3sm status --help` lists the codes.
 
 Rows say `needs-admin` when only root can run the check, such as the runtime socket. Nothing has

@@ -1,0 +1,13 @@
+metrics: available from v1beta1.metrics.k8s.io, read at most every 5s
+
+NODE    ROLE    CPU             CPU%  MEMORY           MEM%  PODS  AGE
+laptop  agent   no metrics yet                               2     -
+studio  server  1250m/20000m    6%    12288Mi/65536Mi  18%   2     9s
+
+pods: 5 in all namespaces, by cpu
+NAMESPACE    POD                  NODE    CPU   MEMORY  RESTARTS
+default      web-1                studio  120m  256Mi   3
+kube-system  metrics-server-5f8b  laptop  6m    300Mi   0
+kube-system  coredns-7c5d         studio  3m    21Mi    1
+default      pending-1            -       -     -       0
+default      web-2                laptop  -     -       0

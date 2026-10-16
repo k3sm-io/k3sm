@@ -54,7 +54,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   image       ingest, publish and reclaim this node's images (image load|import|push|prune|ls|df)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
-  status      show what is running (daemons, apiserver, node, workloads, data root) — the exit code is the verdict, see k3sm status --help
+  status      show what is running (daemons, apiserver, node, workloads, data root; status top for CPU and memory) — the exit code is the verdict, see k3sm status --help
   update      check for a newer k3sm release and which nodes are behind it (update check)
   doctor      run preflight environment + datastore-posture checks
               (--report writes a redacted bug-report bundle)

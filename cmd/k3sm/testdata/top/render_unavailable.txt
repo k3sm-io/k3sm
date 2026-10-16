@@ -1,0 +1,13 @@
+metrics: unavailable (MissingEndpoints: endpoints for service/metrics-server in "kube-system" have no addresses with port name "https"); showing nodes and pods without usage
+
+NODE    ROLE    CPU       CPU%  MEMORY     MEM%  PODS  AGE
+laptop  agent   -/8000m   -     -/8192Mi   -     2     -
+studio  server  -/20000m  -     -/65536Mi  -     2     -
+
+pods: 5 in all namespaces, by namespace and name
+NAMESPACE    POD                  NODE    CPU  MEMORY  RESTARTS
+default      pending-1            -       -    -       0
+default      web-1                studio  -    -       3
+default      web-2                laptop  -    -       0
+kube-system  coredns-7c5d         studio  -    -       1
+kube-system  metrics-server-5f8b  laptop  -    -       0
