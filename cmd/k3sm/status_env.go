@@ -146,6 +146,7 @@ func newStatusCollector() status.Collector {
 	// probe a control plane it does not run.
 	role, _ := installedRole()
 	paths := statusPaths(workDir)
+	statusDir := installedStatusDir()
 	kube, source, kubeErr := newStatusKube(statusKubeInputsFor(role, paths))
 
 	return status.Collector{
@@ -196,12 +197,12 @@ func newStatusCollector() status.Collector {
 		ServingChain: statusServingChain(kube),
 		// On an agent, the invoking account's own kubeconfig, for when the
 		// node credential is not readable from this account.
-		UserKube: statusUserKubeFor(role, statusAgentJoinServer),
+		UserKube: statusUserKubeFor(role, statusAgentJoinServer, statusDir),
 		// What proves, on a server, that the apiserver the report dials is
 		// this Mac's own: loopback or one of its addresses, at the apiserver
 		// port. A server installed with a non-default --api-port fails it, and
 		// those rows then stay unknown as an ordinary account.
-		ServerAnchor: status.NodeAnchor(statusEndpoints(), status.ServerAnchor(executor.DefaultAPIServerPort, localAddrs())),
+		ServerAnchor: status.NodeAnchor(statusEndpoints(statusDir), status.ServerAnchor(executor.DefaultAPIServerPort, localAddrs())),
 		Paths:        paths,
 		EUID:         euid,
 		ServiceUID:   serviceUID,
@@ -687,9 +688,15 @@ func newStatusKube(in statusKubeInputs) (status.Kube, string, error) {
 }
 
 // statusEndpoints reads the endpoints record this node published, or nil
-// (a node older than the record), from the installed status directory.
-func statusEndpoints() *status.EndpointsRecord {
-	return status.ReadEndpointsRecord(os.ReadFile, status.EndpointsPath(install.StateStatus.Path(install.DefaultDataRoot)))
+// (a node older than the record), from statusDir.
+func statusEndpoints(statusDir string) *status.EndpointsRecord {
+	return status.ReadEndpointsRecord(os.ReadFile, status.EndpointsPath(statusDir))
+}
+
+// installedStatusDir is the installed status directory, where the node
+// publishes its endpoints record.
+func installedStatusDir() string {
+	return install.StateStatus.Path(install.DefaultDataRoot)
 }
 
 // localAddrs lists this Mac's interface addresses, for the server anchor. A
@@ -715,7 +722,7 @@ func localAddrs() []netip.Addr {
 //
 // joinServer reads the agent's --server, which anchors the context: only a
 // context whose server is on that host is used.
-func statusUserKubeFor(role install.Role, joinServer func() (string, error)) func() (status.Kube, string, error) {
+func statusUserKubeFor(role install.Role, joinServer func() (string, error), statusDir string) func() (status.Kube, string, error) {
 	if role != install.RoleAgent {
 		return nil
 	}
@@ -730,7 +737,7 @@ func statusUserKubeFor(role install.Role, joinServer func() (string, error)) fun
 			return nil, "", fmt.Errorf("the server this Mac joined is unknown, so no context can be shown to point at it: %w", err)
 		}
 		name := installedKubeconfigName()
-		ctxName, ok := status.UserKubeContext(raw, name, status.NodeAnchor(statusEndpoints(), status.JoinAnchor(join)))
+		ctxName, ok := status.UserKubeContext(raw, name, status.NodeAnchor(statusEndpoints(statusDir), status.JoinAnchor(join)))
 		if !ok {
 			return nil, "", fmt.Errorf("neither the %q context nor the current one points at the server this Mac joined", name)
 		}
