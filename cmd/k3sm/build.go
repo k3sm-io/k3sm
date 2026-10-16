@@ -30,6 +30,7 @@ import (
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
+	"k3sm.io/k3sm/pkg/buildledger"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/oci"
 )
@@ -37,6 +38,7 @@ import (
 const buildUsage = `k3sm build — build an image from a Dockerfile
 
 Usage: k3sm build --tag <ref> --output <path> [flags] <context-dir>
+       k3sm build ls [-o text|json]
 
 ONE command, two engines, chosen from the Dockerfile:
 
@@ -85,6 +87,11 @@ k3sm Pod requires (a ValidatingAdmissionPolicy refuses a Pod without them):
 
 See docs/user/what-runs.md for a copy-pasteable manifest.
 
+Every build is kept in your build history, the newest 200 of them:
+
+  k3sm build ls                                  # a table, newest first
+  k3sm build ls -o json                          # the records as JSON
+
 Pin FROM to a digest (name@sha256:…) if you want a reproducible build: a tag can
 move under you. See docs/user/what-runs.md for the whole path, and
 docs/user/images.md for the reference.
@@ -117,6 +124,9 @@ type buildOptions struct {
 
 // runBuild is the `k3sm build` entry point.
 func runBuild(args []string) error {
+	if len(args) > 0 && args[0] == "ls" {
+		return runBuildLs(args[1:], os.Stdout)
+	}
 	opts, err := parseBuildArgs(args, os.Stderr)
 	if err != nil {
 		return err
@@ -194,8 +204,24 @@ type engineBuilder func(ctx context.Context, o buildOptions, out io.Writer) erro
 
 // build parses, assembles and writes, routing to the build engine when the
 // Dockerfile needs one.
+//
+// Every build is entered in the user's build ledger (`k3sm build ls`): a
+// running record before the build starts and the outcome when it returns. The
+// ledger observes the build and never steers it, so a ledger that cannot be
+// written costs a warning, not the build.
 func build(ctx context.Context, o buildOptions, out io.Writer) error {
-	return buildWith(ctx, o, out, engineBuild, recordInStore, pushBuilt)
+	return buildRecorded(ctx, defaultBuildLedger(), o, out, engineBuildWith, recordInStore, pushBuilt)
+}
+
+// buildRecorded is buildWith entered in the ledger l (nil records nothing).
+// engineFor builds the engine seam over the recorder, so both routes deliver
+// through the one recorder whose digest the ledger keeps.
+func buildRecorded(ctx context.Context, l *buildledger.Ledger, o buildOptions, out io.Writer, engineFor func(storeRecorder) engineBuilder, record storeRecorder, push imagePusher) error {
+	tr := startBuildRecord(l, o)
+	record = tr.recorder(record)
+	err := buildWith(ctx, o, out, tr.engine(engineFor(record)), record, push)
+	tr.finish(err)
+	return err
 }
 
 // buildWith is build with the engine seam injected.

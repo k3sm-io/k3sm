@@ -98,12 +98,20 @@ func engineBuildArgs(o buildOptions, platform, layoutDir string) []string {
 	}
 }
 
-// engineBuild is the production engineBuilder: it ensures the engine is running,
-// drives the bundled buildx against it, and lands the result at --output in the
-// SAME shape the native path writes — same tag, same sink, same summary. What an
-// operator does next (k3sm image load, a Pod naming the tag) is therefore
-// independent of which engine built the image.
-func engineBuild(ctx context.Context, o buildOptions, out io.Writer) error {
+// engineBuildWith returns the production engineBuilder, delivering through
+// record so both routes share the caller's recorder. It ensures the engine is
+// running, drives the bundled buildx against it, and lands the result at
+// --output in the SAME shape the native path writes — same tag, same sink, same
+// summary. What an operator does next (k3sm image load, a Pod naming the tag)
+// is therefore independent of which engine built the image.
+func engineBuildWith(record storeRecorder) engineBuilder {
+	return func(ctx context.Context, o buildOptions, out io.Writer) error {
+		return engineBuildRecorded(ctx, o, out, record)
+	}
+}
+
+// engineBuildRecorded is the engine build itself, recording through record.
+func engineBuildRecorded(ctx context.Context, o buildOptions, out io.Writer, record storeRecorder) error {
 	ref, err := name.NewTag(o.tag)
 	if err != nil {
 		return fmt.Errorf("--tag %q: %w", o.tag, err)
@@ -143,7 +151,7 @@ func engineBuild(ctx context.Context, o buildOptions, out io.Writer) error {
 	// --tag, plus the artifact when --output asked for one and the upload when
 	// --push did. Sharing this is what makes "which engine built it" invisible
 	// after the build.
-	return deliver(ctx, o, ref, b, out, recordInStore, pushBuilt, sess.endpoint, platform)
+	return deliver(ctx, o, ref, b, out, record, pushBuilt, sess.endpoint, platform)
 }
 
 // layoutIndex returns the multi-platform image index a layout's single

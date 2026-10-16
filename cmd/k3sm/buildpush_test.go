@@ -184,7 +184,7 @@ func TestBuildPushOrdering(t *testing.T) {
 			push:       true,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, &out, engineBuild, store.record, pusher.push); err != nil {
+		}, &out, engineBuildWith(recordInStore), store.record, pusher.push); err != nil {
 			t.Fatalf("build: %v", err)
 		}
 
@@ -213,7 +213,7 @@ func TestBuildPushOrdering(t *testing.T) {
 			tag:        "myapp:v1",
 			format:     "docker",
 			contextDir: ctxDir,
-		}, &out, engineBuild, store.record, pusher.push); err != nil {
+		}, &out, engineBuildWith(recordInStore), store.record, pusher.push); err != nil {
 			t.Fatalf("build: %v", err)
 		}
 		if len(pusher.targets) != 0 {
@@ -239,7 +239,7 @@ func TestBuildPushOrdering(t *testing.T) {
 			push:       true,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuild, store.record, pusher.push)
+		}, io.Discard, engineBuildWith(recordInStore), store.record, pusher.push)
 		if err == nil {
 			t.Fatal("expected the store failure to fail the build")
 		}
@@ -260,7 +260,7 @@ func TestBuildPushOrdering(t *testing.T) {
 			push:       true,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, &out, engineBuild, store.record, pusher.push)
+		}, &out, engineBuildWith(recordInStore), store.record, pusher.push)
 		if err == nil {
 			t.Fatal("expected the push failure to fail the build")
 		}
@@ -290,7 +290,7 @@ func TestBuildPushOrdering(t *testing.T) {
 			push:       true,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuild, store.record, pusher.push)
+		}, io.Discard, engineBuildWith(recordInStore), store.record, pusher.push)
 		if !errors.Is(err, errNoNodeRegistry) {
 			t.Fatalf("build --push with no node registry = %v, want errNoNodeRegistry", err)
 		}
@@ -381,7 +381,7 @@ func TestBuildPushToRegistry(t *testing.T) {
 			output:     layout,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, &out, engineBuild, store.record, pushBuilt); err != nil {
+		}, &out, engineBuildWith(recordInStore), store.record, pushBuilt); err != nil {
 			t.Fatalf("build --push: %v", err)
 		}
 
@@ -427,7 +427,7 @@ func TestBuildPushToRegistry(t *testing.T) {
 			output:     layout,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, &out, engineBuild, noStore, pushBuilt); err != nil {
+		}, &out, engineBuildWith(recordInStore), noStore, pushBuilt); err != nil {
 			t.Fatalf("build --push: %v", err)
 		}
 		if !strings.Contains(out.String(), "push:   "+target) {

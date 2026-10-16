@@ -208,7 +208,7 @@ func TestBuildPlatformRouting(t *testing.T) {
 			platforms:   platforms,
 			platformSet: true,
 			contextDir:  ctxDir,
-		}, io.Discard, engineBuild, noStore, noPush)
+		}, io.Discard, engineBuildWith(recordInStore), noStore, noPush)
 		if !errors.Is(err, errNoEmulation) {
 			t.Fatalf("buildWith = %v, want errNoEmulation", err)
 		}
