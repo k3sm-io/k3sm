@@ -129,11 +129,29 @@ k3sm build ls            # a table, newest first
 k3sm build ls -o json    # the records as a JSON array, newest first
 ```
 
-The table shows each build's ID, status (`running`, `succeeded` or `failed`), tag, platform,
-engine (`native` or `engine`), start time and duration. The JSON records add the absolute
+The table shows each build's ID, status (`running`, `succeeded`, `failed` or `cancelled`), tag,
+platform, engine (`native` or `engine`), start time and duration. The JSON records add the absolute
 Dockerfile and context paths, the finish time, the digest of the image recorded in this node's
 store on success, and the error text on failure, clipped to 1 KiB. A build interrupted before it
 finished stays `running`. If the history cannot be written, the build prints a warning and goes on.
+
+Each build also keeps its output, the build engine's progress included, beside its record. The log
+is capped at 16 MiB and goes when its record goes.
+
+```sh
+k3sm build logs <id>      # print a build's stored output
+k3sm build logs -f <id>   # and keep printing while it runs; returns when it finishes
+k3sm build cancel <id>    # stop a running build
+k3sm build rm <id>        # remove a finished build and its log from the history
+```
+
+`k3sm build cancel` asks the build's own process to stop. On the build engine that interrupts
+buildx, which cancels the build's job in BuildKit; buildx that has not exited 30 seconds later is
+killed. The build is then recorded `cancelled`, with its finish time, and the build command exits
+with an error. A finished build is refused. A record left `running` by a build that was killed
+before it could finish has no process to stop, so `cancel` marks it `cancelled`. `k3sm build rm`
+refuses a running build: cancel it first. A build is reached by its full ID, as `k3sm build ls`
+shows it.
 
 ### Deliberate Differences From `docker build`
 

@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // The HOST-side buildx pin.
@@ -363,10 +364,30 @@ func BuildxArgs(userArgs []string) []string {
 // A non-zero exit is returned as an *exec.ExitError (wrapped), so the caller can
 // forward buildx's exit code instead of flattening it to 1.
 func RunBuildx(ctx context.Context, bin string, args, env []string) error {
+	return RunBuildxTo(ctx, bin, args, env, os.Stdout, os.Stderr)
+}
+
+// buildxStopGrace is how long a cancelled buildx gets, after SIGINT, to cancel
+// its solve and exit before it is killed.
+const buildxStopGrace = 30 * time.Second
+
+// RunBuildxTo is RunBuildx with buildx's output sent to stdout and stderr.
+//
+// Cancelling ctx is how a build is cancelled, so it INTERRUPTS buildx rather
+// than killing it: on SIGINT buildx cancels its solve, and buildkitd cancels
+// the build's job when the solve ends. A SIGKILL would leave buildkitd to
+// notice the dropped session on its own. buildx that has not exited
+// buildxStopGrace after the interrupt is killed.
+func RunBuildxTo(ctx context.Context, bin string, args, env []string, stdout, stderr io.Writer) error {
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, stdout, stderr
 	cmd.Env = env
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = buildxStopGrace
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("exec buildx: %w (%w)", ctx.Err(), err)
+		}
 		return fmt.Errorf("exec buildx: %w", err)
 	}
 	return nil

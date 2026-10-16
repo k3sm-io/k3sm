@@ -18,6 +18,8 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- **`k3sm build cancel`, `rm`, `logs` and `prune`.** `cancel <id>` stops a running build: on the build engine it interrupts buildx, which cancels the job in BuildKit, and the build is recorded `cancelled`; a finished build is refused. `rm <id>` removes a finished build and its log from the history. `logs <id>` prints the build's stored output, which every build now keeps beside its record (capped at 16 MiB), and `-f` follows it until the build finishes. `prune` reclaims the engine's cache: a dry run by default, `--force` prunes and prints the bytes reclaimed, `--all` also removes BuildKit's internal, frontend and shared records. See [images](https://k3sm.io/docs/images/) and [building images](https://k3sm.io/docs/builder/).
+- **`cancel`, `rm`, `logs` and `prune` as the first argument of `k3sm build` are subcommands.** As with `ls`, a build names `--tag` before its context, so only the bare spelling changes meaning; `./logs` still builds a directory named `logs`.
 - **`k3sm datavol status -o json` has a pinned shape.** The `record`, `mounted`, `statfs` and `preVolume` keys are held by golden files, so the k3sm app and scripts can rely on them. See [storage](https://k3sm.io/docs/storage/).
 - **`k3sm status` asks the cluster DNS.** A new `dns` row sends one query for `kubernetes.default.svc.cluster.local` over UDP to the node's DNS address with a 3 second timeout, on servers and workers and without `sudo`. A resolver that does not answer makes the verdict `degraded`; when it still answers over TCP, `wide.tcp` says so and the remedy restarts the node daemon. See [status JSON](https://k3sm.io/docs/status-json/).
 - **`k3sm update check`.** It finds the latest k3sm release the way the install script does and lists every node with its version, `current`, `behind` or `ahead`, plus the Kubernetes version the release ships; `-o json` prints the same report. A server runs the check at most once an hour, and `k3sm status` gains an `update` row: `ok` when every node runs the latest release, `behind` naming the nodes on an older release, `ahead` when a node runs a newer one, `unknown` when GitHub was unreachable or the last check is more than a day old. The row never makes the verdict `degraded`, and `k3sm status` itself never contacts GitHub. See [upgrade](https://k3sm.io/docs/upgrade/).
@@ -58,6 +60,7 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
+- **Engine builds print plain progress.** `k3sm build` copies buildx's output into the build's log, so buildx no longer draws its interactive progress view and prints the plain form instead.
 - **Workers enforce NetworkPolicy.** A worker's datapath now watches NetworkPolicies, Namespaces and every node's Pods under its own identity, so policies selecting Pods on a worker apply there, as they already did on the server. See [limitations](https://k3sm.io/docs/limitations/).
 - **The control plane runs Kubernetes v1.37.1**, and the `k8s.io` client libraries are v0.37.1.
 - **kine, etcd and etcdutl ship in the release payload**, and the node runs those copies instead of building them at boot. The bundled kine is v0.17.2 and the bundled buildx is v0.38.0.
