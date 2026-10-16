@@ -33,10 +33,28 @@ import (
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 )
 
-// CordonedAnnotation marks a Node this controller cordoned, so it lifts only
-// its own cordon and never one an operator set. It is private to the
-// controller: the node-side never reads or writes it.
-const CordonedAnnotation = "k3sm.io/update-cordoned"
+// The controller's own Node annotations. They are private to the controller:
+// the node-side never reads or writes them. Each holds what a restarted
+// controller needs to resume.
+const (
+	// CordonedAnnotation marks a Node this controller cordoned, so it lifts
+	// only its own cordon and never one an operator set.
+	CordonedAnnotation = "k3sm.io/update-cordoned"
+	// HandedOverAnnotation is when the node was handed the release (RFC3339);
+	// the node timeout counts from it.
+	HandedOverAnnotation = "k3sm.io/update-handed-over-at"
+	// ReadyAtAnnotation is when the node was first seen done and Ready
+	// (RFC3339); the settle period counts from it.
+	ReadyAtAnnotation = "k3sm.io/update-ready-at"
+)
+
+// SettlePeriod is how long a node must stay done and Ready before it is
+// uncordoned and the roll moves on.
+const SettlePeriod = 60 * time.Second
+
+// ResolveBound is how long transient release-index failures are retried
+// before the Update fails.
+const ResolveBound = 10 * time.Minute
 
 // controlPlaneLabel marks a server Node.
 const controlPlaneLabel = "node-role.kubernetes.io/control-plane"
@@ -49,6 +67,7 @@ const (
 	ConditionProgressing = "Progressing"
 	ConditionSucceeded   = "Succeeded"
 	ConditionFailed      = "Failed"
+	ConditionResolved    = "Resolved"
 )
 
 // The condition reasons this controller writes.
@@ -59,6 +78,7 @@ const (
 	ReasonSucceeded = "Succeeded"
 	ReasonFailed    = "Failed"
 	ReasonCancelled = "Cancelled"
+	ReasonResolved  = "Resolved"
 )
 
 // Payload is the JSON value of the k3sm.io/update-payload Node annotation: what
@@ -122,11 +142,20 @@ func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update) time.D
 			return idleResync
 		case "", updatesv1alpha1.UpdateNodePhasePending:
 			if u.Spec.Cancel {
-				c.cancelFrom(u, i)
+				c.cancelFrom(u, i, byName)
 				return idleResync
 			}
 		}
-		if err := c.advance(ctx, u, e, byName[e.Name], now); err != nil {
+		from := e.Phase
+		oldBase, oldAt := splitProgress(e.Message)
+		err := c.advance(ctx, u, e, byName[e.Name], now)
+		base, _ := splitProgress(e.Message)
+		at := oldAt
+		if e.Phase != from || base != oldBase || at == "" {
+			at = now.Format(time.RFC3339)
+		}
+		e.Message = withProgress(base, at)
+		if err != nil {
 			var rf rollFailure
 			if errors.As(err, &rf) {
 				c.fail(u, rf.Error())
@@ -142,19 +171,75 @@ func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update) time.D
 			c.fail(u, fmt.Sprintf("node %s: %s", e.Name, e.Message))
 			return idleResync
 		case updatesv1alpha1.UpdateNodePhaseCancelled:
-			c.cancelFrom(u, i+1)
+			c.cancelFrom(u, i+1, byName)
 			return idleResync
 		}
-		c.progress(u, ReasonRolling, fmt.Sprintf("node %s: %s", e.Name, e.Phase))
+		c.progress(u, ReasonRolling, fmt.Sprintf("node %s: %s%s%s", e.Name, e.Phase, progressMark, at))
 		return c.cfg.Poll
 	}
 	c.succeed(u)
 	return idleResync
 }
 
+// progressMark separates a node message from its last-progress time. The
+// time is the last moment the node's phase or message changed, so a stalled
+// node is visible without a status field for it.
+const progressMark = "; last progress "
+
+// splitProgress splits a node message into its text and its last-progress
+// time ("" when it carries none).
+func splitProgress(msg string) (base, at string) {
+	if msg == "" {
+		return "", ""
+	}
+	if strings.HasPrefix(msg, "last progress ") {
+		return "", strings.TrimPrefix(msg, "last progress ")
+	}
+	if i := strings.LastIndex(msg, progressMark); i >= 0 {
+		return msg[:i], msg[i+len(progressMark):]
+	}
+	return msg, ""
+}
+
+// withProgress is base with its last-progress time.
+func withProgress(base, at string) string {
+	if base == "" {
+		return "last progress " + at
+	}
+	return base + progressMark + at
+}
+
+// transition reports one node's phase change: an Event on the Update and on
+// the Node, and an Info log line.
+func (c *Controller) transition(u *updatesv1alpha1.Update, e *updatesv1alpha1.UpdateNodeStatus, from updatesv1alpha1.UpdateNodePhase, n *corev1.Node) {
+	base, _ := splitProgress(e.Message)
+	c.log.Info("update controller: node phase", "update", u.Name, "version", u.Spec.Version,
+		"node", e.Name, "from", string(from), "to", string(e.Phase), "message", base)
+	if c.cfg.Recorder == nil {
+		return
+	}
+	typ := corev1.EventTypeNormal
+	if e.Phase == updatesv1alpha1.UpdateNodePhaseFailed {
+		typ = corev1.EventTypeWarning
+	}
+	reason := "Node" + string(e.Phase)
+	detail := string(e.Phase)
+	if base != "" {
+		detail += ": " + base
+	}
+	c.cfg.Recorder.Eventf(&corev1.ObjectReference{
+		APIVersion: updatesv1alpha1.SchemeGroupVersion.String(), Kind: "Update", Name: u.Name, UID: u.UID,
+	}, typ, reason, "node %s: %s", e.Name, detail)
+	ref := &corev1.ObjectReference{APIVersion: "v1", Kind: "Node", Name: e.Name}
+	if n != nil {
+		ref.UID = n.UID
+	}
+	c.cfg.Recorder.Eventf(ref, typ, reason, "update to %s: %s", u.Spec.Version, detail)
+}
+
 // plan records the node order and each node's starting release in status, and
-// refuses a request that cannot start: an unusable tag, too many nodes, or a
-// downgrade the spec does not allow.
+// refuses a request that cannot start: an unusable tag, too many nodes, a
+// drain with nowhere to move pods, or a downgrade the spec does not allow.
 func (c *Controller) plan(u *updatesv1alpha1.Update, nodes []corev1.Node) error {
 	tag := u.Spec.Version
 	if !validTag(tag) {
@@ -165,6 +250,9 @@ func (c *Controller) plan(u *updatesv1alpha1.Update, nodes []corev1.Node) error 
 	}
 	if len(nodes) > maxNodes {
 		return fmt.Errorf("the cluster has %d nodes; an Update records at most %d", len(nodes), maxNodes)
+	}
+	if u.Spec.Strategy.Drain && len(nodes) == 1 {
+		return errors.New("spec.strategy.drain needs another node to move pods to, and this cluster has one node; create the Update without drain")
 	}
 	ordered := c.order(nodes)
 	if !u.Spec.AllowDowngrade {
@@ -213,11 +301,22 @@ func (c *Controller) order(nodes []corev1.Node) []*corev1.Node {
 	return out
 }
 
-// advance moves one node entry as far as it can go now. A returned error is
-// transient (an API call failed) unless it is a rollFailure.
+// advance moves one node entry as far as it can go now, reporting every phase
+// it passes through (one pass can go Pending, Cordoning, Draining,
+// Downloading). It writes e.Message without its last-progress time (roll adds
+// it). A returned error is transient (an API call failed) unless it is a
+// rollFailure.
 func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *updatesv1alpha1.UpdateNodeStatus, n *corev1.Node, now time.Time) error {
 	tag := u.Spec.Version
 	at := metav1.NewTime(now)
+	last, node := e.Phase, n
+	mark := func() {
+		if e.Phase != last {
+			c.transition(u, e, last, node)
+			last = e.Phase
+		}
+	}
+	defer mark()
 	if e.Phase == "" || e.Phase == updatesv1alpha1.UpdateNodePhasePending {
 		if n == nil {
 			e.Phase, e.Message, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, "the node no longer exists", &at
@@ -227,12 +326,13 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 			e.Phase, e.Message, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseSkipped, "already runs "+tag, &at
 			return nil
 		}
-		if err := c.ensureResolved(ctx, u); err != nil {
+		if err := c.ensureResolved(ctx, u, now); err != nil {
 			return err
 		}
 		e.From = fromRelease(n)
 		e.StartedAt = &at
 		e.Phase, e.Message = updatesv1alpha1.UpdateNodePhaseCordoning, "cordoning"
+		mark()
 	}
 	if n == nil {
 		e.Phase, e.Message, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, "the node was deleted during its update", &at
@@ -241,7 +341,6 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 	if e.StartedAt == nil {
 		e.StartedAt = &at
 	}
-	elapsed := now.Sub(e.StartedAt.Time)
 
 	handover := false
 	switch e.Phase {
@@ -249,7 +348,7 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 		if u.Spec.Cancel {
 			// Not handed over yet: the cancel lifts this node's cordon and the
 			// roll stops here.
-			if _, err := c.uncordon(ctx, n); err != nil {
+			if _, err := c.release(ctx, n); err != nil {
 				return err
 			}
 			e.Phase, e.Message, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseCancelled, "cancelled before the node was handed over", &at
@@ -263,13 +362,27 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 			handover = true
 			break
 		}
-		e.Phase = updatesv1alpha1.UpdateNodePhaseDraining
-		remaining, err := c.drain(ctx, n.Name)
+		if n.Name == c.cfg.ServerNode {
+			// The server is never drained: the install recreates its native
+			// pods on the new binary, and evicting them would only move the
+			// cluster's control-plane-adjacent pods for nothing.
+			handover = true
+			break
+		}
+		e.Phase, e.Message = updatesv1alpha1.UpdateNodePhaseDraining, "draining"
+		mark()
+		remaining, bare, err := c.drain(ctx, n.Name)
 		if err != nil {
 			return err
 		}
+		if len(bare) > 0 {
+			e.Phase, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, &at
+			e.Message = fmt.Sprintf("not drained: %d pods have no controller and would not come back: %s; move or delete them, then create a new Update",
+				len(bare), strings.Join(bare, ", "))
+			return nil
+		}
 		if len(remaining) > 0 {
-			if elapsed > c.cfg.DrainTimeout {
+			if now.Sub(e.StartedAt.Time) > c.cfg.DrainTimeout {
 				e.Phase, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, &at
 				e.Message = fmt.Sprintf("drain did not finish within %s; %d pods remain: %s",
 					c.cfg.DrainTimeout, len(remaining), strings.Join(remaining, ", "))
@@ -282,10 +395,11 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 	}
 	if handover {
 		var err error
-		if n, err = c.handover(ctx, u, n); err != nil {
+		if n, err = c.handover(ctx, u, n, now); err != nil {
 			return err
 		}
 		e.Phase, e.Message = updatesv1alpha1.UpdateNodePhaseDownloading, "handed to the node; waiting for it to report"
+		mark()
 	}
 	if !nodeSidePhase(e.Phase) {
 		return fmt.Errorf("unknown node phase %q", e.Phase)
@@ -294,10 +408,15 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 	if n.Annotations[updatesv1alpha1.AnnotationUpdateVersion] != tag {
 		// Someone moved the request; hand the node this Update's again.
 		var err error
-		if n, err = c.handover(ctx, u, n); err != nil {
+		if n, err = c.handover(ctx, u, n, now); err != nil {
 			return err
 		}
 	}
+	handedAt, ok := annotationTime(n, HandedOverAnnotation)
+	if !ok {
+		handedAt = e.StartedAt.Time
+	}
+	ready := nodeReady(n)
 	reported, msg := parsePhase(n.Annotations[updatesv1alpha1.AnnotationUpdatePhase])
 	switch {
 	case reported == updatesv1alpha1.UpdateNodePhaseFailed:
@@ -306,22 +425,67 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 		}
 		e.Phase, e.Message, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, msg, &at
 		return nil
-	case reported == updatesv1alpha1.UpdateNodePhaseDone && onTarget(n, tag):
-		if _, err := c.uncordon(ctx, n); err != nil {
-			return err
+	case reported == updatesv1alpha1.UpdateNodePhaseDone && onTarget(n, tag) && ready:
+		readyAt, settling := annotationTime(n, ReadyAtAnnotation)
+		if !settling {
+			var err error
+			if n, err = c.patchNode(ctx, n.Name, annotations(map[string]any{ReadyAtAnnotation: now.Format(time.RFC3339)})); err != nil {
+				return err
+			}
+			readyAt = now
 		}
-		e.Phase, e.Message, e.FinishedAt, e.To = updatesv1alpha1.UpdateNodePhaseDone, "", &at, tag
-		return nil
+		if now.Sub(readyAt) >= SettlePeriod {
+			if _, err := c.release(ctx, n); err != nil {
+				return err
+			}
+			e.Phase, e.Message, e.FinishedAt, e.To = updatesv1alpha1.UpdateNodePhaseDone, "runs "+tag, &at, tag
+			return nil
+		}
+		e.Message = fmt.Sprintf("runs %s and is Ready; settling until %s", tag, readyAt.Add(SettlePeriod).Format(time.RFC3339))
+	case reported == updatesv1alpha1.UpdateNodePhaseDone && onTarget(n, tag):
+		if _, settling := n.Annotations[ReadyAtAnnotation]; settling {
+			// It went NotReady while settling: the settle starts over.
+			if _, err := c.patchNode(ctx, n.Name, annotations(map[string]any{ReadyAtAnnotation: nil})); err != nil {
+				return err
+			}
+		}
+		e.Message = "runs " + tag + "; waiting for the node to be Ready"
 	case reported == updatesv1alpha1.UpdateNodePhaseDone:
 		e.Message = "the node reported Done; waiting for its kubeletVersion to carry " + tag
 	case nodeSidePhase(reported):
 		e.Phase, e.Message = reported, msg
 	}
-	if elapsed > c.cfg.NodeTimeout {
+	if !ready && !strings.Contains(e.Message, "NotReady") {
+		e.Message += "; the node is NotReady"
+	}
+	if now.Sub(handedAt) > c.cfg.NodeTimeout {
 		e.Phase, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, &at
-		e.Message = fmt.Sprintf("the node did not finish within %s (last: %s)", c.cfg.NodeTimeout, e.Message)
+		e.Message = fmt.Sprintf("the node did not finish within %s of its handover (last: %s)", c.cfg.NodeTimeout, e.Message)
 	}
 	return nil
+}
+
+// nodeReady reports whether the Node's Ready condition is True.
+func nodeReady(n *corev1.Node) bool {
+	for _, c := range n.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// annotationTime reads an RFC3339 time the controller recorded on the Node.
+func annotationTime(n *corev1.Node, key string) (time.Time, bool) {
+	v, ok := n.Annotations[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // nodeSidePhase reports whether p is a step the node-side reports while it
@@ -342,21 +506,31 @@ func parsePhase(v string) (updatesv1alpha1.UpdateNodePhase, string) {
 }
 
 // ensureResolved resolves the target once and records it in status.resolved.
-func (c *Controller) ensureResolved(ctx context.Context, u *updatesv1alpha1.Update) error {
+// A transient failure is retried for ResolveBound, counted from the first
+// failure (the Resolved condition's transition time, so the bound survives a
+// restart); past it the roll fails with the last error.
+func (c *Controller) ensureResolved(ctx context.Context, u *updatesv1alpha1.Update, now time.Time) error {
 	if r := u.Status.Resolved; r != nil && r.Version == u.Spec.Version && r.Digest != "" {
 		return nil
 	}
 	rel, err := c.cfg.Resolver.Resolve(ctx, u.Spec.Version)
-	if err != nil {
-		if errors.Is(err, ErrRelease) {
-			return rollFailure{fmt.Errorf("resolve %s: %w", u.Spec.Version, err)}
-		}
-		return fmt.Errorf("resolve %s: %w", u.Spec.Version, err)
+	if err == nil && !isSHA256Hex(rel.SHA256) {
+		err = fmt.Errorf("%w: malformed sha256", ErrRelease)
 	}
-	if !isSHA256Hex(rel.SHA256) {
-		return rollFailure{fmt.Errorf("resolve %s: %w: malformed sha256", u.Spec.Version, ErrRelease)}
+	if err != nil {
+		err = fmt.Errorf("resolve %s: %w", u.Spec.Version, err)
+		if errors.Is(err, ErrRelease) {
+			return rollFailure{err}
+		}
+		prev := meta.FindStatusCondition(u.Status.Conditions, ConditionResolved)
+		c.setCondition(u, ConditionResolved, metav1.ConditionFalse, ReasonRetrying, err.Error())
+		if prev != nil && prev.Status == metav1.ConditionFalse && now.Sub(prev.LastTransitionTime.Time) > ResolveBound {
+			return rollFailure{fmt.Errorf("the release did not resolve within %s; last error: %w", ResolveBound, err)}
+		}
+		return err
 	}
 	u.Status.Resolved = &updatesv1alpha1.UpdateResolved{Version: u.Spec.Version, Digest: "sha256:" + rel.SHA256}
+	c.setCondition(u, ConditionResolved, metav1.ConditionTrue, ReasonResolved, rel.URL+" sha256:"+rel.SHA256)
 	return nil
 }
 
@@ -384,19 +558,25 @@ func (c *Controller) payload(u *updatesv1alpha1.Update) (string, error) {
 }
 
 // handover asks the node for the release: the version and payload annotations
-// are set and any earlier phase report is cleared, in one patch.
-func (c *Controller) handover(ctx context.Context, u *updatesv1alpha1.Update, n *corev1.Node) (*corev1.Node, error) {
+// are set, any earlier phase report and settle mark are cleared, and the
+// handover time is recorded (the node timeout counts from it), in one patch.
+func (c *Controller) handover(ctx context.Context, u *updatesv1alpha1.Update, n *corev1.Node, now time.Time) (*corev1.Node, error) {
 	p, err := c.payload(u)
 	if err != nil {
 		return nil, err
 	}
-	return c.patchNode(ctx, n.Name, map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{
-			updatesv1alpha1.AnnotationUpdateVersion: u.Spec.Version,
-			updatesv1alpha1.AnnotationUpdatePayload: p,
-			updatesv1alpha1.AnnotationUpdatePhase:   nil,
-		}},
-	})
+	return c.patchNode(ctx, n.Name, annotations(map[string]any{
+		updatesv1alpha1.AnnotationUpdateVersion: u.Spec.Version,
+		updatesv1alpha1.AnnotationUpdatePayload: p,
+		updatesv1alpha1.AnnotationUpdatePhase:   nil,
+		HandedOverAnnotation:                    now.Format(time.RFC3339),
+		ReadyAtAnnotation:                       nil,
+	}))
+}
+
+// annotations is a merge patch of Node annotations (a nil value removes one).
+func annotations(a map[string]any) map[string]any {
+	return map[string]any{"metadata": map[string]any{"annotations": a}}
 }
 
 // cordon marks the node unschedulable, unless it already is (then the cordon
@@ -405,21 +585,21 @@ func (c *Controller) cordon(ctx context.Context, n *corev1.Node) (*corev1.Node, 
 	if n.Spec.Unschedulable {
 		return n, nil
 	}
-	return c.patchNode(ctx, n.Name, map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{CordonedAnnotation: "true"}},
-		"spec":     map[string]any{"unschedulable": true},
-	})
+	patch := annotations(map[string]any{CordonedAnnotation: "true"})
+	patch["spec"] = map[string]any{"unschedulable": true}
+	return c.patchNode(ctx, n.Name, patch)
 }
 
-// uncordon lifts a cordon this controller made, and only that.
-func (c *Controller) uncordon(ctx context.Context, n *corev1.Node) (*corev1.Node, error) {
-	if n.Annotations[CordonedAnnotation] != "true" {
-		return n, nil
+// release ends the controller's hold on a node: it removes the controller's
+// own annotations and lifts the cordon if the controller made it (an
+// operator's cordon stays). The update-version, -payload and -phase
+// annotations stay: they record what the node was asked for and reported.
+func (c *Controller) release(ctx context.Context, n *corev1.Node) (*corev1.Node, error) {
+	patch := annotations(map[string]any{CordonedAnnotation: nil, HandedOverAnnotation: nil, ReadyAtAnnotation: nil})
+	if n.Annotations[CordonedAnnotation] == "true" {
+		patch["spec"] = map[string]any{"unschedulable": false}
 	}
-	return c.patchNode(ctx, n.Name, map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{CordonedAnnotation: nil}},
-		"spec":     map[string]any{"unschedulable": false},
-	})
+	return c.patchNode(ctx, n.Name, patch)
 }
 
 func (c *Controller) patchNode(ctx context.Context, name string, patch map[string]any) (*corev1.Node, error) {
@@ -471,11 +651,14 @@ func (c *Controller) fail(u *updatesv1alpha1.Update, msg string) {
 
 // cancelFrom marks every entry from i on that has not started Cancelled and
 // ends the roll Cancelled.
-func (c *Controller) cancelFrom(u *updatesv1alpha1.Update, i int) {
+func (c *Controller) cancelFrom(u *updatesv1alpha1.Update, i int, nodes map[string]*corev1.Node) {
+	at := c.cfg.Now().UTC().Truncate(time.Second).Format(time.RFC3339)
 	for j := i; j < len(u.Status.Nodes); j++ {
 		e := &u.Status.Nodes[j]
 		if e.Phase == "" || e.Phase == updatesv1alpha1.UpdateNodePhasePending {
-			e.Phase, e.Message = updatesv1alpha1.UpdateNodePhaseCancelled, "cancelled before it started"
+			from := e.Phase
+			e.Phase, e.Message = updatesv1alpha1.UpdateNodePhaseCancelled, withProgress("cancelled before it started", at)
+			c.transition(u, e, from, nodes[e.Name])
 		}
 	}
 	msg := "spec.cancel stopped the roll"

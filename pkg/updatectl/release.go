@@ -38,7 +38,7 @@ const maxChecksumsBytes = 1 << 20
 
 // ErrRelease marks a definitive release-index failure: the tag is unusable,
 // the release or its checksums file does not exist, or the checksums file
-// names no darwin/arm64 archive. Retrying cannot fix it, so the roll fails.
+// names no darwin/arm64 archive (a 404, 403 or 410 included). Retrying cannot fix it, so the roll fails.
 // Every other resolve error (the network, a 5xx) is transient and retried.
 var ErrRelease = errors.New("release cannot be resolved")
 
@@ -143,6 +143,9 @@ func (r HTTPResolver) Resolve(ctx context.Context, tag string) (Release, error) 
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		return Release{}, fmt.Errorf("%w: %s: not found (has release %s been published?)", ErrRelease, sumsURL, vtag)
+	case resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusGone:
+		// A refused or withdrawn release does not come back by retrying.
+		return Release{}, fmt.Errorf("%w: %s: http %d", ErrRelease, sumsURL, resp.StatusCode)
 	case resp.StatusCode != http.StatusOK:
 		return Release{}, fmt.Errorf("fetch %s: http %d", sumsURL, resp.StatusCode)
 	}

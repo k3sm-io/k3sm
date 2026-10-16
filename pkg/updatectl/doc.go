@@ -42,25 +42,37 @@ limitations under the License.
 //   - The node is cordoned. A node an operator had already cordoned stays
 //     cordoned after the update: only a cordon this controller made (marked by
 //     the CordonedAnnotation) is lifted.
-//   - With Spec.Strategy.Drain, its pods are evicted through the eviction API,
-//     so PodDisruptionBudgets hold; DaemonSet-owned and mirror pods are left in
-//     place. A drain still blocked after the drain timeout fails the node.
+//   - With Spec.Strategy.Drain, a node other than the server is drained. Its
+//     pods are listed first: a pod with no controller owner would not come
+//     back, so the node fails with the list and nothing is evicted. The rest
+//     are evicted through the eviction API, so PodDisruptionBudgets hold;
+//     DaemonSet-owned, mirror and finished pods stay. A drain still blocked
+//     after the drain timeout fails the node. The server is never drained: the
+//     install recreates its native pods anyway. Drain on a one-node cluster is
+//     refused before anything starts.
 //   - The node is handed over: the Node annotations k3sm.io/update-version (the
 //     tag) and k3sm.io/update-payload (a JSON Payload: the archive URL, its
-//     sha256, the signature policy and the downgrade permission) are set and a
-//     stale k3sm.io/update-phase is cleared, in one patch.
-//   - The node-side applies the release and reports k3sm.io/update-phase. The
-//     controller mirrors the phase into status; Failed fails the node; Done
-//     together with a kubeletVersion carrying the target completes it, and the
-//     node is uncordoned. A node that has not completed within the node timeout
-//     (counted from the moment it left Pending) fails.
+//     sha256, the signature policy and the downgrade permission) are set, a
+//     stale k3sm.io/update-phase is cleared and the handover time is recorded,
+//     in one patch. The node timeout counts from the handover.
+//   - The node-side applies the release and reports k3sm.io/update-phase as
+//     "<phase>[: <message>]". The controller mirrors the phase into status;
+//     Failed fails the node. The node is done once it reports Done, its
+//     kubeletVersion carries the target and it is Ready, and has stayed so for
+//     SettlePeriod; then its cordon is lifted and the roll moves on.
+//
+// Every node phase transition is an Event on the Update and on the Node and an
+// Info log line; node messages and the Progressing condition end in "last
+// progress <RFC3339>". A transient release-index failure is retried for
+// ResolveBound, then fails the Update.
 //
 // A failed node stops the roll: status.phase is Failed, the failed node stays
-// cordoned for the operator, and every later node stays Pending. Spec.Cancel
-// lets a node that has been handed over finish, lifts the cordon of a node that
-// has not, and marks every node not started Cancelled; the Update ends
-// Cancelled. A finished Update (Succeeded, Failed or Cancelled) is never
-// resumed: Spec.Version is immutable, so a retry is a new "current".
+// cordoned with its annotations for the operator, and every later node stays
+// Pending. Spec.Cancel lets a node that has been handed over finish, lifts the
+// cordon of a node that has not, and marks every node not started Cancelled;
+// the Update ends Cancelled. A finished Update (Succeeded, Failed or
+// Cancelled) is never resumed: Spec.Version is immutable, so a retry is a new
+// "current".
 //
 // # Restart safety
 //
@@ -68,7 +80,8 @@ limitations under the License.
 // restarted controller resumes where the last one stopped. That restart is part
 // of the design, not an accident: the server updates itself last, through the
 // same node-side path, and its controller restarts on the new release while its
-// own entry is in progress. Timeouts count from status.nodes[].startedAt, which
-// survives the restart. On an HA control plane the controller runs under a
+// own entry is in progress. The timeouts and the settle count from
+// status.nodes[].startedAt and the controller's own Node annotations, which
+// survive the restart. On an HA control plane the controller runs under a
 // Lease, so one server rolls at a time.
 package updatectl

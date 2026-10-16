@@ -37,6 +37,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 )
@@ -85,6 +86,11 @@ type rig struct {
 
 	// failNodes report Failed with this message instead of Done.
 	failNodes map[string]string
+	// notReady nodes come back NotReady after they report Done.
+	notReady map[string]bool
+	// step is how far the clock moves between passes.
+	step     time.Duration
+	recorder *record.FakeRecorder
 }
 
 func node(name, kubelet string, server bool) *corev1.Node {
@@ -93,6 +99,7 @@ func node(name, kubelet string, server bool) *corev1.Node {
 		n.Labels[controlPlaneLabel] = "true"
 	}
 	n.Status.NodeInfo.KubeletVersion = kubelet
+	n.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
 	return n
 }
 
@@ -108,6 +115,9 @@ func newRig(t *testing.T, nodes ...*corev1.Node) *rig {
 		resolver:  &fakeResolver{},
 		now:       time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC),
 		failNodes: map[string]string{},
+		notReady:  map[string]bool{},
+		step:      10 * time.Second,
+		recorder:  record.NewFakeRecorder(10000),
 	}
 	// An empty scheme: the fake then stores the Updates as unstructured, as
 	// the apiserver serves them to a dynamic client.
@@ -153,7 +163,8 @@ func (r *rig) controller() *Controller {
 	r.t.Helper()
 	c, err := New(Config{
 		Client: r.cs, Dynamic: r.dyn, Resolver: r.resolver, ServerNode: serverName,
-		Now: func() time.Time { return r.now }, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now: func() time.Time { return r.now }, Recorder: r.recorder,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		r.t.Fatal(err)
@@ -237,6 +248,9 @@ func (r *rig) nodeSide() {
 			} else {
 				n.Annotations[updatesv1alpha1.AnnotationUpdatePhase] = string(updatesv1alpha1.UpdateNodePhaseDone)
 				n.Status.NodeInfo.KubeletVersion = newKubelet
+				if r.notReady[n.Name] {
+					n.Status.Conditions[0].Status = corev1.ConditionFalse
+				}
 			}
 		default:
 			continue
@@ -251,7 +265,7 @@ func (r *rig) nodeSide() {
 // singleton finishes or stop says so.
 func (r *rig) drive(c *Controller, stop func() bool) {
 	r.t.Helper()
-	for range 100 {
+	for range 1000 {
 		if _, err := c.reconcile(context.Background()); err != nil {
 			r.t.Fatalf("reconcile: %v", err)
 		}
@@ -259,9 +273,9 @@ func (r *rig) drive(c *Controller, stop func() bool) {
 			return
 		}
 		r.nodeSide()
-		r.now = r.now.Add(time.Second)
+		r.now = r.now.Add(r.step)
 	}
-	r.t.Fatal("the roll did not finish in 100 passes")
+	r.t.Fatal("the roll did not finish in 1000 passes")
 }
 
 func (r *rig) log() []string {
@@ -378,7 +392,7 @@ func TestRollingOrderWorkersThenServer(t *testing.T) {
 		if u.Status.Phase != updatesv1alpha1.UpdatePhaseFailed || !meta.IsStatusConditionTrue(u.Status.Conditions, ConditionFailed) {
 			t.Fatalf("phase %q conditions %+v", u.Status.Phase, u.Status.Conditions)
 		}
-		if msg := u.Status.Nodes[1].Message; msg != "disk full" {
+		if msg := u.Status.Nodes[1].Message; !strings.HasPrefix(msg, "disk full"+progressMark) {
 			t.Fatalf("w2 message %q", msg)
 		}
 		if c := meta.FindStatusCondition(u.Status.Conditions, ConditionFailed); !strings.Contains(c.Message, "w2: disk full") {
@@ -419,8 +433,7 @@ func TestRollingOrderWorkersThenServer(t *testing.T) {
 
 	t.Run("cancel before the handover lifts the cordon", func(t *testing.T) {
 		r := newRig(t, append(threeNodes(), podNode())...)
-		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: "w0"}}
-		if err := r.cs.Tracker().Add(pod); err != nil {
+		if err := r.cs.Tracker().Add(pod("held", "w0", owned)); err != nil {
 			t.Fatal(err)
 		}
 		r.cs.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {

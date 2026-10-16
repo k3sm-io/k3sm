@@ -623,9 +623,19 @@ func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.C
 	}()
 	return func() {
 		cancel()
-		<-done
+		// Bounded: a reconcile stuck on a hung apiserver call must not hold
+		// the server's shutdown; the drain of the other operators goes on.
+		select {
+		case <-done:
+		case <-time.After(updateControllerStopWait):
+			logger.Warn("update controller did not stop in time; continuing shutdown", "wait", updateControllerStopWait)
+		}
 	}
 }
+
+// updateControllerStopWait bounds how long the server's shutdown waits for the
+// update controller to return.
+const updateControllerStopWait = 30 * time.Second
 
 // startMLXOperator is step 4f: the MLX operator, which ensures the MLXModel CRD,
 // then reconciles each MLXModel into a StatefulSet plus its headless and ClusterIP

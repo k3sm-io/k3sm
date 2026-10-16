@@ -36,24 +36,38 @@ const mirrorPodAnnotation = "kubernetes.io/config.mirror"
 // still present, sorted as namespace/name. It never waits: the caller polls
 // until nothing remains or its timeout passes.
 //
+// Before any eviction it lists the bare pods (no controller owner): evicting
+// one deletes it for good, so drain returns them in bare and evicts nothing,
+// and the caller fails the node with the list rather than delete them.
+//
 // Evictions go through the eviction API, so a PodDisruptionBudget that cannot
 // lose a pod answers 429 and the pod stays for a later pass, as kubectl drain
 // retries it. DaemonSet-owned pods (the DaemonSet controller would recreate
 // them on the cordoned node regardless) and mirror pods are left in place, as
 // are pods that have already finished.
-func (c *Controller) drain(ctx context.Context, node string) ([]string, error) {
+func (c *Controller) drain(ctx context.Context, node string) (remaining, bare []string, err error) {
 	pods, err := c.cfg.Client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
 		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", node).String(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list pods on %s: %w", node, err)
+		return nil, nil, fmt.Errorf("list pods on %s: %w", node, err)
 	}
-	var remaining []string
+	var moved []*corev1.Pod
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.Spec.NodeName != node || !drained(p) {
 			continue
 		}
+		if metav1.GetControllerOf(p) == nil {
+			bare = append(bare, p.Namespace+"/"+p.Name)
+		}
+		moved = append(moved, p)
+	}
+	if len(bare) > 0 {
+		sort.Strings(bare)
+		return nil, bare, nil
+	}
+	for _, p := range moved {
 		key := p.Namespace + "/" + p.Name
 		if p.DeletionTimestamp != nil {
 			remaining = append(remaining, key) // already going
@@ -74,7 +88,7 @@ func (c *Controller) drain(ctx context.Context, node string) ([]string, error) {
 		}
 	}
 	sort.Strings(remaining)
-	return remaining, nil
+	return remaining, nil, nil
 }
 
 // drained reports whether a drain moves p.

@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,9 +34,12 @@ import (
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/client-go/tools/record"
 
 	crdconfig "k3sm.io/apis/config/crd"
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
@@ -58,6 +62,9 @@ const (
 	errorBackoff        = 10 * time.Second
 	crdRetry            = 5 * time.Second
 )
+
+// eventComponent is the Event source the controller records under.
+const eventComponent = "k3sm-update-controller"
 
 // updateResource is the Update GVR the dynamic client reads and writes.
 var updateResource = schema.GroupVersionResource{
@@ -92,6 +99,9 @@ type Config struct {
 	Poll time.Duration
 	// Now is the clock. nil means time.Now.
 	Now func() time.Time
+	// Recorder records the node phase Events on the Update and the Node. nil
+	// means Run builds one over Client.
+	Recorder record.EventRecorder
 	// Log is the structured logger. nil means slog.Default().
 	Log *slog.Logger
 }
@@ -99,7 +109,7 @@ type Config struct {
 // Controller reconciles the singleton Update.
 //
 // Concurrency: one loop goroutine runs every reconcile; the informers only
-// signal kick. No field is written after New, so none needs a lock.
+// signal kick. No field is written after Run starts, so none needs a lock.
 type Controller struct {
 	cfg  Config
 	log  *slog.Logger
@@ -162,6 +172,12 @@ func (c *Controller) Run(ctx context.Context) error {
 			case <-time.After(crdRetry):
 			}
 		}
+	}
+	if c.cfg.Recorder == nil {
+		b := record.NewBroadcaster()
+		b.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: c.cfg.Client.CoreV1().Events("")})
+		defer b.Shutdown()
+		c.cfg.Recorder = b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: eventComponent})
 	}
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta:  metav1.ObjectMeta{Name: LeaseName, Namespace: LeaseNamespace},
