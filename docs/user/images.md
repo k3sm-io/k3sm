@@ -118,6 +118,23 @@ either path; see [What runs](what-runs.md).
 > writes a portable artifact to a path you name, which is what you want for moving the image to
 > another node or a registry, and it is equally usable with other tools.
 
+### Build History: `k3sm build ls`
+
+Every `k3sm build` is recorded in your build history when it starts and again when it finishes,
+whichever path built it. The history keeps the newest 200 builds, in `~/.k3sm/builds`, readable by
+you alone.
+
+```sh
+k3sm build ls            # a table, newest first
+k3sm build ls -o json    # the records as a JSON array, newest first
+```
+
+The table shows each build's ID, status (`running`, `succeeded` or `failed`), tag, platform,
+engine (`native` or `engine`), start time and duration. The JSON records add the absolute
+Dockerfile and context paths, the finish time, the digest of the image recorded in this node's
+store on success, and the error text on failure, clipped to 1 KiB. A build interrupted before it
+finished stays `running`. If the history cannot be written, the build prints a warning and goes on.
+
 ### Deliberate Differences From `docker build`
 
 Each of these is a documented difference:
