@@ -45,9 +45,10 @@ import (
 //     (stagingtoken.go);
 //   - the staged version is a release version no lower than the installed one
 //     (unless --allow-downgrade; releaseversion.go);
-//   - the staged k3sm and every other Mach-O in the tree carry a Developer ID
-//     Application signature from one team, and on an update the installed
-//     /Library/k3sm/k3sm carries the same;
+//   - the tree's signing follows the installed build (checkSigningContinuity):
+//     a team-signed install takes only that team's Developer ID signature on
+//     every Mach-O, an ad-hoc signed install takes an ad-hoc tree or a
+//     team-signed one, and a first install takes only a team-signed tree;
 //   - with --require-team-signature, every Mach-O in the tree, the staged k3sm
 //     included, carries a valid Developer ID Application signature of its own
 //     team, judged on its own and not against the installed build.
@@ -364,20 +365,11 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 // It never consults the installed binary, so an ad-hoc signed installed build
 // does not relax it.
 func requireTeamSignatures(ctx context.Context, cfg Config, entries []StagedEntry) error {
-	paths := []string{cfg.Executable}
-	for _, e := range entries {
-		if !e.Mode.IsRegular() || e.Path == cfg.Executable {
-			continue
-		}
-		macho, err := cfg.StagingFS.MachO(e.Path)
-		if err != nil {
-			return fmt.Errorf("install: %w", untrusted("read %s: %v", e.Path, err))
-		}
-		if macho {
-			paths = append(paths, e.Path)
-		}
+	others, err := treeMachOs(cfg, entries)
+	if err != nil {
+		return err
 	}
-	for _, p := range paths {
+	for _, p := range append([]string{cfg.Executable}, others...) {
 		team, err := cfg.Signer.TeamID(ctx, p)
 		if err != nil {
 			return fmt.Errorf("install: --require-team-signature: %s: %w", p, err)
@@ -396,49 +388,134 @@ func (c Config) discardToken() {
 	}
 }
 
-// checkSigningContinuity proves the staged tree may replace what is installed.
-// The staged k3sm must carry a valid identity signature whose certificate is a
-// Developer ID Application certificate; every other Mach-O in the staged tree
-// (the helpers root runs and installs, the payload, the app's own executable)
-// must carry the same Team ID and the same kind of certificate; and on an
-// update the installed binary must too. An ad-hoc, unsigned or invalid
-// installed binary refuses, because nothing then ties the staged build to
-// whoever installed the current one. A first install has nothing installed to
-// compare: the installed binary's own signature is the record the next update
-// is checked against.
+// checkSigningContinuity proves the staged tree may replace what is installed,
+// and the installed build decides the rule:
+//
+//   - a team-signed install (a Developer ID Application signature) takes only
+//     a tree whose staged k3sm and every other Mach-O carry that same team's
+//     Developer ID Application signature, so an ad-hoc tree never replaces it;
+//   - an ad-hoc signed install takes either a tree signed by one Developer ID
+//     team (the staged k3sm's, on every Mach-O) or an ad-hoc tree, in which
+//     no Mach-O carries a team signature;
+//   - a first install, with nothing installed, takes only a team-signed tree:
+//     the installed binary's signature is the record the next update is
+//     checked against.
+//
+// "Ad-hoc" here is what TeamID reports as ErrNoTeamID: ad-hoc, unsigned or
+// failing verification. macOS on Apple Silicon refuses to run an unsigned or
+// invalid Mach-O, so such a tree installs a build that will not start rather
+// than one that runs unchecked. --require-team-signature
+// (requireTeamSignatures) refuses any tree without a team signature first,
+// whatever is installed.
 func checkSigningContinuity(ctx context.Context, cfg Config, entries []StagedEntry) error {
-	team, err := cfg.Signer.TeamID(ctx, cfg.Executable)
-	if err != nil {
-		return fmt.Errorf("install: read the signing Team ID of the staged %s: %w", cfg.Executable, err)
+	installed := cfg.installedBinary()
+	installedTeam, err := cfg.Signer.TeamID(ctx, installed)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		team, err := stagedTeam(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		if err := requireTreeTeam(ctx, cfg, entries, team); err != nil {
+			return err
+		}
+		cfg.Logger.Info("first install from a k3sm.app staging directory", "team-id", team)
+		return nil
+	case errors.Is(err, ErrNoTeamID):
+		team, err := cfg.Signer.TeamID(ctx, cfg.Executable)
+		switch {
+		case errors.Is(err, ErrNoTeamID):
+			if err := requireTreeAdHoc(ctx, cfg, entries); err != nil {
+				return err
+			}
+			cfg.Logger.Info("updating an ad-hoc signed install with an ad-hoc signed build")
+			return nil
+		case err != nil:
+			return fmt.Errorf("install: read the signing Team ID of the staged %s: %w", cfg.Executable, err)
+		}
+		if err := requireDeveloperID(ctx, cfg.Signer, cfg.Executable, team); err != nil {
+			return err
+		}
+		if err := requireTreeTeam(ctx, cfg, entries, team); err != nil {
+			return err
+		}
+		cfg.Logger.Info("updating an ad-hoc signed install with a team-signed build", "team-id", team)
+		return nil
+	case err != nil:
+		return fmt.Errorf("install: read the signing Team ID of the installed %s: %w", installed, err)
 	}
-	if err := requireDeveloperID(ctx, cfg.Signer, cfg.Executable, team); err != nil {
+	if err := requireDeveloperID(ctx, cfg.Signer, installed, installedTeam); err != nil {
 		return err
 	}
+	if err := requireTeam(ctx, cfg.Signer, cfg.Executable, installedTeam); err != nil {
+		return err
+	}
+	return requireTreeTeam(ctx, cfg, entries, installedTeam)
+}
+
+// stagedTeam is the Team ID of the staged k3sm's Developer ID Application
+// signature, or a refusal.
+func stagedTeam(ctx context.Context, cfg Config) (string, error) {
+	team, err := cfg.Signer.TeamID(ctx, cfg.Executable)
+	if err != nil {
+		return "", fmt.Errorf("install: read the signing Team ID of the staged %s: %w", cfg.Executable, err)
+	}
+	if err := requireDeveloperID(ctx, cfg.Signer, cfg.Executable, team); err != nil {
+		return "", err
+	}
+	return team, nil
+}
+
+// treeMachOs returns every regular file of the staged tree, other than the
+// staged k3sm, that is a Mach-O.
+func treeMachOs(cfg Config, entries []StagedEntry) ([]string, error) {
+	var out []string
 	for _, e := range entries {
 		if !e.Mode.IsRegular() || e.Path == cfg.Executable {
 			continue
 		}
 		macho, err := cfg.StagingFS.MachO(e.Path)
 		if err != nil {
-			return fmt.Errorf("install: %w", untrusted("read %s: %v", e.Path, err))
+			return nil, fmt.Errorf("install: %w", untrusted("read %s: %v", e.Path, err))
 		}
-		if !macho {
-			continue
+		if macho {
+			out = append(out, e.Path)
 		}
-		if err := requireTeam(ctx, cfg.Signer, e.Path, team); err != nil {
+	}
+	return out, nil
+}
+
+// requireTreeTeam refuses the tree unless every Mach-O other than the staged
+// k3sm carries team's Developer ID Application signature.
+func requireTreeTeam(ctx context.Context, cfg Config, entries []StagedEntry, team string) error {
+	paths, err := treeMachOs(cfg, entries)
+	if err != nil {
+		return err
+	}
+	for _, p := range paths {
+		if err := requireTeam(ctx, cfg.Signer, p, team); err != nil {
 			return err
 		}
 	}
-	installed := cfg.installedBinary()
-	if _, err := cfg.Signer.TeamID(ctx, installed); errors.Is(err, fs.ErrNotExist) {
-		cfg.Logger.Info("first install from a k3sm.app staging directory", "team-id", team)
-		return nil
-	}
-	if err := requireTeam(ctx, cfg.Signer, installed, team); err != nil {
-		if errors.Is(err, ErrNoTeamID) {
-			return fmt.Errorf("%w; run `sudo k3sm uninstall` and install again", err)
-		}
+	return nil
+}
+
+// requireTreeAdHoc refuses an ad-hoc staged tree in which some Mach-O carries
+// a team signature anyway: a tree is signed one way or the other.
+func requireTreeAdHoc(ctx context.Context, cfg Config, entries []StagedEntry) error {
+	paths, err := treeMachOs(cfg, entries)
+	if err != nil {
 		return err
+	}
+	for _, p := range paths {
+		team, err := cfg.Signer.TeamID(ctx, p)
+		switch {
+		case errors.Is(err, ErrNoTeamID):
+		case err != nil:
+			return fmt.Errorf("install: read the signing Team ID of %s: %w", p, err)
+		default:
+			return fmt.Errorf("install: %w: %s is signed by team %s and the staged k3sm is ad-hoc signed", ErrTeamIDMismatch, p, team)
+		}
 	}
 	return nil
 }

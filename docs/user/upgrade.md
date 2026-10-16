@@ -152,10 +152,14 @@ node:
    runs is refused unless the update allows a downgrade.
 3. Writes `Installing` and hands the unpacked set and its per-file checksums to the `k3sm-netd`
    root helper, which checks every file again and runs the new `k3sm install --from-staging`.
-   Under the `required` signature policy the installer is run with `--require-team-signature`,
-   so every binary must carry a Developer ID team signature whatever the installed build is
-   signed with.
-4. Writes `Restarting` while the installer restarts the daemons. The restarted daemon writes
+   That install updates the node in place: it keeps the node's role, the server a worker joined
+   and every argument the node was installed with.
+4. The signatures follow the installed build. A node installed from a build signed by a
+   Developer ID team takes only a release signed by that same team. A node installed from an
+   ad-hoc signed build takes an ad-hoc signed release or a team-signed one. Under the `required`
+   signature policy the installer runs with `--require-team-signature` and refuses any release
+   without a Developer ID team signature, whatever the node runs.
+5. Writes `Restarting` while the installer restarts the daemons. The restarted daemon writes
    `Done` once it runs the new release and its pod runtime answers, and the node's kubelet
    version reports it.
 

@@ -533,11 +533,12 @@ func TestReleaseVersionOrder(t *testing.T) {
 	}
 }
 
-// TestFromStagingTeamIDContinuity pins the signing continuity check: the
-// staged k3sm and every other Mach-O in the staged tree carry a Developer ID
-// Application signature from one team, an update needs the installed binary to
-// carry the same, and an ad-hoc, other-team or non-Developer ID signature
-// anywhere refuses. A non-Mach-O file needs no signature.
+// TestFromStagingTeamIDContinuity pins the signing continuity check, which
+// follows the installed build: a first install and a team-signed install take
+// only a tree whose every Mach-O carries one Developer ID team's signature (the
+// installed team on an update), so an ad-hoc tree never replaces a team-signed
+// install; an ad-hoc install takes an ad-hoc tree or a team-signed one, but not
+// a tree mixing the two. A non-Mach-O file needs no signature.
 func TestFromStagingTeamIDContinuity(t *testing.T) {
 	t.Parallel()
 	installed := Config{}.withDefaults().installedBinary()
@@ -552,8 +553,14 @@ func TestFromStagingTeamIDContinuity(t *testing.T) {
 		{name: "update by the same team", signer: fakeSigner{ids: signedTree(map[string]string{installed: testTeamID})}},
 		{name: "update over another team refused", want: ErrTeamIDMismatch,
 			signer: fakeSigner{ids: signedTree(map[string]string{installed: "ZZZZZ99999"})}},
-		{name: "ad-hoc installed binary refused", want: ErrTeamIDMismatch,
+		{name: "an ad-hoc install takes a team-signed tree",
 			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{installed: ErrNoTeamID}}},
+		{name: "an ad-hoc install takes an ad-hoc tree",
+			signer: fakeSigner{errs: adHocTree(installed)}},
+		{name: "an ad-hoc install refuses a tree mixing ad-hoc and team signatures", want: ErrTeamIDMismatch,
+			signer: fakeSigner{ids: map[string]string{helper: testTeamID}, errs: without(adHocTree(installed), helper)}},
+		{name: "a team-signed install refuses an ad-hoc tree", want: ErrTeamIDMismatch,
+			signer: fakeSigner{ids: map[string]string{installed: testTeamID}, errs: adHocTree()}},
 		{name: "installed binary signed Apple Development by the same team refused", want: ErrNotDeveloperID,
 			signer: fakeSigner{ids: signedTree(map[string]string{installed: testTeamID}), notDevID: map[string]bool{installed: true}}},
 		{name: "ad-hoc staged k3sm refused", want: ErrNoTeamID,
@@ -596,6 +603,22 @@ func TestFromStagingTeamIDContinuity(t *testing.T) {
 }
 
 var errSignatureUnreadable = errors.New("codesign failed")
+
+// without returns m less key.
+func without(m map[string]error, key string) map[string]error {
+	delete(m, key)
+	return m
+}
+
+// adHocTree reports every fixture Mach-O, and each extra path, as carrying no
+// Team ID: an ad-hoc signed tree.
+func adHocTree(extra ...string) map[string]error {
+	errs := map[string]error{}
+	for _, f := range append(stagedMachOs(), extra...) {
+		errs[f] = ErrNoTeamID
+	}
+	return errs
+}
 
 // TestStampedVersion pins how a binary's version is read from its build info.
 func TestStampedVersion(t *testing.T) {
@@ -990,6 +1013,8 @@ func TestRequireTeamSignature(t *testing.T) {
 			signer: fakeSigner{ids: signedTree(nil), errs: map[string]error{helper: ErrNoTeamID}}},
 		{name: "a helper signed Apple Development is refused", want: ErrNotDeveloperID,
 			signer: fakeSigner{ids: signedTree(nil), notDevID: map[string]bool{helper: true}}},
+		{name: "an ad-hoc tree over an ad-hoc install is refused", want: ErrNoTeamID,
+			signer: fakeSigner{errs: adHocTree(Config{}.withDefaults().installedBinary())}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
