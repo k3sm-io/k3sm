@@ -218,7 +218,7 @@ func serveResolverUDP(t *testing.T, r *clusterResolver) string {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- r.serveUDP(ctx, pc) }()
+	go func() { done <- r.serveUDP(ctx, pc, nil) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {

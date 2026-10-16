@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -192,6 +193,9 @@ type clusterResolver struct {
 	// pinned cluster Service CIDR.
 	podCIDR     netip.Prefix
 	serviceCIDR netip.Prefix
+	// udpDropped counts UDP queries dropped because udpInFlightMax handlers were
+	// already running.
+	udpDropped atomic.Uint64
 }
 
 // newClusterResolver builds the resolver for the DNS VIP and cluster domain over
@@ -216,52 +220,154 @@ func newClusterResolver(vip netip.Addr, domain string, zone dnsZone, fwd dnsForw
 	return r
 }
 
-// serveUDP answers datagram queries on pc until ctx is cancelled. Each datagram is
-// handled in its own goroutine (a forward may block on the upstream resolver) and
-// tracked so serveUDP drains in-flight handlers before returning — no goroutine
-// leak under -race. Cancelling ctx closes pc, which unblocks ReadFrom.
-func (r *clusterResolver) serveUDP(ctx context.Context, pc net.PacketConn) error {
-	go func() { <-ctx.Done(); _ = pc.Close() }()
+// udpDeadBurst empty reads inside udpDeadWindow mark the resolver's UDP socket
+// dead. A zero-byte datagram is legal on the wire and is never a DNS query (a query
+// carries a 12-byte header at least), so one is skipped without a handler; what a
+// healthy socket never does is return them back to back. A socket whose receive side
+// the kernel has shut (macOS SS_CANTRCVMORE: recvfrom returns 0 bytes, no error, no
+// source address, at once and forever) produces a burst of thousands per millisecond,
+// so the threshold trips within microseconds of the first one while a stray empty
+// datagram, or a few, stays harmless.
+const (
+	udpDeadBurst  = 8
+	udpDeadWindow = 100 * time.Millisecond
+)
 
+// udpInFlightMax bounds the UDP query handlers running at once. A handler can block
+// on the upstream forwarder for up to resolverQueryTimeout, so without a bound a
+// burst of datagrams (or a read loop gone wrong) becomes a goroutine per datagram.
+// A datagram arriving with every slot taken is dropped and counted: the client
+// retries, which is what a resolver under overload owes it.
+const udpInFlightMax = 256
+
+// errUDPSocketDead marks the end of serving one UDP socket because it stopped
+// receiving (a burst of empty reads, or a read error) rather than because the
+// resolver is shutting down.
+var errUDPSocketDead = errors.New("dns udp socket stopped receiving")
+
+// udpRebinder returns a fresh UDP socket on the DNS VIP. It retries until it has
+// one or ctx is done; an error means ctx is done.
+type udpRebinder func(ctx context.Context) (net.PacketConn, error)
+
+// serveUDP answers datagram queries on pc until ctx is cancelled. Each query is
+// handled in its own goroutine (a forward may block on the upstream resolver), at
+// most udpInFlightMax at once, and tracked so serveUDP drains in-flight handlers
+// before returning: no goroutine leak under -race. Cancelling ctx closes the
+// socket, which unblocks ReadFrom.
+//
+// A socket that stops receiving is replaced, not served to death: serveUDP logs it
+// once at Warn with the socket's receive buffer size, closes it, and takes a fresh
+// one from rebind (the DNS-VIP bind retry, which waits out a netd outage). With a
+// nil rebind it returns the errUDPSocketDead error instead. It returns nil on a
+// clean shutdown.
+func (r *clusterResolver) serveUDP(ctx context.Context, pc net.PacketConn, rebind udpRebinder) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	sem := make(chan struct{}, udpInFlightMax)
+
+	for {
+		err := r.serveUDPConn(ctx, pc, sem, &wg)
+		if err == nil || ctx.Err() != nil {
+			_ = pc.Close()
+			return nil
+		}
+		rcvbuf, known := socketRcvBuf(pc)
+		r.log.Warn("cluster DNS UDP socket stopped receiving; closing it and re-binding the DNS VIP",
+			"addr", pc.LocalAddr(), "reason", err, "so_rcvbuf", rcvbufAttr(rcvbuf, known))
+		_ = pc.Close()
+		if rebind == nil {
+			return err
+		}
+		next, rerr := rebind(ctx)
+		if rerr != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("re-bind dns udp socket: %w", rerr)
+		}
+		r.log.Info("cluster DNS UDP socket re-bound", "addr", next.LocalAddr())
+		pc = next
+	}
+}
+
+// serveUDPConn reads queries from one socket until ctx is cancelled (nil) or the
+// socket stops receiving (an errUDPSocketDead error). It never closes pc except on
+// cancellation; the caller owns that.
+func (r *clusterResolver) serveUDPConn(ctx context.Context, pc net.PacketConn, sem chan struct{}, wg *sync.WaitGroup) error {
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = pc.Close()
+		case <-stop:
+		}
+	}()
 
 	buf := make([]byte, 1500)
+	var empties int
+	var burstStart time.Time
 	for {
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil // clean shutdown (pc closed)
 			}
-			return fmt.Errorf("dns udp read: %w", err)
+			return fmt.Errorf("%w: read: %w", errUDPSocketDead, err)
+		}
+		if n == 0 {
+			now := time.Now()
+			if empties == 0 || now.Sub(burstStart) > udpDeadWindow {
+				empties, burstStart = 0, now
+			}
+			empties++
+			if empties >= udpDeadBurst {
+				return fmt.Errorf("%w: %d empty reads in %s", errUDPSocketDead, empties, now.Sub(burstStart))
+			}
+			continue
+		}
+		empties = 0
+		select {
+		case sem <- struct{}{}:
+		default:
+			if d := r.udpDropped.Add(1); d == 1 || d%1024 == 0 {
+				r.log.Warn("cluster DNS UDP query dropped: every handler slot is busy", "in-flight-max", udpInFlightMax, "dropped-total", d)
+			}
+			continue
 		}
 		query := make([]byte, n)
 		copy(query, buf[:n])
 		wg.Add(1)
 		go func(query []byte, addr net.Addr) {
 			defer wg.Done()
-			qctx, cancel := context.WithTimeout(ctx, resolverQueryTimeout)
-			defer cancel()
-			resp, negotiated, err := r.respond(qctx, query)
-			if err != nil {
-				r.log.Debug("dns udp respond", "err", err)
-				return
-			}
-			// resp already carries the response OPT (buildResponse adds it before
-			// this comparison), so the negotiated budget counts the OPT and an EDNS
-			// client near the boundary never receives a datagram over its advertised
-			// size (RFC 6891 §6.2.3).
-			if len(resp) > negotiated {
-				resp, err = truncateResponse(resp)
-				if err != nil {
-					r.log.Debug("dns udp truncate", "err", err)
-					return
-				}
-			}
-			if _, err := pc.WriteTo(resp, addr); err != nil {
-				r.log.Debug("dns udp write", "err", err)
-			}
+			defer func() { <-sem }()
+			r.answerUDP(ctx, pc, query, addr)
 		}(query, addr)
+	}
+}
+
+// answerUDP resolves one datagram query and writes the reply to addr on pc.
+func (r *clusterResolver) answerUDP(ctx context.Context, pc net.PacketConn, query []byte, addr net.Addr) {
+	qctx, cancel := context.WithTimeout(ctx, resolverQueryTimeout)
+	defer cancel()
+	resp, negotiated, err := r.respond(qctx, query)
+	if err != nil {
+		r.log.Debug("dns udp respond", "err", err)
+		return
+	}
+	// resp already carries the response OPT (buildResponse adds it before
+	// this comparison), so the negotiated budget counts the OPT and an EDNS
+	// client near the boundary never receives a datagram over its advertised
+	// size (RFC 6891 §6.2.3).
+	if len(resp) > negotiated {
+		resp, err = truncateResponse(resp)
+		if err != nil {
+			r.log.Debug("dns udp truncate", "err", err)
+			return
+		}
+	}
+	if _, err := pc.WriteTo(resp, addr); err != nil {
+		r.log.Debug("dns udp write", "err", err)
 	}
 }
 
@@ -1134,7 +1240,9 @@ func newDNSBinder(netdSocket string) dnsBinder {
 // root k3sm-netd daemon (the same daemon the Service proxy uses), so the resolver
 // runs unprivileged. The daemon admits the alias (the VIP is in the pinned Service
 // CIDR) and authorizes the <1024 bind (the kube-dns Service declares :53), then
-// passes the listening socket back via SCM_RIGHTS.
+// passes the listening socket back via SCM_RIGHTS. Each adopted socket is checked
+// for a flushed receive buffer (see errSocketCannotReceive) and refused if it has
+// one, so the bind retry asks netd for another.
 type helperDNSBinder struct {
 	client *wire.Client
 }
@@ -1153,6 +1261,10 @@ func (b *helperDNSBinder) listenTCP(ctx context.Context, addr netip.AddrPort) (n
 	if err != nil {
 		return nil, fmt.Errorf("adopt helper tcp socket %s: %w", addr, err)
 	}
+	if err := checkReceiving(ln); err != nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("adopt helper tcp socket %s: %w", addr, err)
+	}
 	return ln, nil
 }
 
@@ -1164,6 +1276,10 @@ func (b *helperDNSBinder) listenUDP(ctx context.Context, addr netip.AddrPort) (n
 	defer f.Close()
 	pc, err := net.FilePacketConn(f)
 	if err != nil {
+		return nil, fmt.Errorf("adopt helper udp socket %s: %w", addr, err)
+	}
+	if err := checkReceiving(pc); err != nil {
+		_ = pc.Close()
 		return nil, fmt.Errorf("adopt helper udp socket %s: %w", addr, err)
 	}
 	return pc, nil
