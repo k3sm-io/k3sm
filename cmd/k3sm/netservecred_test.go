@@ -26,6 +26,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/nodecred"
 )
 
@@ -180,4 +181,66 @@ func TestEnsureNetserveCredential(t *testing.T) {
 			t.Errorf("a failed fetch left a netserve kubeconfig behind (%v)", err)
 		}
 	})
+}
+
+// TestWorkerNetserveRotation pins the worker's in-process rotation: the
+// re-check is NetserveStatus, so a stored pair outside the margin is left alone
+// and one inside it is renewed with the node credential, persisted, and swapped
+// into the running client, at a fake "now" a day before its expiry.
+func TestWorkerNetserveRotation(t *testing.T) {
+	clusterCA, err := certs.NewCA("k3sm-cluster-ca")
+	if err != nil {
+		t.Fatalf("cluster CA: %v", err)
+	}
+	signing, err := certs.NewCA("k3sm-signing-ca")
+	if err != nil {
+		t.Fatalf("signing CA: %v", err)
+	}
+	const node = "worker-a"
+	const url = "https://100.64.0.1:6444"
+	store := nodeCredentialStore{dir: t.TempDir()}
+	oldCert, oldKey, err := signing.IssueNetserveClient(node, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	if err := store.saveNetserve(url, node, clusterCA.CertPEM, oldCert, oldKey); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	newCert, newKey, err := signing.IssueNetserveClient(node, 365*24*time.Hour)
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	fetches := 0
+	rot := workerNetserveRotation{
+		store: store, nodeName: node, apiserverURL: url,
+		res: &bootstrap.JoinResult{NodeName: node, ClusterCAPEM: clusterCA.CertPEM, ClientCAPEM: signing.CertPEM},
+		fetch: func(context.Context, *bootstrap.JoinResult, string) ([]byte, []byte, error) {
+			fetches++
+			return newCert, newKey, nil
+		},
+	}
+	cred, err := netserve.NewRotatingCredential(oldCert, oldKey, nil)
+	if err != nil {
+		t.Fatalf("credential: %v", err)
+	}
+	r := &netserve.Rotator{Credential: cred, Due: rot.due, Renew: rot.renew}
+
+	now := time.Now()
+	if r.Tick(context.Background(), now) || fetches != 0 {
+		t.Fatalf("renewed a pair 30 days from expiry (fetches %d)", fetches)
+	}
+	dayBefore := cred.NotAfter().Add(-nodecred.ExpiryMargin + time.Hour)
+	if !r.Tick(context.Background(), dayBefore) || fetches != 1 {
+		t.Fatalf("did not renew inside the margin (fetches %d)", fetches)
+	}
+	if got, _, err := store.reader().NetserveStatus(now, node, signing.CertPEM); got != nodecred.Valid || err != nil {
+		t.Fatalf("the renewed pair was not persisted: %v %v", got, err)
+	}
+	_, stored, _ := store.reader().NetserveStatus(now, node, signing.CertPEM)
+	if string(stored.CertPEM) != string(newCert) {
+		t.Error("the store still holds the old certificate after a renewal")
+	}
+	if !cred.NotAfter().After(dayBefore.Add(300 * 24 * time.Hour)) {
+		t.Error("the running client was not swapped to the renewed pair")
+	}
 }

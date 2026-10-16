@@ -171,7 +171,7 @@ func TestNewKubeClientResolution(t *testing.T) {
 		_, err := startWorkerNetserve(ctx, agentOptions{workDir: t.TempDir()},
 			&bootstrap.JoinResult{PodCIDR: "100.64.2.0/24", MeshIP: "100.64.2.1"},
 			hostnet.Mode{Backend: hostnet.BackendNone},
-			filepath.Join(t.TempDir(), "absent.kubeconfig"), quietLogger())
+			filepath.Join(t.TempDir(), "absent.kubeconfig"), workerNetserveRotation{}, quietLogger())
 		if err == nil {
 			t.Fatal("expected an error for a missing kubeconfig")
 		}
@@ -187,7 +187,7 @@ func TestNewKubeClientResolution(t *testing.T) {
 		_, err := startWorkerNetserve(ctx, agentOptions{workDir: t.TempDir()},
 			&bootstrap.JoinResult{PodCIDR: "100.64.2.0/24", MeshIP: "100.64.2.1"},
 			hostnet.Mode{Backend: hostnet.BackendNone},
-			kc, quietLogger())
+			kc, workerNetserveRotation{}, quietLogger())
 		if err == nil {
 			t.Fatal("expected an error for an unparseable kubeconfig")
 		}

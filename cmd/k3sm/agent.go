@@ -545,7 +545,9 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 		if err != nil {
 			return err
 		}
-		datapath, err = startWorkerNetserve(ctx, opts, res, mode, netserveKubeconfig, logger)
+		datapath, err = startWorkerNetserve(ctx, opts, res, mode, netserveKubeconfig, workerNetserveRotation{
+			store: store, nodeName: opts.nodeName, apiserverURL: apiserverURL, res: res, fetch: fetchNetserveCertFrom(joinHost),
+		}, logger)
 		if err != nil {
 			return err
 		}
@@ -1392,10 +1394,19 @@ func restConfigHost(cfg *rest.Config) string {
 // transport overrides (nodeTransportOverrides): the provider holds both halves of
 // a guest's two-address identity and this is the proxy that must learn the live
 // one.
-func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, netserveKubeconfig string, logger *slog.Logger) (*netserve.Server, error) {
-	_, cs, err := kubeclient.FromPath(netserveKubeconfig)
+//
+// The datapath's client presents its netserve certificate through a
+// netserve.RotatingCredential, and rot keeps that certificate in date in
+// process (startNetserveRotation): the datapath is never restarted for a
+// renewal, its connections are.
+func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, netserveKubeconfig string, rot workerNetserveRotation, logger *slog.Logger) (*netserve.Server, error) {
+	restCfg, _, err := kubeclient.FromPath(netserveKubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("load the netserve kubeconfig for the node-local datapath: %w", err)
+	}
+	cs, err := rot.start(ctx, restCfg, logger)
+	if err != nil {
+		return nil, fmt.Errorf("build the node-local datapath's netserve client: %w", err)
 	}
 	// The vm-capability question is asked HERE, before the datapath is built and
 	// before the VK node exists — through runtimed's own safe host probe, the same

@@ -54,6 +54,7 @@ import (
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/netserve"
+	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/provider"
@@ -672,7 +673,7 @@ func startServerDatapath(ctx context.Context, plan serverPlan, restCfg *rest.Con
 	// the signing CA, the identity a joined worker's datapath carries. Its reads
 	// are pkg/rbac's k3sm:netserve role and nothing more; only the kube-dns
 	// Service create rides the admin client (DNSServiceClient below).
-	netserveCS, err := serverNetserveClient(opts, restCfg, logger)
+	netserveCS, err := serverNetserveClient(ctx, opts, restCfg, logger)
 	if err != nil {
 		return nil, nodeOptions{}, err
 	}
@@ -1042,7 +1043,12 @@ func serverNodeRESTConfig(admin *rest.Config, h *certs.Hierarchy, nodeName strin
 // netserve identity (certs.NetserveSubject(nodeName)), minted in memory from the
 // signing CA on every boot, exactly as serverNodeRESTConfig mints the node
 // identity. The hierarchy is loaded the same way serverNodeOptions loads it.
-func serverNetserveClient(opts serverOptions, admin *rest.Config, logger *slog.Logger) (kubernetes.Interface, error) {
+//
+// The pair rides a netserve.RotatingCredential whose Rotator re-mints it from
+// the same signing CA within nodecred.ExpiryMargin of its expiry, until ctx
+// ends, so a server that runs longer than the identity's lifetime swaps it in
+// place rather than losing its datapath.
+func serverNetserveClient(ctx context.Context, opts serverOptions, admin *rest.Config, logger *slog.Logger) (kubernetes.Interface, error) {
 	h, err := certs.EnsureHierarchy(opts.workDir, opts.role(), opts.posture())
 	if err != nil {
 		return nil, fmt.Errorf("load the CA hierarchy for the server datapath's netserve identity: %w", err)
@@ -1056,7 +1062,19 @@ func serverNetserveClient(opts serverOptions, admin *rest.Config, logger *slog.L
 	} else {
 		return nil, fmt.Errorf("read back the server datapath's netserve identity: %w", err)
 	}
-	client, err := kubernetes.NewForConfig(cfg)
+	cred, err := netserve.NewRotatingCredential(cfg.CertData, cfg.KeyData, nil)
+	if err != nil {
+		return nil, fmt.Errorf("hold the server datapath's netserve identity: %w", err)
+	}
+	rot := &netserve.Rotator{
+		Credential: cred,
+		Margin:     nodecred.ExpiryMargin,
+		Renew: func(context.Context) ([]byte, []byte, error) {
+			return h.Signing.IssueNetserveClient(opts.nodeName, executor.ComponentCertValidity)
+		},
+		Logger: logger,
+	}
+	client, err := startNetserveClient(ctx, cred, rest.AnonymousClientConfig(cfg), rot)
 	if err != nil {
 		return nil, fmt.Errorf("build the server datapath's netserve client: %w", err)
 	}
