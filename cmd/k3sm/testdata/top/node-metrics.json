@@ -1,0 +1,12 @@
+{
+  "kind": "NodeMetricsList",
+  "apiVersion": "metrics.k8s.io/v1beta1",
+  "items": [
+    {
+      "metadata": {"name": "studio"},
+      "timestamp": "2026-10-16T11:59:51Z",
+      "window": "20s",
+      "usage": {"cpu": "1250000000n", "memory": "12582912Ki"}
+    }
+  ]
+}

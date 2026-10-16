@@ -49,6 +49,13 @@ Views:
   logs [job]  tail the daemons' log files; job is netd, server or agent — when
               omitted, the two this Mac is installed with (netd and the node
               daemon of its role)
+  top         CPU and memory by node and by pod, read from metrics-server
+              (metrics.k8s.io); a node it has not sampled says "no metrics
+              yet", and when the metrics API is unavailable the first line
+              says why and the tables show nodes and pods without usage.
+              With --watch the metrics API is read at most every 5s, whatever
+              the interval. Exits 0 when it read the cluster, 6 when it could
+              not
 
 Flags:
   -o text|json|wide   output format (default text; json is the machine interface)
@@ -57,6 +64,11 @@ Flags:
   --timeout 90s       how long --wait waits
   --watch[=2s]        re-render in place until interrupted (requires a terminal)
   --lines 50          how many log lines ` + "`status logs`" + ` prints per file
+  --sort cpu|memory   ` + "`status top`" + `: order the pod table by cpu (the default) or
+                      memory, then by the other
+  -n <namespace>      ` + "`status top`" + `: only the pods of this namespace (the node
+                      table stays cluster-wide)
+  --limit 20          ` + "`status top`" + `: how many pod rows to print; 0 prints all
   --datavol-label io.k3sm.datavol
                       the data-volume mount job the datavol row reads its last
                       exit code from (launchctl print system/<label>);
@@ -120,7 +132,21 @@ type statusOptions struct {
 	datavolLabel  string
 	datavolRecord string
 	datavolRoot   string
+	// topSort, topNamespace and topLimit shape `status top` and are refused
+	// with any other view.
+	topSort      string
+	topNamespace string
+	topLimit     int
 }
+
+// topOptions is the `status top` part of the command line.
+func (o statusOptions) topOptions() status.TopOptions {
+	return status.TopOptions{Sort: status.TopSort(o.topSort), Namespace: o.topNamespace, Limit: o.topLimit}
+}
+
+// topOnlyFlags are the flags only `status top` reads, by name, with the
+// spelling an error message quotes.
+var topOnlyFlags = []struct{ name, spelled string }{{"sort", "--sort"}, {"n", "-n"}, {"limit", "--limit"}}
 
 // checkDatavolScope refuses a partial --datavol-* set. The row's PRESENCE is
 // decided by the record and root, and its VERDICT by the label, so scoping only
@@ -200,7 +226,7 @@ func (w *watchFlag) Set(v string) error {
 func (w *watchFlag) IsBoolFlag() bool { return true }
 
 // statusViews are the accepted first positional arguments.
-var statusViews = map[string]bool{"daemons": true, "cluster": true, "logs": true}
+var statusViews = map[string]bool{"daemons": true, "cluster": true, "logs": true, "top": true}
 
 // statusLogTargets are the accepted `status logs` arguments. All three are
 // accepted on any Mac: naming a log this node does not have is a question with
@@ -227,10 +253,14 @@ func defaultLogTargets(role install.Role) []string {
 // the first non-flag argument, and a status verb that only accepted one of those
 // two orders would be a papercut on every use.
 func parseStatusArgs(args []string, errOut io.Writer) (statusOptions, error) {
-	o := statusOptions{format: "text", timeout: defaultWaitTimeout, lines: defaultLogLines}
+	o := statusOptions{format: "text", timeout: defaultWaitTimeout, lines: defaultLogLines,
+		topSort: string(status.TopSortCPU), topLimit: status.DefaultTopLimit}
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(errOut)
-	fs.Usage = func() { fmt.Fprint(errOut, statusUsage) }
+	// The flag package calls Usage on --help as well as on a bad flag. Help
+	// is printed by runStatus to stdout, so Usage is silent and a bad flag
+	// prints the usage below instead.
+	fs.Usage = func() {}
 
 	var watch watchFlag
 	fs.StringVar(&o.format, "o", o.format, "output format: text, json or wide")
@@ -239,6 +269,9 @@ func parseStatusArgs(args []string, errOut io.Writer) (statusOptions, error) {
 	fs.DurationVar(&o.timeout, "timeout", o.timeout, "how long --wait waits")
 	fs.IntVar(&o.lines, "lines", o.lines, "log lines per file for `status logs`")
 	fs.Var(&watch, "watch", "re-render in place every interval")
+	fs.StringVar(&o.topSort, "sort", o.topSort, "status top: order the pod table by cpu or memory")
+	fs.StringVar(&o.topNamespace, "n", "", "status top: only the pods of this namespace")
+	fs.IntVar(&o.topLimit, "limit", o.topLimit, "status top: pod rows to print, 0 for all")
 	// The --datavol-* defaults are empty and mean "the installed value" (see
 	// scopeDatavol); statusUsage prints the values they resolve to.
 	fs.StringVar(&o.datavolLabel, "datavol-label", "", "the data-volume mount job the datavol row reports on (default "+install.DatavolLabel+")")
@@ -251,14 +284,27 @@ func parseStatusArgs(args []string, errOut io.Writer) (statusOptions, error) {
 		args = args[1:]
 	}
 	if err := fs.Parse(args); err != nil {
+		// --help on a real view (or on none) is a request, answered with exit
+		// 0 by runStatus; the app probes `status top --help` that way to learn
+		// the view exists. --help on an unknown view stays a usage error.
+		if errors.Is(err, flag.ErrHelp) {
+			if len(positional) > 0 && !statusViews[positional[0]] {
+				fmt.Fprint(errOut, statusUsage)
+				return o, fmt.Errorf("unknown view %q — expected daemons, cluster, logs or top", positional[0])
+			}
+			return o, err
+		}
+		fmt.Fprint(errOut, statusUsage)
 		return o, err
 	}
 	positional = append(positional, fs.Args()...)
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	o.watch = watch.d
 
 	if len(positional) > 0 {
 		if !statusViews[positional[0]] {
-			return o, fmt.Errorf("unknown view %q — expected daemons, cluster or logs", positional[0])
+			return o, fmt.Errorf("unknown view %q — expected daemons, cluster, logs or top", positional[0])
 		}
 		o.view = positional[0]
 		positional = positional[1:]
@@ -287,7 +333,41 @@ func parseStatusArgs(args []string, errOut io.Writer) (statusOptions, error) {
 	if err := o.checkDatavolScope(); err != nil {
 		return o, err
 	}
+	if err := o.checkTop(set); err != nil {
+		return o, err
+	}
+	if o.view != "top" {
+		o.topSort, o.topLimit = "", 0
+	}
 	return o, nil
+}
+
+// checkTop validates the `status top` flags, and refuses them with any other
+// view, where they would be silently ignored.
+func (o statusOptions) checkTop(set map[string]bool) error {
+	if o.view != "top" {
+		for _, f := range topOnlyFlags {
+			if set[f.name] {
+				return fmt.Errorf("%s applies to `status top` only", f.spelled)
+			}
+		}
+		return nil
+	}
+	switch status.TopSort(o.topSort) {
+	case status.TopSortCPU, status.TopSortMemory:
+	default:
+		return fmt.Errorf("unknown --sort %q — expected cpu or memory", o.topSort)
+	}
+	if o.topLimit < 0 {
+		return fmt.Errorf("--limit must be 0 (all) or positive, got %d", o.topLimit)
+	}
+	if o.format == "wide" {
+		return errors.New("`status top` prints text or json, not wide")
+	}
+	if o.wait {
+		return errors.New("--wait does not apply to `status top`; use --watch")
+	}
+	return nil
 }
 
 // statusRunner is the command with every side effect injected: where output
@@ -315,6 +395,9 @@ type statusRunner struct {
 	// installed as. An empty list means the control-plane default, so a runner
 	// assembled without one still tails something rather than nothing.
 	logTargets []string
+	// top reads one frame of `status top`. The production one keeps its
+	// metrics sample between --watch frames (status.TopCollector).
+	top func(context.Context, status.TopOptions) status.TopReport
 	// appPresent reports whether k3sm.app is installed. When it reports
 	// false, the human output ends with appHint; the JSON never carries it.
 	// Nil prints no hint.
@@ -356,8 +439,38 @@ func (r statusRunner) snapshot(ctx context.Context, o statusOptions) (status.Ver
 		rep := r.probe()
 		return rep.Verdict, func() int { return r.emitJSON(rep, rep.Verdict) }
 	}
+	if o.view == "top" {
+		return r.snapshotTop(ctx, o)
+	}
 	rep := r.collect(ctx)
 	return rep.Verdict, func() int { return r.emit(rep, o) }
+}
+
+// snapshotTop reads one `status top` frame. Its exit code is not a cluster
+// verdict: 0 when the nodes and pods were read (with or without metrics), the
+// unknown code when they could not be.
+func (r statusRunner) snapshotTop(ctx context.Context, o statusOptions) (status.Verdict, func() int) {
+	if r.top == nil {
+		return status.VerdictUnknown, func() int {
+			fmt.Fprintln(r.errOut, "k3sm status: the top view is not wired")
+			return exitInternalError
+		}
+	}
+	rep := r.top(ctx, o.topOptions())
+	verdict := status.VerdictRunning
+	if rep.ClusterError != "" {
+		verdict = status.VerdictUnknown
+	}
+	return verdict, func() int {
+		if o.format == "json" {
+			return r.emitJSON(rep, verdict)
+		}
+		if _, err := io.WriteString(r.out, status.RenderTop(rep, status.Style{Color: r.color})); err != nil {
+			fmt.Fprintln(r.errOut, "k3sm status: write report:", err)
+			return exitInternalError
+		}
+		return verdict.ExitCode()
+	}
 }
 
 // emitJSON writes one JSON document and returns the verdict's exit code. The
@@ -505,6 +618,17 @@ func (r statusRunner) runLogs(o statusOptions) int {
 	return code
 }
 
+// statusArgsExit answers a command line parseStatusArgs refused: --help
+// prints the usage to stdout and exits 0, anything else is a usage error.
+func statusArgsExit(err error, out, errOut io.Writer) int {
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Fprint(out, statusUsage)
+		return 0
+	}
+	fmt.Fprintln(errOut, "k3sm status:", err)
+	return exitUsage
+}
+
 // runStatus is the `k3sm status` entry point. It returns the process exit code
 // and prints its own errors, because the exit code IS the verdict here — the
 // generic "print the error and exit 1" wrapper the other verbs use would
@@ -516,10 +640,7 @@ func runStatus(args []string) int {
 	}
 	o, err := parseStatusArgs(args, os.Stderr)
 	if err != nil {
-		if !errors.Is(err, flag.ErrHelp) {
-			fmt.Fprintln(os.Stderr, "k3sm status:", err)
-		}
-		return exitUsage
+		return statusArgsExit(err, os.Stdout, os.Stderr)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

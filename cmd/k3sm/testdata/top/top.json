@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "timestamp": "2026-10-16T12:00:00Z",
+  "metrics": {
+    "available": true
+  },
+  "sort": "cpu",
+  "limit": 3,
+  "nodes": [
+    {
+      "name": "laptop",
+      "role": "agent",
+      "sampled": false,
+      "cpu": {
+        "usedMillicores": null,
+        "allocatableMillicores": 8000,
+        "percent": null
+      },
+      "memory": {
+        "usedBytes": null,
+        "allocatableBytes": 8589934592,
+        "percent": null
+      },
+      "pods": 2,
+      "sampleAgeSeconds": null
+    },
+    {
+      "name": "studio",
+      "role": "server",
+      "sampled": true,
+      "cpu": {
+        "usedMillicores": 1250,
+        "allocatableMillicores": 20000,
+        "percent": 6
+      },
+      "memory": {
+        "usedBytes": 12884901888,
+        "allocatableBytes": 68719476736,
+        "percent": 18
+      },
+      "pods": 2,
+      "sampleAgeSeconds": 9
+    }
+  ],
+  "podsTotal": 5,
+  "pods": [
+    {
+      "namespace": "default",
+      "name": "web-1",
+      "node": "studio",
+      "sampled": true,
+      "cpuMillicores": 120,
+      "memoryBytes": 268435456,
+      "restarts": 3
+    },
+    {
+      "namespace": "kube-system",
+      "name": "metrics-server-5f8b",
+      "node": "laptop",
+      "sampled": true,
+      "cpuMillicores": 6,
+      "memoryBytes": 314572800,
+      "restarts": 0
+    },
+    {
+      "namespace": "kube-system",
+      "name": "coredns-7c5d",
+      "node": "studio",
+      "sampled": true,
+      "cpuMillicores": 3,
+      "memoryBytes": 22020096,
+      "restarts": 1
+    }
+  ]
+}

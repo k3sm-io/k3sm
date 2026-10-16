@@ -1,0 +1,44 @@
+{
+  "kind": "PodList",
+  "apiVersion": "v1",
+  "items": [
+    {
+      "metadata": {"namespace": "kube-system", "name": "coredns-7c5d"},
+      "spec": {"nodeName": "studio", "containers": [{"name": "coredns"}]},
+      "status": {"phase": "Running", "containerStatuses": [{"name": "coredns", "restartCount": 1}]}
+    },
+    {
+      "metadata": {"namespace": "default", "name": "web-1"},
+      "spec": {
+        "nodeName": "studio",
+        "initContainers": [{"name": "proxy", "restartPolicy": "Always"}, {"name": "setup"}],
+        "containers": [{"name": "app"}]
+      },
+      "status": {
+        "phase": "Running",
+        "initContainerStatuses": [{"name": "proxy", "restartCount": 2}, {"name": "setup", "restartCount": 5}],
+        "containerStatuses": [{"name": "app", "restartCount": 1}]
+      }
+    },
+    {
+      "metadata": {"namespace": "default", "name": "web-2"},
+      "spec": {"nodeName": "laptop", "containers": [{"name": "app"}]},
+      "status": {"phase": "Running", "containerStatuses": [{"name": "app", "restartCount": 0}]}
+    },
+    {
+      "metadata": {"namespace": "kube-system", "name": "metrics-server-5f8b"},
+      "spec": {"nodeName": "laptop", "containers": [{"name": "metrics-server"}]},
+      "status": {"phase": "Running", "containerStatuses": [{"name": "metrics-server", "restartCount": 0}]}
+    },
+    {
+      "metadata": {"namespace": "default", "name": "batch-done"},
+      "spec": {"nodeName": "studio", "containers": [{"name": "job"}]},
+      "status": {"phase": "Succeeded"}
+    },
+    {
+      "metadata": {"namespace": "default", "name": "pending-1"},
+      "spec": {"containers": [{"name": "app"}]},
+      "status": {"phase": "Pending"}
+    }
+  ]
+}

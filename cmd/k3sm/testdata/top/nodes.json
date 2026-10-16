@@ -1,0 +1,14 @@
+{
+  "kind": "NodeList",
+  "apiVersion": "v1",
+  "items": [
+    {
+      "metadata": {"name": "studio", "labels": {"node-role.kubernetes.io/control-plane": "true"}},
+      "status": {"allocatable": {"cpu": "20", "memory": "64Gi", "pods": "110"}}
+    },
+    {
+      "metadata": {"name": "laptop"},
+      "status": {"allocatable": {"cpu": "8", "memory": "8Gi", "pods": "110"}}
+    }
+  ]
+}

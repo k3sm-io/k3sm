@@ -1,0 +1,27 @@
+{
+  "kind": "PodMetricsList",
+  "apiVersion": "metrics.k8s.io/v1beta1",
+  "items": [
+    {
+      "metadata": {"namespace": "kube-system", "name": "coredns-7c5d"},
+      "timestamp": "2026-10-16T11:59:50Z",
+      "window": "20s",
+      "containers": [{"name": "coredns", "usage": {"cpu": "3m", "memory": "21Mi"}}]
+    },
+    {
+      "metadata": {"namespace": "default", "name": "web-1"},
+      "timestamp": "2026-10-16T11:59:50Z",
+      "window": "20s",
+      "containers": [
+        {"name": "app", "usage": {"cpu": "100m", "memory": "200Mi"}},
+        {"name": "proxy", "usage": {"cpu": "20m", "memory": "56Mi"}}
+      ]
+    },
+    {
+      "metadata": {"namespace": "kube-system", "name": "metrics-server-5f8b"},
+      "timestamp": "2026-10-16T11:59:50Z",
+      "window": "20s",
+      "containers": [{"name": "metrics-server", "usage": {"cpu": "5123456n", "memory": "300Mi"}}]
+    }
+  ]
+}
