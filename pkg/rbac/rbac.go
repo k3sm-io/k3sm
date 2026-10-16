@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -30,6 +31,7 @@ import (
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	netv1 "k3sm.io/apis/net/v1"
 
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
@@ -127,7 +129,123 @@ func ensureGraph(ctx context.Context, cs kubernetes.Interface) error {
 	if err := ensureInPodReaderRBAC(ctx, cs, ConformanceNamespace, ConformanceServiceAccount); err != nil {
 		return err
 	}
-	return ensureRegistryAdvertReaderRBAC(ctx, cs)
+	if err := ensureRegistryAdvertReaderRBAC(ctx, cs); err != nil {
+		return err
+	}
+	return ensureNetserveRBAC(ctx, cs)
+}
+
+// NetserveRole names the ClusterRole and the ClusterRoleBinding that grant the
+// netserve identity (certs.NetserveGroup) its reads.
+const NetserveRole = "k3sm:netserve"
+
+// netserveRules is the netserve ClusterRole's whole grant: get, list and watch,
+// cluster-wide, on exactly the five resources a node's datapath reads. services
+// and endpointslices feed the Service proxy and the cluster DNS zone; namespaces,
+// networkpolicies and pods feed the NetworkPolicy watcher. pods is cluster-wide
+// on purpose: a policy's peer selector names pods on every node, and a watcher
+// that saw only its own node's pods could not resolve a cross-node peer (the
+// Node authorizer's scope is exactly that blind spot).
+//
+// It is read-only. There is no create (the kube-dns Service is the server's to
+// provision, under its own identity), and no secrets, configmaps or nodes: none
+// is read by the datapath, and each would be a confidentiality or a node-identity
+// grant the netserve identity has no consumer for. TestWorkerNodeGrantsAreProvisionedAndMinimal
+// pins the set.
+func netserveRules() []rbacv1.PolicyRule {
+	read := func(group string, resources ...string) rbacv1.PolicyRule {
+		return rbacv1.PolicyRule{APIGroups: []string{group}, Resources: resources, Verbs: []string{"get", "list", "watch"}}
+	}
+	return []rbacv1.PolicyRule{
+		read("", "services", "namespaces", "pods"),
+		read("discovery.k8s.io", "endpointslices"),
+		read("networking.k8s.io", "networkpolicies"),
+	}
+}
+
+// ensureNetserveRBAC provisions the k3sm:netserve ClusterRole (netserveRules)
+// and its ClusterRoleBinding to the k3sm:netservers group: the grant every
+// node's datapath runs under, the k3s system:k3s-controller shape.
+//
+// Unlike the grants above it is CREATE-OR-UPDATE: a Get by name, then a Create
+// when absent, or an Update when the rules, the subjects or the managed label
+// have drifted. The set is pinned and narrow, so a drifted copy (an operator
+// edit, an older build's shape) is repaired to it on the next server start rather
+// than trusted because the name exists. A binding whose roleRef drifted is
+// deleted and re-created, because roleRef is immutable. The Get is authoritative
+// by name, never a LIST (see doc.go).
+func ensureNetserveRBAC(ctx context.Context, cs kubernetes.Interface) error {
+	api := cs.RbacV1()
+
+	want := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: NetserveRole, Labels: managedLabels()},
+		Rules:      netserveRules(),
+	}
+	have, err := api.ClusterRoles().Get(ctx, NetserveRole, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		if _, err := api.ClusterRoles().Create(ctx, want, metav1.CreateOptions{}); err != nil {
+			return fmt.Errorf("create the netserve cluster role: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("get the netserve cluster role: %w", err)
+	case !equality.Semantic.DeepEqual(have.Rules, want.Rules) || !hasManagedLabel(have.Labels) || have.AggregationRule != nil:
+		upd := have.DeepCopy()
+		upd.Rules = want.Rules
+		upd.AggregationRule = nil
+		upd.Labels = withManagedLabel(upd.Labels)
+		if _, err := api.ClusterRoles().Update(ctx, upd, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("repair the netserve cluster role: %w", err)
+		}
+	}
+
+	wantBinding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: NetserveRole, Labels: managedLabels()},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: NetserveRole},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: "Group", Name: certs.NetserveGroup}},
+	}
+	haveBinding, err := api.ClusterRoleBindings().Get(ctx, NetserveRole, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		if _, err := api.ClusterRoleBindings().Create(ctx, wantBinding, metav1.CreateOptions{}); err != nil {
+			return fmt.Errorf("create the netserve cluster role binding: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("get the netserve cluster role binding: %w", err)
+	case haveBinding.RoleRef != wantBinding.RoleRef:
+		if err := api.ClusterRoleBindings().Delete(ctx, NetserveRole, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete the netserve cluster role binding to re-create its roleRef: %w", err)
+		}
+		if _, err := api.ClusterRoleBindings().Create(ctx, wantBinding, metav1.CreateOptions{}); err != nil {
+			return fmt.Errorf("re-create the netserve cluster role binding: %w", err)
+		}
+	case !equality.Semantic.DeepEqual(haveBinding.Subjects, wantBinding.Subjects) || !hasManagedLabel(haveBinding.Labels):
+		upd := haveBinding.DeepCopy()
+		upd.Subjects = wantBinding.Subjects
+		upd.Labels = withManagedLabel(upd.Labels)
+		if _, err := api.ClusterRoleBindings().Update(ctx, upd, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("repair the netserve cluster role binding: %w", err)
+		}
+	}
+	return nil
+}
+
+// hasManagedLabel reports whether labels carry k3sm.io/managed=true.
+func hasManagedLabel(labels map[string]string) bool {
+	return labels["k3sm.io/managed"] == "true"
+}
+
+// withManagedLabel returns a copy of labels with k3sm.io/managed=true set,
+// keeping any other label an operator added.
+func withManagedLabel(labels map[string]string) map[string]string {
+	out := make(map[string]string, len(labels)+1)
+	for k, v := range labels {
+		out[k] = v
+	}
+	for k, v := range managedLabels() {
+		out[k] = v
+	}
+	return out
 }
 
 // ensureNodeDatapathRBAC provisions the node-datapath ClusterRole + its

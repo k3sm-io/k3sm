@@ -1,6 +1,56 @@
 [
   {
     "kind": "ClusterRole",
+    "name": "k3sm:netserve",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "rules": [
+      {
+        "verbs": [
+          "get",
+          "list",
+          "watch"
+        ],
+        "apiGroups": [
+          ""
+        ],
+        "resources": [
+          "services",
+          "namespaces",
+          "pods"
+        ]
+      },
+      {
+        "verbs": [
+          "get",
+          "list",
+          "watch"
+        ],
+        "apiGroups": [
+          "discovery.k8s.io"
+        ],
+        "resources": [
+          "endpointslices"
+        ]
+      },
+      {
+        "verbs": [
+          "get",
+          "list",
+          "watch"
+        ],
+        "apiGroups": [
+          "networking.k8s.io"
+        ],
+        "resources": [
+          "networkpolicies"
+        ]
+      }
+    ]
+  },
+  {
+    "kind": "ClusterRole",
     "name": "k3sm:node-datapath",
     "labels": {
       "k3sm.io/managed": "true"
@@ -44,6 +94,25 @@
         "resources": [
           "meshpeers"
         ]
+      }
+    ]
+  },
+  {
+    "kind": "ClusterRoleBinding",
+    "name": "k3sm:netserve",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "roleRef": {
+      "apiGroup": "rbac.authorization.k8s.io",
+      "kind": "ClusterRole",
+      "name": "k3sm:netserve"
+    },
+    "subjects": [
+      {
+        "kind": "Group",
+        "apiGroup": "rbac.authorization.k8s.io",
+        "name": "k3sm:netservers"
       }
     ]
   },

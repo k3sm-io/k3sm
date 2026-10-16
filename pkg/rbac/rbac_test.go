@@ -161,15 +161,15 @@ func TestRBACProvisionIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list cluster roles: %v", err)
 	}
-	if len(roles.Items) != 1 || roles.Items[0].Name != nodeDatapathRole {
-		t.Errorf("cluster roles = %d %v, want exactly [%s]", len(roles.Items), names(roles.Items), nodeDatapathRole)
+	if got, want := names(roles.Items), []string{NetserveRole, nodeDatapathRole}; !sameSet(got, want) {
+		t.Errorf("cluster roles = %d %v, want exactly %v", len(roles.Items), got, want)
 	}
 	bindings, err := cs.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list cluster role bindings: %v", err)
 	}
-	if len(bindings.Items) != 1 {
-		t.Errorf("cluster role bindings = %d, want exactly 1 (no default-role mutation)", len(bindings.Items))
+	if len(bindings.Items) != 2 {
+		t.Errorf("cluster role bindings = %d, want exactly 2, node-datapath and netserve (no default-role mutation)", len(bindings.Items))
 	}
 	assertNoSystemObjects(t, cs)
 }

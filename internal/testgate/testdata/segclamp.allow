@@ -21,6 +21,7 @@ pkg/executor/supervised.go tcpReady net.Dialer{} # readiness dial of a child com
 pkg/registrysvc/service.go Service.await net.Dialer{} # readiness dial of the registry child; validateBind admits loopback only
 pkg/registrysvc/relay.go newRelay net.Dialer{} # relay's upstream is the registry's 127.0.0.1 listener; the relay listener itself is clamped
 cmd/k3sm/certificate.go probeAPIServerServing http.Transport{} # healthz probe of the local apiserver at 127.0.0.1
+pkg/netserve/credential.go RotatingCredential.RESTConfig http.Transport{} # dials only through the credential's connrotation dialer, which wraps tcpseg.Dialer (NewRotatingCredential)
 
 # Bind probes: the listener is closed at once and never accepts.
 pkg/executor/portguard.go preflightDatastorePort net.Listen # 127.0.0.1 bind probe, closed immediately

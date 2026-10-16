@@ -179,6 +179,59 @@ for the cluster the node is already in is ignored, so leaving one in a start scr
 The node certificate an agent receives at join is valid for one year. Nothing renews it in place, so
 renewing it means rejoining with a fresh token before it expires.
 
+### The datapath identity
+
+Each node's Service proxy, cluster DNS resolver and NetworkPolicy watcher talk to the apiserver as
+their own identity, not as the node: a client certificate with the user `k3sm:netserve:<node>` in
+the group `k3sm:netservers`, signed by the cluster's client CA. The server binds that group to the
+`k3sm:netserve` ClusterRole, which can get, list and watch Services, EndpointSlices, Namespaces,
+NetworkPolicies and Pods across the cluster, and nothing else. This is the shape k3s gives its agent
+controllers (`system:k3s-controller`).
+
+What that read covers, so you can judge what a compromised node exposes:
+
+- Every Pod spec in every namespace, including literal environment values, command arguments, image
+  names, and the names of the Secrets and ConfigMaps a Pod refers to. Put sensitive values in a
+  Secret rather than inline in a Pod spec.
+- Never the value of a Secret or a ConfigMap: the role has no access to either.
+- No Pod logs, no `exec`, `attach` or port-forward, and no write of any kind. It cannot create a
+  Service, change a Node or read the Node objects.
+
+An agent receives the certificate when it joins, beside its node certificate, and stores it as
+`netserve.kubeconfig` in its work dir with the same `0600` mode. An agent that joined before this
+identity existed, or whose copy is missing or about to expire, asks the server for a new one,
+authenticating with its node certificate. The server issues it only for that node's own name, at most
+five times in a row and then once a minute per node, and never for longer than the node certificate
+has left. A worker upgraded in place therefore picks up the identity on its first start after the
+upgrade and needs no new token. The server's own datapath mints the same identity in memory.
+
+The certificate lives as long as the node certificate it was issued against, one year from the join.
+A running node checks it every six hours and replaces it in place during its last day, without
+restarting the datapath; the server does the same for its own copy. As in k3s, nothing revokes an
+issued certificate: deleting the Node or the `MeshPeer` does not cut it off, and the only way to
+invalidate every outstanding certificate before it expires is to rotate the cluster CA.
+
+Upgrade the server first, then the agents one node at a time. In a cluster where the server is older
+than an upgraded agent, that agent does not start: it logs that the server does not issue this
+certificate and retries every half minute until the server is upgraded.
+
+The server lays down the role and its binding at every start, and repairs either one if its rules,
+subjects or role reference have been changed. If that step fails, the server stops its start rather
+than run with a partial grant; fix the cause the log names and restart the server, which applies the
+grant again.
+
+With this identity every node enforces NetworkPolicy for its own Pods. To confirm what it may do:
+
+```sh
+kubectl auth can-i list pods --all-namespaces --as=k3sm:netserve:<node> --as-group=k3sm:netservers   # yes
+kubectl auth can-i list secrets --all-namespaces --as=k3sm:netserve:<node> --as-group=k3sm:netservers  # no
+```
+
+If you once added ClusterRoleBindings by hand to give the `system:nodes` group the datapath's reads,
+such as one binding the upstream `system:node` ClusterRole to that group, they are no longer needed.
+k3sm neither creates nor deletes them; remove them yourself with `kubectl delete clusterrolebinding
+<name>`.
+
 ### Node-password bindings
 
 The first join for a node name binds that name to the node's node-password, and every later join for
@@ -396,9 +449,9 @@ There are no per-node `svclb-*` pods. Each node's k3sm process holds the listene
   has the same effect.
 - `externalTrafficPolicy: Local` is not narrowed to nodes with a local endpoint. Every hosting node
   forwards to the ClusterIP, so the client source address is lost.
-- Upgrade agents first and the server last. An agent older than its server hosts nothing until it is
-  upgraded, and a newer agent under an older server leaves LoadBalancer hosting on the server alone,
-  as before.
+- Upgrade the server first and then the agents, one node at a time, because an agent needs its
+  [datapath identity](#the-datapath-identity) from the server. An agent older than its server hosts
+  no LoadBalancer Service until it is upgraded.
 
 ## What Crosses Nodes
 

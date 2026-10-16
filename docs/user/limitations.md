@@ -292,10 +292,8 @@ workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
 
 In a multi-node cluster:
 
-- A worker starts no NetworkPolicy informers and enforces nothing, because its node identity is
-  not granted access to NetworkPolicies and Namespaces and no dedicated controller identity exists
-  yet. Connections to a backend on a worker are allowed whatever the policy says.
-- The server node enforces policies for its own Pods.
+- Every node, server and worker, enforces policies for its own Pods, under its
+  [datapath identity](multi-node.md#the-datapath-identity).
 - A `from` rule with a `podSelector` or `namespaceSelector` cannot match a Pod on another node.
   Traffic arriving from a peer node's mesh address is always allowed.
 

@@ -30,6 +30,8 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"k3sm.io/k3sm/pkg/certs"
 )
 
 // updateGolden regenerates testdata/rbac-graph.golden. Regenerating it is a grant
@@ -164,13 +166,14 @@ func createdObjects(t *testing.T, actions []ktesting.Action) []GoldenObject {
 	return out
 }
 
-// bindsNodesOrEveryone reports whether subjects reach a node identity: the
-// system:nodes group, any system:node:<name> user, or the two groups every
-// identity (authenticated or not) belongs to.
+// bindsNodesOrEveryone reports whether subjects reach a node-held identity: the
+// system:nodes group, any system:node:<name> user, the k3sm:netservers group
+// every node's datapath runs in, or the two groups every identity
+// (authenticated or not) belongs to.
 func bindsNodesOrEveryone(subjects []rbacv1.Subject) bool {
 	for _, s := range subjects {
 		switch {
-		case s.Kind == "Group" && (s.Name == systemNodesGroup || s.Name == "system:authenticated" || s.Name == "system:unauthenticated"):
+		case s.Kind == "Group" && (s.Name == systemNodesGroup || s.Name == certs.NetserveGroup || s.Name == "system:authenticated" || s.Name == "system:unauthenticated"):
 			return true
 		case s.Kind == "User" && len(s.Name) > len("system:node:") && s.Name[:len("system:node:")] == "system:node:":
 			return true

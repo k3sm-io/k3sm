@@ -101,8 +101,8 @@ func TestNetworkPolicyHosting(t *testing.T) {
 		PodCIDR:           "100.64.1.0/24",
 		MeshEgressIP:      "100.64.1.1",
 		PeerMeshEgressIPs: []string{"100.64.2.1"},
-		// The server shape: its admin client may read the cluster-wide
-		// NetworkPolicies and Namespaces the watcher needs.
+		// The netserve shape every node takes: its identity may read the
+		// cluster-wide NetworkPolicies, Namespaces and Pods the watcher needs.
 		EnforceNetworkPolicy: true,
 		Logger:               slog.New(slog.NewTextHandler(logBuf, nil)),
 	})

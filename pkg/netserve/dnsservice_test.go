@@ -32,12 +32,13 @@ import (
 func TestEnsureDNSService(t *testing.T) {
 	cs := fake.NewClientset()
 	s := New(Config{
-		Client:        cs,
-		WorkDir:       t.TempDir(),
-		DNSVIP:        "10.43.0.10",
-		ClusterDomain: "cluster.local",
-		PodCIDR:       "100.64.1.0/24",
-		NetdSocket:    "/var/lib/k3sm/run/netd.sock",
+		Client:           fake.NewClientset(),
+		DNSServiceClient: cs,
+		WorkDir:          t.TempDir(),
+		DNSVIP:           "10.43.0.10",
+		ClusterDomain:    "cluster.local",
+		PodCIDR:          "100.64.1.0/24",
+		NetdSocket:       "/var/lib/k3sm/run/netd.sock",
 	})
 	ctx := context.Background()
 	if err := s.ensureDNSService(ctx); err != nil {
@@ -72,6 +73,43 @@ func TestEnsureDNSService(t *testing.T) {
 	// Idempotent: a second call (Service already exists) must not error.
 	if err := s.ensureDNSService(ctx); err != nil {
 		t.Fatalf("ensureDNSService not idempotent: %v", err)
+	}
+}
+
+// TestWorkerProvisionsNoDNSService pins that a datapath without a
+// DNSServiceClient (every joined worker) issues no request for the kube-dns
+// Service: its Client is the netserve identity, which holds no create verb, so a
+// create there would be refused on every start. The server provisions it, through
+// its admin client.
+func TestWorkerProvisionsNoDNSService(t *testing.T) {
+	cs := fake.NewClientset()
+	s := New(Config{
+		Client:     cs,
+		WorkDir:    t.TempDir(),
+		DNSVIP:     "10.43.0.10",
+		PodCIDR:    "100.64.1.0/24",
+		NetdSocket: "/var/lib/k3sm/run/netd.sock",
+	})
+	s.provisionDNSService(context.Background())
+	if got := cs.Actions(); len(got) != 0 {
+		t.Fatalf("a worker datapath issued %d request(s) for the kube-dns Service, want none: %v", len(got), got)
+	}
+
+	admin := fake.NewClientset()
+	s = New(Config{
+		Client:           cs,
+		DNSServiceClient: admin,
+		WorkDir:          t.TempDir(),
+		DNSVIP:           "10.43.0.10",
+		PodCIDR:          "100.64.1.0/24",
+		NetdSocket:       "/var/lib/k3sm/run/netd.sock",
+	})
+	s.provisionDNSService(context.Background())
+	if _, err := admin.CoreV1().Services("kube-system").Get(context.Background(), "kube-dns", metav1.GetOptions{}); err != nil {
+		t.Fatalf("the server datapath did not provision kube-dns through its DNSServiceClient: %v", err)
+	}
+	if got := cs.Actions(); len(got) != 0 {
+		t.Fatalf("the server datapath wrote kube-dns through its netserve Client: %v", got)
 	}
 }
 

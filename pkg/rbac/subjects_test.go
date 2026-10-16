@@ -67,6 +67,10 @@ func TestProvisionSubjectsUnchanged(t *testing.T) {
 	objs := createdObjects(t, cs.Actions())
 
 	want := []string{
+		"bind ClusterRoleBinding /k3sm:netserve -> ClusterRole k3sm:netserve Group /k3sm:netservers",
+		"rule ClusterRole /k3sm:netserve [] [services namespaces pods] [get list watch] []",
+		"rule ClusterRole /k3sm:netserve [discovery.k8s.io] [endpointslices] [get list watch] []",
+		"rule ClusterRole /k3sm:netserve [networking.k8s.io] [networkpolicies] [get list watch] []",
 		"bind ClusterRoleBinding /k3sm:node-datapath -> ClusterRole k3sm:node-datapath Group /system:nodes",
 		"bind RoleBinding default/k3sm:in-pod-reader -> Role k3sm:in-pod-reader ServiceAccount default/snapshot-manager",
 		"bind RoleBinding k3sm-registry/k3sm-registry-advert-reader -> Role k3sm-registry-advert-reader Group /system:nodes",
