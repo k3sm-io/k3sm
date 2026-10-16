@@ -234,3 +234,12 @@ func StartTimeBound() time.Duration {
 	node := 2*serverRestartBudget.unload + serverRestartBudget.running
 	return precondition + netd + node + uncordonBudget.running
 }
+
+// LifecycleMargin is the slack the overall deadline of a stop or start adds
+// to its computed bound, for the launchctl and file calls no budget counts.
+const LifecycleMargin = 30 * time.Second
+
+// StartCutoff is when `k3sm start` is cut off: StartTimeBound plus
+// LifecycleMargin. `k3sm start --print-time-bound` prints it, so a caller
+// waiting on a start uses the deadline the start itself enforces.
+func StartCutoff() time.Duration { return StartTimeBound() + LifecycleMargin }

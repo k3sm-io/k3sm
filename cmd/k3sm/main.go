@@ -110,7 +110,7 @@ func main() {
 			os.Exit(code)
 		}
 	case "start":
-		if code := runStart(os.Args[2:], os.Stderr); code != 0 {
+		if code := runStart(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
 			os.Exit(code)
 		}
 	case "restart":

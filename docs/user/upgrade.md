@@ -278,6 +278,19 @@ does **not** revert them; you have to.
    every pod sandbox, deleting the policy only hides the problem: the Service is created, its endpoints
    go Ready, and no pod can reach it.
 
+## Starting a Stopped Node From a Script
+
+An upgrade leaves a stopped node stopped, so a script that upgrades and then runs `sudo k3sm start`
+needs to know how long to wait. `k3sm start --print-time-bound` prints the start's cut-off as a
+whole number of seconds and exits 0. It needs no root and does nothing else. The value is the start's
+time bound, which includes the uncordon's 90-second retry window, plus a 30-second margin: 570
+seconds today. Wait at least that long before treating a start as stuck.
+
+`sudo k3sm start` exits 1 both when it fails and when the daemons are up but the Node is still
+cordoned. In the second case stderr carries a line that begins with the fixed token
+`k3sm: node is still cordoned`, beside the sentence a person reads. Match that token, not the
+sentence, and run `sudo k3sm start` again to uncordon the node.
+
 ## Next
 
 - [Stopping and starting](stop-start.md) explains why an upgrade leaves a stopped node stopped, and `--start`.

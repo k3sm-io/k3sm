@@ -21,6 +21,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -44,7 +46,7 @@ func TestLifecycleVerbsRefuseWithoutRoot(t *testing.T) {
 	t.Cleanup(func() { lifecycleGeteuid = orig })
 	for verb, run := range map[string]func([]string, *bytes.Buffer) int{
 		"stop":    func(a []string, w *bytes.Buffer) int { return runStop(a, w) },
-		"start":   func(a []string, w *bytes.Buffer) int { return runStart(a, w) },
+		"start":   func(a []string, w *bytes.Buffer) int { return runStart(a, io.Discard, w) },
 		"restart": func(a []string, w *bytes.Buffer) int { return runRestart(a, w) },
 	} {
 		var stderr bytes.Buffer
@@ -277,7 +279,69 @@ func TestLifecycleContextIsBounded(t *testing.T) {
 	if !ok {
 		t.Fatal("the lifecycle context has no deadline")
 	}
-	if left := time.Until(dl); left > time.Minute+lifecycleMargin || left < time.Minute {
-		t.Errorf("deadline in %s, want about %s", left, time.Minute+lifecycleMargin)
+	if left := time.Until(dl); left > time.Minute+install.LifecycleMargin || left < time.Minute {
+		t.Errorf("deadline in %s, want about %s", left, time.Minute+install.LifecycleMargin)
+	}
+}
+
+// TestStartPrintTimeBoundMatchesTheStartPath pins `k3sm start
+// --print-time-bound`: it prints the cut-off the start path enforces
+// (install.StartTimeBound plus install.LifecycleMargin) in whole seconds and
+// exits 0, before the root check, so nothing else runs.
+func TestStartPrintTimeBoundMatchesTheStartPath(t *testing.T) {
+	orig := lifecycleGeteuid
+	lifecycleGeteuid = func() int {
+		t.Error("--print-time-bound reached the root check; it must return before anything else runs")
+		return 501
+	}
+	t.Cleanup(func() { lifecycleGeteuid = orig })
+
+	var stdout, stderr bytes.Buffer
+	if code := runStart([]string{"--print-time-bound"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("start --print-time-bound exited %d, want 0 (stderr %q)", code, stderr.String())
+	}
+	want := install.StartTimeBound() + install.LifecycleMargin
+	if want%time.Second != 0 {
+		t.Fatalf("the start cut-off %s is not a whole number of seconds", want)
+	}
+	if got, wantOut := stdout.String(), fmt.Sprintf("%d\n", int64(want/time.Second)); got != wantOut {
+		t.Errorf("stdout = %q, want %q", got, wantOut)
+	}
+	if install.StartCutoff() != want {
+		t.Errorf("install.StartCutoff() = %s, want StartTimeBound+LifecycleMargin = %s", install.StartCutoff(), want)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+	if !strings.Contains(startUsage, "--print-time-bound") || !strings.Contains(startUsage, install.StartCutoff().String()) {
+		t.Errorf("start help does not state the flag and the cut-off %s:\n%s", install.StartCutoff(), startUsage)
+	}
+}
+
+// TestLifecycleExitMarksStillCordoned pins the marker a caller matches: a
+// start whose daemons are up but whose node stayed cordoned exits 1 with
+// install.StillCordonedMarker on stderr, beside the human sentence.
+func TestLifecycleExitMarksStillCordoned(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantMarker bool
+	}{
+		{"still cordoned", fmt.Errorf("%w (gave up after 3 attempts)", install.ErrNodeStillCordoned), true},
+		{"other failure", errors.New("bootstrap netd: refused"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			if code := lifecycleExit("start", tc.err, &stderr); code != exitLifecycleFailed {
+				t.Errorf("exit = %d, want %d", code, exitLifecycleFailed)
+			}
+			out := stderr.String()
+			if got := strings.Contains(out, install.StillCordonedMarker); got != tc.wantMarker {
+				t.Errorf("marker %q present = %v, want %v:\n%s", install.StillCordonedMarker, got, tc.wantMarker, out)
+			}
+			if tc.wantMarker && !strings.Contains(out, "re-run `sudo k3sm start` to uncordon it") {
+				t.Errorf("the human sentence is gone:\n%s", out)
+			}
+		})
 	}
 }
