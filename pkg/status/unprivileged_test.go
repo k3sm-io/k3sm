@@ -20,11 +20,17 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/nodecred"
 )
 
 // TestUnprivilegedStatusReadsWhatTheUserCan is the gate for an ordinary
@@ -129,5 +135,117 @@ func TestUnprivilegedStatusReadsWhatTheUserCan(t *testing.T) {
 	}
 	if rep.Verdict != VerdictRunning {
 		t.Errorf("verdict = %v (%s), want running: a needs-admin row never degrades it\n%s", rep.Verdict, rep.Summary, Render(rep, Style{}))
+	}
+}
+
+// TestUnprivilegedAgentReadsThroughTheUserKubeconfig is the agent half of the
+// gate: on a worker whose node credential this account cannot read, the report
+// reads the cluster with the account's own kubeconfig, the way kubectl does,
+// so the apiserver, node and workloads rows answer and the kubeconfig row
+// names the context it used instead of reporting the credential missing.
+func TestUnprivilegedAgentReadsThroughTheUserKubeconfig(t *testing.T) {
+	p := agentPaths(t.TempDir())
+	fsys := withCredential(t, agentInstalledFS(p), p.AgentCredentialDir, goldenTime.Add(90*24*time.Hour))
+	fsys.denied = map[string]bool{filepath.Join(p.AgentCredentialDir, nodecred.KubeconfigFile): true}
+	c := agentCollector(t, p, fsys)
+	c.EUID = 501
+	c.KubeErr = errors.New("node credential /var/lib/k3sm/agent/kubeconfig is not readable by this account (re-run with sudo)")
+	source := `/Users/me/.kube/config context "k3sm"`
+	builds := 0
+	c.UserKube = func() (Kube, string, error) {
+		builds++
+		kube := healthyKube()
+		kube.server = "https://100.64.0.1:6444"
+		return kube, source, nil
+	}
+	rep := c.Collect(context.Background())
+
+	if rep.Role != dataroot.RoleAgent {
+		t.Fatalf("role = %s, want agent", rep.Role)
+	}
+	if builds != 1 {
+		t.Errorf("the user's kubeconfig was read %d times, want once", builds)
+	}
+	for _, tc := range []struct {
+		row    string
+		state  RowState
+		sev    Severity
+		detail string
+	}{
+		{RowAPIServer, StateReady, SeverityOK, "https://100.64.0.1:6444 readyz ok"},
+		{RowNode, StateReady, SeverityOK, "1/1 nodes ready · my-mac kubelet v1.36.2"},
+		{RowWorkloads, StateOK, SeverityOK, "3 running"},
+		{RowKubeconfig, StateOK, SeverityOK, source + " (" + UserKubeNote + ")"},
+	} {
+		row, ok := rep.Row(tc.row)
+		if !ok {
+			t.Errorf("no %s row", tc.row)
+			continue
+		}
+		if row.State != tc.state || row.Severity != tc.sev || row.Detail != tc.detail {
+			t.Errorf("%s = %s/%s %q, want %s/%s %q", tc.row, row.State, row.Severity, row.Detail, tc.state, tc.sev, tc.detail)
+		}
+	}
+	if kc, _ := rep.Row(RowKubeconfig); kc.Wide["source"] != "user-kubeconfig" {
+		t.Errorf("kubeconfig wide = %v, want the user kubeconfig named as the source", kc.Wide)
+	}
+
+	t.Run("a readable node credential is used, never the user's kubeconfig", func(t *testing.T) {
+		c := agentCollector(t, p, withCredential(t, agentInstalledFS(p), p.AgentCredentialDir, goldenTime.Add(90*24*time.Hour)))
+		c.Kube = healthyKube()
+		c.UserKube = func() (Kube, string, error) {
+			t.Fatal("the user's kubeconfig was read although the node credential answers")
+			return nil, "", nil
+		}
+		c.Collect(context.Background())
+	})
+	t.Run("a kubeconfig with no usable context leaves the rows as they were", func(t *testing.T) {
+		c := agentCollector(t, p, fsys)
+		c.EUID = 501
+		c.KubeErr = errors.New("node credential is not readable by this account")
+		c.UserKube = func() (Kube, string, error) { return nil, "", errors.New("no k3sm context") }
+		rep := c.Collect(context.Background())
+		if api, _ := rep.Row(RowAPIServer); api.State != StateUnknown || !strings.Contains(api.Detail, "no k3sm context") {
+			t.Errorf("apiserver = %s %q, want unknown naming both reasons", api.State, api.Detail)
+		}
+		if kc, _ := rep.Row(RowKubeconfig); kc.State != StateMissing {
+			t.Errorf("kubeconfig = %s, want missing", kc.State)
+		}
+	})
+}
+
+// TestUserKubeContext pins which context of the invoking account's kubeconfig
+// an agent's report reads: the installed admin context when there is one, else
+// the current context only when it points at the host this Mac joined.
+func TestUserKubeContext(t *testing.T) {
+	cfg := func(current string, contexts map[string]string) *clientcmdapi.Config {
+		c := clientcmdapi.NewConfig()
+		c.CurrentContext = current
+		for name, server := range contexts {
+			c.Clusters[name] = &clientcmdapi.Cluster{Server: server}
+			c.Contexts[name] = &clientcmdapi.Context{Cluster: name}
+		}
+		return c
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  *clientcmdapi.Config
+		join string
+		want string
+		ok   bool
+	}{
+		{"the k3sm context wins", cfg("other", map[string]string{"k3sm": "https://100.64.0.1:6444", "other": "https://192.168.0.50:6444"}), "192.168.0.50", "k3sm", true},
+		{"the current context on the joined host", cfg("lab", map[string]string{"lab": "https://192.168.0.50:6444"}), "192.168.0.50:9345", "lab", true},
+		{"a join server given as a URL", cfg("lab", map[string]string{"lab": "https://studio.example:6444"}), "https://Studio.example:9345", "lab", true},
+		{"the current context on another cluster", cfg("work", map[string]string{"work": "https://10.0.0.9:6443"}), "192.168.0.50", "", false},
+		{"no join server to compare with", cfg("lab", map[string]string{"lab": "https://192.168.0.50:6444"}), "", "", false},
+		{"no kubeconfig", nil, "192.168.0.50", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := UserKubeContext(tc.cfg, "k3sm", tc.join)
+			if got != tc.want || ok != tc.ok {
+				t.Errorf("UserKubeContext = %q, %v, want %q, %v", got, ok, tc.want, tc.ok)
+			}
+		})
 	}
 }

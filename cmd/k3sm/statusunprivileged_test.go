@@ -21,9 +21,14 @@ import (
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // TestStatusServingChainReadsTheHandshake pins the reader the serving-cert row
@@ -49,5 +54,38 @@ func TestStatusServingChainReadsTheHandshake(t *testing.T) {
 	}
 	if statusServingChain(nil) != nil {
 		t.Error("a reader was built with no client")
+	}
+}
+
+// TestStatusUserKubeReadsTheInvokingAccountsKubeconfig pins the agent fallback's
+// reader: it exists on an agent only, builds the client from the k3sm context
+// of the account's own kubeconfig, and names that file and context.
+func TestStatusUserKubeReadsTheInvokingAccountsKubeconfig(t *testing.T) {
+	if statusUserKubeFor(install.RoleServer) != nil {
+		t.Error("a server got the agent's kubeconfig fallback")
+	}
+	path := filepath.Join(t.TempDir(), "config")
+	cfg := clientcmdapi.NewConfig()
+	cfg.Clusters["k3sm"] = &clientcmdapi.Cluster{Server: "https://100.64.0.1:6444"}
+	cfg.AuthInfos["k3sm"] = &clientcmdapi.AuthInfo{Token: "not-a-real-token"}
+	cfg.Contexts["k3sm"] = &clientcmdapi.Context{Cluster: "k3sm", AuthInfo: "k3sm"}
+	cfg.Contexts["other"] = &clientcmdapi.Context{Cluster: "k3sm", AuthInfo: "k3sm"}
+	cfg.CurrentContext = "other"
+	if err := clientcmd.WriteToFile(*cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KUBECONFIG", path)
+	if installedKubeconfigName() != installedContextName {
+		t.Skip("this Mac's install names its own kubeconfig context")
+	}
+	kube, source, err := statusUserKubeFor(install.RoleAgent)()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if kube.Server() != "https://100.64.0.1:6444" {
+		t.Errorf("server = %q, want the k3sm context's", kube.Server())
+	}
+	if want := path + ` context "k3sm"`; source != want {
+		t.Errorf("source = %q, want %q", source, want)
 	}
 }

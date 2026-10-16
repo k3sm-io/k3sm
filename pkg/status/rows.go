@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,9 +35,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"golang.org/x/sys/unix"
 
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
@@ -67,6 +70,9 @@ func (c Collector) Collect(ctx context.Context) Report {
 	dataRoot, volume := c.dataRootRow(ctx, role)
 	ld := c.launchdRows(now(), role, bothRoles, volume != nil)
 	instRow, installed, netd, node, nodePID := ld.install, ld.installed, ld.netd, ld.node, ld.nodePID
+	if role == dataroot.RoleAgent && c.Kube == nil && ld.credential == CredentialUnknown && c.UserKube != nil {
+		c = c.withUserKube()
+	}
 	apiserver := c.apiserverRow(ctx, role, ld.credential)
 	serving := apiserver.Severity == SeverityOK
 	// The node list is read ONCE and handed to both rows that use it, so the
@@ -1530,6 +1536,31 @@ func datastoreThroughAPIServer(row *Row, apiserver Row) {
 	row.Remedy = "sudo k3sm status"
 }
 
+// withUserKube adopts the invoking account's own kubeconfig (UserKube) as the
+// report's apiserver client, on an agent whose node credential this account
+// cannot read. A kubeconfig that offers no usable context leaves the report
+// as it was, with both reasons in KubeErr.
+func (c Collector) withUserKube() Collector {
+	kube, source, err := c.UserKube()
+	if err != nil || kube == nil {
+		if err != nil && c.KubeErr != nil {
+			c.KubeErr = fmt.Errorf("%w; your kubeconfig: %v", c.KubeErr, err)
+		}
+		return c
+	}
+	c.Kube, c.KubeSource, c.KubeErr, c.kubeFromUser = kube, source, nil, true
+	if c.Interconnect == nil {
+		c.Interconnect = func(ctx context.Context) (*netv1alpha1.Interconnect, error) {
+			return ReadInterconnect(ctx, kube)
+		}
+	}
+	return c
+}
+
+// UserKubeNote is the clause the kubeconfig row adds when the report reads the
+// cluster with the invoking account's kubeconfig on an agent.
+const UserKubeNote = "your kubeconfig; this account cannot read the node credential"
+
 // kubeconfigRow reports the credentials this command found, and where.
 func (c Collector) kubeconfigRow() Row {
 	row := Row{Name: RowKubeconfig}
@@ -1544,7 +1575,56 @@ func (c Collector) kubeconfigRow() Row {
 	if row.Detail == "" {
 		row.Detail = "resolved"
 	}
+	if c.kubeFromUser {
+		row.Detail += " (" + UserKubeNote + ")"
+		row.Wide = map[string]string{"source": "user-kubeconfig"}
+	}
 	return row
+}
+
+// UserKubeContext picks the context of the invoking account's kubeconfig that
+// an agent's report reads the cluster with: the context named name (the
+// installed admin context, k3sm unless install was told otherwise) when the
+// file has one, else the current context when its cluster's server is on the
+// host this Mac joined (joinServer, the agent's --server: a host, host:port or
+// URL). ok is false when neither holds, because reading some other cluster and
+// calling it this one would be worse than reading none.
+func UserKubeContext(cfg *clientcmdapi.Config, name, joinServer string) (string, bool) {
+	if cfg == nil {
+		return "", false
+	}
+	if _, ok := cfg.Contexts[name]; ok && name != "" {
+		return name, true
+	}
+	cur, ok := cfg.Contexts[cfg.CurrentContext]
+	if !ok || cur == nil {
+		return "", false
+	}
+	cluster, ok := cfg.Clusters[cur.Cluster]
+	if !ok || cluster == nil {
+		return "", false
+	}
+	join := serverHost(joinServer)
+	if join == "" || serverHost(cluster.Server) != join {
+		return "", false
+	}
+	return cfg.CurrentContext, true
+}
+
+// serverHost is the host of a server named as a URL, host:port or bare host.
+func serverHost(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.Contains(s, "://") {
+		u, err := url.Parse(s)
+		if err != nil {
+			return ""
+		}
+		return strings.ToLower(u.Hostname())
+	}
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		return strings.ToLower(h)
+	}
+	return strings.ToLower(strings.Trim(s, "[]"))
 }
 
 // runtimedRow reports the native runtime daemon's health. It is rendered only by

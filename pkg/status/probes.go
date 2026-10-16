@@ -312,13 +312,25 @@ type Collector struct {
 	// leaves the serving-cert row unknown for an account that cannot read the
 	// certificate file. It is consulted on a server only, and only then.
 	ServingChain func(ctx context.Context) (PresentedChain, error)
-	Paths        Paths
-	EUID         int
-	ServiceUID   int
-	Now          func() time.Time
-	Version      version.Info
-	Host         string
+	// UserKube builds an apiserver client from the invoking account's own
+	// kubeconfig, and names the file and context it used. It is consulted on an
+	// agent whose node credential this account cannot read, the ordinary
+	// posture of an unprivileged run there: the apiserver, node and workloads
+	// rows then read the cluster the way kubectl would, and the kubeconfig row
+	// names that context. Which context is UserKubeContext's decision.
+	// OPTIONAL: nil leaves those rows to the node credential.
+	UserKube   func() (Kube, string, error)
+	Paths      Paths
+	EUID       int
+	ServiceUID int
+	Now        func() time.Time
+	Version    version.Info
+	Host       string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string
+
+	// kubeFromUser records that Kube came from UserKube, which the kubeconfig
+	// row reports. Collect sets it; a caller never does.
+	kubeFromUser bool
 }

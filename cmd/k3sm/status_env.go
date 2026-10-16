@@ -185,12 +185,15 @@ func newStatusCollector() status.Collector {
 		// The certificate the apiserver presents, for the serving-cert row of
 		// an account that cannot read the certificate file.
 		ServingChain: statusServingChain(kube),
-		Paths:        paths,
-		EUID:         euid,
-		ServiceUID:   serviceUID,
-		Version:      version.Get(),
-		Host:         macOSVersionOrEmpty(),
-		Hostname:     hostnameOrEmpty(),
+		// On an agent, the invoking account's own kubeconfig, for when the
+		// node credential is not readable from this account.
+		UserKube:   statusUserKubeFor(role),
+		Paths:      paths,
+		EUID:       euid,
+		ServiceUID: serviceUID,
+		Version:    version.Get(),
+		Host:       macOSVersionOrEmpty(),
+		Hostname:   hostnameOrEmpty(),
 	}
 }
 
@@ -670,7 +673,36 @@ func newStatusKube(in statusKubeInputs) (status.Kube, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	return buildStatusKube(cfg)
+}
 
+// statusUserKubeFor returns, on an agent, the reader of the invoking account's
+// own kubeconfig the report falls back to when the node credential is not
+// readable (status.Collector.UserKube); nil on a server, which resolves the
+// user's kubeconfig already.
+func statusUserKubeFor(role install.Role) func() (status.Kube, string, error) {
+	if role != install.RoleAgent {
+		return nil
+	}
+	return func() (status.Kube, string, error) {
+		rules := clientcmd.NewDefaultClientConfigLoadingRules()
+		raw, err := rules.Load()
+		if err != nil {
+			return nil, "", err
+		}
+		join, _ := statusAgentJoinServer()
+		name := installedKubeconfigName()
+		ctxName, ok := status.UserKubeContext(raw, name, join)
+		if !ok {
+			return nil, "", fmt.Errorf("no %q context, and the current context does not point at the server this Mac joined", name)
+		}
+		return buildStatusKube(kubectlConfig{context: ctxName})
+	}
+}
+
+// buildStatusKube builds the report's apiserver client for one resolved
+// kubeconfig and context, with the probe timeout.
+func buildStatusKube(cfg kubectlConfig) (status.Kube, string, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if cfg.kubeconfig != "" {
 		rules.ExplicitPath = cfg.kubeconfig

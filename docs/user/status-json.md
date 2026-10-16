@@ -187,6 +187,10 @@ Other rows read what your account can, through the apiserver, instead of a file 
   cluster-internal names and addresses, never a credential. The rows read the second copy when the
   first is not readable, and `wide.record` names the file read. A server older than the status
   directory writes no second copy, and then the rows say `needs-admin`.
+- On a worker whose node credential your account cannot read, `apiserver`, `node` and `workloads`
+  read the cluster with your own kubeconfig: its `k3sm` context (or the name given to `k3sm install
+  --kubeconfig-name`), else the current context when its server is on the host the worker joined.
+  The `kubeconfig` row then names that file and context, with `wide.source` `user-kubeconfig`.
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was
