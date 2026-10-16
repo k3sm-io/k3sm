@@ -58,12 +58,36 @@ type CA struct {
 	CertPEM []byte
 	// KeyPEM is the PEM-encoded CA private key.
 	KeyPEM []byte
+	// now is the clock this CA's certificates are minted on; nil means
+	// time.Now. Only NewCAWithClock sets it, so a CA from NewCA or LoadCA is
+	// always on the real clock. It covers the CA certificate NewCAWithClock
+	// mints and every leaf issued through issueLeaf: signLeaf (IssueServing,
+	// IssueClient, IssueServerClient, ServingChainTLS, SignClientCSR,
+	// SignServingCSR, IssueNetserveClient, Hierarchy.IssueProxyClient) and
+	// IssueUpdateSigner. SelfSignedServing has no CA and stays on time.Now.
+	now func() time.Time
+}
+
+// clock returns the CA's clock reading.
+func (c *CA) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 // NewCA creates a new self-signed ECDSA P-256 CA with the given common name. The
 // CA is valid for ten years (a control-plane lifetime); leaf certs it issues are
 // short-lived. ECDSA P-256 keeps the CA small and signing fast.
 func NewCA(commonName string) (*CA, error) {
+	return NewCAWithClock(commonName, nil)
+}
+
+// NewCAWithClock is NewCA on the clock now (nil means time.Now): the CA
+// certificate's validity and that of every leaf it issues through issueLeaf
+// start from it, so a caller that judges validity at a time of its choosing
+// mints on that same clock. The clock cannot be changed after construction.
+func NewCAWithClock(commonName string, now func() time.Time) (*CA, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate CA key: %w", err)
@@ -72,12 +96,13 @@ func NewCA(commonName string) (*CA, error) {
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now()
+	c := &CA{now: now}
+	at := c.clock()
 	tmpl := x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: commonName},
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.AddDate(10, 0, 0),
+		NotBefore:             at.Add(-time.Hour),
+		NotAfter:              at.AddDate(10, 0, 0),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -95,12 +120,11 @@ func NewCA(commonName string) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal CA key: %w", err)
 	}
-	return &CA{
-		Cert:    cert,
-		Key:     key,
-		CertPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
-		KeyPEM:  pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
-	}, nil
+	c.Cert = cert
+	c.Key = key
+	c.CertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	c.KeyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return c, nil
 }
 
 // LoadCA reconstructs a CA from its PEM-encoded certificate and private key (the
@@ -325,7 +349,7 @@ func (c *CA) issueLeaf(pub any, subject pkix.Name, dnsSANs []string, ipSANs []ne
 	if validFor <= 0 {
 		validFor = 365 * 24 * time.Hour
 	}
-	now := time.Now()
+	now := c.clock()
 	tmpl := x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               subject,

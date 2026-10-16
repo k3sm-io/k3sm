@@ -115,7 +115,7 @@ func newRig(t *testing.T, nodes ...*corev1.Node) *rig {
 		t:         t,
 		cs:        fake.NewSimpleClientset(objs...),
 		resolver:  &fakeResolver{},
-		now:       time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC),
+		now:       rigStart,
 		failNodes: map[string]string{},
 		notReady:  map[string]bool{},
 		step:      10 * time.Second,
@@ -161,13 +161,18 @@ func newRig(t *testing.T, nodes ...*corev1.Node) *rig {
 	return r
 }
 
+// rigStart is where every rig's clock starts, and the clock the shared CA and
+// signer are minted on: the handover a rig verifies at r.now is judged on the
+// clock it was signed on, never against the wall clock.
+var rigStart = time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+
 // testSigning is one cluster CA and the update signer it issued, shared by
-// every controller the tests build.
+// every controller the tests build. Both are minted at rigStart.
 var testSigning = sync.OnceValue(func() struct {
 	ca     *certs.CA
 	signer *certs.UpdateSigner
 } {
-	ca, err := certs.NewCA("k3sm-cluster-ca")
+	ca, err := certs.NewCAWithClock("k3sm-cluster-ca", func() time.Time { return rigStart })
 	if err != nil {
 		panic(err)
 	}
