@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // RowMeshClaims reports the pod-range claims a server found abandoned: a joining
@@ -63,7 +65,7 @@ const (
 )
 
 // meshClaimsName is the record's basename, beside the etcd status record.
-const meshClaimsName = "mesh-claims.json"
+const meshClaimsName = install.MeshClaimsRecordName
 
 // MeshClaimsPath is the record's path for a work dir.
 func MeshClaimsPath(workDir string) string { return filepath.Join(workDir, meshClaimsName) }

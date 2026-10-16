@@ -109,6 +109,15 @@ const StatusDirMode fs.FileMode = 0o755
 // an unprivileged report and nothing else.
 const StatusSubdir = "status"
 
+// MeshClaimsRecordName and ServicesRecordName are the basenames of the two
+// records a server writes for `k3sm status`, both in its work dir and in
+// StatusSubdir. They are spelled here, where uninstall removes them, and
+// pkg/status names its paths from them.
+const (
+	MeshClaimsRecordName = "mesh-claims.json"
+	ServicesRecordName   = "services.json"
+)
+
 // manifestsSubdir is the manifest directory's leaf name, spelled once.
 const manifestsSubdir = "manifests"
 

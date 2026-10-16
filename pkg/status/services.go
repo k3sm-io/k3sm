@@ -77,7 +77,7 @@ type VIPEntry struct {
 const ServicesRecordInterval = 30 * time.Second
 
 // servicesName is the record's basename, beside the mesh claim record.
-const servicesName = "services.json"
+const servicesName = install.ServicesRecordName
 
 // ServicesPath is the record's path for a work dir.
 func ServicesPath(workDir string) string { return filepath.Join(workDir, servicesName) }

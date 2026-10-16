@@ -2198,6 +2198,10 @@ func TestUninstallIdempotent(t *testing.T) {
 		// A joining HA server's staged server-class join token, removed in the
 		// same position as the admin token below and for the same reason; on a
 		// server that never joined, removing an absent file is a no-op.
+		"RemoveAll:/var/lib/k3sm/status/services.json",
+		"RemoveAll:/var/lib/k3sm/server/services.json",
+		"RemoveAll:/var/lib/k3sm/status/mesh-claims.json",
+		"RemoveAll:/var/lib/k3sm/server/mesh-claims.json",
 		"RemoveAll:/var/lib/k3sm/server/join-token",
 		// The staged admin token, removed with the daemons rather than preserved
 		// with the rest of the data root: it is a system:masters credential with
@@ -2814,6 +2818,16 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		// server; it is admitted by that exact path, and only on the server role.
 		if dc.Role == RoleServer {
 			created[dc.serverJoinTokenPath()] = true
+		}
+		// The `k3sm status` records are written by the server daemon this
+		// install bootstrapped, in its work dir and in the status directory, so
+		// they are created only when that daemon was, and admitted by their
+		// exact paths.
+		if dc.Role == RoleServer && toSet(recorded(installCalls, "Bootstrap:"))[ServerLabel] {
+			for _, name := range []string{MeshClaimsRecordName, ServicesRecordName} {
+				created[filepath.Join(dc.serverWorkDir(), name)] = true
+				created[filepath.Join(StateStatus.Path(dc.DataRoot), name)] = true
+			}
 		}
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
 			if !created[p] {
