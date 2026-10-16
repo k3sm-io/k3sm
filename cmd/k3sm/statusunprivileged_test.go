@@ -60,7 +60,7 @@ func TestStatusUserKubeReadsTheInvokingAccountsKubeconfig(t *testing.T) {
 	if want := path + ` context "k3sm"`; source != want {
 		t.Errorf("source = %q, want %q", source, want)
 	}
-	elsewhere := func() (string, error) { return "192.168.0.50", nil }
+	elsewhere := func() (string, error) { return "192.0.2.50", nil }
 	if _, _, err := statusUserKubeFor(install.RoleAgent, elsewhere)(); err == nil {
 		t.Error("a k3sm context on another host was used for this worker's cluster")
 	}

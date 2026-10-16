@@ -77,7 +77,7 @@ func TestAgentEndpointsRecordNamesTheMeshAndJoinHosts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runAgentEndpointsPublisher(context.Background(), statusDir, "https://100.64.0.1:6444", "192.168.0.50", ca.CertPEM, pipeAPIServer(t, certPEM, keyPEM), time.Millisecond, logger)
+	runAgentEndpointsPublisher(context.Background(), statusDir, "https://100.64.0.1:6444", "192.0.2.50", ca.CertPEM, pipeAPIServer(t, certPEM, keyPEM), time.Millisecond, logger)
 	path := status.EndpointsPath(statusDir)
 	info, err := os.Stat(path)
 	if err != nil || info.Mode().Perm() != 0o644 {
@@ -87,7 +87,7 @@ func TestAgentEndpointsRecordNamesTheMeshAndJoinHosts(t *testing.T) {
 	if rec == nil || rec.Port != 6444 {
 		t.Fatalf("record = %+v, want port 6444", rec)
 	}
-	for _, h := range []string{"192.168.0.50", "100.64.0.1", "127.0.0.1", "kubernetes.default.svc"} {
+	for _, h := range []string{"192.0.2.50", "100.64.0.1", "127.0.0.1", "kubernetes.default.svc"} {
 		if !slices.Contains(rec.Hosts, h) {
 			t.Errorf("record hosts %v do not name %s", rec.Hosts, h)
 		}
@@ -104,7 +104,7 @@ func TestAgentEndpointsRecordNamesTheMeshAndJoinHosts(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
-		runAgentEndpointsPublisher(ctx, dir, "https://100.64.0.1:6444", "192.168.0.50", ca.CertPEM, pipeAPIServer(t, forged, forgedKey), 10*time.Millisecond, logger)
+		runAgentEndpointsPublisher(ctx, dir, "https://100.64.0.1:6444", "192.0.2.50", ca.CertPEM, pipeAPIServer(t, forged, forgedKey), 10*time.Millisecond, logger)
 		if _, err := os.Stat(status.EndpointsPath(dir)); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("a record was published from an untrusted certificate: %v", err)
 		}
