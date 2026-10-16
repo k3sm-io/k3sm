@@ -160,7 +160,7 @@ Row names in the full report include `install`, `netd`, `server` or `agent`, `ap
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
 `mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
-`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin` or `behind`.
+`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind` or `ahead`.
 
 `needs-admin` marks a check that only root can run, so nothing was checked and nothing is wrong. Its
 `remedy` is `sudo k3sm status`, and it never changes the `verdict`. A client can show it as not
@@ -247,12 +247,18 @@ never contacts GitHub. The record is in the server's work dir, so as any user bu
 `unknown` with the remedy `sudo k3sm status`. Its `state` is:
 
 - `ok` when every node's kubelet reports the latest release.
-- `behind` (severity `warn`) when a node runs another release. `detail` names each such node and the
+- `behind` (severity `warn`) when a node runs an older release. `detail` names each such node and the
   version its kubelet reports, and `remedy` is the install one-liner. The row never moves the verdict:
   a cluster with an update available is still `running`.
+- `ahead` (severity `ok`) when a node runs a release newer than the latest and none is behind.
+  `detail` names those nodes; there is no remedy.
 - `unknown` when the last check could not finish (`detail` carries its error, first line only and
-  redacted), when a node reports no k3sm version, when no check is recorded, or when the record is
-  older than 24 hours. The remedy is `sudo k3sm update check`.
+  redacted), when a node reports no tagged k3sm release, when no check is recorded, or when the record
+  is older than 24 hours, dated more than five minutes in the future, or fails validation. The remedy
+  is `sudo k3sm update check`.
+
+Each node's state is recomputed from the version in the record, in semver order, and the versions
+are what the nodes report of themselves: the row is a convenience signal, not an attestation.
 
 `wide.checked` is when the check ran, `wide.latest` the release tag and `wide.latest-kubernetes` the
 Kubernetes version that release ships, when its notes say.

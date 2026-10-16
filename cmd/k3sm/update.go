@@ -173,20 +173,27 @@ func renderUpdate(w io.Writer, rep update.Report) {
 	fmt.Fprintf(tw, "installed\t%s (%s)\n", rep.Installed, rep.InstalledState)
 	if len(rep.Nodes) > 0 {
 		fmt.Fprintf(tw, "\nNODE\tVERSION\tSTATE\n")
+		// Node names and versions are what each node says of itself, so they
+		// are control-stripped before they reach a terminal.
 		for _, n := range rep.Nodes {
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", n.Name, n.Version, n.State)
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", status.ClipText(n.Name, 253), status.ClipText(n.Version, 128), n.State)
 		}
 	}
 	_ = tw.Flush()
 }
 
 // writeUpdateRecord writes rec to status.UpdatePath(workDir), 0644, through
-// atomicfile. Its directory is created 0755 when missing; as root, it is given
-// to the work dir's owner, so the server can keep refreshing a record root
-// wrote first.
+// atomicfile. Its directory is created 0755 when missing and, as root, given to
+// the work dir's owner, so the server can keep refreshing a record root wrote
+// first. Before any write the directory is Lstat'ed and held to
+// checkStatusDir: a real directory, owned by root or the work dir's owner.
 func writeUpdateRecord(workDir string, rec status.UpdateRecord) error {
 	path := status.UpdatePath(workDir)
 	dir := filepath.Dir(path)
+	owner, err := fileOwner(workDir)
+	if err != nil {
+		return err
+	}
 	if err := os.Mkdir(dir, 0o755); err == nil {
 		if err := os.Chmod(dir, 0o755); err != nil {
 			return err
@@ -199,11 +206,52 @@ func writeUpdateRecord(workDir string, rec status.UpdateRecord) error {
 	} else if !errors.Is(err, fs.ErrExist) {
 		return err
 	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if err := checkStatusDir(dir, fi, owner); err != nil {
+		return err
+	}
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
 	return atomicfile.Replace(path, b, 0o644)
+}
+
+// checkStatusDir refuses a status directory the record must not be written
+// into: anything but a real directory (a symlink could point the write
+// anywhere the writer may write), or one owned by neither root nor the work
+// dir's owner (whoever owns it controls what sits beside the record).
+func checkStatusDir(dir string, fi fs.FileInfo, workDirOwner uint32) error {
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to write the update record: %s is a symlink, not a directory", dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("refusing to write the update record: %s is not a directory", dir)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("refusing to write the update record: cannot read the owner of %s", dir)
+	}
+	if st.Uid != 0 && st.Uid != workDirOwner {
+		return fmt.Errorf("refusing to write the update record: %s is owned by uid %d, neither root nor the work dir's owner (uid %d)", dir, st.Uid, workDirOwner)
+	}
+	return nil
+}
+
+// fileOwner is the uid that owns path.
+func fileOwner(path string) (uint32, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("cannot read the owner of %s", path)
+	}
+	return st.Uid, nil
 }
 
 // chownLike gives path the owner and group of ref.

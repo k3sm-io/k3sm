@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -36,14 +37,18 @@ import (
 
 // index is a fake release index: a `latest` redirect (to /tag/<stable>, or to
 // the index page when stable is empty), the releases list and the by-tag API,
-// all under /releases as a non-GitHub BaseURL is read.
+// all under indexPath as a non-GitHub BaseURL is read.
 type index struct {
 	stable   string
 	releases []map[string]any
 }
 
-// indexURL is where a test index is served; no socket is opened (handlerClient).
-const indexURL = "https://index.test"
+// indexURL and indexPath are where a test index is served, the path the
+// canonical GitHub index has; no socket is opened (handlerClient).
+const (
+	indexURL  = "https://index.test"
+	indexPath = "/k3sm-io/k3sm/releases"
+)
 
 // handlerClient is a client that serves every request from h in process,
 // through httptest.NewRecorder, so no test opens a socket.
@@ -65,22 +70,22 @@ func (f roundTripper) RoundTrip(req *http.Request) (*http.Response, error) { ret
 // client serves the index through handlerClient.
 func (ix index) client() *http.Client {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(indexPath+"/latest", func(w http.ResponseWriter, r *http.Request) {
 		if ix.stable == "" {
-			http.Redirect(w, r, "/releases", http.StatusFound)
+			http.Redirect(w, r, indexPath, http.StatusFound)
 			return
 		}
-		http.Redirect(w, r, "/releases/tag/"+ix.stable, http.StatusFound)
+		http.Redirect(w, r, indexPath+"/tag/"+ix.stable, http.StatusFound)
 	})
-	mux.HandleFunc("/releases/tag/", func(w http.ResponseWriter, r *http.Request) {})
-	mux.HandleFunc("/releases", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(indexPath+"/tag/", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc(indexPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("per_page") == "" {
 			return // the HTML index page
 		}
 		_ = json.NewEncoder(w).Encode(ix.releases)
 	})
-	mux.HandleFunc("/releases/tags/", func(w http.ResponseWriter, r *http.Request) {
-		tag := strings.TrimPrefix(r.URL.Path, "/releases/tags/")
+	mux.HandleFunc(indexPath+"/tags/", func(w http.ResponseWriter, r *http.Request) {
+		tag := strings.TrimPrefix(r.URL.Path, indexPath+"/tags/")
 		for _, rel := range ix.releases {
 			if rel["tag_name"] == tag {
 				_ = json.NewEncoder(w).Encode(rel)
@@ -124,7 +129,7 @@ func TestLatestFollowsInstallSh(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := Latest(context.Background(), Inputs{BaseURL: indexURL + "/releases", HTTP: tc.ix.client()})
+			got, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: tc.ix.client()})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -139,13 +144,13 @@ func TestLatestFollowsInstallSh(t *testing.T) {
 // tag, an unreachable index, and a redirect off https.
 func TestLatestRefuses(t *testing.T) {
 	t.Run("no release", func(t *testing.T) {
-		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + "/releases", HTTP: index{}.client()}); err == nil || !strings.Contains(err.Error(), "no k3sm release") {
+		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: index{}.client()}); err == nil || !strings.Contains(err.Error(), "no k3sm release") {
 			t.Errorf("err = %v", err)
 		}
 	})
 	t.Run("unusable stable tag", func(t *testing.T) {
 		ix := index{stable: "v1;rm", releases: []map[string]any{rel("v0.2.0", "2026-10-01T00:00:00Z", false, "")}}
-		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + "/releases", HTTP: ix.client()}); err == nil || !strings.Contains(err.Error(), "unusable release tag") {
+		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: ix.client()}); err == nil || !strings.Contains(err.Error(), "unusable release tag") {
 			t.Errorf("err = %v", err)
 		}
 	})
@@ -153,15 +158,15 @@ func TestLatestRefuses(t *testing.T) {
 		down := &http.Client{Transport: roundTripper(func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("connect: connection refused")
 		})}
-		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + "/releases", HTTP: down, Timeout: time.Second}); err == nil {
+		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: down, Timeout: time.Second}); err == nil {
 			t.Error("an unreachable index resolved a release")
 		}
 	})
 	t.Run("https to http redirect", func(t *testing.T) {
 		c := handlerClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "http://index.test/releases/tag/v0.2.0", http.StatusFound)
+			http.Redirect(w, r, "http://index.test"+indexPath+"/tag/v0.2.0", http.StatusFound)
 		}))
-		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + "/releases", HTTP: c}); err == nil {
+		if _, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: c}); err == nil {
 			t.Error("a redirect from https to http was followed")
 		} else if !strings.Contains(err.Error(), "refusing a redirect") {
 			t.Errorf("err = %v, want the downgrade refusal", err)
@@ -169,14 +174,61 @@ func TestLatestRefuses(t *testing.T) {
 	})
 }
 
-func TestValidTag(t *testing.T) {
-	for tag, want := range map[string]bool{
-		"v0.1.7": true, "0.1.7": true, "v0.2.0-rc.1": true, "v1+meta_x": true,
-		"": false, "-v1": false, "v1/../x": false, "v1 2": false, "v1;rm": false, "v1$(x)": false,
+// TestLatestRedirectIsPinned pins the `latest` redirect to the index it was
+// asked of: another host, another repository's tags, or a nested path under
+// tag/ is refused outright, never taken as the stable release and never
+// dropped to the pre-stable fallback.
+func TestLatestRedirectIsPinned(t *testing.T) {
+	releases := []map[string]any{rel("v0.2.0", "2026-10-01T00:00:00Z", false, "")}
+	for name, target := range map[string]string{
+		"another host":       "https://evil.test" + indexPath + "/tag/v9.9.9",
+		"another repository": "/other/repo/releases/tag/v9.9.9",
+		"a nested tag path":  indexPath + "/tag/v9.9.9/extra",
+		"an empty tag":       indexPath + "/tag/",
+		"an escaped slash":   indexPath + "/tag/v9%2F..%2Fx",
 	} {
-		if got := ValidTag(tag); got != want {
-			t.Errorf("ValidTag(%q) = %v, want %v", tag, got, want)
+		t.Run(name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc(indexPath+"/latest", func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target, http.StatusFound)
+			})
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("per_page") != "" {
+					_ = json.NewEncoder(w).Encode(releases)
+				}
+			})
+			_, err := Latest(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: handlerClient(mux)})
+			if err == nil || (!errors.Is(err, errRedirectPin) && !errors.Is(err, errBadTag)) {
+				t.Errorf("redirect to %s: err = %v, want a refusal", target, err)
+			}
+		})
+	}
+	t.Run("the canonical base pins /k3sm-io/k3sm/releases/tag/", func(t *testing.T) {
+		final, _ := url.Parse("https://github.com/k3sm-io/k3sm/releases/tag/v0.1.7")
+		if tag, err := pinnedTag(DefaultBaseURL, final); err != nil || tag != "v0.1.7" {
+			t.Errorf("pinnedTag = %q, %v", tag, err)
 		}
+		other, _ := url.Parse("https://github.com/k3sm-io/k3sm-fork/releases/tag/v0.1.7")
+		if _, err := pinnedTag(DefaultBaseURL, other); !errors.Is(err, errRedirectPin) {
+			t.Errorf("a fork's tag: err = %v", err)
+		}
+		index, _ := url.Parse("https://github.com/k3sm-io/k3sm/releases")
+		if tag, err := pinnedTag(DefaultBaseURL, index); err != nil || tag != "" {
+			t.Errorf("the index page: %q, %v, want no stable release", tag, err)
+		}
+	})
+}
+
+// TestRecordClipsTheError pins the stored error: at most UpdateErrorMax bytes
+// plus the clip mark, with no control characters.
+func TestRecordClipsTheError(t *testing.T) {
+	long := errors.New("line one\nline \x1b[31mtwo " + strings.Repeat("x", 4096))
+	got := Report{}.Record(long).Error
+	if len(got) > status.UpdateErrorMax+len("...") || !strings.HasSuffix(got, "...") {
+		t.Errorf("stored error is %d bytes: %q...", len(got), got[:40])
+	}
+	if strings.ContainsAny(got, "\n\x1b") {
+		t.Errorf("stored error carries a control character: %q", got[:40])
 	}
 }
 
@@ -192,6 +244,8 @@ func TestCheckComparesNodes(t *testing.T) {
 		node("b", "v1.36.2+k3sm.0.1.7"),
 		node("a", version.Info{KubeVersion: "v1.37.1", Version: "0.2.0"}.NodeVersion()),
 		node("c", "v1.37.1"),
+		node("d", version.Info{KubeVersion: "v1.37.1", Version: "0.3.0-rc.1"}.NodeVersion()),
+		node("e", version.Info{KubeVersion: "v1.37.1", Version: "0.2.0", Dirty: true}.NodeVersion()),
 	)
 	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
@@ -200,10 +254,12 @@ func TestCheckComparesNodes(t *testing.T) {
 	}{
 		{version.Info{Version: "0.2.0"}, status.UpdateCurrent},
 		{version.Info{Version: "v0.2.0"}, status.UpdateCurrent},
-		{version.Info{Version: "0.2.0", Dirty: true}, status.UpdateBehind},
+		{version.Info{Version: "0.2.0", Dirty: true}, status.UpdateUnknown},
+		{version.Info{Version: "dev"}, status.UpdateUnknown},
 		{version.Info{Version: "0.1.7"}, status.UpdateBehind},
+		{version.Info{Version: "0.2.1"}, status.UpdateAhead},
 	} {
-		rep, err := Check(context.Background(), Inputs{BaseURL: indexURL + "/releases", HTTP: ix.client(), Kube: cs, Installed: tc.installed, Now: func() time.Time { return now }})
+		rep, err := Check(context.Background(), Inputs{BaseURL: indexURL + indexPath, HTTP: ix.client(), Kube: cs, Installed: tc.installed, Now: func() time.Time { return now }})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -214,6 +270,8 @@ func TestCheckComparesNodes(t *testing.T) {
 			{Name: "a", Version: "v1.37.1+k3sm.0.2.0", State: status.UpdateCurrent},
 			{Name: "b", Version: "v1.36.2+k3sm.0.1.7", State: status.UpdateBehind},
 			{Name: "c", Version: "v1.37.1", State: status.UpdateUnknown},
+			{Name: "d", Version: "v1.37.1+k3sm.0.3.0-rc.1", State: status.UpdateAhead},
+			{Name: "e", Version: "v1.37.1+k3sm.0.2.0.dirty", State: status.UpdateUnknown},
 		}
 		if len(rep.Nodes) != len(want) {
 			t.Fatalf("nodes = %+v", rep.Nodes)

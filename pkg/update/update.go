@@ -24,7 +24,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -82,7 +81,8 @@ type Node struct {
 	Name string `json:"name"`
 	// Version is status.nodeInfo.kubeletVersion as the node reports it.
 	Version string `json:"version"`
-	// State is status.UpdateCurrent, UpdateBehind or UpdateUnknown.
+	// State is status.UpdateCurrent, UpdateBehind, UpdateAhead or
+	// UpdateUnknown.
 	State string `json:"state"`
 }
 
@@ -90,15 +90,18 @@ type Node struct {
 type Report struct {
 	CheckedAt time.Time `json:"checkedAt"`
 	Latest    Release   `json:"latest"`
-	// Installed is this binary's version, InstalledState how it compares.
+	// Installed is this binary's version, InstalledDirty whether it was built
+	// from a modified tree, and InstalledState how it compares.
 	Installed      string `json:"installed"`
+	InstalledDirty bool   `json:"installedDirty,omitempty"`
 	InstalledState string `json:"installedState,omitempty"`
 	// Nodes is every Node, sorted by name; empty when no cluster was asked.
 	Nodes []Node `json:"nodes"`
 }
 
 // Record is the report as `k3sm status` reads it, with err (the check's
-// failure, nil when it finished) as its error text.
+// failure, nil when it finished) as its error text, control-stripped and
+// clipped to status.UpdateErrorMax bytes.
 func (r Report) Record(err error) status.UpdateRecord {
 	rec := status.UpdateRecord{
 		CheckedAt:      r.CheckedAt,
@@ -106,10 +109,11 @@ func (r Report) Record(err error) status.UpdateRecord {
 		Published:      r.Latest.Published,
 		KubeVersion:    r.Latest.KubeVersion,
 		Installed:      r.Installed,
+		InstalledDirty: r.InstalledDirty,
 		InstalledState: r.InstalledState,
 	}
 	if err != nil {
-		rec.Error = err.Error()
+		rec.Error = status.ClipText(err.Error(), status.UpdateErrorMax)
 	}
 	for _, n := range r.Nodes {
 		rec.Nodes = append(rec.Nodes, status.UpdateNode{Name: n.Name, Version: n.Version, State: n.State})
@@ -125,7 +129,7 @@ func Check(ctx context.Context, in Inputs) (Report, error) {
 	if in.Now != nil {
 		now = in.Now
 	}
-	rep := Report{CheckedAt: now().UTC(), Installed: in.Installed.Version, Nodes: []Node{}}
+	rep := Report{CheckedAt: now().UTC(), Installed: in.Installed.Version, InstalledDirty: in.Installed.Dirty, Nodes: []Node{}}
 	rel, err := Latest(ctx, in)
 	if err != nil {
 		return rep, fmt.Errorf("resolve the latest release: %w", err)
@@ -141,7 +145,7 @@ func Check(ctx context.Context, in Inputs) (Report, error) {
 	}
 	for _, n := range list.Items {
 		v := n.Status.NodeInfo.KubeletVersion
-		rep.Nodes = append(rep.Nodes, Node{Name: n.Name, Version: v, State: nodeState(v, rel.Tag)})
+		rep.Nodes = append(rep.Nodes, Node{Name: n.Name, Version: v, State: status.NodeReleaseState(v, rel.Tag)})
 	}
 	sort.Slice(rep.Nodes, func(i, j int) bool { return rep.Nodes[i].Name < rep.Nodes[j].Name })
 	return rep, nil
@@ -166,7 +170,7 @@ func Latest(ctx context.Context, in Inputs) (Release, error) {
 	r := reader{client: noDowngrade(in.HTTP), base: base, ua: "k3sm/" + in.Installed.Version}
 
 	tag, stableErr := r.stableTag(ctx)
-	if errors.Is(stableErr, errBadTag) {
+	if errors.Is(stableErr, errBadTag) || errors.Is(stableErr, errRedirectPin) {
 		return Release{}, stableErr
 	}
 	if tag == "" {
@@ -244,11 +248,31 @@ func (r reader) stableTag(ctx context.Context) (string, error) {
 	if resp.StatusCode >= 400 {
 		return "", fmt.Errorf("%s/latest: %s", r.base, resp.Status)
 	}
-	final := resp.Request.URL.Path
-	if path.Base(path.Dir(final)) != "tag" {
+	return pinnedTag(r.base, resp.Request.URL)
+}
+
+// pinnedTag is the tag the `latest` redirect landed on, held to the index it
+// was asked of: the final URL must be on the base URL's host, and its path the
+// base path itself (no stable release yet: "") or <base path>/tag/<tag>
+// (for DefaultBaseURL, /k3sm-io/k3sm/releases/tag/). Anywhere else is refused,
+// so a redirect cannot hand the check another repository's tag.
+func pinnedTag(base string, final *url.URL) (string, error) {
+	b, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(final.Host, b.Host) {
+		return "", fmt.Errorf("%w to another host: %s", errRedirectPin, final.Redacted())
+	}
+	basePath := strings.TrimRight(b.Path, "/")
+	if strings.TrimRight(final.Path, "/") == basePath {
 		return "", nil
 	}
-	tag, err := url.PathUnescape(path.Base(final))
+	escaped, ok := strings.CutPrefix(final.EscapedPath(), basePath+"/tag/")
+	if !ok || escaped == "" || strings.Contains(escaped, "/") {
+		return "", fmt.Errorf("%w outside %s/tag/: %s", errRedirectPin, basePath, final.Redacted())
+	}
+	tag, err := url.PathUnescape(escaped)
 	if err != nil {
 		return "", err
 	}
@@ -257,6 +281,9 @@ func (r reader) stableTag(ctx context.Context) (string, error) {
 	}
 	return tag, nil
 }
+
+// errRedirectPin is a `latest` redirect that left the index (pinnedTag).
+var errRedirectPin = errors.New("refusing the latest-release redirect")
 
 // errBadTag is a stable tag outside ValidTag. It is final, as in install.sh:
 // the stable channel answered, and with something no release can be.
@@ -336,22 +363,9 @@ func (r reader) getJSON(ctx context.Context, u string, v any) error {
 	return nil
 }
 
-// ValidTag reports whether tag is a usable release tag: non-empty, not
-// starting with "-", and only the characters a git version tag carries
-// (install.sh's valid_tag).
-func ValidTag(tag string) bool {
-	if tag == "" || strings.HasPrefix(tag, "-") {
-		return false
-	}
-	for _, c := range tag {
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '.', c == '+', c == '_', c == '-':
-		default:
-			return false
-		}
-	}
-	return true
-}
+// ValidTag reports whether tag is a usable release tag (version.ValidTag,
+// install.sh's valid_tag).
+func ValidTag(tag string) bool { return version.ValidTag(tag) }
 
 // kubeVersionNote is how release notes name the Kubernetes version a release
 // ships ("The control plane runs Kubernetes v1.37.1"). k3sm publishes no
@@ -367,29 +381,11 @@ func kubeVersionFrom(body string) string {
 }
 
 // installedState compares this binary's version with tag. A binary built from
-// a modified tree is not the release, whatever it is stamped.
+// a modified tree is not the release, whatever it is stamped, so it compares
+// as unknown, like a dev build.
 func installedState(v version.Info, tag string) string {
-	if !v.Dirty && strings.TrimPrefix(v.Version, "v") == strings.TrimPrefix(tag, "v") {
-		return status.UpdateCurrent
-	}
-	return status.UpdateBehind
-}
-
-// nodeK3smMarker separates the Kubernetes version from the k3sm release in a
-// k3sm node's kubelet version (version.Info.NodeVersion).
-const nodeK3smMarker = "+k3sm."
-
-// nodeState compares a node's kubelet version with tag, through the same
-// encoding the node reports with, so a tag and the node running it compare
-// equal whatever the build metadata rules make of the tag.
-func nodeState(kubelet, tag string) string {
-	_, have, ok := strings.Cut(kubelet, nodeK3smMarker)
-	if !ok || have == "" {
+	if v.Dirty {
 		return status.UpdateUnknown
 	}
-	_, want, _ := strings.Cut(version.Info{KubeVersion: "v0", Version: tag}.NodeVersion(), nodeK3smMarker)
-	if have == want {
-		return status.UpdateCurrent
-	}
-	return status.UpdateBehind
+	return status.ReleaseState(v.Version, tag)
 }

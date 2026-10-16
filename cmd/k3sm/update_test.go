@@ -225,3 +225,60 @@ func TestUpdateCheckDue(t *testing.T) {
 		t.Errorf("unparseable record: due in %s", d)
 	}
 }
+
+// TestUpdateRecordRefusesAnUnsafeStatusDir pins the check before every write:
+// a symlink or a file where the status directory belongs is refused, nothing
+// is written through it, and a directory owned by anyone but root or the work
+// dir's owner is refused with the uids.
+func TestUpdateRecordRefusesAnUnsafeStatusDir(t *testing.T) {
+	rec := status.UpdateRecord{CheckedAt: time.Now()}
+	t.Run("symlink", func(t *testing.T) {
+		wd, elsewhere := t.TempDir(), t.TempDir()
+		if err := os.Symlink(elsewhere, filepath.Join(wd, status.UpdateDirName)); err != nil {
+			t.Fatal(err)
+		}
+		err := writeUpdateRecord(wd, rec)
+		if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+			t.Fatalf("err = %v, want the symlink refusal", err)
+		}
+		if entries, _ := os.ReadDir(elsewhere); len(entries) != 0 {
+			t.Errorf("wrote through the symlink: %v", entries)
+		}
+	})
+	t.Run("file", func(t *testing.T) {
+		wd := t.TempDir()
+		if err := os.WriteFile(filepath.Join(wd, status.UpdateDirName), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeUpdateRecord(wd, rec); err == nil || !strings.Contains(err.Error(), "not a directory") {
+			t.Fatalf("err = %v, want the not-a-directory refusal", err)
+		}
+	})
+	t.Run("foreign owner", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root owns every directory it makes")
+		}
+		dir := t.TempDir()
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mine := uint32(os.Geteuid())
+		if err := checkStatusDir(dir, fi, mine); err != nil {
+			t.Errorf("the work dir owner's directory: %v", err)
+		}
+		if err := checkStatusDir(dir, fi, mine+1); err == nil || !strings.Contains(err.Error(), "neither root nor the work dir's owner") {
+			t.Errorf("err = %v, want the owner refusal", err)
+		}
+	})
+	t.Run("created", func(t *testing.T) {
+		wd := t.TempDir()
+		if err := writeUpdateRecord(wd, rec); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Lstat(filepath.Join(wd, status.UpdateDirName))
+		if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 {
+			t.Errorf("status dir %v, err %v; want a 0755 directory", fi.Mode(), err)
+		}
+	})
+}
