@@ -109,7 +109,7 @@ func topRun(t *testing.T, kube *fixtureKube, args ...string) (int, string, strin
 		t.Fatal("the full report was collected for the top view")
 		return status.Report{}
 	})
-	r.top = lazyTop(func() *status.TopCollector {
+	r.top = lazyTop(func(context.Context) *status.TopCollector {
 		return &status.TopCollector{Kube: kube, Now: func() time.Time { return topFixtureNow }}
 	})
 	code := r.run(context.Background(), o)
@@ -186,7 +186,7 @@ func TestStatusTopClusterUnreadable(t *testing.T) {
 	t.Parallel()
 	var out, errOut bytes.Buffer
 	r := testRunner(&out, &errOut, nil)
-	r.top = lazyTop(func() *status.TopCollector {
+	r.top = lazyTop(func(context.Context) *status.TopCollector {
 		return &status.TopCollector{KubeErr: os.ErrPermission}
 	})
 	o, err := parseStatusArgs([]string{"top"}, &errOut)
@@ -217,7 +217,7 @@ func TestStatusTopWatchPollsMetricsAtMostEvery5s(t *testing.T) {
 		frames++
 		return frames < 6
 	}
-	r.top = lazyTop(func() *status.TopCollector {
+	r.top = lazyTop(func(context.Context) *status.TopCollector {
 		return &status.TopCollector{Kube: kube, Now: func() time.Time { return now }}
 	})
 	o, err := parseStatusArgs([]string{"top", "--watch=2s"}, &errOut)

@@ -103,20 +103,28 @@ func newStatusRunner(o statusOptions) statusRunner {
 // lazyTop builds the top collector on the first frame and keeps it for every
 // later one, so the other views never resolve its client and a --watch loop
 // keeps one metrics sample between frames.
-func lazyTop(build func() *status.TopCollector) func(context.Context, status.TopOptions) status.TopReport {
+func lazyTop(build func(context.Context) *status.TopCollector) func(context.Context, status.TopOptions) status.TopReport {
 	var c *status.TopCollector
 	return func(ctx context.Context, o status.TopOptions) status.TopReport {
 		if c == nil {
-			c = build()
+			c = build(ctx)
 		}
 		return c.Collect(ctx, o)
 	}
 }
 
-// newTopCollector resolves the apiserver client the full report would use: the
-// role's credentials, and on a worker whose node credential this account cannot
-// read, the account's own kubeconfig context for the server it joined.
-func newTopCollector() *status.TopCollector {
+// newTopCollector resolves the top view's apiserver client (chooseTopKube):
+// under sudo, the invoking user's own kubeconfig when it can list nodes;
+// otherwise the client the full report would use, which is the role's
+// credentials, and on a worker whose node credential this account cannot read,
+// the account's own kubeconfig context for the server it joined.
+func newTopCollector(ctx context.Context) *status.TopCollector {
+	kube, err := chooseTopKube(ctx, topSudoInputsFromEnv(), reportTopKube)
+	return &status.TopCollector{Kube: kube, KubeErr: err, Now: time.Now}
+}
+
+// reportTopKube is the client the full report would use, for the top view.
+func reportTopKube() (status.Kube, error) {
 	euid := os.Geteuid()
 	role, _ := installedRole()
 	paths := statusPaths(statusWorkDir(euid, lookupServiceUID()))
@@ -128,7 +136,7 @@ func newTopCollector() *status.TopCollector {
 			}
 		}
 	}
-	return &status.TopCollector{Kube: kube, KubeErr: err, Now: time.Now}
+	return kube, err
 }
 
 // appBundlePath is where k3sm.app is installed.
