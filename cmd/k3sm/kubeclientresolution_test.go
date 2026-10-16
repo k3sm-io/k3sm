@@ -106,7 +106,7 @@ func TestNewKubeClientResolution(t *testing.T) {
 	t.Run("builder loads the work-dir kubeconfig", func(t *testing.T) {
 		workDir := t.TempDir()
 		writeKubeconfigAt(t, executor.KubeconfigPath(workDir), "https://127.0.0.1:6443")
-		mgr, err := newBuilderManager(builderOptions{workDir: workDir})
+		mgr, err := newBuilderManager(builderOptions{workDir: workDir, workDirExplicit: true})
 		if err != nil {
 			t.Fatalf("newBuilderManager with a real kubeconfig: %v", err)
 		}
@@ -118,7 +118,7 @@ func TestNewKubeClientResolution(t *testing.T) {
 	t.Run("builder absent kubeconfig names `k3sm server` verbatim", func(t *testing.T) {
 		workDir := t.TempDir()
 		kc := executor.KubeconfigPath(workDir)
-		_, err := newBuilderManager(builderOptions{workDir: workDir})
+		_, err := newBuilderManager(builderOptions{workDir: workDir, workDirExplicit: true})
 		if err == nil {
 			t.Fatal("expected an error for a missing kubeconfig")
 		}
@@ -131,7 +131,7 @@ func TestNewKubeClientResolution(t *testing.T) {
 	t.Run("builder unparseable kubeconfig keeps the site's load wrap", func(t *testing.T) {
 		workDir := t.TempDir()
 		kc := writeUnparseableKubeconfigAt(t, executor.KubeconfigPath(workDir))
-		_, err := newBuilderManager(builderOptions{workDir: workDir})
+		_, err := newBuilderManager(builderOptions{workDir: workDir, workDirExplicit: true})
 		if err == nil {
 			t.Fatal("expected an error for an unparseable kubeconfig")
 		}
