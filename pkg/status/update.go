@@ -102,7 +102,35 @@ type UpdateRecord struct {
 	InstalledState string `json:"installedState,omitempty"`
 	// Nodes is every Node of the cluster, sorted by name.
 	Nodes []UpdateNode `json:"nodes,omitempty"`
+	// Roll is the managed update in progress, nil when none is: the server
+	// refreshes it while an Update is not finished, independently of the
+	// hourly check.
+	Roll *UpdateRoll `json:"roll,omitempty"`
 }
+
+// UpdateRoll is the managed update a record saw in progress.
+type UpdateRoll struct {
+	// ObservedAt is when the server last read the Update. The row trusts a
+	// roll only while it is fresh (UpdateRollStaleAfter).
+	ObservedAt time.Time `json:"observedAt"`
+	// Version is the release the cluster is moving to (spec.version).
+	Version string `json:"version"`
+	// Phase is the Update's display phase (Pending, Rolling), empty before
+	// the controller reconciles it.
+	Phase string `json:"phase,omitempty"`
+	// Node is the node being updated and NodePhase its step; both empty
+	// before the first node starts.
+	Node      string `json:"node,omitempty"`
+	NodePhase string `json:"nodePhase,omitempty"`
+}
+
+// UpdateRollEvery is how often a server re-reads the Update while one may be
+// in progress, and so how far the update row trails the controller.
+const UpdateRollEvery = 30 * time.Second
+
+// UpdateRollStaleAfter is how old a recorded roll may get before the row
+// stops reporting it: several missed refreshes, as when the server is down.
+const UpdateRollStaleAfter = 5 * time.Minute
 
 // UpdateNode is one Node of an update record.
 type UpdateNode struct {
@@ -163,6 +191,12 @@ func validUpdateRecord(rec UpdateRecord) error {
 	if !utf8.ValidString(rec.Error) || len(rec.Error) > UpdateErrorMax+len("...") {
 		return fmt.Errorf("%w: error text", errUpdateRecordInvalid)
 	}
+	if r := rec.Roll; r != nil {
+		if !version.ValidTag(r.Version) || !UpdatePhaseWord(r.Phase) || !UpdatePhaseWord(r.NodePhase) ||
+			(r.Node != "" && len(validation.IsDNS1123Subdomain(r.Node)) > 0) {
+			return fmt.Errorf("%w: roll", errUpdateRecordInvalid)
+		}
+	}
 	for _, n := range rec.Nodes {
 		if len(validation.IsDNS1123Subdomain(n.Name)) > 0 {
 			return fmt.Errorf("%w: node name", errUpdateRecordInvalid)
@@ -175,6 +209,21 @@ func validUpdateRecord(rec UpdateRecord) error {
 		}
 	}
 	return nil
+}
+
+// UpdatePhaseWord reports whether s may be a recorded update phase: empty, or
+// a short run of ASCII letters (the phases are open-ended display words, so
+// the shape is checked, not the value).
+func UpdatePhaseWord(s string) bool {
+	if len(s) > 32 {
+		return false
+	}
+	for _, c := range s {
+		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
+			return false
+		}
+	}
+	return true
 }
 
 // knownUpdateWord reports whether s is a per-node update word (or empty, when
@@ -276,6 +325,9 @@ func UpdateRowFrom(rec UpdateRecord, now time.Time) Row {
 		row.Detail = err.Error()
 		return row
 	}
+	if r := rec.Roll; r != nil && !r.ObservedAt.After(now.Add(updateClockSlack)) && now.Sub(r.ObservedAt) <= UpdateRollStaleAfter {
+		return updateRollRow(row, *r)
+	}
 	row.Wide["checked"] = rec.CheckedAt.UTC().Format(time.RFC3339)
 	if rec.Latest != "" {
 		row.Wide["latest"] = rec.Latest
@@ -346,6 +398,29 @@ func UpdateRowFrom(rec UpdateRecord, now time.Time) Row {
 	default:
 		row.State, row.Severity = StateOK, SeverityOK
 		row.Detail = fmt.Sprintf("every node runs the latest release, k3sm %s", rec.Latest)
+	}
+	return row
+}
+
+// updateRollRow is the update row while a managed update is in progress. It
+// is informational: severity ok, no remedy, the verdict unmoved.
+func updateRollRow(row Row, r UpdateRoll) Row {
+	row.State, row.Severity, row.Remedy = StateRolling, SeverityOK, ""
+	phase := r.Phase
+	if phase == "" {
+		phase = "Pending"
+	}
+	row.Wide["target"] = r.Version
+	row.Wide["phase"] = phase
+	row.Wide["observed"] = r.ObservedAt.UTC().Format(time.RFC3339)
+	row.Detail = fmt.Sprintf("updating the cluster to k3sm %s: %s", r.Version, phase)
+	if r.Node != "" {
+		row.Wide["node"] = r.Node
+		row.Detail += ", node " + r.Node
+		if r.NodePhase != "" {
+			row.Wide["node-phase"] = r.NodePhase
+			row.Detail += " " + r.NodePhase
+		}
 	}
 	return row
 }

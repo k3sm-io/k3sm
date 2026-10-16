@@ -160,7 +160,7 @@ Row names in the full report include `install`, `netd`, `server` or `agent`, `ap
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
 `mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
-`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind` or `ahead`.
+`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind`, `ahead` or `rolling`.
 
 `needs-admin` marks a check that only root can run, so nothing was checked and nothing is wrong. Its
 `remedy` is `sudo k3sm status`, and it never changes the `verdict`. A client can show it as not
@@ -271,6 +271,16 @@ reads the row. Its `state` is:
   a cluster with an update available is still `running`.
 - `ahead` (severity `ok`) when a node runs a release newer than the latest and none is behind.
   `detail` names those nodes; there is no remedy.
+- `rolling` (severity `ok`) while a managed update is in progress (see
+  [Upgrade](upgrade.md#managed-update)): the server reads the `Update` every 30 seconds and records
+  it beside the check, so a roll started from any Mac shows here. `detail` names the target release,
+  the update's phase and the node being updated with its step, for example `updating the cluster to
+  k3sm v0.2.0: Rolling, node laptop Installing`. `wide.target` is the release, `wide.phase` the
+  update's phase (`Pending` before the first node starts), `wide.node` and `wide.node-phase` the node
+  being updated and its step (omitted before the first node starts), and `wide.observed` when the
+  server last read the update. There is no remedy and the verdict does not move. A roll the server
+  has not refreshed for five minutes (the server is down, say) is no longer reported, and the row
+  falls back to the check's state. Once the update finishes the row returns to the check's state.
 - `unknown` when the last check could not finish (`detail` carries its error, first line only and
   redacted), when a node reports no tagged k3sm release, when no check is recorded, or when the record
   is older than 24 hours, dated more than five minutes in the future, or fails validation. The remedy

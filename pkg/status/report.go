@@ -83,6 +83,9 @@ const (
 	// StateAhead is the update row's word for a cluster with a node newer than
 	// the latest release and none behind it.
 	StateAhead RowState = "ahead"
+	// StateRolling is the update row's word for a cluster the server's update
+	// controller is rolling to a release (an Update not yet finished).
+	StateRolling RowState = "rolling"
 )
 
 // Row is one subsystem's line in the report.

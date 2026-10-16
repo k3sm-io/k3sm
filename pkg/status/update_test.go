@@ -192,3 +192,58 @@ func TestUpdateRowReadsTheRecord(t *testing.T) {
 		t.Error("a collector with no work dir has an update row")
 	}
 }
+
+// TestUpdateRowRolling pins the row while a managed update is in progress: a
+// fresh roll is `rolling` (severity ok, no remedy) with the phase and the
+// current node in the detail and wide.phase / wide.node, ahead of a behind
+// cluster or a failed check; a stale roll falls back to the check's verdict;
+// a roll of the wrong shape invalidates the record.
+func TestUpdateRowRolling(t *testing.T) {
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	behind := UpdateRecord{CheckedAt: now.Add(-time.Hour), Latest: "v0.2.0", Nodes: []UpdateNode{nodeAt("laptop", "0.1.7", UpdateCurrent)}}
+	roll := func(at time.Time, node, nodePhase string) *UpdateRoll {
+		return &UpdateRoll{ObservedAt: at, Version: "v0.2.0", Phase: "Rolling", Node: node, NodePhase: nodePhase}
+	}
+	for _, tc := range []struct {
+		name       string
+		rec        UpdateRecord
+		state      RowState
+		detail     string
+		phase, nd  string
+		withRemedy bool
+	}{
+		{"rolling a node", func() UpdateRecord {
+			r := behind
+			r.Roll = roll(now.Add(-time.Minute), "laptop", "Installing")
+			return r
+		}(),
+			StateRolling, "updating the cluster to k3sm v0.2.0: Rolling, node laptop Installing", "Rolling", "laptop", false},
+		{"pending, no check recorded", UpdateRecord{Roll: &UpdateRoll{ObservedAt: now, Version: "v0.2.0"}},
+			StateRolling, "updating the cluster to k3sm v0.2.0: Pending", "Pending", "", false},
+		{"check failed", func() UpdateRecord {
+			r := behind
+			r.Error, r.Roll = "dial tcp: refused", roll(now, "laptop", "Downloading")
+			return r
+		}(), StateRolling, "node laptop Downloading", "Rolling", "laptop", false},
+		{"stale roll", func() UpdateRecord {
+			r := behind
+			r.Roll = roll(now.Add(-UpdateRollStaleAfter-time.Second), "laptop", "Installing")
+			return r
+		}(),
+			StateBehind, "behind: laptop", "", "", true},
+		{"bad node name", func() UpdateRecord { r := behind; r.Roll = roll(now, "Bad Node", "Installing"); return r }(),
+			StateUnknown, "roll", "", "", true},
+		{"bad phase", func() UpdateRecord { r := behind; r.Roll = roll(now, "laptop", "Installing\x1b[2J"); return r }(),
+			StateUnknown, "roll", "", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := UpdateRowFrom(tc.rec, now)
+			if r.State != tc.state || !strings.Contains(r.Detail, tc.detail) || r.Wide["phase"] != tc.phase || r.Wide["node"] != tc.nd || (r.Remedy != "") != tc.withRemedy {
+				t.Errorf("row = %+v", r)
+			}
+			if tc.state == StateRolling && (r.Severity != SeverityOK || r.Wide["target"] != "v0.2.0") {
+				t.Errorf("rolling row = %+v", r)
+			}
+		})
+	}
+}

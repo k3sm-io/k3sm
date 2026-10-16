@@ -46,7 +46,6 @@ import (
 	"k3sm.io/k3sm/pkg/rbac"
 	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/k3sm/pkg/runtimeclass"
-	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/svclb"
 	"k3sm.io/k3sm/pkg/updatectl"
 )
@@ -575,7 +574,15 @@ func startProvisioner(ctx context.Context, plan serverPlan, cs kubernetes.Interf
 func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (mlxGPU *operator.RuntimeGPU, stop func()) {
 	mlxGPU, stopMLX := startMLXOperator(ctx, plan, restCfg, cs, logger)
 	stopInterconnect := startInterconnectResolver(ctx, plan, restCfg, cs, logger)
-	go runUpdateRecorder(ctx, plan.opts.workDir, cs, status.UpdateRecordInterval, logger)
+	// A dynamic client that cannot be built leaves the update row without
+	// the managed update in progress; the release check still runs.
+	var dyn dynamic.Interface
+	if d, err := dynamic.NewForConfig(restCfg); err != nil {
+		logger.Error("update record: the update row will not show a roll: build its dynamic client", "err", err)
+	} else {
+		dyn = d
+	}
+	go runUpdateRecorder(ctx, plan.opts.workDir, cs, dyn, logger)
 	stopUpdates := startUpdateController(ctx, plan, restCfg, cs, logger)
 	return mlxGPU, func() {
 		stopUpdates()
