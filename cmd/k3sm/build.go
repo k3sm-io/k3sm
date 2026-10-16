@@ -39,6 +39,10 @@ const buildUsage = `k3sm build — build an image from a Dockerfile
 
 Usage: k3sm build --tag <ref> --output <path> [flags] <context-dir>
        k3sm build ls [-o text|json]
+       k3sm build cancel <id>
+       k3sm build rm <id>
+       k3sm build logs [-f] <id>
+       k3sm build prune [--all] [--force]
 
 ONE command, two engines, chosen from the Dockerfile:
 
@@ -91,6 +95,10 @@ Every build is kept in your build history, the newest 200 of them:
 
   k3sm build ls                                  # a table, newest first
   k3sm build ls -o json                          # the records as JSON
+  k3sm build logs -f <id>                        # a build's output, followed
+  k3sm build cancel <id>                         # stop a running build
+  k3sm build rm <id>                             # drop a record and its log
+  k3sm build prune [--all] --force               # reclaim the engine's cache
 
 Pin FROM to a digest (name@sha256:…) if you want a reproducible build: a tag can
 move under you. See docs/user/what-runs.md for the whole path, and
@@ -124,8 +132,13 @@ type buildOptions struct {
 
 // runBuild is the `k3sm build` entry point.
 func runBuild(args []string) error {
-	if len(args) > 0 && args[0] == "ls" {
-		return runBuildLs(args[1:], os.Stdout)
+	if len(args) > 0 {
+		switch args[0] {
+		case "ls":
+			return runBuildLs(args[1:], os.Stdout)
+		case "cancel", "rm", "logs", "prune":
+			return runBuildManage(args[0], args[1:])
+		}
 	}
 	opts, err := parseBuildArgs(args, os.Stderr)
 	if err != nil {
@@ -219,9 +232,10 @@ func build(ctx context.Context, o buildOptions, out io.Writer) error {
 func buildRecorded(ctx context.Context, l *buildledger.Ledger, o buildOptions, out io.Writer, engineFor func(storeRecorder) engineBuilder, record storeRecorder, push imagePusher) error {
 	tr := startBuildRecord(l, o)
 	record = tr.recorder(record)
-	err := buildWith(ctx, o, out, tr.engine(engineFor(record)), record, push)
-	tr.finish(err)
-	return err
+	out = tr.tee(out)
+	return tr.run(ctx, func(ctx context.Context) error {
+		return buildWith(ctx, o, out, tr.engine(engineFor(record)), record, push)
+	})
 }
 
 // buildWith is build with the engine seam injected.

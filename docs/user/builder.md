@@ -145,6 +145,22 @@ PersistentVolumeClaim (40Gi by default; `k3sm builder up --cache-size <size>`).
 For a cold cache, `k3sm builder delete` removes the PVC (and the namespace) for
 you, and the next start rebuilds the cache from scratch.
 
+To reclaim space without losing the engine, prune the cache. The engine must be
+running, because BuildKit does the pruning:
+
+```sh
+k3sm build prune                # dry run: what a prune would reclaim
+k3sm build prune --force        # prune, and print the bytes reclaimed
+k3sm build prune --all --force  # also the internal, frontend and shared records
+```
+
+A default prune removes the cache records nothing holds, and keeps BuildKit's
+internal and frontend records (the Dockerfile frontend among them) and the cache
+shared with images the engine built, which the next build reuses. `--all`
+removes those too, so the next build starts colder. Cache that a running build
+holds is never removed. The dry run's figure is an estimate: removing a record can
+free its parent, so a prune can reclaim a little more than it said.
+
 The cache lives on an ext4 image the guest loop-mounts on the claim, because
 BuildKit's overlay snapshotter needs a real Linux filesystem and the host storage
 cannot provide that shape directly.

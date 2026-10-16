@@ -32,6 +32,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 
+	"k3sm.io/k3sm/pkg/builder"
 	"k3sm.io/k3sm/pkg/buildledger"
 )
 
@@ -67,6 +68,9 @@ type buildRecord struct {
 	// digest is the digest of the image the store recorded, captured by the
 	// recorder wrapper on the path that ran.
 	digest string
+	// log is the build's stored log (`k3sm build logs`), or nil when it could
+	// not be created.
+	log *buildledger.LogWriter
 }
 
 // startBuildRecord writes the running record for o. The route starts as the
@@ -93,7 +97,93 @@ func startBuildRecord(l *buildledger.Ledger, o buildOptions) *buildRecord {
 		return tr
 	}
 	tr.rec, tr.started = rec, true
+	if tr.log, err = l.CreateLog(rec.ID); err != nil {
+		slog.Warn("build ledger: this build's log is not kept", "id", rec.ID, "err", err)
+	}
 	return tr
+}
+
+// teeOutput is a build's output writer that also carries where the build's
+// error stream goes, so the engine path can hand buildx's progress (stderr) to
+// the same log its stdout reaches without widening the engineBuilder seam.
+type teeOutput struct {
+	io.Writer
+	// stderr is the error stream copied into the log, for a stderr that is not
+	// a terminal.
+	stderr io.Writer
+	// term is the process's stderr when it is a terminal, and log the log's
+	// error-stream input: the engine runs buildx on a pseudo-terminal then, so
+	// its interactive progress still draws, and copies it to both.
+	term *os.File
+	log  io.Writer
+}
+
+// processStderr is the process's own error stream; a seam for the tests.
+var processStderr io.Writer = os.Stderr
+
+// stderrOf is the error stream that belongs with out: the tee's when out is
+// one, the process's otherwise.
+func stderrOf(out io.Writer) io.Writer {
+	if t, ok := out.(*teeOutput); ok {
+		return t.stderr
+	}
+	return processStderr
+}
+
+// stderrTerminal is the process's stderr when it is a terminal, else nil. A
+// seam so the tee's choice is testable without a terminal.
+var stderrTerminal = func() *os.File {
+	if builder.IsTerminal(os.Stderr) {
+		return os.Stderr
+	}
+	return nil
+}
+
+// tee returns out, and the process's stderr, each copied into the build's
+// log. Each stream reaches the log through its own PlainWriter, so the log
+// holds text and not terminal control. Without a log, out is returned
+// unchanged.
+func (tr *buildRecord) tee(out io.Writer) io.Writer {
+	if tr.log == nil {
+		return out
+	}
+	errLog := buildledger.NewPlainWriter(tr.log)
+	t := &teeOutput{
+		Writer: io.MultiWriter(out, buildledger.NewPlainWriter(tr.log)),
+		stderr: io.MultiWriter(stderrOf(out), errLog),
+		log:    errLog,
+	}
+	if _, nested := out.(*teeOutput); !nested {
+		t.term = stderrTerminal()
+	}
+	return t
+}
+
+// runEngineBuildx runs buildx for an engine build, its output going where out
+// says: on a pseudo-terminal when the build's stderr is a terminal and the
+// build is logged, so buildx draws its interactive progress, and with a plain
+// copy to stderrOf(out) otherwise.
+func runEngineBuildx(ctx context.Context, bin string, args, env []string, out io.Writer) error {
+	if t, ok := out.(*teeOutput); ok && t.term != nil {
+		return builder.RunBuildxPTY(ctx, bin, args, env, out, t.term, t.log)
+	}
+	return builder.RunBuildxTo(ctx, bin, args, env, out, stderrOf(out))
+}
+
+// run runs job, cancellable through `k3sm build cancel` when the build is
+// recorded, and records the outcome.
+func (tr *buildRecord) run(ctx context.Context, job func(context.Context) error) error {
+	if tr.log != nil {
+		defer func() {
+			if err := tr.log.Close(); err != nil {
+				slog.Warn("build ledger: close the build's log", "id", tr.rec.ID, "err", err)
+			}
+		}()
+	}
+	if !tr.started {
+		return job(ctx)
+	}
+	return builder.RunCancellable(ctx, tr.ledger.CancelPath(tr.rec.ID), job, tr.finish)
 }
 
 // routeToEngine marks r as an engine build, for the platform the engine builds.
@@ -130,12 +220,19 @@ func (tr *buildRecord) recorder(next storeRecorder) storeRecorder {
 	}
 }
 
-// finish rewrites the record with the build's outcome.
-func (tr *buildRecord) finish(buildErr error) {
+// finish rewrites the record with the build's outcome: cancelled when a
+// `k3sm build cancel` stopped it.
+func (tr *buildRecord) finish(cancelled bool, buildErr error) {
 	if !tr.started {
 		return
 	}
-	if _, err := tr.ledger.Finish(tr.rec, tr.digest, buildErr); err != nil {
+	var err error
+	if cancelled {
+		_, err = tr.ledger.Cancel(tr.rec)
+	} else {
+		_, err = tr.ledger.Finish(tr.rec, tr.digest, buildErr)
+	}
+	if err != nil {
 		slog.Warn("build ledger: record the build's outcome", "id", tr.rec.ID, "err", err)
 	}
 }

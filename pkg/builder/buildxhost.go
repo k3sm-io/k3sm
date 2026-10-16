@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // The HOST-side buildx pin.
@@ -363,13 +364,48 @@ func BuildxArgs(userArgs []string) []string {
 // A non-zero exit is returned as an *exec.ExitError (wrapped), so the caller can
 // forward buildx's exit code instead of flattening it to 1.
 func RunBuildx(ctx context.Context, bin string, args, env []string) error {
+	return RunBuildxTo(ctx, bin, args, env, os.Stdout, os.Stderr)
+}
+
+// buildxStopGrace is how long a cancelled buildx gets, after SIGINT, to cancel
+// its solve and exit before it is killed.
+const buildxStopGrace = 30 * time.Second
+
+// RunBuildxTo is RunBuildx with buildx's output sent to stdout and stderr.
+//
+// Cancelling ctx is how a build is cancelled, so it INTERRUPTS buildx rather
+// than killing it: on SIGINT buildx cancels its solve, and buildkitd cancels
+// the build's job when the solve ends. A SIGKILL would leave buildkitd to
+// notice the dropped session on its own. buildx that has not exited
+// buildxStopGrace after the interrupt is killed.
+func RunBuildxTo(ctx context.Context, bin string, args, env []string, stdout, stderr io.Writer) error {
+	cmd := buildxCommand(ctx, bin, args, env)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	return buildxRunErr(ctx, cmd.Run())
+}
+
+// buildxCommand is the buildx process RunBuildxTo and RunBuildxPTY start:
+// stdin inherited, and cancellation an interrupt with a kill after
+// buildxStopGrace.
+func buildxCommand(ctx context.Context, bin string, args, env []string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Stdin = os.Stdin
 	cmd.Env = env
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("exec buildx: %w", err)
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = buildxStopGrace
+	return cmd
+}
+
+// buildxRunErr wraps a buildx run's error, naming the cancellation when ctx
+// ended it and keeping an *exec.ExitError in the chain.
+func buildxRunErr(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
 	}
-	return nil
+	if ctx.Err() != nil {
+		return fmt.Errorf("exec buildx: %w (%w)", ctx.Err(), err)
+	}
+	return fmt.Errorf("exec buildx: %w", err)
 }
 
 // buildxRunner runs one buildx subcommand and returns its combined output. It is

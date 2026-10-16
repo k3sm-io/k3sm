@@ -57,3 +57,5 @@ pkg/builder/buildxhost.go downloadTo http.DefaultClient # buildx release asset d
 pkg/executor/etcdsupervise.go tcpDial net.Dialer{} # readiness probe of the etcd child's 127.0.0.1 client port
 pkg/executor/etcdsupervise.go peerView http.Transport{} # cluster-ID and revision probe of an etcd peer listener on a server's --etcd-peer-ip LAN address (the underlay, never an lo0 alias)
 pkg/status/etcd.go httpGetLoopback http.DefaultClient # etcd metrics/health read on 127.0.0.1
+pkg/builder/cancel.go RequestCancel var net.Dialer # dials a running build's cancel unix socket in the 0700 ledger dir
+pkg/builder/cancel.go BuildAlive var net.Dialer # liveness dial of a running build's cancel unix socket

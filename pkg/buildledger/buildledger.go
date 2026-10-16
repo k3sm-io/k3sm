@@ -48,6 +48,9 @@ const (
 	StatusSucceeded Status = "succeeded"
 	// StatusFailed is a build that returned an error.
 	StatusFailed Status = "failed"
+	// StatusCancelled is a build stopped by `k3sm build cancel`, or a running
+	// record whose build process was gone when it was cancelled.
+	StatusCancelled Status = "cancelled"
 )
 
 const (
@@ -345,6 +348,13 @@ func (l *Ledger) prune() error {
 	var errs []error
 	for _, e := range entries[l.max:] {
 		if err := l.remove(filepath.Join(l.dir, e.name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+			continue
+		}
+		// The log goes with its record: a log nothing lists is space nobody can
+		// find to reclaim.
+		logName := strings.TrimSuffix(e.name, ".json") + logSuffix
+		if err := l.remove(filepath.Join(l.dir, logName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}
