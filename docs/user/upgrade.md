@@ -2,6 +2,28 @@
 
 Moving a k3sm node or cluster to a new release.
 
+## Checking for an Update
+
+```sh
+k3sm update check          # or: k3sm update check -o json
+```
+
+`k3sm update check` finds the latest release the way the install script does: the newest stable
+release, or, before the first stable release exists, the newest release of any kind. It prints the
+release tag, when it was published, the Kubernetes version it ships when its release notes say, the
+version of the `k3sm` binary you ran, and every node of the cluster with the version its kubelet
+reports, marked `current` or `behind`. A node whose kubelet reports no k3sm version is `unknown`. It
+only reads; it downloads and installs nothing. It exits 0 when the check finished and 1 when it
+could not (GitHub unreachable, for example), with the reason on stderr.
+
+The same check feeds the `update` row of `k3sm status` on a server. The server runs it at most once
+an hour and records the result; `k3sm status` reads that record and never contacts GitHub itself.
+The row is `ok` when every node runs the latest release, `behind` (severity `warn`) naming each node
+that does not, and `unknown` when the last check could not reach GitHub, when no check is recorded,
+or when the record is more than 24 hours old. An update never makes the verdict `degraded`. Run
+`sudo k3sm update check` to refresh the record on demand: the record lives in the server's work
+directory, so a check run without `sudo` prints its result but cannot record it.
+
 ## Single Node
 
 For script (gen-1) installs, re-run the one-liner:

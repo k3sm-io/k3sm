@@ -158,9 +158,9 @@ four.
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig` and `runtimed`; some rows appear only when the
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
-`mesh-claims`, `services`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
+`mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
-`skip`, `drift`, `healthy`, `unhealthy`, `stale` or `needs-admin`.
+`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin` or `behind`.
 
 `needs-admin` marks a check that only root can run, so nothing was checked and nothing is wrong. Its
 `remedy` is `sudo k3sm status`, and it never changes the `verdict`. A client can show it as not
@@ -239,6 +239,23 @@ with that, so a `kubernetes` port that lost its backend or left the table is `un
 pinned backend. Each report lists every Service and every EndpointSlice once from the apiserver, so
 a script that polls the full report pays for those two lists on every poll; poll the daemons probe
 when that is all you need.
+
+The `update` row appears on an installed server. It reports whether every node runs the latest k3sm
+release, from the record the last update check left (see [Upgrade](upgrade.md#checking-for-an-update)).
+The server checks at most once an hour and `sudo k3sm update check` checks on demand; the report itself
+never contacts GitHub. The record is in the server's work dir, so as any user but root the row is
+`unknown` with the remedy `sudo k3sm status`. Its `state` is:
+
+- `ok` when every node's kubelet reports the latest release.
+- `behind` (severity `warn`) when a node runs another release. `detail` names each such node and the
+  version its kubelet reports, and `remedy` is the install one-liner. The row never moves the verdict:
+  a cluster with an update available is still `running`.
+- `unknown` when the last check could not finish (`detail` carries its error, first line only and
+  redacted), when a node reports no k3sm version, when no check is recorded, or when the record is
+  older than 24 hours. The remedy is `sudo k3sm update check`.
+
+`wide.checked` is when the check ran, `wide.latest` the release tag and `wide.latest-kubernetes` the
+Kubernetes version that release ships, when its notes say.
 
 The `etcd` row's `wide` carries the scheduled etcd snapshots: `snapshot-schedule` (the cron
 expression, or `off`), and when a schedule is set, `last-scheduled-snapshot` (RFC 3339, or
