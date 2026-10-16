@@ -140,7 +140,8 @@ Every node daemon, server and agent alike, watches its own Node. When the update
 node:
 
 1. Writes the phase `Downloading` and fetches the release archive over HTTPS from `github.com`
-   (following redirects only to `objects.githubusercontent.com`), at most 512 MiB and within 10
+   (following redirects only to `objects.githubusercontent.com` and
+   `release-assets.githubusercontent.com`, each one checked), at most 512 MiB and within 10
    minutes, into a fresh directory under `/var/lib/k3sm/updates` that only the `_k3sm` user can
    read.
 2. Writes `Verifying` and checks the archive's sha256 against the release's published checksum

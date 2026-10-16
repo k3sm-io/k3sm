@@ -37,7 +37,8 @@ limitations under the License.
 // when the tag is not the build it runs:
 //
 //   - refuses a payload that is malformed, an archive URL that is not https
-//     on github.com or objects.githubusercontent.com, and a tag below the
+//     on github.com, objects.githubusercontent.com or
+//     release-assets.githubusercontent.com, and a tag below the
 //     running build unless the payload allows a downgrade;
 //   - writes Downloading and fetches the archive (at most MaxArchiveBytes,
 //     within DownloadTimeout) into a fresh directory under its own root, a

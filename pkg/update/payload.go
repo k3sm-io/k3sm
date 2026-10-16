@@ -90,9 +90,9 @@ func isSHA256Hex(s string) bool {
 }
 
 // AllowedHosts are the only hosts an archive is fetched from, on the first
-// request and on every redirect: GitHub's release download host and the host
-// it redirects release assets to.
-var AllowedHosts = []string{"github.com", "objects.githubusercontent.com"}
+// request and on every redirect: GitHub's release download host and the two
+// hosts it redirects release assets to.
+var AllowedHosts = []string{"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
 
 // CheckURL accepts an https URL with no user information, on an AllowedHosts
 // host and the default port.

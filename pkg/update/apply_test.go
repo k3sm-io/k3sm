@@ -38,7 +38,9 @@ func TestCheckURL(t *testing.T) {
 	}{
 		{"https://github.com/k3sm-io/k3sm/releases/download/v0.2.0/k3sm_0.2.0_darwin_arm64.tar.gz", true},
 		{"https://objects.githubusercontent.com/github-production-release-asset/1?X-Amz-Signature=x", true},
+		{"https://release-assets.githubusercontent.com/github-production-release-asset/1?sp=r", true},
 		{"https://GitHub.com:443/a", true},
+		{"https://assets.githubusercontent.com/a", false},
 		{"http://github.com/a", false},
 		{"https://github.com:8443/a", false},
 		{"https://user:pw@github.com/a", false},
@@ -233,6 +235,28 @@ func TestHTTPFetcherPinsEveryRedirect(t *testing.T) {
 	}
 	if _, err := (HTTPFetcher{Client: client("https://objects.githubusercontent.com/a", MaxArchiveBytes+1)}).Fetch(context.Background(), start); !errors.Is(err, ErrRefused) {
 		t.Errorf("oversized: Fetch = %v, want ErrRefused", err)
+	}
+	// Each hop is judged: github.com to release-assets is followed, but a
+	// release-assets response that redirects off the pin is refused.
+	hops := &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+		h := http.Header{}
+		switch r.URL.Host {
+		case "github.com":
+			h.Set("Location", "https://release-assets.githubusercontent.com/a")
+		case "release-assets.githubusercontent.com":
+			h.Set("Location", "https://evil.example/b")
+		default:
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: r}, nil
+		}
+		return &http.Response{StatusCode: http.StatusFound, Header: h, Body: http.NoBody, Request: r}, nil
+	})}
+	if _, err := (HTTPFetcher{Client: hops}).Fetch(context.Background(), start); !errors.Is(err, ErrRefused) {
+		t.Errorf("second hop off the pin: Fetch = %v, want ErrRefused", err)
+	}
+	if b, err := (HTTPFetcher{Client: client("https://release-assets.githubusercontent.com/a?sp=r", 2)}).Fetch(context.Background(), start); err != nil {
+		t.Errorf("redirect to release-assets: Fetch = %v", err)
+	} else {
+		_ = b.Close()
 	}
 	body, err := (HTTPFetcher{Client: client("https://objects.githubusercontent.com/a?sig=1", 2)}).Fetch(context.Background(), start)
 	if err != nil {
