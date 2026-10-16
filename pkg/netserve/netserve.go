@@ -74,8 +74,19 @@ const DefaultVMNetSubnet = "192.168.64.0/24"
 
 // Config configures the network services the server hosts.
 type Config struct {
-	// Client is the cluster client the Service/EndpointSlice watcher uses.
+	// Client is the cluster client every watcher of this datapath uses: the
+	// Service/EndpointSlice watcher, the cluster DNS zone and the NetworkPolicy
+	// watcher. On every node it is the node's netserve identity
+	// (certs.NetserveSubject), which pkg/rbac's k3sm:netserve role grants exactly
+	// those reads, cluster-wide, and nothing else.
 	Client kubernetes.Interface
+	// DNSServiceClient provisions the kube-system/kube-dns Service the cluster
+	// DNS resolver's privileged bind is authorized against (ensureDNSService).
+	// It is set ONLY on the server, to its admin client: the Service is
+	// cluster-scoped state the control plane owns, and the netserve identity
+	// carries no create verb. Nil (every worker) provisions nothing; the
+	// resolver then binds against the Service the server already created.
+	DNSServiceClient kubernetes.Interface
 	// WorkDir is the server's on-disk state directory.
 	WorkDir string
 	// DNSVIP is the cluster DNS VIP the in-process resolver binds and pods resolve
@@ -155,19 +166,17 @@ type Config struct {
 	// source, which is the unscoped behavior and never a wrong deny.
 	VMNetSubnet string
 	// EnforceNetworkPolicy starts the NetworkPolicy watcher that fills the policy
-	// table. The watcher lists and watches NetworkPolicies and Namespaces cluster
-	// wide, which only an identity granted those reads can do: the server sets it
-	// (its datapath runs under the admin client). A joined worker leaves it false,
-	// because its node identity is granted neither read and a watcher that cannot
-	// sync leaves the table empty anyway; with it false no policy informer starts,
-	// the table stays empty (every connection allowed) and Run logs that once.
+	// table. The watcher lists and watches NetworkPolicies, Namespaces and Pods
+	// cluster wide, which the netserve identity is granted on every node, so
+	// both the server and a joined worker set it. With it false no policy
+	// informer starts, the table stays empty (every connection allowed) and Run
+	// logs that once.
 	EnforceNetworkPolicy bool
-	// PodScopeNode is the node whose pods this datapath may see. Set it when the
-	// datapath runs under that node's own identity: the Node authorizer refuses a
-	// node's cluster-wide pod list, so the NetworkPolicy watcher then lists only
-	// spec.nodeName=PodScopeNode (proxy.WithPodNodeScope). Empty is cluster-wide
-	// (the server, under the admin identity). It only matters with
-	// EnforceNetworkPolicy set.
+	// PodScopeNode, when set, narrows the NetworkPolicy watcher's pod list to
+	// spec.nodeName=PodScopeNode (proxy.WithPodNodeScope). It is for an identity
+	// the Node authorizer scopes to its own pods; the netserve identity reads pods
+	// cluster-wide, which a cross-node policy peer needs, so the shipped nodes
+	// leave it empty. It only matters with EnforceNetworkPolicy set.
 	PodScopeNode string
 	// NetdSocket, when non-empty, routes the proxy's privileged operations (the
 	// lo0 ClusterIP VIP alias and any privileged-port <1024 bind) through the root
@@ -474,12 +483,10 @@ func (s *Server) Run(ctx context.Context) error {
 	// DNS-VIP :53 bind against (exactly as k3sm-ingress is for :80/:443). Without it
 	// netd denies the bind ("no service declares port 53") and the per-node resolver
 	// stays dark — in-pod cluster DNS fails. Best-effort: a failure is logged, not
-	// fatal (the resolver's bind retry outlasts a transient apiserver).
-	if s.dnsVIP.IsValid() {
-		if err := s.ensureDNSService(ctx); err != nil {
-			s.log.Warn("ensure kube-dns Service; netd may deny the DNS VIP bind", "err", err)
-		}
-	}
+	// fatal (the resolver's bind retry outlasts a transient apiserver). Only the
+	// server provisions it (Config.DNSServiceClient); a worker's resolver binds
+	// against the Service the server created.
+	s.provisionDNSService(ctx)
 	// The per-node cluster DNS resolver. It is best-effort: a bind/serve failure is
 	// logged and the goroutine returns nil so it never tears the Service proxy down
 	// (a node with a degraded resolver still serves ClusterIP/NodePort traffic).
@@ -504,11 +511,24 @@ func (s *Server) Run(ctx context.Context) error {
 // logs one Info line and blocks until ctx, leaving the table empty.
 func (s *Server) RunPolicyWatch(ctx context.Context) error {
 	if s.policyWatch == nil {
-		s.log.Info("NetworkPolicy enforcement is off on this node: worker nodes wait for a dedicated controller identity; policies on the server node's pods are enforced")
+		s.log.Info("NetworkPolicy enforcement is off on this node: no policy watcher runs and every connection is allowed")
 		<-ctx.Done()
 		return nil
 	}
 	return s.policyWatch.Run(ctx)
+}
+
+// provisionDNSService runs ensureDNSService when this datapath owns the
+// kube-dns Service (Config.DNSServiceClient set, the server) and the DNS VIP
+// parsed, logging a failure rather than returning it. On a worker it does nothing
+// and issues no request: the netserve identity holds no create verb.
+func (s *Server) provisionDNSService(ctx context.Context) {
+	if !s.dnsVIP.IsValid() || s.cfg.DNSServiceClient == nil {
+		return
+	}
+	if err := s.ensureDNSService(ctx); err != nil {
+		s.log.Warn("ensure kube-dns Service; netd may deny the DNS VIP bind", "err", err)
+	}
 }
 
 // ensureDNSService idempotently provisions kube-system/kube-dns: a selector-less
@@ -519,7 +539,8 @@ func (s *Server) RunPolicyWatch(ctx context.Context) error {
 // never allowed-by-coincidence — like k3sm-ingress for :80/:443), and in-cluster
 // `kube-dns`/`kubernetes.io/name: CoreDNS` discovery resolves. The proxy is
 // exempted from this VIP (WithInfraVIPExemptions) so it never races the resolver
-// for the socket.
+// for the socket. It writes through Config.DNSServiceClient, the server's admin
+// client; Run calls it only when that is set.
 func (s *Server) ensureDNSService(ctx context.Context) error {
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -541,7 +562,7 @@ func (s *Server) ensureDNSService(ctx context.Context) error {
 			},
 		},
 	}
-	if _, err := s.cfg.Client.CoreV1().Services("kube-system").Create(ctx, svc, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+	if _, err := s.cfg.DNSServiceClient.CoreV1().Services("kube-system").Create(ctx, svc, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create kube-dns service %s: %w", s.dnsVIP, err)
 	}
 	return nil

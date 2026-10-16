@@ -192,6 +192,64 @@ func TestScopedPolicyWatcherForbiddenWarnsOnce(t *testing.T) {
 	}
 }
 
+// TestNetservePolicyWatcherListsEveryNodesPods pins the shape every node's
+// datapath now takes under its netserve identity: EnforceNetworkPolicy set and
+// PodScopeNode empty, so the policy watcher lists pods cluster-wide, with no
+// spec.nodeName field selector. A cross-node policy peer is a pod on ANOTHER
+// node, and a node-scoped list could never resolve one.
+func TestNetservePolicyWatcherListsEveryNodesPods(t *testing.T) {
+	t.Parallel()
+	cs := fake.NewClientset()
+	var mu sync.Mutex // guards selectors
+	var selectors []string
+	cs.PrependReactor("list", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		la, ok := a.(k8stesting.ListAction)
+		if ok {
+			mu.Lock()
+			selectors = append(selectors, la.GetListRestrictions().Fields.String())
+			mu.Unlock()
+		}
+		return false, nil, nil
+	})
+	srv := New(Config{
+		Client:               cs,
+		WorkDir:              t.TempDir(),
+		DNSVIP:               "10.43.0.10",
+		PodCIDR:              "100.64.2.0/24",
+		MeshEgressIP:         "100.64.2.1",
+		EnforceNetworkPolicy: true,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.RunPolicyWatch(ctx) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(selectors)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunPolicyWatch did not return within 10s of cancellation")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(selectors) == 0 {
+		t.Fatal("the policy watcher never listed pods")
+	}
+	for _, sel := range selectors {
+		if sel != "" {
+			t.Errorf("pods list carries field selector %q; the netserve identity lists every node's pods", sel)
+		}
+	}
+}
+
 // errFake is a plain error carrying a fixed message.
 type errFake string
 
