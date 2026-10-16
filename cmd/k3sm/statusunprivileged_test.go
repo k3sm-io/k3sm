@@ -17,23 +17,44 @@ limitations under the License.
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/status"
 )
+
+// writeEndpointsRecord publishes an endpoints record naming hosts at port in
+// a fresh status directory and returns the directory.
+func writeEndpointsRecord(t *testing.T, port int, hosts ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	raw, err := json.Marshal(status.EndpointsRecord{UpdatedAt: time.Now(), Port: port, Hosts: hosts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(status.EndpointsPath(dir), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
 
 // TestStatusUserKubeReadsTheInvokingAccountsKubeconfig pins the agent fallback's
 // reader: it exists on an agent only, builds the client from the k3sm context
 // of the account's own kubeconfig when that context points at the host this
 // Mac joined, names that file and context, and refuses a k3sm context that
-// points anywhere else.
+// points anywhere else. The status directory is a temp dir, so the host's own
+// endpoints record never decides the outcome.
 func TestStatusUserKubeReadsTheInvokingAccountsKubeconfig(t *testing.T) {
 	join := func() (string, error) { return "100.64.0.1:9345", nil }
-	if statusUserKubeFor(install.RoleServer, join) != nil {
+	noRecord := t.TempDir()
+	if statusUserKubeFor(install.RoleServer, join, noRecord) != nil {
 		t.Error("a server got the agent's kubeconfig fallback")
 	}
 	path := filepath.Join(t.TempDir(), "config")
@@ -50,18 +71,35 @@ func TestStatusUserKubeReadsTheInvokingAccountsKubeconfig(t *testing.T) {
 	if installedKubeconfigName() != installedContextName {
 		t.Skip("this Mac's install names its own kubeconfig context")
 	}
-	kube, source, err := statusUserKubeFor(install.RoleAgent, join)()
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	if kube.Server() != "https://100.64.0.1:6444" {
-		t.Errorf("server = %q, want the k3sm context's", kube.Server())
-	}
-	if want := path + ` context "k3sm"`; source != want {
-		t.Errorf("source = %q, want %q", source, want)
-	}
-	elsewhere := func() (string, error) { return "192.0.2.50", nil }
-	if _, _, err := statusUserKubeFor(install.RoleAgent, elsewhere)(); err == nil {
-		t.Error("a k3sm context on another host was used for this worker's cluster")
-	}
+
+	t.Run("no record anchors on the joined host", func(t *testing.T) {
+		kube, source, err := statusUserKubeFor(install.RoleAgent, join, noRecord)()
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		if kube.Server() != "https://100.64.0.1:6444" {
+			t.Errorf("server = %q, want the k3sm context's", kube.Server())
+		}
+		if want := path + ` context "k3sm"`; source != want {
+			t.Errorf("source = %q, want %q", source, want)
+		}
+		elsewhere := func() (string, error) { return "192.0.2.50", nil }
+		if _, _, err := statusUserKubeFor(install.RoleAgent, elsewhere, noRecord)(); err == nil {
+			t.Error("a k3sm context on another host was used for this worker's cluster")
+		}
+	})
+
+	t.Run("a record naming the mesh address accepts the context", func(t *testing.T) {
+		dir := writeEndpointsRecord(t, 6444, "192.0.2.50", "100.64.0.1")
+		if _, _, err := statusUserKubeFor(install.RoleAgent, join, dir)(); err != nil {
+			t.Errorf("build: %v", err)
+		}
+	})
+
+	t.Run("a record naming other hosts refuses the context", func(t *testing.T) {
+		dir := writeEndpointsRecord(t, 6444, "192.0.2.50")
+		if _, _, err := statusUserKubeFor(install.RoleAgent, join, dir)(); err == nil {
+			t.Error("a k3sm context on another host was used for this worker's cluster")
+		}
+	})
 }
