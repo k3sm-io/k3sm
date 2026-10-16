@@ -68,6 +68,11 @@ type Options struct {
 	// bind (fail safe). It yields identities rather than a bare bool because
 	// those branches are an ALLOWLIST: declaring the port is necessary but NOT sufficient.
 	LBDeclarers func(port int) []ServiceRef
+	// Synced reports whether the Service set behind Declares and LBDeclarers has
+	// completed its first sync. It changes only the wording of a refusal ("not
+	// yet synced" versus "no service declares"); an unsynced set still denies.
+	// nil means the set is always synced.
+	Synced func() bool
 	// NodeAddressService is the ONE Service permitted to authorize a privileged
 	// bind on this node's own address or on the IPv4 wildcard — the canonical
 	// ingress LoadBalancer. The
@@ -140,6 +145,7 @@ func BuildConfig(opts Options) (netd.Config, error) {
 			Declares:           opts.Declares,
 			NodeIP:             opts.NodeIP,
 			LBDeclarers:        opts.LBDeclarers,
+			Synced:             opts.Synced,
 			NodeAddressService: opts.NodeAddressService,
 			NodePodCIDR:        NodePodCIDRInForce(NodeIdentityPath(opts.MeshKeyDir), opts.NodePodCIDR),
 			VMPodPorts:         opts.VMPodPorts,
@@ -295,6 +301,9 @@ type PortPolicy struct {
 	// LBDeclarers reports which Services of type LoadBalancer declare port. nil
 	// denies node-address binds.
 	LBDeclarers func(port int) []ServiceRef
+	// Synced reports whether the Service set has completed its first sync; it
+	// only changes refusal wording. nil means always synced.
+	Synced func() bool
 	// NodeAddressService is the only Service whose declaration authorizes a
 	// node-address or wildcard bind. The zero ServiceRef denies the class (deny).
 	NodeAddressService ServiceRef
@@ -336,6 +345,9 @@ func (a servicePortAuthorizer) Authorize(_ context.Context, port int, nodeAddr s
 		if a.policy.Declares == nil {
 			return fmt.Errorf("no service set available to authorize port %d on %s", port, nodeAddr)
 		}
+		if err := a.checkSynced(port, nodeAddr); err != nil {
+			return err
+		}
 		if !a.policy.Declares(port) {
 			return fmt.Errorf("no service declares port %d (requested on %s)", port, nodeAddr)
 		}
@@ -346,6 +358,15 @@ func (a servicePortAuthorizer) Authorize(_ context.Context, port int, nodeAddr s
 		return a.authorizeVMPod(port, addr)
 	}
 	return fmt.Errorf("bind address %s is neither a service-CIDR VIP, this node's own address, the wildcard, nor a pod address on this node (port %d denied)", nodeAddr, port)
+}
+
+// checkSynced refuses while the Service set has not completed its first sync,
+// so the log says so instead of claiming no Service declares the port.
+func (a servicePortAuthorizer) checkSynced(port int, target string) error {
+	if a.policy.Synced != nil && !a.policy.Synced() {
+		return fmt.Errorf("service set not yet synced; port %d cannot be authorized yet on %s", port, target)
+	}
+	return nil
 }
 
 // inNodePodCIDR reports whether addr is a host address inside this node's pod
@@ -435,6 +456,9 @@ func (a servicePortAuthorizer) authorizeCanonical(port int, target string) error
 	}
 	if a.policy.LBDeclarers == nil {
 		return fmt.Errorf("no service set available to authorize port %d on %s", port, target)
+	}
+	if err := a.checkSynced(port, target); err != nil {
+		return err
 	}
 	declarers := a.policy.LBDeclarers(port)
 	for _, d := range declarers {

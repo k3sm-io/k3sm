@@ -581,3 +581,37 @@ func TestNodePodCIDRInForce(t *testing.T) {
 		t.Errorf("persistence off: %s, want %s", got, configured)
 	}
 }
+
+// TestPortAuthorizerSyncedWording pins the refusal text for an unsynced
+// Service set versus a synced one that declares nothing on the port.
+func TestPortAuthorizerSyncedWording(t *testing.T) {
+	svcCIDR := netip.MustParsePrefix("10.43.0.0/16")
+	canonical := ServiceRef{Namespace: "kube-system", Name: "k3sm-ingress"}
+	synced := false
+	a := PortAuthorizer(PortPolicy{
+		ServiceCIDR:        svcCIDR,
+		NodeIP:             netip.MustParseAddr("192.168.7.20"),
+		NodeAddressService: canonical,
+		Declares:           func(int) bool { return false },
+		LBDeclarers:        func(int) []ServiceRef { return nil },
+		Synced:             func() bool { return synced },
+	})
+	cases := []struct {
+		name, addr, want string
+		synced           bool
+	}{
+		{"vip unsynced", "10.43.0.10", "service set not yet synced; port 53 cannot be authorized yet on 10.43.0.10", false},
+		{"vip synced", "10.43.0.10", "no service declares port 53 (requested on 10.43.0.10)", true},
+		{"node address unsynced", "192.168.7.20", "service set not yet synced; port 53 cannot be authorized yet on node address 192.168.7.20", false},
+		{"node address synced", "192.168.7.20", "does not declare port 53", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synced = tc.synced
+			err := a.Authorize(context.Background(), 53, tc.addr)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Authorize error = %v, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+}

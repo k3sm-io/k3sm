@@ -143,7 +143,7 @@ func runNetd(args []string) error {
 		}
 	}
 
-	declares, lbDeclarers, gid := buildServiceSet(ctx, opts.kubeconfig, logger)
+	declares, lbDeclarers, synced, gid := buildServiceSet(ctx, opts.kubeconfig, logger)
 
 	cfg, err := netdsvc.BuildConfig(netdsvc.Options{
 		NodePodCIDR:        nodeCIDR,
@@ -151,6 +151,7 @@ func runNetd(args []string) error {
 		ServiceUID:         uint32(uid),
 		Declares:           declares,
 		LBDeclarers:        lbDeclarers,
+		Synced:             synced,
 		NodeAddressService: canonicalLBService(),
 		NodeIP:             nodeIP,
 		VMPodPorts:         buildVMPodSet(ctx, opts.kubeconfig, logger),
@@ -304,11 +305,11 @@ func canonicalLBService() netdsvc.ServiceRef {
 // worker the installed plist passes the node kubeconfig the join wrote, because
 // nothing on a worker ever writes the control plane's admin kubeconfig and a
 // credential that never loads is indistinguishable here from deny-all.
-func buildServiceSet(ctx context.Context, kubeconfig string, logger *slog.Logger) (declares func(int) bool, lbDeclarers func(int) []netdsvc.ServiceRef, gid int) {
+func buildServiceSet(ctx context.Context, kubeconfig string, logger *slog.Logger) (declares func(int) bool, lbDeclarers func(int) []netdsvc.ServiceRef, synced func() bool, gid int) {
 	gid = serviceGID()
 	if kubeconfig == "" {
 		logger.Warn("no --kubeconfig: privileged-port (<1024) binds will be denied (no authoritative Service set)")
-		return nil, nil, gid
+		return nil, nil, nil, gid
 	}
 
 	// The Service authorizer is populated ASYNCHRONOUSLY. netd is bootstrapped by
@@ -330,6 +331,7 @@ func buildServiceSet(ctx context.Context, kubeconfig string, logger *slog.Logger
 		defer mu.RUnlock()
 		return lister
 	}
+	synced = func() bool { return current() != nil }
 	declares = func(port int) bool {
 		l := current()
 		if l == nil {
@@ -351,7 +353,7 @@ func buildServiceSet(ctx context.Context, kubeconfig string, logger *slog.Logger
 		mu.Unlock()
 	})
 
-	return declares, lbDeclarers, gid
+	return declares, lbDeclarers, synced, gid
 }
 
 // activateServiceAuthorizer waits for the server's kubeconfig to appear and its
