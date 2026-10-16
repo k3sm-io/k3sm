@@ -28,6 +28,14 @@ limitations under the License.
 //   - kubelet-client-ca.crt  the client-identity CA this node's :10250 verifies the apiserver against
 //   - node-assignment.json   the mesh/apiserver assignment: pod /24, mesh-egress /32, peer snapshot, apiserver endpoints
 //
+// Beside them sits a sixth file that is deliberately not part of that set:
+//
+//   - netserve.kubeconfig    the cluster CA + this node's netserve client keypair (the datapath's identity)
+//
+// It is derived from the node credential (the agent fetches it with that
+// credential when it is missing or expiring), so a store without it is still a
+// complete credential, and NetserveStatus reports on it separately.
+//
 // The assignment file is the non-obvious one. The three certificate artifacts
 // reconstruct this node's IDENTITY, but a worker also needs the values the
 // server ASSIGNED it — the pod /24 the mesh device is built from and the
