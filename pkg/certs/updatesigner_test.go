@@ -59,7 +59,7 @@ func TestIssueUpdateSigner(t *testing.T) {
 	if s.Key.Curve != elliptic.P256() {
 		t.Errorf("key curve = %v", s.Key.Curve.Params().Name)
 	}
-	if life := c.NotAfter.Sub(c.NotBefore); life < UpdateSignerValidity || life > UpdateSignerValidity+2*time.Hour {
+	if life := c.NotAfter.Sub(c.NotBefore); life != UpdateSignerValidity+time.Hour || UpdateSignerValidity != 24*time.Hour {
 		t.Errorf("validity = %v", life)
 	}
 	roots := x509.NewCertPool()

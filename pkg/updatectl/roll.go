@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/update"
 )
 
@@ -554,7 +555,11 @@ func (c *Controller) handover(ctx context.Context, u *updatesv1alpha1.Update, n 
 	if err != nil {
 		return nil, err
 	}
-	sig, err := update.SignPayload(c.cfg.Signer, p)
+	signer, err := c.currentSigner()
+	if err != nil {
+		return nil, err
+	}
+	sig, err := update.SignPayload(signer, p)
 	if err != nil {
 		return nil, err
 	}
@@ -562,11 +567,30 @@ func (c *Controller) handover(ctx context.Context, u *updatesv1alpha1.Update, n 
 		updatesv1alpha1.AnnotationUpdateVersion: u.Spec.Version,
 		update.AnnotationUpdatePayload:          string(p),
 		update.AnnotationUpdatePayloadSig:       sig,
-		update.AnnotationUpdateSigner:           string(c.cfg.Signer.CertPEM),
+		update.AnnotationUpdateSigner:           string(signer.CertPEM),
 		updatesv1alpha1.AnnotationUpdatePhase:   nil,
 		HandedOverAnnotation:                    now.Format(time.RFC3339),
 		ReadyAtAnnotation:                       nil,
 	}))
+}
+
+// currentSigner is the signer for the next handover: the one held while it
+// has at least certs.UpdateSignerRenewBefore left at the controller's clock,
+// else a freshly issued one.
+func (c *Controller) currentSigner() (*certs.UpdateSigner, error) {
+	if s := c.signer; s != nil && s.Cert != nil && s.Cert.NotAfter.Sub(c.cfg.Now()) >= certs.UpdateSignerRenewBefore {
+		return s, nil
+	}
+	s, err := c.cfg.IssueSigner()
+	if err != nil {
+		return nil, fmt.Errorf("issue the update signer: %w", err)
+	}
+	if s == nil || s.Key == nil || s.Cert == nil || len(s.CertPEM) == 0 {
+		return nil, errors.New("issue the update signer: an incomplete signer")
+	}
+	c.signer = s
+	c.log.Info("issued a fresh update signer", "not-after", s.Cert.NotAfter.UTC().Format(time.RFC3339))
+	return s, nil
 }
 
 // annotations is a merge patch of Node annotations (a nil value removes one).

@@ -41,10 +41,14 @@ const (
 	UpdateSignerCommonName = "k3sm:update-signer"
 	// UpdateSignerOrganization is the update signer's Organization.
 	UpdateSignerOrganization = "k3sm:update-signers"
-	// UpdateSignerValidity is the signer certificate's lifetime. It is
-	// re-minted at every server start, so the lifetime bounds only a server
-	// that runs for a year without restarting.
-	UpdateSignerValidity = 365 * 24 * time.Hour
+	// UpdateSignerValidity is the signer certificate's lifetime: a day, so a
+	// signed payload that leaks stops authorising anything a day after it was
+	// signed. The update controller re-mints well before it ends
+	// (UpdateSignerRenewBefore).
+	UpdateSignerValidity = 24 * time.Hour
+	// UpdateSignerRenewBefore is how much validity a signer must have left to
+	// sign another handover; a signer with less is replaced by a fresh one.
+	UpdateSignerRenewBefore = 12 * time.Hour
 )
 
 // ErrUpdateSignerIdentity refuses a certificate that would carry the update

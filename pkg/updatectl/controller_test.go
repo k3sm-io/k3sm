@@ -184,7 +184,7 @@ var testSigning = sync.OnceValue(func() struct {
 func (r *rig) controller() *Controller {
 	r.t.Helper()
 	c, err := New(Config{
-		Client: r.cs, Dynamic: r.dyn, Resolver: r.resolver, ServerNode: serverName, Signer: testSigning().signer,
+		Client: r.cs, Dynamic: r.dyn, Resolver: r.resolver, ServerNode: serverName, IssueSigner: func() (*certs.UpdateSigner, error) { return testSigning().signer, nil },
 		Now: func() time.Time { return r.now }, Recorder: r.recorder,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -542,5 +542,54 @@ func TestNewRequiresAnUpdateSigner(t *testing.T) {
 	r := newRig(t)
 	if _, err := New(Config{Client: r.cs, Dynamic: r.dyn, ServerNode: serverName}); err == nil || !strings.Contains(err.Error(), "signer") {
 		t.Fatalf("New without a signer = %v, want refused", err)
+	}
+}
+
+// TestUpdateSignerIsShortLived pins the signer's renewal on a fake clock: a
+// signer is reused while it has at least certs.UpdateSignerRenewBefore left,
+// and replaced by a fresh one-day signer once it has less, so no payload the
+// controller signs authorises anything for more than a day.
+func TestUpdateSignerIsShortLived(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+	issued := 0
+	r := newRig(t)
+	c, err := New(Config{
+		Client: r.cs, Dynamic: r.dyn, ServerNode: serverName,
+		Now: func() time.Time { return now },
+		IssueSigner: func() (*certs.UpdateSigner, error) {
+			issued++
+			s := *testSigning().signer
+			cert := *s.Cert
+			cert.NotAfter = now.Add(certs.UpdateSignerValidity)
+			s.Cert = &cert
+			return &s, nil
+		},
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := func(d time.Duration, wantIssued int) {
+		t.Helper()
+		now = now.Add(d)
+		s, err := c.currentSigner()
+		if err != nil {
+			t.Fatalf("currentSigner = %v", err)
+		}
+		if issued != wantIssued {
+			t.Fatalf("after +%v: %d signers issued, want %d", d, issued, wantIssued)
+		}
+		if left := s.Cert.NotAfter.Sub(now); left < certs.UpdateSignerRenewBefore || left > certs.UpdateSignerValidity {
+			t.Fatalf("after +%v: the signer used has %v left", d, left)
+		}
+	}
+	step(0, 1)            // the first handover mints one
+	step(11*time.Hour, 1) // 13 h left: reused
+	step(2*time.Hour, 2)  // 11 h left: replaced
+	step(time.Minute, 2)  // the fresh one is reused
+	step(48*time.Hour, 3) // long expired: replaced
+	if certs.UpdateSignerValidity != 24*time.Hour {
+		t.Errorf("UpdateSignerValidity = %v, want a day", certs.UpdateSignerValidity)
 	}
 }
