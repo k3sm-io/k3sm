@@ -283,6 +283,10 @@ type nodeOptions struct {
 	// (startLBHoster). Nil (the standalone `k3sm node`) binds on every
 	// interface and attaches nothing.
 	lan *lanSwitch
+	// updateRoot is the managed update's directory under the data root
+	// (updateRootFor). `k3sm server` and `k3sm agent` set it; empty (the
+	// standalone `k3sm node`) runs no update watcher.
+	updateRoot string
 }
 
 // nodeKubeletListen is the standalone `k3sm node` --listen default
@@ -1135,6 +1139,11 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// before the runtime closes (defers are LIFO).
 	stopInterconnect := startInterconnectNode(ctx, opts, cs, restCfg, recorder, opts.interconnectMetrics, slog.Default())
 	defer stopInterconnect()
+	// The managed update watcher acts on this node's own Node annotations too,
+	// so it starts at the same point, after the provider registered; its Done
+	// also waits for the runtime-health probe.
+	stopUpdate := startNodeUpdate(ctx, opts, cs, runtimeHealthProbe(prov), slog.Default())
+	defer stopUpdate()
 	slog.Default().Info(fmt.Sprintf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir))
 
 	return awaitNodeExit(ctx, errc, stopRuntime)

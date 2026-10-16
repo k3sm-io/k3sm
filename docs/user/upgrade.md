@@ -129,6 +129,41 @@ are designed so adjacent versions interoperate across that window. Upgrade agent
 control-plane Mac last unless a release note says otherwise. An HA cluster has its own order, mint-authority server first; see [HA](ha.md#upgrading-an-ha-cluster-to-the-aggregation-layer). See [Multi-node](multi-node.md) and
 [HA](ha.md).
 
+## Managed Update
+
+A managed update moves the whole cluster to one release through an `Update` object
+(`updates.k3sm.io`), node by node, without a re-run of the installer on each Mac.
+
+### On Each Node
+
+Every node daemon, server and agent alike, watches its own Node. When the update reaches it, the
+node:
+
+1. Writes the phase `Downloading` and fetches the release archive over HTTPS from `github.com`
+   (following redirects only to `objects.githubusercontent.com`), at most 512 MiB and within 10
+   minutes, into a fresh directory under `/var/lib/k3sm/updates` that only the `_k3sm` user can
+   read.
+2. Writes `Verifying` and checks the archive's sha256 against the release's published checksum
+   before anything is unpacked. It then unpacks the build set (`k3sm`, `k3sm-execshim`,
+   `k3sm-vmhost`, the two shim dylibs and `cp-payload/`) as regular files only. A link, an
+   absolute or `..` path, or any file outside that set refuses the update; the archive's
+   `LICENSE`, `NOTICE` and `k3sm-netd` are not unpacked. A release older than the one the node
+   runs is refused unless the update allows a downgrade.
+3. Writes `Installing` and hands the unpacked set and its per-file checksums to the `k3sm-netd`
+   root helper, which checks every file again and runs the new `k3sm install --from-staging`.
+   Under the `required` signature policy the installer is run with `--require-team-signature`,
+   so every binary must carry a Developer ID team signature whatever the installed build is
+   signed with.
+4. Writes `Restarting` while the installer restarts the daemons. The restarted daemon writes
+   `Done` once it runs the new release and its pod runtime answers, and the node's kubelet
+   version reports it.
+
+The node never runs a downloaded binary itself. A refusal or a failed install writes `Failed`
+with the reason (`kubectl get node <name> -o jsonpath='{.metadata.annotations.k3sm\.io/update-phase}'`),
+and the download directory stays for diagnosis until the next update attempt or the next daemon
+start removes it. A node without the `k3sm-netd` helper, such as a standalone `k3sm node`, does not
+take part.
+
 ## Before You Upgrade
 
 - Back up the datastore with `sudo k3sm snapshot save --out <somewhere off this node>`. It is safe to

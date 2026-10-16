@@ -811,6 +811,7 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		// (resolveKubeletEndpoint), never the wildcard.
 		kubeletPort: opts.kubeletPort,
 		podRoot:     opts.podRoot,
+		updateRoot:  updateRootFor(opts.workDir),
 		logs:        opts.logs,
 		nodeIP:      nodeAddressing.nodeIP,
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.

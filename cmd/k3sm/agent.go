@@ -764,6 +764,7 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		// (resolveKubeletEndpoint), never the wildcard.
 		kubeletPort: ports.KubeletAPIPort,
 		podRoot:     opts.podRoot,
+		updateRoot:  updateRootFor(opts.workDir),
 		logs:        opts.logs,
 		nodeIP:      agentInternalIP(res),
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
