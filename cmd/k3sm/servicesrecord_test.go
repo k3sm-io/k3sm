@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -198,5 +199,81 @@ func TestWriteRecordPublishesAUserReadableCopy(t *testing.T) {
 		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("%s survived the removal: %v", p, err)
 		}
+	}
+}
+
+// TestWriteFileAtomicNeverWidensAMode pins the record writer's modes: the copy
+// takes its 0644 before it takes its name, so the final name never carries a
+// wider mode (a reader polling it sees 0644 or nothing), a stale wider file at
+// that name is replaced rather than kept, and the 0600 original keeps 0600
+// however often it is rewritten.
+func TestWriteFileAtomicNeverWidensAMode(t *testing.T) {
+	root := t.TempDir()
+	wd := filepath.Join(root, "server")
+	if err := os.Mkdir(wd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(status.Dir(wd), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := status.ServicesPath(wd)
+	user := status.UserReadablePath(wd, path)
+	if err := os.WriteFile(user, []byte("{}"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(user, 0o666); err != nil { // past the umask
+		t.Fatal(err)
+	}
+	rec := status.ServicesRecord{VIPs: []status.VIPEntry{}}
+	if err := writeRecord(wd, path, rec); err != nil {
+		t.Fatalf("write over the stale copy: %v", err)
+	}
+	if info, err := os.Stat(user); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("the stale 0666 copy was kept: %v (err %v)", info.Mode().Perm(), err)
+	}
+
+	stop := make(chan struct{})
+	seen := make(chan string, 1)
+	go func() {
+		defer close(seen)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for p, want := range map[string]fs.FileMode{path: 0o600, user: 0o644} {
+				info, err := os.Stat(p)
+				if err != nil {
+					continue
+				}
+				if got := info.Mode().Perm(); got != want {
+					seen <- fmt.Sprintf("%s seen at %v, want %v", p, got, want)
+					return
+				}
+			}
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		if err := writeRecord(wd, path, rec); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	close(stop)
+	if msg, ok := <-seen; ok {
+		t.Error(msg)
+	}
+	for p, want := range map[string]fs.FileMode{path: 0o600, user: 0o644} {
+		info, err := os.Stat(p)
+		if err != nil || info.Mode().Perm() != want {
+			t.Errorf("%s mode = %v (err %v), want %v", p, info.Mode().Perm(), err, want)
+		}
+	}
+	entries, err := os.ReadDir(status.Dir(wd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("the status dir holds %d entries, want only the copy (no temp file left behind)", len(entries))
 	}
 }

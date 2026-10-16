@@ -101,8 +101,12 @@ const StatusDirMode fs.FileMode = 0o755
 // the server publishes, world-readable, the records `k3sm status` reads (the
 // mesh-claim and Service proxy records), beside the 0600 copies in its own
 // work dir. They hold cluster-internal names and addresses, never a credential,
-// so an ordinary account may read them; pods cannot write here, because their
-// sandbox scopes writes to the pod's own volume.
+// so an ordinary account may read them. The directory is the service user's,
+// and pods run as that user: what keeps a pod from writing here is its Seatbelt
+// profile, which confines pod writes to the pod's own volume, not the owner.
+// Nothing that acts reads these copies (`k3sm status` only reports them, and the
+// 0600 originals in the work dir stay the source), so a forged copy can mislead
+// an unprivileged report and nothing else.
 const StatusSubdir = "status"
 
 // manifestsSubdir is the manifest directory's leaf name, spelled once.
