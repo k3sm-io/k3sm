@@ -30,7 +30,7 @@ import (
 // a public host, and an accepted value reaches the install Config.
 func TestUpdateReleaseBaseWiring(t *testing.T) {
 	t.Parallel()
-	const base = "http://192.168.0.50:8080/releases"
+	const base = "https://192.168.0.50:8443/releases"
 	got, err := updateResolver(base + "/").AssetURL("v0.2.0")
 	if err != nil || got != base+"/download/v0.2.0/k3sm_0.2.0_darwin_arm64.tar.gz" {
 		t.Errorf("resolver with a base: AssetURL = %q, %v", got, err)
@@ -57,8 +57,11 @@ func TestUpdateReleaseBaseWiring(t *testing.T) {
 	if cfg := o.installConfig("/tmp/k3sm", nil, nil); cfg.UpdateReleaseBase != base {
 		t.Errorf("install Config UpdateReleaseBase = %q, want %q", cfg.UpdateReleaseBase, base)
 	}
-	if _, err := parseInstallFlags([]string{"--user", "admin", "--update-release-base", "http://example.com/releases"}); err == nil || !strings.Contains(err.Error(), "RFC 1918") {
+	if _, err := parseInstallFlags([]string{"--user", "admin", "--update-release-base", "http://example.com/releases"}); err == nil || !strings.Contains(err.Error(), "loopback") {
 		t.Errorf("parseInstallFlags with http on a public host = %v, want refused", err)
+	}
+	if _, err := parseInstallFlags([]string{"--user", "admin", "--update-release-base", "http://192.168.0.50:8080/releases"}); err == nil || !strings.Contains(err.Error(), "network path") {
+		t.Errorf("parseInstallFlags with http on a private LAN address = %v, want refused naming the risk", err)
 	}
 	if _, err := parseInstallFlags([]string{"--user", "admin", "--agent", "--server", "192.0.2.10", "--update-release-base", "https://mirror.example.com/r"}); err != nil {
 		t.Errorf("an agent install with an https mirror = %v, want accepted", err)

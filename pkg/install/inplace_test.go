@@ -171,13 +171,13 @@ func TestResolveInPlace(t *testing.T) {
 // is rendered into the role's daemon arguments, replaced by a later value,
 // and kept by an in-place update, which names none.
 func TestUpdateReleaseBaseIsRecordedAndCarried(t *testing.T) {
-	const base = "http://192.168.0.50:8080/releases"
+	const base = "https://192.168.0.50:8443/releases"
 	want := "--" + UpdateReleaseBaseFlag + "=" + base
 	t.Run("server", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
 		first := testConfig(t)
-		first.UpdateReleaseBase = "http://192.168.0.9/old"
+		first.UpdateReleaseBase = "https://192.168.0.9/old"
 		if err := Install(context.Background(), f, first); err != nil {
 			t.Fatalf("first install: %v", err)
 		}

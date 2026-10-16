@@ -32,9 +32,10 @@ func TestParseReleaseBase(t *testing.T) {
 		want string // "" = refused
 	}{
 		{"https://mirror.example.com/k3sm/releases/", "https://mirror.example.com/k3sm/releases"},
-		{"http://192.168.0.50:8080/releases", "http://192.168.0.50:8080/releases"},
-		{"http://10.1.2.3/r", "http://10.1.2.3/r"},
-		{"http://172.20.0.1/r", "http://172.20.0.1/r"},
+		{"https://192.168.0.50:8443/releases", "https://192.168.0.50:8443/releases"},
+		{"http://192.168.0.50:8080/releases", ""},
+		{"http://10.1.2.3/r", ""},
+		{"http://172.20.0.1/r", ""},
 		{"http://127.0.0.1:9000/r", "http://127.0.0.1:9000/r"},
 		{"http://[::1]:9000/r", "http://[::1]:9000/r"},
 		{"http://localhost:9000/r", "http://localhost:9000/r"},
@@ -59,7 +60,7 @@ func TestParseReleaseBase(t *testing.T) {
 
 func TestHostPinAdmitsTheRecordedBase(t *testing.T) {
 	t.Parallel()
-	base, err := ParseReleaseBase("http://192.168.0.50:8080/releases")
+	base, err := ParseReleaseBase("https://192.168.0.50:8443/releases")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,20 +69,31 @@ func TestHostPinAdmitsTheRecordedBase(t *testing.T) {
 		url string
 		ok  bool
 	}{
-		{"http://192.168.0.50:8080/releases/download/v0.2.0/k3sm_0.2.0_darwin_arm64.tar.gz", true},
+		{"https://192.168.0.50:8443/releases/download/v0.2.0/k3sm_0.2.0_darwin_arm64.tar.gz", true},
 		{"https://github.com/k3sm-io/k3sm/releases/download/v0.2.0/a.tar.gz", true},
-		{"https://192.168.0.50:8080/a", false},
-		{"http://192.168.0.50:8081/a", false},
-		{"http://192.168.0.51:8080/a", false},
-		{"http://user@192.168.0.50:8080/a", false},
+		{"http://192.168.0.50:8443/a", false},
+		{"https://192.168.0.50:8444/a", false},
+		{"https://192.168.0.51:8443/a", false},
+		{"https://user@192.168.0.50:8443/a", false},
 		{"https://evil.example/a", false},
 	} {
 		if err := pin.CheckRaw(tc.url); (err == nil) != tc.ok {
 			t.Errorf("pin.CheckRaw(%q) = %v, want ok=%v", tc.url, err, tc.ok)
 		}
 	}
-	if err := (HostPin{}).CheckRaw("http://192.168.0.50:8080/a"); !errors.Is(err, ErrRefused) {
+	if err := (HostPin{}).CheckRaw("https://192.168.0.50:8443/a"); !errors.Is(err, ErrRefused) {
 		t.Errorf("a pin with no recorded base admitted the lab host: %v", err)
+	}
+	// Plain http on a loopback base is admitted on that host and port only.
+	lb, err := ParseReleaseBase("http://127.0.0.1:9000/r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (HostPin{Base: lb}).CheckRaw("http://127.0.0.1:9000/r/download/v0.2.0/a.tar.gz"); err != nil {
+		t.Errorf("loopback http base refused its own host: %v", err)
+	}
+	if err := (HostPin{Base: lb}).CheckRaw("http://192.168.0.50:9000/a"); !errors.Is(err, ErrRefused) {
+		t.Errorf("loopback http base admitted a LAN host: %v", err)
 	}
 	// The fetcher re-checks every hop against the same pin.
 	client := &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
@@ -93,10 +105,10 @@ func TestHostPinAdmitsTheRecordedBase(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
 	})}
 	f := HTTPFetcher{Client: client, Pin: pin}
-	if _, err := f.Fetch(context.Background(), "http://192.168.0.50:8080/start"); !errors.Is(err, ErrRefused) {
+	if _, err := f.Fetch(context.Background(), "https://192.168.0.50:8443/start"); !errors.Is(err, ErrRefused) {
 		t.Errorf("a redirect from the lab base to a foreign host: Fetch = %v, want ErrRefused", err)
 	}
-	body, err := f.Fetch(context.Background(), "http://192.168.0.50:8080/releases/a.tar.gz")
+	body, err := f.Fetch(context.Background(), "https://192.168.0.50:8443/releases/a.tar.gz")
 	if err != nil {
 		t.Fatalf("Fetch from the lab base = %v", err)
 	}

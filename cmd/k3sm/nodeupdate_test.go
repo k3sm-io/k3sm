@@ -403,7 +403,7 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 
 	t.Run("a recorded release base admits its host and nothing more", func(t *testing.T) {
 		t.Parallel()
-		const base = "http://192.168.0.50:8080/releases"
+		const base = "https://192.168.0.50:8443/releases"
 		p := good
 		p.URL = base + "/download/v0.2.0/k3sm_0.2.0_darwin_arm64.tar.gz"
 		r := runNodeUpdate(t, updateCase{node: handedOverNode(t, p, nil), base: base})

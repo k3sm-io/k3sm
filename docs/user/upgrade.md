@@ -150,7 +150,22 @@ started with (`--cluster-ca`). That CA is the server's own cluster CA certificat
 a worker a root-owned copy `sudo k3sm install` writes from the CA the join token pins. The helper
 also checks the subject and the signature over the exact payload bytes, and that the archive matches
 the signed sha256, before it unpacks or runs anything. Only the holder of the cluster CA key, the
-server, can produce a payload a node will install.
+server, can produce a payload a node will install. The signer is valid for a day, and the server
+issues a fresh one before the one it holds has less than 12 hours left, so a signed payload that
+leaks stops authorising anything within a day.
+
+What this does not protect against: the server's service user (`_k3sm`) holds the cluster CA key,
+so a compromise of that user on the server can mint signers for every node. On a node installed
+from an ad-hoc signed build that is root on the node; on one installed from a build signed by a
+Developer ID team it is limited to a signed rollback to a genuine, team-signed older release. This
+is the k3s posture, in which the control plane is root-equivalent for the cluster: protect the
+server as you would its root account.
+
+One residual for workers that joined before this release. A worker installed without
+`--token-file` has no token to pin its cluster CA, so its first install on this release takes the
+root-only copy once from the node credential the service user wrote. Pass `--token-file` once
+(`sudo k3sm install --agent --server <server> --token-file <file>`, with a fresh token from
+`k3sm token create`) to pin the copy to the CA the token names.
 
 ### On Each Node
 
@@ -202,9 +217,11 @@ sudo k3sm install --agent --server <server> --update-release-base https://mirror
 The index must have GitHub's layout: `<base>/download/<tag>/k3sm_<version>_darwin_arm64.tar.gz` and
 `<base>/download/<tag>/k3sm_<version>_checksums.txt`. The server reads the release, its checksum and
 the update check from it. Each node downloads the archive from it, from the base's own host and port
-and from GitHub's hosts, and still verifies the archive's sha256. The base must be `https`, or `http`
-only on a loopback or private (RFC 1918) address such as a lab network; plain `http` on any other
-host is refused. Set it on every node of the cluster, the server and each worker. The setting is
+and from GitHub's hosts, and still verifies the archive's sha256. The base must be `https`. Plain
+`http` is accepted only on a loopback address (an index served on the server itself) and refused
+on any other host, a private LAN address included: the server signs the checksum it reads from the
+index, so over plain `http` any host on the network path could choose the release digest every
+node then installs. A lab serving its own builds on the LAN serves them over `https`. Set it on every node of the cluster, the server and each worker. The setting is
 recorded with the other install arguments, so later installs, managed updates included, keep it;
 install again with another `--update-release-base` to change it.
 

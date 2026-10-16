@@ -31,11 +31,12 @@ import (
 const ReleaseBaseFlag = install.UpdateReleaseBaseFlag
 
 // ParseReleaseBase validates a --update-release-base value: an absolute https
-// URL, or an http URL whose host is a loopback or RFC 1918 address (a lab
-// rig on a private network), with no user information, query or fragment.
-// The trailing slash is dropped. An http base on any other host is refused:
-// the archive's sha256 is always checked, but a plain-http index on a public
-// network is one anybody on the path can answer.
+// URL, or an http URL whose host is loopback (an index on the server itself),
+// with no user information, query or fragment. The trailing slash is dropped.
+// Plain http on any other host, a private LAN address included, is refused:
+// the server reads the release checksum from the index and signs it, so
+// whoever answers the index chooses the digest every node then installs, and
+// on plain http that is any host on the path.
 func ParseReleaseBase(raw string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimRight(strings.TrimSpace(raw), "/"))
 	if err != nil {
@@ -52,8 +53,8 @@ func ParseReleaseBase(raw string) (*url.URL, error) {
 	switch u.Scheme {
 	case "https":
 	case "http":
-		if !privateHost(u.Hostname()) {
-			return nil, fmt.Errorf("--%s %q: plain http is allowed only on a loopback or RFC 1918 address (a lab rig); use https", ReleaseBaseFlag, raw)
+		if !loopbackHost(u.Hostname()) {
+			return nil, fmt.Errorf("--%s %q: plain http is allowed only on a loopback address; use https: the server signs the checksum it reads from this index, so over plain http any host on the network path (a LAN host included) could choose the release digest every node installs", ReleaseBaseFlag, raw)
 		}
 	default:
 		return nil, fmt.Errorf("--%s %q is neither https nor http", ReleaseBaseFlag, raw)
@@ -61,18 +62,13 @@ func ParseReleaseBase(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// privateHost reports whether host is localhost, a loopback address, or an
-// RFC 1918 IPv4 address (10/8, 172.16/12, 192.168/16).
-func privateHost(host string) bool {
+// loopbackHost reports whether host is localhost or a loopback address.
+func loopbackHost(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	a, err := netip.ParseAddr(host)
-	if err != nil {
-		return false
-	}
-	a = a.Unmap()
-	return a.IsLoopback() || (a.Is4() && a.IsPrivate())
+	return err == nil && a.Unmap().IsLoopback()
 }
 
 // HostPin is the set of places an archive may be fetched from, on the first
