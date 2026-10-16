@@ -77,6 +77,9 @@ const (
 	// whose readable part found something, that part's severity), so it never
 	// moves the verdict, and its remedy is the sudo command that answers it.
 	StateNeedsAdmin RowState = "needs-admin"
+	// StateBehind is the update row's word for a cluster with at least one
+	// node that does not run the latest k3sm release.
+	StateBehind RowState = "behind"
 )
 
 // Row is one subsystem's line in the report.

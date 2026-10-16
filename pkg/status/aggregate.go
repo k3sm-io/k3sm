@@ -93,7 +93,11 @@ const (
 // and a member that is down or a node beyond the index ceiling leaves every pod
 // on the mesh, which is where it would be without the cable. The row warns with
 // its remedy.
-var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, RowShadowShells: true, RowMeshClaims: true, RowInterconnect: true}
+//
+// update is one too: a release newer than the one a node runs is news, not a
+// fault, and a cluster serving every request is not degraded because a newer
+// build exists. The row warns with the upgrade command.
+var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, RowShadowShells: true, RowMeshClaims: true, RowInterconnect: true, RowUpdate: true}
 
 // workerAdvisoryRows are the rows that are advisory ON A WORKER, because they
 // describe a control plane this Mac does not run.

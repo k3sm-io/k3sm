@@ -153,6 +153,11 @@ func (c Collector) Collect(ctx context.Context) Report {
 		if r, ok := c.servicesRow(ctx, serving, now()); ok {
 			rows = append(rows, r)
 		}
+		// Whether every node runs the latest release, from the last update
+		// check, on an installed Mac only (there is nothing to update before).
+		if r, ok := c.updateRow(now()); ok && installed {
+			rows = append(rows, r)
+		}
 	}
 	rows = append(rows,
 		c.kubeconfigRow(),
