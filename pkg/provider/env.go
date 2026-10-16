@@ -74,10 +74,10 @@ type podFacts struct {
 }
 
 // apiServerServicePort is the port the kubernetes Service in the default
-// namespace serves the API on. The apiserver's own reconciler publishes that
-// Service with port 443 whatever its secure port is (k3sm's is 6444, behind the
-// Service proxy), and the kubelet renders the variables below from the Service,
-// not from the endpoint.
+// namespace serves the API on. The value mirrors the Service the apiserver's
+// own reconciler publishes (port 443, whatever the secure port behind it; k3sm's
+// is 6444, behind the Service proxy) and derives from no k3sm code or flag: the
+// kubelet renders the variables below from that Service, not from the endpoint.
 const apiServerServicePort = "443"
 
 // apiServerEnv is the service environment the kubelet gives EVERY container for

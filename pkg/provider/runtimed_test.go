@@ -478,6 +478,45 @@ func TestRuntimedDeniesHelperSocket(t *testing.T) {
 	}
 }
 
+// TestBuildBoxResolvesTheServiceAccountThroughTheOneHelper pins the downward
+// API's spec.serviceAccountName at the translate boundary: a pod the apiserver's
+// admission stamped reads its own account, and a pod that reaches the provider
+// with the field unset reads "default", the same answer the token binding gives
+// (podServiceAccount), never an empty string a workload would take as a value.
+//
+// Fails-before: the translate site copied the bare spec field, so the unset row
+// resolved to "".
+func TestBuildBoxResolvesTheServiceAccountThroughTheOneHelper(t *testing.T) {
+	for _, tc := range []struct {
+		name, spec, want string
+	}{
+		{name: "stamped by admission", spec: "api-sa", want: "api-sa"},
+		{name: "unset on the pod", spec: "", want: defaultServiceAccount},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeRuntimeServer()
+			r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir()}, nil, nil)
+			pod := runtimedPod("default", "web")
+			pod.Spec.ServiceAccountName = tc.spec
+			pod.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "SA", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.serviceAccountName"}}}}
+
+			box, err := r.buildBox(context.Background(), pod, "192.168.1.10")
+			if err != nil {
+				t.Fatalf("buildBox: %v", err)
+			}
+			var got string
+			for _, e := range box.GetContainers()[0].GetEnv() {
+				if e.GetName() == "SA" {
+					got = e.GetValue()
+				}
+			}
+			if got != tc.want {
+				t.Errorf("downward spec.serviceAccountName = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func runtimedPod(ns, name string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID("uid-" + name)},

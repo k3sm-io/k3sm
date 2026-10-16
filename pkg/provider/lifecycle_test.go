@@ -29,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -360,41 +361,79 @@ func TestDeletePodForceDeletesFromAPIForPromptRemoval(t *testing.T) {
 // the provider by name, and calls DeletePod again), so the unpinned delete
 // removed the replacement from the apiserver.
 //
+// The companion case pins the other direction in the same test: the pod's own
+// delete, with the matching UID, proceeds and removes it, so the guarantee does
+// not rest on an older sibling test staying green.
+//
 // Fails-before: the delete carried no precondition, so the fake tracker (which
 // keys by name) removed the replacement and the captured options had no UID.
 func TestDeletePodForceDeleteIsPinnedToThePodUID(t *testing.T) {
-	r, _ := newLifecycleFake(t, nil)
-	old := lifecyclePod("del", 30, corev1.Container{Name: "c0", Command: []string{"/web"}})
-	old.UID = "uid-old"
-	replacement := old.DeepCopy()
-	replacement.UID = "uid-new"
-	// The apiserver already holds the REPLACEMENT under the same name when the
-	// predecessor's second teardown runs.
-	client := fake.NewSimpleClientset(replacement)
-	var captured []metav1.DeleteOptions
-	client.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		da := action.(k8stesting.DeleteAction)
-		captured = append(captured, da.GetDeleteOptions())
-		if pre := da.GetDeleteOptions().Preconditions; pre != nil && pre.UID != nil && string(*pre.UID) != string(replacement.UID) {
-			return true, nil, apierrors.NewConflict(corev1.Resource("pods"), old.Name, fmt.Errorf("uid precondition failed"))
+	// capturing wraps a clientset so every pod delete's options are kept, and
+	// a delete whose UID precondition names a pod other than the one held is
+	// refused with the apiserver's 409.
+	capturing := func(client *fake.Clientset, held types.UID) *[]metav1.DeleteOptions {
+		var captured []metav1.DeleteOptions
+		client.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			da := action.(k8stesting.DeleteAction)
+			captured = append(captured, da.GetDeleteOptions())
+			if pre := da.GetDeleteOptions().Preconditions; pre != nil && pre.UID != nil && *pre.UID != held {
+				return true, nil, apierrors.NewConflict(corev1.Resource("pods"), da.GetName(), fmt.Errorf("uid precondition failed"))
+			}
+			return false, nil, nil
+		})
+		return &captured
+	}
+	requirePinnedTo := func(t *testing.T, captured []metav1.DeleteOptions, uid types.UID) {
+		t.Helper()
+		if len(captured) != 1 {
+			t.Fatalf("captured %d deletes, want 1", len(captured))
 		}
-		return false, nil, nil
-	})
-	r.client = client
+		if pre := captured[0].Preconditions; pre == nil || pre.UID == nil || *pre.UID != uid {
+			t.Fatalf("force-delete carried no UID precondition for the pod being torn down (got %+v); a same-name successor is not protected", captured[0].Preconditions)
+		}
+	}
 
-	if err := r.CreatePod(context.Background(), old); err != nil {
-		t.Fatalf("CreatePod: %v", err)
-	}
-	if err := r.DeletePod(context.Background(), old); err != nil {
-		t.Fatalf("DeletePod must swallow the precondition conflict, got %v", err)
-	}
-	if len(captured) != 1 {
-		t.Fatalf("captured %d deletes, want 1", len(captured))
-	}
-	if pre := captured[0].Preconditions; pre == nil || pre.UID == nil || string(*pre.UID) != string(old.UID) {
-		t.Fatalf("force-delete carried no UID precondition for the pod being torn down (got %+v); a same-name successor is not protected", captured[0].Preconditions)
-	}
-	if _, err := client.CoreV1().Pods(replacement.Namespace).Get(context.Background(), replacement.Name, metav1.GetOptions{}); err != nil {
-		t.Fatalf("the replacement pod was removed from the apiserver by its predecessor's teardown: %v", err)
-	}
+	t.Run("a same-name successor survives the predecessor's teardown", func(t *testing.T) {
+		r, _ := newLifecycleFake(t, nil)
+		old := lifecyclePod("del", 30, corev1.Container{Name: "c0", Command: []string{"/web"}})
+		old.UID = "uid-old"
+		replacement := old.DeepCopy()
+		replacement.UID = "uid-new"
+		// The apiserver already holds the REPLACEMENT under the same name when the
+		// predecessor's second teardown runs.
+		client := fake.NewSimpleClientset(replacement)
+		captured := capturing(client, replacement.UID)
+		r.client = client
+
+		if err := r.CreatePod(context.Background(), old); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		if err := r.DeletePod(context.Background(), old); err != nil {
+			t.Fatalf("DeletePod must swallow the precondition conflict, got %v", err)
+		}
+		requirePinnedTo(t, *captured, old.UID)
+		if _, err := client.CoreV1().Pods(replacement.Namespace).Get(context.Background(), replacement.Name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("the replacement pod was removed from the apiserver by its predecessor's teardown: %v", err)
+		}
+	})
+
+	t.Run("the pod's own delete, matching UID, proceeds", func(t *testing.T) {
+		r, _ := newLifecycleFake(t, nil)
+		own := lifecyclePod("del", 30, corev1.Container{Name: "c0", Command: []string{"/web"}})
+		own.UID = "uid-own"
+		client := fake.NewSimpleClientset(own)
+		captured := capturing(client, own.UID)
+		r.client = client
+
+		if err := r.CreatePod(context.Background(), own); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		if err := r.DeletePod(context.Background(), own); err != nil {
+			t.Fatalf("DeletePod: %v", err)
+		}
+		requirePinnedTo(t, *captured, own.UID)
+		if _, err := client.CoreV1().Pods(own.Namespace).Get(context.Background(), own.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("the pod's own force-delete did not remove it (get err=%v)", err)
+		}
+	})
 }

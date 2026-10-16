@@ -250,6 +250,37 @@ func TestResolvePodBoxEnvInjectsTheAPIServerService(t *testing.T) {
 		}
 	})
 
+	t.Run("envFrom overrides the service environment and an explicit env var overrides both", func(t *testing.T) {
+		// The full precedence chain on ONE name: the master service sets
+		// KUBERNETES_SERVICE_HOST and _PORT, an envFrom ConfigMap overrides
+		// both, an explicit env var overrides the host again. Each layer must
+		// win over the one before it and lose to the one after.
+		cs := fake.NewSimpleClientset(
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "api-override"}, Data: map[string]string{"KUBERNETES_SERVICE_HOST": "configmap.internal", "KUBERNETES_SERVICE_PORT": "8443"}},
+		)
+		box := &runtimev1.PodBox{
+			Namespace: "prod",
+			Containers: []*runtimev1.Container{{
+				Name:    "c0",
+				EnvFrom: []*runtimev1.EnvFromSource{{ConfigMapRef: &runtimev1.ConfigMapEnvSource{Name: "api-override"}}},
+				Env:     []*runtimev1.EnvVar{{Name: "KUBERNETES_SERVICE_HOST", Value: "explicit.internal"}},
+			}},
+		}
+		if err := resolvePodBoxEnv(context.Background(), box, podFacts{apiServerVIP: "10.43.0.1"}, newTestKubeResolver(cs)); err != nil {
+			t.Fatalf("resolvePodBoxEnv: %v", err)
+		}
+		env := envOf(box.GetContainers()[0])
+		for name, want := range map[string]string{
+			"KUBERNETES_SERVICE_HOST":       "explicit.internal", // explicit env over envFrom over the service
+			"KUBERNETES_SERVICE_PORT":       "8443",              // envFrom over the service
+			"KUBERNETES_SERVICE_PORT_HTTPS": "443",               // the service, untouched by either
+		} {
+			if env[name] != want {
+				t.Errorf("env[%q] = %q, want %q", name, env[name], want)
+			}
+		}
+	})
+
 	t.Run("no API VIP injects nothing", func(t *testing.T) {
 		box := &runtimev1.PodBox{Namespace: "prod", Containers: []*runtimev1.Container{{Name: "c0"}}}
 		if err := resolvePodBoxEnv(context.Background(), box, podFacts{}, nil); err != nil {
