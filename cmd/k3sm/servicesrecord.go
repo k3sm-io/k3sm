@@ -46,13 +46,16 @@ type servicesSource interface {
 // record.
 const servicesSyncPoll = time.Second
 
-// removeServicesRecord removes the record an earlier server process left. It
-// describes a proxy that is gone, and runs whether or not this server has a
-// datapath, so a server restarted without one leaves no record behind.
+// removeServicesRecord removes the record an earlier server process left, and
+// its user-readable copy. It describes a proxy that is gone, and runs whether or
+// not this server has a datapath, so a server restarted without one leaves no
+// record behind.
 func removeServicesRecord(workDir string, logger *slog.Logger) {
 	path := status.ServicesPath(workDir)
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		logger.Warn("could not remove the previous Service proxy record", "path", path, "err", err)
+	for _, p := range []string{path, status.UserReadablePath(workDir, path)} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			logger.Warn("could not remove the previous Service proxy record", "path", p, "err", err)
+		}
 	}
 }
 
@@ -75,7 +78,7 @@ func runServicesRecorder(ctx context.Context, src servicesSource, workDir string
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		if err := recordServices(src, path, time.Now()); err != nil && ctx.Err() == nil {
+		if err := recordServices(src, workDir, path, time.Now()); err != nil && ctx.Err() == nil {
 			logger.Warn("could not record the Service proxy for `k3sm status`", "path", path, "err", err)
 		}
 		select {
@@ -86,9 +89,9 @@ func runServicesRecorder(ctx context.Context, src servicesSource, workDir string
 	}
 }
 
-// recordServices writes src's routing table to path through writeFileAtomic,
-// which creates the file 0600 like the other records beside it.
-func recordServices(src servicesSource, path string, now time.Time) error {
+// recordServices writes src's routing table to path through writeRecord: 0600
+// like the other records beside it, and 0644 in the status directory.
+func recordServices(src servicesSource, workDir, path string, now time.Time) error {
 	rec := svcstatus.Record(src.VIPStates(), src.PinnedBackends(), src.UnproxiedClusterIPs(), now)
-	return writeFileAtomic(path, rec)
+	return writeRecord(workDir, path, rec)
 }

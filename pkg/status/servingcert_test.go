@@ -17,8 +17,12 @@ limitations under the License.
 package status
 
 import (
+	"context"
+	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -81,7 +85,7 @@ func TestServingCertRow(t *testing.T) {
 				fsys.unreadable[caPath] = true
 			}
 			c := Collector{FS: fsys, Paths: Paths{WorkDir: wd, ServerLabel: "io.k3sm.server"}}
-			row, ok := c.servingCertRow(tc.now)
+			row, ok := c.servingCertRow(context.Background(), tc.now)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v (row %+v)", ok, tc.wantOK, row)
 			}
@@ -148,7 +152,7 @@ func TestAdminKubeconfigAnchorRow(t *testing.T) {
 		{name: "mismatch: skip-verify", record: rec(kube), kube: kubeconfig("    insecure-skip-tls-verify: true"), state: StateDrift, sev: SeverityWarn, detail: "MISMATCH: re-run sudo k3sm install"},
 		{name: "missing record", state: StateSkip, sev: SeveritySkip, detail: "not recorded"},
 		{name: "record without the path", record: rec(""), state: StateSkip, sev: SeveritySkip, detail: "not recorded"},
-		{name: "non-root", euid: 501, record: rec(kube), kube: kubeconfig(pin(ca.CertPEM)), state: StateSkip, sev: SeveritySkip, detail: "not checked: not root"},
+		{name: "non-root", euid: 501, record: rec(kube), kube: kubeconfig(pin(ca.CertPEM)), state: StateNeedsAdmin, sev: SeveritySkip, detail: "needs sudo: only root checks the admin kubeconfig"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fsys := fakeFS{present: map[string]bool{}, contents: map[string][]byte{}, unreadable: map[string]bool{}}
@@ -183,4 +187,79 @@ func TestAdminKubeconfigAnchorRow(t *testing.T) {
 			}
 		}
 	})
+}
+
+// handshakeLeaf issues an apiserver serving certificate from ca for the
+// loopback names and parses it, the shape a TLS handshake hands back.
+func handshakeLeaf(t *testing.T, ca *certs.CA, validFor time.Duration) *x509.Certificate {
+	t.Helper()
+	pemBytes, _, err := ca.IssueServing("kube-apiserver", []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1")}, validFor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := parseFirstCert(pemBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return leaf
+}
+
+// TestServingCertRowFromHandshake pins the account that cannot read the
+// certificate file: the row reads the certificate the apiserver presents and
+// runs the same checks on it (in date, issued by the cluster CA the reader's
+// kubeconfig pins, naming the host it was reached by).
+func TestServingCertRowFromHandshake(t *testing.T) {
+	const wd = "/var/lib/k3sm/server"
+	ca, err := certs.NewCA("k3sm-cluster-ca")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := certs.NewCA("k3sm-cluster-ca")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	good := handshakeLeaf(t, ca, time.Hour)
+	presented := func(host string, ca []byte, chain ...*x509.Certificate) func(context.Context) (PresentedChain, error) {
+		return func(context.Context) (PresentedChain, error) {
+			return PresentedChain{Server: "https://" + host + ":6444", Host: host, Chain: chain, CA: ca}, nil
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		chain  func(context.Context) (PresentedChain, error)
+		now    time.Time
+		state  RowState
+		sev    Severity
+		detail string
+	}{
+		{"issued by the cluster CA, in date", presented("127.0.0.1", ca.CertPEM, good), now, StateOK, SeverityOK, "issued by the CA your kubeconfig pins, valid until " + good.NotAfter.UTC().Format("2006-01-02") + " (read from the TLS handshake)"},
+		{"expired", presented("127.0.0.1", ca.CertPEM, good), now.Add(2 * time.Hour), StateExpired, SeverityFail, "expired"},
+		{"another CA's certificate", presented("127.0.0.1", ca.CertPEM, handshakeLeaf(t, other, time.Hour)), now, StateCorrupt, SeverityFail, "not issued by the CA your kubeconfig pins"},
+		{"a host the certificate does not name", presented("100.64.0.9", ca.CertPEM, good), now, StateCorrupt, SeverityFail, "does not name 100.64.0.9"},
+		{"an endpoint that is not this server", presented("10.0.0.9", ca.CertPEM, good), now, StateUnknown, SeverityUnknown, NotThisServerDetail},
+		{"a kubeconfig that pins no CA", presented("127.0.0.1", nil, good), now, StateUnknown, SeverityUnknown, "pins no cluster CA"},
+		{"no handshake", func(context.Context) (PresentedChain, error) {
+			return PresentedChain{}, errors.New("connection refused")
+		}, now, StateUnknown, SeverityUnknown, "connection refused"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fsys := fakeFS{
+				present:    map[string]bool{certs.ClusterCACertPath(wd): true},
+				unreadable: map[string]bool{certs.ClusterCACertPath(wd): true, certs.APIServerServingCertPath(wd): true},
+			}
+			c := Collector{FS: fsys, ServingChain: tc.chain, Paths: Paths{WorkDir: wd, ServerLabel: "io.k3sm.server"},
+				ServerAnchor: ServerAnchor(6444, []netip.Addr{netip.MustParseAddr("100.64.0.9")})}
+			row, ok := c.servingCertRow(context.Background(), tc.now)
+			if !ok {
+				t.Fatal("no serving-cert row")
+			}
+			if row.State != tc.state || row.Severity != tc.sev || !strings.Contains(row.Detail, tc.detail) {
+				t.Errorf("row = %s/%s %q, want %s/%s containing %q", row.State, row.Severity, row.Detail, tc.state, tc.sev, tc.detail)
+			}
+			if row.Wide["source"] != "handshake" {
+				t.Errorf("wide source = %q, want handshake", row.Wide["source"])
+			}
+		})
+	}
 }

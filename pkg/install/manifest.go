@@ -195,6 +195,10 @@ func artifactManifest(cfg Config) []artifact {
 	// removed after the daemon that reads it has been booted out.
 	// assertExists is false because a data root an older build installed has no
 	// such file until the next install stages one.
+	// The endpoints record either node daemon publishes in the status
+	// directory, REMOVED after that daemon is booted out for the reason the
+	// server's records below are: it describes a node that no longer runs.
+	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), EndpointsRecordName), assertExists: false})
 	if cfg.Role == RoleServer {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
 		// A joining HA server's staged server-class join token, removed for the
@@ -203,6 +207,17 @@ func artifactManifest(cfg Config) []artifact {
 		// start) and no longer. assertExists is false: only a --server-join
 		// install stages one.
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverJoinTokenPath(), assertExists: false})
+		// The records the server writes for `k3sm status`, the 0600 originals
+		// in its work dir and the 0644 copies in the status directory, REMOVED
+		// after the daemon that refreshes them is booted out: they describe a
+		// server that no longer runs, and a copy left in the world-readable
+		// directory would be read as this Mac's state by the next report.
+		// assertExists is false: a server writes them only once it runs.
+		for _, name := range []string{MeshClaimsRecordName, ServicesRecordName} {
+			items = append(items,
+				artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(cfg.serverWorkDir(), name), assertExists: false},
+				artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), name), assertExists: false})
+		}
 		// The secrets encryption pair, PRESERVED with the datastore it unlocks:
 		// deleting the key would leave every Secret in the preserved state.db
 		// unreadable. assertExists is false: encryption is opt-in.

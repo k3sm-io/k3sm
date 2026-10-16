@@ -19,10 +19,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -40,6 +44,7 @@ import (
 
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 
 	"k3sm.io/k3sm/pkg/datavol"
@@ -178,13 +183,24 @@ func newStatusCollector() status.Collector {
 		AgentJoinServer: statusAgentJoinServer,
 		// The Service proxy's record against one uncached Services and
 		// EndpointSlices LIST, over the same client as every apiserver row.
-		Services:   statusServices(kube),
-		Paths:      paths,
-		EUID:       euid,
-		ServiceUID: serviceUID,
-		Version:    version.Get(),
-		Host:       macOSVersionOrEmpty(),
-		Hostname:   hostnameOrEmpty(),
+		Services: statusServices(kube),
+		// The certificate the apiserver presents, for the serving-cert row of
+		// an account that cannot read the certificate file.
+		ServingChain: statusServingChain(kube),
+		// On an agent, the invoking account's own kubeconfig, for when the
+		// node credential is not readable from this account.
+		UserKube: statusUserKubeFor(role, statusAgentJoinServer),
+		// What proves, on a server, that the apiserver the report dials is
+		// this Mac's own: loopback or one of its addresses, at the apiserver
+		// port. A server installed with a non-default --api-port fails it, and
+		// those rows then stay unknown as an ordinary account.
+		ServerAnchor: status.NodeAnchor(statusEndpoints(), status.ServerAnchor(executor.DefaultAPIServerPort, localAddrs())),
+		Paths:        paths,
+		EUID:         euid,
+		ServiceUID:   serviceUID,
+		Version:      version.Get(),
+		Host:         macOSVersionOrEmpty(),
+		Hostname:     hostnameOrEmpty(),
 	}
 }
 
@@ -231,6 +247,59 @@ func statusServices(kube status.Kube) status.ServicesComparer {
 		return nil
 	}
 	return svcstatus.Comparer{Client: rk.client, Timeout: statusAPITimeout}
+}
+
+// statusServingChain reads the certificate chain the apiserver behind kube
+// presents in a TLS handshake, with the CA kube's kubeconfig pins, or is nil
+// (the row stays unknown) when there is no client.
+//
+// The handshake skips verification ONLY to read the presented chain: nothing is
+// sent over the connection, and the row verifies the chain against the pinned CA
+// itself, so that it can say which check failed rather than only that one did.
+func statusServingChain(kube status.Kube) func(context.Context) (status.PresentedChain, error) {
+	rk, ok := kube.(restKube)
+	if !ok || rk.cfg == nil {
+		return nil
+	}
+	cfg := rk.cfg
+	return func(ctx context.Context) (status.PresentedChain, error) {
+		u, err := url.Parse(cfg.Host)
+		if err != nil {
+			return status.PresentedChain{}, fmt.Errorf("parse the apiserver URL %q: %w", cfg.Host, err)
+		}
+		pc := status.PresentedChain{Server: cfg.Host, Host: u.Hostname()}
+		if cfg.TLSClientConfig.ServerName != "" {
+			pc.Host = cfg.TLSClientConfig.ServerName
+		}
+		pc.CA = cfg.TLSClientConfig.CAData
+		if len(pc.CA) == 0 && cfg.TLSClientConfig.CAFile != "" {
+			if pc.CA, err = os.ReadFile(cfg.TLSClientConfig.CAFile); err != nil {
+				return pc, fmt.Errorf("read the kubeconfig's CA file: %w", err)
+			}
+		}
+		addr := u.Host
+		if u.Port() == "" {
+			addr = net.JoinHostPort(u.Hostname(), "443")
+		}
+		ctx, cancel := context.WithTimeout(ctx, statusAPITimeout)
+		defer cancel()
+		raw, err := (&tcpseg.Dialer{Timeout: statusAPITimeout}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return pc, err
+		}
+		tc := tls.Client(raw, &tls.Config{
+			ServerName: pc.Host,
+			MinVersion: tls.VersionTLS12,
+			// Read-only: the chain is verified against pc.CA by the row.
+			InsecureSkipVerify: true,
+		})
+		defer func() { _ = tc.Close() }()
+		if err := tc.HandshakeContext(ctx); err != nil {
+			return pc, err
+		}
+		pc.Chain = tc.ConnectionState().PeerCertificates
+		return pc, nil
+	}
 }
 
 // newDaemonsCollector assembles the collector for the launchd-only daemons
@@ -462,6 +531,9 @@ type restKube struct {
 	client *kubernetes.Clientset
 	server string
 	tls    string
+	// cfg is the rest config the client was built from, which the serving-cert
+	// row's handshake reads the URL and the pinned CA from.
+	cfg *rest.Config
 }
 
 // RawGet performs an unstructured GET against an absolute apiserver path.
@@ -604,7 +676,64 @@ func newStatusKube(in statusKubeInputs) (status.Kube, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	return buildStatusKube(cfg)
+}
 
+// statusEndpoints reads the endpoints record this node published, or nil
+// (a node older than the record), from the installed status directory.
+func statusEndpoints() *status.EndpointsRecord {
+	return status.ReadEndpointsRecord(os.ReadFile, status.EndpointsPath(install.StateStatus.Path(install.DefaultDataRoot)))
+}
+
+// localAddrs lists this Mac's interface addresses, for the server anchor. A
+// failed read lists none, which leaves loopback as the only anchor.
+func localAddrs() []netip.Addr {
+	ifaddrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, a := range ifaddrs {
+		if p, err := netip.ParsePrefix(a.String()); err == nil {
+			out = append(out, p.Addr())
+		}
+	}
+	return out
+}
+
+// statusUserKubeFor returns, on an agent, the reader of the invoking account's
+// own kubeconfig the report falls back to when the node credential is not
+// readable (status.Collector.UserKube); nil on a server, which resolves the
+// user's kubeconfig already.
+//
+// joinServer reads the agent's --server, which anchors the context: only a
+// context whose server is on that host is used.
+func statusUserKubeFor(role install.Role, joinServer func() (string, error)) func() (status.Kube, string, error) {
+	if role != install.RoleAgent {
+		return nil
+	}
+	return func() (status.Kube, string, error) {
+		rules := clientcmd.NewDefaultClientConfigLoadingRules()
+		raw, err := rules.Load()
+		if err != nil {
+			return nil, "", err
+		}
+		join, err := joinServer()
+		if err != nil {
+			return nil, "", fmt.Errorf("the server this Mac joined is unknown, so no context can be shown to point at it: %w", err)
+		}
+		name := installedKubeconfigName()
+		ctxName, ok := status.UserKubeContext(raw, name, status.NodeAnchor(statusEndpoints(), status.JoinAnchor(join)))
+		if !ok {
+			return nil, "", fmt.Errorf("neither the %q context nor the current one points at the server this Mac joined", name)
+		}
+		return buildStatusKube(kubectlConfig{context: ctxName})
+	}
+}
+
+// buildStatusKube builds the report's apiserver client for one resolved
+// kubeconfig and context, with the probe timeout.
+func buildStatusKube(cfg kubectlConfig) (status.Kube, string, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if cfg.kubeconfig != "" {
 		rules.ExplicitPath = cfg.kubeconfig
@@ -624,7 +753,7 @@ func newStatusKube(in statusKubeInputs) (status.Kube, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	return restKube{client: cs, server: restCfg.Host, tls: tlsPosture(restCfg)}, kubeSource(cfg, rules), nil
+	return restKube{client: cs, server: restCfg.Host, tls: tlsPosture(restCfg), cfg: restCfg}, kubeSource(cfg, rules), nil
 }
 
 // tlsPosture describes how a rest config trusts the apiserver, in the two words

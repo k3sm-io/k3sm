@@ -1805,6 +1805,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureOwnedDir:/var/lib/k3sm/manifests:0:0:0755",
 		"EnsureOwnedDir:/var/lib/k3sm/run:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/Library:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/status:271:20:0755",
 		"EnsureOwnedDir:/var/lib/k3sm/pods:271:20:0750",
 		"EnsureOwnedDir:/var/lib/k3sm/storage:271:20:0750",
 		"EnsureOwnedDir:/var/lib/k3sm/blobs:271:20:0750",
@@ -2197,12 +2198,17 @@ func TestUninstallIdempotent(t *testing.T) {
 		// A joining HA server's staged server-class join token, removed in the
 		// same position as the admin token below and for the same reason; on a
 		// server that never joined, removing an absent file is a no-op.
+		"RemoveAll:/var/lib/k3sm/status/services.json",
+		"RemoveAll:/var/lib/k3sm/server/services.json",
+		"RemoveAll:/var/lib/k3sm/status/mesh-claims.json",
+		"RemoveAll:/var/lib/k3sm/server/mesh-claims.json",
 		"RemoveAll:/var/lib/k3sm/server/join-token",
 		// The staged admin token, removed with the daemons rather than preserved
 		// with the rest of the data root: it is a system:masters credential with
 		// no use on a Mac that is no longer a k3sm server, and it goes AFTER the
 		// daemon that reads it has been booted out.
 		"RemoveAll:/var/lib/k3sm/server/token",
+		"RemoveAll:/var/lib/k3sm/status/endpoints.json",
 		// The launcher link is judged BEFORE the sweep deletes its target: after
 		// the sweep it is a dangling link whose identity can no longer be read.
 		"RemoveSymlink:/usr/local/bin/k3sm",
@@ -2813,6 +2819,19 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		// server; it is admitted by that exact path, and only on the server role.
 		if dc.Role == RoleServer {
 			created[dc.serverJoinTokenPath()] = true
+		}
+		// The `k3sm status` records are written by the server daemon this
+		// install bootstrapped, in its work dir and in the status directory, so
+		// they are created only when that daemon was, and admitted by their
+		// exact paths.
+		if toSet(recorded(installCalls, "Bootstrap:"))[daemonLabel(dc.Role)] {
+			created[filepath.Join(StateStatus.Path(dc.DataRoot), EndpointsRecordName)] = true
+		}
+		if dc.Role == RoleServer && toSet(recorded(installCalls, "Bootstrap:"))[ServerLabel] {
+			for _, name := range []string{MeshClaimsRecordName, ServicesRecordName} {
+				created[filepath.Join(dc.serverWorkDir(), name)] = true
+				created[filepath.Join(StateStatus.Path(dc.DataRoot), name)] = true
+			}
 		}
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
 			if !created[p] {

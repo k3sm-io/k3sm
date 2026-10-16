@@ -560,7 +560,7 @@ func TestCollectorSkipsRuntimedUnprivileged(t *testing.T) {
 	if !ok {
 		t.Fatal("no runtimed row")
 	}
-	if rt.State != StateUnknown || rt.Detail != "needs sudo (socket is owner-only)" {
+	if rt.State != StateNeedsAdmin || rt.Severity != SeveritySkip || rt.Detail != RuntimedNeedsAdminDetail || rt.Remedy != "sudo k3sm status" {
 		t.Fatalf("runtimed row = %q/%q", rt.State, rt.Detail)
 	}
 }

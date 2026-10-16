@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/netip"
 	"net/url"
@@ -254,12 +255,29 @@ func (e *meshEnroller) recordAbandonedClaims(ctx context.Context, workDir, self 
 			Acquired: acquired,
 		})
 	}
-	return writeFileAtomic(status.MeshClaimsPath(workDir), rec)
+	return writeRecord(workDir, status.MeshClaimsPath(workDir), rec)
+}
+
+// writeRecord writes a `k3sm status` record twice: 0600 at path in the work dir,
+// and 0644 at its user-readable copy in status.Dir, when that directory exists,
+// so an account that cannot see inside the work dir can still read it. The
+// records hold cluster-internal names and addresses, never a credential. A
+// missing status directory (a work dir outside an install) skips the copy.
+func writeRecord(workDir, path string, v any) error {
+	if err := writeFileAtomic(path, v, 0o600); err != nil {
+		return err
+	}
+	user := status.UserReadablePath(workDir, path)
+	if _, err := os.Stat(filepath.Dir(user)); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return writeFileAtomic(user, v, 0o644)
 }
 
 // writeFileAtomic writes v as JSON to path through a temporary file and a rename,
-// so a reader never sees a half-written record.
-func writeFileAtomic(path string, v any) error {
+// so a reader never sees a half-written record. The file gets mode before it
+// takes its name.
+func writeFileAtomic(path string, v any, mode fs.FileMode) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -270,6 +288,10 @@ func writeFileAtomic(path string, v any) error {
 	}
 	defer func() { _ = os.Remove(tmp.Name()) }()
 	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
 		_ = tmp.Close()
 		return err
 	}

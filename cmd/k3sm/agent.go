@@ -464,6 +464,11 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	if err := store.Save(apiserverURL, opts.nodeName, res); err != nil {
 		return err
 	}
+	// The hosts that name this cluster's apiserver, for an unprivileged `k3sm
+	// status` to anchor the user's kubeconfig against: published once the
+	// apiserver answers a handshake verified against the pinned cluster CA,
+	// which over the mesh may be a little after this.
+	go runAgentEndpointsPublisher(ctx, agentStatusDir(opts.workDir), apiserverURL, opts.server, res.ClusterCAPEM, clampedDial, agentEndpointsRetry, logger)
 
 	// Bring up the wireguard mesh (the root utun leg, direct or via the helper) and
 	// keep it converging via the MeshPeer watch, THEN the node-local datapath (the

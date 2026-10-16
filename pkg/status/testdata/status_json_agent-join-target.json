@@ -94,9 +94,10 @@
     },
     {
       "name": "runtimed",
-      "state": "unknown",
-      "severity": "unknown",
-      "detail": "needs sudo (socket is owner-only)"
+      "state": "needs-admin",
+      "severity": "skip",
+      "detail": "needs sudo: the runtime daemon's socket is owner-only",
+      "remedy": "sudo k3sm status"
     }
   ],
   "next": [
@@ -105,7 +106,8 @@
     "k3sm status logs agent",
     "sudo k3sm install",
     "k3sm kubeconfig --write",
-    "k3sm kubectl get pods -A"
+    "k3sm kubectl get pods -A",
+    "sudo k3sm status"
   ],
   "joinTarget": "192.0.2.10:9345",
   "version": {

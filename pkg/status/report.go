@@ -70,6 +70,13 @@ const (
 	// status post or Lease renewal is older than the window the node lifecycle
 	// allows it.
 	StateStale RowState = "stale"
+	// StateNeedsAdmin is a check only root can run: the runtime daemon's
+	// owner-only socket, the admin kubeconfig install recorded, a root-only
+	// file. It is not unknown: nothing went wrong and nothing is hidden by a
+	// fault, the answer simply needs sudo. Its severity is skip (or, on a row
+	// whose readable part found something, that part's severity), so it never
+	// moves the verdict, and its remedy is the sudo command that answers it.
+	StateNeedsAdmin RowState = "needs-admin"
 )
 
 // Row is one subsystem's line in the report.

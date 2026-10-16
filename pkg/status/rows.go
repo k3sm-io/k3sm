@@ -37,6 +37,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
@@ -67,6 +68,9 @@ func (c Collector) Collect(ctx context.Context) Report {
 	dataRoot, volume := c.dataRootRow(ctx, role)
 	ld := c.launchdRows(now(), role, bothRoles, volume != nil)
 	instRow, installed, netd, node, nodePID := ld.install, ld.installed, ld.netd, ld.node, ld.nodePID
+	if role == dataroot.RoleAgent && c.Kube == nil && ld.credential == CredentialUnknown && c.UserKube != nil {
+		c = c.withUserKube()
+	}
 	apiserver := c.apiserverRow(ctx, role, ld.credential)
 	serving := apiserver.Severity == SeverityOK
 	// The node list is read ONCE and handed to both rows that use it, so the
@@ -121,7 +125,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	if pre, ok := c.preVolumeRow(); ok {
 		rows = append(rows, pre)
 	}
-	rows = append(rows, c.datastoreRow(role))
+	rows = append(rows, c.datastoreRow(role, apiserver))
 	// The embedded etcd member, on an etcd-posture server only: quorum, alarms,
 	// size against quota and WAL fsync latency, beside the datastore row it details.
 	if role != dataroot.RoleAgent {
@@ -129,7 +133,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 			rows = append(rows, r)
 		}
 		// The apiserver serving certificate: present, issued by the cluster CA, in date.
-		if r, ok := c.servingCertRow(now()); ok {
+		if r, ok := c.servingCertRow(ctx, now()); ok {
 			rows = append(rows, r)
 		}
 		// The admin kubeconfig install wrote, checked against that cluster CA.
@@ -365,9 +369,12 @@ func (c Collector) serverArgsRow() (Row, bool) {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return Row{}, false // no install to report arguments for
+	case errors.Is(err, fs.ErrPermission):
+		needsAdmin(&row, "needs sudo: "+path+" is readable by root only")
+		return row, true
 	case err != nil:
 		row.State, row.Severity = StateUnknown, SeverityUnknown
-		row.Detail = "unreadable as this user: " + path
+		row.Detail = "could not read " + path + ": " + errText(err)
 		return row, true
 	}
 	args, err := c.ServerArgs(raw)
@@ -1268,9 +1275,16 @@ func (c Collector) preVolumeRow() (Row, bool) {
 		// smaller number as if it were the whole.
 		sizeText = "at least " + sizeText + ", re-run with sudo for the full size"
 	}
+	state := StateOK
+	if partial && c.EUID != 0 {
+		// The size is a lower bound because this account could not read the
+		// whole copy; only root can finish the walk. The warning itself stands:
+		// the copy is there whoever reads it.
+		state = StateNeedsAdmin
+	}
 	row := Row{
 		Name:     RowPreVolume,
-		State:    StateOK,
+		State:    state,
 		Severity: SeverityWarn,
 		Detail:   fmt.Sprintf("%s holds the pre-migration copy (%s, %s)", path, sizeText, ageText(c.since(info.ModTime()))),
 		Remedy:   "sudo rm -r " + path + "   # once you are satisfied with the migrated cluster",
@@ -1457,7 +1471,12 @@ const WorkerDatastoreDetail = "not this node's: the control plane's datastore li
 // On an embedded etcd HA server the datastore is the etcd member, not a state.db,
 // so an initialized member (executor.EtcdMemberExists) is reported as such rather
 // than as "no state.db yet" — which would read as a server that never came up.
-func (c Collector) datastoreRow(role dataroot.Role) Row {
+//
+// An account that cannot read the db asks the apiserver instead, the way kubectl
+// would: the apiserver's readiness check includes its etcd check, which kine
+// answers, so a ready apiserver proves the datastore answers. apiserver is the
+// row Collect already built from that probe; the db is never opened for it.
+func (c Collector) datastoreRow(role dataroot.Role, apiserver Row) Row {
 	row := Row{Name: RowDatastore}
 	if role == dataroot.RoleAgent {
 		row.State, row.Severity = StateSkip, SeveritySkip
@@ -1475,9 +1494,7 @@ func (c Collector) datastoreRow(role dataroot.Role) Row {
 	present, uv, jm, err := DatastorePosture(path)
 	switch {
 	case errors.Is(err, fs.ErrPermission):
-		row.State, row.Severity = StateUnknown, SeverityUnknown
-		row.Detail = "state.db not readable as this user (re-run with sudo)"
-		row.Remedy = "sudo k3sm status"
+		datastoreThroughAPIServer(&row, apiserver, c.anchored(apiserver.Wide["server"]))
 	case err != nil:
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "could not read " + path + ": " + errText(err)
@@ -1496,6 +1513,65 @@ func (c Collector) datastoreRow(role dataroot.Role) Row {
 	return row
 }
 
+// DatastoreAnswersDetail is the datastore row's detail when an account that
+// cannot read the db learned from this server's apiserver readiness check that
+// the datastore answers.
+const DatastoreAnswersDetail = "answers (the apiserver's readiness check reached it); the WAL and user_version checks run only as root"
+
+// NotThisServerDetail is the reason an unprivileged row does not vouch for an
+// endpoint ServerAnchor did not accept.
+const NotThisServerDetail = "the kubeconfig does not point at this server"
+
+// datastoreThroughAPIServer fills the datastore row of an account that may not
+// read the db from the apiserver row: ok when the apiserver is ready (its
+// readiness includes the etcd check kine answers) AND anchored says the
+// endpoint is this server's own; unknown otherwise, with the reason.
+func datastoreThroughAPIServer(row *Row, apiserver Row, anchored bool) {
+	row.Wide["source"] = "apiserver readyz"
+	row.Remedy = "sudo k3sm status"
+	row.State, row.Severity = StateUnknown, SeverityUnknown
+	switch {
+	case apiserver.State != StateReady:
+		row.Detail = "state.db is not readable as this user and the apiserver did not answer its readiness check, so nothing reached the datastore"
+	case !anchored:
+		row.Detail = "state.db is not readable as this user, and " + NotThisServerDetail + " (" + apiserver.Wide["server"] + ")"
+	default:
+		row.State, row.Severity, row.Remedy = StateOK, SeverityOK, ""
+		row.Detail = DatastoreAnswersDetail
+	}
+}
+
+// anchored reports whether ServerAnchor accepts server as this Mac's own
+// control plane.
+func (c Collector) anchored(server string) bool {
+	return c.ServerAnchor != nil && server != "" && c.ServerAnchor(server)
+}
+
+// withUserKube adopts the invoking account's own kubeconfig (UserKube) as the
+// report's apiserver client, on an agent whose node credential this account
+// cannot read. A kubeconfig that offers no usable context leaves the report
+// as it was, with both reasons in KubeErr.
+func (c Collector) withUserKube() Collector {
+	kube, source, err := c.UserKube()
+	if err != nil || kube == nil {
+		if err != nil && c.KubeErr != nil {
+			c.KubeErr = fmt.Errorf("%w; your kubeconfig: %v", c.KubeErr, err)
+		}
+		return c
+	}
+	c.Kube, c.KubeSource, c.KubeErr, c.kubeFromUser = kube, source, nil, true
+	if c.Interconnect == nil {
+		c.Interconnect = func(ctx context.Context) (*netv1alpha1.Interconnect, error) {
+			return ReadInterconnect(ctx, kube)
+		}
+	}
+	return c
+}
+
+// UserKubeNote is the clause the kubeconfig row adds when the report reads the
+// cluster with the invoking account's kubeconfig on an agent.
+const UserKubeNote = "your kubeconfig; this account cannot read the node credential"
+
 // kubeconfigRow reports the credentials this command found, and where.
 func (c Collector) kubeconfigRow() Row {
 	row := Row{Name: RowKubeconfig}
@@ -1510,6 +1586,10 @@ func (c Collector) kubeconfigRow() Row {
 	if row.Detail == "" {
 		row.Detail = "resolved"
 	}
+	if c.kubeFromUser {
+		row.Detail += " (" + UserKubeNote + ")"
+		row.Wide = map[string]string{"source": "user-kubeconfig"}
+	}
 	return row
 }
 
@@ -1523,8 +1603,7 @@ func (c Collector) runtimedRow(ctx context.Context, role dataroot.Role) Row {
 	// seam: a caller that wires a Runtimed anyway must still not have this
 	// command dial an owner-only socket it has no business opening.
 	if c.Runtimed == nil || !RuntimedReachable(c.EUID, c.ServiceUID) {
-		row.State, row.Severity = StateUnknown, SeverityUnknown
-		row.Detail = "needs sudo (socket is owner-only)"
+		needsAdmin(&row, RuntimedNeedsAdminDetail)
 		return row
 	}
 	info, err := c.Runtimed.Info(ctx)
@@ -1544,6 +1623,20 @@ func (c Collector) runtimedRow(ctx context.Context, role dataroot.Role) Row {
 	row.Detail = fmt.Sprintf("%s reports unhealthy: %s", info.GetRuntimeName(), conditionSummary(info.GetConditions()))
 	row.Remedy = c.nodeKickstart(role)
 	return row
+}
+
+// RuntimedNeedsAdminDetail is the runtimed row's detail for an account that may
+// not open the runtime daemon's control socket.
+const RuntimedNeedsAdminDetail = "needs sudo: the runtime daemon's socket is owner-only"
+
+// needsAdminRemedy is the remedy of every needs-admin row: the same report, run
+// as root.
+const needsAdminRemedy = "sudo k3sm status"
+
+// needsAdmin marks row as a check only root can run (StateNeedsAdmin), with
+// severity skip so it never moves the verdict.
+func needsAdmin(row *Row, detail string) {
+	row.State, row.Severity, row.Detail, row.Remedy = StateNeedsAdmin, SeveritySkip, detail, needsAdminRemedy
 }
 
 // conditionSummary names the conditions that are not true, which is the only

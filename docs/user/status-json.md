@@ -160,7 +160,52 @@ Row names in the full report include `install`, `netd`, `server` or `agent`, `ap
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
 `mesh-claims`, `services`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
-`skip`, `drift`, `healthy`, `unhealthy` or `stale`.
+`skip`, `drift`, `healthy`, `unhealthy`, `stale` or `needs-admin`.
+
+`needs-admin` marks a check that only root can run, so nothing was checked and nothing is wrong. Its
+`remedy` is `sudo k3sm status`, and it never changes the `verdict`. A client can show it as not
+checked rather than as a fault. Run as any account other than root, these rows report it:
+
+| row | what needs root |
+|---|---|
+| `runtimed` | the runtime daemon's control socket is owner-only; severity `skip` |
+| `admin-kubeconfig` | only root reads the admin kubeconfig install recorded; severity `skip` |
+| `server-args` | the server's LaunchDaemon plist is readable by root only; severity `skip` |
+| `pre-volume` | the size is a lower bound because part of the copy is root-only; severity stays `warn`, because the copy is there whoever reads it |
+
+Other rows read what your account can, through the apiserver, instead of a file only root can read:
+
+- `datastore`: `ok` with `detail` `answers (the apiserver's readiness check reached it); the WAL and
+  user_version checks run only as root` when the apiserver is ready, because its readiness check
+  includes the datastore. `wide.source` is `apiserver readyz`. The row counts the answer only when
+  your kubeconfig's server is one of this cluster's endpoints (see the endpoints record below).
+  Otherwise it is `unknown`, saying the kubeconfig does not point at this server. It is also
+  `unknown` when the apiserver did not answer.
+- `serving-cert`: reads the certificate the apiserver presents when it is reached with your
+  kubeconfig, and checks it as root checks the file: in date, issued by the CA your kubeconfig
+  pins, and naming the host you reached it by. `wide.source` is `handshake`. The same test of the
+  server applies as for `datastore`. It is `unknown` when that test fails, the handshake fails, or
+  your kubeconfig pins no CA.
+- `mesh-claims` and `services`: a server writes each record twice, mode 0600 in its own work dir
+  and mode 0644 in `/var/lib/k3sm/status/`, which any account can read. The records hold
+  cluster-internal names and addresses, never a credential. The rows read the second copy when the
+  first is not readable, and `wide.record` names the file read. A server older than the status
+  directory writes no second copy, and then the rows say `needs-admin`.
+- On a worker whose node credential your account cannot read, `apiserver`, `node` and `workloads`
+  read the cluster with your own kubeconfig: its `k3sm` context (or the name given to `k3sm install
+  --kubeconfig-name`), else the current context, and either only when its server is one of this
+  cluster's endpoints (see below). A context is never used by its name alone. The `kubeconfig` row
+  then names that file and context, with `wide.source` `user-kubeconfig`.
+
+The endpoints record, `/var/lib/k3sm/status/endpoints.json` (mode 0644), is how a report run as an
+ordinary account knows which endpoints are this cluster's. The node daemon writes it at start: the
+apiserver `port`, and the `hosts` that name the apiserver. On a server those are its serving
+certificate's names and addresses, loopback, and this Mac's own addresses. On a worker they are the
+host it joined, the apiserver address it uses, and the names on the serving certificate that
+apiserver presents, read over a connection verified against the cluster CA the worker pinned when
+it joined. A kubeconfig context counts as this cluster's when its server's host is in `hosts` and its
+port is `port`. A node older than the record writes none; then a server accepts a loopback address or
+one of this Mac's addresses at port 6444, and a worker accepts the host it joined.
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was
@@ -170,9 +215,8 @@ as `leaseAgeSeconds` and `statusAgeSeconds` when known.
 
 The `services` row appears on a server. It compares the backends the server's Service proxy routes
 each Service port to with the Ready endpoints in the cluster's EndpointSlices. The server records
-its proxy in a file in its work dir that only root can read, once the proxy has loaded every Service
-and then every 30 seconds, so run `sudo k3sm status` to see the row's verdict; as any other user the
-row is `unknown` with that remedy. Its `state` is:
+its proxy in a file in its work dir, once the proxy has loaded every Service and then every 30
+seconds, with a copy any account can read in `/var/lib/k3sm/status/`. Its `state` is:
 
 - `ok` when every compared port matches. `detail` gives the port count.
 - `unhealthy` (severity `warn`) when a port's backends differ. `detail` names each such Service
