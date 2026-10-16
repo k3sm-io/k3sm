@@ -67,8 +67,9 @@ Both JSON shapes are versioned; [Status JSON](status-json.md) is their contract.
 
 The exit code is the verdict, so a script can branch on it. `k3sm status --help` lists the codes.
 
-Rows say `unknown` when your account cannot read something the daemons own: the run directory, the
-datastore, the runtime socket. Nothing has failed there; re-run with `sudo` for those rows.
+Rows say `needs-admin` when only root can run the check, such as the runtime socket. Nothing has
+failed there; run `sudo k3sm status` for those rows. A row says `unknown` when the report could not
+see the answer from your account another way, for example when the apiserver does not answer.
 
 ## Logs
 

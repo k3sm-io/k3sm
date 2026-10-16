@@ -68,15 +68,15 @@ func TestServerArgsRow(t *testing.T) {
 			wantDetail: "none (the stock template: no --mesh-ip, no --registry-port)",
 		},
 		{
-			name: "a plist this account cannot read is unknown, never a failure",
+			name: "a plist this account cannot read needs admin, never a failure",
 			collector: func() Collector {
 				fsys := installedFS(p)
 				fsys.contents = map[string][]byte{plist: []byte("--mesh-ip 100.64.0.1")}
 				fsys.unreadable = map[string]bool{plist: true}
 				return Collector{FS: fsys, ServerArgs: fakeServerArgs, Paths: p}
 			},
-			wantRow: true, wantState: StateUnknown,
-			wantDetail: "unreadable as this user: " + plist,
+			wantRow: true, wantState: StateNeedsAdmin,
+			wantDetail: "needs sudo: " + plist + " is readable by root only",
 		},
 		{
 			name: "a plist whose argv will not parse is unknown too",

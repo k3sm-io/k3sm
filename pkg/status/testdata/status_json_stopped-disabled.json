@@ -100,9 +100,10 @@
     },
     {
       "name": "runtimed",
-      "state": "unknown",
-      "severity": "unknown",
-      "detail": "needs sudo (socket is owner-only)"
+      "state": "needs-admin",
+      "severity": "skip",
+      "detail": "needs sudo: the runtime daemon's socket is owner-only",
+      "remedy": "sudo k3sm status"
     }
   ],
   "next": [
@@ -110,7 +111,8 @@
     "sudo launchctl enable system/io.k3sm.server",
     "sudo launchctl kickstart -k system/io.k3sm.server",
     "k3sm status logs server",
-    "k3sm kubectl get pods -A"
+    "k3sm kubectl get pods -A",
+    "sudo k3sm status"
   ],
   "version": {
     "version": "v0.1.7",

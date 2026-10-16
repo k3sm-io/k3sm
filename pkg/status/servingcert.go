@@ -136,7 +136,8 @@ func (c Collector) adminKubeconfigAnchorRow() (Row, bool) {
 		if _, err := c.FS.Stat(certs.ClusterCACertPath(wd)); errors.Is(err, fs.ErrNotExist) {
 			return Row{}, false
 		}
-		return skip("not checked: not root", "sudo k3sm status")
+		needsAdmin(&row, "needs sudo: only root checks the admin kubeconfig against the cluster CA")
+		return row, true
 	}
 	caRaw, err := c.FS.ReadFile(certs.ClusterCACertPath(wd))
 	if err != nil {

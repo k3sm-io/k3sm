@@ -148,7 +148,7 @@ func TestAdminKubeconfigAnchorRow(t *testing.T) {
 		{name: "mismatch: skip-verify", record: rec(kube), kube: kubeconfig("    insecure-skip-tls-verify: true"), state: StateDrift, sev: SeverityWarn, detail: "MISMATCH: re-run sudo k3sm install"},
 		{name: "missing record", state: StateSkip, sev: SeveritySkip, detail: "not recorded"},
 		{name: "record without the path", record: rec(""), state: StateSkip, sev: SeveritySkip, detail: "not recorded"},
-		{name: "non-root", euid: 501, record: rec(kube), kube: kubeconfig(pin(ca.CertPEM)), state: StateSkip, sev: SeveritySkip, detail: "not checked: not root"},
+		{name: "non-root", euid: 501, record: rec(kube), kube: kubeconfig(pin(ca.CertPEM)), state: StateNeedsAdmin, sev: SeveritySkip, detail: "needs sudo: only root checks the admin kubeconfig"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fsys := fakeFS{present: map[string]bool{}, contents: map[string][]byte{}, unreadable: map[string]bool{}}

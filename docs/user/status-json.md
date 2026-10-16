@@ -160,7 +160,18 @@ Row names in the full report include `install`, `netd`, `server` or `agent`, `ap
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
 `mesh-claims`, `services`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
-`skip`, `drift`, `healthy`, `unhealthy` or `stale`.
+`skip`, `drift`, `healthy`, `unhealthy`, `stale` or `needs-admin`.
+
+`needs-admin` marks a check that only root can run, so nothing was checked and nothing is wrong. Its
+`remedy` is `sudo k3sm status`, and it never changes the `verdict`. A client can show it as not
+checked rather than as a fault. Run as any account other than root, these rows report it:
+
+| row | what needs root |
+|---|---|
+| `runtimed` | the runtime daemon's control socket is owner-only; severity `skip` |
+| `admin-kubeconfig` | only root reads the admin kubeconfig install recorded; severity `skip` |
+| `server-args` | the server's LaunchDaemon plist is readable by root only; severity `skip` |
+| `pre-volume` | the size is a lower bound because part of the copy is root-only; severity stays `warn`, because the copy is there whoever reads it |
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was

@@ -102,14 +102,16 @@
     },
     {
       "name": "runtimed",
-      "state": "unknown",
-      "severity": "unknown",
-      "detail": "needs sudo (socket is owner-only)"
+      "state": "needs-admin",
+      "severity": "skip",
+      "detail": "needs sudo: the runtime daemon's socket is owner-only",
+      "remedy": "sudo k3sm status"
     }
   ],
   "next": [
     "sudo launchctl kickstart -k system/io.k3sm.netd",
-    "sudo launchctl kickstart -k system/io.k3sm.server"
+    "sudo launchctl kickstart -k system/io.k3sm.server",
+    "sudo k3sm status"
   ],
   "workers": [],
   "version": {

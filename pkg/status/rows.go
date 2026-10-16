@@ -365,9 +365,12 @@ func (c Collector) serverArgsRow() (Row, bool) {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return Row{}, false // no install to report arguments for
+	case errors.Is(err, fs.ErrPermission):
+		needsAdmin(&row, "needs sudo: "+path+" is readable by root only")
+		return row, true
 	case err != nil:
 		row.State, row.Severity = StateUnknown, SeverityUnknown
-		row.Detail = "unreadable as this user: " + path
+		row.Detail = "could not read " + path + ": " + errText(err)
 		return row, true
 	}
 	args, err := c.ServerArgs(raw)
@@ -1268,9 +1271,16 @@ func (c Collector) preVolumeRow() (Row, bool) {
 		// smaller number as if it were the whole.
 		sizeText = "at least " + sizeText + ", re-run with sudo for the full size"
 	}
+	state := StateOK
+	if partial && c.EUID != 0 {
+		// The size is a lower bound because this account could not read the
+		// whole copy; only root can finish the walk. The warning itself stands:
+		// the copy is there whoever reads it.
+		state = StateNeedsAdmin
+	}
 	row := Row{
 		Name:     RowPreVolume,
-		State:    StateOK,
+		State:    state,
 		Severity: SeverityWarn,
 		Detail:   fmt.Sprintf("%s holds the pre-migration copy (%s, %s)", path, sizeText, ageText(c.since(info.ModTime()))),
 		Remedy:   "sudo rm -r " + path + "   # once you are satisfied with the migrated cluster",
@@ -1523,8 +1533,7 @@ func (c Collector) runtimedRow(ctx context.Context, role dataroot.Role) Row {
 	// seam: a caller that wires a Runtimed anyway must still not have this
 	// command dial an owner-only socket it has no business opening.
 	if c.Runtimed == nil || !RuntimedReachable(c.EUID, c.ServiceUID) {
-		row.State, row.Severity = StateUnknown, SeverityUnknown
-		row.Detail = "needs sudo (socket is owner-only)"
+		needsAdmin(&row, RuntimedNeedsAdminDetail)
 		return row
 	}
 	info, err := c.Runtimed.Info(ctx)
@@ -1544,6 +1553,20 @@ func (c Collector) runtimedRow(ctx context.Context, role dataroot.Role) Row {
 	row.Detail = fmt.Sprintf("%s reports unhealthy: %s", info.GetRuntimeName(), conditionSummary(info.GetConditions()))
 	row.Remedy = c.nodeKickstart(role)
 	return row
+}
+
+// RuntimedNeedsAdminDetail is the runtimed row's detail for an account that may
+// not open the runtime daemon's control socket.
+const RuntimedNeedsAdminDetail = "needs sudo: the runtime daemon's socket is owner-only"
+
+// needsAdminRemedy is the remedy of every needs-admin row: the same report, run
+// as root.
+const needsAdminRemedy = "sudo k3sm status"
+
+// needsAdmin marks row as a check only root can run (StateNeedsAdmin), with
+// severity skip so it never moves the verdict.
+func needsAdmin(row *Row, detail string) {
+	row.State, row.Severity, row.Detail, row.Remedy = StateNeedsAdmin, SeveritySkip, detail, needsAdminRemedy
 }
 
 // conditionSummary names the conditions that are not true, which is the only

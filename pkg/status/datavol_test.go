@@ -481,9 +481,11 @@ func TestPreVolumeRowPartialWalk(t *testing.T) {
 	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
 
 	for _, tc := range []struct {
-		name string
-		tree map[string][]fakeFileInfo
-		want string
+		name      string
+		tree      map[string][]fakeFileInfo
+		euid      int
+		want      string
+		wantState RowState
 	}{
 		{
 			name: "an unreadable subtree makes the size a lower bound",
@@ -491,14 +493,27 @@ func TestPreVolumeRowPartialWalk(t *testing.T) {
 				preVolume:             {{name: "server", mode: fs.ModeDir | 0o750}, {name: "top", size: 1 << 30}},
 				preVolume + "/server": nil, // present but its children are not readable: absent from the tree
 			},
-			want: "at least 1G, re-run with sudo",
+			want:      "at least 1G, re-run with sudo",
+			wantState: StateOK,
+		},
+		{
+			name: "as an ordinary account the full size needs admin, and the copy still warns",
+			tree: map[string][]fakeFileInfo{
+				preVolume:             {{name: "server", mode: fs.ModeDir | 0o750}, {name: "top", size: 1 << 30}},
+				preVolume + "/server": nil,
+			},
+			euid:      501,
+			want:      "at least 1G, re-run with sudo",
+			wantState: StateNeedsAdmin,
 		},
 		{
 			name: "a fully readable tree is reported whole",
 			tree: map[string][]fakeFileInfo{
 				preVolume: {{name: "top", size: 1 << 30}},
 			},
-			want: "(1G, ",
+			euid:      501,
+			want:      "(1G, ",
+			wantState: StateOK,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -515,13 +530,16 @@ func TestPreVolumeRowPartialWalk(t *testing.T) {
 				}
 			}
 			fsys.tree = tree
-			c := Collector{DataRoot: fsys, Paths: testPaths(""), ServiceUID: 271, Now: func() time.Time { return now }}
+			c := Collector{DataRoot: fsys, Paths: testPaths(""), EUID: tc.euid, ServiceUID: 271, Now: func() time.Time { return now }}
 			row, ok := c.preVolumeRow()
 			if !ok {
 				t.Fatal("no pre-volume row")
 			}
 			if !strings.Contains(row.Detail, tc.want) {
 				t.Errorf("detail %q does not contain %q", row.Detail, tc.want)
+			}
+			if row.State != tc.wantState || row.Severity != SeverityWarn {
+				t.Errorf("row = %s/%s, want %s/warn", row.State, row.Severity, tc.wantState)
 			}
 		})
 	}
