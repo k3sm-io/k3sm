@@ -43,7 +43,8 @@
 #   --disk-image  (--upload only) the app's disk image, named exactly
 #                 k3sm_<version>_darwin_arm64.dmg (the version without its
 #                 leading v). It is checked as described below, never trusted
-#                 for its name.
+#                 for its name, and uploaded twice: under that name and under
+#                 the fixed alias k3sm_darwin_arm64.dmg.
 #   --self-test   hermetic test of the refusals and the promote check, with
 #                 every signing, notary, keychain and GitHub tool replaced by a
 #                 fake on PATH (no network, no credentials, no keychain)
@@ -68,15 +69,15 @@
 #   6. immediately before the draft, every file about to be uploaded is
 #      checked again: the stage tree and the tarball against PAYLOAD-SHA256,
 #      the tarball's SHA-256 against the one step 5 checked (the seal's under
-#      --upload), the disk image copy against the hash taken at its checks,
-#      and the checksums file against all of them; then
+#      --upload), the disk image copy and its alias against the hash taken
+#      at its checks, and the checksums file against all of them; then
 #      gh release create <tag> --draft --verify-tag with those assets
 #      (--prerelease for an -rc.N tag)
 #   7. read the draft back (gh release view --json) and check it: still a draft,
 #      exactly the expected asset names, each fully uploaded, with the local
 #      size and SHA-256 (the asset digest GitHub reports, or a download when it
 #      reports none), and the tarball's and image's digests also equal the
-#      hashes checked before the upload
+#      hashes checked before the upload (the alias's too)
 #   8. only then promote: gh release edit <tag> --draft=false, with --latest
 #      for a final version and --latest=false for a release candidate
 #
@@ -122,11 +123,25 @@
 #     and the X.Y.Z core for vX.Y.Z-rc.N (the key takes only a plain x.y.z)
 #   - codesign --verify --strict --deep against the Developer ID Application
 #     requirement for the Team ID, and xcrun stapler validate, accept the app
-# Then this script computes the image's SHA-256 and appends `<sha256>  <name>`
-# to the checksums file before the draft is created, so the draft carries four
-# assets instead of three and step 7 checks all four. install.sh selects its
-# checksums line by exact archive name, so the image's line does not affect it.
+# Then this script computes the image's SHA-256, copies the checked image to
+# the alias k3sm_darwin_arm64.dmg (mode 0444, in the same private directory),
+# refuses unless the alias hashes the same, and appends `<sha256>  <name>` for
+# the versioned name and then `<sha256>  k3sm_darwin_arm64.dmg`, the same hash,
+# to the checksums file before the draft is created. The draft carries five
+# assets instead of three and step 7 checks all five. install.sh selects its
+# checksums line by exact archive name, so the image lines do not affect it.
 # This script names no other repository: it only takes the image file.
+#
+# THE ALIAS is the stable download link. Every image release carries an asset
+# of the same fixed name, and GitHub resolves
+#   https://github.com/<repo>/releases/latest/download/k3sm_darwin_arm64.dmg
+# to that asset on the release marked latest. A final version is promoted
+# --latest and a release candidate --latest=false (step 8), so the link always
+# names the newest final release's image, never a candidate's. The name keeps
+# the tarball's darwin_arm64 platform suffix, so a downloaded file says what it
+# is and an image for another platform could sit beside it under its own name.
+# A final release published without --disk-image carries no alias, and the
+# link then answers 404 until the next image release.
 #
 # A draft whose assets fail step 7 is never promoted, so a failed or partial
 # upload of a large asset cannot become the latest release that an install
@@ -278,12 +293,20 @@ package_assets() {
 	fi
 }
 
-# The disk image's private directory under the assets (0700, the image 0444).
+# The disk image's private directory under the assets (0700, the image and its
+# alias 0444).
 IMAGE_DIR_NAME=disk-image
+# The image's fixed-name alias: the same bytes under a name that does not change
+# between releases, so releases/latest/download/<this> is a stable link.
+IMAGE_ALIAS_NAME=k3sm_darwin_arm64.dmg
 
 # asset_path <assetdir> <tag> <name>: the local file behind an asset name.
 asset_path() {
-	if [ "$3" = "$(image_name "$2")" ]; then printf '%s/%s/%s' "$1" "$IMAGE_DIR_NAME" "$3"; else printf '%s/%s' "$1" "$3"; fi
+	if [ "$3" = "$(image_name "$2")" ] || [ "$3" = "$IMAGE_ALIAS_NAME" ]; then
+		printf '%s/%s/%s' "$1" "$IMAGE_DIR_NAME" "$3"
+	else
+		printf '%s/%s' "$1" "$3"
+	fi
 }
 
 # expected_assets <tag> <assetdir>: the asset names a complete draft carries,
@@ -336,6 +359,7 @@ verify_draft() {
 		pinned=""
 		[ "$n" = "$(asset_base "$tag").tar.gz" ] && pinned="$tsha"
 		[ "$n" = "$(image_name "$tag")" ] && pinned="$isha"
+		[ "$n" = "$IMAGE_ALIAS_NAME" ] && pinned="$isha"
 		if [ -n "$pinned" ] && [ "$digest" != "sha256:$pinned" ]; then
 			echo "    $n: digest $digest differs from the checked sha256:$pinned"; problems=1
 		fi
@@ -368,12 +392,12 @@ promote() {
 # the tarball against the expected hash (the seal's under --upload), the image
 # copy against the hash taken when it was checked, and the checksums file
 # against all of them. Then create the draft and promote. Three assets
-# (tarball, manifest, checksums), or four with the image.
+# (tarball, manifest, checksums), or five with the image and its alias.
 upload() {
 	local tag="$1" repo="$2" notes="$3" dir="$4" tree="$5" tsha="$6" isha="${7:-}" count=3 names=() n problems pre=() base img
 	base="$(asset_base "$tag")"
 	[ -n "$tsha" ] || die "upload needs the expected tarball hash"
-	[ -z "$isha" ] || count=4
+	[ -z "$isha" ] || count=5
 	if ! problems="$(tree_manifest_problems "$tree" "$tree/PAYLOAD-SHA256")"; then
 		printf '%s\n' "$problems" >&2
 		refuse tree-changed "the stage tree no longer matches its PAYLOAD-SHA256; nothing was uploaded."
@@ -385,9 +409,10 @@ upload() {
 	[ "$(sha256_of "$dir/$base.tar.gz")" = "$tsha" ] ||
 		refuse tarball-changed "the tarball is not the one that was verified (sha256 $tsha); nothing was uploaded."
 	if [ -n "$isha" ]; then
-		img="$(asset_path "$dir" "$tag" "$(image_name "$tag")")"
-		[ -f "$img" ] && [ ! -L "$img" ] && [ "$(sha256_of "$img")" = "$isha" ] ||
-			refuse image-changed "the disk image changed after its checks (sha256 $isha); nothing was uploaded."
+		for img in "$(asset_path "$dir" "$tag" "$(image_name "$tag")")" "$(asset_path "$dir" "$tag" "$IMAGE_ALIAS_NAME")"; do
+			[ -f "$img" ] && [ ! -L "$img" ] && [ "$(sha256_of "$img")" = "$isha" ] ||
+				refuse image-changed "the disk image or its alias $(basename "$img") changed after its checks (sha256 $isha); nothing was uploaded."
+		done
 	fi
 	if ! problems="$(checksums_problems "$tag" "$dir" "$isha")"; then
 		printf '%s\n' "$problems" >&2
@@ -451,8 +476,9 @@ seal_value() { sed -n "s/^$2=//p" "$1"; }
 # checksums_problems <tag> <assetdir> [image-sha256]: zero when the checksums
 # file holds exactly the lines shasum writes for the tarball and manifest
 # assets now, followed, when an image hash is given, by exactly that image's
-# line; and the directory holds nothing but those assets (the image only in
-# its private directory, and only when a hash is given).
+# line and then its alias's line with the same hash; and the directory holds
+# nothing but those assets (the image and its alias only in their private
+# directory, and only when a hash is given).
 checksums_problems() {
 	local tag="$1" dir="$2" isha="${3:-}" base sums img want got extra allowed
 	base="$(asset_base "$tag")"
@@ -461,7 +487,7 @@ checksums_problems() {
 	[ -f "$dir/$sums" ] || { echo "    no checksums file $dir/$sums"; return 1; }
 	want="$(cd "$dir" && shasum -a 256 "$base.tar.gz" "$base.PAYLOAD-SHA256" 2>/dev/null)" ||
 		{ echo "    the tarball or manifest asset is missing from $dir"; return 1; }
-	[ -z "$isha" ] || want="$want"$'\n'"$isha  $img"
+	[ -z "$isha" ] || want="$want"$'\n'"$isha  $img"$'\n'"$isha  $IMAGE_ALIAS_NAME"
 	got="$(cat "$dir/$sums")"
 	if [ "$want" != "$got" ]; then
 		echo "    $sums does not hold exactly the expected lines:"
@@ -469,7 +495,7 @@ checksums_problems() {
 		return 1
 	fi
 	allowed=(-e "$base.tar.gz" -e "$base.PAYLOAD-SHA256" -e "$sums")
-	[ -z "$isha" ] || allowed+=(-e "$IMAGE_DIR_NAME" -e "$IMAGE_DIR_NAME/$img")
+	[ -z "$isha" ] || allowed+=(-e "$IMAGE_DIR_NAME" -e "$IMAGE_DIR_NAME/$img" -e "$IMAGE_DIR_NAME/$IMAGE_ALIAS_NAME")
 	extra="$(cd "$dir" && find . -mindepth 1 | sed 's|^\./||' | grep -vxF "${allowed[@]}" || true)"
 	[ -z "$extra" ] || { echo "    $dir holds files that are not release assets:"; printf '%s\n' "$extra" | sed 's/^/      /'; return 1; }
 	if [ -n "$isha" ] && { [ -L "$dir/$IMAGE_DIR_NAME" ] || [ ! -d "$dir/$IMAGE_DIR_NAME" ]; }; then
@@ -477,16 +503,18 @@ checksums_problems() {
 	fi
 }
 
-# reset_checksums <tag> <assetdir>: drop any disk image line and image copy an
-# earlier --upload (or anyone else) left, so the file again holds only the
-# sealed two lines. An image reaches the upload only through --disk-image.
+# reset_checksums <tag> <assetdir>: drop any disk image or alias line and image
+# copy an earlier --upload (or anyone else) left, so the file again holds only
+# the sealed two lines. An image reaches the upload only through --disk-image.
 reset_checksums() {
 	local tag="$1" dir="$2" sums img
 	sums="$dir/$(checksums_name "$tag")"
 	img="$(image_name "$tag")"
 	[ -f "$sums" ] || return 0
-	if ! { awk -v f="$img" '$2 != f' "$sums" >"$sums.tmp" && mv "$sums.tmp" "$sums"; }; then die "could not rewrite $sums"; fi
-	rm -f "$dir/$img"
+	if ! { awk -v f="$img" -v a="$IMAGE_ALIAS_NAME" '$2 != f && $2 != a' "$sums" >"$sums.tmp" && mv "$sums.tmp" "$sums"; }; then
+		die "could not rewrite $sums"
+	fi
+	rm -f "$dir/$img" "$dir/$IMAGE_ALIAS_NAME"
 	rm -rf "${dir:?}/$IMAGE_DIR_NAME"
 }
 
@@ -647,11 +675,13 @@ disk_image_problems() {
 
 # add_disk_image <file> <tag> <team> <manifest> <assetdir>: copy the image,
 # mode 0444, into a private 0700 directory under the assets, run every check
-# on that copy, hash it once into IMAGE_SHA256, and append its checksums line.
-# upload re-hashes the same copy right before the draft and uploads exactly it.
+# on that copy, hash it once into IMAGE_SHA256, copy the checked copy to the
+# fixed-name alias beside it, refuse unless the alias hashes the same, and
+# append both checksums lines. upload re-hashes both right before the draft and
+# uploads exactly them.
 IMAGE_SHA256=""
 add_disk_image() {
-	local src="$1" tag="$2" team="$3" manifest="$4" dir="$5" name idir copy problems
+	local src="$1" tag="$2" team="$3" manifest="$4" dir="$5" name idir copy alias problems
 	name="$(image_name "$tag")"
 	check_image_name "$src" "$tag"
 	if [ -L "$src" ] || [ ! -f "$src" ]; then die "--disk-image $src is not a regular file"; fi
@@ -667,8 +697,14 @@ add_disk_image() {
 		refuse image-unverified "the disk image failed its checks; nothing was uploaded."
 	fi
 	IMAGE_SHA256="$(sha256_of "$copy")"
-	printf '%s  %s\n' "$IMAGE_SHA256" "$name" >>"$dir/$(checksums_name "$tag")" ||
-		die "could not append the disk image to the checksums file"
+	alias="$idir/$IMAGE_ALIAS_NAME"
+	if ! { cp "$copy" "$alias.tmp" && chmod 444 "$alias.tmp" && mv "$alias.tmp" "$alias"; }; then
+		die "could not copy the disk image to its alias $alias"
+	fi
+	[ "$(sha256_of "$alias")" = "$IMAGE_SHA256" ] ||
+		refuse image-changed "the alias $IMAGE_ALIAS_NAME does not hash as the checked image (sha256 $IMAGE_SHA256); nothing was uploaded."
+	printf '%s  %s\n%s  %s\n' "$IMAGE_SHA256" "$name" "$IMAGE_SHA256" "$IMAGE_ALIAS_NAME" >>"$dir/$(checksums_name "$tag")" ||
+		die "could not append the disk image and its alias to the checksums file"
 }
 
 # check_image_name <file> <tag>: the closed name, checked before anything else.
@@ -1182,19 +1218,30 @@ EOF
 
 	fresh; mk_image "$W/img" "$W/tree"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
-	up_promoted "control: --upload with a good image uploads four assets and promotes" 4
+	up_promoted "control: --upload with a good image uploads five assets (the image and its alias) and promotes" 5
 	img="$W/tree.assets/$IMAGE_DIR_NAME/$(image_name "$tag")"
-	if [ "$(stat -f %Lp "$W/tree.assets/$IMAGE_DIR_NAME")" = 700 ] && [ "$(stat -f %Lp "$img")" = 444 ]; then
-		ok "the image is checked and uploaded from a mode 0444 copy in a private 0700 directory"
+	local alias sums
+	alias="$W/tree.assets/$IMAGE_DIR_NAME/$IMAGE_ALIAS_NAME"
+	sums="$W/tree.assets/$(checksums_name "$tag")"
+	if [ "$(stat -f %Lp "$W/tree.assets/$IMAGE_DIR_NAME")" = 700 ] && [ "$(stat -f %Lp "$img")" = 444 ] &&
+		[ "$(stat -f %Lp "$alias")" = 444 ]; then
+		ok "the image and its alias are uploaded from mode 0444 copies in a private 0700 directory"
 	else
-		bad "image copy modes: dir $(stat -f %Lp "$W/tree.assets/$IMAGE_DIR_NAME" 2>&1), file $(stat -f %Lp "$img" 2>&1)"
+		bad "image copy modes: dir $(stat -f %Lp "$W/tree.assets/$IMAGE_DIR_NAME" 2>&1), file $(stat -f %Lp "$img" 2>&1), alias $(stat -f %Lp "$alias" 2>&1)"
 	fi
-	if [ "$(grep -c . "$W/tree.assets/$(checksums_name "$tag")")" = 3 ] &&
-		grep -qx "$(sha256_of "$img")  $(image_name "$tag")" "$W/tree.assets/$(checksums_name "$tag")" &&
+	if [ "$(grep -c . "$sums")" = 4 ] &&
+		[ "$(sed -n 3p "$sums")" = "$(sha256_of "$img")  $(image_name "$tag")" ] &&
 		grep -qxF "$img" "$T/uploaded"; then
 		ok "the image's checksums line is computed by publish.sh and the image is uploaded"
 	else
-		bad "image checksums line: $(tr '\n' ';' <"$W/tree.assets/$(checksums_name "$tag")")"
+		bad "image checksums line: $(tr '\n' ';' <"$sums")"
+	fi
+	if [ "$IMAGE_ALIAS_NAME" = k3sm_darwin_arm64.dmg ] && cmp -s "$img" "$alias" &&
+		[ "$(sed -n 4p "$sums")" = "$(sha256_of "$img")  k3sm_darwin_arm64.dmg" ] &&
+		grep -qxF "$alias" "$T/uploaded" && [ "$(grep -c '\.dmg$' "$T/uploaded")" = 2 ]; then
+		ok "the alias k3sm_darwin_arm64.dmg is byte-identical, listed with the image's sha256, and uploaded"
+	else
+		bad "alias (uploaded: $(tr '\n' ';' <"$T/uploaded"), sums: $(tr '\n' ';' <"$sums"))"
 	fi
 	mnt="$(sed -n 's/^hdiutil attach -readonly -nobrowse -noautoopen -mountpoint \([^ ]*\) .*/\1/p' "$log")"
 	if [ -n "$mnt" ] && grep -qx "hdiutil attach -readonly -nobrowse -noautoopen -mountpoint $mnt $img" "$log" &&
@@ -1261,6 +1308,10 @@ EOF
 	(cd "$W/tree.assets" && shasum -a 256 "$(image_name "$tag")" >>"$(checksums_name "$tag")")
 	run_up "$W/tree"
 	up_promoted "an image added to the assets after the checksums were written is not uploaded" 3
+	fresh; printf 'unchecked alias\n' >"$W/tree.assets/$IMAGE_ALIAS_NAME"
+	(cd "$W/tree.assets" && shasum -a 256 "$IMAGE_ALIAS_NAME" >>"$(checksums_name "$tag")")
+	run_up "$W/tree"
+	up_promoted "an alias added to the assets after the checksums were written is not uploaded" 3
 
 	fresh; mk_image "$W/img" "$W/tree"; printf 'stray\n' >"$W/img/root/k3sm.app/Contents/Resources/payload/extra"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
@@ -1279,7 +1330,7 @@ EOF
 	up_refuses "an image holding more than k3sm.app and the Applications link refuses" image-unverified
 	fresh; mk_image "$W/img" "$W/tree"; mkdir "$W/img/root/.fseventsd"; printf 'log\n' >"$W/img/root/.fseventsd/fseventsd-uuid"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
-	up_promoted "an image root with a .fseventsd directory is accepted" 4
+	up_promoted "an image root with a .fseventsd directory is accepted" 5
 	fresh; mk_image "$W/img" "$W/tree"; printf 'hidden\n' >"$W/img/root/.hidden"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
 	up_refuses "an image root with another hidden entry refuses" image-unverified
@@ -1305,6 +1356,23 @@ EOF
 		ok "an image missing from the draft read-back refuses before promote"
 	else
 		bad "image missing from the read-back (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	fresh; mk_image "$W/img" "$W/tree"
+	view_jq=".assets |= map(select(.name != \"$IMAGE_ALIAS_NAME\"))" run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: draft-unverified" <<<"$out" && grep -q "$IMAGE_ALIAS_NAME" <<<"$out" &&
+		grep -q '^gh release create' "$log" && ! grep -q '^gh release edit' "$log"; then
+		ok "the alias missing from the draft read-back refuses before promote"
+	else
+		bad "alias missing from the read-back (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
+	fresh; mk_image "$W/img" "$W/tree"
+	view_jq=".assets |= map(if .name == \"$IMAGE_ALIAS_NAME\" then .digest = \"sha256:$(printf '0%.0s' $(seq 64))\" else . end)" \
+		run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: draft-unverified" <<<"$out" && grep -q "$IMAGE_ALIAS_NAME: digest" <<<"$out" &&
+		! grep -q '^gh release edit' "$log"; then
+		ok "an alias whose read-back digest differs from the image's refuses before promote"
+	else
+		bad "alias digest in the read-back (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
 	fi
 
 	# A release candidate's app carries the tag's x.y.z core. The version
@@ -1363,9 +1431,35 @@ EOF
 	fresh
 	between "$W/tree" "" swap_tarball
 	up_refuses "a tarball swapped after the upload checks, with a matching checksums line, refuses before create" tarball-changed
+	# shellcheck disable=SC2329 # invoked by name through between
+	change_alias() {
+		local f
+		f="$2/$IMAGE_DIR_NAME/$IMAGE_ALIAS_NAME"
+		chmod u+w "$f"
+		printf 'x' >>"$f"
+	}
+	# shellcheck disable=SC2329 # invoked by name through between
+	drop_alias() {
+		rm -f "$2/$IMAGE_DIR_NAME/$IMAGE_ALIAS_NAME"
+	}
+	# shellcheck disable=SC2329 # invoked by name through between
+	drop_alias_line() {
+		local s
+		s="$2/$(checksums_name "$tag")"
+		grep -v "  $IMAGE_ALIAS_NAME\$" "$s" >"$s.tmp" && mv "$s.tmp" "$s"
+	}
 	fresh; mk_image "$W/img" "$W/tree"
 	between "$W/tree" "$W/img/out/$(image_name "$tag")" change_image
 	up_refuses "an image copy changed after its checks refuses before upload" image-changed
+	fresh; mk_image "$W/img" "$W/tree"
+	between "$W/tree" "$W/img/out/$(image_name "$tag")" change_alias
+	up_refuses "an alias changed after its checks refuses before upload" image-changed
+	fresh; mk_image "$W/img" "$W/tree"
+	between "$W/tree" "$W/img/out/$(image_name "$tag")" drop_alias
+	up_refuses "an alias removed after its checks refuses before upload" image-changed
+	fresh; mk_image "$W/img" "$W/tree"
+	between "$W/tree" "$W/img/out/$(image_name "$tag")" drop_alias_line
+	up_refuses "a checksums file without the alias line refuses before upload" checksums
 	fresh; mk_image "$W/img" "$W/tree"
 	FAKE_CODESIGN_IMAGE_TEAM=ZYXWV98765 run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
 	if [ "$rc" -ne 0 ] && grep -q "REFUSE: image-unverified" <<<"$out" && grep -q "codesign --verify --strict rejects the image" <<<"$out" &&
