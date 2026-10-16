@@ -48,6 +48,7 @@ import (
 	"k3sm.io/k3sm/pkg/runtimeclass"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/svclb"
+	"k3sm.io/k3sm/pkg/updatectl"
 )
 
 // The post-bring-up phases of `k3sm server`, in runServer's order. Each one that
@@ -565,20 +566,76 @@ func startProvisioner(ctx context.Context, plan serverPlan, cs kubernetes.Interf
 	}
 }
 
-// startServerOperators is steps 4f and 4f': the MLX operator, then the
-// interconnect resolver. Its stop drains them in reverse order (the resolver
-// first), before exec.Stop tears the control plane down, exactly as two
-// separate defers in runServer would. It also starts the hourly update check
-// for `k3sm status`, which ends with ctx.
+// startServerOperators is steps 4f and 4f' plus the update step: the MLX
+// operator, the interconnect resolver, then the update controller. Its stop
+// drains them in reverse order (the update controller first), before exec.Stop
+// tears the control plane down, exactly as separate defers in runServer would.
+// It also starts the hourly update check for `k3sm status`, which ends with
+// ctx.
 func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (mlxGPU *operator.RuntimeGPU, stop func()) {
 	mlxGPU, stopMLX := startMLXOperator(ctx, plan, restCfg, cs, logger)
 	stopInterconnect := startInterconnectResolver(ctx, plan, restCfg, cs, logger)
 	go runUpdateRecorder(ctx, plan.opts.workDir, cs, status.UpdateRecordInterval, logger)
+	stopUpdates := startUpdateController(ctx, plan, restCfg, cs, logger)
 	return mlxGPU, func() {
+		stopUpdates()
 		stopInterconnect()
 		stopMLX()
 	}
 }
+
+// startUpdateController is the update step: the update controller (pkg/updatectl),
+// which ensures the Update CRD and rolls the cluster to the release the
+// singleton Update names, workers first and this server last. It runs under
+// the in-process admin client, as the other server operators do, and under its
+// own Lease, so one server of an HA control plane rolls at a time. Same
+// lifetime as the MLX operator: drained before the control plane stops. A
+// client or controller that cannot be built is logged and stop is noStop.
+func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
+	dyn, err := dynamic.NewForConfig(restCfg)
+	if err != nil {
+		logger.Error("update controller disabled: build its dynamic client", "err", err)
+		return noStop
+	}
+	crd, err := apiextensionsclient.NewForConfig(restCfg)
+	if err != nil {
+		logger.Error("update controller disabled: build its apiextensions client", "err", err)
+		return noStop
+	}
+	c, err := updatectl.New(updatectl.Config{
+		Client:     cs,
+		Dynamic:    dyn,
+		CRD:        crd,
+		ServerNode: plan.opts.nodeName,
+		Log:        logger,
+	})
+	if err != nil {
+		logger.Error("update controller disabled", "err", err)
+		return noStop
+	}
+	uCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := c.Run(uCtx); err != nil && uCtx.Err() == nil {
+			logger.Error("update controller", "err", err)
+		}
+	}()
+	return func() {
+		cancel()
+		// Bounded: a reconcile stuck on a hung apiserver call must not hold
+		// the server's shutdown; the drain of the other operators goes on.
+		select {
+		case <-done:
+		case <-time.After(updateControllerStopWait):
+			logger.Warn("update controller did not stop in time; continuing shutdown", "wait", updateControllerStopWait)
+		}
+	}
+}
+
+// updateControllerStopWait bounds how long the server's shutdown waits for the
+// update controller to return.
+const updateControllerStopWait = 30 * time.Second
 
 // startMLXOperator is step 4f: the MLX operator, which ensures the MLXModel CRD,
 // then reconciles each MLXModel into a StatefulSet plus its headless and ClusterIP
