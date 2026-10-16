@@ -126,6 +126,11 @@ func (c Collector) Collect(ctx context.Context) Report {
 		rows = append(rows, pre)
 	}
 	rows = append(rows, c.datastoreRow(role, apiserver))
+	// A worker Mac's read-only update row, from the latest release a server
+	// publishes on its Node, on an installed worker only.
+	if role == dataroot.RoleAgent && installed {
+		rows = append(rows, c.agentUpdateRow(serving, nodes, nodesErr, now()))
+	}
 	// The embedded etcd member, on an etcd-posture server only: quorum, alarms,
 	// size against quota and WAL fsync latency, beside the datastore row it details.
 	if role != dataroot.RoleAgent {

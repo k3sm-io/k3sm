@@ -352,6 +352,10 @@ type updateRecorder struct {
 	interval, rollEvery time.Duration
 	now                 func() time.Time
 	logger              *slog.Logger
+	// publish puts the record's latest release on this server's Node
+	// (status.UpdateAnnotations), where a worker's `k3sm status` reads it;
+	// nil publishes nothing.
+	publish func(ctx context.Context, annotations map[string]string) error
 }
 
 // checkBase is the release index a check reads: the validated release base,
@@ -380,8 +384,9 @@ func installedReleaseBase(role install.Role) string {
 // runUpdateRecorder starts the server's update recorder: the hourly check
 // against the release index (baseURL, the recorded --update-release-base, or
 // GitHub's when empty) and the Update poll over dyn.
-func runUpdateRecorder(ctx context.Context, workDir, baseURL string, cs kubernetes.Interface, dyn dynamic.Interface, logger *slog.Logger) {
+func runUpdateRecorder(ctx context.Context, workDir, nodeName, baseURL string, cs kubernetes.Interface, dyn dynamic.Interface, logger *slog.Logger) {
 	updateRecorder{
+		publish: nodeAnnotationPublisher(cs, nodeName),
 		workDir: workDir,
 		check: func(ctx context.Context) (update.Report, error) {
 			return update.Check(ctx, update.Inputs{BaseURL: checkBase(baseURL), Kube: cs, Installed: version.Get()})
@@ -405,6 +410,7 @@ func (r updateRecorder) run(ctx context.Context) {
 	poll := time.NewTimer(0)
 	defer poll.Stop()
 	var roll *status.UpdateRoll
+	var published map[string]string
 	for {
 		select {
 		case <-ctx.Done():
@@ -420,9 +426,13 @@ func (r updateRecorder) run(ctx context.Context) {
 			rec := rep.Record(err)
 			rec.Roll = roll
 			r.write(rec)
+			published = r.publishRecord(ctx, published)
 			check.Reset(r.interval)
 		case <-poll.C:
 			poll.Reset(r.rollEvery)
+			// Also on the poll: the Node may not be registered at the first
+			// check, and `k3sm update check` rewrites the record on its own.
+			published = r.publishRecord(ctx, published)
 			if r.dyn == nil {
 				continue
 			}
@@ -445,6 +455,59 @@ func (r updateRecorder) run(ctx context.Context) {
 			rec.Roll = roll
 			r.write(rec)
 		}
+	}
+}
+
+// publishRecord publishes the recorded latest release when it differs from
+// what was last published, and returns what is now published. A failure is
+// logged and retried on the next poll; a record with no usable latest release
+// publishes nothing, so the Node keeps the last good one.
+func (r updateRecorder) publishRecord(ctx context.Context, published map[string]string) map[string]string {
+	if r.publish == nil {
+		return published
+	}
+	want := status.UpdateAnnotations(readUpdateRecord(r.workDir))
+	if want == nil || sameAnnotations(want, published) {
+		return published
+	}
+	if err := r.publish(ctx, want); err != nil {
+		if ctx.Err() == nil {
+			r.logger.Debug("could not publish the latest release on this server's Node", "err", err)
+		}
+		return published
+	}
+	return want
+}
+
+// sameAnnotations reports whether a and b hold the same keys and values.
+func sameAnnotations(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if w, ok := b[k]; !ok || w != v {
+			return false
+		}
+	}
+	return true
+}
+
+// nodeAnnotationPublisher merge-patches annotations onto the Node named
+// nodeName with the server's own client, or nil when there is no client or
+// no Node name. Only the published keys move; every other annotation stays.
+func nodeAnnotationPublisher(cs kubernetes.Interface, nodeName string) func(context.Context, map[string]string) error {
+	if cs == nil || nodeName == "" {
+		return nil
+	}
+	return func(ctx context.Context, annotations map[string]string) error {
+		body, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": annotations}})
+		if err != nil {
+			return err
+		}
+		if _, err := cs.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, body, metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("annotate node %s: %w", nodeName, err)
+		}
+		return nil
 	}
 }
 

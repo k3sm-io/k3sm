@@ -55,9 +55,12 @@ func NodeRelease(kubelet string) (string, bool) {
 // metadata (ignored for ordering), with an optional leading "v".
 var semverCore = regexp.MustCompile(`^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$`)
 
-// pseudoPrerelease is the tail of a Go pseudo-version prerelease
-// (20261015120000-0123456789ab): a build of an untagged commit.
-var pseudoPrerelease = regexp.MustCompile(`(^|\.)\d{14}-[0-9a-f]{12}$`)
+// pseudoPrerelease is the timestamp-revision pair of a Go pseudo-version
+// prerelease (20261015120000-0123456789ab): a build of an untagged commit. It
+// matches as a whole dotted identifier pair anywhere in the prerelease, so a
+// dirty pseudo-version build (whose NodeVersion appends ".dirty") is untagged
+// too.
+var pseudoPrerelease = regexp.MustCompile(`(^|\.)\d{14}-[0-9a-f]{12}(\.|$)`)
 
 // semver is a parsed release version.
 type semver struct {

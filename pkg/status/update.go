@@ -22,11 +22,13 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	"k3sm.io/k3sm/pkg/install"
@@ -34,10 +36,11 @@ import (
 )
 
 // RowUpdate reports whether every node of the cluster runs the latest k3sm
-// release, read from the record the last update check left. It exists only on
-// a server. The report never asks GitHub itself: the server refreshes the
-// record at most once an UpdateRecordInterval, and `k3sm update check` does on
-// demand.
+// release, read from the record the last update check left. A server reads the
+// record from its status directory; a worker Mac reads the copy a server
+// publishes on its own Node (PublishedUpdateRecord), read-only. The report
+// never asks GitHub itself: the server refreshes the record at most once an
+// UpdateRecordInterval, and `k3sm update check` does on demand.
 const RowUpdate = "update"
 
 // The per-node words of an update record.
@@ -326,7 +329,7 @@ func UpdateRowFrom(rec UpdateRecord, now time.Time) Row {
 		return row
 	}
 	if r := rec.Roll; r != nil && !r.ObservedAt.After(now.Add(updateClockSlack)) && now.Sub(r.ObservedAt) <= UpdateRollStaleAfter {
-		return updateRollRow(row, *r)
+		return updateRollRow(row, *r, rec.Latest)
 	}
 	row.Wide["checked"] = rec.CheckedAt.UTC().Format(time.RFC3339)
 	if rec.Latest != "" {
@@ -403,14 +406,19 @@ func UpdateRowFrom(rec UpdateRecord, now time.Time) Row {
 }
 
 // updateRollRow is the update row while a managed update is in progress. It
-// is informational: severity ok, no remedy, the verdict unmoved.
-func updateRollRow(row Row, r UpdateRoll) Row {
+// is informational: severity ok, no remedy, the verdict unmoved. latest is the
+// newest release the last check found, carried in wide.latest when known so a
+// reader can name it mid-roll too.
+func updateRollRow(row Row, r UpdateRoll, latest string) Row {
 	row.State, row.Severity, row.Remedy = StateRolling, SeverityOK, ""
 	phase := r.Phase
 	if phase == "" {
 		phase = "Pending"
 	}
 	row.Wide["target"] = r.Version
+	if latest != "" {
+		row.Wide["latest"] = latest
+	}
 	row.Wide["phase"] = phase
 	row.Wide["observed"] = r.ObservedAt.UTC().Format(time.RFC3339)
 	row.Detail = fmt.Sprintf("updating the cluster to k3sm %s: %s", r.Version, phase)
@@ -423,4 +431,102 @@ func updateRollRow(row Row, r UpdateRoll) Row {
 		}
 	}
 	return row
+}
+
+// The Node annotations a server publishes the latest release it recorded on,
+// on its own Node, so a worker Mac's report can name it: the record itself
+// sits in the server's status directory, which no worker can read, while
+// every node identity may already read Node objects. Nothing beyond the latest
+// tag and when it was checked is published.
+const (
+	// NodeReleaseLatestAnnotation is the latest release tag the server's last
+	// successful check found.
+	NodeReleaseLatestAnnotation = "k3sm.io/release-latest"
+	// NodeReleaseCheckedAnnotation is when that check ran, RFC 3339 in UTC.
+	NodeReleaseCheckedAnnotation = "k3sm.io/release-checked"
+)
+
+// UpdateAnnotations is what a server publishes on its own Node for rec, or nil
+// when rec names no usable latest release (a failed check publishes nothing,
+// so the last good one stays).
+func UpdateAnnotations(rec UpdateRecord) map[string]string {
+	if rec.Error != "" || rec.Latest == "" || !version.ValidTag(rec.Latest) || rec.CheckedAt.IsZero() {
+		return nil
+	}
+	return map[string]string{
+		NodeReleaseLatestAnnotation:  rec.Latest,
+		NodeReleaseCheckedAnnotation: rec.CheckedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+// PublishedUpdateRecord rebuilds an update record from a node list: the latest
+// release the most recently checked control-plane Node publishes
+// (UpdateAnnotations), and every node's kubelet version. It returns the
+// publishing Node's name, or false when no control-plane Node carries a usable
+// pair. Pure. The annotations are untrusted input like the record on disk:
+// UpdateRowFrom validates what this returns, and a value of the wrong shape is
+// skipped here.
+func PublishedUpdateRecord(nodes []corev1.Node) (UpdateRecord, string, bool) {
+	var rec UpdateRecord
+	server := ""
+	for _, n := range nodes {
+		if _, cp := n.Labels[controlPlaneNodeLabel]; !cp {
+			continue
+		}
+		latest := n.Annotations[NodeReleaseLatestAnnotation]
+		checked, err := time.Parse(time.RFC3339, n.Annotations[NodeReleaseCheckedAnnotation])
+		if err != nil || !version.ValidTag(latest) {
+			continue
+		}
+		if server == "" || checked.After(rec.CheckedAt) {
+			rec.CheckedAt, rec.Latest, server = checked, latest, n.Name
+		}
+	}
+	if server == "" {
+		return UpdateRecord{}, "", false
+	}
+	for _, n := range nodes {
+		v := n.Status.NodeInfo.KubeletVersion
+		rec.Nodes = append(rec.Nodes, UpdateNode{Name: n.Name, Version: v, State: NodeReleaseState(v, rec.Latest)})
+	}
+	sort.Slice(rec.Nodes, func(i, j int) bool { return rec.Nodes[i].Name < rec.Nodes[j].Name })
+	return rec, server, true
+}
+
+// agentUpdateCannot opens the worker's update row detail when the published
+// record cannot be read.
+const agentUpdateCannot = "this Mac cannot read the latest release the server recorded: "
+
+// agentUpdateRow is a worker Mac's update row: read-only, from the record a
+// server publishes on its Node, read through the node list this report
+// already took with this Mac's existing credentials. When the list is not
+// there to read, the row says why and stays unknown. A worker cannot refresh
+// the server's record, so it never offers the check as a remedy.
+func (c Collector) agentUpdateRow(serving bool, nodes []corev1.Node, nodesErr error, now time.Time) Row {
+	row := Row{Name: RowUpdate, State: StateUnknown, Severity: SeverityUnknown}
+	switch {
+	case c.Kube == nil:
+		row.Detail = agentUpdateCannot + "no cluster client this account may use"
+		if c.EUID != 0 {
+			row.Remedy = "sudo k3sm status"
+		}
+		return row
+	case !serving:
+		row.Detail = agentUpdateCannot + "the apiserver does not answer"
+		return row
+	case nodesErr != nil:
+		row.Detail = agentUpdateCannot + ClipText(Redact(firstLine(nodesErr.Error())), updateTextMax)
+		return row
+	}
+	rec, server, ok := PublishedUpdateRecord(nodes)
+	if !ok {
+		row.Detail = "no server has published an update check yet (a server publishes one once an hour)"
+		return row
+	}
+	r := UpdateRowFrom(rec, now)
+	r.Wide["record"] = "node/" + server
+	if r.Remedy == UpdateCheckRemedy {
+		r.Remedy = ""
+	}
+	return r
 }

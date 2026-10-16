@@ -17,10 +17,14 @@ limitations under the License.
 package status
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -246,4 +250,111 @@ func TestUpdateRowRolling(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestUpdateRowCarriesLatestDuringARollAndOnAgents pins the latest release in
+// the two places the row used to drop it. A rolling row carries wide.latest
+// beside wide.target when the check found one. A worker Mac's report carries
+// a read-only update row from the latest a server publishes on its Node (read
+// through the node list the worker already takes): the cluster verdict with
+// wide.latest and no refresh remedy. Only a control-plane Node's annotations
+// count, a value of the wrong shape is skipped, and when the list is not there
+// to read the row is unknown and says why.
+func TestUpdateRowCarriesLatestDuringARollAndOnAgents(t *testing.T) {
+	t.Parallel()
+	now := goldenTime
+
+	t.Run("a rolling row carries the latest release", func(t *testing.T) {
+		rec := UpdateRecord{CheckedAt: now.Add(-time.Hour), Latest: "v0.2.1", Nodes: []UpdateNode{nodeAt("laptop", "0.1.7", UpdateBehind)},
+			Roll: &UpdateRoll{ObservedAt: now, Version: "v0.2.0", Phase: "Rolling", Node: "laptop", NodePhase: "Installing"}}
+		r := UpdateRowFrom(rec, now)
+		if r.State != StateRolling || r.Wide["latest"] != "v0.2.1" || r.Wide["target"] != "v0.2.0" {
+			t.Errorf("rolling row = %+v, want wide.latest v0.2.1 beside wide.target v0.2.0", r)
+		}
+		rec.Latest = ""
+		if r := UpdateRowFrom(rec, now); r.State != StateRolling || r.Wide["latest"] != "" {
+			t.Errorf("rolling row with no check = %+v, want no wide.latest", r)
+		}
+	})
+
+	server := func(name, latest, checked string) corev1.Node {
+		n := workerNode(name, "v1.37.1+k3sm.0.2.0")
+		n.Labels = map[string]string{controlPlaneNodeLabel: ""}
+		n.Annotations = map[string]string{NodeReleaseLatestAnnotation: latest, NodeReleaseCheckedAnnotation: checked}
+		return n
+	}
+	checked := now.Add(-time.Hour).Format(time.RFC3339)
+	pub := UpdateAnnotations(UpdateRecord{CheckedAt: now.Add(-time.Hour), Latest: "v0.2.0"})
+	if pub[NodeReleaseLatestAnnotation] != "v0.2.0" || pub[NodeReleaseCheckedAnnotation] != checked {
+		t.Fatalf("UpdateAnnotations = %v", pub)
+	}
+	if UpdateAnnotations(UpdateRecord{CheckedAt: now, Latest: "v0.2.0", Error: "dial tcp: refused"}) != nil {
+		t.Error("a failed check publishes annotations")
+	}
+
+	worker := func(t *testing.T, kube Kube) Row {
+		t.Helper()
+		p := agentPaths(t.TempDir())
+		fsys := withCredential(t, agentInstalledFS(p), p.AgentCredentialDir, now.Add(90*24*time.Hour))
+		c := agentCollector(t, p, fsys)
+		if kube != nil {
+			c.Kube = kube
+		}
+		rep := c.Collect(context.Background())
+		r, ok := rep.Row(RowUpdate)
+		if !ok {
+			t.Fatalf("a worker's report has no update row\n%s", Render(rep, Style{}))
+		}
+		return r
+	}
+	cluster := func(nodes ...corev1.Node) fakeKube {
+		k := healthyKube()
+		k.nodes = append(k.nodes, nodes...)
+		return k
+	}
+	forged := workerNode("rogue", "v1.37.1+k3sm.0.2.0")
+	forged.Annotations = map[string]string{NodeReleaseLatestAnnotation: "v9.9.9", NodeReleaseCheckedAnnotation: now.Format(time.RFC3339)}
+
+	for _, tc := range []struct {
+		name          string
+		kube          Kube
+		state         RowState
+		latest, rec   string
+		detail        string
+		remedyAllowed bool
+	}{
+		{"behind, from the server's Node", cluster(server("studio", "v0.2.0", checked), workerNode("laptop", "v1.37.1+k3sm.0.1.7")),
+			StateBehind, "v0.2.0", "node/studio", "behind: laptop", true},
+		{"the newest check wins", cluster(server("studio", "v0.1.0", now.Add(-48*time.Hour).Format(time.RFC3339)), server("studio-2", "v0.2.0", checked)),
+			StateUnknown, "v0.2.0", "node/studio-2", "no tagged k3sm release reported by: my-mac", false},
+		{"a worker's own annotation is not the server's", cluster(forged),
+			StateUnknown, "", "", "no server has published an update check yet", false},
+		{"a value of the wrong shape is skipped", cluster(server("studio", "v0.2.0;rm", checked)),
+			StateUnknown, "", "", "no server has published", false},
+		{"the apiserver does not answer", fakeKube{rawErr: map[string]error{"/readyz": errors.New("connection refused")}, server: "https://100.64.0.1:6444", tls: "ca pinned"},
+			StateUnknown, "", "", "cannot read the latest release the server recorded: the apiserver does not answer", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := worker(t, tc.kube)
+			if r.State != tc.state || r.Wide["latest"] != tc.latest || r.Wide["record"] != tc.rec || !strings.Contains(r.Detail, tc.detail) {
+				t.Errorf("row = %+v, want state %s latest %q record %q detail ~%q", r, tc.state, tc.latest, tc.rec, tc.detail)
+			}
+			if r.Remedy == UpdateCheckRemedy || r.Remedy == UpdateCheckRemedyWritable || (!tc.remedyAllowed && r.Remedy != "") {
+				t.Errorf("remedy = %q; a worker cannot refresh the server's record", r.Remedy)
+			}
+		})
+	}
+
+	t.Run("the node list refused", func(t *testing.T) {
+		r := Collector{Kube: healthyKube()}.agentUpdateRow(true, nil, errors.New(`nodes is forbidden: User "system:node:laptop" cannot list resource "nodes"`), now)
+		if r.State != StateUnknown || !strings.Contains(r.Detail, "cannot read the latest release the server recorded: nodes is forbidden") {
+			t.Errorf("row = %+v", r)
+		}
+	})
+	t.Run("no cluster client", func(t *testing.T) {
+		r := Collector{EUID: 501}.agentUpdateRow(false, nil, nil, now)
+		if r.State != StateUnknown || !strings.Contains(r.Detail, "no cluster client") || r.Remedy != "sudo k3sm status" {
+			t.Errorf("row = %+v", r)
+		}
+	})
 }
