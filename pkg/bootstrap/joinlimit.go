@@ -96,13 +96,36 @@ type joinRateLimiter struct {
 // newJoinRateLimiter returns a limiter at the shipped tuning. now defaults to
 // time.Now when nil.
 func newJoinRateLimiter(now func() time.Time) *joinRateLimiter {
+	return newKeyedRateLimiter(now, JoinRateBurst, JoinRateRefill)
+}
+
+// NetserveRateBurst and NetserveRateRefill tune the per-node limit on the
+// netserve issuance verb: five issues back to back, then one a minute. A healthy
+// node asks once per start and once per renewal, so five covers a node that
+// restarts a few times in a row; the refill bounds a node credential holder's
+// signatures to one a minute.
+const (
+	NetserveRateBurst  = 5
+	NetserveRateRefill = time.Minute
+)
+
+// newNetserveRateLimiter returns the netserve issuance limiter, keyed by the
+// VERIFIED node name (the presenting certificate's), never a name a caller
+// supplies. now defaults to time.Now when nil.
+func newNetserveRateLimiter(now func() time.Time) *joinRateLimiter {
+	return newKeyedRateLimiter(now, NetserveRateBurst, NetserveRateRefill)
+}
+
+// newKeyedRateLimiter is the token bucket both limiters share, at burst units
+// refilling one per refill. now defaults to time.Now when nil.
+func newKeyedRateLimiter(now func() time.Time, burst int, refill time.Duration) *joinRateLimiter {
 	if now == nil {
 		now = time.Now
 	}
 	return &joinRateLimiter{
 		now:     now,
-		burst:   JoinRateBurst,
-		refill:  JoinRateRefill,
+		burst:   burst,
+		refill:  refill,
 		buckets: map[string]joinRateBucket{},
 	}
 }

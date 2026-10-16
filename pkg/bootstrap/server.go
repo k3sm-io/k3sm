@@ -118,6 +118,9 @@ type Server struct {
 	// joins bounds how fast ONE token may drive the expensive, post-authentication
 	// half of handleJoin (see joinRateLimiter).
 	joins *joinRateLimiter
+	// netserveIssues bounds how fast ONE node may obtain netserve certificates
+	// (handleNetserveCert), keyed by the verified node name.
+	netserveIssues *joinRateLimiter
 	// preauth bounds anonymous join volume per source address and in total,
 	// ahead of the token verification's bcrypt cost (see preAuthLimiter).
 	preauth *preAuthLimiter
@@ -176,7 +179,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		}
 		cfg.SelfNodeName = self
 	}
-	return &Server{cfg: cfg, joins: newJoinRateLimiter(cfg.Now), preauth: newPreAuthLimiter(cfg.Now)}, nil
+	return &Server{cfg: cfg, joins: newJoinRateLimiter(cfg.Now), netserveIssues: newNetserveRateLimiter(cfg.Now), preauth: newPreAuthLimiter(cfg.Now)}, nil
 }
 
 // Handler returns the bootstrap HTTP mux (CACertPath + JoinPath +

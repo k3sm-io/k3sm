@@ -50,6 +50,13 @@ type meshEndpointFixture struct {
 // certificate verification against the signing CA, holding one enrolled peer.
 func newMeshEndpointFixture(t *testing.T) *meshEndpointFixture {
 	t.Helper()
+	return newMeshEndpointFixtureAt(t, nil)
+}
+
+// newMeshEndpointFixtureAt is newMeshEndpointFixture with the server's clock
+// injected (nil is the real clock), for the rows that advance a rate limit.
+func newMeshEndpointFixtureAt(t *testing.T, now func() time.Time) *meshEndpointFixture {
+	t.Helper()
 	clusterCA, err := certs.NewCA("k3sm-cluster-ca")
 	if err != nil {
 		t.Fatalf("cluster CA: %v", err)
@@ -81,6 +88,7 @@ func newMeshEndpointFixture(t *testing.T) *meshEndpointFixture {
 		Enroller:      enroller,
 		ServerAuth:    bootstrap.NewStaticServerSecret("server-bootstrap-secret-0123456789abcdef"),
 		Bundle:        staticBundle("sealed-bundle-bytes"),
+		Now:           now,
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)

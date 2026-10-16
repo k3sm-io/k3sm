@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,16 @@ func (s *Server) handleNetserveCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.authorizeNodeSelf(w, leaf, req.NodeName, netserveCertVerb) {
+		return
+	}
+	// PER-NODE RATE LIMIT, after authentication so the key is the verified
+	// node name (authorizeNodeSelf has bound req.NodeName to the certificate),
+	// and before the CSR parse and the signature, which are the work it bounds.
+	if ok, retryAfter := s.netserveIssues.allow(req.NodeName); !ok {
+		secs := retryAfterSeconds(retryAfter)
+		s.cfg.Logger.Warn(netserveCertVerb+" rejected", "reason", "rate-limit", "node", req.NodeName, "retryAfterSeconds", secs)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		http.Error(w, fmt.Sprintf("too many netserve certificate requests for this node; retry in %ds", secs), http.StatusTooManyRequests)
 		return
 	}
 

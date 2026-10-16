@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -231,5 +232,53 @@ func TestApproveAndSignNetserveCSR(t *testing.T) {
 	leaf := parseCertPEM(t, certPEM)
 	if node, ok := certs.NetserveNodeName(leaf); !ok || node != "n" {
 		t.Errorf("NetserveNodeName = %q, %v; want n, true", node, ok)
+	}
+}
+
+// TestNetserveCertRateLimitPerNode pins the per-node limit: five issues back to
+// back, the sixth answered 429 with a Retry-After, another node unaffected
+// because the key is the VERIFIED node name, and one more issue once a minute
+// has passed.
+func TestNetserveCertRateLimitPerNode(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Now()
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	f := newMeshEndpointFixtureAt(t, clock)
+	worker1 := f.nodeClient(t, f.signingCA, "system:node:worker-1", []string{"system:nodes"})
+	worker2 := f.nodeClient(t, f.signingCA, "system:node:worker-2", []string{"system:nodes"})
+	ask := func(client *http.Client, node string) int {
+		code, _ := postNetserve(t, client, f.ts.URL, bootstrap.NetserveCertRequest{NodeName: node, CSRPEM: netserveCSRPEM(t, pkix.Name{}, nil)})
+		return code
+	}
+	for i := 0; i < bootstrap.NetserveRateBurst; i++ {
+		if code := ask(worker1, "worker-1"); code != http.StatusOK {
+			t.Fatalf("issue %d = %d, want 200 within the burst", i+1, code)
+		}
+	}
+	req, _ := json.Marshal(bootstrap.NetserveCertRequest{NodeName: "worker-1", CSRPEM: netserveCSRPEM(t, pkix.Name{}, nil)})
+	resp, err := worker1.Post(f.ts.URL+bootstrap.NetserveCertPath, "application/json", bytes.NewReader(req))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("issue past the burst = %d (Retry-After %q), want 429 with a Retry-After", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	// A refused request naming another node is refused by the self-scoping
+	// guard, not served from that node's budget.
+	if code := ask(worker1, "worker-2"); code != http.StatusForbidden {
+		t.Errorf("worker-1 asking for worker-2 = %d, want 403", code)
+	}
+	if code := ask(worker2, "worker-2"); code != http.StatusOK {
+		t.Errorf("worker-2 = %d, want 200: the limit is per node", code)
+	}
+	mu.Lock()
+	now = now.Add(bootstrap.NetserveRateRefill)
+	mu.Unlock()
+	if code := ask(worker1, "worker-1"); code != http.StatusOK {
+		t.Errorf("worker-1 after one refill = %d, want 200", code)
+	}
+	if code := ask(worker1, "worker-1"); code != http.StatusTooManyRequests {
+		t.Errorf("worker-1 again = %d, want 429: one refill is one issue", code)
 	}
 }
