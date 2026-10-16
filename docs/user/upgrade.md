@@ -71,7 +71,10 @@ While an update is in progress, `apply` refuses and names its phase. A finished 
 `k3sm update status [-o text|json] [--watch]` prints the update's phase, the release it resolved
 (tag and digest), one row per node (name, from, to, phase, message, and the time of its last
 progress) and the conditions. `--watch` prints again on every change and returns when the update
-finishes. With no update, it says so and exits 0.
+finishes. With no update it prints `no managed update` and exits 0; `-o json` then prints
+`{"phase":"","version":"","resolved":null,"nodes":[],"conditions":[]}`. While an update is in
+progress the `update` row of `k3sm status` is `rolling`, naming the phase and the node being
+updated, so `k3sm status` alone shows a roll started from any Mac.
 
 `k3sm update cancel` stops the roll: the node being updated finishes its update, the nodes not yet
 started are left on the release they run, and the update ends `Cancelled`. A cancel is not a

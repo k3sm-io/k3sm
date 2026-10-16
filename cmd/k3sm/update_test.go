@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -472,7 +473,7 @@ func TestUpdateApplyCreatesThePlan(t *testing.T) {
 		{Name: "laptop", From: "v0.1.7", To: "v0.2.0", Phase: "Installing", Message: "installing", LastProgress: "2026-10-15T11:59:00Z"},
 		{Name: "studio", From: "v0.1.7", To: "v0.2.0", Phase: "Pending", LastProgress: "2026-10-15T11:58:00Z"},
 	}
-	if !v.Present || v.Phase != "Rolling" || v.Finished || v.Version != "v0.2.0" || !v.Drain || v.Signature != "required" ||
+	if v.Name != "current" || v.Phase != "Rolling" || v.Finished || v.Version != "v0.2.0" || !v.Drain || v.Signature != "required" ||
 		v.Resolved == nil || v.Resolved.Digest != "sha256:abc" || len(v.Conditions) != 1 {
 		t.Errorf("status view = %+v", v)
 	}
@@ -597,5 +598,96 @@ func TestUpdateStatusWatchStopsWhenFinished(t *testing.T) {
 	if strings.Count(out, "update   current to v0.2.0") != 3 || strings.Count(out, "phase    Rolling") != 1 ||
 		!strings.Contains(out, "phase    not yet reconciled") || strings.LastIndex(out, "phase    Succeeded") < strings.LastIndex(out, "Rolling") {
 		t.Errorf("watch output:\n%s", out)
+	}
+}
+
+// TestUpdateStatusNoUpdate pins the no-update answer the app reads: exit 0,
+// "no managed update", and the fixed empty JSON.
+func TestUpdateStatusNoUpdate(t *testing.T) {
+	c := newUpdateCluster()
+	code, out, errOut := c.run(t, "status", "-o", "json")
+	if code != 0 {
+		t.Fatalf("status -o json: exit %d, stderr %s", code, errOut)
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(out)); err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"phase":"","version":"","resolved":null,"nodes":[],"conditions":[]}`; compact.String() != want {
+		t.Errorf("status -o json = %s, want %s", compact.String(), want)
+	}
+	if code, out, _ := c.run(t, "status", "--watch"); code != 0 || !strings.HasPrefix(out, "no managed update") {
+		t.Errorf("status --watch: exit %d, out %q", code, out)
+	}
+}
+
+// TestUpdateRecorderRecordsTheRoll is the server's recorder against a fake
+// release check and a fake cluster: while the Update is not finished the
+// record carries the roll (so the status row is `rolling` naming the phase and
+// the node) beside the check's fields, and once it finishes the roll goes.
+func TestUpdateRecorderRecordsTheRoll(t *testing.T) {
+	wd := installedWorkDir(t)
+	c := newUpdateCluster()
+	obj, err := newUpdateObject(updatesv1alpha1.UpdateSpec{Version: "v0.2.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.dyn.Resource(updateGVR).Create(context.Background(), obj, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c.setStatus(t, updatesv1alpha1.UpdateStatus{
+		Phase: updatesv1alpha1.UpdatePhaseRolling,
+		Nodes: []updatesv1alpha1.UpdateNodeStatus{
+			{Name: "laptop", Phase: updatesv1alpha1.UpdateNodePhaseDone},
+			{Name: "studio", Phase: updatesv1alpha1.UpdateNodePhaseInstalling},
+		},
+		Conditions: []metav1.Condition{progressing(metav1.ConditionTrue, updatectl.ReasonRolling)},
+	})
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		updateRecorder{
+			workDir: wd,
+			check: func(context.Context) (update.Report, error) {
+				return update.Report{CheckedAt: now, Latest: update.Release{Tag: "v0.2.0"}, Installed: "0.1.7", Nodes: []update.Node{}}, nil
+			},
+			dyn:       c.dyn,
+			interval:  time.Hour,
+			rollEvery: time.Millisecond,
+			now:       func() time.Time { return now },
+			logger:    slog.New(slog.DiscardHandler),
+		}.run(ctx)
+	}()
+	defer func() { cancel(); <-done }()
+
+	waitRecord := func(what string, ok func(status.UpdateRecord) bool) status.UpdateRecord {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			rec := readUpdateRecord(wd)
+			if ok(rec) {
+				return rec
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: record %+v", what, rec)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	rec := waitRecord("the roll and the check", func(r status.UpdateRecord) bool { return r.Roll != nil && r.Latest == "v0.2.0" })
+	if want := (status.UpdateRoll{ObservedAt: now, Version: "v0.2.0", Phase: "Rolling", Node: "studio", NodePhase: "Installing"}); *rec.Roll != want {
+		t.Errorf("roll = %+v, want %+v", *rec.Roll, want)
+	}
+	row := status.UpdateRowFrom(rec, now)
+	if row.State != status.StateRolling || row.Wide["phase"] != "Rolling" || row.Wide["node"] != "studio" || !strings.Contains(row.Detail, "node studio Installing") {
+		t.Errorf("row = %+v", row)
+	}
+
+	c.setStatus(t, updatesv1alpha1.UpdateStatus{Phase: updatesv1alpha1.UpdatePhaseSucceeded, Conditions: []metav1.Condition{progressing(metav1.ConditionFalse, updatectl.ReasonSucceeded)}})
+	rec = waitRecord("the roll cleared", func(r status.UpdateRecord) bool { return r.Roll == nil })
+	if rec.Latest != "v0.2.0" {
+		t.Errorf("clearing the roll lost the check: %+v", rec)
 	}
 }

@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
@@ -335,32 +336,139 @@ func updateCheckDue(workDir string, now time.Time, interval time.Duration) time.
 	return 0
 }
 
-// runUpdateRecorder refreshes the update record for `k3sm status` at most once
-// an interval until ctx ends. Every failure is logged and survivable: a check
-// is a report, never a reason to stop a server, and a failed one is itself
-// recorded so the row says why.
-func runUpdateRecorder(ctx context.Context, workDir string, cs kubernetes.Interface, interval time.Duration, logger *slog.Logger) {
-	wait := updateCheckDue(workDir, time.Now(), interval)
+// updateRecorder keeps the update record for `k3sm status` fresh on a server:
+// the release check at most once an interval, and the managed update in
+// progress every rollEvery, so a roll started anywhere shows in the update row.
+type updateRecorder struct {
+	workDir string
+	// check is one release check (update.Check against the release index).
+	check func(ctx context.Context) (update.Report, error)
+	// dyn reads the Update; nil records no roll.
+	dyn dynamic.Interface
+	// interval is the check interval, rollEvery the roll poll.
+	interval, rollEvery time.Duration
+	now                 func() time.Time
+	logger              *slog.Logger
+}
+
+// runUpdateRecorder starts the server's update recorder: the hourly check
+// against the release index and the Update poll over dyn.
+func runUpdateRecorder(ctx context.Context, workDir string, cs kubernetes.Interface, dyn dynamic.Interface, logger *slog.Logger) {
+	updateRecorder{
+		workDir: workDir,
+		check: func(ctx context.Context) (update.Report, error) {
+			return update.Check(ctx, update.Inputs{BaseURL: update.DefaultBaseURL, Kube: cs, Installed: version.Get()})
+		},
+		dyn:       dyn,
+		interval:  status.UpdateRecordInterval,
+		rollEvery: status.UpdateRollEvery,
+		now:       time.Now,
+		logger:    logger,
+	}.run(ctx)
+}
+
+// run refreshes the record until ctx ends. Every failure is logged and
+// survivable: a check is a report, never a reason to stop a server, and a
+// failed one is itself recorded so the row says why. The one goroutine owns
+// roll, so the check's record carries the roll last seen and the roll's
+// refresh keeps the last check's fields.
+func (r updateRecorder) run(ctx context.Context) {
+	check := time.NewTimer(updateCheckDue(r.workDir, r.now(), r.interval))
+	defer check.Stop()
+	poll := time.NewTimer(0)
+	defer poll.Stop()
+	var roll *status.UpdateRoll
 	for {
-		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
-			t.Stop()
 			return
-		case <-t.C:
+		case <-check.C:
+			rep, err := r.check(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				r.logger.Info("could not check for a k3sm update", "err", err)
+			}
+			rec := rep.Record(err)
+			rec.Roll = roll
+			r.write(rec)
+			check.Reset(r.interval)
+		case <-poll.C:
+			poll.Reset(r.rollEvery)
+			if r.dyn == nil {
+				continue
+			}
+			u, err := getUpdate(ctx, r.dyn)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				// The CRD not served yet, or the apiserver away: the last
+				// roll ages out of the row on its own (UpdateRollStaleAfter).
+				r.logger.Debug("could not read the Update for `k3sm status`", "err", err)
+				continue
+			}
+			next := updateRollFrom(u, r.now())
+			if next == nil && roll == nil {
+				continue
+			}
+			roll = next
+			rec := readUpdateRecord(r.workDir)
+			rec.Roll = roll
+			r.write(rec)
 		}
-		rep, err := update.Check(ctx, update.Inputs{BaseURL: update.DefaultBaseURL, Kube: cs, Installed: version.Get()})
-		if ctx.Err() != nil {
-			return
-		}
-		if err != nil {
-			logger.Info("could not check for a k3sm update", "err", err)
-		}
-		if err := writeUpdateRecord(workDir, rep.Record(err)); err != nil && !errors.Is(err, errNoStatusDir) {
-			logger.Warn("could not record the update check for `k3sm status`", "path", status.UpdatePath(workDir), "err", err)
-		}
-		wait = interval
 	}
+}
+
+// write records rec, logging a failure (a work dir outside an install has no
+// status directory, which is not one).
+func (r updateRecorder) write(rec status.UpdateRecord) {
+	if err := writeUpdateRecord(r.workDir, rec); err != nil && !errors.Is(err, errNoStatusDir) {
+		r.logger.Warn("could not record the update check for `k3sm status`", "path", status.UpdatePath(r.workDir), "err", err)
+	}
+}
+
+// readUpdateRecord is the record on disk, or an empty one when there is none
+// or it does not parse (the next check rewrites it whole).
+func readUpdateRecord(workDir string) status.UpdateRecord {
+	var rec status.UpdateRecord
+	if raw, err := os.ReadFile(status.UpdatePath(workDir)); err == nil {
+		if json.Unmarshal(raw, &rec) != nil {
+			rec = status.UpdateRecord{}
+		}
+	}
+	return rec
+}
+
+// updateRollFrom is the roll the update row reports for u, observed at now:
+// nil when there is no Update or it has finished. The node is the first one
+// that has started and not ended. A field the record would refuse (a tag or a
+// phase of an unexpected shape) is left out rather than invalidating the
+// record; an unusable tag means no roll, since the controller fails it.
+func updateRollFrom(u *updatesv1alpha1.Update, now time.Time) *status.UpdateRoll {
+	if u == nil || updateFinished(u) || !version.ValidTag(u.Spec.Version) {
+		return nil
+	}
+	word := func(s string) string {
+		if status.UpdatePhaseWord(s) {
+			return s
+		}
+		return ""
+	}
+	r := &status.UpdateRoll{ObservedAt: now.UTC().Truncate(time.Second), Version: u.Spec.Version, Phase: word(string(u.Status.Phase))}
+	for _, n := range u.Status.Nodes {
+		switch n.Phase {
+		case "", updatesv1alpha1.UpdateNodePhasePending, updatesv1alpha1.UpdateNodePhaseDone,
+			updatesv1alpha1.UpdateNodePhaseSkipped, updatesv1alpha1.UpdateNodePhaseCancelled:
+			continue
+		}
+		if len(validation.IsDNS1123Subdomain(n.Name)) == 0 {
+			r.Node, r.NodePhase = n.Name, word(string(n.Phase))
+		}
+		break
+	}
+	return r
 }
 
 // updateGVR is the Update resource the managed-update subcommands read and
@@ -560,24 +668,28 @@ func newUpdateObject(spec updatesv1alpha1.UpdateSpec) (*unstructured.Unstructure
 	return &unstructured.Unstructured{Object: obj}, nil
 }
 
-// updateStatusView is `k3sm update status -o json`.
+// updateStatusView is `k3sm update status -o json`. With no Update named
+// current it is exactly {"phase":"","version":"","resolved":null,"nodes":[],
+// "conditions":[]}: every other key is omitted, and a present Update always
+// has a version.
 type updateStatusView struct {
-	// Present is false when the cluster has no Update named current; every
-	// other field is then empty.
-	Present bool   `json:"present"`
-	Name    string `json:"name"`
-	Version string `json:"version,omitempty"`
+	// Present is whether the cluster has an Update named current; it is not
+	// encoded (Version says it).
+	Present bool `json:"-"`
 	// Phase is the controller's display phase; empty before it reconciles.
-	Phase string `json:"phase,omitempty"`
+	Phase   string `json:"phase"`
+	Version string `json:"version"`
+	// Resolved is the verified release; null until verification passed.
+	Resolved   *updatesv1alpha1.UpdateResolved `json:"resolved"`
+	Nodes      []updateStatusNode              `json:"nodes"`
+	Conditions []metav1.Condition              `json:"conditions"`
+	Name       string                          `json:"name,omitempty"`
 	// Finished is the controller's end-state predicate over the conditions.
-	Finished       bool                            `json:"finished"`
-	Cancel         bool                            `json:"cancel"`
-	Drain          bool                            `json:"drain"`
-	Signature      string                          `json:"signature,omitempty"`
-	AllowDowngrade bool                            `json:"allowDowngrade"`
-	Resolved       *updatesv1alpha1.UpdateResolved `json:"resolved,omitempty"`
-	Nodes          []updateStatusNode              `json:"nodes"`
-	Conditions     []metav1.Condition              `json:"conditions"`
+	Finished       bool   `json:"finished,omitempty"`
+	Cancel         bool   `json:"cancel,omitempty"`
+	Drain          bool   `json:"drain,omitempty"`
+	Signature      string `json:"signature,omitempty"`
+	AllowDowngrade bool   `json:"allowDowngrade,omitempty"`
 	// Generation and ObservedGeneration say whether the status describes the
 	// current spec (a cancel not yet seen trails).
 	Generation         int64 `json:"generation,omitempty"`
@@ -616,10 +728,11 @@ func splitUpdateProgress(msg string) (base, at string) {
 // and messages carry what nodes say of themselves, so every string is
 // control-stripped.
 func newUpdateStatusView(u *updatesv1alpha1.Update) updateStatusView {
-	v := updateStatusView{Name: updatesv1alpha1.UpdateName, Nodes: []updateStatusNode{}, Conditions: []metav1.Condition{}}
+	v := updateStatusView{Nodes: []updateStatusNode{}, Conditions: []metav1.Condition{}}
 	if u == nil {
 		return v
 	}
+	v.Name = updatesv1alpha1.UpdateName
 	clip := func(s string) string { return status.ClipText(s, 1024) }
 	v.Present = true
 	v.Version = clip(u.Spec.Version)
@@ -650,7 +763,7 @@ func newUpdateStatusView(u *updatesv1alpha1.Update) updateStatusView {
 // renderUpdateStatus prints v for a person.
 func renderUpdateStatus(w io.Writer, v updateStatusView) {
 	if !v.Present {
-		fmt.Fprintf(w, "No update: the cluster has no Update named %q. Start one with `k3sm update apply`.\n", v.Name)
+		fmt.Fprintf(w, "no managed update (the cluster has no Update named %q; start one with `k3sm update apply`)\n", updatesv1alpha1.UpdateName)
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
