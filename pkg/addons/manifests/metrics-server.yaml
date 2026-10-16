@@ -185,7 +185,7 @@ spec:
         - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
         - --kubelet-use-node-status-port
         - --metric-resolution=15s
-        image: ghcr.io/k3sm-io/metrics-server@sha256:2334cdb7df40b9efea2af2dc7444f16b715f6ee025fb849070e424f6900ad743
+        image: ghcr.io/k3sm-io/metrics-server@sha256:6fac8d3b40e13eed21a57101083ce9a7ebbb7d136e946deec1b6511c11620005
         imagePullPolicy: IfNotPresent
         livenessProbe:
           failureThreshold: 3

@@ -5,15 +5,8 @@
 # pin= (the next upstream release), whichever comes first. govulncheck failing
 # for any reason other than findings (a network error included) is a failure.
 #
-# These are upstream v0.9.0's own dependency versions. The reasons below rest on
-# govulncheck's source-mode call traces over the pinned module (README.md,
-# Reachability).
+# Accept a finding only with a reason resting on govulncheck's source-mode call
+# traces over the pinned module (README.md, Reachability). The graph's security
+# fixes (build.sh MS_FIXES) leave no finding to accept.
 #
 # <id> <module> <found> <fixed> until=<YYYY-MM-DD> pin=<version> <reason>
-GO-2026-6505 go.opentelemetry.io/otel v1.44.0 none until=2026-11-14 pin=v0.9.0 exporter config logging, reached only from package init; tracing is not configured, so no endpoint exists to log (govulncheck lists this module for the advisory on some runs and not others)
-GO-2026-6505 go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.44.0 v1.45.0 until=2026-11-14 pin=v0.9.0 exporter config logging, reached only from package init; tracing is not configured, so no endpoint exists to log
-GO-2026-6505 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.44.0 v1.45.0 until=2026-11-14 pin=v0.9.0 exporter config logging, reached only from package init; tracing is not configured, so no endpoint exists to log
-GO-2026-6505 go.opentelemetry.io/otel/sdk v1.44.0 v1.45.0 until=2026-11-14 pin=v0.9.0 exporter config logging, reached only from package init; tracing is not configured, so no endpoint exists to log
-GO-2026-6443 google.golang.org/grpc v1.81.1 v1.82.2 until=2026-11-14 pin=v0.9.0 xDS gRPC server panic; metrics-server runs no gRPC server (grpc is linked for otel and etcd clients); source mode finds no call path
-GO-2026-6348 google.golang.org/grpc v1.81.1 v1.83.1 until=2026-11-14 pin=v0.9.0 every source-mode trace is the gRPC client transport (http2Client), used only by an otel exporter that is not configured; no gRPC server runs
-GO-2026-6061 google.golang.org/grpc v1.81.1 v1.82.1 until=2026-11-14 pin=v0.9.0 xDS RBAC and the gRPC HTTP/2 server transport; every source-mode trace is the client transport (http2Client), and no gRPC server runs

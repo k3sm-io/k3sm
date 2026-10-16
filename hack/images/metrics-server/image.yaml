@@ -12,11 +12,11 @@
 # records new digests sets published: false until the operator pushes it,
 # makes it public and re-derives the digest from the published artifact.
 image:
-  ref: ghcr.io/k3sm-io/metrics-server@sha256:2334cdb7df40b9efea2af2dc7444f16b715f6ee025fb849070e424f6900ad743
+  ref: ghcr.io/k3sm-io/metrics-server@sha256:6fac8d3b40e13eed21a57101083ce9a7ebbb7d136e946deec1b6511c11620005
   tag: ghcr.io/k3sm-io/metrics-server:v0.9.0
   index: ""
   platforms:
-    darwin/arm64: sha256:2334cdb7df40b9efea2af2dc7444f16b715f6ee025fb849070e424f6900ad743
+    darwin/arm64: sha256:6fac8d3b40e13eed21a57101083ce9a7ebbb7d136e946deec1b6511c11620005
 source:
   module: sigs.k8s.io/metrics-server
   version: v0.9.0
@@ -24,5 +24,5 @@ source:
   sum: h1:nlqqZ2H0Xfko8eJC/1qaNVVT17hu4rxndkOi22KTZ4w=
 build:
   toolchain: go1.27.2
-  binarySHA256: bbcb4d15e9b6b4b47f8344f97abf78afbf5700d47deb2e7d3bc241be1665d7ce
+  binarySHA256: d74ef5d915702321561b687c1776e5d44e59f872b1672d240e45b062a93d0ea8
 published: true

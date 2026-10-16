@@ -52,7 +52,7 @@ else
 fi
 
 echo "==> the committed module graph"
-if "$BUILD" --check-graph >/dev/null; then ok "go.mod and go.sum require the pinned module and x/net, with the pinned Sum"; else bad "build.sh --check-graph: $("$BUILD" --check-graph)"; fi
+if "$BUILD" --check-graph >/dev/null; then ok "go.mod and go.sum require the pinned module, x/net and the security fixes, with the pinned Sum"; else bad "build.sh --check-graph: $("$BUILD" --check-graph)"; fi
 MS_XNET="$(pin MS_XNET)"
 if grep -qxF "	dep	golang.org/x/net	${MS_XNET}	$(awk -v v="$MS_XNET" '$1 == "golang.org/x/net" && $2 == v { print $3 }' "$HERE/go.sum")" "$LOCK"; then
 	ok "buildinfo.lock links golang.org/x/net $MS_XNET"
@@ -63,7 +63,36 @@ mkdir -p "$tmp/graph"
 for f in go.mod go.sum; do cp "$HERE/$f" "$tmp/graph/"; done
 sed -i.bak "s/^\(sigs.k8s.io\/metrics-server $MS_VERSION \)h1:.*/\1h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=/" "$tmp/graph/go.sum"
 if "$BUILD" --check-graph "$tmp/graph" >/dev/null; then bad "a go.sum with another Sum passed"; else ok "a go.sum with another Sum for the pinned module is refused"; fi
-cp "$HERE/go.sum" "$tmp/graph/"
+MS_FIXES="$(pin MS_FIXES)"
+[ -n "$MS_FIXES" ] || bad "build.sh pins no MS_FIXES"
+# Each fix in turn: downgraded in the require block; present only as a literal
+# lookalike path (each dot a different byte, which a regex dot would match); and
+# present at its version only inside an exclude block. Every one is refused,
+# naming the module.
+for fix in $MS_FIXES; do
+	fmod="${fix%@*}" fver="${fix#*@}"
+	look="$(printf '%s' "$fmod" | tr . X)"
+	for variant in downgraded lookalike exclude-only; do
+		cp "$HERE/go.mod" "$HERE/go.sum" "$tmp/graph/"
+		awk -v mod="$fmod" -v ver="$fver" -v look="$look" -v how="$variant" '
+			$1 == mod && $2 == ver {
+				if (how == "downgraded") { sub(ver, "v0.0.0") }
+				else if (how == "lookalike") { $1 = "\t" look; sub(/^ /, "") }
+				else { next }
+			}
+			{ print }
+			END { if (how == "exclude-only") printf "exclude (\n\t%s %s\n)\n", mod, ver }
+		' "$HERE/go.mod" >"$tmp/graph/go.mod"
+		if out="$("$BUILD" --check-graph "$tmp/graph")"; then
+			bad "a go.mod with $fmod $variant passed"
+		elif printf '%s\n' "$out" | grep -qF "require $fmod $fver"; then
+			ok "a go.mod with $fmod $variant is refused, naming it"
+		else
+			bad "$fmod $variant not named: $out"
+		fi
+	done
+done
+cp "$HERE/go.mod" "$HERE/go.sum" "$tmp/graph/"
 printf 'replace golang.org/x/net => example.com/net v0.0.1\n' >>"$tmp/graph/go.mod"
 if "$BUILD" --check-graph "$tmp/graph" >/dev/null; then bad "a go.mod with a replace passed"; else ok "a go.mod with a replace is refused"; fi
 
@@ -123,13 +152,20 @@ if marker_problems "$tmp/marker" metrics-server "$MS_VERSION" nocgo >/dev/null; 
 if marker_problems "$tmp/marker" metrics-server v0.8.0 nocgo >/dev/null; then bad "a marker naming another pin passed"; else ok "a marker naming another pin is refused"; fi
 
 echo "==> govulncheck findings: matched by id, module and found version, never expired"
-read -r vid vmod vver _ < <(awk '!/^#/ && NF { print; exit }' "$HERE/govulncheck.accepted")
+# The checks run on a copy of the recipe with a fixture acceptance, so they hold
+# whether or not the committed list accepts anything.
+mkdir -p "$tmp/vt/hack/images/metrics-server"
+cp "$BUILD" "$tmp/vt/hack/images/metrics-server/build.sh"
+cp -R "$tmp/tree/hack/release" "$tmp/vt/hack/"
+vid=GO-2099-0002 vmod=example.com/accepted vver=v1.0.0
+printf '%s %s %s v1.0.1 until=2026-11-14 pin=%s fixture acceptance for the self-test\n' "$vid" "$vmod" "$vver" "$MS_VERSION" >"$tmp/vt/hack/images/metrics-server/govulncheck.accepted"
+if out="$(VULN_TODAY=2026-10-15 "$BUILD" --check-vulns 0 /dev/null)"; then ok "the committed govulncheck.accepted parses"; else bad "govulncheck.accepted: $out"; fi
 finding() { printf 'Vulnerability #1: %s\n  Module: %s\n    Found in: %s@%s\n' "$1" "$2" "$2" "$3"; }
 finding "$vid" "$vmod" "$vver" >"$tmp/vuln-known.txt"
 { finding "$vid" "$vmod" "$vver"; finding GO-2099-0001 example.com/new v1.0.0; } >"$tmp/vuln-new.txt"
 finding "$vid" example.com/other "$vver" >"$tmp/vuln-module.txt"
 finding "$vid" "$vmod" v99.0.0 >"$tmp/vuln-version.txt"
-check() { VULN_TODAY="${VULN_TODAY:-2026-10-15}" "$BUILD" --check-vulns "$@"; }
+check() { VULN_TODAY="${VULN_TODAY:-2026-10-15}" bash "$tmp/vt/hack/images/metrics-server/build.sh" --check-vulns "$@"; }
 if check 3 "$tmp/vuln-known.txt" >/dev/null; then ok "an accepted finding passes"; else bad "an accepted finding was refused: $(check 3 "$tmp/vuln-known.txt")"; fi
 if out="$(check 3 "$tmp/vuln-new.txt")"; then bad "a new finding passed"; elif printf '%s\n' "$out" | grep -q "GO-2099-0001"; then ok "a new finding is refused, naming it"; else bad "new finding not named: $out"; fi
 if check 3 "$tmp/vuln-module.txt" >/dev/null; then bad "an accepted id in another module passed"; else ok "an accepted id found in another module is refused"; fi
@@ -137,7 +173,7 @@ if check 3 "$tmp/vuln-version.txt" >/dev/null; then bad "an accepted id at anoth
 if out="$(VULN_TODAY=2099-01-01 check 3 "$tmp/vuln-known.txt")"; then bad "an expired acceptance passed"; elif printf '%s\n' "$out" | grep -q "expired"; then ok "an expired acceptance is refused"; else bad "expiry not named: $out"; fi
 mkdir -p "$tmp/pin/hack/images/metrics-server"
 sed 's/^MS_VERSION=".*"/MS_VERSION="v9.9.9"/' "$BUILD" >"$tmp/pin/hack/images/metrics-server/build.sh"
-cp "$HERE/govulncheck.accepted" "$tmp/pin/hack/images/metrics-server/"
+cp "$tmp/vt/hack/images/metrics-server/govulncheck.accepted" "$tmp/pin/hack/images/metrics-server/"
 cp -R "$tmp/tree/hack/release" "$tmp/pin/hack/"
 if out="$(VULN_TODAY=2026-10-15 bash "$tmp/pin/hack/images/metrics-server/build.sh" --check-vulns 3 "$tmp/vuln-known.txt")"; then bad "an acceptance for another upstream release passed"; elif printf '%s\n' "$out" | grep -q "was for metrics-server"; then ok "an acceptance for another upstream release is refused"; else bad "pin mismatch not named: $out"; fi
 if check 1 "$tmp/vuln-known.txt" >/dev/null; then bad "a failed govulncheck run passed"; else ok "a failed govulncheck run (a network error) is refused"; fi
