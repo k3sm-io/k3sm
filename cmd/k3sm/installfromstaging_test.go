@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -150,4 +151,71 @@ func TestInstallEarlyRefusalDiscardsToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInstallInPlaceShape pins the in-place update at the CLI: the root
+// helper's argv (--from-staging alone, with no $SUDO_USER and no --user)
+// passes the early refusals, any other install still needs a human --user,
+// and a Mac resolved as a worker refuses the control-plane flags.
+func TestInstallInPlaceShape(t *testing.T) {
+	t.Parallel()
+	const stage = "/Library/k3sm.staging/netd-update-AbCd"
+	env := installEnv{euid: 0, executable: func() (string, error) { return stage + "/k3sm", nil }}
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		inPlace bool
+		wantErr string
+	}{
+		{name: "the root helper's argv", args: []string{"--from-staging", stage, "--allow-downgrade", "--require-team-signature"}, inPlace: true},
+		{name: "a worker update from the app is not in place", args: []string{"--user", "admin", "--from-staging", stage, "--agent", "--server", "192.0.2.10"}},
+		{name: "--from-staging with a role flag still needs --user", args: []string{"--from-staging", stage, "--agent", "--server", "192.0.2.10"}, wantErr: "non-root human"},
+		{name: "a plain install still needs --user", args: []string{}, wantErr: "non-root human"},
+		{name: "--user root is refused in place too", args: []string{"--from-staging", stage, "--user", "root"}, inPlace: true, wantErr: "non-root human"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			args := tc.args
+			if !slices.Contains(args, "--user") {
+				args = append([]string{"--user", ""}, args...)
+			}
+			o, _, _, err := env.prepare(args)
+			if o.inPlace() != tc.inPlace {
+				t.Errorf("inPlace = %v, want %v", o.inPlace(), tc.inPlace)
+			}
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("prepare = %v, want accepted", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("prepare = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+	t.Run("a worker resolved from the disk refuses control-plane flags", func(t *testing.T) {
+		t.Parallel()
+		asAgent := func(c install.Config) (install.Config, error) { c.Role = install.RoleAgent; return c, nil }
+		o, err := parseInstallFlags([]string{"--from-staging", stage, "--mesh-ip", "100.64.0.1"})
+		if err != nil {
+			t.Fatalf("parseInstallFlags = %v", err)
+		}
+		if _, err := o.resolveInPlace(o.installConfig(stage+"/k3sm", nil, nil), asAgent); err == nil || !strings.Contains(err.Error(), "--mesh-ip") {
+			t.Fatalf("resolveInPlace = %v, want --mesh-ip refused on a worker", err)
+		}
+		o, err = parseInstallFlags([]string{"--from-staging", stage})
+		if err != nil {
+			t.Fatalf("parseInstallFlags = %v", err)
+		}
+		cfg, err := o.resolveInPlace(o.installConfig(stage+"/k3sm", nil, nil), asAgent)
+		if err != nil || cfg.Role != install.RoleAgent {
+			t.Fatalf("resolveInPlace = %v, %v; want the resolved worker", cfg.Role, err)
+		}
+		called := false
+		o, _ = parseInstallFlags([]string{"--user", "admin", "--from-staging", stage, "--agent", "--server", "192.0.2.10"})
+		if _, err := o.resolveInPlace(o.installConfig(stage+"/k3sm", nil, nil), func(c install.Config) (install.Config, error) { called = true; return c, nil }); err != nil || called {
+			t.Fatalf("an explicit worker update ran the in-place resolver (called=%v, err=%v)", called, err)
+		}
+	})
 }

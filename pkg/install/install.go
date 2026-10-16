@@ -1852,7 +1852,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if cfg.BinarySource == "" {
 		return fmt.Errorf("install: BinarySource (the k3sm binary to install) is required")
 	}
-	if cfg.TargetUser == "" {
+	// A worker writes no admin kubeconfig (step 5), so only a control plane
+	// needs its owner; an in-place agent update (ResolveInPlace) names none.
+	if cfg.TargetUser == "" && cfg.Role != RoleAgent {
 		return fmt.Errorf("install: TargetUser (the kubeconfig owner, e.g. $SUDO_USER) is required")
 	}
 	// BEFORE anything is written, and before a single byte is copied: a Mac
