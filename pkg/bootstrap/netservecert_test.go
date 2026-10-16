@@ -235,6 +235,35 @@ func TestApproveAndSignNetserveCSR(t *testing.T) {
 	}
 }
 
+// TestNetserveCertCannotObtainNetserveCert is the regression guard on
+// authorizeNodeSelf for this route: a netserve certificate (O=k3sm:netservers,
+// CN=k3sm:netserve:<node>) chains to the signing CA like a node's does, so only
+// the handler's two subject checks keep it from minting itself a successor. Each
+// row breaks exactly one of them; both must refuse.
+func TestNetserveCertCannotObtainNetserveCert(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cn  string
+		org []string
+	}{
+		"a netserve certificate":                           {"k3sm:netserve:worker-1", []string{"k3sm:netservers"}},
+		"O=system:nodes without the system:node: CN":       {"k3sm:netserve:worker-1", []string{"system:nodes"}},
+		"the system:node: CN without O=system:nodes":       {"system:node:worker-1", []string{"k3sm:netservers"}},
+		"the system:node: CN with both groups but no node": {"system:node:", []string{"system:nodes"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newMeshEndpointFixture(t)
+			client := f.nodeClient(t, f.signingCA, tc.cn, tc.org)
+			code, cert := postNetserve(t, client, f.ts.URL, bootstrap.NetserveCertRequest{
+				NodeName: "worker-1",
+				CSRPEM:   netserveCSRPEM(t, pkix.Name{}, nil),
+			})
+			if code != http.StatusForbidden || cert != nil {
+				t.Errorf("status = %d, want 403: CN %q O %v must not obtain a netserve certificate", code, tc.cn, tc.org)
+			}
+		})
+	}
+}
+
 // TestNetserveCertRateLimitPerNode pins the per-node limit: five issues back to
 // back, the sixth answered 429 with a Retry-After, another node unaffected
 // because the key is the VERIFIED node name, and one more issue once a minute
