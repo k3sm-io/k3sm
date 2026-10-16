@@ -277,3 +277,78 @@ func TestServerAnchor(t *testing.T) {
 		}
 	}
 }
+
+// TestEndpointsRecordAnchorsTheContext pins the published endpoints record as
+// the anchor: a worker that joined over the LAN address while its kubeconfig
+// points at the mesh address gets its context once the record names both; a
+// host or port outside the record is refused; a missing record falls back to
+// the anchor a node without one had.
+func TestEndpointsRecordAnchorsTheContext(t *testing.T) {
+	kubeconfig := func(server string) *clientcmdapi.Config {
+		c := clientcmdapi.NewConfig()
+		c.Clusters["k3sm"] = &clientcmdapi.Cluster{Server: server}
+		c.Contexts["k3sm"] = &clientcmdapi.Context{Cluster: "k3sm"}
+		c.CurrentContext = "k3sm"
+		return c
+	}
+	join := JoinAnchor("192.168.0.50")
+	rec := &EndpointsRecord{Port: 6444, Hosts: []string{"192.168.0.50", "100.64.0.1", "kubernetes.default.svc"}}
+
+	if _, ok := UserKubeContext(kubeconfig("https://100.64.0.1:6444"), "k3sm", NodeAnchor(nil, join)); ok {
+		t.Fatal("without the record the mesh address was accepted; this case proves nothing")
+	}
+	for _, tc := range []struct {
+		name   string
+		rec    *EndpointsRecord
+		server string
+		ok     bool
+	}{
+		{"the mesh address the record names", rec, "https://100.64.0.1:6444", true},
+		{"the join address the record names", rec, "https://192.168.0.50:6444", true},
+		{"a DNS SAN the record names", rec, "https://Kubernetes.Default.Svc:6444", true},
+		{"a host outside the record", rec, "https://10.0.0.9:6444", false},
+		{"a named host outside the record", rec, "https://other.example:6444", false},
+		{"the right host on another port", rec, "https://100.64.0.1:6443", false},
+		{"a non-default port the record carries", &EndpointsRecord{Port: 7444, Hosts: []string{"127.0.0.1"}}, "https://127.0.0.1:7444", true},
+		{"a missing record falls back to the join host", nil, "https://192.168.0.50:6444", true},
+		{"a missing record still refuses the mesh address", nil, "https://100.64.0.1:6444", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ok := UserKubeContext(kubeconfig(tc.server), "k3sm", NodeAnchor(tc.rec, join))
+			if ok != tc.ok {
+				t.Errorf("context for %s accepted = %v, want %v", tc.server, ok, tc.ok)
+			}
+		})
+	}
+	t.Run("a server's record covers its non-default port", func(t *testing.T) {
+		anchor := NodeAnchor(&EndpointsRecord{Port: 7444, Hosts: []string{"127.0.0.1", "100.64.0.1"}}, ServerAnchor(6444, nil))
+		if !anchor("https://100.64.0.1:7444") || anchor("https://127.0.0.1:6444") {
+			t.Error("the server anchor did not follow the record's port")
+		}
+	})
+	t.Run("the record is read from the status directory", func(t *testing.T) {
+		raw, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := EndpointsPath("/var/lib/k3sm/status")
+		read := func(p string) ([]byte, error) {
+			if p == path {
+				return raw, nil
+			}
+			return nil, errors.New("absent")
+		}
+		if got := ReadEndpointsRecord(read, path); got == nil || got.Port != 6444 || len(got.Hosts) != 3 {
+			t.Errorf("read %+v, want the record", got)
+		}
+		for name, body := range map[string]string{"garbage": "{", "no port": `{"hosts":["a"]}`, "no hosts": `{"port":6444}`} {
+			bad := func(string) ([]byte, error) { return []byte(body), nil }
+			if ReadEndpointsRecord(bad, path) != nil {
+				t.Errorf("a record with %s was trusted", name)
+			}
+		}
+		if ReadEndpointsRecord(read, "/elsewhere") != nil {
+			t.Error("an absent record was read as one")
+		}
+	})
+}

@@ -116,6 +116,11 @@ const StatusSubdir = "status"
 const (
 	MeshClaimsRecordName = "mesh-claims.json"
 	ServicesRecordName   = "services.json"
+	// EndpointsRecordName is the third, written by either node role and only
+	// in StatusSubdir: the apiserver port and the hosts that name this
+	// cluster's apiserver, which an unprivileged `k3sm status` anchors its
+	// kubeconfig against.
+	EndpointsRecordName = "endpoints.json"
 )
 
 // manifestsSubdir is the manifest directory's leaf name, spelled once.

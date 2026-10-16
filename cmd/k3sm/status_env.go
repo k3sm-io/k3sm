@@ -194,7 +194,7 @@ func newStatusCollector() status.Collector {
 		// this Mac's own: loopback or one of its addresses, at the apiserver
 		// port. A server installed with a non-default --api-port fails it, and
 		// those rows then stay unknown as an ordinary account.
-		ServerAnchor: status.ServerAnchor(executor.DefaultAPIServerPort, localAddrs()),
+		ServerAnchor: status.NodeAnchor(statusEndpoints(), status.ServerAnchor(executor.DefaultAPIServerPort, localAddrs())),
 		Paths:        paths,
 		EUID:         euid,
 		ServiceUID:   serviceUID,
@@ -679,6 +679,12 @@ func newStatusKube(in statusKubeInputs) (status.Kube, string, error) {
 	return buildStatusKube(cfg)
 }
 
+// statusEndpoints reads the endpoints record this node published, or nil
+// (a node older than the record), from the installed status directory.
+func statusEndpoints() *status.EndpointsRecord {
+	return status.ReadEndpointsRecord(os.ReadFile, status.EndpointsPath(install.StateStatus.Path(install.DefaultDataRoot)))
+}
+
 // localAddrs lists this Mac's interface addresses, for the server anchor. A
 // failed read lists none, which leaves loopback as the only anchor.
 func localAddrs() []netip.Addr {
@@ -717,7 +723,7 @@ func statusUserKubeFor(role install.Role, joinServer func() (string, error)) fun
 			return nil, "", fmt.Errorf("the server this Mac joined is unknown, so no context can be shown to point at it: %w", err)
 		}
 		name := installedKubeconfigName()
-		ctxName, ok := status.UserKubeContext(raw, name, status.JoinAnchor(join))
+		ctxName, ok := status.UserKubeContext(raw, name, status.NodeAnchor(statusEndpoints(), status.JoinAnchor(join)))
 		if !ok {
 			return nil, "", fmt.Errorf("neither the %q context nor the current one points at the server this Mac joined", name)
 		}

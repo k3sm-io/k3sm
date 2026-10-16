@@ -17,13 +17,18 @@ limitations under the License.
 package status
 
 import (
+	"encoding/json"
 	"net"
 	"net/netip"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // An unprivileged report reads the cluster through the invoking account's own
@@ -122,4 +127,82 @@ func serverHostPort(s string) (host, port string) {
 		return strings.ToLower(h), p
 	}
 	return strings.ToLower(strings.Trim(s, "[]")), ""
+}
+
+// EndpointsRecord is what a node publishes, 0644 in the status directory, about
+// the apiserver it belongs to: the port, and every host that names this
+// cluster's apiserver. A server lists its serving certificate's SANs, loopback
+// and its interface addresses; an agent lists the host it joined and the SANs
+// of the serving certificate it read over a handshake verified against its
+// node credential's pinned cluster CA. It holds names and addresses, never a
+// credential.
+type EndpointsRecord struct {
+	UpdatedAt time.Time `json:"updatedAt"`
+	Port      int       `json:"port"`
+	Hosts     []string  `json:"hosts"`
+}
+
+// EndpointsPath is the record's path in a status directory.
+func EndpointsPath(statusDir string) string {
+	return filepath.Join(statusDir, install.EndpointsRecordName)
+}
+
+// ReadEndpointsRecord reads the record at path. A missing, unreadable or
+// unparsable record, or one with no port or no hosts, is nil: the node is older
+// than the record or the record cannot be trusted to name anything, and the
+// caller falls back to the anchor it had without one.
+func ReadEndpointsRecord(read func(string) ([]byte, error), path string) *EndpointsRecord {
+	raw, err := read(path)
+	if err != nil {
+		return nil
+	}
+	var rec EndpointsRecord
+	if json.Unmarshal(raw, &rec) != nil || rec.Port <= 0 || len(rec.Hosts) == 0 {
+		return nil
+	}
+	return &rec
+}
+
+// RecordAnchor accepts a server URL whose host is one of the record's hosts and
+// whose port is the record's port.
+func RecordAnchor(rec EndpointsRecord) Anchor {
+	want := strconv.Itoa(rec.Port)
+	hosts := make([]string, 0, len(rec.Hosts))
+	for _, h := range rec.Hosts {
+		hosts = append(hosts, canonicalHost(h))
+	}
+	return func(server string) bool {
+		host, port := serverHostPort(server)
+		if port != want || host == "" {
+			return false
+		}
+		host = canonicalHost(host)
+		for _, h := range hosts {
+			if h == host {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// NodeAnchor is the anchor an unprivileged report uses: the published record
+// when this node has one, else fallback (the interface-address anchor on a
+// server, the join-host anchor on an agent), which is what a node older than
+// the record leaves.
+func NodeAnchor(rec *EndpointsRecord, fallback Anchor) Anchor {
+	if rec == nil {
+		return fallback
+	}
+	return RecordAnchor(*rec)
+}
+
+// canonicalHost lowercases a host and writes an IP in its canonical form, so
+// "::1" and "0:0::1" or a mapped IPv4 compare equal.
+func canonicalHost(h string) string {
+	h = strings.ToLower(strings.Trim(strings.TrimSpace(h), "[]"))
+	if a, err := netip.ParseAddr(h); err == nil {
+		return a.Unmap().String()
+	}
+	return h
 }

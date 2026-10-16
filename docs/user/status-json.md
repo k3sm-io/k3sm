@@ -178,8 +178,8 @@ Other rows read what your account can, through the apiserver, instead of a file 
 - `datastore`: `ok` with `detail` `answers (the apiserver's readiness check reached it); the WAL and
   user_version checks run only as root` when the apiserver is ready, because its readiness check
   includes the datastore. `wide.source` is `apiserver readyz`. The row counts the answer only when
-  your kubeconfig's server is this Mac: a loopback address or one of its own addresses, at port
-  6444. Otherwise it is `unknown`, saying the kubeconfig does not point at this server. It is also
+  your kubeconfig's server is one of this cluster's endpoints (see the endpoints record below).
+  Otherwise it is `unknown`, saying the kubeconfig does not point at this server. It is also
   `unknown` when the apiserver did not answer.
 - `serving-cert`: reads the certificate the apiserver presents when it is reached with your
   kubeconfig, and checks it as root checks the file: in date, issued by the CA your kubeconfig
@@ -193,9 +193,19 @@ Other rows read what your account can, through the apiserver, instead of a file 
   directory writes no second copy, and then the rows say `needs-admin`.
 - On a worker whose node credential your account cannot read, `apiserver`, `node` and `workloads`
   read the cluster with your own kubeconfig: its `k3sm` context (or the name given to `k3sm install
-  --kubeconfig-name`), else the current context, and either only when its server is on the host
-  the worker joined (the `--server` it was installed with). A context is never used by its name
-  alone. The `kubeconfig` row then names that file and context, with `wide.source` `user-kubeconfig`.
+  --kubeconfig-name`), else the current context, and either only when its server is one of this
+  cluster's endpoints (see below). A context is never used by its name alone. The `kubeconfig` row
+  then names that file and context, with `wide.source` `user-kubeconfig`.
+
+The endpoints record, `/var/lib/k3sm/status/endpoints.json` (mode 0644), is how a report run as an
+ordinary account knows which endpoints are this cluster's. The node daemon writes it at start: the
+apiserver `port`, and the `hosts` that name the apiserver. On a server those are its serving
+certificate's names and addresses, loopback, and this Mac's own addresses. On a worker they are the
+host it joined, the apiserver address it uses, and the names on the serving certificate that
+apiserver presents, read over a connection verified against the cluster CA the worker pinned when
+it joined. A kubeconfig context counts as this cluster's when its server's host is in `hosts` and its
+port is `port`. A node older than the record writes none; then a server accepts a loopback address or
+one of this Mac's addresses at port 6444, and a worker accepts the host it joined.
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was

@@ -364,6 +364,9 @@ func provisionServingLeaf(opts serverOptions, cfg *executor.Config, logger *slog
 	// posture.
 	cfg.RootCAFile = certs.ClusterCACertPath(opts.workDir)
 	logLegacyCertDir(opts.workDir, logger)
+	// The hosts that leaf names, published for an unprivileged `k3sm status`
+	// to anchor the user's kubeconfig against.
+	publishServerEndpoints(opts.workDir, opts.apiPort, logger)
 	return nil
 }
 

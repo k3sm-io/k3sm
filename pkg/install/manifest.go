@@ -195,6 +195,10 @@ func artifactManifest(cfg Config) []artifact {
 	// removed after the daemon that reads it has been booted out.
 	// assertExists is false because a data root an older build installed has no
 	// such file until the next install stages one.
+	// The endpoints record either node daemon publishes in the status
+	// directory, REMOVED after that daemon is booted out for the reason the
+	// server's records below are: it describes a node that no longer runs.
+	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), EndpointsRecordName), assertExists: false})
 	if cfg.Role == RoleServer {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
 		// A joining HA server's staged server-class join token, removed for the
