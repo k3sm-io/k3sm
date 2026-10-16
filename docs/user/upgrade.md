@@ -134,32 +134,50 @@ control-plane Mac last unless a release note says otherwise. An HA cluster has i
 A managed update moves the whole cluster to one release through an `Update` object
 (`updates.k3sm.io`), node by node, without a re-run of the installer on each Mac.
 
+### Chain of Trust
+
+The server authorises every update, and a node cannot authorise its own. At every start the server
+mints an update-signing certificate from the cluster CA (`CN=k3sm:update-signer`,
+`O=k3sm:update-signers`, code signing only, held in memory and never written to disk). When it hands
+a node a release, it signs the payload naming that release: the tag, the archive URL, the archive's
+sha256 from the release checksums, the signature policy and the downgrade permission. The node's
+annotations carry the payload (`k3sm.io/update-payload`), the signature
+(`k3sm.io/update-payload-sig`) and the signer certificate (`k3sm.io/update-signer`).
+
+A node can write its own annotations, so the annotations alone prove nothing. The `k3sm-netd` root
+helper, which installs the release as root, checks that the signer chains to the cluster CA it was
+started with (`--cluster-ca`). That CA is the server's own cluster CA certificate on a server, and on
+a worker a root-owned copy `sudo k3sm install` writes from the CA the join token pins. The helper
+also checks the subject and the signature over the exact payload bytes, and that the archive matches
+the signed sha256, before it unpacks or runs anything. Only the holder of the cluster CA key, the
+server, can produce a payload a node will install.
+
 ### On Each Node
 
 Every node daemon, server and agent alike, watches its own Node. When the update reaches it, the
 node:
 
-1. Writes the phase `Downloading` and fetches the release archive over HTTPS from `github.com`
+1. Checks the payload's signature against the cluster CA it pins, and refuses an unsigned payload,
+   one signed by any other CA, or one naming another release than the Node asks for, before it
+   downloads anything. It also refuses a release older than the one it runs unless the update
+   allows a downgrade.
+2. Writes the phase `Downloading` and fetches the release archive over HTTPS from `github.com`
    (following redirects only to `objects.githubusercontent.com` and
    `release-assets.githubusercontent.com`, each one checked), at most 512 MiB and within 10
    minutes, into a fresh directory under `/var/lib/k3sm/updates` that only the `_k3sm` user can
    read. A node installed with `--update-release-base` also accepts that base's own host (below).
-2. Writes `Verifying` and checks the archive's sha256 against the release's published checksum
-   before anything is unpacked. It then unpacks the build set (`k3sm`, `k3sm-execshim`,
-   `k3sm-vmhost`, the two shim dylibs and `cp-payload/`) as regular files only. A link, an
-   absolute or `..` path, or any file outside that set refuses the update; the archive's
-   `LICENSE`, `NOTICE` and `k3sm-netd` are not unpacked. A release older than the one the node
-   runs is refused unless the update allows a downgrade.
-3. Writes `Installing` and hands the unpacked set and its per-file checksums to the `k3sm-netd`
-   root helper, which checks every file again and runs the new `k3sm install --from-staging`.
-   That install updates the node in place: it keeps the node's role, the server a worker joined
-   and every argument the node was installed with.
-4. The signatures follow the installed build. A node installed from a build signed by a
+3. Writes `Verifying` and checks the archive's sha256 against the signed payload.
+4. Writes `Installing` and hands the archive, the payload, its signature and the signer to the
+   `k3sm-netd` root helper. The helper verifies them again (above), unpacks only the build set
+   (`k3sm`, `k3sm-execshim`, `k3sm-vmhost`, the two shim dylibs and `cp-payload/`) as regular
+   files, applies the code-signing policy and the downgrade rule, and only then runs the new
+   `k3sm install --from-staging`. That install updates the node in place: it keeps the node's role,
+   the server a worker joined and every argument the node was installed with.
+5. The signatures follow the installed build. A node installed from a build signed by a
    Developer ID team takes only a release signed by that same team. A node installed from an
    ad-hoc signed build takes an ad-hoc signed release or a team-signed one. Under the `required`
-   signature policy the installer runs with `--require-team-signature` and refuses any release
-   without a Developer ID team signature, whatever the node runs.
-5. Writes `Restarting` while the installer restarts the daemons. The restarted daemon writes
+   signature policy every binary must carry a Developer ID team signature, whatever the node runs.
+6. Writes `Restarting` while the installer restarts the daemons. The restarted daemon writes
    `Done` once it runs the new release and its pod runtime answers, and the node's kubelet
    version reports it.
 
@@ -167,7 +185,9 @@ The node never runs a downloaded binary itself. A refusal or a failed install wr
 with the reason (`kubectl get node <name> -o jsonpath='{.metadata.annotations.k3sm\.io/update-phase}'`),
 and the download directory stays for diagnosis until the next update attempt or the next daemon
 start removes it. A node without the `k3sm-netd` helper, such as a standalone `k3sm node`, does not
-take part.
+take part. A worker that joined before this release has no root-owned CA copy until it is
+installed again (`sudo k3sm install --agent --server <server>`), and until then its helper refuses
+every managed update.
 
 ### Release Base for a Mirror or a Lab
 

@@ -509,7 +509,8 @@ var updateGVR = schema.GroupVersionResource{
 const updateWatchEvery = 2 * time.Second
 
 // updateAnnotationPrefix is the prefix of every Node annotation an update
-// writes: the controller's handover (update-version, update-payload), the
+// writes: the controller's handover (update-version, update-payload,
+// update-payload-sig, update-signer), the
 // node-side's report (update-phase) and the controller's own bookkeeping
 // (update-cordoned, update-handed-over-at, update-ready-at).
 const updateAnnotationPrefix = "k3sm.io/update-"

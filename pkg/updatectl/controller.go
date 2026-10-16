@@ -43,6 +43,7 @@ import (
 
 	crdconfig "k3sm.io/apis/config/crd"
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/crdensure"
 )
 
@@ -84,6 +85,9 @@ type Config struct {
 	CRD crdensure.CRDClient
 	// Resolver resolves the target release. nil means HTTPResolver{}.
 	Resolver Resolver
+	// Signer signs every payload handed to a node: the server's update signer,
+	// minted in memory from the cluster CA (certs.IssueUpdateSigner). Required.
+	Signer *certs.UpdateSigner
 	// ServerNode is the Node this controller runs on. It is updated last.
 	// Required.
 	ServerNode string
@@ -126,6 +130,9 @@ func New(cfg Config) (*Controller, error) {
 	}
 	if cfg.ServerNode == "" {
 		return nil, errors.New("update controller: no server node name")
+	}
+	if cfg.Signer == nil || cfg.Signer.Key == nil || len(cfg.Signer.CertPEM) == 0 {
+		return nil, errors.New("update controller: no update signer, so no payload could be authorised")
 	}
 	if cfg.Resolver == nil {
 		cfg.Resolver = HTTPResolver{}

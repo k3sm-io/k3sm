@@ -1909,7 +1909,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// It returns the operator's join token — the exact bytes it validated and
 	// compared against the endpoint's cluster — so staging writes those and the
 	// file is read once, with no privileged write between the check and the copy.
-	joinToken, err := preflightJoinEndpoint(sys, cfg)
+	joinToken, joinCA, err := preflightJoinEndpoint(sys, cfg)
 	if err != nil {
 		return err
 	}
@@ -2206,6 +2206,12 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     could not place for itself), and after the state tree at 1a because the
 	//     root-only key dir is carved directly under the root-owned data root.
 	if err := provisionMeshKey(sys, cfg, uid); err != nil {
+		return err
+	}
+	// 1g′. On a worker, the root-only copy of the cluster CA its netd checks a
+	//      managed update's signer against (--cluster-ca), beside the mesh key
+	//      in the root-only directory 1g has just ensured.
+	if err := provisionAgentClusterCA(sys, cfg, joinCA); err != nil {
 		return err
 	}
 

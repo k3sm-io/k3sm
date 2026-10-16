@@ -27,6 +27,8 @@ import (
 	"unicode/utf8"
 
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+
+	"k3sm.io/k3sm/pkg/version"
 )
 
 // ErrRefused is the base error of every refusal this package makes before it
@@ -34,8 +36,11 @@ import (
 var ErrRefused = errors.New("update refused")
 
 // Payload is the JSON value of the k3sm.io/update-payload Node annotation the
-// update controller writes.
+// update controller writes and signs (EncodePayload, SignPayload).
 type Payload struct {
+	// Version is the release tag the payload installs; it must equal the
+	// Node's k3sm.io/update-version.
+	Version string `json:"version"`
 	// URL is the darwin/arm64 release archive.
 	URL string `json:"url"`
 	// SHA256 is the archive's lowercase hex sha256.
@@ -63,6 +68,9 @@ func ParsePayload(raw string) (Payload, error) {
 	case "", updatesv1alpha1.UpdateSignatureIfSigned, updatesv1alpha1.UpdateSignatureRequired:
 	default:
 		return Payload{}, fmt.Errorf("%w: unknown signature policy %q", ErrRefused, p.Signature)
+	}
+	if !version.ValidTag(p.Version) {
+		return Payload{}, fmt.Errorf("%w: the payload names no valid release tag", ErrRefused)
 	}
 	if !isSHA256Hex(p.SHA256) {
 		return Payload{}, fmt.Errorf("%w: the payload sha256 is not a lowercase hex sha256", ErrRefused)

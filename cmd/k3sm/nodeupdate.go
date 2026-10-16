@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/url"
 	"path/filepath"
@@ -97,8 +98,12 @@ func productionUpdateDeps(opts nodeOptions, ready func(context.Context) bool) no
 // (the install step is the helper's), or no update root (the standalone
 // `k3sm node`, which no install manages).
 func newNodeUpdater(opts nodeOptions, cs kubernetes.Interface, deps nodeUpdateDeps, logger *slog.Logger) (*update.Watcher, error) {
-	if cs == nil || !opts.netMode.UsesHelper() || opts.updateRoot == "" {
+	if cs == nil || !opts.netMode.UsesHelper() || opts.updateRoot == "" || len(opts.updateClusterCAPEM) == 0 {
 		return nil, nil
+	}
+	roots := update.CAPool(opts.updateClusterCAPEM)
+	if roots == nil {
+		return nil, errors.New("the cluster CA this node pins does not parse")
 	}
 	return update.New(update.Config{
 		Node:        opts.nodeName,
@@ -108,6 +113,7 @@ func newNodeUpdater(opts nodeOptions, cs kubernetes.Interface, deps nodeUpdateDe
 		Fetcher:     deps.fetcher,
 		Netd:        deps.netd,
 		Ready:       deps.ready,
+		ClusterCA:   roots,
 		ReleaseBase: deps.releaseBase,
 		Log:         logger,
 	})

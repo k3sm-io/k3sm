@@ -820,8 +820,10 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		updateRoot:  updateRootFor(opts.workDir),
 		// The recorded release base, which the update watcher's pin admits.
 		updateReleaseBase: opts.updateReleaseBase,
-		logs:              opts.logs,
-		nodeIP:            nodeAddressing.nodeIP,
+		// The server's own cluster CA: the update signer it mints chains to it.
+		updateClusterCAPEM: nodeHierarchy.Cluster.CertPEM,
+		logs:               opts.logs,
+		nodeIP:             nodeAddressing.nodeIP,
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,
 		runtime:     opts.rtName,

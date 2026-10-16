@@ -33,7 +33,9 @@ import (
 func meshKeyCalls(f *fakeSystem, prefix string) []string {
 	var out []string
 	for _, c := range f.calls {
-		if strings.HasPrefix(c, prefix) {
+		// The worker's cluster CA copy shares the root-only directory and is
+		// not a key (TestProvisionAgentClusterCA owns it).
+		if strings.HasPrefix(c, prefix) && !strings.Contains(c, AgentClusterCAPath) {
 			out = append(out, c)
 		}
 	}

@@ -29,25 +29,32 @@ limitations under the License.
 // every k3sm node daemon (server and agent alike) that installs the release
 // the update controller asks its Node for.
 //
-// The controller hands a node over by setting two annotations on it in one
-// patch (updatesv1alpha1.AnnotationUpdateVersion, the release tag, and
-// AnnotationUpdatePayload, a JSON Payload naming the release archive, its
-// sha256, the signature policy and the downgrade permission) and clearing
+// The controller hands a node over in one patch: the release tag
+// (updatesv1alpha1.AnnotationUpdateVersion), the canonical payload naming the
+// release archive, its sha256, the signature policy and the downgrade
+// permission (AnnotationUpdatePayload, EncodePayload), its signature
+// (AnnotationUpdatePayloadSig, SignPayload) by the server's update signer and
+// that signer's certificate (AnnotationUpdateSigner); it clears
 // AnnotationUpdatePhase. The Watcher sees the handover on its own Node and,
 // when the tag is not the build it runs:
 //
-//   - refuses a payload that is malformed, an archive URL that is not https
-//     on github.com, objects.githubusercontent.com or
-//     release-assets.githubusercontent.com, and a tag below the
-//     running build unless the payload allows a downgrade;
+//   - verifies the signature first (VerifySignedPayload): the signer must
+//     chain to the cluster CA this node pins and name the update signer, and
+//     the signature must cover the exact payload bytes. A node can write its
+//     own annotations, so nothing else in them is trusted, and an unsigned
+//     payload is never even downloaded;
+//   - refuses a payload for another tag, an archive URL its HostPin does not
+//     admit, and a tag below the running build unless the payload allows a
+//     downgrade;
 //   - writes Downloading and fetches the archive (at most MaxArchiveBytes,
 //     within DownloadTimeout) into a fresh directory under its own root, a
 //     directory of the data root the service user owns;
-//   - writes Verifying and checks the archive's sha256 against the payload
-//     before a byte of it is unpacked, then extracts the build set (regular
-//     files only, by an exact list of names) and computes its manifest;
-//   - writes Installing and asks the k3sm-netd root helper, through its
-//     ApplyUpdate verb, to install the set, mirroring the phases it streams.
+//   - writes Verifying and checks the archive's sha256 against the payload;
+//   - writes Installing and hands the archive path, the payload, the
+//     signature and the signer to the k3sm-netd root helper's ApplyUpdate
+//     verb, mirroring the phases it streams. The helper verifies the
+//     signature again against its own --cluster-ca, and the archive's digest,
+//     before it unpacks the build set and runs the staged installer.
 //
 // The installer restarts this daemon. The restarted daemon finds its own
 // build on the tag and, once it is fully up (Config.Ready), writes Done; the
@@ -57,9 +64,7 @@ limitations under the License.
 //
 // A refusal or a failed install writes Failed with the reason, and the
 // download directory stays for diagnosis until the next attempt or the next
-// start removes it. Nothing downloaded is ever run by
-// this package: the only binary of the set that runs is the staged k3sm, and
-// the root helper runs it after its own digest check.
+// start removes it. Nothing downloaded is opened or run by this package.
 //
 // The phase annotation reads "<phase>" or "<phase>: <message>", the message
 // at most MaxMessageBytes with control characters removed.

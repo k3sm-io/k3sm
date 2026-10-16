@@ -19,6 +19,7 @@ package update
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -87,6 +88,12 @@ type Config struct {
 	Fetcher Fetcher
 	// Netd installs the build set.
 	Netd Netd
+	// ClusterCA is the cluster CA the update signer must chain to: the node
+	// credential's CA on an agent, the server's own cluster CA on a server.
+	// Required: without it no payload can be authorised.
+	ClusterCA *x509.CertPool
+	// Now is the clock the signer's validity is judged at; nil is time.Now.
+	Now func() time.Time
 	// ReleaseBase is the node's recorded --update-release-base, nil for
 	// GitHub's index: the HostPin admits its host for the archive URL.
 	ReleaseBase *url.URL
@@ -120,6 +127,8 @@ func New(cfg Config) (*Watcher, error) {
 		return nil, errors.New("update: the node name is required")
 	case cfg.Client == nil:
 		return nil, errors.New("update: the API client is required")
+	case cfg.ClusterCA == nil:
+		return nil, errors.New("update: the cluster CA is required: it is what authorises an update")
 	case cfg.Fetcher == nil || cfg.Netd == nil:
 		return nil, errors.New("update: the fetcher and the root helper client are required")
 	case !filepath.IsAbs(cfg.Root) || filepath.Clean(cfg.Root) != cfg.Root:
@@ -206,8 +215,7 @@ func (w *Watcher) Sync(ctx context.Context) error {
 		w.log.Info("update: this node runs the requested release", "version", tag)
 		return w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseDone, "")
 	}
-	raw := n.Annotations[updatesv1alpha1.AnnotationUpdatePayload]
-	key := tag + "\n" + raw
+	key := tag + "\n" + n.Annotations[AnnotationUpdatePayload] + "\n" + n.Annotations[AnnotationUpdatePayloadSig]
 	switch phase {
 	case "":
 	case updatesv1alpha1.UpdateNodePhaseDownloading, updatesv1alpha1.UpdateNodePhaseVerifying:
@@ -219,7 +227,7 @@ func (w *Watcher) Sync(ctx context.Context) error {
 		return nil
 	}
 	w.tried[key] = true
-	return w.attempt(ctx, tag, raw)
+	return w.attempt(ctx, tag, n.Annotations)
 }
 
 // onTarget reports whether the running build is tag, by the measure the
@@ -230,14 +238,19 @@ func (w *Watcher) onTarget(tag string) bool {
 	return w.cfg.Running.NodeVersion() == want.NodeVersion()
 }
 
-// attempt runs one update of this node to tag. A refusal or a failure writes
-// Failed; a stop of this daemon (ctx ending) writes nothing, because the
-// restarted daemon judges the outcome.
-func (w *Watcher) attempt(ctx context.Context, tag, raw string) error {
+// attempt runs one update of this node to tag. The signature is checked
+// before anything else, so a payload the server did not sign is never even
+// downloaded. A refusal or a failure writes Failed; a stop of this daemon (ctx
+// ending) writes nothing, because the restarted daemon judges the outcome.
+func (w *Watcher) attempt(ctx context.Context, tag string, ann map[string]string) error {
 	log := w.log.With("version", tag)
-	p, err := ParsePayload(raw)
+	signed, err := VerifySignedPayload(w.cfg.ClusterCA, []byte(ann[AnnotationUpdatePayload]), ann[AnnotationUpdatePayloadSig], ann[AnnotationUpdateSigner], w.now())
 	if err != nil {
 		return w.fail(ctx, log, err, "")
+	}
+	p := signed.Payload
+	if p.Version != tag {
+		return w.fail(ctx, log, fmt.Errorf("%w: the signed payload installs %s, the Node asks for %s", ErrRefused, p.Version, tag), "")
 	}
 	if err := (HostPin{Base: w.cfg.ReleaseBase}).CheckRaw(p.URL); err != nil {
 		return w.fail(ctx, log, err, "")
@@ -263,32 +276,25 @@ func (w *Watcher) attempt(ctx context.Context, tag, raw string) error {
 		return w.fail(ctx, log, err, "")
 	}
 
+	// The root helper re-checks the digest on its own copy; checking it here
+	// too fails a bad download without a root round trip.
 	if err := w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseVerifying, ""); err != nil {
 		return err
 	}
 	if sum != p.SHA256 {
-		return w.fail(ctx, log, fmt.Errorf("%w: the archive's sha256 is %s, the release publishes %s", ErrRefused, sum, p.SHA256), "")
-	}
-	set := filepath.Join(dir, setDirName)
-	if err := os.Mkdir(set, 0o700); err != nil {
-		return w.fail(ctx, log, fmt.Errorf("create %s: %w", set, err), "")
-	}
-	manifest, err := ExtractSet(archive, set)
-	if err != nil {
-		return w.fail(ctx, log, err, "")
+		return w.fail(ctx, log, fmt.Errorf("%w: the archive's sha256 is %s, the signed payload says %s", ErrRefused, sum, p.SHA256), "")
 	}
 
 	if err := w.setPhase(ctx, updatesv1alpha1.UpdateNodePhaseInstalling, ""); err != nil {
 		return err
 	}
-	log.Info("update: handing the verified build set to the root helper")
+	log.Info("update: handing the signed payload and the archive to the root helper")
 	m := newPhaseMirror(updatesv1alpha1.UpdateNodePhaseInstalling)
 	res, err := w.cfg.Netd.ApplyUpdate(ctx, wire.ApplyUpdateArgs{
-		SourceDir:            set,
-		Manifest:             manifest,
-		Version:              tag,
-		AllowDowngrade:       p.AllowDowngrade,
-		RequireTeamSignature: p.RequireTeamSignature(),
+		ArchivePath: archive,
+		Payload:     signed.Raw,
+		Signature:   signed.Signature,
+		SignerCert:  signed.SignerPEM,
 	}, func(ph wire.UpdatePhase) {
 		if next, ok := m.advance(ph); ok {
 			if err := w.setPhase(ctx, next, ""); err != nil {
@@ -307,6 +313,13 @@ func (w *Watcher) attempt(ctx context.Context, tag, raw string) error {
 		return w.setPhase(ctx, next, "")
 	}
 	return nil
+}
+
+func (w *Watcher) now() time.Time {
+	if w.cfg.Now != nil {
+		return w.cfg.Now()
+	}
+	return time.Now()
 }
 
 // phaseMirror maps the root helper's streamed phases onto the node phase,

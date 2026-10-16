@@ -2335,23 +2335,29 @@ func TestAgentInstallRendersNetdWithTheNodeIdentity(t *testing.T) {
 		// wantKubeconfig is the exact --kubeconfig value the rendered argv must
 		// carry; forbid, when non-empty, is a substring no argv element may hold.
 		wantKubeconfig string
-		forbid         string
+		// wantClusterCA is the --cluster-ca a managed update's signer must
+		// chain to: the server's own PKI copy, a worker's root-only copy.
+		wantClusterCA string
+		forbid        string
 	}{
 		{
 			name:           "agent is handed its own node credential",
 			cfg:            Config{Role: RoleAgent, DataRoot: dataRoot},
 			wantKubeconfig: AgentCredentialPath(dataRoot),
+			wantClusterCA:  AgentClusterCAPath,
 			forbid:         serverWork,
 		},
 		{
 			name:           "server keeps the control-plane kubeconfig",
 			cfg:            Config{Role: RoleServer, DataRoot: dataRoot},
 			wantKubeconfig: filepath.Join(serverWork, "k3sm.kubeconfig"),
+			wantClusterCA:  filepath.Join(serverWork, "tls", "cluster-ca.crt"),
 		},
 		{
 			name:           "the zero-value role is the server",
 			cfg:            Config{DataRoot: dataRoot},
 			wantKubeconfig: filepath.Join(serverWork, "k3sm.kubeconfig"),
+			wantClusterCA:  filepath.Join(serverWork, "tls", "cluster-ca.crt"),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2361,6 +2367,9 @@ func TestAgentInstallRendersNetdWithTheNodeIdentity(t *testing.T) {
 			}
 			if got := flagValue(args, "kubeconfig"); got != tc.wantKubeconfig {
 				t.Errorf("netd --kubeconfig = %q, want %q (argv: %v)", got, tc.wantKubeconfig, args)
+			}
+			if got := flagValue(args, "cluster-ca"); got != tc.wantClusterCA {
+				t.Errorf("netd --cluster-ca = %q, want %q (argv: %v)", got, tc.wantClusterCA, args)
 			}
 			if tc.forbid != "" {
 				for _, a := range args {

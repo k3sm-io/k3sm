@@ -290,6 +290,10 @@ type nodeOptions struct {
 	// updateReleaseBase is the daemon's --update-release-base (validated), the
 	// extra host the update watcher's pin admits; empty is GitHub's only.
 	updateReleaseBase string
+	// updateClusterCAPEM is the cluster CA a managed update's signer must
+	// chain to: the server's own, or the one a worker's credential pins. Empty
+	// runs no update watcher.
+	updateClusterCAPEM []byte
 }
 
 // nodeKubeletListen is the standalone `k3sm node` --listen default

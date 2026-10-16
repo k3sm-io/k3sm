@@ -112,6 +112,10 @@ type Options struct {
 	// netd.Config.IdentityPath empty), which is the same fail-quiet posture netd
 	// applies to an unreadable file.
 	MeshKeyDir string
+	// ClusterCAPath is the cluster CA certificate a managed update's signer
+	// must chain to (`k3sm netd --cluster-ca`): the server's own PKI copy, or a
+	// worker's root-only copy. Empty makes the daemon refuse every ApplyUpdate.
+	ClusterCAPath string
 	// Logger is the structured logger threaded into the daemon; nil uses
 	// slog.Default via netd.NewServer.
 	Logger *slog.Logger
@@ -144,7 +148,8 @@ func BuildConfig(opts Options) (netd.Config, error) {
 			NodePodCIDR:        NodePodCIDRInForce(NodeIdentityPath(opts.MeshKeyDir), opts.NodePodCIDR),
 			VMPodPorts:         opts.VMPodPorts,
 		}),
-		Logger: opts.Logger,
+		ClusterCAPath: opts.ClusterCAPath,
+		Logger:        opts.Logger,
 	}
 	if opts.MeshKeyDir != "" {
 		cfg.MeshKeyResolver = MeshKeyResolver(opts.MeshKeyDir)

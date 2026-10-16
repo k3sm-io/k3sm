@@ -128,6 +128,7 @@ func NetdPlist(cfg Config) []byte {
 		"--service-cidr", cfg.ServiceCIDR,
 		"--mesh-key-dir", MeshKeyDir,
 		"--kubeconfig", kubeconfig,
+		"--cluster-ca", cfg.netdClusterCAPath(),
 	}
 	if cidr := cfg.netdNodePodCIDR(); cidr != "" {
 		args = append(args, "--node-pod-cidr", cidr)

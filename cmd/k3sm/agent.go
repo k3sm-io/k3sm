@@ -776,8 +776,11 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		updateRoot:  updateRootFor(opts.workDir),
 		// The recorded release base, which the update watcher's pin admits.
 		updateReleaseBase: opts.updateReleaseBase,
-		logs:              opts.logs,
-		nodeIP:            agentInternalIP(res),
+		// The cluster CA this worker's credential pins: an update's signer
+		// must chain to it.
+		updateClusterCAPEM: res.ClusterCAPEM,
+		logs:               opts.logs,
+		nodeIP:             agentInternalIP(res),
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,
 		runtime:     opts.rtName,

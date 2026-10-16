@@ -37,6 +37,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/addons"
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
@@ -598,6 +599,21 @@ func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Co
 // own Lease, so one server of an HA control plane rolls at a time. Same
 // lifetime as the MLX operator: drained before the control plane stops. A
 // client or controller that cannot be built is logged and stop is noStop.
+// mintUpdateSigner issues this start's update signer from the cluster CA, in
+// memory: the identity whose signature authorises every managed update a node
+// installs. It loads the hierarchy the way the server node's identity does
+// (EnsureHierarchy loads the existing CAs in every posture).
+func mintUpdateSigner(opts serverOptions) (*certs.UpdateSigner, error) {
+	h, err := certs.EnsureHierarchy(opts.workDir, opts.role(), opts.posture())
+	if err != nil {
+		return nil, fmt.Errorf("load the CA hierarchy: %w", err)
+	}
+	if h.Cluster == nil || h.Cluster.Key == nil {
+		return nil, errors.New("this server holds no cluster CA key")
+	}
+	return h.Cluster.IssueUpdateSigner()
+}
+
 // updateResolver is the controller's release resolver, reading the recorded
 // --update-release-base when set and GitHub's index otherwise.
 func updateResolver(rawBase string) updatectl.HTTPResolver {
@@ -615,12 +631,18 @@ func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.C
 		logger.Error("update controller disabled: build its apiextensions client", "err", err)
 		return noStop
 	}
+	signer, err := mintUpdateSigner(plan.opts)
+	if err != nil {
+		logger.Error("update controller disabled: mint the update signer", "err", err)
+		return noStop
+	}
 	c, err := updatectl.New(updatectl.Config{
 		Client:     cs,
 		Dynamic:    dyn,
 		CRD:        crd,
 		ServerNode: plan.opts.nodeName,
 		Resolver:   updateResolver(plan.opts.updateReleaseBase),
+		Signer:     signer,
 		Log:        logger,
 	})
 	if err != nil {
