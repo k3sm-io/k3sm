@@ -237,14 +237,14 @@ func TestUserKubeContext(t *testing.T) {
 		want string
 		ok   bool
 	}{
-		{"the k3sm context on the joined host wins", cfg("other", map[string]string{"k3sm": "https://192.168.0.50:6444", "other": "https://192.168.0.50:6445"}), "192.168.0.50", "k3sm", true},
-		{"a k3sm context pointing at another host yields no context", cfg("k3sm", map[string]string{"k3sm": "https://10.0.0.9:6444"}), "192.168.0.50", "", false},
-		{"a k3sm context elsewhere falls to an anchored current context", cfg("lab", map[string]string{"k3sm": "https://10.0.0.9:6444", "lab": "https://192.168.0.50:6444"}), "192.168.0.50", "lab", true},
-		{"the current context on the joined host", cfg("lab", map[string]string{"lab": "https://192.168.0.50:6444"}), "192.168.0.50:9345", "lab", true},
+		{"the k3sm context on the joined host wins", cfg("other", map[string]string{"k3sm": "https://192.0.2.50:6444", "other": "https://192.0.2.50:6445"}), "192.0.2.50", "k3sm", true},
+		{"a k3sm context pointing at another host yields no context", cfg("k3sm", map[string]string{"k3sm": "https://10.0.0.9:6444"}), "192.0.2.50", "", false},
+		{"a k3sm context elsewhere falls to an anchored current context", cfg("lab", map[string]string{"k3sm": "https://10.0.0.9:6444", "lab": "https://192.0.2.50:6444"}), "192.0.2.50", "lab", true},
+		{"the current context on the joined host", cfg("lab", map[string]string{"lab": "https://192.0.2.50:6444"}), "192.0.2.50:9345", "lab", true},
 		{"a join server given as a URL", cfg("lab", map[string]string{"lab": "https://studio.example:6444"}), "https://Studio.example:9345", "lab", true},
-		{"the current context on another cluster", cfg("work", map[string]string{"work": "https://10.0.0.9:6443"}), "192.168.0.50", "", false},
-		{"no join server to compare with", cfg("lab", map[string]string{"lab": "https://192.168.0.50:6444"}), "", "", false},
-		{"no kubeconfig", nil, "192.168.0.50", "", false},
+		{"the current context on another cluster", cfg("work", map[string]string{"work": "https://10.0.0.9:6443"}), "192.0.2.50", "", false},
+		{"no join server to compare with", cfg("lab", map[string]string{"lab": "https://192.0.2.50:6444"}), "", "", false},
+		{"no kubeconfig", nil, "192.0.2.50", "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, ok := UserKubeContext(tc.cfg, "k3sm", JoinAnchor(tc.join))
@@ -260,17 +260,17 @@ func TestUserKubeContext(t *testing.T) {
 func TestServerAnchor(t *testing.T) {
 	anchor := ServerAnchor(6444, []netip.Addr{netip.MustParseAddr("100.64.0.1")})
 	for server, want := range map[string]bool{
-		"https://127.0.0.1:6444":    true,
-		"https://localhost:6444":    true,
-		"https://[::1]:6444":        true,
-		"https://100.64.0.1:6444":   true,
-		"https://127.0.0.1:6443":    false,
-		"https://100.64.0.1:443":    false,
-		"https://100.64.0.1":        false,
-		"https://100.64.0.9:6444":   false,
-		"https://studio.lan:6444":   false,
-		"https://192.168.0.50:6444": false,
-		"":                          false,
+		"https://127.0.0.1:6444":  true,
+		"https://localhost:6444":  true,
+		"https://[::1]:6444":      true,
+		"https://100.64.0.1:6444": true,
+		"https://127.0.0.1:6443":  false,
+		"https://100.64.0.1:443":  false,
+		"https://100.64.0.1":      false,
+		"https://100.64.0.9:6444": false,
+		"https://studio.lan:6444": false,
+		"https://192.0.2.50:6444": false,
+		"":                        false,
 	} {
 		if got := anchor(server); got != want {
 			t.Errorf("ServerAnchor(%q) = %v, want %v", server, got, want)
@@ -291,8 +291,8 @@ func TestEndpointsRecordAnchorsTheContext(t *testing.T) {
 		c.CurrentContext = "k3sm"
 		return c
 	}
-	join := JoinAnchor("192.168.0.50")
-	rec := &EndpointsRecord{Port: 6444, Hosts: []string{"192.168.0.50", "100.64.0.1", "kubernetes.default.svc"}}
+	join := JoinAnchor("192.0.2.50")
+	rec := &EndpointsRecord{Port: 6444, Hosts: []string{"192.0.2.50", "100.64.0.1", "kubernetes.default.svc"}}
 
 	if _, ok := UserKubeContext(kubeconfig("https://100.64.0.1:6444"), "k3sm", NodeAnchor(nil, join)); ok {
 		t.Fatal("without the record the mesh address was accepted; this case proves nothing")
@@ -304,13 +304,13 @@ func TestEndpointsRecordAnchorsTheContext(t *testing.T) {
 		ok     bool
 	}{
 		{"the mesh address the record names", rec, "https://100.64.0.1:6444", true},
-		{"the join address the record names", rec, "https://192.168.0.50:6444", true},
+		{"the join address the record names", rec, "https://192.0.2.50:6444", true},
 		{"a DNS SAN the record names", rec, "https://Kubernetes.Default.Svc:6444", true},
 		{"a host outside the record", rec, "https://10.0.0.9:6444", false},
 		{"a named host outside the record", rec, "https://other.example:6444", false},
 		{"the right host on another port", rec, "https://100.64.0.1:6443", false},
 		{"a non-default port the record carries", &EndpointsRecord{Port: 7444, Hosts: []string{"127.0.0.1"}}, "https://127.0.0.1:7444", true},
-		{"a missing record falls back to the join host", nil, "https://192.168.0.50:6444", true},
+		{"a missing record falls back to the join host", nil, "https://192.0.2.50:6444", true},
 		{"a missing record still refuses the mesh address", nil, "https://100.64.0.1:6444", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
