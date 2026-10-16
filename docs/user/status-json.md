@@ -259,11 +259,22 @@ pinned backend. Each report lists every Service and every EndpointSlice once fro
 a script that polls the full report pays for those two lists on every poll; poll the daemons probe
 when that is all you need.
 
-The `update` row appears on an installed server. It reports whether every node runs the latest k3sm
+The `update` row appears on an installed server and an installed worker. It reports whether every node runs the latest k3sm
 release, from the record the last update check left (see [Upgrade](upgrade.md#checking-for-an-update)).
 The server checks at most once an hour and `sudo k3sm update check` checks on demand; the report itself
 never contacts GitHub. The record is `/var/lib/k3sm/status/update.json` (mode 0644), so any account
 reads the row. Its `state` is:
+
+On a worker the row is read-only. After each check a server publishes the latest release and when it
+checked on its own Node (the `k3sm.io/release-latest` and `k3sm.io/release-checked` annotations),
+and the worker's report reads them from the node list, so it compares every node with the same
+release the server does; `wide.record` is `node/<server>`. Only a control-plane Node's annotations
+count, and with more than one server the most recent check wins. The row offers no check remedy,
+since a worker cannot refresh the server's record. When the report cannot list nodes (the apiserver
+does not answer, or the credential it reads with may not list them) or no server has published a
+check yet, the row is `unknown` and `detail` says why.
+
+The row's `state` is:
 
 - `ok` when every node's kubelet reports the latest release.
 - `behind` (severity `warn`) when a node runs an older release. `detail` names each such node and the
@@ -278,7 +289,8 @@ reads the row. Its `state` is:
   k3sm v0.2.0: Rolling, node laptop Installing`. `wide.target` is the release, `wide.phase` the
   update's phase (`Pending` before the first node starts), `wide.node` and `wide.node-phase` the node
   being updated and its step (omitted before the first node starts), and `wide.observed` when the
-  server last read the update. There is no remedy and the verdict does not move. A roll the server
+  server last read the update. `wide.latest` is the latest release the last check found, when it
+found one. There is no remedy and the verdict does not move. A roll the server
   has not refreshed for five minutes (the server is down, say) is no longer reported, and the row
   falls back to the check's state. Once the update finishes the row returns to the check's state.
 - `unknown` when the last check could not finish (`detail` carries its error, first line only and

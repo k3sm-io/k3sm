@@ -691,3 +691,68 @@ func TestUpdateRecorderRecordsTheRoll(t *testing.T) {
 		t.Errorf("clearing the roll lost the check: %+v", rec)
 	}
 }
+
+// TestUpdateRecorderPublishesTheLatestOnItsNode is the server half of a
+// worker's update row: after a check the recorder merge-patches the latest
+// release and when it was checked onto the server's own Node, keeping every
+// other annotation, and a worker's status reads that pair back through the
+// node list (status.PublishedUpdateRecord). A failed check publishes nothing.
+func TestUpdateRecorderPublishesTheLatestOnItsNode(t *testing.T) {
+	wd := installedWorkDir(t)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:        "studio",
+		Labels:      map[string]string{"node-role.kubernetes.io/control-plane": ""},
+		Annotations: map[string]string{"k3sm.io/update-phase": "Done"},
+	}}
+	cs := fake.NewClientset(node)
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		updateRecorder{
+			workDir: wd,
+			check: func(context.Context) (update.Report, error) {
+				return update.Report{CheckedAt: now, Latest: update.Release{Tag: "v0.2.0"}, Installed: "0.1.7", Nodes: []update.Node{}}, nil
+			},
+			interval:  time.Hour,
+			rollEvery: time.Millisecond,
+			now:       func() time.Time { return now },
+			logger:    slog.New(slog.DiscardHandler),
+			publish:   nodeAnnotationPublisher(cs, "studio"),
+		}.run(ctx)
+	}()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	var got *corev1.Node
+	for {
+		n, err := cs.CoreV1().Nodes().Get(context.Background(), "studio", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n.Annotations[status.NodeReleaseLatestAnnotation] != "" {
+			got = n
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the latest release was never published: %v", n.Annotations)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	want := map[string]string{
+		"k3sm.io/update-phase":              "Done",
+		status.NodeReleaseLatestAnnotation:  "v0.2.0",
+		status.NodeReleaseCheckedAnnotation: "2026-10-15T12:00:00Z",
+	}
+	if !sameAnnotations(got.Annotations, want) {
+		t.Errorf("annotations = %v, want %v", got.Annotations, want)
+	}
+	rec, server, ok := status.PublishedUpdateRecord([]corev1.Node{*got})
+	if !ok || server != "studio" || rec.Latest != "v0.2.0" || !rec.CheckedAt.Equal(now) {
+		t.Errorf("PublishedUpdateRecord = %+v, %q, %v", rec, server, ok)
+	}
+	if nodeAnnotationPublisher(nil, "studio") != nil || nodeAnnotationPublisher(cs, "") != nil {
+		t.Error("a publisher with no client or no Node name publishes")
+	}
+}

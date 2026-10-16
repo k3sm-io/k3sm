@@ -86,6 +86,12 @@
       "detail": "not this node's: the control plane's datastore lives on another Mac"
     },
     {
+      "name": "update",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "this Mac cannot read the latest release the server recorded: no cluster client this account may use"
+    },
+    {
       "name": "kubeconfig",
       "state": "missing",
       "severity": "warn",

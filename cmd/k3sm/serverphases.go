@@ -584,7 +584,7 @@ func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Co
 	} else {
 		dyn = d
 	}
-	go runUpdateRecorder(ctx, plan.opts.workDir, releaseBaseURL(plan.opts.updateReleaseBase), cs, dyn, logger)
+	go runUpdateRecorder(ctx, plan.opts.workDir, plan.opts.nodeName, releaseBaseURL(plan.opts.updateReleaseBase), cs, dyn, logger)
 	stopUpdates := startUpdateController(ctx, plan, restCfg, cs, logger)
 	return mlxGPU, func() {
 		stopUpdates()
