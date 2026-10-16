@@ -366,14 +366,12 @@ verify_manifest() {
 # This script pins the toolchain that build runs under, proves the staged binaries
 # are the pinned builds, and records how they were built in the manifest header.
 
-# The Go toolchain the payload's source-built children are built with. `k3sm
-# payload` runs those builds with GOTOOLCHAIN=local, so the go on PATH is the
-# compiler; staging refuses any other version before it builds anything. Bump it
-# deliberately, with the Go toolchain the repos move to.
-PAYLOAD_GO_VERSION="go1.27.2"
-
-# The go command the toolchain assert asks. Overridable for the self-test only.
-GO="${GO:-go}"
+# The Go toolchain pin and the out-of-module build checks (toolchain_problems,
+# buildinfo_problems, buildinfo_settings, marker_problems) live in ONE sourced
+# library, shared with every other recipe that builds a pinned module outside
+# k3sm's go.mod (hack/images/metrics-server/build.sh). Never copy them.
+# shellcheck source=hack/release/lib/gochild.sh
+. "$HERE/lib/gochild.sh"
 
 # read_pins: KINE_VERSION, ETCD_VERSION, KINE_VARIANT, ETCD_VARIANT and KINE_PATCH
 # (the patch-set id, "none" without one), ZOT_VERSION and ZOT_VARIANT, and
@@ -400,56 +398,6 @@ read_pins() {
 	HELM_BINARY="helm-$HELM_VERSION"
 }
 
-# toolchain_problems <pin>: non-zero, naming the problem, unless `go env GOVERSION`
-# under GOTOOLCHAIN=local (the setting the payload builds run under) is <pin>.
-toolchain_problems() {
-	local want="$1" got
-	got="$(GOTOOLCHAIN=local "$GO" env GOVERSION 2>/dev/null)" || { echo "no usable go toolchain on PATH (the payload pins $want)"; return 1; }
-	[ "$got" = "$want" ] || { echo "the go on PATH is $got; the payload's kine and etcd builds pin $want (PAYLOAD_GO_VERSION): put $want first on PATH"; return 1; }
-}
-
-# buildinfo_problems <kind> <want-version> <go-pin>  (stdin: `go version -m` text)
-# The build stamp of one staged child, from the build info Go records in the binary
-# (read, never executed): the toolchain, the main package, the pinned module version
-# (etcd: the server module; etcdutl and zot: their own; kine: built from patched
-# source, so its version is the marker's and the stamped string's), no replaced
-# module, and the build settings: CGO_ENABLED=0, darwin/arm64, and -trimpath for
-# all but zot (registrysvc builds it with a plain `go install`). Prints one line
-# per problem; returns 0 only when there are none.
-buildinfo_problems() {
-	local kind="$1" want="$2" pin="$3" text path mod gov bad=0
-	text="$(cat)"
-	case "$kind" in
-	kine) path="github.com/k3s-io/kine"; mod="" ;;
-	etcd) path="k3sm.io/etcd-child"; mod="go.etcd.io/etcd/server/v3" ;;
-	etcdutl) path="go.etcd.io/etcd/etcdutl/v3"; mod="go.etcd.io/etcd/etcdutl/v3" ;;
-	zot) path="zotregistry.dev/zot/v2/cmd/zot"; mod="zotregistry.dev/zot/v2" ;;
-	*) echo "unknown child $kind"; return 1 ;;
-	esac
-	local settings="CGO_ENABLED=0 -trimpath=true GOOS=darwin GOARCH=arm64"
-	[ "$kind" = zot ] && settings="CGO_ENABLED=0 GOOS=darwin GOARCH=arm64"
-	problem() { echo "$kind: $*"; bad=1; }
-	gov="$(printf '%s\n' "$text" | sed -n '1s/^.*: \(go[0-9][^[:space:]]*\)$/\1/p')"
-	[ "$gov" = "$pin" ] || problem "built with '${gov:-?}', the payload pins $pin"
-	printf '%s\n' "$text" | grep -qx "[[:space:]]*path[[:space:]]$path" || problem "main package is not $path"
-	if [ -n "$mod" ]; then
-		printf '%s\n' "$text" | grep -Eq "^[[:space:]]*(mod|dep)[[:space:]]${mod}[[:space:]]${want}([[:space:]]|\$)" || problem "module $mod is not at $want"
-		printf '%s\n' "$text" | grep -Eq "^[[:space:]]*=>" && problem "a module is replaced"
-	fi
-	local setting
-	for setting in $settings; do
-		printf '%s\n' "$text" | grep -qx "[[:space:]]*build[[:space:]]$setting" || problem "build setting $setting is missing"
-	done
-	unset -f problem
-	return "$bad"
-}
-
-# buildinfo_settings: the `build` lines of `go version -m` text on stdin, as one
-# space-separated line (the manifest's record of how a child was built).
-buildinfo_settings() {
-	sed -n 's/^[[:space:]]*build[[:space:]]\(.*\)$/\1/p' | tr '\n' ' ' | sed 's/ $//'
-}
-
 # child_problems <payload-dir> <go-pin>: the staged kine, etcd, etcdutl and zot are
 # the pinned builds: each marker names the pin and variant, each build info passes
 # buildinfo_problems against <go-pin>, and kine carries its stamped version (pin+patch set) in its
@@ -464,8 +412,7 @@ child_problems() {
 		*) want="$ETCD_VERSION"; variant="$ETCD_VARIANT" ;;
 		esac
 		[ -f "$dir/$kind" ] || { echo "$kind: not staged in $dir"; bad=1; continue; }
-		[ "$(cat "$dir/$kind.version" 2>/dev/null)" = "$want $variant" ] ||
-			{ echo "$kind: marker $kind.version is not '$want $variant'"; bad=1; }
+		marker_problems "$dir" "$kind" "$want" "$variant" || bad=1
 		"$GO" version -m "$dir/$kind" 2>/dev/null | buildinfo_problems "$kind" "$want" "$pin" || bad=1
 	done
 	if [ -f "$dir/kine" ] && [ "$KINE_PATCH" != none ] && ! grep -aqF -- "$KINE_VERSION+$KINE_PATCH" "$dir/kine"; then

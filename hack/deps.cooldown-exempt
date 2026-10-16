@@ -11,4 +11,4 @@
 #
 # The reason is required. Delete a line once its version is older than the
 # cooldown; the script prints a note for every line that no longer matches.
-golang.org/x/net v0.60.0 x/net v0.60.0 adopted 2026-10-09 for GO-2026-6611/6612/6617; supply-chain audit 2026-10-11 (two blind auditors + per-module third opinion) found it byte-identical to the upstream tag
+golang.org/x/net v0.60.0 x/net v0.60.0 adopted 2026-10-09 for GO-2026-6611/6612/6617; supply-chain audit 2026-10-11 (two blind auditors + per-module third opinion) found it byte-identical to the upstream tag; also the security fix for GO-2026-6617, 6612, 6611, 6603 (HTTP/2 server DoS reachable on the metrics-server serving path) in hack/images/metrics-server/go.mod

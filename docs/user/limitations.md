@@ -18,25 +18,38 @@ are **not** more optimistic than the profile.
   namespaces**, and no device-plugins or hugepages. Anything that assumes those substrates does not
   apply.
 - The resource model is best-effort. There is **no CFS millicore CPU enforcement** on the native
-  path, so CPU `limits` are not enforced and `HPA`-on-CPU is **unservable**. Memory is sampled
+  path, so CPU `limits` are not enforced. `HPA` on CPU is **served but advisory**: the
+  usage-to-request ratio it scales on is not millicore-faithful, because no CPU quota holds a Pod to
+  its request. Memory is sampled
   (`proc_pid_rusage`) and can drive OOMKill, but this is best-effort, not cgroup enforcement. Under
   node memory pressure k3sm evicts one Pod at a time, ranked as the kubelet ranks them (see
   [Memory Pressure and Eviction](#memory-pressure-and-eviction)).
   The **`vm` RuntimeClass differs**. A guest is a real Linux kernel, so each container gets a cgroup2
   leaf, and a `vm` Pod's CPU and memory figures come from it. A `vm` Pod's memory ceiling is still the
   guest's whole-VM size rather than a per-container limit. See [`vm` RuntimeClass](vm-runtimeclass.md).
-- `kubectl top pod` reads the `metrics.k8s.io` API, which metrics-server serves. k3sm ships
-  metrics-server as an add-on and applies it on a server installed with `--mesh-ip` once a node in the
-  cluster can run `vm` Pods, because metrics-server is a Linux image and its scrape verifies the
-  kubelet certificate the cluster CA issues. A single-node server without `--mesh-ip` does not run
-  it, so `kubectl top` has no data there. Where it runs, a native Pod's figures are the CPU time and
-  memory footprint its processes used, read with `proc_pid_rusage`. These are usage figures, and k3sm
-  enforces no CPU quota against them.
-  `kubectl top node` reports host-wide usage, so a node's figures include processes k3sm did not
-  start and can exceed its allocatable. On a multi-node cluster a worker's row shows `<unknown>` in
-  every column, because metrics-server, running in a `vm` Pod, cannot reach another node over the
-  mesh. If a
+- `kubectl top` reads the `metrics.k8s.io` API, which metrics-server serves. k3sm ships
+  metrics-server as an add-on, built natively for darwin/arm64, and applies it on a server installed
+  with `--mesh-ip`, because its scrape verifies the kubelet certificate the cluster CA issues. A
+  single-node server without `--mesh-ip` does not run it, so `kubectl top` has no data there. Where it
+  runs, a native Pod's figures are the CPU time and memory footprint its processes used, read with
+  `proc_pid_rusage`. These are usage figures, and k3sm enforces no CPU quota against them.
+  `kubectl top node` has a row for every Ready node, workers included. The figures are host-wide, so
+  they include processes k3sm did not start and can exceed the node's allocatable. If a
   metrics-server you installed yourself already serves the API, k3sm leaves it alone.
+- metrics-server runs as a native Pod, and only on server nodes: its Deployment requires the
+  `node-role.kubernetes.io/control-plane=true` label, which each server sets on its own Node. This is
+  a stated exception to the rule that untrusted workloads go in the `vm` RuntimeClass. Native Pods on
+  one node share a trust domain, and metrics-server's ServiceAccount token can list and watch every
+  Node and Pod in the cluster and read each node's resource metrics (`nodes/metrics`). The Seatbelt
+  profile keeps other Pods from reading the token file, and pinning to server nodes keeps the token
+  off workers. Run untrusted workloads on a server node in the `vm` RuntimeClass.
+- metrics-server's data crosses two TLS connections. It scrapes each node's kubelet port at the
+  Node's `InternalIP`, which is the mesh address on a joined node. It verifies the kubelet
+  certificate against the cluster CA, and it authenticates with its token, which the node checks
+  with a TokenReview and a `nodes/metrics` access review. The apiserver reaches metrics-server
+  through its Service, and the APIService keeps upstream's `insecureSkipTLSVerify: true`, so the
+  apiserver does not verify metrics-server's certificate on that connection. The apiserver does
+  authenticate itself to metrics-server with its proxy client certificate.
 - Workloads must be adapted. A raw upstream `[Conformance]` Pod, one that assumes a Linux image,
   bind mounts, or Linux-only fields, is rejected at admission or stranded. Images are the k3sm native
   image model (see [Images](images.md)), not arbitrary OCI Linux images.

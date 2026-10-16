@@ -22,7 +22,8 @@ limitations under the License.
 // an unstructured object, and server-side-applies it with a stable k3sm field
 // manager. The production tree holds one add-on today, metrics-server
 // (manifests/metrics-server.yaml: upstream v0.9.0, its RBAC verbatim, the
-// Deployment adapted to run the Linux image as a vm pod on a Darwin node), so a
+// Deployment adapted to run k3sm's native darwin/arm64 build of it as a native pod
+// on a server node), so a
 // server where it can serve issues one apply per object in that file on every start
 // (§ Gated add-ons).
 //
@@ -167,15 +168,12 @@ limitations under the License.
 //
 // Every skip logs its reason at Info: once in Converge, and in Regate when it changes.
 //
-// metrics-server's requirement is two facts. The kubelet serving certs chain to the CA
-// in kube-root-ca.crt: the mesh serving posture, inferred by the server from its
+// metrics-server's requirement is one fact: the kubelet serving certs chain to the CA
+// in kube-root-ca.crt, the mesh serving posture, inferred by the server from its
 // mesh-provisioned cluster-CA serving pair (on a single-node server the kubelet cert
-// is self-signed and the verified scrape fails). And at least one Node carries the vm
-// RuntimeClass label (k3sm.io/virtualization=true), since the image is Linux; that is
-// a cluster fact, so a server that cannot host guests still applies it for a
-// vm-capable worker. "No vm node" counts only as positive evidence: the read showed at
-// least one Node and none labelled. Zero Nodes (the first start of a fresh cluster, or
-// a stale LIST) is undecided.
+// is self-signed and the verified scrape fails). The image is native darwin/arm64, so
+// no node capability is required. A Node read still guards the decision: zero Nodes
+// (the first start of a fresh cluster, or a stale LIST) or a failed read is undecided.
 //
 // # Re-evaluation after start (Regate)
 //
@@ -183,16 +181,14 @@ limitations under the License.
 // the mesh serving posture the server then runs Regate for the life of its process:
 // every RegateInterval (2 minutes) it re-reads the posture and re-decides the gated
 // files only, applying one as soon as its requirement holds and its guard allows it.
-// A fresh multi-node cluster therefore gets metrics-server within one interval of a
-// vm-capable node registering, with no restart. Everything else stays converge-only.
+// A fresh multi-node cluster therefore gets metrics-server within one interval of its
+// first node registering, with no restart. Everything else stays converge-only.
 //
 //   - A gated file applied in full, at start or by a tick, is done: the loop stops
 //     touching it, and returns when no gated file is left.
 //   - Regate withdraws only after two consecutive ticks, one interval apart, both read
 //     positive evidence, and at most once per process, so a single stale LIST cannot
 //     remove a working add-on. Converge at start withdraws on one positive read.
-//   - A node LOSING the label after the add-on was applied is not acted on until the
-//     next server start, where Converge decides again.
 //   - A single-node server runs no loop: its kubelet-CA fact cannot change in-process.
 //
 // Converge-only additionally makes the reconciler safe under HA with no coordination:
