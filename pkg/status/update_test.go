@@ -148,27 +148,37 @@ func TestUpdateRowReadsTheRecord(t *testing.T) {
 	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 	wd := "/var/lib/k3sm/server"
 	path := UpdatePath(wd)
-	if path != "/var/lib/k3sm/server/status/update.json" {
-		t.Fatalf("UpdatePath = %s", path)
+	if path != "/var/lib/k3sm/status/update.json" {
+		t.Fatalf("UpdatePath = %s, want the user-readable status directory", path)
 	}
 	good, err := json.Marshal(UpdateRecord{CheckedAt: now, Latest: "v0.2.0", Nodes: []UpdateNode{{Name: "a", Version: "v1.37.1+k3sm.0.2.0", State: UpdateCurrent}}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	stale, err := json.Marshal(UpdateRecord{CheckedAt: now.Add(-48 * time.Hour), Latest: "v0.2.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const user, service = 501, 250
 	cases := []struct {
 		name   string
 		fs     fakeFS
+		euid   int
 		state  RowState
 		remedy string
 	}{
-		{"absent", fakeFS{}, StateUnknown, UpdateCheckRemedy},
-		{"unreadable", fakeFS{unreadable: map[string]bool{path: true}}, StateUnknown, "sudo k3sm status"},
-		{"unparseable", fakeFS{contents: map[string][]byte{path: []byte("{")}}, StateUnknown, UpdateCheckRemedy},
-		{"current", fakeFS{contents: map[string][]byte{path: good}}, StateOK, ""},
+		{"absent, as a user", fakeFS{}, user, StateUnknown, UpdateCheckRemedy},
+		{"absent, as root", fakeFS{}, 0, StateUnknown, UpdateCheckRemedyWritable},
+		{"absent, as the service user", fakeFS{}, service, StateUnknown, UpdateCheckRemedyWritable},
+		{"stale, as a user", fakeFS{contents: map[string][]byte{path: stale}}, user, StateUnknown, UpdateCheckRemedy},
+		{"stale, as root", fakeFS{contents: map[string][]byte{path: stale}}, 0, StateUnknown, UpdateCheckRemedyWritable},
+		{"unreadable", fakeFS{unreadable: map[string]bool{path: true}}, user, StateUnknown, "sudo k3sm status"},
+		{"unparseable", fakeFS{contents: map[string][]byte{path: []byte("{")}}, user, StateUnknown, UpdateCheckRemedy},
+		{"current, as a user", fakeFS{contents: map[string][]byte{path: good}}, user, StateOK, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := Collector{FS: tc.fs, Paths: Paths{WorkDir: wd}}
+			c := Collector{FS: tc.fs, Paths: Paths{WorkDir: wd}, EUID: tc.euid, ServiceUID: service}
 			r, ok := c.updateRow(now)
 			if !ok {
 				t.Fatal("no update row")

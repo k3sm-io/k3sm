@@ -27,9 +27,11 @@ old. An update never makes the verdict `degraded`.
 
 The row is a convenience signal, not an attestation. Each node's version is what that node reports
 of itself in `status.nodeInfo.kubeletVersion`, so a node can claim any version; use it to see what
-needs upgrading, never as proof of what a node runs. Run
-`sudo k3sm update check` to refresh the record on demand: the record lives in the server's work
-directory, so a check run without `sudo` prints its result but cannot record it.
+needs upgrading, never as proof of what a node runs.
+
+The record is `/var/lib/k3sm/status/update.json`, mode 0644, so `k3sm status` reads it without
+`sudo`. Run `sudo k3sm update check` to refresh it on demand: the directory belongs to the k3sm
+service user, so a check run without `sudo` prints its result but cannot record it.
 
 ## Single Node
 

@@ -26,14 +26,12 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
 
-	"k3sm.io/k3sm/internal/atomicfile"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/update"
 	"k3sm.io/k3sm/pkg/version"
@@ -62,7 +60,8 @@ type updateEnv struct {
 	// no cluster could be asked.
 	inputs  update.Inputs
 	kubeErr error
-	// workDir is the server work dir whose status record the check refreshes.
+	// workDir is the server work dir; the check refreshes the record in the
+	// status directory beside it (status.Dir).
 	workDir string
 }
 
@@ -121,7 +120,7 @@ func runUpdate(ctx context.Context, args []string, env updateEnv) int {
 
 // runUpdateCheck runs one check, records it for `k3sm status`, and prints it.
 // A record it may not write (an ordinary account, which cannot write the
-// server's work dir) is a note on stderr, never a failed check.
+// service user's status directory) is a note on stderr, never a failed check.
 func runUpdateCheck(ctx context.Context, args []string, env updateEnv) int {
 	fsFlags := flag.NewFlagSet("update check", flag.ContinueOnError)
 	fsFlags.SetOutput(env.errOut)
@@ -182,42 +181,32 @@ func renderUpdate(w io.Writer, rep update.Report) {
 	_ = tw.Flush()
 }
 
-// writeUpdateRecord writes rec to status.UpdatePath(workDir), 0644, through
-// atomicfile. Its directory is created 0755 when missing and, as root, given to
-// the work dir's owner, so the server can keep refreshing a record root wrote
-// first. Before any write the directory is Lstat'ed and held to
-// checkStatusDir: a real directory, owned by root or the work dir's owner.
+// errNoStatusDir is a work dir with no status directory beside it (a work dir
+// outside an install): there is nowhere for `k3sm status` to read a record.
+var errNoStatusDir = errors.New("no status directory")
+
+// writeUpdateRecord writes rec to status.UpdatePath(workDir), 0644, in the
+// user-readable status directory (status.Dir), through writeFileAtomic like the
+// server's other records there. The directory is install's; this never creates
+// it. Before any write it is Lstat'ed and held to checkStatusDir: a real
+// directory, owned by root or the work dir's owner.
 func writeUpdateRecord(workDir string, rec status.UpdateRecord) error {
-	path := status.UpdatePath(workDir)
-	dir := filepath.Dir(path)
-	owner, err := fileOwner(workDir)
+	dir := status.Dir(workDir)
+	fi, err := os.Lstat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w at %s", errNoStatusDir, dir)
+	}
 	if err != nil {
 		return err
 	}
-	if err := os.Mkdir(dir, 0o755); err == nil {
-		if err := os.Chmod(dir, 0o755); err != nil {
-			return err
-		}
-		if os.Geteuid() == 0 {
-			if err := chownLike(dir, workDir); err != nil {
-				return err
-			}
-		}
-	} else if !errors.Is(err, fs.ErrExist) {
-		return err
-	}
-	fi, err := os.Lstat(dir)
+	owner, err := fileOwner(workDir)
 	if err != nil {
 		return err
 	}
 	if err := checkStatusDir(dir, fi, owner); err != nil {
 		return err
 	}
-	b, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	return atomicfile.Replace(path, b, 0o644)
+	return writeFileAtomic(status.UpdatePath(workDir), rec, 0o644)
 }
 
 // checkStatusDir refuses a status directory the record must not be written
@@ -252,19 +241,6 @@ func fileOwner(path string) (uint32, error) {
 		return 0, fmt.Errorf("cannot read the owner of %s", path)
 	}
 	return st.Uid, nil
-}
-
-// chownLike gives path the owner and group of ref.
-func chownLike(path, ref string) error {
-	fi, err := os.Stat(ref)
-	if err != nil {
-		return err
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return nil
-	}
-	return os.Lchown(path, int(st.Uid), int(st.Gid))
 }
 
 // updateCheckDue is how long a server waits before its next update check: the
@@ -306,7 +282,7 @@ func runUpdateRecorder(ctx context.Context, workDir string, cs kubernetes.Interf
 		if err != nil {
 			logger.Info("could not check for a k3sm update", "err", err)
 		}
-		if err := writeUpdateRecord(workDir, rep.Record(err)); err != nil {
+		if err := writeUpdateRecord(workDir, rep.Record(err)); err != nil && !errors.Is(err, errNoStatusDir) {
 			logger.Warn("could not record the update check for `k3sm status`", "path", status.UpdatePath(workDir), "err", err)
 		}
 		wait = interval

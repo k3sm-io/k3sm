@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -62,6 +63,20 @@ func (downTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, errors.New("dial tcp: connect: connection refused")
 }
 
+// installedWorkDir is a server work dir with the status directory beside it,
+// as install lays them out (<data root>/server and <data root>/status).
+func installedWorkDir(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	wd := filepath.Join(root, "server")
+	for _, d := range []string{wd, status.Dir(wd)} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return wd
+}
+
 // kubeletNode is a Node whose kubelet reports v.
 func kubeletNode(name, v string) *corev1.Node {
 	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}, Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: v}}}
@@ -71,7 +86,7 @@ func kubeletNode(name, v string) *corev1.Node {
 // through the verb: a release index whose stable release is v0.2.0, a cluster
 // with one node on it and one on v0.1.7, and this binary on v0.1.7. The report
 // names the release, its date and Kubernetes version and each node's state; the
-// record lands 0644 in the work dir's status directory; and the status row it
+// record lands 0644 in the user-readable status directory; and the status row it
 // yields warns naming the behind node and only it.
 func TestUpdateCheckComparesInstalledAndLatest(t *testing.T) {
 	index := fakeReleaseIndex("v0.2.0", "2026-10-01T00:00:00Z", "- **The control plane runs Kubernetes v1.37.1**.")
@@ -79,7 +94,7 @@ func TestUpdateCheckComparesInstalledAndLatest(t *testing.T) {
 	behind := version.Info{KubeVersion: "v1.36.2", Version: "0.1.7"}.NodeVersion()
 	cs := fake.NewClientset(kubeletNode("studio", current), kubeletNode("laptop", behind))
 	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
-	wd := t.TempDir()
+	wd := installedWorkDir(t)
 	var out, errOut bytes.Buffer
 	env := updateEnv{
 		out:    &out,
@@ -113,7 +128,7 @@ func TestUpdateCheckComparesInstalledAndLatest(t *testing.T) {
 	}
 
 	path := status.UpdatePath(wd)
-	if path != filepath.Join(wd, "status", "update.json") {
+	if path != filepath.Join(filepath.Dir(wd), "status", "update.json") {
 		t.Fatalf("record path %s", path)
 	}
 	fi, err := os.Stat(path)
@@ -165,7 +180,7 @@ func TestUpdateCheckComparesInstalledAndLatest(t *testing.T) {
 // not answer exits 1 and leaves a record whose row is unknown with the error.
 func TestUpdateCheckUnreachableIsRecorded(t *testing.T) {
 	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
-	wd := t.TempDir()
+	wd := installedWorkDir(t)
 	var out, errOut bytes.Buffer
 	env := updateEnv{out: &out, errOut: &errOut, workDir: wd, inputs: update.Inputs{
 		BaseURL: fakeIndexURL, HTTP: &http.Client{Transport: downTransport{}}, Timeout: time.Second, Installed: version.Info{Version: "0.1.7"}, Now: func() time.Time { return now },
@@ -202,7 +217,7 @@ func TestUpdateUsage(t *testing.T) {
 // old record is due at once.
 func TestUpdateCheckDue(t *testing.T) {
 	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
-	wd := t.TempDir()
+	wd := installedWorkDir(t)
 	if d := updateCheckDue(wd, now, time.Hour); d != 0 {
 		t.Errorf("absent record: due in %s", d)
 	}
@@ -227,14 +242,22 @@ func TestUpdateCheckDue(t *testing.T) {
 }
 
 // TestUpdateRecordRefusesAnUnsafeStatusDir pins the check before every write:
-// a symlink or a file where the status directory belongs is refused, nothing
-// is written through it, and a directory owned by anyone but root or the work
-// dir's owner is refused with the uids.
+// a symlink or a file where the status directory belongs is refused and
+// nothing is written through it, a directory owned by anyone but root or the
+// work dir's owner is refused with the uids, and a work dir with no status
+// directory beside it is errNoStatusDir with nothing created.
 func TestUpdateRecordRefusesAnUnsafeStatusDir(t *testing.T) {
 	rec := status.UpdateRecord{CheckedAt: time.Now()}
+	bare := func(t *testing.T) string {
+		wd := filepath.Join(t.TempDir(), "server")
+		if err := os.Mkdir(wd, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return wd
+	}
 	t.Run("symlink", func(t *testing.T) {
-		wd, elsewhere := t.TempDir(), t.TempDir()
-		if err := os.Symlink(elsewhere, filepath.Join(wd, status.UpdateDirName)); err != nil {
+		wd, elsewhere := bare(t), t.TempDir()
+		if err := os.Symlink(elsewhere, status.Dir(wd)); err != nil {
 			t.Fatal(err)
 		}
 		err := writeUpdateRecord(wd, rec)
@@ -246,8 +269,8 @@ func TestUpdateRecordRefusesAnUnsafeStatusDir(t *testing.T) {
 		}
 	})
 	t.Run("file", func(t *testing.T) {
-		wd := t.TempDir()
-		if err := os.WriteFile(filepath.Join(wd, status.UpdateDirName), nil, 0o644); err != nil {
+		wd := bare(t)
+		if err := os.WriteFile(status.Dir(wd), nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if err := writeUpdateRecord(wd, rec); err == nil || !strings.Contains(err.Error(), "not a directory") {
@@ -271,14 +294,23 @@ func TestUpdateRecordRefusesAnUnsafeStatusDir(t *testing.T) {
 			t.Errorf("err = %v, want the owner refusal", err)
 		}
 	})
-	t.Run("created", func(t *testing.T) {
-		wd := t.TempDir()
+	t.Run("absent", func(t *testing.T) {
+		wd := bare(t)
+		if err := writeUpdateRecord(wd, rec); !errors.Is(err, errNoStatusDir) {
+			t.Fatalf("err = %v, want errNoStatusDir", err)
+		}
+		if _, err := os.Lstat(status.Dir(wd)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the status directory was created: %v", err)
+		}
+	})
+	t.Run("installed", func(t *testing.T) {
+		wd := installedWorkDir(t)
 		if err := writeUpdateRecord(wd, rec); err != nil {
 			t.Fatal(err)
 		}
-		fi, err := os.Lstat(filepath.Join(wd, status.UpdateDirName))
-		if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 {
-			t.Errorf("status dir %v, err %v; want a 0755 directory", fi.Mode(), err)
+		fi, err := os.Lstat(status.UpdatePath(wd))
+		if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o644 {
+			t.Errorf("record %v, err %v; want a 0644 file", fi, err)
 		}
 	})
 }

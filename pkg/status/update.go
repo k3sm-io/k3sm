@@ -29,6 +29,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -195,21 +196,25 @@ const UpdateRecordInterval = time.Hour
 // vouching for it.
 const updateStaleAfter = 24 * time.Hour
 
-// UpdateCheckRemedy refreshes the record.
-const UpdateCheckRemedy = "sudo k3sm update check"
+// UpdateCheckRemedy refreshes the record, for an account that may not write
+// the status directory; UpdateCheckRemedyWritable is the same for one that may
+// (root and the service user).
+const (
+	UpdateCheckRemedy         = "sudo k3sm update check"
+	UpdateCheckRemedyWritable = "k3sm update check"
+)
 
 // UpdateUpgradeRemedy is how a node moves to the latest release (docs/user/upgrade.md).
 const UpdateUpgradeRemedy = "curl -fsSL https://k3sm.io/install.sh | sh"
 
-// UpdateDirName is the record's directory under the server work dir.
-const UpdateDirName = "status"
-
 // updateName is the record's basename.
-const updateName = "update.json"
+const updateName = install.UpdateRecordName
 
-// UpdatePath is the record's path for a server work dir.
+// UpdatePath is the record's path for a server work dir: only in the
+// user-readable status directory (Dir), 0644, so any account's `k3sm status`
+// reads it.
 func UpdatePath(workDir string) string {
-	return filepath.Join(workDir, UpdateDirName, updateName)
+	return filepath.Join(Dir(workDir), updateName)
 }
 
 // updateRow reads the update record, or false when this report has no work dir
@@ -224,7 +229,7 @@ func (c Collector) updateRow(now time.Time) (Row, bool) {
 	raw, err := c.FS.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		row.Detail, row.Remedy = updateMissingDetail, UpdateCheckRemedy
+		row.Detail, row.Remedy = updateMissingDetail, c.updateCheckRemedy()
 		return row, true
 	case err != nil:
 		row.Detail, row.Remedy = "unreadable as this user: "+path, "sudo k3sm status"
@@ -232,12 +237,25 @@ func (c Collector) updateRow(now time.Time) (Row, bool) {
 	}
 	var rec UpdateRecord
 	if err := json.Unmarshal(raw, &rec); err != nil {
-		row.Detail, row.Remedy = "the update record does not parse: "+path, UpdateCheckRemedy
+		row.Detail, row.Remedy = "the update record does not parse: "+path, c.updateCheckRemedy()
 		return row, true
 	}
 	r := UpdateRowFrom(rec, now)
 	r.Wide["record"] = path
+	if r.Remedy == UpdateCheckRemedy {
+		r.Remedy = c.updateCheckRemedy()
+	}
 	return r, true
+}
+
+// updateCheckRemedy is the refresh command for the account running the
+// report: the bare check when it may write the status directory (root, or the
+// service user who owns it), the sudo form otherwise.
+func (c Collector) updateCheckRemedy() string {
+	if c.EUID == 0 || (c.ServiceUID >= 0 && c.EUID == c.ServiceUID) {
+		return UpdateCheckRemedyWritable
+	}
+	return UpdateCheckRemedy
 }
 
 // updateMissingDetail is the row's detail when no usable check is recorded.

@@ -199,6 +199,11 @@ func artifactManifest(cfg Config) []artifact {
 	// directory, REMOVED after that daemon is booted out for the reason the
 	// server's records below are: it describes a node that no longer runs.
 	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), EndpointsRecordName), assertExists: false})
+	// The update record, REMOVED for the same reason: it compares the nodes of
+	// a cluster this Mac no longer serves. Either role may hold one, because
+	// `sudo k3sm update check` writes it wherever it runs. assertExists is
+	// false: no check may have run.
+	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), UpdateRecordName), assertExists: false})
 	if cfg.Role == RoleServer {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
 		// A joining HA server's staged server-class join token, removed for the

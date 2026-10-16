@@ -122,7 +122,7 @@
       "detail": "no update check is recorded yet (the server checks once an hour)",
       "remedy": "sudo k3sm update check",
       "wide": {
-        "record": "/nonexistent/k3sm-status-contract/server/status/update.json"
+        "record": "/nonexistent/k3sm-status-contract/status/update.json"
       }
     },
     {

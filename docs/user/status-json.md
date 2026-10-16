@@ -243,8 +243,8 @@ when that is all you need.
 The `update` row appears on an installed server. It reports whether every node runs the latest k3sm
 release, from the record the last update check left (see [Upgrade](upgrade.md#checking-for-an-update)).
 The server checks at most once an hour and `sudo k3sm update check` checks on demand; the report itself
-never contacts GitHub. The record is in the server's work dir, so as any user but root the row is
-`unknown` with the remedy `sudo k3sm status`. Its `state` is:
+never contacts GitHub. The record is `/var/lib/k3sm/status/update.json` (mode 0644), so any account
+reads the row. Its `state` is:
 
 - `ok` when every node's kubelet reports the latest release.
 - `behind` (severity `warn`) when a node runs an older release. `detail` names each such node and the
@@ -255,7 +255,8 @@ never contacts GitHub. The record is in the server's work dir, so as any user bu
 - `unknown` when the last check could not finish (`detail` carries its error, first line only and
   redacted), when a node reports no tagged k3sm release, when no check is recorded, or when the record
   is older than 24 hours, dated more than five minutes in the future, or fails validation. The remedy
-  is `sudo k3sm update check`.
+  is `sudo k3sm update check`, or `k3sm update check` when the report runs as root or the
+  service user, who may write the record.
 
 Each node's state is recomputed from the version in the record, in semver order, and the versions
 are what the nodes report of themselves: the row is a convenience signal, not an attestation.
