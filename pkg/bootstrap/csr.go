@@ -52,6 +52,11 @@ var (
 	// set the rest of the stack speaks, or an RSA modulus outside the accepted
 	// size range.
 	ErrUnsupportedCSRKey = errors.New("bootstrap: CSR public key is not an acceptable node key")
+	// ErrNetserveCSRSAN is returned when a netserve CSR requests any SAN. The
+	// netserve identity is a client identity named by its subject alone, so a SAN
+	// in its CSR is either a mistake or an attempt to have the signer vouch for
+	// a name it never checked.
+	ErrNetserveCSRSAN = errors.New("bootstrap: a netserve CSR may request no SAN")
 )
 
 // The RSA modulus bounds a node CSR may carry. k3sm's own client mints P-256
@@ -223,4 +228,40 @@ func ApproveAndSignKubeletServing(clusterCA *certs.CA, csr *x509.CertificateRequ
 	subject := pkix.Name{CommonName: id.NodeName}
 	dns := []string{id.NodeName, "localhost"}
 	return clusterCA.SignServingCSR(csr, subject, dns, []net.IP{ip}, validFor)
+}
+
+// CheckNetserveCSR validates a netserve CSR as far as the request alone allows:
+// an acceptable key, a valid self-signature (proof the requester holds the
+// private key) and no SAN of any kind. The key is judged before the signature for
+// the reason CheckNodeCSR gives.
+func CheckNetserveCSR(csr *x509.CertificateRequest) error {
+	if csr == nil {
+		return ErrEmptyIdentity
+	}
+	if err := checkCSRKey(csr.PublicKey); err != nil {
+		return err
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return fmt.Errorf("verify CSR self-signature: %w", err)
+	}
+	if len(csr.DNSNames)+len(csr.IPAddresses)+len(csr.EmailAddresses)+len(csr.URIs) > 0 {
+		return ErrNetserveCSRSAN
+	}
+	return nil
+}
+
+// ApproveAndSignNetserveCSR validates csr (CheckNetserveCSR) and signs it with
+// the SIGNING CA as nodeName's netserve CLIENT certificate: the authoritative
+// subject certs.NetserveSubject(nodeName), no SANs, ExtKeyUsageClientAuth. The
+// CSR's own subject is ignored. nodeName must already be authenticated by the
+// caller: the join's node-password binding, or the presenting node certificate
+// on NetserveCertPath.
+func ApproveAndSignNetserveCSR(signingCA *certs.CA, csr *x509.CertificateRequest, nodeName string, validFor time.Duration) ([]byte, error) {
+	if nodeName == "" {
+		return nil, ErrEmptyIdentity
+	}
+	if err := CheckNetserveCSR(csr); err != nil {
+		return nil, err
+	}
+	return signingCA.SignClientCSR(csr, certs.NetserveSubject(nodeName), nil, nil, validFor)
 }

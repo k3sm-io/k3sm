@@ -107,6 +107,12 @@ type JoinResult struct {
 	NodeClientKeyPEM      []byte
 	KubeletServingCertPEM []byte
 	KubeletServingKeyPEM  []byte
+	// NetserveClientCertPEM / NetserveClientKeyPEM are this node's netserve
+	// identity (certs.NetserveSubject), the credential its datapath runs under.
+	// Empty against a server that predates it; the agent then fetches one at
+	// start (FetchNetserveCert), as it does on every resume.
+	NetserveClientCertPEM []byte
+	NetserveClientKeyPEM  []byte
 	PodCIDR               string
 	MeshIP                string
 	Peers                 []netv1.MeshPeerSpec
@@ -188,6 +194,13 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 		return nil, fmt.Errorf("generate serving CSR: %w", err)
 	}
 
+	// The netserve identity: a subject-only client CSR with no SAN, which is all
+	// the signer accepts (CheckNetserveCSR).
+	netserveKeyPEM, netserveCSRPEM, err := generateCSR(certs.NetserveSubject(opts.NodeName), nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("generate netserve CSR: %w", err)
+	}
+
 	wgPriv, wgPub := opts.WGPrivateKeyB64, ""
 	if wgPriv == "" {
 		wgPriv, wgPub, err = GenerateWireguardKey()
@@ -199,12 +212,13 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 	}
 
 	reqBody := JoinRequest{
-		Token:         opts.Token,
-		NodeName:      opts.NodeName,
-		NodeIP:        opts.NodeIP,
-		NodePassword:  opts.NodePassword,
-		ClientCSRPEM:  string(clientCSRPEM),
-		ServingCSRPEM: string(servingCSRPEM),
+		Token:          opts.Token,
+		NodeName:       opts.NodeName,
+		NodeIP:         opts.NodeIP,
+		NodePassword:   opts.NodePassword,
+		ClientCSRPEM:   string(clientCSRPEM),
+		ServingCSRPEM:  string(servingCSRPEM),
+		NetserveCSRPEM: string(netserveCSRPEM),
 		Mesh: netv1.MeshEnrollRequest{
 			NodeName:  opts.NodeName,
 			PublicKey: wgPub,
@@ -230,7 +244,15 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 	if nodeIP == "" {
 		nodeIP = opts.NodeIP
 	}
+	// A server that predates the netserve identity answers without one; the key
+	// minted for it is then dropped, and the agent fetches a pair at start.
+	var netserveCert, netserveKey []byte
+	if resp.NetserveClientCertPEM != "" {
+		netserveCert, netserveKey = []byte(resp.NetserveClientCertPEM), netserveKeyPEM
+	}
 	return &JoinResult{
+		NetserveClientCertPEM: netserveCert,
+		NetserveClientKeyPEM:  netserveKey,
 		NodeName:              resp.NodeName,
 		NodeIP:                nodeIP,
 		ClusterCAPEM:          []byte(resp.ClusterCAPEM),

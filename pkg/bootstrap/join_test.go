@@ -169,6 +169,15 @@ func TestJoinRoundTrip(t *testing.T) {
 	if err := serving.CheckSignatureFrom(clusterCA.Cert); err != nil {
 		t.Errorf("kubelet-serving cert must be signed by the cluster CA: %v", err)
 	}
+	// The netserve identity rides the join: CN=k3sm:netserve:worker-1,
+	// O=k3sm:netservers, signed by the signing CA, paired with the key the node
+	// kept.
+	if err := bootstrap.CheckNetserveKeyPair(res.NetserveClientCertPEM, res.NetserveClientKeyPEM, "worker-1"); err != nil {
+		t.Fatalf("the join's netserve pair: %v", err)
+	}
+	if err := parseCertPEM(t, res.NetserveClientCertPEM).CheckSignatureFrom(signingCA.Cert); err != nil {
+		t.Errorf("the netserve certificate must be signed by the signing CA: %v", err)
+	}
 }
 
 // TestJoinRejectsBadToken confirms an invalid bootstrap token is refused at the

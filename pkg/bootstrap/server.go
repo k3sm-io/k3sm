@@ -198,6 +198,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc(JoinPath, s.handleJoin)
 	mux.HandleFunc(MeshEndpointPath, s.handleMeshEndpoint)
 	mux.HandleFunc(DeregisterPath, s.handleDeregister)
+	mux.HandleFunc(NetserveCertPath, s.handleNetserveCert)
 	if s.cfg.ServerAuth != nil && s.cfg.Bundle != nil {
 		mux.HandleFunc(BundlePath, s.handleBundle)
 	}
@@ -438,6 +439,20 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var netserveCSR *x509.CertificateRequest
+	if req.NetserveCSRPEM != "" {
+		netserveCSR, err = parseCSR(req.NetserveCSRPEM)
+		if err != nil {
+			s.cfg.Logger.Warn("join rejected", "reason", "netserve-csr-parse", "node", req.NodeName, "err", err)
+			http.Error(w, "parse netserve CSR: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := CheckNetserveCSR(netserveCSR); err != nil {
+			s.cfg.Logger.Warn("join rejected", "reason", "netserve-csr-denied", "node", req.NodeName, "err", err)
+			http.Error(w, "netserve CSR denied", http.StatusForbidden)
+			return
+		}
+	}
 
 	// 4. Controller-mediated mesh enroll (writes THIS node's MeshPeer + peer
 	// snapshot). It runs BEFORE any certificate is signed because it is what
@@ -518,6 +533,21 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The netserve identity rides the join beside the node identity, with the
+	// same lifetime, so a fresh worker's datapath has its own credential from its
+	// first start. It names the node the node-password just bound, never anything
+	// the CSR asked for.
+	var netserveCert []byte
+	if netserveCSR != nil {
+		netserveCert, err = ApproveAndSignNetserveCSR(s.cfg.SigningCA, netserveCSR, req.NodeName, s.cfg.NodeCertTTL)
+		if err != nil {
+			s.releaseFresh(r, req.NodeName, alloc, "netserve-csr-denied")
+			s.cfg.Logger.Warn("join rejected", "reason", "netserve-csr-denied", "node", req.NodeName, "err", err)
+			http.Error(w, "netserve CSR denied", http.StatusForbidden)
+			return
+		}
+	}
+
 	resp := JoinResponse{
 		SchemaVersion:         JoinSchemaVersion,
 		NodeName:              req.NodeName,
@@ -526,6 +556,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		ClientCAPEM:           string(s.cfg.SigningCA.CertPEM),
 		NodeClientCertPEM:     string(clientCert),
 		KubeletServingCertPEM: string(servingCert),
+		NetserveClientCertPEM: string(netserveCert),
 		APIServers:            s.apiServers(r.Context()),
 		Mesh:                  meshResp,
 	}

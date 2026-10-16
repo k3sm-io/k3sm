@@ -48,6 +48,13 @@ const (
 	// the same guard, so a node can deregister itself and nothing else (see
 	// DeregisterRequest).
 	DeregisterPath = "/v1-k3sm/mesh/deregister"
+	// NetserveCertPath issues a JOINED node its netserve client certificate
+	// (certs.NetserveSubject): the identity its datapath authenticates to the
+	// apiserver as. It is authenticated exactly as MeshEndpointPath is, by the
+	// node's own client certificate, and it issues for that certificate's node
+	// and no other (see NetserveCertRequest). It is how a node that joined before
+	// the identity existed obtains one at start, without a rejoin.
+	NetserveCertPath = "/v1-k3sm/netserve/cert"
 )
 
 // JoinSchemaVersion stamps the k3sm-internal join exchange payloads (JoinRequest /
@@ -83,6 +90,10 @@ type JoinRequest struct {
 	// ServingCSRPEM is the PEM CSR the server signs into a kubelet-serving cert
 	// (cluster CA); may be empty.
 	ServingCSRPEM string `json:"servingCSRPEM,omitempty"`
+	// NetserveCSRPEM is the PEM CSR the server signs into this node's netserve
+	// client cert (CN=k3sm:netserve:<name>, O=k3sm:netservers, signing CA); may
+	// be empty, in which case the node fetches it at start (NetserveCertPath).
+	NetserveCSRPEM string `json:"netserveCSRPEM,omitempty"`
 	// Mesh is the wireguard mesh-enroll request (public key + endpoint + requested
 	// podCIDR).
 	Mesh netv1.MeshEnrollRequest `json:"mesh"`
@@ -133,6 +144,29 @@ type DeregisterRequest struct {
 	NodeName string `json:"nodeName"`
 }
 
+// NetserveCertRequest is the payload a JOINED node POSTs to NetserveCertPath.
+//
+// It carries the node name and a CSR. The name is present only so the server can
+// check it against the certificate that authenticated the request (the same
+// self-scoping guard the endpoint refresh runs), and it is never trusted on its
+// own. The CSR contributes its public key and nothing else: the server sets the
+// subject (certs.NetserveSubject) and issues with no SANs, so no field of the
+// request can name an identity other than the caller's.
+type NetserveCertRequest struct {
+	// NodeName is the node asking. It MUST equal the authenticated
+	// certificate's system:node:<name> identity; a mismatch is a 403.
+	NodeName string `json:"nodeName"`
+	// CSRPEM is the PEM CSR over the netserve key the node keeps.
+	CSRPEM string `json:"csrPEM"`
+}
+
+// NetserveCertResponse is NetserveCertPath's reply: the issued netserve client
+// certificate (the node pairs it with the private key it kept).
+type NetserveCertResponse struct {
+	// CertPEM is the CN=k3sm:netserve:<name>, O=k3sm:netservers client cert.
+	CertPEM string `json:"certPEM"`
+}
+
 // JoinResponse is the bootstrap endpoint's reply: the cluster CA the node now trusts
 // for the apiserver, its issued certs, and the mesh-enroll snapshot it programs
 // immediately.
@@ -167,6 +201,9 @@ type JoinResponse struct {
 	// KubeletServingCertPEM is the issued kubelet-serving cert (cluster CA); may be
 	// empty if no serving CSR was submitted.
 	KubeletServingCertPEM string `json:"kubeletServingCertPEM,omitempty"`
+	// NetserveClientCertPEM is the issued netserve client cert (signing CA); empty
+	// when the request carried no netserve CSR.
+	NetserveClientCertPEM string `json:"netserveClientCertPEM,omitempty"`
 	// APIServers are the control-plane apiserver endpoints (host:port) the joining
 	// node's client-side load-balancer health-checks + targets, so a server death fails
 	// over without re-pointing the kubeconfig. A single-server cluster carries
