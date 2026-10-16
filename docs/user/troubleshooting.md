@@ -86,6 +86,12 @@ usage. `--sort`, `-n` and `--limit` shape the pod table only; the node table alw
 whole cluster. The view exits 0 when it read the cluster, with or without metrics, and 6 when it
 could not.
 
+Under `sudo`, the view reads with your own `~/.kube/config` and the installed k3sm context when it
+can list nodes, because a worker's node credential may read only its own node; it refuses that file
+if you do not own it, if others can write it, or if it runs a credential plugin or reads its
+credential from another file, and when no credential can list nodes it says to run the view
+without `sudo`.
+
 The exit code is the verdict, so a script can branch on it. `k3sm status --help` lists the codes.
 
 Rows say `needs-admin` when only root can run the check, such as the runtime socket. Nothing has
