@@ -39,7 +39,7 @@ func TestBuildServiceSetDenyAllUntilReady(t *testing.T) {
 	defer cancel()
 
 	missing := filepath.Join(t.TempDir(), "does-not-exist.kubeconfig")
-	declares, lbDeclarers, _ := buildServiceSet(ctx, missing, quietLogger())
+	declares, lbDeclarers, synced, _ := buildServiceSet(ctx, missing, quietLogger())
 
 	// The predicates must be non-nil: a nil PortAuthorizer input can never later
 	// authorize, so the async swap-in only works if the closures exist up front.
@@ -47,6 +47,9 @@ func TestBuildServiceSetDenyAllUntilReady(t *testing.T) {
 		t.Fatal("buildServiceSet returned nil predicates for a not-yet-present kubeconfig; must be non-nil deny-all so the async authorizer can swap in")
 	}
 	// Deny-all while the lister is nil (the boot window before the swap).
+	if synced() {
+		t.Fatal("synced() = true before the first Service sync; the refusal would say no service declares the port")
+	}
 	if declares(443) || len(lbDeclarers(53)) != 0 {
 		t.Fatal("expected deny (no declarers) before the Service authorizer syncs")
 	}
@@ -72,8 +75,8 @@ func TestCanonicalLBServiceIsTheIngressService(t *testing.T) {
 // --kubeconfig configured → nil predicates (netd denies every <1024 bind, the
 // existing "no authoritative Service set" contract).
 func TestBuildServiceSetEmptyKubeconfigDenies(t *testing.T) {
-	declares, lbDeclarers, _ := buildServiceSet(context.Background(), "", quietLogger())
-	if declares != nil || lbDeclarers != nil {
+	declares, lbDeclarers, synced, _ := buildServiceSet(context.Background(), "", quietLogger())
+	if declares != nil || lbDeclarers != nil || synced != nil {
 		t.Fatal("empty --kubeconfig must yield nil predicates (deny-all, no authoritative set)")
 	}
 }
