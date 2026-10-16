@@ -156,7 +156,7 @@ four.
 | `timestamp` | string | RFC 3339 |
 
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
-`workloads`, `data-root`, `datastore`, `kubeconfig` and `runtimed`; some rows appear only when the
+`workloads`, `data-root`, `datastore`, `kubeconfig`, `runtimed` and `dns`; some rows appear only when the
 thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
 `mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
@@ -206,6 +206,25 @@ apiserver presents, read over a connection verified against the cluster CA the w
 it joined. A kubeconfig context counts as this cluster's when its server's host is in `hosts` and its
 port is `port`. A node older than the record writes none; then a server accepts a loopback address or
 one of this Mac's addresses at port 6444, and a worker accepts the host it joined.
+
+The `dns` row asks this node's resolver for `kubernetes.default.svc.cluster.local`: one query over
+UDP to the cluster DNS address (`10.43.0.10`, or the `--dns-vip` the node daemon was installed
+with), port 53, with a 3 second timeout. It appears on every role and needs no root. Its `state` is:
+
+- `ok` when the resolver answers with an address. `detail` and `wide.answer` give the address.
+- `down` (severity `warn`) when no answer arrives over UDP in 3 seconds. The report then asks the
+  same question over TCP, and when TCP answers, `wide.tcp` gives that answer: the resolver is up and
+  its UDP socket is not receiving, which pods and the host resolver see as names that time out.
+  `remedy` restarts the node daemon (`sudo launchctl kickstart -k system/io.k3sm.server` on a
+  server, `system/io.k3sm.agent` on a worker).
+- `unhealthy` (severity `warn`) when the resolver answers over UDP with no address, such as a
+  name error. `detail` gives the reply's code.
+- `skip` when k3sm is not installed or the node daemon is not running.
+- `unknown` when the node daemon's `--dns-vip` is not an address.
+
+Unlike `node-resolver`, which reports whether the host routes cluster names to that address, this
+row reports whether anything answers there, and a `warn` makes the `verdict` `degraded`. `wide.vip`
+and `wide.name` give the address and the name asked.
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was

@@ -163,6 +163,11 @@ func (c Collector) Collect(ctx context.Context) Report {
 		c.kubeconfigRow(),
 		c.runtimedRow(ctx, role),
 	)
+	// Whether the node resolver answers at the DNS VIP, on every role; the
+	// row skips itself on a Mac with no install or a stopped node daemon.
+	if r, ok := c.dnsRow(ctx, role, installed, node); ok {
+		rows = append(rows, r)
+	}
 	// The host-DNS floor and the shell set pods run through, on an installed
 	// Mac only (neither exists before `sudo k3sm install`).
 	if installed {

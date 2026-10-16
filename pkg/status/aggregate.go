@@ -63,6 +63,10 @@ const (
 	// common coreutils) pods run in place of the platform binaries, compared
 	// with the live host binaries. Same conditions.
 	RowShadowShells = "shadow-shells"
+	// RowDNS is one query to this node's resolver at the cluster DNS VIP, over
+	// UDP: whether the resolver answers, not only whether the host routes to
+	// it. The row exists when a querier was wired in, on every role.
+	RowDNS = "dns"
 )
 
 // advisoryRows are the rows whose WARN is a note to the operator rather than a

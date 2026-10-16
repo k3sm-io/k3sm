@@ -161,6 +161,7 @@ func contractServer(t *testing.T, netd, server string, kube Kube, kubeErr error)
 		KubeSource: `~/.kube/config context "k3sm"`,
 		Procs:      fakeProcs{live: LivenessRunning},
 		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o755, uid: 0, mounted: true},
+		DNS:        answeringDNS(),
 		Paths:      p,
 		EUID:       501,
 		ServiceUID: 250,
@@ -192,6 +193,7 @@ func contractAgent(t *testing.T, stage func(*testing.T, Paths, fakeFS) fakeFS) C
 	p := agentPaths(contractWorkDir)
 	c := agentCollector(t, p, stage(t, p, agentInstalledFS(p)))
 	c.KubeErr = errors.New("no k3sm context in ~/.kube/config")
+	c.DNS = answeringDNS()
 	c.Version = contractVersion
 	c.Hostname = "my-mac"
 	return c
