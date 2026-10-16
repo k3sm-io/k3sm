@@ -610,7 +610,7 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	net, nodeAddressing, err := startServerDatapath(ctx, plan, cs, sm, vmCapable, logger) // 4c. Service proxy + DNS
+	net, nodeAddressing, err := startServerDatapath(ctx, plan, restCfg, cs, sm, vmCapable, logger) // 4c. Service proxy + DNS
 	if err != nil {
 		return err
 	}
@@ -660,7 +660,7 @@ func runServer(args []string) (err error) {
 // this Mac's addresses and the address the node advertises; an unusable or
 // empty-selecting spec is the error, and the server refuses to start rather
 // than serve NodePorts nowhere. SIGHUP re-resolves it (attachServerProxy).
-func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions, error) {
+func startServerDatapath(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions, error) {
 	// Before any datapath decision: the previous process's Service proxy record
 	// describes a proxy that is gone, whether or not this one starts a datapath.
 	removeServicesRecord(plan.opts.workDir, logger)
@@ -668,6 +668,14 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		return nil, nodeOptions{}, nil
 	}
 	opts, mode := plan.opts, plan.mode
+	// The datapath's identity: this node's netserve client, minted in memory from
+	// the signing CA, the identity a joined worker's datapath carries. Its reads
+	// are pkg/rbac's k3sm:netserve role and nothing more; only the kube-dns
+	// Service create rides the admin client (DNSServiceClient below).
+	netserveCS, err := serverNetserveClient(opts, restCfg, logger)
+	if err != nil {
+		return nil, nodeOptions{}, err
+	}
 	// The kubernetes-VIP backend: ONLY the loopback-advertise posture (single
 	// node) pins the static proxy backend at the apiserver's real loopback listen
 	// address — the executor runs that apiserver with --endpoint-reconciler-type=none
@@ -688,7 +696,8 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	nodeAddressing := nodeOptions{nodeIP: opts.nodeIP, podCIDR: sm.podCIDR, netMode: mode}
 	net, err := attachDatapath(plan.lan, opts.nodePortAddresses, advertisedNodeIP(nodeAddressing), mode.DataPath(), func(nodePorts []netip.Addr) *netserve.Server {
 		return netserve.New(netserve.Config{
-			Client:            cs,
+			Client:            netserveCS,
+			DNSServiceClient:  cs,
 			WorkDir:           opts.workDir,
 			DNSVIP:            opts.clusterIP,
 			ClusterDomain:     opts.domain,
@@ -704,10 +713,10 @@ func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Int
 			PeerMeshEgressIPs: sm.peerEgress,
 			VMBackend:         vmCapable,
 			VMNetSubnet:       netserve.DefaultVMNetSubnet,
-			// cs is the admin client (exec.Kubeconfig()), so the policy watcher's
-			// cluster-wide NetworkPolicies, Pods and Namespaces reads are allowed
-			// and PodScopeNode stays empty. TestServerNetservePolicyClientIsAdmin
-			// pins both.
+			// netserveCS is this node's netserve identity, granted the policy
+			// watcher's cluster-wide NetworkPolicies, Pods and Namespaces reads, so
+			// PodScopeNode stays empty; cs, the admin client, only provisions
+			// kube-dns. TestServerNetserveRunsAsNetserveIdentity pins all three.
 			EnforceNetworkPolicy: true,
 			NetdSocket:           mode.Socket,
 			Disabled:             !mode.DataPath(),
@@ -1026,6 +1035,58 @@ func serverNodeRESTConfig(admin *rest.Config, h *certs.Hierarchy, nodeName strin
 	cfg.TLSClientConfig.CertData = certPEM
 	cfg.TLSClientConfig.KeyData = keyPEM
 	applyNodeClientBudget(cfg)
+	return cfg, nil
+}
+
+// serverNetserveClient builds the client the server's datapath runs on: its
+// netserve identity (certs.NetserveSubject(nodeName)), minted in memory from the
+// signing CA on every boot, exactly as serverNodeRESTConfig mints the node
+// identity. The hierarchy is loaded the same way serverNodeOptions loads it.
+func serverNetserveClient(opts serverOptions, admin *rest.Config, logger *slog.Logger) (kubernetes.Interface, error) {
+	h, err := certs.EnsureHierarchy(opts.workDir, opts.role(), opts.posture())
+	if err != nil {
+		return nil, fmt.Errorf("load the CA hierarchy for the server datapath's netserve identity: %w", err)
+	}
+	cfg, err := serverNetserveRESTConfig(admin, h, opts.nodeName)
+	if err != nil {
+		return nil, err
+	}
+	if cn, notAfter, err := clientCertIdentity(cfg.CertData); err == nil {
+		logger.Info("minted the server datapath's netserve identity (in memory, never written to disk)", "cn", cn, "groups", certs.NetserveGroup, "not_after", notAfter.UTC().Format(time.RFC3339))
+	} else {
+		return nil, fmt.Errorf("read back the server datapath's netserve identity: %w", err)
+	}
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build the server datapath's netserve client: %w", err)
+	}
+	return client, nil
+}
+
+// serverNetserveRESTConfig is serverNodeRESTConfig for the netserve identity:
+// rest.AnonymousClientConfig(admin) keeps the apiserver address and its trust,
+// drops every admin credential, and the minted pair becomes the only one. The
+// admin rate limiter is dropped so the datapath's watches do not share the
+// admin client's budget. It fails closed on a hierarchy without a usable signing
+// CA; it never falls back to the admin identity.
+func serverNetserveRESTConfig(admin *rest.Config, h *certs.Hierarchy, nodeName string) (*rest.Config, error) {
+	if admin == nil {
+		return nil, errors.New("mint the server datapath's netserve identity: no admin client config to take the apiserver address from")
+	}
+	if nodeName == "" {
+		return nil, errors.New("mint the server datapath's netserve identity: empty node name")
+	}
+	if h == nil || h.Signing == nil || h.Signing.Cert == nil || h.Signing.Key == nil {
+		return nil, errors.New("mint the server datapath's netserve identity: no usable signing CA (the work dir's PKI must carry the signing half of the CA hierarchy)")
+	}
+	certPEM, keyPEM, err := h.Signing.IssueNetserveClient(nodeName, executor.ComponentCertValidity)
+	if err != nil {
+		return nil, fmt.Errorf("mint the server datapath's netserve identity: %w", err)
+	}
+	cfg := rest.AnonymousClientConfig(admin)
+	cfg.RateLimiter = nil
+	cfg.TLSClientConfig.CertData = certPEM
+	cfg.TLSClientConfig.KeyData = keyPEM
 	return cfg, nil
 }
 

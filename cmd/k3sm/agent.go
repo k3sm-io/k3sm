@@ -531,7 +531,21 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 		// both come from the stored assignment, which is the same pair the server
 		// assigned. Without this a joined worker has no Service proxy and no DNS, so
 		// a pod on it can't resolve names or reach the API VIP.
-		datapath, err = startWorkerNetserve(ctx, opts, res, mode, kubeconfigPath, logger)
+		//
+		// The datapath authenticates as this node's netserve identity, not the
+		// node credential: the k3sm:netserve role grants it the cluster-wide reads
+		// the Service proxy, the DNS zone and the NetworkPolicy watcher need.
+		netserveKubeconfig, err := ensureNetserveCredential(ctx, store, opts.nodeName, apiserverURL, res,
+			fetchNetserveCertFrom(joinHost), time.Now(), logger)
+		if errors.Is(err, bootstrap.ErrNetserveCertUnsupported) {
+			// A server older than this agent: the same answer on every start
+			// until the server is upgraded (it goes first), so back off.
+			return agentTerminal(ctx, breaker, logger, err)
+		}
+		if err != nil {
+			return err
+		}
+		datapath, err = startWorkerNetserve(ctx, opts, res, mode, netserveKubeconfig, logger)
 		if err != nil {
 			return err
 		}
@@ -1378,10 +1392,10 @@ func restConfigHost(cfg *rest.Config) string {
 // transport overrides (nodeTransportOverrides): the provider holds both halves of
 // a guest's two-address identity and this is the proxy that must learn the live
 // one.
-func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, kubeconfigPath string, logger *slog.Logger) (*netserve.Server, error) {
-	_, cs, err := kubeclient.FromPath(kubeconfigPath)
+func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, netserveKubeconfig string, logger *slog.Logger) (*netserve.Server, error) {
+	_, cs, err := kubeclient.FromPath(netserveKubeconfig)
 	if err != nil {
-		return nil, fmt.Errorf("load node kubeconfig for node-local datapath: %w", err)
+		return nil, fmt.Errorf("load the netserve kubeconfig for the node-local datapath: %w", err)
 	}
 	// The vm-capability question is asked HERE, before the datapath is built and
 	// before the VK node exists — through runtimed's own safe host probe, the same
@@ -1428,16 +1442,13 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 		// worker with no vm backend keeps the byte-identical plain table.
 		VMBackend:   vmCapable,
 		VMNetSubnet: netserve.DefaultVMNetSubnet,
-		// The worker's datapath runs under the node kubeconfig
-		// (system:node:<name>). The policy watcher's cluster-wide
-		// NetworkPolicies and Namespaces reads are granted to neither the Node
-		// authorizer nor system:nodes, so the worker runs no policy watcher
-		// (its table could never sync). Granting those reads is an RBAC
-		// decision, not made here. PodScopeNode stays set so that, once a
-		// worker does enforce, its pods list is the one the Node authorizer
-		// allows: only the pods bound to this node.
-		EnforceNetworkPolicy: false,
-		PodScopeNode:         opts.nodeName,
+		// The worker's datapath runs under its netserve identity
+		// (k3sm:netserve:<name> in k3sm:netservers), which the k3sm:netserve
+		// role grants cluster-wide reads of NetworkPolicies, Namespaces and Pods.
+		// So the worker enforces, and lists every node's pods (no PodScopeNode):
+		// a cross-node policy peer is a pod bound to another node. It sets no
+		// DNSServiceClient: the kube-dns Service is the server's to provision.
+		EnforceNetworkPolicy: true,
 		NetdSocket:           mode.Socket,
 		Disabled:             !mode.DataPath(),
 		Logger:               logger,
@@ -1558,8 +1569,23 @@ func advertisedAPIServerHost(res *bootstrap.JoinResult) string {
 // system:node identity (client cert + key) and verifies the apiserver against the
 // cluster CA the join returned — NOT an insecure-skip-tls-verify admin token.
 func writeNodeKubeconfig(path, server, nodeName string, res *bootstrap.JoinResult) error {
+	content := renderClientKubeconfig(server, "system:node:"+nodeName, res.ClusterCAPEM, res.NodeClientCertPEM, res.NodeClientKeyPEM)
+	// Installed atomically (and skipped when unchanged) like every other artifact
+	// of the credential store this belongs to: a restart rewrites this file, and a
+	// half-written kubeconfig is a node that cannot authenticate.
+	if err := writeStoreFile(path, content, 0o600); err != nil {
+		return fmt.Errorf("write node kubeconfig: %w", err)
+	}
+	return nil
+}
+
+// renderClientKubeconfig renders a kubeconfig that authenticates as user with
+// the client keypair and verifies the apiserver at server against caPEM. It is
+// the one shape both the node kubeconfig and the netserve kubeconfig take, so
+// the reader (pkg/nodecred) parses both the same way.
+func renderClientKubeconfig(server, user string, caPEM, certPEM, keyPEM []byte) []byte {
 	b64 := base64.StdEncoding.EncodeToString
-	content := fmt.Sprintf(`apiVersion: v1
+	return []byte(fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:
 - name: k3sm
@@ -1579,17 +1605,10 @@ users:
     client-key-data: %s
 `,
 		server,
-		b64(res.ClusterCAPEM),
-		"system:node:"+nodeName,
-		"system:node:"+nodeName,
-		b64(res.NodeClientCertPEM),
-		b64(res.NodeClientKeyPEM),
-	)
-	// Installed atomically (and skipped when unchanged) like every other artifact
-	// of the credential store this belongs to: a restart rewrites this file, and a
-	// half-written kubeconfig is a node that cannot authenticate.
-	if err := writeStoreFile(path, []byte(content), 0o600); err != nil {
-		return fmt.Errorf("write node kubeconfig: %w", err)
-	}
-	return nil
+		b64(caPEM),
+		user,
+		user,
+		b64(certPEM),
+		b64(keyPEM),
+	))
 }

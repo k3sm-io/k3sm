@@ -179,6 +179,39 @@ for the cluster the node is already in is ignored, so leaving one in a start scr
 The node certificate an agent receives at join is valid for one year. Nothing renews it in place, so
 renewing it means rejoining with a fresh token before it expires.
 
+### The datapath identity
+
+Each node's Service proxy, cluster DNS resolver and NetworkPolicy watcher talk to the apiserver as
+their own identity, not as the node: a client certificate with the user `k3sm:netserve:<node>` in
+the group `k3sm:netservers`, signed by the cluster's client CA. The server binds that group to the
+`k3sm:netserve` ClusterRole, which can get, list and watch Services, EndpointSlices, Namespaces,
+NetworkPolicies and Pods across the cluster, and nothing else. It cannot create anything and cannot
+read Secrets, ConfigMaps or Nodes. This is the shape k3s gives its agent controllers
+(`system:k3s-controller`).
+
+An agent receives the certificate when it joins, beside its node certificate, and stores it as
+`netserve.kubeconfig` in its work dir with the same `0600` mode. An agent that joined before this
+identity existed, or whose copy is missing or about to expire, asks the server for a new one at start,
+authenticating with its node certificate; the server issues it only for that node's own name, and
+never for longer than the node certificate has left. A worker upgraded in place therefore picks up the
+identity on its first start after the upgrade and needs no new token. The server's own datapath mints
+the same identity in memory on every start.
+
+Upgrade the server before the agents. An agent whose server does not issue this certificate yet logs
+that it cannot start and retries every half minute until the server is upgraded.
+
+With this identity every node enforces NetworkPolicy for its own Pods. To confirm what it may do:
+
+```sh
+kubectl auth can-i list pods --all-namespaces --as=k3sm:netserve:<node> --as-group=k3sm:netservers   # yes
+kubectl auth can-i list secrets --all-namespaces --as=k3sm:netserve:<node> --as-group=k3sm:netservers  # no
+```
+
+If you once added ClusterRoleBindings by hand to give the `system:nodes` group the datapath's reads,
+such as one binding the upstream `system:node` ClusterRole to that group, they are no longer needed.
+k3sm neither creates nor deletes them; remove them yourself with `kubectl delete clusterrolebinding
+<name>`.
+
 ### Node-password bindings
 
 The first join for a node name binds that name to the node's node-password, and every later join for
@@ -396,9 +429,9 @@ There are no per-node `svclb-*` pods. Each node's k3sm process holds the listene
   has the same effect.
 - `externalTrafficPolicy: Local` is not narrowed to nodes with a local endpoint. Every hosting node
   forwards to the ClusterIP, so the client source address is lost.
-- Upgrade agents first and the server last. An agent older than its server hosts nothing until it is
-  upgraded, and a newer agent under an older server leaves LoadBalancer hosting on the server alone,
-  as before.
+- Upgrade the server first and then the agents, because an agent needs its
+  [datapath identity](#the-datapath-identity) from the server. An agent older than its server hosts
+  no LoadBalancer Service until it is upgraded.
 
 ## What Crosses Nodes
 

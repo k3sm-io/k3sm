@@ -52,6 +52,7 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
+- **Workers enforce NetworkPolicy.** A worker's datapath now watches NetworkPolicies, Namespaces and every node's Pods under its own identity, so policies selecting Pods on a worker apply there, as they already did on the server. See [limitations](https://k3sm.io/docs/limitations/).
 - **The control plane runs Kubernetes v1.37.1**, and the `k8s.io` client libraries are v0.37.1.
 - **kine, etcd and etcdutl ship in the release payload**, and the node runs those copies instead of building them at boot. The bundled kine is v0.17.2 and the bundled buildx is v0.38.0.
 - **New installs start with LAN access off**, so a NodePort or LoadBalancer on a fresh install answers on this Mac and the cluster mesh only. An existing install keeps LAN access on across an upgrade. Turn it on with `sudo k3sm network lan on`.
@@ -60,6 +61,7 @@ pin, its date, and the tarball's sha256.
 
 ### Security
 
+- **Each node's datapath runs as its own identity.** The Service proxy, the cluster DNS resolver and the NetworkPolicy watcher authenticate as `k3sm:netserve:<node>` in the `k3sm:netservers` group, which the `k3sm:netserve` ClusterRole lets get, list and watch Services, EndpointSlices, Namespaces, NetworkPolicies and Pods and nothing else, instead of as the node or, on the server, as the admin. An agent receives the certificate at join; one already joined fetches it from the server at start with its node certificate. See [multi-node](https://k3sm.io/docs/multi-node/).
 - **The kubelet API binds the node's own address only**, not every interface, so port 10250 is no longer reachable from the LAN. A joined agent under `--network none` holds no mesh address and now refuses to start.
 - **Control-plane downloads are checked against their pinned digests** on the boot path, and a Developer ID-signed k3sm verifies its control-plane binaries in place and never re-signs them.
 - **The kine, etcd and registry builds pin Go's module verification settings**, so an ambient `GOSUMDB=off` or similar no longer weakens them.
@@ -92,7 +94,8 @@ pin, its date, and the tarball's sha256.
 - Every namespace's `kube-root-ca.crt` becomes the cluster CA. A Pod that read its `ca.crt` at start fails with "unknown authority" against the apiserver until it is restarted.
 - Rolling back by reinstalling the previous release publishes its self-signed certificate in `kube-root-ca.crt` again and rewrites the admin kubeconfig, so a Pod that read the cluster CA fails with "unknown authority" until it is restarted.
 - Copy every kubeconfig you took off the node again after the upgrade, for example with `kubectl config view --minify --flatten --context k3sm --raw`.
-- On a cluster using LoadBalancer Services, upgrade the agents before the server.
+- On a multi-node cluster, upgrade the server first and then the agents. An agent upgraded in place fetches its datapath identity from the server on its first start and needs no new token; under a server that does not issue it yet, the agent retries every half minute until the server is upgraded. An agent older than its server hosts no LoadBalancer Service until it is upgraded.
+- ClusterRoleBindings added by hand to give the `system:nodes` group the datapath's reads are no longer needed, and k3sm leaves them in place. Remove them with `kubectl delete clusterrolebinding <name>`.
 - A node stopped with `k3sm stop` stays stopped across an upgrade; pass `--start` to start it.
 - A node built from source needs the registry in its payload: restage with `k3sm payload` before `sudo k3sm install`.
 

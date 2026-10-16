@@ -175,7 +175,7 @@ func TestNewKubeClientResolution(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected an error for a missing kubeconfig")
 		}
-		if !strings.HasPrefix(err.Error(), "load node kubeconfig for node-local datapath: ") {
+		if !strings.HasPrefix(err.Error(), "load the netserve kubeconfig for the node-local datapath: ") {
 			t.Errorf("error = %q, want the agent's own datapath wrap", err.Error())
 		}
 	})
@@ -191,7 +191,7 @@ func TestNewKubeClientResolution(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected an error for an unparseable kubeconfig")
 		}
-		if !strings.HasPrefix(err.Error(), "load node kubeconfig for node-local datapath: ") {
+		if !strings.HasPrefix(err.Error(), "load the netserve kubeconfig for the node-local datapath: ") {
 			t.Errorf("error = %q, want the agent's own datapath wrap", err.Error())
 		}
 	})
