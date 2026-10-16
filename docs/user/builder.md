@@ -122,6 +122,16 @@ k3sm builder down       # stop it, keeping the build cache
 k3sm builder delete     # stop it and remove the build cache — a full reset
 ```
 
+These commands, and `k3sm build prune` below, need no `sudo`. They reach the
+cluster with the same kubeconfig as `k3sm kubectl`. Run as root, they use the
+control plane's admin kubeconfig in its work dir. Run as yourself, that file is
+not readable, so they use your own kubeconfig (`$KUBECONFIG`, else
+`~/.kube/config`) with the context `sudo k3sm install` merged into it. With
+`--work-dir <dir>` or `K3SM_WORK_DIR`, they use that work dir's admin kubeconfig
+and nothing else. When no kubeconfig is usable, the error names both paths: run
+the command with `sudo`, or copy the admin context into your kubeconfig with
+`sudo k3sm kubeconfig --write`.
+
 `k3sm builder up` waits until a BuildKit worker registers, then prints:
 
 ```

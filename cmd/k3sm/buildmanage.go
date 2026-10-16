@@ -259,17 +259,15 @@ func runBuildPrune(ctx context.Context, args []string, w io.Writer) error {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, buildPruneUsage) }
 	all := fs.Bool("all", false, "also remove internal, frontend and shared cache records")
 	force := fs.Bool("force", false, "prune (without this, only report what would be reclaimed)")
-	workDir := fs.String("work-dir", "", "control-plane work dir holding the admin kubeconfig (default: K3SM_WORK_DIR or the posture default)")
+	workDir := fs.String("work-dir", "", "control-plane work dir whose admin kubeconfig is used verbatim (default: K3SM_WORK_DIR, else the posture default with a fallback to your own kubeconfig)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("build prune takes no positional arguments (got %q)", fs.Arg(0))
 	}
-	if *workDir == "" {
-		*workDir = workDirFromEnv()
-	}
-	mgr, err := newBuilderManager(builderOptions{workDir: *workDir})
+	dir, explicit := builderWorkDir(*workDir)
+	mgr, err := newBuilderManager(builderOptions{workDir: dir, workDirExplicit: explicit})
 	if err != nil {
 		return err
 	}

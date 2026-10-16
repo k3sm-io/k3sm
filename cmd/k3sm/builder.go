@@ -21,10 +21,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/k3sm/pkg/builder"
 	"k3sm.io/k3sm/pkg/executor"
@@ -74,6 +77,11 @@ type builderOptions struct {
 	mirror     bool
 	timeout    time.Duration
 	workDir    string
+	// workDirExplicit is set when the operator named the work dir (--work-dir
+	// or K3SM_WORK_DIR). Its admin kubeconfig is then used verbatim, with no
+	// fallback to the user's own kubeconfig: talking to a different cluster
+	// than the one named would be a lie.
+	workDirExplicit bool
 }
 
 // runBuilder is the `k3sm builder up|down|delete|status|buildx` entry point.
@@ -111,14 +119,23 @@ func parseBuilderArgs(sub string, args []string) (builderOptions, error) {
 	fs.IntVar(&opts.port, "port", builder.DefaultTCPPort, "buildkitd tcp port the ClusterIP Service fronts")
 	fs.BoolVar(&opts.mirror, "mirror", false, "pull the buildkitd image from the k3sm GHCR mirror instead of upstream-direct")
 	fs.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "how long `up` waits for a registered worker")
-	fs.StringVar(&opts.workDir, "work-dir", "", "control-plane work dir holding the admin kubeconfig (default: K3SM_WORK_DIR or the posture default)")
+	fs.StringVar(&opts.workDir, "work-dir", "", "control-plane work dir whose admin kubeconfig is used verbatim (default: K3SM_WORK_DIR, else the posture default with a fallback to your own kubeconfig)")
 	if err := fs.Parse(args); err != nil {
 		return builderOptions{}, err
 	}
-	if opts.workDir == "" {
-		opts.workDir = workDirFromEnv()
-	}
+	opts.workDir, opts.workDirExplicit = builderWorkDir(opts.workDir)
 	return opts, nil
+}
+
+// builderWorkDir resolves a builder verb's --work-dir flag value: the flag when
+// given, else K3SM_WORK_DIR, else the posture default (workDirFromEnv). The
+// second result reports whether the operator named the work dir, which pins its
+// admin kubeconfig with no fallback.
+func builderWorkDir(flagValue string) (string, bool) {
+	if flagValue != "" {
+		return flagValue, true
+	}
+	return workDirFromEnv(), os.Getenv("K3SM_WORK_DIR") != ""
 }
 
 // builderConfig maps parsed flags to a builder.Config. Pure, so the flag-to-spec
@@ -135,19 +152,92 @@ func builderConfig(opts builderOptions) builder.Config {
 	}
 }
 
-// newBuilderManager builds a Manager against the admin kubeconfig. It is the
-// legible-absence boundary for a missing control plane: no kubeconfig means the
-// error names `k3sm server`, not a bare file-not-found.
+// newBuilderManager builds a Manager against the cluster this account can
+// reach, resolved the way `k3sm kubectl` resolves it (builderKubeconfig). It is
+// the legible-absence boundary for a missing control plane: no usable
+// kubeconfig means the error names the fix, not a bare file-not-found.
 func newBuilderManager(opts builderOptions) (*builder.Manager, error) {
-	kc := executor.KubeconfigPath(opts.workDir)
-	if !fileExists(kc) {
-		return nil, fmt.Errorf("kubeconfig %s not found — run `k3sm server` first (set --work-dir or K3SM_WORK_DIR if you used a non-default `k3sm server --work-dir`)", kc)
-	}
-	restCfg, cs, err := kubeclient.FromPath(kc)
+	restCfg, cs, err := builderClients(builderKubeInputs(opts))
 	if err != nil {
-		return nil, fmt.Errorf("load kubeconfig %s: %w", kc, err)
+		return nil, err
 	}
 	return builderManagerFrom(restCfg, cs, opts), nil
+}
+
+// builderKubeInputs gathers the kubeconfig choice's inputs from this process:
+// the builder's work dir (pinned when explicit), $KUBECONFIG, the home dir and
+// the installed context name.
+func builderKubeInputs(opts builderOptions) kubectlInputs {
+	home, _ := os.UserHomeDir()
+	in := kubectlInputs{
+		workDir:       opts.workDir,
+		kubeconfigEnv: os.Getenv("KUBECONFIG"),
+		home:          home,
+		contextName:   installedKubeconfigName(),
+		exists:        fileExists,
+	}
+	if opts.workDirExplicit {
+		in.workDirOverride = opts.workDir
+	}
+	return in
+}
+
+// builderKubeconfig picks the credentials the builder verbs run with. The
+// choice is resolveKubectlConfig's, so the builder and `k3sm kubectl` agree:
+// the work dir's admin kubeconfig when it is readable (root, the _k3sm service
+// user) or explicitly named, else the user's $KUBECONFIG or ~/.kube/config
+// pinned to the installed context. Only the errors are the builder's own: an
+// explicit work dir keeps its `k3sm server` message, and the ordinary user with
+// neither kubeconfig is told both paths and both ways out.
+func builderKubeconfig(in kubectlInputs) (kubectlConfig, error) {
+	cfg, err := resolveKubectlConfig(in)
+	if err == nil {
+		return cfg, nil
+	}
+	kc := executor.KubeconfigPath(in.workDir)
+	if in.workDirOverride != "" {
+		return kubectlConfig{}, fmt.Errorf("kubeconfig %s not found — run `k3sm server` first (set --work-dir or K3SM_WORK_DIR if you used a non-default `k3sm server --work-dir`)", kc)
+	}
+	user := "~/.kube/config"
+	if c := userKubeconfigCandidates(in.kubeconfigEnv, in.home); len(c) > 0 {
+		user = strings.Join(c, " or ")
+	}
+	return kubectlConfig{}, fmt.Errorf("no kubeconfig for the build engine: %s is not readable by this account and %s does not exist — run with sudo, or copy the admin kubeconfig into yours with `sudo k3sm kubeconfig --write`", kc, user)
+}
+
+// builderClients resolves the builder's kubeconfig and builds the rest.Config
+// and clientset from it. The user-kubeconfig case reads exactly the files
+// builderKubeconfig looked at ($KUBECONFIG's list when set, else ~/.kube/config
+// under in.home), with the installed context pinned rather than the file's
+// current-context.
+func builderClients(in kubectlInputs) (*rest.Config, kubernetes.Interface, error) {
+	cfg, err := builderKubeconfig(in)
+	if err != nil {
+		return nil, nil, err
+	}
+	if cfg.kubeconfig != "" {
+		restCfg, cs, err := kubeclient.FromPath(cfg.kubeconfig)
+		if err != nil {
+			return nil, nil, fmt.Errorf("load kubeconfig %s: %w", cfg.kubeconfig, err)
+		}
+		return restCfg, cs, nil
+	}
+	rules := &clientcmd.ClientConfigLoadingRules{}
+	if in.kubeconfigEnv != "" {
+		rules.Precedence = filepath.SplitList(in.kubeconfigEnv)
+	} else {
+		rules.Precedence = []string{filepath.Join(in.home, ".kube", "config")}
+	}
+	restCfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules,
+		&clientcmd.ConfigOverrides{CurrentContext: cfg.context}).ClientConfig()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load kubeconfig context %q from %s: %w", cfg.context, strings.Join(rules.Precedence, ":"), err)
+	}
+	cs, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build kubernetes client: %w", err)
+	}
+	return restCfg, cs, nil
 }
 
 // builderManagerFrom is the client-injected seam newBuilderManager wraps, so the

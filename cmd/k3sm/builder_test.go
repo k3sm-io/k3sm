@@ -98,7 +98,7 @@ func TestBuilderUsageListsDelete(t *testing.T) {
 // TestBuilderAbsentControlPlaneIsLegible pins that a missing kubeconfig names the
 // fix (`k3sm server`) rather than surfacing a bare file-not-found.
 func TestBuilderAbsentControlPlaneIsLegible(t *testing.T) {
-	opts := builderOptions{workDir: t.TempDir()}
+	opts := builderOptions{workDir: t.TempDir(), workDirExplicit: true}
 	_, err := newBuilderManager(opts)
 	if err == nil {
 		t.Fatal("expected an error for a missing kubeconfig")

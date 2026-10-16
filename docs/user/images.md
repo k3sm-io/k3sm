@@ -156,6 +156,11 @@ before it could finish has no process to stop, so `cancel` marks it `cancelled`.
 refuses a running build: cancel it first. A build is reached by its full ID, as `k3sm build ls`
 shows it.
 
+`k3sm build prune` and the `k3sm builder` commands talk to the build engine on the cluster, and
+need no `sudo`: as yourself they use your own kubeconfig with the context `sudo k3sm install`
+merged into it, the same one `k3sm kubectl` uses. See
+[managing the engine](builder.md#managing-the-engine).
+
 ### Deliberate Differences From `docker build`
 
 Each of these is a documented difference:

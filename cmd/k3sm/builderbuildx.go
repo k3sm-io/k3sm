@@ -54,7 +54,9 @@ type buildxSession struct {
 // that needs a real builder gets one, which is the whole point of there being a
 // single build command.
 func newBuildxSession(ctx context.Context, workDir string, bootstrap bool, out io.Writer) (buildxSession, error) {
-	mgr, err := newBuilderManager(builderOptions{workDir: workDir})
+	// The buildx session stages its binary and config under workDir, so it
+	// keeps that work dir's admin kubeconfig with no user fallback.
+	mgr, err := newBuilderManager(builderOptions{workDir: workDir, workDirExplicit: true})
 	if err != nil {
 		return buildxSession{}, err
 	}
