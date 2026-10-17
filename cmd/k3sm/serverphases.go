@@ -43,6 +43,7 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/interconnect"
 	"k3sm.io/k3sm/pkg/mlx/operator"
+	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
 	"k3sm.io/k3sm/pkg/registrysvc"
@@ -63,14 +64,22 @@ func noStop() {}
 // provisionServerCluster is steps 3–3b: the cluster-scoped admission policies +
 // the vm RuntimeClass, and the fail-closed RBAC graph. Step 3c, the embedded
 // add-ons, is startEmbeddedAddons.
-func provisionServerCluster(ctx context.Context, plan serverPlan, cs kubernetes.Interface, logger *slog.Logger) error {
+//
+// The admission policies go through policy.NewClient, built from restCfg: cs keeps
+// client-go's default 5 QPS limiter, which paced the policy reconcile at about a
+// second per drifted object.
+func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) error {
 	opts := plan.opts
+	pcs, err := policy.NewClient(restCfg)
+	if err != nil {
+		return err
+	}
 	// 3. Provision the cluster-scoped admission policies + the vm RuntimeClass.
 	// Extracted so the SET is testable against a fake clientset: what this
 	// binary provisions is a posture-INDEPENDENT product decision, and a silently
 	// absent policy is otherwise invisible until a real cluster admits something it
 	// should have rejected.
-	provisionClusterPolicies(ctx, cs, plan.mode, os.Geteuid(), opts.deniedLocalPorts(), logger)
+	provisionClusterPolicies(ctx, pcs, plan.mode, os.Geteuid(), opts.deniedLocalPorts(), logger)
 
 	// 3b. Provision the RBAC graph BEFORE the VK node (step 5) and the
 	// worker-join supervisor (step 4d) start, so a joining worker's system:node

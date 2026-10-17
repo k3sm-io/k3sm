@@ -603,7 +603,7 @@ func runServer(args []string) (err error) {
 		return err
 	}
 	// 3–3c. Admission policies, the fail-closed RBAC graph, the embedded add-ons.
-	if err = provisionServerCluster(ctx, plan, cs, logger); err != nil {
+	if err = provisionServerCluster(ctx, plan, restCfg, cs, logger); err != nil {
 		return err
 	}
 	stopAddons := startEmbeddedAddons(ctx, plan, restCfg, cs, logger)
