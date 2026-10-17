@@ -141,8 +141,8 @@ func TestRegistryAuthChainOrder(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Authorization: %v", err)
 		}
-		if cfg.RegistryToken != "an-explicit-token" {
-			t.Errorf("RegistryToken = %q, want the env token", cfg.RegistryToken)
+		if cfg.Password != "an-explicit-token" || cfg.RegistryToken != "" {
+			t.Errorf("resolved password %q, registry token set %v; want the env token as the password", cfg.Password, cfg.RegistryToken != "")
 		}
 		if cfg.Password == cred.Password {
 			t.Error("the local credential shadowed an explicitly set token")

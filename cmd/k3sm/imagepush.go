@@ -40,10 +40,18 @@ import (
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
-// registryTokenEnv overrides the docker config chain with a bearer token read
-// from the environment. It exists for the non-interactive case — a lab Mac or a
-// release step that holds a token but has never run `docker login`.
+// registryTokenEnv overrides the docker config chain with a token read from the
+// environment. It exists for the non-interactive case — a lab Mac or a release
+// step that holds a token but has never run `docker login`.
 const registryTokenEnv = "K3SM_REGISTRY_TOKEN"
+
+// registryUserEnv names the user the env token is presented with. Registries
+// that authenticate a personal access token by its own value (ghcr among them)
+// ignore it, so it defaults to defaultRegistryUser.
+const registryUserEnv = "K3SM_REGISTRY_USER"
+
+// defaultRegistryUser is the user when registryUserEnv is unset.
+const defaultRegistryUser = "token"
 
 // The push failure modes an operator acts on differently. They are sentinels
 // rather than message text because "the credential was refused" and "the host
@@ -226,8 +234,20 @@ func registryAuth(ref name.Reference, workDir string) (authn.Authenticator, erro
 	// substitution, both of which carry the trailing newline into the value —
 	// and a bearer token with a newline in it is rejected as a bad credential,
 	// which reads to the operator like the wrong token rather than a stray byte.
+	//
+	// The token is a username/password credential, exactly what `docker login`
+	// stores, NOT a RegistryToken: go-containerregistry sends a RegistryToken as
+	// a raw bearer and never exchanges it, which ghcr, Docker Hub and most
+	// hosted registries refuse. As a password it is sent as basic auth to a
+	// registry that issues a Basic challenge, and traded at the token realm for
+	// a scoped token on a Bearer challenge, by the library's own exchange (which
+	// also vets the realm URL).
 	if token := strings.TrimSpace(os.Getenv(registryTokenEnv)); token != "" {
-		return authn.FromConfig(authn.AuthConfig{RegistryToken: token}), nil
+		user := strings.TrimSpace(os.Getenv(registryUserEnv))
+		if user == "" {
+			user = defaultRegistryUser
+		}
+		return authn.FromConfig(authn.AuthConfig{Username: user, Password: token}), nil
 	}
 	if local := localRegistryAuth(ref, workDir); local != nil {
 		return local, nil
