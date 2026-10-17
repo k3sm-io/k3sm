@@ -737,7 +737,7 @@ Runbook:
   **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for a later
   release), and it passes against the release build. See
   [`vm` RuntimeClass](vm-runtimeclass.md).
-- **Multi-node** ships as documented **EXPERIMENTAL**, preview-quality until it graduates in a
+- **Multi-node** ships as documented **EXPERIMENTAL** until it graduates in a
   later release. See [Multi-node](multi-node.md).
 - **A two-server (HA) control plane is experimental, from v0.1.7.** `sudo k3sm install
   --cluster-init` forms an embedded etcd control plane on the first server and

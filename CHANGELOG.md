@@ -117,7 +117,7 @@ pin, its date, and the tarball's sha256.
 
 ## v0.1.7 — 2026-10-05
 
-`vm` Pods answer on their own pod IP from anywhere in the cluster, and two Macs can run the control plane together as an experimental preview.
+`vm` Pods answer on their own pod IP from anywhere in the cluster, and two Macs can run the control plane together as an experimental feature.
 
 ### Added
 

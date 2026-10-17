@@ -7,7 +7,7 @@
 # frontend over the network — and to demonstrate one Linux Pod consuming another
 # through a Service.
 #
-# > The `vm` RuntimeClass is EXPERIMENTAL and preview-quality. See
+# > The `vm` RuntimeClass is EXPERIMENTAL. See
 # > docs/user/vm-runtimeclass.md and docs/user/limitations.md before depending on it.
 #
 # It depends on temporal-dev-server.yaml being applied first: TEMPORAL_ADDRESS

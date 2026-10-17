@@ -9,8 +9,8 @@ too, in a per-pod Virtualization.framework micro-VM, through an opt-in RuntimeCl
 run on any path yet.
 
 The latest release is a pre-release, v0.1.7 (2026-10-05). The control plane on `main` embeds
-Kubernetes v1.37.1. Multi-node clusters, two Macs joined over a wireguard mesh, are a preview, and
-so is a control plane shared by two servers; both graduate in a later release. Models served on
+Kubernetes v1.37.1. Multi-node clusters, two Macs joined over a wireguard mesh, and a control plane shared by
+two servers are experimental; both graduate in a later release. Models served on
 the Mac's GPU with MLX have their own resource and CRD (`mlx.k3sm.io/gpu` and `MLXModel`). The
 [roadmap](ROADMAP.md) says what has shipped and what comes next.
 
