@@ -24,7 +24,7 @@ import "testing"
 // admission and the svclb refusal disagree about the same port.
 func TestReservedSetMatchesPredicate(t *testing.T) {
 	set := ReservedSet()
-	for _, p := range []int{0, 80, 443, 1023, 1024, 8080, 10249, 10250, 10251, 29999, 30000, 30500, 32767, 32768, 65535} {
+	for _, p := range []int{0, 21, 22, 23, 53, 80, 88, 443, 445, 548, 631, 1023, 1024, 8080, 10249, 10250, 10251, 29999, 30000, 30500, 32767, 32768, 65535} {
 		if got, want := set[int32(p)], Reserved(p); got != want {
 			t.Errorf("ReservedSet()[%d] = %v, Reserved(%d) = %v — the set and the predicate must agree", p, got, p, want)
 		}
@@ -47,6 +47,14 @@ func TestReservedBoundaries(t *testing.T) {
 		{10249, false},
 		{80, false},
 		{443, false},
+		{22, true},
+		{53, true},
+		{88, true},
+		{445, true},
+		{548, true},
+		{631, true},
+		{21, false},
+		{632, false},
 	}
 	for _, tt := range tests {
 		if got := Reserved(tt.port); got != tt.want {
@@ -60,5 +68,18 @@ func TestReservedBoundaries(t *testing.T) {
 func TestNodePortRangeRendersTheBounds(t *testing.T) {
 	if got, want := NodePortRange(), "30000-32767"; got != want {
 		t.Errorf("NodePortRange() = %q, want %q", got, want)
+	}
+}
+
+// TestHostServicePortsIsACopy pins that a caller cannot edit the reserved set
+// through the slice it was handed.
+func TestHostServicePortsIsACopy(t *testing.T) {
+	got := HostServicePorts()
+	if len(got) != 6 || got[0] != 22 || got[5] != 631 {
+		t.Fatalf("HostServicePorts() = %v, want [22 53 88 445 548 631]", got)
+	}
+	got[0] = 2222
+	if !Reserved(22) || Reserved(2222) {
+		t.Error("editing the returned slice changed the reserved set")
 	}
 }

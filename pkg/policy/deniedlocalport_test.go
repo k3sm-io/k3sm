@@ -159,7 +159,7 @@ func TestReservedPortClauseRejectsDeniedLocalPorts(t *testing.T) {
 	// INDEPENDENCE, asserted from the other side: the same NodePort-range clash
 	// this policy admits is rejected by the sibling, with the sibling's reason.
 	t.Run("a NodePort-range clash still reports the reserved-listener reason", func(t *testing.T) {
-		lb := celProgram(t, reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort))
+		lb := celProgram(t, reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort, ports.HostServicePorts()))
 		out, _, err := lb.Eval(map[string]any{"object": service("LoadBalancer", 30500)})
 		if err != nil {
 			t.Fatalf("eval sibling: %v", err)
@@ -167,7 +167,7 @@ func TestReservedPortClauseRejectsDeniedLocalPorts(t *testing.T) {
 		if out.Value().(bool) {
 			t.Fatal("the sibling policy must still reject a LoadBalancer Service in the NodePort range")
 		}
-		msgPrg := celProgram(t, reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort))
+		msgPrg := celProgram(t, reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort, ports.HostServicePorts()))
 		mout, _, err := msgPrg.Eval(map[string]any{"object": service("LoadBalancer", 30500)})
 		if err != nil {
 			t.Fatalf("eval sibling message: %v", err)

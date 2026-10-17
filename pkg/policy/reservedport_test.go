@@ -75,7 +75,7 @@ func service(svcType string, portNumbers ...int) map[string]any {
 // "rejects a plain NodePort Service" and turn the mandated acceptance into a
 // false red.
 func TestReservedLoadBalancerPortCELSemantics(t *testing.T) {
-	prg := celProgram(t, reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort))
+	prg := celProgram(t, reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort, ports.HostServicePorts()))
 
 	tests := []struct {
 		name      string
@@ -89,6 +89,14 @@ func TestReservedLoadBalancerPortCELSemantics(t *testing.T) {
 		{"LB with one good and one reserved port is REJECTED", service("LoadBalancer", 8080, 10250), false},
 		{"an ordinary LB port is admitted", service("LoadBalancer", 8080), true},
 		{"LB on 80/443 is admitted (the ingress ports are deliberately NOT reserved)", service("LoadBalancer", 80, 443), true},
+		{"LB on Remote Login's 22 is REJECTED", service("LoadBalancer", 22), false},
+		{"LB on the DNS port 53 is REJECTED", service("LoadBalancer", 53), false},
+		{"LB on Kerberos 88 is REJECTED", service("LoadBalancer", 88), false},
+		{"LB on SMB 445 is REJECTED", service("LoadBalancer", 445), false},
+		{"LB on AFP 548 is REJECTED", service("LoadBalancer", 548), false},
+		{"LB on CUPS 631 is REJECTED", service("LoadBalancer", 631), false},
+		{"LB beside a host-service port is admitted", service("LoadBalancer", 21, 81, 632), true},
+		{"a ClusterIP Service on 22 is admitted", service("ClusterIP", 22), true},
 		{"LB just outside the range is admitted", service("LoadBalancer", 29999, 32768), true},
 		// The load-bearing acceptance: the apiserver ALLOCATES a NodePort
 		// Service's nodePort out of the very range this guards, so rejecting a
@@ -122,7 +130,7 @@ func TestReservedLoadBalancerPortCELSemantics(t *testing.T) {
 // over refuse-and-park, so a message that does not name the port fails the point
 // of the change.
 func TestReservedLoadBalancerPortMessageNamesThePort(t *testing.T) {
-	prg := celProgram(t, reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort))
+	prg := celProgram(t, reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort, ports.HostServicePorts()))
 	out, _, err := prg.Eval(map[string]any{"object": service("LoadBalancer", 8080, 30500)})
 	if err != nil {
 		t.Fatalf("eval: %v", err)
@@ -149,15 +157,15 @@ func TestReservedLoadBalancerPortMessageNamesThePort(t *testing.T) {
 // DERIVATION — an expression with 30000-32767 hard-written into it would pass
 // every evaluation case above while silently ignoring a future range change.
 func TestReservedLoadBalancerPortCELDerivesItsBounds(t *testing.T) {
-	const sentinelMin, sentinelMax, sentinelKubelet = 40000, 40001, 44444
-	expr := reservedLBPortExpr(sentinelMin, sentinelMax, sentinelKubelet)
+	const sentinelMin, sentinelMax, sentinelKubelet, sentinelHost = 40000, 40001, 44444, 45555
+	expr := reservedLBPortExpr(sentinelMin, sentinelMax, sentinelKubelet, []int{sentinelHost})
 
-	for _, want := range []int{sentinelMin, sentinelMax, sentinelKubelet} {
+	for _, want := range []int{sentinelMin, sentinelMax, sentinelKubelet, sentinelHost} {
 		if !strings.Contains(expr, strconv.Itoa(want)) {
 			t.Errorf("expression must carry the sentinel bound %d, got:\n%s", want, expr)
 		}
 	}
-	for _, forbidden := range []int{ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort} {
+	for _, forbidden := range append([]int{ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort}, ports.HostServicePorts()...) {
 		if strings.Contains(expr, strconv.Itoa(forbidden)) {
 			t.Errorf("expression must NOT carry the production constant %d — it is hard-written, not derived; got:\n%s", forbidden, expr)
 		}
@@ -169,8 +177,8 @@ func TestReservedLoadBalancerPortCELDerivesItsBounds(t *testing.T) {
 		port      int
 		wantAdmit bool
 	}{
-		{40000, false}, {40001, false}, {44444, false},
-		{39999, true}, {40002, true}, {30500, true}, {10250, true},
+		{40000, false}, {40001, false}, {44444, false}, {45555, false},
+		{39999, true}, {40002, true}, {30500, true}, {10250, true}, {22, true}, {631, true},
 	} {
 		out, _, err := prg.Eval(map[string]any{"object": service("LoadBalancer", tc.port)})
 		if err != nil {
@@ -226,7 +234,7 @@ func TestEnsureRejectReservedLoadBalancerPortShape(t *testing.T) {
 		t.Fatalf("validations = %d, want 1", len(p.Spec.Validations))
 	}
 	v := p.Spec.Validations[0]
-	if v.Expression != reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort) {
+	if v.Expression != reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort, ports.HostServicePorts()) {
 		t.Error("the provisioned expression must be the derived one, not a literal")
 	}
 	if v.MessageExpression == "" {
@@ -260,8 +268,8 @@ var updateGolden = flag.Bool("update", false, "rewrite the golden CEL files from
 // then review the resulting diff.
 func TestReservedLoadBalancerPortGolden(t *testing.T) {
 	golden := filepath.Join("testdata", "reserved-loadbalancer-port.cel")
-	got := reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort) + "\n" +
-		reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort) + "\n"
+	got := reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort, ports.HostServicePorts()) + "\n" +
+		reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort, ports.HostServicePorts()) + "\n"
 	if *updateGolden {
 		if err := os.WriteFile(golden, []byte(got), 0o644); err != nil {
 			t.Fatalf("write golden %s: %v", golden, err)

@@ -154,17 +154,21 @@ func nodeAdvertiseAddr(opts nodeOptions, log *slog.Logger) netip.Addr {
 // OWN client. Its listeners bind the IPv4 wildcard while LAN access is on and
 // the node's own address and 127.0.0.1 while it is off.
 //
-// On a node with the netd helper, a port in the operator's
-// --lb-privileged-ports list binds through the helper on every address, the
-// wildcard included (hosterBinder), and every other port binds in-process: an
-// unlisted port below 1024 is served on the wildcard (no privilege needed) and
-// not on a specific set, as before the list existed. Routing by the list
-// rather than by netd's answer keeps one owner per listed port: Darwin refuses
+// On a node with the netd helper, every bind below 1024 goes through the
+// helper (hosterBinder), whatever its address and whether or not the port is in
+// the operator's --lb-privileged-ports list; ports of 1024 and above bind
+// in-process. The list decides only what the helper grants on this node's own
+// addresses (127.0.0.1, the node address) while LAN access is off: a listed
+// port is served there, an unlisted one is refused and its Service unserved
+// until LAN access is back on, when the helper grants its wildcard. Routing
+// every privileged bind to the helper keeps one owner per port: Darwin refuses
 // an unprivileged wildcard bind while another user's socket holds a specific
-// address on the same port, so a root node-address listener and an in-process
-// wildcard could never be swapped bind-before-close. A helper refusal of a
-// listed port leaves its Service unserved, and the next reconcile asks again.
-// A node with no helper keeps the in-process binder (nil) for everything.
+// address on the same port, and netd itself holds the Service proxy's root
+// ClusterIP VIP socket on every Service port below 1024, so an in-process
+// wildcard bound only when it won the race against that VIP bind and never
+// re-bound after a LAN access swap. A helper refusal leaves its Service
+// unserved, and the next reconcile asks again. A node with no helper keeps the
+// in-process binder (nil) for everything.
 //
 // ReservedPorts is the datapath-side half of the reserved-port guard (the
 // admission VAP is the legible half), from the same single source as the CEL
@@ -192,9 +196,8 @@ func lbHosterConfig(cs kubernetes.Interface, opts nodeOptions, log *slog.Logger)
 		IngressService: types.NamespacedName{Namespace: ingresshost.ServiceNamespace, Name: ingresshost.ServiceName},
 		Logger:         log,
 	}
-	if socket != "" && len(opts.lbPrivilegedPorts) > 0 {
+	if socket != "" {
 		cfg.Binder = hosterBinder{
-			listed: slices.Clone(opts.lbPrivilegedPorts),
 			// The netdBinder adapter, as for the ingress host: svclb asks for
 			// "tcp4" on an IPv4 address and netd's wire speaks only "tcp".
 			privileged: netdBinder{netd: &netbind.Netd{Client: wire.NewClient(socket)}},
@@ -205,17 +208,18 @@ func lbHosterConfig(cs kubernetes.Interface, opts nodeOptions, log *slog.Logger)
 	return cfg
 }
 
-// hosterBinder routes a svclb listener on a listed port to privileged (the
-// netd helper), whatever its address, and every other listener to direct.
+// hosterBinder routes every svclb listener below 1024 to privileged (the netd
+// helper), whatever its address and whether or not its port is listed, and
+// every other listener to direct. It never sees an ingress-declared port: the
+// hoster reserves those before it binds.
 type hosterBinder struct {
-	listed     []uint16
 	privileged netbind.Binder
 	direct     netbind.Binder
 }
 
 // Listen binds addr through the binder its port selects.
 func (b hosterBinder) Listen(ctx context.Context, network string, addr netip.AddrPort) (net.Listener, error) {
-	if addr.Port() < privilegedPortCeiling && slices.Contains(b.listed, addr.Port()) {
+	if addr.Port() < privilegedPortCeiling {
 		return b.privileged.Listen(ctx, network, addr)
 	}
 	return b.direct.Listen(ctx, network, addr)

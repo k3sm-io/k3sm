@@ -292,7 +292,8 @@ the database's schema or encoding changes, and no backup is taken for it.
 
 The release that moved LoadBalancer listeners to the wildcard also provisions a
 `ValidatingAdmissionPolicy` that **rejects** a `type: LoadBalancer` Service declaring a port k3sm's own
-listeners own, either the NodePort range `30000-32767` or the kubelet API port `10250`. It matches on
+listeners own, either the NodePort range `30000-32767` or the kubelet API port `10250`. A later
+release adds the macOS host-service ports `22`, `53`, `88`, `445`, `548` and `631`. It matches on
 CREATE **and** UPDATE, and it does **not** ratchet on `oldObject`.
 
 That means a cluster **already carrying** such a Service is not grandfathered in. The object stays in
@@ -305,7 +306,8 @@ Check before you upgrade:
 ```sh
 kubectl get svc -A -o json | jq -r '
   .items[] | select(.spec.type=="LoadBalancer")
-  | select(.spec.ports[]? | .port==10250 or (.port>=30000 and .port<=32767))
+  | select(.spec.ports[]? | .port==10250 or (.port>=30000 and .port<=32767)
+      or ([.port] | inside([22,53,88,445,548,631])))
   | "\(.metadata.namespace)/\(.metadata.name)"'
 ```
 

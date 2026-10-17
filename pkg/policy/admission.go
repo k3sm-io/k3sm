@@ -19,6 +19,7 @@ package policy
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
@@ -162,12 +163,28 @@ const udpServiceExpr = `object.spec.ports.all(p, !has(p.protocol) || p.protocol 
 
 // reservedPortClause is the CEL sub-expression testing whether the port of the
 // Service port bound to variable p falls in the reserved set: the NodePort range,
-// or the kubelet API port. The bounds are interpolated from their arguments —
-// pkg/ports at the one call site — so no reserved-port literal is ever written
-// into CEL by hand.
-func reservedPortClause(p string, nodePortMin, nodePortMax, kubeletPort int) string {
-	return fmt.Sprintf("((%[1]s.port >= %[2]d && %[1]s.port <= %[3]d) || %[1]s.port == %[4]d)",
+// the kubelet API port, or a macOS host-service port. The values are
+// interpolated from their arguments (pkg/ports at the one call site), so no
+// reserved-port literal is ever written into CEL by hand.
+func reservedPortClause(p string, nodePortMin, nodePortMax, kubeletPort int, hostPorts []int) string {
+	clause := fmt.Sprintf("(%[1]s.port >= %[2]d && %[1]s.port <= %[3]d) || %[1]s.port == %[4]d",
 		p, nodePortMin, nodePortMax, kubeletPort)
+	for _, hp := range hostPorts {
+		clause += fmt.Sprintf(" || %s.port == %d", p, hp)
+	}
+	return "(" + clause + ")"
+}
+
+// joinPorts renders ports for a message: "22, 53 and 88".
+func joinPorts(ports []int) string {
+	names := make([]string, 0, len(ports))
+	for _, p := range ports {
+		names = append(names, strconv.Itoa(p))
+	}
+	if len(names) < 2 {
+		return strings.Join(names, "")
+	}
+	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
 }
 
 // reservedLBPortExpr is the CEL the Deny policy enforces on Service create and
@@ -184,10 +201,10 @@ func reservedPortClause(p string, nodePortMin, nodePortMax, kubeletPort int) str
 // plain NodePort Service's nodePort out of the very range this guards, so keying on
 // nodePort — or dropping the type scope — would reject every NodePort Service in the
 // cluster. The has() guards tolerate a Service that omits type or ports.
-func reservedLBPortExpr(nodePortMin, nodePortMax, kubeletPort int) string {
+func reservedLBPortExpr(nodePortMin, nodePortMax, kubeletPort int, hostPorts []int) string {
 	return "!has(object.spec.type) || object.spec.type != 'LoadBalancer' || " +
 		"!has(object.spec.ports) || " +
-		"object.spec.ports.all(p, !" + reservedPortClause("p", nodePortMin, nodePortMax, kubeletPort) + ")"
+		"object.spec.ports.all(p, !" + reservedPortClause("p", nodePortMin, nodePortMax, kubeletPort, hostPorts) + ")"
 }
 
 // reservedLBPortMessageExpr renders the rejection message, naming the first
@@ -199,10 +216,11 @@ func reservedLBPortExpr(nodePortMin, nodePortMax, kubeletPort int) string {
 // reserved ports only. Two Services declaring the same ordinary LoadBalancer port
 // are still first-come — the second one's listener simply fails to bind and its
 // status stays empty.
-func reservedLBPortMessageExpr(nodePortMin, nodePortMax, kubeletPort int) string {
+func reservedLBPortMessageExpr(nodePortMin, nodePortMax, kubeletPort int, hostPorts []int) string {
 	return `'k3sm: LoadBalancer port ' + ` +
-		`string(object.spec.ports.filter(p, ` + reservedPortClause("p", nodePortMin, nodePortMax, kubeletPort) + `)[0].port) + ` +
-		fmt.Sprintf(`' is RESERVED by a k3sm wildcard listener (the NodePort range %d-%d and the kubelet API port %d). `, nodePortMin, nodePortMax, kubeletPort) +
+		`string(object.spec.ports.filter(p, ` + reservedPortClause("p", nodePortMin, nodePortMax, kubeletPort, hostPorts) + `)[0].port) + ` +
+		fmt.Sprintf(`' is RESERVED by a k3sm wildcard listener (the NodePort range %d-%d and the kubelet API port %d) or for a macOS host service (%s: Remote Login, DNS, Kerberos, file and printer sharing). `, nodePortMin, nodePortMax, kubeletPort, joinPorts(hostPorts)) +
+		`A tenant listener on a host-service port would keep that service from starting on this Mac. ` +
 		`k3sm binds LoadBalancer ports on 0.0.0.0 and Go sets no SO_REUSEPORT, so a k3sm-served Service would race a k3sm listener for the same socket ` +
 		`— losing the kubelet API port breaks logs/exec/top on this node, and a NodePort-range collision takes down an unrelated ClusterIP. ` +
 		`Choose a different spec.ports[].port. Only these RESERVED ports are rejected: two Services sharing an ordinary LoadBalancer port are still first-come. ` +
@@ -258,9 +276,9 @@ func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Int
 				}},
 			},
 			Validations: []admissionregistrationv1.Validation{{
-				Expression:        reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort),
-				MessageExpression: reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort),
-				Message:           "k3sm: this LoadBalancer Service declares a port reserved by a k3sm wildcard listener (the NodePort range or the kubelet API port); choose a different spec.ports[].port",
+				Expression:        reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort, ports.HostServicePorts()),
+				MessageExpression: reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort, ports.HostServicePorts()),
+				Message:           "k3sm: this LoadBalancer Service declares a reserved port (the NodePort range, the kubelet API port, or a macOS host-service port); choose a different spec.ports[].port",
 				Reason:            reasonInvalid(),
 			}},
 		},
@@ -293,7 +311,8 @@ func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Int
 // into CEL by hand.
 //
 // It is written fresh rather than on reservedPortClause: that helper renders a
-// RANGE plus one singleton (the NodePort range, the kubelet API port), which is
+// RANGE plus fixed singletons (the NodePort range, the kubelet API port, the
+// macOS host-service ports), which is
 // not the shape of an arbitrary denied-port set, and it is reached only from an
 // expression that gates on type: LoadBalancer — the one gate this policy must NOT
 // inherit (see deniedLocalPortExpr).

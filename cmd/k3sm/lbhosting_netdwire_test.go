@@ -52,9 +52,10 @@ func (l socketlessListener) Addr() net.Addr          { return net.TCPAddrFromAdd
 // TestHosterBinderSpeaksTheNetdWireProtocol drives the svclb hoster's binder
 // with the "tcp4" network svclb asks for on an IPv4 address, against a daemon
 // stand-in that refuses every protocol but "tcp" and "udp". A listed port must
-// bind on the wildcard and on a specific address through the netdBinder
-// adapter lbHosterConfig puts on the netd leg; the same requests handed to the
-// daemon with no adapter are refused, which keeps the test non-vacuous.
+// bind on the wildcard and on a specific address, and an unlisted port below
+// 1024 on the wildcard, through the netdBinder adapter lbHosterConfig puts on
+// the netd leg; the same requests handed to the daemon with no adapter are
+// refused, which keeps the test non-vacuous.
 func TestHosterBinderSpeaksTheNetdWireProtocol(t *testing.T) {
 	opts := gateNodeOptions()
 	opts.lbPrivilegedPorts = []uint16{80}
@@ -69,18 +70,18 @@ func TestHosterBinderSpeaksTheNetdWireProtocol(t *testing.T) {
 	if _, ok := adapter.netd.(*netbind.Netd); !ok {
 		t.Fatalf("the adapter wraps %T, want *netbind.Netd", adapter.netd)
 	}
-	addrs := []netip.AddrPort{netip.MustParseAddrPort("0.0.0.0:80"), netip.MustParseAddrPort("100.64.0.1:80")}
+	addrs := []netip.AddrPort{netip.MustParseAddrPort("0.0.0.0:80"), netip.MustParseAddrPort("100.64.0.1:80"), netip.MustParseAddrPort("0.0.0.0:81")}
 
 	daemon := &wireContractNetd{}
 	adapter.netd = daemon
 	hb.privileged = adapter
 	for _, ap := range addrs {
 		if _, err := hb.Listen(context.Background(), "tcp4", ap); err != nil {
-			t.Errorf("hoster bind of listed %s over tcp4 failed: %v", ap, err)
+			t.Errorf("hoster bind of %s over tcp4 failed: %v", ap, err)
 		}
 	}
-	if !slices.Equal(daemon.protocols, []string{"tcp", "tcp"}) {
-		t.Errorf("the daemon saw protocols %v, want tcp for both binds", daemon.protocols)
+	if !slices.Equal(daemon.protocols, []string{"tcp", "tcp", "tcp"}) {
+		t.Errorf("the daemon saw protocols %v, want tcp for all three binds (the unlisted wildcard on 81 included)", daemon.protocols)
 	}
 
 	bare := &wireContractNetd{}
