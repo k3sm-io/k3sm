@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 #
-# k3sm B253 acceptance gate — the runnable proof that a node which exits stops the
-# runtime it embedded, so no k3sm-vmhost outlives `launchctl bootout
-# system/io.k3sm.server`.
+# k3sm B253 acceptance gate — the runnable proof that a node which exits closes
+# the runtime it embedded, inside its derived ExitTimeOut.
+#
+# SUPERSEDED IN PART (B713): vm pods now survive a daemon restart like native
+# pods. The runtime's Close detaches every k3sm-vmhost instead of stopping it,
+# and the next start re-attaches it, so the lab tier below now proves the
+# opposite of its first form: a bootout leaves every helper RUNNING, and the
+# vm helpers stop at `k3sm stop` and `k3sm uninstall` instead (pkg/install
+# stopVMHelpers). The history below is kept as the reason the close is wired.
 #
 # The problem it closes: `k3sm server` builds its runtimed runtime in-process
 # (provider.NewRuntimed) and drives it by direct RPC, never through
@@ -25,23 +31,20 @@
 #   (HostProcess) yields a safe no-op. Plus the structural pins no unit test can
 #   carry, because each is a fact about where a line sits rather than about a
 #   function's behaviour: the teardown is wired into startNode, its defer is
-#   registered AFTER the control socket's (LIFO runs it first, so the vm stop does
-#   not queue its 35s bound behind the socket's shutdown grace inside launchd's
-#   single ExitTimeOut), the stop takes no context (threading the node's already
-#   cancelled context in would make the vm sweep return instantly having stopped
-#   nothing — the bug, reintroduced in a shape that looks like care), the startup
-#   orphan reap that backstops it is still wired, and — the rung no Go test can
-#   carry — the 37 seconds pkg/install BUDGETS for this stage still equal the
-#   bounds runtimed actually ships (its two constants are unexported, so the
-#   budget is a literal on the k3sm side and this is its drift alarm).
+#   registered AFTER the control socket's (LIFO runs it first), the stop takes no
+#   context (the node's is already cancelled on the commonest shutdown path),
+#   the startup re-attach and orphan reap are still wired, and — the rung no Go
+#   test can carry — the 2 seconds pkg/install BUDGETS for this stage still
+#   equal the close grace runtimed actually ships (the constant is unexported,
+#   so the budget is a literal on the k3sm side and this is its drift alarm).
 #   RED BEFORE: on the unmodified tree stopEmbeddedRuntime and awaitNodeExit do
 #   not exist, so the Go leg fails to build and every structural pin fails.
 #
 #   LAB TIER (K3SM_LAB=1, a Mac with k3sm installed AND at least one vm pod
-#   running; root, prompts for sudo) — the only tier that can prove the thing the
-#   fix is about: boot out io.k3sm.server and watch every k3sm-vmhost go with it
-#   inside the plist's ExitTimeOut, then prove the data root unmounts with no
-#   dissent. It STOPS THE CLUSTER, so it is announced LAB-PENDING and never
+#   running; root, prompts for sudo): boot out io.k3sm.server, prove the server
+#   process leaves inside the plist's ExitTimeOut while every k3sm-vmhost keeps
+#   running under its same pid, then prove that the only dissent to unmounting
+#   the data root comes from the pod processes that survive by design. It STOPS THE CLUSTER, so it is announced LAB-PENDING and never
 #   silently passed when K3SM_LAB is unset, it refuses to run as a pass when the
 #   rig has no vm pod (the assertion would be vacuous), and it restores the mount
 #   and both daemons on every path via a trap. It touches /var/lib/k3sm ONLY
@@ -64,7 +67,7 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 lab_pending() { echo "LAB-PENDING  $1"; }
 
-echo "==> k3sm B253 acceptance (no k3sm-vmhost outlives the node that booted it)"
+echo "==> k3sm B253 acceptance (the node closes its embedded runtime inside its ExitTimeOut)"
 
 # ---- b253.0 — the gate parses and its sources exist -------------------------
 b0=ok
@@ -94,43 +97,38 @@ grep -qE '^\s*defer stopRuntime\(\)$' "$NODE_GO" || w=no
 grep -qF 'return awaitNodeExit(ctx, errc, stopRuntime)' "$NODE_GO" || w=no
 ladder "$w" "b253.1  startNode builds the embedded-runtime teardown, defers it, and runs it on both exit paths"
 
-# LIFO: the LATER defer runs FIRST, so the runtime's vm stop is registered AFTER
-# the control socket's teardown. Reversing these two lines silently gives the 35s
-# vm sweep whatever is left of the ExitTimeOut after the socket's own shutdown
-# grace — and launchd answers a blown ExitTimeOut with SIGKILL, stranding exactly
-# the helpers the sweep exists to stop.
+# LIFO: the LATER defer runs FIRST, so the runtime's close is registered AFTER
+# the control socket's teardown, and the budget table orders the stages that way.
 o=ok
 sock_line="$(grep -nE '^\s*defer stopControlSocket\(\)$' "$NODE_GO" | head -1 | cut -d: -f1)"
 rt_line="$(grep -nE '^\s*defer stopRuntime\(\)$' "$NODE_GO" | head -1 | cut -d: -f1)"
 if [ -z "$sock_line" ] || [ -z "$rt_line" ] || [ "$sock_line" -ge "$rt_line" ]; then o=no; fi
-ladder "$o" "b253.1  the runtime teardown is deferred AFTER the control socket's, so LIFO stops the vm guests first (lines ${sock_line:-?} < ${rt_line:-?})"
+ladder "$o" "b253.1  the runtime teardown is deferred AFTER the control socket's, so LIFO closes the runtime first (lines ${sock_line:-?} < ${rt_line:-?})"
 
-# The stop takes NO context. Close derives its own 35s vm bound from
-# context.Background(); handing it the node's context would hand it one that is
-# already cancelled on the commonest shutdown path (SIGTERM), and StopAllVMs would
-# return instantly having stopped nothing.
+# The stop takes NO context. Close derives its own bound; handing it the node's
+# context would hand it one that is already cancelled on the commonest shutdown
+# path (SIGTERM).
 c=ok
 grep -qF 'func stopEmbeddedRuntime(prov vkadapter.Provider, log *slog.Logger) func()' "$NODE_GO" || c=no
-ladder "$c" "b253.1  stopEmbeddedRuntime takes no context (the vm bound is Close's own, never the node's cancelled one)"
+ladder "$c" "b253.1  stopEmbeddedRuntime takes no context (the close bound is Close's own, never the node's cancelled one)"
 
-# The startup orphan sweep is the BACKSTOP that makes Close's bound a bound rather
-# than a promise: a helper still running when it expires is reaped at the next
-# start. The fix does not replace it, so it must still be wired: NewRuntimed
-# runs adoptNodePods, which re-attaches surviving pods and then reaps.
+# The startup re-attach and orphan sweep are what a surviving pod meets at the
+# next start: NewRuntimed runs adoptNodePods, which re-attaches surviving pods
+# (vm pods included) and then reaps whatever was not re-attached.
 r=ok
 sed -n '/^func NewRuntimed(/,/^}/p' "$PROVIDER_GO" | grep -qE '^[[:space:]]*r\.adoptNodePods\(ctx, rt\)$' || r=no
 sed -n '/^func (r \*runtimedRuntime) adoptNodePods(/,/^}/p' "$ATTACH_GO" | grep -qF 'if err := a.ReapOrphanedPods(); err != nil {' || r=no
-ladder "$r" "b253.1  the startup pod reap is still wired into provider.NewRuntimed (the backstop for a helper that misses the bound)"
+ladder "$r" "b253.1  the startup re-attach and pod reap are still wired into provider.NewRuntimed"
 
 # ---- b253.1 — the BUDGET, and the two copies that must not drift -----------
 # The node's close is now a named stage of the plist's ExitTimeOut, which
 # pkg/install derives (serverExitTimeOut / agentExitTimeOut). Two of the stage
-# bounds are runtimed's, and runtimed does not export them — so the k3sm side
-# carries a literal, and this is the only thing that notices when runtimed moves
-# it. Reading runtimed's source through `go list` rather than a relative path
+# bounds is runtimed's close grace, which runtimed does not export, so the k3sm
+# side carries a literal, and this is the only thing that notices when runtimed
+# moves it. Reading runtimed's source through `go list` rather than a relative path
 # keeps it correct in a lane, a module cache, or a sibling checkout.
 b=ok
-grep -qE '^\s*teardownRuntimedClose = 37$' "$PLIST_GO" || b=no
+grep -qE '^\s*teardownRuntimedClose = 2$' "$PLIST_GO" || b=no
 grep -qF 'ExitTimeOut: serverExitTimeOut,' "$PLIST_GO" || b=no
 grep -qF 'ExitTimeOut:      agentExitTimeOut,' "$PLIST_GO" || b=no
 grep -qE '^\s*teardownControlPlane  = 30$' "$PLIST_GO" || b=no
@@ -138,7 +136,7 @@ grep -qE '^\s*teardownControlPlane  = 30$' "$PLIST_GO" || b=no
 grep -qE '^const serverExitTimeOutSeconds = [0-9]+$' "$PLIST_GO" || b=no
 # The stage literals are bound to their owners by assertions, not by trust. This
 # one has an importable owner, so the binding lives in the Go test; the rung below
-# is the binding for runtimed's two, which are unexported.
+# is the binding for runtimed's close grace, which is unexported.
 grep -qF 'int(executor.StopBound/time.Second)' "$K3SM_ROOT/pkg/install/exittimeout_test.go" || b=no
 ladder "$b" "b253.1  both node plists render a DERIVED ExitTimeOut and the control-plane stage is bound to executor.StopBound by a test"
 
@@ -148,18 +146,20 @@ if [ -z "$RUNTIMED_DIR" ] || [ ! -f "$RUNTIMED_DIR/pkg/runtime/close.go" ]; then
 	d=no
 	echo "    could not locate runtimed's pkg/runtime/close.go (go list -m said '${RUNTIMED_DIR:-<nothing>}')"
 else
-	vm_bound="$(grep -oE 'vmShutdownBound = [0-9]+' "$RUNTIMED_DIR/pkg/runtime/close.go" | grep -oE '[0-9]+' || true)"
 	close_grace="$(grep -oE 'defaultCloseGrace = [0-9]+' "$RUNTIMED_DIR/pkg/runtime/close.go" | grep -oE '[0-9]+' || true)"
 	budget="$(grep -oE 'teardownRuntimedClose = [0-9]+' "$PLIST_GO" | grep -oE '[0-9]+' || true)"
-	if [ -z "$vm_bound" ] || [ -z "$close_grace" ] || [ -z "$budget" ]; then
+	if [ -z "$close_grace" ] || [ -z "$budget" ]; then
 		d=no
-		echo "    could not read one of the bounds (vmShutdownBound='${vm_bound:-}' defaultCloseGrace='${close_grace:-}' budget='${budget:-}')"
-	elif [ "$((vm_bound + close_grace))" -ne "$budget" ]; then
+		echo "    could not read one of the bounds (defaultCloseGrace='${close_grace:-}' budget='${budget:-}')"
+	elif [ "$close_grace" -ne "$budget" ]; then
 		d=no
-		echo "    runtimed close costs $((vm_bound + close_grace))s (${vm_bound}+${close_grace}) but pkg/install budgets ${budget}s"
+		echo "    runtimed close costs ${close_grace}s but pkg/install budgets ${budget}s"
+	elif grep -qE 'vmShutdownBound = [0-9]+' "$RUNTIMED_DIR/pkg/runtime/close.go"; then
+		d=no
+		echo "    runtimed's close carries a vm stop bound again, which pkg/install no longer budgets"
 	fi
 fi
-ladder "$d" "b253.1  pkg/install's runtimed-close budget still equals runtimed's own vmShutdownBound + defaultCloseGrace"
+ladder "$d" "b253.1  pkg/install's runtimed-close budget still equals runtimed's own defaultCloseGrace, and the close stops no vm"
 
 # ---- Go leg runner ---------------------------------------------------------
 # GOARCH is pinned to arm64: a Mac whose Go toolchain is itself x86_64-under-
@@ -202,8 +202,8 @@ run_test "b253.5" 2 TestExitTimeOutCoversTheDaemonTeardown ./pkg/install/
 
 # ---- b253.L — the lab tier --------------------------------------------------
 if [ "${K3SM_LAB:-}" != 1 ]; then
-	lab_pending "b253.L1  booting out io.k3sm.server leaves no k3sm-vmhost running"
-	lab_pending "b253.L2  the data root unmounts with no dissent once the server is out"
+	lab_pending "b253.L1  booting out io.k3sm.server leaves every k3sm-vmhost running under its same pid"
+	lab_pending "b253.L2  once the server is out, only surviving pod processes dissent to unmounting the data root"
 	lab_pending "     set K3SM_LAB=1 to run them on a rig with a vm pod — they stop the cluster"
 elif [ "$(uname -s)" != Darwin ]; then
 	lab_pending "b253.L  skipped — the lab tier needs a Mac with k3sm installed"
@@ -265,32 +265,36 @@ else
 		sudo launchctl kickstart -k system/io.k3sm.server >/dev/null 2>&1 || true
 	}
 
-	# NON-VACUITY GATE. With no vm pod on the rig there is no helper to strand, so
-	# "pgrep found nothing" would pass on the broken build too. The tier refuses to
-	# report a pass it did not earn.
+	# NON-VACUITY GATE. With no vm pod on the rig there is no helper to keep, so
+	# the survival assertion would pass on any build. The tier refuses to report a
+	# pass it did not earn.
 	before="$(pgrep -x k3sm-vmhost 2>/dev/null | tr '\n' ' ' || true)"
 	if [ -z "$before" ]; then
 		lab_pending "b253.L1  skipped — no k3sm-vmhost is running, so the assertion would be vacuous; start a vm-RuntimeClass pod first"
-		lab_pending "b253.L2  skipped — same reason (the dissent this proves is an orphan helper holding the data root)"
+		lab_pending "b253.L2  skipped — same reason"
 	else
 		trap restore EXIT
 		echo "--- k3sm-vmhost pids before the bootout: $before"
 		sudo launchctl bootout system/io.k3sm.server >/dev/null 2>&1 || true
 		await_unloaded io.k3sm.server || true
 
-		l1=no; waited=0
-		while [ "$waited" -lt "$DEADLINE" ]; do
-			if [ -z "$(pgrep -x k3sm-vmhost 2>/dev/null || true)" ]; then l1=ok; break; fi
-			sleep 2; waited=$((waited + 2))
-		done
-		if [ "$l1" = ok ]; then
-			ladder ok "b253.L1  every k3sm-vmhost stopped ${waited}s after the bootout (ExitTimeOut ${EXIT_TIMEOUT}s)"
+		# The server must be fully out first: a helper alive while the server still
+		# runs its teardown proves nothing about what the teardown did.
+		await_unloaded io.k3sm.server "$DEADLINE" || true
+		if await_exited "$DEADLINE"; then
+			after="$(pgrep -x k3sm-vmhost 2>/dev/null | tr '\n' ' ' || true)"
+			if [ "$after" = "$before" ]; then
+				ladder ok "b253.L1  every k3sm-vmhost kept running under its same pid once the server was out (pids: $after)"
+			else
+				ladder no "b253.L1  the k3sm-vmhost pids changed across the bootout: before '$before', after '$after'"
+			fi
 		else
-			ladder no "b253.L1  k3sm-vmhost outlived io.k3sm.server by ${DEADLINE}s (pids: $(pgrep -x k3sm-vmhost | tr '\n' ' '))"
+			ladder no "b253.L1  the server process was still alive ${DEADLINE}s after the bootout (ExitTimeOut ${EXIT_TIMEOUT}s)"
 		fi
 
-		# The consequence the operator actually hits: an orphan helper's cwd IS the
-		# data root, so the volume is busy and diskutil dissents by pid.
+		# A surviving pod process (a native pod's, or a vm pod's helper, whose cwd
+		# is the data root) keeps the volume busy by design, so the unmount may be
+		# dissented by one; never by the server.
 		if [ -z "$VOLUME" ]; then
 			lab_pending "b253.L2  skipped — $DATA_ROOT is not a separate volume on this Mac, so there is nothing to unmount"
 		elif ! mounted; then
@@ -303,15 +307,14 @@ else
 			sudo launchctl bootout system/io.k3sm.netd >/dev/null 2>&1 || true
 			await_unloaded io.k3sm.netd || true
 			unmount_out="$(sudo diskutil unmount "$DATA_ROOT" 2>&1 || true)"
-			# A NATIVE pod's process survives the daemon stop by design (see the
-			# header), and its rootfs sits under <data root>/pods, so on a rig that
-			# runs native workloads the unmount is dissented by that pod's pid. That
-			# dissent is not the defect this leg proves — an orphan HELPER (or the
-			# server's own pid) holding the root — so it passes with the dissenter
-			# named; any other dissenter, or a busy root with no named pid, fails.
+			# A native pod's process and a vm pod's k3sm-vmhost both survive the
+			# daemon stop by design (see the header), so the unmount may be dissented
+			# by one of them. That passes with the dissenter named; any other
+			# dissenter (the server's own pid), or a busy root with no named pid,
+			# fails.
 			if mounted; then
-				if printf '%s' "$unmount_out" | grep -qE 'dissented by PID [0-9]+ \((/private)?'"$DATA_ROOT"'/pods/'; then
-					ladder ok "b253.L2  no helper or server pid held $DATA_ROOT once the server was out; the one dissenter is a native pod process, which survives the stop by design: $unmount_out"
+				if printf '%s' "$unmount_out" | grep -qE 'dissented by PID [0-9]+ \(((/private)?'"$DATA_ROOT"'/pods/|[^)]*k3sm-vmhost)'; then
+					ladder ok "b253.L2  no server pid held $DATA_ROOT once the server was out; the one dissenter is a pod process, which survives the stop by design: $unmount_out"
 				else
 					ladder no "b253.L2  $DATA_ROOT did not unmount after the server was booted out: $unmount_out"
 				fi

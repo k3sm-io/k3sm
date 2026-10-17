@@ -29,16 +29,19 @@ import (
 
 	"k3sm.io/k3sm/pkg/netdsvc"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // The stop scenario every lifecycle test starts from: a server installed with a
 // NON-default Service CIDR (so a flush of the default range would be visibly
-// wrong), one recorded pod process group alive, one k3sm-vmhost helper alive
-// that outlived its daemon, and this node's cluster identity on disk.
+// wrong), one recorded pod process group alive, one vm pod's k3sm-vmhost helper
+// alive (spawned with a 5s grace), and this node's cluster identity on disk.
 const (
 	stopTestServiceCIDR = "10.96.0.0/16"
 	stopTestPodPgid     = 501
 	stopTestVMPgid      = 601
+	// stopTestVMGrace is the grace the vm pod's helper was spawned with.
+	stopTestVMGrace = 5 * time.Second
 )
 
 // stoppableNode installs a server on a fresh fake and seeds the running node
@@ -57,7 +60,7 @@ func stoppableNode(t *testing.T) (*fakeSystem, Config, *bytes.Buffer) {
 	}
 	f.podReap = []runtimed.PodReapRecord{{PodID: "web", Container: "app", Pgid: stopTestPodPgid, StartUnixNano: 11}}
 	f.podLeaders = map[int]int64{stopTestPodPgid: 11, stopTestVMPgid: 22}
-	f.life.vmhosts = []VMHostRecord{{PodID: "linux", Pgid: stopTestVMPgid, StartUnixNano: 22}}
+	f.life.vmhosts = []VMHostRecord{{Schema: 1, PodID: "linux", Pgid: stopTestVMPgid, StartUnixNano: 22, StopGraceNanos: int64(stopTestVMGrace)}}
 	f.life.procs = map[int]fakeProc{stopTestVMPgid: {exe: DefaultInstallDir + "/" + VMHostName, uid: fakeServiceUID}}
 	f.putFile(netdsvc.NodeIdentityPath(MeshKeyDir), []byte("100.64.3.0/24\n"))
 	cfg.MarkNode = func(_ context.Context, stopped bool, actor, _ string) error {
@@ -92,14 +95,15 @@ var wantCleanStop = []string{
 	"Disabled:" + ServerLabel,
 	"Bootout:" + ServerLabel,
 	// 4. The workload half of the shared teardown, while the mesh is still
-	//    up: pods (SIGTERM, the grace), the surviving vm helper (SIGKILL by
-	//    its recorded identity), control-plane orphans.
+	//    up: pods (SIGTERM, the grace), the vm pod's helper (SIGTERM by its
+	//    recorded identity, then the wait for its recorded grace plus the
+	//    helper's margin), control-plane orphans.
 	"ReadPodReapRecords:" + DefaultDataRoot,
 	fmt.Sprintf("Signal:%d:TERM", stopTestPodPgid),
 	fmt.Sprintf("WaitGone:%d:%s", stopTestPodPgid, podGroupStopGrace),
 	"ReadVMHostRecords:" + DefaultDataRoot,
-	fmt.Sprintf("Signal:%d:KILL", stopTestVMPgid),
-	fmt.Sprintf("WaitGone:%d:%s", stopTestVMPgid, vmHostKillWait),
+	fmt.Sprintf("Signal:%d:TERM", stopTestVMPgid),
+	fmt.Sprintf("WaitGone:%d:%s", stopTestVMPgid, stopTestVMGrace+sandbox.VMHelperStopMargin),
 	"ReapOrphans:" + DefaultDataRoot + "/server/bin",
 	// 5. RemoveMesh, while netd still serves.
 	"RemoveMesh",
@@ -118,7 +122,7 @@ var wantCleanStop = []string{
 
 // TestStopTearsDownPodsAndKeepsPlists is the stop gate: `k3sm stop` is the
 // full stop, in its exact order, keeps every plist (so the node stays stopped
-// across reboot) and the node identity, kills a surviving vm helper by its
+// across reboot) and the node identity, stops a vm pod's helper by its
 // recorded identity, flushes the Service CIDR the node was installed with,
 // names whatever it could not remove, and converges on a rerun.
 func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
@@ -190,7 +194,7 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 		}
 	})
 
-	t.Run("a forged vm record is never killed", func(t *testing.T) {
+	t.Run("a forged vm record is never signalled", func(t *testing.T) {
 		for name, proc := range map[string]fakeProc{
 			"wrong executable": {exe: "/usr/sbin/sshd", uid: fakeServiceUID},
 			"wrong uid":        {exe: DefaultInstallDir + "/" + VMHostName, uid: 0},
@@ -202,8 +206,8 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 			if !errors.As(err, &serr) || !slices.Contains(serr.Leftovers(), LeftoverVMHelpers) {
 				t.Errorf("%s: Stop = %v, want the vm record reported", name, err)
 			}
-			if idx(f.calls, fmt.Sprintf("Signal:%d:KILL", stopTestVMPgid)) >= 0 {
-				t.Errorf("%s: a process the record does not prove is k3sm-vmhost was killed", name)
+			if idx(f.calls, fmt.Sprintf("Signal:%d:TERM", stopTestVMPgid)) >= 0 || idx(f.calls, fmt.Sprintf("Signal:%d:KILL", stopTestVMPgid)) >= 0 {
+				t.Errorf("%s: a process the record does not prove is k3sm-vmhost was signalled", name)
 			}
 		}
 	})
@@ -288,7 +292,7 @@ func TestStopTearsDownPodsAndKeepsPlists(t *testing.T) {
 		{"the vm helper records cannot be read", LeftoverVMHelpers,
 			func(f *fakeSystem) { f.failOn("ReadVMHostRecords", errors.New("permission denied")) },
 			func(f *fakeSystem) { delete(f.failures, "ReadVMHostRecords") }},
-		{"the vm helper survives SIGKILL", LeftoverVMHelpers,
+		{"the vm helper outlives its grace and survives SIGKILL", LeftoverVMHelpers,
 			func(f *fakeSystem) { f.podLingering = map[int]bool{stopTestVMPgid: true} },
 			func(f *fakeSystem) { f.podLingering = nil }},
 		{"a vm record names another executable", LeftoverVMHelpers,

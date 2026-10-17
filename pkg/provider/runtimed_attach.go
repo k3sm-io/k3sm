@@ -31,7 +31,8 @@ import (
 // Pod re-attachment after a node-daemon restart.
 //
 // A native pod's processes are session leaders that outlive the daemon that
-// spawned them, so a `launchctl kickstart -k` leaves them running. The node's
+// spawned them, and so is a vm pod's k3sm-vmhost helper, which keeps its guest
+// running; a `launchctl kickstart -k` leaves all of them running. The node's
 // answer, like the kubelet's, is to read the pods bound to it from the apiserver
 // (the spec source of truth; runtimed persists none) and ask the runtime to
 // ATTACH to each pod's live processes instead of creating it again. A pod the
@@ -65,13 +66,27 @@ type podAttacher interface {
 
 var _ podAttacher = (*runtimed.Runtime)(nil)
 
+// vmSweepDeferrer is the optional runtime capability the startup uses when it
+// could not list this node's pods: keep the vm helpers a previous run left
+// running rather than let the startup reap kill the ones no attach claimed.
+// *runtimed.Runtime has it.
+type vmSweepDeferrer interface {
+	DeferVMSweep(reason string)
+}
+
+var _ vmSweepDeferrer = (*runtimed.Runtime)(nil)
+
 // podNetReattacher is the optional pod-network capability an attach needs:
 // re-reserving the address a surviving pod is already bound to, and re-ensuring
-// its lo0 alias, without allocating a new one. *PodNetAdapter implements it. A
-// network without it cannot keep a surviving pod's address from being handed
-// to another pod, so such a node attaches nothing.
+// its lo0 alias, without allocating a new one. Reattach serves a native pod and
+// ReattachGuest a vm pod, whose address is recorded as a guest's so the guest
+// network the attach's buildBox reads back (SetupGuest, idempotent per pod)
+// resolves to that same address. *PodNetAdapter implements it. A network
+// without it cannot keep a surviving pod's address from being handed to
+// another pod, so such a node attaches nothing.
 type podNetReattacher interface {
 	Reattach(ctx context.Context, podID, ip string) error
+	ReattachGuest(ctx context.Context, podID, ip string) error
 }
 
 // attachListTimeout bounds the startup list of this node's pods. A list that
@@ -80,13 +95,22 @@ type podNetReattacher interface {
 // created again.
 const attachListTimeout = orphanAPITimeout
 
-// adoptNodePods is the startup sequence: attach every running native pod bound
-// to this node, then run the runtime's startup reap. It never fails the node:
+// adoptNodePods is the startup sequence: attach every running pod bound to this
+// node, then run the runtime's startup reap. It never fails the node:
 // an unreachable apiserver, a pod that cannot be attached and a reap fault all
 // degrade to the create-everything behavior.
 func (r *runtimedRuntime) adoptNodePods(ctx context.Context, a podAttacher) {
 	attached, left := 0, 0
-	listed := r.listNodePodsAtStartup(ctx)
+	listed, ok := r.listNodePodsAtStartup(ctx)
+	if !ok {
+		// Without the list nothing says which vm pods still exist, so a helper
+		// no attach claims may be a running pod's guest: it is kept running for
+		// the next start rather than killed. Native pods keep the reap they had.
+		if d, can := a.(vmSweepDeferrer); can {
+			r.log.Warn("startup re-attachment: the pod list failed, so vm pod helpers are kept running for the next start instead of being reaped")
+			d.DeferVMSweep("the startup list of this node's pods failed")
+		}
+	}
 	r.retainTerminatedPods(listed)
 	pods := podsToAttach(listed)
 	for i := range pods {
@@ -106,25 +130,28 @@ func (r *runtimedRuntime) adoptNodePods(ctx context.Context, a podAttacher) {
 }
 
 // listNodePodsAtStartup returns every pod bound to this node, read once at
-// startup. A node without an apiserver client, or a list that fails, yields
-// none: nothing is attached and nothing is retained.
-func (r *runtimedRuntime) listNodePodsAtStartup(ctx context.Context) []corev1.Pod {
+// startup, and whether the list answered. A node without an apiserver client
+// yields none, answered; a list that fails or times out yields none, not
+// answered. Either way nothing is attached and nothing is retained.
+func (r *runtimedRuntime) listNodePodsAtStartup(ctx context.Context) ([]corev1.Pod, bool) {
 	if r.podSource == nil {
-		return nil
+		return nil, true
 	}
 	listCtx, cancel := context.WithTimeout(ctx, attachListTimeout)
 	listed, err := r.podSource.listNodePods(listCtx, r.nodeName)
 	cancel()
 	if err != nil {
-		r.log.Warn("startup pod re-attachment skipped: cannot list this node's pods; surviving pod processes will be reaped and the pods created again", "err", err)
-		return nil
+		r.log.Warn("startup pod re-attachment skipped: cannot list this node's pods; surviving native pod processes will be reaped and the pods created again", "err", err)
+		return nil, false
 	}
-	return listed
+	return listed, true
 }
 
 // podsToAttach returns the listed pods an attach may apply to: in the Running
-// phase, not being deleted, and native (a vm pod's helper never survives its
-// daemon).
+// phase, not being deleted, and on a RuntimeClass this node resolves. Native
+// and vm pods alike: runtimed's AttachPod decides whether the processes a pod
+// left behind may be adopted (for a vm pod, its fail-closed helper adoption),
+// and a pod it refuses is created again.
 func podsToAttach(listed []corev1.Pod) []corev1.Pod {
 	var out []corev1.Pod
 	for i := range listed {
@@ -132,7 +159,7 @@ func podsToAttach(listed []corev1.Pod) []corev1.Pod {
 		if p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning {
 			continue
 		}
-		if backend, err := podSandboxBackend(p); err != nil || backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		if _, err := podSandboxBackend(p); err != nil {
 			continue
 		}
 		out = append(out, *p)
@@ -181,6 +208,15 @@ func (r *runtimedRuntime) attachPod(ctx context.Context, a podAttacher, pod *cor
 	}
 	rs, err := a.AttachPod(ctx, box)
 	if err != nil {
+		if errors.Is(err, runtimed.ErrVMHelperUnadoptable) {
+			// The pod's guest is still running under a helper this runtime may
+			// neither adopt nor stop. Its address stays reserved, because the
+			// guest still answers on it, and the runtime refuses to create the
+			// pod beside it; the next start decides the helper.
+			r.log.Warn("startup re-attachment: a vm pod's helper is still running but cannot be adopted; the pod is not created again beside it",
+				"namespace", pod.Namespace, "name", pod.Name, "err", err)
+			return false
+		}
 		if errors.Is(err, runtimed.ErrNothingToAttach) {
 			r.log.Info("startup re-attachment: no live processes to attach; the pod will be created again", "namespace", pod.Namespace, "name", pod.Name, "reason", err)
 		} else {
@@ -213,14 +249,14 @@ func (r *runtimedRuntime) attachPod(ctx context.Context, a podAttacher, pod *cor
 // the pod network. false means the pod cannot be attached with its address
 // intact and must be created again.
 //
-// NO VM BRANCH, deliberately. A vm guest never survives a node-daemon restart:
-// its VM helper dies with the daemon, runtimed's AttachPod refuses a vm pod
-// (ErrNothingToAttach, "not a host-process pod"), and listPodsToAttach drops vm
-// pods before an attach is tried. So a vm pod never reaches here, its published
-// /32 alias is an orphan that the startup sweep (ReconcileStartup) correctly
-// removes, and the pod is created again with a fresh SetupGuest. podnet's
-// ReattachGuest exists for the day guests outlive the daemon; wiring it here is
-// part of that change, together with reattaching the guest itself.
+// A vm pod's guest survives a node-daemon restart in its k3sm-vmhost helper, so
+// its published /32 (the identity the node's proxy relays from, aliased on lo0)
+// is re-reserved the same way, through ReattachGuest: podnet records the binding
+// as a guest's, the startup sweep (ReconcileStartup) keeps its alias, and
+// buildBox's SetupGuest for the pod returns that same address and records the
+// guest network config runtimed reads. If runtimed then refuses to adopt the
+// helper, attachPod releases the address and the pod is created again with a
+// fresh SetupGuest, as before.
 func (r *runtimedRuntime) reattachPodIP(ctx context.Context, pod *corev1.Pod) (string, bool) {
 	if r.network == nil {
 		return r.nodeIP, true
@@ -240,7 +276,11 @@ func (r *runtimedRuntime) reattachPodIP(ctx context.Context, pod *corev1.Pod) (s
 		r.log.Warn("startup re-attachment: the pod network cannot re-reserve an address; the pod will be created again", "namespace", pod.Namespace, "name", pod.Name)
 		return "", false
 	}
-	if err := re.Reattach(ctx, id, ip.String()); err != nil {
+	reattach := re.Reattach
+	if backend, err := podSandboxBackend(pod); err == nil && backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		reattach = re.ReattachGuest
+	}
+	if err := reattach(ctx, id, ip.String()); err != nil {
 		r.log.Warn("startup re-attachment: cannot re-reserve the pod's address; it will be created again", "namespace", pod.Namespace, "name", pod.Name, "pod_ip", ip.String(), "err", err)
 		return "", false
 	}

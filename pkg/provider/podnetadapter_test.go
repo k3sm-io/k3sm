@@ -49,8 +49,10 @@ type fakeIPAM struct {
 	// indistinguishable from one that was never made.
 	setups      []string
 	guestSetups []string
-	sweeps      []map[string]netip.Addr // recorded SweepStale known-sets
-	nodeAliases []netip.Addr            // recorded EnsureNodeAlias addresses
+	// guestReattaches records the pods ReattachGuest re-reserved (append-only).
+	guestReattaches []string
+	sweeps          []map[string]netip.Addr // recorded SweepStale known-sets
+	nodeAliases     []netip.Addr            // recorded EnsureNodeAlias addresses
 }
 
 func newFakeIPAM(t *testing.T, cidr string) *fakeIPAM {
@@ -130,6 +132,18 @@ func (f *fakeIPAM) ReattachPod(_ context.Context, podID string, ip netip.Addr) e
 		return fmt.Errorf("reattach pod %s: %w", podID, podnet.ErrIPInUse)
 	}
 	f.byPod[podID] = ip
+	return nil
+}
+
+// ReattachGuest is ReattachPod for a vm pod, recorded in guestReattaches so a
+// test can tell which seam re-reserved an address.
+func (f *fakeIPAM) ReattachGuest(ctx context.Context, podID string, ip netip.Addr) error {
+	if err := f.ReattachPod(ctx, podID, ip); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.guestReattaches = append(f.guestReattaches, podID)
+	f.mu.Unlock()
 	return nil
 }
 

@@ -79,8 +79,12 @@ func (b *recordingVMBackend) GuestRosettaShareSupported() bool { return false }
 func (b *recordingVMBackend) StopVM(context.Context, string, time.Duration) error { return nil }
 func (b *recordingVMBackend) StopAllVMs(context.Context) error                    { return nil }
 func (b *recordingVMBackend) ReapOrphanVMs() error                                { return nil }
-func (b *recordingVMBackend) VMDone(string) (<-chan struct{}, bool)               { return nil, false }
-func (b *recordingVMBackend) VMHelperOutput(string) string                        { return "" }
+func (b *recordingVMBackend) AdoptVM(context.Context, string) error {
+	return sandbox.ErrVMNotAdopted
+}
+func (b *recordingVMBackend) DetachVMs()                            {}
+func (b *recordingVMBackend) VMDone(string) (<-chan struct{}, bool) { return nil, false }
+func (b *recordingVMBackend) VMHelperOutput(string) string          { return "" }
 
 func (b *recordingVMBackend) CreateVM(_ context.Context, spec sandbox.VMSpec) error {
 	b.mu.Lock()

@@ -645,7 +645,8 @@ process that exits stays exited until a `Deployment`/`Job` controller replaces t
 
 ### What Survives a Node-Daemon Restart
 
-A native Pod's processes outlive the node daemon. When the daemon restarts (`sudo launchctl kickstart
+A Pod's processes outlive the node daemon, on the default runtime and in the `vm` RuntimeClass
+alike. When the daemon restarts (`sudo launchctl kickstart
 -k system/io.k3sm.server`, or `io.k3sm.agent` on a worker, a crash, an upgrade), the new daemon reads
 the Pods bound to its node from the API server and re-attaches to every running Pod whose processes
 are still alive, instead of killing them and creating the Pod again. A re-attached Pod keeps its Pod
@@ -654,6 +655,13 @@ container runs under its own resident shim, which holds the container's output a
 across the restart: the container log continues with no gap, exit codes stay real, and
 `kubectl exec` works on a re-attached Pod.
 
+A `vm` Pod's helper process, which runs its Linux virtual machine, keeps running through the
+restart too, so the guest and its containers never stop and nothing inside them is restarted. The
+new daemon re-attaches it only when the helper is provably the one the previous daemon started:
+the same k3sm build, the same boot of the Mac, the same helper binary and process, and a helper that
+answers on its control socket. A helper that fails any of those checks is stopped and the Pod is
+created again. The container log continues from where it stopped.
+
 What a re-attached Pod does not get back:
 
 - CPU usage restarts from zero at the re-attachment.
@@ -661,18 +669,23 @@ What a re-attached Pod does not get back:
   when it exits, never `0`. Its later output is not logged, `kubectl exec` into it is refused, and
   the Pod carries the `k3sm.io/log-stream-lost` condition with reason `ShimCrashed`. Delete the Pod
   (or let its controller replace it) to get it back.
+- A `vm` Pod's containers report a new container ID after the re-attachment, although the
+  containers themselves kept running.
 
-Some Pods are created again rather than re-attached: `vm` Pods (a guest never outlives its helper),
-Pods that were still running an init container, Pods whose processes all exited, and every Pod after
-the daemon binary itself changed (an upgrade), because a Pod is only supervised by the exact build
-that started it.
+Some Pods are created again rather than re-attached: Pods that were still running an init
+container, Pods whose processes all exited, a `vm` Pod whose helper fails the checks above, and every
+Pod after the daemon binary itself changed (an upgrade), because a Pod is only supervised by the
+exact build that started it. That includes `vm` Pods, so the upgrade to the first release in which
+they survive a restart recreates them once. A reboot of the Mac recreates every Pod.
 
 A change to a runtimed flag that shapes the sandbox profile (work dir, home, resolver or apiserver
 VIP, pod logs dir, shadow bin dir) makes the next daemon start recreate every Pod instead of
 re-attaching.
 
-`sudo k3sm uninstall` stops every recorded Pod process group (SIGTERM, then SIGKILL after 10 s) once
-the daemons are gone, so nothing k3sm started keeps running and a reinstall starts every Pod fresh. A
+`sudo k3sm uninstall` and `sudo k3sm stop` stop every recorded Pod process group (SIGTERM, then
+SIGKILL after 10 s) once the daemons are gone, and every `vm` Pod's helper (SIGTERM, then SIGKILL
+after the Pod's termination grace plus 8 s, at most 45 s), so nothing k3sm started keeps running and
+a reinstall starts every Pod fresh. A
 group whose original leader process has already exited is left alone and logged, because nothing
 proves it still belongs to the Pod.
 

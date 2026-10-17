@@ -46,6 +46,9 @@ func (r *aliasRecordingIPAM) Teardown(context.Context, string) error { return ni
 func (r *aliasRecordingIPAM) ReattachPod(context.Context, string, netip.Addr) error {
 	return nil
 }
+func (r *aliasRecordingIPAM) ReattachGuest(context.Context, string, netip.Addr) error {
+	return nil
+}
 func (r *aliasRecordingIPAM) SweepStale(context.Context, map[string]netip.Addr) error { return nil }
 func (r *aliasRecordingIPAM) EnsureNodeAlias(_ context.Context, ip netip.Addr) error {
 	r.aliases = append(r.aliases, ip.String())

@@ -229,7 +229,7 @@ func UncordonBound() time.Duration { return uncordonBudget.running }
 // running, then answering) and for the node daemon, and the uncordon's whole
 // retry window (uncordonBudget, which bounds every attempt inside it).
 func StartTimeBound() time.Duration {
-	precondition := serverRestartBudget.unload + netdRestartBudget.unload + podGroupStopGrace + vmHostKillWait
+	precondition := serverRestartBudget.unload + netdRestartBudget.unload + podGroupStopGrace + vmHelperStopBound + vmHostKillWait
 	netd := 2*netdRestartBudget.unload + 2*netdRestartBudget.running
 	node := 2*serverRestartBudget.unload + serverRestartBudget.running
 	return precondition + netd + node + uncordonBudget.running

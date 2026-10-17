@@ -89,6 +89,10 @@ type PodIPAM interface {
 	// (idempotent: the alias of a surviving pod is usually still there), without
 	// allocating. It refuses an address held by another pod.
 	ReattachPod(ctx context.Context, podID string, ip netip.Addr) error
+	// ReattachGuest is ReattachPod for a vm pod whose guest survived: the same
+	// exact-address reservation and lo0 alias, recorded as a guest's binding so
+	// a later SetupGuest for the pod returns that address.
+	ReattachGuest(ctx context.Context, podID string, ip netip.Addr) error
 	// SweepStale removes every k3sm-owned lo0 alias in the node podCIDR not in
 	// the known podID->IP set nor bound by ReattachPod (the crash-recovery
 	// orphan sweep).
@@ -337,6 +341,24 @@ func (a *PodNetAdapter) Reattach(ctx context.Context, podID, ip string) error {
 	}
 	if err := a.ipam.ReattachPod(ctx, podID, addr); err != nil {
 		return fmt.Errorf("podnet reattach %s: %w", podID, err)
+	}
+	return nil
+}
+
+// ReattachGuest is Reattach for a vm pod whose k3sm-vmhost helper, and so its
+// guest, survived a node-daemon restart, through podnet's ReattachGuest: the
+// same exact-address reservation and lo0 alias, recorded as a GUEST binding.
+// That is what lets the attach's SetupGuest for the pod (idempotent per pod)
+// return the same address and record the guest network config runtimed reads
+// back through GuestNetwork; a host-process binding would refuse it. Teardown
+// releases it as it would a SetupGuest's.
+func (a *PodNetAdapter) ReattachGuest(ctx context.Context, podID, ip string) error {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return fmt.Errorf("podnet reattach guest %s: parse %q: %w", podID, ip, err)
+	}
+	if err := a.ipam.ReattachGuest(ctx, podID, addr); err != nil {
+		return fmt.Errorf("podnet reattach guest %s: %w", podID, err)
 	}
 	return nil
 }
