@@ -54,7 +54,10 @@ limitations under the License.
 //     signature and the signer to the k3sm-netd root helper's ApplyUpdate
 //     verb, mirroring the phases it streams. The helper verifies the
 //     signature again against its own --cluster-ca, and the archive's digest,
-//     before it unpacks the build set and runs the staged installer.
+//     before it unpacks the build set and runs the staged installer;
+//   - writes Restarting when the helper reports, after every check passed,
+//     that it is running the staged installer: that installer stops this
+//     daemon, so this is the last moment the daemon can write it.
 //
 // The installer restarts this daemon. The restarted daemon finds its own
 // build on the tag and, once it is fully up (Config.Ready), writes Done; the
