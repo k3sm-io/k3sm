@@ -15,7 +15,8 @@ Virtualization.framework.
 > Service's ClusterIP on the same node, and at its pod IP on the ports it declares, through a relay on
 > its node. Guest-to-guest reachability is still not a documented boundary, and the relay does not
 > promise one. See [Limitations](limitations.md) for everything that was measured, including what is
-> still not wired.
+> still not wired. A guest's `/etc/resolv.conf` names the cluster DNS VIP, which the node's own
+> resolver serves on both a server and a worker.
 >
 > It ships **`linux/arm64` only** (`linux/amd64` needs in-guest translation
 > and is held for a later release); its acceptance script
