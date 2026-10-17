@@ -91,6 +91,38 @@ func replace(rows []Row, r Row) []Row {
 	return append(out, r)
 }
 
+// TestVerdictIgnoresWorkloads pins that the workloads row, at any severity,
+// never decides the verdict: it describes what runs on k3sm, not k3sm.
+func TestVerdictIgnoresWorkloads(t *testing.T) {
+	t.Parallel()
+
+	warn := row(RowWorkloads, StateNotReady, SeverityWarn, "1 running · 2 pending", "k3sm kubectl get pods -A")
+	fail := row(RowWorkloads, StateNotReady, SeverityFail, "3 failed", "k3sm kubectl get pods -A")
+	tests := []struct {
+		name string
+		rows []Row
+		role dataroot.Role
+		want Verdict
+	}{
+		{"server workloads warn", replace(healthyRows(), warn), dataroot.RoleServer, VerdictRunning},
+		{"server workloads fail", replace(healthyRows(), fail), dataroot.RoleServer, VerdictRunning},
+		{"worker workloads warn", replace(healthyAgentRows(), warn), dataroot.RoleAgent, VerdictRunning},
+		{"worker workloads fail", replace(healthyAgentRows(), fail), dataroot.RoleAgent, VerdictRunning},
+		{"server datastore fail still degrades", replace(replace(healthyRows(), fail), row(RowDatastore, StateNotReady, SeverityFail, "corrupt", "")), dataroot.RoleServer, VerdictDegraded},
+		{"server daemon down still stops", replace(replace(healthyRows(), warn), serverRow(StateFailed, SeverityFail, "exit 1", "")), dataroot.RoleServer, VerdictStopped},
+		{"worker daemon down still stops", replace(replace(healthyAgentRows(), fail), agentRowFor(StateFailed, SeverityFail, "exit 1", "")), dataroot.RoleAgent, VerdictStopped},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, summary, _ := Aggregate(tc.rows, true, tc.role)
+			if got != tc.want {
+				t.Fatalf("verdict = %v (%q), want %v", got, summary, tc.want)
+			}
+		})
+	}
+}
+
 // TestAggregateVerdicts is the verdict contract: every verdict the exit-code
 // table names, decided from rows alone. Aggregate is pure, so each case is the
 // literal machine state an operator would be in.
@@ -117,21 +149,21 @@ func TestAggregateVerdicts(t *testing.T) {
 		},
 		{
 			name:        "degraded — a warning while the apiserver still serves",
-			rows:        replace(healthyRows(), row(RowWorkloads, StateNotReady, SeverityWarn, "1 running · 2 pending", "k3sm kubectl get pods -A")),
+			rows:        replace(healthyRows(), row(RowKubeconfig, StateMissing, SeverityWarn, "no k3sm context in ~/.kube/config", "k3sm kubeconfig --write")),
 			installed:   true,
 			wantVerdict: VerdictDegraded,
-			wantSummary: "workloads: 1 running · 2 pending",
-			wantNext:    []string{"k3sm kubectl get pods -A"},
+			wantSummary: "kubeconfig: no k3sm context in ~/.kube/config",
+			wantNext:    []string{"k3sm kubeconfig --write"},
 		},
 		{
 			name: "degraded — a failure outranks a warning in the summary",
 			rows: replace(
-				replace(healthyRows(), row(RowWorkloads, StateNotReady, SeverityWarn, "1 pending", "k3sm kubectl get pods -A")),
+				replace(healthyRows(), row(RowKubeconfig, StateMissing, SeverityWarn, "no k3sm context", "k3sm kubeconfig --write")),
 				row(RowDatastore, StateNotReady, SeverityFail, "kine sqlite is corrupt", "k3sm snapshot restore")),
 			installed:   true,
 			wantVerdict: VerdictDegraded,
 			wantSummary: "datastore: kine sqlite is corrupt",
-			wantNext:    []string{"k3sm snapshot restore", "k3sm kubectl get pods -A"},
+			wantNext:    []string{"k3sm snapshot restore", "k3sm kubeconfig --write"},
 		},
 		{
 			name: "stopped cleanly — the server is idle and nothing is serving",

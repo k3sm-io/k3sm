@@ -103,7 +103,7 @@ func goldenReports() map[string]Report {
 				"sudo launchctl kickstart -k system/io.k3sm.server\nk3sm status logs server")), true),
 		"render_stopped_not_mounted.txt": report(notMounted, true),
 		"render_degraded.txt": report(replace(healthyRows(),
-			row(RowWorkloads, StateNotReady, SeverityWarn, "1 running · 2 pending · 1 failed", "k3sm kubectl get pods -A")), true),
+			row(RowKubeconfig, StateMissing, SeverityWarn, "no k3sm context in ~/.kube/config", "k3sm kubeconfig --write")), true),
 		"render_not_installed.txt": report([]Row{
 			row(RowInstall, StateAbsent, SeverityFail, "no k3sm install found on this Mac", "sudo k3sm install"),
 			row(RowNetd, StateNotLoaded, SeverityFail, "io.k3sm.netd is not loaded in the system domain", "sudo k3sm install"),

@@ -101,7 +101,13 @@ const (
 // update is one too: a release newer than the one a node runs is news, not a
 // fault, and a cluster serving every request is not degraded because a newer
 // build exists. The row warns with the upgrade command.
-var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, RowShadowShells: true, RowMeshClaims: true, RowInterconnect: true, RowUpdate: true}
+//
+// workloads is the strongest case, and the only one whose FAIL is exempt too
+// (see verdictExempt): pods fail and restart routinely, and the verdict
+// describes k3sm's own health, not the health of what runs on it. A single
+// failed pod is not a degraded cluster. The row keeps its counts, state and
+// severity in the report.
+var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, RowShadowShells: true, RowMeshClaims: true, RowInterconnect: true, RowUpdate: true, RowWorkloads: true}
 
 // workerAdvisoryRows are the rows that are advisory ON A WORKER, because they
 // describe a control plane this Mac does not run.
@@ -144,6 +150,15 @@ func advisory(role dataroot.Role, name string) bool {
 		return true
 	}
 	return role == dataroot.RoleAgent && workerAdvisoryRows[name]
+}
+
+// verdictExempt reports whether a row at this severity is excluded from the
+// verdict: an advisory row's WARN, and the workloads row at any severity.
+func verdictExempt(role dataroot.Role, r Row) bool {
+	if r.Name == RowWorkloads {
+		return true
+	}
+	return r.Severity == SeverityWarn && advisory(role, r.Name)
 }
 
 // nodeRowName is the row that carries this Mac's node daemon: the control plane
@@ -200,7 +215,7 @@ func Aggregate(rows []Row, installed bool, role dataroot.Role) (Verdict, string,
 	}
 	for _, sev := range []Severity{SeverityFail, SeverityWarn} {
 		for _, r := range rows {
-			if r.Severity == sev && !(sev == SeverityWarn && advisory(role, r.Name)) {
+			if r.Severity == sev && !verdictExempt(role, r) {
 				return VerdictDegraded, fmt.Sprintf("%s: %s", r.Name, r.Detail), nextSteps(rows, VerdictDegraded)
 			}
 		}
