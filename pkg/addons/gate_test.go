@@ -82,7 +82,7 @@ func TestMetricsServerAddonGate(t *testing.T) {
 		posture Posture
 		reason  string
 	}{
-		{"skipped on the single-node posture", Posture{}, "single-node posture"},
+		{"skipped when the kubelet serving certs do not chain to the in-cluster CA", Posture{}, "do not chain to the in-cluster CA"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			actions, logs := converge(t, tc.posture)

@@ -31,10 +31,10 @@ import (
 //
 // Both halves are load-bearing, and each is a different product posture. Set is the
 // multi-node contract: it is what makes a node's serving cert VERIFIED, and B213 is
-// the story of nodes that could not satisfy it. Absent is the single-node/dev
-// contract (DESIGN §5c): the flag's absence is what makes certs.SelfSignedServing
-// correct there — emit it single-node and every dev cluster's logs/exec breaks, the
-// mirror image of the defect being fixed.
+// the story of nodes that could not satisfy it. Absent is the single-node contract
+// (DESIGN §5c): a single-node server's node presents a cluster-CA leaf too, but
+// whether its apiserver verifies that leaf is a separate decision, and the flag
+// stays off there until it is made.
 func TestApiserverKubeletCAFlagIffConfigured(t *testing.T) {
 	t.Parallel()
 	const flag = "--kubelet-certificate-authority"
@@ -77,55 +77,45 @@ func TestApiserverKubeletCAFlagIffConfigured(t *testing.T) {
 
 // TestRotationReportsTheKubeletServingPair keeps the rotation report COMPLETE. The
 // control-plane node's kubelet serving pair is re-minted from the cluster CA on
-// every boot of a --mesh-ip server, so it belongs in Reissued: an artifact that is
-// re-issued but absent from the report breaks the report's stated invariant just as
-// badly as one that is listed but never re-issued.
+// every boot of every server, single-node included, so it belongs in Reissued: an
+// artifact that is re-issued but absent from the report breaks the report's stated
+// invariant just as badly as one that is listed but never re-issued.
 //
 // The pair is deliberately held in memory (no key file), so it is reported with a
-// non-filesystem locator and its presence follows the installed topology
-// (RotateOptions.MeshServer), never the apiserver serving cert: every topology now
-// issues that leaf, so a single-node work dir holding it must still report the pair
-// absent.
+// non-filesystem locator, and present whatever the work dir holds: a single-node
+// work dir and a mesh one report it alike.
 func TestRotationReportsTheKubeletServingPair(t *testing.T) {
 	t.Parallel()
-	find := func(t *testing.T, wd string, mesh bool) RotationArtifact {
-		t.Helper()
-		for _, a := range reissuedArtifacts(wd, mesh) {
-			if strings.Contains(a.Detail, "kubelet serving cert+key") {
-				return a
+	withLeaf := t.TempDir()
+	if err := os.MkdirAll(filepath.Dir(certs.APIServerServingCertPath(withLeaf)), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(certs.APIServerServingCertPath(withLeaf), []byte("leaf"), 0o644); err != nil {
+		t.Fatalf("write leaf: %v", err)
+	}
+	for name, wd := range map[string]string{"an empty work dir": t.TempDir(), "a work dir with the serving leaf": withLeaf} {
+		t.Run(name, func(t *testing.T) {
+			var found []RotationArtifact
+			for _, a := range reissuedArtifacts(wd) {
+				if strings.Contains(a.Detail, "kubelet serving cert+key") {
+					found = append(found, a)
+				}
 			}
-		}
-		t.Fatalf("reissuedArtifacts does not report the node's kubelet serving pair, which every --mesh-ip boot re-mints")
-		return RotationArtifact{}
+			if len(found) != 1 {
+				t.Fatalf("reissuedArtifacts lists %d kubelet serving pairs, want exactly 1 (every server boot re-mints it)", len(found))
+			}
+			a := found[0]
+			if !a.Present {
+				t.Error("every server boot mints the kubelet serving pair, single-node included, so it must be reported present")
+			}
+			if strings.HasPrefix(a.Path, "/") {
+				t.Errorf("Path = %q — the pair is held in memory and must not claim a file an operator could go read", a.Path)
+			}
+			if !strings.Contains(a.Detail, "cluster CA") {
+				t.Errorf("Detail = %q — must name its issuer, the cluster CA", a.Detail)
+			}
+		})
 	}
-	withLeaf := func(t *testing.T) string {
-		t.Helper()
-		wd := t.TempDir()
-		if err := os.MkdirAll(filepath.Dir(certs.APIServerServingCertPath(wd)), 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		if err := os.WriteFile(certs.APIServerServingCertPath(wd), []byte("leaf"), 0o644); err != nil {
-			t.Fatalf("write leaf: %v", err)
-		}
-		return wd
-	}
-
-	t.Run("mesh server: reported present", func(t *testing.T) {
-		a := find(t, withLeaf(t), true)
-		if !a.Present {
-			t.Error("a mesh server must report the kubelet serving pair as re-issued")
-		}
-		if strings.HasPrefix(a.Path, "/") {
-			t.Errorf("Path = %q — the pair is held in memory and must not claim a file an operator could go read", a.Path)
-		}
-	})
-
-	t.Run("single-node server with the serving leaf: reported absent", func(t *testing.T) {
-		a := find(t, withLeaf(t), false)
-		if a.Present {
-			t.Error("a single-node server mints no cluster-CA kubelet serving pair, so reporting it present would overstate the rotation")
-		}
-	})
 }
 
 // TestRotationReportsTheServerNodeClientIdentity keeps the report complete for the
@@ -144,7 +134,7 @@ func TestRotationReportsTheServerNodeClientIdentity(t *testing.T) {
 	for name, wd := range map[string]string{"single-node": t.TempDir(), "mesh": mesh} {
 		t.Run(name, func(t *testing.T) {
 			var found []RotationArtifact
-			for _, a := range reissuedArtifacts(wd, name == "mesh") {
+			for _, a := range reissuedArtifacts(wd) {
 				if strings.Contains(a.Detail, "CN=system:node:") && strings.Contains(a.Detail, "O=system:nodes") {
 					found = append(found, a)
 				}

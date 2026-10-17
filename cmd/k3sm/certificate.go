@@ -131,20 +131,14 @@ func rotateInstalled(ctx context.Context, out io.Writer, read func(string) ([]by
 // read BEFORE the restart: a rotation that cannot tell what it restarted, or
 // verify that it came back, must not incur the blast radius.
 //
-// MeshServer is the installed topology, read from the installed server plist
-// (else the server-arguments record; install.InstalledMeshIP) — the same read the
-// probe address uses. A failed read aborts the rotation here, with or without
-// --restart, and never defaults a topology. With restart it also resolves the
-// probe's trust anchor (the cluster CA), the probe address, and the recorded
-// --tls-san names, and wires the health check; addr is "" on a dry run. The
-// caller supplies the Restarter.
+// What a rotation re-issues no longer depends on the installed topology (every
+// server mints the same set), so a dry run reads nothing. With restart it resolves
+// the probe's trust anchor (the cluster CA), the probe address (read from the
+// installed server plist, else the server-arguments record; a failed read aborts
+// before the restart), and the recorded --tls-san names, and wires the health
+// check; addr is "" on a dry run. The caller supplies the Restarter.
 func rotateOptions(read func(string) ([]byte, error), plistPath, recordPath, workDir string, restart bool, port int) (executor.RotateOptions, string, error) {
 	opts := executor.RotateOptions{WorkDir: workDir, Restart: restart}
-	meshIP, err := install.InstalledMeshIP(read, plistPath, recordPath)
-	if err != nil {
-		return opts, "", fmt.Errorf("read the installed server plist %s (or the arguments record %s) for its --mesh-ip, which decides what the rotation re-issues; refusing to rotate, dry run included, without it: %w", plistPath, recordPath, err)
-	}
-	opts.MeshServer = meshIP != ""
 	if !restart {
 		return opts, "", nil
 	}

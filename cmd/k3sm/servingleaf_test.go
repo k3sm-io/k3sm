@@ -32,7 +32,6 @@ import (
 
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/executor"
-	"k3sm.io/k3sm/pkg/install"
 )
 
 // TestSingleNodeServingLeafIsClusterCASigned is the gate for the single-node
@@ -222,41 +221,11 @@ func TestSingleNodeServingLeafIsClusterCASigned(t *testing.T) {
 	})
 }
 
-// TestRotateMeshServerFromPlist pins where the rotation's topology comes from. The
-// kubelet serving pair is minted on a --mesh-ip boot only, and the apiserver serving
-// leaf no longer witnesses that (every topology issues it), so RotateOptions.MeshServer
-// follows the installed server plist (else the server-arguments record). A read that
-// fails aborts the rotation before anything is restarted, and never defaults a
-// topology.
-func TestRotateMeshServerFromPlist(t *testing.T) {
+// TestRotatePlistReadFailsClosed pins that a rotation with --restart reads the
+// installed server plist (else the server-arguments record) for the probe address
+// before anything is restarted, and that a read that fails aborts it.
+func TestRotatePlistReadFailsClosed(t *testing.T) {
 	t.Parallel()
-	meshPlist := install.ServerPlist(install.Config{AdminToken: "k3sm-fixed", ExtraServerArgs: []string{"--mesh-ip", "100.64.0.1"}})
-	stockPlist := install.ServerPlist(install.Config{AdminToken: "k3sm-fixed"})
-	for _, tc := range []struct {
-		name  string
-		plist []byte
-		want  bool
-	}{
-		{name: "a mesh plist is a mesh server", plist: meshPlist, want: true},
-		{name: "a stock plist is single-node", plist: stockPlist, want: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			dir := t.TempDir()
-			plistPath := filepath.Join(dir, install.ServerLabel+".plist")
-			if err := os.WriteFile(plistPath, tc.plist, 0o644); err != nil {
-				t.Fatal(err)
-			}
-			opts, _, err := rotateOptions(os.ReadFile, plistPath, filepath.Join(dir, "record.json"), dir, false, 6444)
-			if err != nil {
-				t.Fatalf("rotateOptions: %v", err)
-			}
-			if opts.MeshServer != tc.want {
-				t.Errorf("MeshServer = %v, want %v", opts.MeshServer, tc.want)
-			}
-		})
-	}
-
 	t.Run("a failed plist read aborts before the restart", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()

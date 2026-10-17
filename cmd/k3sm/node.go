@@ -155,17 +155,17 @@ type nodeOptions struct {
 
 	// kubeletServingCertPEM / kubeletServingKeyPEM are this node's kubelet SERVING
 	// keypair — the cert :10250 presents — issued by the cluster CA, in PEM. They are
-	// the half of the endpoint's TLS that the APISERVER verifies: a mesh server runs
+	// the half of the endpoint's TLS that its CLIENTS verify: a mesh server runs
 	// with --kubelet-certificate-authority=<cluster CA>, so a serving cert that does
 	// not chain to it is refused with "x509: certificate signed by unknown authority"
-	// and kubectl logs/exec is broken cluster-wide.
+	// and kubectl logs/exec is broken cluster-wide; metrics-server verifies it against
+	// kube-root-ca.crt, the cluster CA, on every topology.
 	//
-	// EMPTY is the single-node/dev default: kubeletServingTLS self-signs (see
-	// certs.SelfSignedServing), which is correct exactly where no cluster CA is
-	// configured on the apiserver's kubelet client. `k3sm agent` fills them from the
-	// join response and `k3sm server --mesh-ip` from its own local mint, so on every
-	// posture where the apiserver was told which CA to trust, the node presents a leaf
-	// from that CA.
+	// EMPTY is the standalone `k3sm node`/dev default only: kubeletServingTLS
+	// self-signs (see certs.SelfSignedServing), which is correct exactly where there
+	// is no server and so no cluster CA. `k3sm agent` fills them from the join
+	// response and `k3sm server` (every topology) from its own local mint, so every
+	// node of a server's cluster presents a leaf from the cluster CA.
 	//
 	// Both or neither: exactly one set is a hard error (kubeletServingTLS refuses),
 	// mirroring the pairing discipline the client-CA anchor above already carries. The
@@ -2169,7 +2169,7 @@ func upsertTaint(taints []corev1.Taint, t corev1.Taint) []corev1.Taint {
 
 // errHalfKubeletServingPair reports a kubelet serving cert without its key, or a
 // key without its cert. The cause is always SERVER-side — one write site emits both
-// halves together (pkg/bootstrap's join response, or the mesh server's own local
+// halves together (pkg/bootstrap's join response, or the server's own local
 // mint) — so the message says so: an operator handed this error must go look at the
 // server's PKI/bootstrap bundle, not at a setting on the node that reported it.
 //
@@ -2177,7 +2177,7 @@ func upsertTaint(taints []corev1.Taint, t corev1.Taint) []corev1.Taint {
 // fallback is exactly the defect this guards: a node that quietly presents a self-signed
 // leaf to an apiserver started with --kubelet-certificate-authority is a node whose
 // logs/exec is broken, and it looks healthy while being so.
-var errHalfKubeletServingPair = errors.New("kubelet serving keypair is half-present (a cert without its key, or a key without its cert) — both halves are minted and delivered TOGETHER by the server (the join response's kubeletServingCertPEM/KeyPEM, or a mesh server's own local mint), so this is a corrupt or truncated server-side bootstrap bundle, not a setting on this node")
+var errHalfKubeletServingPair = errors.New("kubelet serving keypair is half-present (a cert without its key, or a key without its cert) — both halves are minted and delivered TOGETHER by the server (the join response's kubeletServingCertPEM/KeyPEM, or a server's own local mint), so this is a corrupt or truncated server-side bootstrap bundle, not a setting on this node")
 
 // kubeletServingTLS builds the TLS config the VK node serves on :10250. The
 // cert's SANs include loopback, the node name, and EVERY address in nodeIPs —
@@ -2188,12 +2188,12 @@ var errHalfKubeletServingPair = errors.New("kubelet serving keypair is half-pres
 // are passed; duplicates and unparseable entries are dropped.
 //
 // servingCertPEM/servingKeyPEM are the CLUSTER-CA-ISSUED pair this node was given
-// (a worker in its join response, a mesh server from its own mint). When BOTH are
-// present they are used verbatim and nothing is self-signed: their SANs were chosen
-// by the issuer, which is why nodeIPs then only feeds the self-signed fallback. When
-// BOTH are empty the cert is self-signed — the single-node/dev posture, where the
-// apiserver configures no --kubelet-certificate-authority and therefore trusts what
-// the node presents. Exactly one present is errHalfKubeletServingPair.
+// (a worker in its join response, a server from its own mint, on every topology).
+// When BOTH are present they are used verbatim and nothing is self-signed: their
+// SANs were chosen by the issuer, which is why nodeIPs then only feeds the
+// self-signed fallback. When BOTH are empty the cert is self-signed — the
+// standalone `k3sm node`/dev posture, where no server and no cluster CA exist.
+// Exactly one present is errHalfKubeletServingPair.
 //
 // The CLIENT half is not optional and is not this function's to choose: auth
 // stamps tls.RequireAndVerifyClientCert plus the cluster's client-identity CA onto

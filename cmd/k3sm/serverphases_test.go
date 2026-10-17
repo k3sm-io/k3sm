@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -90,18 +91,31 @@ func TestServerPhaseStopsAreNeverNil(t *testing.T) {
 }
 
 // TestAddonPosture pins the facts the gated embedded add-ons key on. The kubelet
-// CA fact is inferred from the mesh-provisioned cluster-CA serving pair (a mesh IP
-// AND that pair); no node capability is read, because the add-on is a native pod;
-// and a failed node read, or a read showing no Node at all, is Undecided: only
-// positive evidence may lead to a withdrawal.
+// CA fact is read off what the server minted: its own node's kubelet serving pair
+// from the cluster CA (recorded by serverNodeOptions) AND the apiserver's
+// cluster-CA serving pair that makes kube-root-ca.crt that CA, on every topology,
+// the mesh IP playing no part. No node capability is read, because the add-on is a
+// native pod; and a pair not minted yet, a failed node read, or a read showing no
+// Node at all is Undecided: only positive evidence may lead to a withdrawal.
 func TestAddonPosture(t *testing.T) {
-	mesh := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
-	mesh.cfg.ServingCertFile, mesh.cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
-	noPair := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}}
-	// A single-node server holds the cluster-CA serving pair too (every topology
-	// issues it), and its kubelet serving cert is still self-signed: false.
-	singleNode := serverPlan{}
-	singleNode.cfg.ServingCertFile, singleNode.cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
+	fact := func(minted bool) *kubeletServingFact {
+		f := newKubeletServingFact()
+		if minted {
+			f.markMinted()
+		}
+		return f
+	}
+	withPair := func(p serverPlan) serverPlan {
+		p.cfg.ServingCertFile, p.cfg.ServingKeyFile = "/w/tls/apiserver.crt", "/w/tls/apiserver.key"
+		return p
+	}
+	mesh := withPair(serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}, kubeletServing: fact(true)})
+	noPair := serverPlan{opts: serverOptions{meshIP: "100.64.0.1"}, kubeletServing: fact(true)}
+	// A single-node server mints its node's kubelet serving pair from the cluster
+	// CA too, so the verified scrape works there: true.
+	singleNode := withPair(serverPlan{kubeletServing: fact(true)})
+	kubeletPairPending := withPair(serverPlan{kubeletServing: fact(false)})
+	noFact := withPair(serverPlan{})
 	node := func(name string, labels map[string]string) *corev1.Node {
 		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
 	}
@@ -117,8 +131,10 @@ func TestAddonPosture(t *testing.T) {
 	}{
 		{"mesh, a server and a worker", mesh, []runtime.Object{plainServer, worker}, nil, true, false},
 		{"mesh, a single server node still decides", mesh, []runtime.Object{plainServer}, nil, true, false},
-		{"single-node with the serving pair", singleNode, []runtime.Object{plainServer}, nil, false, false},
-		{"mesh ip but no cluster-CA serving pair", noPair, []runtime.Object{worker}, nil, false, false},
+		{"single-node with the minted kubelet pair", singleNode, []runtime.Object{plainServer}, nil, true, false},
+		{"no kubelet serving fact at all", noFact, []runtime.Object{plainServer}, nil, false, false},
+		{"the kubelet pair not minted yet is undecided", kubeletPairPending, []runtime.Object{plainServer}, nil, false, true},
+		{"mesh ip but no cluster-CA apiserver serving pair", noPair, []runtime.Object{worker}, nil, false, false},
 		{"node read fails", mesh, nil, errors.New("connection refused"), true, true},
 		{"no Node registered yet is undecided", mesh, nil, nil, true, true},
 	} {
@@ -141,5 +157,53 @@ func TestAddonPosture(t *testing.T) {
 				t.Errorf("%d node reads, want exactly one", lists)
 			}
 		})
+	}
+}
+
+// TestMintKicksOneImmediateRegatePass pins that the kubelet serving mint runs one
+// add-on re-evaluation pass at once rather than on the next RegateInterval tick:
+// the ticker here never fires, the first markMinted yields exactly one tick, a
+// second mark yields none, and the ticker still flows through afterwards.
+func TestMintKicksOneImmediateRegatePass(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	tick := make(chan time.Time)
+	fact := newKubeletServingFact()
+	ticks, done := regateTicks(ctx, tick, fact.kicked())
+
+	select {
+	case <-ticks:
+		t.Fatal("a pass ran before the pair was minted")
+	case <-time.After(50 * time.Millisecond):
+	}
+	fact.markMinted()
+	select {
+	case <-ticks:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the mint did not kick a pass; the add-ons would wait for the RegateInterval tick")
+	}
+	fact.markMinted()
+	select {
+	case <-ticks:
+		t.Fatal("a second mark kicked another pass; the kick is once")
+	case <-time.After(50 * time.Millisecond):
+	}
+	want := time.Unix(42, 0)
+	go func() { tick <- want }()
+	if got := <-ticks; !got.Equal(want) {
+		t.Errorf("forwarded tick = %v, want %v", got, want)
+	}
+	if minted, decided := fact.read(); !minted || !decided {
+		t.Errorf("read() = %v, %v after the mint; want true, true", minted, decided)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("regateTicks did not stop when its context ended")
+	}
+	if _, ok := <-ticks; ok {
+		t.Error("the tick channel is not closed after stop")
 	}
 }

@@ -41,8 +41,14 @@ For an HA upgrade see [HA](ha.md#upgrading-an-ha-cluster-to-the-aggregation-laye
 ## What Rotation Is
 
 Every control-plane boot re-issues the CA-signed leaves unconditionally: the scheduler and
-controller-manager client-cert kubeconfigs, and (on a multi-node server) the apiserver serving
-cert. A restart therefore *is* the rotation. `k3sm certificate rotate` wraps that restart with
+controller-manager client-cert kubeconfigs, the apiserver serving cert, and the server node's own
+kubelet serving cert, which the cluster CA signs on a single-node server as on a multi-node one and
+which is held in memory, never written to disk. A restart therefore *is* the rotation.
+
+Both serving certs are issued for one year, and only a boot re-issues them. A server that runs more
+than 365 days without a restart serves an expired kubelet certificate until it is restarted.
+Until then metrics-server cannot scrape that node, and on a multi-node server `kubectl logs` and
+`exec` against it fail too. `k3sm certificate rotate` wraps that restart with
 checks:
 
 1. verify the CA hierarchy is present and complete (reading only the certificates, never a CA
