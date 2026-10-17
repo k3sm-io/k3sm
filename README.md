@@ -39,6 +39,7 @@ k3sm ships as a single binary. Its subcommands:
 | `kubectl` | Run the bundled kubectl against this cluster, with `KUBECONFIG` preset |
 | `kubeconfig` | Print the admin kubeconfig, or write/merge it into `~/.kube/config` |
 | `status` | Show what is running (daemons, apiserver, node, workloads, data root), with a one-line verdict and the fix for whatever is down |
+| `alerts` | List only what needs attention, each with its cause, the evidence, numbered fix steps and the docs page (`-o json` for scripts and tools) |
 | `doctor` | Run preflight environment and datastore-posture checks |
 | `netd` | Run the root-privileged network helper (launched by its own daemon) |
 | `dev` | Bring up a disposable single-node cluster for local development |

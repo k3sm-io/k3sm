@@ -17,6 +17,27 @@
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
         "runs": "0"
+      },
+      "alert": {
+        "cause": "launchd's answer about the network helper (netd) could not be read, so whether it runs is unknown.",
+        "evidence": [
+          "launchctl reported a state this build cannot read",
+          "label: io.k3sm.netd",
+          "plist: /Library/LaunchDaemons/io.k3sm.netd.plist",
+          "pid: 0",
+          "runs: 0",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/netd.log"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     },
     {
@@ -26,13 +47,34 @@
       "detail": "launchctl reported a state this build cannot read",
       "remedy": "sudo k3sm status",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
         "label": "io.k3sm.server",
         "last-exit": "(never exited)",
         "log-path": "/var/log/k3sm/server.log",
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
         "runs": "0"
+      },
+      "alert": {
+        "cause": "launchd's answer about the control-plane daemon could not be read, so whether it runs is unknown.",
+        "evidence": [
+          "launchctl reported a state this build cannot read",
+          "label: io.k3sm.server",
+          "plist: /Library/LaunchDaemons/io.k3sm.server.plist",
+          "pid: 0",
+          "runs: 0",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/server.log"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     }
   ]

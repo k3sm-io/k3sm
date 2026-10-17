@@ -24,7 +24,7 @@
       "severity": "ok",
       "detail": "pid 1292",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
         "label": "io.k3sm.server",
         "last-exit": "(never exited)",
         "log-path": "/var/log/k3sm/server.log",

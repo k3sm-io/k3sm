@@ -1,11 +1,13 @@
 # Status JSON
 
-`k3sm status` has two machine-readable shapes. Both are versioned, and this page is their contract:
-what each field means, which values an enum can take, and what a version bump promises.
+`k3sm status` has two machine-readable shapes, and `k3sm alerts` a third cut from the first. All are
+versioned, and this page is their contract: what each field means, which values an enum can take,
+and what a version bump promises.
 
 ```sh
 k3sm status -o json            # the full report
 k3sm status daemons -o json    # the daemons probe
+k3sm alerts -o json            # only the rows that need attention, with their alerts
 ```
 
 The full report probes every subsystem: the LaunchDaemons, the apiserver, the node, the workloads,
@@ -18,8 +20,8 @@ cheap enough to poll.
 
 ## Versioning
 
-Both shapes carry `"schemaVersion": 1`, and so does `k3sm doctor --json`, which emits the full
-report's shape.
+Every shape carries `"schemaVersion": 1`, and so does `k3sm doctor --json`, which emits the full
+report's shape. The `alert` object on rows and the `k3sm alerts` shape are additions under version 1.
 
 Output from releases before the stamp has no `schemaVersion` key; treat it as version 0. Version 1
 renamed the keys under `version` from capitalised (`Version`, `Commit`, `GoVersion`) to the
@@ -499,6 +501,80 @@ attached Pod in the row's `wide` keys.
 | `detail` | string | one sentence for a person; do not parse it |
 | `remedy` | string | the command or commands that fix this row, one per line; omitted when there is nothing to do |
 | `wide` | object of strings | extra detail (label, pid, run count, last exit, plist and log paths); informational, and its keys are not part of the contract, except the `settings` row's (above) |
+| `alert` | object | what is wrong and how to fix it (see [Alerts](#alerts)); present on every row whose `severity` is `warn`, `fail` or `unknown`, and on every `needs-admin` row; omitted on every other row |
 
 Text taken from a daemon's log or arguments is redacted before it reaches any field: no join token,
 bootstrap token or URL password appears in either shape.
+
+## Alerts
+
+Every row that needs attention carries an `alert` object, in the full report, in the daemons probe
+and in `k3sm alerts`. A row needs attention when its `severity` is `warn`, `fail` or `unknown`, or its
+`state` is `needs-admin` (whose severity is `skip`: nothing is known to be wrong, but only an
+administrator can say so). A row that is `ok`, or `skip` for any other reason, has no `alert`. The
+row's `detail` and `remedy` stay as they were, so a reader that predates the alert loses nothing.
+
+```json
+"alert": {
+  "cause": "The control-plane daemon is loaded in launchd but not running, so the cluster's control plane is not serving.",
+  "evidence": [ "io.k3sm.server is loaded but not running", "label: io.k3sm.server", "last-exit: 1" ],
+  "fix": [
+    { "step": "Restart the daemon", "command": "sudo launchctl kickstart -k system/io.k3sm.server", "needsAdmin": true, "confirm": false }
+  ],
+  "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running",
+  "since": "2026-10-01T09:28:12Z"
+}
+```
+
+| field | type | notes |
+|---|---|---|
+| `cause` | string | one sentence: what is wrong, in plain words; for a person, do not parse it |
+| `evidence` | array of strings | the facts the check saw: the row's `detail` first, then the ones that bear on it (the quoted log line, the last exit, the file read, the counts); every entry is redacted (tokens, bearer credentials, PEM blocks, kubeconfig keys and passwords are masked) |
+| `fix` | array of steps | the steps that repair the row, in order; never empty |
+| `fix[].step` | string | what the step does, in a sentence |
+| `fix[].command` | string | the shell command that does it, ready to run as written; omitted for a step done by hand, including any step whose command would need a name filled in or would name a cluster object whose name is not a valid Kubernetes name |
+| `fix[].needsAdmin` | boolean | `true` when the step needs an administrator: its command runs `sudo` anywhere, pipes a download into a shell, or runs the install script |
+| `fix[].confirm` | boolean | `true` when the step destroys state or relaxes trust, so a person should confirm it before it runs: removing files, force-deleting a pod, the out-of-service taint, minting a join token, an etcd cluster reset, clearing the crash-loop breaker, a download piped into a shell |
+| `docs` | string | the page and anchor that covers the failure, relative to the `docs/user/` directory of the k3sm repository (`troubleshooting.md#...` is `docs/user/troubleshooting.md`) |
+| `since` | string | when the condition began, RFC 3339 in UTC; omitted when it is not known |
+
+`needsAdmin: false` does not mean a step is safe to run unattended. It says only that the step does
+not need an administrator. A tool that runs fix steps for a person should ask before any step whose
+`confirm` is `true`, and should show every command before it runs.
+
+`evidence` is diagnostic. It can name local paths, the user name in them, node and pod names and
+addresses. Review it before you share it outside your own machines.
+
+### `k3sm alerts`
+
+`k3sm alerts` runs the same checks as `k3sm status`, no more, and prints only the rows that need
+attention with their alerts. It is the one call a tool or a model makes to ask "what is wrong here,
+and how do I fix it". Its exit code is the verdict, exactly as `k3sm status`'s is.
+
+```json
+{
+  "schemaVersion": 1,
+  "verdict": "degraded",
+  "role": "server",
+  "summary": "dns: the resolver at 10.43.0.10 did not answer over UDP in 3 s",
+  "node": "my-mac",
+  "alerts": [ { "name": "dns", "state": "down", "severity": "warn", "detail": "the resolver at 10.43.0.10 did not answer over UDP in 3 s", "remedy": "...", "alert": { "cause": "..." } } ],
+  "version": { "version": "v0.1.7", "kubeVersion": "v1.36.2" },
+  "timestamp": "2026-10-01T09:30:00Z"
+}
+```
+
+| field | type | notes |
+|---|---|---|
+| `schemaVersion` | number | `1` |
+| `verdict` | string | the full report's verdict; see [Shared enums](#shared-enums) |
+| `role` | string | `server` or `agent` |
+| `summary` | string | the full report's summary; do not parse it |
+| `node` | string | the Kubernetes node this Mac runs as when the report could tell, otherwise this Mac's short host name; omitted when neither is known |
+| `alerts` | array of rows | the rows that carry an `alert`, in the full report's order, each in the [Rows](#rows) shape; an empty array (never `null`) when nothing needs attention |
+| `version` | object | the build that produced the report, as in the full report |
+| `timestamp` | string | RFC 3339 |
+
+Without `-o json`, `k3sm alerts` prints the same content for a person: the verdict line, then each
+row with its cause, evidence, numbered fix steps (a step that needs an administrator is marked) and
+documentation page.

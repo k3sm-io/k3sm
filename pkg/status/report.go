@@ -103,6 +103,10 @@ type Row struct {
 	Detail   string            `json:"detail"`
 	Remedy   string            `json:"remedy,omitempty"`
 	Wide     map[string]string `json:"wide,omitempty"`
+	// Alert is the structured cause, evidence, fix steps and docs page of a
+	// row that needs attention: present on every row NeedsAlert accepts, and
+	// on no other. Detail and Remedy carry the same facts for older readers.
+	Alert *Alert `json:"alert,omitempty"`
 }
 
 // PeerStatus is one mesh peer's line. The multi-node mesh does not report here

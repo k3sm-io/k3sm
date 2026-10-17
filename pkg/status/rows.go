@@ -194,6 +194,8 @@ func (c Collector) Collect(ctx context.Context) Report {
 	}
 
 	verdict, summary, next := Aggregate(rows, installed, role)
+	stopped := c.stoppedBy()
+	attachAlerts(rows, alertContext{now: now(), role: role, stopped: stopped})
 	return Report{
 		SchemaVersion: SchemaVersion,
 		Verdict:       verdict,
@@ -202,7 +204,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 		Rows:          rows,
 		Next:          next,
 		Interconnect:  icBlock,
-		StoppedBy:     c.stoppedBy(),
+		StoppedBy:     stopped,
 		Network:       network,
 		Workers:       c.workers(role, nodesRead, nodes, nodesErr),
 		JoinTarget:    c.joinTarget(role),

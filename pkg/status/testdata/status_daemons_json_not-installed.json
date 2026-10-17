@@ -17,6 +17,27 @@
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
         "runs": "0"
+      },
+      "alert": {
+        "cause": "The network helper (netd) is not loaded in launchd, so nothing runs it and pods on this Mac lose their network and the node resolver is not maintained.",
+        "evidence": [
+          "io.k3sm.netd is not loaded in the system domain",
+          "label: io.k3sm.netd",
+          "plist: /Library/LaunchDaemons/io.k3sm.netd.plist",
+          "pid: 0",
+          "runs: 0",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/netd.log"
+        ],
+        "fix": [
+          {
+            "step": "Re-run the install, which is idempotent and puts back what is missing",
+            "command": "sudo k3sm install",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     },
     {
@@ -26,13 +47,34 @@
       "detail": "io.k3sm.server is not loaded in the system domain",
       "remedy": "sudo k3sm install",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
         "label": "io.k3sm.server",
         "last-exit": "(never exited)",
         "log-path": "/var/log/k3sm/server.log",
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
         "runs": "0"
+      },
+      "alert": {
+        "cause": "The control-plane daemon is not loaded in launchd, so nothing runs it and the cluster's control plane is not serving.",
+        "evidence": [
+          "io.k3sm.server is not loaded in the system domain",
+          "label: io.k3sm.server",
+          "plist: /Library/LaunchDaemons/io.k3sm.server.plist",
+          "pid: 0",
+          "runs: 0",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/server.log"
+        ],
+        "fix": [
+          {
+            "step": "Re-run the install, which is idempotent and puts back what is missing",
+            "command": "sudo k3sm install",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     }
   ]

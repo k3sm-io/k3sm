@@ -175,7 +175,18 @@ type Paths struct {
 
 // tokenFlags are the argv flags whose VALUE is a credential. A log line that
 // echoes one is redacted flag-and-all.
-var tokenFlags = regexp.MustCompile(`(--(?:token|agent-token|server-token|server-ca-hash))[= ]\S+`)
+var tokenFlags = regexp.MustCompile(`(--(?:token|agent-token|server-token|server-ca-hash|node-password))[= ]\S+`)
+
+// bearerTokens is an HTTP bearer credential, in an Authorization header or
+// alone ("bearer <token>").
+var bearerTokens = regexp.MustCompile(`(?i)\b(bearer)\s+\S+`)
+
+// pemBlocks is a PEM block (a key or a certificate), whole, or cut off by the
+// end of the line it was quoted from.
+var pemBlocks = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]+-----(?s:.*?-----END [A-Z0-9 ]+-----|.*$)`)
+
+// kubeconfigSecrets are the kubeconfig keys whose value is a credential.
+var kubeconfigSecrets = regexp.MustCompile(`\b((?:client-key-data|client-certificate-data|token)\s*:)\s*\S+`)
 
 // tokenLiterals are the credential SHAPES k3sm mints: the join token
 // (`k3sm-<opaque>`) and the CA-pinned bootstrap token (`K10<sha256>::…`). They
@@ -206,7 +217,10 @@ const redacted = "<redacted>"
 // — but a crash-looping server's own log can echo the flags it was started
 // with, and that log tail IS quoted into the row.
 func Redact(s string) string {
+	s = pemBlocks.ReplaceAllString(s, redacted)
 	s = tokenFlags.ReplaceAllString(s, "$1 "+redacted)
+	s = bearerTokens.ReplaceAllString(s, "$1 "+redacted)
+	s = kubeconfigSecrets.ReplaceAllString(s, "$1 "+redacted)
 	s = urlCredentials.ReplaceAllString(s, "$1:***@")
 	return tokenLiterals.ReplaceAllString(s, redacted)
 }

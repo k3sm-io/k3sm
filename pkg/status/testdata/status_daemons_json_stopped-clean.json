@@ -17,6 +17,27 @@
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
         "runs": "1"
+      },
+      "alert": {
+        "cause": "The network helper (netd) exited with an error and is not running, so pods on this Mac lose their network and the node resolver is not maintained.",
+        "evidence": [
+          "1 run, last exit 1",
+          "label: io.k3sm.netd",
+          "plist: /Library/LaunchDaemons/io.k3sm.netd.plist",
+          "pid: 0",
+          "runs: 1",
+          "last-exit: 1",
+          "log-path: /var/log/k3sm/netd.log"
+        ],
+        "fix": [
+          {
+            "step": "Restart the daemon",
+            "command": "sudo launchctl kickstart -k system/io.k3sm.netd",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     },
     {
@@ -26,13 +47,40 @@
       "detail": "loaded but not running (3 runs)",
       "remedy": "sudo launchctl kickstart -k system/io.k3sm.server\nk3sm status logs server",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
         "label": "io.k3sm.server",
         "last-exit": "0",
         "log-path": "/var/log/k3sm/server.log",
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
         "runs": "3"
+      },
+      "alert": {
+        "cause": "The control-plane daemon is loaded in launchd but not running, so the cluster's control plane is not serving.",
+        "evidence": [
+          "loaded but not running (3 runs)",
+          "label: io.k3sm.server",
+          "plist: /Library/LaunchDaemons/io.k3sm.server.plist",
+          "pid: 0",
+          "runs: 3",
+          "last-exit: 0",
+          "log-path: /var/log/k3sm/server.log"
+        ],
+        "fix": [
+          {
+            "step": "Restart the daemon",
+            "command": "sudo launchctl kickstart -k system/io.k3sm.server",
+            "needsAdmin": true,
+            "confirm": false
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs server",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     }
   ]

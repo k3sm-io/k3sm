@@ -76,13 +76,16 @@ func (c Collector) CollectDaemons() DaemonsReport {
 	verdict, summary, _ := Aggregate([]Row{ld.install, ld.netd, ld.node}, ld.installed, role)
 	record := c
 	record.NetworkApplied = nil
+	stopped := c.stoppedBy()
+	daemons := []Row{ld.netd, ld.node}
+	attachAlerts(daemons, alertContext{now: now(), role: role, stopped: stopped})
 	return DaemonsReport{
 		SchemaVersion: SchemaVersion,
 		Verdict:       verdict,
 		Role:          role,
 		Summary:       summary,
-		Daemons:       []Row{ld.netd, ld.node},
-		StoppedBy:     c.stoppedBy(),
+		Daemons:       daemons,
+		StoppedBy:     stopped,
 		Network:       record.network(role, ld.installed),
 	}
 }

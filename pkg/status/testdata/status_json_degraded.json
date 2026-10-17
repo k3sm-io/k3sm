@@ -29,6 +29,27 @@
         "pid": "1292",
         "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
         "runs": "1"
+      },
+      "alert": {
+        "cause": "launchd says the network helper (netd) is running, but its process is gone, so pods on this Mac lose their network and the node resolver is not maintained.",
+        "evidence": [
+          "launchd reports running, but pid 1292 is not in the process table · socket /var/lib/k3sm/run/netd.sock",
+          "label: io.k3sm.netd",
+          "plist: /Library/LaunchDaemons/io.k3sm.netd.plist",
+          "pid: 1292",
+          "runs: 1",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/netd.log"
+        ],
+        "fix": [
+          {
+            "step": "Restart the daemon",
+            "command": "sudo launchctl kickstart -k system/io.k3sm.netd",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     },
     {
@@ -38,13 +59,34 @@
       "detail": "launchd reports running, but pid 1292 is not in the process table",
       "remedy": "sudo launchctl kickstart -k system/io.k3sm.server",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
         "label": "io.k3sm.server",
         "last-exit": "(never exited)",
         "log-path": "/var/log/k3sm/server.log",
         "pid": "1292",
         "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
         "runs": "1"
+      },
+      "alert": {
+        "cause": "launchd says the control-plane daemon is running, but its process is gone, so the cluster's control plane is not serving.",
+        "evidence": [
+          "launchd reports running, but pid 1292 is not in the process table",
+          "label: io.k3sm.server",
+          "plist: /Library/LaunchDaemons/io.k3sm.server.plist",
+          "pid: 1292",
+          "runs: 1",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/server.log"
+        ],
+        "fix": [
+          {
+            "step": "Restart the daemon",
+            "command": "sudo launchctl kickstart -k system/io.k3sm.server",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     },
     {
@@ -102,6 +144,22 @@
       "remedy": "sudo k3sm update check",
       "wide": {
         "record": "/nonexistent/k3sm-status-contract/status/update.json"
+      },
+      "alert": {
+        "cause": "No update check is recorded yet, so whether a newer release exists is unknown.",
+        "evidence": [
+          "no update check is recorded yet (the server checks once an hour)",
+          "record: /nonexistent/\u003credacted\u003e"
+        ],
+        "fix": [
+          {
+            "step": "Check for a new release now",
+            "command": "sudo k3sm update check",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "upgrade.md#checking-for-an-update"
       }
     },
     {
@@ -115,7 +173,22 @@
       "state": "needs-admin",
       "severity": "skip",
       "detail": "needs sudo: the runtime daemon's socket is owner-only",
-      "remedy": "sudo k3sm status"
+      "remedy": "sudo k3sm status",
+      "alert": {
+        "cause": "The runtime daemon's socket is owner-only, so only an administrator can ask it whether it is healthy; nothing is known to be wrong.",
+        "evidence": [
+          "needs sudo: the runtime daemon's socket is owner-only"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#checks-that-need-sudo"
+      }
     },
     {
       "name": "dns",
