@@ -68,6 +68,45 @@ else
 	ladder no "b137.3  asset names match the .goreleaser.yaml templates (frozen contract)"
 fi
 
+# b137.4 — the install line passes no flag. install.sh's own
+# `"$STAGE/k3sm" install` must end at `install`, so the published one-liner
+# installs with k3sm's built-in defaults, the same ones the k3sm.app install
+# uses (the app adds only --from-staging and --user). A default added here and
+# not in the app, or the reverse, would make the two installs differ. The check
+# is a function of the file so the case below can prove it rejects a copy with
+# a flag appended.
+install_line_problems() { # <script> — prints each offending line, non-zero on any
+	local f="$1" lines rc=0 line rest
+	lines="$(grep -F '"$STAGE/k3sm" install' "$f" | grep -Ev '^[[:space:]]*#' || true)"
+	if [ -z "$lines" ]; then
+		echo "no \"\$STAGE/k3sm\" install line found"
+		return 1
+	fi
+	while IFS= read -r line; do
+		rest="${line#*\"\$STAGE/k3sm\" install}"
+		if ! [[ "$rest" =~ ^[[:space:]]*(\;.*)?$ ]]; then
+			echo "passes arguments after install: $line"
+			rc=1
+		fi
+	done <<<"$lines"
+	return "$rc"
+}
+if problems="$(install_line_problems "$SCRIPT")"; then
+	ladder ok "b137.4  install.sh's \"\$STAGE/k3sm\" install line passes no flag"
+else
+	ladder no "b137.4  install.sh's \"\$STAGE/k3sm\" install line passes no flag ($problems)"
+fi
+FLAGCOPY="$(mktemp /tmp/b137-flag.XXXXXX)"
+sed 's|"$STAGE/k3sm" install;|"$STAGE/k3sm" install --lan-access;|' "$SCRIPT" >"$FLAGCOPY"
+if cmp -s "$SCRIPT" "$FLAGCOPY"; then
+	ladder no "b137.4r the flag-appended copy differs from install.sh (the sed matched nothing)"
+elif install_line_problems "$FLAGCOPY" >/dev/null; then
+	ladder no "b137.4r a copy of install.sh with a flag appended is rejected"
+else
+	ladder ok "b137.4r a copy of install.sh with a flag appended is rejected"
+fi
+rm -f "$FLAGCOPY"
+
 # ---- python3 presence (the mock server needs it) ----------------------------
 if ! command -v python3 >/dev/null 2>&1; then
 	echo "FAIL  b137  python3 not found — the loopback mock server requires it" >&2

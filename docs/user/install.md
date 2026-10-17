@@ -141,7 +141,10 @@ Every channel manages the same `/Library/k3sm`. Once more than one has shipped, 
 ### Installing From k3sm.app
 
 k3sm.app is built from its own public repository, [k3sm-io/app](https://github.com/k3sm-io/app),
-a separate SwiftPM package. The command-line install needs nothing from the app.
+a separate SwiftPM package. The command-line install needs nothing from the app. The app runs the
+same `k3sm install` with the same defaults as `install.sh`, adding only `--from-staging` and
+`--user`, and it installs the release it carries, which can be older than the newest release the
+script picks.
 
 The k3sm app installs, updates and uninstalls with the same `/Library/k3sm`. Each of those
 actions asks for an administrator password once. That step copies the app's bundled files into a

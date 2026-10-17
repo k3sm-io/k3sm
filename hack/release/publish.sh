@@ -228,7 +228,39 @@ tarball_problems() {
 	cmp -s "$x/PAYLOAD-SHA256" "$manifest" || { echo "    the archived PAYLOAD-SHA256 differs from the staged one"; rc=1; }
 	tree_manifest_problems "$x" "$manifest" LICENSE NOTICE || rc=1
 	rm -rf "$x"
+	tarball_member_problems "$tarball" "$manifest" || rc=1
 	return "$rc"
+}
+
+# tarball_member_problems <tarball> <manifest>: zero when the archive's member
+# list is exactly the manifest's paths plus PAYLOAD-SHA256, LICENSE and NOTICE,
+# each once, with no member other than those and the directories that hold
+# them. The k3sm.app payload is the same manifest-listed tree, so this is what
+# keeps the tarball install.sh unpacks and the payload the app installs from
+# holding the same files. Extraction alone cannot see a duplicate member, a
+# directory-only member, or a missing LICENSE or NOTICE; the listing can.
+tarball_member_problems() {
+	local tarball="$1" manifest="$2" listing files dirs want extra_dirs
+	listing="$(tar -tzf "$tarball" 2>/dev/null)" || { echo "    cannot list $tarball"; return 1; }
+	listing="$(printf '%s\n' "$listing" | sed 's|^\./||' | sed '/^$/d')"
+	files="$(printf '%s\n' "$listing" | grep -v '/$' | LC_ALL=C sort || true)"
+	dirs="$(printf '%s\n' "$listing" | grep '/$' | sed 's|/$||' | LC_ALL=C sort -u || true)"
+	want="$({
+		grep -v '^#' "$manifest" | sed '/^$/d' | sed 's/^[0-9a-f]\{64\}  //'
+		printf '%s\n' PAYLOAD-SHA256 LICENSE NOTICE
+	} | LC_ALL=C sort)"
+	if [ "$files" != "$want" ]; then
+		echo "    the members of $(basename "$tarball") are not exactly the manifest's files plus PAYLOAD-SHA256, LICENSE and NOTICE:"
+		diff <(printf '%s\n' "$want") <(printf '%s\n' "$files") | sed -n 's/^\([<>]\)/      \1/p'
+		return 1
+	fi
+	# Every directory member must be a parent of a wanted file.
+	extra_dirs="$(LC_ALL=C comm -23 <(printf '%s\n' "$dirs" | sed '/^$/d') <(printf '%s\n' "$want" | awk -F/ '{ p = ""; for (i = 1; i < NF; i++) { p = (p == "" ? $i : p "/" $i); print p } }' | LC_ALL=C sort -u))"
+	if [ -n "$extra_dirs" ]; then
+		echo "    $(basename "$tarball") holds directory members no listed file needs:"
+		printf '%s\n' "$extra_dirs" | sed 's/^/      > /'
+		return 1
+	fi
 }
 
 # entitlement_problems <relpath> <entitlements-xml>: the decision over one
@@ -965,6 +997,36 @@ EOF
 	package_case "a manifest-listed file missing from the tree refuses" "$Q" "$tag" "$T/missing.assets" refuse
 	Q="$T/link/tree"; mk_payload "$Q"; ln -s k3sm "$Q/k3sm-link"
 	package_case "a symlink in the tree refuses" "$Q" "$tag" "$T/link.assets" refuse
+	# The tarball's member list, read with tar -t, must be exactly the
+	# manifest's files plus PAYLOAD-SHA256, LICENSE and NOTICE: the same file
+	# set the k3sm.app payload carries. Each case below extracts to a tree
+	# that the extract-and-compare alone accepts.
+	# member_case <name> <want: pass|refuse> <tar member args...>
+	member_case() {
+		local name="$1" want="$2" tb="$T/members/$1.tar.gz"
+		shift 2
+		mkdir -p "$T/members"
+		(cd "$P" && COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$tb" "$@" -C "$REPO_ROOT" LICENSE NOTICE) 2>/dev/null || true
+		rc=0; out="$(tarball_problems "$tb" "$P/PAYLOAD-SHA256" 2>&1)" || rc=$?
+		if { [ "$want" = pass ] && [ "$rc" -eq 0 ]; } || { [ "$want" = refuse ] && [ "$rc" -ne 0 ] && grep -q "members of\|directory members" <<<"$out"; }; then
+			ok "tarball members: $name"
+		else
+			bad "tarball members: $name (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+		fi
+	}
+	member_case "control: the manifest's files plus PAYLOAD-SHA256, LICENSE and NOTICE pass" pass k3sm cp-payload PAYLOAD-SHA256
+	member_case "a member listed twice refuses" refuse k3sm cp-payload PAYLOAD-SHA256 k3sm
+	mkdir -p "$P/empty-dir"
+	member_case "a directory member no listed file needs refuses" refuse k3sm cp-payload PAYLOAD-SHA256 empty-dir
+	rmdir "$P/empty-dir"
+	# NOTICE missing: build this one by hand, since member_case always adds both.
+	(cd "$P" && COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$T/members/no-notice.tar.gz" k3sm cp-payload PAYLOAD-SHA256 -C "$REPO_ROOT" LICENSE)
+	rc=0; out="$(tarball_problems "$T/members/no-notice.tar.gz" "$P/PAYLOAD-SHA256" 2>&1)" || rc=$?
+	if [ "$rc" -ne 0 ] && grep -q "members of" <<<"$out" && grep -q "< NOTICE" <<<"$out"; then
+		ok "tarball members: a tarball without NOTICE refuses"
+	else
+		bad "tarball members: a tarball without NOTICE refuses (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
 	# A tree changed after packaging is caught again right before upload,
 	# before any gh call.
 	Q="$T/late/tree"; mk_payload "$Q"

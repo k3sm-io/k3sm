@@ -103,6 +103,11 @@ func (c Collector) Collect(ctx context.Context) Report {
 	if args, ok := c.serverArgsRow(); ok {
 		rows = append(rows, args)
 	}
+	// The node's install settings, read back, beside the daemon they configure.
+	network := c.network(role, installed)
+	if settings, ok := c.settingsRow(role, installed, dataRoot, volume, network); ok {
+		rows = append(rows, settings)
+	}
 	rows = append(rows,
 		apiserver,
 		c.nodeRow(serving, role, nodes, nodesErr),
@@ -194,7 +199,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 		Next:          next,
 		Interconnect:  icBlock,
 		StoppedBy:     c.stoppedBy(),
-		Network:       c.network(role, installed),
+		Network:       network,
 		Workers:       c.workers(role, nodesRead, nodes, nodesErr),
 		JoinTarget:    c.joinTarget(role),
 		Version:       c.Version,

@@ -48,6 +48,18 @@
       }
     },
     {
+      "name": "settings",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "NodePort addresses 192.0.2.0/24 · release base default · data volume none · LAN access unknown",
+      "wide": {
+        "data-volume": "none",
+        "lan-access": "unknown",
+        "nodeport-addresses": "192.0.2.0/24",
+        "release-base": "default"
+      }
+    },
+    {
       "name": "apiserver",
       "state": "unknown",
       "severity": "unknown",

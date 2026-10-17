@@ -48,6 +48,23 @@
       }
     },
     {
+      "name": "settings",
+      "state": "needs-admin",
+      "severity": "skip",
+      "detail": "NodePort addresses restricted · registry port restricted · TLS SANs restricted · mesh IP restricted · kubeconfig name restricted · release base restricted · data volume none · LAN access unknown",
+      "remedy": "sudo k3sm status",
+      "wide": {
+        "data-volume": "none",
+        "kubeconfig-name": "restricted",
+        "lan-access": "unknown",
+        "mesh-ip": "restricted",
+        "nodeport-addresses": "restricted",
+        "registry-port": "restricted",
+        "release-base": "restricted",
+        "tls-sans": "restricted"
+      }
+    },
+    {
       "name": "apiserver",
       "state": "unknown",
       "severity": "unknown",

@@ -46,6 +46,22 @@
       }
     },
     {
+      "name": "settings",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "NodePort addresses every interface · registry port off · TLS SANs none · mesh IP none · kubeconfig name k3sm · release base default · data volume none · LAN access on",
+      "wide": {
+        "data-volume": "none",
+        "kubeconfig-name": "k3sm",
+        "lan-access": "on",
+        "mesh-ip": "none",
+        "nodeport-addresses": "every interface",
+        "registry-port": "off",
+        "release-base": "default",
+        "tls-sans": "none"
+      }
+    },
+    {
       "name": "apiserver",
       "state": "ready",
       "severity": "ok",
