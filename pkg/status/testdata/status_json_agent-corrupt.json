@@ -45,6 +45,43 @@
         "pid": "1292",
         "plist": "/Library/LaunchDaemons/io.k3sm.agent.plist",
         "runs": "1"
+      },
+      "alert": {
+        "cause": "The node credential stored on this Mac does not parse, so the worker cannot authenticate to the control plane.",
+        "evidence": [
+          "pid 1292 · the stored node credential in /var/lib/k3sm/agent does not parse",
+          "label: io.k3sm.agent",
+          "plist: /Library/LaunchDaemons/io.k3sm.agent.plist",
+          "pid: 1292",
+          "runs: 1",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/agent.log",
+          "credential: corrupt",
+          "credential-dir: /var/lib/k3sm/agent"
+        ],
+        "fix": [
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs agent",
+            "needsAdmin": false
+          },
+          {
+            "step": "Mint a join token (on the control-plane Mac)",
+            "command": "k3sm token create",
+            "needsAdmin": false
+          },
+          {
+            "step": "Install this Mac as a worker with that token (on this Mac)",
+            "command": "sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "needsAdmin": true
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs agent",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "multi-node.md#joining-an-agent"
       }
     },
     {
@@ -52,21 +89,81 @@
       "state": "unknown",
       "severity": "unknown",
       "detail": "the stored node credential does not parse, so no apiserver URL could be read from it: no k3sm context in ~/.kube/config",
-      "remedy": "k3sm status logs agent\nk3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent"
+      "remedy": "k3sm status logs agent\nk3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
+      "alert": {
+        "cause": "The worker's node credential does not parse, so the address of its control plane could not be read.",
+        "evidence": [
+          "the stored node credential does not parse, so no apiserver URL could be read from it: no k3sm context in ~/.kube/config"
+        ],
+        "fix": [
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs agent",
+            "needsAdmin": false
+          },
+          {
+            "step": "Mint a join token (on the control-plane Mac)",
+            "command": "k3sm token create",
+            "needsAdmin": false
+          },
+          {
+            "step": "Install this Mac as a worker with that token (on this Mac)",
+            "command": "sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "needsAdmin": true
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs agent",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "multi-node.md#joining-an-agent"
+      }
     },
     {
       "name": "node",
       "state": "unknown",
       "severity": "unknown",
       "detail": "apiserver unreachable",
-      "remedy": "k3sm status logs agent"
+      "remedy": "k3sm status logs agent",
+      "alert": {
+        "cause": "The node list could not be read because the apiserver does not answer; this row clears once the apiserver row does.",
+        "evidence": [
+          "apiserver unreachable"
+        ],
+        "fix": [
+          {
+            "step": "Fix the apiserver row first",
+            "needsAdmin": false
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs agent",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "troubleshooting.md#control-plane-startup-failure"
+      }
     },
     {
       "name": "workloads",
       "state": "unknown",
       "severity": "unknown",
       "detail": "apiserver unreachable",
-      "remedy": "k3sm kubectl get pods -A"
+      "remedy": "k3sm kubectl get pods -A",
+      "alert": {
+        "cause": "The pods could not be listed because the apiserver does not answer; this row clears once the apiserver row does.",
+        "evidence": [
+          "apiserver unreachable"
+        ],
+        "fix": [
+          {
+            "step": "Fix the apiserver row first",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "troubleshooting.md#control-plane-startup-failure"
+      }
     },
     {
       "name": "data-root",
@@ -89,21 +186,61 @@
       "name": "update",
       "state": "unknown",
       "severity": "unknown",
-      "detail": "this Mac cannot read the latest release the server recorded: no cluster client this account may use"
+      "detail": "this Mac cannot read the latest release the server recorded: no cluster client this account may use",
+      "alert": {
+        "cause": "This worker could not read the update check its server publishes, so whether a newer release exists is unknown from here.",
+        "evidence": [
+          "this Mac cannot read the latest release the server recorded: no cluster client this account may use"
+        ],
+        "fix": [
+          {
+            "step": "Run k3sm status on a control-plane Mac; a server checks for a release once an hour and publishes the result",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "upgrade.md#checking-for-an-update"
+      }
     },
     {
       "name": "kubeconfig",
       "state": "missing",
       "severity": "warn",
       "detail": "no k3sm context in ~/.kube/config",
-      "remedy": "sudo k3sm install\nk3sm kubeconfig --write"
+      "remedy": "sudo k3sm install\nk3sm kubeconfig --write",
+      "alert": {
+        "cause": "This account has no kubeconfig for the cluster. On a worker that is expected: kubectl runs against the control-plane Mac.",
+        "evidence": [
+          "no k3sm context in ~/.kube/config"
+        ],
+        "fix": [
+          {
+            "step": "To use kubectl here, run k3sm kubeconfig on the control-plane Mac and copy the result into ~/.kube/config on this Mac",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "kubectl-access.md#bundled-path"
+      }
     },
     {
       "name": "runtimed",
       "state": "needs-admin",
       "severity": "skip",
       "detail": "needs sudo: the runtime daemon's socket is owner-only",
-      "remedy": "sudo k3sm status"
+      "remedy": "sudo k3sm status",
+      "alert": {
+        "cause": "The runtime daemon's socket is owner-only, so only an administrator can ask it whether it is healthy; nothing is known to be wrong.",
+        "evidence": [
+          "needs sudo: the runtime daemon's socket is owner-only"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true
+          }
+        ],
+        "docs": "troubleshooting.md#checks-that-need-sudo"
+      }
     },
     {
       "name": "dns",

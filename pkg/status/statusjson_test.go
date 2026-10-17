@@ -74,7 +74,13 @@ var (
 	daemonsRequired = []string{"schemaVersion", "verdict", "role", "summary", "daemons"}
 	daemonsOptional = []string{"stoppedBy", "network"}
 	rowRequired     = []string{"name", "state", "severity", "detail"}
-	rowOptional     = []string{"remedy", "wide"}
+	rowOptional     = []string{"remedy", "wide", "alert"}
+	// alertRequired and alertOptional are the keys of a row's alert, and
+	// fixStepRequired / fixStepOptional those of each of its fix steps.
+	alertRequired   = []string{"cause", "evidence", "fix", "docs"}
+	alertOptional   = []string{"since"}
+	fixStepRequired = []string{"step", "needsAdmin"}
+	fixStepOptional = []string{"command"}
 	versionRequired = []string{"version", "commit", "dirty", "date", "goVersion", "platform", "kubeVersion", "kineVersion"}
 	versionOptional = []string{"modules"}
 	moduleRequired  = []string{"path", "sha"}
@@ -435,7 +441,35 @@ func checkRows(t *testing.T, where string, rows any, seen map[string]bool) {
 		return
 	}
 	for i, r := range list {
-		checkKeys(t, fmt.Sprintf("%s[%d]", where, i), r, rowRequired, rowOptional, seen)
+		at := fmt.Sprintf("%s[%d]", where, i)
+		checkKeys(t, at, r, rowRequired, rowOptional, seen)
+		checkAlert(t, at, r, seen)
+	}
+}
+
+// checkAlert asserts a row's alert is present exactly when its severity is
+// warn, fail or unknown or its state is needs-admin, and checks its keys and
+// those of each fix step.
+func checkAlert(t *testing.T, where string, row any, seen map[string]bool) {
+	t.Helper()
+	m, _ := row.(map[string]any)
+	sev, state := m["severity"], m["state"]
+	want := sev == "warn" || sev == "fail" || sev == "unknown" || state == string(StateNeedsAdmin)
+	a, has := m["alert"]
+	if has != want {
+		t.Errorf("%s (%v/%v) carries an alert: %v, want %v", where, state, sev, has, want)
+	}
+	if !has {
+		return
+	}
+	checkKeys(t, where+" alert", a, alertRequired, alertOptional, seen)
+	am, _ := a.(map[string]any)
+	fix, _ := am["fix"].([]any)
+	if len(fix) == 0 {
+		t.Errorf("%s alert has no fix step", where)
+	}
+	for j, f := range fix {
+		checkKeys(t, fmt.Sprintf("%s alert fix[%d]", where, j), f, fixStepRequired, fixStepOptional, seen)
 	}
 }
 
@@ -484,6 +518,8 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			{reflect.TypeOf(Network{}), sortedUnion(networkRequired, networkOptional)},
 			{reflect.TypeOf(NetworkApplied{}), sortedUnion(networkAppliedRequired, networkAppliedOptional)},
 			{reflect.TypeOf(Row{}), sortedUnion(rowRequired, rowOptional)},
+			{reflect.TypeOf(Alert{}), sortedUnion(alertRequired, alertOptional)},
+			{reflect.TypeOf(FixStep{}), sortedUnion(fixStepRequired, fixStepOptional)},
 			{reflect.TypeOf(PeerStatus{}), sortedUnion(peerRequired)},
 			{reflect.TypeOf(Worker{}), sortedUnion(workerRequired, workerOptional)},
 			{reflect.TypeOf(Interconnect{}), sortedUnion(interconnectRequired, interconnectOptional)},
@@ -664,6 +700,13 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			if got, want := stateTable(gotFull.Rows), stateTable(full.Rows); got != want {
 				t.Errorf("full rows: collected %s, golden %s", got, want)
 			}
+			for _, pair := range [][2][]Row{{gotFull.Rows, full.Rows}, {gotProbe.Daemons, probe.Daemons}} {
+				for i := range pair[0] {
+					if i < len(pair[1]) && !reflect.DeepEqual(pair[0][i].Alert, pair[1][i].Alert) {
+						t.Errorf("%s alert: collected %+v, golden %+v", pair[0][i].Name, pair[0][i].Alert, pair[1][i].Alert)
+					}
+				}
+			}
 			if !reflect.DeepEqual(gotFull.Interconnect, full.Interconnect) {
 				t.Errorf("interconnect block: collected %+v, golden %+v", gotFull.Interconnect, full.Interconnect)
 			}
@@ -696,7 +739,7 @@ func TestStatusJSONContractGolden(t *testing.T) {
 		// Every optional key appears in some golden, so a rename of a key that
 		// one fixture omits still fails in another. peers is the exception: it
 		// is reserved, and no posture emits it yet (the struct check covers it).
-		for _, k := range append(append(append(append([]string{"next", "interconnect", "stoppedBy", "workers", "joinTarget", "network"}, rowOptional...), versionOptional...), interconnectOptional...), networkOptional...) {
+		for _, k := range append(append(append(append([]string{"next", "interconnect", "stoppedBy", "workers", "joinTarget", "network"}, rowOptional...), versionOptional...), interconnectOptional...), append(networkOptional, append(alertOptional, fixStepOptional...)...)...) {
 			if !optionalSeen[k] {
 				t.Errorf("no golden carries the optional key %q", k)
 			}

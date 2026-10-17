@@ -37,7 +37,7 @@
       "detail": "497 runs, last exit 1",
       "remedy": "sudo launchctl kickstart -k system/io.k3sm.server\nk3sm status logs server",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
         "label": "io.k3sm.server",
         "last-exit": "1",
         "log": "level=ERROR msg=\"control plane exited\" err=\"bind: address already in use\"",
@@ -46,6 +46,32 @@
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
         "runs": "497"
+      },
+      "alert": {
+        "cause": "The control-plane daemon keeps exiting and launchd keeps restarting it, so the cluster's control plane is not serving.",
+        "evidence": [
+          "497 runs, last exit 1",
+          "last log line: level=ERROR msg=\"control plane exited\" err=\"bind: address already in use\"",
+          "label: io.k3sm.server",
+          "plist: /Library/LaunchDaemons/io.k3sm.server.plist",
+          "pid: 0",
+          "runs: 497",
+          "last-exit: 1",
+          "log-path: /var/log/k3sm/server.log"
+        ],
+        "fix": [
+          {
+            "step": "Restart the daemon",
+            "command": "sudo launchctl kickstart -k system/io.k3sm.server",
+            "needsAdmin": true
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs server",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "troubleshooting.md#control-plane-startup-failure"
       }
     },
     {
@@ -57,6 +83,27 @@
       "wide": {
         "server": "https://127.0.0.1:6444",
         "tls": "ca pinned"
+      },
+      "alert": {
+        "cause": "The control plane does not answer at https://127.0.0.1:6444, so the cluster is not serving.",
+        "evidence": [
+          "https://127.0.0.1:6444: connection refused",
+          "server: https://127.0.0.1:6444",
+          "tls: ca pinned"
+        ],
+        "fix": [
+          {
+            "step": "Restart the daemon",
+            "command": "sudo launchctl kickstart -k system/io.k3sm.server",
+            "needsAdmin": true
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs server",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "troubleshooting.md#control-plane-startup-failure"
       }
     },
     {
@@ -64,14 +111,45 @@
       "state": "unknown",
       "severity": "unknown",
       "detail": "apiserver unreachable",
-      "remedy": "k3sm status logs server"
+      "remedy": "k3sm status logs server",
+      "alert": {
+        "cause": "The node list could not be read because the apiserver does not answer; this row clears once the apiserver row does.",
+        "evidence": [
+          "apiserver unreachable"
+        ],
+        "fix": [
+          {
+            "step": "Fix the apiserver row first",
+            "needsAdmin": false
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs server",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "troubleshooting.md#control-plane-startup-failure"
+      }
     },
     {
       "name": "workloads",
       "state": "unknown",
       "severity": "unknown",
       "detail": "apiserver unreachable",
-      "remedy": "k3sm kubectl get pods -A"
+      "remedy": "k3sm kubectl get pods -A",
+      "alert": {
+        "cause": "The pods could not be listed because the apiserver does not answer; this row clears once the apiserver row does.",
+        "evidence": [
+          "apiserver unreachable"
+        ],
+        "fix": [
+          {
+            "step": "Fix the apiserver row first",
+            "needsAdmin": false
+          }
+        ],
+        "docs": "troubleshooting.md#control-plane-startup-failure"
+      }
     },
     {
       "name": "data-root",
@@ -101,6 +179,21 @@
       "remedy": "sudo k3sm update check",
       "wide": {
         "record": "/nonexistent/k3sm-status-contract/status/update.json"
+      },
+      "alert": {
+        "cause": "No update check is recorded yet, so whether a newer release exists is unknown.",
+        "evidence": [
+          "no update check is recorded yet (the server checks once an hour)",
+          "record: /nonexistent/k3sm-status-contract/status/update.json"
+        ],
+        "fix": [
+          {
+            "step": "Check for a new release now",
+            "command": "sudo k3sm update check",
+            "needsAdmin": true
+          }
+        ],
+        "docs": "upgrade.md#checking-for-an-update"
       }
     },
     {
@@ -114,7 +207,21 @@
       "state": "needs-admin",
       "severity": "skip",
       "detail": "needs sudo: the runtime daemon's socket is owner-only",
-      "remedy": "sudo k3sm status"
+      "remedy": "sudo k3sm status",
+      "alert": {
+        "cause": "The runtime daemon's socket is owner-only, so only an administrator can ask it whether it is healthy; nothing is known to be wrong.",
+        "evidence": [
+          "needs sudo: the runtime daemon's socket is owner-only"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true
+          }
+        ],
+        "docs": "troubleshooting.md#checks-that-need-sudo"
+      }
     },
     {
       "name": "dns",
