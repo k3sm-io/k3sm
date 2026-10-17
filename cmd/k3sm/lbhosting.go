@@ -23,11 +23,13 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -149,20 +151,74 @@ func nodeAdvertiseAddr(opts nodeOptions, log *slog.Logger) netip.Addr {
 
 // lbHosterConfig is the per-node svclb configuration: the hoster every node
 // process runs (each joined worker and the server's own node), on the node's
-// OWN client. Its listeners bind the IPv4 wildcard through the single
-// in-process binder (a nil Binder is netbind.Direct): netd grants a privileged
-// wildcard only to the canonical ingress Service, so a helper binder would fail
-// every tenant listener. ReservedPorts is the datapath-side half of the
-// reserved-port guard (the admission VAP is the legible half), from the same
-// single source as the CEL and the apiserver argv.
+// OWN client. Its listeners bind the IPv4 wildcard while LAN access is on and
+// the node's own address and 127.0.0.1 while it is off.
+//
+// On a node with the netd helper, a port in the operator's
+// --lb-privileged-ports list binds through the helper on every address, the
+// wildcard included (hosterBinder), and every other port binds in-process: an
+// unlisted port below 1024 is served on the wildcard (no privilege needed) and
+// not on a specific set, as before the list existed. Routing by the list
+// rather than by netd's answer keeps one owner per listed port: Darwin refuses
+// an unprivileged wildcard bind while another user's socket holds a specific
+// address on the same port, so a root node-address listener and an in-process
+// wildcard could never be swapped bind-before-close. A helper refusal of a
+// listed port leaves its Service unserved, and the next reconcile asks again.
+// A node with no helper keeps the in-process binder (nil) for everything.
+//
+// ReservedPorts is the datapath-side half of the reserved-port guard (the
+// admission VAP is the legible half), from the same single source as the CEL
+// and the apiserver argv, plus the ingress host's ports on a server: those
+// belong to the ingress host on every bind shape, so a tenant Service
+// declaring one is refused here, LAN access on or off, instead of losing a
+// bind race (LAN on) or shadowing the ingress on the node address (LAN off).
+// IngressService extends that to every node, from the ports the canonical
+// ingress Service declares.
 func lbHosterConfig(cs kubernetes.Interface, opts nodeOptions, log *slog.Logger) svclb.HosterConfig {
-	return svclb.HosterConfig{
+	socket := netdSocketFor(opts.netMode)
+	reserved := ports.ReservedSet()
+	for _, p := range opts.ingressPorts {
+		reserved[p] = true
+	}
+	cfg := svclb.HosterConfig{
 		Client:        cs,
 		NodeName:      opts.nodeName,
 		BindAddr:      wildcardBindAddr,
-		ReservedPorts: ports.ReservedSet(),
-		Logger:        log,
+		ReservedPorts: reserved,
+		// Every node reserves what the canonical ingress Service declares, so
+		// a tenant on such a port is unserved everywhere, LAN access on or off;
+		// ingressPorts above covers a server's window before its informer has
+		// the Service.
+		IngressService: types.NamespacedName{Namespace: ingresshost.ServiceNamespace, Name: ingresshost.ServiceName},
+		Logger:         log,
 	}
+	if socket != "" && len(opts.lbPrivilegedPorts) > 0 {
+		cfg.Binder = hosterBinder{
+			listed: slices.Clone(opts.lbPrivilegedPorts),
+			// The netdBinder adapter, as for the ingress host: svclb asks for
+			// "tcp4" on an IPv4 address and netd's wire speaks only "tcp".
+			privileged: netdBinder{netd: &netbind.Netd{Client: wire.NewClient(socket)}},
+			direct:     netbind.Direct{},
+		}
+		cfg.PrivilegedPorts = slices.Clone(opts.lbPrivilegedPorts)
+	}
+	return cfg
+}
+
+// hosterBinder routes a svclb listener on a listed port to privileged (the
+// netd helper), whatever its address, and every other listener to direct.
+type hosterBinder struct {
+	listed     []uint16
+	privileged netbind.Binder
+	direct     netbind.Binder
+}
+
+// Listen binds addr through the binder its port selects.
+func (b hosterBinder) Listen(ctx context.Context, network string, addr netip.AddrPort) (net.Listener, error) {
+	if addr.Port() < privilegedPortCeiling && slices.Contains(b.listed, addr.Port()) {
+		return b.privileged.Listen(ctx, network, addr)
+	}
+	return b.direct.Listen(ctx, network, addr)
 }
 
 // lbHosterResetTimeout bounds the hoster's synchronous start-of-life reset in
@@ -330,7 +386,9 @@ func ingressBinder(netdSocket string, httpPort, httpsPort int) netbind.Binder {
 // family name across the wire would be refused by every netd daemon, which is
 // restarted independently of this process.
 type netdBinder struct {
-	netd *netbind.Netd
+	// netd is the helper binder, a *netbind.Netd in production; a Binder so
+	// a unit test can stand in for the daemon without a socket.
+	netd netbind.Binder
 }
 
 // Listen requests addr from netd under the wire protocol name for network.

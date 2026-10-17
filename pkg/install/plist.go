@@ -23,6 +23,8 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strconv"
+
+	"k3sm.io/k3sm/pkg/dataroot"
 )
 
 // The two LaunchDaemon plist modes, and why the control plane's is not the
@@ -70,6 +72,9 @@ func plistMode(label string) fs.FileMode {
 func plistContent(label string, cfg Config) ([]byte, error) {
 	switch label {
 	case NetdLabel:
+		if err := cfg.withDefaults().checkNetdLBPrivilegedPorts(); err != nil {
+			return nil, err
+		}
 		return NetdPlist(cfg), nil
 	case ServerLabel:
 		return ServerPlist(cfg), nil
@@ -116,6 +121,12 @@ func plistContent(label string, cfg Config) ([]byte, error) {
 // range. It passes no --node-ip for
 // the separate reason TestNetdPlistXML records (the node-address authorizer
 // branch is dormant by configuration).
+//
+// --lb-privileged-ports is the list of LoadBalancer ports below 1024 netd may
+// bind on this node's own address while LAN access is off, taken from the node
+// daemon's own arguments for its Role (netdLBPrivilegedPorts). It is always
+// rendered: netd's own default allows no port, so a job written before the
+// flag existed keeps today's refusal.
 func NetdPlist(cfg Config) []byte {
 	cfg = cfg.withDefaults()
 	kubeconfig := filepath.Join(cfg.serverWorkDir(), "k3sm.kubeconfig")
@@ -129,6 +140,7 @@ func NetdPlist(cfg Config) []byte {
 		"--mesh-key-dir", MeshKeyDir,
 		"--kubeconfig", kubeconfig,
 		"--cluster-ca", cfg.netdClusterCAPath(),
+		"--" + dataroot.LBPrivilegedPortsFlag, cfg.netdLBPrivilegedPorts(),
 	}
 	if cidr := cfg.netdNodePodCIDR(); cidr != "" {
 		args = append(args, "--node-pod-cidr", cidr)

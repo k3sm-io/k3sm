@@ -298,10 +298,21 @@ nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
 - The record must be a regular file owned by root and writable by no one else. Anything else is
   treated as unusable, and the node daemon serves LAN access off until it is set again.
 - On a stopped node the setting is recorded and applies at `sudo k3sm start`.
-- With LAN access off, a LoadBalancer port below 1024 is not served on that node, because macOS
-  lets only root bind a specific address below 1024; use a port of 1024 or above, or turn LAN
-  access on. The ingress host still serves `80` and `443` on the node's own address, but not on
+- With LAN access off, a LoadBalancer port below 1024 is served on the node's own address and on
+  `127.0.0.1` through the root network helper only when it is in the node's `--lb-privileged-ports`
+  list, a `k3sm server` and `k3sm agent` flag recorded with the install arguments that defaults to
+  `80,443`. The ingress host still serves `80` and `443` on the node's own address, but not on
   `127.0.0.1`.
+- The ingress host's ports belong to it: a LoadBalancer Service on one of them is not served on any
+  node while the ingress host declares the port, with LAN access on or off. The default list
+  therefore serves a LoadBalancer on `80` or `443` only where the ingress host is disabled or moved
+  to other ports.
+- A listed port's `127.0.0.1` socket is held by the root network helper on the node daemon's
+  behalf, so any local process can connect to it, the same as to the node's own address.
+- A LoadBalancer bound on a port before the node has seen the ingress host's Service declare it is
+  taken down at the next reconcile, within one resync.
+- The helper serves a listed port only on the node's own address, `127.0.0.1` and the addresses of
+  the Mac's `en` interfaces, so a node address on a Thunderbolt bridge is not served below 1024.
 - The switch does not cover the apiserver (loopback, or the mesh address), the wireguard mesh port
   (it answers only cluster peers) or the worker join port. A new worker joins over the LAN, so the
   join port stays reachable with LAN access off, and every request to it needs the cluster join

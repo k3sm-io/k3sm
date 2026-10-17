@@ -283,6 +283,15 @@ type nodeOptions struct {
 	// (startLBHoster). Nil (the standalone `k3sm node`) binds on every
 	// interface and attaches nothing.
 	lan *lanSwitch
+	// lbPrivilegedPorts is the daemon's --lb-privileged-ports (validated): the
+	// LoadBalancer ports below 1024 the svclb hoster binds through the netd
+	// helper. Nil (the standalone `k3sm node`) brokers none.
+	lbPrivilegedPorts []uint16
+	// ingressPorts are the ingress host's listener ports on a server (0
+	// dropped): the hoster reserves them, so a tenant LoadBalancer Service on
+	// one is refused deterministically rather than racing the ingress host.
+	// Nil on a worker, which runs no ingress host.
+	ingressPorts []int32
 	// updateRoot is the managed update's directory under the data root
 	// (updateRootFor). `k3sm server` and `k3sm agent` set it; empty (the
 	// standalone `k3sm node`) runs no update watcher.

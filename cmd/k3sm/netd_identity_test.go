@@ -21,6 +21,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/podnet"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/netdsvc"
 )
@@ -63,6 +64,14 @@ func TestNetdFlagDefaultsShareTheNodeIdentityDerivation(t *testing.T) {
 			name: "mesh-key-dir defaults to the installer's root-only key dir",
 			flag: "mesh-key-dir",
 			want: install.MeshKeyDir,
+		},
+		{
+			// Empty, not the server's 80,443: the installer always renders the
+			// node's list, so a job without the flag predates it and keeps
+			// refusing every LoadBalancer port below 1024 on a host address.
+			name: "lb-privileged-ports defaults to no port",
+			flag: dataroot.LBPrivilegedPortsFlag,
+			want: "",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

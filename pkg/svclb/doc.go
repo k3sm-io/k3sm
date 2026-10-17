@@ -75,11 +75,18 @@ limitations under the License.
 //
 // # Addresses
 //
-// Listeners bind the WILDCARD (0.0.0.0): every interface answers, matching
-// Docker Desktop's vpnkit and k3s' klipper-lb. On Darwin a wildcard bind needs
-// NO privilege at any port (it is the SPECIFIC-address privileged bind that
-// returns EACCES, inverted from Linux), so there is ONE in-process binder and
-// the root netd helper is off the LoadBalancer datapath entirely.
+// With LAN access on, listeners bind the WILDCARD (0.0.0.0): every interface
+// answers, matching Docker Desktop's vpnkit and k3s' klipper-lb. On Darwin a
+// wildcard bind needs NO privilege at any port (it is the SPECIFIC-address
+// privileged bind that returns EACCES, inverted from Linux). With LAN access
+// off they bind the node's own address and 127.0.0.1. On a node with the root
+// netd helper every bind of a port the operator listed (--lb-privileged-ports,
+// 80 and 443 by default) is requested from it, the wildcard included, so both
+// shapes of the port have one owner; the helper grants it only when a
+// LoadBalancer Service declares the port and the ingress host does not. A
+// refusal leaves the Service unserved on that node until a reconcile is
+// granted. An unlisted port below 1024 binds in-process: on the wildcard it
+// needs no privilege, and on a specific set it is not served.
 //
 // The status publishes SERVER-HELD addresses only: each node's mesh address
 // from its MeshPeer record (written only through the server's guarded enroll

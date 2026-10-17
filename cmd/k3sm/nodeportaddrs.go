@@ -23,6 +23,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/proxy"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/install"
 )
 
@@ -36,6 +37,33 @@ const nodePortAddressesUsage = "the addresses NodePort listeners bind, as a comm
 // nodePortHostAddrs is the host-address seam the resolution reads
 // (proxy.HostAddrs). A package var so a test can name the host's addresses.
 var nodePortHostAddrs = proxy.HostAddrs
+
+// validatedLBPorts is the parsed --lb-privileged-ports of a daemon whose
+// entry check already refused a bad value (`k3sm server` and `k3sm agent`
+// both parse it before anything starts), so a failure cannot reach here; it
+// would yield no brokered port, the narrower posture.
+func validatedLBPorts(value string) []uint16 {
+	ports, err := dataroot.ParseLBPrivilegedPorts(value)
+	if err != nil {
+		return nil
+	}
+	return ports
+}
+
+// ingressListenerPorts are the ingress host's enabled listener ports.
+func ingressListenerPorts(httpPort, httpsPort int) []int32 {
+	var out []int32
+	for _, p := range []int{httpPort, httpsPort} {
+		if p > 0 && p < 65536 {
+			out = append(out, int32(p))
+		}
+	}
+	return out
+}
+
+// lbPrivilegedPortsUsage is the --lb-privileged-ports help, shared by `k3sm
+// server` and `k3sm agent`.
+const lbPrivilegedPortsUsage = "LoadBalancer ports below 1024 (comma-separated, 1-1023) served through the root network helper on this node's own address and 127.0.0.1 while LAN access is off; any other LoadBalancer port below 1024 is not served on this node then. Recorded with the install arguments and handed to the helper by the installer; empty allows none"
 
 // resolveNodePortAddresses resolves a --nodeport-addresses spec for this node,
 // at datapath start and at every LAN access change (lanSwitch.resolve),

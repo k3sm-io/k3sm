@@ -21,7 +21,8 @@ limitations under the License.
 // against the authoritative Service set (and, for a bind on the node's own
 // address or the IPv4 wildcard, against ONE named canonical Service, and for a
 // bind on a published vm pod address, against the ports that pod is relayed
-// on), and a MeshKeyResolver that
+// on, and for a bind on one of this Mac's own addresses, against the
+// operator's LoadBalancer port list), and a MeshKeyResolver that
 // reads the node's wireguard private key from a root-only path — into a
 // darwin-net netd.Config. The pure policy and the seams are testable without root or a real
 // apiserver.
@@ -102,6 +103,17 @@ type Options struct {
 	// vm pod's published address (see PortPolicy.VMPodPorts), else nil. nil
 	// denies every <1024 bind on a pod address (fail safe).
 	VMPodPorts func(addr netip.Addr) []uint16
+	// LBPrivilegedPorts backs the LoadBalancer-port branch of the
+	// privileged-port authorizer: the ports below 1024 a LoadBalancer Service
+	// may be served on at one of this Mac's own addresses (`k3sm netd
+	// --lb-privileged-ports`, rendered by the installer from the node's
+	// recorded arguments). Empty denies the branch (fail safe).
+	LBPrivilegedPorts []uint16
+	// InterfaceAddrs maps each address currently assigned to this Mac's
+	// interfaces to the interface's name, read on every request so an address
+	// DHCP moved is never pinned. nil denies the LoadBalancer-port branch
+	// (fail safe).
+	InterfaceAddrs func() (map[netip.Addr]string, error)
 	// MeshKeyDir is the root-only directory the MeshKeyResolver reads the node's
 	// wireguard private key from. Empty disables ConfigureMesh (a nil resolver,
 	// which fails fast — there is no embedded key).
@@ -153,6 +165,8 @@ func BuildConfig(opts Options) (netd.Config, error) {
 			NodeAddressService: opts.NodeAddressService,
 			NodePodCIDR:        NodePodCIDRInForce(NodeIdentityPath(opts.MeshKeyDir), opts.NodePodCIDR),
 			VMPodPorts:         opts.VMPodPorts,
+			LBPrivilegedPorts:  opts.LBPrivilegedPorts,
+			InterfaceAddrs:     opts.InterfaceAddrs,
 		}),
 		ClusterCAPath: opts.ClusterCAPath,
 		Logger:        opts.Logger,
@@ -256,7 +270,7 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 
 // PortPolicy is the DENY-BY-DEFAULT privileged-port (<1024) bind policy the
 // authorizer applies. A bind is authorized iff the requested address falls in
-// exactly one of four explicitly named classes (an explicit policy decision,
+// exactly one of five explicitly named classes (an explicit policy decision,
 // never allowed-by-coincidence):
 //
 //   - a Service-CIDR VIP whose port some Service in the authoritative set
@@ -266,7 +280,10 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 //     port, or
 //   - the IPv4 WILDCARD 0.0.0.0 on a privileged port when that same canonical
 //     Service declares the port (the ingress host's 80/443 listeners, bound on
-//     every interface through the root helper, the k3s ServiceLB shape), or
+//     every interface through the root helper, the k3s ServiceLB shape), or,
+//     for a port in LBPrivilegedPorts that the canonical Service does not
+//     declare, when any LoadBalancer Service declares it (the svclb hoster's
+//     LAN-on listener, so it has the same owner as its LAN-off one), or
 //   - a PUBLISHED VM POD ADDRESS: an address inside this node's pod /24 that is
 //     a vm-RuntimeClass pod's published status.podIP, on a port that pod
 //     declares as a TCP containerPort or that a Service's EndpointSlice targets
@@ -281,7 +298,20 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 //     pod's, a vm pod on another node, an unassigned one) and any port the set
 //     does not list for THAT address (including a port another pod declares)
 //     are refused. A native pod gets no such class: it binds its own /32
-//     itself, and a privileged port there stays refused.
+//     itself, and a privileged port there stays refused, or
+//   - one of THIS MAC'S OWN ADDRESSES on a port the operator listed
+//     (LBPrivilegedPorts, 80 and 443 by default) that some LoadBalancer
+//     Service declares: the svclb hoster's listeners while LAN access is off,
+//     when they bind the node's address instead of every interface. The
+//     address must be assigned to an interface when the request arrives
+//     (InterfaceAddrs, re-read every time) and be one of three shapes:
+//     127.0.0.1 (no other loopback address), this node's own mesh-egress
+//     address (the node address of a derived or mesh node), or an address of
+//     an en* interface (an operator-chosen node address); never a Service-CIDR
+//     VIP, a pod address, or an address of a utun, bridge, vmenet, feth, awdl
+//     or llw interface. A port the canonical ingress Service declares is
+//     refused here: it is the ingress host's on every bind shape. The port list
+//     comes from netd's own root-owned launchd job, never from the request.
 //
 // The node-address and wildcard classes are one ALLOWLIST keyed on namespace+name, not a
 // test on the requester's shape. It used to authorize the bind for ANY Service
@@ -321,6 +351,12 @@ type PortPolicy struct {
 	// every TCP port an EndpointSlice targets at addr), and nil when addr is not
 	// one. nil denies the class.
 	VMPodPorts func(addr netip.Addr) []uint16
+	// LBPrivilegedPorts is the operator's list of LoadBalancer ports below 1024
+	// the host-address class admits. Empty denies the class.
+	LBPrivilegedPorts []uint16
+	// InterfaceAddrs maps the addresses assigned to this Mac's interfaces now
+	// to their interface names. nil denies the host-address class.
+	InterfaceAddrs func() (map[netip.Addr]string, error)
 }
 
 // servicePortAuthorizer confirms a privileged (<1024) bind against the
@@ -335,7 +371,7 @@ func PortAuthorizer(policy PortPolicy) netd.PortAuthorizer {
 	return servicePortAuthorizer{policy: policy}
 }
 
-// Authorize rejects binding port on nodeAddr unless one of PortPolicy's four
+// Authorize rejects binding port on nodeAddr unless one of PortPolicy's five
 // address classes admits it. See PortPolicy for the deny-by-default contract.
 func (a servicePortAuthorizer) Authorize(_ context.Context, port int, nodeAddr string) error {
 	addr, err := netip.ParseAddr(nodeAddr)
@@ -359,10 +395,104 @@ func (a servicePortAuthorizer) Authorize(_ context.Context, port int, nodeAddr s
 		return nil
 	case a.policy.NodeIP.IsValid() && addr == a.policy.NodeIP:
 		return a.authorizeCanonical(port, "node address "+nodeAddr)
-	case a.inNodePodCIDR(addr):
+	case a.inNodePodCIDR(addr) && !a.isNodeEgress(addr):
 		return a.authorizeVMPod(port, addr)
 	}
-	return fmt.Errorf("bind address %s is neither a service-CIDR VIP, this node's own address, the wildcard, nor a pod address on this node (port %d denied)", nodeAddr, port)
+	return a.authorizeHostAddr(port, addr)
+}
+
+// isNodeEgress reports whether addr is the mesh-egress address (.1) of this
+// node's pod /24 in force: the node's own address on a derived or mesh node,
+// which is never handed to a pod (podnet.MeshEgressIP).
+func (a servicePortAuthorizer) isNodeEgress(addr netip.Addr) bool {
+	if a.policy.NodePodCIDR == nil {
+		return false
+	}
+	egress, err := podnet.MeshEgressIP(a.policy.NodePodCIDR())
+	return err == nil && addr == egress
+}
+
+// authorizeHostAddr applies the host-address class: a LoadBalancer port the
+// operator listed, on one of the addresses the svclb hoster's LAN-off set can
+// hold, that a LoadBalancer Service other than the ingress host's declares.
+// Those addresses are exactly three shapes: 127.0.0.1; this node's own
+// mesh-egress address (the node address of a derived or mesh node, an lo0
+// alias); and an operator-chosen node address, which is an address on an
+// Ethernet or Wi-Fi interface (a name starting with "en"). No other interface
+// qualifies: not the mesh utun, not the vm bridges or their feth/vmenet legs,
+// not AirDrop's awdl or llw, and not another lo0 alias. Every input is the
+// daemon's own (the port list from its launchd job, the interface addresses
+// read now, the Service set from the apiserver); the request contributes only
+// the address and port it asks for. A refusal names the port and the reason
+// so the root daemon's log says why a LoadBalancer Service went unserved.
+func (a servicePortAuthorizer) authorizeHostAddr(port int, addr netip.Addr) error {
+	if !slices.Contains(a.policy.LBPrivilegedPorts, uint16(port)) {
+		return fmt.Errorf("port %d on %s is not in the allowed LoadBalancer port list (%s); an address that is neither a service-CIDR VIP, the wildcard, nor a published vm pod address is authorized only for a listed port", port, addr, describeAllowed(a.policy.LBPrivilegedPorts))
+	}
+	target := fmt.Sprintf("%s port %d", addr, port)
+	switch {
+	case addr == loopbackV4:
+		// 127.0.0.1 is this Mac's own loopback: the LAN-off set serves it,
+		// and it is on lo0 by construction, so only the Service set decides.
+		return a.authorizeLBDeclared(port, addr.String())
+	case addr.IsLoopback():
+		return fmt.Errorf("bind on %s denied: the only loopback address authorized for a LoadBalancer port is 127.0.0.1", target)
+	case !addr.Is4():
+		return fmt.Errorf("bind on %s denied: only an IPv4 host address is authorized for a LoadBalancer port", target)
+	case a.policy.ServiceCIDR.IsValid() && a.policy.ServiceCIDR.Contains(addr):
+		return fmt.Errorf("bind on %s denied: a service-CIDR address is never a LoadBalancer host address", target)
+	case podnet.ClusterPodCIDR.Contains(addr) && !a.isNodeEgress(addr):
+		return fmt.Errorf("bind on %s denied: inside the cluster pod range only this node's own address is authorized", target)
+	}
+	if a.policy.InterfaceAddrs == nil {
+		return fmt.Errorf("bind on %s denied: no host address set available", target)
+	}
+	ifaces, err := a.policy.InterfaceAddrs()
+	if err != nil {
+		return fmt.Errorf("bind on %s denied: list this Mac's addresses: %w", target, err)
+	}
+	name, ok := ifaces[addr]
+	if !ok {
+		return fmt.Errorf("bind on %s denied: the address is not assigned to this Mac", target)
+	}
+	if !a.isNodeEgress(addr) && !strings.HasPrefix(name, "en") {
+		return fmt.Errorf("bind on %s denied: the address is on %s; a LoadBalancer port is authorized only on 127.0.0.1, this node's own address, or an address of an en* interface", target, name)
+	}
+	return a.authorizeLBDeclared(port, addr.String())
+}
+
+// loopbackV4 is the one loopback address the LoadBalancer-port class admits.
+var loopbackV4 = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+
+// authorizeLBDeclared admits a listed port on target when some LoadBalancer
+// Service in the authoritative set declares it and the canonical ingress
+// Service does not. A port the ingress Service declares belongs to the ingress
+// host on every bind shape: a tenant's root-held node-address or loopback
+// socket beside the ingress host's wildcard on the same port would win the
+// more-specific match and take the ingress's traffic on that address.
+func (a servicePortAuthorizer) authorizeLBDeclared(port int, target string) error {
+	if a.policy.LBDeclarers == nil {
+		return fmt.Errorf("no service set available to authorize port %d on %s", port, target)
+	}
+	if err := a.checkSynced(port, target); err != nil {
+		return err
+	}
+	declarers := a.policy.LBDeclarers(port)
+	if len(declarers) == 0 {
+		return fmt.Errorf("no LoadBalancer service declares port %d (requested on %s)", port, target)
+	}
+	if canonical := a.policy.NodeAddressService; canonical.IsValid() && slices.Contains(declarers, canonical) {
+		return fmt.Errorf("port %d on %s belongs to the ingress host: the canonical ingress service %s declares it, so no other LoadBalancer service is served on it", port, target, canonical)
+	}
+	return nil
+}
+
+// describeAllowed renders the allowed LoadBalancer port list for a refusal.
+func describeAllowed(ports []uint16) string {
+	if len(ports) == 0 {
+		return "empty"
+	}
+	return describePorts(ports)
 }
 
 // checkSynced refuses while the Service set has not completed its first sync,
@@ -430,6 +560,9 @@ func describePorts(ports []uint16) string {
 // does not depend on PortPolicy.NodeIP: the wildcard names no address, so there
 // is no node address to match, only a declaring subject.
 //
+// For a port in LBPrivilegedPorts any declaring LoadBalancer Service also
+// admits it (see PortPolicy); an unlisted port keeps the canonical-only rule.
+//
 // The IPv6 unspecified address is refused. A "[::]" socket is dual-stack and
 // would publish the listener on every IPv6 address of the host, a surface no
 // k3sm listener is meant to have (the ingress binds 0.0.0.0 explicitly).
@@ -442,7 +575,19 @@ func (a servicePortAuthorizer) authorizeWildcard(port int, addr netip.Addr) erro
 	if port >= 1024 {
 		return fmt.Errorf("wildcard bind on non-privileged port %d denied: only a privileged (<1024) wildcard bind is brokered", port)
 	}
-	return a.authorizeCanonical(port, "the wildcard "+addr.String())
+	target := "the wildcard " + addr.String()
+	err := a.authorizeCanonical(port, target)
+	if err == nil || !slices.Contains(a.policy.LBPrivilegedPorts, uint16(port)) {
+		return err
+	}
+	// A port the operator listed: any declaring LoadBalancer Service, so the
+	// svclb hoster's wildcard and its LAN-off node-address listener on that
+	// port have the same owner (root) and a LAN access swap can bind the new
+	// shape before it closes the old one.
+	if lerr := a.authorizeLBDeclared(port, target); lerr != nil {
+		return fmt.Errorf("%w; and as a listed LoadBalancer port: %w", err, lerr)
+	}
+	return nil
 }
 
 // authorizeCanonical applies the allowlist shared by the node-address and

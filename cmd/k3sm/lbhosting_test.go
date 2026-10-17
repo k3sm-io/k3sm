@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -40,6 +41,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/ports"
 )
 
@@ -105,21 +107,89 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 
 	// (a, second half) THE SVCLB BINDER SELECTION. The address and the binder are
 	// INDEPENDENT: a one-line address change satisfies the assert above while
-	// leaving every tenant LoadBalancer port routed into netd, which grants a
-	// privileged wildcard only to the canonical ingress Service. The ingress
-	// host's own binder is TestIngressHostBindsThroughNetdWhenPresent's.
-	t.Run("svclb gets no privileged binder even in the helper posture", func(t *testing.T) {
+	// leaving the binder wrong. With the helper present every bind of a LISTED
+	// port, the wildcard included, goes to netd, so both shapes of the port have
+	// one owner and a LAN access swap cannot meet Darwin's cross-owner
+	// EADDRINUSE; every other port, an unlisted one below 1024 included, binds
+	// in-process and never asks netd. The ingress host's own binder is
+	// TestIngressHostBindsThroughNetdWhenPresent's.
+	t.Run("svclb sends exactly the listed ports to netd", func(t *testing.T) {
 		opts := gateNodeOptions()
 		if !opts.netMode.UsesHelper() {
 			t.Fatal("fixture must be in the helper posture or the assertion below is vacuous")
 		}
+		opts.lbPrivilegedPorts = []uint16{80, 443}
 		lb := lbHosterConfig(fake.NewClientset(), opts, log)
-		// Nil means the package's in-process netbind.Direct default: ONE binder,
-		// taking every port including <1024. (The per-port behavioural proof lives
-		// in pkg/svclb's inverted "single in-process binder takes every port"
-		// subtest.)
-		if lb.Binder != nil {
-			t.Errorf("svclb Binder = %T, want nil (the single in-process binder); netd refuses a tenant wildcard, so a helper binder fails every listener", lb.Binder)
+		hb, ok := lb.Binder.(hosterBinder)
+		if !ok {
+			t.Fatalf("svclb Binder = %T, want hosterBinder in the helper posture", lb.Binder)
+		}
+		if !slices.Equal(lb.PrivilegedPorts, []uint16{80, 443}) || !slices.Equal(hb.listed, []uint16{80, 443}) {
+			t.Errorf("PrivilegedPorts = %v, binder list = %v, want the node's list [80 443] for both", lb.PrivilegedPorts, hb.listed)
+		}
+		n, ok := hb.privileged.(netdBinder)
+		if raw, isNetd := n.netd.(*netbind.Netd); !ok || !isNetd || raw.Client == nil {
+			t.Fatalf("hosterBinder privileged leg = %T, want the netdBinder adapter over a wire client (a raw *netbind.Netd sends \"tcp4\", which netd refuses)", hb.privileged)
+		}
+		if _, ok := hb.direct.(netbind.Direct); !ok {
+			t.Fatalf("hosterBinder direct leg = %T, want netbind.Direct", hb.direct)
+		}
+		node := netip.MustParseAddr("100.64.0.1")
+		priv, direct := &recordingBinder{}, &recordingBinder{}
+		b := hosterBinder{listed: hb.listed, privileged: priv, direct: direct}
+		for _, ap := range []netip.AddrPort{
+			netip.AddrPortFrom(node, 80),
+			netip.AddrPortFrom(wildcardBindAddr, 80),
+			netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 443),
+			netip.AddrPortFrom(wildcardBindAddr, 81),
+			netip.AddrPortFrom(node, 81),
+			netip.AddrPortFrom(wildcardBindAddr, 8080),
+		} {
+			_, _ = b.Listen(context.Background(), "tcp", ap)
+		}
+		wantPriv := []netip.AddrPort{netip.AddrPortFrom(node, 80), netip.AddrPortFrom(wildcardBindAddr, 80), netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 443)}
+		if !slices.Equal(priv.got, wantPriv) {
+			t.Errorf("netd leg got %v, want only the listed ports %v", priv.got, wantPriv)
+		}
+		wantDirect := []netip.AddrPort{netip.AddrPortFrom(wildcardBindAddr, 81), netip.AddrPortFrom(node, 81), netip.AddrPortFrom(wildcardBindAddr, 8080)}
+		if !slices.Equal(direct.got, wantDirect) {
+			t.Errorf("in-process leg got %v, want the unlisted and unprivileged ports %v", direct.got, wantDirect)
+		}
+	})
+
+	t.Run("the ingress host's ports are reserved on a server only", func(t *testing.T) {
+		opts := gateNodeOptions()
+		opts.ingressPorts = ingressListenerPorts(80, 0)
+		lb := lbHosterConfig(fake.NewClientset(), opts, log)
+		if !lb.ReservedPorts[80] || lb.ReservedPorts[443] {
+			t.Errorf("reserved 80=%v 443=%v, want the enabled ingress port 80 only", lb.ReservedPorts[80], lb.ReservedPorts[443])
+		}
+		if !lb.ReservedPorts[int32(ports.KubeletAPIPort)] {
+			t.Error("the ingress ports replaced the base reserved set instead of joining it")
+		}
+		worker := lbHosterConfig(fake.NewClientset(), gateNodeOptions(), log)
+		if worker.ReservedPorts[80] {
+			t.Error("a node with no ingress host reserves port 80 from flags it does not have")
+		}
+		// Every node, a worker included, reserves what the canonical ingress
+		// Service declares, by its namespace and name.
+		if worker.IngressService.Namespace != ingresshost.ServiceNamespace || worker.IngressService.Name != ingresshost.ServiceName {
+			t.Errorf("IngressService = %v, want %s/%s", worker.IngressService, ingresshost.ServiceNamespace, ingresshost.ServiceName)
+		}
+	})
+
+	t.Run("svclb brokers nothing with an empty list", func(t *testing.T) {
+		if lb := lbHosterConfig(fake.NewClientset(), gateNodeOptions(), log); lb.Binder != nil || lb.PrivilegedPorts != nil {
+			t.Errorf("svclb Binder = %T, PrivilegedPorts = %v, want nil and nil with no listed port", lb.Binder, lb.PrivilegedPorts)
+		}
+	})
+
+	t.Run("svclb keeps the in-process binder with no helper", func(t *testing.T) {
+		opts := gateNodeOptions()
+		opts.netMode = hostnet.Mode{Backend: hostnet.BackendDirect}
+		opts.lbPrivilegedPorts = []uint16{80, 443}
+		if lb := lbHosterConfig(fake.NewClientset(), opts, log); lb.Binder != nil || lb.PrivilegedPorts != nil {
+			t.Errorf("svclb Binder = %T, PrivilegedPorts = %v, want nil (netbind.Direct) and nil on a node without the helper", lb.Binder, lb.PrivilegedPorts)
 		}
 	})
 
@@ -343,8 +413,10 @@ func TestIngressHostBindsThroughNetdWhenPresent(t *testing.T) {
 			if err != nil {
 				t.Fatalf("lbHostingConfigs: %v", err)
 			}
-			if lb := lbHosterConfig(fake.NewClientset(), gateNodeOptions(), log); lb.Binder != nil {
-				t.Errorf("svclb Binder = %T, want nil: the netd wildcard grant is the canonical ingress Service's alone", lb.Binder)
+			lbOpts := gateNodeOptions()
+			lbOpts.lbPrivilegedPorts = []uint16{80, 443}
+			if _, ok := lbHosterConfig(fake.NewClientset(), lbOpts, log).Binder.(hosterBinder); !ok {
+				t.Errorf("svclb Binder is not the hosterBinder: with the helper every svclb bind of a listed port goes to netd")
 			}
 			if ih.NodeName != gateNodeOptions().nodeName {
 				t.Errorf("ingress NodeName = %q, want the node's own name %q (it names the node's EndpointSlice shard)", ih.NodeName, gateNodeOptions().nodeName)
@@ -354,7 +426,7 @@ func TestIngressHostBindsThroughNetdWhenPresent(t *testing.T) {
 				if !tc.wantNetd {
 					t.Fatalf("ingress Binder = netdBinder, want in-process (netd grants a wildcard only below 1024)")
 				}
-				if b.netd == nil || b.netd.Client == nil {
+				if n, ok := b.netd.(*netbind.Netd); !ok || n.Client == nil {
 					t.Fatal("the netd binder must carry a wire client for the configured socket")
 				}
 			case netbind.Direct:
@@ -520,4 +592,12 @@ func TestNetdProtocolKeepsTheWireNames(t *testing.T) {
 			}
 		})
 	}
+}
+
+// recordingBinder records every address it is asked to bind and binds nothing.
+type recordingBinder struct{ got []netip.AddrPort }
+
+func (r *recordingBinder) Listen(_ context.Context, _ string, ap netip.AddrPort) (net.Listener, error) {
+	r.got = append(r.got, ap)
+	return nil, errors.New("recordingBinder binds nothing")
 }

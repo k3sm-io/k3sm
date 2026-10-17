@@ -113,6 +113,11 @@ type serverOptions struct {
 	// nodePortAddresses is --nodeport-addresses: where this server's NodePort
 	// listeners bind (empty = every interface).
 	nodePortAddresses string
+	// lbPrivilegedPorts is --lb-privileged-ports: the LoadBalancer ports below
+	// 1024 this node's netd may bind on the node's own address while LAN access
+	// is off. This daemon only validates it; netd reads it from its own plist,
+	// which the installer renders from this recorded argument.
+	lbPrivilegedPorts string
 	// updateReleaseBase is --update-release-base: the release index the
 	// managed update reads instead of GitHub's (a mirror, a lab rig). Empty is
 	// GitHub's; it is validated after the flags parse (releaseBaseFlag).
@@ -381,6 +386,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// bind: address already in use". This renumbers the LISTENER ONLY; it does not
 	// change the bind address or the API's authn posture.
 	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
+	fs.StringVar(&opts.lbPrivilegedPorts, dataroot.LBPrivilegedPortsFlag, dataroot.DefaultLBPrivilegedPorts, lbPrivilegedPortsUsage)
 	fs.StringVar(&opts.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
 	fs.IntVar(&opts.kubeletPort, "kubelet-port", ports.KubeletAPIPort, "kubelet HTTP API (logs/exec/stats) listen port — every node on a host needs its own")
 	// The scheduler's and controller-manager's secure ports, the last two fixed
@@ -820,9 +826,11 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 	}
 
 	nodeOpts := nodeOptions{
-		lan:        plan.lan,
-		restConfig: nodeRESTCfg,
-		nodeName:   opts.nodeName,
+		lan:               plan.lan,
+		lbPrivilegedPorts: validatedLBPorts(opts.lbPrivilegedPorts),
+		ingressPorts:      ingressListenerPorts(opts.ingressHTTPPort, opts.ingressHTTPSPort),
+		restConfig:        nodeRESTCfg,
+		nodeName:          opts.nodeName,
 		// The kubelet API binds this node's own InternalIP on this port
 		// (resolveKubeletEndpoint), never the wildcard.
 		kubeletPort: opts.kubeletPort,

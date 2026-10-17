@@ -2323,6 +2323,63 @@ func TestNetdPlistXML(t *testing.T) {
 	if strings.Contains(x, "--node-ip") {
 		t.Error("netd plist must NOT render --node-ip: the node-address authorizer branch is dormant by configuration (B116/B133); re-arming it needs a deliberate decision, not a plist edit")
 	}
+	// The LoadBalancer port list is ALWAYS rendered, the default included:
+	// netd's own default allows no port, so a job without the flag is one
+	// written before it existed.
+	mustContain(t, x, "<string>--lb-privileged-ports</string>\n    <string>80,443</string>")
+}
+
+// TestNetdPlistCarriesTheNodeLBPortList proves netd's --lb-privileged-ports
+// is the node daemon's own recorded value for its Role, else the default, so
+// the root helper's list is the one the operator recorded with the install.
+func TestNetdPlistCarriesTheNodeLBPortList(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{name: "server default", cfg: Config{Role: RoleServer}, want: dataroot.DefaultLBPrivilegedPorts},
+		{name: "agent default", cfg: Config{Role: RoleAgent}, want: dataroot.DefaultLBPrivilegedPorts},
+		{name: "server recorded list", cfg: Config{Role: RoleServer, ExtraServerArgs: []string{"--lb-privileged-ports", "80"}}, want: "80"},
+		{name: "server inline spelling, last one wins", cfg: Config{Role: RoleServer, ExtraServerArgs: []string{"--lb-privileged-ports=22", "--lb-privileged-ports=80,8"}}, want: "80,8"},
+		{name: "server recorded empty list allows none", cfg: Config{Role: RoleServer, ExtraServerArgs: []string{"--lb-privileged-ports="}}, want: ""},
+		{name: "agent recorded list", cfg: Config{Role: RoleAgent, ExtraAgentArgs: []string{"--lb-privileged-ports", "443"}}, want: "443"},
+		{name: "agent ignores a server list", cfg: Config{Role: RoleAgent, ExtraServerArgs: []string{"--lb-privileged-ports", "443"}}, want: dataroot.DefaultLBPrivilegedPorts},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := parseProgramArguments(NetdPlist(tc.cfg))
+			if err != nil {
+				t.Fatalf("parse netd ProgramArguments: %v", err)
+			}
+			got, ok := dataroot.LastFlagValue(args, dataroot.LBPrivilegedPortsFlag)
+			if !ok || got != tc.want {
+				t.Errorf("netd --lb-privileged-ports = %q (present %v), want %q (argv: %v)", got, ok, tc.want, args)
+			}
+		})
+	}
+}
+
+// TestNetdPlistRefusesAListNetdWouldRefuse proves a bad --lb-privileged-ports
+// fails the install where the netd job is rendered, never as a root helper
+// that crash-loops on its own argv.
+func TestNetdPlistRefusesAListNetdWouldRefuse(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{name: "server", cfg: Config{Role: RoleServer, ExtraServerArgs: []string{"--lb-privileged-ports", "80,8080"}}},
+		{name: "agent", cfg: Config{Role: RoleAgent, ExtraAgentArgs: []string{"--lb-privileged-ports=http"}}},
+		{name: "a bare trailing flag", cfg: Config{Role: RoleServer, ExtraServerArgs: []string{"--lb-privileged-ports"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := plistContent(NetdLabel, tc.cfg); err == nil {
+				t.Fatal("the netd job rendered from a list netd refuses at start")
+			}
+		})
+	}
+	if _, err := plistContent(NetdLabel, Config{Role: RoleServer, ExtraServerArgs: []string{"--lb-privileged-ports", "443"}}); err != nil {
+		t.Errorf("a valid list was refused: %v", err)
+	}
 }
 
 // TestAgentInstallRendersNetdWithTheNodeIdentity proves the netd plist's
