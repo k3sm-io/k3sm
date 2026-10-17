@@ -324,10 +324,18 @@ func (w *Watcher) now() time.Time {
 
 // phaseMirror maps the root helper's streamed phases onto the node phase,
 // writing each step forward once. Verifying and Installing are already
-// written by the node before the verb runs. Done means the installer exited
-// 0; the node reports Restarting for it, because Done is the claim of the
-// restarted daemon running the new build. Failed is reported from the verb's
-// error, with its message.
+// written by the node before the verb runs, so the node's Installing covers
+// the helper's own checks. The helper sends its Installing frame only after
+// every check passed, immediately before it execs the staged installer, and
+// that installer stops this daemon before the stream can end: so the node
+// writes Restarting on that frame, while it still runs, and a watcher sees
+// Restarting before the stop on every node. The progress callback runs
+// synchronously, so the patch is sent before the next frame is read; the
+// helper does not wait for it, so an installer that stopped this daemon
+// within the patch's round trip would still win. A later Restarting (the
+// stream ending mid-install) or Done (the installer exited 0) moves nothing,
+// because Done is the claim of the restarted daemon running the new build.
+// Failed is reported from the verb's error, with its message.
 type phaseMirror struct {
 	last updatesv1alpha1.UpdateNodePhase
 }
@@ -338,7 +346,7 @@ func newPhaseMirror(start updatesv1alpha1.UpdateNodePhase) *phaseMirror {
 
 func (m *phaseMirror) advance(ph wire.UpdatePhase) (updatesv1alpha1.UpdateNodePhase, bool) {
 	switch ph {
-	case wire.UpdatePhaseRestarting, wire.UpdatePhaseDone:
+	case wire.UpdatePhaseInstalling, wire.UpdatePhaseRestarting, wire.UpdatePhaseDone:
 		if m.last == updatesv1alpha1.UpdateNodePhaseRestarting {
 			return "", false
 		}

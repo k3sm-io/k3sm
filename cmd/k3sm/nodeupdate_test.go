@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/url"
@@ -386,7 +387,7 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 			result: wire.UpdateResult{Phase: wire.UpdatePhaseFailed, Log: "line one\ninstall: refused\x07 the staged build"}}
 		r := runNodeUpdate(t, updateCase{node: handedOverNode(t, good, nil), netd: netd})
 		got := phasesWritten(t, r.cs)
-		if names := phaseNames(got); !slices.Equal(names, []string{"Downloading", "Verifying", "Installing", "Failed"}) {
+		if names := phaseNames(got); !slices.Equal(names, []string{"Downloading", "Verifying", "Installing", "Restarting", "Failed"}) {
 			t.Fatalf("phases = %v", names)
 		}
 		last := got[len(got)-1]
@@ -516,4 +517,108 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 			t.Fatalf("phases %v, fetched %v, calls %d; want Failed before any download", got, r.fetch.urls, len(r.netd.calls))
 		}
 	})
+}
+
+// execNetd stands for the root helper as the rig showed it: it streams
+// Verifying, then Installing immediately before it execs the staged installer,
+// and that installer stops the node daemon, so the stream never ends from the
+// daemon's side. At the exec it records the phase annotation already on the
+// Node, then stops the daemon (cancels its context).
+type execNetd struct {
+	cs          *fake.Clientset
+	stop        context.CancelFunc
+	execs       int
+	phaseAtExec string
+}
+
+func (n *execNetd) ApplyUpdate(ctx context.Context, _ wire.ApplyUpdateArgs, progress func(wire.UpdatePhase)) (wire.UpdateResult, error) {
+	progress(wire.UpdatePhaseVerifying)
+	progress(wire.UpdatePhaseInstalling)
+	node, err := n.cs.CoreV1().Nodes().Get(context.Background(), updTestNode, metav1.GetOptions{})
+	if err != nil {
+		return wire.UpdateResult{}, err
+	}
+	n.execs++
+	n.phaseAtExec = node.Annotations[updatesv1alpha1.AnnotationUpdatePhase]
+	n.stop()
+	<-ctx.Done()
+	return wire.UpdateResult{Phase: wire.UpdatePhaseInstalling}, fmt.Errorf("read %s response: %w", wire.VerbApplyUpdate, ctx.Err())
+}
+
+// TestUpdateApplyWritesRestartingBeforeTheExec is the gate for the Restarting
+// phase: the staged installer stops the node daemon, so the daemon writes
+// Restarting when the root helper reports it is about to exec the installer,
+// and the annotation is on the Node before the exec runs. The restarted
+// daemon then writes Done, and a watcher of the Node sees Downloading,
+// Verifying, Installing, Restarting, Done in that order.
+func TestUpdateApplyWritesRestartingBeforeTheExec(t *testing.T) {
+	t.Parallel()
+	good := update.Payload{Version: updTestTag, URL: updTestURL, SHA256: updSHA256Hex(updTestArchive), Signature: updatesv1alpha1.UpdateSignatureIfSigned}
+	cs := fake.NewClientset(handedOverNode(t, good, nil))
+	watch, err := cs.CoreV1().Nodes().Watch(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("watch nodes: %v", err)
+	}
+	defer watch.Stop()
+
+	root := filepath.Join(t.TempDir(), "updates")
+	daemon := func(running string, netd update.Netd) *update.Watcher {
+		t.Helper()
+		w, err := newNodeUpdater(nodeOptions{
+			nodeName:           updTestNode,
+			netMode:            hostnet.Mode{Backend: hostnet.BackendHelper, Socket: "/var/lib/k3sm/run/netd.sock"},
+			updateRoot:         root,
+			updateClusterCAPEM: updSigning().ca.CertPEM,
+		}, cs, nodeUpdateDeps{
+			fetcher: &fakeFetcher{archive: updTestArchive},
+			netd:    netd,
+			running: version.Info{Version: running, KubeVersion: updTestKube},
+		}, slog.New(slog.DiscardHandler))
+		if err != nil || w == nil {
+			t.Fatalf("newNodeUpdater = %v, %v", w, err)
+		}
+		return w
+	}
+
+	// The old daemon runs the update until the installer stops it.
+	oldCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+	netd := &execNetd{cs: cs, stop: stop}
+	if err := daemon(updTestRunning, netd).Sync(oldCtx); err != nil {
+		t.Fatalf("Sync of the old daemon = %v", err)
+	}
+	if netd.execs != 1 {
+		t.Fatalf("the installer ran %d times, want 1", netd.execs)
+	}
+	if p, _ := update.ParsePhase(netd.phaseAtExec); p != updatesv1alpha1.UpdateNodePhaseRestarting {
+		t.Fatalf("the phase on the Node when the installer ran = %q, want Restarting", netd.phaseAtExec)
+	}
+
+	// The restarted daemon on the new build writes Done.
+	if err := daemon("0.2.0", &fakeNetd{t: t}).Sync(context.Background()); err != nil {
+		t.Fatalf("Sync of the restarted daemon = %v", err)
+	}
+
+	var seen []string
+	for len(seen) < 5 {
+		select {
+		case ev := <-watch.ResultChan():
+			n, ok := ev.Object.(*corev1.Node)
+			if !ok {
+				t.Fatalf("watch event object %T, want a Node", ev.Object)
+			}
+			p, _ := update.ParsePhase(n.Annotations[updatesv1alpha1.AnnotationUpdatePhase])
+			if p != "" && (len(seen) == 0 || seen[len(seen)-1] != string(p)) {
+				seen = append(seen, string(p))
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("watched phases %v, then nothing", seen)
+		}
+	}
+	if want := []string{"Downloading", "Verifying", "Installing", "Restarting", "Done"}; !slices.Equal(seen, want) {
+		t.Fatalf("watched phases %v, want %v", seen, want)
+	}
+	if got, want := phaseNames(phasesWritten(t, cs)), []string{"Downloading", "Verifying", "Installing", "Restarting", "Done"}; !slices.Equal(got, want) {
+		t.Fatalf("phases written %v, want %v", got, want)
+	}
 }
