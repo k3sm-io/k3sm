@@ -71,6 +71,10 @@ type netdOptions struct {
 	// plists pass neither, so the three daemons agree by construction.
 	dnsVIP        string
 	clusterDomain string
+	// lbPrivilegedPorts is --lb-privileged-ports, the LoadBalancer ports below
+	// 1024 the authorizer admits on this Mac's own addresses
+	// (netdsvc.Options.LBPrivilegedPorts).
+	lbPrivilegedPorts string
 }
 
 // netdFlags registers `k3sm netd`'s flags against opts and returns the set. It
@@ -99,7 +103,42 @@ func netdFlags(opts *netdOptions) *flag.FlagSet {
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the node resolver entry routes svc and the cluster domain to")
 	fs.StringVar(&opts.clusterDomain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the node resolver entry registers as a match domain")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT: ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
+	// No default list here: the installer always renders the node's own list
+	// (install.NetdPlist), so a job without the flag is one written before it
+	// existed, and it keeps refusing every such bind as it did.
+	fs.StringVar(&opts.lbPrivilegedPorts, dataroot.LBPrivilegedPortsFlag, "", "LoadBalancer ports below 1024 (comma-separated) the svclb hoster may be handed on every interface, on this node's own address and on 127.0.0.1, when a LoadBalancer Service other than the ingress host's declares the port; rendered by the installer from the node's recorded arguments; empty allows none")
 	return fs
+}
+
+// netdInterfaceAddrs maps the addresses assigned to this Mac's up interfaces,
+// lo0 included, to the interface names: the node's own address on a derived or
+// mesh node is an lo0 alias, and the authorizer decides by name which other
+// interfaces count. It is read on every request the LoadBalancer-port class
+// decides, so an address DHCP moved is never pinned.
+func netdInterfaceAddrs() (map[netip.Addr]string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("list interfaces: %w", err)
+	}
+	out := make(map[netip.Addr]string)
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			// One unreadable interface must not hide the rest.
+			continue
+		}
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok {
+				if ip, ok := netip.AddrFromSlice(n.IP); ok {
+					out[ip.Unmap()] = iface.Name
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 // runNetd runs the root k3sm-netd helper: it serves the only irreducibly-root
@@ -147,6 +186,11 @@ func runNetd(args []string) error {
 		}
 	}
 
+	lbPorts, err := dataroot.ParseLBPrivilegedPorts(opts.lbPrivilegedPorts)
+	if err != nil {
+		return err
+	}
+
 	declares, lbDeclarers, synced, gid := buildServiceSet(ctx, opts.kubeconfig, logger)
 
 	cfg, err := netdsvc.BuildConfig(netdsvc.Options{
@@ -159,6 +203,8 @@ func runNetd(args []string) error {
 		NodeAddressService: canonicalLBService(),
 		NodeIP:             nodeIP,
 		VMPodPorts:         buildVMPodSet(ctx, opts.kubeconfig, logger),
+		LBPrivilegedPorts:  lbPorts,
+		InterfaceAddrs:     netdInterfaceAddrs,
 		MeshKeyDir:         opts.meshKeyDir,
 		ClusterCAPath:      opts.clusterCA,
 		Logger:             logger,
@@ -174,7 +220,7 @@ func runNetd(args []string) error {
 	// identity-path is logged because it is the one input whose ABSENCE is silent:
 	// with no mesh key dir the daemon persists nothing, so an adopted /24 is lost
 	// on the next restart and the only evidence is this field being empty.
-	logger.Info("k3sm-netd serving", "socket", opts.socket, "node-pod-cidr", nodeCIDR, "service-cidr", svcCIDR, "service-uid", uid, "node-ip", opts.nodeIP, "identity-path", cfg.IdentityPath)
+	logger.Info("k3sm-netd serving", "socket", opts.socket, "node-pod-cidr", nodeCIDR, "service-cidr", svcCIDR, "service-uid", uid, "node-ip", opts.nodeIP, "lb-privileged-ports", opts.lbPrivilegedPorts, "identity-path", cfg.IdentityPath)
 
 	stopResolver := startNodeResolver(opts, logger)
 	defer stopResolver()

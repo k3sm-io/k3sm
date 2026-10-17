@@ -146,6 +146,9 @@ func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.L
 	if opts.ingressHTTPSPort < 0 || opts.ingressHTTPSPort > 65535 {
 		return fmt.Errorf("--ingress-https-port %d out of range 0-65535", opts.ingressHTTPSPort)
 	}
+	if _, err := dataroot.ParseLBPrivilegedPorts(opts.lbPrivilegedPorts); err != nil {
+		return err
+	}
 	if opts.registryPort < 0 || opts.registryPort > 65535 {
 		return fmt.Errorf("--registry-port %d out of range 0-65535 (0 disables)", opts.registryPort)
 	}

@@ -117,7 +117,7 @@ func validateRecordArgs(args []string, managed []string, rejected error) error {
 			}
 		}
 	}
-	return nil
+	return validateLBPrivilegedPorts(args, rejected)
 }
 
 // ReadAgentArgsRecord reads the agent-arguments record at path, with

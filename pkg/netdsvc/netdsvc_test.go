@@ -18,6 +18,7 @@ package netdsvc
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -617,5 +618,214 @@ func TestPortAuthorizerSyncedWording(t *testing.T) {
 				t.Fatalf("Authorize error = %v, want it to contain %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestPortAuthorizerAdmitsListedLBPortOnHostAddress is the host-address class
+// table: with LAN access off the svclb hoster asks netd for a LoadBalancer
+// port below 1024 on one of this Mac's own addresses. It is admitted only for
+// a port the operator listed, on an address assigned to an interface now, that
+// is not loopback, a Service-CIDR VIP or a pod address (inside the cluster pod
+// range only this node's mesh-egress address is its own), and only while some
+// LoadBalancer Service declares the port. 127.0.0.1 is admitted on the same
+// terms (no other loopback address is), and so is the wildcard, so the
+// hoster's LAN-on and LAN-off listeners of a listed port share one owner. The
+// address shapes are only the hoster's: 127.0.0.1, this node's .1 (even beside
+// a vm pod in the same /24), and en* addresses; a utun, bridge, awdl or other
+// lo0 address is refused. A port the canonical ingress Service declares is
+// refused on every shape but the ingress host's own wildcard.
+func TestPortAuthorizerAdmitsListedLBPortOnHostAddress(t *testing.T) {
+	t.Parallel()
+	nodeCIDR := netip.MustParsePrefix("100.64.3.0/24")
+	lan := netip.MustParseAddr("192.168.7.20")
+	egress := netip.MustParseAddr("100.64.3.1")
+	tenant := ServiceRef{Namespace: "default", Name: "www"}
+	host := map[netip.Addr]string{
+		netip.MustParseAddr("127.0.0.1"):    "lo0",
+		egress:                              "lo0",
+		lan:                                 "en0",
+		netip.MustParseAddr("192.168.8.4"):  "en7",
+		netip.MustParseAddr("100.64.3.7"):   "lo0",
+		netip.MustParseAddr("10.43.0.20"):   "lo0",
+		netip.MustParseAddr("100.64.9.1"):   "lo0",
+		netip.MustParseAddr("100.64.3.255"): "utun4",
+		netip.MustParseAddr("172.20.0.9"):   "utun5",
+		netip.MustParseAddr("192.168.64.1"): "bridge100",
+		netip.MustParseAddr("169.254.3.3"):  "awdl0",
+		netip.MustParseAddr("192.0.2.77"):   "lo0",
+	}
+	// 80 and 443 are tenant ports; 8 is listed and also the canonical ingress
+	// Service's; 22 is declared but not listed.
+	lbDeclarers := func(port int) []ServiceRef {
+		switch port {
+		case 80, 443, 22:
+			return []ServiceRef{tenant}
+		case 8:
+			return []ServiceRef{tenant, canonicalIngress}
+		}
+		return nil
+	}
+	full := PortPolicy{
+		ServiceCIDR:        netip.MustParsePrefix("10.43.0.0/16"),
+		Declares:           func(int) bool { return false },
+		LBDeclarers:        lbDeclarers,
+		NodeAddressService: canonicalIngress,
+		NodePodCIDR:        func() netip.Prefix { return nodeCIDR },
+		VMPodPorts: func(a netip.Addr) []uint16 {
+			if a == netip.MustParseAddr("100.64.3.7") {
+				return []uint16{443}
+			}
+			return nil
+		},
+		LBPrivilegedPorts: []uint16{8, 80, 443},
+		InterfaceAddrs:    func() (map[netip.Addr]string, error) { return host, nil },
+	}
+	with := func(edit func(*PortPolicy)) PortPolicy {
+		p := full
+		edit(&p)
+		return p
+	}
+
+	cases := []struct {
+		name    string
+		policy  PortPolicy
+		port    int
+		addr    string
+		allow   bool
+		mention string
+	}{
+		{name: "listed port on the node's mesh-egress address", policy: full, port: 80, addr: "100.64.3.1", allow: true},
+		{name: "listed port on a live en0 address", policy: full, port: 443, addr: "192.168.7.20", allow: true},
+		{name: "listed port on another en* interface", policy: full, port: 80, addr: "192.168.8.4", allow: true},
+		{name: "the node's .1 with a vm pod in the same /24", policy: full, port: 443, addr: "100.64.3.1", allow: true},
+		{name: "a vm pod's own address keeps its own class", policy: full, port: 443, addr: "100.64.3.7", allow: true},
+		{name: "a utun address", policy: full, port: 80, addr: "172.20.0.9", mention: "on utun5"},
+		{name: "the mesh utun link address", policy: full, port: 80, addr: "100.64.3.255"},
+		{name: "a vm bridge address", policy: full, port: 80, addr: "192.168.64.1", mention: "on bridge100"},
+		{name: "an awdl address", policy: full, port: 80, addr: "169.254.3.3"},
+		{name: "another lo0 alias", policy: full, port: 80, addr: "192.0.2.77", mention: "on lo0"},
+		{name: "an ingress-owned listed port on the node address", policy: full, port: 8, addr: "100.64.3.1", mention: "belongs to the ingress host"},
+		{name: "an ingress-owned listed port on 127.0.0.1", policy: full, port: 8, addr: "127.0.0.1", mention: "belongs to the ingress host"},
+		{name: "an ingress-owned listed port on an en* address", policy: full, port: 8, addr: "192.168.7.20", mention: "belongs to the ingress host"},
+		{name: "IPv4-mapped spelling of a live address", policy: full, port: 80, addr: "::ffff:100.64.3.1", allow: true},
+		{name: "a port not in the list", policy: full, port: 22, addr: "100.64.3.1", mention: "port 22 on 100.64.3.1 is not in the allowed LoadBalancer port list (8, 80, 443)"},
+		{name: "an empty list allows nothing", policy: with(func(p *PortPolicy) { p.LBPrivilegedPorts = nil }), port: 80, addr: "100.64.3.1", mention: "not in the allowed LoadBalancer port list (empty)"},
+		{name: "127.0.0.1 on a listed port", policy: full, port: 80, addr: "127.0.0.1", allow: true},
+		{name: "127.0.0.1 on a port not in the list", policy: full, port: 22, addr: "127.0.0.1", mention: "not in the allowed LoadBalancer port list"},
+		{name: "127.0.0.1 with no declaring LoadBalancer service", policy: with(func(p *PortPolicy) { p.LBDeclarers = func(int) []ServiceRef { return nil } }), port: 80, addr: "127.0.0.1", mention: "no LoadBalancer service declares port 80"},
+		{name: "another 127/8 address", policy: full, port: 80, addr: "127.0.0.2", mention: "only loopback address authorized"},
+		{name: "IPv6 loopback", policy: full, port: 80, addr: "::1", mention: "only loopback address authorized"},
+		{name: "the wildcard on a listed port a tenant declares", policy: full, port: 80, addr: "0.0.0.0", allow: true},
+		{name: "the wildcard on a port not in the list", policy: full, port: 22, addr: "0.0.0.0"},
+		{name: "the wildcard on a listed port nobody declares", policy: with(func(p *PortPolicy) { p.LBDeclarers = func(int) []ServiceRef { return nil } }), port: 80, addr: "0.0.0.0"},
+		{name: "the ingress keeps its own wildcard on a listed port it declares", policy: full, port: 8, addr: "0.0.0.0", allow: true},
+		{name: "a service-CIDR address", policy: full, port: 80, addr: "10.43.0.20"},
+		{name: "a pod address of this node", policy: full, port: 80, addr: "100.64.3.7"},
+		{name: "another node's mesh-egress address", policy: full, port: 80, addr: "100.64.9.1", mention: "cluster pod range"},
+		{name: "an address not assigned to this Mac", policy: full, port: 80, addr: "192.168.7.99", mention: "not assigned to this Mac"},
+		{name: "no LoadBalancer service declares the port", policy: with(func(p *PortPolicy) { p.LBDeclarers = func(int) []ServiceRef { return nil } }), port: 80, addr: "100.64.3.1", mention: "no LoadBalancer service declares port 80"},
+		{name: "nil LoadBalancer service set", policy: with(func(p *PortPolicy) { p.LBDeclarers = nil }), port: 80, addr: "100.64.3.1"},
+		{name: "unsynced service set", policy: with(func(p *PortPolicy) { p.Synced = func() bool { return false } }), port: 80, addr: "100.64.3.1", mention: "not yet synced"},
+		{name: "nil host address set", policy: with(func(p *PortPolicy) { p.InterfaceAddrs = nil }), port: 80, addr: "100.64.3.1"},
+		{name: "an unreadable host address set", policy: with(func(p *PortPolicy) {
+			p.InterfaceAddrs = func() (map[netip.Addr]string, error) { return nil, errors.New("no interfaces") }
+		}), port: 80, addr: "100.64.3.1"},
+		{name: "the IPv6 unspecified address stays refused", policy: full, port: 80, addr: "::"},
+		{name: "an IPv6 address", policy: with(func(p *PortPolicy) {
+			p.InterfaceAddrs = func() (map[netip.Addr]string, error) {
+				return map[netip.Addr]string{netip.MustParseAddr("2001:db8::1"): "en0"}, nil
+			}
+		}), port: 80, addr: "2001:db8::1"},
+		{name: "the zero policy", policy: PortPolicy{}, port: 80, addr: "192.168.7.20"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := PortAuthorizer(tc.policy).Authorize(context.Background(), tc.port, tc.addr)
+			if tc.allow && err != nil {
+				t.Errorf("Authorize(%d, %s) = %v, want authorized", tc.port, tc.addr, err)
+			}
+			if !tc.allow && err == nil {
+				t.Errorf("Authorize(%d, %s) authorized, want refused", tc.port, tc.addr)
+			}
+			if tc.mention != "" && (err == nil || !strings.Contains(err.Error(), tc.mention)) {
+				t.Errorf("refusal = %v, want it to say %q", err, tc.mention)
+			}
+		})
+	}
+
+	t.Run("an unlisted wildcard is still the canonical ingress Service's alone", func(t *testing.T) {
+		t.Parallel()
+		p := with(func(p *PortPolicy) { p.NodeAddressService = canonicalIngress })
+		if err := PortAuthorizer(p).Authorize(context.Background(), 22, "0.0.0.0"); err == nil {
+			t.Error("an unlisted port declared only by a tenant Service authorized the wildcard")
+		}
+		canon := with(func(p *PortPolicy) {
+			p.NodeAddressService = canonicalIngress
+			p.LBPrivilegedPorts = nil
+			p.LBDeclarers = func(int) []ServiceRef { return []ServiceRef{canonicalIngress} }
+		})
+		if err := PortAuthorizer(canon).Authorize(context.Background(), 8, "0.0.0.0"); err != nil {
+			t.Errorf("the canonical ingress Service no longer authorizes its own wildcard: %v", err)
+		}
+	})
+
+	t.Run("the host address set is read on every request", func(t *testing.T) {
+		t.Parallel()
+		cur := map[netip.Addr]string{lan: "en0"}
+		p := with(func(p *PortPolicy) { p.InterfaceAddrs = func() (map[netip.Addr]string, error) { return cur, nil } })
+		a := PortAuthorizer(p)
+		if err := a.Authorize(context.Background(), 80, "192.168.7.20"); err != nil {
+			t.Fatalf("live address refused: %v", err)
+		}
+		cur = map[netip.Addr]string{netip.MustParseAddr("192.168.7.21"): "en0"}
+		if err := a.Authorize(context.Background(), 80, "192.168.7.20"); err == nil {
+			t.Error("an address the Mac no longer holds was still authorized")
+		}
+	})
+
+	t.Run("BuildConfig wires the class", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := BuildConfig(Options{
+			NodePodCIDR:       nodeCIDR,
+			ServiceCIDR:       netip.MustParsePrefix("10.43.0.0/16"),
+			LBDeclarers:       lbDeclarers,
+			LBPrivilegedPorts: []uint16{80},
+			InterfaceAddrs:    func() (map[netip.Addr]string, error) { return host, nil },
+		})
+		if err != nil {
+			t.Fatalf("BuildConfig: %v", err)
+		}
+		if err := cfg.PortAuthorizer.Authorize(context.Background(), 80, "100.64.3.1"); err != nil {
+			t.Errorf("assembled authorizer refused a listed port on the node address: %v", err)
+		}
+		if err := cfg.PortAuthorizer.Authorize(context.Background(), 443, "100.64.3.1"); err == nil {
+			t.Error("assembled authorizer admitted a port the list does not name")
+		}
+	})
+}
+
+// TestAuthorizeLBDeclaredRefusesAnIngressOwnedPort pins the ownership rule on
+// the declarer set itself: when the canonical ingress Service is among a
+// port's LoadBalancer declarers the listed-port classes refuse, whoever else
+// declares it, and a port only tenants declare is admitted.
+func TestAuthorizeLBDeclaredRefusesAnIngressOwnedPort(t *testing.T) {
+	t.Parallel()
+	tenant := ServiceRef{Namespace: "default", Name: "www"}
+	a := servicePortAuthorizer{policy: PortPolicy{
+		NodeAddressService: canonicalIngress,
+		LBDeclarers: func(port int) []ServiceRef {
+			if port == 80 {
+				return []ServiceRef{tenant, canonicalIngress}
+			}
+			return []ServiceRef{tenant}
+		},
+	}}
+	err := a.authorizeLBDeclared(80, "100.64.3.1")
+	if err == nil || !strings.Contains(err.Error(), "belongs to the ingress host") || !strings.Contains(err.Error(), canonicalIngress.String()) {
+		t.Errorf("authorizeLBDeclared(80) = %v, want the ingress-ownership refusal naming %s", err, canonicalIngress)
+	}
+	if err := a.authorizeLBDeclared(443, "100.64.3.1"); err != nil {
+		t.Errorf("authorizeLBDeclared(443) = %v, want admitted: only a tenant declares it", err)
 	}
 }

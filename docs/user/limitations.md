@@ -327,8 +327,11 @@ Today at `main`, per port class:
   own address only. See [LAN access](install.md#lan-access).
 - **LoadBalancer / Ingress** binds the **wildcard** `*:<port>` while LAN access is on, matching k3s
   and the desktop container tools, which publish LoadBalancer ports on all interfaces. With LAN
-  access off it binds the node's own address (and `127.0.0.1` from port 1024 up), and a LoadBalancer
-  port below 1024 is not served.
+  access off it binds the node's own address and `127.0.0.1` (the ingress host binds `127.0.0.1`
+  only from port 1024 up), and a LoadBalancer port below 1024 is served only when it is in the
+  node's `--lb-privileged-ports` list (`80,443` by default). A LoadBalancer port is not served on
+  any node while the ingress host declares the port, so the default list serves `80` and `443` only
+  where the ingress host is disabled or moved.
 
   **The bind address and the advertised address are different.** Read them separately.
   With LAN access on, the **port** is reachable on every interface the Mac has, including its LAN

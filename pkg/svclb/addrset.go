@@ -61,11 +61,18 @@ const privilegedPortMax = 1023
 //
 // On a port below 1024 the loopback addresses are dropped from a specific set.
 // No unprivileged process can bind a specific address there, and the one
-// broker that can (the netd helper, for the ingress listeners) admits this
-// node's own address and never loopback; the node's address answers on this
-// Mac anyway. The result may be empty, which a caller refuses with
+// broker that can (the netd helper, for the ingress and LoadBalancer
+// listeners) admits this node's own address and never loopback; the node's
+// address answers on this Mac anyway. The result may be empty, which a caller refuses with
 // ErrNoBindAddress rather than binding nothing quietly.
 func EffectiveBindAddrs(addrs []netip.Addr, port uint16) []netip.Addr {
+	return effectiveBindAddrs(addrs, port, false)
+}
+
+// effectiveBindAddrs is EffectiveBindAddrs, keeping loopback below 1024 when
+// keepLoopback is set: the svclb hoster's binder brokers those binds through
+// the netd helper, which can bind 127.0.0.1 for a listed port.
+func effectiveBindAddrs(addrs []netip.Addr, port uint16, keepLoopback bool) []netip.Addr {
 	var out []netip.Addr
 	for _, a := range addrs {
 		if !a.IsValid() {
@@ -75,7 +82,7 @@ func EffectiveBindAddrs(addrs []netip.Addr, port uint16) []netip.Addr {
 		if a.IsUnspecified() && a.Is4() {
 			return []netip.Addr{a}
 		}
-		if port <= privilegedPortMax && a.IsLoopback() {
+		if port <= privilegedPortMax && a.IsLoopback() && !keepLoopback {
 			continue
 		}
 		out = append(out, a)
@@ -107,6 +114,8 @@ func IsWildcard(addrs []netip.Addr) bool {
 type AddrSetListener struct {
 	port   uint16
 	listen ListenFunc
+	// keepLoopback keeps loopback below 1024 (effectiveBindAddrs).
+	keepLoopback bool
 
 	mu sync.Mutex
 	// lns is the committed set's listeners; pending is what the last Prepare
@@ -130,14 +139,21 @@ type accepted struct {
 // port), all or nothing: a failed bind closes the listeners already opened
 // and the error names the address.
 func ListenAddrSet(ctx context.Context, listen ListenFunc, addrs []netip.Addr, port uint16) (*AddrSetListener, error) {
+	return listenAddrSet(ctx, listen, addrs, port, false)
+}
+
+// listenAddrSet is ListenAddrSet, keeping loopback below 1024 for the whole
+// life of the set when keepLoopback is set.
+func listenAddrSet(ctx context.Context, listen ListenFunc, addrs []netip.Addr, port uint16, keepLoopback bool) (*AddrSetListener, error) {
 	l := &AddrSetListener{
-		port:   port,
-		listen: listen,
-		lns:    make(map[netip.Addr]net.Listener),
-		conns:  make(chan accepted),
-		closed: make(chan struct{}),
+		port:         port,
+		listen:       listen,
+		keepLoopback: keepLoopback,
+		lns:          make(map[netip.Addr]net.Listener),
+		conns:        make(chan accepted),
+		closed:       make(chan struct{}),
 	}
-	opened, err := l.bind(ctx, EffectiveBindAddrs(addrs, port))
+	opened, err := l.bind(ctx, l.effective(addrs))
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +164,11 @@ func ListenAddrSet(ctx context.Context, listen ListenFunc, addrs []netip.Addr, p
 		go l.serve(ln)
 	}
 	return l, nil
+}
+
+// effective is where this set binds under addrs.
+func (l *AddrSetListener) effective(addrs []netip.Addr) []netip.Addr {
+	return effectiveBindAddrs(addrs, l.port, l.keepLoopback)
 }
 
 // bind opens want, all or nothing.
@@ -270,7 +291,7 @@ func (l *AddrSetListener) Addrs() []netip.Addr {
 // untouched. A Prepare replaces an earlier one that was never finished.
 func (l *AddrSetListener) Prepare(ctx context.Context, addrs []netip.Addr) error {
 	l.Abort()
-	want := EffectiveBindAddrs(addrs, l.port)
+	want := l.effective(addrs)
 	if len(want) == 0 {
 		return fmt.Errorf("port %d: %w", l.port, ErrNoBindAddress)
 	}
@@ -312,7 +333,7 @@ func (l *AddrSetListener) Prepare(ctx context.Context, addrs []netip.Addr) error
 // it closes every committed address outside EffectiveBindAddrs(addrs, port)
 // and keeps what Prepare opened.
 func (l *AddrSetListener) Commit(addrs []netip.Addr) {
-	want := EffectiveBindAddrs(addrs, l.port)
+	want := l.effective(addrs)
 	l.mu.Lock()
 	var drop []net.Listener
 	for a, ln := range l.lns {

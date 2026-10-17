@@ -45,6 +45,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
@@ -88,6 +89,11 @@ type agentOptions struct {
 	// nodePortAddresses is --nodeport-addresses: where this worker's NodePort
 	// listeners bind (empty = every interface).
 	nodePortAddresses string
+	// lbPrivilegedPorts is --lb-privileged-ports: the LoadBalancer ports below
+	// 1024 this node's netd may bind on the node's own address while LAN access
+	// is off. This daemon only validates it; netd reads it from its own plist,
+	// which the installer renders from this recorded argument.
+	lbPrivilegedPorts string
 	// updateReleaseBase is --update-release-base: the release index the
 	// managed update reads instead of GitHub's (a mirror, a lab rig). Empty is
 	// GitHub's; it is validated after the flags parse (releaseBaseFlag).
@@ -119,6 +125,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver serves on and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
+	fs.StringVar(&opts.lbPrivilegedPorts, dataroot.LBPrivilegedPortsFlag, dataroot.DefaultLBPrivilegedPorts, lbPrivilegedPortsUsage)
 	fs.StringVar(&opts.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
 }
 
@@ -206,6 +213,9 @@ func runAgent(args []string) error {
 		return fmt.Errorf("--server is required")
 	}
 	if err := checkNodePortAddresses(&opts.nodePortAddresses, opts.network); err != nil {
+		return err
+	}
+	if _, err := dataroot.ParseLBPrivilegedPorts(opts.lbPrivilegedPorts); err != nil {
 		return err
 	}
 
@@ -782,9 +792,10 @@ func agentResumeFromCredential(ctx context.Context, opts agentOptions, cred *nod
 // cannot acquire a second resolution idiom.
 func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPath string, mode hostnet.Mode, datapath *netserve.Server) nodeOptions {
 	return nodeOptions{
-		lan:        opts.lan,
-		kubeconfig: kubeconfigPath,
-		nodeName:   opts.nodeName,
+		lan:               opts.lan,
+		lbPrivilegedPorts: validatedLBPorts(opts.lbPrivilegedPorts),
+		kubeconfig:        kubeconfigPath,
+		nodeName:          opts.nodeName,
 		// The kubelet API binds the assigned mesh address on this port
 		// (resolveKubeletEndpoint), never the wildcard.
 		kubeletPort: ports.KubeletAPIPort,

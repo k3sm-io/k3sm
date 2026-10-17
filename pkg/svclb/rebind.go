@@ -61,7 +61,8 @@ type Rebind struct {
 	committed bool
 	// Unserved names the Services ("ns/name") a commit takes off this node:
 	// a port of theirs cannot bind under the new set (a port below 1024 on a
-	// specific set, see ErrPrivilegedPortNotWildcard).
+	// specific set that the netd helper did not grant, see
+	// ErrPrivilegedPortNotWildcard).
 	Unserved []string
 }
 
@@ -267,14 +268,32 @@ func (h *Hoster) classifyBindErr(port int32, err error) error {
 }
 
 // classifyRebindErr is classifyBindErr under the set addrs: a port below 1024
-// on a specific set, refused with EACCES or left with no address (loopback
-// only), is ErrPrivilegedPortNotWildcard.
+// refused by the netd helper's policy (on any set), or refused with EACCES or
+// left with no address (loopback only) on a specific set, is
+// ErrPrivilegedPortNotWildcard. A rebind then takes that Service off the node
+// instead of failing the swap, and the next reconcile asks again.
 func (h *Hoster) classifyRebindErr(addrs []netip.Addr, port int32, err error) error {
-	if port <= privilegedPortMax && !IsWildcard(addrs) &&
-		(errors.Is(err, syscall.EACCES) || errors.Is(err, ErrNoBindAddress)) {
+	if port <= privilegedPortMax && (isNetdPolicyRefusal(err) ||
+		(!IsWildcard(addrs) && (errors.Is(err, syscall.EACCES) || errors.Is(err, ErrNoBindAddress)))) {
 		return fmt.Errorf("svclb: port %d: %w: %w", port, ErrPrivilegedPortNotWildcard, err)
 	}
 	return err
+}
+
+// netdPolicyRefusal is the text the netd wire client puts on a BindPort the
+// root helper refused by policy: "netd BindPort rejected: " followed by the
+// daemon's own error, which starts with darwin-net's netd.ErrPolicy text. The
+// helper does not send that refusal as a named reason, so the client returns
+// it as a plain string and there is no sentinel to match with errors.Is; the
+// documented text is the contract. A port the operator did not list, an
+// address that is not this Mac's, and a netd too old to know the LoadBalancer
+// port class all refuse this way.
+const netdPolicyRefusal = "netd BindPort rejected: netd: request denied by policy"
+
+// isNetdPolicyRefusal reports whether err carries the netd helper's policy
+// refusal of a port bind.
+func isNetdPolicyRefusal(err error) bool {
+	return err != nil && strings.Contains(err.Error(), netdPolicyRefusal)
 }
 
 // addrsString renders an address set for a log line.

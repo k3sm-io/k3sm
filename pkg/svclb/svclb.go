@@ -100,14 +100,32 @@ type HosterConfig struct {
 	// reservations — only a test — passes an explicit empty map, which is a
 	// visible opt-out rather than an omission.
 	ReservedPorts map[int32]bool
-	// Binder opens every listener in-process (on Darwin a WILDCARD bind below
-	// 1024 does not require root; it is the SPECIFIC-address bind that returns
-	// EACCES, inverted from Linux). Nil means netbind.Direct; injectable for
-	// tests. There is deliberately no second, privileged binder here: the root
-	// netd helper grants a privileged wildcard only for a port the canonical
-	// kube-system/k3sm-ingress Service declares, which is the ingress host's
-	// listener, never a tenant LoadBalancer Service's.
+	// Binder opens every listener. Nil means netbind.Direct (in-process);
+	// injectable for tests. On Darwin a WILDCARD bind below 1024 does not
+	// require root; it is the SPECIFIC-address bind that returns EACCES,
+	// inverted from Linux. On a node with the root netd helper the node daemon
+	// passes a binder that sends every bind of a port the operator listed
+	// (--lb-privileged-ports), the wildcard included, to the helper, and binds
+	// every other port in-process. One owner for both the wildcard and the
+	// specific-address listener of a port is what lets a LAN access swap bind
+	// the new set before it closes the old one: Darwin refuses an unprivileged
+	// wildcard bind while a socket of another user holds a specific address on
+	// the same port.
 	Binder netbind.Binder
+	// PrivilegedPorts are the ports below 1024 Binder brokers through the
+	// root helper, which can bind 127.0.0.1 there. For those ports the hoster
+	// keeps loopback in a specific address set instead of leaving it out
+	// (EffectiveBindAddrs); a refused bind still leaves its Service unserved.
+	PrivilegedPorts []uint16
+	// IngressService names the canonical ingress LoadBalancer Service
+	// (namespace, name; pass pkg/ingresshost's ServiceNamespace/ServiceName).
+	// Every port it declares is reserved from tenant LoadBalancer Services on
+	// THIS node, whether or not the ingress host runs here: the root network
+	// helper refuses a tenant a node-address socket on such a port with LAN
+	// access off, so serving it with LAN access on would make the node's
+	// answer flip with the switch. It is matched by namespace and name, never
+	// by a label a tenant could set. The zero value reserves nothing.
+	IngressService types.NamespacedName
 	// Logger is the structured log sink; nil means slog.Default.
 	Logger *slog.Logger
 }
@@ -121,10 +139,12 @@ type dialFunc func(ctx context.Context, network, address string) (net.Conn, erro
 var errReservedPort = errors.New("port is reserved by a k3sm listener")
 
 // ErrPrivilegedPortNotWildcard is the sentinel for a LoadBalancer port below
-// 1024 under a specific address set: macOS lets only root bind a specific
-// address there, and the hoster binds in-process, unprivileged (the wildcard
-// needs no privilege). Such a Service is not served on this node while the
-// set is specific; it is a refusal, not a failure of the set.
+// 1024 under a specific address set that could not be bound: macOS lets only
+// root bind a specific address there, and the root netd helper refused it (a
+// port not in the operator's --lb-privileged-ports list, or a helper too old
+// to know the class) or there is no helper (EACCES). Such a Service is not
+// served on this node while the set is specific; it is a refusal, not a
+// failure of the set.
 var ErrPrivilegedPortNotWildcard = errors.New("a LoadBalancer port below 1024 binds only on every interface")
 
 // Hoster binds the LoadBalancer Services the decider stamped onto THIS node,
@@ -174,6 +194,9 @@ type Hoster struct {
 	// entries is each fully bound Service's report entry, keyed "ns/name", as
 	// the last reconcile computed it; a rebind withdraws from it.
 	entries map[string]string
+	// ingressPorts are the ports the canonical ingress Service
+	// (HosterConfig.IngressService) declared at the last reconcile.
+	ingressPorts map[int32]bool
 	// draining holds the forwarders a rebind took off the air: their listeners
 	// are closed and their accepted connections run to completion. closeAll
 	// cancels them; reconcile reaps the ones with nothing left in flight.
@@ -448,6 +471,7 @@ func Claims(svc *corev1.Service) bool {
 // ports) are torn down, missing listeners are bound, and the bound report is
 // rewritten if the set of fully bound Services changed.
 func (h *Hoster) reconcile(ctx context.Context, svcs []*corev1.Service) {
+	h.ingressPorts = h.ingressServicePorts(svcs)
 	desired := make(map[string]*corev1.Service)
 	for _, s := range svcs {
 		if !Claims(s) {
@@ -474,7 +498,7 @@ func (h *Hoster) reconcile(ctx context.Context, svcs []*corev1.Service) {
 			}
 		}
 		for port, f := range ports {
-			if dst, ok := want[port]; !ok || dst != f.dst {
+			if dst, ok := want[port]; !ok || dst != f.dst || h.ingressPorts[port] {
 				f.stop()
 				delete(ports, port)
 			}
@@ -500,6 +524,26 @@ func (h *Hoster) reconcile(ctx context.Context, svcs []*corev1.Service) {
 		}
 	}
 	h.report(ctx, entries)
+}
+
+// ingressServicePorts returns the ports the canonical ingress Service in svcs
+// declares, or nil when it is absent or not configured.
+func (h *Hoster) ingressServicePorts(svcs []*corev1.Service) map[int32]bool {
+	id := h.cfg.IngressService
+	if id.Namespace == "" || id.Name == "" {
+		return nil
+	}
+	for _, s := range svcs {
+		if s == nil || s.Namespace != id.Namespace || s.Name != id.Name {
+			continue
+		}
+		out := make(map[int32]bool, len(s.Spec.Ports))
+		for _, p := range s.Spec.Ports {
+			out[p.Port] = true
+		}
+		return out
+	}
+	return nil
 }
 
 // reconcileService binds the missing TCP listeners for one stamped
@@ -549,13 +593,13 @@ func (h *Hoster) reconcileService(ctx context.Context, key string, svc *corev1.S
 		if err != nil {
 			if errors.Is(err, ErrPrivilegedPortNotWildcard) {
 				h.throttledWarn(fmt.Sprintf("%s\x00privileged:%d", key, p.Port),
-					"svclb: loadbalancer port below 1024 is not served on this node while its listeners are limited to this Mac and the cluster mesh (LAN access off): macOS lets only root bind a specific address below 1024. Use a port of 1024 or above, or turn LAN access on",
+					"svclb: loadbalancer port below 1024 is not served on this node: with LAN access off macOS lets only root bind this node's address below 1024, and the root network helper serves only a port listed in --lb-privileged-ports (80 and 443 by default) that the ingress host does not own, once a LoadBalancer Service declaring it is in the helper's view (retried on every reconcile). List the port, use a port of 1024 or above, or turn LAN access on",
 					"service", key, "port", p.Port, "bind", addrsString(h.addrs))
 				continue
 			}
 			if errors.Is(err, errReservedPort) {
 				h.throttledWarn(fmt.Sprintf("%s\x00reserved:%d", key, p.Port),
-					"svclb: loadbalancer port is RESERVED by a k3sm wildcard listener (the NodePort range or the kubelet API port); no listener bound, this node is not advertised — pick a different spec.ports[].port",
+					"svclb: loadbalancer port is RESERVED by a k3sm listener (the NodePort range, the kubelet API port, or a port the ingress host's kube-system/k3sm-ingress Service declares); no listener bound, this node is not advertised — pick a different spec.ports[].port",
 					"service", key, "port", p.Port, "bind", addrsString(h.addrs))
 				continue
 			}
@@ -595,11 +639,10 @@ func (h *Hoster) report(ctx context.Context, entries []string) {
 	h.log.Info("svclb: bound report updated", "node", h.cfg.NodeName, "incarnation", h.incarnation, "services", len(entries))
 }
 
-// bind opens one BindAddr:port listener through the single in-process binder and
-// starts its forwarder. There is no port-keyed binder selection: on Darwin a
-// wildcard bind needs no privilege at ANY port, and the netd helper authorizes a
-// privileged wildcard only for the canonical ingress Service, so it stays off
-// the tenant LoadBalancer datapath.
+// bind opens one listener on every address of the set through the configured
+// binder and starts its forwarder. Which process makes a bind is the binder's
+// concern (HosterConfig.Binder): with the netd helper present, every bind of a
+// listed port goes to it; every other bind is in-process.
 //
 // It REFUSES a reserved port before touching the binder: against a wildcard
 // NodePort listener the winner would be decided by start order, and against
@@ -607,10 +650,10 @@ func (h *Hoster) report(ctx context.Context, entries []string) {
 // configured address set the wildcard LB listener would coexist and answer
 // every other address on the same port. A port keeps one owner on a node.
 func (h *Hoster) bind(ctx context.Context, port int32, dst netip.AddrPort, ranges Ranges) (*forwarder, error) {
-	if h.cfg.ReservedPorts[port] {
+	if h.cfg.ReservedPorts[port] || h.ingressPorts[port] {
 		return nil, fmt.Errorf("svclb: refusing port %d: %w", port, errReservedPort)
 	}
-	set, err := ListenAddrSet(ctx, h.dir.Listen, h.addrs, uint16(port))
+	set, err := listenAddrSet(ctx, h.dir.Listen, h.addrs, uint16(port), slices.Contains(h.cfg.PrivilegedPorts, uint16(port)))
 	if err != nil {
 		return nil, h.classifyBindErr(port, err)
 	}
