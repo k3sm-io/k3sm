@@ -218,7 +218,7 @@ func artifactManifest(cfg Config) []artifact {
 		// server that no longer runs, and a copy left in the world-readable
 		// directory would be read as this Mac's state by the next report.
 		// assertExists is false: a server writes them only once it runs.
-		for _, name := range []string{MeshClaimsRecordName, ServicesRecordName} {
+		for _, name := range []string{MeshClaimsRecordName, ServicesRecordName, RegistryStateRecordName} {
 			items = append(items,
 				artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(cfg.serverWorkDir(), name), assertExists: false},
 				artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), name), assertExists: false})

@@ -125,6 +125,12 @@ const (
 	// server's hourly update check and by `k3sm update check`: the latest
 	// release and each node's version against it.
 	UpdateRecordName = "update.json"
+	// RegistryStateRecordName is the fifth, written by a server that runs the
+	// ingest registry, in its work dir and in StatusSubdir like the first two:
+	// the registry's state, port, reason and since. pkg/registrysvc writes it
+	// under the same name (it cannot import this package; a pkg/status test
+	// pins the two together).
+	RegistryStateRecordName = "registry-state.json"
 )
 
 // manifestsSubdir is the manifest directory's leaf name, spelled once.

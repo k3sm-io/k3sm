@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -80,6 +82,27 @@ func registryConfig(opts serverOptions, payloadBinDir string, logger *slog.Logge
 		PayloadBinDir: payloadBinDir,
 		Port:          opts.registryPort,
 		Logger:        logger,
+	}
+}
+
+// recordRegistryDisabled writes the registry's state record for a registry the
+// server disabled before a Service existed to record it (the Service records its
+// own transitions), so `k3sm status` reports this boot's refusal rather than a
+// previous boot's state. A failed write is logged and survived.
+func recordRegistryDisabled(opts serverOptions, reason string, logger *slog.Logger) {
+	if opts.workDir == "" {
+		return // no work dir to record in (New refuses this configuration)
+	}
+	st := registrysvc.State{
+		State:  registrysvc.StateDisabled,
+		Port:   opts.registryPort,
+		Addr:   net.JoinHostPort(registrysvc.LoopbackAddress, strconv.Itoa(opts.registryPort)),
+		Reason: reason,
+		Since:  time.Now().UTC(),
+	}
+	if err := registrysvc.WriteState(opts.workDir, st); err != nil {
+		logger.Warn("could not record the ingest registry state for `k3sm status`",
+			"path", registrysvc.StatePath(opts.workDir), "err", err)
 	}
 }
 

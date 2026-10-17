@@ -104,6 +104,10 @@ func (s *Service) reclaimOrphans(ctx context.Context) error {
 		}
 		s.cfg.Logger.Warn("reclaimed an ingest registry child a previous server left running on the registry port",
 			"pid", p.pid, "addr", s.Addr())
+		s.mu.Lock()
+		s.reclaimedPID = p.pid
+		s.mu.Unlock()
+		s.record(StateReclaimed, "", p.pid)
 	}
 	return nil
 }

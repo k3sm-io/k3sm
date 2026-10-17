@@ -246,6 +246,7 @@ func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	if err != nil {
 		logger.Error("ingest registry disabled: the signing path cannot be decided, so the payload's zot cannot be verified",
 			"err", err, "remedy", executor.SelfSignatureRemedy)
+		recordRegistryDisabled(opts, "the signing path cannot be decided, so the payload's zot cannot be verified: "+err.Error(), logger)
 		return noStop, puller
 	}
 	if release {
@@ -254,6 +255,7 @@ func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	svc, err := registrysvc.New(cfg)
 	if err != nil {
 		logger.Error("ingest registry disabled", "err", err)
+		recordRegistryDisabled(opts, err.Error(), logger)
 		return noStop, puller
 	}
 	stop, puller = startIngestRegistry(ctx, ingestRegistry{

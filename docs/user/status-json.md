@@ -158,9 +158,11 @@ four.
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig`, `runtimed` and `dns`; some rows appear only when the
 thing they describe exists (`datavol`, `server-args`, `settings`, `heartbeat`, `pre-volume`, `etcd`,
-`mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
+`mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`, `ingest-registry`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
 `skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind`, `ahead` or `rolling`.
+
+`ingest-registry`, on a server started with `--registry-port`, is `ok` when the registry the server recorded as serving answers `/v2/` on its loopback port, `down` (`warn`) when it does not, `disabled` (`warn`, with the reason in `detail`) when the server gave up starting it, and `stopped` (`skip`) after the server tore it down; `wide.port` and `wide.since` carry the port and when it entered that state, and the row reads the copy of the server's record in `/var/lib/k3sm/status/` (mode 0644, no credential), so any account sees the same row; `wide.record` names the file read.
 
 `needs-admin` marks a check that only root can run, so nothing was checked and nothing is wrong. Its
 `remedy` is `sudo k3sm status`, and it never changes the `verdict`. A client can show it as not
