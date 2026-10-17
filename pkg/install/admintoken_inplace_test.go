@@ -48,7 +48,9 @@ func adminCredential(t *testing.T, f *fakeSystem) (token string, ca []byte) {
 // turn in a managed roll (and Repair) runs the in-place update, and that update
 // keeps the admin credential, so a copy of the admin kubeconfig taken before the
 // roll (a worker's, a tool's) still authenticates after it. A fresh install still
-// mints a credential of its own.
+// mints a credential of its own. An installed token the update cannot trust is
+// not carried: the update mints, stages the new token in step with the
+// kubeconfig, and reports the rotation.
 func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 	firstServer := func(t *testing.T) (*fakeSystem, Config, []byte) {
 		t.Helper()
@@ -56,8 +58,12 @@ func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 		f := &fakeSystem{}
 		first := testConfig(t)
 		first.MeshIP = "100.64.0.1"
-		if err := Install(context.Background(), f, first); err != nil {
+		res, err := InstallWithResult(context.Background(), f, first)
+		if err != nil {
 			t.Fatalf("the first server install: %v", err)
+		}
+		if res.AdminTokenRotated {
+			t.Error("a fresh install reported a rotated admin token: it has no token to rotate")
 		}
 		staged := f.files[first.withDefaults().serverTokenPath()]
 		if !mintedAdminToken.MatchString(string(bytes.TrimSpace(staged))) {
@@ -71,6 +77,18 @@ func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 		return req
 	}
 	alice := func(string) (string, error) { return "alice", nil }
+	update := func(t *testing.T, f *fakeSystem, req Config) Result {
+		t.Helper()
+		cfg, err := ResolveInPlace(f, req, alice)
+		if err != nil {
+			t.Fatalf("ResolveInPlace = %v", err)
+		}
+		res, err := InstallWithResult(context.Background(), f, cfg)
+		if err != nil {
+			t.Fatalf("the in-place server install: %v", err)
+		}
+		return res
+	}
 
 	for _, tc := range []struct {
 		name string
@@ -86,13 +104,7 @@ func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 		t.Run("an in-place update keeps the credential: "+tc.name, func(t *testing.T) {
 			f, first, staged := firstServer(t)
 			beforeTok, beforeCA := adminCredential(t, f)
-			cfg, err := ResolveInPlace(f, tc.req(first), alice)
-			if err != nil {
-				t.Fatalf("ResolveInPlace = %v", err)
-			}
-			if err := Install(context.Background(), f, cfg); err != nil {
-				t.Fatalf("the in-place server install: %v", err)
-			}
+			res := update(t, f, tc.req(first))
 			afterTok, afterCA := adminCredential(t, f)
 			if afterTok != beforeTok {
 				t.Error("the in-place update rewrote the admin kubeconfig with a new token: every copy taken before the roll is now Unauthorized")
@@ -102,6 +114,9 @@ func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 			}
 			if got := f.files[first.withDefaults().serverTokenPath()]; !bytes.Equal(got, staged) {
 				t.Error("the in-place update staged a different admin token for the server daemon than the one it served before")
+			}
+			if res.AdminTokenRotated {
+				t.Error("the in-place update kept the token but reported it rotated")
 			}
 		})
 	}
@@ -117,29 +132,41 @@ func TestServerRollKeepsTheAdminCredentialValid(t *testing.T) {
 	})
 
 	for _, tc := range []struct {
-		name   string
-		staged []byte
+		name  string
+		plant func(f *fakeSystem, path string, staged []byte)
 	}{
-		{"a malformed staged token", []byte("k3sm-x,admin,admin-uid,\"system:masters\"\n")},
-		{"an empty staged token", []byte("\n")},
+		{"a malformed staged token", func(f *fakeSystem, path string, _ []byte) {
+			f.putFile(path, []byte("k3sm-x,admin,admin-uid,\"system:masters\"\n"))
+		}},
+		{"an empty staged token", func(f *fakeSystem, path string, _ []byte) { f.putFile(path, []byte("\n")) }},
+		{"a missing staged token", func(f *fakeSystem, path string, _ []byte) { delete(f.files, path) }},
+		{"a symlink in place of the staged token", func(f *fakeSystem, path string, _ []byte) { f.putSymlink(path) }},
+		{"a staged token owned by another user", func(f *fakeSystem, path string, _ []byte) {
+			f.putOwned(path, 501, 20, 0o600, EntryRegular)
+		}},
+		{"a group-writable staged token", func(f *fakeSystem, path string, _ []byte) {
+			f.putOwned(path, 271, 271, 0o620, EntryRegular)
+		}},
+		{"a staged token larger than a token can be", func(f *fakeSystem, path string, staged []byte) {
+			f.putFile(path, append(bytes.Repeat([]byte(" "), maxAdminTokenFile), staged...))
+		}},
 	} {
-		t.Run(tc.name+" is not carried: the update mints one", func(t *testing.T) {
-			f, first, _ := firstServer(t)
+		t.Run(tc.name+" is not carried: the update mints one and reports it", func(t *testing.T) {
+			f, first, staged := firstServer(t)
 			path := first.withDefaults().serverTokenPath()
-			f.putFile(path, tc.staged)
-			cfg, err := ResolveInPlace(f, inPlace(first), alice)
-			if err != nil {
-				t.Fatalf("ResolveInPlace = %v", err)
-			}
-			if cfg.AdminToken != "" {
-				t.Fatal("a staged value that is not a minted admin token was carried")
-			}
-			if err := Install(context.Background(), f, cfg); err != nil {
-				t.Fatalf("the in-place server install: %v", err)
-			}
+			beforeTok, _ := adminCredential(t, f)
+			tc.plant(f, path, staged)
+			res := update(t, f, inPlace(first))
+			delete(f.kinds, path) // read back what the install staged over the plant
 			tok, _ := adminCredential(t, f)
+			if tok == beforeTok {
+				t.Error("an untrusted staged token was carried into the admin kubeconfig")
+			}
 			if !mintedAdminToken.MatchString(tok) || string(bytes.TrimSpace(f.files[path])) != tok {
 				t.Error("the update did not mint and stage a fresh admin token in lockstep with the kubeconfig")
+			}
+			if !res.AdminTokenRotated {
+				t.Error("the update minted a new admin token without reporting the rotation")
 			}
 		})
 	}

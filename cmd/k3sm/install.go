@@ -102,8 +102,16 @@ func runInstall(args []string) error {
 	}
 	// Only an install --start over a stopped node calls it: the uncordon.
 	cfg.MarkNode = nodeMarker(sys, install.DefaultDataRoot)
-	return install.Install(ctx, sys, cfg)
+	res, err := install.InstallWithResult(ctx, sys, cfg)
+	if res.AdminTokenRotated {
+		fmt.Fprintln(os.Stderr, adminTokenRotatedNote)
+	}
+	return err
 }
+
+// adminTokenRotatedNote is the one line an in-place update prints when it
+// could not keep the installed admin token and minted a new one.
+const adminTokenRotatedNote = "k3sm: the installed admin token could not be kept (missing, corrupt or untrusted), so a new one was minted: copy the admin kubeconfig again to every other Mac or tool that uses it"
 
 // inPlace reports the in-place update shape: --from-staging with no role flag
 // (--agent, --server-join) and no --token-file, the argv the k3sm-netd root

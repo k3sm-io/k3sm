@@ -1617,3 +1617,52 @@ func TestEnsureRunDirAppliesTheRunRow(t *testing.T) {
 		t.Errorf("gid = %d, want the run row's %d", st.Gid, row.GID)
 	}
 }
+
+// TestReadOwnedRegularFileOnDisk is the on-disk half of the admin-token carry's
+// read: the owner and mode come from the descriptor read, a symlink and a fifo
+// are refused as non-regular (the fifo without parking the open), and a file
+// past the limit is refused.
+func TestReadOwnedRegularFileOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	tok := filepath.Join(dir, "token")
+	if err := os.WriteFile(tok, []byte("k3sm-tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("a regular file reports its owner and mode", func(t *testing.T) {
+		b, e, err := readOwnedRegularFile(tok, 256)
+		if err != nil {
+			t.Fatalf("readOwnedRegularFile = %v", err)
+		}
+		if string(b) != "k3sm-tok\n" || e.UID != os.Getuid() || e.Mode != 0o600 || e.Kind != EntryRegular {
+			t.Errorf("read %q as %+v, want the content, uid %d, mode 0600, regular", b, e, os.Getuid())
+		}
+	})
+	t.Run("a symlink is refused", func(t *testing.T) {
+		link := filepath.Join(dir, "link")
+		if err := os.Symlink(tok, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := readOwnedRegularFile(link, 256); !errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("readOwnedRegularFile(symlink) = %v, want ErrNotRegularFile", err)
+		}
+	})
+	t.Run("a fifo is refused without blocking", func(t *testing.T) {
+		fifo := filepath.Join(dir, "fifo")
+		if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := readOwnedRegularFile(fifo, 256); !errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("readOwnedRegularFile(fifo) = %v, want ErrNotRegularFile", err)
+		}
+	})
+	t.Run("a file past the limit is refused", func(t *testing.T) {
+		if _, _, err := readOwnedRegularFile(tok, 4); err == nil {
+			t.Error("readOwnedRegularFile read a file larger than its limit")
+		}
+	})
+	t.Run("a missing file keeps the not-exist contract", func(t *testing.T) {
+		if _, _, err := readOwnedRegularFile(filepath.Join(dir, "absent"), 256); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("readOwnedRegularFile(absent) = %v, want fs.ErrNotExist", err)
+		}
+	})
+}
