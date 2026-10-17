@@ -25,94 +25,76 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
-// TestExitTimeOutCoversTheDaemonTeardown is the drift alarm on the one number that
-// decides whether a stopping daemon finishes or is SIGKILLed mid-teardown.
+// TestExitTimeOutCoversTheDaemonTeardown is the drift alarm on the budget table
+// itself: that it names every step TestExitTimeOutCoversEveryTeardownStep
+// expects, at the same bound and on the same lane; that the step owned by an
+// importable package matches its owner; and that the derivation reaches the
+// rendered plists.
 //
-// Every stage a k3sm daemon runs on its way out happens inside the plist's single
-// ExitTimeOut, and the stages are owned by four different packages. The arithmetic
-// is therefore asserted rather than assumed: if a stage's bound grows and this
-// number does not, launchd starts killing the daemon part-way through its own
-// shutdown — which orphans kine and the apiserver on the server path, and a vm host
-// helper on either, the exact failure the teardown exists to prevent.
+// The server's two longest stretches, the node lane (the embedded runtime's close
+// first) and the control-plane lane (the node drain, the ingest registry's
+// teardown and the control-plane stop), do not queue: the node starts the
+// control-plane lane from its own teardown and closes the runtime while it runs
+// (cmd/k3sm/exitoverlap.go), so the pair costs the LONGER of them. The cases
+// below assert that as an invariant rather than as arithmetic.
 //
-// The server's two longest stages — the embedded runtime's close and the
-// control-plane stop, the latter preceded by the drain that lets the node's own
-// loops finish writing — no longer queue: the node starts the stop from its own
-// teardown and closes the runtime while that runs (cmd/k3sm/exitoverlap.go), so the
-// pair costs the LARGER of them. That is the one structural change to this budget
-// since it was first derived, and the case below asserts it as an invariant (the
-// pair's budget covers each of them) rather than as the subtraction the serial
-// model used.
-//
-// HONEST SCOPE. The "at least the sum" assertion is structural today — the
-// ExitTimeOut is computed from those same stages, so it cannot currently fail; it
-// is here because it is the invariant the derivation exists to satisfy, and it is
-// what fails first the day someone sets the plists' value by hand again. The
-// assertions that can actually go red are the ones binding a stage LITERAL to the
-// owner of that bound: executor.StopBound here, and — for runtimed's two, which
-// are unexported — hack/acceptance/B253.sh, which reads them out of the runtimed
-// module and compares. Three stages have no gate at all: runtimedSocketShutdownGrace,
-// controlPlaneStopWaitMargin and nodeDrainGrace all live in package main.
+// HONEST SCOPE. The assertions that can go red on a moved owner are the one
+// binding the control-plane step to executor.StopBound here, and, for runtimed's
+// two unexported constants, hack/acceptance/B253.sh. The steps whose owners live
+// in package main are bound only by the expected list in the other test, which a
+// reader keeps in step with cmd/k3sm by hand.
 func TestExitTimeOutCoversTheDaemonTeardown(t *testing.T) {
 	// launchd's own default, stated so the "> 20" assertions below read as the
 	// claim they are: the default is a SIGKILL deadline k3sm cannot live inside.
 	const launchdDefaultExitTimeOut = 20
 
-	// The binding assertion: the control-plane stage is a literal in the budget
+	// The binding assertion: the control-plane step is a literal in the budget
 	// table, and this is what makes it track the package that owns the bound.
 	if got, want := teardownControlPlane, int(executor.StopBound/time.Second); got != want {
-		t.Errorf("the control-plane teardown stage budgets %ds, but executor.StopBound is %ds — raise the stage (and re-read the whole budget) or the daemon is SIGKILLed mid-stop", got, want)
+		t.Errorf("the control-plane teardown step budgets %ds, but executor.StopBound is %ds — raise the step (and re-read the whole budget) or the daemon is SIGKILLed mid-stop", got, want)
 	}
 
-	cases := []struct {
+	// The literal the shell gates fall back on is the derivation's value.
+	if serverExitTimeOutSeconds != serverExitTimeOut {
+		t.Errorf("serverExitTimeOutSeconds = %d, but the derived server ExitTimeOut is %ds; the shell gates' fallback would size their waits wrong", serverExitTimeOutSeconds, serverExitTimeOut)
+	}
+
+	for _, tc := range []struct {
 		name   string
 		got    int
-		stages []struct {
-			name  string
-			bound int
-		}
+		table  []teardownStep
+		expect []expectedTeardownStep
 	}{
-		{
-			name: "io.k3sm.server",
-			got:  serverExitTimeOut,
-			stages: []struct {
-				name  string
-				bound int
-			}{
-				{"runtimed close + node drain/control-plane stop, CONCURRENT (the larger of them)", serverConcurrentTeardown},
-				{"runtimed control socket (runtimedSocketShutdownGrace)", teardownControlSocket},
-				{"mesh teardown (meshTeardownTimeout)", teardownMesh},
-				{"launchd signal/reap headroom", teardownHeadroom},
-			},
-		},
-		{
-			// A worker runs no control plane, so it has nothing to overlap the
-			// runtime close with — it still embeds a runtime with vm guests to stop.
-			name: "io.k3sm.agent",
-			got:  agentExitTimeOut,
-			stages: []struct {
-				name  string
-				bound int
-			}{
-				{"runtimed close (vmShutdownBound + defaultCloseGrace)", teardownRuntimedClose},
-				{"runtimed control socket (runtimedSocketShutdownGrace)", teardownControlSocket},
-				{"mesh teardown (meshTeardownTimeout)", teardownMesh},
-				{"launchd signal/reap headroom", teardownHeadroom},
-			},
-		},
-	}
-
-	for _, tc := range cases {
+		{"io.k3sm.server", serverExitTimeOut, serverTeardownSteps, expectedServerTeardown},
+		{"io.k3sm.agent", agentExitTimeOut, agentTeardownSteps, expectedAgentTeardown},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sum := 0
-			var named []string
-			for _, s := range tc.stages {
-				sum += s.bound
-				named = append(named, fmt.Sprintf("%s=%ds", s.name, s.bound))
+			// The table and the expected account name the same steps, one each, at
+			// the same bound on the same lane.
+			byName := map[string]teardownStep{}
+			for _, s := range tc.table {
+				if _, dup := byName[s.name]; dup {
+					t.Errorf("the budget table names %q twice", s.name)
+				}
+				byName[s.name] = s
 			}
-			if tc.got < sum {
-				t.Errorf("ExitTimeOut = %ds, but the teardown needs at least %ds (%s) — launchd would SIGKILL the daemon mid-stop",
-					tc.got, sum, strings.Join(named, " + "))
+			for _, e := range tc.expect {
+				s, ok := byName[e.name]
+				switch {
+				case !ok:
+					t.Errorf("the budget table has no step %q (%ds); a step it does not name is a step launchd may SIGKILL", e.name, e.bound)
+				case s.bound != e.bound || int(s.lane) != e.lane:
+					t.Errorf("the budget table budgets %q at %ds on lane %d, want %ds on lane %d", e.name, s.bound, s.lane, e.bound, e.lane)
+				}
+				delete(byName, e.name)
+			}
+			for name := range byName {
+				t.Errorf("the budget table names %q, which the expected account does not; add it there too", name)
+			}
+
+			// The derivation covers its own table, rounded up, and is worth setting.
+			if need := teardownBudget(tc.table); tc.got < need || tc.got%10 != 0 || tc.got-need >= 10 {
+				t.Errorf("ExitTimeOut = %ds for a %ds budget, want that budget rounded up to the next multiple of ten", tc.got, need)
 			}
 			if tc.got <= launchdDefaultExitTimeOut {
 				t.Errorf("ExitTimeOut = %ds, which is not above launchd's %ds default; the plist would be setting nothing worth setting",
@@ -121,30 +103,28 @@ func TestExitTimeOutCoversTheDaemonTeardown(t *testing.T) {
 		})
 	}
 
-	// The overlap invariant, and the whole reason the server's budget is no longer
-	// the sum: ONE stage is shared by two teardowns that run at the same time, so it
-	// must cover each of them on its own. A stage that outgrew it would be cut off
-	// by launchd with the other one still draining.
-	if serverConcurrentTeardown < teardownRuntimedClose {
-		t.Errorf("the concurrent stage budgets %ds but the runtimed close alone costs %ds", serverConcurrentTeardown, teardownRuntimedClose)
+	// The overlap invariant, and the whole reason the server's budget is not the
+	// sum of its steps: the two lanes run at the same time, so the budget must
+	// cover each of them on its own, and must be less than paying for both.
+	lane := func(steps []teardownStep, l teardownLane) int {
+		n := 0
+		for _, s := range steps {
+			if s.lane == l {
+				n += s.bound
+			}
+		}
+		return n
 	}
-	if want := teardownNodeDrain + teardownControlPlane + teardownStopWaitMargin; serverConcurrentTeardown < want {
-		t.Errorf("the concurrent stage budgets %ds but the control-plane stop costs %ds — its node drain, its own bound and the wait margin", serverConcurrentTeardown, want)
+	node, cp, after := lane(serverTeardownSteps, laneNode), lane(serverTeardownSteps, laneControlPlane), lane(serverTeardownSteps, laneAfterWait)
+	if b := teardownBudget(serverTeardownSteps); b < node+after || b < cp+after {
+		t.Errorf("the server budget is %ds but its node lane costs %ds and its control-plane lane %ds, each before the %ds after the wait", b, node, cp, after)
 	}
-
-	// The server's budget must exceed the agent's by exactly what its extra,
-	// OVERLAPPED stage adds beyond the close the agent already pays for — 0 while
-	// the runtimed close is the longer of the two. A future stage added to one role
-	// only would otherwise be easy to add to the wrong budget.
-	if want := serverConcurrentTeardown - teardownRuntimedClose; serverTeardownBudget-agentTeardownBudget != want {
-		t.Errorf("the server budget exceeds the agent's by %ds, want exactly what the overlapped control-plane stop adds (%ds)",
-			serverTeardownBudget-agentTeardownBudget, want)
+	if b := teardownBudget(serverTeardownSteps); b >= node+cp+after {
+		t.Errorf("the server budget is %ds, no better than the %ds a SERIAL teardown needs; the two lanes are not being overlapped", b, node+cp+after)
 	}
-	// And the claim that makes the overlap worth having: the server no longer pays
-	// for both stages end to end.
-	if serial := teardownRuntimedClose + teardownControlPlane + teardownControlSocket + teardownMesh + teardownHeadroom; serverTeardownBudget >= serial {
-		t.Errorf("the server budget is %ds, no better than the %ds a SERIAL teardown needs — the two long stages are not being overlapped",
-			serverTeardownBudget, serial)
+	// A worker has no control-plane lane at all.
+	if n := lane(agentTeardownSteps, laneControlPlane); n != 0 {
+		t.Errorf("the agent's table budgets %ds on a control-plane lane a worker never runs", n)
 	}
 
 	// The rendered plists are what launchd reads, so the derivation is worth

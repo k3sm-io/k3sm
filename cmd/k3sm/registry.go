@@ -42,6 +42,18 @@ const (
 	registryAdvertiseRefresh = 5 * time.Minute
 	// registryRetractGrace bounds the best-effort retraction at shutdown.
 	registryRetractGrace = 5 * time.Second
+	// registryTeardownMargin is the slack on registryTeardownBound past the sum
+	// of its steps' own graces: the aux goroutines' drain before the
+	// retractions, and scheduling on a Mac stopping everything at once. Without
+	// it a teardown that used every grace to the full would be cut off.
+	registryTeardownMargin = 5 * time.Second
+	// registryTeardownBound is the whole teardown startIngestRegistry returns:
+	// the advertisement's retraction, the cluster Service's retraction, then the
+	// child's stop, run in that order, plus the margin. It is the bound the
+	// control-plane stop waits on the teardown for (controlPlaneStopper.precede)
+	// and the backstop's wait ends by (sharedStage), and pkg/install budgets the
+	// same steps in the launchd ExitTimeOut.
+	registryTeardownBound = 2*registryRetractGrace + registryShutdownGrace + registryTeardownMargin
 )
 
 // registryService is the lifetime seam `k3sm server` drives the node-local ingest

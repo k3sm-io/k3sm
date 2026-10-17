@@ -95,7 +95,7 @@ safe: it finishes an interrupted stop, and does nothing on a stopped node.
 On a server this stops the cluster's control plane: joined workers lose it
 until 'sudo k3sm start'.
 
-Time bound: at most %s on a server (cordon 15s, the node daemon's 60s
+Time bound: at most %s on a server (cordon 15s, the node daemon's 90s
 ExitTimeOut plus 15s for launchd, RemoveMesh 15s, pod grace 10s, vm helpers
 5s, netd 30s); a worker's is no longer. The stop is cut off at that bound
 plus 30s, or by SIGINT, SIGTERM or SIGHUP; it then exits naming what it left

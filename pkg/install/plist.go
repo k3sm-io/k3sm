@@ -247,51 +247,79 @@ func ServerPlist(cfg Config) []byte {
 //
 // launchd SIGTERMs the job at `bootout`/`kickstart -k` and SIGKILLs it
 // ExitTimeOut seconds later (its default is 20). Everything a k3sm daemon does on
-// its way out happens inside that ONE number, and each stage's bound is owned by a
+// its way out happens inside that ONE number, and each step's bound is owned by a
 // different package — so a hand-picked literal here is wrong the first time any of
 // them moves, and the failure is silent and bad: a SIGKILL mid-stop orphans
 // exactly the children the stop exists to reap (kine and the apiserver on the
-// server path, a vm host helper on either).
+// server path, the ingest registry's zot child on a server with one, a vm host
+// helper on either).
 //
-// The stages, each with the symbol that owns its bound:
+// A stopping server runs its deferred steps on two lanes at once:
 //
+//	NODE LANE, on the daemon's own goroutine, one step after another:
 //	runtimed close     37s  vmShutdownBound (35s) + defaultCloseGrace (2s), both
 //	                        runtimed pkg/runtime/close.go — the embedded runtime's
 //	                        concurrent vm-helper stop, deferred by startNode.
-//	control-plane stop 40s  executor.StopBound (30s) — four components drained
-//	                        serially at drainGrace each, plus the post-SIGKILL reap
-//	                        — plus the 5s outer margin runServer's WAIT for it adds
-//	                        (cmd/k3sm's controlPlaneStopWaitMargin), plus the 5s the
-//	                        stop waits for the node's own loops to drain first
-//	                        (cmd/k3sm's nodeDrainGrace), so the apiserver does not go
-//	                        away under a run loop still publishing status. SERVER
-//	                        ONLY: a worker runs no control plane.
-//	                        It runs CONCURRENTLY with the runtimed close above (the
-//	                        node starts the server's stop from its own teardown —
-//	                        cmd/k3sm/exitoverlap.go), so the two together cost the
-//	                        LARGER of them, never their sum.
-//	control socket      5s  runtimedSocketShutdownGrace, cmd/k3sm/runtimedsocket.go.
-//	mesh teardown       5s  meshTeardownTimeout, cmd/k3sm/agent.go — both roles.
+//	node update stop    2s  nodeUpdateStopGrace, cmd/k3sm/nodeupdate.go — the
+//	                        managed-update watcher, which mid-install is blocked on
+//	                        the root helper's stream and is left there.
+//	runtimed socket     5s  runtimedSocketShutdownGrace, cmd/k3sm/runtimedsocket.go.
+//	update controller  30s  updateControllerStopWait, cmd/k3sm/serverphases.go —
+//	                        SERVER ONLY, inside the operators' stop.
+//	(drains)            0s  every other deferred stop of startNode and runServer
+//	                        (the interconnect handlers, the heartbeat watch, the
+//	                        svclb hoster, the event broadcaster, the interconnect
+//	                        resolver, the MLX operator, the provisioner, the etcd
+//	                        admin client, the manifest directory, the helm
+//	                        controller, the add-on regate) and the registry's
+//	                        deferred backstop, whose wait for the early run ends
+//	                        by that run's own bound, inside the control-plane
+//	                        lane's window: each cancels its
+//	                        context and waits for a goroutine that returns on it,
+//	                        so none has a bound of its own. Each is still a named
+//	                        step in serverTeardownSteps, at 0, so the day one of
+//	                        them can block it is a line that has to change.
+//
+//	CONTROL-PLANE LANE, begun by the node's teardown (cmd/k3sm/exitoverlap.go) and
+//	waited for by runServer once the node lane reaches it — SERVER ONLY:
+//	node drain          5s  nodeDrainGrace — the node's loops finish their last
+//	                        apiserver writes before anything below begins.
+//	registry teardown  25s  the ingest registry's teardown, cmd/k3sm/registry.go:
+//	                        two best-effort retractions at registryRetractGrace (5s)
+//	                        each, then the zot child's stop at registryShutdownGrace
+//	                        (10s), within registryTeardownBound, which adds
+//	                        registryTeardownMargin (5s). It runs HERE, before the control plane goes, so
+//	                        the child is stopped in the first seconds of the exit
+//	                        rather than last, and the retractions still have an
+//	                        apiserver to land on.
+//	control-plane stop 30s  executor.StopBound — four components drained serially,
+//	                        plus the post-SIGKILL reap.
+//	wait margin         5s  controlPlaneStopWaitMargin, the slack on runServer's
+//	                        wait for this lane.
+//
+//	AFTER THE WAIT, both roles:
+//	mesh teardown       5s  meshTeardownTimeout, cmd/k3sm/agent.go.
 //	headroom           10s  launchd's own signal/reap latency and the log flush.
 //
-// Every bound is a LITERAL here so the table above can be read in one place, and
-// each literal is bound back to its owner by a test rather than by trust:
-// TestExitTimeOutCoversTheDaemonTeardown compares the control-plane stage with
-// executor.StopBound (the one owner this package can import), and
-// hack/acceptance/B253.sh's CI tier reads runtimed's two constants out of its
-// module and compares them with the close stage. The three stages whose owners live
-// in package main (runtimedSocketShutdownGrace, controlPlaneStopWaitMargin and
-// nodeDrainGrace) have no importable owner and no gate — 15s of a 60s budget
-// between them, and the headroom absorbs a drift in any of them.
+// So the server's budget is the LONGER of the two lanes, plus the steps after the
+// wait: max(37+2+5+30, 5+25+30+5) + 5 + 10 = 89s. A worker runs no control plane,
+// no ingest registry and no operators, so its budget is its node lane alone:
+// 37+2+5+5+10 = 59s.
+//
+// Every bound is a LITERAL here so the table can be read in one place. Two are
+// bound back to their owners by more than trust: TestExitTimeOutCoversTheDaemonTeardown
+// compares the control-plane step with executor.StopBound (the one owner this
+// package can import), and hack/acceptance/B253.sh's CI tier reads runtimed's two
+// constants out of its module and compares them with the close step. The steps
+// whose owners live in package main have no importable owner and no gate; the
+// headroom absorbs a small drift in any of them.
 //
 // The sums are rounded UP to the next multiple of ten, because an ExitTimeOut is
-// read by operators in a plist and 60 is legible where 57 invites the question of
-// what the 7 was for. Rounding up can only add headroom.
+// read by operators in a plist and 90 is legible where 89 invites the question of
+// what the 9 was for. Rounding up can only add headroom.
 //
-// Both roles land on the same 60s today, and that is a RESULT, not a coincidence
-// to lean on: the server's extra stage is overlapped with the runtimed close, so
-// only the 3s by which it now exceeds that close reaches the total, and the
-// rounding absorbs them.
+// A changed ExitTimeOut reaches a Mac only through the plist launchd reads, so it
+// takes effect at the next `k3sm install` (or managed update), not at a restart.
 const (
 	teardownRuntimedClose = 37
 	teardownControlSocket = 5
@@ -300,37 +328,132 @@ const (
 	teardownHeadroom      = 10
 
 	// teardownStopWaitMargin is the slack runServer's WAIT for the control-plane
-	// stop adds on top of that stop's own budget — cmd/k3sm's
+	// lane adds on top of that lane's own steps — cmd/k3sm's
 	// controlPlaneStopWaitMargin, which lives in package main and so, like
 	// runtimedSocketShutdownGrace, cannot be imported and asserted here.
 	teardownStopWaitMargin = 5
-	// teardownNodeDrain is how long the control-plane stop waits, before it starts
+	// teardownNodeDrain is how long the control-plane lane waits, before it starts
 	// at all, for the node's Virtual Kubelet and status loops to return —
-	// cmd/k3sm's nodeDrainGrace, another package-main bound. It is part of the
-	// concurrent stage rather than a stage of its own: it is spent inside the same
-	// window the runtimed close occupies.
+	// cmd/k3sm's nodeDrainGrace, another package-main bound.
 	teardownNodeDrain = 5
 
-	// serverConcurrentTeardown is the cost of the server's two LONGEST stages,
-	// which overlap rather than queue: the node starts the control-plane stop at
-	// the very beginning of its own teardown and closes its embedded runtime while
-	// that stop drains (cmd/k3sm/exitoverlap.go). They contend for nothing — vm
-	// host helpers on one side, control-plane children on the other — so the budget
-	// is the larger of the two, and the day either one grows past the other this
-	// arithmetic follows it without being re-chosen. The control-plane side counts
-	// its own drain wait, because the clock on it starts when the node's teardown
-	// does, not when the stop finally begins.
-	serverConcurrentTeardown = max(teardownRuntimedClose, teardownNodeDrain+teardownControlPlane+teardownStopWaitMargin)
+	// The ingest registry's teardown, step by step (cmd/k3sm/registry.go): the
+	// advertisement's retraction and the cluster Service's retraction, each at
+	// registryRetractGrace, then the child's stop at registryShutdownGrace, and
+	// the margin registryTeardownBound adds over their sum.
+	teardownRegistryAdvertRetract  = 5
+	teardownRegistryServiceRetract = 5
+	teardownRegistryChildStop      = 10
+	teardownRegistryMargin         = 5
 
-	serverTeardownBudget = serverConcurrentTeardown + teardownControlSocket + teardownMesh + teardownHeadroom
-	agentTeardownBudget  = teardownRuntimedClose + teardownControlSocket + teardownMesh + teardownHeadroom
+	// teardownNodeUpdate is cmd/k3sm's nodeUpdateStopGrace: the most the node's
+	// teardown waits for the managed-update watcher.
+	teardownNodeUpdate = 2
+	// teardownUpdateController is cmd/k3sm's updateControllerStopWait: the most
+	// the server's operator drain waits for the update controller.
+	teardownUpdateController = 30
+)
 
-	// serverExitTimeOut is the io.k3sm.server plist's ExitTimeOut: every stage
+// teardownLane is where a deferred step runs relative to the others; see the
+// budget table above.
+type teardownLane int
+
+const (
+	// laneNode is the daemon's own goroutine, up to its wait for the
+	// control-plane lane.
+	laneNode teardownLane = iota
+	// laneControlPlane is the server's control-plane lane, concurrent with
+	// laneNode.
+	laneControlPlane
+	// laneAfterWait is the daemon's own goroutine after that wait.
+	laneAfterWait
+)
+
+// teardownStep is one deferred step of a stopping daemon: the step and the
+// symbol owning its bound, the bound in seconds, and its lane.
+type teardownStep struct {
+	name  string
+	bound int
+	lane  teardownLane
+}
+
+// serverTeardownSteps is every deferred step of a stopping `k3sm server`, in the
+// order each lane runs them. TestExitTimeOutCoversEveryTeardownStep names each
+// step it expects and checks the plist's ExitTimeOut covers them.
+var serverTeardownSteps = []teardownStep{
+	{"runtimed close (vmShutdownBound + defaultCloseGrace)", teardownRuntimedClose, laneNode},
+	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
+	{"node interconnect handlers stop (context drain)", 0, laneNode},
+	{"heartbeat watch stop (context drain)", 0, laneNode},
+	{"svclb hoster stop (context drain)", 0, laneNode},
+	{"runtimed control socket (runtimedSocketShutdownGrace)", teardownControlSocket, laneNode},
+	{"event broadcaster shutdown (non-blocking)", 0, laneNode},
+	{"update controller stop (updateControllerStopWait)", teardownUpdateController, laneNode},
+	{"interconnect resolver stop (context drain)", 0, laneNode},
+	{"mlx operator stop (context drain)", 0, laneNode},
+	{"local-path provisioner stop (context drain)", 0, laneNode},
+	{"etcd admin client close", 0, laneNode},
+	{"ingest registry backstop (waits out the early run within its bound)", 0, laneNode},
+	{"manifest directory stop (context drain)", 0, laneNode},
+	{"helm controller stop (context drain)", 0, laneNode},
+	{"add-on regate stop (context drain)", 0, laneNode},
+
+	{"node drain (nodeDrainGrace)", teardownNodeDrain, laneControlPlane},
+	{"ingest registry advertisement retract (registryRetractGrace)", teardownRegistryAdvertRetract, laneControlPlane},
+	{"ingest registry Service retract (registryRetractGrace)", teardownRegistryServiceRetract, laneControlPlane},
+	{"ingest registry child stop (registryShutdownGrace)", teardownRegistryChildStop, laneControlPlane},
+	{"ingest registry teardown margin (registryTeardownMargin)", teardownRegistryMargin, laneControlPlane},
+	{"control-plane stop (executor.StopBound)", teardownControlPlane, laneControlPlane},
+	{"control-plane wait margin (controlPlaneStopWaitMargin)", teardownStopWaitMargin, laneControlPlane},
+
+	{"mesh teardown (meshTeardownTimeout)", teardownMesh, laneAfterWait},
+	{"launchd signal/reap headroom", teardownHeadroom, laneAfterWait},
+}
+
+// agentTeardownSteps is every deferred step of a stopping `k3sm agent`: its
+// node's, then its mesh teardown. It has no control-plane lane.
+var agentTeardownSteps = []teardownStep{
+	{"runtimed close (vmShutdownBound + defaultCloseGrace)", teardownRuntimedClose, laneNode},
+	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
+	{"node interconnect handlers stop (context drain)", 0, laneNode},
+	{"heartbeat watch stop (context drain)", 0, laneNode},
+	{"svclb hoster stop (context drain)", 0, laneNode},
+	{"runtimed control socket (runtimedSocketShutdownGrace)", teardownControlSocket, laneNode},
+	{"event broadcaster shutdown (non-blocking)", 0, laneNode},
+
+	{"mesh teardown (meshTeardownTimeout)", teardownMesh, laneAfterWait},
+	{"launchd signal/reap headroom", teardownHeadroom, laneAfterWait},
+}
+
+// teardownBudget is the seconds a step list needs: the longer of the two
+// concurrent lanes, then the steps after the wait.
+func teardownBudget(steps []teardownStep) int {
+	var lanes [3]int
+	for _, s := range steps {
+		lanes[s.lane] += s.bound
+	}
+	return max(lanes[laneNode], lanes[laneControlPlane]) + lanes[laneAfterWait]
+}
+
+// roundUpToTen rounds a budget up to the next multiple of ten (see above).
+func roundUpToTen(seconds int) int { return ((seconds + 9) / 10) * 10 }
+
+// serverExitTimeOutSeconds is serverExitTimeOut written out as a literal, for
+// the shell gates that cannot run the derivation: hack/acceptance/B253.sh and
+// hack/acceptance/status.sh read it as their fallback when the installed plist
+// cannot be read, and b253.1 pins the line. TestExitTimeOutCoversTheDaemonTeardown
+// binds it to the derivation.
+//
+//lint:ignore U1000 read by the shell gates, not by Go; the test binds it to the derivation.
+const serverExitTimeOutSeconds = 90
+
+var (
+	// serverExitTimeOut is the io.k3sm.server plist's ExitTimeOut: every step
 	// above, rounded up to the next multiple of ten.
-	serverExitTimeOut = ((serverTeardownBudget + 9) / 10) * 10
-	// agentExitTimeOut is the io.k3sm.agent plist's, on the same derivation minus
-	// the control-plane stop a worker never runs.
-	agentExitTimeOut = ((agentTeardownBudget + 9) / 10) * 10
+	serverExitTimeOut = roundUpToTen(teardownBudget(serverTeardownSteps))
+	// agentExitTimeOut is the io.k3sm.agent plist's, on the same derivation over
+	// the agent's steps.
+	agentExitTimeOut = roundUpToTen(teardownBudget(agentTeardownSteps))
 )
 
 // agentThrottleInterval is launchd's minimum seconds between spawns of the

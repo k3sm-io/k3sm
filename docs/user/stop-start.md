@@ -96,7 +96,7 @@ Other exit codes: 1 for a refusal or failure before anything was stopped, 2 for 
 
 ## Time Bound
 
-A server stop takes at most 150 seconds: the cordon (15), the node daemon's unload (75), the mesh
+A server stop takes at most 180 seconds: the cordon (15), the node daemon's unload (105), the mesh
 removal (15), pod grace (10), VM helpers (5) and the network helper (30). A worker's stop is never
 longer. The command is cut off 30 seconds after that bound, or by `SIGINT`, `SIGTERM` or `SIGHUP`,
 and then exits naming what it left. Re-running it converges.

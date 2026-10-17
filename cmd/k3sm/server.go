@@ -607,28 +607,28 @@ func runServer(args []string) (err error) {
 		return err
 	}
 	stopAddons := startEmbeddedAddons(ctx, plan, restCfg, cs, logger)
-	defer stopAddons()
+	defer timedTeardownStep(logger, "add-on-regate", stopAddons)
 	// 3c''/3c'. Each stop drains before exec.Stop's defer (LIFO runs it first).
 	stopHelm := startHelmController(ctx, plan, restCfg, cs, logger)
-	defer stopHelm()
+	defer timedTeardownStep(logger, "helm-controller", stopHelm)
 	stopManifests := startManifestDir(ctx, restCfg, cs, logger)
-	defer stopManifests()
+	defer timedTeardownStep(logger, "manifest-dir", stopManifests)
 	vmCapable := vmBackendAvailable() // can this node host vm guests? (3d registry, 4c datapath)
-	// 3d. The ingest registry; torn down BEFORE the control plane (LIFO).
-	stopRegistry, registryPuller := startServerRegistry(ctx, plan, cs, vmCapable, logger)
-	defer stopRegistry()
+	// 3d. The ingest registry; torn down EARLY, on cpStop's lane, and the defer is its backstop.
+	stopRegistry, registryPuller := startServerRegistry(ctx, plan, cs, vmCapable, cpStop, logger)
+	defer timedTeardownStep(logger, "ingest-registry-backstop", stopRegistry)
 	net, nodeAddressing, err := startServerDatapath(ctx, plan, restCfg, cs, sm, vmCapable, logger) // 4c. Service proxy + DNS
 	if err != nil {
 		return err
 	}
 	// 4d. The worker-join supervisor; its stop closes the HA etcd admin client.
 	closeEtcdAdmin := startJoinSupervisor(ctx, plan, cs, sm, logger)
-	defer closeEtcdAdmin()
+	defer timedTeardownStep(logger, "etcd-admin-close", closeEtcdAdmin)
 	// 4e/4f. Each stop drains before exec.Stop's defer (LIFO runs it first).
 	stopProvisioner := startProvisioner(ctx, plan, cs, logger)
-	defer stopProvisioner()
+	defer timedTeardownStep(logger, "provisioner", stopProvisioner)
 	mlxGPU, stopOperators := startServerOperators(ctx, plan, restCfg, cs, logger)
-	defer stopOperators()
+	defer timedTeardownStep(logger, "server-operators", stopOperators)
 	if sm.dataPathRefused != nil { // this server's pod range is not its own
 		return parkServerDataPath(ctx, opts, sm.dataPathRefused, logger)
 	}

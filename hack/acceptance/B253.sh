@@ -134,6 +134,8 @@ grep -qE '^\s*teardownRuntimedClose = 37$' "$PLIST_GO" || b=no
 grep -qF 'ExitTimeOut: serverExitTimeOut,' "$PLIST_GO" || b=no
 grep -qF 'ExitTimeOut:      agentExitTimeOut,' "$PLIST_GO" || b=no
 grep -qE '^\s*teardownControlPlane  = 30$' "$PLIST_GO" || b=no
+# The literal the lab tier falls back on when the installed plist cannot be read.
+grep -qE '^const serverExitTimeOutSeconds = [0-9]+$' "$PLIST_GO" || b=no
 # The stage literals are bound to their owners by assertions, not by trust. This
 # one has an importable owner, so the binding lives in the Go test; the rung below
 # is the binding for runtimed's two, which are unexported.
@@ -215,10 +217,16 @@ else
 	# itself, and no more — a helper that outlives it is stranded.
 	# Read from the INSTALLED plist, never from a constant in this checkout: the
 	# rig's daemon is stopping on the budget launchd actually gave it. The fallback
-	# is this tree's derived server value, used only when plutil cannot read it.
+	# is this tree's derived server value (serverExitTimeOutSeconds in plist.go,
+	# pinned by b253.1 and bound to the derivation by a Go test), used only when
+	# plutil cannot read it; with neither, the waits cannot be sized and the tier
+	# stops rather than guess.
 	EXIT_TIMEOUT="$(plutil -extract ExitTimeOut raw -o - "$SERVER_PLIST" 2>/dev/null || true)"
 	case "$EXIT_TIMEOUT" in
-		''|*[!0-9]*) EXIT_TIMEOUT=60 ;;  # this tree's derived serverExitTimeOut, pinned by b253.1
+		''|*[!0-9]*) EXIT_TIMEOUT="$(grep -oE '^const serverExitTimeOutSeconds = [0-9]+$' "$PLIST_GO" | grep -oE '[0-9]+$' || true)" ;;
+	esac
+	case "$EXIT_TIMEOUT" in
+		''|*[!0-9]*) echo "b253.L  cannot size the waits: no ExitTimeOut in $SERVER_PLIST and no serverExitTimeOutSeconds in $PLIST_GO" >&2; exit 1 ;;
 	esac
 	DEADLINE=$((EXIT_TIMEOUT + 10))
 

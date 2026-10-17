@@ -217,9 +217,15 @@ else
 	# teardown stages) plus 10s of margin, read from the INSTALLED plist rather than
 	# from a constant here. A fixed wait shorter than that grace fails a daemon that
 	# was stopping correctly, which is the one verdict these rungs must never give.
+	# The fallback, when plutil cannot read it, is this tree's derived value as
+	# pkg/install/plist.go writes it out (serverExitTimeOutSeconds, bound to the
+	# derivation by a Go test); with neither, the waits cannot be sized, so stop.
 	EXIT_TIMEOUT="$(plutil -extract ExitTimeOut raw -o - "$SERVER_PLIST" 2>/dev/null || true)"
 	case "$EXIT_TIMEOUT" in
-		''|*[!0-9]*) EXIT_TIMEOUT=90 ;;  # this tree's derived serverExitTimeOut
+		''|*[!0-9]*) EXIT_TIMEOUT="$(grep -oE '^const serverExitTimeOutSeconds = [0-9]+$' "$K3SM_ROOT/pkg/install/plist.go" | grep -oE '[0-9]+$' || true)" ;;
+	esac
+	case "$EXIT_TIMEOUT" in
+		''|*[!0-9]*) echo "status: cannot size the teardown waits: no ExitTimeOut in $SERVER_PLIST and no serverExitTimeOutSeconds in pkg/install/plist.go" >&2; exit 1 ;;
 	esac
 	TEARDOWN_DEADLINE=$((EXIT_TIMEOUT + 10))
 	# bootout returns before launchd finishes tearing the job down; a bootstrap

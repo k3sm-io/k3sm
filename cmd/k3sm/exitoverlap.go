@@ -104,6 +104,12 @@ type controlPlaneStopper struct {
 	log       *slog.Logger
 
 	mu sync.Mutex
+	// first is the stage that runs BEFORE the control plane is stopped, on the
+	// stop's own lane (see precede), and firstBound is how long the stop waits
+	// for it. Nil runs the stop alone, which is every stopper but `k3sm
+	// server`'s with an ingest registry.
+	first      func()
+	firstBound time.Duration
 	// begun is claimed by whichever of begin and finish gets there first, so a
 	// hook that fires late (its drain wait outlived a teardown that had already
 	// reached finish) cannot start a second stop over the first.
@@ -128,6 +134,28 @@ func newControlPlaneStopper(base context.Context, stop func(context.Context) err
 	}
 }
 
+// precede registers first as a stage that runs on the control-plane stop's own
+// lane, ahead of the stop, bounded by bound: the stop begins once first returns
+// or bound elapses, whichever is sooner. It must be called before the node's
+// teardown can fire begin, which is why runServer calls it during bring-up.
+//
+// `k3sm server` hands it the ingest registry's teardown. That teardown used to
+// be one of runServer's own defers, so it ran only after the node's whole
+// teardown (the runtime close, every node-side drain) had returned, last of the
+// stages a stopping daemon runs; a teardown that overran launchd's ExitTimeOut
+// was SIGKILLed before it ran, and the registry child, in its own process
+// group, outlived the daemon holding its port. On this lane it runs while the
+// node closes its runtime, in the first seconds of the exit. It also runs while
+// the apiserver is still up, which its two best-effort retractions need.
+func (s *controlPlaneStopper) precede(first func(), bound time.Duration) {
+	if s == nil {
+		return // no control plane to stop ahead of; the owner's own defer runs first
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.first, s.firstBound = first, bound
+}
+
 // begin launches the control-plane stop in the background and returns
 // immediately. It is the nodeOptions.onExitBegin hook `k3sm server` installs, so
 // it runs at the very start of the node's teardown — before the embedded runtime
@@ -141,10 +169,14 @@ func (s *controlPlaneStopper) begin() {
 	s.begun = true
 	done := make(chan error, 1)
 	s.done = done
+	first, firstBound := s.first, s.firstBound
 	s.mu.Unlock()
 
 	s.log.Info("stopping the control plane alongside the node's runtime teardown", "bound", s.bound)
-	go func() { done <- s.runStop() }()
+	go func() {
+		s.runFirst(first, firstBound)
+		done <- s.runStop()
+	}()
 }
 
 // finish completes the control-plane teardown: it waits for a stop begin already
@@ -161,19 +193,114 @@ func (s *controlPlaneStopper) finish() error {
 		// Claim it, so a hook still inside its drain wait finds the work done
 		// rather than starting a second stop behind this one.
 		s.begun = true
+		first, firstBound := s.first, s.firstBound
 		s.mu.Unlock()
+		s.runFirst(first, firstBound)
 		return s.runStop()
 	}
 	done := s.done
+	// The lane began with the preceding stage, so the wait covers that stage's
+	// bound as well as the stop's own.
+	waitBound := s.waitBound + s.firstBound
 	s.mu.Unlock()
 
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(s.waitBound):
+	case <-time.After(waitBound):
 		s.log.Error("the control-plane stop is still running past its wait bound; launchd's ExitTimeOut will reap whatever is left of it",
-			"stage", "control-plane-stop", "still_running", true, "wait_bound", s.waitBound)
-		return fmt.Errorf("%w: control-plane stop still running %s after it began", errControlPlaneStopTimeout, s.waitBound)
+			"stage", "control-plane-stop", "still_running", true, "wait_bound", waitBound)
+		return fmt.Errorf("%w: control-plane stop still running %s after it began", errControlPlaneStopTimeout, waitBound)
+	}
+}
+
+// sharedStage is a teardown stage two exit paths reach: the early run on the
+// control-plane stop's lane (precede) and its owner's deferred backstop, for the
+// exits that never reach the node's teardown. Whichever calls run first runs the
+// stage; a later call WAITS for that run, but only until bound has passed since
+// it began, so the backstop never extends the teardown past the stage's own
+// budget. The wait is what keeps a child that was sent SIGTERM by the early run
+// from being left without its SIGKILL when the process exits right after.
+type sharedStage struct {
+	name  string
+	f     func()
+	bound time.Duration
+	log   *slog.Logger
+
+	mu      sync.Mutex
+	started time.Time
+	done    chan struct{} // nil until the first run begins; closed when it returns
+}
+
+// newSharedStage returns the shared stage for f, bounded by bound.
+func newSharedStage(name string, f func(), bound time.Duration, log *slog.Logger) *sharedStage {
+	return &sharedStage{name: name, f: f, bound: bound, log: log}
+}
+
+// run runs the stage, or waits for the run already under way (see sharedStage).
+func (s *sharedStage) run() {
+	s.mu.Lock()
+	if s.done == nil {
+		done := make(chan struct{})
+		s.done, s.started = done, time.Now()
+		s.mu.Unlock()
+		defer close(done)
+		s.f()
+		return
+	}
+	done, deadline := s.done, s.started.Add(s.bound)
+	s.mu.Unlock()
+	select {
+	case <-done:
+		return
+	default:
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		s.log.Error("teardown stage still running past its bound; not waiting for it again",
+			"stage", s.name, "bound", s.bound)
+		return
+	}
+	s.log.Info("waiting for the teardown stage already under way", "stage", s.name, "remaining", remaining)
+	select {
+	case <-done:
+	case <-time.After(remaining):
+		s.log.Error("teardown stage still running past its bound; continuing shutdown",
+			"stage", s.name, "bound", s.bound)
+	}
+}
+
+// timedTeardownStep runs one deferred teardown step between two Info lines, so
+// a stopping daemon's log names the step it is in and how long each took: a
+// stall shows as a "started" with no "done".
+func timedTeardownStep(log *slog.Logger, step string, f func()) {
+	start := time.Now()
+	log.Info("teardown step started", "step", step)
+	f()
+	log.Info("teardown step done", "step", step, "elapsed", time.Since(start).Round(time.Millisecond))
+}
+
+// runFirst runs the preceding stage and waits for it at most bound. On expiry
+// it says so and returns, leaving the stage running: the control-plane stop
+// behind it has its own budget to keep, and the stage's goroutine ends with the
+// process if not before.
+func (s *controlPlaneStopper) runFirst(first func(), bound time.Duration) {
+	if first == nil {
+		return
+	}
+	start := time.Now()
+	s.log.Info("teardown step started", "step", "before-control-plane-stop")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		first()
+	}()
+	select {
+	case <-done:
+		s.log.Info("teardown step done", "step", "before-control-plane-stop", "elapsed", time.Since(start).Round(time.Millisecond))
+	case <-time.After(bound):
+		s.log.Error("the stage before the control-plane stop is still running past its bound; stopping the control plane anyway",
+			"step", "before-control-plane-stop", "still_running", true, "bound", bound)
 	}
 }
 
@@ -188,7 +315,10 @@ func (s *controlPlaneStopper) runStop() error {
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(base), s.bound)
 	defer cancel()
-	return s.stop(ctx)
+	start := time.Now()
+	err := s.stop(ctx)
+	s.log.Info("teardown step done", "step", "control-plane-stop", "elapsed", time.Since(start).Round(time.Millisecond))
+	return err
 }
 
 // teardownWithConcurrentExit composes the node's teardown: it starts the wait for

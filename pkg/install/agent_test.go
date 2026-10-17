@@ -506,14 +506,17 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		// what they already have, so `k3sm install` on an existing server is still
 		// the no-op-shaped upgrade it was.
 		//
-		// It has moved three times since, each deliberately: the admin token left the argv
+		// It has moved four times since, each deliberately: the admin token left the argv
 		// for a staged file, so the golden shows --token-file and the path (B249,
 		// gated by TestServerPlistCarriesNoToken); and ExitTimeOut fell from 90s to
 		// 60s when the daemon's two longest teardown stages stopped being serial
 		// (B320, gated by TestExitTimeOutCoversTheDaemonTeardown); and the Go
 		// module and build caches were pinned into the work dir once the data
 		// root became root-owned (B397, gated by
-		// TestMeshKeyDirLivesOutsideTheServiceUserRunDir). A render that
+		// TestMeshKeyDirLivesOutsideTheServiceUserRunDir); and ExitTimeOut rose
+		// back to 90s once every deferred teardown step was budgeted, the ingest
+		// registry's and the update controller's among them (B703, gated by
+		// TestExitTimeOutCoversEveryTeardownStep). A render that
 		// moves for any other reason is still the regression this pins.
 		want, err := os.ReadFile(filepath.Join("testdata", "server.plist.golden"))
 		if err != nil {

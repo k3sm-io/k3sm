@@ -55,11 +55,11 @@ func TestServerPhaseStopsAreNeverNil(t *testing.T) {
 		start func() func()
 	}{
 		{"registry disabled (--registry-port 0)", func() func() {
-			stop, _ := startServerRegistry(ctx, serverPlan{opts: serverOptions{registryPort: 0}}, nil, false, logger)
+			stop, _ := startServerRegistry(ctx, serverPlan{opts: serverOptions{registryPort: 0}}, nil, false, nil, logger)
 			return stop
 		}},
 		{"registry failed to build (no work dir)", func() func() {
-			stop, _ := startServerRegistry(ctx, serverPlan{opts: serverOptions{registryPort: 5000}}, nil, false, logger)
+			stop, _ := startServerRegistry(ctx, serverPlan{opts: serverOptions{registryPort: 5000}}, nil, false, nil, logger)
 			return stop
 		}},
 		{"join supervisor disabled (no mesh enroller)", func() func() {
