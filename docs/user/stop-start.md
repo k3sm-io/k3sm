@@ -8,7 +8,7 @@ node out of a cluster without uninstalling it. All three verbs need root.
 |---|---|
 | `sudo k3sm stop` | Stops every k3sm daemon, pod and network change on this Mac, and records the stop. The node stays stopped until you start it. |
 | `sudo k3sm start` | Undoes a stop: brings the network helper and the node daemon back and clears the record. On a node that is already running it restarts nothing: it finishes an uncordon an earlier start ran out of time for, or makes one uncordon attempt. |
-| `sudo k3sm restart` | Restarts the k3sm daemons. Native Pods keep running, but a `vm` Pod is recreated and a container whose shim died loses its logs and exec (see [what survives a restart](limitations.md#what-survives-a-node-daemon-restart)). On a stopped node it refuses; add `--start` to start the node instead. |
+| `sudo k3sm restart` | Restarts the k3sm daemons. Pods keep running, `vm` Pods included, and are re-attached; a container whose shim died loses its logs and exec (see [what survives a restart](limitations.md#what-survives-a-node-daemon-restart)). On a stopped node it refuses; add `--start` to start the node instead. |
 
 Each verb takes `--reason TEXT`, which is recorded in the stop record and in the logs.
 
@@ -20,8 +20,9 @@ In order:
 2. Cordons the Node and annotates it `k3sm.io/stopped-by-user`. This is best effort and bounded
    at 15 seconds, so a stop still completes when the cluster is unreachable.
 3. Disables and stops the node daemon.
-4. Stops every pod: `SIGTERM`, ten seconds of grace, then `SIGKILL`. Linux VM helpers are stopped
-   too.
+4. Stops every pod: `SIGTERM`, ten seconds of grace, then `SIGKILL`. A `vm` Pod's helper gets
+   `SIGTERM`, then its Pod's termination grace plus 8 seconds (at most 45 seconds) to shut its
+   guest down before `SIGKILL`.
 5. Removes the WireGuard mesh.
 6. Removes the addresses k3sm added to `lo0` and to the interconnect, and the pf anchor.
 7. Disables and stops the network helper (`io.k3sm.netd`).
@@ -96,12 +97,13 @@ Other exit codes: 1 for a refusal or failure before anything was stopped, 2 for 
 
 ## Time Bound
 
-A server stop takes at most 180 seconds: the cordon (15), the node daemon's unload (105), the mesh
-removal (15), pod grace (10), VM helpers (5) and the network helper (30). A worker's stop is never
+A server stop takes at most 215 seconds: the cordon (15), the node daemon's unload (95), the mesh
+removal (15), pod grace (10), `vm` Pod grace (45) and any helper it had to kill (5), and the network
+helper (30). A worker's stop is never
 longer. The command is cut off 30 seconds after that bound, or by `SIGINT`, `SIGTERM` or `SIGHUP`,
 and then exits naming what it left. Re-running it converges.
 
-`k3sm start` is cut off after about nine and a half minutes, or by the same signals. The stop record stays
+`k3sm start` is cut off after about eleven minutes, or by the same signals. The stop record stays
 until the daemons are up, so a start that fails leaves the node reported as stopped, and running
 `sudo k3sm start` again is safe.
 
@@ -110,7 +112,7 @@ until the daemons are up, so a start that fails leaves the node reported as stop
 A script that runs `sudo k3sm start`, for example after an upgrade, needs to know how long to
 wait. `k3sm start --print-time-bound` prints the start's cut-off as a whole number of seconds and
 exits 0. It needs no root and does nothing else. The value is the start's
-time bound, which includes the uncordon's 90-second retry window, plus a 30-second margin: 570
+time bound, which includes the uncordon's 90-second retry window, plus a 30-second margin: 675
 seconds today. Wait at least that long before treating a start as stuck.
 
 `sudo k3sm start` exits 1 both when it fails and when the daemons are up but the Node is still

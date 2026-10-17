@@ -18,6 +18,7 @@ package install
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -41,9 +42,9 @@ import (
 // The post-bootout teardown, shared by `k3sm uninstall` and `k3sm stop`.
 //
 // Once the node daemon is booted out, the things still holding k3sm state on
-// the Mac are the same for both verbs: the pod process groups (a daemon restart
-// re-attaches to them, so its shutdown leaves them running on purpose), any
-// k3sm-vmhost helper that outlived its daemon, control-plane children that
+// the Mac are the same for both verbs: the pod process groups and the
+// k3sm-vmhost helpers of vm pods (a daemon restart re-attaches to both, so its
+// shutdown leaves them running on purpose), control-plane children that
 // outlived the server, and the durable kernel state no daemon removes on the
 // way out (the pf anchor an older release loaded, the lo0 aliases, the
 // interconnect aliases on bridge0). One function tears all of it down, in one
@@ -55,13 +56,33 @@ import (
 
 // VMHostRecord is one k3sm-vmhost helper the runtime recorded: its process
 // group and the group leader's kernel start time, the exact-instance identity a
-// kill is matched against. It mirrors the fields of runtimed's vm reap record
-// (sandbox.vmProcRecord) that the teardown needs.
+// signal is matched against, and the grace the helper was spawned with. It
+// mirrors runtimed's vm reap record (sandbox.vmProcRecord), whose JSON names
+// these are; the record is runtimed's, and this is a narrow reader of it.
+//
+// Schema, HelperCDHash, HelperProtocol, RuntimeVersion and BootSession are what
+// a restarted daemon checks before it adopts the helper. The teardown does not
+// adopt, so it only logs them beside the stop; Schema 0 marks a record an
+// earlier runtime wrote, which carries no grace, and its helper is given the
+// helper's own default (sandbox.VMHelperStopWait of 0).
 type VMHostRecord struct {
-	PodID         string `json:"podId"`
-	Pgid          int    `json:"pgid"`
-	StartUnixNano int64  `json:"startUnixNano"`
+	Schema         int    `json:"schema,omitempty"`
+	PodID          string `json:"podId"`
+	Pgid           int    `json:"pgid"`
+	StartUnixNano  int64  `json:"startUnixNano"`
+	StopGraceNanos int64  `json:"stopGraceNanos,omitempty"`
+	HelperCDHash   string `json:"helperCdhash,omitempty"`
+	HelperProtocol int    `json:"helperProtocol,omitempty"`
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	BootSession    string `json:"bootSession,omitempty"`
 }
+
+// vmHelperStopBound bounds the graceful leg of the vm helper stop: every helper
+// is sent SIGTERM at once, and the slowest is waited for at most this long
+// before it is sent SIGKILL. It is runtimed's own bound for a caller that ends
+// every guest on the node (sandbox.VMStopAllBound), so the teardown honours a
+// pod grace exactly as far as the runtime itself would.
+const vmHelperStopBound = sandbox.VMStopAllBound
 
 // vmHostKillWait is how long the teardown waits for the vm helpers it killed to
 // leave the process table. SIGKILL cannot be caught, so this only covers the
@@ -171,9 +192,8 @@ type tailResult struct {
 }
 
 // teardownWorkloads stops everything still running k3sm workloads once the
-// node daemon is gone: the recorded pod process groups, any k3sm-vmhost helper
-// that survived its daemon, and control-plane children that outlived the
-// server daemon.
+// node daemon is gone: the recorded pod process groups, the k3sm-vmhost helpers
+// of vm pods, and control-plane children that outlived the server daemon.
 func teardownWorkloads(ctx context.Context, sys System, cfg Config) []LeftoverItem {
 	var left []LeftoverItem
 	add := func(kind Leftover, err error) {
@@ -183,10 +203,10 @@ func teardownWorkloads(ctx context.Context, sys System, cfg Config) []LeftoverIt
 	}
 	// The pod process groups, by the runtime's recorded identity (podgroups.go).
 	add(LeftoverPods, teardownPodGroups(ctx, sys, cfg))
-	// The vm helpers. A helper carries the opposite contract to a native pod:
-	// no VM outlives the daemon that booted it, so one still here is an orphan
-	// and is killed outright.
-	add(LeftoverVMHelpers, killVMHostSurvivors(ctx, sys, cfg))
+	// The vm helpers, on the same contract as the pod groups: a daemon restart
+	// leaves them running, and this stop ends them, SIGTERM first so each guest
+	// gets the grace its pod was spawned with (stopVMHelpers).
+	add(LeftoverVMHelpers, stopVMHelpers(ctx, sys, cfg))
 	// Backstop: reap any control-plane children that outlived the booted-out
 	// server daemon (a Stop() cut short by launchd's SIGKILL, or a crash). They
 	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
@@ -243,30 +263,36 @@ func teardownTail(ctx context.Context, sys System, cfg Config, fp flushPrefixes,
 	return tailResult{left: append(left, hostLeft...), interconnectSwept: swept}
 }
 
-// killVMHostSurvivors SIGKILLs every k3sm-vmhost helper the runtime recorded
-// that is provably still that helper, then waits for them to go.
+// stopVMHelpers stops every k3sm-vmhost helper the runtime recorded that is
+// provably still that helper: SIGTERM to each, a wait of
+// sandbox.VMHelperStopWait(its recorded grace) capped at vmHelperStopBound,
+// SIGKILL to each one still running at the end of its own wait, and then
+// vmHostKillWait for the killed to leave. It is the pod groups' stop
+// (teardownPodGroups) for vm pods: a SIGTERM to a helper is its guest's
+// graceful stop, and the helper SIGTERMs the guest's containers, waits out the
+// grace and powers the machine off itself, so the SIGKILL here is only the
+// backstop for a helper that does not.
 //
-// A record authorizes a root SIGKILL of a process group, so it is believed only
+// A record authorizes a root signal to a process group, so it is believed only
 // as far as it can be checked:
 //
 //   - the store directory and the record file must be trusted: not a symlink,
 //     owned by root or the service user, and not group- or world-writable
-//     (readVMHostRecords). An untrusted record is never read as a kill order;
+//     (readVMHostRecords). An untrusted record is never read as an order;
 //   - the group's leader (pid == pgid) must be alive with exactly the recorded
 //     start time, runtimed's own exact-instance rule (sandbox.vmReapDecision).
 //     A leader that is gone, or a recycled pgid with a different immutable
 //     start, means nothing of ours is there: skipped, and not a leftover;
 //   - the leader must be the installed k3sm-vmhost (its executable path) and
 //     run as the service user. A start-time match on any other process is a
-//     forged or corrupted record: never killed, and reported.
+//     forged or corrupted record: never signalled, and reported.
 //
-// Nothing is ever matched by process name. SIGKILL with no grace is the
-// runtime's choice for an orphaned helper too: the graceful path runs inside
-// the daemon that is already gone.
+// Nothing is ever matched by process name. The helpers are stopped together,
+// so the stage costs the longest wait, not their sum.
 //
 // It returns an error naming every record it could not act on or rule out,
-// and every killed helper still alive after vmHostKillWait.
-func killVMHostSurvivors(ctx context.Context, sys System, cfg Config) error {
+// and every helper still alive after its SIGKILL and vmHostKillWait.
+func stopVMHelpers(ctx context.Context, sys System, cfg Config) error {
 	svcUID, err := sys.ServiceUID(cfg.ServiceUser)
 	if err != nil {
 		return fmt.Errorf("look up the service user %s, which vm helpers run as: %w", cfg.ServiceUser, err)
@@ -281,37 +307,32 @@ func killVMHostSurvivors(ctx context.Context, sys System, cfg Config) error {
 		cfg.Logger.Warn("untrusted vm helper record skipped, never acted on", "record", name)
 		errs = errors.Join(errs, fmt.Errorf("untrusted vm helper record %s (not acted on)", name))
 	}
-	want := cfg.installedVMHost()
-	var killed []int
+	verify := func(rec VMHostRecord) (bool, error) {
+		return verifyVMHelper(sys, cfg, rec, cfg.installedVMHost(), svcUID)
+	}
+	var stopping []vmHelperStop
 	for _, rec := range store.Records {
 		if rec.Pgid <= 1 || rec.StartUnixNano == 0 {
 			continue
 		}
-		start, alive := sys.ProcessGroupLeaderStart(rec.Pgid)
-		if !alive {
+		ok, verr := verify(rec)
+		errs = errors.Join(errs, verr)
+		if !ok {
 			continue
 		}
-		if start != rec.StartUnixNano {
-			cfg.Logger.Info("vm helper process group id now belongs to another process; not signalled", "pod", rec.PodID, "pgid", rec.Pgid)
-			continue
-		}
-		exe, uid, perr := sys.ProcessExecutable(rec.Pgid)
-		switch {
-		case perr != nil:
-			errs = errors.Join(errs, fmt.Errorf("vm helper group %d: cannot read its executable, not killed: %w", rec.Pgid, perr))
-			continue
-		case filepath.Clean(exe) != want || uid != svcUID:
-			cfg.Logger.Warn("a vm helper record names a process that is not this install's k3sm-vmhost; not killed", "pod", rec.PodID, "pgid", rec.Pgid, "exe", exe, "uid", uid)
-			errs = errors.Join(errs, fmt.Errorf("vm helper record for group %d names %s (uid %d), not %s (uid %d); not killed", rec.Pgid, exe, uid, want, svcUID))
-			continue
-		}
-		cfg.Logger.Warn("a k3sm-vmhost helper outlived its daemon; killing it (SIGKILL)", "pod", rec.PodID, "pgid", rec.Pgid)
-		if serr := sys.SignalProcessGroup(rec.Pgid, syscall.SIGKILL); serr != nil {
+		wait := vmHelperWait(rec)
+		cfg.Logger.Info("stopping vm pod helper (SIGTERM)", "pod", rec.PodID, "pgid", rec.Pgid,
+			"wait", wait, "record_schema", rec.Schema, "helper_protocol", rec.HelperProtocol,
+			"runtime_version", rec.RuntimeVersion, "boot_session", rec.BootSession)
+		if serr := sys.SignalProcessGroup(rec.Pgid, syscall.SIGTERM); serr != nil {
+			cfg.Logger.Warn("could not signal vm helper group", "pod", rec.PodID, "pgid", rec.Pgid, "signal", "SIGTERM", "err", serr)
 			errs = errors.Join(errs, fmt.Errorf("signal vm helper group %d: %w", rec.Pgid, serr))
 			continue
 		}
-		killed = append(killed, rec.Pgid)
+		stopping = append(stopping, vmHelperStop{rec: rec, wait: wait})
 	}
+	killed, kerr := awaitVMHelpers(ctx, sys, cfg, stopping, verify)
+	errs = errors.Join(errs, kerr)
 	if len(killed) == 0 {
 		return errs
 	}
@@ -323,6 +344,101 @@ func killVMHostSurvivors(ctx context.Context, sys System, cfg Config) error {
 		errs = errors.Join(errs, fmt.Errorf("k3sm-vmhost process groups still alive %s after SIGKILL: %s", vmHostKillWait, strings.Join(strs, ",")))
 	}
 	return errs
+}
+
+// verifyVMHelper reports whether rec's process group is provably still the
+// recorded helper, the check every signal the teardown sends is preceded by:
+// the group can be inspected and its leader (pid == pgid) is alive with exactly
+// the recorded start time, and the leader is the installed k3sm-vmhost running
+// as the service user. A group that cannot be inspected, a gone leader or a
+// recycled pgid is false with no error (nothing of ours is provably there); a
+// start-time match on another executable or uid is false with an error (a
+// forged or corrupted record), as is an executable that cannot be read.
+func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, want string, svcUID uint32) (bool, error) {
+	start, alive := sys.ProcessGroupLeaderStart(rec.Pgid)
+	if !alive {
+		return false, nil
+	}
+	if start != rec.StartUnixNano {
+		cfg.Logger.Info("vm helper process group id now belongs to another process; not signalled", "pod", rec.PodID, "pgid", rec.Pgid)
+		return false, nil
+	}
+	exe, uid, err := sys.ProcessExecutable(rec.Pgid)
+	switch {
+	case err != nil:
+		return false, fmt.Errorf("vm helper group %d: cannot read its executable, not signalled: %w", rec.Pgid, err)
+	case filepath.Clean(exe) != want || uid != svcUID:
+		cfg.Logger.Warn("a vm helper record names a process that is not this install's k3sm-vmhost; not signalled", "pod", rec.PodID, "pgid", rec.Pgid, "exe", exe, "uid", uid)
+		return false, fmt.Errorf("vm helper record for group %d names %s (uid %d), not %s (uid %d); not signalled", rec.Pgid, exe, uid, want, svcUID)
+	}
+	return true, nil
+}
+
+// vmHelperStop is one helper the teardown sent SIGTERM, and how long it gets.
+type vmHelperStop struct {
+	rec  VMHostRecord
+	wait time.Duration
+}
+
+// vmHelperWait is how long the teardown waits for rec's helper after its
+// SIGTERM: the runtime's own wait for the grace the helper was spawned with
+// (sandbox.VMHelperStopWait, the grace plus the helper's margin), capped at
+// vmHelperStopBound. A helper whose grace does not fit is still SIGTERMed first;
+// it is cut at the bound, as the runtime's own stop of every guest would cut it.
+func vmHelperWait(rec VMHostRecord) time.Duration {
+	return min(sandbox.VMHelperStopWait(time.Duration(rec.StopGraceNanos)), vmHelperStopBound)
+}
+
+// awaitVMHelpers waits for the SIGTERMed helpers in stopping, each up to its
+// own wait from the moment they were signalled, and SIGKILLs every one still
+// running when its wait ends, after verify proves again, at that moment, that
+// the group is still the recorded helper (its pid may have been freed and
+// reused during the wait). It returns the killed groups. The waits run on one
+// clock: the helpers are taken in order of their wait, and each round waits
+// only for the time between the previous helper's deadline and the next one's.
+func awaitVMHelpers(ctx context.Context, sys System, cfg Config, stopping []vmHelperStop, verify func(VMHostRecord) (bool, error)) ([]int, error) {
+	slices.SortStableFunc(stopping, func(a, b vmHelperStop) int { return cmp.Compare(a.wait, b.wait) })
+	var (
+		killed  []int
+		errs    error
+		elapsed time.Duration
+	)
+	for len(stopping) > 0 {
+		deadline := stopping[0].wait
+		pgids := make([]int, len(stopping))
+		for i, s := range stopping {
+			pgids[i] = s.rec.Pgid
+		}
+		left := map[int]bool{}
+		for _, pgid := range sys.WaitProcessGroupsGone(ctx, pgids, deadline-elapsed) {
+			left[pgid] = true
+		}
+		elapsed = deadline
+		var still []vmHelperStop
+		for _, s := range stopping {
+			switch {
+			case !left[s.rec.Pgid]:
+				cfg.Logger.Info("vm pod helper stopped", "pod", s.rec.PodID, "pgid", s.rec.Pgid)
+			case s.wait > deadline:
+				still = append(still, s)
+			default:
+				ok, verr := verify(s.rec)
+				errs = errors.Join(errs, verr)
+				if !ok {
+					continue
+				}
+				cfg.Logger.Warn("vm pod helper did not exit within its grace; killing it (SIGKILL)", "pod", s.rec.PodID, "pgid", s.rec.Pgid, "wait", s.wait)
+				if serr := sys.SignalProcessGroup(s.rec.Pgid, syscall.SIGKILL); serr != nil {
+					cfg.Logger.Warn("could not signal vm helper group", "pod", s.rec.PodID, "pgid", s.rec.Pgid, "signal", "SIGKILL", "err", serr)
+					errs = errors.Join(errs, fmt.Errorf("signal vm helper group %d: %w", s.rec.Pgid, serr))
+					continue
+				}
+				killed = append(killed, s.rec.Pgid)
+			}
+		}
+		stopping = still
+	}
+	return killed, errs
 }
 
 // maxVMHostRecordSize bounds one vm reap record read. A real record is a few

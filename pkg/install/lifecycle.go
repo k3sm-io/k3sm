@@ -110,10 +110,11 @@ var removeMeshTimeout = 15 * time.Second
 
 // StopTimeBound is the longest a server stop can take: the cordon bound, the
 // node daemon's unload budget (its ExitTimeOut plus launchd's margin), the
-// RemoveMesh bound, the pod SIGTERM grace, the vm helper wait, and netd's
-// unload budget. A worker's is never longer.
+// RemoveMesh bound, the pod SIGTERM grace, the vm helpers' graceful stop and
+// the wait for any it had to kill, and netd's unload budget. A worker's is
+// never longer.
 func StopTimeBound() time.Duration {
-	return markNodeTimeout + serverRestartBudget.unload + removeMeshTimeout + podGroupStopGrace + vmHostKillWait + netdRestartBudget.unload
+	return markNodeTimeout + serverRestartBudget.unload + removeMeshTimeout + podGroupStopGrace + vmHelperStopBound + vmHostKillWait + netdRestartBudget.unload
 }
 
 // StopIncompleteError is a stop that left something behind. The stop marker

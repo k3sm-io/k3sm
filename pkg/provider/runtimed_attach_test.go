@@ -100,6 +100,11 @@ func (a *attachRuntime) ReapOrphanedPods() error {
 	return nil
 }
 
+// DeferVMSweep records that the startup kept the vm helpers for the next start.
+func (a *attachRuntime) DeferVMSweep(string) {
+	a.log("defer-vm-sweep")
+}
+
 // CreatePod records the create.
 func (a *attachRuntime) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
 	a.log("create:" + req.GetPod().GetPodId())
@@ -308,12 +313,14 @@ func TestStartAttachesLiveNodePods(t *testing.T) {
 		}
 	})
 
-	t.Run("an unlisted node attaches nothing and still reaps", func(t *testing.T) {
+	t.Run("an unlisted node attaches nothing, keeps vm helpers and still reaps", func(t *testing.T) {
 		rt := newAttachRuntime()
 		r := newRuntimedWith(rt, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir()}, nil, nil)
 		r.podSource = &fakePodSource{listErr: errors.New("apiserver unreachable")}
 		r.adoptNodePods(context.Background(), rt)
-		if got, want := rt.sequence(), []string{"reap"}; !slices.Equal(got, want) {
+		// The vm helpers are kept for the next start (nothing says which vm pods
+		// still exist); the native reap runs as it always did.
+		if got, want := rt.sequence(), []string{"defer-vm-sweep", "reap"}; !slices.Equal(got, want) {
 			t.Fatalf("sequence = %v, want %v", got, want)
 		}
 	})
@@ -528,5 +535,117 @@ func TestAdoptedPodRestartsInPlace(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestStartAttachesASurvivingVMPod is the provider half of vm pod survival
+// across a node-daemon restart. A vm pod's k3sm-vmhost helper keeps its guest
+// running through the restart, so the pod is attached like a native one: its
+// published address is re-reserved through the GUEST seam (ReattachGuest), the
+// attach's own guest-network read (SetupGuest, idempotent per pod) resolves to
+// that same address and records the guest config runtimed reads, and the box
+// runtimed is asked to attach carries the vm backend and that address. A vm pod
+// runtimed refuses to adopt (its helper failed the adoption check) is released
+// for the create path, guest config and all.
+func TestStartAttachesASurvivingVMPod(t *testing.T) {
+	started := time.Unix(1_700_000_000, 0)
+	vm := "vm"
+	vmPod := func(name, ip string) corev1.Pod {
+		p := attachTestPod(name, corev1.PodRunning, ip, started)
+		p.Spec.RuntimeClassName = &vm
+		return p
+	}
+	db := vmPod("db", "100.64.0.9")
+	stale := vmPod("stale", "100.64.0.10")
+	held := vmPod("held", "100.64.0.11")
+
+	rt := newAttachRuntime()
+	rt.results["uid-db"] = attachResult{status: &runtimev1.PodStatus{
+		PodId: "uid-db",
+		Phase: runtimev1.PodPhase_POD_PHASE_RUNNING,
+		PodIp: "100.64.0.9",
+	}}
+	rt.results["uid-held"] = attachResult{err: fmt.Errorf("attach pod uid-held: %w: %w", runtimed.ErrNothingToAttach, runtimed.ErrVMHelperUnadoptable)}
+	ipam := newFakeIPAM(t, "100.64.0.0/24")
+	adapter := NewPodNetAdapter(ipam, "192.168.1.10", nil)
+	r := newRuntimedWith(rt, RuntimedConfig{
+		NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(),
+		Network: adapter, ResolverVIP: "10.43.0.10", Recorder: record.NewFakeRecorder(64),
+	}, nil, nil)
+	r.podSource = &fakePodSource{listed: []corev1.Pod{db, stale, held}}
+
+	r.adoptNodePods(context.Background(), rt)
+
+	if got, want := rt.sequence(), []string{"attach:uid-db", "attach:uid-stale", "attach:uid-held", "reap"}; !slices.Equal(got, want) {
+		t.Fatalf("startup sequence = %v, want %v (vm pods are attached before the reap, like native ones)", got, want)
+	}
+	box := rt.boxes["uid-db"]
+	if got := box.GetPodIp(); got != "100.64.0.9" {
+		t.Errorf("attach box pod_ip = %q, want the pod's published 100.64.0.9", got)
+	}
+	if got := box.GetSandboxProfile().GetBackend(); got != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		t.Errorf("attach box backend = %v, want the vm backend", got)
+	}
+	ipam.mu.Lock()
+	dbIP, dbBound := ipam.byPod["uid-db"]
+	_, staleBound := ipam.byPod["uid-stale"]
+	heldIP, heldBound := ipam.byPod["uid-held"]
+	guestReattaches := slices.Clone(ipam.guestReattaches)
+	ipam.mu.Unlock()
+	if !dbBound || dbIP.String() != "100.64.0.9" {
+		t.Errorf("uid-db bound = %v %v, want 100.64.0.9 re-reserved", dbBound, dbIP)
+	}
+	if !slices.Equal(guestReattaches, []string{"uid-db", "uid-stale", "uid-held"}) {
+		t.Errorf("guest re-reservations = %v, want both vm pods through ReattachGuest", guestReattaches)
+	}
+	if gn, ok := adapter.GuestNetwork("uid-db"); !ok || gn.PodIP.String() != "100.64.0.9" {
+		t.Errorf("guest network for uid-db = %+v (recorded %v), want the re-reserved 100.64.0.9", gn, ok)
+	}
+	if r.trackByID("uid-db") == nil {
+		t.Error("the adopted vm pod is not tracked")
+	}
+
+	if staleBound {
+		t.Error("uid-stale still holds its address after runtimed refused to adopt its helper")
+	}
+	if _, ok := adapter.GuestNetwork("uid-stale"); ok {
+		t.Error("uid-stale's guest config survived its refused attach")
+	}
+	if r.trackByID("uid-stale") != nil {
+		t.Error("a vm pod whose helper was not adopted is tracked; it must be left for the create path")
+	}
+
+	// A helper still running that the runtime may neither adopt nor stop: its
+	// guest still answers on the address, so the address stays reserved.
+	if !heldBound || heldIP.String() != "100.64.0.11" {
+		t.Errorf("uid-held bound = %v %v, want 100.64.0.11 kept for the live guest", heldBound, heldIP)
+	}
+	if r.trackByID("uid-held") != nil {
+		t.Error("an unadoptable vm pod is tracked as attached")
+	}
+}
+
+// TestPodsToAttachIncludesVMPods pins which listed pods the startup attaches:
+// running, not being deleted, on a RuntimeClass the node resolves, vm pods
+// included.
+func TestPodsToAttachIncludesVMPods(t *testing.T) {
+	started := time.Unix(1_700_000_000, 0)
+	vm, bogus := "vm", "no-such-handler"
+	native := attachTestPod("native", corev1.PodRunning, "100.64.0.7", started)
+	guest := attachTestPod("guest", corev1.PodRunning, "100.64.0.8", started)
+	guest.Spec.RuntimeClassName = &vm
+	unknown := attachTestPod("unknown", corev1.PodRunning, "100.64.0.9", started)
+	unknown.Spec.RuntimeClassName = &bogus
+	pending := attachTestPod("pending", corev1.PodPending, "", started)
+	deleting := attachTestPod("deleting", corev1.PodRunning, "100.64.0.10", started)
+	now := metav1.Now()
+	deleting.DeletionTimestamp = &now
+
+	var got []string
+	for _, p := range podsToAttach([]corev1.Pod{native, guest, unknown, pending, deleting}) {
+		got = append(got, p.Name)
+	}
+	if want := []string{"native", "guest"}; !slices.Equal(got, want) {
+		t.Errorf("podsToAttach = %v, want %v", got, want)
 	}
 }

@@ -75,7 +75,8 @@ func TestReadVMHostRecords(t *testing.T) {
 		}
 	}
 	// The exact shape runtimed writes (sandbox.vmProcRecord).
-	write("601.json", `{"podId":"linux","pgid":601,"startUnixNano":22,"agentSocket":"/x/agent.sock","runDir":"/x"}`, 0o600)
+	write("601.json", `{"schema":1,"podId":"linux","pgid":601,"startUnixNano":22,"agentSocket":"/x/agent.sock","runDir":"/x",`+
+		`"stopGraceNanos":30000000000,"helperCdhash":"ab12","helperProtocol":1,"runtimeVersion":"cdhash:cd34","bootSession":"B-1"}`, 0o600)
 	write("1.json", `{"podId":"bad","pgid":1,"startUnixNano":5}`, 0o600)
 	write("junk.json", `not json`, 0o600)
 	write("602.json.tmp", `{"podId":"tmp","pgid":602,"startUnixNano":7}`, 0o600)
@@ -91,7 +92,9 @@ func TestReadVMHostRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(st.Records) != 1 || st.Records[0] != (VMHostRecord{PodID: "linux", Pgid: 601, StartUnixNano: 22}) {
+	want := VMHostRecord{Schema: 1, PodID: "linux", Pgid: 601, StartUnixNano: 22, StopGraceNanos: 30_000_000_000,
+		HelperCDHash: "ab12", HelperProtocol: 1, RuntimeVersion: "cdhash:cd34", BootSession: "B-1"}
+	if len(st.Records) != 1 || st.Records[0] != want {
 		t.Errorf("records = %+v, want only the well-formed trusted 601", st.Records)
 	}
 	if !slices.Equal(st.Rejected, []string{"603.json", "777.json"}) {

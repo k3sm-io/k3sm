@@ -116,6 +116,11 @@ func teardownPodGroups(ctx context.Context, sys System, cfg Config) error {
 			cfg.Logger.Info("pod process group stopped", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid)
 			continue
 		}
+		// Re-verified at this moment: the group may have emptied, and its pgid
+		// been reused, during the grace.
+		if !podGroupIsRecorded(sys, cfg, rec) {
+			continue
+		}
 		cfg.Logger.Warn("pod process group did not exit within the grace period; killing it (SIGKILL)", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid, "grace", podGroupStopGrace)
 		if serr := sys.SignalProcessGroup(rec.Pgid, syscall.SIGKILL); serr != nil {
 			cfg.Logger.Warn("could not signal pod process group", "pod", rec.PodID, "pgid", rec.Pgid, "signal", "SIGKILL", "err", serr)

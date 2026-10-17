@@ -244,6 +244,12 @@ install again with another `--update-release-base` to change it.
   `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
 - Check the version skew. Confirm the target Kubernetes pin with `k3sm version`; see
   [Versions](versions.md).
+- Plan for `vm` Pods. Every upgrade, every rollback, and the first upgrade to a release in which `vm`
+  Pods survive a daemon restart, recreates each running `vm` Pod: its guest is stopped without its
+  grace period and booted again, because a Pod is only re-attached by the exact build that started
+  it. If that matters for a workload (a database, for example), drain or scale down its `vm` Pods
+  before you upgrade or roll back. Native Pods are recreated the same way. See
+  [what survives a restart](limitations.md#what-survives-a-node-daemon-restart).
 
 ## Upgrading Across a Datastore-Engine Change
 
@@ -365,6 +371,10 @@ needs more than one server (see [HA](ha.md)).
 
 Rollback means reverting to the previous binary, plus the daemon restart that comes with it. There is
 no runtime flag to flip. That is `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
+
+Like an upgrade, a rollback recreates every running Pod, `vm` Pods included, and an earlier release
+in which `vm` Pods did not survive a restart stops their guests as it starts. Drain `vm` Pods first if
+a hard stop of their guests matters.
 
 If the release you are leaving changed the **datastore engine**, reverting the binary is only half of
 it, because the database has already been migrated in place. Restore the

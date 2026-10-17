@@ -932,28 +932,26 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// STANDALONE k3sm-runtimed daemon runs once its Serve returns (runtimed
 	// cmd/k3sm-runtimed). This node drives its runtime by direct RPC
 	// (provider.NewRuntimed) and never through runtime.Server.Serve, so nothing on
-	// this path called Close at all: a `launchctl bootout system/io.k3sm.server`
-	// left every k3sm-vmhost of every vm pod still running, each one holding the
-	// data root open (it is the plist's WorkingDirectory), which is why a following
-	// `diskutil unmount` of the data root was dissented by an orphan helper's pid.
+	// this path called Close at all, and the runtime's supervision outlived the
+	// node it served.
 	//
-	// It does NOT touch native host-process pods, and that asymmetry is the
-	// runtime's own contract rather than an omission here: Close cancels
-	// supervision and deliberately leaves the pod PROCESSES running, so they
-	// survive a daemon restart and the next start's pod reap reconciles them,
-	// while every vm helper IS stopped because no VM outlives the binary that
-	// booted it — an orphaned helper holds a whole machine nothing on the node can
-	// talk to, adopt or stop (runtimed pkg/runtime/close.go).
+	// It stops NO pod, and that is the runtime's own contract rather than an
+	// omission here: Close cancels supervision and deliberately leaves the pod
+	// processes running, native pods' and vm pods' k3sm-vmhost helpers alike, so
+	// they survive a daemon restart and the next start re-attaches them (or its
+	// startup reap reconciles them) the way a kubelet restart stops no container
+	// (runtimed pkg/runtime/close.go). Pods stop on a deletion, and at `k3sm
+	// stop` and `k3sm uninstall`, whose teardown runs once this daemon is gone
+	// (pkg/install teardownWorkloads).
 	//
-	// ORDERING IS LOAD-BEARING, and it is why this defer is registered AFTER the
-	// control socket's: defers are LIFO, so this one runs FIRST. It is also a new
-	// STAGE of a fixed budget — every teardown a k3sm daemon runs happens serially
-	// inside the plist's single ExitTimeOut, which pkg/install now derives from
-	// this close's own bound plus the socket, the control-plane stop and the mesh
-	// teardown. A blown ExitTimeOut is answered with SIGKILL of the daemon, which
-	// strands exactly the helpers this stop exists to reap (and, on the server,
-	// orphans kine and the apiserver mid-stop), so this stop runs first and the
-	// budget that covers it is derived rather than guessed.
+	// ORDERING, and it is why this defer is registered AFTER the control
+	// socket's: defers are LIFO, so this one runs FIRST. It is a STAGE of a fixed
+	// budget: every teardown a k3sm daemon runs happens inside the plist's single
+	// ExitTimeOut, which pkg/install derives from this close's own bound plus the
+	// socket, the control-plane stop and the mesh teardown. A blown ExitTimeOut is
+	// answered with SIGKILL of the daemon, which on the server orphans kine and the
+	// apiserver mid-stop, so the budget that covers it is derived rather than
+	// guessed.
 	//
 	// The closure is idempotent, so this defer and awaitNodeExit's call below
 	// (which is what runs it on the two normal exit paths) cannot double-stop; the
@@ -980,7 +978,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// in the same place, run by awaitNodeExit on the same two paths. The wrapper
 	// only prefixes it with opts.onExitBegin, so a caller with its own teardown
 	// (`k3sm server`, whose control-plane stop is the other long stage of a stopping
-	// daemon) gets that stage started while the vm helpers come down and overlaps
+	// daemon) gets that stage started while the runtime closes and overlaps
 	// the two instead of paying their sum inside one ExitTimeOut — but not before
 	// this node's loops have drained (or nodeDrainGrace has passed), so the
 	// apiserver does not go away under a run loop still publishing status. nil on
@@ -1199,10 +1197,10 @@ func awaitNodeExit(ctx context.Context, errc <-chan error, stopRuntime func()) e
 // in-process runtime the provider drives. It is declared HERE, at the consumer,
 // for the same reason runtimeHealthReporter is — and as an INTERFACE rather than
 // the concrete *runtimed.Runtime that controlSocketSource hands back, because the
-// concrete type stops real vm host helpers and cannot stand in a unit test.
+// concrete type drives real pod processes and cannot stand in a unit test.
 type embeddedRuntimeCloser interface {
-	// Close stops the supervision the runtime owns and every vm host helper it
-	// booted, leaving native pod processes running. It derives its own bound
+	// Close stops the supervision the runtime owns, leaving every pod process
+	// running, vm host helpers included. It derives its own bound
 	// internally (a caller must NOT nest it in a timeout off the node's already
 	// cancelled context) and is idempotent.
 	Close() error
@@ -1228,11 +1226,10 @@ func embeddedRuntime(prov vkadapter.Provider) embeddedRuntimeCloser {
 // drives. The closure is never nil, so `defer stop()` is unconditional, and it is
 // idempotent, so the node may both defer it and call it on its exit path.
 //
-// It takes NO context, deliberately. Close derives its own 35-second vm bound
-// from context.Background(); threading the node's context in would hand it a
-// context that is already cancelled on the commonest shutdown path (SIGTERM), and
-// the vm stop would return instantly having stopped nothing — the bug this exists
-// to fix, reintroduced in a shape that looks like care.
+// It takes NO context, deliberately. Close derives its own bound (the runtime's
+// close grace) from the wall clock; threading the node's context in would hand
+// it a context that is already cancelled on the commonest shutdown path
+// (SIGTERM), and the wait for supervision to stop would end before it began.
 func stopEmbeddedRuntime(prov vkadapter.Provider, log *slog.Logger) func() {
 	rt := embeddedRuntime(prov)
 	if rt == nil {
@@ -1244,14 +1241,13 @@ func stopEmbeddedRuntime(prov vkadapter.Provider, log *slog.Logger) func() {
 			start := time.Now()
 			err := rt.Close()
 			if err != nil {
-				// Never fatal: the process is exiting either way, and a helper still
-				// running when Close's bound expired is left to the next start's
-				// orphan sweep — the backstop that makes that bound a bound.
-				log.Warn("the embedded runtime did not stop cleanly at node exit; a vm host helper may be left for the next start's orphan sweep",
+				// Never fatal: the process is exiting either way, and the pods it
+				// supervised are re-attached or reaped at the next start.
+				log.Warn("the embedded runtime did not stop its pod supervision cleanly at node exit",
 					"elapsed", time.Since(start), "err", err)
 				return
 			}
-			log.Info("stopped the embedded runtime at node exit (vm host helpers stopped; native pod processes left running)",
+			log.Info("stopped the embedded runtime at node exit (pod processes and vm helpers left running for the next start)",
 				"elapsed", time.Since(start))
 		})
 	}

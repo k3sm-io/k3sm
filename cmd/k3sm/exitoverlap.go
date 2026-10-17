@@ -49,7 +49,7 @@ import (
 // load-bearing — see startNode). startNode simply fires an optional hook at the
 // very START of its teardown, before the close; `k3sm server` is the only caller
 // that sets one, and its hook launches the control-plane stop so the stop is
-// already draining while the vm helpers come down. runServer's own defer then
+// already draining while the runtime closes. runServer's own defer then
 // WAITS for that stop instead of starting it.
 //
 // One thing the overlap must NOT do is pull the apiserver out from under the node

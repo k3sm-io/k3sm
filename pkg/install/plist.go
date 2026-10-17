@@ -263,15 +263,19 @@ func ServerPlist(cfg Config) []byte {
 // different package — so a hand-picked literal here is wrong the first time any of
 // them moves, and the failure is silent and bad: a SIGKILL mid-stop orphans
 // exactly the children the stop exists to reap (kine and the apiserver on the
-// server path, the ingest registry's zot child on a server with one, a vm host
-// helper on either).
+// server path, the ingest registry's zot child on a server with one).
 //
 // A stopping server runs its deferred steps on two lanes at once:
 //
 //	NODE LANE, on the daemon's own goroutine, one step after another:
-//	runtimed close     37s  vmShutdownBound (35s) + defaultCloseGrace (2s), both
-//	                        runtimed pkg/runtime/close.go — the embedded runtime's
-//	                        concurrent vm-helper stop, deferred by startNode.
+//	runtimed close      2s  defaultCloseGrace, runtimed pkg/runtime/close.go: the
+//	                        embedded runtime's close, deferred by startNode. It
+//	                        stops no pod: native pods and vm pods' k3sm-vmhost
+//	                        helpers outlive the daemon and are re-attached at
+//	                        its next start, so no vm stop is budgeted here. The
+//	                        stop of the vm helpers runs after the daemon is gone,
+//	                        in `k3sm stop` and `k3sm uninstall` (stopVMHelpers,
+//	                        bounded by sandbox.VMStopAllBound in StopTimeBound).
 //	node update stop    2s  nodeUpdateStopGrace, cmd/k3sm/nodeupdate.go — the
 //	                        managed-update watcher, which mid-install is blocked on
 //	                        the root helper's stream and is left there.
@@ -314,26 +318,26 @@ func ServerPlist(cfg Config) []byte {
 //	headroom           10s  launchd's own signal/reap latency and the log flush.
 //
 // So the server's budget is the LONGER of the two lanes, plus the steps after the
-// wait: max(37+2+5+30, 5+25+30+5) + 5 + 10 = 89s. A worker runs no control plane,
+// wait: max(2+2+5+30, 5+25+30+5) + 5 + 10 = 80s. A worker runs no control plane,
 // no ingest registry and no operators, so its budget is its node lane alone:
-// 37+2+5+5+10 = 59s.
+// 2+2+5+5+10 = 24s.
 //
 // Every bound is a LITERAL here so the table can be read in one place. Two are
 // bound back to their owners by more than trust: TestExitTimeOutCoversTheDaemonTeardown
 // compares the control-plane step with executor.StopBound (the one owner this
-// package can import), and hack/acceptance/B253.sh's CI tier reads runtimed's two
-// constants out of its module and compares them with the close step. The steps
+// package can import), and hack/acceptance/B253.sh's CI tier reads runtimed's
+// close grace out of its module and compares it with the close step. The steps
 // whose owners live in package main have no importable owner and no gate; the
 // headroom absorbs a small drift in any of them.
 //
 // The sums are rounded UP to the next multiple of ten, because an ExitTimeOut is
-// read by operators in a plist and 90 is legible where 89 invites the question of
-// what the 9 was for. Rounding up can only add headroom.
+// read by operators in a plist and 30 is legible where 24 invites the question of
+// what the 4 was for. Rounding up can only add headroom.
 //
 // A changed ExitTimeOut reaches a Mac only through the plist launchd reads, so it
 // takes effect at the next `k3sm install` (or managed update), not at a restart.
 const (
-	teardownRuntimedClose = 37
+	teardownRuntimedClose = 2
 	teardownControlSocket = 5
 	teardownControlPlane  = 30
 	teardownMesh          = 5
@@ -393,7 +397,7 @@ type teardownStep struct {
 // order each lane runs them. TestExitTimeOutCoversEveryTeardownStep names each
 // step it expects and checks the plist's ExitTimeOut covers them.
 var serverTeardownSteps = []teardownStep{
-	{"runtimed close (vmShutdownBound + defaultCloseGrace)", teardownRuntimedClose, laneNode},
+	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
 	{"node interconnect handlers stop (context drain)", 0, laneNode},
 	{"heartbeat watch stop (context drain)", 0, laneNode},
@@ -425,7 +429,7 @@ var serverTeardownSteps = []teardownStep{
 // agentTeardownSteps is every deferred step of a stopping `k3sm agent`: its
 // node's, then its mesh teardown. It has no control-plane lane.
 var agentTeardownSteps = []teardownStep{
-	{"runtimed close (vmShutdownBound + defaultCloseGrace)", teardownRuntimedClose, laneNode},
+	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
 	{"node interconnect handlers stop (context drain)", 0, laneNode},
 	{"heartbeat watch stop (context drain)", 0, laneNode},
@@ -457,7 +461,7 @@ func roundUpToTen(seconds int) int { return ((seconds + 9) / 10) * 10 }
 // binds it to the derivation.
 //
 //lint:ignore U1000 read by the shell gates, not by Go; the test binds it to the derivation.
-const serverExitTimeOutSeconds = 90
+const serverExitTimeOutSeconds = 80
 
 var (
 	// serverExitTimeOut is the io.k3sm.server plist's ExitTimeOut: every step
