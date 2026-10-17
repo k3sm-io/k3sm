@@ -75,6 +75,11 @@ finishes. With no update it prints `no managed update` and exits 0; `-o json` th
 `{"phase":"","version":"","resolved":null,"nodes":[],"conditions":[]}`. While an update is in
 progress the `update` row of `k3sm status` is `rolling`, naming the phase and the node being
 updated, so `k3sm status` alone shows a roll started from any Mac.
+When a server's update could not keep its stored admin token and minted a new one, its row is
+followed by an `admin credential re-minted` line (and `-o json` sets `"adminTokenRotated": true` on
+that node), also on an update that was cancelled or aborted: every copy of the admin kubeconfig
+taken before the update is refused, so copy it again with `k3sm kubeconfig` on the server to every
+other Mac and tool that uses it.
 
 `k3sm update cancel` stops the roll: the node being updated finishes its update, the nodes not yet
 started are left on the release they run, and the update ends `Cancelled`. A cancel is not a

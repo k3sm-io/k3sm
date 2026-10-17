@@ -450,6 +450,8 @@ func TestUpdateApplyCreatesThePlan(t *testing.T) {
 		Nodes: []updatesv1alpha1.UpdateNodeStatus{
 			{Name: "laptop", From: "v0.1.7", To: "v0.2.0", Phase: updatesv1alpha1.UpdateNodePhaseInstalling, Message: "installing; last progress 2026-10-15T11:59:00Z"},
 			{Name: "studio", From: "v0.1.7", To: "v0.2.0", Phase: updatesv1alpha1.UpdateNodePhasePending, Message: "last progress 2026-10-15T11:58:00Z"},
+			{Name: "studio2", From: "v0.1.7", To: "v0.2.0", Phase: updatesv1alpha1.UpdateNodePhaseDone, AdminTokenRotated: true,
+				Message: "runs v0.2.0; " + updatectl.AdminTokenRotatedMessage + "; last progress 2026-10-15T11:57:00Z"},
 		},
 		Conditions: []metav1.Condition{progressing(metav1.ConditionTrue, updatectl.ReasonRolling)},
 	})
@@ -472,17 +474,34 @@ func TestUpdateApplyCreatesThePlan(t *testing.T) {
 	wantNodes := []updateStatusNode{
 		{Name: "laptop", From: "v0.1.7", To: "v0.2.0", Phase: "Installing", Message: "installing", LastProgress: "2026-10-15T11:59:00Z"},
 		{Name: "studio", From: "v0.1.7", To: "v0.2.0", Phase: "Pending", LastProgress: "2026-10-15T11:58:00Z"},
+		{Name: "studio2", From: "v0.1.7", To: "v0.2.0", Phase: "Done", LastProgress: "2026-10-15T11:57:00Z", AdminTokenRotated: true,
+			Message: "runs v0.2.0; " + updatectl.AdminTokenRotatedMessage},
 	}
 	if v.Name != "current" || v.Phase != "Rolling" || v.Finished || v.Version != "v0.2.0" || !v.Drain || v.Signature != "required" ||
 		v.Resolved == nil || v.Resolved.Digest != "sha256:abc" || len(v.Conditions) != 1 {
 		t.Errorf("status view = %+v", v)
 	}
-	if len(v.Nodes) != 2 || v.Nodes[0] != wantNodes[0] || v.Nodes[1] != wantNodes[1] {
+	if len(v.Nodes) != 3 || v.Nodes[0] != wantNodes[0] || v.Nodes[1] != wantNodes[1] || v.Nodes[2] != wantNodes[2] {
 		t.Errorf("status nodes = %+v, want %+v", v.Nodes, wantNodes)
 	}
-	// The text form carries the same table.
-	if _, out, _ := c.run(t, "status"); !strings.Contains(out, "laptop   v0.1.7   v0.2.0   Installing   2026-10-15T11:59:00Z   installing") {
+	// The app reads the flag by this key, set only on the node it describes.
+	if strings.Count(out, `"adminTokenRotated": true`)+strings.Count(out, `"adminTokenRotated":true`) != 1 {
+		t.Errorf("status json does not carry adminTokenRotated on exactly one node:\n%s", out)
+	}
+	// The text form carries the same table, and the remedy under the node
+	// whose credential was re-minted, and only there.
+	_, out, _ = c.run(t, "status")
+	if !strings.Contains(out, "laptop    v0.1.7   v0.2.0   Installing   2026-10-15T11:59:00Z   installing") {
 		t.Errorf("status text:\n%s", out)
+	}
+	lines := strings.Split(out, "\n")
+	for i, l := range lines {
+		if strings.Contains(l, adminTokenRotatedRemedy) && (i == 0 || !strings.HasPrefix(lines[i-1], "studio2 ")) {
+			t.Errorf("the remedy is not under studio2:\n%s", out)
+		}
+	}
+	if strings.Count(out, adminTokenRotatedRemedy) != 1 {
+		t.Errorf("status text carries the remedy %d times, want once:\n%s", strings.Count(out, adminTokenRotatedRemedy), out)
 	}
 
 	// cancel sets the flag and says what it means.
@@ -507,7 +526,7 @@ func TestUpdateApplyCreatesThePlan(t *testing.T) {
 		Phase: updatesv1alpha1.UpdatePhaseFailed,
 		Nodes: []updatesv1alpha1.UpdateNodeStatus{
 			{Name: "laptop", Phase: updatesv1alpha1.UpdateNodePhaseDone},
-			{Name: "studio", Phase: updatesv1alpha1.UpdateNodePhaseFailed, Message: "install failed"},
+			{Name: "studio", To: "v0.2.1", Phase: updatesv1alpha1.UpdateNodePhaseFailed, Message: "install failed"},
 		},
 		Conditions: []metav1.Condition{
 			progressing(metav1.ConditionFalse, updatectl.ReasonFailed),
@@ -521,7 +540,10 @@ func TestUpdateApplyCreatesThePlan(t *testing.T) {
 		updatectl.CordonedAnnotation:            "true",
 		updatectl.HandedOverAnnotation:          "2026-10-15T11:00:00Z",
 		updatectl.ReadyAtAnnotation:             "2026-10-15T11:05:00Z",
-		"k3sm.io/other":                         "kept",
+		// The server's install minted a new admin token before the step
+		// failed: abort records it on the Update before clearing it.
+		updatectl.AdminTokenRotatedAnnotation: "0.2.1 2026-10-15T11:04:00Z",
+		"k3sm.io/other":                       "kept",
 	}
 	controllerCordoned := c.node(t, "studio")
 	controllerCordoned.Annotations, controllerCordoned.Spec.Unschedulable = all, true
@@ -537,7 +559,7 @@ func TestUpdateApplyCreatesThePlan(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("abort: exit %d, stderr %s", code, errOut)
 	}
-	for _, want := range []string{"Marked the Update current to v0.2.1 Cancelled (it was Failed)", "Node studio: uncordoned", "Node laptop: left cordoned"} {
+	for _, want := range []string{"Marked the Update current to v0.2.1 Cancelled (it was Failed)", "Node studio: uncordoned", "Node laptop: left cordoned", "Node studio: " + adminTokenRotatedRemedy} {
 		if !strings.Contains(out, want) {
 			t.Errorf("abort output lacks %q:\n%s", want, out)
 		}
@@ -557,6 +579,11 @@ func TestUpdateApplyCreatesThePlan(t *testing.T) {
 		}
 	}
 	u := c.get(t)
+	for _, e := range u.Status.Nodes {
+		if want := e.Name == "studio"; e.AdminTokenRotated != want || strings.Contains(e.Message, updatectl.AdminTokenRotatedMessage) != want {
+			t.Errorf("aborted entry %s: AdminTokenRotated %v, message %q; want the flag and the remedy %v", e.Name, e.AdminTokenRotated, e.Message, want)
+		}
+	}
 	if u.Status.Phase != updatesv1alpha1.UpdatePhaseCancelled || !updateEndedAs(u, updatectl.ReasonCancelled) ||
 		!meta.IsStatusConditionTrue(u.Status.Conditions, updatectl.ConditionFailed) {
 		t.Errorf("aborted status = %+v", u.Status)

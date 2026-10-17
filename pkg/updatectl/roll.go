@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -49,6 +50,120 @@ const (
 	// (RFC3339); the settle period counts from it.
 	ReadyAtAnnotation = "k3sm.io/update-ready-at"
 )
+
+// AdminTokenRotatedAnnotation is the one update annotation a node writes for
+// the controller outside its phase report: a control plane whose in-place
+// install minted a new admin token (the installed one was missing, corrupt or
+// untrusted) sets it, once Ready again, to "<version> <RFC3339>": the release
+// that install put on the node and the install's time.
+//
+// The controller records it on the node's status (AdminTokenRotated) when the
+// node carries the control-plane label and the version is the release the
+// node entry moves the node to (To). The version decides first: the time is
+// the node's clock and the handover the controller's, so a lagging
+// control-plane clock would otherwise hide a real rotation. Only a mark naming
+// another version (an unstamped or hand-installed build) falls back to the
+// time, and is logged. A mark is cleared at the node's next handover, and by
+// `k3sm update abort` once it has recorded it.
+const AdminTokenRotatedAnnotation = "k3sm.io/update-admin-token-rotated-at"
+
+// AdminTokenRotatedMessage is what a node's message says once its status
+// carries AdminTokenRotated: every copy of the admin kubeconfig taken from the
+// control plane before the update is now refused.
+const AdminTokenRotatedMessage = "the admin credential was re-minted: copy the admin kubeconfig again"
+
+// ParseAdminTokenRotatedMark splits an AdminTokenRotatedAnnotation value into
+// the release version and the install's time. ok is false for anything that
+// is not exactly "<version> <RFC3339>".
+func ParseAdminTokenRotatedMark(v string) (version string, at time.Time, ok bool) {
+	version, ts, found := strings.Cut(v, " ")
+	if !found || version == "" || strings.ContainsAny(ts, " ") {
+		return "", time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+	return version, at, true
+}
+
+// NoteAdminTokenRotations sets AdminTokenRotated on every node entry of u that
+// the node behind it has reported a rotation for (see
+// AdminTokenRotatedAnnotation), and appends the remedy to a finished entry's
+// message. Only entries past their handover are read: the handover clears any
+// earlier mark, so a mark on a node that has not been handed over belongs to
+// an earlier roll. A flag once set stays set. The controller calls it on every
+// pass of the newest Update, while it rolls and after it Succeeded; `k3sm
+// update abort` calls it before it clears the annotations, so neither end of a
+// roll loses the report. It reports whether it set a flag.
+//
+// A mark counts when it is a control plane's and its version is the entry's
+// To. A mark naming another version (an unstamped or hand-installed build) is
+// logged, and counts only when its time is at or after the node's handover
+// (the handover annotation, or the entry's start once that is gone): the
+// clocks of the node and the controller decide only when the version cannot.
+func NoteAdminTokenRotations(u *updatesv1alpha1.Update, nodes []corev1.Node, log *slog.Logger) bool {
+	byName := make(map[string]*corev1.Node, len(nodes))
+	for i := range nodes {
+		byName[nodes[i].Name] = &nodes[i]
+	}
+	noted := false
+	for i := range u.Status.Nodes {
+		e := &u.Status.Nodes[i]
+		if e.AdminTokenRotated || !handedOverPhase(e.Phase) || !rotationReported(byName[e.Name], e, log) {
+			continue
+		}
+		e.AdminTokenRotated, noted = true, true
+		if e.Phase == updatesv1alpha1.UpdateNodePhaseDone || e.Phase == updatesv1alpha1.UpdateNodePhaseFailed {
+			base, at := splitProgress(e.Message)
+			base = withRotation(e, base)
+			if at == "" {
+				e.Message = base
+			} else {
+				e.Message = withProgress(base, at)
+			}
+		}
+	}
+	return noted
+}
+
+// rotationReported reports whether n is a control plane whose mark counts for
+// entry e (see NoteAdminTokenRotations). The versions are compared as the
+// node's kubeletVersion carries them, so "v0.2.0" and the stamped "0.2.0"
+// agree. A worker's mark is ignored: a worker has no admin token to rotate.
+func rotationReported(n *corev1.Node, e *updatesv1alpha1.UpdateNodeStatus, log *slog.Logger) bool {
+	if n == nil || e.To == "" {
+		return false
+	}
+	if _, cp := n.Labels[controlPlaneLabel]; !cp {
+		return false
+	}
+	version, at, ok := ParseAdminTokenRotatedMark(n.Annotations[AdminTokenRotatedAnnotation])
+	if !ok {
+		return false
+	}
+	if buildMetadata(version) == buildMetadata(e.To) {
+		return true
+	}
+	floor, ok := annotationTime(n, HandedOverAnnotation)
+	if !ok && e.StartedAt != nil {
+		floor, ok = e.StartedAt.Time, true
+	}
+	if ok && !at.Before(floor) {
+		log.Warn("update controller: a control plane reported an admin token rotation for another release than it was moved to; recording it, since it was made after the handover",
+			"node", e.Name, "mark_version", version, "to", e.To, "at", at.Format(time.RFC3339))
+		return true
+	}
+	log.Warn("update controller: ignoring an admin token rotation mark for another release than the node was moved to, made before its handover",
+		"node", e.Name, "mark_version", version, "to", e.To, "at", at.Format(time.RFC3339))
+	return false
+}
+
+// handedOverPhase reports whether an entry in phase p has been handed the
+// release.
+func handedOverPhase(p updatesv1alpha1.UpdateNodePhase) bool {
+	return nodeSidePhase(p) || p == updatesv1alpha1.UpdateNodePhaseDone || p == updatesv1alpha1.UpdateNodePhaseFailed
+}
 
 // SettlePeriod is how long a node must stay done and Ready before it is
 // uncordoned and the roll moves on.
@@ -96,14 +211,19 @@ func (f rollFailure) Unwrap() error { return f.err }
 
 // roll advances the singleton as far as it can go without waiting and returns
 // when the next pass is due. It mutates only u.Status (and the Nodes through
-// the API).
-func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update) time.Duration {
+// the API). newest is whether no other Update was created after u: a
+// Succeeded Update keeps recording a control plane's late admin token
+// rotation report only while it is the newest.
+func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update, newest bool) time.Duration {
 	now := c.cfg.Now().UTC().Truncate(time.Second)
 	st := &u.Status
 	st.ObservedGeneration = u.Generation
 	c.setCondition(u, updatesv1alpha1.UpdateConditionReconciled, metav1.ConditionTrue, ReasonSingleton,
 		"this is the Update the controller rolls")
 	if finished(u) {
+		if newest && endedAs(u, ReasonSucceeded) {
+			c.noteLateRotations(ctx, u)
+		}
 		return idleResync
 	}
 
@@ -122,6 +242,10 @@ func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update) time.D
 			return idleResync
 		}
 	}
+	// Every pass, before any entry advances or the roll ends, so a rotation a
+	// control plane reports late (after it settled, or while the roll fails or
+	// is cancelled) still reaches its entry.
+	NoteAdminTokenRotations(u, list.Items, c.log)
 
 	for i := range st.Nodes {
 		e := &st.Nodes[i]
@@ -170,6 +294,26 @@ func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update) time.D
 	}
 	c.succeed(u)
 	return idleResync
+}
+
+// noteLateRotations records on a Succeeded Update an admin token rotation a
+// control plane reported after its entry finished, and names the node in the
+// Succeeded condition. A failed node list is retried on the next pass.
+func (c *Controller) noteLateRotations(ctx context.Context, u *updatesv1alpha1.Update) {
+	list, err := c.cfg.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		c.log.Warn("update controller: list nodes for a late admin token rotation report", "err", err)
+		return
+	}
+	if NoteAdminTokenRotations(u, list.Items, c.log) {
+		c.succeed(u)
+	}
+}
+
+// endedAs reports whether u ended with the given Progressing reason.
+func endedAs(u *updatesv1alpha1.Update, reason string) bool {
+	p := meta.FindStatusCondition(u.Status.Conditions, ConditionProgressing)
+	return p != nil && p.Status == metav1.ConditionFalse && p.Reason == reason
 }
 
 // progressMark separates a node message from its last-progress time. The
@@ -429,10 +573,10 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 			if _, err := c.release(ctx, n); err != nil {
 				return err
 			}
-			e.Phase, e.Message, e.FinishedAt, e.To = updatesv1alpha1.UpdateNodePhaseDone, "runs "+tag, &at, tag
+			e.Phase, e.Message, e.FinishedAt, e.To = updatesv1alpha1.UpdateNodePhaseDone, withRotation(e, "runs "+tag), &at, tag
 			return nil
 		}
-		e.Message = fmt.Sprintf("runs %s and is Ready; settling until %s", tag, readyAt.Add(SettlePeriod).Format(time.RFC3339))
+		e.Message = withRotation(e, fmt.Sprintf("runs %s and is Ready; settling until %s", tag, readyAt.Add(SettlePeriod).Format(time.RFC3339)))
 	case reported == updatesv1alpha1.UpdateNodePhaseDone && onTarget(n, tag):
 		if _, settling := n.Annotations[ReadyAtAnnotation]; settling {
 			// It went NotReady while settling: the settle starts over.
@@ -454,6 +598,21 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 		e.Message = fmt.Sprintf("the node did not finish within %s of its handover (last: %s)", c.cfg.NodeTimeout, e.Message)
 	}
 	return nil
+}
+
+// withRotation is msg with the admin credential remedy appended when the
+// node's status carries AdminTokenRotated.
+func withRotation(e *updatesv1alpha1.UpdateNodeStatus, msg string) string {
+	if !e.AdminTokenRotated {
+		return msg
+	}
+	if strings.Contains(msg, AdminTokenRotatedMessage) {
+		return msg
+	}
+	if msg == "" {
+		return AdminTokenRotatedMessage
+	}
+	return msg + "; " + AdminTokenRotatedMessage
 }
 
 // nodeReady reports whether the Node's Ready condition is True.
@@ -548,7 +707,9 @@ func (c *Controller) payload(u *updatesv1alpha1.Update) ([]byte, error) {
 // handover asks the node for the release: the version, the payload, its
 // signature and the signer certificate are set, any earlier phase report and
 // settle mark are cleared, and the handover time is recorded (the node timeout
-// counts from it), in one patch. The signature is what authorises the node's
+// counts from it), in one patch. A rotation mark an earlier install left is
+// cleared in the same patch, so a mark the node carries after it is this
+// handover's. The signature is what authorises the node's
 // root helper to install: a node can write its own annotations, but not sign.
 func (c *Controller) handover(ctx context.Context, u *updatesv1alpha1.Update, n *corev1.Node, now time.Time) (*corev1.Node, error) {
 	p, err := c.payload(u)
@@ -571,6 +732,7 @@ func (c *Controller) handover(ctx context.Context, u *updatesv1alpha1.Update, n 
 		updatesv1alpha1.AnnotationUpdatePhase:   nil,
 		HandedOverAnnotation:                    now.Format(time.RFC3339),
 		ReadyAtAnnotation:                       nil,
+		AdminTokenRotatedAnnotation:             nil,
 	}))
 }
 
@@ -612,7 +774,10 @@ func (c *Controller) cordon(ctx context.Context, n *corev1.Node) (*corev1.Node, 
 // release ends the controller's hold on a node: it removes the controller's
 // own annotations and lifts the cordon if the controller made it (an
 // operator's cordon stays). The update-version, -payload and -phase
-// annotations stay: they record what the node was asked for and reported.
+// annotations stay: they record what the node was asked for and reported. So
+// does a rotation mark: the status that records it is written after this
+// patch, and a failed status write must find the mark again on the next pass;
+// the next handover clears it.
 func (c *Controller) release(ctx context.Context, n *corev1.Node) (*corev1.Node, error) {
 	patch := annotations(map[string]any{CordonedAnnotation: nil, HandedOverAnnotation: nil, ReadyAtAnnotation: nil})
 	if n.Annotations[CordonedAnnotation] == "true" {
@@ -687,9 +852,20 @@ func (c *Controller) cancelFrom(u *updatesv1alpha1.Update, i int, nodes map[stri
 	c.setCondition(u, ConditionFailed, metav1.ConditionFalse, ReasonCancelled, msg)
 }
 
-// succeed ends the roll Succeeded.
+// succeed ends the roll Succeeded. The message names every node whose admin
+// credential was re-minted, since each copy of the admin kubeconfig taken
+// before the roll is refused until it is copied again.
 func (c *Controller) succeed(u *updatesv1alpha1.Update) {
 	msg := "every node runs " + u.Spec.Version
+	var rotated []string
+	for _, e := range u.Status.Nodes {
+		if e.AdminTokenRotated {
+			rotated = append(rotated, e.Name)
+		}
+	}
+	if len(rotated) > 0 {
+		msg += "; admin credential re-minted on " + strings.Join(rotated, ", ")
+	}
 	u.Status.Phase = updatesv1alpha1.UpdatePhaseSucceeded
 	c.setCondition(u, ConditionProgressing, metav1.ConditionFalse, ReasonSucceeded, msg)
 	c.setCondition(u, ConditionSucceeded, metav1.ConditionTrue, ReasonSucceeded, msg)

@@ -19,12 +19,14 @@ package install
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/nodecred"
+	"k3sm.io/k3sm/pkg/version"
 )
 
 // The in-place update: `k3sm install --from-staging <dir>` with no role flag
@@ -208,4 +210,48 @@ func keepAdminTokenInPlace(sys System, cfg *Config, serviceUID uint32) (minted b
 	}
 	cfg.AdminToken = tok
 	return true, nil
+}
+
+// AdminTokenRotatedMarkerName is the file a control-plane install leaves in
+// the server work dir when it minted a new admin token over an installed one
+// (Result.AdminTokenRotated). It holds two lines, the install's time (RFC
+// 3339) and the release version the install put on the node (what `k3sm
+// version` reports after it), and never the token or anything derived from
+// it. The update controller decides by the version, which no clock can skew.
+//
+// It exists because the stderr line the install prints for the rotation is
+// read by nobody under a managed roll: that install runs inside the root
+// helper, whose output goes to a root-owned log. The server daemon reads the
+// marker once its node is Ready, publishes the time on its Node for the update
+// controller, and removes it (see AdminTokenRotatedMarkerPath).
+const AdminTokenRotatedMarkerName = "admin-token-rotated-at"
+
+// AdminTokenRotatedMarkerPath is the rotation marker inside a control plane's
+// work dir (<data root>/server for an installed server). It is a function of
+// the work dir alone so the installer, which derives the dir from the data
+// root, and the daemon, which is told it, name one file.
+func AdminTokenRotatedMarkerPath(serverWorkDir string) string {
+	return filepath.Join(serverWorkDir, AdminTokenRotatedMarkerName)
+}
+
+// recordAdminTokenRotation leaves the rotation marker for the server daemon
+// when this install minted over an installed token. An install that kept the
+// token leaves an existing marker in place: the rotation it reports has not
+// been published yet if the marker is still there, and only the node removes
+// it, once its Node carries the mark (the update controller ignores a mark
+// older than the node's handover). The marker is the service user's (the
+// daemon consumes it), 0600 like the token beside it, and written
+// temp-and-rename by the seam.
+func recordAdminTokenRotation(sys System, cfg Config, uid uint32, rotated bool) error {
+	if !rotated {
+		return nil
+	}
+	path := AdminTokenRotatedMarkerPath(cfg.serverWorkDir())
+	at := sys.Now().UTC().Truncate(time.Second).Format(time.RFC3339)
+	release := version.Get().Version
+	if err := sys.WriteServiceUserFile(path, []byte(at+"\n"+release+"\n"), uid, ServerTokenFileMode, ServerTokenDirMode); err != nil {
+		return fmt.Errorf("install: record the admin token rotation at %s: %w", path, err)
+	}
+	cfg.Logger.Info("recorded the admin token rotation for the server to report on its Node", "path", path, "at", at, "release", release)
+	return nil
 }

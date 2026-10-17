@@ -292,7 +292,7 @@ func (c *Controller) reconcile(ctx context.Context) (time.Duration, error) {
 		if u.Name != updatesv1alpha1.UpdateName {
 			c.notTheSingleton(u)
 		} else {
-			if d := c.roll(ctx, u); d < next {
+			if d := c.roll(ctx, u, newestUpdate(list.Items, i)); d < next {
 				next = d
 			}
 		}
@@ -309,6 +309,20 @@ func (c *Controller) reconcile(ctx context.Context) (time.Duration, error) {
 	}
 	return next, nil
 }
+
+// newestUpdate reports whether no Update in items was created after
+// items[i].
+func newestUpdate(items []unstructured.Unstructured, i int) bool {
+	created := items[i].GetCreationTimestamp()
+	for j := range items {
+		if j != i && created.Before(ptrTime(items[j].GetCreationTimestamp())) {
+			return false
+		}
+	}
+	return true
+}
+
+func ptrTime(t metav1.Time) *metav1.Time { return &t }
 
 // notTheSingleton records that an Update under another name is ignored.
 func (c *Controller) notTheSingleton(u *updatesv1alpha1.Update) {

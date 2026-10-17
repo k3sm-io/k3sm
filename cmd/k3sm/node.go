@@ -294,6 +294,11 @@ type nodeOptions struct {
 	// chain to: the server's own, or the one a worker's credential pins. Empty
 	// runs no update watcher.
 	updateClusterCAPEM []byte
+	// adminTokenMarker is the admin token rotation marker in this control
+	// plane's work dir (install.AdminTokenRotatedMarkerPath), which the node
+	// publishes on its Node once Ready (startAdminTokenRotationReport). Only
+	// `k3sm server` sets it; a worker has no server work dir.
+	adminTokenMarker string
 }
 
 // nodeKubeletListen is the standalone `k3sm node` --listen default
@@ -1151,6 +1156,11 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// also waits for the runtime-health probe.
 	stopUpdate := startNodeUpdate(ctx, opts, cs, runtimeHealthProbe(prov), slog.Default())
 	defer timedTeardownStep(slog.Default(), "node-update-watcher", stopUpdate)
+	// A control plane whose last install minted a new admin token tells the
+	// update controller so through its Node, at the same point and for the
+	// same reason: the controller reads it only from a node that is Ready.
+	stopRotationReport := startAdminTokenRotationReport(ctx, opts, cs, slog.Default())
+	defer timedTeardownStep(slog.Default(), "admin-token-rotation-report", stopRotationReport)
 	slog.Default().Info(fmt.Sprintf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir))
 
 	return awaitNodeExit(ctx, errc, stopRuntime)

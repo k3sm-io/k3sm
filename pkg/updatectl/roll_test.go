@@ -17,11 +17,14 @@ limitations under the License.
 package updatectl
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
@@ -540,6 +544,229 @@ func TestBuildMetadataMatchesNodeVersion(t *testing.T) {
 		}
 		if !onTarget(node("n", nv, false), tag) {
 			t.Errorf("%s: a node reporting %q is not on it", tag, nv)
+		}
+	}
+}
+
+// TestNodeStatusCarriesAdminTokenRotated: a control plane whose mark names the
+// release its entry moves it to carries AdminTokenRotated, its message names
+// the remedy and the Succeeded condition names it. The version decides, not
+// the clock: a mark timed before the handover (a lagging control-plane clock)
+// still counts. A mark naming another release (an unstamped build) is logged
+// with both versions and counts only when it was made at or after the
+// handover. A worker's mark is
+// ignored. A mark that lands after the node settled is still recorded while
+// the roll goes on, and when it ends cancelled. The handover clears a mark a
+// node carried in from an earlier roll.
+func TestNodeStatusCarriesAdminTokenRotated(t *testing.T) {
+	const cp2 = "cp2" // a control plane that is not the controller's own
+	type mark struct {
+		node    string
+		version string
+		offset  time.Duration // the mark's time relative to the node's handover
+		late    bool          // set once the node's entry is Done, not when it reports Done
+	}
+	for _, tc := range []struct {
+		name    string
+		marks   []mark
+		cancel  bool
+		rotated []string
+		warn    string // a Warn line must carry this
+	}{
+		{name: "a mark for the release, at the handover", marks: []mark{{node: serverName, version: "0.2.0"}}, rotated: []string{serverName}},
+		{name: "a mark for the release, timed before the handover", marks: []mark{{node: serverName, version: target, offset: -time.Hour}}, rotated: []string{serverName}},
+		{name: "a mark for another release, made after the handover", marks: []mark{{node: serverName, version: "dev", offset: time.Minute}}, rotated: []string{serverName}, warn: "mark_version=dev to=v0.2.0"},
+		{name: "a mark for another release, made at the handover", marks: []mark{{node: serverName, version: "0.1.9"}}, rotated: []string{serverName}, warn: "mark_version=0.1.9 to=v0.2.0"},
+		{name: "a mark for another release, made before the handover", marks: []mark{{node: serverName, version: "0.1.9", offset: -time.Second}}, warn: "mark_version=0.1.9 to=v0.2.0"},
+		{name: "no mark"},
+		{name: "a worker's mark", marks: []mark{{node: "w1", version: "0.2.0"}}},
+		{name: "a mark that lands after the node settled", marks: []mark{{node: cp2, version: "0.2.0", late: true}}, rotated: []string{cp2}},
+		{name: "a mark on a roll that ends cancelled", marks: []mark{{node: cp2, version: "0.2.0"}}, cancel: true, rotated: []string{cp2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nodes := append(threeNodes(), node(cp2, oldKubelet, true))
+			// w1 carries a mark from an earlier roll: its handover clears it.
+			nodes[2].Annotations = map[string]string{AdminTokenRotatedAnnotation: "0.2.0 " + rigStart.Add(-time.Hour).Format(time.RFC3339)}
+			r := newRig(t, nodes...)
+			r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+			c := r.controller()
+			var logs bytes.Buffer
+			c.log = slog.New(slog.NewTextHandler(&logs, nil))
+			done := map[string]bool{}
+			cancelled := false
+			for range 1000 {
+				if _, err := c.reconcile(context.Background()); err != nil {
+					t.Fatalf("reconcile: %v", err)
+				}
+				u := r.update(updatesv1alpha1.UpdateName)
+				if finished(u) {
+					break
+				}
+				entryDone := map[string]bool{}
+				for _, e := range u.Status.Nodes {
+					entryDone[e.Name] = e.Phase == updatesv1alpha1.UpdateNodePhaseDone
+				}
+				r.nodeSide()
+				for _, m := range tc.marks {
+					n := r.node(m.node)
+					reported := n.Annotations[updatesv1alpha1.AnnotationUpdatePhase] == string(updatesv1alpha1.UpdateNodePhaseDone)
+					if done[m.node] || !reported || (m.late && !entryDone[m.node]) {
+						continue
+					}
+					handedAt, ok := annotationTime(n, HandedOverAnnotation)
+					if !ok {
+						handedAt = r.now // the release patch has already gone
+					}
+					n.Annotations[AdminTokenRotatedAnnotation] = m.version + " " + handedAt.Add(m.offset).Format(time.RFC3339)
+					if err := r.cs.Tracker().Update(corev1.SchemeGroupVersion.WithResource("nodes"), n, ""); err != nil {
+						t.Fatal(err)
+					}
+					done[m.node] = true
+				}
+				// Cancel while cp2 settles: the roll ends before srv starts.
+				if tc.cancel && !cancelled && done[cp2] {
+					r.setCancel()
+					cancelled = true
+				}
+				r.now = r.now.Add(r.step)
+			}
+			u := r.update(updatesv1alpha1.UpdateName)
+			want := updatesv1alpha1.UpdatePhaseSucceeded
+			if tc.cancel {
+				want = updatesv1alpha1.UpdatePhaseCancelled
+			}
+			if u.Status.Phase != want {
+				t.Fatalf("phase %q, want %q", u.Status.Phase, want)
+			}
+			for _, e := range u.Status.Nodes {
+				flagged := slices.Contains(tc.rotated, e.Name)
+				if e.AdminTokenRotated != flagged {
+					t.Errorf("node %s AdminTokenRotated = %v, want %v", e.Name, e.AdminTokenRotated, flagged)
+				}
+				if got := strings.Contains(e.Message, AdminTokenRotatedMessage); got != flagged {
+					t.Errorf("node %s message %q: remedy present %v, want %v", e.Name, e.Message, got, flagged)
+				}
+			}
+			if !tc.cancel {
+				succeeded := meta.FindStatusCondition(u.Status.Conditions, ConditionSucceeded)
+				if succeeded == nil {
+					t.Fatal("no Succeeded condition")
+				}
+				for _, name := range []string{serverName, cp2} {
+					names := strings.Contains(succeeded.Message, "admin credential re-minted on") && strings.Contains(succeeded.Message, name)
+					if flagged := slices.Contains(tc.rotated, name); names != flagged {
+						t.Errorf("Succeeded message %q: names %s %v, want %v", succeeded.Message, name, names, flagged)
+					}
+				}
+			}
+			if v := r.node("w1").Annotations[AdminTokenRotatedAnnotation]; strings.HasSuffix(v, rigStart.Add(-time.Hour).Format(time.RFC3339)) {
+				t.Error("the handover left w1's mark from an earlier roll")
+			}
+			if tc.warn != "" && (!strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), tc.warn)) {
+				t.Errorf("no Warn naming both versions (%q) in:\n%s", tc.warn, logs.String())
+			}
+			if tc.warn == "" && strings.Contains(logs.String(), "mark_version=") {
+				t.Errorf("a version-mismatch Warn on a mark that names the release:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// TestAdminTokenRotationAfterSucceeded: a control plane's mark that lands
+// after the newest Update reached Succeeded is still recorded on it, and the
+// Succeeded condition names the node; once a newer Update exists the old one
+// is left as it is.
+func TestAdminTokenRotationAfterSucceeded(t *testing.T) {
+	const cp2 = "cp2"
+	succeeded := func(t *testing.T) (*rig, *Controller) {
+		t.Helper()
+		r := newRig(t, append(threeNodes(), node(cp2, oldKubelet, true))...)
+		r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+		c := r.controller()
+		r.drive(c, nil)
+		if got := r.update(updatesv1alpha1.UpdateName).Status.Phase; got != updatesv1alpha1.UpdatePhaseSucceeded {
+			t.Fatalf("phase %q, want Succeeded", got)
+		}
+		return r, c
+	}
+	markLate := func(t *testing.T, r *rig, c *Controller, name string) *updatesv1alpha1.Update {
+		t.Helper()
+		n := r.node(name)
+		n.Annotations[AdminTokenRotatedAnnotation] = "0.2.0 " + r.now.Format(time.RFC3339)
+		if err := r.cs.Tracker().Update(corev1.SchemeGroupVersion.WithResource("nodes"), n, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return r.update(updatesv1alpha1.UpdateName)
+	}
+	entry := func(u *updatesv1alpha1.Update, name string) updatesv1alpha1.UpdateNodeStatus {
+		for _, e := range u.Status.Nodes {
+			if e.Name == name {
+				return e
+			}
+		}
+		return updatesv1alpha1.UpdateNodeStatus{}
+	}
+
+	t.Run("the newest Update records a late mark", func(t *testing.T) {
+		r, c := succeeded(t)
+		u := markLate(t, r, c, serverName)
+		if e := entry(u, serverName); !e.AdminTokenRotated || !strings.Contains(e.Message, AdminTokenRotatedMessage) {
+			t.Errorf("srv entry %+v: want the flag and the remedy", e)
+		}
+		if cond := meta.FindStatusCondition(u.Status.Conditions, ConditionSucceeded); cond == nil || cond.Status != metav1.ConditionTrue ||
+			!strings.Contains(cond.Message, "admin credential re-minted on "+serverName) {
+			t.Errorf("Succeeded %+v", cond)
+		}
+		if u.Status.Phase != updatesv1alpha1.UpdatePhaseSucceeded {
+			t.Errorf("phase %q", u.Status.Phase)
+		}
+	})
+
+	t.Run("an Update a newer one followed is left alone", func(t *testing.T) {
+		r, c := succeeded(t)
+		newer := &updatesv1alpha1.Update{
+			TypeMeta:   metav1.TypeMeta{APIVersion: updatesv1alpha1.SchemeGroupVersion.String(), Kind: "Update"},
+			ObjectMeta: metav1.ObjectMeta{Name: "later", Generation: 1, CreationTimestamp: metav1.NewTime(r.now)},
+			Spec:       updatesv1alpha1.UpdateSpec{Version: "v0.2.1"},
+		}
+		obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(newer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.dyn.Resource(updateResource).Create(context.Background(), &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		u := markLate(t, r, c, cp2)
+		if e := entry(u, cp2); e.AdminTokenRotated || strings.Contains(e.Message, AdminTokenRotatedMessage) {
+			t.Errorf("cp2 entry %+v: an older Update recorded a mark", e)
+		}
+		if cond := meta.FindStatusCondition(u.Status.Conditions, ConditionSucceeded); cond == nil || strings.Contains(cond.Message, "re-minted") {
+			t.Errorf("Succeeded %+v", cond)
+		}
+	})
+}
+
+// TestParseAdminTokenRotatedMark pins the annotation's one shape.
+func TestParseAdminTokenRotatedMark(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		version string
+		ok      bool
+	}{
+		{"0.2.0 2026-10-17T09:30:00Z", "0.2.0", true},
+		{"v0.2.0 2026-10-17T09:30:00Z", "v0.2.0", true},
+		{"2026-10-17T09:30:00Z", "", false},
+		{"0.2.0 not-a-time", "", false},
+		{"0.2.0 2026-10-17T09:30:00Z extra", "", false},
+		{" 2026-10-17T09:30:00Z", "", false},
+		{"", "", false},
+	} {
+		v, _, ok := ParseAdminTokenRotatedMark(tc.in)
+		if ok != tc.ok || v != tc.version {
+			t.Errorf("ParseAdminTokenRotatedMark(%q) = %q, %v; want %q, %v", tc.in, v, ok, tc.version, tc.ok)
 		}
 	}
 }
