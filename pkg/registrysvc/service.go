@@ -216,8 +216,9 @@ func (s *Service) startOnce(ctx context.Context) error {
 	// Fail closed BEFORE the spawn if the port is already held: the readiness wait
 	// below would be satisfied by the incumbent's listener, so a child that lost
 	// its bind would leave the registry reporting itself up while every push went
-	// to somebody else's registry.
-	if err := preflightPort(s.cfg.BindAddress, s.cfg.Port); err != nil {
+	// to somebody else's registry. The one holder that is reclaimed first is a
+	// previous server's orphaned child (orphan.go), which nothing else ever stops.
+	if err := s.claimPort(ctx); err != nil {
 		return err
 	}
 	c, err := s.spawn()
