@@ -40,7 +40,6 @@ func healthyDoctorEnv() doctorEnv {
 		macOSVersion:     func() (string, error) { return "26.1", nil },
 		sipEnabled:       func() (bool, error) { return true, nil },
 		helperState:      func() (bool, bool) { return true, true },
-		brewPresent:      func() bool { return true },
 		datastorePosture: func() (bool, int, string, error) { return true, 3, "wal", nil },
 		developerDir:     func() (string, error) { return "/Applications/Xcode.app/Contents/Developer", nil },
 		// The healthy baseline is a control plane, which is what a Mac running
@@ -110,10 +109,6 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"helper/warn-not-installed", checkHelper, func(e *doctorEnv) {
 			e.helperState = func() (bool, bool) { return false, false }
 		}, statusWarn},
-
-		// brew: present → PASS, absent → WARN.
-		{"brew/pass-present", checkBrew, func(e *doctorEnv) { e.brewPresent = func() bool { return true } }, statusPass},
-		{"brew/warn-absent", checkBrew, func(e *doctorEnv) { e.brewPresent = func() bool { return false } }, statusWarn},
 
 		// datastore: present+wal → PASS, absent → SKIP, non-wal → WARN, error → WARN;
 		// and on a worker SKIP either way — a worker runs no kine.
@@ -383,7 +378,7 @@ func TestDoctorChecksTable(t *testing.T) {
 				t.Errorf("registry entry %q returns checkResult.name %q — must match", dc.name, r.name)
 			}
 		}
-		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "brew", "datastore", "toolchain", "agent-daemon"} {
+		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon"} {
 			if !seen[want] {
 				t.Errorf("registry missing check %q", want)
 			}

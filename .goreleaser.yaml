@@ -1,8 +1,8 @@
 # k3sm goreleaser config — UNSIGNED SNAPSHOT (build shape only).
 #
 # This config proves the RELEASE ARTIFACT SHAPE for the single k3sm binary. It is
-# deliberately an unsigned snapshot: codesigning/notarization and the Homebrew-tap
-# push require signing credentials held outside this repo and are stubbed-disabled
+# deliberately an unsigned snapshot: codesigning/notarization
+# requires signing credentials held outside this repo and is stubbed-disabled
 # below (goreleaser schema-validates live `signs:`/`notarize:`/`brews:` stanzas
 # against certs/tokens that are absent in this repo, so they are kept as commented
 # reference blocks).
@@ -148,7 +148,7 @@ snapshot:
   # Keep snapshot versions from colliding with real tags.
   version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
 
-# --- STUBBED HUMAN SLICE (signing / notarization / Homebrew tap) --------------
+# --- STUBBED HUMAN SLICE (signing / notarization) --------------
 # Kept as commented reference so the full release contract is reviewable without
 # failing schema validation against certs/tokens that are absent in this repo.
 # Secrets are referenced ONLY via {{ .Env.* }} templates — never literals.
@@ -171,13 +171,3 @@ snapshot:
 #         issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
 #         key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
 #         key: "{{ .Env.MACOS_NOTARY_KEY }}"
-#
-# brews:
-#   - name: k3sm
-#     repository:
-#       owner: k3sm-io
-#       name: homebrew-tap
-#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-#     homepage: "https://k3sm.io"
-#     description: "macOS-native Kubernetes distribution for Apple Silicon"
-#     license: "Apache-2.0"

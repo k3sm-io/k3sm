@@ -148,11 +148,10 @@ Seatbelt-confined. The consequences:
   running as root, and the helper plus a startup probe otherwise, which is how it runs in production.
   `--network none` is no-op networking for control-plane-only or CI bring-up; it is **not** a
   production fallback.
-- **Upgrade.** Re-running the install script, or a Homebrew upgrade once the tap ships, replaces the
+- **Upgrade.** Re-running the install script replaces the
   binary and restarts both LaunchDaemons onto it. The helper RPC is version-stamped and additive, so
-  a routine upgrade does not break the datapath. Homebrew packaging and the notarized, signed
-  installer are the second and third install generations, arriving with and after the first public
-  release. See [user/install.md](user/install.md) and [user/upgrade.md](user/upgrade.md).
+  a routine upgrade does not break the datapath. The k3sm app through the Mac App Store and the notarized, signed
+  installer are the second and third install generations. See [user/install.md](user/install.md) and [user/upgrade.md](user/upgrade.md).
 - **Uninstall.** `sudo k3sm uninstall` boots out both daemons, removes the `lo0` aliases, and removes
   `/Library/k3sm`. No orphaned root listener survives, and the `utun` goes with netd, because the
   kernel reaps a `utun` when the process holding it exits. Uninstall also flushes the mesh's `io.k3sm.mesh` `pf` anchor, which older

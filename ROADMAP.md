@@ -92,7 +92,7 @@ release engineering. What ships:
 - Install arrives in three generations, in shipping order: *(1)*
   `curl -fsSL https://k3sm.io/install.sh | sh`, a checksum-verified release tarball handed to
   `sudo k3sm install` (a curl download carries no quarantine xattr); *(2)*
-  `brew install k3sm-io/tap/k3sm`; *(3)* a signed, notarized `.pkg`. Underneath it are goreleaser,
+  the k3sm app through the Mac App Store; *(3)* a signed, notarized `.pkg`. Underneath it are goreleaser,
   [user docs](docs/user/), and the website.
 - `k3sm image load` / `k3sm image import` ingest docker-save
   tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and

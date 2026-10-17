@@ -47,8 +47,7 @@ import (
 // the single root step (run as `sudo k3sm install`): it copies THIS binary into
 // the root-owned install dir, writes the plists, bootstraps both daemons, and
 // writes the admin kubeconfig to the invoking human's home ($SUDO_USER), owned by
-// them. The Homebrew formula that invokes this and the notarize/signing pipeline
-// are the packaging follow-up.
+// them. The notarize/signing pipeline is the packaging follow-up.
 func runInstall(args []string) error {
 	env := installEnv{
 		euid:        os.Geteuid(),

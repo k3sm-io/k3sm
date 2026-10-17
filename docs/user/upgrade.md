@@ -123,8 +123,7 @@ Mac, 10240 on an 8 GB one). When it is below the limit k3sm requests, the instal
 the node's UDP Service flow capacity drops toward its floor. `sudo sysctl -w kern.maxfiles=131072
 kern.maxfilesperproc=131072` raises it until the next reboot.
 
-> **Homebrew is planned; the `k3sm-io/tap` is not published yet.** When it ships, `brew upgrade
-> k3sm` will do the same job, restarting the daemons via `launchctl kickstart`.
+> **The k3sm app, through the Mac App Store, is planned** as a second upgrade channel.
 
 ## Multi-Node Rolling Upgrade
 
@@ -242,8 +241,7 @@ install again with another `--update-release-base` to change it.
   release changes the datastore engine (below), but that copy lives on the same disk as the cluster it
   protects, so it is not a substitute for yours.
 - Know your rollback path. On the script channel, prior releases stay downloadable, so rollback is
-  `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run. The planned Homebrew channel will retain the
-  prior bottle, so rollback there will not need a rebuild round-trip.
+  `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
 - Check the version skew. Confirm the target Kubernetes pin with `k3sm version`; see
   [Versions](versions.md).
 
@@ -366,8 +364,7 @@ needs more than one server (see [HA](ha.md)).
 ## Rollback
 
 Rollback means reverting to the previous binary, plus the daemon restart that comes with it. There is
-no runtime flag to flip. On the script channel that is `K3SM_INSTALL_VERSION=<prior-tag>` and a
-re-run. On the planned Homebrew channel it will be a `brew` pin or a switch to the prior bottle.
+no runtime flag to flip. That is `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
 
 If the release you are leaving changed the **datastore engine**, reverting the binary is only half of
 it, because the database has already been migrated in place. Restore the
