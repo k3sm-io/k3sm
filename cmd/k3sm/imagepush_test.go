@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"io"
@@ -86,10 +87,12 @@ func TestImagePushOCILayout(t *testing.T) {
 		}
 	})
 
-	t.Run("sends-the-env-token-as-a-bearer-credential", func(t *testing.T) {
+	t.Run("sends-the-env-token-as-a-basic-credential", func(t *testing.T) {
 		const token = "s3cr3t-token-value"
 		t.Setenv(registryTokenEnv, "  "+token+"\n") // a token read from a file carries its newline
-		host, probe := startRegistry(t, "Bearer "+token)
+		t.Setenv(registryUserEnv, "")
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte(defaultRegistryUser+":"+token))
+		host, probe := startRegistry(t, want)
 		dir := fixtureLayout(t, "example.com/app:v1", "payload-two")
 
 		out, err := runPush(t, dir, host+"/team/app:v1")
@@ -99,7 +102,7 @@ func TestImagePushOCILayout(t *testing.T) {
 		seen := probe.headers()
 		authorized := 0
 		for _, h := range seen {
-			if h == "Bearer "+token {
+			if h == want {
 				authorized++
 				continue
 			}
@@ -108,7 +111,7 @@ func TestImagePushOCILayout(t *testing.T) {
 			}
 		}
 		if authorized == 0 {
-			t.Errorf("no request carried the env token as a bearer credential; headers = %q", seen)
+			t.Errorf("no request carried the env token as a basic credential; headers = %q", seen)
 		}
 		if strings.Contains(out, token) {
 			t.Error("push echoed the credential to stdout")
@@ -233,7 +236,7 @@ func TestImagePushOCILayout(t *testing.T) {
 
 		t.Run("auth", func(t *testing.T) {
 			t.Setenv(registryTokenEnv, "the-wrong-token")
-			host, _ := startRegistry(t, "Bearer the-right-token")
+			host, _ := startRegistry(t, "Basic "+base64.StdEncoding.EncodeToString([]byte(defaultRegistryUser+":the-right-token")))
 			err := mustFailPush(t, dir, host+"/team/app:v1")
 			if !errors.Is(err, errPushAuth) {
 				t.Errorf("push with a refused credential = %v, want errPushAuth", err)

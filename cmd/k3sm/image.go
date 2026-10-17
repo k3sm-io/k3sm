@@ -88,7 +88,8 @@ push    upload an image to a registry reference, and print the digest it now has
         that is no path on disk is taken as a reference in THIS NODE's store,
         exported with save and then uploaded. The upload itself does NOT talk to
         the daemon: it reads a directory you own and uploads as you. The
-        credential comes from $K3SM_REGISTRY_TOKEN, this node's own
+        credential comes from $K3SM_REGISTRY_TOKEN (with $K3SM_REGISTRY_USER
+        as its user, "token" by default), this node's own
         ingest-registry credential (only when the target IS this node's loopback
         registry), or the docker config chain — never from the command line, and
         k3sm stores none of it.

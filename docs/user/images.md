@@ -318,6 +318,21 @@ The credential is read at the moment of the upload and forgotten. It comes from
 writes no credential file and never takes one on the command line, where it would land in shell
 history and process listings.
 
+`K3SM_REGISTRY_TOKEN` is used the way `docker login` uses a password: k3sm presents it with the
+username in `K3SM_REGISTRY_USER` (`token` if that is unset), and a registry that issues
+short-lived tokens, as ghcr.io, Docker Hub and most hosted registries do, trades it for a token
+scoped to the repository being pushed.
+
+For ghcr.io, use a classic personal access token with the `write:packages` scope, or a
+fine-grained token with write access to packages. ghcr ignores the username for a token, so
+`K3SM_REGISTRY_USER` can stay unset:
+
+```sh
+K3SM_REGISTRY_TOKEN="$(cat ~/.config/ghcr-token)" k3sm image push ./layout ghcr.io/me/myapp:v1
+```
+
+Neither the token you set nor the token the registry issues is ever printed or logged.
+
 That closes the loop of **build → push → pull → run**. The node pulls exactly as it would from any
 registry: digests verified, `imagePullSecrets` honoured, multi-arch manifest lists read.
 
