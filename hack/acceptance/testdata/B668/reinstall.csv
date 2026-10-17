@@ -1,0 +1,395 @@
+t_ms,role,node,probe,ok,ms,detail
+1792000000003,server,k3sm-server,node,1,120,ready=True phase=
+1792000000007,server,k3sm-server,daemon,1,1402,server=running
+1792000000007,server,k3sm-server,status,0,1402,exit=1 verdict=degraded
+1792000000011,server,k3sm-server,api,1,74,ok
+1792000000027,server,k3sm-server,netd,1,1,connected
+1792000000255,server,k3sm-server,api,1,78,ok
+1792000000255,server,k3sm-server,node,1,106,ready=True phase=
+1792000000293,server,k3sm-server,netd,1,3,connected
+1792000000510,server,k3sm-server,api,1,77,ok
+1792000000522,server,k3sm-server,node,1,62,ready=True phase=
+1792000000562,server,k3sm-server,netd,1,1,connected
+1792000000751,server,k3sm-server,api,1,40,ok
+1792000000776,server,k3sm-server,node,1,74,ready=True phase=
+1792000000826,server,k3sm-server,netd,1,1,connected
+1792000001019,server,k3sm-server,api,1,70,ok
+1792000001042,server,k3sm-server,node,1,101,ready=True phase=
+1792000001067,server,k3sm-server,netd,1,3,connected
+1792000001267,server,k3sm-server,api,1,54,ok
+1792000001304,server,k3sm-server,node,1,103,ready=True phase=
+1792000001322,server,k3sm-server,netd,1,1,connected
+1792000001409,server,k3sm-server,daemon,1,1661,server=running
+1792000001409,server,k3sm-server,status,0,1661,exit=1 verdict=degraded
+1792000001512,server,k3sm-server,api,1,85,ok
+1792000001546,server,k3sm-server,node,1,73,ready=True phase=
+1792000001589,server,k3sm-server,netd,1,2,connected
+1792000001766,server,k3sm-server,api,1,75,ok
+1792000001812,server,k3sm-server,node,1,75,ready=True phase=
+1792000001847,server,k3sm-server,netd,1,1,connected
+1792000002021,server,k3sm-server,api,1,80,ok
+1792000002078,server,k3sm-server,node,1,109,ready=True phase=
+1792000002101,server,k3sm-server,netd,1,1,connected
+1792000002287,server,k3sm-server,api,1,54,ok
+1792000002326,server,k3sm-server,node,1,71,ready=True phase=
+1792000002346,server,k3sm-server,netd,1,2,connected
+1792000002546,server,k3sm-server,api,1,73,ok
+1792000002585,server,k3sm-server,node,1,103,ready=True phase=
+1792000002593,server,k3sm-server,netd,1,1,connected
+1792000002797,server,k3sm-server,api,1,40,ok
+1792000002849,server,k3sm-server,netd,1,2,connected
+1792000002850,server,k3sm-server,node,1,117,ready=True phase=
+1792000003057,server,k3sm-server,api,1,44,ok
+1792000003070,server,k3sm-server,daemon,1,1382,server=running
+1792000003070,server,k3sm-server,status,1,1382,exit=0 verdict=running
+1792000003091,server,k3sm-server,netd,1,3,connected
+1792000003118,server,k3sm-server,node,1,70,ready=True phase=
+1792000003302,server,k3sm-server,api,1,77,ok
+1792000003334,server,k3sm-server,netd,1,1,connected
+1792000003384,server,k3sm-server,node,1,80,ready=True phase=
+1792000003543,server,k3sm-server,api,1,89,ok
+1792000003582,server,k3sm-server,netd,1,3,connected
+1792000003630,server,k3sm-server,node,1,65,ready=True phase=
+1792000003784,server,k3sm-server,api,1,57,ok
+1792000003836,server,k3sm-server,netd,1,1,connected
+1792000003892,server,k3sm-server,node,1,65,ready=True phase=
+1792000004039,server,k3sm-server,api,1,86,ok
+1792000004087,server,k3sm-server,netd,0,1,Connection refused
+1792000004135,server,k3sm-server,node,1,76,ready=True phase=
+1792000004306,server,k3sm-server,api,1,64,ok
+1792000004330,server,k3sm-server,netd,0,1,Connection refused
+1792000004400,server,k3sm-server,node,1,78,ready=True phase=
+1792000004452,server,k3sm-server,daemon,1,1500,server=running
+1792000004452,server,k3sm-server,status,1,1500,exit=0 verdict=running
+1792000004568,server,k3sm-server,api,1,67,ok
+1792000004575,server,k3sm-server,netd,0,2,Connection refused
+1792000004641,server,k3sm-server,node,1,88,ready=True phase=
+1792000004819,server,k3sm-server,api,1,76,ok
+1792000004843,server,k3sm-server,netd,0,1,Connection refused
+1792000004899,server,k3sm-server,node,1,103,ready=True phase=
+1792000005073,server,k3sm-server,api,1,48,ok
+1792000005108,server,k3sm-server,netd,0,1,Connection refused
+1792000005149,server,k3sm-server,node,1,61,ready=True phase=
+1792000005339,server,k3sm-server,api,1,46,ok
+1792000005362,server,k3sm-server,netd,0,3,Connection refused
+1792000005399,server,k3sm-server,node,1,87,ready=True phase=
+1792000005580,server,k3sm-server,api,1,71,ok
+1792000005628,server,k3sm-server,netd,0,1,Connection refused
+1792000005650,server,k3sm-server,node,1,64,ready=True phase=
+1792000005827,server,k3sm-server,api,1,83,ok
+1792000005891,server,k3sm-server,netd,0,1,Connection refused
+1792000005897,server,k3sm-server,node,1,97,ready=True phase=
+1792000005952,server,k3sm-server,daemon,0,1554,server=stopped
+1792000005952,server,k3sm-server,status,0,1554,exit=1 verdict=degraded
+1792000006080,server,k3sm-server,api,0,80,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000006139,server,k3sm-server,netd,1,3,connected
+1792000006159,server,k3sm-server,node,0,91,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000006345,server,k3sm-server,api,0,66,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000006395,server,k3sm-server,netd,1,1,connected
+1792000006411,server,k3sm-server,node,0,94,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000006601,server,k3sm-server,api,0,64,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000006649,server,k3sm-server,netd,1,1,connected
+1792000006660,server,k3sm-server,node,0,116,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000006858,server,k3sm-server,api,0,74,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000006908,server,k3sm-server,node,0,102,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000006914,server,k3sm-server,netd,1,1,connected
+1792000007115,server,k3sm-server,api,0,77,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000007156,server,k3sm-server,netd,1,1,connected
+1792000007161,server,k3sm-server,node,0,88,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000007362,server,k3sm-server,api,0,61,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000007398,server,k3sm-server,netd,1,1,connected
+1792000007428,server,k3sm-server,node,0,118,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000007506,server,k3sm-server,daemon,0,1542,server=stopped
+1792000007506,server,k3sm-server,status,0,1542,exit=1 verdict=degraded
+1792000007623,server,k3sm-server,api,0,41,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000007664,server,k3sm-server,netd,1,1,connected
+1792000007676,server,k3sm-server,node,0,93,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000007889,server,k3sm-server,api,0,78,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000007919,server,k3sm-server,netd,1,2,connected
+1792000007944,server,k3sm-server,node,0,83,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000008149,server,k3sm-server,api,0,50,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000008168,server,k3sm-server,netd,1,2,connected
+1792000008204,server,k3sm-server,node,0,83,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000008410,server,k3sm-server,api,0,60,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000008411,server,k3sm-server,netd,1,2,connected
+1792000008467,server,k3sm-server,node,0,78,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000008670,server,k3sm-server,netd,1,3,connected
+1792000008679,server,k3sm-server,api,0,76,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000008727,server,k3sm-server,node,0,102,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000008919,server,k3sm-server,netd,1,2,connected
+1792000008936,server,k3sm-server,api,0,85,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000008986,server,k3sm-server,node,0,111,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000009048,server,k3sm-server,daemon,0,1658,server=stopped
+1792000009048,server,k3sm-server,status,0,1658,exit=1 verdict=degraded
+1792000009165,server,k3sm-server,netd,1,2,connected
+1792000009195,server,k3sm-server,api,0,80,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000009251,server,k3sm-server,node,0,66,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000009418,server,k3sm-server,netd,1,1,connected
+1792000009460,server,k3sm-server,api,0,76,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000009514,server,k3sm-server,node,0,81,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000009674,server,k3sm-server,netd,1,3,connected
+1792000009708,server,k3sm-server,api,0,47,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000009774,server,k3sm-server,node,0,94,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000009936,server,k3sm-server,netd,1,1,connected
+1792000009950,server,k3sm-server,api,0,80,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000010030,server,k3sm-server,node,0,102,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000010193,server,k3sm-server,netd,1,1,connected
+1792000010220,server,k3sm-server,api,0,45,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000010284,server,k3sm-server,node,0,82,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000010444,server,k3sm-server,netd,1,3,connected
+1792000010470,server,k3sm-server,api,0,44,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000010526,server,k3sm-server,node,0,78,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000010704,server,k3sm-server,netd,1,3,connected
+1792000010706,server,k3sm-server,daemon,0,1334,server=stopped
+1792000010706,server,k3sm-server,status,0,1334,exit=1 verdict=degraded
+1792000010723,server,k3sm-server,api,0,49,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000010786,server,k3sm-server,node,0,96,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000010955,server,k3sm-server,netd,1,1,connected
+1792000010963,server,k3sm-server,api,0,67,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000011049,server,k3sm-server,node,0,101,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000011214,server,k3sm-server,netd,1,2,connected
+1792000011226,server,k3sm-server,api,0,47,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000011308,server,k3sm-server,node,0,100,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000011456,server,k3sm-server,netd,1,3,connected
+1792000011468,server,k3sm-server,api,0,79,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000011553,server,k3sm-server,node,0,83,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000011710,server,k3sm-server,netd,1,3,connected
+1792000011730,server,k3sm-server,api,0,64,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000011819,server,k3sm-server,node,0,101,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000011960,server,k3sm-server,netd,1,3,connected
+1792000011992,server,k3sm-server,api,0,61,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000012040,server,k3sm-server,daemon,0,1575,server=stopped
+1792000012040,server,k3sm-server,status,0,1575,exit=1 verdict=degraded
+1792000012073,server,k3sm-server,node,0,66,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000012212,server,k3sm-server,netd,1,1,connected
+1792000012249,server,k3sm-server,api,0,57,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000012341,server,k3sm-server,node,0,69,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000012460,server,k3sm-server,netd,1,3,connected
+1792000012504,server,k3sm-server,api,0,42,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000012608,server,k3sm-server,node,0,101,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000012708,server,k3sm-server,netd,1,3,connected
+1792000012753,server,k3sm-server,api,0,44,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000012870,server,k3sm-server,node,0,98,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000012950,server,k3sm-server,netd,1,2,connected
+1792000012996,server,k3sm-server,api,0,74,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000013123,server,k3sm-server,node,0,79,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000013197,server,k3sm-server,netd,1,1,connected
+1792000013237,server,k3sm-server,api,0,52,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000013382,server,k3sm-server,node,0,89,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000013463,server,k3sm-server,netd,1,2,connected
+1792000013506,server,k3sm-server,api,0,58,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000013615,server,k3sm-server,daemon,0,1516,server=stopped
+1792000013615,server,k3sm-server,status,0,1516,exit=1 verdict=degraded
+1792000013637,server,k3sm-server,node,0,110,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000013714,server,k3sm-server,netd,1,3,connected
+1792000013765,server,k3sm-server,api,0,49,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000013882,server,k3sm-server,node,0,64,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000013978,server,k3sm-server,netd,1,2,connected
+1792000014025,server,k3sm-server,api,0,61,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000014125,server,k3sm-server,node,0,71,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000014222,server,k3sm-server,netd,1,3,connected
+1792000014275,server,k3sm-server,api,0,48,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000014388,server,k3sm-server,node,0,94,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000014465,server,k3sm-server,netd,1,3,connected
+1792000014542,server,k3sm-server,api,0,64,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000014645,server,k3sm-server,node,0,85,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000014725,server,k3sm-server,netd,1,3,connected
+1792000014793,server,k3sm-server,api,0,73,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000014896,server,k3sm-server,node,0,77,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000014989,server,k3sm-server,netd,1,3,connected
+1792000015044,server,k3sm-server,api,0,78,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000015131,server,k3sm-server,daemon,0,1406,server=stopped
+1792000015131,server,k3sm-server,status,0,1406,exit=1 verdict=degraded
+1792000015144,server,k3sm-server,node,0,63,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000015232,server,k3sm-server,netd,1,2,connected
+1792000015305,server,k3sm-server,api,0,46,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000015410,server,k3sm-server,node,0,62,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000015489,server,k3sm-server,netd,1,1,connected
+1792000015564,server,k3sm-server,api,0,72,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000015664,server,k3sm-server,node,0,77,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000015754,server,k3sm-server,netd,1,3,connected
+1792000015812,server,k3sm-server,api,0,80,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000015912,server,k3sm-server,node,0,109,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000015994,server,k3sm-server,netd,1,1,connected
+1792000016073,server,k3sm-server,api,0,55,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000016167,server,k3sm-server,node,0,116,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000016241,server,k3sm-server,netd,1,2,connected
+1792000016341,server,k3sm-server,api,0,67,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000016417,server,k3sm-server,node,0,85,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000016482,server,k3sm-server,netd,1,1,connected
+1792000016537,server,k3sm-server,daemon,0,1632,server=stopped
+1792000016537,server,k3sm-server,status,0,1632,exit=1 verdict=degraded
+1792000016611,server,k3sm-server,api,0,73,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000016671,server,k3sm-server,node,0,111,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000016739,server,k3sm-server,netd,1,3,connected
+1792000016860,server,k3sm-server,api,0,61,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000016934,server,k3sm-server,node,0,82,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000017005,server,k3sm-server,netd,1,1,connected
+1792000017100,server,k3sm-server,api,0,66,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000017189,server,k3sm-server,node,0,67,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000017270,server,k3sm-server,netd,1,2,connected
+1792000017370,server,k3sm-server,api,0,60,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000017433,server,k3sm-server,node,0,97,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000017535,server,k3sm-server,netd,1,1,connected
+1792000017610,server,k3sm-server,api,0,79,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000017676,server,k3sm-server,node,0,67,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000017776,server,k3sm-server,netd,1,1,connected
+1792000017868,server,k3sm-server,api,0,48,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000017933,server,k3sm-server,node,0,118,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000018036,server,k3sm-server,netd,1,3,connected
+1792000018110,server,k3sm-server,api,0,80,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000018169,server,k3sm-server,daemon,0,1550,server=stopped
+1792000018169,server,k3sm-server,status,0,1550,exit=1 verdict=degraded
+1792000018195,server,k3sm-server,node,0,71,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000018305,server,k3sm-server,netd,1,3,connected
+1792000018360,server,k3sm-server,api,0,62,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000018456,server,k3sm-server,node,0,96,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000018554,server,k3sm-server,netd,1,1,connected
+1792000018620,server,k3sm-server,api,0,62,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000018709,server,k3sm-server,node,0,107,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000018795,server,k3sm-server,netd,1,3,connected
+1792000018878,server,k3sm-server,api,0,57,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000018960,server,k3sm-server,node,0,107,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000019050,server,k3sm-server,netd,1,3,connected
+1792000019141,server,k3sm-server,api,0,41,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000019204,server,k3sm-server,node,0,98,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000019297,server,k3sm-server,netd,1,3,connected
+1792000019398,server,k3sm-server,api,0,83,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000019449,server,k3sm-server,node,0,85,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000019560,server,k3sm-server,netd,1,3,connected
+1792000019639,server,k3sm-server,api,0,63,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000019713,server,k3sm-server,node,0,94,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000019719,server,k3sm-server,daemon,0,1455,server=stopped
+1792000019719,server,k3sm-server,status,0,1455,exit=1 verdict=degraded
+1792000019802,server,k3sm-server,netd,1,2,connected
+1792000019886,server,k3sm-server,api,0,69,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000019968,server,k3sm-server,node,0,96,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000020068,server,k3sm-server,netd,1,1,connected
+1792000020135,server,k3sm-server,api,1,78,ok
+1792000020214,server,k3sm-server,node,1,115,ready=True phase=
+1792000020333,server,k3sm-server,netd,1,1,connected
+1792000020385,server,k3sm-server,api,1,63,ok
+1792000020461,server,k3sm-server,node,1,110,ready=True phase=
+1792000020603,server,k3sm-server,netd,1,3,connected
+1792000020631,server,k3sm-server,api,1,88,ok
+1792000020710,server,k3sm-server,node,1,113,ready=True phase=
+1792000020850,server,k3sm-server,netd,1,3,connected
+1792000020882,server,k3sm-server,api,1,78,ok
+1792000020974,server,k3sm-server,node,1,117,ready=True phase=
+1792000021111,server,k3sm-server,netd,1,2,connected
+1792000021130,server,k3sm-server,api,1,90,ok
+1792000021174,server,k3sm-server,daemon,1,1311,server=running
+1792000021174,server,k3sm-server,status,0,1311,exit=1 verdict=degraded
+1792000021226,server,k3sm-server,node,1,112,ready=True phase=
+1792000021359,server,k3sm-server,netd,1,3,connected
+1792000021381,server,k3sm-server,api,1,89,ok
+1792000021478,server,k3sm-server,node,1,95,ready=True phase=
+1792000021611,server,k3sm-server,netd,1,2,connected
+1792000021645,server,k3sm-server,api,0,76,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000021745,server,k3sm-server,node,0,79,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000021867,server,k3sm-server,netd,1,1,connected
+1792000021906,server,k3sm-server,api,0,48,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000022004,server,k3sm-server,node,0,93,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000022119,server,k3sm-server,netd,1,1,connected
+1792000022155,server,k3sm-server,api,0,54,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000022265,server,k3sm-server,node,0,79,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000022388,server,k3sm-server,netd,1,2,connected
+1792000022415,server,k3sm-server,api,0,57,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000022485,server,k3sm-server,daemon,1,1537,server=running
+1792000022485,server,k3sm-server,status,0,1537,exit=1 verdict=degraded
+1792000022531,server,k3sm-server,node,0,102,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000022653,server,k3sm-server,netd,1,1,connected
+1792000022662,server,k3sm-server,api,0,51,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000022786,server,k3sm-server,node,0,98,rc=1 Unable to connect to the server: dial tcp 192.0.2.10:6444: connect: connection refused
+1792000022905,server,k3sm-server,netd,1,3,connected
+1792000022922,server,k3sm-server,api,0,81,rc=1 The connection to the server 192.0.2.10:6444 was refused - did you specify the right host or port?
+1792000023032,server,k3sm-server,node,1,100,ready=True phase=
+1792000023168,server,k3sm-server,netd,1,3,connected
+1792000023183,server,k3sm-server,api,1,46,ok
+1792000023272,server,k3sm-server,node,1,109,ready=True phase=
+1792000023436,server,k3sm-server,netd,1,3,connected
+1792000023441,server,k3sm-server,api,1,61,ok
+1792000023534,server,k3sm-server,node,1,74,ready=True phase=
+1792000023690,server,k3sm-server,netd,1,3,connected
+1792000023701,server,k3sm-server,api,1,54,ok
+1792000023789,server,k3sm-server,node,1,93,ready=True phase=
+1792000023942,server,k3sm-server,netd,1,1,connected
+1792000023955,server,k3sm-server,api,1,50,ok
+1792000024022,server,k3sm-server,daemon,1,1534,server=running
+1792000024022,server,k3sm-server,status,1,1534,exit=0 verdict=running
+1792000024048,server,k3sm-server,node,1,72,ready=True phase=
+1792000024187,server,k3sm-server,netd,1,2,connected
+1792000024197,server,k3sm-server,api,1,87,ok
+1792000024294,server,k3sm-server,node,1,93,ready=True phase=
+1792000024450,server,k3sm-server,netd,1,3,connected
+1792000024456,server,k3sm-server,api,1,76,ok
+1792000024540,server,k3sm-server,node,1,112,ready=True phase=
+1792000024705,server,k3sm-server,netd,1,2,connected
+1792000024710,server,k3sm-server,api,1,54,ok
+1792000024795,server,k3sm-server,node,1,101,ready=True phase=
+1792000024963,server,k3sm-server,netd,1,1,connected
+1792000024974,server,k3sm-server,api,1,42,ok
+1792000025064,server,k3sm-server,node,1,67,ready=True phase=
+1792000025207,server,k3sm-server,netd,1,1,connected
+1792000025230,server,k3sm-server,api,1,52,ok
+1792000025321,server,k3sm-server,node,1,102,ready=True phase=
+1792000025451,server,k3sm-server,netd,1,3,connected
+1792000025479,server,k3sm-server,api,1,76,ok
+1792000025556,server,k3sm-server,daemon,1,1687,server=running
+1792000025556,server,k3sm-server,status,1,1687,exit=0 verdict=running
+1792000025587,server,k3sm-server,node,1,68,ready=True phase=
+1792000025701,server,k3sm-server,netd,1,1,connected
+1792000025724,server,k3sm-server,api,1,57,ok
+1792000025841,server,k3sm-server,node,1,65,ready=True phase=
+1792000025966,server,k3sm-server,netd,1,3,connected
+1792000025975,server,k3sm-server,api,1,81,ok
+1792000026100,server,k3sm-server,node,0,63,ready=False phase=
+1792000026217,server,k3sm-server,api,1,79,ok
+1792000026235,server,k3sm-server,netd,1,2,connected
+1792000026341,server,k3sm-server,node,0,99,ready=False phase=
+1792000026468,server,k3sm-server,api,1,48,ok
+1792000026495,server,k3sm-server,netd,1,2,connected
+1792000026588,server,k3sm-server,node,0,64,ready=False phase=
+1792000026720,server,k3sm-server,api,1,73,ok
+1792000026753,server,k3sm-server,netd,1,3,connected
+1792000026843,server,k3sm-server,node,0,61,ready=False phase=
+1792000026984,server,k3sm-server,api,1,57,ok
+1792000027010,server,k3sm-server,netd,1,2,connected
+1792000027111,server,k3sm-server,node,0,80,ready=False phase=
+1792000027238,server,k3sm-server,api,1,80,ok
+1792000027243,server,k3sm-server,daemon,1,1653,server=running
+1792000027243,server,k3sm-server,status,1,1653,exit=0 verdict=running
+1792000027277,server,k3sm-server,netd,1,2,connected
+1792000027360,server,k3sm-server,node,0,82,ready=False phase=
+1792000027490,server,k3sm-server,api,1,66,ok
+1792000027518,server,k3sm-server,netd,1,2,connected
+1792000027621,server,k3sm-server,node,0,68,ready=False phase=
+1792000027748,server,k3sm-server,api,1,42,ok
+1792000027782,server,k3sm-server,netd,1,1,connected
+1792000027864,server,k3sm-server,node,0,113,ready=False phase=
+1792000028015,server,k3sm-server,api,1,49,ok
+1792000028027,server,k3sm-server,netd,1,2,connected
+1792000028122,server,k3sm-server,node,0,119,ready=False phase=
+1792000028261,server,k3sm-server,api,1,70,ok
+1792000028274,server,k3sm-server,netd,1,2,connected
+1792000028363,server,k3sm-server,node,0,65,ready=False phase=
+1792000028529,server,k3sm-server,api,1,79,ok
+1792000028538,server,k3sm-server,netd,1,1,connected
+1792000028625,server,k3sm-server,node,0,81,ready=False phase=
+1792000028790,server,k3sm-server,netd,1,3,connected
+1792000028799,server,k3sm-server,api,1,67,ok
+1792000028895,server,k3sm-server,node,0,73,ready=False phase=
+1792000028896,server,k3sm-server,daemon,1,1505,server=running
+1792000028896,server,k3sm-server,status,1,1505,exit=0 verdict=running
+1792000029044,server,k3sm-server,netd,1,3,connected
+1792000029056,server,k3sm-server,api,1,85,ok
+1792000029163,server,k3sm-server,node,0,115,ready=False phase=
+1792000029291,server,k3sm-server,netd,1,3,connected
+1792000029302,server,k3sm-server,api,1,87,ok
+1792000029409,server,k3sm-server,node,0,104,ready=False phase=
+1792000029556,server,k3sm-server,api,1,88,ok
+1792000029556,server,k3sm-server,netd,1,3,connected
+1792000029672,server,k3sm-server,node,0,91,ready=False phase=
+1792000029812,server,k3sm-server,netd,1,2,connected
+1792000029816,server,k3sm-server,api,1,73,ok
+1792000029921,server,k3sm-server,node,0,110,ready=False phase=

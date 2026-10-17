@@ -1,0 +1,6 @@
+role=worker node=k3sm-worker probe=api no window (118 samples over 29.910s)
+role=worker node=k3sm-worker probe=status start=+9.038 end=+17.992 seconds=8.954 down_samples=6 reasons=exit=1 verdict=degraded
+role=worker node=k3sm-worker probe=daemon start=+9.038 end=+16.622 seconds=7.584 down_samples=5 reasons=agent=stopped
+role=worker node=k3sm-worker probe=netd start=+8.168 end=+9.438 seconds=1.270 down_samples=5 reasons=Connection refused
+role=worker node=k3sm-worker probe=node start=+11.221 end=+19.685 seconds=8.464 down_samples=33 reasons=ready=False phase=Restarting
+phases role=worker node=k3sm-worker: Downloading -> Verifying -> Installing -> Restarting -> Done

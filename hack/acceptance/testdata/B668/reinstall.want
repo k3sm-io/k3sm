@@ -1,0 +1,10 @@
+role=server node=k3sm-server probe=api start=+6.077 end=+20.132 seconds=14.055 down_samples=55 reasons=rc=1
+role=server node=k3sm-server probe=api start=+21.642 end=+23.180 seconds=1.538 down_samples=6 reasons=rc=1
+role=server node=k3sm-server probe=status start=+0.004 end=+3.067 seconds=3.063 down_samples=2 began_down reasons=exit=1 verdict=degraded
+role=server node=k3sm-server probe=status start=+5.949 end=+24.019 seconds=18.070 down_samples=12 reasons=exit=1 verdict=degraded
+role=server node=k3sm-server probe=daemon start=+5.949 end=+21.171 seconds=15.222 down_samples=10 reasons=server=stopped
+role=server node=k3sm-server probe=netd start=+4.084 end=+6.136 seconds=2.052 down_samples=8 reasons=Connection refused
+role=server node=k3sm-server probe=node start=+6.156 end=+20.211 seconds=14.055 down_samples=55 reasons=rc=1
+role=server node=k3sm-server probe=node start=+21.742 end=+23.029 seconds=1.287 down_samples=5 reasons=rc=1
+role=server node=k3sm-server probe=node start=+26.097 end=open seconds=>=3.821 down_samples=16 reasons=ready=False phase=
+phases role=server node=k3sm-server: (none)

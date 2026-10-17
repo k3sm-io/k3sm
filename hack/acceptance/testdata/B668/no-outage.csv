@@ -1,0 +1,109 @@
+t_ms,role,node,probe,ok,ms,detail
+1792000000011,worker,k3sm-worker,api,1,46,ok
+1792000000020,worker,k3sm-worker,netd,1,1,connected
+1792000000026,worker,k3sm-worker,daemon,1,1500,agent=running
+1792000000026,worker,k3sm-worker,status,1,1500,exit=0 verdict=running
+1792000000048,worker,k3sm-worker,node,1,98,ready=True phase=
+1792000000273,worker,k3sm-worker,api,1,70,ok
+1792000000279,worker,k3sm-worker,netd,1,2,connected
+1792000000289,worker,k3sm-worker,node,1,91,ready=True phase=
+1792000000518,worker,k3sm-worker,api,1,44,ok
+1792000000527,worker,k3sm-worker,netd,1,2,connected
+1792000000547,worker,k3sm-worker,node,1,80,ready=True phase=
+1792000000758,worker,k3sm-worker,api,1,75,ok
+1792000000781,worker,k3sm-worker,netd,1,3,connected
+1792000000817,worker,k3sm-worker,node,1,67,ready=True phase=
+1792000001026,worker,k3sm-worker,api,1,88,ok
+1792000001030,worker,k3sm-worker,netd,1,3,connected
+1792000001082,worker,k3sm-worker,node,1,78,ready=True phase=
+1792000001267,worker,k3sm-worker,api,1,73,ok
+1792000001276,worker,k3sm-worker,netd,1,2,connected
+1792000001345,worker,k3sm-worker,node,1,86,ready=True phase=
+1792000001519,worker,k3sm-worker,netd,1,1,connected
+1792000001524,worker,k3sm-worker,api,1,57,ok
+1792000001526,worker,k3sm-worker,daemon,1,1554,agent=running
+1792000001526,worker,k3sm-worker,status,1,1554,exit=0 verdict=running
+1792000001604,worker,k3sm-worker,node,1,72,ready=True phase=
+1792000001780,worker,k3sm-worker,netd,1,2,connected
+1792000001787,worker,k3sm-worker,api,1,46,ok
+1792000001859,worker,k3sm-worker,node,1,75,ready=True phase=
+1792000002035,worker,k3sm-worker,api,1,41,ok
+1792000002043,worker,k3sm-worker,netd,1,3,connected
+1792000002112,worker,k3sm-worker,node,1,91,ready=True phase=
+1792000002300,worker,k3sm-worker,api,1,56,ok
+1792000002309,worker,k3sm-worker,netd,1,1,connected
+1792000002353,worker,k3sm-worker,node,1,86,ready=True phase=
+1792000002559,worker,k3sm-worker,netd,1,1,connected
+1792000002564,worker,k3sm-worker,api,1,52,ok
+1792000002606,worker,k3sm-worker,node,1,101,ready=True phase=
+1792000002808,worker,k3sm-worker,netd,1,1,connected
+1792000002809,worker,k3sm-worker,api,1,58,ok
+1792000002873,worker,k3sm-worker,node,1,113,ready=True phase=
+1792000003049,worker,k3sm-worker,netd,1,3,connected
+1792000003067,worker,k3sm-worker,api,1,86,ok
+1792000003080,worker,k3sm-worker,daemon,1,1338,agent=running
+1792000003080,worker,k3sm-worker,status,1,1338,exit=0 verdict=running
+1792000003120,worker,k3sm-worker,node,1,72,ready=True phase=
+1792000003292,worker,k3sm-worker,netd,1,2,connected
+1792000003336,worker,k3sm-worker,api,1,63,ok
+1792000003360,worker,k3sm-worker,node,1,76,ready=True phase=
+1792000003554,worker,k3sm-worker,netd,1,2,connected
+1792000003579,worker,k3sm-worker,api,1,78,ok
+1792000003608,worker,k3sm-worker,node,1,93,ready=True phase=
+1792000003794,worker,k3sm-worker,netd,1,2,connected
+1792000003829,worker,k3sm-worker,api,1,64,ok
+1792000003854,worker,k3sm-worker,node,1,74,ready=True phase=
+1792000004044,worker,k3sm-worker,netd,1,1,connected
+1792000004084,worker,k3sm-worker,api,1,51,ok
+1792000004107,worker,k3sm-worker,node,1,76,ready=True phase=
+1792000004307,worker,k3sm-worker,netd,1,2,connected
+1792000004332,worker,k3sm-worker,api,1,57,ok
+1792000004351,worker,k3sm-worker,node,1,63,ready=True phase=
+1792000004418,worker,k3sm-worker,daemon,1,1443,agent=running
+1792000004418,worker,k3sm-worker,status,1,1443,exit=0 verdict=running
+1792000004573,worker,k3sm-worker,netd,1,3,connected
+1792000004574,worker,k3sm-worker,api,1,75,ok
+1792000004618,worker,k3sm-worker,node,1,80,ready=True phase=
+1792000004833,worker,k3sm-worker,netd,1,1,connected
+1792000004840,worker,k3sm-worker,api,1,40,ok
+1792000004875,worker,k3sm-worker,node,1,96,ready=True phase=
+1792000005082,worker,k3sm-worker,netd,1,1,connected
+1792000005107,worker,k3sm-worker,api,1,76,ok
+1792000005127,worker,k3sm-worker,node,1,117,ready=True phase=
+1792000005349,worker,k3sm-worker,netd,1,2,connected
+1792000005368,worker,k3sm-worker,api,1,59,ok
+1792000005386,worker,k3sm-worker,node,1,115,ready=True phase=
+1792000005593,worker,k3sm-worker,netd,1,2,connected
+1792000005633,worker,k3sm-worker,api,1,72,ok
+1792000005650,worker,k3sm-worker,node,1,107,ready=True phase=
+1792000005851,worker,k3sm-worker,netd,1,1,connected
+1792000005861,worker,k3sm-worker,daemon,1,1621,agent=running
+1792000005861,worker,k3sm-worker,status,1,1621,exit=0 verdict=running
+1792000005879,worker,k3sm-worker,api,1,67,ok
+1792000005891,worker,k3sm-worker,node,1,84,ready=True phase=
+1792000006101,worker,k3sm-worker,netd,1,1,connected
+1792000006134,worker,k3sm-worker,node,1,73,ready=True phase=
+1792000006137,worker,k3sm-worker,api,1,67,ok
+1792000006352,worker,k3sm-worker,netd,1,2,connected
+1792000006391,worker,k3sm-worker,api,1,54,ok
+1792000006402,worker,k3sm-worker,node,1,96,ready=True phase=
+1792000006597,worker,k3sm-worker,netd,1,2,connected
+1792000006640,worker,k3sm-worker,api,1,42,ok
+1792000006669,worker,k3sm-worker,node,1,119,ready=True phase=
+1792000006867,worker,k3sm-worker,netd,1,3,connected
+1792000006882,worker,k3sm-worker,api,1,69,ok
+1792000006914,worker,k3sm-worker,node,1,78,ready=True phase=
+1792000007110,worker,k3sm-worker,netd,1,1,connected
+1792000007141,worker,k3sm-worker,api,1,57,ok
+1792000007174,worker,k3sm-worker,node,1,111,ready=True phase=
+1792000007363,worker,k3sm-worker,netd,1,1,connected
+1792000007397,worker,k3sm-worker,api,1,81,ok
+1792000007441,worker,k3sm-worker,node,1,80,ready=True phase=
+1792000007482,worker,k3sm-worker,daemon,1,1642,agent=running
+1792000007482,worker,k3sm-worker,status,1,1642,exit=0 verdict=running
+1792000007606,worker,k3sm-worker,netd,1,1,connected
+1792000007651,worker,k3sm-worker,api,1,61,ok
+1792000007705,worker,k3sm-worker,node,1,93,ready=True phase=
+1792000007848,worker,k3sm-worker,netd,1,1,connected
+1792000007895,worker,k3sm-worker,api,1,83,ok
+1792000007952,worker,k3sm-worker,node,1,111,ready=True phase=
