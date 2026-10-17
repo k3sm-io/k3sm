@@ -716,6 +716,30 @@ func (f *fakeSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, 
 	return b, perm, nil
 }
 
+// ReadOwnedRegularFile is ReadRegularFile's verdict plus the owner the
+// ownership table seeds for path (putOwned). With no entry the file is the
+// service user's (uid 271, what EnsureServiceUser answers) at mode 0600 or
+// putFileMode's mode, which is what the install's own staging leaves.
+func (f *fakeSystem) ReadOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error) {
+	f.calls = append(f.calls, "ReadOwnedRegularFile:"+path)
+	b, err := f.readRegularFileContent(path)
+	if err != nil {
+		return nil, OwnedEntry{}, err
+	}
+	e, ok := f.owners[path]
+	if !ok {
+		perm, pok := f.modes[path]
+		if !pok {
+			perm = 0o600
+		}
+		e = OwnedEntry{Path: path, UID: 271, GID: 271, Mode: perm, Kind: EntryRegular}
+	}
+	if int64(len(b)) > limit {
+		return nil, e, fmt.Errorf("read %s: larger than %d bytes", path, limit)
+	}
+	return b, e, nil
+}
+
 // readRegularFileContent is ReadRegularFile's verdict with no call-log entry
 // of its own, so ReadRegularFile and ReadRegularFileWithMode can each log
 // exactly once despite sharing this lookup.

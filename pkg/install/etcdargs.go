@@ -60,8 +60,8 @@ const (
 	// serverJoinTokenName is the leaf name of the staged server-class join token
 	// in the server work dir. It is a different file from the static admin token
 	// (serverTokenName) because it is a different credential: the admin token is
-	// re-minted by every install, the join token is the operator's and is staged
-	// only when they pass one.
+	// minted by the installer (and kept by an in-place update), the join token
+	// is the operator's and is staged only when they pass one.
 	serverJoinTokenName = "join-token"
 )
 

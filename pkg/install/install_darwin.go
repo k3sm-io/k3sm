@@ -1717,6 +1717,48 @@ func readRegularFileWithMode(path string) ([]byte, fs.FileMode, error) {
 	return b, fi.Mode().Perm(), err
 }
 
+// ReadOwnedRegularFile is ReadRegularFile plus the owner and mode, all from
+// one descriptor, bounded to limit bytes. See the System interface.
+func (darwinSystem) ReadOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error) {
+	return readOwnedRegularFile(path, limit)
+}
+
+// readOwnedRegularFile is the method above, split out for the on-disk test.
+// It carries readRegularFileWithMode's three load-bearing details (O_NOFOLLOW,
+// O_NONBLOCK, the type judged on the descriptor) and adds the owner from the
+// same fstat and the size bound.
+func readOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) {
+			return nil, OwnedEntry{}, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)
+		}
+		return nil, OwnedEntry{}, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer func() { _ = f.Close() }() // read-only; nothing to flush
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		return nil, OwnedEntry{}, fmt.Errorf("stat %s: %w", path, err)
+	}
+	e := OwnedEntry{Path: path, UID: int(st.Uid), GID: int(st.Gid), Mode: fs.FileMode(st.Mode) & fs.ModePerm, Kind: EntryOther}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, e, fmt.Errorf("open %s: %w", path, ErrNotRegularFile)
+	}
+	e.Kind = EntryRegular
+	if st.Size > limit {
+		return nil, e, fmt.Errorf("read %s: %d bytes, larger than %d", path, st.Size, limit)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, e, fmt.Errorf("read %s: %w", path, err)
+	}
+	if int64(len(b)) > limit {
+		return nil, e, fmt.Errorf("read %s: larger than %d bytes", path, limit)
+	}
+	return b, e, nil
+}
+
 // ReadFile reads a root-readable file, propagating os.ReadFile's error verbatim
 // so a caller can distinguish "not there yet" (fs.ErrNotExist — a first install
 // has neither the installed plist nor the cluster CA) from a real read failure.

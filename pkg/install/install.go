@@ -928,6 +928,14 @@ type System interface {
 	// content, the same way ReadRegularFile already judges the mesh key's TYPE
 	// before trusting it.
 	ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error)
+	// ReadOwnedRegularFile is ReadRegularFile plus the owner, group and mode,
+	// all read off the SAME open descriptor as the content (O_NOFOLLOW and
+	// fstat), and it refuses a file larger than limit bytes. It exists for the
+	// one credential install reads AS ROOT from a service-user-writable
+	// directory and then trusts: the admin token an in-place update carries
+	// (carriedAdminToken), whose owner and write bits have to be judged on the
+	// file actually read.
+	ReadOwnedRegularFile(path string, limit int64) ([]byte, OwnedEntry, error)
 	// ReadFile reads a root-readable file: the installed server plist, whose
 	// operator-supplied arguments a reinstall must carry over; the
 	// server-arguments record that carries those same arguments when no plist
@@ -1493,6 +1501,10 @@ type Config struct {
 	// manifest, and Install and Uninstall each set it from the record before
 	// they build that manifest.
 	dataVolumeDeclared bool
+	// keepAdminToken is set by ResolveInPlace for a control plane updated in
+	// place: Install carries the admin token the installed server serves
+	// (carriedAdminToken) instead of minting one, and mints only when it cannot.
+	keepAdminToken bool
 	// stayStopped is set by Install when a stop marker is present and Start
 	// is not: the install lays the new tree down and restarts nothing.
 	stayStopped bool
@@ -1843,7 +1855,19 @@ func (c Config) plistPath(label string) string {
 // (run via sudo): ensure _k3sm, copy the binary root-owned, write the two
 // plists, bootstrap netd (the helper) BEFORE server (which needs it), then write
 // the admin kubeconfig to the human's home. The caller has already verified root.
-func Install(ctx context.Context, sys System, cfg Config) (err error) {
+func Install(ctx context.Context, sys System, cfg Config) error {
+	_, err := InstallWithResult(ctx, sys, cfg)
+	return err
+}
+
+// InstallWithResult is Install, also returning the Result.
+func InstallWithResult(ctx context.Context, sys System, cfg Config) (Result, error) {
+	var res Result
+	err := install(ctx, sys, cfg, &res)
+	return res, err
+}
+
+func install(ctx context.Context, sys System, cfg Config, res *Result) (err error) {
 	cfg = cfg.withDefaults()
 	// Taken before anything is written. The post-restart verification counts a
 	// daemon's bring-up failures from that daemon's own bootstrap fence instead
@@ -1954,7 +1978,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	}
 	defer release()
 
-	if cfg.AdminToken == "" {
+	if cfg.AdminToken == "" && !cfg.keepAdminToken {
 		tok, err := generateToken()
 		if err != nil {
 			return err
@@ -2070,6 +2094,13 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	}
 	cfg.Logger.Info("ensured service user", "user", cfg.ServiceUser, "uid", uid)
 
+	// 1′. An in-place update keeps the admin token, judged now that the
+	//     service uid that may own it is known (keepAdminTokenInPlace).
+	mintedInPlace, err := keepAdminTokenInPlace(sys, &cfg, uid)
+	if err != nil {
+		return err
+	}
+
 	// 1a. The state tree, per the ownership table and BEFORE anything is written
 	//     under it: the data root root:wheel 0755, then every tree the
 	//     unprivileged daemons write, handed to the service user one by one. The
@@ -2182,6 +2213,7 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 			return err
 		}
 		cfg.Logger.Info("staged the control plane's admin token for the server daemon (the daemon is told where its token is, never what it is)", "path", cfg.serverTokenPath())
+		res.AdminTokenRotated = mintedInPlace
 	}
 
 	// 1f″. A server that is no longer a joining member (its etcd role changed
