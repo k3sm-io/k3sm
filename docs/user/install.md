@@ -298,11 +298,13 @@ nothing on your Wi-Fi or Ethernet does. With it on, they bind every interface.
 - The record must be a regular file owned by root and writable by no one else. Anything else is
   treated as unusable, and the node daemon serves LAN access off until it is set again.
 - On a stopped node the setting is recorded and applies at `sudo k3sm start`.
-- With LAN access off, a LoadBalancer port below 1024 is served on the node's own address and on
-  `127.0.0.1` through the root network helper only when it is in the node's `--lb-privileged-ports`
-  list, a `k3sm server` and `k3sm agent` flag recorded with the install arguments that defaults to
-  `80,443`. The ingress host still serves `80` and `443` on the node's own address, but not on
-  `127.0.0.1`.
+- Every LoadBalancer listener below 1024 binds through the root network helper. With LAN access on,
+  every node serves such a port on every interface, whether or not it is listed. With LAN access
+  off, it is served on the node's own address and on `127.0.0.1` only when it is in the node's
+  `--lb-privileged-ports` list, a `k3sm server` and `k3sm agent` flag recorded with the install
+  arguments that defaults to `80,443`; an unlisted port is not served until LAN access is back on.
+  The list decides only those node-address binds. The ingress host still serves `80` and `443` on
+  the node's own address, but not on `127.0.0.1`.
 - The ingress host's ports belong to it: a LoadBalancer Service on one of them is not served on any
   node while the ingress host declares the port, with LAN access on or off. The default list
   therefore serves a LoadBalancer on `80` or `443` only where the ingress host is disabled or moved

@@ -85,7 +85,8 @@ type HosterConfig struct {
 	// runs. Every address must be valid.
 	BindAddrs []netip.Addr
 	// ReservedPorts is the set of ports k3sm's OWN listeners occupy (the
-	// NodePort range and the kubelet API port — pkg/ports.ReservedSet). bind
+	// NodePort range and the kubelet API port) plus the macOS host-service
+	// ports a tenant listener would keep from starting (pkg/ports.ReservedSet). bind
 	// REFUSES them outright rather than racing a k3sm listener for the port (a
 	// wildcard NodePort fails the bind by start order; a NodePort or kubelet API
 	// listener on a specific address coexists with the wildcard LB listener and
@@ -599,7 +600,7 @@ func (h *Hoster) reconcileService(ctx context.Context, key string, svc *corev1.S
 			}
 			if errors.Is(err, errReservedPort) {
 				h.throttledWarn(fmt.Sprintf("%s\x00reserved:%d", key, p.Port),
-					"svclb: loadbalancer port is RESERVED by a k3sm listener (the NodePort range, the kubelet API port, or a port the ingress host's kube-system/k3sm-ingress Service declares); no listener bound, this node is not advertised — pick a different spec.ports[].port",
+					"svclb: loadbalancer port is RESERVED by a k3sm listener (the NodePort range, the kubelet API port, or a port the ingress host's kube-system/k3sm-ingress Service declares) or for a macOS host service (22, 53, 88, 445, 548, 631); no listener bound, this node is not advertised — pick a different spec.ports[].port",
 					"service", key, "port", p.Port, "bind", addrsString(h.addrs))
 				continue
 			}

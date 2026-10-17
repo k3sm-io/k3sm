@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 // Package ports single-sources the TCP ports k3sm's own node listeners bind (the
-// NodePort range and the kubelet API port), and the reserved set derived from
-// them.
+// NodePort range and the kubelet API port), the macOS host-service ports no
+// LoadBalancer may take, and the reserved set derived from both.
 //
 // It is a LEAF: it depends on nothing else in this repo, so the apiserver argv
 // (pkg/executor), the kubelet API listen addresses (cmd/k3sm), the svclb bind
@@ -71,6 +71,25 @@ const (
 // 51820 would take the mesh's port and partition the cluster, and the guard
 // below — TCP-shaped by construction — would not have considered it.
 
+// hostServicePorts are the TCP ports macOS's own services listen on when they
+// run, most once switched on in System Settings: 22 (Remote Login, sshd), 53 (the
+// DNS proxy Internet Sharing starts for the vm network bridge whenever a vm pod
+// runs), 88 (the local Kerberos KDC screen and file sharing authenticate to),
+// 445 (SMB file sharing), 548 (AFP file sharing) and 631 (CUPS printer
+// sharing). The svclb hoster binds a LoadBalancer port below 1024 through the
+// root network helper, and a root wildcard socket on a port blocks launchd
+// from binding the service's own wildcard there later, so a tenant Service on
+// one of these ports, taken while the service is off, would keep the host
+// service from starting on this Mac. They are reserved for that reason, not
+// because k3sm listens on them.
+var hostServicePorts = [...]int{22, 53, 88, 445, 548, 631}
+
+// HostServicePorts returns the reserved macOS host-service ports, sorted. The
+// result is a fresh slice; callers may keep it.
+func HostServicePorts() []int {
+	return append([]int(nil), hostServicePorts[:]...)
+}
+
 // NodePortRange renders the --service-node-port-range argv value ("30000-32767")
 // from the bounds above, so the apiserver's allocation range and the reserved
 // set below cannot be edited apart.
@@ -79,11 +98,17 @@ func NodePortRange() string {
 }
 
 // Reserved reports whether port belongs to a listener k3sm's own node process
-// owns: the NodePort range, or the kubelet API port. A LoadBalancer Service
-// declaring such a port would race or share a k3sm listener's port, so
-// admission rejects it (pkg/policy) and svclb refuses to bind it (pkg/svclb)
-// rather than letting start order decide.
+// owns (the NodePort range, or the kubelet API port) or to a macOS host
+// service (HostServicePorts). A LoadBalancer Service declaring such a port
+// would race or share a k3sm listener's port, or keep a host service from
+// binding its own, so admission rejects it (pkg/policy) and svclb refuses to
+// bind it (pkg/svclb) rather than letting start order decide.
 func Reserved(port int) bool {
+	for _, p := range hostServicePorts {
+		if port == p {
+			return true
+		}
+	}
 	return port == KubeletAPIPort || (port >= NodePortRangeMin && port <= NodePortRangeMax)
 }
 
@@ -92,10 +117,13 @@ func Reserved(port int) bool {
 // so the hoster holds the reserved policy as DATA the assembler injected rather
 // than importing this package and re-deciding it.
 func ReservedSet() map[int32]bool {
-	set := make(map[int32]bool, NodePortRangeMax-NodePortRangeMin+2)
+	set := make(map[int32]bool, NodePortRangeMax-NodePortRangeMin+2+len(hostServicePorts))
 	for p := NodePortRangeMin; p <= NodePortRangeMax; p++ {
 		set[int32(p)] = true
 	}
 	set[int32(KubeletAPIPort)] = true
+	for _, p := range hostServicePorts {
+		set[int32(p)] = true
+	}
 	return set
 }

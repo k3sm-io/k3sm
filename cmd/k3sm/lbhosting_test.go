@@ -107,13 +107,13 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 
 	// (a, second half) THE SVCLB BINDER SELECTION. The address and the binder are
 	// INDEPENDENT: a one-line address change satisfies the assert above while
-	// leaving the binder wrong. With the helper present every bind of a LISTED
-	// port, the wildcard included, goes to netd, so both shapes of the port have
-	// one owner and a LAN access swap cannot meet Darwin's cross-owner
-	// EADDRINUSE; every other port, an unlisted one below 1024 included, binds
-	// in-process and never asks netd. The ingress host's own binder is
+	// leaving the binder wrong. With the helper present every bind below 1024,
+	// listed or not, the wildcard included, goes to netd, so every shape of the
+	// port shares an owner with netd's own Service-VIP socket and a LAN access
+	// swap cannot meet Darwin's cross-owner EADDRINUSE; ports of 1024 and above
+	// bind in-process. The ingress host's own binder is
 	// TestIngressHostBindsThroughNetdWhenPresent's.
-	t.Run("svclb sends exactly the listed ports to netd", func(t *testing.T) {
+	t.Run("svclb sends every port below 1024 to netd", func(t *testing.T) {
 		opts := gateNodeOptions()
 		if !opts.netMode.UsesHelper() {
 			t.Fatal("fixture must be in the helper posture or the assertion below is vacuous")
@@ -124,8 +124,8 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 		if !ok {
 			t.Fatalf("svclb Binder = %T, want hosterBinder in the helper posture", lb.Binder)
 		}
-		if !slices.Equal(lb.PrivilegedPorts, []uint16{80, 443}) || !slices.Equal(hb.listed, []uint16{80, 443}) {
-			t.Errorf("PrivilegedPorts = %v, binder list = %v, want the node's list [80 443] for both", lb.PrivilegedPorts, hb.listed)
+		if !slices.Equal(lb.PrivilegedPorts, []uint16{80, 443}) {
+			t.Errorf("PrivilegedPorts = %v, want the node's list [80 443]", lb.PrivilegedPorts)
 		}
 		n, ok := hb.privileged.(netdBinder)
 		if raw, isNetd := n.netd.(*netbind.Netd); !ok || !isNetd || raw.Client == nil {
@@ -136,7 +136,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 		}
 		node := netip.MustParseAddr("100.64.0.1")
 		priv, direct := &recordingBinder{}, &recordingBinder{}
-		b := hosterBinder{listed: hb.listed, privileged: priv, direct: direct}
+		b := hosterBinder{privileged: priv, direct: direct}
 		for _, ap := range []netip.AddrPort{
 			netip.AddrPortFrom(node, 80),
 			netip.AddrPortFrom(wildcardBindAddr, 80),
@@ -147,13 +147,19 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 		} {
 			_, _ = b.Listen(context.Background(), "tcp", ap)
 		}
-		wantPriv := []netip.AddrPort{netip.AddrPortFrom(node, 80), netip.AddrPortFrom(wildcardBindAddr, 80), netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 443)}
-		if !slices.Equal(priv.got, wantPriv) {
-			t.Errorf("netd leg got %v, want only the listed ports %v", priv.got, wantPriv)
+		wantPriv := []netip.AddrPort{
+			netip.AddrPortFrom(node, 80),
+			netip.AddrPortFrom(wildcardBindAddr, 80),
+			netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 443),
+			netip.AddrPortFrom(wildcardBindAddr, 81),
+			netip.AddrPortFrom(node, 81),
 		}
-		wantDirect := []netip.AddrPort{netip.AddrPortFrom(wildcardBindAddr, 81), netip.AddrPortFrom(node, 81), netip.AddrPortFrom(wildcardBindAddr, 8080)}
+		if !slices.Equal(priv.got, wantPriv) {
+			t.Errorf("netd leg got %v, want every port below 1024, listed or not, %v", priv.got, wantPriv)
+		}
+		wantDirect := []netip.AddrPort{netip.AddrPortFrom(wildcardBindAddr, 8080)}
 		if !slices.Equal(direct.got, wantDirect) {
-			t.Errorf("in-process leg got %v, want the unlisted and unprivileged ports %v", direct.got, wantDirect)
+			t.Errorf("in-process leg got %v, want only the unprivileged port %v", direct.got, wantDirect)
 		}
 	})
 
@@ -178,9 +184,10 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 		}
 	})
 
-	t.Run("svclb brokers nothing with an empty list", func(t *testing.T) {
-		if lb := lbHosterConfig(fake.NewClientset(), gateNodeOptions(), log); lb.Binder != nil || lb.PrivilegedPorts != nil {
-			t.Errorf("svclb Binder = %T, PrivilegedPorts = %v, want nil and nil with no listed port", lb.Binder, lb.PrivilegedPorts)
+	t.Run("svclb still brokers every port below 1024 with an empty list", func(t *testing.T) {
+		lb := lbHosterConfig(fake.NewClientset(), gateNodeOptions(), log)
+		if _, ok := lb.Binder.(hosterBinder); !ok || len(lb.PrivilegedPorts) != 0 {
+			t.Errorf("svclb Binder = %T, PrivilegedPorts = %v, want the hosterBinder and no listed port: the list decides only the node-address binds", lb.Binder, lb.PrivilegedPorts)
 		}
 	})
 
@@ -416,7 +423,7 @@ func TestIngressHostBindsThroughNetdWhenPresent(t *testing.T) {
 			lbOpts := gateNodeOptions()
 			lbOpts.lbPrivilegedPorts = []uint16{80, 443}
 			if _, ok := lbHosterConfig(fake.NewClientset(), lbOpts, log).Binder.(hosterBinder); !ok {
-				t.Errorf("svclb Binder is not the hosterBinder: with the helper every svclb bind of a listed port goes to netd")
+				t.Errorf("svclb Binder is not the hosterBinder: with the helper every svclb bind below 1024 goes to netd")
 			}
 			if ih.NodeName != gateNodeOptions().nodeName {
 				t.Errorf("ingress NodeName = %q, want the node's own name %q (it names the node's EndpointSlice shard)", ih.NodeName, gateNodeOptions().nodeName)

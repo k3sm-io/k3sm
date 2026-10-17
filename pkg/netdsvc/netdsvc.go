@@ -281,9 +281,10 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 //   - the IPv4 WILDCARD 0.0.0.0 on a privileged port when that same canonical
 //     Service declares the port (the ingress host's 80/443 listeners, bound on
 //     every interface through the root helper, the k3s ServiceLB shape), or,
-//     for a port in LBPrivilegedPorts that the canonical Service does not
-//     declare, when any LoadBalancer Service declares it (the svclb hoster's
-//     LAN-on listener, so it has the same owner as its LAN-off one), or
+//     for a port the canonical Service does not declare, when any LoadBalancer
+//     Service declares it, listed in LBPrivilegedPorts or not (the svclb
+//     hoster's LAN-on listener, so it has the same owner as netd's own
+//     Service-VIP socket on the port and as the hoster's LAN-off listener), or
 //   - a PUBLISHED VM POD ADDRESS: an address inside this node's pod /24 that is
 //     a vm-RuntimeClass pod's published status.podIP, on a port that pod
 //     declares as a TCP containerPort or that a Service's EndpointSlice targets
@@ -592,8 +593,30 @@ func describePorts(ports []uint16) string {
 // does not depend on PortPolicy.NodeIP: the wildcard names no address, so there
 // is no node address to match, only a declaring subject.
 //
-// For a port in LBPrivilegedPorts any declaring LoadBalancer Service also
-// admits it (see PortPolicy); an unlisted port keeps the canonical-only rule.
+// For a port the canonical Service does not declare, any declaring
+// LoadBalancer Service admits it too, whether or not the port is in
+// LBPrivilegedPorts (see PortPolicy). The listed-port rule exists to keep root
+// from binding a SPECIFIC node address below 1024 for a tenant, where the
+// tenant's socket would take that address from a host listener. A wildcard is
+// a different trade, and the owner decides it, because Darwin checks a bind
+// against the other sockets on the port by user:
+//
+//   - A root-owned wildcard (this arm) lets root and launchd services still
+//     bind a specific address beside it, and the specific socket wins its
+//     address; netd's own Service-VIP socket is one. It blocks a NON-root
+//     specific bind on that port, such as a user's dev server on 127.0.0.1 or
+//     an `ssh -L` forward, for as long as the Service is served.
+//   - A wildcard owned by the node daemon's service user, the shape before
+//     this arm, blocked the root host services instead (netd's VIP socket
+//     among them: the in-process wildcard bound only when it won the race
+//     against the VIP bind, and never re-bound after a LAN access swap).
+//
+// Root ownership is taken: the cluster's own VIP socket and the system's
+// services keep working, at the cost of a non-root local listener on a tenant
+// LoadBalancer port. The macOS host-service ports (pkg/ports, 22, 53, 88, 445,
+// 548 and 631) are reserved from tenants for the same reason, so a root
+// wildcard never keeps one of those services from binding its own wildcard
+// later. A port the canonical Service declares stays its own.
 //
 // The IPv6 unspecified address is refused. A "[::]" socket is dual-stack and
 // would publish the listener on every IPv6 address of the host, a surface no
@@ -609,15 +632,17 @@ func (a servicePortAuthorizer) authorizeWildcard(port int, addr netip.Addr) erro
 	}
 	target := "the wildcard " + addr.String()
 	err := a.authorizeCanonical(port, target)
-	if err == nil || !slices.Contains(a.policy.LBPrivilegedPorts, uint16(port)) {
+	if err == nil || !a.policy.NodeAddressService.IsValid() {
+		// With no canonical Service configured nothing can say the ingress
+		// does not own the port, so the tenant arm stays shut (fail safe).
 		return err
 	}
-	// A port the operator listed: any declaring LoadBalancer Service, so the
-	// svclb hoster's wildcard and its LAN-off node-address listener on that
-	// port have the same owner (root) and a LAN access swap can bind the new
-	// shape before it closes the old one.
+	// Any declaring LoadBalancer Service the canonical one is not beside, so
+	// the svclb hoster's wildcard has the same owner (root) as netd's VIP
+	// socket on the port and as its LAN-off listener, and a LAN access swap
+	// binds the new shape before it closes the old one.
 	if lerr := a.authorizeLBDeclared(port, target); lerr != nil {
-		return fmt.Errorf("%w; and as a listed LoadBalancer port: %w", err, lerr)
+		return fmt.Errorf("%w; and as a LoadBalancer port: %w", err, lerr)
 	}
 	return nil
 }

@@ -380,10 +380,14 @@ func TestNodeAddressAuthorizerAllowlist(t *testing.T) {
 // TestWildcardAuthorizerAllowlist is the B403 gate, the wildcard twin of
 // TestNodeAddressAuthorizerAllowlist: the ingress host asks the root helper for
 // 0.0.0.0:80/443 (the k3s ServiceLB shape), and the helper grants that
-// privileged wildcard bind ONLY when the canonical kube-system/k3sm-ingress
-// Service declares the port. A same-named Service in another namespace, a
-// tenant LoadBalancer on the same port, an undeclared port, the IPv6 wildcard
-// and a non-privileged port are all refused. The arm does not depend on
+// privileged wildcard bind when the canonical kube-system/k3sm-ingress
+// Service declares the port. A tenant LoadBalancer (a same-named Service in
+// another namespace included) is admitted the wildcard of a port it declares
+// that the canonical Service does not: that is the svclb hoster's LAN-on
+// listener, which a wildcard bind cannot let shadow any specific host socket.
+// An undeclared port, a port only a ClusterIP declares, the IPv6 wildcard, a
+// non-privileged port and a policy with no canonical Service configured are
+// all refused. The arm does not depend on
 // PortPolicy.NodeIP (the installed plist renders none), and a specific-address
 // request keeps the pre-existing classes' verdicts.
 func TestWildcardAuthorizerAllowlist(t *testing.T) {
@@ -419,10 +423,16 @@ func TestWildcardAuthorizerAllowlist(t *testing.T) {
 		{name: "wildcard :443 declared by the canonical ingress is allowed", policy: policy(production), port: 443, addr: "0.0.0.0", allow: true},
 		{name: "an impostor does not block the canonical Service",
 			policy: policy(map[int][]ServiceRef{80: {tenantWeb, canonicalIngress}}), port: 80, addr: "0.0.0.0", allow: true},
-		{name: "wildcard :80 declared only by a tenant LoadBalancer is refused and named",
-			policy: policy(map[int][]ServiceRef{80: {tenantWeb}}), port: 80, addr: "0.0.0.0", wantNamed: "tenant-a/public-web"},
-		{name: "wildcard :80 declared only by a same-named Service in another namespace is refused and named",
-			policy: policy(map[int][]ServiceRef{80: {otherNSIngress}}), port: 80, addr: "0.0.0.0", wantNamed: "tenant-a/k3sm-ingress"},
+		{name: "wildcard :80 declared only by a tenant LoadBalancer is the hoster's and allowed",
+			policy: policy(map[int][]ServiceRef{80: {tenantWeb}}), port: 80, addr: "0.0.0.0", allow: true},
+		{name: "wildcard :80 declared only by a same-named Service in another namespace is a tenant's and allowed",
+			policy: policy(map[int][]ServiceRef{80: {otherNSIngress}}), port: 80, addr: "0.0.0.0", allow: true},
+		{name: "a tenant's wildcard with no canonical Service configured is refused, fail-safe",
+			policy: func() PortPolicy {
+				p := policy(map[int][]ServiceRef{80: {tenantWeb}})
+				p.NodeAddressService = ServiceRef{}
+				return p
+			}(), port: 80, addr: "0.0.0.0"},
 		{name: "wildcard on a port no LoadBalancer declares is refused", policy: policy(production), port: 22, addr: "0.0.0.0"},
 		{name: "wildcard on 53 (declared by a ClusterIP only) is refused", policy: policy(production), port: 53, addr: "0.0.0.0"},
 		{name: "the IPv6 wildcard is refused even for the canonical port", policy: policy(production), port: 80, addr: "::"},
@@ -628,8 +638,10 @@ func TestPortAuthorizerSyncedWording(t *testing.T) {
 // is not loopback, a Service-CIDR VIP or a pod address (inside the cluster pod
 // range only this node's mesh-egress address is its own), and only while some
 // LoadBalancer Service declares the port. 127.0.0.1 is admitted on the same
-// terms (no other loopback address is), and so is the wildcard, so the
-// hoster's LAN-on and LAN-off listeners of a listed port share one owner. The
+// terms (no other loopback address is). The wildcard is admitted for any port
+// a LoadBalancer Service declares, listed or not, so the hoster's LAN-on
+// listener shares one owner with netd's own Service-VIP socket on the port and
+// with the hoster's LAN-off listeners. The
 // address shapes are only the hoster's: 127.0.0.1, this node's .1 (even beside
 // a vm pod in the same /24), and en* addresses; a utun, bridge, awdl or other
 // lo0 address is refused. A port the canonical ingress Service declares is
@@ -716,7 +728,11 @@ func TestPortAuthorizerAdmitsListedLBPortOnHostAddress(t *testing.T) {
 		{name: "another 127/8 address", policy: full, port: 80, addr: "127.0.0.2", mention: "only loopback address authorized"},
 		{name: "IPv6 loopback", policy: full, port: 80, addr: "::1", mention: "only loopback address authorized"},
 		{name: "the wildcard on a listed port a tenant declares", policy: full, port: 80, addr: "0.0.0.0", allow: true},
-		{name: "the wildcard on a port not in the list", policy: full, port: 22, addr: "0.0.0.0"},
+		{name: "the wildcard on an unlisted port a tenant declares", policy: full, port: 22, addr: "0.0.0.0", allow: true},
+		{name: "the wildcard on an unlisted port nobody declares", policy: full, port: 81, addr: "0.0.0.0", mention: "no LoadBalancer service declares port 81"},
+		{name: "the wildcard on an unlisted port with an empty list", policy: with(func(p *PortPolicy) { p.LBPrivilegedPorts = nil }), port: 22, addr: "0.0.0.0", allow: true},
+		{name: "the wildcard on an unlisted port before the first sync", policy: with(func(p *PortPolicy) { p.Synced = func() bool { return false } }), port: 22, addr: "0.0.0.0", mention: "not yet synced"},
+		{name: "the wildcard on an unlisted non-privileged port", policy: full, port: 2222, addr: "0.0.0.0", mention: "non-privileged"},
 		{name: "the wildcard on a listed port nobody declares", policy: with(func(p *PortPolicy) { p.LBDeclarers = func(int) []ServiceRef { return nil } }), port: 80, addr: "0.0.0.0"},
 		{name: "the ingress keeps its own wildcard on a listed port it declares", policy: full, port: 8, addr: "0.0.0.0", allow: true},
 		{name: "a service-CIDR address", policy: full, port: 80, addr: "10.43.0.20"},
@@ -754,11 +770,17 @@ func TestPortAuthorizerAdmitsListedLBPortOnHostAddress(t *testing.T) {
 		})
 	}
 
-	t.Run("an unlisted wildcard is still the canonical ingress Service's alone", func(t *testing.T) {
+	t.Run("an ingress-declared wildcard stays the canonical ingress Service's", func(t *testing.T) {
 		t.Parallel()
-		p := with(func(p *PortPolicy) { p.NodeAddressService = canonicalIngress })
-		if err := PortAuthorizer(p).Authorize(context.Background(), 22, "0.0.0.0"); err == nil {
-			t.Error("an unlisted port declared only by a tenant Service authorized the wildcard")
+		// Unlisted, declared by the ingress and a tenant: the tenant arm
+		// refuses it as the ingress host's, and only the canonical Service's
+		// own declaration admits the bind.
+		a := servicePortAuthorizer{policy: with(func(p *PortPolicy) { p.LBPrivilegedPorts = nil })}
+		if err := a.authorizeLBDeclared(8, "the wildcard 0.0.0.0"); err == nil || !strings.Contains(err.Error(), "belongs to the ingress host") {
+			t.Errorf("tenant arm on an ingress-declared port = %v, want the ingress-ownership refusal", err)
+		}
+		if err := a.Authorize(context.Background(), 8, "0.0.0.0"); err != nil {
+			t.Errorf("the ingress host's own wildcard on an unlisted port it declares was refused: %v", err)
 		}
 		canon := with(func(p *PortPolicy) {
 			p.NodeAddressService = canonicalIngress
@@ -900,7 +922,8 @@ func TestIngressHostNodeAddressBindAdmitted(t *testing.T) {
 		}(), port: 80, addr: "192.168.64.1", mention: "on bridge100"},
 		{name: "ingress-declared 80 before the first sync", policy: func() PortPolicy { p := listed; p.Synced = func() bool { return false }; return p }(), port: 80, addr: "100.64.0.1", mention: "not yet synced"},
 		{name: "the ingress's wildcard is unchanged", policy: server, port: 80, addr: "0.0.0.0", allow: true},
-		{name: "a tenant's wildcard on an unlisted ingress port is unchanged", policy: server, port: 22, addr: "0.0.0.0"},
+		{name: "a tenant's wildcard on an unlisted port", policy: server, port: 22, addr: "0.0.0.0", allow: true},
+		{name: "a wildcard on an undeclared port", policy: nobody, port: 22, addr: "0.0.0.0", mention: "no LoadBalancer service declares port 22"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

@@ -34,6 +34,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // netdRefusal is what a LoadBalancer listener bind returns when the root netd
@@ -47,9 +49,11 @@ func netdRefusal(ap netip.AddrPort) error {
 var listedPorts = []uint16{80, 443}
 
 // netdRoute is the node daemon's svclb binder shape (cmd/k3sm hosterBinder):
-// every bind of a listed port, the wildcard included, goes to netd and nothing
-// else; every other bind is in-process, where a specific address below 1024 is
-// refused with EACCES as macOS refuses an unprivileged process. The netd leg
+// every bind below 1024, listed or not, the wildcard included, goes to netd;
+// every other bind is in-process. The in-process leg models macOS: a specific
+// address below 1024 is refused with EACCES, and a wildcard is refused with
+// EADDRINUSE while the netd leg (root, another user) holds a specific address
+// on the same port, as netd's Service-VIP socket does. The netd leg
 // maps the family-pinned network svclb asks for ("tcp4") to the wire name, as
 // cmd/k3sm's netdBinder adapter does, and the fake daemon refuses any other
 // protocol as netd does, so a binder that forwarded "tcp4" would fail here. It
@@ -66,7 +70,7 @@ type netdRoute struct {
 }
 
 func (r *netdRoute) Listen(ctx context.Context, network string, ap netip.AddrPort) (net.Listener, error) {
-	if ap.Port() <= privilegedPortMax && slices.Contains(listedPorts, ap.Port()) {
+	if ap.Port() <= privilegedPortMax {
 		r.mu.Lock()
 		r.asked = append(r.asked, ap)
 		r.networks = append(r.networks, network)
@@ -93,6 +97,9 @@ func (r *netdRoute) Listen(ctx context.Context, network string, ap netip.AddrPor
 	if ap.Port() <= privilegedPortMax && !ap.Addr().IsUnspecified() {
 		return nil, fmt.Errorf("listen tcp %s: %w", ap, syscall.EACCES)
 	}
+	if ap.Addr().IsUnspecified() && r.netd.holdsSpecific(ap.Port()) {
+		return nil, fmt.Errorf("listen tcp4 %s: bind: %w", ap, syscall.EADDRINUSE)
+	}
 	ln, err := r.direct.Listen(ctx, network, ap)
 	if err == nil {
 		r.mu.Lock()
@@ -100,6 +107,19 @@ func (r *netdRoute) Listen(ctx context.Context, network string, ap netip.AddrPor
 		r.mu.Unlock()
 	}
 	return ln, err
+}
+
+// holdsSpecific reports whether b holds an open listener on a specific
+// address on port.
+func (b *setBinder) holdsSpecific(port uint16) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ap, l := range b.open {
+		if ap.Port() == port && !ap.Addr().IsUnspecified() && !l.isClosed() {
+			return true
+		}
+	}
+	return false
 }
 
 // netdAsks counts the netd requests for port.
@@ -145,9 +165,7 @@ func echoDialer(_ context.Context, _, _ string) (net.Conn, error) {
 // node's own address and 127.0.0.1 with LAN access off and on the wildcard with
 // it on, every listener of the port from the helper so a swap in either
 // direction binds before it closes without ever meeting Darwin's cross-owner
-// EADDRINUSE, an accepted connection surviving each swap; an unlisted port
-// never asking the helper (in-process on the wildcard, unserved on a specific
-// set, as before the list); a helper refusal of a listed port leaving only
+// EADDRINUSE, an accepted connection surviving each swap; a helper refusal of a listed port leaving only
 // that Service unserved until a later reconcile is granted; and an ingress
 // host port refused as reserved in both LAN states, on a worker too.
 func TestPrivilegedPortServedOnSpecificSetViaNetd(t *testing.T) {
@@ -290,40 +308,6 @@ func TestPrivilegedPortServedOnSpecificSetViaNetd(t *testing.T) {
 		defer c.Close()
 		if err := echoTwice(c, "wild-again"); err != nil {
 			t.Fatalf("a new connection on the wildcard was not spliced: %v", err)
-		}
-	})
-
-	t.Run("an unlisted port never asks netd: in-process on the wildcard, unserved on a specific set", func(t *testing.T) {
-		t.Parallel()
-		h, cs, route := newRouted(t, nil, wildcard, nil, nil)
-		odd := lbService("default", "odd", "10.43.0.7", 81)
-		www := lbService("default", "www", "10.43.0.6", 80)
-		svcs := []*corev1.Service{odd, www}
-		h.reconcile(ctx, svcs)
-		oddWild := route.direct.get(t, "0.0.0.0:81")
-		if !reportOf(t, cs, testNode).entries[reportEntry(odd)] {
-			t.Fatal("an unlisted port below 1024 is not served on the wildcard with LAN access on")
-		}
-		rb, err := prepare(h, local)
-		if err != nil {
-			t.Fatalf("prepare: %v", err)
-		}
-		if !slices.Equal(rb.Unserved, []string{"default/odd"}) {
-			t.Fatalf("Unserved = %v, want default/odd only", rb.Unserved)
-		}
-		if err := rb.Commit(); err != nil {
-			t.Fatal(err)
-		}
-		if !oddWild.isClosed() {
-			t.Error("the unserved service still listens on the wildcard")
-		}
-		h.reconcile(ctx, svcs)
-		r := reportOf(t, cs, testNode)
-		if r.entries[reportEntry(odd)] || !r.entries[reportEntry(www)] {
-			t.Fatalf("report with LAN access off = %v, want www, not odd", r.entries)
-		}
-		if n := route.netdAsks(81); n != 0 {
-			t.Errorf("netd was asked for the unlisted port 81 %d times, want never", n)
 		}
 	})
 
@@ -475,4 +459,198 @@ func TestPrivilegedPortServedOnSpecificSetViaNetd(t *testing.T) {
 			t.Errorf("BindAddrs after a refused swap = %v, want the wildcard", h.BindAddrs())
 		}
 	})
+}
+
+// TestUnlistedPortRebindsAfterALANSwap is the gate for a LoadBalancer port
+// below 1024 the operator did not list (--lb-privileged-ports), on a node
+// whose netd already holds the Service proxy's root ClusterIP VIP socket on
+// the same port. macOS refuses an unprivileged wildcard bind beside another
+// user's specific socket on the port, so the hoster's wildcard goes through
+// netd too: it binds on first provisioning, comes off the node with LAN access
+// off (netd grants an unlisted port no node-address bind), and binds again
+// once LAN access is back on, every listener of the port from netd and none
+// in-process. A netd refusal of the wildcard leaves only that Service
+// unserved, and the next reconcile asks again.
+func TestUnlistedPortRebindsAfterALANSwap(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	vip81 := netip.MustParseAddrPort("10.43.49.222:81")
+	wild81 := netip.MustParseAddrPort("0.0.0.0:81")
+	node81 := netip.MustParseAddrPort("100.64.0.1:81")
+
+	prepare := func(h *Hoster, addrs []netip.Addr) (*Rebind, error) {
+		req := rebindRequest{addrs: addrs, reply: make(chan rebindReply, 1)}
+		go h.handleRebind(ctx, req)
+		r := <-req.reply
+		return r.rb, r.err
+	}
+	// newHeld is a hoster on the wildcard whose netd holds the VIP on 81 and
+	// refuses deny, as the node daemon wires it.
+	newHeld := func(t *testing.T, deny ...netip.AddrPort) (*Hoster, *fake.Clientset, *netdRoute) {
+		t.Helper()
+		refusals := map[netip.AddrPort]error{}
+		for _, ap := range deny {
+			refusals[ap] = netdRefusal(ap)
+		}
+		route := &netdRoute{netd: &setBinder{deny: refusals}, direct: &setBinder{}}
+		if _, err := route.netd.Listen(ctx, "tcp", vip81); err != nil {
+			t.Fatalf("hold the VIP: %v", err)
+		}
+		cs := fake.NewClientset(testNodeObject(testNode, nil))
+		h := newTestHoster(t, cs, testNode, route, map[int32]bool{}, nil)
+		h.cfg.PrivilegedPorts = slices.Clone(listedPorts)
+		h.addrs = slices.Clone(wildcard)
+		h.dial = echoDialer
+		return h, cs, route
+	}
+	assertNoInProcess := func(t *testing.T, route *netdRoute) {
+		t.Helper()
+		if _, inProc := portOwners(route, 81); len(inProc) != 0 {
+			t.Errorf("port 81 was bound in-process on %v; every listener below 1024 must come from netd", inProc)
+		}
+	}
+
+	t.Run("the model refuses an in-process wildcard beside a root specific socket", func(t *testing.T) {
+		t.Parallel()
+		// Above 1024 the route binds in-process, so this is the rule an
+		// in-process wildcard of 81 would meet beside netd's VIP socket.
+		route := &netdRoute{netd: &setBinder{}, direct: &setBinder{}}
+		if _, err := route.netd.Listen(ctx, "tcp", netip.MustParseAddrPort("10.43.49.222:2081")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := route.Listen(ctx, "tcp4", netip.MustParseAddrPort("0.0.0.0:2081")); !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatalf("in-process wildcard beside a root specific socket = %v, want EADDRINUSE; the gate below proves nothing", err)
+		}
+	})
+
+	t.Run("served on first provisioning and again after LAN access off and on", func(t *testing.T) {
+		t.Parallel()
+		h, cs, route := newHeld(t, node81)
+		odd := lbService("default", "odd", "10.43.49.222", 81)
+		www := lbService("default", "www", "10.43.0.6", 80)
+		svcs := []*corev1.Service{odd, www}
+		h.reconcile(ctx, svcs)
+		if !reportOf(t, cs, testNode).entries[reportEntry(odd)] {
+			t.Fatal("an unlisted port below 1024 is not served on the wildcard on first provisioning")
+		}
+		first := route.netd.get(t, wild81.String())
+		c := first.connect(t)
+		if err := echoTwice(c, "first"); err != nil {
+			t.Fatalf("a connection on %s was not spliced: %v", wild81, err)
+		}
+		_ = c.Close()
+
+		rb, err := prepare(h, local)
+		if err != nil {
+			t.Fatalf("prepare LAN off: %v", err)
+		}
+		if !slices.Equal(rb.Unserved, []string{"default/odd"}) {
+			t.Fatalf("Unserved = %v, want default/odd only: netd grants an unlisted port no node-address bind", rb.Unserved)
+		}
+		if err := rb.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if !first.isClosed() {
+			t.Error("the unserved service still listens on the wildcard")
+		}
+		h.reconcile(ctx, svcs)
+		if r := reportOf(t, cs, testNode); r.entries[reportEntry(odd)] || !r.entries[reportEntry(www)] {
+			t.Fatalf("report with LAN access off = %v, want www, not odd", r.entries)
+		}
+		if n := route.netdAsks(81); n < 2 {
+			t.Errorf("netd was asked for 81 %d times, want the wildcard and the node address", n)
+		}
+
+		rb, err = prepare(h, wildcard)
+		if err != nil {
+			t.Fatalf("prepare LAN on: %v", err)
+		}
+		if len(rb.Unserved) != 0 {
+			t.Fatalf("Unserved = %v, want none with LAN access on", rb.Unserved)
+		}
+		if err := rb.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			h.reconcile(ctx, svcs)
+			if !reportOf(t, cs, testNode).entries[reportEntry(odd)] {
+				t.Fatal("the unlisted port did not re-bind its wildcard after LAN access came back on")
+			}
+		}
+		again := route.netd.get(t, wild81.String())
+		if again == first || again.isClosed() {
+			t.Fatal("no new wildcard listener on 81 after the swap")
+		}
+		c = again.connect(t)
+		defer c.Close()
+		if err := echoTwice(c, "again"); err != nil {
+			t.Fatalf("a connection on the re-bound %s was not spliced: %v", wild81, err)
+		}
+		assertNoInProcess(t, route)
+		if route.netd.get(t, vip81.String()).isClosed() {
+			t.Error("the VIP socket was closed by the hoster")
+		}
+	})
+
+	t.Run("a netd refusal of the wildcard is unserved and the next reconcile asks again", func(t *testing.T) {
+		t.Parallel()
+		h, cs, route := newHeld(t, wild81)
+		odd := lbService("default", "odd", "10.43.49.222", 81)
+		web := lbService("default", "web", "10.43.0.5", 8080)
+		svcs := []*corev1.Service{odd, web}
+		h.reconcile(ctx, svcs)
+		if r := reportOf(t, cs, testNode); r.entries[reportEntry(odd)] || !r.entries[reportEntry(web)] {
+			t.Fatalf("report with 81 refused = %v, want web only", r.entries)
+		}
+		assertNoInProcess(t, route)
+		asked := route.netdAsks(81)
+		route.netd.mu.Lock()
+		route.netd.deny = nil
+		route.netd.mu.Unlock()
+		h.reconcile(ctx, svcs)
+		if route.netdAsks(81) <= asked {
+			t.Fatal("the next reconcile did not ask netd again")
+		}
+		if !reportOf(t, cs, testNode).entries[reportEntry(odd)] {
+			t.Fatal("the service is not served once netd grants the wildcard")
+		}
+		assertNoInProcess(t, route)
+	})
+}
+
+// TestHostServicePortReserved pins the macOS host-service ports in the
+// hoster's reserved set: a tenant LoadBalancer on one of them is refused
+// before netd is asked, LAN access on or off, so a root listener of a tenant
+// never keeps sshd, SMB, AFP, CUPS, the KDC or the Internet Sharing DNS proxy
+// from binding its port later.
+func TestHostServicePortReserved(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, addrs := range [][]netip.Addr{wildcard, local} {
+		var buf bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&buf, nil))
+		route := &netdRoute{netd: &setBinder{}, direct: &setBinder{}}
+		cs := fake.NewClientset(testNodeObject(testNode, nil))
+		h := newTestHoster(t, cs, testNode, route, ports.ReservedSet(), log)
+		h.cfg.PrivilegedPorts = slices.Clone(listedPorts)
+		h.addrs = slices.Clone(addrs)
+		h.dial = echoDialer
+		var svcs []*corev1.Service
+		for _, p := range ports.HostServicePorts() {
+			svcs = append(svcs, lbService("default", fmt.Sprintf("host-%d", p), "10.43.0.9", int32(p)))
+		}
+		h.reconcile(ctx, svcs)
+		r := reportOf(t, cs, testNode)
+		for i, p := range ports.HostServicePorts() {
+			if r.entries[reportEntry(svcs[i])] {
+				t.Errorf("bind %v: a tenant service on host-service port %d is reported", addrs, p)
+			}
+			if n := route.netdAsks(uint16(p)); n != 0 {
+				t.Errorf("bind %v: netd was asked %d times for host-service port %d", addrs, n, p)
+			}
+		}
+		if !strings.Contains(buf.String(), "RESERVED") || !strings.Contains(buf.String(), "macOS host service") {
+			t.Errorf("bind %v: no reserved-port warning naming the host services: %s", addrs, buf.String())
+		}
+	}
 }

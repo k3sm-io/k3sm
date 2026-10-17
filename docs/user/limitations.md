@@ -329,9 +329,11 @@ Today at `main`, per port class:
   and the desktop container tools, which publish LoadBalancer ports on all interfaces. With LAN
   access off it binds the node's own address and `127.0.0.1` (the ingress host binds `127.0.0.1`
   only from port 1024 up), and a LoadBalancer port below 1024 is served only when it is in the
-  node's `--lb-privileged-ports` list (`80,443` by default). A LoadBalancer port is not served on
-  any node while the ingress host declares the port, so the default list serves `80` and `443` only
-  where the ingress host is disabled or moved.
+  node's `--lb-privileged-ports` list (`80,443` by default). A LoadBalancer port below 1024 binds
+  through the root network helper in both states, so with LAN access on an unlisted one is served on
+  every interface of every node too; the list decides only the node-address binds. A LoadBalancer
+  port is not served on any node while the ingress host declares the port, so the default list
+  serves `80` and `443` only where the ingress host is disabled or moved.
 
   **The bind address and the advertised address are different.** Read them separately.
   With LAN access on, the **port** is reachable on every interface the Mac has, including its LAN
@@ -406,7 +408,10 @@ Today at `main`, per port class:
 - k3sm reserves some ports, and rejects LoadBalancer Services that claim them. The NodePort range
   `30000-32767` and the kubelet API port `10250` are k3sm's own listeners (see
   [Network exposure](install.md#network-exposure) for the addresses they bind), and a LoadBalancer
-  listener on the same port would either fail or split the port with them. A `type: LoadBalancer`
+  listener on the same port would either fail or split the port with them. The macOS host-service
+  ports `22` (Remote Login), `53` (the Internet Sharing DNS proxy), `88` (Kerberos), `445` (SMB),
+  `548` (AFP) and `631` (printer sharing) are reserved too, so a LoadBalancer taken while a service
+  is off cannot keep it from starting later. A `type: LoadBalancer`
   Service declaring one of those ports is **rejected at `kubectl apply`** with a message naming the
   port, and every node additionally refuses to bind it. Plain NodePort Services are unaffected,
   because the apiserver allocates their `nodePort` out of that very range. Ordinary duplicate
