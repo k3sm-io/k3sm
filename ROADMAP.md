@@ -1,20 +1,25 @@
 # k3sm roadmap
 
-> **Hand-written public roadmap narrative.** The engineering ledger each repo keeps is the
-> source of truth for delivery state. **Edit by hand.**
+> The roadmap is grouped by minor version: each block below is one minor release line, what it
+> shipped or what it is planned to carry. When the plan changes, the block a feature belongs to is
+> changed here, and the per-repo engineering ledgers stay the source of truth for delivery state.
 
 k3sm is a macOS-native Kubernetes distribution for Apple Silicon, the macOS/arm64 analog of
 [k3s](https://github.com/k3s-io/k3s). Pods run as **native Darwin processes**, with zero Linux and
 no VM in the default path, isolated with macOS's own primitives (Seatbelt, `lo0`/vmnet,
 wireguard-go, launchd, APFS) instead of Linux's (cgroups, namespaces, iptables, systemd,
 OverlayFS). A `vm` RuntimeClass adds an opt-in path that boots `linux/arm64` OCI images in a
-per-pod micro-VM (see Shipped, below).
+per-pod micro-VM (see v0.1, below).
 
-This is a k3s-style three-horizon roadmap. Where a capability is implemented but not yet
-run live, this page says so. The trade-offs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
+Where a capability is implemented but not yet run live, this page says so. The trade-offs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
 the docs today.
 
-## Shipped
+## v0.1 (shipped)
+
+v0.1.0 was the public release (2026-09-01); v0.1.1 through v0.1.7 followed. [CHANGELOG.md](CHANGELOG.md)
+has every release's notes.
+
+### What the v0.1 line ships
 
 Everything listed below is implemented and passes k3sm's own test suite. The single-node path is
 complete: the Virtual Kubelet node, the embedded control plane, and pod isolation/resource
@@ -49,7 +54,7 @@ release engineering. What ships:
   exit-code propagation, PersistentVolumeClaims that survive a hard hypervisor kill, in-guest cluster
   DNS, per-container CPU and memory, and a Service routing to a `vm` pod through its ClusterIP.
   Shipped at v0.1.0 (tagged 2026-09-01), `linux/arm64` only. An `amd64` image is refused at pull
-  rather than started and left to crash, on either the native or the `vm` path. See Next.
+  rather than started and left to crash, on either the native or the `vm` path. See v0.2.
 - **A built-in image build engine.** `k3sm builder up|down|delete` manages a guest-root buildkitd
   engine inside a `vm`-RuntimeClass micro-VM with a PVC-backed cache; `k3sm build` auto-routes any
   Dockerfile with `RUN` (or another engine-only verb) through it while a COPY-only Dockerfile keeps
@@ -57,7 +62,7 @@ release engineering. What ships:
   install only k3sm, then build and run containers with no separate container engine. The full loop
   is a RUN build → OCI export →
   `k3sm image push` → a Pod running the result.
-  `linux/arm64` only; `linux/amd64` under guest Rosetta is not wired (see Future, below). The
+  `linux/arm64` only; `linux/amd64` under guest Rosetta is not wired (see Not yet assigned, below). The
   buildkitd image currently defaults to the pinned upstream digest rather than the (still-private)
   k3sm GHCR mirror, and buildx ships as a verified prebuilt asset rather than source-built; both are
   the remaining packaging work.
@@ -67,22 +72,6 @@ release engineering. What ships:
   tolerate no failures, workers stay attached to the server they joined through, and a leader
   lease lost to quorum loss is still counted as a crash. The external-datastore path (kine to
   Postgres) was removed in v0.1.6, and single-node installs keep the SQLite-backed datastore.
-- **v0.1.7.** A `vm` Pod answers on its pod IP from every node: its node holds the address and
-  relays each TCP connection on the Pod's declared and Service-targeted ports to the guest, so
-  Services reach `vm` Pods across nodes. The experimental two-server control plane above ships in
-  this release.
-- **v0.1.6.** Hosts survive heavy pod-network traffic: TCP connections on the pod network have
-  their segment size lowered after connect, and a torn-down pod's address is blackholed, so an open
-  connection fails cleanly instead of re-routing onto the mesh interface and triggering a macOS
-  kernel panic. A shadow set of re-signed shell utilities makes mounted paths work for `tar`, the
-  usual coreutils and recursive walks (`rm -r`, `ls -R`, `find`, `cp -R`). Native Pods run `curl`
-  and other TLS clients. The server's node runs as `system:node:<name>` under the Node authorizer.
-  The node evicts Pods under memory pressure, one at a time. Container logs are written to disk in
-  the CRI format, and a resident shim keeps container output and exit status. `k3sm status`
-  reports the data volume, and `k3sm install --data-volume` puts the data root on a size-capped
-  APFS volume. Two alphas ride along: the groundwork for Thunderbolt direct links between Macs
-  (contracts and the networking library, not yet wired into the node) and sharded MLX models
-  placed over the existing mesh, neither yet run on hardware.
 - **Conformance hardening.** As close to standard k8s as the Darwin substrate
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
@@ -98,7 +87,7 @@ release engineering. What ships:
   Apple GPU, including a model-hub weight
   download under a default-deny Seatbelt profile and a clean deletion)*
 
-## v0.1.0, the public release (shipped 2026-09-01)
+### v0.1.0, the public release (2026-09-01)
 
 - Install arrives in three generations, in shipping order: *(1)*
   `curl -fsSL https://k3sm.io/install.sh | sh`, a checksum-verified release tarball handed to
@@ -108,14 +97,14 @@ release engineering. What ships:
 - `k3sm image load` / `k3sm image import` ingest docker-save
   tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and
   `k3sm build` packages native darwin/arm64 binaries from a COPY-only Dockerfile subset
-  (`RUN` arrives with the vm-backed builder, see Shipped, above).
+  (`RUN` arrives with the vm-backed builder, see What the v0.1 line ships, above).
 - Standard **linux/arm64 images**
   run as `vm`-RuntimeClass pods, one lightweight micro-VM per pod, with `kubectl exec/logs/top`,
   PVC-backed persistence, Service/DNS reachability, readiness probes, and private-registry
   pulls. A whole multi-part app's containers run this way, as unmodified images with a three-line
   manifest adaptation (`kubernetes.io/os: darwin` + `runtimeClassName: vm`).
-  *(it was run and passed against the released build, see Shipped, above;
-  published performance figures and the remaining gaps ship in v0.2, below)*
+  *(it was run and passed against the released build, see What the v0.1 line ships, above;
+  published performance figures and the remaining gaps are in v0.2, below)*
 - linux/amd64 images do not run on any path yet. Running them needs Rosetta-for-Linux
   translation inside the guest, cut from the first release so the arm64 path could
   ship on its own. There is no emulation fallback, because no user-mode x86 emulator exists for a Darwin host. An
@@ -123,23 +112,48 @@ release engineering. What ships:
   left to crash, and a node that cannot translate does not advertise that it can.
   *(scheduled for a v0.1.x follow-up)*
 
-v0.1.1 followed on 2026-09-02; see [CHANGELOG.md](CHANGELOG.md) for what it adds.
+### v0.1.6 and v0.1.7
 
-## Future (post-v0.1.0)
+- **v0.1.6.** Hosts survive heavy pod-network traffic: TCP connections on the pod network have
+  their segment size lowered after connect, and a torn-down pod's address is blackholed, so an open
+  connection fails cleanly instead of re-routing onto the mesh interface and triggering a macOS
+  kernel panic. A shadow set of re-signed shell utilities makes mounted paths work for `tar`, the
+  usual coreutils and recursive walks (`rm -r`, `ls -R`, `find`, `cp -R`). Native Pods run `curl`
+  and other TLS clients. The server's node runs as `system:node:<name>` under the Node authorizer.
+  The node evicts Pods under memory pressure, one at a time. Container logs are written to disk in
+  the CRI format, and a resident shim keeps container output and exit status. `k3sm status`
+  reports the data volume, and `k3sm install --data-volume` puts the data root on a size-capped
+  APFS volume. Two alphas ride along: the groundwork for Thunderbolt direct links between Macs
+  (contracts and the networking library, not yet wired into the node) and sharded MLX models
+  placed over the existing mesh, neither yet run on hardware.
+- **v0.1.7.** A `vm` Pod answers on its pod IP from every node: its node holds the address and
+  relays each TCP connection on the Pod's declared and Service-targeted ports to the guest, so
+  Services reach `vm` Pods across nodes. The experimental two-server control plane above ships in
+  this release.
 
-- **The Linux `vm` path, v0.2.** The Linux-image capability ships at v0.1 (above); v0.2 adds
+## v0.2 (planned)
+
+- **The Linux `vm` path.** The Linux-image capability ships at v0.1 (above); v0.2 adds
   the remaining two-Mac and vm tests with **published performance figures** (VM boot latency = restart
   cost, the Rosetta non-TSO ratio, virtiofs I/O vs native APFS), and the remaining ceilings
   either closed or documented (per-pod network segmentation between micro-VMs, host-path
   sharing). It also adds darwin/amd64 pod payloads under host Rosetta on the native path.
+
+## v0.3 (planned)
+
+- **De-EXPERIMENTAL HA.** The headline of this line, once it has been run on two Macs with Postgres.
+- **Multi-node graduates.** Multi-node clusters leave EXPERIMENTAL together with the two-server
+  control plane.
+
+## Not yet assigned to a minor version
+
 - **`linux/amd64` in the build engine, via guest Rosetta.** The managed buildkitd builder (see
-  Shipped, above) builds `linux/arm64` only today; targeting `linux/amd64` needs the same
+  v0.1, above) builds `linux/arm64` only today; targeting `linux/amd64` needs the same
   in-guest Rosetta translation the `vm` RuntimeClass itself doesn't have yet (see Limitations).
 - **Kubelet-faithful registry semantics on the native path.** The pull-failure backoff taxonomy
   (`ErrImagePull`/`ImagePullBackOff` alternation, `ErrImageNeverPull`), Rosetta-consuming
   multi-arch selection, and a warm-cache offline start under `imagePullPolicy: IfNotPresent` /
   `Never` are still open.
-- **De-EXPERIMENTAL HA.** The v0.3 headline, once it has been run on two Macs with Postgres.
 - **ANE.** Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA.** Dynamic Resource Allocation for GPUs, once extended resources have shipped.
 - **A serving fleet for MLX models.** Multi-model, multi-worker inference above `MLXModel`: an
@@ -178,7 +192,7 @@ v0.1.1 followed on 2026-09-02; see [CHANGELOG.md](CHANGELOG.md) for what it adds
   shell inside a module, so `kubectl exec` has nothing to reach.
 - **Autoscaling.** Scale-to-zero / activator-fronted model serving.
 
-### Non-goals
+## Non-goals
 
 - **Not a Linux-container runtime.** k3sm runs native Darwin processes. Linux images run only
   under the `vm` RuntimeClass (a separate micro-VM stack, `linux/arm64` only), never
