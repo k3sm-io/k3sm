@@ -173,6 +173,10 @@ if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
 	# pins, records and refusals, hermetically. The build itself is operator-run.
 	echo "==> [k3sm] metrics-server image recipe (self-test)"
 	hack/images/metrics-server/selftest.sh
+	# The release publisher's hermetic self-test (refusals, promote check,
+	# the final-release disk-image requirement). set -e reads its exit code.
+	echo "==> [k3sm] release publish (self-test)"
+	hack/release/publish.sh --self-test
 	echo "==> [k3sm] verify-deps (self-test)"
 	hack/verify-deps.sh --self-test
 	echo "==> [k3sm] verify-deps"
