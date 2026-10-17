@@ -187,7 +187,9 @@ node:
    (`k3sm`, `k3sm-execshim`, `k3sm-vmhost`, the two shim dylibs and `cp-payload/`) as regular
    files, applies the code-signing policy and the downgrade rule, and only then runs the new
    `k3sm install --from-staging`. That install updates the node in place: it keeps the node's role,
-   the server a worker joined and every argument the node was installed with.
+   the server a worker joined and every argument the node was installed with. On a server it also
+   keeps the admin credential, so a copy of the admin kubeconfig on another Mac still works after
+   the server's turn.
 5. The signatures follow the installed build. A node installed from a build signed by a
    Developer ID team takes only a release signed by that same team. A node installed from an
    ad-hoc signed build takes an ad-hoc signed release or a team-signed one. Under the `required`

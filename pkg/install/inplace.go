@@ -19,6 +19,8 @@ package install
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"k3sm.io/k3sm/pkg/dataroot"
@@ -33,7 +35,8 @@ import (
 // --server its plist names and the node credential its work dir holds, and
 // every operator argument is carried over from the installed plist (or the
 // recorded arguments) the way any reinstall carries it. The result is the
-// same reinstall an operator performs with explicit flags.
+// same reinstall an operator performs with explicit flags, with one
+// difference: a control plane keeps its admin token (carriedAdminToken).
 
 // ErrNothingToUpdate refuses an in-place update on a Mac with no k3sm
 // installed.
@@ -47,7 +50,8 @@ type FileOwner func(path string) (user string, err error)
 // admin kubeconfig is rewritten for cfg.TargetUser, or when that is empty for
 // the owner of the kubeconfig the last install recorded writing. A worker is
 // reinstalled with its plist's --server and must hold a valid node credential,
-// because it rejoins with no token. Both daemons installed, an unreadable
+// because it rejoins with no token. A control plane also keeps the admin token
+// it already serves (carriedAdminToken). Both daemons installed, an unreadable
 // plist or record, and nothing installed at all refuse.
 //
 // One case is not an update: nothing is installed and cfg.TargetUser is set.
@@ -101,6 +105,7 @@ func resolveAgentInPlace(sys System, cfg, d Config) (Config, error) {
 func resolveServerInPlace(sys System, cfg, d Config, owner FileOwner) (Config, error) {
 	cfg.Role = RoleServer
 	cfg.Logger = d.Logger
+	cfg.AdminToken = carriedAdminToken(sys, d)
 	if cfg.TargetUser != "" {
 		cfg.Logger.Info("updating the installed server in place", "kubeconfig-owner", cfg.TargetUser)
 		return cfg, nil
@@ -122,4 +127,36 @@ func resolveServerInPlace(sys System, cfg, d Config, owner FileOwner) (Config, e
 	cfg.TargetUser = u
 	cfg.Logger.Info("updating the installed server in place", "kubeconfig-owner", u, "kubeconfig", rec.AdminKubeconfig)
 	return cfg, nil
+}
+
+// adminTokenPattern is the shape generateToken mints. A staged value of any
+// other shape is not carried: the server renders the token into its
+// token-auth CSV, so a stray comma or newline would change what it grants.
+var adminTokenPattern = regexp.MustCompile(`^k3sm-[0-9a-f]{48}$`)
+
+// carriedAdminToken returns the admin token the installed control plane
+// serves (the file staged at serverTokenPath), or "" so Install mints one.
+//
+// An in-place update is not a fresh install, so it keeps the credential, as
+// k3s keeps its token across an upgrade: a fresh token would leave every
+// copy of the admin kubeconfig outside this Mac (a worker's, a tool's)
+// Unauthorized after a managed roll that reports Done, with no path for them
+// to learn the new one. The cluster CA survives the reinstall as well, so the
+// kubeconfig the install rewrites is the one those copies already hold. A
+// missing or malformed file falls back to minting, which is what every
+// install did before; the value itself is never logged.
+func carriedAdminToken(sys System, d Config) string {
+	path := d.serverTokenPath()
+	raw, err := sys.ReadFile(path)
+	if err != nil {
+		d.Logger.Warn("the installed admin token is unreadable, so this update mints a new one and every copied admin kubeconfig must be refreshed", "path", path, "err", err)
+		return ""
+	}
+	tok := strings.TrimSpace(string(raw))
+	if !adminTokenPattern.MatchString(tok) {
+		d.Logger.Warn("the installed admin token is not a k3sm admin token, so this update mints a new one and every copied admin kubeconfig must be refreshed", "path", path)
+		return ""
+	}
+	d.Logger.Info("keeping the installed admin token across the in-place update", "path", path)
+	return tok
 }
