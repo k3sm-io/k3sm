@@ -309,9 +309,16 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 //     address (the node address of a derived or mesh node), or an address of
 //     an en* interface (an operator-chosen node address); never a Service-CIDR
 //     VIP, a pod address, or an address of a utun, bridge, vmenet, feth, awdl
-//     or llw interface. A port the canonical ingress Service declares is
-//     refused here: it is the ingress host's on every bind shape. The port list
-//     comes from netd's own root-owned launchd job, never from the request.
+//     or llw interface. The port list comes from netd's own root-owned
+//     launchd job, never from the request. A port the canonical ingress
+//     Service declares is the ingress host's on every bind shape, so no
+//     tenant LoadBalancer is served on it here; instead the same address
+//     class admits it for the ingress host itself while LAN access is off,
+//     whether or not the port is listed, on this node's mesh-egress address
+//     or an en* address (never 127.0.0.1: the ingress host does not serve
+//     loopback below 1024). netd cannot tell which local process asks, but
+//     the svclb hoster never asks for an ingress-declared port (it reserves
+//     them on every node), so the ingress host is the only caller for one.
 //
 // The node-address and wildcard classes are one ALLOWLIST keyed on namespace+name, not a
 // test on the requester's shape. It used to authorize the bind for ANY Service
@@ -414,7 +421,10 @@ func (a servicePortAuthorizer) isNodeEgress(addr netip.Addr) bool {
 
 // authorizeHostAddr applies the host-address class: a LoadBalancer port the
 // operator listed, on one of the addresses the svclb hoster's LAN-off set can
-// hold, that a LoadBalancer Service other than the ingress host's declares.
+// hold, that a LoadBalancer Service other than the ingress host's declares;
+// or a port the canonical ingress Service declares, listed or not, on the
+// node's mesh-egress or an en* address, which is the ingress host's own
+// LAN-off listener (see PortPolicy).
 // Those addresses are exactly three shapes: 127.0.0.1; this node's own
 // mesh-egress address (the node address of a derived or mesh node, an lo0
 // alias); and an operator-chosen node address, which is an address on an
@@ -426,7 +436,8 @@ func (a servicePortAuthorizer) isNodeEgress(addr netip.Addr) bool {
 // the address and port it asks for. A refusal names the port and the reason
 // so the root daemon's log says why a LoadBalancer Service went unserved.
 func (a servicePortAuthorizer) authorizeHostAddr(port int, addr netip.Addr) error {
-	if !slices.Contains(a.policy.LBPrivilegedPorts, uint16(port)) {
+	ingress := a.ingressDeclares(port)
+	if !ingress && !slices.Contains(a.policy.LBPrivilegedPorts, uint16(port)) {
 		return fmt.Errorf("port %d on %s is not in the allowed LoadBalancer port list (%s); an address that is neither a service-CIDR VIP, the wildcard, nor a published vm pod address is authorized only for a listed port", port, addr, describeAllowed(a.policy.LBPrivilegedPorts))
 	}
 	target := fmt.Sprintf("%s port %d", addr, port)
@@ -434,6 +445,8 @@ func (a servicePortAuthorizer) authorizeHostAddr(port int, addr netip.Addr) erro
 	case addr == loopbackV4:
 		// 127.0.0.1 is this Mac's own loopback: the LAN-off set serves it,
 		// and it is on lo0 by construction, so only the Service set decides.
+		// The ingress host leaves loopback out below 1024, so an
+		// ingress-declared port is refused here as it always was.
 		return a.authorizeLBDeclared(port, addr.String())
 	case addr.IsLoopback():
 		return fmt.Errorf("bind on %s denied: the only loopback address authorized for a LoadBalancer port is 127.0.0.1", target)
@@ -458,7 +471,26 @@ func (a servicePortAuthorizer) authorizeHostAddr(port int, addr netip.Addr) erro
 	if !a.isNodeEgress(addr) && !strings.HasPrefix(name, "en") {
 		return fmt.Errorf("bind on %s denied: the address is on %s; a LoadBalancer port is authorized only on 127.0.0.1, this node's own address, or an address of an en* interface", target, name)
 	}
+	if ingress {
+		// The ingress host's LAN-off listener on the node's own address.
+		return nil
+	}
 	return a.authorizeLBDeclared(port, addr.String())
+}
+
+// ingressDeclares reports whether the canonical ingress Service is among the
+// LoadBalancer Services declaring port in a synced Service set. Before the
+// first sync it reports false, so the listed-port path's refusal says the set
+// is not synced yet.
+func (a servicePortAuthorizer) ingressDeclares(port int) bool {
+	canonical := a.policy.NodeAddressService
+	if !canonical.IsValid() || a.policy.LBDeclarers == nil {
+		return false
+	}
+	if a.policy.Synced != nil && !a.policy.Synced() {
+		return false
+	}
+	return slices.Contains(a.policy.LBDeclarers(port), canonical)
 }
 
 // loopbackV4 is the one loopback address the LoadBalancer-port class admits.
