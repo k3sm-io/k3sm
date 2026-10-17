@@ -320,8 +320,9 @@ history and process listings.
 
 `K3SM_REGISTRY_TOKEN` is used the way `docker login` uses a password: k3sm presents it with the
 username in `K3SM_REGISTRY_USER` (`token` if that is unset), and a registry that issues
-short-lived tokens, as ghcr.io, Docker Hub and most hosted registries do, trades it for a token
-scoped to the repository being pushed.
+short-lived tokens, as ghcr.io and most hosted public registries do, trades it for a token
+scoped to the repository being pushed. The exchange goes to the token realm the registry names,
+which can be a different host from the registry itself, so the credential is sent there.
 
 For ghcr.io, use a classic personal access token with the `write:packages` scope, or a
 fine-grained token with write access to packages. ghcr ignores the username for a token, so
