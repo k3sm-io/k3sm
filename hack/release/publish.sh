@@ -140,8 +140,8 @@
 # names the newest final release's image, never a candidate's. The name keeps
 # the tarball's darwin_arm64 platform suffix, so a downloaded file says what it
 # is and an image for another platform could sit beside it under its own name.
-# A final release published without --disk-image carries no alias, and the
-# link then answers 404 until the next image release.
+# A final release without --disk-image is refused (image-required), so the
+# link never answers 404; a release candidate needs none.
 #
 # A draft whose assets fail step 7 is never promoted, so a failed or partial
 # upload of a large asset cannot become the latest release that an install
@@ -737,6 +737,15 @@ add_disk_image() {
 		refuse image-changed "the alias $IMAGE_ALIAS_NAME does not hash as the checked image (sha256 $IMAGE_SHA256); nothing was uploaded."
 	printf '%s  %s\n%s  %s\n' "$IMAGE_SHA256" "$name" "$IMAGE_SHA256" "$IMAGE_ALIAS_NAME" >>"$dir/$(checksums_name "$tag")" ||
 		die "could not append the disk image and its alias to the checksums file"
+}
+
+# require_image_for_final <tag> <image>: a final release is promoted --latest,
+# and the stable link resolves to the alias that only --disk-image adds, so a
+# final release without one would answer 404. A release candidate is never
+# latest and needs none.
+require_image_for_final() {
+	is_rc "$1" || [ -n "${2:-}" ] ||
+		refuse image-required "$1 is a final release and needs --disk-image: without the image there is no stable alias, and releases/latest/download/$IMAGE_ALIAS_NAME would answer 404; nothing was uploaded."
 }
 
 # check_image_name <file> <tag>: the closed name, checked before anything else.
@@ -1639,6 +1648,16 @@ EOF
 	else
 		bad "sign.sh codesign/notarytool flags"
 	fi
+	for v in "$tag" "$rctag"; do
+		rc=0; out="$( (require_image_for_final "$v" "") 2>&1)" || rc=$?
+		if is_rc "$v"; then
+			if [ "$rc" -eq 0 ]; then ok "a release candidate without --disk-image is allowed"; else bad "rc without image (rc=$rc: $out)"; fi
+		elif [ "$rc" -eq 2 ] && grep -q "REFUSE: image-required" <<<"$out" && grep -q "404" <<<"$out"; then
+			ok "a final release without --disk-image refuses, naming the 404"
+		else bad "final without image (rc=$rc: $out)"; fi
+	done
+	rc=0; out="$( (require_image_for_final "$tag" "$T/x.dmg") 2>&1)" || rc=$?
+	if [ "$rc" -eq 0 ]; then ok "a final release with --disk-image passes the requirement"; else bad "final with image (rc=$rc: $out)"; fi
 	if command -v shellcheck >/dev/null 2>&1; then
 		if shellcheck "$HERE/publish.sh" "$sign"; then ok "shellcheck"; else bad "shellcheck"; fi
 	else
@@ -1714,6 +1733,7 @@ if [ "$MODE" = upload ]; then
 	STAGE="$(cd "$STAGE" && pwd)"
 	ASSETS="$STAGE.assets"
 	[ -d "$ASSETS" ] || die "$ASSETS is not a directory; --through-verify leaves it"
+	require_image_for_final "$VERSION" "$DISK_IMAGE"
 	run_upload "$REPO_ROOT" "refs/tags/$VERSION" "$VERSION" "$TEAM_ID" "$STAGE" "$REPO" "$NOTES" "$DISK_IMAGE"
 	echo "==> released $VERSION on $REPO"
 	exit 0
