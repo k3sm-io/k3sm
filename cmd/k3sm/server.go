@@ -552,7 +552,7 @@ func runServer(args []string) (err error) {
 	// cosmetic: in the mesh posture the apiserver BINDS and advertises the mesh IP,
 	// so tearing the utun and its alias down first would pull the interface out
 	// from under a control plane that is still draining.
-	// It stays a no-op until step 4b's enroll assigns it, and forever under
+	// It stays a no-op until step 2b's enroll assigns it, and forever under
 	// `--network none`, so registering it this early costs nothing.
 	meshDown := meshTeardown(noMeshTeardown)
 	defer func() { meshTeardownOnExit(ctx, meshDown, logger) }()
@@ -590,6 +590,18 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
 	}
+	// 2a. The MeshPeer CRD, FAIL-CLOSED; 2a/2b precede step 3 (see enrollServerMesh).
+	if err = ensureMeshPeerCRD(ctx, opts.meshIP, func() (crdensure.CRDClient, error) {
+		return apiextensionsclient.NewForConfig(restCfg)
+	}, logger); err != nil {
+		return err
+	}
+	// 2b. This server joins its own mesh through the ONE shared enroller.
+	sm, err := enrollServerMesh(ctx, plan, restCfg, cs, exec.Kubeconfig(), meshDown, logger)
+	meshDown = sm.down
+	if err != nil {
+		return err
+	}
 	// 3–3c. Admission policies, the fail-closed RBAC graph, the embedded add-ons.
 	if err = provisionServerCluster(ctx, plan, cs, logger); err != nil {
 		return err
@@ -605,18 +617,6 @@ func runServer(args []string) (err error) {
 	// 3d. The ingest registry; torn down BEFORE the control plane (LIFO).
 	stopRegistry, registryPuller := startServerRegistry(ctx, plan, cs, vmCapable, logger)
 	defer stopRegistry()
-	// 4a. The MeshPeer CRD, FAIL-CLOSED, before anything that can write a MeshPeer.
-	if err = ensureMeshPeerCRD(ctx, opts.meshIP, func() (crdensure.CRDClient, error) {
-		return apiextensionsclient.NewForConfig(restCfg)
-	}, logger); err != nil {
-		return err
-	}
-	// 4b. This server joins its own mesh through the ONE shared enroller.
-	sm, err := enrollServerMesh(ctx, plan, restCfg, cs, exec.Kubeconfig(), meshDown, logger)
-	meshDown = sm.down
-	if err != nil {
-		return err
-	}
 	net, nodeAddressing, err := startServerDatapath(ctx, plan, restCfg, cs, sm, vmCapable, logger) // 4c. Service proxy + DNS
 	if err != nil {
 		return err
@@ -652,7 +652,7 @@ func runServer(args []string) (err error) {
 // direct ops); Disabled (--network none) runs no datapath. It returns the Server
 // and the addressing half of the in-process node's options.
 //
-// MeshEgressIP and PeerMeshEgressIPs are seeded from step 4b's enroll. The
+// MeshEgressIP and PeerMeshEgressIPs are seeded from step 2b's enroll. The
 // dialer's source bind is DESTINATION-SCOPED (darwin-net binds it only for a
 // destination inside the cluster pod CIDR and outside this node's own /24), so
 // wiring a real mesh-egress source here does not disturb loopback, ClusterIP or
@@ -915,14 +915,14 @@ type crdClientFactory func() (crdensure.CRDClient, error)
 // The manifest is k3sm.io/apis' own bytes (crdconfig.MeshPeerCRD) applied through
 // pkg/crdensure — the same applier the MLX operator uses for MLXModel — so there is
 // no second apply path and no shadow copy of the schema. An error is returned, never
-// logged and swallowed: the caller fail-closes on it (see step 4a in runServer).
+// logged and swallowed: the caller fail-closes on it (see step 2a in runServer).
 //
-// Step 4a runs it on the MESH path only, BEFORE anything that can write a MeshPeer
+// Step 2a runs it on the MESH path only, BEFORE anything that can write a MeshPeer
 // exists. Nothing used to apply it: the manifest shipped in k3sm.io/apis and every
 // worker join 500'd at the enroller's write until a human installed the CRD by
 // hand.
 //
-// The ORDER is the point. It must precede newMeshEnroller (step 4b) and therefore
+// The ORDER is the point. It must precede newMeshEnroller (step 2b) and therefore
 // the join listener startBootstrapServer opens, because the first worker to reach
 // that listener writes a MeshPeer — a CRD ensured afterwards would still lose
 // whichever join won the race. It also precedes this server's OWN enroll, which is

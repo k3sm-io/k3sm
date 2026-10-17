@@ -889,7 +889,7 @@ func listenJoinAddr(ctx context.Context, listen listenFunc, addr string, attempt
 // bounded window when the address is transiently busy (listenJoinAddr). It blocks until ctx is
 // cancelled, then shuts down. This is the live, mesh-bound supervisor — its end-to-end
 // exercise is the two-Mac K3SM_LAB gate. The MeshPeer CRD the enroller's write lands
-// in is ensured fail-closed by runServer's step 4a before this listener exists, so a
+// in is ensured fail-closed by runServer's step 2a before this listener exists, so a
 // join reaching it never meets a missing CRD.
 func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *slog.Logger) error {
 	h := deps.hierarchy

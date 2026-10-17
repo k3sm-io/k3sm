@@ -186,7 +186,7 @@ func TestEnsureMeshPeerCRDProvisionsOnlyOnTheMeshPath(t *testing.T) {
 // TestEnsureMeshPeerCRDFailsClosed pins the fail-closed contract: neither a client
 // that cannot be built nor an API server that rejects the apply is swallowed.
 //
-// This is the half that distinguishes step 4a from the log-and-continue admission
+// This is the half that distinguishes step 2a from the log-and-continue admission
 // provisioners beside it. A MeshPeer CRD that silently failed to apply produces a
 // control plane whose join listener accepts workers and then 500s every enroll —
 // the exact defect B224 exists to remove, re-created one level up.

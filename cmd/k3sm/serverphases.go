@@ -50,7 +50,9 @@ import (
 	"k3sm.io/k3sm/pkg/updatectl"
 )
 
-// The post-bring-up phases of `k3sm server`, in runServer's order. Each one that
+// The post-bring-up phases of `k3sm server`, in runServer's order, except that
+// enrollServerMesh (step 2b) is declared beside the mesh phases it feeds while it
+// runs before step 3. Each one that
 // owns a goroutine returns a stop func that cancels the phase's derived context
 // and then waits for the goroutine; runServer defers it at the phase's position,
 // so the defers still run in reverse registration order (LIFO).
@@ -270,7 +272,7 @@ func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	})
 }
 
-// serverMesh is what step 4b leaves behind for the phases after it.
+// serverMesh is what step 2b leaves behind for the phases after it.
 type serverMesh struct {
 	// enroller is the ONE mesh enroller the self-enroll and the join supervisor
 	// share; nil off the mesh path.
@@ -366,7 +368,7 @@ func parkServerDataPath(ctx context.Context, opts serverOptions, refusal error, 
 	}
 }
 
-// enrollServerMesh is step 4b: THIS SERVER JOINS ITS OWN MESH, at the pod range
+// enrollServerMesh is step 2b: THIS SERVER JOINS ITS OWN MESH, at the pod range
 // its own --mesh-ip names.
 //
 // The enroller is constructed here, not at the supervisor (step 4d), because both
@@ -388,6 +390,16 @@ func parkServerDataPath(ctx context.Context, opts serverOptions, refusal error, 
 // take the process down. What is lost on failure is named in the log line,
 // because "the server is not on its own mesh" is otherwise only visible as
 // cross-node traffic that silently goes nowhere.
+//
+// It runs BEFORE step 3's provisioning, right behind the apiserver, because a
+// worker reaches this server's API over the mesh: every provisioning second spent
+// ahead of it was a second the worker's path stayed down. It needs nothing step 3
+// provisions. The MeshPeer CRD is step 2a's, and every write here (the
+// node-password Secret, the range claims, the MeshPeer, the mesh watch) rides the
+// system:masters admin client, which the Node,RBAC authorizer does not evaluate.
+// On a fresh datastore its first Lease and Secret writes therefore follow the
+// control plane's healthy report at once, and it relies on bindSelfNodePassword's
+// bounded retry to absorb the race with the system namespaces being created.
 //
 // It completes BEFORE step 4c builds the proxy (mesh.Start plumbs the mesh-egress
 // lo0 alias the proxy's source bind depends on) and BEFORE step 4d opens the join
@@ -466,8 +478,8 @@ func enrollServerMesh(ctx context.Context, plan serverPlan, restCfg *rest.Config
 // startJoinSupervisor is step 4d: the worker-join supervisor (mesh-bound; mints
 // node certs + enrolls peers), plus the CA-bundle endpoint in the HA posture. Only
 // when multi-node is enabled (sm.enroller non-nil); the live two-Mac join is the
-// K3SM_LAB gate (step 4a has already ensured the MeshPeer CRD the enroller's write
-// lands in, and step 4b has already claimed this server's range through this same
+// K3SM_LAB gate (step 2a has already ensured the MeshPeer CRD the enroller's write
+// lands in, and step 2b has already claimed this server's range through this same
 // enroller).
 //
 // A join is answered with this server's apiserver first and then every other
@@ -492,10 +504,10 @@ func startJoinSupervisor(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		// any request for. It is opts.nodeName and never a cluster-wide value:
 		// in HA every server protects its own name here, and its siblings'
 		// names are protected by their own processes plus the shared
-		// node-password bindings step 4b takes.
+		// node-password bindings step 2b takes.
 		selfNodeName: opts.nodeName,
 		tokens:       tokens,
-		// The store step 4b already bound this node's own name in.
+		// The store step 2b already bound this node's own name in.
 		nodePasswords: sm.nodePasswords,
 		enroller:      sm.enroller,
 		apiServers:    []string{net.JoinHostPort(opts.meshIP, strconv.Itoa(opts.apiPort))},

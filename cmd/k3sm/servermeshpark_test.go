@@ -41,7 +41,7 @@ import (
 	"k3sm.io/k3sm/pkg/status"
 )
 
-// TestEnrollServerMeshFailureKeepsTheMeshIPRange: step 4b seeds the node's pod
+// TestEnrollServerMeshFailureKeepsTheMeshIPRange: step 2b seeds the node's pod
 // range from --mesh-ip BEFORE the enrol, so whatever the enrol does the range stays
 // the one the lo0 alias and the netd seed use. A range another node holds is a
 // DATA-PATH refusal (the node, pod network and mesh egress do not start); any other

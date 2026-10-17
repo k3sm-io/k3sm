@@ -36,9 +36,13 @@ import (
 //     worker (the free-index scanner has no reason not to), and two peers would
 //     claim one AllowedIPs, which wireguard cannot admit.
 //
-// It also pins the two upstream preconditions the plan names: the enroll runs
-// after the RBAC graph and after the MeshPeer CRD ensure — the CRD its very first
-// write lands in.
+// It also pins the upstream preconditions: the enroll runs after the MeshPeer CRD
+// ensure (the CRD its very first write lands in), and the RBAC graph exists before
+// the join listener opens, because a joining worker's first request is evaluated
+// by the Node,RBAC authorizer. The server's own enroll is not ordered after the
+// RBAC graph: it rides the system:masters admin client, which that authorizer
+// does not evaluate, and it runs before provisioning
+// (TestServerBringsTheMeshUpBeforeProvisioning).
 func TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener(t *testing.T) {
 	tr := runServerTrace(t)
 	first := tr.firstCalls()
@@ -58,7 +62,7 @@ func TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener(t *testing.T) {
 	}
 
 	mustPrecede := []struct{ before, after, why string }{
-		{"rbac.Provision", "enrollSelfAndBringUpMesh", "the enroll writes a MeshPeer under an enforcing Node,RBAC authorizer"},
+		{"rbac.Provision", "startBootstrapServer", "a joining worker's first request is evaluated by the Node,RBAC authorizer against the graph"},
 		{"ensureMeshPeerCRD", "enrollSelfAndBringUpMesh", "the self-enroll is the FIRST MeshPeer written on a fresh cluster"},
 		{"newMeshEnroller", "enrollSelfAndBringUpMesh", "the self-enroll goes through the same locked enroller the join RPC uses"},
 		{"enrollSelfAndBringUpMesh", "netserve.New", "mesh.Start plumbs the mesh-egress lo0 alias the proxy sources from"},
@@ -200,7 +204,7 @@ func TestServerNetserveWiresTheMeshEgressSource(t *testing.T) {
 //
 // runServer hands --mesh-ip to the executor as the apiserver's BindAddress at step
 // 1, but for M14.2 the only code that ever plumbed that address was mesh.Start —
-// at step 4b, three phases later. So a mesh IP that is not already a host address
+// at the mesh bring-up, several phases later. So a mesh IP that is not already a host address
 // dies at `listen tcp 100.64.0.1:6444: bind: can't assign requested address`
 // before any of this file's other pins can even be reached, and the operator has
 // to alias it by hand. The M14.2 lab tier booted --mesh-ip 127.0.0.1, which every
@@ -260,5 +264,56 @@ func TestRunServerEnsuresTheMeshIPAliasBeforeTheControlPlane(t *testing.T) {
 	if !passesMeshIP {
 		t.Errorf("runServer's ensureMeshIPAlias at %s is not passed opts.meshIP — the single-node posture's no-op is what keeps this call free there",
 			tr.where(call))
+	}
+}
+
+// TestServerBringsTheMeshUpBeforeProvisioning pins where the mesh comes up in the
+// server's bring-up: right after the control plane is healthy and its client is
+// built, before the cluster provisioning and the ingest registry.
+//
+// A worker reaches this server's API over the mesh, so every second between the
+// apiserver answering and the wireguard device existing is a second the worker's
+// path is down while the server's own probe already says ok. Measured on a
+// two-Mac roll, the worker's window ran 14.5 s past the server's own, the time
+// the admission policies, the RBAC graph, the add-ons, the helm controller, the
+// manifest directory and the registry took before the enroll ran.
+//
+// Nothing in that provisioning is an input to the enroll: the MeshPeer CRD is
+// applied by ensureMeshPeerCRD itself, and the enroll, its node-password bind,
+// its range claims and the mesh watch all ride the server's system:masters admin
+// client, which the Node,RBAC authorizer does not evaluate. The RBAC graph is a
+// precondition of the worker-join listener instead, and that ordering is pinned
+// by TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener.
+//
+// Moving the enroll earlier must not move it past the two phases that consume
+// it, so this pin also holds enrollServerMesh ahead of startServerDatapath (the
+// proxy sources from the mesh-egress alias mesh.Start plumbs) and of
+// startBootstrapServer (this node's range claim must be durable before a worker
+// can be assigned one), the order enrollSelfAndBringUpMesh calls load-bearing.
+func TestServerBringsTheMeshUpBeforeProvisioning(t *testing.T) {
+	tr := runServerTrace(t)
+	first := tr.firstCalls()
+
+	mesh := []string{"ensureMeshPeerCRD", "enrollServerMesh"}
+	provisioning := []string{"provisionClusterPolicies", "startServerRegistry"}
+	consumers := []string{"startServerDatapath", "startBootstrapServer"}
+	for _, name := range append(append(append([]string{}, mesh...), provisioning...), consumers...) {
+		if _, ok := first[name]; !ok {
+			t.Fatalf("runServer never calls %s; this ordering pin would be vacuous", name)
+		}
+	}
+	for _, m := range mesh {
+		for _, p := range provisioning {
+			if first[m].pos >= first[p].pos {
+				t.Errorf("runServer calls %s at %s, NOT before %s at %s: the worker's path to this API stays down while provisioning runs",
+					m, tr.where(first[m].call), p, tr.where(first[p].call))
+			}
+		}
+	}
+	for _, c := range consumers {
+		if first["enrollServerMesh"].pos >= first[c].pos {
+			t.Errorf("runServer calls enrollServerMesh at %s, NOT before %s at %s: the mesh it consumes is not up yet",
+				tr.where(first["enrollServerMesh"].call), c, tr.where(first[c].call))
+		}
 	}
 }
