@@ -219,7 +219,7 @@ func TestRotationReportListsProxyClientCert(t *testing.T) {
 		}
 		return out
 	}
-	re, oos := paths(reissuedArtifacts(wd, false)), paths(outOfScopeArtifacts(wd))
+	re, oos := paths(reissuedArtifacts(wd)), paths(outOfScopeArtifacts(wd))
 	for _, want := range []string{ProxyClientCertPath(wd), ProxyClientKeyPath(wd)} {
 		if !slices.Contains(re, want) {
 			t.Errorf("reissuedArtifacts does not list %s", want)

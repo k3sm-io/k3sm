@@ -70,6 +70,11 @@ type serverPlan struct {
 	// ingress host and the node's svclb hoster attach to it, and SIGHUP moves
 	// them all.
 	lan *lanSwitch
+	// kubeletServing is whether the in-process node's kubelet serving pair was
+	// minted from the cluster CA. It is shared by pointer because the plan is
+	// passed by value: serverNodeOptions records it after the embedded add-ons
+	// first converged, and addonPosture reads it on every re-evaluation.
+	kubeletServing *kubeletServingFact
 }
 
 // errServerTokenAsAdmin refuses a server-class join token on a start where it
@@ -714,7 +719,7 @@ func startControlPlane(ctx, stop context.Context, opts serverOptions, mode hostn
 		return serverPlan{}, nil, fmt.Errorf("HA server-join: %w", err)
 	}
 	plan := serverPlan{opts: opts, mode: mode, cfg: cfg, serverPKI: pki, interconnectMetrics: interconnect.NewMetrics(),
-		lan: startDaemonLAN(ctx, opts.workDir, logger)}
+		lan: startDaemonLAN(ctx, opts.workDir, logger), kubeletServing: newKubeletServingFact()}
 	exec := executor.NewSupervised(plan.cfg)
 	// Before Start, so the exit handler can ask about any child it is told of.
 	probe.set(exec)

@@ -133,7 +133,7 @@ func TestRotationReportsAPIServerKubeletClientCert(t *testing.T) {
 	t.Parallel()
 	wd := "/var/lib/k3sm/server"
 	paths := make([]string, 0, 8)
-	for _, a := range reissuedArtifacts(wd, false) {
+	for _, a := range reissuedArtifacts(wd) {
 		paths = append(paths, a.Path)
 	}
 	for _, want := range []string{APIServerKubeletClientCertPath(wd), APIServerKubeletClientKeyPath(wd)} {

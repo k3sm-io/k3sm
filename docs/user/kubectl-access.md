@@ -72,8 +72,8 @@ The bootstrap/join credentials for adding nodes are separate; see [Multi-node](m
 
 ## Things That Behave Differently Through kubectl
 
-- **`kubectl top pod`** works where k3sm's metrics-server add-on runs: on a server installed with
-  `--mesh-ip`. A single-node server without `--mesh-ip` does not run it. Native Pods report the CPU
+- **`kubectl top pod`** works where k3sm's metrics-server add-on runs, which is every server,
+  single-node included. Native Pods report the CPU
   time and memory their processes used. HPA on CPU is served but advisory, because no CPU limit is
   enforced. `kubectl top node` shows host-wide figures for every Ready node, workers included. See
   [Limitations](limitations.md#headline-divergences).

@@ -891,19 +891,27 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		interconnectMetrics: plan.interconnectMetrics,
 	}
 
-	// 4f-bis. The control-plane node's OWN kubelet serving cert.
+	// 4f-bis. The control-plane node's OWN kubelet serving cert, on every topology.
 	//
 	// A worker receives one in its join response; this node never joins, so nothing
-	// hands it one and it self-signed — against its own apiserver, which the mesh
-	// provisioning started with --kubelet-certificate-authority=<cluster CA>. That is
-	// the defect in its purest form: `kubectl logs` against the control-plane node
-	// failed with "x509: certificate signed by unknown authority" on the very machine
-	// holding the CA that could have signed it. It runs HERE because the SAN set is
-	// read off the finished nodeOpts, and it fails the whole bring-up on a
-	// mint error rather than degrading to the self-signed cert that is the defect.
-	if err := setServerKubeletServing(&nodeOpts, plan.hierarchy, opts.meshIP); err != nil {
+	// hands it one and it self-signed. On a mesh server that was against its own
+	// apiserver, started with --kubelet-certificate-authority=<cluster CA>: `kubectl
+	// logs` against the control-plane node failed with "x509: certificate signed by
+	// unknown authority" on the very machine holding the CA that could have signed
+	// it. On a single-node server it was metrics-server's verified scrape that
+	// failed, against kube-root-ca.crt (the cluster CA). So every server mints the
+	// pair from the cluster CA, as k3s signs every kubelet serving cert with its
+	// server CA. nodeHierarchy is passed, not plan.hierarchy: the latter is set on
+	// the mesh path only, and arming it on single-node would arm the mesh and
+	// enroll machinery that keys on it. It runs HERE because the SAN set is read
+	// off the finished nodeOpts, and it fails the whole bring-up on a mint error
+	// rather than degrading to a self-signed cert.
+	if err := setServerKubeletServing(&nodeOpts, nodeHierarchy, opts.meshIP); err != nil {
 		return nodeOptions{}, err
 	}
+	// The gated add-ons read this fact (addonPosture), undecided until now; the
+	// first mark also kicks one immediate re-evaluation pass.
+	plan.kubeletServing.markMinted()
 	return nodeOpts, nil
 }
 
@@ -962,18 +970,23 @@ func ensureMeshPeerCRD(ctx context.Context, meshIP string, newClient crdClientFa
 // serving cert. It is pinned to the SAME 365d writeAPIServerServingCert gives the
 // apiserver's leaf: both are re-minted by every boot of the same process, so a
 // shorter life here would only mean the node's cert expired first on a long-lived
-// server — a second expiry date to reason about, buying nothing.
+// server — a second expiry date to reason about, buying nothing. The ceiling is
+// the same too: nothing re-mints it in-process, so a server that runs more than
+// 365 days without a restart serves an expired kubelet cert until it restarts.
 const kubeletServingValidFor = 365 * 24 * time.Hour
 
 // setServerKubeletServing mints the control-plane node's kubelet serving keypair
-// from the CLUSTER CA and stores it on nodeOpts, for the posture where the
-// apiserver was told to verify node certs against that CA.
+// from the CLUSTER CA (never the signing CA, which issues client identities) and
+// stores it on nodeOpts, on every server topology. meshIP only adds the mesh
+// address to the SANs (serverKubeletServingIPs); an empty one is the single-node
+// server, which mints the same leaf without it.
 //
-// meshIP == "" is the single-node/dev posture: it leaves the fields EMPTY, so
-// kubeletServingTLS self-signs exactly as before. That branch is load-bearing — a
-// single-node apiserver configures no --kubelet-certificate-authority, so a
-// cluster-CA leaf would buy nothing and the self-signed path stays the default this
-// change does not disturb.
+// On a mesh server the apiserver verifies the leaf (--kubelet-certificate-authority
+// names the cluster CA). On a single-node server no apiserver flag names it, but
+// metrics-server verifies every kubelet against kube-root-ca.crt, the cluster CA,
+// so a self-signed leaf there left its scrape failing x509. A server therefore
+// never falls back to certs.SelfSignedServing: it supplies a non-empty pair or
+// fails the boot.
 //
 // The pair is held in MEMORY and re-minted on every boot: nothing is written to
 // disk, so no new private key file joins the work dir and pkg/executor's rotation
@@ -986,15 +999,12 @@ const kubeletServingValidFor = 365 * 24 * time.Hour
 // exact defect this function exists to remove, and would do it in the one case
 // (broken PKI) where an operator most needs to be told.
 func setServerKubeletServing(nodeOpts *nodeOptions, hierarchy *certs.Hierarchy, meshIP string) error {
-	if meshIP == "" {
-		return nil
-	}
 	// Checked BEFORE issuing, and down to the key: a CA loaded without its private
 	// half cannot sign, and x509.CreateCertificate's reaction to one is not a
 	// diagnosable error. Refusing here names the real fault — the work dir's PKI —
 	// where an operator can act on it.
 	if hierarchy == nil || hierarchy.Cluster == nil || hierarchy.Cluster.Cert == nil || hierarchy.Cluster.Key == nil {
-		return fmt.Errorf("mint the control-plane node's kubelet serving cert: no usable cluster CA (the multi-node posture needs the signing half of the CA hierarchy the apiserver's --kubelet-certificate-authority names)")
+		return fmt.Errorf("mint the control-plane node's kubelet serving cert: no usable cluster CA (the server needs the cluster CA and its private key to sign this node's :10250 leaf; check the work dir's PKI)")
 	}
 	certPEM, keyPEM, err := hierarchy.Cluster.IssueServing(
 		nodeOpts.nodeName,
@@ -1147,7 +1157,8 @@ func clientCertIdentity(certPEM []byte) (string, time.Time, error) {
 // apiserver might dial this node's :10250 at, deduplicated, unparseable entries
 // dropped.
 //
-//   - meshIP — what peers know this node by, and what a mesh apiserver binds;
+//   - meshIP — what peers know this node by, and what a mesh apiserver binds
+//     (empty on a single-node server, which then names no mesh address);
 //   - the ADVERTISED address (advertisedNodeIP) and the raw nodeOpts.nodeIP — the
 //     two can differ, and startNode advertises the derived one;
 //   - the REGISTERED InternalIP (proxyableNodeIP of the advertised opts, exactly as

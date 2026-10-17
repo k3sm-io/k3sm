@@ -34,10 +34,10 @@ import (
 // serve. The zero value is the most restrictive: every gated add-on is skipped.
 type Posture struct {
 	// ClusterCAKubeletServing reports that every kubelet serving cert in the
-	// cluster chains to the CA published as kube-root-ca.crt. That holds on the
-	// multi-node (mesh) posture, where the cluster CA issues the kubelet serving
-	// certs and is the controller-manager's --root-ca-file. On a single-node
-	// server the kubelet cert is self-signed and it does not hold.
+	// cluster chains to the CA published as kube-root-ca.crt. That holds on every
+	// server topology, single-node included, once the server's own node has
+	// minted its kubelet serving pair: the cluster CA issues every kubelet
+	// serving cert and is the controller-manager's --root-ca-file.
 	ClusterCAKubeletServing bool
 	// Undecided, when set, says why the server could not establish the facts
 	// above: a failed read, or a read that showed no Node at all (a stale LIST,
@@ -191,7 +191,7 @@ var requirements = map[string]requirement{
 // no particular node capability: only the verified kubelet scrape.
 func metricsServerRequirement(p Posture) string {
 	if !p.ClusterCAKubeletServing {
-		return "kubelet serving certs do not chain to the in-cluster CA (single-node posture), so metrics-server's verified kubelet scrape cannot succeed"
+		return "kubelet serving certs do not chain to the in-cluster CA, so metrics-server's verified kubelet scrape cannot succeed"
 	}
 	return ""
 }

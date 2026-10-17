@@ -111,12 +111,6 @@ type RotateOptions struct {
 	// (DefaultRotateHealthPoll).
 	HealthTimeout time.Duration
 	HealthPoll    time.Duration
-	// MeshServer reports whether the installed server runs with --mesh-ip. The
-	// caller reads it from the installed server plist (the argv launchd runs) and
-	// aborts the rotation when that read fails, so a topology is never defaulted. It
-	// decides only whether the kubelet serving pair, minted on a mesh boot alone, is
-	// reported present.
-	MeshServer bool
 }
 
 // RotationArtifact is one on-disk credential a rotation report names.
@@ -214,7 +208,7 @@ func RotateCertificates(ctx context.Context, opts RotateOptions) (*RotationRepor
 		ClusterCAPin:       pins.cluster,
 		SigningCAPin:       pins.signing,
 		RequestHeaderCAPin: pins.requestHeader,
-		Reissued:           reissuedArtifacts(opts.WorkDir, opts.MeshServer),
+		Reissued:           reissuedArtifacts(opts.WorkDir),
 		OutOfScope:         outOfScopeArtifacts(opts.WorkDir),
 	}
 	if !opts.Restart {
@@ -345,8 +339,8 @@ func awaitRestartedInstance(ctx context.Context, opts RotateOptions, priorPID in
 }
 
 // reissuedArtifacts lists the CA-signed leaf credentials the control-plane boot
-// re-issues — the actual content of a rotation. meshServer is RotateOptions.MeshServer.
-func reissuedArtifacts(workDir string, meshServer bool) []RotationArtifact {
+// re-issues — the actual content of a rotation.
+func reissuedArtifacts(workDir string) []RotationArtifact {
 	return []RotationArtifact{
 		artifact(SchedulerKubeconfigPath(workDir),
 			"client cert CN="+schedulerCN+", issued by the signing CA — re-issued on every boot"),
@@ -364,7 +358,7 @@ func reissuedArtifacts(workDir string, meshServer bool) []RotationArtifact {
 			"apiserver serving cert, issued by the cluster CA — re-issued on every boot"),
 		artifact(certs.APIServerServingKeyPath(workDir),
 			"apiserver serving key for the cert above"),
-		kubeletServingArtifact(meshServer),
+		kubeletServingArtifact(),
 		serverNodeClientArtifact(),
 	}
 }
@@ -373,8 +367,8 @@ func reissuedArtifacts(workDir string, meshServer bool) []RotationArtifact {
 // CN=system:node:<server node name>, O=system:nodes cert its in-process node talks
 // to the apiserver with, issued by the signing CA.
 //
-// Like the kubelet serving pair above it has no path: it is minted into memory on
-// every boot and never written. Unlike that pair it is minted in EVERY posture
+// Like the kubelet serving pair below it has no path: it is minted into memory on
+// every boot and never written, and like that pair it is minted in EVERY posture
 // (single-node, dev, mesh), because every server runs its node under this identity,
 // so it is reported present unconditionally — a rotation's restart re-mints it
 // wherever a control plane boots.
@@ -387,8 +381,8 @@ func serverNodeClientArtifact() RotationArtifact {
 }
 
 // kubeletServingArtifact describes the control-plane node's kubelet SERVING
-// keypair — the cert :10250 presents, issued by the cluster CA on a multi-node
-// (--mesh-ip) boot.
+// keypair — the cert :10250 presents, issued by the cluster CA on every boot of
+// every server topology, single-node included.
 //
 // It is listed because Reissued's contract is COMPLETENESS: it is what a boot
 // re-issues, and this pair is re-minted on every boot exactly like the apiserver's
@@ -396,16 +390,14 @@ func serverNodeClientArtifact() RotationArtifact {
 // rotation just as badly as claiming an artifact that is not re-issued.
 //
 // It has no path: the pair is held in memory for the life of the server process and
-// deliberately never written (no new private key on disk). Present is therefore the
-// installed topology, meshServer (RotateOptions.MeshServer, read from the installed
-// server plist): only a --mesh-ip boot mints it, so a single-node server reports it
-// absent, which is true. The apiserver serving cert is no witness: every topology
-// issues it.
-func kubeletServingArtifact(meshServer bool) RotationArtifact {
+// deliberately never written (no new private key on disk). It is reported present
+// unconditionally: a server boot either mints it or fails, on every topology, so a
+// rotation's restart re-mints it wherever a control plane comes back.
+func kubeletServingArtifact() RotationArtifact {
 	return RotationArtifact{
 		Path:    "(in memory — never written to disk)",
-		Detail:  "kubelet serving cert+key for this node's :10250, issued by the cluster CA — multi-node (--mesh-ip) servers only; re-minted into memory on every boot, so its presence is read off the installed server's --mesh-ip",
-		Present: meshServer,
+		Detail:  "kubelet serving cert+key for this node's :10250, issued by the cluster CA — every server topology; re-minted into memory on every boot",
+		Present: true,
 	}
 }
 

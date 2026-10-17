@@ -28,10 +28,10 @@ are **not** more optimistic than the profile.
   leaf, and a `vm` Pod's CPU and memory figures come from it. A `vm` Pod's memory ceiling is still the
   guest's whole-VM size rather than a per-container limit. See [`vm` RuntimeClass](vm-runtimeclass.md).
 - `kubectl top` reads the `metrics.k8s.io` API, which metrics-server serves. k3sm ships
-  metrics-server as an add-on, built natively for darwin/arm64, and applies it on a server installed
-  with `--mesh-ip`, because its scrape verifies the kubelet certificate the cluster CA issues. A
-  single-node server without `--mesh-ip` does not run it, so `kubectl top` has no data there. Where it
-  runs, a native Pod's figures are the CPU time and memory footprint its processes used, read with
+  metrics-server as an add-on, built natively for darwin/arm64, and applies it on every server,
+  single-node included. Its scrape verifies each node's kubelet certificate against the cluster CA,
+  which issues that certificate on every node: a worker receives it when it joins, and a server signs
+  its own at every start. A native Pod's figures are the CPU time and memory footprint its processes used, read with
   `proc_pid_rusage`. These are usage figures, and k3sm enforces no CPU quota against them.
   `kubectl top node` has a row for every Ready node, workers included. The figures are host-wide, so
   they include processes k3sm did not start and can exceed the node's allocatable. If a
