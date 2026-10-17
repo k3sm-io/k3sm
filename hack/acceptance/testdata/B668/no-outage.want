@@ -1,0 +1,6 @@
+role=worker node=k3sm-worker probe=api no window (32 samples over 7.884s)
+role=worker node=k3sm-worker probe=status no window (6 samples over 7.456s)
+role=worker node=k3sm-worker probe=daemon no window (6 samples over 7.456s)
+role=worker node=k3sm-worker probe=netd no window (32 samples over 7.828s)
+role=worker node=k3sm-worker probe=node no window (32 samples over 7.904s)
+phases role=worker node=k3sm-worker: (none)
