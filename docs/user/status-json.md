@@ -157,7 +157,7 @@ four.
 
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig`, `runtimed` and `dns`; some rows appear only when the
-thing they describe exists (`datavol`, `server-args`, `heartbeat`, `pre-volume`, `etcd`,
+thing they describe exists (`datavol`, `server-args`, `settings`, `heartbeat`, `pre-volume`, `etcd`,
 `mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
 `skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind`, `ahead` or `rolling`.
@@ -171,6 +171,7 @@ checked rather than as a fault. Run as any account other than root, these rows r
 | `runtimed` | the runtime daemon's control socket is owner-only; severity `skip` |
 | `admin-kubeconfig` | only root reads the admin kubeconfig install recorded; severity `skip` |
 | `server-args` | the server's LaunchDaemon plist is readable by root only; severity `skip` |
+| `settings` | the node daemon's arguments are readable by root only; those values read `restricted`, the others are still read; severity `skip` |
 | `pre-volume` | the size is a lower bound because part of the copy is root-only; severity stays `warn`, because the copy is there whoever reads it |
 
 Other rows read what your account can, through the apiserver, instead of a file only root can read:
@@ -225,6 +226,28 @@ with), port 53, with a 3 second timeout. It appears on every role and needs no r
 Unlike `node-resolver`, which reports whether the host routes cluster names to that address, this
 row reports whether anything answers there, and a `warn` makes the `verdict` `degraded`. `wide.vip`
 and `wide.name` give the address and the name asked.
+
+The `settings` row reports the node's install settings: the values `k3sm install` recorded in the
+node daemon's arguments (or the default the daemon takes when none is recorded), the data volume, and
+LAN access. It appears on an installed Mac, after the `server-args` row on a server and the `agent`
+row on a worker, and it never changes the `verdict`. Its `wide` keys are part of the contract:
+
+| key | value |
+|---|---|
+| `nodeport-addresses` | the `--nodeport-addresses` value, or `every interface` |
+| `registry-port` | the node registry's port, or `off`; server only |
+| `tls-sans` | the extra apiserver certificate names, comma-separated, or `none`; server only |
+| `mesh-ip` | the mesh address, or `none`; server only |
+| `kubeconfig-name` | the name the admin kubeconfig is merged under; server only |
+| `release-base` | the release index the managed update reads, or `default`; a password in the URL is masked |
+| `data-volume` | `none` for a plain directory, else the volume's name, quota and encryption |
+| `lan-access` | `on` or `off`, the value the node daemon serves; `unreadable` when the record cannot be used |
+
+A value read from a file only root can read is `restricted`, and the row's `state` is then
+`needs-admin`. A value whose source could not be read for another reason is `unknown`, and so is
+the row's `state` when that source is the node daemon's arguments. No value is a token, key or
+password: the row names a fixed set of settings, none of which is a credential. `detail` gives the
+same values in one line.
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was
@@ -471,7 +494,7 @@ attached Pod in the row's `wide` keys.
 | `severity` | string | `ok`, `warn`, `fail`, `skip` or `unknown` |
 | `detail` | string | one sentence for a person; do not parse it |
 | `remedy` | string | the command or commands that fix this row, one per line; omitted when there is nothing to do |
-| `wide` | object of strings | extra detail (label, pid, run count, last exit, plist and log paths); informational, and its keys are not part of the contract |
+| `wide` | object of strings | extra detail (label, pid, run count, last exit, plist and log paths); informational, and its keys are not part of the contract, except the `settings` row's (above) |
 
 Text taken from a daemon's log or arguments is redacted before it reaches any field: no join token,
 bootstrap token or URL password appears in either shape.

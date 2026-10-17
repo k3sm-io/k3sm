@@ -54,7 +54,7 @@ const (
 // cluster. It is still in the JSON, still in the cluster view, and still in the
 // verdict.
 var serverOverviewRows = []string{
-	RowInstall, RowNetd, RowServer, RowServerArgs, RowAPIServer,
+	RowInstall, RowNetd, RowServer, RowServerArgs, RowSettings, RowAPIServer,
 	RowNode, RowWorkloads, RowInterconnect, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
 }
 
@@ -62,7 +62,7 @@ var serverOverviewRows = []string{
 // stands exactly where the server row does, and the server-args row is gone
 // with the daemon it described.
 var agentOverviewRows = []string{
-	RowInstall, RowNetd, RowAgent, RowAPIServer,
+	RowInstall, RowNetd, RowAgent, RowSettings, RowAPIServer,
 	RowNode, RowWorkloads, RowInterconnect, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
 }
 

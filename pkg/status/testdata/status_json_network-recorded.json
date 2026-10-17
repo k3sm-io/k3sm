@@ -46,6 +46,22 @@
       }
     },
     {
+      "name": "settings",
+      "state": "ok",
+      "severity": "ok",
+      "detail": "NodePort addresses local · registry port 5000 · TLS SANs k3sm.example.test,192.0.2.20 · mesh IP 100.64.0.1 · kubeconfig name k3sm · release base https://releases.example.test/k3sm · data volume none · LAN access off",
+      "wide": {
+        "data-volume": "none",
+        "kubeconfig-name": "k3sm",
+        "lan-access": "off",
+        "mesh-ip": "100.64.0.1",
+        "nodeport-addresses": "local",
+        "registry-port": "5000",
+        "release-base": "https://releases.example.test/k3sm",
+        "tls-sans": "k3sm.example.test,192.0.2.20"
+      }
+    },
+    {
       "name": "apiserver",
       "state": "ready",
       "severity": "ok",

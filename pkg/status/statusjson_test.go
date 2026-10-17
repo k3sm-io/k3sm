@@ -291,7 +291,10 @@ func contractScenarios() map[string]contractScenario {
 			return c
 		}},
 		"unknown": {verdict: VerdictUnknown, collector: func(t *testing.T) Collector {
-			return contractServer(t, "launchctl_format_drift.txt", "launchctl_format_drift.txt", nil, errors.New("no k3sm context in ~/.kube/config"))
+			c := contractServer(t, "launchctl_format_drift.txt", "launchctl_format_drift.txt", nil, errors.New("no k3sm context in ~/.kube/config"))
+			// The arguments source is root's: the settings it holds are restricted.
+			c.NodeArgs = func(install.Role) ([]string, error) { return nil, os.ErrPermission }
+			return c
 		}},
 		"running-interconnect": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
 			return contractInterconnect(t)
@@ -305,14 +308,26 @@ func contractScenarios() map[string]contractScenario {
 			return contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", kube, nil)
 		}},
 		"network-recorded": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
-			return contractNetwork(t, contractRecordOff, func(install.Role) ([]byte, error) {
+			c := contractNetwork(t, contractRecordOff, func(install.Role) ([]byte, error) {
 				return []byte(`{"lan":"off","serial":"4f0c2a9e1b7d3c55"}`), nil
 			})
+			// An operator-configured server: the settings row reads each flag.
+			c.NodeArgs = func(install.Role) ([]string, error) {
+				return []string{
+					"--nodeport-addresses", "local", "--registry-port", "5000",
+					"--tls-san=k3sm.example.test", "--tls-san=192.0.2.20", "--mesh-ip", "100.64.0.1",
+					"--update-release-base=https://releases.example.test/k3sm",
+				}, nil
+			}
+			return c
 		}},
 		"network-absent": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
-			return contractNetwork(t, func() (install.NetworkRecord, bool, error) {
+			c := contractNetwork(t, func() (install.NetworkRecord, bool, error) {
 				return install.NetworkRecord{Version: install.NetworkRecordVersion, LAN: install.LANOn}, false, nil
 			}, nil)
+			// A stock install: no recorded flag, so every setting is its default.
+			c.NodeArgs = func(install.Role) ([]string, error) { return nil, nil }
+			return c
 		}},
 		"network-unreadable": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
 			return contractNetwork(t, func() (install.NetworkRecord, bool, error) {
@@ -328,6 +343,9 @@ func contractScenarios() map[string]contractScenario {
 			c := contractAgent(t, func(_ *testing.T, _ Paths, fsys fakeFS) fakeFS { return fsys })
 			sys := agentPlistSystem("192.0.2.10")
 			c.AgentJoinServer = func() (string, error) { return install.AgentJoinServer(sys, install.Config{}) }
+			c.NodeArgs = func(install.Role) ([]string, error) {
+				return []string{"--nodeport-addresses", "192.0.2.0/24"}, nil
+			}
 			return c
 		}},
 		"agent-waiting": {verdict: VerdictDegraded, collector: func(t *testing.T) Collector {
