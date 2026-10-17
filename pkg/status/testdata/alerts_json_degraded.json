@@ -1,0 +1,236 @@
+{
+  "schemaVersion": 1,
+  "verdict": "degraded",
+  "role": "agent",
+  "summary": "agent: pid 1292 · the node credential expired on 2026-09-04, so this worker can no longer authenticate",
+  "node": "my-mac",
+  "alerts": [
+    {
+      "name": "agent",
+      "state": "expired",
+      "severity": "warn",
+      "detail": "pid 1292 · the node credential expired on 2026-09-04, so this worker can no longer authenticate",
+      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
+      "wide": {
+        "credential": "expired",
+        "credential-dir": "/var/lib/k3sm/agent",
+        "credential-expires": "2026-09-04T09:30:00Z",
+        "label": "io.k3sm.agent",
+        "last-exit": "(never exited)",
+        "log-path": "/var/log/k3sm/agent.log",
+        "pid": "1292",
+        "plist": "/Library/LaunchDaemons/io.k3sm.agent.plist",
+        "runs": "1"
+      },
+      "alert": {
+        "cause": "The worker's node credential has expired, so this Mac can no longer authenticate to the control plane and its node goes NotReady.",
+        "evidence": [
+          "pid 1292 · the node credential expired on 2026-09-04, so this worker can no longer authenticate",
+          "label: io.k3sm.agent",
+          "plist: /Library/LaunchDaemons/io.k3sm.agent.plist",
+          "pid: 1292",
+          "runs: 1",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/agent.log",
+          "credential: expired",
+          "credential-expires: 2026-09-04T09:30:00Z",
+          "credential-dir: /var/lib/k3sm/agent"
+        ],
+        "fix": [
+          {
+            "step": "Mint a join token (on the control-plane Mac)",
+            "command": "k3sm token create",
+            "needsAdmin": false,
+            "confirm": true
+          },
+          {
+            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "needsAdmin": true,
+            "confirm": false
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs agent",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "multi-node.md#joining-an-agent",
+        "since": "2026-09-04T09:30:00Z"
+      }
+    },
+    {
+      "name": "apiserver",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "the node credential has expired, so this worker can no longer reach its apiserver: no k3sm context in ~/.kube/config",
+      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
+      "alert": {
+        "cause": "The worker's node credential has expired, so it can no longer reach its control plane.",
+        "evidence": [
+          "the node credential has expired, so this worker can no longer reach its apiserver: no k3sm context in ~/.kube/config"
+        ],
+        "fix": [
+          {
+            "step": "Mint a join token (on the control-plane Mac)",
+            "command": "k3sm token create",
+            "needsAdmin": false,
+            "confirm": true
+          },
+          {
+            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "needsAdmin": true,
+            "confirm": false
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs agent",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "multi-node.md#joining-an-agent"
+      }
+    },
+    {
+      "name": "node",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "apiserver unreachable",
+      "remedy": "k3sm status logs agent",
+      "alert": {
+        "cause": "The node list could not be read because the apiserver could not be reached from here; this row clears once the apiserver row does.",
+        "evidence": [
+          "apiserver unreachable"
+        ],
+        "fix": [
+          {
+            "step": "Fix the apiserver row first",
+            "needsAdmin": false,
+            "confirm": false
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs agent",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#multi-node-join-fails"
+      }
+    },
+    {
+      "name": "workloads",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "apiserver unreachable",
+      "remedy": "k3sm kubectl get pods -A",
+      "alert": {
+        "cause": "The pods could not be listed because the apiserver could not be reached from here; this row clears once the apiserver row does.",
+        "evidence": [
+          "apiserver unreachable"
+        ],
+        "fix": [
+          {
+            "step": "Fix the apiserver row first",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#multi-node-join-fails"
+      }
+    },
+    {
+      "name": "update",
+      "state": "unknown",
+      "severity": "unknown",
+      "detail": "this Mac cannot read the latest release the server recorded: no cluster client this account may use",
+      "alert": {
+        "cause": "This worker could not read the update check its server publishes, so whether a newer release exists is unknown from here.",
+        "evidence": [
+          "this Mac cannot read the latest release the server recorded: no cluster client this account may use"
+        ],
+        "fix": [
+          {
+            "step": "Run k3sm status on a control-plane Mac; a server checks for a release once an hour and publishes the result",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "upgrade.md#checking-for-an-update"
+      }
+    },
+    {
+      "name": "kubeconfig",
+      "state": "missing",
+      "severity": "warn",
+      "detail": "no k3sm context in ~/.kube/config",
+      "remedy": "sudo k3sm install\nk3sm kubeconfig --write",
+      "alert": {
+        "cause": "This account has no kubeconfig for the cluster. On a worker that is expected: kubectl runs against the control-plane Mac.",
+        "evidence": [
+          "no k3sm context in ~/.kube/config"
+        ],
+        "fix": [
+          {
+            "step": "To use kubectl here, run k3sm kubeconfig on the control-plane Mac and copy the result into ~/.kube/config on this Mac",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "kubectl-access.md#bundled-path"
+      }
+    },
+    {
+      "name": "runtimed",
+      "state": "needs-admin",
+      "severity": "skip",
+      "detail": "needs sudo: the runtime daemon's socket is owner-only",
+      "remedy": "sudo k3sm status",
+      "alert": {
+        "cause": "The runtime daemon's socket is owner-only, so only an administrator can ask it whether it is healthy; nothing is known to be wrong.",
+        "evidence": [
+          "needs sudo: the runtime daemon's socket is owner-only"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#checks-that-need-sudo"
+      }
+    }
+  ],
+  "version": {
+    "version": "v0.1.7",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "dirty": false,
+    "date": "2026-10-01T00:00:00Z",
+    "goVersion": "go1.26.1",
+    "platform": "darwin/arm64",
+    "kubeVersion": "v1.36.2",
+    "kineVersion": "v1.14.2",
+    "modules": [
+      {
+        "path": "k3sm.io/apis",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/darwin-net",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/runtimed",
+        "sha": "v0.1.7"
+      },
+      {
+        "path": "k3sm.io/k3sm",
+        "sha": "v0.1.7"
+      }
+    ]
+  },
+  "timestamp": "2026-09-05T09:30:00Z"
+}
