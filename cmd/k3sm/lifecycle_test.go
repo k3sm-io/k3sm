@@ -45,7 +45,7 @@ func TestLifecycleVerbsRefuseWithoutRoot(t *testing.T) {
 	lifecycleGeteuid = func() int { return 501 }
 	t.Cleanup(func() { lifecycleGeteuid = orig })
 	for verb, run := range map[string]func([]string, *bytes.Buffer) int{
-		"stop":    func(a []string, w *bytes.Buffer) int { return runStop(a, w) },
+		"stop":    func(a []string, w *bytes.Buffer) int { return runStop(a, io.Discard, w) },
 		"start":   func(a []string, w *bytes.Buffer) int { return runStart(a, io.Discard, w) },
 		"restart": func(a []string, w *bytes.Buffer) int { return runRestart(a, w) },
 	} {
@@ -343,5 +343,23 @@ func TestLifecycleExitMarksStillCordoned(t *testing.T) {
 				t.Errorf("the human sentence is gone:\n%s", out)
 			}
 		})
+	}
+}
+
+// TestLifecycleConfigCarriesStdout pins that `k3sm stop` (and `k3sm start`)
+// hand the install package the command's stdout as Config.Out, so the result
+// lines a stop prints (each vm pod whose grace the stop bound cut) reach the
+// operator rather than io.Discard; the logger keeps stderr.
+func TestLifecycleConfigCarriesStdout(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	cfg := lifecycleConfig(install.NewDarwinSystem(), &stdout, &stderr)
+	if cfg.Out != io.Writer(&stdout) {
+		t.Errorf("Config.Out = %v, want the command's stdout", cfg.Out)
+	}
+	if cfg.Logger == nil {
+		t.Error("Config.Logger is nil, want the stderr logger")
+	}
+	if got := lifecycleConfig(install.NewDarwinSystem(), nil, &stderr).Out; got != nil {
+		t.Errorf("a verb with no result lines got Out = %v, want nil (discarded)", got)
 	}
 }

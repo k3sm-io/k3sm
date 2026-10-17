@@ -114,7 +114,7 @@ func defaultNetworkEnv(stdout, stderr io.Writer) networkEnv {
 		HostAddrs:  nodePortHostAddrs,
 		NodeArgs:   func(role install.Role) ([]string, error) { return install.InstalledNodeArgs(sys, role) },
 		Restart: func(ctx context.Context) error {
-			return install.Restart(ctx, sys, lifecycleConfig(sys, stderr), install.ActorUser, "k3sm network lan")
+			return install.Restart(ctx, sys, lifecycleConfig(sys, nil, stderr), install.ActorUser, "k3sm network lan")
 		},
 		Wait:   lanApplyTimeout + 10*time.Second,
 		Poll:   200 * time.Millisecond,

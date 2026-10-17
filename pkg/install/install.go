@@ -1084,6 +1084,7 @@ type System interface {
 	// symlinks, are read (see readVMHostRecords). An absent store holds none.
 	// It never changes the store, which the runtime owns.
 	ReadVMHostRecords(dataRoot string, owners []uint32) (VMHostStore, error)
+	vmHostShortener // the vm helper stop's shorten request (teardown.go)
 	// ServiceUID returns the uid of the named service user. Read-only.
 	ServiceUID(name string) (uint32, error)
 	// ProcessExecutable returns the executable path pid was started from

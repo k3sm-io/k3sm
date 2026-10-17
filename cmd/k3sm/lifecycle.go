@@ -166,7 +166,7 @@ func requireRoot(verb string, stderr io.Writer) bool {
 }
 
 // runStop is `k3sm stop`.
-func runStop(args []string, stderr io.Writer) int {
+func runStop(args []string, stdout, stderr io.Writer) int {
 	actor, reason, ok := lifecycleFlags("stop", args, stderr, stopUsage(), nil)
 	if !ok {
 		return exitLifecycleUsage
@@ -177,13 +177,15 @@ func runStop(args []string, stderr io.Writer) int {
 	sys := install.NewDarwinSystem()
 	ctx, cancel := lifecycleContext(install.StopTimeBound())
 	defer cancel()
-	return lifecycleExit("stop", install.Stop(ctx, sys, lifecycleConfig(sys, stderr), actor, reason), stderr)
+	return lifecycleExit("stop", install.Stop(ctx, sys, lifecycleConfig(sys, stdout, stderr), actor, reason), stderr)
 }
 
 // lifecycleConfig wires a lifecycle verb's Config: the logger and the
-// cluster-facing calls.
-func lifecycleConfig(sys install.System, stderr io.Writer) install.Config {
+// cluster-facing calls, and stdout for the result lines a verb prints (a stop
+// names each vm pod whose grace its bound cut). A nil stdout discards them.
+func lifecycleConfig(sys install.System, stdout, stderr io.Writer) install.Config {
 	return install.Config{
+		Out:           stdout,
 		Logger:        newDaemonLogger(stderr, slog.LevelInfo),
 		MarkNode:      nodeMarker(sys, install.DefaultDataRoot),
 		RemoveMesh:    netdRemoveMesh(install.DefaultNetdSocket),
@@ -475,7 +477,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	sys := install.NewDarwinSystem()
 	ctx, cancel := lifecycleContext(install.StartTimeBound())
 	defer cancel()
-	return lifecycleExit("start", install.Start(ctx, sys, lifecycleConfig(sys, stderr), actor, reason), stderr)
+	return lifecycleExit("start", install.Start(ctx, sys, lifecycleConfig(sys, stdout, stderr), actor, reason), stderr)
 }
 
 // runRestart is `k3sm restart`.
@@ -491,7 +493,7 @@ func runRestart(args []string, stderr io.Writer) int {
 		return exitNeedsRoot
 	}
 	sys := install.NewDarwinSystem()
-	cfg := lifecycleConfig(sys, stderr)
+	cfg := lifecycleConfig(sys, nil, stderr)
 	cfg.Start = start
 	ctx := context.Background()
 	if start {

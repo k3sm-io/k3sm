@@ -48,6 +48,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/dataroot"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
@@ -2129,6 +2130,12 @@ func (darwinSystem) ProcessGroupMemberStart(pgid, pid int) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// ShortenVMHostStop asks a vm helper to start its stop with a grace that fits
+// bound (sandbox.ShortenVMHostStop, which proves the peer pid first).
+func (darwinSystem) ShortenVMHostStop(ctx context.Context, socket string, pid int, bound time.Duration) (sandbox.VMHostShortenOutcome, error) {
+	return sandbox.ShortenVMHostStop(ctx, socket, pid, bound)
 }
 
 // SignalProcessGroup sends sig to process group pgid (kill(-pgid)). ESRCH, the

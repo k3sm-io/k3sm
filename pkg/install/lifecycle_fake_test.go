@@ -17,11 +17,16 @@ limitations under the License.
 package install
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"slices"
+	"sync"
+	"time"
+
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // fakeLifecycle is the fake's model of the stop marker, the runtime's vm
@@ -37,6 +42,18 @@ type fakeLifecycle struct {
 	disableIgnored map[string]bool
 	// vmRejected are record files ReadVMHostRecords refused to trust.
 	vmRejected []string
+	// shorten is what ShortenVMHostStop answers, by pgid; a pgid with no
+	// entry answers as a helper that predates the request (unsupported).
+	shorten map[int]sandbox.VMHostShortenOutcome
+	// shortenRendezvous, when > 0, makes every ShortenVMHostStop wait until
+	// that many requests are in flight at once (or fail after 2s): a stop that
+	// sent its requests one after another never gets there.
+	shortenRendezvous int
+	shortenArrived    int
+	shortenAll        chan struct{}
+	// shortenMu guards the fields above and f.calls for the requests, which
+	// the teardown sends concurrently.
+	shortenMu sync.Mutex
 	// procs is what ProcessExecutable answers, by pid.
 	procs map[int]fakeProc
 	// oslog is every line OSLog was handed, as "<LEVEL> <msg>".
@@ -143,6 +160,43 @@ func (f *fakeSystem) RemoveStopMarker(path string) error {
 	}
 	delete(f.life.markers, path)
 	return nil
+}
+
+// ShortenVMHostStop is the fake control socket: it records the request and
+// answers from f.life.shorten, or with the error failOn set for its call.
+func (f *fakeSystem) ShortenVMHostStop(_ context.Context, socket string, pid int, bound time.Duration) (sandbox.VMHostShortenOutcome, error) {
+	call := fmt.Sprintf("Shorten:%d:%s:%s", pid, socket, bound)
+	l := &f.life
+	l.shortenMu.Lock()
+	f.calls = append(f.calls, call)
+	err := f.failures[call]
+	out, ok := l.shorten[pid]
+	var all chan struct{}
+	if l.shortenRendezvous > 0 {
+		if l.shortenAll == nil {
+			l.shortenAll = make(chan struct{})
+		}
+		l.shortenArrived++
+		all = l.shortenAll
+		if l.shortenArrived == l.shortenRendezvous {
+			close(all)
+		}
+	}
+	l.shortenMu.Unlock()
+	if all != nil {
+		select {
+		case <-all:
+		case <-time.After(2 * time.Second):
+			return sandbox.VMHostShortenOutcome{}, fmt.Errorf("fake: request for %d waited alone; the requests were not concurrent", pid)
+		}
+	}
+	if err != nil {
+		return sandbox.VMHostShortenOutcome{}, err
+	}
+	if ok {
+		return out, nil
+	}
+	return sandbox.VMHostShortenOutcome{Reason: "the helper answered with its banner only"}, nil
 }
 
 func (f *fakeSystem) ReadVMHostRecords(dataRoot string, owners []uint32) (VMHostStore, error) {

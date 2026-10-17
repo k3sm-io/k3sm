@@ -31,6 +31,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -60,6 +61,10 @@ import (
 // mirrors runtimed's vm reap record (sandbox.vmProcRecord), whose JSON names
 // these are; the record is runtimed's, and this is a narrow reader of it.
 //
+// RunDir is the helper's private run dir, where its control socket
+// (sandbox.VMHostControlSocketName) lives: the teardown asks the helper there to
+// shorten a grace its bound would cut (shortenVMHelper).
+//
 // Schema, HelperCDHash, HelperProtocol, RuntimeVersion and BootSession are what
 // a restarted daemon checks before it adopts the helper. The teardown does not
 // adopt, so it only logs them beside the stop; Schema 0 marks a record an
@@ -71,6 +76,7 @@ type VMHostRecord struct {
 	Pgid           int    `json:"pgid"`
 	StartUnixNano  int64  `json:"startUnixNano"`
 	StopGraceNanos int64  `json:"stopGraceNanos,omitempty"`
+	RunDir         string `json:"runDir,omitempty"`
 	HelperCDHash   string `json:"helperCdhash,omitempty"`
 	HelperProtocol int    `json:"helperProtocol,omitempty"`
 	RuntimeVersion string `json:"runtimeVersion,omitempty"`
@@ -264,8 +270,10 @@ func teardownTail(ctx context.Context, sys System, cfg Config, fp flushPrefixes,
 }
 
 // stopVMHelpers stops every k3sm-vmhost helper the runtime recorded that is
-// provably still that helper: SIGTERM to each, a wait of
-// sandbox.VMHelperStopWait(its recorded grace) capped at vmHelperStopBound,
+// provably still that helper: first, to each whose grace the bound cuts, a
+// shorten request (shortenVMHelpers), all at once; then SIGTERM to each, a
+// wait of sandbox.VMHelperStopWait(its recorded grace) capped at
+// vmHelperStopBound, measured from the start of the stop,
 // SIGKILL to each one still running at the end of its own wait, and then
 // vmHostKillWait for the killed to leave. It is the pod groups' stop
 // (teardownPodGroups) for vm pods: a SIGTERM to a helper is its guest's
@@ -310,11 +318,26 @@ func stopVMHelpers(ctx context.Context, sys System, cfg Config) error {
 	verify := func(rec VMHostRecord) (bool, error) {
 		return verifyVMHelper(sys, cfg, rec, cfg.installedVMHost(), svcUID)
 	}
-	var stopping []vmHelperStop
+	var helpers []VMHostRecord
 	for _, rec := range store.Records {
 		if rec.Pgid <= 1 || rec.StartUnixNano == 0 {
 			continue
 		}
+		ok, verr := verify(rec)
+		errs = errors.Join(errs, verr)
+		if ok {
+			helpers = append(helpers, rec)
+		}
+	}
+	// Every wait below is measured from start, the one clock the SIGKILLs run
+	// on, and the shorten requests go out first, together, each with the time
+	// left until the shared deadline (shortenVMHelpers).
+	start := sys.Now()
+	shortenVMHelpers(ctx, sys, cfg, helpers, start.Add(vmHelperStopBound))
+	var stopping []vmHelperStop
+	for _, rec := range helpers {
+		// Proven again: the requests above took time, and every signal is
+		// preceded by a fresh proof the group is still the helper.
 		ok, verr := verify(rec)
 		errs = errors.Join(errs, verr)
 		if !ok {
@@ -331,7 +354,7 @@ func stopVMHelpers(ctx context.Context, sys System, cfg Config) error {
 		}
 		stopping = append(stopping, vmHelperStop{rec: rec, wait: wait})
 	}
-	killed, kerr := awaitVMHelpers(ctx, sys, cfg, stopping, verify)
+	killed, kerr := awaitVMHelpers(ctx, sys, cfg, stopping, verify, sys.Now().Sub(start))
 	errs = errors.Join(errs, kerr)
 	if len(killed) == 0 {
 		return errs
@@ -344,6 +367,113 @@ func stopVMHelpers(ctx context.Context, sys System, cfg Config) error {
 		errs = errors.Join(errs, fmt.Errorf("k3sm-vmhost process groups still alive %s after SIGKILL: %s", vmHostKillWait, strings.Join(strs, ",")))
 	}
 	return errs
+}
+
+// vmHostShortener is the System seam the vm helper stop's shorten request
+// goes through.
+type vmHostShortener interface {
+	// ShortenVMHostStop asks the k3sm-vmhost helper serving the control
+	// socket at socket, which must be the process pid, to start its stop with
+	// the grace bound leaves it (sandbox.ShortenVMHostStop). A helper that
+	// predates the request reports sandbox.VMHostShortenUnsupported.
+	ShortenVMHostStop(ctx context.Context, socket string, pid int, bound time.Duration) (sandbox.VMHostShortenOutcome, error)
+}
+
+// shortenVMHelpers sends the shorten request (shortenVMHelper) to every helper
+// whose recorded grace does not fit vmHelperStopBound, concurrently, one
+// goroutine per helper, and returns once every request has been answered or
+// failed. It runs before any SIGTERM, so one slow helper delays no other
+// helper's request, and no request delays the stop by more than the slowest
+// one (each is bounded by the client's own timeout). Each request carries the
+// time left until deadline, the shared SIGKILL deadline, measured when it is
+// sent, not the constant bound.
+func shortenVMHelpers(ctx context.Context, sys System, cfg Config, helpers []VMHostRecord, deadline time.Time) {
+	var (
+		wg sync.WaitGroup
+		mu sync.Mutex // serialises the cut lines on cfg.Out and the logger
+	)
+	for _, rec := range helpers {
+		if vmHelperWait(rec) >= sandbox.VMHelperStopWait(time.Duration(rec.StopGraceNanos)) {
+			continue
+		}
+		wg.Add(1)
+		go func(rec VMHostRecord) {
+			defer wg.Done()
+			report := shortenVMHelper(ctx, sys, rec, deadline.Sub(sys.Now()))
+			mu.Lock()
+			report(cfg)
+			mu.Unlock()
+		}(rec)
+	}
+	wg.Wait()
+}
+
+// shortenVMHelper runs before the SIGTERM of a helper whose recorded grace
+// does not fit the time left, bound. It asks the helper, on its control socket,
+// to start its stop with the grace the bound leaves it
+// (sandbox.ShortenedStopGrace), so the guest is told the time it actually has
+// instead of being killed at the bound partway through a grace it believed it
+// had. The client proves the socket is served by the recorded helper's pid
+// before it sends anything. The SIGTERM and the wait that follow are the same
+// whatever the answer: on a shortened stop the SIGTERM is redundant, and a
+// helper that predates the request, one that cannot be reached, or any error
+// leaves today's SIGTERM-and-wait as the stop.
+//
+// The cut is printed to the command's output as well as logged, because it is
+// the one place a full stop or an uninstall shortens a promise made to a
+// workload.
+//
+// It returns the report of what came of it, run by the caller under its lock:
+// every cut is logged at Warn and printed, unless the helper was already
+// stopping with a grace that fits, which is only logged.
+func shortenVMHelper(ctx context.Context, sys System, rec VMHostRecord, bound time.Duration) func(Config) {
+	grace := sandbox.VMHelperStopWait(time.Duration(rec.StopGraceNanos)) - sandbox.VMHelperStopMargin
+	cut, cerr := sandbox.ShortenedStopGrace(grace, bound)
+	var (
+		out sandbox.VMHostShortenOutcome
+		err error
+	)
+	switch {
+	case rec.RunDir == "":
+		err = errors.New("no request sent: the record names no run dir (an earlier runtime wrote it)")
+	case cerr != nil:
+		cut = 0
+		err = fmt.Errorf("no request sent: %w", cerr)
+	default:
+		out, err = sys.ShortenVMHostStop(ctx, filepath.Join(rec.RunDir, sandbox.VMHostControlSocketName), rec.Pgid, bound)
+	}
+	fits := bound - sandbox.VMHelperStopMargin
+	switch {
+	case err == nil && out.Result == sandbox.VMHostShortened:
+		return func(cfg Config) {
+			cfg.Logger.Warn("vm pod grace cut to fit the stop bound; the guest was told", "pod", rec.PodID, "pgid", rec.Pgid,
+				"original_grace", out.From, "new_grace", out.To, "bound", bound)
+			_, _ = fmt.Fprintf(cfg.Out, "vm pod %s: grace %s cut to %s to fit the %s stop bound; the guest was told\n",
+				rec.PodID, out.From, out.To, bound)
+		}
+	case err == nil && out.Result == sandbox.VMHostAlreadyStopping && out.From <= fits:
+		return func(cfg Config) {
+			cfg.Logger.Info("vm pod helper was already stopping with a grace that fits the stop bound", "pod", rec.PodID, "pgid", rec.Pgid,
+				"grace", out.From, "bound", bound)
+		}
+	case err == nil && out.Result == sandbox.VMHostAlreadyStopping:
+		return func(cfg Config) {
+			cfg.Logger.Warn("vm pod helper was already stopping with a grace longer than the stop bound allows; it will be killed at the bound",
+				"pod", rec.PodID, "pgid", rec.Pgid, "grace", out.From, "bound", bound)
+			_, _ = fmt.Fprintf(cfg.Out, "vm pod %s: already stopping with grace %s, longer than the %s stop bound allows; it is killed at the bound\n",
+				rec.PodID, out.From, bound)
+		}
+	}
+	reason := out.Reason
+	if err != nil {
+		reason = err.Error()
+	}
+	return func(cfg Config) {
+		cfg.Logger.Warn("vm pod grace does not fit the stop bound and the helper could not be told; it will be killed at the bound",
+			"pod", rec.PodID, "pgid", rec.Pgid, "grace", grace, "bound", bound, "reason", reason)
+		_, _ = fmt.Fprintf(cfg.Out, "vm pod %s: grace %s does not fit the %s stop bound (it would be cut to %s); the helper could not be told, so it is killed at the bound: %s\n",
+			rec.PodID, grace, bound, cut, reason)
+	}
 }
 
 // verifyVMHelper reports whether rec's process group is provably still the
@@ -390,18 +520,18 @@ func vmHelperWait(rec VMHostRecord) time.Duration {
 }
 
 // awaitVMHelpers waits for the SIGTERMed helpers in stopping, each up to its
-// own wait from the moment they were signalled, and SIGKILLs every one still
+// own wait from the start of the stop (elapsed is how much of the clock the
+// shorten requests and the SIGTERMs already spent), and SIGKILLs every one still
 // running when its wait ends, after verify proves again, at that moment, that
 // the group is still the recorded helper (its pid may have been freed and
 // reused during the wait). It returns the killed groups. The waits run on one
 // clock: the helpers are taken in order of their wait, and each round waits
 // only for the time between the previous helper's deadline and the next one's.
-func awaitVMHelpers(ctx context.Context, sys System, cfg Config, stopping []vmHelperStop, verify func(VMHostRecord) (bool, error)) ([]int, error) {
+func awaitVMHelpers(ctx context.Context, sys System, cfg Config, stopping []vmHelperStop, verify func(VMHostRecord) (bool, error), elapsed time.Duration) ([]int, error) {
 	slices.SortStableFunc(stopping, func(a, b vmHelperStop) int { return cmp.Compare(a.wait, b.wait) })
 	var (
-		killed  []int
-		errs    error
-		elapsed time.Duration
+		killed []int
+		errs   error
 	)
 	for len(stopping) > 0 {
 		deadline := stopping[0].wait
@@ -410,10 +540,10 @@ func awaitVMHelpers(ctx context.Context, sys System, cfg Config, stopping []vmHe
 			pgids[i] = s.rec.Pgid
 		}
 		left := map[int]bool{}
-		for _, pgid := range sys.WaitProcessGroupsGone(ctx, pgids, deadline-elapsed) {
+		for _, pgid := range sys.WaitProcessGroupsGone(ctx, pgids, max(deadline-elapsed, 0)) {
 			left[pgid] = true
 		}
-		elapsed = deadline
+		elapsed = max(elapsed, deadline)
 		var still []vmHelperStop
 		for _, s := range stopping {
 			switch {
