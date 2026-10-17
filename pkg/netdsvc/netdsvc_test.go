@@ -704,9 +704,9 @@ func TestPortAuthorizerAdmitsListedLBPortOnHostAddress(t *testing.T) {
 		{name: "a vm bridge address", policy: full, port: 80, addr: "192.168.64.1", mention: "on bridge100"},
 		{name: "an awdl address", policy: full, port: 80, addr: "169.254.3.3"},
 		{name: "another lo0 alias", policy: full, port: 80, addr: "192.0.2.77", mention: "on lo0"},
-		{name: "an ingress-owned listed port on the node address", policy: full, port: 8, addr: "100.64.3.1", mention: "belongs to the ingress host"},
+		{name: "an ingress-owned listed port on the node address is the ingress host's bind", policy: full, port: 8, addr: "100.64.3.1", allow: true},
 		{name: "an ingress-owned listed port on 127.0.0.1", policy: full, port: 8, addr: "127.0.0.1", mention: "belongs to the ingress host"},
-		{name: "an ingress-owned listed port on an en* address", policy: full, port: 8, addr: "192.168.7.20", mention: "belongs to the ingress host"},
+		{name: "an ingress-owned listed port on an en* address is the ingress host's bind", policy: full, port: 8, addr: "192.168.7.20", allow: true},
 		{name: "IPv4-mapped spelling of a live address", policy: full, port: 80, addr: "::ffff:100.64.3.1", allow: true},
 		{name: "a port not in the list", policy: full, port: 22, addr: "100.64.3.1", mention: "port 22 on 100.64.3.1 is not in the allowed LoadBalancer port list (8, 80, 443)"},
 		{name: "an empty list allows nothing", policy: with(func(p *PortPolicy) { p.LBPrivilegedPorts = nil }), port: 80, addr: "100.64.3.1", mention: "not in the allowed LoadBalancer port list (empty)"},
@@ -827,5 +827,93 @@ func TestAuthorizeLBDeclaredRefusesAnIngressOwnedPort(t *testing.T) {
 	}
 	if err := a.authorizeLBDeclared(443, "100.64.3.1"); err != nil {
 		t.Errorf("authorizeLBDeclared(443) = %v, want admitted: only a tenant declares it", err)
+	}
+}
+
+// TestIngressHostNodeAddressBindAdmitted is the B709 gate. With LAN access off
+// the ingress host binds 80 and 443 on the node's own address through netd,
+// which reaches the host-address class. A port the canonical ingress Service
+// declares is admitted there for the ingress host on the node's mesh-egress
+// .1 and on an en* address whether or not the operator listed it, never on
+// 127.0.0.1, and a port only tenants declare keeps the listed-port rule.
+func TestIngressHostNodeAddressBindAdmitted(t *testing.T) {
+	t.Parallel()
+	tenant := ServiceRef{Namespace: "default", Name: "www"}
+	host := map[netip.Addr]string{
+		netip.MustParseAddr("127.0.0.1"):    "lo0",
+		netip.MustParseAddr("100.64.0.1"):   "lo0",
+		netip.MustParseAddr("192.168.7.20"): "en0",
+	}
+	// 80 and 443 are the ingress's (443 with a tenant beside it); 8080 is a
+	// tenant's listed port; 22 a tenant's unlisted one.
+	declarers := func(port int) []ServiceRef {
+		switch port {
+		case 80:
+			return []ServiceRef{canonicalIngress}
+		case 443:
+			return []ServiceRef{tenant, canonicalIngress}
+		case 8080, 22:
+			return []ServiceRef{tenant}
+		}
+		return nil
+	}
+	// The server's netd: no --node-ip, an operator port list of 8080 only, and
+	// the mesh /24 in force.
+	server := PortPolicy{
+		ServiceCIDR:        netip.MustParsePrefix("10.43.0.0/16"),
+		Declares:           func(int) bool { return false },
+		LBDeclarers:        declarers,
+		NodeAddressService: canonicalIngress,
+		NodePodCIDR:        func() netip.Prefix { return netip.MustParsePrefix("100.64.0.0/24") },
+		LBPrivilegedPorts:  []uint16{8080},
+		InterfaceAddrs:     func() (map[netip.Addr]string, error) { return host, nil },
+	}
+	nobody := server
+	nobody.LBDeclarers = func(int) []ServiceRef { return nil }
+	listed := server
+	listed.LBPrivilegedPorts = []uint16{80, 443}
+
+	for _, tc := range []struct {
+		name    string
+		policy  PortPolicy
+		port    int
+		addr    string
+		allow   bool
+		mention string
+	}{
+		{name: "ingress-declared 80 on the mesh .1", policy: server, port: 80, addr: "100.64.0.1", allow: true},
+		{name: "ingress-declared 80 on an en* address", policy: server, port: 80, addr: "192.168.7.20", allow: true},
+		{name: "ingress-declared 443 a tenant also declares, on the mesh .1", policy: server, port: 443, addr: "100.64.0.1", allow: true},
+		{name: "ingress-declared 80 listed too, on the mesh .1", policy: listed, port: 80, addr: "100.64.0.1", allow: true},
+		{name: "ingress-declared 80 on 127.0.0.1", policy: listed, port: 80, addr: "127.0.0.1", mention: "belongs to the ingress host"},
+		{name: "ingress-declared 80 unlisted on 127.0.0.1", policy: server, port: 80, addr: "127.0.0.1"},
+		{name: "no LoadBalancer declares 80", policy: nobody, port: 80, addr: "100.64.0.1", mention: "not in the allowed LoadBalancer port list"},
+		{name: "no LoadBalancer declares a listed 80", policy: func() PortPolicy { p := nobody; p.LBPrivilegedPorts = []uint16{80}; return p }(), port: 80, addr: "100.64.0.1", mention: "no LoadBalancer service declares port 80"},
+		{name: "a tenant-only listed port keeps the listed rule", policy: server, port: 8080, addr: "100.64.0.1", allow: true},
+		{name: "a tenant-only unlisted port", policy: server, port: 22, addr: "100.64.0.1", mention: "not in the allowed LoadBalancer port list"},
+		{name: "ingress-declared 80 on a non-en interface", policy: func() PortPolicy {
+			p := server
+			p.InterfaceAddrs = func() (map[netip.Addr]string, error) {
+				return map[netip.Addr]string{netip.MustParseAddr("192.168.64.1"): "bridge100"}, nil
+			}
+			return p
+		}(), port: 80, addr: "192.168.64.1", mention: "on bridge100"},
+		{name: "ingress-declared 80 before the first sync", policy: func() PortPolicy { p := listed; p.Synced = func() bool { return false }; return p }(), port: 80, addr: "100.64.0.1", mention: "not yet synced"},
+		{name: "the ingress's wildcard is unchanged", policy: server, port: 80, addr: "0.0.0.0", allow: true},
+		{name: "a tenant's wildcard on an unlisted ingress port is unchanged", policy: server, port: 22, addr: "0.0.0.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := PortAuthorizer(tc.policy).Authorize(context.Background(), tc.port, tc.addr)
+			if tc.allow && err != nil {
+				t.Errorf("Authorize(%d, %s) = %v, want authorized", tc.port, tc.addr, err)
+			}
+			if !tc.allow && err == nil {
+				t.Errorf("Authorize(%d, %s) authorized, want refused", tc.port, tc.addr)
+			}
+			if tc.mention != "" && (err == nil || !strings.Contains(err.Error(), tc.mention)) {
+				t.Errorf("refusal = %v, want it to say %q", err, tc.mention)
+			}
+		})
 	}
 }

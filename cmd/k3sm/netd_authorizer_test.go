@@ -20,11 +20,16 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/netip"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/ingresshost"
+	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/k3sm/pkg/svclb"
 )
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -100,5 +105,81 @@ func TestStartServiceInformerRetryableOnMissingKubeconfig(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("startServiceInformer hung on a missing kubeconfig; must return a retryable error")
+	}
+}
+
+// TestServerLANOffIngressBindsAdmittedByNetd drives the server shape end to
+// end through netd's authorizer: the canonical ingress Service on 80/443, LAN
+// access off, the node address the server's mesh .1 (netd runs with no
+// --node-ip, so the bind reaches the host-address class), the default port
+// list. Every address the ingress host binds for each port (the LAN switch's
+// local set, less loopback below 1024) must be admitted, and so must the LAN-on
+// wildcard; before the fix the node-address binds were refused as an
+// ingress-owned port and `k3sm network lan off` rolled back.
+func TestServerLANOffIngressBindsAdmittedByNetd(t *testing.T) {
+	node := netip.MustParseAddr("100.64.0.1")
+	lan := netip.MustParseAddr("192.0.2.20")
+	sw := &lanSwitch{
+		hostAddrs: func() ([]netip.Addr, error) {
+			return []netip.Addr{lan, netip.MustParseAddr("127.0.0.1"), node}, nil
+		},
+		node: node,
+	}
+	off, err := sw.resolve(install.LANOff)
+	if err != nil {
+		t.Fatalf("resolve LAN off: %v", err)
+	}
+	on, err := sw.resolve(install.LANOn)
+	if err != nil {
+		t.Fatalf("resolve LAN on: %v", err)
+	}
+
+	lbPorts, err := dataroot.ParseLBPrivilegedPorts(dataroot.DefaultLBPrivilegedPorts)
+	if err != nil {
+		t.Fatalf("parse the default port list: %v", err)
+	}
+	canonical := canonicalLBService()
+	cfg, err := netdsvc.BuildConfig(netdsvc.Options{
+		NodePodCIDR: netip.MustParsePrefix("100.64.0.0/24"),
+		ServiceCIDR: netip.MustParsePrefix("10.43.0.0/16"),
+		Declares:    func(int) bool { return false },
+		LBDeclarers: func(port int) []netdsvc.ServiceRef {
+			if port == 80 || port == 443 {
+				return []netdsvc.ServiceRef{canonical}
+			}
+			return nil
+		},
+		NodeAddressService: canonical,
+		LBPrivilegedPorts:  lbPorts,
+		InterfaceAddrs: func() (map[netip.Addr]string, error) {
+			return map[netip.Addr]string{
+				netip.MustParseAddr("127.0.0.1"): "lo0",
+				node:                             "lo0",
+				lan:                              "en0",
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildConfig: %v", err)
+	}
+
+	for _, port := range []uint16{80, 443} {
+		binds := svclb.EffectiveBindAddrs(off.listeners, port)
+		if len(binds) == 0 {
+			t.Fatalf("LAN off leaves the ingress host no address for port %d (set %v)", port, off.listeners)
+		}
+		for _, a := range binds {
+			if a.IsLoopback() {
+				t.Errorf("the ingress host would bind %s:%d; loopback is left out below 1024", a, port)
+			}
+			if err := cfg.PortAuthorizer.Authorize(context.Background(), int(port), a.String()); err != nil {
+				t.Errorf("LAN off: netd refused the ingress host's %s:%d: %v", a, port, err)
+			}
+		}
+		for _, a := range svclb.EffectiveBindAddrs(on.listeners, port) {
+			if err := cfg.PortAuthorizer.Authorize(context.Background(), int(port), a.String()); err != nil {
+				t.Errorf("LAN on: netd refused the ingress host's %s:%d: %v", a, port, err)
+			}
+		}
 	}
 }
