@@ -28,8 +28,7 @@ without running anything as root.
 
 Two alternatives:
 
-- **Homebrew** is planned, and the `k3sm-io/tap` is not published yet. When it ships, run
-  `brew install k3sm-io/tap/k3sm && sudo k3sm install`.
+- **The k3sm app, through the Mac App Store,** is planned.
 - **From source**, if you would rather build it yourself: clone `apis`, `runtimed`, `darwin-net`
   and `k3sm` side by side, run `go work init ./apis ./runtimed ./darwin-net ./k3sm`, build with
   `CGO_ENABLED=1 go build -o k3sm ./cmd/k3sm` inside `k3sm`, assemble the install set with

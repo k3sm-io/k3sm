@@ -56,7 +56,7 @@ else
 fi
 
 # b137.3 — asset-name cross-check: the goreleaser name templates are a frozen
-# public contract (they are also the brew formula's download URLs). If either
+# public contract (they are also the install script's download URLs). If either
 # template changes, this goes red instead of every future release silently
 # 404ing for the live script.
 if grep -qF 'name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"' "$CONFIG" \

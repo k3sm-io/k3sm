@@ -35,8 +35,7 @@ and one residual limitation remains (no per-pod uid isolation).
 
 - The `k3sm` binary in **`/Library/k3sm`** (`root:wheel`), whichever channel delivered it (with the
   script, pin `K3SM_INSTALL_VERSION` to reinstall a prior release, since the assets stay on GitHub
-  Releases; the planned Homebrew channel will retain the previous version, so rollback there will
-  not need a rebuild).
+  Releases).
 - The launcher, a symlink **`/usr/local/bin/k3sm` → `/Library/k3sm/k3sm`**. `/usr/local/bin` is
   the first entry in `/etc/paths`, so every terminal opened after the install finds `k3sm` with no
   profile edit; a terminal that was already open may need `hash -r` or simply a new window. Because
@@ -124,15 +123,13 @@ k3sm's distribution ships in three generations, listed in shipping order:
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
    one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
 
-2. **Homebrew (gen 2)** is planned, and the `k3sm-io/tap` is not published yet. When it ships, run
-   `brew install k3sm-io/tap/k3sm`, then `sudo k3sm install`.
+2. **The k3sm app, through the Mac App Store,** is planned.
 
 3. **Notarized `.pkg` (gen 3)** is a signed, stapled installer package for offline and managed
    installs.
 
 > **Status:** pre-release builds are published; the script resolves the newest one, and a pin
-> via `K3SM_INSTALL_VERSION` always wins. The `k3sm-io/tap` is not published yet. The Homebrew
-> channel and the `.pkg` arrive with the first stable release.
+> via `K3SM_INSTALL_VERSION` always wins. The `.pkg` arrives with the first stable release.
 
 Every channel manages the same `/Library/k3sm`. Once more than one has shipped, run
 `sudo k3sm install` after switching so the daemons run the newly delivered binary, or run
@@ -438,7 +435,7 @@ because this deletes a user account and the cluster's datastore.
 
 The purge learns whose `~/.kube/config` to clean from `sudo`. When there is no `sudo` environment, name the account with `--user <name>`; it wins over `sudo`'s own record, and root, system and service accounts are refused.
 
-Run it before `brew uninstall k3sm`: the `k3sm` binary is what performs the purge.
+Run it before removing the `k3sm` binary: the binary is what performs the purge.
 
 Before deleting anything it checks that the data directories are the ones install created, and it
 stops without removing anything if a check fails. Install marks each directory with a

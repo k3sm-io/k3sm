@@ -100,7 +100,6 @@ type doctorEnv struct {
 	macOSVersion     func() (string, error)                                                // sysctl kern.osproductversion
 	sipEnabled       func() (bool, error)                                                  // csrutil status
 	helperState      func() (installed, running bool)                                      // launchctl print system/io.k3sm.netd
-	brewPresent      func() bool                                                           // exec.LookPath("brew")
 	datastorePosture func() (present bool, userVersion int, journalMode string, err error) // read-only sqlite header
 	developerDir     func() (string, error)                                                // xcode-select -p
 	// etcdMember reports whether this server holds an embedded etcd member (the HA
@@ -148,7 +147,6 @@ func doctorChecks() []doctorCheck {
 		{"macos", checkMacOS},
 		{"sip", checkSIP},
 		{"netd-helper", checkHelper},
-		{"brew", checkBrew},
 		{"datastore", checkDatastore},
 		{"toolchain", checkXcodeToolchain},
 		{"agent-daemon", checkAgentDaemon},
@@ -250,20 +248,6 @@ func checkHelper(env doctorEnv) checkResult {
 			detail: install.NetdLabel + " not detected — either not installed, or not readable without privilege (a system-domain launchctl print may need root); the default runtimed runtime (unprivileged) and the datapath need it, and an unprivileged node without it refuses to start",
 			remedy: "sudo k3sm doctor   # confirm it is truly absent rather than unreadable\nsudo k3sm install   # or pass --runtime hostprocess for rootless dev",
 		}
-	}
-}
-
-// checkBrew reports Homebrew presence. Homebrew is an install vector, not a
-// runtime dependency, so absence is a WARN.
-func checkBrew(env doctorEnv) checkResult {
-	if env.brewPresent() {
-		return checkResult{name: "brew", status: statusPass, detail: "Homebrew present"}
-	}
-	return checkResult{
-		name:   "brew",
-		status: statusWarn,
-		detail: "Homebrew not found — an install vector, not required at runtime",
-		remedy: "install Homebrew from https://brew.sh only if you want the brew install path; nothing k3sm runs needs it",
 	}
 }
 
@@ -516,7 +500,7 @@ const doctorUsage = `k3sm doctor — preflight checks for this Mac
 Usage: k3sm doctor [flags]
 
 It reports what k3sm needs from the machine — the CPU, the macOS floor, SIP, the
-` + "`" + install.NetdLabel + "`" + ` helper, Homebrew, the kine datastore, the Xcode toolchain
+` + "`" + install.NetdLabel + "`" + ` helper, the kine datastore, the Xcode toolchain
 grant, and (on a worker) the agent daemon and its node credential. Every row
 that is not a pass carries the command that repairs it, collected under ` + "`Next:`" + `.
 
@@ -784,7 +768,6 @@ func realDoctorEnv(workDir string) doctorEnv {
 		macOSVersion: probeMacOSVersion,
 		sipEnabled:   probeSIPEnabled,
 		helperState:  probeHelperState,
-		brewPresent:  func() bool { _, err := exec.LookPath("brew"); return err == nil },
 		datastorePosture: func() (bool, int, string, error) {
 			return probeDatastorePosture(executor.StateDBPath(workDir))
 		},

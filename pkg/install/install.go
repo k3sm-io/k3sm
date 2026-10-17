@@ -22,8 +22,7 @@ limitations under the License.
 // chown) lives in install_darwin.go; the seam, the install/uninstall ordering,
 // the launchd plist rendering, and the fake live here.
 //
-// The Homebrew formula / goreleaser config / brew post_install kickstart hook /
-// notarization + designated-requirement entitlements that drive these commands
+// The goreleaser config / notarization + designated-requirement entitlements that drive these commands
 // are the packaging follow-up (DESIGN §5c) — out of scope here.
 package install
 

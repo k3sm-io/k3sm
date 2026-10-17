@@ -120,7 +120,7 @@ func TestDoctorRendersRemedies(t *testing.T) {
 	t.Run("a-warn-only-run-takes-the-status-degraded-code", func(t *testing.T) {
 		t.Parallel()
 		env := healthyDoctorEnv()
-		env.brewPresent = func() bool { return false }
+		env.helperState = func() (bool, bool) { return false, false }
 		rep, screen, code := reportFor(t, env)
 
 		for _, row := range rep.Rows {
@@ -138,8 +138,8 @@ func TestDoctorRendersRemedies(t *testing.T) {
 		if !hasNext {
 			t.Fatalf("a warning run rendered no Next: block:\n%s", screen)
 		}
-		if !strings.Contains(block, "brew.sh") {
-			t.Errorf("the Next: block does not carry the brew remedy:\n%s", screen)
+		if !strings.Contains(block, "sudo k3sm install") {
+			t.Errorf("the Next: block does not carry the helper remedy:\n%s", screen)
 		}
 	})
 
@@ -532,7 +532,6 @@ func brokenDoctorEnv() doctorEnv {
 	e.macOSVersion = func() (string, error) { return "15.5", nil }
 	e.sipEnabled = func() (bool, error) { return false, nil }
 	e.helperState = func() (bool, bool) { return true, false }
-	e.brewPresent = func() bool { return false }
 	e.datastorePosture = func() (bool, int, string, error) { return true, 3, "rollback", nil }
 	e.developerDir = func() (string, error) { return "/Library/Developer/CommandLineTools", nil }
 	return e
