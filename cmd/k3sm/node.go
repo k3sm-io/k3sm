@@ -842,7 +842,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// teardown so it does not leak.
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: cs.CoreV1().Events("")})
-	defer eventBroadcaster.Shutdown()
+	defer timedTeardownStep(slog.Default(), "event-broadcaster", eventBroadcaster.Shutdown)
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "k3sm", Host: opts.nodeName})
 
 	// Cluster image mirrors (the peer ingest registries this node may fall back
@@ -1087,7 +1087,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// left on the Node never vouches for listeners this one has not opened.
 	// Stopped (listeners drained) on every return path.
 	stopLBHoster := startLBHoster(ctx, opts, cs, slog.Default())
-	defer stopLBHoster()
+	defer timedTeardownStep(slog.Default(), "svclb-hoster", stopLBHoster)
 
 	errc := make(chan error, 1)
 	// Every loop reports its return through nodeLoops, which is what closes the
@@ -1126,7 +1126,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	watchDone := make(chan struct{})
 	hbWatch := &heartbeatWatch{node: opts.nodeName, started: time.Now(), log: slog.Default()}
 	go func() { defer close(watchDone); hbWatch.run(watchCtx, n.Heartbeat) }()
-	defer func() { stopWatch(); <-watchDone }()
+	defer timedTeardownStep(slog.Default(), "heartbeat-watch", func() { stopWatch(); <-watchDone })
 
 	if err := awaitNodeReady(ctx, n.Ready(), errc, nodeStartupTimeout, opts.nodeName, opts.listen); err != nil {
 		return err
@@ -1145,12 +1145,12 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// because both act on this node's own Node annotations. They are stopped
 	// before the runtime closes (defers are LIFO).
 	stopInterconnect := startInterconnectNode(ctx, opts, cs, restCfg, recorder, opts.interconnectMetrics, slog.Default())
-	defer stopInterconnect()
+	defer timedTeardownStep(slog.Default(), "node-interconnect", stopInterconnect)
 	// The managed update watcher acts on this node's own Node annotations too,
 	// so it starts at the same point, after the provider registered; its Done
 	// also waits for the runtime-health probe.
 	stopUpdate := startNodeUpdate(ctx, opts, cs, runtimeHealthProbe(prov), slog.Default())
-	defer stopUpdate()
+	defer timedTeardownStep(slog.Default(), "node-update-watcher", stopUpdate)
 	slog.Default().Info(fmt.Sprintf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir))
 
 	return awaitNodeExit(ctx, errc, stopRuntime)

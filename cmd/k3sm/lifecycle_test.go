@@ -72,8 +72,8 @@ func TestStopHelpStatesTheTimeBound(t *testing.T) {
 			t.Errorf("stop help lacks %q:\n%s", want, help)
 		}
 	}
-	if got := install.StopTimeBound(); got != 150*time.Second {
-		t.Errorf("StopTimeBound = %s; the help text's breakdown (15+60+15+15+10+5+30) sums to 150s", got)
+	if got := install.StopTimeBound(); got != 180*time.Second {
+		t.Errorf("StopTimeBound = %s; the help text's breakdown (15+90+15+15+10+5+30) sums to 180s", got)
 	}
 }
 

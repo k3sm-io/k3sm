@@ -2421,13 +2421,14 @@ func TestServerPlistXML(t *testing.T) {
 	mustContain(t, x, "<string>runtimed</string>")
 	mustContain(t, x, "<key>RunAtLoad</key>\n  <true/>")
 	mustContain(t, x, "<key>KeepAlive</key>\n  <true/>")
-	// ExitTimeOut > launchd's 20s default so the daemon's teardown — the embedded
-	// runtime's vm stop and Stop()'s control-plane drain, which run concurrently,
-	// then the control socket and the mesh teardown — finishes before SIGKILL (else
-	// the stragglers orphan). The number is derived;
-	// TestExitTimeOutCoversTheDaemonTeardown owns the arithmetic, and this golden is
+	// ExitTimeOut > launchd's 20s default so the daemon's teardown — the node lane
+	// (the embedded runtime's vm stop, the node's own drains, the operators') and,
+	// concurrently, the control-plane lane (the ingest registry's teardown, then
+	// Stop()'s drain), then the mesh teardown — finishes before SIGKILL (else the
+	// stragglers orphan). The number is derived;
+	// TestExitTimeOutCoversEveryTeardownStep owns the arithmetic, and this golden is
 	// what pins the derivation to the rendered plist.
-	mustContain(t, x, "<key>ExitTimeOut</key>\n  <integer>60</integer>")
+	mustContain(t, x, "<key>ExitTimeOut</key>\n  <integer>90</integer>")
 	if strings.Contains(string(NetdPlist(Config{})), "ExitTimeOut") {
 		t.Error("netd plist should NOT set ExitTimeOut (it has no child processes to reap)")
 	}

@@ -205,10 +205,14 @@ func startManifestDir(ctx context.Context, restCfg *rest.Config, cs kubernetes.I
 // apiserver is healthy, because bringing it up also publishes the KEP-1755
 // local-registry-hosting ConfigMap — discovery needs a cluster to publish into.
 //
-// It is torn down BEFORE the control plane: runServer defers the returned stop
-// AFTER exec.Stop's, so LIFO runs it first. That ordering is not cosmetic — the
-// registry child holds a port and an open blob store, and a control plane that
-// went away underneath it would leave both to the process reaper.
+// It is torn down EARLY and BEFORE the control plane: the returned stop is
+// handed to the control-plane stopper (controlPlaneStopper.precede), which runs
+// it as soon as the node's teardown begins and stops the control plane only
+// after it. That ordering is not cosmetic: the registry child holds a port and
+// an open blob store in its own process group, so a daemon SIGKILLed before the
+// stop ran left it serving under launchd, and its retractions need a live
+// apiserver. runServer also defers the stop, for the exits that never reach the
+// node's teardown; after an early run it waits for that run, within its bound.
 //
 // NEVER FATAL: startIngestRegistry logs and returns a no-op teardown if the
 // registry cannot come up. See its doc for why that is the right posture here
@@ -228,7 +232,7 @@ func startManifestDir(ctx context.Context, restCfg *rest.Config, cs kubernetes.I
 // registry — which is handed to the node so a reference naming the Service
 // address is classified exactly as a loopback one is. The zero value (no
 // registry) leaves runtimed's classification unchanged.
-func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Interface, vmCapable bool, logger *slog.Logger) (stop func(), puller registryPullerWiring) {
+func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Interface, vmCapable bool, cpStop *controlPlaneStopper, logger *slog.Logger) (stop func(), puller registryPullerWiring) {
 	opts := plan.opts
 	if opts.registryPort == 0 {
 		return noStop, puller
@@ -252,7 +256,7 @@ func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		logger.Error("ingest registry disabled", "err", err)
 		return noStop, puller
 	}
-	return startIngestRegistry(ctx, ingestRegistry{
+	stop, puller = startIngestRegistry(ctx, ingestRegistry{
 		svc:      svc,
 		port:     opts.registryPort,
 		nodeName: opts.nodeName,
@@ -279,6 +283,12 @@ func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		clusterDomain: opts.domain,
 		logger:        logger,
 	})
+	// The early run, on the control-plane stop's lane, and runServer's deferred
+	// backstop share one stage: whichever comes first runs the teardown, and the
+	// other waits for it within its bound.
+	stop = newSharedStage("ingest-registry-teardown", stop, registryTeardownBound, logger).run
+	cpStop.precede(stop, registryTeardownBound)
+	return stop, puller
 }
 
 // serverMesh is what step 2b leaves behind for the phases after it.

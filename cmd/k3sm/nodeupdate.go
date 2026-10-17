@@ -22,7 +22,7 @@ import (
 	"log/slog"
 	"net/url"
 	"path/filepath"
-	"sync"
+	"time"
 
 	"k8s.io/client-go/kubernetes"
 
@@ -133,15 +133,41 @@ func startNodeUpdate(ctx context.Context, opts nodeOptions, cs kubernetes.Interf
 		logger.Info("managed update disabled on this node: it needs the k3sm-netd root helper and an installed data root", "node", opts.nodeName)
 		return noStop
 	}
+	return superviseUpdateWatcher(ctx, w.Run, nodeUpdateStopGrace, logger)
+}
+
+// nodeUpdateStopGrace bounds how long the node's teardown waits for the update
+// watcher to return once its context is cancelled. pkg/install budgets it as one
+// step of the launchd ExitTimeOut.
+//
+// The wait is bounded because the watcher cannot always return on cancellation.
+// Mid-install it is inside the root helper's ApplyUpdate stream, and that stream's
+// read honours only the connection deadline (the install timeout, tens of
+// minutes), never the context. The stream ends when the staged installer stops
+// k3sm-netd, and the installer does that only after this daemon has exited: an
+// unbounded wait here held the daemon until launchd's SIGKILL, with every
+// teardown step after it (the server's ingest registry among them) never run.
+// Returning after the grace leaves that one goroutine blocked on the stream;
+// it ends with the process, which is what the installer is waiting for.
+const nodeUpdateStopGrace = 2 * time.Second
+
+// superviseUpdateWatcher runs run on its own goroutine under a context of its
+// own and returns the stop: cancel, then wait for run at most grace. A watcher
+// still running after the grace is reported and left; see nodeUpdateStopGrace.
+func superviseUpdateWatcher(ctx context.Context, run func(context.Context), grace time.Duration, logger *slog.Logger) (stop func()) {
 	uctx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	wg.Add(1)
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		w.Run(uctx)
+		defer close(done)
+		run(uctx)
 	}()
 	return func() {
 		cancel()
-		wg.Wait()
+		select {
+		case <-done:
+		case <-time.After(grace):
+			logger.Warn("update watcher did not return in time; continuing shutdown (an install in progress continues in the root helper)",
+				"stage", "node-update-stop", "wait", grace)
+		}
 	}
 }
