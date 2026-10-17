@@ -63,6 +63,8 @@ verdict, not a failure to answer, so read stdout first and use the exit code as 
 | `not-installed` | there is no k3sm install on this Mac |
 | `unknown` | the state could not be read from this account; re-run with `sudo` |
 
+The `verdict` describes k3sm's own health: the daemons, the apiserver, the node, networking and the data root decide it, and the `workloads` row never does, at any severity.
+
 **`role`** is which node this Mac is installed as: `server` (the control plane) or `agent` (a worker
 that joined one). A Mac with no install reports `server`.
 
