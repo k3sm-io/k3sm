@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -59,6 +60,13 @@ type PodNetwork interface {
 	// Errors preserve the podnet sentinels with %w, exactly as Setup does.
 	SetupGuest(ctx context.Context, podID string, dnsCfg netv1.DNSConfig) (sandbox.GuestNetworkConfig, error)
 }
+
+// ErrGuestDNSVIPUnresolved is returned by SetupGuest when a cluster-DNS guest's
+// DNS VIP cannot be determined: the pod's ClusterFirst DNS config names no VIP,
+// names one that does not parse, or names one the node's podnet VM config
+// contradicts. A guest provisioned without it would boot with no cluster
+// resolver, so the provisioning fails instead.
+var ErrGuestDNSVIPUnresolved = errors.New("cluster DNS VIP for the vm guest is unresolved")
 
 // PodIPAM is the consumer-side slice of darwin-net's *podnet.Network the
 // adapter drives: idempotent per-pod /32 allocation + lo0 alias plumbing,
@@ -236,6 +244,10 @@ func (a *PodNetAdapter) SetupGuest(ctx context.Context, podID string, dnsCfg net
 	if err != nil {
 		return sandbox.GuestNetworkConfig{}, fmt.Errorf("podnet setup guest %s: %w", podID, err)
 	}
+	vip, err := resolveGuestDNSVIP(dnsCfg, gn.DNSVIP)
+	if err != nil {
+		return sandbox.GuestNetworkConfig{}, fmt.Errorf("guest network for %s: %w", podID, err)
+	}
 	fields, err := dns.GuestResolvConfFields(dnsCfg)
 	if err != nil {
 		return sandbox.GuestNetworkConfig{}, fmt.Errorf("guest resolv.conf fields for %s: %w", podID, err)
@@ -252,14 +264,47 @@ func (a *PodNetAdapter) SetupGuest(ctx context.Context, podID string, dnsCfg net
 		PodIP:       gn.PodIP,
 		Gateway:     gn.Gateway,
 		NATSubnet:   gn.NATSubnet,
-		DNSVIP:      gn.DNSVIP,
+		DNSVIP:      vip,
 	}
 	a.mu.Lock()
 	a.guest[podID] = cfg
 	a.mu.Unlock()
+	vipField := "none (pod dnsPolicy None)"
+	if vip.IsValid() {
+		vipField = vip.String()
+	}
 	a.log.Info("guest network provisioned for vm pod",
-		"pod", podID, "pod_ip", gn.PodIP.String(), "dns_vip", gn.DNSVIP.String())
+		"pod", podID, "pod_ip", gn.PodIP.String(), "dns_vip", vipField)
 	return cfg, nil
+}
+
+// resolveGuestDNSVIP returns the cluster DNS VIP a vm guest's network carries. The one
+// authority is the pod's own DNS config: its ClusterDNSIP is the address the
+// guest's resolv.conf names (dns.GuestResolvConfFields renders it as the sole
+// nameserver), and on both roles it is the node's --dns-vip, the address the
+// node's own resolver binds. The node's podnet VM config is not an authority:
+// production sets none, so its DNSVIP is zero on a server and on a worker alike.
+// When it is set it must agree, or the carried value would not be the guest's
+// resolver.
+//
+// A ClusterFirst config without a parseable VIP is ErrGuestDNSVIPUnresolved,
+// never a zero value. A None config names its own nameservers and has no
+// cluster VIP, so the zero value is the truthful answer there.
+func resolveGuestDNSVIP(dnsCfg netv1.DNSConfig, podnetVIP netip.Addr) (netip.Addr, error) {
+	if dnsCfg.Policy == netv1.DNSPolicyNone {
+		return netip.Addr{}, nil
+	}
+	if dnsCfg.ClusterDNSIP == "" {
+		return netip.Addr{}, fmt.Errorf("%w: the pod's cluster DNS config names no VIP", ErrGuestDNSVIPUnresolved)
+	}
+	vip, err := netip.ParseAddr(dnsCfg.ClusterDNSIP)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("%w: parse cluster DNS VIP %q: %w", ErrGuestDNSVIPUnresolved, dnsCfg.ClusterDNSIP, err)
+	}
+	if podnetVIP.IsValid() && podnetVIP != vip {
+		return netip.Addr{}, fmt.Errorf("%w: podnet names %s but the pod's resolv.conf names %s", ErrGuestDNSVIPUnresolved, podnetVIP, vip)
+	}
+	return vip, nil
 }
 
 // GuestNetwork implements runtimed's optional runtime.GuestNetworker seam: it
