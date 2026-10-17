@@ -315,6 +315,10 @@ type Collector struct {
 	// OPTIONAL: nil leaves the services row out. It is consulted on a server
 	// only, and only once the record has been read.
 	Services ServicesComparer
+	// RegistryProbe GETs the ingest registry's loopback /v2/ endpoint, for the
+	// ingest-registry row. OPTIONAL: nil is a plain HTTP GET bounded at about a
+	// second.
+	RegistryProbe RegistryProbe
 	// ServingChain reads the certificate chain the apiserver presents in its
 	// TLS handshake, with the CA the reader's kubeconfig pins. OPTIONAL: nil
 	// leaves the serving-cert row unknown for an account that cannot read the

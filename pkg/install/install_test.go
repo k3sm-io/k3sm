@@ -2222,6 +2222,8 @@ func TestUninstallIdempotent(t *testing.T) {
 		// A joining HA server's staged server-class join token, removed in the
 		// same position as the admin token below and for the same reason; on a
 		// server that never joined, removing an absent file is a no-op.
+		"RemoveAll:/var/lib/k3sm/status/registry-state.json",
+		"RemoveAll:/var/lib/k3sm/server/registry-state.json",
 		"RemoveAll:/var/lib/k3sm/status/services.json",
 		"RemoveAll:/var/lib/k3sm/server/services.json",
 		"RemoveAll:/var/lib/k3sm/status/mesh-claims.json",
@@ -2923,7 +2925,7 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 			created[filepath.Join(StateStatus.Path(dc.DataRoot), UpdateRecordName)] = true
 		}
 		if dc.Role == RoleServer && toSet(recorded(installCalls, "Bootstrap:"))[ServerLabel] {
-			for _, name := range []string{MeshClaimsRecordName, ServicesRecordName} {
+			for _, name := range []string{MeshClaimsRecordName, ServicesRecordName, RegistryStateRecordName} {
 				created[filepath.Join(dc.serverWorkDir(), name)] = true
 				created[filepath.Join(StateStatus.Path(dc.DataRoot), name)] = true
 			}

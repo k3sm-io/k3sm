@@ -112,6 +112,10 @@ type Service struct {
 	cmd    *exec.Cmd
 	log    *os.File
 	exited chan struct{}
+	// reclaimedPID is the orphaned child the current Start reclaimed, or 0. It
+	// is reset at the top of every Start and decides whether the serving
+	// record says StateServing or StateReclaimed.
+	reclaimedPID int
 }
 
 // New validates cfg and returns a Service.
@@ -180,12 +184,23 @@ func (s *Service) Port() int { return s.cfg.Port }
 // does nothing at all. The bounded retry is here rather than at the caller so the
 // backoff and the give-up point are the same in every posture.
 func (s *Service) Start(ctx context.Context) error {
+	s.mu.Lock()
+	s.reclaimedPID = 0
+	s.mu.Unlock()
 	var err error
 	for attempt := 1; attempt <= startAttempts; attempt++ {
 		err = s.startOnce(ctx)
 		if err == nil {
 			s.cfg.Logger.Info("ingest registry serving",
 				"addr", s.Addr(), "storage", StateDir(s.cfg.WorkDir), "credential", CredentialPath(s.cfg.WorkDir))
+			s.mu.Lock()
+			reclaimed := s.reclaimedPID
+			s.mu.Unlock()
+			if reclaimed != 0 {
+				s.record(StateReclaimed, "", reclaimed)
+			} else {
+				s.record(StateServing, "", 0)
+			}
 			return nil
 		}
 		if ctx.Err() != nil {
@@ -201,7 +216,12 @@ func (s *Service) Start(ctx context.Context) error {
 			}
 		}
 	}
-	return fmt.Errorf("bring up the ingest registry on %s after %d attempts: %w", s.Addr(), startAttempts, err)
+	err = fmt.Errorf("bring up the ingest registry on %s after %d attempts: %w", s.Addr(), startAttempts, err)
+	s.mu.Lock()
+	reclaimed := s.reclaimedPID
+	s.mu.Unlock()
+	s.record(StateDisabled, err.Error(), reclaimed)
+	return err
 }
 
 // startOnce is one bring-up attempt: stage the binary, write the state, preflight
@@ -226,7 +246,7 @@ func (s *Service) startOnce(ctx context.Context) error {
 		return err
 	}
 	if err := s.await(ctx, c); err != nil {
-		s.Shutdown(context.WithoutCancel(ctx))
+		s.stop(context.WithoutCancel(ctx))
 		return err
 	}
 	return nil
@@ -367,15 +387,27 @@ func (s *Service) logTail() string {
 
 // Shutdown SIGTERMs the child's process group, waits drainGrace for the reaper to
 // observe the exit, then SIGKILLs if it has not, and closes the log. It is
-// idempotent and safe on a service that never started.
+// idempotent and safe on a service that never started. Stopping a running child
+// records StateStopped.
 func (s *Service) Shutdown(ctx context.Context) error {
+	if s.stop(ctx) {
+		s.record(StateStopped, "", 0)
+	}
+	return nil
+}
+
+// stop is Shutdown without the state record, which is also how a failed
+// bring-up attempt tears its own child down: that child never served, and the
+// attempt's outcome is Start's to record. It reports whether a child was
+// running.
+func (s *Service) stop(ctx context.Context) bool {
 	s.mu.Lock()
 	cmd, lf, exited := s.cmd, s.log, s.exited
 	s.cmd, s.log, s.exited = nil, nil, nil
 	s.mu.Unlock()
 
 	if cmd == nil || cmd.Process == nil {
-		return nil
+		return false
 	}
 	pid := cmd.Process.Pid
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
@@ -394,5 +426,5 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		_ = lf.Close()
 	}
 	s.cfg.Logger.Info("stopped the ingest registry child", "pid", pid)
-	return nil
+	return true
 }
