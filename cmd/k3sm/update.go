@@ -575,7 +575,8 @@ const updateWatchEvery = 2 * time.Second
 // writes: the controller's handover (update-version, update-payload,
 // update-payload-sig, update-signer), the
 // node-side's report (update-phase) and the controller's own bookkeeping
-// (update-cordoned, update-handed-over-at, update-ready-at).
+// (update-cordoned, update-handed-over-at, update-ready-at), and a control
+// plane's report of an admin token rotation (update-admin-token-rotated-at).
 const updateAnnotationPrefix = "k3sm.io/update-"
 
 // errNoUpdate is a cluster with no Update named current.
@@ -797,7 +798,14 @@ type updateStatusNode struct {
 	// LastProgress (RFC 3339; empty when the message carries none).
 	Message      string `json:"message,omitempty"`
 	LastProgress string `json:"lastProgress,omitempty"`
+	// AdminTokenRotated is set when the node's in-place install minted a new
+	// admin token: every admin kubeconfig copied from it before is refused.
+	AdminTokenRotated bool `json:"adminTokenRotated,omitempty"`
 }
+
+// adminTokenRotatedRemedy is the line the text form prints under a node whose
+// AdminTokenRotated is set.
+const adminTokenRotatedRemedy = "admin credential re-minted: copy the admin kubeconfig (`k3sm kubeconfig` on the server) again to every other Mac and tool that uses it"
 
 // updateProgressMark separates a node message from its last-progress time,
 // as the controller writes it ("<message>; last progress <RFC3339>").
@@ -840,7 +848,7 @@ func newUpdateStatusView(u *updatesv1alpha1.Update) updateStatusView {
 		base, at := splitUpdateProgress(n.Message)
 		v.Nodes = append(v.Nodes, updateStatusNode{
 			Name: clip(n.Name), From: clip(n.From), To: clip(n.To), Phase: clip(string(n.Phase)),
-			Message: clip(base), LastProgress: clip(at),
+			Message: clip(base), LastProgress: clip(at), AdminTokenRotated: n.AdminTokenRotated,
 		})
 	}
 	for _, c := range u.Status.Conditions {
@@ -878,6 +886,10 @@ func renderUpdateStatus(w io.Writer, v updateStatusView) {
 		fmt.Fprintf(tw, "\nNODE\tFROM\tTO\tPHASE\tLAST PROGRESS\tMESSAGE\n")
 		for _, n := range v.Nodes {
 			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", n.Name, n.From, n.To, n.Phase, n.LastProgress, n.Message)
+			if n.AdminTokenRotated {
+				// Under the node's MESSAGE, so the table's columns stay aligned.
+				fmt.Fprintf(tw, "\t\t\t\t\t%s\n", adminTokenRotatedRemedy)
+			}
 		}
 	}
 	if len(v.Conditions) > 0 {
@@ -1003,6 +1015,14 @@ func runUpdateAbort(ctx context.Context, args []string, env updateEnv) int {
 		fmt.Fprintln(env.errOut, "k3sm update abort:", err)
 		return exitInternalError
 	}
+	// The nodes are read before the Update is ended, so a control plane's
+	// admin token rotation is recorded on the aborted Update before its
+	// annotation is cleared below.
+	nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		fmt.Fprintln(env.errOut, "k3sm update abort: list nodes:", err)
+		return exitInternalError
+	}
 	switch {
 	case u == nil:
 		fmt.Fprintf(env.out, "No Update named %q; releasing the nodes only.\n", updatesv1alpha1.UpdateName)
@@ -1014,17 +1034,18 @@ func runUpdateAbort(ctx context.Context, args []string, env updateEnv) int {
 		if env.inputs.Now != nil {
 			now = env.inputs.Now
 		}
+		updatectl.NoteAdminTokenRotations(u, nodes.Items, slog.New(slog.NewTextHandler(env.errOut, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		abortUpdateStatus(u, now().UTC().Truncate(time.Second))
 		if err := writeUpdateStatus(ctx, dyn, u); err != nil {
 			fmt.Fprintln(env.errOut, "k3sm update abort:", err)
 			return exitInternalError
 		}
 		fmt.Fprintf(env.out, "Marked the Update %s to %s Cancelled (it was %s).\n", updatesv1alpha1.UpdateName, status.ClipText(u.Spec.Version, 128), was)
-	}
-	nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		fmt.Fprintln(env.errOut, "k3sm update abort: list nodes:", err)
-		return exitInternalError
+		for _, e := range u.Status.Nodes {
+			if e.AdminTokenRotated {
+				fmt.Fprintf(env.out, "Node %s: %s.\n", status.ClipText(e.Name, 253), adminTokenRotatedRemedy)
+			}
+		}
 	}
 	failed := false
 	released := 0
@@ -1091,7 +1112,11 @@ func abortUpdateStatus(u *updatesv1alpha1.Update, now time.Time) {
 			continue
 		}
 		e.Phase = updatesv1alpha1.UpdateNodePhaseCancelled
-		e.Message = "aborted by k3sm update abort" + updateProgressMark + at
+		msg := "aborted by k3sm update abort"
+		if e.AdminTokenRotated {
+			msg += "; " + updatectl.AdminTokenRotatedMessage
+		}
+		e.Message = msg + updateProgressMark + at
 	}
 	msg := "k3sm update abort ended the roll"
 	set := func(typ string, st metav1.ConditionStatus) {

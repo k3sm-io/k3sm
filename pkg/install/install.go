@@ -2214,6 +2214,9 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 		}
 		cfg.Logger.Info("staged the control plane's admin token for the server daemon (the daemon is told where its token is, never what it is)", "path", cfg.serverTokenPath())
 		res.AdminTokenRotated = mintedInPlace
+		if err := recordAdminTokenRotation(sys, cfg, uid, mintedInPlace); err != nil {
+			return err
+		}
 	}
 
 	// 1f″. A server that is no longer a joining member (its etcd role changed

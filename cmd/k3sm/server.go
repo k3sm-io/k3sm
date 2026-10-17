@@ -832,8 +832,10 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		updateReleaseBase: opts.updateReleaseBase,
 		// The server's own cluster CA: the update signer it mints chains to it.
 		updateClusterCAPEM: nodeHierarchy.Cluster.CertPEM,
-		logs:               opts.logs,
-		nodeIP:             nodeAddressing.nodeIP,
+		// The marker an install leaves when it minted a new admin token.
+		adminTokenMarker: install.AdminTokenRotatedMarkerPath(opts.workDir),
+		logs:             opts.logs,
+		nodeIP:           nodeAddressing.nodeIP,
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,
 		runtime:     opts.rtName,
