@@ -97,7 +97,7 @@ func enrollerOverHandler(t *testing.T) (*meshEnroller, *meshPeerAPIStub) {
 // TestJoinedServerEnrolsAtItsOwnMeshIndex is the B447 gate. A server joined with
 // --mesh-ip 100.64.1.1 enrols at 100.64.1.0/24 — the range its lo0 alias, its netd
 // seed and its apiserver bind already use — beside the first server's 100.64.0.0/24,
-// which it never touches; and the pod range step 4b leaves for the node passes the
+// which it never touches; and the pod range step 2b leaves for the node passes the
 // alias check the node's bring-up runs.
 //
 // Before B447 every server claimed index 0: the joiner's enrol failed on the first
@@ -140,18 +140,18 @@ func TestJoinedServerEnrolsAtItsOwnMeshIndex(t *testing.T) {
 		}
 	})
 
-	t.Run("step 4b's pod range passes the node's alias check", func(t *testing.T) {
+	t.Run("step 2b's pod range passes the node's alias check", func(t *testing.T) {
 		api := newMeshPeerAPIStub()
 		seedPeer(t, api, firstServer, "100.64.0.0/24")
 		sm := runEnrollServerMesh(t, api, joinedServer, joinedMeshIP)
 		if sm.dataPathRefused != nil {
-			t.Fatalf("step 4b refused the data path: %v", sm.dataPathRefused)
+			t.Fatalf("step 2b refused the data path: %v", sm.dataPathRefused)
 		}
 		if sm.podCIDR != "100.64.1.0/24" {
-			t.Errorf("step 4b left podCIDR %q, want 100.64.1.0/24", sm.podCIDR)
+			t.Errorf("step 2b left podCIDR %q, want 100.64.1.0/24", sm.podCIDR)
 		}
 		if err := checkNodeAliasAddr(joinedMeshIP, sm.podCIDR, install.DefaultServiceCIDR); err != nil {
-			t.Errorf("the node's alias check refuses %s in step 4b's range %s: %v", joinedMeshIP, sm.podCIDR, err)
+			t.Errorf("the node's alias check refuses %s in step 2b's range %s: %v", joinedMeshIP, sm.podCIDR, err)
 		}
 		// Why the seed matters: the first-server default is the range the alias
 		// check refuses for this mesh IP, which is the exit the joiner used to take.
@@ -161,7 +161,7 @@ func TestJoinedServerEnrolsAtItsOwnMeshIndex(t *testing.T) {
 	})
 }
 
-// runEnrollServerMesh runs step 4b for a server named node with --mesh-ip meshIP
+// runEnrollServerMesh runs step 2b for a server named node with --mesh-ip meshIP
 // over api, with no datapath, and returns what it left.
 func runEnrollServerMesh(t *testing.T, api http.Handler, node, meshIP string) serverMesh {
 	t.Helper()
