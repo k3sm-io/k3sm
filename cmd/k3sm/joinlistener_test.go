@@ -42,11 +42,12 @@ import (
 // then delegates to a real loopback bind on an ephemeral port — so the row that
 // serves for real never contends for the supervisor's fixed port.
 type scriptedListen struct {
-	mu     sync.Mutex
-	errs   []error
-	calls  int
-	addrs  []string
-	opened []net.Listener
+	mu       sync.Mutex
+	errs     []error
+	calls    int
+	addrs    []string
+	networks []string
+	opened   []net.Listener
 }
 
 func (s *scriptedListen) listen(network, addr string) (net.Listener, error) {
@@ -54,6 +55,7 @@ func (s *scriptedListen) listen(network, addr string) (net.Listener, error) {
 	n := s.calls
 	s.calls++
 	s.addrs = append(s.addrs, addr)
+	s.networks = append(s.networks, network)
 	s.mu.Unlock()
 	if n < len(s.errs) {
 		return nil, s.errs[n]
@@ -101,6 +103,20 @@ func TestJoinSupervisorRebindsAfterTransientFailure(t *testing.T) {
 		}
 		if !strings.Contains(log.String(), addr) {
 			t.Errorf("the retry log does not name the address %s; log was:\n%s", addr, log.String())
+		}
+	})
+
+	t.Run("the IPv4 wildcard binds IPv4-only", func(t *testing.T) {
+		// A dual-stack "tcp" socket on 0.0.0.0 binds beside an IPv4-only holder
+		// of the port on macOS, so the holder would be invisible to the retry.
+		script := &scriptedListen{}
+		ln, err := listenJoinAddr(context.Background(), script.listen, addr, joinListenerAttempts, time.Millisecond, quietLogger())
+		if err != nil {
+			t.Fatalf("listenJoinAddr: %v", err)
+		}
+		defer ln.Close()
+		if got := script.networks; len(got) != 1 || got[0] != "tcp4" {
+			t.Errorf("join listener networks = %q, want [tcp4]", got)
 		}
 	})
 

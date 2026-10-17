@@ -32,7 +32,14 @@ import "strconv"
 // The listeners k3sm's node process owns on these ports. Go sets SO_REUSEADDR but
 // NOT SO_REUSEPORT, so wildcard-vs-wildcard on the same port fails EADDRINUSE,
 // while wildcard-vs-specific coexists (that is why the ClusterIP/DNS VIPs, which
-// bind SPECIFIC addresses, are deliberately absent from this set).
+// bind SPECIFIC addresses, are deliberately absent from this set). The
+// wildcard-vs-wildcard failure holds only within one address family: on macOS a
+// "tcp" bind of 0.0.0.0 is a dual-stack AF_INET6 socket, which coexists with an
+// IPv4 wildcard holder of the port. That is why the wildcard listeners that
+// guard against a holder, the svclb address set (the LoadBalancer hoster and the
+// ingress host) and the worker-join listener, bind IPv4-only ("tcp4"); the
+// other k3sm listeners bind specific addresses, where the family does not
+// decide the collision.
 //
 // The kubelet API binds the node's own address, never the wildcard, and the
 // NodePorts bind either the wildcard (the default) or a configured address set.

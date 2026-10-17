@@ -33,7 +33,8 @@
 #     l.3  Service lb-a (port 18080, no labels): ingress lists both nodes' mesh
 #          addresses, and each address serves the backend from the OTHER Mac;
 #     l.4  server labelled svclb.k3sm.io/enablelb=true: ingress drops to the
-#          server, and the worker holds no listener on 18080;
+#          server, and the worker holds no wildcard (LoadBalancer) listener on
+#          18080 (its ClusterIP listener on the Service VIP is not counted);
 #     l.5  server in pool blue (multi-pool form), worker in pool green (single
 #          form): lb-blue and lb-green, both on 18081, are each hosted on one Mac;
 #     l.6  a plain process holds 18082 on the worker: lb-c (18082) lists the
@@ -192,7 +193,12 @@ wait_ingress() {
 	return 1
 }
 sorted() { printf '%s\n' "$@" | sort | xargs; }
-listening() { on "$1" "sudo -n lsof -nP -iTCP:$2 -sTCP:LISTEN -t 2>/dev/null | wc -l | tr -d ' '"; }
+# listening <ssh> <port>: how many WILDCARD TCP listeners <ssh> holds on <port>,
+# the shape a LoadBalancer listener takes (lsof -nP NAME `*:<port>` or
+# `[::]:<port>`). A specific-address listener is not counted, so the Service
+# proxy's ClusterIP listener, which every node holds on the VIP, never reads as
+# the LoadBalancer listener.
+listening() { on "$1" "sudo -n lsof -nP -iTCP:$2 -sTCP:LISTEN 2>/dev/null | awk -v a='*:$2' -v b='[::]:$2' '{for (i = 1; i <= NF; i++) if (\$i == a || \$i == b) { n++; break }} END { print n + 0 }'"; }
 
 # l.3 -------------------------------------------------------------------------
 lb_service lb-a 18080
@@ -218,9 +224,9 @@ else
 	ladder no "b416.l4a allow-list mode: lb-a ingress drops to the server"
 fi
 if [ "$(listening "$K3SM_B416_WORKER_SSH" 18080)" = 0 ]; then
-	ladder ok "b416.l4b the worker holds no listener on 18080"
+	ladder ok "b416.l4b the worker holds no wildcard LoadBalancer listener on 18080"
 else
-	ladder no "b416.l4b the worker holds no listener on 18080"
+	ladder no "b416.l4b the worker holds no wildcard LoadBalancer listener on 18080"
 fi
 kc label node "$SERVER" svclb.k3sm.io/enablelb- >/dev/null
 

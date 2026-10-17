@@ -311,7 +311,7 @@ func ingressBinder(netdSocket string, httpPort, httpsPort int) netbind.Binder {
 			unpriv++
 		}
 	}
-	helper := &netbind.Netd{Client: wire.NewClient(netdSocket)}
+	helper := netdBinder{netd: &netbind.Netd{Client: wire.NewClient(netdSocket)}}
 	switch {
 	case priv == 0:
 		return direct
@@ -320,6 +320,34 @@ func ingressBinder(netdSocket string, httpPort, httpsPort int) netbind.Binder {
 	default:
 		return portSplitBinder{privileged: helper, unprivileged: direct}
 	}
+}
+
+// netdBinder binds through the netd helper with the protocol name the netd
+// wire speaks. The ingress listeners ask for an address-family network
+// ("tcp4" for an IPv4 address, so an in-process bind is IPv4-only and an IPv4
+// holder of the port is a bind error); netd accepts only "tcp" and "udp", and
+// the daemon itself chooses the socket family from the address. Sending the
+// family name across the wire would be refused by every netd daemon, which is
+// restarted independently of this process.
+type netdBinder struct {
+	netd *netbind.Netd
+}
+
+// Listen requests addr from netd under the wire protocol name for network.
+func (b netdBinder) Listen(ctx context.Context, network string, addr netip.AddrPort) (net.Listener, error) {
+	return b.netd.Listen(ctx, netdProtocol(network), addr)
+}
+
+// netdProtocol maps a Go network name to the netd wire protocol: the
+// family-pinned "tcp4"/"tcp6" and "udp4"/"udp6" become "tcp" and "udp".
+func netdProtocol(network string) string {
+	switch network {
+	case "tcp4", "tcp6":
+		return "tcp"
+	case "udp4", "udp6":
+		return "udp"
+	}
+	return network
 }
 
 // privilegedPortCeiling is the first port an unprivileged process may bind on
