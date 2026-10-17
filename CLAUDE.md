@@ -9,7 +9,7 @@ embedding, launchd/packaging. Imports `k3sm.io/{apis,runtimed,darwin-net}`.
 
 > Product design: `docs/DESIGN.md`. Milestones: `docs/M0-spike.md`, `docs/M0-node.md`. Spike: `hack/spike/run.sh`.
 > Roadmap & current phase: `docs/PHASES.md`. Acceptance gates: `hack/acceptance/`.
-> Public roadmap narrative: `ROADMAP.md` (hand-written).
+> Public roadmap: `ROADMAP.md`, grouped by minor version.
 
 ## Build / test
 ```sh
