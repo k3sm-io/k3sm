@@ -29,6 +29,22 @@ import (
 // ListenFunc binds one stream listener on ap (netbind.Binder.Listen's shape).
 type ListenFunc func(ctx context.Context, network string, ap netip.AddrPort) (net.Listener, error)
 
+// streamNetwork is the network a stream listener on a binds with: "tcp4" for
+// an IPv4 address, the wildcard included, and "tcp" otherwise.
+//
+// On macOS `net.Listen("tcp", "0.0.0.0:p")` opens a DUAL-STACK AF_INET6 socket,
+// and that socket binds successfully beside an IPv4-only process already
+// holding *:p: wildcard-vs-wildcard fails EADDRINUSE only within one address
+// family. The listener would then be reported bound while the IPv4 holder
+// answers every IPv4 connection. The cluster serves no IPv6, so binding IPv4
+// only loses nothing and makes the conflict a bind error.
+func streamNetwork(a netip.Addr) string {
+	if a.Unmap().Is4() {
+		return "tcp4"
+	}
+	return "tcp"
+}
+
 // ErrNoBindAddress is the named refusal of an address set that leaves a port
 // nothing to bind (an empty set, or a set of loopback addresses only on a port
 // below 1024; see EffectiveBindAddrs).
@@ -142,7 +158,7 @@ func (l *AddrSetListener) bind(ctx context.Context, want []netip.Addr) (map[neti
 	out := make(map[netip.Addr]net.Listener, len(want))
 	for _, a := range want {
 		ap := netip.AddrPortFrom(a, l.port)
-		ln, err := l.listen(ctx, "tcp", ap)
+		ln, err := l.listen(ctx, streamNetwork(a), ap)
 		if err != nil {
 			for _, o := range out {
 				_ = o.Close()

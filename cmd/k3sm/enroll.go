@@ -843,6 +843,23 @@ const (
 	joinListenerBackoff = 1500 * time.Millisecond
 )
 
+// streamNetworkFor is the network a stream listener on addr binds with: "tcp4"
+// when addr's host is an IPv4 address, the wildcard included, else "tcp". On
+// macOS a "tcp" bind of 0.0.0.0:p is a dual-stack AF_INET6 socket that binds
+// beside an IPv4-only holder of *:p (wildcard-vs-wildcard fails EADDRINUSE only
+// within one address family), so the holder would answer every IPv4 join while
+// this listener reported itself bound. The cluster serves no IPv6.
+func streamNetworkFor(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "tcp"
+	}
+	if a, err := netip.ParseAddr(host); err == nil && a.Unmap().Is4() {
+		return "tcp4"
+	}
+	return "tcp"
+}
+
 // listenJoinAddr binds addr, retrying ONLY a transiently busy address.
 //
 // The discrimination is the whole point: EADDRINUSE on this port means something
@@ -858,7 +875,7 @@ func listenJoinAddr(ctx context.Context, listen listenFunc, addr string, attempt
 	}
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		ln, err := listen("tcp", addr)
+		ln, err := listen(streamNetworkFor(addr), addr)
 		if err == nil {
 			if attempt > 1 {
 				log.Info("worker-join listener bound after the address freed", "addr", addr, "attempts", attempt)

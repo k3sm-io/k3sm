@@ -350,11 +350,11 @@ func TestIngressHostBindsThroughNetdWhenPresent(t *testing.T) {
 				t.Errorf("ingress NodeName = %q, want the node's own name %q (it names the node's EndpointSlice shard)", ih.NodeName, gateNodeOptions().nodeName)
 			}
 			switch b := ih.Binder.(type) {
-			case *netbind.Netd:
+			case netdBinder:
 				if !tc.wantNetd {
-					t.Fatalf("ingress Binder = *netbind.Netd, want in-process (netd grants a wildcard only below 1024)")
+					t.Fatalf("ingress Binder = netdBinder, want in-process (netd grants a wildcard only below 1024)")
 				}
-				if b.Client == nil {
+				if b.netd == nil || b.netd.Client == nil {
 					t.Fatal("the netd binder must carry a wire client for the configured socket")
 				}
 			case netbind.Direct:
@@ -365,8 +365,8 @@ func TestIngressHostBindsThroughNetdWhenPresent(t *testing.T) {
 				if !tc.wantSplitByPort {
 					t.Fatalf("ingress Binder = portSplitBinder, want a single binder")
 				}
-				if _, ok := b.privileged.(*netbind.Netd); !ok {
-					t.Errorf("split binder privileged leg = %T, want *netbind.Netd", b.privileged)
+				if _, ok := b.privileged.(netdBinder); !ok {
+					t.Errorf("split binder privileged leg = %T, want netdBinder", b.privileged)
 				}
 				if _, ok := b.unprivileged.(netbind.Direct); !ok {
 					t.Errorf("split binder unprivileged leg = %T, want netbind.Direct", b.unprivileged)
@@ -499,5 +499,25 @@ func TestLBHosterNeedsTheDatapath(t *testing.T) {
 	stop()
 	if n := len(cs.Actions()); n != 0 {
 		t.Errorf("a no-datapath node issued %d API actions for svclb, want none", n)
+	}
+}
+
+// TestNetdProtocolKeepsTheWireNames pins the netd adapter's mapping: the
+// ingress host binds IPv4 addresses with the family-pinned "tcp4", and netd's
+// wire accepts only "tcp" and "udp", so a family name must never reach it.
+func TestNetdProtocolKeepsTheWireNames(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"tcp4", "tcp"},
+		{"tcp6", "tcp"},
+		{"tcp", "tcp"},
+		{"udp4", "udp"},
+		{"udp6", "udp"},
+		{"udp", "udp"},
+	} {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := netdProtocol(tc.in); got != tc.want {
+				t.Errorf("netdProtocol(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
