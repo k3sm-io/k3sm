@@ -3,7 +3,7 @@
 Joining more than one Mac into a single k3sm cluster.
 
 > **Status: EXPERIMENTAL** (what that means: [Experimental and alpha](README.md#what-experimental-means)).
-> Multi-node is preview-quality until it graduates in a later release. See [Limitations](limitations.md).
+> See [Limitations](limitations.md).
 
 ## Mesh Model
 

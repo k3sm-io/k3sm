@@ -7,7 +7,7 @@
 # The image is `linux/arm64`, so it runs under the `vm` RuntimeClass — a per-Pod
 # micro-VM on Virtualization.framework — while the node stays a Mac.
 #
-# > The `vm` RuntimeClass is EXPERIMENTAL and preview-quality. See
+# > The `vm` RuntimeClass is EXPERIMENTAL. See
 # > docs/user/vm-runtimeclass.md and docs/user/limitations.md before depending on it.
 #
 # WHY ONE POD AND ONE IMAGE. Every container in a `vm` Pod shares a single root

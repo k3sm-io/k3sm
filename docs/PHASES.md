@@ -1038,7 +1038,7 @@ phases:
             desc: "flip the multi-node/HA status banners in the doc SOURCES and regenerate the site copies; rewrite the tutorial's caveat block so the three 'not yet' bullets retire in favour of the recorded run's date and hardware; set site/data/gates.yaml M3: validated and M6: validated (the 'proven end to end on real hardware by its named test' rank); update the hack/verify-tutorial-live.sh and hack/acceptance/B212.sh skip REASONS from 'not yet proven' to the recorded run (the skips themselves stay — CI still has one machine)."
           - id: M14.6-d2
             done: false
-            desc: "ha.md MUST state the access model honestly: there is no floating apiserver VIP — hack/lab/m6.sh proves survival by switching to server B's kubeconfig, so client failover is a MANUAL KUBECONFIG SWAP, not transparent. A reader who sees the EXPERIMENTAL badge disappear otherwise imports the upstream assumption (apiserver behind a load balancer, clients ride through a server loss); removing the badge without adding this sentence converts a flagged preview-quality gap into a silent surprise."
+            desc: "ha.md MUST state the access model honestly: there is no floating apiserver VIP — hack/lab/m6.sh proves survival by switching to server B's kubeconfig, so client failover is a MANUAL KUBECONFIG SWAP, not transparent. A reader who sees the EXPERIMENTAL badge disappear otherwise imports the upstream assumption (apiserver behind a load balancer, clients ride through a server loss); removing the badge without adding this sentence converts a flagged experimental gap into a silent surprise."
         acceptance:
           - id: M14.6-a1
             met: false
