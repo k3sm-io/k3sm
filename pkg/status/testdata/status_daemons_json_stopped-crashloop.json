@@ -25,7 +25,7 @@
       "detail": "497 runs, last exit 1",
       "remedy": "sudo launchctl kickstart -k system/io.k3sm.server\nk3sm status logs server",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
         "label": "io.k3sm.server",
         "last-exit": "1",
         "log": "level=ERROR msg=\"control plane exited\" err=\"bind: address already in use\"",
@@ -34,6 +34,34 @@
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
         "runs": "497"
+      },
+      "alert": {
+        "cause": "The control-plane daemon keeps exiting and launchd keeps restarting it, so the cluster's control plane is not serving.",
+        "evidence": [
+          "497 runs, last exit 1",
+          "last log line: level=ERROR msg=\"control plane exited\" err=\"bind: address already in use\"",
+          "label: io.k3sm.server",
+          "plist: /Library/LaunchDaemons/io.k3sm.server.plist",
+          "pid: 0",
+          "runs: 497",
+          "last-exit: 1",
+          "log-path: /var/log/k3sm/server.log"
+        ],
+        "fix": [
+          {
+            "step": "Restart the daemon",
+            "command": "sudo launchctl kickstart -k system/io.k3sm.server",
+            "needsAdmin": true,
+            "confirm": false
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs server",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#control-plane-startup-failure"
       }
     }
   ]

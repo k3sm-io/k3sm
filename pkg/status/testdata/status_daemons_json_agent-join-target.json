@@ -33,6 +33,40 @@
         "pid": "1292",
         "plist": "/Library/LaunchDaemons/io.k3sm.agent.plist",
         "runs": "1"
+      },
+      "alert": {
+        "cause": "The worker daemon is running but this Mac has never joined a cluster: it holds no node credential, so it is not a node yet.",
+        "evidence": [
+          "pid 1292 · waiting for a join: this Mac holds no node credential yet",
+          "label: io.k3sm.agent",
+          "plist: /Library/LaunchDaemons/io.k3sm.agent.plist",
+          "pid: 1292",
+          "runs: 1",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/agent.log",
+          "credential: absent",
+          "credential-dir: /var/lib/k3sm/agent"
+        ],
+        "fix": [
+          {
+            "step": "Mint a join token (on the control-plane Mac)",
+            "command": "k3sm token create",
+            "needsAdmin": false,
+            "confirm": true
+          },
+          {
+            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "needsAdmin": true,
+            "confirm": false
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs agent",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "multi-node.md#joining-an-agent"
       }
     }
   ]

@@ -29,6 +29,27 @@
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.netd.plist",
         "runs": "0"
+      },
+      "alert": {
+        "cause": "launchd's answer about the network helper (netd) could not be read, so whether it runs is unknown.",
+        "evidence": [
+          "launchctl reported a state this build cannot read",
+          "label: io.k3sm.netd",
+          "plist: /Library/LaunchDaemons/io.k3sm.netd.plist",
+          "pid: 0",
+          "runs: 0",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/netd.log"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     },
     {
@@ -38,13 +59,34 @@
       "detail": "launchctl reported a state this build cannot read",
       "remedy": "sudo k3sm status",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
         "label": "io.k3sm.server",
         "last-exit": "(never exited)",
         "log-path": "/var/log/k3sm/server.log",
         "pid": "0",
         "plist": "/Library/LaunchDaemons/io.k3sm.server.plist",
         "runs": "0"
+      },
+      "alert": {
+        "cause": "launchd's answer about the control-plane daemon could not be read, so whether it runs is unknown.",
+        "evidence": [
+          "launchctl reported a state this build cannot read",
+          "label: io.k3sm.server",
+          "plist: /Library/LaunchDaemons/io.k3sm.server.plist",
+          "pid: 0",
+          "runs: 0",
+          "last-exit: (never exited)",
+          "log-path: /var/log/k3sm/server.log"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#a-k3sm-daemon-is-not-running"
       }
     },
     {
@@ -62,6 +104,21 @@
         "registry-port": "restricted",
         "release-base": "restricted",
         "tls-sans": "restricted"
+      },
+      "alert": {
+        "cause": "The installed daemon's launchd plist is readable by root only, so this account could not read the settings it runs with; nothing is known to be wrong.",
+        "evidence": [
+          "NodePort addresses restricted · registry port restricted · TLS SANs restricted · mesh IP restricted · kubeconfig name restricted · release base restricted · data volume none · LAN access unknown"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#checks-that-need-sudo"
       }
     },
     {
@@ -69,21 +126,76 @@
       "state": "unknown",
       "severity": "unknown",
       "detail": "no kubeconfig: no k3sm context in ~/.kube/config",
-      "remedy": "sudo k3sm install\nk3sm kubeconfig --write"
+      "remedy": "sudo k3sm install\nk3sm kubeconfig --write",
+      "alert": {
+        "cause": "No kubeconfig was found for this account, so the control plane could not be asked whether it is serving.",
+        "evidence": [
+          "no kubeconfig: no k3sm context in ~/.kube/config"
+        ],
+        "fix": [
+          {
+            "step": "Re-run the install, which is idempotent and puts back what is missing",
+            "command": "sudo k3sm install",
+            "needsAdmin": true,
+            "confirm": false
+          },
+          {
+            "step": "Write the admin kubeconfig into ~/.kube/config",
+            "command": "k3sm kubeconfig --write",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "kubectl-access.md#bundled-path"
+      }
     },
     {
       "name": "node",
       "state": "unknown",
       "severity": "unknown",
       "detail": "apiserver unreachable",
-      "remedy": "k3sm status logs server"
+      "remedy": "k3sm status logs server",
+      "alert": {
+        "cause": "The node list could not be read because the apiserver could not be reached from here; this row clears once the apiserver row does.",
+        "evidence": [
+          "apiserver unreachable"
+        ],
+        "fix": [
+          {
+            "step": "Fix the apiserver row first",
+            "needsAdmin": false,
+            "confirm": false
+          },
+          {
+            "step": "Read the daemon's log for the failure",
+            "command": "k3sm status logs server",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#control-plane-startup-failure"
+      }
     },
     {
       "name": "workloads",
       "state": "unknown",
       "severity": "unknown",
       "detail": "apiserver unreachable",
-      "remedy": "k3sm kubectl get pods -A"
+      "remedy": "k3sm kubectl get pods -A",
+      "alert": {
+        "cause": "The pods could not be listed because the apiserver could not be reached from here; this row clears once the apiserver row does.",
+        "evidence": [
+          "apiserver unreachable"
+        ],
+        "fix": [
+          {
+            "step": "Fix the apiserver row first",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#control-plane-startup-failure"
+      }
     },
     {
       "name": "data-root",
@@ -113,6 +225,22 @@
       "remedy": "sudo k3sm update check",
       "wide": {
         "record": "/nonexistent/k3sm-status-contract/status/update.json"
+      },
+      "alert": {
+        "cause": "No update check is recorded yet, so whether a newer release exists is unknown.",
+        "evidence": [
+          "no update check is recorded yet (the server checks once an hour)",
+          "record: /nonexistent/\u003credacted\u003e"
+        ],
+        "fix": [
+          {
+            "step": "Check for a new release now",
+            "command": "sudo k3sm update check",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "upgrade.md#checking-for-an-update"
       }
     },
     {
@@ -120,14 +248,50 @@
       "state": "missing",
       "severity": "warn",
       "detail": "no k3sm context in ~/.kube/config",
-      "remedy": "sudo k3sm install\nk3sm kubeconfig --write"
+      "remedy": "sudo k3sm install\nk3sm kubeconfig --write",
+      "alert": {
+        "cause": "No kubeconfig was found for this account, so kubectl and this report cannot reach the cluster as you.",
+        "evidence": [
+          "no k3sm context in ~/.kube/config"
+        ],
+        "fix": [
+          {
+            "step": "Re-run the install, which is idempotent and puts back what is missing",
+            "command": "sudo k3sm install",
+            "needsAdmin": true,
+            "confirm": false
+          },
+          {
+            "step": "Write the admin kubeconfig into ~/.kube/config",
+            "command": "k3sm kubeconfig --write",
+            "needsAdmin": false,
+            "confirm": false
+          }
+        ],
+        "docs": "kubectl-access.md#bundled-path"
+      }
     },
     {
       "name": "runtimed",
       "state": "needs-admin",
       "severity": "skip",
       "detail": "needs sudo: the runtime daemon's socket is owner-only",
-      "remedy": "sudo k3sm status"
+      "remedy": "sudo k3sm status",
+      "alert": {
+        "cause": "The runtime daemon's socket is owner-only, so only an administrator can ask it whether it is healthy; nothing is known to be wrong.",
+        "evidence": [
+          "needs sudo: the runtime daemon's socket is owner-only"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#checks-that-need-sudo"
+      }
     },
     {
       "name": "dns",

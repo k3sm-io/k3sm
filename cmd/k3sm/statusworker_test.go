@@ -843,6 +843,12 @@ func TestStatusOnAWorkerRendersNoControlPlaneRows(t *testing.T) {
 			Remedy:   serverLog,
 			Wide:     map[string]string{"path": executor.StateDBPath(rollback.paths.WorkDir)},
 		}
+		// The alert is the row's own explanation of the same facts, pinned by
+		// the status package; here only its presence is the contract.
+		if ds.Alert == nil {
+			t.Errorf("server datastore row (non-wal) carries no alert")
+		}
+		ds.Alert = nil
 		if !reflect.DeepEqual(ds, want) {
 			t.Errorf("server datastore row (non-wal) =\n %+v\nwant\n %+v", ds, want)
 		}

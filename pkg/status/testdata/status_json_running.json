@@ -36,7 +36,7 @@
       "severity": "ok",
       "detail": "pid 1292",
       "wide": {
-        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.36.5",
+        "cp-binaries": "unknown-staged (no kube.version marker; staged before markers existed), pinned v1.37.1",
         "label": "io.k3sm.server",
         "last-exit": "(never exited)",
         "log-path": "/var/log/k3sm/server.log",
@@ -111,6 +111,22 @@
       "remedy": "sudo k3sm update check",
       "wide": {
         "record": "/nonexistent/k3sm-status-contract/status/update.json"
+      },
+      "alert": {
+        "cause": "No update check is recorded yet, so whether a newer release exists is unknown.",
+        "evidence": [
+          "no update check is recorded yet (the server checks once an hour)",
+          "record: /nonexistent/\u003credacted\u003e"
+        ],
+        "fix": [
+          {
+            "step": "Check for a new release now",
+            "command": "sudo k3sm update check",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "upgrade.md#checking-for-an-update"
       }
     },
     {
@@ -124,7 +140,22 @@
       "state": "needs-admin",
       "severity": "skip",
       "detail": "needs sudo: the runtime daemon's socket is owner-only",
-      "remedy": "sudo k3sm status"
+      "remedy": "sudo k3sm status",
+      "alert": {
+        "cause": "The runtime daemon's socket is owner-only, so only an administrator can ask it whether it is healthy; nothing is known to be wrong.",
+        "evidence": [
+          "needs sudo: the runtime daemon's socket is owner-only"
+        ],
+        "fix": [
+          {
+            "step": "Run the report as an administrator, which can read what this account cannot",
+            "command": "sudo k3sm status",
+            "needsAdmin": true,
+            "confirm": false
+          }
+        ],
+        "docs": "troubleshooting.md#checks-that-need-sudo"
+      }
     },
     {
       "name": "dns",

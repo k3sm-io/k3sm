@@ -193,7 +193,8 @@ sudo launchctl kickstart -k system/io.k3sm.server
 
 If the volume was never declared with a k3sm record (an `/etc/fstab` line you wrote yourself, with
 no `sudo k3sm install --data-volume` run since), `datavol mount` has nothing to work from and you
-mount it by hand instead:
+mount it by hand instead. Check first: `ls /var/lib/k3sm/run` must list only the netd socket before
+you remove it, because anything else there is data the remove would delete.
 
 ```sh
 diskutil info /var/lib/k3sm                     # the Device Node line names the volume
@@ -519,7 +520,9 @@ Work through this in order.
 - **If the Mac is coming back**, stop after applying the taint below and remove it once the node
   rejoins. Deleting the node is only for a Mac that is actually leaving the cluster; see
   [Removing a worker](multi-node.md#removing-a-worker) for that flow instead.
-- **Apply the out-of-service taint** once you are sure the Mac is not coming back on its own:
+- **Apply the out-of-service taint** once you are sure the Mac is not coming back on its own.
+  Check first: the Mac is powered off or disconnected for good, not asleep, because the taint lets
+  its Pods be deleted while their containers may still run there:
 
   ```sh
   kubectl taint node <name> node.kubernetes.io/out-of-service=nodeshutdown:NoExecute
@@ -536,7 +539,8 @@ Work through this in order.
   kubectl taint node <name> node.kubernetes.io/out-of-service:NoExecute-
   ```
 - **Force-delete as a last resort**, only if a Pod is still stuck after the taint, or you cannot
-  wait for it:
+  wait for it. Check first: the Pod has no attached volume another copy could write to at the same
+  time:
 
   ```sh
   kubectl delete pod <name> --grace-period=0 --force
@@ -551,6 +555,209 @@ Work through this in order.
   holds up the whole rollout. Set `maxSurge: 1` and `maxUnavailable: 0` on the DaemonSet's
   `updateStrategy.rollingUpdate` so a new Pod comes up beside the old one instead of waiting for a
   slot an offline node will never free.
+
+## Checks That Need sudo
+
+Some rows read files or sockets that only root may open: the runtime daemon's socket, the datastore
+file, the serving certificate, the etcd and mesh records, the installed daemon's plist. Run as an
+ordinary account, `k3sm status` reports those rows as `needs-admin` (or `unknown` with `sudo k3sm
+status` as the remedy) instead of guessing. A `needs-admin` row never moves the verdict, and it does
+not mean anything is wrong. Run the same report as an administrator to get the answer:
+
+```sh
+sudo k3sm status
+```
+
+If the row is still `unknown` under sudo, the file it reads is missing or damaged, and the row's
+detail names it.
+
+## A k3sm Daemon Is Not Running
+
+The `netd`, `server` and `agent` rows report what launchd says about each LaunchDaemon. Read the
+state first:
+
+- **`not-loaded`**: nothing runs the daemon. The install is incomplete or was partly removed; `sudo
+  k3sm install` puts it back and is safe to re-run.
+- **`disabled`**: launchd will not start it, not even at boot. If you ran `k3sm stop`, that is on
+  purpose and `sudo k3sm start` brings it back (see [Stopping and starting](stop-start.md)).
+  Otherwise re-enable it with `sudo launchctl enable system/<label>`, then restart it.
+- **`stopped`**: it is loaded but not running. Restart it with `sudo launchctl kickstart -k
+  system/<label>`.
+- **`failed`** or **`crash-loop`**: it exited with an error. The row quotes the last line of its
+  log, and `k3sm status logs <row>` prints more. Fix what the log names, then restart it.
+- **`unknown`** with a warning: launchd says it is running but its process is gone. Restart it.
+
+The labels are `io.k3sm.netd`, `io.k3sm.server` on a control-plane Mac and `io.k3sm.agent` on a
+worker. When netd is down, pods on that Mac lose their network and cluster names stop resolving on
+the host.
+
+## The Crash-Loop Breaker Tripped
+
+When a control-plane component crashes again and again, or the control plane fails to come up
+several times in a row, the server daemon parks itself: it stays running so launchd does not keep
+restarting it, but it serves nothing. `k3sm status` reports the server row as `crash-loop` with the
+time the breaker tripped.
+
+1. Read what it recorded. The row's remedy names the crash-loop record; each entry carries the
+   failing component and the tail of its log:
+
+   ```sh
+   k3sm status logs server
+   sudo tail -n 50 /var/lib/k3sm/server/crashloop.json
+   ```
+
+2. Fix the fault it names. A fault that cannot heal on retry (a bad flag, a missing file) is
+   quoted in the row's remedy with the command that repairs it. A breaker tripped by repeated loss
+   of the leader lease points at etcd quorum or an overloaded apiserver; check the etcd and
+   apiserver rows on every server.
+3. Clear the record. The parked daemon notices and restarts the control plane by itself:
+
+   ```sh
+   sudo k3sm server --clear-crashloop
+   ```
+
+## The Staged Control Plane Does Not Match This Build
+
+Each k3sm build carries the Kubernetes control-plane binaries it was tested with, and stages them
+when it installs. The server row warns when the binaries that are actually serving differ from the
+ones this build pins:
+
+- **Older than this build**: k3sm was upgraded but the control-plane binaries were not re-staged,
+  so the previous Kubernetes version is still serving. Re-run `sudo k3sm install`; the next start
+  of the server picks up the new set.
+- **Newer than this build**: the daemon refuses to downgrade the control plane and keeps serving
+  the newer set. Install a k3sm release whose control-plane version is at or above the staged one.
+
+## A Node Is Not Ready
+
+The `node` row counts the cluster's nodes that report `Ready`, and the `heartbeat` row says
+whether this Mac's own node still reports in on time. A node stops being `Ready` when its daemon
+stopped, its Mac is asleep or off the network, or its credential expired.
+
+```sh
+k3sm kubectl get nodes
+k3sm kubectl describe node <name>      # the conditions say which check failed and since when
+```
+
+- On the Mac that is not ready, run `k3sm status`. Its daemon rows and its `apiserver` row usually
+  name the cause.
+- A stale heartbeat on a running node points at the node daemon itself. Read `k3sm status logs
+  server` (or `agent` on a worker) and restart it if it is wedged.
+- A worker whose credential expired needs to join again; see [Multi-node](multi-node.md#joining-an-agent).
+- A Mac that is gone for good leaves its pods stuck terminating; see
+  [the section below](#a-node-went-offline-and-pods-are-stuck-terminating).
+
+## The etcd Member Is Unhealthy
+
+On a server that runs embedded etcd, the `etcd` row reads the member's status record, which the
+running server rewrites every minute. What it reports, and what to do:
+
+- **NOSPACE alarm, or nearing the quota**: the database reached its backend quota and the cluster
+  turned read-only, or is about to. Compact the keyspace to the current revision, defragment every
+  member, then disarm the alarm. Writes resume only after the disarm.
+- **No leader**: the member cannot see a majority of servers, so the cluster accepts no writes.
+  Start the other servers; each waits for its peers. If a majority is gone for good, stop the
+  daemon on one survivor, run `sudo k3sm server --cluster-reset` there, and start it again. Check
+  first: take a snapshot of the survivor, and be sure the other servers will not come back, because
+  a reset makes this server a cluster of one and the others must re-join with wiped etcd data.
+- **Peer address drift**: the member is registered under an address that is no longer this
+  server's, so its peers cannot reach it. Restore the previous address (`--etcd-peer-ip`); server
+  addresses must be stable, for example through a DHCP reservation. Otherwise remove the member
+  through another server and re-join this one with a wiped etcd data directory.
+- **Another alarm, such as CORRUPT**: read `k3sm status logs server` for the cause. A corrupt member
+  must be removed and re-joined with a wiped etcd data directory.
+- **The record is stale or does not parse**: the server stopped refreshing it. Read the server log
+  for the reason.
+
+See [High availability](ha.md) and [Backup & restore](backup-restore.md) before you remove or
+reset a member.
+
+## A Service Routes to the Wrong Backends
+
+The `services` row compares the Service proxy's own record of what it routes with the Ready
+endpoints the API holds. When they differ, traffic for those Service ports may reach the wrong
+pods, or none.
+
+- Wait a minute. The proxy re-lists Services and EndpointSlices every 30 seconds and repairs a
+  lost update by itself.
+- If the row still differs, restart the server:
+
+  ```sh
+  sudo launchctl kickstart -k system/io.k3sm.server
+  ```
+
+- If the row says Services could not be listed, check that the API answers for your account:
+  `k3sm kubectl get endpointslices -A`.
+- Right after a start the row may say the proxy has not recorded yet. It does so 30 seconds after
+  the server starts.
+
+## The Ingest Registry
+
+A server started with `--registry-port` runs a node-local registry and records whether it is
+serving. The `ingest-registry` row checks that record against the registry itself:
+
+- **`down`**: the registry was recorded as serving but does not answer on its port, so pushes and
+  pulls through it fail. Restart the server, which restarts the registry:
+  `sudo launchctl kickstart -k system/io.k3sm.server`.
+- **`disabled`**: the server gave up starting it, and the row's detail says why (for example, the
+  port is already in use). Fix that cause, or choose another `--registry-port`, then restart the
+  server.
+- **The record does not parse, or names an unknown state**: restart the server, which rewrites the
+  record. An unknown state means the record was written by a newer k3sm than the one you ran the
+  report with.
+
+See [Node-local registry](registry.md) and
+[A Pod Cannot Pull From the Node-Local Registry](#a-pod-cannot-pull-from-the-node-local-registry).
+
+## The Runtime Daemon Is Unhealthy
+
+The runtime daemon starts, stops and inspects the containers on its node. Its socket is
+owner-only, so an ordinary account sees the `runtimed` row as `needs-admin`; run `sudo k3sm
+status` for the answer. When it does not answer, or reports itself unhealthy, pods on that node
+may not start. The row names the conditions that are not true. Restart the node daemon, which
+restarts the runtime with it:
+
+```sh
+sudo launchctl kickstart -k system/io.k3sm.server   # io.k3sm.agent on a worker
+```
+
+If it stays unhealthy, read `k3sm status logs server` (or `agent`). A `NetworkReady` condition
+that is false points at netd: check the `netd` row.
+
+## The Node Resolver Does Not Answer
+
+Cluster names (`*.svc` and the cluster domain) resolve through a resolver on each node, which netd
+publishes into the host's resolver configuration. Two rows cover it:
+
+- **`dns`** asks the resolver for the `kubernetes` Service. If it does not answer over UDP, or
+  answers with no address, restart the node daemon:
+  `sudo launchctl kickstart -k system/io.k3sm.server` (`io.k3sm.agent` on a worker). If it answers
+  over TCP but not UDP, its UDP socket stopped receiving, and the same restart fixes it. A
+  `--dns-vip` that is not an IP address serves no resolver at all; re-run `sudo k3sm install` with a
+  valid address, or without the flag.
+- **`node-resolver`** checks that the host routes cluster names to that resolver. If the entry is
+  missing, or netd is not running to maintain it, restart netd, which republishes it:
+
+  ```sh
+  sudo launchctl kickstart -k system/io.k3sm.netd
+  ```
+
+  `scutil --dns` shows the host resolver configuration directly.
+
+For names that fail only inside a pod, see
+[DNS From Inside a Pod Does Not Resolve Cluster Names](#dns-from-inside-a-pod-does-not-resolve-cluster-names).
+
+## Host Binaries Changed After a macOS Update
+
+Pods that start through `/bin/sh` run re-signed copies of a few host binaries, which carry k3sm's
+DNS and path shims. A macOS update replaces the originals, and the copies then lag behind. The
+`shadow-shells` row reports `drift` with the binaries that changed, `missing` when no copies exist,
+and a warning when the copies come from an older install that lacks some this k3sm makes. Re-run
+the install, which re-makes the set from the current host binaries:
+
+```sh
+sudo k3sm install
+```
 
 ## Next
 
