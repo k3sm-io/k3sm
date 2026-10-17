@@ -17,6 +17,7 @@ limitations under the License.
 package install
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -24,6 +25,9 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
+
+	"k3sm.io/k3sm/pkg/version"
 )
 
 var (
@@ -37,7 +41,10 @@ var (
 // checkStagedVersion refuses an unversioned staged build, and a staged version
 // lower than the installed one unless AllowDowngrade. An installed version
 // that cannot be read or compared is treated as a downgrade: the override is
-// the same flag, and the default is to refuse.
+// the same flag, and the default is to refuse. The installed version is what
+// the installed binary reports, so this guards against operator error, not
+// against a tampered install: a tampered binary can lie. It runs only after
+// the signing checks have passed.
 func checkStagedVersion(cfg Config) error {
 	staged, ok := parseReleaseVersion(cfg.StagedVersion)
 	if !ok {
@@ -178,6 +185,68 @@ func comparePreIdent(a, b string) int {
 		return 1
 	}
 	return strings.Compare(a, b)
+}
+
+// binaryVersionTimeout bounds one `<binary> version --short` run.
+const binaryVersionTimeout = 10 * time.Second
+
+// maxVersionOutput bounds what a version run may print before it is
+// disregarded.
+const maxVersionOutput = 4 << 10
+
+// versionRunner runs the k3sm binary at path as `version --short` and returns
+// what it printed on stdout.
+type versionRunner func(ctx context.Context, path string) ([]byte, error)
+
+// ErrMalformedVersion reports that the installed binary answered
+// `version --short` with something that is not one release tag. The install
+// is refused rather than guessed at from the build information.
+var ErrMalformedVersion = errors.New("the binary's version answer is malformed")
+
+// readBinaryVersion is the release version of the k3sm binary at path, as the
+// binary itself reports it. It runs the binary (`version --short`, bounded by
+// binaryVersionTimeout) because that is the one answer that cannot depend on
+// how it was built: a release build is made with -trimpath, under which Go
+// records no -ldflags, so the version stamp is not in the build information
+// and stampedVersion would read the module's pseudo-version instead. Only
+// when the run gives no answer (it fails, prints nothing, or prints more than
+// maxVersionOutput) is the build information read; an answer that is not one
+// valid tag is ErrMalformedVersion.
+func readBinaryVersion(path string, run versionRunner, readBI func(string) (*debug.BuildInfo, error)) (string, error) {
+	if run != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), binaryVersionTimeout)
+		out, err := run(ctx, path)
+		cancel()
+		if err == nil && len(out) > 0 && len(out) <= maxVersionOutput {
+			v, ok := versionFromOutput(out)
+			if !ok {
+				return "", fmt.Errorf("%s: %w", path, ErrMalformedVersion)
+			}
+			return v, nil
+		}
+	}
+	bi, err := readBI(path)
+	if err != nil {
+		return "", fmt.Errorf("read the build information of %s: %w", path, err)
+	}
+	return stampedVersion(bi), nil
+}
+
+// versionFromOutput is the version a `version --short` run printed: one line
+// that is a valid tag. A binary from before --short ignores the flag and
+// prints the full report, whose first line is exactly "k3sm <version>"; that
+// line is read the same way.
+func versionFromOutput(out []byte) (string, bool) {
+	first, rest, _ := strings.Cut(string(out), "\n")
+	if after, ok := strings.CutPrefix(first, "k3sm "); ok {
+		first = after
+	} else if strings.TrimSpace(rest) != "" {
+		return "", false
+	}
+	if !version.ValidTag(first) {
+		return "", false
+	}
+	return first, true
 }
 
 // versionStampPrefix is the -X flag the release pipeline stamps the version

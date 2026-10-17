@@ -61,7 +61,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   snapshot    back up, restore, list and prune datastore snapshots (snapshot save|restore|ls|delete|prune)
   secrets-encrypt  report secrets encryption at rest (secrets-encrypt status)
   interconnect     arm or disarm the Thunderbolt cable as an opt-in network (interconnect enable|disable)
-  version     print version
+  version     print version (--short: the release version alone)
 
 See docs/DESIGN.md for the roadmap.
 `
@@ -74,6 +74,12 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "version", "-v", "--version":
+		// --short prints the release version alone, the machine-readable
+		// answer the installer reads off an installed binary.
+		if len(os.Args) > 2 && os.Args[2] == "--short" {
+			fmt.Println(ver.Version)
+			return
+		}
 		fmt.Print(ver)
 	case "-h", "--help", "help":
 		fmt.Printf(usage, ver.Version)

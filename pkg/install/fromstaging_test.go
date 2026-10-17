@@ -123,6 +123,7 @@ type fakeSigner struct {
 	ids      map[string]string
 	errs     map[string]error
 	notDevID map[string]bool
+	rec      *fakeStagingFS // when set, TeamID calls are logged in rec.calls
 }
 
 func (s fakeSigner) DeveloperID(_ context.Context, path, _ string) (bool, error) {
@@ -130,6 +131,9 @@ func (s fakeSigner) DeveloperID(_ context.Context, path, _ string) (bool, error)
 }
 
 func (s fakeSigner) TeamID(_ context.Context, path string) (string, error) {
+	if s.rec != nil {
+		s.rec.calls = append(s.rec.calls, "TeamID:"+path)
+	}
 	if err := s.errs[path]; err != nil {
 		return "", err
 	}
@@ -1072,4 +1076,104 @@ func TestCompareReleaseVersions(t *testing.T) {
 			t.Errorf("CompareReleaseVersions(%q, %q) = %d, %v; want %d, %v", tc.a, tc.b, cmp, ok, tc.cmp, tc.ok)
 		}
 	}
+}
+
+// TestReadBinaryVersion pins how the installed binary's version is read: the
+// binary's own `version --short` answer wins, so a -trimpath release build
+// (no recorded -ldflags, so the module pseudo-version in its build info)
+// reports its real release version; an older binary that prints the full
+// report is read from its first line; and only a run that gives no answer
+// falls back to the build information.
+func TestReadBinaryVersion(t *testing.T) {
+	t.Parallel()
+	trimpath := &debug.BuildInfo{Main: debug.Module{Path: "k3sm.io/k3sm", Version: "v0.1.8-0.20261016044636-182e77c2731a"},
+		Settings: []debug.BuildSetting{{Key: "-trimpath", Value: "true"}}}
+	readBI := func(string) (*debug.BuildInfo, error) { return trimpath, nil }
+	answer := func(out string, err error) versionRunner {
+		return func(_ context.Context, path string) ([]byte, error) {
+			if path != "/Library/k3sm/k3sm" {
+				t.Errorf("ran %s", path)
+			}
+			return []byte(out), err
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		run  versionRunner
+		want string
+	}{
+		{"the binary's --short answer", answer("0.1.8-rc.0\n", nil), "0.1.8-rc.0"},
+		{"an older binary's full report", answer("k3sm 0.1.8-rc.0\n  commit:        182e77c\n  go:            go1.27.2\n", nil), "0.1.8-rc.0"},
+		{"a failed run falls back to the build info", answer("", errors.New("exit status 2")), "v0.1.8-0.20261016044636-182e77c2731a"},
+		{"empty output falls back", answer("", nil), "v0.1.8-0.20261016044636-182e77c2731a"},
+		{"output over the cap falls back", answer(strings.Repeat("a", maxVersionOutput+1), nil), "v0.1.8-0.20261016044636-182e77c2731a"},
+		{"no runner reads the build info", nil, "v0.1.8-0.20261016044636-182e77c2731a"},
+	} {
+		got, err := readBinaryVersion("/Library/k3sm/k3sm", tc.run, readBI)
+		if err != nil || got != tc.want {
+			t.Errorf("%s: readBinaryVersion = %q, %v; want %q", tc.name, got, err, tc.want)
+		}
+	}
+	for _, bad := range []string{"0.1.8\nnoise\n", "version 0.1.8\n"} {
+		if _, err := readBinaryVersion("/Library/k3sm/k3sm", answer(bad, nil), readBI); !errors.Is(err, ErrMalformedVersion) {
+			t.Errorf("answer %q: err = %v, want ErrMalformedVersion", bad, err)
+		}
+	}
+	if _, ok := parseReleaseVersion("v0.1.8-0.20261016044636-182e77c2731a"); ok {
+		t.Error("the pseudo-version parsed as a release, so the fallback test proves nothing")
+	}
+	if _, ok := parseReleaseVersion("0.1.8-rc.0"); !ok {
+		t.Error("the --short answer is not a release version")
+	}
+	failing := func(string) (*debug.BuildInfo, error) { return nil, errors.New("not a Go binary") }
+	if _, err := readBinaryVersion("/Library/k3sm/k3sm", answer("", errors.New("exec format error")), failing); err == nil {
+		t.Error("no run answer and no build info returned no error")
+	}
+}
+
+// TestPreflightChecksSignaturesBeforeRunningTheInstalledBinary pins the
+// order: the installed binary is executed (BinaryVersion) only after every
+// signing check has run, and a tree the signing checks refuse never gets
+// that far.
+func TestPreflightChecksSignaturesBeforeRunningTheInstalledBinary(t *testing.T) {
+	t.Parallel()
+	t.Run("every TeamID call precedes BinaryVersion", func(t *testing.T) {
+		t.Parallel()
+		sfs, cfg := stagedFixture()
+		installed := cfg.installedBinary()
+		sfs.versions[installed] = "0.3.0"
+		cfg.Signer = fakeSigner{ids: signedTree(map[string]string{installed: testTeamID}), rec: sfs}
+		cfg.RequireTeamSignature = true
+		if err := preflightFromStaging(context.Background(), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		lastTeam, version := -1, -1
+		for i, c := range sfs.calls {
+			switch {
+			case strings.HasPrefix(c, "TeamID:"):
+				lastTeam = i
+			case c == "BinaryVersion:"+installed && version < 0:
+				version = i
+			}
+		}
+		if lastTeam < 0 || version < 0 || lastTeam > version {
+			t.Errorf("TeamID last at %d, BinaryVersion at %d; calls = %v", lastTeam, version, sfs.calls)
+		}
+	})
+	t.Run("a refused signature never runs the installed binary", func(t *testing.T) {
+		t.Parallel()
+		sfs, cfg := stagedFixture()
+		installed := cfg.installedBinary()
+		sfs.versions[installed] = "0.3.0"
+		cfg.Signer = fakeSigner{ids: signedTree(nil), errs: map[string]error{testStagedExe: ErrNoTeamID}, rec: sfs}
+		cfg.RequireTeamSignature = true
+		if err := preflightFromStaging(context.Background(), &cfg); err == nil {
+			t.Fatal("an unsigned staged k3sm was accepted")
+		}
+		for _, c := range sfs.calls {
+			if strings.HasPrefix(c, "BinaryVersion:") {
+				t.Errorf("the installed binary was run after a refused signature; calls = %v", sfs.calls)
+			}
+		}
+	})
 }

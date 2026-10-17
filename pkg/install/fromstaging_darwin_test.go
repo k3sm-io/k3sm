@@ -18,12 +18,17 @@ package install
 
 import (
 	"context"
+	"debug/buildinfo"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -108,7 +113,9 @@ func TestDarwinStagingFSOnDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, err := sfs.BinaryVersion(self); err != nil || v == "" {
+	// The test binary is not a k3sm (running it with arguments would run the
+	// tests again), so only the build-information fallback is exercised.
+	if v, err := readBinaryVersion(self, nil, buildinfo.ReadFile); err != nil || v == "" {
 		t.Errorf("BinaryVersion(test binary) = %q, %v, want a version string", v, err)
 	}
 	if ok, err := sfs.MachO(self); err != nil || !ok {
@@ -189,4 +196,95 @@ func TestCodesignTeamIDMissing(t *testing.T) {
 	if _, err := (CodesignTeamID{}).TeamID(context.Background(), filepath.Join(t.TempDir(), "missing")); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("TeamID(missing) = %v, want fs.ErrNotExist", err)
 	}
+}
+
+// TestDarwinBinaryVersionRunsTheBinary proves BinaryVersion asks the binary:
+// a script answering `version --short` has no Go build information at all, so
+// its answer can only have come from running it, with the minimal environment
+// (no HOME, no inherited variables).
+func TestDarwinBinaryVersionRunsTheBinary(t *testing.T) {
+	t.Setenv("K3SM_LEAK_CHECK", "inherited")
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "k3sm")
+	script := "#!/bin/sh\n[ \"$1 $2\" = \"version --short\" ] || exit 2\n[ -z \"$K3SM_LEAK_CHECK$HOME\" ] || exit 3\necho 0.1.8-rc.0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := binaryVersionOwnedBy(bin, uint32(os.Getuid()))
+	if err != nil || got != "0.1.8-rc.0" {
+		t.Fatalf("BinaryVersion = %q, %v; want the binary's own answer", got, err)
+	}
+	if _, err := (DarwinStagingFS{}).BinaryVersion(filepath.Join(dir, "absent")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("BinaryVersion of an absent binary = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// TestDarwinBinaryVersionRefusesUnsafeBinary pins the checks made before the
+// installed binary is run as root: a symlink, a file of another owner and a
+// group-writable file are refused without being executed.
+func TestDarwinBinaryVersionRefusesUnsafeBinary(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "ran")
+	script := "#!/bin/sh\ntouch " + marker + "\necho 0.1.8-rc.0\n"
+	bin := filepath.Join(dir, "k3sm")
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(bin, link); err != nil {
+		t.Fatal(err)
+	}
+	uid := uint32(os.Getuid())
+	if _, err := binaryVersionOwnedBy(link, uid); err == nil {
+		t.Error("a symlink was run")
+	}
+	if _, err := binaryVersionOwnedBy(bin, uid+1); err == nil {
+		t.Error("a file of another owner was run")
+	}
+	if _, err := (DarwinStagingFS{}).BinaryVersion(bin); err == nil && os.Getuid() != 0 {
+		t.Error("a non-root-owned file was run by BinaryVersion")
+	}
+	gw := filepath.Join(dir, "gw")
+	if err := os.WriteFile(gw, []byte(script), 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(gw, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := binaryVersionOwnedBy(gw, uid); err == nil {
+		t.Error("a group-writable file was run")
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("an unsafe binary was executed")
+	}
+}
+
+// TestDarwinBinaryVersionKillsForkedChildren proves a binary that forks a
+// sleeper does not leave it running once the version run is over.
+func TestDarwinBinaryVersionKillsForkedChildren(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	bin := filepath.Join(dir, "k3sm")
+	script := "#!/bin/sh\nsleep 60 >/dev/null 2>&1 </dev/null &\necho $! > " + pidFile + "\necho 0.1.8-rc.0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := binaryVersionOwnedBy(bin, uint32(os.Getuid())); err != nil || got != "0.1.8-rc.0" {
+		t.Fatalf("BinaryVersion = %q, %v", got, err)
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	t.Errorf("the forked sleeper %d outlived the version run", pid)
 }
