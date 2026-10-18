@@ -48,7 +48,7 @@ import (
 var (
 	// reportRequired and reportOptional are the top-level keys of `k3sm status
 	// -o json`. The optional ones are omitted when empty.
-	reportRequired = []string{"schemaVersion", "verdict", "role", "summary", "rows", "version", "host", "timestamp"}
+	reportRequired = []string{"schemaVersion", "capabilities", "verdict", "role", "summary", "rows", "version", "host", "timestamp"}
 	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy", "network", "workers", "joinTarget"}
 	// workerRequired and workerOptional are the keys of each entry of the
 	// optional workers list; version is omitted while a kubelet has reported
@@ -718,6 +718,9 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotProbe.Network, probe.Network) {
 				t.Errorf("probe network: collected %+v, golden %+v", networkOf(gotProbe.Network), networkOf(probe.Network))
+			}
+			if !reflect.DeepEqual(gotFull.Capabilities, full.Capabilities) || !reflect.DeepEqual(full.Capabilities, []string{CapabilityWatchJSON}) {
+				t.Errorf("capabilities: collected %v, golden %v, want [%s]", gotFull.Capabilities, full.Capabilities, CapabilityWatchJSON)
 			}
 			if gotFull.JoinTarget != full.JoinTarget {
 				t.Errorf("joinTarget: collected %q, golden %q", gotFull.JoinTarget, full.JoinTarget)

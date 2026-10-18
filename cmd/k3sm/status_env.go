@@ -98,6 +98,7 @@ func newStatusRunner(o statusOptions) statusRunner {
 		logTargets: defaultLogTargets(role),
 		top:        lazyTop(newTopCollector),
 		appPresent: func() bool { return fileExists(appBundlePath) },
+		stream:     newStatusStream(o),
 	}
 }
 

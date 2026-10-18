@@ -8,6 +8,7 @@ and what a version bump promises.
 k3sm status -o json            # the full report
 k3sm status daemons -o json    # the daemons probe
 k3sm alerts -o json            # only the rows that need attention, with their alerts
+k3sm status --watch -o json    # the full report as a stream, one line per change (stdout not a terminal)
 ```
 
 The full report probes every subsystem: the LaunchDaemons, the apiserver, the node, the workloads,
@@ -52,6 +53,61 @@ verdict, not a failure to answer, so read stdout first and use the exit code as 
 | 4 | `degraded` |
 | 5 | `not-installed` |
 | 6 | `unknown` |
+| 7 | the stream only: the apiserver refused the credential (see [The stream](#the-stream)) |
+
+## The stream
+
+When stdout is not a terminal, `k3sm status --watch -o json` writes the full report as a stream
+instead of refusing: one JSON object per line (NDJSON), each a frame. A k3sm that offers it says so
+with `watch-json` in the one-shot report's `capabilities`, so check that rather than trying the
+command and reading its error. Without `-o json`, or with a view (`daemons`, `cluster`, `top`), a
+redirected `--watch` is still refused with exit 2.
+
+```json
+{"kind":"report","schemaVersion":1,"report":{"schemaVersion":1,"capabilities":["watch-json"],"verdict":"running","...":"..."}}
+{"kind":"error","schemaVersion":1,"code":"apiserver-unreachable","message":"..."}
+{"kind":"closing","schemaVersion":1,"code":"lifetime","message":"the stream ends after 31m12s; start a new one"}
+```
+
+| field | type | notes |
+|---|---|---|
+| `kind` | string | `report`, `error` or `closing` |
+| `schemaVersion` | number | `1`, the same contract version as the report |
+| `report` | object | on a `report` frame: the full report, the same shape `k3sm status -o json` prints |
+| `code` | string | on an `error` or `closing` frame: what happened, from the table below |
+| `message` | string | on an `error` or `closing` frame: one sentence for a person; do not parse it |
+
+A line is at most 2 MiB, newline included. A report that would not fit is replaced by a
+`frame-too-large` error frame.
+
+When frames are written:
+
+- the first report at once;
+- after that, a report only when it says something the last one did not: a different verdict,
+  role or summary, or a row whose name, state, severity or detail changed. The timestamp, the
+  build, a row's `wide` and `alert`, and ages such as "posted 12s ago" are not compared;
+- the report is collected again when a node or Pod changes (a watch with the same credential the
+  report uses), and every 30 seconds whatever happens, which is how a change that no watch sees
+  (a daemon, a certificate, DNS) arrives. Changes are batched for 250 ms, and the report is
+  collected at most twice a second;
+- a row that needs root (`needs-admin`) stays `needs-admin` in every frame of a stream run without
+  `sudo`.
+
+The stream ends on its own after about 30 minutes (a few minutes of random spread, so streams
+started together do not end together): it writes a `closing` frame and exits 0. Start a new one
+then. An exit without a `closing` frame is a crash or a kill.
+
+| code | frame | meaning |
+|---|---|---|
+| `auth-refused` | `error` | the apiserver refused the credential. The stream exits 7 right after. Running it again with the same credential will be refused again, so do not retry it; fix the kubeconfig |
+| `apiserver-unreachable` | `error` | the node and Pod watch could not reach the apiserver. It keeps retrying, and the 30-second collect keeps the reports coming |
+| `watch-forbidden` | `error` | this credential may not list or watch nodes or Pods. The stream carries on with the 30-second collect alone |
+| `no-credentials` | `error` | there is no kubeconfig to watch with. The stream carries on with the 30-second collect alone |
+| `frame-too-large` | `error` | a report did not fit in 2 MiB |
+| `lifetime` | `closing` | the stream reached its lifetime and exits 0 |
+
+An error frame is written once per kind of failure, not on every retry. A reader should ignore a
+`kind` or `code` it does not know.
 
 ## Shared enums
 
@@ -130,6 +186,7 @@ four.
 ```json
 {
   "schemaVersion": 1,
+  "capabilities": [ "watch-json" ],
   "verdict": "running",
   "role": "server",
   "summary": "1/1 nodes ready",
@@ -144,6 +201,7 @@ four.
 | field | type | notes |
 |---|---|---|
 | `schemaVersion` | number | `1` |
+| `capabilities` | array of strings | the optional modes this k3sm offers; `watch-json` means [the stream](#the-stream) is there. Absent in output from a k3sm older than the field, which has none of them; ignore a value you do not know |
 | `verdict` | string | see [Shared enums](#shared-enums) |
 | `role` | string | `server` or `agent` |
 | `summary` | string | one sentence for a person; do not parse it |

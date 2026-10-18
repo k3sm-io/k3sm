@@ -62,7 +62,14 @@ Flags:
   --no-color          never emit colour or glyphs
   --wait              poll until the cluster is running, or --timeout elapses
   --timeout 90s       how long --wait waits
-  --watch[=2s]        re-render in place until interrupted (requires a terminal)
+  --watch[=2s]        re-render in place until interrupted (requires a terminal);
+                      with -o json and stdout not a terminal, stream the report
+                      instead: one JSON frame per line, written first at once and
+                      then only when the report changes (on a node or pod change,
+                      and re-checked every 30s), at most 2 a second, ending after
+                      about 30 minutes with a closing frame and exit 0. The
+                      interval does not apply. docs/user/status-json.md has the
+                      frame format
   --lines 50          how many log lines ` + "`status logs`" + ` prints per file
   --sort cpu|memory   ` + "`status top`" + `: order the pod table by cpu (the default) or
                       memory, then by the other
@@ -86,13 +93,17 @@ Exit codes (a script may branch on these; the set is ADDITIVE ONLY and a number
 is never reassigned):
   0  running        the control plane is serving and every subsystem is healthy
   1  internal error a probe itself failed — this is not a verdict about k3sm
-  2  usage          a bad flag or view (also: --watch with output redirected)
+  2  usage          a bad flag or view (also: --watch with output redirected,
+                    other than the -o json stream)
   3  stopped        installed, and the control plane is not serving — cleanly
                     stopped or crash-looping; the summary says which
   4  degraded       serving, with at least one subsystem failing or warning
   5  not installed  there is no k3sm install on this Mac
   6  unknown        the state could not be determined — usually because this
                     account cannot read the daemons' files; re-run with sudo
+  7  auth refused   --watch -o json stream only: the apiserver refused this
+                    credential (an auth-refused frame says so); running the
+                    stream again with the same credential will be refused again
 `
 
 // Timing defaults. The poll interval is fixed rather than flag-driven: --wait
@@ -398,6 +409,9 @@ type statusRunner struct {
 	// top reads one frame of `status top`. The production one keeps its
 	// metrics sample between --watch frames (status.TopCollector).
 	top func(context.Context, status.TopOptions) status.TopReport
+	// stream is the NDJSON mode of --watch -o json on a stdout that is not a
+	// terminal. Nil refuses that mode like any other redirected --watch.
+	stream *statusStream
 	// appPresent reports whether k3sm.app is installed. When it reports
 	// false, the human output ends with appHint; the JSON never carries it.
 	// Nil prints no hint.
@@ -548,13 +562,17 @@ func (r statusRunner) endDots(dots bool) {
 	}
 }
 
-// runWatch re-renders in place until the context ends. It REFUSES a redirected
-// stdout: the escape sequences that make watching work would be written into
-// whatever file or pipe is on the other end, which is never what the caller
-// meant.
+// runWatch re-renders in place until the context ends. On a redirected stdout
+// it streams the full report as NDJSON when asked for JSON (runStream), and
+// REFUSES otherwise: the escape sequences that make watching work would be
+// written into whatever file or pipe is on the other end, which is never what
+// the caller meant.
 func (r statusRunner) runWatch(ctx context.Context, o statusOptions) int {
 	if !r.stdoutTTY {
-		fmt.Fprintln(r.errOut, "k3sm status: --watch needs a terminal (stdout is not one) — drop --watch, or use --wait for a script")
+		if o.format == "json" && o.view == "" && r.stream != nil {
+			return r.runStream(ctx)
+		}
+		fmt.Fprintln(r.errOut, "k3sm status: --watch needs a terminal (stdout is not one) — drop --watch, use --wait for a script, or `k3sm status --watch -o json` for a stream of reports")
 		return exitUsage
 	}
 	code := exitInternalError

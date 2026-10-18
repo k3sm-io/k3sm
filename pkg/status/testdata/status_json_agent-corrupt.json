@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
   "verdict": "degraded",
   "role": "agent",
   "summary": "agent: pid 1292 · the stored node credential in /var/lib/k3sm/agent does not parse",

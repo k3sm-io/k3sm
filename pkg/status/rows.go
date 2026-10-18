@@ -198,6 +198,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	attachAlerts(rows, alertContext{now: now(), role: role, stopped: stopped})
 	return Report{
 		SchemaVersion: SchemaVersion,
+		Capabilities:  Capabilities(),
 		Verdict:       verdict,
 		Role:          role,
 		Summary:       summary,
