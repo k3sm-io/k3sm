@@ -89,6 +89,17 @@ CGO_ENABLED=1 go build -o /tmp/k3sm ./cmd/k3sm
 K3SM_BIN=/tmp/k3sm hack/images/mlx-serve/build.sh
 ```
 
+It runs as your own user with no `sudo`: it packages with
+`k3sm build --no-record`, which writes the OCI layout and never records the image
+in this node's image store (recording needs root, because it goes through the
+runtime daemon's socket). To run the image on the build Mac, tar the layout and
+import it as a separate root step:
+
+```sh
+tar -cf ~/.cache/k3sm/mlx-serve/oci.tar -C ~/.cache/k3sm/mlx-serve/oci .
+sudo k3sm image import ~/.cache/k3sm/mlx-serve/oci.tar
+```
+
 It stages into `~/.cache/k3sm/mlx-serve` (override with `K3SM_MLX_WORK`, or
 `--stage` / `--output` individually), and re-running is cheap: the staged tree is
 reused unless the lockfile or the interpreter pin changed, or `--restage` is
@@ -119,7 +130,7 @@ What the script does, and why each step is there:
 7. **Checks the staged tree against the builder's 2 GiB context ceiling**, which
    binds well before any image-size budget does.
 8. **Writes the Dockerfile outside the context** (`COPY . /` would otherwise
-   absorb it) and runs `k3sm build --format oci`.
+   absorb it) and runs `k3sm build --no-record --format oci`.
 9. **Runs `walk-verify.sh`** on the result, unless `--no-verify`.
 
 ## Verify
@@ -142,9 +153,7 @@ copy-on-write sharing the runtime depends on. Evidence:
 
 ## Publish
 
-Publishing is a **human-run lab step**. There is no automated registry workflow
-and none is planned before the public release; the image is published from a Mac
-by hand, and the digest is recorded.
+Push the layout with the registry token from the environment, as your own user:
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
@@ -170,7 +179,8 @@ hack/images/mlx-serve/selftest.sh
 ```
 
 Runs in seconds on any Mac and needs neither uv nor a `k3sm` binary: it checks
-that the scripts are shellcheck-clean, that the emitted Dockerfile is COPY-only
+that the scripts are shellcheck-clean, that `build.sh` packages with
+`k3sm build --no-record --output`, that the emitted Dockerfile is COPY-only
 and carries the serving argv, that the lockfile is exactly pinned with a hash
 per artifact, that `build.sh` refuses a lockfile that is not and refuses to run
 without uv, and that `walk-verify.sh` goes red on an invalid signature, on a

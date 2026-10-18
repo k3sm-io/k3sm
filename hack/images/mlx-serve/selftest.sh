@@ -14,6 +14,8 @@
 #   * the lockfile is exactly pinned with a hash for every artifact, and the
 #     build refuses one that is not;
 #   * the build refuses to run at all without uv;
+#   * the build packages with `k3sm build --no-record --output`, so it needs no
+#     root and never touches the node's image store;
 #   * walk-verify goes RED on an invalid signature, on a mislabelled layer, on a
 #     blob that does not match its digest, and on a non-Mach-O entrypoint — and
 #     GREEN on the universal-binary shape that a whole-file signature check
@@ -126,6 +128,20 @@ if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'uv not found'; then
 	ladder ok "3.uv  build.sh stops on a missing uv (exit $rc)"
 else
 	ladder no "3.uv  build.sh stops on a missing uv (exit $rc)"
+fi
+
+# The packaging step writes the layout only. Without --no-record, `k3sm build`
+# records into the node's image store through the runtime daemon's socket, which
+# an ordinary user cannot reach, so a non-root build would fail at packaging.
+# Every `k3sm build` invocation in build.sh must carry --no-record and --output.
+# shellcheck disable=SC2016 # the pattern is the literal text "$K3SM_BIN"
+calls="$(grep -F '"$K3SM_BIN" build ' "$BUILD")"
+if [ -n "$calls" ] &&
+	! printf '%s\n' "$calls" | grep -v -- '--no-record' | grep -q . &&
+	! printf '%s\n' "$calls" | grep -v -- '--output' | grep -q .; then
+	ladder ok "3.norecord  build.sh packages with k3sm build --no-record --output (no root, no store)"
+else
+	ladder no "3.norecord  build.sh packages with k3sm build --no-record --output (no root, no store)"
 fi
 
 # ---- 4 — the emitted Dockerfile --------------------------------------------
@@ -512,7 +528,8 @@ cat <<'EOF'
 Not covered here — this needs a Mac with uv, a k3sm binary and the network:
   * staging the tree (uv python install + uv pip install --require-hashes),
     and with it the interpreter-URL pin assertion;
-  * `k3sm build --format oci` over the real 1.3 GB context, its digest, and
+  * `k3sm build --no-record --format oci` over the real 1.3 GB context, as an
+    ordinary user, its digest, and
     building the same context twice to compare digests;
   * walk-verify over the REAL payload (a few hundred Mach-Os), which is the
     acceptance criterion this file only rehearses;
