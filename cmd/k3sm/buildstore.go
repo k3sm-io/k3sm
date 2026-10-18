@@ -89,6 +89,9 @@ func (b built) digest() (ggcrv1.Hash, error) {
 // because it is the only step that can fail for a reason outside this Mac — a
 // refused credential, an unreachable host — and a failure there must not cost
 // the operator the build.
+//
+// --no-record drops the store step and nothing else: artifact, then push, and
+// the summary says the image was not recorded and how to load it.
 func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.Writer, record storeRecorder, push imagePusher, engineEndpoint, enginePlatform string) error {
 	if o.output != "" {
 		// A multi-platform build writes the whole INDEX, which only the layout
@@ -109,8 +112,13 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.
 			}
 		}
 	}
-	if err := record(ctx, ref, b.image); err != nil {
-		return err
+	// --no-record ends the build at the artifact and the upload: the store is
+	// never dialed, which is what lets a user who cannot reach the runtime
+	// daemon's socket build at all.
+	if !o.noRecord {
+		if err := record(ctx, ref, b.image); err != nil {
+			return err
+		}
 	}
 
 	// The upload comes after the recording, so a target this node cannot reach
@@ -134,12 +142,20 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.
 	// nodeSelector or the provider toleration, so the Pod it creates is refused
 	// at admission — printing it on every successful build sent the operator
 	// straight into a failure.
-	fmt.Fprintf(out, "built %s\n  digest: %s\n  store:  recorded in this node's image store (name %s in a Pod manifest)\n", ref, digest, ref)
+	fmt.Fprintf(out, "built %s\n  digest: %s\n", ref, digest)
+	if o.noRecord {
+		fmt.Fprintf(out, "  store:  not recorded (--no-record); to run it on this node, load it as root: %s\n", noRecordLoadHint(o))
+	} else {
+		fmt.Fprintf(out, "  store:  recorded in this node's image store (name %s in a Pod manifest)\n", ref)
+	}
 	// The platform line appears only for a build that produced more than one,
 	// where "which of these is in the store" is a question the operator now has.
 	// A single-platform build's platform is the one they asked for, or the one
-	// path's only target, so printing it would be noise.
-	if len(b.platforms) > 1 {
+	// path's only target, so printing it would be noise. A --no-record build
+	// recorded nothing, so the line names only what it built.
+	if len(b.platforms) > 1 && o.noRecord {
+		fmt.Fprintf(out, "  built:  %s\n", strings.Join(b.platforms, ", "))
+	} else if len(b.platforms) > 1 {
 		fmt.Fprintf(out, "  built:  %s (the store recorded %s)\n", strings.Join(b.platforms, ", "), b.storePlatform)
 	}
 	if o.output != "" {
@@ -152,6 +168,28 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.
 		fmt.Fprintf(out, "  engine: %s (%s)\n", engineEndpoint, enginePlatform)
 	}
 	return nil
+}
+
+// noRecordLoadHint names the separate root step that puts a --no-record build in
+// this node's store. A docker-save tarball loads as written; an OCI layout
+// directory is tarred first and imported, because `k3sm image import` takes the
+// tarred layout. A push-only build wrote no artifact, so the hint names the flag
+// that would.
+func noRecordLoadHint(o buildOptions) string {
+	switch {
+	case o.output == "":
+		return "write an artifact with --output, then sudo k3sm image load (docker) or sudo k3sm image import (a tarred oci layout)"
+	case o.format == "oci":
+		return fmt.Sprintf("tar -cf %[1]s.tar -C %[1]s . && sudo k3sm image import %[1]s.tar", o.output)
+	default:
+		return "sudo k3sm image load " + o.output
+	}
+}
+
+// refuseRecord is the storeRecorder of a --no-record build. deliver never calls
+// it; it exists so that a path that did would fail without dialing the daemon.
+func refuseRecord(_ context.Context, ref name.Tag, _ ggcrv1.Image) error {
+	return fmt.Errorf("record %s: this is a --no-record build, which never writes this node's image store", ref)
 }
 
 // recordInStore is the production storeRecorder: it hands the image to the

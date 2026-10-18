@@ -69,6 +69,15 @@ ingest registry (--registry-port), which is where a bare name resolves from.
   k3sm build -t myapp:v1 --push .                # and into this node's registry
   k3sm build -t ghcr.io/org/myapp:v1 --push .    # or into a named registry
 
+--no-record skips the store: the build writes --output and/or uploads --push
+and never talks to this node's runtime daemon, the way "buildctl --output
+type=oci" builds without a containerd. It needs no root, so it is the mode for
+a build run as an ordinary user. At least one of --output and --push is
+required with it. Running the result on this node is then a separate root step:
+
+  k3sm build -t myapp:v1 --no-record --output myapp.tar .
+  sudo k3sm image load myapp.tar                 # the store, when you want it
+
 --platform names the target. Unset builds darwin/arm64 natively, or a Linux
 image when the Dockerfile needs the engine. An EXPLICIT Linux target always
 builds on the engine, so a COPY-only Dockerfile can produce a Linux image too:
@@ -116,8 +125,13 @@ type buildOptions struct {
 	// push additionally uploads the built image to a registry once it is in the
 	// store. It is a sink, not a substitute: the store recording happens either
 	// way, so an image that failed to upload is still runnable on this node.
-	push   bool
-	format string
+	push bool
+	// noRecord skips the store recording: the build delivers only to --output
+	// and/or --push and never dials the runtime daemon, so an unprivileged user
+	// who cannot reach its socket can still build. parseBuildArgs refuses it
+	// without one of those sinks, because the build would then go nowhere.
+	noRecord bool
+	format   string
 	// platforms is the parsed --platform list: one target, or several for a
 	// multi-platform build. It is never empty — an argv that named no platform
 	// carries the native path's default.
@@ -163,6 +177,7 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	fs.StringVar(&o.tag, "t", "", "short form of --tag")
 	fs.StringVar(&o.output, "output", "", "additionally write the image to this path (the store recording always happens)")
 	fs.BoolVar(&o.push, "push", false, "additionally upload the image to the registry the tag names (a bare tag goes to this node's ingest registry)")
+	fs.BoolVar(&o.noRecord, "no-record", false, "do not record the image in this node's image store (never dials the runtime daemon, needs no root); requires --output or --push")
 	fs.StringVar(&o.format, "format", "docker", "output format: docker (a `docker load` tarball) or oci (an OCI layout dir)")
 	var platformSpec string
 	fs.StringVar(&platformSpec, "platform", oci.DefaultPlatform, "target platform, or several separated by commas: "+oci.DefaultPlatform+" (native) or "+enginePlatform+" and friends (the build engine)")
@@ -194,6 +209,12 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	// build always creates, and an unnamed recording is one nothing can select.
 	if o.tag == "" {
 		return o, errors.New("--tag is required")
+	}
+	// --no-record removes the one sink every other build has, so a build with
+	// neither --output nor --push would produce an image and then discard it.
+	// That is refused before any work starts rather than reported as a success.
+	if o.noRecord && o.output == "" && !o.push {
+		return o, errors.New("--no-record needs --output or --push: without the image store the build has nowhere to deliver the image")
 	}
 	if o.format != "docker" && o.format != "oci" {
 		return o, fmt.Errorf("--format %q: want \"docker\" or \"oci\"", o.format)
@@ -231,6 +252,12 @@ func build(ctx context.Context, o buildOptions, out io.Writer) error {
 // through the one recorder whose digest the ledger keeps.
 func buildRecorded(ctx context.Context, l *buildledger.Ledger, o buildOptions, out io.Writer, engineFor func(storeRecorder) engineBuilder, record storeRecorder, push imagePusher) error {
 	tr := startBuildRecord(l, o)
+	if o.noRecord {
+		// deliver already skips the store under --no-record. This replaces the
+		// seam as well, so a path that reached it anyway fails loudly instead of
+		// dialing the daemon the operator asked this build to leave alone.
+		record = refuseRecord
+	}
 	record = tr.recorder(record)
 	out = tr.tee(out)
 	return tr.run(ctx, func(ctx context.Context) error {
