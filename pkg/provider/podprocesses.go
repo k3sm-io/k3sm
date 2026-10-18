@@ -41,8 +41,8 @@ type PodProcessCounter interface {
 }
 
 // sumPodProcessCounts sums PodStats.process.process_count over the pods that
-// carry it. A pod whose process is nil does not report (a vm pod today) and is
-// left out of the sum; it is not counted as zero. A present zero is a real
+// carry it. A pod whose process is nil does not report (the runtime could not
+// inspect one of its groups) and is left out of the sum; it is not counted as zero. A present zero is a real
 // count. reported is false when no pod reports, which skips the per-uid leg.
 //
 // The sum is a lower bound on the processes the pods' uid holds: a process that
