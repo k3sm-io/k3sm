@@ -90,11 +90,30 @@ func heartbeatPublished(t *testing.T, n *corev1.Node) *corev1.Node {
 	done := make(chan struct{})
 	go func() { defer close(done); _ = nsp.Run(ctx) }() // Run returns ctx.Err() on cancel
 	defer func() { cancel(); <-done }()
+	// No wall-clock budget of our own: a starved host may take far longer than any
+	// fixed number. A loop that never publishes still fails, at the test deadline.
+	var expired <-chan time.Time
+	if dl, ok := t.Deadline(); ok {
+		// Leave 5 s to report, but never a non-positive wait under a short -timeout.
+		timer := time.NewTimer(max(time.Until(dl)-5*time.Second, time.Second))
+		defer timer.Stop()
+		expired = timer.C
+	}
 	select {
 	case pub := <-got:
 		return pub
-	case <-time.After(30 * time.Second):
-		t.Fatal("status loop published nothing within 30s")
+	case <-done:
+		// A publish that landed just before Run returned still counts: drain it first,
+		// since select picks among ready cases at random.
+		select {
+		case pub := <-got:
+			return pub
+		default:
+		}
+		t.Fatal("status loop exited before publishing")
+		return nil
+	case <-expired:
+		t.Fatal("status loop published nothing before the test deadline")
 		return nil
 	}
 }
