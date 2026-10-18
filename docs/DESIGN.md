@@ -10,7 +10,7 @@ Kubernetes' control plane is portable Go; its node layer is deeply Linux-specifi
 
 **Decisions locked:** (1) Pods run **truly native Darwin workloads, zero Linux**. (2) **Multi-node from the start** (no single-node-only shortcuts baked in). (3) Goals: **local dev + Mac CI/build-farm + Kubernetes/Darwin research**. (4) Org `k3sm-io`, domain `k3sm.io` (owned), vanity module paths `k3sm.io/<repo>`.
 
-**Target & outcome.** macOS 26+ (Tahoe), Apple Silicon arm64. `k3sm server` brings up a conformant control plane + node; `kubectl run` a native-macOS image and it executes on the Mac with native isolation/networking; a second Mac joins with one token. The whole distribution installs via `brew install k3sm-io/tap/k3sm`.
+**Target & outcome.** macOS 26+ (Tahoe), Apple Silicon arm64. `k3sm server` brings up a conformant control plane + node; `kubectl run` a native-macOS image and it executes on the Mac with native isolation/networking; a second Mac joins with one token. The whole distribution installs with one install script (`curl -fsSL https://k3sm.io/install.sh | sh`), which runs `sudo k3sm install`; see `docs/user/install.md`.
 
 ## 2. The core constraint
 

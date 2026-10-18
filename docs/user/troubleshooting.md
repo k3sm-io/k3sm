@@ -293,8 +293,8 @@ Four things worth knowing before you debug further:
   at the top of this section says: its other containers start and keep running.
 - **The message is bounded.** The waiting message and the `Failed` event carry a truncated copy of
   the underlying error, where upstream Kubernetes prints it whole. The full text, including the
-  registry response, is in the node log (`k3sm logs`, or `log show --predicate 'subsystem ==
-  "io.k3sm.node"'`).
+  registry response, is in the node log (`/var/log/k3sm/server.log`, or `agent.log` on a worker, or `log show
+  --predicate 'subsystem == "io.k3sm.node"'`).
 - **The schedule is per Pod and per image.** Ten Pods referencing one bad image are ten independent
   retry schedules, exactly as they would be on a kubelet. Restarting the node daemon resets every
   schedule to the 10s base, so a restart is the fastest way to retry everything at once after you
