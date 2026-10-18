@@ -322,12 +322,14 @@ func TestJobBackoffAndCompletionAccounting(t *testing.T) {
 		}
 	})
 
-	t.Run("sidecar-bearing Job pod is terminal on its mains", func(t *testing.T) {
+	t.Run("sidecar-bearing Job pod is terminal on its mains once its sidecar stops", func(t *testing.T) {
 		pod := sidecarJobPod()
 		r, f, clk, tr := newTracked(t, pod)
 
 		// runtimed's mains-only phase: the main failed (Never pod ⇒ terminal);
-		// the sidecar still shows running while runtimed tears it down.
+		// the sidecar still shows running while runtimed tears it down, so
+		// the pod is held Running (upstream never reports a terminal phase
+		// while a container runs) and nothing is restarted into the teardown.
 		rs := &runtimev1.PodStatus{
 			PodId:                 string(pod.UID),
 			Phase:                 runtimev1.PodPhase_POD_PHASE_FAILED,
@@ -335,8 +337,15 @@ func TestJobBackoffAndCompletionAccounting(t *testing.T) {
 			ContainerStatuses:     []*runtimev1.ContainerStatus{rtTerminated("main", 1, 0, time.Unix(6000, 0))},
 		}
 		st := r.buildStatus(pod.DeepCopy(), tr, rs, nil)
+		if st.Phase != corev1.PodRunning {
+			t.Fatalf("phase = %s, want Running (the sidecar is still being torn down)", st.Phase)
+		}
+
+		// The sidecar stopped on SIGTERM: now terminal on the mains.
+		rs.InitContainerStatuses = []*runtimev1.ContainerStatus{rtTerminated("proxy", 143, 0, time.Unix(6001, 0))}
+		st = r.buildStatus(pod.DeepCopy(), tr, rs, nil)
 		if st.Phase != corev1.PodFailed {
-			t.Fatalf("phase = %s, want Failed (terminal on mains despite the running sidecar)", st.Phase)
+			t.Fatalf("phase = %s, want Failed (terminal on mains once the sidecar stopped)", st.Phase)
 		}
 		if clk.HasWaiters() {
 			t.Error("a re-exec timer was armed on a terminal pod")

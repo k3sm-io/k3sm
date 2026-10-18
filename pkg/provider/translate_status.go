@@ -76,7 +76,7 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 
 	containersReady := containersReadyFrom(cs)
 
-	phase := derivePhase(pod, rs.GetPhase(), cs)
+	phase := holdForRunningSidecars(pod, derivePhase(pod, rs.GetPhase(), cs), initCS)
 	out := &corev1.PodStatus{
 		Phase:                 phase,
 		Reason:                rs.GetReason(),
@@ -542,7 +542,8 @@ func applyProbeOverlay(cs []corev1.ContainerStatus, probes probeState) {
 //   - a main that will be restarted (its termination resolves restartable, or it
 //     already carries the synthesized CrashLoopBackOff waiting state) ⇒ Running;
 //   - otherwise the runtime's own terminal verdict stands (mains-only, per the
-//     Job contract).
+//     Job contract). toPodStatus then holds that terminal verdict at Running
+//     while a native sidecar still runs (holdForRunningSidecars).
 //
 // pod may be nil (the pod-less status path): with no spec there is no policy to
 // honor, so the runtime's verdict is taken as authoritative and the legacy
@@ -590,6 +591,39 @@ func derivePhase(pod *corev1.Pod, rp runtimev1.PodPhase, cs []corev1.ContainerSt
 	default:
 		return corev1.PodPending
 	}
+}
+
+// holdForRunningSidecars keeps a pod Running while any of its native sidecars
+// (init containers with restartPolicy: Always, KEP-753) still runs, whatever
+// terminal phase the mains decided. It mirrors the kubelet's getPhase, which
+// counts a running restartable init container as running: upstream never
+// reports a terminal phase while a container runs.
+//
+// derivePhase and runtimed's own phase are mains-only (the Job contract), so
+// without this the pod went Succeeded/Failed the moment its mains exited, while
+// runtimed was still stopping the sidecars in reverse start order. Virtual
+// Kubelet skips the status write for a pod already terminal in the API, so the
+// sidecars' terminated states were never published. Holding the phase until no
+// sidecar runs makes the terminal write the one that carries every sidecar's
+// terminated state (runtimed SIGKILLs a sidecar that ignores SIGTERM when the
+// pod's termination grace runs out, so the hold is bounded).
+//
+// Only a sidecar the runtime reports Running holds the pod: a waiting or
+// crash-looping sidecar does not (upstream ignores a restartable init container
+// with a last termination, and runtimed does not restart sidecars once the
+// mains are terminal), and a plain init container is never considered. A
+// non-terminal phase is returned unchanged, so the hold never decides Pending vs
+// Running. A nil pod has no spec to name its sidecars, so nothing is held.
+func holdForRunningSidecars(pod *corev1.Pod, phase corev1.PodPhase, initCS []corev1.ContainerStatus) corev1.PodPhase {
+	if pod == nil || (phase != corev1.PodSucceeded && phase != corev1.PodFailed) {
+		return phase
+	}
+	for i := range initCS {
+		if initCS[i].State.Running != nil && isNativeSidecar(pod, initCS[i].Name) {
+			return corev1.PodRunning
+		}
+	}
+	return phase
 }
 
 // computeInitialized derives the PodInitialized condition from the init-container
