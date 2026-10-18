@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-10-15
-updated_by: B528 (B451 BI10, the two-Mac interconnect ladder authored; the cable run owed)
+updated: 2026-10-18
+updated_by: M21 encode (docs/m21-plan.md, the cooperative node budget)
 
 phases:
   - id: M0
@@ -1564,6 +1564,191 @@ phases:
             met: false
             check: "M19-lab green on the recorded rig run and the site pages published"
             method: e2e
+  - id: M21
+    title: the cooperative node budget: thresholds and pressure published to applications, the NodeBudget API, the budget page and C++ SDK, the two kill tiers
+    status: todo
+    strategy: hard cut
+    depends_on:
+      - apis:M21
+      - runtimed:M21
+    note: "Authoritative input: docs/m21-plan.md (workspace); its BINDING block governs. Hard cut: every piece is additive (a CRD group, annotations, a page file, guest/v1 fields) or a single-node daemon change; nodes of mixed versions tolerate each other in every order. The one deliberate behaviour change is the swap arm split, which makes larger hosts evict earlier; release notes state it. The NodeBudget reader ClusterRole adds a role and its merge waits on the maintainer. Ships as the last item of the next release after v0.1.7."
+    subphases:
+      - id: M21.0
+        title: spike and calibration
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "Run on both rig Macs; the answers amend the plan's defaults before M21.1 starts."
+        deliverables:
+          - id: M21.0-d1
+            done: false
+            desc: "Answers on both rig Macs: the memorystatus sysctl names and unprivileged reads, the default thresholds against a week of samples, the cross-process notifyEpoch wait under a generated pod profile, Node annotation write cost against the Lease, the virtiofs mmap negative, the maximum compressor fill rate at the 75-98% band, and that the kernel still finds a victim when only batch pods are marked; a results table with an evidence digest per row."
+        acceptance:
+          - id: M21.0-a1
+            met: false
+            check: "hack/acceptance/m21.sh --g0 parses the committed results table and exits 0"
+            method: lab
+      - id: M21.1
+        title: the producer and the pressure condition fixes
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M21.0
+        note: "The swap arm split lands first, before any change to a kill path."
+        deliverables:
+          - id: M21.1-d1
+            done: false
+            desc: "The swap arm is split into memory.swap and swapfs.available, the swap-volume floor scales with host memory, MemoryPressure names swap-volume space as the limiting resource, and DiskPressure trips when the swap volume is not the data root's volume."
+          - id: M21.1-d2
+            done: false
+            desc: "budgetOf, a pure function over the pressure snapshot: the five-rung threshold ladder with release levels, minimum reclaim and wall-clock dwells; the sampler at 1 s from the warn rung up; the advisory SoftPressure condition."
+          - id: M21.1-d3
+            done: false
+            desc: "A persisted eviction, OOM and restart history under the data root, with per-band counters and no pod names."
+          - id: M21.1-d4
+            done: false
+            desc: "An additive budget block in k3sm status."
+          - id: M21.1-d5
+            done: false
+            desc: "The Summary API node Fs, Runtime.ImageFs, Rlimit and Swap slots."
+        acceptance:
+          - id: M21.1-a1
+            met: false
+            check: "hack/acceptance/m21.sh --g1 exits 0: rungs pinned for 8, 16, 64 and 128 GiB hosts, the swapfs naming red before and green after, history across a provider restart, the four Summary API slots"
+            method: integration
+      - id: M21.3
+        title: the NodeBudget channel
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - apis:M21.2
+          - k3sm:M21.1
+        note: "Nodes write only an annotation on their own Node; no binding that reaches a node identity gains a new resource. The admit-stop taint is additive and never touches the kubelet-shaped pressure conditions or taints."
+        deliverables:
+          - id: M21.3-d1
+            done: false
+            desc: "The node publishes its budget as a rate-limited, quantized annotation on its own Node and applies the relayed policy, keeping the last valid one and reporting PolicyRejected or PolicyClamped."
+          - id: M21.3-d2
+            done: false
+            desc: "A server relay controller writes NodeBudget status keyed by the writing node, applies budget.k3sm.io/admit-stop:PreferNoSchedule by a key-scoped patch, relays the policy, and on a malformed or oversized annotation reports Reporting=False with no taint."
+          - id: M21.3-d3
+            done: false
+            desc: "The budget.k3sm.io:nodebudget-reader ClusterRole, unbound by default, and a test that no binding reaching system:nodes names the budget resources."
+        acceptance:
+          - id: M21.3-a1
+            met: false
+            check: "hack/acceptance/m21.sh --g2 exits 0: status within one relay interval, the taint lifecycle, PolicyRejected, a malformed annotation, watch for a bound ServiceAccount and 403 for an unbound one, no node grant"
+            method: integration
+      - id: M21.6
+        title: the native budget page
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - apis:M21.4
+          - runtimed:M21.5
+          - k3sm:M21.3
+        deliverables:
+          - id: M21.6-d1
+            done: false
+            desc: "The node agent writes the page at /var/lib/k3sm/budget/budget.v1.page under the seqlock with notifyEpoch, generation and an optional doorbell, keeping the writer lock and arming state where no pod can open them; pods opt in with the budget.k3sm.io/page annotation and no environment variable."
+        acceptance:
+          - id: M21.6-a1
+            met: false
+            check: "K3SM_LAB=1 hack/lab/m21.sh --g3 exits 0 on the rig: an opted-in pod reads the page, others get EPERM, writes and the lock are denied, generation survives a writer restart"
+            method: lab
+      - id: M21.7
+        title: the C++ SDK (k3sm-sdk-cpp)
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M21.6
+        note: "C++20, header-only plus a small C shim, no third-party dependencies, pinned by full commit sha; its semver is independent of the page ABI major."
+        deliverables:
+          - id: M21.7-d1
+            done: false
+            desc: "The skeleton's version contract: SameMajorVersion, a version header generated from the CMake project version, and a sha pin without GIT_SHALLOW in the docs."
+          - id: M21.7-d2
+            done: false
+            desc: "The page reader: read-only mapping, the seqlock read with typed errors, the helpers, the path constants and a constexpr default_page_path() resolved at compile time, checked against the committed fixture bytes."
+          - id: M21.7-d3
+            done: false
+            desc: "The change notifier on notifyEpoch (os_sync on Darwin, futex on Linux, poll, optional doorbell)."
+          - id: M21.7-d4
+            done: false
+            desc: "The C ABI shim and the k3sm-budget-dump reader."
+          - id: M21.7-d5
+            done: false
+            desc: "The quality bar: torn-read stress under TSan, a fuzz harness, ASan and a benchmark."
+          - id: M21.7-d6
+            done: false
+            desc: "Linux builds with GCC and Clang on arm64 and x86_64, run in vm pods, with the fixtures on both architectures."
+          - id: M21.7-d7
+            done: false
+            desc: "The page writer half for C++ producers: the layout derived from the same fixtures, the seqlock write order, notifyEpoch, a preallocated page never renamed or truncated, a two-process writer and reader stress test."
+        acceptance:
+          - id: M21.7-a1
+            met: false
+            check: "k3sm-sdk-cpp/hack/ci.sh exits 0 including the Linux vm-pod legs, and the rig benchmark meets read p50 under 100 ns, p99 under 1 us and wake-to-read p99 under 1 ms; then v1.0.0 is tagged"
+            method: lab
+      - id: M21.10
+        title: vm memory limits and OOM status
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - apis:M21.8
+          - runtimed:M21.9
+        deliverables:
+          - id: M21.10-d1
+            done: false
+            desc: "The provider passes vm container memory limits into the guest and maps oom_killed to OOMKilled."
+        acceptance:
+          - id: M21.10-a1
+            met: false
+            check: "K3SM_LAB=1 hack/lab/m21.sh --g5 exits 0 on the rig: a vm pod over its limit ends OOMKilled, memory.high events rise, the guest page carries PSI and wakes in under 10 ms"
+            method: lab
+      - id: M21.12
+        title: admission and the two kill tiers
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M21.1
+          - k3sm:M21.3
+          - runtimed:M21.11
+        note: "A characterization test of today's hard eviction lands first; every later change is red to green against it. Tier 2 stays grace 0 and always armed; tier 1 is observe-first and takes only pods annotated budget.k3sm.io/band: batch."
+        deliverables:
+          - id: M21.12-d1
+            done: false
+            desc: "The characterization test of today's hard eviction: candidate order, grace 0, the cascade cap, the trips."
+          - id: M21.12-d2
+            done: false
+            desc: "Bands from priority and the band annotation (which only lowers); BestEffort refused at admission under hard MemoryPressure with upstream's exemptions; batch-band pods refused at the critical rung."
+          - id: M21.12-d3
+            done: false
+            desc: "Tier 2 ranks batch, then standard, never critical; its trips sit beyond tier 1's; a short wall-clock hold with an instantaneous override near the kernel limit."
+          - id: M21.12-d4
+            done: false
+            desc: "Tier 1: a real eviction with grace of at least 10 s after the published deadline and a held trigger on k3sm's own compressor and available-memory signals, a kill-rate cap and a cool-off (one delivery per node per tier1CooloffSeconds, default 1800), a re-check of the live signals and deadline just before each delivery, observe mode first with auto arming only after 3 matched pressure episodes (persisted, logged, an Event, reset on a binary or policy change, published as armingEpisodes), a refused-delivery counter that stays 0 here because the node-side eviction does not consult PodDisruptionBudgets, a node-local disarm, and compiled floors no policy can lower."
+        acceptance:
+          - id: M21.12-a1
+            met: false
+            check: "K3SM_LAB=1 hack/lab/m21.sh --g6 exits 0 on the rig: both kill tiers, admission, the band marks and the swap-volume leg"
+            method: lab
+      - id: M21.13
+        title: docs and graduation
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M21.12
+          - k3sm:M21.6
+        deliverables:
+          - id: M21.13-d1
+            done: false
+            desc: "docs/user/node-budget.md and its site manifest entry, the DESIGN.md and privilege-model paragraphs, and release-note sentences naming the page ABI and the earlier eviction on larger hosts."
+        acceptance:
+          - id: M21.13-a1
+            met: false
+            check: "hack/verify-site-clean.sh --sources is clean over the new page"
+            method: e2e
 ---
 
 # k3sm — Phase roadmap
@@ -2268,3 +2453,47 @@ real `M19` and `M19-lab` gates replacing the skeletons.
 ### M19.4 — site and graduation bar ⬜
 The what-runs fourth path and the compare page after M19-lab is green, the de-EXPERIMENTAL bar, and
 the DESIGN.md paragraph for the fourth execution path.
+
+## M21: the cooperative node budget ⬜
+`docs/m21-plan.md` (workspace) is authoritative (encoded 2026-10-18). An application on k3sm can
+read how much room the node has, how close it is to each threshold, and exactly where k3sm will
+stop admitting and start evicting, so it can shrink before the node has to act. The node publishes
+one budget through three channels: the cluster-scoped `NodeBudget` resource (the source of truth,
+readable through a dedicated reader role), a zero-syscall page on the node for pods that opt in,
+read through the `k3sm-sdk-cpp` C++ SDK, and an additive block in `k3sm status`. The contract is
+platform-neutral, so a Linux producer can publish the same resource and page.
+
+Eviction gains a second, gentler tier. Tier 1 evicts only pods marked
+`budget.k3sm.io/band: batch`, after a published deadline, with a grace of at least 10 s, and starts
+in observe mode. Tier 2 is today's immediate hard eviction, always armed, and never takes a
+critical pod. The swap arm stops reporting disk space as memory, which makes hosts of 64 GiB and
+more evict earlier than before.
+
+**Hard cut.** Every piece is additive or a single-node change, and mixed-version nodes tolerate
+each other in every order. It ships as the last item of the next release after v0.1.7.
+
+### M21.0 spike and calibration ⬜
+Thresholds, notification under the sandbox, annotation cost and the compressor fill rate,
+measured on two Macs.
+
+### M21.1 the producer and the pressure condition fixes ⬜
+The swap arm split, the threshold ladder, `SoftPressure`, the persisted history, the status block
+and the Summary API slots.
+
+### M21.2 to M21.3 the NodeBudget channel ⬜
+The node annotation, the server relay, the additive admit-stop taint and the reader role.
+
+### M21.6 the native budget page ⬜
+The page writer and the opt-in read.
+
+### M21.7 the C++ SDK ⬜
+The reader, the writer half for C++ producers, the notifier, the C shim, the quality bar and Linux builds, tagged v1.0.0.
+
+### M21.10 vm memory limits and OOM status ⬜
+Real limits inside vm guests and `OOMKilled` when they are hit.
+
+### M21.12 admission and the two kill tiers ⬜
+The characterization test first, then bands, admission, the tier-2 changes and tier 1.
+
+### M21.13 docs and graduation ⬜
+The user page, the design and privilege-model paragraphs and the release notes.
