@@ -66,6 +66,10 @@ import (
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
 type serverOptions struct {
 	workDir string
+	// workDirHold is not a flag: it is the work-dir lock this start took for its
+	// orphan reap (reapThenAdmitServerStart), handed to the executor's Config by
+	// serverExecutorConfig so the lock is held without a gap until Stop.
+	workDirHold *executor.WorkDirHold
 	// clearCrashLoop clears the crash-loop record and exits instead of serving.
 	clearCrashLoop bool
 	nodeName       string
@@ -514,8 +518,8 @@ func runServer(args []string) (err error) {
 
 	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM) // never rebound (cancelledByStop)
 	defer stop()
-	// Secrets encryption and a tripped breaker PARK here (admitServerStart).
-	encryptionConfig, done, err := admitServerStart(stopCtx, opts, breaker, mode, logger)
+	encryptionConfig, done, err := reapThenAdmitServerStart(stopCtx, &opts, breaker, mode, logger) // may PARK; Release is a no-op once Start adopts
+	defer func() { _ = opts.workDirHold.Release() }()
 	if done || err != nil {
 		return err
 	}

@@ -1053,8 +1053,9 @@ func TestStopKeepsWorkDirLockUntilReaped(t *testing.T) {
 }
 
 // TestEtcdPostureHoldsWorkDirLock: an etcd-posture server holds the work-dir lock from
-// Start to Stop, so a reset (which takes the same lock) cannot run beside its member;
-// the kine posture takes no lock.
+// Start to Stop, so a reset (which takes the same lock) cannot run beside its member.
+// The kine posture holds it too (the next start's orphan reap keys on it), and Start
+// adopts a hold the server already took instead of locking a second time.
 func TestEtcdPostureHoldsWorkDirLock(t *testing.T) {
 	origProvision, origBringUp := supervisedProvision, supervisedBringUp
 	t.Cleanup(func() { supervisedProvision, supervisedBringUp = origProvision, origBringUp })
@@ -1087,10 +1088,39 @@ func TestEtcdPostureHoldsWorkDirLock(t *testing.T) {
 	if err := k.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = k.Stop(context.Background()) }()
-	if _, err := os.Stat(WorkDirLockPath(kineWD)); !os.IsNotExist(err) {
-		t.Errorf("the kine posture created a lock file (%v)", err)
+	if _, err := lockWorkDir(kineWD); !errors.Is(err, ErrWorkDirLocked) {
+		t.Errorf("lock while the kine posture runs = %v, want ErrWorkDirLocked", err)
 	}
+	if err := k.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A hold the server took for its orphan reap is adopted by Start: no second
+	// lock (which would be refused against the hold), and the server's own Release
+	// after the adoption is a no-op, so the lock lasts until Stop.
+	unlockKine, err := lockWorkDir(kineWD)
+	if err != nil {
+		t.Fatalf("lock after the kine Stop = %v, want it released", err)
+	}
+	hold := &WorkDirHold{unlock: unlockKine}
+	adopted := NewSupervised(withServingPair(Config{WorkDir: kineWD, Token: "tok", WorkDirHold: hold}))
+	if err := adopted.Start(t.Context()); err != nil {
+		t.Fatalf("Start with a held WorkDirHold = %v, want it adopted", err)
+	}
+	if err := hold.Release(); err != nil {
+		t.Fatalf("Release after adoption = %v", err)
+	}
+	if _, err := lockWorkDir(kineWD); !errors.Is(err, ErrWorkDirLocked) {
+		t.Errorf("lock after the server's Release of an adopted hold = %v, want ErrWorkDirLocked (Start owns it)", err)
+	}
+	if err := adopted.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err = lockWorkDir(kineWD)
+	if err != nil {
+		t.Fatalf("lock after the adopting Stop = %v, want it released", err)
+	}
+	_ = unlock()
 }
 
 // TestEtcdSupersededMemberRefused: a peer answering for another cluster parks this

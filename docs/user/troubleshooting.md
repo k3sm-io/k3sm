@@ -598,6 +598,12 @@ several times in a row, the server daemon parks itself: it stays running so laun
 restarting it, but it serves nothing. `k3sm status` reports the server row as `crash-loop` with the
 time the breaker tripped.
 
+A server that was killed outright leaves its control-plane processes running. Its next start stops
+the ones it left behind before starting its own, so they do not count toward the breaker; a process
+holding the datastore port that this server did not start is still refused. A server parked on the
+crash-loop breaker keeps its work dir locked, so stop it (`sudo k3sm stop` or `launchctl bootout`)
+before a restore.
+
 1. Read what it recorded. The row's remedy names the crash-loop record; each entry carries the
    failing component and the tail of its log:
 

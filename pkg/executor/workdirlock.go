@@ -25,9 +25,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// workDirLockName is the advisory lock file a server holds in its work dir while an
-// etcd member runs there. ClusterReset takes the same lock, so a reset can never start
-// a second member over a data dir the daemon's member is serving.
+// workDirLockName is the advisory lock file a server holds in its work dir while its
+// control plane may run there, in both postures. ClusterReset takes the same lock, so
+// a reset can never start a second member over a data dir the daemon's member is
+// serving, and a server start's orphan reap takes it, so it never mistakes a live
+// server's children for a killed run's leftovers (ReapOrphanedControlPlane).
 const workDirLockName = "server.lock"
 
 // ErrWorkDirLocked reports that another process (a running server, or a reset in
