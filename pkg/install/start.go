@@ -70,7 +70,8 @@ func startPrecondition(ctx context.Context, sys System, cfg Config, d installedD
 // it does not). A node with no stop marker and every daemon running is
 // already started: Start restarts nothing. With the uncordon-pending marker
 // it re-runs the full uncordon (the repair); without it, one best-effort
-// attempt, which changes nothing on a node no stop annotated.
+// attempt, which changes nothing on a node no stop annotated. Either way, a
+// successful start opens the menu bar app hidden (Config.AppLauncher).
 func Start(ctx context.Context, sys System, cfg Config, actor, reason string) error {
 	cfg = cfg.withDefaults()
 	actor, reason, err := lifecycleIdentity(actor, reason)
@@ -100,6 +101,7 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 			markNode(ctx, cfg, false, actor, reason)
 		}
 		lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm start: already running, nothing to do", "actor", actor, "reason", reason, "result", "already-running")
+		launchApp(ctx, cfg, "start")
 		return nil
 	}
 	lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm start: starting", "actor", actor, "reason", reason)
@@ -127,6 +129,7 @@ func Start(ctx context.Context, sys System, cfg Config, actor, reason string) er
 		return fmt.Errorf("start: %w", err)
 	}
 	lifecycleLog(ctx, sys, cfg, slog.LevelInfo, "k3sm start: started", "actor", actor, "reason", reason, "result", "started")
+	launchApp(ctx, cfg, "start")
 	return nil
 }
 
@@ -157,7 +160,8 @@ func uncordonAfterStart(ctx context.Context, sys System, cfg Config, actor, reas
 // Restart is `k3sm restart`: the daemons are restarted through the restart
 // sequence and pods keep running (a node daemon restart re-attaches to them).
 // On a node the user stopped it refuses with ErrUserStopped, unless cfg.Start,
-// in which case it is Start.
+// in which case it is Start. With cfg.Start it also opens the app
+// (Config.AppLauncher) once the daemons are back; a plain restart does not.
 func Restart(ctx context.Context, sys System, cfg Config, actor, reason string) error {
 	cfg = cfg.withDefaults()
 	marker, present, merr := readStopMarker(sys, cfg)
@@ -178,6 +182,11 @@ func Restart(ctx context.Context, sys System, cfg Config, actor, reason string) 
 	cfg.Role = d.role
 	if _, err := restartDaemons(ctx, sys, cfg, d.manifest(cfg)); err != nil {
 		return fmt.Errorf("restart: %w", err)
+	}
+	// Only `restart --start` asks for the app: a plain restart is a repair,
+	// not a start, and opens nothing.
+	if cfg.Start {
+		launchApp(ctx, cfg, "restart")
 	}
 	return nil
 }

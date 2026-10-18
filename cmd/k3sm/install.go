@@ -101,6 +101,9 @@ func runInstall(args []string) error {
 	}
 	// Only an install --start over a stopped node calls it: the uncordon.
 	cfg.MarkNode = nodeMarker(sys, install.DefaultDataRoot)
+	// Once the node is up, open the menu bar app hidden for the user at the
+	// screen (best effort; see install.Config.AppLauncher).
+	cfg.AppLauncher = install.NewAppLauncher(logger, self)
 	res, err := install.InstallWithResult(ctx, sys, cfg)
 	if res.AdminTokenRotated {
 		fmt.Fprintln(os.Stderr, adminTokenRotatedNote)

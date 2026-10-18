@@ -62,6 +62,9 @@ type Signature struct {
 	AdHoc bool
 	// TeamID is the signing certificate's Team ID; empty when there is none.
 	TeamID string
+	// Identifier is the signature's code identifier (an app's is its bundle
+	// identifier); empty when codesign reports none.
+	Identifier string
 }
 
 // IdentitySigned reports a valid signature made by a certificate identity (a
@@ -194,7 +197,8 @@ func (i CodesignInspector) run(ctx context.Context, args ...string) (bool, error
 	return false, fmt.Errorf("run %s: %w", i.tool(), err)
 }
 
-// parseDisplay reads `codesign -dv` output of a file whose signature verified.
+// parseDisplay reads `codesign -dv` output of a file whose signature verified:
+// its kind, Team ID and code identifier.
 func parseDisplay(out string) Signature {
 	sig := Signature{Valid: true}
 	for _, line := range strings.Split(out, "\n") {
@@ -211,6 +215,8 @@ func parseDisplay(out string) Signature {
 			if strings.Contains(val, "(adhoc") || strings.Contains(val, ",adhoc") {
 				sig.AdHoc = true
 			}
+		case "Identifier":
+			sig.Identifier = val
 		case "TeamIdentifier":
 			if val != "not set" {
 				sig.TeamID = val
