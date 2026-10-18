@@ -1010,6 +1010,16 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 	// and the boot continues on it; ensureControlPlaneBinaries reports it too.
 	restageKube := false
 	previousKube, markerState := readKubeMarkerState(bd)
+	// On the release path a work dir whose valid marker already names the version
+	// the payload vouches for must still hold the payload's own bytes: an earlier dev
+	// install of the same pin left an ad-hoc set the release verification refuses.
+	// Only a valid, equal marker reaches this, so the downgrade and malformed-marker
+	// refusals below are never bypassed.
+	if policy.release && markerState == kubeMarkerValid && previousKube == kubeVersion && kubeSetStaged(payloadDir, kubeVersion) {
+		if err := ensureReleaseControlPlane(ctx, logger, policy, bd, payloadDir, kubeVersion); err != nil {
+			return err
+		}
+	}
 	if !kubeSetStaged(bd, kubeVersion) && kubeSetStaged(payloadDir, kubeVersion) {
 		switch {
 		case markerState == kubeMarkerMalformed:
@@ -1105,6 +1115,74 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		logger.Info("seeded the control-plane binaries from the staged payload",
 			"from", previousKube, "to", kubeVersion, "dir", bd)
 	}
+	return nil
+}
+
+// ensureReleaseControlPlane makes a release-path work dir, whose valid marker names
+// kubeVersion, hold exactly the control-plane set the payload vouches for at that
+// version. It mirrors the release path for zot (registrysvc) and the source-built
+// children (stagedChild.ensureShipped), over the whole set at once:
+//
+//  1. every payload copy is verified against the Developer ID requirement first;
+//     any failure refuses with the work dir untouched, its marker still present;
+//  2. the bin dir must be one nobody else can write to, before any copy already
+//     there is trusted or replaced;
+//  3. a set byte-identical to the payload's is left alone (the caller then
+//     verifies it in place, as before);
+//  4. otherwise the marker is cleared, every binary is installed from the payload
+//     on a new inode, each temp verified before it takes its name, and the marker
+//     is written LAST. A crash or refusal after the clear leaves no marker, so the
+//     next boot's seed re-stages the whole set from the payload.
+//
+// The replaced set is recorded in the heal marker at the new marker's stamp. That
+// stamp is the same version a dev boot's heal lines carry, and a line records only
+// a name and a stamp: for the new inodes, Developer ID signed and never written in
+// place, "needs no heal at this stamp" is true, so a pre-existing same-stamp line
+// describes the new bytes correctly and RecordHealed leaves it as it is.
+//
+// A process that already maps one of the old binaries keeps that mapping: the new
+// bytes take effect when the child next starts, at the next daemon start for any
+// child that outlived the previous one.
+func ensureReleaseControlPlane(ctx context.Context, logger *slog.Logger, p signingPolicy, bd, payloadDir, kubeVersion string) error {
+	for _, name := range cpBinaries {
+		if err := verifyReleaseBinary(ctx, p, filepath.Join(payloadDir, name)); err != nil {
+			return fmt.Errorf("verify the payload's control-plane set: %w", err)
+		}
+	}
+	if err := atomicfile.CheckTrustedDir(bd); err != nil {
+		return fmt.Errorf("verify the control-plane set in %s: %w", bd, err)
+	}
+	differing := ""
+	for _, name := range cpBinaries {
+		same, err := sameContent(filepath.Join(payloadDir, name), filepath.Join(bd, name))
+		if err != nil {
+			return fmt.Errorf("compare the payload's %s with the work dir's: %w", name, err)
+		}
+		if !same {
+			differing = name
+			break
+		}
+	}
+	if differing == "" {
+		return nil
+	}
+	if err := clearKubeMarker(bd); err != nil {
+		return err
+	}
+	for _, name := range cpBinaries {
+		src, dst := filepath.Join(payloadDir, name), filepath.Join(bd, name)
+		if err := atomicfile.InstallFile(src, dst, 0o755, verifyTempHook(ctx, p, name)); err != nil {
+			return fmt.Errorf("replace %s from the payload: %w", dst, err)
+		}
+	}
+	if err := writeKubeMarker(bd, kubeVersion); err != nil {
+		return err
+	}
+	if err := binsign.RecordHealed(bd, healStamp(kubeMarkerPath(bd)), cpBinaries...); err != nil {
+		return err
+	}
+	logger.Info("replaced the control-plane binaries with the signed payload's: the work dir held other bytes at the same version",
+		"version", kubeVersion, "first-differing", differing, "dir", bd)
 	return nil
 }
 
