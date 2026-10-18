@@ -19,7 +19,7 @@ updates the register. Treat that pin, and `k3sm version`, as the source of truth
 
 ## Current Skew (Point-in-Time)
 
-On `main` at the time of writing (the v0.1.7 release pins v1.36.5 and v0.36.5):
+For the next release, as built from `main` at the time of writing. The [releases page](https://k3sm.io/releases/) and `k3sm version` show the pin a published release carries:
 
 - **Control plane** (embedded kube-apiserver / KCM / scheduler): `DefaultKubeVersion` **v1.37.1**.
 - **Client libraries** (`k8s.io/api`, `k8s.io/client-go`): **v0.37.1**.
