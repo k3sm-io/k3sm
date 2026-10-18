@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -238,6 +239,10 @@ func newStatusCollector() status.Collector {
 		// On an agent, the invoking account's own kubeconfig, for when the
 		// node credential is not readable from this account.
 		UserKube: statusUserKubeFor(role, statusAgentJoinServer, statusDir),
+		// One SelfSubjectReview with whichever client the report ends up
+		// reading the cluster with, so the kubeconfig row can tell a refused
+		// credential from one that was merely found.
+		ReviewSelf: statusReviewSelf,
 		// What proves, on a server, that the apiserver the report dials is
 		// this Mac's own: loopback or one of its addresses, at the apiserver
 		// port. A server installed with a non-default --api-port fails it, and
@@ -295,6 +300,24 @@ func statusServices(kube status.Kube) status.ServicesComparer {
 		return nil
 	}
 	return svcstatus.Comparer{Client: rk.client, Timeout: statusAPITimeout}
+}
+
+// statusReviewSelf asks the apiserver behind kube who its credential
+// authenticates as, with one SelfSubjectReview create, which the default
+// system:basic-user role grants every authenticated identity. A client that is
+// not the production one cannot be asked, and says so.
+func statusReviewSelf(ctx context.Context, kube status.Kube) (string, error) {
+	rk, ok := kube.(restKube)
+	if !ok || rk.client == nil {
+		return "", errors.New("no clientset to review the credential with")
+	}
+	ctx, cancel := context.WithTimeout(ctx, statusAPITimeout)
+	defer cancel()
+	review, err := rk.client.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if err != nil {
+		return "", err
+	}
+	return review.Status.UserInfo.Username, nil
 }
 
 // statusServingChain reads the certificate chain the apiserver behind kube

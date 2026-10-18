@@ -60,6 +60,12 @@ const (
 	// StateAddressMismatch is the fourth: the credential is complete and in
 	// date, and names an address this node is not assigned.
 	StateAddressMismatch RowState = "address-mismatch"
+	// StateRefused is the kubeconfig row's word for a credential the
+	// apiserver answered and refused as unauthenticated (401): the file is
+	// there and parses, and what it holds is no longer accepted, typically an
+	// admin credential a reinstall of the server replaced. A credential that
+	// authenticates and is then denied by RBAC (403) is not refused.
+	StateRefused RowState = "refused"
 	// StateDrift is the shadow binary set's word for a copy made from a host
 	// binary macOS has since replaced, or a set made by an older install.
 	StateDrift     RowState = "drift"

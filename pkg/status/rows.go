@@ -33,9 +33,9 @@ import (
 	"syscall"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-
 	"golang.org/x/sys/unix"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -174,7 +174,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 		}
 	}
 	rows = append(rows,
-		c.kubeconfigRow(),
+		c.kubeconfigRow(ctx, role),
 		c.runtimedRow(ctx, role),
 	)
 	// Whether the node resolver answers at the DNS VIP, on every role; the
@@ -1598,8 +1598,13 @@ func (c Collector) withUserKube() Collector {
 // cluster with the invoking account's kubeconfig on an agent.
 const UserKubeNote = "your kubeconfig; this account cannot read the node credential"
 
-// kubeconfigRow reports the credentials this command found, and where.
-func (c Collector) kubeconfigRow() Row {
+// kubeconfigRow reports the credentials this command found, and where, and
+// whether the apiserver accepts them: one SelfSubjectReview with the same
+// client (ReviewSelf). A 401 is the refused state; a 403 means the identity
+// authenticated and RBAC denied it, which is not this row's concern; any other
+// failure (a timeout, an unreachable apiserver) is the apiserver row's, so the
+// row then says what it said before.
+func (c Collector) kubeconfigRow(ctx context.Context, role dataroot.Role) Row {
 	row := Row{Name: RowKubeconfig}
 	if c.Kube == nil {
 		row.State, row.Severity = StateMissing, SeverityWarn
@@ -1608,16 +1613,56 @@ func (c Collector) kubeconfigRow() Row {
 		return row
 	}
 	row.State, row.Severity = StateOK, SeverityOK
-	row.Detail = c.KubeSource
-	if row.Detail == "" {
-		row.Detail = "resolved"
+	source := c.KubeSource
+	if source == "" {
+		source = "resolved"
 	}
+	row.Detail = source
 	if c.kubeFromUser {
 		row.Detail += " (" + UserKubeNote + ")"
 		row.Wide = map[string]string{"source": "user-kubeconfig"}
 	}
+	if c.ReviewSelf == nil {
+		return row
+	}
+	user, err := c.ReviewSelf(ctx, c.Kube)
+	switch {
+	case err == nil:
+		if user != "" {
+			if row.Wide == nil {
+				row.Wide = map[string]string{}
+			}
+			row.Wide["user"] = user
+		}
+	case apierrors.IsUnauthorized(err):
+		row.State, row.Severity = StateRefused, SeverityFail
+		row.Detail = "the apiserver refused the credential in " + source + " (401 Unauthorized)"
+		if c.kubeFromUser {
+			row.Detail += "; " + UserKubeNote
+		}
+		row.Remedy = c.refusedKubeconfigRemedy(role)
+	}
 	return row
 }
+
+// refusedKubeconfigRemedy is how an operator replaces a refused credential. On
+// a worker the node credential is re-issued only by a fresh join, and an
+// account's own kubeconfig is a copy of the server's, so it is copied again;
+// on a server the install merges its current admin credential into the
+// invoking account's kubeconfig.
+func (c Collector) refusedKubeconfigRemedy(role dataroot.Role) string {
+	if role != dataroot.RoleAgent {
+		return "sudo k3sm install   # merges this server's current admin credential into your kubeconfig"
+	}
+	if c.kubeFromUser {
+		return RefusedUserKubeconfigRemedy
+	}
+	return c.joinRemedy()
+}
+
+// RefusedUserKubeconfigRemedy is the remedy of a worker account's own
+// kubeconfig the apiserver refused: copy the server's admin kubeconfig again.
+const RefusedUserKubeconfigRemedy = "k3sm kubeconfig > k3sm.yaml   # on the control-plane Mac; then merge k3sm.yaml into ~/.kube/config on this Mac"
 
 // runtimedRow reports the native runtime daemon's health. It is rendered only by
 // the cluster view and by JSON — the overview has no room for it and it is the

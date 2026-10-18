@@ -1169,6 +1169,9 @@ func registryAlert(r Row) *Alert {
 }
 
 func kubeconfigAlert(r Row, ac alertContext) *Alert {
+	if r.State == StateRefused {
+		return refusedKubeconfigAlert(r, ac)
+	}
 	if r.State != StateMissing {
 		return nil
 	}
@@ -1178,6 +1181,23 @@ func kubeconfigAlert(r Row, ac alertContext) *Alert {
 			manual("To use kubectl here, run k3sm kubeconfig on the control-plane Mac and copy the result into ~/.kube/config on this Mac"))
 	}
 	return alert("No kubeconfig was found for this account, so kubectl and this report cannot reach the cluster as you.", docsKubeconfig, remedySteps(r.Remedy)...)
+}
+
+// refusedKubeconfigAlert is the alert of a credential the apiserver refused
+// as unauthenticated, with the way to replace it on this Mac's role.
+func refusedKubeconfigAlert(r Row, ac alertContext) *Alert {
+	switch {
+	case ac.role == dataroot.RoleAgent && r.Remedy == RefusedUserKubeconfigRemedy:
+		return alert("The apiserver refused the credential in your kubeconfig, so kubectl and this report cannot reach the cluster as you. A reinstall of the server replaces its admin credential, and a copy taken before it is refused.",
+			docsKubeconfig,
+			manual("On the control-plane Mac, run k3sm kubeconfig > k3sm.yaml"),
+			manual("Copy k3sm.yaml to this Mac and merge it into ~/.kube/config, replacing the old k3sm context"))
+	case ac.role == dataroot.RoleAgent:
+		return alert("The apiserver refused this worker's node credential, so the node cannot reach the cluster. Only a fresh join issues a new one.",
+			docsJoin, remedySteps(r.Remedy)...)
+	}
+	return alert("The apiserver refused the credential in your kubeconfig, so kubectl and this report cannot reach the cluster as you. A reinstall of the server replaces its admin credential, and a copy taken before it is refused.",
+		docsKubeconfig, remedySteps(r.Remedy)...)
 }
 
 func runtimedAlert(r Row) *Alert {
