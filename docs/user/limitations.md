@@ -91,6 +91,33 @@ tooling either. Network is not the obstacle: every native Pod may open outbound 
 host network stack, and k3sm does not filter them (see "NetworkPolicy Is a Policy Hint, Not a
 Security Boundary" below).
 
+### POSIX Named Semaphores Are Per-Pod, and the Host Pool Is Shared
+
+A native Pod can create and use POSIX named semaphores (`sem_open`), which is what Python
+`multiprocessing` pools, `concurrent.futures.ProcessPoolExecutor` and `compileall -j 0` need. macOS
+keeps these semaphores in **one namespace for the whole host**, where Linux gives each container its
+own. So k3sm confines each Pod to a name prefix derived from its Pod UID: the Seatbelt profile refuses
+every other name with `EPERM`, and a Pod cannot open, post, wait on or remove another Pod's semaphore.
+The one exception is a prefix collision: the prefix is a 32-bit hash of the Pod's UID, which the
+apiserver assigns, so two Pods whose prefixes collide (a 1 in 2^32 chance per pair) share semaphore
+names. The runtime moves a workload's own names under that prefix, so programs need no change.
+
+- The rename happens in the library k3sm injects into native processes. A process that does not load
+  it keeps its own names and gets `EPERM`: a platform binary under `/usr/bin` or `/bin` outside the
+  node's re-signed set (`/usr/bin/python3` is one), or a container that sets its own
+  `DYLD_INSERT_LIBRARIES`. A Python the image or the Pod installs loads it.
+- macOS caps a semaphore name at 30 bytes and the prefix takes 15, so a longer name is replaced by a
+  hash of it. Two processes that open the same name still reach the same semaphore.
+- A Pod can tell whether a semaphore name exists on the host (a foreign name that exists fails with
+  `EPERM`, a missing one with `ENOENT`). It cannot use one.
+- The semaphore limit (`kern.posix.sem.max`) is **shared by every Pod on the node**, with no per-Pod
+  cap, so a Pod that leaks semaphores can exhaust it for its neighbours.
+- A Pod created before the node was upgraded to a release with this grant has no semaphore grant
+  until it is recreated, so it keeps getting `EPERM`.
+- POSIX shared memory (`shm_open`, Python `multiprocessing.shared_memory`) stays denied.
+- Untrusted or multi-tenant work belongs on the **`vm` RuntimeClass**, where the Linux guest has its
+  own IPC namespace (see [`vm` RuntimeClass](vm-runtimeclass.md)).
+
 ### Signing Names Files by Relative Path, and SwiftPM Cannot Finish
 
 A Pod compiles. `clang` and `swiftc` build C, Objective-C and Swift against an installed SDK into the
