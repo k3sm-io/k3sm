@@ -15,8 +15,8 @@
 # The ladder, and why each rung is here:
 #
 #   m8.0  preflight — GPU node, MLXModel CRD established, the example on disk.
-#   m8.1  pre-seed  — stage the pinned weights on the host. BEST EFFORT: it only
-#                     shortens the first-ready wait, never decides the verdict.
+#   m8.1  pre-seed  — nothing is staged on the host: the weights are seeded on the
+#                     cluster at m8.3-b, the way an operator without host root does.
 #   m8.2  apply     — examples/mlxmodel.yaml, the shipped manifest itself.
 #   m8.3  volume    — the cache PVC binds, and the seed lands in its local path.
 #   m8.4  ready     — via CONDITIONS. status.phase is a derived printer column and
@@ -60,19 +60,23 @@
 # Usage:
 #   KUBECONFIG=/path/to/kubeconfig hack/acceptance/m8.sh
 #   hack/acceptance/m8.sh --plan     # print the ladder and the pins; touch nothing
+#   hack/acceptance/m8.sh --self-test  # render the manifest and the seed Job; no cluster
 #
 # Knobs (all optional):
 #   K3SM_MLX_IMAGE        serving image override, ideally the @sha256 digest pin
-#   K3SM_MLX_NAMESPACE    namespace to run in (default: the example's own)
+#   K3SM_MLX_NAMESPACE    namespace to run in (default: the example's own); it is
+#                         rendered into the gate's copy of the example
 #   K3SM_MLX_CONCURRENCY  m8.7 concurrent requests (default 4, the engine's
 #                         --max-num-seqs ceiling; below 4 the rung proves less)
 #   K3SM_MLX_READY_TIMEOUT   seconds to wait for Ready (default 1800)
 #   K3SM_MLX_DELETE_TIMEOUT  seconds to wait for GC (default 300)
-#   K3SM_MLX_STAGE        host weight-stage dir (default ~/.cache/k3sm/m8/hf)
+#   K3SM_LAB_TOLERATE_KEYS  extra taint keys the seed Job tolerates (hack/lab/lib/tolerations.sh)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 EXAMPLE="$REPO_ROOT/examples/mlxmodel.yaml"
+# shellcheck source=../lab/lib/tolerations.sh
+. "$REPO_ROOT/hack/lab/lib/tolerations.sh"
 
 # The pins. These MUST agree with examples/mlxmodel.yaml — m8.0 asserts it rather
 # than trusting it, so an edit to either file that forgets the other goes red here
@@ -82,10 +86,15 @@ MODEL_REPO="mlx-community/Qwen3-0.6B-4bit"
 MODEL_REV="73e3e38d981303bc594367cd910ea6eb48349da8"
 SERVING_PORT="8000"
 
+# Where the serving pod mounts the cache and what it sets HF_HOME to. These MUST
+# equal pkg/mlx/render.go (CacheMountPath, hfHomePath); --self-test asserts it, so
+# the seed Job writes where the server reads.
+CACHE_MOUNT="/var/lib/mlx/cache"
+HF_HOME_PATH="$CACHE_MOUNT/huggingface"
+
 CONCURRENCY="${K3SM_MLX_CONCURRENCY:-4}"
 READY_TIMEOUT="${K3SM_MLX_READY_TIMEOUT:-1800}"
 DELETE_TIMEOUT="${K3SM_MLX_DELETE_TIMEOUT:-300}"
-STAGE="${K3SM_MLX_STAGE:-$HOME/.cache/k3sm/m8/hf}"
 REQ_TIMEOUT=120
 
 PASS=0; FAIL=0; SKIP=0
@@ -97,6 +106,126 @@ ladder() {
 	esac
 }
 note() { echo "      $*"; }
+
+# render_manifest <namespace> — the gate's copy of the example on stdout, with
+# metadata.namespace set to <namespace> (the example hard-codes `default`, which
+# kubectl apply -n refuses against any other namespace) and, when K3SM_MLX_IMAGE
+# is set, the image line replaced. The shipped file itself is never rewritten.
+render_manifest() {
+	local ns="$1"
+	sed -E "s#^(  namespace:).*#\1 ${ns}#" "$EXAMPLE" |
+		if [ -n "${K3SM_MLX_IMAGE:-}" ]; then
+			sed -E "s#^([[:space:]]*image:).*#\1 ${K3SM_MLX_IMAGE}#"
+		else
+			cat
+		fi
+}
+
+# seed_image — the image the seed Job runs: the serving image (its interpreter
+# carries huggingface_hub, a dependency of the engine), as the gate will apply it.
+seed_image() {
+	render_manifest "$1" | grep -E '^[[:space:]]*image:' | head -1 | sed -E 's#^[[:space:]]*image:[[:space:]]*##'
+}
+
+# render_seed_job <namespace> <node> <image> <pvc> — a Job that downloads the
+# pinned snapshot into the model's cache PVC under HF_HOME, the layout the engine
+# reads (pkg/mlx modelReference). It is what an operator does on k3sm with no host
+# root: the pod writes the volume as the unprivileged pod user, so ownership is
+# already right. Pinned with nodeName (the PV is node-local) and the darwin
+# selector; tolerations come from the lab helper.
+render_seed_job() {
+	local ns="$1" node="$2" image="$3" pvc="$4"
+	# A pod's mount at an absolute path is a path-rebase shim over opens and mkdir,
+	# not a mount namespace, and huggingface_hub resolves HF_HOME through /var ->
+	# /private/var before it creates directories, which leaves the shim's prefix
+	# (docs/user/limitations.md, "Volume Mounts Resolve for Native Workloads"). So
+	# the mount and HF_HOME are the serving pod's exactly, and the download is
+	# pointed at the same directory by a RELATIVE cache_dir: the pod's working
+	# directory is the pod data volume, where the mount is materialized at ./<path>.
+	local SEED_PY
+	SEED_PY="import os,sys; from huggingface_hub import snapshot_download; c='.'+os.environ['HF_HOME']+'/hub'; print(os.getcwd(), c); print(snapshot_download(sys.argv[1], revision=sys.argv[2], cache_dir=c))"
+	cat <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: m8-seed-$MODEL_NAME
+  namespace: $ns
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      nodeName: $node
+      nodeSelector: {kubernetes.io/os: darwin}
+      tolerations: [$(lab_tolerations_yaml)]
+      containers:
+      - name: seed
+        image: $image
+        command: ["/bin/python3.12", "-c", "$SEED_PY", "$MODEL_REPO", "$MODEL_REV"]
+        env:
+        - {name: HF_HOME, value: $HF_HOME_PATH}
+        volumeMounts:
+        - {name: cache, mountPath: $CACHE_MOUNT}
+      volumes:
+      - name: cache
+        persistentVolumeClaim: {claimName: $pvc}
+EOF
+}
+
+# delete_seed_job — delete the seed Job in the foreground and wait until no pod of
+# it remains (bounded), so nothing but the replica references the cache claim.
+delete_seed_job() {
+	kubectl delete job "m8-seed-$MODEL_NAME" -n "$NS" --ignore-not-found --cascade=foreground --wait=true --timeout=120s >/dev/null 2>&1 || true
+	local d=$((SECONDS + 120))
+	while [ "$SECONDS" -lt "$d" ]; do
+		[ -z "$(kubectl get pods -n "$NS" -l "job-name=m8-seed-$MODEL_NAME" -o name 2>/dev/null || true)" ] && return 0
+		sleep 2
+	done
+	note "seed Job pods still present after 120s"
+}
+
+# --------------------------------------------------------------------------------
+# --self-test: render the manifest and the seed Job and assert their shape. No
+# cluster, no network. The live legs are run on the rig.
+# --------------------------------------------------------------------------------
+if [ "${1:-}" = "--self-test" ]; then
+	st_fail=0
+	st() { if [ "$1" = ok ]; then echo "ok    $2"; else echo "FAIL  $2"; st_fail=1; fi; }
+	m="$(render_manifest lab-ns)"
+	printf '%s\n' "$m" | grep -qx '  namespace: lab-ns' && ! printf '%s\n' "$m" | grep -q 'namespace: default' &&
+		st ok "namespace rendered into the example copy" || st no "namespace rendered into the example copy"
+	[ "$(printf '%s\n' "$m" | grep -c 'namespace:')" = 1 ] && st ok "exactly one namespace line" || st no "exactly one namespace line"
+	[ "$(render_manifest default)" = "$(cat "$EXAMPLE")" ] && st ok "default namespace leaves the example byte-identical" || st no "default namespace leaves the example byte-identical"
+	m="$(K3SM_MLX_IMAGE=example.invalid/img@sha256:abc render_manifest lab-ns)"
+	printf '%s\n' "$m" | grep -q 'image: example.invalid/img@sha256:abc' && st ok "image override still applies" || st no "image override still applies"
+	j="$(K3SM_LAB_TOLERATE_KEYS='estate.example.com/off' render_seed_job lab-ns node-a img:1 cache-$MODEL_NAME-0)"
+	for want in 'kind: Job' 'namespace: lab-ns' 'nodeName: node-a' 'kubernetes.io/os: darwin' \
+		'claimName: cache-qwen3-06b-0' 'image: img:1' "$MODEL_REPO" "$MODEL_REV" \
+		'value: /var/lib/mlx/cache/huggingface' '{key: estate.example.com/off, operator: Exists}'; do
+		printf '%s\n' "$j" | grep -qF -- "$want" && st ok "seed Job carries $want" || st no "seed Job carries $want"
+	done
+	[ "$(printf '%s\n' "$j" | grep -c 'k3sm.io/provider')" = 1 ] && st ok "seed Job tolerates k3sm.io/provider once" || st no "seed Job tolerates k3sm.io/provider once"
+	[ "$(printf '%s\n' "$j" | grep -c 'tolerations:')" = 1 ] && ! printf '%s\n' "$j" | grep -q 'operator: Exists}, {key: [^e]' &&
+		st ok "seed Job tolerates only the provider key and the named extras" || st no "seed Job tolerates only the provider key and the named extras"
+	printf '%s\n' "$j" | grep -qF -- "mountPath: $CACHE_MOUNT" && st ok "seed Job mounts the cache at $CACHE_MOUNT" || st no "seed Job mounts the cache at $CACHE_MOUNT"
+	go_mount="$(sed -nE 's/^[[:space:]]*CacheMountPath = "([^"]+)".*/\1/p' "$REPO_ROOT/pkg/mlx/render.go")"
+	go_home="$(sed -nE 's/^[[:space:]]*hfHomePath = CacheMountPath \+ "([^"]+)".*/\1/p' "$REPO_ROOT/pkg/mlx/render.go")"
+	[ -n "$go_mount" ] && [ "$CACHE_MOUNT" = "$go_mount" ] && st ok "gate cache mount equals the serving pod's ($go_mount)" || st no "gate cache mount equals the serving pod's (${go_mount:-unparsed})"
+	[ -n "$go_home" ] && [ "$HF_HOME_PATH" = "$go_mount$go_home" ] && printf '%s\n' "$j" | grep -qF -- "value: $go_mount$go_home" &&
+		st ok "seed Job HF_HOME equals the serving pod's ($go_mount$go_home)" || st no "seed Job HF_HOME equals the serving pod's"
+	printf '%s\n' "$j" | grep -qF "cache_dir=c" && printf '%s\n' "$j" | grep -qF "c='.'+os.environ['HF_HOME']" &&
+		st ok "seed download targets a relative cache_dir under the mount" || st no "seed download targets a relative cache_dir under the mount"
+	body="$(cat "$0")"
+	del_line="$(printf '%s\n' "$body" | grep -n '^delete_seed_job$' | head -1 | cut -d: -f1)"
+	seed_line="$(printf '%s\n' "$body" | grep -n 'render_seed_job "\$NS"' | head -1 | cut -d: -f1)"
+	ready_line="$(printf '%s\n' "$body" | grep -n '^# m8.4 Ready' | head -1 | cut -d: -f1)"
+	[ -n "$del_line" ] && [ -n "$seed_line" ] && [ -n "$ready_line" ] && [ "$seed_line" -lt "$del_line" ] && [ "$del_line" -lt "$ready_line" ] &&
+		st ok "seed Job is deleted after m8.3-b and before m8.4" || st no "seed Job is deleted after m8.3-b and before m8.4"
+	printf '%s\n' "$body" | grep -q 'cascade=foreground' && st ok "seed Job delete is foreground" || st no "seed Job delete is foreground"
+	[ "$(seed_image lab-ns)" = "$(grep -E '^[[:space:]]*image:' "$EXAMPLE" | head -1 | sed -E 's#^[[:space:]]*image:[[:space:]]*##')" ] &&
+		st ok "seed image is the example's serving image" || st no "seed image is the example's serving image"
+	exit "$st_fail"
+fi
 
 # --------------------------------------------------------------------------------
 # --plan: the ladder, the pins, and nothing else. No cluster, no network, no files
@@ -122,9 +251,9 @@ if [ "${1:-}" = "--plan" ] || [ "${1:-}" = "--dry-run" ]; then
 	echo
 	echo "ladder"
 	echo "  m8.0  preflight   GPU node + MLXModel CRD established + example present"
-	echo "  m8.1  pre-seed    stage the pinned revision on the host (best effort)"
+	echo "  m8.1  pre-seed    nothing staged on the host; the seed runs on the cluster"
 	echo "  m8.2  apply       kubectl apply -f examples/mlxmodel.yaml"
-	echo "  m8.3  volume      cache PVC Bound; seed copied into the PV local path"
+	echo "  m8.3  volume      cache PVC Bound; a seed Job writes the pinned snapshot into it"
 	echo "  m8.4  ready       status.conditions[Ready]=True AND observedGeneration current"
 	echo "  m8.5  endpoint    ClusterIP allocated; status.endpoint published"
 	echo "  m8.5-c served id  GET /v1/models (singular) — the id every completion posts"
@@ -138,7 +267,7 @@ if [ "${1:-}" = "--plan" ] || [ "${1:-}" = "--dry-run" ]; then
 fi
 
 if [ $# -gt 0 ]; then
-	echo "m8.sh: unknown argument: $1 (try --plan)" >&2
+	echo "m8.sh: unknown argument: $1 (try --plan or --self-test)" >&2
 	exit 2
 fi
 
@@ -157,6 +286,7 @@ NS="${NS:-default}"
 MANIFEST=""
 cleanup() {
 	kubectl delete mlxmodel "$MODEL_NAME" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	kubectl delete job "m8-seed-$MODEL_NAME" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	[ -n "$MANIFEST" ] && rm -f "$MANIFEST"
 	return 0
 }
@@ -207,41 +337,23 @@ if [ "$FAIL" -ne 0 ]; then
 fi
 
 # --------------------------------------------------------------------------------
-# m8.1 pre-seed the pinned weights on the host.
-#
-# BEST EFFORT BY CONSTRUCTION. It never fails the gate and never skips a rung: if
-# the stage cannot be built or cannot be copied in, the engine downloads the
-# weights itself and the only cost is a longer m8.4. Making it fatal would turn a
-# Hugging Face outage or a missing CLI into an M8 verdict, which it is not.
+# m8.1 pre-seed. Nothing is staged on the host: the volume lives under a root-owned
+# tree, and an operator on k3sm does not copy into it by hand. The weights are
+# seeded by a Job on the cluster at m8.3-b.
 # --------------------------------------------------------------------------------
-HF_CLI=""
-if command -v hf >/dev/null 2>&1; then HF_CLI="hf"
-elif command -v huggingface-cli >/dev/null 2>&1; then HF_CLI="huggingface-cli"
-fi
-SEEDED=0
-if [ -z "$HF_CLI" ]; then
-	ladder skip "m8.1  pre-seed — no hf/huggingface-cli on PATH; the engine will download in-pod"
-elif HF_HOME="$STAGE" "$HF_CLI" download "$MODEL_REPO" --revision "$MODEL_REV" >/dev/null 2>&1; then
-	SEEDED=1
-	ladder ok "m8.1  pre-seed — pinned revision staged at $STAGE"
-else
-	ladder skip "m8.1  pre-seed — $HF_CLI download failed; the engine will download in-pod"
-fi
+ladder ok "m8.1  pre-seed — no host staging; the seed Job writes the volume at m8.3-b"
 
 # --------------------------------------------------------------------------------
 # m8.2 apply the shipped example.
 #
-# The example is applied as-is unless K3SM_MLX_IMAGE overrides the image. The
-# override is a line-level substitution on a COPY: the point of this gate is to
-# prove the manifest users are handed, so the file itself is never rewritten.
+# The example is applied as-is except for the namespace (rendered to $NS) and, when
+# K3SM_MLX_IMAGE is set, the image. Both are line-level substitutions on a COPY: the
+# point of this gate is to prove the manifest users are handed, so the file itself
+# is never rewritten.
 # --------------------------------------------------------------------------------
 MANIFEST="$(mktemp -t m8-mlxmodel).yaml"
-if [ -n "${K3SM_MLX_IMAGE:-}" ]; then
-	sed -E "s#^([[:space:]]*image:).*#\1 ${K3SM_MLX_IMAGE}#" "$EXAMPLE" > "$MANIFEST"
-	note "image overridden: $K3SM_MLX_IMAGE"
-else
-	cp "$EXAMPLE" "$MANIFEST"
-fi
+render_manifest "$NS" > "$MANIFEST"
+[ -z "${K3SM_MLX_IMAGE:-}" ] || note "image overridden: $K3SM_MLX_IMAGE"
 if [ -n "${K3SM_MLX_NAMESPACE:-}" ]; then
 	kubectl get namespace "$NS" >/dev/null 2>&1 || kubectl create namespace "$NS" >/dev/null
 fi
@@ -279,23 +391,31 @@ else
 	ladder no "m8.3-a  cache PVC $PVC did not bind within 300s"
 fi
 
-PVPATH="$(kubectl get pv "$PV" -o jsonpath='{.spec.local.path}' 2>/dev/null || true)"
-if [ "$SEEDED" -eq 1 ] && [ -n "$PVPATH" ] && [ -d "$PVPATH" ]; then
-	# HF_HOME is set by the operator to <mount>/huggingface, so that subdirectory
-	# is exactly what the stage must become. Ownership is restored to whatever owns
-	# the PV directory (the unprivileged _k3sm user), or the pod cannot write the
-	# cache it is about to use.
-	owner="$(stat -f '%Su:%Sg' "$PVPATH" 2>/dev/null || true)"
-	if mkdir -p "$PVPATH/huggingface" 2>/dev/null &&
-		cp -R "$STAGE/." "$PVPATH/huggingface/" 2>/dev/null &&
-		{ [ -z "$owner" ] || chown -R "$owner" "$PVPATH/huggingface" 2>/dev/null; }; then
-		ladder ok "m8.3-b  staged weights copied into $PVPATH/huggingface (owner $owner)"
-	else
-		ladder skip "m8.3-b  could not write $PVPATH/huggingface (permissions); the engine downloads in-pod"
-	fi
+# m8.3-b: a Job writes the pinned snapshot into the PVC. The replica pod places the
+# PV on a node, so the Job is pinned to that pod's node.
+SEED_NODE=""
+deadline=$((SECONDS + 300))
+while [ "$SECONDS" -lt "$deadline" ]; do
+	SEED_NODE="$(kubectl get pod "$STS-0" -n "$NS" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+	[ -n "$SEED_NODE" ] && break
+	sleep 3
+done
+SEED_JOB="m8-seed-$MODEL_NAME"
+if [ -z "$SEED_NODE" ]; then
+	ladder no "m8.3-b  pod $STS-0 was not scheduled within 300s; no node to seed on"
+elif render_seed_job "$NS" "$SEED_NODE" "$(seed_image "$NS")" "$PVC" | kubectl apply -f - >/dev/null &&
+	kubectl wait --for=condition=complete "job/$SEED_JOB" -n "$NS" --timeout=900s >/dev/null 2>&1; then
+	ladder ok "m8.3-b  seed Job wrote $MODEL_REPO @ ${MODEL_REV:0:12} into $PVC on $SEED_NODE"
 else
-	ladder skip "m8.3-b  no staged weights to copy; the engine downloads in-pod"
+	ladder no "m8.3-b  seed Job did not complete"
+	kubectl logs -n "$NS" "job/$SEED_JOB" --tail=20 2>&1 | sed 's/^/      /' || true
 fi
+# Remove the seed Job and wait for its pods to go: a completed pod still references
+# the claim, and the pvc-protection finalizer would then keep the PVC after the
+# StatefulSet's whenDeleted:Delete fires (m8.9-pvc). The EXIT trap is the backstop.
+delete_seed_job
+# The pod crash-looped on the empty cache until now; restart it onto the snapshot.
+kubectl delete pod "$STS-0" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 # --------------------------------------------------------------------------------
 # m8.4 Ready — via CONDITIONS, with observedGeneration.
