@@ -39,19 +39,18 @@ import (
 
 // M10 conformance criteria.
 //
-// The M10.0 criteria (TestM10_AuditLogLevel, TestM10_PSADefaultWarn) now carry
-// REAL bodies — they run under -tags e2e against a booted `k3sm server`
-// (integration tier, hack/ci.sh --integration; never unit CI). The remaining
-// M10.1/M10.2 criteria are still t.Skip'd TODO stubs so the criterion set is
-// VISIBLE and each criterion has a named home to grow into, WITHOUT yet being
-// required. Per
-// Res.9 a new conformance criterion is promoted into the required M2_CRITERIA/
-// M4_CRITERIA sets (in hack/acceptance/m<n>.sh, enforced by the non-vacuous guard
-// hack/lib/conformance.sh) ONLY in the PR that lands it green — never before, so a
-// green gate is never regressed. Until then a skipped-but-not-required criterion is
-// allowed: conformance.sh only fails on a missing/failed/SKIPPED *required* criterion,
-// and none of these are in a required list. The eventual composite hack/acceptance/
-// m10.sh execs the M10 slice once these land green.
+// This file holds the M10.0 criteria (TestM10_AuditLogLevel,
+// TestM10_PSADefaultWarn, TestM10_PSAEnforceCutover). The M10.1-M10.3 criteria
+// live one per file beside it: m10_perpodip_test.go (TestM10_PerPodIP),
+// m10_events_test.go (TestM10_ProviderEvents), m10_crashloop_test.go
+// (TestM10_CrashLoopBackOff), m10_job_test.go (TestM10_JobCompletion),
+// m10_sidecar_test.go (TestM10_NativeSidecar) and m10_ingress_test.go
+// (TestM10_Ingress); m10_pullsecret_test.go is TestM10_ImagePullSecret. They run
+// under -tags e2e against a running cluster ($KUBECONFIG), never in unit CI, and
+// hack/acceptance/m10.sh is the composite gate that runs every one of them and
+// reports each criterion's verdict. TestM10_PSAEnforceCutover is the one
+// SKIP-SPEC: it needs a server booted with --psa-enforce-baseline, which this
+// harness cannot do per test.
 //
 // Criterion names carry the M10 tag (Res.9 — native sidecars / node Events are M10.x,
 // NOT TestM2_*/TestM4_*).
@@ -122,10 +121,15 @@ func warnClient(t *testing.T) (kubernetes.Interface, *psaWarningCollector) {
 // violating=true adds hostNetwork: true — a `baseline` violation (host
 // namespaces) that is meaningful on Darwin (the hostPath/hostNet axis), while
 // staying admitted under the shipped enforce=privileged default.
+//
+// When $K3SM_E2E_NODE is set the pod is pinned to that node by nodeName: on a
+// multi-node cluster the blanket toleration would otherwise let the scheduler
+// place it on a node the operator has tainted away from test workloads.
 func m10Pod(name string, violating bool) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{"app": name}},
 		Spec: corev1.PodSpec{
+			NodeName:      os.Getenv("K3SM_E2E_NODE"),
 			NodeSelector:  map[string]string{"kubernetes.io/os": "darwin"},
 			RestartPolicy: corev1.RestartPolicyNever,
 			Tolerations:   []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
@@ -370,59 +374,4 @@ func TestM10_PSAEnforceCutover(t *testing.T) {
 		t.Fatalf("baseline-clean pod must stay ADMITTED under enforce=baseline: %v", err)
 	}
 	deletePod(ctx, cs, clean)
-}
-
-// TestM10_NativeSidecar is the M10.2 native-sidecar criterion (Res.8): an initContainer
-// with restartPolicy:Always (the k8s 1.33 stable sidecar) STAYS RUNNING alongside the
-// regular containers and tears down in reverse order — over the new apis PodBox/
-// Container proto restart_policy field (never a k3sm.io/* annotation).
-func TestM10_NativeSidecar(t *testing.T) {
-	t.Skip("TODO(M10.2): assert an initContainer restartPolicy:Always sidecar stays Running + reverse-order teardown over the apis proto field — B73")
-}
-
-// TestM10_CrashLoopBackOff is the M10.2/B26 live-restart criterion: the provider is
-// the SINGLE exit-driven restart authority on the runtimed path (runtimed performs no
-// exit-driven restarts), re-execing a crashed container in place under the effective
-// restart policy with the upstream CrashLoopBackOff schedule. The unit-level contract
-// is pinned by pkg/provider TestNativeSidecarStaysRunning / TestRestartTriggerIdempotent.
-func TestM10_CrashLoopBackOff(t *testing.T) {
-	t.Skip("TODO(M10.2): assert a restartPolicy:Always pod whose container exits nonzero is re-exec'd in place via RestartContainer (provider-decided; runtimed does no exit restarts): between attempts the container status shows waiting.reason=CrashLoopBackOff with the 10s-base doubling back-off message and lastState.terminated carrying the prior exit; restartCount increments monotonically per re-exec (runtimed's restart_count, never double-counted by the provider); the pod PHASE stays Running for the whole crash loop; and a container that stays up past the stabilization window resets the back-off to base on its next crash — B26")
-}
-
-// TestM10_JobCompletion is the M10.2/B74 Job terminal-phase criterion: the controller
-// composition of the per-pod contract pinned by pkg/provider
-// TestJobBackoffAndCompletionAccounting (Never/exit≠0 → Failed terminal; OnFailure/
-// exit≠0 → restart-in-place; mains 0 → Succeeded) against the REAL embedded
-// kube-controller-manager Job controller.
-func TestM10_JobCompletion(t *testing.T) {
-	t.Skip("TODO(M10.2): assert a live batch/v1 Job end-to-end: (1) completions=2 exit-0 pods run to phase Succeeded and the Job reports condition Complete with status.succeeded=2; (2) a restartPolicy:Never Job whose pod exits nonzero surfaces phase Failed TERMINAL (no in-place restart, no CrashLoopBackOff overlay) and the Job controller creates replacement pods until backoffLimit is exhausted → condition Failed reason BackoffLimitExceeded; (3) a restartPolicy:OnFailure Job restarts the SAME pod in place (restartCount++ from runtimed's count, phase stays Running, NO replacement pod) until exit 0 → Succeeded; (4) a sidecar-bearing Job pod (initContainer restartPolicy:Always) goes terminal on its MAINS with the sidecar torn down by runtimed — B74")
-}
-
-// TestM10_ProviderEvents is the M10.2 node-lifecycle-Events criterion: the provider's
-// EventRecorder emits Pulled/Created/Started/Killing/BackOff so `kubectl describe pod`
-// shows the container lifecycle (today the provider has no EventRecorder).
-func TestM10_ProviderEvents(t *testing.T) {
-	t.Skip("TODO(M10.2): assert the provider emits Pulled/Created/Started/Killing/BackOff lifecycle Events — B75")
-}
-
-// TestM10_PerPodIP is the M10.1 per-pod-IP criterion (Res.1): two pods on the same
-// node each report a DISTINCT status.podIP (a real podnet /32, not podIP≈nodeIP), and
-// a headless Service returns ALL backend pod IPs — proving the podnet adapter over
-// supervisor.NodeNetwork on the converged runtimed path.
-func TestM10_PerPodIP(t *testing.T) {
-	t.Skip("TODO(M10.1): assert two same-node pods get distinct podnet /32s + a headless Service returns all pod IPs — B81 (blocked on M10.1 podnet wiring)")
-}
-
-// TestM10_Ingress is the M10.3 ingress criterion: the SERVER-PROCESS-hosted L7
-// ingress (darwin-net pkg/ingress behind pkg/ingresshost) routes by host+path
-// to a backend Service's ClusterIP VIP, the k3sm IngressClass exists, statuses
-// are honest (written only once the listeners are bound), and svclb (B32)
-// advertises a plain LoadBalancer Service only once a host reports it bound
-// (each node's hoster binds and reports on its own Node; the server's decider
-// writes the status). The unit-level contracts are pinned by pkg/ingresshost
-// TestIngressHostingSecretDiscipline / TestIngressClassAndStatus and pkg/svclb
-// TestSvclbBindHonesty / TestNodePoolSelection; the shell gate is
-// hack/acceptance/m10-ingress.sh.
-func TestM10_Ingress(t *testing.T) {
-	t.Skip("TODO(M10.3): against a live `k3sm server` started with the HIGH-PORT ingress listener (--ingress-http-port 8080 --ingress-https-port 8443 — the integration tier; the privileged :80/:443 netd-authorized leg is the LAB slice): (1) assert the IngressClass k3sm (controller k3sm.io/ingress) and the canonical kube-system/k3sm-ingress LoadBalancer Service (ports 80+443, selector-less, svclb-ignored) are provisioned; (2) run a hello-http backend pod + ClusterIP Service, apply an Ingress (class k3sm, host ingress.test, path /) and GET http://<nodeIP>:8080/ with Host: ingress.test → the backend identity, plus a wrong-Host negative → 404; (3) assert the Ingress status.loadBalancer.ingress carries the node InternalIP only AFTER the listener answers (bind-then-advertise); (4) create a plain type=LoadBalancer Service on a free high port fronting the same pod, assert svclb splices <nodeIP>:port → backend AND writes the status IP, then create a CONFLICTING LoadBalancer on the same port and assert its status stays empty (honesty negative); (5) apply an Ingress tls[] block with a kubernetes.io/tls Secret and assert SNI termination on :8443 serves that certificate and a rotated Secret is re-served after the next reconcile — M10.3 (closes the live leg of B32)")
 }
