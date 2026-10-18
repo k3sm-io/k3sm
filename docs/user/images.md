@@ -118,6 +118,17 @@ either path; see [What runs](what-runs.md).
 > writes a portable artifact to a path you name, which is what you want for moving the image to
 > another node or a registry, and it is equally usable with other tools.
 
+`--no-record` builds without the store. The build writes `--output`, uploads with `--push`, or
+both, and never contacts the node's runtime daemon or its image store, so it needs no root. It is
+refused without `--output` or `--push`. To run the image on the build Mac afterwards, record it as
+a separate step, as root: `sudo k3sm image load myapp.tar` for a docker-save tar, or tar an OCI
+layout and `sudo k3sm image import` the tar (see "Loading an Image Into the Store" below).
+
+```sh
+k3sm build --tag myapp:v1 --no-record --output myapp.tar .   # a file only, as your own user
+sudo k3sm image load myapp.tar                               # into the store, when you want it
+```
+
 ### Build History: `k3sm build ls`
 
 Every `k3sm build` is recorded in your build history when it starts and again when it finishes,
@@ -173,7 +184,7 @@ Each of these is a documented difference:
 | `.dockerignore` | **Not implemented.** `COPY .` therefore includes `.git`, `.env` and anything else in the directory, so scope your `COPY` lines, or build from a clean tree. |
 | `--platform` | Accepts `darwin/arm64` (the default, packaged natively) and Linux targets, which build on the engine; name several at once for a multi-platform index. Neither builder cross-compiles: a `darwin/arm64` image is refused any other value on the native path, and a `RUN` step for an architecture the engine's `arm64` guest cannot execute is refused by name. |
 | Variables (`$VAR`), `ARG` | **Rejected.** No expansion is performed, and a literal `$` in a path would be an invisible divergence. |
-| Build output | Recorded in this node's image store under the tag you gave. `--output` additionally writes a portable artifact (a docker-save tar, or an OCI layout with `--format oci`) to a path you name. `--push` additionally uploads it. The store recording happens in every case, including with `--push`, because what a k3sm build produces is an image this node can run. |
+| Build output | Recorded in this node's image store under the tag you gave. `--output` additionally writes a portable artifact (a docker-save tar, or an OCI layout with `--format oci`) to a path you name. `--push` additionally uploads it. The store recording happens in every case, including with `--push`, because what a k3sm build produces is an image this node can run, unless you pass `--no-record`, which skips the store, needs no root, and requires `--output` or `--push`. |
 | Timestamps | Fixed, not wall-clock, so rebuilding the same context yields the same image digest. |
 | File modes | Normalized to `0755` (if any execute bit is set) or `0644`. A `0600` source becomes world-readable in the image, and setuid/setgid/sticky bits are dropped. Preserving source modes would break reproducibility, since git records only the execute bit. |
 | Ownership & xattrs | Every entry is `uid 0 / gid 0` with no user or group name, and no extended attributes, so the builder's account identity and macOS xattrs (including `com.apple.quarantine`) never reach the image. |

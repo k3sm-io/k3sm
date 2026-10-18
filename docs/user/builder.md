@@ -91,6 +91,31 @@ k3sm build -t myapp:v1 --output ./layout --format oci .
 k3sm image push ./layout localhost:6450/myapp:v1
 ```
 
+### Building without the store: `--no-record`
+
+Recording into the store goes through the node's runtime daemon, whose socket
+only the daemon's own account can use, so an ordinary user's build fails at
+that step. `--no-record` skips it. The build writes `--output`, uploads with
+`--push`, or both, and never contacts the daemon or this node's image store, so
+it needs no root:
+
+```sh
+k3sm build -t myapp:v1 --no-record --output myapp.tar .
+k3sm build -t myapp:v1 --no-record --output ./layout --format oci .
+k3sm build -t ghcr.io/org/myapp:v1 --no-record --push .
+```
+
+A build with `--no-record` and neither `--output` nor `--push` is refused before
+it starts, because the image would have nowhere to go. The summary says the
+image was not recorded and prints the command that records it. Running the
+image on the build Mac is then a separate step, as root:
+
+```sh
+sudo k3sm image load myapp.tar                 # a docker-save tar
+tar -cf layout.tar -C ./layout .               # an OCI layout: tar it,
+sudo k3sm image import layout.tar              # then import it
+```
+
 ## The engine
 
 The engine is a long-lived [BuildKit](https://github.com/moby/buildkit) daemon
