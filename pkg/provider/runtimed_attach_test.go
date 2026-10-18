@@ -649,3 +649,60 @@ func TestPodsToAttachIncludesVMPods(t *testing.T) {
 		t.Errorf("podsToAttach = %v, want %v", got, want)
 	}
 }
+
+// TestReattachKeepsContainerStartedAt pins that an attach publishes the start
+// facts of the pod's first life: the container's running startedAt is the one
+// runtimed's attach reported, and status.startTime is the one the pod was
+// published with. Neither is stamped with the time of the attach.
+func TestReattachKeepsContainerStartedAt(t *testing.T) {
+	podStart := time.Unix(1_700_000_000, 0)
+	containerStart := podStart.Add(30 * time.Second)
+	web := attachTestPod("web", corev1.PodRunning, "100.64.0.7", podStart)
+
+	rt := newAttachRuntime()
+	rt.results["uid-web"] = attachResult{status: &runtimev1.PodStatus{
+		PodId: "uid-web",
+		Phase: runtimev1.PodPhase_POD_PHASE_RUNNING,
+		PodIp: "100.64.0.7",
+		ContainerStatuses: []*runtimev1.ContainerStatus{
+			{
+				Name: "c0", Image: "registry/web:latest", ContainerId: "cid0", Ready: true,
+				State: &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: timestamppb.New(containerStart)}},
+			},
+			{
+				Name: "c1", Image: "registry/web:latest", ContainerId: "cid1", Ready: true,
+				State: &runtimev1.ContainerState{Running: &runtimev1.ContainerStateRunning{StartedAt: timestamppb.New(containerStart)}},
+			},
+		},
+	}}
+
+	r := newRuntimedWith(rt, RuntimedConfig{
+		NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(),
+		Network: NewPodNetAdapter(newFakeIPAM(t, "100.64.0.0/24"), "192.168.1.10", nil),
+	}, nil, nil)
+	r.podSource = &fakePodSource{listed: []corev1.Pod{web}}
+	ctx := context.Background()
+
+	r.adoptNodePods(ctx, rt)
+
+	st, err := r.GetPodStatus(ctx, "default", "web")
+	if err != nil {
+		t.Fatalf("GetPodStatus web: %v", err)
+	}
+	if st.StartTime == nil || !st.StartTime.Time.Equal(podStart) {
+		t.Errorf("status.startTime = %v, want the first-life %v", st.StartTime, podStart)
+	}
+	if len(st.ContainerStatuses) != 2 {
+		t.Fatalf("containerStatuses = %d, want 2", len(st.ContainerStatuses))
+	}
+	for _, cs := range st.ContainerStatuses {
+		run := cs.State.Running
+		if run == nil || !run.StartedAt.Time.Equal(containerStart) {
+			t.Errorf("%s state.running = %+v, want startedAt %v", cs.Name, run, containerStart)
+			continue
+		}
+		if st.StartTime != nil && st.StartTime.Time.After(run.StartedAt.Time) {
+			t.Errorf("%s startedAt %v precedes status.startTime %v", cs.Name, run.StartedAt.Time, st.StartTime.Time)
+		}
+	}
+}
