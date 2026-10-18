@@ -71,6 +71,14 @@ func TestSampleHostStatsLive(t *testing.T) {
 	if s.PIDCount < 2 || s.PIDCount > s.PIDMax {
 		t.Errorf("PIDCount = %d, want 2..%d", s.PIDCount, s.PIDMax)
 	}
+	// The per-uid ceiling is positive and never above the systemwide one; the
+	// host sampler leaves the pod process count to the status loop.
+	if s.PIDMaxPerUID <= 0 || s.PIDMaxPerUID > s.PIDMax {
+		t.Errorf("PIDMaxPerUID = %d, want kern.maxprocperuid in 1..%d", s.PIDMaxPerUID, s.PIDMax)
+	}
+	if s.PodProcReported {
+		t.Errorf("PodProcReported = true from the host sampler, want false")
+	}
 
 	// A missing path must fail the whole snapshot rather than yield a zeroed one
 	// that the unsampled guards would read as "no pressure".

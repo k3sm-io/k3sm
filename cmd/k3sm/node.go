@@ -1116,6 +1116,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 				DataRoot:       opts.podRoot,
 				RuntimeHealthy: runtimeHealthProbe(prov),
 				Images:         nodeImageInventory(prov),
+				PodProcesses:   nodePodProcessCounter(prov),
 				Log:            slog.Default(),
 			})
 			if nerr != nil {
@@ -1334,6 +1335,28 @@ func nodeImageInventory(prov vkadapter.Provider) provider.ImageInventory {
 		return nil
 	}
 	return inv
+}
+
+// podProcessCounterSource is the optional provider capability the node-status
+// loop reads for PIDPressure's per-uid leg, declared at this consumer like
+// imageInventorySource.
+type podProcessCounterSource interface {
+	PodProcessCounter() (provider.PodProcessCounter, bool)
+}
+
+// nodePodProcessCounter returns prov's pod process counter, or nil when its
+// runtime keeps no process ledger; a nil counter leaves PIDPressure with the
+// systemwide leg only.
+func nodePodProcessCounter(prov vkadapter.Provider) provider.PodProcessCounter {
+	s, ok := prov.(podProcessCounterSource)
+	if !ok {
+		return nil
+	}
+	c, ok := s.PodProcessCounter()
+	if !ok {
+		return nil
+	}
+	return c
 }
 
 // evictionManagerRunner is the optional provider capability that runs the

@@ -148,7 +148,7 @@ func TestComputeNodeConditionsPressure(t *testing.T) {
 			{"exactly 90% used -> sufficient (strict >)", 900, corev1.ConditionFalse,
 				"KubeletHasSufficientPID", "kubelet has sufficient PID available"},
 			{"just above 90% used -> insufficient", 901, corev1.ConditionTrue,
-				"KubeletHasInsufficientPID", "kubelet has insufficient PID available"},
+				"KubeletHasInsufficientPID", "kubelet has insufficient PID available: systemwide 901 of kern.maxproc 1000"},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {

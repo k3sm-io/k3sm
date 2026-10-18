@@ -65,6 +65,10 @@ type NodeStatusConfig struct {
 	// means the runtime keeps no image store (the host-process runtime), and the
 	// node reports no images.
 	Images ImageInventory
+	// PodProcesses reports the process counts the pods hold, the numerator of
+	// PIDPressure's per-uid leg. A nil value means the runtime keeps no process
+	// ledger (the host-process runtime), and only the systemwide leg runs.
+	PodProcesses PodProcessCounter
 	// Interval overrides the status recompute period; zero uses
 	// defaultNodeStatusInterval.
 	Interval time.Duration
@@ -115,6 +119,7 @@ type NodeStatusProvider struct {
 	interval  time.Duration
 	health    func(ctx context.Context) bool
 	inventory ImageInventory
+	podProcs  PodProcessCounter
 
 	// Seams, defaulted by the constructor. Tests replace them to drive the loop
 	// hermetically — no Mach, no statfs, no apiserver. sample is the HOST
@@ -141,6 +146,15 @@ type NodeStatusProvider struct {
 	imagesInFlight bool
 	// imagesWG counts the in-flight listing goroutine; tests wait on it.
 	imagesWG sync.WaitGroup
+
+	// procCount and procReported are the last pod process count the runtime
+	// answered (see PodProcessCounter), carried across a failed call like the
+	// image list. procFailing, procInFlight and procWG mirror the image fields.
+	procCount    int64
+	procReported bool
+	procFailing  bool
+	procInFlight bool
+	procWG       sync.WaitGroup
 
 	// monitor owns the host sample (see the type doc).
 	monitor *pressureMonitor
@@ -177,6 +191,7 @@ func NewNodeStatusProvider(cfg NodeStatusConfig) (*NodeStatusProvider, error) {
 		interval:  interval,
 		health:    cfg.RuntimeHealthy,
 		inventory: cfg.Images,
+		podProcs:  cfg.PodProcesses,
 		sample:    sampleHostStats,
 		now:       time.Now,
 		publish:   naive.UpdateStatus,
@@ -279,6 +294,8 @@ func (p *NodeStatusProvider) publishOnce(ctx context.Context) error {
 		healthy = p.health(ctx)
 	}
 	p.startImageRefresh(ctx)
+	p.startProcessCountRefresh(ctx)
+	s.PodProcCount, s.PodProcReported = p.cachedProcessCount()
 	node := p.recompute(s, sampled, healthy, metav1.NewTime(p.now()))
 	node.Status.Images = p.cachedImages()
 	return p.publish(ctx, node)
@@ -348,6 +365,68 @@ func (p *NodeStatusProvider) refreshImages(ctx context.Context) {
 		p.imagesFailing = false
 		p.log.Info("list node images recovered; Node.status.images is current again")
 	}
+}
+
+// podProcessCountTimeout bounds one pod process count call. Like the image
+// listing it runs off the publish path.
+const podProcessCountTimeout = 5 * time.Second
+
+// startProcessCountRefresh starts one pod process count call in its own
+// goroutine, unless one is already running, for the same reason and with the
+// same lifetime as startImageRefresh: a slow runtime never delays a heartbeat,
+// and a publication reads whatever the cache holds.
+func (p *NodeStatusProvider) startProcessCountRefresh(ctx context.Context) {
+	if p.podProcs == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.procInFlight {
+		p.mu.Unlock()
+		return
+	}
+	p.procInFlight = true
+	p.procWG.Add(1)
+	p.mu.Unlock()
+	go func() {
+		defer p.procWG.Done()
+		p.refreshProcessCount(ctx)
+	}()
+}
+
+// refreshProcessCount asks the runtime for the pods' process count once and
+// updates the cache. A failure keeps the previous count, warns on the
+// transition into failure and logs the recovery once, as refreshImages does.
+// Before the first answer the cache reports nothing and the per-uid leg is
+// skipped.
+func (p *NodeStatusProvider) refreshProcessCount(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(ctx, podProcessCountTimeout)
+	count, reported, err := p.podProcs.PodProcessCount(cctx)
+	cancel()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.procInFlight = false
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if !p.procFailing {
+			p.procFailing = true
+			p.log.Warn("count pod processes failed; the per-uid PIDPressure leg keeps the previous count until a count succeeds", "error", err)
+		}
+		return
+	}
+	p.procCount, p.procReported = count, reported
+	if p.procFailing {
+		p.procFailing = false
+		p.log.Info("count pod processes recovered; the per-uid PIDPressure leg is current again")
+	}
+}
+
+// cachedProcessCount returns the cached pod process count for one publication.
+func (p *NodeStatusProvider) cachedProcessCount() (int64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.procCount, p.procReported
 }
 
 // cachedImages returns a copy of the image cache for one publication. Before

@@ -58,12 +58,17 @@ func sampleHostStats(dataRoot string) (hostStats, error) {
 	}
 	blockSize := int64(fs.Bsize)
 
-	// kern.maxproc is the machine's global process-table ceiling — the wall that
-	// actually stops a pod from forking. See pidPressureUsedPercent for why the
-	// per-uid ceiling is not the denominator here.
+	// kern.maxproc is the machine's global process-table ceiling, the
+	// systemwide PIDPressure leg's denominator. kern.maxprocperuid is the
+	// ceiling every non-root uid meets, the pods' service user included: the
+	// per-uid leg's denominator. See pidPressureUsedPercent for both legs.
 	maxProc, err := unix.SysctlUint32("kern.maxproc")
 	if err != nil {
 		return hostStats{}, fmt.Errorf("sysctl kern.maxproc: %w", err)
+	}
+	maxProcPerUID, err := unix.SysctlUint32("kern.maxprocperuid")
+	if err != nil {
+		return hostStats{}, fmt.Errorf("sysctl kern.maxprocperuid: %w", err)
 	}
 	procCount, err := sampleProcessCount()
 	if err != nil {
@@ -82,6 +87,7 @@ func sampleHostStats(dataRoot string) (hostStats, error) {
 		DiskCapacityBytes:        int64(fs.Blocks) * blockSize,
 		PIDCount:                 procCount,
 		PIDMax:                   int64(maxProc),
+		PIDMaxPerUID:             int64(maxProcPerUID),
 		CompressorPages:          head.compressorPages,
 		CompressorPagesLimit:     head.compressorPagesLimit,
 		CompressorSegments:       head.compressorSegments,

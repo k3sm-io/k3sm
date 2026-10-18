@@ -17,6 +17,8 @@ limitations under the License.
 package provider
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -96,19 +98,54 @@ const diskPressureTripFreeBytes int64 = 2 << 30
 // level that clears this condition.
 const diskPressureClearFreeBytes int64 = 10 << 30
 
-// pidPressureUsedPercent is the fraction, in percent, of the SYSTEMWIDE process
-// ceiling above which k3sm raises PIDPressure. Upstream Kubernetes ships NO
-// default pid.available eviction threshold, so this is a k3sm-specific default,
-// not a "kubelet default".
+// pidPressureUsedPercent is the fraction, in percent, of a process ceiling above
+// which k3sm raises PIDPressure. Upstream Kubernetes ships NO default
+// pid.available eviction threshold, so this is a k3sm-specific default, not a
+// "kubelet default". It applies to two legs, and PIDPressure is True when either
+// trips:
 //
-// The denominator is kern.maxproc — the machine's global process table — because
-// that is the wall that actually stops a pod from forking. It is the honest
-// choice for a node that shares its process table with a human's login session:
-// the per-uid ceiling (kern.maxprocperuid) can be nowhere near exhausted on a
-// machine that nonetheless cannot spawn, and the per-uid figure varies by an
-// order of magnitude across Macs. A per-uid leg scoped to k3sm's own service
-// account is a separate, additive signal and is not sampled here.
+//   - The SYSTEMWIDE leg, which stays authoritative: the machine's process-table
+//     size over kern.maxproc, the wall that stops any process from forking. A Mac
+//     shares its process table with a human's login session, so this leg can
+//     trip on processes k3sm never started.
+//   - The PER-UID leg, k3sm-specific: the processes the pods report over
+//     kern.maxprocperuid, the ceiling the unprivileged service user's pods meet
+//     first. Its numerator is a documented LOWER BOUND: it counts the members of
+//     each pod's recorded process group(s), as the runtime daemon reports them,
+//     while the kernel's per-uid limit also counts the uid's other processes and
+//     any process that left its group. So this leg can fire later than the true
+//     limit, never earlier. It is skipped when no pod reports a count or the
+//     ceiling was not sampled.
+//
+// Both legs trip strictly ABOVE the percentage, never at it.
 const pidPressureUsedPercent int64 = 90
+
+// The PIDPressure Reason/Message literals, the kubelet's own strings. A True
+// condition's Message gains a ": <leg reading>" suffix (pidPressured).
+const (
+	sufficientPIDReason    = "KubeletHasSufficientPID"
+	sufficientPIDMessage   = "kubelet has sufficient PID available"
+	insufficientPIDReason  = "KubeletHasInsufficientPID"
+	insufficientPIDMessage = "kubelet has insufficient PID available"
+)
+
+// pidPressured reports whether either PIDPressure leg exceeds
+// pidPressureUsedPercent of its ceiling, and a reading naming the leg that
+// tripped (the systemwide leg first, when both do). Both legs cross-multiply to
+// avoid floating point, and each is skipped when its ceiling is zero
+// (unsampled); the per-uid leg is also skipped when no pod reports a count.
+func pidPressured(s hostStats) (bool, string) {
+	if s.PIDMax > 0 && s.PIDCount*100 > s.PIDMax*pidPressureUsedPercent {
+		return true, fmt.Sprintf("systemwide %d of kern.maxproc %d", s.PIDCount, s.PIDMax)
+	}
+	// The first comparison keeps a huge reported count from overflowing the
+	// cross-multiplication: past the ceiling itself the leg has tripped anyway.
+	if s.PodProcReported && s.PIDMaxPerUID > 0 &&
+		(s.PodProcCount > s.PIDMaxPerUID || s.PodProcCount*100 > s.PIDMaxPerUID*pidPressureUsedPercent) {
+		return true, fmt.Sprintf("per-uid %d pod processes of kern.maxprocperuid %d", s.PodProcCount, s.PIDMaxPerUID)
+	}
+	return false, ""
+}
 
 // The DiskPressure Reason/Message literals. They are named because BOTH
 // computeNodeConditions (which raises the condition) and reconcileTransitions
@@ -180,6 +217,16 @@ type hostStats struct {
 	// PIDMax is the systemwide process ceiling, kern.maxproc. A zero value means
 	// "not yet sampled" and is treated as no pressure.
 	PIDMax int64
+	// PIDMaxPerUID is kern.maxprocperuid, the process ceiling the pods' uid
+	// meets: the denominator of the per-uid PIDPressure leg. Zero means "not
+	// sampled" and skips that leg.
+	PIDMaxPerUID int64
+	// PodProcCount is the sum of the process counts the pods report
+	// (sumPodProcessCounts), the per-uid leg's numerator and a lower bound.
+	// PodProcReported is false when no pod reports a count, which skips the
+	// leg; a zero PodProcCount with PodProcReported true is a real zero.
+	PodProcCount    int64
+	PodProcReported bool
 
 	// CompressorPages and CompressorPagesLimit are vm.compressor.pages_compressed
 	// and vm.compressor.pages_compressed_limit; CompressorSegments and
@@ -263,21 +310,20 @@ func computeNodeConditions(s hostStats, now metav1.Time) []corev1.NodeCondition 
 		disk.Message = diskPressureMessage
 	}
 
-	// PIDPressure: True iff systemwide PID usage exceeds pidPressureUsedPercent of
-	// kern.maxproc. Cross-multiply to avoid floating point; guard a zero
-	// (unsampled) PIDMax.
+	// PIDPressure: True iff either leg of pidPressured trips; the Message names
+	// the leg that did, the way MemoryPressure names its signal.
 	pid := corev1.NodeCondition{
 		Type:               corev1.NodePIDPressure,
 		Status:             corev1.ConditionFalse,
-		Reason:             "KubeletHasSufficientPID",
-		Message:            "kubelet has sufficient PID available",
+		Reason:             sufficientPIDReason,
+		Message:            sufficientPIDMessage,
 		LastHeartbeatTime:  now,
 		LastTransitionTime: now,
 	}
-	if s.PIDMax > 0 && s.PIDCount*100 > s.PIDMax*pidPressureUsedPercent {
+	if pressured, reading := pidPressured(s); pressured {
 		pid.Status = corev1.ConditionTrue
-		pid.Reason = "KubeletHasInsufficientPID"
-		pid.Message = "kubelet has insufficient PID available"
+		pid.Reason = insufficientPIDReason
+		pid.Message = insufficientPIDMessage + ": " + reading
 	}
 
 	// NetworkUnavailable: always False. k3sm sets this statically — the node's
