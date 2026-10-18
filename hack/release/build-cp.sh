@@ -118,7 +118,12 @@ go_dir() {
 # staging modules); without one, workspace mode is off.
 build_env() {
 	local src="$1" work="$2" godir="$3" gowork="off"
-	[ -f "$src/go.work" ] && gowork="$src/go.work"
+	# The go command's cwd is the resolved path, so GOWORK must name the same
+	# spelling or it does not match the workspace's `use .` (B766).
+	if [ -f "$src/go.work" ]; then
+		src="$(cd "$src" && pwd -P)"
+		gowork="$src/go.work"
+	fi
 	cat <<-EOF
 		PATH=$godir:/usr/bin:/bin
 		HOME=$work/home
@@ -135,6 +140,10 @@ build_env() {
 		SOURCE_DATE_EPOCH=$KUBE_TAG_EPOCH
 	EOF
 }
+
+# cleanup_tree <dir>: remove a work tree even when it holds read-only
+# directories (a Go module cache is written read-only).
+cleanup_tree() { chmod -R u+w "$1" 2>/dev/null || true; rm -rf "$1"; }
 
 # prepare_work <work>: create the directories build_env points into.
 prepare_work() { mkdir -p "$1/home" "$1/gocache" "$1/gopath" "$1/tmp"; }
@@ -230,7 +239,8 @@ build() {
 	out="$(cd "$out" && pwd)"
 	work="$(mktemp -d -t k3sm-build-cp)"
 	# shellcheck disable=SC2064 # expand now: work is local
-	trap "rm -rf '$work'" EXIT
+	trap "cleanup_tree '$work'" EXIT
+	work="$(cd "$work" && pwd -P)"
 	tgz="$work/kubernetes-src.tar.gz"
 	mkdir "$work/src"
 	prepare_work "$work"
@@ -241,6 +251,7 @@ build() {
 	echo "==> verify sha512, then extract"
 	verify_and_extract "$tgz" "$KUBE_SRC_SHA512" "$work/src" || die "the source archive failed verification"
 	src="$(source_root "$work/src")" || die "unrecognised source layout"
+	src="$(cd "$src" && pwd -P)"
 	assert_toolchain "$src" "$work" "$godir" || die "toolchain mismatch"
 
 	for name in "${OUTPUTS[@]}"; do
@@ -259,10 +270,10 @@ build() {
 # Hermetic: no network, no credentials. The positive build path is NOT exercised
 # here (it needs the real archive and its toolchain); the refusals are.
 self_test() {
-	local self="$HERE/build-cp.sh" tmp fails=0 out plan want name fix good dest
+	local self="$HERE/build-cp.sh" tmp fails=0 rs out plan want name fix good dest
 	tmp="$(mktemp -d -t k3sm-build-cp-selftest)"
 	# shellcheck disable=SC2064 # expand now: tmp is local
-	trap "rm -rf '$tmp'" EXIT
+	trap "cleanup_tree '$tmp'" EXIT
 	ok() { echo "  ok    $*"; }
 	bad() { echo "  FAIL  $*"; fails=$((fails + 1)); }
 
@@ -312,7 +323,16 @@ self_test() {
 	done
 	if build_env "<src>" "<work>" "<go-dir>" | grep -qx "GOWORK=off"; then ok "a source without go.work builds with workspace mode off"; else bad "the plan does not isolate GOWORK"; fi
 	mkdir -p "$tmp/wsrc" && : >"$tmp/wsrc/go.work"
-	if build_env "$tmp/wsrc" "$tmp/w" "/g" | grep -qx "GOWORK=$tmp/wsrc/go.work"; then ok "a source with go.work builds as its own workspace"; else bad "GOWORK does not name the source's go.work"; fi
+	if build_env "$tmp/wsrc" "$tmp/w" "/g" | grep -qx "GOWORK=$(cd "$tmp/wsrc" && pwd -P)/go.work"; then ok "a source with go.work builds as its own workspace"; else bad "GOWORK does not name the source's go.work"; fi
+
+	# B766: a src reached through a symlinked parent must yield the resolved GOWORK.
+	mkdir -p "$tmp/real/s" && : >"$tmp/real/s/go.work" && ln -s "$tmp/real" "$tmp/link"
+	rs="$(cd "$tmp/real/s" && pwd -P)"
+	if build_env "$tmp/link/s" "$tmp/w" "/g" | grep -qx "GOWORK=$rs/go.work"; then ok "GOWORK names the resolved path through a symlinked parent"; else bad "GOWORK keeps the symlinked spelling"; fi
+	# B766: cleanup removes a tree holding a read-only subtree.
+	mkdir -p "$tmp/ro/a/b" && : >"$tmp/ro/a/b/f" && chmod -R a-w "$tmp/ro/a"
+	cleanup_tree "$tmp/ro"
+	if [ ! -e "$tmp/ro" ]; then ok "cleanup removes a work dir with a read-only subtree"; else chmod -R u+w "$tmp/ro"; bad "a read-only subtree survived cleanup"; fi
 
 	echo "==> the extractor is the system bsdtar"
 	if [ "$TAR" = /usr/bin/tar ] && is_bsdtar; then ok "$TAR is bsdtar"; else bad "$TAR is not bsdtar"; fi
