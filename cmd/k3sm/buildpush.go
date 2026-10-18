@@ -71,12 +71,24 @@ func pushDelivered(ctx context.Context, o buildOptions, ref name.Tag, b built, p
 	workDir := workDirFromEnv()
 	target, err := resolvePushTarget(o.tag, workDir)
 	if err != nil {
-		return name.Tag{}, pushAfterStoreError(ref, err)
+		return name.Tag{}, pushFailure(o, ref, err)
 	}
 	if err := push(ctx, target, b, workDir); err != nil {
-		return name.Tag{}, pushAfterStoreError(ref, err)
+		return name.Tag{}, pushFailure(o, ref, err)
 	}
 	return target, nil
+}
+
+// pushFailure renders a push failure for where the build left the image: in the
+// node store, or, under --no-record, only at --output if anywhere.
+func pushFailure(o buildOptions, ref name.Tag, err error) error {
+	if !o.noRecord {
+		return pushAfterStoreError(ref, err)
+	}
+	if o.output != "" {
+		return fmt.Errorf("image %s was written to %s and not recorded (--no-record); push failed: %w", ref, o.output, err)
+	}
+	return fmt.Errorf("image %s was not recorded (--no-record) and has no --output; push failed: %w", ref, err)
 }
 
 // pushAfterStoreError renders a push failure that happened after the store

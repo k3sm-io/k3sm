@@ -25,8 +25,9 @@
 #   hack/images/mlx-serve/build.sh --check-lock <file>
 #
 # Requires: macOS on Apple silicon, uv, python3, and a `k3sm` binary. It needs
-# no root, writes only under its work dir, and pushes nothing anywhere — see
-# README.md for the publish step.
+# no root: it packages with `k3sm build --no-record`, which writes the OCI layout
+# and never touches this node's image store. It writes only under its work dir
+# and pushes nothing anywhere — see README.md for the publish step.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -351,10 +352,13 @@ stage_shard_entrypoint
 assert_stageable
 assert_context_budget
 
-echo "==> package (k3sm build --format oci)"
+echo "==> package (k3sm build --no-record --format oci)"
 print_dockerfile > "$WORK/Dockerfile"
 rm -rf "$OUT"
-"$K3SM_BIN" build --file "$WORK/Dockerfile" --tag "$TAG" --format oci --output "$OUT" "$STAGE"
+# --no-record: the product is the layout, which `k3sm image push` publishes. The
+# image store is not needed, and recording into it would need root (the runtime
+# daemon's socket), so the build stays an ordinary user's.
+"$K3SM_BIN" build --no-record --file "$WORK/Dockerfile" --tag "$TAG" --format oci --output "$OUT" "$STAGE"
 
 DIGEST="$(python3 -c '
 import json, sys
