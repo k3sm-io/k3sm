@@ -186,6 +186,11 @@ type nodeOptions struct {
 	// node (serverSelfPodCIDR), the index-0 default on a single node
 	// (defaultNodePodCIDR). Never a second IPAM source.
 	podCIDR string
+	// meshIP is this node's mesh address: a joined worker's enrolled res.MeshIP,
+	// a mesh server's --mesh-ip. Empty off the mesh, where the node's address in
+	// its own range is the range's mesh-egress .1 (nodePodRange derives it). It
+	// only cross-checks the pod range the Node publishes as spec.podCIDR.
+	meshIP string
 	// netMode is the resolved host-network backend the podnet adapter's lo0
 	// alias plumbing and the runtimed preflight follow (helper vs direct vs
 	// none). The zero value is BackendNone (no datapath — no adapter, podIP ≈
@@ -674,6 +679,22 @@ func nodeInternalIP(podCIDR string) string {
 	return ip.String()
 }
 
+// nodePodRange is the pod range this node publishes on its Node object: the
+// /24 its podnet adapter allocates pod /32s from (opts.podCIDR, the one IPAM
+// source), cross-checked against the node's mesh address. It publishes nothing
+// when the node allocates no pod addresses (hostprocess, --network none), where
+// pods share the node's address and no range describes them.
+func nodePodRange(opts nodeOptions, allocates bool, log *slog.Logger) provider.NodePodRange {
+	if !allocates {
+		return provider.NodePodRange{}
+	}
+	meshIP := opts.meshIP
+	if meshIP == "" {
+		meshIP = nodeInternalIP(opts.podCIDR)
+	}
+	return provider.NewNodePodRange(opts.podCIDR, meshIP, log)
+}
+
 // errRuntimedPosture is the NAMED refuse-to-start error of the default runtime:
 // the runtimed runtime's pod network needs root or the
 // netd helper, and neither is present. k3sm never silently degrades to
@@ -1046,6 +1067,10 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	if s, ok := prov.(provider.ObjectSource); ok {
 		objects = s.Objects()
 	}
+	// The pod range this node publishes as spec.podCIDR(s): stamped on the Node a
+	// fresh registration creates, and patched once after Ready onto an existing
+	// Node that carries none.
+	podRange := nodePodRange(opts, netAdapter != nil, slog.Default())
 	n, err := vkadapter.NewNode(opts.nodeName, vkadapter.NodeConfig{
 		Client:           cs,
 		HeartbeatClient:  heartbeatCS, // nil on the server's in-process node: cs carries the heartbeat there
@@ -1056,7 +1081,10 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		TLSConfig:        servingTLS,       // nil = plain HTTP (dev path); set = kubelet-serving TLS, every presented client cert verified
 		AuthorizeHandler: authorizeKubelet, // nil iff TLSConfig is nil — the adapter enforces the pairing
 		TokenRoutes:      tokenRoutes,      // the read-only metrics routes the bearer path is confined to; nil with TLSConfig
-		ConfigureNode:    func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, opts.listen, caps) },
+		ConfigureNode: func(nd *corev1.Node) {
+			configureNode(nd, opts.nodeName, internalIP, opts.listen, caps)
+			podRange.Stamp(nd)
+		},
 		// The kubelet's own /containerLogs surface, on a subtree pattern that
 		// beats Virtual Kubelet's "/" catch-all. VK's logs route flattens
 		// tailLines and limitBytes into ints, which cannot express `--tail=0` or
@@ -1142,6 +1170,13 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 
 	if err := awaitNodeReady(ctx, n.Ready(), errc, nodeStartupTimeout, opts.nodeName, opts.listen); err != nil {
 		return err
+	}
+	// A Node registered before it carried a pod range (an earlier release, or a
+	// Node that survived a restart) gets it here, once: Virtual Kubelet's
+	// registration of an existing Node writes status only. A failure is logged
+	// and not retried; the next start tries again.
+	if err := podRange.Publish(ctx, cs.CoreV1().Nodes(), opts.nodeName); err != nil {
+		slog.Default().Warn("could not publish this node's pod range as spec.podCIDR; the next start retries", "node", opts.nodeName, "err", err)
 	}
 	// Container-log rotation and garbage collection start HERE, after the node is
 	// ready — which is after Virtual Kubelet's pod informer has synced, so the

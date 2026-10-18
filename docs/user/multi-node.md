@@ -126,6 +126,7 @@ new node is index 1, its pod range is `100.64.1.0/24`, and the address it will b
 reserved, so with a second server at `100.64.1.0/24` the next worker gets `100.64.2.0/24`. Each
 range is owned through a claim object (a `Lease` named `meshrange-<n>` in `kube-system`), and two
 servers answering joins at once cannot hand out the same range.
+Each node also publishes its pod range on its Node object as `spec.podCIDR` (and `spec.podCIDRs`).
 
 The join also returns the list of apiserver endpoints the worker may use: the server it joined
 through first, then any other server whose node is Ready. The worker keeps talking to the server it
