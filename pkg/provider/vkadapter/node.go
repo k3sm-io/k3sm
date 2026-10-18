@@ -398,7 +398,10 @@ func newNode(nodeName string, cfg NodeConfig, timings nodeTimings) (*Node, error
 	}
 
 	eb := record.NewBroadcaster()
-	recorder := eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(nodeName, "pod-controller")})
+	var recorder record.EventRecorder = eb.NewRecorder(scheme.Scheme, corev1.EventSource{Component: path.Join(nodeName, "pod-controller")})
+	if cfg.WrapPodEvents != nil {
+		recorder = cfg.WrapPodEvents(recorder)
+	}
 
 	scm := &scmAdapters{objects: cfg.Objects}
 	pc, err := vknode.NewPodController(vknode.PodControllerConfig{

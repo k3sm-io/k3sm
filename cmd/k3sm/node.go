@@ -878,7 +878,10 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: cs.CoreV1().Events("")})
 	defer timedTeardownStep(slog.Default(), "event-broadcaster", eventBroadcaster.Shutdown)
-	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "k3sm", Host: opts.nodeName})
+	// One spacer per node: the providers and Virtual Kubelet's pod controller
+	// record through it, so both Event streams share one clock.
+	spacer := provider.NewEventSpacer(eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "k3sm", Host: opts.nodeName}))
+	recorder, _ := nodeEventRecorders(spacer, nil)
 
 	// Cluster image mirrors (the peer ingest registries this node may fall back
 	// to). Started HERE, off the node's own client, so every bring-up that has an
@@ -1096,6 +1099,11 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		// interconnect.MetricsPath.
 		ExtraRoutes: append(containerLogRoutes(prov), interconnectRoutes(opts.interconnectMetrics)...),
 		Objects:     objects,
+		// Virtual Kubelet's own pod Events share the providers' spacer.
+		WrapPodEvents: func(vk record.EventRecorder) record.EventRecorder {
+			_, vkRec := nodeEventRecorders(spacer, vk)
+			return vkRec
+		},
 		// Replace VK's auto-Ready naive node provider with the real one: it samples
 		// this Mac for memory/disk/PID pressure and debounces the runtime's health
 		// into Ready. It receives the node AFTER configureNode stamped it, and
@@ -2406,4 +2414,13 @@ func (g *gatedLoop) stop(timeout time.Duration) {
 	case <-time.After(timeout):
 		slog.Warn("the eviction loop did not stop before the runtime closed", "timeout", timeout)
 	}
+}
+
+// nodeEventRecorders returns the recorders a node's two Event streams use, both
+// spaced by the one spacer: the provider's and Virtual Kubelet's pod
+// controller's (vkInner is the recorder VK would otherwise use). Sharing the
+// spacer serialises them against one clock, so no two Events of the node can
+// take the same name in one microsecond.
+func nodeEventRecorders(spacer *provider.EventSpacer, vkInner record.EventRecorder) (providerRec, vkRec record.EventRecorder) {
+	return spacer, spacer.Wrap(vkInner)
 }

@@ -301,9 +301,9 @@ func TestRuntimedPathEmitsContainerLifecycleEvents(t *testing.T) {
 		NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(), Recorder: rec,
 	}, nil, nil)
 	// The provider's spacer reads the same coarse clock the recorder stamps with.
-	spacer, ok := r.recorder.(*eventSpacer)
+	spacer, ok := r.recorder.(*EventSpacer)
 	if !ok {
-		t.Fatalf("the provider's recorder is %T, want the *eventSpacer over the configured one", r.recorder)
+		t.Fatalf("the provider's recorder is %T, want the *EventSpacer over the configured one", r.recorder)
 	}
 	spacer.now = wall.Now
 	clk := testclock.NewFakeClock(time.Unix(10000, 0))
