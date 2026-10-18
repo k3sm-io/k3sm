@@ -464,9 +464,9 @@ There are no per-node `svclb-*` pods. Each node's k3sm process holds the listene
 
 ## Caveats
 
-- Cross-node Pod traffic has been shown to pass only on the two-Mac lab rig the
-  [roadmap](https://github.com/k3sm-io/k3sm/blob/main/ROADMAP.md) records (2026-09-01), not by a
-  shipped acceptance gate. Since v0.1.7 a `vm` Pod answers on its pod IP from every node, for TCP on
+- Native Pods on different Macs reach each other by pod IP, each pod IP sits inside its node's
+  published `spec.podCIDR`, and a headless Service answers A, SRV and PTR lookups from either node.
+  Since v0.1.7 a `vm` Pod answers on its pod IP from every node, for TCP on
   the ports it declares and the ports a Service targets on it; UDP to a `vm` Pod's IP is not relayed
   ([Limitations](limitations.md#vm-pods-services-and-direct-pod-ips)).
 - Per-pod IP identity and headless/StatefulSet DNS records are present, but multi-node as a whole is
