@@ -856,6 +856,7 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		dnsVIP:      opts.clusterIP,         // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		domain:      opts.domain,            // SAME cluster domain the per-node resolver serves → in-pod shim search list
 		podCIDR:     nodeAddressing.podCIDR, // this server's --mesh-ip /24 (same source as the netserve locality)
+		meshIP:      opts.meshIP,            // this server's --mesh-ip; empty off the mesh
 		netMode:     nodeAddressing.netMode, // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:    true,                   // serve kubelet API over TLS so logs/exec work via the proxy
 
