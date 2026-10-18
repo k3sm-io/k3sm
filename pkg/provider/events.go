@@ -523,7 +523,7 @@ func recordContainerEvent(rec record.EventRecorder, pod *corev1.Pod, e container
 	rec.Event(pod, e.eventtype, e.reason, e.message)
 }
 
-// eventSpacer is the provider's record.EventRecorder: it hands every Event to
+// EventSpacer is the node's record.EventRecorder: it hands every Event to
 // the node's recorder at a clock reading later than the previous Event's.
 //
 // client-go names an Event "<object name>.<hex UnixNano of its timestamp>"
@@ -541,8 +541,15 @@ func recordContainerEvent(rec record.EventRecorder, pod *corev1.Pod, e container
 // of them makes every name distinct. The wait is at most one clock step (a
 // microsecond on macOS, nothing on a nanosecond clock), and the inner recorder
 // only queues the Event, so the lock is never held across an apiserver call.
-type eventSpacer struct {
+type EventSpacer struct {
 	inner record.EventRecorder
+	*spacerClock
+}
+
+// spacerClock is the clock state every recorder of one node shares: the
+// provider's and Virtual Kubelet's own pod-controller recorder are serialised
+// against a single last-Event reading, so their Events can never share a name.
+type spacerClock struct {
 	// now is the clock the inner recorder stamps Events with (time.Now); a test
 	// substitutes a coarse one.
 	now func() time.Time
@@ -551,17 +558,42 @@ type eventSpacer struct {
 	last int64 // UnixNano read just after the previous Event was handed over
 }
 
-var _ record.EventRecorder = (*eventSpacer)(nil)
+var _ record.EventRecorder = (*EventSpacer)(nil)
 
-func newEventSpacer(inner record.EventRecorder) *eventSpacer {
-	return &eventSpacer{inner: inner, now: time.Now}
+// NewEventSpacer returns the node's Event spacer over inner. Build it once per
+// node: hand it to the providers (which adopt an EventSpacer as given rather
+// than wrapping it again) and call Wrap for every other recorder of the node's
+// Events, so all of them share one clock.
+func NewEventSpacer(inner record.EventRecorder) *EventSpacer {
+	return NewEventSpacerClock(inner, time.Now)
+}
+
+// NewEventSpacerClock is NewEventSpacer with the clock the inner recorder
+// stamps Events with named, for a test that substitutes a coarse one.
+func NewEventSpacerClock(inner record.EventRecorder, now func() time.Time) *EventSpacer {
+	return &EventSpacer{inner: inner, spacerClock: &spacerClock{now: now}}
+}
+
+// Wrap returns a recorder over inner that shares this spacer's clock, so its
+// Events are spaced against this spacer's own.
+func (s *EventSpacer) Wrap(inner record.EventRecorder) record.EventRecorder {
+	return &EventSpacer{inner: inner, spacerClock: s.spacerClock}
+}
+
+// newEventSpacer wraps inner for a provider. An inner that already is an
+// EventSpacer is the node's shared one and is used as is.
+func newEventSpacer(inner record.EventRecorder) record.EventRecorder {
+	if s, ok := inner.(*EventSpacer); ok {
+		return s
+	}
+	return NewEventSpacer(inner)
 }
 
 // spaced runs record once the clock reads past the previous Event's
 // timestamp. last is read AFTER the inner recorder returns, so it is at or past
 // the timestamp that recorder took; the next Event's timestamp is then strictly
 // later.
-func (s *eventSpacer) spaced(record func()) {
+func (s *EventSpacer) spaced(record func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for s.now().UnixNano() <= s.last {
@@ -571,15 +603,18 @@ func (s *eventSpacer) spaced(record func()) {
 	s.last = s.now().UnixNano()
 }
 
-func (s *eventSpacer) Event(obj runtime.Object, eventtype, reason, message string) {
+// Event implements record.EventRecorder.
+func (s *EventSpacer) Event(obj runtime.Object, eventtype, reason, message string) {
 	s.spaced(func() { s.inner.Event(obj, eventtype, reason, message) })
 }
 
-func (s *eventSpacer) Eventf(obj runtime.Object, eventtype, reason, format string, args ...any) {
+// Eventf implements record.EventRecorder.
+func (s *EventSpacer) Eventf(obj runtime.Object, eventtype, reason, format string, args ...any) {
 	s.spaced(func() { s.inner.Eventf(obj, eventtype, reason, format, args...) })
 }
 
-func (s *eventSpacer) AnnotatedEventf(obj runtime.Object, annotations map[string]string, eventtype, reason, format string, args ...any) {
+// AnnotatedEventf implements record.EventRecorder.
+func (s *EventSpacer) AnnotatedEventf(obj runtime.Object, annotations map[string]string, eventtype, reason, format string, args ...any) {
 	s.spaced(func() { s.inner.AnnotatedEventf(obj, annotations, eventtype, reason, format, args...) })
 }
 

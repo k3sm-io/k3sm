@@ -50,6 +50,7 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 )
 
@@ -205,6 +206,11 @@ type NodeConfig struct {
 	// answer instead of a cluster-wide informer. nil makes such a read return
 	// an error.
 	Objects ObjectGetter
+	// WrapPodEvents, when non-nil, wraps the recorder Virtual Kubelet's pod
+	// controller records its own pod Events through (ProviderCreateSuccess,
+	// BackOff and the rest). The node passes the provider's Event spacer so both
+	// Event streams are serialised against one clock.
+	WrapPodEvents func(record.EventRecorder) record.EventRecorder
 }
 
 // Route is one extra handler registered on the kubelet HTTP API mux.
