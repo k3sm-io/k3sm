@@ -346,6 +346,14 @@ type Collector struct {
 	// names that context. Which context is UserKubeContext's decision.
 	// OPTIONAL: nil leaves those rows to the node credential.
 	UserKube func() (Kube, string, error)
+	// ReviewSelf asks the apiserver behind kube who its credential
+	// authenticates as: one SelfSubjectReview (authentication.k8s.io/v1),
+	// which every authenticated identity may create. It returns the user name
+	// the apiserver resolved. The kubeconfig row calls it with the client the
+	// report reads the cluster with, so a credential the apiserver refuses
+	// (an Unauthorized status error) is told apart from one that was merely
+	// found. OPTIONAL: nil leaves the row to report only that a client exists.
+	ReviewSelf func(ctx context.Context, kube Kube) (string, error)
 	// ServerAnchor proves, on a server, that the apiserver URL the report's
 	// client dials is this Mac's own control plane (ServerAnchor in
 	// production). The datastore and serving-cert rows of an account that

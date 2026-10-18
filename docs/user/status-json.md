@@ -164,7 +164,21 @@ Row names in the full report include `install`, `netd`, `server` or `agent`, `ap
 thing they describe exists (`datavol`, `server-args`, `settings`, `heartbeat`, `pre-volume`, `etcd`,
 `mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`, `ingest-registry`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
-`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind`, `ahead` or `rolling`.
+`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind`, `ahead`, `rolling` or `refused`.
+
+`kubeconfig` names the credentials the report reads the cluster with and where it found them. When
+it has a client, it proves the credential with one authenticated request, a `SelfSubjectReview`
+(`authentication.k8s.io/v1`, which every authenticated identity may create):
+
+| state | severity | meaning |
+|---|---|---|
+| `ok` | `ok` | a credential was found; when the apiserver answered the review, `wide.user` is the user name it authenticated as |
+| `refused` | `fail` | the apiserver answered `401 Unauthorized`: the credential in the file `detail` names is no longer accepted, as happens to a copy of the admin kubeconfig taken before the server was reinstalled. `remedy` replaces it: on a server, `sudo k3sm install`, which merges the current admin credential into your kubeconfig; on a worker, a fresh copy of `k3sm kubeconfig` from the control-plane Mac for your own kubeconfig, or a fresh join for the node credential |
+| `missing` | `warn` | no kubeconfig was found for this account; `detail` says why |
+
+A `403 Forbidden` is not `refused`: the credential authenticated and RBAC denied the request, so the
+row stays `ok`. A review that fails any other way (a timeout, an apiserver that does not answer)
+leaves the row `ok` without `wide.user`; the `apiserver` row reports reachability.
 
 `ingest-registry`, on a server started with `--registry-port`, is `ok` when the registry the server recorded as serving answers `/v2/` on its loopback port, `down` (`warn`) when it does not, `disabled` (`warn`, with the reason in `detail`) when the server gave up starting it, and `stopped` (`skip`) after the server tore it down; `wide.port` and `wide.since` carry the port and when it entered that state, and the row reads the copy of the server's record in `/var/lib/k3sm/status/` (mode 0644, no credential), so any account sees the same row; `wide.record` names the file read.
 

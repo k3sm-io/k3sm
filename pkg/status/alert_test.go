@@ -38,6 +38,7 @@ import (
 	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
@@ -611,6 +612,18 @@ func alertCases() []alertCase {
 		// this account's kubeconfig and the runtime daemon
 		{"kubeconfig missing", fromScenario("unknown", RowKubeconfig)},
 		{"kubeconfig missing on a worker", fromScenario("agent-waiting", RowKubeconfig)},
+		{"kubeconfig refused", built(func(t *testing.T) Row {
+			return Collector{Kube: fakeKube{}, KubeSource: "~/.kube/config", ReviewSelf: reviewSelf("", apierrors.NewUnauthorized("Unauthorized"), nil)}.
+				kubeconfigRow(context.Background(), dataroot.RoleServer)
+		})},
+		{"kubeconfig refused on a worker", func(t *testing.T) (Row, alertContext) {
+			return Collector{Kube: fakeKube{}, KubeSource: "~/.kube/config", ReviewSelf: reviewSelf("", apierrors.NewUnauthorized("Unauthorized"), nil), kubeFromUser: true}.
+				kubeconfigRow(context.Background(), dataroot.RoleAgent), alertContext{now: goldenTime, role: dataroot.RoleAgent}
+		}},
+		{"node credential refused on a worker", func(t *testing.T) (Row, alertContext) {
+			return Collector{Kube: fakeKube{}, KubeSource: "/var/lib/k3sm/agent/node.kubeconfig", ReviewSelf: reviewSelf("", apierrors.NewUnauthorized("Unauthorized"), nil)}.
+				kubeconfigRow(context.Background(), dataroot.RoleAgent), alertContext{now: goldenTime, role: dataroot.RoleAgent}
+		}},
 		{"runtimed needs admin", fromScenario("running", RowRuntimed)},
 		{"runtimed down", built(runtimedRow(nil, errors.New("connection refused")))},
 		{"runtimed unhealthy", built(runtimedRow(&runtimev1.GetRuntimeInfoResponse{RuntimeName: "k3sm-runtimed", Healthy: false,
