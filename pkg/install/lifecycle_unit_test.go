@@ -92,7 +92,7 @@ func TestReadVMHostRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := VMHostRecord{Schema: 1, PodID: "linux", Pgid: 601, StartUnixNano: 22, StopGraceNanos: 30_000_000_000,
+	want := VMHostRecord{Schema: 1, PodID: "linux", Pgid: 601, StartUnixNano: 22, StopGraceNanos: 30_000_000_000, RunDir: "/x",
 		HelperCDHash: "ab12", HelperProtocol: 1, RuntimeVersion: "cdhash:cd34", BootSession: "B-1"}
 	if len(st.Records) != 1 || st.Records[0] != want {
 		t.Errorf("records = %+v, want only the well-formed trusted 601", st.Records)
