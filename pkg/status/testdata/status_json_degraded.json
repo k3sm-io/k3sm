@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
   "verdict": "degraded",
   "role": "server",
   "summary": "netd: launchd reports running, but pid 1292 is not in the process table · socket /var/lib/k3sm/run/netd.sock",

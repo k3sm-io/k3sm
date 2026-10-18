@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
   "verdict": "degraded",
   "role": "agent",
   "summary": "agent: pid 1292 · the kubelet serving certificate in /var/lib/k3sm/agent names a different address than the one this node is assigned, so the control plane cannot reach this node's :10250 (kubectl logs/exec fail)",

@@ -624,6 +624,7 @@ func doctorReport(env doctorEnv, ver version.Info, now time.Time) status.Report 
 	}
 	return status.Report{
 		SchemaVersion: status.SchemaVersion,
+		Capabilities:  status.Capabilities(),
 		Verdict:       verdict,
 		Role:          role,
 		Summary:       summary,

@@ -134,8 +134,14 @@ type PeerStatus struct {
 type Report struct {
 	// SchemaVersion is the version of this JSON contract (SchemaVersion, the
 	// constant). Collect sets it; it is never stamped on at the render layer.
-	SchemaVersion int     `json:"schemaVersion"`
-	Verdict       Verdict `json:"verdict"`
+	SchemaVersion int `json:"schemaVersion"`
+	// Capabilities lists the optional modes this binary's `k3sm status`
+	// offers (Capabilities, the function), so a consumer can tell from one
+	// report whether a mode is there instead of trying it and reading the
+	// error. Collect sets it. An added word is an additive change; a reader
+	// ignores a word it does not know.
+	Capabilities []string `json:"capabilities"`
+	Verdict      Verdict  `json:"verdict"`
 	// Role is which node this Mac is installed as, decided from the two
 	// node-daemon plists on disk (dataroot.RoleFromPlists). It picks the rows
 	// the screens render and the daemon the verdict is about, so it is part of
@@ -170,6 +176,15 @@ type Report struct {
 	Host       string       `json:"host"`
 	Timestamp  time.Time    `json:"timestamp"`
 }
+
+// CapabilityWatchJSON is the capability word for the NDJSON stream: on a
+// stdout that is not a terminal, `k3sm status --watch -o json` writes one
+// frame per change instead of refusing.
+const CapabilityWatchJSON = "watch-json"
+
+// Capabilities returns the capability words a report carries, in a fresh
+// slice so no caller can change another's.
+func Capabilities() []string { return []string{CapabilityWatchJSON} }
 
 // Row returns the named row and whether it was present.
 func (r Report) Row(name string) (Row, bool) {

@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
   "verdict": "degraded",
   "role": "agent",
   "summary": "agent: pid 1292 · the node credential expired on 2026-09-04, so this worker can no longer authenticate",

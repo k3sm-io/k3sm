@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
   "verdict": "unknown",
   "role": "server",
   "summary": "could not determine cluster state as this user (re-run with sudo)",

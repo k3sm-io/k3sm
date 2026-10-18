@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
   "verdict": "stopped",
   "role": "server",
   "summary": "io.k3sm.server is stopped and the apiserver is not serving",

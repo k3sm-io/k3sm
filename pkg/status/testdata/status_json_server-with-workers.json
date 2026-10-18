@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
   "verdict": "running",
   "role": "server",
   "summary": "3/3 nodes ready",

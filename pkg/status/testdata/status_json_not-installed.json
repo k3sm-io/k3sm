@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
   "verdict": "not-installed",
   "role": "server",
   "summary": "k3sm is not installed on this Mac",

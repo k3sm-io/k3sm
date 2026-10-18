@@ -168,6 +168,7 @@ func TestStatusUsageDocumentsExitCodes(t *testing.T) {
 	for _, must := range []string{
 		"0  running", "1  internal error", "2  usage",
 		"3  stopped", "4  degraded", "5  not installed", "6  unknown",
+		"7  auth refused",
 		"ADDITIVE ONLY",
 	} {
 		if !strings.Contains(statusUsage, must) {

@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "capabilities": [
+    "watch-json"
+  ],
   "verdict": "degraded",
   "role": "agent",
   "summary": "agent: pid 1292 · waiting for a join: this Mac holds no node credential yet",
