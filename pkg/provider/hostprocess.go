@@ -92,6 +92,8 @@ func podKey(ns, name string) string { return ns + "/" + name }
 func NewHostProcess(nodeName, podRoot, nodeIP string, recorder record.EventRecorder) *HostProcess {
 	if recorder == nil {
 		recorder = nopRecorder{}
+	} else {
+		recorder = newEventSpacer(recorder)
 	}
 	return &HostProcess{nodeName: nodeName, podRoot: podRoot, nodeIP: nodeIP, recorder: recorder, pods: map[string]*podRec{}}
 }
@@ -125,11 +127,11 @@ type podEvent struct {
 // outside the provider lock.
 func (p *HostProcess) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	events, err := p.startPod(pod)
-	// Emit outside p.mu (startPod has returned, releasing the lock). The Event's
-	// involved object is the Pod, so client-go derives the Pod ObjectReference; the
-	// container name is carried in the message.
+	// Emit outside p.mu (startPod has returned, releasing the lock), through the
+	// same recorder seam the runtimed path uses: the Pod's reference with the
+	// container's fieldPath, and the container name in the message as well.
 	for _, ev := range events {
-		p.recorder.Event(pod, ev.eventtype, ev.reason, ev.message)
+		recordContainerEvent(p.recorder, pod, ev)
 	}
 	return err
 }
@@ -137,7 +139,7 @@ func (p *HostProcess) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 // startPod is the locked body of CreatePod: it launches each container process,
 // records status, and returns the lifecycle Events for CreatePod to emit after
 // the lock is released.
-func (p *HostProcess) startPod(pod *corev1.Pod) ([]podEvent, error) {
+func (p *HostProcess) startPod(pod *corev1.Pod) ([]containerEvent, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	k := podKey(pod.Namespace, pod.Name)
@@ -151,7 +153,7 @@ func (p *HostProcess) startPod(pod *corev1.Pod) ([]podEvent, error) {
 	rec := &podRec{pod: pod.DeepCopy(), procs: map[string]*procRec{}}
 	now := metav1.Now()
 	var cstats []corev1.ContainerStatus
-	var events []podEvent
+	var events []containerEvent
 
 	for i := range pod.Spec.Containers {
 		c := &pod.Spec.Containers[i]
@@ -161,7 +163,7 @@ func (p *HostProcess) startPod(pod *corev1.Pod) ([]podEvent, error) {
 		}
 		// This runtime has no registry pull (image == already-present native binary), so the
 		// Pulled event uses the kubelet's "already present" phrasing.
-		events = append(events, podEvent{corev1.EventTypeNormal, reasonPulled, msgImageAlreadyPresent(c.Image)})
+		events = append(events, pulledAlreadyPresentEvent(c.Name, c.Image))
 		logPath := filepath.Join(dir, c.Name+".log")
 		lf, err := os.Create(logPath)
 		if err != nil {
@@ -171,14 +173,13 @@ func (p *HostProcess) startPod(pod *corev1.Pod) ([]podEvent, error) {
 		cmd.Stdout, cmd.Stderr = lf, lf
 		cmd.Env = envSlice(c.Env)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own process group → clean teardown
-		events = append(events, podEvent{corev1.EventTypeNormal, reasonCreated, msgCreatedContainer(c.Name)})
 		if err := cmd.Start(); err != nil {
 			_ = lf.Close()
-			events = append(events, podEvent{corev1.EventTypeWarning, reasonFailed, msgFailedStart(c.Name)})
+			events = append(events, containerLifecycleEvents(c.Name, false)...)
 			cstats = append(cstats, waitingStatus(c, "StartError", err.Error()))
 			continue
 		}
-		events = append(events, podEvent{corev1.EventTypeNormal, reasonStarted, msgStartedContainer(c.Name)})
+		events = append(events, containerLifecycleEvents(c.Name, true)...)
 		rec.procs[c.Name] = &procRec{cmd: cmd, logPath: logPath}
 		cstats = append(cstats, runningStatus(c, now))
 		go p.reap(k, c.Name, cmd, lf)
@@ -277,7 +278,7 @@ func (p *HostProcess) UpdatePod(ctx context.Context, pod *corev1.Pod) error { re
 func (p *HostProcess) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	events := p.stopPod(pod)
 	for _, ev := range events {
-		p.recorder.Event(pod, ev.eventtype, ev.reason, ev.message)
+		recordContainerEvent(p.recorder, pod, ev)
 	}
 	return nil
 }
@@ -285,7 +286,7 @@ func (p *HostProcess) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 // stopPod is the locked body of DeletePod: it kills each container process group,
 // marks the pod Succeeded, and returns the Killing Events for DeletePod to emit
 // after the lock is released.
-func (p *HostProcess) stopPod(pod *corev1.Pod) []podEvent {
+func (p *HostProcess) stopPod(pod *corev1.Pod) []containerEvent {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	k := podKey(pod.Namespace, pod.Name)
@@ -293,9 +294,9 @@ func (p *HostProcess) stopPod(pod *corev1.Pod) []podEvent {
 	if !ok {
 		return nil // already gone; DeletePod may be called repeatedly
 	}
-	var events []podEvent
+	var events []containerEvent
 	for name, pr := range rec.procs {
-		events = append(events, podEvent{corev1.EventTypeNormal, reasonKilling, msgStoppingContainer(name)})
+		events = append(events, killingEvent(name, ""))
 		if pr.cmd.Process != nil {
 			_ = syscall.Kill(-pr.cmd.Process.Pid, syscall.SIGKILL) // whole process group
 		}

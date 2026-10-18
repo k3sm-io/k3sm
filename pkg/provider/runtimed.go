@@ -380,6 +380,15 @@ type podTrack struct {
 	// entries clear when it refreshes again. Never held with another lock.
 	refreshWarnMu sync.Mutex
 	refreshWarned map[string]bool
+
+	// lifecycleMu guards instances, the per-container instance latch of the
+	// container lifecycle Events (runtimed_lifecycle.go): the last instance whose
+	// Created and Started were recorded, its last observed running state, and
+	// whether a Killing was recorded for it. Never held with another lock; the
+	// Events are recorded after it is released. An idempotent CreatePod copies
+	// it onto the replacing track (inheritLifecycle).
+	lifecycleMu sync.Mutex
+	instances   map[string]*containerInstance
 }
 
 // RuntimedConfig configures a runtimedRuntime.
@@ -731,9 +740,9 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 	// path-rebase shim — the exact cause of the in-pod ENOENTs — was INVISIBLE in
 	// the server log and got mis-diagnosed as another subsystem. An absent shim
 	// must read as empty here, never as a missing key.
-	recorder := cfg.Recorder
-	if recorder == nil {
-		recorder = nopRecorder{}
+	var recorder record.EventRecorder = nopRecorder{}
+	if cfg.Recorder != nil {
+		recorder = newEventSpacer(cfg.Recorder)
 	}
 	log.Info("runtimed provider configured",
 		"dyld_shim", cfg.DyldShim,
@@ -1770,6 +1779,11 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		start = old.startTime // idempotent: keep the original start time
 	}
 	t := &podTrack{pod: pod.DeepCopy(), startTime: start}
+	if old != nil {
+		// The replay reports the instances the replaced track already recorded
+		// Created and Started for; they are not new.
+		t.inheritLifecycle(old)
+	}
 	r.track[id] = t
 	r.mu.Unlock()
 	if old != nil {
@@ -2106,6 +2120,14 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	if t != nil && t.evictedStatus() != nil {
 		return r.teardownPod(ctx, pod, 0, nil)
 	}
+	// The kubelet's killContainer records Killing for each container it stops
+	// before the preStop hook and the stop itself: one per container last
+	// observed running, none for one that already exited.
+	if t != nil {
+		for _, name := range t.runningContainersToKill(pod) {
+			recordContainerEvent(r.recorder, pod, killingEvent(name, ""))
+		}
+	}
 	// Serve preStop hooks BEFORE termination: runtimed sends SIGTERM
 	// synchronously inside DeletePod, so the provider runs preStop first and passes
 	// the RESIDUAL grace (the budget minus the hook's wall-time, floored at 1s).
@@ -2438,6 +2460,10 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	// gets (or keeps) its retry schedule on the same convergence, so every status
 	// path — stream, backstop, direct GetPodStatus — paces the retries identically.
 	r.observePulls(pod, t, rs)
+	// The container lifecycle Events (Created, Started, and a host binary's
+	// Pulled), once per container instance. After observePulls, so a fetched
+	// image's Pulled precedes the Created it led to.
+	r.observeLifecycle(pod, t, rs)
 	// Feed the Service proxy this pod's live transport address, on the
 	// same convergence the exit observation rides. It reads the status and the
 	// node's own guest record; it contributes NOTHING to the corev1 status being

@@ -387,6 +387,11 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 			t.Error("a container being restarted must not be Ready")
 		}
 
+		// Upstream's surface for an immediate liveness kill: the Normal Killing
+		// with killContainer's liveness message, and nothing else.
+		if ev, want := nextLifecycleEvent(rec.Events, 3*time.Second), "Normal Killing "+msgKillingLiveness("c0"); ev != want {
+			t.Errorf("recorded %q, want %q", ev, want)
+		}
 		if ev := nextLifecycleEvent(rec.Events, 100*time.Millisecond); ev != "" {
 			t.Errorf("recorded %q, want NO BackOff event for an un-throttled liveness restart", ev)
 		}

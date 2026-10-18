@@ -233,6 +233,9 @@ func (r *runtimedRuntime) attachPod(ctx context.Context, a podAttacher, pod *cor
 		start = *pod.Status.StartTime
 	}
 	t := &podTrack{pod: pod.DeepCopy(), startTime: start, diedWhileDown: diedWhileDown(rs)}
+	// The attached containers were created and started in the pod's first life;
+	// their Created and Started are not recorded again.
+	t.seedLifecycle(rs)
 	r.mu.Lock()
 	r.track[id] = t
 	r.mu.Unlock()
