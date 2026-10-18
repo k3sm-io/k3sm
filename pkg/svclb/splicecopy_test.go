@@ -269,59 +269,52 @@ func TestCopyPooledConcurrentCopiesDoNotAlias(t *testing.T) {
 	}
 }
 
+// chunkReader yields n full-size chunks and then io.EOF without allocating.
+type chunkReader struct{ left int }
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if r.left == 0 {
+		return 0, io.EOF
+	}
+	r.left--
+	return len(p), nil
+}
+
 // TestCopyPooledAllocationDoesNotScaleWithChunks closes the second hole: the
 // zero-byte test above never executes io.copyBuffer's loop body at all, so it
 // cannot see a buffer allocated per CHUNK rather than per call.
 //
-// A per-chunk allocation is strictly worse than the io.Copy it replaced — it
-// pays 32 KiB for every 32 KiB moved instead of once per connection — and it
-// passes both the zero-byte allocation test and the fidelity test. The
-// invariant that catches it is scale-independence: for the same number of
-// calls, allocation must not grow with the number of chunks copied.
+// A per-chunk allocation is strictly worse than the io.Copy it replaced: it
+// pays 32 KiB for every 32 KiB moved instead of once per connection. The
+// invariant that catches it is scale-independence: allocations per call must
+// not grow with the number of chunks copied.
 //
-// A ratio is used rather than an absolute bound because -race inflates the
-// baseline substantially; a ratio is immune to that.
+// The copy runs over in-memory endpoints and is counted in allocations
+// (testing.AllocsPerRun), not bytes read from process-wide MemStats around real
+// TCP pairs. Allocation COUNT is independent of -race's byte inflation, and no
+// sockets or netpoller are involved, so there is nothing for load to inflate.
+// Mallocs from other goroutines can still land in the window, so the
+// comparison allows a small constant and takes the best of a few attempts; a
+// per-chunk allocation adds one malloc per extra chunk (62 here), far above it.
 func TestCopyPooledAllocationDoesNotScaleWithChunks(t *testing.T) {
-	measure := func(chunks int) uint64 {
-		const calls = 8
-		payload := bytes.Repeat([]byte("x"), spliceBufSize*chunks)
-		run := func() {
-			for range calls {
-				src, peer := tcpPair(t)
-				var wg sync.WaitGroup
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					_, _ = peer.Write(payload)
-					_ = peer.CloseWrite()
-				}()
-				if _, err := copyPooled(io.Discard, src); err != nil {
-					t.Fatalf("copyPooled: %v", err)
-				}
-				wg.Wait()
+	const slack = 2
+	measure := func(chunks int) float64 {
+		return testing.AllocsPerRun(50, func() {
+			if _, err := copyPooled(io.Discard, &chunkReader{left: chunks}); err != nil {
+				t.Errorf("copyPooled: %v", err)
 			}
+		})
+	}
+	var few, many float64
+	for range 5 {
+		few, many = measure(2), measure(64) // 32x the chunks
+		if many <= few+slack {
+			return
 		}
-		run() // warm the pool and the conn machinery
-		var before, after runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-		run()
-		runtime.ReadMemStats(&after)
-		return (after.TotalAlloc - before.TotalAlloc) / calls
 	}
-
-	few := measure(2)
-	many := measure(64) // 32x the chunks
-	if few == 0 {
-		t.Fatal("measured zero allocation; the measurement is broken, not the code")
-	}
-	ratio := float64(many) / float64(few)
-	if ratio > 8 {
-		t.Errorf("copyPooled allocated %d B/call copying 2 chunks but %d B/call copying 64 chunks "+
-			"(ratio %.1fx, want < 8x): allocation is scaling with CHUNK COUNT, so a buffer is being "+
-			"allocated per chunk rather than drawn once from the pool — strictly worse than the io.Copy "+
-			"this replaced", few, many, ratio)
-	}
+	t.Errorf("copyPooled made %.1f allocs/call copying 2 chunks but %.1f copying 64 chunks "+
+		"(want within %d): allocation is scaling with CHUNK COUNT, so a buffer is being "+
+		"allocated per chunk rather than drawn once from the pool", few, many, slack)
 }
 
 // itoa avoids a fmt dependency in the hot assertion loop above.
