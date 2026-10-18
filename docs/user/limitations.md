@@ -698,6 +698,11 @@ always agree.
 - **Hard and memory-only.** There are no soft thresholds, no disk or PID eviction, no refusal of
   new BestEffort Pods while the node is under pressure, and no `--eviction-hard` override. The
   thresholds are fixed.
+- **`PIDPressure` has a second trigger.** Besides 90% of the machine's process table
+  (`kern.maxproc`), it goes True above 90% of the per-user process limit (`kern.maxprocperuid`)
+  that the Pods' service user meets. Upstream Kubernetes has no such trigger. The count is a lower
+  bound: a process that leaves its Pod's process group is not counted, and neither are `vm` Pods yet,
+  so it can fire later than the real limit. The condition's message names the trigger that fired.
 - **Ranked like the kubelet.** Pods using more memory than they request go first, then lower
   `priority`, then the largest usage over request. A BestEffort Pod requests nothing, so it ranks
   first. Pods at `system-cluster-critical` or `system-node-critical` priority are never evicted.
