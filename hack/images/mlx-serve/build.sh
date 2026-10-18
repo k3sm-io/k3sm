@@ -4,10 +4,16 @@
 #
 # The image is a FROM-scratch, COPY-only native darwin/arm64 image: a
 # python-build-standalone CPython dist plus the serving engine's wheel closure,
-# staged ON THE BUILD HOST by uv and then packaged verbatim by `k3sm build`.
-# There is no RUN step anywhere, because the builder packages files and does not
-# execute them — so everything that would have been a RUN happens here, in this
-# script, before the tree is handed over.
+# staged by uv and then packaged verbatim by `k3sm build`. There is no RUN step
+# anywhere, because the builder packages files and does not execute them — so
+# everything that would have been a RUN happens here, in this script, before the
+# tree is handed over.
+#
+# The stage can run in two places. On the cluster (the default; see
+# stage-job.sh), a native Job runs this script with --stage-only into a
+# PersistentVolume, and the host then packages that volume's stage with
+# --from-stage. On the host, a plain run stages and packages in one go. Both
+# paths run the same checks below.
 #
 # What the image does NOT contain: model weights. Weights are a volume concern
 # (HF_HOME points at the cache mount), never image content.
@@ -20,14 +26,18 @@
 # Usage:
 #   hack/images/mlx-serve/build.sh                 # stage, build, walk-verify
 #   hack/images/mlx-serve/build.sh --restage       # rebuild the staged tree
+#   hack/images/mlx-serve/build.sh --stage-only    # stage and check, no package
+#   hack/images/mlx-serve/build.sh --from-stage <dir>  # package a stage made elsewhere
 #   hack/images/mlx-serve/build.sh --no-verify     # skip the walk-verify step
 #   hack/images/mlx-serve/build.sh --print-dockerfile
 #   hack/images/mlx-serve/build.sh --check-lock <file>
 #
-# Requires: macOS on Apple silicon, uv, python3, and a `k3sm` binary. It needs
-# no root: it packages with `k3sm build --no-record`, which writes the OCI layout
-# and never touches this node's image store. It writes only under its work dir
-# and pushes nothing anywhere — see README.md for the publish step.
+# Requires: macOS on Apple silicon, uv, python3, and a `k3sm` binary
+# (--stage-only needs only uv; --from-stage needs no uv). It needs no root: it
+# packages with `k3sm build --no-record`, which writes the OCI layout and never
+# touches this node's image store. It writes only under its work dir (and, with
+# --stage-only, the --stage dir) and pushes nothing anywhere — see README.md for
+# the publish step.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -76,6 +86,8 @@ WORK="${K3SM_MLX_WORK:-$HOME/.cache/k3sm/mlx-serve}"
 TAG="$DEFAULT_TAG"
 OUT=""
 STAGE=""
+FROM_STAGE=""
+STAGE_ONLY=0
 RESTAGE=0
 VERIFY=1
 K3SM_BIN="${K3SM_BIN:-}"
@@ -171,6 +183,12 @@ require_host() {
 	# A translated (Rosetta) shell reports x86_64 and would stage x86_64 wheels
 	# into an arm64 image, so it is refused rather than warned about.
 	[ "$(uname -m)" = "arm64" ] || die "build from a native arm64 shell (uname -m says $(uname -m); a Rosetta-translated shell would stage the wrong wheels)"
+}
+
+# require_python3 is the packaging host's check: it reads the layout's index.
+# Staging does not need it (the pin assertion parses with the staged
+# interpreter), so a stage Job runs without the command line tools' python3.
+require_python3() {
 	command -v python3 >/dev/null 2>&1 || die "python3 not found (Xcode command line tools)"
 }
 
@@ -205,10 +223,16 @@ require_k3sm() {
 # to downloads, the manifest row (and its URL) is what is listed on a cold and a
 # warm cache alike, which is exactly the fact being pinned: what uv WOULD fetch
 # for this key.
+#
+# The listing is parsed by the interpreter uv just installed, not by a host
+# python3, so the stage needs nothing beyond uv and the pinned interpreter. It
+# runs isolated (-I) and writes no bytecode (-B): that dist is what gets staged,
+# and a timestamp .pyc left in it by this parse would ship in the image (the
+# precompile step keeps an existing up-to-date .pyc rather than rewriting it).
 assert_interpreter_pin() {
 	local got
 	got="$("$UV" python list --all-versions --only-downloads --output-format json 2>/dev/null |
-		python3 -c '
+		"$UV_PYTHON_INSTALL_DIR/$PY_KEY/$PY_BIN" -I -B -c '
 import json, sys
 key = sys.argv[1]
 try:
@@ -228,16 +252,21 @@ for e in entries:
   Bump PY_URL deliberately (and re-measure the image) or use uv $UV_MIN."
 }
 
+# stage_want is the stamp a stage carries: the interpreter key and the lockfile
+# digest it was staged from. It sits beside the stage, never inside it (a stamp
+# file in the tree would ship in the image).
+stage_want() {
+	echo "$PY_KEY $(shasum -a 256 "$HERE/requirements.lock" | awk '{print $1}')"
+}
+
 stage_tree() {
 	export UV_PYTHON_INSTALL_DIR="$WORK/python"
 	export UV_CACHE_DIR="${UV_CACHE_DIR:-$WORK/uv-cache}"
 	mkdir -p "$UV_PYTHON_INSTALL_DIR"
 
 	local stamp want
-	# Beside the stage, never inside it: a stamp file in the tree would ship in
-	# the image.
 	stamp="${STAGE}.stamp"
-	want="$PY_KEY $(shasum -a 256 "$HERE/requirements.lock" | awk '{print $1}')"
+	want="$(stage_want)"
 	if [ "$RESTAGE" -eq 0 ] && [ -x "$STAGE/$PY_BIN" ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
 		echo "  stage: up to date ($STAGE) — pass --restage to rebuild"
 		return 0
@@ -245,7 +274,6 @@ stage_tree() {
 
 	echo "==> stage the interpreter ($PY_KEY)"
 	"$UV" python install "$PY_KEY" >/dev/null
-	assert_interpreter_pin
 
 	# uv keeps a version ALIAS symlink beside the dist whose target is ABSOLUTE
 	# (cpython-3.12-macos-aarch64-none -> /abs/.../cpython-3.12.14-...). The
@@ -254,6 +282,7 @@ stage_tree() {
 	local dist="$UV_PYTHON_INSTALL_DIR/$PY_KEY"
 	[ -d "$dist" ] || die "expected the resolved interpreter dir at $dist"
 	[ ! -L "$dist" ] || die "$dist is a symlink; stage the resolved versioned directory, not uv's alias"
+	assert_interpreter_pin
 
 	rm -rf "$STAGE"
 	mkdir -p "$(dirname "$STAGE")"
@@ -277,9 +306,17 @@ stage_tree() {
 	# modules the lockfile could not know would be imported. -s/-p rewrite the
 	# recorded source paths to their in-image locations; unchecked-hash .pyc are
 	# never revalidated against source mtimes, which a tar round-trip perturbs.
-	if ! "$STAGE/$PY_BIN" -m compileall -q -j 0 --invalidation-mode unchecked-hash \
-		-s "$STAGE" -p / "$STAGE/lib/python3.12" >/dev/null 2>&1; then
-		echo "  note: some modules did not precompile (usually vendored py2 samples) — not fatal"
+	#
+	# -j 1, serial, on purpose: -j 0 runs a ProcessPoolExecutor, whose queue lock
+	# is a POSIX semaphore, and a pod's sandbox profile refuses sem_open (EPERM).
+	# In the stage Job that killed compileall before it compiled anything. The
+	# serial run writes the same .pyc files. Its output is kept and judged by
+	# assert_precompiled, never discarded.
+	local log="$WORK/compileall.log"
+	if ! "$STAGE/$PY_BIN" -m compileall -q -j 1 --invalidation-mode unchecked-hash \
+		-s "$STAGE" -p / "$STAGE/lib/python3.12" > "$log" 2>&1; then
+		echo "  compileall exited non-zero; its last lines ($log):"
+		tail -20 "$log" | sed 's/^/    /'
 	fi
 
 	echo "$want" > "$stamp"
@@ -302,6 +339,41 @@ stage_shard_entrypoint() {
 	done
 }
 
+# assert_precompiled fails the build when more than PRECOMPILE_MAX_MISSING
+# modules under lib/python3.12 have no .pyc. A few are expected (a vendored
+# sample that does not compile, the entrypoint modules installed after the
+# precompile); anything more means the precompile step did not run, and every
+# serving pod would write its own bytecode into its clone of the rootfs. The
+# check reads the tree, not compileall's exit status, so it holds for a stage
+# made anywhere. The staged interpreter runs isolated and writes no bytecode.
+PRECOMPILE_MAX_MISSING=5
+assert_precompiled() {
+	local out total missing
+	out="$("$STAGE/$PY_BIN" -I -B - "$STAGE/lib/python3.12" <<'PY'
+import importlib.util, os, sys
+root = sys.argv[1]
+total, missing = 0, []
+for d, dirs, files in os.walk(root):
+    dirs[:] = [x for x in dirs if x != "__pycache__"]
+    for f in files:
+        if f.endswith(".py"):
+            total += 1
+            if not os.path.exists(importlib.util.cache_from_source(os.path.join(d, f))):
+                missing.append(os.path.relpath(os.path.join(d, f), root))
+print(total, len(missing))
+for m in sorted(missing)[:20]:
+    print(m)
+PY
+)" || die "cannot run the staged interpreter to check the precompile"
+	read -r total missing <<< "$(printf '%s\n' "$out" | head -1)"
+	if [ "$missing" -gt 0 ]; then
+		printf '%s\n' "$out" | tail -n +2 | sed 's/^/    no .pyc: /'
+	fi
+	[ "$missing" -le "$PRECOMPILE_MAX_MISSING" ] ||
+		die "$missing of $total modules have no .pyc (more than $PRECOMPILE_MAX_MISSING); the precompile step failed"
+	echo "  precompiled: $((total - missing)) of $total modules"
+}
+
 # assert_stageable rejects the symlink shapes the builder refuses, here, where
 # the offending entry can be named — the builder's own error names only the
 # context root.
@@ -319,6 +391,46 @@ assert_stageable() {
 	[ "$bad" -eq 0 ] || die "$bad symlink(s) the builder will refuse (it accepts relative, resolvable, in-context links only)"
 }
 
+# assert_stage_current is --from-stage's guard: the stage handed over must have
+# been made from THIS checkout's pins. It carries the stamp stage_tree wrote, an
+# interpreter, and the same entrypoint modules as the files beside this script,
+# so a stale or foreign volume is refused rather than packaged.
+assert_stage_current() {
+	local stamp="${STAGE}.stamp" want
+	[ -d "$STAGE" ] || die "no stage at $STAGE"
+	[ -x "$STAGE/$PY_BIN" ] || die "the stage at $STAGE has no interpreter ($PY_BIN)"
+	[ -f "$stamp" ] || die "the stage at $STAGE has no stamp ($stamp); it was not made by build.sh --stage-only"
+	want="$(stage_want)"
+	[ "$(cat "$stamp")" = "$want" ] || die "the stage at $STAGE was made from other pins
+    stage:    $(cat "$stamp")
+    checkout: $want
+  Re-run the stage Job from this checkout (stage-job.sh apply)."
+	local module
+	for module in "$SHARD_MODULE" "$SERVE_MODULE"; do
+		cmp -s "$HERE/$module.py" "$STAGE/lib/python3.12/site-packages/$module.py" ||
+			die "the stage's $module.py differs from $HERE/$module.py; re-run the stage Job"
+	done
+	echo "  stage: $STAGE ($want)"
+}
+
+# assert_readable names every entry the packaging user cannot read. A stage made
+# by the cluster's Job belongs to the runtime user, and the host packages it as
+# the operator's user, so an unreadable file would otherwise surface as a bare
+# builder error.
+assert_readable() {
+	local bad=0 p
+	while IFS= read -r p; do
+		if [ -d "$p" ]; then
+			[ -r "$p" ] && [ -x "$p" ] && continue
+		else
+			[ -r "$p" ] && continue
+		fi
+		echo "  UNREADABLE: ${p#"$STAGE"/}" >&2
+		bad=$((bad + 1))
+	done < <(find "$STAGE" ! -type l)
+	[ "$bad" -eq 0 ] || die "$bad entr(y/ies) under $STAGE are not readable by $(id -un)"
+}
+
 # assert_context_budget guards the builder's own 2 GiB context ceiling, which
 # binds before any image-size budget does.
 assert_context_budget() {
@@ -329,57 +441,30 @@ assert_context_budget() {
 	[ "$bytes" -lt "$limit" ] || die "the staged tree exceeds the builder's context budget; prune the payload before building"
 }
 
-# ---- main -------------------------------------------------------------------
-while [ $# -gt 0 ]; do
-	case "$1" in
-		--tag) TAG="${2:-}"; [ -n "$TAG" ] || die "--tag needs a value"; shift 2 ;;
-		--output) OUT="${2:-}"; [ -n "$OUT" ] || die "--output needs a value"; shift 2 ;;
-		--stage) STAGE="${2:-}"; [ -n "$STAGE" ] || die "--stage needs a value"; shift 2 ;;
-		--work) WORK="${2:-}"; [ -n "$WORK" ] || die "--work needs a value"; shift 2 ;;
-		--restage) RESTAGE=1; shift ;;
-		--no-verify) VERIFY=0; shift ;;
-		--print-dockerfile) print_dockerfile; exit 0 ;;
-		--check-lock) verify_lock "${2:?--check-lock needs a file}"; exit $? ;;
-		-h|--help) usage; exit 0 ;;
-		*) die "unknown flag: $1 (try --help)" ;;
-	esac
-done
+# package writes the Dockerfile, packages the stage with `k3sm build`, and
+# walk-verifies the layout.
+package() {
+	echo "==> package (k3sm build --no-record --format oci)"
+	mkdir -p "$WORK"
+	print_dockerfile > "$WORK/Dockerfile"
+	rm -rf "$OUT"
+	# --no-record: the product is the layout, which `k3sm image push` publishes. The
+	# image store is not needed, and recording into it would need root (the runtime
+	# daemon's socket), so the build stays an ordinary user's.
+	"$K3SM_BIN" build --no-record --file "$WORK/Dockerfile" --tag "$TAG" --format oci --output "$OUT" "$STAGE"
 
-[ -n "$STAGE" ] || STAGE="$WORK/stage"
-[ -n "$OUT" ] || OUT="$WORK/oci"
-
-echo "==> preflight"
-require_host
-verify_lock "$HERE/requirements.lock"
-require_uv
-require_k3sm
-
-mkdir -p "$WORK"
-stage_tree
-stage_shard_entrypoint
-assert_stageable
-assert_context_budget
-
-echo "==> package (k3sm build --no-record --format oci)"
-print_dockerfile > "$WORK/Dockerfile"
-rm -rf "$OUT"
-# --no-record: the product is the layout, which `k3sm image push` publishes. The
-# image store is not needed, and recording into it would need root (the runtime
-# daemon's socket), so the build stays an ordinary user's.
-"$K3SM_BIN" build --no-record --file "$WORK/Dockerfile" --tag "$TAG" --format oci --output "$OUT" "$STAGE"
-
-DIGEST="$(python3 -c '
+	DIGEST="$(python3 -c '
 import json, sys
 idx = json.load(open(sys.argv[1]))
 print(idx["manifests"][0]["digest"])
 ' "$OUT/index.json")"
 
-if [ "$VERIFY" -eq 1 ]; then
-	echo "==> walk-verify the payload"
-	"$HERE/walk-verify.sh" --layout "$OUT"
-fi
+	if [ "$VERIFY" -eq 1 ]; then
+		echo "==> walk-verify the payload"
+		"$HERE/walk-verify.sh" --layout "$OUT"
+	fi
 
-cat <<EOF
+	cat <<EOF
 
 ==> built
   tag:    $TAG
@@ -394,3 +479,72 @@ Publish it (the credential is read from the environment, never from argv):
 Record the digest above — the operator pins the image by digest, and the tag is
 display-only. See README.md.
 EOF
+}
+
+# ---- main -------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--tag) TAG="${2:-}"; [ -n "$TAG" ] || die "--tag needs a value"; shift 2 ;;
+		--output) OUT="${2:-}"; [ -n "$OUT" ] || die "--output needs a value"; shift 2 ;;
+		--stage) STAGE="${2:-}"; [ -n "$STAGE" ] || die "--stage needs a value"; shift 2 ;;
+		--work) WORK="${2:-}"; [ -n "$WORK" ] || die "--work needs a value"; shift 2 ;;
+		--from-stage) FROM_STAGE="${2:-}"; [ -n "$FROM_STAGE" ] || die "--from-stage needs a value"; shift 2 ;;
+		--stage-only) STAGE_ONLY=1; shift ;;
+		--restage) RESTAGE=1; shift ;;
+		--no-verify) VERIFY=0; shift ;;
+		--print-dockerfile) print_dockerfile; exit 0 ;;
+		--check-lock) verify_lock "${2:?--check-lock needs a file}"; exit $? ;;
+		-h|--help) usage; exit 0 ;;
+		*) die "unknown flag: $1 (try --help)" ;;
+	esac
+done
+
+if [ -n "$FROM_STAGE" ]; then
+	[ "$STAGE_ONLY" -eq 0 ] || die "--from-stage and --stage-only are opposite halves; pass one"
+	[ -z "$STAGE" ] || die "--from-stage names the stage; drop --stage"
+	[ "$RESTAGE" -eq 0 ] || die "--from-stage packages an existing stage; --restage does not apply"
+	STAGE="$FROM_STAGE"
+fi
+[ -n "$STAGE" ] || STAGE="$WORK/stage"
+[ -n "$OUT" ] || OUT="$WORK/oci"
+
+echo "==> preflight"
+require_host
+verify_lock "$HERE/requirements.lock"
+
+if [ -n "$FROM_STAGE" ]; then
+	# Package a stage made elsewhere (the cluster's stage Job): no uv, no
+	# network. The stage must carry this checkout's pins.
+	require_python3
+	require_k3sm
+	assert_stage_current
+	assert_readable
+	assert_precompiled
+	assert_stageable
+	assert_context_budget
+	package
+	exit 0
+fi
+
+require_uv
+if [ "$STAGE_ONLY" -eq 0 ]; then
+	require_python3
+	require_k3sm
+fi
+
+mkdir -p "$WORK"
+stage_tree
+stage_shard_entrypoint
+assert_precompiled
+assert_stageable
+
+assert_context_budget
+
+if [ "$STAGE_ONLY" -eq 1 ]; then
+	echo
+	echo "==> staged (no package): $STAGE"
+	echo "  stamp: $(cat "${STAGE}.stamp")"
+	exit 0
+fi
+
+package

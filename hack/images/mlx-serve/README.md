@@ -56,6 +56,7 @@ multimodal input tokens are not counted.
 | file | what it is |
 |---|---|
 | `build.sh` | stages the tree with uv and packages it with `k3sm build` |
+| `stage-job.sh` | runs the stage step as a native Job on the cluster |
 | `requirements.in` | the engine pin — the only direct requirement |
 | `requirements.lock` | the resolved closure, one hash per artifact; do not hand-edit |
 | `walk-verify.sh` | asserts every Mach-O in the payload is validly signed |
@@ -107,9 +108,52 @@ sharded serving is for trusted tenants only.
 
 ## Build
 
-Needs a Mac on Apple silicon, in a **native arm64 shell** (a Rosetta-translated
-shell would stage x86_64 wheels into an arm64 image, so the script refuses one),
-with [uv](https://docs.astral.sh/uv/), `python3`, and a `k3sm` binary.
+The build runs on k3sm. The stage step (fetch the pinned interpreter and the
+hash-pinned closure, precompile) runs as a native Job on the cluster, and the
+host only packages the staged tree and pushes it, as the operator's own user:
+
+```sh
+# 1. stage on the cluster, onto a local volume of the named node
+hack/images/mlx-serve/stage-job.sh apply --node <node>
+
+# 2. on that node, package the volume's stage (no uv, no network)
+CGO_ENABLED=1 go build -o /tmp/k3sm ./cmd/k3sm
+K3SM_BIN=/tmp/k3sm hack/images/mlx-serve/build.sh \
+    --from-stage "$(hack/images/mlx-serve/stage-job.sh path)"
+```
+
+`stage-job.sh render --node <node>` prints the manifests without applying them:
+a Namespace (`mlx-serve-build`), a `local-path` claim for the stage, a ConfigMap
+carrying `build.sh`, `requirements.lock`, `k3sm_shard.py` and `k3sm_serve.py`
+verbatim, and the Job. The Job's pod is a native pod that:
+
+- checks the ConfigMap's `requirements.lock` against the sha256 rendered into
+  the Job;
+- downloads uv at the exact version that generated the lockfile and checks it
+  against the sha256 its release publishes, failing closed on a mismatch;
+- runs `build.sh --stage-only`, which is every check and step below up to the
+  context ceiling, into the claim.
+
+It carries **no credential**: no Secret, no service-account token, no pull
+secret. The registry credential never leaves the operator's user on the host.
+The node is chosen with a `nodeSelector`, so the scheduler places the pod and
+binds the claim (a `WaitForFirstConsumer` claim stays `Pending` under a
+`nodeName` pod). The staged tree lands at
+`/var/lib/k3sm/storage/<namespace>/<claim>/stage` on that node, owned by the
+runtime user and readable by the operator.
+
+`build.sh --from-stage` refuses a stage that was not made from the checkout's
+pins (it compares the stamp the stage step writes beside the tree), that lacks
+the interpreter, whose entrypoint modules differ from the checkout's, or that holds
+a file the packaging user cannot read. Then it packages and walk-verifies as
+below.
+
+### Building on the host
+
+Staging on the host is the fallback. It needs a Mac on Apple silicon, in a
+**native arm64 shell** (a Rosetta-translated shell would stage x86_64 wheels
+into an arm64 image, so the script refuses one), with
+[uv](https://docs.astral.sh/uv/), `python3`, and a `k3sm` binary.
 
 ```sh
 CGO_ENABLED=1 go build -o /tmp/k3sm ./cmd/k3sm
@@ -132,7 +176,7 @@ It stages into `~/.cache/k3sm/mlx-serve` (override with `K3SM_MLX_WORK`, or
 reused unless the lockfile or the interpreter pin changed, or `--restage` is
 given. Expect roughly 1.3 GB unpacked and a couple of minutes on a cold cache.
 
-What the script does, and why each step is there:
+What the script does, on either path, and why each step is there:
 
 1. **Refuses a lockfile that is not fully pinned** — every requirement must be an
    exact `==` with at least one hash, and no direct (`git+`) URL, which cannot
@@ -140,7 +184,9 @@ What the script does, and why each step is there:
 2. **Installs the pinned interpreter and asserts the artifact URL.** The uv
    version key alone is not a pin: a later uv ships a newer
    python-build-standalone build of the same CPython patch release. `build.sh`
-   compares uv's resolved URL against `PY_URL` and stops if they differ.
+   compares uv's resolved URL against `PY_URL` and stops if they differ. The
+   listing is parsed by the interpreter just installed, run with `-I -B` so it
+   leaves no bytecode in the tree it is about to stage.
 3. **Stages the resolved versioned directory.** uv keeps a version-alias symlink
    beside the dist whose target is an absolute path; the builder accepts
    relative, resolvable, in-context symlinks and nothing else, so the alias is
@@ -153,7 +199,10 @@ What the script does, and why each step is there:
 6. **Precompiles bytecode** (`unchecked-hash`, with in-image source paths).
    Without it every pod writes its own `__pycache__` into its copy-on-write
    clone of the rootfs — breaking sharing for exactly the model-architecture
-   modules the lockfile could not know would be imported.
+   modules the lockfile could not know would be imported. It runs serially:
+   a parallel `compileall` needs a POSIX semaphore, which a pod's sandbox
+   refuses. The build then fails if more than five modules have no `.pyc`, on
+   both paths, so a precompile that did not run cannot pass quietly.
 7. **Checks the staged tree against the builder's 2 GiB context ceiling**, which
    binds well before any image-size budget does.
 8. **Writes the Dockerfile outside the context** (`COPY . /` would otherwise
@@ -214,12 +263,17 @@ and carries the serving argv, that the lockfile is exactly pinned with a hash
 per artifact, that `build.sh` refuses a lockfile that is not and refuses to run
 without uv, and that `walk-verify.sh` goes red on an invalid signature, on a
 mislabelled layer, on a blob that does not match its digest, and on a
-non-Mach-O entrypoint. It also drives `k3sm_shard` with fake name resolution
+non-Mach-O entrypoint. It checks the stage Job `stage-job.sh` renders (the uv
+version and sha256, the lockfile digest, the files carried verbatim, no
+credential, the placement and toleration) and that its entry script stops on a
+digest mismatch before downloading anything, and it drives
+`build.sh --from-stage` against a fake stage and a fake `k3sm`, including every
+refusal. It also drives `k3sm_shard` with fake name resolution
 (no model, no GPU): the ring hostfile and the `jaccl` device matrix land in the
 pod data volume, resolution retries and gives up on time, and the liveness
 probe answers correctly. It drives the `k3sm_serve` context guard against
 fakes, and, when a staged tree exists (`K3SM_MLX_STAGE`, default the build's
-work dir), against the real engine's HTTP app. It prints what it does **not** cover; the live build,
+work dir), against the real engine's HTTP app. It prints what it does **not** cover; the stage Job on a cluster, the live build,
 the real payload walk, the push, and a sharded model on two Macs are the lab
 run.
 
@@ -266,6 +320,13 @@ the new interpreter.
 - Two builds of the same context on the same machine produce the same digest.
   That has not been shown to hold across Go toolchain versions, so do not treat
   a digest as reproducible across build hosts.
+- The staged tree depends on where it was staged, so a stage made by the Job and
+  one made on the host package to different digests. uv writes the stage's
+  absolute interpreter path into the console-script shebangs under `bin/` and
+  their `RECORD` entries, the interpreter's install directory into
+  `libpython3.12.dylib` and its sysconfig data, and the handful of modules the
+  staging interpreter imports carry timestamp `.pyc` files. The file set is the
+  same; the image runs its entrypoint through `-m`, never a `bin/` script.
 - `selftest.sh`'s invalid-signature fixture is an *unsigned* hand-written Mach-O.
   A signed-then-tampered binary is rejected for a different reason; only the
   live payload walk exercises that.

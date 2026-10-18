@@ -26,6 +26,13 @@
 #   * the k3sm-serve context guard refuses a request longer than the engine's
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
 #     when a staged tree is present, against the real vllm-mlx server.
+#   * the stage Job stage-job.sh renders pins uv by version and published
+#     sha256 and the lockfile by digest, carries the checkout's files verbatim,
+#     fails closed on a digest mismatch, carries no credential, and is placed by
+#     nodeSelector with the provider toleration;
+#   * build.sh --from-stage packages a stage made elsewhere with no uv, and
+#     refuses a stage from other pins, without its stamp or interpreter, with a
+#     drifted entrypoint module, or with a file the packaging user cannot read.
 #
 # Usage: hack/images/mlx-serve/selftest.sh
 # Exit: 0 all checks pass, 1 otherwise.
@@ -51,7 +58,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/mlx-selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
 # ---- 0 — the scripts parse and are executable -------------------------------
-for s in "$BUILD" "$WALK" "$HERE/selftest.sh"; do
+for s in "$BUILD" "$WALK" "$HERE/stage-job.sh" "$HERE/selftest.sh"; do
 	n="$(basename "$s")"
 	if [ -x "$s" ] && bash -n "$s" 2>/dev/null; then
 		ladder ok "0.$n  executable + parses (bash -n)"
@@ -61,7 +68,7 @@ for s in "$BUILD" "$WALK" "$HERE/selftest.sh"; do
 done
 
 if command -v shellcheck >/dev/null 2>&1; then
-	if out="$(shellcheck -s bash "$BUILD" "$WALK" "$HERE/selftest.sh" 2>&1)"; then
+	if out="$(shellcheck -s bash "$BUILD" "$WALK" "$HERE/stage-job.sh" "$HERE/selftest.sh" 2>&1)"; then
 		ladder ok "0.shellcheck  clean"
 	else
 		ladder no "0.shellcheck  clean"
@@ -790,12 +797,239 @@ else
 	ladder skip "9.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
 fi
 
+# ---- 10 — the stage Job (stage-job.sh render) --------------------------------
+# A golden check of what the cluster is asked to run. The uv pin is repeated
+# here, independently of stage-job.sh, so an edited pin goes red until it is
+# re-checked against the release's published sha256 and edited here too.
+STAGEJOB="$HERE/stage-job.sh"
+GOLD_UV_VERSION="0.12.7"
+GOLD_UV_SHA256="127ebdda7ad953cdf198e964b570ea5771b85467ea93eb7cb6d6f8e6f55408f3"
+GOLD_UV_URL="https://github.com/astral-sh/uv/releases/download/$GOLD_UV_VERSION/uv-aarch64-apple-darwin.tar.gz"
+GOLD_NODE="k3sm-golden"
+RJ="$WORK/stage-job.yaml"
+
+if "$STAGEJOB" render > /dev/null 2>&1; then
+	ladder no "10.nonode  render refuses to run without --node"
+else
+	ladder ok "10.nonode  render refuses to run without --node"
+fi
+if "$STAGEJOB" render --node "$GOLD_NODE" > "$RJ" 2>/dev/null && [ -s "$RJ" ]; then
+	ladder ok "10.render  stage-job.sh render --node emits the manifests"
+else
+	ladder no "10.render  stage-job.sh render --node emits the manifests"
+fi
+
+kinds="$(grep -E '^kind: ' "$RJ" | awk '{print $2}' | tr '\n' ' ')"
+if [ "$kinds" = "Namespace PersistentVolumeClaim ConfigMap Job " ]; then
+	ladder ok "10.kinds  a Namespace, the stage claim, the source ConfigMap and the Job, nothing else"
+else
+	ladder no "10.kinds  a Namespace, the stage claim, the source ConfigMap and the Job, nothing else (got: $kinds)"
+fi
+
+# The pins and digests the Job carries.
+envval() { awk -v n="$1" '$0 ~ "- name: " n "$" { getline; sub(/^ *value: /, ""); gsub(/"/, ""); print; exit }' "$RJ"; }
+if [ "$(envval UV_VERSION)" = "$GOLD_UV_VERSION" ] && [ "$(envval UV_SHA256)" = "$GOLD_UV_SHA256" ] &&
+	[ "$(envval UV_URL)" = "$GOLD_UV_URL" ]; then
+	ladder ok "10.uvpin  uv $GOLD_UV_VERSION, its release URL and its published sha256"
+else
+	ladder no "10.uvpin  uv $GOLD_UV_VERSION, its release URL and its published sha256"
+fi
+if grep -qx "UV_MIN=\"$GOLD_UV_VERSION\"" "$BUILD"; then
+	ladder ok "10.uvmin  the Job's uv is the uv build.sh pins the lockfile and interpreter to"
+else
+	ladder no "10.uvmin  the Job's uv is the uv build.sh pins the lockfile and interpreter to"
+fi
+if [ "$(envval LOCK_SHA256)" = "$(shasum -a 256 "$LOCK" | awk '{print $1}')" ]; then
+	ladder ok "10.lockdigest  LOCK_SHA256 is requirements.lock's sha256"
+else
+	ladder no "10.lockdigest  LOCK_SHA256 is requirements.lock's sha256"
+fi
+
+# The ConfigMap carries the checkout's files byte for byte, and the entry script.
+cm_out="$(python3 - "$RJ" "$HERE" "$WORK/entry" <<'PY'
+import json, os, re, sys
+rendered, here, entry_dir = sys.argv[1:]
+data, in_cm = {}, False
+for line in open(rendered):
+    if line.startswith("kind: "):
+        in_cm = line.strip() == "kind: ConfigMap"
+    m = re.match(r'^  ([A-Za-z0-9._-]+): (".*")$', line.rstrip("\n"))
+    if in_cm and m:
+        data[m.group(1)] = json.loads(m.group(2))
+for name in ("build.sh", "requirements.lock", "k3sm_shard.py", "k3sm_serve.py"):
+    ok = name in data and data[name] == open(os.path.join(here, name)).read()
+    print(("ok " if ok else "no ") + "bytes." + name)
+print(("ok " if set(data) == {"build.sh", "requirements.lock", "k3sm_shard.py", "k3sm_serve.py", "stage-entry.sh"} else "no ") + "keys")
+os.makedirs(entry_dir, exist_ok=True)
+open(os.path.join(entry_dir, "stage-entry.sh"), "w").write(data.get("stage-entry.sh", ""))
+PY
+)"
+while read -r verdict name; do
+	[ -n "$verdict" ] || continue
+	case "$verdict" in
+		ok) ladder ok "10.cm.$name  the ConfigMap carries it verbatim" ;;
+		*)  ladder no "10.cm.$name  the ConfigMap carries it verbatim" ;;
+	esac
+done <<< "$cm_out"
+
+# The entry script checks both digests before it runs anything, then stages
+# with build.sh --stage-only (the same checks as a host build).
+ENTRY="$WORK/entry/stage-entry.sh"
+lock_line="$(grep -n 'LOCK_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | head -1)"
+uv_line="$(grep -n 'UV_SHA256.*shasum -a 256 -c' "$ENTRY" | cut -d: -f1 | head -1)"
+tar_line="$(grep -n 'tar -xzf' "$ENTRY" | cut -d: -f1 | head -1)"
+build_line="$(grep -n 'build.sh" --stage-only' "$ENTRY" | cut -d: -f1 | head -1)"
+if [ -n "$lock_line" ] && [ -n "$uv_line" ] && [ -n "$tar_line" ] && [ -n "$build_line" ] &&
+	[ "$uv_line" -lt "$tar_line" ] && [ "$lock_line" -lt "$build_line" ] && grep -q '^set -euo pipefail$' "$ENTRY"; then
+	ladder ok "10.entry  the lock and uv digests are checked (set -e) before uv is unpacked and build.sh --stage-only runs"
+else
+	ladder no "10.entry  the lock and uv digests are checked (set -e) before uv is unpacked and build.sh --stage-only runs"
+fi
+# Fail closed, run for real: a lockfile that does not match the rendered digest
+# stops the entry script before anything is downloaded.
+FAKEROOT="$WORK/fakepod"; mkdir -p "$FAKEROOT/src" "$FAKEROOT/stage"
+cp "$ENTRY" "$BUILD" "$HERE/k3sm_shard.py" "$HERE/k3sm_serve.py" "$FAKEROOT/src/"
+printf 'tampered==1.0 \\\n    --hash=sha256:aaa\n' > "$FAKEROOT/src/requirements.lock"
+( cd "$FAKEROOT" && env -i PATH=/usr/bin:/bin UV_VERSION="$GOLD_UV_VERSION" UV_URL="https://invalid.example/uv.tar.gz" \
+	UV_SHA256="$GOLD_UV_SHA256" LOCK_SHA256="$(envval LOCK_SHA256)" /bin/bash ./src/stage-entry.sh ) >/dev/null 2>&1; rc=$?
+if [ "$rc" -ne 0 ] && [ ! -e "$FAKEROOT/work/dl/uv.tar.gz" ] && [ ! -e "$FAKEROOT/stage/stage" ]; then
+	ladder ok "10.failclosed  a lockfile that does not match LOCK_SHA256 stops the Job before any download (exit $rc)"
+else
+	ladder no "10.failclosed  a lockfile that does not match LOCK_SHA256 stops the Job before any download (exit $rc)"
+fi
+
+# No credential reaches the pod: no Secret, no token, no pull secret.
+if ! grep -qiE 'secret|serviceAccountName|imagePullSecrets|envFrom|token|password|credential|registry|docker' \
+	<(grep -vE '^  (build\.sh|requirements\.lock|k3sm_shard\.py|k3sm_serve\.py|stage-entry\.sh): ' "$RJ" |
+		grep -vx '      automountServiceAccountToken: false') &&
+	grep -qx '      automountServiceAccountToken: false' "$RJ"; then
+	ladder ok "10.nocred  no Secret, token, pull secret or registry reference; the service-account token is not mounted"
+else
+	ladder no "10.nocred  no Secret, token, pull secret or registry reference; the service-account token is not mounted"
+fi
+if ! grep -qiE 'token|password|registry|ghcr|push' "$ENTRY"; then
+	ladder ok "10.nocred.entry  the entry script names no credential and pushes nothing"
+else
+	ladder no "10.nocred.entry  the entry script names no credential and pushes nothing"
+fi
+
+# Placement: a nodeSelector (the scheduler binds the WaitForFirstConsumer
+# claim), never nodeName (which skips the scheduler and leaves it Pending).
+if grep -qx '        kubernetes.io/os: darwin' "$RJ" && grep -qx "        kubernetes.io/hostname: $GOLD_NODE" "$RJ" &&
+	! grep -q 'nodeName' "$RJ"; then
+	ladder ok "10.placement  nodeSelector darwin + hostname $GOLD_NODE, no nodeName"
+else
+	ladder no "10.placement  nodeSelector darwin + hostname $GOLD_NODE, no nodeName"
+fi
+tol="$(awk '/^      tolerations:$/ { on = 1; next } on && /^      [a-z]/ { on = 0 } on' "$RJ")"
+want_tol="$(printf '        - key: k3sm.io/provider\n          operator: Exists\n          effect: NoSchedule')"
+if [ "$tol" = "$want_tol" ]; then
+	ladder ok "10.toleration  exactly the provider toleration (NoSchedule), as product pods carry it"
+else
+	ladder no "10.toleration  exactly the provider toleration (NoSchedule), as product pods carry it"
+fi
+if grep -qx '          image: native' "$RJ" && grep -qxF '          command: ["/bin/bash", "./src/stage-entry.sh"]' "$RJ" &&
+	grep -qx '  backoffLimit: 0' "$RJ" && grep -qx '      restartPolicy: Never' "$RJ" &&
+	grep -qx '  storageClassName: local-path' "$RJ"; then
+	ladder ok "10.shape  a native pod, run once, its stage on a local-path claim"
+else
+	ladder no "10.shape  a native pod, run once, its stage on a local-path claim"
+fi
+
+# ---- 11 — build.sh --from-stage (package the stage Job's volume) -------------
+# The precompile runs serially: -j 0 needs a POSIX semaphore, which the pod
+# sandbox refuses, and a failed precompile must reach assert_precompiled.
+if grep -qE -- '-m compileall .*-j 1 ' "$BUILD" && ! grep -qE -- '-m compileall .*-j 0' "$BUILD" &&
+	grep -q '^assert_precompiled$' "$BUILD" && ! grep -qE 'compileall.*>/dev/null 2>&1' "$BUILD"; then
+	ladder ok "11.serial  build.sh precompiles with -j 1, keeps its output, and asserts the result on both paths"
+else
+	ladder no "11.serial  build.sh precompiles with -j 1, keeps its output, and asserts the result on both paths"
+fi
+# A fake stage and a fake k3sm: what is proven is the mode's contract (the
+# guards, no uv, the packaging argv), not a real build.
+PY_KEY_GOLD="$(sed -n 's/^PY_KEY="\(.*\)"$/\1/p' "$BUILD")"
+PV="$WORK/pv"
+mkstage() {
+	rm -rf "$PV"; mkdir -p "$PV/stage/bin" "$PV/stage/lib/python3.12/site-packages"
+	# The interpreter build.sh runs to check the precompile: the host's python3.
+	printf '#!/bin/sh\nexec python3 "$@"\n' > "$PV/stage/bin/python3.12"
+	chmod +x "$PV/stage/bin/python3.12"
+	cp "$HERE/k3sm_shard.py" "$HERE/k3sm_serve.py" "$PV/stage/lib/python3.12/site-packages/"
+	echo "$PY_KEY_GOLD $(shasum -a 256 "$LOCK" | awk '{print $1}')" > "$PV/stage.stamp"
+}
+FAKEK3SM="$WORK/fake-k3sm"
+cat > "$FAKEK3SM" <<'FAKE'
+#!/bin/bash
+# Records its argv and writes the one file build.sh reads back from a layout.
+printf '%s\n' "$@" > "$FAKE_ARGV"
+out=""
+while [ $# -gt 0 ]; do [ "$1" = "--output" ] && out="$2"; shift; done
+mkdir -p "$out"
+printf '{"manifests":[{"digest":"sha256:%064d"}]}\n' 0 > "$out/index.json"
+FAKE
+chmod +x "$FAKEK3SM"
+fromstage() {
+	rm -f "$WORK/fake-argv"
+	FAKE_ARGV="$WORK/fake-argv" K3SM_MLX_UV=/nonexistent/uv K3SM_BIN="$FAKEK3SM" \
+		"$BUILD" --work "$WORK/pkg" --no-verify "$@" 2>&1
+}
+
+mkstage
+out="$(fromstage --from-stage "$PV/stage")"; rc=$?
+if [ "$rc" -eq 0 ] && [ -f "$WORK/fake-argv" ] &&
+	[ "$(head -2 "$WORK/fake-argv" | tr '\n' ' ')" = "build --no-record " ] &&
+	[ "$(tail -1 "$WORK/fake-argv")" = "$PV/stage" ] &&
+	grep -qx -- '--output' "$WORK/fake-argv"; then
+	ladder ok "11.package  --from-stage packages the volume's stage with k3sm build --no-record --output, with no uv"
+else
+	ladder no "11.package  --from-stage packages the volume's stage with k3sm build --no-record --output, with no uv (exit $rc)"
+	printf '%s\n' "$out" | tail -5
+fi
+
+refused() { # <label> <expected message> <build.sh args...>
+	local label="$1" msg="$2"; shift 2
+	out="$(fromstage "$@")"; rc=$?
+	if [ "$rc" -ne 0 ] && [ ! -f "$WORK/fake-argv" ] && printf '%s' "$out" | grep -q -- "$msg"; then
+		ladder ok "11.$label  refused before packaging (exit $rc)"
+	else
+		ladder no "11.$label  refused before packaging (exit $rc)"
+		printf '%s\n' "$out" | tail -3
+	fi
+}
+mkstage; echo "$PY_KEY_GOLD 0000" > "$PV/stage.stamp"
+refused "stalestamp  a stage made from other pins is" "other pins" --from-stage "$PV/stage"
+mkstage; rm -f "$PV/stage.stamp"
+refused "nostamp  a stage without build.sh's stamp is" "no stamp" --from-stage "$PV/stage"
+mkstage; echo "# drift" >> "$PV/stage/lib/python3.12/site-packages/k3sm_shard.py"
+refused "shard  a stage whose k3sm_shard.py differs from the checkout's is" "k3sm_shard.py differs" --from-stage "$PV/stage"
+mkstage; echo "# drift" >> "$PV/stage/lib/python3.12/site-packages/k3sm_serve.py"
+refused "serve  a stage whose k3sm_serve.py differs from the checkout's is" "k3sm_serve.py differs" --from-stage "$PV/stage"
+mkstage; rm -f "$PV/stage/bin/python3.12"
+refused "nointerp  a stage without the interpreter is" "no interpreter" --from-stage "$PV/stage"
+mkstage; echo x > "$PV/stage/secret.txt"; chmod 000 "$PV/stage/secret.txt"
+if [ -r "$PV/stage/secret.txt" ]; then
+	ladder skip "11.unreadable  running as root; every file is readable"
+else
+	refused "unreadable  a stage with a file the packaging user cannot read is" "UNREADABLE" --from-stage "$PV/stage"
+fi
+chmod 600 "$PV/stage/secret.txt" 2>/dev/null
+# The stage Job once staged a tree with almost no bytecode (the sandbox
+# refused compileall's process pool) and nothing noticed. More than a handful of
+# modules without a .pyc is now a refusal, wherever the stage was made.
+mkstage; for i in 1 2 3 4 5 6; do echo "x = $i" > "$PV/stage/lib/python3.12/site-packages/m$i.py"; done
+refused "precompile  a stage with more than a handful of uncompiled modules is" "the precompile step failed" --from-stage "$PV/stage"
+mkstage
+refused "exclusive  --from-stage with --stage-only is" "opposite halves" --from-stage "$PV/stage" --stage-only
+refused "nostage  --from-stage with --stage is" "drop --stage" --from-stage "$PV/stage" --stage "$PV/stage"
+
 # ---- summary ----------------------------------------------------------------
 echo "----------------------------------------"
 echo "mlx-serve selftest: $PASS passed, $FAIL failed, $SKIP skipped"
 cat <<'EOF'
 
 Not covered here — this needs a Mac with uv, a k3sm binary and the network:
+  * the stage Job on a cluster (egress, the pod sandbox, the volume) and the
+    host packaging its volume with --from-stage;
   * staging the tree (uv python install + uv pip install --require-hashes),
     and with it the interpreter-URL pin assertion;
   * `k3sm build --no-record --format oci` over the real 1.3 GB context, as an
