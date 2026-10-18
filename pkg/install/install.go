@@ -1473,6 +1473,11 @@ type Config struct {
 	// stopping the control plane cuts them off. Nil skips it; an error is a
 	// warning that the count is unknown.
 	JoinedWorkers func(ctx context.Context) (int, error)
+	// AppLauncher opens the menu bar app, with its window hidden, for the user
+	// at the screen once Install, Start or Restart with Start has brought the
+	// node up (see launchApp). Best effort: an error is logged and never fails
+	// the command. Nil launches nothing.
+	AppLauncher AppLauncher
 	// Purge makes Uninstall also remove everything it otherwise keeps: the data
 	// root (and the data volume under it), the daemon log dir, the arguments
 	// records, the k3sm context in TargetUser's kubeconfig and the service user.
@@ -1858,13 +1863,6 @@ func (c Config) plistPath(label string) string {
 func Install(ctx context.Context, sys System, cfg Config) error {
 	_, err := InstallWithResult(ctx, sys, cfg)
 	return err
-}
-
-// InstallWithResult is Install, also returning the Result.
-func InstallWithResult(ctx context.Context, sys System, cfg Config) (Result, error) {
-	var res Result
-	err := install(ctx, sys, cfg, &res)
-	return res, err
 }
 
 func install(ctx context.Context, sys System, cfg Config, res *Result) (err error) {

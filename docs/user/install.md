@@ -143,6 +143,11 @@ same `k3sm install` with the same defaults as `install.sh`, adding only `--from-
 `--user`, and it installs the release it carries, which can be older than the newest release the
 script picks.
 
+When the app is installed in `/Applications`, `k3sm install`, `k3sm start` and
+`k3sm restart --start` open it for the user logged in at the screen once the node is up, with its
+window hidden, so its menu bar icon appears at once. They skip it when nobody is logged in at the
+screen, when it already runs, or when its signature does not match the running `k3sm`.
+
 The k3sm app installs, updates and uninstalls with the same `/Library/k3sm`. Each of those
 actions asks for an administrator password once. That step copies the app's bundled files into a
 root-owned staging folder, checks the copy, and then runs the install from that copy. It never runs k3sm

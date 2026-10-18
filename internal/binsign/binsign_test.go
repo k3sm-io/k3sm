@@ -216,8 +216,8 @@ func TestParseDisplay(t *testing.T) {
 		out  string
 		want Signature
 	}{
-		{"ad hoc", "Executable=/x\nCodeDirectory v=20400 size=1 flags=0x2(adhoc) hashes=1+0\nSignature=adhoc\nTeamIdentifier=not set\n",
-			Signature{Valid: true, AdHoc: true}},
+		{"ad hoc", "Executable=/x\nIdentifier=io.k3sm.app\nCodeDirectory v=20400 size=1 flags=0x2(adhoc) hashes=1+0\nSignature=adhoc\nTeamIdentifier=not set\n",
+			Signature{Valid: true, AdHoc: true, Identifier: "io.k3sm.app"}},
 		{"linker-signed", "CodeDirectory v=20400 size=1 flags=0x20002(adhoc,linker-signed) hashes=1+0\nSignature=adhoc\n",
 			Signature{Valid: true, AdHoc: true}},
 		{"Developer ID", "CodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+0\nAuthority=Developer ID Application: K (ABCDE12345)\nTeamIdentifier=ABCDE12345\n",

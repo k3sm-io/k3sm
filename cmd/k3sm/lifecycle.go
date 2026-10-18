@@ -477,7 +477,22 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	sys := install.NewDarwinSystem()
 	ctx, cancel := lifecycleContext(install.StartTimeBound())
 	defer cancel()
-	return lifecycleExit("start", install.Start(ctx, sys, lifecycleConfig(sys, stdout, stderr), actor, reason), stderr)
+	cfg := lifecycleConfig(sys, stdout, stderr)
+	cfg.AppLauncher = appLauncher(cfg.Logger)
+	return lifecycleExit("start", install.Start(ctx, sys, cfg, actor, reason), stderr)
+}
+
+// appLauncher is the launcher a start (or restart --start) opens the menu bar
+// app with, hidden, once the node is up. It is nil, and the app is not
+// opened, when the running binary's path cannot be resolved: its signature is
+// what the app's is checked against.
+func appLauncher(logger *slog.Logger) install.AppLauncher {
+	self, err := install.Executable()
+	if err != nil {
+		logger.Warn("not opening the k3sm app: the running k3sm could not be located", "err", err)
+		return nil
+	}
+	return install.NewAppLauncher(logger, self)
 }
 
 // runRestart is `k3sm restart`.
@@ -495,6 +510,9 @@ func runRestart(args []string, stderr io.Writer) int {
 	sys := install.NewDarwinSystem()
 	cfg := lifecycleConfig(sys, nil, stderr)
 	cfg.Start = start
+	if start {
+		cfg.AppLauncher = appLauncher(cfg.Logger)
+	}
 	ctx := context.Background()
 	if start {
 		// --start may be a start: the same bound, and the same signals, as
