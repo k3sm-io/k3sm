@@ -9,4 +9,4 @@
 # as resolved transitive dependencies and are pinned, with hashes, in
 # requirements.lock. Adding a direct requirement here changes the payload the
 # image ships; regenerate the lockfile in the same commit (see README.md).
-vllm-mlx==0.4.1
+vllm-mlx==0.5.0

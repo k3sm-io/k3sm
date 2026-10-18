@@ -33,9 +33,10 @@ import (
 )
 
 // measuredSurface is the `vllm_mlx.cli serve` command line as MEASURED on the rig
-// against the pinned engine (0.4.1, the version hack/images/mlx-serve/build.sh
-// installs), byte-for-byte reproduced host-side: the key is the option, the value
-// says whether it consumes the following token.
+// against 0.4.1 and re-read from the pinned engine's `serve --help` (0.5.0, the
+// version hack/images/mlx-serve/build.sh installs), byte-for-byte reproduced
+// host-side: the key is the option, the value says whether it consumes the
+// following token.
 //
 // It is a TABLE CONSTANT, and the membership check below is EXACT. That is the
 // whole lesson of this test: `--model` is an unambiguous abbreviation of
@@ -217,7 +218,7 @@ func TestEngineArgsMatchTheMeasuredSurface(t *testing.T) {
 			rendered, _ := splitRendered(t, tc.model)
 			for _, bad := range absentFlags {
 				if slices.Contains(rendered, bad) {
-					t.Errorf("%s: rendered argv %v carries %q, which vllm-mlx 0.4.1 does not have", tc.name, rendered, bad)
+					t.Errorf("%s: rendered argv %v carries %q, which the pinned vllm-mlx does not have", tc.name, rendered, bad)
 				}
 			}
 		}
@@ -234,7 +235,7 @@ func TestEngineArgsMatchTheMeasuredSurface(t *testing.T) {
 		for _, bad := range absentFlags {
 			argv := append(append([]string{}, good...), bad, "x")
 			if _, err := scanEngineArgv(argv); err == nil {
-				t.Errorf("scanEngineArgv accepted %q, which vllm-mlx 0.4.1 does not have — the surface check is vacuous", bad)
+				t.Errorf("scanEngineArgv accepted %q, which the pinned vllm-mlx does not have — the surface check is vacuous", bad)
 			}
 		}
 		if _, ok := measuredSurface["--models-config"]; !ok {
