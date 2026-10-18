@@ -41,13 +41,15 @@
 #      that could never match would be visible.
 #
 # The pod is pinned with nodeName to THIS Mac's node (k3sm-<short hostname>,
-# or $K3SM_NODE_NAME) and keeps the darwin nodeSelector. It tolerates only the
-# provider taint.
+# or $K3SM_NODE_NAME) and keeps the darwin nodeSelector. It tolerates only what
+# hack/lab/lib/tolerations.sh renders: the provider taint, plus any keys the
+# operator names in K3SM_LAB_TOLERATE_KEYS.
 #
 # Knobs:
 #   K3SM_LAB=1            required; without it this gate FAILS (it never skips green)
 #   B239_VM_IMAGE         the Linux image (default alpine:3.20, hack/lab/m11.sh's)
 #   B239_SHARE_TAG        the pooled projected-volume share tag (default k3sm.proj)
+#   K3SM_LAB_TOLERATE_KEYS  extra taint keys to tolerate (the tolerations helper)
 #   B239_READY_TIMEOUT    seconds to wait for the pod to be Ready (default 600:
 #                         a first vm boot pulls and unpacks the image)
 #
@@ -55,6 +57,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# shellcheck source-path=SCRIPTDIR source=../lab/lib/tolerations.sh
+. "$REPO_ROOT/hack/lab/lib/tolerations.sh"
+LAB_TOLERATIONS="$(lab_tolerations_yaml NoSchedule)" || exit 1
 
 GATE_NAME=B239
 NS=default
@@ -193,7 +198,7 @@ spec:
   runtimeClassName: vm
   nodeName: $NODE_NAME
   nodeSelector: {kubernetes.io/os: darwin}
-  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
+  tolerations: [$LAB_TOLERATIONS]
   automountServiceAccountToken: false
   terminationGracePeriodSeconds: 1
   containers:
