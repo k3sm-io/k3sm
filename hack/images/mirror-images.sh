@@ -13,7 +13,7 @@
 # The copy is `crane cp` of the FULL index from the upstream ref BY DIGEST, never with
 # --platform: a platform subset is a different manifest with a different digest, and the
 # whole point of the mirror is that its digest IS upstream's, auditable against upstream
-# by anyone. crane is pinned at v0.20.2 and run through `go run`, so nothing is installed
+# by anyone. crane is pinned at v0.22.1 and run through `go run`, so nothing is installed
 # on the host PATH.
 #
 # OFF BY DEFAULT: with no arguments this prints what it would copy and writes nothing.
@@ -35,12 +35,12 @@
 #   hack/images/mirror-images.sh --manifest <path> ...  # replace the default manifests
 #
 # Environment:
-#   K3SM_CRANE  a crane binary to use instead of `go run ...@v0.20.2`; refused unless
-#               `$K3SM_CRANE version` prints exactly v0.20.2.
+#   K3SM_CRANE  a crane binary to use instead of `go run ...@v0.22.1`; refused unless
+#               `$K3SM_CRANE version` prints exactly v0.22.1.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CRANE_VERSION="v0.20.2"
+CRANE_VERSION="v0.22.1"
 MIRROR_PREFIX="ghcr.io/k3sm-io/mirror/"
 REGISTRY="ghcr.io"
 
