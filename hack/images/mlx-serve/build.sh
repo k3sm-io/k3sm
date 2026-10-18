@@ -51,7 +51,6 @@ UV_MIN="0.12.7"
 # probe, so nothing downstream catches it. --continuous-batching is therefore
 # part of the image, not an operator tuning knob. Measured evidence:
 # hack/spike/m8/findings-s5.md.
-ENGINE_MODULE="vllm_mlx.cli"
 SERVE_PORT="8000"
 # The engine binds 127.0.0.1 by default, which is unreachable through a Service.
 SERVE_HOST="0.0.0.0"
@@ -62,10 +61,15 @@ HF_HOME_PATH="/models"
 # sharded MLXModel's rank Pods run it instead of the ENTRYPOINT; it execs
 # mlx_lm.server, which the engine's closure already carries.
 SHARD_MODULE="k3sm_shard"
+# The single-node entrypoint module (k3sm_serve.py beside this script). It runs
+# the engine's own CLI (vllm_mlx.cli) in-process with the same argv, after
+# installing the context guard: a request longer than the engine's window is
+# refused with HTTP 400 instead of served through a rotating cache.
+SERVE_MODULE="k3sm_serve"
 
 # The tag this script builds and pushes. A build output has no digest until it is built,
 # so it stays a tag here; consumers pin the digest the registry reports for it.
-DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0"
+DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1"
 
 # ---- options ----------------------------------------------------------------
 WORK="${K3SM_MLX_WORK:-$HOME/.cache/k3sm/mlx-serve}"
@@ -108,7 +112,7 @@ LABEL org.opencontainers.image.source="https://github.com/k3sm-io/k3sm"
 LABEL io.k3sm.mlx-serve.engine="$(engine_pin)"
 LABEL io.k3sm.mlx-serve.python="$PY_KEY"
 EXPOSE $SERVE_PORT/tcp
-ENTRYPOINT ["/$PY_BIN", "-m", "$ENGINE_MODULE", "serve", "--continuous-batching", "--host", "$SERVE_HOST", "--port", "$SERVE_PORT"]
+ENTRYPOINT ["/$PY_BIN", "-m", "$SERVE_MODULE", "serve", "--continuous-batching", "--host", "$SERVE_HOST", "--port", "$SERVE_PORT"]
 EOF
 }
 
@@ -281,17 +285,21 @@ stage_tree() {
 	echo "$want" > "$stamp"
 }
 
-# stage_shard_entrypoint installs k3sm-shard, the sharded-rank entrypoint, as a
-# top-level module so a rank Pod runs it as `/bin/python3.12 -m k3sm_shard`
-# (argv[0] stays the interpreter Mach-O). It is copied on EVERY build, outside
-# the stamp-guarded staging, so an edited entrypoint never ships stale from a
-# reused stage. The single-node ENTRYPOINT below is untouched: only the
-# operator's sharded render overrides the command.
+# stage_shard_entrypoint installs the two entrypoint modules as top-level
+# modules: k3sm-shard, which a sharded rank Pod runs as
+# `/bin/python3.12 -m k3sm_shard`, and k3sm-serve, which the single-node
+# ENTRYPOINT runs (argv[0] stays the interpreter Mach-O either way). They are
+# copied on EVERY build, outside the stamp-guarded staging, so an edited
+# entrypoint never ships stale from a reused stage. Only the operator's sharded
+# render overrides the ENTRYPOINT.
 stage_shard_entrypoint() {
-	local dest="$STAGE/lib/python3.12/site-packages/$SHARD_MODULE.py"
-	[ -d "$(dirname "$dest")" ] || die "no site-packages in the staged tree ($(dirname "$dest"))"
-	install -m 0644 "$HERE/$SHARD_MODULE.py" "$dest"
-	echo "  shard entrypoint: $SHARD_MODULE ($dest)"
+	local module dest
+	for module in "$SHARD_MODULE" "$SERVE_MODULE"; do
+		dest="$STAGE/lib/python3.12/site-packages/$module.py"
+		[ -d "$(dirname "$dest")" ] || die "no site-packages in the staged tree ($(dirname "$dest"))"
+		install -m 0644 "$HERE/$module.py" "$dest"
+		echo "  entrypoint module: $module ($dest)"
+	done
 }
 
 # assert_stageable rejects the symlink shapes the builder refuses, here, where

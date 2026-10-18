@@ -14,7 +14,7 @@ concern: `HF_HOME` points at `/models`, which the operator mounts.
 |---|---|
 | engine | `vllm-mlx==0.5.0` (Apache-2.0), pinned in `requirements.in` |
 | interpreter | CPython 3.12.14, python-build-standalone, macos-aarch64 |
-| entrypoint | `/bin/python3.12 -m vllm_mlx.cli serve --continuous-batching --host 0.0.0.0 --port 8000` |
+| entrypoint | `/bin/python3.12 -m k3sm_serve serve --continuous-batching --host 0.0.0.0 --port 8000` (the engine's own CLI, run in-process with the context guard below) |
 | args | the model — a repo id or a path under `/models` — supplied by the pod |
 | port | 8000; readiness at `GET /health`, which reports `model_loaded` |
 | platform | `darwin/arm64` only |
@@ -25,6 +25,32 @@ concurrent client, while `/health` stays green and a readiness probe stays
 green — so nothing else catches it. Measurements:
 [`hack/spike/m8/findings-s5.md`](../../spike/m8/findings-s5.md).
 
+## Context length
+
+The engine has no `--max-model-len` and checks no prompt length. Its only
+per-sequence bound is `--max-kv-size`, which k3sm renders from the model's
+derived context and which selects a rotating KV cache: a sequence that outgrows
+it loses its first tokens, and the engine answers HTTP 200 with text built on
+the context it has left. `k3sm_serve` closes that gap the way vLLM enforces
+`max_model_len`. It runs `vllm_mlx.cli` in the same process with the same
+arguments, after hooking the server so that, on `/v1/completions` and
+`/v1/chat/completions` (streaming or not), a request is checked before a
+response starts. With the window W taken from the engine's `--max-kv-size` (the
+last one in argv wins, as it does for the cache) and the prompt counted with
+the model's tokenizer after the chat template:
+
+- a prompt of W tokens or more is refused;
+- a prompt plus a client `max_tokens` over W is refused;
+- an omitted `max_tokens` runs as the rest of the window.
+
+A refusal is HTTP 400 with vLLM's error object
+(`{"error": {"message": "This model's maximum context length is W tokens. ...",
+"type": "BadRequestError", "param": null, "code": 400}}`). The guard hooks
+engine functions by name and the process exits at start if one has moved, so
+an engine bump fails loudly rather than serving unguarded; selftest rung 9
+checks the hooks against a staged tree. `/v1/responses`, `/v1/messages` and
+multimodal input tokens are not counted.
+
 ## Files
 
 | file | what it is |
@@ -33,6 +59,7 @@ green — so nothing else catches it. Measurements:
 | `requirements.in` | the engine pin — the only direct requirement |
 | `requirements.lock` | the resolved closure, one hash per artifact; do not hand-edit |
 | `walk-verify.sh` | asserts every Mach-O in the payload is validly signed |
+| `k3sm_serve.py` | the single-node entrypoint: the engine's CLI plus the context guard (above) |
 | `k3sm_shard.py` | the entrypoint of one rank of a sharded `MLXModel` (see below) |
 | `selftest.sh` | the checks that do not need a build (see below) |
 
@@ -157,17 +184,19 @@ Push the layout with the registry token from the environment, as your own user:
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
-  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0
+  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1
 ```
 
 The credential is read from the environment or the docker config chain — never
 from argv — and is not stored. `push` prints the digest and the pin:
 
 ```
-pushed ghcr.io/k3sm-io/mlx-serve:0.5.0
+pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1
   digest: sha256:…
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```
+
+The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`), so a tag never changes what it names.
 
 Record that pin. The operator resolves the image **by digest**; the tag is
 display-only and the next push moves it.
@@ -188,7 +217,9 @@ mislabelled layer, on a blob that does not match its digest, and on a
 non-Mach-O entrypoint. It also drives `k3sm_shard` with fake name resolution
 (no model, no GPU): the ring hostfile and the `jaccl` device matrix land in the
 pod data volume, resolution retries and gives up on time, and the liveness
-probe answers correctly. It prints what it does **not** cover; the live build,
+probe answers correctly. It drives the `k3sm_serve` context guard against
+fakes, and, when a staged tree exists (`K3SM_MLX_STAGE`, default the build's
+work dir), against the real engine's HTTP app. It prints what it does **not** cover; the live build,
 the real payload walk, the push, and a sharded model on two Macs are the lab
 run.
 
