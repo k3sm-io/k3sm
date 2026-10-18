@@ -22,6 +22,7 @@ package acceptance
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path"
@@ -594,5 +595,45 @@ func hasLine(want string) func(t *testing.T, out string) {
 			}
 		}
 		t.Errorf("no line exactly %q; output:\n%s", want, out)
+	}
+}
+
+// TestM10LabGateContract pins the M10-lab row now that its gate is the real two-Mac
+// ladder rather than a skeleton, so TestLabSkeletonHonesty no longer selects it. Every
+// invocation is hermetic: none contacts a cluster. The row must be a manual lab row on
+// two Macs whose script is not a skeleton; then:
+//
+//   - K3SM_LAB unset exits 0 and says PENDING (a skip, never a pass);
+//   - --plan exits 0 and lists every assertion m10.1..m10.7;
+//   - --self-test exits 0: shellcheck when installed, unique assertion names, the
+//     PENDING branch, and the refusals (one Ready node, kubectl missing, a malformed
+//     taint spec) each exiting 2 with nothing created, against a fake kubectl.
+func TestM10LabGateContract(t *testing.T) {
+	row, ok := loadGateRows(t)["M10-lab"]
+	if !ok {
+		t.Fatal("phases.json declares no M10-lab row")
+	}
+	if row.Gate != "hack/lab/m10.sh" || row.Tier != "lab" || !row.Manual || row.Skeleton {
+		t.Errorf("M10-lab: gate=%q tier=%q manual=%v skeleton=%v, want hack/lab/m10.sh, lab, true, false", row.Gate, row.Tier, row.Manual, row.Skeleton)
+	}
+	if strings.Join(row.Requires, ",") != "two-macs" {
+		t.Errorf("M10-lab requires %v, want [two-macs]", row.Requires)
+	}
+	gate := filepath.Join(repoRoot(t), filepath.FromSlash(row.Gate))
+
+	if code, out := runGateArgs(t, gate, ""); code != 0 || !strings.Contains(out, "PENDING") {
+		t.Errorf("K3SM_LAB unset: exit %d, want 0 with PENDING\n%s", code, out)
+	}
+	code, out := runGateArgs(t, gate, "", "--plan")
+	if code != 0 {
+		t.Errorf("--plan: exit %d, want 0\n%s", code, out)
+	}
+	for i := 1; i <= 7; i++ {
+		if name := fmt.Sprintf("m10.%d ", i); !strings.Contains(out, name) {
+			t.Errorf("--plan does not list %q", name)
+		}
+	}
+	if code, out := runGateArgs(t, gate, "", "--self-test"); code != 0 || !strings.Contains(out, "m10 self-test: green") {
+		t.Errorf("--self-test: exit %d, want 0 and green\n%s", code, out)
 	}
 }
