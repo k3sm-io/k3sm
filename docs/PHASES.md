@@ -632,7 +632,7 @@ phases:
             desc: "STUB (M10.3; Res.10/12). IN-PROCESS userspace L7 reverse-proxy in its OWN darwin-net/pkg/ingress (or l7) package — NOT accreting onto the L4 proxy: host/path routing, default backend, TLS-from-Secret fronting ClusterIP VIPs; :80/:443 via the netd VerbBindPort fd-passing seam. REJECT a bundled Traefik binary (it forks the single-binary model). SPECIFIC-NODE BIND (Res.12): the Ingress binds a SPECIFIC node address (netd rejects *:80). TLS-KEY DISCIPLINE (Res.10/12): TLS keys stay in-process-memory-only; the IngressClass controller's Secret grant is SCOPED to the referenced tls[].secretName. KLIPPER-LITE LoadBalancer: status.loadBalancer.ingress = node IP (closes B32). Plus a k3sm IngressClass controller."
         acceptance:
           - id: M10.3-a1
-            met: false  # DELIVERED + unit-gated (ingresshost/svclb/netdsvc); the m10-ingress.sh integration (high-port, needs a running cluster) + the privileged :80/:443 netd leg are the lab/e2e slice, not run in this environment
+            met: true  # 2026-10-18: hack/acceptance/m10-ingress.sh 8/8 on the two-Mac rig at the privileged :80/:443 (netd leg): host+path routing, 404 for an unclaimed host, Ingress and LoadBalancer status, the svclb splice, and TLS from a Secret with SNI serving the Secret's certificate
             check: "hack/acceptance/m10-ingress.sh: a host/path route resolves through the L7 proxy + TLS-from-Secret terminates + status.loadBalancer.ingress is populated with the node IP (klipper-lite). Post-launch v0.2 headline."
             method: e2e
       - id: M10.4
