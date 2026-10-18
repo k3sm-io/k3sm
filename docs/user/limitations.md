@@ -112,11 +112,32 @@ names. The runtime moves a workload's own names under that prefix, so programs n
   `EPERM`, a missing one with `ENOENT`). It cannot use one.
 - The semaphore limit (`kern.posix.sem.max`) is **shared by every Pod on the node**, with no per-Pod
   cap, so a Pod that leaks semaphores can exhaust it for its neighbours.
-- A Pod created before the node was upgraded to a release with this grant has no semaphore grant
-  until it is recreated, so it keeps getting `EPERM`.
+- Upgrading the node to a release with this grant changes every running Pod's profile, so the daemon
+  recreates those Pods instead of re-attaching them, and they come back with the grant.
 - POSIX shared memory (`shm_open`, Python `multiprocessing.shared_memory`) stays denied.
 - Untrusted or multi-tenant work belongs on the **`vm` RuntimeClass**, where the Linux guest has its
   own IPC namespace (see [`vm` RuntimeClass](vm-runtimeclass.md)).
+
+### A Native Pod Signals Its Own Process Group
+
+A process in a native Pod can signal its own children and every process in its own process group, so
+a shell can kill a job, a Python `multiprocessing` pool can stop its workers, and an in-Pod supervisor
+can stop what it started. Each Pod is its own session and process group, so it cannot signal another
+Pod, the node daemons or a host process, not even with signal 0. Linux lets the processes of one
+container signal each other freely; the native path is narrower:
+
+- A process can still signal a direct child that moved to a new session or group (`setsid`,
+  `setpgid`), but not a grandchild that did, including one whose parent exited and left it to
+  `launchd`. Such a process gets `EPERM`.
+- A process whose parent exited, so that `launchd` adopted it, can still be signalled as long as it
+  stayed in the Pod's process group.
+- Pod teardown signals the Pod's process group from outside the sandbox, so this limit does not
+  affect it: teardown still reaches the group.
+
+This filters only who a Pod can signal. Pods on one node still share one trust domain: they run as
+the same user with no PID namespace, and the other surfaces that user can reach are not filtered this
+way (see "No Per-Pod uid Isolation" above). Untrusted work belongs on the **`vm` RuntimeClass** (see
+[`vm` RuntimeClass](vm-runtimeclass.md)).
 
 ### Signing Names Files by Relative Path, and SwiftPM Cannot Finish
 
