@@ -18,12 +18,16 @@ package provider
 
 import (
 	"fmt"
+	goruntime "runtime"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/reference"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -32,8 +36,8 @@ import (
 
 // Pod lifecycle Event reasons. They match the kubelet's UpperCamelCase reason
 // vocabulary so `kubectl describe pod` reads identically to upstream and event
-// consumers keying off the reason behave the same. Shared (unexported) here so a
-// future runtimed-path emit reuses the identical reasons and messages.
+// consumers keying off the reason behave the same. Shared (unexported) here so the
+// HostProcess and runtimed paths record the identical reasons and messages.
 //
 // SCOPE: BackOff is emitted on the RUNTIMED path ONLY (the exit-driven
 // re-exec + CrashLoopBackOff loop lives there). The HostProcess provider has
@@ -45,7 +49,9 @@ const (
 	reasonCreated = "Created" // container object created, before process start
 	reasonStarted = "Started" // container process started successfully
 	// reasonKilling is recorded when a container process is being stopped: by
-	// DeletePod on the HostProcess path, and on the runtimed path after a
+	// DeletePod on both paths (one per container still running), on the runtimed
+	// path before a live container is killed and re-exec'd (a committed liveness
+	// failure, a failed postStart hook under a restarting policy), and after a
 	// container whose postStart hook failed under a non-restarting policy was
 	// stopped (msgKillingPostStart).
 	reasonKilling = "Killing"
@@ -280,12 +286,20 @@ func msgImageAlreadyPresent(image string) string {
 	return fmt.Sprintf("Container image %q already present on machine", image)
 }
 
-// msgCreatedContainer is the Created-event message; the container name lives in
-// the message because the Event's involved object is the Pod.
+// msgCreatedContainer is the Created-event message. The container is named both
+// here and in the Event's fieldPath (recordContainerEvent), as upstream does.
 func msgCreatedContainer(name string) string { return "Created container " + name }
 
 // msgStartedContainer is the Started-event message.
 func msgStartedContainer(name string) string { return "Started container " + name }
+
+// msgKillingLiveness is the Killing-event message for a container killed because
+// its liveness probe failed. Kubelet-verbatim: computePodActions builds
+// "Container %s failed liveness probe" and appends ", will be restarted" before
+// handing it to killContainer, which records it as-is.
+func msgKillingLiveness(name string) string {
+	return fmt.Sprintf("Container %s failed liveness probe, will be restarted", name)
+}
 
 // msgKillingPostStart is the Killing-event message for a container stopped
 // because its postStart hook failed. Kubelet-verbatim: upstream's killContainer
@@ -428,6 +442,145 @@ func msgXcodeToolchainUngranted(developerDir string) string {
 		"toolchain grant accepts — it grants a full Xcode developer directory, and a Command Line "+
 		"Tools root needs no grant because a pod already reads that tree. %s",
 		runtimev1.AnnotationXcodeToolchain, developerDir, remedy)
+}
+
+// containerEvent is a lifecycle Event about ONE container of a pod. The kubelet
+// records these against the Pod with the container's fieldPath
+// (spec.containers{name}), which is what `kubectl describe pod` prints in its
+// From column and what tells two containers on one image apart: a Pulled
+// message names the image, not the container, so without the fieldPath the
+// recorder's correlator folds both containers' Pulled into one Event.
+type containerEvent struct {
+	container string
+	podEvent
+}
+
+// containerLifecycleEvents are the kubelet's Events for one start of a
+// container, in its order: Created, then Started when the process started or
+// the Warning Failed when it did not. Both providers build them here, so the
+// HostProcess and runtimed paths cannot drift in reason, type or message.
+func containerLifecycleEvents(name string, started bool) []containerEvent {
+	out := []containerEvent{{name, podEvent{corev1.EventTypeNormal, reasonCreated, msgCreatedContainer(name)}}}
+	if started {
+		return append(out, containerEvent{name, podEvent{corev1.EventTypeNormal, reasonStarted, msgStartedContainer(name)}})
+	}
+	return append(out, containerEvent{name, podEvent{corev1.EventTypeWarning, reasonFailed, msgFailedStart(name)}})
+}
+
+// pulledAlreadyPresentEvent is the kubelet's Pulled Event for a container whose
+// image the node did not fetch for this start (a host binary): one per start
+// attempt, as upstream's image manager records one per trip.
+func pulledAlreadyPresentEvent(name, image string) containerEvent {
+	return containerEvent{name, podEvent{corev1.EventTypeNormal, reasonPulled, msgImageAlreadyPresent(image)}}
+}
+
+// killingEvent is the kubelet's Normal Killing Event for a container the node is
+// about to stop. An empty message is upstream's default, "Stopping container
+// <name>"; a cause-specific stop (a failed liveness probe, a failed postStart
+// hook) passes the message killContainer is handed for it.
+func killingEvent(name, message string) containerEvent {
+	if message == "" {
+		message = msgStoppingContainer(name)
+	}
+	return containerEvent{name, podEvent{corev1.EventTypeNormal, reasonKilling, message}}
+}
+
+// containerFieldPath is the kubelet's fieldPath for a container of pod
+// (kubecontainer.GenerateContainerRef): spec.containers{name},
+// spec.initContainers{name} or spec.ephemeralContainers{name}. A name the spec
+// does not declare gets "", and the Event is recorded against the Pod alone.
+func containerFieldPath(pod *corev1.Pod, name string) string {
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == name {
+			return "spec.containers{" + name + "}"
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == name {
+			return "spec.initContainers{" + name + "}"
+		}
+	}
+	for i := range pod.Spec.EphemeralContainers {
+		if pod.Spec.EphemeralContainers[i].Name == name {
+			return "spec.ephemeralContainers{" + name + "}"
+		}
+	}
+	return ""
+}
+
+// recordContainerEvent records e against pod with the container's fieldPath, the
+// kubelet's recordContainerEvent. The involved object is the Pod's own reference
+// (reference.GetPartialReference, as upstream builds it), so the Event is listed
+// under the pod by involvedObject.uid exactly as a pod-level one is. It runs
+// outside every provider lock, like every other Event here.
+func recordContainerEvent(rec record.EventRecorder, pod *corev1.Pod, e containerEvent) {
+	if fp := containerFieldPath(pod, e.container); fp != "" {
+		if ref, err := reference.GetPartialReference(scheme.Scheme, pod, fp); err == nil {
+			rec.Event(ref, e.eventtype, e.reason, e.message)
+			return
+		}
+	}
+	rec.Event(pod, e.eventtype, e.reason, e.message)
+}
+
+// eventSpacer is the provider's record.EventRecorder: it hands every Event to
+// the node's recorder at a clock reading later than the previous Event's.
+//
+// client-go names an Event "<object name>.<hex UnixNano of its timestamp>"
+// (record.makeEvent), and the macOS wall clock advances in whole microseconds.
+// Two Events for one pod recorded inside one microsecond, which is how a
+// container's Created and Started arrive, therefore get the SAME name. The
+// apiserver refuses the second Create as AlreadyExists, but the recorder's
+// correlator has already filed that Event's key under the shared name, so the
+// next occurrence of the dropped Event (the Started of a re-exec) is PATCHED
+// onto the first: the apiserver ends up holding a Created Event carrying
+// "Started container <name>", and no Started at all. The kubelet never meets
+// this on Linux, where the clock has nanosecond steps.
+//
+// Serializing the provider's Events and waiting out the clock step between two
+// of them makes every name distinct. The wait is at most one clock step (a
+// microsecond on macOS, nothing on a nanosecond clock), and the inner recorder
+// only queues the Event, so the lock is never held across an apiserver call.
+type eventSpacer struct {
+	inner record.EventRecorder
+	// now is the clock the inner recorder stamps Events with (time.Now); a test
+	// substitutes a coarse one.
+	now func() time.Time
+
+	mu   sync.Mutex
+	last int64 // UnixNano read just after the previous Event was handed over
+}
+
+var _ record.EventRecorder = (*eventSpacer)(nil)
+
+func newEventSpacer(inner record.EventRecorder) *eventSpacer {
+	return &eventSpacer{inner: inner, now: time.Now}
+}
+
+// spaced runs record once the clock reads past the previous Event's
+// timestamp. last is read AFTER the inner recorder returns, so it is at or past
+// the timestamp that recorder took; the next Event's timestamp is then strictly
+// later.
+func (s *eventSpacer) spaced(record func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.now().UnixNano() <= s.last {
+		goruntime.Gosched()
+	}
+	record()
+	s.last = s.now().UnixNano()
+}
+
+func (s *eventSpacer) Event(obj runtime.Object, eventtype, reason, message string) {
+	s.spaced(func() { s.inner.Event(obj, eventtype, reason, message) })
+}
+
+func (s *eventSpacer) Eventf(obj runtime.Object, eventtype, reason, format string, args ...any) {
+	s.spaced(func() { s.inner.Eventf(obj, eventtype, reason, format, args...) })
+}
+
+func (s *eventSpacer) AnnotatedEventf(obj runtime.Object, annotations map[string]string, eventtype, reason, format string, args ...any) {
+	s.spaced(func() { s.inner.AnnotatedEventf(obj, annotations, eventtype, reason, format, args...) })
 }
 
 // nopRecorder is a no-op record.EventRecorder. NewHostProcess substitutes it when

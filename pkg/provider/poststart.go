@@ -266,7 +266,7 @@ func (r *runtimedRuntime) failPostStart(ctx context.Context, t *podTrack, pod *c
 	// table, so this decision cannot drift from the exit-driven one.
 	failed := &corev1.ContainerStateTerminated{ExitCode: 1, Reason: reasonFailedPostStartHook}
 	if !shouldRestartOnExit(effectivePodRestartPolicy(pod), containerPolicy, failed) {
-		r.killAfterPostStart(ctx, pod, podID, key, container)
+		r.killAfterPostStart(ctx, t, pod, podID, key, container)
 		return
 	}
 	if err := r.killAndRestart(podID, container, restartReasonPostStart); err != nil {
@@ -304,11 +304,11 @@ const (
 //
 // The event is recorded only after a successful stop: a Killing event for a
 // container that was not killed would be a reported-vs-actual divergence.
-func (r *runtimedRuntime) killAfterPostStart(ctx context.Context, pod *corev1.Pod, podID, key, container string) {
+func (r *runtimedRuntime) killAfterPostStart(ctx context.Context, t *podTrack, pod *corev1.Pod, podID, key, container string) {
 	err := r.stopContainerReason(ctx, podID, container, reasonFailedPostStartHook)
 	switch {
 	case err == nil:
-		r.recorder.Event(pod, corev1.EventTypeNormal, reasonKilling, msgKillingPostStart)
+		r.recordKilling(t, pod, container, msgKillingPostStart)
 	case ctx.Err() != nil:
 		// The pod was deleted or replaced mid-stop: its teardown owns the process.
 	case errors.Is(err, errStopVerbMissing):

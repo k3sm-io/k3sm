@@ -56,15 +56,25 @@ func isPullProgressEvent(ev string) bool {
 		strings.HasPrefix(ev, corev1.EventTypeNormal+" "+reasonPulled+" ")
 }
 
-// nextLifecycleEvent returns the next recorded event that is not pull progress,
-// or "" if none arrives within d. A non-positive d makes one non-blocking pass,
+// isContainerStartEvent reports whether ev is the Created or Started the
+// runtimed path records once per container instance it observes
+// (runtimed_lifecycle.go). Like pull progress they ride every create, so a test
+// asserting on another pod event filters them out;
+// TestRuntimedPathEmitsContainerLifecycleEvents owns them.
+func isContainerStartEvent(ev string) bool {
+	return strings.HasPrefix(ev, corev1.EventTypeNormal+" "+reasonCreated+" ") ||
+		strings.HasPrefix(ev, corev1.EventTypeNormal+" "+reasonStarted+" ")
+}
+
+// nextLifecycleEvent returns the next recorded event that is neither pull
+// progress nor a container's Created/Started, or "" if none arrives within d. A non-positive d makes one non-blocking pass,
 // which is the "assert silence" shape.
 func nextLifecycleEvent(ch <-chan string, d time.Duration) string {
 	deadline := time.Now().Add(d)
 	for {
 		select {
 		case ev := <-ch:
-			if isPullProgressEvent(ev) {
+			if isPullProgressEvent(ev) || isContainerStartEvent(ev) {
 				continue
 			}
 			return ev

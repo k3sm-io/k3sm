@@ -508,6 +508,7 @@ func (r *runtimedRuntime) startRestartWorkerLocked(t *podTrack, cr *containerRes
 // probe blip against a healthy container.
 func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *containerRestart, gen uint64, podID, name, reason string, delay time.Duration) {
 	defer r.finishAttempt(t, cr, gen)
+	killAnnounced := false
 	for {
 		if delay > 0 {
 			select {
@@ -518,6 +519,13 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 			r.emitBackOff(podID, name)
 		} else if ctx.Err() != nil {
 			return
+		}
+		// A trigger that kills a LIVE container (a liveness failure, a failed
+		// postStart hook) records the kubelet's Killing before the re-exec RPC
+		// that stops it, once per worker, not once per retried RPC.
+		if msg, live := killMessageFor(reason, name); live && !killAnnounced {
+			killAnnounced = true
+			r.recordKilling(t, r.podByID(podID), name, msg)
 		}
 		err := r.respawn(ctx, t, podID, name, reason)
 		if err == nil {
