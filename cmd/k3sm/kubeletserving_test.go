@@ -116,10 +116,10 @@ func TestKubeletServingTLSUsesIssuedPair(t *testing.T) {
 }
 
 // TestKubeletServingTLSSelfSignedDefault pins the DEV posture the fix must not
-// disturb: with no issued pair the node self-signs, exactly as single-node
-// `k3sm server` and standalone `k3sm node` still do. That branch is correct only
-// because such an apiserver names no --kubelet-certificate-authority, so the
-// assertion is deliberately two-sided — self-signed AND not chaining to a cluster CA.
+// disturb: with no issued pair the node self-signs, exactly as standalone
+// `k3sm node` still does (every `k3sm server` supplies a cluster-CA pair). That
+// branch is correct only because no cluster CA exists there, so the assertion is
+// deliberately two-sided — self-signed AND not chaining to a cluster CA.
 func TestKubeletServingTLSSelfSignedDefault(t *testing.T) {
 	t.Parallel()
 	ca := testClusterCA(t)
@@ -303,16 +303,8 @@ func TestServerMeshNodeOptionsMintFromClusterCA(t *testing.T) {
 			t.Errorf("IP SANs %v missing the REGISTERED InternalIP %s — the apiserver dials that address (--kubelet-preferred-address-types=InternalIP), so logs/exec would fail on a SAN mismatch", leaf.IPAddresses, internalIP)
 		}
 	})
-
-	t.Run("single node: no pair, so the self-signed dev default stands", func(t *testing.T) {
-		nodeOpts := nodeOptions{nodeName: "k3sm-solo", nodeIP: loopbackNodeIP, kubeletPort: ports.KubeletAPIPort}
-		if err := setServerKubeletServing(&nodeOpts, hierarchy, ""); err != nil {
-			t.Fatalf("setServerKubeletServing on the single-node path: %v", err)
-		}
-		if len(nodeOpts.kubeletServingCertPEM) != 0 || len(nodeOpts.kubeletServingKeyPEM) != 0 {
-			t.Error("the single-node path minted a cluster-CA pair; that posture names no --kubelet-certificate-authority and must keep self-signing")
-		}
-	})
+	// The single-node server mints the same leaf without the mesh IP:
+	// TestSingleNodeKubeletServingCertChainsToClusterCA.
 }
 
 // TestServerMeshMintFailsClosedWithoutCA pins the direction of failure. A CA that

@@ -62,9 +62,9 @@ var wantNativeSecurityContext = &corev1.SecurityContext{
 // runtimeClassName), pinned to server nodes by node affinity on the control-plane
 // role label, with the ServiceAccount token mounted explicitly, upstream's args
 // exactly (so --kubelet-insecure-tls cannot slip in) and upstream's RBAC, Service
-// and APIService byte for byte; and the gate applies it on the mesh serving
-// posture whether or not any node can run vm pods, and still skips it on a
-// single-node server. Before this gate the Deployment was a vm pod running the upstream
+// and APIService byte for byte; and the gate applies it on the cluster-CA kubelet
+// serving posture whether or not any node can run vm pods, and still skips it
+// where the kubelet certs do not chain to the in-cluster CA. Before this gate the Deployment was a vm pod running the upstream
 // Linux image, and the gate skipped it on a cluster with no vm-labelled node.
 func TestMetricsServerAddonRunsNative(t *testing.T) {
 	d := metricsServerDeployment(t)
@@ -131,12 +131,12 @@ func TestMetricsServerAddonRunsNative(t *testing.T) {
 		}
 	})
 
-	t.Run("the gate applies it with no vm node and skips it on a single node", func(t *testing.T) {
+	t.Run("the gate applies it with no vm node and skips it without cluster-CA kubelet certs", func(t *testing.T) {
 		if reason := metricsServerRequirement(Posture{ClusterCAKubeletServing: true}); reason != "" {
-			t.Errorf("mesh serving posture, no vm-labelled node: skipped (%s), want applied", reason)
+			t.Errorf("cluster-CA kubelet serving posture, no vm-labelled node: skipped (%s), want applied", reason)
 		}
-		if reason := metricsServerRequirement(Posture{}); !strings.Contains(reason, "single-node posture") {
-			t.Errorf("single-node posture: reason %q, want the single-node skip", reason)
+		if reason := metricsServerRequirement(Posture{}); !strings.Contains(reason, "do not chain to the in-cluster CA") {
+			t.Errorf("no cluster-CA kubelet serving: reason %q, want the unverifiable-scrape skip", reason)
 		}
 	})
 }

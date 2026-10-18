@@ -25,6 +25,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -114,15 +115,17 @@ func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.
 // manifest that will not apply is survivable: the control plane is up without it.
 // The shipped set is metrics-server (pkg/addons/manifests/metrics-server.yaml), a
 // native pod pinned to server nodes (the control-plane role label
-// labelServerNode sets), applied only where it can serve (addonPosture): on the
-// mesh posture, whose kubelet serving certs chain to the in-cluster CA.
+// labelServerNode sets), applied only where it can serve (addonPosture): where
+// the kubelet serving certs chain to the in-cluster CA, which is every server
+// once its node has minted its pair.
 //
-// A fresh multi-node cluster has no Node when this first runs, so the gate is
-// undecided then. On the mesh serving posture the gated add-ons are therefore
-// re-evaluated every addons.RegateInterval for the life of the process (Regate),
-// so metrics-server lands once the first node registers, with no restart. On a
-// single-node server the kubelet-CA fact can never change in-process, so no loop is
-// started. The returned stop cancels the loop and waits for it; runServer defers it
+// When this first runs the server's own node has not minted its kubelet serving
+// pair yet, and a fresh cluster has no Node, so the gate is undecided then. The
+// gated add-ons are therefore re-evaluated every addons.RegateInterval for the
+// life of the process (Regate) on every topology, so metrics-server lands within
+// one interval of a node registering, with no restart; the mint itself kicks an
+// immediate pass, so a restarted server re-applies right after it.
+// The returned stop cancels the loop and waits for it; runServer defers it
 // so LIFO drains it before the control plane stops. It is never nil.
 func startEmbeddedAddons(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
 	nodes := cs.CoreV1().Nodes()
@@ -135,20 +138,19 @@ func startEmbeddedAddons(ctx context.Context, plan serverPlan, restCfg *rest.Con
 	if err := ar.Converge(ctx); err != nil {
 		logger.Error("converge embedded add-on manifests", "err", err)
 	}
-	if !posture.ClusterCAKubeletServing {
-		return noStop
-	}
 	rgCtx, rgCancel := context.WithCancel(ctx)
 	ticker := time.NewTicker(addons.RegateInterval)
+	ticks, ticksDone := regateTicks(rgCtx, ticker.C, plan.kubeletServing.kicked())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		defer ticker.Stop()
-		ar.Regate(rgCtx, func(c context.Context) addons.Posture { return addonPosture(c, plan, nodes) }, ticker.C)
+		ar.Regate(rgCtx, func(c context.Context) addons.Posture { return addonPosture(c, plan, nodes) }, ticks)
 	}()
 	return func() {
 		rgCancel()
 		<-done
+		<-ticksDone
 	}
 }
 
@@ -909,26 +911,108 @@ func repairServerNodeLabels(ctx context.Context, cs kubernetes.Interface, nodeNa
 	return nil
 }
 
+// kubeletServingFact records that the server's in-process node holds a kubelet
+// serving pair minted from the cluster CA. It is pending from the plan's creation
+// until serverNodeOptions runs setServerKubeletServing, which happens after the
+// embedded add-ons first converge (the SANs need the node's addressing, step 4c).
+// There is no "absent" state: a server either mints the pair or fails its boot.
+// A nil fact is a plan with no node to mint for, which reads as decided and false.
+// Safe for concurrent use: the Regate goroutine reads what the bring-up records.
+type kubeletServingFact struct {
+	minted atomic.Bool
+	// kick carries one signal when minted first flips, so the gated add-ons are
+	// re-decided at once instead of on the next RegateInterval tick. Buffered, so
+	// the mint never blocks on the loop.
+	kick chan struct{}
+}
+
+// newKubeletServingFact returns a pending fact.
+func newKubeletServingFact() *kubeletServingFact {
+	return &kubeletServingFact{kick: make(chan struct{}, 1)}
+}
+
+// markMinted records the mint and, the first time, signals kick. A nil fact
+// ignores it.
+func (f *kubeletServingFact) markMinted() {
+	if f == nil {
+		return
+	}
+	if f.minted.CompareAndSwap(false, true) {
+		select {
+		case f.kick <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// read reports whether the pair was minted, and whether that is known yet: a
+// pending fact is undecided, a nil one is decided and false.
+func (f *kubeletServingFact) read() (minted, decided bool) {
+	if f == nil {
+		return false, true
+	}
+	m := f.minted.Load()
+	return m, m
+}
+
+// kicked is the channel markMinted signals; nil (never ready) for a nil fact.
+func (f *kubeletServingFact) kicked() <-chan struct{} {
+	if f == nil {
+		return nil
+	}
+	return f.kick
+}
+
+// regateTicks merges the RegateInterval ticker with kick into the one tick
+// channel Regate reads, so a kick runs one re-evaluation pass at once. It runs
+// until ctx ends, then closes the returned channel; done is closed after that.
+func regateTicks(ctx context.Context, tick <-chan time.Time, kick <-chan struct{}) (ticks <-chan time.Time, done <-chan struct{}) {
+	out := make(chan time.Time)
+	fin := make(chan struct{})
+	go func() {
+		defer close(fin)
+		defer close(out)
+		for {
+			var t time.Time
+			select {
+			case <-ctx.Done():
+				return
+			case t = <-tick:
+			case <-kick:
+				t = time.Now()
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case out <- t:
+			}
+		}
+	}()
+	return out, fin
+}
+
 // addonPosture is the facts the gated embedded add-ons are checked against.
 //
-// ClusterCAKubeletServing is INFERRED, not observed: it is read off the mesh IP and
-// the cluster-CA serving pair, not off any kubelet's certificate. Every topology
-// sets plan.cfg.ServingCertFile/ServingKeyFile (provisionServingLeaf), so
-// kube-root-ca.crt is the cluster CA everywhere; the pair alone therefore says
-// nothing about the kubelet. plan.opts.meshIP is what setServerKubeletServing
-// keys on to issue this node's kubelet serving cert from that same CA, and a
-// worker exists only on a mesh cluster, where its join response carries a
-// cluster-CA-issued serving cert. On a single-node server the mesh IP is empty:
-// the kubelet serving cert stays self-signed, so the posture is false even with
-// the pair set. TestAddonPosture pins the inference.
+// ClusterCAKubeletServing is read off what this server minted, not off any
+// kubelet's certificate. It ANDs two different leaves: the in-process node's
+// kubelet serving pair minted from the cluster CA (plan.kubeletServing, recorded
+// by serverNodeOptions), which is what metrics-server verifies, AND the
+// apiserver's cluster-CA serving leaf (plan.cfg.ServingCertFile/ServingKeyFile),
+// which is what makes kube-root-ca.crt the cluster CA it verifies against. Every server mints the kubelet
+// pair or fails its boot, single-node included, and a worker exists only on a
+// mesh cluster, where its join response carries a cluster-CA-issued serving cert.
+// TestAddonPosture pins the inference.
 //
-// The Node read is the undecided guard: a failed read, or a cluster with no Node
-// at all (a stale LIST, or a fresh cluster before any node registers), is
-// Posture.Undecided, which neither applies nor withdraws, because only positive
-// evidence may withdraw a working add-on. One Node is enough to decide.
+// Until the pair is minted the posture is Undecided, so the start-up Converge
+// neither applies nor withdraws a gated add-on; the mint then kicks one Regate
+// pass at once (regateTicks), so a restart re-applies within moments. The Node read is the other undecided guard: a failed read, or a cluster
+// with no Node at all (a stale LIST, or a fresh cluster before any node
+// registers), is Posture.Undecided too, because only positive evidence may
+// withdraw a working add-on. One Node is enough to decide.
 func addonPosture(ctx context.Context, plan serverPlan, nodes nodeLister) addons.Posture {
+	minted, decided := plan.kubeletServing.read()
 	p := addons.Posture{
-		ClusterCAKubeletServing: plan.opts.meshIP != "" && plan.cfg.ServingCertFile != "" && plan.cfg.ServingKeyFile != "",
+		ClusterCAKubeletServing: minted && plan.cfg.ServingCertFile != "" && plan.cfg.ServingKeyFile != "",
 	}
 	registered, err := nodes.List(ctx, metav1.ListOptions{Limit: 1})
 	switch {
@@ -936,6 +1020,9 @@ func addonPosture(ctx context.Context, plan serverPlan, nodes nodeLister) addons
 		p.Undecided = fmt.Sprintf("list nodes: %v", err)
 	case len(registered.Items) == 0:
 		p.Undecided = "no Node is registered yet"
+	}
+	if !decided {
+		p.Undecided = "the control-plane node's kubelet serving cert is not minted yet"
 	}
 	return p
 }

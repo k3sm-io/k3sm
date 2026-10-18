@@ -32,9 +32,9 @@
 # kubelet endpoint admits a bearer token on /metrics/resource only after a
 # TokenReview and a nodes/metrics SubjectAccessReview against the apiserver.
 # It verifies each node's serving cert against the pod's in-cluster CA bundle
-# (kube-root-ca.crt). On a multi-node cluster that is the cluster CA, which
-# issues every node's kubelet serving cert with its InternalIP as a SAN, as on
-# k3s. A single-node install's kubelet cert is self-signed and does not verify.
+# (kube-root-ca.crt). That is the cluster CA on every topology, single-node
+# included, and it issues every node's kubelet serving cert with its InternalIP
+# as a SAN, as on k3s.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
