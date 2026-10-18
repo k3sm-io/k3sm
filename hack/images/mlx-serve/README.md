@@ -12,7 +12,7 @@ concern: `HF_HOME` points at `/models`, which the operator mounts.
 
 | | |
 |---|---|
-| engine | `vllm-mlx==0.4.1` (Apache-2.0), pinned in `requirements.in` |
+| engine | `vllm-mlx==0.5.0` (Apache-2.0), pinned in `requirements.in` |
 | interpreter | CPython 3.12.14, python-build-standalone, macos-aarch64 |
 | entrypoint | `/bin/python3.12 -m vllm_mlx.cli serve --continuous-batching --host 0.0.0.0 --port 8000` |
 | args | the model — a repo id or a path under `/models` — supplied by the pod |
@@ -148,14 +148,14 @@ by hand, and the digest is recorded.
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
-  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.4.1
+  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0
 ```
 
 The credential is read from the environment or the docker config chain — never
 from argv — and is not stored. `push` prints the digest and the pin:
 
 ```
-pushed ghcr.io/k3sm-io/mlx-serve:0.4.1
+pushed ghcr.io/k3sm-io/mlx-serve:0.5.0
   digest: sha256:…
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```
@@ -190,13 +190,19 @@ Change `requirements.in`, then regenerate in the same commit — on a Mac,
 ```sh
 uv python install cpython-3.12.14-macos-aarch64-none
 uv pip compile --generate-hashes --no-header \
+    --exclude-newer "$(date -u -v-14d +%Y-%m-%dT00:00:00Z)" \
     --python "${UV_PYTHON_INSTALL_DIR:-$HOME/.local/share/uv/python}/cpython-3.12.14-macos-aarch64-none/bin/python3.12" \
     requirements.in -o requirements.lock
 ```
 
+`--exclude-newer` is the 14-day dependency cooldown: the resolver ignores every
+artifact uploaded after midnight UTC 14 days before the run, so a version
+published inside the cooldown never enters the closure. The current lockfile
+was compiled with `--exclude-newer 2026-10-04T00:00:00Z`.
+
 Keep the comment header at the top of `requirements.lock` (it records the uv
-version and the interpreter the closure was resolved against) and update its
-generated-on line.
+version, the interpreter the closure was resolved against, and the upload
+cutoff) and update its generated-on and cutoff lines.
 
 Do **not** pass `--python-platform macos`: it defaults to macOS 13.0, for which
 no `mlx` wheel exists — mlx ships `macosx_14_0_arm64` and newer — so the

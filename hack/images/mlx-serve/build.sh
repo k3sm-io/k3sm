@@ -64,7 +64,7 @@ SHARD_MODULE="k3sm_shard"
 
 # The tag this script builds and pushes. A build output has no digest until it is built,
 # so it stays a tag here; consumers pin the digest the registry reports for it.
-DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.4.1"
+DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0"
 
 # ---- options ----------------------------------------------------------------
 WORK="${K3SM_MLX_WORK:-$HOME/.cache/k3sm/mlx-serve}"

@@ -26,9 +26,11 @@ import (
 // The serving engine, its MEASURED command-line surface, and the two facts about
 // it that this file encodes.
 //
-// The engine is vllm-mlx 0.4.1 (the version hack/images/mlx-serve/build.sh
-// installs). Its `serve` surface was measured on the rig and reproduced
-// host-side; this is the whole of it:
+// The engine is vllm-mlx 0.5.0 (the version hack/images/mlx-serve/build.sh
+// installs). Its `serve` surface was measured on the rig against 0.4.1,
+// reproduced host-side, and re-read from 0.5.0's `serve --help`, which keeps
+// every option below and adds none that any of them prefixes; this is the
+// part the render uses:
 //
 //	model                   POSITIONAL — a repository reference or a local path.
 //	                        There is NO --model option.
