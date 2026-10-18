@@ -198,6 +198,11 @@ type Config struct {
 	// cancels the server's root context and returns, which lets the ordinary
 	// shutdown path run every deferred teardown exactly once, in order.
 	OnComponentExit func(name string, err error, logPath, logTail string)
+	// WorkDirHold is the work-dir lock the server already took for its orphan
+	// reap (ReapOrphanedControlPlane). Start adopts it instead of locking again,
+	// so the lock is held without a gap from the reap until Stop has reaped every
+	// child. Nil means Start takes the lock itself.
+	WorkDirHold *WorkDirHold
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }

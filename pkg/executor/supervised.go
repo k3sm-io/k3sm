@@ -93,9 +93,12 @@ const drainGrace = 5 * time.Second
 // context, so a daemon that calls Stop under this bound gets it back at the
 // deadline with ErrStopBudgetExceeded naming whatever it could not witness reaped
 // (B321). What the deadline does not promise is that the child is gone — it has
-// been SIGKILLed, and a process refusing to die is left for launchd's own kill and
-// the next start's reap — which is why the ExitTimeOut derived from this still
-// carries headroom rather than being the sum to the second.
+// been SIGKILLed, and a process refusing to die outlives the daemon in its own
+// process group, where launchd's kill of the job does not reach it. In the kine
+// posture the next server start stops such a leftover before it starts its own
+// (ReapOrphanedControlPlane); an etcd member is not reaped that way. That is why
+// the ExitTimeOut derived from this still carries headroom rather than being the
+// sum to the second.
 const StopBound = 30 * time.Second
 
 // exitLogTailLines is how many trailing log lines an early-exit error carries —
@@ -279,8 +282,8 @@ type Supervised struct {
 	// stopping, when set, runs in Stop just before each component is signalled. A
 	// test seam that observes the teardown order; nil in production.
 	stopping func(c *component)
-	// unlockWorkDir releases the work-dir lock the etcd posture holds from Start
-	// until Stop has reaped every child (see lockWorkDir). Guarded by mu.
+	// unlockWorkDir releases the work-dir lock held from Start until Stop has
+	// reaped every child (see lockWorkDir). Guarded by mu.
 	unlockWorkDir func() error
 }
 
@@ -388,19 +391,29 @@ func (s *Supervised) Start(ctx context.Context) error {
 	tok := s.token
 	s.mu.Unlock()
 
-	// The etcd posture holds the work-dir lock for as long as its member may run, so a
-	// `--cluster-reset` (which takes the same lock) can never start a second member
-	// over the data dir this one serves.
-	if s.cfg.Etcd != nil {
-		unlock, err := lockWorkDir(s.cfg.WorkDir)
-		if err != nil {
+	// Both postures hold the work-dir lock for as long as their children may run.
+	// In the etcd posture it keeps a `--cluster-reset` (which takes the same lock)
+	// from starting a second member over the data dir this one serves; in the kine
+	// posture it is what lets the next start's orphan reap tell a previous run's
+	// leftovers from a live server's children (ReapOrphanedControlPlane). A lock the
+	// server already took for that reap is adopted, not taken twice.
+	// In the kine posture a lock that cannot be taken is the work-dir provision
+	// step failing (the lock file lives in the work dir), so it is reported as
+	// one; the etcd posture's error is returned as before.
+	unlock, ok := s.cfg.WorkDirHold.adopt()
+	if !ok {
+		var err error
+		if unlock, err = lockWorkDir(s.cfg.WorkDir); err != nil {
 			s.releaseStartClaim()
+			if s.cfg.Etcd == nil {
+				err = provisionStep("workdirs", err)
+			}
 			return err
 		}
-		s.mu.Lock()
-		s.unlockWorkDir = unlock
-		s.mu.Unlock()
 	}
+	s.mu.Lock()
+	s.unlockWorkDir = unlock
+	s.mu.Unlock()
 
 	if tok == "" {
 		minted, err := generateToken()
@@ -1339,8 +1352,9 @@ func (s *Supervised) Ready(ctx context.Context) bool {
 // control-plane child had been witnessed reaped. It is a REPORT, not a failure to
 // act: every component has been signalled and escalated to SIGKILL by then, and
 // the error names the ones whose exit Stop could not observe inside the budget, so
-// the daemon's shutdown log says which child may be left for launchd's own SIGKILL
-// and the next start's reap.
+// the daemon's shutdown log says which child may outlive it. Such a child is in
+// its own process group, out of reach of launchd's kill of the job; in the kine
+// posture the next server start stops it (ReapOrphanedControlPlane).
 var ErrStopBudgetExceeded = errors.New("control-plane teardown exceeded its budget")
 
 // Stop tears the control plane down in reverse dependency order: the components
@@ -1561,7 +1575,7 @@ func (s *Supervised) stopComponent(ctx context.Context, c *component) bool {
 	}
 	switch {
 	case !witnessed:
-		s.cfg.Logger.Warn("control-plane component was SIGKILLed but its exit was not observed before the teardown budget expired; it is left for launchd and the next start",
+		s.cfg.Logger.Warn("control-plane component was SIGKILLed but its exit was not observed before the teardown budget expired; if it outlives this daemon, the next server start stops it (kine posture)",
 			"component", c.name, "pid", pid)
 	case alreadyExited:
 		s.cfg.Logger.Debug("control-plane component had already exited before teardown", "component", c.name)

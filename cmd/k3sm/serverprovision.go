@@ -392,6 +392,7 @@ func logLegacyCertDir(workDir string, logger *slog.Logger) {
 // posture and the HA member route touch it.
 func serverExecutorConfig(opts serverOptions, encryptionConfig string, logger *slog.Logger) executor.Config {
 	cfg := opts.executorConfig(logger)
+	cfg.WorkDirHold = opts.workDirHold
 	// Packaged install: `k3sm install` stages the control-plane payload at
 	// <install-dir>/bin beside the daemon binary; boot seeds the workdir from it
 	// so it never shells out to gh/go (absent under launchd as _k3sm). Dev shells

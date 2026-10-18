@@ -54,8 +54,10 @@ const holderProbeTimeout = 2 * time.Second
 //
 // Nothing of ours can legitimately hold the port here — this runs immediately
 // before we spawn our own kine, so any listener is by definition foreign (a
-// second `k3sm server`, a second dev instance, an orphaned kine, or an unrelated
-// etcd). The probe is a real bind of 127.0.0.1:<port>, which also catches a
+// second `k3sm server`, a second dev instance, an orphaned kine of another work
+// dir, or an unrelated etcd). A killed previous run's kine of this same work dir
+// is not here to be refused: the server start stopped it first
+// (ReapOrphanedControlPlane). The probe is a real bind of 127.0.0.1:<port>, which also catches a
 // holder bound on the wildcard, and it fails closed: any bind error at all is a
 // refusal, because a port we cannot take is a port our kine cannot take either.
 //
