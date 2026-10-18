@@ -22,7 +22,10 @@
 #     would have failed;
 #   * the k3sm-shard entrypoint renders the ring hostfile and the jaccl device
 #     matrix into the pod data volume from fake name resolution, retries and
-#     bounds resolution, and its liveness probe answers 0 and 1 correctly.
+#     bounds resolution, and its liveness probe answers 0 and 1 correctly;
+#   * the k3sm-serve context guard refuses a request longer than the engine's
+#     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
+#     when a staged tree is present, against the real vllm-mlx server.
 #
 # Usage: hack/images/mlx-serve/selftest.sh
 # Exit: 0 all checks pass, 1 otherwise.
@@ -520,6 +523,273 @@ else
 	head -20 "$WORK/shard-driver.err"
 fi
 
+# ---- 8 — the k3sm-serve context guard (single-node) --------------------------
+# vllm-mlx 0.5.0 has no max-model-len and validates no prompt length; its only
+# bound is --max-kv-size, a ROTATING cache, so an over-length request is served
+# HTTP 200 on a context that lost its start. k3sm_serve refuses it with vLLM's
+# HTTP 400 instead. Here against fakes of the server module and the engine:
+# the rule, the four seams, the refusal body, and the fail-closed install.
+SERVE="$HERE/k3sm_serve.py"
+if [ -f "$SERVE" ] && PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$SERVE" 2>/dev/null; then
+	ladder ok "8.parse  k3sm_serve.py parses"
+else
+	ladder no "8.parse  k3sm_serve.py parses"
+fi
+if printf '%s' "$ep" | grep -qF '"k3sm_serve", "serve"' && grep -q '^SERVE_MODULE="k3sm_serve"$' "$BUILD" &&
+	grep -qE '^	for module in .*SHARD_MODULE.*SERVE_MODULE' "$BUILD"; then
+	ladder ok "8.entrypoint  the ENTRYPOINT runs vllm-mlx's serve through k3sm_serve, and build.sh installs it"
+else
+	ladder no "8.entrypoint  the ENTRYPOINT runs vllm-mlx's serve through k3sm_serve, and build.sh installs it"
+fi
+
+cat > "$WORK/serve-driver.py" <<'PY'
+import asyncio, sys, types
+sys.path.insert(0, sys.argv[1])
+import k3sm_serve as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+def refused(fn):
+    try:
+        fn()
+    except ks.ContextLengthExceeded as e:
+        return e.message
+    return None
+
+R, D = ks.RequestedMaxTokens, ks.DefaultMaxTokens
+check("rule.fit  a prompt and max_tokens inside the window run unchanged", ks.admit(900, R(64), 1024) == 64)
+check("rule.edge  prompt + max_tokens == window still fits", ks.admit(960, R(64), 1024) == 64)
+m = refused(lambda: ks.admit(1677, R(64), 1024))
+check("rule.prompt  a prompt longer than the window is refused with vLLM's message",
+      m is not None and m.startswith("This model's maximum context length is 1024 tokens.") and "1677 input tokens" in m)
+check("rule.full  a prompt that fills the window is refused (no room to generate)",
+      refused(lambda: ks.admit(1024, D(32768), 1024)) is not None)
+m = refused(lambda: ks.admit(980, R(64), 1024))
+check("rule.maxtokens  a client max_tokens that overruns the window is refused",
+      m is not None and "'max_tokens' or 'max_completion_tokens' is too large: 64" in m and "(64 > 1024 - 980)" in m)
+check("rule.default  an omitted max_tokens is clamped to the rest of the window", ks.admit(1000, D(32768), 1024) == 24)
+check("rule.nowindow  no --max-kv-size, nothing guarded", ks.admit(10**6, R(64), 0) == 64)
+check("window.batched  the batched engine's window is its scheduler's max_kv_size",
+      ks.window_of(types.SimpleNamespace(_scheduler_config=types.SimpleNamespace(max_kv_size=1024))) == 1024)
+check("window.unset  an engine with no max_kv_size has no window", ks.window_of(types.SimpleNamespace()) == 0)
+
+class Tok:
+    def encode(self, text):
+        return text.split()
+check("count.encode  tokens are counted with the tokenizer's encode", ks.count_tokens(Tok(), "a b c") == 3)
+check("count.processor  a processor's inner tokenizer is used when it has no encode",
+      ks.count_tokens(types.SimpleNamespace(tokenizer=Tok()), "a b") == 2)
+body = ks.error_body("m")
+check("body.shape  the refusal is vLLM's OpenAI error object",
+      body == {"error": {"message": "m", "type": "BadRequestError", "param": None, "code": 400}})
+
+class HTTPError(Exception):
+    def __init__(self, status_code, detail):
+        super().__init__(detail)
+        self.status_code, self.detail = status_code, detail
+
+class App:
+    handlers = {}
+    def add_exception_handler(self, cls, fn):
+        App.handlers[cls] = fn
+
+class Engine:
+    def __init__(self, window):
+        self._scheduler_config = types.SimpleNamespace(max_kv_size=window)
+        self.tokenizer = Tok()
+        self.ran = []
+    def _apply_chat_template(self, messages, tools, num_images=0, num_audios=0, chat_template_kwargs=None,
+                             enable_thinking=None):
+        return " ".join("<%s> %s" % (m["role"], m["content"]) for m in messages) + " <assistant>"
+    async def generate(self, prompt, max_tokens=256, **kw):
+        self.ran.append(max_tokens)
+        return "generated"
+
+server = types.ModuleType("fake_server")
+server.app = App()
+server._resolve_request_max_tokens = lambda v: 32768 if v is None else v
+server._prepare_chat_completion_invocation = lambda engine, request, mt: types.SimpleNamespace(
+    messages=request["messages"], chat_kwargs={"max_tokens": mt})
+server.stream_completion = lambda engine, prompt, request, mt, **kw: ("stream", mt)
+mmc = lambda messages: (None, [], [], [])
+Refusal = ks.install(server, Engine, HTTPError, lambda status_code, content: (status_code, content), mmc, lambda t: t)
+
+def refusal(fn):
+    try:
+        fn()
+    except Refusal as e:
+        return e
+    return None
+
+eng = Engine(64)
+long, short = " ".join(["w"] * 70), " ".join(["w"] * 10)
+msgs = lambda t: {"messages": [{"role": "user", "content": t}]}
+res = server._resolve_request_max_tokens
+check("seam.mark  the max_tokens seam marks the client's value and the default apart",
+      type(res(8)) is ks.RequestedMaxTokens and type(res(None)) is ks.DefaultMaxTokens and res(None) == 32768)
+e = refusal(lambda: server._prepare_chat_completion_invocation(eng, msgs(long), res(8)))
+check("chat.over  an over-length chat request is refused with HTTP 400 (stream or not: before either path)",
+      e is not None and e.status_code == 400 and "64 tokens" in e.detail and "72 input tokens" in e.detail)
+p = server._prepare_chat_completion_invocation(eng, msgs(short), res(8))
+check("chat.fit  an in-window chat request passes with its max_tokens", p.chat_kwargs["max_tokens"] == 8)
+p = server._prepare_chat_completion_invocation(eng, msgs(short), res(None))
+check("chat.default  an omitted max_tokens runs as the rest of the window (64 - 12)", p.chat_kwargs["max_tokens"] == 52)
+check("chat.templated  the chat count is of the engine's templated prompt, not the raw text",
+      refusal(lambda: server._prepare_chat_completion_invocation(eng, msgs(" ".join(["w"] * 60)), res(3))) is not None)
+check("stream.over  an over-length streaming completion is refused before the stream starts",
+      refusal(lambda: server.stream_completion(eng, long, {}, res(8))) is not None)
+check("stream.fit  an in-window streaming completion streams", server.stream_completion(eng, short, {}, res(8)) == ("stream", 8))
+run = lambda mt, prompt: asyncio.run(Engine.generate(eng, prompt=prompt, max_tokens=mt))
+check("generate.over  an over-length completion is refused at the engine call",
+      refusal(lambda: run(res(8), long)) is not None)
+eng.ran.clear()
+check("generate.fit  an in-window completion runs", run(res(8), short) == "generated" and eng.ran == [8])
+eng.ran.clear()
+run(res(None), short)
+check("generate.default  an omitted max_tokens is clamped at the engine call (64 - 10)", eng.ran == [54])
+eng.ran.clear()
+run(100, long)
+check("generate.checked  a value another seam already admitted is not checked twice", eng.ran == [100])
+handler = App.handlers.get(Refusal)
+status, content = asyncio.run(handler(None, Refusal("too long"))) if handler else (None, None)
+check("handler.registered  the refusal answers 400 with the error object", status == 400 and content == ks.error_body("too long"))
+
+broken = types.ModuleType("moved_server")
+broken.app = App()
+try:
+    ks.install(broken, Engine, HTTPError, None, mmc, lambda t: t)
+    check("install.failclosed  a moved seam ends the process instead of serving unguarded", False)
+except ks.GuardError:
+    check("install.failclosed  a moved seam ends the process instead of serving unguarded", True)
+check("main.batching  serve without --continuous-batching is refused (the guard needs the batched engine)",
+      ks.main(["serve", "/models/m"]) == 2)
+PY
+SERVE_CHECKS=0
+serve_out="$(PYTHONDONTWRITEBYTECODE=1 python3 "$WORK/serve-driver.py" "$HERE" 2>"$WORK/serve-driver.err")"
+while read -r verdict name; do
+	[ -n "$verdict" ] || continue
+	SERVE_CHECKS=$((SERVE_CHECKS + 1))
+	case "$verdict" in
+		ok) ladder ok "8.$name" ;;
+		no) ladder no "8.$name" ;;
+		*)  ladder no "8.driver  $verdict $name" ;;
+	esac
+done <<< "$serve_out"
+if [ "$SERVE_CHECKS" -ge 26 ]; then
+	ladder ok "8.count  all $SERVE_CHECKS guard checks reported"
+else
+	ladder no "8.count  only $SERVE_CHECKS of 26 guard checks reported (the driver crashed?)"
+	head -20 "$WORK/serve-driver.err"
+fi
+
+# ---- 9 — the guard on the REAL engine (needs a staged tree) -----------------
+# The seams above are vllm-mlx 0.5.0's own functions; this rung installs the
+# guard on the real server module and drives its real HTTP app (a fake engine
+# under it: no model, no GPU), so an engine bump that moves a seam is caught
+# here before an image is built. It needs the tree build.sh stages.
+STAGED="${K3SM_MLX_STAGE:-${K3SM_MLX_WORK:-$HOME/.cache/k3sm/mlx-serve}/stage}"
+if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/vllm_mlx" ]; then
+	cat > "$WORK/serve-real.py" <<'PY'
+import sys, types
+sys.path.insert(0, sys.argv[1])
+import logging
+logging.disable(logging.WARNING)
+import k3sm_serve as ks
+from fastapi.testclient import TestClient
+from vllm_mlx import server
+from vllm_mlx.engine.batched import BatchedEngine
+
+ks.install_on_engine()
+
+class Tok:
+    def encode(self, text):
+        return text.split()
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kw):
+        return " ".join("<%s> %s" % (m["role"], m["content"]) for m in messages) + " <assistant>"
+
+class Out:
+    def __init__(self, prompt):
+        self.output_text = self.new_text = "ok"
+        self.output_token_ids = [1]
+        self.prompt_tokens, self.completion_tokens = len(prompt.split()), 1
+        self.finish_reason, self.finished = "stop", True
+
+RAN = []
+class Core:
+    async def generate(self, prompt, sampling_params):
+        RAN.append(sampling_params.max_tokens)
+        return Out(prompt)
+    async def add_request(self, prompt, sampling_params, prefix_boundary=0):
+        RAN.append(sampling_params.max_tokens)
+        self.prompt = prompt
+        return "r"
+    async def stream_outputs(self, request_id):
+        yield Out(self.prompt)
+
+class Engine(BatchedEngine):
+    def __init__(self, window):
+        self._scheduler_config = types.SimpleNamespace(max_kv_size=window)
+        self._tokenizer, self._is_mllm, self._processor = Tok(), False, None
+        self._model_name, self._loaded, self._engine, self._mllm_scheduler = "fake", True, Core(), None
+
+engine = Engine(64)
+async def acquire(raw_request, **kw):
+    return engine
+async def release(raw_request):
+    return None
+server._acquire_default_engine_for_request = acquire
+server._release_engine_for_request = release
+server._validate_model_name = lambda model: None
+client = TestClient(server.app)
+long, short = " ".join(["w"] * 70), " ".join(["w"] * 10)
+
+def post(path, **body):
+    body.setdefault("model", "fake")
+    return client.post(path, json=body)
+
+def check(name, r, want, text=None):
+    ok = r.status_code == want and (text is None or text in r.text)
+    print(("ok " if ok else "no ") + "%s (HTTP %d)" % (name, r.status_code), flush=True)
+
+chat = lambda t: [{"role": "user", "content": t}]
+for stream in (False, True):
+    tag = "stream" if stream else "plain"
+    check("real.chat.over.%s  /v1/chat/completions over the window answers 400" % tag,
+          post("/v1/chat/completions", messages=chat(long), max_tokens=8, stream=stream), 400,
+          "This model's maximum context length is 64 tokens")
+    check("real.chat.fit.%s  /v1/chat/completions inside the window answers 200" % tag,
+          post("/v1/chat/completions", messages=chat(short), max_tokens=8, stream=stream), 200)
+    check("real.cmpl.over.%s  /v1/completions over the window answers 400" % tag,
+          post("/v1/completions", prompt=long, max_tokens=8, stream=stream), 400, '"type":"BadRequestError"')
+    check("real.cmpl.fit.%s  /v1/completions inside the window answers 200" % tag,
+          post("/v1/completions", prompt=short, max_tokens=8, stream=stream), 200)
+RAN.clear()
+post("/v1/chat/completions", messages=chat(short))
+post("/v1/completions", prompt=short)
+print(("ok " if RAN == [52, 54] else "no ") + "real.default  an omitted max_tokens runs as the rest of the window %r" % RAN)
+PY
+	REAL_CHECKS=0
+	real_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/serve-real.py" "$HERE" 2>"$WORK/serve-real.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		REAL_CHECKS=$((REAL_CHECKS + 1))
+		case "$verdict" in
+			ok) ladder ok "9.$name" ;;
+			no) ladder no "9.$name" ;;
+			*)  ladder no "9.driver  $verdict $name" ;;
+		esac
+	done <<< "$real_out"
+	if [ "$REAL_CHECKS" -ge 9 ]; then
+		ladder ok "9.count  all $REAL_CHECKS real-engine checks reported"
+	else
+		ladder no "9.count  only $REAL_CHECKS of 9 real-engine checks reported (the driver crashed?)"
+		tail -20 "$WORK/serve-real.err"
+	fi
+else
+	ladder skip "9.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+fi
+
 # ---- summary ----------------------------------------------------------------
 echo "----------------------------------------"
 echo "mlx-serve selftest: $PASS passed, $FAIL failed, $SKIP skipped"
@@ -537,6 +807,7 @@ Not covered here — this needs a Mac with uv, a k3sm binary and the network:
     codesign rejects for a different reason);
   * `k3sm image push` to a registry;
   * k3sm-shard under the real sandbox profile with live per-pod DNS records and
-    a real mlx_lm.server on two Macs (the M17 lab ladder's sharded-ring rung).
+    a real mlx_lm.server on two Macs (the M17 lab ladder's sharded-ring rung);
+  * the context guard on a real model and tokenizer (a live recall probe).
 EOF
 [ "$FAIL" -eq 0 ] || exit 1
