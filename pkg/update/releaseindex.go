@@ -21,7 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -87,12 +87,20 @@ type ReleaseIndexApp struct {
 type ReleaseIndexImage struct {
 	// Name is k3sm_<version>_darwin_arm64.dmg.
 	Name string `json:"name"`
-	// URL is the https download URL on an AllowedHosts host, ending in Name.
+	// URL is ReleaseDownloadURL(Tag, Name), exactly.
 	URL string `json:"url"`
 	// SHA256 is the image's lowercase hex sha256.
 	SHA256 string `json:"sha256"`
 	// Size is the image's size in bytes, 1 to MaxReleaseImageBytes.
 	Size int64 `json:"size"`
+}
+
+// ReleaseDownloadURL is the one URL an index may name for a release asset: the
+// k3sm-io/k3sm release download of name under tag, on github.com with no port.
+// The other AllowedHosts are hosts a fetch may be redirected to, never the URL
+// an index names.
+func ReleaseDownloadURL(tag, name string) string {
+	return "https://github.com/k3sm-io/k3sm/releases/download/" + tag + "/" + name
 }
 
 // ReleaseIndexK3sm names the k3sm build of the set.
@@ -115,12 +123,18 @@ var (
 
 // ParseReleaseIndex decodes one release index and checks every field against
 // its grammar. It refuses a document over MaxReleaseIndexBytes before parsing
-// it, an unknown field, a second JSON value, a schema or context other than
-// the v1 constants, a tag that is not a final release, an image URL off the
-// AllowedHosts pin set, and an image over MaxReleaseImageBytes.
+// it; a key that is not a schema key in exact case, or that appears twice in
+// one object; anything after the one JSON object; a schema or context other
+// than the v1 constants; a tag that is not a final release; and an image URL
+// other than the release download URL of that tag and image name.
 func ParseReleaseIndex(raw []byte) (ReleaseIndex, error) {
 	if len(raw) > MaxReleaseIndexBytes {
 		return ReleaseIndex{}, fmt.Errorf("%w: %d bytes, over the %d byte cap", ErrReleaseIndex, len(raw), MaxReleaseIndexBytes)
+	}
+	// encoding/json keeps the last of two equal keys and matches keys without
+	// regard to case, so the keys are checked on the token stream first.
+	if err := checkReleaseIndexKeys(raw); err != nil {
+		return ReleaseIndex{}, fmt.Errorf("%w: %w", ErrReleaseIndex, err)
 	}
 	var ix ReleaseIndex
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -128,13 +142,78 @@ func ParseReleaseIndex(raw []byte) (ReleaseIndex, error) {
 	if err := dec.Decode(&ix); err != nil {
 		return ReleaseIndex{}, fmt.Errorf("%w: not a valid document: %w", ErrReleaseIndex, err)
 	}
-	if _, err := dec.Token(); err == nil {
-		return ReleaseIndex{}, fmt.Errorf("%w: more than one JSON value", ErrReleaseIndex)
+	if err := dec.Decode(&json.RawMessage{}); !errors.Is(err, io.EOF) {
+		return ReleaseIndex{}, fmt.Errorf("%w: trailing data after the document", ErrReleaseIndex)
 	}
 	if err := ix.check(); err != nil {
 		return ReleaseIndex{}, fmt.Errorf("%w: %w", ErrReleaseIndex, err)
 	}
 	return ix, nil
+}
+
+// releaseIndexKeys is the v1 key tree: each object's keys, mapped to the keys
+// of the object that key holds (nil for a scalar).
+type releaseIndexKeys map[string]releaseIndexKeys
+
+var releaseIndexSchemaKeys = releaseIndexKeys{
+	"schema": nil, "context": nil, "issuedAt": nil, "tag": nil, "minimumMacOS": nil,
+	"app": {
+		"bundleID": nil, "shortVersion": nil,
+		"image": {"name": nil, "url": nil, "sha256": nil, "size": nil},
+	},
+	"k3sm": {"archive": nil, "archiveSHA256": nil, "payloadManifestSHA256": nil},
+}
+
+// checkReleaseIndexKeys walks the token stream of one top-level object and
+// refuses a key that is not in releaseIndexSchemaKeys at its place, in exact
+// case, a key repeated within one object, and any array. The walk is at most
+// three objects deep, because no other key admits an object.
+func checkReleaseIndexKeys(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("not a valid document: %w", err)
+	}
+	if tok != json.Delim('{') {
+		return errors.New("the document is not a JSON object")
+	}
+	return walkReleaseIndexObject(dec, releaseIndexSchemaKeys)
+}
+
+// walkReleaseIndexObject consumes an object's members and its closing brace,
+// its opening brace already read.
+func walkReleaseIndexObject(dec *json.Decoder, keys releaseIndexKeys) error {
+	seen := make(map[string]bool, len(keys))
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("not a valid document: %w", err)
+		}
+		key, _ := tok.(string)
+		sub, known := keys[key]
+		switch {
+		case !known:
+			return fmt.Errorf("unknown key %q", key)
+		case seen[key]:
+			return fmt.Errorf("duplicate key %q", key)
+		}
+		seen[key] = true
+		if tok, err = dec.Token(); err != nil {
+			return fmt.Errorf("not a valid document: %w", err)
+		}
+		switch tok {
+		case json.Delim('{'):
+			if err := walkReleaseIndexObject(dec, sub); err != nil {
+				return err
+			}
+		case json.Delim('['):
+			return fmt.Errorf("key %q holds an array", key)
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return fmt.Errorf("not a valid document: %w", err)
+	}
+	return nil
 }
 
 // check applies the field grammar; ParseReleaseIndex wraps its error.
@@ -154,7 +233,7 @@ func (ix ReleaseIndex) check() error {
 		return errors.New("issuedAt is not a UTC time YYYY-MM-DDTHH:MM:SSZ")
 	}
 	core := strings.TrimPrefix(ix.Tag, "v")
-	if err := ix.App.check(core); err != nil {
+	if err := ix.App.check(ix.Tag, core); err != nil {
 		return fmt.Errorf("app: %w", err)
 	}
 	if err := ix.K3sm.check(core); err != nil {
@@ -163,7 +242,7 @@ func (ix ReleaseIndex) check() error {
 	return nil
 }
 
-func (a ReleaseIndexApp) check(core string) error {
+func (a ReleaseIndexApp) check(tag, core string) error {
 	switch {
 	case a.BundleID != ReleaseAppBundleID:
 		return fmt.Errorf("bundleID is not %s", ReleaseAppBundleID)
@@ -179,15 +258,8 @@ func (a ReleaseIndexApp) check(core string) error {
 	case im.Size < 1 || im.Size > MaxReleaseImageBytes:
 		return fmt.Errorf("image size %d is outside 1 to %d bytes", im.Size, MaxReleaseImageBytes)
 	}
-	u, err := url.Parse(im.URL)
-	if err != nil {
-		return errors.New("image url does not parse")
-	}
-	if err := checkURL(u); err != nil {
-		return fmt.Errorf("image url: %w", err)
-	}
-	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || !strings.HasSuffix(u.EscapedPath(), "/"+im.Name) {
-		return errors.New("image url carries a query or fragment, or does not end in the image name")
+	if want := ReleaseDownloadURL(tag, im.Name); im.URL != want {
+		return fmt.Errorf("image url is not %s", want)
 	}
 	return nil
 }

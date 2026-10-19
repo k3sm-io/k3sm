@@ -38,9 +38,19 @@ the index does not name.
 ## The document
 
 One JSON object, UTF-8, at most 64 KiB, checked before it is parsed. Exactly
-one JSON value; a trailing value is refused. Every field is required and an
-unknown field is refused, so a v1 reader never silently ignores something a
-later writer meant.
+one JSON value: anything after the object, a second value or stray bytes, is
+refused. Every field is required. Keys are checked on the token stream before
+the document is decoded, because common JSON decoders keep the last of two
+equal keys and match keys without regard to case:
+
+- every key is a schema key at its place, in exact case (`TAG` and `bundleId`
+  are refused, not read as `tag` and `bundleID`);
+- no key appears twice in one object, at any level;
+- no value is an array.
+
+So a v1 reader never silently ignores, or picks between, things a writer put
+in the document. A key written with a JSON escape is compared after the escape
+is decoded.
 
 ```json
 {
@@ -77,7 +87,7 @@ later writer meant.
 | `app.bundleID` | exactly `io.k3sm.app` | the staged bundle check |
 | `app.shortVersion` | `tag` without its `v` | the app's update line, and the staged bundle's `CFBundleShortVersionString` check |
 | `app.image.name` | exactly `k3sm_<version>_darwin_arm64.dmg`, `<version>` being `tag` without its `v` | the staged download's file name |
-| `app.image.url` | `https`, no user information, the default port, a host in the pin list, no query or fragment, and a path ending in `/<name>` | the download |
+| `app.image.url` | exactly `https://github.com/k3sm-io/k3sm/releases/download/<tag>/<name>`, byte for byte: no port (not even `:443` or an empty one), no user information, no query or fragment, no other repository, tag or path | the download's first request |
 | `app.image.sha256` | 64 lowercase hex | the downloaded image's digest check |
 | `app.image.size` | 1 to 512 MiB | the download's byte cap and progress |
 | `k3sm.archive` | exactly `k3sm_<version>_darwin_arm64.tar.gz` | the cross-check against the bundle's sealed release record |
@@ -112,7 +122,10 @@ The host carries no trust (the document is signed), only availability.
 
 `AllowedHosts` in `pkg/update/payload.go` is the one list of hosts a release
 asset is fetched from, on the first request and on every redirect, for a
-node's archive download and for the app alike. `pkg/update/testdata/release-index/allowed-hosts.json`
+node's archive download and for the app alike. The URL an index names is
+always on `github.com` (`ReleaseDownloadURL`); the other hosts in the list are
+where GitHub redirects that request, so they are allowed for redirect hops and
+never as the URL an index names. `pkg/update/testdata/release-index/allowed-hosts.json`
 is that list exported as a JSON array; the test fails when the two differ. The
 app's decoder test compares its own pin list against this fixture, so a host
 added or removed here is a visible failure there until the app follows.
@@ -123,9 +136,18 @@ added or removed here is a visible failure there until the app follows.
 it to the same bytes, so a field added, dropped, renamed or reordered in the Go
 type is a failing test until the fixture and this document change with it.
 The app vendors the fixture byte for byte and decodes it with its own decoder.
-The red fixtures (`red-unknown-field.json`, `red-foreign-host.json`,
-`red-rc-tag.json`) each differ from the golden in one respect and must be
-refused; a document over the 64 KiB cap is built by the test rather than
+
+Every `red-*.json` file is one change to the golden document that a decoder
+must refuse: an unknown, case-variant or duplicate key at the top level and
+nested, an array, a document that is not an object, trailing data, every field
+outside its grammar, and every way the image URL can differ from the release
+download URL (another host, a redirect host, another repository, another tag,
+a `../` segment, an explicit port, a query, a fragment). The red files are the
+refusal corpus the app's decoder runs too. They are generated from one table
+in `pkg/update/releaseindex_test.go`; the test fails when a committed file is
+not exactly its change to the golden or when a file is missing or stray, and
+`go test ./pkg/update -run TestReleaseIndexSchemaGolden -update-release-index`
+rewrites them. A document over the 64 KiB cap is built by the test rather than
 committed.
 
 ## Decisions
@@ -133,7 +155,10 @@ committed.
 - One document describes exactly one version set, the latest final release.
 - The decoder runs only on content a signature check has accepted; it never
   verifies a signature itself.
-- Strict decoding: unknown fields, trailing values and anything outside the
-  grammar above are refused, never clipped into shape.
+- Strict decoding: unknown, case-variant and duplicate keys, trailing data
+  and anything outside the grammar above are refused, never clipped into
+  shape.
+- The image URL is not a free field: it is the one release download URL its
+  tag and name determine, so the tag in the path is bound to the index's tag.
 - A change to the format is a new `schema` and `context` string, not an edit to
   v1.
