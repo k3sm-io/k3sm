@@ -49,6 +49,7 @@ type fakeRuntimeServer struct {
 	started      time.Time
 	footprint    map[string]uint64 // pod id -> working-set bytes (M2.3 metrics)
 	lastGrace    int64             // grace_period_seconds of the last DeletePod (M2.3)
+	graces       []int64           // grace_period_seconds of every DeletePod, in order
 	gotSA        string            // ServiceAccount bound on the last CreatePod ctx (M2.4)
 	restartCalls int               // RestartContainer RPC invocations (M2.2 swap)
 	lastRestart  restartRecord     // args of the last RestartContainer RPC
@@ -338,6 +339,7 @@ func (f *fakeRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePo
 	f.deleteCalls++
 	f.deleteIDs = append(f.deleteIDs, req.GetPodId())
 	f.lastGrace = req.GetGracePeriodSeconds()
+	f.graces = append(f.graces, req.GetGracePeriodSeconds())
 	var qerr error
 	if len(f.deleteFIFO) > 0 {
 		qerr, f.deleteFIFO = f.deleteFIFO[0], f.deleteFIFO[1:]
