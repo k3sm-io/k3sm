@@ -2456,6 +2456,9 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 		return *st
 	}
 	r.observeExits(pod, t, rs)
+	// The prober follows container instances on the same convergence, so a
+	// liveness restart's hold lifts only once the replacement is observed.
+	observeProbeInstances(ps, rs)
 	// The pull-failure twin of observeExits: a container runtimed could not start
 	// gets (or keeps) its retry schedule on the same convergence, so every status
 	// path — stream, backstop, direct GetPodStatus — paces the retries identically.

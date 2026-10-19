@@ -484,3 +484,27 @@ func (r *runtimedRuntime) publishStatusUpdate(ctx context.Context, id string) {
 	pod.Status = r.buildStatus(pod, t, resp.GetStatus(), ps)
 	cb(pod)
 }
+
+// observeProbeInstances feeds one runtime status observation to the pod's
+// prober, so liveness follows container instances: it is held while a liveness
+// restart is in flight, skipped while the current instance is not running, and
+// delayed by initialDelaySeconds from a replacement instance's start. It rides
+// buildStatus, the convergence every status path shares, so the prober sees each
+// instance change whichever path delivered it. ps is the prober the status is
+// being built with; a pod without one (or a test's fake probeState) is skipped.
+func observeProbeInstances(ps probeState, rs *runtimev1.PodStatus) {
+	pp, ok := ps.(*podProber)
+	if !ok || pp == nil || rs == nil {
+		return
+	}
+	obs := make([]probeInstance, 0, len(rs.GetContainerStatuses()))
+	for _, cs := range rs.GetContainerStatuses() {
+		o := probeInstance{name: cs.GetName(), id: cs.GetContainerId()}
+		if run := cs.GetState().GetRunning(); run != nil {
+			o.running = true
+			o.startedAt = run.GetStartedAt().AsTime()
+		}
+		obs = append(obs, o)
+	}
+	pp.observeInstances(obs)
+}
