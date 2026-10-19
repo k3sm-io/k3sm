@@ -69,3 +69,19 @@ func sampleMemoryHeadroom() (memoryHeadroom, error) {
 	h.swapVolumeCapacity = int64(fs.Blocks) * bsize
 	return h, nil
 }
+
+// swapVolumeSeparate reports whether the swap volume and the volume holding
+// dataRoot sit in different APFS containers (apfsContainer over each volume's
+// f_mntfromname), so that their free space is not one pool.
+func swapVolumeSeparate(dataRoot string) (bool, error) {
+	var swapFS, dataFS unix.Statfs_t
+	if err := unix.Statfs(swapVolumePath, &swapFS); err != nil {
+		return false, fmt.Errorf("statfs %s: %w", swapVolumePath, err)
+	}
+	if err := unix.Statfs(dataRoot, &dataFS); err != nil {
+		return false, fmt.Errorf("statfs %s: %w", dataRoot, err)
+	}
+	swapFrom := unix.ByteSliceToString(swapFS.Mntfromname[:])
+	dataFrom := unix.ByteSliceToString(dataFS.Mntfromname[:])
+	return apfsContainer(swapFrom) != apfsContainer(dataFrom), nil
+}

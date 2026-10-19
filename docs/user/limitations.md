@@ -756,10 +756,19 @@ always agree.
   first. Pods at `system-cluster-critical` or `system-node-critical` priority are never evicted.
 - **Three signals.** `MemoryPressure` goes True when available memory drops below 100Mi (the
   kubelet's default), when the memory compressor reaches 80% of either of its kernel limits, or
-  when swap is in use, still growing, and the volume that holds swap has under 8 GiB free. The
-  condition's message names the one that fired, for example
-  `kubelet has insufficient memory available: compressor 83% of limit`. macOS starts killing
-  processes itself at 98% of a compressor limit, so k3sm acts first.
+  when swap is in use (1 GiB or more) and still growing while the volume that holds swap has less
+  free space than its floor. The floor is a quarter of the Mac's memory, and at least 8 GiB: 8 GiB
+  up to a 32 GiB Mac, 16 GiB on 64 GiB, 32 GiB on 128 GiB. The condition's message names the one
+  that fired, for example `kubelet has insufficient memory available: compressor 83% of limit`.
+  When the swap signal fires, the message names `swapfs.available` and says disk space on the swap
+  volume is the limiting resource: evicting a Pod stops swap from growing, but freeing disk space
+  is what ends the pressure. macOS starts killing processes itself at 98% of a compressor limit, so
+  k3sm acts first.
+- **`DiskPressure` watches the swap volume when it is separate.** On a standard Mac the swap
+  volume and the data root share one APFS container, so they share free space and the data-root
+  trigger covers both. When the data root is on another disk, `DiskPressure` also goes True while
+  the swap volume has less free space than the floor above, and clears at one and a half times the
+  floor. Its message names the swap volume.
 - **One Pod per round.** After each eviction k3sm waits for that Pod to stop and for a fresh
   sample, and evicts again only if pressure is not falling. After 3 evictions in 5 minutes it stops
   for the rest of that pressure episode, logs an error, and records an `EvictionCascadeHalted`

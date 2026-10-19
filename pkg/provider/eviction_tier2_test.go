@@ -57,6 +57,14 @@ import (
 //
 // Every other row is meant to survive that work unchanged.
 //
+// FLIPPED BY THE SWAP-ARM SPLIT (recorded red to green). The swap arm is now
+// the conjunction of a memory leg (memory.swap) and a space leg
+// (swapfs.available) and is reported as swapfs.available, the resource that
+// ran out; its floor became max(8Gi, memsize/4), which is 8 GiB on the 16 GiB
+// fixture host, so no trip value moved here. A6, A7 and A9 now expect the
+// eviction named swapfs.available instead of swap, and A11 expects the message
+// that names the swap volume as the limiting resource.
+//
 // ROWS COVERED ELSEWHERE (cited, not duplicated):
 //
 //	A5  compressor trip at 80%, hold above 70%, release at 70%; segments the same:
@@ -190,8 +198,8 @@ func TestTier2EvictionCharacterization(t *testing.T) {
 				t.Fatalf("first sample: pressured=%v notices=%v; with no previous reading swap cannot be rising", r.pressured(), r.notices())
 			}
 			r.step(swapAt(4*gi, 1*gi))
-			if n := r.notices(); len(n) != 1 || n[0].signal != signalSwap {
-				t.Errorf("second, rising sample: notices = %+v, want one swap eviction", n)
+			if n := r.notices(); len(n) != 1 || n[0].signal != signalSwapfs {
+				t.Errorf("second, rising sample: notices = %+v, want one swapfs.available eviction", n)
 			}
 		}},
 
@@ -210,13 +218,13 @@ func TestTier2EvictionCharacterization(t *testing.T) {
 				r.step(swapAt(tc.first, 7*gi))
 				r.step(swapAt(tc.then, 7*gi))
 				n := r.notices()
-				if got := len(n) == 1 && n[0].signal == signalSwap; got != tc.wantEviction {
-					t.Errorf("%s: swap eviction = %v (notices %+v), want %v", tc.name, got, n, tc.wantEviction)
+				if got := len(n) == 1 && n[0].signal == signalSwapfs; got != tc.wantEviction {
+					t.Errorf("%s: swapfs.available eviction = %v (notices %+v), want %v", tc.name, got, n, tc.wantEviction)
 				}
 			}
 		}},
 
-		{"A9 arm priority: memory.available, then compressor, then swap", func(t *testing.T) {
+		{"A9 arm priority: memory.available, then compressor, then the swap arm named swapfs.available", func(t *testing.T) {
 			at := func(avail, compPct, swapUsed int64) hostStats {
 				s := compressorAt(compPct)
 				s.MemAvailableBytes = avail
@@ -231,7 +239,7 @@ func TestTier2EvictionCharacterization(t *testing.T) {
 			}{
 				{"all three arms raised", at(50*mi, 90, 3*gi), signalMemoryAvailable},
 				{"compressor and swap raised", at(8*gi, 90, 3*gi), signalCompressor},
-				{"swap alone raised", at(8*gi, 0, 3*gi), signalSwap},
+				{"swap alone raised", at(8*gi, 0, 3*gi), signalSwapfs},
 			} {
 				r := newTier2Rig(hog())
 				r.step(at(8*gi, 0, 2*gi)) // calm prime: gives the swap arm its previous reading
@@ -263,7 +271,7 @@ func TestTier2EvictionCharacterization(t *testing.T) {
 				{"compressor", []hostStats{compressorAt(85)},
 					nodeLow + "Threshold quantity: compressor 80% of limit, available: compressor 85% of limit. "},
 				{"swap", []hostStats{swapAt(2*gi, 6*gi), swapAt(3*gi, 6*gi)},
-					nodeLow + "Threshold quantity: 8.0Gi free on the swap volume, available: swap growing, 6.0Gi free on the swap volume. "},
+					nodeLow + "Threshold quantity: swapfs.available 8.0Gi, available: swapfs.available 6.0Gi (floor 8.0Gi) with memory.swap growing (3.0Gi used): disk space on the swap volume is the limiting resource. "},
 			} {
 				r := newTier2Rig(noStats)
 				for _, s := range tc.seq {

@@ -44,3 +44,17 @@ func TestSampleMemoryHeadroomLive(t *testing.T) {
 		t.Errorf("swap volume %d free of %d, want 0 <= free <= capacity > 0", h.swapVolumeAvailable, h.swapVolumeCapacity)
 	}
 }
+
+// TestSwapVolumeSeparateLive compares the swap volume's container with the root
+// volume's on this Mac. On the stock layout the swap volume, the sealed system
+// snapshot and the data volume all live in one APFS container, so the answer is
+// false even though each volume has its own f_fsid.
+func TestSwapVolumeSeparateLive(t *testing.T) {
+	separate, err := swapVolumeSeparate("/")
+	if err != nil {
+		t.Fatalf("swapVolumeSeparate: %v", err)
+	}
+	if separate {
+		t.Error("the swap volume and / read as separate containers; on the stock layout they share one")
+	}
+}

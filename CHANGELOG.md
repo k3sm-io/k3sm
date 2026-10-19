@@ -69,6 +69,7 @@ pin, its date, and the tarball's sha256.
 
 ### Changed
 
+- **Larger hosts evict earlier when the swap volume runs short of space.** The swap trigger of `MemoryPressure` (swap in use and growing while the swap volume is short of free space) now uses a floor of a quarter of the Mac's memory, at least 8 GiB, instead of a flat 8 GiB. A Mac with 32 GiB of memory or less is unchanged; a 64 GiB Mac starts evicting at 16 GiB free on the swap volume and a 128 GiB Mac at 32 GiB. The condition's message and the eviction message now name `swapfs.available` and say disk space on the swap volume is the limiting resource, instead of reporting it as memory. When the swap volume is in a different APFS container from the data root, `DiskPressure` also goes True below that floor. See [limitations](https://k3sm.io/docs/limitations/).
 - **`--help` on a `k3sm status` view exits 0.** `k3sm status daemons --help`, `cluster --help`, `logs --help` and `top --help` print the usage to stdout and exit 0, as `k3sm status --help` already did; they used to exit 2. `--help` after an unknown view still exits 2.
 - **Workers enforce NetworkPolicy.** A worker's datapath now watches NetworkPolicies, Namespaces and every node's Pods under its own identity, so policies selecting Pods on a worker apply there, as they already did on the server. See [limitations](https://k3sm.io/docs/limitations/).
 - **The control plane runs Kubernetes v1.37.1**, and the `k8s.io` client libraries are v0.37.1.

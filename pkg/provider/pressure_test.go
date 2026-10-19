@@ -319,7 +319,7 @@ func TestPressureMonitorSharesMemoryPressurePredicate(t *testing.T) {
 		}{
 			{[]hostStats{compressorAt(85)}, "kubelet has insufficient memory available: compressor 85% of limit"},
 			{[]hostStats{availableAt(50 << 20)}, "kubelet has insufficient memory available: memory.available 50Mi"},
-			{[]hostStats{swapAt(2<<30, 6<<30), swapAt(3<<30, 6<<30)}, "kubelet has insufficient memory available: swap growing, 6.0Gi free on the swap volume"},
+			{[]hostStats{swapAt(2<<30, 6<<30), swapAt(3<<30, 6<<30)}, "kubelet has insufficient memory available: swapfs.available 6.0Gi (floor 8.0Gi) with memory.swap growing (3.0Gi used): disk space on the swap volume is the limiting resource"},
 		} {
 			h := newNodeStatusHarness(t, bootstrapNode())
 			var node *corev1.Node

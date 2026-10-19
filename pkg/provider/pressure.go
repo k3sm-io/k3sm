@@ -43,10 +43,16 @@ import (
 //     vm.compressor.pages_compressed_limit, or compressor segments at 80% of
 //     vm.compressor.segment.limit. macOS's no-paging-space kill fires at 98% of
 //     either limit, so this trips well before the kernel acts.
-//   - swap headroom (k3sm-specific, deliberately conjunctive): at least 1 GiB of
-//     swap in use AND swap use rising across the last two samples AND under 8 GiB
-//     free on the swap volume. Free disk alone is a DiskPressure fact; a full disk
-//     with no swap in use must not evict anything, because eviction cannot free it.
+//   - swap headroom (k3sm-specific, deliberately conjunctive) over two legs with
+//     their own names. The memory leg, memory.swap, is at least 1 GiB of swap in
+//     use AND swap use rising across the last two samples; it has no disk term.
+//     The space leg, swapfs.available, is free space on the swap volume under its
+//     floor, max(8Gi, memsize/4). The hard trigger needs both. Free disk alone is
+//     a DiskPressure fact; a full disk with no swap in use must not evict
+//     anything, because eviction cannot free it. When both legs hold, evicting a
+//     memory-heavy pod stops the swap growth, but the resource that ran out is
+//     space on the swap volume, so the arm is reported as swapfs.available and
+//     the condition's Message says disk space is the limiting resource.
 //
 // HYSTERESIS. Each signal trips at its trip value and clears only at its release
 // value (available >= 200Mi; both compressor ratios <= 70%; the swap arm false for
@@ -65,7 +71,12 @@ const (
 	signalNone            pressureSignal = ""
 	signalMemoryAvailable pressureSignal = "memory.available"
 	signalCompressor      pressureSignal = "compressor"
-	signalSwap            pressureSignal = "swap"
+	// signalMemorySwap names the memory leg of the swap arm: swap in use and
+	// rising. It never fires the arm alone; the reading quotes it.
+	signalMemorySwap pressureSignal = "memory.swap"
+	// signalSwapfs names the swap arm when it fires: both legs hold, and the
+	// limiting resource is free space on the swap volume.
+	signalSwapfs pressureSignal = "swapfs.available"
 )
 
 // memAvailableReleaseBytes is the available-memory level at or above which a
@@ -84,18 +95,31 @@ const (
 )
 
 // The swap-headroom arm's thresholds: swap in use at all (1 GiB, so a Mac with a
-// little idle swap is not "swapping"), and the free space left on the volume the
-// swapfiles live on. The kernel's swap-low test needs a failed swapfile creation
-// (the volume full) or the swapfile cap, so 8 GiB free is a margin ahead of it.
-// The arm releases after swapReleaseCalmSamples consecutive false samples.
+// little idle swap is not "swapping"), and the lower bound of the free-space
+// floor on the volume the swapfiles live on (swapfsFloor). The kernel's swap-low
+// test needs a failed swapfile creation (the volume full) or the swapfile cap, so
+// the floor is a margin ahead of it. The arm releases after
+// swapReleaseCalmSamples consecutive false samples.
 const (
-	swapTripUsedBytes       int64 = 1 << 30
-	swapVolumeTripFreeBytes int64 = 8 << 30
-	swapReleaseCalmSamples        = 2
+	swapTripUsedBytes      int64 = 1 << 30
+	swapfsFloorMinBytes    int64 = 8 << 30
+	swapReleaseCalmSamples       = 2
 )
 
-// swapVolumePath is the APFS volume macOS keeps its swapfiles on. It shares its
-// container (and so its free space) with the data volume.
+// swapfsFloor is the swapfs.available floor for a host with memCapacity bytes of
+// physical memory: max(8Gi, memsize/4). A flat 8 GiB is the same margin on an
+// 8 GiB laptop and a 128 GiB desktop, though the larger host can page far more out
+// before the volume fills; a quarter of memory scales the margin with what can
+// land in swap. It is 8 GiB up to a 32 GiB host, 16 GiB on 64 GiB and 32 GiB on
+// 128 GiB. An unsampled capacity (zero) gets the 8 GiB minimum.
+func swapfsFloor(memCapacity int64) int64 {
+	return max(swapfsFloorMinBytes, memCapacity/4)
+}
+
+// swapVolumePath is the APFS volume macOS keeps its swapfiles on. On the stock
+// layout it shares its container (and so its free space) with the data volume;
+// the sampler checks, because a data root on another disk does not
+// (hostStats.SwapVolumeSeparate).
 const swapVolumePath = "/System/Volumes/VM"
 
 // The monitor's cadence: calm, fast once any signal passes its half-way mark
@@ -106,12 +130,12 @@ const (
 	pressureCalmSamplesToSlowDown = 3
 )
 
-// The half-way marks pressureElevated tests against.
+// The half-way marks pressureElevated tests against. The swap volume's is twice
+// its floor, computed per host (swapfsFloor).
 const (
-	memAvailableElevatedBytes   = memAvailableReleaseBytes
-	compressorElevatedPercent   = compressorTripPercent / 2
-	swapElevatedUsedBytes       = swapTripUsedBytes / 2
-	swapVolumeElevatedFreeBytes = 2 * swapVolumeTripFreeBytes
+	memAvailableElevatedBytes = memAvailableReleaseBytes
+	compressorElevatedPercent = compressorTripPercent / 2
+	swapElevatedUsedBytes     = swapTripUsedBytes / 2
 )
 
 // The MemoryPressure Reason/Message vocabulary, the kubelet's literals. A raised
@@ -216,24 +240,37 @@ func evaluateMemory(s hostStats) memoryVerdict {
 		v.threshold = fmt.Sprintf("compressor %d%% of limit", compressorTripPercent)
 		v.level = max(ratioOf(s.CompressorPages, s.CompressorPagesLimit), ratioOf(s.CompressorSegments, s.CompressorSegmentsLimit))
 	case next.swap:
-		v.pressured, v.signal = true, signalSwap
-		v.reading = fmt.Sprintf("swap growing, %s free on the swap volume", formatBytes(s.SwapVolumeAvailableBytes))
-		v.threshold = fmt.Sprintf("%s free on the swap volume", formatBytes(swapVolumeTripFreeBytes))
+		floor := swapfsFloor(s.MemCapacityBytes)
+		v.pressured, v.signal = true, signalSwapfs
+		v.reading = fmt.Sprintf("%s %s (floor %s) with %s growing (%s used): disk space on the swap volume is the limiting resource",
+			signalSwapfs, formatBytes(s.SwapVolumeAvailableBytes), formatBytes(floor), signalMemorySwap, formatBytes(s.SwapUsedBytes))
+		v.threshold = fmt.Sprintf("%s %s", signalSwapfs, formatBytes(floor))
 		v.level = float64(s.SwapUsedBytes)
 	}
 	return v
 }
 
-// swapArm is the raw (un-held) swap arm. Every leg must be sampled: an unsampled
-// swap volume (zero capacity) or a snapshot with no previous swap reading cannot
-// fire it.
+// swapArm is the raw (un-held) swap arm: the conjunction of its memory leg and
+// its space leg.
 func swapArm(s hostStats) bool {
-	if s.SwapVolumeCapacityBytes <= 0 || !s.history.swapPrevOK {
-		return false
-	}
-	return s.SwapUsedBytes >= swapTripUsedBytes &&
-		s.SwapUsedBytes > s.history.swapPrev &&
-		s.SwapVolumeAvailableBytes < swapVolumeTripFreeBytes
+	return memorySwapLeg(s) && swapfsLeg(s)
+}
+
+// memorySwapLeg is the memory.swap leg: at least 1 GiB of swap in use and rising
+// since the previous sample. It has no disk term. A snapshot with no previous
+// swap reading cannot satisfy it.
+func memorySwapLeg(s hostStats) bool {
+	return s.history.swapPrevOK &&
+		s.SwapUsedBytes >= swapTripUsedBytes &&
+		s.SwapUsedBytes > s.history.swapPrev
+}
+
+// swapfsLeg is the swapfs.available leg: free space on the swap volume strictly
+// under the host's floor. An unsampled swap volume (zero capacity) cannot
+// satisfy it.
+func swapfsLeg(s hostStats) bool {
+	return s.SwapVolumeCapacityBytes > 0 &&
+		s.SwapVolumeAvailableBytes < swapfsFloor(s.MemCapacityBytes)
 }
 
 // pressureElevated reports whether any signal has passed the half-way mark to its
@@ -253,7 +290,7 @@ func pressureElevated(s hostStats) bool {
 	}
 	return s.SwapVolumeCapacityBytes > 0 &&
 		s.SwapUsedBytes >= swapElevatedUsedBytes &&
-		s.SwapVolumeAvailableBytes < swapVolumeElevatedFreeBytes
+		s.SwapVolumeAvailableBytes < 2*swapfsFloor(s.MemCapacityBytes)
 }
 
 // percentOf returns n as a whole percentage of limit, rounded down, and false

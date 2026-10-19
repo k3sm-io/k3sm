@@ -28,3 +28,8 @@ var errHeadroomUnsupported = errors.New("memory headroom sampling requires darwi
 func sampleMemoryHeadroom() (memoryHeadroom, error) {
 	return memoryHeadroom{}, errHeadroomUnsupported
 }
+
+// swapVolumeSeparate is unsupported off darwin: the swap volume is a macOS path.
+func swapVolumeSeparate(string) (bool, error) {
+	return false, errHeadroomUnsupported
+}
