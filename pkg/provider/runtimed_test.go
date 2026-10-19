@@ -736,7 +736,8 @@ func TestRuntimedDeleteGrace(t *testing.T) {
 	}{
 		{"unset defaults to 30", nil, 30},
 		{"explicit 10 passed through", ptr(int64(10)), 10},
-		{"explicit 0 passed through (immediate)", ptr(int64(0)), 0},
+		{"explicit 1 floored to 2", ptr(int64(1)), 2},
+		{"spec 0 floored to 2", ptr(int64(0)), 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

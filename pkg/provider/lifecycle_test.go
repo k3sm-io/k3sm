@@ -159,7 +159,7 @@ func waitForEvent(t *testing.T, f *fakeLifecycleServer, kind string) {
 //   - postStart is DISPATCHED after CreatePod (in a goroutine);
 //   - preStop runs BEFORE the runtimed DeletePod RPC, in order;
 //   - the residual grace passed to runtimed is the budget minus preStop wall-time,
-//     floored at 1s (never 0 — a 0 would skip SIGTERM);
+//     floored at minimumGracePeriodSeconds, 2s (never 0: a 0 would skip SIGTERM);
 //   - the httpGet handler reuses buildCheck's host/port/scheme resolution;
 //   - a sleep preStop delays termination by its duration (bounded by the grace);
 //   - preStop is best-effort: a failing hook does NOT abort the delete.
@@ -246,7 +246,7 @@ func TestLifecycleHooksExecHTTP(t *testing.T) {
 		}
 	})
 
-	t.Run("a preStop that drains the full grace floors at 1s (never 0)", func(t *testing.T) {
+	t.Run("a preStop that drains the full grace floors at 2s (never 0)", func(t *testing.T) {
 		clk := testclock.NewFakeClock(time.Unix(0, 0))
 		r, f := newLifecycleFake(t, clk)
 		pod := lifecyclePod("floor", 5, corev1.Container{
@@ -267,10 +267,11 @@ func TestLifecycleHooksExecHTTP(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatalf("DeletePod: %v", err)
 		}
-		// 5 − 5 = 0, but the floor MUST pass 1 so runtimed still sends SIGTERM
-		// (a resolved 0 is an immediate SIGKILL with no SIGTERM).
-		if g := deleteGrace(t, f); g != 1 {
-			t.Errorf("residual grace = %d, want 1 (floored, never 0)", g)
+		// 5 − 5 = 0, but the floor MUST pass minimumGracePeriodSeconds so
+		// runtimed still sends SIGTERM and waits 2s, as the kubelet does (a
+		// resolved 0 is an immediate SIGKILL with no SIGTERM).
+		if g := deleteGrace(t, f); g != 2 {
+			t.Errorf("residual grace = %d, want 2 (floored, never 0)", g)
 		}
 	})
 

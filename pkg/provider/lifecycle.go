@@ -56,12 +56,13 @@ import (
 // --grace-period override, else spec.terminationGracePeriodSeconds, else the k8s 30s
 // default) covers BOTH the preStop hooks and the SIGTERM→SIGKILL window — the
 // upstream contract is that the grace countdown starts before preStop. preStop is
-// bounded by that budget; the residual returned is grace − ceil(preStopElapsed),
-// FLOORED AT 1 so SIGTERM still fires even when preStop drained the budget (runtimed
-// treats a resolved 0 as an immediate SIGKILL with NO SIGTERM — see the runtime
-// server's graceDuration). A 0 budget (a --grace-period=0 force delete) skips preStop
-// and returns 0, preserving the immediate-kill semantics (upstream also skips preStop
-// on a force delete).
+// bounded by that budget; the residual returned is grace − ceil(preStopElapsed).
+// Every value returned is floored at minimumGracePeriodSeconds (2 s), with and
+// without preStop, as the kubelet's killContainer floors the grace it hands the
+// runtime: SIGTERM always fires and the container gets two seconds before
+// SIGKILL. A budget of 0 or less (a pod whose grace is 0) skips preStop, as
+// upstream does when the grace is not above 0, and still returns the floor; in
+// the apis contract a wire 0 is an immediate SIGKILL, which only evictPod sends.
 //
 // preStop is best-effort: a failed or non-zero hook is logged and termination
 // proceeds — it does NOT abort the delete (unlike a probe failure, which fails the
@@ -69,7 +70,7 @@ import (
 func (r *runtimedRuntime) runPreStop(ctx context.Context, pod *corev1.Pod) int64 {
 	grace := graceSeconds(pod)
 	if grace <= 0 {
-		return grace // force/immediate delete: skip preStop, immediate SIGKILL
+		return floorGrace(grace) // no budget: skip preStop, still SIGTERM first
 	}
 	podIP := pod.Status.PodIP
 	if podIP == "" {
@@ -96,13 +97,9 @@ func (r *runtimedRuntime) runPreStop(ctx context.Context, pod *corev1.Pod) int64
 		}
 	}
 	if !ran {
-		return grace // no preStop hooks: pass the full grace through unchanged
+		return floorGrace(grace) // no preStop hooks: the full budget, floored
 	}
-	residual := grace - ceilSeconds(r.clk.Since(start))
-	if residual < 1 {
-		residual = 1 // floor: a resolved 0 would skip SIGTERM (immediate SIGKILL)
-	}
-	return residual
+	return floorGrace(grace - ceilSeconds(r.clk.Since(start)))
 }
 
 // runHook dispatches one lifecycle handler for (podID, container), bounded by

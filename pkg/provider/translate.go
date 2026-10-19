@@ -82,6 +82,15 @@ const rlimitUnlimited = "unlimited"
 // grace as immediate-kill, which is NOT the k8s default.
 const defaultGraceSeconds int64 = 30
 
+// minimumGracePeriodSeconds is the floor on every grace the provider hands
+// runtimed's DeletePod outside a hard eviction: the kubelet's
+// minimumGracePeriodInSeconds (pkg/kubelet/kuberuntime/kuberuntime_container.go,
+// v1.36.2), which killContainer applies before its CRI StopContainer call, so a
+// container always gets SIGTERM and two seconds before SIGKILL. The kubelet
+// never sends the runtime 0; in the apis contract 0 is an immediate SIGKILL,
+// which only evictPod asks for (see its doc).
+const minimumGracePeriodSeconds int64 = 2
+
 // toPodBox translates a corev1.Pod into the runtime PodBox runtimed consumes. It
 // fills sandbox_profile and signature_policy so runtimed's fail-closed gate
 // passes: a nil profile or an unset signature policy makes CreatePod refuse the
@@ -912,13 +921,16 @@ func isQOSComputeResource(name corev1.ResourceName) bool {
 	return name == corev1.ResourceCPU || name == corev1.ResourceMemory
 }
 
-// graceSeconds is the SIGTERM→SIGKILL window the provider passes as
-// DeletePodRequest.grace_period_seconds. The apiserver stamps
+// graceSeconds is the pod's raw termination budget: the apiserver stamps
 // DeletionGracePeriodSeconds on the object at delete time (honoring a kubectl
 // --grace-period override), so it takes precedence; otherwise the pod's
-// terminationGracePeriodSeconds; otherwise the k8s 30s default. runtimed treats a
-// 0 grace as immediate-kill — which is why the default is applied HERE, not left
-// to the proto3 zero value.
+// terminationGracePeriodSeconds; otherwise the k8s 30s default. The default is
+// applied HERE, not left to the proto3 zero value, because in the apis contract
+// DeletePodRequest.grace_period_seconds 0 is an immediate kill.
+//
+// The raw budget decides whether preStop runs (it does not when the budget is 0
+// or less). It is never sent as is: floorGrace floors it at
+// minimumGracePeriodSeconds, the way the kubelet resolves a delete.
 func graceSeconds(pod *corev1.Pod) int64 {
 	if g := pod.DeletionGracePeriodSeconds; g != nil {
 		return *g
@@ -927,6 +939,16 @@ func graceSeconds(pod *corev1.Pod) int64 {
 		return *g
 	}
 	return defaultGraceSeconds
+}
+
+// floorGrace floors a resolved grace at minimumGracePeriodSeconds. Every
+// DeletePod grace the provider sends is at least that floor, except evictPod's
+// hard kill, so grace 0 on the wire means only the hard eviction's immediate kill.
+func floorGrace(g int64) int64 {
+	if g < minimumGracePeriodSeconds {
+		return minimumGracePeriodSeconds
+	}
+	return g
 }
 
 // toRuntimeContainers maps corev1 containers to runtime containers (argv =
