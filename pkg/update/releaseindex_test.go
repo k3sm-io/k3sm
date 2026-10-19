@@ -218,10 +218,54 @@ func TestReleaseIndexSchemaGolden(t *testing.T) {
 }
 
 // TestParseReleaseIndexAcceptsEscapedKeys shows the key check runs on decoded
-// key text: a JSON escape spelling a schema key exactly is that key.
+// key text: a JSON escape spelling a schema key exactly is that key, and two
+// spellings of one key are a duplicate.
 func TestParseReleaseIndexAcceptsEscapedKeys(t *testing.T) {
 	golden := string(readReleaseIndexFixture(t, "index.json"))
-	if _, err := ParseReleaseIndex([]byte(strings.Replace(golden, `"tag"`, `"tag"`, 1))); err != nil {
-		t.Errorf("an escaped exact key is refused: %v", err)
+	want, err := ParseReleaseIndex([]byte(golden))
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	// escaped replaces the first occurrence of old and fails the test when
+	// there is none, so a case cannot silently test the unmodified document.
+	escaped := func(t *testing.T, doc, old, repl string) string {
+		t.Helper()
+		if !strings.Contains(doc, old) {
+			t.Fatalf("the fixture has no %s", old)
+		}
+		return strings.Replace(doc, old, repl, 1)
+	}
+
+	accepts := []struct{ name, old, repl string }{
+		{"escaped top-level key", `"tag"`, `"\u0074ag"`},
+		{"escaped nested key", `"bundleID"`, `"bundle\u0049D"`},
+		{"escaped innermost key", `"sha256"`, `"sha\u0032\u0035\u0036"`},
+		{"escaped value", `"0.2.0",`, `"0\u002e2.0",`},
+		{"escaped solidus in the url", `https://github.com/k3sm-io/k3sm/releases/download/v0.2.0/k3sm_0.2.0_darwin_arm64.dmg`,
+			`https:\/\/github.com\/k3sm-io\/k3sm\/releases\/download\/v0.2.0\/k3sm_0.2.0_darwin_arm64.dmg`},
+	}
+	for _, tc := range accepts {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := escaped(t, golden, tc.old, tc.repl)
+			if doc == golden {
+				t.Fatal("the document is unchanged")
+			}
+			got, err := ParseReleaseIndex([]byte(doc))
+			if err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			if got != want {
+				t.Errorf("parsed %+v, want %+v", got, want)
+			}
+		})
+	}
+
+	t.Run("escaped and plain spelling of one key is a duplicate", func(t *testing.T) {
+		doc := escaped(t, golden, `"tag": "v0.2.0",`, `"tag": "v0.2.0", "\u0074ag": "v0.2.0",`)
+		_, err := ParseReleaseIndex([]byte(doc))
+		if !errors.Is(err, ErrReleaseIndex) || !strings.Contains(err.Error(), "duplicate key") {
+			t.Errorf("got %v, want a duplicate key refusal", err)
+		}
+	})
 }
