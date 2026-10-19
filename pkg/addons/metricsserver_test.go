@@ -296,3 +296,43 @@ func convert(t *testing.T, o *unstructured.Unstructured, into any) {
 		t.Fatalf("decode %s %s into %T: %v", o.GetKind(), o.GetName(), into, err)
 	}
 }
+
+// TestMetricsServerLivenessProbeTolerance pins the liveness probe's room for a
+// host stall. Upstream's chart sets neither timeoutSeconds (so the 1 s default
+// applies) nor an initial delay; on a Mac a whole-host stall longer than one
+// probe window killed a healthy metrics-server, so the shipped probe waits
+// longer for an answer and starts after the process has had time to come up.
+func TestMetricsServerLivenessProbeTolerance(t *testing.T) {
+	objs, errs := (&Reconciler{fsys: FS()}).load()
+	for _, err := range errs {
+		t.Errorf("decode the embedded tree: %v", err)
+	}
+	for _, o := range objs {
+		if o.GetKind() != "Deployment" || o.GetName() != "metrics-server" {
+			continue
+		}
+		containers, found, err := unstructured.NestedSlice(o.Object, "spec", "template", "spec", "containers")
+		if err != nil || !found || len(containers) != 1 {
+			t.Fatalf("metrics-server containers = %v (found %v, err %v), want exactly one", containers, found, err)
+		}
+		c, ok := containers[0].(map[string]any)
+		if !ok {
+			t.Fatalf("container is %T, want a map", containers[0])
+		}
+		probe, found, err := unstructured.NestedMap(c, "livenessProbe")
+		if err != nil || !found {
+			t.Fatalf("livenessProbe missing (err %v)", err)
+		}
+		for field, want := range map[string]int64{"timeoutSeconds": 5, "initialDelaySeconds": 20} {
+			got, _, err := unstructured.NestedInt64(probe, field)
+			if err != nil {
+				t.Fatalf("livenessProbe.%s: %v", field, err)
+			}
+			if got < want {
+				t.Errorf("livenessProbe.%s = %d, want at least %d", field, got, want)
+			}
+		}
+		return
+	}
+	t.Fatal("metrics-server Deployment not in the embedded tree")
+}
