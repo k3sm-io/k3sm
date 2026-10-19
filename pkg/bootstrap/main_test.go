@@ -25,10 +25,12 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// The work factors the package ships with, captured before TestMain lowers them.
+// The work factors the package ships with. TestMain captures them as its first
+// act, after every package initializer and init function has run, so an init
+// that lowered either one would be captured, and pinned, rather than escape.
 var (
-	shippedHashCost        = hashCost
-	shippedBundleSealIters = bundleSealIters
+	shippedHashCost        int
+	shippedBundleSealIters int
 )
 
 // TestMain lowers the two deliberate work factors, the bcrypt cost and the
@@ -39,6 +41,7 @@ var (
 // measures the work factor's cost; TestShippedWorkFactors pins the shipped values
 // and that every hashing path reads them.
 func TestMain(m *testing.M) {
+	shippedHashCost, shippedBundleSealIters = hashCost, bundleSealIters
 	hashCost = bcrypt.MinCost
 	bundleSealIters = bundleMinPBKDF2Iters
 	os.Exit(m.Run())

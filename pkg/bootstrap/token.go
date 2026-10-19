@@ -115,6 +115,11 @@ func ParseToken(s string) (Token, error) {
 // pay several per request); a test pins the shipped value to bcrypt.DefaultCost.
 var hashCost = bcrypt.DefaultCost
 
+// HashCost returns the bcrypt cost bootstrap secrets are hashed at, so a
+// NodePasswordStore implemented outside this package hashes at the same cost.
+// There is deliberately no setter.
+func HashCost() int { return hashCost }
+
 // compareHash is the one bcrypt compare every token verification performs. It
 // is a package var only so the cost-equalization gate can COUNT the compares
 // each outcome performs, which asserts the property without a timing test.
