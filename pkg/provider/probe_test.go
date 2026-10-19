@@ -333,7 +333,18 @@ func TestM2_LivenessRestarts(t *testing.T) {
 		t.Fatalf("status RestartCount=%d, want 1 (runtimed's count verbatim, not doubled by the probe tally)", st.ContainerStatuses[0].RestartCount)
 	}
 
-	// After the gauge resets, another 3 failures restart again (no storm per fail).
+	// While the restart is in flight liveness is held: failures against the old
+	// instance are not counted (TestLivenessNotCountedDuringRestart owns the
+	// end-to-end case).
+	for i := 0; i < 3; i++ {
+		if react := feed(m, probeLiveness, outcomeFailure); react != reactNone {
+			t.Fatalf("failure during the restart reaction %v, want none", react)
+		}
+	}
+
+	// Once the replacement instance is observed, the gauge has reset and another
+	// 3 failures restart again (no storm per fail).
+	m.observeInstance("c0-2", true, time.Unix(0, 0))
 	feed(m, probeLiveness, outcomeFailure)
 	feed(m, probeLiveness, outcomeFailure)
 	if react := feed(m, probeLiveness, outcomeFailure); react != reactRestart {

@@ -196,6 +196,30 @@ type containerMonitor struct {
 	pending   bool
 	evaluated bool
 
+	// Container-instance tracking, the kubelet prober worker's containerID and
+	// onHold (k8s.io/kubernetes/pkg/kubelet/prober/worker.go). The runtime's
+	// status observations feed it (observeInstance); a probe tick only reads it.
+	//
+	// instanceID is the container id of the last observed instance ("" until one
+	// is observed). running and startedAt describe that instance. replacement is
+	// true when the instance replaced an earlier observed one: its liveness probe
+	// then waits initialDelaySeconds from ITS start, as the kubelet measures the
+	// delay from the running container's StartedAt, while the first instance's
+	// delay is the probe loop's own initial wait.
+	//
+	// held is the liveness hold a committed liveness failure sets: the restart is
+	// asynchronous (a re-exec worker, possibly waiting out CrashLoopBackOff), so
+	// the old instance, and then a replacement that is still coming up, would
+	// otherwise keep answering refused probes and count the same failure a second
+	// time. heldFrom is the instance the failure was committed against; the hold
+	// lifts only when a DIFFERENT instance is observed.
+	instanceID  string
+	running     bool
+	startedAt   time.Time
+	replacement bool
+	held        bool
+	heldFrom    string
+
 	startup   *probeSpec // nil if the container has no startup probe
 	readiness *probeSpec // nil if the container has no readiness probe
 	liveness  *probeSpec // nil if the container has no liveness probe
@@ -228,7 +252,63 @@ func (m *containerMonitor) shouldProbe(kind probeKind) bool {
 	if kind == probeStartup {
 		return !m.startedLocked()
 	}
+	if kind == probeLiveness && !m.livenessEligibleLocked() {
+		return false
+	}
 	return m.startedLocked()
+}
+
+// livenessEligibleLocked reports whether liveness may be evaluated for the
+// current container instance: not while a liveness restart is in flight (held),
+// and not while the observed instance is not running — the kubelet worker's
+// onHold and State.Running checks. With no instance observed yet there is
+// nothing to gate on, and liveness runs under the startup gate alone. Caller
+// holds mu.
+func (m *containerMonitor) livenessEligibleLocked() bool {
+	if m.held {
+		return false
+	}
+	return m.instanceID == "" || m.running
+}
+
+// inLivenessDelay reports whether now is still inside a replacement instance's
+// initialDelaySeconds, measured from that instance's start: the kubelet skips a
+// probe while time.Since(State.Running.StartedAt) < InitialDelaySeconds, so a
+// restarted container gets the same grace its first instance got.
+func (m *containerMonitor) inLivenessDelay(now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.liveness == nil || !m.replacement || m.liveness.sched.initialDelay <= 0 {
+		return false
+	}
+	return now.Sub(m.startedAt) < m.liveness.sched.initialDelay
+}
+
+// observeInstance records one runtime observation of the container: its
+// instance id, whether that instance is running, and when it started. A new
+// instance id is a container restart: the liveness gauge starts over from its
+// initial value (no failure carries across instances) and any liveness hold
+// lifts, because the instance the failure was committed against is gone. An
+// observation with no id says nothing about which instance is current and is
+// ignored, like the kubelet's wait for a container id.
+func (m *containerMonitor) observeInstance(id string, running bool, startedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if id == "" {
+		return
+	}
+	if id != m.instanceID {
+		m.replacement = m.instanceID != ""
+		m.instanceID = id
+		if m.held && id != m.heldFrom {
+			m.held, m.heldFrom = false, ""
+		}
+		if m.liveness != nil {
+			m.liveness.gauge.reset(outcomeSuccess)
+		}
+	}
+	m.running = running
+	m.startedAt = startedAt
 }
 
 // observe feeds one raw outcome for the given kind through its gauge under the
@@ -264,6 +344,9 @@ func (m *containerMonitor) observe(kind probeKind, raw probeOutcome) probeReacti
 		if !m.startedLocked() {
 			return reactNone // gated by startup
 		}
+		if !m.livenessEligibleLocked() {
+			return reactNone // a restart is in flight, or the instance is not running
+		}
 		prev := m.liveness.gauge.committed
 		if m.liveness.gauge.record(raw) == outcomeFailure && prev != outcomeFailure {
 			return reactRestart // crossed into committed failure → restart once
@@ -287,13 +370,15 @@ func (m *containerMonitor) noteNotEvaluated() {
 }
 
 // onRestart applies a container restart: it bumps the monitor's restart tally
-// (internal bookkeeping — the surfaced RestartCount is runtimed's) and resets
+// (internal bookkeeping — the surfaced RestartCount is runtimed's), resets
 // every gauge so the startup gate must re-open (and liveness/readiness
-// re-accumulate) for the fresh container instance.
+// re-accumulate) for the fresh container instance, and holds liveness until a
+// different instance than the one that failed is observed (observeInstance).
 func (m *containerMonitor) onRestart() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.restarts++
+	m.held, m.heldFrom = true, m.instanceID
 	if m.startup != nil {
 		m.startup.gauge.reset(outcomeUnknown)
 	}
@@ -551,6 +636,9 @@ func (pp *podProber) tick(ctx context.Context, m *containerMonitor, kind probeKi
 	if !m.shouldProbe(kind) {
 		return
 	}
+	if kind == probeLiveness && m.inLivenessDelay(pp.clk.Now()) {
+		return
+	}
 	raw, evaluated := pp.runCheck(ctx, m.name, kind, s)
 	if !evaluated {
 		// The attempt was not made (errProbeTargetPending). Record the window and
@@ -636,6 +724,27 @@ func (pp *podProber) doRestart(ctx context.Context, container string) {
 	}
 	if err := pp.restartFunc(ctx, pp.podID, container); err != nil {
 		pp.log.Warn("container restart failed", "pod", pp.podID, "container", container, "err", err)
+	}
+}
+
+// probeInstance is one runtime observation of a probed container: the
+// container id of the current instance, whether it is running, and when it
+// started. It is the runtime-agnostic shape observeInstances takes.
+type probeInstance struct {
+	name      string
+	id        string
+	running   bool
+	startedAt time.Time
+}
+
+// observeInstances feeds runtime observations to the containers' monitors so
+// liveness follows container instances the way the kubelet's prober worker does
+// (containerMonitor.observeInstance). Containers without probes are ignored.
+func (pp *podProber) observeInstances(obs []probeInstance) {
+	for _, o := range obs {
+		if m, ok := pp.monitors[o.name]; ok {
+			m.observeInstance(o.id, o.running, o.startedAt)
+		}
 	}
 }
 
