@@ -135,6 +135,7 @@ into the single binary a user installs; `app` is the macOS app on top of it.
 | [app](https://github.com/k3sm-io/app) | The macOS app: a menu bar status item and a window with the cluster, this Mac, the nodes and a workloads console; it reads `k3sm status -o json` | none |
 | [linux-guest](https://github.com/k3sm-io/linux-guest) | The pinned guest kernel and initramfs releases the `vm` RuntimeClass boots | none |
 | [k3sm-sdk-cpp](https://github.com/k3sm-io/k3sm-sdk-cpp) | A C++ SDK for applications that read node pressure and headroom from k3sm (header-only, CMake; the API is being designed) | none |
+| [k3sm-sdk-swift](https://github.com/k3sm-io/k3sm-sdk-swift) | A Swift SDK for applications that read node pressure and headroom from k3sm (SwiftPM; the API is being designed) | none |
 
 ## Documentation
 
