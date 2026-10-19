@@ -52,6 +52,10 @@ const (
 // controller then refuses to resolve the Update unless a trusted pin for
 // exactly that tag matched, so a pin that is missing by the time the
 // controller resolves fails the roll instead of letting it run unpinned.
+// No RBAC rule k3sm ships names updates.k3sm.io, so only a cluster-admin
+// identity can write an Update; removing this annotation therefore needs an
+// identity that can already change spec.version, and the requirement adds no
+// weaker way around the pin.
 const ReleasePinRequiredAnnotation = "k3sm.io/release-pin-required"
 
 // The condition reasons the release pin adds.

@@ -841,7 +841,8 @@ func runUpdateClearPin(fsFlags *flag.FlagSet, env updateEnv) int {
 	case cleared.Path == "":
 		fmt.Fprintln(env.out, "There is no release pin.")
 	case cleared.Untrusted != "":
-		fmt.Fprintf(env.out, "Removed %s, which could not be trusted (%s), with any release pin in it.\n", cleared.Path, cleared.Untrusted)
+		fmt.Fprintf(env.out, "Moved %s aside to %s: it could not be trusted (%s). Created a fresh %s; nothing is pinned.\n",
+			cleared.Path, cleared.Aside, cleared.Untrusted, cleared.Path)
 	default:
 		fmt.Fprintf(env.out, "Removed the release pin %s.\n", cleared.Path)
 	}

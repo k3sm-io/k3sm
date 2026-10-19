@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -379,46 +378,128 @@ func TestReleasePinWriterFailsClosedOnADirectorySwap(t *testing.T) {
 }
 
 // TestClearReleasePinRemovesAnUntrustedDirectory is root's recovery from a pin
-// directory entry a less privileged user planted: each untrusted shape is
-// removed whole and named, and nothing a symlink points at is touched.
+// directory entry a less privileged user planted: whatever its shape, depth or
+// refills, the entry is moved aside whole and never walked, a fresh pin
+// directory takes its place, and root can pin again at once. Nothing a symlink
+// points at is touched.
 func TestClearReleasePinRemovesAnUntrustedDirectory(t *testing.T) {
 	victim := t.TempDir()
 	write(t, filepath.Join(victim, "keep"), "keep")
+	writable := func(mode os.FileMode) func(t *testing.T, dir string) {
+		return func(t *testing.T, dir string) { plantTree(t, dir); chmod(t, dir, mode) }
+	}
 	for _, tc := range []struct {
-		name  string
-		plant func(t *testing.T, dir string)
-		owner uint32
-		want  string
+		name   string
+		plant  func(t *testing.T, dir string)
+		refill bool
+		want   string
 	}{
 		{name: "a symlink to a directory", plant: func(t *testing.T, dir string) { symlink(t, victim, dir) }, want: "a symlink"},
 		{name: "a dangling symlink", plant: func(t *testing.T, dir string) { symlink(t, filepath.Join(victim, "absent"), dir) }, want: "a symlink"},
 		{name: "a regular file", plant: func(t *testing.T, dir string) { write(t, dir, "x") }, want: "not a directory"},
-		{name: "another owner", plant: plantTree, owner: testOwner() + 1, want: "owned by uid"},
-		{name: "group-writable", plant: func(t *testing.T, dir string) { plantTree(t, dir); chmod(t, dir, 0o775) }, want: "writable by its group or others"},
-		{name: "world-writable", plant: func(t *testing.T, dir string) { plantTree(t, dir); chmod(t, dir, 0o757) }, want: "writable by its group or others"},
+		{name: "group-writable", plant: writable(0o775), want: "writable by its group or others"},
+		{name: "world-writable", plant: writable(0o757), want: "writable by its group or others"},
+		{name: "a tree 64 directories deep", plant: func(t *testing.T, dir string) {
+			deep := dir
+			for i := range 64 {
+				deep = filepath.Join(deep, fmt.Sprintf("d%02d", i))
+			}
+			if err := os.MkdirAll(deep, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			write(t, filepath.Join(deep, "f"), "f")
+			chmod(t, dir, 0o775)
+		}, want: "writable by its group or others"},
+		{name: "a tree refilled while it is cleared", plant: writable(0o775), refill: true, want: "writable by its group or others"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wd := t.TempDir()
 			tc.plant(t, ReleasePinDir(wd))
-			owner := testOwner()
-			if tc.owner != 0 {
-				owner = tc.owner
+			if tc.refill {
+				// The planter keeps writing into the entry between root's
+				// check and root's act.
+				pinClearChecked = func() {
+					for i := range 200 {
+						write(t, filepath.Join(ReleasePinDir(wd), fmt.Sprintf("refill-%03d", i)), "x")
+					}
+				}
+				t.Cleanup(func() { pinClearChecked = func() {} })
 			}
-			c, err := clearReleasePin(wd, owner)
-			if err != nil || c.Path != ReleasePinDir(wd) || !strings.Contains(c.Untrusted, tc.want) {
+			c, err := clearReleasePin(wd, testOwner())
+			if err != nil || c.Path != ReleasePinDir(wd) || !strings.Contains(c.Untrusted, tc.want) ||
+				!strings.HasPrefix(filepath.Base(c.Aside), "update.untrusted-") || filepath.Dir(c.Aside) != wd {
 				t.Fatalf("clear: %+v, %v; want %q", c, err, tc.want)
 			}
-			if _, err := os.Lstat(ReleasePinDir(wd)); !errors.Is(err, fs.ErrNotExist) {
-				t.Fatalf("the untrusted entry is still there: %v", err)
+			if _, err := os.Lstat(c.Aside); err != nil {
+				t.Fatalf("the aside entry is gone: %v", err)
+			}
+			fi, err := os.Lstat(ReleasePinDir(wd))
+			if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 {
+				t.Fatalf("no fresh pin directory: %v, %v", fi, err)
+			}
+			if entries, _ := os.ReadDir(ReleasePinDir(wd)); len(entries) != 0 {
+				t.Fatalf("the fresh pin directory is not empty: %v", entries)
 			}
 			if b, err := os.ReadFile(filepath.Join(victim, "keep")); err != nil || string(b) != "keep" {
 				t.Fatalf("the symlink's target was touched: %q, %v", b, err)
 			}
-			// root can pin again afterwards.
+			if entries, _ := os.ReadDir(victim); len(entries) != 1 {
+				t.Fatalf("the symlink's target gained entries: %v", entries)
+			}
 			if err := writeReleasePin(wd, ReleasePin{Version: target, SHA256: targetSum, At: rigStart}, testOwner()); err != nil {
 				t.Fatalf("pin after clear: %v", err)
 			}
+			if pin, err := readReleasePin(wd, testOwner()); err != nil || pin == nil || pin.SHA256 != targetSum {
+				t.Fatalf("read after the new pin: %+v, %v", pin, err)
+			}
+			if tc.refill {
+				// The planter refills its aside tree and plants a new
+				// untrusted entry between root's calls: the next clear moves
+				// that one aside too, under a new name.
+				pinClearChecked = func() {}
+				for i := range 50 {
+					write(t, filepath.Join(c.Aside, fmt.Sprintf("later-%02d", i)), "x")
+				}
+				mv(t, ReleasePinDir(wd), filepath.Join(t.TempDir(), "root-dir"))
+				writable(0o777)(t, ReleasePinDir(wd))
+				c2, err := clearReleasePin(wd, testOwner())
+				if err != nil || c2.Aside == "" || c2.Aside == c.Aside {
+					t.Fatalf("second clear: %+v, %v (first aside %s)", c2, err, c.Aside)
+				}
+				if err := writeReleasePin(wd, ReleasePin{Version: target, SHA256: targetSum, At: rigStart}, testOwner()); err != nil {
+					t.Fatalf("pin after the second clear: %v", err)
+				}
+			}
 		})
+	}
+}
+
+// TestClearReleasePinRetriesARaceToReplant plants a new untrusted entry
+// between root's rename aside and its mkdir: root moves that one aside too and
+// still ends with a fresh pin directory.
+func TestClearReleasePinRetriesARaceToReplant(t *testing.T) {
+	wd := t.TempDir()
+	symlink(t, t.TempDir(), ReleasePinDir(wd))
+	replants := 0
+	pinClearChecked = func() {}
+	t.Cleanup(func() { pinClearChecked = func() {}; renameAsideHook = func() {} })
+	renameAsideHook = func() {
+		if replants < 2 {
+			replants++
+			symlink(t, t.TempDir(), ReleasePinDir(wd))
+		}
+	}
+	c, err := clearReleasePin(wd, testOwner())
+	if err != nil || replants != 2 || c.Untrusted != "a symlink" {
+		t.Fatalf("clear: %+v, %v, replants %d", c, err, replants)
+	}
+	fi, err := os.Lstat(ReleasePinDir(wd))
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("no fresh pin directory: %v, %v", fi, err)
+	}
+	asides, _ := filepath.Glob(filepath.Join(wd, "update.untrusted-*"))
+	if len(asides) != 3 {
+		t.Fatalf("asides %v, want 3", asides)
 	}
 }
 

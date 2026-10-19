@@ -25,7 +25,9 @@ import (
 	"io/fs"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"strconv"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -38,15 +40,15 @@ import (
 // on the opened descriptor, and every later step (the chmod, the temp file,
 // the rename, the unlink) acts on that descriptor. A swap after the check can
 // then only move the directory root is writing into, never redirect root's
-// write elsewhere, and the writer notices the move and fails.
+// write elsewhere. The reader holds the pin to the same owner and mode checks
+// on the descriptors it reads through. Those two are the defence; the
+// writer's after-the-fact check that the directory is still in place
+// (samePinDir) only turns a swap into a clear error instead of a pin written
+// where nothing will read it.
 
 // pinDirChecked is called after the writer has checked the pin directory and
 // before it writes the pin: a test seam for swapping the directory there.
 var pinDirChecked = func() {}
-
-// maxClearDepth bounds how deep ClearReleasePin descends into an untrusted
-// directory tree.
-const maxClearDepth = 16
 
 // openWorkDir opens workDir as a directory, without following it if it is a
 // symlink. A missing work dir is an error wrapping fs.ErrNotExist.
@@ -147,8 +149,8 @@ func writeReleasePin(workDir string, pin ReleasePin, owner uint32) error {
 		return fmt.Errorf("write the release pin %s: %w", ReleasePinPath(workDir), err)
 	}
 	if err := samePinDir(parent, dfd); err != nil {
-		// The pin went into a directory no longer at the pin path: take it
-		// back out, and fail.
+		// The pin went into a directory no longer at the pin path, so no
+		// reader will find it: take it back out and say so.
 		_ = unix.Unlinkat(dfd, releasePinFileName, 0)
 		return fmt.Errorf("write the release pin: %s was replaced during the write: %w", ReleasePinDir(workDir), err)
 	}
@@ -189,7 +191,11 @@ func writePinAt(dfd int, data []byte) error {
 }
 
 // samePinDir reports an error unless the pin directory entry in parent is
-// still the directory dfd holds.
+// still the directory dfd holds. It is diagnostic, not a defence: a swap
+// after it is not seen, and none needs to be, because the write already went
+// through the checked descriptor and a reader holds whatever it finds at the
+// pin path to the owner and mode checks. It only makes a swap during the
+// write fail loudly instead of leaving a pin no reader will find.
 func samePinDir(parent, dfd int) error {
 	var held, now unix.Stat_t
 	if err := unix.Fstat(dfd, &held); err != nil {
@@ -204,24 +210,46 @@ func samePinDir(parent, dfd int) error {
 	return nil
 }
 
-// Cleared is what ClearReleasePin removed.
+// Cleared is what ClearReleasePin did.
 type Cleared struct {
-	// Path is what was removed: the pin file, or the whole pin directory
-	// entry when it could not be trusted. Empty means there was nothing.
+	// Path is the pin file removed, or, when the pin directory entry could
+	// not be trusted, the pin directory recreated in its place. Empty means
+	// there was nothing to clear.
 	Path string
 	// Untrusted says why the pin directory entry could not be trusted, when
-	// the whole entry was removed.
+	// it was moved aside.
 	Untrusted string
+	// Aside is where the untrusted entry was moved, in the work dir. root
+	// never reads, walks or deletes it.
+	Aside string
 }
 
+// pinClearChecked is called after ClearReleasePin has judged the pin
+// directory entry and before it acts on it: a test seam for changing the
+// entry there.
+var pinClearChecked = func() {}
+
+// renameAsideHook is called after ClearReleasePin has moved an entry aside and
+// before it creates the fresh pin directory: a test seam for a writer racing
+// to plant a new entry there.
+var renameAsideHook = func() {}
+
+// maxAsideAttempts bounds how often ClearReleasePin moves an untrusted entry
+// aside and tries to create a fresh pin directory in its place, against a
+// writer that plants a new entry each time. Each attempt is constant work, so
+// no tree shape can make a clear fail; only a writer racing every attempt can.
+const maxAsideAttempts = 8
+
 // ClearReleasePin removes the release pin under workDir, as root. A trusted
-// pin directory keeps its place and loses only the pin. A pin directory entry
-// that cannot be trusted (a symlink, not a directory, another owner, writable
-// by its group or others) is removed whole, so a less privileged user cannot
-// block every update by planting one: a symlink or a file is unlinked, a
-// directory is emptied and removed, every step relative to the work dir's
-// descriptor and never following a symlink. A missing work dir, directory or
-// pin is not an error.
+// pin directory keeps its place and loses only the pin file. A pin directory
+// entry that cannot be trusted (a symlink, not a directory, another owner,
+// writable by its group or others) is renamed aside within the work dir,
+// as an entry, so a symlink moves as a link and is never followed, to a new
+// name update.untrusted-<unix nanoseconds> that no existing entry holds; a
+// fresh root-owned 0755 pin directory is then created in its place. The
+// aside entry is never read, walked or deleted, so no tree a less privileged
+// user plants, however deep or however often refilled, can stop the clear.
+// A missing work dir, directory or pin is not an error.
 func ClearReleasePin(workDir string) (Cleared, error) {
 	return clearReleasePin(workDir, 0)
 }
@@ -244,13 +272,8 @@ func clearReleasePin(workDir string, owner uint32) (Cleared, error) {
 		return Cleared{}, fmt.Errorf("clear the release pin: stat %s: %w", ReleasePinDir(workDir), err)
 	}
 	if p := statProblem(&st, owner, true); p != "" {
-		if err := removeAllAt(parent, releasePinDirName, 0); err != nil {
-			return Cleared{}, fmt.Errorf("clear the release pin: remove %s (%s): %w", ReleasePinDir(workDir), p, err)
-		}
-		if err := unix.Fsync(parent); err != nil {
-			return Cleared{}, fmt.Errorf("clear the release pin: sync %s: %w", workDir, err)
-		}
-		return Cleared{Path: ReleasePinDir(workDir), Untrusted: p}, nil
+		pinClearChecked()
+		return replaceUntrustedPinDir(parent, workDir, owner, p)
 	}
 	dfd, err := openPinDirAt(parent, workDir, owner)
 	if err != nil {
@@ -271,65 +294,67 @@ func clearReleasePin(workDir string, owner uint32) (Cleared, error) {
 	return Cleared{Path: ReleasePinPath(workDir)}, nil
 }
 
-// removeAllAt removes name in the directory dirfd and, when it is a
-// directory, everything under it, never following a symlink: anything but a
-// directory is unlinked; a directory is opened relative to dirfd with
-// O_NOFOLLOW, emptied the same way through its own descriptor, and removed.
-// A directory refilled while it is emptied is retried a bounded number of
-// times; the depth is bounded by maxClearDepth.
-func removeAllAt(dirfd int, name string, depth int) error {
-	if depth > maxClearDepth {
-		return fmt.Errorf("%s is nested deeper than %d directories", name, maxClearDepth)
+// replaceUntrustedPinDir moves the untrusted pin directory entry in parent
+// aside and creates a fresh pin directory in its place, retrying when another
+// entry appears at the pin directory's name in between. why is what made the
+// first entry untrusted.
+func replaceUntrustedPinDir(parent int, workDir string, owner uint32, why string) (Cleared, error) {
+	var first string
+	for range maxAsideAttempts {
+		aside, err := renameAside(parent)
+		if err != nil && !errors.Is(err, unix.ENOENT) {
+			return Cleared{}, fmt.Errorf("clear the release pin: move %s aside: %w", ReleasePinDir(workDir), err)
+		}
+		if first == "" && aside != "" {
+			first = aside
+		}
+		renameAsideHook()
+		err = unix.Mkdirat(parent, releasePinDirName, 0o755)
+		if errors.Is(err, unix.EEXIST) {
+			continue // planted again since the rename: move that aside too
+		}
+		if err != nil {
+			return Cleared{}, fmt.Errorf("clear the release pin: create %s: %w", ReleasePinDir(workDir), err)
+		}
+		dfd, err := openPinDirAt(parent, workDir, owner)
+		if err != nil {
+			// Swapped between the mkdir and the open: try again.
+			continue
+		}
+		err = unix.Fchmod(dfd, 0o755)
+		if err == nil {
+			err = unix.Fsync(parent)
+		}
+		_ = unix.Close(dfd)
+		if err != nil {
+			return Cleared{}, fmt.Errorf("clear the release pin: set up %s: %w", ReleasePinDir(workDir), err)
+		}
+		out := Cleared{Path: ReleasePinDir(workDir), Untrusted: why}
+		if first != "" {
+			out.Aside = filepath.Join(workDir, first)
+		}
+		return out, nil
 	}
-	var st unix.Stat_t
-	if err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return nil
-		}
-		return err
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
-		if err := unix.Unlinkat(dirfd, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
-			return err
-		}
-		return nil
-	}
-	for range 3 {
-		if err := emptyDirAt(dirfd, name, depth); err != nil {
-			return err
-		}
-		err := unix.Unlinkat(dirfd, name, unix.AT_REMOVEDIR)
-		if err == nil || errors.Is(err, unix.ENOENT) {
-			return nil
-		}
-		if !errors.Is(err, unix.ENOTEMPTY) {
-			return err
-		}
-	}
-	return fmt.Errorf("%s kept being refilled while it was removed", name)
+	return Cleared{}, fmt.Errorf("clear the release pin: %s was replaced again on each of %d attempts", ReleasePinDir(workDir), maxAsideAttempts)
 }
 
-// emptyDirAt removes every entry of the directory name in dirfd.
-func emptyDirAt(dirfd int, name string, depth int) error {
-	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return nil
+// renameAside renames the pin directory entry in parent, as an entry and
+// without following it, to update.untrusted-<unix nanoseconds>, refusing to
+// replace any existing entry (RENAME_EXCL) and picking a new name when one
+// exists. It returns the new name.
+func renameAside(parent int) (string, error) {
+	for i := range 16 {
+		name := releasePinDirName + ".untrusted-" + strconv.FormatInt(time.Now().UnixNano()+int64(i), 10)
+		err := unix.RenameatxNp(parent, releasePinDirName, parent, name, unix.RENAME_EXCL)
+		if errors.Is(err, unix.EEXIST) {
+			continue
 		}
-		return err
-	}
-	d := os.NewFile(uintptr(fd), name)
-	defer func() { _ = d.Close() }()
-	names, err := d.Readdirnames(-1)
-	if err != nil {
-		return err
-	}
-	for _, n := range names {
-		if err := removeAllAt(fd, n, depth+1); err != nil {
-			return err
+		if err != nil {
+			return "", err
 		}
+		return name, nil
 	}
-	return nil
+	return "", errors.New("no free aside name")
 }
 
 // readReleasePin reads the pin under workDir, held to the checks the pin
