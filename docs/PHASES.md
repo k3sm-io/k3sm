@@ -1509,6 +1509,61 @@ phases:
             met: false
             check: "hack/verify-site-clean.sh --sources is clean over the app pages and the release notes name the notarized disk image."
             method: e2e
+      - id: M18.7
+        title: the app updates itself and owns the version set (the signed release index, the verified swap and relaunch, the cluster roll pinned to the app's payload)
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M18.3
+          - k3sm:M18.6
+        note: "Authoritative input: docs/m18-7-plan.md (workspace), BINDING. The app ships by Developer ID direct distribution only (a signed, notarized disk image plus the install script); app vX bundles k3sm vX; the app checks that it is the latest release against a release index signed with the Developer ID and a secure timestamp, trust evaluated at the signing time, no new key; it downloads, verifies, swaps itself atomically and relaunches, with a journalled swap reconciled at every launch and a hardened admin-prompted path for standard users (a constant target, and root runs only the already-installed helper). After a self-update the app asks before rolling the cluster, and the roll binds to the app's verified bundled payload through a server-local release pin written by the installed CLI: no API change, the existing managed update chain and its workers-first order are unchanged. The macOS app's own source is out of tree; rows here cite k3sm-side checks."
+        deliverables:
+          - id: M18.7-d1
+            done: false
+            desc: "Out of tree, attended: the signing, notarization and LaunchServices spikes on macOS 26 and 27, and the recorded trust ruling (the requirement text, the timestamped index signer)."
+          - id: M18.7-d2
+            done: false
+            desc: "The release index contract owned here: docs/design/release-index.md (schema k3sm-release-index/v1, a context string, final releases only, minimumMacOS), a strict decoder in pkg/update, a committed golden fixture and the archive host pin list exported as a fixture the app compares against (pkg/update TestReleaseIndexSchemaGolden)."
+          - id: M18.7-d3
+            done: false
+            desc: "hack/release/publish.sh accepts the signed index and its stable alias as release assets, uploads them to the draft, re-checks them before --latest promotion, refuses a final without them and an rc with them (publish.sh --self-test-index)."
+          - id: M18.7-d4
+            done: false
+            desc: "The release pin: `k3sm update apply --pin-sha256 <hex>` (root only, no update in progress) writes a root-owned pin record in the server work directory before creating the Update, `--clear-pin` removes it, and the update controller's PinnedResolver requires the release checksums to equal a pin for the requested version, ending the Update Failed (ReleasePinMismatch) before any node is cordoned on a mismatch and recording ResolvedPinned on a match (pkg/updatectl TestPinnedResolverRefusesDigestMismatch, cmd/k3sm TestUpdateApplyPinRequiresRoot)."
+          - id: M18.7-d5
+            done: false
+            desc: "Out of tree: the app's update check (the exact payload tag and sealed release record in the bundle, the index decoder against this repo's golden fixture, the timestamped signature verifier, the check loop, its states and a request that sends no identifier of ours)."
+          - id: M18.7-d6
+            done: false
+            desc: "Out of tree: the verified download, the swap engine and helper (journal, launch reconcile, LaunchServices registration, the previous copy outside Applications), a gate that runs the shipped helper, and the hardened standard-user root path with its hostile-target test."
+          - id: M18.7-d7
+            done: false
+            desc: "Out of tree: the version-set offer after a self-update (asked once, refused while a node is NotReady or the server is more than one minor release behind), run through the pinned `update apply` of d4."
+          - id: M18.7-d8
+            done: false
+            desc: "Out of tree: the release integration (the index written from the publish seal, signed with a secure timestamp in the attended release, verified with the app's own verifier, uploaded through publish.sh) and a committed real signed index fixture."
+          - id: M18.7-d9
+            done: false
+            desc: "hack/lab/m18.sh --bundled-roll: on the two-Mac rig a matching pin rolls workers first and then the server, and a wrong pin ends Failed with no node touched."
+          - id: M18.7-d10
+            done: false
+            desc: "Out of tree, attended on macOS 26 and 27: install release N from the disk image, self-update to N+1, relaunch, the cluster question, the pinned roll, a broken N+1 rolled back, and the standard-user path."
+          - id: M18.7-d11
+            done: false
+            desc: "docs/user/upgrade.md and install.md describe the app path beside the unchanged CLI path and the pin flags; the privacy statement lists what the update check sends and what it still reveals; the CHANGELOG."
+        acceptance:
+          - id: M18.7-a1
+            met: false
+            check: "go test ./pkg/update -run TestReleaseIndexSchemaGolden, go test ./pkg/updatectl -run TestPinnedResolverRefusesDigestMismatch and go test ./cmd/k3sm -run TestUpdateApplyPinRequiresRoot pass, and hack/release/publish.sh --self-test-index passes."
+            method: unit
+          - id: M18.7-a2
+            met: false
+            check: "On the rig under K3SM_LAB=1, hack/lab/m18.sh --bundled-roll: a matching pin rolls workers first and then the server with ResolvedPinned; a wrong pin ends Failed with ReleasePinMismatch and no node cordoned. Met only by a recorded lab run."
+            method: lab
+          - id: M18.7-a3
+            met: false
+            check: "The attended end to end of d10 is recorded on macOS 26 and 27, and hack/verify-site-clean.sh --sources is clean over the updated user pages."
+            method: e2e
   - id: M19
     title: wasm RuntimeClass — WebAssembly workloads as native pods (the class, the node label, packaging, the user doc, the gates)
     status: todo
@@ -2421,6 +2476,16 @@ and switching to local-only network access on untrusted Wi-Fi as best-effort hyg
 
 ### M18.6 — distribution ⬜
 The first signed and notarized release of both channels, the cask, and the closed-source note.
+
+### M18.7: the app updates itself and owns the version set ⬜
+`docs/m18-7-plan.md` is authoritative (encoded 2026-10-18). The app checks that it is the latest
+release against an index signed with the project's Developer ID and a secure timestamp, downloads
+the new disk image, verifies it, swaps itself in one step and relaunches; a failed launch rolls back.
+Each app release carries the k3sm release it was built with. After an update the app asks before
+updating the cluster, and that update installs exactly the k3sm release inside the app: the
+installed CLI records the release digest the app vouches for, and the cluster refuses the update
+before touching any node if the published release disagrees. A hard cut: no API change, and the
+existing workers-first update is unchanged.
 
 ## M19 — wasm RuntimeClass: WebAssembly workloads as native pods ⬜
 `docs/m19-plan.md` is authoritative (encoded 2026-10-10). M19 adds a fourth execution path beside
