@@ -1,0 +1,22 @@
+{
+  "schema": "k3sm-release-index/v1",
+  "context": "io.k3sm.release-index/v1",
+  "issuedAt": "2026-11-02T18:04:11Z",
+  "tag": "v0.2.0",
+  "minimumMacOS": "26.0",
+  "app": {
+    "bundleID": "io.k3sm.app",
+    "shortVersion": "0.2.0",
+    "image": {
+      "name": "k3sm_0.2.0_darwin_arm64.dmg",
+      "url": "https://github.com/k3sm-io/k3sm/releases/download/v0.1.0/k3sm_0.2.0_darwin_arm64.dmg",
+      "sha256": "6105d6cc76af400325e94d588ce511be5bfdbb73b437dc51eca43917d7a43e3d",
+      "size": 123456789
+    }
+  },
+  "k3sm": {
+    "archive": "k3sm_0.2.0_darwin_arm64.tar.gz",
+    "archiveSHA256": "0eb3e36bfb24dcd9bb1d1bece1531216b59539a8fde17ee80224af0653c92aa3",
+    "payloadManifestSHA256": "05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f"
+  }
+}
