@@ -98,6 +98,19 @@ const diskPressureTripFreeBytes int64 = 2 << 30
 // level that clears this condition.
 const diskPressureClearFreeBytes int64 = 10 << 30
 
+// DiskPressure's swap-volume leg. When the swap volume sits in a different APFS
+// container from the data root (hostStats.SwapVolumeSeparate), its free space is
+// a pool the data-root leg cannot see, so DiskPressure also trips when
+// swapfs.available is under its floor (swapfsFloor, the same floor as the swap
+// arm's space leg). It clears at swapfsDiskPressureClearNum/Den of the floor,
+// 1.5x: the critical rung of the swapfs.available ladder, the first level above
+// the hard floor. On the stock layout the two share one container and this leg
+// never runs; the data-root leg already covers the shared free space.
+const (
+	swapfsDiskPressureClearNum int64 = 3
+	swapfsDiskPressureClearDen int64 = 2
+)
+
 // pidPressureUsedPercent is the fraction, in percent, of a process ceiling above
 // which k3sm raises PIDPressure. Upstream Kubernetes ships NO default
 // pid.available eviction threshold, so this is a k3sm-specific default, not a
@@ -246,6 +259,13 @@ type hostStats struct {
 	// sampled witness (zero means "not sampled" and the swap arm cannot fire).
 	SwapVolumeAvailableBytes int64
 	SwapVolumeCapacityBytes  int64
+	// SwapVolumeSeparate is true when the swap volume and the data root's volume
+	// sit in different APFS containers, and so draw on different free space. The
+	// sampler compares the containers named by each volume's f_mntfromname
+	// (apfsContainer), never f_fsid: every APFS volume has its own fsid even when
+	// it shares a container. The zero value, false, is the stock layout and leaves
+	// DiskPressure to the data-root leg.
+	SwapVolumeSeparate bool
 
 	// history is stamped by the pressure monitor from the samples before this
 	// one: the memory-pressure hysteresis hold and the previous swap reading.
@@ -293,9 +313,11 @@ func computeNodeConditions(s hostStats, now metav1.Time) []corev1.NodeCondition 
 	}
 
 	// DiskPressure: the TRIP edge only — True iff free space on the data-root
-	// volume is below the absolute diskPressureTripFreeBytes floor. The clear edge
-	// is reconcileTransitions'. A zero (unsampled) capacity is no pressure rather
-	// than a comparison against a snapshot that was never taken.
+	// volume is below the absolute diskPressureTripFreeBytes floor, or the swap
+	// volume is a separate container under its swapfs.available floor
+	// (swapfsDiskPressured). The clear edge is reconcileTransitions'. A zero
+	// (unsampled) capacity is no pressure rather than a comparison against a
+	// snapshot that was never taken.
 	disk := corev1.NodeCondition{
 		Type:               corev1.NodeDiskPressure,
 		Status:             corev1.ConditionFalse,
@@ -304,10 +326,16 @@ func computeNodeConditions(s hostStats, now metav1.Time) []corev1.NodeCondition 
 		LastHeartbeatTime:  now,
 		LastTransitionTime: now,
 	}
-	if s.DiskCapacityBytes > 0 && s.DiskAvailableBytes < diskPressureTripFreeBytes {
+	switch {
+	case s.DiskCapacityBytes > 0 && s.DiskAvailableBytes < diskPressureTripFreeBytes:
 		disk.Status = corev1.ConditionTrue
 		disk.Reason = diskPressureReason
 		disk.Message = diskPressureMessage
+	case swapfsDiskPressured(s):
+		disk.Status = corev1.ConditionTrue
+		disk.Reason = diskPressureReason
+		disk.Message = fmt.Sprintf("%s: %s %s on the swap volume (floor %s)", diskPressureMessage,
+			signalSwapfs, formatBytes(s.SwapVolumeAvailableBytes), formatBytes(swapfsFloor(s.MemCapacityBytes)))
 	}
 
 	// PIDPressure: True iff either leg of pidPressured trips; the Message names
@@ -359,7 +387,8 @@ func computeNodeConditions(s hostStats, now metav1.Time) []corev1.NodeCondition 
 //     space recovers to diskPressureClearFreeBytes. Between the two levels the
 //     previous verdict wins in BOTH directions — a node on the way down stays
 //     False until it crosses the trip floor, and a node on the way up stays True
-//     until it crosses the clear level.
+//     until it crosses the clear level. A separate swap volume has the same
+//     trigger between its swapfs.available floor and 1.5x that floor.
 //  2. LastTransitionTime preservation. computeNodeConditions stamps every
 //     condition with now, which is correct only for a condition that just
 //     changed. Emitting it verbatim every heartbeat would restart "time under
@@ -381,12 +410,13 @@ func reconcileTransitions(prev, next []corev1.NodeCondition, s hostStats) []core
 			p.Status == corev1.ConditionTrue && out[i].Status == corev1.ConditionFalse &&
 			diskInHysteresisBand(s) {
 			// Held, not re-raised: the node is still short of the clear level, so it
-			// reports the SAME Reason/Message it reported when it tripped. A distinct
-			// "recovering" vocabulary would be a second string for one node state, and
-			// consumers key off Status, not prose.
+			// reports the SAME Reason/Message it reported when it tripped (which
+			// names the swap volume when that leg tripped). A distinct "recovering"
+			// vocabulary would be a second string for one node state, and consumers
+			// key off Status, not prose.
 			out[i].Status = corev1.ConditionTrue
 			out[i].Reason = diskPressureReason
-			out[i].Message = diskPressureMessage
+			out[i].Message = p.Message
 		}
 		if p != nil && p.Status == out[i].Status {
 			out[i].LastTransitionTime = p.LastTransitionTime
@@ -397,10 +427,24 @@ func reconcileTransitions(prev, next []corev1.NodeCondition, s hostStats) []core
 
 // diskInHysteresisBand reports whether s sits below the DiskPressure clear level
 // on a volume that was actually sampled — i.e. whether an already-raised
-// DiskPressure must stay raised. It is false for an unsampled snapshot, so a
-// sampler failure can never wedge the condition True.
+// DiskPressure must stay raised. That is the data-root volume under
+// diskPressureClearFreeBytes, or a separate swap volume under 1.5x its
+// swapfs.available floor. Either band holds the condition, whichever leg raised
+// it: a node in one band is not yet clear of disk pressure. It is false for an
+// unsampled snapshot, so a sampler failure can never wedge the condition True.
 func diskInHysteresisBand(s hostStats) bool {
-	return s.DiskCapacityBytes > 0 && s.DiskAvailableBytes < diskPressureClearFreeBytes
+	if s.DiskCapacityBytes > 0 && s.DiskAvailableBytes < diskPressureClearFreeBytes {
+		return true
+	}
+	return s.SwapVolumeSeparate && s.SwapVolumeCapacityBytes > 0 &&
+		s.SwapVolumeAvailableBytes < swapfsFloor(s.MemCapacityBytes)*swapfsDiskPressureClearNum/swapfsDiskPressureClearDen
+}
+
+// swapfsDiskPressured is DiskPressure's swap-volume trip: the swap volume sits in
+// a different container from the data root, was sampled, and has less free space
+// than its swapfs.available floor. Swap use plays no part; this is a disk fact.
+func swapfsDiskPressured(s hostStats) bool {
+	return s.SwapVolumeSeparate && swapfsLeg(s)
 }
 
 // findNodeCondition returns a pointer to the condition of type typ in conds, or

@@ -19,6 +19,7 @@ package provider
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -79,6 +80,10 @@ func sampleHostStats(dataRoot string) (hostStats, error) {
 	if err != nil {
 		return hostStats{}, fmt.Errorf("sample memory headroom: %w", err)
 	}
+	separate, err := swapVolumeSeparate(dataRoot)
+	if err != nil {
+		return hostStats{}, fmt.Errorf("compare the swap volume with the data root: %w", err)
+	}
 
 	return hostStats{
 		MemAvailableBytes:        memAvail,
@@ -95,7 +100,32 @@ func sampleHostStats(dataRoot string) (hostStats, error) {
 		SwapUsedBytes:            head.swapUsed,
 		SwapVolumeAvailableBytes: head.swapVolumeAvailable,
 		SwapVolumeCapacityBytes:  head.swapVolumeCapacity,
+		SwapVolumeSeparate:       separate,
 	}, nil
+}
+
+// apfsContainer returns the container part of a volume's f_mntfromname: the
+// whole disk an APFS volume lives in. "/dev/disk3s6" (the swap volume),
+// "/dev/disk3s7" (a data volume) and "/dev/disk3s1s1" (the sealed system
+// snapshot) all name container "disk3", so they share free space. A name that is
+// not a /dev/disk<N> device is returned whole, so two such volumes compare equal
+// only when they name the same source.
+//
+// f_fsid cannot answer this: APFS gives every volume its own fsid, including
+// volumes that share a container.
+func apfsContainer(mntfrom string) string {
+	rest, ok := strings.CutPrefix(mntfrom, "/dev/disk")
+	if !ok {
+		return mntfrom
+	}
+	n := 0
+	for n < len(rest) && rest[n] >= '0' && rest[n] <= '9' {
+		n++
+	}
+	if n == 0 || (n < len(rest) && rest[n] != 's') {
+		return mntfrom
+	}
+	return "disk" + rest[:n]
 }
 
 // memoryHeadroom is the raw reading behind the compressor and swap arms of
