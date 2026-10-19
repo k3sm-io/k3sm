@@ -63,10 +63,13 @@ func joinedClaim() bootstrap.MeshClaim {
 }
 
 // stubServer returns a REST config whose every request h serves in-process, so
-// no socket is opened (handlerTransport).
+// no socket is opened (handlerTransport). A negative QPS turns off client-go's
+// client-side limiter (5 QPS by default), which only paced the in-process
+// requests: the concurrent-enroll tests spent seconds waiting on it, and with it
+// off their joins contend harder, not less.
 func stubServer(t *testing.T, h http.Handler) *rest.Config {
 	t.Helper()
-	return &rest.Config{Host: "http://apiserver.invalid", Transport: handlerTransport{h}}
+	return &rest.Config{Host: "http://apiserver.invalid", Transport: handlerTransport{h}, QPS: -1}
 }
 
 // handlerTransport is an http.RoundTripper that answers every request by calling

@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -34,7 +35,11 @@ import (
 )
 
 // pipeAPIServer is an apiserverLeafDial whose far end is an in-memory TLS
-// server presenting certPEM/keyPEM, so the handshake runs with no socket.
+// server presenting certPEM/keyPEM, so the handshake runs with no socket. After
+// the handshake the server reads until the client is gone: a net.Pipe write
+// blocks until the far end reads, so a server that went straight to Close would
+// leave the client's close_notify (and its own) blocked until crypto/tls's
+// five-second close deadline.
 func pipeAPIServer(t *testing.T, certPEM, keyPEM []byte) apiserverLeafDial {
 	t.Helper()
 	pair, err := tls.X509KeyPair(certPEM, keyPEM)
@@ -45,7 +50,9 @@ func pipeAPIServer(t *testing.T, certPEM, keyPEM []byte) apiserverLeafDial {
 		client, server := net.Pipe()
 		go func() {
 			srv := tls.Server(server, &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12})
-			_ = srv.HandshakeContext(ctx)
+			if srv.HandshakeContext(ctx) == nil {
+				_, _ = io.Copy(io.Discard, srv)
+			}
 			_ = srv.Close()
 		}()
 		return client, nil
