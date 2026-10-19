@@ -11,13 +11,13 @@ fixes whatever is down sits at the bottom.
 A healthy cluster looks like this:
 
 ```
-k3sm running: 1/1 nodes ready                               v0.1.1 · kube v1.36.2 · macOS 26.1
+k3sm running: 1/1 nodes ready                               v0.1.1 · kube v1.37.1 · macOS 26.1
 
     install     ok          /Library/k3sm/k3sm · launcher /usr/local/bin/k3sm · 2 LaunchDaemons in /Library/LaunchDaemons
     netd        running     pid 512 · socket /var/lib/k3sm/run/netd.sock
     server      running     pid 840
     apiserver   ready       https://127.0.0.1:6444 readyz ok
-    node        ready       1/1 nodes ready · my-mac kubelet v1.36.2
+    node        ready       1/1 nodes ready · my-mac kubelet v1.37.1
     workloads   ok          3 running
     data-root   ok          /var/lib/k3sm (apfs volume k3sm, 29.9G of 100G used, mounted)
     datastore   ok          kine sqlite, wal, user_version 1
@@ -30,7 +30,7 @@ A control plane that will not start looks like this. The verdict names the cause
 quotes the last line of its log:
 
 ```
-k3sm stopped: io.k3sm.server is crash-looping (12 runs, last exit 1)  v0.1.1 · kube v1.36.2 · macOS 26.1
+k3sm stopped: io.k3sm.server is crash-looping (12 runs, last exit 1)  v0.1.1 · kube v1.37.1 · macOS 26.1
 
     install     ok          /Library/k3sm/k3sm · launcher /usr/local/bin/k3sm · 2 LaunchDaemons in /Library/LaunchDaemons
     netd        running     pid 512 · socket /var/lib/k3sm/run/netd.sock
@@ -533,7 +533,7 @@ Work through this in order.
   `k3sm status` prints this exact command in the workloads row once a Pod has been stuck
   terminating on a `NotReady` node for more than two minutes, so you rarely have to type it from
   memory. The taint tells the pod garbage collector it may finish deleting Pods bound to that node.
-  It rechecks every 20 seconds (the pinned v1.36 podgc interval), so a stuck Pod clears within
+  It rechecks every 20 seconds (the pinned v1.37 podgc interval), so a stuck Pod clears within
   about that long of the taint landing.
 - **Remove the taint once the node is back:**
 

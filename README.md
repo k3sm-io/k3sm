@@ -40,6 +40,7 @@ k3sm ships as a single binary. Its subcommands:
 | `kubeconfig` | Print the admin kubeconfig, or write/merge it into `~/.kube/config` |
 | `status` | Show what is running (daemons, apiserver, node, workloads, data root), with a one-line verdict and the fix for whatever is down |
 | `alerts` | List only what needs attention, each with its cause, the evidence, numbered fix steps and the docs page (`-o json` for scripts and tools) |
+| `update` | Check for a newer release, or roll the whole cluster to one, workers first and the server last (`update check\|apply\|status\|cancel\|abort`) |
 | `doctor` | Run preflight environment and datastore-posture checks |
 | `netd` | Run the root-privileged network helper (launched by its own daemon) |
 | `dev` | Bring up a disposable single-node cluster for local development |
@@ -121,8 +122,9 @@ including the resource model, NetworkPolicy's reduced scope, and the per-pod iso
 
 ## How the pieces fit together
 
-k3sm is one of five code repositories under the `k3sm-io` GitHub organization, beside a sixth
-that publishes the Linux guest the `vm` RuntimeClass boots. `apis` defines the shared contracts;
+k3sm is one of seven code repositories under the `k3sm-io` GitHub organization (`apis`, `runtimed`,
+`darwin-net`, `k3sm`, `app` and the C++ and Swift SDKs), beside a separate release repository that
+publishes the Linux guest the `vm` RuntimeClass boots. `apis` defines the shared contracts;
 `runtimed` and `darwin-net` implement the node-level primitives; this repo assembles all three
 into the single binary a user installs; `app` is the macOS app on top of it.
 
