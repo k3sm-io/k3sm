@@ -2091,7 +2091,8 @@ func (r *runtimedRuntime) dispatchCurrent(ctx context.Context, id string) {
 // DeletePod runs the pod's preStop hooks, then stops the pod's processes and
 // forgets the bookkeeping. Idempotent. The SIGTERM→SIGKILL grace window is the pod's
 // termination budget (deletion/termination grace, k8s 30s default) MINUS the preStop
-// wall-time (floored at 1s), since runtimed treats a 0 grace as immediate-kill.
+// wall-time, floored at minimumGracePeriodSeconds (2s) the way the kubelet floors
+// it, since in the apis contract a 0 grace is an immediate kill.
 func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
 	r.forgetRetained(id)
@@ -2117,8 +2118,10 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// An evicted pod's processes are already gone (evictPod stopped them), so
 	// there is nothing for a preStop hook to run in: finish the teardown it left
 	// for this call (the /32, the log tree, the track, the apiserver object).
+	// The grace is the floor, not 0: runtimed already forgot the pod, and wire 0
+	// is reserved for evictPod's immediate kill.
 	if t != nil && t.evictedStatus() != nil {
-		return r.teardownPod(ctx, pod, 0, nil)
+		return r.teardownPod(ctx, pod, minimumGracePeriodSeconds, nil)
 	}
 	// The kubelet's killContainer records Killing for each container it stops
 	// before the preStop hook and the stop itself: one per container last
@@ -2130,7 +2133,8 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	}
 	// Serve preStop hooks BEFORE termination: runtimed sends SIGTERM
 	// synchronously inside DeletePod, so the provider runs preStop first and passes
-	// the RESIDUAL grace (the budget minus the hook's wall-time, floored at 1s).
+	// the RESIDUAL grace (the budget minus the hook's wall-time, floored at
+	// minimumGracePeriodSeconds, 2s).
 	// best-effort — a failed hook is logged inside runPreStop, the delete proceeds.
 	grace := r.runPreStop(ctx, pod)
 	return r.teardownPod(ctx, pod, grace, nil)
@@ -2166,9 +2170,12 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 // (pkg/kubelet/kuberuntime/kuberuntime_container.go, v1.36.2) then skips the
 // preStop hook (it runs only when the grace budget is above 0) and floors the
 // grace it hands the runtime at minimumGracePeriodInSeconds (2 s): upstream sends
-// SIGTERM and SIGKILLs two seconds later. k3sm sends grace 0, which runtimed
-// renders as an immediate SIGKILL. The skipped preStop matches upstream; the
-// missing 2 s SIGTERM window is a deliberate k3sm divergence: the pod is
+// SIGTERM and SIGKILLs two seconds later. k3sm sends grace 0, the apis
+// contract's immediate kill (DeletePodRequest.grace_period_seconds: 0 means
+// immediate SIGKILL). evictPod is the only sender of 0: every other DeletePod
+// floors its grace at minimumGracePeriodSeconds (floorGrace). The skipped
+// preStop matches upstream; the missing 2 s SIGTERM window is a deliberate k3sm
+// divergence: the pod is
 // evicted because the node is about to run out of memory, and two more seconds
 // of an incompressible fill on a Mac can carry the compressor from the trip
 // value to the kernel's own kill point.

@@ -1313,10 +1313,13 @@ func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
 		delete(r.compensating, podID)
 		r.mu.Unlock()
 	}()
+	// The pod's own grace, floored, as an ordinary delete resolves it. Wire 0
+	// is the apis contract's immediate kill, which only evictPod sends.
+	grace := floorGrace(graceSeconds(pod))
 	backoff := newCrashLoopBackoff(r.clk)
 	for {
 		_, err := r.rt.DeletePod(context.Background(),
-			&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: 0})
+			&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: grace})
 		if err == nil {
 			return
 		}

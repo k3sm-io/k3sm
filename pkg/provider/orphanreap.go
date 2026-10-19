@@ -277,7 +277,7 @@ func (r *runtimedRuntime) reapOrphan(ctx context.Context, pod *corev1.Pod, t *po
 		"namespace", pod.Namespace, "name", pod.Name, "uid", id,
 		"consecutiveNotFound", orphanReapThreshold)
 	t.quiesce()
-	if err := r.teardownPod(ctx, pod, graceSeconds(pod), t); err != nil {
+	if err := r.teardownPod(ctx, pod, floorGrace(graceSeconds(pod)), t); err != nil {
 		r.log.Warn("orphan reaper: teardown failed; retrying next tick",
 			"namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return
