@@ -51,6 +51,9 @@ type Release struct {
 	URL string
 	// SHA256 is the archive's lowercase hex sha256.
 	SHA256 string
+	// Pinned is set by PinnedResolver when SHA256 equals the release pin for
+	// Version.
+	Pinned bool
 }
 
 // Resolver resolves a release tag to its darwin/arm64 archive.

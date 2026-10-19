@@ -61,6 +61,8 @@ Usage:
   k3sm update check [-o text|json]
   k3sm update apply [--version <tag>] [--drain] [--allow-downgrade]
                     [--signature if-signed|required] [--yes]
+                    [--pin-sha256 <digest>]
+  k3sm update apply --clear-pin
   k3sm update status [-o text|json] [--watch]
   k3sm update cancel
   k3sm update abort
@@ -94,6 +96,17 @@ Flags:
                       default if-signed: the installed build's signer)
   --yes               do not ask for confirmation (apply; required when
                       stdin is not a terminal)
+  --pin-sha256 <digest>
+                      bind the roll to this darwin/arm64 archive sha256 (apply;
+                      root only; needs --version): the release pin is written
+                      to the server before the Update is created, and the
+                      update controller refuses the release, before any node
+                      is cordoned, unless its checksums file carries exactly
+                      this digest
+  --clear-pin         remove the release pin and exit (apply; root only); a pin
+                      directory that cannot be trusted is moved aside, and the
+                      aside entries stay in the work dir for the service user
+                      to remove
   --watch             keep printing until the update finishes (status)
 
 Every subcommand but check reaches the cluster with the credentials
@@ -124,6 +137,13 @@ type updateEnv struct {
 	// watchEvery is how often `status --watch` re-reads; zero is
 	// updateWatchEvery.
 	watchEvery time.Duration
+	// root is whether this process runs as root, the only identity that may
+	// write or clear the release pin.
+	root bool
+	// writePin and clearPin write and remove the release pin under workDir;
+	// nil means updatectl.WriteReleasePin and updatectl.ClearReleasePin.
+	writePin func(workDir string, pin updatectl.ReleasePin) error
+	clearPin func(workDir string) (updatectl.Cleared, error)
 }
 
 // newUpdateEnv wires the production environment: the GitHub release index, the
@@ -138,6 +158,7 @@ func newUpdateEnv() updateEnv {
 		inputs:  update.Inputs{BaseURL: checkBase(installedReleaseBase(role)), Installed: version.Get()},
 		workDir: workDir,
 		in:      os.Stdin,
+		root:    euid == 0,
 	}
 	if fi, err := os.Stdin.Stat(); err == nil {
 		env.inTerminal = fi.Mode()&fs.ModeCharDevice != 0
@@ -663,6 +684,8 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 	allowDowngrade := fsFlags.Bool("allow-downgrade", false, "permit a release older than a node runs")
 	signature := fsFlags.String("signature", string(updatesv1alpha1.UpdateSignatureIfSigned), "code-signature policy: if-signed or required")
 	yes := fsFlags.Bool("yes", false, "do not ask for confirmation")
+	pinSHA := fsFlags.String("pin-sha256", "", "bind the roll to this archive sha256 (root only; needs --version)")
+	clearPin := fsFlags.Bool("clear-pin", false, "remove the release pin and exit (root only)")
 	if err := fsFlags.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -670,6 +693,29 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 	if fsFlags.NArg() > 0 || (sig != updatesv1alpha1.UpdateSignatureIfSigned && sig != updatesv1alpha1.UpdateSignatureRequired) {
 		fmt.Fprint(env.errOut, updateUsage)
 		return exitUsage
+	}
+	if *clearPin {
+		return runUpdateClearPin(fsFlags, env)
+	}
+	pinning := false // --pin-sha256 was given, even empty
+	fsFlags.Visit(func(f *flag.Flag) { pinning = pinning || f.Name == "pin-sha256" })
+	if pinning {
+		if !env.root {
+			fmt.Fprintln(env.errOut, "k3sm update apply: --pin-sha256 writes the server's release pin and must run as root")
+			return exitInternalError
+		}
+		if *tag == "" {
+			fmt.Fprintln(env.errOut, "k3sm update apply: --pin-sha256 binds one release; name it with --version")
+			return exitUsage
+		}
+		if err := (updatectl.ReleasePin{Version: *tag, SHA256: *pinSHA}).Validate(); err != nil {
+			fmt.Fprintln(env.errOut, "k3sm update apply: --pin-sha256:", err)
+			return exitUsage
+		}
+		if env.workDir == "" {
+			fmt.Fprintln(env.errOut, "k3sm update apply: no server work dir to write the release pin in")
+			return exitInternalError
+		}
 	}
 	if *tag != "" && !version.ValidTag(*tag) {
 		fmt.Fprintf(env.errOut, "k3sm update apply: --version %q is not a release tag\n", status.ClipText(*tag, 128))
@@ -718,6 +764,21 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 			return exitInternalError
 		}
 	}
+	if pinning {
+		// Before the Update exists, so the controller's first resolve already
+		// sees the pin. No Update is in progress (refused above), so no roll
+		// has resolved its release yet.
+		write := env.writePin
+		if write == nil {
+			write = updatectl.WriteReleasePin
+		}
+		pin := updatectl.ReleasePin{Version: target, SHA256: *pinSHA, At: time.Now().UTC().Truncate(time.Second)}
+		if err := write(env.workDir, pin); err != nil {
+			fmt.Fprintln(env.errOut, "k3sm update apply:", err)
+			return exitInternalError
+		}
+		fmt.Fprintf(env.out, "Pinned %s to sha256:%s.\n", status.ClipText(target, 128), *pinSHA)
+	}
 	if existing != nil {
 		uid := existing.UID
 		err := dyn.Resource(updateGVR).Delete(ctx, updatesv1alpha1.UpdateName, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
@@ -733,6 +794,11 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 		Verify:         updatesv1alpha1.UpdateVerify{Signature: sig},
 		AllowDowngrade: *allowDowngrade,
 	})
+	if err == nil && pinning {
+		// The controller refuses this Update unless a trusted pin for target
+		// matches, so a pin lost before it resolves fails the roll closed.
+		obj.SetAnnotations(map[string]string{updatectl.ReleasePinRequiredAnnotation: target})
+	}
 	if err == nil {
 		_, err = dyn.Resource(updateGVR).Create(ctx, obj, metav1.CreateOptions{})
 	}
@@ -741,6 +807,58 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 		return exitInternalError
 	}
 	fmt.Fprintf(env.out, "Created the Update %s to %s. Follow it with `k3sm update status --watch`.\n", updatesv1alpha1.UpdateName, status.ClipText(target, 128))
+	return 0
+}
+
+// runUpdateClearPin is `k3sm update apply --clear-pin`: remove the release pin
+// and exit. It takes no other apply flag and reaches no cluster.
+func runUpdateClearPin(fsFlags *flag.FlagSet, env updateEnv) int {
+	other := ""
+	fsFlags.Visit(func(f *flag.Flag) {
+		if f.Name != "clear-pin" && f.Name != "yes" {
+			other = f.Name
+		}
+	})
+	if other != "" {
+		fmt.Fprintf(env.errOut, "k3sm update apply: --clear-pin takes no other flag (got --%s)\n", other)
+		return exitUsage
+	}
+	if !env.root {
+		fmt.Fprintln(env.errOut, "k3sm update apply: --clear-pin removes the server's release pin and must run as root")
+		return exitInternalError
+	}
+	if env.workDir == "" {
+		fmt.Fprintln(env.errOut, "k3sm update apply: no server work dir to remove the release pin from")
+		return exitInternalError
+	}
+	remove := env.clearPin
+	if remove == nil {
+		remove = updatectl.ClearReleasePin
+	}
+	cleared, err := remove(env.workDir)
+	var contested *updatectl.PinDirContestedError
+	if errors.As(err, &contested) {
+		fmt.Fprintf(env.errOut, "k3sm update apply: %s was replaced again after each of %d attempts to move it aside.\n", contested.Dir, contested.Attempts)
+		for _, a := range contested.Asides {
+			fmt.Fprintln(env.errOut, "  moved aside:", a)
+		}
+		fmt.Fprintf(env.errOut, "Stop the server, clear the pin again, then start the server:\n  %s\n", updatectl.PinClearRecovery)
+		return exitInternalError
+	}
+	if err != nil {
+		fmt.Fprintln(env.errOut, "k3sm update apply:", err)
+		return exitInternalError
+	}
+	switch {
+	case cleared.Path == "":
+		fmt.Fprintln(env.out, "There is no release pin.")
+	case cleared.Untrusted != "":
+		fmt.Fprintf(env.out, "Moved %s aside to %s: it could not be trusted (%s). Created a fresh %s; nothing is pinned.\n",
+			cleared.Path, strings.Join(cleared.Asides, ", "), cleared.Untrusted, cleared.Path)
+		fmt.Fprintln(env.out, "The aside entries stay in the work dir; they belong to the service user, which may remove them.")
+	default:
+		fmt.Fprintf(env.out, "Removed the release pin %s.\n", cleared.Path)
+	}
 	return 0
 }
 

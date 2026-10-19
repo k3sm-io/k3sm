@@ -39,6 +39,12 @@ limitations under the License.
 //     release's checksums file) and recorded in status.resolved. A release
 //     that does not exist, or whose checksums name no archive, fails the roll
 //     before any node is cordoned.
+//   - When root has pinned the target (`k3sm update apply --pin-sha256`,
+//     the release pin under the server work dir, read by PinnedResolver), the
+//     checksums digest must equal the pin: a mismatch, a missing entry, or a
+//     pin that cannot be trusted fails the roll with the reason
+//     ReleasePinMismatch before any node is cordoned, and a match is recorded
+//     with the reason ResolvedPinned. A pin for another version is ignored.
 //   - The node is cordoned. A node an operator had already cordoned stays
 //     cordoned after the update: only a cordon this controller made (marked by
 //     the CordonedAnnotation) is lifted.
