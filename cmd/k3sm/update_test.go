@@ -900,6 +900,25 @@ func TestUpdateApplyPinRequiresRoot(t *testing.T) {
 		}
 	})
 
+	t.Run("a contested clear names every aside and the recovery", func(t *testing.T) {
+		c := newUpdateCluster(server)
+		asides := []string{"/w/update.untrusted-1", "/w/update.untrusted-2"}
+		code, _, errOut := c.runWith(t, func(env *updateEnv) {
+			env.root, env.workDir = true, t.TempDir()
+			env.clearPin = func(string) (updatectl.Cleared, error) {
+				return updatectl.Cleared{}, &updatectl.PinDirContestedError{Dir: "/w/update", Attempts: 8, Asides: asides}
+			}
+		}, "apply", "--clear-pin")
+		if code != exitInternalError {
+			t.Fatalf("exit %d, stderr %s", code, errOut)
+		}
+		for _, want := range append(asides, "sudo launchctl bootout system/io.k3sm.server", "sudo k3sm update apply --clear-pin", "8 attempts") {
+			if !strings.Contains(errOut, want) {
+				t.Errorf("stderr lacks %q:\n%s", want, errOut)
+			}
+		}
+	})
+
 	t.Run("without the flags apply never touches the pin", func(t *testing.T) {
 		c := newUpdateCluster(server)
 		var p pins

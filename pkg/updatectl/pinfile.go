@@ -27,9 +27,12 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // Every operation on the release pin runs relative to directory descriptors,
@@ -222,6 +225,10 @@ type Cleared struct {
 	// Aside is where the untrusted entry was moved, in the work dir. root
 	// never reads, walks or deletes it.
 	Aside string
+	// Asides are every entry moved aside, Aside first, when a writer planted
+	// a new entry between the rename and the mkdir. They accumulate in the
+	// work dir and are the service user's to remove.
+	Asides []string
 }
 
 // pinClearChecked is called after ClearReleasePin has judged the pin
@@ -249,7 +256,11 @@ const maxAsideAttempts = 8
 // fresh root-owned 0755 pin directory is then created in its place. The
 // aside entry is never read, walked or deleted, so no tree a less privileged
 // user plants, however deep or however often refilled, can stop the clear.
-// A missing work dir, directory or pin is not an error.
+// Aside entries accumulate in the work dir and are the service user's to
+// remove. A writer that replants the entry after every attempt makes the
+// clear give up with a *PinDirContestedError naming the asides and the
+// recovery (PinClearRecovery). A missing work dir, directory or pin is not an
+// error.
 func ClearReleasePin(workDir string) (Cleared, error) {
 	return clearReleasePin(workDir, 0)
 }
@@ -297,16 +308,17 @@ func clearReleasePin(workDir string, owner uint32) (Cleared, error) {
 // replaceUntrustedPinDir moves the untrusted pin directory entry in parent
 // aside and creates a fresh pin directory in its place, retrying when another
 // entry appears at the pin directory's name in between. why is what made the
-// first entry untrusted.
+// first entry untrusted. Aside entries accumulate in the work dir; they are
+// the service user's to remove, and root never touches them again.
 func replaceUntrustedPinDir(parent int, workDir string, owner uint32, why string) (Cleared, error) {
-	var first string
+	var asides []string
 	for range maxAsideAttempts {
 		aside, err := renameAside(parent)
 		if err != nil && !errors.Is(err, unix.ENOENT) {
 			return Cleared{}, fmt.Errorf("clear the release pin: move %s aside: %w", ReleasePinDir(workDir), err)
 		}
-		if first == "" && aside != "" {
-			first = aside
+		if aside != "" {
+			asides = append(asides, filepath.Join(workDir, aside))
 		}
 		renameAsideHook()
 		err = unix.Mkdirat(parent, releasePinDirName, 0o755)
@@ -329,13 +341,42 @@ func replaceUntrustedPinDir(parent int, workDir string, owner uint32, why string
 		if err != nil {
 			return Cleared{}, fmt.Errorf("clear the release pin: set up %s: %w", ReleasePinDir(workDir), err)
 		}
-		out := Cleared{Path: ReleasePinDir(workDir), Untrusted: why}
-		if first != "" {
-			out.Aside = filepath.Join(workDir, first)
+		out := Cleared{Path: ReleasePinDir(workDir), Untrusted: why, Asides: asides}
+		if len(asides) > 0 {
+			out.Aside = asides[0]
 		}
 		return out, nil
 	}
-	return Cleared{}, fmt.Errorf("clear the release pin: %s was replaced again on each of %d attempts", ReleasePinDir(workDir), maxAsideAttempts)
+	return Cleared{}, &PinDirContestedError{Dir: ReleasePinDir(workDir), Attempts: maxAsideAttempts, Asides: asides}
+}
+
+// PinDirContestedError is ClearReleasePin giving up because a new entry
+// appeared at the pin directory's name after each of its attempts to move one
+// aside: something running as the service user is replanting it. Asides are
+// the entries it moved aside, each left in the work dir.
+type PinDirContestedError struct {
+	// Dir is the pin directory path.
+	Dir string
+	// Attempts is how many times an entry was moved aside.
+	Attempts int
+	// Asides are the full paths of the entries moved aside, in order.
+	Asides []string
+}
+
+// PinClearRecovery is the documented recovery when a clear is contested: stop
+// the control plane, which runs as the service user, clear the pin again, and
+// start the control plane.
+var PinClearRecovery = "sudo launchctl bootout system/" + install.ServerLabel +
+	"; sudo k3sm update apply --clear-pin" +
+	"; sudo launchctl bootstrap system " + filepath.Join(install.DefaultLaunchDaemonDir, install.ServerLabel+".plist")
+
+func (e *PinDirContestedError) Error() string {
+	moved := "none"
+	if len(e.Asides) > 0 {
+		moved = strings.Join(e.Asides, ", ")
+	}
+	return fmt.Sprintf("clear the release pin: %s was replaced again after each of %d attempts to move it aside (moved aside: %s); stop the server and clear again: %s",
+		e.Dir, e.Attempts, moved, PinClearRecovery)
 }
 
 // renameAside renames the pin directory entry in parent, as an entry and

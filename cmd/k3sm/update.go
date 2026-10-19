@@ -103,7 +103,10 @@ Flags:
                       update controller refuses the release, before any node
                       is cordoned, unless its checksums file carries exactly
                       this digest
-  --clear-pin         remove the release pin and exit (apply; root only)
+  --clear-pin         remove the release pin and exit (apply; root only); a pin
+                      directory that cannot be trusted is moved aside, and the
+                      aside entries stay in the work dir for the service user
+                      to remove
   --watch             keep printing until the update finishes (status)
 
 Every subcommand but check reaches the cluster with the credentials
@@ -833,6 +836,15 @@ func runUpdateClearPin(fsFlags *flag.FlagSet, env updateEnv) int {
 		remove = updatectl.ClearReleasePin
 	}
 	cleared, err := remove(env.workDir)
+	var contested *updatectl.PinDirContestedError
+	if errors.As(err, &contested) {
+		fmt.Fprintf(env.errOut, "k3sm update apply: %s was replaced again after each of %d attempts to move it aside.\n", contested.Dir, contested.Attempts)
+		for _, a := range contested.Asides {
+			fmt.Fprintln(env.errOut, "  moved aside:", a)
+		}
+		fmt.Fprintf(env.errOut, "Stop the server, clear the pin again, then start the server:\n  %s\n", updatectl.PinClearRecovery)
+		return exitInternalError
+	}
 	if err != nil {
 		fmt.Fprintln(env.errOut, "k3sm update apply:", err)
 		return exitInternalError
@@ -842,7 +854,8 @@ func runUpdateClearPin(fsFlags *flag.FlagSet, env updateEnv) int {
 		fmt.Fprintln(env.out, "There is no release pin.")
 	case cleared.Untrusted != "":
 		fmt.Fprintf(env.out, "Moved %s aside to %s: it could not be trusted (%s). Created a fresh %s; nothing is pinned.\n",
-			cleared.Path, cleared.Aside, cleared.Untrusted, cleared.Path)
+			cleared.Path, strings.Join(cleared.Asides, ", "), cleared.Untrusted, cleared.Path)
+		fmt.Fprintln(env.out, "The aside entries stay in the work dir; they belong to the service user, which may remove them.")
 	default:
 		fmt.Fprintf(env.out, "Removed the release pin %s.\n", cleared.Path)
 	}

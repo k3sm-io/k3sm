@@ -55,7 +55,8 @@ const (
 // No RBAC rule k3sm ships names updates.k3sm.io, so only a cluster-admin
 // identity can write an Update; removing this annotation therefore needs an
 // identity that can already change spec.version, and the requirement adds no
-// weaker way around the pin.
+// weaker way around the pin. pkg/rbac's TestNoProvisionedRuleGrantsUpdates
+// fails if a provisioned rule ever grants the group.
 const ReleasePinRequiredAnnotation = "k3sm.io/release-pin-required"
 
 // The condition reasons the release pin adds.

@@ -498,8 +498,41 @@ func TestClearReleasePinRetriesARaceToReplant(t *testing.T) {
 		t.Fatalf("no fresh pin directory: %v, %v", fi, err)
 	}
 	asides, _ := filepath.Glob(filepath.Join(wd, "update.untrusted-*"))
-	if len(asides) != 3 {
-		t.Fatalf("asides %v, want 3", asides)
+	if len(asides) != 3 || len(c.Asides) != 3 || c.Aside != c.Asides[0] {
+		t.Fatalf("asides on disk %v, reported %v (first %s), want 3", asides, c.Asides, c.Aside)
+	}
+}
+
+// TestClearReleasePinGivesUpOnARelentlessReplant replants the entry after every
+// attempt: the clear gives up after maxAsideAttempts with an error that names
+// every entry it moved aside and the documented recovery.
+func TestClearReleasePinGivesUpOnARelentlessReplant(t *testing.T) {
+	wd := t.TempDir()
+	symlink(t, t.TempDir(), ReleasePinDir(wd))
+	t.Cleanup(func() { renameAsideHook = func() {} })
+	renameAsideHook = func() { symlink(t, t.TempDir(), ReleasePinDir(wd)) }
+	_, err := clearReleasePin(wd, testOwner())
+	var contested *PinDirContestedError
+	if !errors.As(err, &contested) || contested.Attempts != maxAsideAttempts || len(contested.Asides) != maxAsideAttempts {
+		t.Fatalf("err %v (%+v)", err, contested)
+	}
+	onDisk, _ := filepath.Glob(filepath.Join(wd, "update.untrusted-*"))
+	if len(onDisk) != maxAsideAttempts {
+		t.Fatalf("asides on disk %v", onDisk)
+	}
+	for _, a := range contested.Asides {
+		if !strings.Contains(err.Error(), a) {
+			t.Errorf("the error does not name %s: %v", a, err)
+		}
+	}
+	for _, want := range []string{
+		"sudo launchctl bootout system/io.k3sm.server",
+		"sudo k3sm update apply --clear-pin",
+		"sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not name the recovery step %q: %v", want, err)
+		}
 	}
 }
 
