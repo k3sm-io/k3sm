@@ -123,7 +123,7 @@ k3sm's distribution ships in three generations, listed in shipping order:
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
    one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
 
-2. **The k3sm app,** a signed, notarized download from k3sm.io that updates itself, is planned.
+2. **The k3sm app,** a signed, notarized download from k3sm.io that updates itself (see [Installing From k3sm.app](#installing-from-k3smapp)).
 
 3. **Notarized `.pkg` (gen 3)** is a signed, stapled installer package for offline and managed
    installs.
