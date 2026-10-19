@@ -150,7 +150,7 @@ Seatbelt-confined. The consequences:
   production fallback.
 - **Upgrade.** Re-running the install script replaces the
   binary and restarts both LaunchDaemons onto it. The helper RPC is version-stamped and additive, so
-  a routine upgrade does not break the datapath. The k3sm app through the Mac App Store and the notarized, signed
+  a routine upgrade does not break the datapath. The k3sm app (a signed, notarized download from k3sm.io) and the notarized, signed
   installer are the second and third install generations. See [user/install.md](user/install.md) and [user/upgrade.md](user/upgrade.md).
 - **Uninstall.** `sudo k3sm uninstall` boots out both daemons, removes the `lo0` aliases, and removes
   `/Library/k3sm`. No orphaned root listener survives, and the `utun` goes with netd, because the
