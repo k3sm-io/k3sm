@@ -193,7 +193,10 @@ spec:
             path: /livez
             port: https
             scheme: HTTPS
+          # Upstream's chart sets no timeout (1 s) and no delay; a whole-host stall killed a healthy pod.
+          initialDelaySeconds: 20
           periodSeconds: 10
+          timeoutSeconds: 5
         name: metrics-server
         ports:
         - containerPort: 10250
