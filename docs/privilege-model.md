@@ -56,8 +56,11 @@ A root daemon taking IPC from user space is the classic local-privilege-escalati
 class `vmnetd` and `socket_vmnet` have lived through. `k3sm-netd` is built to a strict model:
 
 - The helper does networking and privileged-port binds, and nothing else. No Pod spawning, no file
-  operations, no sandbox profile application; those stay in user space. The verb set is closed:
-  `EnsureAlias`, `RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `BindPort`.
+  operations, no sandbox profile application; those stay in user space. The verb set is closed
+  and has nine verbs: `EnsureAlias`, `RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `BindPort`, `Hello`,
+  `EnsureInterconnectAlias`, `RemoveInterconnectAlias` and `ApplyUpdate`. `ApplyUpdate` installs a
+  signed release payload, verified against the cluster CA before anything runs; see the chain of
+  trust in [Upgrades](user/upgrade.md#chain-of-trust).
 - The RPC carries typed scalars, never text. It passes an IP, a typed peer (`{public key, endpoint,
   allowedIPs}`), a `{port, node address}`, and never `route` or wireguard-UAPI
   *text*. The daemon **renders** the privileged artifact itself and **re-validates** every parameter

@@ -133,7 +133,7 @@ are designed so adjacent versions interoperate across that window. Upgrade agent
 control-plane Mac last unless a release note says otherwise. An HA cluster has its own order, mint-authority server first; see [HA](ha.md#upgrading-an-ha-cluster-to-the-aggregation-layer). See [Multi-node](multi-node.md) and
 [HA](ha.md).
 
-## Managed Update
+## How a Managed Update Runs
 
 A managed update moves the whole cluster to one release through an `Update` object
 (`updates.k3sm.io`), node by node, without a re-run of the installer on each Mac.
