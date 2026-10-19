@@ -28,7 +28,7 @@ without running anything as root.
 
 Two alternatives:
 
-- **The k3sm app, through the Mac App Store,** is planned.
+- **The k3sm app,** a signed, notarized download from k3sm.io that updates itself, is planned.
 - **From source**, if you would rather build it yourself: clone `apis`, `runtimed`, `darwin-net`
   and `k3sm` side by side, run `go work init ./apis ./runtimed ./darwin-net ./k3sm`, build with
   `CGO_ENABLED=1 go build -o k3sm ./cmd/k3sm` inside `k3sm`, assemble the install set with
