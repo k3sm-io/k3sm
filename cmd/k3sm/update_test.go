@@ -820,7 +820,10 @@ func TestUpdateApplyPinRequiresRoot(t *testing.T) {
 				p.written = append(p.written, pin)
 				return nil
 			}
-			env.clearPin = func(string) (bool, error) { p.cleared++; return true, nil }
+			env.clearPin = func(wd string) (updatectl.Cleared, error) {
+				p.cleared++
+				return updatectl.Cleared{Path: updatectl.ReleasePinPath(wd)}, nil
+			}
 		}
 	}
 
@@ -867,8 +870,8 @@ func TestUpdateApplyPinRequiresRoot(t *testing.T) {
 		if p.updateAtWrite {
 			t.Fatal("the Update existed before the pin was written")
 		}
-		if got := c.get(t).Spec.Version; got != "v0.2.0" {
-			t.Fatalf("Update version %s", got)
+		if got := c.get(t); got.Spec.Version != "v0.2.0" || got.Annotations[updatectl.ReleasePinRequiredAnnotation] != "v0.2.0" {
+			t.Fatalf("Update version %s, annotations %v", got.Spec.Version, got.Annotations)
 		}
 		if !strings.Contains(out, "Pinned v0.2.0 to sha256:"+sum) {
 			t.Fatalf("output %s", out)
@@ -905,6 +908,9 @@ func TestUpdateApplyPinRequiresRoot(t *testing.T) {
 		}
 		if len(p.written) != 0 || p.cleared != 0 {
 			t.Fatalf("the pin was touched: %+v", p)
+		}
+		if a := c.get(t).Annotations; a[updatectl.ReleasePinRequiredAnnotation] != "" {
+			t.Fatalf("an unpinned Update requires a pin: %v", a)
 		}
 	})
 }

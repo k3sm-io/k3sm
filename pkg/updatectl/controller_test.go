@@ -201,9 +201,15 @@ func (r *rig) controller() *Controller {
 
 func (r *rig) createUpdate(name string, spec updatesv1alpha1.UpdateSpec) {
 	r.t.Helper()
+	r.createUpdateWith(name, nil, spec)
+}
+
+// createUpdateWith is createUpdate with annotations on the Update.
+func (r *rig) createUpdateWith(name string, annotations map[string]string, spec updatesv1alpha1.UpdateSpec) {
+	r.t.Helper()
 	u := &updatesv1alpha1.Update{
 		TypeMeta:   metav1.TypeMeta{APIVersion: updatesv1alpha1.SchemeGroupVersion.String(), Kind: "Update"},
-		ObjectMeta: metav1.ObjectMeta{Name: name, Generation: 1},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Generation: 1, Annotations: annotations},
 		Spec:       spec,
 	}
 	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(u)

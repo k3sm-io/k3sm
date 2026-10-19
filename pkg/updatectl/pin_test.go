@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -32,6 +33,7 @@ import (
 
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/update"
 )
 
 const otherSum = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
@@ -197,6 +199,75 @@ func TestPinnedResolverRefusesDigestMismatch(t *testing.T) {
 		}
 	})
 
+	t.Run("a required pin that is missing or for another tag refuses", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			pin      *ReleasePin
+			required string
+		}{
+			{name: "no pin", required: target},
+			{name: "a pin for another tag", pin: &ReleasePin{Version: "v0.1.9", SHA256: targetSum}, required: target},
+			{name: "the annotation names another tag", pin: &ReleasePin{Version: target, SHA256: targetSum}, required: "v0.1.9"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				r := newRig(t, threeNodes()...)
+				wd := t.TempDir()
+				if tc.pin != nil {
+					wd = pinWorkDir(t, tc.pin.Version, tc.pin.SHA256)
+				}
+				r.createUpdateWith(updatesv1alpha1.UpdateName, map[string]string{ReleasePinRequiredAnnotation: tc.required}, updatesv1alpha1.UpdateSpec{Version: target})
+				r.drive(pinnedController(r, wd), nil)
+				u := r.update(updatesv1alpha1.UpdateName)
+				failed := meta.FindStatusCondition(u.Status.Conditions, ConditionFailed)
+				if u.Status.Phase != updatesv1alpha1.UpdatePhaseFailed || failed == nil || failed.Reason != ReasonReleasePinMismatch || u.Status.Resolved != nil {
+					t.Fatalf("phase %q, Failed %+v, resolved %+v", u.Status.Phase, failed, u.Status.Resolved)
+				}
+				if got := r.log(); len(got) != 0 {
+					t.Fatalf("a node was touched: %v", got)
+				}
+			})
+		}
+		// The plain resolver, without PinnedResolver, can never satisfy it.
+		r := newRig(t, threeNodes()...)
+		r.createUpdateWith(updatesv1alpha1.UpdateName, map[string]string{ReleasePinRequiredAnnotation: target}, updatesv1alpha1.UpdateSpec{Version: target})
+		r.drive(r.controller(), nil)
+		if u := r.update(updatesv1alpha1.UpdateName); u.Status.Phase != updatesv1alpha1.UpdatePhaseFailed || len(r.log()) != 0 {
+			t.Fatalf("an unpinned resolver satisfied a required pin: %q %v", u.Status.Phase, r.log())
+		}
+	})
+
+	t.Run("a required and matching pin is what every node's signed payload carries", func(t *testing.T) {
+		r := newRig(t, threeNodes()...)
+		wd := pinWorkDir(t, target, targetSum)
+		r.createUpdateWith(updatesv1alpha1.UpdateName, map[string]string{ReleasePinRequiredAnnotation: target}, updatesv1alpha1.UpdateSpec{Version: target})
+		c := pinnedController(r, wd)
+		if _, err := c.reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		pin, err := readReleasePin(wd, testOwner())
+		if err != nil || pin == nil {
+			t.Fatalf("pin %+v, %v", pin, err)
+		}
+		u := r.update(updatesv1alpha1.UpdateName)
+		raw, err := c.payload(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := update.ParsePayload(string(raw))
+		if err != nil || p.SHA256 != pin.SHA256 {
+			t.Fatalf("payload() %+v, %v; want sha256 %s", p, err, pin.SHA256)
+		}
+		ann := r.node("w1").Annotations
+		if ann[update.AnnotationUpdatePayload] != string(raw) {
+			t.Fatalf("the handed-over payload is not payload(): %s", ann[update.AnnotationUpdatePayload])
+		}
+		signed, err := update.VerifySignedPayload(update.CAPool(testSigning().ca.CertPEM), []byte(ann[update.AnnotationUpdatePayload]),
+			ann[update.AnnotationUpdatePayloadSig], ann[update.AnnotationUpdateSigner], r.now)
+		if err != nil || signed.Payload.SHA256 != pin.SHA256 {
+			t.Fatalf("the signed payload does not verify to the pin: %v (%+v)", err, signed.Payload)
+		}
+	})
+
 	t.Run("without a pin the reason stays Resolved", func(t *testing.T) {
 		r := newRig(t, threeNodes()...)
 		r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
@@ -237,18 +308,130 @@ func TestReleasePinWriteAndRemove(t *testing.T) {
 	if err := writeReleasePin(wd, want, testOwner()+1); err == nil {
 		t.Fatal("wrote into a directory another uid owns")
 	}
-	if removed, err := removeReleasePin(wd, testOwner()); !removed || err != nil {
-		t.Fatalf("remove: %v, %v", removed, err)
+	if c, err := clearReleasePin(wd, testOwner()); c.Path != ReleasePinPath(wd) || c.Untrusted != "" || err != nil {
+		t.Fatalf("clear: %+v, %v", c, err)
 	}
-	if removed, err := removeReleasePin(wd, testOwner()); removed || err != nil {
-		t.Fatalf("second remove: %v, %v", removed, err)
+	if _, err := os.Lstat(ReleasePinDir(wd)); err != nil {
+		t.Fatalf("clearing a trusted pin removed its directory: %v", err)
 	}
-	if removed, err := removeReleasePin(t.TempDir(), testOwner()); removed || err != nil {
-		t.Fatalf("remove with no directory: %v, %v", removed, err)
+	if c, err := clearReleasePin(wd, testOwner()); c.Path != "" || err != nil {
+		t.Fatalf("second clear: %+v, %v", c, err)
+	}
+	if c, err := clearReleasePin(t.TempDir(), testOwner()); c.Path != "" || err != nil {
+		t.Fatalf("clear with no directory: %+v, %v", c, err)
+	}
+	if c, err := clearReleasePin(filepath.Join(t.TempDir(), "absent"), testOwner()); c.Path != "" || err != nil {
+		t.Fatalf("clear with no work dir: %+v, %v", c, err)
 	}
 	if got, err := readReleasePin(wd, testOwner()); got != nil || err != nil {
-		t.Fatalf("read after remove: %+v, %v", got, err)
+		t.Fatalf("read after clear: %+v, %v", got, err)
 	}
+	if entries, _ := os.ReadDir(ReleasePinDir(wd)); len(entries) != 0 {
+		t.Fatalf("left behind: %v", entries)
+	}
+}
+
+// TestReleasePinWriterFailsClosedOnADirectorySwap swaps the pin directory for
+// a symlink between the writer's check and its write, as the service user that
+// owns the work dir could: the write must fail, and nothing may land where the
+// symlink points.
+func TestReleasePinWriterFailsClosedOnADirectorySwap(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing bool
+	}{{"a new directory", false}, {"an existing directory", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			wd := t.TempDir()
+			if tc.existing {
+				if err := os.Mkdir(ReleasePinDir(wd), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			victim := t.TempDir()
+			chmod(t, victim, 0o700)
+			moved := filepath.Join(t.TempDir(), "moved")
+			swapped := false
+			pinDirChecked = func() {
+				mv(t, ReleasePinDir(wd), moved)
+				symlink(t, victim, ReleasePinDir(wd))
+				swapped = true
+			}
+			t.Cleanup(func() { pinDirChecked = func() {} })
+			err := writeReleasePin(wd, ReleasePin{Version: target, SHA256: targetSum, At: rigStart}, testOwner())
+			if !swapped || err == nil || !strings.Contains(err.Error(), "was replaced during the write") {
+				t.Fatalf("swapped %v, err %v", swapped, err)
+			}
+			if entries, _ := os.ReadDir(victim); len(entries) != 0 {
+				t.Fatalf("the write reached the symlink's target: %v", entries)
+			}
+			fi, err := os.Stat(victim)
+			if err != nil || fi.Mode().Perm() != 0o700 {
+				t.Fatalf("the symlink's target was chmodded: %v, %v", fi.Mode(), err)
+			}
+			if entries, _ := os.ReadDir(moved); len(entries) != 0 {
+				t.Fatalf("the moved directory kept a pin or a temp file: %v", entries)
+			}
+			if pin, err := readReleasePin(wd, testOwner()); pin != nil || err == nil {
+				t.Fatalf("the swapped path reads as a pin: %+v, %v", pin, err)
+			}
+		})
+	}
+}
+
+// TestClearReleasePinRemovesAnUntrustedDirectory is root's recovery from a pin
+// directory entry a less privileged user planted: each untrusted shape is
+// removed whole and named, and nothing a symlink points at is touched.
+func TestClearReleasePinRemovesAnUntrustedDirectory(t *testing.T) {
+	victim := t.TempDir()
+	write(t, filepath.Join(victim, "keep"), "keep")
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, dir string)
+		owner uint32
+		want  string
+	}{
+		{name: "a symlink to a directory", plant: func(t *testing.T, dir string) { symlink(t, victim, dir) }, want: "a symlink"},
+		{name: "a dangling symlink", plant: func(t *testing.T, dir string) { symlink(t, filepath.Join(victim, "absent"), dir) }, want: "a symlink"},
+		{name: "a regular file", plant: func(t *testing.T, dir string) { write(t, dir, "x") }, want: "not a directory"},
+		{name: "another owner", plant: plantTree, owner: testOwner() + 1, want: "owned by uid"},
+		{name: "group-writable", plant: func(t *testing.T, dir string) { plantTree(t, dir); chmod(t, dir, 0o775) }, want: "writable by its group or others"},
+		{name: "world-writable", plant: func(t *testing.T, dir string) { plantTree(t, dir); chmod(t, dir, 0o757) }, want: "writable by its group or others"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wd := t.TempDir()
+			tc.plant(t, ReleasePinDir(wd))
+			owner := testOwner()
+			if tc.owner != 0 {
+				owner = tc.owner
+			}
+			c, err := clearReleasePin(wd, owner)
+			if err != nil || c.Path != ReleasePinDir(wd) || !strings.Contains(c.Untrusted, tc.want) {
+				t.Fatalf("clear: %+v, %v; want %q", c, err, tc.want)
+			}
+			if _, err := os.Lstat(ReleasePinDir(wd)); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the untrusted entry is still there: %v", err)
+			}
+			if b, err := os.ReadFile(filepath.Join(victim, "keep")); err != nil || string(b) != "keep" {
+				t.Fatalf("the symlink's target was touched: %q, %v", b, err)
+			}
+			// root can pin again afterwards.
+			if err := writeReleasePin(wd, ReleasePin{Version: target, SHA256: targetSum, At: rigStart}, testOwner()); err != nil {
+				t.Fatalf("pin after clear: %v", err)
+			}
+		})
+	}
+}
+
+// plantTree makes dir a directory holding a pin, a nested directory and a
+// symlink out of the tree, so a whole-entry clear is non-trivial.
+func plantTree(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, releasePinFileName), `{"version":"v0.2.0","sha256":"`+targetSum+`","at":"2026-10-18T00:00:00Z"}`)
+	write(t, filepath.Join(dir, "a", "b", "f"), "f")
+	symlink(t, t.TempDir(), filepath.Join(dir, "a", "out"))
 }
 
 func pinnedController(r *rig, wd string) *Controller {

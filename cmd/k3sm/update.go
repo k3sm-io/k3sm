@@ -138,9 +138,9 @@ type updateEnv struct {
 	// write or clear the release pin.
 	root bool
 	// writePin and clearPin write and remove the release pin under workDir;
-	// nil means updatectl.WriteReleasePin and updatectl.RemoveReleasePin.
+	// nil means updatectl.WriteReleasePin and updatectl.ClearReleasePin.
 	writePin func(workDir string, pin updatectl.ReleasePin) error
-	clearPin func(workDir string) (bool, error)
+	clearPin func(workDir string) (updatectl.Cleared, error)
 }
 
 // newUpdateEnv wires the production environment: the GitHub release index, the
@@ -694,7 +694,7 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 	if *clearPin {
 		return runUpdateClearPin(fsFlags, env)
 	}
-	pinning := false
+	pinning := false // --pin-sha256 was given, even empty
 	fsFlags.Visit(func(f *flag.Flag) { pinning = pinning || f.Name == "pin-sha256" })
 	if pinning {
 		if !env.root {
@@ -791,6 +791,11 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 		Verify:         updatesv1alpha1.UpdateVerify{Signature: sig},
 		AllowDowngrade: *allowDowngrade,
 	})
+	if err == nil && pinning {
+		// The controller refuses this Update unless a trusted pin for target
+		// matches, so a pin lost before it resolves fails the roll closed.
+		obj.SetAnnotations(map[string]string{updatectl.ReleasePinRequiredAnnotation: target})
+	}
 	if err == nil {
 		_, err = dyn.Resource(updateGVR).Create(ctx, obj, metav1.CreateOptions{})
 	}
@@ -825,17 +830,20 @@ func runUpdateClearPin(fsFlags *flag.FlagSet, env updateEnv) int {
 	}
 	remove := env.clearPin
 	if remove == nil {
-		remove = updatectl.RemoveReleasePin
+		remove = updatectl.ClearReleasePin
 	}
-	removed, err := remove(env.workDir)
+	cleared, err := remove(env.workDir)
 	if err != nil {
 		fmt.Fprintln(env.errOut, "k3sm update apply:", err)
 		return exitInternalError
 	}
-	if removed {
-		fmt.Fprintln(env.out, "Removed the release pin.")
-	} else {
+	switch {
+	case cleared.Path == "":
 		fmt.Fprintln(env.out, "There is no release pin.")
+	case cleared.Untrusted != "":
+		fmt.Fprintf(env.out, "Removed %s, which could not be trusted (%s), with any release pin in it.\n", cleared.Path, cleared.Untrusted)
+	default:
+		fmt.Fprintf(env.out, "Removed the release pin %s.\n", cleared.Path)
 	}
 	return 0
 }

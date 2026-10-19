@@ -17,22 +17,12 @@ limitations under the License.
 package updatectl
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"log/slog"
-	"os"
 	"path/filepath"
-	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
-
-	"k3sm.io/k3sm/internal/atomicfile"
 )
 
 // The release pin is a server-local record of the archive digest a release
@@ -56,6 +46,13 @@ const (
 	// maxReleasePinBytes bounds the pin read; a record is under 200 bytes.
 	maxReleasePinBytes = 4096
 )
+
+// ReleasePinRequiredAnnotation, on an Update, names the release tag root
+// pinned when it created the Update (`k3sm update apply --pin-sha256`). The
+// controller then refuses to resolve the Update unless a trusted pin for
+// exactly that tag matched, so a pin that is missing by the time the
+// controller resolves fails the roll instead of letting it run unpinned.
+const ReleasePinRequiredAnnotation = "k3sm.io/release-pin-required"
 
 // The condition reasons the release pin adds.
 const (
@@ -107,167 +104,6 @@ func ReleasePinDir(workDir string) string { return filepath.Join(workDir, releas
 // ReleasePinPath is the release pin file under workDir.
 func ReleasePinPath(workDir string) string {
 	return filepath.Join(ReleasePinDir(workDir), releasePinFileName)
-}
-
-// WriteReleasePin records pin under workDir. The caller must be root: the
-// directory is created root-owned 0755 when missing, an existing one must be
-// a real directory owned by root and writable by no one else, and the file is
-// replaced through a temp file beside it (0644, fsync'ed, renamed, the
-// directory fsync'ed).
-func WriteReleasePin(workDir string, pin ReleasePin) error {
-	return writeReleasePin(workDir, pin, 0)
-}
-
-func writeReleasePin(workDir string, pin ReleasePin, owner uint32) error {
-	if err := pin.Validate(); err != nil {
-		return fmt.Errorf("write the release pin: %w", err)
-	}
-	dir := ReleasePinDir(workDir)
-	if err := os.Mkdir(dir, 0o755); err == nil {
-		if err := os.Chmod(dir, 0o755); err != nil {
-			return fmt.Errorf("write the release pin: %w", err)
-		}
-	} else if !errors.Is(err, fs.ErrExist) {
-		return fmt.Errorf("write the release pin: %w", err)
-	}
-	d, err := openPinDir(dir, owner)
-	if err != nil {
-		return fmt.Errorf("write the release pin: %w", err)
-	}
-	_ = d.Close() // only its checks were needed
-	b, err := json.Marshal(pin)
-	if err != nil {
-		return fmt.Errorf("write the release pin: %w", err)
-	}
-	if err := atomicfile.Replace(ReleasePinPath(workDir), append(b, '\n'), 0o644); err != nil {
-		return fmt.Errorf("write the release pin: %w", err)
-	}
-	return nil
-}
-
-// RemoveReleasePin removes the release pin under workDir. It reports whether
-// there was one. The directory must pass the same checks as for a write; a
-// missing directory or file is not an error.
-func RemoveReleasePin(workDir string) (bool, error) {
-	return removeReleasePin(workDir, 0)
-}
-
-func removeReleasePin(workDir string, owner uint32) (bool, error) {
-	d, err := openPinDir(ReleasePinDir(workDir), owner)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("remove the release pin: %w", err)
-	}
-	defer func() { _ = d.Close() }()
-	err = unix.Unlinkat(int(d.Fd()), releasePinFileName, 0)
-	if errors.Is(err, unix.ENOENT) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("remove the release pin: unlink %s: %w", ReleasePinPath(workDir), err)
-	}
-	if err := d.Sync(); err != nil {
-		return true, fmt.Errorf("remove the release pin: sync %s: %w", ReleasePinDir(workDir), err)
-	}
-	return true, nil
-}
-
-// readReleasePin reads the pin under workDir, held to the checks the pin
-// needs: a real directory and a regular file, both owned by owner and writable
-// by no one else. A missing directory or file is (nil, nil). The file is
-// opened relative to the checked directory's descriptor, without following a
-// symlink, and checked on the opened descriptor, so neither can be swapped
-// between the check and the read.
-func readReleasePin(workDir string, owner uint32) (*ReleasePin, error) {
-	d, err := openPinDir(ReleasePinDir(workDir), owner)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = d.Close() }()
-	fd, err := unix.Openat(int(d.Fd()), releasePinFileName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
-	if errors.Is(err, unix.ENOENT) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", ReleasePinPath(workDir), err)
-	}
-	f := os.NewFile(uintptr(fd), ReleasePinPath(workDir))
-	defer func() { _ = f.Close() }()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat %s: %w", f.Name(), err)
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", f.Name())
-	}
-	if err := trustedOwnerMode(f.Name(), fi, owner); err != nil {
-		return nil, err
-	}
-	raw, err := io.ReadAll(io.LimitReader(f, maxReleasePinBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", f.Name(), err)
-	}
-	if len(raw) > maxReleasePinBytes {
-		return nil, fmt.Errorf("%s is larger than %d bytes", f.Name(), maxReleasePinBytes)
-	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	var pin ReleasePin
-	if err := dec.Decode(&pin); err != nil {
-		return nil, fmt.Errorf("decode %s: %w", f.Name(), err)
-	}
-	if err := pin.Validate(); err != nil {
-		return nil, fmt.Errorf("%s: %w", f.Name(), err)
-	}
-	return &pin, nil
-}
-
-// openPinDir opens dir without following a symlink and holds it to the pin's
-// checks on the opened descriptor: a directory owned by owner, writable by no
-// one else. A missing dir is an error wrapping fs.ErrNotExist.
-func openPinDir(dir string, owner uint32) (*os.File, error) {
-	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if errors.Is(err, unix.ENOENT) {
-		return nil, fmt.Errorf("open %s: %w", dir, fs.ErrNotExist)
-	}
-	if err != nil {
-		// A symlink fails O_NOFOLLOW with ELOOP, a file O_DIRECTORY with ENOTDIR.
-		return nil, fmt.Errorf("%s is not a real directory: %w", dir, err)
-	}
-	d := os.NewFile(uintptr(fd), dir)
-	fi, err := d.Stat()
-	if err == nil && !fi.IsDir() {
-		err = fmt.Errorf("%s is not a directory", dir)
-	}
-	if err == nil {
-		err = trustedOwnerMode(dir, fi, owner)
-	}
-	if err != nil {
-		_ = d.Close()
-		return nil, err
-	}
-	return d, nil
-}
-
-// trustedOwnerMode refuses fi unless owner owns it and neither its group nor
-// others may write it.
-func trustedOwnerMode(path string, fi fs.FileInfo, owner uint32) error {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("cannot read the owner of %s", path)
-	}
-	if st.Uid != owner {
-		return fmt.Errorf("%s is owned by uid %d, not uid %d", path, st.Uid, owner)
-	}
-	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%s is writable by its group or others (%v)", path, fi.Mode().Perm())
-	}
-	return nil
 }
 
 // PinnedResolver wraps a Resolver with the release pin under WorkDir. With no

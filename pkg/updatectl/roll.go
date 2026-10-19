@@ -667,9 +667,19 @@ func (c *Controller) ensureResolved(ctx context.Context, u *updatesv1alpha1.Upda
 	if r := u.Status.Resolved; r != nil && r.Version == u.Spec.Version && r.Digest != "" {
 		return nil
 	}
-	rel, err := c.cfg.Resolver.Resolve(ctx, u.Spec.Version)
+	required, pinRequired := u.Annotations[ReleasePinRequiredAnnotation]
+	var rel Release
+	var err error
+	if pinRequired && required != u.Spec.Version {
+		err = pinError("the Update was pinned for %q but targets %q", required, u.Spec.Version)
+	} else {
+		rel, err = c.cfg.Resolver.Resolve(ctx, u.Spec.Version)
+	}
 	if err == nil && !isSHA256Hex(rel.SHA256) {
 		err = fmt.Errorf("%w: malformed sha256", ErrRelease)
+	}
+	if err == nil && pinRequired && !rel.Pinned {
+		err = pinError("the Update requires a release pin for %s and no trusted pin for it matched", u.Spec.Version)
 	}
 	if err != nil {
 		err = fmt.Errorf("resolve %s: %w", u.Spec.Version, err)
