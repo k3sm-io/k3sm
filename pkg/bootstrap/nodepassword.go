@@ -112,7 +112,7 @@ func (s *MemoryNodePasswords) Ensure(_ context.Context, nodeName, password strin
 	defer s.mu.Unlock()
 	hash, bound := s.byName[nodeName]
 	if !bound {
-		h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		h, err := bcrypt.GenerateFromPassword([]byte(password), hashCost)
 		if err != nil {
 			return fmt.Errorf("hash node-password: %w", err)
 		}

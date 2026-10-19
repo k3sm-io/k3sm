@@ -276,7 +276,7 @@ func (s *secretNodePasswords) Ensure(ctx context.Context, nodeName, password str
 	name := nodeName + nodePasswordSecretSuffix
 	sec, err := s.secrets.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		hash, herr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		hash, herr := bcrypt.GenerateFromPassword([]byte(password), bootstrap.HashCost())
 		if herr != nil {
 			return fmt.Errorf("hash node-password: %w", herr)
 		}

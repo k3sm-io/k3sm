@@ -17,12 +17,17 @@ limitations under the License.
 package bootstrap
 
 import (
+	"bytes"
+	"fmt"
 	"go/ast"
 	"go/build"
 	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -113,7 +118,7 @@ func TestJoinTokenIDMatchesEveryShippedVerifier(t *testing.T) {
 }
 
 // tokenVerifierImplementations type-checks the non-test sources of this
-// package from source and returns, sorted, the name of every package-level
+// package (its imports read from compiled export data) and returns, sorted, the name of every package-level
 // named type whose value or pointer type satisfies TokenVerifier.
 func tokenVerifierImplementations(t *testing.T) []string {
 	t.Helper()
@@ -130,7 +135,7 @@ func tokenVerifierImplementations(t *testing.T) []string {
 		}
 		files = append(files, af)
 	}
-	conf := types.Config{Importer: importer.ForCompiler(fset, "source", nil)}
+	conf := types.Config{Importer: exportDataImporter(t, fset, bp.Dir)}
 	pkg, err := conf.Check(bp.Name, fset, files, nil)
 	if err != nil {
 		t.Fatalf("type-check %s: %v", bp.Dir, err)
@@ -158,4 +163,34 @@ func tokenVerifierImplementations(t *testing.T) []string {
 			bp.Dir, strings.Join(bp.GoFiles, ", "))
 	}
 	return impls
+}
+
+// exportDataImporter returns an importer that reads every dependency of the
+// package in dir from the export data the go command compiles (and caches)
+// for it. Type-checking the dependency graph from source instead costs over a
+// minute under the race detector; the export data carries the same types.
+func exportDataImporter(t *testing.T, fset *token.FileSet, dir string) types.Importer {
+	t.Helper()
+	cmd := exec.Command("go", "list", "-export", "-deps", "-f", "{{if .Export}}{{.ImportPath}}={{.Export}}{{end}}", ".")
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list -export in %s: %v: %s", dir, err, stderr.String())
+	}
+	exports := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		path, file, ok := strings.Cut(line, "=")
+		if ok {
+			exports[path] = file
+		}
+	}
+	return importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
+		file, ok := exports[path]
+		if !ok {
+			return nil, fmt.Errorf("no export data for %q", path)
+		}
+		return os.Open(file)
+	})
 }

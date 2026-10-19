@@ -108,6 +108,18 @@ func ParseToken(s string) (Token, error) {
 	return t, nil
 }
 
+// hashCost is the bcrypt cost every bootstrap secret is hashed at: minted token
+// secrets, the dummy token hash, and bound node passwords. It is a package var
+// only so this package's own tests can hash at bcrypt.MinCost (one hash at
+// DefaultCost takes about a second under the race detector, and the join tests
+// pay several per request); a test pins the shipped value to bcrypt.DefaultCost.
+var hashCost = bcrypt.DefaultCost
+
+// HashCost returns the bcrypt cost bootstrap secrets are hashed at, so a
+// NodePasswordStore implemented outside this package hashes at the same cost.
+// There is deliberately no setter.
+func HashCost() int { return hashCost }
+
 // compareHash is the one bcrypt compare every token verification performs. It
 // is a package var only so the cost-equalization gate can COUNT the compares
 // each outcome performs, which asserts the property without a timing test.
@@ -131,7 +143,7 @@ var compareHash = bcrypt.CompareHashAndPassword
 // (a crypto/rand failure) yields a nil hash, whose compare fails fast: the
 // request is still denied, only the equalization is lost.
 var dummyTokenHash = sync.OnceValue(func() []byte {
-	h, err := bcrypt.GenerateFromPassword([]byte("k3sm-bootstrap-dummy-token-secret"), bcrypt.DefaultCost)
+	h, err := bcrypt.GenerateFromPassword([]byte("k3sm-bootstrap-dummy-token-secret"), hashCost)
 	if err != nil {
 		return nil
 	}
@@ -183,7 +195,7 @@ func (s *TokenStore) Create(ttl time.Duration) (user, secret string, expiry time
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(sec), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(sec), hashCost)
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("hash token secret: %w", err)
 	}
