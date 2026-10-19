@@ -3,7 +3,7 @@ repo: k3sm
 schema: phases/v1
 current_phase: M6
 updated: 2026-10-18
-updated_by: M21 encode (docs/m21-plan.md, the cooperative node budget)
+updated_by: M21 amendment (docs/m21-plan.md, the Swift SDK and the app as a consumer)
 
 phases:
   - id: M0
@@ -1620,13 +1620,13 @@ phases:
             check: "M19-lab green on the recorded rig run and the site pages published"
             method: e2e
   - id: M21
-    title: the cooperative node budget: thresholds and pressure published to applications, the NodeBudget API, the budget page and C++ SDK, the two kill tiers
+    title: "the cooperative node budget: thresholds and pressure published to applications, the NodeBudget API, the budget page, the C++ and Swift SDKs, the app as a consumer, the two kill tiers"
     status: todo
     strategy: hard cut
     depends_on:
       - apis:M21
       - runtimed:M21
-    note: "Authoritative input: docs/m21-plan.md (workspace); its BINDING block governs. Hard cut: every piece is additive (a CRD group, annotations, a page file, guest/v1 fields) or a single-node daemon change; nodes of mixed versions tolerate each other in every order. The one deliberate behaviour change is the swap arm split, which makes larger hosts evict earlier; release notes state it. The NodeBudget reader ClusterRole adds a role and its merge waits on the maintainer. Ships as the last item of the next release after v0.1.7."
+    note: "Authoritative input: docs/m21-plan.md (workspace); its BINDING block governs. Hard cut: every piece is additive (a CRD group, annotations, a page file, guest/v1 fields) or a single-node daemon change; nodes of mixed versions tolerate each other in every order. The one deliberate behaviour change is the swap arm split, which makes larger hosts evict earlier; release notes state it. The NodeBudget reader ClusterRole adds a role and its merge waits on the maintainer. The k3sm app reads the budget through the Swift SDK and takes it as its one first-party dependency. Ships as the last item of the next release after v0.1.7."
     subphases:
       - id: M21.0
         title: spike and calibration
@@ -1706,6 +1706,9 @@ phases:
           - id: M21.6-d1
             done: false
             desc: "The node agent writes the page at /var/lib/k3sm/budget/budget.v1.page under the seqlock with notifyEpoch, generation and an optional doorbell, keeping the writer lock and arming state where no pod can open them; pods opt in with the budget.k3sm.io/page annotation and no environment variable."
+          - id: M21.6-d2
+            done: false
+            desc: "The budget directory is mode 0755 and the page 0644, so a local account such as the app can read it; pod access is still decided by the sandbox profile, and the writer lock, history and arming state stay in the protected agent directory."
         acceptance:
           - id: M21.6-a1
             met: false
@@ -1804,6 +1807,61 @@ phases:
             met: false
             check: "hack/verify-site-clean.sh --sources is clean over the new page"
             method: e2e
+      - id: M21.14
+        title: the Swift SDK (k3sm-sdk-swift)
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M21.6
+        note: "Planned with the C++ SDK: the same page contract, errors, path constants and version rules. Swift 6, macOS 26, SwiftPM, no dependencies, pinned by exact revision; its semver is independent of the page ABI major. A pure Swift reader over the Synchronization module's atomics; no writer."
+        deliverables:
+          - id: M21.14-d1
+            done: false
+            desc: "The skeleton aligned with the plan: the Swift 6 language mode, the version and page ABI constants, the revision pin in the docs, and the gate's build, test and sanitizer stages."
+          - id: M21.14-d2
+            done: false
+            desc: "The page reader: a read-only mapping, the seqlock read with typed errors, the path constants with the native default, the helpers, checked against the committed fixture bytes."
+          - id: M21.14-d3
+            done: false
+            desc: "The change notifier on notifyEpoch (os_sync_wait_on_address on the shared mapping, poll, an async stream fed by one thread)."
+          - id: M21.14-d4
+            done: false
+            desc: "Codable NodeBudget status types, checked against the golden Darwin and Linux status documents, which also decode the budget block of k3sm status."
+          - id: M21.14-d5
+            done: false
+            desc: "The quality bar: a torn-read stress under the thread sanitizer with a negative control that must see a tear, a two-process read, a property test over page bytes, the address sanitizer and a benchmark."
+        acceptance:
+          - id: M21.14-a1
+            met: false
+            check: "k3sm-sdk-swift/hack/ci.sh exits 0 and the rig benchmark meets read p50 under 100 ns, p99 under 1 us and wake-to-read p99 under 1 ms against a live page; then v1.0.0 is tagged in the same cut as the C++ SDK"
+            method: lab
+      - id: M21.15
+        title: the app reads the node budget
+        status: todo
+        strategy: hard cut
+        depends_on:
+          - k3sm:M21.1
+          - k3sm:M21.3
+          - k3sm:M21.14
+        note: "The app reads the budget only through the Swift SDK: this Mac from the page, with the k3sm status budget block as the fallback, and the cluster from the NodeBudget list over its existing kubectl read. Victim identity never appears; a would-kill decision shows as band and reason."
+        deliverables:
+          - id: M21.15-d1
+            done: false
+            desc: "The app depends on k3sm-sdk-swift at an exact revision listed in its allow file, its only dependency, and its gate builds offline after one resolve."
+          - id: M21.15-d2
+            done: false
+            desc: "This Mac's level, admit, headroom and thresholds in the status item, the menu and the node inspector, redrawn on a change notification, with the kill mode and arming state."
+          - id: M21.15-d3
+            done: false
+            desc: "The cluster view: every node's budget on the Nodes tab, in the inspector and on the Alerts tab, with kill mode, arming, would-kill as band and reason, and the per-band counters."
+          - id: M21.15-d4
+            done: false
+            desc: "No cluster update is offered while a node is evicting, and the offer defaults to Not now while a node refuses new pods or is critical."
+        acceptance:
+          - id: M21.15-a1
+            met: false
+            check: "K3SM_LAB=1 app/hack/acceptance/m21-budget.sh --live exits 0 on the rig: the app's decoders read the live page and the NodeBudget list and agree with k3sm status"
+            method: lab
 ---
 
 # k3sm — Phase roadmap
@@ -2525,7 +2583,8 @@ read how much room the node has, how close it is to each threshold, and exactly 
 stop admitting and start evicting, so it can shrink before the node has to act. The node publishes
 one budget through three channels: the cluster-scoped `NodeBudget` resource (the source of truth,
 readable through a dedicated reader role), a zero-syscall page on the node for pods that opt in,
-read through the `k3sm-sdk-cpp` C++ SDK, and an additive block in `k3sm status`. The contract is
+read through the `k3sm-sdk-cpp` C++ SDK or the `k3sm-sdk-swift` Swift SDK, and an additive block in
+`k3sm status`. The k3sm app reads it through the Swift SDK. The contract is
 platform-neutral, so a Linux producer can publish the same resource and page.
 
 Eviction gains a second, gentler tier. Tier 1 evicts only pods marked
@@ -2549,7 +2608,7 @@ and the Summary API slots.
 The node annotation, the server relay, the additive admit-stop taint and the reader role.
 
 ### M21.6 the native budget page ⬜
-The page writer and the opt-in read.
+The page writer and the opt-in read, and a page a local account can read.
 
 ### M21.7 the C++ SDK ⬜
 The reader, the writer half for C++ producers, the notifier, the C shim, the quality bar and Linux builds, tagged v1.0.0.
@@ -2562,3 +2621,11 @@ The characterization test first, then bands, admission, the tier-2 changes and t
 
 ### M21.13 docs and graduation ⬜
 The user page, the design and privilege-model paragraphs and the release notes.
+
+### M21.14 the Swift SDK ⬜
+Planned with the C++ SDK: the reader, the notifier, Codable status types and the quality bar, tagged
+v1.0.0 in the same cut.
+
+### M21.15 the app reads the node budget ⬜
+This Mac's budget in the status item and window, the cluster's budgets on the Nodes and Alerts tabs,
+and no cluster update offered while a node is evicting.
