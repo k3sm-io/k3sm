@@ -56,7 +56,6 @@ run on hardware, that is an added caveat: nobody has exercised it on real Macs y
     to pods and the cluster, and how a stop survives a reboot.
 23. [Building images](builder.md) covers `k3sm build` and the in-cluster build engine.
 24. [Helm charts](helm.md) covers installing releases with the `HelmChart` object.
-25. [A durable-execution server](temporal-example.md) walks through running one on k3sm as a
     worked example.
 26. [FAQ](faq.md) gives short answers to the common questions.
 
