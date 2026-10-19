@@ -77,6 +77,14 @@ var (
 	ErrBundleIterations = fmt.Errorf("%w: PBKDF2 iteration count out of range", ErrBundleFormat)
 )
 
+// bundleSealIters is the PBKDF2 iteration count SealBundle derives and records in
+// the envelope header. It is a package var only so this package's own tests can
+// seal at bundleMinPBKDF2Iters (one 600k-iteration derivation takes about two
+// seconds under the race detector); a test pins the shipped value to
+// bundlePBKDF2Iters. OpenBundle reads the count from the header, so the value
+// never changes what an envelope opens with.
+var bundleSealIters = bundlePBKDF2Iters
+
 // SealBundle AES-256-GCM-seals plaintext (the certs.Hierarchy.Marshal bytes) under a
 // key derived from secret. It draws a fresh crypto/rand salt + nonce per call and binds
 // the versioned header (magic+version+kdf+iters+salt+nonce) as the GCM AAD. The returned
@@ -94,8 +102,8 @@ func SealBundle(secret string, plaintext []byte) ([]byte, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("read nonce: %w", err)
 	}
-	header := bundleHeader(salt, nonce, bundlePBKDF2Iters)
-	gcm, err := bundleGCM(secret, salt, bundlePBKDF2Iters)
+	header := bundleHeader(salt, nonce, bundleSealIters)
+	gcm, err := bundleGCM(secret, salt, bundleSealIters)
 	if err != nil {
 		return nil, err
 	}

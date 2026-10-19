@@ -85,7 +85,7 @@ func (s *FileTokenStore) Create(ttl time.Duration) (user, secret string, expiry 
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(sec), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(sec), hashCost)
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("hash token secret: %w", err)
 	}

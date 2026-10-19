@@ -41,8 +41,13 @@ func TestTokenVerifyDoesNotRevealWhetherAnIdExists(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dummy hash is not a bcrypt hash: %v", err)
 		}
-		if cost != bcrypt.DefaultCost {
-			t.Fatalf("dummy hash cost = %d, want bcrypt.DefaultCost (%d): an unknown id would cost differently from a known one", cost, bcrypt.DefaultCost)
+		if cost != hashCost {
+			t.Fatalf("dummy hash cost = %d, want the token hash cost (%d): an unknown id would cost differently from a known one", cost, hashCost)
+		}
+		// TestMain lowers hashCost for speed; the cost the package ships with,
+		// which the dummy hash is minted at in production, is bcrypt.DefaultCost.
+		if shippedHashCost != bcrypt.DefaultCost {
+			t.Fatalf("shipped token hash cost = %d, want bcrypt.DefaultCost (%d)", shippedHashCost, bcrypt.DefaultCost)
 		}
 	})
 
