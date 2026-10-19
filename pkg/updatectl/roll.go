@@ -203,8 +203,12 @@ const (
 type Payload = update.Payload
 
 // rollFailure is a definitive failure that ends the roll before the current
-// node is touched.
-type rollFailure struct{ err error }
+// node is touched. reason is the Failed condition's reason; empty means
+// ReasonFailed.
+type rollFailure struct {
+	err    error
+	reason string
+}
 
 func (f rollFailure) Error() string { return f.err.Error() }
 func (f rollFailure) Unwrap() error { return f.err }
@@ -273,7 +277,7 @@ func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update, newest
 		if err != nil {
 			var rf rollFailure
 			if errors.As(err, &rf) {
-				c.fail(u, rf.Error())
+				c.failWith(u, rf.reason, rf.Error())
 				return idleResync
 			}
 			c.progress(u, ReasonRetrying, fmt.Sprintf("node %s: %v", e.Name, err))
@@ -669,18 +673,26 @@ func (c *Controller) ensureResolved(ctx context.Context, u *updatesv1alpha1.Upda
 	}
 	if err != nil {
 		err = fmt.Errorf("resolve %s: %w", u.Spec.Version, err)
+		if errors.Is(err, ErrReleasePinMismatch) {
+			c.setCondition(u, ConditionResolved, metav1.ConditionFalse, ReasonReleasePinMismatch, err.Error())
+			return rollFailure{err: err, reason: ReasonReleasePinMismatch}
+		}
 		if errors.Is(err, ErrRelease) {
-			return rollFailure{err}
+			return rollFailure{err: err}
 		}
 		prev := meta.FindStatusCondition(u.Status.Conditions, ConditionResolved)
 		c.setCondition(u, ConditionResolved, metav1.ConditionFalse, ReasonRetrying, err.Error())
 		if prev != nil && prev.Status == metav1.ConditionFalse && now.Sub(prev.LastTransitionTime.Time) > ResolveBound {
-			return rollFailure{fmt.Errorf("the release did not resolve within %s; last error: %w", ResolveBound, err)}
+			return rollFailure{err: fmt.Errorf("the release did not resolve within %s; last error: %w", ResolveBound, err)}
 		}
 		return err
 	}
 	u.Status.Resolved = &updatesv1alpha1.UpdateResolved{Version: u.Spec.Version, Digest: "sha256:" + rel.SHA256}
-	c.setCondition(u, ConditionResolved, metav1.ConditionTrue, ReasonResolved, rel.URL+" sha256:"+rel.SHA256)
+	reason := ReasonResolved
+	if rel.Pinned {
+		reason = ReasonResolvedPinned
+	}
+	c.setCondition(u, ConditionResolved, metav1.ConditionTrue, reason, rel.URL+" sha256:"+rel.SHA256)
 	return nil
 }
 
@@ -827,10 +839,20 @@ func (c *Controller) progress(u *updatesv1alpha1.Update, reason, msg string) {
 
 // fail ends the roll Failed. Nodes not reached stay Pending.
 func (c *Controller) fail(u *updatesv1alpha1.Update, msg string) {
+	c.failWith(u, ReasonFailed, msg)
+}
+
+// failWith ends the roll Failed with reason on the Failed condition (empty
+// means ReasonFailed). Progressing and Succeeded keep ReasonFailed, the end
+// state every reader of the Update tests for.
+func (c *Controller) failWith(u *updatesv1alpha1.Update, reason, msg string) {
+	if reason == "" {
+		reason = ReasonFailed
+	}
 	u.Status.Phase = updatesv1alpha1.UpdatePhaseFailed
 	c.setCondition(u, ConditionProgressing, metav1.ConditionFalse, ReasonFailed, msg)
 	c.setCondition(u, ConditionSucceeded, metav1.ConditionFalse, ReasonFailed, msg)
-	c.setCondition(u, ConditionFailed, metav1.ConditionTrue, ReasonFailed, msg)
+	c.setCondition(u, ConditionFailed, metav1.ConditionTrue, reason, msg)
 }
 
 // cancelFrom marks every entry from i on that has not started Cancelled and

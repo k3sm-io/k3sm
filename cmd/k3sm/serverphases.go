@@ -672,12 +672,15 @@ func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.C
 		logger.Error("update controller disabled: no update signer", "err", err)
 		return noStop
 	}
+	// The release pin root writes with `k3sm update apply --pin-sha256` binds a
+	// roll to its digest before any node is touched.
+	resolver := updatectl.PinnedResolver{Resolver: updateResolver(plan.opts.updateReleaseBase), WorkDir: plan.opts.workDir, Log: logger}
 	c, err := updatectl.New(updatectl.Config{
 		Client:      cs,
 		Dynamic:     dyn,
 		CRD:         crd,
 		ServerNode:  plan.opts.nodeName,
-		Resolver:    updateResolver(plan.opts.updateReleaseBase),
+		Resolver:    resolver,
 		IssueSigner: issueSigner,
 		Log:         logger,
 	})

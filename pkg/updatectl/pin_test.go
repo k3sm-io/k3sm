@@ -1,0 +1,294 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package updatectl
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+
+	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
+	"k3sm.io/k3sm/pkg/certs"
+)
+
+const otherSum = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+// testOwner is the uid the tests hold the pin to: the test process's own,
+// since a test cannot create root-owned files.
+func testOwner() uint32 { return uint32(os.Getuid()) }
+
+// pinWorkDir is a work dir with a pin for version and sum written by the
+// test's own uid.
+func pinWorkDir(t *testing.T, version, sum string) string {
+	t.Helper()
+	wd := t.TempDir()
+	if err := writeReleasePin(wd, ReleasePin{Version: version, SHA256: sum, At: rigStart}, testOwner()); err != nil {
+		t.Fatal(err)
+	}
+	return wd
+}
+
+func pinned(r Resolver, wd string) PinnedResolver {
+	return PinnedResolver{Resolver: r, WorkDir: wd, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), owner: testOwner()}
+}
+
+// TestPinnedResolverRefusesDigestMismatch is the release pin's gate: a pin for
+// the target whose digest the release's checksums file does not carry ends
+// the Update Failed with the reason ReleasePinMismatch before any node is
+// cordoned, and a matching pin records the pinned digest with the reason
+// ResolvedPinned, which then rides every node's CA-signed payload.
+func TestPinnedResolverRefusesDigestMismatch(t *testing.T) {
+	ctx := context.Background()
+	t.Run("resolver", func(t *testing.T) {
+		noEntry := fmt.Errorf("%w: checksums file has no entry for k3sm_0.2.0_darwin_arm64.tar.gz", ErrRelease)
+		for _, tc := range []struct {
+			name       string
+			pin        *ReleasePin
+			inner      error
+			wantErr    error
+			wantPinned bool
+		}{
+			{name: "no pin resolves unpinned"},
+			{name: "a pin for another version is ignored", pin: &ReleasePin{Version: "v0.1.9", SHA256: otherSum}},
+			{name: "a matching pin", pin: &ReleasePin{Version: target, SHA256: targetSum}, wantPinned: true},
+			{name: "a mismatching pin", pin: &ReleasePin{Version: target, SHA256: otherSum}, wantErr: ErrReleasePinMismatch},
+			{name: "no checksums entry under a pin", pin: &ReleasePin{Version: target, SHA256: targetSum}, inner: noEntry, wantErr: ErrReleasePinMismatch},
+			{name: "a transient error under a pin is retried", pin: &ReleasePin{Version: target, SHA256: targetSum}, inner: errors.New("connection refused")},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				wd := t.TempDir()
+				if tc.pin != nil {
+					wd = pinWorkDir(t, tc.pin.Version, tc.pin.SHA256)
+				}
+				rel, err := pinned(&fakeResolver{err: tc.inner}, wd).Resolve(ctx, target)
+				switch {
+				case tc.wantErr != nil:
+					if !errors.Is(err, tc.wantErr) || !errors.Is(err, ErrRelease) {
+						t.Fatalf("err = %v, want %v wrapping ErrRelease", err, tc.wantErr)
+					}
+				case tc.inner != nil:
+					if err == nil || errors.Is(err, ErrRelease) {
+						t.Fatalf("err = %v, want the transient error unchanged", err)
+					}
+				case err != nil:
+					t.Fatalf("resolve: %v", err)
+				case rel.Pinned != tc.wantPinned || rel.SHA256 != targetSum:
+					t.Fatalf("release %+v, want pinned=%v", rel, tc.wantPinned)
+				}
+			})
+		}
+	})
+
+	t.Run("a pin that cannot be trusted refuses", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			setup func(t *testing.T, wd string)
+			owner uint32
+		}{
+			{name: "group-writable file", setup: func(t *testing.T, wd string) { chmod(t, ReleasePinPath(wd), 0o664) }},
+			{name: "world-writable directory", setup: func(t *testing.T, wd string) { chmod(t, ReleasePinDir(wd), 0o757) }},
+			{name: "another owner", owner: testOwner() + 1},
+			{name: "symlinked file", setup: func(t *testing.T, wd string) {
+				elsewhere := filepath.Join(t.TempDir(), "pin")
+				mv(t, ReleasePinPath(wd), elsewhere)
+				symlink(t, elsewhere, ReleasePinPath(wd))
+			}},
+			{name: "symlinked directory", setup: func(t *testing.T, wd string) {
+				elsewhere := filepath.Join(t.TempDir(), "update")
+				mv(t, ReleasePinDir(wd), elsewhere)
+				symlink(t, elsewhere, ReleasePinDir(wd))
+			}},
+			{name: "malformed record", setup: func(t *testing.T, wd string) { write(t, ReleasePinPath(wd), "{not json") }},
+			{name: "unknown field", setup: func(t *testing.T, wd string) {
+				write(t, ReleasePinPath(wd), `{"version":"v0.2.0","sha256":"`+targetSum+`","at":"2026-10-18T00:00:00Z","extra":1}`)
+			}},
+			{name: "bad digest", setup: func(t *testing.T, wd string) {
+				write(t, ReleasePinPath(wd), `{"version":"v0.2.0","sha256":"ABC","at":"2026-10-18T00:00:00Z"}`)
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				wd := pinWorkDir(t, target, targetSum)
+				if tc.setup != nil {
+					tc.setup(t, wd)
+				}
+				r := pinned(&fakeResolver{}, wd)
+				if tc.owner != 0 {
+					r.owner = tc.owner
+				}
+				// Another version: an untrusted pin refuses whatever the target.
+				for _, tag := range []string{target, "v0.3.0"} {
+					if _, err := r.Resolve(ctx, tag); !errors.Is(err, ErrReleasePinMismatch) || !errors.Is(err, ErrRelease) {
+						t.Fatalf("resolve %s: err = %v, want ErrReleasePinMismatch", tag, err)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("a mismatch fails the Update before any node is cordoned", func(t *testing.T) {
+		r := newRig(t, threeNodes()...)
+		wd := pinWorkDir(t, target, otherSum)
+		r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+		r.drive(pinnedController(r, wd), nil)
+		u := r.update(updatesv1alpha1.UpdateName)
+		failed := meta.FindStatusCondition(u.Status.Conditions, ConditionFailed)
+		if u.Status.Phase != updatesv1alpha1.UpdatePhaseFailed || failed == nil || failed.Reason != ReasonReleasePinMismatch ||
+			!strings.Contains(failed.Message, otherSum) || !strings.Contains(failed.Message, targetSum) {
+			t.Fatalf("phase %q, Failed %+v", u.Status.Phase, failed)
+		}
+		if c := meta.FindStatusCondition(u.Status.Conditions, ConditionResolved); c == nil || c.Reason != ReasonReleasePinMismatch {
+			t.Fatalf("Resolved %+v", c)
+		}
+		if u.Status.Resolved != nil {
+			t.Fatalf("a refused release was recorded: %+v", u.Status.Resolved)
+		}
+		if !finished(u) {
+			t.Fatal("the refused Update is not finished")
+		}
+		if got := r.log(); len(got) != 0 {
+			t.Fatalf("a node was touched: %v", got)
+		}
+	})
+
+	t.Run("a match records ResolvedPinned and signs the pinned digest", func(t *testing.T) {
+		r := newRig(t, threeNodes()...)
+		wd := pinWorkDir(t, target, targetSum)
+		r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+		c := pinnedController(r, wd)
+		if _, err := c.reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		u := r.update(updatesv1alpha1.UpdateName)
+		if res := u.Status.Resolved; res == nil || res.Digest != "sha256:"+targetSum {
+			t.Fatalf("resolved %+v", res)
+		}
+		if cond := meta.FindStatusCondition(u.Status.Conditions, ConditionResolved); cond == nil || cond.Reason != ReasonResolvedPinned {
+			t.Fatalf("Resolved %+v", cond)
+		}
+		if p := r.node("w1").Annotations[updatesv1alpha1.AnnotationUpdatePayload]; !strings.Contains(p, targetSum) {
+			t.Fatalf("payload %s", p)
+		}
+		r.drive(c, nil)
+		if got := r.update(updatesv1alpha1.UpdateName).Status.Phase; got != updatesv1alpha1.UpdatePhaseSucceeded {
+			t.Fatalf("phase %q", got)
+		}
+	})
+
+	t.Run("without a pin the reason stays Resolved", func(t *testing.T) {
+		r := newRig(t, threeNodes()...)
+		r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+		if _, err := pinnedController(r, t.TempDir()).reconcile(ctx); err != nil {
+			t.Fatal(err)
+		}
+		u := r.update(updatesv1alpha1.UpdateName)
+		if cond := meta.FindStatusCondition(u.Status.Conditions, ConditionResolved); cond == nil || cond.Reason != ReasonResolved {
+			t.Fatalf("Resolved %+v", cond)
+		}
+	})
+}
+
+// TestReleasePinWriteAndRemove pins the writer: the record round-trips, the
+// file is 0644 in a 0755 directory, a bad record or an untrusted directory is
+// refused, and removing is idempotent.
+func TestReleasePinWriteAndRemove(t *testing.T) {
+	wd := t.TempDir()
+	want := ReleasePin{Version: target, SHA256: targetSum, At: time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)}
+	if err := writeReleasePin(wd, want, testOwner()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readReleasePin(wd, testOwner())
+	if err != nil || got == nil || *got != want {
+		t.Fatalf("read back %+v, %v", got, err)
+	}
+	for path, mode := range map[string]os.FileMode{ReleasePinDir(wd): 0o755, ReleasePinPath(wd): 0o644} {
+		fi, err := os.Lstat(path)
+		if err != nil || fi.Mode().Perm() != mode {
+			t.Fatalf("%s: %v, %v; want %v", path, fi.Mode(), err, mode)
+		}
+	}
+	for _, bad := range []ReleasePin{{Version: "v0.2.0;rm", SHA256: targetSum}, {Version: target, SHA256: strings.ToUpper(targetSum)}} {
+		if err := writeReleasePin(wd, bad, testOwner()); err == nil {
+			t.Fatalf("wrote %+v", bad)
+		}
+	}
+	if err := writeReleasePin(wd, want, testOwner()+1); err == nil {
+		t.Fatal("wrote into a directory another uid owns")
+	}
+	if removed, err := removeReleasePin(wd, testOwner()); !removed || err != nil {
+		t.Fatalf("remove: %v, %v", removed, err)
+	}
+	if removed, err := removeReleasePin(wd, testOwner()); removed || err != nil {
+		t.Fatalf("second remove: %v, %v", removed, err)
+	}
+	if removed, err := removeReleasePin(t.TempDir(), testOwner()); removed || err != nil {
+		t.Fatalf("remove with no directory: %v, %v", removed, err)
+	}
+	if got, err := readReleasePin(wd, testOwner()); got != nil || err != nil {
+		t.Fatalf("read after remove: %+v, %v", got, err)
+	}
+}
+
+func pinnedController(r *rig, wd string) *Controller {
+	r.t.Helper()
+	c, err := New(Config{
+		Client: r.cs, Dynamic: r.dyn, Resolver: pinned(r.resolver, wd), ServerNode: serverName,
+		IssueSigner: func() (*certs.UpdateSigner, error) { return testSigning().signer, nil },
+		Now:         func() time.Time { return r.now }, Recorder: r.recorder,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return c
+}
+
+func chmod(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mv(t *testing.T, from, to string) {
+	t.Helper()
+	if err := os.Rename(from, to); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func write(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -346,6 +346,12 @@ func newUpdateCluster(objs ...runtime.Object) updateCluster {
 // run runs `k3sm update <args>` against the cluster, with --yes or not.
 func (c updateCluster) run(t *testing.T, args ...string) (code int, out, errOut string) {
 	t.Helper()
+	return c.runWith(t, nil, args...)
+}
+
+// runWith is run with env adjusted by mutate first (nil changes nothing).
+func (c updateCluster) runWith(t *testing.T, mutate func(*updateEnv), args ...string) (code int, out, errOut string) {
+	t.Helper()
 	var o, e bytes.Buffer
 	env := updateEnv{
 		out:    &o,
@@ -360,6 +366,9 @@ func (c updateCluster) run(t *testing.T, args ...string) (code int, out, errOut 
 		dyn:        c.dyn,
 		in:         strings.NewReader(""),
 		watchEvery: time.Millisecond,
+	}
+	if mutate != nil {
+		mutate(&env)
 	}
 	code = runUpdate(context.Background(), args, env)
 	return code, o.String(), e.String()
@@ -782,4 +791,120 @@ func TestUpdateRecorderPublishesTheLatestOnItsNode(t *testing.T) {
 	if nodeAnnotationPublisher(nil, "studio") != nil || nodeAnnotationPublisher(cs, "") != nil {
 		t.Error("a publisher with no client or no Node name publishes")
 	}
+}
+
+// TestUpdateApplyPinRequiresRoot pins the release pin's CLI half: only root
+// writes or clears the pin, --pin-sha256 needs --version and a well-formed
+// digest, nothing is written while an Update is in progress, and the pin is
+// written before the Update is created. Without the flags apply is unchanged.
+func TestUpdateApplyPinRequiresRoot(t *testing.T) {
+	const sum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	behind := version.Info{KubeVersion: "v1.36.2", Version: "0.1.7"}.NodeVersion()
+	server := kubeletNode("studio", behind)
+	server.Labels = map[string]string{"node-role.kubernetes.io/control-plane": "true"}
+
+	// pins records the seams' calls; asRoot wires them and sets root.
+	type pins struct {
+		written []updatectl.ReleasePin
+		cleared int
+		// updateAtWrite is whether an Update existed when the pin was written.
+		updateAtWrite bool
+	}
+	asRoot := func(c updateCluster, p *pins, root bool) func(*updateEnv) {
+		return func(env *updateEnv) {
+			env.root = root
+			env.workDir = t.TempDir()
+			env.writePin = func(_ string, pin updatectl.ReleasePin) error {
+				u, _ := getUpdate(context.Background(), c.dyn)
+				p.updateAtWrite = u != nil
+				p.written = append(p.written, pin)
+				return nil
+			}
+			env.clearPin = func(string) (bool, error) { p.cleared++; return true, nil }
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		root     bool
+		args     []string
+		wantCode int
+		wantErr  string
+	}{
+		{name: "pin as a user", args: []string{"apply", "--yes", "--version", "v0.2.0", "--pin-sha256", sum}, wantCode: exitInternalError, wantErr: "must run as root"},
+		{name: "an empty pin as a user", args: []string{"apply", "--yes", "--version", "v0.2.0", "--pin-sha256", ""}, wantCode: exitInternalError, wantErr: "must run as root"},
+		{name: "clear as a user", args: []string{"apply", "--clear-pin"}, wantCode: exitInternalError, wantErr: "must run as root"},
+		{name: "pin without --version", root: true, args: []string{"apply", "--yes", "--pin-sha256", sum}, wantCode: exitUsage, wantErr: "--version"},
+		{name: "a malformed digest", root: true, args: []string{"apply", "--yes", "--version", "v0.2.0", "--pin-sha256", strings.ToUpper(sum)}, wantCode: exitUsage, wantErr: "64 lowercase hex"},
+		{name: "clear with another flag", root: true, args: []string{"apply", "--clear-pin", "--version", "v0.2.0"}, wantCode: exitUsage, wantErr: "takes no other flag"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newUpdateCluster(server)
+			var p pins
+			code, _, errOut := c.runWith(t, asRoot(c, &p, tc.root), tc.args...)
+			if code != tc.wantCode || !strings.Contains(errOut, tc.wantErr) {
+				t.Fatalf("exit %d, stderr %q; want %d and %q", code, errOut, tc.wantCode, tc.wantErr)
+			}
+			if len(p.written) != 0 || p.cleared != 0 {
+				t.Fatalf("the pin was touched: %+v", p)
+			}
+			if u, _ := getUpdate(context.Background(), c.dyn); u != nil {
+				t.Fatalf("an Update was created: %+v", u.Spec)
+			}
+		})
+	}
+
+	t.Run("root writes the pin, then creates the Update", func(t *testing.T) {
+		c := newUpdateCluster(server)
+		var p pins
+		code, out, errOut := c.runWith(t, asRoot(c, &p, true), "apply", "--yes", "--version", "v0.2.0", "--pin-sha256", sum)
+		if code != 0 {
+			t.Fatalf("exit %d, stderr %s", code, errOut)
+		}
+		if len(p.written) != 1 || p.written[0].Version != "v0.2.0" || p.written[0].SHA256 != sum || p.written[0].At.IsZero() {
+			t.Fatalf("pin %+v", p.written)
+		}
+		if p.updateAtWrite {
+			t.Fatal("the Update existed before the pin was written")
+		}
+		if got := c.get(t).Spec.Version; got != "v0.2.0" {
+			t.Fatalf("Update version %s", got)
+		}
+		if !strings.Contains(out, "Pinned v0.2.0 to sha256:"+sum) {
+			t.Fatalf("output %s", out)
+		}
+
+		// A second pinned apply while that Update is in progress writes nothing.
+		c.setStatus(t, updatesv1alpha1.UpdateStatus{
+			Phase:      updatesv1alpha1.UpdatePhaseRolling,
+			Conditions: []metav1.Condition{progressing(metav1.ConditionTrue, updatectl.ReasonRolling)},
+		})
+		code, _, errOut = c.runWith(t, asRoot(c, &p, true), "apply", "--yes", "--version", "v0.2.1", "--pin-sha256", sum)
+		if code != exitInternalError || !strings.Contains(errOut, "is Rolling") || len(p.written) != 1 {
+			t.Fatalf("pinned apply while Rolling: exit %d, stderr %q, pins %+v", code, errOut, p.written)
+		}
+	})
+
+	t.Run("root clears the pin without touching the cluster", func(t *testing.T) {
+		c := newUpdateCluster(server)
+		var p pins
+		code, out, errOut := c.runWith(t, asRoot(c, &p, true), "apply", "--clear-pin")
+		if code != 0 || p.cleared != 1 || !strings.Contains(out, "Removed the release pin") {
+			t.Fatalf("exit %d, stderr %q, out %q, cleared %d", code, errOut, out, p.cleared)
+		}
+		if u, _ := getUpdate(context.Background(), c.dyn); u != nil {
+			t.Fatalf("--clear-pin created an Update: %+v", u.Spec)
+		}
+	})
+
+	t.Run("without the flags apply never touches the pin", func(t *testing.T) {
+		c := newUpdateCluster(server)
+		var p pins
+		if code, _, errOut := c.runWith(t, asRoot(c, &p, true), "apply", "--yes", "--version", "v0.2.0"); code != 0 {
+			t.Fatalf("exit %d, stderr %s", code, errOut)
+		}
+		if len(p.written) != 0 || p.cleared != 0 {
+			t.Fatalf("the pin was touched: %+v", p)
+		}
+	})
 }
