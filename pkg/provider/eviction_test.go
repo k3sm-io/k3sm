@@ -189,10 +189,13 @@ func sortBy(cands []evictionCandidate, cmpNames []string) {
 
 // fakeEvictionTarget records what the manager asks of the runtime.
 type fakeEvictionTarget struct {
-	mu         sync.Mutex
-	cands      []evictionCandidate
-	candCalls  int
-	evicted    []string
+	mu        sync.Mutex
+	cands     []evictionCandidate
+	candCalls int
+	evicted   []string
+	// notices is every evictionNotice the manager passed, in order: the firing
+	// signal and the message of each eviction.
+	notices    []evictionNotice
 	candidates func() []evictionCandidate
 }
 
@@ -206,10 +209,11 @@ func (f *fakeEvictionTarget) evictionCandidates(context.Context) []evictionCandi
 	return slices.Clone(f.cands)
 }
 
-func (f *fakeEvictionTarget) evictPod(_ context.Context, pod *corev1.Pod, _ evictionNotice) error {
+func (f *fakeEvictionTarget) evictPod(_ context.Context, pod *corev1.Pod, n evictionNotice) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.evicted = append(f.evicted, pod.Name)
+	f.notices = append(f.notices, n)
 	return nil
 }
 
