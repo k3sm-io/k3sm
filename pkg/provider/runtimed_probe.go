@@ -486,9 +486,11 @@ func (r *runtimedRuntime) publishStatusUpdate(ctx context.Context, id string) {
 }
 
 // observeProbeInstances feeds one runtime status observation to the pod's
-// prober, so liveness follows container instances: it is held while a liveness
-// restart is in flight, skipped while the current instance is not running, and
-// delayed by initialDelaySeconds from a replacement instance's start. It rides
+// prober, so probe state follows container instances: liveness is held while a
+// liveness restart is in flight and skipped while the current instance is not
+// running; a replacement instance, whatever restarted it, starts with fresh
+// startup and readiness state, and every probe waits initialDelaySeconds from
+// that instance's start. It rides
 // buildStatus, the convergence every status path shares, so the prober sees each
 // instance change whichever path delivered it. ps is the prober the status is
 // being built with; a pod without one (or a test's fake probeState) is skipped.

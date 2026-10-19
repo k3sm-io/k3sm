@@ -202,10 +202,10 @@ type containerMonitor struct {
 	//
 	// instanceID is the container id of the last observed instance ("" until one
 	// is observed). running and startedAt describe that instance. replacement is
-	// true when the instance replaced an earlier observed one: its liveness probe
-	// then waits initialDelaySeconds from ITS start, as the kubelet measures the
-	// delay from the running container's StartedAt, while the first instance's
-	// delay is the probe loop's own initial wait.
+	// true when the instance replaced an earlier observed one: its probes then
+	// wait initialDelaySeconds from ITS start, as the kubelet measures the delay
+	// from the running container's StartedAt, while the first instance's delay is
+	// the probe loop's own initial wait.
 	//
 	// held is the liveness hold a committed liveness failure sets: the restart is
 	// asynchronous (a re-exec worker, possibly waiting out CrashLoopBackOff), so
@@ -271,26 +271,51 @@ func (m *containerMonitor) livenessEligibleLocked() bool {
 	return m.instanceID == "" || m.running
 }
 
-// inLivenessDelay reports whether now is still inside a replacement instance's
-// initialDelaySeconds, measured from that instance's start: the kubelet skips a
-// probe while time.Since(State.Running.StartedAt) < InitialDelaySeconds, so a
-// restarted container gets the same grace its first instance got.
-func (m *containerMonitor) inLivenessDelay(now time.Time) bool {
+// inInitialDelay reports whether now is still inside a replacement instance's
+// initialDelaySeconds for the given probe, measured from that instance's start:
+// the kubelet skips a probe of any kind while
+// time.Since(State.Running.StartedAt) < InitialDelaySeconds, so a restarted
+// container gets the same grace its first instance got.
+func (m *containerMonitor) inInitialDelay(kind probeKind, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.liveness == nil || !m.replacement || m.liveness.sched.initialDelay <= 0 {
+	s := m.specLocked(kind)
+	if s == nil || !m.replacement || s.sched.initialDelay <= 0 {
 		return false
 	}
-	return now.Sub(m.startedAt) < m.liveness.sched.initialDelay
+	return now.Sub(m.startedAt) < s.sched.initialDelay
+}
+
+// specLocked returns the probe of the given kind, or nil when the container does
+// not define it. Caller holds mu (the specs themselves are fixed at creation).
+func (m *containerMonitor) specLocked(kind probeKind) *probeSpec {
+	switch kind {
+	case probeStartup:
+		return m.startup
+	case probeReadiness:
+		return m.readiness
+	case probeLiveness:
+		return m.liveness
+	default:
+		return nil
+	}
 }
 
 // observeInstance records one runtime observation of the container: its
 // instance id, whether that instance is running, and when it started. A new
-// instance id is a container restart: the liveness gauge starts over from its
-// initial value (no failure carries across instances) and any liveness hold
-// lifts, because the instance the failure was committed against is gone. An
-// observation with no id says nothing about which instance is current and is
-// ignored, like the kubelet's wait for a container id.
+// instance id is a container restart, whatever caused it (a liveness failure, a
+// crash, an exit the restartPolicy restarts): the liveness gauge starts over
+// from its initial value (no failure carries across instances) and any liveness
+// hold lifts, because the instance the failure was committed against is gone.
+// When the new instance replaces an earlier observed one, the startup and
+// readiness gauges start over too, the kubelet's per-instance prober worker
+// seeding each result with its initial value: the replacement is not started
+// until its startup probe succeeds again, and not ready until a readiness
+// success after its initialDelaySeconds (inInitialDelay). The first observed
+// instance keeps whatever its probes already committed, since it is the
+// instance they ran against. An observation with no id says nothing about which
+// instance is current and is ignored, like the kubelet's wait for a container
+// id.
 func (m *containerMonitor) observeInstance(id string, running bool, startedAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -305,6 +330,14 @@ func (m *containerMonitor) observeInstance(id string, running bool, startedAt ti
 		}
 		if m.liveness != nil {
 			m.liveness.gauge.reset(outcomeSuccess)
+		}
+		if m.replacement {
+			if m.startup != nil {
+				m.startup.gauge.reset(outcomeUnknown)
+			}
+			if m.readiness != nil {
+				m.readiness.gauge.reset(outcomeFailure)
+			}
 		}
 	}
 	m.running = running
@@ -636,7 +669,7 @@ func (pp *podProber) tick(ctx context.Context, m *containerMonitor, kind probeKi
 	if !m.shouldProbe(kind) {
 		return
 	}
-	if kind == probeLiveness && m.inLivenessDelay(pp.clk.Now()) {
+	if m.inInitialDelay(kind, pp.clk.Now()) {
 		return
 	}
 	raw, evaluated := pp.runCheck(ctx, m.name, kind, s)
