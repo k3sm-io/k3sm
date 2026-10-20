@@ -40,15 +40,15 @@ import (
 // installed base.
 const (
 	// DefaultZotVersion is THE zot module version the registry child is built
-	// from. v2.1.20 is the newest v2.1.x tag at the time of writing and it was
-	// chosen by BUILDING it: `go install zotregistry.dev/zot/v2/cmd/zot@v2.1.20`
+	// from. v2.1.22 is the newest v2.1.x tag at the time of writing and it was
+	// chosen by BUILDING it: `go install zotregistry.dev/zot/v2/cmd/zot@v2.1.22`
 	// completes CGO_ENABLED=0 for darwin/arm64 out of module, and the resulting
 	// binary was driven through the four behaviours this package depends on —
 	// authenticated push accepted, anonymous push refused 401, anonymous pull
 	// served, and the rendered config accepted by zot's STRICT loader (it
 	// UnmarshalExact's the file and fails on any unknown key, so a config this
 	// package renders is either exactly right or refused at boot).
-	DefaultZotVersion = "v2.1.20"
+	DefaultZotVersion = "v2.1.22"
 	// ZotBinaryName is the staged binary's basename (in the workdir bin, in an
 	// install payload, and in the release archive).
 	ZotBinaryName = "zot"

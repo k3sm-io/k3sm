@@ -896,7 +896,7 @@ FAKE
 	echo "==> the build stamp of kine, etcd, etcdutl and zot (go version -m captures; dep lists trimmed)"
 	local kind want fx2
 	for kind in kine etcd etcdutl zot; do
-		case "$kind" in kine) want=v0.17.2 ;; zot) want=v2.1.20 ;; *) want=v3.6.15 ;; esac
+		case "$kind" in kine) want=v0.17.2 ;; zot) want=v2.1.22 ;; *) want=v3.6.15 ;; esac
 		fx2="$td/goversion-$kind.txt"
 		if out="$(buildinfo_problems "$kind" "$want" go1.27.2 <"$fx2")"; then ok "$kind capture passes"; else bad "$kind capture rejected: $out"; fi
 		if out="$(buildinfo_problems "$kind" "$want" go1.27.9 <"$fx2")"; then bad "$kind: another toolchain passed"; elif printf '%s\n' "$out" | grep -q "built with 'go1.27.2'"; then ok "$kind: another toolchain is refused"; else bad "$kind: toolchain not named: $out"; fi
@@ -918,8 +918,8 @@ FAKE
 	mkdir -p "$cpd"
 	(
 		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p1 KINE_PATCH=p1 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
-		ZOT_VERSION=v2.1.20 ZOT_VARIANT=minimal HELM_BINARY=helm-v4.3.0
-		printf 'zot\n' >"$cpd/zot"; echo "v2.1.20 minimal" >"$cpd/zot.version"
+		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal HELM_BINARY=helm-v4.3.0
+		printf 'zot\n' >"$cpd/zot"; echo "v2.1.22 minimal" >"$cpd/zot.version"
 		printf 'helm\n' >"$cpd/helm-v4.3.0"
 		printf 'mach-o...v0.17.2+p1...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p1" >"$cpd/kine.version"
 		printf 'etcd\n' >"$cpd/etcd"; echo "v3.6.15 nocgo" >"$cpd/etcd.version"
@@ -935,9 +935,9 @@ FAKE
 		rm "$cpd/etcdutl"
 		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif printf '%s\n' "$o" | grep -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
 		printf 'etcdutl\n' >"$cpd/etcdutl"
-		echo "v2.1.19 minimal" >"$cpd/zot.version"
-		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
 		echo "v2.1.20 minimal" >"$cpd/zot.version"
+		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
+		echo "v2.1.22 minimal" >"$cpd/zot.version"
 		rm "$cpd/zot" "$cpd/helm-v4.3.0"
 		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a payload without zot and helm passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot: not staged" && printf '%s\n' "$o" | grep -q "helm-v4.3.0: not staged"; then echo "  ok    a missing zot and a missing helm are refused"; else echo "  FAIL  missing zot or helm not named: $o"; r=1; fi
 		exit "$r"
