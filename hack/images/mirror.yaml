@@ -51,9 +51,9 @@ images:
         digest: sha256:a461e7f0ce921972028acfbed628d45663d83e67ac1230722c2b34cf72760a0d
 
   - name: debian
-    upstream: docker.io/library/debian:trixie-20260918-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
-    mirror: ghcr.io/k3sm-io/mirror/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
-    tag: trixie-20260918-slim
+    upstream: docker.io/library/debian:trixie-20261005-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+    mirror: ghcr.io/k3sm-io/mirror/debian@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+    tag: trixie-20261005-slim
     platforms:
       - platform: linux/arm64/v8
-        digest: sha256:da496358bd6934d2bd6a563a33176a2e50eff5490c54b4ac6fb051b69fef4071
+        digest: sha256:a2ca65377c251208de42e1a2722cb949211236c161b634f6f3663754e2d06850
