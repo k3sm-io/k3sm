@@ -22,6 +22,7 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // artifactKind classifies a manifest entry so install/uninstall can perform the
@@ -153,6 +154,9 @@ func artifactManifest(cfg Config) []artifact {
 	// terms: it is what lets the work-dir seed replace a stale control-plane set after a
 	// binary-only upgrade, and a pre-marker archive has none, so it is not asserted.
 	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KubeMarkerName), assertExists: false})
+	// The zot version marker rides beside the zot binary on the same terms: the server
+	// seeds its registry from the payload zot only when this marker vouches for the pin.
+	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", registrysvc.ZotMarkerName), assertExists: false})
 	items = append(items, []artifact{
 		// Forward-declared: the cp-payload bin tree + relocated k3sm-netd land
 		// under InstallDir once the packaging follow-up moves them off DataRoot. They
