@@ -569,7 +569,7 @@ golang.org/x/tools/go/expect v0.1.1-deprecated # 2025-06-13T18:44:18Z
 golang.org/x/tools/go/packages/packagestest v0.1.1-deprecated # 2025-06-13T18:44:18Z
 golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da # 2024-09-03T12:06:38Z
 golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 # 2023-01-26T15:27:24Z
-golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446 # 2026-05-22T21:04:24Z
+golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f # 2026-10-06T16:45:05Z
 gonum.org/v1/gonum v0.17.0 # 2025-12-29T19:16:44Z
 gonum.org/v1/netlib v0.0.0-20190313105609-8cb42192e0e0 # 2019-03-13T10:56:09Z
 gonum.org/v1/plot v0.15.2 # 2025-03-12T19:21:08Z
