@@ -21,7 +21,7 @@
 # the compiler; each caller refuses any other version before it builds anything.
 # Bump it deliberately, with the Go toolchain the repos move to.
 # shellcheck disable=SC2034 # read by the sourcing script
-PAYLOAD_GO_VERSION="go1.27.2"
+PAYLOAD_GO_VERSION="go1.27.3"
 
 # The go command the toolchain assert asks. Overridable for the self-tests only.
 GO="${GO:-go}"
