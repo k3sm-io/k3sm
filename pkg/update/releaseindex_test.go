@@ -99,6 +99,9 @@ var releaseIndexReds = []struct {
 	{"issued-at-impossible-date", replace(`2026-11-02T18:04:11Z`, `2026-02-30T18:04:11Z`), "issuedAt is not"},
 	{"minimum-macos-word", replace(`"26.0"`, `"Tahoe"`), "minimumMacOS is not"},
 	{"minimum-macos-four-parts", replace(`"26.0"`, `"26.0.0.1"`), "minimumMacOS is not"},
+	{"minimum-supported-tag-above-tag", replace(`"minimumSupportedTag": "v0.1.0"`, `"minimumSupportedTag": "v0.3.0"`), "minimumSupportedTag v0.3.0 is above tag v0.2.0"},
+	{"minimum-supported-tag-rc", replace(`"minimumSupportedTag": "v0.1.0"`, `"minimumSupportedTag": "v0.1.0-rc.1"`), "minimumSupportedTag is not a final release tag"},
+	{"minimum-supported-tag-missing", replace(`  "minimumSupportedTag": "v0.1.0",`+"\n", ``), "minimumSupportedTag is not a final release tag"},
 	{"other-bundle-id", replace(`"io.k3sm.app"`, `"io.k3sm.app2"`), "bundleID is not"},
 	{"short-version-mismatch", replace(`"shortVersion": "0.2.0"`, `"shortVersion": "0.2.1"`), "shortVersion is not"},
 	{"image-name-mismatch", replace(`"name": "k3sm_0.2.0_darwin_arm64.dmg"`, `"name": "k3sm_0.2.0_darwin_amd64.dmg"`), "image name is not"},
@@ -145,7 +148,7 @@ func TestReleaseIndexSchemaGolden(t *testing.T) {
 		t.Fatalf("the golden index is refused: %v", err)
 	}
 	if ix.Schema != ReleaseIndexSchema || ix.Context != ReleaseIndexContext || ix.Tag != "v0.2.0" ||
-		ix.App.ShortVersion != "0.2.0" || ix.App.Image.Size != 123456789 ||
+		ix.MinimumSupportedTag != "v0.1.0" || ix.App.ShortVersion != "0.2.0" || ix.App.Image.Size != 123456789 ||
 		ix.App.Image.URL != strings.Trim(goldenURL, `"`) || ix.K3sm.Archive != "k3sm_0.2.0_darwin_arm64.tar.gz" {
 		t.Errorf("the golden index decoded to %+v", ix)
 	}
@@ -215,6 +218,51 @@ func TestReleaseIndexSchemaGolden(t *testing.T) {
 			t.Errorf("allowed-hosts.json is\n%s\nbut AllowedHosts encodes as\n%s", got, want)
 		}
 	})
+}
+
+// TestReleaseIndexMinimumSupportedTag pins the go-back floor: the golden
+// carries minimumSupportedTag right after minimumMacOS, a final tag at or
+// below tag is accepted, and anything else is refused for its own reason.
+func TestReleaseIndexMinimumSupportedTag(t *testing.T) {
+	golden := string(readReleaseIndexFixture(t, "index.json"))
+	if !strings.Contains(golden, `"minimumMacOS": "26.0",`+"\n"+`  "minimumSupportedTag": "v0.1.0",`+"\n") {
+		t.Fatal("the golden index does not carry minimumSupportedTag right after minimumMacOS")
+	}
+	const field = `"minimumSupportedTag": "v0.1.0"`
+	tests := []struct {
+		name, value, reason string
+	}{
+		{name: "an older final release", value: "v0.1.0"},
+		{name: "the release itself", value: "v0.2.0"},
+		{name: "the first release", value: "v0.0.0"},
+		{name: "an older patch compares numerically", value: "v0.1.10"},
+		{name: "a newer patch", value: "v0.2.1", reason: "minimumSupportedTag v0.2.1 is above tag v0.2.0"},
+		{name: "a newer major", value: "v1.0.0", reason: "minimumSupportedTag v1.0.0 is above tag v0.2.0"},
+		{name: "a release candidate of the tag", value: "v0.2.0-rc.1", reason: "minimumSupportedTag is not a final release tag"},
+		{name: "build metadata", value: "v0.1.0+x", reason: "minimumSupportedTag is not a final release tag"},
+		{name: "no v", value: "0.1.0", reason: "minimumSupportedTag is not a final release tag"},
+		{name: "a leading zero", value: "v0.01.0", reason: "minimumSupportedTag is not a final release tag"},
+		{name: "two parts", value: "v0.1", reason: "minimumSupportedTag is not a final release tag"},
+		{name: "empty", value: "", reason: "minimumSupportedTag is not a final release tag"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := replace(field, `"minimumSupportedTag": "`+tc.value+`"`)(t, golden)
+			ix, err := ParseReleaseIndex([]byte(doc))
+			if tc.reason == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+				if ix.MinimumSupportedTag != tc.value {
+					t.Errorf("minimumSupportedTag decoded as %q, want %q", ix.MinimumSupportedTag, tc.value)
+				}
+				return
+			}
+			if !errors.Is(err, ErrReleaseIndex) || !strings.Contains(err.Error(), tc.reason) {
+				t.Errorf("got %v, want ErrReleaseIndex naming %q", err, tc.reason)
+			}
+		})
+	}
 }
 
 // TestParseReleaseIndexAcceptsEscapedKeys shows the key check runs on decoded
