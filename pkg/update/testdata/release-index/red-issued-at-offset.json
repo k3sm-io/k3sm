@@ -4,6 +4,7 @@
   "issuedAt": "2026-11-02T18:04:11+01:00",
   "tag": "v0.2.0",
   "minimumMacOS": "26.0",
+  "minimumSupportedTag": "v0.1.0",
   "app": {
     "bundleID": "io.k3sm.app",
     "shortVersion": "0.2.0",

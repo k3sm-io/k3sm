@@ -172,6 +172,9 @@
 #   - the decoded fields name exactly this release: the tag, the disk image's
 #     name, sha256 and size, the tarball's name and sealed hash, and the
 #     sha256 of the stage tree's PAYLOAD-SHA256
+#   - the minimum supported tag the index carries is printed, not compared:
+#     the decoder already holds it to a final tag at or below the tag, and
+#     which floor to set is the release's decision
 # Then the checked copy is copied to the alias k3sm_release-index.p7m beside it,
 # refused unless it hashes the same, and both lines are appended to the
 # checksums file after the image's. The draft carries seven assets and step 7
@@ -859,9 +862,10 @@ index_fields() { (cd "$REPO_ROOT" && go run ./hack/release/indexcheck "$1"); }
 
 # release_index_problems <index> <tag> <manifest> <image-copy> <image-sha256>
 # <tarball-sha256>: extract the signed content of <index> and check it decodes
-# and names exactly this release. Prints every problem.
+# and names exactly this release. Prints every problem, or on success the
+# minimum supported tag the index carries.
 release_index_problems() {
-	local ix="$1" tag="$2" manifest="$3" image="$4" isha="$5" tsha="$6" x got want rc=0
+	local ix="$1" tag="$2" manifest="$3" image="$4" isha="$5" tsha="$6" x got want floor rc=0
 	x="$(mktemp -d)"
 	chmod 700 "$x"
 	if ! security cms -D -i "$ix" -o "$x/index.json" >/dev/null 2>&1 || [ ! -f "$x/index.json" ]; then
@@ -871,8 +875,10 @@ release_index_problems() {
 		echo "    the decoder refuses the index content:"; printf '%s\n' "$got" | sed 's/^/      /'; rm -rf "$x"; return 1
 	fi
 	rm -rf "$x"
+	floor="$(sed -n 's/^minimum_supported_tag=//p' <<<"$got")"
 	want="$(printf '%s\n' \
 		"tag=$tag" \
+		"minimum_supported_tag=$floor" \
 		"image_name=$(image_name "$tag")" \
 		"image_sha256=$isha" \
 		"image_size=$(stat -f %z "$image")" \
@@ -883,6 +889,8 @@ release_index_problems() {
 		echo "    the index does not name this release (< this release, > the index):"
 		diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | sed -n 's/^\([<>]\)/      \1/p'
 		rc=1
+	else
+		echo "    the index sets the minimum supported tag $floor"
 	fi
 	return "$rc"
 }
@@ -895,7 +903,7 @@ release_index_problems() {
 # checksums lines. upload re-hashes both right before the draft.
 INDEX_SHA256=""
 add_release_index() {
-	local src="$1" tag="$2" dir="$3" manifest="$4" isha="$5" tsha="$6" name xdir copy alias size problems
+	local src="$1" tag="$2" dir="$3" manifest="$4" isha="$5" tsha="$6" name xdir copy alias size report
 	is_rc "$tag" &&
 		refuse index-rc "$tag is a release candidate; a release index is for final releases only; nothing was uploaded."
 	check_index_name "$src" "$tag"
@@ -913,11 +921,12 @@ add_release_index() {
 		rm -rf "$xdir"
 		refuse index-size "the release index is $size bytes, outside 1 to $INDEX_MAX_BYTES; nothing was uploaded."
 	fi
-	if ! problems="$(release_index_problems "$copy" "$tag" "$manifest" "$(asset_path "$dir" "$tag" "$(image_name "$tag")")" "$isha" "$tsha")"; then
-		printf '%s\n' "$problems" >&2
+	if ! report="$(release_index_problems "$copy" "$tag" "$manifest" "$(asset_path "$dir" "$tag" "$(image_name "$tag")")" "$isha" "$tsha")"; then
+		printf '%s\n' "$report" >&2
 		rm -rf "$xdir"
 		refuse index-unverified "the release index failed its checks; nothing was uploaded."
 	fi
+	printf '%s\n' "$report"
 	INDEX_SHA256="$(sha256_of "$copy")"
 	alias="$xdir/$INDEX_ALIAS_NAME"
 	if ! { cp "$copy" "$alias.tmp" && chmod 444 "$alias.tmp" && mv "$alias.tmp" "$alias"; }; then
@@ -1183,7 +1192,7 @@ mk_index() {
 		--argjson size "$(stat -f %z "$im")" --arg archive "$(asset_base "$tag").tar.gz" \
 		--arg asha "$(sha256_of "$d/tree.assets/$(asset_base "$tag").tar.gz")" --arg msha "$(sha256_of "$d/tree/PAYLOAD-SHA256")" \
 		'{schema: "k3sm-release-index/v1", context: "io.k3sm.release-index/v1", issuedAt: "2026-11-02T18:04:11Z",
-		  tag: $tag, minimumMacOS: "26.0",
+		  tag: $tag, minimumMacOS: "26.0", minimumSupportedTag: $tag,
 		  app: {bundleID: "io.k3sm.app", shortVersion: $v,
 		        image: {name: $name, url: ("https://github.com/k3sm-io/k3sm/releases/download/" + $tag + "/" + $name),
 		                sha256: $sha, size: $size}},
@@ -1201,6 +1210,11 @@ index_cases() {
 	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
 	up_promoted "control: a final release with the image and the index is promoted with --latest" 7
+	if grep -qx "    the index sets the minimum supported tag $tag" <<<"$out"; then
+		ok "the minimum supported tag the index carries is printed"
+	else
+		bad "the minimum supported tag is not printed"; printf '%s\n' "$out" | sed 's/^/       /'
+	fi
 	xd="$W/tree.assets/$INDEX_DIR_NAME"
 	ix="$xd/$(index_name "$tag")"
 	sums="$W/tree.assets/$(checksums_name "$tag")"
@@ -1324,6 +1338,10 @@ index_cases() {
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
 	up_refuses "an index the decoder refuses (another context) refuses" index-unverified
 	grep -q "decoder refuses" <<<"$out" || bad "the decoder refusal is not named"
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W" '.minimumSupportedTag = "v0.0.1"'
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	up_refuses "an index whose minimum supported tag is above its tag refuses" index-unverified
+	grep -q "minimumSupportedTag v0.0.1 is above tag $tag" <<<"$out" || bad "the floor above the tag is not named"
 	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W" ".app.image.sha256 = \"$(printf 'b%.0s' $(seq 64))\""
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
 	up_refuses "an index naming another image digest refuses" index-unverified
