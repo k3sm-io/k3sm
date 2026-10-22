@@ -28,7 +28,7 @@ package images
 // procedure and the reviewer merge-precondition.
 const (
 	// Buildkitd is the BuildKit daemon image. It is the mirror of the upstream
-	// moby/buildkit v0.33.0 release index; the mirrored copy is byte-identical, so
+	// moby/buildkit v0.34.0 release index; the mirrored copy is byte-identical, so
 	// this digest is upstream's own and can be re-resolved against the upstream
 	// registry by anyone. The index carries linux/arm64 and linux/amd64, the two
 	// platforms k3sm needs.
@@ -36,7 +36,7 @@ const (
 	// A registry outage does not strand a build: the same digest is servable from
 	// upstream, so pulling it from there and side-loading the result is a complete
 	// recovery path.
-	Buildkitd = "ghcr.io/k3sm-io/mirror/buildkit@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3"
+	Buildkitd = "ghcr.io/k3sm-io/mirror/buildkit@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c"
 
 	// DebianToolchain is the guest-kernel build toolchain image: the mirror of the
 	// upstream debian trixie-20261005-slim release index, byte-identical, so the

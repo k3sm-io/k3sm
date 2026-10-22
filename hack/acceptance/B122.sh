@@ -134,7 +134,7 @@ fi
 
 # (b) a flipped digest in BOTH refs: schema-valid, so the LOCKSTEP check must be what
 #     rejects it. This is the leg that proves lockstep itself bites.
-sed 's|\(sha256:\)6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3|\1deadbeef0000000000000000000000000000000000000000000000000000beef|g' \
+sed 's|\(sha256:\)b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c|\1deadbeef0000000000000000000000000000000000000000000000000000beef|g' \
 	"$MANIFEST" >"$TMP/flip-both.yaml"
 if cmp -s "$MANIFEST" "$TMP/flip-both.yaml"; then
 	ladder no "b122.3b mutation actually changed the manifest (sed matched nothing)"
