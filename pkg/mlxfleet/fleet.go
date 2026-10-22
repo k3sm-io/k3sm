@@ -25,7 +25,7 @@ import (
 // ChartVersion is the upstream chart version every value in this package was
 // read from. It names the testdata records the pin tests read, so bumping it
 // without re-recording them is a red test rather than a silent re-pin.
-const ChartVersion = "1.5.0"
+const ChartVersion = "1.5.1"
 
 // Group is the API group every fleet CRD lives in.
 const Group = "nvidia.com"
