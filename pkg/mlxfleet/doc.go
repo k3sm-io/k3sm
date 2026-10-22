@@ -30,11 +30,14 @@ limitations under the License.
 //
 // Every value here was read from the chart at ChartVersion, installed on a k3sm
 // node in the M16.0 S2 spike (hack/spike/m16/findings-s2.md is the write-back).
-// ChartVersion 1.5.1 is the chart built from upstream tag v1.5.1, commit
-// 2093662a4d4e5fd318732935213dde08dc7be818. The records were first taken from
-// 1.5.0 on 2026-09-21 to 2026-09-23 and re-recorded for 1.5.1 on 2026-10-22; the
-// two charts render the same CRDs and operator ClusterRole. A re-pin re-records every file below from a tagged
+// ChartVersion 1.5.0 is the chart built from upstream tag v1.5.0, commit
+// b83b1d9304ebfc624709ac46db32b1b6f1ff1615; the records were taken on
+// 2026-09-21 to 2026-09-23. A re-pin re-records every file below from a tagged
 // upstream release and updates this commit alongside ChartVersion.
+//
+// The fleet's images run one patch ahead of the chart (1.5.1 against chart 1.5.0)
+// because upstream publishes no 1.5.1 OCI chart; the staged mirror manifest
+// explains why that is safe, and a test holds ChartVersion to the staged chart.
 //
 // The pinned set is six custom resources, and the tests assert that count:
 // DynamoComponentDeployment, DynamoGraphDeploymentRequest,

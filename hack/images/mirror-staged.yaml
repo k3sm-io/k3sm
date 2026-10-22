@@ -23,10 +23,16 @@ images:
   # M16 R12: the upstream serving control plane's Helm chart. It is published as an OCI
   # chart at nvcr.io/nvidia/ai-dynamo/dynamo-platform, NOT under .../charts/ (that path
   # has no repository: the anonymous token endpoint answers 400).
-  # The chart is staged at 1.5.0, not 1.5.1: nvcr.io publishes no 1.5.1 OCI chart (its tag
-  # list stops at 1.5.0). The 1.5.1 chart exists only in NVIDIA's NGC Helm repository; it
-  # differs from 1.5.0 by the version strings and the image tag defaults, and the
-  # operator's CRDs and ClusterRole render identically. The images below are at 1.5.1.
+  # The chart stays at 1.5.0 while the three images below are at 1.5.1. nvcr.io publishes no
+  # 1.5.1 OCI chart (its tag list stops at 1.5.0); the 1.5.1 chart exists only in NVIDIA's
+  # NGC Helm repository, and this mechanism copies OCI artifacts by digest, so it cannot
+  # carry that tarball. The split is safe because the 1.5.0 chart takes the operator image
+  # tag as a value (dynamo-operator controllerManager.manager.image.tag, and the frontend
+  # tag in the platform values), and rendering the 1.5.0 chart with that one value set to
+  # 1.5.1 changes only the operator image references: CRDs, ClusterRole and every other
+  # object are identical to the 1.5.1 chart's. The install therefore sets the image tags
+  # (by digest in values-k3sm.yaml). pkg/mlxfleet pins ChartVersion to this chart's tag,
+  # and TestChartVersionMatchesStagedChart fails if the two ever disagree.
   - name: dynamo-platform
     upstream: nvcr.io/nvidia/ai-dynamo/dynamo-platform:1.5.0@sha256:ff09c3bdfb26fb6b9274917a80c0fdf9bf23eeb02912988262ac5f87a5860714
     mirror: ghcr.io/k3sm-io/mirror/dynamo-platform@sha256:ff09c3bdfb26fb6b9274917a80c0fdf9bf23eeb02912988262ac5f87a5860714
