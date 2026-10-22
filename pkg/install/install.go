@@ -52,6 +52,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
+	"k3sm.io/k3sm/pkg/registrysvc"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -2331,9 +2332,10 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     The control-plane version marker is staged the same way and for the same
 	//     reasons: without it the seed cannot tell this release's kube binaries from
 	//     the ones an earlier release left in the work dir, and an absent marker only
-	//     means the seed leaves the present set alone.
-	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KubeMarkerName),
-		cfg.stagedPayloadFile(executor.KubeMarkerName))
+	//     means the seed leaves the present set alone. The zot marker rides along: without it the server cannot take the payload zot.
+	for _, m := range []string{executor.KubeMarkerName, registrysvc.ZotMarkerName} {
+		_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, m), cfg.stagedPayloadFile(m))
+	}
 
 	// 2c′. The shadow binary set: ad-hoc re-signed copies of the host shells,
 	//      tar and the common coreutils under <InstallDir>/shadow, with the manifest of what they were made

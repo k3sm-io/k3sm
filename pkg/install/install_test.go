@@ -40,6 +40,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/k3sm/pkg/registrysvc"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
@@ -1934,6 +1935,8 @@ func TestInstallOrchestration(t *testing.T) {
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
 		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KubeMarkerName,
+		// The zot version marker, staged the same best-effort way beside zot.
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + registrysvc.ZotMarkerName,
 		// The shadow binary set, staged with the binary that uses it: each copy
 		// in the shared list cloned root:wheel 0755, re-signed ad hoc, verified,
 		// its source's cdhash read, then the manifest (TestShadowSetIsMadeAtInstall
@@ -2135,10 +2138,10 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// The payload set lands at InstallDir/bin/<name> — one copy per
 	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims + vmhost.
 	head := len(fixedHead)
-	// +4 for the four version markers (kine, etcd, etcdutl, then the control-plane
-	// set), staged beside the binaries they describe.
-	if want := head + len(executor.PayloadBinaries()) + 4; len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the four markers)", len(dsts), want)
+	// +5 for the five version markers (kine, etcd, etcdutl, the control-plane
+	// set, then zot), staged beside the binaries they describe.
+	if want := head + len(executor.PayloadBinaries()) + 5; len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the five markers)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], stage+"/bin/"+name; got != want {
@@ -3315,5 +3318,49 @@ func mustContain(t *testing.T, haystack, needle string) {
 	t.Helper()
 	if !strings.Contains(haystack, needle) {
 		t.Errorf("plist missing %q\n--- plist ---\n%s", needle, haystack)
+	}
+}
+
+// TestInstallStagesTheZotMarker is the gate for the bundled registry: the server
+// seeds zot from the payload only when zot.version beside it vouches for the
+// pin, and without it falls back to a build a launchd daemon cannot run. So an
+// install must stage the marker from the payload, publish it into the live
+// bin dir, and what it stages must satisfy the server's own predicate.
+func TestInstallStagesTheZotMarker(t *testing.T) {
+	payload := t.TempDir()
+	if err := os.WriteFile(filepath.Join(payload, registrysvc.ZotBinaryName), []byte("zot\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := registrysvc.DefaultZotVersion + " minimal\n"
+	if err := os.WriteFile(filepath.Join(payload, registrysvc.ZotMarkerName), []byte(marker), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeSystem{}
+	cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice", PayloadSource: payload}
+	if err := Install(context.Background(), f, cfg); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	live := f.treeUnder(cfg.withDefaults().InstallDir)
+	src, ok := live["bin/"+registrysvc.ZotMarkerName]
+	if !ok {
+		t.Fatalf("%s is not in the published install root %v", registrysvc.ZotMarkerName, live)
+	}
+	if want := filepath.Join(payload, registrysvc.ZotMarkerName); src != want {
+		t.Errorf("zot marker came from %q, want the payload's %q", src, want)
+	}
+	// Reproduce the staged bin dir from what the install copied and ask the
+	// server's predicate about it.
+	bin := t.TempDir()
+	for _, name := range []string{registrysvc.ZotBinaryName, registrysvc.ZotMarkerName} {
+		b, err := os.ReadFile(live["bin/"+name])
+		if err != nil {
+			t.Fatalf("read the staged source of %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(bin, name), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !registrysvc.PayloadVouchesZot(bin, registrysvc.DefaultZotVersion) {
+		t.Errorf("the staged zot set is not one the server would use (marker %q, pin %s)", marker, registrysvc.DefaultZotVersion)
 	}
 }

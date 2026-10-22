@@ -107,6 +107,12 @@ func zotStaged(bd, version string) bool {
 	return v == version && variant == zotBuildVariant
 }
 
+// PayloadVouchesZot reports whether the payload bin dir holds a zot whose marker
+// vouches for version: the exact predicate under which the server takes the
+// payload zot instead of building one. An installer uses it to prove the set it
+// staged is one the server will use.
+func PayloadVouchesZot(bd, version string) bool { return zotStaged(bd, version) }
+
 // writeZotMarker writes the marker atomically (temp + rename) so a crashed or
 // killed boot can never leave a half-written marker vouching for the wrong bytes.
 func writeZotMarker(bd, version string) error {
