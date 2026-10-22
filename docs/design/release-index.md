@@ -164,4 +164,6 @@ committed.
 - The image URL is not a free field: it is the one release download URL its
   tag and name determine, so the tag in the path is bound to the index's tag.
 - A change to the format is a new `schema` and `context` string, not an edit to
-  v1.
+  v1. `minimumSupportedTag` was added to v1 before any index was published, so
+  no reader of the older shape exists. From the first published index on, the
+  rule holds as written.
