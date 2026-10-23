@@ -80,6 +80,11 @@ func TestProvisionSubjectsUnchanged(t *testing.T) {
 		"rule ClusterRole /k3sm:node-datapath [net.k3sm.io] [meshpeers] [get list watch] []",
 		"rule Role default/k3sm:in-pod-reader [] [pods configmaps services] [get list watch] []",
 		"rule Role k3sm-registry/k3sm-registry-advert-reader [] [configmaps] [get list watch] []",
+		"bind ClusterRoleBinding /k3sm:registry-gate -> ClusterRole k3sm:registry-gate Group /k3sm:registry-gates",
+		"rule ClusterRole /k3sm:registry-gate [authentication.k8s.io] [tokenreviews] [create] []",
+		"rule ClusterRole /k3sm:registry-gate [authorization.k8s.io] [subjectaccessreviews] [create] []",
+		"rule ClusterRole /k3sm:registry-gate [] [namespaces] [get] []",
+		"rule ClusterRole /k3sm:registry-pusher [registry.k3sm.io] [repositories] [push] []",
 	}
 	sort.Strings(want)
 	got := grantLines(objs)

@@ -132,7 +132,10 @@ func ensureGraph(ctx context.Context, cs kubernetes.Interface) error {
 	if err := ensureRegistryAdvertReaderRBAC(ctx, cs); err != nil {
 		return err
 	}
-	return ensureNetserveRBAC(ctx, cs)
+	if err := ensureNetserveRBAC(ctx, cs); err != nil {
+		return err
+	}
+	return ensureRegistryPushRBAC(ctx, cs)
 }
 
 // NetserveRole names the ClusterRole and the ClusterRoleBinding that grant the
@@ -167,64 +170,130 @@ func netserveRules() []rbacv1.PolicyRule {
 // and its ClusterRoleBinding to the k3sm:netservers group: the grant every
 // node's datapath runs under, the k3s system:k3s-controller shape.
 //
-// Unlike the grants above it is CREATE-OR-UPDATE: a Get by name, then a Create
-// when absent, or an Update when the rules, the subjects or the managed label
-// have drifted. The set is pinned and narrow, so a drifted copy (an operator
-// edit, an older build's shape) is repaired to it on the next server start rather
-// than trusted because the name exists. A binding whose roleRef drifted is
-// deleted and re-created, because roleRef is immutable. The Get is authoritative
-// by name, never a LIST (see doc.go).
+// Unlike the grants above it is CREATE-OR-UPDATE (ensureClusterRole,
+// ensureClusterRoleBinding): the set is pinned and narrow, so a drifted copy (an
+// operator edit, an older build's shape) is repaired to it on the next server
+// start rather than trusted because the name exists.
 func ensureNetserveRBAC(ctx context.Context, cs kubernetes.Interface) error {
-	api := cs.RbacV1()
-
-	want := &rbacv1.ClusterRole{
-		ObjectMeta: metav1.ObjectMeta{Name: NetserveRole, Labels: managedLabels()},
-		Rules:      netserveRules(),
+	if err := ensureClusterRole(ctx, cs, "netserve", NetserveRole, netserveRules()); err != nil {
+		return err
 	}
-	have, err := api.ClusterRoles().Get(ctx, NetserveRole, metav1.GetOptions{})
+	return ensureClusterRoleBinding(ctx, cs, "netserve", NetserveRole, certs.NetserveGroup)
+}
+
+// RegistryGateRole names the ClusterRole and the ClusterRoleBinding that grant
+// the ingest registry's push gate (certs.RegistryGateGroup) the three calls it
+// makes to authorize an in-pod push.
+const RegistryGateRole = "k3sm:registry-gate"
+
+// RegistryPusherRole names the ClusterRole a namespace binds, with an ordinary
+// RoleBinding, to the ServiceAccounts it lets push to a node's ingest registry.
+// k3sm ships the role and NO binding to it: who may push is the namespace's
+// decision, made in RBAC.
+const RegistryPusherRole = "k3sm:registry-pusher"
+
+// registryGateRules is the push gate's whole grant: create a TokenReview (is
+// this token valid for the registry audience), create a SubjectAccessReview
+// (may this identity push this repository), and get a namespace by name (does
+// it carry the push label). There is no list or watch: the gate reads one
+// namespace at a time, cached for seconds, so a cluster-wide namespace read is
+// authority it has no consumer for.
+func registryGateRules() []rbacv1.PolicyRule {
+	return []rbacv1.PolicyRule{
+		{APIGroups: []string{"authentication.k8s.io"}, Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
+		{APIGroups: []string{"authorization.k8s.io"}, Resources: []string{"subjectaccessreviews"}, Verbs: []string{"create"}},
+		{APIGroups: []string{""}, Resources: []string{"namespaces"}, Verbs: []string{"get"}},
+	}
+}
+
+// registryPusherRules is the verb the push gate's SubjectAccessReview asks
+// about: push on registry.k3sm.io repositories. It is a virtual resource (no
+// such API is served), which is exactly how RBAC carries an authorization that
+// a component other than the apiserver enforces.
+func registryPusherRules() []rbacv1.PolicyRule {
+	return []rbacv1.PolicyRule{{
+		APIGroups: []string{registrysvc.PushAPIGroup},
+		Resources: []string{registrysvc.PushResource},
+		Verbs:     []string{registrysvc.PushVerb},
+	}}
+}
+
+// ensureRegistryPushRBAC provisions the push gate's ClusterRole and its binding
+// to the k3sm:registry-gates group, and the UNBOUND k3sm:registry-pusher
+// ClusterRole a namespace binds itself. Both roles are create-or-update, like
+// the netserve role.
+func ensureRegistryPushRBAC(ctx context.Context, cs kubernetes.Interface) error {
+	if err := ensureClusterRole(ctx, cs, "registry gate", RegistryGateRole, registryGateRules()); err != nil {
+		return err
+	}
+	if err := ensureClusterRoleBinding(ctx, cs, "registry gate", RegistryGateRole, certs.RegistryGateGroup); err != nil {
+		return err
+	}
+	return ensureClusterRole(ctx, cs, "registry pusher", RegistryPusherRole, registryPusherRules())
+}
+
+// ensureClusterRole creates the named managed ClusterRole with exactly rules, or
+// repairs it when its rules, its managed label or an aggregation rule drifted.
+// The Get is authoritative by name, never a LIST (see doc.go). what names the
+// role in errors.
+func ensureClusterRole(ctx context.Context, cs kubernetes.Interface, what, name string, rules []rbacv1.PolicyRule) error {
+	api := cs.RbacV1()
+	want := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: managedLabels()},
+		Rules:      rules,
+	}
+	have, err := api.ClusterRoles().Get(ctx, name, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
 		if _, err := api.ClusterRoles().Create(ctx, want, metav1.CreateOptions{}); err != nil {
-			return fmt.Errorf("create the netserve cluster role: %w", err)
+			return fmt.Errorf("create the %s cluster role: %w", what, err)
 		}
 	case err != nil:
-		return fmt.Errorf("get the netserve cluster role: %w", err)
+		return fmt.Errorf("get the %s cluster role: %w", what, err)
 	case !equality.Semantic.DeepEqual(have.Rules, want.Rules) || !hasManagedLabel(have.Labels) || have.AggregationRule != nil:
 		upd := have.DeepCopy()
 		upd.Rules = want.Rules
 		upd.AggregationRule = nil
 		upd.Labels = withManagedLabel(upd.Labels)
 		if _, err := api.ClusterRoles().Update(ctx, upd, metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("repair the netserve cluster role: %w", err)
+			return fmt.Errorf("repair the %s cluster role: %w", what, err)
 		}
 	}
+	return nil
+}
 
+// ensureClusterRoleBinding creates the managed ClusterRoleBinding name, binding
+// the ClusterRole of the same name to exactly one group, or repairs it. A
+// binding whose roleRef drifted is deleted and re-created, because roleRef is
+// immutable.
+func ensureClusterRoleBinding(ctx context.Context, cs kubernetes.Interface, what, name, group string) error {
+	api := cs.RbacV1()
 	wantBinding := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Name: NetserveRole, Labels: managedLabels()},
-		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: NetserveRole},
-		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: "Group", Name: certs.NetserveGroup}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: managedLabels()},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: name},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: "Group", Name: group}},
 	}
-	haveBinding, err := api.ClusterRoleBindings().Get(ctx, NetserveRole, metav1.GetOptions{})
+	haveBinding, err := api.ClusterRoleBindings().Get(ctx, name, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
 		if _, err := api.ClusterRoleBindings().Create(ctx, wantBinding, metav1.CreateOptions{}); err != nil {
-			return fmt.Errorf("create the netserve cluster role binding: %w", err)
+			return fmt.Errorf("create the %s cluster role binding: %w", what, err)
 		}
 	case err != nil:
-		return fmt.Errorf("get the netserve cluster role binding: %w", err)
+		return fmt.Errorf("get the %s cluster role binding: %w", what, err)
 	case haveBinding.RoleRef != wantBinding.RoleRef:
-		if err := api.ClusterRoleBindings().Delete(ctx, NetserveRole, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("delete the netserve cluster role binding to re-create its roleRef: %w", err)
+		if err := api.ClusterRoleBindings().Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete the %s cluster role binding to re-create its roleRef: %w", what, err)
 		}
 		if _, err := api.ClusterRoleBindings().Create(ctx, wantBinding, metav1.CreateOptions{}); err != nil {
-			return fmt.Errorf("re-create the netserve cluster role binding: %w", err)
+			return fmt.Errorf("re-create the %s cluster role binding: %w", what, err)
 		}
 	case !equality.Semantic.DeepEqual(haveBinding.Subjects, wantBinding.Subjects) || !hasManagedLabel(haveBinding.Labels):
 		upd := haveBinding.DeepCopy()
 		upd.Subjects = wantBinding.Subjects
 		upd.Labels = withManagedLabel(upd.Labels)
 		if _, err := api.ClusterRoleBindings().Update(ctx, upd, metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("repair the netserve cluster role binding: %w", err)
+			return fmt.Errorf("repair the %s cluster role binding: %w", what, err)
 		}
 	}
 	return nil
