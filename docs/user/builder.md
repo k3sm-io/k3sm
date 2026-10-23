@@ -41,7 +41,7 @@ kind. Run it with `runtimeClassName: vm` (see
 Several targets at once build an index:
 
 ```sh
-k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci -o out .
+k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci --output out .
 ```
 
 `--output` (as `oci`) and `--push` carry every platform. This node's image store

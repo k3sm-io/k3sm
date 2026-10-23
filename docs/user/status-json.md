@@ -41,7 +41,7 @@ So a reader should:
 
 ## Exit codes and stdout
 
-Both commands write their JSON document to stdout **whatever the exit code**. A non-zero exit is a
+Every shape writes its JSON document to stdout **whatever the exit code**. A non-zero exit is a
 verdict, not a failure to answer, so read stdout first and use the exit code as a shortcut.
 
 | exit | meaning |

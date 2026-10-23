@@ -1,9 +1,10 @@
 # k3sm — distribution & assembly
 
 Module **`k3sm.io/k3sm`** (≈ k3s): the single-binary distribution. `cmd/k3sm` (server | agent | node |
-install | token | kubectl | doctor | dev | build | image | …; `image` is load|import|prune|ls|df, a
-client of runtimed's Images service — the daemon is the store's only writer. `build` is COPY-only and
-writes to a file, not to the shared store; OCI plumbing lives in `pkg/oci` — see docs/user/images.md),
+install | token | kubectl | doctor | dev | build | image | …; `image` is
+load|import|push|pull|tag|untag|inspect|save|prune|ls|df, a client of runtimed's Images service — the
+daemon is the store's only writer. `build` runs Dockerfile `RUN` steps through the build engine and
+records the image to the store unless `--no-record` is given (`--output` additionally writes a file); OCI plumbing lives in `pkg/oci` — see docs/user/images.md),
 `pkg/provider` (the Virtual Kubelet Darwin provider — the HostProcess runtime), control-plane
 embedding, launchd/packaging. Imports `k3sm.io/{apis,runtimed,darwin-net}`.
 

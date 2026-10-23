@@ -102,9 +102,9 @@ write into it.
 
 ## Install Channels
 
-k3sm's distribution ships in three generations, listed in shipping order:
+k3sm ships through three channels, listed in shipping order:
 
-1. **The install script (gen 1, first to ship):**
+1. **The install script (first to ship):**
 
    ```sh
    curl -fsSL https://k3sm.io/install.sh | sh
@@ -113,8 +113,9 @@ k3sm's distribution ships in three generations, listed in shipping order:
    The script preflights (Apple silicon, macOS 26+), downloads the release tarball and its
    checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do,
    and then runs `sudo k3sm install`. The verification checks **same-origin integrity**, meaning
-   the tarball matches the checksums published beside it. It does not check publisher identity;
-   provenance (Developer ID + notarization) arrives with gen 3. Environment variables set the
+   the tarball matches the checksums published beside it. It does not check publisher identity.
+   Publisher identity comes from the other two channels: the app download is Developer ID signed
+   and notarized, and so is the `.pkg`. Environment variables set the
    options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
    unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
    `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh` (v0.1.7 is the release you are on
@@ -123,9 +124,9 @@ k3sm's distribution ships in three generations, listed in shipping order:
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
    one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
 
-2. **The k3sm app,** a signed, notarized download from k3sm.io that updates itself (see [Installing From k3sm.app](#installing-from-k3smapp)).
+2. **The k3sm app,** a signed, notarized download from k3sm.io that checks for a new release and points you to the download (see [Installing From k3sm.app](#installing-from-k3smapp)).
 
-3. **Notarized `.pkg` (gen 3)** is a signed, stapled installer package for offline and managed
+3. **Notarized `.pkg`** is a signed, stapled installer package for offline and managed
    installs.
 
 > **Status:** pre-release builds are published; the script resolves the newest one, and a pin

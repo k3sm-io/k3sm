@@ -51,7 +51,7 @@ Darwin provider that turns a Pod spec into a running process; `pkg/executor` bri
 supervises the embedded control plane; `pkg/bootstrap` and `pkg/certs` handle join tokens, node
 identity and the certificate hierarchy; `pkg/install` manages the launchd daemons; `pkg/mlx`
 renders an `MLXModel` into the objects that serve it; `pkg/addons` carries the metrics-server
-add-on, which a server installed with `--mesh-ip` applies once a node can run `vm` Pods; and
+add-on, which every server applies once its node has minted its kubelet serving certificate; and
 `pkg/oci` is the one place in the repo that reads or writes OCI image bytes. k3sm imports
 `k3sm.io/runtimed` (the native runtime daemon) and `k3sm.io/darwin-net` (pod networking) to do
 the actual work of running and connecting pods.

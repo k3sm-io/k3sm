@@ -92,7 +92,7 @@ release engineering. What ships:
 - Install arrives in three generations, in shipping order: *(1)*
   `curl -fsSL https://k3sm.io/install.sh | sh`, a checksum-verified release tarball handed to
   `sudo k3sm install` (a curl download carries no quarantine xattr); *(2)*
-  the k3sm app, a Developer ID signed, notarized download from k3sm.io that updates itself; *(3)* a signed, notarized `.pkg`. Underneath it are goreleaser,
+  the k3sm app, a Developer ID signed, notarized download from k3sm.io that checks for a new release and points to the download; *(3)* a signed, notarized `.pkg`. Underneath it are goreleaser,
   [user docs](docs/user/), and the website.
 - `k3sm image load` / `k3sm image import` ingest docker-save
   tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and
@@ -181,10 +181,6 @@ release engineering. What ships:
 - **`linux/amd64` in the build engine, via guest Rosetta.** The managed buildkitd builder (see
   v0.1, above) builds `linux/arm64` only today; targeting `linux/amd64` needs the same
   in-guest Rosetta translation the `vm` RuntimeClass itself doesn't have yet (see Limitations).
-- **Kubelet-faithful registry semantics on the native path.** The pull-failure backoff taxonomy
-  (`ErrImagePull`/`ImagePullBackOff` alternation, `ErrImageNeverPull`), Rosetta-consuming
-  multi-arch selection, and a warm-cache offline start under `imagePullPolicy: IfNotPresent` /
-  `Never` are still open.
 - **ANE.** Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA.** Dynamic Resource Allocation for GPUs, once extended resources have shipped.
 - **A serving fleet for MLX models.** Multi-model, multi-worker inference above `MLXModel`: an
@@ -195,7 +191,7 @@ release engineering. What ships:
   across, and autoscaling is a planner sitting above one. `MLXModel` stays the one-object way to
   serve a single model.
 - **Direct links.** Macs cabled together over Thunderbolt find each other on the cable, and a new
-  Mac joins while the server's pairing window is open (`sudo k3sm pair`), optionally pinned to the
+  Mac joins while the server's pairing window is open (a planned pairing step), optionally pinned to the
   cluster it expects. Cluster traffic between two cabled Macs then takes the cable as a plain kernel
   route, with the wireguard mesh kept for peers that have no cable and as the fallback when one is
   pulled. That route is not encrypted, so the cable is treated as a trusted segment, and a per-link

@@ -122,10 +122,9 @@ Seatbelt-confined. The consequences:
   **rejected at admission**, never silently coerced, since k3sm cannot provide that isolation.
 - **Untrusted or multi-tenant workloads are destined for the [`vm` RuntimeClass](user/vm-runtimeclass.md)**,
   which is backed by Virtualization.framework (an *entitlement*, not root) and is a real isolation
-  boundary. **It does not run a Pod yet**, so it is where such workloads belong by design and not a
-  mitigation available today. Until it lands, a node is one trust domain with no in-product
-  alternative, consistent with the long-standing design position that same-node Pods are one trust
-  domain ([DESIGN.md](DESIGN.md) §3).
+  boundary. Pods in the default runtime on a node are one trust domain, consistent with the
+  long-standing design position that same-node Pods share one ([DESIGN.md](DESIGN.md) §3); the `vm`
+  RuntimeClass is the in-product alternative for workloads that need a boundary.
 - If the runtime's Seatbelt capability probe ever fails, the runtime degrades to **`vm` or
   refuse-to-run**, never to "run the Pod unconfined."
 - The control-plane children run under the same `_k3sm` uid as native Pods, and a component's death
@@ -168,7 +167,7 @@ Seatbelt-confined. The consequences:
   the entitlement that would avoid them is Apple-restricted. The one-time admin step is unavoidable,
   and every desktop container tool on macOS needs it.
 - **Per-Pod uid isolation without a VM.** The helper is networking-only by decision; untrusted
-  workloads are destined for the [`vm` RuntimeClass](user/vm-runtimeclass.md), which does not run yet.
+  workloads are destined for the [`vm` RuntimeClass](user/vm-runtimeclass.md).
 - **Rootless multi-node without the helper.** The mesh needs `utun` and routes, which are irreducibly
   root.
 
@@ -179,4 +178,4 @@ Seatbelt-confined. The consequences:
 - [user/install.md](user/install.md) lists the install channels and what each lays down.
 - [user/limitations.md](user/limitations.md) puts the no-per-Pod-uid-isolation gap in context.
 - [user/vm-runtimeclass.md](user/vm-runtimeclass.md) describes the intended isolation boundary for
-  untrusted workloads, which does not run yet.
+  untrusted workloads.

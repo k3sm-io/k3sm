@@ -100,9 +100,10 @@ come back and serve.
 
 A rotation restarts the control-plane daemon, which is **not** a graceful, in-place reload:
 
-- Every pod on the node is destroyed. Pods are in-process children of the daemon; there is no
-  durable pod-to-IP manifest, and startup reconciliation sweeps every k3sm-owned `lo0` alias.
-  Controller-owned pods (Deployments, StatefulSets) are recreated; bare pods are not.
+- Pods survive. A rotation restarts the daemon with `launchctl kickstart -k`, and the new daemon
+  re-attaches to every Pod whose processes are still alive, keeping its Pod IP and its listeners (see
+  [What Survives a Node-Daemon Restart](limitations.md#what-survives-a-node-daemon-restart)).
+  A Pod that did not survive is recreated only if a controller owns it.
 - The apiserver is unavailable for roughly 5–90 seconds while kine and the apiserver come
   back and the watch cache is rebuilt.
 - On an HA control plane the scheduler / controller-manager leader-election leases flap.

@@ -41,6 +41,6 @@ mechanism is a separate design with its own applying identity (a bounded Service
   `kubernetes.io/os: darwin` nodeSelector and no toleration for the `k3sm.io/provider`
   NoSchedule taint, so its Deployment applies cleanly while its pods are rejected at admission
   or left Unschedulable two controllers away. Adapt the pod template before adding it here.
-- **Removing a file does not delete anything from the cluster.** The reconciler never issues a
-  delete verb (see `../doc.go`); an object dropped from this directory is left in place for an
-  operator to remove.
+- **Removing a file does not delete anything from the cluster.** The reconciler never prunes
+  (see `../doc.go`); its one delete is the withdrawal of a gated add-on. An object dropped from
+  this directory is left in place for an operator to remove.

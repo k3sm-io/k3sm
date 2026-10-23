@@ -486,7 +486,7 @@ The node advertises a capability label only when its start-time probe said yes.
 ## Multi-Node Join Fails
 
 - Re-mint the token (`sudo k3sm token create`); tokens expire.
-- Confirm the agent can reach the server on `6443` and the wireguard mesh is up. See
+- Confirm the agent can reach the server on `9345` (the join) and `6444` (the apiserver) and the wireguard mesh is up. See
   [Multi-node](multi-node.md).
 
 ## The Thunderbolt Interconnect Is Not Used

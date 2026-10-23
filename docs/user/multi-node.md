@@ -88,7 +88,7 @@ sudo k3sm install --agent \
 ```
 
 `--server` is the control-plane Mac's **underlay** address (a LAN IP or DNS name, no scheme, no
-port). The join dials `<server>:9345`, not the apiserver's `:6443`.
+port). The join dials `<server>:9345`, not the apiserver's `:6444`.
 
 `--node-ip` is **optional**, and it does not name this Mac's own LAN address at all. It names the
 **mesh** address this node holds inside the cluster's wireguard mesh range (100.64.0.0/10 by

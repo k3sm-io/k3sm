@@ -543,7 +543,7 @@ out of scope (they re-issue on agent restart, which needs a fresh join token). S
 
 k3sm does **not** run CoreDNS. Each node serves an in-process, authoritative cluster resolver on the
 DNS VIP and forwards everything else to the host's upstream resolver. What a Pod gets
-depends on the runtime path it runs on (see the `restartPolicy` section above for the two paths).
+depends on the runtime path it runs on (see the `restartPolicy` section below for the two paths).
 
 **What the resolver answers on every path (this is the server side):**
 

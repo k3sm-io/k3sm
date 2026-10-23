@@ -49,7 +49,7 @@ k3sm update cancel                      # stop after the current node
 k3sm update abort                       # recover from a failed step
 ```
 
-`k3sm update apply [--version <tag>] [--drain] [--allow-downgrade] [--signature if-signed|required] [--yes]`
+`k3sm update apply [--version <tag>] [--drain] [--allow-downgrade] [--signature if-signed|required] [--yes] [--pin-sha256 <digest>]`
 moves the cluster to the latest release, or to the tag `--version` names. It prints the plan
 first: the nodes in the order they will be updated with the version each runs, the target, whether
 nodes are drained, and the signature policy. It then asks for confirmation; `--yes` skips the
@@ -64,6 +64,13 @@ creates the `Update` named `current` that the server's update controller rolls.
   Developer ID build accepts only the same team's signature, an ad-hoc build accepts an ad-hoc
   release. `required` refuses any release without a Developer ID signature. The release's
   checksum is verified under either policy.
+
+- `--pin-sha256 <digest>` binds the roll to one darwin/arm64 archive checksum. It needs
+  `--version` and must run as root. The pin is written to the server before the Update is created,
+  and the update controller refuses the release, before any node is cordoned, unless its checksums
+  file carries exactly this digest.
+- `k3sm update apply --clear-pin` removes that pin and exits. It takes no other flag (except
+  `--yes`) and must run as root.
 
 While an update is in progress, `apply` refuses and names its phase. A finished update
 (`Succeeded`, `Failed` or `Cancelled`) is removed and replaced, so a retry is a new update.
@@ -97,7 +104,7 @@ The k3sm app offers the same update as a menu item and a button, both of which r
 
 ## Single Node
 
-For script (gen-1) installs, re-run the one-liner:
+For script installs, re-run the one-liner:
 
 ```sh
 curl -fsSL https://k3sm.io/install.sh | sh
@@ -123,7 +130,7 @@ Mac, 10240 on an 8 GB one). When it is below the limit k3sm requests, the instal
 the node's UDP Service flow capacity drops toward its floor. `sudo sysctl -w kern.maxfiles=131072
 kern.maxfilesperproc=131072` raises it until the next reboot.
 
-> **The k3sm app** is a second upgrade channel: a signed, notarized download from k3sm.io that updates itself.
+> **The k3sm app** is a second upgrade channel: a signed, notarized download from k3sm.io. It checks for a new release and points you to the download; it does not replace itself.
 
 ## Multi-Node Rolling Upgrade
 
