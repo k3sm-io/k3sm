@@ -82,7 +82,9 @@ func enrollerOverStub(t *testing.T) (*meshEnroller, *meshPeerAPIStub) {
 	api := newMeshPeerAPIStub()
 	srv := httptest.NewServer(api)
 	t.Cleanup(srv.Close)
-	e, err := newMeshEnroller(&rest.Config{Host: srv.URL}, quietLogger())
+	// QPS -1: no client-side limiter, which would only pace the stub's requests
+	// (see stubServer).
+	e, err := newMeshEnroller(&rest.Config{Host: srv.URL, QPS: -1}, quietLogger())
 	if err != nil {
 		t.Fatalf("newMeshEnroller: %v", err)
 	}
