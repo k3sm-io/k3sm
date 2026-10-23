@@ -3,7 +3,7 @@
 The **reference-workload-driven** acceptance spec: assertions that exercise every Kubernetes feature class a
 representative reference workload needs, built from tiny native test binaries with **no dependency on any
 proprietary images**. It proves *feature-class coverage* (deterministic, CI-able) — **not** image-level
-compatibility (the amd64-Linux images are handled only by the M5 `vm` path).
+compatibility (the amd64-Linux images are handled only by the `vm` path, proven by `hack/lab/m11.sh`).
 
 ## How it wires in (no parallel gate family)
 
@@ -27,7 +27,7 @@ compatibility (the amd64-Linux images are handled only by the M5 `vm` path).
 - **CGO_ENABLED=1** for every M2+ slice (k3sm is cgo from M1). **Tier** per `phases.json`: single-node →
   `integration` (`m2.sh` root; `m3.sh` root single-node NodePort+PVC; `m4.sh` non-root RBAC); cross-node / `vm` →
   `lab` (`K3SM_LAB=1`; `hack/lab/m3.sh` two-Mac mesh/DNS; the `vm` slice is proven by `hack/lab/m11.sh`, which
-  absorbed the M5 lab remainder). M3 and M4 each split an integration row and a lab row. Slices **share one
+  absorbed the earlier Linux-image lab remainder). M3 and M4 each split an integration row and a lab row. Slices **share one
   cluster bring-up**.
 - Helper binaries **`hello-http`** (controllable HTTP server: probe-transition health toggles + NodePort backend)
   and **`conftool`** (`memhog` for OOMKilled, `apicall` for in-pod kubectl, `resolve` for in-pod DNS) are built
@@ -54,13 +54,12 @@ compatibility (the amd64-Linux images are handled only by the M5 `vm` path).
 | `TestM2_InPodKubectl` | projected bound SA token + CA reach the apiserver; granted read allowed, ungranted 403 | `snapshotManager` in-pod kubectl | M2 / integration |
 | `TestM2_InPodDNS` | in-pod DNS resolves `kubernetes.default.svc` (getaddrinfo shim) | in-cluster DNS | M2 / integration |
 | `TestM2_DenyUsers` (negative) | pod cannot read `/Users` / write outside its volumes (Seatbelt) | the default-deny isolation contract | M2 / integration |
-| `TestM2_ImagePullSecrets` (**deferred**) | private-registry pull — not an M2/M3 native-runtime feature | (tracked, `t.Skip`) | M2 / deferred |
+| `TestM2_ImagePullSecrets` (**superseded**) | private-registry pull; now covered by `TestM10_ImagePullSecret` in `e2e/m10_pullsecret_test.go`. The `t.Skip` stub in `e2e/m2_test.go` stays as a checklist reference | (tracked, `t.Skip`) | M2 / superseded |
 | `TestM2_DaemonSet` (**deferred**) | DaemonSet scheduling — not yet a k3sm feature class | (tracked, `t.Skip`) | M2 / deferred |
 | `TestM3_NodePort` | a Deployment is reachable on `*:nodePort` | VSCode SSH NodePort, snapshot gRPC range | M3 / integration (single-node) + lab |
 | `TestM3_PVCPersistsAcrossRestart` | StatefulSet+PVC data survives a pod restart | Postgres / compile-artifacts PVCs | M3 / integration (single-node) + lab |
 | `TestM3_InPodKubectlAndDNSOnWorker` | on the JOINED worker: cluster DNS + in-pod kubectl via the node-local API VIP | cross-node in-cluster access | M3 / lab (`K3SM_WORKER`) |
 | `TestM4_RBACEnforced` | a restricted SA is denied a verb; admin + control-plane SAs allowed | `snapshot-manager` ClusterRole | M4 / integration (`m4.sh`) |
-| `TestM5_LinuxImageUnderVM` | a Linux image runs under `runtimeClassName: vm`, Service/DNS-reachable | pgvector / nats Linux images | M5 / lab (`K3SM_LAB=1`) |
 
 ## Status
 
@@ -69,7 +68,13 @@ This is the **spec**, plus (as of the conformance-suite work) the **authored + c
 `conftool` helpers under `e2e/testdata/cmd/`, and the gates `m2.sh` (M2), `m3.sh` (single-node M3 integration),
 `hack/lab/m3.sh` (two-Mac M3 lab), `m4.sh` (RBAC integration) enumerate their required criteria under the
 non-vacuous guard. The **LIVE green is integration-tier** (a dev Mac + root for `m2.sh`/`m3.sh`; `k3sm install`
-for the helper posture), so it is not run in unit CI — **the suite stays `met:false` (integration-pending)** until
-the gates run green on a capable host. The `vm` slice is proven by `hack/lab/m11.sh` (M11 absorbed the M5
-lab remainder — see `hack/acceptance/phases.json`'s `M5` row), not by a criterion-test slice under this
+for the helper posture), so it is not run in unit CI — the suite stays **integration-pending** until
+the gates run green on a capable host. The `vm` slice is proven by `hack/lab/m11.sh`, not by a criterion-test slice under this
 directory.
+
+Later milestones add their criteria in `e2e/m10_*_test.go` and `e2e/m16_test.go`, registered through
+`hack/acceptance/m<n>.sh`. The helper binaries under `e2e/testdata/cmd/` are `hello-http`, `conftool`, `pullprobe` (the
+workload `TestM10_ImagePullSecret` pulls from its auth-gated registry: it prints the run's sentinel and checks that no
+forbidden credential string reaches its environment or rootfs) and `b411-echo` (a TLS stand-in extension apiserver that
+requests a client certificate and reports what the aggregator presented, so a test can check it chains to the
+request-header CA).
