@@ -47,12 +47,12 @@ func TestProviderRoutesEnabledGate(t *testing.T) {
 	}
 }
 
-// TestValidateProviderRouteAuth pins the B176 fail-closed gate on the OTHER
+// TestValidateProviderRouteAuth pins the fail-closed route check on the OTHER
 // security axis: given that the routes are served at all, they are served
 // authenticated. The facts must hold TOGETHER — an authorization predicate, a
 // listener that verifies every client certificate it is shown, and a CA pool to
 // verify it against — and dropping any one of them is a construction error, not a
-// degraded mode. Since B93 the listener may skip REQUIRING a certificate only when
+// degraded mode. With delegated auth the listener may skip REQUIRING a certificate only when
 // the config declares token routes, and only routes from the fixed read-only
 // metrics set. The accepted row is the positive control: without it a validator that
 // rejected everything would pass this table vacuously.
@@ -74,7 +74,7 @@ func TestValidateProviderRouteAuth(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "the pre-B176 posture (no client auth, no authorizer) is refused",
+			name:    "the old posture (no client auth, no authorizer) is refused",
 			cfg:     NodeConfig{TLSConfig: &tls.Config{}},
 			wantErr: true,
 		},

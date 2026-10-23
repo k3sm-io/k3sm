@@ -38,7 +38,7 @@ import (
 // ATTACH to each pod's live processes instead of creating it again. A pod the
 // runtime cannot attach to is created afresh by the normal create path.
 //
-// ORDERING (binding, and why it lives in the constructor): every attach runs
+// ORDERING (and why it lives in the constructor): every attach runs
 // BEFORE runtimed's startup pod reap, because the reap kills every recorded
 // process group no registered pod owns, and an attach is what registers one.
 // The reap runs before any create, because Virtual Kubelet — the only caller of

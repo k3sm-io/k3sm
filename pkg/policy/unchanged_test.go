@@ -139,7 +139,7 @@ func (s *populatedAPIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// TestUnchangedPolicyIsNotRewritten is the B702 gate. The apiserver stores every
+// TestUnchangedPolicyIsNotRewritten pins that an unchanged policy is not rewritten. The apiserver stores every
 // policy and binding with its defaults filled in, so the sparse object this
 // package builds never DeepEquals the stored one; the comparison used to call
 // every unchanged object stale, and every server start rewrote all of them. On a

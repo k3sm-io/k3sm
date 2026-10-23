@@ -129,8 +129,8 @@ var errPullRefused = errors.New("test registry: this world serves one image")
 // guestVMImage. Every other reference is refused with errPullRefused.
 //
 // It has to SERVE rather than refuse outright because runtimed's vm spine now
-// resolves a pod's containers BEFORE the backend is reached (M11.2-d11
-// resolveVMContainers): each container is pulled, its run config is read, and
+// resolves a pod's containers BEFORE the backend is reached
+// (resolveVMContainers): each container is pulled, its run config is read, and
 // the two are merged with the pod spec, so a vm pod whose image cannot be pulled
 // fails at IMAGE_PULL and never reaches CreateVM. Both halves are on ONE fake
 // and the config is looked up THROUGH the manifest's own reference — runtimed's
@@ -290,7 +290,7 @@ func hostPod(ns, name string) *corev1.Pod {
 	}
 }
 
-// TestGuestNetworkWiredToRuntimed is the M11.4-a1 named gate for the B6 producer
+// TestGuestNetworkWiredToRuntimed pins the guest-network producer
 // wiring: the k3sm provider produces a vm pod's guest network — podnet's
 // allocation + NAT parameters and pkg/dns's resolv.conf, structured and rendered
 // — BEFORE translation, and the adapter carries it to runtimed, which stamps it

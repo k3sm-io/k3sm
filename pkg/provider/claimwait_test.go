@@ -170,7 +170,7 @@ func assertHeld(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer) {
 	}
 }
 
-// TestPodWithUnboundClaimWaits is the B630 gate: a pod whose claim is still
+// TestPodWithUnboundClaimWaits pins that a pod whose claim is still
 // Pending is not started and gets the kubelet's FailedMount Event; it is
 // re-checked on a back-off rather than a busy loop; and once the claim binds,
 // the pod starts, on the directory its bound PV names.

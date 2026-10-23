@@ -33,12 +33,12 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
-// TestEnsureReconcilesAStalePolicyInPlace is the create-or-update gate (B153). It
+// TestEnsureReconcilesAStalePolicyInPlace is the create-or-update test. It
 // pins the property the old create-if-absent path did NOT have: a cluster whose
 // datastore already holds an out-of-date object is REPAIRED on the next server
 // start, not left frozen at whatever shape it was first created with.
 //
-// This is the merge-precondition of the B153 fix itself. Changing the foreign-user
+// The create-or-update path is a precondition of every policy change. Changing the foreign-user
 // expression's allowed uid is INERT on every existing cluster without it — the fix
 // would be green in CI and absent in production.
 //

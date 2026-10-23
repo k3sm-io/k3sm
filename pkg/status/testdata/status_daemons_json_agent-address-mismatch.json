@@ -23,7 +23,7 @@
       "state": "address-mismatch",
       "severity": "fail",
       "detail": "pid 1292 · the kubelet serving certificate in /var/lib/k3sm/agent names a different address than the one this node is assigned, so the control plane cannot reach this node's :10250 (kubectl logs/exec fail)",
-      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
+      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
       "wide": {
         "credential": "address-mismatch",
         "credential-dir": "/var/lib/k3sm/agent",
@@ -57,7 +57,7 @@
             "confirm": true
           },
           {
-            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
             "needsAdmin": true,
             "confirm": false
           },

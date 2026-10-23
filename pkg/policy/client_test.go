@@ -140,7 +140,7 @@ func reconcileEverySet(ctx context.Context, cs kubernetes.Interface) error {
 	return nil
 }
 
-// TestReconcileIsNotRateLimitedPerObject is the B699 gate. On a populated
+// TestReconcileIsNotRateLimitedPerObject pins start-up reconcile throughput. On a populated
 // datastore whose every k3sm-managed object has drifted, the server's start-up
 // reconcile used to pay about a second per object: the admin clientset it ran on
 // kept client-go's default 5 QPS / 10 burst limiter, and each drifted object costs

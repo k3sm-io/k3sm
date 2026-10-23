@@ -67,7 +67,7 @@ func condStatusOf(conds []corev1.PodCondition, ct corev1.PodConditionType) strin
 	return "<absent>"
 }
 
-// TestVMPodReadyWaitsForTransportOverride is the B314 named gate: a vm pod's
+// TestVMPodReadyWaitsForTransportOverride pins that a vm pod's
 // POD-LEVEL PodReady is withheld until the Service proxy holds the published->live
 // transport override that makes the pod dialable at the address its EndpointSlice
 // carries — and is withheld again if that override is lost.

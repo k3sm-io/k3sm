@@ -42,7 +42,7 @@ import (
 // SandboxProfile.AllowNetwork=true for an ordinary pod — the precondition for
 // runtimed's per-pod Seatbelt egress rules (the cluster DNS + API VIPs) to be
 // emitted at all (those rules are gated on AllowNetwork). Cluster networking is
-// the normal case; a no-network pod would be the exception. Maps to M3.3-a1.
+// the normal case; a no-network pod would be the exception.
 func TestM3_3_ToPodBoxAllowsClusterNetwork(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web", UID: types.UID("uid-web")},
@@ -111,7 +111,7 @@ func TestToPodBoxFillsGate(t *testing.T) {
 	}
 }
 
-// TestToPodBoxDefaultBackendUnspecified is the M5.1 proof that a pod with NO
+// TestToPodBoxDefaultBackendUnspecified proves that a pod with NO
 // runtimeClassName stamps SANDBOX_BACKEND_UNSPECIFIED — NOT the old hardcoded
 // SEATBELT_EXEC(=1) rung. Stamping UNSPECIFIED lets runtimed's reworked
 // SelectBackend(UNSPECIFIED,…) walk the host-OS-version-gated Seatbelt ladder and
@@ -145,7 +145,7 @@ func TestToPodBoxDefaultBackendUnspecified(t *testing.T) {
 	}
 }
 
-// TestToPodBoxVMRuntimeClass is the M5.1 proof that runtimeClassName: vm resolves to
+// TestToPodBoxVMRuntimeClass proves that runtimeClassName: vm resolves to
 // SANDBOX_BACKEND_VM and that the guest is sized from the pod's cpu/memory: vCPUs
 // rounded UP from summed milli-CPU, memory summed in bytes, each container's
 // effective value being its limit when set, else its request; nothing set ⇒ 0 (the
@@ -220,7 +220,7 @@ func TestToPodBoxVMRuntimeClass(t *testing.T) {
 	}
 }
 
-// TestPodVMMemoryBytesExcludesOverhead is the B45 provider-side invariant guarding the
+// TestPodVMMemoryBytesExcludesOverhead is the provider-side invariant guarding the
 // three-figures decoupling documented at pkg/runtimeclass vmMemoryOverhead's "THREE
 // DISTINCT memory figures" doc: the vm RuntimeClass's
 // host-side scheduler-ACCOUNTING Overhead (256Mi, owned by pkg/runtimeclass) must NEVER be
@@ -264,7 +264,7 @@ func TestPodVMMemoryBytesExcludesOverhead(t *testing.T) {
 	}
 }
 
-// TestToPodBoxUnknownRuntimeClassFailsClosed is the M5.1 proof that a pod naming a
+// TestToPodBoxUnknownRuntimeClassFailsClosed proves that a pod naming a
 // RuntimeClass with no backend mapping is REFUSED at translation (an error wrapping
 // runtimev1.ErrUnknownHandler, nil box) rather than silently running on the
 // host-process path — k3sm never downgrades a pod that asked for an isolation class
@@ -290,7 +290,7 @@ func TestToPodBoxUnknownRuntimeClassFailsClosed(t *testing.T) {
 	}
 }
 
-// TestToPodBoxInjectsClusterDNSEnv is the B18 DNS-keystone gate: toPodBox injects the
+// TestToPodBoxInjectsClusterDNSEnv pins the DNS keystone: toPodBox injects the
 // K3SM_DNS_* env the DYLD getaddrinfo shim reads (serialized by dns.ConfigToEnv) into
 // EVERY container — init AND regular — for a cluster-first DNSPolicy, and injects
 // NOTHING for Default/None or an unusable config. Without it the shim defers to the
@@ -372,7 +372,7 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 
 	// Negative — Default and None opt out of cluster DNS: NO K3SM_DNS_* on any
 	// container (no env ⇒ the shim falls back to the host resolver, which is correct
-	// Default semantics; None custom-nameserver passthrough is deferred to B19/B20).
+	// Default semantics; None custom-nameserver passthrough is handled elsewhere).
 	t.Run("opt-out policies inject nothing", func(t *testing.T) {
 		for _, policy := range []corev1.DNSPolicy{corev1.DNSDefault, corev1.DNSNone} {
 			t.Run(string(policy), func(t *testing.T) {
@@ -419,13 +419,13 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 	})
 }
 
-// TestToPodBoxClusterFirstMergesDNSConfig is the B20a gate: buildBox merges a
+// TestToPodBoxClusterFirstMergesDNSConfig pins that buildBox merges a
 // ClusterFirst pod's spec.dnsConfig (extra searches appended+deduped, ndots
 // override) into the cluster DNS base BEFORE toPodBox injects the K3SM_DNS_* env the
 // DYLD getaddrinfo shim reads — so it asserts on the LIVE box env (every container,
 // init + regular), not the pure dns.MergeDNSConfig primitive. The merge is gated
 // structurally in buildBox on the cluster-DNS policy, so a None/Default pod gets the
-// UNMERGED base and (per B18) NO injection at all — pinning the B20a/B20b seam.
+// UNMERGED base and NO injection at all — pinning the ClusterFirst/None seam.
 // Fails-before (buildBox ignored spec.dnsConfig → the plain cluster defaults),
 // passes-after.
 func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
@@ -528,8 +528,8 @@ func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
 	})
 
 	// Case 3 — NEGATIVE: None and Default get the UNMERGED base and NO injection at
-	// all (unchanged from B18) even WITH a dnsConfig. This pins the B20a/B20b seam: a
-	// None pod's own dnsConfig is NOT merged into a cluster base here — B20b owns None.
+	// all even WITH a dnsConfig. This pins the ClusterFirst/None seam: a None pod's
+	// own dnsConfig is NOT merged into a cluster base here; None is handled elsewhere.
 	t.Run("None and Default inject nothing even with dnsConfig", func(t *testing.T) {
 		cfg := &corev1.PodDNSConfig{
 			Searches: []string{"corp.internal"},
@@ -554,7 +554,7 @@ func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
 	})
 }
 
-// TestDNSConfigOverrideClampsNdots is the k3sm-side B47 gate: dnsConfigOverride
+// TestDNSConfigOverrideClampsNdots is the k3sm-side ndots test: dnsConfigOverride
 // clamps a pod's spec.dnsConfig ndots to [0,15] (the resolv.conf RES_MAXNDOTS
 // ceiling) BEFORE the int32 narrowing, so an absurd value in the overflow band
 // (>=2^31) cannot wrap negative and be silently discarded by dns.MergeDNSConfig as
@@ -603,7 +603,7 @@ func countToken(toks []string, tok string) int {
 	return n
 }
 
-// TestToPodBoxInjectsBindDisciplineEnv is the B217 wiring gate: toPodBox injects the
+// TestToPodBoxInjectsBindDisciplineEnv pins the wiring: toPodBox injects the
 // K3SM_POD_IP env the DYLD bind() interpose reads (podnet.BindDisciplineEnv, infra-wins)
 // into EVERY container iff the pod has a DISTINCT /32 — podIP != nodeIP. A hostNetwork/
 // vm/no-network pod resolves podIP to nodeIP and gets NOTHING, so the shipped hostNetwork
@@ -650,7 +650,7 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 		}
 	})
 
-	// B218: the connect() rung's destination scope, K3SM_CLUSTER_CIDRS, ships
+	// The connect() rung's destination scope, K3SM_CLUSTER_CIDRS, ships
 	// alongside K3SM_POD_IP for a distinct-/32 pod — canonically serialized by
 	// podnet.BindDisciplineEnvWithCIDRs (never hand-formatted here). The cluster
 	// pod CIDR is unconditional (a fixed constant); the Service CIDR is present
@@ -905,7 +905,7 @@ func TestToPodStatusTerminatedVerbatim(t *testing.T) {
 	}
 }
 
-// TestToPodBoxM2Fields is the M2.1-a1 proof that the translation carries the new
+// TestToPodBoxM2Fields proves that the translation carries the new
 // pod-spec surface to the PodBox: configMap/secret/emptyDir/downwardAPI/projected
 // volumes + volumeMounts, downward-API env (structural valueFrom) + envFrom,
 // container securityContext, pod fsGroup, terminationGracePeriodSeconds, and
@@ -1000,7 +1000,7 @@ func TestToPodBoxM2Fields(t *testing.T) {
 	}
 }
 
-// TestToPodBoxMemoryLimitAnnotation is the M2.3-a1 proof that the pod's
+// TestToPodBoxMemoryLimitAnnotation proves that the pod's
 // resources.limits.memory drives the k3sm.io/memory-limit-bytes annotation
 // (runtimed's interim OOM/metering seam): set from a bounded pod, summed across
 // containers, and ABSENT when any container is unbounded (no false OOM).
@@ -1064,8 +1064,8 @@ func TestToPodBoxMemoryLimitAnnotation(t *testing.T) {
 	}
 }
 
-// TestTypedMemoryLimitWritten is the M2.2-swap proof that the translation writes
-// the TYPED apis:M2.2 PodBox fields, not just the interim annotation: a pod with
+// TestTypedMemoryLimitWritten proves that the translation writes the
+// TYPED PodBox fields, not just the interim annotation: a pod with
 // resources.limits.memory sets PodBox.memory_limit_bytes, and every pod carries the
 // correct qos_class enum (Guaranteed/Burstable/BestEffort) mapped from the kubelet
 // QoS classification.
@@ -1134,7 +1134,7 @@ func TestTypedMemoryLimitWritten(t *testing.T) {
 	}
 }
 
-// TestToContainerStatusMirror is the M2.1-a1 proof that the new ContainerStatus
+// TestToContainerStatusMirror proves that the new ContainerStatus
 // mirror fields (volume_mounts + user) round-trip from the runtime status into
 // corev1.PodStatus so kubectl describe / get -o yaml stays lossless.
 func TestToContainerStatusMirror(t *testing.T) {
@@ -1173,7 +1173,7 @@ func TestToContainerStatusMirror(t *testing.T) {
 	}
 }
 
-// TestToPodStatusOOMKilled is the M2.3-a1 proof that a runtimed OOMKilled
+// TestToPodStatusOOMKilled proves that a runtimed OOMKilled
 // terminated status surfaces as a corev1 terminated reason OOMKilled with a Failed
 // phase (the userspace memory-limit kill the kubelet would report).
 func TestToPodStatusOOMKilled(t *testing.T) {
@@ -1200,7 +1200,7 @@ func TestToPodStatusOOMKilled(t *testing.T) {
 	}
 }
 
-// TestDerivePhase covers the phase-derivation rule directly, INCLUDING the B26
+// TestDerivePhase covers the phase-derivation rule directly, INCLUDING the
 // restart-policy awareness: upstream's getPhase branches on RestartPolicy before
 // it can ever return Failed, so a restartable termination keeps the pod Running
 // and a running container always beats a failed sibling. A nil pod (the pod-less
@@ -1273,7 +1273,7 @@ func TestDerivePhase(t *testing.T) {
 	}
 }
 
-// TestPodStatusQOSClass is the B12 gate: toPodStatus is the SINGLE authority that
+// TestPodStatusQOSClass pins that toPodStatus is the SINGLE authority that
 // sets Status.QOSClass across all four publish paths (kubelet parity). It proves
 // (1) the kubelet-parity derivation Guaranteed/Burstable/BestEffort, (2) that an
 // init container is counted (it can flip a Guaranteed pod to Burstable), (3) that
@@ -1281,7 +1281,7 @@ func TestDerivePhase(t *testing.T) {
 // the blank-status derive fallback, and (5) that BOTH the pod-bearing GetPods path
 // and the formerly pod-less GetPodStatus path (runtimed.go:321) now emit the class.
 //
-// It FAILS before B12 (toPodStatus emitted no QOSClass → blank) and PASSES after.
+// It FAILS against the earlier toPodStatus (no QOSClass → blank) and PASSES now.
 func TestPodStatusQOSClass(t *testing.T) {
 	q := func(s string) resource.Quantity { return resource.MustParse(s) }
 	cpuMem := func(cpu, mem string) corev1.ResourceList {
@@ -1410,7 +1410,7 @@ func TestPodStatusQOSClass(t *testing.T) {
 	})
 }
 
-// TestRlimitSourceAndQoSClass is the B7 named gate: the provider is the SOURCE
+// TestRlimitSourceAndQoSClass pins that the provider is the SOURCE
 // of PodBox.rlimits (field 102), fed exclusively by pod-scoped
 // k3sm.io/rlimit-<resource> annotations. It proves:
 //   - the mechanical suffix→"RLIMIT_"+ToUpper(suffix) transform, forwarded
@@ -1584,7 +1584,7 @@ func TestRlimitSourceAndQoSClass(t *testing.T) {
 		})
 	}
 
-	// REGRESSION GUARD (not new B7 behavior): qos_class translation already ships
+	// REGRESSION GUARD (not new rlimit behavior): qos_class translation already ships
 	// green on main (translate.go podQOSClass; TestTypedMemoryLimitWritten). These
 	// subtests only pin that the rlimit source does not disturb it — qos
 	// APPLICATION evidence lives in runtimed's slices, not here.
@@ -1635,7 +1635,7 @@ func TestRlimitSourceAndQoSClass(t *testing.T) {
 	}
 }
 
-// TestComputeInitialized pins the B26 conformance fix: PodInitialized was
+// TestComputeInitialized pins a conformance fix: PodInitialized was
 // stamped ConditionTrue unconditionally, so a pod whose native sidecar was
 // crash-looping before it ever started still reported "the init phase is done".
 // The condition is now derived from the init-container statuses, with the
@@ -1715,7 +1715,7 @@ func TestComputeInitialized(t *testing.T) {
 
 // TestToPodBoxPersistentVolumeClaimVolume pins the durable PVC source through
 // translation. It is a regression test with a specific history: the source existed in
-// the proto (persistent_volume_claim, M3.1) and runtimed already materialized it, but
+// the proto (persistent_volume_claim) and runtimed already materialized it, but
 // toVolume had no case for it — so the volume was silently dropped and every
 // StatefulSet with a volumeClaimTemplate failed at admission with "volume_mount
 // \"data\" references undefined volume", a message that names the mount and never the
@@ -1774,7 +1774,7 @@ func TestToPodBoxPersistentVolumeClaimVolume(t *testing.T) {
 	}
 }
 
-// TestToPodBoxForwardsImagePullPolicyVerbatim is the provider half of the M12.1
+// TestToPodBoxForwardsImagePullPolicyVerbatim is the provider half of the image
 // skew contract: the pod spec's STAMPED imagePullPolicy reaches the wire
 // unchanged, on regular and init containers alike, and an unset field maps to
 // UNSPECIFIED — the legacy pull-through runtimed must read as "today's

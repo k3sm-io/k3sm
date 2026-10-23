@@ -178,7 +178,7 @@ func agentCollector(t *testing.T, p Paths, fsys fakeFS) Collector {
 	}
 }
 
-// TestStatusReportsTheAgentDaemon is the gate for B310: on a Mac installed as a
+// TestStatusReportsTheAgentDaemon pins that on a Mac installed as a
 // joining worker, `k3sm status` reports the agent daemon AND the credential
 // that makes it a cluster member — and on a control plane it reports exactly
 // what it always did.
@@ -286,7 +286,7 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 				wantIn: "does not parse",
 			},
 			{
-				// B340: complete, matched and in date, and still unusable —
+				// Complete, matched and in date, and still unusable —
 				// the apiserver dials this node's :10250 at the address it was
 				// assigned and the certificate names another one.
 				name: "address-mismatch — the certificate names an address this node is not assigned",
@@ -423,8 +423,8 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 	})
 }
 
-// TestWorkerStatusIsNotDegradedByItsControlPlane is the pkg half of the B324
-// gate: on a worker, the apiserver and node rows describe a control plane on
+// TestWorkerStatusIsNotDegradedByItsControlPlane is the pkg half of the
+// worker-verdict test: on a worker, the apiserver and node rows describe a control plane on
 // ANOTHER Mac, so they warn and never carry the verdict — and a leftover
 // control-plane work dir is named as a leftover rather than reported on. The
 // cmd half (which credentials are resolved, and what is dialled) is
@@ -710,5 +710,31 @@ func TestRoleKeyedRemediesAreStable(t *testing.T) {
 				t.Errorf("remedy = %q, want %q", tc.got, tc.want)
 			}
 		})
+	}
+}
+
+// TestJoinRemedyNamesTheWorkerInstall pins that the rejoin remedy an operator
+// copies spells the worker install `k3sm install` actually accepts (--agent,
+// --server, --token-file) and that the alert step describes it as a worker
+// install rather than as a plain re-run.
+func TestJoinRemedyNamesTheWorkerInstall(t *testing.T) {
+	const want = "sudo k3sm install --agent --server <control-plane> --token-file <file>"
+	workerFlags := map[string]bool{"--agent": true, "--server": true, "--token-file": true}
+	var install string
+	for _, line := range strings.Split(Collector{}.joinRemedy(), "\n") {
+		if cmd, _, _ := strings.Cut(line, "#"); strings.HasPrefix(cmd, "sudo k3sm install") {
+			install = strings.TrimSpace(cmd)
+		}
+	}
+	if install != want {
+		t.Fatalf("join remedy install line = %q, want %q", install, want)
+	}
+	for _, field := range strings.Fields(install) {
+		if strings.HasPrefix(field, "--") && !workerFlags[field] {
+			t.Errorf("join remedy names %s, which the worker install does not define", field)
+		}
+	}
+	if got, wantStep := describe(install), "Install this Mac as a worker with that token"; got != wantStep {
+		t.Errorf("describe(%q) = %q, want %q", install, got, wantStep)
 	}
 }

@@ -417,7 +417,7 @@ var describers = []struct {
 	{func(s string) bool { return strings.Contains(s, "diskutil mount") }, "Remove the shadow directory and mount the volume over the data root by hand"},
 	{prefix("sudo launchctl kickstart -k system/"), "Restart the daemon"},
 	{prefix("sudo launchctl enable system/"), "Re-enable the daemon in launchd"},
-	{prefix("sudo k3sm install --role agent"), "Install this Mac as a worker with that token"},
+	{prefix("sudo k3sm install --agent"), "Install this Mac as a worker with that token"},
 	{prefix("sudo k3sm install --data-volume"), "Re-run the install with the data volume, which loads its mount job"},
 	{prefix("sudo k3sm install"), "Re-run the install, which is idempotent and puts back what is missing"},
 	{prefix("sudo k3sm status"), "Run the report as an administrator, which can read what this account cannot"},

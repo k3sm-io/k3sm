@@ -51,7 +51,7 @@ const PodSecurityPinnedVersion = "v1.36"
 //   - PodSecurityWarnLevel is baseline: a baseline-violating pod is ADMITTED and
 //     the author gets a kubectl warning naming the violation.
 //   - PodSecurityAuditLevel is restricted: restricted-level violations are
-//     recorded as audit annotations in the audit log. Res.2 asks for
+//     recorded as audit annotations in the audit log. The intent is
 //     "baseline-warn + restricted-warn", and a PodSecurityConfiguration carries
 //     exactly ONE level per axis — so the stricter level rides the axis that is
 //     observation-only by construction, which is what "audit-observable, zero

@@ -257,7 +257,7 @@ func (n *probeNode) awaitReadyReason(t *testing.T, podID, reason string) corev1.
 	}
 }
 
-// TestVMPodProbesDialTheLiveGuestAddress is the B318 named gate: a vm pod's
+// TestVMPodProbesDialTheLiveGuestAddress pins that a vm pod's
 // probes must be dialed at the guest's LIVE lease, never at the published /32
 // they were resolved against — and while no lease is held they must not be dialed
 // at all.

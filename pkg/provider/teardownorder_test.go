@@ -25,7 +25,7 @@ import (
 	"k3sm.io/darwin-net/pkg/proxy"
 )
 
-// TestTeardownDropsTransportBeforeAlias pins the B440 teardown order: when a vm
+// TestTeardownDropsTransportBeforeAlias pins the vm pod teardown order: when a vm
 // pod is deleted, the generation that drops its override (which closes the
 // node's relay on the published address) is handed to the proxy while the
 // pod's /32 is still allocated, and the allocation (with its lo0 alias) is

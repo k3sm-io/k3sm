@@ -38,7 +38,7 @@
       "state": "waiting",
       "severity": "warn",
       "detail": "pid 1292 · waiting for a join: this Mac holds no node credential yet",
-      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
+      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
       "wide": {
         "credential": "absent",
         "credential-dir": "/var/lib/k3sm/agent",
@@ -70,7 +70,7 @@
             "confirm": true
           },
           {
-            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
             "needsAdmin": true,
             "confirm": false
           },
@@ -89,7 +89,7 @@
       "state": "unknown",
       "severity": "unknown",
       "detail": "this Mac has not joined a cluster, so there is no apiserver to probe: no k3sm context in ~/.kube/config",
-      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
+      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
       "alert": {
         "cause": "This Mac has not joined a cluster, so there is no control plane for it to reach.",
         "evidence": [
@@ -103,7 +103,7 @@
             "confirm": true
           },
           {
-            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
             "needsAdmin": true,
             "confirm": false
           },
@@ -259,7 +259,7 @@
   ],
   "next": [
     "k3sm token create   # on the control-plane Mac",
-    "sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac",
+    "sudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac",
     "k3sm status logs agent",
     "sudo k3sm install",
     "k3sm kubeconfig --write",

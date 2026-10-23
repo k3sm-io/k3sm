@@ -858,7 +858,7 @@ func TestStatusOnAWorkerRendersNoControlPlaneRows(t *testing.T) {
 		// The two rows whose remedies restart a node daemon: the runtime daemon
 		// that did not answer, and the shadowed data root that has to be
 		// re-opened once it is mounted. Both used to name io.k3sm.server, a
-		// launchd job a worker's Mac does not have — `k3sm install --role agent`
+		// launchd job a worker's Mac does not have — `k3sm install --agent`
 		// never writes that plist, so the operator's kickstart fails with
 		// "could not find service".
 		mac := stageNodeMac(t, macOpts{role: install.RoleAgent, joined: true, serverWorkDir: true, stateDB: 2})

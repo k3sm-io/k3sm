@@ -24,7 +24,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
-// The staged control-plane version (B395). `k3sm version` reports the pin this
+// The staged control-plane version. `k3sm version` reports the pin this
 // binary was BUILT with, which is what it intends to run; the work dir's
 // executor.KubeMarkerName marker records what was actually STAGED there. The two
 // differ exactly when a binary-only upgrade moved the pin without re-staging the

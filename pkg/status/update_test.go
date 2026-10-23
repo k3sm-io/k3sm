@@ -204,7 +204,7 @@ func TestUpdateRowReadsTheRecord(t *testing.T) {
 // a roll of the wrong shape invalidates the record.
 func TestUpdateRowRolling(t *testing.T) {
 	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
-	behind := UpdateRecord{CheckedAt: now.Add(-time.Hour), Latest: "v0.2.0", Nodes: []UpdateNode{nodeAt("laptop", "0.1.7", UpdateCurrent)}}
+	behind := UpdateRecord{CheckedAt: now.Add(-time.Hour), Latest: "v0.2.0", Nodes: []UpdateNode{nodeAt("node-b", "0.1.7", UpdateCurrent)}}
 	roll := func(at time.Time, node, nodePhase string) *UpdateRoll {
 		return &UpdateRoll{ObservedAt: at, Version: "v0.2.0", Phase: "Rolling", Node: node, NodePhase: nodePhase}
 	}
@@ -218,26 +218,26 @@ func TestUpdateRowRolling(t *testing.T) {
 	}{
 		{"rolling a node", func() UpdateRecord {
 			r := behind
-			r.Roll = roll(now.Add(-time.Minute), "laptop", "Installing")
+			r.Roll = roll(now.Add(-time.Minute), "node-b", "Installing")
 			return r
 		}(),
-			StateRolling, "updating the cluster to k3sm v0.2.0: Rolling, node laptop Installing", "Rolling", "laptop", false},
+			StateRolling, "updating the cluster to k3sm v0.2.0: Rolling, node node-b Installing", "Rolling", "node-b", false},
 		{"pending, no check recorded", UpdateRecord{Roll: &UpdateRoll{ObservedAt: now, Version: "v0.2.0"}},
 			StateRolling, "updating the cluster to k3sm v0.2.0: Pending", "Pending", "", false},
 		{"check failed", func() UpdateRecord {
 			r := behind
-			r.Error, r.Roll = "dial tcp: refused", roll(now, "laptop", "Downloading")
+			r.Error, r.Roll = "dial tcp: refused", roll(now, "node-b", "Downloading")
 			return r
-		}(), StateRolling, "node laptop Downloading", "Rolling", "laptop", false},
+		}(), StateRolling, "node node-b Downloading", "Rolling", "node-b", false},
 		{"stale roll", func() UpdateRecord {
 			r := behind
-			r.Roll = roll(now.Add(-UpdateRollStaleAfter-time.Second), "laptop", "Installing")
+			r.Roll = roll(now.Add(-UpdateRollStaleAfter-time.Second), "node-b", "Installing")
 			return r
 		}(),
-			StateBehind, "behind: laptop", "", "", true},
+			StateBehind, "behind: node-b", "", "", true},
 		{"bad node name", func() UpdateRecord { r := behind; r.Roll = roll(now, "Bad Node", "Installing"); return r }(),
 			StateUnknown, "roll", "", "", true},
-		{"bad phase", func() UpdateRecord { r := behind; r.Roll = roll(now, "laptop", "Installing\x1b[2J"); return r }(),
+		{"bad phase", func() UpdateRecord { r := behind; r.Roll = roll(now, "node-b", "Installing\x1b[2J"); return r }(),
 			StateUnknown, "roll", "", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -265,8 +265,8 @@ func TestUpdateRowCarriesLatestDuringARollAndOnAgents(t *testing.T) {
 	now := goldenTime
 
 	t.Run("a rolling row carries the latest release", func(t *testing.T) {
-		rec := UpdateRecord{CheckedAt: now.Add(-time.Hour), Latest: "v0.2.1", Nodes: []UpdateNode{nodeAt("laptop", "0.1.7", UpdateBehind)},
-			Roll: &UpdateRoll{ObservedAt: now, Version: "v0.2.0", Phase: "Rolling", Node: "laptop", NodePhase: "Installing"}}
+		rec := UpdateRecord{CheckedAt: now.Add(-time.Hour), Latest: "v0.2.1", Nodes: []UpdateNode{nodeAt("node-b", "0.1.7", UpdateBehind)},
+			Roll: &UpdateRoll{ObservedAt: now, Version: "v0.2.0", Phase: "Rolling", Node: "node-b", NodePhase: "Installing"}}
 		r := UpdateRowFrom(rec, now)
 		if r.State != StateRolling || r.Wide["latest"] != "v0.2.1" || r.Wide["target"] != "v0.2.0" {
 			t.Errorf("rolling row = %+v, want wide.latest v0.2.1 beside wide.target v0.2.0", r)
@@ -323,13 +323,13 @@ func TestUpdateRowCarriesLatestDuringARollAndOnAgents(t *testing.T) {
 		detail        string
 		remedyAllowed bool
 	}{
-		{"behind, from the server's Node", cluster(server("studio", "v0.2.0", checked), workerNode("laptop", "v1.37.1+k3sm.0.1.7")),
-			StateBehind, "v0.2.0", "node/studio", "behind: laptop", true},
-		{"the newest check wins", cluster(server("studio", "v0.1.0", now.Add(-48*time.Hour).Format(time.RFC3339)), server("studio-2", "v0.2.0", checked)),
-			StateUnknown, "v0.2.0", "node/studio-2", "no tagged k3sm release reported by: my-mac", false},
+		{"behind, from the server's Node", cluster(server("node-a", "v0.2.0", checked), workerNode("node-b", "v1.37.1+k3sm.0.1.7")),
+			StateBehind, "v0.2.0", "node/node-a", "behind: node-b", true},
+		{"the newest check wins", cluster(server("node-a", "v0.1.0", now.Add(-48*time.Hour).Format(time.RFC3339)), server("node-c", "v0.2.0", checked)),
+			StateUnknown, "v0.2.0", "node/node-c", "no tagged k3sm release reported by: my-mac", false},
 		{"a worker's own annotation is not the server's", cluster(forged),
 			StateUnknown, "", "", "no server has published an update check yet", false},
-		{"a value of the wrong shape is skipped", cluster(server("studio", "v0.2.0;rm", checked)),
+		{"a value of the wrong shape is skipped", cluster(server("node-a", "v0.2.0;rm", checked)),
 			StateUnknown, "", "", "no server has published", false},
 		{"the apiserver does not answer", fakeKube{rawErr: map[string]error{"/readyz": errors.New("connection refused")}, server: "https://100.64.0.1:6444", tls: "ca pinned"},
 			StateUnknown, "", "", "cannot read the latest release the server recorded: the apiserver does not answer", false},
@@ -346,7 +346,7 @@ func TestUpdateRowCarriesLatestDuringARollAndOnAgents(t *testing.T) {
 	}
 
 	t.Run("the node list refused", func(t *testing.T) {
-		r := Collector{Kube: healthyKube()}.agentUpdateRow(true, nil, errors.New(`nodes is forbidden: User "system:node:laptop" cannot list resource "nodes"`), now)
+		r := Collector{Kube: healthyKube()}.agentUpdateRow(true, nil, errors.New(`nodes is forbidden: User "system:node:node-b" cannot list resource "nodes"`), now)
 		if r.State != StateUnknown || !strings.Contains(r.Detail, "cannot read the latest release the server recorded: nodes is forbidden") {
 			t.Errorf("row = %+v", r)
 		}

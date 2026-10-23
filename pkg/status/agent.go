@@ -237,6 +237,6 @@ func (c Collector) credentialState(now time.Time) (CredentialState, time.Time) {
 // Mac have anything to re-install with.
 func (c Collector) joinRemedy() string {
 	return "k3sm token create   # on the control-plane Mac\n" +
-		"sudo k3sm install --role agent --server <control-plane> --token-file <file>   # on this Mac\n" +
+		"sudo k3sm install --agent --server <control-plane> --token-file <file>   # on this Mac\n" +
 		"k3sm status logs " + RowAgent
 }

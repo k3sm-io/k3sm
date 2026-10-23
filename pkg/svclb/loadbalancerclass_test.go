@@ -33,7 +33,7 @@ import (
 
 func strptr(s string) *string { return &s }
 
-// TestLoadBalancerClassRespected is B135's named gate.
+// TestLoadBalancerClassRespected pins that svclb ignores a classed Service.
 //
 // spec.loadBalancerClass is the API's multi-implementation contract: nil means
 // "the default implementation", and an implementation must IGNORE a Service

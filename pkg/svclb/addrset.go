@@ -61,10 +61,15 @@ const privilegedPortMax = 1023
 //
 // On a port below 1024 the loopback addresses are dropped from a specific set.
 // No unprivileged process can bind a specific address there, and the one
-// broker that can (the netd helper, for the ingress and LoadBalancer
-// listeners) admits this node's own address and never loopback; the node's
-// address answers on this Mac anyway. The result may be empty, which a caller refuses with
-// ErrNoBindAddress rather than binding nothing quietly.
+// broker that can, the netd helper, decides by the port's class. For a port the
+// canonical ingress Service declares it admits this node's own address and
+// never loopback, so the ingress host, which binds through this exported form,
+// leaves loopback out; the node's address answers on this Mac anyway. For a
+// port the operator listed that another LoadBalancer Service declares it also
+// admits 127.0.0.1, which is why the svclb hoster keeps loopback on a listed
+// port (effectiveBindAddrs with keepLoopback). The
+// result may be empty, which a caller refuses with ErrNoBindAddress rather than
+// binding nothing quietly.
 func EffectiveBindAddrs(addrs []netip.Addr, port uint16) []netip.Addr {
 	return effectiveBindAddrs(addrs, port, false)
 }

@@ -60,7 +60,7 @@ func withDeveloperDir(t *testing.T, dir string) {
 	lookupDeveloperDir = func() (string, error) { return dir, nil }
 }
 
-// TestXcodeToolchainOptIn is the B264 provider-side gate: the
+// TestXcodeToolchainOptIn is the provider-side test: the
 // k3sm.io/xcode-toolchain annotation is read by PRESENCE and turns into
 // SandboxProfile.xcode_toolchain_dir carrying the NODE's developer directory —
 // and only ever that directory, never a pod-supplied path.

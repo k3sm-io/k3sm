@@ -263,7 +263,7 @@ func (f *instanceFake) status() *runtimev1.PodStatus {
 	return f.statusLocked()
 }
 
-// TestRuntimedPathEmitsContainerLifecycleEvents is the B762 gate: a pod on the
+// TestRuntimedPathEmitsContainerLifecycleEvents pins that a pod on the
 // runtimed path records the kubelet's container lifecycle Events, each against
 // the Pod with the container's fieldPath, exactly once per container instance:
 //

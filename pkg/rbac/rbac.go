@@ -340,8 +340,8 @@ func ensureInPodReaderRBAC(ctx context.Context, cs kubernetes.Interface, ns, sa 
 // to pull, and a cross-node pull of a `localhost:<port>/…` reference fails on a
 // node that was simply never fed.
 //
-// OPERATOR-APPROVED 2026-09-02 as the narrowest widening available. Approval was
-// asked for because this is the first grant that gives the system:nodes group a
+// It is the narrowest widening available, and it was reviewed as such because
+// this is the first grant that gives the system:nodes group a
 // read it did not have, and the shape of it is forced: the reader is a shared
 // informer, so it needs list and watch, and RBAC's resourceNames narrows GET but
 // has NO effect on list or watch — a rule cannot say "watch only the objects

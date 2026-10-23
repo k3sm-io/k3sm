@@ -1687,7 +1687,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 			return nil
 		}
 	}
-	// Ordering (BINDING): allocate the pod's /32 BEFORE translation/env
+	// Ordering: allocate the pod's /32 BEFORE translation/env
 	// resolution so box.PodIp and the status.podIP downward-API env carry it. A
 	// translate failure below does NOT release it here (an idempotent retry or
 	// the eventual DeletePod → releasePodNetwork reclaims it; auto-releasing
@@ -1996,8 +1996,7 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	// lifetime, binding the pod identity on its own context. The binding here
 	// stays because env-source resolution in buildBox (resolvePodBoxEnv →
 	// ConfigMap/Secret key refs) legitimately re-runs on every box build, and
-	// this seam is kept uniform for CreatePod and UpdatePod rather than split
-	// (B233).
+	// this seam is kept uniform for CreatePod and UpdatePod rather than split.
 	ctx = withPodIdentity(ctx, pod)
 	// A spec change (an ephemeral container added) can add references; the
 	// registration is replaced, so a removed reference stops being fetchable.

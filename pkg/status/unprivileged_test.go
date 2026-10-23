@@ -241,7 +241,7 @@ func TestUserKubeContext(t *testing.T) {
 		{"a k3sm context pointing at another host yields no context", cfg("k3sm", map[string]string{"k3sm": "https://10.0.0.9:6444"}), "192.0.2.50", "", false},
 		{"a k3sm context elsewhere falls to an anchored current context", cfg("lab", map[string]string{"k3sm": "https://10.0.0.9:6444", "lab": "https://192.0.2.50:6444"}), "192.0.2.50", "lab", true},
 		{"the current context on the joined host", cfg("lab", map[string]string{"lab": "https://192.0.2.50:6444"}), "192.0.2.50:9345", "lab", true},
-		{"a join server given as a URL", cfg("lab", map[string]string{"lab": "https://studio.example:6444"}), "https://Studio.example:9345", "lab", true},
+		{"a join server given as a URL", cfg("lab", map[string]string{"lab": "https://node-a.example:6444"}), "https://Node-a.example:9345", "lab", true},
 		{"the current context on another cluster", cfg("work", map[string]string{"work": "https://10.0.0.9:6443"}), "192.0.2.50", "", false},
 		{"no join server to compare with", cfg("lab", map[string]string{"lab": "https://192.0.2.50:6444"}), "", "", false},
 		{"no kubeconfig", nil, "192.0.2.50", "", false},
@@ -268,7 +268,7 @@ func TestServerAnchor(t *testing.T) {
 		"https://100.64.0.1:443":  false,
 		"https://100.64.0.1":      false,
 		"https://100.64.0.9:6444": false,
-		"https://studio.lan:6444": false,
+		"https://node-a.lan:6444": false,
 		"https://192.0.2.50:6444": false,
 		"":                        false,
 	} {

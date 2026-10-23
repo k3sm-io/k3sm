@@ -261,13 +261,13 @@ func poolService(name string, port int32, labels map[string]string) *corev1.Serv
 	return s
 }
 
-// TestNodePoolSelection is the B416 gate: multi-node ServiceLB with node pools.
+// TestNodePoolSelection pins multi-node ServiceLB with node pools.
 //
 // It covers the pure halves (selectHosts, computeIngress, the report codec) and
 // a fake-clientset leg that runs the decider and one hoster per node against
 // one store, which is the whole protocol: the decider stamps hosts, each hoster
 // binds and reports on its own Node, and the decider writes the replaced status
-// slice. The binding resolutions each have a case: P1 (server-held addresses
+// slice. Each protocol rule has a case, named by its subtest prefix: P1 (server-held addresses
 // only), P2 (allow-list mode on enablelb=true only), P4 (a report is trusted
 // per incarnation across a Ready transition), P5 (start-up hold-down), P7
 // (replace-on-reconcile) and P8/P10 (the per-node Event).

@@ -53,7 +53,7 @@ func (f *fakePublisher) Remove(key string) error {
 	return nil
 }
 
-// TestNodeResolverEntryIsPublishedOnStart is the netd half of B243's node
+// TestNodeResolverEntryIsPublishedOnStart is the netd half of the node
 // resolver floor: netd publishes ONE dynamic-store entry at the fixed key with
 // the exact supplemental DNS dictionary (the DNS VIP as the only server, svc and
 // the cluster domain as NoSearch match domains, order 1000), writes the FULL

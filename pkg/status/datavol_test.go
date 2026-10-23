@@ -472,7 +472,7 @@ func TestDatavolScopeOverrides(t *testing.T) {
 
 // TestPreVolumeRowPartialWalk pins that a size the walk could not finish is
 // reported as a lower bound, never as the whole: an unprivileged `k3sm status`
-// against a root-owned copy sees only what it may read (540M on the rig, for a
+// against a root-owned copy sees only what it may read (540M on a test machine, for a
 // 1.8G tree), and printing that number bare would understate what the operator
 // is about to reclaim.
 func TestPreVolumeRowPartialWalk(t *testing.T) {

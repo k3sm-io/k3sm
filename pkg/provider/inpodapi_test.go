@@ -36,7 +36,7 @@ import (
 	"k3sm.io/runtimed/pkg/mount"
 )
 
-// M2.4 in-cluster API access. The driving reference is the snapshot-manager's
+// In-cluster API access. The driving reference is the snapshot-manager's
 // in-pod kubectl (TestM2_InPodKubectl): a pod must
 // reach kubernetes.default.svc with a projected SA token minted for ITS OWN
 // ServiceAccount, the apiserver serving CA, and the namespace, all at the
@@ -124,7 +124,7 @@ func saAccessPod(ns, name, sa string) *corev1.Pod {
 	}
 }
 
-// TestM2_InPodKubectl is the M2.4-a1 proof: a pod's projected SA token is minted
+// TestM2_InPodKubectl proves that a pod's projected SA token is minted
 // for ITS OWN ServiceAccount (not the namespace default), the serving CA and the
 // namespace land at the canonical in-pod paths, and the provider binds the pod's
 // SA across the runtime seam.

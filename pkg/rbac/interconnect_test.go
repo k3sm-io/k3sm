@@ -51,7 +51,7 @@ func grantsInterconnect(rules []rbacv1.PolicyRule) bool {
 	return false
 }
 
-// TestNodeGroupHasNoInterconnectGrant pins the B524 no-new-RBAC promise: nodes
+// TestNodeGroupHasNoInterconnectGrant pins the no-new-RBAC promise of interconnects: nodes
 // never read the Interconnect object (they report and read desired state
 // through annotations on their own Node), so no binding that reaches a node
 // identity may grant any verb on interconnects.net.k3sm.io. A grant there would
