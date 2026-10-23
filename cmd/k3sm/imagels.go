@@ -112,7 +112,7 @@ type imageDFReport struct {
 
 // imageRegistryEnv is what ls and df read: the cluster, and how to reach the
 // registry the cluster publishes. Injected so the gate runs against a fake
-// clientset and an httptest registry.
+// clientset and an in-process fake registry.
 type imageRegistryEnv struct {
 	kube kubernetes.Interface
 	// apiHost is the host of the apiserver URL kube dials. The registry runs
