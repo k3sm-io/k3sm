@@ -124,7 +124,7 @@ k3sm ships through three channels, listed in shipping order:
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
    one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
 
-2. **The k3sm app,** a signed, notarized download from k3sm.io that checks for a new release and points you to the download (see [Installing From k3sm.app](#installing-from-k3smapp)).
+2. **The k3sm app,** a signed, notarized download from k3sm.io (see [Installing From k3sm.app](#installing-from-k3smapp)).
 
 3. **Notarized `.pkg`** is a signed, stapled installer package for offline and managed
    installs.

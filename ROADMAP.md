@@ -92,7 +92,7 @@ release engineering. What ships:
 - Install arrives in three generations, in shipping order: *(1)*
   `curl -fsSL https://k3sm.io/install.sh | sh`, a checksum-verified release tarball handed to
   `sudo k3sm install` (a curl download carries no quarantine xattr); *(2)*
-  the k3sm app, a Developer ID signed, notarized download from k3sm.io that checks for a new release and points to the download; *(3)* a signed, notarized `.pkg`. Underneath it are goreleaser,
+  the k3sm app, a Developer ID signed, notarized download from k3sm.io; *(3)* a signed, notarized `.pkg`. Underneath it are goreleaser,
   [user docs](docs/user/), and the website.
 - `k3sm image load` / `k3sm image import` ingest docker-save
   tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and
@@ -169,6 +169,10 @@ release engineering. What ships:
   memory the GPU can use, and whether the Neural Engine and Apple's on-device model are available.
   This is a breaking change: `mlx.k3sm.io/gpu` and the `mlx.k3sm.io/*` node labels are retired, and
   the release notes say how to move a hand-written Pod to the new names.
+
+- **The app finds its own new releases.** The k3sm app checks a release index signed with the
+  project's Developer ID for a newer release of itself and of k3sm, says how far behind it is, and
+  points to the download. Installing a release in place comes after it.
 
 ## v0.4 (planned)
 

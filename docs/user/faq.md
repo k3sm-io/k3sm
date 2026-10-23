@@ -68,7 +68,7 @@ See [Versions](versions.md), and read the live pin from `k3sm version`.
 ## How Do I Upgrade?
 
 Re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`, which installs the latest
-release and restarts the daemons. The k3sm app, a signed, notarized download from k3sm.io that checks for a new release and points you to the download, is the second
+release and restarts the daemons. The k3sm app, a signed, notarized download from k3sm.io, is the second
 install channel. A multi-node cluster rolls node-by-node. See
 [Upgrade](upgrade.md).
 
