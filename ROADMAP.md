@@ -138,7 +138,9 @@ release engineering. What ships:
   the same in a Pod spec, inside native and `vm` Pods, and from every node. `k3sm build`,
   `k3sm image load` and the other image commands write to it, each node keeps only a pull cache,
   and an upgrade moves the images already on a node into the registry without losing any. The
-  macOS app's Images view shows the registry. An opt-in NodePort exposes it off the cluster.
+  registry serves HTTPS with a certificate from the cluster CA, which every Pod already trusts, so
+  no client needs an insecure-registry setting. The macOS app's Images view shows the registry. An
+  opt-in NodePort exposes it off the cluster.
 - **Pushing from inside a Pod.** A Pod pushes with its own ServiceAccount token, in a namespace
   that opts in with a label and a RoleBinding, into a repository prefix that namespace owns.
   Reads stay anonymous; no shared push password is handed out.
