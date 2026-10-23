@@ -660,7 +660,7 @@ phases:
       m11-core launch ledger row. FLIPPED EARLY (2026-09-01, its R29 — operator decision):
       the vm RuntimeClass ships DE-EXPERIMENTAL at v0.1 for linux/arm64, single-node; the
       user docs and the public roadmap describe it by what it runs (k3sm#282). What stays
-      v0.2: the published performance figures, linux/amd64-via-Rosetta, and the remaining
+      v0.3: the published performance figures, linux/amd64-via-Rosetta, and the remaining
       ceilings (per-pod network segmentation between guests, host-path sharing). Run out of
       ledger order with recorded rationale — the M10 remainder is hardware-gated and not a
       dependency. Hard cut. The flip WAS structurally lab-gated, never unit-green-only: the
@@ -883,7 +883,7 @@ phases:
             method: lab
 
   - id: M14
-    title: Multi-node & HA de-EXPERIMENTAL graduation (v0.3)
+    title: Multi-node & HA de-EXPERIMENTAL graduation (v0.4)
     status: in-progress
     strategy: hard cut
     depends_on:
@@ -1027,7 +1027,7 @@ phases:
             check: "K3SM_LAB=1 hack/lab/m6.sh exits 0 on two Macs + Postgres with the soak at >= 24h and the duration recorded; writes through to flip k3sm:M6.0-a1 and k3sm:M6.1-a1 met:true and M6 status:done"
             method: lab
       - id: M14.6
-        title: the de-EXPERIMENTAL flip — docs, site, and the v0.3 close
+        title: the de-EXPERIMENTAL flip — docs, site, and the v0.4 close
         status: todo
         strategy: hard cut
         depends_on: []
@@ -2218,7 +2218,7 @@ failover are the `hack/lab/m6.sh` / `e2e/TestM6_*` lab legs (`K3SM_LAB=1`, never
 ## M11 — Linux containers & multi-arch (k3sm slice) ✅
 `docs/m11-plan.md` is authoritative (encoded 2026-07-10; done 2026-09-01). M11 **de-EXPERIMENTALs the
 `vm` RuntimeClass** — flipped early at v0.1 (its R29, 2026-09-01) for `linux/arm64`, single-node;
-the published performance figures, `linux/amd64`, and the remaining ceilings are the v0.2 event.
+the published performance figures, `linux/amd64`, and the remaining ceilings are the v0.3 event.
 **Hard cut.** The flip was **structurally lab-gated** (the full `hack/lab/m11.sh` ledger green on an
 entitled VZ Mac against the release artifact + the R19(c) threat-terms sign-off) — never
 unit-green-only.

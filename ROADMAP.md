@@ -133,13 +133,34 @@ release engineering. What ships:
 
 ## v0.2 (planned)
 
-- **The Linux `vm` path.** The Linux-image capability ships at v0.1 (above); v0.2 adds
+- **One image store and one name for it.** The server's registry becomes the single place the
+  cluster's images live, under one flat reference, `registry-k3sm:6450/<repo>:<tag>`, that works
+  the same in a Pod spec, inside native and `vm` Pods, and from every node. `k3sm build`,
+  `k3sm image load` and the other image commands write to it, each node keeps only a pull cache,
+  and an upgrade moves the images already on a node into the registry without losing any. The
+  registry serves HTTPS with a certificate from the cluster CA, which every Pod already trusts, so
+  no client needs an insecure-registry setting. The macOS app's Images view shows the registry. An
+  opt-in NodePort exposes it off the cluster.
+- **Pushing from inside a Pod.** A Pod pushes with its own ServiceAccount token, in a namespace
+  that opts in with a label and a RoleBinding, into a repository prefix that namespace owns.
+  Reads stay anonymous; no shared push password is handed out.
+- **Managed updates.** `k3sm update check` and `k3sm update apply` roll the cluster to a release
+  node by node, and each node installs only a payload its server signed.
+- **A real stop and start.** `sudo k3sm stop`, `start` and `restart`, with a stop that holds
+  across a reboot.
+- **Operations.** `k3sm status top`, `kubectl top` through the bundled metrics-server, build
+  history and cancellation, LoadBalancer Services on every node, and scheduled etcd snapshots on
+  HA servers.
+
+## v0.3 (planned)
+
+- **The Linux `vm` path.** The Linux-image capability ships at v0.1 (above); v0.3 adds
   the remaining two-Mac and vm tests with **published performance figures** (VM boot latency = restart
   cost, the Rosetta non-TSO ratio, virtiofs I/O vs native APFS), and the remaining ceilings
   either closed or documented (per-pod network segmentation between micro-VMs, host-path
   sharing). It also adds darwin/amd64 pod payloads under host Rosetta on the native path.
 
-## v0.3 (planned)
+## v0.4 (planned)
 
 - **De-EXPERIMENTAL HA.** The headline of this line, once it has been run on two Macs with Postgres.
 - **Multi-node graduates.** Multi-node clusters leave EXPERIMENTAL together with the two-server
@@ -172,11 +193,8 @@ release engineering. What ships:
   sharded across cabled Macs (the reserved `MLXModel.Distributed` seam, one rank per Mac) on MLX's
   `ring` backend. The `jaccl` backend over RDMA follows where macOS exposes it, which today means
   Thunderbolt 5 Macs on macOS 26.2 or later with RDMA enabled once in macOS Recovery.
-- **A macOS app, and a real stop and start.** k3sm gains `k3sm stop`, `k3sm start` and
-  `k3sm restart`. Stop is a full stop, like k3s's killall script: the node, its pods, the mesh and
-  the cluster addresses come down, and the node stays stopped across a reboot until you start it
-  again. Restart keeps pods running. On top of that, k3sm gets a second way to install: a notarized
-  app you drag into Applications. While k3sm runs it shows a menu-bar item with status, stop,
+- **A macOS app.** On top of `k3sm stop` and `start` (v0.2), k3sm gets a second way to install: a
+  notarized app you drag into Applications. While k3sm runs it shows a menu-bar item with status, stop,
   restart and logs (and, on the server, a command that joins a worker), and its window handles
   first-time setup, updates and uninstall. An optional auto-stop takes the node down when the Mac
   joins a Wi-Fi network you have not marked trusted; it is a convenience, not a security boundary.
