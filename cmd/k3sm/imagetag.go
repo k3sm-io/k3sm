@@ -58,6 +58,7 @@ func imageTag(ctx context.Context, client runtimev1.ImagesClient, o imageOptions
 		}
 		fmt.Fprintf(out, "%s resolves to %s\n", o.source, digest)
 	}
+	//lint:ignore SA1019 the node-store image verbs stay until build and load move to the registry
 	resp, err := client.TagImage(ctx, &runtimev1.TagImageRequest{
 		Digest:    digest,
 		Reference: o.target,
@@ -90,6 +91,7 @@ func imageTag(ctx context.Context, client runtimev1.ImagesClient, o imageOptions
 // name. An ambiguous untag — no --platform on a reference with several entries —
 // is refused too, and removes nothing.
 func imageUntag(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) error {
+	//lint:ignore SA1019 the node-store image verbs stay until build and load move to the registry
 	resp, err := client.UntagImage(ctx, &runtimev1.UntagImageRequest{
 		Reference: o.source,
 		Platform:  o.platform,

@@ -96,6 +96,7 @@ func imageLoad(ctx context.Context, client runtimev1.ImagesClient, o imageOption
 		return fmt.Errorf("rewind %s: %w", o.archive, err)
 	}
 
+	//lint:ignore SA1019 the node-store image verbs stay until build and load move to the registry
 	stream, err := client.LoadImage(ctx)
 	if err != nil {
 		return imageRPCError(what, o.socket, err)
