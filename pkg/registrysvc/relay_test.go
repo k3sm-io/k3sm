@@ -22,10 +22,10 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http/httptest"
 	"net/netip"
 	"slices"
 	"strconv"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -169,53 +169,97 @@ func TestVMNetGateway(t *testing.T) {
 	})
 }
 
-// TestRelayForwards drives the accept+forward mechanics over a loopback pair: the
-// relay's own production listener and dialer, an echo server standing in for the
-// registry, and a client standing in for a peer.
-//
-// The half-close row is the one worth having. A registry push writes a large body
-// and then reads the response, and a pull streams a blob long after the request
-// ended; a forwarder that tore the pair down when EITHER direction finished would
-// truncate both, and would still pass a naive round-trip test.
-func TestRelayForwards(t *testing.T) {
-	t.Run("bytes reach the registry and the answer comes back", func(t *testing.T) {
-		port := startEchoRegistry(t)
-		client := dialThroughRelay(t, port)
-		if _, err := client.Write([]byte("ping\n")); err != nil {
-			t.Fatalf("write through the relay: %v", err)
+// TestRelayServesTheGate drives the relay's serve mechanics over a loopback
+// listener: the relay's own production server and gate, a fake registry behind
+// it, and a raw client standing in for a peer or a guest. A read reaches the
+// registry; a DELETE does not; a dead registry closes a read's connection
+// rather than answering, which is what a peer's puller reads as "this mirror
+// does not have it".
+func TestRelayServesTheGate(t *testing.T) {
+	t.Run("a read reaches the registry and the answer comes back", func(t *testing.T) {
+		z, zaddr := socketZot(t)
+		addr := serveThroughRelay(t, portOf(t, zaddr))
+		r := rawDoTCP(t, addr, "GET", "/v2/app/manifests/v1", nil, "")
+		if r.status != 200 || r.body != "content" {
+			t.Errorf("read = %d %q, want 200 content", r.status, r.body)
 		}
-		got := readLine(t, client)
-		if got != "ping" {
-			t.Errorf("read %q through the relay, want %q", got, "ping")
+		if n := len(z.requests()); n != 1 {
+			t.Errorf("the registry saw %d requests, want 1", n)
 		}
 	})
 
-	t.Run("a client half-close does not truncate the response", func(t *testing.T) {
-		port := startEchoRegistry(t)
-		client := dialThroughRelay(t, port)
-		if _, err := client.Write([]byte("last\n")); err != nil {
+	t.Run("a DELETE never reaches the registry", func(t *testing.T) {
+		z, zaddr := socketZot(t)
+		addr := serveThroughRelay(t, portOf(t, zaddr))
+		if r := rawDoTCP(t, addr, "DELETE", "/v2/app/manifests/v1", nil, ""); r.status != 405 {
+			t.Errorf("DELETE = %d, want 405", r.status)
+		}
+		if n := len(z.requests()); n != 0 {
+			t.Errorf("the registry saw %d requests, want none", n)
+		}
+	})
+
+	t.Run("a relay with no gate identity refuses writes", func(t *testing.T) {
+		_, zaddr := socketZot(t)
+		addr := serveThroughRelay(t, portOf(t, zaddr))
+		if r := rawDoTCP(t, addr, "PUT", "/v2/team/app/manifests/v1", nil, "{}"); r.status != 503 {
+			t.Errorf("write = %d, want 503", r.status)
+		}
+	})
+
+	t.Run("a dead registry closes a read's connection rather than hanging", func(t *testing.T) {
+		addr := serveThroughRelay(t, freePort(t))
+		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.WriteString(c, "GET /v2/ HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 			t.Fatalf("write: %v", err)
 		}
-		// The client is done writing. The registry must still be able to answer,
-		// which is exactly the shape of a completed push awaiting its response.
-		if tc, ok := client.(*net.TCPConn); ok {
-			if err := tc.CloseWrite(); err != nil {
-				t.Fatalf("half-close: %v", err)
-			}
+		b, err := io.ReadAll(c)
+		if err != nil {
+			t.Fatalf("read from a relay with no registry behind it: %v", err)
 		}
-		if got := readLine(t, client); got != "last" {
-			t.Errorf("read %q after a half-close, want %q — the response was truncated", got, "last")
+		if len(b) != 0 {
+			t.Errorf("got %q, want the connection closed with no response", b)
 		}
 	})
 
-	t.Run("a dead registry closes the connection rather than hanging", func(t *testing.T) {
-		// No echo server: the loopback dial is refused, which is precisely what a
-		// peer's puller reads as "this mirror does not have it".
-		port := freePort(t)
-		client := dialThroughRelay(t, port)
-		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
-		if _, err := io.ReadAll(client); err != nil {
-			t.Fatalf("read from a relay with no registry behind it: %v", err)
+	t.Run("the connection cap holds a client beyond it until a slot frees", func(t *testing.T) {
+		front, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		ll := newLimitListener(front, 1)
+		t.Cleanup(func() { _ = ll.Close() })
+		accepted := make(chan net.Conn, 2)
+		go func() {
+			for {
+				c, err := ll.Accept()
+				if err != nil {
+					return
+				}
+				accepted <- c
+			}
+		}()
+		c1, _ := net.Dial("tcp", front.Addr().String())
+		c2, _ := net.Dial("tcp", front.Addr().String())
+		defer c1.Close()
+		defer c2.Close()
+		first := <-accepted
+		select {
+		case <-accepted:
+			t.Fatal("a second connection was accepted past the cap")
+		case <-time.After(200 * time.Millisecond):
+		}
+		_ = first.Close()
+		select {
+		case c := <-accepted:
+			_ = c.Close()
+		case <-time.After(5 * time.Second):
+			t.Fatal("the waiting connection was not accepted after a slot freed")
 		}
 	})
 }
@@ -226,7 +270,7 @@ func TestRelayForwards(t *testing.T) {
 // the listener stops immediately, without spending the retry budget on a
 // condition nothing here can change, and without touching the other address.
 func TestRelaySkipsAnAbsentAddress(t *testing.T) {
-	r := newRelay(6450, []netip.Addr{netip.MustParseAddr("192.168.64.1")}, quietLogger())
+	r := newRelay(6450, []netip.Addr{netip.MustParseAddr("192.168.64.1")}, quietLogger(), GateAuth{}, Credential{})
 	attempts := 0
 	r.listen = func(string) (net.Listener, error) {
 		attempts++
@@ -255,7 +299,7 @@ func TestRelayStopsOnContextCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	r := newRelay(portOf(t, ln.Addr()), nil, quietLogger())
+	r := newRelay(portOf(t, ln.Addr()), nil, quietLogger(), GateAuth{}, Credential{})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
@@ -278,41 +322,16 @@ func TestRelayStopsOnContextCancel(t *testing.T) {
 // quietLogger discards: these tests assert behavior, not log lines.
 func quietLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
-// startEchoRegistry stands in for the loopback ingest registry: it echoes each
-// line back. It returns the port, which is BOTH the relay's forward target and
-// the port the relay would bind on a real address.
-func startEchoRegistry(t *testing.T) int {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer c.Close()
-				_, _ = io.Copy(c, c)
-			}()
-		}
-	}()
-	return portOf(t, ln.Addr())
-}
-
-// dialThroughRelay starts a relay whose forward target is 127.0.0.1:<port>,
-// fronted by a loopback listener the test dials — the same accept+forward path a
-// mesh peer or a vm guest takes, with no mesh and no guest.
-func dialThroughRelay(t *testing.T, port int) net.Conn {
+// serveThroughRelay starts a relay whose upstream is 127.0.0.1:<port>, served
+// on a loopback listener the test dials: the same serve path a mesh peer or a
+// vm guest takes, with no mesh and no guest. It returns the address to dial.
+func serveThroughRelay(t *testing.T, port int) string {
 	t.Helper()
 	front, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	r := newRelay(port, nil, quietLogger())
+	r := newRelay(port, nil, quietLogger(), GateAuth{}, gateCred)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
@@ -324,13 +343,7 @@ func dialThroughRelay(t *testing.T, port int) net.Conn {
 		<-done
 		_ = front.Close()
 	})
-	c, err := net.DialTimeout("tcp", front.Addr().String(), 5*time.Second)
-	if err != nil {
-		t.Fatalf("dial the relay: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
-	return c
+	return front.Addr().String()
 }
 
 // portOf extracts the port from a listener address.
@@ -347,22 +360,22 @@ func portOf(t *testing.T, a net.Addr) int {
 	return n
 }
 
-// readLine reads one newline-terminated line.
-func readLine(t *testing.T, c net.Conn) string {
+// socketZot serves a fake registry over a real loopback listener, for the relay
+// tests, whose subject is the listener.
+func socketZot(t *testing.T) (*fakeZot, net.Addr) {
 	t.Helper()
-	buf := make([]byte, 0, 64)
-	one := make([]byte, 1)
-	for {
-		n, err := c.Read(one)
-		if err != nil {
-			t.Fatalf("read: %v (got %q so far)", err, buf)
-		}
-		if n == 0 {
-			continue
-		}
-		if one[0] == '\n' {
-			return strings.TrimRight(string(buf), "\r")
-		}
-		buf = append(buf, one[0])
+	z := newFakeZot(t)
+	srv := httptest.NewServer(z.h)
+	t.Cleanup(srv.Close)
+	return z, srv.Listener.Addr()
+}
+
+// rawDoTCP is rawDo over a real TCP connection to addr.
+func rawDoTCP(t *testing.T, addr, method, target string, headers map[string]string, body string) rawResponse {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
 	}
+	return rawOn(t, c, method, target, headers, body)
 }

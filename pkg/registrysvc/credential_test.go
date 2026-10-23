@@ -223,3 +223,62 @@ func TestCredentialWithoutAddressMatchesNothing(t *testing.T) {
 		}
 	}
 }
+
+// TestWriteCredentialGateUser pins the push gate's credential on disk: its
+// bcrypt line sits in the htpasswd file beside the local CLI's, and its
+// plaintext password appears in no file at all, because the gate holds it in
+// memory and nothing else ever presents it.
+func TestWriteCredentialGateUser(t *testing.T) {
+	work := t.TempDir()
+	if err := os.MkdirAll(StateDir(work), 0o700); err != nil {
+		t.Fatalf("create the state dir: %v", err)
+	}
+	cred, err := generateCredential("127.0.0.1:6450")
+	if err != nil {
+		t.Fatalf("generateCredential: %v", err)
+	}
+	gate, err := generateGateCredential("127.0.0.1:6450")
+	if err != nil {
+		t.Fatalf("generateGateCredential: %v", err)
+	}
+	if gate.Username != gateUser || gate.Password == cred.Password {
+		t.Fatalf("gate credential = %+v, want user %q with its own password", gate, gateUser)
+	}
+	if err := WriteCredential(work, cred, gate); err != nil {
+		t.Fatalf("WriteCredential: %v", err)
+	}
+	b, err := os.ReadFile(HTPasswdPath(work))
+	if err != nil {
+		t.Fatalf("read htpasswd: %v", err)
+	}
+	hashes := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		user, hash, _ := strings.Cut(line, ":")
+		hashes[user] = hash
+	}
+	for _, c := range []Credential{cred, gate} {
+		if err := bcrypt.CompareHashAndPassword([]byte(hashes[c.Username]), []byte(c.Password)); err != nil {
+			t.Errorf("htpasswd line for %q does not verify its password: %v", c.Username, err)
+		}
+	}
+	got, err := ReadCredential(work)
+	if err != nil {
+		t.Fatalf("ReadCredential: %v", err)
+	}
+	if got != cred {
+		t.Errorf("the plaintext file holds %+v, want the local CLI's credential only", got)
+	}
+	entries, err := os.ReadDir(StateDir(work))
+	if err != nil {
+		t.Fatalf("read the state dir: %v", err)
+	}
+	for _, e := range entries {
+		body, err := os.ReadFile(StateDir(work) + "/" + e.Name())
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(body), gate.Password) {
+			t.Errorf("%s holds the gate's plaintext password", e.Name())
+		}
+	}
+}

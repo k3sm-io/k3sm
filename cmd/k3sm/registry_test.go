@@ -402,6 +402,8 @@ func (f *fakeRegistry) Start(context.Context) error {
 
 func (f *fakeRegistry) Addr() string { return f.addr }
 
+func (f *fakeRegistry) GateCredential() registrysvc.Credential { return registrysvc.Credential{} }
+
 func (f *fakeRegistry) Shutdown(ctx context.Context) error {
 	// The teardown runs from a defer during shutdown, so it must NOT inherit the
 	// cancelled bring-up context — a child killed instead of drained leaves its

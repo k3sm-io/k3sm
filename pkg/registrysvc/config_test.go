@@ -84,8 +84,16 @@ func TestRenderConfigShape(t *testing.T) {
 		if len(group.DefaultPolicy) != 0 {
 			t.Errorf("defaultPolicy = %v, want empty — being authenticated must grant nothing by itself", group.DefaultPolicy)
 		}
-		if len(group.Policies) != 1 {
-			t.Fatalf("policies = %v, want exactly one", group.Policies)
+		if len(group.Policies) != 2 {
+			t.Fatalf("policies = %v, want exactly two (the local CLI and the push gate)", group.Policies)
+		}
+		// The push gate's user creates and updates and NEVER deletes: a pod
+		// that passed every authorization still cannot remove an image.
+		if want := []string{gateUser}; !reflect.DeepEqual(group.Policies[1].Users, want) {
+			t.Errorf("gate policy users = %v, want %v", group.Policies[1].Users, want)
+		}
+		if want := []string{"read", "create", "update"}; !reflect.DeepEqual(group.Policies[1].Actions, want) {
+			t.Errorf("gate policy actions = %v, want %v (no delete)", group.Policies[1].Actions, want)
 		}
 		if want := []string{pushUser}; !reflect.DeepEqual(group.Policies[0].Users, want) {
 			t.Errorf("policy users = %v, want %v", group.Policies[0].Users, want)

@@ -234,7 +234,12 @@ func startManifestDir(ctx context.Context, restCfg *rest.Config, cs kubernetes.I
 // registry — which is handed to the node so a reference naming the Service
 // address is classified exactly as a loopback one is. The zero value (no
 // registry) leaves runtimed's classification unchanged.
-func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Interface, vmCapable bool, cpStop *controlPlaneStopper, logger *slog.Logger) (stop func(), puller registryPullerWiring) {
+//
+// The relay's push gate authorizes in-pod pushes under its own identity
+// (serverRegistryGateClient), minted here in memory from the signing CA. A gate
+// identity that cannot be minted is logged and leaves every write refused; it
+// never falls back to restCfg's admin identity.
+func startServerRegistry(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, vmCapable bool, cpStop *controlPlaneStopper, logger *slog.Logger) (stop func(), puller registryPullerWiring) {
 	opts := plan.opts
 	if opts.registryPort == 0 {
 		return noStop, puller
@@ -285,6 +290,7 @@ func startServerRegistry(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		clusterSvcs:   cs.CoreV1().Services(registrysvc.AdvertisementNamespace),
 		clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace),
 		clusterDomain: opts.domain,
+		gateAuth:      serverRegistryGateAuth(ctx, opts, restCfg, logger),
 		logger:        logger,
 	})
 	// The early run, on the control-plane stop's lane, and runServer's deferred
