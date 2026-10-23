@@ -190,7 +190,7 @@ func TestAgentResumeWarnsOnACertificateAddressMismatch(t *testing.T) {
 		}
 		// The remedy is the rejoin, and it spans two Macs: the token is minted
 		// on the control plane.
-		for _, want := range []string{"k3sm token create", "k3sm install --role agent", "--token-file"} {
+		for _, want := range []string{"k3sm token create", "k3sm install --agent --server", "--token-file"} {
 			if !strings.Contains(row.Remedy, want) {
 				t.Errorf("remedy = %q, want it to carry %q", row.Remedy, want)
 			}

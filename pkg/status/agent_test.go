@@ -712,3 +712,29 @@ func TestRoleKeyedRemediesAreStable(t *testing.T) {
 		})
 	}
 }
+
+// TestJoinRemedyNamesTheWorkerInstall pins that the rejoin remedy an operator
+// copies spells the worker install `k3sm install` actually accepts (--agent,
+// --server, --token-file) and that the alert step describes it as a worker
+// install rather than as a plain re-run.
+func TestJoinRemedyNamesTheWorkerInstall(t *testing.T) {
+	const want = "sudo k3sm install --agent --server <control-plane> --token-file <file>"
+	workerFlags := map[string]bool{"--agent": true, "--server": true, "--token-file": true}
+	var install string
+	for _, line := range strings.Split(Collector{}.joinRemedy(), "\n") {
+		if cmd, _, _ := strings.Cut(line, "#"); strings.HasPrefix(cmd, "sudo k3sm install") {
+			install = strings.TrimSpace(cmd)
+		}
+	}
+	if install != want {
+		t.Fatalf("join remedy install line = %q, want %q", install, want)
+	}
+	for _, field := range strings.Fields(install) {
+		if strings.HasPrefix(field, "--") && !workerFlags[field] {
+			t.Errorf("join remedy names %s, which the worker install does not define", field)
+		}
+	}
+	if got, wantStep := describe(install), "Install this Mac as a worker with that token"; got != wantStep {
+		t.Errorf("describe(%q) = %q, want %q", install, got, wantStep)
+	}
+}

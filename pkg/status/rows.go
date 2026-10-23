@@ -351,7 +351,7 @@ func (c Collector) installRow(hasDataVolume bool, role dataroot.Role, bothRoles 
 			c.Paths.AgentLabel, dataroot.RoleServer)
 	}
 	// A control-plane work dir sitting beside an AGENT install is a leftover:
-	// `k3sm install --role agent` never creates one, so it is an earlier
+	// `k3sm install --agent` never creates one, so it is an earlier
 	// server-era install whose state directory outlived its daemon. It is said
 	// out loud because an operator who finds that directory reasonably concludes
 	// this Mac still runs a control plane, and because until B324 the report
