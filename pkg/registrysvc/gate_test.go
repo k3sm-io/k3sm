@@ -53,13 +53,82 @@ type zotRequest struct {
 type fakeZot struct {
 	mu   sync.Mutex
 	seen []zotRequest
-	srv  *httptest.Server
+	h    http.Handler
+}
+
+// fakeZotHost is the upstream address the gate under test is pointed at. It is
+// never dialled: the gate's Transport is the fake's RoundTrip.
+const fakeZotHost = "zot.test:5000"
+
+// RoundTrip serves a request on the fake registry in-process, without a socket.
+func (z *fakeZot) RoundTrip(req *http.Request) (*http.Response, error) {
+	in := req.Clone(req.Context())
+	in.RequestURI = req.URL.RequestURI()
+	if in.Body == nil {
+		in.Body = http.NoBody
+	}
+	rec := httptest.NewRecorder()
+	z.h.ServeHTTP(rec, in)
+	resp := rec.Result()
+	resp.Request = req
+	return resp, nil
+}
+
+// memListener is an in-memory net.Listener: a connection is a net.Pipe, so the
+// gate is served by a real http.Server with no socket.
+type memListener struct {
+	conns chan net.Conn
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newMemListener() *memListener {
+	return &memListener{conns: make(chan net.Conn), done: make(chan struct{})}
+}
+
+func (l *memListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *memListener) Close() error { l.once.Do(func() { close(l.done) }); return nil }
+
+type memAddr struct{}
+
+func (memAddr) Network() string { return "mem" }
+func (memAddr) String() string  { return "gate.test" }
+
+func (l *memListener) Addr() net.Addr { return memAddr{} }
+
+// dial returns the client end of a new in-memory connection.
+func (l *memListener) dial() (net.Conn, error) {
+	c, s := net.Pipe()
+	select {
+	case l.conns <- s:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+// serveMem serves h on a memListener until the test ends.
+func serveMem(t *testing.T, h http.Handler) *memListener {
+	t.Helper()
+	l := newMemListener()
+	srv := &http.Server{Handler: h}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close(); _ = l.Close() })
+	return l
 }
 
 func newFakeZot(t *testing.T) *fakeZot {
 	t.Helper()
 	z := &fakeZot{}
-	z.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	z.h = (http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		z.mu.Lock()
 		z.seen = append(z.seen, zotRequest{
@@ -70,7 +139,7 @@ func newFakeZot(t *testing.T) *fakeZot {
 		w.Header().Set("Set-Cookie", "session=zot")
 		switch r.Method {
 		case "POST", "PATCH":
-			w.Header().Set("Location", "http://"+z.srv.Listener.Addr().String()+"/v2/x/blobs/uploads/abc")
+			w.Header().Set("Location", "http://"+fakeZotHost+"/v2/x/blobs/uploads/abc")
 			w.WriteHeader(http.StatusAccepted)
 		case "PUT":
 			w.WriteHeader(http.StatusCreated)
@@ -79,7 +148,6 @@ func newFakeZot(t *testing.T) *fakeZot {
 			_, _ = io.WriteString(w, "content")
 		}
 	}))
-	t.Cleanup(z.srv.Close)
 	return z
 }
 
@@ -181,7 +249,7 @@ type gateFixture struct {
 	namespaces *fakeNamespaces
 	clock      *fakeClock
 	gate       *gate
-	front      *httptest.Server
+	front      *memListener
 }
 
 const (
@@ -243,14 +311,14 @@ func newGateFixture(t *testing.T) *gateFixture {
 		clock: &fakeClock{t: testEpoch},
 	}
 	f.gate = newGate(gateConfig{
-		Upstream:   strings.TrimPrefix(f.zot.srv.URL, "http://"),
+		Upstream:   fakeZotHost,
+		Transport:  f.zot,
 		Auth:       GateAuth{Tokens: f.tokens, Access: f.access, Namespaces: f.namespaces},
 		Credential: gateCred,
 		Logger:     quietLogger(),
 		Now:        f.clock.now,
 	})
-	f.front = httptest.NewServer(f.gate)
-	t.Cleanup(f.front.Close)
+	f.front = serveMem(t, f.gate)
 	return f
 }
 
@@ -268,12 +336,18 @@ type rawResponse struct {
 
 // rawDo writes one request with exactly target on its request line, so path
 // tricks reach the gate unnormalized, and reads the response.
-func rawDo(t *testing.T, addr, method, target string, headers map[string]string, body string) rawResponse {
+func rawDo(t *testing.T, l *memListener, method, target string, headers map[string]string, body string) rawResponse {
 	t.Helper()
-	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	c, err := l.dial()
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
+	return rawOn(t, c, method, target, headers, body)
+}
+
+// rawOn is rawDo over a connection the caller dialled; it closes c.
+func rawOn(t *testing.T, c net.Conn, method, target string, headers map[string]string, body string) rawResponse {
+	t.Helper()
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 	var b strings.Builder
@@ -307,7 +381,7 @@ func (f *gateFixture) do(t *testing.T, method, target, auth, body string, extra 
 	if auth != "" {
 		h["Authorization"] = auth
 	}
-	return rawDo(t, f.front.Listener.Addr().String(), method, target, h, body)
+	return rawDo(t, f.front, method, target, h, body)
 }
 
 // --- the named gate --------------------------------------------------------
@@ -677,7 +751,7 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 
 	t.Run("a refused client is never sent 100 Continue", func(t *testing.T) {
 		f := newGateFixture(t)
-		line := expectContinue(t, f.front.Listener.Addr().String(), "/v2/team/app/blobs/uploads/abc", "")
+		line := expectContinue(t, f.front, "/v2/team/app/blobs/uploads/abc", "")
 		if !strings.HasPrefix(line, "HTTP/1.1 401") {
 			t.Errorf("first response line = %q, want the 401 and no 100 Continue", line)
 		}
@@ -685,7 +759,7 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 
 	t.Run("an authorized client is sent 100 Continue and its body is forwarded", func(t *testing.T) {
 		f := newGateFixture(t)
-		line := expectContinue(t, f.front.Listener.Addr().String(), "/v2/team/app/blobs/uploads/abc", basic(tokTeam))
+		line := expectContinue(t, f.front, "/v2/team/app/blobs/uploads/abc", basic(tokTeam))
 		if !strings.HasPrefix(line, "HTTP/1.1 202") {
 			t.Errorf("final response line = %q, want 202", line)
 		}
@@ -696,10 +770,8 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 
 	t.Run("a gate with no apiserver identity serves reads and refuses writes", func(t *testing.T) {
 		z := newFakeZot(t)
-		g := newGate(gateConfig{Upstream: strings.TrimPrefix(z.srv.URL, "http://"), Credential: gateCred, Logger: quietLogger()})
-		front := httptest.NewServer(g)
-		t.Cleanup(front.Close)
-		addr := front.Listener.Addr().String()
+		g := newGate(gateConfig{Upstream: fakeZotHost, Transport: z, Credential: gateCred, Logger: quietLogger()})
+		addr := serveMem(t, g)
 		if r := rawDo(t, addr, "GET", "/v2/team/app/manifests/v1", nil, ""); r.status != 200 {
 			t.Errorf("read = %d, want 200", r.status)
 		}
@@ -723,9 +795,9 @@ func (b *tripwireBody) Read([]byte) (int, error) {
 // expectContinue sends a PATCH with Expect: 100-continue and withholds its
 // 10-byte body until the server says 100 Continue. It returns the final status
 // line: for a refusal, the very first line the server sent.
-func expectContinue(t *testing.T, addr, target, auth string) string {
+func expectContinue(t *testing.T, l *memListener, target, auth string) string {
 	t.Helper()
-	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	c, err := l.dial()
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

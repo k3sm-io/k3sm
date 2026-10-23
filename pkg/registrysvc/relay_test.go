@@ -22,6 +22,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http/httptest"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -176,9 +177,9 @@ func TestVMNetGateway(t *testing.T) {
 // does not have it".
 func TestRelayServesTheGate(t *testing.T) {
 	t.Run("a read reaches the registry and the answer comes back", func(t *testing.T) {
-		z := newFakeZot(t)
-		addr := serveThroughRelay(t, portOf(t, z.srv.Listener.Addr()))
-		r := rawDo(t, addr, "GET", "/v2/app/manifests/v1", nil, "")
+		z, zaddr := socketZot(t)
+		addr := serveThroughRelay(t, portOf(t, zaddr))
+		r := rawDoTCP(t, addr, "GET", "/v2/app/manifests/v1", nil, "")
 		if r.status != 200 || r.body != "content" {
 			t.Errorf("read = %d %q, want 200 content", r.status, r.body)
 		}
@@ -188,9 +189,9 @@ func TestRelayServesTheGate(t *testing.T) {
 	})
 
 	t.Run("a DELETE never reaches the registry", func(t *testing.T) {
-		z := newFakeZot(t)
-		addr := serveThroughRelay(t, portOf(t, z.srv.Listener.Addr()))
-		if r := rawDo(t, addr, "DELETE", "/v2/app/manifests/v1", nil, ""); r.status != 405 {
+		z, zaddr := socketZot(t)
+		addr := serveThroughRelay(t, portOf(t, zaddr))
+		if r := rawDoTCP(t, addr, "DELETE", "/v2/app/manifests/v1", nil, ""); r.status != 405 {
 			t.Errorf("DELETE = %d, want 405", r.status)
 		}
 		if n := len(z.requests()); n != 0 {
@@ -199,9 +200,9 @@ func TestRelayServesTheGate(t *testing.T) {
 	})
 
 	t.Run("a relay with no gate identity refuses writes", func(t *testing.T) {
-		z := newFakeZot(t)
-		addr := serveThroughRelay(t, portOf(t, z.srv.Listener.Addr()))
-		if r := rawDo(t, addr, "PUT", "/v2/team/app/manifests/v1", nil, "{}"); r.status != 503 {
+		_, zaddr := socketZot(t)
+		addr := serveThroughRelay(t, portOf(t, zaddr))
+		if r := rawDoTCP(t, addr, "PUT", "/v2/team/app/manifests/v1", nil, "{}"); r.status != 503 {
 			t.Errorf("write = %d, want 503", r.status)
 		}
 	})
@@ -357,4 +358,24 @@ func portOf(t *testing.T, a net.Addr) int {
 		t.Fatalf("port %q: %v", p, err)
 	}
 	return n
+}
+
+// socketZot serves a fake registry over a real loopback listener, for the relay
+// tests, whose subject is the listener.
+func socketZot(t *testing.T) (*fakeZot, net.Addr) {
+	t.Helper()
+	z := newFakeZot(t)
+	srv := httptest.NewServer(z.h)
+	t.Cleanup(srv.Close)
+	return z, srv.Listener.Addr()
+}
+
+// rawDoTCP is rawDo over a real TCP connection to addr.
+func rawDoTCP(t *testing.T, addr, method, target string, headers map[string]string, body string) rawResponse {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	return rawOn(t, c, method, target, headers, body)
 }

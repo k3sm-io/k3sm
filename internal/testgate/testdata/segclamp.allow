@@ -19,7 +19,8 @@
 # 127.0.0.1 only.
 pkg/executor/supervised.go tcpReady net.Dialer{} # readiness dial of a child component on 127.0.0.1
 pkg/registrysvc/service.go Service.await net.Dialer{} # readiness dial of the registry child; validateBind admits loopback only
-pkg/registrysvc/relay.go newRelay net.Dialer{} # relay's upstream is the registry's 127.0.0.1 listener; the relay listener itself is clamped
+pkg/registrysvc/gate.go newGate net.Dialer{} # gate's upstream is the registry's 127.0.0.1 listener; the gate listener itself is clamped
+pkg/registrysvc/gate.go newGate http.Transport{} # dials only the registry's 127.0.0.1 listener through the dialer above; the apiserver clients are separate
 cmd/k3sm/certificate.go probeAPIServerServing http.Transport{} # healthz probe of the local apiserver at 127.0.0.1
 pkg/netserve/credential.go RotatingCredential.RESTConfig http.Transport{} # dials only through the credential's connrotation dialer, which wraps tcpseg.Dialer (NewRotatingCredential)
 
