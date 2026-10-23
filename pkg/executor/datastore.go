@@ -52,7 +52,7 @@ func sqliteEndpoint(workDir string) string {
 // endpoint that can fail to render does not change every caller.
 func kineArgs(cfg Config) ([]string, error) {
 	// Disable kine's Prometheus metrics endpoint. It defaults to :8080 on ALL
-	// interfaces (kine v1.14.2 app.go: "set 0 to disable metrics serving"), and
+	// interfaces (kine app.go at the shipped pin, DefaultKineVersion: "set 0 to disable metrics serving"), and
 	// because k3sm pods share the host network (no netns), that listener collides
 	// with any workload binding :8080 — e.g. a readiness probe server — failing it
 	// with "bind: address already in use". k3sm does not scrape kine's metrics; a

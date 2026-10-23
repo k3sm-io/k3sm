@@ -29,7 +29,7 @@ limitations under the License.
 // # What is pinned, and against what
 //
 // Every value here was read from the chart at ChartVersion, installed on a k3sm
-// node in the M16.0 S2 spike (hack/spike/m16/findings-s2.md is the write-back).
+// node.
 // ChartVersion 1.5.0 is the chart built from upstream tag v1.5.0, commit
 // b83b1d9304ebfc624709ac46db32b1b6f1ff1615; the records were taken on
 // 2026-09-21 to 2026-09-23. A re-pin re-records every file below from a tagged

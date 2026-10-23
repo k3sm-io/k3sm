@@ -23,7 +23,8 @@ limitations under the License.
 // the launchd plist rendering, and the fake live here.
 //
 // The goreleaser config / notarization + designated-requirement entitlements that drive these commands
-// are the packaging follow-up (DESIGN §5c) — out of scope here.
+// live outside this package, in the k3sm release packaging (hack/release and
+// .goreleaser.yaml).
 package install
 
 import (

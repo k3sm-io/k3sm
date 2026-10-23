@@ -38,7 +38,7 @@ import (
 )
 
 // TestIssueUpdateSigner pins the signer's shape: CN and O, code signing only,
-// a P-256 key, a year, and a chain to the CA that issued it.
+// a P-256 key, a one-day lifetime, and a chain to the CA that issued it.
 func TestIssueUpdateSigner(t *testing.T) {
 	t.Parallel()
 	ca, err := NewCA("k3sm-cluster-ca")

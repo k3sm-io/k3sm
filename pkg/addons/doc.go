@@ -130,7 +130,7 @@ limitations under the License.
 // when managedFields record k3sm's own apply, with a UID precondition.
 //
 // Both halves are deliberate. A prune keyed on the k3sm.io/managed label would be
-// catastrophic — that label is stamped by seven other packages, so a label-selector
+// catastrophic — that label is stamped by many other packages, so a label-selector
 // prune would delete PersistentVolumes pinning user data, the kube-dns Service, the
 // node-datapath ClusterRoleBinding every joined worker needs, the admission policies,
 // the default LimitRange, and the vm RuntimeClass. And a LIST may not authorize a

@@ -72,7 +72,8 @@ type Netd interface {
 	ApplyUpdate(ctx context.Context, args wire.ApplyUpdateArgs, progress func(wire.UpdatePhase)) (wire.UpdateResult, error)
 }
 
-// Config configures a Watcher. Every field but Log is required.
+// Config configures a Watcher. New requires Node, Client, ClusterCA, Fetcher, Netd and Root; Now,
+// ReleaseBase, Ready and Log are optional.
 type Config struct {
 	// Node is this node's name.
 	Node string

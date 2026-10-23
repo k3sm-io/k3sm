@@ -23,7 +23,7 @@ limitations under the License.
 // (hack/lib/clusterup.sh) into a Go Executor with a Supervised strategy that
 // os/exec-supervises the four components as CHILD PROCESSES — it ensures the
 // prebuilt darwin/arm64 control-plane binaries (kwok-ci/k8s; upstream refuses to
-// ship them, k/k#118359), builds kine from source with cgo, ad-hoc signs every
+// ship them, k/k#118359), builds kine from source (CGO_ENABLED=0), ad-hoc signs every
 // Mach-O so it can exec, writes the SA keypair + static token + kubeconfig, and
 // starts kine → apiserver → scheduler → controller-manager, scoping KCM's
 // --controllers to drop the node-side controllers that assume real Linux
@@ -31,7 +31,7 @@ limitations under the License.
 //
 // The from-source IN-PROCESS embedding the DESIGN sketched (the k3s
 // pkg/executor/embed pattern, one set of goroutines in this process) is DEFERRED
-// to a future milestone: Wave-0 confirmed importing the apiserver/scheduler/KCM
+// to a future milestone: a feasibility test showed importing the apiserver/scheduler/KCM
 // command trees from k3s-io/kubernetes into this module is infeasible today (the
 // monorepo's internal package graph does not vendor cleanly here). The Embedded
 // strategy is a stub that returns ErrEmbeddedNotImplemented so the seam is in

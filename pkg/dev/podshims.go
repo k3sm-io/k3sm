@@ -298,7 +298,7 @@ func (m *Manager) stagePodShims(ctx context.Context, instance string, datapath b
 			return "", "", err
 		}
 		if pathShim == "" {
-			fmt.Fprint(m.out, "NOTE: absolute volume-mount paths unavailable in-pod (no stageable path-rebase shim) — ConfigMap/Secret/emptyDir/service-account mounts will ENOENT. Run k3sm dev from the workspace for volume mounts.\n")
+			fmt.Fprint(m.out, "NOTE: absolute volume-mount paths unavailable in-pod (no stageable path-rebase shim) — ConfigMap/Secret/emptyDir/service-account mounts will ENOENT. Run k3sm dev from a source checkout (the go.work workspace) for volume mounts.\n")
 		}
 	}
 	if wantsDNSShim(datapath, runtimeName) {
@@ -307,7 +307,7 @@ func (m *Manager) stagePodShims(ctx context.Context, instance string, datapath b
 			return "", "", err
 		}
 		if dnsShim == "" {
-			fmt.Fprint(m.out, "NOTE: in-pod cluster DNS unavailable (no stageable getaddrinfo shim) — pods stay on the system resolver and cluster Service names NXDOMAIN. Run k3sm dev from the workspace for cluster DNS.\n")
+			fmt.Fprint(m.out, "NOTE: in-pod cluster DNS unavailable (no stageable getaddrinfo shim) — pods stay on the system resolver and cluster Service names NXDOMAIN. Run k3sm dev from a source checkout (the go.work workspace) for cluster DNS.\n")
 		}
 	}
 	return pathShim, dnsShim, nil

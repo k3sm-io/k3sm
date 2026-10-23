@@ -295,7 +295,7 @@ func NewSupervised(cfg Config) *Supervised {
 		token: cfg.Token,
 		etcd:  defaultEtcdSeams(),
 		// The healthz probe is token-less and carries no credential, so it does not yet
-		// verify the apiserver's cluster-CA serving leaf (a filed follow-up). The probe dials the apiserver's
+		// verify the apiserver's cluster-CA serving leaf. The probe dials the apiserver's
 		// bind host, which is the node or mesh address on a multi-node server, so its
 		// dialer clamps the TCP segment size like every other node-address connection.
 		client: &http.Client{
@@ -1274,7 +1274,7 @@ const redactedTokenPlaceholder = "<redacted>"
 // pkg/status.Redact is the sibling of this function and covers the same class for
 // the status report. It cannot be reused here: pkg/status imports pkg/executor, so
 // importing it back is a cycle. Hoisting both into a leaf package is the right
-// end state and is left as a follow-up; these patterns cover the component-log
+// end state and has not been done; these patterns cover the component-log
 // shapes (bearer headers, DSN userinfo) that the status patterns do not.
 var (
 	// credentialAssignments matches a key=value or key: value (the key and the
