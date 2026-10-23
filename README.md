@@ -51,7 +51,9 @@ Darwin provider that turns a Pod spec into a running process; `pkg/executor` bri
 supervises the embedded control plane; `pkg/bootstrap` and `pkg/certs` handle join tokens, node
 identity and the certificate hierarchy; `pkg/install` manages the launchd daemons; `pkg/mlx`
 renders an `MLXModel` into the objects that serve it; `pkg/addons` carries the metrics-server
-add-on, which every server applies once its node has minted its kubelet serving certificate; and
+add-on, which every server applies once its node has minted its kubelet serving certificate; `pkg/update` and `pkg/updatectl` back `k3sm update`, the release check and the server-driven roll of
+the cluster to a release, workers first and the server last; `pkg/interconnect` is the opt-in
+Thunderbolt cable network between Macs, beside the wireguard mesh; and
 `pkg/oci` is the one place in the repo that reads or writes OCI image bytes. k3sm imports
 `k3sm.io/runtimed` (the native runtime daemon) and `k3sm.io/darwin-net` (pod networking) to do
 the actual work of running and connecting pods.
@@ -91,7 +93,7 @@ An install needs more than the binary: the Seatbelt exec helper, two DYLD shims,
 helper and the control-plane payload sit beside it. `hack/release/stage.sh` builds the binary
 again and assembles that whole set, ad-hoc signed, into the folder you name. It needs the Command
 Line Tools, a signed-in GitHub CLI (`gh`), and the exact Go release the script pins
-(`PAYLOAD_GO_VERSION` in the script) first on your `PATH`, and the staged folder comes to about
+(`PAYLOAD_GO_VERSION` in `hack/release/lib/gochild.sh`, which the script sources) first on your `PATH`, and the staged folder comes to about
 700 MB.
 
 Install runs once, as root, and sets up an unprivileged `_k3sm` user and daemon that everything
