@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034 # a sourced library: the variables it sets are read by the rungs
-# Shared plumbing for the M17.0 spikes (s1.sh … s5.sh) and for run.sh, which chains
-# them. The M17 plan's §Sub-phases M17.0 is what each rung answers; its Phase B
-# resolution R8 is the list of pre-decided substitutions every halt below quotes.
+# Shared plumbing for the M17 spikes (s1.sh … s5.sh) and for run.sh, which chains
+# them. Each rung answers one question of the M17 spike, and every halt below quotes
+# its pre-decided substitution.
 #
 # THE RIG. Two Macs joined by one Thunderbolt cable, both members of one k3sm
 # cluster (one server, one agent), both on main, both Ready. The DRIVER (this
@@ -40,10 +40,10 @@
 #   0  PASS      every required criterion of the rung reached a verdict, and passed.
 #   1  FAIL      a required criterion failed, or the rung refused to run (no
 #                K3SM_LAB=1, a missing host or evidence variable, a rig that is not
-#                ready). For a failed criterion the M17 plan's halt applies and the
-#                substitution printed beside it is pre-decided (R8).
+#                ready). For a failed criterion the rung's halt applies and the
+#                substitution printed beside it is pre-decided.
 #   2  RECORDED  nothing failed, but the rung produced only measurements and no
-#                verdict. NOT a green M17.0: a measurement does not discharge a row.
+#                verdict. NOT a green M17 spike: a measurement does not discharge a row.
 #
 # A rung that passes a criterion and records figures exits 0: recording is
 # additive evidence, never a downgrade. Only a rung with no verdict at all exits 2.
@@ -141,7 +141,7 @@ spike_verdict() {
 # prints the rung and exits 0 WITHOUT reading any host or evidence variable, so the
 # ladder's shape is reviewable with no rig attached.
 spike_plan() {
-	echo "==> k3sm M17.0 spike $1 — PLAN ONLY (nothing is contacted, nothing is written)"
+	echo "==> k3sm M17 spike $1 — PLAN ONLY (nothing is contacted, nothing is written)"
 	echo
 	echo "question"
 	printf '%s\n' "$2" | sed 's/^/  /'
@@ -152,7 +152,7 @@ spike_plan() {
 	echo "method"
 	printf '%s\n' "$4" | sed 's/^/  /'
 	echo
-	echo "halt and pre-decided substitution (the M17 plan, R8)"
+	echo "halt and pre-decided substitution "
 	printf '%s\n' "$5" | sed 's/^/  /'
 	echo
 	echo "findings   hack/spike/m17/findings-$(lower "$1").md"
@@ -183,20 +183,20 @@ spike_args() {
 spike_require() {
 	local rung="$1" missing="" v
 	if [ "${K3SM_LAB:-}" != "1" ]; then
-		echo "M17.0 $rung: REFUSED — this rung changes host networking on two Macs and runs only under K3SM_LAB=1 with K3SM_M17_SERVER, K3SM_M17_WORKER and K3SM_EVIDENCE set. This is NOT a pass." >&2
+		echo "M17 spike $rung: REFUSED — this rung changes host networking on two Macs and runs only under K3SM_LAB=1 with K3SM_M17_SERVER, K3SM_M17_WORKER and K3SM_EVIDENCE set. This is NOT a pass." >&2
 		exit 1
 	fi
 	for v in K3SM_M17_SERVER K3SM_M17_WORKER K3SM_EVIDENCE; do
 		[ -n "${!v:-}" ] || missing="$missing $v"
 	done
 	if [ -n "$missing" ]; then
-		echo "FAIL      M17.0 $rung: missing$missing (no defaults: the ssh targets are the operator's own machines, and evidence lives outside any repository). A missing host is a FAIL, never a PENDING." >&2
+		echo "FAIL      M17 spike $rung: missing$missing (no defaults: the ssh targets are the operator's own machines, and evidence lives outside any repository). A missing host is a FAIL, never a PENDING." >&2
 		exit 1
 	fi
 	case "$K3SM_EVIDENCE" in
 	/*) ;;
 	*)
-		echo "FAIL      M17.0 $rung: K3SM_EVIDENCE must be an absolute path" >&2
+		echo "FAIL      M17 spike $rung: K3SM_EVIDENCE must be an absolute path" >&2
 		exit 1
 		;;
 	esac
@@ -205,11 +205,11 @@ spike_require() {
 	local probe="$K3SM_EVIDENCE"
 	while [ ! -d "$probe" ]; do probe="$(dirname "$probe")"; done
 	if git -C "$probe" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-		echo "FAIL      M17.0 $rung: K3SM_EVIDENCE is inside a git work tree; evidence never lands in a repository" >&2
+		echo "FAIL      M17 spike $rung: K3SM_EVIDENCE is inside a git work tree; evidence never lands in a repository" >&2
 		exit 1
 	fi
 	mkdir -p "$K3SM_EVIDENCE" || {
-		echo "FAIL      M17.0 $rung: cannot create $K3SM_EVIDENCE" >&2
+		echo "FAIL      M17 spike $rung: cannot create $K3SM_EVIDENCE" >&2
 		exit 1
 	}
 }
@@ -386,7 +386,7 @@ payload_file() {
 	local f="$RUNG_DIR/$side-$name.sh"
 	{
 		echo "#!/bin/bash"
-		echo "# M17.0 $RUNG payload '$name' for the $side Mac (written by hack/spike/m17/lib.sh)"
+		echo "# M17 spike $RUNG payload '$name' for the $side Mac (written by hack/spike/m17/lib.sh)"
 		echo "set -u"
 		printf 'export SIDE=%q PEER=%q STATE_DIR=%q REMOTE_DIR=%q\n' "$side" "$(peer_of "$side")" "$STATE_DIR" "$REMOTE_DIR"
 		for kv in "$@"; do printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"; done
@@ -453,7 +453,7 @@ else:
 PY
 }
 
-# figure <path> <metric> <unit> <command> <values...> — one R15 figure: appended to
+# figure <path> <metric> <unit> <command> <values...> — one figure: appended to
 # figures.jsonl (with the run context) and printed as a RECORDED line. The command
 # is the exact one run, with LAN addresses replaced by a role placeholder.
 figure() {
@@ -477,7 +477,7 @@ PY
 spike_prompt() {
 	local msg="
 ############################################################################
-#  M17.0 $RUNG — OPERATOR ACTION REQUESTED (waiting up to ${PROMPT_WAIT}s)
+#  M17 spike $RUNG — OPERATOR ACTION REQUESTED (waiting up to ${PROMPT_WAIT}s)
 #  $1
 ############################################################################"
 	printf '\a%s\n' "$msg" >&2
@@ -497,24 +497,24 @@ spike_begin() {
 	RUNG_DIR="$K3SM_EVIDENCE/$(lower "$RUNG")"
 	mkdir -p "$RUNG_DIR"
 	exec > >(tee -a "$RUNG_DIR/driver.log") 2>&1
-	note "M17.0 $RUNG — evidence in $RUNG_DIR"
+	note "M17 spike $RUNG — evidence in $RUNG_DIR"
 
 	local tool
 	for tool in ssh scp python3 go; do
 		command -v "$tool" >/dev/null 2>&1 || {
-			echo "FAIL      M17.0 $RUNG: the driver needs $tool on PATH"
+			echo "FAIL      M17 spike $RUNG: the driver needs $tool on PATH"
 			exit 1
 		}
 	done
 	local side
 	for side in server worker; do
 		if ! on "$side" "mkdir -p $REMOTE_DIR && sudo -n true" >/dev/null 2>&1; then
-			echo "FAIL      M17.0 $RUNG: the $side Mac is unreachable over ssh, or its sudo is not passwordless"
+			echo "FAIL      M17 spike $RUNG: the $side Mac is unreachable over ssh, or its sudo is not passwordless"
 			exit 1
 		fi
 	done
 	spike_ship_probe || {
-		echo "FAIL      M17.0 $RUNG: could not build or ship the probe"
+		echo "FAIL      M17 spike $RUNG: could not build or ship the probe"
 		exit 1
 	}
 	spike_restore_both
@@ -524,7 +524,7 @@ spike_begin() {
 	if ! spike_topology; then
 		TOPOLOGY_OK=0
 		if [ "${SPIKE_TOPOLOGY_OPTIONAL:-0}" != 1 ]; then
-			echo "FAIL      M17.0 $RUNG: the rig's topology could not be established (see above; S1 is the rung that diagnoses it)"
+			echo "FAIL      M17 spike $RUNG: the lab host's topology could not be established (see above; S1 is the rung that diagnoses it)"
 			exit 1
 		fi
 	fi
@@ -575,7 +575,7 @@ spike_end() {
 		printf '%s\n' "$nodes" | awk -v n="$WRK_NODE" '$1==n && $2=="Ready"' | grep -q .; then
 		pass "rig: both nodes Ready after the rung"
 	else
-		fail "rig: a node is not Ready after the rung (the rig must be left with both nodes Ready)"
+		fail "rig: a node is not Ready after the rung (the lab host must be left with both nodes Ready)"
 	fi
 	trap - EXIT
 	spike_verdict "$1"
@@ -715,7 +715,7 @@ EOF
 }
 
 # figures_from_log <path> <log> — turn a payload's "FIG <metric> <value>" and
-# "CMD <metric> <exact command>" lines into R15 figures (one per metric, all its
+# "CMD <metric> <exact command>" lines into figures (one per metric, all its
 # values: median and p99). The unit follows the metric's family.
 figures_from_log() {
 	local path="$1" log="$2" metric unit cmd
@@ -736,7 +736,7 @@ figures_from_log() {
 }
 
 # The server-side measuring payload S2 runs per path: TCP single and 4-stream in
-# both directions at MSS 1340 (R15's one clamp for every cross-node path, so the
+# both directions at MSS 1340 (the figure schema's one clamp for every cross-node path, so the
 # figure is the one a pod socket sees), idle and loaded RTT, and (UDP=1) loss at the MTU boundary, each
 # RUNS times, against TARGET; TARGET_LABEL is what the recorded command shows (a
 # LAN address is never recorded, only its role).

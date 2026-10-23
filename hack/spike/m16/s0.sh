@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# M16.0-d1 / S0 — k3sm preconditions, no framework. THE RUNG THE REST OF M16 RESTS ON.
+# S0 — k3sm preconditions, no framework. THE RUNG THE REST OF M16 RESTS ON.
 #
-# Three criteria, each with a BINDING halt whose substitution the M16 plan already
+# Three criteria, each with a BINDING halt whose substitution the spike already
 # decided, so a red here never needs a human to choose what happens next:
 #
 #   (1) WEBHOOK DELIVERY, BOTH PATHS — a trivial ClusterIP-backed VALIDATING webhook
@@ -12,7 +12,7 @@
 #       which darwin-net's proxy owns as a lo0-alias socket. A url: ref would prove
 #       something else entirely, and a native backend would never exercise the guest
 #       leg the fleet's control plane runs on.
-#       HALT: fails -> the plan's R4(a): v1alpha1 only, no conversion in the path.
+#       HALT: fails -> v1alpha1 only, no conversion in the path.
 #
 #   (2) TWO ENGINES ON ONE GPU — two vllm-mlx engines as HOST PROCESSES (the M8 S5
 #       bake-off method: no scratch binary, no reinstall, nothing installed system-
@@ -22,7 +22,7 @@
 #       against the one-engine control, because a burst snapshot ends before the peak
 #       the sizing formula's headroom exists for. This is the SAFETY MEASUREMENT for
 #       the capacity policy's slot floor, not a benchmark.
-#       HALT: thrashing or a doubled p99 -> the plan's R5 floor rises (a smaller model
+#       HALT: thrashing or a doubled p99 -> the slot floor rises (a smaller model
 #       or a larger slot) and S0(2) re-runs; single-slot only if no small model fits two.
 #
 #   (3) THE DIAL NOBODY HAS MEASURED — a vm guest dialing a NATIVE pod's own lo0-alias
@@ -30,7 +30,7 @@
 #       the fleet's base request path works AND that a guest bypasses the proxy and the
 #       NetworkPolicy L4 hint (a trust-domain fact the user doc must carry); blocked
 #       means the control plane cannot be hosted under vm at all.
-#       HALT: blocked -> the plan's R4(b): the native-Darwin control plane.
+#       HALT: blocked -> the native-Darwin fallback: the native-Darwin control plane.
 #
 # Every object this rung creates lives in the spike namespace and is deleted at the
 # end of the criterion that made it. The M8 MLXModel and its PVC are never touched.
@@ -41,7 +41,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RUNG="S0"
 QUESTION="Do k3sm's three unproven preconditions hold: webhook delivery to a vm-backed ClusterIP on BOTH the admission and the CRD-conversion paths; two MLX engines co-resident on one GPU within a measured memory and latency budget; and a vm guest reaching a native pod's own pod IP (and back)?"
 METHOD="Rig-side over ssh, no framework installed: a python TLS webhook server in a runtimeClassName: vm pod behind a ClusterIP Service, registered by service ref for both a ValidatingWebhookConfiguration and a CRD conversion strategy; then two vllm-mlx host processes under a sustained 1 200-token load at --max-num-seqs concurrency with percentiles and wired-memory sampling against a one-engine control; then a native pod listener dialled from a vm guest and the reverse."
-HALT="(1) fails -> R4(a), v1alpha1 only with no conversion in the path. (2) thrashes or doubles p99 -> R5's slot floor rises (smaller model or larger slot) and S0(2) re-runs; single-slot only if no small model fits two. (3) blocked -> R4(b), the native-Darwin control plane."
+HALT="(1) fails -> v1alpha1 only with no conversion in the path. (2) thrashes or doubles p99 -> the slot floor rises (smaller model or larger slot) and S0(2) re-runs; single-slot only if no small model fits two. (3) blocked -> the native-Darwin control plane."
 
 case "${1:-}" in
 --plan | --dry-run) spike_plan "$RUNG" "$QUESTION" "$METHOD" "$HALT" ;;
@@ -282,7 +282,7 @@ kc delete validatingwebhookconfiguration m16-spike --ignore-not-found >/dev/null
 # --- (b) the CRD CONVERSION path -------------------------------------------------
 # A DISTINCT dispatch path in the apiserver (apiextensions, not admission), and it
 # fires on every non-storage-version read including LIST and WATCH. Proving the
-# admission path says nothing about this one, which is why the plan's R14 ships two
+# admission path says nothing about this one, which is why the gate ships two
 # tests and flips two register rows.
 kc delete crd m16widgets.spike.k3sm.io --ignore-not-found >/dev/null 2>&1
 kc apply -f - <<YAML >/dev/null
@@ -524,7 +524,7 @@ PY
 )
 case "$VERDICT" in
   PASS*) verdict PASS "s0.2 co-residency  two engines held the sustained load: ${VERDICT#PASS }" ;;
-  *)     verdict FAIL "s0.2 co-residency  ${VERDICT#FAIL } — the plan's R5 floor rises (a smaller model or a larger slot) and this rung re-runs; single-slot only if no small model fits two" ;;
+  *)     verdict FAIL "s0.2 co-residency  ${VERDICT#FAIL } — the slot floor rises (a smaller model or a larger slot) and this rung re-runs; single-slot only if no small model fits two" ;;
 esac
 kill "$P1" "$P2" 2>/dev/null; sleep 2; pkill -f 'vllm_mlx.cli serve' 2>/dev/null
 EOF
@@ -585,7 +585,7 @@ if [ "$OK" = 1 ]; then
   recorded "s0.3 addresses: native pod IP $NIP, vm guest published IP $GIP"
 
   # guest -> native pod IP. The consequential direction: the fleet's frontend dials
-  # each worker's PUBLISHED address, not a VIP, so a blocked dial here is R4(b).
+  # each worker's PUBLISHED address, not a VIP, so a blocked dial here triggers the native-Darwin fallback.
   G2N=$(kc -n "$NS" exec m16-guest -- python3 -c "
 import sys, urllib.request
 try:
@@ -598,7 +598,7 @@ except Exception as e:
       verdict PASS "s0.3 guest->native  a vm guest reached the native pod's own lo0-alias pod IP $NIP:8099 directly"
       recorded "s0.3 TRUST-DOMAIN FACT: that dial bypasses the Service proxy and the NetworkPolicy L4 hint, exactly as any same-node process does — docs/user/mlx-fleet.md must say so"
       ;;
-    *) verdict FAIL "s0.3 guest->native  blocked ($G2N) — the plan's R4(b) applies: the control plane moves to the native-Darwin build" ;;
+    *) verdict FAIL "s0.3 guest->native  blocked ($G2N) — the native-Darwin fallback applies: the control plane moves to the native-Darwin build" ;;
   esac
 
   # native -> guest published IP. Recorded rather than required: nothing in M16's

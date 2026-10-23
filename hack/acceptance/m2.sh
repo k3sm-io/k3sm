@@ -326,7 +326,7 @@ fi
 #
 # It proves the KILL branch only. The leader-dead/grandchild-alive case is deliberately
 # keep-and-warn (a permanent runbooked leak beats an unbounded wrong-target root
-# SIGKILL) and is B124's deferred work; step (6) below is a non-gating fixture
+# SIGKILL) and is the pod-survival gate's deferred work; step (6) below is a non-gating fixture
 # self-check that we did NOT accidentally land on that path.
 echo "==> m2.R  startup pod reap: orphan a pod across a daemon bounce, assert the daemon reaps it"
 REAP_POD="m2-reap-orphan"
@@ -455,11 +455,11 @@ fi
 ladder "$([ -z "$reap_why" ] && echo ok || echo no)" "m2.R  daemon startup pod reap kills an orphaned pod process group across a kickstart -k"
 [ -z "$reap_why" ] || echo "--- m2.R detail: $reap_why"
 
-# (6) [diagnostic, never gates] Did the fixture accidentally exercise B124's deferred
+# (6) [diagnostic, never gates] Did the fixture accidentally exercise the pod-survival gate's deferred
 #     keep-and-warn path (leader dead, group alive via a grandchild) instead of the
 #     kill branch? A PRESENT line here means the leg's evidence is about the wrong
 #     branch even if it passed.
-echo "--- [diagnostic] m2.R keep-and-warn (B124's deferred leader-dead/grandchild-alive path):"
+echo "--- [diagnostic] m2.R keep-and-warn (the pod-survival gate's deferred leader-dead/grandchild-alive path):"
 if tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null | grep -q 'orphaned pod process group leaked'; then
 	echo "    PRESENT — a recorded group hit keep-and-warn; re-read the fixture before trusting m2.R"
 else

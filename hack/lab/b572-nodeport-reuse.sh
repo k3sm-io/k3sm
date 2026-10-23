@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k3sm B572 repro: a NodePort reused after its Service and namespace are deleted
+# k3sm repro: a NodePort reused after its Service and namespace are deleted
 # must answer only the live Service's pod, from both nodes.
 #
 # LAB ONLY (K3SM_LAB=1). Runs against the RUNNING two-node cluster in $KUBECONFIG,
@@ -25,7 +25,7 @@
 #        IP on 8080, answer HTTP/1.0 200 with the body, one request per accept,
 #        exit after SERVE_MAX_REQUESTS requests or SERVE_LIFETIME seconds), is
 #        shipped to EACH node and built there with clang into
-#        /private/var/tmp/k3sm-b572/ (the rig's b476 ship-and-build flow: scp, or
+#        /private/var/tmp/k3sm-b572/ (the lab host's b476 ship-and-build flow: scp, or
 #        cp on the Mac the driver runs on, then a build script). No platform
 #        binary serves, so the pod bind shim question does not arise.
 #        The pod's command is `/bin/sh /cfg/serve.sh`, which re-runs the server
@@ -402,7 +402,7 @@ if [ "${K3SM_LAB_PRINT_MANIFESTS:-}" = 1 ]; then
 fi
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
-	echo "LAB-PENDING: not a pass (B572 NodePort reuse repro needs K3SM_LAB=1 and the two-node rig)"
+	echo "LAB-PENDING: not a pass (NodePort reuse repro needs K3SM_LAB=1 and the two-node rig)"
 	exit 3
 fi
 
@@ -412,7 +412,7 @@ for v in KUBECONFIG K3SM_B572_SERVER_NODE K3SM_B572_WORKER_NODE K3SM_B572_SERVER
 	[ -n "${!v:-}" ] || missing="$missing $v"
 done
 if [ -n "$missing" ]; then
-	echo "B572: required variable(s) unset:$missing (see the header of $0)" >&2
+	echo "NodePort reuse: required variable(s) unset:$missing (see the header of $0)" >&2
 	exit 2
 fi
 KUBECTL="${KUBECTL:-kubectl}"
@@ -421,7 +421,7 @@ WORKER="$K3SM_B572_WORKER_NODE"
 EVIDENCE="${K3SM_B572_EVIDENCE:-$(mktemp -d -t b572-evidence)}"
 mkdir -p "$EVIDENCE"
 kc() { "$KUBECTL" "$@"; }
-# Remote commands need a login shell on the rig Macs.
+# Remote commands need a login shell on the lab Macs.
 ME="$(hostname -s 2>/dev/null || true)"
 on() {
 	local host="$1"; shift
@@ -432,13 +432,13 @@ ssh_of() { if [ "$1" = "$SERVER" ]; then echo "$K3SM_B572_SERVER_SSH"; else echo
 kc get --raw /healthz >/dev/null || { echo "the cluster at \$KUBECONFIG is not serving" >&2; exit 2; }
 for n in "$SERVER" "$WORKER"; do
 	ready="$(kc get node "$n" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
-	[ "$ready" = True ] || { echo "B572: node $n is not Ready (got '${ready:-absent}')" >&2; exit 2; }
+	[ "$ready" = True ] || { echo "NodePort reuse: node $n is not Ready (got '${ready:-absent}')" >&2; exit 2; }
 done
 mesh_ip() { kc get meshpeers.net.k3sm.io "$1" -o jsonpath='{.spec.meshIP}'; }
 SERVER_IP="$(mesh_ip "$SERVER")"
 WORKER_IP="$(mesh_ip "$WORKER")"
-[ -n "$SERVER_IP" ] && [ -n "$WORKER_IP" ] || { echo "B572: a MeshPeer mesh address is missing (server '$SERVER_IP', worker '$WORKER_IP')" >&2; exit 2; }
-echo "==> k3sm B572 NodePort reuse (server $SERVER @ $SERVER_IP, worker $WORKER @ $WORKER_IP; p1 $P1, p2 $P2; evidence $EVIDENCE)"
+[ -n "$SERVER_IP" ] && [ -n "$WORKER_IP" ] || { echo "NodePort reuse: a MeshPeer mesh address is missing (server '$SERVER_IP', worker '$WORKER_IP')" >&2; exit 2; }
+echo "==> k3sm NodePort reuse (server $SERVER @ $SERVER_IP, worker $WORKER @ $WORKER_IP; p1 $P1, p2 $P2; evidence $EVIDENCE)"
 lab_tolerations_header
 
 PASS=0; FAIL=0
@@ -548,15 +548,15 @@ for ns in $NAMESPACES; do
 	if kc get namespace "$ns" >/dev/null 2>&1; then
 		echo "namespace $ns exists; deleting and waiting"
 		kc delete namespace "$ns" --wait=false >/dev/null
-		kc wait --for=delete "namespace/$ns" --timeout=180s >/dev/null || { echo "B572: namespace $ns still present after 180s" >&2; exit 2; }
+		kc wait --for=delete "namespace/$ns" --timeout=180s >/dev/null || { echo "NodePort reuse: namespace $ns still present after 180s" >&2; exit 2; }
 	fi
 done
 held="$(kc get svc -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{" "}{range .spec.ports[*]}{.nodePort}{","}{end}{"\n"}{end}' |
 	awk -v a="$P1" -v b="$P2" '{ n = split($2, q, ","); for (i = 1; i <= n; i++) if (q[i] == a || q[i] == b) print $1 }')"
-[ -z "$held" ] || { echo "B572: NodePort $P1/$P2 already held by: $held" >&2; exit 2; }
+[ -z "$held" ] || { echo "NodePort reuse: NodePort $P1/$P2 already held by: $held" >&2; exit 2; }
 for n in "$SERVER" "$WORKER"; do
 	out="$(lsof_on "$n" "$P1,$P2")"
-	[ "$(listen_count "$out" "$P1")$(listen_count "$out" "$P2")" = 00 ] || { echo "B572: $n already listens on $P1/$P2:" >&2; echo "$out" >&2; exit 2; }
+	[ "$(listen_count "$out" "$P1")$(listen_count "$out" "$P2")" = 00 ] || { echo "NodePort reuse: $n already listens on $P1/$P2:" >&2; echo "$out" >&2; exit 2; }
 	stray="$(listen_addrs "$(lsof_on "$n" 8080)" 8080)"
 	[ -z "$stray" ] || echo "WARN  $n already has 8080 listener(s) before any b572 pod: $stray (see the dump)"
 done
@@ -662,7 +662,7 @@ else
 	ladder no "b572.s2b no listener on p1 $P1 on either node, within 60 s ($lis)"
 fi
 left="$(survivors "$(on "$K3SM_B572_WORKER_SSH" "ps -axo pid=,user=" | awk '$2 == "_k3sm" { print $1 }')" "$A_PIDS")"
-# Also any _k3sm process carrying pod A's marker now (a server the loop started
+# Also any _k3sm process carrying pod A's marker now (a server this script started
 # after the record above).
 left="$(echo "$left $(pod_pids "$WORKER" b572-a)" | tr ' ' '\n' | sort -un | xargs)"
 if [ -z "$left" ]; then
@@ -691,6 +691,6 @@ done
 dump "C and B live"
 
 echo "----------------------------------------"
-echo "B572: $PASS passed, $FAIL failed (evidence $EVIDENCE)"
+echo "NodePort reuse: $PASS passed, $FAIL failed (evidence $EVIDENCE)"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "B572 NodePort reuse repro GREEN"
+echo "NodePort reuse repro GREEN"

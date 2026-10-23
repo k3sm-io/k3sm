@@ -10,7 +10,7 @@
 # cable. The cabled slices are the SEPARATE rows M17.0 (hack/spike/m17/run.sh),
 # M17-lab (hack/lab/m17.sh) and M17-rdma (hack/lab/m17-rdma.sh), all manual: true.
 #
-# The REAL M17 gate is a COMPOSITE (the M17 plan §Gates), written by M17.4:
+# The REAL M17 gate is a COMPOSITE (listed below), written when the gate lands:
 #   1 enumeration with no cable attached yields an EMPTY DirectLink for the node
 #   2 the DirectLink and MeshPeer CRDs are ensured by the binary
 #   3 k3sm doctor prints the direct-link section
@@ -26,5 +26,5 @@
 # proven". Pinned always-RED by TestNonManualSkeletonsAlwaysRed, which runs it under
 # BOTH K3SM_LAB unset and K3SM_LAB=1.
 set -euo pipefail
-echo "M17 gate: NOT YET IMPLEMENTED — the real M17 composite gate (empty DirectLink with no cable + CRDs ensured + doctor section + ShardsPlaced=False with the named reason + rank-Pod admission + kubectl logs/exec/delete rank rungs) lands with M17.4. This is a skeleton and MUST be red."
+echo "M17 gate: NOT YET IMPLEMENTED — the real M17 composite gate (empty DirectLink with no cable + CRDs ensured + doctor section + ShardsPlaced=False with the named reason + rank-Pod admission + kubectl logs/exec/delete rank rungs) is not written yet. This is a skeleton and MUST be red."
 exit 1

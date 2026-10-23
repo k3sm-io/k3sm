@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # k3sm M15 lab gate — the container-vm RuntimeClass on a real VZ-capable Mac.
-# — SKELETON (an honest placeholder; the real ladder lands with M15.3).
+# — SKELETON (an honest placeholder; the real ladder is not written yet).
 #
 # # K3SM-SKELETON
 #
@@ -11,7 +11,7 @@
 #
 # --core is a STRICT SUBSET (rungs 1-9). A green --core run NEVER satisfies M15-lab.
 #
-# THE LADDER (written by M15.3 from the M15 plan §Gates; this file asserts NONE of it yet):
+# THE LADDER (written when the ladder lands from the gates listed below; this file asserts NONE of it yet):
 #   1 preflight   k3sm.io/container-vm label present; the RuntimeClass provisioned; the
 #                 capability probe never consulted any container CLI (a negative assertion)
 #   2 boot        uname -sm = Linux aarch64 AND uname -r = the pinned kernel string
@@ -29,8 +29,8 @@
 # Honesty contract (TestLabSkeletonHonesty, manual:true ∧ skeleton:true): under no K3SM_LAB
 # this exits 0 saying PENDING — a skip, NOT a pass; under K3SM_LAB=1 it exits non-zero,
 # because a placeholder that greened on a lab host would falsely pass a milestone whose
-# real proof is still owed. M15.3 replaces this body and flips skeleton to false in the
-# SAME change (the M11 plan's R27).
+# real proof is still owed. The real ladder replaces this body and flips skeleton to false in the
+# SAME change.
 set -euo pipefail
 MODE=full
 case "${1:-}" in
@@ -41,8 +41,8 @@ case "${1:-}" in
 esac
 GATE_NAME="M15-lab"; [ "$MODE" = core ] && GATE_NAME="M15-core"
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "${GATE_NAME} gate: PENDING (dev-mac + vz + network). The container-vm path needs K3SM_LAB=1 + a real VZ-capable Mac, and this script is a skeleton: its ladder lands with M15.3. This is NOT a pass."
+	echo "${GATE_NAME} gate: PENDING (dev-mac + vz + network). The container-vm path needs K3SM_LAB=1 + a real VZ-capable Mac, and this script is a skeleton: its ladder is not written yet. This is NOT a pass."
 	exit 0
 fi
-echo "${GATE_NAME} gate: NOT YET IMPLEMENTED — the container-vm ladder lands with M15.3 (the M15 plan §Gates). This is a skeleton and MUST be red under K3SM_LAB=1."
+echo "${GATE_NAME} gate: NOT YET IMPLEMENTED — the container-vm ladder is not written yet (listed below). This is a skeleton and MUST be red under K3SM_LAB=1."
 exit 1

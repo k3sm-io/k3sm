@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
 # k3sm M18 lab gate — the lifecycle CLI and the macOS app on the two lab Macs.
-# — SKELETON (an honest placeholder; the real ladder lands with M18.4 and M18.5).
+# — SKELETON (an honest placeholder; the real ladder is not written yet).
 #
 # # K3SM-SKELETON
 #
 # Row in hack/acceptance/phases.json:
 #   M18-lab  gate hack/lab/m18.sh, tier lab, requires two-macs, manual: true, skeleton: true
 #
-# THE LADDER (from the M18 plan §Gates; this file asserts NONE of it yet):
+# THE LADDER (from the gates listed below; this file asserts NONE of it yet):
 #   1  worker-stop   stop the worker: cordoned, no process, no alias, stoppedBy; pods reschedule
 #   2  worker-start  start the worker: Ready, uncordoned, mesh back
 #   3  server-stop   stop the server with a joined worker: the warning, the control plane down
@@ -24,7 +24,7 @@
 #
 # Honesty contract (TestLabSkeletonHonesty, manual:true ∧ skeleton:true): under no K3SM_LAB
 # this exits 0 saying PENDING — a skip, NOT a pass; under K3SM_LAB=1 it exits non-zero,
-# because a placeholder that greened on the rig would falsely pass a milestone whose real
+# because a placeholder that greened on the lab host would falsely pass a milestone whose real
 # proof is still owed. The ladder replaces this body and flips skeleton to false in the SAME change.
 set -euo pipefail
 case "${1:-}" in
@@ -33,8 +33,8 @@ case "${1:-}" in
 	*) echo "$0: unknown argument $1 (expected no arguments)" >&2; exit 2 ;;
 esac
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "M18-lab gate: PENDING (two-macs). The lifecycle and app ladder needs K3SM_LAB=1 and the two lab Macs, and this script is a skeleton: its ladder lands with M18.4 and M18.5. This is NOT a pass."
+	echo "M18-lab gate: PENDING (two-macs). The lifecycle and app ladder needs K3SM_LAB=1 and the two lab Macs, and this script is a skeleton: its ladder is not written yet. This is NOT a pass."
 	exit 0
 fi
-echo "M18-lab gate: NOT YET IMPLEMENTED — the lifecycle and app ladder lands with M18.4 and M18.5 (the M18 plan §Gates). This is a skeleton and MUST be red under K3SM_LAB=1."
+echo "M18-lab gate: NOT YET IMPLEMENTED — the lifecycle and app ladder is not written yet (listed below). This is a skeleton and MUST be red under K3SM_LAB=1."
 exit 1

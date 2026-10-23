@@ -11,7 +11,7 @@
 # The REAL M7-lab proof uses real Developer-ID certs:
 # spctl/stapler validate the notarized artifacts, then a clean-Mac `brew install` →
 # `sudo k3sm install` → cluster Ready → reboot → Ready (launchd survival), greening
-# the transferred M4.0 acceptance AND the ex-M4-lab reboot debt in one run. NONE of
+# the transferred acceptance AND the ex-M4-lab reboot debt in one run. NONE of
 # that exists yet.
 #
 # Honesty contract (why each branch exits the way it does; mirrors hack/lab/m3.sh):

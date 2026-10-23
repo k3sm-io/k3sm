@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm M10 gate: Kubernetes conformance hardening, the composite (Res.9).
+# k3sm M10 gate: Kubernetes conformance hardening, the composite.
 #
 # This is the M10 row in hack/acceptance/phases.json (gate hack/acceptance/m10.sh,
 # tier integration, requires dev-mac, manual: false). The lab slice (cross-node
@@ -9,7 +9,7 @@
 # It runs every M10 criterion and reports each one PASS, FAIL or SKIP:
 #   - the M10 e2e criteria, `go test -tags e2e -run '^TestM10_' ./e2e/`, against the
 #     RUNNING cluster in $KUBECONFIG (this gate boots nothing);
-#   - the M10.1 server-side unit gates, pkg/provider TestCreatePodAssignsDistinctPodIP
+#   - the server-side unit gates, pkg/provider TestCreatePodAssignsDistinctPodIP
 #     and pkg/netserve TestHeadlessServiceReturnsAllPodIPs.
 # `--plan` prints the criterion table. TestM10_PSAEnforceCutover is a SKIP-SPEC: it
 # needs a server booted with --psa-enforce-baseline (the human-gated enforce cutover),
@@ -49,18 +49,18 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 #               other result counts like e2e
 #   kind <pkg>  a server-side unit gate in ./<pkg>/; it must PASS
 CRITERIA=(
-	"TestM10_AuditLogLevel|e2e|M10.0 audit: secret events at level Metadata, no payload at rest, PSA audit annotation"
-	"TestM10_PSADefaultWarn|e2e|M10.0 PSA: a baseline-violating pod is admitted with a warning; a clean pod warns nothing"
-	"TestM10_PSAEnforceCutover|spec|M10.0 PSA enforce: a hostNetwork pod is 403 under --psa-enforce-baseline (needs that server)"
-	"TestM10_ImagePullSecret|e2e|M10.2 imagePullSecrets: a private image pulls with the secret, is refused without, leaks nowhere"
-	"TestM10_PerPodIP|e2e|M10.1 per-pod IP: two same-node pods get distinct in-range /32s; a headless Service answers both"
-	"TestM10_ProviderEvents|e2e|M10.2 Events: Pulled/Created/Started per container, BackOff on a crash loop, Killing on delete"
-	"TestM10_CrashLoopBackOff|e2e|M10.2 restart: in-place re-exec, CrashLoopBackOff 10s/20s/40s, Running phase, stabilization reset"
-	"TestM10_JobCompletion|e2e|M10.2 Jobs: Complete, BackoffLimitExceeded, OnFailure in place, a sidecar Job ends on its main"
-	"TestM10_NativeSidecar|e2e|M10.2 sidecars: stay running beside the main, stop after it in reverse order, then the pod is terminal"
-	"TestM10_Ingress|e2e|M10.3 ingress: class + canonical Service, host routing + 404, honest statuses, svclb + conflict, TLS SNI + rotation"
-	"TestCreatePodAssignsDistinctPodIP|pkg/provider|M10.1 server-side: the podnet adapter assigns each pod a distinct IP"
-	"TestHeadlessServiceReturnsAllPodIPs|pkg/netserve|M10.1 server-side: the resolver answers a headless name with every pod IP"
+	"TestM10_AuditLogLevel|e2e|audit: secret events at level Metadata, no payload at rest, PSA audit annotation"
+	"TestM10_PSADefaultWarn|e2e|PSA: a baseline-violating pod is admitted with a warning; a clean pod warns nothing"
+	"TestM10_PSAEnforceCutover|spec|PSA enforce: a hostNetwork pod is 403 under --psa-enforce-baseline (needs that server)"
+	"TestM10_ImagePullSecret|e2e|imagePullSecrets: a private image pulls with the secret, is refused without, leaks nowhere"
+	"TestM10_PerPodIP|e2e|per-pod IP: two same-node pods get distinct in-range /32s; a headless Service answers both"
+	"TestM10_ProviderEvents|e2e|Events: Pulled/Created/Started per container, BackOff on a crash loop, Killing on delete"
+	"TestM10_CrashLoopBackOff|e2e|restart: in-place re-exec, CrashLoopBackOff 10s/20s/40s, Running phase, stabilization reset"
+	"TestM10_JobCompletion|e2e|Jobs: Complete, BackoffLimitExceeded, OnFailure in place, a sidecar Job ends on its main"
+	"TestM10_NativeSidecar|e2e|sidecars: stay running beside the main, stop after it in reverse order, then the pod is terminal"
+	"TestM10_Ingress|e2e|ingress: class + canonical Service, host routing + 404, honest statuses, svclb + conflict, TLS SNI + rotation"
+	"TestCreatePodAssignsDistinctPodIP|pkg/provider|server-side: the podnet adapter assigns each pod a distinct IP"
+	"TestHeadlessServiceReturnsAllPodIPs|pkg/netserve|server-side: the resolver answers a headless name with every pod IP"
 )
 
 crit_field() { # crit_field <entry> <1|2|3>

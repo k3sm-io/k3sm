@@ -9,7 +9,7 @@
 # tier integration, requires dev-mac, manual: false, skeleton: true). The two-Mac slice
 # is the SEPARATE row M18-lab (hack/lab/m18.sh, manual: true).
 #
-# The REAL M18 gate is a COMPOSITE (the M18 plan §Gates), written as M18.1 lands:
+# The REAL M18 gate is a COMPOSITE (listed below), written when the gate lands:
 #   1 k3sm stop on an installed single-Mac node leaves no node daemon, netd, exec shim
 #     or pod process and no cluster lo0 alias, keeps the plists, and writes the
 #     stoppedBy marker (phase stopped)
@@ -25,5 +25,5 @@
 # proven". Pinned always-RED by TestNonManualSkeletonsAlwaysRed, which runs it under
 # BOTH K3SM_LAB unset and K3SM_LAB=1.
 set -euo pipefail
-echo "M18 gate: NOT YET IMPLEMENTED — the real M18 composite gate (stop leaves no process or alias and keeps the plists, status reports stoppedBy, install honours the stop, start returns Ready, restart keeps pods, an interrupted stop converges) lands with M18.1. This is a skeleton and MUST be red."
+echo "M18 gate: NOT YET IMPLEMENTED — the real M18 composite gate (stop leaves no process or alias and keeps the plists, status reports stoppedBy, install honours the stop, start returns Ready, restart keeps pods, an interrupted stop converges) is not written yet. This is a skeleton and MUST be red."
 exit 1

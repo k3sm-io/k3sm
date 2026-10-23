@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2029,SC2329 # the remote commands expand on the client by design; the EXIT trap calls cleanup and the verdict
-# k3sm B46 lab gate: real memory pressure on the control-plane Mac, two legs.
+# k3sm lab gate: real memory pressure on the control-plane Mac, two legs.
 #
 #   Leg 1 (eviction acts first): a BestEffort native pod fills incompressible
 #   memory at a fixed rate on the server node. Pass iff the provider's eviction
@@ -111,9 +111,9 @@ if [ "$SELF_TEST" = yes ]; then
 		esac
 	done
 	if [ "$bad" -ne 0 ]; then
-		echo "B46 self-test: FAIL"; exit 1
+		echo "memory pressure self-test: FAIL"; exit 1
 	fi
-	echo "B46 self-test: PASS (unset K3SM_LAB -> exit 3 + '$PENDING_TEXT')"
+	echo "memory pressure self-test: PASS (unset K3SM_LAB -> exit 3 + '$PENDING_TEXT')"
 	exit 0
 fi
 
@@ -154,7 +154,7 @@ fi
 
 # ── Lab guard ─────────────────────────────────────────────────────────────────────
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "B46 lab gate: $PENDING_TEXT. Set K3SM_LAB=1 and point K3SM_B46_SSH / K3SM_B46_NODE at the server to run it."
+	echo "lab gate: $PENDING_TEXT. Set K3SM_LAB=1 and point K3SM_B46_SSH / K3SM_B46_NODE at the server to run it."
 	exit 3
 fi
 
@@ -266,7 +266,7 @@ cleanup() {
 		fi
 	fi
 	# Node readiness is checked and reported on EVERY exit path, a refused or
-	# failed run included: the rig must be left Ready, and the log says whether
+	# failed run included: the lab host must be left Ready, and the log says whether
 	# it was. Only a run that was otherwise passing turns red on it.
 	if command -v kubectl >/dev/null 2>&1; then
 		if all_nodes_ready; then
@@ -279,7 +279,7 @@ cleanup() {
 		echo "      cleanup: every node Ready at exit: unknown (kubectl not on PATH)"
 	fi
 	echo "----------------------------------------"
-	echo "B46: $PASS passed, $FAIL failed (evidence: $EV)"
+	echo "memory pressure: $PASS passed, $FAIL failed (evidence: $EV)"
 	case "$rc" in
 	0) emit_run_log_verdict PASS ;;
 	*) emit_run_log_verdict FAIL ;;
@@ -577,7 +577,7 @@ lease_gaps() {
 # ── Leg 1 ─────────────────────────────────────────────────────────────────────────
 leg1() {
 	local pod="b46-fill-1" uid start_srv start_epoch end_srv phase reason evicted_cnt etm comp_at mpmsg_seen taint log_off
-	echo "==> B46 leg 1: eviction acts first ($NS1/$pod, BestEffort)"
+	echo "==> leg 1: eviction acts first ($NS1/$pod, BestEffort)"
 	rm -f "$EV/watchdog.fired"
 	arm_deadman 1 "$pod"
 	log_off="$(server_log_offset)"; [ -n "$log_off" ] || refuse "cannot read the size of $SERVER_LOG"
@@ -641,7 +641,7 @@ leg1() {
 # ── Leg 2 ─────────────────────────────────────────────────────────────────────────
 leg2() {
 	local pod="b46-fill-2" start_srv start_epoch pid flags skip_srv exitc log_off
-	echo "==> B46 leg 2: the kernel picks the marked pod ($NS2/$pod, system-node-critical)"
+	echo "==> leg 2: the kernel picks the marked pod ($NS2/$pod, system-node-critical)"
 	rm -f "$EV/watchdog.fired"
 	disarm_deadman 1
 	arm_deadman 2 "$pod"

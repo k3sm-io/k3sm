@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B248 acceptance gate — the runnable proof that k3sm's data root can live
+# k3sm data volume acceptance gate — the runnable proof that k3sm's data root can live
 # on an APFS volume k3sm creates, bounds, mounts, migrates onto and destroys.
 #
 # The problem it closes: /var/lib/k3sm is a directory on the boot volume, so a
@@ -46,7 +46,7 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 lab_pending() { echo "LAB-PENDING  $1"; }
 
-echo "==> k3sm B248 acceptance (the data root on a k3sm-owned APFS volume)"
+echo "==> k3sm data volume acceptance (the data root on a k3sm-owned APFS volume)"
 
 # ---- b248.0 — the gate parses and its sources exist -------------------------
 b0=ok
@@ -59,8 +59,8 @@ b0=ok
 ladder "$b0" "b248.0  gate parses (bash -n) + pkg/datavol/seams.go + cmd/k3sm/datavol.go + pkg/install/{plist,manifest}.go + b248helper present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B248: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B248: $PASS passed, $FAIL failed" >&2
+	echo "data volume: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
+	echo "data volume: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -183,7 +183,7 @@ SCRATCH_ROOT=/Library/k3sm-acceptance-datavol
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "B248 LAB tier (ONE Mac, root; set K3SM_LAB=1 to run — it creates and destroys real APFS volumes under $SCRATCH_ROOT):"
+	echo "LAB tier (ONE Mac, root; set K3SM_LAB=1 to run — it creates and destroys real APFS volumes under $SCRATCH_ROOT):"
 	lab_pending "b248.L0  the boot APFS container is discoverable and has >= 4 GiB free"
 	lab_pending "b248.L1  a created volume is case-sensitive APFS, quota-capped, mounted nobrowse,nosuid,nodev, un-indexed and Time-Machine-excluded"
 	lab_pending "b248.L2  statfs reports the quota, a 1 GiB write lands on the volume, and a write past the cap fails with ENOSPC"
@@ -196,14 +196,14 @@ if [ "${K3SM_LAB:-}" != 1 ]; then
 	lab_pending "b248.L9  the same label re-bootstrapped onto a failing invocation exits non-zero and the datavol row renders failed with that exit"
 	lab_pending "b248.L10 after cleanup no scratch launchd job, no scratch volume and no scratch tree remains"
 	echo
-	echo "  It runs on ONE Mac and needs root. Nothing it touches is the rig's: every"
+	echo "  It runs on ONE Mac and needs root. Nothing it touches is the lab host's: every"
 	echo "  path lives under $SCRATCH_ROOT, and /var/lib/k3sm, /Library/k3sm and"
 	echo "  /etc/fstab are never written (the helper refuses any other path). L8/L9's"
 	echo "  scoped \`k3sm status\` reads the installed state the report always reads, and"
 	echo "  their launchd job is a scratch label, never io.k3sm.datavol."
 else
 	echo "----------------------------------------"
-	echo "B248 LAB tier: creating real APFS volumes under $SCRATCH_ROOT (root; each step prompts sudo as needed)"
+	echo "LAB tier: creating real APFS volumes under $SCRATCH_ROOT (root; each step prompts sudo as needed)"
 
 	GATE_DIR="$SCRATCH_ROOT/gate-$$"
 	MP="$GATE_DIR/mnt"
@@ -295,9 +295,9 @@ for k in sys.argv[1].split("."):
     d = d.get(k) if isinstance(d, dict) else None
 print(d if isinstance(d, int) else 0)' "$1"; }
 
-	# ---- b248.L0 — the rig can host the tier at all ------------------------
+	# ---- b248.L0 — the lab host can host the tier at all ------------------------
 	# A missing diskutil or a full container is a HARD FAIL, never a skip: a
-	# green B248 that quietly ran no lab rung would mean "B248 was not checked".
+	# green that quietly ran no lab rung would mean "data volume was not checked".
 	CONTAINER=""
 	FREE=0
 	l0=ok
@@ -314,8 +314,8 @@ print(d if isinstance(d, int) else 0)' "$1"; }
 	ladder "$l0" "b248.L0  boot APFS container ${CONTAINER:-<unknown>} has $FREE bytes free (>= 4 GiB) and diskutil/python3 are present"
 	if [ "$l0" != ok ]; then
 		echo "----------------------------------------"
-		echo "B248: the lab tier cannot run on this Mac (no diskutil/python3, or < 4 GiB free) — nothing below was checked" >&2
-		echo "B248: $PASS passed, $FAIL failed" >&2
+		echo "data volume: the lab tier cannot run on this Mac (no diskutil/python3, or < 4 GiB free) — nothing below was checked" >&2
+		echo "data volume: $PASS passed, $FAIL failed" >&2
 		exit 1
 	fi
 
@@ -685,10 +685,10 @@ print(d)' "$1"; }
 fi
 
 echo "----------------------------------------"
-echo "B248: $PASS passed, $FAIL failed"
+echo "data volume: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 if [ "${K3SM_LAB:-}" = 1 ]; then
-	echo "================ B248 GREEN (CI + lab tiers) ================"
+	echo "================ data volume GREEN (CI + lab tiers) ================"
 else
-	echo "================ B248 GREEN (CI tier; the lab tier needs K3SM_LAB=1 and root) ================"
+	echo "================ data volume GREEN (CI tier; the lab tier needs K3SM_LAB=1 and root) ================"
 fi

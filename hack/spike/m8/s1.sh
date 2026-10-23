@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# M8.0-d1 / S1 — Metal under Seatbelt: a FULL MLX inference round-trip under a
+# S1 — Metal under Seatbelt: a FULL MLX inference round-trip under a
 # k3sm default-deny profile, plus the egress half of exit criterion 2.
 #
-# S1 is the M8 GO/NO-GO (the M8 plan §M8.0). Its two exit criteria:
+# S1 is the M8 GO/NO-GO. Its two exit criteria:
 #   (1) tokens generated under the profile                       — REQUIRED
 #   (2) an HF weight download through the PRODUCTION datapath    — see findings
 #       (DNS shim -> Service-proxy dialer -> egress) under a generated
@@ -13,17 +13,17 @@
 #   probe0  run generation under a default-deny profile with NO GPU rules and
 #           harvest the raw sandbox denial log (the evidence the allow-set is
 #           derived from, not guessed)
-#   matrix  test each candidate iokit rule spelling — this is R22's primary job:
+#   matrix  test each candidate iokit rule spelling — this is the prefix rule's primary job:
 #           VALIDATE the (iokit-registry-entry-class-prefix "AGXAcceleratorG")
 #           candidate, and record whether it under- or over-scopes
 #   minimal emit the converged MINIMAL profile and re-run BOTH a full generation
 #           and a cold JIT Metal-kernel compile under it
 #   ablate  drop each candidate rule in turn — a rule that is not load-bearing is
-#           OVER-SCOPE and must not ship (Res. 11 / the profile's core invariant)
+#           OVER-SCOPE and must not ship (the profile's core invariant)
 #   cache   probe whether the confined pod can reach the shared shader cache
 #           (DARWIN_USER_CACHE_DIR/com.apple.metal*) — the cross-pod channel
-#           Res. 11 requires be RECORDED, never silently widened
-#   egress  re-download the model under the R21 allow_internet_egress stanza
+#           the spike requires be RECORDED, never silently widened
+#   egress  re-download the model under the allow_internet_egress stanza
 #
 # Recorded verdict: findings-s1.md.
 set -euo pipefail
@@ -118,7 +118,7 @@ PY
 # are re-allowed AFTER the (deny ... (subpath "/Users")) exactly as production
 # re-allows the pod data volume after the protected denies.
 mkp() { cat <<SB
-;; k3sm M8.0/S1 spike profile — mirrors runtimed/pkg/sandbox/sbpl.go rule order.
+;; k3sm M8 spike S1 spike profile — mirrors runtimed/pkg/sandbox/sbpl.go rule order.
 (version 1)
 (deny default)
 (import "system.sb")
@@ -167,8 +167,8 @@ echo "### ioreg — what the AGX registry actually exposes on this rig"
 ioreg -l 2>/dev/null | grep -oE 'AGXAccelerator[A-Za-z0-9]*' | sort -u | sed 's/^/  service-class /'
 "$V" -c 'import mlx.core as mx; d=mx.device_info(); print("  mlx device_info:", d)'
 
-echo "### matrix — candidate rule spellings (R22 primary job)"
-run rule-prefix-R22   '(allow iokit-open (iokit-registry-entry-class-prefix "AGXAcceleratorG"))' "$W/jit.py"
+echo "### matrix — candidate rule spellings (prefix rule primary job)"
+run rule-prefix   '(allow iokit-open (iokit-registry-entry-class-prefix "AGXAcceleratorG"))' "$W/jit.py"
 run rule-prefix-uc    '(allow iokit-open (iokit-registry-entry-class-prefix "AGXDeviceUserClient"))' "$W/jit.py"
 run rule-exact-pair   "$IOK" "$W/jit.py"
 run rule-open-bare    '(allow iokit-open)' "$W/jit.py"
@@ -186,7 +186,7 @@ run ablate-plus-getprops "$IOK
 echo "### cache — can the confined pod reach the SHARED shader cache?"
 run cacheprobe "$IOK" "$W/cacheprobe.py"
 
-echo "### egress — exit criterion 2, SBPL half (R21 allow_internet_egress stanza)"
+echo "### egress — exit criterion 2, SBPL half (allow_internet_egress stanza)"
 NET=';; network: ALLOWED — unfiltered outbound+bind+inbound under (deny default).
 ;; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;
 ;; per-IP scoping (VIP egress, per-pod-IP bind) does NOT compile.
@@ -207,6 +207,6 @@ denials "$T0" | sed 's/^/      DENY /'
 
 echo "### criterion 2, PRODUCTION-DATAPATH half"
 echo "  see findings-s1.md — 'k3sm dev up' rootless is network=none (datapath"
-echo "  INERT) and --datapath requires euid 0, which the M8.0 lab guardrails and"
+echo "  INERT) and --datapath requires euid 0, which the M8 spike lab guardrails and"
 echo "  this dispatch's no-root exclusion forbid. Recorded ATTEMPTED-BLOCKED."
 EOF

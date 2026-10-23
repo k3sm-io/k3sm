@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B222 acceptance gate — the runnable proof that the apiserver healthz PROBE
+# k3sm healthz probe address acceptance gate — the runnable proof that the apiserver healthz PROBE
 # and every in-process CLIENT dial the address the apiserver ACTUALLY BINDS, not a
 # hardcoded loopback.
 #
@@ -61,7 +61,7 @@ PASS=0; FAIL=0; SKIP=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 skipped() { echo "SKIP  $1"; SKIP=$((SKIP+1)); }
 
-echo "==> k3sm B222 acceptance (apiserver probe + in-process clients follow the effective bind)"
+echo "==> k3sm healthz probe address acceptance (apiserver probe + in-process clients follow the effective bind)"
 
 # ---- b222.0 — the gate parses and its sources exist -------------------------
 b0=ok
@@ -70,8 +70,8 @@ for f in "$SETUP" "$SUPERVISED" "$EMBEDDED"; do [ -f "$f" ] || b0=no; done
 ladder "$b0" "b222.0  gate parses (bash -n) + pkg/executor sources present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B222: the gate or its sources are missing/unparseable — nothing else can run" >&2
-	echo "B222: $PASS passed, $FAIL failed, $SKIP skipped" >&2
+	echo "healthz probe address: the gate or its sources are missing/unparseable — nothing else can run" >&2
+	echo "healthz probe address: $PASS passed, $FAIL failed, $SKIP skipped" >&2
 	exit 1
 fi
 
@@ -98,10 +98,10 @@ ladder "$a" "b222.2  apiServerArgs renders --bind-address from apiServerHost (ON
 # The full consumer set: the healthz probe, both RESTConfigToken implementations,
 # and the three kubeconfig writes (admin + scheduler + controller-manager).
 #
-# WHAT IS PINNED, AND WHAT DELIBERATELY IS NOT (re-scoped 2026-09-03): B222's
+# WHAT IS PINNED, AND WHAT DELIBERATELY IS NOT (re-scoped 2026-09-03): this gate's
 # subject is the HOST — that every consumer takes it from the ONE derivation
 # (apiServerURL/apiServerHost over the config) instead of re-deriving loopback.
-# The TOKEN argument travelling beside it is not B222's subject and never was, so
+# The TOKEN argument travelling beside it is not this gate's subject and never was, so
 # it is matched loosely. Two rungs here pinned the token expression literally and
 # went stale when it changed for unrelated reasons: `s.token` became
 # `s.currentToken()` (a mutex-guarded read added with the concurrency fix), and
@@ -111,7 +111,7 @@ ladder "$a" "b222.2  apiServerArgs renders --bind-address from apiServerHost (ON
 # this rung was reporting on token plumbing it does not own. The host halves
 # (`apiServerURL(s.cfg)`, `apiServerURL(e.cfg)`, `writeKubeconfig(s.cfg,`,
 # `writeComponentKubeconfig(s.cfg,`) stay pinned EXACTLY: those are the literals
-# whose loss is the defect B222 exists to prevent.
+# whose loss is the defect exists to prevent.
 c=ok
 grep -qE 'url := apiServerURL\(s\.cfg\) \+ "/healthz"' "$SUPERVISED" || c=no
 grep -qE 'return apiServerURL\(s\.cfg\), ' "$SUPERVISED" || c=no
@@ -191,13 +191,13 @@ ALIAS="${B222_ALIAS:-100.64.222.1}"
 
 if [ "${K3SM_LAB:-}" != 1 ] || [ "$(id -u)" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "B222 INTEGRATION tier — NOT RUN (requires root: creating the lo0 alias $ALIAS needs \`ifconfig lo0 alias\`)."
+	echo "INTEGRATION tier — NOT RUN (requires root: creating the lo0 alias $ALIAS needs \`ifconfig lo0 alias\`)."
 	echo "  Run it with:  sudo K3SM_LAB=1 $SELF"
 	skipped "b222.I1  \`k3sm server --node-ip $ALIAS\` (a NON-loopback bind) reaches 'control plane healthy' — requires root"
 	skipped "b222.I2  the written k3sm.kubeconfig names https://$ALIAS:<api-port> — requires root"
 else
 	echo "----------------------------------------"
-	echo "B222 INTEGRATION tier: adding lo0 alias $ALIAS and booting a server bound to it"
+	echo "INTEGRATION tier: adding lo0 alias $ALIAS and booting a server bound to it"
 	IWD="$(mktemp -d /tmp/b222.XXXXXX)"
 	SRV_PID=""
 	int_cleanup() {
@@ -260,10 +260,10 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B222: $PASS passed, $FAIL failed, $SKIP skipped"
+echo "healthz probe address: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1
 if [ "$SKIP" -eq 0 ]; then
-	echo "================ B222 GREEN (CI + integration) ================"
+	echo "================ healthz probe address GREEN (CI + integration) ================"
 else
-	echo "================ B222 GREEN (CI tier; $SKIP integration rung(s) SKIPPED — see above) ================"
+	echo "================ healthz probe address GREEN (CI tier; $SKIP integration rung(s) SKIPPED — see above) ================"
 fi

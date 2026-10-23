@@ -1,4 +1,4 @@
-# S0 findings — k3sm preconditions, no framework (M16.0-d1)
+# S0 findings — k3sm preconditions, no framework
 
 > **Status: RUN 2026-09-17** on the single-node dev Mac named under Rig. Criteria (1)
 > and (3) hold; criterion (2) fails on this rig and its pre-decided substitution is
@@ -20,7 +20,7 @@ Do k3sm's three unproven preconditions hold?
    alias. A `url:` ref would prove something else, and a native backend would never
    exercise the guest leg the fleet's control plane runs on.
 2. **Two engines on one GPU.** Do two `vllm-mlx` engines co-reside within a measured
-   memory and latency budget, or does the rig thrash?
+   memory and latency budget, or does the lab host thrash?
 3. **The dial nobody has measured.** Can a `vm` guest reach a native pod's own
    lo0-alias pod IP, and the reverse?
 
@@ -39,9 +39,9 @@ guest, and a `vm` guest listener dialled from a native pod.
 
 | criterion | on failure |
 |---|---|
-| (1) webhook delivery | R4(a): v1alpha1 only, no conversion in the path |
-| (2) two engines | R5's slot floor rises (a smaller model or a larger slot) and S0(2) re-runs; single-slot only if no small model fits two |
-| (3) the guest→native dial | R4(b): the native-Darwin control plane per F2 |
+| (1) webhook delivery | v1alpha1 only, no conversion in the path |
+| (2) two engines | the slot floor rises (a smaller model or a larger slot) and S0(2) re-runs; single-slot only if no small model fits two |
+| (3) the guest→native dial | the native-Darwin control plane |
 
 ## Scoreboard
 
@@ -59,7 +59,7 @@ guest, and a `vm` guest listener dialled from a native pod.
 | | |
 |---|---|
 | host | the M16 rig, reached over the harness's ssh path (`K3SM_M16_HOST`) |
-| SoC / memory | Apple M2, 8 GiB (Mac14,2); the rig also hosted the control plane and four vm pods during the run |
+| SoC / memory | Apple M2, 8 GiB (Mac14,2); the lab host also hosted the control plane and four vm pods during the run |
 | macOS | 26.6.2 |
 | date (UTC) | 2026-09-17 |
 | engine pin | vllm-mlx 0.4.1 on an arm64 CPython 3.12 venv |

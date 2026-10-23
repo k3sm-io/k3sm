@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B404 acceptance gate — the SIT's T2 (psa-enforce) leg preflights its work
+# k3sm SIT psa leg acceptance gate — the SIT's T2 (psa-enforce) leg preflights its work
 # dir and resets its server log before it boots.
 #
 # `sudo hack/sit/run.sh` runs T2 as root, so $SIT_PSA_WORKDIR (default
@@ -47,7 +47,7 @@ esac
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B404 acceptance (SIT T2 preflights its work dir and resets its log) [$K3SM_ROOT]"
+echo "==> k3sm SIT psa leg acceptance (SIT T2 preflights its work dir and resets its log) [$K3SM_ROOT]"
 
 # body prints run_psa_enforce_leg, header to the first column-0 `}`, as
 # "<in-body line no>\x1f<line>" (1 = the header).
@@ -120,6 +120,6 @@ printf '%s\n' "$out" | grep -qF "SIT_PSA_WORKDIR=" || b3=no
 ladder "$b3" "b404.3  preflight on a chmod-555 dir returns 1 and names the path + remedy (rc=$rc)"
 
 echo "----------------------------------------"
-echo "B404: $PASS passed, $FAIL failed"
+echo "SIT psa leg: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B404 GREEN ================"
+echo "================ SIT psa leg GREEN ================"

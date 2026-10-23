@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Shared plumbing for the M11.0 spikes (s1.sh, and later s3.sh / s4.sh / s5.sh).
+# Shared plumbing for the M11 spikes (s1.sh, and later s3.sh / s4.sh / s5.sh).
 #
 # The spikes run on the LAB Mac, not on the workstation: they need
 # Virtualization.framework, an ad-hoc signature carrying
 # com.apple.security.virtualization, and the freedom to boot throwaway guests.
 # Each s<N>.sh is a DRIVER — it ships a lab-side payload over ssh and runs it
-# under the guardrails recorded in k3sm/docs/PHASES.md M11.0:
+# under the guardrails recorded in k3sm/docs/PHASES.md M11 spike:
 #
 #   * every write confined to $PREFIX (default ~/k3sm-spike-m11) or /tmp scratch;
 #   * never /Library/Sandbox/Profiles, the TCC/Privacy DB, Gatekeeper/SIP state,
@@ -41,7 +41,7 @@ KERNEL_SHA256="${K3SM_SPIKE_KERNEL_SHA256:-71fe6776ef591ea452661a5933e11d2044c5d
 
 # LAB-SIDE PREAMBLE. Injected ahead of every heredoc, because a non-interactive
 # ssh gets neither a login PATH nor GNU coreutils, and both bit this harness
-# before it ever reached the rig:
+# before it ever reached the lab host:
 #
 #   * go lives at /opt/homebrew/bin/go on the lab Mac and is on NEITHER the
 #     non-interactive nor the login-shell PATH, so a bare `go build` fails with

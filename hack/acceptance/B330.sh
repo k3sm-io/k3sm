@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# k3sm B330 acceptance gate — the runnable proof that the M16 spike venvs are
+# k3sm spike venv acceptance gate — the runnable proof that the M16 spike venvs are
 # pinned to an arm64 interpreter, so a Mac carrying both an Apple-Silicon and an
 # x86_64 Homebrew never silently builds the venv `hack/spike/m16/s0.sh` drives
 # vllm-mlx from out of the wrong one.
 #
-# The defect (observed on the studio rig, S0 run 13): `uv venv --python 3.12
+# The defect (observed on the lab host, S0 run 13): `uv venv --python 3.12
 # <dir>` resolves to whichever python 3.12 matches first on PATH. On a Mac with
 # a stray x86_64 Homebrew ahead of the Apple-Silicon one, that is the x86_64
 # interpreter — so `vllm-mlx==0.4.1` (macosx_*_arm64 wheels only) has nothing to
@@ -49,7 +49,7 @@ S3="$K3SM_ROOT/hack/spike/m16/s3.sh"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B330 acceptance (the M16 spike venvs are pinned to an arm64 interpreter)"
+echo "==> k3sm spike venv acceptance (the M16 spike venvs are pinned to an arm64 interpreter)"
 
 # ---- b330.0 — the gate parses and its sources exist -------------------------
 b0=ok
@@ -62,20 +62,20 @@ grep -q 'spike_pip()' "$LIB" || b0=no
 ladder "$b0" "b330.0  gate parses (bash -n) + lib.sh/s0.sh/s1.sh/s3.sh present + spike_venv/spike_pip defined"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B330: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B330: $PASS passed, $FAIL failed" >&2
+	echo "spike venv: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
+	echo "spike venv: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
 # ---- b330.1 — the helpers live INSIDE LAB_PREAMBLE, not driver-side --------
 # lib.sh's lab() prepends ONLY $LAB_PREAMBLE ahead of a payload before shipping it
 # over ssh (see lib.sh's `lab()`); a helper defined outside that heredoc is a
-# function the rig's bash never sees, and every s<N>.sh call site would fail
+# function the lab host's bash never sees, and every s<N>.sh call site would fail
 # "command not found" on the real path despite this gate's CI tier reading green.
 p=ok
 awk '/^read -r -d .. LAB_PREAMBLE <<.PREEOF./,/^PREEOF$/' "$LIB" | grep -q 'spike_venv()' || p=no
 awk '/^read -r -d .. LAB_PREAMBLE <<.PREEOF./,/^PREEOF$/' "$LIB" | grep -q 'spike_pip()' || p=no
-ladder "$p" "b330.1  spike_venv/spike_pip are defined inside LAB_PREAMBLE (the text lab() actually ships to the rig)"
+ladder "$p" "b330.1  spike_venv/spike_pip are defined inside LAB_PREAMBLE (the text lab() actually ships to the lab host)"
 
 # ---- b330.2 — the WIRING: s0/s1/s3 call the helpers, never a raw uv call ---
 w=ok
@@ -108,7 +108,7 @@ grep -qF 'vllm-mlx==$ENGINE_VERSION did not install: $(tail -1 "$PREFIX/logs/pip
 ladder "$q" "b330.2  s0.sh's FAIL verdict quotes the pip log's own last line (pip-venv-vllm-mlx.log)"
 
 # ---- fixtures ---------------------------------------------------------------
-# Every behavioural rung below runs the helpers EXACTLY as the rig will: source
+# Every behavioural rung below runs the helpers EXACTLY as the lab host will: source
 # lib.sh (defines $LAB_PREAMBLE and never touches a network), then eval that
 # text in a throwaway bash -c so spike_venv/spike_pip become real functions in a
 # process whose PATH is shadowed with fakes — never the real `uv`.
@@ -253,7 +253,7 @@ ladder "$v5" "b330.7  the pip log name derives from BOTH the venv dir (venv-s1) 
 # The regression this closes: hack/spike/m16/s0.sh's load.py posted a hardcoded
 # "model": "m", and vllm-mlx 0.4.1 answers /v1/chat/completions with a 404 "The
 # model `m` does not exist" for anything but the model it was launched with — a
-# LIVE S0 rerun on an arm64 venv (B330's own fix working) got exactly this 404
+# LIVE S0 rerun on an arm64 venv (this gate's own fix working) got exactly this 404
 # on every request, counted as a generic "failed" with no hint why. This rung
 # extracts the SHIPPED load.py straight out of s0.sh (never a copy maintained
 # here) and drives it against a tiny fake HTTP server that only answers
@@ -366,5 +366,5 @@ if d.get("ok") != 1 or d.get("failed") != 0:
 fi
 ladder "$l8" "b330.8  load.py resolves the model id from GET /v1/models and the fake engine answers it: one ok request, zero failures"
 echo "----------------------------------------"
-echo "B330: $PASS passed, $FAIL failed"
+echo "spike venv: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

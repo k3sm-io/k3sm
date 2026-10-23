@@ -1,4 +1,4 @@
-# S1 findings — enumeration and mapping (M17.0)
+# S1 findings — enumeration and mapping
 
 > **Status: NOT YET RUN.** Write-back target for `hack/spike/m17/s1.sh`. The rung's
 > transcript, raw command output and figures land in `$K3SM_EVIDENCE/s1/`; this file
@@ -27,9 +27,9 @@ reboot (`K3SM_M17_ALLOW_REBOOT=1`); a prompted receptacle or dock move;
 
 | criterion | on failure |
 |---|---|
-| s1.5 `PF_ROUTE` silent on unplug | R8: the 2 s poll is the only source and the fallback figure is re-measured (S4) |
+| s1.5 `PF_ROUTE` silent on unplug | the 2 s poll is the only source and the fallback figure is re-measured (S4) |
 | s1.1 `NoThunderboltService` | the design's `NoThunderboltService` condition stands; s1.9 says whether `ioreg` can substitute |
-| s1.2 / s1.3 / s1.7 | no substitution is pre-decided: the M17 plan §1 mapping does not hold; the spike stops for a re-plan |
+| s1.2 / s1.3 / s1.7 | no substitution is pre-decided: the direct-link design's mapping does not hold; the spike stops for a re-plan |
 
 ## Scoreboard
 
@@ -59,7 +59,7 @@ reboot (`K3SM_M17_ALLOW_REBOOT=1`); a prompted receptacle or dock move;
 ## Consequences recorded here
 
 - Whether `linkwatch`'s `PF_ROUTE` reader is a real latency optimisation on a
-  Thunderbolt `enX`, or the poll carries the stream alone (R8).
+  Thunderbolt `enX`, or the poll carries the stream alone.
 - Whether a consumer must treat an unplug as a vanishing (`Gone`) or a flag flip,
   and whether the interface name survives a replug (state stays keyed by domain UUID
   either way).

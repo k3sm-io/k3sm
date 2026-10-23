@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# M17.0 / S4 — sleep, unplug and replug UNDER A BULK FLOW: what the kernel does when
+# S4 — sleep, unplug and replug UNDER A BULK FLOW: what the kernel does when
 # the cable goes, how long traffic takes to find the tunnel, and whether a cable flip
-# can fault the kernel (the B350/B370 panic class was a route change moving an open
+# can fault the kernel (the earlier kernel-panic class was a route change moving an open
 # socket between interfaces; a cable flip is the same class of event).
 #
 #   (1) What the kernel does to the cable port's routes (the /25s, the host route,
@@ -28,7 +28,7 @@ do to the direct routes, how long until a bulk flow's traffic rides the tunnel, 
 bridge member, and does repeated flipping ever fault the kernel?"
 CRITERIA="s4.2 no kernel fault on either Mac across every flip and unplug (kern.boottime unchanged, no new panic report)
 s4.3 configd never re-adds a removed port to bridge0 within 2 s of a link event (faster than the watcher's poll)
-s4.1 the bulk iperf3 flow across the cable (MSS 1340, R15) is still running at the end of the rung
+s4.1 the bulk iperf3 flow across the cable (MSS 1340, figure schema) is still running at the end of the rung
 RECORDED: the route table's reaction per event; fallback latency (median, p99) over the flips and over the physical
 unplugs; configd re-add count and latency; wireguard re-programming time; the silent-peer and sleeping-peer windows"
 METHOD="Both Macs configured as netd would (privileged, restore trap held for the rung), a pod-range lo0 alias on the
@@ -36,9 +36,9 @@ worker and a bulk iperf3 flow to it from the server. Per event, an observer on e
 membership and the /25 count every 0.5 s while the server pings the alias every 0.1 s (--apple-time); FLIPS
 (>= 10) administrative down/up of the worker's port, then UNPLUGS (>= 10) prompted physical unplug/replug cycles;
 a pf anchor that drops the worker's cable traffic for 30 s; an optional real sleep with pmset schedule wake."
-HALT="s4.3 fails (configd re-adds faster than the watcher) -> R8: the watcher removes on every network-change event,
+HALT="s4.3 fails (configd re-adds faster than the watcher) -> the watcher removes on every network-change event,
   and the doc says the bridge is managed.
-s1.5 failed earlier (PF_ROUTE silent) -> R8: the fallback figure recorded here is the poll-only figure.
+s1.5 failed earlier (PF_ROUTE silent) -> the fallback figure recorded here is the poll-only figure.
 s4.2 fails (a kernel fault) -> no substitution is pre-decided: the spike stops and the fault is reported with its
   panic report; nothing in M17 ships over a path that faults the kernel."
 
@@ -46,7 +46,7 @@ spike_args "$RUNG" "$QUESTION" "$CRITERIA" "$METHOD" "$HALT" "$@"
 
 spike_require "$RUNG"
 if ! [ "$UNPLUGS" -ge 10 ] 2>/dev/null || ! [ "$FLIPS" -ge 10 ] 2>/dev/null; then
-	echo "FAIL      M17.0 S4: K3SM_M17_UNPLUGS=$UNPLUGS K3SM_M17_FLIPS=$FLIPS; the fallback distribution needs >= 10 of each" >&2
+	echo "FAIL      M17 spike S4: K3SM_M17_UNPLUGS=$UNPLUGS K3SM_M17_FLIPS=$FLIPS; the fallback distribution needs >= 10 of each" >&2
 	exit 1
 fi
 
@@ -57,7 +57,7 @@ spike_cleanup() {
 	on worker "[ -s $REMOTE_DIR/iperf3.pid ] && kill \$(cat $REMOTE_DIR/iperf3.pid) 2>/dev/null; rm -f $REMOTE_DIR/iperf3.pid" </dev/null >/dev/null 2>&1 || true
 }
 
-R8_S4="halt (R8): the watcher removes on every network-change event, and the doc says the bridge is managed"
+R8_S4="halt: the watcher removes on every network-change event, and the doc says the bridge is managed"
 
 # The observer: link state, bridge0 membership and the /25 count every 0.5 s for
 # DURATION seconds; with PING_TARGET, a 0.1 s ping whose largest reply gap is the
@@ -152,7 +152,7 @@ iperf3 -s -p 5201 -D --pidfile "$REMOTE_DIR/iperf3.pid" >/dev/null 2>&1; sleep 2
 EOF
 if [ "$FAILS" -gt 0 ]; then spike_end "$RUNG"; fi
 remote server "s4-bulk" T="$WRK_PROBE_IP" <<'EOF'
-# MSS 1340: the one clamp R15 applies to every cross-node path, so a flow that moves
+# MSS 1340: the one clamp figure schema applies to every cross-node path, so a flow that moves
 # from the cable to the tunnel never carries a segment the tunnel cannot.
 nohup iperf3 -c "$T" -p 5201 -t 86400 -i 1 -M 1340 --forceflush </dev/null >"$REMOTE_DIR/bulk.log" 2>&1 &
 echo $! >"$REMOTE_DIR/bulk.pid"
@@ -219,7 +219,7 @@ done
 if [ "$done_unplugs" -gt 0 ]; then
 	# shellcheck disable=SC2086
 	figure unplug "fallback-unplug-ms" "ms" "physical unplug/replug — largest gap of ping -i 0.1 --apple-time <worker pod-range alias> on the server" $gaps
-	[ "$done_unplugs" -lt 10 ] && record "s4.2 only $done_unplugs physical unplugs were performed; the plan asks for >= 10"
+	[ "$done_unplugs" -lt 10 ] && record "s4.2 only $done_unplugs physical unplugs were performed; the spike asks for >= 10"
 	record "s4.1 kernel reaction to an unplug (first unplug, server side): $(routes_of unplug1)"
 fi
 
@@ -282,7 +282,7 @@ sleep 30
 spike_pf_clear k3sm-m17-spike
 EOF
 observe_wait
-record "s4.6 silent peer, link up, 30 s: server $(routes_of silent); largest reply gap $(gap_of silent) ms (routes that stay up while the peer is silent are what the R13 liveness probe exists for)"
+record "s4.6 silent peer, link up, 30 s: server $(routes_of silent); largest reply gap $(gap_of silent) ms (routes that stay up while the peer is silent are what the liveness probe exists for)"
 check_readds silent
 
 if [ "${K3SM_M17_ALLOW_SLEEP:-}" != 1 ]; then

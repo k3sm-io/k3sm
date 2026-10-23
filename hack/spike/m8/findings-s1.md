@@ -1,10 +1,10 @@
-# S1 — Metal under Seatbelt (M8.0-d1) — **PARTIAL / GO**
+# S1 — Metal under Seatbelt — **PARTIAL / GO**
 
 > **Verdict: criterion 1 PASS (the M8 go/no-go), criterion 2 SPLIT — SBPL half
-> PASS, production-datapath half ATTEMPTED-BLOCKED.** Per the M8 plan Res. 17 S1 is
+> PASS, production-datapath half ATTEMPTED-BLOCKED.** Per the spike definition, S1 is
 > the terminal spike; criterion 1 passing means **M8 proceeds**. Criterion 2's
 > blocked half is a *structural* block with an exact cause (below), not an
-> unfinished attempt, and it does not gate the M8.2-d1 encoding.
+> unfinished attempt, and it does not gate the sandbox encoding.
 
 Run: 2026-08-29, agent-driven over ssh. Re-run with `hack/spike/m8/s1.sh`
 (`--setup` first on a clean rig).
@@ -14,7 +14,7 @@ Run: 2026-08-29, agent-driven over ssh. Re-run with `hack/spike/m8/s1.sh`
 | | |
 |---|---|
 | host | the lab Mac, reached over the harness's ssh path (`K3SM_SPIKE_HOST`) |
-| SoC | **Apple M1-family**, 64 GiB unified — *not* the part the M8.0 ledger row records; the row should be corrected |
+| SoC | **Apple M1-family**, 64 GiB unified — *not* the part the M8 spike ledger row records; the row should be corrected |
 | macOS | **26.5.2** |
 | GPU | `AGXAcceleratorG13X` (IOKit service class); MLX reports `architecture: applegpu_g13d`, `max_recommended_working_set_size: 55662788608` |
 | toolchain | uv 0.12.7 → CPython 3.12.14 (python-build-standalone) |
@@ -85,9 +85,9 @@ allow-set is derived from; nothing here was guessed:
 generation works anyway — they are probes, not requirements. Allowing either
 would be an unforced widening.
 
-## R22 — the prefix rule: **it does NOT hold as written; the fallback is NOT needed either**
+## The prefix rule: **it does NOT hold as written; the fallback is NOT needed either**
 
-R22's primary job was to validate `(iokit-registry-entry-class-prefix "AGXAcceleratorG")`.
+The prefix rule's primary job was to validate `(iokit-registry-entry-class-prefix "AGXAcceleratorG")`.
 Measured, on the real rig:
 
 | candidate | result |
@@ -101,13 +101,13 @@ Measured, on the real rig:
 the **user client being opened**, not the class of the accelerator IOService
 behind it. On this rig the service is `AGXAcceleratorG13X` but the user client is
 `AGXDeviceUserClient`; `"AGXAcceleratorG"` therefore matches nothing MLX opens.
-R22's string was derived from the *service* name and is simply the wrong axis.
+The rule's string was derived from the *service* name and is simply the wrong axis.
 
-**What this means for M8.2-d1, and it is good news:**
+**What this means for the sandbox encoding, and it is good news:**
 
-1. **The prefix rule's SHAPE is vindicated — its STRING is not.** R22's real
+1. **The prefix rule's SHAPE is vindicated — its STRING is not.** The rule's real
    goal was "no per-chip-family table". That goal is *met*, and more strongly
-   than R22 hoped: `AGXDeviceUserClient` and `IOSurfaceRootUserClient` are
+   than the rule hoped: `AGXDeviceUserClient` and `IOSurfaceRootUserClient` are
    **family-independent class names** — they carry no `G13X`/`G14`/`G16` suffix
    at all. Two **exact** class names cover every family by construction.
 2. **The per-family fallback table is not merely unnecessary — it is
@@ -117,20 +117,20 @@ R22's string was derived from the *service* name and is simply the wrong axis.
 3. **Prefer exact classes over a prefix.** `(iokit-registry-entry-class-prefix "AGX")`
    also passes but admits every future `AGX*` user client sight-unseen. Two exact
    names are tighter and cost nothing, since neither varies by family.
-4. **Res. 14's fail-closed control is unaffected and remains THE gate.** R22
+4. **The fail-closed control is unaffected and remains THE gate.** The prefix rule
    already says the SBPL rule is "a static ceiling, not a family approximation";
    this result makes that literally true — the rule contains no family
    information whatsoever. `metal.go`'s Go-side data and the
    `sandbox_gpu_supported` advertisement stay the sole family gate, keyed (per
-   R22's prefix-rule branch) on the **functional probe**.
+   the prefix-rule branch) on the **functional probe**.
 
 **FLAGGED — the one honest scope caveat.** Only **M1-family hardware (G13X /
 `applegpu_g13d`)** was available. The claim "these two class names are
 family-independent" rests on their *form* (no family suffix) plus Apple's own
-practice, not on an M3/M4 measurement. M8.3's `sandbox_gpu_supported` functional
+practice, not on an M3/M4 measurement. the follow-on's `sandbox_gpu_supported` functional
 probe is what makes this safe: on a family where the two names are wrong, the
 probe fails and the node never advertises `mlx.k3sm.io/gpu`. That is the
-fail-closed path Res. 14 requires, and it is why this residual is acceptable
+fail-closed path the spike requires, and it is why this residual is acceptable
 rather than blocking.
 
 ## Ablation — every candidate rule that is NOT load-bearing
@@ -145,12 +145,12 @@ Each was added to the passing minimal set and its necessity tested by removal:
 | shader-cache write scope | **NO** | see below |
 
 Three of the four research hints were **over-scope on macOS 26.5.2**. This is
-exactly the widening Res. 11 and the M8.0 guardrails require be flagged rather
+exactly the widening the spike guardrails require be flagged rather
 than silently adopted — so they are flagged, and dropped.
 
-## Shader cache — Res. 11 resolves the GOOD way: **no write allow, no cross-pod channel**
+## Shader cache — resolves the GOOD way: **no write allow, no cross-pod channel**
 
-Res. 11 required S1 to show either that the shader cache is steerable per-pod or
+The spike required S1 to show either that the shader cache is steerable per-pod or
 that the allow is an enumerated narrow subpath, **and** that `limitations.md`
 names the cross-pod shared-cache channel it creates. Measured: **neither branch
 is needed, because no write allow is needed at all.**
@@ -169,15 +169,15 @@ A before/after `stat` + file-count over `com.apple.metalfe` across a sandboxed J
 run **and** an unsandboxed control showed **zero change in either case**: MLX's
 `metal_kernel` path does not write an on-disk shader cache at all.
 
-**Consequence for M8.2-d1 and `limitations.md`:** there is **no cross-pod
+**Consequence for the sandbox encoding and `limitations.md`:** there is **no cross-pod
 shared-cache channel to disclose**, because the shared cache is unreachable from
 a confined pod. `file-write*` outside the pod data volume stays absent — the
 profile's core invariant is intact, undiluted. This is strictly better than
-either branch Res. 11 anticipated, and M8.2-d1 should encode **no write rule**.
+either branch the spike anticipated, and the sandbox encoding should encode **no write rule**.
 
 **FLAGGED as a re-check, not a widening:** should a future MLX/engine version
 (or the S5 winner) begin using an on-disk `MTLBinaryArchive`, this conclusion
-changes. The M8.6 gate should keep a `WRITE_DENIED` assertion so the regression
+changes. The serving gate should keep a `WRITE_DENIED` assertion so the regression
 is caught rather than silently papered over with a write allow.
 
 ## Criterion 2 — HF weight download through the production datapath: **SPLIT**
@@ -185,9 +185,9 @@ is caught rather than silently papered over with a write allow.
 ### (a) SBPL half — **PASS**
 
 The 289.6 MB model was downloaded end-to-end (DNS, TLS, HTTP) from a pod-shaped
-process under the R21 `allow_internet_egress` stanza — emitted **byte-identical**
+process under the `allow_internet_egress` stanza — emitted **byte-identical**
 to `sbpl.go`'s `AllowNetwork` stanza (`sbpl.go:382-411`), comment lines included,
-which is the artifact R21's re-scoped `Validate` check will compare against:
+which is the artifact the re-scoped `Validate` check will compare against:
 
 ```
   egress => DOWNLOAD_OK 7.3s 289.6MB
@@ -199,7 +199,7 @@ which is the artifact R21's re-scoped `Validate` check will compare against:
 All residual denials are non-fatal — `configd` and the `PF_SYSTEM` route socket
 are optional network-configuration probes, and Python's TLS uses the system trust
 store, not `openssl.cnf`. **No additional network rule is required beyond the
-existing stanza**, which confirms R21's "same unfiltered-but-compilable stanza as
+existing stanza**, which confirms the "same unfiltered-but-compilable stanza as
 `allow_network`" is sufficient for the MLX weight-pull path.
 
 ### (b) Production-datapath half — **ATTEMPTED-BLOCKED (structural)**
@@ -213,7 +213,7 @@ Not run. The exact cause, from `k3sm/cmd/k3sm/dev.go:47-49`:
 ```
 
 The DNS shim → Service-proxy dialer → egress chain criterion 2 names **exists
-only in the `--datapath` tier**, and that tier **requires euid 0**. The M8.0
+only in the `--datapath` tier**, and that tier **requires euid 0**. The M8 spike
 ledger guardrails and this dispatch both forbid root/sudo on the lab. So the
 criterion is not "we ran out of time" — it is unreachable from a rootless
 session by construction. Standing it up needs a *privileged* lab slice.
@@ -221,8 +221,8 @@ session by construction. Standing it up needs a *privileged* lab slice.
 **Owed slice.** Run the HF download from inside a real pod on a
 `k3sm dev up --datapath` cluster (euid 0) and confirm it resolves through the
 DNS shim and dials through the Service proxy. This is the machine check on
-the M8 plan's "darwin-net has no planned work" claim, and it is **still owed** —
-recommend filing it as an M8.6-gate row or a `human_gate: true` backlog item,
+the earlier "darwin-net has no planned work" claim, and it is **still owed** —
+recommend tracking it as a serving-gate row or a follow-up item that needs human sign-off,
 since it needs root.
 
 **What criterion 2(a) does and does not license.** It proves the *Seatbelt* layer
@@ -241,7 +241,7 @@ probe whose failure MLX and CPython tolerate; none was widened.
 
 ## What W4's builder must do differently
 
-1. **Encode the two exact user-client class names.** Not R22's
+1. **Encode the two exact user-client class names.** Not the original
    `"AGXAcceleratorG"` prefix — it does not match. Not a per-family table — it
    cannot be expressed on this filter axis.
 2. **Emit no `mach-lookup`, no `iokit-get-properties`, no CVMS read, no
@@ -252,9 +252,9 @@ probe whose failure MLX and CPython tolerate; none was widened.
    functional probe as the only family gate.
 4. **The pod's cwd must be inside its data volume.** A pod whose cwd is a denied
    path dies in `import rich` on `os.getcwd()` → `PermissionError`, long before
-   any GPU rule matters. Cost one debugging cycle here; it will cost M8.4 one too
+   any GPU rule matters. Cost one debugging cycle here; it will cost the image build one too
    if `mlx-serve`'s entrypoint does not chdir.
-5. **The M8.0 ledger row names the wrong SoC** — the rig is a higher-tier
+5. **The M8 spike ledger row names the wrong SoC** — the lab host is a higher-tier
    M1-family part with 64 GiB unified, not the M1 Max the row records. The GPU
-   row in the rig table above is the operative fact for the allow-set; correct
+   row in the lab host table above is the operative fact for the allow-set; correct
    the ledger row to the SoC family.

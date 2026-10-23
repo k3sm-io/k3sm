@@ -20,7 +20,7 @@ lab host (arm64, macOS 26.6.x).
 | pinned | `runtimed/pkg/guestartifacts` `ActiveGuestKernel = "v6.18.48-9c05f8f3b26c"`; digests minted from the RE-DOWNLOADED published assets |
 
 The 77.8 MB size is the bundle-vs-ensure decision input: with the ~132 MB installer
-tarball, bundling the kernel would grow it ~60%; the install-time ensure (B108)
+tarball, bundling the kernel would grow it ~60%; the install-time ensure
 ships instead, and an air-gapped install pre-seeds the artifact dir.
 
 ## PGP first mint (dual anchor)
@@ -63,7 +63,7 @@ phase 0 requires a gzipped vmlinuz plus its matching Ubuntu linux-modules .deb
 built in, which that pairing cannot express. Follow-up: a small s3-run.sh
 adaptation (skip module extraction, accept an uncompressed kernel) re-runs the
 probe as-is. OPERATOR FLAG per the plan: a measured YES reopens the fsGroup
-path (B112's precondition); nothing in this build acts on it.
+path (the vm-storage work's precondition); nothing in this build acts on it.
 
 ## Live verification on this rig (same day)
 

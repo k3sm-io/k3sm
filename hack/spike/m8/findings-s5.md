@@ -1,24 +1,24 @@
-# S5 — serving-engine bake-off (M8.0-d5) — **PASS: the working hypothesis is RATIFIED, with a binding configuration amendment**
+# S5 — serving-engine bake-off — **PASS: the working hypothesis is RATIFIED, with a binding configuration amendment**
 
-> **M8.4 ENGINE DECISION: `vllm-mlx==0.4.1`, served with `--continuous-batching`.**
+> **ENGINE DECISION: `vllm-mlx==0.4.1`, served with `--continuous-batching`.**
 >
-> The M8 plan's working hypothesis (vllm-mlx) survives — but **only with that
+> The working hypothesis (vllm-mlx) survives — but **only with that
 > flag**, which is **not** the default. At its defaults vllm-mlx serves exactly
 > one request at a time and returns **HTTP 503 to every other concurrent
 > client**: 1 of 4 and 1 of 8 requests succeeded. With the flag it wins every
 > throughput axis outright (**775 tok/s aggregate at N=8**, 1.7× the runner-up)
 > and its single-stream rate goes *up*, not down. `--continuous-batching` is
-> therefore a **binding part of the M8.4 image contract**, not a tuning knob.
+> therefore a **binding part of the mlx-serve image contract**, not a tuning knob.
 >
-> **oMLX is ELIMINATED on packageability, not on merit.** M8.4-d1 requires
+> **oMLX is ELIMINATED on packageability, not on merit.** the image build requires
 > `uv pip install --require-hashes` against a checked-in lockfile; oMLX's
 > dependency closure contains **four `git+` direct-URL requirements** that
 > cannot carry a hash, and the install fails in hash-enforcing mode. It is also
 > not published on PyPI at all.
 >
 > **S3's open process-model question is CLOSED: all three engines are
-> single-process.** Res. 18's DEFAULT branch holds — pin the winner
-> single-process at M8.4 — and **the M8.2 pgid-enumeration deliverable is NOT
+> single-process.** The single-process DEFAULT branch holds — pin the winner
+> single-process at the image build — and **the pgid-enumeration deliverable is NOT
 > required**.
 >
 > The stated minimum bar is cleared by more than one candidate, so the "S5
@@ -38,10 +38,10 @@ do not share and process trees cannot be confused.
 | **vllm-mlx** (the working hypothesis) | `vllm-mlx==0.4.1` | PyPI |
 | **oMLX** | `github.com/jundot/omlx` @ `e008a66b4703bc77404dab30f8f898a117d49dfe` (self-versioned 0.6.4) | **not on PyPI** — `pip install` from a clone, a brew tap, or a `.dmg` |
 
-A note on identifying oMLX: the plan names it only as "oMLX (two-tier KV
+A note on identifying oMLX: the spike names it only as "oMLX (two-tier KV
 cache)". There is no `omlx` distribution on PyPI (404). The project measured is
 `jundot/omlx`, whose README describes exactly the two-tier hot-RAM/cold-SSD KV
-cache the plan's parenthetical names. That identification is recorded here so a
+cache the spike's parenthetical names. That identification is recorded here so a
 later reader can check it rather than inherit it.
 
 ## The scoreboard
@@ -68,7 +68,7 @@ identical requests from N threads simultaneously and report **every** outcome.
 
 ## 1 · Packageability — the axis that decides one candidate outright
 
-M8.4-d1's requirement is not negotiable: *"`uv pip install --require-hashes`
+The image build's requirement is not negotiable: *"`uv pip install --require-hashes`
 against a checked-in, hash-pinned lockfile"*. So the first question asked of each
 engine was whether its closure can be **expressed** that way, before any
 performance number was allowed to matter.
@@ -98,7 +98,7 @@ simply be floated forward.
 
 Recorded for fairness, since this is elimination on a supply-chain rule rather
 than on capability: **oMLX is the second-fastest candidate**, beats vllm-mlx's
-*defaults* everywhere, has the richest `/health`, and is Apache-2.0. If M8.4's
+*defaults* everywhere, has the richest `/health`, and is Apache-2.0. If the image build's
 hash-pinning requirement were ever relaxed — it should not be — oMLX would be a
 live candidate again, and the commit above is where to restart.
 
@@ -163,8 +163,8 @@ For comparison, the other two batch correctly at their defaults but scale less
 well: mlx-lm 8/8 at 460.8 tok/s (2.5× its single stream — it has
 `--decode-concurrency`), oMLX 8/8 at 471.8 tok/s (2.0×). Neither ever 503s.
 
-**BINDING for M8.4-d1: `--continuous-batching` is part of the image's argv, not
-an operator tuning knob**, and the M8.6 gate should assert N-concurrent success —
+**BINDING for the image build: `--continuous-batching` is part of the image's argv, not
+an operator tuning knob**, and the serving gate should assert N-concurrent success —
 an S4-style single-request smoke test passes against the broken configuration.
 
 ## 3 · `/health` — three surfaces, and only two are usable as a readiness probe
@@ -180,7 +180,7 @@ answers `{"detail":"Metrics endpoint is disabled"}` — it **has** a Prometheus
 endpoint (`prometheus-client` is a base dependency) behind configuration, which
 the other two do not.
 
-**Consequence for M8.5's readiness probe.** mlx-lm's `/health` reports `ok`
+**Consequence for the readiness probe.** mlx-lm's `/health` reports `ok`
 before any weights are loaded — it serves the model list from the HF cache and
 loads lazily on first request. A readiness probe pointed at it marks the pod
 Ready while the first real request still pays the full model load. vllm-mlx's
@@ -218,7 +218,7 @@ Two of these matter beyond cosmetics:
   model, because its HF-cache discovery is on by default. vllm-mlx advertises
   exactly the one model named on argv. For an `MLXModel` CRD whose contract is
   "this resource serves this model", a `/v1/models` that varies with the
-  contents of a mounted PVC is a fidelity problem in M8.5's render.
+  contents of a mounted PVC is a fidelity problem in the pod render.
 
 ## 5 · Process model — S3(5)'s open question, CLOSED
 
@@ -233,10 +233,10 @@ Two of these matter beyond cosmetics:
 and threads share the task's `ri_phys_footprint` — so the sampler's
 leader-PID-only walk (`pod.go` `containerPIDs`) is **exact** for any of them.
 
-- Res. 18's **default** branch is the one that fires: **pin the winner
-  single-process at M8.4**. It is already single-process, so "pinning" means
+- The single-process **default** branch is the one that fires: **pin the winner
+  single-process at the image build**. It is already single-process, so "pinning" means
   *asserting* it, not changing it.
-- **The M8.2 `proc_listpids(PROC_PGRP_ONLY,…)` pgid-enumeration deliverable is
+- **The the sandbox work `proc_listpids(PROC_PGRP_ONLY,…)` pgid-enumeration deliverable is
   NOT required for M8.** S3 proved the mechanism works and pre-authorized it; S5
   establishes it is not needed. It should be recorded as available-but-unbuilt,
   not silently dropped — S3's 3.9× under-count is real for any future forking
@@ -245,9 +245,9 @@ leader-PID-only walk (`pod.go` `containerPIDs`) is **exact** for any of them.
 **FLAGGED — the scope of that verdict.** It holds for the **single-model serving
 configuration measured here**. Every candidate has a multi-model mode
 (vllm-mlx `--models-config`, oMLX's engine pool and `cluster` subcommand) that
-was not exercised. If M8.5 ever renders a multi-model pod, the process model must
+was not exercised. If the pod render ever renders a multi-model pod, the process model must
 be re-measured before the leader-PID-only assumption is carried over.
-The M8.6 gate should assert a **single-process** pod so a future engine bump that
+The serving gate should assert a **single-process** pod so a future engine bump that
 starts forking fails loudly instead of silently under-accounting memory.
 
 ## 6 · Footprint — the one axis the winner loses, and what it costs downstream
@@ -283,7 +283,7 @@ still comfortably under 2 GB — but they do change two engineering conclusions:
    ~38 s `file(1)` walk on every image arrival is not acceptable; reading the
    Mach-O magic in Go is now required rather than merely tidy.
 2. **The per-pod materialize budget roughly triples** (1.2 s → ~4.7 s clone).
-   Still small against a 3.2 s first token, but M8.5's probe timings should be
+   Still small against a 3.2 s first token, but the readiness probe timings should be
    sized against the composed number, not S4's mlx-lm-only one.
 
 One more margin worth naming: `pkg/oci`'s build-context budget
@@ -313,7 +313,7 @@ alone.
 **`vllm-mlx==0.4.1` with `--continuous-batching`.** In order of how the
 candidates fell out:
 
-1. **oMLX fails a hard M8.4 requirement** — no hash-pinnable lockfile, no PyPI
+1. **oMLX fails a hard image-build requirement** — no hash-pinnable lockfile, no PyPI
    distribution. Eliminated regardless of its (good) numbers.
 2. **Between the two survivors, vllm-mlx wins throughput at every concurrency**
    (279 vs 185 single-stream; 775 vs 461 at N=8), has the only `/health` that
@@ -324,7 +324,7 @@ candidates fell out:
    not a formality: it batches correctly, it is MIT, and it is already the
    dependency S1–S4 measured.
 
-### The pinned wheel set (M8.4-d1 input)
+### The pinned wheel set (image-build input)
 
 ```
 vllm-mlx==0.4.1
@@ -337,7 +337,7 @@ generating it:
 - **compile it natively on macOS 14+ arm64** — `--python-platform macos`
   defaults to macOS 13.0, for which no `mlx` wheel exists;
 - the lockfile is **not** checked in by this spike. It is regenerated by
-  `s5.sh` at `<prefix>/engines/vllmmlx/req-hashed.txt`; M8.4-d1 owns the
+  `s5.sh` at `<prefix>/engines/vllmmlx/req-hashed.txt`; the image build owns the
   checked-in copy, so that it is reviewed as product supply chain rather than
   inherited from a spike's scratch directory.
 
@@ -346,12 +346,12 @@ generating it:
 1. **Ship `--continuous-batching` in the image's argv.** Without it the pod
    serves one request at a time and 503s the rest — with a green `/health` and a
    green readiness probe, so nothing else catches it.
-2. **Make the M8.6 gate concurrent.** Assert N≥4 simultaneous completions all
+2. **Make the serving gate concurrent.** Assert N≥4 simultaneous completions all
    return 200. A single-request smoke test passes against the broken config.
-3. **Point M8.5's readiness probe at `/health` and require `model_loaded`** —
+3. **Point the readiness probe at `/health` and require `model_loaded`** —
    not the mere 200, and not oMLX-style `loaded_count`.
-4. **Pin the pod single-process and assert it**, per Res. 18's default branch.
-   **Do not build the M8.2 pgid-enumeration deliverable for M8** — record it as
+4. **Pin the pod single-process and assert it**, per the single-process default branch.
+   **Do not build the pgid-enumeration deliverable for M8** — record it as
    available-but-unbuilt, with S3's 3.9× under-count as the reason it must come
    back if any future engine forks.
 5. **Re-check the image against the 2 GiB `MaxContextBytes` build-context

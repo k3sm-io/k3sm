@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-// B168 — every repo's hack/ci.sh guards its Go stages on `go list ./...`. The
+// Every repo's hack/ci.sh guards its Go stages on `go list ./...`. The
 // original guard tested only whether the OUTPUT was empty:
 //
 //	if [ -n "$(CGO_ENABLED=$CGO go list ./... 2>/dev/null)" ]; then ... fi
@@ -34,7 +34,7 @@ import (
 // packages yet — from `go list` FAILING (broken go.mod, unresolvable dependency,
 // bad GOWORK, absent toolchain). In the failure case the 2>/dev/null swallowed
 // the reason, vet/build/test were skipped, and the script still printed
-// "OK: <repo> ci green": a fail-open gate, the B165 class.
+// "OK: <repo> ci green": a fail-open gate, the fail-open class.
 //
 // The fix keys on go list's EXIT STATUS instead, which splits three outcomes the
 // old guard collapsed into two. All three are pinned below, because the obvious
@@ -184,7 +184,7 @@ func licensed(t *testing.T, realScript, body string) string {
 	return strings.TrimRight(string(hdr), "\n") + "\n\n" + body
 }
 
-// TestCIGuardFailsWhenGoListErrors is the B168 regression: a hack/ci.sh whose
+// TestCIGuardFailsWhenGoListErrors is the regression: a hack/ci.sh whose
 // `go list ./...` cannot enumerate the module must exit NON-ZERO and say why. It
 // must NOT take the no-Go-packages branch — doing so is what let the old guard
 // report green over a Go gate that never ran.
@@ -213,7 +213,7 @@ func TestCIGuardFailsWhenGoListErrors(t *testing.T) {
 		{
 			// The module parses; `go list` then fails LOADING PACKAGES. `go mod
 			// tidy` is untroubled by it, so this is the fixture that pins the
-			// headline of B168: under the old guard all four scripts printed
+			// headline of that defect: under the old guard all four scripts printed
 			// "OK: <repo> ci green" and exited ZERO, having run no Go stage at all.
 			name:  "conflicting package names in one directory",
 			goMod: goModOK,

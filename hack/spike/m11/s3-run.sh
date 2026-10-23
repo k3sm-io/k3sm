@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M11.0-d3 / S3 — the virtiofs slice, RUN. One hard gate, four recordings.
+# S3 — the virtiofs slice, RUN. One hard gate, four recordings.
 #
 # s3.sh is the RUNBOOK: it owns every criterion's statement and the branch
 # consequence each observed answer selects. THIS script RUNS the no-root subset
@@ -18,7 +18,7 @@
 # both facts are recorded from the artifacts, not assumed), and the guest's Go
 # PID 1 loads it with finit_module(2) before mounting the tag.
 #
-# It stays a THROWAWAY. The pinned product kernel is B111's human-gated job;
+# It stays a THROWAWAY. The pinned product kernel is the pinned-kernel work's human-gated job;
 # making a design-invalidating spike wait on a human-gated producer would invert
 # the dependency. What this kernel buys is a floor: >=6.12 with a loadable
 # virtiofs, which is the minimum on which S3(2) is even askable.
@@ -181,7 +181,7 @@ if ! grep -qiE '^\*\*Verdict:\*\* *_?\(?GO' "$HERE/findings-s1.md" 2>/dev/null; 
 
   S3 extends S1's harness and is meaningless if the boot path is invalid. Run
   s1.sh, record its verdict, and re-run this. If S1 recorded NO-GO on criterion
-  1 or 2, M11 halts under the M11 plan's R19(b) and S3 is moot.
+  1 or 2, M11 halts and S3 is moot.
 EOF
   exit 1
 fi
@@ -1019,7 +1019,7 @@ for f in out/s3-guest.log; do
 done
 
 # Leave no VM behind. Scoped to THIS prefix's binary so a co-resident harness on
-# the rig is untouched.
+# the lab host is untouched.
 pkill -f "$PREFIX/s3/tools/vzs3" 2>/dev/null || true
 echo "S3_CLEANUP=done"
 LABEOF

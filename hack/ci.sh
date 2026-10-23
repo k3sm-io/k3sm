@@ -64,7 +64,7 @@ fi
 # for. A NON-ZERO exit (broken go.mod, unresolvable dependency, bad GOWORK, absent
 # toolchain) is a HARD ERROR: the old `[ -n "$(go list ./... 2>/dev/null)" ]` could
 # not tell the two apart, so it silently skipped vet/build/test and still reported
-# green — a gate that cannot even enumerate its packages must go RED (B168).
+# green — a gate that cannot even enumerate its packages must go RED.
 golist_err="$(mktemp)"
 trap 'rm -f "$golist_err"' EXIT
 if ! go_pkgs="$(CGO_ENABLED=$CGO go list ./... 2>"$golist_err")"; then
@@ -85,7 +85,7 @@ if [ -n "$go_pkgs" ]; then
 
 	# The integration tier is NOT run here (it needs darwin + a real socket), but
 	# nothing else in this repo COMPILES the `integration` build tag, so the
-	# B116 privilege-premise canary would rot invisibly. Vet it.
+	# privilege-premise canary would rot invisibly. Vet it.
 	# Every build tag this repo defines gets vetted, not just the ones a stage runs.
 	# A tagged file that no stage COMPILES can break on main invisibly: a helper added
 	# under no tag collided with one under `kinecompat`, and the compat gate could not

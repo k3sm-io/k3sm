@@ -23,7 +23,7 @@
 #   LIVE TIER (needs $KUBECONFIG on a vm-capable node) — the engine actually
 #   serving. It is PRINTED AS OWED here, not run: it needs a booted vm guest, a
 #   real buildkitd worker and a real RUN build, which is the orchestrator's
-#   single-node lab step, not a CI leg (CI is disabled by operator directive).
+#   single-node lab step, not a CI leg (CI is disabled).
 #
 # The GOARCH=arm64 pin is a CORRECTNESS requirement: a Mac's Go toolchain may be
 # x86_64-under-Rosetta, and an unpinned build produces an x86_64 binary this

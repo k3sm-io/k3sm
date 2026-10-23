@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M11.0-d5 / S5 — the AUTOMATABLE half of guest networking.
+# S5 — the AUTOMATABLE half of guest networking.
 #
 # s5.sh is the RUNBOOK: it states every criterion and, for each, the branch
 # consequence the observed answer selects. THIS script RUNS the subset that
@@ -13,7 +13,7 @@
 #   2   host -> guest dial at the guest's vmnet address
 #   4   guest <-> guest matrix, TWO guests on one NAT segment (a SECURITY fact)
 #   5   DHCP lease stability across restart under a deterministic MAC, N=3
-#   6   THE SOURCE ADDRESS THE HOST OBSERVES  <-- the deciding fact for B113
+#   6   THE SOURCE ADDRESS THE HOST OBSERVES  <-- the deciding fact for per-pod attribution
 #   7   guest link MTU
 #
 # What does NOT run here, and why — recorded, never faked:
@@ -90,7 +90,7 @@ if ! grep -qiE '^\*\*Verdict:\*\* *_?\(?GO' "$HERE/findings-s1.md" 2>/dev/null; 
 
   S5 extends S1's harness and is meaningless if the boot path is invalid. Run
   s1.sh, record its verdict, and re-run this. If S1 recorded NO-GO on criterion
-  1 or 2, M11 halts under the M11 plan's R19(b) and S5 is moot.
+  1 or 2, M11 halts and S5 is moot.
 EOF
   exit 1
 fi
@@ -700,7 +700,7 @@ export S5_SHARE_DIR="$S5DIR/share" S5_WAIT=70
 
 # A locally-administered MAC derived from a fixed string, so the DHCP server
 # sees the SAME client across restarts. Criterion 5 asks whether that is enough
-# to keep the lease: B113b's address->pod registry is only buildable if it is.
+# to keep the lease: per-pod attributionb's address->pod registry is only buildable if it is.
 MAC_A=$(printf '5a:c3:%s' "$(echo -n k3sm-s5-guest-a | shasum -a 256 | cut -c1-8 | sed 's/../&:/g;s/:$//')")
 MAC_CTL=$(printf '5a:c3:%s' "$(echo -n k3sm-s5-guest-ctl | shasum -a 256 | cut -c1-8 | sed 's/../&:/g;s/:$//')")
 echo "S5_C5_MAC_A=$MAC_A"
@@ -825,7 +825,7 @@ for f in out/s5-lease1.log out/s5-lease2.log out/s5-lease3.log out/s5-lease-ctl.
 done
 
 # Leave no VM behind. Scoped to THIS prefix's binary so a co-resident harness
-# on the rig is untouched.
+# on the lab host is untouched.
 pkill -f "$PREFIX/s5/tools/vznet" 2>/dev/null || true
 echo "S5_CLEANUP=done"
 LABEOF

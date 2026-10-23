@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k3sm B96 acceptance: HelmChart objects become helm Jobs, against an INSTALLED,
+# k3sm HelmChart acceptance: HelmChart objects become helm Jobs, against an INSTALLED,
 # RUNNING server (`sudo k3sm install` on this Mac, a live cluster at
 # $KUBECONFIG). This gate boots nothing itself.
 #
@@ -45,13 +45,13 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 finish() {
 	echo "----------------------------------------"
-	echo "B96: $PASS passed, $FAIL failed"
+	echo "HelmChart: $PASS passed, $FAIL failed"
 	[ "$FAIL" -eq 0 ] || exit 1
-	echo "=========== B96 GREEN ==========="
+	echo "=========== HelmChart GREEN ==========="
 }
 
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "B96 gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
+	echo "HelmChart gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
 	exit 3
 fi
 if [ -z "${KUBECONFIG:-}" ]; then
@@ -98,7 +98,7 @@ cleanup() {
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
-echo "==> B96 acceptance (run $RUN)"
+echo "==> HelmChart acceptance (run $RUN)"
 
 # wait_until <budget seconds> <command...>: poll until the command succeeds.
 wait_until() {

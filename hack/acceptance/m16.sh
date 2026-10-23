@@ -9,8 +9,8 @@
 # tier integration, requires dev-mac + apple-gpu + vz + network, manual: false,
 # skeleton: true). There is deliberately no lab row beside it: the whole ladder
 # runs on ONE Mac that hosts its own single-node k3sm server, so a GPU dev-mac with
-# Virtualization covers the proof. The M16 plan's single-slot branch is the only
-# branch that would add an M16-lab row, and M16.5 writes it in the same change that
+# Virtualization covers the proof. The single-slot branch is the only
+# branch that would add an M16-lab row, and the gate author writes it in the same change that
 # replaces this body.
 #
 # The REAL M16 gate is a COMPOSITE — a ten-rung ladder over a running cluster, and
@@ -24,7 +24,7 @@
 #                        pinned grant (no wildcard verb/resource, no stray secrets).
 #   m16.2   conversion   a v1alpha1 read of a v1beta1 object answers through the
 #                        conversion webhook's ClusterIP. Its proof already exists,
-#                        as the two e2e tests the plan's R14 names — they carry no
+#                        as the two e2e tests named below — they carry no
 #                        TestM16 prefix by design, so this rung selects them with
 #                        the -run pattern verbatim:
 #                          go test -tags e2e -run '^Test(Admission|Conversion)WebhookDeliveryThroughProxy$' -timeout 20m ./e2e/
@@ -44,7 +44,7 @@
 #                        test (continuous batching, pinned KV).
 #   m16.8   routing      two worker replicas on this node, a repeated prefix steered
 #                        to the WARM pod, asserted from router metrics AND a measured
-#                        TTFT gap. Required; SKIP-class only under the plan's sidecar
+#                        TTFT gap. Required; SKIP-class only under the sidecar
 #                        substitution, where round-robin is the documented contract.
 #   m16.9   deletion     every fleet object gone, zero Terminating, the M8 PVC
 #                        untouched.
@@ -57,5 +57,5 @@
 # proven". Pinned always-RED by TestNonManualSkeletonsAlwaysRed, which runs it under
 # BOTH K3SM_LAB unset and K3SM_LAB=1.
 set -euo pipefail
-echo "M16 gate: NOT YET IMPLEMENTED — the real M16 composite gate (the ten-rung ladder m16.0-m16.10: mirror-digest preflight, chart install, live RBAC assertion, CRD conversion, worker guardrails, discovery, /v1/models, a budgeted completion with per-hop timing, the conformance kit, warm-prefix routing across two workers, deletion, and the kickstart re-run) lands with M16.5. This is a skeleton and MUST be red."
+echo "M16 gate: NOT YET IMPLEMENTED — the real M16 composite gate (the ten-rung ladder m16.0-m16.10: mirror-digest preflight, chart install, live RBAC assertion, CRD conversion, worker guardrails, discovery, /v1/models, a budgeted completion with per-hop timing, the conformance kit, warm-prefix routing across two workers, deletion, and the kickstart re-run) is not written yet. This is a skeleton and MUST be red."
 exit 1

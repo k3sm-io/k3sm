@@ -1,4 +1,4 @@
-# S3 findings — link-local after member removal (M17.0)
+# S3 findings — link-local after member removal
 
 > **Status: NOT YET RUN.** Write-back target for `hack/spike/m17/s3.sh`. The zone value
 > recorded here is the golden `TestPairTrustDecision` fakes and the real-socket zone
@@ -21,7 +21,7 @@ login user on each Mac.
 
 ## Halt (binding, substitution pre-decided)
 
-Any criterion fails (`fe80` unusable on a removed member) → **R8: the beacon rides
+Any criterion fails (`fe80` unusable on a removed member) → **the beacon rides
 `bridge0` on the unjoined Mac only and the server keeps its ports removed.** Build
 amendment A1 already made the joiner side of that the design; this rung records
 whether the server side holds.

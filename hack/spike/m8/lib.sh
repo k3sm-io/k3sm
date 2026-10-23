@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Shared plumbing for the M8.0 spikes (s1.sh / s2.sh / s3.sh).
+# Shared plumbing for the M8 spikes (s1.sh / s2.sh / s3.sh).
 #
 # The spikes run on the LAB Mac, not on the workstation: they need a real Apple
 # GPU, and they install a Python/MLX toolchain that must not land on a dev
 # machine. Each s<N>.sh is therefore a DRIVER — it ships a lab-side payload over
-# ssh and runs it under the guardrails recorded in k3sm/docs/PHASES.md M8.0:
+# ssh and runs it under the guardrails recorded in k3sm/docs/PHASES.md M8 spike:
 #
 #   * every write confined to $PREFIX (default ~/k3sm-spike-m8) or /tmp scratch;
 #   * never /Library/Sandbox/Profiles, the TCC/Privacy DB, Gatekeeper/SIP state,

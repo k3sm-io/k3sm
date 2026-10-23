@@ -160,7 +160,7 @@ reset_dir() {
 _port_listeners() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | sort -u || true; }
 
 # _proc_is_ours attributes a pid to THIS acceptance rig before anything kills it.
-# Two witnesses, both structural: the executable path lies under one of the rig's
+# Two witnesses, both structural: the executable path lies under one of the lab host's
 # own directories ($BIN, $SERVER_WORKDIR/bin, $STAGE_DIR), or the argv names one of
 # them (`k3sm server --work-dir $SERVER_WORKDIR …` run via `go run` executes out of
 # a temp build dir, so the path witness cannot see it — and that process is exactly
@@ -180,7 +180,7 @@ _proc_is_ours() {
 }
 
 # reap_port <port> [fatal|warn] frees a port a PREVIOUS gate left listening.
-# It kills only pids _proc_is_ours attributes to the rig (TERM, then KILL after a
+# It kills only pids _proc_is_ours attributes to the lab host (TERM, then KILL after a
 # grace period). A listener it cannot attribute is never killed; what happens then
 # is the mode:
 #   fatal (default) — return non-zero. For $KINE_PORT/$APISERVER_PORT a foreign
@@ -283,7 +283,7 @@ wait_tcp() { local port=$1 n=0; until nc -z 127.0.0.1 "$port" 2>/dev/null; do sl
 # cluster_down stops the node and every control-plane process, and hands the host
 # back the global state the run took from it: the ports, and the lo0 aliases.
 #
-# It is the EXIT-side mirror of cluster_reset (B150), and it exists because
+# It is the EXIT-side mirror of cluster_reset, and it exists because
 # reaping only at BRING-UP leaves the LAST gate of a sequence uncleaned — nothing
 # follows it to sweep up after. Measured on an ALL-GREEN m0 -> m1 -> m3 -> m4 run
 # (2026-08-27, so this is not a failure path): the host was left with a root
@@ -300,7 +300,7 @@ wait_tcp() { local port=$1 n=0; until nc -z 127.0.0.1 "$port" 2>/dev/null; do sl
 #     leaked process IS that one: its control-plane children were already stopped
 #     in the log while it kept the kubelet listener open. Only a KILL escalation
 #     frees the port — which reap_port already implements (TERM, grace, KILL)
-#     behind the rig-attribution rule.
+#     behind the lab host-attribution rule.
 #   - The pkill patterns are anchored at $BIN/<name>, so they cannot match the
 #     `go run` temp binary (hostprocess posture) nor $STAGE_DIR/k3sm (runtimed
 #     posture, where $BIN has by then been repointed at $SERVER_WORKDIR/bin).
@@ -440,7 +440,7 @@ EOF
 # node_up builds and starts a k3sm Virtual Kubelet node, then waits for it Ready.
 #   node_up [node-name] [pod-root]
 # --runtime hostprocess is PINNED: the M0 gate's posture is deliberately rootless
-# (no netd helper, no root) and the binary's default flipped to runtimed in M10.1,
+# (no netd helper, no root) and the binary's default flipped to runtimed,
 # so relying on the default would refuse to start via the runtimed preflight.
 node_up() {
 	local node_name="${1:-k3sm-m0}" pod_root="${2:-$K3SM_WORKDIR/pods}"
@@ -469,7 +469,7 @@ node_up() {
 #     network = none (default) | direct | helper | auto
 #
 # The runtime is ALWAYS passed explicitly on the argv (an explicit pin): the
-# k3sm binary's own default flipped to runtimed in M10.1, but the gates that use
+# k3sm binary's own default flipped to runtimed, but the gates that use
 # this helper without root keep the deliberately rootless hostprocess posture.
 #
 # network=none is the NON-ROOT CI/dev bring-up: run the control plane + node
@@ -635,7 +635,7 @@ server_up() {
 # It exists because the multi-node claim had no unattended harness at all: every
 # join proof was a two-Mac K3SM_LAB session, so anything a joined worker derives
 # INDEPENDENTLY of its server — the guest-artifact verdict this was added for
-# (B108), the capability labels, the per-node datapath — had no way to be checked
+#, the capability labels, the per-node datapath — had no way to be checked
 # by a gate. One host cannot prove the mesh (there is no second machine to route
 # between), but it can prove per-node DERIVATION, which is a different property
 # and the one most likely to drift silently.
@@ -684,7 +684,7 @@ agent_up() {
 		return 1 ;;
 	esac
 
-	# NO --node-ip: since B338 the SERVER assigns this node's address and issues
+	# NO --node-ip: now the SERVER assigns this node's address and issues
 	# its certificates for that assignment, so a join asserting 127.0.0.1 is
 	# refused (it names an address the allocator did not give this node). The
 	# joined node therefore registers with its assigned mesh address, which under

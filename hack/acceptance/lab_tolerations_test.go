@@ -29,12 +29,12 @@ import (
 	"testing"
 )
 
-// B570 — lab harness pods tolerate the VK node taint k3sm.io/provider and nothing
+// Lab harness pods tolerate the VK node taint k3sm.io/provider and nothing
 // else, so a NoExecute taint another workload's controller put on a lab node
 // evicts them mid-leg. hack/lab/lib/tolerations.sh renders every lab pod's
 // tolerations: the provider entry plus one Exists toleration per key the operator
 // names in K3SM_LAB_TOLERATE_KEYS. The tests below run the real helper and the
-// real adopting scripts under /bin/bash (the macOS bash 3.2 the rig runs), never a
+// real adopting scripts under /bin/bash (the macOS bash 3.2 the lab host runs), never a
 // re-implementation.
 
 const (
@@ -101,7 +101,7 @@ func requireLabBash(t *testing.T) {
 	}
 }
 
-// TestLabHarnessTolerateKeys is the B570 gate. It pins the helper's output for
+// TestLabHarnessTolerateKeys is the toleration-keys gate. It pins the helper's output for
 // every shape of K3SM_LAB_TOLERATE_KEYS against golden files, its refusal of every
 // key that is not a Kubernetes qualified name (exit 2, nothing on stdout), and,
 // for each adopting lab script, that the pod manifests the script would apply

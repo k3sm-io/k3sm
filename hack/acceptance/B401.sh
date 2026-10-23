@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B401 acceptance gate — every bare-boot helper in hack/lib/clusterup.sh
+# k3sm container log dir acceptance gate — every bare-boot helper in hack/lib/clusterup.sh
 # gives its node a per-run container log dir.
 #
 # `k3sm server`, `agent` and `node` all validate --pod-logs-dir at boot, and its
@@ -49,7 +49,7 @@ esac
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B401 acceptance (bare-boot helpers pass a per-run --pod-logs-dir)"
+echo "==> k3sm container log dir acceptance (bare-boot helpers pass a per-run --pod-logs-dir)"
 
 # body <fn> prints the function's definition, from its header to the first
 # column-0 `}`, as "<in-body line no>\x1f<line>" (1 = the header). The unit
@@ -81,7 +81,7 @@ for fn in server_up node_up agent_up; do
 done
 ladder "$b0" "b401.0  clusterup.sh and the gate parse; server_up/node_up/agent_up present"
 if [ "$b0" != ok ]; then
-	echo "B401: $PASS passed, $FAIL failed" >&2
+	echo "container log dir: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -156,6 +156,6 @@ for spec in 'server_up|^[[:space:]]*cluster_reset( |$)' \
 done
 
 echo "----------------------------------------"
-echo "B401: $PASS passed, $FAIL failed"
+echo "container log dir: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B401 GREEN ================"
+echo "================ container log dir GREEN ================"

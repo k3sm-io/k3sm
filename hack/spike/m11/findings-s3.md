@@ -48,9 +48,9 @@ S3_SHARE_RW=yes
 ```
 
 This kernel stays a **throwaway**. The pinned product kernel is human-gated
-B111's job; what this one buys is the floor — ≥6.12 with a loadable virtiofs —
+the pinned-kernel work's job; what this one buys is the floor — ≥6.12 with a loadable virtiofs —
 on which S3(2) is even askable. It does not pre-empt S4's config work; if
-anything it supplies S4 with a second data point (see the M11.0-d4 note below).
+anything it supplies S4 with a second data point (see the S4 note below).
 
 ## Rig, kernel and guest
 
@@ -80,7 +80,7 @@ was taken under.
 
 | # | criterion | observed | consequence this selects |
 |---|---|---|---|
-| **2** | **HARD GATE** — does Apple's virtiofs advertise FUSE idmapped-mount support? | **NO.** `mount_setattr(MOUNT_ATTR_IDMAP)` on a detached clone of the virtiofs mount fails **`EINVAL` (errno 22)**, on kernel `6.14.0-37-generic`, while the tmpfs control succeeds and a `MOUNT_ATTR_NOSUID` on the *same* virtiofs tree also succeeds | `s3.sh` verbatim: **"NO ⇒ human-reviewed fsGroup re-plan. Do NOT adopt a chmod fallback here; it is banned as a dual path, and adopting one in a lab session is exactly the silent divergence the M11 plan's Resolution 1 forbids."** Its pre-decided consequence also fires: **"on NO, the CORE storage leg substitutes a root-in-guest image and PVC-PGDATA-with-fsGroup moves to the follow-on."** B112 does **not** unblock on this evidence |
+| **2** | **HARD GATE** — does Apple's virtiofs advertise FUSE idmapped-mount support? | **NO.** `mount_setattr(MOUNT_ATTR_IDMAP)` on a detached clone of the virtiofs mount fails **`EINVAL` (errno 22)**, on kernel `6.14.0-37-generic`, while the tmpfs control succeeds and a `MOUNT_ATTR_NOSUID` on the *same* virtiofs tree also succeeds | `s3.sh` verbatim: **"NO ⇒ human-reviewed fsGroup re-plan. Do NOT adopt a chmod fallback here; it is banned as a dual path, and adopting one in a lab session is exactly the silent divergence the plan forbids."** Its pre-decided consequence also fires: **"on NO, the CORE storage leg substitutes a root-in-guest image and PVC-PGDATA-with-fsGroup moves to the follow-on."** the vm-storage work does **not** unblock on this evidence |
 | **1-lite** | guest fsync on the RW share, N=50 | **all 50 succeeded**, `min 393 µs · median 422 µs · p95 450 µs · max 480 µs`; the tmpfs contrast in the same boot is `median 12 µs` — virtiofs fsync costs ≈**35×** a tmpfs fsync and the distribution is **tight** (p95/median = 1.07), i.e. single-mode | a durable per-file sync on a virtiofs volume costs sub-millisecond on this rig, and there is **no bimodal tail** that would suggest some syncs take an APFS `F_FULLFSYNC` path and others do not. It does **NOT** establish that any of them do — see the ceiling note below |
 | **1** | pgbench on a virtiofs-backed PGDATA vs the 0.25× native bar | **NOT RUN** — no database in the throwaway guest | **NEITHER branch fires.** The virtio-blk escape hatch is neither un-parked (R24c) nor deleted; it stays **parked**, exactly as before this sitting |
 | **4** | emptyDir-shaped IO on the RW share | seq write 64 MiB (1 MiB records, fsync at end): **1237.4 MiB/s**; seq read after a guest cache drop: **2765.9 MiB/s**; random 4 KiB write ×1024 + fsync: **31.0 MiB/s / 7935 IOPS**. Same passes on guest tmpfs: **9724.1 / 24444.6 MiB/s** and **2721.0 MiB/s / 696579 IOPS** | streaming IO over virtiofs is ≈**1/8** of guest tmpfs and small random writes are ≈**1/88** — the shape is *transport-bound per operation*, not bandwidth-bound. An emptyDir served from virtiofs is fine for streaming and poor for small-random. Read the caveats before quoting any of these |
@@ -159,7 +159,7 @@ server behaviour was observed on THIS macOS build only.** Apple documents no
 FUSE feature-negotiation contract for its virtiofs device, so a later macOS may
 advertise `FUSE_ALLOW_IDMAP` and flip this answer. The gate is answered for the
 decision that has to be made now; it is not a permanent property of the
-platform, and B112's merge-precondition should be re-measured against the
+platform, and the vm-storage work's merge-precondition should be re-measured against the
 shipping macOS floor before the fsGroup leg is declared either way.
 
 ## Criterion 1-lite — fsync on the RW share · verbatim
@@ -280,7 +280,7 @@ designed for.
 | S3(6) confined-vs-unconfined vmhost throughput | needs the vmhost confinement wiring. S1(5) answered coexistence, which is a different question |
 | anything requiring host root | out of bounds for the spike guardrails in `lib.sh`; the root-needing S5 legs have their own operator-run driver (`s5-root.sh`) and this file adds none |
 
-## Incidental finding — a second data point for S4 (M11.0-d4)
+## Incidental finding — a second data point for S4
 
 S4 must produce a kernel config with the virtiofs stack **built in**. This
 sitting is evidence for the *shape* of that requirement rather than for a
@@ -298,7 +298,7 @@ fails closed on such a kernel.
    rather than `6.8.0-138-generic`), because S3(2) requires ≥6.12 and S5's
    kernel cannot mount a share at all. Pinned by URL and sha256, re-verified on
    every run, and recorded above. This is a spike artifact, not a product pin;
-   B111 remains the pinned-kernel owner.
+   the pinned-kernel work remains the owner.
 2. **The virtiofs share is READ-WRITE**, where S5's was read-only. Every S3
    figure is a write figure, so a read-only share would have made criteria 1, 4
    and 5 unmeasurable. The share is a fresh directory under the lab prefix

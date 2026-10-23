@@ -6,7 +6,7 @@
 #
 # This is DISTINCT from hack/lab/m3.sh, which owns the CROSS-NODE criteria
 # (in-pod kubectl + cluster DNS from a pod on the JOINED worker) and runs only on a
-# two-Mac rig under K3SM_LAB=1. Splitting them gives the single-node-testable M3
+# two-Mac lab under K3SM_LAB=1. Splitting them gives the single-node-testable M3
 # assertions a home that actually executes in CI rather than skip-greening.
 #
 # Bring-up: a single-node `k3sm server` with the runtimed runtime + the DIRECT

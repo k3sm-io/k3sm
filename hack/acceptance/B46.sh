@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B46 acceptance gate: one runnable command for memory-pressure eviction
+# k3sm memory pressure acceptance gate: one runnable command for memory-pressure eviction
 # (the provider's eviction manager) and the pressure-kill mark (runtimed spawns
 # every pod process pcontrol-KILL, so macOS's out-of-swap kill picks a pod before
 # the control plane).
@@ -45,7 +45,7 @@ ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "
 # with cgo.
 GOENV=(env GOARCH=arm64 CGO_ENABLED=1)
 
-echo "==> k3sm B46 acceptance (memory-pressure eviction + pressure-kill mark)"
+echo "==> k3sm memory pressure acceptance (memory-pressure eviction + pressure-kill mark)"
 
 b0=ok
 bash -n "$SELF" || b0=no
@@ -53,7 +53,7 @@ bash -n "$SELF" || b0=no
 [ -d "$RUNTIMED_ROOT/pkg/supervisor" ] || b0=no
 ladder "$b0" "b46.0  gate + lab gate parse; sibling runtimed checkout present"
 if [ "$b0" != ok ]; then
-	echo "B46: $PASS passed, $FAIL failed" >&2
+	echo "memory pressure: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -85,7 +85,7 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B46 units: $PASS passed, $FAIL failed"
+echo "units: $PASS passed, $FAIL failed"
 if [ "$FAIL" -ne 0 ]; then
 	exit 1
 fi
@@ -93,7 +93,7 @@ if [ "$UNIT_ONLY" = yes ]; then
 	exit 0
 fi
 
-echo "==> B46 lab gate (hack/lab/B46.sh)"
+echo "==> memory pressure lab gate (hack/lab/B46.sh)"
 rc=0
 bash "$LAB" || rc=$?
 exit "$rc"

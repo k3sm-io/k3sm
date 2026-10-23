@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# k3sm B243 acceptance: the node resolver floor and the shadow shells, against
+# k3sm resolver floor acceptance: the node resolver floor and the shadow shells, against
 # an INSTALLED, RUNNING node (`sudo k3sm install` on this Mac, a live cluster at
 # $KUBECONFIG). This gate boots nothing itself.
 #
 # Background. dyld strips DYLD_INSERT_LIBRARIES from a restricted (platform,
 # CS_RESTRICT, hardened) binary, so a pod that starts through /bin/sh used to
-# lose the getaddrinfo + path-rebase shim for everything it ran. B243 answers in
+# lose the getaddrinfo + path-rebase shim for everything it ran. This gate answers in
 # layers: netd publishes one supplemental DNS entry (svc + the cluster domain
 # routed to the DNS VIP, no search domains) that mDNSResponder applies to every
 # process; install makes re-signed copies of bash/zsh/dash/env that runtimed
@@ -56,9 +56,9 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 finish() {
 	echo "----------------------------------------"
-	echo "B243: $PASS passed, $FAIL failed"
+	echo "resolver floor: $PASS passed, $FAIL failed"
 	[ "$FAIL" -eq 0 ] || exit 1
-	echo "=========== B243 GREEN ==========="
+	echo "=========== resolver floor GREEN ==========="
 }
 
 # supplemental_at_vip <domain> — scutil --dns lists a resolver for <domain>
@@ -72,7 +72,7 @@ supplemental_at_vip() {
 }
 
 if [ "${1:-}" = "--after-uninstall" ]; then
-	echo "==> B243 acceptance, after uninstall"
+	echo "==> resolver floor acceptance, after uninstall"
 	if ! scutil --dns | grep -q "nameserver\[[0-9]*\] : $DNS_VIP\$" \
 		&& printf 'show %s\n' "$STORE_KEY" | scutil | grep -q "No such key"; then
 		ladder ok "b243-6  scutil --dns clean after uninstall (no resolver at $DNS_VIP, $STORE_KEY gone)"
@@ -84,7 +84,7 @@ if [ "${1:-}" = "--after-uninstall" ]; then
 fi
 
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "B243 gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
+	echo "resolver floor gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
 	exit 3
 fi
 if [ -z "${KUBECONFIG:-}" ]; then
@@ -117,7 +117,7 @@ if ! kc get node "$NODE_NAME" >/dev/null 2>&1; then
 	echo "node $NODE_NAME is not in the cluster: this gate pins its pods to THIS Mac's node (set K3SM_NODE_NAME to override)" >&2
 	exit 1
 fi
-echo "==> B243 acceptance (node $NODE_NAME, DNS VIP $DNS_VIP, cluster domain $CLUSTER_DOMAIN)"
+echo "==> resolver floor acceptance (node $NODE_NAME, DNS VIP $DNS_VIP, cluster domain $CLUSTER_DOMAIN)"
 
 # The node resolver starts listening some seconds after the node is Ready;
 # wait for it before any leg reads a lookup result.
@@ -247,7 +247,7 @@ else
 fi
 
 # 3. The host resolves the apiserver FQDN with no shim at all.
-#    Run as the invoking user with Homebrew first on PATH, as the rig does;
+#    Run as the invoking user with Homebrew first on PATH, as the lab host does;
 #    /usr/bin/curl prints "*   Trying <ip>:443...", and either curl prints
 #    "* Connected to <host> (<ip>) port 443" once the connect succeeds.
 api_ip="$(kc get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}')"

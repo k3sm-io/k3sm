@@ -32,6 +32,9 @@
 # hack/release/publish.sh, runs `stage.sh --rewrite-manifest` and then
 # `stage.sh --verify-release <TEAMID>` after this script.
 #
+# CLAUDECODE and K3SM_AUTO are set by automated agent sessions, which this script
+# refuses.
+#
 # THE REFUSAL. Before it parses an argument or looks up any tool, this script
 # refuses when CLAUDECODE or K3SM_AUTO is set at all (set but empty counts), when
 # /dev/tty cannot be opened, and, right after parsing and still before any tool

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# k3sm M4 INTEGRATION gate — the live RBAC-enforcement flip (M4.1). It brings up a
+# k3sm M4 INTEGRATION gate — the live RBAC-enforcement flip. It brings up a
 # single-node `k3sm server`, whose apiserver defaults to
-# --authorization-mode=Node,RBAC + NodeRestriction since M4.1, and whose
+# --authorization-mode=Node,RBAC + NodeRestriction by default, and whose
 # pkg/rbac.Provision laid down the node-datapath ClusterRole + the in-pod-reader
 # RoleBinding fail-closed at start. It then runs the build-tagged
 # e2e/TestM4_RBACEnforced criterion, proving live authorization:
@@ -11,10 +11,10 @@
 #     signing CA on disk (it SKIPS single-node here — covered by hack/lab/m3.sh).
 #
 # This is the RBAC/conformance INTEGRATION slice, split out from the packaging /
-# launchd lab gate (hack/lab/m4.sh, the M4-lab row in phases.json) so M4.1's live
+# launchd lab gate (hack/lab/m4.sh, the M4-lab row in phases.json) so the live
 # authz assertion has a CI-runnable home rather than riding the two-Mac lab. It
 # needs NO root: TestM4_RBACEnforced is SelfSubjectAccessReviews + a token mint +
-# API calls, no pods/datapath. The full M4.1-a1 verdict (incl. the system:node leg)
+# API calls, no pods/datapath. The full verdict (incl. the system:node leg)
 # is the multi-node lab; this gate proves the SA half live in CI.
 #
 # Tier: integration (dev Mac, no root). Exit 0 iff every check passes.
@@ -30,7 +30,7 @@ ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "
 cleanup() { cluster_down; }
 trap cleanup EXIT
 
-echo "==> k3sm M4 integration gate (k3sm server, --authorization-mode=Node,RBAC default since M4.1)"
+echo "==> k3sm M4 integration gate (k3sm server, --authorization-mode=Node,RBAC default)"
 server_up k3sm-m4 hostprocess
 
 # Point the node-identity leg at THIS cluster's CA hierarchy. The test defaults to

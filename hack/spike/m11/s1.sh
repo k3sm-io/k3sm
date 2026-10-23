@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# M11.0-d1 / S1 — minimal VZ Linux boot. THE DESIGN-INVALIDATING SPIKE.
+# S1 — minimal VZ Linux boot. THE DESIGN-INVALIDATING SPIKE.
 #
 # Everything in M11 is written on the assumption that this passes. It therefore
-# runs FIRST and ALONE, and a NO-GO on criterion 1 or 2 fires the M11 plan's R19(b):
+# runs FIRST and ALONE, and a NO-GO on criterion 1 or 2 fires the NO-GO halt:
 # a dated resolution, the m9 ledger row removed, the announcement reverted to
 # the vm-EXPERIMENTAL-stub line. Never an ad-hoc gate waiver.
 #
-# Six criteria (k3sm/docs/PHASES.md M11.0-d1):
+# Six criteria (k3sm/docs/PHASES.md):
 #   1 entitlement-only ad-hoc signing suffices        — GO/NO-GO, with counterfactual
 #   2 console tokens from a real kernel boot          — GO/NO-GO, with gzip control
 #   3 cold-boot latency, TWO figures                  — RECORDING
 #   4 guest<->guest reachability                      — RECORDING (a security fact);
 #                                                       run by s5-run.sh, mirrored here
-#   5 Seatbelt x VZ coexistence in one process        — decides Resolution 7; BOTH
+#   5 Seatbelt x VZ coexistence in one process        — decides the vmhost confinement design; BOTH
 #                                                       orderings (confine-first, VM-first)
 #   6 Rosetta availability probe safe when unentitled — HALTS the shipped label path
 #
@@ -350,7 +350,7 @@ func waitStopped(vm *vz.VirtualMachine, d time.Duration) bool {
 // (build+start, then sandbox_apply).
 //
 // Every outcome is a valid recording. A denial here is NOT terminal for M11 —
-// the M11 plan's R22 admits a documented residual — so this never exits
+// the plan admits a documented residual — so this never exits
 // non-zero for a denial, only for a harness fault.
 func runSeatbelt(order string) {
 	workDir, dataVol := os.Getenv("S1_SB_WORKDIR"), os.Getenv("S1_SB_DATAVOL")
@@ -631,7 +631,7 @@ for o in before after; do
   if grep -q "VZBOOT_SB_VERDICT_$(echo "$o" | tr a-z A-Z)=worked" "out/seatbelt-$o.log"; then
     echo "  CRITERION 5 ($o): WORKS — a VM constructs and starts under the pod profile"
   else
-    echo "  CRITERION 5 ($o): DOES NOT WORK — record the verbatim line above; NOT terminal (the M11 plan's R22)"
+    echo "  CRITERION 5 ($o): DOES NOT WORK — record the verbatim line above; NOT terminal (a documented residual)"
   fi
 done
 
@@ -649,7 +649,7 @@ cat <<'EOF'
   mirrored back into findings-s1.md criterion 4 VERBATIM.
 
   RECORD THE OUTCOME in k3sm/hack/spike/m11/findings-s1.md:
-    - the rig table, and the kernel sha256 + byte size this run used;
+    - the lab host table, and the kernel sha256 + byte size this run used;
     - criterion 1 with ALL THREE verdicts (unsigned / ad-hoc-no-entitlement /
       ad-hoc-entitled) — the counterfactual is the evidence, not the success;
     - the console transcript excerpt and the gzip rejection;
@@ -661,7 +661,7 @@ cat <<'EOF'
     - the Rosetta probe value observed on this rig;
     - any deviation from the guardrails in lib.sh, flagged rather than adopted.
 
-  GO/NO-GO: criteria 1 or 2 failing is TERMINAL for M11 -> the M11 plan's R19(b).
-  Criterion 5 failing is NOT terminal (R22 admits a documented residual).
+  GO/NO-GO: criteria 1 or 2 failing is TERMINAL for M11 -> the NO-GO halt.
+  Criterion 5 failing is NOT terminal (a documented residual is admitted).
   Criterion 6 failing HALTS the shipped label path — it is a bug in merged code.
 EOF

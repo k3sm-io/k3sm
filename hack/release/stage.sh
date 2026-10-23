@@ -28,8 +28,8 @@
 #                    (completeness against the install contract, codesign --verify
 #                    on every Mach-O, the arm64 arch assert, and the k3sm-vmhost
 #                    virtualization-entitlement read-back) over a tree that already
-#                    exists. This is the seam the workspace's hack/release-gate.sh
-#                    drives so the artifact-quality tier re-uses THESE checks over
+#                    exists. This is the seam a release gate run from the parent
+#                    checkout of all the repos drives so the artifact-quality tier re-uses THESE checks over
 #                    the extracted archive rather than growing a second copy of
 #                    them that can drift from what staging asserts. Ad-hoc
 #                    signatures pass.
@@ -1171,8 +1171,8 @@ if [ "$STUB_PAYLOAD" = 0 ]; then
 	tc_problem="$(toolchain_problems "$PAYLOAD_GO_VERSION")" || die "$tc_problem"
 fi
 
-# The k3sm binary. Built from the repo with the workspace active so the sibling
-# modules resolve to these checkouts.
+# The k3sm binary. Built from the repo with go.work active (the sibling-checkout layout)
+# so the sibling modules resolve to these checkouts.
 echo "==> build $BINARY_NAME"
 build_flags=(-trimpath)
 [ -n "$LDFLAGS" ] && build_flags+=(-ldflags "$LDFLAGS")
@@ -1190,7 +1190,7 @@ echo "==> build DYLD shims (runtimed path-rebase, darwin-net getaddrinfo)"
 "$WS_ROOT/runtimed/hack/build-pathshim.sh" "$OUT" >/dev/null
 "$WS_ROOT/darwin-net/hack/build-shim.sh" "$OUT" >/dev/null
 
-# The per-pod VM host helper. Built from the workspace root for the same reason
+# The per-pod VM host helper. Built from the parent of the repo checkouts for the same reason
 # as the exec shim, and signed separately below (see VMHOST_ENTITLEMENTS above).
 echo "==> build k3sm-vmhost (runtimed)"
 [ -f "$VMHOST_ENTITLEMENTS" ] || die "vmhost entitlements plist not found at $VMHOST_ENTITLEMENTS"

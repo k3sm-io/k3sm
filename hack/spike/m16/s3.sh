@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M16.0-d4 / S3 — the engine decision.
+# S3 — the engine decision.
 #
 # The worker k3sm ships runs the M8 engine IN-PROCESS behind the upstream backend
 # contract, which is the whole reason the worker can be ~400-800 lines instead of a
@@ -23,7 +23,7 @@
 #   s3.5  the alternative engine run against the M8 baseline on this same rig, as a
 #         CONTROL. Recorded, never gating: it is the negative space around the choice.
 #
-# HALT: s3.1 fails -> the plan's R3 sidecar shape (the worker talks HTTP to an
+# HALT: s3.1 fails -> the HTTP sidecar shape (the worker talks HTTP to an
 # mlx-serve process; the block size is unset, so routing degrades to round-robin by
 # contract and the user doc says so). Pre-decided; this rung never improvises another.
 set -euo pipefail
@@ -33,7 +33,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RUNG="S3"
 QUESTION="Can the M8 engine be driven in-process from token IDs with the KV cache pinned and continuous batching on, aborted mid-stream, and its prefix-cache block hashes observed cheaply enough to publish on the hot path?"
 METHOD="Rig-side over ssh: the engine core constructed directly in a python process with the M8 sizing formula's pinned max_kv_size and max_num_seqs, driven from tokenized IDs, aborted mid-stream, its prefix cache inspected for stored and evicted block hashes, and the publish call timed sync versus async; then the alternative engine installed in its own venv and run against the M8 baseline on the same rig as a recorded control."
-HALT="the in-process path fails -> R3's HTTP sidecar shape onto mlx-serve, where the block size is unset, routing degrades to round-robin by contract, and docs/user/mlx-fleet.md says so in its first section."
+HALT="the in-process path fails -> the HTTP sidecar shape onto mlx-serve, where the block size is unset, routing degrades to round-robin by contract."
 
 case "${1:-}" in
 --plan | --dry-run) spike_plan "$RUNG" "$QUESTION" "$METHOD" "$HALT" ;;
@@ -258,7 +258,7 @@ async def main():
     tokens = len(getattr(last, "output_token_ids", None) or [])
     finish = getattr(last, "finish_reason", None)
     if not events:
-        verdict("FAIL", "s3.1 in-process", "the in-process stream yielded nothing within %.0fs - the plan's R3 sidecar shape applies"
+        verdict("FAIL", "s3.1 in-process", "the in-process stream yielded nothing within %.0fs - the HTTP sidecar shape applies"
                 % STREAM_BUDGET)
         await stop(core)
         return 0
@@ -316,7 +316,7 @@ async def main():
                     % after)
         else:
             verdict("FAIL", "s3.2 abort", "abort_request returned %r for a live request" % (accepted,))
-        # The stream's own ending is a separate fact for the plan to judge, never part of the PASS:
+        # The stream's own ending is a separate fact for the reader to judge, never part of the PASS:
         # a worker whose engine leaves the stream open must end it itself.
         record("s3.2-stream after the abort the stream %s; the worker %s"
                % (ended, "can rely on the engine to end the stream" if ended.startswith("ended") else "must end the stream itself"))

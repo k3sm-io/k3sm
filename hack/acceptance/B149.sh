@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B149 acceptance gate — the unit-tier proof of the disposable macOS-guest lab
+# k3sm lab VM harness acceptance gate — the unit-tier proof of the disposable macOS-guest lab
 # harness, hack/lab-vm.sh.
 #
 # WHAT IS PROVEN HERE. The harness's PLUMBING: that its CLI dispatch works, that it
@@ -31,7 +31,7 @@ SELF="$HERE/B149.sh"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B149 acceptance (disposable macOS-guest lab harness, fully faked)"
+echo "==> k3sm lab VM harness acceptance (disposable macOS-guest lab harness, fully faked)"
 
 # ---- b149.0 — both deliverables exist and parse -----------------------------
 b0=ok
@@ -44,8 +44,8 @@ fi
 ladder "$b0" "b149.0  hack/lab-vm.sh + hack/acceptance/B149.sh exist and parse (bash -n)"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B149: the harness is missing or unparseable — nothing else can run" >&2
-	echo "B149: $PASS passed, $FAIL failed" >&2
+	echo "lab VM harness: the harness is missing or unparseable — nothing else can run" >&2
+	echo "lab VM harness: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -399,7 +399,7 @@ KNOWN-UNPROVEN HERE:
     macOS guest boots, that the pinned base image is reachable, or that the guest
     accepts the credentials the harness assumes.
   - The first real in-guest execution of the m2-class gate is a SEPARATE step and
-    has not happened. Until it does, treat "B149 GREEN" as "the harness is wired
+    has not happened. Until it does, treat "GREEN" as "the harness is wired
     correctly", never as "the host-mutating gates now run in a guest".
   - The base image's usability is a stated PRECONDITION, checked here only as a
     name-family match. Whether a given image actually ships sshd, an administrator
@@ -412,6 +412,6 @@ KNOWN-UNPROVEN HERE:
     inside the guest rather than as a refusal.
 UNPROVEN
 echo "----------------------------------------"
-echo "B149: $PASS passed, $FAIL failed"
+echo "lab VM harness: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B149 GREEN ================"
+echo "================ lab VM harness GREEN ================"

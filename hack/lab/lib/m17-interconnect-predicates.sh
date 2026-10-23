@@ -276,7 +276,7 @@ icp_arp_permanent() {
 	}
 }
 
-# icp_i10_verdict <T0> <T1> <T2> — the plan I10 budget, seconds on one monotonic
+# icp_i10_verdict <T0> <T1> <T2> — the unplug budget, seconds on one monotonic
 # clock: the member is down within 20 s of the carrier drop and the MLX re-render
 # starts within 30 s.
 icp_i10_verdict() {
