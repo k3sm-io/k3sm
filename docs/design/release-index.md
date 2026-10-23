@@ -7,8 +7,8 @@ Status: accepted. The schema is implemented by `ParseReleaseIndex` in
 ## Problem
 
 The k3sm app owns the version set: app vX bundles k3sm vX,
-one tag, one sealed build tree, one tarball digest, one disk image. In v0.2 the app checks for a new release and points to the
-download; it does not install one itself. To tell a
+one tag, one sealed build tree, one tarball digest, one disk image. In v0.2 the app does not check for a new release; that check
+arrives in v0.3, and installing a release in place comes after it. To tell a
 user that a newer release exists, and to download it, the app needs one
 document that names the latest final release and the exact bytes of both
 halves of its set. That document has to be authentic (it decides what the app

@@ -130,7 +130,7 @@ Mac, 10240 on an 8 GB one). When it is below the limit k3sm requests, the instal
 the node's UDP Service flow capacity drops toward its floor. `sudo sysctl -w kern.maxfiles=131072
 kern.maxfilesperproc=131072` raises it until the next reboot.
 
-> **The k3sm app** is a second upgrade channel: a signed, notarized download from k3sm.io. It checks for a new release and points you to the download; it does not replace itself.
+> **The k3sm app** is a second upgrade channel: a signed, notarized download from k3sm.io. It does not look for a newer version of itself yet: a new version is a new download from the release page.
 
 ## Multi-Node Rolling Upgrade
 
