@@ -262,8 +262,8 @@ var pinnedNodeDatapathRules = []rbacv1.PolicyRule{
 	{APIGroups: []string{netv1.GroupName}, Resources: []string{"meshpeers"}, Verbs: []string{"get", "list", "watch"}},
 }
 
-// TestRBACRegistryAdvertReaderRole proves the operator-approved (2026-09-02)
-// registry-advertisement grant is exactly what was approved and nothing more:
+// TestRBACRegistryAdvertReaderRole proves the reviewed
+// registry-advertisement grant is exactly what was reviewed and nothing more:
 // a NAMESPACED Role in the advertisement namespace granting get/list/watch on
 // configmaps — three verbs, one resource, one core group — bound to the
 // system:nodes group, plus the namespace that Role would be uncreatable without.

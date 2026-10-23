@@ -160,7 +160,7 @@ func connect(t *testing.T, l *acceptListener, d *recordingDialer, peer string) b
 	return false
 }
 
-// TestLoadBalancerSourceRangesEnforced pins B131, the k3s shape of
+// TestLoadBalancerSourceRangesEnforced pins the k3s shape of
 // spec.loadBalancerSourceRanges: enforced on LoadBalancer traffic at accept,
 // before any backend dial; spec field, then the legacy annotation, then
 // allow-all; entries TrimSpace'd; all-or-nothing parsing; fail-closed on first

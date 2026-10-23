@@ -77,15 +77,15 @@ func clientCert(t *testing.T, ca *certs.CA, cn string, org []string) tls.Certifi
 	return pair
 }
 
-// TestKubeletEndpointRequiresClientCert is the B176 gate: the VK node's kubelet
+// TestKubeletEndpointRequiresClientCert pins that the VK node's kubelet
 // HTTP endpoint (:10250 — logs, exec, attach, port-forward, stats) is served over
 // mutual TLS anchored on the cluster's client-identity CA, and admits exactly ONE
 // identity — the CN the PKI mints for the apiserver's kubelet client.
 //
 // It runs against a real in-process TLS listener configured by the SAME production
 // code path the node uses (NewKubeletEndpointAuth → ServingTLS → Handler), not a
-// restatement of it, so a regression in either half is caught here. Before B176
-// this endpoint ran nodeutil.NoAuth() over a tls.NoClientCert listener on a
+// restatement of it, so a regression in either half is caught here. This endpoint
+// once ran nodeutil.NoAuth() over a tls.NoClientCert listener on a
 // wildcard bind: every subtest below except the apiserver one would have served
 // exec to its caller.
 //
@@ -309,9 +309,9 @@ func TestKubeletEndpointAuthFailsClosed(t *testing.T) {
 }
 
 // TestProviderRoutesRefuseUnauthenticatedWiring pins the structural half of the
-// B176 fix: vkadapter.NewNode REFUSES to build a node whose kubelet provider
+// mutual-TLS requirement: vkadapter.NewNode REFUSES to build a node whose kubelet provider
 // routes would be served without mutual TLS plus an authorizer. It is the mutation
-// guard for the exact pre-B176 shape — a serving-only tls.Config with an
+// guard for the exact earlier shape — a serving-only tls.Config with an
 // always-allow handler — which was previously a valid NodeConfig.
 func TestProviderRoutesRefuseUnauthenticatedWiring(t *testing.T) {
 	ca, err := certs.NewCA("k3sm-signing-ca")
@@ -332,7 +332,7 @@ func TestProviderRoutesRefuseUnauthenticatedWiring(t *testing.T) {
 		wantErrContains string
 	}{
 		{
-			name:            "the pre-B176 shape: serving TLS, no client auth, no authorizer",
+			name:            "the old shape: serving TLS, no client auth, no authorizer",
 			cfg:             vkadapter.NodeConfig{TLSConfig: &tls.Config{}},
 			wantErrContains: "AuthorizeHandler",
 		},

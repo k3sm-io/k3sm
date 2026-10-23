@@ -25,7 +25,7 @@ import (
 	"k3sm.io/k3sm/pkg/shadow"
 )
 
-// TestHostDNSRows pins the two B243 rows: node-resolver reports whether netd's
+// TestHostDNSRows pins the two host DNS rows: node-resolver reports whether netd's
 // entry is in the host resolver configuration, and shadow-shells compares the
 // manifest's source cdhashes with the live host binaries and names the remedy
 // (sudo k3sm install) on drift or when the set is missing. Neither row exists

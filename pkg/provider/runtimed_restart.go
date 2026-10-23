@@ -55,7 +55,7 @@ import (
 // decision: RestartContainer when the policy restarts, StopContainer when it does
 // not, and runtimed makes neither choice.
 //
-// Idempotency (binding): the trigger is keyed per container on the
+// Idempotency: the trigger is keyed per container on the
 // termination's identity — terminationKey{restart_count, exit code,
 // FinishedAt} — inside the podTrack, so a stream+backstop double-delivery of
 // the same terminated status never double-restarts. runtimed's restart_count
@@ -71,7 +71,7 @@ import (
 // cancelRestarts), so a backoff wait never blocks the watch goroutine and never
 // leaks past the pod.
 //
-// Worker identity (binding): a re-exec worker is handed the *podTrack and
+// Worker identity: a re-exec worker is handed the *podTrack and
 // *containerRestart it was started against, plus its claim generation — it never
 // re-resolves them from podID. An idempotent CreatePod for the same pod.UID
 // installs a new podTrack while a worker may be blocked inside RestartContainer,

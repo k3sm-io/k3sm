@@ -24,7 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestComputeNodeConditionsPressure is item B15's gate: it pins the pure
+// TestComputeNodeConditionsPressure pins the pure
 // node-pressure helper over a FAKED hostStats (no Statfs / sysctl / Mach in the
 // test). For each of Memory/Disk/PID it drives a snapshot just below, at, and
 // just above the threshold to prove the exact (and direction-correct) boundary

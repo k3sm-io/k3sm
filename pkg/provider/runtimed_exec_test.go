@@ -37,7 +37,7 @@ import (
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
-// M2.5 — provider-served exec/attach/port-forward. These prove the provider wires
+// Provider-served exec/attach/port-forward. These prove the provider wires
 // the VK AttachIO / byte stream to the runtime/v1 Exec/Attach/PortForward bidi
 // RPCs (against the frozen apis contract) using a fake runtime stream — no real
 // confinement (that is e2e). The fake echoes input back and reports a scripted
@@ -209,7 +209,7 @@ func newStreamProvider(t *testing.T, f runtimev1.RuntimeServer) *runtimedRuntime
 	return r
 }
 
-// TestM2_Exec is the M2.5-a1 proof for `kubectl exec`: RunInContainer streams
+// TestM2_Exec is the proof for `kubectl exec`: RunInContainer streams
 // stdin to the runtime Exec RPC, returns its stdout, and maps the exit code (zero
 // ⇒ nil; non-zero ⇒ a CodeExitError carrying the code).
 func TestM2_Exec(t *testing.T) {
@@ -287,7 +287,7 @@ func TestM2_ExecPodNotFound(t *testing.T) {
 	}
 }
 
-// TestM2_Attach is the M2.5-a1 proof for `kubectl attach`: AttachToContainer
+// TestM2_Attach is the proof for `kubectl attach`: AttachToContainer
 // streams a container's stdio over the runtime Attach RPC.
 func TestM2_Attach(t *testing.T) {
 	f := &fakeStreamRuntime{}
@@ -304,7 +304,7 @@ func TestM2_Attach(t *testing.T) {
 	}
 }
 
-// TestM2_PortForward is the M2.5-a1 proof for `kubectl port-forward`: PortForward
+// TestM2_PortForward is the proof for `kubectl port-forward`: PortForward
 // proxies bytes both ways between the VK stream and the runtime PortForward RPC.
 func TestM2_PortForward(t *testing.T) {
 	f := &fakeStreamRuntime{}
@@ -354,7 +354,7 @@ func TestM2_PortForwardPodNotFound(t *testing.T) {
 	}
 }
 
-// B78 — kubectl cp is exec-of-tar: `kubectl cp local pod:dst` runs `exec -- tar xf
+// kubectl cp is exec-of-tar: `kubectl cp local pod:dst` runs `exec -- tar xf
 // -` with the tar on STDIN, and `kubectl cp pod:src local` runs `exec -- tar cf -`
 // with the tar on STDOUT. The exec-stream bridge (RunInContainer → streamAttachIO →
 // pumpClientStreams → streamPipe → Exec) must round-trip a binary tar byte-for-byte,

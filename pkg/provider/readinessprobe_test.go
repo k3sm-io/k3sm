@@ -41,7 +41,7 @@ import (
 // k8s.io/kubernetes pkg/kubelet/prober/worker.go).
 //
 // Row 2 is the one no other test in this package covers: a readiness SUCCESS must
-// not promote a container whose postStart hook is still gating it (B39). Upstream
+// not promote a container whose postStart hook is still gating it. Upstream
 // publishes nothing at all for a container while its postStart hook runs
 // (k8s.io/api core/v1 types.go, Lifecycle.PostStart: "Other management of the
 // container blocks until the hook completes"), so a probe verdict that arrived

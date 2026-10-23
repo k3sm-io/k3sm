@@ -37,7 +37,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-// TestDaemonSetTemplateTolerationPolicy is the B566 gate. The DaemonSet controller
+// TestDaemonSetTemplateTolerationPolicy pins the template toleration. The DaemonSet controller
 // chooses nodes from the pod TEMPLATE, so the provider toleration must be in the
 // stored template, not only in the pods: without it desiredNumberScheduled stays 0
 // on a cluster where every node carries the provider taint, and no pod is ever
@@ -114,7 +114,7 @@ func TestDaemonSetTemplateTolerationPolicy(t *testing.T) {
 			t.Errorf("template patch missing %q: %s", want, patchExpr)
 		}
 	}
-	// Res.7: the toleration only, never a nodeSelector.
+	// The toleration only, never a nodeSelector.
 	blob := patchExpr + " " + wantCond
 	for _, banned := range []string{"nodeSelector", "darwin"} {
 		if strings.Contains(blob, banned) {

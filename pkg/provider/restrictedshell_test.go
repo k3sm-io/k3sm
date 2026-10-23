@@ -56,12 +56,13 @@ func shimInactiveCondition(reason, container, path string) *runtimev1.PodConditi
 	}
 }
 
-// TestRestrictedShellEntrypointWarns is B309's pod-visible-signal gate,
-// re-pointed by B243 (the name is kept so B309's gate reference stays live): a
+// TestRestrictedShellEntrypointWarns pins the pod-visible signal for a lost
+// shim (the name predates the current signal and is kept because other
+// references use it): a
 // container whose main process lost the DNS shim must say so ON THE POD. The
-// signal is no longer the argv heuristic B309 shipped (a SIP path prefix on
+// signal is no longer the original argv heuristic (a SIP path prefix on
 // Command[0]) but runtimed's kernel verdict, the k3sm.io/shim-inactive
-// condition, because since B243 a /bin/sh entrypoint runs through the node's
+// condition, because a /bin/sh entrypoint now runs through the node's
 // re-signed shell and KEEPS the shim, while a restricted binary under any
 // other path still loses it. So the table pins both directions: the argv alone
 // no longer warns, and the condition warns whatever the argv.
@@ -82,7 +83,7 @@ func TestRestrictedShellEntrypointWarns(t *testing.T) {
 			wantEvent:  true,
 		},
 		{
-			// /bin/sh on the host-binary route: B309 warned on the argv; the
+			// /bin/sh on the host-binary route: the old heuristic warned on the argv; the
 			// shadow shell keeps the shim, runtimed reports nothing, no Event.
 			name:       "bin_sh_through_the_shadow_shell_no_warn",
 			containers: []corev1.Container{{Name: "c0", Image: runtimed.NativeImage, Command: []string{"/bin/sh"}}},

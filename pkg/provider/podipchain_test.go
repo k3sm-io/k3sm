@@ -25,14 +25,14 @@ import (
 	"k3sm.io/darwin-net/pkg/proxy"
 )
 
-// TestVMPodPublishedIPKeysItsTransportOverride is the B237 closing gate: it joins
+// TestVMPodPublishedIPKeysItsTransportOverride joins
 // the two halves of a vm pod's two-address identity into ONE assertion chain, from
 // the node's IPAM to the Service proxy's routing table.
 //
 // THE CHAIN, and what produces each link:
 //
 //	podnet allocator  -> SetupGuest allocates the pod's /32
-//	podIP             -> publishes that /32 (B237: it used to publish the node IP)
+//	podIP             -> publishes that /32 (it used to publish the node IP)
 //	toPodBox          -> carries it to runtimed as PodBox.pod_ip, over the RPC
 //	runtimed          -> echoes it back as PodStatus.pod_ip (the fake does what the
 //	                     real daemon does: a pod's reported ip IS the box's)
@@ -46,7 +46,7 @@ import (
 // agree — the adapter's guest record, the PodBox the provider sent over the RPC,
 // the corev1 status.podIP the VK callback delivered, and the key of the override
 // map the real routing table took. The lease value arrives only through the gRPC
-// status stream. Before B237 this test cannot pass at all: podIP returned the node
+// status stream. Against the earlier node-IP stand-in this test cannot pass at all: podIP returned the node
 // IP, so the PodBox and status.podIP links carried an address the override map is
 // not keyed on, and every guest on the node shared it.
 //
@@ -78,7 +78,7 @@ func TestVMPodPublishedIPKeysItsTransportOverride(t *testing.T) {
 	}
 
 	// Link 2: podIP published exactly that address into the PodBox — this is the
-	// B237 flip, observed at the far side of the RPC rather than at its source.
+	// per-pod /32 flip, observed at the far side of the RPC rather than at its source.
 	if box := n.rt.boxPodIP(id); box != published {
 		t.Fatalf("PodBox.pod_ip = %q, want the allocated guest /32 %q — podIP must publish what SetupGuest drew", box, published)
 	}

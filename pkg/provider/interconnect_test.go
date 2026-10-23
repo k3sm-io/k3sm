@@ -204,7 +204,7 @@ func (h *icHarness) events() string {
 	}
 }
 
-// TestInterconnectAnnotationAttachesSecondAddress is the B451 BI7 gate: a pod
+// TestInterconnectAnnotationAttachesSecondAddress pins that a pod
 // annotated k3sm.io/interconnects gets, at create, a slot of the node's
 // interconnect /24 from the root helper, the K3SM_INTERCONNECT_* env after its
 // own env, and the k3sm.io/InterconnectAttached condition; every refusal is

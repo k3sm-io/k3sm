@@ -73,19 +73,19 @@ func (n *docTruthNetwork) MarkHostNetwork(podID string) {
 	n.hostNetMarked = append(n.hostNetMarked, podID)
 }
 
-// TestPodIPDocMatchesVMBehaviour is the B167 gate: it binds the podIP doc
+// TestPodIPDocMatchesVMBehaviour binds the podIP doc
 // comment to what podIP actually DOES for a vm-RuntimeClass pod, so the two
 // cannot drift apart again.
 //
 // HISTORY, because the gate's polarity has now flipped TWICE and that is the
 // interesting part. The comment once asserted, in the present tense, that a vm
 // pod was routed to SetupGuest — while nothing called it; the gate pinned that
-// ABSENCE. M11.4-d4 landed the carrier and the gate inverted to pin its
+// ABSENCE. The carrier then landed and the gate inverted to pin its
 // PRESENCE, while still recording the thing that had NOT changed: podIP returned
 // the NODE IP for a vm pod, so every vm pod on a node published the same
 // status.podIP.
 //
-// B237 retires that stand-in, and this gate now pins the end state. podIP
+// Publishing the guest's own /32 retired that stand-in, and this gate now pins the end state. podIP
 // publishes the /32 SetupGuest allocated, because the two-address model needs a
 // per-pod identity to key on: the published /32 is the pod's cluster identity
 // (status.podIP, EndpointSlices, DNS, NetworkPolicy) and is live on no
@@ -104,7 +104,7 @@ func (n *docTruthNetwork) MarkHostNetwork(podID string) {
 //  4. THE OTHER BRANCHES — hostNetwork and the nil adapter still resolve to the
 //     node IP, and hostNetwork draws no guest address.
 //  5. PRODUCTION CALLER — a non-test file in this module calls SetupGuest. If the
-//     B6 producer is ever unwired, this goes red and the doc must be restated.
+//     guest-network producer is ever unwired, this goes red and the doc must be restated.
 //  6. THE DOC MATCHES — it names the wired carrier, states the published/live
 //     two-address split, and does not revive any retired claim.
 func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
@@ -176,7 +176,7 @@ func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
 		}
 	})
 
-	// The two branches B237 did NOT touch. Both still resolve to the node IP, and
+	// The two branches the vm /32 change did NOT touch. Both still resolve to the node IP, and
 	// neither draws a guest address — the vm flip must not have widened into them.
 	t.Run("hostNetwork and the nil adapter still resolve to the node IP", func(t *testing.T) {
 		hostNet := &corev1.Pod{
@@ -217,7 +217,7 @@ func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
 
 	t.Run("SetupGuest has a production caller in this module", func(t *testing.T) {
 		if !wired {
-			t.Fatal("no non-test file in this module calls SetupGuest — the B6 producer wiring is gone. " +
+			t.Fatal("no non-test file in this module calls SetupGuest — the guest-network producer wiring is gone. " +
 				"It ran buildBox -> setupGuestNetwork -> PodNetwork.SetupGuest, and the adapter carried the " +
 				"result to runtimed as sandbox.VMSpec.Network (runtime.GuestNetworker); podIP publishes the " +
 				"address it returns. Restore it; if it was removed deliberately, restate podIP's doc comment " +
@@ -253,8 +253,8 @@ func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
 		}
 		// The retired claims. Each was true once and is false now, and re-asserting
 		// any of them is exactly the drift this gate was built to catch: the first
-		// two predate the wired carrier, the third is the node-IP stand-in B237
-		// retired.
+		// two predate the wired carrier, the third is the node-IP stand-in the vm
+		// /32 change retired.
 		for _, stale := range []*regexp.Regexp{
 			regexp.MustCompile(`(?i)no\s+production\s+caller`),
 			regexp.MustCompile(`NOT WIRED:`),

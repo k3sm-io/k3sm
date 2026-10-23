@@ -36,7 +36,7 @@ import (
 	"k3sm.io/runtimed/pkg/mount"
 )
 
-// TestKubeResolverMaterialize is the M2.1-a1 proof that the provider's
+// TestKubeResolverMaterialize proves that the provider's
 // mount.Resolver resolves a fake ConfigMap/Secret into mount content: the resolver
 // returns the apiserver objects' data, and runtimed's materializer writes them as
 // files under the pod data volume (the end-to-end seam, no apiserver, no root).
@@ -115,7 +115,7 @@ func TestKubeResolverOptionalMissing(t *testing.T) {
 	}
 }
 
-// TestResolvePodBoxEnv is the M2.1 proof that the provider flattens env into
+// TestResolvePodBoxEnv proves that the provider flattens env into
 // LITERAL values (runtimed reads only EnvVar.value): envFrom expansion,
 // configMap/secretKeyRef, downward-API fieldRef, with explicit env overriding
 // envFrom and value_from/env_from cleared afterwards.
@@ -343,7 +343,7 @@ func TestResolvePodBoxEnvOptional(t *testing.T) {
 	}
 }
 
-// TestKubeCredentialsDockerConfig is the M2.6/imagePullSecret seam proof: a
+// TestKubeCredentialsDockerConfig is the imagePullSecret seam proof: a
 // dockerconfigjson Secret resolves to the registry credential matching the image
 // ref's host, and a non-matching host yields an anonymous pull.
 func TestKubeCredentialsDockerConfig(t *testing.T) {

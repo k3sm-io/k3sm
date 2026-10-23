@@ -29,7 +29,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestTranslateGPURequestAndEgressAnnotation is the M8.3-d2 named gate: the
+// TestTranslateGPURequestAndEgressAnnotation pins that the
 // GPU request read is pinned to LIMITS (not requests), the egress annotation
 // is read via the apis-owned constant (never a hand-spelled literal), and
 // translate enforces AllowInternetEgress ⇒ AllowNetwork so a pod that opts

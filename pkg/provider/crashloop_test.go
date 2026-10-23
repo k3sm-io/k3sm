@@ -77,12 +77,12 @@ func newCrashFake(t *testing.T, pod *corev1.Pod) (*runtimedRuntime, *fakeRuntime
 	return r, f, clk, tr, rec
 }
 
-// TestRestartOnExitCrashLoopSurface is the B26 NAMED GATE: the exit-driven
+// TestRestartOnExitCrashLoopSurface pins the exit-driven
 // re-exec and the CrashLoopBackOff surface a crash-looping pod must present to
 // `kubectl get`/`kubectl describe`, end to end through the provider's single
 // restart authority.
 //
-// It pins, in one place, every behaviour B26 exists to deliver:
+// It pins, in one place, every behaviour the restart authority exists to deliver:
 //
 //  1. an EXIT (not a probe) drives a re-exec through the RestartContainer RPC;
 //  2. the container surfaces Waiting{Reason: CrashLoopBackOff} with upstream's
@@ -540,10 +540,10 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 func intstrFromInt(port int32) intstr.IntOrString { return intstr.FromInt32(port) }
 
 // TestContainerRestartStateMachine is the table-driven proof of the collapsed
-// restart bookkeeping (B26): `restarting` (the OBSERVABLE window the status
+// restart bookkeeping: `restarting` (the OBSERVABLE window the status
 // overlay renders) and `attempt` (the internal single-worker claim) are written
 // only by the four methods on containerRestart, and they advance independently.
-// Before B26 a single `pending` flag conflated the two, so the window closed the
+// Previously a single `pending` flag conflated the two, so the window closed the
 // instant the RPC returned.
 func TestContainerRestartStateMachine(t *testing.T) {
 	tests := []struct {

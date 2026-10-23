@@ -46,7 +46,8 @@ import (
 // --- test helpers -----------------------------------------------------------
 
 // vd is the monitor's verdict for a test that only reads its fields: the
-// evaluability flag is the subject of the B318 gate, not of the FSM cases here.
+// evaluability flag is the subject of TestVMPodProbesDialTheLiveGuestAddress,
+// not of the FSM cases here.
 func vd(m *containerMonitor) probeVerdict {
 	v, _ := m.verdict()
 	return v
@@ -357,7 +358,7 @@ func TestM2_LivenessRestarts(t *testing.T) {
 
 // --- TestProbeRestartInvokesRPC ----------------------------------------------
 
-// TestProbeRestartInvokesRPC is the M2.2-swap proof that a committed liveness
+// TestProbeRestartInvokesRPC proves that a committed liveness
 // failure does not just bump bookkeeping but invokes the runtime RestartContainer
 // RPC (the restartFunc seam, previously nil, now wired by startProber). It drives
 // failureThreshold consecutive liveness failures through the real prober the
@@ -401,7 +402,7 @@ func TestProbeRestartInvokesRPC(t *testing.T) {
 	if got := vd(m).restarts; got != 1 {
 		t.Fatalf("probe-driven restarts = %d, want 1", got)
 	}
-	// Since B26 the seam schedules through the SHARED restart authority's worker
+	// The seam schedules through the SHARED restart authority's worker
 	// rather than calling the RPC inline, so the call is asynchronous — a
 	// non-crash-looping container's liveness kill is still immediate (delay 0,
 	// kubelet parity), but it lands on the worker goroutine.
@@ -694,10 +695,10 @@ func TestProbeRunnerStopsCleanly(t *testing.T) {
 
 // --- TestBuildCheckGRPCProbeNoPanic ------------------------------------------
 
-// TestBuildCheckGRPCProbeNoPanic is the B9 regression gate: a gRPC-handler probe
+// TestBuildCheckGRPCProbeNoPanic is a regression test: a gRPC-handler probe
 // (a GA-valid manifest) and a handler-less probe must both build a NON-nil check,
 // and a panicking check must be recovered rather than crash the single k3sm
-// process. Before B9, buildCheck returned nil for the gRPC/default case while the
+// process. buildCheck once returned nil for the gRPC/default case while the
 // runner still built a probeSpec for the non-nil Probe and invoked the nil check
 // with no recover() — an unrecovered panic that took down the whole node. It
 // proves four things: gRPC health is now SERVED (over the dial seam), the default

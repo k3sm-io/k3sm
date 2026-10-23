@@ -203,7 +203,7 @@ func (f *fakeIPAM) exhaust(t *testing.T) {
 const testNodeIP = "192.168.1.10"
 
 // newRuntimedWithPodNet builds a runtimed-backed provider runtime over the fake
-// runtime server with the podnet adapter injected — the M10.1 assembly shape.
+// runtime server with the podnet adapter injected — the production assembly shape.
 func newRuntimedWithPodNet(t *testing.T) (*runtimedRuntime, *fakeRuntimeServer, *fakeIPAM, *PodNetAdapter) {
 	t.Helper()
 	ipam := newFakeIPAM(t, "100.64.0.0/24")
@@ -219,7 +219,7 @@ func newRuntimedWithPodNet(t *testing.T) (*runtimedRuntime, *fakeRuntimeServer, 
 }
 
 // podWithEnv builds a pod whose container carries a status.podIP downward-API
-// env fieldRef — the M10.1 ordering canary (resolvable only if the /32 was
+// env fieldRef — the ordering canary (resolvable only if the /32 was
 // allocated BEFORE env resolution).
 func podWithEnv(ns, name string) *corev1.Pod {
 	pod := runtimedPod(ns, name)
@@ -280,8 +280,8 @@ func createdPodIP(t *testing.T, f *fakeRuntimeServer, podUID string) string {
 	return box.GetPodIp()
 }
 
-// TestCreatePodAssignsDistinctPodIP is the M10.1-a1 server-side per-pod-IP gate
-// (Res.1): the runtimed provider allocates each pod a DISTINCT in-CIDR /32 ≠
+// TestCreatePodAssignsDistinctPodIP is the server-side per-pod-IP test: the
+// runtimed provider allocates each pod a DISTINCT in-CIDR /32 ≠
 // nodeIP through the injected podnet adapter BEFORE translation — so box.PodIp
 // and the resolved status.podIP downward-API env carry it (the ordering fix for
 // the POD_IP env bug, where env resolution used to read the node IP) — while a
@@ -325,7 +325,7 @@ func TestCreatePodAssignsDistinctPodIP(t *testing.T) {
 		if got := createdEnv(t, f, "uid-b", "POD_IP"); got != ipB {
 			t.Errorf("pod b POD_IP env = %q, want the allocated /32 %q", got, ipB)
 		}
-		// B217: a distinct-/32 pod carries the bind-discipline env the DYLD interpose
+		// A distinct-/32 pod carries the bind-discipline env the DYLD interpose
 		// reads (K3SM_POD_IP == the allocated /32), so its wildcard binds rewrite onto
 		// its own address and two same-node pods can both hold :8080.
 		if got := createdEnv(t, f, "uid-a", podnet.EnvPodIP); got != ipA {
@@ -349,7 +349,7 @@ func TestCreatePodAssignsDistinctPodIP(t *testing.T) {
 		if got := createdEnv(t, f, "uid-hostnet", "POD_IP"); got != testNodeIP {
 			t.Errorf("hostNetwork POD_IP env = %q, want nodeIP %q", got, testNodeIP)
 		}
-		// B217: the bind-discipline env is NOT injected for a hostNetwork pod (podIP ==
+		// The bind-discipline env is NOT injected for a hostNetwork pod (podIP ==
 		// nodeIP, no distinct /32). Injecting K3SM_POD_IP would rewrite its wildcard
 		// binds onto the node IP and silently narrow the shipped hostNetwork semantic
 		// (share the node's addresses). This asserts the guard the plan's architect

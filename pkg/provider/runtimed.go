@@ -1996,8 +1996,7 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	// lifetime, binding the pod identity on its own context. The binding here
 	// stays because env-source resolution in buildBox (resolvePodBoxEnv →
 	// ConfigMap/Secret key refs) legitimately re-runs on every box build, and
-	// this seam is kept uniform for CreatePod and UpdatePod rather than split
-	// (B233).
+	// this seam is kept uniform for CreatePod and UpdatePod rather than split.
 	ctx = withPodIdentity(ctx, pod)
 	// A spec change (an ephemeral container added) can add references; the
 	// registration is replaced, so a removed reference stops being fetchable.

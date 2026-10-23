@@ -24,7 +24,7 @@ import (
 	testclock "k8s.io/utils/clock/testing"
 )
 
-// TestRestartPolicyOnExit is item B8's gate (extended by M10.2/B26): it pins the
+// TestRestartPolicyOnExit pins the
 // pure restart-decision helpers — the effective-policy truth table (the pod-level
 // RestartPolicy-on-exit rules, including the Signal check that distinguishes an
 // OOMKilled/SIGKILL termination from a clean exit, plus the container-level
@@ -108,7 +108,7 @@ func TestRestartPolicyOnExit(t *testing.T) {
 		}
 		// The container stays up past the stabilization window before crashing
 		// again, so the next delay resets to base. This clock-driven reset is the
-		// SINGLE reset authority (B26): there is deliberately no explicit Reset()
+		// SINGLE reset authority: there is deliberately no explicit Reset()
 		// that a second caller could drive with different semantics.
 		clk.Step(crashLoopStableWindow + time.Second)
 		if got := b.Next(); got != 10*time.Second {
@@ -118,7 +118,7 @@ func TestRestartPolicyOnExit(t *testing.T) {
 }
 
 // TestEffectivePodRestartPolicy pins the ONE place the corev1 Always default is
-// resolved (B26): the restart decision and the phase derivation both read it, so
+// resolved: the restart decision and the phase derivation both read it, so
 // a divergent default here would let a pod be restarted while reporting Failed.
 func TestEffectivePodRestartPolicy(t *testing.T) {
 	tests := []struct {

@@ -62,7 +62,7 @@ limitations under the License.
 // (admissionregistration.k8s.io/v1), which unlike the Deny/Warn VAPs above CHANGE
 // the stored object. Both inject the provider toleration and NEVER the
 // kubernetes.io/os=darwin nodeSelector — a DaemonSet declares its own placement
-// intent and overriding it would defeat the DS's selector/affinity (Res.7) — and
+// intent and overriding it would defeat the DS's selector/affinity — and
 // both use a JSONPatch on the atomic tolerations list (not an ApplyConfiguration,
 // which would clobber the DefaultTolerationSeconds-injected NoExecute tolerations):
 //   - daemonset-template-provider-toleration: on DaemonSet CREATE and UPDATE, adds
@@ -105,5 +105,5 @@ limitations under the License.
 // (the intent guard) still requires that selector on every pod; the mutating policy
 // injects only the
 // toleration and deliberately does not supply the selector (injecting it would override
-// the DS's placement, Res.7).
+// the DS's placement).
 package policy

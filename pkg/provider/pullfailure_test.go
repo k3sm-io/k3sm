@@ -427,7 +427,7 @@ func countEvents(events []string, substr string) int {
 	return n
 }
 
-// TestPullFailureWaitingStates is the B119 NAMED GATE: the kubelet's image
+// TestPullFailureWaitingStates pins the kubelet's image
 // pull-failure surface, end to end through the provider.
 //
 // It is one test with two groups, because the feature has two halves that must

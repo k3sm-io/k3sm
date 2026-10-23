@@ -218,7 +218,7 @@ func assertWarnPolicy(t *testing.T, policyName, bindingName string, wantInExpr [
 	}
 }
 
-// assertServiceWarnPolicy is the shared check for the M3.1 advisory Service
+// assertServiceWarnPolicy is the shared check for the advisory Service
 // policies: Services matched on CREATE+UPDATE (so a `kubectl edit` that introduces
 // the divergence also warns), routed through assertWarnPolicy.
 func assertServiceWarnPolicy(t *testing.T, policyName, bindingName string, wantInExpr []string, ensure func(kubernetes.Interface) error) {
@@ -381,7 +381,7 @@ func TestProviderTolerationWarn(t *testing.T) {
 	}
 }
 
-// TestEgressAnnotationWarnVAP is the B91 gate. It pins the policy STRUCTURE
+// TestEgressAnnotationWarnVAP pins the policy STRUCTURE
 // (Warn-only, FailurePolicy Ignore — load-bearing: this advisory must never
 // take the cluster down — pods/CREATE only) and then EVALUATES the CEL (not
 // merely greps it): a pod that hand-sets runtimev1.AnnotationInternetEgress
@@ -471,7 +471,7 @@ func TestEgressAnnotationWarnVAP(t *testing.T) {
 	}
 }
 
-// TestXcodeToolchainAnnotationWarnVAP is the B264 admission gate, the exact
+// TestXcodeToolchainAnnotationWarnVAP is the admission test, the exact
 // sibling of TestEgressAnnotationWarnVAP above: it pins the policy STRUCTURE
 // (Warn-only, FailurePolicy Ignore — this advisory must never take the cluster
 // down — pods/CREATE only) and then EVALUATES the CEL rather than grepping it. A
@@ -619,9 +619,9 @@ func egressAnnotationPod(annotations, labels map[string]string) map[string]any {
 	return map[string]any{"metadata": meta}
 }
 
-// TestDaemonSetTolerationInjectedNotNodeSelector is the B76 gate: the MUTATING policy
+// TestDaemonSetTolerationInjectedNotNodeSelector pins that the MUTATING policy
 // EnsureDaemonSetTolerationMutation provisions injects the provider TOLERATION into
-// DaemonSet-owned pods and NEVER the os=darwin nodeSelector (Res.7 — a DaemonSet's own
+// DaemonSet-owned pods and NEVER the os=darwin nodeSelector (a DaemonSet's own
 // placement intent must not be overridden). It asserts the concrete
 // MutatingAdmissionPolicy object: (a) the JSONPatch mutation injects the provider
 // toleration keyed to ProviderTaintKey (Exists/NoSchedule on the tolerations list); (b)
@@ -684,7 +684,7 @@ func TestDaemonSetTolerationInjectedNotNodeSelector(t *testing.T) {
 		}
 	}
 
-	// (b) NEGATIVE PIN (Res.7): the mutation injects ONLY the toleration — the policy
+	// (b) NEGATIVE PIN: the mutation injects ONLY the toleration — the policy
 	// references NEITHER a nodeSelector NOR darwin anywhere (patch, matchConditions, or
 	// anything else). Injecting the os=darwin selector would override the DS's own
 	// placement intent.
@@ -694,7 +694,7 @@ func TestDaemonSetTolerationInjectedNotNodeSelector(t *testing.T) {
 	}
 	for _, banned := range []string{"nodeSelector", "darwin"} {
 		if strings.Contains(blob, banned) {
-			t.Errorf("Res.7 violated: policy must NOT reference %q (toleration only), got %q", banned, blob)
+			t.Errorf("toleration-only rule violated: policy must NOT reference %q (toleration only), got %q", banned, blob)
 		}
 	}
 
@@ -726,7 +726,7 @@ func TestDaemonSetTolerationInjectedNotNodeSelector(t *testing.T) {
 	}
 }
 
-// TestMutatingAdmissionPolicyEnsuredAsV1 is the B504 gate: the toleration injector's
+// TestMutatingAdmissionPolicyEnsuredAsV1 pins that the toleration injector's
 // policy and binding are created, then updated on drift, through
 // admissionregistration.k8s.io/v1 and never through v1beta1.
 func TestMutatingAdmissionPolicyEnsuredAsV1(t *testing.T) {

@@ -232,7 +232,7 @@ func completePod(namespace, name string, cpuNanos, wsBytes uint64) statsv1alpha1
 }
 
 // memoryOnlyPod is the SHAPE THIS ITEM EXISTS TO REJECT: a real working set and no
-// CPU sample at all — what a metrics endpoint built on k3sm's pre-B14 stats would
+// CPU sample at all — what a metrics endpoint built on k3sm's earlier, memory-only stats would
 // have emitted for every pod on the node.
 func memoryOnlyPod(namespace, name string, wsBytes uint64) statsv1alpha1.PodStats {
 	ps := completePod(namespace, name, 0, wsBytes)
@@ -243,7 +243,7 @@ func memoryOnlyPod(namespace, name string, wsBytes uint64) statsv1alpha1.PodStat
 
 // --- the gate ----------------------------------------------------------------
 
-// TestGetMetricsResource is the B14 gate. It drives the provider's
+// TestGetMetricsResource drives the provider's
 // /metrics/resource surface end to end — Summary in, Prometheus families out,
 // through the real expfmt encoder — and judges the result with a
 // metrics-server-shaped consumer (scrapeAsMetricsServer), because that is the only

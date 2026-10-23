@@ -31,7 +31,7 @@ import (
 // These are the M0 "Tier-1" unit tests: pure helpers plus VK-contract behavior of the
 // HostProcess provider, with no privilege or network — just harmless host commands
 // (`/usr/bin/true`, `/bin/sh -c …`). The runtimed gRPC client becomes a second runtime
-// implementation at M2; the provider grows a small Runtime interface seam then (k3sm:M2.1).
+// implementation at M2; the provider grows a small Runtime interface seam then.
 
 func newPod(ns, name string, command ...string) *corev1.Pod {
 	return &corev1.Pod{

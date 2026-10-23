@@ -354,8 +354,8 @@ func (c Collector) installRow(hasDataVolume bool, role dataroot.Role, bothRoles 
 	// `k3sm install --agent` never creates one, so it is an earlier
 	// server-era install whose state directory outlived its daemon. It is said
 	// out loud because an operator who finds that directory reasonably concludes
-	// this Mac still runs a control plane, and because until B324 the report
-	// itself drew that conclusion — it read the stale admin kubeconfig and
+	// this Mac still runs a control plane, and because the report once drew
+	// that conclusion itself — it read the stale admin kubeconfig and
 	// probed the loopback apiserver. Nothing reads it now, so the note is
 	// advisory: like the bothRoles clause above it leaves the severity where the
 	// missing-parts arms put it, and never moves the verdict.

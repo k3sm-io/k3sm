@@ -66,7 +66,7 @@ func headlessService(port int) map[string]any {
 	return svc
 }
 
-// TestReservedPortClauseRejectsDeniedLocalPorts is the B301 gate. It EVALUATES the
+// TestReservedPortClauseRejectsDeniedLocalPorts EVALUATES the
 // Deny policy's CEL (it does not grep the string) and pins the four decisions the
 // policy exists to make:
 //

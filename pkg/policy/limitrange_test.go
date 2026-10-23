@@ -26,13 +26,13 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-// TestDefaultLimitRangeMemoryOnly pins the M10.0 default-LimitRange shape
-// (Res.5): the object lands in the `default` namespace ONLY, is type Container
+// TestDefaultLimitRangeMemoryOnly pins the default-LimitRange shape:
+// the object lands in the `default` namespace ONLY, is type Container
 // with memory defaults present, carries NO cpu key under ANY field (default/
 // defaultRequest/max/min/maxLimitRequestRatio — CPU is best-effort on Darwin,
 // so a CPU row would over-claim a guarantee k3sm cannot keep), and is
 // create-or-update (a pre-existing object is reconciled onto the shipped defaults
-// — B153; see the sub-test for why that contract was reversed).
+// — see the sub-test for why that contract was reversed).
 func TestDefaultLimitRangeMemoryOnly(t *testing.T) {
 	ctx := context.Background()
 
@@ -81,7 +81,7 @@ func TestDefaultLimitRangeMemoryOnly(t *testing.T) {
 		}
 	})
 
-	// B153 REVERSED this sub-test's contract. It used to assert create-if-absent
+	// The create-or-update change REVERSED this sub-test's contract. It used to assert create-if-absent
 	// ("in-cluster objects are operator-space — never update"), which is the same
 	// create-only path that made a changed admission policy inert on every existing
 	// cluster. An object carrying k3sm.io/managed is k3sm-owned, so it is now

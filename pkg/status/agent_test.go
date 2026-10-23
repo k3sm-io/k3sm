@@ -178,7 +178,7 @@ func agentCollector(t *testing.T, p Paths, fsys fakeFS) Collector {
 	}
 }
 
-// TestStatusReportsTheAgentDaemon is the gate for B310: on a Mac installed as a
+// TestStatusReportsTheAgentDaemon pins that on a Mac installed as a
 // joining worker, `k3sm status` reports the agent daemon AND the credential
 // that makes it a cluster member — and on a control plane it reports exactly
 // what it always did.
@@ -286,7 +286,7 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 				wantIn: "does not parse",
 			},
 			{
-				// B340: complete, matched and in date, and still unusable —
+				// Complete, matched and in date, and still unusable —
 				// the apiserver dials this node's :10250 at the address it was
 				// assigned and the certificate names another one.
 				name: "address-mismatch — the certificate names an address this node is not assigned",
@@ -423,8 +423,8 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 	})
 }
 
-// TestWorkerStatusIsNotDegradedByItsControlPlane is the pkg half of the B324
-// gate: on a worker, the apiserver and node rows describe a control plane on
+// TestWorkerStatusIsNotDegradedByItsControlPlane is the pkg half of the
+// worker-verdict test: on a worker, the apiserver and node rows describe a control plane on
 // ANOTHER Mac, so they warn and never carry the verdict — and a leftover
 // control-plane work dir is named as a leftover rather than reported on. The
 // cmd half (which credentials are resolved, and what is dialled) is

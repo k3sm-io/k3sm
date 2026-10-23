@@ -47,13 +47,13 @@ type fakeRuntimeServer struct {
 	mu           sync.Mutex
 	created      map[string]*runtimev1.PodBox
 	started      time.Time
-	footprint    map[string]uint64 // pod id -> working-set bytes (M2.3 metrics)
-	lastGrace    int64             // grace_period_seconds of the last DeletePod (M2.3)
+	footprint    map[string]uint64 // pod id -> working-set bytes (metrics)
+	lastGrace    int64             // grace_period_seconds of the last DeletePod
 	graces       []int64           // grace_period_seconds of every DeletePod, in order
-	gotSA        string            // ServiceAccount bound on the last CreatePod ctx (M2.4)
-	restartCalls int               // RestartContainer RPC invocations (M2.2 swap)
+	gotSA        string            // ServiceAccount bound on the last CreatePod ctx
+	restartCalls int               // RestartContainer RPC invocations
 	lastRestart  restartRecord     // args of the last RestartContainer RPC
-	restartErr   error             // when set, RestartContainer fails (the B26 retry path)
+	restartErr   error             // when set, RestartContainer fails (the retry path)
 	// restartResp, when set, is the response every RestartContainer answers: a
 	// typed refusal (a vm guest without the verb, a pod being stopped).
 	restartResp *runtimev1.RestartContainerResponse
@@ -69,7 +69,7 @@ type fakeRuntimeServer struct {
 	stopResp  *runtimev1.StopContainerResponse
 	stopped   map[string]map[string]bool // pod id -> container name -> stopped
 
-	// The StartContainer seam of the B119 pull-retry path (see pullfailure_test.go):
+	// The StartContainer seam of the pull-retry path (see pullfailure_test.go):
 	// a FIFO of queued outcomes, a call tally, and an optional hold channel that
 	// parks the handler so a test can observe the provider inside its attempt
 	// window. An exhausted FIFO answers success.
@@ -82,7 +82,7 @@ type fakeRuntimeServer struct {
 	// pod-scoped retry from a bare goroutine on context.Background.
 	startCancels int
 
-	// The CreatePod/DeletePod seams of the B119 parked-create path: a FIFO of
+	// The CreatePod/DeletePod seams of the parked-create path: a FIFO of
 	// refusals the fake answers before its default success (the vm shape, where
 	// a container-class image failure fails the whole create), call tallies, and
 	// an optional hold on DeletePod so the delete ORDER — cancel the pull
@@ -147,7 +147,7 @@ func (f *fakeRuntimeServer) setConditions(id string, conds ...*runtimev1.PodCond
 }
 
 // setRestartErr makes every subsequent RestartContainer RPC fail with err (nil
-// restores success), so the B26 re-exec-failure retry loop is testable.
+// restores success), so the re-exec-failure retry loop is testable.
 func (f *fakeRuntimeServer) setRestartErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -163,7 +163,7 @@ func (f *fakeRuntimeServer) setRestartResp(resp *runtimev1.RestartContainerRespo
 }
 
 // restartRecord captures the arguments of a RestartContainer RPC so the probe
-// runner's wiring to the runtime action is observable at the seam (M2.2 swap).
+// runner's wiring to the runtime action is observable at the seam.
 type restartRecord struct {
 	podID     string
 	container string
@@ -230,7 +230,7 @@ func newFakeRuntimeServer() *fakeRuntimeServer {
 	return &fakeRuntimeServer{created: map[string]*runtimev1.PodBox{}, footprint: map[string]uint64{}, started: time.Unix(5000, 0)}
 }
 
-// ListPodStats serves the typed kubectl-top metrics path (apis:M2.2): it renders a
+// ListPodStats serves the typed kubectl-top metrics path: it renders a
 // PodStats per created pod that has a recorded footprint, attributing the
 // working-set to both the pod and each of its containers. A pod with no footprint
 // (the unlimited-pod / no-sampler case) is omitted, mirroring runtimed.
@@ -267,7 +267,7 @@ func (f *fakeRuntimeServer) ListPodStats(_ context.Context, req *runtimev1.ListP
 }
 
 // RestartContainer records the in-place container restart the provider's probe
-// runner drives on a committed liveness failure (apis:M2.2 swap), returning a
+// runner drives on a committed liveness failure, returning a
 // successful response with the restarted container's status.
 func (f *fakeRuntimeServer) RestartContainer(_ context.Context, req *runtimev1.RestartContainerRequest) (*runtimev1.RestartContainerResponse, error) {
 	f.mu.Lock()
@@ -287,9 +287,9 @@ func (f *fakeRuntimeServer) RestartContainer(_ context.Context, req *runtimev1.R
 func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
 	f.mu.Lock()
 	f.createCalls++
-	// Record the ServiceAccount the provider bound to the ctx so the M2.4
+	// Record the ServiceAccount the provider bound to the ctx so the
 	// per-pod SA-token binding is observable at the runtime seam. An unbound ctx
-	// records "" — the fail-closed shape, not a silent "default" (B226).
+	// records "" — the fail-closed shape, not a silent "default".
 	if id, ok := podIdentityFromContext(ctx); ok {
 		f.gotSA = id.serviceAccount
 	} else {
@@ -528,7 +528,7 @@ func runtimedPod(ns, name string) *corev1.Pod {
 	}
 }
 
-// TestRuntimedCreateRunning is the unit-level proof of M1.3: a pod handed to the
+// TestRuntimedCreateRunning is the unit-level proof that a pod handed to the
 // runtimed-backed provider comes back Running with the gate-filling PodBox sent
 // to the runtime.
 func TestRuntimedCreateRunning(t *testing.T) {
@@ -627,7 +627,7 @@ func TestRuntimedDeleteForgets(t *testing.T) {
 	}
 }
 
-// TestRuntimedStatsSummaryFootprint is the M2.3-a1 proof that GetStatsSummary
+// TestRuntimedStatsSummaryFootprint proves that GetStatsSummary
 // reports the runtimed working-set footprint: a fake PodMetrics value flows into
 // the Summary API the kubelet serves (kubectl top reads it).
 func TestRuntimedStatsSummaryFootprint(t *testing.T) {
@@ -680,7 +680,7 @@ func TestRuntimedStatsSummaryUnsampled(t *testing.T) {
 	}
 }
 
-// TestStatsSummaryFromListPodStats is the M2.2-swap proof that GetStatsSummary
+// TestStatsSummaryFromListPodStats proves that GetStatsSummary
 // builds the kubelet Summary from the typed ListPodStats RPC (not the in-proc
 // PodMetrics path): a fake ListPodStats footprint flows through the wire contract
 // into the Summary's working-set (pod + per-container), and the stable per-pod
@@ -725,7 +725,7 @@ func TestStatsSummaryFromListPodStats(t *testing.T) {
 	}
 }
 
-// TestRuntimedDeleteGrace is the M2.3-a1 proof for the SIGTERM→SIGKILL grace: the
+// TestRuntimedDeleteGrace is the proof for the SIGTERM→SIGKILL grace: the
 // pod's terminationGracePeriodSeconds is passed through to runtimed, and the k8s
 // 30s default is applied when unset (runtimed treats 0 as immediate-kill).
 func TestRuntimedDeleteGrace(t *testing.T) {
@@ -761,13 +761,13 @@ func TestRuntimedDeleteGrace(t *testing.T) {
 }
 
 // TestVMBackendAvailableFromInfo covers the pure GetRuntimeInfo->vm-capability
-// mapping the node uses to set the k3sm.io/virtualization label (B1): the
+// mapping the node uses to set the k3sm.io/virtualization label: the
 // VMBackendAvailable condition TRUE => capable; FALSE, a missing condition (an
-// older runtimed that predates B1), or a nil response => NOT capable (fail-closed,
+// older runtimed that predates the vm condition), or a nil response => NOT capable (fail-closed,
 // so a probe/skew miss never FALSELY advertises a node as vm-schedulable).
 //
-// B103 consolidated the three capability readers into nodeCapabilitiesFromInfo, so
-// this B1 proof now reads the VMBackend field of that mapper — same assertions,
+// The three capability readers are consolidated into nodeCapabilitiesFromInfo, so
+// this proof reads the VMBackend field of that mapper — same assertions,
 // same fail-closed verdicts, one mapper. The condition Types come from the IMPORTED
 // runtimed constants (never restated literals), for the same reason the mapper imports
 // them: a producer/consumer rename must be a compile error here, not a permanently
@@ -789,7 +789,7 @@ func TestVMBackendAvailableFromInfo(t *testing.T) {
 		{"vm unavailable", &runtimev1.GetRuntimeInfoResponse{Conditions: []*runtimev1.RuntimeCondition{
 			cond(runtimed.ConditionVMBackendAvailable, runtimev1.ConditionStatus_CONDITION_STATUS_FALSE),
 		}}, false},
-		{"condition missing (older runtimed, pre-B1)", &runtimev1.GetRuntimeInfoResponse{Conditions: []*runtimev1.RuntimeCondition{
+		{"condition missing (older runtimed, before the condition existed)", &runtimev1.GetRuntimeInfoResponse{Conditions: []*runtimev1.RuntimeCondition{
 			cond(runtimed.ConditionSandboxBackend, runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
 		}}, false},
 		{"nil response", nil, false},

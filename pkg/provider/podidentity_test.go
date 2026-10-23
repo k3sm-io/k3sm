@@ -25,7 +25,7 @@ import (
 )
 
 // TestPodExecutionUID pins the derivation of the uid the foreign-user admission
-// ceiling is parameterised with (B153 sub-decision 1). The lookup is INJECTED so
+// ceiling is parameterised with. The lookup is INJECTED so
 // the table is hermetic: whether `_k3sm` exists on the machine running the test
 // must not decide the verdict.
 func TestPodExecutionUID(t *testing.T) {

@@ -27,7 +27,7 @@ import (
 	"testing"
 )
 
-// vkModulePath is the Virtual Kubelet module import path. B67 confines every
+// vkModulePath is the Virtual Kubelet module import path. The provider confines every
 // import of it (and its subpackages) to the vkadapter package; TestVKImportsConfined
 // ToAdapter is the module-wide gate that keeps it that way.
 const vkModulePath = "github.com/virtual-kubelet/virtual-kubelet"
@@ -68,7 +68,7 @@ func importsVK(importPath string) bool {
 	return importPath == vkModulePath || strings.HasPrefix(importPath, vkModulePath+"/")
 }
 
-// TestVKImportsConfinedToAdapter is the B67 module-wide gate: EVERY .go file under
+// TestVKImportsConfinedToAdapter is the module-wide check: EVERY .go file under
 // the module (including _test.go) is lexically parsed for its imports, and any
 // import of the Virtual Kubelet module (or a subpackage) is a FAILURE unless the
 // file lives in the vkadapter package directory — the single sanctioned seam.
@@ -155,7 +155,7 @@ func TestVKImportsConfinedToAdapter(t *testing.T) {
 			return
 		}
 		for _, o := range offenders {
-			t.Errorf("%s imports %q directly — route it through k3sm.io/k3sm/pkg/provider/vkadapter instead (B67 confinement)", o.file, o.importPath)
+			t.Errorf("%s imports %q directly — route it through k3sm.io/k3sm/pkg/provider/vkadapter instead (VK confinement)", o.file, o.importPath)
 		}
 	})
 
@@ -171,7 +171,7 @@ func TestVKImportsConfinedToAdapter(t *testing.T) {
 			t.Fatalf("no .go files found in the vkadapter dir %s; the confinement target is missing, so the gate proves nothing", adapterDir)
 		}
 		if !adapterVKimp {
-			t.Fatalf("vkadapter (%s) does not import %q — B67 confines VK coupling THERE, so if the adapter holds none the confinement is a no-op and this gate is vacuous", adapterDir, vkModulePath)
+			t.Fatalf("vkadapter (%s) does not import %q — the provider confines VK coupling THERE, so if the adapter holds none the confinement is a no-op and this gate is vacuous", adapterDir, vkModulePath)
 		}
 	})
 }

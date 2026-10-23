@@ -30,7 +30,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 )
 
-// TestGuestNetworkCarriesTheDNSVIP is the B612 gate: a vm pod's guest network
+// TestGuestNetworkCarriesTheDNSVIP pins that a vm pod's guest network
 // carries the cluster DNS VIP its resolv.conf names, on a server and on a worker,
 // and the provisioning log line prints that address.
 //

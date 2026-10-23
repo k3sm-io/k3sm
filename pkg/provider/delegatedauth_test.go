@@ -164,7 +164,7 @@ var delegatedRoutes = []string{
 	"/containerLogs/default/web/app",
 }
 
-// TestKubeletDelegatedAuth is the B93 gate on the kubelet endpoint: a bearer
+// TestKubeletDelegatedAuth pins delegated auth on the kubelet endpoint: a bearer
 // token is admitted ONLY on the read-only resource-metrics routes, ONLY after
 // the apiserver authenticated it (TokenReview) and authorized nodes/metrics or
 // nodes/stats on this node (SubjectAccessReview), and every review failure is a
@@ -177,7 +177,7 @@ var delegatedRoutes = []string{
 // because on this surface the load-bearing claim is that a refused caller never
 // reaches the route, not only that the status code is right.
 //
-// Before B93 the token rows could not be expressed: ServingTLS required a client
+// Before delegated auth the token rows could not be expressed: ServingTLS required a client
 // certificate, so a cert-less metrics-server scrape failed the handshake and every
 // "200" row below failed.
 func TestKubeletDelegatedAuth(t *testing.T) {
