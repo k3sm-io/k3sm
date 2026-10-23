@@ -842,6 +842,10 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		// The worker's own Service proxy is where its vm pods' live guest leases
 		// are published; nil when the worker runs no datapath.
 		transportOverrides: nodeTransportOverrides(datapath, mode),
+
+		// The cluster's one registry name, fetched from the server's mesh
+		// address over TLS verified against the cluster CA this join pinned.
+		flatRegistry: agentFlatRegistry(res),
 	}
 }
 

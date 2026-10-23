@@ -884,6 +884,9 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		// peer-mirror brokering. Zero on a node with no registry.
 		localRegistryHost: w.registryPuller.LocalHost,
 		clusterRegistries: w.registryPuller.ClusterRegistries,
+		// The cluster's one registry name, fetched from this server's own
+		// registry on loopback; zero when it runs none.
+		flatRegistry: w.registryPuller.Flat,
 		// This server's own kine port — the SAME resolved value (flag or default)
 		// that reaches executor.Config.KinePort — so every pod's SBPL denies
 		// connect() to the node's plaintext datastore listener. The deny is by

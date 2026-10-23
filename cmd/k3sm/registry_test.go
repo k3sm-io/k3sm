@@ -278,6 +278,9 @@ func TestStartIngestRegistry(t *testing.T) {
 		if puller.LocalHost != registrysvc.LoopbackAuthority(6450) {
 			t.Errorf("LocalHost = %q, want %q", puller.LocalHost, registrysvc.LoopbackAuthority(6450))
 		}
+		if want := serverFlatRegistry(6450); puller.Flat.Addr != want.Addr || puller.Flat.TLS || puller.Flat.aliasPort != 6450 {
+			t.Errorf("Flat = %+v, want the loopback endpoint %+v", puller.Flat, want)
+		}
 		published, err := cs.CoreV1().Services(registrysvc.FlatServiceNamespace).
 			Get(context.Background(), registrysvc.FlatServiceName, metav1.GetOptions{})
 		if err != nil {
@@ -467,6 +470,7 @@ func TestRegistryPullerWiringIsAccepted(t *testing.T) {
 		if w.LocalHost != "" {
 			opts = append(opts, image.WithLocalRegistry(w.LocalHost))
 		}
+		opts = append(opts, image.WithFlatRegistry(w.Flat.mapping()))
 		_, perr := image.NewPuller(cache, image.RemoteFetch, image.NoLocalIndex{}, opts...)
 		return perr
 	}
@@ -476,7 +480,7 @@ func TestRegistryPullerWiringIsAccepted(t *testing.T) {
 		for _, name := range registrysvc.FlatServiceDNSNames("cluster.local") {
 			cluster = append(cluster, net.JoinHostPort(name, strconv.Itoa(registrysvc.FlatServicePort)))
 		}
-		w := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(6450), ClusterRegistries: cluster}
+		w := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(6450), ClusterRegistries: cluster, Flat: serverFlatRegistry(6450)}
 		if err := newPuller(w); err != nil {
 			t.Fatalf("runtimed refuses the wiring this node publishes (%+v): %v", w, err)
 		}
@@ -485,7 +489,7 @@ func TestRegistryPullerWiringIsAccepted(t *testing.T) {
 	t.Run("a node with no registry Service", func(t *testing.T) {
 		// Loopback alone is cluster-local unconditionally, so the single-Mac
 		// wiring must be accepted with no authority set at all.
-		w := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(6450)}
+		w := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(6450), Flat: serverFlatRegistry(6450)}
 		if err := newPuller(w); err != nil {
 			t.Fatalf("runtimed refuses the single-node wiring (%+v): %v", w, err)
 		}
