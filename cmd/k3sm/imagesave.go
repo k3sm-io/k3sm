@@ -114,6 +114,7 @@ func saveImageArchive(ctx context.Context, client runtimev1.ImagesClient, req *r
 // streamSaveImage drains the export stream into w and returns what the terminal
 // frame reported.
 func streamSaveImage(ctx context.Context, client runtimev1.ImagesClient, req *runtimev1.SaveImageRequest, w io.Writer, socket string) (savedArchive, error) {
+	//lint:ignore SA1019 the node-store image verbs stay until build and load move to the registry
 	stream, err := client.SaveImage(ctx, req)
 	if err != nil {
 		return savedArchive{}, imageRPCError("save image", socket, err)
