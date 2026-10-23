@@ -35,6 +35,10 @@ limitations under the License.
 // 2026-09-21 to 2026-09-23. A re-pin re-records every file below from a tagged
 // upstream release and updates this commit alongside ChartVersion.
 //
+// The fleet's images run one patch ahead of the chart (1.5.1 against chart 1.5.0)
+// because upstream publishes no 1.5.1 OCI chart; the staged mirror manifest
+// explains why that is safe, and a test holds ChartVersion to the staged chart.
+//
 // The pinned set is six custom resources, and the tests assert that count:
 // DynamoComponentDeployment, DynamoGraphDeploymentRequest,
 // DynamoGraphDeployment, DynamoGraphDeploymentScalingAdapter, DynamoModel and
