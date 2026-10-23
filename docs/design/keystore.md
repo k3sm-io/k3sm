@@ -115,4 +115,4 @@ The maintainer's answers to the four questions asked in issue 731:
 Owed by the implementation: the acceptance gate script for Phase A, under
 `hack/acceptance/`, named in the implementation pull request.
 
-Still open: (add questions here as review raises them)
+No open questions yet.

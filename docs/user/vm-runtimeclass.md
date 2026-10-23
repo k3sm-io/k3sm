@@ -111,15 +111,7 @@ discipline merges `stdout` and `stderr` before either leaves the container, so `
 A container with `stdin: true` and no terminal keeps a writable pipe instead. A container that
 declares neither is started exactly as before.
 
-## Logs
-
-A `vm` Pod's logs are the same files a native Pod's are. The guest's output is relayed to the node
-and written to `/var/log/pods/<namespace>_<pod>_<uid>/<container>/<restartCount>.log` in the CRI
-format, by the same writer, so there is one log tree on the node and one reader over it. Rotation,
-`--previous` after a restart, the flat `/var/log/containers` symlinks and a host-level log shipper
-all behave identically on both paths. [Container logs](logs.md) is the full page.
-
-Then:
+Then attach to it:
 
 ```sh
 kubectl attach -it untrusted-job
@@ -175,6 +167,14 @@ therefore arrive slightly later than usual: 89 to 178 ms from the guest opening 
 
 This is expected and needs no action. The guest's short wait for link and its DHCP retry cover it,
 and later `vm` Pods on the same bridge are not affected.
+
+## Logs
+
+A `vm` Pod's logs are the same files a native Pod's are. The guest's output is relayed to the node
+and written to `/var/log/pods/<namespace>_<pod>_<uid>/<container>/<restartCount>.log` in the CRI
+format, by the same writer, so there is one log tree on the node and one reader over it. Rotation,
+`--previous` after a restart, the flat `/var/log/containers` symlinks and a host-level log shipper
+all behave identically on both paths. [Container logs](logs.md) is the full page.
 
 ## Trade-Offs
 
