@@ -83,9 +83,6 @@ func (o gateOp) String() string {
 	}
 }
 
-// isWrite reports whether op must be authenticated and authorized.
-func (o gateOp) isWrite() bool { return o >= opUploadStart }
-
 // gateRoute is classify's answer.
 type gateRoute struct {
 	op gateOp

@@ -141,3 +141,6 @@ func FuzzClassify(f *testing.F) {
 		}
 	})
 }
+
+// isWrite reports whether op must be authenticated and authorized.
+func (o gateOp) isWrite() bool { return o >= opUploadStart }
