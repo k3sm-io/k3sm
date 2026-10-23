@@ -16,7 +16,9 @@
 #
 # Every failure is NAMED, on stderr, so a red says what broke:
 #   "govulncheck missing or wrong version", "vuln DB unreachable",
-#   "no config message", "malformed JSON stream", "govulncheck failed".
+#   "no config message", "malformed JSON stream", "govulncheck failed",
+#   "vulnerability database is not the production one", "vulnerability
+#   database is stale".
 #
 # Nothing here sets GOFLAGS, GOSUMDB, GOPROXY or any other variable that changes
 # how modules or the vulnerability database are verified. The caller sets
@@ -61,20 +63,25 @@ gv_find() {
 # function in its trace (the binary links a vulnerable symbol), else
 # `info <id> <module>@<version>`.
 #
+# With no -db (every real scan) the config message must name the production
+# database, https://vuln.go.dev, and its db_last_modified must be no more than
+# GV_DB_MAX_AGE_DAYS before the scan date; a scan against another or a stale
+# database is a named red. A -db scan (the hermetic self-test) skips that check.
+#
 # A stripped binary (-ldflags -s) has no symbol table, and govulncheck then
 # reports every symbol of an affected package as present (a function of the
 # form `<pkg>/*`), so a stripped child is scanned conservatively: its module-level
 # findings become symbol-level ones.
 # shellcheck disable=SC2016 # python source, not shell
 GV_PARSE_PY='
-import json, re, sys
-out, err, rc, pin = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+import datetime, json, re, sys
+out, err, rc, pin, dbarg, maxage = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], int(sys.argv[6])
 data = open(out, encoding="utf-8", errors="replace").read()
 errtext = open(err, encoding="utf-8", errors="replace").read().strip()
 def fail(name, detail=""):
     sys.stderr.write("govulncheck: " + name + (": " + detail if detail else "") + "\n")
     sys.exit(1)
-DB = re.compile(r"creating client|fetching vulnerabilities|vulndb|vuln\.go\.dev|dial tcp|no such host|i/o timeout|connection refused|connection reset|TLS handshake|unexpected status|index/(db|modules)|no such file or directory", re.I)
+DB = re.compile(r"creating client|fetching vulnerabilities|vulndb|vuln\.go\.dev|dial tcp|no such host|i/o timeout|connection refused|connection reset|TLS handshake|unexpected status|index/(db|modules)", re.I)
 if rc != 0:
     if DB.search(errtext):
         fail("vuln DB unreachable", errtext.splitlines()[-1] if errtext else "")
@@ -99,6 +106,17 @@ if cfg.get("scanner_version") != pin:
     fail("govulncheck missing or wrong version", "the stream reports %r, the pin is %s" % (cfg.get("scanner_version"), pin))
 if cfg.get("scan_mode") != "binary":
     fail("malformed JSON stream", "scan_mode %r, want binary" % cfg.get("scan_mode"))
+if not dbarg:
+    if cfg.get("db") != "https://vuln.go.dev":
+        fail("vulnerability database is not the production one", "(%s)" % cfg.get("db"))
+    lm = cfg.get("db_last_modified")
+    try:
+        lmd = datetime.date.fromisoformat(str(lm)[:10])
+    except ValueError:
+        lmd = None
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    if lmd is None or (today - lmd).days > maxage:
+        fail("vulnerability database is stale", "(%s)" % lm)
 osv = {}
 for m in msgs:
     f = m.get("finding")
@@ -116,6 +134,9 @@ for oid in sorted(osv):
     print(("symbol %s %s %s" % (oid, e["mod"], e["sym"])) if e["sym"] else ("info %s %s" % (oid, e["mod"])))
 '
 
+# GV_DB_MAX_AGE_DAYS: how old the production database's db_last_modified may be.
+GV_DB_MAX_AGE_DAYS=30
+
 # gv_scan_binary <govulncheck> <pin> <binary> [<db-url>]: scan one binary
 # (-mode=binary -format json; the default database unless <db-url> is given) and
 # print the reduced lines above. Returns 1, the failure named on stderr, when the
@@ -131,7 +152,7 @@ gv_scan_binary() {
 		"$gv" -mode=binary -format json "$bin" >"$tmp/out" 2>"$tmp/err" || rc=$?
 	fi
 	local res=0
-	python3 -I -c "$GV_PARSE_PY" "$tmp/out" "$tmp/err" "$rc" "$pin" || res=1
+	python3 -I -c "$GV_PARSE_PY" "$tmp/out" "$tmp/err" "$rc" "$pin" "$db" "$GV_DB_MAX_AGE_DAYS" || res=1
 	rm -rf "$tmp"
 	return "$res"
 }
@@ -143,13 +164,20 @@ gv_scan_binary() {
 #
 # An entry allows the symbol-level finding <GO-id> in <child> at exactly
 # <child-version> (a pin bump makes the entry match nothing, which re-triggers
-# review) until the end of <expiry>. A malformed entry, an expired entry, and in
-# a scan an entry matching no finding (stale) are each a red.
+# review) until the end of <expiry>. The reason is at least GV_ALLOW_MIN_REASON
+# characters and the expiry at most GV_ALLOW_MAX_DAYS days after today, so every
+# entry is re-reviewed on a schedule. A malformed entry, an expired entry, and in
+# a scan an entry matching no symbol-level finding (stale) are each a red, and
+# so is a malformed findings line.
+GV_ALLOW_MIN_REASON=20
+GV_ALLOW_MAX_DAYS=120
+GV_FIX_HINT="bump the child's pin (pkg/executor for kubernetes, the pin files read_pins reads for the rest) or name it in hack/release/govulncheck.allow with a reason and an expiry"
 # shellcheck disable=SC2016 # python source, not shell
 GV_ALLOW_PY='
 import datetime, re, sys
-mode, allow, today = sys.argv[1], sys.argv[2], sys.argv[3]
-findings = sys.argv[4] if len(sys.argv) > 4 else None
+mode, allow, today, minreason, maxdays, hint = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
+findings = sys.argv[7] if len(sys.argv) > 7 else None
+horizon = (datetime.date.fromisoformat(today) + datetime.timedelta(days=maxdays)).isoformat()
 probs, entries, seen = [], [], set()
 try:
     lines = open(allow, encoding="utf-8").read().splitlines()
@@ -173,27 +201,31 @@ for n, raw in enumerate(lines, 1):
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", exp): raise ValueError
     except ValueError:
         probs.append("%s: expiry %r is not a YYYY-MM-DD date" % (where, exp)); continue
-    if not reason.strip():
-        probs.append("%s: no reason" % where); continue
+    if len(reason.strip()) < minreason:
+        probs.append("%s: reason %r is shorter than %d characters: say why shipping the finding is acceptable" % (where, reason.strip(), minreason)); continue
     key = (oid, child, ver)
     if key in seen:
         probs.append("%s: duplicate entry for %s %s %s" % (where, oid, child, ver)); continue
     seen.add(key)
     if exp < today:
         probs.append("%s: EXPIRED %s on %s (%s %s %s): fix it or re-review and extend the entry" % (where, exp, today, oid, child, ver))
+    elif exp > horizon:
+        probs.append("%s: expiry %s is more than %d days after %s (latest %s): re-review sooner" % (where, exp, maxdays, today, horizon))
     entries.append({"key": key, "where": where, "used": False})
 if mode == "check":
     unallowed = []
     for line in open(findings, encoding="utf-8").read().splitlines():
         f = line.split()
-        if len(f) < 5:
+        if not line.strip():
             continue
+        if len(f) < 5:
+            probs.append("malformed findings line %r: want <child> <version> <kind> <id> <module>" % line); continue
         child, ver, kind, oid, mod = f[0], f[1], f[2], f[3], f[4]
         sym = f[5] if len(f) > 5 else ""
         hit = [e for e in entries if e["key"] == (oid, child, ver)]
-        for e in hit:
-            e["used"] = True
         if kind == "symbol":
+            for e in hit:
+                e["used"] = True
             if hit:
                 print("allowed  %s %s: %s in %s (%s) [%s]" % (child, ver, oid, mod, sym, hit[0]["where"]))
             else:
@@ -201,19 +233,19 @@ if mode == "check":
         else:
             print("info     %s %s: %s in %s (no vulnerable symbol in the binary)" % (child, ver, oid, mod))
     for u in unallowed:
-        probs.append("FINDING  " + u + " (fix it, or name it in the allow file with a reason and an expiry)")
+        probs.append("FINDING  " + u + " (" + hint + ")")
     for e in entries:
         if not e["used"]:
-            probs.append("%s: STALE, %s %s %s matches no finding in this scan: delete it" % ((e["where"],) + e["key"]))
+            probs.append("%s: STALE, %s %s %s matches no symbol-level finding in this scan: delete it" % ((e["where"],) + e["key"]))
 for p in probs:
     print(p)
 sys.exit(1 if probs else 0)
 '
 
-# gv_allow_lint <allow-file> <today YYYY-MM-DD>: format and expiry only (no
+# gv_allow_lint <allow-file> <today YYYY-MM-DD>: format, reason and expiry (no
 # scan, so no stale check). Problems on stdout; non-zero when there are any.
 gv_allow_lint() {
-	python3 -I -c "$GV_ALLOW_PY" lint "$1" "$2"
+	python3 -I -c "$GV_ALLOW_PY" lint "$1" "$2" "$GV_ALLOW_MIN_REASON" "$GV_ALLOW_MAX_DAYS" "$GV_FIX_HINT"
 }
 
 # gv_allow_check <allow-file> <today> <findings-file>: <findings-file> holds
@@ -221,7 +253,7 @@ gv_allow_lint() {
 # prefixed). Prints every allowed and informational finding; non-zero, naming
 # each, on an unallowed symbol-level finding, a malformed, expired or stale entry.
 gv_allow_check() {
-	python3 -I -c "$GV_ALLOW_PY" check "$1" "$2" "$3"
+	python3 -I -c "$GV_ALLOW_PY" check "$1" "$2" "$GV_ALLOW_MIN_REASON" "$GV_ALLOW_MAX_DAYS" "$GV_FIX_HINT" "$3"
 }
 
 # gv_scan_children <govulncheck> <pin> <allow-file> <today> <db-url|""> [<child> <version> <path>]...

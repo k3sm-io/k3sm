@@ -596,36 +596,53 @@ refuse_unpinned_payload() {
 # a red, never a skip.
 
 # child_scan_version <name>: the pin a staged cp-payload file was built or
-# downloaded at, the version the allow file keys on. Needs read_pins.
+# downloaded at, the version the allow file keys on. Needs read_pins. Returns 1
+# for a name with no mapping, and 2, the child named on stderr, when the mapping
+# resolves to an empty version (read_pins not run, or the pin unset).
 child_scan_version() {
+	local v
 	case "$1" in
-	kube-apiserver | kube-scheduler | kube-controller-manager | kubectl) echo "$KUBE_VERSION" ;;
-	kine) echo "$KINE_VERSION" ;;
-	etcd | etcdutl) echo "$ETCD_VERSION" ;;
-	zot) echo "$ZOT_VERSION" ;;
-	"$HELM_BINARY") echo "$HELM_VERSION" ;;
+	kube-apiserver | kube-scheduler | kube-controller-manager | kubectl) v="$KUBE_VERSION" ;;
+	kine) v="$KINE_VERSION" ;;
+	etcd | etcdutl) v="$ETCD_VERSION" ;;
+	zot) v="$ZOT_VERSION" ;;
+	"$HELM_BINARY") v="$HELM_VERSION" ;;
 	*) return 1 ;;
 	esac
+	[ -n "$v" ] || { echo "child_scan_version: $1 resolves to an empty version (read_pins not run, or its pin unset)" >&2; return 2; }
+	printf '%s\n' "$v"
 }
 
 # child_scan_set <payload-dir>: `<child> <version> <path>` per Go binary of
 # release_payload_files (version markers skipped; helm under its unversioned
-# name, as the allow file writes it). A listed file that is missing, or has no
-# version mapping, is named on stdout and returns 1; a file that is not a Go
-# binary is noted on stderr and skipped.
+# name, as the allow file writes it). A listed file that is missing, has no
+# version mapping or an empty version, or that `go version` cannot read as a Go
+# binary is named on stdout and returns 1.
 child_scan_set() {
-	local dir="$1" rel name child ver bad=0
+	local dir="$1" rel name child ver bad=0 vrc
 	while IFS= read -r rel; do
 		case "$rel" in *.version | "") continue ;; esac
 		name="${rel#cp-payload/}"
 		child="$name"
 		[ "$name" = "$HELM_BINARY" ] && child=helm
-		ver="$(child_scan_version "$name")" || { echo "PROBLEM $name: no version mapping in child_scan_version (add one so the scan can key the allow file)"; bad=1; continue; }
-		[ -f "$dir/$name" ] || { echo "PROBLEM $name: not staged in $dir"; bad=1; continue; }
-		if ! "$GO" version "$dir/$name" >/dev/null 2>&1; then
-			echo "    skip $name: not a Go binary" >&2
+		vrc=0
+		ver="$(child_scan_version "$name")" || vrc=$?
+		if [ "$vrc" = 1 ]; then
+			echo "PROBLEM $name: no version mapping in child_scan_version (add one so the scan can key the allow file)"
+			bad=1
+			continue
+		elif [ "$vrc" != 0 ]; then
+			echo "PROBLEM $name: empty version (read_pins not run, or its pin unset)"
+			bad=1
 			continue
 		fi
+		[ -f "$dir/$name" ] || { echo "PROBLEM $name: not staged in $dir"; bad=1; continue; }
+		# `go version <file>` exits 0 even for a file it cannot read, so the verdict
+		# is its stdout: "<file>: go<version>" for a Go binary, nothing otherwise.
+		case "$("$GO" version "$dir/$name" 2>/dev/null)" in
+		"$dir/$name: go"[0-9]*) ;;
+		*) echo "PROBLEM $name: not a readable Go binary; every entry of release_payload_files must be one"; bad=1; continue ;;
+		esac
 		printf '%s %s %s\n' "$child" "$ver" "$dir/$name"
 	done < <(release_payload_files)
 	return "$bad"
@@ -657,9 +674,10 @@ children_vuln_scan() {
 # and govulncheck reads a planted local database (-db file://...), so no case
 # touches the network. Uses self_test's ok/bad.
 gv_self_test() {
-	local t="$1/gv" pin gv today o rc probe plain
+	local t="$1/gv" pin gv today soon far o rc probe plain
 	local plant="$t/db-plant" info="$t/db-info"
 	today="$(date -u +%Y-%m-%d)"
+	soon="$(date -u -v+30d +%Y-%m-%d)" far="$(date -u -v+200d +%Y-%m-%d)"
 	mkdir -p "$t/prog" "$plant" "$info"
 	printf 'module example.com/gvprobe\n\ngo 1.26\n' >"$t/prog/go.mod"
 	cat >"$t/prog/main.go" <<'GO'
@@ -714,14 +732,14 @@ GO
 
 	scan "" "$plant" "$probe"
 	expect "vuln scan: a planted finding in a stripped binary is red" 1 "FINDING  probe v0.0.1: GO-2099-0001" "fmt.Sprintf"
-	scan "GO-2099-0001 probe v0.0.1 synthetic self-test reason 2999-12-31" "$plant" "$probe"
+	scan "GO-2099-0001 probe v0.0.1 synthetic self-test reason $soon" "$plant" "$probe"
 	expect "vuln scan: a matching allow entry turns it green" 0 "allowed  probe v0.0.1: GO-2099-0001"
 	scan "GO-2099-0001 probe v0.0.1 synthetic self-test reason 2000-01-01" "$plant" "$probe"
 	expect "vuln scan: an expired allow entry is red" 1 "EXPIRED 2000-01-01"
-	scan "GO-2099-0001 probe v0.0.1 synthetic self-test reason 2999-12-31
-GO-2099-0009 probe v0.0.1 matches nothing in this scan 2999-12-31" "$plant" "$probe"
+	scan "GO-2099-0001 probe v0.0.1 synthetic self-test reason $soon
+GO-2099-0009 probe v0.0.1 matches nothing in this scan $soon" "$plant" "$probe"
 	expect "vuln scan: a stale allow entry matching no finding is red" 1 "STALE, GO-2099-0009 probe v0.0.1"
-	scan "GO-2099-0001 probe v0.0.0 keyed on the previous pin 2999-12-31" "$plant" "$probe"
+	scan "GO-2099-0001 probe v0.0.0 keyed on the previous pin $soon" "$plant" "$probe"
 	expect "vuln scan: an entry keyed on another child version does not allow (a pin bump re-reviews)" 1 "FINDING  probe v0.0.1: GO-2099-0001" "STALE, GO-2099-0001 probe v0.0.0"
 	scan "" "$info" "$plain"
 	expect "vuln scan: a finding with no vulnerable symbol in the binary is informational" 0 "info     probe v0.0.1: GO-2099-0002"
@@ -729,8 +747,19 @@ GO-2099-0009 probe v0.0.1 matches nothing in this scan 2999-12-31" "$plant" "$pr
 	expect "vuln scan: a stripped binary is read conservatively (every symbol of the package counts)" 1 "FINDING  probe v0.0.1: GO-2099-0002"
 	scan "" "$t/no-such-db" "$probe"
 	expect "vuln scan: an unreachable vulnerability database is a named red" 1 "vuln DB unreachable"
-	scan "GO-2099-0001 probe v0.0.1 2999-12-31" "$plant" "$probe"
+	scan "GO-2099-0001 probe v0.0.1 $soon" "$plant" "$probe"
 	expect "vuln scan: a malformed allow entry is red" 1 "want <GO-id> <child> <child-version> <reason> <expiry>"
+	scan "GO-2099-0001 probe v0.0.1 synthetic self-test reason $far" "$plant" "$probe"
+	expect "vuln scan: an allow expiry more than 120 days out is red" 1 "is more than 120 days after"
+	scan "GO-2099-0001 probe v0.0.1 too short $soon" "$plant" "$probe"
+	expect "vuln scan: an allow reason under 20 characters is red" 1 "is shorter than 20 characters"
+	scan "GO-2099-0002 probe v0.0.1 informational finding only, not a symbol hit $soon" "$info" "$plain"
+	expect "vuln scan: an entry matching only an informational finding is stale" 1 "STALE, GO-2099-0002 probe v0.0.1"
+	printf 'probe v0.0.1 symbol\n' >"$t/findings-short"
+	printf '' >"$t/allow"
+	rc=0
+	o="$(gv_allow_check "$t/allow" "$today" "$t/findings-short" 2>&1)" || rc=$?
+	expect "vuln scan: a findings line with fewer than 5 fields is red" 1 "malformed findings line"
 
 	# Fake tools: absent, the wrong version, a stream with no config, a stream
 	# cut short. The fakes report the pin on -version where the case needs it.
@@ -762,6 +791,24 @@ SH
 	rc=0
 	o="$(gv_scan_children "$t/fake/truncated" "$pin" "$t/allow" "$today" "" probe v0.0.1 "$probe" 2>&1)" || rc=$?
 	expect "vuln scan: a stream that does not end cleanly is a named red" 1 "malformed JSON stream"
+	fake otherdb "$pin" <<SH
+printf '%s\n' '{"config":{"scanner_version":"$pin","scan_mode":"binary","db":"https://mirror.example.com/vulndb","db_last_modified":"${today}T00:00:00Z"}}'
+SH
+	rc=0
+	o="$(gv_scan_children "$t/fake/otherdb" "$pin" "$t/allow" "$today" "" probe v0.0.1 "$probe" 2>&1)" || rc=$?
+	expect "vuln scan: a config naming another database is a named red" 1 "vulnerability database is not the production one" "mirror.example.com"
+	fake staledb "$pin" <<SH
+printf '%s\n' '{"config":{"scanner_version":"$pin","scan_mode":"binary","db":"https://vuln.go.dev","db_last_modified":"2000-01-01T00:00:00Z"}}'
+SH
+	rc=0
+	o="$(gv_scan_children "$t/fake/staledb" "$pin" "$t/allow" "$today" "" probe v0.0.1 "$probe" 2>&1)" || rc=$?
+	expect "vuln scan: a stale database (db_last_modified over 30 days old) is a named red" 1 "vulnerability database is stale" "2000-01-01"
+	fake proddb "$pin" <<SH
+printf '%s\n' '{"config":{"scanner_version":"$pin","scan_mode":"binary","db":"https://vuln.go.dev","db_last_modified":"${today}T00:00:00Z"}}'
+SH
+	rc=0
+	o="$(gv_scan_children "$t/fake/proddb" "$pin" "$t/allow" "$today" "" probe v0.0.1 "$probe" 2>&1)" || rc=$?
+	expect "vuln scan: a fresh production database with no findings is green" 0 "scan probe v0.0.1"
 	unset -f fake
 
 	# The scan set is release_payload_files: every listed Go binary is scanned
@@ -780,6 +827,22 @@ SH
 			echo "  ok    vuln scan set: every Go binary of release_payload_files ($want), each under its pin"
 		else
 			echo "  FAIL  vuln scan set: $o"; exit 1
+		fi
+		echo "not a Go binary" >"$pd/kine"
+		if o="$(child_scan_set "$pd" 2>/dev/null)"; then
+			echo "  FAIL  a listed payload file that is not a Go binary was skipped, not red"; exit 1
+		elif printf '%s\n' "$o" | grep -q "PROBLEM kine: not a readable Go binary"; then
+			echo "  ok    vuln scan set: a listed payload file that is not a Go binary is red"
+		else
+			echo "  FAIL  vuln scan set: the non-Go kine not named: $o"; exit 1
+		fi
+		cp "$probe" "$pd/kine"
+		if o="$(ZOT_VERSION="" child_scan_set "$pd" 2>/dev/null)"; then
+			echo "  FAIL  a child whose pin resolves empty was scanned"; exit 1
+		elif printf '%s\n' "$o" | grep -q "PROBLEM zot: empty version"; then
+			echo "  ok    vuln scan set: a child whose version resolves empty is red, named"
+		else
+			echo "  FAIL  vuln scan set: the empty zot version not named: $o"; exit 1
 		fi
 		K3SM_BUILT_FILES="$K3SM_BUILT_FILES
 cp-payload/newchild"
@@ -1470,7 +1533,7 @@ if [ "$STUB_PAYLOAD" = 1 ]; then
 else
 	echo "==> children vuln scan (govulncheck -mode=binary over every staged Go child; allow file $GV_ALLOW)"
 	children_vuln_scan "$PAYLOAD_DIR" ||
-		die "children vuln scan: a staged child carries an unallowed vulnerability, the allow file has an expired or stale entry, or the scan could not run (above)"
+		die "children vuln scan: a staged child carries an unallowed vulnerability (bump the child's pin (pkg/executor for kubernetes, the pin files read_pins reads for the rest) or name it in hack/release/govulncheck.allow with a reason and an expiry), the allow file has an expired or stale entry, or the scan could not run (above)"
 fi
 
 # The pre-sign digests, recorded before ANY signing: the pinned digests describe
