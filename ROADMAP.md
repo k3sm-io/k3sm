@@ -161,8 +161,8 @@ release engineering. What ships:
   sharing). It also adds darwin/amd64 pod payloads under host Rosetta on the native path.
 - **llama.cpp serving.** A second native model-serving engine beside MLX: a model resource names a
   GGUF model and its serving settings (context size, parallel slots, GPU layers), and k3sm runs
-  llama.cpp's OpenAI-compatible server for it as a native Pod on the Mac's GPU, behind a Service,
-  the same way `MLXModel` runs an MLX model.
+  llama.cpp's own server, which speaks the common chat-completions API, for it as a native Pod on
+  the Mac's GPU, behind a Service, the same way `MLXModel` runs an MLX model.
 
 ## v0.4 (planned)
 
