@@ -189,7 +189,7 @@ func TestServerJoinFailsClosedOnAbsentBundle(t *testing.T) {
 	})
 }
 
-// TestImportCABundleBackfillsOnlyMissingCA is the B435 bootstrap-side gate: a server
+// TestImportCABundleBackfillsOnlyMissingCA pins this contract: a server
 // that already imported the bundle can import it again (a restart), the second import
 // installs only the CA that went missing and leaves the present ones byte-identical,
 // and a half-present CA refuses the import with nothing written.

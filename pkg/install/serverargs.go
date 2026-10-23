@@ -572,7 +572,7 @@ func InstalledKubeconfigName(read func(path string) ([]byte, error), plistPath, 
 }
 
 // UpdateReleaseBaseFlag is the `k3sm server` and `k3sm agent` argument
-// naming the release index the managed update reads (a mirror or a lab rig;
+// naming the release index the managed update reads (a mirror or a test environment;
 // pkg/update validates it). Install renders it into the role's daemon
 // arguments, where every later reinstall, an in-place one included, carries it.
 const UpdateReleaseBaseFlag = "update-release-base"

@@ -28,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestM10_NativeSidecar is the M10.2 native-sidecar criterion (Res.8): an initContainer
+// TestM10_NativeSidecar is the native-sidecar criterion (Res.8): an initContainer
 // with restartPolicy:Always (the k8s 1.33 stable sidecar) STAYS RUNNING alongside the
 // regular containers and tears down in reverse order — over the new apis PodBox/
 // Container proto restart_policy field (never a k3sm.io/* annotation). That the

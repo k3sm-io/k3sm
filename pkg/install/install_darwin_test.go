@@ -1019,7 +1019,7 @@ func TestEnsureHelpersRefuseASymlink(t *testing.T) {
 	}
 }
 
-// TestOwnedWritesUseTheOpenDescriptor is B376's gate: the writers that hand a
+// TestOwnedWritesUseTheOpenDescriptor pins this contract: the writers that hand a
 // freshly written credential to a lower-privileged principal must bind its
 // owner and mode to the OPEN temp descriptor, never re-resolve the file by name
 // inside a directory that principal can write, and must never publish an entry
@@ -1257,7 +1257,7 @@ func symlinkT(t *testing.T, target, link string) {
 // TestAdoptTreeWalksByDescriptorAndNeverFollowsASymlink exercises the REAL
 // adoption walk against a REAL filesystem, unprivileged.
 //
-// It is the half of B327 a fake cannot assert. The fake in install_test.go
+// It is the half a fake cannot assert. The fake in install_test.go
 // models the policy — which entries are adopted, in which order — but it has no
 // descriptors, so the property this walk exists for (the object acted on is the
 // object that was classified, even though a pod running as the service user can

@@ -190,7 +190,7 @@ func TestM2_EnvFrom(t *testing.T) {
 	applyAndWaitSucceeded(t, c, pod, 90*time.Second)
 }
 
-// TestM2_Probes proves the provider-served probe TRANSITIONS (M2.2): a readiness
+// TestM2_Probes proves the provider-served probe TRANSITIONS: a readiness
 // failure removes the pod from its Service's Ready endpoints, and a liveness
 // failure increments restartCount — the NATS/compile-server probe features. Both
 // legs need a routable pod IP (the runtimed runtime), so the gate brings that up.
@@ -292,7 +292,7 @@ func TestM2_GracefulStop(t *testing.T) {
 
 // TestM2_ResourceLimitsOOMKilled proves resources.limits.memory enforcement: a pod
 // that allocates past its limit is killed with reason OOMKilled (phase Failed) —
-// the M2.3 userspace memory-limit kill.
+// the userspace memory-limit kill.
 func TestM2_ResourceLimitsOOMKilled(t *testing.T) {
 	c := Up(t)
 	const name = "m2-oomkilled"
@@ -312,7 +312,7 @@ func TestM2_ResourceLimitsOOMKilled(t *testing.T) {
 }
 
 // TestM2_KubectlTop proves the kubelet Summary API reports a real footprint for a
-// running pod (the M2.3 ri_phys_footprint → working-set surface `kubectl top` reads).
+// running pod (the ri_phys_footprint → working-set surface `kubectl top` reads).
 // k3sm meters LIMIT-carrying pods in M2: the per-pod memory sampler is limit-driven
 // (the same sampler enforces OOM and feeds Summary), so an unlimited pod is not
 // sampled and is absent from Summary — a documented M2 posture (broadening metering
@@ -364,7 +364,7 @@ func TestM2_KubectlTop(t *testing.T) {
 // projected bound SA token + the published CA over kubernetes.default.svc, and is
 // AUTHORIZED under the default Node,RBAC for the in-pod-reader grant yet DENIED
 // what it was not granted — the snapshotManager in-pod kubectl feature. It binds
-// the SAME SA names the M4.1 k3sm:in-pod-reader RoleBinding grants (rbac.Conformance*).
+// the SAME SA names the k3sm:in-pod-reader RoleBinding grants (rbac.Conformance*).
 func TestM2_InPodKubectl(t *testing.T) {
 	c := Up(t)
 	ctx := context.Background()
@@ -415,14 +415,14 @@ func TestM2_DenyUsers(t *testing.T) {
 }
 
 // TestM2_ImagePullSecrets is a DEFERRED criterion whose canonical home is now
-// TestM10_ImagePullSecret (B80): the imagePullSecrets private-registry pull-auth
+// TestM10_ImagePullSecret: the imagePullSecrets private-registry pull-auth
 // criterion moved to the M10 conformance set once the pull path landed (resolver.go +
-// runtimed/pkg/image/pull.go, M2.6). This stub is retained only as the M2 checklist-of-
+// runtimed/pkg/image/pull.go,). This stub is retained only as the M2 checklist-of-
 // record reference (hack/acceptance/conformance/README.md, hack/acceptance/m2.sh);
 // the single owning criterion lives in e2e/m10_pullsecret_test.go.
 func TestM2_ImagePullSecrets(t *testing.T) {
 	Up(t)
-	t.Skip("superseded by TestM10_ImagePullSecret — B80 (imagePullSecrets pull-auth criterion; see e2e/m10_pullsecret_test.go)")
+	t.Skip("superseded by TestM10_ImagePullSecret (imagePullSecrets pull-auth criterion; see e2e/m10_pullsecret_test.go)")
 }
 
 // TestM2_DaemonSet is a DEFERRED criterion: DaemonSet scheduling is not yet a k3sm

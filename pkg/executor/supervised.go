@@ -91,8 +91,7 @@ const drainGrace = 5 * time.Second
 //
 // It is a budget Stop KEEPS: every wait in the teardown selects on the caller's
 // context, so a daemon that calls Stop under this bound gets it back at the
-// deadline with ErrStopBudgetExceeded naming whatever it could not witness reaped
-// (B321). What the deadline does not promise is that the child is gone — it has
+// deadline with ErrStopBudgetExceeded naming whatever it could not witness reaped. What the deadline does not promise is that the child is gone — it has
 // been SIGKILLed, and a process refusing to die outlives the daemon in its own
 // process group, where launchd's kill of the job does not reach it. In the kine
 // posture the next server start stops such a leftover before it starts its own
@@ -1362,7 +1361,7 @@ var ErrStopBudgetExceeded = errors.New("control-plane teardown exceeded its budg
 // so walking the slice in reverse stops the apiserver and the controllers first
 // and kine last, after which the SQLite DB is no longer in use. Idempotent.
 //
-// It HONOURS ctx, and that is the whole of B321. The daemon calls it under
+// It HONOURS ctx, and that is the whole of its contract. The daemon calls it under
 // context.WithTimeout(…, StopBound) and pkg/install derives the plist's
 // ExitTimeOut from that same symbol — but Stop used to ignore the context
 // entirely, waiting on a component's exited channel without a bound once the
@@ -1531,7 +1530,7 @@ func shutdownOrder(comps []*component) []*component {
 // ctx. Both waits select on ctx: a context that ends during the drain escalates
 // to the SIGKILL immediately rather than spending a grace the caller no longer
 // has, and the wait after the SIGKILL gives up with the budget instead of parking
-// forever (B321).
+// forever.
 //
 // A false verdict is deliberately CONSERVATIVE. Stop reports it by name, and a
 // component SIGKILLed at the very edge of the budget is named even though the

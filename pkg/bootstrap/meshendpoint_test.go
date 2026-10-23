@@ -209,7 +209,7 @@ func postRefresh(t *testing.T, client *http.Client, baseURL, body string, header
 	return resp.StatusCode, nil
 }
 
-// TestMeshEndpointVerbAuthAndGuard is B283's security table for the endpoint
+// TestMeshEndpointVerbAuthAndGuard is the security table for the endpoint
 // refresh verb.
 //
 // The verb is a SECOND write path into a node's MeshPeer, reachable from the LAN

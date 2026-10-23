@@ -22,9 +22,8 @@ limitations under the License.
 // chown) lives in install_darwin.go; the seam, the install/uninstall ordering,
 // the launchd plist rendering, and the fake live here.
 //
-// The goreleaser config / notarization + designated-requirement entitlements that drive these commands
-// live outside this package, in the k3sm release packaging (hack/release and
-// .goreleaser.yaml).
+// The goreleaser config, notarization and entitlements that drive these commands
+// live outside this package, in the release packaging (hack/release, .goreleaser.yaml).
 package install
 
 import (

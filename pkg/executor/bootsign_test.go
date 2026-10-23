@@ -205,7 +205,7 @@ func assertUntouched(t *testing.T, bd string, before map[string]fileID) {
 	}
 }
 
-// TestBootVerifiesPayloadWithoutResigning is the B480 gate. A boot verifies the
+// TestBootVerifiesPayloadWithoutResigning pins this contract. A boot verifies the
 // payload's signatures in place and never ad-hoc re-signs a validly signed binary:
 //
 //   - the signing path is chosen from the daemon's own signature, with no flag:

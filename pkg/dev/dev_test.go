@@ -183,7 +183,7 @@ func TestLoadValidatesPath(t *testing.T) {
 	}
 }
 
-// TestDevUpWaitsForNodeRegistration is the B155 gate.
+// TestDevUpWaitsForNodeRegistration pins this contract.
 //
 // `k3sm dev up` returned ~90 seconds before the node registered: measured on lab
 // hardware 2026-08-27, the server logged `starting k3sm node` at 12:34:36 and
@@ -710,7 +710,7 @@ contexts:
 current-context: k3sm
 `
 
-// TestListReportsUnknownNotStaleWhenUnprobeable is the B211 gate: an instance
+// TestListReportsUnknownNotStaleWhenUnprobeable pins this contract: an instance
 // whose pid EXISTS but cannot be signalled from this uid must never be reported
 // stale.
 //
@@ -812,7 +812,7 @@ func TestListReportsUnknownNotStaleWhenUnprobeable(t *testing.T) {
 	})
 }
 
-// TestUnprobeableInstanceIsNotReaped pins the reclaim half of B211: teardown
+// TestUnprobeableInstanceIsNotReaped pins the reclaim half: teardown
 // signals an instance it cannot probe rather than skipping it as already-dead.
 // Skipping would leave a live server running while its registry entry, kubeconfig
 // context and lo0 aliases were removed — a worse outcome than the misreport that

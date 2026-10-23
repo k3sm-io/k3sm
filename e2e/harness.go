@@ -70,7 +70,7 @@ func Up(t *testing.T) *Cluster {
 }
 
 // Healthz returns the apiserver /healthz body (e.g. "ok"), proving the control
-// plane is serving — the M1.1 exit check.
+// plane is serving.
 func (c *Cluster) Healthz(t *testing.T) string {
 	t.Helper()
 	body, err := c.Client.Discovery().RESTClient().Get().AbsPath("/healthz").DoRaw(context.Background())

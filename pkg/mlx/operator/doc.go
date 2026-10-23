@@ -88,8 +88,8 @@ limitations under the License.
 // gang on the network is never restarted because the cable came back.
 //
 // The path in use is the k3sm.io/mlx-interconnect annotation on every rank Pod
-// and is named in the ShardsPlaced message ("ring over thunderbolt"). The plan's
-// status.interconnect field is deferred: MLXModelStatus in k3sm.io/apis has no
+// and is named in the ShardsPlaced message ("ring over thunderbolt"). A status.interconnect
+// field is deferred: MLXModelStatus in k3sm.io/apis has no
 // such field, and the CRD's structural schema would prune it, so it is an apis
 // addition still to make.
 //

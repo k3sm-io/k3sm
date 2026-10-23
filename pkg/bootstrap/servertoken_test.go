@@ -129,7 +129,7 @@ func TestLoadOrCreateServerSecret(t *testing.T) {
 	}
 }
 
-// TestEnsureServerSecret pins the B435 secret record: written once (0600, bare), a
+// TestEnsureServerSecret pins the secret record: written once (0600, bare), a
 // re-run with the same secret is a no-op even across whitespace, and a different
 // secret is ErrServerSecretMismatch with the recorded one untouched and neither
 // secret in the error.

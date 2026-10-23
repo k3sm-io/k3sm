@@ -34,7 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-// TestNodePortServiceOpensWildcardListener is the M3.1-a1 rootless rehearsal: a
+// TestNodePortServiceOpensWildcardListener is the rootless rehearsal: a
 // NodePort Service object, fed to a running netserve.Server through its embedded
 // darwin-net Service watcher (fake clientset), makes the in-process proxy open the
 // node-wide *:NodePort TCP listener (dialed here via loopback) and load-balance to
@@ -105,7 +105,7 @@ func TestNodePortServiceOpensWildcardListener(t *testing.T) {
 	go func() { runErr <- s.Run(ctx) }()
 
 	// The *:NodePort listener comes up (dialed via loopback) once the watcher
-	// reconciles the Service — the core M3.1-a1 assertion.
+	// reconciles the Service — the core assertion.
 	waitListen(t, nodePort, runErr)
 	// And it splices through to the Ready backend (LB via the userspace proxy).
 	if got := readIDWithRetry(t, nodePort, "np-backend"); got != "np-backend" {
@@ -213,7 +213,7 @@ func safePort(t *testing.T, host string) int32 {
 // spending the deadline to report the symptom ("never came up") and discarding
 // the cause — the failure mode that made the ephemeral-port steal above so
 // hard to read.
-// DEADLINE IS NOT THE ROOT CAUSE — see B156.
+// DEADLINE IS NOT THE ROOT CAUSE.
 //
 // An earlier fix raised this from 5s to 30s, concluding the cut simply sat inside
 // a load-proportional bring-up distribution (measured idle: 4.36s, 4.68s, 4.70s,

@@ -58,7 +58,7 @@ func seedLegacyKeyTree(f *fakeSystem) {
 	f.putOwned(LegacyMeshKeyDir, 0, 0, 0o700, EntryDir)
 }
 
-// TestMeshKeyDirLivesOutsideTheServiceUserRunDir is the B397 gate.
+// TestMeshKeyDirLivesOutsideTheServiceUserRunDir pins this contract.
 //
 // The defect: the mesh keys lived in <run dir>/keys, and the run dir is the
 // service user's. On macOS the right to unlink or rename an entry is the
@@ -302,7 +302,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 				t.Errorf("uninstall removed preserved key state: %s", c)
 			}
 		}
-		// The node identity is role state and still goes (B396).
+		// The node identity is role state and still goes.
 		wantCall(t, f, "RemoveAll:"+newIdentity)
 	})
 

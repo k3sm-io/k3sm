@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Command b411-echo is the B411 e2e extension-apiserver stand-in: a TLS server that
+// Command b411-echo is the e2e extension-apiserver stand-in: a TLS server that
 // REQUESTS (never verifies) a client certificate and reports what the aggregator
 // presented, so the test, not this binary, decides whether that certificate chains
 // to the request-header CA.

@@ -48,14 +48,14 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
-// B411 — the apiserver aggregation layer's request-header trust, proven against a
-// live kube-apiserver on the rig. Run by hack/acceptance/B411.sh under K3SM_LAB=1 on
+// The apiserver aggregation layer's request-header trust, proven against a
+// live kube-apiserver on a test environment. Run by hack/acceptance/B411.sh under K3SM_LAB=1 on
 // the server Mac, which sets:
 //
 //	B411_WORK_DIR     the server's work dir (default /var/lib/k3sm/server)
 //	B411_SERVER_NODE  the server's node name; the backend is pinned there so the
 //	                  aggregator's dial never crosses the server-to-worker Service
-//	                  path (recorded RED separately), which would read as a B411 defect.
+//	                  path (recorded RED separately), which would read as a request-header trust defect.
 //
 // Files the server keeps 0600 (the CA keys, the proxy key) are read through
 // `sudo -n cat` into memory when this account cannot open them: nothing is
@@ -252,7 +252,7 @@ func startB411Backend(t *testing.T, c *Cluster) *b411Backend {
 		last = resp.Status
 		return resp.StatusCode == http.StatusOK
 	}) {
-		t.Fatalf("NOT A B411 RESULT: the test process never reached the native echo backend through its ClusterIP %s (the native-pod Service proxy path); last: %s", url, last)
+		t.Fatalf("NOT A REQUEST-HEADER TRUST RESULT: the test process never reached the native echo backend through its ClusterIP %s (the native-pod Service proxy path); last: %s", url, last)
 	}
 	return b
 }

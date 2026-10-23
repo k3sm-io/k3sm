@@ -26,7 +26,7 @@ import (
 // TestControllersFlagScoping asserts the KCM controller scoping: the flag is
 // "*" (all on-by-default controllers) minus the node-side controllers that
 // assume Linux kubelets, and the endpointslice-controller (which
-// M1.4's Service proxy reconciles off) is NOT among the disabled set, so it stays
+// Service proxy reconciles off) is NOT among the disabled set, so it stays
 // on.
 func TestControllersFlagScoping(t *testing.T) {
 	flag := controllersFlag()
@@ -43,7 +43,7 @@ func TestControllersFlagScoping(t *testing.T) {
 	}
 
 	if disabled["endpointslice-controller"] {
-		t.Error("endpointslice-controller must NOT be disabled (M1.4 Service proxy needs it)")
+		t.Error("endpointslice-controller must NOT be disabled (the Service proxy needs it)")
 	}
 	for _, dropped := range []string{
 		"persistentvolume-attach-detach-controller",
@@ -55,7 +55,7 @@ func TestControllersFlagScoping(t *testing.T) {
 	}
 }
 
-// TestPersistentVolumeControllersKept asserts the controllers the M3.2 local-path
+// TestPersistentVolumeControllersKept asserts the controllers the local-path
 // provisioner + StatefulSet binding depend on stay ENABLED in the scoped KCM
 // --controllers set: the in-tree persistentvolume-binder (binds the PVC to the
 // PV the provisioner creates), the statefulset controller (creates the
@@ -82,7 +82,7 @@ func TestPersistentVolumeControllersKept(t *testing.T) {
 		"pv-protection-controller",
 	} {
 		if disabled[keep] {
-			t.Errorf("controller %q must stay ENABLED (M3.2 provisioner + StatefulSet binding needs it), found disabled in %q", keep, flag)
+			t.Errorf("controller %q must stay ENABLED (the provisioner + StatefulSet binding needs it), found disabled in %q", keep, flag)
 		}
 	}
 }
@@ -93,7 +93,7 @@ func TestPersistentVolumeControllersKept(t *testing.T) {
 // the previous release's registry: the file must be re-captured and renamed.
 const kcmControllersGolden = "testdata/kcm-controllers-" + DefaultKubeVersion + ".txt"
 
-// TestNodeFailureControllersKept is the B366 tripwire for the controllers that
+// TestNodeFailureControllersKept is the tripwire for the controllers that
 // rescue a Pod from a failed node: node-lifecycle-controller (marks the node
 // NotReady and taints it), taint-eviction-controller (evicts Pods off the
 // NoExecute taint; its own registry entry at this minor), and

@@ -172,7 +172,7 @@ func (r *joinServerRig) postWithHeaders(t *testing.T, req bootstrap.JoinRequest)
 	return resp.StatusCode, strings.TrimSpace(string(raw)), resp.Header
 }
 
-// TestJoinIssuesForTheAssignedNodeAddress is the server half of B338: the
+// TestJoinIssuesForTheAssignedNodeAddress is the server half: the
 // InternalIP an issued node certificate names is the mesh enroll's ASSIGNMENT,
 // unconditionally, and the request's nodeIP is only an equality gate on it.
 //

@@ -43,7 +43,7 @@ func TestM1(t *testing.T) {
 	ctx := context.Background()
 	const ns, name = "default", "m1-web"
 
-	// M1.1 — the control plane (brought up by `k3sm server`) is serving.
+	// the control plane (brought up by `k3sm server`) is serving.
 	if got := c.Healthz(t); got != "ok" {
 		t.Fatalf("apiserver /healthz = %q, want ok", got)
 	}
@@ -56,7 +56,7 @@ func TestM1(t *testing.T) {
 		_ = c.Client.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
 	})
 
-	// M1.3 — a native pod (the M1 host-binary image convention) reaches Running.
+	// a native pod (the M1 host-binary image convention) reaches Running.
 	applyM1Pod(t, c, ns, name)
 	pod := c.WaitPodPhase(t, ns, name, corev1.PodRunning, 90*time.Second)
 	if len(pod.Status.ContainerStatuses) == 0 || pod.Status.ContainerStatuses[0].State.Running == nil {
@@ -64,7 +64,7 @@ func TestM1(t *testing.T) {
 	}
 	t.Logf("pod Running on node %q (podIP=%s hostIP=%s)", pod.Spec.NodeName, pod.Status.PodIP, pod.Status.HostIP)
 
-	// M1.4 — expose → ClusterIP allocated; the KEPT endpointslice controller
+	// expose → ClusterIP allocated; the KEPT endpointslice controller
 	// reconciles it. Under the HostProcess runtime the PodIP is the node loopback
 	// (127.0.0.1), which the apiserver rejects for endpoints, so the slice stays
 	// address-less here BY DESIGN; the controller still runs (proven by the
@@ -78,7 +78,7 @@ func TestM1(t *testing.T) {
 	t.Logf("Service %s/%s ClusterIP=%s", ns, name, svc.Spec.ClusterIP)
 	requireEndpointSliceController(t, c, ns, name, 60*time.Second)
 
-	// M1.4 — the cluster DNS Service exists for the in-process resolver to answer against.
+	// the cluster DNS Service exists for the in-process resolver to answer against.
 	if !kubeDNSPresentOrSkipped(t, c) {
 		t.Log("kube-dns Service not present; DNS data-path asserted by hack/acceptance/m1.sh")
 	}

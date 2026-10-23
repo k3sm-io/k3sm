@@ -46,7 +46,7 @@ func (f *failTempSigner) Satisfies(ctx context.Context, path, requirement string
 	return f.fakeCodeSigner.Satisfies(ctx, path, requirement)
 }
 
-// TestReleaseReplacesDifferingControlPlaneSet is the B765 gate. On the release
+// TestReleaseReplacesDifferingControlPlaneSet pins this contract. On the release
 // path, when the work dir's kube marker is valid and names the version the payload
 // vouches for but the control-plane set there is missing a binary or differs in
 // content from the payload's (an earlier dev install's ad-hoc build of the same

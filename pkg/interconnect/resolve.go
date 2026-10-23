@@ -28,8 +28,7 @@ import (
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 )
 
-// UpHold is how long a member must be continuously up before it counts as up
-// (plan I10). It is measured from the member's persisted lastTransition, never
+// UpHold is how long a member must be continuously up before it counts as up. It is measured from the member's persisted lastTransition, never
 // from an in-memory clock, so a resolver restart (or a failover to the other
 // server) neither shortens nor restarts the hold.
 const UpHold = 60 * time.Second
@@ -95,7 +94,7 @@ type Result struct {
 	HasPeer bool
 }
 
-// AcceptReport parses raw as an untrusted report (plan I6): the apis bounds
+// AcceptReport parses raw as an untrusted report: the apis bounds
 // (size, peer count, field shapes, schema), then every reachable peer must be an
 // existing Node. It returns the report, or the rejection reason and error.
 func AcceptReport(raw string, nodes map[string]bool) (netv1alpha1.InterconnectReport, string, error) {
@@ -339,8 +338,8 @@ func segments(members []netv1alpha1.InterconnectMember) []netv1alpha1.Interconne
 	return out
 }
 
-// cableLoops returns the members that sit in a bridged Thunderbolt loop (plan
-// §2/Q2), from the reported cable graph. Reports are untrusted, so a cable edge
+// cableLoops returns the members that sit in a bridged Thunderbolt loop,
+// from the reported cable graph. Reports are untrusted, so a cable edge
 // between A and B counts only when BOTH ends confirm it: A lists one of B's
 // local domains as a peer AND B lists one of A's. Its multiplicity is the
 // smaller of the two ends' counts. Then:

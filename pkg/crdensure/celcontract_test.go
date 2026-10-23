@@ -131,7 +131,7 @@ func modelObject(mutate ...func(spec map[string]any)) map[string]any {
 	}
 }
 
-// TestCELAcceptsDistributedShape is the M17.4-d5 CEL slice: spec.distributed is
+// TestCELAcceptsDistributedShape is the CEL slice: spec.distributed is
 // no longer reserved. The MLXModel rule validates its shape (ranks set and at
 // least 2, one rank per node) and the enums on backend and parallelism reject
 // anything else, so a well-formed sharding request is admitted for the operator

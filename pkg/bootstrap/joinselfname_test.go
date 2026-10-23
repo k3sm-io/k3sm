@@ -113,7 +113,7 @@ func (e *peerStoreEnroller) calls() int {
 	return e.enrolls
 }
 
-// TestJoinRefusesTheControlPlaneNodeName is the B348 gate: a worker join that
+// TestJoinRefusesTheControlPlaneNodeName pins this contract: a worker join that
 // claims the CONTROL PLANE's own node name is refused, and refused before
 // anything identity-bearing has happened.
 //

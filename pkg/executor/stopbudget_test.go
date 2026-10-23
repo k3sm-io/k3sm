@@ -91,7 +91,7 @@ func fakeReapedComponent(t *testing.T, name string) *component {
 // fakeStuckComponent builds a component whose reaper NEVER closes exited — the
 // shape of the hazard this file gates: a child parked in an uninterruptible state,
 // or a reaper goroutine that has not observed the exit. Stop cannot distinguish
-// the two, and before B321 it waited on that channel forever after the SIGKILL.
+// the two, and before Stop honoured its context it waited on that channel forever after the SIGKILL.
 func fakeStuckComponent(t *testing.T, name string) *component {
 	t.Helper()
 	return startFakeChild(t, name)
@@ -113,7 +113,7 @@ func startFakeChild(t *testing.T, name string) *component {
 	return &component{name: name, cmd: cmd, exited: make(chan struct{})}
 }
 
-// TestStopHonoursItsContextAfterSIGKILL is B321's gate.
+// TestStopHonoursItsContextAfterSIGKILL pins this contract.
 //
 // What was wrong: Stop took a context and never read it. stopComponent waited
 // drainGrace for the SIGTERM, escalated to SIGKILL, and then waited on the

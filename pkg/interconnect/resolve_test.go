@@ -108,7 +108,7 @@ func segIDs(res Result) map[string][]string {
 
 var enabled = netv1alpha1.InterconnectSpec{Medium: netv1alpha1.MediumThunderbolt, Enabled: true}
 
-// TestResolverSegments is the B524 resolver gate: membership needs a fresh,
+// TestResolverSegments pins this contract: membership needs a fresh,
 // accepted report and mutual adjacency over server-recomputed addresses;
 // segments are components of mutual reachability; loops and out-of-range
 // indices are marked and never fail the object; the desired annotation follows

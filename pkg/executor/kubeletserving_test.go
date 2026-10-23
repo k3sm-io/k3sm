@@ -25,12 +25,12 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 )
 
-// TestApiserverKubeletCAFlagIffConfigured pins the DIVERGENCE B213 is most likely
+// TestApiserverKubeletCAFlagIffConfigured pins the DIVERGENCE the kubelet serving-cert work is most likely
 // to perturb, in BOTH directions and in one place: --kubelet-certificate-authority
 // is emitted exactly when Config.KubeletCAFile is set, and is absent otherwise.
 //
 // Both halves are load-bearing, and each is a different product posture. Set is the
-// multi-node contract: it is what makes a node's serving cert VERIFIED, and B213 is
+// multi-node contract: it is what makes a node's serving cert VERIFIED, and the kubelet serving-cert work is
 // the story of nodes that could not satisfy it. Absent is the single-node contract
 // (DESIGN §5c): a single-node server's node presents a cluster-CA leaf too, but
 // whether its apiserver verifies that leaf is a separate decision, and the flag

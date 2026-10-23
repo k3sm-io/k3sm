@@ -40,7 +40,7 @@ import (
 // each backend carries a hostname (<svc>-<i>) and the slice a named port pg/tcp,
 // so the SRV owner _pg._tcp.<svc>.prod.svc.cluster.local synthesizes one SRV per
 // endpoint. The bare <svc>.prod.svc.cluster.local A owner synthesizes the
-// all-backends A set — the M10.1 record shapes that drive UDP truncation in
+// all-backends A set — the record shapes that drive UDP truncation in
 // production (the synthA/synthSRV path, not the forwarder path).
 func headlessResolver(t *testing.T, svc string, nEndpoints int, withPort bool) *clusterResolver {
 	t.Helper()
@@ -228,7 +228,7 @@ func serveResolverUDP(t *testing.T, r *clusterResolver) string {
 	return pc.LocalAddr().String()
 }
 
-// TestEDNSHonorsAdvertisedUDPSize is the core M10.1/EDNS0 proof over the headless
+// TestEDNSHonorsAdvertisedUDPSize is the core/EDNS0 proof over the headless
 // SYNTHESIS path (synthA, not the forwarder): a headless Service's all-backends A
 // set that overflows the 512 floor is TRUNCATED for a non-EDNS client but served
 // WHOLE, over UDP with no TC, to an EDNS client advertising dns.EDNSUDPPayloadSize

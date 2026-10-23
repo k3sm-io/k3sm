@@ -131,7 +131,7 @@ func (e *internalErr) Error() string { return e.msg }
 // the manifest set on the serving path: the reconciler issues apply patches and NOTHING
 // else. The withdrawal of a gated add-on is asserted on its own in gate_test.go.
 //
-// This is where B170's two BINDING prune constraints are encoded mechanically rather
+// This is where the two mandatory prune constraints are encoded mechanically rather
 // than trusted:
 //
 //   - "never LIST to decide a DELETE" — a list verb is a failure here, so the decision
@@ -379,7 +379,7 @@ func TestEmbeddedManifestReconcile(t *testing.T) {
 	}
 
 	t.Run("dropping a manifest from the set never issues a delete and leaves the object in the cluster", func(t *testing.T) {
-		// The BINDING prune constraint, exercised end to end: the embedded set SHRINKS
+		// The mandatory prune constraint, exercised end to end: the embedded set SHRINKS
 		// between two converges. A label-keyed prune or a LIST-diff prune would delete
 		// addon-space here; a converge-only reconciler leaves it alone.
 		ctx := context.Background()

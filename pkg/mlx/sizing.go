@@ -27,7 +27,7 @@ import (
 // it that this file encodes.
 //
 // The engine is vllm-mlx 0.5.0 (the version hack/images/mlx-serve/build.sh
-// installs). Its `serve` surface was measured on the rig against 0.4.1,
+// installs). Its `serve` surface was measured on hardware against 0.4.1,
 // reproduced host-side, and re-read from 0.5.0's `serve --help`, which keeps
 // every option below and adds none that any of them prefixes; this is the
 // part the render uses:

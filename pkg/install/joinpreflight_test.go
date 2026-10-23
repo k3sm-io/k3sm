@@ -47,7 +47,7 @@ func assertNothingWritten(t *testing.T, calls []string) {
 	}
 }
 
-// TestAgentInstallPreflightsTheJoinEndpoint is the gate for B334: the
+// TestAgentInstallPreflightsTheJoinEndpoint pins this contract: the
 // 2026-09-17 `k3sm install --agent --server <name>` that took a name resolving
 // to an address nothing answered on, wrote the whole tree, and left the daemon
 // crash-looping on "post mesh endpoint refresh: dial tcp <addr>:9345: connection

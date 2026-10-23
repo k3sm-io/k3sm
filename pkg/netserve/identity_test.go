@@ -31,7 +31,7 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-// identityFixture builds the M10.1 identity-record cluster: a headless
+// identityFixture builds the identity-record cluster: a headless
 // StatefulSet-shaped Service (db, ClusterIP None, named port pg/5432) with two
 // READY hostname-carrying endpoints + one NOT-ready one, a headless Service
 // publishing not-ready addresses, and a normal ClusterIP Service (web) for the
@@ -149,7 +149,7 @@ func respondTyped(t *testing.T, r *clusterResolver, name string, qtype dnsmessag
 	return hdr.RCode, addrs, srvs, ptrs
 }
 
-// TestHeadlessServiceReturnsAllPodIPs is the M10.1-a1 server-side DNS-identity
+// TestHeadlessServiceReturnsAllPodIPs is the server-side DNS-identity
 // gate (Res.1): the per-node resolver serves the record surface darwin-net's
 // dns.Synthesize builds from the Services + EndpointSlices listers — the
 // headless all-ready-backends A set (readiness-filtered), the StatefulSet
@@ -158,7 +158,7 @@ func respondTyped(t *testing.T, r *clusterResolver, name string, qtype dnsmessag
 // upstream forward for an in-CIDR reverse name), the publishNotReadyAddresses
 // override, and the stateless <dashed-ip>.<ns>.pod.<domain> decode.
 //
-// Fails-before: every one of these names was NXDOMAIN (the documented pre-M10.1
+// Fails-before: every one of these names was NXDOMAIN (the documented earlier
 // divergence); passes-after with the synthesis wired.
 func TestHeadlessServiceReturnsAllPodIPs(t *testing.T) {
 	t.Parallel()

@@ -290,7 +290,7 @@ const manifestDarwinDeploy = `{"apiVersion": "apps/v1", "kind": "Deployment",
     "containers": [{"name": "c", "image": "example/darwin-addon:1"}]}}}}
 `
 
-// TestManifestDirReconcile is the B94 gate: the root-owned auto-deploy manifest
+// TestManifestDirReconcile pins this contract: the root-owned auto-deploy manifest
 // directory is applied (server-side apply, field manager k3sm-manifest-dir,
 // never forced) on start and on change, unchanged files are skipped by checksum,
 // hidden/parked files and symlinks are ignored, RBAC, admission, Secret and

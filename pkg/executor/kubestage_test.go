@@ -33,7 +33,7 @@ import (
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
-// The control-plane version marker (B395). The four kwok-ci/k8s binaries used to be
+// The control-plane version marker. The four kwok-ci/k8s binaries used to be
 // provisioned on presence alone, so a binary-only upgrade that moved
 // DefaultKubeVersion kept serving the previous release's apiserver with nothing in
 // the log, the status report, or the crash record. These tests pin the marker
@@ -151,7 +151,7 @@ func TestKubeMarkerParse(t *testing.T) {
 	})
 }
 
-// TestSeedBinDirRestagesStaleControlPlaneBinaries is the B395 gate: a workdir whose
+// TestSeedBinDirRestagesStaleControlPlaneBinaries pins this contract: a workdir whose
 // marker names an older release, beside a payload whose marker vouches for the
 // target, gets the WHOLE set from the payload and a marker vouching for the target.
 func TestSeedBinDirRestagesStaleControlPlaneBinaries(t *testing.T) {

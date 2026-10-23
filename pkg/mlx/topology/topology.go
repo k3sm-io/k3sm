@@ -47,8 +47,8 @@ type Edge struct {
 	Segment string
 	// LocalRDMA is the local RDMA device on the link ("rdma_en2"), or empty.
 	// The Interconnect status carries no RDMA device, so FromInterconnect
-	// leaves it empty: jaccl over a bridged segment waits on the rig answer to
-	// whether RDMA enumerates on bridged ports.
+	// leaves it empty: jaccl over a bridged segment is not yet verified on
+	// hardware: whether RDMA enumerates on bridged ports is unknown.
 	LocalRDMA string
 	// PeerRDMA is the peer's RDMA device at the far end, or empty.
 	PeerRDMA string

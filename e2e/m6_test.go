@@ -16,13 +16,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// M6 synthetic conformance criteria (DESIGN §9 M6; docs/PHASES.md M6.0/M6.1) — HA:
+// M6 synthetic conformance criteria (DESIGN §9 M6) — HA:
 // embedded etcd (one member per server, learner join + promotion) and leader
 // election. These are LAB-tier (hack/lab/m6.sh, K3SM_LAB=1): they need TWO
 // control-plane servers, A (--cluster-init) and B (--server-join). $KUBECONFIG points
 // at server A; $K3SM_KUBECONFIG_B at server B. A criterion SKIPS (which the
-// non-vacuous guard turns RED under K3SM_LAB — "you said you have the rig, prove
-// it") unless its inputs are provided.
+// non-vacuous guard turns RED under K3SM_LAB — "you said you have the cluster,
+// prove it") unless its inputs are provided.
 //
 // On two Macs this proves the mechanics (join, TLS, replication, leader election,
 // quorum loss, recovery, reset, cold restart), not fault tolerance: two voting
@@ -150,7 +150,7 @@ func TestM6_LeaderElectionSingleActive(t *testing.T) {
 	}
 }
 
-// TestM6_SecondServerJoinsReconstructsCAs is the M6.1 acceptance (lab-tier): the second
+// TestM6_SecondServerJoinsReconstructsCAs is the acceptance (lab-tier): the second
 // control-plane server reconstructed the IDENTICAL cluster CA from the first server's
 // AES-256-GCM bootstrap bundle. Both servers' admin kubeconfigs (the signing-CA-issued
 // client-cert kubeconfigs the HA path writes) must embed the SAME cluster
@@ -165,7 +165,7 @@ func TestM6_SecondServerJoinsReconstructsCAs(t *testing.T) {
 	caA := clusterCAData(t, os.Getenv("KUBECONFIG"))
 	caB := clusterCAData(t, os.Getenv("K3SM_KUBECONFIG_B"))
 	if len(caA) == 0 || len(caB) == 0 {
-		t.Skip("M6.1: both kubeconfigs must embed the cluster CA (use the HA admin kubeconfig, not the loopback token kubeconfig)")
+		t.Skip("both kubeconfigs must embed the cluster CA (use the HA admin kubeconfig, not the loopback token kubeconfig)")
 	}
 	if !bytes.Equal(caA, caB) {
 		t.Fatalf("server A and server B embed DIFFERENT cluster CAs — the second server did not reconstruct the identical CA from the bundle")
@@ -176,7 +176,7 @@ func TestM6_SecondServerJoinsReconstructsCAs(t *testing.T) {
 	// refused by every peer and could not read the cluster's client listener).
 	dirA, dirB := os.Getenv("K3SM_M6_ETCD_CA_A"), os.Getenv("K3SM_M6_ETCD_CA_B")
 	if dirA == "" || dirB == "" {
-		t.Skip("M6.1: $K3SM_M6_ETCD_CA_A / $K3SM_M6_ETCD_CA_B unset — each server's tls/etcd/server-ca.crt and peer-ca.crt are required (hack/lab/m6.sh collects them)")
+		t.Skip("$K3SM_M6_ETCD_CA_A / $K3SM_M6_ETCD_CA_B unset — each server's tls/etcd/server-ca.crt and peer-ca.crt are required (hack/lab/m6.sh collects them)")
 	}
 	for _, name := range []string{"server-ca.crt", "peer-ca.crt"} {
 		pinA, pinB := caPin(t, filepath.Join(dirA, name)), caPin(t, filepath.Join(dirB, name))

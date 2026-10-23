@@ -56,7 +56,7 @@ type Cable struct {
 	Addresses map[string]netip.Addr
 	// ForceNetwork places on the network whatever spec.distributed.interconnect
 	// asks, and marks the placement FellBack. The controller sets it while the
-	// model's interconnect restart limit runs (plan I10).
+	// model's interconnect restart limit runs.
 	ForceNetwork bool
 }
 
@@ -102,7 +102,7 @@ func (e *PlacementError) Error() string { return e.Reason + ": " + e.Message }
 //     nodes.
 //   - Fewer than ranks free candidates whose allocatable memory holds the
 //     per-rank share is InsufficientMemory.
-//   - The path comes from spec.distributed.interconnect (plan §4). network
+//   - The path comes from spec.distributed.interconnect. network
 //     places on pod IPs over the cluster network and reads no cable.
 //     thunderbolt needs ONE segment of the thunderbolt Interconnect holding
 //     ranks fitting nodes that have an interconnect address, else
@@ -113,8 +113,8 @@ func (e *PlacementError) Error() string { return e.Reason + ": " + e.Message }
 //     over the segment graph. On the network path the graph is empty.
 //   - jaccl needs a CLIQUE of ranks fitting nodes, every one labelled
 //     k3sm.io/rdma, with RDMA at both ends of every link. The Interconnect
-//     carries no RDMA device, so jaccl waits on the rig answer to whether RDMA
-//     enumerates on bridged ports.
+//     carries no RDMA device, so jaccl waits on a hardware check of whether RDMA
+//     enumerates on bridged ports; that is not yet verified on hardware.
 //   - ring takes a CYCLE of ranks nodes in the graph (on a segment, the first
 //     by name); on the network path, the first ranks fitting nodes by name.
 //   - auto is jaccl when a jaccl placement exists, else ring.

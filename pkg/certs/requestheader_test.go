@@ -56,7 +56,7 @@ func fiveCAHierarchy(t *testing.T) *Hierarchy {
 	return h
 }
 
-// TestRequestHeaderCAProvisioned is B411's named gate: a mint authority's first
+// TestRequestHeaderCAProvisioned pins this contract: a mint authority's first
 // EnsureHierarchy yields the request-header CA, a self-signed CA-only root with the
 // documented CN, persisted 0644/0600 at RequestHeaderCACertPath, and loaded (not
 // re-minted) on the next call.
@@ -408,7 +408,7 @@ func must(err error) {
 	}
 }
 
-// v2Plaintext is a schema-2 bundle (B410's eight keys) for h's four B410 CAs.
+// v2Plaintext is a schema-2 bundle (the eight keys) for h's four CAs.
 func v2Plaintext(t *testing.T, h *Hierarchy, extra map[string]any) []byte {
 	t.Helper()
 	m := map[string]any{
@@ -433,7 +433,7 @@ func v2Plaintext(t *testing.T, h *Hierarchy, extra map[string]any) []byte {
 }
 
 // TestBundleV2DecodesV3CarriesRequestHeaderCA pins the schema-3 codec: a v2 plaintext
-// decodes to the four B410 CAs and reports the request-header CA missing; v3
+// decodes to the four CAs and reports the request-header CA missing; v3
 // round-trips all five; v1, unknown keys and v4 are refused; Marshal refuses a
 // hierarchy missing any of the five, or nil.
 func TestBundleV2DecodesV3CarriesRequestHeaderCA(t *testing.T) {

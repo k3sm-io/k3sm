@@ -132,7 +132,7 @@ func writeFull(t *testing.T, h *Hierarchy) string {
 	return wd
 }
 
-// TestMissingOnDisk pins the B435 probe the server-join consults before any fetch:
+// TestMissingOnDisk pins the probe the server-join consults before any fetch:
 // fully absent CAs are reported by id in table order, fully present ones are not, and
 // a half-present pair is an error that names the surviving file.
 func TestMissingOnDisk(t *testing.T) {

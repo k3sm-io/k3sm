@@ -82,7 +82,7 @@ func (b mutatingPodShimBuilder) Sign(ctx context.Context, path, identifier strin
 	return b.fakePodShimBuilder.Sign(ctx, path, identifier)
 }
 
-// TestCachedShimResignNeverRewritesALiveInode is the pkg/dev half of the B544
+// TestCachedShimResignNeverRewritesALiveInode is the pkg/dev half of the
 // rule: a cached shim reused after a failed rebuild may be mapped by running pods
 // (the DYLD shims) or launchers (k3sm-execshim), and macOS kills every NEW process
 // that maps a signed Mach-O rewritten in place. So the re-sign is skipped when the

@@ -145,7 +145,7 @@ func TestProvisionExecShimRebuildsOverCached(t *testing.T) {
 	}
 }
 
-// TestExecShimUnwritableCacheIsNotReused is the B461 gate.
+// TestExecShimUnwritableCacheIsNotReused pins this contract.
 //
 // provisionExecShim always rebuilds the helper, and reuses a cached one only
 // when the host cannot build. On 2026-10-07 the source was present and only the
@@ -287,7 +287,7 @@ func rootBase(t *testing.T) string {
 	return base
 }
 
-// TestExecShimRootRunUsesPrivateDir pins the root-run half of B461. A
+// TestExecShimRootRunUsesPrivateDir pins the root-run half. A
 // `sudo k3sm dev up --datapath` server runs as root and execs the helper as its
 // Seatbelt launcher, so it must never execute a helper the unprivileged user can
 // replace: not the user's .bin, and not one under any directory the user could
@@ -557,7 +557,7 @@ func TestWithExecShimPathTrailingElementStillPrepends(t *testing.T) {
 	}
 }
 
-// TestDevUpWaitsForDefaultNamespaceBootstrap is the B152 gate.
+// TestDevUpWaitsForDefaultNamespaceBootstrap pins this contract.
 //
 // `Up` used to return as soon as the apiserver was healthy and its kubeconfig
 // merged, while the service-account controller and the root-ca-cert-publisher had

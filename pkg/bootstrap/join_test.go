@@ -147,7 +147,7 @@ func TestJoinRoundTrip(t *testing.T) {
 	if string(res.ClusterCAPEM) != string(clusterCA.CertPEM) {
 		t.Error("join did not return the cluster CA")
 	}
-	// B176: the joining worker also receives the CLIENT-IDENTITY (signing) CA — the
+	// the joining worker also receives the CLIENT-IDENTITY (signing) CA — the
 	// anchor its own :10250 verifies the apiserver's client cert against. Without it
 	// the worker cannot authenticate the one caller it must serve, and startNode
 	// refuses to bring the node up rather than serve exec/attach unauthenticated.

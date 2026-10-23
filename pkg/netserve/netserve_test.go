@@ -28,13 +28,13 @@ import (
 )
 
 // TestM3_3_InfraVIPExemptionAndMeshEgressPassed proves netserve.New passes the
-// right node-local-datapath config to the Service proxy for M3.3: the DNS VIP is
+// right node-local-datapath config to the Service proxy for: the DNS VIP is
 // recorded as the infra-VIP exemption (the proxy steps aside so the per-node
 // resolver owns 10.43.0.10:53 — no EADDRINUSE) and the node's mesh-egress /32 is
 // recorded as the proxy's backend-dial source (so cross-node dials are not
 // blackholed by wireguard). darwin-net's proxy exempt_test.go / meshegress_test.go
 // prove the proxy HONORS these; this proves k3sm SUPPLIES the right values, and
-// selects the netd-helper binder when unprivileged. Maps to M3.3-a1.
+// selects the netd-helper binder when unprivileged.
 func TestM3_3_InfraVIPExemptionAndMeshEgressPassed(t *testing.T) {
 	t.Parallel()
 
@@ -121,9 +121,9 @@ func TestNetdSocketConstructs(t *testing.T) {
 	}
 }
 
-// TestRunDoesNotWriteCorefile is the B33 gate: it proves Run leaves no
+// TestRunDoesNotWriteCorefile pins this contract: it proves Run leaves no
 // Corefile-named file anywhere under the server's WorkDir tree. This is the
-// negative half of B33's deletion of the vestigial CoreDNS Corefile renderer
+// negative half of the deletion of the vestigial CoreDNS Corefile renderer
 // (darwin-net's dns.CorefileOptions/PerNodeDNS, and the writeCorefile call this
 // package's Run used to make on every start) — nothing ever consumed the file it
 // wrote, so the operator decided to delete the renderer outright (git remembers;

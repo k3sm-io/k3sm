@@ -26,7 +26,7 @@ import (
 	"testing"
 )
 
-// The staged-install-root gate (B352). Every test here is about WHERE an
+// The staged-install-root gate. Every test here is about WHERE an
 // artifact is written and WHEN it becomes visible; none of them changes what
 // any existing check verifies.
 //

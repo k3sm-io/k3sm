@@ -185,7 +185,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 	})
 
 	t.Run("no --node-ip renders no --node-ip", func(t *testing.T) {
-		// B338: the mesh address is the control plane's to assign, so an install
+		// the mesh address is the control plane's to assign, so an install
 		// that asserts none must leave the flag off the daemon's argv entirely.
 		// Rendering it with an empty value is not "no assertion" but an
 		// unparseable one, discovered a join later.
@@ -507,18 +507,18 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		// the no-op-shaped upgrade it was.
 		//
 		// It has moved five times since, each deliberately: the admin token left the argv
-		// for a staged file, so the golden shows --token-file and the path (B249,
-		// gated by TestServerPlistCarriesNoToken); and ExitTimeOut fell from 90s to
-		// 60s when the daemon's two longest teardown stages stopped being serial
-		// (B320, gated by TestExitTimeOutCoversTheDaemonTeardown); and the Go
+		// for a staged file, so the golden shows --token-file and the path
+		// (gated by TestServerPlistCarriesNoToken); and ExitTimeOut fell from 90s to 60s
+		// when the daemon's two longest teardown stages stopped being serial
+		// (gated by TestExitTimeOutCoversTheDaemonTeardown); and the Go
 		// module and build caches were pinned into the work dir once the data
-		// root became root-owned (B397, gated by
+		// root became root-owned (gated by
 		// TestMeshKeyDirLivesOutsideTheServiceUserRunDir); and ExitTimeOut rose
 		// back to 90s once every deferred teardown step was budgeted, the ingest
-		// registry's and the update controller's among them (B703, gated by
+		// registry's and the update controller's among them (gated by
 		// TestExitTimeOutCoversEveryTeardownStep); and ExitTimeOut fell to 80s
 		// once the embedded runtime's close stopped ending vm helpers, which now
-		// outlive a daemon restart like native pods (B713, gated by the same
+		// outlive a daemon restart like native pods (gated by the same
 		// test). A render that
 		// moves for any other reason is still the regression this pins.
 		want, err := os.ReadFile(filepath.Join("testdata", "server.plist.golden"))
@@ -563,7 +563,7 @@ type seedLegacyEntry struct {
 	kind EntryKind
 }
 
-// TestAgentInstallAdoptsLegacyRootOwnedFiles is the gate for B323: a reinstall
+// TestAgentInstallAdoptsLegacyRootOwnedFiles pins this contract: a reinstall
 // over a worker installed BEFORE the node daemon moved from root to the _k3sm
 // service user hands that node's state over to the service user, so the daemon
 // can write it.
@@ -759,7 +759,7 @@ func TestAgentInstallAdoptsLegacyRootOwnedFiles(t *testing.T) {
 				}
 				f.putOwned(path, e.uid, e.gid, e.mode, e.kind)
 			}
-			// No --token-file: the B323 shape is a reinstall over a node that has
+			// No --token-file: the shape is a reinstall over a node that has
 			// ALREADY joined, which stages nothing and so repairs nothing on its
 			// way past.
 			cfg := agentCfg(t)

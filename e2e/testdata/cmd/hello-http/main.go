@@ -2,7 +2,7 @@
 // suite runs as a native pod "image" (TestM2_Probes, TestM3_NodePort). It serves
 // a fixed identity on "/", and health endpoints (/healthz, /livez) that can be
 // configured to FLIP from healthy to failing after a delay — so a readiness or
-// liveness probe TRANSITION (the M2.2 endpoint-removal / restart semantics) is
+// liveness probe TRANSITION (the endpoint-removal / restart semantics) is
 // exercised deterministically instead of waiting on an external event.
 //
 // stdlib only: it builds CGO_ENABLED=0 and, once ad-hoc-signed (codesign -s -),

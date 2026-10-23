@@ -183,7 +183,7 @@ func TestStatusOverTheReadSeam(t *testing.T) {
 		}
 	})
 
-	// The B340 verdict: a credential that is complete, matched and in date and
+	// The verdict: a credential that is complete, matched and in date and
 	// still cannot serve :10250 to the apiserver, because its certificate names
 	// an address this node was not assigned.
 	t.Run("a serving certificate for another address is an address mismatch", func(t *testing.T) {

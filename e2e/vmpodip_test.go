@@ -49,7 +49,7 @@ import (
 // TestAdmissionWebhookDeliveryThroughProxy (m16_test.go); this test does not
 // repeat it.
 //
-// RUN IT (two-Mac rig, from the server; the conftool helper must exist at the
+// RUN IT (two-Mac cluster, from the server; the conftool helper must exist at the
 // same path on the worker, as TestM3_InPodKubectlAndDNSOnWorker needs):
 //
 //	KUBECONFIG=<path> K3SM_WORKER=<worker node> CGO_ENABLED=1 go test -tags e2e \
@@ -90,7 +90,7 @@ for p in ports[1:]:
 serve(ports[0])
 `
 
-// TestVMPodIPReachableAcrossNodes is the B440 lab gate for the k3sm half: two vm
+// TestVMPodIPReachableAcrossNodes pins this contract for the k3sm half: two vm
 // Pods on the worker, each answering its own banner; a dial of either's
 // status.podIP reaches that Pod and never the other, from the server, from the
 // worker host and from a native pod on the worker; an undeclared port a Service
@@ -101,7 +101,7 @@ func TestVMPodIPReachableAcrossNodes(t *testing.T) {
 	ctx := context.Background()
 	worker := os.Getenv("K3SM_WORKER")
 	if worker == "" {
-		t.Skip("LAB-ONLY: set $K3SM_WORKER to a joined worker node (two-Mac rig); single-node gates do not run this")
+		t.Skip("LAB-ONLY: set $K3SM_WORKER to a joined worker node (two-Mac cluster); single-node gates do not run this")
 	}
 	bin := helperBin(t, "conftool")
 

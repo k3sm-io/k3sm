@@ -48,7 +48,7 @@ func recordText(t *testing.T, r dataroot.Record) string {
 	return string(b)
 }
 
-// k3smVolume is the rig's data volume as the Fake describes it.
+// k3smVolume is a development machine's data volume as the Fake describes it.
 func k3smVolume(mountpoint string) datavoltest.Volume {
 	return datavoltest.Volume{
 		UUID: rigUUID, Name: "k3sm", Container: "disk3", Device: "disk3s7",
@@ -226,7 +226,7 @@ func TestEnsureCreatesOrAdopts(t *testing.T) {
 	t.Run("adopting a hardware-encrypted, passphrase-less volume records encrypted=false", func(t *testing.T) {
 		f := datavoltest.New()
 		f.Fstab = "UUID=" + rigUUID + " " + testRoot + " apfs rw\n"
-		f.Add(k3smVolume(testRoot)) // no passphrase, like the rig's own volume
+		f.Add(k3smVolume(testRoot)) // no passphrase, like a development machine's own volume
 
 		// The platform reports encryption at rest for every internal volume,
 		// which is exactly the trap: it says nothing about a passphrase.

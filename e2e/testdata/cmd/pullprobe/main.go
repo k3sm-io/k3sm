@@ -111,11 +111,11 @@ func main() {
 	for _, kv := range env {
 		if forbid.contains([]byte(kv)) {
 			k, _, _ := strings.Cut(kv, "=")
-			fmt.Printf("B80-LEAK where=env name=%s\n", k)
+			fmt.Printf("PULLPROBE-LEAK where=env name=%s\n", k)
 			leaks++
 		}
 	}
-	fmt.Printf("B80-ENV entries=%d\n", len(env))
+	fmt.Printf("PULLPROBE-ENV entries=%d\n", len(env))
 
 	roots, err := scanRoots()
 	if err != nil {
@@ -127,7 +127,7 @@ func main() {
 	for _, root := range roots {
 		werr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
-				fmt.Printf("B80-UNREADABLE path=%s\n", path)
+				fmt.Printf("PULLPROBE-UNREADABLE path=%s\n", path)
 				skipped++
 				return nil
 			}
@@ -136,20 +136,20 @@ func main() {
 			}
 			info, err := d.Info()
 			if err != nil || info.Size() > maxScanFile {
-				fmt.Printf("B80-SKIPPED path=%s\n", path)
+				fmt.Printf("PULLPROBE-SKIPPED path=%s\n", path)
 				skipped++
 				return nil
 			}
 			b, err := os.ReadFile(path)
 			if err != nil {
-				fmt.Printf("B80-UNREADABLE path=%s\n", path)
+				fmt.Printf("PULLPROBE-UNREADABLE path=%s\n", path)
 				skipped++
 				return nil
 			}
 			files++
 			bytes += int64(len(b))
 			if forbid.contains(b) {
-				fmt.Printf("B80-LEAK where=file path=%s\n", path)
+				fmt.Printf("PULLPROBE-LEAK where=file path=%s\n", path)
 				leaks++
 			}
 			return nil
@@ -159,13 +159,13 @@ func main() {
 			os.Exit(2)
 		}
 	}
-	fmt.Printf("B80-ROOTS %s\n", strings.Join(roots, " "))
-	fmt.Printf("B80-SCAN files=%d bytes=%d skipped=%d\n", files, bytes, skipped)
+	fmt.Printf("PULLPROBE-ROOTS %s\n", strings.Join(roots, " "))
+	fmt.Printf("PULLPROBE-SCAN files=%d bytes=%d skipped=%d\n", files, bytes, skipped)
 	if leaks > 0 {
-		fmt.Printf("B80-CONFIDENTIALITY leaks=%d\n", leaks)
+		fmt.Printf("PULLPROBE-CONFIDENTIALITY leaks=%d\n", leaks)
 		os.Exit(3)
 	}
-	fmt.Println("B80-CONFIDENTIALITY clean")
+	fmt.Println("PULLPROBE-CONFIDENTIALITY clean")
 }
 
 // scanRoots returns the working directory and the executable's directory,
