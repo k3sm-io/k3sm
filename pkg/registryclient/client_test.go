@@ -32,13 +32,34 @@ import (
 
 func newClient(t *testing.T, h http.Handler, opts registryclient.Options) *registryclient.Client {
 	t.Helper()
-	srv := httptest.NewServer(h)
-	t.Cleanup(srv.Close)
-	c, err := registryclient.New(srv.URL, opts)
+	opts.Transport = handlerTransport{h}
+	c, err := registryclient.New("http://registry.test", opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	return c
+}
+
+// handlerTransport answers every request by calling h through a recorder, so
+// the client stack runs unchanged and no socket is opened. It honours the
+// request context, which a blocked handler needs to see cancelled.
+type handlerTransport struct{ h http.Handler }
+
+func (t handlerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t.h.ServeHTTP(rec, r)
+	}()
+	select {
+	case <-done:
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
+	}
+	resp := rec.Result()
+	resp.Request = r
+	return resp, nil
 }
 
 var (
@@ -198,10 +219,8 @@ func TestRequestTimeout(t *testing.T) {
 		case <-r.Context().Done():
 		}
 	})
-	srv := httptest.NewServer(h)
-	defer srv.Close()
 	defer close(release)
-	c, err := registryclient.New(srv.URL, registryclient.Options{Timeout: 50 * time.Millisecond})
+	c, err := registryclient.New("http://registry.test", registryclient.Options{Timeout: 50 * time.Millisecond, Transport: handlerTransport{h}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -73,8 +74,8 @@ type Options struct {
 	Timeout time.Duration
 	// RootCAs, when set, is the trust store for an https base URL.
 	RootCAs *x509.CertPool
-	// Transport replaces the HTTP transport; a test passes an httptest
-	// server's. When set, RootCAs is ignored.
+	// Transport replaces the HTTP transport; a test passes an in-process
+	// handler's. When set, RootCAs is ignored.
 	Transport http.RoundTripper
 }
 
@@ -107,10 +108,17 @@ func New(base string, opts Options) (*Client, error) {
 	}
 	rt := opts.Transport
 	if rt == nil {
-		t := http.DefaultTransport.(*http.Transport).Clone()
 		// The registry is a cluster component, never reached through the
-		// operator's HTTP proxy.
-		t.Proxy = nil
+		// operator's HTTP proxy, so Proxy stays nil. This is built here rather
+		// than cloned from http.DefaultTransport, which is shared global state.
+		t := &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		}
 		if opts.RootCAs != nil {
 			t.TLSClientConfig = &tls.Config{RootCAs: opts.RootCAs, MinVersion: tls.VersionTLS12}
 		}

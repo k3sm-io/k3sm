@@ -61,3 +61,7 @@ pkg/status/etcd.go httpGetLoopback http.DefaultClient # etcd metrics/health read
 pkg/status/registryrow.go probeRegistry http.DefaultClient # ingest registry /v2/ probe on 127.0.0.1
 pkg/builder/cancel.go RequestCancel var net.Dialer # dials a running build's cancel unix socket in the 0700 ledger dir
 pkg/builder/cancel.go BuildAlive var net.Dialer # liveness dial of a running build's cancel unix socket
+
+# Registry reads: the CLI's image ls/df client dials the server's registry on the apiserver host (loopback on the server, the underlay address otherwise), never a pod address.
+pkg/registryclient/client.go New http.Transport{} # anonymous registry read toward the server host on the physical interface; no mesh, no lo0 alias
+pkg/registryclient/client.go New net.Dialer{} # anonymous registry read toward the server host on the physical interface; no mesh, no lo0 alias

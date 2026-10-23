@@ -23,9 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
-	"net/http/httptest"
-	"net/url"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -64,12 +62,11 @@ func newImageFixture(t *testing.T, reachable bool) imageFixture {
 	b := reg.Image("tools/multi", "", registryclient.Platform{OS: "linux", Architecture: "amd64"}, []byte("amd base"), []byte("amd"))
 	multi := reg.Index("tools/multi", "v1", a, b)
 
-	srv := httptest.NewServer(reg.Handler())
-	t.Cleanup(srv.Close)
-	u, _ := url.Parse(srv.URL)
-	_, port, _ := net.SplitHostPort(u.Host)
+	// The registry is served in process (handlerTransport): no socket is opened.
+	const port = "6450"
+	var transport http.RoundTripper = handlerTransport{reg.Handler()}
 	if !reachable {
-		srv.Close() // nothing answers on the published port
+		transport = refusedTransport{} // nothing answers on the published port
 	}
 	doc, err := registrysvc.HostingDocument(mustAtoi(t, port), "")
 	if err != nil {
@@ -118,11 +115,18 @@ func newImageFixture(t *testing.T, reachable bool) imageFixture {
 	}
 	cs := fake.NewSimpleClientset(objs...)
 	return imageFixture{
-		env:              imageRegistryEnv{kube: cs, apiHost: "127.0.0.1"},
+		env:              imageRegistryEnv{kube: cs, apiHost: "127.0.0.1", transport: transport},
 		appV1:            appV1.Digest,
 		multi:            multi.Digest,
-		registryHostPort: u.Host,
+		registryHostPort: "127.0.0.1:" + port,
 	}
+}
+
+// refusedTransport fails every request the way a closed port does.
+type refusedTransport struct{}
+
+func (refusedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("dial tcp %s: connect: connection refused", r.URL.Host)
 }
 
 func mustAtoi(t *testing.T, s string) int {
