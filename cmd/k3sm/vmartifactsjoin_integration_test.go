@@ -42,7 +42,7 @@ import (
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
-// The B108 cluster-join leg: two k3sm nodes, one control plane, and the question
+// The cluster-join leg: two k3sm nodes, one control plane, and the question
 // of whether a JOINED worker derives its guest-artifact state for itself.
 //
 // # What is actually at risk
@@ -111,10 +111,10 @@ func TestIntegrationGuestArtifactsAgreeAcrossJoinedNodes(t *testing.T) {
 		// LOUD, never silent: this is the only proof that a JOINED node ensures its
 		// own artifacts, so a reader of a green run must be able to tell that it did
 		// not run rather than assume it passed.
-		t.Skip("B108 JOIN LEG NOT RUN: set K3SM_LAB=1 (it builds the repo, downloads a control plane and runs two daemons for minutes)")
+		t.Skip("JOIN LEG NOT RUN: set K3SM_LAB=1 (it builds the repo, downloads a control plane and runs two daemons for minutes)")
 	}
 	if os.Geteuid() != 0 {
-		t.Skip("B108 JOIN LEG NOT RUN: needs root — the runtimed posture stages pod-readable artifacts under /Library, and only the runtimed runtime wires guest artifacts at all")
+		t.Skip("JOIN LEG NOT RUN: needs root — the runtimed posture stages pod-readable artifacts under /Library, and only the runtimed runtime wires guest artifacts at all")
 	}
 
 	kubeconfig, serverPodRoot, agentPodRoot := bringUpJoinedPair(t)

@@ -25,7 +25,7 @@ import (
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
-// TestRosettaLinuxWithheldWithoutGuestSupport is the k3sm half of B229: the node must
+// TestRosettaLinuxWithheldWithoutGuestSupport is the k3sm half of the guest-support withholding: the node must
 // NOT advertise a capability it does not have.
 //
 // The regression this pins is specific and this-milestone. runtimed evaluates
@@ -41,8 +41,8 @@ import (
 // It is deliberately distinct from TestRosettaLabelDeleteOnLoss's composition_guest_false
 // subtest rather than folded into it. That test's decisive row is the VZ-INCAPABLE host
 // (VMBackend false); this one's is the VZ-CAPABLE host whose guest cannot translate —
-// the corner B229 opens, which reaches production only once VMBackend goes true. It is
-// also the gate string B229 names, so it must be a top-level test that
+// the corner that opens, which reaches production only once VMBackend goes true. It is
+// also the gate string the roadmap names, so it must be a top-level test that
 // `go test -run '^TestRosettaLinuxWithheldWithoutGuestSupport$'` selects.
 //
 // Three properties, none of which the existing composition row asserts together:
@@ -60,7 +60,7 @@ import (
 // Deliberately NOT t.Parallel: the configureNode legs read the hostMemBytes package var
 // that TestNodeCapacityFromHostMemory swaps, so this stays in the sequential phase.
 func TestRosettaLinuxWithheldWithoutGuestSupport(t *testing.T) {
-	// vmCapableGuestless is the B229 host: the vm backend IS available (so vm pods run
+	// vmCapableGuestless is the host: the vm backend IS available (so vm pods run
 	// natively) but the guest advertises no Rosetta, so linux/amd64 is not translatable.
 	vmCapableGuestless := provider.NodeCapabilities{VMBackend: true, RosettaGuest: false}
 

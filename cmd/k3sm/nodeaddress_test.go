@@ -33,7 +33,7 @@ import (
 
 // testKubeletAuth builds the kubelet endpoint's auth posture from a throwaway CA,
 // so the address/SAN assertions here exercise the REAL kubeletServingTLS signature
-// (which has no shape that omits client authentication — B176) without needing a
+// (which has no shape that omits client authentication) without needing a
 // provisioned work dir.
 func testKubeletAuth(t *testing.T) *provider.KubeletEndpointAuth {
 	t.Helper()
@@ -105,7 +105,7 @@ func stubLocalAddrs(t *testing.T, addrs ...string) {
 	t.Cleanup(func() { localInterfaceAddrs = saved })
 }
 
-// TestNodeAddressProxyable is B174's gate, narrowed by the kubelet listener
+// TestNodeAddressProxyable is the gate for this behaviour, narrowed by the kubelet listener
 // derivation: the address the VK node registers as its NodeInternalIP is the
 // address its kubelet API binds, so on the pod network it satisfies the
 // upstream apiserver node-proxy predicate, and with no pod network it is
@@ -192,7 +192,7 @@ func TestNodeAddressProxyable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("kubeletServingTLS: %v", err)
 		}
-		// B176: the serving half never ships without the client half.
+		// The serving half never ships without the client half.
 		if cfg.ClientAuth != tls.RequireAndVerifyClientCert {
 			t.Errorf("kubeletServingTLS ClientAuth = %v, want tls.RequireAndVerifyClientCert", cfg.ClientAuth)
 		}

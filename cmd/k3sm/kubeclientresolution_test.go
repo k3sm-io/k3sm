@@ -79,7 +79,7 @@ func writeUnparseableKubeconfigAt(t *testing.T, path string) string {
 
 // TestNewKubeClientResolution is the characterization table for every command
 // site that loads an explicitly-named kubeconfig and builds a client from it
-// (B251). It is written against the pre-refactor behaviour and KEPT afterwards:
+// . It is written against the pre-refactor behaviour and KEPT afterwards:
 // folding those inline clientcmd+kubernetes pairs onto one helper is a refactor
 // only if every one of these verdicts is unchanged.
 //

@@ -56,7 +56,7 @@ type fakeImagesDaemon struct {
 	loadResp   *runtimev1.LoadImageResponse
 	loadErr    error
 
-	// The B191 verbs. Each keeps the request it was handed, because the gate's
+	// The verbs. Each keeps the request it was handed, because the gate's
 	// claim is that the CLI is a CLIENT — the daemon decides — and the only way
 	// to see that is what reached the wire.
 	gotPull     *runtimev1.PullImageRequest

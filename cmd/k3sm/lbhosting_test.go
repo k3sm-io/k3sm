@@ -68,7 +68,7 @@ func gateNodeOptions() nodeOptions {
 	}
 }
 
-// TestLBListenersBindWildcardAdvertiseDerived is the B116 gate.
+// TestLBListenersBindWildcardAdvertiseDerived is the gate for this behaviour.
 //
 // It owns the WIRING and the DERIVATION at the call site — the decision
 // lbHostingConfigs makes — and nothing else. The behavioural halves are
@@ -366,7 +366,7 @@ func TestServerKubeletPortRenumbersOnlyThePort(t *testing.T) {
 // TestKubeletListenAddressesUsePortsConstant pins that the kubelet API listen
 // addresses are BUILT from ports.KubeletAPIPort, so the port the reserved-set
 // guard protects and the port the node actually listens on cannot desync. Before
-// B116 that port had no constant at all — just bare literals inside address
+// that, the port had no constant at all — just bare literals inside address
 // strings.
 func TestKubeletListenAddressesUsePortsConstant(t *testing.T) {
 	suffix := ":" + strconv.Itoa(ports.KubeletAPIPort)
@@ -390,7 +390,7 @@ func TestKubeletListenAddressesUsePortsConstant(t *testing.T) {
 	}
 }
 
-// TestIngressHostBindsThroughNetdWhenPresent is the B403 gate for the binder
+// TestIngressHostBindsThroughNetdWhenPresent is the gate for this behaviour for the binder
 // decision lbHostingConfigs owns. An unprivileged 0.0.0.0:80 loses to netd's
 // root-owned Service-VIP:80 socket (a different-uid wildcard fails with
 // EADDRINUSE on Darwin), so when the node has a netd helper the ingress host's

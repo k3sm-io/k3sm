@@ -105,7 +105,7 @@ func isKubernetesLabelNamespace(ns string) bool {
 		ns == "k8s.io" || strings.HasSuffix(ns, ".k8s.io")
 }
 
-// TestConfigureNodeStampsNoForbiddenLabels is the B225 (lab defect D4) regression
+// TestConfigureNodeStampsNoForbiddenLabels is the (lab defect D4) regression
 // gate: a JOINED WORKER registers as `system:node:<name>`, so every label on the
 // Node object it creates — and re-asserts on every status tick — passes through
 // NodeRestriction. One forbidden key rejects the whole create/patch and the worker

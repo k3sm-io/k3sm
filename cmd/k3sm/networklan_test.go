@@ -250,7 +250,7 @@ func newLANRig(t *testing.T, role install.Role) *lanRig {
 	return rig
 }
 
-// lanRigHost is the rig Mac's interface addresses: a Wi-Fi address,
+// lanRigHost is a lab Mac's interface addresses: a Wi-Fi address,
 // loopback and the mesh address on its utun.
 func lanRigHost() ([]netip.Addr, error) {
 	return []netip.Addr{netip.MustParseAddr("192.0.2.20"), netip.MustParseAddr("127.0.0.1"), lanNode}, nil

@@ -33,7 +33,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 )
 
-// This file is M14.2 d3's unit tier: the control-plane node's own index-0 enroll,
+// This file is the unit tier for the control-plane node's own index-0 enroll,
 // and the worker index assignment that had to be corrected in the same change.
 //
 // The two are one defect, not two. `EnrollSelf` makes index 0 an OCCUPIED slot for
@@ -232,7 +232,7 @@ func TestEnrollAssignsLowestFreeIndexAboveZero(t *testing.T) {
 	}
 }
 
-// TestEnrollReleaseAllocationFreesTheIndex is B339's enroller half: the undo of an
+// TestEnrollReleaseAllocationFreesTheIndex is the enroller half: the undo of an
 // allocation a join carved and then failed to use. The enroll is what DECIDES a
 // node's address, so it runs before the certificates are signed; without a release
 // every join that dies at its CSR leaves a MeshPeer holding a /24 that

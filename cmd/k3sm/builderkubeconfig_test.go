@@ -82,7 +82,7 @@ func unreadableWorkDir(t *testing.T) string {
 	return workDir
 }
 
-// TestBuilderUsesTheUserKubeconfigWhenTheWorkDirIsUnreadable is the B648 gate.
+// TestBuilderUsesTheUserKubeconfigWhenTheWorkDirIsUnreadable is the gate for this behaviour.
 // The builder verbs (up|down|delete|status, and `k3sm build prune`, which goes
 // through the same newBuilderManager) resolve their kubeconfig the way
 // `k3sm kubectl` does: the work dir's admin kubeconfig when it is readable, the
@@ -206,7 +206,7 @@ func TestBuilderWorkDirExplicitness(t *testing.T) {
 
 // TestBuilderAndKubectlResolveAlike holds the builder to `k3sm kubectl`: on
 // every input where kubectl resolves a kubeconfig, the builder resolves the same
-// one. TestResolveKubectlConfig, unchanged by B648, pins kubectl's own answers.
+// one. TestResolveKubectlConfig, unchanged by this change, pins kubectl's own answers.
 func TestBuilderAndKubectlResolveAlike(t *testing.T) {
 	const (
 		serviceWorkDir = "/var/lib/k3sm/server"

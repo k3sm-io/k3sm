@@ -41,7 +41,7 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 )
 
-// This file is B447: every control-plane server's pod range is the /24 its own
+// This file pins that every control-plane server's pod range is the /24 its own
 // --mesh-ip names, and that range is reserved — by an atomic claim object — before
 // anything is written for it. The two-server lab run is the live proof; these are
 // the unit tier.
@@ -94,13 +94,13 @@ func enrollerOverHandler(t *testing.T) (*meshEnroller, *meshPeerAPIStub) {
 	return e, api
 }
 
-// TestJoinedServerEnrolsAtItsOwnMeshIndex is the B447 gate. A server joined with
+// TestJoinedServerEnrolsAtItsOwnMeshIndex is the gate for this behaviour. A server joined with
 // --mesh-ip 100.64.1.1 enrols at 100.64.1.0/24 — the range its lo0 alias, its netd
 // seed and its apiserver bind already use — beside the first server's 100.64.0.0/24,
 // which it never touches; and the pod range step 2b leaves for the node passes the
 // alias check the node's bring-up runs.
 //
-// Before B447 every server claimed index 0: the joiner's enrol failed on the first
+// Before that, every server claimed index 0: the joiner's enrol failed on the first
 // server's row and the node's pod range stayed 100.64.0.0/24, which the alias check
 // refuses for 100.64.1.1, so the daemon exited.
 func TestJoinedServerEnrolsAtItsOwnMeshIndex(t *testing.T) {

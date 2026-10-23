@@ -25,11 +25,11 @@ import (
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
-// TestRosettaLabelDeleteOnLoss is the B103 proof of the two Rosetta capability node
+// TestRosettaLabelDeleteOnLoss is the proof of the two Rosetta capability node
 // labels: k3sm.io/rosetta (host darwin/amd64 Mach-O translation) and
 // k3sm.io/rosetta-linux (linux/amd64 ELF in a VZ guest, a CONJUNCTION of the vm
 // backend and the guest probe). It follows the shape of TestNodeVirtualizationLabel
-// (B1, the delete-on-loss precedent this mirrors) and pins three properties:
+// (the delete-on-loss precedent this mirrors) and pins three properties:
 //
 //  1. the label KEYS are the documented literals (a const rename is a red test, not a
 //     silently-renamed node label the roadmap's four docs no longer describe);
@@ -171,7 +171,7 @@ func TestRosettaLabelDeleteOnLoss(t *testing.T) {
 	// the applyRosettaLabels CALL from configureNode would leave every leaf-helper
 	// subtest above green while the shipped node carried no Rosetta label at all.
 	t.Run("configureNode_threads_caps", func(t *testing.T) {
-		// Pin the HOST facts to a native Apple Silicon Mac (B104): configureNode now
+		// Pin the HOST facts to a native Apple Silicon Mac: configureNode now
 		// DERIVES the reported arch through the readHostArchFacts seam, so pinning the
 		// facts keeps the arch assertions below hermetic — they prove "Rosetta capability
 		// never widens the arch", not "the machine running the tests happens to be arm64".
@@ -212,7 +212,7 @@ func TestRosettaLabelDeleteOnLoss(t *testing.T) {
 			}
 			// Rosetta capability NEVER widens the arch the node reports: both the label
 			// and NodeInfo.Architecture stay the machine's native arm64 (derived from the
-			// pinned host facts above — B104), so a generic client is never told this node
+			// pinned host facts above), so a generic client is never told this node
 			// IS amd64 no matter which translation capabilities it advertises.
 			if got := n.Labels["kubernetes.io/arch"]; got != "arm64" {
 				t.Errorf("%s: kubernetes.io/arch = %q, want arm64 (Rosetta must not widen the arch label)", tc.name, got)
@@ -223,14 +223,14 @@ func TestRosettaLabelDeleteOnLoss(t *testing.T) {
 		}
 	})
 
-	// B1 must not regress: the same configureNode call still stamps the virtualization
+	// The virtualization label must not regress: the same configureNode call still stamps the virtualization
 	// label from caps.VMBackend.
 	t.Run("configureNode_preserves_vm_label", func(t *testing.T) {
 		n := &corev1.Node{}
 		configureNode(n, "k3sm-node", "10.0.0.1", nodeKubeletListen, provider.NodeCapabilities{VMBackend: true})
 		wantTrue(t, n, runtimeclass.LabelVirtualization)
 
-		// And the loss direction of B1's label still deletes (pre-seeded).
+		// And the loss direction of the label still deletes (pre-seeded).
 		lost := &corev1.Node{}
 		lost.Labels = map[string]string{runtimeclass.LabelVirtualization: runtimeclass.LabelTrue}
 		configureNode(lost, "k3sm-node", "10.0.0.1", nodeKubeletListen, provider.NodeCapabilities{})

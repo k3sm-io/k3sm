@@ -26,7 +26,7 @@ import (
 //
 // runServer boots a real control plane, so no unit test can call it — and this
 // repo's recurring defect class is precisely a well-tested helper that bring-up
-// never calls (B195, B209). pkg/executor's tests prove the seam works; nothing
+// never calls. pkg/executor's tests prove the seam works; nothing
 // but this proves runServer still uses it. Three things are asserted, each of
 // which a plausible refactor breaks while leaving every other test green:
 //

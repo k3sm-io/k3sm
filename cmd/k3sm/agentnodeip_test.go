@@ -135,7 +135,7 @@ func newJoinRig(t *testing.T) *joinRig {
 		token: bootstrap.FormatToken(clusterCA.PinHash(), user, secret)}
 }
 
-// join runs the agent-side join client against the rig, asserting nothing.
+// join runs the agent-side join client against the fake server, asserting nothing.
 func (r *joinRig) join(ctx context.Context, nodeName, nodeIP string) (*bootstrap.JoinResult, error) {
 	return bootstrap.Join(ctx, bootstrap.JoinOptions{
 		Server:       r.ts.URL,
@@ -185,7 +185,7 @@ func certIPSANs(t *testing.T, certPEM []byte) []string {
 	return out
 }
 
-// TestAgentJoinDerivesTheNodeIPFromTheAssignment is the B338 gate: the address a
+// TestAgentJoinDerivesTheNodeIPFromTheAssignment is the gate for this behaviour: the address a
 // worker holds inside the cluster is the CONTROL PLANE'S to assign, and every
 // consumer of it — the issued certificates, the Node object's InternalIP, the
 // node's own datapath — takes it from that one assignment.

@@ -44,7 +44,7 @@ func withHostArchFacts(t *testing.T, f hostArchFacts, err error) {
 	t.Cleanup(func() { readHostArchFacts = restore })
 }
 
-// TestNodeArchLabelTruthful is the B104 proof that the architecture this node reports —
+// TestNodeArchLabelTruthful is the proof that the architecture this node reports —
 // BOTH the kubernetes.io/arch label and NodeInfo.Architecture — is DERIVED from host
 // facts through the readHostArchFacts seam, replacing the two hardcoded "arm64" literals
 // in configureNode.
@@ -198,7 +198,7 @@ func TestNodeArchLabelTruthful(t *testing.T) {
 		}
 	})
 
-	// B103 must not regress THROUGH THIS CHANGE: Rosetta capability never widens the
+	// The Rosetta label work must not regress THROUGH THIS CHANGE: Rosetta capability never widens the
 	// arch the node reports. The full four-corner proof lives in
 	// TestRosettaLabelDeleteOnLoss; this leg pins the interaction the derivation could
 	// plausibly break — a Rosetta-host-capable Apple Silicon node still reports arm64.

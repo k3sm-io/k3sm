@@ -27,7 +27,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 )
 
-// TestDefaultRuntimeIsRuntimed pins THE M10.1 default-runtime flip: the shared
+// TestDefaultRuntimeIsRuntimed pins the default-runtime flip: the shared
 // --runtime registration (addRuntimeFlag — the ONE default `k3sm node`, `k3sm
 // agent`, and `k3sm server` all use) defaults to runtimed, an empty value
 // resolves to it, and the single-node podCIDR derivation matches the enroller's
@@ -44,7 +44,7 @@ func TestDefaultRuntimeIsRuntimed(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	if rt != runtimeRuntimed {
-		t.Errorf("shared --runtime default = %q, want %q (the M10.1 flip)", rt, runtimeRuntimed)
+		t.Errorf("shared --runtime default = %q, want %q (the default-runtime flip)", rt, runtimeRuntimed)
 	}
 	if got := resolveRuntime(""); got != runtimeRuntimed {
 		t.Errorf("resolveRuntime(\"\") = %q, want %q", got, runtimeRuntimed)

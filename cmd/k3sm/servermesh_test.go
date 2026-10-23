@@ -28,7 +28,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 )
 
-// TestServerMeshKeyIsMintedOnceAndReused is M14.2 d2's unit tier.
+// TestServerMeshKeyIsMintedOnceAndReused is the unit tier for the server mesh key.
 //
 // The property is PERSISTENCE, not secrecy: the public key derived from this file
 // is what every peer programs into its wireguard device, so a key re-minted on
@@ -157,7 +157,7 @@ func TestServerMeshEndpointPrefersAnUnderlayAddress(t *testing.T) {
 	}
 }
 
-// TestServerMeshEndpointNeverPicksATunnel is B283's B3 leg.
+// TestServerMeshEndpointNeverPicksATunnel is the leg.
 //
 // At bring-up the mesh utun does not exist, so the old tunnel-INCLUDING scan was
 // harmless by accident. The endpoint refresher re-derives this value every 30s

@@ -67,7 +67,7 @@ func (r *nameRecorder) AnnotatedEventf(runtime.Object, map[string]string, string
 
 var _ record.EventRecorder = (*nameRecorder)(nil)
 
-// TestNodeRecorderSpacesEvents pins B764: the recorder Virtual Kubelet records
+// TestNodeRecorderSpacesEvents pins that the recorder Virtual Kubelet records
 // its pod Events through is wrapped by the SAME spacer the providers use, so a
 // provider Event and a VK Event recorded in one (fake) microsecond still get
 // distinct names. nodeEventRecorders is what the node wires; two separate

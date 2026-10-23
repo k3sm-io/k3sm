@@ -55,7 +55,7 @@ const (
 
 func tail(lines ...string) string { return strings.Join(lines, "\n") }
 
-// TestLeaderLeaseLossIsNotACrash pins B454: on an HA server that loses etcd
+// TestLeaderLeaseLossIsNotACrash pins that on an HA server that loses etcd
 // quorum, the controller-manager or scheduler that held its lease exits as
 // upstream intends. The daemon must still restart (the exit cancels the
 // process), but the record must carry it as leader-lost — never as a crash, so

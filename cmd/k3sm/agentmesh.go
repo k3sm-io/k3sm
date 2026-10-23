@@ -202,8 +202,8 @@ func firstProxyableIP(ips []net.IP) string {
 //
 // It excludes tunnels deliberately: for advertising a wireguard endpoint a utun
 // address is the exact defect this file prevents, because the mesh's own utun
-// carries the address no un-joined peer can route to. Package var so the selection is unit-testable on a host whose
-// interfaces a test cannot change.
+// carries the address no un-joined peer can route to. Package var so the
+// selection is unit-testable on a host whose interfaces a test cannot change.
 var underlayInterfaceIPs = func() []net.IP {
 	ifaces, err := net.Interfaces()
 	if err != nil {

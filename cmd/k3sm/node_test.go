@@ -68,13 +68,13 @@ func TestNodeInternalIP(t *testing.T) {
 }
 
 // TestRuntimedConfiguresPostureVIPs proves the runtimed runtime is configured with
-// the correct per-pod Seatbelt egress VIPs (the k3sm half of M3.3 deliverable 5):
+// the correct per-pod Seatbelt egress VIPs (the k3sm half of the posture wiring):
 // ResolverVIP is the cluster DNS VIP (10.43.0.10) — the same VIP the per-node
 // resolver binds and pods resolve against — NOT runtimed's legacy default
 // (10.96.0.10), and APIServerVIP is the kubernetes Service ClusterIP (10.43.0.1)
 // derived from the cluster service CIDR. runtimed threads both into its per-pod
 // sandbox.Posture, so without this a confined pod's DNS is scoped to the wrong VIP
-// and in-pod kubectl has no API-server egress rule. Maps to M3.3-a1.
+// and in-pod kubectl has no API-server egress rule. Covers the worker-bringup wiring.
 func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 	t.Parallel()
 
@@ -93,7 +93,7 @@ func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 	if cfg.APIServerVIP != "10.43.0.1" {
 		t.Errorf("APIServerVIP = %q, want 10.43.0.1 (the kubernetes Service ClusterIP, first host of the service CIDR)", cfg.APIServerVIP)
 	}
-	// ClusterDomain PREFERS the threaded --cluster-domain (B18): a hardcoded
+	// ClusterDomain PREFERS the threaded --cluster-domain: a hardcoded
 	// cluster.local under a custom domain would make every unqualified Service lookup
 	// NXDOMAIN (the shim search list must match the resolver's served zone).
 	if cfg.ClusterDomain != "corp.internal" {
@@ -106,8 +106,8 @@ func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 		t.Errorf("ResolverVIP with no --dns-vip = %q, want the cluster DNS VIP default 10.43.0.10", got)
 	}
 	// An unset --cluster-domain falls back to the single-sourced dns.DefaultClusterDomain
-	// (B42 wave 2): the SAME const the per-node resolver's empty-domain fallback resolves to,
-	// so this k3sm-side fallback can never silently diverge from the served zone (the B18
+	// It is the SAME const the per-node resolver's empty-domain fallback resolves to,
+	// so this k3sm-side fallback can never silently diverge from the served zone (the earlier
 	// desync the consolidation closes). A regression that re-hardcoded a different literal here
 	// fails against the const, not a copy of it.
 	if got := runtimedConfig(nodeOptions{}, nil).ClusterDomain; got != dns.DefaultClusterDomain {
@@ -121,7 +121,7 @@ func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 	}
 }
 
-// TestRuntimedConfigPrefersExplicitShimFlags pins the OTHER half of the B151
+// TestRuntimedConfigPrefersExplicitShimFlags pins the OTHER half of the
 // pod-support-shim wiring: an explicitly-passed --path-shim / --dns-shim must win
 // over the sibling-dylib lookup.
 //
@@ -159,12 +159,12 @@ func TestRuntimedConfigPrefersExplicitShimFlags(t *testing.T) {
 	}
 }
 
-// TestNodeVirtualizationLabel is the M5.1 proof of the vm RuntimeClass
+// TestNodeVirtualizationLabel is the proof of the vm RuntimeClass
 // node-capability gate: the k3sm.io/virtualization label is present (value "true")
 // iff the node can run the Virtualization.framework backend, and ABSENT otherwise —
 // so the vm RuntimeClass nodeSelector keeps a vm pod off a non-VZ node. It also pins
 // the fail-closed default: configureNode with vmCapable=false (the runtimed
-// VMBackendAvailable probe absent/false — B1) stamps NO virtualization label, so a vm
+// VMBackendAvailable probe absent/false) stamps NO virtualization label, so a vm
 // pod stays Unschedulable.
 func TestNodeVirtualizationLabel(t *testing.T) {
 	t.Parallel()
@@ -187,8 +187,8 @@ func TestNodeVirtualizationLabel(t *testing.T) {
 		t.Error("clearing the virtualization label must not disturb other node labels")
 	}
 
-	// configureNode threads the runtimed vm-capability probe (B1) — now carried in the
-	// provider.NodeCapabilities struct (B103): the zero value ⇒ the label is ABSENT
+	// configureNode threads the runtimed vm-capability probe — now carried in the
+	// provider.NodeCapabilities struct: the zero value ⇒ the label is ABSENT
 	// (no VZ node ⇒ vm pods stay Unschedulable, fail-closed); VMBackend: true ⇒
 	// present, so the vm RuntimeClass nodeSelector can bind.
 	incapableNode := &corev1.Node{}
@@ -203,9 +203,9 @@ func TestNodeVirtualizationLabel(t *testing.T) {
 	}
 }
 
-// TestNodeCapacityFromHostMemory is the B13 proof that the node advertises REAL
+// TestNodeCapacityFromHostMemory is the proof that the node advertises REAL
 // host memory (hw.memsize) in its Capacity instead of the prior hardcoded 8Gi (with
-// B41's system-reserved Allocatable carve-out layered on top). nodeCapacity is
+// the system-reserved Allocatable carve-out layered on top). nodeCapacity is
 // exercised directly (pure, hermetic, no syscall), and the configureNode wiring is
 // exercised through an injected hostMemBytes reader — including the documented 8Gi
 // fallback on a failed or implausible host-fact read (which must never advertise a
@@ -255,12 +255,12 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		}
 	})
 
-	// configureNode advertises the injected host memory as Capacity, and B41 holds back
+	// configureNode advertises the injected host memory as Capacity, and the reserve holds back
 	// a system-reserved memory carve-out so Allocatable memory < Capacity memory (cpu
-	// and pods pass through unchanged & present). This INVERTS B13's prior Allocatable
+	// and pods pass through unchanged & present). This INVERTS the prior Allocatable
 	// == Capacity: the scheduler must not be able to commit 100% of RAM to pod requests
 	// and starve the co-located control plane.
-	t.Run("configureNode advertises host memory; Allocatable = Capacity - reserve (B41)", func(t *testing.T) {
+	t.Run("configureNode advertises host memory; Allocatable = Capacity - reserve", func(t *testing.T) {
 		thirtyTwo := 32 * gib
 		restore := hostMemBytes
 		hostMemBytes = func() (uint64, error) { return uint64(thirtyTwo), nil }
@@ -280,14 +280,14 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		}
 
 		// Memory is held back by exactly the computed reserve: Allocatable == Capacity −
-		// reserve, strictly LESS than Capacity (the B41 inversion of Allocatable == Capacity).
+		// reserve, strictly LESS than Capacity (the inversion of Allocatable == Capacity).
 		wantReserve := memReserveBytes(thirtyTwo)
 		allocMem := n.Status.Allocatable[corev1.ResourceMemory]
 		if got, want := allocMem.Value(), thirtyTwo-wantReserve; got != want {
 			t.Errorf("Allocatable memory = %d, want %d (Capacity %d − reserve %d)", got, want, thirtyTwo, wantReserve)
 		}
 		if allocMem.Value() >= capMem.Value() {
-			t.Errorf("Allocatable memory (%d) must be strictly < Capacity memory (%d) after the B41 reserve", allocMem.Value(), capMem.Value())
+			t.Errorf("Allocatable memory (%d) must be strictly < Capacity memory (%d) after the reserve", allocMem.Value(), capMem.Value())
 		}
 
 		// cpu and pods pass through unchanged: present in Allocatable AND == Capacity
@@ -358,7 +358,7 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 }
 
 // TestConfigureNodeTopologyLabels proves configureNode advertises the well-known GA
-// topology labels (B16): topology.kubernetes.io/zone and .../region. The load-bearing
+// topology labels: topology.kubernetes.io/zone and .../region. The load-bearing
 // assertion is that zone is set to THIS node's name — byte-identical to
 // kubernetes.io/hostname by construction — so it is a per-node failure domain, not a
 // shared static zone (which would FALSELY claim co-located Macs are co-failing, and
@@ -387,7 +387,7 @@ func TestConfigureNodeTopologyLabels(t *testing.T) {
 	}
 }
 
-// TestNodeAllocatableReserve is the B41 proof of the node system-reserved memory
+// TestNodeAllocatableReserve is the proof of the node system-reserved memory
 // carve-out. nodeAllocatable holds back a memory reserve from Allocatable for the
 // CO-LOCATED control plane (so the scheduler cannot commit 100% of RAM to pod requests
 // and starve apiserver/scheduler/KCM/kine/runtimed), and memReserveBytes sizes that
@@ -501,7 +501,7 @@ func TestNodeAllocatableReserve(t *testing.T) {
 	})
 }
 
-// TestNodeStartupBoundedAndDiagnostic pins the bounded startup wait (B158).
+// TestNodeStartupBoundedAndDiagnostic pins the bounded startup wait.
 //
 // Before this, startNode blocked FOREVER in a select on the VK node's Ready
 // channel vs its Run error: observed live 2026-08-27, a node whose VK run loop
@@ -629,7 +629,7 @@ users:
 }
 
 // TestNodeRESTClientHasTimeout pins a request timeout on the rest.Config the
-// node's apiserver clientset is built from (B161).
+// node's apiserver clientset is built from.
 //
 // clientcmd.BuildConfigFromFlags leaves rest.Config.Timeout at zero ("no
 // timeout"), and nothing else in the node path set one — so a stalled HTTPS
@@ -736,7 +736,7 @@ func TestNodeRESTClientHasTimeout(t *testing.T) {
 
 // TestNodeRESTConfigHasKubeletBudget pins the upstream kubelet's client-side
 // request budget (kubeAPIQPS 50, kubeAPIBurst 100) on the rest.Config the
-// node's clientset is built from (B360). BuildConfigFromFlags leaves QPS and
+// node's clientset is built from. BuildConfigFromFlags leaves QPS and
 // Burst at zero, which client-go turns into its 5/10 default — one bucket the
 // node's status writes, informers, leases, events, and volume reads all share.
 // client-go exposes no public accessor for the limiter it builds, so the gate

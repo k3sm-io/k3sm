@@ -236,7 +236,7 @@ func TestDatavolStatusJSONShape(t *testing.T) {
 // TestDatavolStatusUsedSource is the gate for which probe the reported usage
 // comes from. It exists because statfs(2) answers the question WRONG on a
 // quota-less APFS volume -- it reports the container's block counts, so its
-// "used" is the whole disk's, which on the lab rig read 790G for a volume
+// "used" is the whole disk's, which on a test Mac read 790G for a volume
 // holding 34.8G. The bug is invisible in the output, so the test asserts the
 // SOURCE alongside the number.
 func TestDatavolStatusUsedSource(t *testing.T) {

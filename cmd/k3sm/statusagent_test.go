@@ -33,7 +33,7 @@ import (
 	"k3sm.io/k3sm/pkg/status"
 )
 
-// TestStatusReportsTheAgentDaemon is the cmd half of the B310 gate: the log view
+// TestStatusReportsTheAgentDaemon is the cmd half of the gate: the log view
 // tails the daemons this Mac actually has, and `agent` is a job an operator can
 // name. The report half — the rows, the credential and the screens — is
 // pkg/status's own TestStatusReportsTheAgentDaemon.

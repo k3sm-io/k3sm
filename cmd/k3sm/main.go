@@ -30,7 +30,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -51,7 +51,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
   build       build an image from a Dockerfile (COPY-only natively; RUN via the build engine)
   builder     manage the in-cluster buildkitd engine (builder up|down|delete|status|buildx)
-  image       ingest, publish and reclaim this node's images (image load|import|push|prune|ls|df)
+  image       ingest, publish and reclaim this node's images (image load|import|push|pull|tag|untag|inspect|save|prune|ls|df)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
   status      show what is running (daemons, apiserver, node, workloads, data root; status top for CPU and memory) — the exit code is the verdict, see k3sm status --help

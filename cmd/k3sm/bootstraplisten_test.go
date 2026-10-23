@@ -26,7 +26,7 @@ import (
 // TestBootstrapListenAddrIsWildcardOnTheMeshPath pins the address the worker-join
 // supervisor listens on.
 //
-// The defect it fixes was invisible to every existing gate because the M14.2 lab
+// The defect it fixes was invisible to every existing gate because the lab
 // tier booted with --mesh-ip 127.0.0.1: a supervisor bound to loopback is still
 // reachable from the same host, so a single-Mac join succeeded while the only
 // posture that matters — a SECOND Mac dialing https://<underlay>:9345 — was

@@ -29,7 +29,7 @@ import (
 	"testing"
 )
 
-// TestAgentPodRootDefaultsOffTempDir pins B276: `k3sm agent`'s pod root — which
+// TestAgentPodRootDefaultsOffTempDir pins that `k3sm agent`'s pod root — which
 // is runtimed's ON-DISK ROOT (image cache, pod dirs, every PVC bound on this
 // node), not "per-pod logs/state" — no longer defaults into the temp dir.
 //

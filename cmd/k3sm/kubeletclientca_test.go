@@ -27,7 +27,7 @@ import (
 	"k3sm.io/k3sm/pkg/ports"
 )
 
-// TestWorkerKubeletClientCAThreads proves the B176 anchor survives the one hop
+// TestWorkerKubeletClientCAThreads proves the anchor survives the one hop
 // that is easy to drop: `k3sm agent` receives the cluster's client-identity CA in
 // its join response and must hand it to the in-process node, because a joined
 // worker serves :10250 on its mesh address, reachable from every peer, and is
@@ -36,7 +36,7 @@ import (
 // serveTLS is asserted alongside it: the two travel together by construction —
 // serving TLS is exactly the condition under which the provider routes
 // (logs/exec/attach/port-forward) are attached, so a worker with serveTLS and no
-// anchor is the pre-B176 posture.
+// anchor is the posture before client-auth stamping.
 func TestWorkerKubeletClientCAThreads(t *testing.T) {
 	t.Parallel()
 	ca, err := certs.NewCA("k3sm-signing-ca")
@@ -70,7 +70,7 @@ func TestWorkerKubeletClientCAThreads(t *testing.T) {
 // cluster by --kubeconfig, so nothing in the process knows where that cluster's
 // client CA lives — only the operator does. Being unable to name it is a refusal,
 // NOT a reason to fall back to an unauthenticated listener: the fallback would be
-// exactly the posture B176 removed, reintroduced through the one path that has no
+// exactly the posture client-auth stamping removed, reintroduced through the one path that has no
 // PKI of its own.
 func TestStandaloneNodeServeTLSDemandsClientCA(t *testing.T) {
 	t.Parallel()

@@ -93,7 +93,7 @@ type podRootChoice struct {
 // On a stock Mac the two roles' derivations COINCIDE — /var/lib/k3sm/server and
 // /var/lib/k3sm/agent both have /var/lib/k3sm as their parent — which is safe
 // only because the two daemons never share a Mac: pkg/install's cross-role
-// refusal (refuseCrossRole, B294) rejects installing the second role over the
+// refusal (refuseCrossRole) rejects installing the second role over the
 // first rather than letting two daemons fight over one root.
 func resolveAgentPodRoot(explicit, workDir, legacyDir string, hasData func(dir string) (bool, error)) podRootChoice {
 	durable := executor.RuntimeRoot(workDir)

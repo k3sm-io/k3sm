@@ -368,7 +368,7 @@ func readPKITree(t *testing.T, workDir string) map[string]string {
 	return out
 }
 
-// TestServerJoinFetchesBundleOnlyWhenCAMissing is the B435 gate: a joined server
+// TestServerJoinFetchesBundleOnlyWhenCAMissing is the gate for this behaviour: a joined server
 // restarts. The bundle is fetched only while a CA is missing, a restart over a
 // complete hierarchy fetches nothing and succeeds (on main it hit the import's
 // refusal to overwrite its own files), a backfill leaves present CAs byte-identical,
@@ -548,7 +548,7 @@ func TestServerJoinFetchesBundleOnlyWhenCAMissing(t *testing.T) {
 	})
 }
 
-// TestServerJoinSavesSecretBeforeFetch pins the B435 ordering: the token's secret is on
+// TestServerJoinSavesSecretBeforeFetch pins the ordering: the token's secret is on
 // disk before the bundle is requested, so a fetch that fails afterwards still leaves
 // it recorded.
 func TestServerJoinSavesSecretBeforeFetch(t *testing.T) {

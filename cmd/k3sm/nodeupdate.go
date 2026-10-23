@@ -35,7 +35,7 @@ import (
 
 // releaseBaseUsage is the --update-release-base help, shared by `k3sm
 // install`, `k3sm server` and `k3sm agent`.
-const releaseBaseUsage = "the release index the managed update reads instead of GitHub's, for a mirror or a lab rig: an https URL, or http only on a loopback address (the server signs the checksum it reads from the index, so plain http on a network would let any host on the path choose it). Recorded with the other install arguments and kept by later installs"
+const releaseBaseUsage = "the release index the managed update reads instead of GitHub's, for a mirror or a test environment: an https URL, or http only on a loopback address (the server signs the checksum it reads from the index, so plain http on a network would let any host on the path choose it). Recorded with the other install arguments and kept by later installs"
 
 // releaseBase validates a --update-release-base value; empty is nil (GitHub's
 // index).

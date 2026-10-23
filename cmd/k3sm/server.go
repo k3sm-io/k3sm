@@ -123,8 +123,8 @@ type serverOptions struct {
 	// which the installer renders from this recorded argument.
 	lbPrivilegedPorts string
 	// updateReleaseBase is --update-release-base: the release index the
-	// managed update reads instead of GitHub's (a mirror, a lab rig). Empty is
-	// GitHub's; it is validated after the flags parse (releaseBaseFlag).
+	// managed update reads instead of GitHub's (a mirror, a test environment). Empty is
+	// GitHub's; it is validated after the flags parse (releaseBase).
 	updateReleaseBase string
 
 	// clusterInit / serverJoin select the embedded-etcd HA posture (see
@@ -670,13 +670,13 @@ func runServer(args []string) (err error) {
 // before.
 //
 // A server whose pod range is not its own (sm.dataPathRefused) starts NO datapath
-// and returns zero values: runServerNode parks it before anything reads them.
+// and returns zero values: runServer parks it (parkServerDataPath) before anything reads them.
 //
 // The NodePort address set is resolved here from the LAN switch (off: this Mac
 // and the mesh; on: --nodeport-addresses, empty being every interface) against
 // this Mac's addresses and the address the node advertises; an unusable or
 // empty-selecting spec is the error, and the server refuses to start rather
-// than serve NodePorts nowhere. SIGHUP re-resolves it (attachServerProxy).
+// than serve NodePorts nowhere. SIGHUP re-resolves it (attachDatapath).
 func startServerDatapath(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions, error) {
 	// Before any datapath decision: the previous process's Service proxy record
 	// describes a proxy that is gone, whether or not this one starts a datapath.

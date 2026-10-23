@@ -39,7 +39,7 @@ func rateLimited(wait time.Duration) error {
 	}
 }
 
-// TestAgentWaitsOutARateLimitedJoin is the agent half of B346.
+// TestAgentWaitsOutARateLimitedJoin is the agent half of the rate-limited join retry.
 //
 // The server bounds how fast ONE token may drive a join, so several Macs
 // onboarded at once against one token take turns. An agent calls the join once
