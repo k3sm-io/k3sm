@@ -38,12 +38,12 @@ func TestMeshClaimsRowFrom(t *testing.T) {
 	})
 	t.Run("abandoned", func(t *testing.T) {
 		row := meshClaimsRowFrom(MeshClaimsRecord{UpdatedAt: now.Add(-time.Minute), Abandoned: []AbandonedMeshClaim{
-			{Claim: "kube-system/meshrange-1", Holder: "laptop", PodCIDR: "100.64.1.0/24", Kind: MeshClaimServerReservation},
+			{Claim: "kube-system/meshrange-1", Holder: "node-b", PodCIDR: "100.64.1.0/24", Kind: MeshClaimServerReservation},
 		}}, now)
 		if row.Severity != SeverityWarn || row.Remedy != MeshClaimsRemedy {
 			t.Errorf("row = %+v, want a warning with the remedy", row)
 		}
-		for _, want := range []string{"kube-system/meshrange-1", "laptop", "100.64.1.0/24"} {
+		for _, want := range []string{"kube-system/meshrange-1", "node-b", "100.64.1.0/24"} {
 			if !strings.Contains(row.Detail, want) {
 				t.Errorf("detail %q does not name %q", row.Detail, want)
 			}

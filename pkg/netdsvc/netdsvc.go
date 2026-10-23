@@ -86,11 +86,13 @@ type Options struct {
 	// NodeAddressService itself declares the port. The zero Addr disables the
 	// node-address branch entirely (deny).
 	//
-	// DORMANT BY CONFIGURATION, NOT BY CONSTRUCTION. The ingress listeners ask
-	// netd for the WILDCARD (a separate class that needs no NodeIP) and svclb
-	// binds the wildcard in-process, so nothing asks netd for a node-address
-	// bind, and the
-	// installed plist renders NO --node-ip — leaving this zero and the branch
+	// DORMANT BY CONFIGURATION, NOT BY CONSTRUCTION. Nothing reaches this
+	// branch: the ingress listeners ask netd for the WILDCARD (a separate class
+	// that needs no NodeIP), and a privileged bind on one of this Mac's own
+	// addresses (svclb's listed LoadBalancer ports, the ingress host's LAN-off
+	// listener) goes through the host-address class (authorizeHostAddr), which
+	// reads the interface addresses on every request instead of a fixed NodeIP.
+	// The installed plist renders NO --node-ip, leaving this zero and the branch
 	// denying. The branch is deliberately KEPT rather than deleted: it is the
 	// authorization design for any future privileged specific-address bind, and
 	// it was narrowed to the NodeAddressService allowlist so re-arming it cannot

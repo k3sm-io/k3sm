@@ -57,8 +57,8 @@ limitations under the License.
 //   - the k3sm-registry namespace and the registry-advertisement reader Role +
 //     RoleBinding to the system:nodes group, granting read (get/list/watch) on
 //     configmaps IN THAT NAMESPACE ONLY, so a node's image puller can learn which
-//     peers hold an image it was asked to pull. Operator-approved 2026-09-02 as
-//     the narrowest widening available: the reader is an informer, so it needs
+//     peers hold an image it was asked to pull. It is the narrowest widening
+//     available: the reader is an informer, so it needs
 //     list and watch, and RBAC resourceNames does not constrain either verb — the
 //     namespace IS the scope, which is why the advertisements were moved out of
 //     the shared kube-public namespace to earn it (the KEP-1755 hosting document
@@ -106,9 +106,9 @@ limitations under the License.
 // binding subject); it never authors a system:* object. Provisioning is
 // Create-tolerate-AlreadyExists (idempotent, no read to decide), except the
 // k3sm:netserve pair, which decides create-or-update by one Get by name; it never LISTs to
-// decide what to provision — a watch-cache LIST under the pinned kine v1.14.2, where
-// ConsistentListFromCache is GA-locked true, can read stale and double-provision or
-// skip. Any existence check is an authoritative Get-by-name, never a LIST.
+// decide what to provision — a watch-cache LIST under the pinned kine
+// (executor.DefaultKineVersion), where ConsistentListFromCache is GA-locked true, can
+// read stale and double-provision or skip. Any existence check is an authoritative Get-by-name, never a LIST.
 //
 // # Component-identity divergence (since narrowed)
 //

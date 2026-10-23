@@ -463,7 +463,7 @@ func TestRetractable(t *testing.T) {
 		{"the pre-B116 loopback default", "127.0.0.1", true},
 		{"another loopback address", "127.0.0.53", true},
 		{"a foreign public address", "203.0.113.9", false},
-		{"a LAN address", "192.168.7.20", false},
+		{"a LAN address", "192.0.2.20", false},
 		{"not an address at all", "some-hostname", false},
 		{"empty", "", false},
 	}

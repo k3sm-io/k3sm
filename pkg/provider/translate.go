@@ -85,7 +85,7 @@ const defaultGraceSeconds int64 = 30
 // minimumGracePeriodSeconds is the floor on every grace the provider hands
 // runtimed's DeletePod outside a hard eviction: the kubelet's
 // minimumGracePeriodInSeconds (pkg/kubelet/kuberuntime/kuberuntime_container.go,
-// v1.36.2), which killContainer applies before its CRI StopContainer call, so a
+// as of v1.36), which killContainer applies before its CRI StopContainer call, so a
 // container always gets SIGTERM and two seconds before SIGKILL. The kubelet
 // never sends the runtime 0; in the apis contract 0 is an immediate SIGKILL,
 // which only evictPod asks for (see its doc).
