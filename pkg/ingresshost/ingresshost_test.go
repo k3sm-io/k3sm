@@ -85,7 +85,7 @@ func tlsSecret(namespace, name string, secretType corev1.SecretType, certPEM, ke
 	}
 }
 
-// The B116 fixture addresses: BIND is the wildcard, ADVERTISE is the node's
+// The fixture addresses: BIND is the wildcard, ADVERTISE is the node's
 // derived .1 inside testPodCIDR. Deliberately different values, so an assertion
 // that reads the wrong field cannot pass by coincidence.
 var (
@@ -117,7 +117,7 @@ func newTestHost(t *testing.T, cs kubernetes.Interface, httpPort, httpsPort uint
 	return h, &buf
 }
 
-// TestIngressHostingSecretDiscipline pins the M10.3 SECURITY-BINDING TLS
+// TestIngressHostingSecretDiscipline pins the SECURITY-BINDING TLS
 // Secret handling: Secrets are fetched by targeted Get (never an informer), a
 // non-kubernetes.io/tls type is rejected by name, a parse failure is logged
 // with the NAME and never the data, and a subsequent reconcile callback
@@ -212,7 +212,7 @@ func classIngress(namespace, name string, class *string) *networkingv1.Ingress {
 	}
 }
 
-// TestIngressClassAndStatus pins the M10.3 provisioning + status contract: the
+// TestIngressClassAndStatus pins the provisioning + status contract: the
 // k3sm IngressClass (controller k3sm.io/ingress) and the canonical
 // kube-system/k3sm-ingress LoadBalancer Service (ports 80+443, svclb-ignored,
 // selector-less) are provisioned idempotently, and the status writer stamps
@@ -310,7 +310,7 @@ func TestIngressClassAndStatus(t *testing.T) {
 	})
 }
 
-// TestIngressHostNewValidationAsymmetry pins the B116 construction contract,
+// TestIngressHostNewValidationAsymmetry pins the construction contract,
 // which had NO test before: BindAddr must be valid but MAY be the wildcard, while
 // AdvertiseAddr may be the ZERO Addr.
 //
@@ -392,7 +392,7 @@ func TestIngressHostDerivationFailureServesButNeverAdvertises(t *testing.T) {
 }
 
 // TestIngressHostRetractsWhenNotServing pins the retraction path this host did
-// NOT have before B116: syncStatus returned early on !serving and never removed
+// NOT have before the wildcard bind: syncStatus returned early on !serving and never removed
 // anything, so after "ingress bind retries exhausted" every k3sm-class Ingress
 // kept advertising a dead address forever.
 //
@@ -405,7 +405,7 @@ func TestIngressHostRetractsWhenNotServing(t *testing.T) {
 	mine := classIngress("default", "mine", &own)
 	mine.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{
 		{IP: testAdvertiseAddr.String()}, // the current advertise address
-		{IP: "127.0.0.1"},                // the pre-B116 default
+		{IP: "127.0.0.1"},                // the earlier default
 		{IP: "100.64.0.1"},               // a previous enrollment's derived .1
 		{IP: "203.0.113.9"},              // foreign: never ours
 	}
@@ -541,7 +541,7 @@ func (b *stubBinder) Listen(_ context.Context, _ string, addr netip.AddrPort) (n
 	return stubListener{addr: addr}, nil
 }
 
-// TestCanonicalServiceEndpointsCarryTheNodeListener is the B403 gate for the
+// TestCanonicalServiceEndpointsCarryTheNodeListener pins this contract for the
 // in-cluster half of the k3s ServiceLB shape: the canonical kube-system/
 // k3sm-ingress Service is selector-less, so without a hand-written
 // EndpointSlice its ClusterIP has no backend. After every enabled listener is

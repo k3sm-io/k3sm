@@ -516,7 +516,7 @@ func podResources(memory resource.Quantity) corev1.ResourceRequirements {
 // it is exact: the hub's own cache layout puts the resolved revision there, so a
 // cache staged with `hf download <repo> --revision <sha>` already holds it.
 // Resolving the repository reference OFFLINE would need refs/<branch>, which a
-// revision-staged cache does not write — measured on the rig, and the reason the
+// revision-staged cache does not write — measured on hardware, and the reason the
 // pinned form is a path rather than a reference plus an offline flag.
 //
 // TWO CONSEQUENCES, both stated rather than discovered later:

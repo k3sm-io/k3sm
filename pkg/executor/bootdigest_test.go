@@ -52,7 +52,7 @@ func pinFakeDigests(t *testing.T, version, content string) {
 	payloadDigests[version] = pins
 }
 
-// TestBootPathVerifiesPinnedControlPlaneDigest (B530): the boot and dev-shell paths
+// TestBootPathVerifiesPinnedControlPlaneDigest: the boot and dev-shell paths
 // that download the kwok-ci/k8s binaries verify them against the pinned digests
 // whenever a pin exists for the requested version. A tampered download fails closed
 // and never reaches the working set; an unpinned version is still accepted, with one

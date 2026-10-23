@@ -52,7 +52,7 @@ type Executor interface {
 
 // ErrEmbeddedNotImplemented is returned by the Embedded strategy: from-source
 // in-process embedding of the control plane is deferred to a future milestone
-// (Wave-0 confirmed the k3s-io/kubernetes monorepo import is infeasible today).
+// (a feasibility test showed the k3s-io/kubernetes monorepo import is infeasible today).
 var ErrEmbeddedNotImplemented = errors.New("executor: from-source in-process embedding is not implemented yet (deferred milestone); use the Supervised strategy")
 
 // Config configures an Executor. Zero values get sensible defaults in New*.

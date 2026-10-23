@@ -321,7 +321,7 @@ func hashFile(path string) (string, error) {
 //
 // This is not tidiness. macOS creates .Trashes mode 0000, so a walk that does
 // not skip it fails outright with "operation not permitted" even as root --
-// which is how a real migration on the lab rig failed. And since the
+// which is how a real migration on a test environment failed. And since the
 // destination is a freshly mounted volume while the source is a plain
 // directory, the two sides never carry the same set of them, so counting any
 // of them would fail every migration.

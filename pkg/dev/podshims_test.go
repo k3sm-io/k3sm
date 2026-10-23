@@ -82,7 +82,7 @@ func newTestManagerWithShimBuilder(t *testing.T, b PodShimBuilder) *Manager {
 	return m
 }
 
-// TestDevProvisionsDNSShim is the B151 gate. Despite the name (B151's contract),
+// TestDevProvisionsDNSShim pins this contract. Despite the name,
 // it covers BOTH pod-support DYLD shims, because they are ONE defect with two
 // symptoms: cmd/k3sm resolves the getaddrinfo shim and the path-rebase shim
 // through the same resolveSiblingDylib call, and `k3sm dev` re-execs THIS binary

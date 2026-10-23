@@ -78,7 +78,7 @@ func rateLimitJoin(t *testing.T, token, nodeName string) bootstrap.JoinRequest {
 	}
 }
 
-// TestJoinIsRateLimitedPerToken is the B346 gate: one valid worker token may
+// TestJoinIsRateLimitedPerToken pins this contract: one valid worker token may
 // drive only a bounded number of joins, because a join is expensive on the
 // server's side and every one of those requests is authenticated.
 //
@@ -246,7 +246,7 @@ func TestJoinIsRateLimitedPerToken(t *testing.T) {
 	})
 }
 
-// TestJoinClientSurfacesARateLimitedRefusal is the client half of B346, and it
+// TestJoinClientSurfacesARateLimitedRefusal is the client half, and it
 // ships in the same change for a reason the server half cannot fix: postJSON
 // collapsed every non-2xx into one "join rejected" error, an agent calls Join
 // once per process start, and `k3sm install` waits one bounded budget for the

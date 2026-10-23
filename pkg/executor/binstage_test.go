@@ -229,7 +229,7 @@ func writeBin(t *testing.T, path, content string) {
 	}
 }
 
-// TestBinaryStagingNeverRewritesALiveInode is the B544 gate. macOS caches a Mach-O's
+// TestBinaryStagingNeverRewritesALiveInode pins this contract. macOS caches a Mach-O's
 // code signature per vnode: rewriting a signed binary IN PLACE while any process has
 // it mapped (an O_TRUNC write, a copy onto it, `codesign -f` on it) leaves the
 // kernel holding the old signature, and every process mapping the file afterwards is
@@ -318,7 +318,7 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 		hInvalid.assertReplaced(t)
 		assertSignedAt(t, invalid)
 		// A valid non-ad-hoc signature (a Developer ID) is never replaced by an
-		// ad-hoc one: that would strip its provenance (B480).
+		// ad-hoc one: that would strip its provenance.
 		if got := inode(t, devID); got != devIDIno {
 			t.Errorf("the Developer ID-signed %s was replaced (inode %d -> %d)", filepath.Base(devID), devIDIno, got)
 		}

@@ -30,7 +30,7 @@ import (
 )
 
 // The three reinstall defects observed live across four install cycles on the
-// lab rig, each pinned here:
+// test environment, each pinned here:
 //
 //  1. the run dir was left root-owned by whichever daemon created it first
 //     (netd), so the _k3sm server could not bind its runtimed control socket;

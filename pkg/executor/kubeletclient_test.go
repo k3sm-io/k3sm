@@ -26,7 +26,7 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 )
 
-// TestAPIServerKubeletClientIdentity pins the producer half of B176: every boot
+// TestAPIServerKubeletClientIdentity pins the producer half: every boot
 // provisions the client keypair the apiserver presents to a node's kubelet
 // endpoint, and it carries the ONE identity that endpoint admits
 // (certs.APIServerKubeletClientCN — the constant pkg/provider's accepted-identity

@@ -65,14 +65,14 @@ func TestRollOrder(t *testing.T) {
 // and the nodes in roll order with their versions and states.
 func TestPlanRender(t *testing.T) {
 	behind := version.Info{KubeVersion: "v1.36.2", Version: "0.1.7"}.NodeVersion()
-	p := NewPlan("v0.2.0", []corev1.Node{planNode("studio", true, behind), planNode("laptop\x1b[2J", false, behind)}, "studio", true, "required", false)
-	if len(p.Nodes) != 2 || p.Nodes[1].Name != "studio" || p.Nodes[0].State != status.UpdateBehind {
+	p := NewPlan("v0.2.0", []corev1.Node{planNode("node-a", true, behind), planNode("laptop\x1b[2J", false, behind)}, "node-a", true, "required", false)
+	if len(p.Nodes) != 2 || p.Nodes[1].Name != "node-a" || p.Nodes[0].State != status.UpdateBehind {
 		t.Fatalf("plan = %+v", p)
 	}
 	var b bytes.Buffer
 	p.Render(&b)
 	out := b.String()
-	for _, want := range []string{"target            v0.2.0", "drain             yes", "signature         required", "allow downgrade   no", "1       laptop[2J", "2       studio"} {
+	for _, want := range []string{"target            v0.2.0", "drain             yes", "signature         required", "allow downgrade   no", "1       laptop[2J", "2       node-a"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("plan output lacks %q:\n%s", want, out)
 		}

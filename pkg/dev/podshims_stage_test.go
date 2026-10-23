@@ -279,7 +279,7 @@ func foreignOwned(paths ...string) func(string, *unix.Stat_t) error {
 	}
 }
 
-// TestPodShimStageRefusesForeignOwnedBase is the B464 gate. The rootless tier
+// TestPodShimStageRefusesForeignOwnedBase pins this contract. The rootless tier
 // stages the pod shims, which are DYLD-injected into every dev pod, under
 // <PodRootBasePrefix>-<euid> in the world-writable, sticky /private/var/tmp. The
 // symlink refusal alone let any local user create that name first as a real
@@ -458,7 +458,7 @@ func mkdirMode(t *testing.T, dir string, mode os.FileMode) {
 	}
 }
 
-// TestDevRuntimeRootRefusesForeignOwnedBase is the spawnServer half of B464.
+// TestDevRuntimeRootRefusesForeignOwnedBase is the spawnServer half.
 // The instance runtime root (every pod's data) sits under the same per-user base
 // as the rootless shim stage, so it goes through the same walker (ownedMkdirs):
 // a base another user created, or one group/other can write, is refused before

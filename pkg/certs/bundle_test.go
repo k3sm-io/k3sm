@@ -126,7 +126,7 @@ type v2Struct struct {
 	EtcdPeerCAKeyPEM    []byte `json:"etcdPeerCAKeyPEM"`
 }
 
-// v2StructBytes encodes h's four B410 CAs the way the struct encoder did, stamped
+// v2StructBytes encodes h's four CAs the way the struct encoder did, stamped
 // with version.
 func v2StructBytes(t *testing.T, h *Hierarchy, version int) []byte {
 	t.Helper()

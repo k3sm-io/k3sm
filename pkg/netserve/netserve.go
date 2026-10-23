@@ -46,7 +46,7 @@ const defaultPodCIDR = "100.64.0.0/24"
 
 // DefaultVMNetSubnet is the NAT segment a vm-RuntimeClass pod's guest is expected
 // to land in: the segment Apple's vmnet hands out behind a
-// VZNATNetworkDeviceAttachment, OBSERVED as 192.168.64.0/24 on the reference rig.
+// VZNATNetworkDeviceAttachment, OBSERVED as 192.168.64.0/24 on a reference machine.
 //
 // Apple does not document it and does not let a host choose it — the segment is
 // assigned by macOS at attach time — so this is the one home for a value that can

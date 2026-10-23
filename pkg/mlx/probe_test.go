@@ -44,7 +44,7 @@ const probeHangTimeout = 100 * time.Millisecond
 // hanging forever — it must never be the thing that decides a verdict.
 //
 // Sharing one short budget across both roles is what made this table flake
-// (B206): health_ok_model_missing_is_loading answered a real loopback request
+// : health_ok_model_missing_is_loading answered a real loopback request
 // well inside 100ms unloaded, but on a loaded machine the round trip lost that
 // race, ProbeOpenAISurface saw a client-timeout error instead of a response and
 // correctly returned Unreachable — a verdict about the machine, asserted as if
@@ -54,7 +54,7 @@ const probeHangTimeout = 100 * time.Millisecond
 // cases live in probe_integration_test.go.
 const probeContentBudget = 30 * time.Second
 
-// TestServingProbeVerdictFromOpenAISurface is B65's gate: an httptest fake
+// TestServingProbeVerdictFromOpenAISurface pins this contract: an httptest fake
 // server table proving ProbeOpenAISurface derives the right ProbeVerdict from
 // the OpenAI-compatible surface alone, reading NOTHING engine-specific (S5,
 // hack/spike/m8/findings-s5.md §3–4).

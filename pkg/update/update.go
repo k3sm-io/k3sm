@@ -154,7 +154,10 @@ func Check(ctx context.Context, in Inputs) (Report, error) {
 // Latest resolves the latest release the way install.sh does: the stable
 // channel through the index's `latest` redirect, which skips prereleases;
 // when that lands on no tag (before the first stable release), the newest
-// non-draft release of any kind by publication time. A stable release, once
+// non-draft release of any kind by publication time. The same fallback applies
+// when the stable lookup fails for a reason other than a malformed tag or a
+// refused redirect, in which case a failure of the fallback reports both
+// errors. A stable release, once
 // one exists, therefore always wins.
 func Latest(ctx context.Context, in Inputs) (Release, error) {
 	timeout := in.Timeout

@@ -48,7 +48,7 @@ func facts(mutate ...func(*runtimev1.GPUFacts)) *runtimev1.GPUFacts {
 	return f
 }
 
-// TestValidateFit is the M8.5-a1 pre-render validation table: what the operator
+// TestValidateFit is the pre-render validation table: what the operator
 // decides about a spec BEFORE it renders or applies anything.
 //
 // Every FitFailed row below is a spec that, applied anyway, would produce a pod

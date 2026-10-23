@@ -124,7 +124,7 @@ func TestEnsureKineIntoSkipsOnMatchingMarker(t *testing.T) {
 	}
 }
 
-// TestEnsureKineWithoutToolchainFailsActionably is the toolchain preflight (B393). A
+// TestEnsureKineWithoutToolchainFailsActionably is the toolchain preflight. A
 // binary swap carrying a kine pin bump, on a daemon whose launchd PATH has no `go`,
 // used to reach `go env GOMODCACHE` and fail with a bare exec error five times before
 // the breaker parked. The build path must refuse BEFORE any subprocess, with an error

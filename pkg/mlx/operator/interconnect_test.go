@@ -102,7 +102,7 @@ func (h *harness) rankUIDs(t *testing.T) string {
 	return strings.Join(uids, ",")
 }
 
-// TestInterconnectPathSelection is the B451 BI8 operator gate (plan §4 and I10):
+// TestInterconnectPathSelection pins this contract:
 // spec.distributed.interconnect resolved at placement over the thunderbolt
 // Interconnect, and what a lost segment member costs a placed gang.
 func TestInterconnectPathSelection(t *testing.T) {

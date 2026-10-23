@@ -40,7 +40,7 @@ func recordingDeregister(f *fakeSystem, err error) func(context.Context) error {
 	}
 }
 
-// TestUninstallDeregistersTheNode is the gate for B311: an uninstalled worker
+// TestUninstallDeregistersTheNode pins this contract: an uninstalled worker
 // must leave the cluster, not linger in it.
 //
 // Until this existed, `sudo k3sm uninstall` on a worker removed the Mac and

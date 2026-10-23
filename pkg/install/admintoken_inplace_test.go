@@ -49,7 +49,7 @@ func adminCredential(t *testing.T, f *fakeSystem) (token string, ca []byte) {
 	return au.Token, cl.CertificateAuthorityData
 }
 
-// TestServerRollKeepsTheAdminCredentialValid is the gate for B695: the server's
+// TestServerRollKeepsTheAdminCredentialValid pins this contract: the server's
 // turn in a managed roll (and Repair) runs the in-place update, and that update
 // keeps the admin credential, so a copy of the admin kubeconfig taken before the
 // roll (a worker's, a tool's) still authenticates after it. A fresh install still

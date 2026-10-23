@@ -37,7 +37,7 @@ func flagValues(args []string, name string) []string {
 	return out
 }
 
-// TestControllerManagerRootCAFollowsServingPosture is the B223 (lab defect D2) guard,
+// TestControllerManagerRootCAFollowsServingPosture is the (lab defect D2) guard,
 // extended to the single-node serving leaf.
 //
 // --root-ca-file is the CA the controller-manager's root-ca-cert-publisher republishes

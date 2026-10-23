@@ -92,7 +92,7 @@ func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
 
 const desiredValue = `{"schema":1,"interconnect":"thunderbolt","fallback":"network"}`
 
-// TestDesiredHandlerLevelTriggered is the B524 desired-handler gate: ensure on
+// TestDesiredHandlerLevelTriggered pins this contract: ensure on
 // add, remove on drop, re-ensure after the helper loses the alias and after a
 // reconnect, no hot retry on any named error, and the reason carried into the
 // report.

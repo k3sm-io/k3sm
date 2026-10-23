@@ -29,7 +29,7 @@ import (
 // path the readiness probe takes. Both commands print JSON (`--format '{{json
 // .}}'`), never the human table, so nothing here parses a rounded size.
 //
-// The selection is buildkitd's (cache/manager.go prune in BuildKit v0.33):
+// The selection is buildkitd's (BuildKit's cache/manager.go prune):
 // a record held by a running build is never removed; a default prune also
 // keeps the internal and frontend records (the Dockerfile frontend, the
 // engine's own bookkeeping) and the cache shared with images the engine

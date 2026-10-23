@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-// TestDevKubeClientResolution is the pkg/dev half of the B251 characterization
+// TestDevKubeClientResolution is the pkg/dev half of the characterization
 // table (the cmd half is TestNewKubeClientResolution): both bootstrap waits load
 // the INSTANCE's own kubeconfig by explicit path and wrap a load failure in
 // their own text naming that path. Folding the inline clientcmd+kubernetes pair

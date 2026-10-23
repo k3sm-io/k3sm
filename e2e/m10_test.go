@@ -39,8 +39,8 @@ import (
 
 // M10 conformance criteria.
 //
-// This file holds the M10.0 criteria (TestM10_AuditLogLevel,
-// TestM10_PSADefaultWarn, TestM10_PSAEnforceCutover). The M10.1-M10.3 criteria
+// This file holds the base criteria (TestM10_AuditLogLevel,
+// TestM10_PSADefaultWarn, TestM10_PSAEnforceCutover). The remaining M10 criteria
 // live one per file beside it: m10_perpodip_test.go (TestM10_PerPodIP),
 // m10_events_test.go (TestM10_ProviderEvents), m10_crashloop_test.go
 // (TestM10_CrashLoopBackOff), m10_job_test.go (TestM10_JobCompletion),
@@ -115,8 +115,8 @@ func warnClient(t *testing.T) (kubernetes.Interface, *psaWarningCollector) {
 	return cs, col
 }
 
-// m10Pod is the M10.0 pod fixture: darwin-targeted (satisfying the os=darwin
-// Deny VAP) and provider-taint-tolerating (so the B17 toleration Warn VAP stays
+// m10Pod is the pod fixture: darwin-targeted (satisfying the os=darwin
+// Deny VAP) and provider-taint-tolerating (so the toleration Warn VAP stays
 // quiet — the PSA-warning assertions must not depend on filtering it out).
 // violating=true adds hostNetwork: true — a `baseline` violation (host
 // namespaces) that is meaningful on Darwin (the hostPath/hostNet axis), while
@@ -158,7 +158,7 @@ func serverWorkDir() string {
 	return executor.DefaultWorkDir
 }
 
-// auditEvent is the audit.k8s.io/v1 Event subset the M10.0 audit criterion
+// auditEvent is the audit.k8s.io/v1 Event subset the audit criterion
 // asserts on (one JSON object per audit-log line).
 type auditEvent struct {
 	Level     string `json:"level"`
@@ -170,7 +170,7 @@ type auditEvent struct {
 	Annotations    map[string]string `json:"annotations"`
 }
 
-// TestM10_AuditLogLevel is the M10.0 audit-logging criterion (Res.4): apply an object
+// TestM10_AuditLogLevel is the audit-logging criterion (Res.4): apply an object
 // touching secrets/configmaps and assert the shipped audit policy records it at
 // level: Metadata (or None) — NEVER Request/RequestResponse (no Secret cleartext at
 // rest), with the audit file at a 0600, Seatbelt-denied, off-datastore-volume path.
@@ -267,7 +267,7 @@ func scanAuditLog(path string) (secretEvents int, psaAnnotated bool, err error) 
 	return secretEvents, psaAnnotated, nil
 }
 
-// TestM10_PSADefaultWarn is the M10.0 Pod Security Admission criterion (Res.2): with
+// TestM10_PSADefaultWarn is the Pod Security Admission criterion (Res.2): with
 // the shipped --admission-control-config-file + PodSecurityConfiguration default, a
 // baseline-violating pod is ADMITTED but WARNED (audit-observable, zero rejection)
 // pre-enforce. Carries the negative control (Res.6): a baseline-clean reference pod
@@ -343,7 +343,7 @@ func TestM10_PSADefaultWarn(t *testing.T) {
 	})
 }
 
-// TestM10_PSAEnforceCutover is the --psa-enforce-baseline 403 leg (Res.2/B71).
+// TestM10_PSAEnforceCutover is the --psa-enforce-baseline 403 leg (Res.2).
 // The harness does NOT support a per-test server boot with extra flags (Up
 // attaches to ONE externally booted `k3sm server` via $KUBECONFIG), so this
 // runs only when the acceptance script signals the ambient server was booted

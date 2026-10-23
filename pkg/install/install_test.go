@@ -1863,7 +1863,7 @@ func TestInstallOrchestration(t *testing.T) {
 		// inside that tree over, for BOTH roles, because a single-node server
 		// writes the same tree. Each root is opened once and found absent on a
 		// first install, which is the only reason this is two calls and not a
-		// walk (B327).
+		// walk.
 		"AdoptTree:/var/log/pods",
 		"AdoptTree:/var/log/containers",
 		// Before any daemon bootstraps: root netd would otherwise create the run
@@ -2194,7 +2194,7 @@ func TestInstallRequiresInputs(t *testing.T) {
 }
 
 // TestUninstallIdempotent proves uninstall boots out BOTH daemons (server first,
-// then netd), REMOVES both leaked plists (the B62 fix), and sweeps the install
+// then netd), REMOVES both leaked plists (the earlier uninstall fix), and sweeps the install
 // dir — in reverse install order — and that re-running is safe.
 func TestUninstallIdempotent(t *testing.T) {
 	f := &fakeSystem{}
@@ -2256,7 +2256,7 @@ func TestUninstallIdempotent(t *testing.T) {
 		// one that outlived its daemon is killed by its recorded identity.
 		"ReadVMHostRecords:/var/lib/k3sm",
 		"ReapOrphans:/var/lib/k3sm/server/bin",
-		// The mesh pf anchor flush (B274) is the uninstall backstop for the
+		// The mesh pf anchor flush is the uninstall backstop for the
 		// MSS-clamp rule netd's own shutdown path never reaches.
 		"FlushMeshPFAnchor",
 		// The lo0 flush covers the pinned pod aggregate + the Service CIDR — the
@@ -2291,7 +2291,7 @@ func TestUninstallIdempotent(t *testing.T) {
 }
 
 // TestUninstallFlushesTheMeshPFAnchor proves Uninstall calls FlushMeshPFAnchor
-// exactly once — the B274 backstop for the mesh MSS-clamp pf anchor, which
+// exactly once — the backstop for the mesh MSS-clamp pf anchor, which
 // outlives netd (only the RemoveMesh RPC reaches mesh.WGDevice.Down, and no
 // signal path ever calls it) and would otherwise survive scoped to a utun
 // number macOS recycles onto an unrelated tunnel.
@@ -2323,16 +2323,16 @@ func TestNetdPlistXML(t *testing.T) {
 	if strings.Contains(x, "<key>UserName</key>") {
 		t.Error("netd plist must NOT carry a UserName (it runs as root)")
 	}
-	// B116/B133 — the plist must render NO --node-ip. netdsvc's node-address
+	// The plist must render NO --node-ip. netdsvc's node-address
 	// authorizer branch (a <1024 bind on the node's OWN InternalIP, authorized
-	// ONLY by the canonical kube-system/k3sm-ingress Service since B133) is
+	// ONLY by the canonical kube-system/k3sm-ingress Service) is
 	// DORMANT BY CONFIGURATION, not by construction: the code is still there, and
-	// passing --node-ip would re-arm it. Since B116 the ingress/svclb listeners
+	// passing --node-ip would re-arm it. The ingress/svclb listeners
 	// bind the wildcard in-process and never ask netd for a node-address bind, so
 	// re-adding the flag would widen the root helper's authorized surface with no
 	// consumer. Adding it must redden HERE.
 	if strings.Contains(x, "--node-ip") {
-		t.Error("netd plist must NOT render --node-ip: the node-address authorizer branch is dormant by configuration (B116/B133); re-arming it needs a deliberate decision, not a plist edit")
+		t.Error("netd plist must NOT render --node-ip: the node-address authorizer branch is dormant by configuration; re-arming it needs a deliberate decision, not a plist edit")
 	}
 	// The LoadBalancer port list is ALWAYS rendered, the default included:
 	// netd's own default allows no port, so a job without the flag is one
@@ -2503,7 +2503,7 @@ func TestServerPlistXML(t *testing.T) {
 }
 
 // TestServerPlistRaisesFileLimit proves the server plist raises RLIMIT_NOFILE so
-// darwin-net's UDP flow budget (B48, rl.Cur/2) sizes against a real fd table, not
+// darwin-net's UDP flow budget (rl.Cur/2) sizes against a real fd table, not
 // launchd's 256 default. The load-bearing assertion is well-formedness: a
 // hand-rolled unbalanced/mis-nested <dict> would still pass the substring checks
 // yet make launchd REJECT the plist at bootstrap (a non-loading control plane),
@@ -2820,7 +2820,7 @@ func uninstallGaps(cfg Config, installCalls, uninstallCalls []string) []string {
 	return gaps
 }
 
-// TestUninstallManifestCoversInstall is the B62 gate. It asserts over the seam
+// TestUninstallManifestCoversInstall pins this contract. It asserts over the seam
 // calls RECORDED from a REAL Install run + a REAL Uninstall run against the fake
 // (never the manifest against itself — that tautology would never catch a future
 // off-manifest install line, the exact bug): forward coverage, bidirectional
@@ -2848,7 +2848,7 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		}
 	})
 
-	t.Run("both leaked plists are now removed (the B62 fix)", func(t *testing.T) {
+	t.Run("both leaked plists are now removed (the earlier uninstall fix)", func(t *testing.T) {
 		for _, label := range []string{ServerLabel, NetdLabel} {
 			plist := dc.plistPath(label)
 			if !bootedOut[label] {

@@ -31,7 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// Shared fixtures for the M10.1/M10.2/M10.3 criteria (m10_perpodip_test.go,
+// Shared fixtures for the M10 criteria (m10_perpodip_test.go,
 // m10_events_test.go, m10_crashloop_test.go, m10_job_test.go,
 // m10_sidecar_test.go, m10_ingress_test.go).
 //

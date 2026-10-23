@@ -210,7 +210,7 @@ func crossNodeCSRJoin(t *testing.T, rig *joinServerRig, nodeName string) bootstr
 	}
 }
 
-// TestJoinReleasesTheAllocationOnACSRFailure is B339: a join that fails AFTER the
+// TestJoinReleasesTheAllocationOnACSRFailure pins this contract: a join that fails AFTER the
 // mesh enroll must not leave the index the enroll carved behind it.
 //
 // Since the enroll became the step that DECIDES the node's address it runs before

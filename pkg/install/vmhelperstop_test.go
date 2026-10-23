@@ -157,7 +157,7 @@ func TestStopVMHelpersHonoursEachRecordedGrace(t *testing.T) {
 	})
 }
 
-// TestStopVMHelpersShortensACutGrace pins B718's teardown half: before the
+// TestStopVMHelpersShortensACutGrace pins the teardown half: before the
 // SIGTERM of a helper whose recorded grace does not fit the stop bound, the
 // teardown asks the helper on its control socket to start its stop with the
 // grace the bound leaves it, and prints the cut to the command's output. A

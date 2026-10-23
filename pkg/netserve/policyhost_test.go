@@ -54,7 +54,7 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-// TestNetworkPolicyHosting proves the M10.4 k3sm slice: netserve CONSTRUCTS the
+// TestNetworkPolicyHosting proves the k3sm slice: netserve CONSTRUCTS the
 // NetworkPolicy verdict table with the always-allow seeds (node InternalIP, this
 // node's mesh-egress /32, the construction-time peer mesh-egress /32s), WIRES it
 // into the proxy via proxy.WithPolicyTable, and HOSTS the PolicyWatcher beside
@@ -65,7 +65,7 @@ func (s *syncBuffer) String() string {
 // assertion is observable: proxy.New overwrites the table's logger with the
 // proxy's own (Config.Logger) exactly when WithPolicyTable was applied, so the
 // table's unknown-source fail-open Warn landing in OUR buffer proves the option
-// was passed. Maps to M10.4-a1.
+// was passed.
 func TestNetworkPolicyHosting(t *testing.T) {
 	podIP := func(name, ip string, labels map[string]string) *corev1.Pod {
 		return &corev1.Pod{
@@ -176,7 +176,7 @@ func TestNetworkPolicyHosting(t *testing.T) {
 	}
 }
 
-// TestM10_4_LimitationsDocKeepsLoadBearingPhrases is the M10.4-a1 line-assert:
+// TestM10_4_LimitationsDocKeepsLoadBearingPhrases is the line-assert:
 // docs/user/limitations.md must keep the load-bearing honest-limit phrases of
 // the NetworkPolicy section so the doc cannot silently lose them. Markdown
 // emphasis (backticks/asterisks) is stripped before matching so formatting

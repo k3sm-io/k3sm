@@ -51,7 +51,7 @@ import (
 // The signing CA + cluster CA live under <workDir>/tls; override via K3SM_WORK_DIR.
 const defaultServerWorkDir = "/var/lib/k3sm/server"
 
-// TestM4_RBACEnforced is the M4.1 capability gate (DESIGN §9 M4; the
+// TestM4_RBACEnforced is the capability gate (DESIGN §9 M4; the
 // reference-workload readiness matrix → snapshot-manager). On a cluster running
 // --authorization-mode=Node,RBAC + NodeRestriction it proves both halves of the flip:
 //
@@ -66,7 +66,7 @@ const defaultServerWorkDir = "/var/lib/k3sm/server"
 // This is the integration/lab tier — it does not run in unit CI. The node-cert leg is
 // skipped unless the cluster was brought up with the CA hierarchy + --client-ca-file
 // (the multi-node trust path); the SA leg runs on any RBAC-enforcing cluster. The
-// matching M4.1-a1 acceptance stays met:false (integration-pending) until this runs
+// matching acceptance stays met:false (integration-pending) until this runs
 // green against a live control plane.
 func TestM4_RBACEnforced(t *testing.T) {
 	c := Up(t) // admin (system:masters) client; skips if $KUBECONFIG is unset

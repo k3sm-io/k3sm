@@ -57,7 +57,7 @@ const (
 	// interconnectRecheck is how often a gang placed on the thunderbolt path
 	// re-reads the Interconnect for LinksHealthy.
 	//
-	// The budget (plan I10: a dead path detected within 20 s, the re-render
+	// The budget (a dead path detected within 20 s, the re-render
 	// started within 30 s): the node's probe misses three 5 s rounds and its
 	// report reaches the resolver, which writes the member down on that Node
 	// change, all inside the 20 s detection budget. This recheck then sees the
@@ -66,7 +66,7 @@ const (
 	// = 27 s at worst, 3 s inside the 30 s budget.
 	interconnectRecheck = 5 * time.Second
 	// interconnectRestartLimit is the shortest interval between two
-	// interconnect-driven gang restarts of one model (plan I10). A flapping
+	// interconnect-driven gang restarts of one model. A flapping
 	// cable cannot turn into a restart loop that re-downloads weights.
 	interconnectRestartLimit = 5 * time.Minute
 )
@@ -265,7 +265,7 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 
 // watchInterconnect is the whole-gang reconcile for a gang placed on the
 // thunderbolt path: LinksHealthy while every placed member is up, and
-// interconnectLost when one is not (plan §4 and I10).
+// interconnectLost when one is not.
 func (c *Controller) watchInterconnect(ctx context.Context, key string, raw *unstructured.Unstructured, model *mlxv1alpha1.MLXModel, ic *netv1alpha1.Interconnect, obs mlx.ShardObservation) error {
 	if !obs.InterconnectLost() {
 		c.queue.AddAfter(key, interconnectRecheck)

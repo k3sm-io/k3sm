@@ -103,11 +103,11 @@ func (f *recordingForwarder) callCount() int {
 
 func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
-// TestM3_3_ResolverAnswersClusterAndForwards is an M3.3-a1 unit proof: the
+// TestM3_3_ResolverAnswersClusterAndForwards is a unit proof: the
 // in-process per-node resolver answers cluster Service A records — including
 // kubernetes.default.svc.cluster.local → the API VIP (so an in-pod client-go
 // resolves the kubernetes endpoint NODE-LOCALLY, the in-pod-kubectl half of
-// M3.3-a1) — and forwards off-cluster names upstream, over BOTH the UDP and TCP
+// that) — and forwards off-cluster names upstream, over BOTH the UDP and TCP
 // transports it binds on the DNS VIP. The live cross-node DNS is the m3.sh lab leg;
 // this pins the resolver's wire behavior.
 func TestM3_3_ResolverAnswersClusterAndForwards(t *testing.T) {
@@ -186,10 +186,10 @@ func TestM3_3_ResolverAnswersClusterAndForwards(t *testing.T) {
 	}
 }
 
-// TestNewClusterResolverDefaultsDomain pins the B42 consolidation on the netserve
+// TestNewClusterResolverDefaultsDomain pins the consolidation on the netserve
 // side: newClusterResolver with an EMPTY cluster domain falls back to the
 // single-sourced dns.DefaultClusterDomain — the SAME const cmd/k3sm's runtimedConfig
-// fallback and the --cluster-domain flag defaults now resolve to (closing the B18
+// fallback and the --cluster-domain flag defaults now resolve to (closing the
 // desync between the served zone and the pod-search suffix). It proves both the stored
 // domain field and that the empty-domain resolver actually SERVES that default zone: a
 // cluster Service under *.svc.<dns.DefaultClusterDomain> resolves node-locally.
@@ -233,7 +233,7 @@ func TestNewClusterResolverDefaultsDomain(t *testing.T) {
 	}
 }
 
-// TestM3_3_ResolverBindsViaHelper is an M3.3-a1 unit proof of the bind backend
+// TestM3_3_ResolverBindsViaHelper is a unit proof of the bind backend
 // SELECTION: an unprivileged node (a non-empty netd socket) binds the DNS VIP
 // through the netd helper (which plumbs the alias and passes the <1024 socket back
 // over SCM_RIGHTS), while the explicit run-as-root mode binds directly. The live
@@ -373,7 +373,7 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-// TestExternalNameResolvesViaForwarder is the B19 unit proof: the per-node resolver
+// TestExternalNameResolvesViaForwarder is the unit proof: the per-node resolver
 // resolves an ExternalName Service by chasing spec.externalName through the upstream
 // forwarder and FLATTENING CNAME→A — the target's A records are stamped under the
 // QUERIED cluster name, with no CNAME RR. It pins the load-bearing correctness points
@@ -566,7 +566,7 @@ func TestServiceZoneBranchesOnType(t *testing.T) {
 
 // newServiceZone builds a production serviceZone over Services + EndpointSlices
 // listers fed by the fake clientset's objects (informer caches, warmed before
-// return), so the real Type-branching LookupService AND the M10.1 record
+// return), so the real Type-branching LookupService AND the record
 // synthesis are exercised end to end.
 func newServiceZone(t testing.TB, cs *fake.Clientset) serviceZone {
 	t.Helper()

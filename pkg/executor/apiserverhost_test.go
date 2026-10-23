@@ -128,7 +128,7 @@ func TestAPIServerHostChain(t *testing.T) {
 	}
 }
 
-// TestAPIServerClientsFollowEffectiveBind is the B222 (lab D1) contract: the URL the
+// TestAPIServerClientsFollowEffectiveBind is the (lab D1) contract: the URL the
 // in-process clients dial tracks the address the apiserver ACTUALLY BINDS, which is
 // the same self-defaulting chain apiServerArgs renders --bind-address from
 // (BindAddress -> NodeIP -> loopback).

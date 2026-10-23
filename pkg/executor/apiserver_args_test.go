@@ -83,14 +83,14 @@ func TestApiserverFlagsMeshBindAnonOff(t *testing.T) {
 	}
 }
 
-// TestApiserverNodePortRangeSingleSourced is the M3.1 wiring guard, RE-BASED by
-// B116: the apiserver pins --service-node-port-range, and it pins it from
+// TestApiserverNodePortRangeSingleSourced is the wiring guard, RE-BASED by
+// the apiserver pins --service-node-port-range, and it pins it from
 // pkg/ports — the SAME constants the reserved-port admission CEL and the svclb
 // bind refusal derive from, so the range k3sm allocates NodePorts out of cannot
 // desync from the range it guards against a colliding LoadBalancer port.
 //
 // The bounds are also still asserted >=1024. That is now a conservatism, NOT the
-// EACCES claim the M3.1 comment made: re-measured on macOS 26, a WILDCARD bind
+// EACCES claim the comment made: re-measured on macOS 26, a WILDCARD bind
 // below 1024 succeeds as an ordinary uid (it is the SPECIFIC-address bind that
 // returns EACCES — inverted from Linux; see the cmd/k3sm integration canary).
 func TestApiserverNodePortRangeSingleSourced(t *testing.T) {
@@ -119,7 +119,7 @@ func TestApiserverNodePortRangeSingleSourced(t *testing.T) {
 	}
 }
 
-// TestApiserverArgsNodeRBAC is the M4.1 flip guard: the apiserver defaults to
+// TestApiserverArgsNodeRBAC is the flip guard: the apiserver defaults to
 // --authorization-mode=Node,RBAC (NOT the old AlwaysAllow) and additively enables
 // the NodeRestriction admission plugin — even for a RAW Config (the pure function
 // self-defaults the mode, as it does the bind address). An explicit AuthorizationMode
@@ -130,7 +130,7 @@ func TestApiserverArgsNodeRBAC(t *testing.T) {
 	args := apiServerArgs(cfg)
 
 	if got := flagValue(args, "--authorization-mode"); got != "Node,RBAC" {
-		t.Errorf("--authorization-mode = %q, want Node,RBAC (the M4.1 default flip)", got)
+		t.Errorf("--authorization-mode = %q, want Node,RBAC (the default flip)", got)
 	}
 	if got := flagValue(args, "--authorization-mode"); got == "AlwaysAllow" {
 		t.Errorf("--authorization-mode must no longer be AlwaysAllow")
@@ -185,7 +185,7 @@ func TestApiserverArgsSingleNodeDefault(t *testing.T) {
 	}
 }
 
-// TestApiserverArgs_AuditPolicyWired is the M10.0 argv guard (B70 supplementary
+// TestApiserverArgs_AuditPolicyWired is the argv guard (a supplementary
 // build check — the milestone proof is the enforcement e2e): the apiserver loads
 // the provisioned audit policy + admission-control config, the audit log lands at
 // the single-sourced AuditLogPath with bounded rotation, --audit-log-mode is
@@ -230,7 +230,7 @@ func TestApiserverArgs_AuditPolicyWired(t *testing.T) {
 // BOTH postures so the per-component (system:kube-scheduler / system:kube-controller-
 // manager) and system:node client certs authenticate. Single-node (no explicit
 // ClientCAFile) defaults to the signing CA under the work-dir PKI dir; the mesh path's
-// explicit ClientCAFile is honored verbatim. The M4.1 review flagged the prior
+// explicit ClientCAFile is honored verbatim. The review flagged the prior
 // mesh-only gating.
 func TestClientCAFileAlwaysSet(t *testing.T) {
 	single := Config{WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}

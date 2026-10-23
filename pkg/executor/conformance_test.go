@@ -81,7 +81,7 @@ func requireMetadataOnly(t *testing.T, rules []auditRuleDoc) {
 	}
 }
 
-// TestProvisionConformanceConfigPinned pins the M10.0 provision write (Res.3/4):
+// TestProvisionConformanceConfigPinned pins the provision write (Res.3/4):
 // writeConformanceConfig produces the three artifacts (0700 audit dir + the two
 // 0600 config files), the GV literals are exactly the vendored-k8s pins, the
 // audit policy is structurally Metadata/None-only with secrets/configmaps as the
@@ -181,7 +181,7 @@ func TestProvisionConformanceConfigPinned(t *testing.T) {
 // TestConformanceConfigOverwriteOnBoot pins the overwrite-on-boot contract: the
 // config files track the BINARY (mirroring writeTokenFile, not the Stat-guarded
 // writeServiceAccountKeys) — a stale pre-existing file is refreshed, including
-// a PSA posture change between boots (the argv-reversible B71 cutover).
+// a PSA posture change between boots (the argv-reversible PSA cutover).
 func TestConformanceConfigOverwriteOnBoot(t *testing.T) {
 	wd := t.TempDir()
 	if err := writeConformanceConfig(wd, true); err != nil {
@@ -205,7 +205,7 @@ func TestConformanceConfigOverwriteOnBoot(t *testing.T) {
 	}
 }
 
-// TestPSAAdmissionConfigWiredToArgv is the WIRING leg of the B71 gate (the level
+// TestPSAAdmissionConfigWiredToArgv is the WIRING leg of the gate (the level
 // tuple itself is pinned by pkg/policy's TestPSADefaultLevel): a PSA config the
 // apiserver never loads is decoration. It asserts the whole seam end to end —
 // provision writes the admission config, the argv passes THAT path to

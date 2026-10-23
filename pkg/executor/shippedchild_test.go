@@ -124,7 +124,7 @@ func readFile(t *testing.T, path string) string {
 	return string(b)
 }
 
-// TestShippedKinePreferredOnlyWhenStampMatches is the B475 gate. The executor runs
+// TestShippedKinePreferredOnlyWhenStampMatches pins this contract. The executor runs
 // the kine and etcd the payload ships, and builds on demand only on the dev path:
 //
 //   - dev path: a payload kine whose stamp (version and patch-set id) matches the pins

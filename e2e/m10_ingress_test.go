@@ -54,10 +54,10 @@ const (
 	ingressSvcName        = "k3sm-ingress"
 )
 
-// TestM10_Ingress is the M10.3 ingress criterion: the SERVER-PROCESS-hosted L7
+// TestM10_Ingress is the ingress criterion: the SERVER-PROCESS-hosted L7
 // ingress (darwin-net pkg/ingress behind pkg/ingresshost) routes by host+path
 // to a backend Service's ClusterIP VIP, the k3sm IngressClass exists, statuses
-// are honest (written only once the listeners are bound), and svclb (B32)
+// are honest (written only once the listeners are bound), and svclb
 // advertises a plain LoadBalancer Service only once a host reports it bound
 // (each node's hoster binds and reports on its own Node; the server's decider
 // writes the status). The unit-level contracts are pinned by pkg/ingresshost

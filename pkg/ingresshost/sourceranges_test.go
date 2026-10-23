@@ -184,7 +184,7 @@ func waitEvent(t *testing.T, rec *record.FakeRecorder) string {
 	}
 }
 
-// TestIngressHostEnforcesTheCanonicalSourceRanges pins B131's ingress half: the
+// TestIngressHostEnforcesTheCanonicalSourceRanges pins the ingress half: the
 // canonical kube-system/k3sm-ingress Service's loadBalancerSourceRanges are
 // enforced by the listener the ingress host hands darwin-net's server, so a
 // denied peer is closed before the server ever sees it; the listeners open only

@@ -24,7 +24,7 @@ import (
 	"testing"
 )
 
-// TestServerInstallSeedsNetdNodePodCIDRFromMeshIP is the B446 gate.
+// TestServerInstallSeedsNetdNodePodCIDRFromMeshIP pins this contract.
 //
 // The defect: a control-plane server plumbs its --mesh-ip as an lo0 alias
 // before control-plane bring-up and before its own mesh enrol, but the netd

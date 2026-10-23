@@ -542,8 +542,8 @@ func leaseFresh(l *coordinationv1.Lease, now time.Time) bool {
 	return now.Before(l.Spec.RenewTime.Add(time.Duration(secs) * time.Second))
 }
 
-// autoCreate creates the Interconnect with its defaults and enabled false
-// (plan I1): nothing gets an address until an admin arms it.
+// autoCreate creates the Interconnect with its defaults and enabled false:
+// nothing gets an address until an admin arms it.
 func (r *Resolver) autoCreate(ctx context.Context) error {
 	ic := &netv1alpha1.Interconnect{
 		ObjectMeta: metav1.ObjectMeta{Name: Name},
@@ -703,7 +703,7 @@ func (r *Resolver) reportTransitions(prev, next []netv1alpha1.InterconnectMember
 // annotation anywhere else. A node-edited value that disagrees is overwritten.
 //
 // The value carries the Interconnect's allowedNamespaces and the
-// interconnect-using MLXModels (plan I9: a node reads neither object), so a
+// interconnect-using MLXModels (a node reads neither object), so a
 // change in either rewrites it. modelsKnown false (a failed MLXModel read)
 // writes no new or changed value and only removes annotations, so a node never
 // loses a model on missing information.

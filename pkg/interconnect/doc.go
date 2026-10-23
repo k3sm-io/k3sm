@@ -38,7 +38,7 @@ limitations under the License.
 // derives an address any other way, and a node whose index is beyond
 // netv1alpha1.MaxInterconnectNodeIndex is never a member.
 //
-// # The desired annotation is advisory (plan I6)
+// # The desired annotation is advisory
 //
 // A node can edit its own Node object, so it can rewrite its own desired
 // annotation. That is not an escalation: the most a node editing its desired

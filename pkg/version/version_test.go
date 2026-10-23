@@ -44,7 +44,7 @@ func dep(path, version string) *debug.Module {
 	return &debug.Module{Path: path, Version: version}
 }
 
-// TestVersionFromBuildInfo is the B57 gate: it proves the stamped ldflags render
+// TestVersionFromBuildInfo pins this contract: it proves the stamped ldflags render
 // verbatim (and win over build info), the unstamped path recovers version/commit
 // /date + sibling SHAs from ReadBuildInfo, and the no-build-info path degrades
 // without panic — while Info.String genuinely renders the aligned Kubernetes and

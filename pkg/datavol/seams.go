@@ -62,7 +62,7 @@ type Info struct {
 	// because the SEP encrypts the whole container with a key the hardware
 	// holds; such a volume needs no passphrase, is never locked, and mounts
 	// itself at boot. It is therefore NOT the flag any decision here turns
-	// on, and the rig's own data volume reports Encryption=true with no
+	// on, and a development machine's own data volume reports Encryption=true with no
 	// passphrase in existence.
 	Encrypted bool
 	// FileVault is the plist's FileVault key: encryption GATED ON A

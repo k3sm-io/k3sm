@@ -86,7 +86,7 @@ func TestReleaseDrainsTheLeadFirst(t *testing.T) {
 		drain:     func() { events = append(events, "drained") },
 	}
 	ctx := context.Background()
-	if err := lock.Update(ctx, resourcelock.LeaderElectionRecord{HolderIdentity: "studio"}); err != nil {
+	if err := lock.Update(ctx, resourcelock.LeaderElectionRecord{HolderIdentity: "server-a"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := lock.Update(ctx, resourcelock.LeaderElectionRecord{}); err != nil {

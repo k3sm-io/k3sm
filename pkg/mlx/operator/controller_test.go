@@ -228,7 +228,7 @@ func servingPod(name string, phase corev1.PodPhase, ready bool) *corev1.Pod {
 	return pod
 }
 
-// TestReconcileAppliesTheServingObjects is the core M8.5-a1 reconcile slice: an
+// TestReconcileAppliesTheServingObjects is the core reconcile slice: an
 // MLXModel becomes a StatefulSet plus both Services, every one of them applied by
 // server-side apply under this operator's field manager and carrying a controller
 // ownerReference back to the model.
@@ -419,7 +419,7 @@ type stringReadCloser struct{ *strings.Reader }
 func (*stringReadCloser) Close() error { return nil }
 
 // TestReconcileRefusesAnUnfittableSpecWithoutCreatingPods is the validation half
-// of M8.5-a1 seen end to end: a spec.memory the node's GPU facts cannot fund
+// of seen end to end: a spec.memory the node's GPU facts cannot fund
 // produces a Failed status and NO objects at all.
 //
 // "No objects" is the assertion that matters. A reconcile that applied first and
