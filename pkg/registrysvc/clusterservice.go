@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -135,6 +136,7 @@ type ServiceClient interface {
 	Create(ctx context.Context, svc *corev1.Service, opts metav1.CreateOptions) (*corev1.Service, error)
 	Update(ctx context.Context, svc *corev1.Service, opts metav1.UpdateOptions) (*corev1.Service, error)
 	Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error
+	List(ctx context.Context, opts metav1.ListOptions) (*corev1.ServiceList, error)
 }
 
 // EndpointSliceClient is the slice of the Kubernetes API the EndpointSlice
@@ -146,6 +148,7 @@ type EndpointSliceClient interface {
 	Create(ctx context.Context, es *discoveryv1.EndpointSlice, opts metav1.CreateOptions) (*discoveryv1.EndpointSlice, error)
 	Update(ctx context.Context, es *discoveryv1.EndpointSlice, opts metav1.UpdateOptions) (*discoveryv1.EndpointSlice, error)
 	Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error
+	List(ctx context.Context, opts metav1.ListOptions) (*discoveryv1.EndpointSliceList, error)
 }
 
 // ClusterServiceName returns the name of node's retired per-node registry
@@ -469,6 +472,46 @@ func RemoveClusterService(ctx context.Context, svcs ServiceClient, slices Endpoi
 		return nil
 	}
 	return removeServicePair(ctx, svcs, slices, ClusterServiceName(node))
+}
+
+// RemoveRetiredNodeServices sweeps every retired per-node registry Service and
+// EndpointSlice (registry-<anything> other than the flat registry-k3sm) that k3sm
+// created, whichever node published it: a node that left the cluster, or was
+// renamed, never removes its own. Only objects carrying the k3sm managed label
+// are touched, so a foreign Service that happens to be named registry-x in the
+// registry namespace survives. The caller's clients are namespaced to
+// FlatServiceNamespace.
+func RemoveRetiredNodeServices(ctx context.Context, svcs ServiceClient, slices EndpointSliceClient) error {
+	opts := metav1.ListOptions{LabelSelector: clusterServiceManagedLabel + "=true"}
+	retired := func(name string) bool {
+		return strings.HasPrefix(name, ClusterServicePrefix) && name != FlatServiceName
+	}
+	var errs []error
+	sliceList, err := slices.List(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("list the registry EndpointSlices: %w", err)
+	}
+	svcList, err := svcs.List(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("list the registry Services: %w", err)
+	}
+	names := map[string]bool{}
+	for _, es := range sliceList.Items {
+		if retired(es.Name) && es.Labels[clusterServiceManagedLabel] == "true" {
+			names[es.Name] = true
+		}
+	}
+	for _, sv := range svcList.Items {
+		if retired(sv.Name) && sv.Labels[clusterServiceManagedLabel] == "true" {
+			names[sv.Name] = true
+		}
+	}
+	for name := range names {
+		if err := removeServicePair(ctx, svcs, slices, name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // removeServicePair deletes the EndpointSlice and then the Service named name.

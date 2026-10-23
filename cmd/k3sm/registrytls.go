@@ -21,13 +21,19 @@ import (
 	"crypto/tls"
 	"log/slog"
 	"net"
+	"time"
 
 	"k8s.io/client-go/kubernetes"
 
 	"k3sm.io/k3sm/pkg/certs"
-	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
+
+// registryServingValidity is the registry leaf's lifetime. Its key never
+// leaves the process and is re-minted every boot, so a long life buys nothing
+// and a short one bounds a key lifted from memory. It must stay well above
+// nodecred.ExpiryMargin (24h), the margin the refresh re-mints inside.
+const registryServingValidity = 30 * 24 * time.Hour
 
 // serverRegistryServingMinter returns the function that issues the registry
 // relay's serving certificate: a server-auth leaf from the CLUSTER CA, the CA
@@ -35,7 +41,7 @@ import (
 // so every Pod already trusts it through its service-account ca.crt. The key
 // is generated and held in memory and is never written to disk; the identity
 // re-mints before expiry with the other in-memory component certificates'
-// validity and margin.
+// lifetime (registryServingValidity) and the shared margin.
 //
 // It returns nil, and logs why, when the hierarchy cannot be loaded or carries
 // no cluster CA key. The relay then stays off: there is no plain-HTTP relay to
@@ -52,7 +58,7 @@ func serverRegistryServingMinter(opts serverOptions, logger *slog.Logger) func(d
 	}
 	ca := h.Cluster
 	return func(dnsNames []string, ips []net.IP) (tls.Certificate, error) {
-		return ca.IssueRegistryServing(registrysvc.FlatServiceName, dnsNames, ips, executor.ComponentCertValidity)
+		return ca.IssueRegistryServing(registrysvc.FlatServiceName, dnsNames, ips, registryServingValidity)
 	}
 }
 

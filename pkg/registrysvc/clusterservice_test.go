@@ -529,3 +529,13 @@ func (f *fakeSlices) Delete(_ context.Context, name string, _ metav1.DeleteOptio
 	f.es = nil
 	return nil
 }
+
+// List satisfies ServiceClient; the single-object fake has nothing to sweep.
+func (f *fakeServices) List(context.Context, metav1.ListOptions) (*corev1.ServiceList, error) {
+	return &corev1.ServiceList{}, nil
+}
+
+// List satisfies EndpointSliceClient; the single-object fake has nothing to sweep.
+func (f *fakeSlices) List(context.Context, metav1.ListOptions) (*discoveryv1.EndpointSliceList, error) {
+	return &discoveryv1.EndpointSliceList{}, nil
+}

@@ -20,6 +20,7 @@ import (
 	"crypto/x509"
 	"net"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -82,4 +83,43 @@ func TestIssueRegistryServing(t *testing.T) {
 			t.Fatal("a leaf with no DNS SAN was minted")
 		}
 	})
+}
+
+// TestRegistryServingLeafShape pins the exact constraints of the leaf: not a
+// CA, server-auth only, digital signature and key encipherment (what the
+// shared leaf issuer sets for every serving certificate), and no
+// wildcard SAN.
+func TestRegistryServingLeafShape(t *testing.T) {
+	ca, err := NewCA("k3sm-cluster-ca")
+	if err != nil {
+		t.Fatalf("NewCA: %v", err)
+	}
+	pair, err := ca.IssueRegistryServing("registry-k3sm", []string{"registry-k3sm", "registry-k3sm.k3sm-registry.svc"}, []net.IP{net.ParseIP("10.43.0.9")}, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("IssueRegistryServing: %v", err)
+	}
+	leaf := pair.Leaf
+	if leaf.IsCA {
+		t.Error("the leaf is a CA")
+	}
+	if !leaf.BasicConstraintsValid {
+		t.Error("BasicConstraintsValid is false; the leaf's non-CA claim is unasserted")
+	}
+	if !slices.Equal(leaf.ExtKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}) {
+		t.Errorf("ExtKeyUsage = %v, want exactly [ServerAuth]", leaf.ExtKeyUsage)
+	}
+	if want := x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment; leaf.KeyUsage != want {
+		t.Errorf("KeyUsage = %b, want %b (digital signature | key encipherment)", leaf.KeyUsage, want)
+	}
+	if leaf.KeyUsage&x509.KeyUsageCertSign != 0 {
+		t.Error("the leaf may sign certificates")
+	}
+	for _, n := range leaf.DNSNames {
+		if strings.Contains(n, "*") {
+			t.Errorf("wildcard DNS SAN %q", n)
+		}
+	}
+	if got := leaf.NotAfter.Sub(leaf.NotBefore); got > 30*24*time.Hour+2*time.Hour {
+		t.Errorf("lifetime = %v, want the requested 30 days (plus the backdate)", got)
+	}
 }

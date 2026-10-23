@@ -418,6 +418,14 @@ func (r ingestRegistry) retireNodeService(ctx context.Context) {
 		r.logger.Warn("remove this node's retired per-node registry Service", "err", err,
 			"name", registrysvc.ClusterServiceName(r.nodeName))
 	}
+	if r.joined {
+		return
+	}
+	// The bootstrap server also sweeps the retired Services of nodes that are
+	// gone, which no surviving server would otherwise remove.
+	if err := registrysvc.RemoveRetiredNodeServices(ctx, r.clusterSvcs, r.clusterSlices); err != nil {
+		r.logger.Warn("sweep the retired per-node registry Services", "err", err)
+	}
 }
 
 // publishFlatService publishes the flat registry-k3sm Service and its
