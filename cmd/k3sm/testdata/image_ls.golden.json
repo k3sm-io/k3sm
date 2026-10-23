@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "registry": {
+    "name": "registry-k3sm:6450",
+    "reachable": true
+  },
+  "images": [
+    {
+      "repository": "app",
+      "tag": "v1",
+      "reference": "registry-k3sm:6450/app:v1",
+      "digest": "sha256:bd0ec198d046597d3fd73c47830f84c597812c1cf4bd91b9fe82e0ae52cac276",
+      "platforms": [
+        "darwin/arm64"
+      ],
+      "sizeBytes": 94,
+      "pods": 2,
+      "cachedOn": [
+        "node-a",
+        "node-b"
+      ]
+    },
+    {
+      "repository": "app",
+      "tag": "v2",
+      "reference": "registry-k3sm:6450/app:v2",
+      "digest": "sha256:8b235bf50df568b5348b9b581f71b21543d458223eb6cf86c696cece320ab67c",
+      "platforms": [
+        "darwin/arm64"
+      ],
+      "sizeBytes": 94,
+      "pods": 0,
+      "cachedOn": []
+    },
+    {
+      "repository": "tools/multi",
+      "tag": "v1",
+      "reference": "registry-k3sm:6450/tools/multi:v1",
+      "digest": "sha256:65c0531fc64e75566854e90b1e9d5bdbc1620fdad674bd1f8579c4911909af28",
+      "platforms": [
+        "linux/arm64",
+        "linux/amd64"
+      ],
+      "sizeBytes": 178,
+      "pods": 2,
+      "cachedOn": [
+        "node-a"
+      ]
+    }
+  ],
+  "cachedOnIncomplete": [
+    "node-full"
+  ],
+  "migration": null
+}
