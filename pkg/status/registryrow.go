@@ -30,11 +30,13 @@ import (
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
-// RowIngestRegistry reports the server's node-local OCI ingest registry: the
-// state the server recorded for it (pkg/registrysvc's state record) and whether
-// its /v2/ endpoint answers on loopback. The row exists only on a server that
-// has written the record and whose installed arguments do not leave the
-// registry off; a server older than the record writes none and gets no row.
+// RowIngestRegistry reports the server's OCI image registry: the state the
+// server recorded for it (pkg/registrysvc's state record), whether its /v2/
+// endpoint answers on loopback, and its cluster-facing side: the flat name it
+// is published under, that it serves HTTPS, and when the serving certificate
+// expires. The row exists only on a server that has written the record and
+// whose installed arguments do not turn the registry off (--registry-port 0);
+// a server older than the record writes none and gets no row.
 const RowIngestRegistry = "ingest-registry"
 
 // registryProbeTimeout bounds the /v2/ probe, so the row never holds a report
@@ -89,7 +91,11 @@ func (c Collector) ingestRegistryRow(ctx context.Context, role dataroot.Role) (R
 		probeErr = probe(pctx, registryProbeURL(st.Port))
 		cancel()
 	}
-	row := ingestRegistryRowFrom(st, probeErr, c.registryRemedy())
+	now := time.Now()
+	if c.Now != nil {
+		now = c.Now()
+	}
+	row := ingestRegistryRowFrom(st, probeErr, c.registryRemedy(), now)
 	row.Wide["record"] = path
 	return row, true
 }
@@ -112,12 +118,19 @@ func (c Collector) readRegistryState(workDir string) (string, []byte, error) {
 
 // ingestRegistryRowFrom renders the row from a state record and the probe's
 // answer (nil means /v2/ answered; it is ignored for a state that claims no
-// listener). Pure.
-func ingestRegistryRowFrom(st registrysvc.State, probeErr error, remedy string) Row {
+// listener), as of now. Pure.
+func ingestRegistryRowFrom(st registrysvc.State, probeErr error, remedy string, now time.Time) Row {
 	row := Row{Name: RowIngestRegistry, Wide: map[string]string{
 		"port":  strconv.Itoa(st.Port),
 		"since": st.Since.UTC().Format(time.RFC3339),
 	}}
+	if st.Service != "" {
+		row.Wide["service"] = st.Service
+	}
+	row.Wide["tls"] = strconv.FormatBool(st.TLS)
+	if st.CertNotAfter != nil {
+		row.Wide["cert_not_after"] = st.CertNotAfter.UTC().Format(time.RFC3339)
+	}
 	addr := st.Addr
 	if addr == "" {
 		addr = net.JoinHostPort(registrysvc.LoopbackAddress, strconv.Itoa(st.Port))
@@ -131,9 +144,16 @@ func ingestRegistryRowFrom(st registrysvc.State, probeErr error, remedy string) 
 			return row
 		}
 		row.State, row.Severity = StateOK, SeverityOK
-		row.Detail = "serving on " + addr
+		row.Detail = "serving on " + addr + clusterFacingDetail(st)
 		if st.State == registrysvc.StateReclaimed {
 			row.Detail += fmt.Sprintf("; reclaimed an orphaned registry child (pid %d) at this start", st.ReclaimedPID)
+		}
+		if st.CertNotAfter != nil && !now.Before(*st.CertNotAfter) {
+			// The server re-mints before expiry; an expired certificate means
+			// it could not, and every HTTPS handshake to the cluster name fails.
+			row.State, row.Severity = StateDown, SeverityWarn
+			row.Detail += "; its serving certificate expired at " + st.CertNotAfter.UTC().Format(time.RFC3339)
+			row.Remedy = remedy
 		}
 		return row
 	case registrysvc.StateDisabled:
@@ -155,6 +175,23 @@ func ingestRegistryRowFrom(st registrysvc.State, probeErr error, remedy string) 
 	return row
 }
 
+// clusterFacingDetail is the row's account of the registry's cluster-facing
+// side: the name it is published under and its transport. Empty when the
+// record carries neither (a server that publishes no name and runs no relay).
+func clusterFacingDetail(st registrysvc.State) string {
+	var out string
+	if st.Service != "" {
+		out = "; in the cluster as " + st.Service
+	}
+	if st.TLS && st.CertNotAfter != nil {
+		if out == "" {
+			out = "; relayed to the cluster"
+		}
+		out += " over HTTPS (certificate expires " + st.CertNotAfter.UTC().Format(time.RFC3339) + ")"
+	}
+	return out
+}
+
 // registryRemedy is what to do about a registry that is not serving: read the
 // server log for why, then restart the server, which brings the registry up again.
 func (c Collector) registryRemedy() string {
@@ -165,10 +202,10 @@ func (c Collector) registryRemedy() string {
 	return "k3sm status logs server\nsudo launchctl kickstart -k system/" + label
 }
 
-// registryConfigured reports whether the installed server's arguments configure
-// the ingest registry (a --registry-port above 0), and whether that is known at
-// all: no parser, no readable plist, or an unparsable one leaves it unknown, and
-// the row then rests on the state record alone.
+// registryConfigured reports whether the installed server's arguments run the
+// registry (it runs by default, so only --registry-port 0 turns it off), and
+// whether that is known at all: no parser, no readable plist, or an unparsable
+// one leaves it unknown, and the row then rests on the state record alone.
 func (c Collector) registryConfigured() (configured, known bool) {
 	if c.ServerArgs == nil || c.FS == nil || c.Paths.ServerLabel == "" {
 		return false, false
@@ -183,7 +220,7 @@ func (c Collector) registryConfigured() (configured, known bool) {
 	}
 	v, ok := argValue(args, "registry-port")
 	if !ok {
-		return false, true
+		return true, true
 	}
 	n, err := strconv.Atoi(v)
 	return err == nil && n > 0, true

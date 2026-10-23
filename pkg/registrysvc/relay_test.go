@@ -102,6 +102,7 @@ func TestNewRelayBindDiscipline(t *testing.T) {
 				Port:        tc.port,
 				MeshIP:      tc.meshIP,
 				VMNetSubnet: tc.vmNetSubnet,
+				Serving:     testServing(t),
 				Logger:      quietLogger(),
 			})
 			if tc.wantErr != nil {
@@ -132,7 +133,7 @@ func TestNewRelayBindDiscipline(t *testing.T) {
 func TestNewRelayPortDiscipline(t *testing.T) {
 	for _, port := range []int{0, -1, 65536, 70000} {
 		t.Run("port "+strconv.Itoa(port)+" is refused", func(t *testing.T) {
-			if _, err := NewRelay(RelayConfig{Port: port, MeshIP: "100.64.1.1", Logger: quietLogger()}); err == nil {
+			if _, err := NewRelay(RelayConfig{Port: port, MeshIP: "100.64.1.1", Serving: testServing(t), Logger: quietLogger()}); err == nil {
 				t.Fatalf("NewRelay(port %d) = nil error", port)
 			}
 		})

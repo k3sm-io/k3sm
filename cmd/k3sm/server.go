@@ -58,6 +58,7 @@ import (
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/provider"
+	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/update"
@@ -161,10 +162,9 @@ type serverOptions struct {
 	ingressHTTPPort  int // ingress HTTP listener port, bound on the wildcard (0 disables; 80 = production, an explicit high port = integration tier)
 	ingressHTTPSPort int // ingress HTTPS listener port (same contract as ingressHTTPPort; 443 = production)
 
-	// registryPort is the loopback port the node-local OCI ingest registry serves
-	// on. 0 DISABLES it, and that is the shipped default: the registry stages and
-	// runs a pinned zot child, which is real disk and a real process, and a server
-	// that never ingests a locally built image should pay for neither.
+	// registryPort is the loopback port the server's OCI image registry serves
+	// on, executor.DefaultRegistryPort unless set. The registry is the cluster's
+	// one image store, so it runs by default; 0 opts out.
 	registryPort int
 }
 
@@ -418,12 +418,11 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// contest for these ports against a user LoadBalancer Service declaring them.
 	fs.IntVar(&opts.ingressHTTPPort, "ingress-http-port", 80, "ingress HTTP listener port, bound on ALL interfaces (80 = production; an explicit high port is the integration-tier mode; 0 disables the HTTP listener)")
 	fs.IntVar(&opts.ingressHTTPSPort, "ingress-https-port", 443, "ingress HTTPS listener port, bound on ALL interfaces (443 = production; an explicit high port is the integration-tier mode; 0 disables the HTTPS listener)")
-	// The node-local OCI ingest registry (pkg/registrysvc). DISABLED by default —
-	// it is opt-in capacity, not part of a control plane. When enabled it binds
-	// LOOPBACK ONLY and that is not configurable: pull is anonymous and push is
-	// plain HTTP, so the whole posture rests on nothing off-host being able to
-	// reach it. `k3sm dev` enables it on a per-instance allocated port.
-	fs.IntVar(&opts.registryPort, "registry-port", 0, "node-local OCI ingest registry port on 127.0.0.1 — push locally built images here and pull them by `localhost:<port>/<ref>` (0 disables; "+strconv.Itoa(executor.DefaultRegistryPort)+" is the suggested port)")
+	// The server's OCI image registry (pkg/registrysvc), ON by default: it is
+	// the cluster's one image store. zot binds LOOPBACK ONLY and that is not
+	// configurable; the cluster reaches it through the HTTPS relay as
+	// registry-k3sm:6450. `k3sm dev` runs it on a per-instance allocated port.
+	fs.IntVar(&opts.registryPort, "registry-port", executor.DefaultRegistryPort, "the cluster's OCI image registry port on 127.0.0.1, also served over HTTPS to the cluster as registry-k3sm:"+strconv.Itoa(registrysvc.FlatServicePort)+" (0 disables)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")

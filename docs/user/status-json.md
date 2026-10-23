@@ -238,7 +238,7 @@ A `403 Forbidden` is not `refused`: the credential authenticated and RBAC denied
 row stays `ok`. A review that fails any other way (a timeout, an apiserver that does not answer)
 leaves the row `ok` without `wide.user`; the `apiserver` row reports reachability.
 
-`ingest-registry`, on a server started with `--registry-port`, is `ok` when the registry the server recorded as serving answers `/v2/` on its loopback port, `down` (`warn`) when it does not, `disabled` (`warn`, with the reason in `detail`) when the server gave up starting it, and `stopped` (`skip`) after the server tore it down; `wide.port` and `wide.since` carry the port and when it entered that state, and the row reads the copy of the server's record in `/var/lib/k3sm/status/` (mode 0644, no credential), so any account sees the same row; `wide.record` names the file read.
+`ingest-registry`, on a server that runs the registry (every server unless started with `--registry-port 0`), is `ok` when the registry the server recorded as serving answers `/v2/` on its loopback port, `down` (`warn`) when it does not, `disabled` (`warn`, with the reason in `detail`) when the server gave up starting it, and `stopped` (`skip`) after the server tore it down; `wide.port` and `wide.since` carry the port and when it entered that state, `wide.service` the in-cluster name it is published under (`registry-k3sm:6450`, on the server that publishes it), `wide.tls` whether its cluster-facing listener serves HTTPS, and `wide.cert_not_after` when that listener's certificate expires (the row is `down` once it has expired), and the row reads the copy of the server's record in `/var/lib/k3sm/status/` (mode 0644, no credential), so any account sees the same row; `wide.record` names the file read.
 
 `needs-admin` marks a check that only root can run, so nothing was checked and nothing is wrong. Its
 `remedy` is `sudo k3sm status`, and it never changes the `verdict`. A client can show it as not
@@ -313,7 +313,7 @@ row on a worker, and it never changes the `verdict`. Its `wide` keys are part of
 | key | value |
 |---|---|
 | `nodeport-addresses` | the `--nodeport-addresses` value, or `every interface` |
-| `registry-port` | the node registry's port, or `off`; server only |
+| `registry-port` | the registry's port (`6450` unless set), or `off` for `--registry-port 0`; server only |
 | `tls-sans` | the extra apiserver certificate names, comma-separated, or `none`; server only |
 | `mesh-ip` | the mesh address, or `none`; server only |
 | `kubeconfig-name` | the name the admin kubeconfig is merged under; server only |

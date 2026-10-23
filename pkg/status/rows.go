@@ -383,9 +383,9 @@ func (c Collector) installRow(hasDataVolume bool, role dataroot.Role, bothRoles 
 // same posture every other "could not see it from here" row takes.
 //
 // The row exists because these arguments were, until now, only knowable by
-// reading LaunchDaemon XML: --registry-port in particular disables the node
-// registry by its ABSENCE, with no log line either way, so "is it set" had no
-// answer an operator could ask for.
+// reading LaunchDaemon XML: --registry-port in particular moves or (with 0)
+// turns off the server's registry, with no log line either way, so "is it set"
+// had no answer an operator could ask for.
 func (c Collector) serverArgsRow() (Row, bool) {
 	if c.ServerArgs == nil || c.FS == nil || c.Paths.ServerLabel == "" {
 		return Row{}, false

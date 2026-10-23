@@ -149,7 +149,7 @@ func resolvePushTarget(tag, workDir string) (name.Tag, error) {
 func nodeRegistryAuthority(workDir string) (string, error) {
 	cred, err := registrysvc.ReadCredential(workDir)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w (start the server with --registry-port, or give --tag a full registry reference such as registry.example.com/me/app:v1)", errNoNodeRegistry, err)
+		return "", fmt.Errorf("%w: %w (the server runs its registry unless started with --registry-port 0; or give --tag a full registry reference such as registry.example.com/me/app:v1)", errNoNodeRegistry, err)
 	}
 	_, port, err := net.SplitHostPort(cred.Address)
 	if err != nil {
