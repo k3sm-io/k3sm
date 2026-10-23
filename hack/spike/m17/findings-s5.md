@@ -1,4 +1,4 @@
-# S5 findings — ring ranks between pods on two Macs (M17.0)
+# S5 findings — ring ranks between pods on two Macs
 
 > **Status: NOT YET RUN.** Write-back target for `hack/spike/m17/s5.sh`. Rank logs (one
 > JSON line per event) are in `$K3SM_EVIDENCE/s5/`; the tokens/s figures are in
@@ -24,8 +24,8 @@ spike and the M17-lab ladder pin, so the single-Mac figure compares across all t
 
 | criterion | on failure |
 |---|---|
-| s5.1 / s5.2 with the 8 GiB worker's rank out of memory | R8: the rung moves the model to the workstation |
-| s5.1 / s5.2 otherwise | no substitution is pre-decided: the sharded path of the M17 plan §5 does not hold under the pod network |
+| s5.1 / s5.2 with the 8 GiB worker's rank out of memory | the rung moves the model to the workstation |
+| s5.1 / s5.2 otherwise | no substitution is pre-decided: the sharded path of the sharded-ring design does not hold under the pod network |
 
 ## Scoreboard
 
@@ -56,4 +56,4 @@ spike and the M17-lab ladder pin, so the single-Mac figure compares across all t
 - Whether ranks bind and dial pod IPs under the shim, which the sharded `MLXModel`'s
   rank pods rely on.
 - The tokens/s any page may quote, beside the single-Mac figure — a sharded figure
-  below the single-Mac one is published as such (R15).
+  below the single-Mac one is published as such.

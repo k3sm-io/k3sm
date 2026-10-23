@@ -26,10 +26,10 @@ import (
 )
 
 // m17SpikeRungs are the rungs hack/spike/m17/run.sh chains. S6 is deliberately
-// absent: it is the M17-rdma row, so the M17.0 row can exit 0 on a Thunderbolt 4 rig.
+// absent: it is the M17-rdma row, so the M17 spike row can exit 0 on a Thunderbolt 4 rig.
 var m17SpikeRungs = []string{"s1", "s2", "s3", "s4", "s5"}
 
-// m17SpikeEnv is the test process's environment with every variable the M17.0
+// m17SpikeEnv is the test process's environment with every variable the M17 spike
 // spike reads removed (K3SM_LAB, K3SM_EVIDENCE and all K3SM_M17_*), then extra
 // appended, plus a PATH whose first entry holds ssh and scp stand-ins that record
 // any call in a marker file. A developer who exported a rig's host variables can
@@ -80,7 +80,7 @@ func assertNoHostContacted(t *testing.T, marker string) {
 	}
 }
 
-// TestM17SpikePlanNeedsNoHost pins the review contract of the M17.0 ladder:
+// TestM17SpikePlanNeedsNoHost pins the review contract of the M17 spike ladder:
 // `run.sh --plan` is parsed before any host requirement, so it exits 0 on a machine
 // with no rig, no cable and no host variables, contacts nothing, and lists S1–S5 —
 // each with its verdict criteria and its pre-decided halt — and not S6.
@@ -104,7 +104,7 @@ func TestM17SpikePlanNeedsNoHost(t *testing.T) {
 		}
 	}
 	if strings.Contains(out, "spike S6") {
-		t.Error("run.sh --plan lists S6; S6 belongs to the M17-rdma row, not M17.0")
+		t.Error("run.sh --plan lists S6; S6 belongs to the M17-rdma row, not M17 spike")
 	}
 	assertNoHostContacted(t, marker)
 

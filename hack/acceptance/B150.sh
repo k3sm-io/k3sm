@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B150 acceptance gate — the runnable proof that the acceptance gates are
+# k3sm gate sequence acceptance gate — the runnable proof that the acceptance gates are
 # INDEPENDENTLY RUNNABLE IN SEQUENCE: every bring-up in hack/lib/clusterup.sh
 # starts from a clean cluster work dir and from ports no previous run still holds.
 #
@@ -27,7 +27,7 @@ LIB="$REPO_ROOT/hack/lib/clusterup.sh"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B150 acceptance (per-run cluster isolation: clusterup.sh cluster_reset)"
+echo "==> k3sm gate sequence acceptance (per-run cluster isolation: clusterup.sh cluster_reset)"
 
 # ---- b150.0 — the library exists and parses --------------------------------
 if [ -f "$LIB" ] && bash -n "$LIB"; then
@@ -35,8 +35,8 @@ if [ -f "$LIB" ] && bash -n "$LIB"; then
 else
 	ladder no "b150.0  hack/lib/clusterup.sh present + parses (bash -n)"
 	echo "----------------------------------------"
-	echo "B150: clusterup.sh missing or unparseable — nothing else can run" >&2
-	echo "B150: $PASS passed, $((FAIL)) failed" >&2
+	echo "gate sequence: clusterup.sh missing or unparseable — nothing else can run" >&2
+	echo "gate sequence: $PASS passed, $((FAIL)) failed" >&2
 	exit 1
 fi
 
@@ -123,9 +123,9 @@ mkdir -p "$SEQ/bin" && echo cp > "$SEQ/bin/kube-apiserver"
 sub "$SEQ" 'cluster_reset; mkdir -p "$SERVER_WORKDIR/db"; echo "gate-A service IP 10.43.0.10 allocated" > "$SERVER_WORKDIR/db/state.db"' >/dev/null 2>&1 || true
 mkdir -p "$SEQ/server/db" && echo "gate-A service IP 10.43.0.10 allocated" > "$SEQ/server/db/state.db"
 if sub "$SEQ" 'cluster_reset; [ ! -e "$SERVER_WORKDIR/db/state.db" ]' >/dev/null 2>&1; then
-	ladder ok "b150.3  a second gate over the same work dir starts with NO previous datastore (the B150 contract)"
+	ladder ok "b150.3  a second gate over the same work dir starts with NO previous datastore (the contract)"
 else
-	ladder no "b150.3  a second gate over the same work dir starts with NO previous datastore (the B150 contract)"
+	ladder no "b150.3  a second gate over the same work dir starts with NO previous datastore (the contract)"
 fi
 if [ -f "$SEQ/bin/kube-apiserver" ]; then
 	ladder ok "b150.3b the sequence keeps the download cache across gates (no re-download per gate)"
@@ -230,7 +230,7 @@ start_listener() { # <attribution-arg> <portfile-name>
 	LISTEN_PORT="$(cat "$pf")"
 }
 
-# OURS: the argv names the rig's work dir — the same witness that attributes a
+# OURS: the argv names the lab host's work dir — the same witness that attributes a
 # `go run`-launched `k3sm server --work-dir …` squatting :10250.
 start_listener "$REAP/pods" ours.port
 PORT_OURS="$LISTEN_PORT"
@@ -244,7 +244,7 @@ else
 	ladder no "b150.8  reap_port frees a port held by THIS rig's stale process (rc_ok=$ours_reaped)"
 fi
 
-# FOREIGN: nothing in its argv names the rig. It must survive, fatal must refuse
+# FOREIGN: nothing in its argv names this harness. It must survive, fatal must refuse
 # (a foreign endpoint on the kine/apiserver port would pass wait_tcp and the gate
 # would run against someone else's cluster), warn must tolerate it.
 start_listener "/tmp/b150-unrelated-process" foreign.port
@@ -288,6 +288,6 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B150: $PASS passed, $FAIL failed"
+echo "gate sequence: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B150 GREEN ================"
+echo "================ gate sequence GREEN ================"

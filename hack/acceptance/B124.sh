@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k3sm B124 acceptance: native pods survive a node-daemon restart (re-attach),
+# k3sm pod survival acceptance: native pods survive a node-daemon restart (re-attach),
 # and `k3sm uninstall` leaves no pod process behind. It runs against an
 # INSTALLED, RUNNING node (`sudo k3sm install` on this Mac, a live cluster at
 # $KUBECONFIG) and boots nothing itself. It ends by UNINSTALLING this node; the
@@ -61,13 +61,13 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 finish() {
 	echo "----------------------------------------"
-	echo "B124: $PASS passed, $FAIL failed"
+	echo "pod survival: $PASS passed, $FAIL failed"
 	[ "$FAIL" -eq 0 ] || exit 1
-	echo "=========== B124 GREEN ==========="
+	echo "=========== pod survival GREEN ==========="
 }
 
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "B124 gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
+	echo "pod survival gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
 	exit 3
 fi
 if [ -z "${KUBECONFIG:-}" ]; then
@@ -90,7 +90,7 @@ if [ -z "$LABEL" ]; then
 		LABEL=io.k3sm.server
 	fi
 fi
-echo "==> B124 acceptance (node $NODE_NAME, daemon $LABEL)"
+echo "==> pod survival acceptance (node $NODE_NAME, daemon $LABEL)"
 
 # Per-run pod names, so a previous run's leftover Event or a pod still being
 # deleted can never match this run's checks.

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # k3sm M3 lab gate — the runnable proof of multi-node, mesh, NodePort & persistent
-# storage (DESIGN §9 M3) on a TWO-MAC rig. Unlike the single-host m0/m1/m2 gates,
+# storage (DESIGN §9 M3) on a TWO-MAC lab. Unlike the single-host m0/m1/m2 gates,
 # M3 needs two machines (a control-plane Mac + a joined worker Mac), so this gate
 # is manual: true / requires two-macs in hack/acceptance/phases.json and runs ONLY
 # under K3SM_LAB=1. The orchestrator reports it "pending lab" (never auto-green)
 # when K3SM_LAB is unset; a direct run without it is a no-op skip.
 #
 # It asserts the three M3 exit behaviors, from a host with the admin KUBECONFIG:
-#   (a) M3.1 — a NodePort Service is reachable on *:nodePort,
-#   (b) M3.2 — a StatefulSet+PVC writes data, the pod restarts, the SAME data is
+#   (a) a NodePort Service is reachable on *:nodePort,
+#   (b) a StatefulSet+PVC writes data, the pod restarts, the SAME data is
 #       present (persistence across restart, ReclaimPolicy Retain),
-#   (c) M3.3 — in-pod kubectl AND cluster DNS work from a pod on the JOINED
+#   (c) in-pod kubectl AND cluster DNS work from a pod on the JOINED
 #       (non-control-plane) node: the pod resolves kubernetes.default.svc to the
 #       node-local API VIP (10.43.0.1, proxy-owned + mesh-forwarded) and a Service
 #       name to its ClusterIP via the per-node CoreDNS on 10.43.0.10, and reaches
@@ -62,9 +62,9 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 . "$HERE/../lib/conformance.sh"
 . "$HERE/../lib/conformance-stage.sh"
 
-# ── Lab guard: only run under K3SM_LAB=1 (a real two-Mac rig). ────────────────
+# ── Lab guard: only run under K3SM_LAB=1 (a real two-Mac lab). ────────────────
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "M3 lab gate: PENDING (two-macs). Set K3SM_LAB=1 on a two-Mac rig to run; this is NOT a pass."
+	echo "M3 lab gate: PENDING (two-macs). Set K3SM_LAB=1 on a two-Mac lab to run; this is NOT a pass."
 	exit 0
 fi
 
@@ -82,7 +82,7 @@ fi
 echo "==> k3sm M3 lab gate (two Macs: control plane + joined worker; KUBECONFIG=$KUBECONFIG_PATH)"
 
 # m3.0 — the cluster is multi-node: at least two Ready nodes (control plane + a
-# joined worker). Identify the worker (the node to pin the M3.3 pod onto): an
+# joined worker). Identify the worker (the node to pin the in-pod kubectl pod onto): an
 # explicit $K3SM_WORKER wins; else pick a Ready node whose name differs from this
 # host's k3sm node name (the control plane runs `k3sm server` here).
 ready_nodes="$(kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"{print $1}')"

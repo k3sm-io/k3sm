@@ -1,6 +1,6 @@
-# S2 — nested-dylib signing under AMFI (M8.0-d2) — **PASS**
+# S2 — nested-dylib signing under AMFI — **PASS**
 
-> **Verdict: PASS.** No redesign consequence fires (the M8 plan Res. 17 S2 is
+> **Verdict: PASS.** No redesign consequence fires (per the spike definition S2 is
 > terminal-or-redesign). Signatures survive `clonefile`, the cloned tree execs
 > both unsandboxed and under the S1 Seatbelt profile, and the one file the walk
 > flags is a *known, characterized* class that `AdHocSignTree` must handle.
@@ -20,7 +20,7 @@ by `codesign -dvvv` / `codesign -v`.
 | `pyinstall/` (CPython 3.12.14, the python-build-standalone analog) | 1828 | **11** | 11 | 0 | 0 | 0 |
 | **total** | 7993 | **41** | **40** | **0** | **0** | **1** |
 
-Two facts M8.4 depends on, both confirmed:
+Two facts the image build depends on, both confirmed:
 
 - **Wheels arrive linker-ad-hoc-signed.** 40 of 41 carry
   `flags=0x20002(adhoc,linker-signed)` — the arm64 linker signs every Mach-O it
@@ -31,7 +31,7 @@ Two facts M8.4 depends on, both confirmed:
 
 The absolute count is small (**41 Mach-Os**, not "hundreds") because mlx-lm is
 pure Python and the engine is two dylibs. **The S5 winner will change this
-number** — vllm-mlx/oMLX pull a much heavier dependency set — so M8.4's
+number** — vllm-mlx/oMLX pull a much heavier dependency set — so the image build's
 walk-verify must be mechanized (it is: `s2walk.sh` here is the shape), not
 eyeballed against 41.
 
@@ -49,11 +49,11 @@ x86_64 slice is not signed at all.** A bare `codesign -v` (no `--arch`) reports
 "code object is not signed at all" for the whole file, which is why the naive
 tally calls it INVALID — and why the naive tally is misleading.
 
-**Binding consequence for `AdHocSignTree` (M8.2-d3): it must be arch-aware.**
+**Binding consequence for `AdHocSignTree`: it must be arch-aware.**
 
 - A whole-file `codesign -v` verdict is **not** a usable signal on a fat binary:
   it fails on a file whose native slice is perfectly valid, and would drive an
-  unnecessary re-sign (which de-CoWs the file — precisely the invariant Res. 13's
+  unnecessary re-sign (which de-CoWs the file — precisely the invariant the
   `gateSignature` check-then-sign-only-if-invalid clause exists to protect).
 - The check must be `codesign -v --arch <native>`, or the re-sign must cover the
   whole fat file. Verifying the *native* slice is the cheaper and correct rule:
@@ -87,7 +87,7 @@ tally calls it INVALID — and why the naive tally is misleading.
 
 1. **`AdHocSignTree` must verify per-arch** (`codesign -v --arch <native>`), or
    fat binaries with an unsigned foreign slice will be re-signed every start —
-   de-CoWing argv[0] and its dylibs, which is exactly what Res. 13's
+   de-CoWing argv[0] and its dylibs, which is exactly what the
    check-then-sign-only-if-invalid clause forbids.
 2. **The walk needs `file -b`, not a suffix match.** Extensions in a wheel tree
    are unreliable in both directions.
@@ -95,5 +95,5 @@ tally calls it INVALID — and why the naive tally is misleading.
    linker-signed. `AdHocSignTree`'s job is the *arrival* path (a tree unpacked
    from OCI layers, where `LC_CODE_SIGNATURE` survived the tar but the file may
    have been produced by a non-linker path), not the per-pod materialize.
-4. **41 Mach-Os is an M8.0 datum, not an M8.4 budget.** Re-measure against the
+4. **41 Mach-Os is an M8 spike datum, not an image-build budget.** Re-measure against the
    S5 winner's wheel set before sizing the tree-sign cost (that is S4's job).

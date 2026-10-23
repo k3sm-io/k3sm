@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # k3sm M6 lab gate — the runnable proof of HA on embedded etcd: two control-plane
 # servers, each running one etcd member (the second joined as a learner and promoted),
-# plus leader election (M6.0) and the identical-CA bootstrap bundle v2 (M6.1)
-# (DESIGN §9 M6; docs/PHASES.md M6.0/M6.1). It needs TWO server Macs, so it is
+# plus leader election and the identical-CA bootstrap bundle v2
+# (DESIGN §9 M6; docs/PHASES.md). It needs TWO server Macs, so it is
 # manual: true / requires two-macs in hack/acceptance/phases.json and runs ONLY under
 # K3SM_LAB=1. With K3SM_LAB unset it prints PENDING and exits 0 (never a pass).
 #
@@ -111,7 +111,7 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 
 SCOPE="two Macs prove the mechanics (join, TLS, replication, leader election, quorum loss, recovery, reset, cold restart), not fault tolerance"
 
-# ── Lab guard: only run under K3SM_LAB=1 (a real two-Mac rig). ─────────────────
+# ── Lab guard: only run under K3SM_LAB=1 (a real two-Mac lab). ─────────────────
 if [ "${K3SM_LAB:-}" != "1" ]; then
 	echo "M6 lab gate: PENDING (two-macs). Set K3SM_LAB=1 with two embedded-etcd servers to run; this is NOT a pass. Scope: $SCOPE."
 	exit 0

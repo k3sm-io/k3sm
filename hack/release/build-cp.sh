@@ -119,7 +119,7 @@ go_dir() {
 build_env() {
 	local src="$1" work="$2" godir="$3" gowork="off"
 	# The go command's cwd is the resolved path, so GOWORK must name the same
-	# spelling or it does not match the workspace's `use .` (B766).
+	# spelling or it does not match the workspace's `use .`.
 	if [ -f "$src/go.work" ]; then
 		src="$(cd "$src" && pwd -P)"
 		gowork="$src/go.work"
@@ -325,11 +325,11 @@ self_test() {
 	mkdir -p "$tmp/wsrc" && : >"$tmp/wsrc/go.work"
 	if build_env "$tmp/wsrc" "$tmp/w" "/g" | grep -qx "GOWORK=$(cd "$tmp/wsrc" && pwd -P)/go.work"; then ok "a source with go.work builds as its own workspace"; else bad "GOWORK does not name the source's go.work"; fi
 
-	# B766: a src reached through a symlinked parent must yield the resolved GOWORK.
+	# GOWORK: a src reached through a symlinked parent must yield the resolved GOWORK.
 	mkdir -p "$tmp/real/s" && : >"$tmp/real/s/go.work" && ln -s "$tmp/real" "$tmp/link"
 	rs="$(cd "$tmp/real/s" && pwd -P)"
 	if build_env "$tmp/link/s" "$tmp/w" "/g" | grep -qx "GOWORK=$rs/go.work"; then ok "GOWORK names the resolved path through a symlinked parent"; else bad "GOWORK keeps the symlinked spelling"; fi
-	# B766: cleanup removes a tree holding a read-only subtree.
+	# GOWORK: cleanup removes a tree holding a read-only subtree.
 	mkdir -p "$tmp/ro/a/b" && : >"$tmp/ro/a/b/f" && chmod -R a-w "$tmp/ro/a"
 	cleanup_tree "$tmp/ro"
 	if [ ! -e "$tmp/ro" ]; then ok "cleanup removes a work dir with a read-only subtree"; else chmod -R u+w "$tmp/ro"; bad "a read-only subtree survived cleanup"; fi

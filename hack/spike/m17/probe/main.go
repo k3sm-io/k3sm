@@ -16,7 +16,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Command probe is the M17.0 spike's measuring instrument: the questions a shell
+// Command probe is the M17 spike's measuring instrument: the questions a shell
 // cannot observe on its own, answered through the same libraries the product
 // uses, so a spike finding is a finding about that code and not about a
 // re-implementation of it.

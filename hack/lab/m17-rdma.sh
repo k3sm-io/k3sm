@@ -9,7 +9,7 @@
 #   M17-rdma  gate hack/lab/m17-rdma.sh, tier lab, requires thunderbolt5 + rdma,
 #             manual: true, skeleton: true
 #
-# WHAT THE REAL GATE WILL ASSERT (the M17 plan §Gates and §Sub-phases S6), on two
+# WHAT THE REAL GATE WILL ASSERT (sub-phase S6 and the gates), on two
 # Thunderbolt 5 Macs with RDMA enabled in macOS Recovery (rdma_ctl enable — a human
 # step nothing can automate):
 #   S6.1  ibv_devices and rdma_ctl status, run as the _k3sm service user

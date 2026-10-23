@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B375 acceptance gate — the runnable proof that docs/PHASES.md's retroactive
+# k3sm datavol record acceptance gate — the runnable proof that docs/PHASES.md's retroactive
 # datavol record is TRUTHFUL, not merely present.
 #
 # The defect this documents against: pkg/datavol (the `k3sm datavol mount|status|delete`
@@ -43,7 +43,7 @@ DOC="$K3SM_ROOT/docs/PHASES.md"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B375 acceptance (docs/PHASES.md: the retroactive datavol record is truthful)"
+echo "==> k3sm datavol record acceptance (docs/PHASES.md: the retroactive datavol record is truthful)"
 
 # ---- b375.0 — the gate parses and its source exists -------------------------
 b0=ok
@@ -53,8 +53,8 @@ b0=ok
 ladder "$b0" "b375.0  gate parses (bash -n) + docs/PHASES.md and pkg/datavol present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B375: the gate or its source is missing/unparseable — nothing else can run" >&2
-	echo "B375: $PASS passed, $FAIL failed" >&2
+	echo "datavol record: the gate or its source is missing/unparseable — nothing else can run" >&2
+	echo "datavol record: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -90,8 +90,8 @@ fi
 ladder "$b1" "b375.1  the retroactive record section exists, names datavol mount/status/delete, and states unit-tier + the storage.md cross-link"
 if [ "$b1" != ok ]; then
 	echo "----------------------------------------"
-	echo "B375: the record section is missing or incomplete — nothing else can be checked" >&2
-	echo "B375: $PASS passed, $FAIL failed" >&2
+	echo "datavol record: the record section is missing or incomplete — nothing else can be checked" >&2
+	echo "datavol record: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -123,8 +123,8 @@ done < "$CITED_FILE"
 ladder "$b2" "b375.2  every cited test name ($CITED_COUNT) exists as \`func Name(\` in a datavol-adjacent _test.go"
 if [ "$b2" != ok ]; then
 	echo "----------------------------------------"
-	echo "B375: at least one cited test does not exist in source — the record is not truthful" >&2
-	echo "B375: $PASS passed, $FAIL failed" >&2
+	echo "datavol record: at least one cited test does not exist in source — the record is not truthful" >&2
+	echo "datavol record: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -157,6 +157,6 @@ done < "$WORKDIR/pkgs.txt"
 ladder "$b3" "b375.3  every cited test passes live (per-package go test -run alternation)"
 
 echo "----------------------------------------"
-echo "B375: $PASS passed, $FAIL failed"
+echo "datavol record: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B375 GREEN ================"
+echo "================ datavol record GREEN ================"

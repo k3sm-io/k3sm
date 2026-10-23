@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# k3sm B217 acceptance gate — the runnable proof that the provider injects the
+# k3sm bind discipline acceptance gate — the runnable proof that the provider injects the
 # bind-discipline env (K3SM_POD_IP) so a Pod's wildcard bind() is rewritten onto its
 # own /32, giving same-node Pods separate per-IP port spaces (two Pods can both hold
-# :8080). Plan W4; depends on B216 (the darwin-net bind() interpose) and B215 (the lab
-# probe wave). Closes the DESIGN §6 M2 "IP-per-pod (lo0 alias + bind discipline)"
+# :8080). Depends on the darwin-net bind() interpose and the lab
+# probe wave. Closes the DESIGN §6 M2 "IP-per-pod (lo0 alias + bind discipline)"
 # deliverable.
 #
 # TWO TIERS, split by what can be proven without a live cluster:
@@ -30,7 +30,7 @@
 # The GOARCH=arm64 pin is a CORRECTNESS requirement, not hygiene: this Mac's Go
 # toolchain is itself x86_64-under-Rosetta (`go env GOARCH` -> amd64), and an unpinned
 # build produced an x86_64 shim that dyld refused to load into the arm64 execshim (the
-# B215 trap). The product is darwin/arm64-only.
+# lab-probe trap). The product is darwin/arm64-only.
 #
 # Usage:  hack/acceptance/B217.sh            # CI tier only
 #         K3SM_LAB=1 hack/acceptance/B217.sh # + the live single-node datapath
@@ -45,7 +45,7 @@ SELF="$HERE/B217.sh"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B217 acceptance (provider K3SM_POD_IP injection + per-IP port spaces)"
+echo "==> k3sm bind discipline acceptance (provider K3SM_POD_IP injection + per-IP port spaces)"
 
 # ---- b217.0 — the gate parses and the wiring source exists -----------------
 b0=ok
@@ -54,20 +54,20 @@ b0=ok
 ladder "$b0" "b217.0  gate parses (bash -n) + pkg/provider/translate.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B217: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B217: $PASS passed, $FAIL failed" >&2
+	echo "bind discipline: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
+	echo "bind discipline: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
 # ---- b217.pre — the cross-repo preconditions -------------------------------
 # The injection legally imports darwin-net's podnet.BindDisciplineEnv; the two halves
 # only compile against each other through the workspace go.work. A standalone k3sm
-# clone cannot prove it, so its absence is a hard FAIL (never a skip, or "B217 green"
-# would mean "B217 was not checked").
+# clone cannot prove it, so its absence is a hard FAIL (never a skip, or "green"
+# would mean "bind discipline was not checked").
 if [ -f "$WS_ROOT/go.work" ]; then
 	ladder ok "b217.pre  workspace go.work present ($WS_ROOT/go.work)"
 else
-	ladder no "b217.pre  workspace go.work present — B217 imports darwin-net; a standalone k3sm checkout cannot prove it"
+	ladder no "b217.pre  workspace go.work present — imports darwin-net; a standalone k3sm checkout cannot prove it"
 fi
 if [ -f "$DARWIN_NET_ROOT/pkg/podnet/env.go" ]; then
 	ladder ok "b217.pre  sibling darwin-net podnet ABI present ($DARWIN_NET_ROOT/pkg/podnet/env.go)"
@@ -76,7 +76,7 @@ else
 fi
 if [ "$FAIL" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "B217: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
+	echo "bind discipline: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
 	exit 1
 fi
 
@@ -84,7 +84,7 @@ fi
 # The single-sourced encoder + env const the provider imports. A rename on the
 # darwin-net side (which the provider cannot see at grep time) would break the build,
 # but this pin makes the ABI dependency explicit in the gate so a reader knows what
-# B217 rides on.
+# rides on the interpose.
 abi=ok
 grep -qE 'func BindDisciplineEnv\(' "$DARWIN_NET_ROOT/pkg/podnet/env.go" || abi=no
 grep -qE 'EnvPodIP\s*=\s*"K3SM_POD_IP"' "$DARWIN_NET_ROOT/pkg/podnet/env.go" || abi=no
@@ -95,10 +95,10 @@ ladder "$abi" "b217.1  darwin-net podnet exports BindDisciplineEnv + EnvPodIP (K
 # deleted — the mutant check for a change that would silently narrow the shipped
 # hostNetwork semantic or drop the discipline entirely.
 #
-# B218 widened the call site to also thread the cluster CIDRs (clusterCIDRs) through
+# A later change widened the call site to also thread the cluster CIDRs (clusterCIDRs) through
 # to podnet.BindDisciplineEnvWithCIDRs (the additive superset of BindDisciplineEnv) —
 # these two pins were updated to match; the gated-on-distinct-/32 pin below is
-# unchanged, since B218 did not touch that guard.
+# unchanged, since that change did not touch that guard.
 w=ok
 grep -qE 'injectBindDisciplineEnv\(box, podIP, nodeIP, clusterCIDRs\(dnsCfg\.ClusterDNSIP\), log\)' "$TRANSLATE" || w=no
 grep -qE 'podIP == "" \|\| podIP == nodeIP' "$TRANSLATE" || w=no
@@ -150,7 +150,7 @@ lab_pending() { echo "LAB-PENDING  $1"; }
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "B217 LAB tier (set K3SM_LAB=1 on a dev Mac to run):"
+	echo "LAB tier (set K3SM_LAB=1 on a dev Mac to run):"
 	lab_pending "b217.L1  two Pods each binding :8080 both reach Running (RED before: the 2nd crash-loops EADDRINUSE on origin/main)"
 	lab_pending "b217.L2  each Pod is reachable at its own podIP:8080 through its Service"
 	lab_pending "b217.L3  coexistence with BOTH standing wildcard binders (svclb 0.0.0.0:8080 AND proxy *:NodePort)"
@@ -168,7 +168,7 @@ else
 		# shellcheck source=/dev/null
 		. "$LIB"
 		echo "----------------------------------------"
-		echo "B217 LAB tier: booting a single-node cluster (this mutates lo0/datastore on this Mac)"
+		echo "LAB tier: booting a single-node cluster (this mutates lo0/datastore on this Mac)"
 		if cluster_up; then
 			ladder ok "b217.L0  single-node cluster up"
 			# The live fixture + assertions are authored against the shared kubectl
@@ -185,6 +185,6 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B217: $PASS passed, $FAIL failed"
+echo "bind discipline: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B217 GREEN (CI tier) ================"
+echo "================ bind discipline GREEN (CI tier) ================"

@@ -140,7 +140,7 @@ func loadGateRows(t *testing.T) map[string]gateRow {
 //
 // It asserts ONLY that the scripts exist and are runnable — it never executes a gate
 // and never asserts a gate PASSES. The milestone proofs stay in the gates (and their
-// lab successors B34/B35); a green here can never be mistaken for a proven milestone.
+// lab successors); a green here can never be mistaken for a proven milestone.
 func TestPhasesGatePathsResolve(t *testing.T) {
 	root := repoRoot(t)
 	rows := loadGateRows(t)
@@ -239,7 +239,7 @@ func gateShimTarget(t *testing.T, abs string) (string, bool) {
 // real proof is still owed.
 //
 // The skeleton set is DERIVED from phases.json — every row that is BOTH manual:true
-// AND skeleton:true (Res. 1). Keying on manual:true alone would wrongly select the
+// AND skeleton:true. Keying on manual:true alone would wrongly select the
 // real hardware gates hack/lab/{m3,m6}.sh (manual:true WITHOUT skeleton — they run
 // real conformance slices under K3SM_LAB=1, not hermetic) and, once it lands green,
 // the M9 launch pre-flight; the skeleton:true discriminator keeps those out. DISTINCT
@@ -282,7 +282,7 @@ func TestLabSkeletonHonesty(t *testing.T) {
 }
 
 // TestNonManualSkeletonsAlwaysRed pins the complementary honesty contract for
-// manual:false skeleton gates (Res. 2). A CI-runnable gate (e.g. the M7 umbrella +
+// manual:false skeleton gates. A CI-runnable gate (e.g. the M7 umbrella +
 // M8) is run DIRECTLY by the release process, which trusts exit 0 as "milestone
 // proven" — so a not-yet-real skeleton for such a row must exit NON-ZERO
 // UNCONDITIONALLY (the hack/lab/*.sh K3SM_LAB-unset→exit-0 pattern would falsely
@@ -318,7 +318,7 @@ func TestNonManualSkeletonsAlwaysRed(t *testing.T) {
 			}
 			for _, lab := range []string{"", "1"} {
 				if code := runGate(t, path, lab); code == 0 {
-					t.Errorf("%s (K3SM_LAB=%q): exit 0 — a manual:false skeleton must exit non-zero UNCONDITIONALLY until real (Res. 2), or the release process falsely passes the milestone", rel, lab)
+					t.Errorf("%s (K3SM_LAB=%q): exit 0 — a manual:false skeleton must exit non-zero UNCONDITIONALLY until real, or the release process falsely passes the milestone", rel, lab)
 				}
 			}
 		})
@@ -346,7 +346,7 @@ func runGate(t *testing.T, path, k3smLab string) int {
 	}
 }
 
-// TestM11CoreGateDeclaresCoreMode is B230's gate: it pins, STATICALLY and hermetically,
+// TestM11CoreGateDeclaresCoreMode is the core-mode gate: it pins, STATICALLY and hermetically,
 // the three properties that make the M11-core row honest evidence.
 //
 // Why it must exist as its own test. Today M11-core and M11-lab are both
@@ -358,7 +358,7 @@ func runGate(t *testing.T, path, k3smLab string) int {
 // script's own text, neither of which depends on the row still being a skeleton.
 //
 //  1. THE MODE IS PARSED, NOT IGNORED. The two rows share one gate path, so if the
-//     script ignored its arguments the launch subset and the full B109 ledger would be
+//     script ignored its arguments the launch subset and the full vm-path ledger would be
 //     the same run under two names — and a --core green would silently discharge a row
 //     it does not satisfy. Proven behaviourally (the two invocations differ) plus by an
 //     unknown flag being REJECTED, which is what distinguishes parsing from ignoring.
@@ -382,12 +382,12 @@ func TestM11CoreGateDeclaresCoreMode(t *testing.T) {
 	}
 	full, ok := rows["M11-lab"]
 	if !ok {
-		t.Fatal("phases.json declares no M11-lab row — the FULL B109 vm-path ledger has no gate")
+		t.Fatal("phases.json declares no M11-lab row — the FULL vm-path ledger has no gate")
 	}
 
 	// (2) The rows are distinct BY ARGS over a shared gate path, and M11-core does not
-	// require signing — the M11 plan's R28 removed Developer-ID from this path, so a signing
-	// requirement would make the launch row unrunnable on the rig that must run it.
+	// require signing — the launch plan removed Developer-ID from this path, so a signing
+	// requirement would make the launch row unrunnable on the lab host that must run it.
 	t.Run("manifest_rows_are_distinct_by_args", func(t *testing.T) {
 		if core.Gate != full.Gate {
 			t.Fatalf("M11-core gate %q and M11-lab gate %q differ; the subset relation is expressed by args over ONE script", core.Gate, full.Gate)
@@ -396,11 +396,11 @@ func TestM11CoreGateDeclaresCoreMode(t *testing.T) {
 			t.Fatalf("M11-core args = %v, want [--core] (the launch subset is selected by a parsed flag, not by prose)", core.Args)
 		}
 		if len(full.Args) != 0 {
-			t.Errorf("M11-lab args = %v, want none: the bare invocation IS the full B109 ledger", full.Args)
+			t.Errorf("M11-lab args = %v, want none: the bare invocation IS the full vm-path ledger", full.Args)
 		}
 		for _, req := range core.Requires {
 			if req == "signing" {
-				t.Errorf("M11-core requires %v: it must NOT require signing — R28 removed Developer-ID from this path and the requirement would make the launch row unrunnable", core.Requires)
+				t.Errorf("M11-core requires %v: it must NOT require signing — the launch plan removed Developer-ID from this path and the requirement would make the launch row unrunnable", core.Requires)
 			}
 		}
 		if !core.Manual || !full.Manual {
@@ -422,7 +422,7 @@ func TestM11CoreGateDeclaresCoreMode(t *testing.T) {
 			t.Fatalf("%s (bare) with K3SM_LAB unset: exit %d, want 0 (a skip — PENDING, NOT a pass); output:\n%s", full.Gate, fullCode, fullOut)
 		}
 		if coreOut == fullOut {
-			t.Errorf("%s produces IDENTICAL output for %v and for no args — the argument is being ignored, so a --core green would silently discharge the full B109 ledger; output:\n%s", core.Gate, core.Args, coreOut)
+			t.Errorf("%s produces IDENTICAL output for %v and for no args — the argument is being ignored, so a --core green would silently discharge the full vm-path ledger; output:\n%s", core.Gate, core.Args, coreOut)
 		}
 		if !strings.Contains(coreOut, "M11-core") {
 			t.Errorf("the --core invocation does not name the M11-core row in its notice; a log that cannot say which row it ran discharges neither. Output:\n%s", coreOut)
@@ -445,7 +445,7 @@ func TestM11CoreGateDeclaresCoreMode(t *testing.T) {
 			t.Fatalf("read %s: %v", core.Gate, err)
 		}
 		src := string(body)
-		// The emitter lives in the run-log library the gate sources (B575), so the
+		// The emitter lives in the run-log library the gate sources, so the
 		// library's text counts as the gate's own when, and only when, it is sourced.
 		if sourcesRunlogRE.MatchString(src) {
 			lib, err := os.ReadFile(filepath.Join(repoRoot(t), filepath.FromSlash(runlogLib)))
@@ -504,7 +504,7 @@ func runGateArgs(t *testing.T, path, k3smLab string, args ...string) (int, strin
 // row must be manual, lab-tier, non-skeleton, with the ladder as its gate; then:
 //
 //   - K3SM_LAB truly unset (absent from the environment, not empty) exits 3 with
-//     the exact line "LAB-PENDING: not a pass" (the B46 shape: a distinct code, so
+//     the exact line "LAB-PENDING: not a pass" (the shape: a distinct code, so
 //     no wrapper reads the skip as a pass), through the ladder and the kept
 //     hack/lab/m17.sh shim alike;
 //   - K3SM_LAB=1 with no PEER_SSH/EVIDENCE_DIR exits 2, a refusal;

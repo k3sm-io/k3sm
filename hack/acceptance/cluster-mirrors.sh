@@ -177,7 +177,7 @@ fi
 # image exists on ONE node's registry and the Pod runs on the OTHER, so a
 # one-Mac run would prove only that a node can pull from itself.
 echo "----------------------------------------"
-echo "LIVE TIER (two Macs, run by hand on the lab rig):"
+echo "LIVE TIER (two Macs, run by hand on the lab Macs):"
 pending "mirrors.8  both nodes advertise: kubectl get cm -n k3sm-registry | grep k3sm-node-registry-"
 pending "mirrors.9  the grant is in place: kubectl get role,rolebinding -n k3sm-registry k3sm-registry-advert-reader"
 pending "mirrors.10 a node identity may read them and nothing else there:"
@@ -193,5 +193,5 @@ echo "----------------------------------------"
 echo "cluster-mirrors: $PASS passed, $FAIL failed, $PENDING OWED"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "cluster-mirrors: CI TIER GREEN — the LIVE tier did NOT run, so this exit 0 does NOT mean an image"
-echo "                 crossed between two Macs. Run the owed rungs on the two-Mac rig."
+echo "                 crossed between two Macs. Run the owed rungs on the two-Mac lab."
 exit 0

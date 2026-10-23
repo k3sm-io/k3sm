@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# k3sm M10.3 ingress acceptance — Ingress hosting + IngressClass + LoadBalancer
-# status (klipper-lite svclb, B32) against a RUNNING cluster.
+# k3sm ingress acceptance — Ingress hosting + IngressClass + LoadBalancer
+# status (klipper-lite svclb) against a RUNNING cluster.
 #
 # This gate BOOTS NOTHING itself: $KUBECONFIG must point at a live `k3sm server`
 # that was started with the HIGH-PORT ingress listener — the integration tier:
@@ -11,7 +11,7 @@
 # The privileged :80/:443 leg — the netd-authorized bind on the node InternalIP,
 # granted because the canonical kube-system/k3sm-ingress LoadBalancer Service
 # declares those ports — is asserted when the gate runs at the privileged ports
-# on the rig (INGRESS_HTTP_PORT=80 INGRESS_HTTPS_PORT=443, the server started
+# on the lab host (INGRESS_HTTP_PORT=80 INGRESS_HTTPS_PORT=443, the server started
 # without the high-port flags). The address probed is the node that serves the
 # ingress listener: the one the k3sm-ingress LoadBalancer status names, else the
 # control-plane node.
@@ -121,7 +121,7 @@ fi
 [ -n "$NODE_NAME" ] || { echo "could not resolve the node serving the ingress listener" >&2; exit 1; }
 NODE_IP="$(kc get node "$NODE_NAME" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')"
 [ -n "$NODE_IP" ] || { echo "could not resolve the InternalIP of node $NODE_NAME" >&2; exit 1; }
-echo "==> k3sm M10.3 ingress acceptance (node $NODE_NAME $NODE_IP, http :$INGRESS_HTTP_PORT, https :$INGRESS_HTTPS_PORT)"
+echo "==> k3sm ingress acceptance (node $NODE_NAME $NODE_IP, http :$INGRESS_HTTP_PORT, https :$INGRESS_HTTPS_PORT)"
 
 # 1. The IngressClass k3sm is provisioned with the k3sm controller.
 if [ "$(kc get ingressclass k3sm -o jsonpath='{.spec.controller}' 2>/dev/null)" = "k3sm.io/ingress" ]; then
@@ -227,7 +227,7 @@ else
 	ladder no "m10.3-5b svclb splice nodeIP:18080 -> ClusterIP VIP -> backend"
 fi
 
-# 6. TLS from a Secret terminates (M10.3-a1): a throwaway self-signed pair for
+# 6. TLS from a Secret terminates: a throwaway self-signed pair for
 #    the test host in a kubernetes.io/tls Secret, named by the Ingress tls[]
 #    entry; SNI on the https port must serve exactly that certificate and route
 #    to the backend. The ingress terminates TLS only for hosts a tls[] entry names.
@@ -261,6 +261,6 @@ else
 fi
 
 echo "----------------------------------------"
-echo "M10.3 ingress: $PASS passed, $FAIL failed"
+echo "ingress: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "=========== M10.3 INGRESS GREEN ==========="
+echo "=========== INGRESS GREEN ==========="

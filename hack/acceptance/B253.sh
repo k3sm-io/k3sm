@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# k3sm B253 acceptance gate — the runnable proof that a node which exits closes
+# k3sm node exit acceptance gate — the runnable proof that a node which exits closes
 # the runtime it embedded, inside its derived ExitTimeOut.
 #
-# SUPERSEDED IN PART (B713): vm pods now survive a daemon restart like native
+# SUPERSEDED IN PART: vm pods now survive a daemon restart like native
 # pods. The runtime's Close detaches every k3sm-vmhost instead of stopping it,
 # and the next start re-attaches it, so the lab tier below now proves the
 # opposite of its first form: a bootout leaves every helper RUNNING, and the
@@ -17,7 +17,7 @@
 # Every vm pod's k3sm-vmhost therefore survived the daemon that booted it, holding
 # the data root open (it is the server plist's WorkingDirectory), and the next
 # `diskutil unmount` of the data root was dissented by the orphan helper's pid
-# (observed on the rig 2026-09-06, worked around inside status.sh's destructive
+# (observed on the lab host 2026-09-06, worked around inside status.sh's destructive
 # tier). Native host-process pods are deliberately untouched by the stop: they
 # survive a daemon restart by design and the next start's pod reap reconciles
 # them, while a vm guest never does.
@@ -67,7 +67,7 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 lab_pending() { echo "LAB-PENDING  $1"; }
 
-echo "==> k3sm B253 acceptance (the node closes its embedded runtime inside its ExitTimeOut)"
+echo "==> k3sm node exit acceptance (the node closes its embedded runtime inside its ExitTimeOut)"
 
 # ---- b253.0 — the gate parses and its sources exist -------------------------
 b0=ok
@@ -80,8 +80,8 @@ b0=ok
 ladder "$b0" "b253.0  gate parses (bash -n) + cmd/k3sm/node.go, its exit test, pkg/provider/runtimed{,_attach}.go and pkg/install/plist.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B253: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B253: $PASS passed, $FAIL failed" >&2
+	echo "node exit: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
+	echo "node exit: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -265,7 +265,7 @@ else
 		sudo launchctl kickstart -k system/io.k3sm.server >/dev/null 2>&1 || true
 	}
 
-	# NON-VACUITY GATE. With no vm pod on the rig there is no helper to keep, so
+	# NON-VACUITY GATE. With no vm pod on the lab host there is no helper to keep, so
 	# the survival assertion would pass on any build. The tier refuses to report a
 	# pass it did not earn.
 	before="$(pgrep -x k3sm-vmhost 2>/dev/null | tr '\n' ' ' || true)"
@@ -331,10 +331,10 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B253: $PASS passed, $FAIL failed"
+echo "node exit: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 if [ "${K3SM_LAB:-}" = 1 ]; then
-	echo "================ B253 GREEN (CI + lab tiers) ================"
+	echo "================ node exit GREEN (CI + lab tiers) ================"
 else
-	echo "================ B253 GREEN (CI tier; the lab tier needs K3SM_LAB=1, root and a vm pod) ================"
+	echo "================ node exit GREEN (CI tier; the lab tier needs K3SM_LAB=1, root and a vm pod) ================"
 fi

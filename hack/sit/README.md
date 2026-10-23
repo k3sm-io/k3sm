@@ -92,7 +92,7 @@ Two root reasons appear in `criteria.env`:
 - **uid-drop** — `setuid-uid-drop`: setuid to a foreign uid, root-only **even
   with the netd helper installed**. Seatbelt self-confinement needs **neither**,
   so `DenyUsers`/profile-integrity is a **rootless** (T0) criterion. **No
-  criterion carries this reason today**: since B153 the `k3sm-reject-foreign-user`
+  criterion carries this reason today**: since the admission fix the `k3sm-reject-foreign-user`
   ValidatingAdmissionPolicy is provisioned in every posture, so a pod asking for a
   foreign uid/gid is refused at the API and never reaches a `setuid`.
 
@@ -101,7 +101,7 @@ SIT runs them under `direct`, which gives the same **datapath** pod-view (real p
 IPs, real ClusterIP) — T1 is the full-posture run.
 
 The two topologies were **not** the same for **admission**, and that gap is what
-hid B153: the `k3sm-reject-foreign-user` policy was provisioned only under the
+hid that fix: the `k3sm-reject-foreign-user` policy was provisioned only under the
 helper backend, so `none` (T0) and `direct` (T1) ran with the object absent and
 `M2_FsGroup` was red on real hardware for a reason no criterion field expressed.
 It is now provisioned in every posture, which is why that criterion is `rootless`
@@ -166,7 +166,7 @@ proof.
 ## Scope
 
 - **Single node only.** Cross-node mesh/DNS/HA criteria are `multi-node-deferred`
-  (they run on a two-Mac rig, `hack/lab/`, not here).
+  (they run on a two-Mac lab, `hack/lab/`, not here).
 - **A diagnostic, not a milestone gate.** The SIT has **no `phases.json` row**
   (a `manual:false` euid-gated row is unmodeled by the `(manual, skeleton)`
   honesty schema and would let an orchestrator read exit-0-on-T0 as "datapath

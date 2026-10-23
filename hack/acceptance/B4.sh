@@ -15,7 +15,7 @@
 #   :10250 kubelet, :10259 scheduler, :10257 controller-manager). It uses
 #   apiserver :6454, kine :2394, kubelet :10350, scheduler :10364 and
 #   controller-manager :10362 (the B4_*_PORT knobs below override each), the same
-#   off-default band B213's lab tier boots in, and taken by no other gate. Then it
+#   off-default band the kubelet-serving-cert lab tier boots in, and taken by no other gate. Then it
 #   runs the build-tagged e2e/TestB4_InProcessNodeIdentityScoped against it:
 #     leg 1  the node's Lease and nodes/status are written by system:node:<node>
 #            (system:nodes), and by nobody else afterwards. RED on a build whose
@@ -125,7 +125,7 @@ if [ "${K3SM_LAB:-}" != 1 ]; then
 	summary integration
 	[ "$FAIL" -eq 0 ] || exit 1
 	echo "B4 integration tier GREEN"
-	echo "LAB-PENDING: rig legs not run (set K3SM_LAB=1)"
+	echo "LAB-PENDING: lab legs not run (set K3SM_LAB=1)"
 	exit 3
 fi
 

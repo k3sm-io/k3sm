@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B122 acceptance gate — digest-pinned image constants and the two checks that keep
+# k3sm image pin acceptance gate — digest-pinned image constants and the two checks that keep
 # them honest.
 #
 #   pkg/images            the pins, plus Lockstep (constants <-> hack/images/mirror.yaml)
@@ -30,7 +30,7 @@ ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "==> k3sm B122 acceptance (image pins: lockstep + live verifier)"
+echo "==> k3sm image pin acceptance (image pins: lockstep + live verifier)"
 
 # ---- b122.0 — the artifacts exist -------------------------------------------
 for f in "$MANIFEST" "$SCRIPT" "$K3SM_ROOT/pkg/images/pins.go" "$K3SM_ROOT/pkg/images/doc.go"; do
@@ -47,7 +47,7 @@ else
 fi
 if [ "$FAIL" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "B122: $PASS passed, $FAIL failed (artifacts absent — red at main by construction)" >&2
+	echo "image pin: $PASS passed, $FAIL failed (artifacts absent — red at main by construction)" >&2
 	exit 1
 fi
 
@@ -209,6 +209,6 @@ KNOWN-UNPROVEN HERE:
     (an unused constant is still a registered constant).
 UNPROVEN
 echo "----------------------------------------"
-echo "B122: $PASS passed, $FAIL failed"
+echo "image pin: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B122 GREEN ================"
+echo "================ image pin GREEN ================"

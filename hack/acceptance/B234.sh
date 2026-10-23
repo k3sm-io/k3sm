@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k3sm B234 acceptance: projected volumes refresh at the kubelet cadence, against
+# k3sm projected volume refresh acceptance: projected volumes refresh at the kubelet cadence, against
 # an INSTALLED, RUNNING node (`sudo k3sm install` on this Mac, a live cluster at
 # $KUBECONFIG). This gate boots nothing itself.
 #
@@ -44,13 +44,13 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 finish() {
 	echo "----------------------------------------"
-	echo "B234: $PASS passed, $FAIL failed"
+	echo "projected volume refresh: $PASS passed, $FAIL failed"
 	[ "$FAIL" -eq 0 ] || exit 1
-	echo "=========== B234 GREEN ==========="
+	echo "=========== projected volume refresh GREEN ==========="
 }
 
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "B234 gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
+	echo "projected volume refresh gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
 	exit 3
 fi
 if [ -z "${KUBECONFIG:-}" ]; then
@@ -80,7 +80,7 @@ if ! kc get node "$NODE_NAME" >/dev/null 2>&1; then
 	echo "node $NODE_NAME is not in the cluster: this gate pins its pod to THIS Mac's node (set K3SM_NODE_NAME to override)" >&2
 	exit 1
 fi
-echo "==> B234 acceptance (node $NODE_NAME, run $RUN)"
+echo "==> projected volume refresh acceptance (node $NODE_NAME, run $RUN)"
 
 # configmap <name> <value> [immutable]
 configmap() {
@@ -113,7 +113,7 @@ READER="$(cat <<'EOF'
         read -r t < /b234/tok/token
         [ -L /b234/cfg/..data ] && d=yes
         p=${t#*.}; p=${p%%.*}
-        echo "B234 cfg=$c sub=$s sec=$e imm=$i gone=$g data=$d tok=$p"
+        echo "refresh cfg=$c sub=$s sec=$e imm=$i gone=$g data=$d tok=$p"
         sleep 5
       done
 EOF
@@ -153,7 +153,7 @@ $READER
 EOF
 
 # line: the pod's latest reader line. field <name> <line>: one value from it.
-line() { kc logs "$POD" -n "$NS" --tail=20 2>/dev/null | grep '^B234 ' | tail -1 || true; }
+line() { kc logs "$POD" -n "$NS" --tail=20 2>/dev/null | grep '^refresh ' | tail -1 || true; }
 field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<"$2"; }
 # jwt_exp <payload segment>: the exp claim of a base64url JWT payload.
 jwt_exp() {

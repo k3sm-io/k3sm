@@ -28,14 +28,14 @@ trap cleanup EXIT
 echo "==> k3sm M1 acceptance (k3sm server: embedded-by-supervision control plane + node)"
 server_up k3sm-m1 hostprocess
 
-# M1.1 — the control plane the executor brought up is serving.
+# the control plane the executor brought up is serving.
 if [ "$(kc get --raw /healthz 2>/dev/null)" = "ok" ]; then
 	ladder ok "m1.1  k3sm server control plane healthy (/healthz ok)"
 else
 	ladder no "m1.1  k3sm server control plane healthy (/healthz ok)"
 fi
 
-# KCM scoping — the endpointslice controller is enabled (M1.4 depends on it),
+# KCM scoping — the endpointslice controller is enabled (the service-exposure rung depends on it),
 # node-side controllers dropped. We verify behaviorally via the e2e endpoint
 # assertion below; here we just confirm the controller-manager is alive.
 if pgrep -f "$SERVER_WORKDIR/bin/kube-controller-manager" >/dev/null 2>&1; then
@@ -44,7 +44,7 @@ else
 	ladder no "m1.1  controller-manager running (scoped --controllers)"
 fi
 
-# M1.2/M1.3/M1.4 — the typed e2e suite drives image->Running, expose->ClusterIP
+# the typed e2e suite drives image->Running, expose->ClusterIP
 # (+EndpointSlice), and the DNS Service check against the live `k3sm server`.
 # The -run pattern is ANCHORED. `-run TestM1` is a REGEX, not a prefix match, so it
 # also selects every TestM10_* test in the suite -- which is how this gate came to
@@ -56,7 +56,7 @@ else
 	ladder no "m1.A  image->Running + expose->ClusterIP + DNS Service (e2e TestM1)"
 fi
 
-# M1.2 — the os=darwin admission policy rejects a non-darwin pod (intent guard).
+# the os=darwin admission policy rejects a non-darwin pod (intent guard).
 if kc apply -f - >/dev/null 2>&1 <<'EOF'
 apiVersion: v1
 kind: Pod

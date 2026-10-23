@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm M14.2 acceptance gate — the runnable proof that `k3sm server --mesh-ip`
+# k3sm acceptance gate — the runnable proof that `k3sm server --mesh-ip`
 # JOINS THE MESH IT HOSTS, and that wiring its mesh-egress source into the Service
 # proxy does not break the backend dials the old unconditional bind would have.
 #
@@ -9,10 +9,10 @@
 # worker had an AllowedIPs route to its /24, and the server's own Service proxy was
 # left with MeshEgressIP deliberately EMPTY — because the proxy bound that source
 # on EVERY dial, and a non-local value there broke all backend dials, including
-# same-node loopback. M14.2 fixes both halves: the server enrolls itself at index 0
+# same-node loopback. fixes both halves: the server enrolls itself at index 0
 # (k3sm, this gate) and the source bind becomes destination-scoped (darwin-net).
 #
-# WHY THIS GATE EXISTS SEPARATELY FROM m3.sh (plan R4): hack/acceptance/m3.sh boots
+# WHY THIS GATE EXISTS SEPARATELY FROM m3.sh: hack/acceptance/m3.sh boots
 # WITHOUT --mesh-ip. It therefore cannot exercise a single line of this change, and
 # citing it as regression evidence for the hazard would be vacuous. The hazard proof
 # has to live in a gate that sets --mesh-ip, which is this one.
@@ -54,7 +54,7 @@
 # WHAT THIS GATE DOES NOT PROVE: a cross-node datapath. One Mac has no second
 # machine to route between, so the actual wireguard egress path — the one this
 # defect class has historically hidden in — is the two-Mac hack/lab/m3.sh slice,
-# which M14.2 unblocks and M14.3/M14.4 run. Announced as LAB-PENDING below, never
+# which unblocks and the later two-Mac sessions run. Announced as LAB-PENDING below, never
 # counted as a pass.
 #
 # Usage:  hack/acceptance/m14-servermesh.sh                 # CI tier only
@@ -84,7 +84,7 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 lab_pending() { echo "LAB-PENDING  $1"; }
 
-echo "==> k3sm M14.2 acceptance (the server joins its own mesh; scoped mesh-egress does not break backend dials)"
+echo "==> k3sm acceptance (the server joins its own mesh; scoped mesh-egress does not break backend dials)"
 
 # ---- m14.0 — the gate parses and its wiring sources exist -------------------
 b0=ok
@@ -95,8 +95,8 @@ done
 ladder "$b0" "m14.0  gate parses (bash -n) + cmd/k3sm/{server,agent,enroll,servermesh}.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "M14.2: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
-	echo "M14.2: $PASS passed, $FAIL failed" >&2
+	echo "server mesh: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
+	echo "server mesh: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -105,7 +105,7 @@ fi
 # mesh-egress source is only safe to wire because the proxy's dial-source bind is
 # DESTINATION-SCOPED there. The two halves meet only through the workspace go.work,
 # so a standalone k3sm clone cannot prove this gate — its absence is a hard FAIL,
-# never a skip, or "M14.2 green" would mean "M14.2 was not checked".
+# never a skip, or "green" would mean "server mesh was not checked".
 if [ -f "$WS_ROOT/go.work" ] && [ -d "$WS_ROOT/darwin-net/pkg/proxy" ]; then
 	ladder ok "m14.pre  workspace go.work + sibling darwin-net/pkg/proxy present"
 else
@@ -113,7 +113,7 @@ else
 fi
 if [ "$FAIL" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "M14.2: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
+	echo "server mesh: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
 	exit 1
 fi
 
@@ -254,21 +254,21 @@ run_test "m14.7" 0 TestRunServerEnsuresTheMeshIPAliasBeforeTheControlPlane ./cmd
 
 # ---- m14.6 — the darwin-net half, under -race ------------------------------
 # The scoping decision tables (foreign /24 ⇒ bound; own /24, loopback, node LAN,
-# ClusterIP VIP, LocalityUnknown ⇒ unbound, for BOTH TCP and UDP) are M14.2-d1's
+# ClusterIP VIP, LocalityUnknown ⇒ unbound, for BOTH TCP and UDP) are the scoped dial source's
 # and live in darwin-net. This gate CITES them by running that package rather than
 # re-implementing a copy here: the source-bind decision must have exactly one home,
 # and a second table in this repo would drift from the dialer it describes. The
 # whole package runs under -race because the containment being proven is a
-# per-connection shared-state property — the failure mode the plan names is a
+# per-connection shared-state property — the failure mode of concern is a
 # mutation of the shared dialer's LocalAddr across the per-connection goroutines,
 # which only -race and concurrency together can see.
 dn_out=""; dn_rc=0
 dn_out="$(cd "$K3SM_ROOT" && "${GOFLAGS_ENV[@]}" go test -count=1 -race k3sm.io/darwin-net/pkg/proxy 2>&1)" || dn_rc=$?
 if [ "$dn_rc" -eq 0 ]; then
-	ladder ok "m14.6  darwin-net/pkg/proxy passes under -race (the destination-scoped dial-source tables, M14.2-d1)"
+	ladder ok "m14.6  darwin-net/pkg/proxy passes under -race (the destination-scoped dial-source tables)"
 else
 	printf '%s\n' "$dn_out" | tail -30
-	ladder no "m14.6  darwin-net/pkg/proxy passes under -race — M14.2-d1 (the scoped dial source) is the other half of this sub-phase; the server's mesh-egress wiring is only safe with it"
+	ladder no "m14.6  darwin-net/pkg/proxy passes under -race — the scoped dial source is the other half of this sub-phase; the server's mesh-egress wiring is only safe with it"
 fi
 
 # ============================================================================
@@ -277,7 +277,7 @@ fi
 # ============================================================================
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "M14.2 ROOT tier (run: sudo K3SM_LAB=1 $0):"
+	echo "ROOT tier (run: sudo K3SM_LAB=1 $0):"
 	lab_pending "m14.L0  \`k3sm server --mesh-ip $SELF_MESH_IP --network direct\` (built -race) reaches a healthy apiserver — a REAL mesh IP, which nothing plumbs unless bring-up ensures the lo0 alias first"
 	lab_pending "m14.L1  the index-0 MeshPeer exists: name=<node>, podCIDR=$SELF_POD_CIDR, meshIP=$SELF_MESH_IP, non-empty publicKey (RED before: no such object at all)"
 	lab_pending "m14.L2  the mesh-egress lo0 alias $SELF_MESH_IP is plumbed and a utun carries the mesh link address $SELF_LINK_IP (the device is up)"
@@ -287,17 +287,17 @@ if [ "${K3SM_LAB:-}" != 1 ]; then
 	lab_pending "m14.L5  the -race build reports no DATA RACE across the concurrent local/remote dials"
 	lab_pending "m14.L6  [two-Mac harness] cross-node pod traffic actually traverses the mesh — hack/lab/m3.sh, NOT proven on one Mac"
 	echo "----------------------------------------"
-	echo "M14.2: $PASS passed, $FAIL failed"
+	echo "server mesh: $PASS passed, $FAIL failed"
 	[ "$FAIL" -eq 0 ] || exit 1
-	echo "================ M14.2 GREEN (CI tier; the root tier is owed) ================"
+	echo "================ server mesh GREEN (CI tier; the root tier is owed) ================"
 	exit 0
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "M14.2 ROOT tier requires root for --network direct (utun + lo0 aliases) — run: sudo K3SM_LAB=1 $0" >&2
+	echo "ROOT tier requires root for --network direct (utun + lo0 aliases) — run: sudo K3SM_LAB=1 $0" >&2
 	echo "Refusing to report a K3SM_LAB run green without it: this row is manual:true in phases.json, so exit 0 here would be read as PROVEN." >&2
-	echo "M14.2: $PASS passed, $FAIL failed" >&2
+	echo "server mesh: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -317,12 +317,12 @@ SERVER_PID=""
 LIB="$K3SM_ROOT/hack/lib/clusterup.sh"
 if [ ! -f "$LIB" ]; then
 	ladder no "m14.L0  hack/lib/clusterup.sh present (required for the root tier)"
-	echo "M14.2: $PASS passed, $FAIL failed" >&2
+	echo "server mesh: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 # clusterup.sh is sourced for RESET and TEARDOWN only — never for bring-up, because
 # server_up cannot pass --network direct together with --mesh-ip on a hostprocess
-# runtime, and M14.2 is exactly about that combination.
+# runtime, and the server mesh is exactly about that combination.
 # shellcheck source=/dev/null
 . "$LIB"
 
@@ -345,14 +345,14 @@ trap m14_down EXIT
 
 if ! cluster_reset; then
 	ladder no "m14.L0  cluster_reset (free this gate's ports + drop the previous datastore)"
-	echo "M14.2: $PASS passed, $FAIL failed" >&2
+	echo "server mesh: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 rm -f "$SERVER_WORKDIR/bin"/*.cstemp
 mkdir -p "$M14_WORK" "$M14_WORK/pod-logs"
 
 echo "----------------------------------------"
-echo "M14.2 ROOT tier: building the -race server binary"
+echo "ROOT tier: building the -race server binary"
 # -race, deliberately. The hazard being contained is a per-connection shared-state
 # property (a mutated shared dialer LocalAddr across the proxy's handle()
 # goroutines), and a functional round trip cannot see it. Under -race, with local-
@@ -360,11 +360,11 @@ echo "M14.2 ROOT tier: building the -race server binary"
 RACE_BIN="$M14_WORK/k3sm-race"
 if ! ( cd "$K3SM_ROOT" && "${GOFLAGS_ENV[@]}" go build -race -o "$RACE_BIN" ./cmd/k3sm ); then
 	ladder no "m14.L0  build a -race k3sm binary"
-	echo "M14.2: $PASS passed, $FAIL failed" >&2
+	echo "server mesh: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
-echo "M14.2 ROOT tier: booting a mesh-path control plane in $M14_WORK"
+echo "ROOT tier: booting a mesh-path control plane in $M14_WORK"
 # --mesh-ip $SELF_MESH_IP: a REAL, non-loopback mesh IP — the index-0 mesh-egress
 # /32 this gate already asserts everywhere else.
 #
@@ -412,7 +412,7 @@ ladder "$up" "m14.L0  \`k3sm server --mesh-ip $SELF_MESH_IP --network direct\` (
 if [ "$up" != ok ]; then
 	tail -40 "$M14_WORK/server.log" >&2
 	echo "----------------------------------------"
-	echo "M14.2: $PASS passed, $FAIL failed" >&2
+	echo "server mesh: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -601,6 +601,6 @@ m14_down
 trap - EXIT
 
 echo "----------------------------------------"
-echo "M14.2: $PASS passed, $FAIL failed"
+echo "server mesh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ M14.2 GREEN (CI + root tiers) ================"
+echo "================ server mesh GREEN (CI + root tiers) ================"

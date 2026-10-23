@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# k3sm B61 acceptance gate — the unit-tier structure proof for the docs/user/*
-# user-documentation IA skeleton (backlog item B61). It is offline and hermetic:
+# k3sm user docs structure acceptance gate — the unit-tier structure proof for the docs/user/*
+# user-documentation IA skeleton. It is offline and hermetic:
 # no network, no markdown linter, no control plane. It asserts, red-at-main
 # (docs/user/ absent) via an explicit ladder FAIL line and green-after:
 #
@@ -34,13 +34,13 @@ USERDIR="$REPO_ROOT/docs/user"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B61 acceptance (docs/user IA skeleton + structure/link lint)"
+echo "==> k3sm user docs structure acceptance (docs/user IA skeleton + structure/link lint)"
 
 # --- Check 0: docs/user/ present (explicit red-at-main FAIL line) -------------
 if [ -d "$USERDIR" ]; then
-	ladder ok "B61.0  docs/user/ directory present"
+	ladder ok "docs.0  docs/user/ directory present"
 else
-	ladder no "B61.0  docs/user/ directory present (absent at main)"
+	ladder no "docs.0  docs/user/ directory present (absent at main)"
 fi
 
 # --- Check 1: exact-set manifest ---------------------------------------------
@@ -52,16 +52,16 @@ REQUIRED=(
 )
 for f in "${REQUIRED[@]}"; do
 	if [ -f "$USERDIR/$f" ]; then
-		ladder ok "B61.1  required file present: $f"
+		ladder ok "docs.1  required file present: $f"
 	else
-		ladder no "B61.1  required file MISSING: $f"
+		ladder no "docs.1  required file MISSING: $f"
 	fi
 done
 # README index is the link hub / front door.
 if [ -f "$USERDIR/README.md" ]; then
-	ladder ok "B61.1  README.md index present"
+	ladder ok "docs.1  README.md index present"
 else
-	ladder no "B61.1  README.md index MISSING"
+	ladder no "docs.1  README.md index MISSING"
 fi
 
 # --- Check 2: offline relative-link check ------------------------------------
@@ -91,9 +91,9 @@ if [ -d "$USERDIR" ]; then
 	shopt -u nullglob
 fi
 if [ "$dangling" -eq 0 ] && [ -d "$USERDIR" ]; then
-	ladder ok "B61.2  all in-repo relative links resolve (offline)"
+	ladder ok "docs.2  all in-repo relative links resolve (offline)"
 else
-	ladder no "B61.2  $dangling dangling relative link(s) in docs/user/*"
+	ladder no "docs.2  $dangling dangling relative link(s) in docs/user/*"
 fi
 
 # --- Check 3: honest-gaps matrix + citation presence in limitations.md -------
@@ -104,7 +104,7 @@ declare -a GAP_LABELS=(
 	"DNS gap"
 	"UDP Services deferred"
 	"multi-node/HA EXPERIMENTAL"
-	"single-node watch-staleness (B28)"
+	"single-node watch-staleness"
 )
 declare -a GAP_PATTERNS=(
 	"no per-pod uid"
@@ -116,9 +116,9 @@ declare -a GAP_PATTERNS=(
 if [ -f "$LIM" ]; then
 	for i in "${!GAP_PATTERNS[@]}"; do
 		if grep -iEq "${GAP_PATTERNS[$i]}" "$LIM"; then
-			ladder ok "B61.3  limitations gap present: ${GAP_LABELS[$i]}"
+			ladder ok "docs.3  limitations gap present: ${GAP_LABELS[$i]}"
 		else
-			ladder no "B61.3  limitations gap MISSING: ${GAP_LABELS[$i]}"
+			ladder no "docs.3  limitations gap MISSING: ${GAP_LABELS[$i]}"
 		fi
 	done
 	# citation-presence (the conformance CRITICAL): the public self-assessment
@@ -126,12 +126,12 @@ if [ -f "$LIM" ]; then
 	# UPSTREAM-ALIGNMENT.md register was removed from limitations.md by the
 	# public-repo scrub (k3sm#54) and is no longer checked for here.
 	if grep -iq "conformance-profile" "$LIM"; then
-		ladder ok "B61.3  limitations cites conformance-profile register"
+		ladder ok "docs.3  limitations cites conformance-profile register"
 	else
-		ladder no "B61.3  limitations MISSING conformance-profile citation"
+		ladder no "docs.3  limitations MISSING conformance-profile citation"
 	fi
 else
-	ladder no "B61.3  limitations.md absent (gaps + citations uncheckable)"
+	ladder no "docs.3  limitations.md absent (gaps + citations uncheckable)"
 fi
 
 # --- Check 4: stale-string denylist ------------------------------------------
@@ -145,12 +145,12 @@ if [ -d "$USERDIR" ]; then
 	done
 fi
 if [ "$stale" -eq 0 ] && [ -d "$USERDIR" ]; then
-	ladder ok "B61.4  no stale strings (Pre-M0 / private development)"
+	ladder ok "docs.4  no stale strings (Pre-M0 / private development)"
 else
-	ladder no "B61.4  $stale stale string(s) present in docs/user/*"
+	ladder no "docs.4  $stale stale string(s) present in docs/user/*"
 fi
 
 echo "----------------------------------------"
-echo "B61: $PASS passed, $FAIL failed"
+echo "user docs structure: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B61 GREEN ================"
+echo "================ user docs structure GREEN ================"

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# M11.0-d4 / S4 — the guest kernel artifact. Feeds B111; publishes nothing itself.
+# S4 — the guest kernel artifact. Feeds the pinned-kernel work; publishes nothing itself.
 #
 # S4 answers "what config does the shipping kernel need, how big is it, and can
-# it be built reproducibly" — it does NOT produce the artifact. B111 is the
+# it be built reproducibly" — it does NOT produce the artifact. The pinned-kernel work is the
 # human-gated producer, because the digest a human pins IS the guest TCB trust
 # root, and a spike must not be able to mint one.
 set -euo pipefail
@@ -38,14 +38,14 @@ cat <<'EOF'
   kernel — S1 criterion 2b records that rejection, so this is a fact, not a
   guess. A build that emits `Image.gz` has not produced a usable artifact.
 
-  RECORD: the size figure. It is the decision input for B111's
-  bundle-vs-install-ensure question (R23) — a kernel small enough to bundle
+  RECORD: the size figure. It is the decision input for the pinned-kernel work's
+  bundle-vs-install-ensure question — a kernel small enough to bundle
   changes the install story, and that decision is a human's.
 
   BUILD: a containerized, reproducible dry-run. Record the toolchain, the config
   hash, and whether two runs produce identical bytes. Non-reproducible here means
-  the pinned digest B111 publishes cannot be independently re-derived, which
+  the pinned digest the pinned-kernel work publishes cannot be independently re-derived, which
   defeats the point of pinning it.
 EOF
 
-note "S4 — record in findings-s4.md. B111 consumes this; S4 publishes nothing."
+note "S4 — record in findings-s4.md. The pinned-kernel work consumes this; S4 publishes nothing."

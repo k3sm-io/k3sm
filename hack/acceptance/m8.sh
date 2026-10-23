@@ -186,7 +186,7 @@ delete_seed_job() {
 
 # --------------------------------------------------------------------------------
 # --self-test: render the manifest and the seed Job and assert their shape. No
-# cluster, no network. The live legs are run on the rig.
+# cluster, no network. The live legs are run on the lab host.
 # --------------------------------------------------------------------------------
 if [ "${1:-}" = "--self-test" ]; then
 	st_fail=0

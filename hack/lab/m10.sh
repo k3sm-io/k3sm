@@ -35,7 +35,7 @@
 # shimmed shell, so the connect rung source-pins it to the probe's own /32); the
 # replica answers through /usr/bin/nc bound to its own pod IP.
 #
-# Pods follow the lab rig rules: nodeName AND the darwin nodeSelector on the probes,
+# Pods follow the lab rules: nodeName AND the darwin nodeSelector on the probes,
 # the StatefulSet held to the two nodes by required node affinity; tolerations are
 # k3sm.io/provider (keyed) plus only what the operator names; scripts ride a
 # ConfigMap (a native pod cannot read /tmp); Events are selected by involvedObject.uid.

@@ -22,5 +22,5 @@
 # proven". Pinned always-RED by TestNonManualSkeletonsAlwaysRed, which runs it under
 # BOTH K3SM_LAB unset and K3SM_LAB=1.
 set -euo pipefail
-echo "M15 gate: NOT YET IMPLEMENTED — the real M15 composite gate (handler table + ext4-cache integrity + GuestBackend golden dispatch + CLI-free capability probe) lands with M15.2/M15.3. This is a skeleton and MUST be red."
+echo "M15 gate: NOT YET IMPLEMENTED — the real M15 composite gate (handler table + ext4-cache integrity + GuestBackend golden dispatch + CLI-free capability probe) is not written yet. This is a skeleton and MUST be red."
 exit 1

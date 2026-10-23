@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B668 acceptance gate: measure how long a node's daemons and the API
+# k3sm update downtime acceptance gate: measure how long a node's daemons and the API
 # server are unavailable during a managed update (`k3sm update apply`) or an
 # in-place reinstall (`k3sm install`).
 #
@@ -61,7 +61,7 @@ DAEMON_ROW = {"server": "server", "worker": "agent"}
 
 
 def die(msg, code=2):
-    sys.stderr.write("B668: " + msg + "\n")
+    sys.stderr.write("update downtime: " + msg + "\n")
     sys.exit(code)
 
 
@@ -231,7 +231,7 @@ def sample(argv):
     f.close()
     with open(os.path.join(out, "summary-%s.txt" % node), "w") as s:
         s.write(summarize_text(read([path])))
-    print("B668: samples in %s" % path)
+    print("update downtime: samples in %s" % path)
 
 
 # ---- the windows ------------------------------------------------------------
@@ -330,7 +330,7 @@ def summarize_windows(rows):
 def summarize_text(rows):
     t0 = min(r["t_ms"] for r in rows)
     t1 = max(r["t_ms"] for r in rows)
-    out = ["B668 unavailability windows, trace %s .. %s (%.1fs, %d samples)" % (
+    out = ["unavailability windows, trace %s .. %s (%.1fs, %d samples)" % (
         utc(t0), utc(t1), (t1 - t0) / 1000.0, len(rows))]
     role_seen = None
     for (role, node, probe), g, wins in windows(rows):
@@ -395,7 +395,7 @@ self_test() {
 	work="$(mktemp -d "${TMPDIR:-/tmp}/b668.XXXXXX")"
 	# shellcheck disable=SC2064 # expand $work now
 	trap "rm -rf '$work'" EXIT
-	echo "==> k3sm B668 self-test (the unavailability-window measurer)"
+	echo "==> k3sm update downtime self-test (the unavailability-window measurer)"
 
 	if bash -n "$SELF" && command -v python3 >/dev/null 2>&1 && py check; then
 		ladder ok "b668.0  the script parses and its python program compiles"
@@ -471,7 +471,7 @@ self_test() {
 	fi
 
 	echo "----------------------------------------"
-	echo "B668 self-test: $PASS passed, $FAIL failed"
+	echo "update downtime self-test: $PASS passed, $FAIL failed"
 	[ "$FAIL" -eq 0 ]
 }
 
@@ -480,7 +480,7 @@ case "${1:-}" in
 sample)
 	shift
 	if [ "${K3SM_LAB:-}" != 1 ]; then
-		echo "PENDING  B668 sample needs K3SM_LAB=1 on a rig node (see --help)"
+		echo "PENDING  sample needs K3SM_LAB=1 on a rig node (see --help)"
 		exit 2
 	fi
 	py sample "$@"

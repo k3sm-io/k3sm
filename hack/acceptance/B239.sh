@@ -2,7 +2,7 @@
 # Copyright The k3sm Authors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# k3sm B239 acceptance: inside one vm Pod, a volume that no container mounts is
+# k3sm unmounted-volume acceptance: inside one vm Pod, a volume that no container mounts is
 # out of every container's reach, against an INSTALLED, RUNNING node
 # (`sudo k3sm install` on this Mac, a live cluster at $KUBECONFIG). This gate
 # boots nothing itself.
@@ -286,17 +286,17 @@ fi
 #    reads the volumes the Pod's containers mount (the token at <tag>/token/token,
 #    the positive control for leg 2's path), but a volume that no container
 #    mounts is never staged into the guest, so its marker is not on the device.
-ceil6="$(kx a "d=\$(mktemp -d) && mount -t virtiofs $SHARE_TAG \"\$d\" && { h=\$($(search_script "\$d" "$MU")); t=\$(wc -c < \"\$d/token/token\" 2>/dev/null || echo 0); umount \"\$d\"; echo \"B239-TOKEN=\$t\"; [ -n \"\$h\" ] && echo B239-UNMOUNTED-FOUND; }; true")" || true
-tok6="$(sed -n 's/^B239-TOKEN=//p' <<<"$ceil6" | tr -d ' ')"
-if [ "${tok6:-0}" -gt 0 ] 2>/dev/null && ! grep -qx "B239-UNMOUNTED-FOUND" <<<"$ceil6"; then
+ceil6="$(kx a "d=\$(mktemp -d) && mount -t virtiofs $SHARE_TAG \"\$d\" && { h=\$($(search_script "\$d" "$MU")); t=\$(wc -c < \"\$d/token/token\" 2>/dev/null || echo 0); umount \"\$d\"; echo \"UNMOUNTED-TOKEN=\$t\"; [ -n \"\$h\" ] && echo UNMOUNTED-FOUND; }; true")" || true
+tok6="$(sed -n 's/^UNMOUNTED-TOKEN=//p' <<<"$ceil6" | tr -d ' ')"
+if [ "${tok6:-0}" -gt 0 ] 2>/dev/null && ! grep -qx "UNMOUNTED-FOUND" <<<"$ceil6"; then
 	ladder ok "b239-6  ceiling holds as documented: uid 0 in a mounts the $SHARE_TAG device and reads the mounted token at <tag>/token/token, and the unmounted volume is not on it"
 else
 	ladder no "b239-6  ceiling changed: (got: $(tr '\n' ' ' <<<"$ceil6" | cut -c1-200)); update limitations.md and this leg together"
 fi
 
 # 8. Self-check: the leg-3 search finds a marker that is present.
-self8="$(kx b "h=\$($(search_script / "$MB")); [ -n \"\$h\" ] && echo B239-FOUND")" || true
-if grep -qx "B239-FOUND" <<<"$self8"; then
+self8="$(kx b "h=\$($(search_script / "$MB")); [ -n \"\$h\" ] && echo UNMOUNTED-FOUND")" || true
+if grep -qx "UNMOUNTED-FOUND" <<<"$self8"; then
 	ladder ok "b239-8  self-check: the leg-3 search finds b's marker in b's tree, so it is not vacuous"
 else
 	ladder no "b239-8  self-check: the leg-3 search found nothing in b, so leg 3 proves nothing"

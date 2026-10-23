@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B274 acceptance gate — the runnable proof that `sudo k3sm uninstall`
+# k3sm uninstall pf anchor acceptance gate — the runnable proof that `sudo k3sm uninstall`
 # clears the mesh's MSS-clamp pf anchor (darwin-net's mesh.PFAnchor,
 # "io.k3sm.mesh"), rather than leaving it loaded against a utun interface
 # number that no longer exists. (The mesh no longer loads that anchor; the
@@ -53,7 +53,7 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 lab_pending() { echo "LAB-PENDING  $1"; }
 
-echo "==> k3sm B274 acceptance (uninstall flushes the mesh pf anchor)"
+echo "==> k3sm uninstall pf anchor acceptance (uninstall flushes the mesh pf anchor)"
 
 # ---- b274.0 — the gate parses and its sources exist -------------------------
 b0=ok
@@ -63,8 +63,8 @@ b0=ok
 ladder "$b0" "b274.0  gate parses (bash -n) + pkg/install/install.go + install_darwin.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B274: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B274: $PASS passed, $FAIL failed" >&2
+	echo "uninstall pf anchor: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
+	echo "uninstall pf anchor: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -123,7 +123,7 @@ ladder "$v" "b274.3  go vet is clean over pkg/install (CGO_ENABLED=1)"
 # ============================================================================
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "B274 LAB tier (a Mac with k3sm installed, root; set K3SM_LAB=1 to run):"
+	echo "LAB tier (a Mac with k3sm installed, root; set K3SM_LAB=1 to run):"
 	lab_pending "b274.L0  after \`sudo k3sm uninstall\`, \`sudo pfctl -a io.k3sm.mesh -sr\` prints no rules (anchor absent is also a pass)"
 	echo
 	echo "  DESTRUCTIVE: this rung runs \`sudo k3sm uninstall\` on the host it is invoked"
@@ -131,7 +131,7 @@ if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "  need running k3sm right now."
 else
 	echo "----------------------------------------"
-	echo "B274 LAB tier: running \`sudo k3sm uninstall\` on this host (root; DESTRUCTIVE — no reinstall follows)"
+	echo "LAB tier: running \`sudo k3sm uninstall\` on this host (root; DESTRUCTIVE — no reinstall follows)"
 
 	l0=ok
 	if ! command -v k3sm >/dev/null 2>&1 && [ ! -x /usr/local/bin/k3sm ]; then
@@ -153,10 +153,10 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B274: $PASS passed, $FAIL failed"
+echo "uninstall pf anchor: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 if [ "${K3SM_LAB:-}" = 1 ]; then
-	echo "================ B274 GREEN (CI + lab tiers) ================"
+	echo "================ uninstall pf anchor GREEN (CI + lab tiers) ================"
 else
-	echo "================ B274 GREEN (CI tier; the lab tier needs K3SM_LAB=1, root, and a real install) ================"
+	echo "================ uninstall pf anchor GREEN (CI tier; the lab tier needs K3SM_LAB=1, root, and a real install) ================"
 fi

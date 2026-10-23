@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm M7.0 sub-gate — B28: the single-node watch-staleness soak.
+# k3sm soak sub-gate: the single-node watch-staleness soak.
 #
 # THE QUESTION
 #
@@ -299,7 +299,7 @@ assert_pin() {
 # gate's own red-path proof) exercise the refusal against any work dir.
 if [ "${1:-}" = "--check-pin" ]; then
 	if [ -z "${2:-}" ]; then echo "usage: $0 --check-pin <workdir>" >&2; exit 2; fi
-	echo "==> B28 soak: kine pin witnesses for work dir $2"
+	echo "==> soak: kine pin witnesses for work dir $2"
 	if assert_pin "$2"; then
 		echo "PIN OK"
 		exit 0
@@ -315,7 +315,7 @@ if [ "$DURATION_S" -le 0 ]; then echo "K3SM_SOAK_DURATION must be positive" >&2;
 if [ "$TIMEOUT_MS" -lt 0 ]; then echo "K3SM_SOAK_PROBE_TIMEOUT must be non-negative" >&2; exit 2; fi
 
 for tool in curl perl go lsof; do
-	command -v "$tool" >/dev/null 2>&1 || { echo "B28 soak needs $tool on PATH" >&2; exit 2; }
+	command -v "$tool" >/dev/null 2>&1 || { echo "soak needs $tool on PATH" >&2; exit 2; }
 done
 
 WORK="$(mktemp -d /tmp/b28-soak.XXXXXX)"
@@ -342,7 +342,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "==> k3sm B28 watch-staleness soak (single node, consistent LIST after a committed write under churn)"
+echo "==> k3sm watch-staleness soak (single node, consistent LIST after a committed write under churn)"
 
 # ── s0 — the shipped pin, before anything boots ──────────────────────────────
 WANT_PIN="$(source_pin)"
@@ -359,7 +359,7 @@ export GOMODCACHE="${GOMODCACHE:-$(go env GOMODCACHE)}"
 
 echo "==> building k3sm (CGO_ENABLED=1)"
 ( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$K3SM_BIN" ./cmd/k3sm ) \
-	|| { echo "B28 soak: building k3sm failed" >&2; exit 1; }
+	|| { echo "soak: building k3sm failed" >&2; exit 1; }
 
 # Pre-warm the pinned kine build OUTSIDE the boot. The server builds kine from source
 # on first use, inside `dev up`'s 90s kubeconfig deadline; on a cold Go build cache
@@ -372,20 +372,20 @@ echo "==> building k3sm (CGO_ENABLED=1)"
 # leaves behind that matters is the shared GOCACHE/GOMODCACHE.
 echo "==> pre-warming the pinned kine build (kine $WANT_PIN, CGO_ENABLED=0) — first run compiles, later runs are a cache hit"
 if ! "$K3SM_BIN" payload --kine-only "$WORK/kine-prewarm" >"$WORK/kine-build.log" 2>&1; then
-	echo "B28 soak: pre-warming the kine build failed — the in-boot build would fail the same way:" >&2
+	echo "soak: pre-warming the kine build failed — the in-boot build would fail the same way:" >&2
 	tail -20 "$WORK/kine-build.log" >&2
 	exit 1
 fi
 
 # ── pre-flight: the datastore port must be OURS to take ──────────────────────
 KINE_PORT="$(sed -nE 's/^[[:space:]]*DefaultKinePort[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$EXEC_PKG/executor.go" | head -1)"
-[ -n "$KINE_PORT" ] || { echo "B28 soak: could not read executor.DefaultKinePort" >&2; exit 1; }
+[ -n "$KINE_PORT" ] || { echo "soak: could not read executor.DefaultKinePort" >&2; exit 1; }
 holder="$(lsof -nP -iTCP:"$KINE_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
 if [ -n "$holder" ]; then
-	echo "B28 soak: REFUSING to boot — :$KINE_PORT (the fixed kine port every k3sm server uses) is already held:" >&2
+	echo "soak: REFUSING to boot — :$KINE_PORT (the fixed kine port every k3sm server uses) is already held:" >&2
 	ps -o pid=,args= -p "$holder" 2>/dev/null | cut -c1-200 >&2 || true
-	echo "B28 soak: a soak booted over it would come up against THAT datastore and certify the wrong kine." >&2
-	echo "B28 soak: free the port first (e.g. \`k3sm dev down --name <that instance>\`) and re-run." >&2
+	echo "soak: a soak booted over it would come up against THAT datastore and certify the wrong kine." >&2
+	echo "soak: free the port first (e.g. \`k3sm dev down --name <that instance>\`) and re-run." >&2
 	exit 1
 fi
 # The kubelet API port is not load-bearing for a datastore verdict, so a foreign
@@ -408,14 +408,14 @@ dump_boot_log() {
 		tail -15 "$BOOT_LOG" >&2
 		echo "------------------------------------------------------------" >&2
 	else
-		echo "B28 soak: no server log at $BOOT_LOG — the server never started" >&2
+		echo "soak: no server log at $BOOT_LOG — the server never started" >&2
 	fi
 }
 
 echo "==> booting a disposable rootless dev instance ($K3SM_SOAK_INSTANCE)"
 BOOTED=1   # set BEFORE the attempt: a half-up instance still has to be torn down
 if ! "$K3SM_BIN" dev up --name "$K3SM_SOAK_INSTANCE" --kubeconfig "$KUBECONFIG_FILE"; then
-	echo "B28 soak: \`k3sm dev up\` failed — no cluster to soak" >&2
+	echo "soak: \`k3sm dev up\` failed — no cluster to soak" >&2
 	dump_boot_log
 	# ONE retry, and only for the one failure that is genuinely transient: a cold Go
 	# module cache. The server builds the pinned kine on first use, and downloading its
@@ -423,12 +423,12 @@ if ! "$K3SM_BIN" dev up --name "$K3SM_SOAK_INSTANCE" --kubeconfig "$KUBECONFIG_F
 	# modules are cached and the next boot skips the download entirely. Any other
 	# failure is a real failure and is NOT retried; there is no loop here on purpose.
 	if grep -qE 'go: downloading|build kine .*signal: terminated' "$BOOT_LOG" 2>/dev/null; then
-		echo "B28 soak: RETRYING ONCE — the boot log shows the first-use kine build (module" >&2
-		echo "B28 soak: download or compile) outrunning the 90s kubeconfig deadline. The Go" >&2
-		echo "B28 soak: caches are warmer now; this is the single sanctioned retry." >&2
+		echo "soak: RETRYING ONCE — the boot log shows the first-use kine build (module" >&2
+		echo "soak: download or compile) outrunning the 90s kubeconfig deadline. The Go" >&2
+		echo "soak: caches are warmer now; this is the single sanctioned retry." >&2
 		"$K3SM_BIN" dev down --name "$K3SM_SOAK_INSTANCE" --kubeconfig "$KUBECONFIG_FILE" >/dev/null 2>&1 || true
 		if ! "$K3SM_BIN" dev up --name "$K3SM_SOAK_INSTANCE" --kubeconfig "$KUBECONFIG_FILE"; then
-			echo "B28 soak: the retry failed too — this is not a cold-cache problem" >&2
+			echo "soak: the retry failed too — this is not a cold-cache problem" >&2
 			dump_boot_log
 			exit 1
 		fi
@@ -442,7 +442,7 @@ fi
 INSTANCE_JSON="$HOME/.k3sm/dev/$K3SM_SOAK_INSTANCE/instance.json"
 WORKDIR="$(sed -nE 's/.*"workDir"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$INSTANCE_JSON" 2>/dev/null | head -1 || true)"
 if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
-	echo "B28 soak: could not read the instance work dir out of $INSTANCE_JSON" >&2
+	echo "soak: could not read the instance work dir out of $INSTANCE_JSON" >&2
 	exit 1
 fi
 SERVER_LOG="$WORKDIR/server.log"
@@ -463,17 +463,17 @@ if assert_pin "$WORKDIR" "$PROBE_KINE_PORT"; then
 else
 	ladder no "s1  the soak is running against the shipped kine pin (witnesses disagree — see above)"
 	echo "----------------------------------------"
-	echo "B28: REFUSING to soak — a staleness verdict against an unidentified kine certifies nothing." >&2
-	echo "B28: $PASS passed, $FAIL failed" >&2
+	echo "soak: REFUSING to soak — a staleness verdict against an unidentified kine certifies nothing." >&2
+	echo "soak: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
 # ── API access ───────────────────────────────────────────────────────────────
 KCFG="$WORKDIR/k3sm.kubeconfig"
-[ -f "$KCFG" ] || { echo "B28 soak: no server kubeconfig at $KCFG" >&2; exit 1; }
+[ -f "$KCFG" ] || { echo "soak: no server kubeconfig at $KCFG" >&2; exit 1; }
 API_PORT="$(awk -F'127.0.0.1:' '/server:/{split($2,a,"[^0-9]"); print a[1]; exit}' "$KCFG")"
 TOKEN="$(awk -F'token: ' '/token: /{print $2; exit}' "$KCFG" | tr -d '\r')"
-[ -n "$API_PORT" ] && [ -n "$TOKEN" ] || { echo "B28 soak: could not read the apiserver port/token out of $KCFG" >&2; exit 1; }
+[ -n "$API_PORT" ] && [ -n "$TOKEN" ] || { echo "soak: could not read the apiserver port/token out of $KCFG" >&2; exit 1; }
 API="https://127.0.0.1:$API_PORT"
 echo "    apiserver $API"
 
@@ -532,7 +532,7 @@ ns_create() {
 	printf '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"%s"}}' "$1" >"$WORK/ns.json"
 	api POST /api/v1/namespaces "$WORK/ns.json" || return 1
 	case "$REQ_CODE" in 2*|409) return 0 ;; esac
-	echo "B28 soak: could not create namespace $1 (HTTP $REQ_CODE)" >&2
+	echo "soak: could not create namespace $1 (HTTP $REQ_CODE)" >&2
 	head -c 400 "$RESP" >&2; echo >&2
 	return 1
 }
@@ -614,14 +614,14 @@ churn_writer() {
 }
 
 # The store revision before any churn — half of the revision-floor proof.
-api GET "/api/v1/namespaces/$PROBE_NS/configmaps" || { echo "B28 soak: baseline LIST failed" >&2; exit 1; }
-is2xx "$REQ_CODE" || { echo "B28 soak: baseline LIST HTTP $REQ_CODE" >&2; exit 1; }
+api GET "/api/v1/namespaces/$PROBE_NS/configmaps" || { echo "soak: baseline LIST failed" >&2; exit 1; }
+is2xx "$REQ_CODE" || { echo "soak: baseline LIST HTTP $REQ_CODE" >&2; exit 1; }
 RV_START="$(list_rv)"
 case "$RV_START" in
 ""|*[!0-9]*)
-	echo "B28 soak: could not parse a numeric list resourceVersion from the baseline LIST." >&2
-	echo "B28 soak: this is a PARSER failure, not a staleness finding — every probe below would" >&2
-	echo "B28 soak: report 'never observed' for a reason that has nothing to do with kine. Body prefix:" >&2
+	echo "soak: could not parse a numeric list resourceVersion from the baseline LIST." >&2
+	echo "soak: this is a PARSER failure, not a staleness finding — every probe below would" >&2
+	echo "soak: report 'never observed' for a reason that has nothing to do with kine. Body prefix:" >&2
 	head -c 400 "$RESP" >&2; echo >&2
 	exit 1
 	;;
@@ -657,7 +657,7 @@ while [ "$(now_ms)" -lt "$soak_deadline" ]; do
 	name="probe-$PROBES"
 	printf '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"%s"}}' "$name" >"$WORK/probe.json"
 	if ! api POST "/api/v1/namespaces/$PROBE_NS/configmaps" "$WORK/probe.json" || ! is2xx "$REQ_CODE"; then
-		echo "B28 soak: probe write $name failed (HTTP ${REQ_CODE:-?}) — the cluster stopped accepting writes mid-soak" >&2
+		echo "soak: probe write $name failed (HTTP ${REQ_CODE:-?}) — the cluster stopped accepting writes mid-soak" >&2
 		head -c 400 "$RESP" >&2; echo >&2
 		tail -20 "$SERVER_LOG" >&2 2>/dev/null || true
 		exit 1
@@ -665,7 +665,7 @@ while [ "$(now_ms)" -lt "$soak_deadline" ]; do
 	RV_W="$(obj_rv)"
 	case "$RV_W" in
 	""|*[!0-9]*)
-		echo "B28 soak: the create response for $name carried no numeric resourceVersion — PARSER failure, not staleness. Body prefix:" >&2
+		echo "soak: the create response for $name carried no numeric resourceVersion — PARSER failure, not staleness. Body prefix:" >&2
 		head -c 400 "$RESP" >&2; echo >&2
 		exit 1
 		;;
@@ -817,6 +817,6 @@ curl -sS -k -X DELETE -H "Authorization: Bearer $TOKEN" -o /dev/null "$API/api/v
 curl -sS -k -X DELETE -H "Authorization: Bearer $TOKEN" -o /dev/null "$API/api/v1/namespaces/$CHURN_NS" >/dev/null 2>&1 || true
 
 echo "----------------------------------------"
-echo "B28 soak: $PASS passed, $FAIL failed"
+echo "soak: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "============ B28 SOAK GREEN ============"
+echo "============ SOAK GREEN ============"

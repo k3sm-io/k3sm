@@ -9,7 +9,7 @@
 # tier integration, requires dev-mac, manual: false, skeleton: true). The rig slice
 # is the SEPARATE row M19-lab (hack/lab/m19.sh, manual: true).
 #
-# The REAL M19 gate is a COMPOSITE (listed below), written as M19.3 lands:
+# The REAL M19 gate is a COMPOSITE (listed below), written when the gate lands:
 #   1 the handler table and the SandboxBackend enum pin (wasm is 5, container-vm is 6)
 #   2 the wasm class is provisioned with the k3sm.io/wasm selector merged with the
 #     darwin selector and no tolerations
@@ -27,5 +27,5 @@
 # proven". Pinned always-RED by TestNonManualSkeletonsAlwaysRed, which runs it under
 # BOTH K3SM_LAB unset and K3SM_LAB=1.
 set -euo pipefail
-echo "M19 gate: NOT YET IMPLEMENTED — the real M19 composite gate (handler table and enum pin, class provisioning, label derivation, platform rows, refusal reasons, sibling-set consistency, the staged-helper canary) lands with M19.3. This is a skeleton and MUST be red."
+echo "M19 gate: NOT YET IMPLEMENTED — the real M19 composite gate (handler table and enum pin, class provisioning, label derivation, platform rows, refusal reasons, sibling-set consistency, the staged-helper canary) is not written yet. This is a skeleton and MUST be red."
 exit 1

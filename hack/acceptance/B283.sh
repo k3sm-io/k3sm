@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# k3sm B283 acceptance gate — the runnable proof that a node REPUBLISHES its
+# k3sm endpoint republish acceptance gate — the runnable proof that a node REPUBLISHES its
 # wireguard endpoint when the address it is reachable at changes.
 #
-# The defect (observed on the two-Mac lab rig, 2026-09-13): a node's
+# The defect (observed on the two-Mac lab, 2026-09-13): a node's
 # MeshPeer.spec.endpoint is derived ONCE — at join for a worker, at self-enroll for
 # the control-plane node — and never again. the worker joined at 192.0.2.206:51820
 # and now lives at .111; the CR still said .206. Wireguard's roaming hides that for
@@ -61,7 +61,7 @@ SELF="$HERE/B283.sh"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B283 acceptance (a node republishes its mesh endpoint when its address changes)"
+echo "==> k3sm endpoint republish acceptance (a node republishes its mesh endpoint when its address changes)"
 
 # ---- b283.0 — the gate parses and its sources exist -------------------------
 b0=ok
@@ -71,15 +71,15 @@ b0=ok
 ladder "$b0" "b283.0  gate parses (bash -n) + pkg/bootstrap/meshendpoint.go + cmd/k3sm/meshrefresh.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B283: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B283: $PASS passed, $FAIL failed" >&2
+	echo "endpoint republish: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
+	echo "endpoint republish: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
 # ---- b283.pre — the cross-repo precondition --------------------------------
 # The behaviour spans three repos and they only meet through the workspace
 # go.work, so a standalone k3sm clone cannot prove it — its absence is a hard FAIL,
-# never a skip, or "B283 green" would mean "B283 was not checked".
+# never a skip, or "green" would mean "endpoint republish was not checked".
 pre=ok
 [ -f "$WS_ROOT/go.work" ] || pre=no
 [ -d "$APIS_ROOT" ] || pre=no
@@ -87,7 +87,7 @@ pre=ok
 ladder "$pre" "b283.pre  workspace go.work + sibling apis and darwin-net present ($WS_ROOT)"
 if [ "$FAIL" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "B283: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
+	echo "endpoint republish: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
 	exit 1
 fi
 
@@ -178,12 +178,12 @@ lab_pending() { echo "LAB-PENDING  $1"; }
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "B283 INTEGRATION tier (TWO MACS; set K3SM_LAB=1 on the control-plane Mac to run):"
+	echo "INTEGRATION tier (TWO MACS; set K3SM_LAB=1 on the control-plane Mac to run):"
 	lab_pending "b283.L0  a joined worker is Ready and its MeshPeer names its current LAN address"
 	lab_pending "b283.L1  after the worker's LAN address changes, its MeshPeer endpoint follows within 120s"
 	lab_pending "b283.L2  \`kubectl logs\` of a pod on that worker succeeds from the control-plane Mac afterwards"
 	echo
-	echo "  The procedure, run by hand on the two-Mac rig (it needs a real address change,"
+	echo "  The procedure, run by hand on the two-Mac lab (it needs a real address change,"
 	echo "  which no single-host harness can produce):"
 	echo "    1. Join the second Mac:  k3sm agent --server <cp-lan-ip> --node-ip <mesh-ip> --token <token>"
 	echo "       and confirm:  kubectl get meshpeers <worker> -o jsonpath='{.spec.endpoint}'"
@@ -202,7 +202,7 @@ if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "       the old and new values."
 else
 	echo "----------------------------------------"
-	echo "B283 INTEGRATION tier: this tier is HUMAN-RUN on the two-Mac rig."
+	echo "INTEGRATION tier: this tier is HUMAN-RUN on the two-Mac lab."
 	echo "It cannot be automated from one Mac: its stimulus is a real LAN address change on"
 	echo "a SECOND machine, and its assertion is that a peer on the FIRST one follows it."
 	echo "Run the numbered procedure printed by this gate without K3SM_LAB=1, and record the"
@@ -213,6 +213,6 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B283: $PASS passed, $FAIL failed"
+echo "endpoint republish: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B283 GREEN (CI tier; integration tier is two-Mac, human-run) ================"
+echo "================ endpoint republish GREEN (CI tier; integration tier is two-Mac, human-run) ================"

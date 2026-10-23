@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B365 acceptance gate — the runnable proof that
+# k3sm node runbook acceptance gate — the runnable proof that
 # docs/user/troubleshooting.md carries a real runbook for a node that went
 # offline while it was running Pods, not just a pointer at kubectl.
 #
@@ -13,7 +13,7 @@
 # sleeping Mac it is out of service.
 #
 # CI TIER ONLY — no rig, no cluster, nothing runs. Every rung but the voice
-# lint is a grep over checked-in text; content-anchored per the B336 idiom
+# lint is a grep over checked-in text; content-anchored per the node-ip docs gate idiom
 # (never heading-only), so a heading with no real content under it still fails.
 #
 # Usage:  hack/acceptance/B365.sh
@@ -34,7 +34,7 @@ VOICE_LINT="${K3SM_VOICE_LINT:-}"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B365 acceptance (offline-node stuck-terminating runbook)"
+echo "==> k3sm node runbook acceptance (offline-node stuck-terminating runbook)"
 
 # ---- b365.0 — the gate parses and its sources exist -------------------------
 b0=ok
@@ -44,8 +44,8 @@ b0=ok
 ladder "$b0" "b365.0  gate parses (bash -n) + both docs present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B365: the gate or its sources are missing/unparseable — nothing else can run" >&2
-	echo "B365: $PASS passed, $FAIL failed" >&2
+	echo "node runbook: the gate or its sources are missing/unparseable — nothing else can run" >&2
+	echo "node runbook: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -163,6 +163,6 @@ if [ "$v" != skip ]; then
 fi
 
 echo "----------------------------------------"
-echo "B365: $PASS passed, $FAIL failed"
+echo "node runbook: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B365 GREEN ================"
+echo "================ node runbook GREEN ================"

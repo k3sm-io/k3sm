@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M11.0-d5 / S5 — the ROOT-NEEDING half of guest networking. ONE OPERATOR SITTING.
+# S5 — the ROOT-NEEDING half of guest networking. ONE OPERATOR SITTING.
 #
 #   sudo bash hack/spike/m11/s5-root.sh              # the real sitting
 #   bash hack/spike/m11/s5-root.sh --dry-run         # print the plan, touch nothing
@@ -474,7 +474,7 @@ s5.sh> with the branch that answer selects — s5.sh criterion 1 states them:
 
   (b) alone suffices  => ZERO new privileged surface; the route set becomes data
                          on podnet.GuestNetwork. The outcome to design for.
-  needs (c) or (d)    => a narrow netd route verb (B232): prefixes constrained to
+  needs (c) or (d)    => a narrow netd route verb: prefixes constrained to
                          podCIDR union serviceCIDR, interface constrained to the
                          vmnet family, idempotent, revoked at teardown,
                          LOCAL_PEERCRED uid-gated like every existing verb.

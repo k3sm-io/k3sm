@@ -20,7 +20,7 @@
 # mirror.yaml's header, including the reviewer's independent re-resolution.
 
 images:
-  # M16 R12: the upstream serving control plane's Helm chart. It is published as an OCI
+  # M16: the upstream serving control plane's Helm chart. It is published as an OCI
   # chart at nvcr.io/nvidia/ai-dynamo/dynamo-platform, NOT under .../charts/ (that path
   # has no repository: the anonymous token endpoint answers 400).
   # The chart stays at 1.5.0 while the three images below are at 1.5.1. nvcr.io publishes no
@@ -38,7 +38,7 @@ images:
     mirror: ghcr.io/k3sm-io/mirror/dynamo-platform@sha256:ff09c3bdfb26fb6b9274917a80c0fdf9bf23eeb02912988262ac5f87a5860714
     tag: 1.5.0
 
-  # M16 R12: the operator. The index also carries two attestation manifests
+  # M16: the operator. The index also carries two attestation manifests
   # (unknown/unknown); a full-index copy keeps them, which is what preserves the digest.
   - name: kubernetes-operator
     upstream: nvcr.io/nvidia/ai-dynamo/kubernetes-operator:1.5.1@sha256:4b8229b913d66fff2111c228e02f65d342b3e136bb1ee2f83892e8a140b96d1d
@@ -50,7 +50,7 @@ images:
       - platform: linux/amd64
         digest: sha256:a811250a7bf8051b67ef94d745e958a2585d2d9c321c9a825f4ac09f76ee726a
 
-  # M16 R12: the frontend.
+  # M16: the frontend.
   - name: dynamo-frontend
     upstream: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.5.1@sha256:2ce6f7484185ccae02381fa90b97330bddf021177960d7c0c0ad4ee83a9874fa
     mirror: ghcr.io/k3sm-io/mirror/dynamo-frontend@sha256:2ce6f7484185ccae02381fa90b97330bddf021177960d7c0c0ad4ee83a9874fa
@@ -61,7 +61,7 @@ images:
       - platform: linux/amd64
         digest: sha256:4674f75ae28b3d1a1e0eabd9ae81b9d2edd08c43cfb2ba45a17358046640d344
 
-  # M16 R12: the planner image, the mocker vehicle.
+  # M16: the planner image, the mocker vehicle.
   - name: dynamo-planner
     upstream: nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.5.1@sha256:d1a4f2eac9878fef913ebf4ff4106dd093388ff26f386ae8a3901dc0e4fbde9a
     mirror: ghcr.io/k3sm-io/mirror/dynamo-planner@sha256:d1a4f2eac9878fef913ebf4ff4106dd093388ff26f386ae8a3901dc0e4fbde9a

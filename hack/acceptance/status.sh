@@ -263,10 +263,10 @@ else
 		# — its cwd IS the data root, which is the server plist's WorkingDirectory.
 		#
 		# It is a RUNG, not a note. The node now stops its embedded runtime on the
-		# way out (B253, and hack/acceptance/B253.sh is that fix's own gate), so an
+		# way out (and hack/acceptance/B253.sh is that fix's own gate), so an
 		# orphan here is the bug having returned, and a gate that cannot go red on
 		# it protects nothing. The kill stays: the reproduction below still needs
-		# the volume, and leaving the rig unable to unmount would be a worse
+		# the volume, and leaving the lab host unable to unmount would be a worse
 		# outcome than a red rung.
 		#
 		# The poll runs for the whole TEARDOWN_DEADLINE, not a fixed few seconds:

@@ -64,12 +64,12 @@ compatibility (the amd64-Linux images are handled only by the M5 `vm` path).
 
 ## Status
 
-This is the **spec**, plus (as of M4.2) the **authored + compile-verified + gate-wired** suite: the
+This is the **spec**, plus (as of the conformance-suite work) the **authored + compile-verified + gate-wired** suite: the
 `TestM2_*` / `TestM3_*` criterion funcs live in `e2e/m2_test.go` / `e2e/m3_test.go`, the `hello-http` +
 `conftool` helpers under `e2e/testdata/cmd/`, and the gates `m2.sh` (M2), `m3.sh` (single-node M3 integration),
 `hack/lab/m3.sh` (two-Mac M3 lab), `m4.sh` (RBAC integration) enumerate their required criteria under the
 non-vacuous guard. The **LIVE green is integration-tier** (a dev Mac + root for `m2.sh`/`m3.sh`; `k3sm install`
-for the helper posture), so it is not run in unit CI — **M4.2-a1 stays `met:false` (integration-pending)** until
+for the helper posture), so it is not run in unit CI — **the suite stays `met:false` (integration-pending)** until
 the gates run green on a capable host. The `vm` slice is proven by `hack/lab/m11.sh` (M11 absorbed the M5
 lab remainder — see `hack/acceptance/phases.json`'s `M5` row), not by a criterion-test slice under this
 directory.

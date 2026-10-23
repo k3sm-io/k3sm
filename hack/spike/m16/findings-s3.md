@@ -1,8 +1,8 @@
-# S3 findings — the engine decision (M16.0-d4)
+# S3 findings — the engine decision
 
 > **Status: RUN 2026-10-02 02:37Z, one run of `s3.sh` at `main` dba9ee6 on an outside
 > machine (Apple M4 Max, 64 GiB), not the M16 rig, through the local-payload shim. Per
-> the #446 ruling the canonical run is the rig's and this record is advisory.** The payload exited at its
+> the #446 ruling the canonical run is the lab host's and this record is advisory.** The payload exited at its
 > first criterion: `s3.1` **FAIL** on the invariants check, so `s3.2`–`s3.4` were never
 > reached and `s3.5` recorded that the control did not serve. The payload's own API
 > dump, quoted on the verdict line, shows **what** failed: the probe asks the core's
@@ -17,16 +17,16 @@
 
 > **Rig substitution.** The host under Rig is not the sanctioned M16 rig (the laptop
 > dev Mac: Apple M2, 8 CPU, 8 GiB): it is an outside machine with roughly 8x that
-> memory (Apple M4 Max, 64 GiB). Per the #446 ruling the canonical run is the rig's
+> memory (Apple M4 Max, 64 GiB). Per the #446 ruling the canonical run is the lab host's
 > and this record is advisory. S3's criteria are API shape, not budget, so the
 > substitution bears on `s3.4`'s absolute timings and the `s3.5` control only.
 
-> **The halt is not landed here.** Per #446 a run off the rig does not discharge the
+> **The halt is not landed here.** Per #446 a run off the lab host does not discharge the
 > rung, so neither this run's FAIL nor the halt's substitution can land on its strength.
-> Context for the rig re-run: the verdict line says the core's constructor does not take
+> Context for the lab host re-run: the verdict line says the core's constructor does not take
 > three keywords, while the supplementary records below show the same invariants carried
 > in `SchedulerConfig`, so the FAIL may be a miss of the probe rather than of the path.
-> Whether the rung re-runs on the rig with a corrected probe (Harness notes) or R3 lands
+> Whether the rung re-runs on the lab host with a corrected probe (Harness notes) or the HTTP sidecar shape lands
 > as the ladder says is the maintainers' call, not decided here.
 
 ## Question
@@ -48,7 +48,7 @@ gating.
 
 ## Halt (binding, substitution pre-decided)
 
-The in-process path fails → **R3's HTTP sidecar shape** onto `mlx-serve`, where the
+The in-process path fails → **the HTTP sidecar shape** onto `mlx-serve`, where the
 block size is unset, routing degrades to round-robin by contract, and
 `docs/user/mlx-fleet.md` says so in its first section.
 
@@ -134,7 +134,7 @@ negative space the ladder asks for, never a criterion.
   chooses `BatchedEngine` over `SimpleEngine`, and in-process there is no flag to forget.
   `use_paged_cache=True` is not the default and is the one setting without which there
   are no block hashes to publish. This run observed these values; whether the image's
-  `mlx_worker` tests pin them follows from the rig re-run, not from this record.
+  `mlx_worker` tests pin them follows from the lab host re-run, not from this record.
 - **The publish call was cheap enough to ride the request path on this machine:** 2.8 µs
   median, 3.6 µs p99 per block, identical through an `await`. The cost is the hash, not
   the hook.

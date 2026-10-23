@@ -1,12 +1,12 @@
-# S3 — memory visibility & growth (M8.0-d3) — **PASS, with one binding consequence**
+# S3 — memory visibility & growth — **PASS, with one binding consequence**
 
 > **Verdict: PASS.** `ri_phys_footprint` — the OOM watcher's input in
 > `runtimed/pkg/supervisor/sampler.go` — sees the Metal/unified working set
-> **exactly**, so the accounting source needs no redesign (the M8 plan Res. 17 S3 is
+> **exactly**, so the accounting source needs no redesign (per the spike definition S3 is
 > terminal-or-redesign; neither consequence fires). **One binding consequence
 > does fire**: the sampler's leader-PID-only walk under-counts a forking engine
-> by the entire child working set, so Res. 18's contingency is **required**
-> unless M8.4 pins the S5 winner single-process.
+> by the entire child working set, so the pgid-enumeration contingency is **required**
+> unless the image build pins the S5 winner single-process.
 
 Run: 2026-08-29 on the S1 rig (Apple M1-family, 64 GiB, macOS 26.5.2).
 Re-run with `hack/spike/m8/s3.sh`. Model: `mlx-community/Llama-3.2-3B-Instruct-4bit`
@@ -64,7 +64,7 @@ allocations show only in footprint.**
   samples — MLX's buffer cache (`mlx_cache` spiked to 131 MB at TOK 1000, then
   fell to 2.8 MB) is returned and re-taken.
 
-**Consequence for the M8.5 sizing formula:** a limit set at the steady-state
+**Consequence for the sizing formula:** a limit set at the steady-state
 footprint will be tripped by the allocator's own cache churn. The formula needs
 **headroom above the transient peak**, not above the mean — here that is ~6% on
 a 2 GB working set, and the KV term is `tokens × ~0.15 MB` for a 3B-4bit model
@@ -99,17 +99,17 @@ Bounded probe: `mx.set_wired_limit(1 GiB)`, then allocate **8 GiB** past it.
 
 **Consequence: k3sm's own sampler is the operative killer for MLX pods.** There
 is no Metal-side backstop to defer to, and jetsam does not engage until real
-system pressure. The M8.5 limit and the `sampler.go` OOM path are the *only*
+system pressure. The memory limit and the `sampler.go` OOM path are the *only*
 thing standing between an over-sized `MLXModel` and the whole node.
 
-**FLAGGED — the bounded-probe honesty clause.** The M8.0 guardrails forbid
+**FLAGGED — the bounded-probe honesty clause.** The M8 spike guardrails forbid
 destabilizing the lab, so this probe was hard-capped (8 GiB / 24 GiB) with an
 abort guard at `kern.memorystatus_level < 20`. **It therefore does NOT determine
 the sampler-vs-jetsam ordering under genuine system pressure** — it establishes
 the weaker, sufficient fact that *nothing* fires before ~24 GiB on a 64 GiB rig,
 so the sampler owns the decision in the whole range M8 cares about. A true
 killer-order determination needs a machine that may be driven to OOM (the
-`hack/lab-vm.sh` disposable-guest class), not the shared lab rig. Do not read
+`hack/lab-vm.sh` disposable-guest class), not the shared lab Macs. Do not read
 this section as proving the sampler wins a race against jetsam.
 
 ## (5) Process-group coverage — **leader-PID-only UNDER-COUNTS 3.9×**
@@ -126,15 +126,15 @@ Leader holds 200 MB; two forked children hold 300 MB each.
 - **Leader-PID-only sees 207.3 MB. The true group working set is 817.3 MB.** The
   leader's `ri_phys_footprint` is blind to forked children — a **3.9×
   under-count** here, and the ratio grows with the number of workers.
-- **`proc_listpids(PROC_PGRP_ONLY, getpgid(pid))` fixes it**, exactly as Res. 18
+- **`proc_listpids(PROC_PGRP_ONLY, getpgid(pid))` fixes it**, exactly as the spike
   pre-authorizes: it enumerated the group and summing per-member footprints
   recovered 200 + 300 + 300 MB plus ~17 MB of shell overhead.
 
-**Consequence — one of these two MUST ship, and the choice is M8.4's:**
+**Consequence — one of these two MUST ship, and the choice is the image build's:**
 
-- **Either** M8.4 **pins the S5 winner single-process** (the Res. 18 default), in
+- **Either** the image build **pins the S5 winner single-process** (the single-process default), in
   which case leader-PID-only is exact and nothing changes in `sampler.go`;
-- **or** M8.2 lands the pgid-enumeration deliverable. The mechanism is proven
+- **or** runtimed lands the pgid-enumeration deliverable. The mechanism is proven
   here on public libproc, in the `rusage_darwin.go` cgo pattern, and needs a
   `spicanary` row like its siblings.
 
@@ -160,5 +160,5 @@ that pgid is exactly the pod and nothing else. The sum reconciles
    spurious kills.
 3. **The sampler is the only killer.** No Metal or jetsam backstop engages in the
    range M8 operates in.
-4. **Decide the process-model question explicitly at M8.4** — pin the engine
+4. **Decide the process-model question explicitly at the image build** — pin the engine
    single-process, or land the pgid walk. Do not leave it implicit.

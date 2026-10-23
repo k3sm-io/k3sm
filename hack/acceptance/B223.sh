@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B223 acceptance gate — the runnable proof that the kube-controller-manager's
+# k3sm root CA acceptance gate — the runnable proof that the kube-controller-manager's
 # --root-ca-file names the CA that anchors the serving cert the apiserver ACTUALLY
 # presents, in both postures. That flag is what the root-ca-cert-publisher republishes
 # into every namespace's kube-root-ca.crt ConfigMap, i.e. every Pod's trust anchor for
@@ -63,7 +63,7 @@ SERVER_PROVISION="$K3SM_ROOT/cmd/k3sm/serverprovision.go"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B223 acceptance (KCM --root-ca-file follows the apiserver serving posture)"
+echo "==> k3sm root CA acceptance (KCM --root-ca-file follows the apiserver serving posture)"
 
 # ---- b223.0 — the gate parses and every wiring source exists ----------------
 b0=ok
@@ -72,8 +72,8 @@ for f in "$EXECUTOR" "$SUPERVISED" "$SERVER" "$SERVER_PROVISION"; do [ -f "$f" ]
 ladder "$b0" "b223.0  gate parses (bash -n) + executor.go, supervised.go, cmd/k3sm/server.go, cmd/k3sm/serverprovision.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B223: the gate or a wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B223: $PASS passed, $FAIL failed" >&2
+	echo "root CA: the gate or a wiring source is missing/unparseable — nothing else can run" >&2
+	echo "root CA: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -159,7 +159,7 @@ run_test "b223.6" 4 TestRootCAFileIsPostureLocked ./pkg/executor/
 run_test "b223.7" 4 TestValidateRejectsRootCAWithoutServingCert ./pkg/executor/
 
 # ---- b223.8 — the pre-existing argv guards still hold ------------------------
-# The same two renderers this change touched are the ones M4.1/M6.0 pinned. If this
+# The same two renderers this change touched are the ones the earlier RBAC and HA work pinned. If this
 # change perturbed the client-CA wiring or the loopback bind/port posture, these redden.
 run_test "b223.8" 2 TestLoopbackComponentsBindLoopbackOnly ./pkg/executor/
 out=""; rc=0
@@ -178,7 +178,7 @@ lab_pending() { echo "LAB-PENDING  $1"; }
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "B223 LAB tier (set K3SM_LAB=1 on a dev Mac to run; no root needed, ~3 min):"
+	echo "LAB tier (set K3SM_LAB=1 on a dev Mac to run; no root needed, ~3 min):"
 	lab_pending "b223.L1  a --mesh-ip 127.0.0.1 --network none boot reaches healthz (RED before: the KCM dies on 'error parsing root-ca-file ... no such file or directory')"
 	lab_pending "b223.L2  default/kube-root-ca.crt bytes == <workDir>/tls/cluster-ca.crt"
 	lab_pending "b223.L3  the live apiserver serving cert VERIFIES against the published CA bytes"
@@ -206,7 +206,7 @@ else
 	trap lab_down EXIT INT TERM
 
 	echo "----------------------------------------"
-	echo "B223 LAB tier: booting a MESH single-node control plane (mutates this Mac's :$LAB_API_PORT/:$LAB_KINE_PORT listeners)"
+	echo "LAB tier: booting a MESH single-node control plane (mutates this Mac's :$LAB_API_PORT/:$LAB_KINE_PORT listeners)"
 	# A fresh work dir is load-bearing: on a dir that once booted single-node the stale
 	# self-signed apiserver.crt exists, and the unfixed pin would come up "healthy"
 	# publishing it — the quiet half of the bug, which b223.L2 catches but b223.L1 would
@@ -283,10 +283,10 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B223: $PASS passed, $FAIL failed"
+echo "root CA: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 if [ "${K3SM_LAB:-}" = 1 ]; then
-	echo "================ B223 GREEN (CI + LAB tiers) ================"
+	echo "================ root CA GREEN (CI + LAB tiers) ================"
 else
-	echo "================ B223 GREEN (CI tier) ================"
+	echo "================ root CA GREEN (CI tier) ================"
 fi

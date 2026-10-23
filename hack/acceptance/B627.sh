@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B627 acceptance gate: the rig probes behind the app console's per-tab
+# k3sm console probes acceptance gate: the lab host probes behind the app console's per-tab
 # actions. Each probe runs one action against a running two-Mac cluster and
 # prints what the cluster did, as `probe <n>: <answer>`. The answers are the
 # evidence the console's sheet wording and enabled states cite; a probe never
@@ -71,7 +71,7 @@ case "${1:-}" in
 esac
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
-	echo "PENDING  B627 needs K3SM_LAB=1 and a running two-Mac cluster (see --help)"
+	echo "PENDING  needs K3SM_LAB=1 and a running two-Mac cluster (see --help)"
 	exit 2
 fi
 
@@ -136,7 +136,7 @@ PEER_LAN="${B627_PEER_LAN:-$(peer "$LAN_CMD" 2>/dev/null || true)}"
 
 # ── Evidence: header and the before transcripts ───────────────────────────────
 {
-	echo "B627 run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	echo "run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	echo "local_node: $LOCAL_NODE ($LOCAL_LAN)  peer_node: $PEER_NODE ($PEER_LAN)"
 	echo "context: $CTX  namespace: $NS  vm_image: $VM_IMAGE"
 	echo "k3sm_sha: $(git -C "$K3SM_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -196,7 +196,7 @@ cleanup() {
 		fi
 	fi
 	echo "----------------------------------------"
-	echo "B627 answers:"
+	echo "answers:"
 	cat "$ANSWERS"
 	echo "evidence: $EV"
 	if [ "$rc" -ne 0 ]; then exit "$rc"; fi

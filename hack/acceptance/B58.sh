@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# k3sm B58 acceptance gate — the runnable proof of the UNSIGNED goreleaser
+# k3sm goreleaser snapshot acceptance gate — the runnable proof of the UNSIGNED goreleaser
 # SNAPSHOT config (.goreleaser.yaml): the single k3sm Mach-O plus its renamed
 # k3sm-netd copy, LICENSE and NOTICE, staged into a darwin/arm64 tarball with a
-# checksums file. Signing/notarization/tap-push are the human M7.1 slice and are
+# checksums file. Signing/notarization/tap-push are the human release-signing slice and are
 # stubbed-disabled in the config, so this gate proves BUILD SHAPE only.
 #
 # This is an integration-tier, lab-pending gate: goreleaser is not installed in
@@ -20,16 +20,16 @@ CONFIG="$REPO_ROOT/.goreleaser.yaml"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B58 acceptance (goreleaser unsigned-snapshot build shape)"
+echo "==> k3sm goreleaser snapshot acceptance (goreleaser unsigned-snapshot build shape)"
 
-# B58.0 — the config exists (independent of the tool being installed).
+# snapshot.0 — the config exists (independent of the tool being installed).
 if [ -f "$CONFIG" ]; then
 	ladder ok "b58.0  .goreleaser.yaml present"
 else
 	ladder no "b58.0  .goreleaser.yaml present"
 fi
 
-# B58.1 — the supporting artifacts are LIVE manifest members (they were commented
+# snapshot.1 — the supporting artifacts are LIVE manifest members (they were commented
 # "DEFERRED" while no in-tree producer existed; hack/release/stage.sh is that
 # producer now). The payload members must carry BOTH dst: cp-payload and
 # strip_parent — with either missing, the members land at the wrong path and
@@ -51,11 +51,11 @@ if ! command -v goreleaser >/dev/null 2>&1; then
 	echo "----------------------------------------"
 	if [ -n "${CI:-}" ]; then
 		echo "FAIL  b58  goreleaser not installed — CI MUST have the release tool" >&2
-		echo "B58: goreleaser absent under CI — hard FAIL" >&2
+		echo "goreleaser snapshot: goreleaser absent under CI — hard FAIL" >&2
 		exit 1
 	fi
 	echo "PENDING (lab-tier): goreleaser not installed — the archive proof runs in CI." >&2
-	echo "B58: build-shape checks passed ($PASS ok); the live snapshot/archive proof is deferred to CI." >&2
+	echo "goreleaser snapshot: build-shape checks passed ($PASS ok); the live snapshot/archive proof is deferred to CI." >&2
 	# Non-zero so an un-run archive proof never falsely passes the gate.
 	exit 3
 fi
@@ -99,7 +99,7 @@ REQUIRED="$( (cd "$REPO_ROOT" && GOWORK=off go run ./cmd/k3sm install --print-re
 if [ "$REQ_RC" -ne 0 ] || [ -z "$REQUIRED" ]; then
 	ladder no "b58.2  derive the required-artifact set (k3sm install --print-required-artifacts exited $REQ_RC) — the staging fixture cannot be built, so the archive proof MEASURED NOTHING"
 	echo "----------------------------------------"
-	echo "B58: $PASS passed, $FAIL failed" >&2
+	echo "goreleaser snapshot: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 while IFS= read -r rel; do
@@ -116,7 +116,7 @@ else
 	ladder no "b58.2  goreleaser snapshot release succeeded"
 fi
 
-# B58.3 — the archive carries every artifact `k3sm install` resolves beside the
+# snapshot.3 — the archive carries every artifact `k3sm install` resolves beside the
 # binary, at the path it resolves it. The expected set is DERIVED from
 # pkg/install.RequiredSiblings via the binary's own flag, so adding an artifact
 # there reddens this gate until a manifest member appears for it.
@@ -152,7 +152,7 @@ else
 	ladder no "b58.3  darwin/arm64 archive produced"
 fi
 
-# B58.4 — a checksums file is produced.
+# snapshot.4 — a checksums file is produced.
 if find "$DIST" -name '*checksums.txt' -print -quit | grep -q .; then
 	ladder ok "b58.4  checksums file produced"
 else
@@ -160,6 +160,6 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B58: $PASS passed, $FAIL failed"
+echo "goreleaser snapshot: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B58 GREEN ================"
+echo "================ goreleaser snapshot GREEN ================"

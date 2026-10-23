@@ -100,7 +100,7 @@ It then execs `mlx_lm.server --host 0.0.0.0 --port <serve port>`, adding
 against the local server every 60 seconds, to catch a collective that hung
 while the listener stayed up. A server that is not listening yet passes, so a
 long first download is never killed. The probe costs one forward pass of the
-whole sharded model per minute; that cost is measured on the lab rig beside
+whole sharded model per minute; that cost is measured on the lab Macs beside
 the serving figure.
 
 Rank ports are unauthenticated and reachable by every pod in the cluster, so

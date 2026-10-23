@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B157 acceptance gate — the runnable proof that the acceptance harness
+# k3sm harness cleanup acceptance gate — the runnable proof that the acceptance harness
 # leaves the host as it found it AFTER THE LAST GATE: hack/lib/clusterup.sh's
 # cluster_down reaps the node/server process it can attribute to this rig, and
 # flushes the lo0 aliases the run created.
@@ -8,7 +8,7 @@
 # The bug it pins (observed directly 2026-08-27 on an ALL-GREEN m0 -> m1 -> m3 ->
 # m4 sequence, so this is NOT a failure path): the host was left with a root
 # `k3sm server` alive for 16 minutes still holding *:10250, plus lo0 aliases
-# 10.43.0.10 and 100.64.0.1, and they had to be reaped by hand. B150 made the
+# 10.43.0.10 and 100.64.0.1, and they had to be reaped by hand. The earlier gate-sequence work made the
 # BRING-UP side self-cleaning, which is why the sequence itself passed; nothing
 # reaps on EXIT after the final gate because no later bring-up follows it. The
 # residue is exactly what produces the misleading "listen tcp :10250: bind:
@@ -31,7 +31,7 @@ LIB="$REPO_ROOT/hack/lib/clusterup.sh"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B157 acceptance (exit-side host cleanup: clusterup.sh cluster_down)"
+echo "==> k3sm harness cleanup acceptance (exit-side host cleanup: clusterup.sh cluster_down)"
 
 # ---- b157.0 — the library exists and parses --------------------------------
 if [ -f "$LIB" ] && bash -n "$LIB"; then
@@ -39,8 +39,8 @@ if [ -f "$LIB" ] && bash -n "$LIB"; then
 else
 	ladder no "b157.0  hack/lib/clusterup.sh present + parses (bash -n)"
 	echo "----------------------------------------"
-	echo "B157: clusterup.sh missing or unparseable — nothing else can run" >&2
-	echo "B157: $PASS passed, $((FAIL)) failed" >&2
+	echo "harness cleanup: clusterup.sh missing or unparseable — nothing else can run" >&2
+	echo "harness cleanup: $PASS passed, $((FAIL)) failed" >&2
 	exit 1
 fi
 
@@ -123,7 +123,7 @@ _port_listeners() {
 	lsof -nP -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null | sort -u || true
 }'
 
-# ---- listener fixtures (same shape as B150's) -------------------------------
+# ---- listener fixtures (same shape as the gate-sequence gate's) -------------------------------
 cat > "$WORK/listen.py" <<'PY'
 import socket, sys, time
 s = socket.socket()
@@ -185,25 +185,25 @@ else
 	ladder no "b157.1  cluster_down returns 0 on a quiet host and removes no work-dir state (rc=$quiet_rc kept=$kept)"
 fi
 
-# ---- b157.2 — THE CONTRACT: teardown reaps the rig's node holding :10250 ----
+# ---- b157.2 — THE CONTRACT: teardown reaps the lab host's node holding :10250 ----
 # The observed leak, reproduced: a process this rig launched is still listening on
 # the kubelet port after the gate is done. It must not survive cluster_down. This
 # is the check that goes red if the exit-side reap is reverted.
 REAP="$WORK/reap"; mkdir -p "$REAP"
-start_listener "$REAP/pods" node.port     # argv names the rig's work dir — attributable
+start_listener "$REAP/pods" node.port     # argv names the lab host's work dir — attributable
 export B157_FIXTURE_PORT="$LISTEN_PORT"
 node_rc=0
 down "$REAP" "$NODE_PORT_REDIRECT" >/dev/null 2>&1 || node_rc=$?
 # The assertion is on the PORT, not on `kill -0` of the pid: a killed child of
 # this shell is a zombie until reaped, and kill -0 succeeds on a zombie.
 if [ "$node_rc" -eq 0 ] && [ -z "$(lsof -nP -iTCP:"$B157_FIXTURE_PORT" -sTCP:LISTEN -t 2>/dev/null)" ]; then
-	ladder ok "b157.2  cluster_down reaps THIS rig's leftover node/server still holding :10250 (the B157 contract)"
+	ladder ok "b157.2  cluster_down reaps THIS rig's leftover node/server still holding :10250 (the contract)"
 else
 	ladder no "b157.2  cluster_down reaps THIS rig's leftover node/server still holding :10250 (rc=$node_rc, port still held)"
 fi
 
 # ---- b157.3 — it never kills a listener it cannot attribute -----------------
-# Nothing in this fixture's argv names the rig. Teardown must leave it alone AND
+# Nothing in this fixture's argv names this harness. Teardown must leave it alone AND
 # still return 0: on the way out, a foreign listener is a fact to report, not a
 # teardown failure.
 start_listener "/tmp/b157-unrelated-process" foreign.port
@@ -292,19 +292,19 @@ else
 	ladder no "b157.6  attribution loosened (unanchored pkill: ${broad:-none}; witnesses=$witnesses)"
 fi
 
-# ---- b157.7 — B150's bring-up contract is still wired -----------------------
+# ---- b157.7 — the gate-sequence bring-up contract is still wired -----------------------
 # This item extends TEARDOWN. The bring-up reap it depends on (and must not
-# regress) is B150's; assert the entry points still reset first, so a green B157
+# regress) belongs to the gate-sequence gate; assert the entry points still reset first, so a green harness-cleanup gate
 # can never coexist with a silently-unwired cluster_reset.
 if grep -qF 'cluster_reset || return 1' "$LIB" \
 	&& [ "$(grep -cF 'cluster_reset || return 1' "$LIB")" -ge 2 ] \
 	&& grep -qF 'stage_dir_ok && rm -rf /Library/k3sm-acceptance' "$LIB"; then
-	ladder ok "b157.7  B150's bring-up reset is still wired into both entry points, STAGE_DIR removal still guarded"
+	ladder ok "b157.7  the gate-sequence bring-up reset is still wired into both entry points, STAGE_DIR removal still guarded"
 else
-	ladder no "b157.7  B150's bring-up reset is still wired into both entry points, STAGE_DIR removal still guarded"
+	ladder no "b157.7  the gate-sequence bring-up reset is still wired into both entry points, STAGE_DIR removal still guarded"
 fi
 
 echo "----------------------------------------"
-echo "B157: $PASS passed, $FAIL failed"
+echo "harness cleanup: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B157 GREEN ================"
+echo "================ harness cleanup GREEN ================"

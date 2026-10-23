@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# M8.0-d5 / S5 — serving-engine bake-off: vllm-mlx vs oMLX vs mlx-lm.
+# S5 — serving-engine bake-off: vllm-mlx vs oMLX vs mlx-lm.
 #
-# The M8 plan's working hypothesis for the M8.4 image is vllm-mlx. This spike
+# The working hypothesis for the mlx-serve image is vllm-mlx. This spike
 # ratifies or replaces it with measurements, on the real rig, of the six axes the
 # plan names — plus one it does not, which turns out to decide the question.
 #
@@ -12,9 +12,9 @@
 #   wheel footprint      the venv delta, against the S4 >2 GB image threshold
 #   process model        LOAD-BEARING: S3(5) proved the sampler's leader-PID-only
 #                        walk under-counts a forking engine 3.9x, so an engine
-#                        that forks costs an M8.2 pgid-enumeration deliverable
+#                        that forks costs a pgid-enumeration deliverable
 #   PACKAGEABILITY       (the extra axis) whether the engine can be installed
-#                        from a hash-pinned lockfile at all, which M8.4-d1
+#                        from a hash-pinned lockfile at all, which the image build
 #                        REQUIRES (`uv pip install --require-hashes`)
 #
 # Each engine gets its OWN venv under the prefix so the footprints do not share
@@ -148,7 +148,7 @@ run_engine vllmmlx && install_engine vllmmlx 8182 "vllm-mlx==0.4.1"
 run_engine omlx    && install_engine omlx    8183
 
 # --------------------------------------------------------- packageability ----
-# M8.4-d1 REQUIRES `uv pip install --require-hashes` against a checked-in
+# The image build REQUIRES `uv pip install --require-hashes` against a checked-in
 # lockfile. An engine whose dependency closure cannot be expressed with hashes
 # cannot ship in the image at all, whatever its throughput.
 echo
@@ -402,8 +402,8 @@ ln -s "$MP" "$OMLX_MODELS/qwen05b"
 
 run_engine mlxlm   && serve_engine mlxlm   8181 "$MODEL_S1" \
   "$ENG/mlxlm/venv/bin/mlx_lm.server" --model "$MODEL_S1" --port 8181
-# vllm-mlx is measured TWICE. Continuous batching — the property the M8 plan's
-# working hypothesis names — is OPT-IN there ("--continuous-batching: Enable
+# vllm-mlx is measured TWICE. Continuous batching — the property the working
+# hypothesis names — is OPT-IN there ("--continuous-batching: Enable
 # continuous batching for multiple concurrent users (slower for single user)").
 # Measuring only the default would understate it; measuring only the flag would
 # hide that a default-configured pod 503s under concurrency.
@@ -415,7 +415,7 @@ run_engine omlx    && serve_engine omlx    8183 "qwen05b" \
   "$ENG/omlx/venv/bin/omlx" serve --model-dir "$OMLX_MODELS" --port 8183
 
 # `run_engine X && serve_engine X` is FALSE for every engine --only excluded, and
-# the last such line would otherwise be the payload's exit status. M8.0-a1 wants
+# the last such line would otherwise be the payload's exit status. the spike wants
 # every spike script to exit 0, so say so explicitly rather than by accident.
 exit 0
 EOF

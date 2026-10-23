@@ -1,4 +1,4 @@
-# S2 findings — the control plane on k3sm, GPU-free (M16.0-d3)
+# S2 findings — the control plane on k3sm, GPU-free
 
 > **Status: RUN 2026-09-21 → 2026-09-23, twelve runs on the single-node dev tier named
 > under Rig.** s2.1–s2.4 pass on a tree carrying k3sm #447 plus the two provider fixes
@@ -23,7 +23,7 @@
 > the rung patches the pod specs onto the darwin node only after the helm wait, and
 > the cluster's admission policy rejects every Pod not selecting the darwin os label,
 > so the wait can only end in the progress deadline. No later criterion ran, and the
-> plan's halt condition was not reached. That attempt therefore neither confirms nor
+> spike's halt condition was not reached. That attempt therefore neither confirms nor
 > contradicts the runs recorded here; it shows the rung's patch ordering must move
 > before the wait for a sanctioned-rig rerun to answer anything.
 
@@ -47,7 +47,7 @@ frontend's dial to its **published address**.
 
 ## Halt (binding, substitution pre-decided)
 
-Discovery or the frontend→worker dial fails → **R4(b)**: the native-Darwin control
+Discovery or the frontend→worker dial fails → **native-Darwin fallback**: the native-Darwin control
 plane as a second `hack/images/` entry.
 
 ## Scoreboard
@@ -59,7 +59,7 @@ plane as a second `hack/images/` entry.
 | s2.3 operator `ClusterRole` dumped; wildcards / secrets called out | RECORDED | 12 ClusterRoles dumped; `manager-role` has 51 rules over 22 API groups, **no wildcard** verb, resource or group; `secrets` create/get/list/update/watch + delete/patch cluster-wide (the operator's built-in cert-controller writes `webhook-server-cert`); the cert-manager Role is namespaced. Verbatim below; equal to `pkg/mlxfleet`'s pinned grant |
 | s2.4 a v1alpha1 read answered by the conversion webhook | **PASS** (live, runs 8–11) | `kubectl get dynamocomponentdeployments.v1alpha1.nvidia.com <the graph's first component>` returned through the operator's conversion webhook, a `vm` Pod behind a ClusterIP Service with the CA the spike minted; the apiserver's reply carried its own `nvidia.com/v1alpha1 DynamoComponentDeployment is deprecated` warning, which is the v1alpha1 route answering |
 | s2.5 a completion through the frontend's ClusterIP | **FAIL** — discovery completed, the model never materialized (runs 11–12) | the worker registered (DynamoWorkerMetadata + EndpointSlice present, model card published, `/v1/metadata` served on its system port) and the frontend saw the instance within a second; `/v1/models` answered 200 after 100 s and listed nothing for the remaining 450 s while the frontend's discovery controller retried every 30 s on `fetching http://192.168.64.16:9090/v1/metadata/…/config.json: tcp connect error: No route to host (os error 113)` — the worker's self-detected address is its guest's NAT lease, and another guest cannot reach it. All three Pods stayed Running 1/1 throughout |
-| s2.6 the frontend's dial observed in the worker's own log | **FAIL** — the dial is the failure above, seen from the frontend's side | the script's s2.6 step did not run (s2.5 exits on its red), so this cell is filled from the frontend's own log rather than the worker's: the frontend dialed the worker at the address the worker published, `192.168.64.16:9090`, and got EHOSTUNREACH fourteen times over five minutes. The worker's log shows no inbound connection. This is the pre-decided halt: **R4(b) applies** |
+| s2.6 the frontend's dial observed in the worker's own log | **FAIL** — the dial is the failure above, seen from the frontend's side | the script's s2.6 step did not run (s2.5 exits on its red), so this cell is filled from the frontend's own log rather than the worker's: the frontend dialed the worker at the address the worker published, `192.168.64.16:9090`, and got EHOSTUNREACH fourteen times over five minutes. The worker's log shows no inbound connection. This is the pre-decided halt: **the native-Darwin fallback applies** |
 
 ## Substitutions taken (recorded on the verdict lines, off by default)
 
@@ -88,7 +88,7 @@ names what the node ran: `main` at c142f19, then the fixes S2 itself produced.
 | 5–6 | + untrack | mocker pods | operator Ready, 6 CRDs Established, ClusterRole dumped, graph accepted, frontend Service created — and no Pod: the operator's default `fsGroup: 1000` is refused by `k3sm-reject-foreign-user`, silently from the operator's side | gap |
 | 7 | + untrack | the node | pods reach runtimed for the first time; `fsGroup` refused outright on the vm class (`fsGroup is not supported on the vm RuntimeClass on this platform: applying it requires idmapped mounts, and this host's virtiofs rejects them`); decode also needs the example's `hf-token-secret` | M11 S3 gate; Secret created |
 | 8 | + untrack | the image | **s2.4 passes live**; runtimed refuses the image's named `USER dynamo` (`the image runs as a named user the host cannot resolve and the guest cannot be told`); the frontend's first pull loses a rename race with the decode pod's pull of the same image | named user: documented future work; **pull race: new runtimed bug** |
-| 9 | + untrack | the container | templates get `runAsUser=<node uid>`; **both containers start** and exit 1: `No usable temporary directory found in ['/tmp', '/var/tmp', '/usr/tmp', '/workspace']` — the image's `/tmp` is 1777 but the rootfs lower shows the host tree's `root 0755`, because the Linux dialect's ownership sidecar is written beside the snapshot and applied nowhere in-guest (`runtimed/docs/PHASES.md` M11.2-d4 — the ownership sidecar, `ownership.jsonl`, apply step; not the native-sidecar-container concept at k3sm's own `docs/PHASES.md` M10.2) | **new runtimed gap** |
+| 9 | + untrack | the container | templates get `runAsUser=<node uid>`; **both containers start** and exit 1: `No usable temporary directory found in ['/tmp', '/var/tmp', '/usr/tmp', '/workspace']` — the image's `/tmp` is 1777 but the rootfs lower shows the host tree's `root 0755`, because the Linux dialect's ownership sidecar is written beside the snapshot and applied nowhere in-guest (`runtimed/docs/PHASES.md` — the ownership sidecar, `ownership.jsonl`, apply step; not the native-sidecar-container concept at k3sm's own `docs/PHASES.md`) | **new runtimed gap** |
 | 10 | + untrack | the script | with `TMPDIR`/`HF_HOME` on the tmpfs the **frontend is Running and Ready** 72 s after creation, its Kubernetes discovery daemon watching EndpointSlices and DynamoWorkerMetadata; the script took the first 200 from `/v1/models` (an empty list) as discovery complete and asked for a completion against no model (404). The decode pod lost the pull race again at +42 s and k3sm's back-off retry had its container running at +88 s | script: wait for a listed model |
 | 11 | + untrack | the frontend's cache | **all three pods Running 1/1**; the worker registered (DynamoWorkerMetadata + EndpointSlice, model card published, endpoint on its guest address `192.168.64.15:42759`, not its pod IP `100.64.0.5`); the frontend saw the instance, then retried every 30 s on `creating MDC blobs dir /home/dynamo/.cache/dynamo/mdc/blobs: Permission denied` — the model-card cache is `$HOME/.cache/dynamo/mdc`, HOME only | HOME moves to the tmpfs |
 | 12 | + untrack | **the dial** | with `HOME` on the tmpfs too, the frontend materialized nothing for a different reason: every fetch of the worker's model card at `http://192.168.64.16:9090/v1/metadata/…` failed `No route to host`. The worker bound and published its guest lease (`192.168.64.16`, eth0); the frontend sits at `192.168.64.17` on the same NAT segment; darwin-net's own measurement (`pkg/podnet/doc.go:152`, `docs/user/limitations.md` "from a vm Pod's guest to another vm Pod's guest on the same node: blocked") is reproduced exactly | **HALT — R4(b)** |
@@ -119,9 +119,9 @@ fix. File:line against the trees named under Rig.
    carries numeric ids only; named as future apis work in the code.
 8. **The ownership sidecar is written and never applied in-guest**
    (`runtimed/pkg/image/unpack.go:495` writes it; `ReadOwnershipSidecar` has only test
-   callers; `pkg/guestinit` has no apply step; `runtimed/docs/PHASES.md` M11.2-d4 — the
+   callers; `pkg/guestinit` has no apply step; `runtimed/docs/PHASES.md` — the
    ownership sidecar (`ownership.jsonl`) apply step, not the native-sidecar-container
-   concept at k3sm's own `docs/PHASES.md` M10.2 — lists it as delivered). Every file
+   concept at k3sm's own `docs/PHASES.md` — lists it as delivered). Every file
    in a vm rootfs is root-owned with host modes, so a non-root image has no writable
    directory in its own tree.
 9. **Two concurrent pulls of one reference race at the index commit**
@@ -149,7 +149,7 @@ fix. File:line against the trees named under Rig.
 
 ## Consequence recorded here
 
-**R4(b) applies**: the control plane moves to the native-Darwin build as a second
+**the native-Darwin fallback applies**: the control plane moves to the native-Darwin build as a second
 `hack/images/` entry. S1 already holds the darwin/arm64 build of the runtime at the pin
 (its wheel hash recorded per build), so the halt lands on something that exists. As
 native Darwin processes the frontend and the workers each get a `/32` on `lo0` and the
@@ -177,7 +177,7 @@ The apiserver's answer on the dev tier (runs 6–11; `kubectl get crd -o json` r
 | dynamomodels | nvidia.com | DynamoModel | v1alpha1 | v1alpha1 | None |
 | dynamoworkermetadatas | nvidia.com | DynamoWorkerMetadata | v1alpha1 | v1alpha1 | None |
 
-The plan's S2 row expects **nine** CRDs to reach Established; the operator image at
+The spike's S2 row expects **nine** CRDs to reach Established; the operator image at
 v1.5.0 ships **six** (`deploy/operator/Dockerfile` copies exactly
 `config/crd/bases/`, and that directory holds six). The count in the row was written
 against an earlier upstream ref; the pin, not the row, is the source of truth, and the
@@ -192,7 +192,7 @@ closed rather than silently.
 
 ## The operator `ClusterRole`, verbatim
 
-> Paste the dump here. This is the R11 input and what the golden test pins: a grant
+> Paste the dump here. This is the RBAC golden-test input and what the golden test pins: a grant
 > nobody read is a grant nobody decided. Any wildcard verb or resource, and any
 > `secrets` access outside the webhook cert's namespace, is called out by name.
 

@@ -2,7 +2,7 @@
 # Copyright The k3sm Authors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# k3sm B29 acceptance: `kubectl debug` (ephemeral containers) against an
+# k3sm kubectl debug acceptance: `kubectl debug` (ephemeral containers) against an
 # INSTALLED, RUNNING node (`sudo k3sm install` on this Mac, a live cluster at
 # $KUBECONFIG). This gate boots nothing itself.
 #

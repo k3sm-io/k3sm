@@ -26,7 +26,7 @@ import (
 	"testing"
 )
 
-// B575 — the run-log header and verdict functions live in one sourced library,
+// The run-log header and verdict functions live in one sourced library,
 // hack/lab/lib/runlog.sh. Before it, hack/lab/m17-interconnect.sh read the four
 // function bodies out of hack/lab/m11.sh with sed and evaluated them, so moving
 // text inside m11.sh could break another ladder.
@@ -95,8 +95,8 @@ var runlogAllowlist = map[string]string{
 	"hack/lab/B46.sh": "its header differs (mode leg-<n>, an evidence_dir line, a fixed provisional result); adopting the library changes its log, a separate change",
 }
 
-// TestLabRunLogHeaderHelpersAreShared is the B575 gate. It renders a run-log
-// header through the library under /bin/bash (the macOS bash 3.2 the rig runs)
+// TestLabRunLogHeaderHelpersAreShared is the shared-library gate. It renders a run-log
+// header through the library under /bin/bash (the macOS bash 3.2 the lab host runs)
 // against a golden file, and fails when a hack/lab script other than the library
 // defines or text-extracts those functions.
 func TestLabRunLogHeaderHelpersAreShared(t *testing.T) {

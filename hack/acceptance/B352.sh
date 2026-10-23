@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B352 acceptance gate — the runnable proof that `k3sm install` builds the
+# k3sm install publish acceptance gate — the runnable proof that `k3sm install` builds the
 # whole install root in a sibling directory and publishes it in ONE step, so no
 # failure part-way through can leave a tree the daemon supervisor will execute.
 #
@@ -10,7 +10,7 @@
 # a power loss part-way through left the NEW binary beside the OLD helpers while
 # the daemons still ran the previous build, and launchd's KeepAlive re-execs
 # whatever is at the fixed paths the plists name — so a crash in that window
-# promoted a combination nothing had ever tested. B349 moved every input-only
+# promoted a combination nothing had ever tested. An earlier change moved every input-only
 # refusal ahead of the first write, which closed the refusals; it did not make
 # the copies themselves all-or-nothing.
 #
@@ -64,7 +64,7 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 lab_pending() { echo "LAB-PENDING  $1"; }
 
-echo "==> k3sm B352 acceptance (the install root is staged and published in one step)"
+echo "==> k3sm install publish acceptance (the install root is staged and published in one step)"
 
 # ---- b352.0 — the gate parses and its sources exist -------------------------
 # stage.go is deliberately NOT required here: it is the file this item ADDS, so
@@ -79,8 +79,8 @@ done
 ladder "$b0" "b352.0  gate parses (bash -n) + pkg/install/{install,install_darwin,restart,datavol}.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B352: the gate or its sources are missing — nothing else can run" >&2
-	echo "B352: $PASS passed, $FAIL failed" >&2
+	echo "install publish: the gate or its sources are missing — nothing else can run" >&2
+	echo "install publish: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -307,10 +307,10 @@ lab_pending "b352.L3  /Library/k3sm and /Library/k3sm.staging report the same fi
 lab_pending "b352.L4  a second \`sudo k3sm install\` started while the first is copying is refused immediately, naming the lock at /Library/k3sm.lock — never queued behind a run the operator cannot see"
 lab_pending "b352.L5  an install killed mid-copy (SIGKILL during the payload) leaves /Library/k3sm byte-identical and both daemons still running the previous build; the next install removes the abandoned staging tree and succeeds"
 if [ "${K3SM_LAB:-}" = 1 ]; then
-	echo "B352: K3SM_LAB=1 is set, but the lab rungs above are human-run by design (each one reinstalls or interrupts a real cluster). Nothing was executed." >&2
+	echo "install publish: K3SM_LAB=1 is set, but the lab rungs above are human-run by design (each one reinstalls or interrupts a real cluster). Nothing was executed." >&2
 fi
 
 echo "----------------------------------------"
-echo "B352: $PASS passed, $FAIL failed"
+echo "install publish: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B352 GREEN (CI tier; the five lab rungs are human-run) ================"
+echo "================ install publish GREEN (CI tier; the five lab rungs are human-run) ================"

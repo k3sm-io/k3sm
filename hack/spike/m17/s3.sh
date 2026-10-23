@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M17.0 / S3 — link-local after member removal: the discovery and pairing path.
+# S3 — link-local after member removal: the discovery and pairing path.
 #
 #   (1) After `ifconfig bridge0 deletem <enX>`, the port gets its own fe80::%enX, and
 #       the time from removal to a non-tentative address (the DAD delay) is recorded:
@@ -27,14 +27,14 @@ RECORDED: the DAD delay per Mac; the remote zone; the dial time; whether the por
 METHOD="A privileged script with the restore trap removes each port from bridge0 and polls ifconfig for the fe80
 address; the probe's mcast-listen/mcast-send and zone-serve/zone-dial (net/http, crypto/tls, in-memory self-signed
 certificate verified by pin) run as the login user on each Mac."
-HALT="s3.1/s3.2/s3.3 fail (fe80 unusable on a removed member) -> R8: the beacon rides bridge0 on the UNJOINED Mac only
+HALT="s3.1/s3.2/s3.3 fail (fe80 unusable on a removed member) -> the beacon rides bridge0 on the UNJOINED Mac only
   and the server keeps its ports removed. (Build amendment A1 already made that the design: the joiner pairs from
   bridge0; this rung records whether the server side of A1 holds.)"
 
 spike_args "$RUNG" "$QUESTION" "$CRITERIA" "$METHOD" "$HALT" "$@"
 spike_begin "$RUNG"
 
-R8_S3="halt (R8): the beacon rides bridge0 on the unjoined Mac only and the server keeps its ports removed"
+R8_S3="halt: the beacon rides bridge0 on the unjoined Mac only and the server keeps its ports removed"
 
 # ---------------------------------------------------------------------------------
 note "S3(1) — member removal and the DAD delay, both Macs"
