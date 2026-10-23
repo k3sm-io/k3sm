@@ -7,14 +7,19 @@ By participating, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md
 
 ## Building and testing
 
-k3sm is a multi-repo Go workspace (`apis`, `runtimed`, `darwin-net`, `k3sm`).
-Each repository documents its own build and test commands in its `CLAUDE.md` and
-`docs/GO-STANDARDS.md`. The commit gate for every repository is its `hack/ci.sh`
-(`gofmt -l`, `go vet`, `go build`, `go test`, plus the per-file license-header
-check, plus `staticcheck -tests=false ./...`). Run it before opening a pull request.
-The staticcheck version is pinned; install it with
-`go install honnef.co/go/tools/cmd/staticcheck@2026.2.1`. The gate fails when
-staticcheck is missing or is any other version.
+k3sm is a multi-repository project. Most repositories are Go modules (`apis`,
+`runtimed`, `darwin-net`, `k3sm`); the macOS app and the Swift SDK are Swift
+packages, and the C++ SDK is a CMake project. Every repository has a `hack/ci.sh`
+that is its commit gate. Run it before opening a pull request. Each repository's
+README says what its gate checks and which toolchain it needs.
+
+### Go repositories
+
+The Go gate runs `gofmt -l`, `go vet`, `go build`, `go test`, the per-file
+license-header check, and `staticcheck -tests=false ./...`. Each Go repository
+documents its commands in `docs/GO-STANDARDS.md`. The staticcheck version is
+pinned; install it with `go install honnef.co/go/tools/cmd/staticcheck@2026.2.1`.
+The gate fails when staticcheck is missing or is any other version.
 
 ## Developer Certificate of Origin (DCO)
 
@@ -59,17 +64,18 @@ The `type` is one of, and only one of:
 | `feat` | New user- or API-visible behavior — a flag, a field, a service, a capability |
 | `fix` | Correcting behavior that was wrong against its own contract or spec |
 | `docs` | Documentation only (`*.md`, `docs/`, doc comments) |
-| `test` | Tests only — `*_test.go`, `testdata/`, test fixtures |
+| `test` | Tests only — Go `*_test.go` files, Swift `Tests/`, C++ `tests/`, `testdata/`, test fixtures |
 | `refactor` | Restructuring with no externally observable change |
 | `perf` | A change only in the resource dimension; the body must carry a measurement |
-| `build` | Build, dependency, and packaging surface — `go.mod`, `hack/*.sh`, packaging config |
+| `build` | Build, dependency, and packaging surface — `go.mod`, `Package.swift`, `CMakeLists.txt`, `hack/*.sh`, packaging config |
 | `ci` | Continuous-integration configuration |
 | `chore` | Repo housekeeping with no product surface — `.gitignore`, tooling config |
 | `revert` | Reverting a commit; the body names the reverted sha, its subject, and why |
 
 The `scope` is the **directory name of the package or subsystem you changed** — literally what
-`ls` prints (`dns`, `sandbox`, `provider`, `runtime/v1`, `svclb`, `certs`, …), or a
-cross-cutting area (`docs`, `hack`, `deps`, `ci`). Do not invent a scope the tree does not
+`ls` prints (`dns`, `sandbox`, `provider`, `runtime/v1`, `svclb`, `certs`, …; in the Swift
+repositories the lowercased target directory, such as `k3smstatus`; in the C++ SDK a directory
+such as `include` or `tests`), or a cross-cutting area (`docs`, `hack`, `deps`, `ci`). Do not invent a scope the tree does not
 have. Omit the scope entirely for a genuinely repo-wide change; never write empty parentheses.
 
 Examples:
@@ -105,7 +111,7 @@ that. A one-line change with a self-explanatory subject needs no body.
 ### Pull requests
 
 1. Fork (or branch off `main`) and make your change with signed-off commits.
-2. Ensure `hack/ci.sh` passes locally.
+2. Ensure the repository's `hack/ci.sh` passes locally.
 3. Open a PR against `main`. **The PR title follows the same `type(scope): summary` grammar** —
    PRs are squash-merged, so the title becomes the commit subject on `main`.
 4. Structure the PR body in this order, keeping every heading. If a section has nothing to
