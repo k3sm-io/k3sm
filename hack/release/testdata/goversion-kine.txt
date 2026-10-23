@@ -1,4 +1,4 @@
-/fixture/kine: go1.27.2
+/fixture/kine: go1.27.3
 	path	github.com/k3s-io/kine
 	mod	github.com/k3s-io/kine	(devel)	
 	dep	go.etcd.io/etcd/server/v3	v3.7.2	h1:gfnwItZwsDFKUqCJocsBVMNNtWYGTl7/dHc+83qeYVo=

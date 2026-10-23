@@ -1,4 +1,4 @@
-/fixture/etcd: go1.27.2
+/fixture/etcd: go1.27.3
 	path	k3sm.io/etcd-child
 	mod	k3sm.io/etcd-child	(devel)	
 	dep	go.etcd.io/etcd/server/v3	v3.6.15	h1:IFlqNq0ia29PAcT73gfZjaYO/R+QCOavhenkAP4Y1N0=

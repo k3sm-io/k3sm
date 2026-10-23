@@ -880,10 +880,10 @@ case "\$1 \$2" in
 esac
 FAKE
 	chmod +x "$fgo"
-	if GO="$fgo" FAKE_GOVERSION=go1.27.2 toolchain_problems go1.27.2 >/dev/null; then ok "the pinned toolchain passes"; else bad "the pinned toolchain was refused"; fi
+	if GO="$fgo" FAKE_GOVERSION=go1.27.3 toolchain_problems go1.27.3 >/dev/null; then ok "the pinned toolchain passes"; else bad "the pinned toolchain was refused"; fi
 	if [ "$(cat "$tmp/fake-go.toolchain")" = local ]; then ok "the assert asks with GOTOOLCHAIN=local, as the payload build runs"; else bad "the assert did not set GOTOOLCHAIN=local"; fi
-	if out="$(GO="$fgo" FAKE_GOVERSION=go1.27.1 toolchain_problems go1.27.2)"; then bad "another toolchain passed"; elif printf '%s\n' "$out" | grep -q "go1.27.1.*pin go1.27.2"; then ok "another toolchain is refused, naming both"; else bad "toolchain refusal not named: $out"; fi
-	if GO="$fgo" FAKE_GOVERSION='' toolchain_problems go1.27.2 >/dev/null; then bad "a failing go passed"; else ok "a go that cannot report its version is refused"; fi
+	if out="$(GO="$fgo" FAKE_GOVERSION=go1.27.1 toolchain_problems go1.27.3)"; then bad "another toolchain passed"; elif printf '%s\n' "$out" | grep -q "go1.27.1.*pin go1.27.3"; then ok "another toolchain is refused, naming both"; else bad "toolchain refusal not named: $out"; fi
+	if GO="$fgo" FAKE_GOVERSION='' toolchain_problems go1.27.3 >/dev/null; then bad "a failing go passed"; else ok "a go that cannot report its version is refused"; fi
 	# PATH holds no go, so even a broken assert could not build anything here.
 	if out="$(PATH=/usr/bin:/bin GO="$fgo" FAKE_GOVERSION=go1.0.0 "$self" "$tmp/stage-oldgo" 2>&1)"; then
 		bad "staging with a non-pinned go exited 0"
@@ -898,19 +898,19 @@ FAKE
 	for kind in kine etcd etcdutl zot; do
 		case "$kind" in kine) want=v0.17.2 ;; zot) want=v2.1.22 ;; *) want=v3.6.15 ;; esac
 		fx2="$td/goversion-$kind.txt"
-		if out="$(buildinfo_problems "$kind" "$want" go1.27.2 <"$fx2")"; then ok "$kind capture passes"; else bad "$kind capture rejected: $out"; fi
-		if out="$(buildinfo_problems "$kind" "$want" go1.27.9 <"$fx2")"; then bad "$kind: another toolchain passed"; elif printf '%s\n' "$out" | grep -q "built with 'go1.27.2'"; then ok "$kind: another toolchain is refused"; else bad "$kind: toolchain not named: $out"; fi
-		if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.2)"; then bad "$kind: a cgo build passed"; elif printf '%s\n' "$out" | grep -q "CGO_ENABLED=0"; then ok "$kind: a cgo build is refused"; else bad "$kind: cgo not named: $out"; fi
+		if out="$(buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then ok "$kind capture passes"; else bad "$kind capture rejected: $out"; fi
+		if out="$(buildinfo_problems "$kind" "$want" go1.27.9 <"$fx2")"; then bad "$kind: another toolchain passed"; elif printf '%s\n' "$out" | grep -q "built with 'go1.27.3'"; then ok "$kind: another toolchain is refused"; else bad "$kind: toolchain not named: $out"; fi
+		if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a cgo build passed"; elif printf '%s\n' "$out" | grep -q "CGO_ENABLED=0"; then ok "$kind: a cgo build is refused"; else bad "$kind: cgo not named: $out"; fi
 		if [ "$kind" != zot ]; then
-			if out="$(grep -v -- '-trimpath' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.2)"; then bad "$kind: a build without -trimpath passed"; else ok "$kind: a build without -trimpath is refused"; fi
+			if out="$(grep -v -- '-trimpath' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build without -trimpath passed"; else ok "$kind: a build without -trimpath is refused"; fi
 		fi
-		if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.2)"; then bad "$kind: an amd64 build passed"; else ok "$kind: an amd64 build is refused"; fi
-		if out="$(sed 's/^\([[:space:]]*path[[:space:]]\).*/\1example.com\/other/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.2)"; then bad "$kind: another main package passed"; else ok "$kind: another main package is refused"; fi
+		if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: an amd64 build passed"; else ok "$kind: an amd64 build is refused"; fi
+		if out="$(sed 's/^\([[:space:]]*path[[:space:]]\).*/\1example.com\/other/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: another main package passed"; else ok "$kind: another main package is refused"; fi
 	done
-	if out="$(buildinfo_problems etcd v3.6.14 go1.27.2 <"$td/goversion-etcd.txt")"; then bad "etcd at another version passed"; elif printf '%s\n' "$out" | grep -q "server/v3 is not at v3.6.14"; then ok "etcd at another version is refused"; else bad "etcd version not named: $out"; fi
-	if out="$(buildinfo_problems etcd v3.6.15 go1.27.2 <"$td/goversion-etcdutl.txt")"; then bad "etcdutl passed as etcd"; else ok "etcdutl does not pass as etcd"; fi
-	if out="$(buildinfo_problems zot v2.1.21 go1.27.2 <"$td/goversion-zot.txt")"; then bad "zot at another version passed"; elif printf '%s\n' "$out" | grep -q "zot/v2 is not at v2.1.21"; then ok "zot at another version is refused"; else bad "zot version not named: $out"; fi
-	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$td/goversion-etcd.txt")" | buildinfo_problems etcd v3.6.15 go1.27.2)"; then bad "a replaced module passed"; elif printf '%s\n' "$out" | grep -q "replaced"; then ok "a replaced module is refused"; else bad "replace not named: $out"; fi
+	if out="$(buildinfo_problems etcd v3.6.14 go1.27.3 <"$td/goversion-etcd.txt")"; then bad "etcd at another version passed"; elif printf '%s\n' "$out" | grep -q "server/v3 is not at v3.6.14"; then ok "etcd at another version is refused"; else bad "etcd version not named: $out"; fi
+	if out="$(buildinfo_problems etcd v3.6.15 go1.27.3 <"$td/goversion-etcdutl.txt")"; then bad "etcdutl passed as etcd"; else ok "etcdutl does not pass as etcd"; fi
+	if out="$(buildinfo_problems zot v2.1.21 go1.27.3 <"$td/goversion-zot.txt")"; then bad "zot at another version passed"; elif printf '%s\n' "$out" | grep -q "zot/v2 is not at v2.1.21"; then ok "zot at another version is refused"; else bad "zot version not named: $out"; fi
+	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$td/goversion-etcd.txt")" | buildinfo_problems etcd v3.6.15 go1.27.3)"; then bad "a replaced module passed"; elif printf '%s\n' "$out" | grep -q "replaced"; then ok "a replaced module is refused"; else bad "replace not named: $out"; fi
 	if [ "$(buildinfo_settings <"$td/goversion-kine.txt" | tr ' ' '\n' | grep -c .)" = 8 ]; then ok "the build settings are recorded from the build info"; else bad "buildinfo_settings: $(buildinfo_settings <"$td/goversion-kine.txt")"; fi
 
 	echo "==> child_problems over a staged payload (fake go, real-shaped build info)"
@@ -925,21 +925,21 @@ FAKE
 		printf 'etcd\n' >"$cpd/etcd"; echo "v3.6.15 nocgo" >"$cpd/etcd.version"
 		printf 'etcdutl\n' >"$cpd/etcdutl"; echo "v3.6.15 nocgo" >"$cpd/etcdutl.version"
 		r=0
-		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  ok    the pinned children pass"; else echo "  FAIL  the pinned children were refused: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  ok    the pinned children pass"; else echo "  FAIL  the pinned children were refused: $o"; r=1; fi
 		echo "v0.17.2 nocgo+p0" >"$cpd/kine.version"
-		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a patch-set mismatch passed"; r=1; elif printf '%s\n' "$o" | grep -q "kine.version"; then echo "  ok    a marker naming another patch set is refused"; else echo "  FAIL  marker not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a patch-set mismatch passed"; r=1; elif printf '%s\n' "$o" | grep -q "kine.version"; then echo "  ok    a marker naming another patch set is refused"; else echo "  FAIL  marker not named: $o"; r=1; fi
 		echo "v0.17.2 nocgo+p1" >"$cpd/kine.version"
 		printf 'mach-o...v0.17.2...\n' >"$cpd/kine"
-		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a kine without the stamped version passed"; r=1; elif printf '%s\n' "$o" | grep -q "stamped version"; then echo "  ok    a kine without its stamp is refused"; else echo "  FAIL  stamp not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a kine without the stamped version passed"; r=1; elif printf '%s\n' "$o" | grep -q "stamped version"; then echo "  ok    a kine without its stamp is refused"; else echo "  FAIL  stamp not named: $o"; r=1; fi
 		printf 'mach-o...v0.17.2+p1...\n' >"$cpd/kine"
 		rm "$cpd/etcdutl"
-		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif printf '%s\n' "$o" | grep -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif printf '%s\n' "$o" | grep -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
 		printf 'etcdutl\n' >"$cpd/etcdutl"
 		echo "v2.1.20 minimal" >"$cpd/zot.version"
-		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
 		echo "v2.1.22 minimal" >"$cpd/zot.version"
 		rm "$cpd/zot" "$cpd/helm-v4.3.0"
-		if o="$(child_problems "$cpd" go1.27.2)"; then echo "  FAIL  a payload without zot and helm passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot: not staged" && printf '%s\n' "$o" | grep -q "helm-v4.3.0: not staged"; then echo "  ok    a missing zot and a missing helm are refused"; else echo "  FAIL  missing zot or helm not named: $o"; r=1; fi
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without zot and helm passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot: not staged" && printf '%s\n' "$o" | grep -q "helm-v4.3.0: not staged"; then echo "  ok    a missing zot and a missing helm are refused"; else echo "  FAIL  missing zot or helm not named: $o"; r=1; fi
 		exit "$r"
 	) || fails=$((fails + 1))
 
