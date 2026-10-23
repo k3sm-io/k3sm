@@ -2,8 +2,8 @@
 # shellcheck disable=SC2329 # the assertions and their helpers run through the rung table's "$fn"
 #
 # k3sm M17 lab ladder: the Thunderbolt cable between two cluster Macs as an
-# admin-armed interconnect beside the wireguard mesh (the B451 amendment to the
-# M17 plan, its I1..I10 resolutions and BI10). This file is the one executable
+# admin-armed interconnect beside the wireguard mesh (the cabled-interconnect
+# ladder). This file is the one executable
 # home of the ladder; hack/lab/m17.sh execs it.
 #
 # Row in hack/acceptance/phases.json:

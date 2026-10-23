@@ -662,7 +662,7 @@ else
 	ladder no "b572.s2b no listener on p1 $P1 on either node, within 60 s ($lis)"
 fi
 left="$(survivors "$(on "$K3SM_B572_WORKER_SSH" "ps -axo pid=,user=" | awk '$2 == "_k3sm" { print $1 }')" "$A_PIDS")"
-# Also any _k3sm process carrying pod A's marker now (a server the loop started
+# Also any _k3sm process carrying pod A's marker now (a server this script started
 # after the record above).
 left="$(echo "$left $(pod_pids "$WORKER" b572-a)" | tr ' ' '\n' | sort -un | xargs)"
 if [ -z "$left" ]; then

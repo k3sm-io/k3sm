@@ -19,8 +19,8 @@
 # Asserts (the m1.sh PASS/FAIL ladder pattern):
 #   1. the IngressClass k3sm (controller k3sm.io/ingress) is provisioned,
 #   2. the canonical kube-system/k3sm-ingress LoadBalancer Service declares 80+443,
-#   3. host+path routing: an Ingress (class k3sm) fronting a hello-http backend
-#      answers on http://<nodeIP>:<port> with Host-header routing (+ a wrong-host
+#   3. host+path routing: an Ingress (class k3sm) fronting an nc shell-responder
+#      backend answers on http://<nodeIP>:<port> with Host-header routing (+ a wrong-host
 #      404 negative),
 #   4. the Ingress status.loadBalancer.ingress carries the node InternalIP
 #      (written only AFTER the listener is live — bind-then-advertise),

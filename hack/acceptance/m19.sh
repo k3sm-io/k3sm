@@ -9,7 +9,7 @@
 # tier integration, requires dev-mac, manual: false, skeleton: true). The rig slice
 # is the SEPARATE row M19-lab (hack/lab/m19.sh, manual: true).
 #
-# The REAL M19 gate is a COMPOSITE (the M19 plan §Gates), written as M19.3 lands:
+# The REAL M19 gate is a COMPOSITE (listed below), written as M19.3 lands:
 #   1 the handler table and the SandboxBackend enum pin (wasm is 5, container-vm is 6)
 #   2 the wasm class is provisioned with the k3sm.io/wasm selector merged with the
 #     darwin selector and no tolerations

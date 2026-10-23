@@ -44,6 +44,9 @@
 #                                    module, then golang.org/x/net at MS_XNET,
 #                                    then the MS_FIXES security fixes);
 #                                    review the diff as a dependency change
+#   hack/images/metrics-server/build.sh --work <dir> --tag <ref>
+#                                    name the built image <ref> instead of the
+#                                    default ghcr.io/k3sm-io/metrics-server:<version>
 #   hack/images/metrics-server/build.sh --live                anonymous resolve
 #                                    of image.yaml's ref in the registry
 #   hack/images/metrics-server/build.sh --print-dockerfile

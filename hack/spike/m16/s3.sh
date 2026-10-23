@@ -33,7 +33,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RUNG="S3"
 QUESTION="Can the M8 engine be driven in-process from token IDs with the KV cache pinned and continuous batching on, aborted mid-stream, and its prefix-cache block hashes observed cheaply enough to publish on the hot path?"
 METHOD="Rig-side over ssh: the engine core constructed directly in a python process with the M8 sizing formula's pinned max_kv_size and max_num_seqs, driven from tokenized IDs, aborted mid-stream, its prefix cache inspected for stored and evicted block hashes, and the publish call timed sync versus async; then the alternative engine installed in its own venv and run against the M8 baseline on the same rig as a recorded control."
-HALT="the in-process path fails -> R3's HTTP sidecar shape onto mlx-serve, where the block size is unset, routing degrades to round-robin by contract, and docs/user/mlx-fleet.md says so in its first section."
+HALT="the in-process path fails -> R3's HTTP sidecar shape onto mlx-serve, where the block size is unset, routing degrades to round-robin by contract."
 
 case "${1:-}" in
 --plan | --dry-run) spike_plan "$RUNG" "$QUESTION" "$METHOD" "$HALT" ;;
