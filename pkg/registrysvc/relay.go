@@ -20,9 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"strconv"
 	"sync"
@@ -33,9 +33,9 @@ import (
 	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
-// The MESH/GUEST RELAY: a TCP forwarder that accepts on an address other
-// machines (or this Mac's own vm guests) can reach and hands every connection to
-// the registry's loopback listener.
+// The MESH/GUEST RELAY: an HTTP front that accepts on an address other machines
+// (or this Mac's own vm guests) can reach, serves the push gate there, and hands
+// every request the gate admits to the registry's loopback listener.
 //
 // WHY A RELAY AND NOT A SECOND BIND. The ingest registry binds 127.0.0.1 and New
 // refuses anything else, because that single fact is what makes anonymous pull
@@ -48,11 +48,15 @@ import (
 // WHAT REACHABILITY BUYS, AND WHAT IT DOES NOT. Pull inside the mesh is
 // anonymous, exactly as it is on loopback — that is the point: a peer node's
 // puller falls back to this node when its own ingest registry misses a
-// node-relative reference. PUSH is unchanged and still needs the per-boot
-// credential, which lives in a 0600 file on the pushing node and is never
-// distributed; the relay carries the bytes and enforces nothing, because the
-// htpasswd gate is zot's and sits behind it. So a peer can read what this cluster
-// runs and cannot plant an image it will run.
+// node-relative reference. A WRITE is not carried blindly: every relay address
+// serves the push gate (gate.go), which forwards a write only for a pod whose
+// own ServiceAccount token the apiserver vouches for, in a namespace that opted
+// in, under that namespace's repository prefix, with an RBAC grant to push, and
+// which refuses DELETE outright. The registry's own per-boot credential for the
+// local CLI is never presented here and never leaves the node; the gate holds a
+// second, in-memory credential that can create and update but never delete. So
+// a peer can read what this cluster runs and cannot plant an image it will run
+// unless the cluster's own RBAC said it may.
 //
 // THE TWO ADDRESSES, and why they are the only two:
 //
@@ -84,6 +88,14 @@ const (
 	// because the target is on this host: a loopback dial that has not completed
 	// in a second is not going to.
 	relayDialTimeout = 1 * time.Second
+	// relayReadHeaderTimeout, relayMaxHeaderBytes, relayIdleTimeout and
+	// relayMaxConns bound what one client can hold of a relay address before
+	// the gate has decided anything. There is no read or write timeout: a blob
+	// is as large as an image layer and streams for as long as it takes.
+	relayReadHeaderTimeout = 10 * time.Second
+	relayMaxHeaderBytes    = 16 << 10
+	relayIdleTimeout       = 90 * time.Second
+	relayMaxConns          = 256
 )
 
 // Relay refusals. They are sentinels because the callers respond differently: a
@@ -113,7 +125,15 @@ type RelayConfig struct {
 	// guests and contributes no listener. The GATEWAY — the first host of the
 	// segment — is what gets bound; the subnet is what the caller already knows.
 	VMNetSubnet string
-	// Logger receives bind and forward events. nil means slog.Default.
+	// Auth is the push gate's apiserver clients, under the gate's own narrow
+	// identity. Incomplete (the identity could not be built) serves reads and
+	// refuses every write with 503; there is no raw-forward fallback.
+	Auth GateAuth
+	// GateCredential is the registry credential an authorized write is
+	// forwarded with (Service.GateCredential). Empty refuses every write.
+	GateCredential Credential
+	// Logger receives bind, forward and push-decision events. nil means
+	// slog.Default.
 	Logger *slog.Logger
 }
 
@@ -123,15 +143,15 @@ type RelayConfig struct {
 // The zero value is not usable — construct one with NewRelay, which is where the
 // bind discipline is enforced.
 type Relay struct {
-	port  int
-	binds []netip.Addr
-	log   *slog.Logger
+	port    int
+	binds   []netip.Addr
+	log     *slog.Logger
+	handler http.Handler
 
-	// listen and dial are seams so the accept/forward mechanics are testable over
-	// a loopback pair, with no mesh and no guest. Production wires a
-	// segment-clamped net.Listen and a net.Dialer.
+	// listen is a seam so the serve mechanics are testable over a loopback
+	// listener, with no mesh and no guest. Production wires a segment-clamped
+	// net.Listen.
 	listen func(addr string) (net.Listener, error)
-	dial   func(ctx context.Context, addr string) (net.Conn, error)
 }
 
 // NewRelay validates cfg and returns a Relay.
@@ -151,24 +171,25 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newRelay(cfg.Port, binds, cfg.Logger), nil
+	return newRelay(cfg.Port, binds, cfg.Logger, cfg.Auth, cfg.GateCredential), nil
 }
 
 // newRelay assembles a Relay over the PRODUCTION seams. It is the one place they
-// are wired, so a test that drives the accept/forward mechanics over a loopback
-// pair exercises the same listener and dialer the shipped relay uses.
-func newRelay(port int, binds []netip.Addr, log *slog.Logger) *Relay {
+// are wired, so a test that drives the serve mechanics over a loopback listener
+// exercises the same listener and gate the shipped relay uses.
+func newRelay(port int, binds []netip.Addr, log *slog.Logger, auth GateAuth, cred Credential) *Relay {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Relay{
+	r := &Relay{
 		port:  port,
 		binds: binds,
 		log:   log,
 		// The relay binds a mesh address and the vm NAT gateway, which local pods
 		// reach over lo0, so every accepted connection's TCP segment size is
-		// clamped. The dial is not: it targets the registry's 127.0.0.1 listener,
-		// and 127/8 is permanently on lo0, so that connection never re-routes.
+		// clamped. The gate's upstream dial is not: it targets the registry's
+		// 127.0.0.1 listener, and 127/8 is permanently on lo0, so that connection
+		// never re-routes.
 		listen: func(addr string) (net.Listener, error) {
 			ln, err := net.Listen("tcp", addr)
 			if err != nil {
@@ -176,11 +197,9 @@ func newRelay(port int, binds []netip.Addr, log *slog.Logger) *Relay {
 			}
 			return tcpseg.WrapListener(ln), nil
 		},
-		dial: func(ctx context.Context, addr string) (net.Conn, error) {
-			d := net.Dialer{Timeout: relayDialTimeout}
-			return d.DialContext(ctx, "tcp", addr)
-		},
 	}
+	r.handler = newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log})
+	return r
 }
 
 // relayBinds resolves the addresses cfg asks for, refusing every address that is
@@ -333,75 +352,81 @@ func (r *Relay) retry(ctx context.Context, attempt int, stage, addr string, err 
 	}
 }
 
-// accept runs the accept+forward loop over ln. It returns nil on a clean stop
-// (ctx cancelled or the listener closed) so serve can tell "we are shutting
-// down" from "this listener broke".
-func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			return fmt.Errorf("accept: %w", err)
-		}
-		go r.forward(ctx, conn)
-	}
-}
-
-// forward proxies client↔registry bytes both ways with TCP half-close
-// propagation, returning only once BOTH directions have finished.
+// accept serves the push gate over ln, at most relayMaxConns connections at a
+// time. It returns nil on a clean stop (ctx cancelled or the listener closed)
+// so serve can tell "we are shutting down" from "this listener broke".
 //
-// Waiting for both, and propagating the half-close rather than treating it as a
-// session end, is the same discipline the apiserver load balancer's forwarder
-// documents: a registry push sends a large body and then reads a response, and a
-// pull streams a blob long after the request ended. Tearing the pair down when
-// EITHER direction finished would truncate both.
-func (r *Relay) forward(ctx context.Context, client net.Conn) {
-	defer client.Close()
-	registry, err := r.dial(ctx, r.target())
-	if err != nil {
-		// DEBUG, not WARN: the registry being down is a state a peer's puller
-		// already handles (it reads a connection refusal as "this mirror does not
-		// have it" and moves on), and one dead node must not fill every peer's log.
-		r.log.Debug("ingest registry relay could not reach the local registry", "target", r.target(), "err", err)
-		return
+// One http.Server per address, with the gate mounted directly as its handler.
+// Cancelling ctx closes the server and every connection on it at once, as the
+// raw relay did, because the registry it fronts is about to stop.
+func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
+	srv := &http.Server{
+		Handler:           r.handler,
+		ReadHeaderTimeout: relayReadHeaderTimeout,
+		MaxHeaderBytes:    relayMaxHeaderBytes,
+		IdleTimeout:       relayIdleTimeout,
+		ErrorLog:          slog.NewLogLogger(r.log.Handler(), slog.LevelDebug),
 	}
-	defer registry.Close()
-
-	// Close both conns on ctx cancel so shutdown drains in-flight forwards; the
-	// deferred cancel reaps the watcher when the forward ends first.
-	connCtx, connCancel := context.WithCancel(ctx)
-	defer connCancel()
+	stop := make(chan struct{})
+	defer close(stop)
 	go func() {
-		<-connCtx.Done()
-		_ = client.Close()
-		_ = registry.Close()
+		select {
+		case <-ctx.Done():
+		case <-stop:
+		}
+		_ = srv.Close()
 	}()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(registry, client)
-		relayCloseWrite(registry)
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(client, registry)
-		relayCloseWrite(client)
-	}()
-	wg.Wait()
+	err := srv.Serve(newLimitListener(ln, relayMaxConns))
+	if ctx.Err() != nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return fmt.Errorf("serve: %w", err)
 }
 
-// relayCloseWrite propagates a half-close where the conn supports it (TCP), so
-// the peer reads EOF on that direction while the other stays open.
-func relayCloseWrite(c net.Conn) {
-	if hc, ok := c.(interface{ CloseWrite() error }); ok {
-		_ = hc.CloseWrite()
+// limitListener caps the connections a listener has open at once. Accept
+// blocks while the cap is reached, so a client holding connections open costs
+// other clients a wait, never this process its file descriptors.
+type limitListener struct {
+	net.Listener
+	sem       chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newLimitListener(ln net.Listener, n int) *limitListener {
+	return &limitListener{Listener: ln, sem: make(chan struct{}, n), done: make(chan struct{})}
+}
+
+// Accept waits for a free slot, then accepts.
+func (l *limitListener) Accept() (net.Conn, error) {
+	select {
+	case l.sem <- struct{}{}:
+	case <-l.done:
+		return nil, net.ErrClosed
 	}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: c, release: func() { <-l.sem }}, nil
+}
+
+// Close closes the listener and wakes an Accept waiting for a slot.
+func (l *limitListener) Close() error {
+	l.closeOnce.Do(func() { close(l.done) })
+	return l.Listener.Close()
+}
+
+// limitConn frees its slot exactly once, on Close.
+type limitConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }

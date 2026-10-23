@@ -115,8 +115,9 @@ Pulls are anonymous. The node's runtime pulls with no credential at all, which i
 reference `localhost:<port>/…` with nothing configured.
 
 Pushes are authenticated. Together those two are the whole access model. Anyone who can reach the
-port can read the images this cluster runs, and only the holder of the current push credential can
-put a new one there.
+port can read the images this cluster runs, and only the holder of the current push credential, or a
+Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),
+can put a new one there.
 
 ## Using Images Across the Cluster
 
@@ -139,16 +140,17 @@ the same way it would have before, and the Pod reports the same image-pull error
 
 Reading is open inside the cluster; writing is not. A pull between nodes is anonymous, which is what
 lets a Pod reference `localhost:<port>/…` with nothing configured. Pushing still needs the per-boot
-credential, and that credential never leaves the machine that minted it, so another node can read
-the images this cluster runs and cannot put a new one there.
+credential, which never leaves the machine that minted it, or a Pod's own ServiceAccount token that
+the cluster authorizes for that one repository. Another node can read the images this cluster runs
+and cannot put a new one there on its own authority.
 
 Each node publishes where its registry can be reached as a ConfigMap in the **`k3sm-registry`**
 namespace, which k3sm creates for this. Nodes are granted read on that one namespace and nothing
 more; `kubectl get configmaps -n k3sm-registry` shows what they see.
 
 Nothing about the registry's own listener changes. It still binds loopback and refuses anything
-else. What is reachable from the rest of the cluster is a separate, narrow forwarder that carries
-connections to it, on the cluster network address and nowhere else.
+else. What is reachable from the rest of the cluster is a separate, narrow front that passes reads
+through and checks every write, on the cluster network address and nowhere else.
 
 On a single-machine cluster none of this is in play. There are no other nodes, nothing is published,
 and no forwarder is started.
@@ -193,9 +195,8 @@ Mac and does not use the cluster's DNS, so a Service name in `spec.containers[].
 nothing to resolve it. The addresses above are for a process inside the Pod that is fetching or
 inspecting images itself.
 
-It is a pull address. Pushing from inside a Pod is not supported, because `k3sm image push` finds
-the node's credential only for a loopback target, and that credential never leaves the machine that
-minted it. Push from the Mac.
+It is also a push address, for a Pod that has been allowed to push. See
+[Pushing From Inside a Pod](#pushing-from-inside-a-pod).
 
 Reads are anonymous, here as everywhere. Anything that can reach the address can list and pull the
 images this cluster runs. The loopback listener allows the same thing; this extends it to the
@@ -204,6 +205,111 @@ cluster network and no further.
 A vm Pod needs the node to be running guests. The address a caller is sent to is the node's
 cluster-network address, which is the mesh address on a multi-machine cluster and otherwise the
 guest network's gateway. A single Mac with neither publishes no Service at all.
+
+## Pushing From Inside a Pod
+
+A Pod can push to the registry with its own ServiceAccount token. No shared password is handed out:
+the Pod presents a token the cluster minted for it, and the registry asks the cluster whether that
+ServiceAccount may push that repository. Reads stay anonymous, as everywhere else.
+
+A push is allowed only when all of these hold:
+
+- The token is a projected ServiceAccount token minted for the audience `k3sm-registry`. The Pod's
+  default API token is refused.
+- The Pod's namespace carries the label `k3sm.io/registry-push`, whose value is a repository prefix.
+- The repository sits under that prefix, at least one level down. With the prefix `team`,
+  `team/app` and `team/tools/app` are allowed, and `team`, `teamx/app` and `other/app` are not.
+- The ServiceAccount is bound to the `k3sm:registry-pusher` ClusterRole in that namespace.
+
+Deleting is never allowed from a Pod, whatever the grant. Delete images from the Mac.
+
+Opting a namespace in is two steps. Labelling a namespace is a cluster-admin act, and the prefix
+should be unique per namespace: two namespaces given the same prefix can overwrite each other's
+images.
+
+```sh
+kubectl label namespace team k3sm.io/registry-push=team
+```
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: registry-pusher
+  namespace: team
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k3sm:registry-pusher
+subjects:
+  - kind: ServiceAccount
+    name: builder
+    namespace: team
+```
+
+k3sm ships the `k3sm:registry-pusher` ClusterRole and no binding to it, so nothing can push until a
+namespace binds it.
+
+Give the Pod a token for the registry with a projected volume:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: build
+  namespace: team
+spec:
+  serviceAccountName: builder
+  containers:
+    - name: build
+      image: localhost:6450/team/buildtools:v1
+      volumeMounts:
+        - name: registry-token
+          mountPath: /var/run/secrets/registry
+          readOnly: true
+  volumes:
+    - name: registry-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              audience: k3sm-registry
+              expirationSeconds: 3600
+              path: token
+```
+
+A native Pod's token is refreshed before it expires, so read the file again before each push. A
+Linux (`vm`) Pod's token is written once at start and is not refreshed, so the job must finish its
+pushes within `expirationSeconds`.
+
+Log in with HTTP Basic: the password is the token and the username is ignored. Push to the
+`registry-<node>` Service of a node that runs the registry; the discovery ConfigMap's
+`hostFromClusterNetwork` names it. The image lands on that node, and other nodes pull it from there
+through the fallback described in [Using Images Across the Cluster](#using-images-across-the-cluster).
+The address speaks plain HTTP, so tell each tool so.
+
+```sh
+REG=registry-mynode.k3sm-registry.svc:6450
+TOKEN=$(cat /var/run/secrets/registry/token)
+
+# crane
+crane auth login "$REG" -u pod -p "$TOKEN"
+crane push --insecure ./app.tar "$REG/team/app:v1"
+
+# oras
+oras push --plain-http -u pod -p "$TOKEN" "$REG/team/app:v1" ./artifact.txt
+
+# buildctl reads the Docker config file for credentials
+mkdir -p ~/.docker
+printf '{"auths":{"%s":{"auth":"%s"}}}' "$REG" "$(printf 'pod:%s' "$TOKEN" | base64 | tr -d '\n')" \
+  > ~/.docker/config.json
+buildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+  --output "type=image,name=$REG/team/app:v1,push=true,registry.insecure=true"
+```
+
+A refused push says why. `401` means the token is missing, malformed, expired or minted for another
+audience; `403` means the namespace has not opted in, the repository is outside its prefix, or the
+ServiceAccount is not bound; `405` means the request was a delete or another operation the registry
+never takes from a Pod; `503` means the cluster could not be asked, so retry.
 
 ## Storage
 
@@ -235,7 +341,9 @@ depends on its contents.
   treat the node-local registry as a private store for content the host's other users should not
   see.
 - Authenticated write. A push needs the per-boot credential, so a process that merely reached the
-  port cannot plant an image the cluster will then run.
+  port cannot plant an image the cluster will then run. From inside the cluster, a Pod can push only
+  with its own ServiceAccount token, in a namespace that opted in, under that namespace's prefix,
+  with an RBAC grant to push, and it can never delete.
 
 ## Turning It Off
 

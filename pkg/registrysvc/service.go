@@ -116,6 +116,10 @@ type Service struct {
 	// is reset at the top of every Start and decides whether the serving
 	// record says StateServing or StateReclaimed.
 	reclaimedPID int
+	// gateCred is the push gate's credential for the running child, minted
+	// with the htpasswd file it was written into and never written in
+	// plaintext. Zero until a bring-up attempt has provisioned.
+	gateCred Credential
 }
 
 // New validates cfg and returns a Service.
@@ -169,6 +173,15 @@ func validateBind(address string, port int) error {
 // validated configuration, so it is the same string before and after a start.
 func (s *Service) Addr() string {
 	return net.JoinHostPort(s.cfg.BindAddress, strconv.Itoa(s.cfg.Port))
+}
+
+// GateCredential returns the credential the push gate forwards an authorized
+// write with: the push gate's registry user, valid for the child this Service
+// last provisioned. It is held in memory only. Zero before a Start.
+func (s *Service) GateCredential() Credential {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gateCred
 }
 
 // Port returns the port the registry serves on — what the KEP-1755 ConfigMap and
@@ -261,13 +274,21 @@ func (s *Service) provision() error {
 	if err := os.MkdirAll(StateDir(s.cfg.WorkDir), 0o700); err != nil {
 		return fmt.Errorf("create the registry state dir: %w", err)
 	}
-	cred, err := generateCredential(net.JoinHostPort(s.cfg.BindAddress, strconv.Itoa(s.cfg.Port)))
+	addr := net.JoinHostPort(s.cfg.BindAddress, strconv.Itoa(s.cfg.Port))
+	cred, err := generateCredential(addr)
 	if err != nil {
 		return err
 	}
-	if err := WriteCredential(s.cfg.WorkDir, cred); err != nil {
+	gate, err := generateGateCredential(addr)
+	if err != nil {
 		return err
 	}
+	if err := WriteCredential(s.cfg.WorkDir, cred, gate); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.gateCred = gate
+	s.mu.Unlock()
 	body, err := renderConfig(s.cfg.WorkDir, s.cfg.BindAddress, s.cfg.Port)
 	if err != nil {
 		return err

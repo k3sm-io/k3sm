@@ -625,7 +625,7 @@ func runServer(args []string) (err error) {
 	defer timedTeardownStep(logger, "manifest-dir", stopManifests)
 	vmCapable := vmBackendAvailable() // can this node host vm guests? (3d registry, 4c datapath)
 	// 3d. The ingest registry; torn down EARLY, on cpStop's lane, and the defer is its backstop.
-	stopRegistry, registryPuller := startServerRegistry(ctx, plan, cs, vmCapable, cpStop, logger)
+	stopRegistry, registryPuller := startServerRegistry(ctx, plan, restCfg, cs, vmCapable, cpStop, logger)
 	defer timedTeardownStep(logger, "ingest-registry-backstop", stopRegistry)
 	net, nodeAddressing, err := startServerDatapath(ctx, plan, restCfg, cs, sm, vmCapable, logger) // 4c. Service proxy + DNS
 	if err != nil {

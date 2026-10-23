@@ -70,6 +70,9 @@ type registryService interface {
 	Start(ctx context.Context) error
 	Addr() string
 	Shutdown(ctx context.Context) error
+	// GateCredential is the registry credential the push gate forwards an
+	// authorized in-pod write with, held in memory only.
+	GateCredential() registrysvc.Credential
 }
 
 // registryConfig renders the ingest registry's configuration from the parsed
@@ -150,6 +153,11 @@ type ingestRegistry struct {
 	// clusterDomain is the cluster DNS suffix the Service authority is rendered
 	// with. Empty means dns.DefaultClusterDomain.
 	clusterDomain string
+	// gateAuth is the push gate's apiserver clients, under the gate's own
+	// narrow identity (certs.RegistryGateSubject), never the admin client. An
+	// incomplete one (the identity could not be minted) leaves reads served and
+	// every write refused with 503.
+	gateAuth registrysvc.GateAuth
 	// logger receives bring-up and teardown events.
 	logger *slog.Logger
 }
@@ -397,10 +405,12 @@ func (r ingestRegistry) retractClusterService(ctx context.Context) {
 // and confined to the two addresses registrysvc.NewRelay admits.
 func (r ingestRegistry) relay(ctx context.Context, wg *sync.WaitGroup) {
 	relay, err := registrysvc.NewRelay(registrysvc.RelayConfig{
-		Port:        r.port,
-		MeshIP:      r.meshIP,
-		VMNetSubnet: r.vmNetSubnet,
-		Logger:      r.logger,
+		Port:           r.port,
+		MeshIP:         r.meshIP,
+		VMNetSubnet:    r.vmNetSubnet,
+		Auth:           r.gateAuth,
+		GateCredential: r.svc.GateCredential(),
+		Logger:         r.logger,
 	})
 	switch {
 	case errors.Is(err, registrysvc.ErrNoRelayAddress):

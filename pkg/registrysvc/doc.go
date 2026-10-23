@@ -39,7 +39,7 @@ limitations under the License.
 //
 //	<work-dir>/registry/                    the registry state root, mode 0700
 //	<work-dir>/registry/config.json         the rendered zot config, mode 0600
-//	<work-dir>/registry/htpasswd            the bcrypt push credential, mode 0600
+//	<work-dir>/registry/htpasswd            the bcrypt push credentials, mode 0600
 //	<work-dir>/registry/push-credential.json the same credential in plaintext, mode 0600
 //	<work-dir>/registry/<repo>/…            the OCI blob store (zot's rootDirectory)
 //	<work-dir>/registry.log                 the child's stdout+stderr, mode 0600
@@ -68,4 +68,12 @@ limitations under the License.
 // certificate would buy nothing against an attacker who is already on the host.
 // Constructing a Service with a non-loopback bind address is an error, so the
 // posture cannot be widened by configuration.
+//
+// Off loopback, the relay (relay.go) serves the push gate (gate.go): reads pass
+// through anonymously, and a pod may push only with its own projected
+// ServiceAccount token, audience RegistryAudience, from a namespace labelled
+// PushLabel=<prefix>, into a repository under that prefix, with an RBAC grant of
+// PushVerb on PushAPIGroup/PushResource. The gate forwards such a write with a
+// second, in-memory registry credential that cannot delete, and refuses DELETE
+// outright.
 package registrysvc
