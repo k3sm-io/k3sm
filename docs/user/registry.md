@@ -34,8 +34,8 @@ kubectl get configmap local-registry-hosting -n kube-public \
 ```
 
 ```yaml
-help: https://k3sm.io/docs/user/registry/ (followed by a note that the in-cluster
-  address serves plain HTTP, not TLS)
+help: https://k3sm.io/docs/user/registry/ — the in-cluster address serves plain HTTP,
+  not TLS
 host: localhost:6450
 hostFromClusterNetwork: registry-k3sm-mystudio.k3sm-registry.svc.cluster.local:6450
 hostFromContainerRuntime: localhost:6450
