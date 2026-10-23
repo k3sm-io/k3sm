@@ -32,7 +32,7 @@ import (
 	"k3sm.io/k3sm/pkg/ports"
 )
 
-// The B213 unit ladder: the kubelet endpoint's SERVING half.
+// The unit ladder: the kubelet endpoint's SERVING half.
 //
 // The defect these tests exist against: on a `--mesh-ip` cluster the apiserver is
 // started with --kubelet-certificate-authority=<cluster CA>, but every node —
@@ -66,9 +66,9 @@ func verifyChain(t *testing.T, leaf *x509.Certificate, ca *certs.CA) error {
 	return err
 }
 
-// TestKubeletServingTLSUsesIssuedPair is the core of B213: given the cluster-CA
+// TestKubeletServingTLSUsesIssuedPair is the core of the serving-pair fix: given the cluster-CA
 // issued pair, the endpoint presents THAT leaf — it verifies against the CA the
-// apiserver was told to trust — and B176's client-auth stamping is still applied to
+// apiserver was told to trust — and the client-auth stamping is still applied to
 // the same config. Both halves are asserted together because the fix edits the very
 // function that carries the client half; presenting a verifiable cert while losing
 // RequireAndVerifyClientCert would trade one defect for a worse one.
@@ -100,13 +100,13 @@ func TestKubeletServingTLSUsesIssuedPair(t *testing.T) {
 		t.Error("the presented leaf is not the issued certificate — something re-minted it")
 	}
 	if err := verifyChain(t, leaf, ca); err != nil {
-		t.Errorf("the presented leaf does not chain to the cluster CA: %v — this is the B213 symptom (x509: unknown authority) the apiserver reports", err)
+		t.Errorf("the presented leaf does not chain to the cluster CA: %v — this is the symptom (x509: unknown authority) the apiserver reports", err)
 	}
 	if leaf.Issuer.CommonName == leaf.Subject.CommonName {
 		t.Error("the presented leaf is self-signed; the issued pair was ignored")
 	}
 
-	// B176, unchanged: the serving half never ships without the client half.
+	// Unchanged: the serving half never ships without the client half.
 	if cfg.ClientAuth != tls.RequireAndVerifyClientCert {
 		t.Errorf("ClientAuth = %v, want tls.RequireAndVerifyClientCert", cfg.ClientAuth)
 	}
@@ -137,7 +137,7 @@ func TestKubeletServingTLSSelfSignedDefault(t *testing.T) {
 	if err := verifyChain(t, leaf, ca); err == nil {
 		t.Error("the self-signed dev leaf verified against a cluster CA it was never issued by")
 	}
-	// The SAN contract the dev path has carried since M0.3.
+	// The SAN contract the dev path has carried since the first node.
 	wantIPs := []string{"127.0.0.1", "192.168.1.42"}
 	for _, w := range wantIPs {
 		if !hasIPSAN(leaf, w) {
@@ -235,7 +235,7 @@ func TestAgentNodeOptionsCarriesServingPair(t *testing.T) {
 	})
 }
 
-// TestServerMeshNodeOptionsMintFromClusterCA covers the half of B213 the original
+// TestServerMeshNodeOptionsMintFromClusterCA covers the half of the serving-pair fix the original
 // prescription missed: the CONTROL-PLANE node never joins, so nothing hands it a
 // pair and it must mint its own — which is exactly where the defect was observed.
 //
@@ -310,7 +310,7 @@ func TestServerMeshNodeOptionsMintFromClusterCA(t *testing.T) {
 // TestServerMeshMintFailsClosedWithoutCA pins the direction of failure. A CA that
 // cannot issue must stop the server, NOT degrade to a self-signed cert: the
 // degradation is silent, indistinguishable from health at registration time, and is
-// precisely the state B213 describes.
+// precisely the state the serving-pair fix removes.
 func TestServerMeshMintFailsClosedWithoutCA(t *testing.T) {
 	t.Parallel()
 	unsignable := &certs.CA{Cert: testClusterCA(t).Cert} // a CA with no private key

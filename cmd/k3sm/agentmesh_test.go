@@ -34,7 +34,7 @@ func stubUnderlayIPs(t *testing.T, ips []net.IP) {
 	underlayInterfaceIPs = func() []net.IP { return ips }
 }
 
-// TestWorkerMeshEndpointIsAnUnderlayAddress is M14.2 defect-A's unit tier.
+// TestWorkerMeshEndpointIsAnUnderlayAddress is the unit tier for the underlay-endpoint defect.
 //
 // The property is REACHABILITY BEFORE THE MESH EXISTS. A MeshPeer endpoint is what
 // every other node dials to open the wireguard handshake, and a peer that has not

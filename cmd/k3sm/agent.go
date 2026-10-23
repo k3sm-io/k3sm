@@ -185,7 +185,7 @@ func agentTerminal(ctx context.Context, b *crashBreaker, logger *slog.Logger, er
 //
 // It is a thin wrapper around agentStart because of what an agent's start
 // failure has to leave behind. This daemon backs off instead of exiting, so
-// launchd reports a healthy pid whatever happened, and until k3sm#B322 the only
+// launchd reports a healthy pid whatever happened, and until a start failure was recorded the only
 // trace of a worker that could not join was a log line — which `k3sm install`
 // cannot read a verdict out of. So EVERY start failure is recorded on the same
 // crash-loop record the server keeps (pkg/executor's CrashRecord, under the
@@ -1139,7 +1139,7 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 		// The resume path reports it IMMEDIATELY. A kubeconfig that will not load is
 		// a bring-up that cannot list peers and cannot start a watcher, so spending
 		// the whole first-sync bound discovering that would only delay the same
-		// failure — and the pre-B308 code returned it here, before any wait existed.
+		// failure — and the earlier code returned it here, before any wait existed.
 		if restErr != nil {
 			return teardown, fmt.Errorf("load kubeconfig for mesh watch: %w", restErr)
 		}

@@ -132,7 +132,7 @@ func installFakeMeshSeam(t *testing.T) (*fakeMeshDatapath, chan struct{}) {
 	return dev, watchDone
 }
 
-// TestAgentMeshTeardownReleasesUtun is B245's mesh-lifecycle gate.
+// TestAgentMeshTeardownReleasesUtun is the mesh-lifecycle gate.
 //
 // Before it, nothing held the mesh: the only Close was the last act of the
 // MeshPeer watcher goroutine, which starts running only after ctx is cancelled —

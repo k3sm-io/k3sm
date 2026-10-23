@@ -43,7 +43,7 @@ func selfEnrollOptions(workDir, nodeName string) serverOptions {
 	}
 }
 
-// TestServerBindsItsOwnNodePassword is the cmd half of B348's second layer: the
+// TestServerBindsItsOwnNodePassword is the cmd half of the second layer: the
 // control-plane node takes the first-write-wins node-password binding for its own
 // name at bring-up, so that name is no longer there for a join to claim — and it
 // does so with a PERSISTED value, so the second boot presents the same one.
@@ -133,7 +133,7 @@ func TestServerBindsItsOwnNodePassword(t *testing.T) {
 	})
 }
 
-// TestEnrollRefusesToOverwriteTheControlPlanePeer is B348's third layer: the
+// TestEnrollRefusesToOverwriteTheControlPlanePeer is the third layer: the
 // WORKER-JOIN enroll path may not write over the MeshPeer that holds the
 // control-plane node's pod index, whatever name the request carries.
 //

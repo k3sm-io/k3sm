@@ -24,7 +24,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 )
 
-// TestAgentMeshKeyIsMintedOnceAndReused is M14.2 defect-B's unit tier, and the
+// TestAgentMeshKeyIsMintedOnceAndReused is the unit tier for the worker mesh-key defect, and the
 // worker-side mirror of TestServerMeshKeyIsMintedOnceAndReused.
 //
 // The property is PERSISTENCE, not secrecy. bootstrap.Join minted a fresh

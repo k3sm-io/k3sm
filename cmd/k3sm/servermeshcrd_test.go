@@ -106,7 +106,7 @@ func establishCRDAsync(t *testing.T, cs *apiextensionsfake.Clientset, name strin
 	}()
 }
 
-// TestEnsureMeshPeerCRDProvisionsOnlyOnTheMeshPath is the B224 core: `k3sm server
+// TestEnsureMeshPeerCRDProvisionsOnlyOnTheMeshPath is the core: `k3sm server
 // --mesh-ip` establishes the MeshPeer CRD, and plain single-node `k3sm server` does
 // not touch the API server at all.
 //
@@ -189,7 +189,7 @@ func TestEnsureMeshPeerCRDProvisionsOnlyOnTheMeshPath(t *testing.T) {
 // This is the half that distinguishes step 2a from the log-and-continue admission
 // provisioners beside it. A MeshPeer CRD that silently failed to apply produces a
 // control plane whose join listener accepts workers and then 500s every enroll —
-// the exact defect B224 exists to remove, re-created one level up.
+// the exact defect this test exists to remove, re-created one level up.
 func TestEnsureMeshPeerCRDFailsClosed(t *testing.T) {
 	errFactory := errors.New("no apiextensions client")
 	errApply := errors.New("apiserver refused the apply")
@@ -219,7 +219,7 @@ func TestEnsureMeshPeerCRDFailsClosed(t *testing.T) {
 //
 // runServer boots a real control plane, so no unit test can call it; and this
 // repo's recurring defect class is precisely a well-tested helper that bring-up
-// never calls (B195, B209). So the invariant is asserted structurally: within
+// never calls. So the invariant is asserted structurally: within
 // runServer, the ensureMeshPeerCRD call must appear BEFORE newMeshEnroller and
 // before startBootstrapServer, and its error must be RETURNED rather than logged.
 //

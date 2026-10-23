@@ -50,7 +50,7 @@ func mkfifo(t *testing.T, path string) {
 	}
 }
 
-// TestCopyOnlyDockerfileBuild is B118's acceptance gate. It proves, in one test:
+// TestCopyOnlyDockerfileBuild is the acceptance gate. It proves, in one test:
 //
 //   - the Dockerfile subset parse table — every accepted verb, the RUN rejection
 //     (whose message must name the vm-backed builder), the known-but-unsupported

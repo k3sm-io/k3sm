@@ -126,7 +126,7 @@ func TestIntegrationAgentRestartReusesItsNodeCredential(t *testing.T) {
 // reaps the restarted process — AGENT_PID is reassigned to it).
 //
 // The restart deliberately re-runs the same argv agent_up used, minus the token
-// (and, since B338, with no --node-ip: the address is the server's assignment,
+// (and with no --node-ip: the address is the server's assignment,
 // read back from the stored credential on a restart):
 // `env -u K3SM_TOKEN` guarantees the joined credential is the only thing the
 // process can start from.

@@ -42,7 +42,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-// TestImagePushOCILayout is the B189 gate: `k3sm image push <layout-dir> <ref>`
+// TestImagePushOCILayout is the gate for this behaviour: `k3sm image push <layout-dir> <ref>`
 // uploads the one image a layout holds, prints the digest a caller pins with,
 // takes its credential from the environment and never from argv, and tells the
 // four failure modes apart.

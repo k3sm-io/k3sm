@@ -30,7 +30,7 @@ import (
 )
 
 // TestBuildProviderEnsuresGuestArtifacts pins the PRODUCTION CALL SITE of the
-// guest-artifact ensure (B108): buildProvider, which is the one function both
+// guest-artifact ensure: buildProvider, which is the one function both
 // `k3sm server` and `k3sm agent` reach their runtimed runtime through.
 //
 // Why this test exists at all, given that pkg/provider already tests the ensure

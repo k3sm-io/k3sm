@@ -75,7 +75,7 @@ const nodeDrainGrace = 5 * time.Second
 // runServer is willing to wait for it.
 //
 // It is an OUTER bound on the wait, not a second budget for the stop: the stop
-// already selects on a context limited to executor.StopBound (B321), so this
+// already selects on a context limited to executor.StopBound, so this
 // covers only the slack between that deadline and the goroutine reporting it —
 // scheduling on a loaded Mac that is stopping everything at once. Its job is to
 // make the wait bounded by construction, so no future regression inside Stop can

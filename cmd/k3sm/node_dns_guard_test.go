@@ -27,7 +27,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 )
 
-// TestStandaloneNodeGuardsDNSEnvInjection is the B43 gate: the standalone `k3sm
+// TestStandaloneNodeGuardsDNSEnvInjection is the gate for this behaviour: the standalone `k3sm
 // node --runtime runtimed` command binds NO cluster-DNS resolver (only
 // server.go/agent.go call netserve.New before reaching the shared
 // startNode/buildProvider/runtimedConfig path — see the standaloneDNSGuard doc
@@ -45,7 +45,7 @@ import (
 //
 //	server.go's inline nodeOpts literal and agent.go's agentNodeOptions both
 //	produce — neither ever sets opts.standalone) keeps defaulting and injecting
-//	exactly as before B43.
+//	exactly as before the standalone guard.
 func TestStandaloneNodeGuardsDNSEnvInjection(t *testing.T) {
 	t.Parallel()
 
@@ -54,7 +54,7 @@ func TestStandaloneNodeGuardsDNSEnvInjection(t *testing.T) {
 		// Mirrors runNode: standalone=true, --dns-vip left at its new "" default.
 		cfg := runtimedConfig(nodeOptions{standalone: true, domain: "cluster.local"}, nil)
 		if cfg.ResolverVIP != "" {
-			t.Fatalf("ResolverVIP = %q, want \"\" (standalone binds no resolver — B43)", cfg.ResolverVIP)
+			t.Fatalf("ResolverVIP = %q, want \"\" (standalone binds no resolver)", cfg.ResolverVIP)
 		}
 		dnsCfg := dns.PodDNSConfig(cfg.ResolverVIP, cfg.ClusterDomain, "default")
 		env := dns.ConfigToEnv(dnsCfg)
@@ -94,7 +94,7 @@ func TestStandaloneNodeGuardsDNSEnvInjection(t *testing.T) {
 		}
 		cfg := runtimedConfig(serverLike, nil)
 		if cfg.ResolverVIP != "10.43.0.10" {
-			t.Fatalf("ResolverVIP = %q, want the threaded --dns-vip (server path unaffected by the B43 guard)", cfg.ResolverVIP)
+			t.Fatalf("ResolverVIP = %q, want the threaded --dns-vip (server path unaffected by the guard)", cfg.ResolverVIP)
 		}
 		env := dns.ConfigToEnv(dns.PodDNSConfig(cfg.ResolverVIP, cfg.ClusterDomain, "default"))
 		if env == nil {
@@ -114,7 +114,7 @@ func TestStandaloneNodeGuardsDNSEnvInjection(t *testing.T) {
 			nil,
 		)
 		if agentOpts.standalone {
-			t.Fatal("agentNodeOptions produced a standalone nodeOptions — the B43 guard must not leak into the agent path")
+			t.Fatal("agentNodeOptions produced a standalone nodeOptions — the guard must not leak into the agent path")
 		}
 		agentCfg := runtimedConfig(agentOpts, nil)
 		agentEnv := dns.ConfigToEnv(dns.PodDNSConfig(agentCfg.ResolverVIP, agentCfg.ClusterDomain, "default"))
@@ -124,7 +124,7 @@ func TestStandaloneNodeGuardsDNSEnvInjection(t *testing.T) {
 	})
 
 	// Bare zero-value nodeOptions{} (standalone=false, matching every existing
-	// TestRuntimedConfiguresPostureVIPs assertion) must be UNCHANGED by B43: the
+	// TestRuntimedConfiguresPostureVIPs assertion) must be UNCHANGED by the standalone guard: the
 	// empty-dnsVIP default-fill still applies.
 	t.Run("bare_zero_value_unaffected", func(t *testing.T) {
 		t.Parallel()

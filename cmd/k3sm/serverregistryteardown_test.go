@@ -122,7 +122,7 @@ func TestRegistryTeardownRunsOnTheControlPlaneLane(t *testing.T) {
 		teardown := teardownWithConcurrentExit(stopper.begin, closedChan, time.Minute, func() { closeStage.run(stage) })
 
 		teardown()
-		<-stopStage.fired // ordering the hook against finish is a test artifact; see the B320 gate
+		<-stopStage.fired // ordering the hook against finish is a test artifact; see the gate
 		if err := stopper.finish(); err != nil {
 			t.Fatalf("finish = %v, want nil", err)
 		}

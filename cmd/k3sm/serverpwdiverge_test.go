@@ -32,7 +32,7 @@ import (
 // genericBringUpFailure is the wording every NON-mismatch bring-up failure keeps.
 const genericBringUpFailure = "server mesh bring-up failed; this node is NOT on its own mesh"
 
-// TestSelfNodePasswordMismatchNamesTheRemedy is B354: when this control-plane
+// TestSelfNodePasswordMismatchNamesTheRemedy pins that when this control-plane
 // node's own node-password no longer matches the binding the store holds for its
 // name (a reinstall or restore that lost the password file), the survivable log
 // line says so, names the file and the name, and points at restoring the file —

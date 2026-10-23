@@ -39,7 +39,7 @@ const (
 	certAddress     = "100.64.9.9"
 )
 
-// The B340 gate: a worker whose stored kubelet serving certificate names an
+// The gate: a worker whose stored kubelet serving certificate names an
 // address the control plane did not assign it is NAMED, at the start that
 // resumes from that certificate and in `k3sm status`.
 //

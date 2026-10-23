@@ -43,7 +43,7 @@ func (s stubRuntimeInfo) GetRuntimeInfo(context.Context, *runtimev1.GetRuntimeIn
 	return s.resp, nil
 }
 
-// TestServerMLXOperatorConfigWiresALiveGPUSource is the cmd half of the B195
+// TestServerMLXOperatorConfigWiresALiveGPUSource is the cmd half of the wiring
 // gate: the Config the SERVER path builds carries a live GPU source, and that
 // source reports the node runtime's facts once the node publishes it.
 //

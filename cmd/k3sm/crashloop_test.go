@@ -97,7 +97,7 @@ func TestPayloadSignatureRefusalParksImmediately(t *testing.T) {
 }
 
 // TestPermanentBringUpFailureParksImmediately is the two-tier breaker's gate
-// (B393). A kine pin bump on a daemon whose launchd PATH has no `go` used to
+// . A kine pin bump on a daemon whose launchd PATH has no `go` used to
 // burn CrashLoopThreshold identical bring-up failures before parking, though
 // the fault could not heal on any lap. A failure carrying
 // executor.ErrNoGoToolchain through BringUpError's chain must park on the
@@ -209,7 +209,7 @@ func TestEtcdDeathRecordedOnce(t *testing.T) {
 	}
 }
 
-// TestStopDuringBringUpRecordsNoCrash is the daemon half of B577. An in-place
+// TestStopDuringBringUpRecordsNoCrash is the daemon half of the in-place install stop. An in-place
 // install booted the running server out while its apiserver was still in its
 // health wait; the stop cancelled the wait, the daemon recorded "apiserver not
 // healthy: context canceled" as a bring-up failure, and the install counted that

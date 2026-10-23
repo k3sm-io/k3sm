@@ -41,7 +41,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 )
 
-// This file is B224's MESH-REGRESSION leg: the proof that adopting the MeshPeer CRD
+// This file is the MESH-REGRESSION leg: the proof that adopting the MeshPeer CRD
 // into bring-up's applied set did not perturb the mesh/enroll path it sits in front
 // of. Both tests here are GREEN BEFORE AND AFTER the adoption by design — they are
 // regression pins, not red-before evidence.

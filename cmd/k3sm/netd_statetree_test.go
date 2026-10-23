@@ -25,7 +25,7 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 )
 
-// TestNetdAlignmentUsesTheOwnershipTable is netd's half of the B397 gate.
+// TestNetdAlignmentUsesTheOwnershipTable is netd's half of the gate.
 //
 // Before the root-owned layout, netd found the data root and chowned IT to the
 // service user, so moving the mesh keys up a level would have been undone at the

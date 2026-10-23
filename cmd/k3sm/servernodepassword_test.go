@@ -89,7 +89,7 @@ func shrinkSelfBindRetry(t *testing.T) {
 //
 // The fake clientset stands in for the datastore. The real-kine leg (a binding
 // written, the server restarted with `launchctl kickstart`, the binding still
-// enforced) is a lab rig run: cmd/k3sm has no real-kine harness.
+// enforced) is a lab run: cmd/k3sm has no real-kine harness.
 //
 // Fails before the fix: serverNodePasswordStore does not exist, and the single
 // server's in-memory store comes back empty.

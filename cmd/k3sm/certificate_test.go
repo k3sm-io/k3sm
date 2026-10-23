@@ -298,7 +298,7 @@ func writeSentinel(t *testing.T, path string, mode fs.FileMode) {
 	}
 }
 
-// TestCertificateRotatePreservesCAPin is the B97 gate. `k3sm certificate rotate`
+// TestCertificateRotatePreservesCAPin is the gate for this behaviour. `k3sm certificate rotate`
 // re-issues LEAF credentials over the EXISTING CA hierarchy; it must NEVER re-mint
 // a CA — a re-minted cluster CA would orphan every node's K10<sha256(CA)> join-token
 // pin. The gate pins that invariant (both CA pins AND all four CA PEMs byte-identical),

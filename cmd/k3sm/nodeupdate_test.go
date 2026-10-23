@@ -519,7 +519,7 @@ func TestUpdateApplyVerifiesBeforeInstall(t *testing.T) {
 	})
 }
 
-// execNetd stands for the root helper as the rig showed it: it streams
+// execNetd stands for the root helper as a real node showed it: it streams
 // Verifying, then Installing immediately before it execs the staged installer,
 // and that installer stops the node daemon, so the stream never ends from the
 // daemon's side. At the exec it records the phase annotation already on the

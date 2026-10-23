@@ -49,7 +49,7 @@ func recordingAliasOps(have bool, presentErr, plumbErr error, plumbable bool) (m
 // bring-up, while the only code that ever plumbed that address was mesh.Start at
 // the mesh bring-up. The first real `--mesh-ip 100.64.0.1` boot died with `listen tcp
 // 100.64.0.1:6444: bind: can't assign requested address`, and the operator had to
-// run `ifconfig lo0 alias 100.64.0.1/32` by hand to get past it. The M14.2 lab
+// run `ifconfig lo0 alias 100.64.0.1/32` by hand to get past it. The lab
 // tier booted --mesh-ip 127.0.0.1, an address every host already answers on, so no
 // gate could see it.
 //

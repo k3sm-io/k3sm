@@ -76,7 +76,7 @@ func (s *scriptedListen) count() int {
 	return s.calls
 }
 
-// TestJoinSupervisorRebindsAfterTransientFailure is B245's worker-join listener
+// TestJoinSupervisorRebindsAfterTransientFailure is the worker-join listener
 // gate.
 //
 // Before it, the bind lived inside http.Server.ListenAndServeTLS, so any bind
