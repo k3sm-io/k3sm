@@ -34,8 +34,8 @@ kubectl get configmap local-registry-hosting -n kube-public \
 ```
 
 ```yaml
-help: https://k3sm.io/docs/user/registry/ — the in-cluster address serves plain HTTP,
-  not TLS
+help: https://k3sm.io/docs/user/registry/ (followed by a note that the in-cluster
+  address serves plain HTTP, not TLS)
 host: localhost:6450
 hostFromClusterNetwork: registry-k3sm-mystudio.k3sm-registry.svc.cluster.local:6450
 hostFromContainerRuntime: localhost:6450
@@ -121,20 +121,22 @@ can put a new one there.
 
 ## Using Images Across the Cluster
 
-Every node runs its own registry, so `localhost:6450/myapp:v1` names a **different** registry on
-every Mac in the cluster. Push on one machine, let the scheduler place the Pod on another, and the
-pull fails. The reference is right; the node it landed on was simply never fed.
+The registry runs on the **server**, when the server is started with `--registry-port`. On a
+multi-machine cluster `localhost:6450/myapp:v1` therefore names the registry on the server Mac, and
+on any other Mac `localhost:6450` is a different, empty address. Push to the server, let the
+scheduler place the Pod on another Mac, and a plain `localhost` pull would fail even though the
+reference is right.
 
-k3sm closes that without asking you to do anything differently. Each node publishes where its own
-registry can be reached from inside the cluster, and a node that cannot find a `localhost:<port>/…`
-image in its own registry asks the other nodes for it. The image is stored under the name your Pod
-asked for, so nothing downstream can tell which machine the bytes came from, and every layer is
-verified against its digest exactly as it is on a pull from a public registry.
+k3sm closes that without asking you to do anything differently. The node that runs the registry
+publishes where it can be reached from inside the cluster, and a node that cannot find a
+`localhost:<port>/…` image locally pulls it from there through a fallback. The image is stored under
+the name your Pod asked for, so nothing downstream can tell which machine the bytes came from, and
+every layer is verified against its digest exactly as it is on a pull from a public registry.
 
 Two things are worth knowing about how it behaves.
 
-The direction matters. The node running the Pod dials the node that has the image, so the machine
-you pushed to has to be up and on the cluster network at the moment the pull happens. This is a
+The direction matters. The node running the Pod dials the node that runs the registry, so that
+machine has to be up and on the cluster network at the moment the pull happens. This is a
 fallback between running nodes, not a copy made in advance. If that machine is off, the pull fails
 the same way it would have before, and the Pod reports the same image-pull error.
 
@@ -144,9 +146,9 @@ credential, which never leaves the machine that minted it, or a Pod's own Servic
 the cluster authorizes for that one repository. Another node can read the images this cluster runs
 and cannot put a new one there on its own authority.
 
-Each node publishes where its registry can be reached as a ConfigMap in the **`k3sm-registry`**
-namespace, which k3sm creates for this. Nodes are granted read on that one namespace and nothing
-more; `kubectl get configmaps -n k3sm-registry` shows what they see.
+The node that runs the registry publishes where it can be reached as a ConfigMap in the
+**`k3sm-registry`** namespace, which k3sm creates for this. Nodes are granted read on that one
+namespace and nothing more; `kubectl get configmaps -n k3sm-registry` shows what they see.
 
 Nothing about the registry's own listener changes. It still binds loopback and refuses anything
 else. What is reachable from the rest of the cluster is a separate, narrow front that passes reads
@@ -161,8 +163,8 @@ A process running **inside** a Pod, say a build running in the cluster, cannot u
 `localhost:6450`. A native Pod's `localhost` is the host's, so that one happens to work; a Linux
 guest's `localhost` is its own, and nothing is listening on it.
 
-Each node publishes one address that works for both, and for the Mac itself. It is an ordinary
-Kubernetes Service, named after the node, in the `k3sm-registry` namespace.
+The node that runs the registry publishes one address that works for both, and for the Mac itself.
+It is an ordinary Kubernetes Service, named after the node, in the `k3sm-registry` namespace.
 
 ```sh
 kubectl get svc,endpointslice -n k3sm-registry
@@ -177,10 +179,9 @@ registry-<node>.k3sm-registry:6450
 <the Service's ClusterIP>:6450
 ```
 
-Substitute your node's name (`kubectl get nodes`), or read the fully qualified form straight out of
-the discovery ConfigMap's `hostFromClusterNetwork`, which is what it is there for. The name is
-per-node because every node's registry holds different content, so one shared name would resolve
-to whichever machine answered first.
+Substitute the name of the node that runs the registry (`kubectl get nodes`), or read the fully
+qualified form straight out of the discovery ConfigMap's `hostFromClusterNetwork`, which is what it
+is there for. The name carries the node because the content lives on that one machine.
 
 Some things to know before you use it.
 
@@ -277,15 +278,17 @@ spec:
               path: token
 ```
 
-A native Pod's token is refreshed before it expires, so read the file again before each push. A
-Linux (`vm`) Pod's token is written once at start and is not refreshed, so the job must finish its
-pushes within `expirationSeconds`.
+A native Pod's token file is re-minted once less than a fifth of its lifetime is left, and the check
+runs about once a minute, so read the file again before each push. A Linux (`vm`) Pod's token is
+written once at start and is never re-minted, so the job must finish its pushes within
+`expirationSeconds`.
 
 Log in with HTTP Basic: the password is the token and the username is ignored. Push to the
-`registry-<node>` Service of a node that runs the registry; the discovery ConfigMap's
+`registry-<node>` Service of the node that runs the registry; the discovery ConfigMap's
 `hostFromClusterNetwork` names it. The image lands on that node, and other nodes pull it from there
 through the fallback described in [Using Images Across the Cluster](#using-images-across-the-cluster).
-The address speaks plain HTTP, so tell each tool so.
+The address speaks plain HTTP, so tell each tool so. See
+[What the token is exposed to](#what-the-token-is-exposed-to) before you rely on it.
 
 ```sh
 REG=registry-mynode.k3sm-registry.svc:6450
@@ -306,10 +309,27 @@ buildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \
   --output "type=image,name=$REG/team/app:v1,push=true,registry.insecure=true"
 ```
 
-A refused push says why. `401` means the token is missing, malformed, expired or minted for another
-audience; `403` means the namespace has not opted in, the repository is outside its prefix, or the
-ServiceAccount is not bound; `405` means the request was a delete or another operation the registry
-never takes from a Pod; `503` means the cluster could not be asked, so retry.
+### What the token is exposed to
+
+The in-cluster address is plain HTTP, so the token travels in cleartext. On a multi-machine cluster
+the hop between Macs is encrypted by the mesh. On the `vm` guest network, though, the guests on a
+Mac share one segment, so a hostile `vm` Pod on the same Mac could capture a sibling's push token
+and push into that namespace's prefix until the token expires. Ask for the shortest
+`expirationSeconds` the job allows, and keep untrusted workloads out of namespaces that can push.
+
+### Refusals
+
+A refused push says why, in an OCI error body. Every status a push can get:
+
+| Status | Meaning |
+|---|---|
+| `400` | The request path, query or request target is malformed. |
+| `401` | No token, a malformed token, an expired or otherwise invalid token, or a token minted for another audience. The response carries a Basic `WWW-Authenticate` challenge. |
+| `403` | The caller is authenticated but refused: the token is not a ServiceAccount's, the namespace has not opted in (no label, or an invalid prefix), the repository is outside the prefix, or RBAC denies the push. |
+| `405` | A delete, or any other write shape the registry never takes from a Pod. |
+| `429` | Token checks are rate-limited; wait for the `Retry-After` interval and retry. |
+| `502` | The registry behind the gate is unreachable. |
+| `503` | The cluster API is unreachable, or the gate has no identity to ask it with. Retry. |
 
 ## Storage
 
@@ -336,7 +356,9 @@ depends on its contents.
   any other network your Mac is on. See
   [Using Images Across the Cluster](#using-images-across-the-cluster).
 - Plain HTTP, no TLS. A certificate would buy nothing against an attacker who is already running
-  code on the host, and it would mean every client had to be taught a new trust anchor.
+  code on the host, and it would mean every client had to be taught a new trust anchor. A push
+  token sent over the in-cluster address is exposed on the `vm` guest network; see
+  [What the token is exposed to](#what-the-token-is-exposed-to).
 - Anonymous read. Any process on the machine can list and pull the images the cluster runs. Do not
   treat the node-local registry as a private store for content the host's other users should not
   see.
