@@ -83,7 +83,8 @@ const (
 )
 
 // udpServicePolicyName / udpServiceBindingName name the Warn policy that surfaces
-// the missing UDP datapath (a UDP Service silently blackholes).
+// a UDP Service port the proxy does not serve (a nodePort, a LoadBalancer port, or
+// a ClusterIP port below 1024), which would otherwise receive no traffic silently.
 const (
 	udpServicePolicyName  = "k3sm-warn-service-udp"
 	udpServiceBindingName = "k3sm-warn-service-udp-binding"
@@ -153,13 +154,27 @@ const (
 // field (every ClusterIP Service), so only an explicit Local triggers the warning.
 const etpLocalExpr = `!has(object.spec.externalTrafficPolicy) || object.spec.externalTrafficPolicy != 'Local'`
 
-// udpServiceExpr admits (evaluates true) unless any Service port is UDP. k3sm
-// opens no UDP datapath (the proxy binds only TCP listeners — see darwin-net
-// proxy.openListener, where a UDP port ensures the lo0 alias but opens no datagram
-// socket), so a UDP Service silently blackholes. The warning says so at the API
-// rather than leaving the operator to discover it at runtime. The per-port has()
-// guard tolerates a port that omits protocol (defaulted to TCP server-side).
-const udpServiceExpr = `object.spec.ports.all(p, !has(p.protocol) || p.protocol != 'UDP')`
+// udpServiceExpr admits (evaluates true) unless a Service has a UDP port the
+// darwin-net Service proxy does not serve. The proxy relays UDP for a ClusterIP
+// only (proxy/udprelay.go, one datagram socket bound on the VIP), and only on a
+// port of 1024 or above: it runs unprivileged and the root netd helper opens
+// privileged ports for stream sockets only, so a lower port fails its bind with
+// EACCES. UDP nodePorts are not opened (a wildcard UDP reply can leave a
+// multi-homed Mac from the wrong source address) and svclb skips UDP
+// LoadBalancer ports. So the warning fires for a UDP port on a NodePort or
+// LoadBalancer Service (its ClusterIP half may still work, but the port it
+// publishes does not) and for a UDP port below 1024 on any Service with a VIP. A
+// headless or ExternalName Service is never proxied, so it is admitted silently,
+// and so is the cluster DNS Service (kube-system/kube-dns), whose 53/UDP is
+// answered by the node resolver rather than the proxy. The has() guards
+// tolerate a port that omits protocol (defaulted to TCP server-side) and a
+// Service with no ports or type.
+const udpServiceExpr = `(has(object.metadata.namespace) && object.metadata.namespace == 'kube-system' && has(object.metadata.name) && object.metadata.name == 'kube-dns') || ` +
+	`(has(object.spec.type) && object.spec.type == 'ExternalName') || ` +
+	`(has(object.spec.clusterIP) && object.spec.clusterIP == 'None') || ` +
+	`!has(object.spec.ports) || ` +
+	`object.spec.ports.all(p, !has(p.protocol) || p.protocol != 'UDP' || ` +
+	`(p.port >= 1024 && (!has(object.spec.type) || object.spec.type == 'ClusterIP')))`
 
 // reservedPortClause is the CEL sub-expression testing whether the port of the
 // Service port bound to variable p falls in the reserved set: the NodePort range,
@@ -1060,14 +1075,16 @@ func EnsureExternalTrafficPolicyLocalWarn(ctx context.Context, cs kubernetes.Int
 }
 
 // EnsureUDPServiceWarn idempotently provisions a Warn-action
-// ValidatingAdmissionPolicy on Services with a UDP port. k3sm has no UDP datapath
-// yet (the proxy opens no UDP listener), so a UDP Service silently blackholes; the
-// policy says so at the API WITHOUT rejecting the Service (UDP support is a
-// deferred datapath addition, not an invalid request). Safe to call on every
-// server start (create-or-update; an unchanged spec is not rewritten).
+// ValidatingAdmissionPolicy on Services with a UDP port the proxy does not serve:
+// a UDP nodePort, a UDP LoadBalancer port, or a UDP ClusterIP port below 1024
+// (see udpServiceExpr for exactly what is and is not relayed). Such a port
+// receives no traffic, so the policy says so at the API WITHOUT rejecting the
+// Service (the Service is valid; the datapath is what is missing). A UDP
+// ClusterIP port of 1024 or above is relayed and draws no warning. Safe to call
+// on every server start (create-or-update; an unchanged spec is not rewritten).
 func EnsureUDPServiceWarn(ctx context.Context, cs kubernetes.Interface) error {
 	return ensureWarnPolicy(ctx, cs, udpServicePolicyName, udpServiceBindingName, udpServiceExpr,
-		"k3sm: UDP Service ports have no datapath yet — the proxy opens no UDP listener, so a UDP Service silently blackholes",
+		"k3sm: this Service has a UDP port that receives no traffic: the proxy relays UDP only through the ClusterIP and only on ports 1024 and above, so a UDP nodePort, a UDP LoadBalancer port and a UDP ClusterIP port below 1024 are not served",
 		"services", admissionregistrationv1.Create, admissionregistrationv1.Update)
 }
 

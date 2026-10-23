@@ -272,13 +272,73 @@ func TestExternalTrafficPolicyLocalWarns(t *testing.T) {
 		})
 }
 
-// TestUDPServiceWarns verifies the advisory that surfaces the missing UDP
-// datapath — the proxy opens no UDP listener, so a UDP Service silently
-// blackholes. It Warns (never Denies) on any UDP port, and fails open.
+// TestUDPServiceWarns verifies the shape of the advisory that surfaces a UDP
+// Service port the proxy does not serve. It Warns (never Denies) and fails open;
+// TestUDPServiceWarnCELSemantics evaluates which ports it fires for.
 func TestUDPServiceWarns(t *testing.T) {
 	assertServiceWarnPolicy(t, udpServicePolicyName, udpServiceBindingName,
 		[]string{"protocol", "UDP", "ports.all"},
 		func(cs kubernetes.Interface) error { return EnsureUDPServiceWarn(context.Background(), cs) })
+}
+
+// udpService builds the unstructured Service an admission plugin would evaluate,
+// with one port per (port, protocol) pair and the given clusterIP when non-empty.
+func udpService(namespace, name, svcType, clusterIP string, portProto ...any) map[string]any {
+	svcPorts := make([]any, 0, len(portProto)/2)
+	for i := 0; i+1 < len(portProto); i += 2 {
+		svcPorts = append(svcPorts, map[string]any{"port": int64(portProto[i].(int)), "protocol": portProto[i+1].(string)})
+	}
+	spec := map[string]any{"type": svcType, "ports": svcPorts}
+	if clusterIP != "" {
+		spec["clusterIP"] = clusterIP
+	}
+	return map[string]any{
+		"metadata": map[string]any{"namespace": namespace, "name": name},
+		"spec":     spec,
+	}
+}
+
+// TestUDPServiceWarnCELSemantics EVALUATES the UDP advisory's CEL: it fires only
+// for a UDP port the darwin-net proxy does not serve (a nodePort, a
+// LoadBalancer port, a ClusterIP port below 1024) and stays silent for a UDP
+// ClusterIP port of 1024 or above, which the datagram relay serves.
+func TestUDPServiceWarnCELSemantics(t *testing.T) {
+	prg := celProgram(t, udpServiceExpr)
+	tests := []struct {
+		name      string
+		object    map[string]any
+		wantAdmit bool
+	}{
+		{"a UDP ClusterIP port of 1024 or above is served, no warning", udpService("default", "statsd", "ClusterIP", "", 8125, "UDP"), true},
+		{"a UDP ClusterIP port of exactly 1024 is served, no warning", udpService("default", "a", "ClusterIP", "", 1024, "UDP"), true},
+		{"a UDP port on a Service with no type is a ClusterIP, no warning", map[string]any{"spec": map[string]any{"ports": []any{map[string]any{"port": int64(5353), "protocol": "UDP"}}}}, true},
+		{"a TCP-only Service draws no warning", udpService("default", "web", "LoadBalancer", "", 80, "TCP"), true},
+		{"a port with no protocol (TCP by default) draws no warning", map[string]any{"spec": map[string]any{"type": "NodePort", "ports": []any{map[string]any{"port": int64(53)}}}}, true},
+		{"a UDP ClusterIP port below 1024 warns", udpService("default", "syslog", "ClusterIP", "", 514, "UDP"), false},
+		{"a UDP port on a NodePort Service warns", udpService("default", "game", "NodePort", "", 27015, "UDP"), false},
+		{"a UDP port on a LoadBalancer Service warns", udpService("default", "game", "LoadBalancer", "", 27015, "UDP"), false},
+		{"one unserved UDP port among served ones warns", udpService("default", "mixed", "ClusterIP", "", 8125, "UDP", 123, "UDP"), false},
+		{"a headless Service is not proxied, no warning", udpService("default", "peers", "ClusterIP", "None", 53, "UDP"), true},
+		{"an ExternalName Service is not proxied, no warning", udpService("default", "ext", "ExternalName", "", 53, "UDP"), true},
+		{"the cluster DNS Service is answered by the node resolver, no warning", udpService("kube-system", "kube-dns", "ClusterIP", "", 53, "UDP", 53, "TCP"), true},
+		{"a kube-dns name outside kube-system still warns", udpService("default", "kube-dns", "ClusterIP", "", 53, "UDP"), false},
+		{"a Service with no ports draws no warning", map[string]any{"spec": map[string]any{"type": "ClusterIP"}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, _, err := prg.Eval(map[string]any{"object": tt.object})
+			if err != nil {
+				t.Fatalf("eval: %v", err)
+			}
+			admit, ok := out.Value().(bool)
+			if !ok {
+				t.Fatalf("CEL returned %T (%v), want bool", out.Value(), out.Value())
+			}
+			if admit != tt.wantAdmit {
+				t.Errorf("admit = %v, want %v", admit, tt.wantAdmit)
+			}
+		})
+	}
 }
 
 // TestProviderTolerationWarn verifies the advisory that surfaces a pod missing a

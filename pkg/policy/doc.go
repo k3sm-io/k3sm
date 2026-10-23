@@ -41,12 +41,22 @@ limitations under the License.
 //     scope: the sandbox denies by port number whatever address the pod dials, so
 //     a ClusterIP and a headless Service are as unreachable as a LoadBalancer.
 //
-// Two are Warn advisories that surface honest k3sm datapath divergences to
-// kubectl WITHOUT rejecting the Service (failurePolicy Ignore so they can only
-// ever warn):
+// Five are Warn advisories that surface an honest k3sm divergence to kubectl
+// WITHOUT rejecting the object (failurePolicy Ignore so they can only ever warn).
+// Two are on Services, for datapath divergences:
 //   - externalTrafficPolicy: Local is not honored (the userspace splice does not
 //     preserve client source IP — only Cluster).
-//   - UDP Service ports have no datapath yet (the proxy opens no UDP listener).
+//   - a UDP port the proxy does not serve: a UDP nodePort, a UDP LoadBalancer
+//     port, or a UDP ClusterIP port below 1024. A UDP ClusterIP port of 1024 or
+//     above is relayed and draws no warning.
+//
+// Three are on Pod create:
+//   - provider toleration: a pod with no toleration for the provider taint, which
+//     the scheduler would leave Unschedulable.
+//   - internet-egress annotation: a hand-set opt-in annotation meant to be stamped
+//     by a controller acting on the pod's behalf.
+//   - Xcode toolchain annotation: the same, for the annotation that grants read
+//     access to the node's Xcode developer directory.
 //
 // Two are MUTATING policies — MutatingAdmissionPolicies
 // (admissionregistration.k8s.io/v1), which unlike the Deny/Warn VAPs above CHANGE
