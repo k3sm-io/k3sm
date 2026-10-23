@@ -1,0 +1,25 @@
+# Allowed govulncheck findings in the child binaries hack/release/stage.sh stages.
+#
+# stage.sh scans every staged Go child (govulncheck -mode=binary) after staging
+# and before signing, and reds on any finding whose trace reaches a vulnerable
+# symbol in the binary unless a line below names it. One entry per line:
+#
+#   <GO-id> <child> <child-version> <reason> <expiry YYYY-MM-DD>
+#
+# <child> is the staged name (helm without its version suffix) and
+# <child-version> the pin it was built or downloaded at, so a pin bump makes the
+# entry match nothing and the finding is reviewed again. The reason is required
+# and says why shipping the finding is acceptable until the expiry. An expired
+# entry is a red. An entry that matches no finding in a scan is a red too: delete
+# it, so exemptions do not outlive what they excused.
+#
+# zot v2.1.22 links golang.org/x/net v0.59.0, whose HTTP/2 code carries the five
+# GO-2026-66xx findings (fixed in v0.60.0), and go.opentelemetry.io/otel v1.46.0
+# (GO-2026-6505, no fixed version upstream). All six were reviewed in the
+# k3sm#815 security review; the x/net fix is a zot build against v0.60.0.
+GO-2026-6603 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 Trailer memory exhaustion; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
+GO-2026-6610 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 transport framing headers; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
+GO-2026-6611 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 repeated window changes; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
+GO-2026-6612 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 double flow control refund; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
+GO-2026-6617 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 HPACK encoder race; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
+GO-2026-6505 zot v2.1.22 go.opentelemetry.io/otel v1.46.0 otlptrace exporter endpoint URL logging; no fixed version upstream, accepted until one ships (k3sm#815 security review) 2026-11-15

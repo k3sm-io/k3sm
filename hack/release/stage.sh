@@ -83,11 +83,18 @@
 #                    which reports its version from the embedded VCS build info.
 #   --self-test      hermetic self-test of the manifest, the signature parser, the
 #                    release refusal, the toolchain pin, the source-built children's
-#                    build-stamp checks and the needs-network report (no network,
-#                    no credentials, no keychain)
+#                    build-stamp checks, the needs-network report and the
+#                    children vuln scan, against a planted local vulnerability
+#                    database (no network, no credentials, no keychain)
 #   (k3sm-vmhost is always built and signed with
 #   cmd/k3sm-vmhost/vmhost.entitlements: pkg/install.RequiredSiblings names it,
 #   so a stage without it fails the required-artifact loop.)
+#
+# Staging scans every staged Go child with govulncheck (-mode=binary, the version
+# hack/ci.sh pins) after the payload is final and before signing: a finding whose
+# trace reaches a vulnerable symbol is a red unless hack/release/govulncheck.allow
+# names it (that file states its rules); a scan that cannot be trusted is a red,
+# named. It needs the vulnerability database (vuln.go.dev).
 #
 # Staging writes two digest files into the tree, and copies the manifest beside it:
 #   UPSTREAM-DIGESTS  sha256 of every cp-payload file BEFORE any signing, i.e. the
@@ -373,7 +380,16 @@ verify_manifest() {
 # shellcheck source=hack/release/lib/gochild.sh
 . "$HERE/lib/gochild.sh"
 
-# read_pins: KINE_VERSION, ETCD_VERSION, KINE_VARIANT, ETCD_VARIANT and KINE_PATCH
+# govulncheck: the pin (read from hack/ci.sh), the tool lookup, the JSON-stream
+# reader and the allow-file check live in ONE sourced library, shared with
+# hack/ci.sh and hack/etcd-wrapper.sh. Never copy them.
+# shellcheck source=hack/lib/govulncheck.sh
+. "$REPO_ROOT/hack/lib/govulncheck.sh"
+# The reviewed exemptions for the children scan (format and rules in the file).
+GV_ALLOW="$HERE/govulncheck.allow"
+
+# read_pins: KUBE_VERSION (the control-plane release), KINE_VERSION, ETCD_VERSION,
+# KINE_VARIANT, ETCD_VARIANT and KINE_PATCH
 # (the patch-set id, "none" without one), ZOT_VERSION and ZOT_VARIANT, and
 # HELM_VERSION, HELM_SHA256 and HELM_BINARY, read from the source the staged k3sm
 # is built from, so the checks below compare against that build's own pins.
@@ -383,8 +399,9 @@ read_pins() {
 	ETCD_VERSION="$(sed -n 's/^[[:space:]]*DefaultEtcdVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/executor.go")"
 	KINE_VARIANT="$(sed -n 's/^[[:space:]]*kineBuildVariant[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/setup.go")"
 	ETCD_VARIANT="$(sed -n 's/^[[:space:]]*etcdBuildVariant[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/etcdstage.go")"
-	[ -n "$KINE_VERSION" ] && [ -n "$ETCD_VERSION" ] && [ -n "$KINE_VARIANT" ] && [ -n "$ETCD_VARIANT" ] ||
-		die "cannot read the kine/etcd pins and build variants from $ex"
+	KUBE_VERSION="$(sed -n 's/^[[:space:]]*DefaultKubeVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/executor.go")"
+	[ -n "$KINE_VERSION" ] && [ -n "$ETCD_VERSION" ] && [ -n "$KINE_VARIANT" ] && [ -n "$ETCD_VARIANT" ] && [ -n "$KUBE_VERSION" ] ||
+		die "cannot read the kube/kine/etcd pins and build variants from $ex"
 	case "$KINE_VARIANT" in
 	*+*) KINE_PATCH="${KINE_VARIANT#*+}" ;;
 	*) KINE_PATCH=none ;;
@@ -569,6 +586,213 @@ refuse_unpinned_payload() {
 		printf '%s\n' "$list" | grep -qxF -- "$rel" || { echo "    NOT BUILT FROM PINNED SOURCE: $rel"; bad=1; }
 	done < <(cd "$tree" && find cp-payload -type f | LC_ALL=C sort)
 	return "$bad"
+}
+
+# ---- the children vuln scan ------------------------------------------------------
+# Every Go binary in the payload is scanned with govulncheck before anything is
+# signed. The set is release_payload_files, the one list release staging accepts
+# (and refuses everything else against), so a child added to the payload is
+# scanned the moment it is added there; a name with no version mapping below is
+# a red, never a skip.
+
+# child_scan_version <name>: the pin a staged cp-payload file was built or
+# downloaded at, the version the allow file keys on. Needs read_pins.
+child_scan_version() {
+	case "$1" in
+	kube-apiserver | kube-scheduler | kube-controller-manager | kubectl) echo "$KUBE_VERSION" ;;
+	kine) echo "$KINE_VERSION" ;;
+	etcd | etcdutl) echo "$ETCD_VERSION" ;;
+	zot) echo "$ZOT_VERSION" ;;
+	"$HELM_BINARY") echo "$HELM_VERSION" ;;
+	*) return 1 ;;
+	esac
+}
+
+# child_scan_set <payload-dir>: `<child> <version> <path>` per Go binary of
+# release_payload_files (version markers skipped; helm under its unversioned
+# name, as the allow file writes it). A listed file that is missing, or has no
+# version mapping, is named on stdout and returns 1; a file that is not a Go
+# binary is noted on stderr and skipped.
+child_scan_set() {
+	local dir="$1" rel name child ver bad=0
+	while IFS= read -r rel; do
+		case "$rel" in *.version | "") continue ;; esac
+		name="${rel#cp-payload/}"
+		child="$name"
+		[ "$name" = "$HELM_BINARY" ] && child=helm
+		ver="$(child_scan_version "$name")" || { echo "PROBLEM $name: no version mapping in child_scan_version (add one so the scan can key the allow file)"; bad=1; continue; }
+		[ -f "$dir/$name" ] || { echo "PROBLEM $name: not staged in $dir"; bad=1; continue; }
+		if ! "$GO" version "$dir/$name" >/dev/null 2>&1; then
+			echo "    skip $name: not a Go binary" >&2
+			continue
+		fi
+		printf '%s %s %s\n' "$child" "$ver" "$dir/$name"
+	done < <(release_payload_files)
+	return "$bad"
+}
+
+# children_vuln_scan <payload-dir> [<db-url>]: the children scan. Red on a
+# missing or wrong-version govulncheck, an untrustworthy scan (named), an
+# unallowed symbol-level finding, or an expired or stale allow entry.
+children_vuln_scan() {
+	local dir="$1" db="${2:-}" pin gv scanset line args=() c v p
+	pin="$(gv_pin)" || return 1
+	gv="$(gv_find "$pin")" || return 1
+	if ! scanset="$(child_scan_set "$dir")"; then
+		printf '%s\n' "$scanset" | sed -n 's/^PROBLEM /    /p'
+		return 1
+	fi
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		read -r c v p <<<"$line"
+		args+=("$c" "$v" "$p")
+	done <<<"$scanset"
+	[ "${#args[@]}" -gt 0 ] || { echo "    no Go child found in $dir"; return 1; }
+	gv_scan_children "$gv" "$pin" "$GV_ALLOW" "$(date -u +%Y-%m-%d)" "$db" "${args[@]}"
+}
+
+# gv_self_test <tmp>: the children vuln scan, hermetically. A tiny Go program
+# is built with the flags the stripped children use (-trimpath -ldflags "-s -w",
+# as hack/release/build-cp.sh builds the control-plane binaries),
+# and govulncheck reads a planted local database (-db file://...), so no case
+# touches the network. Uses self_test's ok/bad.
+gv_self_test() {
+	local t="$1/gv" pin gv today o rc probe plain
+	local plant="$t/db-plant" info="$t/db-info"
+	today="$(date -u +%Y-%m-%d)"
+	mkdir -p "$t/prog" "$plant" "$info"
+	printf 'module example.com/gvprobe\n\ngo 1.26\n' >"$t/prog/go.mod"
+	cat >"$t/prog/main.go" <<'GO'
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() { fmt.Fprintln(os.Stdout, fmt.Sprintf("%d", len(os.Args))) }
+GO
+	probe="$t/probe" plain="$t/probe-unstripped"
+	echo "==> children vuln scan: build the probe child (stripped, like the -s -w control-plane builds) and plant a database"
+	if ! (cd "$t/prog" && GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$probe" . &&
+		GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0 "$GO" build -trimpath -o "$plain" .); then
+		bad "children vuln scan: could not build the probe program"
+		return 0
+	fi
+	# One entry on a symbol the probe calls (fmt.Sprintf), one on a symbol it
+	# does not link (net/smtp.SendMail). The stdlib range is open, so it matches
+	# whatever toolchain built the probe.
+	gv_osv() {
+		printf '{"schema_version":"1.3.1","id":"%s","modified":"2099-01-01T00:00:00Z","published":"2099-01-01T00:00:00Z","summary":"synthetic","details":"synthetic self-test entry","affected":[{"package":{"name":"stdlib","ecosystem":"Go"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"}]}],"ecosystem_specific":{"imports":[{"path":"%s","symbols":["%s"]}]}}]}\n' "$1" "$2" "$3"
+	}
+	gv_osv GO-2099-0001 fmt Sprintf >"$plant/GO-2099-0001.json"
+	gv_osv GO-2099-0002 net/smtp SendMail >"$info/GO-2099-0002.json"
+	unset -f gv_osv
+
+	if ! pin="$(gv_pin)"; then bad "children vuln scan: no pin in hack/ci.sh"; return 0; fi
+	if ! gv="$(gv_find "$pin")"; then
+		bad "children vuln scan: govulncheck $pin is needed for the scan cases (go install golang.org/x/vuln/cmd/govulncheck@$pin)"
+		return 0
+	fi
+	# scan <allow-text> <db-dir> <binary>: run the scan, set o (output) and rc.
+	scan() {
+		printf '%s\n' "$1" >"$t/allow"
+		rc=0
+		o="$(gv_scan_children "$gv" "$pin" "$t/allow" "$today" "file://$2" probe v0.0.1 "$3" 2>&1)" || rc=$?
+	}
+	# expect <case> <want-rc> <want-substring>...
+	expect() {
+		local name="$1" want="$2" s miss=""
+		shift 2
+		for s in "$@"; do printf '%s\n' "$o" | grep -qF -- "$s" || miss="$miss '$s'"; done
+		if [ "$rc" = "$want" ] && [ -z "$miss" ]; then
+			ok "$name"
+		else
+			bad "$name: exit $rc (want $want)${miss:+, missing$miss}: $o"
+		fi
+	}
+
+	scan "" "$plant" "$probe"
+	expect "vuln scan: a planted finding in a stripped binary is red" 1 "FINDING  probe v0.0.1: GO-2099-0001" "fmt.Sprintf"
+	scan "GO-2099-0001 probe v0.0.1 synthetic self-test reason 2999-12-31" "$plant" "$probe"
+	expect "vuln scan: a matching allow entry turns it green" 0 "allowed  probe v0.0.1: GO-2099-0001"
+	scan "GO-2099-0001 probe v0.0.1 synthetic self-test reason 2000-01-01" "$plant" "$probe"
+	expect "vuln scan: an expired allow entry is red" 1 "EXPIRED 2000-01-01"
+	scan "GO-2099-0001 probe v0.0.1 synthetic self-test reason 2999-12-31
+GO-2099-0009 probe v0.0.1 matches nothing in this scan 2999-12-31" "$plant" "$probe"
+	expect "vuln scan: a stale allow entry matching no finding is red" 1 "STALE, GO-2099-0009 probe v0.0.1"
+	scan "GO-2099-0001 probe v0.0.0 keyed on the previous pin 2999-12-31" "$plant" "$probe"
+	expect "vuln scan: an entry keyed on another child version does not allow (a pin bump re-reviews)" 1 "FINDING  probe v0.0.1: GO-2099-0001" "STALE, GO-2099-0001 probe v0.0.0"
+	scan "" "$info" "$plain"
+	expect "vuln scan: a finding with no vulnerable symbol in the binary is informational" 0 "info     probe v0.0.1: GO-2099-0002"
+	scan "" "$info" "$probe"
+	expect "vuln scan: a stripped binary is read conservatively (every symbol of the package counts)" 1 "FINDING  probe v0.0.1: GO-2099-0002"
+	scan "" "$t/no-such-db" "$probe"
+	expect "vuln scan: an unreachable vulnerability database is a named red" 1 "vuln DB unreachable"
+	scan "GO-2099-0001 probe v0.0.1 2999-12-31" "$plant" "$probe"
+	expect "vuln scan: a malformed allow entry is red" 1 "want <GO-id> <child> <child-version> <reason> <expiry>"
+
+	# Fake tools: absent, the wrong version, a stream with no config, a stream
+	# cut short. The fakes report the pin on -version where the case needs it.
+	mkdir -p "$t/nogv/bin" "$t/nogv/gopath" "$t/fake"
+	ln -s "$(command -v "$GO")" "$t/nogv/bin/go"
+	rc=0
+	o="$(PATH="$t/nogv/bin:/usr/bin:/bin" GOPATH="$t/nogv/gopath" gv_find "$pin" 2>&1)" || rc=$?
+	expect "vuln scan: an absent govulncheck is a named red" 1 "govulncheck missing or wrong version"
+	# fake <name> <version>  (stdin: the body run for a scan)
+	fake() {
+		{ printf '#!/bin/sh\nif [ "$1" = -version ]; then echo "Scanner: govulncheck@%s"; exit 0; fi\n' "$2"; cat; } >"$t/fake/$1"
+		chmod 0755 "$t/fake/$1"
+	}
+	mkdir -p "$t/fake-old/bin"
+	fake govulncheck v0.0.0 <<<'exit 0'
+	mv "$t/fake/govulncheck" "$t/fake-old/bin/govulncheck"
+	rc=0
+	o="$(PATH="$t/fake-old/bin:$t/nogv/bin:/usr/bin:/bin" GOPATH="$t/nogv/gopath" gv_find "$pin" 2>&1)" || rc=$?
+	expect "vuln scan: a govulncheck at another version is a named red" 1 "govulncheck missing or wrong version" "reports v0.0.0"
+	fake noconfig "$pin" <<'SH'
+echo '{"progress":{"message":"x"}}'
+SH
+	rc=0
+	o="$(gv_scan_children "$t/fake/noconfig" "$pin" "$t/allow" "$today" "" probe v0.0.1 "$probe" 2>&1)" || rc=$?
+	expect "vuln scan: a stream with no config message is a named red" 1 "no config message"
+	fake truncated "$pin" <<SH
+printf '%s\n' '{"config":{"scanner_version":"$pin","scan_mode":"binary"}}' '{"finding": {"osv": "GO-2099-0001"'
+SH
+	rc=0
+	o="$(gv_scan_children "$t/fake/truncated" "$pin" "$t/allow" "$today" "" probe v0.0.1 "$probe" 2>&1)" || rc=$?
+	expect "vuln scan: a stream that does not end cleanly is a named red" 1 "malformed JSON stream"
+	unset -f fake
+
+	# The scan set is release_payload_files: every listed Go binary is scanned
+	# under its pin, and a listed name with no version mapping is a red.
+	(
+		read_pins
+		pd="$t/payload"
+		mkdir -p "$pd"
+		while IFS= read -r rel; do
+			case "$rel" in *.version) echo marker >"$pd/${rel#cp-payload/}" ;; *) cp "$probe" "$pd/${rel#cp-payload/}" ;; esac
+		done < <(release_payload_files)
+		want="$(release_payload_files | grep -vc '\.version$')"
+		if o="$(child_scan_set "$pd" 2>/dev/null)" && [ "$(printf '%s\n' "$o" | grep -c .)" = "$want" ] &&
+			printf '%s\n' "$o" | grep -q "^helm $HELM_VERSION $pd/$HELM_BINARY\$" &&
+			printf '%s\n' "$o" | grep -q "^kube-apiserver $KUBE_VERSION " && printf '%s\n' "$o" | grep -q "^zot $ZOT_VERSION "; then
+			echo "  ok    vuln scan set: every Go binary of release_payload_files ($want), each under its pin"
+		else
+			echo "  FAIL  vuln scan set: $o"; exit 1
+		fi
+		K3SM_BUILT_FILES="$K3SM_BUILT_FILES
+cp-payload/newchild"
+		cp "$probe" "$pd/newchild"
+		if o="$(child_scan_set "$pd" 2>/dev/null)"; then
+			echo "  FAIL  a payload child with no version mapping was scanned without a pin"; exit 1
+		elif printf '%s\n' "$o" | grep -q "PROBLEM newchild: no version mapping"; then
+			echo "  ok    vuln scan set: a new payload child with no version mapping is red"
+		else
+			echo "  FAIL  vuln scan set: newchild not named: $o"; exit 1
+		fi
+	) || fails=$((fails + 1))
+	unset -f scan expect
 }
 
 # ---- self-test --------------------------------------------------------------------
@@ -963,6 +1187,8 @@ LOG
 	fi
 	if [ -z "$(printf 'pkg/y.go:1:1: undefined: Foo\nexit status 1\n' | needs_network_modules)" ]; then ok "a non-network failure names nothing"; else bad "a compile error was reported as needs network"; fi
 
+	gv_self_test "$tmp"
+
 	unset -f ok bad expect_fail
 	echo
 	if [ "$fails" -ne 0 ]; then
@@ -1235,6 +1461,16 @@ else
 		place_cp_build "$CP_BUILD" "$PAYLOAD_DIR" || die "could not place the pinned-source build into $PAYLOAD_DIR"
 		upstream_note="$upstream_note; the control-plane binaries replaced by hack/release/build-cp.sh output"
 	fi
+fi
+
+# The children vuln scan: every staged Go child, after the payload is final and
+# before anything is signed. Stubs are not binaries and are not scanned.
+if [ "$STUB_PAYLOAD" = 1 ]; then
+	echo "==> children vuln scan: skipped (stub payload, nothing to scan)"
+else
+	echo "==> children vuln scan (govulncheck -mode=binary over every staged Go child; allow file $GV_ALLOW)"
+	children_vuln_scan "$PAYLOAD_DIR" ||
+		die "children vuln scan: a staged child carries an unallowed vulnerability, the allow file has an expired or stale entry, or the scan could not run (above)"
 fi
 
 # The pre-sign digests, recorded before ANY signing: the pinned digests describe
