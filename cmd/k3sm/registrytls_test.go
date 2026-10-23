@@ -24,6 +24,7 @@ import (
 	"flag"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -105,18 +106,20 @@ func TestServerRunsRegistryByDefaultOverTLSWithFlatService(t *testing.T) {
 		})
 
 		// The relay binds the mesh address and the vm gateway; the seam points
-		// each at a loopback listener this test dials, so the shipped relay,
-		// gate and TLS configuration serve exactly as they would there.
+		// each at an in-memory listener this test connects to over net.Pipe, so
+		// the shipped relay, gate and TLS configuration serve exactly as they
+		// would there, without a socket.
 		var (
 			mu        sync.Mutex
-			listeners = map[string]net.Listener{}
+			listeners = map[string]*memListener{}
 			bound     = make(chan struct{}, 2)
 		)
 		listen := func(addr string) (net.Listener, error) {
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			ap, err := netip.ParseAddrPort(addr)
 			if err != nil {
 				return nil, err
 			}
+			ln := &memListener{ap: ap, conns: make(chan net.Conn), closed: make(chan struct{})}
 			mu.Lock()
 			listeners[addr] = ln
 			mu.Unlock()
@@ -166,9 +169,9 @@ func TestServerRunsRegistryByDefaultOverTLSWithFlatService(t *testing.T) {
 			if ln == nil {
 				t.Fatalf("the relay did not bind %s (bound: %v)", relayAddr, listeners)
 			}
-			conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", ln.Addr().String(),
-				&tls.Config{RootCAs: pool, ServerName: registrysvc.FlatServiceName})
-			if err != nil {
+			conn := tls.Client(ln.connect(t), &tls.Config{RootCAs: pool, ServerName: registrysvc.FlatServiceName})
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.Handshake(); err != nil {
 				t.Fatalf("TLS to the relay on %s does not verify against the cluster CA: %v", relayAddr, err)
 			}
 			leaf := conn.ConnectionState().PeerCertificates[0]
@@ -184,14 +187,13 @@ func TestServerRunsRegistryByDefaultOverTLSWithFlatService(t *testing.T) {
 				}
 			}
 
-			plain, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
-			if err != nil {
-				t.Fatalf("dial: %v", err)
-			}
+			plain := ln.connect(t)
 			_ = plain.SetDeadline(time.Now().Add(5 * time.Second))
-			if _, err := plain.Write([]byte("GET /v2/ HTTP/1.1\r\nHost: registry-k3sm:6450\r\n\r\n")); err != nil {
-				t.Fatalf("write: %v", err)
-			}
+			// A pipe write blocks until read, and the server answers before it
+			// has consumed the whole request, so the write runs beside the read.
+			go func() {
+				_, _ = plain.Write([]byte("GET /v2/ HTTP/1.1\r\nHost: registry-k3sm:6450\r\n\r\n"))
+			}()
 			line, _ := bufio.NewReader(plain).ReadString('\n')
 			_ = plain.Close()
 			if !strings.Contains(line, " 400 ") {

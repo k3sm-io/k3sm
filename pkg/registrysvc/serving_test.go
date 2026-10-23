@@ -24,7 +24,6 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -168,7 +167,7 @@ func TestFlatServingSANs(t *testing.T) {
 }
 
 // TestRelayServesTLSOnly drives a shipped relay (NewRelay, through the Listen
-// seam onto loopback): the handshake verifies against the cluster CA for the
+// seam onto an in-memory listener): the handshake verifies against the cluster CA for the
 // flat name, and a plain-HTTP request is answered 400 and never reaches the
 // registry.
 func TestRelayServesTLSOnly(t *testing.T) {
@@ -178,19 +177,15 @@ func TestRelayServesTLSOnly(t *testing.T) {
 	}
 	var upstreamHits int
 	var hmu sync.Mutex
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := &fakeZot{h: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hmu.Lock()
 		upstreamHits++
 		hmu.Unlock()
 		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(upstream.Close)
-	front, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
+	})}
+	front := newMemListener()
 	r, err := NewRelay(RelayConfig{
-		Port:    portOf(t, upstream.Listener.Addr()),
+		Port:    6450,
 		MeshIP:  "100.64.9.1",
 		Serving: testServing(t),
 		Listen:  func(string) (net.Listener, error) { return front, nil },
@@ -199,6 +194,9 @@ func TestRelayServesTLSOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
+	// The registry is the in-process fake: the gate's upstream round trip is
+	// answered without a socket.
+	r.handler = newGate(gateConfig{Upstream: fakeZotHost, Transport: upstream, Logger: quietLogger()})
 	done := make(chan struct{})
 	ctx, cancel := context.WithCancel(t.Context())
 	go func() { defer close(done); r.Run(ctx) }()
@@ -206,10 +204,13 @@ func TestRelayServesTLSOnly(t *testing.T) {
 
 	pool := x509.NewCertPool()
 	pool.AddCert(ca.Cert)
-	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: FlatServiceName},
-	}}
-	resp, err := client.Get("https://" + front.Addr().String() + "/v2/")
+		DialContext:     func(context.Context, string, string) (net.Conn, error) { return front.dial() },
+	}
+	t.Cleanup(tr.CloseIdleConnections)
+	client := &http.Client{Timeout: 5 * time.Second, Transport: tr}
+	resp, err := client.Get("https://" + FlatAuthority() + "/v2/")
 	if err != nil {
 		t.Fatalf("HTTPS GET through the relay: %v", err)
 	}
@@ -221,15 +222,17 @@ func TestRelayServesTLSOnly(t *testing.T) {
 	hitsAfterTLS := upstreamHits
 	hmu.Unlock()
 
-	conn, err := net.DialTimeout("tcp", front.Addr().String(), 5*time.Second)
+	conn, err := front.dial()
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := conn.Write([]byte("GET /v2/ HTTP/1.1\r\nHost: registry-k3sm:6450\r\n\r\n")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	// A pipe write blocks until read, and the server answers before it has
+	// consumed the whole request, so the write runs beside the read.
+	go func() {
+		_, _ = conn.Write([]byte("GET /v2/ HTTP/1.1\r\nHost: registry-k3sm:6450\r\n\r\n"))
+	}()
 	line, _ := bufio.NewReader(conn).ReadString('\n')
 	if !strings.Contains(line, "400") {
 		t.Errorf("a plain-HTTP request got %q, want 400", strings.TrimSpace(line))
