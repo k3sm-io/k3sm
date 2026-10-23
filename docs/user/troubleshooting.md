@@ -437,9 +437,9 @@ can start mid-escape-sequence. Redraw with `Ctrl-L`.
 
 ## A Pod Cannot Pull From the Node-Local Registry
 
-- **Connection refused**. The registry is **off by default**. Start the server with
-  `--registry-port <port>` (or use `k3sm dev`, which enables it), and read the published port back
-  from the `local-registry-hosting` ConfigMap in `kube-public` rather than remembering it.
+- **Connection refused**. The registry runs on the server, on port 6450 unless `--registry-port`
+  says otherwise. A server started with `--registry-port 0` runs none. Read the address back from
+  the `local-registry-hosting` ConfigMap in `kube-public` rather than remembering it.
 - **A Pod under `runtimeClassName: vm` cannot reach it at all.** The guest has its own loopback, and
   the registry listens only on the node's. That is a documented limit, not a misconfiguration. Use
   a registry the guest can reach, or load the image into the node's store directly.

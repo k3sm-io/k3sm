@@ -30,66 +30,78 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/validation"
 
 	"k3sm.io/darwin-net/pkg/dns"
 )
 
-// The PER-NODE CLUSTER SERVICE: one cluster address at which this node's ingest
-// registry answers for every class of caller — a native Pod, a Linux vm guest,
-// and the host itself.
+// The FLAT REGISTRY SERVICE: one cluster name, registry-k3sm, at which the
+// server's ingest registry answers every class of caller, a native Pod and a
+// Linux vm guest alike, on every node of the cluster.
 //
 // It is a SELECTOR-LESS Service plus a hand-written EndpointSlice, which is the
 // standard Kubernetes way to give a cluster name to something the cluster does
 // not schedule. Nothing here selects a Pod because there is no Pod: the registry
 // is a child process of the server, reached through the relay's non-loopback
-// bind (relay.go). The Service is a NAME and a VIP; the relay is the thing that
-// answers.
+// bind (relay.go), which terminates TLS in front of it. The Service is a NAME and
+// a VIP; the relay is the thing that answers.
 //
-// WHY PER NODE, and not one Service for the cluster. Every node runs its own
-// registry with its own content, so an address that resolved to "some node" would
-// be a coin flip. The obvious fix — one Service whose EndpointSlice carries every
-// node, with internalTrafficPolicy: Local to pin a caller to its own node — does
-// not work here: node locality is decided by whether the endpoint address falls
-// in the node's podCIDR (darwin-net/pkg/proxy), and every k3sm mesh address is
-// carved from the one cluster range, so every endpoint looks local on every node.
-// Naming the node in the Service sidesteps a signal that cannot be made truthful.
+// ONE SERVICE FOR THE CLUSTER, published by one server. The server's registry
+// is the cluster's one image store, so there is exactly one backend to name.
+// With several servers, the bootstrap server (the one that did not join with
+// --server-join) publishes it and the others publish nothing, so two servers
+// never fight over its one EndpointSlice.
 //
-// WHY THE ENDPOINT IS THE RELAY ADDRESS. EndpointSlice validation refuses a
+// THE NAME IS FLAT and lives in one namespace, but a bare Service name resolves
+// only inside its own namespace through a standard resolv.conf. Cluster DNS
+// answers registry-k3sm from every namespace (darwin-net's resolver), and the
+// node runtime maps the same name to this registry; both spell it with the
+// literals below, and a change here is a change there.
+//
+// WHY THE ENDPOINT IS A RELAY ADDRESS. EndpointSlice validation refuses a
 // loopback address outright, so the registry's own 127.0.0.1 listener can never
-// be an endpoint — and that refusal is the loopback invariant being enforced by
-// the apiserver rather than merely respected here. The address published is
-// therefore one the relay actually binds, taken from the same relayBinds that
-// decides the binds: the mesh address when this node has one, else the vm NAT
-// gateway. A node with neither has no relay, so it publishes no Service; there is
-// nothing that would answer.
+// be an endpoint, and that refusal is the loopback invariant enforced by the
+// apiserver rather than merely respected here. The address published is one the
+// relay actually binds, taken from the same relayBinds that decides the binds:
+// the mesh address when the server has one (reachable from every node), else
+// the vm NAT gateway (reachable only from this Mac's own guests, which on a
+// single Mac is every caller there is). A server with neither has no relay, so
+// it publishes no Service; there is nothing that would answer.
 //
-// WHAT IT IS FOR, and what it is not. This is a PULL address. `k3sm image push`
-// authenticates only against a loopback target (credential.go), by design — the
-// per-boot credential never leaves the machine that minted it — so a push still
-// names localhost:<port>. Pull is anonymous, which is what lets a Pod name this
-// Service with nothing configured.
+// THE PER-NODE SERVICES ARE RETIRED. Earlier releases published one
+// registry-<node> Service per node; a server now removes its own stale one at
+// start (RemoveClusterService) and never publishes it again.
 //
 // RBAC: nothing new. The publisher is the server's retained admin client, the
-// same one that writes the advertisement ConfigMaps, and the readers — a node's
-// Service proxy and DNS resolver — already hold cluster-wide get/list/watch on
+// same one that writes the advertisement ConfigMaps, and the readers (a node's
+// Service proxy and DNS resolver) already hold cluster-wide get/list/watch on
 // services and endpointslices through the k3sm:node-datapath ClusterRole
-// (pkg/rbac). A namespace-scoped grant here would be a duplicate of a grant that
-// already covers it.
+// (pkg/rbac).
 const (
-	// ClusterServicePrefix prefixes every per-node registry Service (and its
-	// EndpointSlice, which carries the same name). A reader selects the set by
-	// this prefix, and the prefix also guarantees the composed name starts with a
-	// letter, which a Service name must.
+	// FlatServiceName is the registry's one cluster name. darwin-net's cluster
+	// DNS resolver and the node runtime's registry mapping spell the same
+	// literal; change all three together or not at all.
+	FlatServiceName = "registry-k3sm"
+	// FlatServiceNamespace is the namespace the Service lives in. It is the
+	// advertisement namespace (AdvertisementNamespace), spelled again here
+	// because darwin-net and the runtime mapping read this literal; a test pins
+	// that the two agree.
+	FlatServiceNamespace = "k3sm-registry"
+	// FlatServicePort is the Service port, and the port every image reference
+	// carries: registry-k3sm:6450/<repo>. It is fixed whatever --registry-port
+	// says, because a reference written into a Pod spec must not change with a
+	// server flag; the target port follows the flag. darwin-net and the runtime
+	// mapping use the same literal.
+	FlatServicePort = 6450
+	// ClusterServicePrefix prefixed the retired per-node registry Services
+	// (registry-<node>). It is kept so a server can find and remove its own
+	// stale one.
 	ClusterServicePrefix = "registry-"
 	// ClusterServicePortName names the single port on both objects. The Service
-	// port name and the EndpointSlice port name MUST agree — that name is what
+	// port name and the EndpointSlice port name MUST agree: that name is what
 	// kube-proxy (and darwin-net's userspace proxy) matches a backend port by, so
 	// a mismatch yields a Service with a VIP and no backends.
 	ClusterServicePortName = "registry"
-	// clusterServiceNodeLabel records the advertising node on both objects, so
-	// `kubectl get svc -n k3sm-registry -l k3sm.io/registry-node=<node>` reads back
-	// the pair without anyone trimming a prefix off a name.
+	// clusterServiceNodeLabel records the publishing server on both objects.
 	clusterServiceNodeLabel = "k3sm.io/registry-node"
 	// clusterServiceManagedLabel marks both objects as k3sm's, matching the
 	// convention pkg/rbac and pkg/policy use for objects k3sm provisions.
@@ -100,11 +112,8 @@ const (
 	// controller owns it.
 	clusterServiceManagedBy = "endpointslice.kubernetes.io/managed-by"
 	// clusterServiceManager is this package, as the managed-by value. It is
-	// spelled as a reverse-DNS NAME and not as the "k3sm.io/registrysvc" path
-	// form the rest of the repo uses for KEYS, because this is a label VALUE: a
-	// value may not contain "/", and the apiserver rejects the whole object if it
-	// does. Upstream's own controllers spell it the same way
-	// ("endpointslice-controller.k8s.io").
+	// spelled as a reverse-DNS NAME because this is a label VALUE: a value may
+	// not contain "/", and the apiserver rejects the whole object if it does.
 	clusterServiceManager = "registrysvc.k3sm.io"
 )
 
@@ -127,6 +136,7 @@ type ServiceClient interface {
 	Create(ctx context.Context, svc *corev1.Service, opts metav1.CreateOptions) (*corev1.Service, error)
 	Update(ctx context.Context, svc *corev1.Service, opts metav1.UpdateOptions) (*corev1.Service, error)
 	Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error
+	List(ctx context.Context, opts metav1.ListOptions) (*corev1.ServiceList, error)
 }
 
 // EndpointSliceClient is the slice of the Kubernetes API the EndpointSlice
@@ -138,93 +148,72 @@ type EndpointSliceClient interface {
 	Create(ctx context.Context, es *discoveryv1.EndpointSlice, opts metav1.CreateOptions) (*discoveryv1.EndpointSlice, error)
 	Update(ctx context.Context, es *discoveryv1.EndpointSlice, opts metav1.UpdateOptions) (*discoveryv1.EndpointSlice, error)
 	Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error
+	List(ctx context.Context, opts metav1.ListOptions) (*discoveryv1.EndpointSliceList, error)
 }
 
-// ClusterServiceName returns the Service (and EndpointSlice) name node's registry
-// is published under.
+// ClusterServiceName returns the name of node's retired per-node registry
+// Service (and its EndpointSlice), which a server removes at start.
 func ClusterServiceName(node string) string {
 	return ClusterServicePrefix + node
 }
 
-// ClusterServiceAuthority renders the in-cluster authority a caller dials —
-// "registry-<node>.k3sm-registry.svc.<cluster-domain>:<port>".
-//
-// The FULLY QUALIFIED form is what gets published, not the short
-// "registry-<node>.k3sm-registry" a Pod in another namespace could also use: the
-// document this feeds is read by tools with no ndots context of their own, and a
-// name that resolves for a Pod and not for the reader is worse than a long one.
-//
-// An empty cluster domain means dns.DefaultClusterDomain, matching every other
-// in-cluster address k3sm renders.
-func ClusterServiceAuthority(node, clusterDomain string, port int) string {
-	domain := clusterDomain
-	if domain == "" {
-		domain = dns.DefaultClusterDomain
-	}
-	return fmt.Sprintf("%s.%s.svc.%s:%d", ClusterServiceName(node), AdvertisementNamespace, domain, port)
+// FlatAuthority is the authority every image reference names the registry by:
+// "registry-k3sm:6450". It carries the port on purpose, and must: a reference
+// whose first component has no port and no dot is a Docker Hub repository by
+// the OCI rule, so registry-k3sm/app would be pulled from Docker Hub.
+func FlatAuthority() string {
+	return net.JoinHostPort(FlatServiceName, strconv.Itoa(FlatServicePort))
 }
 
-// ClusterLocalAuthorities returns every authority that names THIS node's own
-// ingest registry through its cluster Service.
-//
-// It exists for runtimed's puller, which decides whether a reference is
-// node-relative — eligible for plain HTTP on the primary fetch and for the
-// peer-mirror fallback — by matching its authority EXACTLY, against a loopback
-// spelling plus whatever this list admits (runtimed/pkg/image's
-// WithClusterRegistries). The classifier cannot derive these: they depend on a
-// node name, a cluster domain and an assigned VIP runtimed has never heard of.
-//
-// # Why these four spellings and no others
-//
-// The match is exact, so a spelling that is not listed is dialled as HTTPS
-// against a plain-HTTP listener — an inscrutable TLS error, not a 404. The set is
-// therefore every form that RESOLVES to this Service through a standard Pod's
-// resolv.conf (search "<ns>.svc.<domain> svc.<domain> <domain>", ndots 5), and
-// nothing beyond it:
-//
-//   - registry-<node>.k3sm-registry.svc.<domain>:<port> — fully qualified. What
-//     the KEP-1755 document publishes and what the docs tell an operator to write.
-//   - registry-<node>.k3sm-registry.svc:<port> — resolves from ANY namespace via
-//     the "svc.<domain>" search entry. The realistic hand-typed form.
-//   - registry-<node>.k3sm-registry:<port> — the classic "<service>.<namespace>"
-//     short form, which resolves through the same search entry. Listed because a
-//     Kubernetes user writes it by habit, and omitting it fails as a TLS error.
-//   - <clusterIP>:<port> — what a tool that already resolved the name writes back,
-//     and the only form available to a caller with no cluster DNS.
-//
-// Every one of them names the same Service, so admitting all four widens no
-// trust boundary: the plaintext posture is scoped to this node's own registry
-// however it is spelled.
-//
-// HONESTY: the three NAME forms are resolvable from inside a Pod, not from the
-// Mac. runtimed's puller runs host-side and uses the host resolver, which k3sm
-// does not point at the cluster's DNS — so a `spec.containers[].image` naming one
-// of them fails to resolve today, and only the VIP form is dialable there.
-// Admitting the names is still correct: it is the classification a reference
-// carrying one deserves, so if a caller ever does present one the transport and
-// the peer brokering are already right, and the failure a user does hit is a name
-// lookup rather than a TLS handshake against a plain-HTTP listener.
-//
-// clusterIP may be empty (no VIP assigned yet), in which case only the name
-// spellings are returned. Nothing here is a URL: each element is a bare
-// host[:port] authority, the shape a reference's first component takes.
-func ClusterLocalAuthorities(node, clusterDomain, clusterIP string, port int) []string {
-	if node == "" || port <= 0 || port > 65535 {
-		return nil
-	}
+// FlatServiceDNSNames returns every DNS name a caller in the cluster may reach
+// the Service by: the flat name, then each search-suffixed form a standard Pod
+// resolv.conf expands it through, ending with the fully qualified one. They are
+// the DNS SANs of the relay's serving certificate, so a client verifies the
+// registry under whichever spelling it dialled. An empty cluster domain means
+// dns.DefaultClusterDomain.
+func FlatServiceDNSNames(clusterDomain string) []string {
 	domain := clusterDomain
 	if domain == "" {
 		domain = dns.DefaultClusterDomain
 	}
-	name := ClusterServiceName(node)
-	p := strconv.Itoa(port)
-	out := []string{
-		net.JoinHostPort(fmt.Sprintf("%s.%s.svc.%s", name, AdvertisementNamespace, domain), p),
-		net.JoinHostPort(fmt.Sprintf("%s.%s.svc", name, AdvertisementNamespace), p),
-		net.JoinHostPort(fmt.Sprintf("%s.%s", name, AdvertisementNamespace), p),
+	ns := FlatServiceName + "." + FlatServiceNamespace
+	return []string{
+		FlatServiceName,
+		ns,
+		ns + ".svc",
+		ns + ".svc." + domain,
 	}
-	if addr, err := netip.ParseAddr(clusterIP); err == nil && addr.IsValid() {
-		out = append(out, net.JoinHostPort(addr.String(), p))
+}
+
+// FlatServingIPs returns the IP SANs of the relay's serving certificate: the
+// Service's ClusterIP (a caller that resolved the name, or has no DNS, dials
+// it), then the server's mesh address and its vm NAT gateway (the addresses the
+// relay itself binds, which the proxy dials as the endpoint). Each that is
+// empty or unparsable is left out, never spliced in as text.
+func FlatServingIPs(clusterIP, meshIP, vmNetSubnet string) []net.IP {
+	var out []net.IP
+	add := func(a netip.Addr) {
+		if !a.IsValid() || a.IsUnspecified() {
+			return
+		}
+		ip := net.IP(a.AsSlice())
+		for _, have := range out {
+			if have.Equal(ip) {
+				return
+			}
+		}
+		out = append(out, ip)
+	}
+	if a, err := netip.ParseAddr(clusterIP); err == nil {
+		add(a)
+	}
+	if a, err := netip.ParseAddr(meshIP); err == nil {
+		add(a)
+	}
+	if vmNetSubnet != "" {
+		if gw, err := VMNetGateway(vmNetSubnet); err == nil {
+			add(gw)
+		}
 	}
 	return out
 }
@@ -243,7 +232,7 @@ func LoopbackAuthority(port int) string {
 	return net.JoinHostPort("localhost", strconv.Itoa(port))
 }
 
-// ClusterEndpointAddress returns the address the per-node Service sends a caller
+// ClusterEndpointAddress returns the address the flat Service sends a caller
 // to: the mesh address when this node has one, else the vm NAT gateway.
 //
 // It is DERIVED from relayBinds rather than computed again, and that is the
@@ -266,29 +255,24 @@ func ClusterEndpointAddress(meshIP, vmNetSubnet string) (netip.Addr, error) {
 	return binds[0], nil
 }
 
-// ClusterService renders node's selector-less registry Service.
+// FlatService renders the registry's selector-less Service, published by the
+// server named publisher, whose registry listens on targetPort.
 //
-// The port is BOTH the Service port and the target port, deliberately: the relay
-// listens on the registry's own port on every address it binds, so a caller that
-// dials the Service port reaches the same port it would have dialed directly.
-//
-// A node name that will not compose a valid Service name is an error rather than
-// a truncation — a Service name is a DNS-1035 LABEL (63 characters, no dots),
-// which is stricter than the DNS-1123 subdomain a node name may be, so the
-// composition can fail on a node name that is itself perfectly legal.
-func ClusterService(node string, port int) (*corev1.Service, error) {
-	name, err := validClusterServiceName(node)
-	if err != nil {
-		return nil, err
+// The Service port is FlatServicePort whatever the registry's own port is,
+// because the port is part of every image reference; the target port is the
+// port the relay listens on, which is the registry's.
+func FlatService(publisher string, targetPort int) (*corev1.Service, error) {
+	if publisher == "" {
+		return nil, errors.New("publish the registry Service: the publishing server's node name is empty")
 	}
-	if port <= 0 || port > 65535 {
-		return nil, fmt.Errorf("publish the registry Service for %s: port %d is out of range 1-65535", node, port)
+	if targetPort <= 0 || targetPort > 65535 {
+		return nil, fmt.Errorf("publish the registry Service: port %d is out of range 1-65535", targetPort)
 	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: AdvertisementNamespace,
-			Labels:    clusterServiceLabels(node),
+			Name:      FlatServiceName,
+			Namespace: FlatServiceNamespace,
+			Labels:    clusterServiceLabels(publisher),
 		},
 		Spec: corev1.ServiceSpec{
 			Type: corev1.ServiceTypeClusterIP,
@@ -297,27 +281,25 @@ func ClusterService(node string, port int) (*corev1.Service, error) {
 			Ports: []corev1.ServicePort{{
 				Name:       ClusterServicePortName,
 				Protocol:   corev1.ProtocolTCP,
-				Port:       int32(port),
-				TargetPort: intstr.FromInt32(int32(port)),
+				Port:       FlatServicePort,
+				TargetPort: intstr.FromInt32(int32(targetPort)),
 			}},
 		},
 	}, nil
 }
 
-// ClusterEndpointSlice renders the hand-written EndpointSlice backing node's
-// registry Service with the single relay address addr.
+// FlatEndpointSlice renders the hand-written EndpointSlice backing the Service
+// with the single relay address addr, on targetPort.
 //
 // It REFUSES a loopback address with ErrNonRelayableBind. The apiserver refuses
-// one too, so this is not the only guard — it is the guard that names the reason
-// at the place the decision is made, instead of surfacing as a validation error
-// from an object nobody reads.
-func ClusterEndpointSlice(node string, port int, addr netip.Addr) (*discoveryv1.EndpointSlice, error) {
-	name, err := validClusterServiceName(node)
-	if err != nil {
-		return nil, err
+// one too, so this is not the only guard; it is the guard that names the reason
+// at the place the decision is made.
+func FlatEndpointSlice(publisher string, targetPort int, addr netip.Addr) (*discoveryv1.EndpointSlice, error) {
+	if publisher == "" {
+		return nil, errors.New("publish the registry EndpointSlice: the publishing server's node name is empty")
 	}
-	if port <= 0 || port > 65535 {
-		return nil, fmt.Errorf("publish the registry EndpointSlice for %s: port %d is out of range 1-65535", node, port)
+	if targetPort <= 0 || targetPort > 65535 {
+		return nil, fmt.Errorf("publish the registry EndpointSlice: port %d is out of range 1-65535", targetPort)
 	}
 	if !addr.IsValid() || addr.IsUnspecified() {
 		return nil, fmt.Errorf("%w: %q is not an address a cluster caller can be sent to", ErrNonRelayableBind, addr.String())
@@ -329,15 +311,15 @@ func ClusterEndpointSlice(node string, port int, addr netip.Addr) (*discoveryv1.
 		return nil, fmt.Errorf("%w: %s is not an IPv4 address, and the slice is IPv4", ErrNonRelayableBind, addr)
 	}
 	portName := ClusterServicePortName
-	portNum := int32(port)
+	portNum := int32(targetPort)
 	ready := true
-	labels := clusterServiceLabels(node)
-	labels[discoveryv1.LabelServiceName] = name
+	labels := clusterServiceLabels(publisher)
+	labels[discoveryv1.LabelServiceName] = FlatServiceName
 	labels[clusterServiceManagedBy] = clusterServiceManager
 	return &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: AdvertisementNamespace,
+			Name:      FlatServiceName,
+			Namespace: FlatServiceNamespace,
 			Labels:    labels,
 		},
 		AddressType: discoveryv1.AddressTypeIPv4,
@@ -356,30 +338,28 @@ func ClusterEndpointSlice(node string, port int, addr netip.Addr) (*discoveryv1.
 	}, nil
 }
 
-// PublishClusterService creates or refreshes node's Service and EndpointSlice.
+// PublishFlatService creates or refreshes the Service and its EndpointSlice.
 //
 // The SERVICE IS PUBLISHED FIRST so its ClusterIP exists before anything reports
 // an address, and the assigned ClusterIP is RETURNED: it is the VIP a caller
-// dials, and the spelling runtimed must also treat as cluster-local
-// (ClusterLocalAuthorities).
+// dials and an IP SAN of the relay's certificate.
 //
-// Both objects REFRESH rather than being created once, for the reason the
-// advertisement does: the port and the relay address are per-boot facts, and a
-// stale endpoint would send every caller to an address nothing answers on. A
-// refresh mutates only the fields this package owns and is built from the object
-// that was READ, so the resourceVersion is live and a concurrent writer loses the
-// conflict instead of being silently overwritten — most of all the ClusterIP,
-// which the apiserver assigned and which is immutable.
-func PublishClusterService(ctx context.Context, svcs ServiceClient, slices EndpointSliceClient, node string, port int, addr netip.Addr) (string, error) {
-	wantSvc, err := ClusterService(node, port)
+// Both objects REFRESH rather than being created once: the target port and the
+// relay address are per-boot facts, and a stale endpoint would send every caller
+// to an address nothing answers on. A refresh mutates only the fields this
+// package owns and is built from the object that was READ, so the
+// resourceVersion is live and a concurrent writer loses the conflict instead of
+// being silently overwritten, most of all the ClusterIP, which the apiserver
+// assigned and which is immutable.
+func PublishFlatService(ctx context.Context, svcs ServiceClient, slices EndpointSliceClient, publisher string, targetPort int, addr netip.Addr) (string, error) {
+	wantSvc, err := FlatService(publisher, targetPort)
 	if err != nil {
 		return "", err
 	}
-	wantSlice, err := ClusterEndpointSlice(node, port, addr)
+	wantSlice, err := FlatEndpointSlice(publisher, targetPort, addr)
 	if err != nil {
 		return "", err
 	}
-
 	clusterIP, err := publishService(ctx, svcs, wantSvc)
 	if err != nil {
 		return "", err
@@ -455,22 +435,87 @@ func publishEndpointSlice(ctx context.Context, c EndpointSliceClient, want *disc
 	return nil
 }
 
-// RemoveClusterService retracts node's Service and its EndpointSlice. A NotFound
-// is success: there is nothing to retract, which is the state this call wanted.
+// RemoveFlatService retracts the Service and its EndpointSlice: what a server
+// started with the registry off (--registry-port 0) does, so no Pod resolves a
+// name whose backend is gone for good. A NotFound is success: there is nothing
+// to retract, which is the state this call wanted.
 //
-// The SLICE GOES FIRST, so the Service never survives its backing endpoints — a
-// caller that resolves the name in the window between the two dials a VIP with no
-// backend and fails fast, where the other order would leave a slice the apiserver
-// keeps and nothing consumes.
+// The SLICE GOES FIRST, so the Service never survives its backing endpoints: a
+// caller that resolves the name in the window between the two dials a VIP with
+// no backend and fails fast.
 //
-// Retraction is BEST EFFORT by construction, exactly as RemoveAdvertisement is: a
-// node that is SIGKILLed leaves both objects behind, and a caller that dials the
-// stale VIP gets a connection refusal it already handles.
+// Retraction is BEST EFFORT by construction: a server that is SIGKILLed leaves
+// both objects behind, and a caller that dials the stale VIP gets a connection
+// refusal.
+func RemoveFlatService(ctx context.Context, svcs ServiceClient, slices EndpointSliceClient) error {
+	return removeServicePair(ctx, svcs, slices, FlatServiceName)
+}
+
+// RemoveFlatEndpointSlice retracts the Service's endpoints and keeps the
+// Service. It is what a stopping server does: a caller that resolves the name
+// meanwhile dials a VIP with no backend and fails fast, and the ClusterIP (an
+// IP SAN of the serving certificate, and a value a caller may have resolved)
+// stays the same across the restart. A NotFound is success.
+func RemoveFlatEndpointSlice(ctx context.Context, slices EndpointSliceClient) error {
+	if err := slices.Delete(ctx, FlatServiceName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete the %s EndpointSlice: %w", FlatServiceName, err)
+	}
+	return nil
+}
+
+// RemoveClusterService removes node's retired per-node Service and its
+// EndpointSlice, which an earlier release published. A NotFound is success. A
+// node whose retired name would be the flat Service's (a node named "k3sm") is
+// a no-op, so the cleanup can never take the flat Service with it.
 func RemoveClusterService(ctx context.Context, svcs ServiceClient, slices EndpointSliceClient, node string) error {
-	if node == "" {
+	if node == "" || ClusterServiceName(node) == FlatServiceName {
 		return nil
 	}
-	name := ClusterServiceName(node)
+	return removeServicePair(ctx, svcs, slices, ClusterServiceName(node))
+}
+
+// RemoveRetiredNodeServices sweeps every retired per-node registry Service and
+// EndpointSlice (registry-<anything> other than the flat registry-k3sm) that k3sm
+// created, whichever node published it: a node that left the cluster, or was
+// renamed, never removes its own. Only objects carrying the k3sm managed label
+// are touched, so a foreign Service that happens to be named registry-x in the
+// registry namespace survives. The caller's clients are namespaced to
+// FlatServiceNamespace.
+func RemoveRetiredNodeServices(ctx context.Context, svcs ServiceClient, slices EndpointSliceClient) error {
+	opts := metav1.ListOptions{LabelSelector: clusterServiceManagedLabel + "=true"}
+	retired := func(name string) bool {
+		return strings.HasPrefix(name, ClusterServicePrefix) && name != FlatServiceName
+	}
+	var errs []error
+	sliceList, err := slices.List(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("list the registry EndpointSlices: %w", err)
+	}
+	svcList, err := svcs.List(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("list the registry Services: %w", err)
+	}
+	names := map[string]bool{}
+	for _, es := range sliceList.Items {
+		if retired(es.Name) && es.Labels[clusterServiceManagedLabel] == "true" {
+			names[es.Name] = true
+		}
+	}
+	for _, sv := range svcList.Items {
+		if retired(sv.Name) && sv.Labels[clusterServiceManagedLabel] == "true" {
+			names[sv.Name] = true
+		}
+	}
+	for name := range names {
+		if err := removeServicePair(ctx, svcs, slices, name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// removeServicePair deletes the EndpointSlice and then the Service named name.
+func removeServicePair(ctx context.Context, svcs ServiceClient, slices EndpointSliceClient, name string) error {
 	var errs []error
 	if err := slices.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		errs = append(errs, fmt.Errorf("delete the %s EndpointSlice: %w", name, err))
@@ -479,18 +524,6 @@ func RemoveClusterService(ctx context.Context, svcs ServiceClient, slices Endpoi
 		errs = append(errs, fmt.Errorf("delete the %s Service: %w", name, err))
 	}
 	return errors.Join(errs...)
-}
-
-// validClusterServiceName composes and validates node's Service name.
-func validClusterServiceName(node string) (string, error) {
-	if node == "" {
-		return "", errors.New("publish the registry Service: the node name is empty")
-	}
-	name := ClusterServiceName(node)
-	if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
-		return "", fmt.Errorf("publish the registry Service: %q is not a valid Service name: %s", name, strings.Join(errs, "; "))
-	}
-	return name, nil
 }
 
 // clusterServiceLabels returns the labels both objects carry. It returns a fresh

@@ -30,6 +30,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/podnet"
 
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/ports"
@@ -169,7 +170,8 @@ func lanPolicyFor(want install.LAN, role install.Role, args []string, host []net
 	if kp := argPort("kubelet-port", ports.KubeletAPIPort); kp > 0 && kp < 65536 {
 		p.exempt[uint16(kp)] = true
 	}
-	if rp := argPort("registry-port", 0); rp > 0 && rp < 65536 {
+	// The registry runs by default, so an absent flag is its default port.
+	if rp := argPort("registry-port", executor.DefaultRegistryPort); rp > 0 && rp < 65536 {
 		p.exempt[uint16(rp)] = true
 	}
 	for _, ip := range []int{argPort("ingress-http-port", 80), argPort("ingress-https-port", 443)} {

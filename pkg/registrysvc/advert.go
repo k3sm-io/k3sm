@@ -71,11 +71,11 @@ const (
 	// AdvertisementMeshHostKey is the registry authority a peer dials —
 	// "<mesh-ip>:<registry-port>".
 	AdvertisementMeshHostKey = "meshHost"
-	// AdvertisementPlainHTTPKey is "true" when the authority speaks plain HTTP,
-	// which a mesh peer always does: the ingest registry serves no TLS, and the
-	// wireguard mesh already encrypts and authenticates the hop. It is published
-	// as data rather than assumed by the reader because the reader's transport
-	// decision must come from the node that knows what it is serving.
+	// AdvertisementPlainHTTPKey is "true" when the authority speaks plain HTTP.
+	// It is "false": the relay a peer dials serves HTTPS only, under a
+	// certificate from the cluster CA. It is published as data rather than
+	// assumed by the reader because the reader's transport decision must come
+	// from the node that knows what it is serving.
 	AdvertisementPlainHTTPKey = "plainHTTP"
 )
 
@@ -169,7 +169,7 @@ func Advertisement(node, meshIP string, port int) (*corev1.ConfigMap, error) {
 		Data: map[string]string{
 			AdvertisementNodeKey:      node,
 			AdvertisementMeshHostKey:  host,
-			AdvertisementPlainHTTPKey: strconv.FormatBool(true),
+			AdvertisementPlainHTTPKey: strconv.FormatBool(false),
 		},
 	}, nil
 }

@@ -203,9 +203,12 @@ func startManifestDir(ctx context.Context, restCfg *rest.Config, cs kubernetes.I
 }
 
 // startServerRegistry is step 3d: the node-local OCI ingest registry
-// (--registry-port; 0 disables, which is the default). It runs after the
-// apiserver is healthy, because bringing it up also publishes the KEP-1755
-// local-registry-hosting ConfigMap — discovery needs a cluster to publish into.
+// (--registry-port, on by default at executor.DefaultRegistryPort; 0 opts out).
+// It runs after the apiserver is healthy, because bringing it up also publishes
+// the flat registry-k3sm Service and the KEP-1755 local-registry-hosting
+// ConfigMap, and both need a cluster to publish into. A bootstrap server that
+// opts out removes a flat Service an earlier boot left, so no Pod resolves a
+// name nothing will answer.
 //
 // It is torn down EARLY and BEFORE the control plane: the returned stop is
 // handed to the control-plane stopper (controlPlaneStopper.precede), which runs
@@ -238,10 +241,12 @@ func startManifestDir(ctx context.Context, restCfg *rest.Config, cs kubernetes.I
 // The relay's push gate authorizes in-pod pushes under its own identity
 // (serverRegistryGateClient), minted here in memory from the signing CA. A gate
 // identity that cannot be minted is logged and leaves every write refused; it
-// never falls back to restCfg's admin identity.
+// never falls back to restCfg's admin identity. The relay serves HTTPS under a
+// certificate minted in memory from the cluster CA (serverRegistryServingMinter).
 func startServerRegistry(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, vmCapable bool, cpStop *controlPlaneStopper, logger *slog.Logger) (stop func(), puller registryPullerWiring) {
 	opts := plan.opts
 	if opts.registryPort == 0 {
+		retractOptedOutRegistryService(ctx, opts, cs, logger)
 		return noStop, puller
 	}
 	cfg := registryConfig(opts, plan.cfg.PayloadBinDir, logger)
@@ -280,18 +285,22 @@ func startServerRegistry(ctx context.Context, plan serverPlan, restCfg *rest.Con
 		vmNetSubnet: guestNATSubnet(vmCapable),
 		hostingCMs:  cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 		advertCMs:   cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
-		// The per-node registry Service + its hand-written EndpointSlice,
-		// in the SAME namespace as the advertisement: one cluster address
-		// a native Pod, a vm guest and the host all reach this node's
-		// registry at. Written with the retained admin client, exactly as
-		// the advertisement is — the node identities that READ them
-		// already hold cluster-wide services/endpointslices through
-		// k3sm:node-datapath (pkg/rbac).
-		clusterSvcs:   cs.CoreV1().Services(registrysvc.AdvertisementNamespace),
-		clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace),
+		// The flat registry-k3sm Service + its hand-written EndpointSlice,
+		// in the SAME namespace as the advertisement: the one cluster name
+		// a native Pod and a vm guest reach the registry at. Written with
+		// the retained admin client, exactly as the advertisement is; the
+		// node identities that READ them already hold cluster-wide
+		// services/endpointslices through k3sm:node-datapath (pkg/rbac).
+		clusterSvcs:   cs.CoreV1().Services(registrysvc.FlatServiceNamespace),
+		clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.FlatServiceNamespace),
 		clusterDomain: opts.domain,
-		gateAuth:      serverRegistryGateAuth(ctx, opts, restCfg, logger),
-		logger:        logger,
+		// A server that joined an existing control plane leaves the flat
+		// Service and the discovery document to the bootstrap server.
+		joined:      opts.serverJoin,
+		workDir:     opts.workDir,
+		mintServing: serverRegistryServingMinter(opts, logger),
+		gateAuth:    serverRegistryGateAuth(ctx, opts, restCfg, logger),
+		logger:      logger,
 	})
 	// The early run, on the control-plane stop's lane, and runServer's deferred
 	// backstop share one stage: whichever comes first runs the teardown, and the

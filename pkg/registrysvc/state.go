@@ -68,6 +68,52 @@ type State struct {
 	ReclaimedPID int `json:"reclaimedPid,omitempty"`
 	// Since is when the registry entered State.
 	Since time.Time `json:"since"`
+	// Service is the in-cluster authority the registry is published under
+	// (FlatAuthority, "registry-k3sm:6450") when this server publishes the flat
+	// Service; empty otherwise.
+	Service string `json:"service,omitempty"`
+	// TLS is whether the cluster-facing relay serves HTTPS. It is the only way
+	// the relay serves; false means no relay is serving at all.
+	TLS bool `json:"tls,omitempty"`
+	// CertNotAfter is the expiry of the relay's current serving certificate,
+	// updated on every rotation; nil when the relay serves no certificate.
+	CertNotAfter *time.Time `json:"certNotAfter,omitempty"`
+}
+
+// ClusterFacing is what the server's bring-up learns about the registry's
+// cluster-facing side after the registry itself is serving: the published
+// name and the serving certificate. UpdateClusterFacing writes it into the
+// record the Service already wrote.
+type ClusterFacing struct {
+	// Service is FlatAuthority() when the flat Service is published, else "".
+	Service string
+	// CertNotAfter is the serving certificate's expiry; zero means the relay
+	// serves no certificate (and so does not serve).
+	CertNotAfter time.Time
+}
+
+// UpdateClusterFacing records f into workDir's state record, keeping every
+// other field the Service wrote. It is called after the Service records
+// StateServing and before it records StateStopped, never concurrently with
+// either, so the read-modify-write cannot lose a transition. A missing record
+// is an error: there is no serving registry to describe.
+func UpdateClusterFacing(workDir string, f ClusterFacing) error {
+	b, err := os.ReadFile(StatePath(workDir))
+	if err != nil {
+		return fmt.Errorf("read the registry state: %w", err)
+	}
+	st, err := ParseState(b)
+	if err != nil {
+		return err
+	}
+	st.Service = f.Service
+	st.TLS = !f.CertNotAfter.IsZero()
+	st.CertNotAfter = nil
+	if st.TLS {
+		t := f.CertNotAfter.UTC()
+		st.CertNotAfter = &t
+	}
+	return WriteState(workDir, st)
 }
 
 // stateName is the record's basename. It sits in the work dir beside

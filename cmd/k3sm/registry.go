@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
@@ -50,8 +52,8 @@ const (
 	// it a teardown that used every grace to the full would be cut off.
 	registryTeardownMargin = 5 * time.Second
 	// registryTeardownBound is the whole teardown startIngestRegistry returns:
-	// the advertisement's retraction, the cluster Service's retraction, then the
-	// child's stop, run in that order, plus the margin. It is the bound the
+	// the advertisement's retraction, the flat Service's endpoint retraction,
+	// then the child's stop, run in that order, plus the margin. It is the bound the
 	// control-plane stop waits on the teardown for (controlPlaneStopper.precede)
 	// and the backstop's wait ends by (sharedStage), and pkg/install budgets the
 	// same steps in the launchd ExitTimeOut.
@@ -110,20 +112,22 @@ func recordRegistryDisabled(opts serverOptions, reason string, logger *slog.Logg
 }
 
 // ingestRegistry is everything `k3sm server` needs to bring the node-local
-// registry up: the service itself, the port, and the three cluster facts that
-// decide who — besides this node's own pods — can reach it.
+// registry up: the service itself, the port, and the cluster facts that decide
+// who, besides this node's own pods, can reach it and under what name.
 //
 // It is a struct rather than a parameter list because the fields are not
 // interchangeable and several are same-typed strings: a node name, a mesh
 // address and a NAT segment transposed at a call site would compile and would
-// then advertise one node's registry under another node's name.
+// then publish one node's registry under another node's address.
 type ingestRegistry struct {
 	// svc is the registry service to start and stop.
 	svc registryService
-	// port is the loopback port it serves on — the port the discovery document
-	// names, the port peers are advertised at, and the port the relay binds.
+	// port is the loopback port it serves on: the port the discovery document
+	// names for the runtime, the port peers are advertised at, the port the
+	// relay binds and the flat Service's target port.
 	port int
-	// nodeName is this node, the identity its advertisement is published under.
+	// nodeName is this node, the identity its advertisement and the flat
+	// Service's publisher label are written under.
 	nodeName string
 	// meshIP is this node's wireguard address, or "" on a single-node server.
 	// Empty publishes no advertisement and relays on no mesh address: there is no
@@ -134,6 +138,15 @@ type ingestRegistry struct {
 	// which is the only way a guest can reach a host listener (a guest cannot
 	// reach loopback).
 	vmNetSubnet string
+	// joined is a server that joined an existing control plane (--server-join).
+	// It publishes neither the flat Service nor the discovery document: the
+	// bootstrap server does, so two servers never fight over the one name's
+	// endpoints. Its own registry still serves loopback pushes and its relay.
+	joined bool
+	// workDir is where the registry's state record lives; the cluster-facing
+	// facts (the published name, the certificate's expiry) are added to it.
+	// Empty records nothing.
+	workDir string
 	// hostingCMs writes the KEP-1755 discovery document, in kube-public.
 	hostingCMs registrysvc.ConfigMapClient
 	// advertCMs writes and retracts this node's own advertisement, in
@@ -142,17 +155,23 @@ type ingestRegistry struct {
 	// namespace-isolated so the read grant a node identity gets can be scoped to
 	// it (pkg/rbac), and a namespaced client is bound to one namespace.
 	advertCMs registrysvc.AdvertisementClient
-	// clusterSvcs and clusterSlices write and retract this node's per-node
-	// registry Service and its hand-written EndpointSlice, in the same
-	// namespace as the advertisement. They are the ONE cluster address a native
-	// Pod, a vm guest and the host all reach this node's registry at; nil on a
-	// bring-up with no cluster to publish into leaves the Service unpublished and
-	// the KEP-1755 document without a hostFromClusterNetwork.
+	// clusterSvcs and clusterSlices write the flat registry-k3sm Service and its
+	// hand-written EndpointSlice in registrysvc.FlatServiceNamespace, and
+	// remove this node's retired per-node Service. nil on a bring-up with no
+	// cluster to publish into leaves the Service unpublished and the KEP-1755
+	// document naming loopback only.
 	clusterSvcs   registrysvc.ServiceClient
 	clusterSlices registrysvc.EndpointSliceClient
-	// clusterDomain is the cluster DNS suffix the Service authority is rendered
-	// with. Empty means dns.DefaultClusterDomain.
+	// clusterDomain is the cluster DNS suffix the certificate's fully
+	// qualified SAN is rendered with. Empty means dns.DefaultClusterDomain.
 	clusterDomain string
+	// mintServing issues the relay's serving certificate for the given SANs
+	// from the cluster CA, in memory. nil (no usable cluster CA) leaves the
+	// relay off: it never serves plain HTTP.
+	mintServing func(dnsNames []string, ips []net.IP) (tls.Certificate, error)
+	// relayListen overrides how the relay binds an admitted address. nil is the
+	// shipped TCP listener; a test points it at loopback.
+	relayListen func(addr string) (net.Listener, error)
 	// gateAuth is the push gate's apiserver clients, under the gate's own
 	// narrow identity (certs.RegistryGateSubject), never the admin client. An
 	// incomplete one (the identity could not be minted) leaves reads served and
@@ -176,76 +195,66 @@ type registryPullerWiring struct {
 	// "localhost:<port>". It makes a bare "app:v1" resolve here first instead of
 	// normalising straight to Docker Hub.
 	LocalHost string
-	// ClusterRegistries are the NON-loopback spellings of the same registry: the
-	// per-node Service's four resolvable authorities and its VIP
-	// (registrysvc.ClusterLocalAuthorities). Empty on a node that publishes no
-	// Service.
+	// ClusterRegistries are NON-loopback spellings of the same registry that
+	// runtimed fetches over plain HTTP. It is empty: the relay now serves HTTPS
+	// only, and the flat name is mapped by the runtime itself, verifying
+	// against the cluster CA. The field stays so the seam is unchanged.
 	ClusterRegistries []string
 }
 
-// startIngestRegistry brings the registry up, publishes the KEP-1755 discovery
-// ConfigMap, this node's peer-facing advertisement and its per-node cluster
-// Service, starts the mesh/guest relay, and returns the teardown closure the
-// caller defers. The closure is never nil, so the caller's `defer stop()` is
-// unconditional.
+// startIngestRegistry brings the registry up, publishes the flat registry-k3sm
+// Service and the KEP-1755 discovery document (the bootstrap server only),
+// this node's peer-facing advertisement, starts the HTTPS relay, and returns the
+// teardown closure the caller defers. The closure is never nil, so the caller's
+// `defer stop()` is unconditional.
 //
 // It ALSO returns the puller wiring: how runtimed should spell this node's own
-// registry (registryPullerWiring). It is returned rather than published somewhere
-// because runtimed's puller is the consumer — a reference carrying one of those
-// authorities is node-relative in exactly the sense a loopback one is, and
-// runtimed cannot derive them (they depend on a node name, a cluster domain and
-// an assigned VIP it never sees). The zero value on a registry that never started
-// leaves runtimed's classification byte for byte as it was.
+// registry (registryPullerWiring), the loopback authority. The zero value on a
+// registry that never started leaves runtimed's classification byte for byte as
+// it was.
 //
 // NOTHING HERE IS FATAL. A registry that cannot build, bind or serve leaves a
 // cluster that cannot ingest images; a bring-up that aborted over it leaves a
 // cluster that does nothing at all. This is the same log-and-continue posture the
 // ingress listeners and svclb are started under, and the opposite of the
 // fail-closed RBAC and MeshPeer-CRD steps, which decide whether there is a
-// working control plane at all.
+// working control plane at all. The one refusal that IS absolute is plain HTTP
+// off loopback: with no serving certificate there is no relay.
 //
-// EVERYTHING IS PUBLISHED ONLY AFTER THE REGISTRY IS SERVING, discovery document
-// and advertisement alike. A document naming a port nothing answers on is worse
-// than no document: a reader that finds it stops looking and then fails at the
-// push, and a peer that finds it makes a pull wait on a dial that cannot succeed.
+// EVERYTHING IS PUBLISHED ONLY AFTER THE REGISTRY IS SERVING. A document naming
+// a port nothing answers on is worse than no document: a reader that finds it
+// stops looking and then fails at the push.
 func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registryPullerWiring) {
 	logger := r.logger
 	if err := r.svc.Start(ctx); err != nil {
 		logger.Error("ingest registry disabled", "err", err)
 		return func() {}, registryPullerWiring{}
 	}
-	// The per-node Service comes BEFORE the discovery document, because the
-	// document's hostFromClusterNetwork is a claim about it: the address is
-	// published exactly when a Service exists to answer it, and "" otherwise.
-	clusterHost, clusterIP := r.publishClusterService(ctx)
-	if err := registrysvc.PublishHosting(ctx, r.hostingCMs, r.port, clusterHost); err != nil {
-		// The registry is serving and pushes to it work; only the DISCOVERY of it
-		// failed. Reporting and continuing keeps the working half working.
-		logger.Error("publish the local-registry-hosting ConfigMap", "err", err,
-			"namespace", registrysvc.HostingNamespace, "name", registrysvc.HostingConfigMapName)
-	} else {
-		logger.Info("published local-registry-hosting for discovery",
-			"namespace", registrysvc.HostingNamespace, "name", registrysvc.HostingConfigMapName,
-			"addr", r.svc.Addr(), "hostFromClusterNetwork", clusterHost)
+	r.retireNodeService(ctx)
+	// The flat Service comes BEFORE the discovery document, because the
+	// document's host and hostFromClusterNetwork are a claim about it, and
+	// before the certificate, whose IP SANs carry its ClusterIP.
+	clusterIP, published := r.publishFlatService(ctx)
+	clusterHost := ""
+	if published {
+		clusterHost = registrysvc.FlatAuthority()
 	}
+	r.publishHosting(ctx, clusterHost)
 
-	// A context of its own for the two cluster-facing goroutines, so the teardown
+	sans := &servingSANs{clusterIP: clusterIP}
+	serving := r.servingIdentity(sans, clusterHost)
+
+	// A context of its own for the cluster-facing goroutines, so the teardown
 	// can stop them WITHOUT waiting on the caller's: they must be down before the
 	// registry they front is, or a peer's in-flight pull outlives its target.
 	auxCtx, stopAux := context.WithCancel(ctx)
 	var aux sync.WaitGroup
 
 	r.advertise(auxCtx, &aux)
-	r.refreshClusterService(auxCtx, &aux)
-	r.relay(auxCtx, &aux)
+	r.refresh(auxCtx, &aux, published, sans, serving)
+	r.relay(auxCtx, &aux, serving)
 
-	// The registry is SERVING at this point, which is what makes the loopback
-	// spelling true; the cluster spellings are added only when a Service was
-	// actually published, so runtimed never admits an authority nothing answers.
 	wiring := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(r.port)}
-	if clusterHost != "" {
-		wiring.ClusterRegistries = registrysvc.ClusterLocalAuthorities(r.nodeName, r.clusterDomain, clusterIP, r.port)
-	}
 
 	return func() {
 		stopAux()
@@ -255,13 +264,101 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registr
 		// would retract nothing and would SIGKILL the child immediately instead of
 		// letting it close its storage.
 		r.retract(context.WithoutCancel(ctx))
-		r.retractClusterService(context.WithoutCancel(ctx))
+		if published {
+			r.retractFlatEndpoints(context.WithoutCancel(ctx))
+		}
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), registryShutdownGrace)
 		defer cancel()
 		if err := r.svc.Shutdown(stopCtx); err != nil {
 			logger.Error("ingest registry shutdown", "err", err)
 		}
 	}, wiring
+}
+
+// servingSANs holds the one SAN input that can change while the relay serves:
+// the flat Service's ClusterIP, which a refresh may find re-assigned (the
+// Service was deleted and recreated). It is guarded so the mint closure, called
+// from TLS handshakes, reads it safely.
+type servingSANs struct {
+	mu        sync.Mutex
+	clusterIP string
+}
+
+func (s *servingSANs) get() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clusterIP
+}
+
+// set records ip and reports whether it changed.
+func (s *servingSANs) set(ip string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := s.clusterIP != ip
+	s.clusterIP = ip
+	return changed
+}
+
+// publishHosting writes the KEP-1755 document on the bootstrap server.
+func (r ingestRegistry) publishHosting(ctx context.Context, clusterHost string) {
+	if r.joined {
+		r.logger.Info("this server joined an existing control plane, so the bootstrap server publishes local-registry-hosting")
+		return
+	}
+	if err := registrysvc.PublishHosting(ctx, r.hostingCMs, r.port, clusterHost); err != nil {
+		// The registry is serving and pushes to it work; only the DISCOVERY of it
+		// failed. Reporting and continuing keeps the working half working.
+		r.logger.Error("publish the local-registry-hosting ConfigMap", "err", err,
+			"namespace", registrysvc.HostingNamespace, "name", registrysvc.HostingConfigMapName)
+		return
+	}
+	r.logger.Info("published local-registry-hosting for discovery",
+		"namespace", registrysvc.HostingNamespace, "name", registrysvc.HostingConfigMapName,
+		"addr", r.svc.Addr(), "hostFromClusterNetwork", clusterHost)
+}
+
+// servingIdentity mints the relay's serving certificate, or returns nil when
+// there is no relay to serve it (no mesh address and no vm network) or no
+// certificate can be minted, which leaves the relay off. Every mint is
+// recorded in the state record with its expiry.
+func (r ingestRegistry) servingIdentity(sans *servingSANs, clusterHost string) *registrysvc.ServingIdentity {
+	if _, err := registrysvc.ClusterEndpointAddress(r.meshIP, r.vmNetSubnet); err != nil {
+		return nil // no relay address: relay() says why, once
+	}
+	if r.mintServing == nil {
+		r.logger.Error("the ingest registry relay is off: no cluster CA to issue its serving certificate, and it never serves plain HTTP")
+		return nil
+	}
+	dnsNames := registrysvc.FlatServiceDNSNames(r.clusterDomain)
+	serving, err := registrysvc.NewServingIdentity(registrysvc.ServingConfig{
+		Mint: func() (tls.Certificate, error) {
+			return r.mintServing(dnsNames, registrysvc.FlatServingIPs(sans.get(), r.meshIP, r.vmNetSubnet))
+		},
+		Margin: nodecred.ExpiryMargin,
+		OnMint: func(notAfter time.Time) {
+			r.logger.Info("minted the ingest registry's serving certificate from the cluster CA (in memory, never written to disk)",
+				"dns", dnsNames, "clusterIP", sans.get(), "not_after", notAfter.UTC().Format(time.RFC3339))
+			r.recordClusterFacing(registrysvc.ClusterFacing{Service: clusterHost, CertNotAfter: notAfter})
+		},
+		Logger: r.logger,
+	})
+	if err != nil {
+		r.logger.Error("the ingest registry relay is off: its serving certificate could not be minted, and it never serves plain HTTP", "err", err)
+		return nil
+	}
+	return serving
+}
+
+// recordClusterFacing adds the cluster-facing facts to the state record. A
+// failed write is logged and survived: the record is a report.
+func (r ingestRegistry) recordClusterFacing(f registrysvc.ClusterFacing) {
+	if r.workDir == "" {
+		return
+	}
+	if err := registrysvc.UpdateClusterFacing(r.workDir, f); err != nil {
+		r.logger.Warn("could not record the ingest registry's cluster-facing state for `k3sm status`",
+			"path", registrysvc.StatePath(r.workDir), "err", err)
+	}
 }
 
 // advertise publishes this node's peer-facing advertisement and keeps it fresh
@@ -307,60 +404,82 @@ func (r ingestRegistry) advertise(ctx context.Context, wg *sync.WaitGroup) {
 	}()
 }
 
-// publishClusterService publishes this node's per-node registry Service and its
-// hand-written EndpointSlice, and returns the in-cluster authority a caller dials
-// — or "" when there is none, which is the value HostingDocument omits the field
-// for — together with the ClusterIP the apiserver assigned, which is the other
-// spelling of the same registry a workload may write into a reference.
-//
-// It returns "" and says why, once at Info, in the two states where there is
-// nothing to publish: no cluster clients (a bring-up with no apiserver), and no
-// relay address (a single Mac with no mesh and no vm network, where loopback
-// already reaches everything that exists).
-//
-// A publish FAILURE also yields "", deliberately. The registry serves and this
-// node's own pods pull from it; only the cluster-facing name failed, and
-// publishing a hostFromClusterNetwork for a Service that does not exist would
-// send every reader at a name that resolves to nothing.
-func (r ingestRegistry) publishClusterService(ctx context.Context) (authority, clusterIP string) {
+// retireNodeService removes this node's per-node registry-<node> Service and
+// its EndpointSlice, which earlier releases published. Best effort: nothing
+// depends on it being gone, and a NotFound (every boot after the first) is
+// success.
+func (r ingestRegistry) retireNodeService(ctx context.Context) {
 	if r.clusterSvcs == nil || r.clusterSlices == nil {
-		return "", ""
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, registryRetractGrace)
+	defer cancel()
+	if err := registrysvc.RemoveClusterService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName); err != nil {
+		r.logger.Warn("remove this node's retired per-node registry Service", "err", err,
+			"name", registrysvc.ClusterServiceName(r.nodeName))
+	}
+	if r.joined {
+		return
+	}
+	// The bootstrap server also sweeps the retired Services of nodes that are
+	// gone, which no surviving server would otherwise remove.
+	if err := registrysvc.RemoveRetiredNodeServices(ctx, r.clusterSvcs, r.clusterSlices); err != nil {
+		r.logger.Warn("sweep the retired per-node registry Services", "err", err)
+	}
+}
+
+// publishFlatService publishes the flat registry-k3sm Service and its
+// hand-written EndpointSlice, and returns the ClusterIP the apiserver assigned
+// and whether the Service is published.
+//
+// It publishes nothing, and says why once at Info, when this server joined an
+// existing control plane (the bootstrap server publishes), when there are no
+// cluster clients, and when there is no relay address (a single Mac with no
+// mesh and no vm network, where loopback already reaches everything that
+// exists). A publish FAILURE also yields false: publishing a host for a
+// Service that does not exist would send every reader at a name that
+// resolves to nothing.
+func (r ingestRegistry) publishFlatService(ctx context.Context) (clusterIP string, published bool) {
+	if r.joined {
+		r.logger.Info("this server joined an existing control plane, so the bootstrap server publishes the registry Service",
+			"name", registrysvc.FlatServiceName)
+		return "", false
+	}
+	if r.clusterSvcs == nil || r.clusterSlices == nil {
+		return "", false
 	}
 	addr, err := registrysvc.ClusterEndpointAddress(r.meshIP, r.vmNetSubnet)
 	switch {
 	case errors.Is(err, registrysvc.ErrNoClusterAddress):
-		r.logger.Info("this node's ingest registry has no cluster address: no mesh address and no vm network, so loopback reaches everything that exists",
+		r.logger.Info("the ingest registry has no cluster address: no mesh address and no vm network, so loopback reaches everything that exists",
 			"node", r.nodeName)
-		return "", ""
+		return "", false
 	case err != nil:
-		r.logger.Error("this node's ingest registry has no publishable cluster address", "err", err, "node", r.nodeName)
-		return "", ""
+		r.logger.Error("the ingest registry has no publishable cluster address", "err", err, "node", r.nodeName)
+		return "", false
 	}
-	clusterIP, err = registrysvc.PublishClusterService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, addr)
+	clusterIP, err = registrysvc.PublishFlatService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, addr)
 	if err != nil {
-		r.logger.Error("publish this node's registry Service", "err", err,
-			"namespace", registrysvc.AdvertisementNamespace, "name", registrysvc.ClusterServiceName(r.nodeName))
-		return "", ""
+		r.logger.Error("publish the registry Service", "err", err,
+			"namespace", registrysvc.FlatServiceNamespace, "name", registrysvc.FlatServiceName)
+		return "", false
 	}
-	authority = registrysvc.ClusterServiceAuthority(r.nodeName, r.clusterDomain, r.port)
-	r.logger.Info("published this node's ingest registry as a cluster Service",
-		"namespace", registrysvc.AdvertisementNamespace, "name", registrysvc.ClusterServiceName(r.nodeName),
-		"authority", authority, "clusterIP", clusterIP, "endpoint", addr.String())
-	return authority, clusterIP
+	r.logger.Info("published the ingest registry as the cluster Service",
+		"namespace", registrysvc.FlatServiceNamespace, "name", registrysvc.FlatServiceName,
+		"authority", registrysvc.FlatAuthority(), "clusterIP", clusterIP, "endpoint", addr.String())
+	return clusterIP, true
 }
 
-// refreshClusterService re-publishes the Service and its EndpointSlice on the
-// same cadence, and for the same reason, as the advertisement: the relay address
-// and the port are per-boot facts, and a repair is the only thing a re-publish
-// can do — one that changes nothing issues no write at all.
-func (r ingestRegistry) refreshClusterService(ctx context.Context, wg *sync.WaitGroup) {
-	if r.clusterSvcs == nil || r.clusterSlices == nil {
+// refresh re-publishes the flat Service on the advertisement's cadence and
+// keeps the serving certificate current: it is replaced inside its expiry
+// margin, and at once when a re-publish finds the ClusterIP changed (an IP SAN
+// would otherwise name the old VIP). A re-publish that changes nothing issues
+// no write at all.
+func (r ingestRegistry) refresh(ctx context.Context, wg *sync.WaitGroup, published bool, sans *servingSANs, serving *registrysvc.ServingIdentity) {
+	if !published && serving == nil {
 		return
 	}
-	addr, err := registrysvc.ClusterEndpointAddress(r.meshIP, r.vmNetSubnet)
-	if err != nil {
-		return // publishClusterService already said why, once
-	}
+	addr, addrErr := registrysvc.ClusterEndpointAddress(r.meshIP, r.vmNetSubnet)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -371,45 +490,55 @@ func (r ingestRegistry) refreshClusterService(ctx context.Context, wg *sync.Wait
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if _, err := registrysvc.PublishClusterService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, addr); err != nil {
-					r.logger.Error("refresh this node's registry Service", "err", err,
-						"name", registrysvc.ClusterServiceName(r.nodeName))
+			}
+			if published && addrErr == nil {
+				ip, err := registrysvc.PublishFlatService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, addr)
+				switch {
+				case err != nil:
+					r.logger.Error("refresh the registry Service", "err", err, "name", registrysvc.FlatServiceName)
+				case sans.set(ip) && serving != nil:
+					if err := serving.Rotate(); err != nil {
+						r.logger.Error("re-mint the ingest registry's serving certificate for the Service's new ClusterIP", "err", err, "clusterIP", ip)
+					}
 				}
+			}
+			if serving != nil {
+				serving.Refresh()
 			}
 		}
 	}()
 }
 
-// retractClusterService removes this node's Service and EndpointSlice, so a
-// caller stops resolving a name whose backend is going away. Best effort, exactly
-// as retract is.
-func (r ingestRegistry) retractClusterService(ctx context.Context) {
-	if r.clusterSvcs == nil || r.clusterSlices == nil {
+// retractFlatEndpoints removes the flat Service's EndpointSlice and keeps the
+// Service, so a caller fails fast while the server is down and the ClusterIP
+// is the same when it is back. Best effort, exactly as retract is.
+func (r ingestRegistry) retractFlatEndpoints(ctx context.Context) {
+	if r.clusterSlices == nil {
 		return
-	}
-	if _, err := registrysvc.ClusterEndpointAddress(r.meshIP, r.vmNetSubnet); err != nil {
-		return // nothing was ever published
 	}
 	ctx, cancel := context.WithTimeout(ctx, registryRetractGrace)
 	defer cancel()
-	if err := registrysvc.RemoveClusterService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName); err != nil {
-		r.logger.Warn("retract this node's registry Service", "err", err,
-			"name", registrysvc.ClusterServiceName(r.nodeName))
+	if err := registrysvc.RemoveFlatEndpointSlice(ctx, r.clusterSlices); err != nil {
+		r.logger.Warn("retract the registry Service's endpoints", "err", err, "name", registrysvc.FlatServiceName)
 	}
 }
 
-// relay starts the mesh/guest relay, or explains why there is none.
+// relay starts the mesh/guest relay over HTTPS, or explains why there is none.
 //
 // The relay is the ONLY off-loopback exposure of the registry: the service itself
 // refuses any non-loopback bind, so widening reachability is a decision made here
-// and confined to the two addresses registrysvc.NewRelay admits.
-func (r ingestRegistry) relay(ctx context.Context, wg *sync.WaitGroup) {
+// and confined to the two addresses registrysvc.NewRelay admits. With no serving
+// certificate NewRelay refuses (registrysvc.ErrNoServingIdentity): there is no
+// plain-HTTP relay.
+func (r ingestRegistry) relay(ctx context.Context, wg *sync.WaitGroup, serving *registrysvc.ServingIdentity) {
 	relay, err := registrysvc.NewRelay(registrysvc.RelayConfig{
 		Port:           r.port,
 		MeshIP:         r.meshIP,
 		VMNetSubnet:    r.vmNetSubnet,
 		Auth:           r.gateAuth,
 		GateCredential: r.svc.GateCredential(),
+		Serving:        serving,
+		Listen:         r.relayListen,
 		Logger:         r.logger,
 	})
 	switch {
@@ -417,6 +546,8 @@ func (r ingestRegistry) relay(ctx context.Context, wg *sync.WaitGroup) {
 		// Single node, no guests: loopback reaches everything that exists.
 		r.logger.Info("this node's ingest registry is reachable on loopback only: no mesh address and no vm network")
 		return
+	case errors.Is(err, registrysvc.ErrNoServingIdentity):
+		return // servingIdentity already said why, once
 	case err != nil:
 		r.logger.Error("ingest registry relay disabled", "err", err)
 		return

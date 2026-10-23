@@ -18,6 +18,7 @@ package registrysvc
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -33,9 +34,16 @@ import (
 	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
-// The MESH/GUEST RELAY: an HTTP front that accepts on an address other machines
+// The MESH/GUEST RELAY: an HTTPS front that accepts on an address other machines
 // (or this Mac's own vm guests) can reach, serves the push gate there, and hands
 // every request the gate admits to the registry's loopback listener.
+//
+// IT SERVES HTTPS AND NOTHING ELSE. TLS terminates here, under a certificate the
+// cluster CA issues (serving.go), so a ServiceAccount token presented for a push
+// and the image bytes alike are encrypted on every hop a caller can see, whether
+// it arrived over the mesh, over a vm guest's NAT segment or through a Service
+// VIP. A plain-HTTP request to a relay address is answered with 400 and never
+// reaches the gate. zot behind it stays plain HTTP on loopback.
 //
 // WHY A RELAY AND NOT A SECOND BIND. The ingest registry binds 127.0.0.1 and New
 // refuses anything else, because that single fact is what makes anonymous pull
@@ -61,9 +69,9 @@ import (
 // THE TWO ADDRESSES, and why they are the only two:
 //
 //   - THE MESH ADDRESS — this node's wireguard address, inside
-//     podnet.ClusterPodCIDR. Traffic to it is already encrypted and
-//     authenticated by wireguard, so plaintext HTTP over it is re-using a secure
-//     transport rather than forgoing one, and only enrolled peers can address it.
+//     podnet.ClusterPodCIDR. Only enrolled peers can address it, and wireguard
+//     already encrypts the traffic between nodes; TLS on top covers the hops
+//     wireguard does not (a Pod to its own node's proxy, a guest to its gateway).
 //   - THE VM NAT GATEWAY — the host side of the segment macOS's vmnet hands this
 //     node's Linux guests, derived from the NAT subnet. A guest reaches a host
 //     listener bound on the gateway address or the wildcard, and NEVER a
@@ -132,6 +140,15 @@ type RelayConfig struct {
 	// GateCredential is the registry credential an authorized write is
 	// forwarded with (Service.GateCredential). Empty refuses every write.
 	GateCredential Credential
+	// Serving is the TLS identity every relay address presents. Required:
+	// NewRelay refuses a relay without one (ErrNoServingIdentity) rather than
+	// serve plain HTTP off loopback.
+	Serving *ServingIdentity
+	// Listen binds one admitted address. nil means a TCP listener with the
+	// segment clamp. It is a seam for tests that serve the relay over loopback;
+	// the address it is handed is always one relayBinds admitted, so it cannot
+	// widen the bind discipline, only redirect where a test listens.
+	Listen func(addr string) (net.Listener, error)
 	// Logger receives bind, forward and push-decision events. nil means
 	// slog.Default.
 	Logger *slog.Logger
@@ -147,6 +164,10 @@ type Relay struct {
 	binds   []netip.Addr
 	log     *slog.Logger
 	handler http.Handler
+	// tls is the server configuration every accepted connection is wrapped in.
+	// NewRelay always sets it; only this package's tests of the gate mechanics
+	// build a relay without it.
+	tls *tls.Config
 
 	// listen is a seam so the serve mechanics are testable over a loopback
 	// listener, with no mesh and no guest. Production wires a segment-clamped
@@ -171,7 +192,15 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newRelay(cfg.Port, binds, cfg.Logger, cfg.Auth, cfg.GateCredential), nil
+	if cfg.Serving == nil {
+		return nil, ErrNoServingIdentity
+	}
+	r := newRelay(cfg.Port, binds, cfg.Logger, cfg.Auth, cfg.GateCredential)
+	r.tls = cfg.Serving.TLSConfig()
+	if cfg.Listen != nil {
+		r.listen = cfg.Listen
+	}
+	return r, nil
 }
 
 // newRelay assembles a Relay over the PRODUCTION seams. It is the one place they
@@ -352,8 +381,8 @@ func (r *Relay) retry(ctx context.Context, attempt int, stage, addr string, err 
 	}
 }
 
-// accept serves the push gate over ln, at most relayMaxConns connections at a
-// time. It returns nil on a clean stop (ctx cancelled or the listener closed)
+// accept serves the push gate over ln, over TLS, at most relayMaxConns
+// connections at a time. It returns nil on a clean stop (ctx cancelled or the listener closed)
 // so serve can tell "we are shutting down" from "this listener broke".
 //
 // One http.Server per address, with the gate mounted directly as its handler.
@@ -376,7 +405,14 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 		}
 		_ = srv.Close()
 	}()
-	err := srv.Serve(newLimitListener(ln, relayMaxConns))
+	var served net.Listener = newLimitListener(ln, relayMaxConns)
+	if r.tls != nil {
+		// TLS wraps the connection cap, not the reverse: the *tls.Conn the
+		// server sees is what lets it answer a plain-HTTP request with 400,
+		// and closing it closes the capped connection and frees its slot.
+		served = tls.NewListener(served, r.tls)
+	}
+	err := srv.Serve(served)
 	if ctx.Err() != nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
 		return nil
 	}

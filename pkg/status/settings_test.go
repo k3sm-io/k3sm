@@ -64,7 +64,7 @@ func TestSettingsRow(t *testing.T) {
 			wantState: StateOK, wantSev: SeverityOK,
 			wantWide: map[string]string{
 				SettingNodePortAddresses: "every interface",
-				SettingRegistryPort:      "off",
+				SettingRegistryPort:      "6450",
 				SettingTLSSANs:           "none",
 				SettingMeshIP:            "none",
 				SettingKubeconfigName:    install.DefaultKubeconfigName,
@@ -72,7 +72,7 @@ func TestSettingsRow(t *testing.T) {
 				SettingDataVolume:        "none",
 				SettingLANAccess:         "off",
 			},
-			wantDetail: "NodePort addresses every interface · registry port off · TLS SANs none · mesh IP none · kubeconfig name " +
+			wantDetail: "NodePort addresses every interface · registry port 6450 · TLS SANs none · mesh IP none · kubeconfig name " +
 				install.DefaultKubeconfigName + " · release base default · data volume none · LAN access off",
 		},
 		{

@@ -30,42 +30,36 @@ import (
 )
 
 // TestHostingDocument pins the KEP-1755 payload in BOTH of its shapes: the
-// three-address form a node with a cluster-reachable registry publishes, and the
-// two-address form a node with no relay publishes. The field is present exactly
-// when it is true — a node with no mesh address and no vm network has nothing
-// answering off loopback, and an address there would name something no caller
-// could reach.
+// flat-name form a server that publishes the registry-k3sm Service writes, and
+// the loopback form a server with no relay writes. hostFromClusterNetwork is
+// present exactly when it is true.
 func TestHostingDocument(t *testing.T) {
-	const authority = "registry-k3sm-studio.k3sm-registry.svc.cluster.local:6450"
-
-	t.Run("three addresses when the node has a cluster Service", func(t *testing.T) {
-		got := decodeHosting(t, 6450, authority)
-		if want := "localhost:6450"; got["host"] != want {
+	t.Run("the flat name is host and hostFromClusterNetwork", func(t *testing.T) {
+		got := decodeHosting(t, 6450, FlatAuthority())
+		if want := "registry-k3sm:6450"; got["host"] != want {
 			t.Errorf("host = %q, want %q", got["host"], want)
 		}
-		// The literal name `localhost` is what the OCI toolchain special-cases as
-		// an insecure registry, and this one serves plain HTTP.
+		if want := "registry-k3sm:6450"; got["hostFromClusterNetwork"] != want {
+			t.Errorf("hostFromClusterNetwork = %q, want %q", got["hostFromClusterNetwork"], want)
+		}
+		// The node runtime still pulls the server's registry on loopback until
+		// it maps the flat name itself.
 		if want := "localhost:6450"; got["hostFromContainerRuntime"] != want {
 			t.Errorf("hostFromContainerRuntime = %q, want %q", got["hostFromContainerRuntime"], want)
-		}
-		if got["hostFromClusterNetwork"] != authority {
-			t.Errorf("hostFromClusterNetwork = %q, want %q", got["hostFromClusterNetwork"], authority)
 		}
 		if !strings.HasPrefix(got["help"], "https://") {
 			t.Errorf("help = %q, want a documentation URL first", got["help"])
 		}
-		// A Service name gets no insecure-registry special case from an OCI
-		// toolchain, so the document has to SAY the transport somewhere; the KEP
-		// gives it no field, so it rides in help.
-		if !strings.Contains(got["help"], "plain HTTP") {
-			t.Errorf("help = %q, does not state that the cluster address is plain HTTP", got["help"])
+		// The KEP has no transport field, so the document says it in help.
+		if !strings.Contains(got["help"], "HTTPS") || !strings.Contains(got["help"], "ca.crt") {
+			t.Errorf("help = %q, does not state that the cluster name is HTTPS under the cluster CA", got["help"])
 		}
 	})
 
-	t.Run("the cluster address is omitted when there is none", func(t *testing.T) {
+	t.Run("loopback only when there is no Service", func(t *testing.T) {
 		got := decodeHosting(t, 6450, "")
 		if _, present := got["hostFromClusterNetwork"]; present {
-			t.Errorf("hostFromClusterNetwork = %q on a node with no relay; nothing off loopback answers there",
+			t.Errorf("hostFromClusterNetwork = %q on a server with no relay; nothing off loopback answers there",
 				got["hostFromClusterNetwork"])
 		}
 		if want := "localhost:6450"; got["host"] != want {
@@ -73,10 +67,13 @@ func TestHostingDocument(t *testing.T) {
 		}
 	})
 
-	t.Run("the cluster address follows the port", func(t *testing.T) {
-		got := decodeHosting(t, 14507, "registry-n.k3sm-registry.svc.cluster.local:14507")
-		if !strings.HasSuffix(got["hostFromClusterNetwork"], ":14507") {
-			t.Errorf("hostFromClusterNetwork = %q, want the live port", got["hostFromClusterNetwork"])
+	t.Run("the loopback address follows the registry port, the flat name does not", func(t *testing.T) {
+		got := decodeHosting(t, 14507, FlatAuthority())
+		if got["hostFromContainerRuntime"] != "localhost:14507" {
+			t.Errorf("hostFromContainerRuntime = %q, want the live port", got["hostFromContainerRuntime"])
+		}
+		if got["host"] != "registry-k3sm:6450" {
+			t.Errorf("host = %q, want the fixed flat authority", got["host"])
 		}
 	})
 }
@@ -148,14 +145,13 @@ func TestPublishHosting(t *testing.T) {
 	})
 
 	t.Run("a changed cluster address is refreshed", func(t *testing.T) {
-		// The Service authority carries the node name and the port, both per-boot
-		// facts on a dev instance; a stale one names a Service that no longer
-		// exists.
+		// A Service that appears after a boot that had none (a relay address
+		// came up) must reach the document.
 		c := &fakeConfigMaps{}
 		if err := PublishHosting(t.Context(), c, 6450, ""); err != nil {
 			t.Fatalf("PublishHosting: %v", err)
 		}
-		const authority = "registry-mac-a.k3sm-registry.svc.cluster.local:6450"
+		authority := FlatAuthority()
 		if err := PublishHosting(t.Context(), c, 6450, authority); err != nil {
 			t.Fatalf("PublishHosting: %v", err)
 		}
