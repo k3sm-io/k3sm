@@ -163,6 +163,12 @@ release engineering. What ships:
   GGUF model and its serving settings (context size, parallel slots, GPU layers), and k3sm runs
   llama.cpp's own server, which speaks the common chat-completions API, for it as a native Pod on
   the Mac's GPU, behind a Service, the same way `MLXModel` runs an MLX model.
+- **Hardware resources named for the hardware.** The GPU becomes one engine-neutral resource that
+  every Metal workload requests, whether it runs MLX, llama.cpp, PyTorch or another framework, and
+  the media engines become countable resources for video work. Node labels report the chip, the
+  memory the GPU can use, and whether the Neural Engine and Apple's on-device model are available.
+  This is a breaking change: `mlx.k3sm.io/gpu` and the `mlx.k3sm.io/*` node labels are retired, and
+  the release notes say how to move a hand-written Pod to the new names.
 
 ## v0.4 (planned)
 
