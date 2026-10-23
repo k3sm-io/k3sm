@@ -109,9 +109,11 @@ Flags:
                       to remove
   --watch             keep printing until the update finishes (status)
 
-Every subcommand but check reaches the cluster with the credentials
+Every subcommand reaches the cluster with the credentials
 ` + "`k3sm status`" + ` uses: the server's admin kubeconfig as root or the service
-user, the k3sm context of ~/.kube/config otherwise.
+user, the k3sm context of ~/.kube/config otherwise. Only check also works
+with no reachable cluster: it then compares this Mac's k3sm alone with the
+latest release.
 
 Exit codes: 0 done, 1 it could not be done (the error says why), 2 usage, or
 apply without --yes on a stdin that is not a terminal.

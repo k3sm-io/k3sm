@@ -34,7 +34,7 @@ import (
 
 // netserveFetcher obtains a fresh netserve keypair for nodeName from the
 // supervisor, authenticated by the node credential in res. It is a seam so the
-// start decision is tested without a listener; production is fetchNetserveCert.
+// start decision is tested without a listener; production is fetchNetserveCertFrom(joinHost).
 type netserveFetcher func(ctx context.Context, res *bootstrap.JoinResult, nodeName string) (certPEM, keyPEM []byte, err error)
 
 // fetchNetserveCertFrom returns the production netserveFetcher for the

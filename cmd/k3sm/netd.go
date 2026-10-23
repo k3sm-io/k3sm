@@ -102,7 +102,7 @@ func netdFlags(opts *netdOptions) *flag.FlagSet {
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer reads with: Services (VIP and ingress binds), and this node's Pods and EndpointSlices (relay binds on published vm pod addresses) — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the node resolver entry routes svc and the cluster domain to")
 	fs.StringVar(&opts.clusterDomain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the node resolver entry registers as a match domain")
-	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT: ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
+	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. dormant today: privileged ingress and svclb binds go through netd as wildcard or --lb-privileged-ports grants, and the installed plist passes no --node-ip")
 	// No default list here: the installer always renders the node's own list
 	// (install.NetdPlist), so a job without the flag is one written before it
 	// existed, and it keeps refusing every such bind as it did.
@@ -747,7 +747,7 @@ func serviceGID() int {
 // so this refusal repeats — one line per attempt — until the volume is mounted.
 //
 // ALIGN: otherwise netd applies the install ownership table (install.OwnershipOf)
-// to what it finds — see alignStateTree. The data root is root's, root:wheel
+// to what it finds — see alignStateRoot, alignRootTrees and alignServiceTrees. The data root is root's, root:wheel
 // 0755, so a root an older build left owned by the service user is healed here,
 // at the next netd start, and never re-owned to the service user; the trees the
 // unprivileged daemons write under it are the service user's, and netd creates

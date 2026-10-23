@@ -115,7 +115,7 @@ func slot0Peers(indices func(context.Context) (map[string]int, error)) interconn
 	}
 }
 
-// startInterconnectResolver is step 4f': the server's Interconnect resolver. It
+// startInterconnectResolver is the server's Interconnect resolver. It
 // ensures the CRD, then reconciles while this server holds the resolver Lease,
 // on the server's in-process admin client like the MLX operator, recording into
 // plan.interconnectMetrics (which the in-process node serves). It is drained

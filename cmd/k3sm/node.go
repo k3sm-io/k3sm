@@ -1928,7 +1928,7 @@ func nodeCapacity(numCPU int, memBytes uint64, maxPods int64) corev1.ResourceLis
 // system-reserved headroom for the CO-LOCATED control plane. apiserver, scheduler,
 // KCM, kine/SQLite, runtimed, and the node-agent all run in the single io.k3sm.server
 // launchd job, with a combined real working set of roughly 1.2-2.3Gi — so 2Gi is a
-// conservative, lab-refinable floor (a lab run measures the true RSS). It DOMINATES
+// conservative floor, refinable by measurement (a test run measures the true RSS). It DOMINATES
 // the 10% term on small/8Gi hosts (10% of 8Gi = 800Mi < 2Gi); the 10% term scales the
 // apiserver watch-cache up on larger Macs. See memReserveBytes.
 const defaultMemReserveBytes int64 = 2 * 1024 * 1024 * 1024

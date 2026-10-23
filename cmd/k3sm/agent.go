@@ -95,8 +95,8 @@ type agentOptions struct {
 	// which the installer renders from this recorded argument.
 	lbPrivilegedPorts string
 	// updateReleaseBase is --update-release-base: the release index the
-	// managed update reads instead of GitHub's (a mirror, a lab rig). Empty is
-	// GitHub's; it is validated after the flags parse (releaseBaseFlag).
+	// managed update reads instead of GitHub's (a mirror, a test environment). Empty is
+	// GitHub's; it is validated after the flags parse (releaseBase).
 	updateReleaseBase string
 	// lan is the daemon's LAN switch (startDaemonLAN), set by agentStart; not
 	// a flag. The datapath and the node's svclb hoster attach to it.
@@ -1424,7 +1424,7 @@ func restConfigHost(cfg *rest.Config) string {
 //
 // The datapath's client presents its netserve certificate through a
 // netserve.RotatingCredential, and rot keeps that certificate in date in
-// process (startNetserveRotation): the datapath is never restarted for a
+// process (rot.start): the datapath is never restarted for a
 // renewal, its connections are.
 func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, netserveKubeconfig string, rot workerNetserveRotation, logger *slog.Logger) (*netserve.Server, error) {
 	restCfg, _, err := kubeclient.FromPath(netserveKubeconfig)
