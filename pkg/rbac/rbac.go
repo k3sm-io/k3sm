@@ -241,10 +241,13 @@ func ensureRegistryPushRBAC(ctx context.Context, cs kubernetes.Interface) error 
 // the k3sm:registry-pusher role cluster-wide.
 const RegistryBuilderBinding = "k3sm:registry-builder"
 
-// RegistryBuilderTokenRole names the ClusterRole that lets its holder mint a
-// token for the builder ServiceAccount, and nothing else. k3sm ships it with NO
-// binding: an admin binds it, with a RoleBinding in registrysvc.BuilderNamespace,
-// to a user who should push without administering the cluster.
+// RegistryBuilderTokenRole names the Role, in registrysvc.BuilderNamespace,
+// that lets its holder mint a token for the builder ServiceAccount, and
+// nothing else. It is a namespaced Role, not a ClusterRole, so no binding
+// anywhere can make it reach a ServiceAccount named builder in another
+// namespace. k3sm ships it with NO binding: an admin binds it, with a
+// RoleBinding in registrysvc.BuilderNamespace, to a user who should push
+// without administering the cluster.
 const RegistryBuilderTokenRole = "k3sm:registry-builder-token"
 
 // registryBuilderTokenRules is the token role's whole grant: create on the
@@ -264,7 +267,7 @@ func registryBuilderTokenRules() []rbacv1.PolicyRule {
 // ensureRegistryBuilderRBAC provisions the builder identity a user pushes as
 // from any Mac: the ServiceAccount, its cluster-wide ClusterRoleBinding to
 // k3sm:registry-pusher (the push gate asks a cluster-wide SubjectAccessReview
-// for it), and the UNBOUND k3sm:registry-builder-token ClusterRole. It runs on
+// for it), and the UNBOUND k3sm:registry-builder-token Role in its namespace. It runs on
 // every server start, so a new cluster has the identity from its first start.
 //
 // Who may push as builder is decided by who may create its token: an admin
@@ -282,7 +285,35 @@ func ensureRegistryBuilderRBAC(ctx context.Context, cs kubernetes.Interface) err
 	if err := ensureClusterRoleBindingTo(ctx, cs, "registry builder", RegistryBuilderBinding, RegistryPusherRole, builder); err != nil {
 		return err
 	}
-	return ensureClusterRole(ctx, cs, "registry builder token", RegistryBuilderTokenRole, registryBuilderTokenRules())
+	return ensureRole(ctx, cs, "registry builder token", ns, RegistryBuilderTokenRole, registryBuilderTokenRules())
+}
+
+// ensureRole creates the named managed Role in ns with exactly rules, or
+// repairs it when its rules or its managed label drifted. what names the role
+// in errors.
+func ensureRole(ctx context.Context, cs kubernetes.Interface, what, ns, name string, rules []rbacv1.PolicyRule) error {
+	api := cs.RbacV1().Roles(ns)
+	want := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, Labels: managedLabels()},
+		Rules:      rules,
+	}
+	have, err := api.Get(ctx, name, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		if _, err := api.Create(ctx, want, metav1.CreateOptions{}); err != nil {
+			return fmt.Errorf("create the %s role in %s: %w", what, ns, err)
+		}
+	case err != nil:
+		return fmt.Errorf("get the %s role in %s: %w", what, ns, err)
+	case !equality.Semantic.DeepEqual(have.Rules, want.Rules) || !hasManagedLabel(have.Labels):
+		upd := have.DeepCopy()
+		upd.Rules = want.Rules
+		upd.Labels = withManagedLabel(upd.Labels)
+		if _, err := api.Update(ctx, upd, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("repair the %s role in %s: %w", what, ns, err)
+		}
+	}
+	return nil
 }
 
 // ensureClusterRole creates the named managed ClusterRole with exactly rules, or

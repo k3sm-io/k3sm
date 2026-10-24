@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -206,7 +207,10 @@ func TestRegistryBuilderTokenRoleShipsUnbound(t *testing.T) {
 	if err := Provision(ctx, cs); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	role, err := cs.RbacV1().ClusterRoles().Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
+	if _, err := cs.RbacV1().ClusterRoles().Get(ctx, wantBuilderTokenRole, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("%s exists as a ClusterRole (%v); it must be a Role in %s only", wantBuilderTokenRole, err, wantBuilderNamespace)
+	}
+	role, err := cs.RbacV1().Roles(wantBuilderNamespace).Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get %s: %v", wantBuilderTokenRole, err)
 	}
@@ -219,8 +223,8 @@ func TestRegistryBuilderTokenRoleShipsUnbound(t *testing.T) {
 	if len(role.Rules) != 1 || !equalRule(role.Rules[0], want[0]) {
 		t.Errorf("%s rules = %+v, want exactly %+v", wantBuilderTokenRole, role.Rules, want)
 	}
-	if role.Labels["k3sm.io/managed"] != "true" || role.AggregationRule != nil {
-		t.Errorf("%s labels %v aggregation %v, want managed and no aggregation", wantBuilderTokenRole, role.Labels, role.AggregationRule)
+	if role.Labels["k3sm.io/managed"] != "true" {
+		t.Errorf("%s labels %v, want managed", wantBuilderTokenRole, role.Labels)
 	}
 	for _, o := range createdObjects(t, cs.Actions()) {
 		if o.RoleRef != nil && o.RoleRef.Name == wantBuilderTokenRole {
@@ -229,16 +233,16 @@ func TestRegistryBuilderTokenRoleShipsUnbound(t *testing.T) {
 	}
 
 	t.Run("a widened copy is repaired on the next start", func(t *testing.T) {
-		r, _ := cs.RbacV1().ClusterRoles().Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
+		r, _ := cs.RbacV1().Roles(wantBuilderNamespace).Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
 		r.Rules[0].ResourceNames = nil
 		r.Rules[0].Verbs = []string{"create", "get"}
-		if _, err := cs.RbacV1().ClusterRoles().Update(ctx, r, metav1.UpdateOptions{}); err != nil {
+		if _, err := cs.RbacV1().Roles(wantBuilderNamespace).Update(ctx, r, metav1.UpdateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 		if err := Provision(ctx, cs); err != nil {
 			t.Fatalf("Provision: %v", err)
 		}
-		r, _ = cs.RbacV1().ClusterRoles().Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
+		r, _ = cs.RbacV1().Roles(wantBuilderNamespace).Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
 		if len(r.Rules) != 1 || !equalRule(r.Rules[0], want[0]) {
 			t.Errorf("after repair %s rules = %+v, want %+v", wantBuilderTokenRole, r.Rules, want)
 		}

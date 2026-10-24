@@ -99,29 +99,6 @@
   },
   {
     "kind": "ClusterRole",
-    "name": "k3sm:registry-builder-token",
-    "labels": {
-      "k3sm.io/managed": "true"
-    },
-    "rules": [
-      {
-        "verbs": [
-          "create"
-        ],
-        "apiGroups": [
-          ""
-        ],
-        "resources": [
-          "serviceaccounts/token"
-        ],
-        "resourceNames": [
-          "builder"
-        ]
-      }
-    ]
-  },
-  {
-    "kind": "ClusterRole",
     "name": "k3sm:registry-gate",
     "labels": {
       "k3sm.io/managed": "true"
@@ -309,6 +286,30 @@
         ],
         "resources": [
           "configmaps"
+        ]
+      }
+    ]
+  },
+  {
+    "kind": "Role",
+    "namespace": "k3sm-registry",
+    "name": "k3sm:registry-builder-token",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "rules": [
+      {
+        "verbs": [
+          "create"
+        ],
+        "apiGroups": [
+          ""
+        ],
+        "resources": [
+          "serviceaccounts/token"
+        ],
+        "resourceNames": [
+          "builder"
         ]
       }
     ]

@@ -161,7 +161,7 @@ func TestRBACProvisionIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list cluster roles: %v", err)
 	}
-	if got, want := names(roles.Items), []string{NetserveRole, nodeDatapathRole, RegistryGateRole, RegistryPusherRole, RegistryBuilderTokenRole}; !sameSet(got, want) {
+	if got, want := names(roles.Items), []string{NetserveRole, nodeDatapathRole, RegistryGateRole, RegistryPusherRole}; !sameSet(got, want) {
 		t.Errorf("cluster roles = %d %v, want exactly %v", len(roles.Items), got, want)
 	}
 	bindings, err := cs.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{})
