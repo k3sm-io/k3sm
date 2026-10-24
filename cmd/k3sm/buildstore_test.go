@@ -27,6 +27,8 @@ import (
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
 // noStore is the storeRecorder for tests that are not about the store: it
@@ -177,6 +179,42 @@ func TestBuildTagRequiredWithoutOutput(t *testing.T) {
 		}
 		if o.output != "img.tar" {
 			t.Errorf("output = %q", o.output)
+		}
+	})
+}
+
+// TestWarmNodeCacheAsksForCacheOnly pins the one difference between the two
+// pulls that reach the daemon's puller: the warm-up after a build, load or push
+// into the cluster registry asks for a cache-only pull, so the daemon records no
+// operator root and prune can reclaim the node copy once no pod uses it, while
+// `k3sm image pull` stays an operator pull that prune keeps.
+func TestWarmNodeCacheAsksForCacheOnly(t *testing.T) {
+	t.Run("the warm-up is cache-only", func(t *testing.T) {
+		fake := &fakeImagesDaemon{pullResp: &runtimev1.PullImageResponse{Image: &runtimev1.Image{}}}
+		sock := serveFakeImages(t, fake)
+		ref := name.MustParseReference("registry-k3sm:6450/default/app:v1").(name.Tag)
+		if err := warmNodeCache(dialRuntimed, sock)(t.Context(), ref); err != nil {
+			t.Fatalf("warm: %v", err)
+		}
+		if fake.pullCalls != 1 {
+			t.Fatalf("warm pulls = %d, want 1", fake.pullCalls)
+		}
+		if !fake.gotPull.GetCacheOnly() {
+			t.Errorf("the warm-up pull has CacheOnly false; the daemon would record an operator root prune never reclaims")
+		}
+	})
+
+	t.Run("image pull is an operator pull", func(t *testing.T) {
+		fake := &fakeImagesDaemon{pullResp: &runtimev1.PullImageResponse{Image: &runtimev1.Image{}}}
+		sock := serveFakeImages(t, fake)
+		if _, err := runImageCmd(t, []string{"--socket", sock, "pull", "example.test/app:v1"}); err != nil {
+			t.Fatalf("image pull: %v", err)
+		}
+		if fake.gotPull == nil {
+			t.Fatalf("the daemon was never called")
+		}
+		if fake.gotPull.GetCacheOnly() {
+			t.Errorf("image pull sent CacheOnly true; an operator pull must record its root")
 		}
 	})
 }

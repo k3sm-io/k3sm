@@ -260,7 +260,9 @@ func recordInto(ctx context.Context, ref name.Tag, b built, workDir string, push
 
 // warmNodeCache is the production cacheWarmer: it asks this node's runtime to
 // pull ref through its own puller, the path a Pod-driven pull takes, with the
-// Always policy so a tag this command just overwrote is fetched again.
+// Always policy so a tag this command just overwrote is fetched again. The
+// pull is cache-only: the image already lives in the cluster registry, so the
+// node copy is a cache entry prune may reclaim, not an operator-pinned root.
 func warmNodeCache(dial imagesDialer, socket string) cacheWarmer {
 	return func(ctx context.Context, ref name.Tag) error {
 		cc, closer, err := dial(ctx, socket)
@@ -270,7 +272,7 @@ func warmNodeCache(dial imagesDialer, socket string) cacheWarmer {
 		if closer != nil {
 			defer closer.Close()
 		}
-		o := imageOptions{subcommand: "pull", socket: socket, source: ref.String(), policy: runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS}
+		o := imageOptions{subcommand: "pull", socket: socket, source: ref.String(), policy: runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS, cacheOnly: true}
 		return imagePull(ctx, runtimev1.NewImagesClient(cc), o, io.Discard)
 	}
 }
