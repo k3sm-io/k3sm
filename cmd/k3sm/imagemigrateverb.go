@@ -40,6 +40,7 @@ import (
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/k3sm/pkg/status"
 )
 
 // upstreamProbeTimeout bounds one "does the registry this reference names
@@ -114,23 +115,54 @@ func (s runtimedMigrationSource) Export(ctx context.Context, img storeEntry) (gg
 	return out, cleanup, nil
 }
 
-// registryDigestAt is the production registryDigester: a manifest HEAD
-// against this node's registry with its push credential.
-func registryDigestAt(workDir string) registryDigester {
-	return func(ctx context.Context, ref name.Tag) (string, bool, error) {
-		auth, err := registryAuth(ref, workDir)
-		if err != nil {
-			return "", false, err
+// registryDigestAt is the production registryDigester: a manifest HEAD sent
+// the way the run's uploads are, so it asks the same registry with the same
+// credential.
+func registryDigestAt(ctx context.Context, ref name.Tag, dest pushDest) (string, bool, error) {
+	opts, err := dest.options(ctx, ref)
+	if err != nil {
+		return "", false, err
+	}
+	desc, err := remote.Head(ref, opts...)
+	if err != nil {
+		var terr *transport.Error
+		if errors.As(err, &terr) && terr.StatusCode == http.StatusNotFound {
+			return "", false, nil
 		}
-		desc, err := remote.Head(ref, remote.WithContext(ctx), remote.WithAuth(auth))
+		return "", false, err
+	}
+	return desc.Digest.String(), true, nil
+}
+
+// userMigrationRoute is the route of `k3sm image migrate`: the path `k3sm
+// build --push` takes, through the push gate with a builder token minted from
+// the invoking user's kubeconfig. On a server that is its loopback gate, on a
+// worker the server's cluster address. A node never pushes as itself; a user
+// does.
+func userMigrationRoute(workDir string) migrationRoute {
+	return func(ctx context.Context) (migrationWriter, error) {
+		cr, err := resolveClusterRegistry(ctx, workDir)
 		if err != nil {
-			var terr *transport.Error
-			if errors.As(err, &terr) && terr.StatusCode == http.StatusNotFound {
-				return "", false, nil
-			}
-			return "", false, err
+			return migrationWriter{}, err
 		}
-		return desc.Digest.String(), true, nil
+		return migrationWriter{authority: cr.authority, dest: pushDest{workDir: workDir, cluster: &cr}}, nil
+	}
+}
+
+// serverMigrationRoute is the route of the run the server's daemon starts
+// after an upgrade. The daemon is not a user and holds no kubeconfig of one,
+// so it writes the way the server writes to its own registry: straight to the
+// registry's loopback listener with the per-boot push credential the server
+// minted under its work dir (registrysvc.CredentialPath, 0600, readable by
+// the daemon's own account only), which registryAuth presents only to that
+// exact loopback address.
+func serverMigrationRoute(workDir string) migrationRoute {
+	return func(context.Context) (migrationWriter, error) {
+		cred, err := registrysvc.ReadCredential(workDir)
+		if err != nil {
+			return migrationWriter{}, fmt.Errorf("read this server's registry push credential: %w", err)
+		}
+		return migrationWriter{authority: cred.Address, dest: pushDest{workDir: workDir}}, nil
 	}
 }
 
@@ -162,13 +194,14 @@ func namesClusterRegistry(reference, workDir string) bool {
 	return err == nil && isClusterRegistryHost(probe.RegistryStr(), workDir)
 }
 
-// newImageMigrator wires the production migrator for a work dir and a
-// runtimed client.
-func newImageMigrator(workDir string, client runtimev1.ImagesClient, socket string) imageMigrator {
+// newImageMigrator wires the production migrator for a work dir, a runtimed
+// client and the route its uploads take.
+func newImageMigrator(workDir string, client runtimev1.ImagesClient, socket string, route migrationRoute) imageMigrator {
 	return imageMigrator{
 		workDir:  workDir,
 		source:   runtimedMigrationSource{client: client, socket: socket},
-		digestAt: registryDigestAt(workDir),
+		route:    route,
+		digestAt: registryDigestAt,
 		push:     pushBuilt,
 		upstream: upstreamServesDigest,
 		isLocal:  func(ref string) bool { return namesClusterRegistry(ref, workDir) },
@@ -193,8 +226,15 @@ once. The node store is never changed, so a rollback finds every image where
 it was. A re-run skips what the registry already holds. A tag the registry
 holds at another digest keeps the registry's image, and this node's copy is
 pushed as <tag>-k3sm-migrated-<12hex>. An image the store cannot export stays
-in the node store and runnable until it is loaded again. The server runs this
-on its first start after an upgrade; run it by hand on an agent or to retry.
+in the node store and runnable until it is loaded again.
+
+The server runs this by itself on its first start after an upgrade. A worker
+never pushes on its own: run it there by hand, with sudo, because the node
+store is read through the runtime's socket, which only root and the k3sm
+service user may open (as for image prune). The copy goes through the push
+gate with a builder token minted from your kubeconfig, the way
+k3sm build --push does: on a server to its loopback gate, on a worker to the
+server's cluster address. Progress is journalled on this node.
 
   --report  print the last run's report without running
 
@@ -210,7 +250,7 @@ func parseImageMigrateArgs(args []string, errOut io.Writer) (imageMigrateOptions
 		fs.PrintDefaults()
 	}
 	fs.StringVar(&o.socket, "socket", runtimed.DefaultSocketPath, "runtimed control socket to dial")
-	fs.StringVar(&o.workDir, "work-dir", workDirFromEnv(), "control-plane state root: the registry push credential and the migration journal")
+	fs.StringVar(&o.workDir, "work-dir", workDirFromEnv(), "state root of this node's migration journal (and, on a server, of its registry record)")
 	fs.BoolVar(&o.report, "report", false, "print the last run's report without running")
 	fs.StringVar(&o.output, "o", "", "json, for the journal itself instead of the report")
 	fs.DurationVar(&o.timeout, "timeout", 6*time.Hour, "overall deadline")
@@ -249,6 +289,9 @@ func imageMigrateCommand(ctx context.Context, o imageMigrateOptions, out io.Writ
 	if o.report {
 		j, err = readMigrationJournal(o.workDir)
 	} else {
+		if err := migrateRuntimeAccess(o.socket); err != nil {
+			return err
+		}
 		var unlock func()
 		if unlock, err = lockImageMigration(o.workDir); err != nil {
 			return err
@@ -261,7 +304,7 @@ func imageMigrateCommand(ctx context.Context, o imageMigrateOptions, out io.Writ
 		if closer != nil {
 			defer closer.Close()
 		}
-		j, err = newImageMigrator(o.workDir, runtimev1.NewImagesClient(cc), o.socket).run(ctx)
+		j, err = newImageMigrator(o.workDir, runtimev1.NewImagesClient(cc), o.socket, userMigrationRoute(o.workDir)).run(ctx)
 	}
 	if o.output == "json" {
 		enc := json.NewEncoder(out)
@@ -273,6 +316,25 @@ func imageMigrateCommand(ctx context.Context, o imageMigrateOptions, out io.Writ
 		renderMigrationReport(out, j)
 	}
 	return err
+}
+
+// migrateGeteuid and migrateServiceUID are the identity the runtime-socket
+// rule is decided for, seams so the refusal is testable.
+var (
+	migrateGeteuid    = os.Geteuid
+	migrateServiceUID = lookupServiceUID
+)
+
+// migrateRuntimeAccess refuses, before anything is dialled, a run that cannot
+// open the installed runtime's socket: it is mode 0600 inside a 0700
+// directory of the service user, so only root and that user may read the node
+// store through it (status.RuntimedReachable, the one home of that rule). A
+// --socket naming any other path is the caller's own, and is dialled.
+func migrateRuntimeAccess(socket string) error {
+	if socket != runtimed.DefaultSocketPath || status.RuntimedReachable(migrateGeteuid(), migrateServiceUID()) {
+		return nil
+	}
+	return fmt.Errorf("k3sm image migrate reads this node's image store through the runtime's socket %s, which only root and the k3sm service user may open (the same rule as k3sm image prune); run it with sudo: sudo k3sm image migrate", socket)
 }
 
 // migrationLock serialises migrations within this process: the on-upgrade
@@ -326,7 +388,7 @@ func startImageMigration(ctx context.Context, opts serverOptions, logger *slog.L
 	go func() {
 		defer close(done)
 		for {
-			finished, err := migrateOnce(ctx, workDir, logger)
+			finished, err := migrateOnce(ctx, workDir, dialRuntimed, runtimed.DefaultSocketPath, logger)
 			if finished {
 				return
 			}
@@ -341,9 +403,11 @@ func startImageMigration(ctx context.Context, opts serverOptions, logger *slog.L
 	return func() { cancel(); <-done }
 }
 
-// migrateOnce is one attempt of the on-upgrade run. finished is true when
-// there is nothing more for the trigger to do.
-func migrateOnce(ctx context.Context, workDir string, logger *slog.Logger) (finished bool, err error) {
+// migrateOnce is one attempt of the on-upgrade run, reading the node store
+// through dial and socket. finished is true when there is nothing more for
+// the trigger to do. It writes through serverMigrationRoute: the daemon is not
+// a user, so it holds no builder token.
+func migrateOnce(ctx context.Context, workDir string, dial imagesDialer, socket string, logger *slog.Logger) (finished bool, err error) {
 	j, err := readMigrationJournal(workDir)
 	if err != nil {
 		logger.Error("image migration: the journal is unreadable; run k3sm image migrate by hand", "err", err)
@@ -360,7 +424,7 @@ func migrateOnce(ctx context.Context, workDir string, logger *slog.Logger) (fini
 		return false, err
 	}
 	defer unlock()
-	cc, closer, err := dialRuntimed(ctx, runtimed.DefaultSocketPath)
+	cc, closer, err := dial(ctx, socket)
 	if err != nil {
 		if rerr := recordMigrationFailure(workDir, fmt.Errorf("this node's runtime is not reachable: %w", err)); rerr != nil {
 			logger.Warn("image migration: could not record the pending reason", "err", rerr)
@@ -370,7 +434,7 @@ func migrateOnce(ctx context.Context, workDir string, logger *slog.Logger) (fini
 	if closer != nil {
 		defer closer.Close()
 	}
-	j, err = newImageMigrator(workDir, runtimev1.NewImagesClient(cc), runtimed.DefaultSocketPath).run(ctx)
+	j, err = newImageMigrator(workDir, runtimev1.NewImagesClient(cc), socket, serverMigrationRoute(workDir)).run(ctx)
 	if err != nil {
 		return false, err
 	}

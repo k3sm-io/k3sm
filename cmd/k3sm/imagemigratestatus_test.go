@@ -45,7 +45,7 @@ func TestStoreMigrationUnreachableRegistryLeavesJournalPending(t *testing.T) {
 		{
 			name: "the registry does not answer",
 			breakIt: func(m *imageMigrator, _ *migrationRig) {
-				m.digestAt = func(context.Context, name.Tag) (string, bool, error) {
+				m.digestAt = func(context.Context, name.Tag, pushDest) (string, bool, error) {
 					return "", false, errors.New("dial tcp: connection refused")
 				}
 			},

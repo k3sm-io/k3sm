@@ -19,20 +19,28 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
+	"log/slog"
+	"net/http"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
 // fakeNodeStore is a node store the migration reads. It has no write verb at
@@ -99,18 +107,19 @@ type countingPusher struct {
 	fail  func(ref name.Reference) bool
 }
 
-func (p *countingPusher) push(ctx context.Context, ref name.Reference, b built, workDir string) error {
+func (p *countingPusher) push(ctx context.Context, ref name.Reference, b built, dest pushDest) error {
 	p.mu.Lock()
 	p.calls = append(p.calls, ref.String())
 	p.mu.Unlock()
 	if p.fail != nil && p.fail(ref) {
 		return errors.New("the registry went away")
 	}
-	return pushBuilt(ctx, ref, b, workDir)
+	return pushBuilt(ctx, ref, b, dest)
 }
 
-// migrationRig is a real in-memory registry on loopback, this node's push
-// credential for it, and a node store.
+// migrationRig is a real in-memory registry on loopback, this server's push
+// credential for it, and a node store. Its migrator writes the way the
+// server's daemon does (serverMigrationRoute).
 type migrationRig struct {
 	host    string
 	workDir string
@@ -135,7 +144,8 @@ func (r *migrationRig) migrator() imageMigrator {
 	return imageMigrator{
 		workDir:  r.workDir,
 		source:   r.store,
-		digestAt: registryDigestAt(r.workDir),
+		route:    serverMigrationRoute(r.workDir),
+		digestAt: registryDigestAt,
 		push:     r.pusher.push,
 		upstream: func(_ context.Context, ref, digest string) bool { return r.upstream[ref] == digest },
 		isLocal:  func(ref string) bool { return namesClusterRegistry(ref, r.workDir) },
@@ -146,11 +156,7 @@ func (r *migrationRig) migrator() imageMigrator {
 // loopbackRef spells a registry-k3sm:6450 reference as this Mac reaches it.
 func (r *migrationRig) loopbackRef(t *testing.T, flat string) string {
 	t.Helper()
-	tag, err := name.NewTag(flat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	target, err := registryPushTarget(tag, r.workDir)
+	target, err := migrationWriter{authority: r.host}.target(flat)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +203,7 @@ func TestStoreMigrationImportsEveryUserImageAndLosesNone(t *testing.T) {
 	// A build since the upgrade already wrote conflict:v1 into the registry.
 	newer := randomImage(t)
 	newerDigest, _ := newer.Digest()
-	if err := pushBuilt(t.Context(), mustTag(t, rig.loopbackRef(t, "registry-k3sm:6450/conflict:v1")), built{image: newer}, rig.workDir); err != nil {
+	if err := pushBuilt(t.Context(), mustTag(t, rig.loopbackRef(t, "registry-k3sm:6450/conflict:v1")), built{image: newer}, pushDest{workDir: rig.workDir}); err != nil {
 		t.Fatalf("seed the registry: %v", err)
 	}
 
@@ -349,7 +355,7 @@ func TestStoreMigrationResumes(t *testing.T) {
 		rig := newMigrationRig(t)
 		img := randomImage(t)
 		rig.store.add(t, "example.test/app-a:v1", "darwin/arm64", img)
-		if err := pushBuilt(t.Context(), mustTag(t, rig.loopbackRef(t, "registry-k3sm:6450/app-a:v1")), built{image: img}, rig.workDir); err != nil {
+		if err := pushBuilt(t.Context(), mustTag(t, rig.loopbackRef(t, "registry-k3sm:6450/app-a:v1")), built{image: img}, pushDest{workDir: rig.workDir}); err != nil {
 			t.Fatal(err)
 		}
 		j, err := rig.migrator().run(t.Context())
@@ -426,17 +432,14 @@ func TestMigrationTarget(t *testing.T) {
 	}
 }
 
-// TestImageMigrateVerbCallsOnlyReadVerbs drives `k3sm image migrate` against
-// a fake runtimed over a real socket and a real registry, and pins that the
-// node store is only listed and exported: no load, tag, untag, pull or prune
-// reaches the daemon.
-func TestImageMigrateVerbCallsOnlyReadVerbs(t *testing.T) {
-	rig := newMigrationRig(t)
-	ref := rig.host + "/app:v1"
+// migrateDaemon is a fake runtimed whose store holds one image under ref, and
+// the socket it serves on.
+func migrateDaemon(t *testing.T, ref string) (fake *fakeImagesDaemon, sock, digest string) {
+	t.Helper()
 	layout := fixtureLayout(t, ref, "migrate-payload")
-	digest := layoutDigest(t, layout)
+	digest = layoutDigest(t, layout)
 	archive := tarLayout(t, layout)
-	fake := &fakeImagesDaemon{
+	fake = &fakeImagesDaemon{
 		listResp: &runtimev1.ListImagesResponse{Images: []*runtimev1.Image{{
 			ManifestDescriptor: &runtimev1.Descriptor{Digest: digest},
 			Manifest:           &runtimev1.ImageManifest{Reference: ref, Platform: &runtimev1.Platform{Os: "darwin", Architecture: "arm64"}},
@@ -444,16 +447,13 @@ func TestImageMigrateVerbCallsOnlyReadVerbs(t *testing.T) {
 		saveChunks:   [][]byte{archive},
 		saveTerminal: &runtimev1.SaveImageResponse{Digest: digest, SentBytes: int64(len(archive))},
 	}
-	sock := serveFakeImages(t, fake)
+	return fake, serveFakeImages(t, fake), digest
+}
 
-	o, err := parseImageMigrateArgs([]string{"--socket", sock, "--work-dir", rig.workDir}, &bytes.Buffer{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out bytes.Buffer
-	if err := imageMigrateCommand(t.Context(), o, &out, dialRuntimed); err != nil {
-		t.Fatalf("migrate: %v\n%s", err, out.String())
-	}
+// assertStoreOnlyRead fails when anything but list and export reached the
+// node store.
+func assertStoreOnlyRead(t *testing.T, fake *fakeImagesDaemon, digest string) {
+	t.Helper()
 	if fake.gotSave.GetDigest() != digest {
 		t.Errorf("exported %q, want by digest %s", fake.gotSave.GetDigest(), digest)
 	}
@@ -461,21 +461,206 @@ func TestImageMigrateVerbCallsOnlyReadVerbs(t *testing.T) {
 		t.Errorf("the migration wrote the node store: load=%d tag=%v untag=%v pull=%d prune=%v",
 			fake.loadCalls, fake.gotTag, fake.gotUntag, fake.pullCalls, fake.gotPrune)
 	}
-	if got := rig.registryDigest(t, "registry-k3sm:6450/app:v1"); got != digest {
-		t.Errorf("registry holds %q, want %s", got, digest)
-	}
-	if !strings.Contains(out.String(), "migrated     "+ref+" -> registry-k3sm:6450/app:v1") {
-		t.Errorf("report:\n%s", out.String())
-	}
+}
 
-	// --report prints the journal without dialling anything.
-	o.report, o.socket = true, "/nonexistent.sock"
-	out.Reset()
-	if err := imageMigrateCommand(t.Context(), o, &out, dialRuntimed); err != nil {
-		t.Fatalf("--report: %v", err)
+// gateDigest is the digest the push gate g holds at the cluster-registry
+// repository and tag repoTag, or "".
+func gateDigest(t *testing.T, g gateRegistry, repoTag string) string {
+	t.Helper()
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(g.caPEM)
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{RootCAs: pool, ServerName: "registry-k3sm"}
+	ref, err := name.NewTag("127.0.0.1:" + strconv.Itoa(g.port) + "/" + repoTag)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "image migration complete: 1 migrated") {
-		t.Errorf("--report:\n%s", out.String())
+	desc, err := remote.Head(ref, remote.WithTransport(tr))
+	if err != nil {
+		return ""
+	}
+	return desc.Digest.String()
+}
+
+// TestUserImageMigratePushesWithBuilderTokenAndJournals drives `k3sm image
+// migrate` as a user runs it, against a fake runtimed over a real socket: on
+// a worker it pushes to the server's cluster address and on a server to its
+// loopback gate, in both cases with a builder token minted from the user's
+// kubeconfig and no other credential, and it journals on the node it ran on.
+// The node store is only listed and exported: no load, tag, untag, pull or
+// prune reaches the daemon.
+func TestUserImageMigratePushesWithBuilderTokenAndJournals(t *testing.T) {
+	// The node store's reference names a registry on a closed loopback port,
+	// so the "is this a pull cache entry" question is answered no, offline.
+	const ref = "localhost:1/app:v1"
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("builder:"+fakeBuilderTokenToken))
+	cases := []struct {
+		name string
+		// setup returns the node's work dir and the builder-token count.
+		setup func(t *testing.T, g gateRegistry) (string, *int)
+	}{
+		{"on a worker, to the server's cluster address", func(t *testing.T, g gateRegistry) (string, *int) {
+			minted := clusterAPIFor(t, g, flatSlice("127.0.0.1", int32(g.port)))
+			dir := t.TempDir()
+			t.Setenv("K3SM_WORK_DIR", dir)
+			return dir, minted
+		}},
+		{"on the server, to its loopback gate", func(t *testing.T, g gateRegistry) (string, *int) {
+			minted := clusterAPIFor(t, g)
+			return asServer(t, g.port), minted
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			empty := t.TempDir()
+			t.Setenv("HOME", empty)
+			t.Setenv("DOCKER_CONFIG", empty)
+			t.Setenv(registryTokenEnv, "")
+			g := startGateRegistry(t)
+			workDir, minted := tc.setup(t, g)
+			fake, sock, digest := migrateDaemon(t, ref)
+
+			o, err := parseImageMigrateArgs([]string{"--socket", sock, "--work-dir", workDir}, &bytes.Buffer{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			if err := imageMigrateCommand(t.Context(), o, &out, dialRuntimed); err != nil {
+				t.Fatalf("migrate: %v\n%s", err, out.String())
+			}
+			assertStoreOnlyRead(t, fake, digest)
+			if *minted != 1 {
+				t.Errorf("builder tokens minted = %d, want 1", *minted)
+			}
+			if !containsHeader(g.probe.headers(), want) {
+				t.Errorf("the builder token was never presented; headers = %q", g.probe.headers())
+			}
+			for _, h := range g.probe.headers() {
+				if h != "" && h != want {
+					t.Errorf("a credential other than the builder token was presented: %q", h)
+				}
+			}
+			if got := gateDigest(t, g, "app:v1"); got != digest {
+				t.Errorf("registry holds %q, want %s", got, digest)
+			}
+			if !strings.Contains(out.String(), "migrated     "+ref+" -> registry-k3sm:6450/app:v1") {
+				t.Errorf("report:\n%s", out.String())
+			}
+			j, err := readMigrationJournal(workDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !j.Complete || len(j.Images) != 1 || j.Images[0].Outcome != migrationMigrated {
+				t.Errorf("journal on this node = %+v, want one migrated image, complete", j)
+			}
+
+			// --report prints the journal without dialling anything.
+			o.report, o.socket = true, "/nonexistent.sock"
+			out.Reset()
+			if err := imageMigrateCommand(t.Context(), o, &out, dialRuntimed); err != nil {
+				t.Fatalf("--report: %v", err)
+			}
+			if !strings.Contains(out.String(), "image migration complete: 1 migrated") {
+				t.Errorf("--report:\n%s", out.String())
+			}
+		})
+	}
+}
+
+// TestServerStartupMigrationUsesItsOwnCredential: the run the server's daemon
+// starts after an upgrade writes to the registry's loopback listener with the
+// per-boot push credential under its work dir, mints no builder token (the
+// daemon is not a user), and journals there.
+func TestServerStartupMigrationUsesItsOwnCredential(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("HOME", empty)
+	t.Setenv("DOCKER_CONFIG", empty)
+	t.Setenv(registryTokenEnv, "")
+	prev := clusterRegistryClient
+	clusterRegistryClient = func() (clusterRegistryAPI, error) {
+		t.Error("the server's start-up migration resolved a user kubeconfig")
+		return clusterRegistryAPI{}, errors.New("unexpected")
+	}
+	t.Cleanup(func() { clusterRegistryClient = prev })
+
+	perBoot := "Basic " + base64.StdEncoding.EncodeToString([]byte("k3sm:per-boot-secret"))
+	host, probe := startRegistry(t, perBoot)
+	workDir, _ := stageLocalCredential(t, host)
+	const ref = "localhost:1/app:v1"
+	fake, sock, digest := migrateDaemon(t, ref)
+
+	cases := []struct {
+		name string
+		// wantExport is whether this run exports the image.
+		wantExport bool
+	}{
+		{"the first start copies the image", true},
+		{"a later start finds the journal complete and does nothing", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake.gotSave = nil
+			finished, err := migrateOnce(t.Context(), workDir, dialRuntimed, sock, slog.New(slog.DiscardHandler))
+			if err != nil || !finished {
+				t.Fatalf("migrateOnce = %v, %v; want finished", finished, err)
+			}
+			if got := fake.gotSave != nil; got != tc.wantExport {
+				t.Errorf("exported = %v, want %v", got, tc.wantExport)
+			}
+			if tc.wantExport {
+				assertStoreOnlyRead(t, fake, digest)
+			}
+		})
+	}
+	for _, h := range probe.headers() {
+		if h != "" && h != perBoot {
+			t.Errorf("a credential other than the server's own was presented: %q", h)
+		}
+	}
+	if !containsHeader(probe.headers(), perBoot) {
+		t.Errorf("the server's push credential was never presented; headers = %q", probe.headers())
+	}
+	back, _ := name.NewTag(host + "/app:v1")
+	desc, err := remote.Head(back, remote.WithAuth(authn.FromConfig(authn.AuthConfig{Username: "k3sm", Password: "per-boot-secret"})))
+	if err != nil {
+		t.Errorf("read back %s: %v", back, err)
+	} else if desc.Digest.String() != digest {
+		t.Errorf("registry holds %s, want %s", desc.Digest, digest)
+	}
+	if j, err := readMigrationJournal(workDir); err != nil || !j.Complete {
+		t.Errorf("journal = %+v, %v; want complete", j, err)
+	}
+}
+
+// TestImageMigrateNeedsTheRuntimeSocket: a run that cannot open the installed
+// runtime's socket is refused before anything is dialled, naming sudo; root
+// and the service user run, and so does a --socket naming another path.
+func TestImageMigrateNeedsTheRuntimeSocket(t *testing.T) {
+	cases := []struct {
+		name       string
+		euid       int
+		socket     string
+		wantRefuse bool
+	}{
+		{"an ordinary account on the installed socket", 501, runtimed.DefaultSocketPath, true},
+		{"root on the installed socket", 0, runtimed.DefaultSocketPath, false},
+		{"the service user on the installed socket", 270, runtimed.DefaultSocketPath, false},
+		{"an ordinary account on its own socket", 501, "/tmp/k3sm-dev.sock", false},
+	}
+	prevEUID, prevSvc := migrateGeteuid, migrateServiceUID
+	t.Cleanup(func() { migrateGeteuid, migrateServiceUID = prevEUID, prevSvc })
+	migrateServiceUID = func() int { return 270 }
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			migrateGeteuid = func() int { return tc.euid }
+			err := migrateRuntimeAccess(tc.socket)
+			if tc.wantRefuse != (err != nil) {
+				t.Fatalf("migrateRuntimeAccess = %v, want refused %v", err, tc.wantRefuse)
+			}
+			if err != nil && (!strings.Contains(err.Error(), "sudo k3sm image migrate") || !strings.Contains(err.Error(), tc.socket)) {
+				t.Errorf("refusal %q does not name the socket and sudo", err)
+			}
+		})
 	}
 }
 

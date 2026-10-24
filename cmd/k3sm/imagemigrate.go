@@ -118,9 +118,38 @@ type migrationSource interface {
 	Export(ctx context.Context, img storeEntry) (ggcrv1.Image, func(), error)
 }
 
-// registryDigester answers which digest the registry holds at a reference.
-// found is false, with a nil error, when the registry has no such tag.
-type registryDigester func(ctx context.Context, ref name.Tag) (digest string, found bool, err error)
+// registryDigester answers which digest the registry holds at a reference,
+// asked the way dest writes to it. found is false, with a nil error, when the
+// registry has no such tag.
+type registryDigester func(ctx context.Context, ref name.Tag, dest pushDest) (digest string, found bool, err error)
+
+// migrationWriter is where one migration run writes into the cluster
+// registry from this Mac: the authority it dials and how it authenticates.
+type migrationWriter struct {
+	// authority is the host:port a registry-k3sm:6450 reference is rewritten
+	// to for the upload.
+	authority string
+	// dest carries the credential: the builder token for a run a user started,
+	// this server's own push credential for the run its daemon starts.
+	dest pushDest
+}
+
+// target is where this Mac sends the cluster-registry reference flat.
+func (w migrationWriter) target(flat string) (name.Tag, error) {
+	t, err := name.NewTag(flat)
+	if err != nil {
+		return name.Tag{}, fmt.Errorf("parse %s: %w", flat, err)
+	}
+	out, err := name.NewTag(w.authority + "/" + t.RepositoryStr() + ":" + t.TagStr())
+	if err != nil {
+		return name.Tag{}, fmt.Errorf("%s at %s: %w", flat, w.authority, err)
+	}
+	return out, nil
+}
+
+// migrationRoute resolves the writer once per run, and only for a run that
+// has an image to ask the registry about.
+type migrationRoute func(ctx context.Context) (migrationWriter, error)
 
 // upstreamServes reports whether the registry ref names serves digest there.
 // It answers false on any failure to ask: a reference whose registry cannot
@@ -157,9 +186,13 @@ type migrationJournal struct {
 	// on-upgrade trigger reads it; `k3sm image migrate` always re-checks.
 	Complete bool `json:"complete"`
 	// LastError is why the last run stopped short, empty after a run that
-	// reached every entry. `k3sm status` shows it as the pending reason.
-	LastError string            `json:"lastError,omitempty"`
-	Images    []migrationRecord `json:"images"`
+	// reached every entry. `k3sm image migrate --report` shows it.
+	LastError string `json:"lastError,omitempty"`
+	// PendingReason is LastError said without naming any image, for the
+	// world-readable summary `k3sm status` reads. It is set and cleared with
+	// LastError.
+	PendingReason string            `json:"pendingReason,omitempty"`
+	Images        []migrationRecord `json:"images"`
 }
 
 // migrationSummary counts a journal's outcomes, for the report line.
@@ -257,6 +290,7 @@ func writeMigrationJournal(workDir string, j migrationJournal) error {
 type imageMigrator struct {
 	workDir  string
 	source   migrationSource
+	route    migrationRoute
 	digestAt registryDigester
 	push     imagePusher
 	upstream upstreamServes
@@ -283,6 +317,7 @@ func (m imageMigrator) run(ctx context.Context) (migrationJournal, error) {
 	// so the next run resumes and `k3sm status` can say why.
 	stop := func(err error) (migrationJournal, error) {
 		j.LastError = err.Error()
+		j.PendingReason = pendingReason(err)
 		if werr := writeMigrationJournal(m.workDir, j); werr != nil {
 			return j, errors.Join(err, werr)
 		}
@@ -290,12 +325,21 @@ func (m imageMigrator) run(ctx context.Context) (migrationJournal, error) {
 	}
 	entries, err := m.source.List(ctx)
 	if err != nil {
-		return stop(fmt.Errorf("list this node's image store: %w", err))
+		return stop(&migrationStop{public: "this node's image store could not be listed",
+			err: fmt.Errorf("list this node's image store: %w", err)})
 	}
-	for _, group := range groupStoreImages(entries) {
-		rec, err := m.migrate(ctx, &j, group)
+	groups := groupStoreImages(entries)
+	var w migrationWriter
+	if len(groups) > 0 {
+		if w, err = m.route(ctx); err != nil {
+			return stop(&migrationStop{public: "the cluster registry cannot be reached from this Mac: " + err.Error(),
+				err: fmt.Errorf("reach the cluster registry: %w", err)})
+		}
+	}
+	for _, group := range groups {
+		rec, err := m.migrate(ctx, &j, group, w)
 		if err != nil {
-			return stop(err)
+			return stop(imageStepStop(err))
 		}
 		j.put(rec)
 		if err := writeMigrationJournal(m.workDir, j); err != nil {
@@ -304,6 +348,7 @@ func (m imageMigrator) run(ctx context.Context) (migrationJournal, error) {
 	}
 	j.Complete = true
 	j.LastError = ""
+	j.PendingReason = ""
 	j.Finished = m.now().UTC().Format(time.RFC3339)
 	return j, writeMigrationJournal(m.workDir, j)
 }
@@ -319,7 +364,44 @@ func recordMigrationFailure(workDir string, cause error) error {
 	j.Schema = migrationSchema
 	j.Complete = false
 	j.LastError = cause.Error()
+	j.PendingReason = pendingReason(cause)
 	return writeMigrationJournal(workDir, j)
+}
+
+// migrationStop is why a run stopped short, with the same reason said without
+// naming any image, for the world-readable summary.
+type migrationStop struct {
+	public string
+	err    error
+}
+
+func (e *migrationStop) Error() string { return e.err.Error() }
+
+func (e *migrationStop) Unwrap() error { return e.err }
+
+// imageStepStop is the stop of a run whose registry question or upload of one
+// image failed. The full error names the image; the public reason names only
+// the kind of failure.
+func imageStepStop(err error) error {
+	public := "an image could not be copied into the cluster registry"
+	switch {
+	case errors.Is(err, errPushAuth):
+		public += ": the registry refused the credential"
+	case errors.Is(err, errPushNetwork):
+		public += ": the registry could not be reached"
+	}
+	return &migrationStop{public: public + "; sudo k3sm image migrate --report names it", err: err}
+}
+
+// pendingReason is the public form of why a run stopped: a migrationStop's
+// own, else the error itself, which the callers that pass one (the start-up
+// run's "the runtime is not reachable") never let name an image.
+func pendingReason(err error) string {
+	var stop *migrationStop
+	if errors.As(err, &stop) {
+		return stop.public
+	}
+	return err.Error()
 }
 
 // groupStoreImages groups the node store's entries by reference, sorted, so
@@ -356,7 +438,7 @@ func sourcesOf(group []storeEntry) []string {
 }
 
 // migrate decides and carries out one reference.
-func (m imageMigrator) migrate(ctx context.Context, j *migrationJournal, group []storeEntry) (migrationRecord, error) {
+func (m imageMigrator) migrate(ctx context.Context, j *migrationJournal, group []storeEntry, w migrationWriter) (migrationRecord, error) {
 	ref := group[0].Reference
 	rec := migrationRecord{Reference: ref, Sources: sourcesOf(group)}
 	for _, e := range group {
@@ -369,11 +451,11 @@ func (m imageMigrator) migrate(ctx context.Context, j *migrationJournal, group [
 		if !migrationInRegistry(prev.Outcome) {
 			return prev, nil
 		}
-		target, err := m.loopback(prev.Target)
+		target, err := w.target(prev.Target)
 		if err != nil {
 			return rec, err
 		}
-		got, found, err := m.digestAt(ctx, target)
+		got, found, err := m.digestAt(ctx, target, w.dest)
 		if err != nil {
 			return rec, fmt.Errorf("ask the cluster registry for %s: %w", prev.Target, err)
 		}
@@ -408,11 +490,11 @@ func (m imageMigrator) migrate(ctx context.Context, j *migrationJournal, group [
 	digest := h.String()
 	rec.Digest = digest
 
-	target, err := m.loopback(flat.String())
+	target, err := w.target(flat.String())
 	if err != nil {
 		return rec, err
 	}
-	held, found, err := m.digestAt(ctx, target)
+	held, found, err := m.digestAt(ctx, target, w.dest)
 	if err != nil {
 		return rec, fmt.Errorf("ask the cluster registry for %s: %w", flat, err)
 	}
@@ -430,10 +512,10 @@ func (m imageMigrator) migrate(ctx context.Context, j *migrationJournal, group [
 		rec.Outcome = migrationRenamed
 		rec.Detail = fmt.Sprintf("%s holds %s in the registry", flat, held)
 		flat = renamed
-		if target, err = m.loopback(flat.String()); err != nil {
+		if target, err = w.target(flat.String()); err != nil {
 			return rec, err
 		}
-		if held, found, err = m.digestAt(ctx, target); err != nil {
+		if held, found, err = m.digestAt(ctx, target, w.dest); err != nil {
 			return rec, fmt.Errorf("ask the cluster registry for %s: %w", flat, err)
 		}
 	}
@@ -441,19 +523,10 @@ func (m imageMigrator) migrate(ctx context.Context, j *migrationJournal, group [
 	if found && held == digest {
 		return rec, nil
 	}
-	if err := m.push(ctx, target, b, m.workDir); err != nil {
+	if err := m.push(ctx, target, b, w.dest); err != nil {
 		return rec, fmt.Errorf("migrate %s to the cluster registry as %s: %w", ref, flat, err)
 	}
 	return rec, nil
-}
-
-// loopback is where this Mac reaches the cluster-registry reference flat.
-func (m imageMigrator) loopback(flat string) (name.Tag, error) {
-	t, err := name.NewTag(flat)
-	if err != nil {
-		return name.Tag{}, fmt.Errorf("parse %s: %w", flat, err)
-	}
-	return registryPushTarget(t, m.workDir)
 }
 
 // isCached reports whether every entry of the group is served, at its digest,
