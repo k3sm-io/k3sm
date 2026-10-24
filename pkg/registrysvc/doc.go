@@ -72,8 +72,8 @@ limitations under the License.
 // Off loopback, the relay (relay.go) serves the push gate (gate.go): reads pass
 // through anonymously, and a pod may push only with its own projected
 // ServiceAccount token, audience RegistryAudience, from a namespace labelled
-// PushLabel=<prefix>, into a repository under that prefix, with an RBAC grant of
-// PushVerb on PushAPIGroup/PushResource. The gate forwards such a write with a
-// second, in-memory registry credential that cannot delete, and refuses DELETE
-// outright.
+// PushLabel=<its own name>, into a repository under that name, with an RBAC
+// grant of PushVerb on PushAPIGroup/PushResource. The gate forwards such a
+// write with a second, in-memory registry credential that cannot delete, and
+// refuses DELETE outright.
 package registrysvc
