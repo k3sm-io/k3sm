@@ -215,16 +215,18 @@ A push is allowed only when all of these hold:
 
 - The token is a projected ServiceAccount token minted for the audience `k3sm-registry`. The Pod's
   default API token is refused.
-- The Pod's namespace carries the label `k3sm.io/registry-push`, whose value is a repository prefix.
-- The repository sits under that prefix, at least one level down. With the prefix `team`,
+- The Pod's namespace carries the label `k3sm.io/registry-push`, whose value is the namespace's own
+  name. That name is the namespace's repository prefix, so each prefix belongs to one namespace.
+- The repository sits under that prefix, at least one level down. In the namespace `team`,
   `team/app` and `team/tools/app` are allowed, and `team`, `teamx/app` and `other/app` are not.
 - The ServiceAccount is bound to the `k3sm:registry-pusher` ClusterRole in that namespace.
 
 Deleting is never allowed from a Pod, whatever the grant. Delete images from the Mac.
 
-Opting a namespace in is two steps. Labelling a namespace is a cluster-admin act, and the prefix
-should be unique per namespace: two namespaces given the same prefix can overwrite each other's
-images.
+Opting a namespace in is two steps. Labelling a namespace is a cluster-admin act. Any value other
+than the namespace's own name is refused, so two namespaces can never share a prefix and overwrite
+each other's images. To fix a namespace labelled with another value, relabel it:
+`kubectl label namespace <ns> k3sm.io/registry-push=<ns> --overwrite`.
 
 ```sh
 kubectl label namespace team k3sm.io/registry-push=team
@@ -324,7 +326,7 @@ A refused push says why, in an OCI error body. Every status a push can get:
 |---|---|
 | `400` | The request path, query or request target is malformed, or the request was plain HTTP. |
 | `401` | No token, a malformed token, an expired or otherwise invalid token, or a token minted for another audience. The response carries a Basic `WWW-Authenticate` challenge. |
-| `403` | The caller is authenticated but refused: the token is not a ServiceAccount's, the namespace has not opted in (no label, or an invalid prefix), the repository is outside the prefix, or RBAC denies the push. |
+| `403` | The caller is authenticated but refused: the token is not a ServiceAccount's, the namespace has not opted in (no label, or a label value other than the namespace's own name; the message gives the `kubectl label` command that fixes it), the repository is outside the prefix, or RBAC denies the push. |
 | `405` | A delete, or any other write shape the registry never takes from a Pod. |
 | `429` | Token checks are rate-limited, and each client address has its own share of connections, requests and pushes, so one busy client slows itself rather than every other caller; wait for the `Retry-After` interval and retry. |
 | `502` | The registry behind the gate is unreachable. |
