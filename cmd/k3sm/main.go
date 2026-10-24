@@ -51,7 +51,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
   build       build an image from a Dockerfile (COPY-only natively; RUN via the build engine)
   builder     manage the in-cluster buildkitd engine (builder up|down|delete|status|buildx)
-  image       ingest, publish and reclaim this node's images (image load|import|push|pull|tag|untag|inspect|save|prune|ls|df)
+  image       ingest, publish and reclaim this node's images (image load|import|push|pull|tag|untag|inspect|save|prune|ls|df|migrate)
   registry    mint the cluster registry's push token for any OCI tool, through your kubeconfig (registry token|login)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config

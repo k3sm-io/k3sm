@@ -50,6 +50,7 @@ Usage: k3sm image pull <reference> [flags]
        k3sm image prune [flags]
        k3sm image ls [-o json] [flags]
        k3sm image df [-o json] [flags]
+       k3sm image migrate [--report] [-o json]   (copy this node's images into the cluster registry once)
 
 pull    fetch a reference into this node's store through the daemon's OWN
         puller — the same code path a pod-driven pull takes, so every blob is
@@ -193,6 +194,11 @@ const (
 
 // runImage is the `k3sm image` entry point.
 func runImage(args []string) error {
+	// migrate has its own flags and touches the registry as well as runtimed,
+	// so it parses on its own (imagemigrateverb.go).
+	if len(args) > 0 && args[0] == "migrate" {
+		return runImageMigrate(args[1:])
+	}
 	opts, err := parseImageArgs(args, os.Stderr)
 	if err != nil {
 		return err
