@@ -35,6 +35,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/interconnect"
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // serverPKI is the mesh path's provisioned trust material; zero single-node.
@@ -156,6 +157,12 @@ func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.L
 	}
 	if opts.registryPort < 0 || opts.registryPort > 65535 {
 		return fmt.Errorf("--registry-port %d out of range 0-65535 (0 disables)", opts.registryPort)
+	}
+	if err := registrysvc.ValidateNodePort(opts.registryNodePort); err != nil {
+		return fmt.Errorf("--registry-node-port: %w", err)
+	}
+	if opts.registryNodePort != 0 && opts.registryPort == 0 {
+		return fmt.Errorf("--registry-node-port %d needs the registry, which --registry-port 0 turns off", opts.registryNodePort)
 	}
 	// The node name is checked ONCE, here, before anything keys on it: from this
 	// point opts.nodeName is canonical for the self-name guard, this node's own

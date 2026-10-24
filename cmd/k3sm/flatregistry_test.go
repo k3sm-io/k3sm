@@ -111,7 +111,7 @@ func publishedFlatRegistry(t *testing.T, port int, relayAddr string) *fake.Clien
 	cs := fake.NewSimpleClientset()
 	ns := registrysvc.FlatServiceNamespace
 	if _, err := registrysvc.PublishFlatService(t.Context(), cs.CoreV1().Services(ns), cs.DiscoveryV1().EndpointSlices(ns),
-		"boot", port, netip.MustParseAddr(relayAddr)); err != nil {
+		"boot", port, 0, netip.MustParseAddr(relayAddr)); err != nil {
 		t.Fatalf("publish the flat Service: %v", err)
 	}
 	return cs

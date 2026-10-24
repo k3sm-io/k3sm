@@ -273,7 +273,11 @@ func startServerRegistry(ctx context.Context, plan serverPlan, restCfg *rest.Con
 	stop, puller = startIngestRegistry(ctx, ingestRegistry{
 		svc:      svc,
 		port:     opts.registryPort,
+		nodePort: opts.registryNodePort,
 		nodeName: opts.nodeName,
+		// This server's own Node, read with the same retained admin client the
+		// Service is written with, for the NodePort certificate's addresses.
+		nodes: cs.CoreV1().Nodes(),
 		// The mesh address is what peers are advertised at and what the
 		// relay binds; empty (single node) publishes no advertisement and
 		// leaves the registry loopback-only, which is the whole truth there.

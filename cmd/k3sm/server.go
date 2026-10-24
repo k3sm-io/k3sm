@@ -166,6 +166,10 @@ type serverOptions struct {
 	// on, executor.DefaultRegistryPort unless set. The registry is the cluster's
 	// one image store, so it runs by default; 0 opts out.
 	registryPort int
+	// registryNodePort is --registry-node-port: the NodePort the flat
+	// registry-k3sm Service is also exposed on, so a tool off the cluster
+	// reaches the registry at <any node>:<port>. 0, the default, exposes none.
+	registryNodePort int
 }
 
 // executorConfig renders the control-plane Config these flags describe. It is
@@ -423,6 +427,10 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// configurable; the cluster reaches it through the HTTPS relay as
 	// registry-k3sm:6450. `k3sm dev` runs it on a per-instance allocated port.
 	fs.IntVar(&opts.registryPort, "registry-port", executor.DefaultRegistryPort, "the cluster's OCI image registry port on 127.0.0.1, also served over HTTPS to the cluster as registry-k3sm:"+strconv.Itoa(registrysvc.FlatServicePort)+" (0 disables)")
+	// The opt-in NodePort for that registry. It makes registry-k3sm a NodePort
+	// Service whose backend is still the relay, so the push gate answers there:
+	// reads are anonymous to anyone who can reach a node, writes need a token.
+	fs.IntVar(&opts.registryNodePort, "registry-node-port", 0, "also expose the cluster's registry on this `port` in the NodePort range "+ports.NodePortRange()+", so a tool on a Mac reaches it at <any node>:<port> over HTTPS under the cluster CA. Reads there are anonymous to anyone who can reach a node; pushes need a token from k3sm registry token. 0, the default, exposes none")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")

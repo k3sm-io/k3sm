@@ -83,6 +83,12 @@ type State struct {
 	// has bound it; 0 when no loopback gate serves. The k3sm CLI on this Mac
 	// pushes there.
 	GatePort int `json:"gatePort,omitempty"`
+
+	// NodePortError is why the flat Service could not be published with its
+	// opt-in NodePort (--registry-node-port), so it stands as a ClusterIP
+	// Service only; empty when the NodePort is published or not asked for. The
+	// server retries the NodePort on every refresh and clears this on success.
+	NodePortError string `json:"nodePortError,omitempty"`
 }
 
 // ClusterFacing is what the server's bring-up learns about the registry's
@@ -103,6 +109,37 @@ type ClusterFacing struct {
 // either, so the read-modify-write cannot lose a transition. A missing record
 // is an error: there is no serving registry to describe.
 func UpdateClusterFacing(workDir string, f ClusterFacing) error {
+	return updateState(workDir, func(st *State) bool {
+		st.Service = f.Service
+		st.TLS = !f.CertNotAfter.IsZero()
+		st.CertNotAfter = nil
+		if st.TLS {
+			t := f.CertNotAfter.UTC()
+			st.CertNotAfter = &t
+		}
+		return true
+	})
+}
+
+// UpdateNodePortError records reason as the record's NodePortError, keeping
+// every other field: the publish error when the flat Service fell back to
+// ClusterIP, or "" once the NodePort is published again. A record that
+// already says reason is not rewritten, so a refresh that changes nothing
+// writes nothing. The same ordering rule as UpdateClusterFacing applies, and a
+// missing record is an error.
+func UpdateNodePortError(workDir, reason string) error {
+	return updateState(workDir, func(st *State) bool {
+		if st.NodePortError == reason {
+			return false
+		}
+		st.NodePortError = reason
+		return true
+	})
+}
+
+// updateState reads workDir's record, applies edit, and writes it back when
+// edit reports a change.
+func updateState(workDir string, edit func(*State) bool) error {
 	stateUpdate.Lock()
 	defer stateUpdate.Unlock()
 	b, err := os.ReadFile(StatePath(workDir))
@@ -113,37 +150,27 @@ func UpdateClusterFacing(workDir string, f ClusterFacing) error {
 	if err != nil {
 		return err
 	}
-	st.Service = f.Service
-	st.TLS = !f.CertNotAfter.IsZero()
-	st.CertNotAfter = nil
-	if st.TLS {
-		t := f.CertNotAfter.UTC()
-		st.CertNotAfter = &t
+	if !edit(&st) {
+		return nil
 	}
 	return WriteState(workDir, st)
 }
 
-// stateUpdate serialises the read-modify-write updates of the record: a
-// serving certificate's rotation (from a TLS handshake) and the loopback gate's
-// bind can both land while the server runs.
+// stateUpdate serialises this process's read-modify-write updates of the
+// record: a serving certificate's rotation (from a TLS handshake), the loopback
+// gate's bind and the NodePort error from the refresh loop can all land while
+// the server runs, and two updates could otherwise each read the record before
+// the other wrote it and lose one field.
 var stateUpdate sync.Mutex
 
 // RecordGatePort records the loopback push gate's port in workDir's state
 // record, keeping every other field. A missing record is an error, as for
 // UpdateClusterFacing.
 func RecordGatePort(workDir string, port int) error {
-	stateUpdate.Lock()
-	defer stateUpdate.Unlock()
-	b, err := os.ReadFile(StatePath(workDir))
-	if err != nil {
-		return fmt.Errorf("read the registry state: %w", err)
-	}
-	st, err := ParseState(b)
-	if err != nil {
-		return err
-	}
-	st.GatePort = port
-	return WriteState(workDir, st)
+	return updateState(workDir, func(st *State) bool {
+		st.GatePort = port
+		return true
+	})
 }
 
 // ReadLocalState reads this Mac's registry state record as an ordinary account

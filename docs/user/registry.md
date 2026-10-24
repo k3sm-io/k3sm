@@ -109,6 +109,7 @@ spec:
 
 The Mac does not resolve `registry-k3sm`, and does not need to: every node maps that name to the
 registry itself.
+From another Mac, see [Reaching It From Another Mac](#reaching-it-from-another-mac).
 
 `k3sm image tag`, `untag`, `inspect` and `save` still talk to the registry's own loopback listener,
 so they run only on the server. `tag` and `untag` write with the server's per-boot credential, and
@@ -435,6 +436,75 @@ The worker finds the server's registry address in the `registry-k3sm` Service's 
 `k3sm-registry`, so the kubeconfig must also be allowed to read EndpointSlices there. The admin
 kubeconfig is; the `k3sm:registry-builder-token` Role alone is not, and such a user pushes from the
 server or is given that read by an admin.
+
+## Reaching It From Another Mac
+
+The in-cluster name does not resolve on a Mac, and k3sm does not make it resolve. A tool running on
+a Mac that is not the server can reach the registry through a NodePort instead. It is off by
+default. Turn it on with `--registry-node-port` on the server, choosing a port in the NodePort range
+(30000 to 32767), and restart the server:
+
+```sh
+k3sm server --registry-node-port 30650
+```
+
+On an installed server, add the flag to the server daemon's arguments; every later install carries
+it over (see [Server flags across a reinstall](install.md#server-flags-across-a-reinstall)).
+
+The `registry-k3sm` Service then becomes a NodePort Service, and the registry answers at that port
+on every node:
+
+```
+<node-address>:30650
+```
+
+It is the same registry behind the same front. It serves HTTPS under the cluster CA, a plain-HTTP
+request is refused, and every write goes through the same checks as a push from a Pod. On a single
+Mac with no mesh and no Linux guests no Service is published, so there is no NodePort either; use
+`localhost:6450` there.
+
+Dial the **server** by its name:
+
+```
+https://<server hostname>:30650
+```
+
+With the NodePort on, the registry's certificate also names the server as another Mac knows it: the
+host's name, its `.local` name (both `<name>.local` and `<name>` for a Mac that calls itself
+`<name>.local`), and the InternalIP addresses on the server's Node object. A tool that trusts the
+cluster CA then verifies the registry with no extra flags. Take the CA from the cluster:
+
+```sh
+kubectl get configmap kube-root-ca.crt -n default -o jsonpath='{.data.ca\.crt}' > k3sm-ca.crt
+curl --cacert k3sm-ca.crt https://<name>.local:30650/v2/_catalog
+```
+
+The server's InternalIP is its mesh address on a mesh server, so a bare LAN address is not in the
+certificate; use the hostname or `.local` name, which resolve to the LAN address. Dial the server
+rather than another node: the other nodes forward the port too, but their names are not in the
+certificate. When the server's address or name changes, the certificate is re-issued within five
+minutes.
+
+What this changes:
+
+- Reads become anonymous to everything that can reach a node on that port. With LAN access on
+  (`k3sm network lan on`), that is every network the Mac is on, so anyone there can list and pull
+  every image the cluster runs. With LAN access off, NodePorts bind only this Mac and the mesh.
+- Writes still need a token. A push needs a ServiceAccount token for the audience `k3sm-registry`,
+  which `k3sm registry token` prints, under the same rules as
+  [a push from a Pod](#pushing-from-inside-a-pod). An anonymous push is answered `401`.
+- Every client that comes in through the NodePort reaches the registry from the node's own address:
+  the Service proxy does not keep the client's source address, and `externalTrafficPolicy: Local`
+  does not change that. So all of them share one client's share of the [rate limits](#refusals),
+  and one LAN client sending many requests can make every other one get `429`s. Turn the flag on
+  only on a LAN you trust.
+
+If another Service already holds the port, the server logs an error, publishes the Service with
+its cluster address only, and tries the NodePort again every five minutes until the port is free.
+
+Drop the flag and restart the server to close the port again; the Service goes back to a cluster
+address only. Do this before you install an earlier k3sm release on the server: an earlier server
+does not change the Service back, so the port would stay open.
 
 ## Storage
 

@@ -32,6 +32,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"k3sm.io/darwin-net/pkg/dns"
+
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // The FLAT REGISTRY SERVICE: one cluster name, registry-k3sm, at which the
@@ -70,6 +72,17 @@ import (
 // THE PER-NODE SERVICES ARE RETIRED. Earlier releases published one
 // registry-<node> Service per node; a server now removes its own stale one at
 // start (RemoveClusterService) and never publishes it again.
+//
+// THE OPT-IN NODEPORT. A server started with --registry-node-port <port>
+// publishes the same Service as type NodePort on exactly that port, so a tool on
+// a Mac that cannot resolve registry-k3sm reaches the registry at
+// <any node>:<port>. Nothing else about the Service changes: it keeps its
+// ClusterIP, its port and its one hand-written endpoint, the relay address. The
+// NodePort therefore routes through the node's Service proxy to the RELAY, which
+// runs the push gate, and never to the registry's loopback listener: a read
+// stays anonymous, a write needs a ServiceAccount token the gate reviews, exactly
+// as it does from inside the cluster. Without the flag the Service is a plain
+// ClusterIP and no node opens a NodePort for it.
 //
 // RBAC: nothing new. The publisher is the server's retained admin client, the
 // same one that writes the advertisement ConfigMaps, and the readers (a node's
@@ -255,18 +268,39 @@ func ClusterEndpointAddress(meshIP, vmNetSubnet string) (netip.Addr, error) {
 	return binds[0], nil
 }
 
+// ValidateNodePort reports whether nodePort may be the registry's NodePort: 0
+// (no NodePort, the default) or a port inside the apiserver's NodePort range,
+// which the apiserver would refuse anything outside of.
+func ValidateNodePort(nodePort int) error {
+	if nodePort == 0 || (nodePort >= ports.NodePortRangeMin && nodePort <= ports.NodePortRangeMax) {
+		return nil
+	}
+	return fmt.Errorf("registry NodePort %d is outside the NodePort range %s (0 exposes none)", nodePort, ports.NodePortRange())
+}
+
 // FlatService renders the registry's selector-less Service, published by the
 // server named publisher, whose registry listens on targetPort.
 //
 // The Service port is FlatServicePort whatever the registry's own port is,
 // because the port is part of every image reference; the target port is the
 // port the relay listens on, which is the registry's.
-func FlatService(publisher string, targetPort int) (*corev1.Service, error) {
+//
+// nodePort 0 renders a ClusterIP Service. A non-zero nodePort renders a NodePort
+// Service on exactly that port; the target is unchanged, so the NodePort reaches
+// the relay and its push gate like every other caller.
+func FlatService(publisher string, targetPort, nodePort int) (*corev1.Service, error) {
 	if publisher == "" {
 		return nil, errors.New("publish the registry Service: the publishing server's node name is empty")
 	}
 	if targetPort <= 0 || targetPort > 65535 {
 		return nil, fmt.Errorf("publish the registry Service: port %d is out of range 1-65535", targetPort)
+	}
+	if err := ValidateNodePort(nodePort); err != nil {
+		return nil, fmt.Errorf("publish the registry Service: %w", err)
+	}
+	svcType := corev1.ServiceTypeClusterIP
+	if nodePort != 0 {
+		svcType = corev1.ServiceTypeNodePort
 	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -275,7 +309,7 @@ func FlatService(publisher string, targetPort int) (*corev1.Service, error) {
 			Labels:    clusterServiceLabels(publisher),
 		},
 		Spec: corev1.ServiceSpec{
-			Type: corev1.ServiceTypeClusterIP,
+			Type: svcType,
 			// No Selector, and that is the whole shape: there is no Pod behind
 			// this Service, so the endpoints are written by hand below.
 			Ports: []corev1.ServicePort{{
@@ -283,6 +317,7 @@ func FlatService(publisher string, targetPort int) (*corev1.Service, error) {
 				Protocol:   corev1.ProtocolTCP,
 				Port:       FlatServicePort,
 				TargetPort: intstr.FromInt32(int32(targetPort)),
+				NodePort:   int32(nodePort),
 			}},
 		},
 	}, nil
@@ -339,6 +374,8 @@ func FlatEndpointSlice(publisher string, targetPort int, addr netip.Addr) (*disc
 }
 
 // PublishFlatService creates or refreshes the Service and its EndpointSlice.
+// nodePort is the opt-in NodePort (0 for none, see FlatService); a refresh
+// moves an existing Service between the two shapes when the flag changed.
 //
 // The SERVICE IS PUBLISHED FIRST so its ClusterIP exists before anything reports
 // an address, and the assigned ClusterIP is RETURNED: it is the VIP a caller
@@ -351,8 +388,8 @@ func FlatEndpointSlice(publisher string, targetPort int, addr netip.Addr) (*disc
 // resourceVersion is live and a concurrent writer loses the conflict instead of
 // being silently overwritten, most of all the ClusterIP, which the apiserver
 // assigned and which is immutable.
-func PublishFlatService(ctx context.Context, svcs ServiceClient, slices EndpointSliceClient, publisher string, targetPort int, addr netip.Addr) (string, error) {
-	wantSvc, err := FlatService(publisher, targetPort)
+func PublishFlatService(ctx context.Context, svcs ServiceClient, slices EndpointSliceClient, publisher string, targetPort, nodePort int, addr netip.Addr) (string, error) {
+	wantSvc, err := FlatService(publisher, targetPort, nodePort)
 	if err != nil {
 		return "", err
 	}
@@ -383,11 +420,17 @@ func publishService(ctx context.Context, c ServiceClient, want *corev1.Service) 
 	if err != nil {
 		return "", fmt.Errorf("read the %s Service: %w", want.Name, err)
 	}
-	if samePorts(existing.Spec.Ports, want.Spec.Ports) && existing.Spec.Selector == nil {
+	if existing.Spec.Type == want.Spec.Type && samePorts(existing.Spec.Ports, want.Spec.Ports) && existing.Spec.Selector == nil {
 		return existing.Spec.ClusterIP, nil
 	}
 	updated := existing.DeepCopy()
+	updated.Spec.Type = want.Spec.Type
 	updated.Spec.Ports = want.Spec.Ports
+	if want.Spec.Type == corev1.ServiceTypeClusterIP {
+		// The traffic policy belongs to the NodePort shape; a ClusterIP Service
+		// that keeps one is refused by the apiserver.
+		updated.Spec.ExternalTrafficPolicy = ""
+	}
 	// A selector arriving on this object would hand it to the EndpointSlice
 	// controller, which would then delete the hand-written slice as orphaned.
 	updated.Spec.Selector = nil
@@ -546,7 +589,8 @@ func samePorts(a, b []corev1.ServicePort) bool {
 	}
 	for i := range a {
 		if a[i].Name != b[i].Name || a[i].Protocol != b[i].Protocol ||
-			a[i].Port != b[i].Port || a[i].TargetPort != b[i].TargetPort {
+			a[i].Port != b[i].Port || a[i].TargetPort != b[i].TargetPort ||
+			a[i].NodePort != b[i].NodePort {
 			return false
 		}
 	}
