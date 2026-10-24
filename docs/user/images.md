@@ -222,7 +222,7 @@ k3sm build --tag myapp:v1 --output ./layout --format oci .
 tar -cf layout.tar -C ./layout .
 k3sm image import layout.tar
 
-k3sm image ls                       # what this node's cache holds
+k3sm image ls                       # the registry's images and where each is cached
 ```
 
 Both verbs record the archive's image in the cluster registry, the cluster's one image store, as
@@ -255,13 +255,13 @@ registry reference, and a Pod on this node with `imagePullPolicy: Never` finds i
 
 ### The Daemon Socket
 
-Every subcommand except `push` is a client of the node's runtime daemon, reached over a local unix
+Every subcommand except `push`, `ls` and `df` is a client of the node's runtime daemon, reached over a local unix
 socket. A running `k3sm server` (or `k3sm agent`) serves that socket as part of normal bring-up, so
 on a standard install the commands work with no extra setup and no flags:
 
 ```sh
-k3sm image ls
-k3sm image df
+k3sm image inspect myapp:v1
+k3sm image prune
 ```
 
 The socket lives in the runtime root's `run` directory, which on a standard install is
@@ -269,7 +269,7 @@ The socket lives in the runtime root's `run` directory, which on a standard inst
 runtime root serves beside its own image store instead, so point the command at it:
 
 ```sh
-k3sm image ls --socket /path/to/root/run/runtimed.sock
+k3sm image prune --socket /path/to/root/run/runtimed.sock
 ```
 
 Only the daemon's own account can use it. The socket is created mode `600` inside a `700`
@@ -368,6 +368,33 @@ registry: digests verified, `imagePullSecrets` honoured, multi-arch manifest lis
 Registry pull needs nothing special either. An `image: ghcr.io/org/app:tag` Pod is pulled,
 digest-verified and run with kubelet-faithful semantics, including pull policy, pull-failure
 backoff and multi-arch selection. What the image must contain is a `darwin/arm64` payload.
+
+## Listing the Registry: `k3sm image ls` / `k3sm image df`
+
+`ls` and `df` describe the cluster's one registry, the one the server runs. They read it
+anonymously and need no root and no daemon socket, only a kubeconfig that can read Nodes, Pods and
+the `kube-public/local-registry-hosting` ConfigMap. On the server the command reaches the registry
+on its loopback port; on any other Mac it reaches the server's address on the port that ConfigMap
+publishes.
+
+```sh
+k3sm image ls             # every tag, where it is cached, and how many Pods use it
+k3sm image ls -o json     # the same, as a versioned document
+k3sm image df             # the registry's size and each node's image cache
+k3sm image df -o json
+```
+
+Each image is shown under its canonical reference, `registry-k3sm:6450/<repository>:<tag>`, with
+its digest, its platforms (every platform of a multi-platform index), and its size, which counts
+each distinct config and layer once. `PODS` counts the Pods whose container image names that
+digest, or that reference under any spelling of the registry's address. `CACHED ON` lists the nodes
+whose `status.images` report the digest. A node reports at most its 50 largest images there, so a
+node at that cap may cache an image it does not list; the table says so, and `-o json` names such
+nodes under `cachedOnIncomplete`.
+
+If the registry does not answer, both commands still exit 0: the table says it is unreachable, and
+the JSON document carries `"reachable": false` with the error. `df` then still reports the node
+caches.
 
 ## Next
 

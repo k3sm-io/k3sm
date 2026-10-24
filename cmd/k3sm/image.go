@@ -38,7 +38,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
-const imageUsage = `k3sm image — record, name and inspect images in the cluster registry, and manage this node's cache
+const imageUsage = `k3sm image — record, name and inspect images in the cluster registry, list where each is cached, and manage this node's cache
 
 Usage: k3sm image pull <reference> [flags]
        k3sm image tag <reference|digest> <new-tag> [flags]
@@ -49,8 +49,8 @@ Usage: k3sm image pull <reference> [flags]
        k3sm image import <oci-layout.tar> [flags]
        k3sm image push <oci-layout-dir|reference> <registry-reference> [flags]
        k3sm image prune [flags]
-       k3sm image ls [flags]
-       k3sm image df [flags]
+       k3sm image ls [-o json] [flags]
+       k3sm image df [-o json] [flags]
 
 pull    fetch a reference into this node's store through the daemon's OWN
         puller — the same code path a pod-driven pull takes, so every blob is
@@ -106,8 +106,17 @@ prune   delete image content no pod references. DRY RUN BY DEFAULT — pass
         is a client of the runtimed Images service, it never walks the store
         itself. A pod's content is never deleted, and if the daemon cannot
         enumerate every pod's references it refuses the whole prune.
-ls      list the images this node's cache holds.
-df      show the image store's filesystem usage.
+ls      list the images in the cluster's one registry (the server's), each
+        under its canonical reference ` + "`" + canonicalRegistry + "/<repo>:<tag>`" + `, with
+        its digest, platforms and size, how many Pods use it, and the nodes
+        whose status.images report it cached. A node at the 50-image
+        status.images cap may cache an image it does not list; -o json names
+        such nodes under cachedOnIncomplete. Read-only and anonymous: it needs
+        no root and no daemon socket, only a kubeconfig that can read Nodes,
+        Pods and the local-registry-hosting ConfigMap. An unreachable registry
+        is reported (reachable: false, with the error) and still exits 0.
+df      show the registry's size (its distinct blobs) and each node's image
+        cache as its status.images reports it. Same reads as ls.
 
 Flags:
 `
@@ -171,6 +180,15 @@ func runImage(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
 	defer cancel()
+	// ls and df read the cluster's registry, not this node's daemon, so they
+	// dial no socket and need no root.
+	if opts.subcommand == "ls" || opts.subcommand == "df" {
+		env, err := newImageRegistryEnv()
+		if err != nil {
+			return err
+		}
+		return imageRegistryCommand(ctx, opts, os.Stdout, env)
+	}
 	return imageCommand(ctx, opts, os.Stdout, dialRuntimed)
 }
 
@@ -205,10 +223,10 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull; tag, inspect, save: one platform of an index)")
 	fs.StringVar(&policySpec, "policy", "", "pull policy: always, if-not-present or never (pull only; default is the pull-through behaviour)")
 	fs.StringVar(&o.digest, "digest", "", "refuse the removal unless the name still resolves to this manifest digest (untag only)")
-	// One flag, two meanings, chosen by the subcommand — the spelling `docker`
+	// One flag, several meanings, chosen by the subcommand — the spelling `docker`
 	// uses for both. It is validated per subcommand at parse time so `inspect -o
 	// out.tar` fails before anything is dialled.
-	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table")
+	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table; ls, df: json")
 	fs.StringVar(&o.output, "output", "", "alias for -o")
 	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call (load, import, push, pull and save default to 30m — they stream image content)")
 	if err := fs.Parse(args); err != nil {
@@ -309,6 +327,9 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	if o.policy, err = parsePullPolicy(policySpec); err != nil {
 		return o, err
 	}
+	if flagWasSet(fs, "socket") && (o.subcommand == "ls" || o.subcommand == "df") {
+		return o, fmt.Errorf("%s does not take --socket (it reads the cluster's registry, not this node's daemon)", o.subcommand)
+	}
 	if flagWasSet(fs, "digest") && o.subcommand != "untag" {
 		return o, fmt.Errorf("%s does not take --digest (it pins the entry untag is allowed to remove)", o.subcommand)
 	}
@@ -317,13 +338,13 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		if o.output == "" {
 			return o, errors.New("save requires -o <file.tar>: the archive is written to a file you name, never to the terminal")
 		}
-	case "inspect":
+	case "inspect", "ls", "df":
 		if o.output != "" && o.output != "json" {
-			return o, fmt.Errorf("-o %q: inspect renders a table by default and `json` on request", o.output)
+			return o, fmt.Errorf("-o %q: %s renders a table by default and `json` on request", o.output, o.subcommand)
 		}
 	default:
 		if flagWasSet(fs, "o") || flagWasSet(fs, "output") {
-			return o, fmt.Errorf("%s does not take -o (save writes an archive to it, inspect chooses a rendering with it)", o.subcommand)
+			return o, fmt.Errorf("%s does not take -o (save writes an archive to it; inspect, ls and df choose a rendering with it)", o.subcommand)
 		}
 	}
 	// The streaming default applies only when the operator did not choose. Visit
@@ -450,10 +471,6 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 		return imagePull(ctx, client, o, out)
 	case "prune":
 		return imagePrune(ctx, client, o, out)
-	case "ls":
-		return imageList(ctx, client, out)
-	case "df":
-		return imageDF(ctx, client, out)
 	}
 	return fmt.Errorf("unknown subcommand %q", o.subcommand)
 }
@@ -522,44 +539,6 @@ func skipReasonText(r runtimev1.PruneSkipReason) string {
 		return "no reason reported"
 	}
 	return r.String()
-}
-
-// imageList renders the node's recorded images.
-func imageList(ctx context.Context, client runtimev1.ImagesClient, out io.Writer) error {
-	resp, err := client.ListImages(ctx, &runtimev1.ListImagesRequest{})
-	if err != nil {
-		return imageRPCError("list images", "", err)
-	}
-	if len(resp.GetImages()) == 0 {
-		fmt.Fprintln(out, "no images recorded on this node.")
-		return nil
-	}
-	fmt.Fprintf(out, "%-48s %-8s %s\n", "REFERENCE", "LAYERS", "CONFIG")
-	for _, img := range resp.GetImages() {
-		m := img.GetManifest()
-		fmt.Fprintf(out, "%-48s %-8d %s\n", m.GetReference(), len(m.GetLayers()), m.GetConfig().GetDigest())
-	}
-	return nil
-}
-
-// imageDF renders the image store's filesystem usage.
-func imageDF(ctx context.Context, client runtimev1.ImagesClient, out io.Writer) error {
-	resp, err := client.ImageFsInfo(ctx, &runtimev1.ImageFsInfoRequest{})
-	if err != nil {
-		return imageRPCError("image filesystem info", "", err)
-	}
-	fmt.Fprintf(out, "store: %s\n", humanBytes(resp.GetStoreBytes()))
-	for _, fsu := range resp.GetFilesystems() {
-		fmt.Fprintf(out, "%s: %s used of %s, %s available\n",
-			fsu.GetMountpoint(), humanBytes(fsu.GetUsedBytes()),
-			humanBytes(fsu.GetCapacityBytes()), humanBytes(fsu.GetAvailableBytes()))
-	}
-	// The store figure counts every blob at its full logical size, but a blob
-	// whose extents are cloned into a live pod's rootfs shares them — so the sum
-	// is not what a prune would give back, and saying so is cheaper than an
-	// operator inferring a broken prune from the arithmetic.
-	fmt.Fprintln(out, "(store bytes are logical sizes; APFS clones share extents, so a prune frees less)")
-	return nil
 }
 
 // imageRPCError translates a daemon status into an operator-actionable message.

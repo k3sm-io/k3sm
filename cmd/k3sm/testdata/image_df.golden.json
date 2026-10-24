@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "registry": {
+    "name": "registry-k3sm:6450",
+    "reachable": true
+  },
+  "registryBytes": 2962,
+  "nodes": [
+    {
+      "node": "node-a",
+      "cacheBytes": 2000,
+      "images": 2,
+      "incomplete": false
+    },
+    {
+      "node": "node-b",
+      "cacheBytes": 1000,
+      "images": 1,
+      "incomplete": false
+    },
+    {
+      "node": "node-full",
+      "cacheBytes": 50000,
+      "images": 50,
+      "incomplete": true
+    }
+  ]
+}

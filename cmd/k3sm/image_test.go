@@ -45,8 +45,6 @@ type fakeImagesDaemon struct {
 	gotPrune  *runtimev1.PruneImagesRequest
 	pruneResp *runtimev1.PruneImagesResponse
 	pruneErr  error
-	listResp  *runtimev1.ListImagesResponse
-	fsResp    *runtimev1.ImageFsInfoResponse
 
 	// LoadImage is client-streaming, so the fake keeps the metadata frame apart
 	// from the concatenated payload: the gate asserts on both independently.
@@ -142,14 +140,6 @@ func (f *fakeImagesDaemon) PruneImages(_ context.Context, req *runtimev1.PruneIm
 		return nil, f.pruneErr
 	}
 	return f.pruneResp, nil
-}
-
-func (f *fakeImagesDaemon) ListImages(context.Context, *runtimev1.ListImagesRequest) (*runtimev1.ListImagesResponse, error) {
-	return f.listResp, nil
-}
-
-func (f *fakeImagesDaemon) ImageFsInfo(context.Context, *runtimev1.ImageFsInfoRequest) (*runtimev1.ImageFsInfoResponse, error) {
-	return f.fsResp, nil
 }
 
 // LoadImage drains the ingest stream, recording the metadata frame and every
@@ -340,7 +330,7 @@ func TestImageArgParsing(t *testing.T) {
 		},
 		{
 			name: "the socket defaults to the daemon's own",
-			args: []string{"ls"},
+			args: []string{"prune"},
 			check: func(t *testing.T, o imageOptions) {
 				if o.socket == "" {
 					t.Errorf("socket default is empty")
@@ -362,48 +352,6 @@ func TestImageArgParsing(t *testing.T) {
 			}
 			tc.check(t, o)
 		})
-	}
-}
-
-// TestImageLsAndDf covers the two read subcommands' rendering, including the
-// clonefile caveat df must not omit.
-func TestImageLsAndDf(t *testing.T) {
-	fake := &fakeImagesDaemon{
-		listResp: &runtimev1.ListImagesResponse{Images: []*runtimev1.Image{{
-			Manifest: &runtimev1.ImageManifest{
-				Reference: "example.test/app:v1",
-				Config:    &runtimev1.Descriptor{Digest: "sha256:cfg"},
-				Layers:    []*runtimev1.Descriptor{{Digest: "sha256:l1"}, {Digest: "sha256:l2"}},
-			},
-		}}},
-		fsResp: &runtimev1.ImageFsInfoResponse{
-			StoreBytes: 2 << 30,
-			Filesystems: []*runtimev1.FilesystemUsage{{
-				Mountpoint: "/var/lib/k3sm", UsedBytes: 1 << 30,
-				CapacityBytes: 100 << 30, AvailableBytes: 40 << 30,
-			}},
-		},
-	}
-	sock := serveFakeImages(t, fake)
-
-	out, err := runImageCmd(t, []string{"--socket", sock, "ls"})
-	if err != nil {
-		t.Fatalf("image ls: %v", err)
-	}
-	for _, want := range []string{"example.test/app:v1", "sha256:cfg", "REFERENCE"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("ls output missing %q:\n%s", want, out)
-		}
-	}
-
-	out, err = runImageCmd(t, []string{"--socket", sock, "df"})
-	if err != nil {
-		t.Fatalf("image df: %v", err)
-	}
-	for _, want := range []string{"/var/lib/k3sm", "2.0 GiB", "40.0 GiB available", "APFS clones share extents"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("df output missing %q:\n%s", want, out)
-		}
 	}
 }
 
