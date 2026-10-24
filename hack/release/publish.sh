@@ -1420,10 +1420,10 @@ index_cases() {
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
 	up_refuses "an index the decoder refuses (another context) refuses" index-unverified
 	grep -q "decoder refuses" <<<"$out" || bad "the decoder refusal is not named"
-	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W" '.minimumSupportedTag = "v0.0.1"'
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W" '.minimumSupportedTag = "v0.4.0"'
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
 	up_refuses "an index whose minimum supported tag is above its tag refuses" index-unverified
-	grep -q "minimumSupportedTag v0.0.1 is above tag $tag" <<<"$out" || bad "the floor above the tag is not named"
+	grep -q "minimumSupportedTag v0.4.0 is above tag $tag" <<<"$out" || bad "the floor above the tag is not named"
 	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W" ".app.image.sha256 = \"$(printf 'b%.0s' $(seq 64))\""
 	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
 	up_refuses "an index naming another image digest refuses" index-unverified
