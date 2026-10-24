@@ -89,8 +89,9 @@
 #      hashes checked before the upload (the aliases' too)
 #   8. only then promote: gh release edit <tag> --draft=false, with --latest
 #      for a final version and --latest=false for a release candidate; a
-#      final release whose assets hold the disk image without both release
-#      index assets, or a release candidate holding either, is refused here
+#      final release of v0.3.0 or later whose assets hold the disk image
+#      without both release index assets, or a release candidate or a final
+#      release below v0.3.0 holding either, is refused here
 #
 # THE TARBALL'S SHAPE is the one install.sh (at the repo root) consumes: the
 # assets k3sm_<version>_darwin_arm64.tar.gz and k3sm_<version>_checksums.txt
@@ -154,7 +155,9 @@
 # A final release without --disk-image is refused (image-required), so the
 # link never answers 404; a release candidate needs none.
 #
-# THE RELEASE INDEX (--upload --release-index, final releases only). The app
+# THE RELEASE INDEX (--upload --release-index, final releases from v0.3.0
+# only; operator ruling of 2026-10-23: the self-updater, the only reader of
+# the index, first ships in v0.3). The app
 # fetches releases/latest/download/k3sm_release-index.p7m to learn the newest
 # final release and the exact bytes of its version set
 # (docs/design/release-index.md). The file is CMS SignedData; this script
@@ -176,9 +179,12 @@
 # refused unless it hashes the same, and both lines are appended to the
 # checksums file after the image's. The draft carries seven assets and step 7
 # checks all seven, the index and its alias against the hash taken at the
-# index's checks. A final --upload without --release-index is refused before
-# any check (index-required), and so is a release candidate given one
-# (index-rc): a release candidate is never latest and publishes no index.
+# index's checks. A final --upload of v0.3.0 or later without --release-index
+# is refused before any check (index-required). A release candidate given one
+# is refused (index-rc): a release candidate is never latest and publishes no
+# index. A final release below v0.3.0 may carry the disk image with no index,
+# and is refused if given one (index-early): the app in v0.2 never reads it.
+# An -rc.N version counts as below its final, so v0.3.0-rc.1 is below v0.3.0.
 #
 # A draft whose assets fail step 7 is never promoted, so a failed or partial
 # upload of a large asset cannot become the latest release that an install
@@ -207,6 +213,28 @@ die() { echo "publish: $*" >&2; exit 1; }
 
 valid_version() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; }
 is_rc() { [[ "$1" =~ -rc\.[0-9]+$ ]]; }
+
+# version_lt <a> <b>: zero when version a sorts strictly below version b. Both
+# are vMAJOR.MINOR.PATCH with an optional -rc.N, which sorts below its final
+# and, among candidates of one final, by N. A malformed version is not below.
+version_lt() {
+	local re='^v([0-9]+)\.([0-9]+)\.([0-9]+)(-rc\.([0-9]+))?$' va vb i x y
+	[[ "$1" =~ $re ]] || return 1
+	va=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[5]:-0}")
+	[[ -z "${BASH_REMATCH[4]}" ]] && va[3]=999999999
+	[[ "$2" =~ $re ]] || return 1
+	vb=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[5]:-0}")
+	[[ -z "${BASH_REMATCH[4]}" ]] && vb[3]=999999999
+	for i in 0 1 2 3; do
+		x=$((10#${va[i]})); y=$((10#${vb[i]}))
+		[ "$x" -lt "$y" ] && return 0
+		[ "$x" -gt "$y" ] && return 1
+	done
+	return 1
+}
+# index_era <tag>: zero when a final release of this version carries the
+# release index (v0.3.0 and later). The app's self-updater ships in v0.3.
+index_era() { ! is_rc "$1" && ! version_lt "$1" v0.3.0; }
 
 # tag_binding_problems <repo-dir> <ref>: zero when the worktree is clean
 # (untracked files included) and <ref>'s commit is HEAD. Called with
@@ -833,11 +861,17 @@ check_image_name() {
 # require_index_for_final <tag> <index>: a final release is promoted --latest,
 # and the app's update check fetches releases/latest/download/$INDEX_ALIAS_NAME,
 # so a final release without the index would answer 404 to every app. A
-# release candidate is never latest and carries none.
+# release candidate is never latest and carries none. A final release below
+# v0.3.0 has no reader of the index, so it carries none either.
 require_index_for_final() {
 	if is_rc "$1"; then
 		[ -z "${2:-}" ] ||
 			refuse index-rc "$1 is a release candidate; a release index is for final releases only; nothing was uploaded."
+		return 0
+	fi
+	if ! index_era "$1"; then
+		[ -z "${2:-}" ] ||
+			refuse index-early "$1 is below v0.3.0, where no app reads a release index; drop --release-index; nothing was uploaded."
 		return 0
 	fi
 	[ -n "${2:-}" ] ||
@@ -898,6 +932,8 @@ add_release_index() {
 	local src="$1" tag="$2" dir="$3" manifest="$4" isha="$5" tsha="$6" name xdir copy alias size problems
 	is_rc "$tag" &&
 		refuse index-rc "$tag is a release candidate; a release index is for final releases only; nothing was uploaded."
+	index_era "$tag" ||
+		refuse index-early "$tag is below v0.3.0, where no app reads a release index; drop --release-index; nothing was uploaded."
 	check_index_name "$src" "$tag"
 	if [ -L "$src" ] || [ ! -f "$src" ]; then die "--release-index $src is not a regular file"; fi
 	[ -n "$isha" ] || refuse index-needs-image "the release index names the disk image; give --disk-image with it; nothing was uploaded."
@@ -931,8 +967,9 @@ add_release_index() {
 
 # index_promote_check <tag> <repo> <assetdir>: the release index rule at the
 # promote step, over the asset set verify_draft just matched to the draft. A
-# release candidate carries no index; a final release that carries the app's
-# disk image carries both index assets.
+# release candidate carries no index; a final release below v0.3.0 carries
+# none; a final release from v0.3.0 that carries the app's disk image carries
+# both index assets.
 index_promote_check() {
 	local tag="$1" repo="$2" names has_img=0 has_idx=0 has_alias=0
 	names="$(expected_assets "$tag" "$3")"
@@ -942,6 +979,12 @@ index_promote_check() {
 	if is_rc "$tag"; then
 		[ "$has_idx$has_alias" = 00 ] ||
 			refuse index-rc "the draft release candidate $tag carries a release index; it was NOT promoted." \
+				"Delete the draft (gh release delete $tag --repo $repo) and publish again without --release-index."
+		return 0
+	fi
+	if ! index_era "$tag"; then
+		[ "$has_idx$has_alias" = 00 ] ||
+			refuse index-early "the draft final release $tag is below v0.3.0 and carries a release index; it was NOT promoted." \
 				"Delete the draft (gh release delete $tag --repo $repo) and publish again without --release-index."
 		return 0
 	fi
@@ -960,6 +1003,8 @@ run_upload() {
 	if [ -n "$idx" ]; then
 		is_rc "$tag" &&
 			refuse index-rc "$tag is a release candidate; a release index is for final releases only; nothing was uploaded."
+		index_era "$tag" ||
+			refuse index-early "$tag is below v0.3.0, where no app reads a release index; drop --release-index; nothing was uploaded."
 		check_index_name "$idx" "$tag"
 		[ -n "$img" ] || refuse index-needs-image "the release index names the disk image; give --disk-image with it; nothing was uploaded."
 	fi
@@ -1191,6 +1236,43 @@ mk_index() {
 	{ echo FIXTURE-CMS; printf '%s\n' "$json"; } >"$d/idx/$(index_name "$tag")"
 }
 
+# index_era_cases: the version scoping of the index rule. The fixtures run at
+# v0.3.0; these cases run the same helpers at a tag below it, and at v0.3.0.
+index_era_cases() {
+	local tag=v0.2.0 g
+	echo "the release index by version"
+	for g in "v0.2.0 0" "v0.2.9 0" "v0.3.0-rc.1 0" "v0.3.0 1" "v0.10.0 1" "v1.0.0 1"; do
+		if { index_era "${g% *}" && [ "${g#* }" = 1 ]; } || { ! index_era "${g% *}" && [ "${g#* }" = 0 ]; }; then
+			ok "index_era ${g% *} is ${g#* }"
+		else bad "index_era ${g% *} is not ${g#* }"; fi
+	done
+
+	fresh; mk_image "$W/img" "$W/tree"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	up_promoted "v0.2.0 final with the image and no index is promoted with --latest" 5
+
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	up_refuses "v0.2.0 final given a release index is refused before any gh call" index-early
+
+	tag=v0.3.0
+	fresh; mk_image "$W/img" "$W/tree"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")"
+	if [ "$rc" -ne 0 ] && grep -q "REFUSE: index-required" <<<"$out" && ! grep -q '^gh release edit' "$log"; then
+		ok "v0.3.0 final with the image and no index is not promoted"
+	else bad "v0.3.0 without index (rc=$rc, log: $(tr '\n' ';' <"$log"))"; fi
+
+	fresh; mk_image "$W/img" "$W/tree"; mk_index "$W"
+	run_up "$W/tree" "$W/img/out/$(image_name "$tag")" "$W/idx/$(index_name "$tag")"
+	up_promoted "v0.3.0 final with the image and both index assets is promoted" 7
+
+	rc=0; out="$( (require_index_for_final "$rctag" "$T/x.p7m") 2>&1)" || rc=$?
+	if [ "$rc" -eq 2 ] && grep -q "REFUSE: index-rc" <<<"$out"; then ok "a release candidate given an index is still refused"; else
+		bad "rc with index (rc=$rc: $out)"; fi
+	rc=0; out="$( (require_index_for_final "$rctag" "") 2>&1)" || rc=$?
+	if [ "$rc" -eq 0 ]; then ok "a release candidate without an index still passes"; else bad "rc without index (rc=$rc: $out)"; fi
+}
+
 # index_cases: the release index cases, run by --self-test and alone by
 # --self-test-index. They read the caller's fixtures as the helpers above do,
 # and rctag, a release candidate tag.
@@ -1209,7 +1291,7 @@ index_cases() {
 	else
 		bad "index copy modes: dir $(stat -f %Lp "$xd" 2>&1), file $(stat -f %Lp "$ix" 2>&1), alias $(stat -f %Lp "$xd/$INDEX_ALIAS_NAME" 2>&1)"
 	fi
-	if [ "$INDEX_ALIAS_NAME" = k3sm_release-index.p7m ] && [ "$(index_name "$tag")" = k3sm_0.0.0_release-index.p7m ] &&
+	if [ "$INDEX_ALIAS_NAME" = k3sm_release-index.p7m ] && [ "$(index_name "$tag")" = "k3sm_${tag#v}_release-index.p7m" ] &&
 		cmp -s "$ix" "$xd/$INDEX_ALIAS_NAME" &&
 		[ "$(sed -n 5p "$sums")" = "$(sha256_of "$ix")  $(index_name "$tag")" ] &&
 		[ "$(sed -n 6p "$sums")" = "$(sha256_of "$ix")  k3sm_release-index.p7m" ] &&
@@ -1394,7 +1476,7 @@ index_cases() {
 
 # self_test_index: the release index cases alone, on their own fixtures.
 self_test_index() {
-	local fails=0 passes=0 T log out rc tag=v0.0.0 rctag=v0.0.1-rc.1 repo=example/k3sm TEAM=ABCDE12345
+	local fails=0 passes=0 T log out rc tag=v0.3.0 rctag=v0.3.1-rc.1 repo=example/k3sm TEAM=ABCDE12345
 	T="$(mktemp -d)"
 	SELFTEST_TMP="$T"
 	trap 'rm -rf "$SELFTEST_TMP"' EXIT
@@ -1408,6 +1490,7 @@ self_test_index() {
 	local G2="$T/repo2" ref2=refs/heads/fixture head2 W n=0
 	head2="$(selftest_phase_repo "$G2")"
 	index_cases
+	index_era_cases
 	unset -f ok bad
 	unset FAKE_TOOL_LOG
 	echo
@@ -1419,7 +1502,7 @@ self_test_index() {
 	echo "publish index self-test: all passed"
 }
 self_test() {
-	local fails=0 passes=0 skips=0 T log out rc sign="$HERE/sign.sh" tag=v0.0.0 repo=example/k3sm
+	local fails=0 passes=0 skips=0 T log out rc sign="$HERE/sign.sh" tag=v0.3.0 repo=example/k3sm
 	# A case that gets PAST a refusal runs only when this self-test was itself
 	# started attended (neither variable set). The self-test never unsets or
 	# overrides CLAUDECODE or K3SM_AUTO to get past a refusal; under automation
@@ -2060,6 +2143,7 @@ self_test() {
 	: >"$log"
 
 	index_cases
+	index_era_cases
 
 	# ---- install.sh selects its checksums line by the archive's exact name ----
 	echo "install.sh and the image's checksums line"
