@@ -81,7 +81,7 @@ func TestForeignTagRefusedWithoutPush(t *testing.T) {
 		var out bytes.Buffer
 		err := buildRecorded(t.Context(), buildledger.New(t.TempDir()), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"), tag: foreign, format: "docker", contextDir: ctxDir,
-		}, &out, engineBuildWith, recordInRegistry(pushes.push, warmNodeCache(dialRuntimed, sock)), pushes.push)
+		}, &out, engineBuildWith, recordInRegistry(pushes.push, warmNodeCache(dialRuntimed, sock), io.Discard), pushes.push)
 		if !errors.Is(err, errForeignTag) {
 			t.Fatalf("build err = %v, want errForeignTag", err)
 		}
@@ -100,7 +100,7 @@ func TestForeignTagRefusedWithoutPush(t *testing.T) {
 		var out bytes.Buffer
 		err := buildRecorded(t.Context(), buildledger.New(t.TempDir()), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"), tag: foreign, push: true, format: "docker", contextDir: ctxDir,
-		}, &out, engineBuildWith, recordInRegistry(recorded.push, warmNodeCache(dialRuntimed, sock)), pushed.push)
+		}, &out, engineBuildWith, recordInRegistry(recorded.push, warmNodeCache(dialRuntimed, sock), io.Discard), pushed.push)
 		if err != nil {
 			t.Fatalf("build: %v\n%s", err, out.String())
 		}

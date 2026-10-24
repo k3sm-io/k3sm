@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,7 +35,7 @@ import (
 // nothing and cannot fail, so a build test never needs a registry. It is also
 // the assertion that --push was NOT asked for — deliver only calls the seam when
 // the flag is set.
-func noPush(context.Context, name.Reference, built, string) error { return nil }
+func noPush(context.Context, name.Reference, built, pushDest) error { return nil }
 
 // recordingPush is an imagePusher that remembers what it was handed and appends
 // to a shared event log, which is how the store-then-push ORDER is proven
@@ -46,13 +47,13 @@ type recordingPush struct {
 	err      error
 }
 
-func (p *recordingPush) push(_ context.Context, ref name.Reference, b built, workDir string) error {
+func (p *recordingPush) push(_ context.Context, ref name.Reference, b built, dest pushDest) error {
 	if b.image == nil {
 		return errors.New("the pusher was handed a nil image")
 	}
 	*p.log = append(*p.log, "push")
 	p.targets = append(p.targets, ref.String())
-	p.workDirs = append(p.workDirs, workDir)
+	p.workDirs = append(p.workDirs, dest.workDir)
 	return p.err
 }
 
@@ -75,7 +76,18 @@ func stageNodeRegistry(t *testing.T, addr string) string {
 	t.Helper()
 	workDir, _ := stageLocalCredential(t, addr)
 	t.Setenv("K3SM_WORK_DIR", workDir)
+	_, port, _ := net.SplitHostPort(addr)
+	fixedClusterRegistry(t, "localhost:"+port)
 	return workDir
+}
+
+// noKubeconfig leaves this test with no kubeconfig to resolve: an empty work
+// dir, no $KUBECONFIG and an empty home.
+func noKubeconfig(t *testing.T) {
+	t.Helper()
+	t.Setenv("K3SM_WORK_DIR", filepath.Join(t.TempDir(), "server"))
+	t.Setenv("KUBECONFIG", "")
+	t.Setenv("HOME", t.TempDir())
 }
 
 // pushCtx writes a one-file build context and returns its directory.
@@ -98,52 +110,58 @@ func TestResolvePushTarget(t *testing.T) {
 
 	t.Run("resolution", func(t *testing.T) {
 		workDir, _ := stageLocalCredential(t, addr)
+		fixedClusterRegistry(t, "127.0.0.1:6451")
 		cases := []struct {
 			name string
 			tag  string
 			want string
 		}{
-			{"a bare name goes to this node's registry", "myapp:v1", "localhost:6450/myapp:v1"},
-			{"a bare name with a path element goes there too", "team/myapp:v1", "localhost:6450/team/myapp:v1"},
-			{"a bare name with no tag keeps its own spelling", "myapp", "localhost:6450/myapp"},
-			{"this node's registry, written out", "localhost:6450/myapp:v1", "localhost:6450/myapp:v1"},
-			{"this node's registry by address", "127.0.0.1:6450/myapp:v1", "127.0.0.1:6450/myapp:v1"},
+			{"a bare name goes to the cluster registry's gate", "myapp:v1", "127.0.0.1:6451/myapp:v1"},
+			{"a bare name with a path element goes there too", "team/myapp:v1", "127.0.0.1:6451/team/myapp:v1"},
+			{"a bare name with no tag keeps its own spelling", "myapp", "127.0.0.1:6451/myapp"},
+			{"the flat name goes to the gate", "registry-k3sm:6450/myapp:v1", "127.0.0.1:6451/myapp:v1"},
+			{"this node's registry, written out, goes to the gate", "localhost:6450/myapp:v1", "127.0.0.1:6451/myapp:v1"},
+			{"this node's registry by address goes to the gate", "127.0.0.1:6450/myapp:v1", "127.0.0.1:6451/myapp:v1"},
+			{"the loopback gate, written out", "localhost:6451/myapp:v1", "127.0.0.1:6451/myapp:v1"},
 			{"a public registry is untouched", "ghcr.io/org/myapp:v1", "ghcr.io/org/myapp:v1"},
 			{"a private registry is untouched", "registry.example.com/me/myapp:v1", "registry.example.com/me/myapp:v1"},
 			{"an explicit Docker Hub reference is untouched", "docker.io/library/myapp:v1", "docker.io/library/myapp:v1"},
-			{"a registry on another loopback port is untouched", "localhost:6451/myapp:v1", "localhost:6451/myapp:v1"},
+			{"a registry on another loopback port is untouched", "localhost:6452/myapp:v1", "localhost:6452/myapp:v1"},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				got, err := resolvePushTarget(tc.tag, workDir)
+				got, dest, err := resolvePushTarget(context.Background(), tc.tag, workDir)
 				if err != nil {
 					t.Fatalf("resolvePushTarget(%q) = %v", tc.tag, err)
 				}
 				if got.String() != tc.want {
 					t.Errorf("resolvePushTarget(%q) = %q, want %q", tc.tag, got, tc.want)
 				}
+				if toGate := strings.HasPrefix(tc.want, "127.0.0.1:6451/"); toGate != (dest.cluster != nil) {
+					t.Errorf("resolvePushTarget(%q): through the gate = %v, want %v", tc.tag, dest.cluster != nil, toGate)
+				}
 			})
 		}
 	})
 
-	// A bare tag with no node registry is REFUSED, and the refusal names both
-	// ways out. The alternatives are worse than an error: normalising to Docker
-	// Hub would push a private image to the internet, and skipping the upload
-	// would exit 0 on a command whose entire purpose was the upload.
-	t.Run("a bare tag with no node registry is refused", func(t *testing.T) {
-		_, err := resolvePushTarget("myapp:v1", t.TempDir())
-		if !errors.Is(err, errNoNodeRegistry) {
-			t.Fatalf("resolvePushTarget with no registry = %v, want errNoNodeRegistry", err)
+	// A bare tag on a Mac with no kubeconfig is REFUSED, naming the remedy. The
+	// alternatives are worse than an error: normalising to Docker Hub would push
+	// a private image to the internet, and skipping the upload would exit 0 on
+	// a command whose entire purpose was the upload.
+	t.Run("a bare tag with no kubeconfig is refused", func(t *testing.T) {
+		noKubeconfig(t)
+		_, _, err := resolvePushTarget(context.Background(), "myapp:v1", t.TempDir())
+		if !errors.Is(err, errNoUserKubeconfig) {
+			t.Fatalf("resolvePushTarget with no kubeconfig = %v, want errNoUserKubeconfig", err)
 		}
-		for _, want := range []string{"--registry-port", "full registry reference"} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal does not mention %q: %v", want, err)
-			}
+		if !strings.Contains(err.Error(), "k3sm kubeconfig --server") {
+			t.Errorf("the refusal does not name the k3sm kubeconfig remedy: %v", err)
 		}
 	})
 
 	t.Run("a named registry needs no node registry", func(t *testing.T) {
-		got, err := resolvePushTarget("ghcr.io/org/myapp:v1", t.TempDir())
+		noKubeconfig(t)
+		got, _, err := resolvePushTarget(context.Background(), "ghcr.io/org/myapp:v1", t.TempDir())
 		if err != nil {
 			t.Fatalf("a fully qualified tag was refused on a node with no registry: %v", err)
 		}
@@ -153,7 +171,7 @@ func TestResolvePushTarget(t *testing.T) {
 	})
 
 	t.Run("a malformed tag is reported as a tag error", func(t *testing.T) {
-		if _, err := resolvePushTarget("NOT A REFERENCE", t.TempDir()); err == nil {
+		if _, _, err := resolvePushTarget(context.Background(), "NOT A REFERENCE", t.TempDir()); err == nil {
 			t.Fatal("a malformed tag resolved to a push target")
 		} else if errors.Is(err, errNoNodeRegistry) {
 			t.Errorf("a malformed tag was reported as a missing registry: %v", err)
@@ -302,8 +320,11 @@ func TestBuildPushOrdering(t *testing.T) {
 		var log []string
 		store := &loggingStore{log: &log}
 		pusher := &recordingPush{log: &log}
-		// A work dir with no credential is a node whose registry is off.
-		t.Setenv("K3SM_WORK_DIR", t.TempDir())
+		// No kubeconfig: there is no cluster registry this Mac can reach.
+		noKubeconfig(t)
+		prev := resolveClusterRegistry
+		resolveClusterRegistry = resolveClusterRegistryLive
+		t.Cleanup(func() { resolveClusterRegistry = prev })
 
 		err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
@@ -313,8 +334,8 @@ func TestBuildPushOrdering(t *testing.T) {
 			format:     "docker",
 			contextDir: ctxDir,
 		}, io.Discard, engineBuildWith(noStore), store.record, pusher.push)
-		if !errors.Is(err, errNoNodeRegistry) {
-			t.Fatalf("build --push with no node registry = %v, want errNoNodeRegistry", err)
+		if !errors.Is(err, errNoUserKubeconfig) {
+			t.Fatalf("build --push with no kubeconfig = %v, want errNoUserKubeconfig", err)
 		}
 		if len(store.calls) != 0 {
 			t.Errorf("recordings = %v, want none under --no-record", store.calls)
@@ -380,13 +401,10 @@ func TestBuildPushToRegistry(t *testing.T) {
 	t.Setenv("DOCKER_CONFIG", empty)
 	t.Setenv(registryTokenEnv, "")
 
-	t.Run("a bare tag lands in this node's registry, authenticated", func(t *testing.T) {
-		host, probe := startRegistry(t, "")
-		// The credential names the LIVE registry's address, which is what makes
-		// the resolution and the credential lookup agree the way they do on a
-		// node whose server minted both.
-		workDir, cred := stageLocalCredential(t, host)
-		t.Setenv("K3SM_WORK_DIR", workDir)
+	t.Run("a bare tag lands in the cluster registry, with the builder token", func(t *testing.T) {
+		g := startGateRegistry(t)
+		clusterAPIFor(t, g)
+		asServer(t, g.port)
 
 		ctxDir := pushCtx(t)
 		layout := filepath.Join(t.TempDir(), "layout")
@@ -404,7 +422,7 @@ func TestBuildPushToRegistry(t *testing.T) {
 			output:     layout,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, &out, engineBuildWith(noStore), recordInRegistry(pushBuilt, warm), pushBuilt); err != nil {
+		}, &out, engineBuildWith(noStore), recordInRegistry(pushBuilt, warm, io.Discard), pushBuilt); err != nil {
 			t.Fatalf("build --push: %v", err)
 		}
 
@@ -417,19 +435,15 @@ func TestBuildPushToRegistry(t *testing.T) {
 			t.Errorf("--output wrote no layout alongside --push: %v", err)
 		}
 
-		_, port, _ := strings.Cut(host, ":")
-		target := "localhost:" + port + "/myapp:v1"
 		if !strings.Contains(out.String(), "push:   registry-k3sm:6450/myapp:v1") {
 			t.Errorf("the summary does not name the cluster-registry reference:\n%s", out.String())
 		}
-		assertRegistryHolds(t, target, layoutDigest(t, layout))
-
-		want := "Basic " + base64.StdEncoding.EncodeToString([]byte(cred.Username+":"+cred.Password))
-		if !containsHeader(probe.headers(), want) {
-			t.Errorf("the node's own push credential was never presented; headers = %q", probe.headers())
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("builder:"+fakeBuilderTokenToken))
+		if !containsHeader(g.probe.headers(), want) {
+			t.Errorf("the builder token was never presented; headers = %q", g.probe.headers())
 		}
-		if strings.Contains(out.String(), cred.Password) {
-			t.Error("the build echoed the registry credential to stdout")
+		if strings.Contains(out.String(), fakeBuilderTokenToken) {
+			t.Error("the build echoed the builder token to stdout")
 		}
 	})
 
@@ -468,4 +482,67 @@ func containsHeader(seen []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestBuildPushWarnsWhenOnlyCacheWarmFails pins `k3sm build --push` for an
+// ordinary account, which cannot reach the runtime's root-only socket: the
+// upload lands, the warm of this node's cache fails, and the build succeeds
+// with one warning saying the image is in the registry and the first Pod pulls
+// it. An upload that fails still fails the build.
+func TestBuildPushWarnsWhenOnlyCacheWarmFails(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("HOME", empty)
+	t.Setenv("DOCKER_CONFIG", empty)
+	t.Setenv(registryTokenEnv, "")
+	errSocket := errors.New("dial unix runtimed.sock: connect: permission denied")
+	coldWarm := func(context.Context, name.Tag) error { return errSocket }
+	opts := func(ctxDir string) buildOptions {
+		return buildOptions{dockerfile: filepath.Join(ctxDir, "Dockerfile"), tag: "myapp:v1", push: true, contextDir: ctxDir}
+	}
+
+	t.Run("the push lands and the build succeeds with one warning", func(t *testing.T) {
+		g := startGateRegistry(t)
+		clusterAPIFor(t, g)
+		asServer(t, g.port)
+		pushed := 0
+		push := func(ctx context.Context, ref name.Reference, b built, d pushDest) error {
+			err := pushBuilt(ctx, ref, b, d)
+			if err == nil {
+				pushed++
+			}
+			return err
+		}
+		var out, warn bytes.Buffer
+		if err := buildWith(t.Context(), opts(pushCtx(t)), &out, engineBuildWith(noStore), recordInRegistry(push, coldWarm, &warn), push); err != nil {
+			t.Fatalf("build --push with a cold cache: %v", err)
+		}
+		if pushed != 1 {
+			t.Errorf("successful uploads = %d, want 1", pushed)
+		}
+		w := warn.String()
+		if strings.Count(w, "\n") != 1 || !strings.Contains(w, "warning") ||
+			!strings.Contains(w, "registry-k3sm:6450/myapp:v1 is in the cluster registry") ||
+			!strings.Contains(w, "first Pod") || !strings.Contains(w, "permission denied") {
+			t.Errorf("warning = %q, want one line naming the image in the registry, the first Pod's pull and the cause", w)
+		}
+		if !strings.Contains(out.String(), "push:   registry-k3sm:6450/myapp:v1") {
+			t.Errorf("the summary does not name the pushed image:\n%s", out.String())
+		}
+	})
+
+	t.Run("a failed upload still fails the build", func(t *testing.T) {
+		g := startGateRegistry(t)
+		clusterAPIFor(t, g)
+		asServer(t, g.port)
+		errUpload := errors.New("upload refused")
+		push := func(context.Context, name.Reference, built, pushDest) error { return errUpload }
+		var warn bytes.Buffer
+		err := buildWith(t.Context(), opts(pushCtx(t)), io.Discard, engineBuildWith(noStore), recordInRegistry(push, coldWarm, &warn), push)
+		if !errors.Is(err, errUpload) {
+			t.Fatalf("err = %v, want the upload's error", err)
+		}
+		if warn.Len() != 0 {
+			t.Errorf("a failed upload warned %q", warn.String())
+		}
+	})
 }

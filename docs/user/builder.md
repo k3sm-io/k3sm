@@ -68,7 +68,8 @@ The image is in the cluster registry when the build finishes, under
 `registry-k3sm:6450/<repository>:<tag>`, which is everything a Pod on any node
 needs. The build uploads it to this server's registry with its push credential,
 then pulls it into this node's cache, so `imagePullPolicy: Never` works on this
-node too. A bare tag, a `registry-k3sm:6450` tag and a
+node too. An account that cannot reach this node's runtime gets one warning
+instead, and the first Pod that runs the image pulls it. A bare tag, a `registry-k3sm:6450` tag and a
 `localhost:<registry-port>` tag all name that registry. With no registry
 running ([The cluster registry](registry.md)), the build is an error naming both
 ways forward.

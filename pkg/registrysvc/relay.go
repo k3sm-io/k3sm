@@ -161,9 +161,13 @@ type RelayConfig struct {
 // The zero value is not usable — construct one with NewRelay, which is where the
 // bind discipline is enforced.
 type Relay struct {
-	port  int
-	binds []netip.Addr
-	log   *slog.Logger
+	// port is the port every bind listens on; upstream is the registry's
+	// loopback port the gate forwards to. They are equal for the mesh/guest
+	// relay and differ for the loopback gate (loopbackgate.go).
+	port     int
+	upstream int
+	binds    []netip.Addr
+	log      *slog.Logger
 	// limits are the connection caps the listener applies; limiter is the
 	// handler in front of the gate that applies the per-source buckets, and
 	// handler is the limiter.
@@ -179,6 +183,9 @@ type Relay struct {
 	// listener, with no mesh and no guest. Production wires a segment-clamped
 	// net.Listen.
 	listen func(addr string) (net.Listener, error)
+	// onListen, when set, is called with each address once it is bound, so a
+	// caller records a listener only after it exists.
+	onListen func(addr string)
 }
 
 // NewRelay validates cfg and returns a Relay.
@@ -201,7 +208,7 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 	if cfg.Serving == nil {
 		return nil, ErrNoServingIdentity
 	}
-	r := newRelay(cfg.Port, binds, cfg.Logger, cfg.Auth, cfg.GateCredential)
+	r := newRelay(cfg.Port, cfg.Port, binds, cfg.Logger, cfg.Auth, cfg.GateCredential)
 	r.tls = cfg.Serving.TLSConfig()
 	if cfg.Listen != nil {
 		r.listen = cfg.Listen
@@ -212,15 +219,19 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 // newRelay assembles a Relay over the PRODUCTION seams. It is the one place they
 // are wired, so a test that drives the serve mechanics over a loopback listener
 // exercises the same listener and gate the shipped relay uses.
-func newRelay(port int, binds []netip.Addr, log *slog.Logger, auth GateAuth, cred Credential) *Relay {
+//
+// port is the port every bind listens on and upstream the registry's loopback
+// port the gate forwards to.
+func newRelay(port, upstream int, binds []netip.Addr, log *slog.Logger, auth GateAuth, cred Credential) *Relay {
 	if log == nil {
 		log = slog.Default()
 	}
 	r := &Relay{
-		port:   port,
-		binds:  binds,
-		log:    log,
-		limits: defaultRelayLimits,
+		port:     port,
+		upstream: upstream,
+		binds:    binds,
+		log:      log,
+		limits:   defaultRelayLimits,
 		// The relay binds a mesh address and the vm NAT gateway, which local pods
 		// reach over lo0, so every accepted connection's TCP segment size is
 		// clamped. The gate's upstream dial is not: it targets the registry's
@@ -308,7 +319,7 @@ func (r *Relay) addrString(a netip.Addr) string {
 
 // target is the loopback registry every accepted connection is forwarded to.
 func (r *Relay) target() string {
-	return net.JoinHostPort(LoopbackAddress, strconv.Itoa(r.port))
+	return net.JoinHostPort(LoopbackAddress, strconv.Itoa(r.upstream))
 }
 
 // Run serves every configured address until ctx ends.
@@ -355,6 +366,9 @@ func (r *Relay) serve(ctx context.Context, addr string) {
 			continue
 		}
 		r.log.Info("relaying the ingest registry", "addr", addr, "target", r.target())
+		if r.onListen != nil {
+			r.onListen(addr)
+		}
 		serveErr := r.accept(ctx, ln)
 		if cerr := ln.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
 			r.log.Warn("closing an ingest registry relay listener", "addr", addr, "err", cerr)

@@ -117,7 +117,8 @@ either path; see [What runs](what-runs.md).
 > `registry-k3sm:6450/<repository>:<tag>`, so `--tag myapp:v1` becomes
 > `registry-k3sm:6450/myapp:v1`, and a Pod on any node can name it with no further step. The build
 > then pulls it into this node's cache through the runtime's ordinary pull, so a Pod here with
-> `imagePullPolicy: Never` finds it too. `--output` also writes a portable artifact to a path you
+> `imagePullPolicy: Never` finds it too. An account that cannot reach this node's runtime (its socket
+> is root-only) gets one warning instead, and the first Pod that runs the image pulls it. `--output` also writes a portable artifact to a path you
 > name, and it is equally usable with other tools.
 
 A tag names the cluster registry when it has no registry part (`myapp:v1`), when it spells the flat

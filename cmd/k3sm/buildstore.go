@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -227,33 +228,57 @@ func refuseRecord(_ context.Context, ref name.Tag, _ built) error {
 // uses, and then warms this node's cache through warm. The control-plane state
 // root is resolved the way every other registry-aware verb resolves it, so the
 // recording finds exactly the push credential `k3sm image push` would.
-func recordInRegistry(push imagePusher, warm cacheWarmer) storeRecorder {
+//
+// A warm that fails after the upload succeeded does not fail the build: the
+// image is in the registry, and the first Pod that runs it pulls it from there.
+// An ordinary account reaches that case every time, since the runtime's socket
+// is root-only. One warning to warn says so, and the recording succeeds.
+func recordInRegistry(push imagePusher, warm cacheWarmer, warn io.Writer) storeRecorder {
 	return func(ctx context.Context, ref name.Tag, b built) error {
-		return recordInto(ctx, ref, b, workDirFromEnv(), push, warm)
+		err := recordInto(ctx, ref, b, workDirFromEnv(), push, warm)
+		var werr *cacheWarmError
+		if errors.As(err, &werr) {
+			fmt.Fprintf(warn, "k3sm build: warning: %s is in the cluster registry, but this node's cache was not warmed (%v); the first Pod that runs it pulls it from the registry\n", werr.ref, werr.err)
+			return nil
+		}
+		return err
 	}
 }
 
+// cacheWarmError is a recording whose upload succeeded and whose warm of this
+// node's cache failed: the image is in the cluster registry.
+type cacheWarmError struct {
+	ref name.Tag
+	err error
+}
+
+func (e *cacheWarmError) Error() string {
+	return fmt.Sprintf("image %s is in the cluster registry; warming this node's cache failed (retry with k3sm image pull %s): %v", e.ref, e.ref, e.err)
+}
+
+func (e *cacheWarmError) Unwrap() error { return e.err }
+
 // recordInto uploads b to the cluster registry under ref and warms this node's
 // cache with it. It is the one recording path: build, load and import all
-// reach it.
+// reach it. A warm that fails after the upload is a *cacheWarmError.
 //
 // The upload goes to this server's registry on loopback, which is the same
 // registry the flat registry-k3sm:6450 name serves: this Mac does not resolve
 // that name, and does not need to. The warm pull names the flat reference,
 // which the runtime maps to the same registry.
 func recordInto(ctx context.Context, ref name.Tag, b built, workDir string, push imagePusher, warm cacheWarmer) error {
-	target, err := registryPushTarget(ref, workDir)
+	target, dest, err := registryPushTarget(ctx, ref, workDir)
 	if err != nil {
 		return fmt.Errorf("record %s in the cluster registry: %w", ref, err)
 	}
-	if err := push(ctx, target, b, workDir); err != nil {
+	if err := push(ctx, target, b, dest); err != nil {
 		return fmt.Errorf("record %s in the cluster registry: %w", ref, err)
 	}
 	// A failed warm leaves the image in the registry, where every Pod that may
 	// pull finds it; only imagePullPolicy Never on this node would miss it. The
 	// error says so, so the operator retries the pull, not the build.
 	if err := warm(ctx, ref); err != nil {
-		return fmt.Errorf("image %s is in the cluster registry; warming this node's cache failed (retry with k3sm image pull %s): %w", ref, ref, err)
+		return &cacheWarmError{ref: ref, err: err}
 	}
 	return nil
 }

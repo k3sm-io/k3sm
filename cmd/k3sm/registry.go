@@ -179,6 +179,9 @@ type ingestRegistry struct {
 	// relayListen overrides how the relay binds an admitted address. nil is the
 	// shipped TCP listener; a test points it at loopback.
 	relayListen func(addr string) (net.Listener, error)
+	// gateListen overrides how the loopback push gate binds 127.0.0.1. nil is
+	// the shipped TCP listener; a test points it at a free port.
+	gateListen func(addr string) (net.Listener, error)
 	// gateAuth is the push gate's apiserver clients, under the gate's own
 	// narrow identity (certs.RegistryGateSubject), never the admin client. An
 	// incomplete one (the identity could not be minted) leaves reads served and
@@ -267,6 +270,7 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registr
 	r.advertise(auxCtx, &aux)
 	r.refresh(auxCtx, &aux, published, sans, serving)
 	r.relay(auxCtx, &aux, serving)
+	r.loopbackGate(auxCtx, &aux)
 
 	wiring := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(r.port), Flat: r.flatRegistry(ctx)}
 
@@ -596,6 +600,59 @@ func (r ingestRegistry) relay(ctx context.Context, wg *sync.WaitGroup, serving *
 	go func() {
 		defer wg.Done()
 		relay.Run(ctx)
+	}()
+}
+
+// loopbackGate serves the push gate on 127.0.0.1:GatePort(port) over HTTPS,
+// whether or not a mesh or vm guests exist, so the k3sm CLI and Mac tools on
+// this server push with a builder token the gate checks. Its certificate is
+// its own, issued by the cluster CA for localhost, 127.0.0.1 and registry-k3sm,
+// and is never written to disk. With no cluster CA there is no gate: it never
+// serves plain HTTP. The port is recorded in the state record once bound, which
+// is how the CLI finds it.
+func (r ingestRegistry) loopbackGate(ctx context.Context, wg *sync.WaitGroup) {
+	port := registrysvc.GatePort(r.port)
+	if r.mintServing == nil {
+		r.logger.Error("the loopback push gate is off: no cluster CA to issue its serving certificate, and it never serves plain HTTP")
+		return
+	}
+	dnsNames, ips := registrysvc.LoopbackGateDNSNames(), registrysvc.LoopbackGateIPs()
+	serving, err := registrysvc.NewServingIdentity(registrysvc.ServingConfig{
+		Mint:   func() (tls.Certificate, error) { return r.mintServing(dnsNames, ips) },
+		Margin: nodecred.ExpiryMargin,
+		Logger: r.logger,
+	})
+	if err != nil {
+		r.logger.Error("the loopback push gate is off: its serving certificate could not be minted", "err", err)
+		return
+	}
+	gate, err := registrysvc.NewLoopbackGate(registrysvc.LoopbackGateConfig{
+		RegistryPort:   r.port,
+		Port:           port,
+		Auth:           r.gateAuth,
+		GateCredential: r.svc.GateCredential(),
+		Serving:        serving,
+		Listen:         r.gateListen,
+		OnListen: func(addr string) {
+			r.logger.Info("serving the push gate on loopback for this Mac's pushes", "addr", addr)
+			if r.workDir == "" {
+				return
+			}
+			if err := registrysvc.RecordGatePort(r.workDir, port); err != nil {
+				r.logger.Warn("could not record the loopback push gate's port; this Mac's pushes cannot find it",
+					"path", registrysvc.StatePath(r.workDir), "err", err)
+			}
+		},
+		Logger: r.logger,
+	})
+	if err != nil {
+		r.logger.Error("the loopback push gate is off", "err", err)
+		return
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		gate.Run(ctx)
 	}()
 }
 

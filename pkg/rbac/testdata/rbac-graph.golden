@@ -199,6 +199,25 @@
   },
   {
     "kind": "ClusterRoleBinding",
+    "name": "k3sm:registry-builder",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "roleRef": {
+      "apiGroup": "rbac.authorization.k8s.io",
+      "kind": "ClusterRole",
+      "name": "k3sm:registry-pusher"
+    },
+    "subjects": [
+      {
+        "kind": "ServiceAccount",
+        "name": "builder",
+        "namespace": "k3sm-registry"
+      }
+    ]
+  },
+  {
+    "kind": "ClusterRoleBinding",
     "name": "k3sm:registry-gate",
     "labels": {
       "k3sm.io/managed": "true"
@@ -272,6 +291,30 @@
     ]
   },
   {
+    "kind": "Role",
+    "namespace": "k3sm-registry",
+    "name": "k3sm:registry-builder-token",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "rules": [
+      {
+        "verbs": [
+          "create"
+        ],
+        "apiGroups": [
+          ""
+        ],
+        "resources": [
+          "serviceaccounts/token"
+        ],
+        "resourceNames": [
+          "builder"
+        ]
+      }
+    ]
+  },
+  {
     "kind": "RoleBinding",
     "namespace": "default",
     "name": "k3sm:in-pod-reader",
@@ -310,5 +353,13 @@
         "name": "system:nodes"
       }
     ]
+  },
+  {
+    "kind": "ServiceAccount",
+    "namespace": "k3sm-registry",
+    "name": "builder",
+    "labels": {
+      "k3sm.io/managed": "true"
+    }
   }
 ]
