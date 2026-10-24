@@ -99,6 +99,11 @@ func runRegistry(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Check the address before anything is written, so a refused address
+	// leaves no token entry behind in the docker config.
+	if err := validRegistryHost(host); err != nil {
+		return err
+	}
 	if len(api.caPEM) == 0 {
 		return fmt.Errorf("%w: the kubeconfig carries no cluster CA for %s", errNoNodeRegistry, host)
 	}
