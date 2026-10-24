@@ -178,10 +178,10 @@ func emulationRefusal(o buildOptions, parseErr error) error {
 	return nil
 }
 
-// selectStoreImage picks the ONE image a multi-platform build records in this node's
-// image store, and reports its platform.
+// selectStoreImage picks the ONE image of a multi-platform build this node's
+// cache holds, and reports its platform.
 //
-// The store holds single-platform entries, and the reason the choice is not
+// The cache holds single-platform entries, and the reason the choice is not
 // arbitrary is the summary line it feeds: the build tells the operator to
 // a Pod naming `<tag>`, and that is true only for an image a Pod on
 // this node can actually run. So the pick is the platform the node's own Linux

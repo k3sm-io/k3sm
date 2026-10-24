@@ -76,12 +76,13 @@ save    stream one image out of the store as a tarred OCI image layout (the
         ` + "`docker save`" + ` analog) into the file -o names. The archive is checked
         against the digest and the byte count the daemon reports it sent, and
         a short one is discarded rather than left on disk.
-load    stream a ` + "`docker save`" + ` tar into this node's image store.
-import  stream a tarred OCI image layout (the ` + "`docker buildx -o type=oci`" + `
-        output) into this node's image store.
-        Both are streamed to the daemon, which is the store's only writer: it
-        re-hashes every byte and records the reference. Loaded content is stored,
-        not yet runnable — see docs/user/images.md.
+load    record a ` + "`docker save`" + ` tar in the cluster registry, the cluster's one
+        image store, under registry-k3sm:6450/<repository>:<tag>, overwriting
+        that tag; then pull it into this node's cache.
+import  the same for a tarred OCI image layout (the ` + "`docker buildx -o type=oci`" + `
+        output); a layout holding a multi-platform index records the index.
+        Both upload as you with this node's push credential (see --work-dir),
+        and the cache pull goes through the daemon's own puller.
 push    upload an image to a registry reference, and print the digest it now has
         there so callers can pin it. The first argument is normally the OCI
         layout directory ` + "`k3sm build --format oci`" + ` writes; a first argument
@@ -177,12 +178,12 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		fs.PrintDefaults()
 	}
 	fs.StringVar(&o.socket, "socket", runtimed.DefaultSocketPath, "runtimed control socket to dial")
-	// The control-plane state root, consulted by push ONLY, and only to find this
-	// node's ingest-registry credential. A resolve failure is not reported here:
+	// The control-plane state root, consulted by push, load and import, and only
+	// to find this node's ingest-registry credential. A resolve failure is not reported here:
 	// every other subcommand is a client of runtimed and has no use for a work
 	// dir, so an unresolvable one must not make `k3sm image ls` fail.
 	defaultWorkDir, _ := executor.ResolveWorkDir()
-	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's ingest-registry push credential from (push only)")
+	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's ingest-registry push credential from (push, load, import)")
 	// DRY RUN IS THE DEFAULT and deleting takes an explicit flag, because the
 	// blast radius is asymmetric: a needless dry run costs a statfs, while an
 	// unintended prune on a node that cannot reach its registry costs every image
@@ -406,6 +407,14 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 	if o.subcommand == "push" {
 		return imagePush(ctx, o, out, dial)
 	}
+	// load and import upload to the cluster registry as the invoking user, and
+	// dial the daemon only for the warm pull that follows.
+	switch o.subcommand {
+	case "load":
+		return imageIngest(ctx, o, out, ingestPusher, warmNodeCache(dial, o.socket), runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE)
+	case "import":
+		return imageIngest(ctx, o, out, ingestPusher, warmNodeCache(dial, o.socket), runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT)
+	}
 	cc, closer, err := dial(ctx, o.socket)
 	if err != nil {
 		return err
@@ -415,10 +424,6 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 	}
 	client := runtimev1.NewImagesClient(cc)
 	switch o.subcommand {
-	case "load":
-		return imageLoad(ctx, client, o, out, runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE)
-	case "import":
-		return imageLoad(ctx, client, o, out, runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT)
 	case "pull":
 		return imagePull(ctx, client, o, out)
 	case "tag":

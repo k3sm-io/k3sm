@@ -208,7 +208,7 @@ func TestBuildPlatformRouting(t *testing.T) {
 			platforms:   platforms,
 			platformSet: true,
 			contextDir:  ctxDir,
-		}, io.Discard, engineBuildWith(recordInStore), noStore, noPush)
+		}, io.Discard, engineBuildWith(noStore), noStore, noPush)
 		if !errors.Is(err, errNoEmulation) {
 			t.Fatalf("buildWith = %v, want errNoEmulation", err)
 		}
@@ -270,8 +270,8 @@ func TestSelectStoreImage(t *testing.T) {
 }
 
 // TestMultiPlatformDelivery pins what a multi-platform build DELIVERS: the
-// index to --output and --push, one image to the store, and a summary that says
-// which platform the store got.
+// index to --output and --push, one recording, and a summary that says which
+// platform this node's cache holds.
 func TestMultiPlatformDelivery(t *testing.T) {
 	noDocker := t.TempDir()
 	t.Setenv("HOME", noDocker)
@@ -299,12 +299,13 @@ func TestMultiPlatformDelivery(t *testing.T) {
 		t.Fatalf("deliver: %v", err)
 	}
 
-	// The store holds ONE image, and it is the one this node's guests run.
+	// The cluster registry records the build once, and the summary names the
+	// platform this node's cache holds.
 	if len(store.calls) != 1 {
-		t.Fatalf("store recordings = %v, want exactly one", store.calls)
+		t.Fatalf("recordings = %v, want exactly one", store.calls)
 	}
-	if !strings.Contains(log.String(), "built:  linux/arm64, linux/amd64 (the store recorded linux/arm64)") {
-		t.Errorf("the summary does not report the platforms and the store's pick:\n%s", log.String())
+	if !strings.Contains(log.String(), "built:  linux/arm64, linux/amd64 (this node's cache holds linux/arm64)") {
+		t.Errorf("the summary does not report the platforms and this node's pick:\n%s", log.String())
 	}
 
 	// --output carries every platform: the layout indexes the index.

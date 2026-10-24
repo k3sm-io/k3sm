@@ -82,7 +82,7 @@ func TestBuildNoRecordNeverDialsStore(t *testing.T) {
 				pusher := &recordingPush{log: &log}
 				var summary bytes.Buffer
 				if entry == "buildWith" {
-					err = buildWith(t.Context(), o, &summary, engineBuildWith(recordInStore), store.record, pusher.push)
+					err = buildWith(t.Context(), o, &summary, engineBuildWith(noStore), store.record, pusher.push)
 				} else {
 					err = buildRecorded(t.Context(), nil, o, &summary, engineBuildWith, store.record, pusher.push)
 				}

@@ -325,7 +325,7 @@ func appendFixture(t *testing.T, layoutDir, tag, payload string) {
 		output:     layoutDir,
 		format:     "oci",
 		contextDir: ctxDir,
-	}, io.Discard, engineBuildWith(recordInStore), noStore, noPush); err != nil {
+	}, io.Discard, engineBuildWith(noStore), noStore, noPush); err != nil {
 		t.Fatalf("build fixture: %v", err)
 	}
 }

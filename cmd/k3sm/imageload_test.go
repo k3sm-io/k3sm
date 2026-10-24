@@ -19,8 +19,6 @@ package main
 import (
 	"archive/tar"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,12 +28,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/random"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
-
-	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/oci"
 )
 
 // loadTarEntry is one regular file in a fixture archive.
@@ -150,19 +148,13 @@ func writeFixture(t *testing.T, archive []byte) string {
 	return path
 }
 
-func sha256Ref(b []byte) string {
-	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-// TestImageLoadDockerSaveAndOCILayout is the gate for `k3sm image load` and
-// `k3sm image import`: the CLI is a STREAMING CLIENT of the daemon's LoadImage
-// RPC. It proves the first frame carries the metadata the daemon needs
-// (reference, format, advisory digest and size) with no chunk, that every
-// archive byte reaches the daemon unaltered, that the daemon's rejection is
-// what the operator sees, and that a streaming ingest is not bounded by the
-// metadata-sized call deadline.
-func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
+// TestImageLoadRefusesBeforeUpload pins the archives `k3sm image load` and
+// `k3sm image import` refuse, and that each refusal happens before anything is
+// uploaded to the cluster registry or pulled into this node's cache. Asserting
+// only on the error would pass just as well if the archive had been uploaded
+// and then rejected, which is a different (and worse) behaviour on a multi-GB
+// file. A successful ingest is pinned by TestBuildRecordsIntoRegistryNotNodeStore.
+func TestImageLoadRefusesBeforeUpload(t *testing.T) {
 	dockerSave := dockerSaveFixture(t, "example.test/app:v1")
 	layout := ociLayoutFixture(t, "example.test/app:v2")
 	layoutNoRef := ociLayoutFixture(t, "")
@@ -172,83 +164,18 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 	emptyLayout := ociLayoutFixtureN(t)
 
 	tests := []struct {
-		name       string
-		archive    []byte
-		args       func(sock, path string) []string
-		loadResp   *runtimev1.LoadImageResponse
-		loadErr    error
-		wantFormat runtimev1.LoadImageFormat
-		wantRef    string
-		wantOut    []string
-		wantErr    string
-		// wantUnstreamed marks a refusal the CLI must make BEFORE it opens the
-		// stream. Asserting only on the error would pass just as well if the
-		// archive had been shipped and then rejected, which is a different
-		// (and worse) behaviour on a multi-GB file.
-		wantUnstreamed bool
+		name    string
+		archive []byte
+		args    func(sock, path string) []string
+		wantErr string
 	}{
-		{
-			name:    "docker-save streams with the reference the archive names",
-			archive: dockerSave,
-			args: func(sock, path string) []string {
-				return []string{"--socket", sock, "load", path}
-			},
-			loadResp: &runtimev1.LoadImageResponse{
-				Images: []*runtimev1.Image{{
-					ManifestDescriptor: &runtimev1.Descriptor{Digest: "sha256:manifestdigest"},
-					Manifest:           &runtimev1.ImageManifest{Reference: "example.test/app:v1"},
-				}},
-				ReceivedBytes: int64(len(dockerSave)),
-			},
-			wantFormat: runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE,
-			wantRef:    "example.test/app:v1",
-			wantOut:    []string{"example.test/app:v1", "sha256:manifestdigest"},
-		},
-		{
-			name:    "OCI layout streams with the reference the layout annotates",
-			archive: layout,
-			args: func(sock, path string) []string {
-				return []string{"--socket", sock, "import", path}
-			},
-			loadResp: &runtimev1.LoadImageResponse{
-				Images: []*runtimev1.Image{{
-					ManifestDescriptor: &runtimev1.Descriptor{Digest: "sha256:layoutdigest"},
-					Manifest:           &runtimev1.ImageManifest{Reference: "example.test/app:v2"},
-				}},
-				ReceivedBytes: int64(len(layout)),
-			},
-			wantFormat: runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
-			wantRef:    "example.test/app:v2",
-			wantOut:    []string{"example.test/app:v2", "sha256:layoutdigest"},
-		},
-		{
-			name:    "--reference overrides what the archive claims",
-			archive: dockerSave,
-			args: func(sock, path string) []string {
-				return []string{"--socket", sock, "load", path, "--reference", "other.test/app:pinned"}
-			},
-			loadResp:   &runtimev1.LoadImageResponse{ReceivedBytes: int64(len(dockerSave))},
-			wantFormat: runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE,
-			wantRef:    "other.test/app:pinned",
-		},
 		{
 			name:    "an unannotated layout requires --reference",
 			archive: layoutNoRef,
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "import", path}
 			},
-			wantErr:        "--reference",
-			wantUnstreamed: true,
-		},
-		{
-			name:    "an unannotated layout is loadable with --reference",
-			archive: layoutNoRef,
-			args: func(sock, path string) []string {
-				return []string{"--socket", sock, "import", path, "--reference", "example.test/app:named"}
-			},
-			loadResp:   &runtimev1.LoadImageResponse{ReceivedBytes: int64(len(layoutNoRef))},
-			wantFormat: runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
-			wantRef:    "example.test/app:named",
+			wantErr: "--reference",
 		},
 		{
 			name:    "a multi-tag docker-save archive is refused, never silently narrowed",
@@ -256,8 +183,7 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "load", path}
 			},
-			wantErr:        "more than one tag",
-			wantUnstreamed: true,
+			wantErr: "more than one tag",
 		},
 		{
 			name:    "a multi-image docker-save archive is refused, never silently narrowed",
@@ -265,8 +191,7 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "load", path}
 			},
-			wantErr:        "contains 2 images",
-			wantUnstreamed: true,
+			wantErr: "contains 2 images",
 		},
 		{
 			name:    "a multi-image OCI layout is refused, never silently narrowed",
@@ -274,8 +199,7 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "import", path}
 			},
-			wantErr:        "indexes 2 images",
-			wantUnstreamed: true,
+			wantErr: "indexes 2 images",
 		},
 		{
 			name:    "a layout indexing nothing is refused",
@@ -283,8 +207,7 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "import", path}
 			},
-			wantErr:        "indexes no image",
-			wantUnstreamed: true,
+			wantErr: "indexes no image",
 		},
 		{
 			name:    "an OCI layout handed to load names the right verb",
@@ -292,8 +215,7 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "load", path}
 			},
-			wantErr:        "k3sm image import",
-			wantUnstreamed: true,
+			wantErr: "k3sm image import",
 		},
 		{
 			name:    "a docker-save archive handed to import names the right verb",
@@ -301,89 +223,64 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "import", path}
 			},
-			wantErr:        "k3sm image load",
-			wantUnstreamed: true,
-		},
-		{
-			name:    "a digest mismatch from the daemon fails the command",
-			archive: dockerSave,
-			args: func(sock, path string) []string {
-				return []string{"--socket", sock, "load", path}
-			},
-			loadErr: status.Error(codes.InvalidArgument,
-				"image: blob sha256:aaaa hashed to sha256:bbbb"),
-			wantErr: "hashed to sha256:bbbb",
-		},
-		{
-			name:    "an in-band typed rejection fails the command",
-			archive: dockerSave,
-			args: func(sock, path string) []string {
-				return []string{"--socket", sock, "load", path}
-			},
-			loadResp: &runtimev1.LoadImageResponse{Error: &rpcstatus.Status{
-				Code:    int32(codes.FailedPrecondition),
-				Message: "image: the store lease could not be taken",
-			}},
-			wantErr: "the store lease could not be taken",
+			wantErr: "k3sm image load",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fake := &fakeImagesDaemon{loadResp: tc.loadResp, loadErr: tc.loadErr}
+			fake := &fakeImagesDaemon{}
 			sock := serveFakeImages(t, fake)
 			path := writeFixture(t, tc.archive)
+			pushes := &registryPushes{}
+			old := ingestPusher
+			ingestPusher = pushes.push
+			t.Cleanup(func() { ingestPusher = old })
 
 			out, err := runImageCmd(t, tc.args(sock, path))
-			if tc.wantErr != "" {
-				if err == nil {
-					t.Fatalf("command succeeded; want an error containing %q\n%s", tc.wantErr, out)
-				}
-				if !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("err = %v; want one containing %q", err, tc.wantErr)
-				}
-				if tc.wantUnstreamed && fake.loadFirst != nil {
-					t.Errorf("the archive was streamed before the CLI refused it")
-				}
-				return
+			if err == nil {
+				t.Fatalf("command succeeded; want an error containing %q\n%s", tc.wantErr, out)
 			}
-			if err != nil {
-				t.Fatalf("image load: %v", err)
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v; want one containing %q", err, tc.wantErr)
 			}
-			if fake.loadFirst == nil {
-				t.Fatalf("the daemon was never streamed to — the CLI did not act as a client")
-			}
-			if got := fake.loadFirst.GetReference(); got != tc.wantRef {
-				t.Errorf("first-frame reference = %q; want %q", got, tc.wantRef)
-			}
-			if got := fake.loadFirst.GetFormat(); got != tc.wantFormat {
-				t.Errorf("first-frame format = %v; want %v", got, tc.wantFormat)
-			}
-			if got := fake.loadFirst.GetSize(); got != int64(len(tc.archive)) {
-				t.Errorf("first-frame advisory size = %d; want %d", got, len(tc.archive))
-			}
-			if got, want := fake.loadFirst.GetDigest(), sha256Ref(tc.archive); got != want {
-				t.Errorf("first-frame advisory digest = %q; want %q", got, want)
-			}
-			// The metadata frame carries no payload: a daemon that reads the
-			// first frame for metadata must not have to also treat it as content.
-			if len(fake.loadFirst.GetChunk()) != 0 {
-				t.Errorf("the metadata frame carried %d chunk bytes; it must carry none", len(fake.loadFirst.GetChunk()))
-			}
-			if !bytes.Equal(fake.loadBody, tc.archive) {
-				t.Errorf("the daemon received %d bytes; want the archive's %d, byte-identical",
-					len(fake.loadBody), len(tc.archive))
-			}
-			if fake.loadChunks < 1 {
-				t.Errorf("the archive arrived in %d chunk frames; want at least one", fake.loadChunks)
-			}
-			for _, want := range tc.wantOut {
-				if !strings.Contains(out, want) {
-					t.Errorf("output missing %q:\n%s", want, out)
-				}
+			if len(pushes.targets) != 0 || fake.loadCalls != 0 || fake.pullCalls != 0 {
+				t.Errorf("the archive was acted on before the CLI refused it: pushes %v, loads %d, pulls %d",
+					pushes.targets, fake.loadCalls, fake.pullCalls)
 			}
 		})
 	}
+
+	t.Run("a warm pull the daemon refuses fails the command and names the registry", func(t *testing.T) {
+		workDir := withNodeRegistry(t)
+		img, err := random.Image(64, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		saveTar := filepath.Join(t.TempDir(), "save.tar")
+		if err := (oci.TarballSink{Path: saveTar}).Write(t.Context(), name.MustParseReference("app:v1").(name.Tag), img); err != nil {
+			t.Fatalf("write docker-save: %v", err)
+		}
+		fake := &fakeImagesDaemon{pullErr: status.Error(codes.FailedPrecondition, "disk pressure")}
+		sock := serveFakeImages(t, fake)
+		pushes := &registryPushes{}
+		old := ingestPusher
+		ingestPusher = pushes.push
+		t.Cleanup(func() { ingestPusher = old })
+
+		_, err = runImageCmd(t, []string{"--socket", sock, "--work-dir", workDir, "load", saveTar})
+		if err == nil {
+			t.Fatal("a refused warm pull reported success")
+		}
+		for _, want := range []string{"is in the cluster registry", "registry-k3sm:6450/app:v1", "disk pressure"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the error does not contain %q: %v", want, err)
+			}
+		}
+		if len(pushes.targets) != 1 {
+			t.Errorf("pushes = %v, want the upload to have happened first", pushes.targets)
+		}
+	})
 
 	// A streaming ingest must not inherit the metadata-call deadline: a
 	// multi-GB archive over a unix socket outlives two minutes routinely, and a

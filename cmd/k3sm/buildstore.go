@@ -20,8 +20,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -33,30 +31,35 @@ import (
 	"k3sm.io/k3sm/pkg/oci"
 )
 
-// storeRecorder records a freshly built image in THIS node's image store under
-// ref. It is a seam so the sink matrix — store always, artifact when asked — is
-// provable without a running daemon.
-type storeRecorder func(ctx context.Context, ref name.Tag, img ggcrv1.Image) error
+// storeRecorder records what a build produced in the cluster's image store,
+// the server's registry, under ref: the build's tag already normalised to the
+// registry's own name (registryReference). It is a seam so the sink matrix
+// (store always, artifact when asked) is provable without a registry or a
+// running daemon.
+type storeRecorder func(ctx context.Context, ref name.Tag, b built) error
+
+// cacheWarmer pulls ref into this node's image cache through the runtime's
+// ordinary pull path. A seam so the warm step is provable without a daemon.
+type cacheWarmer func(ctx context.Context, ref name.Tag) error
 
 // built is what a build produced, and what delivery moves.
 //
-// The two image fields are not alternatives to choose between at every call
-// site: image is ALWAYS the single image this node's store records and a Pod
-// here can run, and index is additionally set when the build targeted several
-// platforms at once — the shape --output and --push carry, and the one the store
-// cannot hold. A single-platform build leaves index nil, so every existing path
-// reads exactly as it did.
+// image is always the single image this node runs: the sole image of a
+// single-platform build, or the child of a multi-platform index whose platform
+// this node's runtime runs. index is additionally set when the build targeted
+// several platforms at once; the registry records the whole index, and the
+// node's cache warms the child for its own platform. A single-platform build
+// leaves index nil.
 type built struct {
-	// image is the one image the store records: the sole image of a
-	// single-platform build, or the child of a multi-platform index whose
-	// platform this node's runtime runs (selectStoreImage picks it).
+	// image is the image this node runs (selectStoreImage picks it from an
+	// index).
 	image ggcrv1.Image
 	// index is the multi-platform index, or nil for a single-platform build.
 	index ggcrv1.ImageIndex
 	// platforms is what the build targeted, in the order the operator asked for.
 	platforms []string
-	// storePlatform is image's platform — the one the summary reports when the
-	// build produced more than one.
+	// storePlatform is image's platform, the one this node's cache holds and the
+	// summary reports when the build produced more than one.
 	storePlatform string
 }
 
@@ -70,29 +73,32 @@ func (b built) digest() (ggcrv1.Hash, error) {
 	return b.image.Digest()
 }
 
-// deliver puts a built image where the operator can use it: recorded in this
-// node's image store under --tag, and — when they were given — ADDITIONALLY
-// written as a portable artifact (--output) and uploaded to a registry (--push).
+// deliver puts a built image where the operator can use it: recorded in the
+// cluster registry under the normalised registry-k3sm:6450 name, and, when they
+// were given, ADDITIONALLY written as a portable artifact (--output) and
+// uploaded to a registry of the operator's choosing (--push).
 //
-// The store is the DEFAULT terminal state for both build paths, so `k3sm build
-// -t app:dev .` is followed by naming app:dev in a Pod, with nothing in between
-// and no difference between a COPY-only build and one that RUNs commands. The
-// artifact keeps its old meaning exactly: a file you can carry to another node.
-// --push is a THIRD sink, not a replacement for the store: unlike `docker build
-// --push`, the recording still happens, because a k3sm build's product is an
-// image this node can run.
+// The registry is the DEFAULT terminal state for both build paths, so `k3sm
+// build -t app:dev .` is followed by naming registry-k3sm:6450/app:dev in a
+// Pod, with nothing in between. Recording also warms this node's cache through
+// the runtime's ordinary pull, so a Pod here with imagePullPolicy Never finds
+// the image too. The node's own store is a pull cache: no build writes it
+// directly.
 //
-// THE ORDER IS ARTIFACT, STORE, PUSH, and each step earns its place. The
-// artifact is local and cheap, so a bad --output path fails before a
-// multi-gigabyte stream is sent to the daemon, and if the store leg then fails
-// the operator holds a file `k3sm image load` can finish with. The push is LAST
-// because it is the only step that can fail for a reason outside this Mac — a
-// refused credential, an unreachable host — and a failure there must not cost
-// the operator the build.
+// THE ORDER IS ARTIFACT, RECORD, PUSH. The artifact is local and cheap, so a
+// bad --output path fails before anything is uploaded, and if the recording
+// then fails the operator holds a file `k3sm image load` can finish with. The
+// extra push is LAST because a target outside this cluster is the step most
+// likely to fail for a reason outside this Mac, and that must not cost the
+// operator the recording.
 //
-// --no-record drops the store step and nothing else: artifact, then push, and
+// --no-record drops the recording and nothing else: artifact, then push, and
 // the summary says the image was not recorded and how to load it.
 func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.Writer, record storeRecorder, push imagePusher, engineEndpoint, enginePlatform string) error {
+	recorded, err := registryReference(o.tag)
+	if err != nil {
+		return err
+	}
 	if o.output != "" {
 		// A multi-platform build writes the whole INDEX, which only the layout
 		// format can hold — a docker-save tarball carries one image, which is why
@@ -112,26 +118,31 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.
 			}
 		}
 	}
-	// --no-record ends the build at the artifact and the upload: the store is
-	// never dialed, which is what lets a user who cannot reach the runtime
-	// daemon's socket build at all.
+	// --no-record ends the build at the artifact and the upload: neither the
+	// registry nor the runtime daemon is contacted for the recording.
 	if !o.noRecord {
-		if err := record(ctx, ref, b.image); err != nil {
+		if err := record(ctx, recorded, b); err != nil {
 			return err
 		}
 	}
 
-	// The upload comes after the recording, so a target this node cannot reach
-	// costs the operator an error message rather than the build. The reference it
-	// landed under is returned rather than re-derived for the summary: a printed
-	// target that was computed twice can disagree with the one that was pushed to.
+	// The extra upload comes after the recording, so a target this node cannot
+	// reach costs the operator an error message rather than the build. A tag that
+	// already names the cluster registry was uploaded by the recording itself, so
+	// it is not sent twice. The reference it landed under is returned rather than
+	// re-derived for the summary: a printed target that was computed twice can
+	// disagree with the one that was pushed to.
 	var target name.Tag
 	if o.push {
-		pushed, err := pushDelivered(ctx, o, ref, b, push)
-		if err != nil {
-			return err
+		if !o.noRecord && namesClusterRegistry(o.tag, workDirFromEnv()) {
+			target = recorded
+		} else {
+			pushed, err := pushDelivered(ctx, o, ref, b, push)
+			if err != nil {
+				return err
+			}
+			target = pushed
 		}
-		target = pushed
 	}
 
 	digest, err := b.digest()
@@ -144,19 +155,17 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.
 	// straight into a failure.
 	fmt.Fprintf(out, "built %s\n  digest: %s\n", ref, digest)
 	if o.noRecord {
-		fmt.Fprintf(out, "  store:  not recorded (--no-record); to run it on this node, load it as root: %s\n", noRecordLoadHint(o))
+		fmt.Fprintf(out, "  store:  not recorded (--no-record); to record it in the cluster registry: %s\n", noRecordLoadHint(o))
 	} else {
-		fmt.Fprintf(out, "  store:  recorded in this node's image store (name %s in a Pod manifest)\n", ref)
+		fmt.Fprintf(out, "  store:  recorded in the cluster registry as %s (name it in a Pod manifest)\n", recorded)
 	}
 	// The platform line appears only for a build that produced more than one,
-	// where "which of these is in the store" is a question the operator now has.
-	// A single-platform build's platform is the one they asked for, or the one
-	// path's only target, so printing it would be noise. A --no-record build
-	// recorded nothing, so the line names only what it built.
+	// where "which of these does this node run" is a question the operator now
+	// has. The registry holds every platform; this node's cache holds its own.
 	if len(b.platforms) > 1 && o.noRecord {
 		fmt.Fprintf(out, "  built:  %s\n", strings.Join(b.platforms, ", "))
 	} else if len(b.platforms) > 1 {
-		fmt.Fprintf(out, "  built:  %s (the store recorded %s)\n", strings.Join(b.platforms, ", "), b.storePlatform)
+		fmt.Fprintf(out, "  built:  %s (this node's cache holds %s)\n", strings.Join(b.platforms, ", "), b.storePlatform)
 	}
 	if o.output != "" {
 		fmt.Fprintf(out, "  output: %s (%s)\n", o.output, o.format)
@@ -170,8 +179,8 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.
 	return nil
 }
 
-// noRecordLoadHint names the separate root step that puts a --no-record build in
-// this node's store. A docker-save tarball loads as written; an OCI layout
+// noRecordLoadHint names the separate root step that records a --no-record build in
+// the cluster registry. A docker-save tarball loads as written; an OCI layout
 // directory is tarred first and imported, because `k3sm image import` takes the
 // tarred layout. A push-only build wrote no artifact, so the hint names the flag
 // that would.
@@ -187,47 +196,66 @@ func noRecordLoadHint(o buildOptions) string {
 }
 
 // refuseRecord is the storeRecorder of a --no-record build. deliver never calls
-// it; it exists so that a path that did would fail without dialing the daemon.
-func refuseRecord(_ context.Context, ref name.Tag, _ ggcrv1.Image) error {
-	return fmt.Errorf("record %s: this is a --no-record build, which never writes this node's image store", ref)
+// it; it exists so that a path that did would fail without contacting the
+// registry.
+func refuseRecord(_ context.Context, ref name.Tag, _ built) error {
+	return fmt.Errorf("record %s: this is a --no-record build, which never records in the cluster registry", ref)
 }
 
-// recordInStore is the production storeRecorder: it hands the image to the
-// daemon over the SAME ingest RPC `k3sm image load` uses.
-//
-// THE DAEMON IS THE SOLE STORE WRITER (see imageLoad): this writes no blob and
-// records no reference itself. It stages a docker-save tarball in a temp dir
-// because the ingest is a byte stream with a format, not an in-memory handoff —
-// and the staging dir is removed whether the stream succeeds or not.
-//
-// The ingest's own rendering is discarded: it names the temp archive, which is
-// an implementation detail of this path rather than anything the operator asked
-// for. deliver prints the store line instead.
-func recordInStore(ctx context.Context, ref name.Tag, img ggcrv1.Image) error {
-	tmp, err := os.MkdirTemp("", "k3sm-build-store-")
-	if err != nil {
-		return fmt.Errorf("create staging dir: %w", err)
+// recordInRegistry is the production storeRecorder: it uploads what was built
+// to the cluster registry through push, the same upload path `k3sm image push`
+// uses, and then warms this node's cache through warm. The control-plane state
+// root is resolved the way every other registry-aware verb resolves it, so the
+// recording finds exactly the push credential `k3sm image push` would.
+func recordInRegistry(push imagePusher, warm cacheWarmer) storeRecorder {
+	return func(ctx context.Context, ref name.Tag, b built) error {
+		return recordInto(ctx, ref, b, workDirFromEnv(), push, warm)
 	}
-	defer os.RemoveAll(tmp)
-	archive := filepath.Join(tmp, "image.tar")
-	if err := (oci.TarballSink{Path: archive}).Write(ctx, ref, img); err != nil {
-		return fmt.Errorf("stage %s for the image store: %w", ref, err)
-	}
+}
 
-	ctx, cancel := context.WithTimeout(ctx, streamingTimeout)
-	defer cancel()
-
-	socket := runtimed.DefaultSocketPath
-	cc, closer, err := dialRuntimed(ctx, socket)
+// recordInto uploads b to the cluster registry under ref and warms this node's
+// cache with it. It is the one recording path: build, load and import all
+// reach it.
+//
+// The upload goes to this server's registry on loopback, which is the same
+// registry the flat registry-k3sm:6450 name serves: this Mac does not resolve
+// that name, and does not need to. The warm pull names the flat reference,
+// which the runtime maps to the same registry.
+func recordInto(ctx context.Context, ref name.Tag, b built, workDir string, push imagePusher, warm cacheWarmer) error {
+	target, err := registryPushTarget(ref, workDir)
 	if err != nil {
-		return fmt.Errorf("record %s in this node's image store: %w", ref, err)
+		return fmt.Errorf("record %s in the cluster registry: %w", ref, err)
 	}
-	if closer != nil {
-		defer closer.Close()
+	if err := push(ctx, target, b, workDir); err != nil {
+		return fmt.Errorf("record %s in the cluster registry: %w", ref, err)
 	}
-	o := imageOptions{subcommand: "load", socket: socket, archive: archive, reference: ref.String()}
-	if err := imageLoad(ctx, runtimev1.NewImagesClient(cc), o, io.Discard, runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE); err != nil {
-		return fmt.Errorf("record %s in this node's image store: %w", ref, err)
+	// A failed warm leaves the image in the registry, where every Pod that may
+	// pull finds it; only imagePullPolicy Never on this node would miss it. The
+	// error says so, so the operator retries the pull, not the build.
+	if err := warm(ctx, ref); err != nil {
+		return fmt.Errorf("image %s is in the cluster registry; warming this node's cache failed (retry with k3sm image pull %s): %w", ref, ref, err)
 	}
 	return nil
+}
+
+// warmNodeCache is the production cacheWarmer: it asks this node's runtime to
+// pull ref through its own puller, the path a Pod-driven pull takes, with the
+// Always policy so a tag this command just overwrote is fetched again.
+func warmNodeCache(dial imagesDialer, socket string) cacheWarmer {
+	return func(ctx context.Context, ref name.Tag) error {
+		cc, closer, err := dial(ctx, socket)
+		if err != nil {
+			return err
+		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		o := imageOptions{subcommand: "pull", socket: socket, source: ref.String(), policy: runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS}
+		return imagePull(ctx, runtimev1.NewImagesClient(cc), o, io.Discard)
+	}
+}
+
+// defaultCacheWarmer warms through the default runtimed socket.
+func defaultCacheWarmer() cacheWarmer {
+	return warmNodeCache(dialRuntimed, runtimed.DefaultSocketPath)
 }

@@ -39,7 +39,7 @@ import (
 var errNoNodeRegistry = errors.New("this node has no ingest registry to push to")
 
 // imagePusher uploads what a build produced to a registry reference. It is a
-// seam so the ORDER — the node's store first, the registry second — and the
+// seam so the ORDER (the cluster registry first, any other registry second) and the
 // wording of a failed upload are provable without a registry, a credential or a
 // network.
 type imagePusher func(ctx context.Context, ref name.Reference, b built, workDir string) error
@@ -56,14 +56,14 @@ func pushBuilt(ctx context.Context, ref name.Reference, b built, workDir string)
 	return pushImage(ctx, ref, b.image, workDir)
 }
 
-// pushDelivered sends an image that is ALREADY recorded in this node's store on
-// to a registry, and returns the reference it landed under.
+// pushDelivered sends a built image on to the registry --push names, and
+// returns the reference it landed under.
 //
-// Every failure is reported with the store recording named FIRST. The build's
-// work is not lost when an upload fails: the image is in this node's store under
-// --tag and a Pod can name it right now, so the operator's next step is to retry
-// the upload, not the build. An error that did not say so would read as "the
-// build failed".
+// Every failure is reported with the recording named FIRST. The build's work is
+// not lost when this upload fails: the image is in the cluster registry and a
+// Pod can name it right now, so the operator's next step is to retry the
+// upload, not the build. An error that did not say so would read as "the build
+// failed".
 func pushDelivered(ctx context.Context, o buildOptions, ref name.Tag, b built, push imagePusher) (name.Tag, error) {
 	// The control-plane state root is resolved the way every other
 	// registry-aware verb in this binary resolves it, so `k3sm build --push`
@@ -80,7 +80,7 @@ func pushDelivered(ctx context.Context, o buildOptions, ref name.Tag, b built, p
 }
 
 // pushFailure renders a push failure for where the build left the image: in the
-// node store, or, under --no-record, only at --output if anywhere.
+// cluster registry, or, under --no-record, only at --output if anywhere.
 func pushFailure(o buildOptions, ref name.Tag, err error) error {
 	if !o.noRecord {
 		return pushAfterStoreError(ref, err)
@@ -91,24 +91,75 @@ func pushFailure(o buildOptions, ref name.Tag, err error) error {
 	return fmt.Errorf("image %s was not recorded (--no-record) and has no --output; push failed: %w", ref, err)
 }
 
-// pushAfterStoreError renders a push failure that happened after the store
-// recording succeeded.
+// pushAfterStoreError renders a push failure that happened after the
+// recording in the cluster registry succeeded.
 func pushAfterStoreError(ref name.Tag, err error) error {
-	return fmt.Errorf("image %s is in the node store; push failed: %w", ref, err)
+	return fmt.Errorf("image %s is in the cluster registry; push failed: %w", ref, err)
 }
 
-// resolvePushTarget decides WHERE --push sends the image the build recorded
-// under tag.
+// registryReference is the name the cluster registry records tag under:
+// registry-k3sm:6450/<repository>:<tag>.
 //
-// A tag that names a registry goes to that registry, spelled exactly as it was
-// written. A BARE tag — one that names no registry — goes to THIS node's ingest
-// registry, which is the push-side mirror of the pull side's bare-name
-// resolution: a Pod naming "myapp:v1" is served from this node's registry
-// first, so a build that pushes "myapp:v1" must put it there.
+// A bare tag maps there, and so does a tag that already names the cluster
+// registry by its flat name or by this Mac's loopback spelling. A tag that
+// names another registry keeps its repository path and is recorded under the
+// flat name too; --push is what sends it to the registry it names.
 //
-// The store entry is unaffected either way: it keeps the reference the operator
-// wrote, so a Pod naming `myapp:v1` resolves whether or not the push
-// happened.
+// The tag is parsed with an EMPTY default registry, so a bare repository gains
+// no "library/" element: the image is recorded under the repository the
+// operator wrote.
+func registryReference(tag string) (name.Tag, error) {
+	probe, err := name.NewTag(tag, name.WithDefaultRegistry(""))
+	if err != nil {
+		return name.Tag{}, fmt.Errorf("reference %q: %w", tag, err)
+	}
+	ref, err := name.NewTag(flatRegistryHost + "/" + probe.RepositoryStr() + ":" + probe.TagStr())
+	if err != nil {
+		return name.Tag{}, fmt.Errorf("record %q in the cluster registry: %w", tag, err)
+	}
+	return ref, nil
+}
+
+// registryPushTarget is where an upload of ref, a cluster-registry reference,
+// is sent from this Mac: this node's registry on loopback, which the flat name
+// also serves. The Mac does not resolve registry-k3sm, and the push credential
+// is presented only to the loopback spelling it was minted for.
+func registryPushTarget(ref name.Tag, workDir string) (name.Tag, error) {
+	authority, err := nodeRegistryAuthority(workDir)
+	if err != nil {
+		return name.Tag{}, err
+	}
+	target, err := name.NewTag(authority + "/" + ref.RepositoryStr() + ":" + ref.TagStr())
+	if err != nil {
+		return name.Tag{}, fmt.Errorf("push %s to this node's registry at %s: %w", ref, authority, err)
+	}
+	return target, nil
+}
+
+// namesClusterRegistry reports whether tag already names the cluster registry:
+// a bare tag, the flat registry-k3sm:6450 name, or the loopback spelling of
+// this node's registry. Recording such a tag is already the upload, so --push
+// does not send it a second time.
+func namesClusterRegistry(tag, workDir string) bool {
+	probe, err := name.NewTag(tag, name.WithDefaultRegistry(""))
+	if err != nil {
+		return false
+	}
+	switch reg := probe.RegistryStr(); reg {
+	case "", flatRegistryHost:
+		return true
+	default:
+		cred, err := registrysvc.ReadCredential(workDir)
+		return err == nil && cred.MatchesRegistry(reg)
+	}
+}
+
+// resolvePushTarget decides WHERE --push sends the image built under tag.
+//
+// A tag that names another registry goes to that registry, spelled exactly as
+// it was written. A tag that names the cluster registry, by a bare name or by
+// the flat registry-k3sm:6450 name, goes to THIS node's registry on loopback,
+// the same registry the flat name serves.
 func resolvePushTarget(tag, workDir string) (name.Tag, error) {
 	// Parsed with an EMPTY default registry, so "this reference names no
 	// registry" is the PARSER's verdict rather than a second reading of the
@@ -119,7 +170,15 @@ func resolvePushTarget(tag, workDir string) (name.Tag, error) {
 	if err != nil {
 		return name.Tag{}, fmt.Errorf("--tag %q: %w", tag, err)
 	}
-	if probe.RegistryStr() != "" {
+	switch probe.RegistryStr() {
+	case "":
+	case flatRegistryHost:
+		ref, err := registryReference(tag)
+		if err != nil {
+			return name.Tag{}, err
+		}
+		return registryPushTarget(ref, workDir)
+	default:
 		return name.NewTag(tag)
 	}
 	authority, err := nodeRegistryAuthority(workDir)
