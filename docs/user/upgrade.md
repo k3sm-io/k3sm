@@ -385,13 +385,23 @@ cache. Images you built or loaded under an earlier release are still in that nod
 upgrade copies them into the registry once.
 
 The server does this by itself on its first start after the upgrade, in the background, as soon as
-its registry is up. On an agent, or to retry, run it by hand:
+its registry is up. It writes to its own registry with the server's own push credential. A worker
+never copies anything on its own: run the copy there by hand, on that worker. Run it by hand on the
+server too to retry:
 
 ```sh
 sudo k3sm image migrate            # copy, then print the report
 sudo k3sm image migrate --report   # print the last report without running
 sudo k3sm image migrate -o json    # the report as JSON
 ```
+
+`sudo` is needed because the copy reads the node's image store through the runtime's socket, which
+only root and the k3sm service user can open, as for `k3sm image prune`. A copy you run pushes the
+way `k3sm build --push` does: through the push gate, with a builder token minted from your
+kubeconfig, to the server's loopback gate on the server and to the server's cluster address on a
+worker. So on a worker you need the kubeconfig described in
+[Registry: on a worker](registry.md#on-a-worker). Progress is journalled on the node the copy ran on,
+and `k3sm status` shows it on that node without `sudo`.
 
 What it does with each image in the node store:
 
