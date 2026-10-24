@@ -57,8 +57,14 @@ pull    fetch a reference into this node's store through the daemon's OWN
         the reference resolved to. --platform pins which manifest of a
         multi-platform index to fetch; --policy carries the corev1 pull-policy
         semantics (always, if-not-present, never). Pull fills this node's
-        cache; it never writes the cluster registry. A pulled image keeps an
-        operator root in the cache, so prune keeps it.
+        cache. A pulled image keeps an operator root in the cache, so prune
+        keeps it. A public reference is then also copied into the cluster
+        registry as registry-k3sm:6450/<registry>/<repository>:<tag>
+        (docker.io for Docker Hub), which a node pulls from only when the
+        public registry cannot be reached at all. The copy uploads as you
+        through your kubeconfig, like push; a failed copy is a warning, not a
+        failed pull. A cluster-registry reference, or a registry with a port,
+        gets no copy; --no-mirror skips it.
 tag     add a tag in the cluster registry to a manifest it already holds:
         an OCI manifest PUT of the same bytes, so the new tag names the same
         digest. The source is a tag, a <repository>@<digest>, or a bare digest
@@ -165,6 +171,11 @@ type imageOptions struct {
 	// neither of them, and is not a flag either — see registryAuth.
 	layoutDir string
 	target    string
+	// noMirror is pull's --no-mirror: skip the copy into the cluster registry.
+	noMirror bool
+	// warn is where a verb writes a warning that does not fail it: the
+	// writer parseImageArgs was given. Nil discards.
+	warn io.Writer
 	// workDir is the control-plane state root push looks in for THIS node's
 	// ingest-registry credential. It is a path, never a secret: the credential
 	// itself stays in a 0600 file the invoking user must already be able to read.
@@ -203,7 +214,7 @@ func runImage(args []string) error {
 // parseImageArgs parses argv. ContinueOnError so a bad flag is an error the
 // caller reports, never an os.Exit inside a test binary.
 func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
-	var o imageOptions
+	o := imageOptions{warn: errOut}
 	fs := flag.NewFlagSet("image", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	fs.Usage = func() {
@@ -230,6 +241,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	var platformSpec, policySpec string
 	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull; tag, inspect, save: one platform of an index)")
 	fs.StringVar(&policySpec, "policy", "", "pull policy: always, if-not-present or never (pull only; default is the pull-through behaviour)")
+	fs.BoolVar(&o.noMirror, "no-mirror", false, "pull: do not copy a public image into the cluster registry")
 	fs.StringVar(&o.digest, "digest", "", "refuse the removal unless the name still resolves to this manifest digest (untag only)")
 	// One flag, several meanings, chosen by the subcommand — the spelling `docker`
 	// uses for both. It is validated per subcommand at parse time so `inspect -o
@@ -337,6 +349,9 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	}
 	if flagWasSet(fs, "socket") && (o.subcommand == "ls" || o.subcommand == "df") {
 		return o, fmt.Errorf("%s does not take --socket (it reads the cluster's registry, not this node's daemon)", o.subcommand)
+	}
+	if o.noMirror && o.subcommand != "pull" {
+		return o, fmt.Errorf("%s does not take --no-mirror (it skips the cluster-registry copy pull writes of a public image)", o.subcommand)
 	}
 	if flagWasSet(fs, "digest") && o.subcommand != "untag" {
 		return o, fmt.Errorf("%s does not take --digest (it pins the entry untag is allowed to remove)", o.subcommand)
@@ -482,7 +497,17 @@ func imageCommandWith(ctx context.Context, o imageOptions, out io.Writer, dial i
 	client := runtimev1.NewImagesClient(cc)
 	switch o.subcommand {
 	case "pull":
-		return imagePull(ctx, client, o, out)
+		if err := imagePull(ctx, client, o, out); err != nil {
+			return err
+		}
+		if !o.noMirror {
+			warn := o.warn
+			if warn == nil {
+				warn = io.Discard
+			}
+			mirrorPulled(ctx, o, out, warn, pullMirrorer)
+		}
+		return nil
 	case "prune":
 		return imagePrune(ctx, client, o, out, del, time.Now())
 	}
