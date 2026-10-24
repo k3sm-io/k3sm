@@ -82,7 +82,7 @@ func TestMirrorPulled(t *testing.T) {
 			f := &fakeMirrorer{err: tc.copyErr}
 			var out, warn bytes.Buffer
 			o := imageOptions{subcommand: "pull", source: tc.ref, workDir: t.TempDir()}
-			mirrorPulled(context.Background(), o, &out, &warn, f.mirror)
+			mirrorPulled(context.Background(), o, storeImage(tc.ref, digest, "", ""), &out, &warn, f.mirror)
 			if tc.wantMirror == "" {
 				if len(f.calls) != 0 {
 					t.Fatalf("copied %v, want no copy", f.calls)
@@ -145,7 +145,7 @@ func TestImagePullCopiesToClusterRegistry(t *testing.T) {
 			t.Cleanup(func() { pullMirrorer = prev })
 
 			fake := &fakeImagesDaemon{pullResp: &runtimev1.PullImageResponse{
-				Image: storeImage(tc.args[1], "sha256:pulled", "darwin", "arm64"),
+				Image: storeImage(tc.args[1], "sha256:3333333333333333333333333333333333333333333333333333333333333333", "darwin", "arm64"),
 			}}
 			sock := serveFakeImages(t, fake)
 			var warn bytes.Buffer
@@ -191,5 +191,74 @@ func TestNoMirrorIsPullOnly(t *testing.T) {
 	o, err := parseImageArgs([]string{"pull", "nginx:1", "--no-mirror"}, io.Discard)
 	if err != nil || !o.noMirror {
 		t.Fatalf("pull --no-mirror = %+v, %v; want noMirror set", o.noMirror, err)
+	}
+}
+
+// TestImagePullPinsTheCopySource proves the cluster copy reads the exact image
+// the node pull cached: the source is the pulled repository at the digest the
+// daemon reported (the index digest when the tag resolved through an index),
+// never the tag re-resolved at the public registry, and the copy keeps the tag
+// the user pulled. A response with no digest gets no copy and a warning.
+func TestImagePullPinsTheCopySource(t *testing.T) {
+	const (
+		manifestDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+		indexDigest    = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+		ref            = "ghcr.io/org/app:v1"
+		wantDest       = "registry-k3sm:6450/ghcr.io/org/app:v1"
+	)
+	cases := []struct {
+		name       string
+		manifest   string
+		index      string
+		wantSource string // "" = no copy is attempted
+		wantWarn   []string
+	}{
+		{name: "a single manifest is copied from its digest", manifest: manifestDigest, wantSource: "ghcr.io/org/app@" + manifestDigest},
+		{name: "an index is copied from the index digest", manifest: manifestDigest, index: indexDigest, wantSource: "ghcr.io/org/app@" + indexDigest},
+		{name: "a response with no digest skips the copy and warns", wantWarn: []string{"warning", ref, "no digest", "--no-mirror"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeMirrorer{}
+			prev := pullMirrorer
+			pullMirrorer = f.mirror
+			t.Cleanup(func() { pullMirrorer = prev })
+
+			img := storeImage(ref, tc.manifest, "darwin", "arm64")
+			img.Manifest.IndexDigest = tc.index
+			fake := &fakeImagesDaemon{pullResp: &runtimev1.PullImageResponse{Image: img}}
+			sock := serveFakeImages(t, fake)
+			var warn bytes.Buffer
+			o, err := parseImageArgs([]string{"--socket", sock, "--work-dir", t.TempDir(), "pull", ref}, &warn)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			var out bytes.Buffer
+			if err := imageCommand(ctx, o, &out, dialRuntimed); err != nil {
+				t.Fatalf("image pull = %v, want success", err)
+			}
+			if tc.wantSource == "" {
+				if len(f.calls) != 0 {
+					t.Fatalf("copies = %v, want none", f.calls)
+				}
+				if strings.Contains(out.String(), "mirror:") {
+					t.Errorf("out = %q, want no mirror line", out.String())
+				}
+				for _, w := range tc.wantWarn {
+					if !strings.Contains(warn.String(), w) {
+						t.Errorf("warning has no %q\ngot: %s", w, warn.String())
+					}
+				}
+				return
+			}
+			if want := tc.wantSource + " -> " + wantDest; len(f.calls) != 1 || f.calls[0] != want {
+				t.Fatalf("copies = %v, want exactly [%s]", f.calls, want)
+			}
+			if warn.Len() != 0 {
+				t.Errorf("warn = %q, want nothing", warn.String())
+			}
+		})
 	}
 }

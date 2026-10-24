@@ -497,7 +497,8 @@ func imageCommandWith(ctx context.Context, o imageOptions, out io.Writer, dial i
 	client := runtimev1.NewImagesClient(cc)
 	switch o.subcommand {
 	case "pull":
-		if err := imagePull(ctx, client, o, out); err != nil {
+		img, err := imagePull(ctx, client, o, out)
+		if err != nil {
 			return err
 		}
 		if !o.noMirror {
@@ -505,7 +506,7 @@ func imageCommandWith(ctx context.Context, o imageOptions, out io.Writer, dial i
 			if warn == nil {
 				warn = io.Discard
 			}
-			mirrorPulled(ctx, o, out, warn, pullMirrorer)
+			mirrorPulled(ctx, o, img, out, warn, pullMirrorer)
 		}
 		return nil
 	case "prune":

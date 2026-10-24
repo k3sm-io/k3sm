@@ -39,7 +39,10 @@ import (
 // A successful pull leaves an OPERATOR ROOT over the reference in this node's
 // cache, which is why the image survives `k3sm image prune`. (`k3sm image
 // untag` removes a cluster-registry tag, not this root.)
-func imagePull(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) error {
+//
+// It returns the store entry the daemon resolved, so a caller that acts on the
+// pulled image afterwards names that entry's digest rather than the reference.
+func imagePull(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) (*runtimev1.Image, error) {
 	resp, err := client.PullImage(ctx, &runtimev1.PullImageRequest{
 		Reference: o.source,
 		Platform:  o.platform,
@@ -47,13 +50,13 @@ func imagePull(ctx context.Context, client runtimev1.ImagesClient, o imageOption
 		CacheOnly: o.cacheOnly,
 	})
 	if err != nil {
-		return imageRPCError("pull image", o.socket, err)
+		return nil, imageRPCError("pull image", o.socket, err)
 	}
 	// Two failure channels — the transport status above and a typed in-band
 	// Status here — and both mean nothing was recorded. Checking only the first
 	// would report a refused pull as a success.
 	if st := resp.GetError(); st != nil && st.GetCode() != int32(codes.OK) {
-		return fmt.Errorf("pull image: the daemon refused: %s", st.GetMessage())
+		return nil, fmt.Errorf("pull image: the daemon refused: %s", st.GetMessage())
 	}
 	img := resp.GetImage()
 	if resp.GetAlreadyPresent() {
@@ -62,7 +65,7 @@ func imagePull(ctx context.Context, client runtimev1.ImagesClient, o imageOption
 		fmt.Fprintf(out, "pulled %s\n", o.source)
 	}
 	writeImageFacts(out, img)
-	return nil
+	return img, nil
 }
 
 // writeImageFacts renders the digest and resolved platform of a store entry —
