@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -29,9 +28,14 @@ import (
 // TestLoopbackGateBindsLoopbackOnly pins the loopback gate's one bind:
 // 127.0.0.1 at its own port, never the wildcard, never another address, never
 // the registry's own port, and never without a serving certificate. It also
-// pins that NewRelay still refuses a loopback bind, and that the shipped
-// listener is bound on 127.0.0.1 and nothing else.
+// pins that NewRelay still refuses a loopback bind. The bind goes through the
+// Listen seam onto an in-memory listener, so no socket is opened; the shipped
+// TCP bind is proven by the integration-tagged
+// TestLoopbackGateAnswersOnLoopbackOnly.
 func TestLoopbackGateBindsLoopbackOnly(t *testing.T) {
+	if LoopbackAddress != "127.0.0.1" {
+		t.Errorf("LoopbackAddress = %q, want 127.0.0.1", LoopbackAddress)
+	}
 	if GatePort(6450) != 6451 {
 		t.Errorf("GatePort(6450) = %d, want 6451", GatePort(6450))
 	}
@@ -52,22 +56,24 @@ func TestLoopbackGateBindsLoopbackOnly(t *testing.T) {
 		}
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	ln := newMemListener()
+	t.Cleanup(func() { _ = ln.Close() })
 	var mu sync.Mutex
-	var bound []string
+	var listened, bound []string
 	gate, err := NewLoopbackGate(LoopbackGateConfig{
-		RegistryPort: 6450, Port: port, Serving: testServing(t), Logger: quietLogger(),
+		RegistryPort: 6450, Port: 6451, Serving: testServing(t), Logger: quietLogger(),
+		Listen: func(addr string) (net.Listener, error) {
+			mu.Lock()
+			listened = append(listened, addr)
+			mu.Unlock()
+			return ln, nil
+		},
 		OnListen: func(addr string) { mu.Lock(); bound = append(bound, addr); mu.Unlock() },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "127.0.0.1:" + strconv.Itoa(port)
+	const want = "127.0.0.1:6451"
 	if got := gate.Addresses(); len(got) != 1 || got[0] != want {
 		t.Fatalf("Addresses = %v, want [%s]", got, want)
 	}
@@ -78,36 +84,33 @@ func TestLoopbackGateBindsLoopbackOnly(t *testing.T) {
 	done := make(chan struct{})
 	go func() { gate.Run(ctx); close(done) }()
 	defer func() { cancel(); <-done }()
+	waitBound(t, &mu, &bound)
+	mu.Lock()
+	if len(listened) != 1 || listened[0] != want {
+		t.Errorf("listened on %v, want [%s]", listened, want)
+	}
+	if len(bound) != 1 || bound[0] != want {
+		t.Errorf("bound = %v, want [%s]", bound, want)
+	}
+	mu.Unlock()
+	c, err := ln.dial()
+	if err != nil {
+		t.Fatalf("connect to the gate's listener: %v", err)
+	}
+	c.Close()
+}
+
+// waitBound waits up to five seconds for the first OnListen call.
+func waitBound(t *testing.T, mu *sync.Mutex, bound *[]string) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		mu.Lock()
-		n := len(bound)
+		n := len(*bound)
 		mu.Unlock()
 		if n > 0 || time.Now().After(deadline) {
-			break
+			return
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-	mu.Lock()
-	if len(bound) != 1 || bound[0] != want {
-		t.Fatalf("bound = %v, want [%s]", bound, want)
-	}
-	mu.Unlock()
-	c, err := net.DialTimeout("tcp", want, time.Second)
-	if err != nil {
-		t.Fatalf("dial the gate on loopback: %v", err)
-	}
-	c.Close()
-	// Another address of this Mac reaches nothing on the gate's port.
-	addrs, _ := net.InterfaceAddrs()
-	for _, a := range addrs {
-		ipn, ok := a.(*net.IPNet)
-		if !ok || ipn.IP.IsLoopback() || ipn.IP.To4() == nil || ipn.IP.IsLinkLocalUnicast() {
-			continue
-		}
-		if c, err := net.DialTimeout("tcp", net.JoinHostPort(ipn.IP.String(), strconv.Itoa(port)), 500*time.Millisecond); err == nil {
-			c.Close()
-			t.Errorf("the gate answered on %s, want loopback only", ipn.IP)
-		}
 	}
 }
