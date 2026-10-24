@@ -480,7 +480,11 @@ func jsonKeys(typ reflect.Type) []string {
 		if !typ.Field(i).IsExported() {
 			continue // never encoded
 		}
-		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+		tag := typ.Field(i).Tag.Get("json")
+		if tag == "-" {
+			continue // never encoded (a text-only field)
+		}
+		name, _, _ := strings.Cut(tag, ",")
 		keys = append(keys, name)
 	}
 	sort.Strings(keys)

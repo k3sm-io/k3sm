@@ -111,6 +111,11 @@ func Render(r Report, s Style) string {
 			rows = append(rows, row)
 		}
 	}
+	// The image migration row closes the screen: it is text only, carried
+	// beside Rows rather than in them (see Report.ImageMigration).
+	if r.ImageMigration != nil {
+		rows = append(rows, *r.ImageMigration)
+	}
 	return renderScreen(r, rows, s)
 }
 

@@ -193,25 +193,35 @@ func (c Collector) Collect(ctx context.Context) Report {
 		}
 	}
 
+	// The image migration row stays out of rows, so neither the verdict nor
+	// the JSON encoding sees it (Report.ImageMigration), and only on an
+	// installed Mac, which is the only one with node-store images to copy.
+	var imageMigration *Row
+	if installed {
+		if r, ok := c.imageMigrationRow(); ok {
+			imageMigration = &r
+		}
+	}
 	verdict, summary, next := Aggregate(rows, installed, role)
 	stopped := c.stoppedBy()
 	attachAlerts(rows, alertContext{now: now(), role: role, stopped: stopped})
 	return Report{
-		SchemaVersion: SchemaVersion,
-		Capabilities:  Capabilities(),
-		Verdict:       verdict,
-		Role:          role,
-		Summary:       summary,
-		Rows:          rows,
-		Next:          next,
-		Interconnect:  icBlock,
-		StoppedBy:     stopped,
-		Network:       network,
-		Workers:       c.workers(role, nodesRead, nodes, nodesErr),
-		JoinTarget:    c.joinTarget(role),
-		Version:       c.Version,
-		Host:          c.Host,
-		Timestamp:     now(),
+		SchemaVersion:  SchemaVersion,
+		Capabilities:   Capabilities(),
+		Verdict:        verdict,
+		Role:           role,
+		Summary:        summary,
+		Rows:           rows,
+		Next:           next,
+		Interconnect:   icBlock,
+		StoppedBy:      stopped,
+		Network:        network,
+		Workers:        c.workers(role, nodesRead, nodes, nodesErr),
+		JoinTarget:     c.joinTarget(role),
+		ImageMigration: imageMigration,
+		Version:        c.Version,
+		Host:           c.Host,
+		Timestamp:      now(),
 	}
 }
 

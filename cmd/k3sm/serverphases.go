@@ -307,6 +307,10 @@ func startServerRegistry(ctx context.Context, plan serverPlan, restCfg *rest.Con
 		gateAuth:     serverRegistryGateAuth(ctx, opts, restCfg, logger),
 		logger:       logger,
 	})
+	// 3d'. The one-time copy of this node's user images into the registry,
+	// a no-op once its journal is complete. It stops before the registry does.
+	stopRegistry, stopMigration := stop, startImageMigration(ctx, opts, logger)
+	stop = func() { stopMigration(); stopRegistry() }
 	// The early run, on the control-plane stop's lane, and runServer's deferred
 	// backstop share one stage: whichever comes first runs the teardown, and the
 	// other waits for it within its bound.

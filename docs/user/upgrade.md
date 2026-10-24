@@ -377,6 +377,53 @@ datastore ports would have a policy that names one of them, and a Service on ano
 would be admitted by the API and still unreachable from the pods on that server's node. That case
 needs more than one server (see [HA](ha.md)).
 
+## Upgrading Into the One Image Store
+
+From this release the cluster registry is the one place images are stored. `k3sm build`,
+`k3sm image load` and `k3sm image import` record there, and each node's own image store is a pull
+cache. Images you built or loaded under an earlier release are still in that node's store, so the
+upgrade copies them into the registry once.
+
+The server does this by itself on its first start after the upgrade, in the background, as soon as
+its registry is up. It writes to its own registry with the server's own push credential. A worker
+never copies anything on its own: run the copy there by hand, on that worker. Run it by hand on the
+server too to retry:
+
+```sh
+sudo k3sm image migrate            # copy, then print the report
+sudo k3sm image migrate --report   # print the last report without running
+sudo k3sm image migrate -o json    # the report as JSON
+```
+
+`sudo` is needed because the copy reads the node's image store through the runtime's socket, which
+only root and the k3sm service user can open, as for `k3sm image prune`. A copy you run pushes the
+way `k3sm build --push` does: through the push gate, with a builder token minted from your
+kubeconfig, to the server's loopback gate on the server and to the server's cluster address on a
+worker. So on a worker you need the kubeconfig described in
+[Registry: on a worker](registry.md#on-a-worker). Progress is journalled on the node the copy ran on,
+and `k3sm status` shows it on that node without `sudo`.
+
+What it does with each image in the node store:
+
+- **migrated**: pushed to the registry as `registry-k3sm:6450/<repository>:<tag>`. An image you
+  built as `app:dev` lands at `registry-k3sm:6450/app:dev`; a reference that names another registry
+  keeps its repository path (`ghcr.io/org/tool:1.0` lands at `registry-k3sm:6450/org/tool:1.0`).
+- **present**: the registry already held that digest at that tag, so nothing was pushed.
+- **renamed**: the registry already held the tag at a different digest, for example from a build
+  since the upgrade. The registry's image keeps the tag and this node's older image is pushed as
+  `<tag>-k3sm-migrated-<first 12 hex of its digest>`. The report names both.
+- **cache entries left**: the registry the reference names still serves that exact digest (a public
+  image a Pod pulled), so it stays a cache entry and is not copied. A registry that cannot be
+  reached counts as not serving it, and the image is copied.
+- **held (unexportable)**: the node store could not export it. It stays in the node store and keeps
+  running Pods there until you load it again.
+
+The migration never deletes anything from a node store and never changes its records, so rolling
+back to the previous release finds every image where it was. It is resumable: progress is journalled
+under the work dir (`image-migration/journal.json`) after each image, a re-run skips images the
+registry already holds at their digest, and an interrupted run continues where it stopped. A digest-only
+reference (`repo@sha256:...`) has no tag to keep and lands as `<repository>:k3sm-migrated-<12 hex>`.
+
 ## Rollback
 
 Rollback means reverting to the previous binary, plus the daemon restart that comes with it. There is
