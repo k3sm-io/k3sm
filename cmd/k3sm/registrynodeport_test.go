@@ -20,7 +20,9 @@ import (
 	"errors"
 	"flag"
 	"log/slog"
+	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 
@@ -115,6 +117,104 @@ func TestRegistryNodePortFlag(t *testing.T) {
 		}
 		if svc.Spec.Type != corev1.ServiceTypeClusterIP {
 			t.Errorf("type = %q, want the ClusterIP Service", svc.Spec.Type)
+		}
+	})
+}
+
+// TestRegistryNodePortServingSANs pins how the server feeds the NodePort SANs
+// into the serving certificate: with the flag off it reads no Node and the set
+// is exactly the in-cluster one; with it on, the server's own Node and hostname
+// are added, a moved address is a change (the refresh re-mints on it), and a
+// failed Node read keeps the addresses it already names.
+func TestRegistryNodePortServingSANs(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	server := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "k3sm-studio"},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{
+			{Type: corev1.NodeInternalIP, Address: "172.16.5.10"},
+			{Type: corev1.NodeHostName, Address: "k3sm-studio"},
+		}},
+	}
+	ipStrings := func(ips []net.IP) []string {
+		var out []string
+		for _, ip := range ips {
+			out = append(out, ip.String())
+		}
+		return out
+	}
+	newRegistry := func(cs *fake.Clientset, nodePort int) ingestRegistry {
+		return ingestRegistry{
+			nodePort: nodePort, nodeName: "k3sm-studio", meshIP: "100.64.0.1",
+			nodes:    cs.CoreV1().Nodes(),
+			hostname: func() (string, error) { return "Studio.local", nil },
+			logger:   logger,
+		}
+	}
+
+	t.Run("flag off: no Node read, the in-cluster set exactly", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(server)
+		r := newRegistry(cs, 0)
+		sans := &servingSANs{clusterIP: "10.43.0.20", ext: r.nodePortSANs(t.Context(), registrysvc.NodePortSANs{})}
+		for _, a := range cs.Actions() {
+			if a.GetResource().Resource == "nodes" {
+				t.Errorf("the flag-off server read a Node: %v", a)
+			}
+		}
+		dnsNames, ips := r.servingSANSet(sans)
+		if want := registrysvc.FlatServiceDNSNames(""); !slices.Equal(dnsNames, want) {
+			t.Errorf("DNS SANs = %v, want exactly %v", dnsNames, want)
+		}
+		if got, want := ipStrings(ips), []string{"10.43.0.20", "100.64.0.1"}; !slices.Equal(got, want) {
+			t.Errorf("IP SANs = %v, want exactly %v", got, want)
+		}
+	})
+
+	t.Run("flag on: the server's Node and hostname are named", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(server)
+		r := newRegistry(cs, 30650)
+		sans := &servingSANs{clusterIP: "10.43.0.20", ext: r.nodePortSANs(t.Context(), registrysvc.NodePortSANs{})}
+		dnsNames, ips := r.servingSANSet(sans)
+		if want := append(registrysvc.FlatServiceDNSNames(""), "studio.local", "studio"); !slices.Equal(dnsNames, want) {
+			t.Errorf("DNS SANs = %v, want %v", dnsNames, want)
+		}
+		if got, want := ipStrings(ips), []string{"10.43.0.20", "100.64.0.1", "172.16.5.10"}; !slices.Equal(got, want) {
+			t.Errorf("IP SANs = %v, want %v", got, want)
+		}
+
+		// Unchanged: no re-mint.
+		_, prev := sans.snapshot()
+		if sans.setExt(r.nodePortSANs(t.Context(), prev)) {
+			t.Error("an unchanged Node reads as a change")
+		}
+		// The address moved: a change, and the next mint names the new one.
+		moved := server.DeepCopy()
+		moved.Status.Addresses[0].Address = "172.16.5.11"
+		if _, err := cs.CoreV1().Nodes().Update(t.Context(), moved, metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("update the Node: %v", err)
+		}
+		_, prev = sans.snapshot()
+		if !sans.setExt(r.nodePortSANs(t.Context(), prev)) {
+			t.Fatal("a moved InternalIP does not read as a change, so nothing re-mints")
+		}
+		if _, ips := r.servingSANSet(sans); !slices.Contains(ipStrings(ips), "172.16.5.11") || slices.Contains(ipStrings(ips), "172.16.5.10") {
+			t.Errorf("IP SANs after the move = %v, want the new InternalIP only", ipStrings(ips))
+		}
+
+		// A failed read keeps the addresses already named.
+		cs.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("apiserver unavailable")
+		})
+		_, prev = sans.snapshot()
+		if sans.setExt(r.nodePortSANs(t.Context(), prev)) {
+			t.Error("a failed Node read changed the SAN set")
+		}
+	})
+
+	t.Run("flag on, Node not registered yet: the hostname alone", func(t *testing.T) {
+		r := newRegistry(fake.NewSimpleClientset(), 30650)
+		ext := r.nodePortSANs(t.Context(), registrysvc.NodePortSANs{})
+		if len(ext.IPs) != 0 || !slices.Equal(ext.DNS, []string{"studio.local", "studio"}) {
+			t.Errorf("ext = %+v, want the hostname names and no address", ext)
 		}
 	})
 }

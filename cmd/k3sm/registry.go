@@ -23,9 +23,14 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/registrysvc"
@@ -134,6 +139,14 @@ type ingestRegistry struct {
 	// nodeName is this node, the identity its advertisement and the flat
 	// Service's publisher label are written under.
 	nodeName string
+	// nodes reads this server's own Node object, for the InternalIP addresses
+	// the serving certificate names when nodePort is set. It is the retained
+	// admin client the Service is written with, so it needs no new grant. nil
+	// reads no Node.
+	nodes registryNodeGetter
+	// hostname reports the host's name for the serving certificate when
+	// nodePort is set. nil is os.Hostname.
+	hostname func() (string, error)
 	// meshIP is this node's wireguard address, or "" on a single-node server.
 	// Empty publishes no advertisement and relays on no mesh address: there is no
 	// address a peer could dial.
@@ -263,7 +276,7 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registr
 	}
 	r.publishHosting(ctx, clusterHost)
 
-	sans := &servingSANs{clusterIP: clusterIP}
+	sans := &servingSANs{clusterIP: clusterIP, ext: r.nodePortSANs(ctx, registrysvc.NodePortSANs{})}
 	serving := r.servingIdentity(sans, clusterHost)
 
 	// A context of its own for the cluster-facing goroutines, so the teardown
@@ -324,19 +337,87 @@ func (r ingestRegistry) flatRegistry(ctx context.Context) flatRegistryEndpoint {
 	return lookupClusterFlatRegistry(ctx, svcs, slices, r.clusterCAPEM, wait, flatRegistryLookupInterval, r.logger)
 }
 
-// servingSANs holds the one SAN input that can change while the relay serves:
-// the flat Service's ClusterIP, which a refresh may find re-assigned (the
-// Service was deleted and recreated). It is guarded so the mint closure, called
-// from TLS handshakes, reads it safely.
+// servingSANs holds the SAN inputs that can change while the relay serves: the
+// flat Service's ClusterIP, which a refresh may find re-assigned (the Service
+// was deleted and recreated), and, with the NodePort on, the server's own
+// addresses and names (registrysvc.NodePortSANs), which a refresh may find
+// moved. It is guarded so the mint closure, called from TLS handshakes, reads
+// it safely.
 type servingSANs struct {
 	mu        sync.Mutex
 	clusterIP string
+	ext       registrysvc.NodePortSANs
 }
 
 func (s *servingSANs) get() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.clusterIP
+}
+
+// snapshot returns both inputs under one lock, so a mint never pairs one
+// refresh's ClusterIP with another's NodePort names.
+func (s *servingSANs) snapshot() (string, registrysvc.NodePortSANs) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clusterIP, s.ext
+}
+
+// setExt records the NodePort SANs and reports whether they changed.
+func (s *servingSANs) setExt(ext registrysvc.NodePortSANs) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := !s.ext.Equal(ext)
+	s.ext = ext
+	return changed
+}
+
+// registryNodeGetter reads a Node object; the server's CoreV1().Nodes() is one.
+type registryNodeGetter interface {
+	Get(ctx context.Context, name string, opts metav1.GetOptions) (*corev1.Node, error)
+}
+
+// registryNodeReadTimeout bounds one read of the server's own Node.
+const registryNodeReadTimeout = 10 * time.Second
+
+// nodePortSANs is the NodePort SAN set for the serving certificate: zero unless
+// the registry is exposed on a NodePort, and otherwise derived from this
+// server's own Node object and the host's name (registrysvc.NodePortServingSANs).
+//
+// A Node that is not registered yet contributes no address, which is the truth
+// until it is; the next refresh picks it up and re-mints. Any other read
+// failure keeps the addresses of prev, so an apiserver that is briefly not
+// answering never re-mints the certificate without them.
+func (r ingestRegistry) nodePortSANs(ctx context.Context, prev registrysvc.NodePortSANs) registrysvc.NodePortSANs {
+	if r.nodePort == 0 {
+		return registrysvc.NodePortSANs{}
+	}
+	hostnameFn := r.hostname
+	if hostnameFn == nil {
+		hostnameFn = os.Hostname
+	}
+	host, err := hostnameFn()
+	if err != nil {
+		r.logger.Warn("the registry's NodePort certificate names no hostname: the host's name cannot be read", "err", err)
+		host = ""
+	}
+	var node *corev1.Node
+	if r.nodes != nil {
+		readCtx, cancel := context.WithTimeout(ctx, registryNodeReadTimeout)
+		node, err = r.nodes.Get(readCtx, r.nodeName, metav1.GetOptions{})
+		cancel()
+		switch {
+		case err == nil:
+		case apierrors.IsNotFound(err):
+			node = nil
+		default:
+			r.logger.Warn("read this server's Node for the registry's NodePort certificate; keeping the addresses it names", "err", err, "node", r.nodeName)
+			ext := registrysvc.NodePortServingSANs(nil, host)
+			ext.IPs = prev.IPs
+			return ext
+		}
+	}
+	return registrysvc.NodePortServingSANs(node, host)
 }
 
 // set records ip and reports whether it changed.
@@ -378,15 +459,15 @@ func (r ingestRegistry) servingIdentity(sans *servingSANs, clusterHost string) *
 		r.logger.Error("the ingest registry relay is off: no cluster CA to issue its serving certificate, and it never serves plain HTTP")
 		return nil
 	}
-	dnsNames := registrysvc.FlatServiceDNSNames(r.clusterDomain)
 	serving, err := registrysvc.NewServingIdentity(registrysvc.ServingConfig{
 		Mint: func() (tls.Certificate, error) {
-			return r.mintServing(dnsNames, registrysvc.FlatServingIPs(sans.get(), r.meshIP, r.vmNetSubnet))
+			return r.mintServing(r.servingSANSet(sans))
 		},
 		Margin: nodecred.ExpiryMargin,
 		OnMint: func(notAfter time.Time) {
+			dnsNames, ips := r.servingSANSet(sans)
 			r.logger.Info("minted the ingest registry's serving certificate from the cluster CA (in memory, never written to disk)",
-				"dns", dnsNames, "clusterIP", sans.get(), "not_after", notAfter.UTC().Format(time.RFC3339))
+				"dns", dnsNames, "ips", ips, "clusterIP", sans.get(), "not_after", notAfter.UTC().Format(time.RFC3339))
 			r.recordClusterFacing(registrysvc.ClusterFacing{Service: clusterHost, CertNotAfter: notAfter})
 		},
 		Logger: r.logger,
@@ -396,6 +477,14 @@ func (r ingestRegistry) servingIdentity(sans *servingSANs, clusterHost string) *
 		return nil
 	}
 	return serving
+}
+
+// servingSANSet is the SAN set the next serving certificate is minted with: the
+// in-cluster set, plus the NodePort names when the NodePort is on
+// (registrysvc.RelayServingSANs).
+func (r ingestRegistry) servingSANSet(sans *servingSANs) ([]string, []net.IP) {
+	clusterIP, ext := sans.snapshot()
+	return registrysvc.RelayServingSANs(r.clusterDomain, clusterIP, r.meshIP, r.vmNetSubnet, ext)
 }
 
 // recordClusterFacing adds the cluster-facing facts to the state record. A
@@ -539,8 +628,9 @@ func (r ingestRegistry) publishFlat(ctx context.Context, addr netip.Addr) (strin
 // refresh re-publishes the flat Service on the advertisement's cadence and
 // keeps the serving certificate current: it is replaced inside its expiry
 // margin, and at once when a re-publish finds the ClusterIP changed (an IP SAN
-// would otherwise name the old VIP). A re-publish that changes nothing issues
-// no write at all.
+// would otherwise name the old VIP) or, with the NodePort on, when the server's
+// own addresses or names moved. A re-publish that changes nothing issues no
+// write at all.
 func (r ingestRegistry) refresh(ctx context.Context, wg *sync.WaitGroup, published bool, sans *servingSANs, serving *registrysvc.ServingIdentity) {
 	if !published && serving == nil {
 		return
@@ -557,15 +647,26 @@ func (r ingestRegistry) refresh(ctx context.Context, wg *sync.WaitGroup, publish
 				return
 			case <-t.C:
 			}
+			rotate := false
 			if published && addrErr == nil {
 				ip, err := r.publishFlat(ctx, addr)
 				switch {
 				case err != nil:
 					r.logger.Error("refresh the registry Service", "err", err, "name", registrysvc.FlatServiceName)
-				case sans.set(ip) && serving != nil:
-					if err := serving.Rotate(); err != nil {
-						r.logger.Error("re-mint the ingest registry's serving certificate for the Service's new ClusterIP", "err", err, "clusterIP", ip)
-					}
+				case sans.set(ip):
+					rotate = true
+				}
+			}
+			if r.nodePort != 0 {
+				_, prev := sans.snapshot()
+				if sans.setExt(r.nodePortSANs(ctx, prev)) {
+					rotate = true
+				}
+			}
+			if rotate && serving != nil {
+				if err := serving.Rotate(); err != nil {
+					dnsNames, ips := r.servingSANSet(sans)
+					r.logger.Error("re-mint the ingest registry's serving certificate for its changed names", "err", err, "dns", dnsNames, "ips", ips)
 				}
 			}
 			if serving != nil {
