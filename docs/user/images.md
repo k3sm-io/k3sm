@@ -59,8 +59,8 @@ metadata. One with `RUN` builds on the cluster's build engine, which starts on f
 [Building images](builder.md).
 
 ```sh
-k3sm build --tag myapp:v1 .                                  # into this node's image store
-k3sm build --tag myapp:v1 --push .                           # and on to a registry
+k3sm build --tag myapp:v1 .                                  # into the cluster registry
+k3sm build --tag ghcr.io/org/myapp:v1 --push .               # and on to a registry you name
 k3sm build --tag myapp:v1 --output myapp.tar .               # and into a file to carry
 docker load -i myapp.tar          # the tarball is a standard docker-save archive
 k3sm build --tag myapp:v1 --output ./layout --format oci .   # or an OCI layout directory
@@ -100,10 +100,10 @@ Several targets at once build an index:
 k3sm build --tag myapp:v1 --platform linux/arm64,linux/amd64 --format oci --output ./layout .
 ```
 
-`--output` (as `oci`) and `--push` carry every platform. This node's image store holds one image per
-name, so it records the `linux/arm64` one, the platform this node's own guests run, and the build
-summary says which it took. A multi-platform build with no `linux/arm64` in it is refused rather
-than recorded under a name that would not start. `--format docker` is refused for one too, because a
+The cluster registry, `--output` (as `oci`) and `--push` carry every platform. This node's cache
+holds the `linux/arm64` one, the platform this node's own guests run, and the build summary says
+so. A multi-platform build with no `linux/arm64` in it is refused rather than recorded under a name
+that would not start here. `--format docker` is refused for one too, because a
 `docker save` tarball holds a single image.
 
 The engine's guest is `arm64` and registers no emulator, so a `RUN` step for another architecture is
@@ -113,20 +113,27 @@ refused by name before the engine starts. To get a `linux/amd64` build here, com
 Such an image is one you build **for other clusters**. k3sm nodes run no `amd64` payload today, on
 either path; see [What runs](what-runs.md).
 
-> **A built image is in this node's store when the build finishes.** `k3sm build` records it under
-> the tag you gave, so an `image: myapp:v1` Pod spec resolves with no further step. `--output` also
-> writes a portable artifact to a path you name, which is what you want for moving the image to
-> another node or a registry, and it is equally usable with other tools.
+> **A built image is in the cluster registry when the build finishes.** `k3sm build` records it as
+> `registry-k3sm:6450/<repository>:<tag>`, so `--tag myapp:v1` becomes
+> `registry-k3sm:6450/myapp:v1`, and a Pod on any node can name it with no further step. The build
+> then pulls it into this node's cache through the runtime's ordinary pull, so a Pod here with
+> `imagePullPolicy: Never` finds it too. A tag that names another registry is recorded under the same
+> registry name, keeping its repository path. `--output` also writes a portable artifact to a path
+> you name, and it is equally usable with other tools.
 
-`--no-record` builds without the store. The build writes `--output`, uploads with `--push`, or
-both, and never contacts the node's runtime daemon or its image store, so it needs no root. It is
-refused without `--output` or `--push`. To run the image on the build Mac afterwards, record it as
-a separate step, as root: `sudo k3sm image load myapp.tar` for a docker-save tar, or tar an OCI
-layout and `sudo k3sm image import` the tar (see "Loading an Image Into the Store" below).
+The recording uploads to this server's registry with its push credential, so it needs the
+registry running (see [The cluster registry](registry.md)). A node without one fails the build and
+names both ways forward.
+
+`--no-record` builds without recording. The build writes `--output`, uploads with `--push`, or
+both, and never contacts the node's runtime daemon or the cluster registry for the recording, so it
+needs no root. It is refused without `--output` or `--push`. To record the image afterwards, run a
+separate step as root: `sudo k3sm image load myapp.tar` for a docker-save tar, or tar an OCI layout
+and `sudo k3sm image import` the tar (see "Loading an Image Into the Registry" below).
 
 ```sh
 k3sm build --tag myapp:v1 --no-record --output myapp.tar .   # a file only, as your own user
-sudo k3sm image load myapp.tar                               # into the store, when you want it
+sudo k3sm image load myapp.tar                               # into the registry, when you want it
 ```
 
 ### Build History: `k3sm build ls`
@@ -178,20 +185,20 @@ Each of these is a documented difference:
 
 | | k3sm build |
 |---|---|
-| `RUN` | **Supported, on the cluster.** The native packager copies files; it does not execute them, so a `RUN`-containing Dockerfile builds on the in-cluster engine, which `k3sm build` starts on first use. The image lands in the store under its tag either way; see [Building images](builder.md). |
+| `RUN` | **Supported, on the cluster.** The native packager copies files; it does not execute them, so a `RUN`-containing Dockerfile builds on the in-cluster engine, which `k3sm build` starts on first use. The image is recorded in the cluster registry either way; see [Building images](builder.md). |
 | `FROM <ref>` | **Supported**, with two caveats. The base is fetched for `darwin/arm64` using the same credential chain as `k3sm image push`, and is **refused if it declares any other platform**, because a `darwin/arm64` image built on a `linux/amd64` base is a self-consistent lie whose payload cannot execute. And a **tag**-pinned base is not reproducible: the tag can move, so the build says so and prints the base it used. Pin a digest if you want the guarantee. In practice bases are ones your own organisation published; see [What runs](what-runs.md) on why there is no public supply of `darwin` images. |
 | `ADD` | An exact alias of `COPY`. It does **not** fetch remote URLs and does **not** auto-extract archives; both are refused rather than silently downgraded. |
 | `.dockerignore` | **Not implemented.** `COPY .` therefore includes `.git`, `.env` and anything else in the directory, so scope your `COPY` lines, or build from a clean tree. |
 | `--platform` | Accepts `darwin/arm64` (the default, packaged natively) and Linux targets, which build on the engine; name several at once for a multi-platform index. Neither builder cross-compiles: a `darwin/arm64` image is refused any other value on the native path, and a `RUN` step for an architecture the engine's `arm64` guest cannot execute is refused by name. |
 | Variables (`$VAR`), `ARG` | **Rejected.** No expansion is performed, and a literal `$` in a path would be an invisible divergence. |
-| Build output | Recorded in this node's image store under the tag you gave. `--output` additionally writes a portable artifact (a docker-save tar, or an OCI layout with `--format oci`) to a path you name. `--push` additionally uploads it. The store recording happens in every case, including with `--push`, because what a k3sm build produces is an image this node can run, unless you pass `--no-record`, which skips the store, needs no root, and requires `--output` or `--push`. |
+| Build output | Recorded in the cluster registry as `registry-k3sm:6450/<repository>:<tag>`, then pulled into this node's cache. `--output` additionally writes a portable artifact (a docker-save tar, or an OCI layout with `--format oci`) to a path you name. `--push` additionally uploads it to a registry the tag names. The recording happens in every case, including with `--push`, unless you pass `--no-record`, which skips it, needs no root, and requires `--output` or `--push`. |
 | Timestamps | Fixed, not wall-clock, so rebuilding the same context yields the same image digest. |
 | File modes | Normalized to `0755` (if any execute bit is set) or `0644`. A `0600` source becomes world-readable in the image, and setuid/setgid/sticky bits are dropped. Preserving source modes would break reproducibility, since git records only the execute bit. |
 | Ownership & xattrs | Every entry is `uid 0 / gid 0` with no user or group name, and no extended attributes, so the builder's account identity and macOS xattrs (including `com.apple.quarantine`) never reach the image. |
 | Special files | Devices, FIFOs and sockets in the context are **refused**, not skipped. Symlinks are preserved as symlinks, but one whose target would escape the image root is refused. |
 | `WORKDIR` | Sets the config's working directory but does **not** create it in the image. On `FROM scratch` there is no base filesystem to supply it, so add a `COPY` if the directory must exist. |
 
-## Loading an Image Into the Store: `k3sm image load` / `k3sm image import`
+## Loading an Image Into the Registry: `k3sm image load` / `k3sm image import`
 
 `k3sm image load` ingests a `docker save` tarball. `k3sm image import` ingests a **tarred** OCI
 image layout, which is what `docker buildx -o type=oci` writes and what `k3sm build --format oci`
@@ -208,35 +215,30 @@ k3sm build --tag myapp:v1 --output ./layout --format oci .
 tar -cf layout.tar -C ./layout .
 k3sm image import layout.tar
 
-k3sm image ls                       # what this node has recorded
+k3sm image ls                       # what this node's cache holds
 ```
 
-The CLI opens your archive and streams it to the node's runtime daemon. The daemon is the store's
-only writer, so nothing reaches the store from the command itself; it re-hashes every byte against
-the digest it is told to expect and records the reference only after that check passes.
+Both verbs record the archive's image in the cluster registry, the cluster's one image store, as
+`registry-k3sm:6450/<repository>:<tag>`: `myapp:v1` becomes `registry-k3sm:6450/myapp:v1`. A load
+overwrites whatever that tag named before. The CLI reads your archive as you and uploads it with this
+server's push credential, through the same path as `k3sm image push`; `--work-dir` names the
+control plane's state directory when it is not the one your user resolves. A tarred layout whose one
+entry is a multi-platform index is recorded as that whole index.
 
-Loaded content is runnable. Once the load succeeds and `k3sm image ls` shows the reference, a Pod
-naming that reference runs on the default runtime. The node materializes the stored layers into the
-pod's filesystem, so a command that lives inside the image is there to execute. Loading is
-therefore both a way to stage content (an airgapped node, a pre-seeded cache) and a way to ship a
-workload to a node without a registry.
-
-One ordinary Kubernetes rule still applies. What a Pod does with a reference is decided by its
-`imagePullPolicy`. `IfNotPresent` and `Never` serve the loaded reference with no registry traffic.
-`Always`, which is what the apiserver defaults a `:latest` tag to, goes to a registry regardless of
-what this node already holds. Tag the images you load with something other than `latest`, or set
-the policy explicitly.
+The verb then pulls the image into this node's cache through the runtime's ordinary pull, which
+re-hashes every blob against its digest before it records anything. A Pod on any node can name the
+registry reference, and a Pod on this node with `imagePullPolicy: Never` finds it in the cache.
 
 ### Deliberate Differences From `docker load`
 
 | | `k3sm image load` / `import` |
 |---|---|
-| Multiple tags on one image | **Rejected.** The store records one reference per loaded image, so a `docker save` of an image tagged twice is refused with both tags named rather than silently keeping one. Re-save with a single tag, or load it once per tag. |
+| Multiple tags on one image | **Rejected.** A load records one reference per image, so a `docker save` of an image tagged twice is refused with both tags named rather than silently keeping one. Re-save with a single tag, or load it once per tag. |
 | Multiple images in one archive | **Rejected**, for the same reason. One archive holds one image. |
 | Naming the image | Taken from the archive: `RepoTags` for docker-save, the `org.opencontainers.image.ref.name` annotation for an OCI layout. `--reference` overrides it, and is **required** for a layout that carries no annotation. |
 | Format detection | None. The verb is the declaration. A layout handed to `load` (or a docker-save tar handed to `import`) is refused with an error naming the other verb, never sniffed. |
-| Signatures & provenance | Loaded images carry no provenance. This path evaluates no signature policy, because it is an operator-only surface, and what it stores is exactly what you handed it. |
-| Requires a running daemon | Yes. The store is written by the node's runtime daemon over its local socket, so `load` works on an installed, running node and not on a bare directory. Its socket is readable only by the daemon's own account. |
+| Signatures & provenance | Loaded images carry no provenance. This path evaluates no signature policy, because it is an operator-only surface, and what it records is exactly what you handed it. |
+| Requires a running node | Yes. The upload needs this server's registry and its push credential, and the cache pull goes through the node's runtime daemon over its local socket, which is readable only by the daemon's own account. |
 | Deadline | `--timeout` defaults to 30m for these two verbs (they stream a whole archive) and 2m for the metadata verbs. |
 
 ### The Daemon Socket

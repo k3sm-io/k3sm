@@ -6,8 +6,8 @@
 k3sm build -t myapp:dev .
 ```
 
-The image lands in this node's image store under that tag, ready for a Pod to
-name it.
+The image is recorded in the cluster registry as `registry-k3sm:6450/myapp:dev`,
+ready for a Pod on any node to name it, and pulled into this node's cache.
 
 ## What happens under the hood
 
@@ -44,9 +44,9 @@ Several targets at once build an index:
 k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci --output out .
 ```
 
-`--output` (as `oci`) and `--push` carry every platform. This node's image store
-holds one image per name, so it records the `linux/arm64` one, which is what the
-node's own guests run, and the summary says so.
+The cluster registry, `--output` (as `oci`) and `--push` carry every platform.
+This node's cache holds the `linux/arm64` one, which is what the node's own
+guests run, and the summary says so.
 
 The engine's guest is `arm64` and registers no emulator, so `RUN` steps for
 another architecture are refused by name before the engine starts. Copy a
@@ -64,24 +64,26 @@ payload today, on either path. See [What runs](what-runs.md).
 
 ## Getting the image out
 
-The image is in this node's store when the build finishes, which is everything a
-Pod on this node needs. `--push` sends it on to a registry in the same command:
+The image is in the cluster registry when the build finishes, under
+`registry-k3sm:6450/<repository>:<tag>`, which is everything a Pod on any node
+needs. The build uploads it to this server's registry with its push credential,
+then pulls it into this node's cache, so `imagePullPolicy: Never` works on this
+node too. A bare tag, a `registry-k3sm:6450` tag and a
+`localhost:<registry-port>` tag all name that registry. A tag that names another
+registry keeps its repository path and is recorded there as well. With no
+registry running ([The cluster registry](registry.md)), the build is an error
+naming both ways forward.
+
+`--push` sends the image on to the registry a tag names, in the same command:
 
 ```sh
-k3sm build -t myapp:v1 --push .               # this node's own registry
 k3sm build -t ghcr.io/org/myapp:v1 --push .   # a registry you name
 ```
 
-A tag that names a registry goes to that registry. A bare tag goes to this node's
-registry on `localhost:<registry-port>`, the same place a bare `image: myapp:v1`
-in a Pod spec resolves from, and the store keeps your original bare name either
-way. The node's registry is started with `--registry-port`
-([Node-local registry](registry.md)); with none running, a bare tag and `--push`
-is an error naming both ways forward.
-
-The store recording happens first. When the upload then fails, whether from a
+A tag that already names the cluster registry is not uploaded twice. The
+recording happens first. When the extra upload then fails, whether from a
 refused credential or an unreachable host, the build exits non-zero and says the
-image is in the store, so what you retry is the push.
+image is in the cluster registry, so what you retry is the push.
 
 The two-step form is still there, and is what you want for an image you built
 earlier or received as a layout:
@@ -91,13 +93,13 @@ k3sm build -t myapp:v1 --output ./layout --format oci .
 k3sm image push ./layout localhost:6450/myapp:v1
 ```
 
-### Building without the store: `--no-record`
+### Building without recording: `--no-record`
 
-Recording into the store goes through the node's runtime daemon, whose socket
-only the daemon's own account can use, so an ordinary user's build fails at
-that step. `--no-record` skips it. The build writes `--output`, uploads with
-`--push`, or both, and never contacts the daemon or this node's image store, so
-it needs no root:
+The cache pull after the recording goes through the node's runtime daemon, whose
+socket only the daemon's own account can use, so an ordinary user's build fails
+at that step. `--no-record` skips the recording. The build writes `--output`,
+uploads with `--push`, or both, and never contacts the daemon, so it needs no
+root:
 
 ```sh
 k3sm build -t myapp:v1 --no-record --output myapp.tar .
@@ -107,8 +109,8 @@ k3sm build -t ghcr.io/org/myapp:v1 --no-record --push .
 
 A build with `--no-record` and neither `--output` nor `--push` is refused before
 it starts, because the image would have nowhere to go. The summary says the
-image was not recorded and prints the command that records it. Running the
-image on the build Mac is then a separate step, as root:
+image was not recorded and prints the command that records it. Recording the
+image is then a separate step, as root:
 
 ```sh
 sudo k3sm image load myapp.tar                 # a docker-save tar
@@ -237,15 +239,16 @@ buildx build --builder k3sm -o type=oci,dest=out.oci .
 ```
 
 Either way, hand the exported OCI layout to `k3sm image` rather than using
-`buildx --push`, because k3sm's image tooling speaks to the node's own registry
-credential and store:
+`buildx --push`, because k3sm's image tooling speaks to the cluster registry with
+this node's own push credential:
 
 ```sh
 k3sm image push out.oci localhost:<registry-port>/myapp:v1
 ```
 
 A build you drive through `k3sm build` needs neither step. `--push` uploads it
-through that same credential, and the store recording is already done.
+through that same credential, and the recording in the cluster registry is
+already done.
 
 ## Limitations
 

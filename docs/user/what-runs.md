@@ -117,7 +117,8 @@ ENV LOG_LEVEL=info
 ENTRYPOINT ["/usr/local/bin/myapp"]
 DOCKERFILE
 
-# 2. build it — the image is in this node's store when this returns
+# 2. build it: the image is registry-k3sm:6450/myapp:v1 in the cluster
+#    registry, and in this node's cache, when this returns
 k3sm build --tag myapp:v1 .
 
 # 3. run it — a manifest, not `kubectl run`, which cannot set the
@@ -137,7 +138,7 @@ spec:
   restartPolicy: Never
   containers:
     - name: myapp
-      image: myapp:v1
+      image: registry-k3sm:6450/myapp:v1
 EOF
 
 kubectl logs myapp
@@ -147,12 +148,11 @@ A Pod's output is written to `/var/log/pods/<namespace>_<pod>_<uid>/<container>/
 in the CRI format, rotated, and served from there. [Container logs](logs.md) covers the layout, the
 `kubectl logs` options, `--previous`, and how to ship logs off a node.
 
-To move the image off that node, pick a sink. They compose, and the store recording happens in
-every case:
+Every node in the cluster pulls the image from the cluster registry. To move it outside the
+cluster, pick a sink. They compose, and the recording in the cluster registry happens in every case:
 
 ```sh
 k3sm build --tag registry.example.com/me/myapp:v1 --push .   # to a registry you name
-k3sm build --tag myapp:v1 --push .                           # to this node's own registry
 k3sm build --tag myapp:v1 --output myapp.tar .               # to a file, for `k3sm image load`
 ```
 
@@ -168,11 +168,10 @@ cluster involved; one with `RUN` builds on the cluster's build engine, which sta
 is fetched for `darwin/arm64` and refused if it declares any other platform. Every deliberate
 difference from `docker build` is in [Images](images.md).
 
-Pushing a bare tag needs the node's own registry running, and it is off unless you pass
-`--registry-port` (or use `k3sm dev`, which turns it on for you). It is worth the extra step when
-you want the *actual* pull path. A Pod referencing `localhost:<port>/…` honors
-`imagePullPolicy: Always`, notices a moved tag, and fails the way a remote registry would, none of
-which `k3sm image load` can reproduce. See [Node-local registry](registry.md).
+Recording needs the server's registry running, which it is by default (`--registry-port 0` turns it
+off). Because every build and load goes through it, a Pod referencing `registry-k3sm:6450/…` gets the
+actual pull path: it honors `imagePullPolicy: Always`, notices a moved tag, and fails the way a
+remote registry would. See [The cluster registry](registry.md).
 
 ## What Carries Over From Your Container and Kubernetes Workflow
 
