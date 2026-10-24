@@ -190,3 +190,67 @@ func TestAgentFlatRegistryUsesServerRegistryPort(t *testing.T) {
 		}
 	})
 }
+
+// TestJoinedServerFlatRegistryPointsAtClusterRegistry pins a joined server's
+// mapping: a server that joined an existing control plane fetches the flat name
+// from the bootstrap server's relay, at the address and port its EndpointSlice
+// names, over TLS against the cluster CA, never from its own loopback registry,
+// which would split the cluster's one image store. Its own registry stays its
+// bare-name local registry, and runtimed accepts the pair.
+func TestJoinedServerFlatRegistryPointsAtClusterRegistry(t *testing.T) {
+	const bootstrapPort = 7000
+	ca := testClusterCAPEM(t)
+	logger := slog.New(slog.DiscardHandler)
+	ns := registrysvc.FlatServiceNamespace
+	start := func(cs *fake.Clientset, ca []byte) (func(), registryPullerWiring) {
+		return startIngestRegistry(t.Context(), ingestRegistry{
+			svc: &fakeRegistry{addr: "127.0.0.1:6450"}, port: 6450, nodeName: "mac-b", meshIP: "100.64.2.1",
+			joined: true, clusterCAPEM: ca, flatLookupWait: 5 * time.Millisecond,
+			hostingCMs:    cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+			advertCMs:     cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			clusterSvcs:   cs.CoreV1().Services(ns),
+			clusterSlices: cs.DiscoveryV1().EndpointSlices(ns),
+			logger:        logger,
+		})
+	}
+
+	stop, puller := start(publishedFlatRegistry(t, bootstrapPort, "100.64.0.1"), ca)
+	defer stop()
+	if want := "100.64.0.1:" + strconv.Itoa(bootstrapPort); puller.Flat.Addr != want {
+		t.Errorf("Flat.Addr = %q, want the bootstrap server's relay %q, not this server's loopback", puller.Flat.Addr, want)
+	}
+	if !puller.Flat.TLS || string(puller.Flat.CAPEM) != string(ca) {
+		t.Errorf("Flat = TLS %v CA %d bytes, want TLS against the cluster CA", puller.Flat.TLS, len(puller.Flat.CAPEM))
+	}
+	if puller.LocalHost != registrysvc.LoopbackAuthority(6450) {
+		t.Errorf("LocalHost = %q, want this server's own registry %q", puller.LocalHost, registrysvc.LoopbackAuthority(6450))
+	}
+	cache, err := image.NewCache(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	if _, err := image.NewPuller(cache, image.RemoteFetch, image.NoLocalIndex{},
+		image.WithLocalRegistry(puller.LocalHost), image.WithFlatRegistry(puller.Flat.mapping())); err != nil {
+		t.Fatalf("runtimed refuses the joined server's wiring: %v", err)
+	}
+
+	t.Run("no cluster registry Service maps nothing, not this server's loopback", func(t *testing.T) {
+		stop, puller := start(fake.NewSimpleClientset(), ca)
+		defer stop()
+		if puller.Flat.Addr != "" {
+			t.Errorf("Flat = %+v, want the zero endpoint", puller.Flat)
+		}
+	})
+	t.Run("no cluster CA maps nothing", func(t *testing.T) {
+		stop, puller := start(publishedFlatRegistry(t, bootstrapPort, "100.64.0.1"), nil)
+		defer stop()
+		if puller.Flat.Addr != "" {
+			t.Errorf("Flat = %+v, want the zero endpoint", puller.Flat)
+		}
+	})
+	t.Run("the bootstrap server still maps its own loopback", func(t *testing.T) {
+		if got, want := (ingestRegistry{port: 6450}).flatRegistry(t.Context()), serverFlatRegistry(6450); got.Addr != want.Addr || got.TLS {
+			t.Errorf("bootstrap Flat = %+v, want %+v", got, want)
+		}
+	})
+}

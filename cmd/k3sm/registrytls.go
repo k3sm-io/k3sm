@@ -62,6 +62,22 @@ func serverRegistryServingMinter(opts serverOptions, logger *slog.Logger) func(d
 	}
 }
 
+// joinedServerClusterCAPEM is the cluster CA a server that joined an existing
+// control plane verifies the cluster's one registry against, or nil on the
+// bootstrap server, which never dials it. A hierarchy that cannot be loaded is
+// logged and maps the flat name nowhere rather than to this server's own store.
+func joinedServerClusterCAPEM(opts serverOptions, logger *slog.Logger) []byte {
+	if !opts.serverJoin {
+		return nil
+	}
+	h, err := certs.EnsureHierarchy(opts.workDir, opts.role(), opts.posture())
+	if err != nil || h == nil || h.Cluster == nil || len(h.Cluster.CertPEM) == 0 {
+		logger.Error("the flat registry name maps nothing on this server: the cluster CA cannot be loaded", "err", err)
+		return nil
+	}
+	return h.Cluster.CertPEM
+}
+
 // retractOptedOutRegistryService removes the flat registry Service a previous
 // boot published, on a bootstrap server started with --registry-port 0. A
 // joined server never published it and leaves it alone. Best effort: a failure
