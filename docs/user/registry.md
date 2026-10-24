@@ -122,6 +122,13 @@ every server start.
 Pulls are anonymous. The node's runtime pulls with no credential at all, which is what lets a Pod
 reference an image here with nothing configured.
 
+The registry also holds copies of public images. `k3sm image pull docker.io/library/nginx:1`
+copies the image to `registry-k3sm:6450/docker.io/library/nginx:1`, and a node whose pull of the
+public name cannot reach that registry at all (a DNS failure, a refused connection, a timeout)
+pulls the copy instead. An answer from the public registry, such as a 404 or a certificate the
+node does not trust, is never replaced by the copy. See
+[Naming and Reading Images](images.md#naming-and-reading-images-tag-untag-inspect-save-pull).
+
 Pushes are authenticated. Together those two are the whole access model. Anyone who can reach the
 registry can read the images this cluster runs, and only a user holding a builder token (see
 [Pushing With Other Tools](#pushing-with-other-tools)), or a Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),

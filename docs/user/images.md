@@ -316,6 +316,15 @@ pulled the image keeps its cached copy, so a running Pod is unharmed.
 A pulled image survives a prune of this node's cache: `pull` records the reference as content the
 node is meant to keep, so a warmed-but-unused image is not reclaimed behind your back.
 
+`pull` of a public image also copies it, the whole index when there is one, into the cluster
+registry as `registry-k3sm:6450/<registry>/<repository>:<tag>` (Docker Hub is spelled
+`docker.io`). A node uses that copy only when the public registry cannot be reached at all: a
+DNS failure, a refused connection or a timeout. Any answer from the public registry, including
+a 404 or a certificate it cannot verify, stands. The copy uploads as you through your kubeconfig,
+the same way `push` does, and a copy that fails prints a warning naming the cause and does not
+fail the pull. A cluster-registry reference, or a registry with a port, gets no copy, and
+`--no-mirror` skips it.
+
 ## Reclaiming Space: `k3sm image prune`
 
 `k3sm image prune` reclaims space in two places: the cluster registry, and this node's cache.
