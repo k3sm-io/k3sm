@@ -60,18 +60,23 @@ func (s NodePortSANs) Equal(o NodePortSANs) bool {
 // names are the hostname and, when the hostname or a Hostname address on the
 // Node is a .local name, both that .local name and its bare label. A name that
 // is not a valid RFC 1123 subdomain once lowercased is left out rather than put
-// in a certificate.
+// in a certificate, and so is a name in the cluster's own namespace
+// (clusterReservedName): a host called "kubernetes" must not put the
+// apiserver's name into a certificate the registry serves.
 func NodePortServingSANs(node *corev1.Node, hostname string) NodePortSANs {
 	var out NodePortSANs
 	addName := func(n string) {
 		n = strings.ToLower(strings.TrimRight(strings.TrimSpace(n), "."))
-		if n == "" || len(validation.IsDNS1123Subdomain(n)) != 0 || slices.Contains(out.DNS, n) {
+		if n == "" || len(validation.IsDNS1123Subdomain(n)) != 0 || clusterReservedName(n) || slices.Contains(out.DNS, n) {
 			return
 		}
 		out.DNS = append(out.DNS, n)
 	}
 	addLocal := func(n string) {
 		n = strings.ToLower(strings.TrimRight(strings.TrimSpace(n), "."))
+		if clusterReservedName(n) {
+			return // nor its bare label: "box.cluster.local" must not become "box.cluster"
+		}
 		if bare, ok := strings.CutSuffix(n, ".local"); ok && bare != "" {
 			addName(bare)
 			addName(n)
@@ -101,6 +106,18 @@ func NodePortServingSANs(node *corev1.Node, hostname string) NodePortSANs {
 		}
 	}
 	return out
+}
+
+// clusterReservedName reports whether a lowercased host-derived name falls in
+// the names the cluster itself answers to: the apiserver's "kubernetes" and its
+// "kubernetes.*" spellings, and anything under a ".svc" or ".cluster.local"
+// suffix, which in-cluster DNS resolves to a Service. The NodePort SANs come
+// from the host's name and the Node object, neither of which the cluster
+// vouches for, so a name a pod would resolve to a different Service is never
+// put in the registry's certificate.
+func clusterReservedName(n string) bool {
+	return n == "kubernetes" || strings.HasPrefix(n, "kubernetes.") ||
+		strings.HasSuffix(n, ".svc") || strings.HasSuffix(n, ".cluster.local")
 }
 
 // RelayServingSANs is the one composition of the relay's serving certificate

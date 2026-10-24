@@ -130,6 +130,42 @@ func TestNodePortServingSANs(t *testing.T) {
 	})
 }
 
+// TestNodePortServingSANsRefuseClusterNames pins the denylist: a hostname or a
+// Node Hostname address that is a name the cluster itself answers to never
+// becomes a SAN, and a name that merely contains one of those words still does.
+func TestNodePortServingSANsRefuseClusterNames(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		host    string
+		nodeHN  string
+		wantDNS []string
+	}{
+		{name: "kubernetes", host: "kubernetes"},
+		{name: "kubernetes, any case, trailing dot", host: "Kubernetes."},
+		{name: "kubernetes.default", host: "kubernetes.default"},
+		{name: "kubernetes.default.svc", host: "kubernetes.default.svc"},
+		{name: "kubernetes.local, and not its bare label", host: "kubernetes.local"},
+		{name: "a .svc name", host: "registry-k3sm.k3sm-registry.svc"},
+		{name: "a .cluster.local name, and not its bare label", host: "web.default.svc.cluster.local"},
+		{name: "a bare .cluster.local name", host: "box.cluster.local"},
+		{name: "a reserved .local Node Hostname", host: "build-host", nodeHN: "kubernetes.local", wantDNS: []string{"build-host"}},
+		{name: "a name that only contains the words", host: "kubernetes-builder", wantDNS: []string{"kubernetes-builder"}},
+		{name: "svc as a label, not a suffix", host: "svc.example", wantDNS: []string{"svc.example"}},
+		{name: "cluster.local without a leading label", host: "cluster.local", wantDNS: []string{"cluster.local", "cluster"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var node *corev1.Node
+			if tc.nodeHN != "" {
+				node = &corev1.Node{Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeHostName, Address: tc.nodeHN}}}}
+			}
+			got := NodePortServingSANs(node, tc.host)
+			if !slices.Equal(got.DNS, tc.wantDNS) {
+				t.Errorf("DNS = %v, want %v", got.DNS, tc.wantDNS)
+			}
+		})
+	}
+}
+
 // TestRelayVerifiesAtTheNodePortAddress dials the shipped relay the way a tool
 // on another Mac dials the NodePort: at the server Node's InternalIP and the
 // NodePort, and by the host's .local name, trusting only the cluster CA. With
