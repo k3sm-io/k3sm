@@ -493,8 +493,14 @@ What this changes:
 - Writes still need a token. A push needs a ServiceAccount token for the audience `k3sm-registry`,
   which `k3sm registry token` prints, under the same rules as
   [a push from a Pod](#pushing-from-inside-a-pod). An anonymous push is answered `401`.
-- Every client that comes in through the NodePort reaches the registry from the node's own address,
-  so they share one client's share of the [rate limits](#refusals).
+- Every client that comes in through the NodePort reaches the registry from the node's own address:
+  the Service proxy does not keep the client's source address, and `externalTrafficPolicy: Local`
+  does not change that. So all of them share one client's share of the [rate limits](#refusals),
+  and one LAN client sending many requests can make every other one get `429`s. Turn the flag on
+  only on a LAN you trust.
+
+If another Service already holds the port, the server logs an error, publishes the Service with
+its cluster address only, and tries the NodePort again every five minutes until the port is free.
 
 Drop the flag and restart the server to close the port again; the Service goes back to a cluster
 address only.
