@@ -227,3 +227,97 @@ func drain(c chan struct{}) {
 		}
 	}
 }
+
+// TestServingRefreshSurvivesPanickingMint pins that a mint which panics during
+// a refresh unwinds the identity: the panic reaches the caller, the refresh
+// lock is free (a Rotate returns), no flight is left for later handshakes to
+// wait on, the attempt counts as a failure, and the refresh after the retry
+// window mints again.
+func TestServingRefreshSurvivesPanickingMint(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		now    = time.Now().Truncate(time.Second)
+		panics bool
+	)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	ca, err := certs.NewCAWithClock("k3sm-cluster-ca", clock)
+	if err != nil {
+		t.Fatalf("NewCAWithClock: %v", err)
+	}
+	s, err := NewServingIdentity(ServingConfig{
+		Mint: func() (tls.Certificate, error) {
+			mu.Lock()
+			p := panics
+			panics = false
+			mu.Unlock()
+			if p {
+				return tls.Certificate{}, errPanicMint.raise()
+			}
+			return ca.IssueRegistryServing(FlatServiceName, []string{FlatServiceName}, nil, time.Hour)
+		},
+		Margin: 10 * time.Minute,
+		Logger: slog.New(slog.NewTextHandler(&syncBuffer{}, nil)),
+		Now:    clock,
+	})
+	if err != nil {
+		t.Fatalf("NewServingIdentity: %v", err)
+	}
+	first := s.NotAfter()
+
+	// Past expiry, so a wedged flight would block every handshake.
+	advance(61 * time.Minute)
+	mu.Lock()
+	panics = true
+	mu.Unlock()
+	if r := handshakeRecovering(s); r != errPanicMint {
+		t.Fatalf("the panicking mint's handshake recovered %v, want the mint's panic re-raised", r)
+	}
+
+	within := func(name string, f func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() { defer close(done); f() }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s blocked after a panicking mint: the refresh did not unwind", name)
+		}
+	}
+
+	within("a handshake inside the retry window", func() {
+		if _, err := s.GetCertificate(nil); err == nil {
+			t.Errorf("GetCertificate inside the retry window = nil error, want the failed attempt reported")
+		}
+	})
+	within("Rotate", func() {
+		if err := s.Rotate(); err != nil {
+			t.Errorf("Rotate after a panicking mint: %v", err)
+		}
+	})
+	rotated := s.NotAfter()
+	if !rotated.After(first) {
+		t.Errorf("NotAfter = %v after Rotate, want later than %v", rotated, first)
+	}
+
+	advance(55 * time.Minute) // back inside the margin of the rotated certificate
+	advance(defaultServingRetry + time.Second)
+	within("the refresh after the retry window", s.Refresh)
+	if !s.NotAfter().After(rotated) {
+		t.Errorf("NotAfter = %v after the refresh, want a certificate later than %v", s.NotAfter(), rotated)
+	}
+}
+
+// panicValue is what the test mint panics with.
+type panicValue string
+
+func (p panicValue) raise() error { panic(p) }
+
+const errPanicMint panicValue = "mint panicked"
+
+// handshakeRecovering runs one handshake and returns what it panicked with.
+func handshakeRecovering(s *ServingIdentity) (r any) {
+	defer func() { r = recover() }()
+	_, _ = s.GetCertificate(nil)
+	return nil
+}

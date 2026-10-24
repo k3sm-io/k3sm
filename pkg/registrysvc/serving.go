@@ -137,21 +137,29 @@ func (s *ServingIdentity) mint() (tls.Certificate, error) {
 // replace mints a certificate and makes it current, under mintMu. A failure
 // leaves the current certificate in place. OnMint is told of a success.
 func (s *ServingIdentity) replace() (tls.Certificate, error) {
-	s.mintMu.Lock()
-	c, err := s.mint()
-	if err == nil {
-		s.mu.Lock()
-		s.cur = c
-		s.nextTry, s.lastErr = time.Time{}, nil
-		s.mu.Unlock()
-	}
-	s.mintMu.Unlock()
+	c, err := s.mintAndStore()
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 	if s.cfg.OnMint != nil {
 		s.cfg.OnMint(c.Leaf.NotAfter)
 	}
+	return c, nil
+}
+
+// mintAndStore mints a certificate and makes it current while holding mintMu,
+// which is released on every exit, a panicking Mint included.
+func (s *ServingIdentity) mintAndStore() (tls.Certificate, error) {
+	s.mintMu.Lock()
+	defer s.mintMu.Unlock()
+	c, err := s.mint()
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	s.mu.Lock()
+	s.cur = c
+	s.nextTry, s.lastErr = time.Time{}, nil
+	s.mu.Unlock()
 	return c, nil
 }
 
@@ -216,16 +224,7 @@ func (s *ServingIdentity) current() (*tls.Certificate, error) {
 		s.flight = ch
 		s.mu.Unlock()
 
-		c, err := s.replace()
-
-		s.mu.Lock()
-		s.flight = nil
-		if err != nil {
-			s.nextTry, s.lastErr = now.Add(s.cfg.Retry), err
-		}
-		s.mu.Unlock()
-		close(ch)
-
+		c, err := s.refresh(ch, now)
 		if err == nil {
 			return &c, nil
 		}
@@ -236,6 +235,33 @@ func (s *ServingIdentity) current() (*tls.Certificate, error) {
 		}
 		return nil, expiredError(cur, err)
 	}
+}
+
+// errMintPanicked is the failure recorded for a refresh whose Mint or OnMint
+// panicked; the panic itself still reaches the caller.
+var errMintPanicked = errors.New("mint the registry serving certificate: the mint panicked")
+
+// refresh runs the single-flight replacement current started with flight ch,
+// and ends the flight on every exit: flight is cleared, ch is closed, and a
+// failure (a panic included, which is not recovered) holds the next attempt
+// back until Retry has passed.
+func (s *ServingIdentity) refresh(ch chan struct{}, now time.Time) (c tls.Certificate, err error) {
+	returned := false
+	defer func() {
+		if !returned {
+			err = errMintPanicked
+		}
+		s.mu.Lock()
+		s.flight = nil
+		if err != nil {
+			s.nextTry, s.lastErr = now.Add(s.cfg.Retry), err
+		}
+		s.mu.Unlock()
+		close(ch)
+	}()
+	c, err = s.replace()
+	returned = true
+	return c, err
 }
 
 // expiredError reports that no certificate can be served: the current one has
