@@ -410,6 +410,17 @@ subjects:
 A token is a push credential for the whole cluster registry until it expires. Keep it out of shell
 history and logs, and ask for the shortest lifetime the job allows.
 
+Treat the `k3sm-registry` namespace as part of the push credential. Anyone who can create pods there,
+or create `serviceaccounts/token` there, can act as the `builder` ServiceAccount and push any
+repository. The built-in `edit` and `admin` roles both allow that, so a RoleBinding of either in
+`k3sm-registry` is a push grant for the whole registry. Grant nothing in that namespace beyond the
+`k3sm:registry-builder-token` binding above.
+
+On the server, `k3sm registry login` stores the token for `localhost:6451`. On a Mac that other
+users also log in to, a process of theirs could listen on that port while the server is stopped,
+and a tool that does not verify the cluster CA would send it the token. On a shared Mac, skip
+`login` and pipe `k3sm registry token` into the tool's `--password-stdin` when you push.
+
 ### On a worker
 
 A worker writes no user kubeconfig, so `k3sm build`, `image load`, `import` and `push`, and
