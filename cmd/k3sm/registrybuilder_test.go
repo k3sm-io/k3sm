@@ -331,3 +331,94 @@ func flatSlice(addr string, port int32) *discoveryv1.EndpointSlice {
 		Endpoints:   []discoveryv1.Endpoint{{Addresses: []string{addr}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}}},
 	}
 }
+
+// TestWriteDockerCARefusesUnsafeTargets pins the two guards on the CA write:
+// the registry address must be a literal host:port before it becomes a
+// directory name, and no directory under certs.d is reached through a link.
+func TestWriteDockerCARefusesUnsafeTargets(t *testing.T) {
+	ca := []byte("-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n")
+	hosts := []struct {
+		name, host string
+		ok         bool
+	}{
+		{"loopback name and port", "localhost:6451", true},
+		{"IPv4 and port", "100.64.0.1:6450", true},
+		{"IPv6 and port", "[fd00::1]:6450", true},
+		{"DNS name and port", "registry.example.test:443", true},
+		{"a path separator", "evil/../x:6450", false},
+		{"a backslash", `evil\x:6450`, false},
+		{"dot dot", "..:6450", false},
+		{"dot dot inside a name", "a..b:6450", false},
+		{"a NUL", "a\x00b:6450", false},
+		{"no port", "localhost", false},
+		{"an empty port", "localhost:", false},
+		{"a named port", "localhost:http", false},
+		{"a port out of range", "localhost:70000", false},
+		{"a host that is neither", "a_b:6450", false},
+		{"empty", "", false},
+	}
+	for _, tc := range hosts {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path, err := writeDockerCA(dir, tc.host, ca)
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("writeDockerCA(%q) = %v, want success", tc.host, err)
+				}
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, ca) {
+					t.Errorf("CA at %s = %q (%v), want the CA", path, got, err)
+				}
+				return
+			}
+			if !errors.Is(err, errBadRegistryHost) {
+				t.Fatalf("writeDockerCA(%q) = %v, want errBadRegistryHost", tc.host, err)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, "certs.d")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("a refused host still created certs.d (%v)", err)
+			}
+		})
+	}
+
+	links := []struct {
+		name  string
+		plant func(t *testing.T, dockerDir, outside string)
+	}{
+		{"a symlink at certs.d/<host>", func(t *testing.T, dockerDir, outside string) {
+			if err := os.Mkdir(filepath.Join(dockerDir, "certs.d"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(dockerDir, "certs.d", "localhost:6451")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a symlink at certs.d", func(t *testing.T, dockerDir, outside string) {
+			if err := os.Symlink(outside, filepath.Join(dockerDir, "certs.d")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range links {
+		t.Run(tc.name, func(t *testing.T) {
+			dockerDir, outside := t.TempDir(), t.TempDir()
+			if err := os.Chmod(outside, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			tc.plant(t, dockerDir, outside)
+			_, err := writeDockerCA(dockerDir, "localhost:6451", ca)
+			if !errors.Is(err, errSymlinkInCertsDir) {
+				t.Fatalf("writeDockerCA through %s = %v, want errSymlinkInCertsDir", tc.name, err)
+			}
+			entries, err := os.ReadDir(outside)
+			if err != nil || len(entries) != 0 {
+				t.Errorf("the link target holds %v (%v), want nothing written there", entries, err)
+			}
+			fi, err := os.Stat(outside)
+			if err != nil {
+				t.Fatalf("stat the link target: %v", err)
+			}
+			if fi.Mode().Perm() != 0o700 {
+				t.Errorf("the link target mode = %v, want it left at 0700", fi.Mode().Perm())
+			}
+		})
+	}
+}

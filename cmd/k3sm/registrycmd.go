@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"k3sm.io/k3sm/internal/atomicfile"
@@ -126,24 +127,110 @@ func loginAuthority(ctx context.Context, workDir string, slices endpointSliceLis
 	return clusterEndpointAuthority(ctx, slices)
 }
 
+// errBadRegistryHost reports a registry address that is not a literal
+// host:port, refused before it becomes a directory name under certs.d.
+var errBadRegistryHost = errors.New("the registry address is not a literal host:port")
+
+// errSymlinkInCertsDir reports a symbolic link where writeDockerCA expects a
+// directory: following it would write the CA wherever it points.
+var errSymlinkInCertsDir = errors.New("a symbolic link stands where a certs.d directory belongs")
+
 // writeDockerCA writes the cluster CA as certs.d/<host>/ca.crt under the docker
 // config dir, where docker and buildx look for a registry's CA. The file is
-// mode 0644 under a 0755 directory: a CA certificate is public.
+// mode 0644 under a 0755 directory: a CA certificate is public. host must be a
+// literal host:port, and no directory under certs.d is reached through a
+// symbolic link.
 func writeDockerCA(dockerDir, host string, caPEM []byte) (string, error) {
-	dir := filepath.Join(dockerDir, "certs.d", host)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create %s: %w", dir, err)
+	if err := validRegistryHost(host); err != nil {
+		return "", err
 	}
-	// MkdirAll leaves an existing directory's mode alone, and the umask may
-	// have narrowed a new one; the CA is meant to be readable.
-	if err := os.Chmod(dir, 0o755); err != nil {
-		return "", fmt.Errorf("set the mode of %s: %w", dir, err)
+	if err := os.MkdirAll(dockerDir, 0o700); err != nil {
+		return "", fmt.Errorf("create %s: %w", dockerDir, err)
+	}
+	certsDir := filepath.Join(dockerDir, "certs.d")
+	dir := filepath.Join(certsDir, host)
+	for _, d := range []string{certsDir, dir} {
+		if err := ensureRealDir(d, 0o755); err != nil {
+			return "", err
+		}
 	}
 	path := filepath.Join(dir, "ca.crt")
 	if err := atomicfile.Replace(path, caPEM, 0o644); err != nil {
 		return "", fmt.Errorf("write the cluster CA %s: %w", path, err)
 	}
 	return path, nil
+}
+
+// validRegistryHost accepts a literal host:port: an IP address or a DNS name,
+// and a numeric port in 1-65535. A path separator, "..", or NUL is refused
+// whatever else the string holds, since host becomes a directory name.
+func validRegistryHost(host string) error {
+	if host == "" || strings.ContainsAny(host, "/\\\x00") || strings.Contains(host, "..") {
+		return fmt.Errorf("%w: %q", errBadRegistryHost, host)
+	}
+	h, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return fmt.Errorf("%w: %q: %w", errBadRegistryHost, host, err)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+		return fmt.Errorf("%w: %q: the port is not a number in 1-65535", errBadRegistryHost, host)
+	}
+	if net.ParseIP(h) == nil && !validDNSName(h) {
+		return fmt.Errorf("%w: %q: the host is neither an IP address nor a DNS name", errBadRegistryHost, host)
+	}
+	return nil
+}
+
+// validDNSName reports whether name is a DNS name: dot-separated labels of
+// letters, digits and hyphens, each 1-63 bytes and not starting or ending with
+// a hyphen, 253 bytes at most in all.
+func validDNSName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ensureRealDir makes dir a real directory of the given mode without following
+// a symbolic link: an existing symlink is refused, an existing directory has
+// its mode set (the umask may have narrowed it, and the CA is meant to be
+// readable), and a missing one is created. Anything else is refused.
+func ensureRealDir(dir string, mode os.FileMode) error {
+	fi, err := os.Lstat(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.Mkdir(dir, mode); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
+		// Mkdir fails on anything planted since the Lstat rather than
+		// following it; look again at what was made before the Chmod.
+		if fi, err = os.Lstat(dir); err != nil {
+			return fmt.Errorf("inspect %s: %w", dir, err)
+		}
+	case err != nil:
+		return fmt.Errorf("inspect %s: %w", dir, err)
+	}
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s", errSymlinkInCertsDir, dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	if err := os.Chmod(dir, mode); err != nil {
+		return fmt.Errorf("set the mode of %s: %w", dir, err)
+	}
+	return nil
 }
 
 // homeDir is the invoking user's home, or "" when it cannot be resolved.
