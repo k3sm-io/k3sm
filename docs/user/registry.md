@@ -503,7 +503,8 @@ If another Service already holds the port, the server logs an error, publishes t
 its cluster address only, and tries the NodePort again every five minutes until the port is free.
 
 Drop the flag and restart the server to close the port again; the Service goes back to a cluster
-address only.
+address only. Do this before you install an earlier k3sm release on the server: an earlier server
+does not change the Service back, so the port would stay open.
 
 ## Storage
 
