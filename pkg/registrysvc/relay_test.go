@@ -271,7 +271,7 @@ func TestRelayServesTheGate(t *testing.T) {
 // the listener stops immediately, without spending the retry budget on a
 // condition nothing here can change, and without touching the other address.
 func TestRelaySkipsAnAbsentAddress(t *testing.T) {
-	r := newRelay(6450, []netip.Addr{netip.MustParseAddr("192.168.64.1")}, quietLogger(), GateAuth{}, Credential{})
+	r := newRelay(6450, 6450, []netip.Addr{netip.MustParseAddr("192.168.64.1")}, quietLogger(), GateAuth{}, Credential{})
 	attempts := 0
 	r.listen = func(string) (net.Listener, error) {
 		attempts++
@@ -300,7 +300,7 @@ func TestRelayStopsOnContextCancel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	r := newRelay(portOf(t, ln.Addr()), nil, quietLogger(), GateAuth{}, Credential{})
+	r := newRelay(portOf(t, ln.Addr()), portOf(t, ln.Addr()), nil, quietLogger(), GateAuth{}, Credential{})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
@@ -332,7 +332,7 @@ func serveThroughRelay(t *testing.T, port int) string {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	r := newRelay(port, nil, quietLogger(), GateAuth{}, gateCred)
+	r := newRelay(port, port, nil, quietLogger(), GateAuth{}, gateCred)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {

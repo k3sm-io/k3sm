@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"k3sm.io/k3sm/internal/atomicfile"
@@ -78,6 +79,10 @@ type State struct {
 	// CertNotAfter is the expiry of the relay's current serving certificate,
 	// updated on every rotation; nil when the relay serves no certificate.
 	CertNotAfter *time.Time `json:"certNotAfter,omitempty"`
+	// GatePort is the loopback push gate's port (GatePort(Port)) once the gate
+	// has bound it; 0 when no loopback gate serves. The k3sm CLI on this Mac
+	// pushes there.
+	GatePort int `json:"gatePort,omitempty"`
 }
 
 // ClusterFacing is what the server's bring-up learns about the registry's
@@ -98,6 +103,8 @@ type ClusterFacing struct {
 // either, so the read-modify-write cannot lose a transition. A missing record
 // is an error: there is no serving registry to describe.
 func UpdateClusterFacing(workDir string, f ClusterFacing) error {
+	stateUpdate.Lock()
+	defer stateUpdate.Unlock()
 	b, err := os.ReadFile(StatePath(workDir))
 	if err != nil {
 		return fmt.Errorf("read the registry state: %w", err)
@@ -114,6 +121,43 @@ func UpdateClusterFacing(workDir string, f ClusterFacing) error {
 		st.CertNotAfter = &t
 	}
 	return WriteState(workDir, st)
+}
+
+// stateUpdate serialises the read-modify-write updates of the record: a
+// serving certificate's rotation (from a TLS handshake) and the loopback gate's
+// bind can both land while the server runs.
+var stateUpdate sync.Mutex
+
+// RecordGatePort records the loopback push gate's port in workDir's state
+// record, keeping every other field. A missing record is an error, as for
+// UpdateClusterFacing.
+func RecordGatePort(workDir string, port int) error {
+	stateUpdate.Lock()
+	defer stateUpdate.Unlock()
+	b, err := os.ReadFile(StatePath(workDir))
+	if err != nil {
+		return fmt.Errorf("read the registry state: %w", err)
+	}
+	st, err := ParseState(b)
+	if err != nil {
+		return err
+	}
+	st.GatePort = port
+	return WriteState(workDir, st)
+}
+
+// ReadLocalState reads this Mac's registry state record as an ordinary account
+// can: the world-readable published copy first, then the work-dir original. A
+// Mac that runs no server has neither, and that is fs.ErrNotExist.
+func ReadLocalState(workDir string) (State, error) {
+	b, err := os.ReadFile(PublishedStatePath(workDir))
+	if errors.Is(err, fs.ErrNotExist) {
+		b, err = os.ReadFile(StatePath(workDir))
+	}
+	if err != nil {
+		return State{}, fmt.Errorf("read the registry state: %w", err)
+	}
+	return ParseState(b)
 }
 
 // stateName is the record's basename. It sits in the work dir beside

@@ -112,7 +112,7 @@ func newRelayLimitFixture(t *testing.T) *relayLimitFixture {
 		}},
 		Namespaces: &fakeNamespaces{labels: map[string]map[string]string{"team": {PushLabel: "team"}}},
 	}
-	r := newRelay(portOf(t, zaddr), nil, quietLogger(), auth, gateCred)
+	r := newRelay(portOf(t, zaddr), portOf(t, zaddr), nil, quietLogger(), auth, gateCred)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
