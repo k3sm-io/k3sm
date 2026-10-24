@@ -85,6 +85,7 @@ func (l *Ledger) Cancel(r Record) (Record, error) {
 	t := l.now().UTC()
 	r.FinishedAt = &t
 	r.Status = StatusCancelled
+	r.Reference = ""
 	r.ImageDigest = ""
 	r.Error = ""
 	return r, l.Write(r)

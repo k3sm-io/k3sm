@@ -91,8 +91,11 @@ type Record struct {
 	// FinishedAt is unset while the build runs.
 	FinishedAt *time.Time `json:"finishedAt,omitempty"`
 	Status     Status     `json:"status"`
-	// ImageDigest is the digest of the image recorded in this node's store, set
-	// on success.
+	// Reference is the cluster-registry reference the build was recorded
+	// under (registry-k3sm:6450/<repo>:<tag>), set on success.
+	Reference string `json:"reference,omitempty"`
+	// ImageDigest is the digest the cluster registry recorded under Reference,
+	// set on success.
 	ImageDigest string `json:"imageDigest,omitempty"`
 	// Error is the failure's text, clipped to MaxErrorBytes, set on failure.
 	Error string `json:"error,omitempty"`
@@ -179,19 +182,21 @@ func (l *Ledger) Start(r Record) (Record, error) {
 	r.StartedAt = l.now().UTC()
 	r.FinishedAt = nil
 	r.Status = StatusRunning
+	r.Reference = ""
 	r.ImageDigest = ""
 	r.Error = ""
 	return r, l.Write(r)
 }
 
-// Finish rewrites r as finished: succeeded with digest when buildErr is nil,
-// failed with buildErr's text otherwise.
+// Finish rewrites r as finished: succeeded with digest (and the Reference the
+// caller set) when buildErr is nil, failed with buildErr's text otherwise.
 func (l *Ledger) Finish(r Record, digest string, buildErr error) (Record, error) {
 	t := l.now().UTC()
 	r.FinishedAt = &t
 	if buildErr != nil {
 		r.Status = StatusFailed
 		r.Error = clip(redact(buildErr.Error()), MaxErrorBytes)
+		r.Reference = ""
 		r.ImageDigest = ""
 	} else {
 		r.Status = StatusSucceeded

@@ -29,13 +29,14 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestImageSaveVerb is the gate for `k3sm image save`. The load-bearing claim is
-// the TRUNCATION one: the wire's terminal frame is the only thing that tells a
-// complete archive from a short one, so an export that ends without it — or that
-// disagrees about the byte count — must leave NO file behind. A tar short by one
-// layer still opens, and the first thing that would notice is a pod that cannot
-// start.
-func TestImageSaveVerb(t *testing.T) {
+// TestSaveImageArchiveVerifiesTheStream is the gate for the node-store export
+// `k3sm image push` uses for a source named in this node's store. The
+// load-bearing claim is the TRUNCATION one: the wire's terminal frame is the
+// only thing that tells a complete archive from a short one, so an export that
+// ends without it, or that disagrees about the byte count, must leave NO file
+// behind. A tar short by one layer still opens, and the first thing that would
+// notice is a pod that cannot start.
+func TestSaveImageArchiveVerifiesTheStream(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("4d", 32)
 	body := []byte("oci-layout-archive-bytes")
 
@@ -43,58 +44,40 @@ func TestImageSaveVerb(t *testing.T) {
 	// just a single-frame path, is what the gate exercises.
 	chunked := [][]byte{body[:10], body[10:]}
 
+	// save runs one export against fake into target.
+	save := func(t *testing.T, fake *fakeImagesDaemon, target string) (savedArchive, error) {
+		t.Helper()
+		sock := serveFakeImages(t, fake)
+		cc, closer, err := dialRuntimed(t.Context(), sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { closer.Close() })
+		return saveImageArchive(t.Context(), runtimev1.NewImagesClient(cc), &runtimev1.SaveImageRequest{
+			Reference: "example.test/app:v1",
+			Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
+		}, target, sock)
+	}
+
 	t.Run("writes the archive and reports the digest", func(t *testing.T) {
 		fake := &fakeImagesDaemon{
 			saveChunks:   chunked,
 			saveTerminal: &runtimev1.SaveImageResponse{Digest: digest, SentBytes: int64(len(body))},
 		}
-		sock := serveFakeImages(t, fake)
 		dir := t.TempDir()
 		target := filepath.Join(dir, "app.tar")
-
-		out, err := runImageCmd(t, []string{
-			"--socket", sock, "save", "example.test/app:v1", "-o", target, "--platform", "darwin/arm64",
-		})
+		saved, err := save(t, fake, target)
 		if err != nil {
-			t.Fatalf("image save: %v", err)
+			t.Fatalf("save: %v", err)
 		}
 		got, err := os.ReadFile(target)
 		if err != nil {
 			t.Fatalf("read the saved archive: %v", err)
 		}
-		if string(got) != string(body) {
-			t.Errorf("archive = %q, want %q", got, body)
-		}
-		if !strings.Contains(out, digest) {
-			t.Errorf("save printed no digest\ngot:\n%s", out)
-		}
-		// The request is a (reference x platform) export in the only format v1
-		// emits; a digest target would have been sent as a digest instead.
-		if fake.gotSave.GetReference() != "example.test/app:v1" || fake.gotSave.GetDigest() != "" {
-			t.Errorf("request reference=%q digest=%q", fake.gotSave.GetReference(), fake.gotSave.GetDigest())
-		}
-		if fake.gotSave.GetPlatform().GetArchitecture() != "arm64" {
-			t.Errorf("platform on the wire = %v", fake.gotSave.GetPlatform())
-		}
-		if fake.gotSave.GetFormat() != runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT {
-			t.Errorf("format on the wire = %v, want OCI_LAYOUT", fake.gotSave.GetFormat())
+		if string(got) != string(body) || saved.digest != digest {
+			t.Errorf("archive = %q digest = %q, want %q %q", got, saved.digest, body, digest)
 		}
 		assertOnlyFile(t, dir, "app.tar")
-	})
-
-	t.Run("a digest target is sent as a digest", func(t *testing.T) {
-		fake := &fakeImagesDaemon{
-			saveChunks:   chunked,
-			saveTerminal: &runtimev1.SaveImageResponse{Digest: digest, SentBytes: int64(len(body))},
-		}
-		sock := serveFakeImages(t, fake)
-		target := filepath.Join(t.TempDir(), "app.tar")
-		if _, err := runImageCmd(t, []string{"--socket", sock, "save", digest, "-o", target}); err != nil {
-			t.Fatalf("image save: %v", err)
-		}
-		if fake.gotSave.GetDigest() != digest || fake.gotSave.GetReference() != "" {
-			t.Errorf("request reference=%q digest=%q", fake.gotSave.GetReference(), fake.gotSave.GetDigest())
-		}
 	})
 
 	t.Run("refuses a truncated archive and leaves nothing behind", func(t *testing.T) {
@@ -125,13 +108,12 @@ func TestImageSaveVerb(t *testing.T) {
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
-				sock := serveFakeImages(t, tc.fake)
 				dir := t.TempDir()
 				target := filepath.Join(dir, "app.tar")
 
-				out, err := runImageCmd(t, []string{"--socket", sock, "save", "example.test/app:v1", "-o", target})
+				_, err := save(t, tc.fake, target)
 				if err == nil {
-					t.Fatalf("save of a truncated export succeeded: %s", out)
+					t.Fatalf("save of a truncated export succeeded")
 				}
 				if !errors.Is(err, tc.want) {
 					t.Errorf("error = %v, want one wrapping %v", err, tc.want)
@@ -151,11 +133,10 @@ func TestImageSaveVerb(t *testing.T) {
 				Error: status.New(codes.Internal, "a layer blob is missing from the store").Proto(),
 			},
 		}
-		sock := serveFakeImages(t, fake)
 		dir := t.TempDir()
 		target := filepath.Join(dir, "app.tar")
 
-		_, err := runImageCmd(t, []string{"--socket", sock, "save", "example.test/app:v1", "-o", target})
+		_, err := save(t, fake, target)
 		if err == nil {
 			t.Fatalf("save succeeded despite a terminal error frame")
 		}
@@ -170,9 +151,8 @@ func TestImageSaveVerb(t *testing.T) {
 			saveChunks:   chunked,
 			saveTerminal: &runtimev1.SaveImageResponse{SentBytes: int64(len(body))},
 		}
-		sock := serveFakeImages(t, fake)
 		dir := t.TempDir()
-		_, err := runImageCmd(t, []string{"--socket", sock, "save", "example.test/app:v1", "-o", filepath.Join(dir, "app.tar")})
+		_, err := save(t, fake, filepath.Join(dir, "app.tar"))
 		if err == nil || !strings.Contains(err.Error(), "no digest") {
 			t.Errorf("error = %v, want the missing-digest refusal", err)
 		}
@@ -183,13 +163,12 @@ func TestImageSaveVerb(t *testing.T) {
 	// replace a good archive with a short one.
 	t.Run("a failed save does not clobber an existing archive", func(t *testing.T) {
 		fake := &fakeImagesDaemon{saveChunks: chunked}
-		sock := serveFakeImages(t, fake)
 		dir := t.TempDir()
 		target := filepath.Join(dir, "app.tar")
 		if err := os.WriteFile(target, []byte("the previous good archive"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := runImageCmd(t, []string{"--socket", sock, "save", "example.test/app:v1", "-o", target}); err == nil {
+		if _, err := save(t, fake, target); err == nil {
 			t.Fatalf("a truncated save succeeded")
 		}
 		got, err := os.ReadFile(target)
@@ -205,9 +184,8 @@ func TestImageSaveVerb(t *testing.T) {
 	t.Run("surfaces a transport refusal", func(t *testing.T) {
 		fake := &fakeImagesDaemon{saveErr: status.Error(codes.NotFound,
 			"SaveImage: example.test/app:v1 is not in the local index")}
-		sock := serveFakeImages(t, fake)
 		dir := t.TempDir()
-		_, err := runImageCmd(t, []string{"--socket", sock, "save", "example.test/app:v1", "-o", filepath.Join(dir, "app.tar")})
+		_, err := save(t, fake, filepath.Join(dir, "app.tar"))
 		if err == nil || !strings.Contains(err.Error(), "is not in the local index") {
 			t.Errorf("error = %v", err)
 		}

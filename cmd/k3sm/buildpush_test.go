@@ -28,7 +28,6 @@ import (
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
 // noPush is the imagePusher for tests that are not about the upload: it uploads
@@ -64,7 +63,7 @@ type loggingStore struct {
 	err   error
 }
 
-func (s *loggingStore) record(_ context.Context, ref name.Tag, _ ggcrv1.Image) error {
+func (s *loggingStore) record(_ context.Context, ref name.Tag, _ built) error {
 	*s.log = append(*s.log, "store")
 	s.calls = append(s.calls, ref.String())
 	return s.err
@@ -162,17 +161,47 @@ func TestResolvePushTarget(t *testing.T) {
 	})
 }
 
-// TestBuildPushOrdering pins the sequence and the failure wording.
+// TestBuildPushOrdering pins which upload a build makes and the failure
+// wording.
 //
-// The store recording comes FIRST and happens whether or not --push was given —
-// deliberately unlike `docker build --push`, because a k3sm build's product is
-// an image this node can run. So a failed upload leaves the operator with a
-// usable image, and the error has to say so or it reads as a lost build.
+// A build makes exactly one upload: the recording for a tag naming the cluster
+// registry, the push for a tag naming another one. A failed push leaves nothing
+// in the cluster, and the error has to say so.
 func TestBuildPushOrdering(t *testing.T) {
 	ctxDir := pushCtx(t)
 	stageNodeRegistry(t, "127.0.0.1:6450")
+	const foreign = "registry.example.com/me/myapp:v1"
 
-	t.Run("the store is written before the push", func(t *testing.T) {
+	t.Run("a foreign tag is pushed and not recorded", func(t *testing.T) {
+		var log []string
+		store := &loggingStore{log: &log}
+		pusher := &recordingPush{log: &log}
+		var out bytes.Buffer
+
+		if err := buildWith(t.Context(), buildOptions{
+			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
+			tag:        foreign,
+			push:       true,
+			format:     "docker",
+			contextDir: ctxDir,
+		}, &out, engineBuildWith(noStore), store.record, pusher.push); err != nil {
+			t.Fatalf("build: %v", err)
+		}
+
+		if want := []string{"push"}; strings.Join(log, ",") != strings.Join(want, ",") {
+			t.Fatalf("delivery = %v, want %v", log, want)
+		}
+		if len(pusher.targets) != 1 || pusher.targets[0] != foreign {
+			t.Errorf("push targets = %v, want the registry the tag names", pusher.targets)
+		}
+		if !strings.Contains(out.String(), "push:   "+foreign) {
+			t.Errorf("the summary does not report the push target:\n%s", out.String())
+		}
+	})
+
+	t.Run("a tag naming the cluster registry is uploaded once", func(t *testing.T) {
+		// The recording IS the upload to the cluster registry, so --push on a
+		// bare tag sends nothing a second time.
 		var log []string
 		store := &loggingStore{log: &log}
 		pusher := &recordingPush{log: &log}
@@ -184,21 +213,17 @@ func TestBuildPushOrdering(t *testing.T) {
 			push:       true,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, &out, engineBuildWith(recordInStore), store.record, pusher.push); err != nil {
+		}, &out, engineBuildWith(noStore), store.record, pusher.push); err != nil {
 			t.Fatalf("build: %v", err)
 		}
-
-		if want := []string{"store", "push"}; strings.Join(log, ",") != strings.Join(want, ",") {
-			t.Fatalf("delivery order = %v, want %v", log, want)
+		if len(pusher.targets) != 0 {
+			t.Errorf("the cluster registry was uploaded to a second time: %v", pusher.targets)
 		}
-		if len(store.calls) != 1 || store.calls[0] != "myapp:v1" {
-			t.Errorf("store recordings = %v, want the ORIGINAL bare reference", store.calls)
+		if len(store.calls) != 1 || store.calls[0] != "registry-k3sm:6450/myapp:v1" {
+			t.Errorf("recordings = %v, want the cluster-registry reference", store.calls)
 		}
-		if len(pusher.targets) != 1 || pusher.targets[0] != "localhost:6450/myapp:v1" {
-			t.Errorf("push targets = %v, want this node's registry", pusher.targets)
-		}
-		if !strings.Contains(out.String(), "push:   localhost:6450/myapp:v1") {
-			t.Errorf("the summary does not report the resolved push target:\n%s", out.String())
+		if !strings.Contains(out.String(), "push:   registry-k3sm:6450/myapp:v1") {
+			t.Errorf("the summary does not report the cluster-registry reference:\n%s", out.String())
 		}
 	})
 
@@ -213,7 +238,7 @@ func TestBuildPushOrdering(t *testing.T) {
 			tag:        "myapp:v1",
 			format:     "docker",
 			contextDir: ctxDir,
-		}, &out, engineBuildWith(recordInStore), store.record, pusher.push); err != nil {
+		}, &out, engineBuildWith(noStore), store.record, pusher.push); err != nil {
 			t.Fatalf("build: %v", err)
 		}
 		if len(pusher.targets) != 0 {
@@ -224,13 +249,9 @@ func TestBuildPushOrdering(t *testing.T) {
 		}
 	})
 
-	t.Run("a store failure means no push at all", func(t *testing.T) {
-		// The registry must never hold content this node's own store rejected:
-		// the store recording is what makes the image runnable here, and an
-		// upload past a failed recording publishes an image the build cannot
-		// vouch for.
+	t.Run("a recording failure fails the build", func(t *testing.T) {
 		var log []string
-		store := &loggingStore{log: &log, err: errors.New("cannot reach runtimed")}
+		store := &loggingStore{log: &log, err: errors.New("cannot reach the cluster registry")}
 		pusher := &recordingPush{log: &log}
 
 		err := buildWith(t.Context(), buildOptions{
@@ -239,16 +260,16 @@ func TestBuildPushOrdering(t *testing.T) {
 			push:       true,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuildWith(recordInStore), store.record, pusher.push)
+		}, io.Discard, engineBuildWith(noStore), store.record, pusher.push)
 		if err == nil {
-			t.Fatal("expected the store failure to fail the build")
+			t.Fatal("expected the recording failure to fail the build")
 		}
 		if len(pusher.targets) != 0 {
-			t.Errorf("the image was pushed after a failed store recording: %v", pusher.targets)
+			t.Errorf("the image was pushed after a failed recording: %v", pusher.targets)
 		}
 	})
 
-	t.Run("a push failure fails the build and says the image is in the store", func(t *testing.T) {
+	t.Run("a push failure fails the build and says nothing was recorded", func(t *testing.T) {
 		var log []string
 		store := &loggingStore{log: &log}
 		pusher := &recordingPush{log: &log, err: errors.New("registry rejected the credential")}
@@ -256,18 +277,18 @@ func TestBuildPushOrdering(t *testing.T) {
 
 		err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        "myapp:v1",
+			tag:        foreign,
 			push:       true,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, &out, engineBuildWith(recordInStore), store.record, pusher.push)
+		}, &out, engineBuildWith(noStore), store.record, pusher.push)
 		if err == nil {
 			t.Fatal("expected the push failure to fail the build")
 		}
-		if len(store.calls) != 1 {
-			t.Fatalf("store recordings = %v, want the recording to have happened first", store.calls)
+		if len(store.calls) != 0 {
+			t.Fatalf("recordings = %v, want none for a foreign tag", store.calls)
 		}
-		for _, want := range []string{"myapp:v1", "is in the node store", "push failed", "registry rejected the credential"} {
+		for _, want := range []string{foreign, "not recorded", "another registry", "push failed", "registry rejected the credential"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("the error does not contain %q: %v", want, err)
 			}
@@ -277,7 +298,7 @@ func TestBuildPushOrdering(t *testing.T) {
 		}
 	})
 
-	t.Run("a bare tag with no node registry fails the build after the store", func(t *testing.T) {
+	t.Run("a bare tag with no node registry fails a --no-record push", func(t *testing.T) {
 		var log []string
 		store := &loggingStore{log: &log}
 		pusher := &recordingPush{log: &log}
@@ -288,20 +309,18 @@ func TestBuildPushOrdering(t *testing.T) {
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
 			tag:        "myapp:v1",
 			push:       true,
+			noRecord:   true,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuildWith(recordInStore), store.record, pusher.push)
+		}, io.Discard, engineBuildWith(noStore), store.record, pusher.push)
 		if !errors.Is(err, errNoNodeRegistry) {
 			t.Fatalf("build --push with no node registry = %v, want errNoNodeRegistry", err)
 		}
-		if len(store.calls) != 1 {
-			t.Errorf("store recordings = %v, want the image recorded before the push was attempted", store.calls)
+		if len(store.calls) != 0 {
+			t.Errorf("recordings = %v, want none under --no-record", store.calls)
 		}
 		if len(pusher.targets) != 0 {
 			t.Errorf("an unresolvable target was still uploaded: %v", pusher.targets)
-		}
-		if !strings.Contains(err.Error(), "is in the node store") {
-			t.Errorf("the error does not say the image is usable here: %v", err)
 		}
 	})
 }
@@ -371,7 +390,11 @@ func TestBuildPushToRegistry(t *testing.T) {
 
 		ctxDir := pushCtx(t)
 		layout := filepath.Join(t.TempDir(), "layout")
-		store := &recordingStore{}
+		var warmed []string
+		warm := func(_ context.Context, ref name.Tag) error {
+			warmed = append(warmed, ref.String())
+			return nil
+		}
 		var out bytes.Buffer
 
 		if err := buildWith(t.Context(), buildOptions{
@@ -381,14 +404,14 @@ func TestBuildPushToRegistry(t *testing.T) {
 			output:     layout,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, &out, engineBuildWith(recordInStore), store.record, pushBuilt); err != nil {
+		}, &out, engineBuildWith(noStore), recordInRegistry(pushBuilt, warm), pushBuilt); err != nil {
 			t.Fatalf("build --push: %v", err)
 		}
 
-		// The store keeps the operator's ORIGINAL bare reference, and --output
-		// still wrote its artifact: --push is a third sink, not a replacement.
-		if len(store.calls) != 1 || store.calls[0] != "myapp:v1" {
-			t.Errorf("store recordings = %v, want [myapp:v1]", store.calls)
+		// The recording names the cluster registry, and --output still wrote its
+		// artifact: --push is an extra sink, not a replacement.
+		if len(warmed) != 1 || warmed[0] != "registry-k3sm:6450/myapp:v1" {
+			t.Errorf("warm pulls = %v, want [registry-k3sm:6450/myapp:v1]", warmed)
 		}
 		if _, err := os.Stat(filepath.Join(layout, "index.json")); err != nil {
 			t.Errorf("--output wrote no layout alongside --push: %v", err)
@@ -396,8 +419,8 @@ func TestBuildPushToRegistry(t *testing.T) {
 
 		_, port, _ := strings.Cut(host, ":")
 		target := "localhost:" + port + "/myapp:v1"
-		if !strings.Contains(out.String(), "push:   "+target) {
-			t.Errorf("the summary does not name the resolved target %q:\n%s", target, out.String())
+		if !strings.Contains(out.String(), "push:   registry-k3sm:6450/myapp:v1") {
+			t.Errorf("the summary does not name the cluster-registry reference:\n%s", out.String())
 		}
 		assertRegistryHolds(t, target, layoutDigest(t, layout))
 
@@ -427,7 +450,7 @@ func TestBuildPushToRegistry(t *testing.T) {
 			output:     layout,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, &out, engineBuildWith(recordInStore), noStore, pushBuilt); err != nil {
+		}, &out, engineBuildWith(noStore), noStore, pushBuilt); err != nil {
 			t.Fatalf("build --push: %v", err)
 		}
 		if !strings.Contains(out.String(), "push:   "+target) {

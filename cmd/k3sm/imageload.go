@@ -19,27 +19,22 @@ package main
 import (
 	"archive/tar"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
-	"google.golang.org/grpc/codes"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
 const (
-	// loadChunkBytes is the payload of one stream frame. gRPC servers default to
-	// a 4 MiB receive limit, so a 1 MiB chunk leaves ample headroom for framing
-	// while keeping per-frame overhead negligible across a multi-GB archive.
-	loadChunkBytes = 1 << 20
-
 	// archiveMetadataLimit caps the metadata document (manifest.json /
 	// index.json) the CLI parses out of the archive. This is operator-supplied,
 	// potentially untrusted input, so it is never read into memory unbounded.
@@ -51,121 +46,99 @@ const (
 	ociRefNameAnnotation = "org.opencontainers.image.ref.name"
 )
 
-// archiveMeta is what the CLI reads out of the operator's archive before it
-// streams a single byte: the reference the archive names for itself, plus the
-// advisory digest and size the first frame carries.
-//
-// The digest is ADVISORY on the wire and this side must not pretend otherwise:
-// the daemon re-hashes every byte it receives and rejects a mismatch before its
-// lease commits. Sending it buys the daemon an early reject, nothing more.
-type archiveMeta struct {
-	reference string
-	digest    string
-	size      int64
-}
+// ingestPusher is the upload `k3sm image load` and `k3sm image import` record
+// through: the same path `k3sm image push` and `k3sm build` use. A seam so the
+// recording is provable without a registry.
+var ingestPusher imagePusher = pushBuilt
 
-// imageLoad streams an operator's archive to the daemon's LoadImage RPC and
-// renders what the daemon recorded.
+// imageIngest records an operator's archive in the cluster registry and warms
+// this node's cache with it.
 //
-// THE DAEMON IS THE SOLE STORE WRITER. This command opens the archive — the
-// daemon runs as its own unprivileged uid and generally cannot read an
-// operator's home — and does nothing else with it but hash it and put its bytes
-// on the wire. It writes no blob, takes no lease, and records no reference.
-func imageLoad(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer, format runtimev1.LoadImageFormat) error {
-	what := o.subcommand + " image"
+// THE REGISTRY IS THE CLUSTER'S ONE IMAGE STORE. The archive is read here, as
+// the invoking user, and uploaded to this server's registry under the
+// normalised registry-k3sm:6450 name, overwriting whatever that tag named
+// before. The node's own store is a pull cache: the warm pull goes through the
+// runtime's ordinary puller, which re-hashes every blob against its digest, so
+// a Pod on this node with imagePullPolicy Never still finds the image.
+func imageIngest(ctx context.Context, o imageOptions, out io.Writer, push imagePusher, warm cacheWarmer, format runtimev1.LoadImageFormat) error {
 	f, err := os.Open(o.archive)
 	if err != nil {
 		return fmt.Errorf("open archive: %w", err)
 	}
-	defer f.Close()
-
-	meta, err := inspectArchive(f, format)
+	reference, err := inspectArchive(f, format)
+	f.Close()
 	if err != nil {
 		return fmt.Errorf("%s: %w", o.archive, err)
 	}
-	reference := o.reference
-	if reference == "" {
-		reference = meta.reference
+	if o.reference != "" {
+		reference = o.reference
 	}
 	if reference == "" {
 		return fmt.Errorf("%s: the archive records no reference; pass --reference <name:tag>", o.archive)
 	}
-	// The inspection pass consumed the file; the stream must start from byte 0
-	// or the daemon would hash a suffix of what the first frame described.
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("rewind %s: %w", o.archive, err)
+	// load and import have no --push: an archive naming another registry is
+	// recorded only under a name the operator chooses for the cluster.
+	if probe, perr := name.NewTag(reference, name.WithDefaultRegistry("")); perr == nil && !isClusterRegistryHost(probe.RegistryStr(), o.workDir) {
+		return fmt.Errorf("%s: %q: %w (%s); to keep it in the cluster, pass --reference %s; to send it to %s, push it there from an OCI layout with k3sm image push",
+			o.archive, reference, errForeignTag, probe.RegistryStr(), clusterSpelling(probe), probe.RegistryStr())
 	}
-
-	//lint:ignore SA1019 the node-store image verbs stay until build and load move to the registry
-	stream, err := client.LoadImage(ctx)
+	ref, err := registryReference(reference, o.workDir)
 	if err != nil {
-		return imageRPCError(what, o.socket, err)
+		return err
 	}
 
-	// A Send on a client-streaming RPC reports io.EOF once the SERVER has ended
-	// the call; the real status is only available from CloseAndRecv. Reporting
-	// that io.EOF as the failure would hide the daemon's actual reason, so a
-	// short send stops the loop and lets CloseAndRecv speak.
-	done := false
-	if err := stream.Send(&runtimev1.LoadImageRequest{
-		Reference: reference,
-		Format:    format,
-		Digest:    meta.digest,
-		Size:      meta.size,
-	}); err != nil {
-		if !errors.Is(err, io.EOF) {
-			return imageRPCError(what, o.socket, err)
-		}
-		done = true
-	}
-	buf := make([]byte, loadChunkBytes)
-	for !done {
-		n, rerr := f.Read(buf)
-		if n > 0 {
-			if err := stream.Send(&runtimev1.LoadImageRequest{Chunk: buf[:n]}); err != nil {
-				if !errors.Is(err, io.EOF) {
-					return imageRPCError(what, o.socket, err)
-				}
-				break
-			}
-		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				break
-			}
-			return fmt.Errorf("read %s: %w", o.archive, rerr)
-		}
-	}
-
-	resp, err := stream.CloseAndRecv()
+	b, cleanup, err := readArchive(o.archive, format)
 	if err != nil {
-		return imageRPCError(what, o.socket, err)
+		return fmt.Errorf("%s: %w", o.archive, err)
 	}
-	// The RPC can fail two ways — a transport status, and a typed in-band Status
-	// on the terminal response. Both mean nothing was committed, so both have to
-	// exit non-zero; only checking the first would report a rejected ingest as a
-	// success.
-	if st := resp.GetError(); st != nil && st.GetCode() != int32(codes.OK) {
-		return fmt.Errorf("%s: the daemon rejected the archive: %s", what, st.GetMessage())
+	defer cleanup()
+	if err := recordInto(ctx, ref, b, o.workDir, push, warm); err != nil {
+		return err
 	}
-
-	received := resp.GetReceivedBytes()
-	if received < 0 {
-		received = 0
+	digest, err := b.digest()
+	if err != nil {
+		return fmt.Errorf("compute digest: %w", err)
 	}
-	fmt.Fprintf(out, "%s %s (%s)\n", pastTense(o.subcommand), o.archive, humanBytes(uint64(received)))
-	if len(resp.GetImages()) == 0 {
-		fmt.Fprintf(out, "%-48s %s\n", reference, "(the daemon reported no image)")
-		return nil
-	}
-	for _, img := range resp.GetImages() {
-		name := img.GetManifest().GetReference()
-		if name == "" {
-			name = reference
-		}
-		fmt.Fprintf(out, "%-48s %s\n", name, img.GetManifestDescriptor().GetDigest())
-	}
+	fmt.Fprintf(out, "%s %s\n  store:  recorded in the cluster registry as %s\n  digest: %s\n", pastTense(o.subcommand), o.archive, ref, digest)
 	return nil
+}
+
+// readArchive opens the image an archive holds, for upload. A docker-save tar
+// is read in place; a tarred OCI layout is unpacked into a staging directory
+// first, which the returned cleanup removes. A layout whose one descriptor is
+// a multi-platform index is uploaded as that whole index.
+func readArchive(archive string, format runtimev1.LoadImageFormat) (built, func(), error) {
+	if format == runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE {
+		img, err := tarball.ImageFromPath(archive, nil)
+		if err != nil {
+			return built{}, nil, fmt.Errorf("read the docker-save archive: %w", err)
+		}
+		return built{image: img}, func() {}, nil
+	}
+	tmp, err := os.MkdirTemp("", "k3sm-import")
+	if err != nil {
+		return built{}, nil, fmt.Errorf("create a staging directory: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(tmp) }
+	dir := filepath.Join(tmp, "layout")
+	if err := extractOCILayout(archive, dir); err != nil {
+		cleanup()
+		return built{}, nil, err
+	}
+	idx, err := layoutIndex(dir)
+	if err != nil {
+		cleanup()
+		return built{}, nil, fmt.Errorf("read the layout: %w", err)
+	}
+	if idx != nil {
+		return built{index: idx}, cleanup, nil
+	}
+	img, err := layoutImage(dir)
+	if err != nil {
+		cleanup()
+		return built{}, nil, err
+	}
+	return built{image: img}, cleanup, nil
 }
 
 // pastTense renders the ingest subcommand for the result line.
@@ -176,67 +149,46 @@ func pastTense(subcommand string) string {
 	return "loaded"
 }
 
-// inspectArchive reads the archive ONCE, hashing every byte while it pulls the
-// format's metadata document out of the tar stream. One pass rather than two,
-// because the alternative is reading a multi-GB file twice before a byte is sent.
+// inspectArchive reads the format's metadata document out of the tar stream
+// and returns the reference the archive names for itself.
 //
 // It reads the metadata for exactly two reasons: to derive the reference the
-// archive names for itself, and to refuse the archives v1 cannot represent
-// faithfully. It never turns an entry name into a filesystem path — nothing here
-// extracts anything, which is what makes tar path traversal, symlink escape, and
-// hardlink aliasing non-questions on this path rather than three defenses.
-func inspectArchive(r io.Reader, format runtimev1.LoadImageFormat) (archiveMeta, error) {
+// archive names for itself, and to refuse the archives that cannot be recorded
+// faithfully under one reference. It never turns an entry name into a
+// filesystem path.
+func inspectArchive(r io.Reader, format runtimev1.LoadImageFormat) (string, error) {
 	want, err := metadataName(format)
 	if err != nil {
-		return archiveMeta{}, err
+		return "", err
 	}
-	h := sha256.New()
-	counter := &countingWriter{}
-	tee := io.TeeReader(r, io.MultiWriter(h, counter))
-
 	var doc []byte
-	tr := tar.NewReader(tee)
+	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return archiveMeta{}, fmt.Errorf("read as a tar archive: %w", err)
+			return "", fmt.Errorf("read as a tar archive: %w", err)
 		}
 		if hdr.Typeflag != tar.TypeReg || archiveEntryName(hdr.Name) != want {
 			continue
 		}
 		if doc != nil {
-			return archiveMeta{}, fmt.Errorf("contains two %s entries", want)
+			return "", fmt.Errorf("contains two %s entries", want)
 		}
 		doc, err = io.ReadAll(io.LimitReader(tr, archiveMetadataLimit+1))
 		if err != nil {
-			return archiveMeta{}, fmt.Errorf("read %s: %w", want, err)
+			return "", fmt.Errorf("read %s: %w", want, err)
 		}
 		if len(doc) > archiveMetadataLimit {
-			return archiveMeta{}, fmt.Errorf("%s exceeds the %d-byte limit", want, archiveMetadataLimit)
+			return "", fmt.Errorf("%s exceeds the %d-byte limit", want, archiveMetadataLimit)
 		}
 	}
-	// tar stops at the end-of-archive marker, so anything after it is unread.
-	// The daemon hashes the WHOLE file, so this side must too, or the advisory
-	// digest would describe a prefix and every padded archive would look wrong.
-	if _, err := io.Copy(io.Discard, tee); err != nil {
-		return archiveMeta{}, fmt.Errorf("read to end: %w", err)
-	}
 	if doc == nil {
-		return archiveMeta{}, wrongFormatError(format, want)
+		return "", wrongFormatError(format, want)
 	}
-
-	reference, err := referenceFromMetadata(doc, format)
-	if err != nil {
-		return archiveMeta{}, err
-	}
-	return archiveMeta{
-		reference: reference,
-		digest:    "sha256:" + hex.EncodeToString(h.Sum(nil)),
-		size:      counter.n,
-	}, nil
+	return referenceFromMetadata(doc, format)
 }
 
 // metadataName is the entry each format records its image metadata in.
@@ -284,7 +236,7 @@ type ociIndex struct {
 // referenceFromMetadata derives the reference the archive names for itself, and
 // refuses the multi-image and multi-tag archives v1 cannot record faithfully.
 //
-// REFUSAL, NOT NARROWING: LoadImage records ONE reference, so an archive
+// REFUSAL, NOT NARROWING: a load records ONE reference, so an archive
 // carrying several would have to lose all but one. Silently dropping a tag the
 // operator explicitly saved is worse than failing — they would find out when a
 // Pod spec did not resolve, with nothing to connect it to the load.
@@ -325,15 +277,4 @@ func referenceFromMetadata(doc []byte, format runtimev1.LoadImageFormat) (string
 		return "", nil
 	}
 	return tags[0], nil
-}
-
-// countingWriter counts the bytes written through it. It exists so the archive's
-// size is the number of bytes actually hashed rather than a separate os.Stat,
-// which would report a different file if the archive were replaced mid-read.
-type countingWriter struct{ n int64 }
-
-// Write implements io.Writer.
-func (c *countingWriter) Write(p []byte) (int, error) {
-	c.n += int64(len(p))
-	return len(p), nil
 }

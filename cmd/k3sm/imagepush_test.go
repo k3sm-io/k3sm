@@ -316,16 +316,17 @@ func appendFixture(t *testing.T, layoutDir, tag, payload string) {
 	if err := os.WriteFile(dockerfile, []byte("FROM scratch\nCOPY app /app\nENTRYPOINT [\"/app\"]"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// noStore: this fixture wants the ARTIFACT only. A build normally also
-	// records the image in the node's store, which needs a running daemon this
-	// test has no business requiring.
+	// --no-record: this fixture wants the ARTIFACT only. A build normally also
+	// records the image in the cluster registry, which this test has no
+	// business requiring.
 	if err := buildWith(t.Context(), buildOptions{
 		dockerfile: dockerfile,
 		tag:        tag,
 		output:     layoutDir,
+		noRecord:   true,
 		format:     "oci",
 		contextDir: ctxDir,
-	}, io.Discard, engineBuildWith(recordInStore), noStore, noPush); err != nil {
+	}, io.Discard, engineBuildWith(noStore), noStore, noPush); err != nil {
 		t.Fatalf("build fixture: %v", err)
 	}
 }

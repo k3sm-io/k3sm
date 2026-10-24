@@ -17,16 +17,20 @@ limitations under the License.
 package main
 
 import (
+	"archive/tar"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
 	"google.golang.org/grpc/codes"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/k3sm/pkg/oci"
 )
 
 // errSaveTruncated is the verdict a caller acts on differently from every other
@@ -35,28 +39,133 @@ import (
 // the same retry but for very different trust in what is already on disk.
 var errSaveTruncated = errors.New("the archive arrived truncated")
 
-// imageSave streams one image out of the store as a tarred OCI image layout —
-// the `docker save` analog and the exact inverse of load/import.
+// imageSave exports one image from the cluster registry as a tarred OCI image
+// layout, the `docker save` analog and the exact inverse of import.
 //
-// THE CLIENT IS THE SOLE WRITER OF THE OPERATOR'S FILE, the mirror of the rule
-// that the daemon is the sole writer of the store: the daemon runs as its own
-// unprivileged uid, generally cannot write into an operator's home, and must not
-// try. So the bytes come back over the stream and this side puts them on disk.
-func imageSave(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) error {
-	reference, digest := imageTarget(o.source)
-	req := &runtimev1.SaveImageRequest{
-		Reference: reference,
-		Platform:  o.platform,
-		Digest:    digest,
-		Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
-	}
-	saved, err := saveImageArchive(ctx, client, req, o.output, o.socket)
+// An index is saved whole, every platform in one layout, unless --platform
+// selects one. The layout records the cluster-registry name in its ref.name
+// annotation, so `k3sm image import` of the archive records it under the same
+// name.
+//
+// The archive is staged beside the target and renamed into place only once it
+// is complete, so a failed save leaves NO file at the target: not a partial
+// one, and not a previously-good one replaced by a partial one.
+func imageSave(ctx context.Context, o imageOptions, out io.Writer) error {
+	c, err := resolveClusterImage(o.source, o.workDir)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "saved %s (%s)\n", o.output, humanBytes(uint64(saved.bytes)))
-	fmt.Fprintf(out, "  digest: %s\n", saved.digest)
+	opts, err := registryOptions(ctx, c, o.workDir)
+	if err != nil {
+		return err
+	}
+	desc, _, err := getClusterImage(c, o.platform, o.workDir, opts)
+	if err != nil {
+		return err
+	}
+	stage, err := os.MkdirTemp("", "k3sm-save")
+	if err != nil {
+		return fmt.Errorf("create a staging directory: %w", err)
+	}
+	defer os.RemoveAll(stage)
+	dir := filepath.Join(stage, "layout")
+	sink := oci.LayoutSink{Path: dir}
+	if desc.MediaType.IsIndex() {
+		idx, err := desc.ImageIndex()
+		if err != nil {
+			return fmt.Errorf("read the index %s: %w", c.flat, err)
+		}
+		err = sink.WriteIndex(ctx, c.flat, idx)
+		if err != nil {
+			return registryError("save "+c.flat.String(), err)
+		}
+	} else {
+		img, err := desc.Image()
+		if err != nil {
+			return fmt.Errorf("read the image %s: %w", c.flat, err)
+		}
+		if err := sink.Write(ctx, c.flat, img); err != nil {
+			return registryError("save "+c.flat.String(), err)
+		}
+	}
+	n, err := writeArchiveOf(dir, o.output)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "saved %s (%s)\n", o.output, humanBytes(uint64(n)))
+	fmt.Fprintf(out, "  digest: %s\n", desc.Digest)
 	return nil
+}
+
+// writeArchiveOf tars the layout directory dir into path, through a sibling
+// temp file renamed into place only when the tar is complete, and returns the
+// archive's size.
+func writeArchiveOf(dir, path string) (int64, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".k3sm-save-*.tar")
+	if err != nil {
+		return 0, fmt.Errorf("create the archive in %s: %w", filepath.Dir(path), err)
+	}
+	staged := tmp.Name()
+	committed := false
+	defer func() {
+		tmp.Close()
+		if !committed {
+			_ = os.Remove(staged)
+		}
+	}()
+	tw := tar.NewWriter(tmp)
+	err = filepath.WalkDir(dir, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil || rel == "." {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		if d.IsDir() {
+			hdr.Name += "/"
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tw, f)
+		return err
+	})
+	if err == nil {
+		err = tw.Close()
+	}
+	if err != nil {
+		return 0, fmt.Errorf("write the archive: %w", err)
+	}
+	info, err := tmp.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("write the archive: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return 0, fmt.Errorf("write the archive: %w", err)
+	}
+	if err := os.Rename(staged, path); err != nil {
+		return 0, fmt.Errorf("move the archive into place at %s: %w", path, err)
+	}
+	committed = true
+	return info.Size(), nil
 }
 
 // savedArchive is what a completed export is known to be: the manifest digest
@@ -66,7 +175,8 @@ type savedArchive struct {
 	bytes  int64
 }
 
-// saveImageArchive streams a SaveImage export into path and verifies it.
+// saveImageArchive streams a SaveImage export from this node's store into path
+// and verifies it. `k3sm image push` uses it for a source named in the store.
 //
 // TRUNCATION IS THE FAILURE THIS FUNCTION EXISTS TO CATCH. The wire's framing
 // makes it detectable and nothing else does: the server sends chunk frames and
@@ -114,7 +224,7 @@ func saveImageArchive(ctx context.Context, client runtimev1.ImagesClient, req *r
 // streamSaveImage drains the export stream into w and returns what the terminal
 // frame reported.
 func streamSaveImage(ctx context.Context, client runtimev1.ImagesClient, req *runtimev1.SaveImageRequest, w io.Writer, socket string) (savedArchive, error) {
-	//lint:ignore SA1019 the node-store image verbs stay until build and load move to the registry
+	//lint:ignore SA1019 push's node-store source form still exports through SaveImage
 	stream, err := client.SaveImage(ctx, req)
 	if err != nil {
 		return savedArchive{}, imageRPCError("save image", socket, err)

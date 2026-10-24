@@ -27,12 +27,11 @@ import (
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
 // noStore is the storeRecorder for tests that are not about the store: it
 // records nothing and cannot fail, so a build test never needs a daemon.
-func noStore(context.Context, name.Tag, ggcrv1.Image) error { return nil }
+func noStore(context.Context, name.Tag, built) error { return nil }
 
 // recordingStore is a storeRecorder that remembers what it was handed.
 type recordingStore struct {
@@ -40,8 +39,8 @@ type recordingStore struct {
 	err   error
 }
 
-func (r *recordingStore) record(_ context.Context, ref name.Tag, img ggcrv1.Image) error {
-	if img == nil {
+func (r *recordingStore) record(_ context.Context, ref name.Tag, b built) error {
+	if b.image == nil && b.index == nil {
 		return errors.New("the store was handed a nil image")
 	}
 	r.calls = append(r.calls, ref.String())
@@ -77,17 +76,17 @@ func TestBuildSinkMatrix(t *testing.T) {
 
 			err := buildWith(t.Context(), buildOptions{
 				dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-				tag:        "example.com/app:v1",
+				tag:        "app:v1",
 				output:     out,
 				format:     tc.format,
 				contextDir: ctxDir,
-			}, &log, engineBuildWith(recordInStore), store.record, noPush)
+			}, &log, engineBuildWith(noStore), store.record, noPush)
 			if err != nil {
 				t.Fatalf("build: %v", err)
 			}
 
-			if len(store.calls) != 1 || store.calls[0] != "example.com/app:v1" {
-				t.Fatalf("store recordings = %v, want exactly [example.com/app:v1]", store.calls)
+			if len(store.calls) != 1 || store.calls[0] != "registry-k3sm:6450/app:v1" {
+				t.Fatalf("recordings = %v, want exactly [registry-k3sm:6450/app:v1]", store.calls)
 			}
 			if !strings.Contains(log.String(), "store:") {
 				t.Errorf("the summary does not report the store recording:\n%s", log.String())
@@ -116,10 +115,10 @@ func TestBuildSinkMatrix(t *testing.T) {
 		store := &recordingStore{err: errors.New("cannot reach runtimed")}
 		err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        "example.com/app:v1",
+			tag:        "app:v1",
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuildWith(recordInStore), store.record, noPush)
+		}, io.Discard, engineBuildWith(noStore), store.record, noPush)
 		if err == nil {
 			t.Fatal("expected the store failure to fail the build")
 		}
@@ -135,11 +134,11 @@ func TestBuildSinkMatrix(t *testing.T) {
 		store := &recordingStore{}
 		err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        "example.com/app:v1",
+			tag:        "app:v1",
 			output:     filepath.Join(t.TempDir(), "no-such-dir", "img.tar"),
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuildWith(recordInStore), store.record, noPush)
+		}, io.Discard, engineBuildWith(noStore), store.record, noPush)
 		if err == nil {
 			t.Fatal("expected an error for an unwritable --output")
 		}

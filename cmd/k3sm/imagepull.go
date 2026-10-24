@@ -36,9 +36,9 @@ import (
 // commits, the disk-pressure gate, the one image index pods resolve against),
 // and the forked half is the one nobody re-reads.
 //
-// A successful pull leaves an OPERATOR ROOT over the reference, which is why the
-// image survives `k3sm image prune` until it is untagged. The result line says
-// so, because "I pulled it and prune deleted it" is otherwise the report.
+// A successful pull leaves an OPERATOR ROOT over the reference in this node's
+// cache, which is why the image survives `k3sm image prune`. (`k3sm image
+// untag` removes a cluster-registry tag, not this root.)
 func imagePull(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) error {
 	resp, err := client.PullImage(ctx, &runtimev1.PullImageRequest{
 		Reference: o.source,

@@ -50,6 +50,7 @@ type fakeImagesDaemon struct {
 
 	// LoadImage is client-streaming, so the fake keeps the metadata frame apart
 	// from the concatenated payload: the gate asserts on both independently.
+	loadCalls  int
 	loadFirst  *runtimev1.LoadImageRequest
 	loadBody   []byte
 	loadChunks int
@@ -60,6 +61,7 @@ type fakeImagesDaemon struct {
 	// claim is that the CLI is a CLIENT — the daemon decides — and the only way
 	// to see that is what reached the wire.
 	gotPull     *runtimev1.PullImageRequest
+	pullCalls   int
 	pullResp    *runtimev1.PullImageResponse
 	pullErr     error
 	gotTag      *runtimev1.TagImageRequest
@@ -84,6 +86,7 @@ type fakeImagesDaemon struct {
 
 func (f *fakeImagesDaemon) PullImage(_ context.Context, req *runtimev1.PullImageRequest) (*runtimev1.PullImageResponse, error) {
 	f.gotPull = req
+	f.pullCalls++
 	if f.pullErr != nil {
 		return nil, f.pullErr
 	}
@@ -152,6 +155,7 @@ func (f *fakeImagesDaemon) ImageFsInfo(context.Context, *runtimev1.ImageFsInfoRe
 // LoadImage drains the ingest stream, recording the metadata frame and every
 // payload byte. It answers exactly once, at the end, as the RPC's shape requires.
 func (f *fakeImagesDaemon) LoadImage(stream runtimev1.Images_LoadImageServer) error {
+	f.loadCalls++
 	for {
 		req, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
