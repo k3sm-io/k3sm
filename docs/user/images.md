@@ -313,8 +313,8 @@ Untag removes a name, not bytes. The manifest and its blobs stay while another t
 them, and the registry's own garbage collection reclaims what nothing names. A node that already
 pulled the image keeps its cached copy, so a running Pod is unharmed.
 
-A pulled image survives a prune of this node's cache: `pull` records the reference as content the
-node is meant to keep, so a warmed-but-unused image is not reclaimed behind your back.
+A pulled image is ordinary cache content: `pull` records no operator root, so `k3sm image prune`
+can reclaim it once no Pod uses it.
 
 `pull` of a public image also copies it, the whole index when there is one, into the cluster
 registry as `registry-k3sm:6450/<registry>/<repository>:<tag>` (Docker Hub is spelled

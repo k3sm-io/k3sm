@@ -36,9 +36,9 @@ import (
 // commits, the disk-pressure gate, the one image index pods resolve against),
 // and the forked half is the one nobody re-reads.
 //
-// A successful pull leaves an OPERATOR ROOT over the reference in this node's
-// cache, which is why the image survives `k3sm image prune`. (`k3sm image
-// untag` removes a cluster-registry tag, not this root.)
+// A successful pull records no operator root: the image is ordinary cache
+// content, and `k3sm image prune` can reclaim it once no pod uses it. (`k3sm
+// image untag` removes a cluster-registry tag, not cache content.)
 //
 // It returns the store entry the daemon resolved, so a caller that acts on the
 // pulled image afterwards names that entry's digest rather than the reference.

@@ -58,8 +58,8 @@ pull    fetch a reference into this node's store through the daemon's OWN
         the reference resolved to. --platform pins which manifest of a
         multi-platform index to fetch; --policy carries the corev1 pull-policy
         semantics (always, if-not-present, never). Pull fills this node's
-        cache. A pulled image keeps an operator root in the cache, so prune
-        keeps it. A public reference is then also copied into the cluster
+        cache. A pulled image is ordinary cache content, so prune
+        can reclaim it once no pod uses it. A public reference is then also copied into the cluster
         registry as registry-k3sm:6450/<registry>/<repository>:<tag>
         (docker.io for Docker Hub), which a node pulls from only when the
         public registry cannot be reached at all. The copy uploads as you
