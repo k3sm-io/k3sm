@@ -170,7 +170,7 @@ func (f *fakeImagesDaemon) LoadImage(stream runtimev1.Images_LoadImageServer) er
 // serveFakeImages serves fake on a REAL unix socket and returns its path, so the
 // gate exercises the production dialer (dialRuntimed) end to end rather than a
 // substituted transport.
-func serveFakeImages(t *testing.T, fake *fakeImagesDaemon) string {
+func serveFakeImages(t *testing.T, fake runtimev1.ImagesServer) string {
 	t.Helper()
 	// t.TempDir() embeds the test name and overflows darwin's 104-byte sun_path.
 	dir, err := os.MkdirTemp("", "k3i")

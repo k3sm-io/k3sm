@@ -432,6 +432,17 @@ func TestMigrationTarget(t *testing.T) {
 	}
 }
 
+// migrateListDaemon is the shared Images fake plus the one verb the migration
+// still reads the node store through.
+type migrateListDaemon struct {
+	*fakeImagesDaemon
+	listResp *runtimev1.ListImagesResponse
+}
+
+func (m *migrateListDaemon) ListImages(context.Context, *runtimev1.ListImagesRequest) (*runtimev1.ListImagesResponse, error) {
+	return m.listResp, nil
+}
+
 // migrateDaemon is a fake runtimed whose store holds one image under ref, and
 // the socket it serves on.
 func migrateDaemon(t *testing.T, ref string) (fake *fakeImagesDaemon, sock, digest string) {
@@ -440,14 +451,18 @@ func migrateDaemon(t *testing.T, ref string) (fake *fakeImagesDaemon, sock, dige
 	digest = layoutDigest(t, layout)
 	archive := tarLayout(t, layout)
 	fake = &fakeImagesDaemon{
+		saveChunks:   [][]byte{archive},
+		saveTerminal: &runtimev1.SaveImageResponse{Digest: digest, SentBytes: int64(len(archive))},
+	}
+	srv := &migrateListDaemon{
+		fakeImagesDaemon: fake,
 		listResp: &runtimev1.ListImagesResponse{Images: []*runtimev1.Image{{
 			ManifestDescriptor: &runtimev1.Descriptor{Digest: digest},
 			Manifest:           &runtimev1.ImageManifest{Reference: ref, Platform: &runtimev1.Platform{Os: "darwin", Architecture: "arm64"}},
 		}}},
-		saveChunks:   [][]byte{archive},
-		saveTerminal: &runtimev1.SaveImageResponse{Digest: digest, SentBytes: int64(len(archive))},
 	}
-	return fake, serveFakeImages(t, fake), digest
+	sock = serveFakeImages(t, srv)
+	return fake, sock, digest
 }
 
 // assertStoreOnlyRead fails when anything but list and export reached the
@@ -471,6 +486,7 @@ func gateDigest(t *testing.T, g gateRegistry, repoTag string) string {
 	pool.AppendCertsFromPEM(g.caPEM)
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = &tls.Config{RootCAs: pool, ServerName: "registry-k3sm"}
+	tr.DialContext = g.dial
 	ref, err := name.NewTag("127.0.0.1:" + strconv.Itoa(g.port) + "/" + repoTag)
 	if err != nil {
 		t.Fatal(err)
