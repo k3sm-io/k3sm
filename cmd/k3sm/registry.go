@@ -200,6 +200,10 @@ type registryPullerWiring struct {
 	// only, and the flat name is mapped by the runtime itself, verifying
 	// against the cluster CA. The field stays so the seam is unchanged.
 	ClusterRegistries []string
+	// Flat is where this node's runtime fetches the cluster's one registry name
+	// from: this registry, on loopback (serverFlatRegistry). Zero on a node with
+	// no registry.
+	Flat flatRegistryEndpoint
 }
 
 // startIngestRegistry brings the registry up, publishes the flat registry-k3sm
@@ -254,7 +258,7 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registr
 	r.refresh(auxCtx, &aux, published, sans, serving)
 	r.relay(auxCtx, &aux, serving)
 
-	wiring := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(r.port)}
+	wiring := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(r.port), Flat: serverFlatRegistry(r.port)}
 
 	return func() {
 		stopAux()
