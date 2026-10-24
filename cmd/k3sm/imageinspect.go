@@ -18,125 +18,170 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/protobuf/encoding/protojson"
-
-	runtimev1 "k3sm.io/apis/runtime/v1"
+	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
-// imageInspect reports what this node's store knows about one image.
+// imageInspect reports what the cluster registry holds under one name: the
+// manifest, and for an image its config.
 //
-// Strictly read-only: it resolves nothing against a registry, takes no lease and
-// records no root, so it can never make content reachable. The target is a
-// (reference x platform) key or a manifest digest — never both, which the wire
-// answers INVALID_ARGUMENT — and which one the operator typed is decided by the
-// digest's shape, not by a flag.
+// Strictly read-only. The target is a tag or a repository@digest. An index is
+// reported as its platforms unless --platform selects one, which is then
+// inspected as an image. -o json prints the registry's own manifest and config
+// documents (re-indented, not re-encoded) beside the reference and digest.
 //
-// ABSENT FIELDS ARE ABSENT FACTS. The wire makes every field independently
-// optional so a later daemon can report more without a wire change, and the
-// table honours that by omitting a row rather than printing a placeholder: a
-// config the store no longer holds (the ordinary state after a prune reclaimed
-// an unrooted image's blobs) has no rows, not empty ones.
-func imageInspect(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) error {
-	reference, digest := imageTarget(o.source)
-	resp, err := client.InspectImage(ctx, &runtimev1.InspectImageRequest{
-		Reference: reference,
-		Platform:  o.platform,
-		Digest:    digest,
-	})
+// ABSENT FIELDS ARE ABSENT FACTS: a config that sets no user prints no USER
+// row, not an empty one.
+func imageInspect(ctx context.Context, o imageOptions, out io.Writer) error {
+	c, err := resolveClusterImage(o.source, o.workDir)
 	if err != nil {
-		return imageRPCError("inspect image", o.socket, err)
+		return err
 	}
-	if st := resp.GetError(); st != nil && st.GetCode() != int32(codes.OK) {
-		return fmt.Errorf("inspect image: %s", st.GetMessage())
+	opts, err := registryOptions(ctx, c, o.workDir)
+	if err != nil {
+		return err
 	}
+	desc, parent, err := getClusterImage(c, o.platform, o.workDir, opts)
+	if err != nil {
+		return err
+	}
+	view := inspectView{
+		Reference: c.flat.String(),
+		Digest:    desc.Digest.String(),
+		MediaType: string(desc.MediaType),
+		Manifest:  json.RawMessage(desc.Manifest),
+	}
+	if parent != nil {
+		view.Index = parent.Digest.String()
+	}
+	if desc.MediaType.IsIndex() {
+		return writeIndexInspect(out, o.output, view, desc)
+	}
+	img, err := desc.Image()
+	if err != nil {
+		return fmt.Errorf("read the image %s: %w", c.flat, err)
+	}
+	rawCfg, err := img.RawConfigFile()
+	if err != nil {
+		return fmt.Errorf("read the config of %s: %w", c.flat, err)
+	}
+	view.Config = json.RawMessage(rawCfg)
 	if o.output == "json" {
-		return writeInspectJSON(out, resp)
+		return writeInspectJSON(out, view)
 	}
-	writeInspectTable(out, resp)
+	cf, err := img.ConfigFile()
+	if err != nil {
+		return fmt.Errorf("parse the config of %s: %w", c.flat, err)
+	}
+	m, err := img.Manifest()
+	if err != nil {
+		return fmt.Errorf("parse the manifest of %s: %w", c.flat, err)
+	}
+	writeInspectTable(out, view, cf, m)
 	return nil
 }
 
-// writeInspectJSON prints the daemon's response verbatim, in protobuf JSON.
-//
-// protojson rather than encoding/json: the response is a proto message, so its
-// field names, its enum spellings and its Timestamp encoding are the ones the
-// wire defines. Marshalling the Go struct instead would emit XXX_ bookkeeping
-// fields and a Timestamp shaped like nothing any other tool reads.
-func writeInspectJSON(out io.Writer, resp *runtimev1.InspectImageResponse) error {
-	// Unpopulated fields stay out: on this message an absent field means the
-	// daemon reported no value for that fact, and emitting a zero would turn
-	// "not reported" into "reported as empty".
-	b, err := protojson.MarshalOptions{Multiline: true, Indent: "  "}.Marshal(resp)
+// inspectView is the -o json document: the name, the digest, and the
+// registry's documents as it serves them.
+type inspectView struct {
+	Reference string          `json:"reference"`
+	Digest    string          `json:"digest"`
+	MediaType string          `json:"mediaType"`
+	Index     string          `json:"index,omitempty"`
+	Manifest  json.RawMessage `json:"manifest"`
+	Config    json.RawMessage `json:"config,omitempty"`
+}
+
+// writeInspectJSON prints view as indented JSON.
+func writeInspectJSON(out io.Writer, view inspectView) error {
+	b, err := json.MarshalIndent(view, "", "  ")
 	if err != nil {
-		return fmt.Errorf("render the daemon's response as JSON: %w", err)
+		return fmt.Errorf("render the inspection as JSON: %w", err)
 	}
 	_, err = fmt.Fprintf(out, "%s\n", b)
 	return err
 }
 
-// writeInspectTable renders the human form: the facts an operator came for,
-// each one omitted when the daemon did not report it.
-func writeInspectTable(out io.Writer, resp *runtimev1.InspectImageResponse) {
-	img := resp.GetImage()
-	mfst := img.GetManifest()
-	cfg := resp.GetConfig()
+// writeIndexInspect renders an index: its digest and each platform's manifest.
+func writeIndexInspect(out io.Writer, format string, view inspectView, desc *remote.Descriptor) error {
+	if format == "json" {
+		return writeInspectJSON(out, view)
+	}
+	idx, err := desc.ImageIndex()
+	if err != nil {
+		return fmt.Errorf("read the index %s: %w", view.Reference, err)
+	}
+	m, err := idx.IndexManifest()
+	if err != nil {
+		return fmt.Errorf("parse the index %s: %w", view.Reference, err)
+	}
+	fmt.Fprintf(out, "%-11s %s\n", "REFERENCE", view.Reference)
+	fmt.Fprintf(out, "%-11s %s\n", "DIGEST", view.Digest)
+	fmt.Fprintf(out, "%-11s %s\n", "MEDIATYPE", view.MediaType)
+	fmt.Fprintf(out, "%-11s %d\n", "PLATFORMS", len(m.Manifests))
+	for _, child := range m.Manifests {
+		p := "unlabelled"
+		if child.Platform != nil {
+			p = child.Platform.String()
+		}
+		fmt.Fprintf(out, "  %-16s %s\n", p, child.Digest)
+	}
+	fmt.Fprintln(out, "(pass --platform to inspect one of them)")
+	return nil
+}
 
+// writeInspectTable renders the human form of an image: the facts an operator
+// came for, each one omitted when the config does not set it.
+func writeInspectTable(out io.Writer, view inspectView, cf *ggcrv1.ConfigFile, m *ggcrv1.Manifest) {
 	row := func(label, value string) {
 		if value == "" {
 			return
 		}
 		fmt.Fprintf(out, "%-11s %s\n", label, value)
 	}
-	row("REFERENCE", mfst.GetReference())
-	row("DIGEST", img.GetManifestDescriptor().GetDigest())
-	row("MEDIATYPE", img.GetManifestDescriptor().GetMediaType())
-	// The manifest's resolved platform and the config's declared platform are
-	// different facts — they agree on a well-formed image, and a disagreement is
-	// worth being able to see, so a divergent config platform gets its own row.
-	resolved := platformText(mfst.GetPlatform())
-	row("PLATFORM", resolved)
-	if declared := platformText(cfg.GetPlatform()); declared != "" && declared != resolved {
-		row("CONFIG-PLAT", declared)
+	row("REFERENCE", view.Reference)
+	row("DIGEST", view.Digest)
+	row("MEDIATYPE", view.MediaType)
+	if p := cf.Platform(); p != nil {
+		row("PLATFORM", p.String())
 	}
-	row("INDEX", mfst.GetIndexDigest())
-	if ts := cfg.GetCreated(); ts != nil {
-		row("CREATED", ts.AsTime().UTC().Format(time.RFC3339))
+	row("INDEX", view.Index)
+	if !cf.Created.IsZero() {
+		row("CREATED", cf.Created.UTC().Format(time.RFC3339))
 	}
-	row("USER", cfg.GetUser())
-	row("WORKDIR", cfg.GetWorkingDir())
-	if v := cfg.GetEntrypoint(); len(v) > 0 {
+	row("USER", cf.Config.User)
+	row("WORKDIR", cf.Config.WorkingDir)
+	if v := cf.Config.Entrypoint; len(v) > 0 {
 		row("ENTRYPOINT", fmt.Sprintf("%q", v))
 	}
-	if v := cfg.GetCmd(); len(v) > 0 {
+	if v := cf.Config.Cmd; len(v) > 0 {
 		row("CMD", fmt.Sprintf("%q", v))
 	}
-	if c := mfst.GetConfig(); c.GetDigest() != "" {
-		row("CONFIG", fmt.Sprintf("%s  %s", c.GetDigest(), humanBytes(descriptorBytes(c))))
+	row("CONFIG", fmt.Sprintf("%s  %s", m.Config.Digest, humanBytes(blobBytes(m.Config.Size))))
+	fmt.Fprintf(out, "%-11s %d\n", "LAYERS", len(m.Layers))
+	total := blobBytes(m.Config.Size)
+	seen := map[ggcrv1.Hash]bool{m.Config.Digest: true}
+	for _, l := range m.Layers {
+		fmt.Fprintf(out, "  %s  %s\n", l.Digest, humanBytes(blobBytes(l.Size)))
+		if !seen[l.Digest] {
+			seen[l.Digest] = true
+			total += blobBytes(l.Size)
+		}
 	}
-	layers := mfst.GetLayers()
-	fmt.Fprintf(out, "%-11s %d\n", "LAYERS", len(layers))
-	for _, l := range layers {
-		fmt.Fprintf(out, "  %s  %s\n", l.GetDigest(), humanBytes(descriptorBytes(l)))
-	}
-	// The total is what the image MEASURES, never what removing it would
-	// reclaim: a layer shared with another image is counted here and would
-	// survive a prune. Saying so costs a line and saves an operator inferring a
-	// broken prune from the arithmetic.
-	fmt.Fprintf(out, "%-11s %s\n", "TOTAL", humanBytes(resp.GetTotalSizeBytes()))
-	fmt.Fprintln(out, "(total counts each distinct blob once; layers shared with another image survive a prune)")
+	fmt.Fprintf(out, "%-11s %s\n", "TOTAL", humanBytes(total))
+	fmt.Fprintln(out, "(sizes are the registry's stored blob sizes, each distinct blob counted once)")
 }
 
-// descriptorBytes reads a descriptor's size as an unsigned count. A negative
-// size is not a small image, it is a daemon that reported nonsense, and it is
-// clamped rather than wrapped to 16 exbibytes by the conversion.
-func descriptorBytes(d *runtimev1.Descriptor) uint64 {
-	if d.GetSize() < 0 {
+// blobBytes reads a descriptor size as an unsigned count, clamping a negative
+// size, which is a malformed manifest, to zero rather than wrapping it.
+func blobBytes(n int64) uint64 {
+	if n < 0 {
 		return 0
 	}
-	return uint64(d.GetSize())
+	return uint64(n)
 }

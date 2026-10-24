@@ -18,93 +18,126 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
-	"google.golang.org/grpc/codes"
-
-	runtimev1 "k3sm.io/apis/runtime/v1"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
-// imageTag records an ADDITIONAL name for content this node already holds.
+// errTagRepoint reports that `k3sm image tag` was asked to move an existing tag
+// onto a different manifest without --force.
+var errTagRepoint = errors.New("the tag already names another manifest")
+
+// imageTag adds a tag to a manifest the cluster registry already holds.
 //
-// TagImage names its target by DIGEST and never by another tag, because roots
-// are digest-pinned: a tag that named a mutable name would let a concurrent
-// re-pull decide what the new tag ends up meaning. So an operator who typed a
-// reference gets it resolved to a digest FIRST, here, by a read-only
-// InspectImage — the resolution is explicit and visible in the output, rather
-// than a step the daemon takes on the caller's behalf.
+// The new tag is an OCI distribution manifest PUT of the SAME bytes, so it
+// names exactly the digest the source names: nothing is rebuilt or
+// re-serialised. A source in another repository is copied into the new tag's
+// repository, blobs mounted across, and still keeps its digest.
 //
-// The two refusals the operator will actually meet are surfaced verbatim: the
-// digest is not in this store (NOT_FOUND), and the new name already resolves
-// somewhere else (FAILED_PRECONDITION, which this verb never overrides — that is
-// untag, then tag).
-func imageTag(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) error {
-	digest := o.source
-	if !looksLikeDigest(digest) {
-		resolved, err := client.InspectImage(ctx, &runtimev1.InspectImageRequest{
-			Reference: o.source,
-			Platform:  o.platform,
-		})
-		if err != nil {
-			return imageRPCError(fmt.Sprintf("resolve %s to a digest", o.source), o.socket, err)
-		}
-		if st := resolved.GetError(); st != nil && st.GetCode() != int32(codes.OK) {
-			return fmt.Errorf("resolve %s to a digest: %s", o.source, st.GetMessage())
-		}
-		digest = resolved.GetImage().GetManifestDescriptor().GetDigest()
-		if digest == "" {
-			return fmt.Errorf("resolve %s to a digest: the daemon reported no digest for it", o.source)
-		}
-		fmt.Fprintf(out, "%s resolves to %s\n", o.source, digest)
-	}
-	//lint:ignore SA1019 the node-store image verbs stay until build and load move to the registry
-	resp, err := client.TagImage(ctx, &runtimev1.TagImageRequest{
-		Digest:    digest,
-		Reference: o.target,
-		Platform:  o.platform,
-	})
+// It never silently re-points a tag: a new name that already names a different
+// manifest is refused with errTagRepoint unless --force is given, because a
+// Pod that pulls the tag next would run other content than it ran before. Build
+// and load are different: they overwrite their own tag, which is what a rebuild
+// means.
+//
+// The source is a tag, a repository@digest, or a bare digest, which names a
+// manifest in the new tag's repository. --platform tags the platform's child
+// of an index rather than the whole index.
+func imageTag(ctx context.Context, o imageOptions, out io.Writer) error {
+	dst, err := resolveClusterImage(o.target, o.workDir)
 	if err != nil {
-		return imageRPCError("tag image", o.socket, err)
+		return err
 	}
-	if st := resp.GetError(); st != nil && st.GetCode() != int32(codes.OK) {
-		return fmt.Errorf("tag image: %s", st.GetMessage())
+	if !dst.isTag() {
+		return fmt.Errorf("tag %s: the new name must be a tag, not a digest", o.target)
 	}
-	if resp.GetAlreadyPresent() {
-		fmt.Fprintf(out, "already tagged %s\n", o.target)
+	var src clusterImage
+	if looksLikeDigest(o.source) {
+		src, err = clusterImageAt(dst.flat.Context().RepositoryStr(), o.source, o.workDir)
 	} else {
-		fmt.Fprintf(out, "tagged %s\n", o.target)
+		src, err = resolveClusterImage(o.source, o.workDir)
 	}
-	writeImageFacts(out, resp.GetImage())
+	if err != nil {
+		return err
+	}
+	opts, err := registryOptions(ctx, dst, o.workDir)
+	if err != nil {
+		return err
+	}
+	desc, _, err := getClusterImage(src, o.platform, o.workDir, opts)
+	if err != nil {
+		return err
+	}
+	if src.isTag() || o.platform != nil {
+		fmt.Fprintf(out, "%s resolves to %s\n", src.flat, desc.Digest)
+	}
+
+	existing, err := remote.Head(dst.remote, opts...)
+	switch {
+	case err == nil && existing.Digest == desc.Digest:
+		fmt.Fprintf(out, "already tagged %s\n  digest:   %s\n", dst.flat, desc.Digest)
+		return nil
+	case err == nil && !o.force:
+		return fmt.Errorf("tag %s: %w (%s); pass --force to re-point it to %s", dst.flat, errTagRepoint, existing.Digest, desc.Digest)
+	case err != nil && !isNotFound(err):
+		return registryError("read "+dst.flat.String(), err)
+	}
+
+	// Within one repository the blobs are already there, so the tag is the
+	// manifest PUT alone. Across repositories Push uploads what the new
+	// repository lacks first, then the manifest.
+	if src.flat.Context().RepositoryStr() == dst.flat.Context().RepositoryStr() {
+		err = remote.Put(dst.remote, desc, opts...)
+	} else {
+		err = remote.Push(dst.remote, desc, opts...)
+	}
+	if err != nil {
+		return registryError("tag "+dst.flat.String(), err)
+	}
+	if existing != nil {
+		fmt.Fprintf(out, "re-pointed %s from %s\n  digest:   %s\n", dst.flat, existing.Digest, desc.Digest)
+		return nil
+	}
+	fmt.Fprintf(out, "tagged %s\n  digest:   %s\n", dst.flat, desc.Digest)
 	return nil
 }
 
-// imageUntag removes ONE (reference x platform) name.
+// imageUntag deletes one tag from the cluster registry.
 //
-// IT REMOVES A NAME, NOT BYTES, and the result line says so every time: no blob
-// is unlinked here, and content is reclaimed only by `k3sm image prune`, which
-// re-derives reachability first. Untagging a name a running pod still pins
-// leaves that pod unharmed — that is the point of separating the two verbs.
+// IT REMOVES A NAME, NOT BYTES. The registry deletes the tag alone; the
+// manifest and its blobs stay while any other tag or index names them, and the
+// registry's own garbage collection reclaims what nothing names. A node that
+// already pulled the image keeps its cached copy, so a running Pod is not
+// harmed.
 //
-// It is deliberately not idempotent-by-silence: an absent name is NOT_FOUND from
-// the daemon and an error here, because the operator asked to remove a specific
-// name. An ambiguous untag — no --platform on a reference with several entries —
-// is refused too, and removes nothing.
-func imageUntag(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) error {
-	//lint:ignore SA1019 the node-store image verbs stay until build and load move to the registry
-	resp, err := client.UntagImage(ctx, &runtimev1.UntagImageRequest{
-		Reference: o.source,
-		Platform:  o.platform,
-		Digest:    o.digest,
-	})
+// It is deliberately not idempotent-by-silence: an absent tag is an error,
+// because the operator asked to remove a specific name. --digest refuses the
+// removal unless the tag still names that manifest.
+func imageUntag(ctx context.Context, o imageOptions, out io.Writer) error {
+	c, err := resolveClusterImage(o.source, o.workDir)
 	if err != nil {
-		return imageRPCError("untag image", o.socket, err)
+		return err
 	}
-	if st := resp.GetError(); st != nil && st.GetCode() != int32(codes.OK) {
-		return fmt.Errorf("untag image: %s", st.GetMessage())
+	if !c.isTag() {
+		return fmt.Errorf("untag %s: name the tag to remove, not a digest", o.source)
 	}
-	fmt.Fprintf(out, "untagged %s\n", o.source)
-	writeImageFacts(out, resp.GetRemoved())
-	fmt.Fprintln(out, "(the content is still on disk — `k3sm image prune` reclaims what no name and no pod references)")
+	opts, err := registryOptions(ctx, c, o.workDir)
+	if err != nil {
+		return err
+	}
+	desc, err := remote.Head(c.remote, opts...)
+	if err != nil {
+		return registryError("untag "+c.flat.String(), err)
+	}
+	if o.digest != "" && desc.Digest.String() != o.digest {
+		return fmt.Errorf("untag %s: it names %s, not %s; nothing was removed", c.flat, desc.Digest, o.digest)
+	}
+	if err := remote.Delete(c.remote, opts...); err != nil {
+		return registryError("untag "+c.flat.String(), err)
+	}
+	fmt.Fprintf(out, "untagged %s\n  digest:   %s\n", c.flat, desc.Digest)
+	fmt.Fprintln(out, "(the registry reclaims content no tag names at its next garbage collection)")
 	return nil
 }

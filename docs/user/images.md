@@ -283,34 +283,37 @@ repairs it under `Next:`; the latter is a `--socket` away.
 
 `kubectl get node <name> -o json` lists the node's 50 largest images under `status.images`; anyone who can read nodes can read the names. The node refreshes the list with its status, and keeps the last list it read when its image index cannot be read, so the list can go stale until the index reads again.
 
-## Working With the Store: `pull`, `tag`, `untag`, `inspect`, `save`
+## Naming and Reading Images: `tag`, `untag`, `inspect`, `save`, `pull`
 
-These five verbs are the store's day-to-day surface. Each one is a client of the node's runtime
-daemon, and the daemon is the store's only writer, so nothing here walks the store directly.
+`tag`, `untag`, `inspect` and `save` act on the cluster registry, where `build`, `load` and `import`
+record images. They talk to this server's registry as you, with its push credential (`--work-dir`
+names the control plane's state directory when it is not the one your user resolves), and never
+contact the node's runtime daemon. A name may be written bare, as `registry-k3sm:6450/...`, or as
+this node's `localhost:<port>/...`; a name that points at another registry is refused. `pull` is the
+one verb here that fills this node's cache.
 
 ```sh
-k3sm image pull ghcr.io/org/app:v1            # warm the store ahead of a workload
-k3sm image tag ghcr.io/org/app:v1 app:local   # give content a second name
-k3sm image inspect app:local                  # digest, platform, config, layer sizes
-k3sm image save app:local -o app.tar          # export a tarred OCI layout
-k3sm image untag app:local                    # remove that name again
+k3sm image tag myapp:v1 myapp:stable          # a second tag for the same manifest
+k3sm image inspect myapp:stable               # digest, platform, config, layer sizes
+k3sm image save myapp:stable -o myapp.tar     # export a tarred OCI layout
+k3sm image untag myapp:stable                 # remove that tag again
+k3sm image pull ghcr.io/org/app:v1            # warm this node's cache ahead of a workload
 ```
 
 | verb | what it does |
 |---|---|
-| `pull <reference>` | Fetches the reference through the daemon's own puller, the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. |
-| `tag <digest\|reference> <new-reference>` | Records an **additional** name for content the node already holds. Contacts no registry and writes no blob. The target is named by digest, because a tag that named another tag could be re-aimed by a concurrent pull; a reference you pass is resolved to one first, and the resolution is printed. It never re-points an existing name. To move a name, `untag` it, then `tag` again. |
-| `untag <reference>` | Removes **one** name. `--digest` refuses the removal unless the name still resolves to that digest; `--platform` picks the entry when a reference has more than one, and an ambiguous untag is refused rather than guessed. |
-| `inspect <reference\|digest>` | Reports the digest, the resolved platform, the creation time, entrypoint/cmd, user, working directory and each layer's size. `-o json` prints the daemon's raw response for scripting. Read-only, so it contacts no registry and records nothing. |
-| `save <reference> -o <file.tar>` | Streams the image out as a tarred OCI image layout, the `docker save` analog and the exact inverse of `import`. The archive is checked against the digest and the byte count the daemon reports it sent, and a short one is discarded rather than left on disk. |
+| `tag <reference\|digest> <new-tag>` | Adds a tag to a manifest the registry already holds. It sends the same manifest bytes under the new tag, so the new tag names the same digest; a source in another repository is copied across with its blobs. The source is a tag, a `<repository>@<digest>`, or a bare digest, which is looked up in the new tag's repository. `--platform` tags one platform's manifest of a multi-platform index. A new tag that already names another manifest is refused unless you pass `--force`; `build`, `load` and `import` overwrite their own tag without asking. |
+| `untag <tag>` | Deletes one tag. `--digest` refuses the removal unless the tag still names that digest. A tag names a whole index, so `untag` takes no `--platform`. |
+| `inspect <tag\|repository@digest>` | Reads the manifest and config from the registry and reports the digest, the platform, the creation time, entrypoint/cmd, user, working directory and each layer's size. An index lists its platforms; `--platform` inspects one of them. `-o json` prints the registry's manifest and config documents for scripting. Read-only. |
+| `save <tag\|repository@digest> -o <file.tar>` | Exports the image as a tarred OCI image layout, the `docker save` analog and the exact inverse of `import`: the layout names the image `registry-k3sm:6450/<repository>:<tag>`, so importing the archive records it under the same name. An index is saved whole unless `--platform` picks one platform. The archive is written beside the target and renamed into place when complete, so a failed save leaves no file behind. |
+| `pull <reference>` | Fetches the reference into this node's cache through the daemon's own puller, the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. |
 
-Untag removes a name, not bytes. No blob is unlinked by `untag`; content is reclaimed only by
-`k3sm image prune`, which re-derives what is still reachable first. Untagging a name a running Pod
-still uses leaves that Pod unharmed, and a name you removed frees no space until you prune.
+Untag removes a name, not bytes. The manifest and its blobs stay while another tag or index names
+them, and the registry's own garbage collection reclaims what nothing names. A node that already
+pulled the image keeps its cached copy, so a running Pod is unharmed.
 
-A pulled image survives a prune. `pull` and `tag` record the reference as content the node is meant
-to keep, so a warmed-but-unused image is not reclaimed behind your back. Untag it when you no
-longer want it, then prune.
+A pulled image survives a prune of this node's cache: `pull` records the reference as content the
+node is meant to keep, so a warmed-but-unused image is not reclaimed behind your back.
 
 ## Pushing to a Registry: `k3sm image push`
 
@@ -331,8 +334,8 @@ k3sm build --tag registry.example.com/me/myapp:v1 --push .   # to that registry 
 ```
 
 The first argument is normally that layout directory. A first argument that is **no path on
-disk** is taken as a reference in this node's own store instead, and k3sm exports it with `save`,
-verifies the export, and uploads the result.
+disk** is taken as a reference in this node's cache instead, and k3sm exports it from the cache
+through the runtime daemon, verifies the export, and uploads the result.
 
 ```sh
 k3sm image push myapp:v1 registry.example.com/me/myapp:v1

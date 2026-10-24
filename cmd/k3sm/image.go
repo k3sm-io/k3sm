@@ -38,12 +38,12 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
-const imageUsage = `k3sm image — ingest, inspect and reclaim this node's image store
+const imageUsage = `k3sm image — record, name and inspect images in the cluster registry, and manage this node's cache
 
 Usage: k3sm image pull <reference> [flags]
-       k3sm image tag <digest|reference> <new-reference> [flags]
-       k3sm image untag <reference> [flags]
-       k3sm image inspect <reference|digest> [flags]
+       k3sm image tag <reference|digest> <new-tag> [flags]
+       k3sm image untag <tag> [flags]
+       k3sm image inspect <tag|repository@digest> [flags]
        k3sm image save <reference> -o <file.tar> [flags]
        k3sm image load <docker-save.tar> [flags]
        k3sm image import <oci-layout.tar> [flags]
@@ -57,25 +57,32 @@ pull    fetch a reference into this node's store through the daemon's OWN
         re-hashed against its digest before it is recorded. Prints the digest
         the reference resolved to. --platform pins which manifest of a
         multi-platform index to fetch; --policy carries the corev1 pull-policy
-        semantics (always, if-not-present, never). A pulled image survives
-        prune until you untag it.
-tag     record an ADDITIONAL name for content this node already holds. The
-        target is named by digest — a reference is resolved to one first —
-        because a tag that named another tag could be re-aimed by a concurrent
-        pull. It never re-points an existing name: that is untag, then tag.
-untag   remove ONE (reference x platform) name. UNTAG REMOVES A NAME, NOT
-        BYTES: no blob is unlinked here, and content is reclaimed only by
-        ` + "`k3sm image prune`" + `, which re-derives reachability first — so untagging
-        a name a running pod still pins leaves that pod unharmed. --digest
-        refuses the removal unless the name still resolves to that digest.
-inspect report what the store knows about one image: digest, resolved platform,
-        creation time, entrypoint/cmd, user, working directory, and each
-        layer's digest and size. -o json prints the daemon's raw response
-        instead of the table. Read-only — it contacts no registry.
-save    stream one image out of the store as a tarred OCI image layout (the
-        ` + "`docker save`" + ` analog) into the file -o names. The archive is checked
-        against the digest and the byte count the daemon reports it sent, and
-        a short one is discarded rather than left on disk.
+        semantics (always, if-not-present, never). Pull fills this node's
+        cache; it never writes the cluster registry. A pulled image keeps an
+        operator root in the cache, so prune keeps it.
+tag     add a tag in the cluster registry to a manifest it already holds:
+        an OCI manifest PUT of the same bytes, so the new tag names the same
+        digest. The source is a tag, a <repository>@<digest>, or a bare digest
+        in the new tag's repository; --platform tags that platform's child of
+        an index. It refuses to re-point a tag that already names another
+        manifest unless --force is given.
+untag   delete one tag from the cluster registry. It REMOVES A NAME, NOT BYTES:
+        a manifest another tag names stays, the registry's own garbage
+        collection reclaims what nothing names, and a node that already
+        pulled the image keeps its cached copy. --digest refuses the removal
+        unless the tag still names that manifest.
+inspect report what the cluster registry holds under a tag or a
+        <repository>@<digest>: digest, platform, creation time,
+        entrypoint/cmd, user, working directory, and each layer's digest and
+        size. An index lists its platforms; --platform inspects one. -o json
+        prints the registry's manifest and config documents instead.
+save    export one image from the cluster registry as a tarred OCI image
+        layout (the ` + "`docker save`" + ` analog, and what import reads back) into
+        the file -o names. An index is saved whole unless --platform picks
+        one. A failed save leaves no file behind.
+        tag, untag, inspect and save talk to this server's registry as you,
+        with this node's push credential (see --work-dir); they never contact
+        the daemon, and a name naming another registry is refused.
 load    record a ` + "`docker save`" + ` tar in the cluster registry, the cluster's one
         image store, under registry-k3sm:6450/<repository>:<tag>, overwriting
         that tag; then pull it into this node's cache.
@@ -99,7 +106,7 @@ prune   delete image content no pod references. DRY RUN BY DEFAULT — pass
         is a client of the runtimed Images service, it never walks the store
         itself. A pod's content is never deleted, and if the daemon cannot
         enumerate every pod's references it refuses the whole prune.
-ls      list the images this node has recorded.
+ls      list the images this node's cache holds.
 df      show the image store's filesystem usage.
 
 Flags:
@@ -178,30 +185,30 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		fs.PrintDefaults()
 	}
 	fs.StringVar(&o.socket, "socket", runtimed.DefaultSocketPath, "runtimed control socket to dial")
-	// The control-plane state root, consulted by push, load and import, and only
-	// to find this node's ingest-registry credential. A resolve failure is not reported here:
+	// The control-plane state root, consulted by the verbs that talk to the
+	// cluster registry, and only to find this node's ingest-registry credential. A resolve failure is not reported here:
 	// every other subcommand is a client of runtimed and has no use for a work
 	// dir, so an unresolvable one must not make `k3sm image ls` fail.
 	defaultWorkDir, _ := executor.ResolveWorkDir()
-	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's ingest-registry push credential from (push, load, import)")
+	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's ingest-registry push credential from (push, load, import, tag, untag, inspect, save)")
 	// DRY RUN IS THE DEFAULT and deleting takes an explicit flag, because the
 	// blast radius is asymmetric: a needless dry run costs a statfs, while an
 	// unintended prune on a node that cannot reach its registry costs every image
 	// it cannot re-pull.
-	fs.BoolVar(&o.force, "force", false, "actually unlink (without this, prune only reports what it would delete)")
+	fs.BoolVar(&o.force, "force", false, "prune: actually unlink (without this, prune only reports what it would delete); tag: re-point a tag that names another manifest")
 	fs.StringVar(&o.reference, "reference", "", "reference to record a loaded image under (load, import; defaults to the one the archive names)")
 	// The platform is part of the store's (reference x platform) KEY, never a
 	// filter, so it is spelled the way an OCI platform is spelled everywhere
 	// else — os/arch[/variant] — rather than as three flags nobody would pair
 	// correctly.
 	var platformSpec, policySpec string
-	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull, tag, untag, inspect, save)")
+	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull; tag, inspect, save: one platform of an index)")
 	fs.StringVar(&policySpec, "policy", "", "pull policy: always, if-not-present or never (pull only; default is the pull-through behaviour)")
 	fs.StringVar(&o.digest, "digest", "", "refuse the removal unless the name still resolves to this manifest digest (untag only)")
 	// One flag, two meanings, chosen by the subcommand — the spelling `docker`
 	// uses for both. It is validated per subcommand at parse time so `inspect -o
 	// out.tar` fails before anything is dialled.
-	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the daemon's raw response instead of the table")
+	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table")
 	fs.StringVar(&o.output, "output", "", "alias for -o")
 	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call (load, import, push, pull and save default to 30m — they stream image content)")
 	if err := fs.Parse(args); err != nil {
@@ -285,9 +292,12 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// Every flag below belongs to a subset of the verbs. Refusing a flag the
 	// verb cannot honour beats ignoring it: an ignored --platform on a prune
 	// reads as "that platform was pruned" until someone re-reads the store.
-	platformVerbs := map[string]bool{"pull": true, "tag": true, "untag": true, "inspect": true, "save": true}
+	platformVerbs := map[string]bool{"pull": true, "tag": true, "inspect": true, "save": true}
 	if flagWasSet(fs, "platform") && !platformVerbs[o.subcommand] {
-		return o, fmt.Errorf("%s does not take --platform (it selects the (reference x platform) entry pull, tag, untag, inspect and save act on)", o.subcommand)
+		return o, fmt.Errorf("%s does not take --platform (it selects the platform pull fetches, or the child of an index tag, inspect and save act on; a tag names the whole index, so untag takes none)", o.subcommand)
+	}
+	if o.force && o.subcommand != "prune" && o.subcommand != "tag" {
+		return o, fmt.Errorf("%s does not take --force (it unlinks for prune and re-points a tag for tag)", o.subcommand)
 	}
 	var err error
 	if o.platform, err = parsePlatform(platformSpec); err != nil {
@@ -415,6 +425,18 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 	case "import":
 		return imageIngest(ctx, o, out, ingestPusher, warmNodeCache(dial, o.socket), runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT)
 	}
+	// tag, untag, inspect and save act on the cluster registry and never dial
+	// the daemon: the node's store is a pull cache no user verb names.
+	switch o.subcommand {
+	case "tag":
+		return imageTag(ctx, o, out)
+	case "untag":
+		return imageUntag(ctx, o, out)
+	case "inspect":
+		return imageInspect(ctx, o, out)
+	case "save":
+		return imageSave(ctx, o, out)
+	}
 	cc, closer, err := dial(ctx, o.socket)
 	if err != nil {
 		return err
@@ -426,14 +448,6 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 	switch o.subcommand {
 	case "pull":
 		return imagePull(ctx, client, o, out)
-	case "tag":
-		return imageTag(ctx, client, o, out)
-	case "untag":
-		return imageUntag(ctx, client, o, out)
-	case "inspect":
-		return imageInspect(ctx, client, o, out)
-	case "save":
-		return imageSave(ctx, client, o, out)
 	case "prune":
 		return imagePrune(ctx, client, o, out)
 	case "ls":
