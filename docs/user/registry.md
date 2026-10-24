@@ -109,6 +109,7 @@ spec:
 
 The Mac does not resolve `registry-k3sm`, and does not need to: every node maps that name to the
 registry itself.
+From another Mac, see [Reaching It From Another Mac](#reaching-it-from-another-mac).
 
 `k3sm image tag`, `untag`, `inspect` and `save` still talk to the registry's own loopback listener,
 so they run only on the server. `tag` and `untag` write with the server's per-boot credential, and
@@ -435,6 +436,58 @@ The worker finds the server's registry address in the `registry-k3sm` Service's 
 `k3sm-registry`, so the kubeconfig must also be allowed to read EndpointSlices there. The admin
 kubeconfig is; the `k3sm:registry-builder-token` Role alone is not, and such a user pushes from the
 server or is given that read by an admin.
+
+## Reaching It From Another Mac
+
+The in-cluster name does not resolve on a Mac, and k3sm does not make it resolve. A tool running on
+a Mac that is not the server can reach the registry through a NodePort instead. It is off by
+default. Turn it on with `--registry-node-port` on the server, choosing a port in the NodePort range
+(30000 to 32767), and restart the server:
+
+```sh
+k3sm server --registry-node-port 30650
+```
+
+On an installed server, add the flag to the server daemon's arguments; every later install carries
+it over (see [Server flags across a reinstall](install.md#server-flags-across-a-reinstall)).
+
+The `registry-k3sm` Service then becomes a NodePort Service, and the registry answers at that port
+on every node:
+
+```
+<node-address>:30650
+```
+
+It is the same registry behind the same front. It serves HTTPS under the cluster CA, a plain-HTTP
+request is refused, and every write goes through the same checks as a push from a Pod. On a single
+Mac with no mesh and no Linux guests no Service is published, so there is no NodePort either; use
+`localhost:6450` there.
+
+The certificate names `registry-k3sm`, the Service's cluster address and the server's mesh address.
+It does not name a node's LAN address. A tool dialling the server's mesh address verifies as it is;
+a tool dialling a LAN address has to be told to verify the name `registry-k3sm`. Take the CA from
+the cluster, then point the tool at it:
+
+```sh
+kubectl get configmap kube-root-ca.crt -n default -o jsonpath='{.data.ca\.crt}' > k3sm-ca.crt
+curl --cacert k3sm-ca.crt \
+  --connect-to registry-k3sm:30650:<node-address>:30650 \
+  https://registry-k3sm:30650/v2/_catalog
+```
+
+What this changes:
+
+- Reads become anonymous to everything that can reach a node on that port. With LAN access on
+  (`k3sm network lan on`), that is every network the Mac is on, so anyone there can list and pull
+  every image the cluster runs. With LAN access off, NodePorts bind only this Mac and the mesh.
+- Writes still need a token. A push needs a ServiceAccount token for the audience `k3sm-registry`,
+  which `k3sm registry token` prints, under the same rules as
+  [a push from a Pod](#pushing-from-inside-a-pod). An anonymous push is answered `401`.
+- Every client that comes in through the NodePort reaches the registry from the node's own address,
+  so they share one client's share of the [rate limits](#refusals).
+
+Drop the flag and restart the server to close the port again; the Service goes back to a cluster
+address only.
 
 ## Storage
 
