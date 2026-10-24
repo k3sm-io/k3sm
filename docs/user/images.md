@@ -316,6 +316,45 @@ pulled the image keeps its cached copy, so a running Pod is unharmed.
 A pulled image survives a prune of this node's cache: `pull` records the reference as content the
 node is meant to keep, so a warmed-but-unused image is not reclaimed behind your back.
 
+## Reclaiming Space: `k3sm image prune`
+
+`k3sm image prune` reclaims space in two places: the cluster registry, and this node's cache.
+It is a dry run unless you pass `--force`.
+
+```sh
+sudo k3sm image prune                 # report what would go
+sudo k3sm image prune --force         # delete it
+sudo k3sm image prune -o json         # the same report as one JSON document
+```
+
+In the registry it deletes untagged manifests: what is left behind when a tag is pushed again
+and now names a newer image. It keeps every tagged manifest, and these untagged ones too:
+
+- a manifest that a kept multi-platform index names;
+- a referrer, such as a signature, whose subject is kept;
+- a manifest younger than an hour, since a multi-platform push uploads its per-platform
+  manifests before the index that names them.
+
+A deleted manifest's layers are reclaimed by the registry's own garbage collection on its next
+sweep, so disk usage drops some time after the prune. An untagged manifest that a Pod names by
+digest is deleted too, so give anything you run by digest a tag. The registry half runs on the
+server that holds the registry, as the control plane's user. It reads the registry's storage
+and deletes through the registry's API with that server's own push credential. On a node with
+no registry, prune says so and evicts the cache only. Pods cannot delete: the in-cluster push
+path refuses every deletion.
+
+In the cache it asks the node's runtime daemon to evict the content no Pod uses. The daemon
+keeps everything a Pod uses, and if it cannot list every Pod's images it refuses the whole
+prune. This half runs before the registry half, so a refusal there deletes nothing
+anywhere.
+
+The `-o json` document has three keys. `dryRun` is true without `--force`. `registry` holds
+`name`, `skipped` (set only on a node without a registry), `manifests` (each with `repository`,
+`digest`, `mediaType` and `size`, deleted or to be deleted), `kept` (the untagged manifests kept,
+each with its `reason`), and, when present, `unreadable` repositories and `failed` deletions.
+`cache` holds `blobs`, `reclaimedBytes` and `kept` (counts by reason). The command exits non-zero
+when any deletion fails, after printing the report.
+
 ## Pushing to a Registry: `k3sm image push`
 
 `k3sm image push` uploads the image in an OCI layout directory to a registry reference, so a node
