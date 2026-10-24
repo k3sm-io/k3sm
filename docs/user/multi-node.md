@@ -168,6 +168,19 @@ The agent authenticates with the bootstrap token, receives its node credentials,
 **public** key is registered in the `MeshPeer` records held in the datastore. Private keys never leave
 the node. The `MeshPeer` records carry public keys only.
 
+### Pushing images from a worker
+
+A worker writes no user kubeconfig, which is also how k3s behaves. To push to the cluster registry
+from a worker, copy the admin kubeconfig from the server and write one on the worker:
+
+```sh
+k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write
+```
+
+`k3sm registry token` and `k3sm registry login` then mint a push token through it. A user who should
+push without administering the cluster needs only the `k3sm:registry-builder-token` role, bound in
+the `k3sm-registry` namespace. See [the cluster registry](registry.md#pushing-with-other-tools).
+
 ### Restarting a node
 
 A joined agent keeps its credential in its work dir, so restarting it needs no token. It presents the

@@ -340,6 +340,89 @@ A refused push says why, in an OCI error body. Every status a push can get:
 | `502` | The registry behind the gate is unreachable. |
 | `503` | The cluster API is unreachable, or the gate has no identity to ask it with. Retry. |
 
+## Pushing With Other Tools
+
+The cluster has one push identity for people: the `builder` ServiceAccount in the `k3sm-registry`
+namespace. Every server creates it on start and binds it, cluster-wide, to `k3sm:registry-pusher`,
+so a token for it may push any repository. You do not share a password. Each push token is minted
+through your own kubeconfig, and you can mint one only if your kubeconfig may create tokens for
+that ServiceAccount.
+
+Print a token, valid for an hour unless you ask for another lifetime:
+
+```sh
+k3sm registry token
+k3sm registry token --duration 20m
+```
+
+The shortest lifetime is 10 minutes. A lifetime above the cluster's maximum is refused rather than
+shortened. The command makes the same call as:
+
+```sh
+kubectl create token builder -n k3sm-registry --audience k3sm-registry
+```
+
+To let docker, buildx, crane and oras push with nothing else in the loop, write the token into your
+docker config:
+
+```sh
+k3sm registry login
+```
+
+That sets the `registry-k3sm:6450` entry in `$DOCKER_CONFIG/config.json`, or
+`~/.docker/config.json`, with mode `0600`, and keeps everything else in the file. Run it again when
+the token expires. If your docker config keeps credentials in a credential store (Docker Desktop
+does), `login` stops and tells you to feed the store instead:
+
+```sh
+k3sm registry token | docker login registry-k3sm:6450 -u builder --password-stdin
+```
+
+The registry checks the token at its HTTPS front, `registry-k3sm:6450`, which listens on the
+server's cluster network address. Trust the cluster CA. It is the CA your kubeconfig embeds:
+
+```sh
+kubectl config view --raw --minify \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > k3sm-ca.crt
+```
+
+### Who can mint a token
+
+- The admin kubeconfig can. `sudo k3sm install` merges it into the installing user's
+  `~/.kube/config` on the server, so `k3sm registry token` works there right after the install.
+- Anyone else needs a grant. k3sm ships the `k3sm:registry-builder-token` ClusterRole, which allows
+  only `create` on `serviceaccounts/token` for the name `builder`, and binds it to nobody. Bind it
+  with a RoleBinding in `k3sm-registry`, never with a ClusterRoleBinding, which would also cover a
+  ServiceAccount named `builder` in every other namespace:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: registry-builder-token
+  namespace: k3sm-registry
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k3sm:registry-builder-token
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: alice
+```
+
+A token is a push credential for the whole cluster registry until it expires. Keep it out of shell
+history and logs, and ask for the shortest lifetime the job allows.
+
+### On a worker
+
+A worker writes no user kubeconfig, so `k3sm registry token` and `login` stop there with an error
+that names the fix. Copy the admin kubeconfig from the server and write one:
+
+```sh
+k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write
+```
+
 ## Storage
 
 Image content lives under the control plane's state directory:
@@ -367,8 +450,10 @@ depends on its contents.
 - Reads are anonymous. Anything that can reach the registry can list and pull the images the
   cluster runs. Do not treat it as a private store for content the host's other users or the
   cluster's other workloads should not see.
-- Writes are authenticated. A push from the Mac needs the per-boot credential, so a process that
-  merely reached the port cannot plant an image the cluster will then run. From inside the cluster,
+- Writes are authenticated. A push from the Mac needs the per-boot credential, or, at the HTTPS
+  front, a token for the `builder` ServiceAccount minted through a kubeconfig allowed to (see
+  [Pushing With Other Tools](#pushing-with-other-tools)), so a process that merely reached the port
+  cannot plant an image the cluster will then run. From inside the cluster,
   a Pod can push only with its own ServiceAccount token, in a namespace that opted in, under that
   namespace's prefix, with an RBAC grant to push, and it can never delete. The token is encrypted on
   every hop; see [What the token is exposed to](#what-the-token-is-exposed-to).
