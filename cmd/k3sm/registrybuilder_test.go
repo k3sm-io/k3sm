@@ -422,3 +422,96 @@ func TestWriteDockerCARefusesUnsafeTargets(t *testing.T) {
 		})
 	}
 }
+
+// asInstalledServer lays out an installed server the way an ordinary account
+// sees it: a work dir it cannot enter, holding the 0600 registry record, and the
+// world-readable copy the server publishes in the status directory beside it.
+// The private record names another gate port, so a test can tell which was
+// read. It points installedServerWorkDir at the layout and returns the work dir.
+func asInstalledServer(t *testing.T, gatePort int) string {
+	t.Helper()
+	root := t.TempDir()
+	workDir := filepath.Join(root, "server")
+	for _, d := range []string{workDir, filepath.Join(root, "status")} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := registrysvc.WriteState(workDir, registrysvc.State{State: registrysvc.StateServing, Port: 6450, Addr: "127.0.0.1:6450", GatePort: gatePort}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(registrysvc.StatePath(workDir), []byte(`{"state":"serving","port":6450,"gatePort":1111}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(registrysvc.StatePath(workDir), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(workDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(workDir, 0o700) })
+	prev := installedServerWorkDir
+	installedServerWorkDir = workDir
+	t.Cleanup(func() { installedServerWorkDir = prev })
+	return workDir
+}
+
+// TestOrdinaryUserOnServerUsesLoopbackGate pins the server path for an ordinary
+// account: its own work dir (<home>/server) holds no registry record and the
+// installed server's work dir is closed to it, so the gate port comes from the
+// record the server publishes in the status directory. The push goes to
+// 127.0.0.1:<gate port>, not the server's cluster address, and `k3sm registry
+// login` writes localhost:<gate port>.
+func TestOrdinaryUserOnServerUsesLoopbackGate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads the 0700 work dir; this pins the ordinary account's view")
+	}
+	asInstalledServer(t, 6461)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("K3SM_WORK_DIR", "")
+	userWorkDir := workDirFromEnv()
+	if userWorkDir != filepath.Join(home, "server") {
+		t.Fatalf("workDirFromEnv() = %q, want the account's own %s", userWorkDir, filepath.Join(home, "server"))
+	}
+
+	t.Run("the push goes to the loopback gate", func(t *testing.T) {
+		slices := fake.NewClientset(flatSlice("100.64.0.1", 6450)).DiscoveryV1().EndpointSlices("k3sm-registry")
+		got, err := clusterRegistryAuthority(t.Context(), userWorkDir, slices)
+		if err != nil {
+			t.Fatalf("clusterRegistryAuthority: %v", err)
+		}
+		if got != "127.0.0.1:6461" {
+			t.Errorf("authority = %q, want the published gate 127.0.0.1:6461", got)
+		}
+	})
+
+	t.Run("login writes localhost and the gate port", func(t *testing.T) {
+		fakeTokenAPI(t, issue)
+		dir := t.TempDir()
+		t.Setenv("DOCKER_CONFIG", dir)
+		var out bytes.Buffer
+		if err := runRegistry([]string{"login"}, &out, &bytes.Buffer{}); err != nil {
+			t.Fatalf("registry login: %v", err)
+		}
+		raw, _ := os.ReadFile(filepath.Join(dir, "config.json"))
+		var doc struct {
+			Auths map[string]struct{ Auth string } `json:"auths"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("parse the written config: %v", err)
+		}
+		if _, ok := doc.Auths["localhost:6461"]; !ok || len(doc.Auths) != 1 {
+			t.Errorf("docker config auths = %s, want exactly localhost:6461", raw)
+		}
+	})
+
+	t.Run("a worker with neither record uses the cluster address", func(t *testing.T) {
+		installedServerWorkDir = filepath.Join(t.TempDir(), "server")
+		slices := fake.NewClientset(flatSlice("100.64.0.1", 6450)).DiscoveryV1().EndpointSlices("k3sm-registry")
+		got, err := clusterRegistryAuthority(t.Context(), userWorkDir, slices)
+		if err != nil || got != "100.64.0.1:6450" {
+			t.Errorf("authority = %q, %v; want the cluster address 100.64.0.1:6450", got, err)
+		}
+	})
+}

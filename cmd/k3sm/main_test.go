@@ -18,7 +18,9 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	_ "unsafe" // for go:linkname: the bootstrap work factors below
 
@@ -72,6 +74,9 @@ func TestMain(m *testing.M) {
 	capturedHashCost, capturedBundleSealIters = bootstrapHashCost, bootstrapBundleSealIters
 	bootstrapHashCost = bcrypt.MinCost
 	bootstrapBundleSealIters = bundleMinSealIters
+	// No test reads this Mac's installed server: a server Mac's published
+	// registry record would otherwise steer every push test to its gate.
+	installedServerWorkDir = filepath.Join(os.TempDir(), fmt.Sprintf("k3sm-test-no-install-%d", os.Getpid()), "server")
 	os.Exit(m.Run())
 }
 

@@ -22,6 +22,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -146,20 +148,51 @@ func clusterRegistryAuthority(ctx context.Context, workDir string, slices endpoi
 	return clusterEndpointAuthority(ctx, slices)
 }
 
+// installedServerWorkDir is the installed server's work dir. An ordinary account's
+// own work dir (<home>/server) holds no registry state, so localGatePort also
+// reads the record this server publishes beside it, in the world-readable status
+// directory. A variable so a test points it at a fake install.
+var installedServerWorkDir = executor.DefaultWorkDir
+
 // localGatePort is the loopback gate's port this Mac's server recorded, or 0
 // when this Mac serves none (a worker, or a server whose gate is off).
+//
+// It reads workDir's record and, when workDir holds none, the installed
+// server's: for an ordinary account workDir is <home>/server, where no server
+// ever wrote, while the installed server publishes its record world-readably
+// (registrysvc.ReadLocalState reads that copy before the 0600 original). Every
+// way of finding no gate is logged at debug, so a fallback to the cluster
+// address says why.
 func localGatePort(workDir string) int {
-	if workDir == "" {
-		return 0
+	dirs := []string{workDir}
+	if workDir != installedServerWorkDir {
+		dirs = append(dirs, installedServerWorkDir)
 	}
-	st, err := registrysvc.ReadLocalState(workDir)
-	if err != nil {
-		return 0
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		st, err := registrysvc.ReadLocalState(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			slog.Debug("no registry state record; looking further for a loopback push gate", "workDir", dir)
+			continue
+		}
+		if err != nil {
+			slog.Debug("cannot read the registry state record, so no loopback push gate is used",
+				"workDir", dir, "published", registrysvc.PublishedStatePath(dir), "err", err)
+			return 0
+		}
+		if st.State != registrysvc.StateServing && st.State != registrysvc.StateReclaimed {
+			slog.Debug("this Mac's registry is not serving, so no loopback push gate is used", "workDir", dir, "state", st.State)
+			return 0
+		}
+		if st.GatePort == 0 {
+			slog.Debug("this Mac's registry records no loopback push gate", "workDir", dir)
+		}
+		return st.GatePort
 	}
-	if st.State != registrysvc.StateServing && st.State != registrysvc.StateReclaimed {
-		return 0
-	}
-	return st.GatePort
+	slog.Debug("this Mac serves no registry; the push goes to the server's cluster address")
+	return 0
 }
 
 // clusterEndpointAuthority reads the flat registry-k3sm Service's EndpointSlice
