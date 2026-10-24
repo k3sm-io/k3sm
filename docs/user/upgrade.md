@@ -257,6 +257,9 @@ install again with another `--update-release-base` to change it.
   it. If that matters for a workload (a database, for example), drain or scale down its `vm` Pods
   before you upgrade or roll back. Native Pods are recreated the same way. See
   [what survives a restart](limitations.md#what-survives-a-node-daemon-restart).
+- Relabel registry push namespaces. A namespace whose `k3sm.io/registry-push` value is not its own
+  name can no longer push from a Pod; run `kubectl label namespace <ns> k3sm.io/registry-push=<ns> --overwrite`.
+  See [the cluster registry](registry.md#pushing-from-inside-a-pod).
 
 ## Upgrading Across a Datastore-Engine Change
 

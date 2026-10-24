@@ -470,12 +470,13 @@ func TestPushAuthorizesServiceAccountTokenUnderNamespacePrefix(t *testing.T) {
 		{name: "label value with a leading separator is invalid", method: "POST", target: "/v2/team/app/blobs/uploads/", auth: basic(tokTeam), setup: label("-team"), status: 403, reviews: 1, sars: 0},
 		{name: "an empty label value is invalid", method: "POST", target: "/v2/team/app/blobs/uploads/", auth: basic(tokTeam), setup: label(""), status: 403, reviews: 1, sars: 0},
 		{name: "a wildcard label value is invalid", method: "POST", target: "/v2/team/app/blobs/uploads/", auth: basic(tokTeam), setup: label("*"), status: 403, reviews: 1, sars: 0},
+		{name: "a label value other than the namespace name is denied", method: "POST", target: "/v2/other/app/blobs/uploads/", auth: basic(tokTeam), setup: label("other"), status: 403, reviews: 1, sars: 0},
 
 		// The prefix.
 		{name: "the prefix itself is not a repository under it", method: "POST", target: "/v2/team/blobs/uploads/", auth: basic(tokTeam), status: 403, reviews: 1, sars: 0},
-		{name: "p-x/app is not under p", method: "POST", target: "/v2/p-x/app/blobs/uploads/", auth: basic(tokTeam), setup: label("p"), status: 403, reviews: 1, sars: 0},
-		{name: "p.evil/app is not under p", method: "POST", target: "/v2/p.evil/app/blobs/uploads/", auth: basic(tokTeam), setup: label("p"), status: 403, reviews: 1, sars: 0},
-		{name: "pX/app is not a valid repository", method: "POST", target: "/v2/pX/app/blobs/uploads/", auth: basic(tokTeam), setup: label("p"), status: 400, reviews: 0, sars: 0},
+		{name: "team-x/app is not under team", method: "POST", target: "/v2/team-x/app/blobs/uploads/", auth: basic(tokTeam), status: 403, reviews: 1, sars: 0},
+		{name: "team.evil/app is not under team", method: "POST", target: "/v2/team.evil/app/blobs/uploads/", auth: basic(tokTeam), status: 403, reviews: 1, sars: 0},
+		{name: "teamX/app is not a valid repository", method: "POST", target: "/v2/teamX/app/blobs/uploads/", auth: basic(tokTeam), status: 400, reviews: 0, sars: 0},
 		{name: "another namespace's prefix is denied", method: "PUT", target: "/v2/other/app/manifests/v1", auth: basic(tokTeam), status: 403, reviews: 1, sars: 0},
 		{name: "teamx is not under team", method: "PUT", target: "/v2/teamx/app/manifests/v1", auth: basic(tokTeam), status: 403, reviews: 1, sars: 0},
 
@@ -830,4 +831,53 @@ func expectContinue(t *testing.T, l *memListener, target, auth string) string {
 		t.Fatalf("read: %v", err)
 	}
 	return strings.TrimSpace(line)
+}
+
+// TestPushPrefixHeldByOneNamespace pins that a push prefix belongs to exactly
+// one namespace. The gate reads only the pushing namespace, so it cannot see a
+// second namespace claiming the same prefix; instead the label value must be
+// the namespace's own name, and namespace names are unique. A namespace
+// labelled with another namespace's name pushes nowhere, neither under the
+// prefix it claims nor under its own name, and the refusal says how to fix it.
+func TestPushPrefixHeldByOneNamespace(t *testing.T) {
+	tokA := mkToken("a-builder", testEpoch.Add(time.Hour))
+	tokB := mkToken("b-builder", testEpoch.Add(time.Hour))
+	setup := func(t *testing.T) *gateFixture {
+		f := newGateFixture(t)
+		f.tokens.statuses[tokA] = saStatus("a", "builder")
+		f.tokens.statuses[tokB] = saStatus("b", "builder")
+		f.namespaces.labels["a"] = map[string]string{PushLabel: "a"}
+		f.namespaces.labels["b"] = map[string]string{PushLabel: "a"}
+		f.access.allow = func(*authzv1.SubjectAccessReview) bool { return true }
+		return f
+	}
+	const fix = "kubectl label namespace b " + PushLabel + "=b --overwrite"
+	for _, row := range []struct {
+		name, target, tok string
+		status            int
+		reason            string
+	}{
+		{name: "b labelled a is refused under a", target: "/v2/a/app/manifests/v1", tok: tokB, status: 403, reason: fix},
+		{name: "b labelled a is refused under b", target: "/v2/b/app/manifests/v1", tok: tokB, status: 403, reason: fix},
+		{name: "a labelled a pushes under a", target: "/v2/a/app/manifests/v1", tok: tokA, status: 201},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := setup(t)
+			resp := f.do(t, "PUT", row.target, basic(row.tok), "{}", nil)
+			if resp.status != row.status {
+				t.Fatalf("status = %d, want %d (body %s)", resp.status, row.status, resp.body)
+			}
+			if row.reason != "" {
+				if !strings.Contains(resp.body, row.reason) {
+					t.Errorf("refusal %q does not tell the user to run %q", resp.body, row.reason)
+				}
+				if f.access.count() != 0 {
+					t.Errorf("access reviews = %d for a refused label, want 0", f.access.count())
+				}
+				if n := len(f.zot.requests()); n != 0 {
+					t.Errorf("%d requests reached the registry", n)
+				}
+			}
+		})
+	}
 }

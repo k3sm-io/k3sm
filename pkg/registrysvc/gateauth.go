@@ -48,8 +48,10 @@ import (
 //     token among them) is refused, and the namespace is read from the
 //     reviewed username and nowhere else.
 //  2. Does the namespace opt in, and does the repository sit under the prefix
-//     it opted in with? The PushLabel on the namespace names one prefix; a
-//     repository must have at least one component below it.
+//     it opted in with? The PushLabel on the namespace must carry the
+//     namespace's own name, which is its one prefix, so a prefix is held by
+//     exactly one namespace; a repository must have at least one component
+//     below it.
 //  3. May this identity push this repository? A SubjectAccessReview for the
 //     virtual resource PushAPIGroup/PushResource, verb PushVerb, in the
 //     token's namespace, named for the repository: ordinary RBAC, bound by the
@@ -64,8 +66,9 @@ const (
 	// RegistryAudience is the audience a pod's projected token must be minted
 	// for to push.
 	RegistryAudience = "k3sm-registry"
-	// PushLabel is the namespace label that opts a namespace in. Its value is
-	// the one repository prefix the namespace may push under.
+	// PushLabel is the namespace label that opts a namespace in. Its value
+	// must be the namespace's own name, which is the one repository prefix the
+	// namespace may push under.
 	PushLabel = "k3sm.io/registry-push"
 	// PushAPIGroup, PushResource and PushVerb are the SubjectAccessReview's
 	// virtual resource and verb. pkg/rbac's k3sm:registry-pusher grants them.
@@ -328,6 +331,11 @@ func (a *authorizer) namespacePrefix(ctx context.Context, ns string) (namespaceR
 		switch {
 		case !ok:
 			r = namespaceResult{reason: "the namespace does not carry the " + PushLabel + " label"}
+		case v != ns:
+			// The value must name the namespace itself. Namespace names are
+			// unique, so no two namespaces can hold one prefix, and the gate
+			// needs no read of any namespace but the pushing one.
+			r = namespaceResult{reason: "the namespace's " + PushLabel + " label must equal the namespace name: run kubectl label namespace " + ns + " " + PushLabel + "=" + ns + " --overwrite"}
 		case !pushPrefixValue.MatchString(v) || len(v) > maxRepoNameLen:
 			r = namespaceResult{reason: "the namespace's " + PushLabel + " label is not a valid repository prefix"}
 		default:
