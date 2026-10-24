@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -155,43 +154,59 @@ func buildPruneFixture(t *testing.T, workDir string) pruneFixture {
 	return f
 }
 
-// fakeZot records every request reaching the registry and accepts a DELETE.
+// fakeZot is the registry's manifestDeleter seam: it records every deletion
+// the prune makes, as the dist-spec request it stands for, and the identity
+// it authenticated as, and accepts each.
 type fakeZot struct {
-	mu       sync.Mutex
-	requests []string
-	users    []string
+	mu        sync.Mutex
+	requests  []string
+	users     []string
+	authority []string
 }
 
-func (z *fakeZot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (z *fakeZot) delete(_ context.Context, ref name.Digest, auth authn.Authenticator) error {
+	cfg, err := auth.Authorization()
+	if err != nil {
+		return err
+	}
 	z.mu.Lock()
-	user, _, _ := r.BasicAuth()
-	if r.URL.Path != "/v2/" {
-		z.requests = append(z.requests, r.Method+" "+r.URL.Path)
-		z.users = append(z.users, user)
-	}
-	z.mu.Unlock()
-	if r.Method == http.MethodDelete {
-		w.WriteHeader(http.StatusAccepted)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
+	defer z.mu.Unlock()
+	z.requests = append(z.requests, http.MethodDelete+" /v2/"+ref.Context().RepositoryStr()+"/manifests/"+ref.DigestStr())
+	z.users = append(z.users, cfg.Username)
+	z.authority = append(z.authority, ref.Context().RegistryStr())
+	return nil
 }
 
-// serveFakeZot starts the registry and writes this node's push credential
-// naming it, the way the server's registry does at boot.
+// fakeZotPort is the port the fake registry's credential names.
+const fakeZotPort = 6450
+
+// serveFakeZot writes this node's push credential naming the registry, the
+// way the server's registry does at boot, and returns the deleter that stands
+// in for it.
 func serveFakeZot(t *testing.T, workDir string) *fakeZot {
 	t.Helper()
-	z := &fakeZot{}
-	srv := httptest.NewServer(z)
-	t.Cleanup(srv.Close)
-	addr := strings.TrimPrefix(srv.URL, "http://")
 	if err := os.MkdirAll(registrysvc.StateDir(workDir), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	addr := fmt.Sprintf("127.0.0.1:%d", fakeZotPort)
 	if err := registrysvc.WriteCredential(workDir, registrysvc.Credential{Address: addr, Username: "k3sm", Password: "pw"}); err != nil {
 		t.Fatal(err)
 	}
-	return z
+	return &fakeZot{}
+}
+
+// runPruneCmd runs `k3sm image` with the fake registry as the deleter.
+func runPruneCmd(t *testing.T, z *fakeZot, args []string) (string, error) {
+	t.Helper()
+	opts, err := parseImageArgs(args, io.Discard)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	err = imageCommandWith(ctx, opts, &out, dialRuntimed, z.delete)
+	return out.String(), err
 }
 
 // pruneJSON is the -o json document, decoded independently of the command's
@@ -264,7 +279,7 @@ func TestImagePruneDryRunReportsRegistryAndCache(t *testing.T) {
 	}}
 	sock := serveFakeImages(t, fake)
 
-	out, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", workDir, "prune", "-o", "json"})
+	out, err := runPruneCmd(t, zot, []string{"--socket", sock, "--work-dir", workDir, "prune", "-o", "json"})
 	if err != nil {
 		t.Fatalf("image prune -o json: %v", err)
 	}
@@ -315,7 +330,7 @@ func TestImagePruneDryRunReportsRegistryAndCache(t *testing.T) {
 	}
 
 	t.Run("the table names both halves and the dry run", func(t *testing.T) {
-		out, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", workDir, "prune"})
+		out, err := runPruneCmd(t, zot, []string{"--socket", sock, "--work-dir", workDir, "prune"})
 		if err != nil {
 			t.Fatalf("image prune: %v", err)
 		}
@@ -337,7 +352,7 @@ func TestImagePruneForceDeletesUntaggedThroughTheRegistry(t *testing.T) {
 	fake := &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{RemovedDigests: []string{"sha256:cccc"}}}
 	sock := serveFakeImages(t, fake)
 
-	out, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"})
+	out, err := runPruneCmd(t, zot, []string{"--socket", sock, "--work-dir", workDir, "prune", "--force", "-o", "json"})
 	if err != nil {
 		t.Fatalf("image prune --force: %v", err)
 	}
@@ -358,6 +373,12 @@ func TestImagePruneForceDeletesUntaggedThroughTheRegistry(t *testing.T) {
 	for i, u := range zot.users {
 		if u != "k3sm" {
 			t.Errorf("request %d authenticated as %q; want this node's push user", i, u)
+		}
+	}
+	wantAuthority := registrysvc.LoopbackAuthority(fakeZotPort)
+	for i, a := range zot.authority {
+		if a != wantAuthority {
+			t.Errorf("request %d went to %q; want the registry on loopback, %q", i, a, wantAuthority)
 		}
 	}
 	if len(doc.Registry.Manifests) != 3 || len(doc.Registry.Failed) != 0 {
