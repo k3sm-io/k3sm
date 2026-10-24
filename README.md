@@ -96,6 +96,19 @@ Line Tools, a signed-in GitHub CLI (`gh`), and the exact Go release the script p
 (`PAYLOAD_GO_VERSION` in `hack/release/lib/gochild.sh`, which the script sources) first on your `PATH`, and the staged folder comes to about
 700 MB.
 
+Before it signs anything, the staging script scans the bundled Go binaries for known
+vulnerabilities: every Go binary in the control-plane payload (the Kubernetes binaries, kine,
+etcd, etcdutl, zot and helm), with `govulncheck -mode=binary` at the version `hack/ci.sh` pins. It
+needs that govulncheck installed and the Go vulnerability database reachable. A finding whose
+trace reaches a vulnerable symbol in a binary stops the staging unless
+`hack/release/govulncheck.allow` names it by vulnerability id, child and the child's pinned
+version, with a reason and an expiry date. Allow entries expire, and an expired entry turns the
+repo gate (`hack/ci.sh`) red until it is re-reviewed. An expired entry stops the staging, and so
+does an entry that matches no finding, so an exemption ends when its finding or its pin goes away.
+A finding with no vulnerable symbol in the binary is printed and does not stop it. A missing or
+mismatched govulncheck, an unreachable or stale database or an incomplete scan output stops the
+staging with the failure named.
+
 Install runs once, as root, and sets up an unprivileged `_k3sm` user and daemon that everything
 else runs under. Day-to-day use after that needs no `sudo`:
 
