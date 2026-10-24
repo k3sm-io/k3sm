@@ -36,6 +36,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
@@ -252,6 +253,10 @@ func (c gateEndpoint) options(ctx context.Context) ([]remote.Option, error) {
 		return nil, errBadClusterCA
 	}
 	t := http.DefaultTransport.(*http.Transport).Clone()
+	// Segment-clamped like every other dial this node makes toward the mesh
+	// (tcpseg): on a worker the gate is the server's cluster address. The
+	// timeouts are http.DefaultTransport's own dialer's.
+	t.DialContext = (&tcpseg.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	t.TLSClientConfig = &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		RootCAs:    pool,
