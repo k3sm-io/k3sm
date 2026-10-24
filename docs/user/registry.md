@@ -147,6 +147,13 @@ nothing. Every node in the cluster reaches the same store under the same name, s
 once is pullable from any Mac, and every layer is verified against its digest exactly as it is on a
 pull from a public registry.
 
+Each node learns where that store is from the `registry-k3sm` EndpointSlice in `k3sm-registry`: the
+first server's address and the port its registry listens on. A server started with another
+`--registry-port` therefore still serves every reference to `registry-k3sm:6450`, because the port
+in a reference never changes. A node reads the EndpointSlice when it starts, waiting up to 30 seconds
+for a server that is restarting; a node that started while the server was down for longer maps the
+name only after it restarts too.
+
 The direction matters. The node running the Pod pulls from the server, so the server has to be up
 and on the cluster network at the moment the pull happens. If it is off, the pull fails, and the Pod
 reports the usual image-pull error.

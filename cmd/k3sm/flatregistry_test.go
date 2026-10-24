@@ -23,15 +23,20 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
+	"net/netip"
 	"slices"
 	"strconv"
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+
 	"k3sm.io/k3sm/pkg/bootstrap"
-	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/runtimed/pkg/image"
 )
 
@@ -55,10 +60,10 @@ func testClusterCAPEM(t *testing.T) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
-// TestFlatRegistryHostCarriesTheDefaultRegistryPort pins the flat name's port to
-// the registry's default port, which the agent dials the server at.
-func TestFlatRegistryHostCarriesTheDefaultRegistryPort(t *testing.T) {
-	if want := "registry-k3sm:" + strconv.Itoa(executor.DefaultRegistryPort); flatRegistryHost != want {
+// TestFlatRegistryHostIsTheServiceAuthority pins the flat name to the flat
+// Service's authority, whose port is fixed whatever --registry-port says.
+func TestFlatRegistryHostIsTheServiceAuthority(t *testing.T) {
+	if want := registrysvc.FlatAuthority(); flatRegistryHost != want {
 		t.Fatalf("flatRegistryHost = %q, want %q", flatRegistryHost, want)
 	}
 }
@@ -98,30 +103,57 @@ func TestServerFlatRegistryPullerWiring(t *testing.T) {
 	}
 }
 
-// TestAgentFlatRegistryPullerWiring pins the agent's mapping end to end through
-// agentNodeOptions and runtimedConfig: the flat name is fetched from the
-// server's mesh address (the apiserver host the join advertised) at the default
-// registry port, over TLS verified against the cluster CA the join returned.
-func TestAgentFlatRegistryPullerWiring(t *testing.T) {
+// publishedFlatRegistry is a fake cluster holding the flat Service and its
+// EndpointSlice exactly as a bootstrap server named "boot" publishes them, with
+// its relay on relayAddr at port (its --registry-port).
+func publishedFlatRegistry(t *testing.T, port int, relayAddr string) *fake.Clientset {
+	t.Helper()
+	cs := fake.NewSimpleClientset()
+	ns := registrysvc.FlatServiceNamespace
+	if _, err := registrysvc.PublishFlatService(t.Context(), cs.CoreV1().Services(ns), cs.DiscoveryV1().EndpointSlices(ns),
+		"boot", port, netip.MustParseAddr(relayAddr)); err != nil {
+		t.Fatalf("publish the flat Service: %v", err)
+	}
+	return cs
+}
+
+// TestAgentFlatRegistryUsesServerRegistryPort pins the agent's mapping end to
+// end through agentNodeOptions and runtimedConfig: the flat name is fetched from
+// the address AND the port the server published for its relay (its
+// --registry-port, here not the default), over TLS verified against the cluster
+// CA the join returned. The default port is the Service port every reference
+// carries, not the port the relay listens on, so a server on another port must
+// not leave its agents dialing the default.
+func TestAgentFlatRegistryUsesServerRegistryPort(t *testing.T) {
+	const serverPort = 7000
 	ca := testClusterCAPEM(t)
+	logger := slog.New(slog.DiscardHandler)
 	res := &bootstrap.JoinResult{
 		PodCIDR: "100.64.2.0/24", MeshIP: "100.64.2.1",
 		APIServers:   []string{"100.64.0.1:6444"},
 		ClusterCAPEM: ca,
 	}
+	cs := publishedFlatRegistry(t, serverPort, "100.64.0.1")
+	ns := registrysvc.FlatServiceNamespace
+	lookup := func(cs *fake.Clientset, ca []byte, wait time.Duration) flatRegistryEndpoint {
+		return lookupClusterFlatRegistry(t.Context(), cs.CoreV1().Services(ns), cs.DiscoveryV1().EndpointSlices(ns),
+			ca, wait, time.Millisecond, logger)
+	}
+
 	nodeOpts := agentNodeOptions(agentOptions{}, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
+	nodeOpts.flatRegistry = lookup(cs, res.ClusterCAPEM, flatRegistryLookupWait)
 	m := runtimedConfig(nodeOpts, nil).FlatRegistry
 	if m.Host != flatRegistryHost {
 		t.Errorf("Host = %q, want %q", m.Host, flatRegistryHost)
 	}
-	if want := "100.64.0.1:" + strconv.Itoa(executor.DefaultRegistryPort); m.Endpoint.Addr != want {
-		t.Errorf("Endpoint.Addr = %q, want the server's mesh address %q", m.Endpoint.Addr, want)
+	if want := "100.64.0.1:" + strconv.Itoa(serverPort); m.Endpoint.Addr != want {
+		t.Errorf("Endpoint.Addr = %q, want the server's relay at its registry port %q", m.Endpoint.Addr, want)
 	}
 	if !m.Endpoint.TLS || string(m.Endpoint.CAPEM) != string(ca) {
 		t.Errorf("Endpoint = TLS %v CA %d bytes, want TLS against the join's cluster CA", m.Endpoint.TLS, len(m.Endpoint.CAPEM))
 	}
-	if !slices.Contains(m.Aliases, "localhost:6450") {
-		t.Errorf("Aliases = %v, want localhost:6450", m.Aliases)
+	if !slices.Contains(m.Aliases, "localhost:"+strconv.Itoa(serverPort)) {
+		t.Errorf("Aliases = %v, want localhost:%d", m.Aliases, serverPort)
 	}
 	cache, err := image.NewCache(t.TempDir())
 	if err != nil {
@@ -131,16 +163,29 @@ func TestAgentFlatRegistryPullerWiring(t *testing.T) {
 		t.Fatalf("runtimed refuses the agent's flat mapping: %v", err)
 	}
 
-	t.Run("a join that advertised no apiserver host maps nothing", func(t *testing.T) {
-		bare := &bootstrap.JoinResult{PodCIDR: res.PodCIDR, MeshIP: res.MeshIP, ClusterCAPEM: ca}
-		nodeOpts := agentNodeOptions(agentOptions{}, bare, "/k", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
-		if got := runtimedConfig(nodeOpts, nil).FlatRegistry; got.Host != "" {
-			t.Errorf("FlatRegistry = %+v, want the zero mapping", got)
+	t.Run("a cluster with no registry Service maps nothing at once", func(t *testing.T) {
+		start := time.Now()
+		if got := lookup(fake.NewSimpleClientset(), ca, time.Hour); got.Addr != "" {
+			t.Errorf("lookup = %+v, want the zero endpoint", got)
+		}
+		if time.Since(start) > 10*time.Second {
+			t.Error("a cluster with no registry Service was waited on")
+		}
+	})
+	t.Run("a Service whose endpoints are retracted maps nothing after the wait", func(t *testing.T) {
+		cs := publishedFlatRegistry(t, serverPort, "100.64.0.1")
+		if err := cs.DiscoveryV1().EndpointSlices(ns).Delete(t.Context(), registrysvc.FlatServiceName, metav1.DeleteOptions{}); err != nil {
+			t.Fatalf("retract: %v", err)
+		}
+		if got := lookup(cs, ca, 5*time.Millisecond); got.Addr != "" {
+			t.Errorf("lookup = %+v, want the zero endpoint", got)
 		}
 	})
 	t.Run("a join with no cluster CA maps nothing", func(t *testing.T) {
-		noCA := &bootstrap.JoinResult{PodCIDR: res.PodCIDR, MeshIP: res.MeshIP, APIServers: res.APIServers}
-		if got := agentFlatRegistry(noCA); got.Addr != "" {
+		if got := lookup(cs, nil, flatRegistryLookupWait); got.Addr != "" {
+			t.Errorf("lookup = %+v, want the zero endpoint", got)
+		}
+		if got := agentFlatRegistry(t.Context(), "/nonexistent", &bootstrap.JoinResult{}, logger); got.Addr != "" {
 			t.Errorf("agentFlatRegistry = %+v, want the zero endpoint", got)
 		}
 	})
