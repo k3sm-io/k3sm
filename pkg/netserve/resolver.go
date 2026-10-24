@@ -628,6 +628,17 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, in
 	rcode := dnsmessage.RCodeSuccess
 	var ans dnsAnswer
 
+	// The flat registry name (registry-k3sm and the forms a pod's search list
+	// builds from it in any namespace) answers as the registry Service, read from
+	// the same zone that answers ordinary Service names. It runs before the
+	// partial-name classifier, which would otherwise forward the bare name and
+	// NXDOMAIN the <ns>.svc forms. A non-A query for a flat form is an empty
+	// NOERROR; an absent registry Service leaves the name to the paths below.
+	if addrs, handled := dns.ResolveFlatRegistryName(q.Type, qname, r.domain, r.serviceIPv4); handled {
+		resp, err := buildResponse(hdr, q, dnsAnswer{a: addrs}, dnsmessage.RCodeSuccess, edns)
+		return resp, negotiated, err
+	}
+
 	// Server-side partial-name completion (the CoreDNS autopath precedent). The
 	// node resolver entry netd publishes routes the "svc" and cluster-domain
 	// suffixes here for EVERY host process, but macOS applies no ndots to a
@@ -717,6 +728,17 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, in
 
 	resp, err := buildResponse(hdr, q, ans, rcode, edns)
 	return resp, negotiated, err
+}
+
+// serviceIPv4 is the dns.ServiceIPv4Lookup view of the resolver's zone: the
+// IPv4 ClusterIP of namespace/name, and ok=false for an absent, headless,
+// pending, IPv6 or ExternalName Service.
+func (r *clusterResolver) serviceIPv4(namespace, name string) (netip.Addr, bool) {
+	target, ok := r.zone.LookupService(namespace, name)
+	if !ok || target.ExternalName != "" || !target.IP.Is4() {
+		return netip.Addr{}, false
+	}
+	return target.IP, true
 }
 
 // noPartialRoutedNamespace is the opt-in predicate respond hands the partial-name
