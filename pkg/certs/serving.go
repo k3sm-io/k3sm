@@ -76,7 +76,7 @@ func SelfSignedServing(dnsNames []string, ipAddrs []net.IP) (tls.Certificate, er
 		Subject:               pkix.Name{CommonName: "k3sm-kubelet"},
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.AddDate(1, 0, 0),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		KeyUsage:              x509.KeyUsageDigitalSignature, // ECDSA signs; it never enciphers a key
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		DNSNames:              dnsNames,
