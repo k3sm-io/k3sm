@@ -98,8 +98,9 @@ const (
 	relayDialTimeout = 1 * time.Second
 	// relayReadHeaderTimeout, relayMaxHeaderBytes, relayIdleTimeout and
 	// relayMaxConns bound what one client can hold of a relay address before
-	// the gate has decided anything. There is no read or write timeout: a blob
-	// is as large as an image layer and streams for as long as it takes.
+	// the gate has decided anything, and relaylimit.go divides relayMaxConns
+	// into per-source shares. There is no read or write timeout: a blob is as
+	// large as an image layer and streams for as long as it takes.
 	relayReadHeaderTimeout = 10 * time.Second
 	relayMaxHeaderBytes    = 16 << 10
 	relayIdleTimeout       = 90 * time.Second
@@ -160,9 +161,14 @@ type RelayConfig struct {
 // The zero value is not usable — construct one with NewRelay, which is where the
 // bind discipline is enforced.
 type Relay struct {
-	port    int
-	binds   []netip.Addr
-	log     *slog.Logger
+	port  int
+	binds []netip.Addr
+	log   *slog.Logger
+	// limits are the connection caps the listener applies; limiter is the
+	// handler in front of the gate that applies the per-source buckets, and
+	// handler is the limiter.
+	limits  relayLimits
+	limiter *sourceLimiter
 	handler http.Handler
 	// tls is the server configuration every accepted connection is wrapped in.
 	// NewRelay always sets it; only this package's tests of the gate mechanics
@@ -211,9 +217,10 @@ func newRelay(port int, binds []netip.Addr, log *slog.Logger, auth GateAuth, cre
 		log = slog.Default()
 	}
 	r := &Relay{
-		port:  port,
-		binds: binds,
-		log:   log,
+		port:   port,
+		binds:  binds,
+		log:    log,
+		limits: defaultRelayLimits,
 		// The relay binds a mesh address and the vm NAT gateway, which local pods
 		// reach over lo0, so every accepted connection's TCP segment size is
 		// clamped. The gate's upstream dial is not: it targets the registry's
@@ -227,7 +234,8 @@ func newRelay(port int, binds []netip.Addr, log *slog.Logger, auth GateAuth, cre
 			return tcpseg.WrapListener(ln), nil
 		},
 	}
-	r.handler = newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log})
+	r.limiter = newSourceLimiter(newGate(gateConfig{Upstream: r.target(), Auth: auth, Credential: cred, Logger: log}), r.limits, time.Now)
+	r.handler = r.limiter
 	return r
 }
 
@@ -382,7 +390,7 @@ func (r *Relay) retry(ctx context.Context, attempt int, stage, addr string, err 
 }
 
 // accept serves the push gate over ln, over TLS, at most relayMaxConns
-// connections at a time. It returns nil on a clean stop (ctx cancelled or the listener closed)
+// connections at a time and at most relayMaxConnsPerSource from one address. It returns nil on a clean stop (ctx cancelled or the listener closed)
 // so serve can tell "we are shutting down" from "this listener broke".
 //
 // One http.Server per address, with the gate mounted directly as its handler.
@@ -395,6 +403,7 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 		MaxHeaderBytes:    relayMaxHeaderBytes,
 		IdleTimeout:       relayIdleTimeout,
 		ErrorLog:          slog.NewLogLogger(r.log.Handler(), slog.LevelDebug),
+		ConnContext:       r.limiter.ConnContext,
 	}
 	stop := make(chan struct{})
 	defer close(stop)
@@ -405,7 +414,7 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 		}
 		_ = srv.Close()
 	}()
-	var served net.Listener = newLimitListener(ln, relayMaxConns)
+	var served net.Listener = newLimitListener(ln, r.limits.maxConns, r.limits.maxConnsPerSource)
 	if r.tls != nil {
 		// TLS wraps the connection cap, not the reverse: the *tls.Conn the
 		// server sees is what lets it answer a plain-HTTP request with 400,
@@ -419,33 +428,53 @@ func (r *Relay) accept(ctx context.Context, ln net.Listener) error {
 	return fmt.Errorf("serve: %w", err)
 }
 
-// limitListener caps the connections a listener has open at once. Accept
-// blocks while the cap is reached, so a client holding connections open costs
-// other clients a wait, never this process its file descriptors.
+// limitListener caps the connections a listener has open at once, in total
+// and per remote address. Accept blocks while the total cap is reached, so
+// clients holding connections open cost other clients a wait, never this
+// process its file descriptors. A connection from an address already at its
+// share is closed on accept instead: queueing it would make every other
+// address wait behind it.
 type limitListener struct {
 	net.Listener
 	sem       chan struct{}
+	perSource int
+	open      sourceCounts
 	done      chan struct{}
 	closeOnce sync.Once
 }
 
-func newLimitListener(ln net.Listener, n int) *limitListener {
-	return &limitListener{Listener: ln, sem: make(chan struct{}, n), done: make(chan struct{})}
+func newLimitListener(ln net.Listener, total, perSource int) *limitListener {
+	return &limitListener{
+		Listener:  ln,
+		sem:       make(chan struct{}, total),
+		perSource: perSource,
+		open:      sourceCounts{n: map[string]int{}},
+		done:      make(chan struct{}),
+	}
 }
 
-// Accept waits for a free slot, then accepts.
+// Accept waits for a free slot, then accepts a connection from an address
+// under its share.
 func (l *limitListener) Accept() (net.Conn, error) {
-	select {
-	case l.sem <- struct{}{}:
-	case <-l.done:
-		return nil, net.ErrClosed
+	for {
+		select {
+		case l.sem <- struct{}{}:
+		case <-l.done:
+			return nil, net.ErrClosed
+		}
+		c, err := l.Listener.Accept()
+		if err != nil {
+			<-l.sem
+			return nil, err
+		}
+		src := sourceOf(c.RemoteAddr())
+		if !l.open.take(src, l.perSource) {
+			_ = c.Close()
+			<-l.sem
+			continue
+		}
+		return &limitConn{Conn: c, release: func() { l.open.give(src); <-l.sem }}, nil
 	}
-	c, err := l.Listener.Accept()
-	if err != nil {
-		<-l.sem
-		return nil, err
-	}
-	return &limitConn{Conn: c, release: func() { <-l.sem }}, nil
 }
 
 // Close closes the listener and wakes an Accept waiting for a slot.

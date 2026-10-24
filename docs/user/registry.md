@@ -326,7 +326,7 @@ A refused push says why, in an OCI error body. Every status a push can get:
 | `401` | No token, a malformed token, an expired or otherwise invalid token, or a token minted for another audience. The response carries a Basic `WWW-Authenticate` challenge. |
 | `403` | The caller is authenticated but refused: the token is not a ServiceAccount's, the namespace has not opted in (no label, or an invalid prefix), the repository is outside the prefix, or RBAC denies the push. |
 | `405` | A delete, or any other write shape the registry never takes from a Pod. |
-| `429` | Token checks are rate-limited; wait for the `Retry-After` interval and retry. |
+| `429` | Token checks are rate-limited, and each client address has its own share of connections, requests and pushes, so one busy client slows itself rather than every other caller; wait for the `Retry-After` interval and retry. |
 | `502` | The registry behind the gate is unreachable. |
 | `503` | The cluster API is unreachable, or the gate has no identity to ask it with. Retry. |
 
