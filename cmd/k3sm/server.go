@@ -430,7 +430,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// The opt-in NodePort for that registry. It makes registry-k3sm a NodePort
 	// Service whose backend is still the relay, so the push gate answers there:
 	// reads are anonymous to anyone who can reach a node, writes need a token.
-	fs.IntVar(&opts.registryNodePort, "registry-node-port", 0, "also expose the cluster's registry on this NodePort ("+ports.NodePortRange()+"), so a tool on a Mac reaches it at <any node>:<port> over HTTPS under the cluster CA. Reads there are anonymous to anyone who can reach a node; pushes need a token from `k3sm registry token`. 0, the default, exposes none")
+	fs.IntVar(&opts.registryNodePort, "registry-node-port", 0, "also expose the cluster's registry on this `port` in the NodePort range "+ports.NodePortRange()+", so a tool on a Mac reaches it at <any node>:<port> over HTTPS under the cluster CA. Reads there are anonymous to anyone who can reach a node; pushes need a token from k3sm registry token. 0, the default, exposes none")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
