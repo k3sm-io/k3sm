@@ -362,6 +362,9 @@ func migrateOnce(ctx context.Context, workDir string, logger *slog.Logger) (fini
 	defer unlock()
 	cc, closer, err := dialRuntimed(ctx, runtimed.DefaultSocketPath)
 	if err != nil {
+		if rerr := recordMigrationFailure(workDir, fmt.Errorf("this node's runtime is not reachable: %w", err)); rerr != nil {
+			logger.Warn("image migration: could not record the pending reason", "err", rerr)
+		}
 		return false, err
 	}
 	if closer != nil {

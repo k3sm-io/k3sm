@@ -155,8 +155,11 @@ type migrationJournal struct {
 	Finished string `json:"finished,omitempty"`
 	// Complete is set when a run reached every node-store entry. Only the
 	// on-upgrade trigger reads it; `k3sm image migrate` always re-checks.
-	Complete bool              `json:"complete"`
-	Images   []migrationRecord `json:"images"`
+	Complete bool `json:"complete"`
+	// LastError is why the last run stopped short, empty after a run that
+	// reached every entry. `k3sm status` shows it as the pending reason.
+	LastError string            `json:"lastError,omitempty"`
+	Images    []migrationRecord `json:"images"`
 }
 
 // migrationSummary counts a journal's outcomes, for the report line.
@@ -276,17 +279,23 @@ func (m imageMigrator) run(ctx context.Context) (migrationJournal, error) {
 	j.Started = m.now().UTC().Format(time.RFC3339)
 	j.Finished = ""
 
+	// stop records why the run stopped short and leaves the journal pending,
+	// so the next run resumes and `k3sm status` can say why.
+	stop := func(err error) (migrationJournal, error) {
+		j.LastError = err.Error()
+		if werr := writeMigrationJournal(m.workDir, j); werr != nil {
+			return j, errors.Join(err, werr)
+		}
+		return j, err
+	}
 	entries, err := m.source.List(ctx)
 	if err != nil {
-		return j, fmt.Errorf("list this node's image store: %w", err)
+		return stop(fmt.Errorf("list this node's image store: %w", err))
 	}
 	for _, group := range groupStoreImages(entries) {
 		rec, err := m.migrate(ctx, &j, group)
 		if err != nil {
-			if werr := writeMigrationJournal(m.workDir, j); werr != nil {
-				return j, errors.Join(err, werr)
-			}
-			return j, err
+			return stop(err)
 		}
 		j.put(rec)
 		if err := writeMigrationJournal(m.workDir, j); err != nil {
@@ -294,8 +303,23 @@ func (m imageMigrator) run(ctx context.Context) (migrationJournal, error) {
 		}
 	}
 	j.Complete = true
+	j.LastError = ""
 	j.Finished = m.now().UTC().Format(time.RFC3339)
 	return j, writeMigrationJournal(m.workDir, j)
+}
+
+// recordMigrationFailure notes in the journal why a run could not start, so
+// `k3sm status` shows a pending migration with its reason. The caller holds
+// the migration lock. A journal that cannot be read is left alone.
+func recordMigrationFailure(workDir string, cause error) error {
+	j, err := readMigrationJournal(workDir)
+	if err != nil {
+		return err
+	}
+	j.Schema = migrationSchema
+	j.Complete = false
+	j.LastError = cause.Error()
+	return writeMigrationJournal(workDir, j)
 }
 
 // groupStoreImages groups the node store's entries by reference, sorted, so
