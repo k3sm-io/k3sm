@@ -296,11 +296,12 @@ func startServerRegistry(ctx context.Context, plan serverPlan, restCfg *rest.Con
 		clusterDomain: opts.domain,
 		// A server that joined an existing control plane leaves the flat
 		// Service and the discovery document to the bootstrap server.
-		joined:      opts.serverJoin,
-		workDir:     opts.workDir,
-		mintServing: serverRegistryServingMinter(opts, logger),
-		gateAuth:    serverRegistryGateAuth(ctx, opts, restCfg, logger),
-		logger:      logger,
+		joined:       opts.serverJoin,
+		clusterCAPEM: joinedServerClusterCAPEM(opts, logger),
+		workDir:      opts.workDir,
+		mintServing:  serverRegistryServingMinter(opts, logger),
+		gateAuth:     serverRegistryGateAuth(ctx, opts, restCfg, logger),
+		logger:       logger,
 	})
 	// The early run, on the control-plane stop's lane, and runServer's deferred
 	// backstop share one stage: whichever comes first runs the teardown, and the

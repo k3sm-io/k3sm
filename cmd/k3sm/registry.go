@@ -143,6 +143,13 @@ type ingestRegistry struct {
 	// bootstrap server does, so two servers never fight over the one name's
 	// endpoints. Its own registry still serves loopback pushes and its relay.
 	joined bool
+	// clusterCAPEM is the cluster CA a joined server verifies the cluster's one
+	// registry against when it maps the flat name there (clusterFlatRegistry).
+	// Unused on the bootstrap server, which maps the name to its own loopback.
+	clusterCAPEM []byte
+	// flatLookupWait bounds how long a joined server waits for the bootstrap
+	// server's EndpointSlice. Zero is flatRegistryLookupWait.
+	flatLookupWait time.Duration
 	// workDir is where the registry's state record lives; the cluster-facing
 	// facts (the published name, the certificate's expiry) are added to it.
 	// Empty records nothing.
@@ -201,8 +208,11 @@ type registryPullerWiring struct {
 	// against the cluster CA. The field stays so the seam is unchanged.
 	ClusterRegistries []string
 	// Flat is where this node's runtime fetches the cluster's one registry name
-	// from: this registry, on loopback (serverFlatRegistry). Zero on a node with
-	// no registry.
+	// from: on the bootstrap server this registry, on loopback
+	// (serverFlatRegistry); on a server that joined an existing control plane
+	// the bootstrap server's, where the flat Service's EndpointSlice says it is
+	// (clusterFlatRegistry), so the cluster keeps one image store. Zero on a node
+	// with no registry.
 	Flat flatRegistryEndpoint
 }
 
@@ -258,7 +268,7 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registr
 	r.refresh(auxCtx, &aux, published, sans, serving)
 	r.relay(auxCtx, &aux, serving)
 
-	wiring := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(r.port), Flat: serverFlatRegistry(r.port)}
+	wiring := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(r.port), Flat: r.flatRegistry(ctx)}
 
 	return func() {
 		stopAux()
@@ -277,6 +287,32 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registr
 			logger.Error("ingest registry shutdown", "err", err)
 		}
 	}, wiring
+}
+
+// flatRegistry is where this server's runtime fetches the flat name from. The
+// bootstrap server publishes the name and serves it from its own registry on
+// loopback. A joined server publishes nothing, and mapping the name to its own
+// loopback registry would split the store: an image pushed to the cluster
+// registry would be missing on it, and one pulled through it would land in a
+// store no other node reads. It maps the name where every agent does instead,
+// to the bootstrap server's relay, over TLS against the cluster CA.
+func (r ingestRegistry) flatRegistry(ctx context.Context) flatRegistryEndpoint {
+	if !r.joined {
+		return serverFlatRegistry(r.port)
+	}
+	wait := r.flatLookupWait
+	if wait == 0 {
+		wait = flatRegistryLookupWait
+	}
+	var svcs flatServiceGetter
+	if r.clusterSvcs != nil {
+		svcs = r.clusterSvcs
+	}
+	var slices flatSliceGetter
+	if r.clusterSlices != nil {
+		slices = r.clusterSlices
+	}
+	return lookupClusterFlatRegistry(ctx, svcs, slices, r.clusterCAPEM, wait, flatRegistryLookupInterval, r.logger)
 }
 
 // servingSANs holds the one SAN input that can change while the relay serves:

@@ -586,7 +586,12 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
 	logger.Info(fmt.Sprintf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName))
-	return startNode(ctx, agentNodeOptions(opts, res, kubeconfigPath, mode, datapath))
+	nodeOpts := agentNodeOptions(opts, res, kubeconfigPath, mode, datapath)
+	// The cluster's one registry name, fetched from where the flat Service's
+	// EndpointSlice says the server's relay listens, over TLS verified against
+	// the cluster CA this join pinned.
+	nodeOpts.flatRegistry = agentFlatRegistry(ctx, kubeconfigPath, res, logger)
+	return startNode(ctx, nodeOpts)
 }
 
 // agentTokenJoin runs the credential-issuing join and returns the result plus the
@@ -843,9 +848,8 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		// are published; nil when the worker runs no datapath.
 		transportOverrides: nodeTransportOverrides(datapath, mode),
 
-		// The cluster's one registry name, fetched from the server's mesh
-		// address over TLS verified against the cluster CA this join pinned.
-		flatRegistry: agentFlatRegistry(res),
+		// flatRegistry is left to runAgent: it is read from the cluster
+		// (agentFlatRegistry), which this pure builder does not do.
 	}
 }
 
