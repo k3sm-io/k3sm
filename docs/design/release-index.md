@@ -60,6 +60,7 @@ is decoded.
   "issuedAt": "2026-11-02T18:04:11Z",
   "tag": "v0.2.0",
   "minimumMacOS": "26.0",
+  "minimumSupportedTag": "v0.1.0",
   "app": {
     "bundleID": "io.k3sm.app",
     "shortVersion": "0.2.0",
@@ -85,6 +86,7 @@ is decoded.
 | `issuedAt` | `YYYY-MM-DDTHH:MM:SSZ`, UTC, whole seconds, a real date | the app's rollback check: an index with a lower tag, or the same tag and an older `issuedAt`, than one it accepted is refused |
 | `tag` | a final release tag, `vMAJOR.MINOR.PATCH`, no leading zeros, no pre-release, no build metadata; also a valid git tag | the app's "up to date" and "update available" states, and the staged bundle's payload tag check |
 | `minimumMacOS` | `MAJOR[.MINOR[.PATCH]]`, each part at most three digits | the app, before any download: a Mac below it is told so and nothing is fetched |
+| `minimumSupportedTag` | a final release tag with the grammar of `tag`, at or below `tag` | the app's go-back: it refuses to go back to a release below it. A later index can raise it after a bad release ships, and a record kept on the Mac cannot lower it |
 | `app.bundleID` | exactly `io.k3sm.app` | the staged bundle check |
 | `app.shortVersion` | `tag` without its `v` | the app's update line, and the staged bundle's `CFBundleShortVersionString` check |
 | `app.image.name` | exactly `k3sm_<version>_darwin_arm64.dmg`, `<version>` being `tag` without its `v` | the staged download's file name |
@@ -162,4 +164,6 @@ committed.
 - The image URL is not a free field: it is the one release download URL its
   tag and name determine, so the tag in the path is bound to the index's tag.
 - A change to the format is a new `schema` and `context` string, not an edit to
-  v1.
+  v1. `minimumSupportedTag` was added to v1 before any index was published, so
+  no reader of the older shape exists. From the first published index on, the
+  rule holds as written.

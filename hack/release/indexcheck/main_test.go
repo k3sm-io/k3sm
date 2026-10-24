@@ -44,6 +44,7 @@ func TestRun(t *testing.T) {
 			name: "the golden index prints its release fields in order",
 			args: []string{golden},
 			want: "tag=v0.2.0\n" +
+				"minimum_supported_tag=v0.1.0\n" +
 				"image_name=k3sm_0.2.0_darwin_arm64.dmg\n" +
 				"image_sha256=6105d6cc76af400325e94d588ce511be5bfdbb73b437dc51eca43917d7a43e3d\n" +
 				"image_size=123456789\n" +
