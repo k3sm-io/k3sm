@@ -242,11 +242,11 @@ func recordInRegistry(push imagePusher, warm cacheWarmer) storeRecorder {
 // that name, and does not need to. The warm pull names the flat reference,
 // which the runtime maps to the same registry.
 func recordInto(ctx context.Context, ref name.Tag, b built, workDir string, push imagePusher, warm cacheWarmer) error {
-	target, err := registryPushTarget(ref, workDir)
+	target, dest, err := registryPushTarget(ctx, ref, workDir)
 	if err != nil {
 		return fmt.Errorf("record %s in the cluster registry: %w", ref, err)
 	}
-	if err := push(ctx, target, b, workDir); err != nil {
+	if err := push(ctx, target, b, dest); err != nil {
 		return fmt.Errorf("record %s in the cluster registry: %w", ref, err)
 	}
 	// A failed warm leaves the image in the registry, where every Pod that may

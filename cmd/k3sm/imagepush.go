@@ -115,9 +115,14 @@ func imagePush(ctx context.Context, o imageOptions, out io.Writer, dial imagesDi
 	if err != nil {
 		return fmt.Errorf("compute digest of the image in %s: %w", layoutDir, err)
 	}
-	if err := pushImage(ctx, ref, img, o.workDir); err != nil {
+	target, shown, dest, err := imagePushTarget(ctx, ref, o.workDir)
+	if err != nil {
 		return err
 	}
+	if err := pushImage(ctx, target, img, dest); err != nil {
+		return err
+	}
+	ref = shown
 	// The digest is printed so the caller can pin what it just published: a tag
 	// is mutable and the next push moves it, while ref@digest names these bytes
 	// forever.
@@ -136,12 +141,12 @@ func imagePush(ctx context.Context, o imageOptions, out io.Writer, dial imagesDi
 // transport go-containerregistry derives from the reference (plain HTTP for a
 // loopback authority, TLS everywhere else), and the failure taxonomy. A second
 // remote.Write would fork all three, and a fork is the copy nobody re-reads.
-func pushImage(ctx context.Context, ref name.Reference, img ggcrv1.Image, workDir string) error {
-	auth, err := registryAuth(ref, workDir)
+func pushImage(ctx context.Context, ref name.Reference, img ggcrv1.Image, dest pushDest) error {
+	opts, err := dest.options(ctx, ref)
 	if err != nil {
 		return err
 	}
-	if err := remote.Write(ref, img, remote.WithContext(ctx), remote.WithAuth(auth)); err != nil {
+	if err := remote.Write(ref, img, opts...); err != nil {
 		return pushError(ref, err)
 	}
 	return nil
@@ -154,15 +159,42 @@ func pushImage(ctx context.Context, ref name.Reference, img ggcrv1.Image, workDi
 // contract — registryAuth for the credential and pushError for the failure
 // taxonomy — because "what was uploaded" is the only axis on which a
 // multi-platform push differs from a single-platform one.
-func pushIndex(ctx context.Context, ref name.Reference, idx ggcrv1.ImageIndex, workDir string) error {
-	auth, err := registryAuth(ref, workDir)
+func pushIndex(ctx context.Context, ref name.Reference, idx ggcrv1.ImageIndex, dest pushDest) error {
+	opts, err := dest.options(ctx, ref)
 	if err != nil {
 		return err
 	}
-	if err := remote.WriteIndex(ref, idx, remote.WithContext(ctx), remote.WithAuth(auth)); err != nil {
+	if err := remote.WriteIndex(ref, idx, opts...); err != nil {
 		return pushError(ref, err)
 	}
 	return nil
+}
+
+// imagePushTarget is where `k3sm image push` uploads to ref, the name it
+// reports, and how. A reference naming the cluster registry (the flat
+// registry-k3sm:6450 name or a loopback spelling) goes through the push gate
+// with a builder token and is reported under the flat name a Pod spec uses;
+// any other goes where it names with registryAuth's credential.
+func imagePushTarget(ctx context.Context, ref name.Reference, workDir string) (target, shown name.Reference, dest pushDest, err error) {
+	if !isClusterRegistryHost(ref.Context().RegistryStr(), workDir) {
+		return ref, ref, pushDest{workDir: workDir}, nil
+	}
+	cr, err := resolveClusterRegistry(ctx, workDir)
+	if err != nil {
+		return nil, nil, pushDest{}, err
+	}
+	sep := ":"
+	if _, ok := ref.(name.Digest); ok {
+		sep = "@"
+	}
+	repo := ref.Context().RepositoryStr() + sep + ref.Identifier()
+	if target, err = name.ParseReference(cr.authority + "/" + repo); err != nil {
+		return nil, nil, pushDest{}, fmt.Errorf("push %s to the cluster registry at %s: %w", ref, cr.authority, err)
+	}
+	if shown, err = name.ParseReference(flatRegistryHost + "/" + repo); err != nil {
+		return nil, nil, pushDest{}, fmt.Errorf("reference %s/%s: %w", flatRegistryHost, repo, err)
+	}
+	return target, shown, pushDest{workDir: workDir, cluster: &cr}, nil
 }
 
 // layoutImage opens an OCI image layout directory and returns the one image it

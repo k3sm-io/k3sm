@@ -46,7 +46,7 @@ type registryPushes struct {
 	indexes int
 }
 
-func (p *registryPushes) push(_ context.Context, ref name.Reference, b built, _ string) error {
+func (p *registryPushes) push(_ context.Context, ref name.Reference, b built, _ pushDest) error {
 	p.targets = append(p.targets, ref.String())
 	if b.index != nil {
 		p.indexes++
@@ -68,7 +68,19 @@ func withNodeRegistry(t *testing.T) string {
 		t.Fatalf("write credential: %v", err)
 	}
 	t.Setenv("K3SM_WORK_DIR", dir)
+	fixedClusterRegistry(t, "localhost:6450")
 	return dir
+}
+
+// fixedClusterRegistry points resolveClusterRegistry at authority, for tests
+// that are about where an upload goes rather than how the gate is found.
+func fixedClusterRegistry(t *testing.T, authority string) {
+	t.Helper()
+	prev := resolveClusterRegistry
+	resolveClusterRegistry = func(context.Context, string) (gateEndpoint, error) {
+		return gateEndpoint{authority: authority}, nil
+	}
+	t.Cleanup(func() { resolveClusterRegistry = prev })
 }
 
 // testIndex wraps img in a one-child image index.

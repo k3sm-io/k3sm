@@ -28,12 +28,15 @@ import (
 	"time"
 
 	authnv1 "k8s.io/api/authentication/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // fakeBuilderTokenToken is the token the fake apiserver mints. It is a secret
@@ -66,12 +69,39 @@ func fakeTokenAPI(t *testing.T, answer func(spec authnv1.TokenRequestSpec) (*aut
 		out, err := answer(tr.Spec)
 		return true, out, err
 	})
-	prev := builderTokenClient
-	builderTokenClient = func() (serviceAccountTokens, error) {
-		return cs.CoreV1().ServiceAccounts("k3sm-registry"), nil
-	}
-	t.Cleanup(func() { builderTokenClient = prev })
+	fakeClusterAPI(t, cs)
 	return &seen
+}
+
+// fakeClusterAPI points clusterRegistryClient at cs, with fakeKubeconfigCA as the
+// kubeconfig's cluster CA.
+func fakeClusterAPI(t *testing.T, cs *fake.Clientset) {
+	t.Helper()
+	prev := clusterRegistryClient
+	clusterRegistryClient = func() (clusterRegistryAPI, error) {
+		return clusterRegistryAPI{
+			tokens: cs.CoreV1().ServiceAccounts("k3sm-registry"),
+			slices: cs.DiscoveryV1().EndpointSlices("k3sm-registry"),
+			caPEM:  []byte(fakeKubeconfigCA),
+		}, nil
+	}
+	t.Cleanup(func() { clusterRegistryClient = prev })
+}
+
+// fakeKubeconfigCA stands in for the kubeconfig's cluster CA where only its bytes
+// matter.
+const fakeKubeconfigCA = "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n"
+
+// asServer records a serving registry with its loopback gate on gatePort in a
+// fresh work dir, as this Mac's server would, and points the CLI at it.
+func asServer(t *testing.T, gatePort int) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := registrysvc.WriteState(dir, registrysvc.State{State: registrysvc.StateServing, Port: 6450, Addr: "127.0.0.1:6450", GatePort: gatePort}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("K3SM_WORK_DIR", dir)
+	return dir
 }
 
 // issue answers a TokenRequest with the fake token, valid for what was asked.
@@ -192,7 +222,9 @@ func TestRegistryTokenRefusedWithoutTokenRight(t *testing.T) {
 // keeps every other key and registry the file held, writes mode 0600, prints
 // no token, and refuses a config whose credential store would shadow the entry.
 func TestRegistryLoginWritesDockerConfigEntry(t *testing.T) {
-	fakeTokenAPI(t, issue)
+	seen := fakeTokenAPI(t, issue)
+	_ = seen
+	asServer(t, 6451)
 	dir := t.TempDir()
 	t.Setenv("DOCKER_CONFIG", dir)
 	path := filepath.Join(dir, "config.json")
@@ -205,6 +237,12 @@ func TestRegistryLoginWritesDockerConfigEntry(t *testing.T) {
 	}
 	if strings.Contains(out.String(), fakeBuilderTokenToken) {
 		t.Errorf("login printed the token: %q", out.String())
+	}
+	caPath := filepath.Join(dir, "certs.d", "localhost:6451", "ca.crt")
+	for _, want := range []string{"localhost:6451", path, caPath} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("login output %q does not say what it wrote (%s)", out.String(), want)
+		}
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -222,19 +260,54 @@ func TestRegistryLoginWritesDockerConfigEntry(t *testing.T) {
 		t.Fatalf("parse the written config: %v", err)
 	}
 	want := base64.StdEncoding.EncodeToString([]byte("builder:" + fakeBuilderTokenToken))
-	if doc.Auths["registry-k3sm:6450"].Auth != want {
-		t.Errorf("registry-k3sm:6450 entry = %q, want builder:<token>", doc.Auths["registry-k3sm:6450"].Auth)
+	if doc.Auths["localhost:6451"].Auth != want {
+		t.Errorf("localhost:6451 entry = %q, want builder:<token>", doc.Auths["localhost:6451"].Auth)
 	}
 	if doc.Auths["ghcr.io"].Auth != "b3RoZXI=" || doc.Experimental != "enabled" {
 		t.Errorf("login dropped the existing config: %s", raw)
 	}
+	ca, err := os.ReadFile(caPath)
+	if err != nil || string(ca) != fakeKubeconfigCA {
+		t.Errorf("certs.d CA = %q (%v), want the kubeconfig's cluster CA", ca, err)
+	}
+	if fi, err := os.Stat(caPath); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Errorf("certs.d CA mode = %v (%v), want 0644", fi.Mode().Perm(), err)
+	}
+	if fi, err := os.Stat(filepath.Dir(caPath)); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Errorf("certs.d dir mode = %v (%v), want 0755", fi.Mode().Perm(), err)
+	}
+
+	t.Run("a worker logs in to the server's cluster address", func(t *testing.T) {
+		cs := fake.NewClientset(flatSlice("100.64.0.1", 6450))
+		cs.PrependReactor("create", "serviceaccounts", func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetSubresource() != "token" {
+				return false, nil, nil
+			}
+			out, err := issue(a.(ktesting.CreateAction).GetObject().(*authnv1.TokenRequest).Spec)
+			return true, out, err
+		})
+		fakeClusterAPI(t, cs)
+		t.Setenv("K3SM_WORK_DIR", t.TempDir())
+		wdir := t.TempDir()
+		t.Setenv("DOCKER_CONFIG", wdir)
+		if err := runRegistry([]string{"login"}, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+			t.Fatalf("registry login: %v", err)
+		}
+		raw, _ := os.ReadFile(filepath.Join(wdir, "config.json"))
+		if !strings.Contains(string(raw), `"100.64.0.1:6450"`) {
+			t.Errorf("worker docker config = %s, want an entry for 100.64.0.1:6450", raw)
+		}
+		if _, err := os.Stat(filepath.Join(wdir, "certs.d", "100.64.0.1:6450", "ca.crt")); err != nil {
+			t.Errorf("worker certs.d CA: %v", err)
+		}
+	})
 
 	t.Run("a credential store refuses rather than writing a shadowed entry", func(t *testing.T) {
 		if err := os.WriteFile(path, []byte(`{"credsStore":"desktop"}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		err := runRegistry([]string{"login"}, &bytes.Buffer{}, &bytes.Buffer{})
-		if !errors.Is(err, errDockerCredentialStore) || !strings.Contains(err.Error(), "docker login registry-k3sm:6450 -u builder --password-stdin") {
+		if !errors.Is(err, errDockerCredentialStore) || !strings.Contains(err.Error(), "docker login localhost:6451 -u builder --password-stdin") {
 			t.Fatalf("err = %v, want errDockerCredentialStore naming the docker login pipe", err)
 		}
 		raw, _ := os.ReadFile(path)
@@ -242,4 +315,19 @@ func TestRegistryLoginWritesDockerConfigEntry(t *testing.T) {
 			t.Errorf("the refused login changed the file: %s", raw)
 		}
 	})
+}
+
+// flatSlice is the flat registry-k3sm Service's EndpointSlice naming one ready
+// endpoint, as the server publishes it.
+func flatSlice(addr string, port int32) *discoveryv1.EndpointSlice {
+	name, ready := "registry", true
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "registry-k3sm", Namespace: "k3sm-registry",
+			Labels: map[string]string{discoveryv1.LabelServiceName: "registry-k3sm"},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Ports:       []discoveryv1.EndpointPort{{Name: &name, Port: &port}},
+		Endpoints:   []discoveryv1.Endpoint{{Addresses: []string{addr}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}}},
+	}
 }

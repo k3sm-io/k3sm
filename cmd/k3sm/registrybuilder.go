@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	authnv1 "k8s.io/api/authentication/v1"
@@ -67,7 +66,7 @@ var errBuilderTokenDuration = errors.New("the requested token lifetime is not on
 
 // builderTokenRemedy is the fix for a Mac with no kubeconfig: write one with
 // the admin copy, as `k3sm kubeconfig` does on any Mac.
-const builderTokenRemedy = "write one with `k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write`, run with the admin kubeconfig copied from the server (a worker writes no user kubeconfig); or have an admin bind the k3sm:registry-builder-token ClusterRole to you with a RoleBinding in " + registrysvc.BuilderNamespace
+const builderTokenRemedy = "write one with `k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write`, run with the admin kubeconfig copied from the server (a worker writes no user kubeconfig); or have an admin bind the k3sm:registry-builder-token Role to you with a RoleBinding in " + registrysvc.BuilderNamespace
 
 // serviceAccountTokens is the slice of the Kubernetes API a builder token is
 // minted through. cs.CoreV1().ServiceAccounts(ns) satisfies it.
@@ -88,18 +87,6 @@ func (t builderToken) String() string {
 	return "builder token (expires " + t.expires.UTC().Format(time.RFC3339) + ")"
 }
 
-// builderTokenClient resolves the caller's kubeconfig, the way `k3sm kubectl`
-// and the builder verbs do, and returns the builder ServiceAccount's token
-// endpoint through it. It is a variable so a test points it at a fake.
-var builderTokenClient = func() (serviceAccountTokens, error) {
-	in := builderKubeInputs(builderOptions{workDir: workDirFromEnv(), workDirExplicit: os.Getenv("K3SM_WORK_DIR") != ""})
-	_, cs, err := builderClients(in)
-	if err != nil {
-		return nil, fmt.Errorf("%w (%v); %s", errNoUserKubeconfig, err, builderTokenRemedy)
-	}
-	return cs.CoreV1().ServiceAccounts(registrysvc.BuilderNamespace), nil
-}
-
 // mintBuilderToken asks the cluster for a token for the builder ServiceAccount,
 // audience registrysvc.RegistryAudience, valid for d. A token the apiserver
 // issued for LESS than d means d is above its maximum, and is refused rather
@@ -118,7 +105,7 @@ func mintBuilderToken(ctx context.Context, sa serviceAccountTokens, d time.Durat
 	}, metav1.CreateOptions{})
 	switch {
 	case apierrors.IsForbidden(err):
-		return builderToken{}, fmt.Errorf("%w: this kubeconfig may not create tokens for %s/%s; an admin can bind the k3sm:registry-builder-token ClusterRole to you with a RoleBinding in %s",
+		return builderToken{}, fmt.Errorf("%w: this kubeconfig may not create tokens for %s/%s; an admin can bind the k3sm:registry-builder-token Role to you with a RoleBinding in %s",
 			errBuilderTokenRefused, registrysvc.BuilderNamespace, registrysvc.BuilderServiceAccount, registrysvc.BuilderNamespace)
 	case apierrors.IsNotFound(err):
 		return builderToken{}, fmt.Errorf("%w: the %s/%s ServiceAccount does not exist; a server creates it on start, so this cluster's server predates it",
