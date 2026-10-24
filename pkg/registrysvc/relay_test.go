@@ -233,7 +233,7 @@ func TestRelayServesTheGate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("listen: %v", err)
 		}
-		ll := newLimitListener(front, 1)
+		ll := newLimitListener(front, 1, 2)
 		t.Cleanup(func() { _ = ll.Close() })
 		accepted := make(chan net.Conn, 2)
 		go func() {
