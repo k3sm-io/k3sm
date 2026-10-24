@@ -207,6 +207,20 @@ func registryPushTarget(ctx context.Context, ref name.Tag, workDir string) (name
 	return target, pushDest{workDir: workDir, cluster: &cr}, nil
 }
 
+// pushReference parses a push target the way every push verb reads one, so
+// `k3sm build --push` and `k3sm image push` cannot disagree about a bare name.
+//
+// It parses with an EMPTY default registry, so "this reference names no
+// registry" is the PARSER's verdict rather than a second reading of the
+// reference grammar: go-containerregistry treats a first component holding a
+// "." or a ":" as a registry and everything else as part of a Docker Hub
+// repository, and this asks it rather than re-deriving the rule. A reference
+// naming no registry then names the cluster registry (isClusterRegistryHost),
+// never Docker Hub, and gains no "library/" element.
+func pushReference(s string) (name.Reference, error) {
+	return name.ParseReference(s, name.WithDefaultRegistry(""))
+}
+
 // resolvePushTarget decides WHERE --push sends the image built under tag.
 //
 // A tag that names another registry goes to that registry, spelled exactly as
@@ -214,14 +228,13 @@ func registryPushTarget(ctx context.Context, ref name.Tag, workDir string) (name
 // registry, by a bare name, the flat registry-k3sm:6450 name or a loopback
 // spelling, goes to the cluster registry through the push gate.
 func resolvePushTarget(ctx context.Context, tag, workDir string) (name.Tag, pushDest, error) {
-	// Parsed with an EMPTY default registry, so "this reference names no
-	// registry" is the PARSER's verdict rather than a second reading of the
-	// reference grammar: go-containerregistry treats a first component holding a
-	// "." or a ":" as a registry and everything else as part of a Docker Hub
-	// repository, and this asks it rather than re-deriving the rule.
-	probe, err := name.NewTag(tag, name.WithDefaultRegistry(""))
+	parsed, err := pushReference(tag)
 	if err != nil {
 		return name.Tag{}, pushDest{}, fmt.Errorf("--tag %q: %w", tag, err)
+	}
+	probe, ok := parsed.(name.Tag)
+	if !ok {
+		return name.Tag{}, pushDest{}, fmt.Errorf("--tag %q: a build is pushed under a tag, not a digest", tag)
 	}
 	switch reg := probe.RegistryStr(); {
 	case reg == "":

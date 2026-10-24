@@ -84,7 +84,9 @@ var (
 // export `k3sm image save` uses, and everything after that is the identical
 // layout upload.
 func imagePush(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer) error {
-	ref, err := name.ParseReference(o.target)
+	// Read as build --push reads its tag: a reference naming no registry names
+	// the cluster registry, not Docker Hub.
+	ref, err := pushReference(o.target)
 	if err != nil {
 		return fmt.Errorf("target reference %q: %w", o.target, err)
 	}
