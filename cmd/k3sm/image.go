@@ -145,6 +145,11 @@ type imageOptions struct {
 	platform *runtimev1.Platform
 	// policy is the parsed --policy, pull only.
 	policy runtimev1.ImagePullPolicy
+	// cacheOnly marks a pull as a cache warm-up rather than an operator pull:
+	// the daemon records no operator root for it, so prune may reclaim the
+	// image once no pod uses it. No flag sets it; only the warm-up after a
+	// build, load or push into the cluster registry does.
+	cacheOnly bool
 	// digest is untag's --digest pin: the removal is refused unless the entry
 	// still resolves to it.
 	digest string

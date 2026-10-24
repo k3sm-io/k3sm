@@ -44,6 +44,7 @@ func imagePull(ctx context.Context, client runtimev1.ImagesClient, o imageOption
 		Reference: o.source,
 		Platform:  o.platform,
 		Policy:    o.policy,
+		CacheOnly: o.cacheOnly,
 	})
 	if err != nil {
 		return imageRPCError("pull image", o.socket, err)
