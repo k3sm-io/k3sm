@@ -22,6 +22,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -126,6 +127,10 @@ type ingestRegistry struct {
 	// names for the runtime, the port peers are advertised at, the port the
 	// relay binds and the flat Service's target port.
 	port int
+	// nodePort is --registry-node-port: the NodePort the flat Service is also
+	// exposed on, or 0 for a ClusterIP Service. Only the publishing (bootstrap)
+	// server's value matters, because only it writes the Service.
+	nodePort int
 	// nodeName is this node, the identity its advertisement and the flat
 	// Service's publisher label are written under.
 	nodeName string
@@ -502,7 +507,7 @@ func (r ingestRegistry) publishFlatService(ctx context.Context) (clusterIP strin
 		r.logger.Error("the ingest registry has no publishable cluster address", "err", err, "node", r.nodeName)
 		return "", false
 	}
-	clusterIP, err = registrysvc.PublishFlatService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, addr)
+	clusterIP, err = r.publishFlat(ctx, addr)
 	if err != nil {
 		r.logger.Error("publish the registry Service", "err", err,
 			"namespace", registrysvc.FlatServiceNamespace, "name", registrysvc.FlatServiceName)
@@ -510,8 +515,25 @@ func (r ingestRegistry) publishFlatService(ctx context.Context) (clusterIP strin
 	}
 	r.logger.Info("published the ingest registry as the cluster Service",
 		"namespace", registrysvc.FlatServiceNamespace, "name", registrysvc.FlatServiceName,
-		"authority", registrysvc.FlatAuthority(), "clusterIP", clusterIP, "endpoint", addr.String())
+		"authority", registrysvc.FlatAuthority(), "clusterIP", clusterIP, "endpoint", addr.String(),
+		"nodePort", r.nodePort)
 	return clusterIP, true
+}
+
+// publishFlat publishes the flat Service with the opt-in NodePort, and, when
+// that publish fails, publishes it again without one. The NodePort is an extra
+// way in for tools off the cluster; a port the apiserver will not allocate (one
+// another Service holds) must not take the cluster's own registry name away with
+// it, so the failure is reported at Error and the in-cluster Service still
+// stands. The next refresh tries the NodePort again.
+func (r ingestRegistry) publishFlat(ctx context.Context, addr netip.Addr) (string, error) {
+	ip, err := registrysvc.PublishFlatService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, r.nodePort, addr)
+	if err == nil || r.nodePort == 0 {
+		return ip, err
+	}
+	r.logger.Error("expose the registry on its NodePort; publishing the cluster Service without it",
+		"err", err, "nodePort", r.nodePort, "name", registrysvc.FlatServiceName)
+	return registrysvc.PublishFlatService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, 0, addr)
 }
 
 // refresh re-publishes the flat Service on the advertisement's cadence and
@@ -536,7 +558,7 @@ func (r ingestRegistry) refresh(ctx context.Context, wg *sync.WaitGroup, publish
 			case <-t.C:
 			}
 			if published && addrErr == nil {
-				ip, err := registrysvc.PublishFlatService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, addr)
+				ip, err := r.publishFlat(ctx, addr)
 				switch {
 				case err != nil:
 					r.logger.Error("refresh the registry Service", "err", err, "name", registrysvc.FlatServiceName)

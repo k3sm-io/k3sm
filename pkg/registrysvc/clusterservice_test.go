@@ -130,7 +130,7 @@ func TestClusterEndpointAddress(t *testing.T) {
 // port follows the registry, and the port NAME matches the slice's.
 func TestFlatService(t *testing.T) {
 	t.Run("the rendered spec", func(t *testing.T) {
-		svc, err := FlatService("mac-a", 14507)
+		svc, err := FlatService("mac-a", 14507, 0)
 		if err != nil {
 			t.Fatalf("FlatService: %v", err)
 		}
@@ -159,11 +159,11 @@ func TestFlatService(t *testing.T) {
 	})
 
 	t.Run("an empty publisher or an out-of-range port is an error", func(t *testing.T) {
-		if _, err := FlatService("", 6450); err == nil {
+		if _, err := FlatService("", 6450, 0); err == nil {
 			t.Error("FlatService with no publisher = nil error")
 		}
 		for _, port := range []int{0, -1, 65536} {
-			if _, err := FlatService("mac-a", port); err == nil {
+			if _, err := FlatService("mac-a", port, 0); err == nil {
 				t.Errorf("FlatService(port=%d) = nil error, want a refusal", port)
 			}
 		}
@@ -256,7 +256,7 @@ func TestPublishFlatService(t *testing.T) {
 
 	t.Run("absent creates both objects", func(t *testing.T) {
 		svcs, slices := &fakeServices{}, &fakeSlices{}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, mesh); err != nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, mesh); err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
 		if svcs.creates != 1 || slices.creates != 1 {
@@ -269,7 +269,7 @@ func TestPublishFlatService(t *testing.T) {
 
 	t.Run("the assigned ClusterIP is returned", func(t *testing.T) {
 		svcs, slices := &fakeServices{assignIP: "10.43.7.9"}, &fakeSlices{}
-		ip, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, mesh)
+		ip, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, mesh)
 		if err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
@@ -280,10 +280,10 @@ func TestPublishFlatService(t *testing.T) {
 
 	t.Run("a moved relay address is refreshed", func(t *testing.T) {
 		svcs, slices := &fakeServices{}, &fakeSlices{}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, mesh); err != nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, mesh); err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, netip.MustParseAddr("100.64.9.9")); err != nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, netip.MustParseAddr("100.64.9.9")); err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
 		if slices.updates != 1 || slices.es.Endpoints[0].Addresses[0] != "100.64.9.9" {
@@ -294,7 +294,7 @@ func TestPublishFlatService(t *testing.T) {
 	t.Run("an unchanged pair is not rewritten", func(t *testing.T) {
 		svcs, slices := &fakeServices{}, &fakeSlices{}
 		for range 3 {
-			if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, mesh); err != nil {
+			if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, mesh); err != nil {
 				t.Fatalf("PublishFlatService: %v", err)
 			}
 		}
@@ -305,10 +305,10 @@ func TestPublishFlatService(t *testing.T) {
 
 	t.Run("a refresh preserves the assigned ClusterIP and follows the target port", func(t *testing.T) {
 		svcs, slices := &fakeServices{assignIP: "10.43.7.9"}, &fakeSlices{}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, mesh); err != nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, mesh); err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 14507, mesh); err != nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 14507, 0, mesh); err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
 		if svcs.updates != 1 {
@@ -324,11 +324,11 @@ func TestPublishFlatService(t *testing.T) {
 
 	t.Run("a selector that appeared is cleared", func(t *testing.T) {
 		svcs, slices := &fakeServices{}, &fakeSlices{}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, mesh); err != nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, mesh); err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
 		svcs.svc.Spec.Selector = map[string]string{"app": "someone-elses"}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, mesh); err != nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, mesh); err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
 		if svcs.svc.Spec.Selector != nil {
@@ -338,7 +338,7 @@ func TestPublishFlatService(t *testing.T) {
 
 	t.Run("a loopback endpoint publishes nothing at all", func(t *testing.T) {
 		svcs, slices := &fakeServices{}, &fakeSlices{}
-		_, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, netip.MustParseAddr("127.0.0.1"))
+		_, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, netip.MustParseAddr("127.0.0.1"))
 		if !errors.Is(err, ErrNonRelayableBind) {
 			t.Fatalf("err = %v, want ErrNonRelayableBind", err)
 		}
@@ -349,14 +349,14 @@ func TestPublishFlatService(t *testing.T) {
 
 	t.Run("a read failure is reported, not swallowed", func(t *testing.T) {
 		svcs, slices := &fakeServices{getErr: errors.New("apiserver said no")}, &fakeSlices{}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, mesh); err == nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, mesh); err == nil {
 			t.Fatal("PublishFlatService = nil on a read failure, want an error")
 		}
 	})
 
 	t.Run("a slice failure does not hide the Service's ClusterIP", func(t *testing.T) {
 		svcs, slices := &fakeServices{assignIP: "10.43.7.9"}, &fakeSlices{createErr: errors.New("nope")}
-		ip, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, mesh)
+		ip, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, mesh)
 		if err == nil {
 			t.Fatal("PublishFlatService = nil on a slice failure, want an error")
 		}
@@ -372,7 +372,7 @@ func TestPublishFlatService(t *testing.T) {
 func TestRemoveServices(t *testing.T) {
 	t.Run("the flat pair is deleted, slice first", func(t *testing.T) {
 		svcs, slices := &fakeServices{}, &fakeSlices{}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, netip.MustParseAddr("100.64.1.1")); err != nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, netip.MustParseAddr("100.64.1.1")); err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
 		order := []string{}
@@ -415,7 +415,7 @@ func TestRemoveServices(t *testing.T) {
 
 	t.Run("a Service delete failure still reports after the slice was removed", func(t *testing.T) {
 		svcs, slices := &fakeServices{deleteErr: errors.New("nope")}, &fakeSlices{}
-		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, netip.MustParseAddr("100.64.1.1")); err != nil {
+		if _, err := PublishFlatService(t.Context(), svcs, slices, "mac-a", 6450, 0, netip.MustParseAddr("100.64.1.1")); err != nil {
 			t.Fatalf("PublishFlatService: %v", err)
 		}
 		if err := RemoveFlatService(t.Context(), svcs, slices); err == nil {
