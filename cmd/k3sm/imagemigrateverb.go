@@ -152,6 +152,16 @@ func upstreamServesDigest(ctx context.Context, reference, digest string) bool {
 	return desc.Digest.String() == digest
 }
 
+// namesClusterRegistry reports whether a node-store reference already names
+// the cluster registry: the flat registry-k3sm:6450 name or this node's
+// registry by its loopback spelling. Such an entry is not a cache of another
+// registry's image, so the migration never asks an upstream about it. A
+// reference that is not a tag (a digest-only one) names no registry of ours.
+func namesClusterRegistry(reference, workDir string) bool {
+	probe, err := name.NewTag(reference, name.WithDefaultRegistry(""))
+	return err == nil && isClusterRegistryHost(probe.RegistryStr(), workDir)
+}
+
 // newImageMigrator wires the production migrator for a work dir and a
 // runtimed client.
 func newImageMigrator(workDir string, client runtimev1.ImagesClient, socket string) imageMigrator {
