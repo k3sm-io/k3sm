@@ -17,13 +17,16 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	_ "unsafe" // for go:linkname: the bootstrap work factors below
 
+	"github.com/google/go-containerregistry/pkg/name"
 	"golang.org/x/crypto/bcrypt"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -77,6 +80,11 @@ func TestMain(m *testing.M) {
 	// No test reads this Mac's installed server: a server Mac's published
 	// registry record would otherwise steer every push test to its gate.
 	installedServerWorkDir = filepath.Join(os.TempDir(), fmt.Sprintf("k3sm-test-no-install-%d", os.Getpid()), "server")
+	// No pull test copies an image to a real cluster registry: one that is
+	// about the copy installs its own fake.
+	pullMirrorer = func(context.Context, name.Reference, name.Reference, string) error {
+		return errors.New("this test installed no cluster-registry mirrorer")
+	}
 	os.Exit(m.Run())
 }
 

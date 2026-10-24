@@ -298,7 +298,8 @@ func warmNodeCache(dial imagesDialer, socket string) cacheWarmer {
 			defer closer.Close()
 		}
 		o := imageOptions{subcommand: "pull", socket: socket, source: ref.String(), policy: runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS, cacheOnly: true}
-		return imagePull(ctx, runtimev1.NewImagesClient(cc), o, io.Discard)
+		_, err = imagePull(ctx, runtimev1.NewImagesClient(cc), o, io.Discard)
+		return err
 	}
 }
 
