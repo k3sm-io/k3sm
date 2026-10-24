@@ -86,9 +86,8 @@ func TestIssueRegistryServing(t *testing.T) {
 }
 
 // TestRegistryServingLeafShape pins the exact constraints of the leaf: not a
-// CA, server-auth only, digital signature and key encipherment (what the
-// shared leaf issuer sets for every serving certificate), and no
-// wildcard SAN.
+// CA, server-auth only, digital signature alone (what the shared leaf issuer
+// sets for an ECDSA key, which never enciphers one), and no wildcard SAN.
 func TestRegistryServingLeafShape(t *testing.T) {
 	ca, err := NewCA("k3sm-cluster-ca")
 	if err != nil {
@@ -108,8 +107,8 @@ func TestRegistryServingLeafShape(t *testing.T) {
 	if !slices.Equal(leaf.ExtKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}) {
 		t.Errorf("ExtKeyUsage = %v, want exactly [ServerAuth]", leaf.ExtKeyUsage)
 	}
-	if want := x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment; leaf.KeyUsage != want {
-		t.Errorf("KeyUsage = %b, want %b (digital signature | key encipherment)", leaf.KeyUsage, want)
+	if want := x509.KeyUsageDigitalSignature; leaf.KeyUsage != want {
+		t.Errorf("KeyUsage = %b, want %b (digital signature only: the key is ECDSA)", leaf.KeyUsage, want)
 	}
 	if leaf.KeyUsage&x509.KeyUsageCertSign != 0 {
 		t.Error("the leaf may sign certificates")

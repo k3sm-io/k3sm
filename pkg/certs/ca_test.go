@@ -17,6 +17,10 @@ limitations under the License.
 package certs
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"net"
@@ -88,5 +92,32 @@ func TestEnsureHierarchy(t *testing.T) {
 		if info.Mode().Perm() != 0o600 {
 			t.Errorf("%s mode = %o, want 0600 (CA key must not be world-readable)", f, info.Mode().Perm())
 		}
+	}
+}
+
+// TestLeafKeyUsageFollowsKeyType pins the leaf key usage per key type: key
+// encipherment only for RSA, digital signature for every key.
+func TestLeafKeyUsageFollowsKeyType(t *testing.T) {
+	ec, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		pub  any
+		want x509.KeyUsage
+	}{
+		{"ecdsa signs only", &ec.PublicKey, x509.KeyUsageDigitalSignature},
+		{"rsa signs and enciphers", &rk.PublicKey, x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := leafKeyUsage(tc.pub); got != tc.want {
+				t.Errorf("leafKeyUsage = %b, want %b", got, tc.want)
+			}
+		})
 	}
 }
