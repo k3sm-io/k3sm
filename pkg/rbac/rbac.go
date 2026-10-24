@@ -188,8 +188,9 @@ const RegistryGateRole = "k3sm:registry-gate"
 
 // RegistryPusherRole names the ClusterRole a namespace binds, with an ordinary
 // RoleBinding, to the ServiceAccounts it lets push to a node's ingest registry.
-// k3sm ships the role and NO binding to it: who may push is the namespace's
-// decision, made in RBAC.
+// k3sm's one binding to it is RegistryBuilderBinding, to the builder
+// ServiceAccount alone; every other pusher is the namespace's decision, made in
+// RBAC.
 const RegistryPusherRole = "k3sm:registry-pusher"
 
 // registryGateRules is the push gate's whole grant: create a TokenReview (is
@@ -229,7 +230,59 @@ func ensureRegistryPushRBAC(ctx context.Context, cs kubernetes.Interface) error 
 	if err := ensureClusterRoleBinding(ctx, cs, "registry gate", RegistryGateRole, certs.RegistryGateGroup); err != nil {
 		return err
 	}
-	return ensureClusterRole(ctx, cs, "registry pusher", RegistryPusherRole, registryPusherRules())
+	if err := ensureClusterRole(ctx, cs, "registry pusher", RegistryPusherRole, registryPusherRules()); err != nil {
+		return err
+	}
+	return ensureRegistryBuilderRBAC(ctx, cs)
+}
+
+// RegistryBuilderBinding names the ClusterRoleBinding that grants the builder
+// ServiceAccount (registrysvc.BuilderNamespace/registrysvc.BuilderServiceAccount)
+// the k3sm:registry-pusher role cluster-wide.
+const RegistryBuilderBinding = "k3sm:registry-builder"
+
+// RegistryBuilderTokenRole names the ClusterRole that lets its holder mint a
+// token for the builder ServiceAccount, and nothing else. k3sm ships it with NO
+// binding: an admin binds it, with a RoleBinding in registrysvc.BuilderNamespace,
+// to a user who should push without administering the cluster.
+const RegistryBuilderTokenRole = "k3sm:registry-builder-token"
+
+// registryBuilderTokenRules is the token role's whole grant: create on the
+// serviceaccounts/token subresource of the one ServiceAccount named builder.
+// Bound by a RoleBinding in the builder's namespace it reaches exactly
+// k3sm-registry/builder; it carries no get, list or watch, so a holder cannot
+// read the ServiceAccount, its Secrets or anything else.
+func registryBuilderTokenRules() []rbacv1.PolicyRule {
+	return []rbacv1.PolicyRule{{
+		APIGroups:     []string{""},
+		Resources:     []string{"serviceaccounts/token"},
+		ResourceNames: []string{registrysvc.BuilderServiceAccount},
+		Verbs:         []string{"create"},
+	}}
+}
+
+// ensureRegistryBuilderRBAC provisions the builder identity a user pushes as
+// from any Mac: the ServiceAccount, its cluster-wide ClusterRoleBinding to
+// k3sm:registry-pusher (the push gate asks a cluster-wide SubjectAccessReview
+// for it), and the UNBOUND k3sm:registry-builder-token ClusterRole. It runs on
+// every server start, so a new cluster has the identity from its first start.
+//
+// Who may push as builder is decided by who may create its token: an admin
+// kubeconfig can, and a user an admin bound the token role to can. The builder
+// ServiceAccount itself is never mounted into a Pod by k3sm.
+func ensureRegistryBuilderRBAC(ctx context.Context, cs kubernetes.Interface) error {
+	ns := registrysvc.BuilderNamespace
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: registrysvc.BuilderServiceAccount, Labels: managedLabels()},
+	}
+	if _, err := cs.CoreV1().ServiceAccounts(ns).Create(ctx, sa, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create the registry builder service account in %s: %w", ns, err)
+	}
+	builder := rbacv1.Subject{Kind: "ServiceAccount", Name: registrysvc.BuilderServiceAccount, Namespace: ns}
+	if err := ensureClusterRoleBindingTo(ctx, cs, "registry builder", RegistryBuilderBinding, RegistryPusherRole, builder); err != nil {
+		return err
+	}
+	return ensureClusterRole(ctx, cs, "registry builder token", RegistryBuilderTokenRole, registryBuilderTokenRules())
 }
 
 // ensureClusterRole creates the named managed ClusterRole with exactly rules, or
@@ -267,11 +320,18 @@ func ensureClusterRole(ctx context.Context, cs kubernetes.Interface, what, name 
 // binding whose roleRef drifted is deleted and re-created, because roleRef is
 // immutable.
 func ensureClusterRoleBinding(ctx context.Context, cs kubernetes.Interface, what, name, group string) error {
+	return ensureClusterRoleBindingTo(ctx, cs, what, name, name, rbacv1.Subject{APIGroup: rbacv1.GroupName, Kind: "Group", Name: group})
+}
+
+// ensureClusterRoleBindingTo creates the managed ClusterRoleBinding name,
+// binding the ClusterRole role to exactly subject, or repairs it, on the same
+// terms as ensureClusterRoleBinding.
+func ensureClusterRoleBindingTo(ctx context.Context, cs kubernetes.Interface, what, name, role string, subject rbacv1.Subject) error {
 	api := cs.RbacV1()
 	wantBinding := &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: managedLabels()},
-		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: name},
-		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: "Group", Name: group}},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role},
+		Subjects:   []rbacv1.Subject{subject},
 	}
 	haveBinding, err := api.ClusterRoleBindings().Get(ctx, name, metav1.GetOptions{})
 	switch {

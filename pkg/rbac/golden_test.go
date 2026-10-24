@@ -150,6 +150,8 @@ func createdObjects(t *testing.T, actions []ktesting.Action) []GoldenObject {
 			out = append(out, GoldenObject{Kind: "RoleBinding", Namespace: obj.Namespace, Name: obj.Name, Labels: obj.Labels, RoleRef: &ref, Subjects: obj.Subjects})
 		case *corev1.Namespace:
 			out = append(out, GoldenObject{Kind: "Namespace", Name: obj.Name, Labels: obj.Labels})
+		case *corev1.ServiceAccount:
+			out = append(out, GoldenObject{Kind: "ServiceAccount", Namespace: obj.Namespace, Name: obj.Name, Labels: obj.Labels})
 		default:
 			t.Fatalf("Provision created an object of an unexpected type %T; extend the golden serializer deliberately", obj)
 		}

@@ -881,3 +881,59 @@ func TestPushPrefixHeldByOneNamespace(t *testing.T) {
 		})
 	}
 }
+
+// TestPushAuthorizesBuilderClusterWide pins the builder path: a token for the
+// k3sm-registry/builder ServiceAccount is authorized by one cluster-wide
+// SubjectAccessReview (no namespace in its attributes, so only a
+// ClusterRoleBinding can answer yes), skips the namespace label and prefix, and
+// is refused when that review says no. A ServiceAccount named builder in any
+// other namespace gets no such path.
+func TestPushAuthorizesBuilderClusterWide(t *testing.T) {
+	tokBuilder := mkToken("cluster-builder", testEpoch.Add(time.Hour))
+	tokImpostor := mkToken("impostor-builder", testEpoch.Add(time.Hour))
+	setup := func(t *testing.T, allow bool) *gateFixture {
+		f := newGateFixture(t)
+		f.tokens.statuses[tokBuilder] = saStatus(BuilderNamespace, BuilderServiceAccount)
+		f.tokens.statuses[tokImpostor] = saStatus("other", BuilderServiceAccount)
+		f.access.allow = func(sar *authzv1.SubjectAccessReview) bool {
+			return allow && sar.Spec.User == "system:serviceaccount:"+BuilderNamespace+":"+BuilderServiceAccount &&
+				sar.Spec.ResourceAttributes.Namespace == ""
+		}
+		return f
+	}
+	t.Run("an allowed builder pushes any repository", func(t *testing.T) {
+		f := setup(t, true)
+		r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tokBuilder), "{}", nil)
+		if r.status != 201 {
+			t.Fatalf("status = %d (%s), want 201", r.status, r.body)
+		}
+		if f.namespaces.calls != 0 {
+			t.Errorf("the builder path read %d namespaces, want none", f.namespaces.calls)
+		}
+		if len(f.access.seen) != 1 {
+			t.Fatalf("access reviews = %d, want 1", len(f.access.seen))
+		}
+		ra := f.access.seen[0].Spec.ResourceAttributes
+		if ra.Namespace != "" || ra.Verb != PushVerb || ra.Group != PushAPIGroup || ra.Resource != PushResource || ra.Name != "app" {
+			t.Errorf("access review attributes = %+v, want a cluster-wide push on app", ra)
+		}
+		reqs := f.zot.requests()
+		if len(reqs) != 1 || reqs[0].auth != wantGateAuth {
+			t.Errorf("zot saw %+v, want one write with the gate credential", reqs)
+		}
+	})
+	t.Run("a builder the cluster-wide review refuses is denied", func(t *testing.T) {
+		f := setup(t, false)
+		r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tokBuilder), "{}", nil)
+		if r.status != 403 || len(f.zot.requests()) != 0 {
+			t.Fatalf("status = %d, zot saw %d requests; want 403 and nothing forwarded", r.status, len(f.zot.requests()))
+		}
+	})
+	t.Run("a builder ServiceAccount in another namespace is held to its namespace", func(t *testing.T) {
+		f := setup(t, true)
+		r := f.do(t, "PUT", "/v2/app/manifests/v1", basic(tokImpostor), "{}", nil)
+		if r.status != 403 || len(f.zot.requests()) != 0 || f.access.count() != 0 {
+			t.Fatalf("status = %d, forwarded %d, reviews %d; want 403, none, none", r.status, len(f.zot.requests()), f.access.count())
+		}
+	})
+}

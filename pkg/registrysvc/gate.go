@@ -242,25 +242,30 @@ func (g *gate) authorizeWrite(w http.ResponseWriter, r *http.Request, route gate
 		ociError(w, r, http.StatusForbidden, codeDenied, "only a ServiceAccount may push")
 		return
 	}
-	ns, err := g.auth.namespacePrefix(r.Context(), id.namespace)
-	if err != nil {
-		g.refuseUnavailable(w, r, route, id, err)
-		return
-	}
-	if ns.prefix == "" {
-		g.audit(r, route, id, "denied: "+ns.reason, http.StatusForbidden)
-		ociError(w, r, http.StatusForbidden, codeDenied, ns.reason)
-		return
-	}
 	repos := []string{route.repo}
 	if route.from != "" {
 		repos = append(repos, route.from)
 	}
-	for _, repo := range repos {
-		if !underPrefix(repo, ns.prefix) {
-			g.audit(r, route, id, "denied: "+repo+" is outside the namespace prefix "+ns.prefix+"/", http.StatusForbidden)
-			ociError(w, r, http.StatusForbidden, codeDenied, "the repository is outside this namespace's prefix "+ns.prefix+"/")
+	// The builder is authorized cluster-wide (mayPush asks with no namespace),
+	// so it skips the namespace label and prefix, and only it does: every other
+	// ServiceAccount is held to its namespace's opt-in and prefix.
+	if !id.isBuilder() {
+		ns, err := g.auth.namespacePrefix(r.Context(), id.namespace)
+		if err != nil {
+			g.refuseUnavailable(w, r, route, id, err)
 			return
+		}
+		if ns.prefix == "" {
+			g.audit(r, route, id, "denied: "+ns.reason, http.StatusForbidden)
+			ociError(w, r, http.StatusForbidden, codeDenied, ns.reason)
+			return
+		}
+		for _, repo := range repos {
+			if !underPrefix(repo, ns.prefix) {
+				g.audit(r, route, id, "denied: "+repo+" is outside the namespace prefix "+ns.prefix+"/", http.StatusForbidden)
+				ociError(w, r, http.StatusForbidden, codeDenied, "the repository is outside this namespace's prefix "+ns.prefix+"/")
+				return
+			}
 		}
 	}
 	for _, repo := range repos {

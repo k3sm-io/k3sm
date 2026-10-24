@@ -77,6 +77,31 @@ const (
 	PushVerb     = "push"
 )
 
+// The BUILDER identity: the one ServiceAccount a user pushes as from a Mac. A
+// user whose kubeconfig may create tokens for it mints a short-lived token for
+// RegistryAudience (a TokenRequest) and presents that, so a push from any Mac
+// is the user's own cluster authority, never a credential file on a node.
+//
+// It is authorized by a CLUSTER-WIDE SubjectAccessReview (pkg/rbac binds it to
+// k3sm:registry-pusher with a ClusterRoleBinding), not by the namespace label:
+// it pushes the cluster's own repositories, which sit under no namespace's
+// prefix. No other identity takes this path; every other ServiceAccount is
+// authorized by its namespace exactly as before.
+const (
+	// BuilderNamespace is the namespace the builder ServiceAccount lives in.
+	BuilderNamespace = AdvertisementNamespace
+	// BuilderServiceAccount is the builder ServiceAccount's name.
+	BuilderServiceAccount = "builder"
+)
+
+// builderUsername is the username a reviewed builder token carries.
+const builderUsername = "system:serviceaccount:" + BuilderNamespace + ":" + BuilderServiceAccount
+
+// isBuilder reports whether id is the builder ServiceAccount.
+func (id pushIdentity) isBuilder() bool {
+	return id.username == builderUsername && id.namespace == BuilderNamespace
+}
+
 const (
 	// maxTokenBytes bounds the password a push presents before it is ever sent
 	// for review. A projected token is well under 2 KiB.
@@ -366,7 +391,7 @@ func (a *authorizer) mayPush(ctx context.Context, id pushIdentity, repo string) 
 	resp, err := a.auth.Access.Create(rctx, &authzv1.SubjectAccessReview{
 		Spec: authzv1.SubjectAccessReviewSpec{
 			ResourceAttributes: &authzv1.ResourceAttributes{
-				Namespace: id.namespace,
+				Namespace: sarNamespace(id),
 				Verb:      PushVerb,
 				Group:     PushAPIGroup,
 				Resource:  PushResource,
@@ -385,6 +410,17 @@ func (a *authorizer) mayPush(ctx context.Context, id pushIdentity, repo string) 
 	now := a.now()
 	a.access.put(key, allowed, now.Add(accessTTL), now)
 	return allowed, nil
+}
+
+// sarNamespace is the namespace a push SubjectAccessReview asks about: the
+// token's own namespace, or none (a cluster-wide question) for the builder,
+// whose grant is a ClusterRoleBinding. A namespaced RoleBinding in the
+// builder's own namespace therefore cannot stand in for that grant.
+func sarNamespace(id pushIdentity) string {
+	if id.isBuilder() {
+		return ""
+	}
+	return id.namespace
 }
 
 // ttlCache is a bounded map whose entries expire.
