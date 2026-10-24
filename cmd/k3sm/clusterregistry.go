@@ -244,6 +244,10 @@ func slicePort(ports []discoveryv1.EndpointPort) int {
 // errBadClusterCA reports a kubeconfig CA that holds no certificate.
 var errBadClusterCA = errors.New("the kubeconfig's cluster CA holds no PEM certificate")
 
+// gateDial replaces how a request to a push gate is dialed; tests serve the
+// gate in process through it. nil is the segment-clamped TCP dial.
+var gateDial func(ctx context.Context, network, addr string) (net.Conn, error)
+
 // options are the go-containerregistry options a request to c carries: HTTPS
 // verified against the cluster CA under the name registry-k3sm, and the
 // builder token as the password of a Basic login.
@@ -257,6 +261,9 @@ func (c gateEndpoint) options(ctx context.Context) ([]remote.Option, error) {
 	// (tcpseg): on a worker the gate is the server's cluster address. The
 	// timeouts are http.DefaultTransport's own dialer's.
 	t.DialContext = (&tcpseg.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	if gateDial != nil {
+		t.DialContext = gateDial
+	}
 	t.TLSClientConfig = &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		RootCAs:    pool,

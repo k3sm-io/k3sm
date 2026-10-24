@@ -27,12 +27,13 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
 	"net/http"
-	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -51,11 +52,37 @@ import (
 
 // gateRegistry is an in-process registry standing in for a push gate: HTTPS
 // under a certificate a throwaway cluster CA issued for registry-k3sm and
-// 127.0.0.1, as both gates' certificates are.
+// 127.0.0.1, as both gates' certificates are. It is served on an in-memory
+// listener (no socket): gateDial routes a dial of 127.0.0.1:port to it and
+// refuses every other address, the way a closed port does.
 type gateRegistry struct {
 	port  int
 	probe *authProbe
 	caPEM []byte
+	ln    *memListener
+}
+
+// gateRegistryPort is the port the in-process gate answers on.
+const gateRegistryPort = 16451
+
+// dial connects to the gate when addr is its address and refuses otherwise.
+func (g gateRegistry) dial(ctx context.Context, _, addr string) (net.Conn, error) {
+	if addr != g.ln.ap.String() {
+		return nil, fmt.Errorf("dial tcp %s: connect: connection refused", addr)
+	}
+	client, server := net.Pipe()
+	select {
+	case g.ln.conns <- server:
+		return client, nil
+	case <-g.ln.closed:
+		client.Close()
+		server.Close()
+		return nil, net.ErrClosed
+	case <-ctx.Done():
+		client.Close()
+		server.Close()
+		return nil, ctx.Err()
+	}
 }
 
 func startGateRegistry(t *testing.T) gateRegistry {
@@ -89,13 +116,25 @@ func startGateRegistry(t *testing.T) gateRegistry {
 		t.Fatal(err)
 	}
 	probe := &authProbe{inner: registry.New(registry.Logger(log.New(io.Discard, "", 0)))}
-	srv := httptest.NewUnstartedServer(probe)
-	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leafDER}, PrivateKey: key}}}
-	srv.StartTLS()
-	t.Cleanup(srv.Close)
-	_, port, _ := net.SplitHostPort(srv.Listener.Addr().String())
-	n, _ := strconv.Atoi(port)
-	return gateRegistry{port: n, probe: probe, caPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})}
+	ln := &memListener{
+		ap:    netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), gateRegistryPort),
+		conns: make(chan net.Conn), closed: make(chan struct{}),
+	}
+	srv := &http.Server{
+		Handler:   probe,
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leafDER}, PrivateKey: key}}},
+		ErrorLog:  log.New(io.Discard, "", 0),
+	}
+	go func() { _ = srv.ServeTLS(ln, "", "") }()
+	g := gateRegistry{port: gateRegistryPort, probe: probe, caPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), ln: ln}
+	prev := gateDial
+	gateDial = g.dial
+	t.Cleanup(func() {
+		gateDial = prev
+		_ = srv.Close()
+		_ = ln.Close()
+	})
+	return g
 }
 
 // clusterAPIFor points clusterRegistryClient at a fake apiserver that mints
@@ -183,6 +222,7 @@ func TestPushUsesBuilderTokenFromKubeconfig(t *testing.T) {
 			pool.AppendCertsFromPEM(g.caPEM)
 			tr := http.DefaultTransport.(*http.Transport).Clone()
 			tr.TLSClientConfig = &tls.Config{RootCAs: pool, ServerName: "registry-k3sm"}
+			tr.DialContext = g.dial
 			back, _ := name.NewTag("127.0.0.1:" + strconv.Itoa(g.port) + "/team/app:v1")
 			got, err := remote.Image(back, remote.WithTransport(tr))
 			if err != nil {
