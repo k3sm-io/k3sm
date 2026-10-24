@@ -92,3 +92,97 @@ func TestImageMigrationRowIsTextOnly(t *testing.T) {
 		t.Error("the migration row is in Rows, where the verdict would read it")
 	}
 }
+
+// TestImageMigrationRowReadsThePublishedSummary: an ordinary account, which
+// cannot read the root-only journal, gets the row from the summary the
+// migration publishes in the status directory: its state, counts and reason.
+// With no summary, a status directory that exists means no run of this
+// release has written a journal (it publishes beside every write), so the
+// row says not started rather than needs sudo.
+func TestImageMigrationRowReadsThePublishedSummary(t *testing.T) {
+	const (
+		workDir   = "/var/lib/k3sm/server"
+		statusDir = "/var/lib/k3sm/status"
+		summary   = statusDir + "/image-migration.json"
+		journal   = workDir + "/image-migration/journal.json"
+	)
+	cases := []struct {
+		name     string
+		fsys     fakeFS
+		state    RowState
+		severity Severity
+		detail   []string
+	}{
+		{
+			name: "done, from the summary, with the journal root-only",
+			fsys: fakeFS{
+				present:    map[string]bool{statusDir: true},
+				contents:   map[string][]byte{summary: []byte(`{"schema":1,"state":"complete","inRegistry":3,"cacheEntries":1,"held":0}`)},
+				unreadable: map[string]bool{journal: true},
+			},
+			state: StateOK, severity: SeverityOK,
+			detail: []string{"done: 3 images in the cluster registry", "1 pull-cache image left"},
+		},
+		{
+			name: "pending with the published reason",
+			fsys: fakeFS{
+				present:    map[string]bool{statusDir: true},
+				contents:   map[string][]byte{summary: []byte(`{"schema":1,"state":"pending","inRegistry":1,"cacheEntries":0,"held":0,"lastError":"an image could not be copied into the cluster registry: the registry could not be reached"}`)},
+				unreadable: map[string]bool{journal: true},
+			},
+			state: StateFailed, severity: SeverityWarn,
+			detail: []string{"pending: an image could not be copied", "so far 1 image", "nothing was removed"},
+		},
+		{
+			name: "no summary in an existing status directory is not started",
+			fsys: fakeFS{
+				present:    map[string]bool{statusDir: true},
+				unreadable: map[string]bool{journal: true},
+			},
+			state: StateWaiting, severity: SeveritySkip,
+			detail: []string{"not started"},
+		},
+		{
+			name: "no status directory and a root-only journal needs sudo",
+			fsys: fakeFS{
+				unreadable: map[string]bool{journal: true},
+			},
+			state: StateNeedsAdmin, severity: SeveritySkip,
+			detail: []string{"needs sudo"},
+		},
+		{
+			name: "root with no summary reads the journal",
+			fsys: fakeFS{
+				contents: map[string][]byte{journal: []byte(`{"schema":1,"complete":true,"images":[{"outcome":"migrated"}]}`)},
+			},
+			state: StateOK, severity: SeverityOK,
+			detail: []string{"done: 1 image in the cluster registry"},
+		},
+		{
+			name: "a summary that does not parse",
+			fsys: fakeFS{
+				present:  map[string]bool{statusDir: true},
+				contents: map[string][]byte{summary: []byte(`{"schema":7}`)},
+			},
+			state: StateUnknown, severity: SeverityUnknown,
+			detail: []string{"does not parse"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Collector{Paths: Paths{WorkDir: workDir}, FS: tc.fsys}
+			row, ok := c.imageMigrationRow()
+			if !ok {
+				t.Fatal("no row")
+			}
+			if row.Name != ImageMigrationRow || row.State != tc.state || row.Severity != tc.severity {
+				t.Fatalf("row = %s %s %s (%s), want %s %s", row.Name, row.State, row.Severity, row.Detail, tc.state, tc.severity)
+			}
+			for _, want := range tc.detail {
+				if !strings.Contains(row.Detail, want) {
+					t.Errorf("detail %q lacks %q", row.Detail, want)
+				}
+			}
+		})
+	}
+}
