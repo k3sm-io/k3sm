@@ -234,7 +234,7 @@ func TestBuildWithoutKubeconfigNamesRemedy(t *testing.T) {
 		tag:        "myapp:v1",
 		format:     "docker",
 		contextDir: ctxDir,
-	}, io.Discard, engineBuildWith(noStore), recordInRegistry(pusher.push, func(context.Context, name.Tag) error { return nil }), pusher.push)
+	}, io.Discard, engineBuildWith(noStore), recordInRegistry(pusher.push, func(context.Context, name.Tag) error { return nil }, io.Discard), pusher.push)
 	if !errors.Is(err, errNoUserKubeconfig) {
 		t.Fatalf("build = %v, want errNoUserKubeconfig", err)
 	}

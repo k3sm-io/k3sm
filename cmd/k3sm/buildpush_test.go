@@ -422,7 +422,7 @@ func TestBuildPushToRegistry(t *testing.T) {
 			output:     layout,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, &out, engineBuildWith(noStore), recordInRegistry(pushBuilt, warm), pushBuilt); err != nil {
+		}, &out, engineBuildWith(noStore), recordInRegistry(pushBuilt, warm, io.Discard), pushBuilt); err != nil {
 			t.Fatalf("build --push: %v", err)
 		}
 
@@ -482,4 +482,67 @@ func containsHeader(seen []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestBuildPushWarnsWhenOnlyCacheWarmFails pins `k3sm build --push` for an
+// ordinary account, which cannot reach the runtime's root-only socket: the
+// upload lands, the warm of this node's cache fails, and the build succeeds
+// with one warning saying the image is in the registry and the first Pod pulls
+// it. An upload that fails still fails the build.
+func TestBuildPushWarnsWhenOnlyCacheWarmFails(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("HOME", empty)
+	t.Setenv("DOCKER_CONFIG", empty)
+	t.Setenv(registryTokenEnv, "")
+	errSocket := errors.New("dial unix runtimed.sock: connect: permission denied")
+	coldWarm := func(context.Context, name.Tag) error { return errSocket }
+	opts := func(ctxDir string) buildOptions {
+		return buildOptions{dockerfile: filepath.Join(ctxDir, "Dockerfile"), tag: "myapp:v1", push: true, contextDir: ctxDir}
+	}
+
+	t.Run("the push lands and the build succeeds with one warning", func(t *testing.T) {
+		g := startGateRegistry(t)
+		clusterAPIFor(t, g)
+		asServer(t, g.port)
+		pushed := 0
+		push := func(ctx context.Context, ref name.Reference, b built, d pushDest) error {
+			err := pushBuilt(ctx, ref, b, d)
+			if err == nil {
+				pushed++
+			}
+			return err
+		}
+		var out, warn bytes.Buffer
+		if err := buildWith(t.Context(), opts(pushCtx(t)), &out, engineBuildWith(noStore), recordInRegistry(push, coldWarm, &warn), push); err != nil {
+			t.Fatalf("build --push with a cold cache: %v", err)
+		}
+		if pushed != 1 {
+			t.Errorf("successful uploads = %d, want 1", pushed)
+		}
+		w := warn.String()
+		if strings.Count(w, "\n") != 1 || !strings.Contains(w, "warning") ||
+			!strings.Contains(w, "registry-k3sm:6450/myapp:v1 is in the cluster registry") ||
+			!strings.Contains(w, "first Pod") || !strings.Contains(w, "permission denied") {
+			t.Errorf("warning = %q, want one line naming the image in the registry, the first Pod's pull and the cause", w)
+		}
+		if !strings.Contains(out.String(), "push:   registry-k3sm:6450/myapp:v1") {
+			t.Errorf("the summary does not name the pushed image:\n%s", out.String())
+		}
+	})
+
+	t.Run("a failed upload still fails the build", func(t *testing.T) {
+		g := startGateRegistry(t)
+		clusterAPIFor(t, g)
+		asServer(t, g.port)
+		errUpload := errors.New("upload refused")
+		push := func(context.Context, name.Reference, built, pushDest) error { return errUpload }
+		var warn bytes.Buffer
+		err := buildWith(t.Context(), opts(pushCtx(t)), io.Discard, engineBuildWith(noStore), recordInRegistry(push, coldWarm, &warn), push)
+		if !errors.Is(err, errUpload) {
+			t.Fatalf("err = %v, want the upload's error", err)
+		}
+		if warn.Len() != 0 {
+			t.Errorf("a failed upload warned %q", warn.String())
+		}
+	})
 }

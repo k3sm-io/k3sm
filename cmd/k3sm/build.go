@@ -254,7 +254,7 @@ type engineBuilder func(ctx context.Context, o buildOptions, out io.Writer) erro
 // ledger observes the build and never steers it, so a ledger that cannot be
 // written costs a warning, not the build.
 func build(ctx context.Context, o buildOptions, out io.Writer) error {
-	return buildRecorded(ctx, defaultBuildLedger(), o, out, engineBuildWith, recordInRegistry(pushBuilt, defaultCacheWarmer()), pushBuilt)
+	return buildRecorded(ctx, defaultBuildLedger(), o, out, engineBuildWith, recordInRegistry(pushBuilt, defaultCacheWarmer(), os.Stderr), pushBuilt)
 }
 
 // buildRecorded is buildWith entered in the ledger l (nil records nothing).

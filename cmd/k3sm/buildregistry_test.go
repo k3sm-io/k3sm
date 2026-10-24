@@ -154,7 +154,7 @@ func TestBuildRecordsIntoRegistryNotNodeStore(t *testing.T) {
 				fake := &fakeImagesDaemon{pullResp: &runtimev1.PullImageResponse{Image: &runtimev1.Image{}}}
 				sock := serveFakeImages(t, fake)
 				pushes := &registryPushes{}
-				record := recordInRegistry(pushes.push, warmNodeCache(dialRuntimed, sock))
+				record := recordInRegistry(pushes.push, warmNodeCache(dialRuntimed, sock), io.Discard)
 				ledger := buildledger.New(t.TempDir())
 
 				ctxDir := writeCtx(t, "FROM scratch\nCOPY app /app")
@@ -196,7 +196,7 @@ func TestBuildRecordsIntoRegistryNotNodeStore(t *testing.T) {
 		fake := &fakeImagesDaemon{pullResp: &runtimev1.PullImageResponse{Image: &runtimev1.Image{}}}
 		sock := serveFakeImages(t, fake)
 		pushes := &registryPushes{}
-		record := recordInRegistry(pushes.push, warmNodeCache(dialRuntimed, sock))
+		record := recordInRegistry(pushes.push, warmNodeCache(dialRuntimed, sock), io.Discard)
 		img, err := random.Image(64, 1)
 		if err != nil {
 			t.Fatal(err)
