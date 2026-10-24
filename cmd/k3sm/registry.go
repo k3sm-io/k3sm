@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -615,14 +616,36 @@ func (r ingestRegistry) publishFlatService(ctx context.Context) (clusterIP strin
 // another Service holds) must not take the cluster's own registry name away with
 // it, so the failure is reported at Error and the in-cluster Service still
 // stands. The next refresh tries the NodePort again.
+//
+// The fallback is not silent: the caller sees success, because the in-cluster
+// Service is published, but the state record carries the NodePort error
+// (State.NodePortError) until a publish with the NodePort succeeds again.
 func (r ingestRegistry) publishFlat(ctx context.Context, addr netip.Addr) (string, error) {
 	ip, err := registrysvc.PublishFlatService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, r.nodePort, addr)
-	if err == nil || r.nodePort == 0 {
+	if r.nodePort == 0 {
 		return ip, err
+	}
+	if err == nil {
+		r.recordNodePortError("")
+		return ip, nil
 	}
 	r.logger.Error("expose the registry on its NodePort; publishing the cluster Service without it",
 		"err", err, "nodePort", r.nodePort, "name", registrysvc.FlatServiceName)
+	r.recordNodePortError(fmt.Sprintf("publish NodePort %d: %v", r.nodePort, err))
 	return registrysvc.PublishFlatService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, 0, addr)
+}
+
+// recordNodePortError writes the NodePort publish outcome into the state
+// record: reason when the Service fell back to ClusterIP, "" on success. A
+// failed write is logged and survived: the record is a report.
+func (r ingestRegistry) recordNodePortError(reason string) {
+	if r.workDir == "" {
+		return
+	}
+	if err := registrysvc.UpdateNodePortError(r.workDir, reason); err != nil {
+		r.logger.Warn("could not record the ingest registry's NodePort state",
+			"path", registrysvc.StatePath(r.workDir), "err", err)
+	}
 }
 
 // refresh re-publishes the flat Service on the advertisement's cadence and

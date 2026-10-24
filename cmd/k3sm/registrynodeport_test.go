@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -117,6 +118,90 @@ func TestRegistryNodePortFlag(t *testing.T) {
 		}
 		if svc.Spec.Type != corev1.ServiceTypeClusterIP {
 			t.Errorf("type = %q, want the ClusterIP Service", svc.Spec.Type)
+		}
+	})
+
+	t.Run("a taken NodePort is recorded until a later publish takes it", func(t *testing.T) {
+		workDir := t.TempDir()
+		if err := registrysvc.WriteState(workDir, registrysvc.State{State: registrysvc.StateServing, Port: 6450}); err != nil {
+			t.Fatal(err)
+		}
+		readRecord := func(t *testing.T) registrysvc.State {
+			t.Helper()
+			b, err := os.ReadFile(registrysvc.StatePath(workDir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			st, err := registrysvc.ParseState(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return st
+		}
+		taken := true
+		cs := fake.NewSimpleClientset()
+		refuse := func(a k8stesting.Action) (bool, runtime.Object, error) {
+			var svc *corev1.Service
+			switch a := a.(type) {
+			case k8stesting.CreateAction:
+				svc = a.GetObject().(*corev1.Service)
+			case k8stesting.UpdateAction:
+				svc = a.GetObject().(*corev1.Service)
+			}
+			if taken && svc != nil && len(svc.Spec.Ports) > 0 && svc.Spec.Ports[0].NodePort != 0 {
+				return true, nil, errors.New("provided port is already allocated")
+			}
+			return false, nil, nil
+		}
+		cs.PrependReactor("create", "services", refuse)
+		cs.PrependReactor("update", "services", refuse)
+		r := ingestRegistry{
+			port: 6450, nodePort: 30650, nodeName: "mac-a", workDir: workDir,
+			clusterSvcs:   cs.CoreV1().Services(registrysvc.FlatServiceNamespace),
+			clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.FlatServiceNamespace),
+			logger:        logger,
+		}
+		addr := netip.MustParseAddr("100.64.0.1")
+		getType := func(t *testing.T) corev1.ServiceType {
+			t.Helper()
+			svc, err := cs.CoreV1().Services(registrysvc.FlatServiceNamespace).Get(t.Context(), registrysvc.FlatServiceName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get the Service: %v", err)
+			}
+			return svc.Spec.Type
+		}
+
+		if _, err := r.publishFlat(t.Context(), addr); err != nil {
+			t.Fatalf("publishFlat with the port taken: %v", err)
+		}
+		st := readRecord(t)
+		if !strings.Contains(st.NodePortError, "30650") || !strings.Contains(st.NodePortError, "already allocated") {
+			t.Errorf("NodePortError = %q, want one naming the port and the refusal", st.NodePortError)
+		}
+		if st.State != registrysvc.StateServing || st.Port != 6450 {
+			t.Errorf("the update lost the record's other fields: %+v", st)
+		}
+		if typ := getType(t); typ != corev1.ServiceTypeClusterIP {
+			t.Errorf("type = %q with the port taken, want ClusterIP", typ)
+		}
+
+		// The next refresh publishes again: still taken, still recorded.
+		if _, err := r.publishFlat(t.Context(), addr); err != nil {
+			t.Fatalf("second publishFlat: %v", err)
+		}
+		if st := readRecord(t); st.NodePortError == "" {
+			t.Error("a second refused publish cleared NodePortError")
+		}
+
+		taken = false
+		if _, err := r.publishFlat(t.Context(), addr); err != nil {
+			t.Fatalf("publishFlat with the port free: %v", err)
+		}
+		if st := readRecord(t); st.NodePortError != "" {
+			t.Errorf("NodePortError = %q after the NodePort was published, want it cleared", st.NodePortError)
+		}
+		if typ := getType(t); typ != corev1.ServiceTypeNodePort {
+			t.Errorf("type = %q once the port is free, want NodePort", typ)
 		}
 	})
 }
