@@ -24,7 +24,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"sort"
 	"time"
 
 	"google.golang.org/grpc"
@@ -101,11 +100,15 @@ push    upload an image to a registry reference, and print the digest it now has
         ingest-registry credential (only when the target IS this node's loopback
         registry), or the docker config chain — never from the command line, and
         k3sm stores none of it.
-prune   delete image content no pod references. DRY RUN BY DEFAULT — pass
-        --force to actually unlink. The daemon does the deleting: this command
-        is a client of the runtimed Images service, it never walks the store
-        itself. A pod's content is never deleted, and if the daemon cannot
-        enumerate every pod's references it refuses the whole prune.
+prune   delete the cluster registry's untagged manifests and evict what no
+        pod uses from this node's cache. DRY RUN BY DEFAULT — pass --force to
+        delete. The registry half runs on the server that holds the registry:
+        a manifest a tag, a tagged index or a kept referrer still needs stays,
+        and so does one younger than an hour (a push may be in flight); the
+        registry's garbage collection then reclaims the layers. The cache half
+        is the runtimed Images service's own prune: a pod's content is never
+        deleted, and if the daemon cannot enumerate every pod's references it
+        refuses the whole prune. -o json prints both halves as one document.
 ls      list the images in the cluster's one registry (the server's), each
         under its canonical reference ` + "`" + canonicalRegistry + "/<repo>:<tag>`" + `, with
         its digest, platforms and size, how many Pods use it, and the nodes
@@ -213,12 +216,12 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// every other subcommand is a client of runtimed and has no use for a work
 	// dir, so an unresolvable one must not make `k3sm image ls` fail.
 	defaultWorkDir, _ := executor.ResolveWorkDir()
-	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's ingest-registry push credential from (push, load, import, tag, untag, inspect, save)")
+	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's registry push credential and store from (push, load, import, tag, untag, inspect, save, prune)")
 	// DRY RUN IS THE DEFAULT and deleting takes an explicit flag, because the
 	// blast radius is asymmetric: a needless dry run costs a statfs, while an
 	// unintended prune on a node that cannot reach its registry costs every image
 	// it cannot re-pull.
-	fs.BoolVar(&o.force, "force", false, "prune: actually unlink (without this, prune only reports what it would delete); tag: re-point a tag that names another manifest")
+	fs.BoolVar(&o.force, "force", false, "prune: actually delete (without this, prune only reports what it would delete); tag: re-point a tag that names another manifest")
 	fs.StringVar(&o.reference, "reference", "", "reference to record a loaded image under (load, import; defaults to the one the archive names)")
 	// The platform is part of the store's (reference x platform) KEY, never a
 	// filter, so it is spelled the way an OCI platform is spelled everywhere
@@ -231,7 +234,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// One flag, several meanings, chosen by the subcommand — the spelling `docker`
 	// uses for both. It is validated per subcommand at parse time so `inspect -o
 	// out.tar` fails before anything is dialled.
-	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table; ls, df: json")
+	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table; prune: json, for one document with both halves; ls, df: json")
 	fs.StringVar(&o.output, "output", "", "alias for -o")
 	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call (load, import, push, pull and save default to 30m — they stream image content)")
 	if err := fs.Parse(args); err != nil {
@@ -343,13 +346,13 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		if o.output == "" {
 			return o, errors.New("save requires -o <file.tar>: the archive is written to a file you name, never to the terminal")
 		}
-	case "inspect", "ls", "df":
+	case "inspect", "prune", "ls", "df":
 		if o.output != "" && o.output != "json" {
 			return o, fmt.Errorf("-o %q: %s renders a table by default and `json` on request", o.output, o.subcommand)
 		}
 	default:
 		if flagWasSet(fs, "o") || flagWasSet(fs, "output") {
-			return o, fmt.Errorf("%s does not take -o (save writes an archive to it; inspect, ls and df choose a rendering with it)", o.subcommand)
+			return o, fmt.Errorf("%s does not take -o (save writes an archive to it; inspect, prune, ls and df choose a rendering with it)", o.subcommand)
 		}
 	}
 	// The streaming default applies only when the operator did not choose. Visit
@@ -435,6 +438,12 @@ func dialRuntimed(_ context.Context, socket string) (grpc.ClientConnInterface, i
 // correct by locking, because no lock it holds is also held across the daemon's
 // own pull commit, so it would race the very writer it is trying to reason about.
 func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer) error {
+	return imageCommandWith(ctx, o, out, dial, deleteManifest)
+}
+
+// imageCommandWith is imageCommand with the registry's manifest deleter as a
+// seam, which only prune uses.
+func imageCommandWith(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer, del manifestDeleter) error {
 	// push is the one subcommand whose ordinary form is not a daemon client: it
 	// reads a layout the invoking user owns and uploads it to a registry as that
 	// user. Dialing first would fail a perfectly valid push on a node whose
@@ -475,46 +484,9 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 	case "pull":
 		return imagePull(ctx, client, o, out)
 	case "prune":
-		return imagePrune(ctx, client, o, out)
+		return imagePrune(ctx, client, o, out, del, time.Now())
 	}
 	return fmt.Errorf("unknown subcommand %q", o.subcommand)
-}
-
-// imagePrune asks the daemon to prune and renders the typed outcome.
-func imagePrune(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) error {
-	resp, err := client.PruneImages(ctx, &runtimev1.PruneImagesRequest{DryRun: !o.force})
-	if err != nil {
-		return imageRPCError("prune images", o.socket, err)
-	}
-	verb := "would delete"
-	if o.force {
-		verb = "deleted"
-	}
-	if len(resp.GetRemovedDigests()) == 0 {
-		fmt.Fprintln(out, "nothing to reclaim: every blob in the store is referenced.")
-	}
-	for _, d := range resp.GetRemovedDigests() {
-		fmt.Fprintf(out, "%s %s\n", verb, d)
-	}
-	fmt.Fprintf(out, "%s %d blob(s), %s\n", verb, len(resp.GetRemovedDigests()), humanBytes(resp.GetReclaimedBytes()))
-	if !o.force {
-		fmt.Fprintln(out, "(dry run — pass --force to unlink)")
-	}
-	// Kept blobs are summarized by REASON rather than listed one per line: an
-	// operator asking "why is my disk still full" needs the shape of the answer,
-	// and a store with thousands of layers would otherwise bury it.
-	if counts := skipCounts(resp.GetSkipped()); len(counts) > 0 {
-		fmt.Fprintln(out, "kept:")
-		reasons := make([]string, 0, len(counts))
-		for r := range counts {
-			reasons = append(reasons, r)
-		}
-		sort.Strings(reasons)
-		for _, r := range reasons {
-			fmt.Fprintf(out, "  %-24s %d\n", r, counts[r])
-		}
-	}
-	return nil
 }
 
 // skipCounts tallies kept blobs by their typed reason, rendered in the operator's

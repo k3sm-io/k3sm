@@ -216,7 +216,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 		}}
 		sock := serveFakeImages(t, fake)
 
-		out, err := runImageCmd(t, []string{"--socket", sock, "prune"})
+		out, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", t.TempDir(), "prune"})
 		if err != nil {
 			t.Fatalf("image prune: %v", err)
 		}
@@ -240,7 +240,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 		}}
 		sock := serveFakeImages(t, fake)
 
-		out, err := runImageCmd(t, []string{"--socket", sock, "prune", "--force"})
+		out, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", t.TempDir(), "prune", "--force"})
 		if err != nil {
 			t.Fatalf("image prune --force: %v", err)
 		}
@@ -262,7 +262,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 		}}
 		sock := serveFakeImages(t, fake)
 
-		out, err := runImageCmd(t, []string{"--socket", sock, "prune"})
+		out, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", t.TempDir(), "prune"})
 		if err != nil {
 			t.Fatalf("image prune: %v", err)
 		}
@@ -281,7 +281,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 			"image: reachability root set is incomplete: pod \"pod-x\": no images.json")}
 		sock := serveFakeImages(t, fake)
 
-		_, err := runImageCmd(t, []string{"--socket", sock, "prune"})
+		_, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", t.TempDir(), "prune"})
 		if err == nil {
 			t.Fatalf("a refused prune exited 0")
 		}
@@ -296,7 +296,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 			t.Fatalf("MkdirTemp: %v", err)
 		}
 		defer os.RemoveAll(dir)
-		_, err = runImageCmd(t, []string{"--socket", filepath.Join(dir, "absent.sock"), "prune", "--timeout", "2s"})
+		_, err = runImageCmd(t, []string{"--socket", filepath.Join(dir, "absent.sock"), "--work-dir", dir, "prune", "--timeout", "2s"})
 		if err == nil {
 			t.Fatalf("prune succeeded with no daemon listening — the CLI must never fall back to walking the store itself")
 		}
