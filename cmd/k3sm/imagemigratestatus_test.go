@@ -254,3 +254,79 @@ func TestStoppedRunPublishesAReasonWithoutImageNames(t *testing.T) {
 		t.Errorf("summary = %s, want pending with a reason that names no image", raw)
 	}
 }
+
+// TestMigrationJournalKeepsTheServerAccountsOwner: a root run of `k3sm image
+// migrate` on the installed server's work dir hands the journal's directory,
+// lock, journal and summary to the work dir's owner, so the server's daemon,
+// which runs as that account, can still write its own journal. Any other run
+// re-owns nothing. The summary stays 0644 either way.
+func TestMigrationJournalKeepsTheServerAccountsOwner(t *testing.T) {
+	owner := os.Getuid()
+	if owner == 0 {
+		t.Skip("needs a work dir owned by a uid other than root")
+	}
+	cases := []struct {
+		name      string
+		euid      int
+		installed bool
+		wantChown bool
+	}{
+		{name: "root on the installed server's work dir owned by another uid", euid: 0, installed: true, wantChown: true},
+		{name: "a non-root run re-owns nothing", euid: owner + 1, installed: true},
+		{name: "root on a work dir that is not the installed server's", euid: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			workDir := filepath.Join(root, "server")
+			for _, d := range []string{workDir, filepath.Join(root, "status")} {
+				if err := os.MkdirAll(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prevEUID, prevChown, prevInstalled := migrateGeteuid, migrateChown, installedServerWorkDir
+			t.Cleanup(func() { migrateGeteuid, migrateChown, installedServerWorkDir = prevEUID, prevChown, prevInstalled })
+			migrateGeteuid = func() int { return tc.euid }
+			if tc.installed {
+				installedServerWorkDir = workDir
+			}
+			chowned := map[string]int{}
+			migrateChown = func(path string, uid, _ int) error {
+				chowned[path] = uid
+				return nil
+			}
+
+			unlock, err := lockImageMigration(workDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writeMigrationJournal(workDir, migrationJournal{Schema: migrationSchema}); err != nil {
+				t.Fatal(err)
+			}
+			unlock()
+
+			paths := []string{
+				migrationDir(workDir),
+				filepath.Join(migrationDir(workDir), "lock"),
+				migrationJournalPath(workDir),
+				status.ImageMigrationSummaryPath(workDir),
+			}
+			for _, p := range paths {
+				uid, ok := chowned[p]
+				switch {
+				case tc.wantChown && (!ok || uid != owner):
+					t.Errorf("%s: chowned to %d (%v), want the work dir's owner %d", p, uid, ok, owner)
+				case !tc.wantChown && ok:
+					t.Errorf("%s: chowned to %d, want no re-own", p, uid)
+				}
+			}
+			info, err := os.Stat(status.ImageMigrationSummaryPath(workDir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0o644 {
+				t.Errorf("summary mode = %v, want 0644", info.Mode().Perm())
+			}
+		})
+	}
+}

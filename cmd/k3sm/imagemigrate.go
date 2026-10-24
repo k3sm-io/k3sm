@@ -28,6 +28,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -284,7 +285,54 @@ func writeMigrationJournal(workDir string, j migrationJournal) error {
 	if err := atomicfile.Replace(migrationJournalPath(workDir), append(b, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write the image migration journal: %w", err)
 	}
+	if err := adoptMigrationPaths(workDir, migrationDir(workDir), migrationJournalPath(workDir)); err != nil {
+		return err
+	}
 	return publishMigrationSummary(workDir, j)
+}
+
+// migrateChown re-owns a path without following a final symlink; a seam so
+// the hand-off to the work dir's owner is testable without root.
+var migrateChown = os.Lchown
+
+// migrationOwner is the owner the journal's directory and files must carry,
+// and whether this run must re-own what it writes. Only a root run on the
+// installed server's work dir does: the server's daemon runs as the work
+// dir's owner (the control-plane service account) and migrates on its own
+// start, so a journal root left behind would be one the daemon can no longer
+// write. The owner is read from the work dir itself, never named, the way
+// k3s leaves its data dir owned as the install made it. Any other caller
+// writes as itself, which is already the owner the next run of that caller
+// needs.
+func migrationOwner(workDir string) (uid, gid int, adopt bool, err error) {
+	euid := migrateGeteuid()
+	if euid != 0 || filepath.Clean(workDir) != filepath.Clean(installedServerWorkDir) {
+		return 0, 0, false, nil
+	}
+	info, err := os.Stat(workDir)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("read the owner of %s: %w", workDir, err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st == nil || int(st.Uid) == euid {
+		return 0, 0, false, nil
+	}
+	return int(st.Uid), int(st.Gid), true, nil
+}
+
+// adoptMigrationPaths gives each path the work dir's owner when
+// migrationOwner says this run must. Modes are left as written.
+func adoptMigrationPaths(workDir string, paths ...string) error {
+	uid, gid, adopt, err := migrationOwner(workDir)
+	if err != nil || !adopt {
+		return err
+	}
+	for _, p := range paths {
+		if err := migrateChown(p, uid, gid); err != nil {
+			return fmt.Errorf("hand %s to the server's account: %w", p, err)
+		}
+	}
+	return nil
 }
 
 // migrationSummaryOf is the journal's world-readable summary: its state, its
@@ -328,7 +376,7 @@ func publishMigrationSummary(workDir string, j migrationJournal) error {
 	if err := atomicfile.Replace(path, append(b, '\n'), 0o644); err != nil {
 		return fmt.Errorf("publish the image migration summary: %w", err)
 	}
-	return nil
+	return adoptMigrationPaths(workDir, path)
 }
 
 // imageMigrator runs the migration. Every collaborator is a seam.

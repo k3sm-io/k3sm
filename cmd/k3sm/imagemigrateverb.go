@@ -351,11 +351,20 @@ func lockImageMigration(workDir string) (func(), error) {
 		migrationLock.Unlock()
 		return nil, fmt.Errorf("create %s: %w", migrationDir(workDir), err)
 	}
+	if err := adoptMigrationPaths(workDir, migrationDir(workDir)); err != nil {
+		migrationLock.Unlock()
+		return nil, err
+	}
 	path := filepath.Join(migrationDir(workDir), "lock")
 	for attempt := 0; ; attempt++ {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			_ = f.Close()
+			if aerr := adoptMigrationPaths(workDir, path); aerr != nil {
+				_ = os.Remove(path)
+				migrationLock.Unlock()
+				return nil, aerr
+			}
 			return func() { _ = os.Remove(path); migrationLock.Unlock() }, nil
 		}
 		info, serr := os.Stat(path)
