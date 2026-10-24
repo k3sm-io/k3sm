@@ -463,17 +463,27 @@ request is refused, and every write goes through the same checks as a push from 
 Mac with no mesh and no Linux guests no Service is published, so there is no NodePort either; use
 `localhost:6450` there.
 
-The certificate names `registry-k3sm`, the Service's cluster address and the server's mesh address.
-It does not name a node's LAN address. A tool dialling the server's mesh address verifies as it is;
-a tool dialling a LAN address has to be told to verify the name `registry-k3sm`. Take the CA from
-the cluster, then point the tool at it:
+Dial the **server** by its name:
+
+```
+https://<server hostname>:30650
+```
+
+With the NodePort on, the registry's certificate also names the server as another Mac knows it: the
+host's name, its `.local` name (both `<name>.local` and `<name>` for a Mac that calls itself
+`<name>.local`), and the InternalIP addresses on the server's Node object. A tool that trusts the
+cluster CA then verifies the registry with no extra flags. Take the CA from the cluster:
 
 ```sh
 kubectl get configmap kube-root-ca.crt -n default -o jsonpath='{.data.ca\.crt}' > k3sm-ca.crt
-curl --cacert k3sm-ca.crt \
-  --connect-to registry-k3sm:30650:<node-address>:30650 \
-  https://registry-k3sm:30650/v2/_catalog
+curl --cacert k3sm-ca.crt https://<name>.local:30650/v2/_catalog
 ```
+
+The server's InternalIP is its mesh address on a mesh server, so a bare LAN address is not in the
+certificate; use the hostname or `.local` name, which resolve to the LAN address. Dial the server
+rather than another node: the other nodes forward the port too, but their names are not in the
+certificate. When the server's address or name changes, the certificate is re-issued within five
+minutes.
 
 What this changes:
 
