@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -75,7 +76,13 @@ func imageIngest(ctx context.Context, o imageOptions, out io.Writer, push imageP
 	if reference == "" {
 		return fmt.Errorf("%s: the archive records no reference; pass --reference <name:tag>", o.archive)
 	}
-	ref, err := registryReference(reference)
+	// load and import have no --push: an archive naming another registry is
+	// recorded only under a name the operator chooses for the cluster.
+	if probe, perr := name.NewTag(reference, name.WithDefaultRegistry("")); perr == nil && !isClusterRegistryHost(probe.RegistryStr(), o.workDir) {
+		return fmt.Errorf("%s: %q: %w (%s); to keep it in the cluster, pass --reference %s; to send it to %s, push it there from an OCI layout with k3sm image push",
+			o.archive, reference, errForeignTag, probe.RegistryStr(), clusterSpelling(probe), probe.RegistryStr())
+	}
+	ref, err := registryReference(reference, o.workDir)
 	if err != nil {
 		return err
 	}

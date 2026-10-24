@@ -69,21 +69,22 @@ The image is in the cluster registry when the build finishes, under
 needs. The build uploads it to this server's registry with its push credential,
 then pulls it into this node's cache, so `imagePullPolicy: Never` works on this
 node too. A bare tag, a `registry-k3sm:6450` tag and a
-`localhost:<registry-port>` tag all name that registry. A tag that names another
-registry keeps its repository path and is recorded there as well. With no
-registry running ([The cluster registry](registry.md)), the build is an error
-naming both ways forward.
+`localhost:<registry-port>` tag all name that registry. With no registry
+running ([The cluster registry](registry.md)), the build is an error naming both
+ways forward.
 
-`--push` sends the image on to the registry a tag names, in the same command:
+A tag that names another registry is refused unless `--push` sends the image
+there, and then it goes to that registry only, with no copy in the cluster
+registry:
 
 ```sh
 k3sm build -t ghcr.io/org/myapp:v1 --push .   # a registry you name
 ```
 
-A tag that already names the cluster registry is not uploaded twice. The
-recording happens first. When the extra upload then fails, whether from a
-refused credential or an unreachable host, the build exits non-zero and says the
-image is in the cluster registry, so what you retry is the push.
+A tag that already names the cluster registry is not uploaded twice. When the
+push to another registry fails, whether from a refused credential or an
+unreachable host, the build exits non-zero and says the image was not recorded,
+so what you retry is the build or, with `--output`, the push of that artifact.
 
 The two-step form is still there, and is what you want for an image you built
 earlier or received as a layout:

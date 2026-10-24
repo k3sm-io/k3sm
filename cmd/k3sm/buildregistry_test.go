@@ -189,7 +189,7 @@ func TestBuildRecordsIntoRegistryNotNodeStore(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ref, err := registryReference("app:multi")
+		ref, err := registryReference("app:multi", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -212,11 +212,11 @@ func TestBuildRecordsIntoRegistryNotNodeStore(t *testing.T) {
 		}
 		dir := t.TempDir()
 		saveTar := filepath.Join(dir, "save.tar")
-		if err := (oci.TarballSink{Path: saveTar}).Write(t.Context(), name.MustParseReference("example.test/app:v1").(name.Tag), img); err != nil {
+		if err := (oci.TarballSink{Path: saveTar}).Write(t.Context(), name.MustParseReference("app:v1").(name.Tag), img); err != nil {
 			t.Fatalf("write docker-save: %v", err)
 		}
 		layoutDir := filepath.Join(dir, "layout")
-		if err := (oci.LayoutSink{Path: layoutDir}).Write(t.Context(), name.MustParseReference("example.test/team/app:v2").(name.Tag), img); err != nil {
+		if err := (oci.LayoutSink{Path: layoutDir}).Write(t.Context(), name.MustParseReference("registry-k3sm:6450/team/app:v2").(name.Tag), img); err != nil {
 			t.Fatalf("write layout: %v", err)
 		}
 		layoutTar := writeFixture(t, tarDir(t, layoutDir))

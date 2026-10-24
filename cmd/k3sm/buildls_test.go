@@ -161,7 +161,7 @@ func TestBuildRecordsItsOutcome(t *testing.T) {
 	}
 	native := func(t *testing.T) buildOptions {
 		ctxDir := writeCtx(t, "FROM scratch\nCOPY app /app")
-		return buildOptions{dockerfile: filepath.Join(ctxDir, "Dockerfile"), tag: "example.com/app:v1", format: "docker", contextDir: ctxDir}
+		return buildOptions{dockerfile: filepath.Join(ctxDir, "Dockerfile"), tag: "app:v1", format: "docker", contextDir: ctxDir}
 	}
 	only := func(t *testing.T, l *buildledger.Ledger) buildledger.Record {
 		t.Helper()
@@ -180,7 +180,7 @@ func TestBuildRecordsItsOutcome(t *testing.T) {
 			t.Fatalf("build: %v", err)
 		}
 		r := only(t, l)
-		if r.Status != buildledger.StatusSucceeded || r.Engine != buildledger.EngineNative || r.Platform != "darwin/arm64" || r.Tag != "example.com/app:v1" || r.Error != "" || r.FinishedAt == nil {
+		if r.Status != buildledger.StatusSucceeded || r.Engine != buildledger.EngineNative || r.Platform != "darwin/arm64" || r.Tag != "app:v1" || r.Error != "" || r.FinishedAt == nil {
 			t.Errorf("record = %+v", r)
 		}
 		if r.ImageDigest == "" || !strings.Contains(log.String(), r.ImageDigest) {

@@ -812,7 +812,7 @@ func testOutputSinks(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "img.tar")
 		if err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        "example.com/app:v1",
+			tag:        "app:v1",
 			output:     out,
 			format:     "docker",
 			contextDir: ctxDir,
@@ -837,7 +837,7 @@ func testOutputSinks(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "layout")
 		if err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        "example.com/app:v1",
+			tag:        "app:v1",
 			output:     out,
 			format:     "oci",
 			contextDir: ctxDir,
@@ -864,7 +864,7 @@ func testOutputSinks(t *testing.T) {
 		}
 		out := filepath.Join(t.TempDir(), "img.tar")
 		err := buildWith(t.Context(), buildOptions{
-			dockerfile: bad, tag: "example.com/app:v1", output: out, format: "docker", contextDir: ctxDir,
+			dockerfile: bad, tag: "app:v1", output: out, format: "docker", contextDir: ctxDir,
 		}, io.Discard, engineBuildWith(noStore), noStore, noPush)
 		if !errors.Is(err, oci.ErrBadInstruction) {
 			t.Fatalf("build = %v, want ErrBadInstruction", err)

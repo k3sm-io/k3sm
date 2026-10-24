@@ -132,7 +132,7 @@ func TestBuildNoRecordNeverDialsStore(t *testing.T) {
 
 	t.Run("without the flag the store is still recorded", func(t *testing.T) {
 		ctxDir := writeCtx(t, "FROM scratch\nCOPY app /app")
-		o, err := parseBuildArgs([]string{"-t", "example.com/app:v1", ctxDir}, io.Discard)
+		o, err := parseBuildArgs([]string{"-t", "app:v1", ctxDir}, io.Discard)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}

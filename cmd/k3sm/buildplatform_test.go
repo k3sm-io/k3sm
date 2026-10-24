@@ -146,7 +146,7 @@ func TestBuildPlatformRouting(t *testing.T) {
 			}
 			o := buildOptions{
 				dockerfile:  filepath.Join(ctxDir, "Dockerfile"),
-				tag:         "example.com/app:v1",
+				tag:         "app:v1",
 				format:      "docker",
 				platforms:   platforms,
 				platformSet: tc.platformSet,
@@ -203,7 +203,7 @@ func TestBuildPlatformRouting(t *testing.T) {
 		}
 		err = buildWith(t.Context(), buildOptions{
 			dockerfile:  filepath.Join(ctxDir, "Dockerfile"),
-			tag:         "example.com/app:v1",
+			tag:         "app:v1",
 			format:      "docker",
 			platforms:   platforms,
 			platformSet: true,
@@ -269,9 +269,9 @@ func TestSelectStoreImage(t *testing.T) {
 	})
 }
 
-// TestMultiPlatformDelivery pins what a multi-platform build DELIVERS: the
-// index to --output and --push, one recording, and a summary that says which
-// platform this node's cache holds.
+// TestMultiPlatformDelivery pins what a multi-platform build DELIVERS to a tag
+// naming another registry: the index to --output and --push, no recording in
+// the cluster registry, and a summary that lists every platform.
 func TestMultiPlatformDelivery(t *testing.T) {
 	noDocker := t.TempDir()
 	t.Setenv("HOME", noDocker)
@@ -299,13 +299,13 @@ func TestMultiPlatformDelivery(t *testing.T) {
 		t.Fatalf("deliver: %v", err)
 	}
 
-	// The cluster registry records the build once, and the summary names the
-	// platform this node's cache holds.
-	if len(store.calls) != 1 {
-		t.Fatalf("recordings = %v, want exactly one", store.calls)
+	// A tag naming another registry is pushed there only, so the cluster
+	// registry records nothing and no node cache holds a platform.
+	if len(store.calls) != 0 {
+		t.Fatalf("recordings = %v, want none for a foreign --push tag", store.calls)
 	}
-	if !strings.Contains(log.String(), "built:  linux/arm64, linux/amd64 (this node's cache holds linux/arm64)") {
-		t.Errorf("the summary does not report the platforms and this node's pick:\n%s", log.String())
+	if !strings.Contains(log.String(), "built:  linux/arm64, linux/amd64\n") {
+		t.Errorf("the summary does not report the platforms:\n%s", log.String())
 	}
 
 	// --output carries every platform: the layout indexes the index.

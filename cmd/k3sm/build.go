@@ -62,13 +62,15 @@ image store, as registry-k3sm:6450/<repository>:<tag>, ready for a Pod on any
 node to name, and this node's cache is warmed with it, so imagePullPolicy Never
 works here too. What you do next does not depend on which engine built it.
 --output additionally writes a portable artifact you can carry elsewhere
-("docker" tarball, or "oci" for a layout directory). --push additionally
-uploads it to a registry the tag names; a tag that names the cluster registry
-(bare, registry-k3sm:6450, or localhost:<registry-port>) is already there.
+("docker" tarball, or "oci" for a layout directory). A tag that names the
+cluster registry (bare, registry-k3sm:6450, or localhost:<port>) is recorded
+there. A tag that names any other registry is refused unless --push sends it
+to that registry, and then it goes there only: the cluster registry keeps no
+copy under another registry's name.
 
   k3sm build -t myapp:v1 .                       # registry-k3sm:6450/myapp:v1
   k3sm build -t myapp:v1 --output myapp.tar .    # and a file to carry
-  k3sm build -t ghcr.io/org/myapp:v1 --push .    # and into a named registry
+  k3sm build -t ghcr.io/org/myapp:v1 --push .    # to that registry only
 
 --no-record skips the recording: the build writes --output and/or uploads
 --push and never talks to this node's runtime daemon, the way "buildctl
@@ -123,9 +125,9 @@ type buildOptions struct {
 	dockerfile string
 	tag        string
 	output     string
-	// push additionally uploads the built image to a registry once it is in the
-	// store. It is a sink, not a substitute: the store recording happens either
-	// way, so an image that failed to upload is still runnable on this node.
+	// push uploads the built image to the registry a foreign tag names, the
+	// only delivery such a tag gets. On a tag naming the cluster registry the
+	// recording is already that upload, so push adds nothing.
 	push bool
 	// noRecord skips the store recording: the build delivers only to --output
 	// and/or --push and never dials the runtime daemon, so an unprivileged user
@@ -177,7 +179,7 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	fs.StringVar(&o.tag, "tag", "", "image reference to assign, e.g. myapp:v1 (required)")
 	fs.StringVar(&o.tag, "t", "", "short form of --tag")
 	fs.StringVar(&o.output, "output", "", "additionally write the image to this path (the store recording always happens)")
-	fs.BoolVar(&o.push, "push", false, "additionally upload the image to the registry the tag names (a bare tag goes to this node's ingest registry)")
+	fs.BoolVar(&o.push, "push", false, "upload the image to the registry the tag names; required for a tag naming a registry other than the cluster registry, which is then not recorded")
 	fs.BoolVar(&o.noRecord, "no-record", false, "do not record the image in the cluster registry (never dials the runtime daemon, needs no root); requires --output or --push")
 	fs.StringVar(&o.format, "format", "docker", "output format: docker (a `docker load` tarball) or oci (an OCI layout dir)")
 	var platformSpec string
@@ -216,6 +218,13 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	// That is refused before any work starts rather than reported as a success.
 	if o.noRecord && o.output == "" && !o.push {
 		return o, errors.New("--no-record needs --output or --push: without the cluster registry the build has nowhere to deliver the image")
+	}
+	// A tag naming another registry is never recorded in the cluster registry,
+	// so without --push (or --no-record) the build would have nowhere to put
+	// it. That is refused before any work starts.
+	if workDir := workDirFromEnv(); !o.push && !o.noRecord && tagIsForeign(o.tag, workDir) {
+		_, err := registryReference(o.tag, workDir)
+		return o, err
 	}
 	if o.format != "docker" && o.format != "oci" {
 		return o, fmt.Errorf("--format %q: want \"docker\" or \"oci\"", o.format)

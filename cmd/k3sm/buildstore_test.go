@@ -76,7 +76,7 @@ func TestBuildSinkMatrix(t *testing.T) {
 
 			err := buildWith(t.Context(), buildOptions{
 				dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-				tag:        "example.com/app:v1",
+				tag:        "app:v1",
 				output:     out,
 				format:     tc.format,
 				contextDir: ctxDir,
@@ -115,7 +115,7 @@ func TestBuildSinkMatrix(t *testing.T) {
 		store := &recordingStore{err: errors.New("cannot reach runtimed")}
 		err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        "example.com/app:v1",
+			tag:        "app:v1",
 			format:     "docker",
 			contextDir: ctxDir,
 		}, io.Discard, engineBuildWith(noStore), store.record, noPush)
@@ -134,7 +134,7 @@ func TestBuildSinkMatrix(t *testing.T) {
 		store := &recordingStore{}
 		err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        "example.com/app:v1",
+			tag:        "app:v1",
 			output:     filepath.Join(t.TempDir(), "no-such-dir", "img.tar"),
 			format:     "docker",
 			contextDir: ctxDir,

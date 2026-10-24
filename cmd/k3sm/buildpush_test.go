@@ -161,17 +161,18 @@ func TestResolvePushTarget(t *testing.T) {
 	})
 }
 
-// TestBuildPushOrdering pins the sequence and the failure wording.
+// TestBuildPushOrdering pins which upload a build makes and the failure
+// wording.
 //
-// The recording in the cluster registry comes FIRST and happens whether or not
-// --push was given, so a failed upload to another registry leaves the operator
-// with a usable image, and the error has to say so or it reads as a lost build.
+// A build makes exactly one upload: the recording for a tag naming the cluster
+// registry, the push for a tag naming another one. A failed push leaves nothing
+// in the cluster, and the error has to say so.
 func TestBuildPushOrdering(t *testing.T) {
 	ctxDir := pushCtx(t)
 	stageNodeRegistry(t, "127.0.0.1:6450")
 	const foreign = "registry.example.com/me/myapp:v1"
 
-	t.Run("the recording comes before the push", func(t *testing.T) {
+	t.Run("a foreign tag is pushed and not recorded", func(t *testing.T) {
 		var log []string
 		store := &loggingStore{log: &log}
 		pusher := &recordingPush{log: &log}
@@ -187,11 +188,8 @@ func TestBuildPushOrdering(t *testing.T) {
 			t.Fatalf("build: %v", err)
 		}
 
-		if want := []string{"store", "push"}; strings.Join(log, ",") != strings.Join(want, ",") {
-			t.Fatalf("delivery order = %v, want %v", log, want)
-		}
-		if len(store.calls) != 1 || store.calls[0] != "registry-k3sm:6450/me/myapp:v1" {
-			t.Errorf("recordings = %v, want the cluster-registry reference", store.calls)
+		if want := []string{"push"}; strings.Join(log, ",") != strings.Join(want, ",") {
+			t.Fatalf("delivery = %v, want %v", log, want)
 		}
 		if len(pusher.targets) != 1 || pusher.targets[0] != foreign {
 			t.Errorf("push targets = %v, want the registry the tag names", pusher.targets)
@@ -221,6 +219,9 @@ func TestBuildPushOrdering(t *testing.T) {
 		if len(pusher.targets) != 0 {
 			t.Errorf("the cluster registry was uploaded to a second time: %v", pusher.targets)
 		}
+		if len(store.calls) != 1 || store.calls[0] != "registry-k3sm:6450/myapp:v1" {
+			t.Errorf("recordings = %v, want the cluster-registry reference", store.calls)
+		}
 		if !strings.Contains(out.String(), "push:   registry-k3sm:6450/myapp:v1") {
 			t.Errorf("the summary does not report the cluster-registry reference:\n%s", out.String())
 		}
@@ -234,7 +235,7 @@ func TestBuildPushOrdering(t *testing.T) {
 
 		if err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        foreign,
+			tag:        "myapp:v1",
 			format:     "docker",
 			contextDir: ctxDir,
 		}, &out, engineBuildWith(noStore), store.record, pusher.push); err != nil {
@@ -248,14 +249,14 @@ func TestBuildPushOrdering(t *testing.T) {
 		}
 	})
 
-	t.Run("a recording failure means no push at all", func(t *testing.T) {
+	t.Run("a recording failure fails the build", func(t *testing.T) {
 		var log []string
 		store := &loggingStore{log: &log, err: errors.New("cannot reach the cluster registry")}
 		pusher := &recordingPush{log: &log}
 
 		err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        foreign,
+			tag:        "myapp:v1",
 			push:       true,
 			format:     "docker",
 			contextDir: ctxDir,
@@ -268,7 +269,7 @@ func TestBuildPushOrdering(t *testing.T) {
 		}
 	})
 
-	t.Run("a push failure fails the build and says the image is in the cluster registry", func(t *testing.T) {
+	t.Run("a push failure fails the build and says nothing was recorded", func(t *testing.T) {
 		var log []string
 		store := &loggingStore{log: &log}
 		pusher := &recordingPush{log: &log, err: errors.New("registry rejected the credential")}
@@ -284,10 +285,10 @@ func TestBuildPushOrdering(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected the push failure to fail the build")
 		}
-		if len(store.calls) != 1 {
-			t.Fatalf("recordings = %v, want the recording to have happened first", store.calls)
+		if len(store.calls) != 0 {
+			t.Fatalf("recordings = %v, want none for a foreign tag", store.calls)
 		}
-		for _, want := range []string{foreign, "is in the cluster registry", "push failed", "registry rejected the credential"} {
+		for _, want := range []string{foreign, "not recorded", "another registry", "push failed", "registry rejected the credential"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("the error does not contain %q: %v", want, err)
 			}

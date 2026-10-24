@@ -60,7 +60,7 @@ metadata. One with `RUN` builds on the cluster's build engine, which starts on f
 
 ```sh
 k3sm build --tag myapp:v1 .                                  # into the cluster registry
-k3sm build --tag ghcr.io/org/myapp:v1 --push .               # and on to a registry you name
+k3sm build --tag ghcr.io/org/myapp:v1 --push .               # or to a registry you name, only
 k3sm build --tag myapp:v1 --output myapp.tar .               # and into a file to carry
 docker load -i myapp.tar          # the tarball is a standard docker-save archive
 k3sm build --tag myapp:v1 --output ./layout --format oci .   # or an OCI layout directory
@@ -117,9 +117,16 @@ either path; see [What runs](what-runs.md).
 > `registry-k3sm:6450/<repository>:<tag>`, so `--tag myapp:v1` becomes
 > `registry-k3sm:6450/myapp:v1`, and a Pod on any node can name it with no further step. The build
 > then pulls it into this node's cache through the runtime's ordinary pull, so a Pod here with
-> `imagePullPolicy: Never` finds it too. A tag that names another registry is recorded under the same
-> registry name, keeping its repository path. `--output` also writes a portable artifact to a path
-> you name, and it is equally usable with other tools.
+> `imagePullPolicy: Never` finds it too. `--output` also writes a portable artifact to a path you
+> name, and it is equally usable with other tools.
+
+A tag names the cluster registry when it has no registry part (`myapp:v1`), when it spells the flat
+name (`registry-k3sm:6450/myapp:v1`), or when it names this node's registry on loopback
+(`localhost:<port>/myapp:v1`, on the port the server's registry listens on). A tag that names any
+other registry is refused, and the error names both ways forward: tag it
+`registry-k3sm:6450/<repository>:<tag>` to keep it in the cluster, or add `--push` to send it to
+the registry it names. With `--push` the image goes to that registry only. The cluster registry
+keeps no copy of it, so a Pod that names `ghcr.io/org/myapp:v1` pulls it from ghcr.io.
 
 The recording uploads to this server's registry with its push credential, so it needs the
 registry running (see [The cluster registry](registry.md)). A node without one fails the build and
@@ -191,7 +198,7 @@ Each of these is a documented difference:
 | `.dockerignore` | **Not implemented.** `COPY .` therefore includes `.git`, `.env` and anything else in the directory, so scope your `COPY` lines, or build from a clean tree. |
 | `--platform` | Accepts `darwin/arm64` (the default, packaged natively) and Linux targets, which build on the engine; name several at once for a multi-platform index. Neither builder cross-compiles: a `darwin/arm64` image is refused any other value on the native path, and a `RUN` step for an architecture the engine's `arm64` guest cannot execute is refused by name. |
 | Variables (`$VAR`), `ARG` | **Rejected.** No expansion is performed, and a literal `$` in a path would be an invisible divergence. |
-| Build output | Recorded in the cluster registry as `registry-k3sm:6450/<repository>:<tag>`, then pulled into this node's cache. `--output` additionally writes a portable artifact (a docker-save tar, or an OCI layout with `--format oci`) to a path you name. `--push` additionally uploads it to a registry the tag names. The recording happens in every case, including with `--push`, unless you pass `--no-record`, which skips it, needs no root, and requires `--output` or `--push`. |
+| Build output | Recorded in the cluster registry as `registry-k3sm:6450/<repository>:<tag>`, then pulled into this node's cache. `--output` additionally writes a portable artifact (a docker-save tar, or an OCI layout with `--format oci`) to a path you name. A tag that names another registry is refused unless `--push` uploads it there, and then it is not recorded in the cluster registry. `--no-record` skips the recording, needs no root, and requires `--output` or `--push`. |
 | Timestamps | Fixed, not wall-clock, so rebuilding the same context yields the same image digest. |
 | File modes | Normalized to `0755` (if any execute bit is set) or `0644`. A `0600` source becomes world-readable in the image, and setuid/setgid/sticky bits are dropped. Preserving source modes would break reproducibility, since git records only the execute bit. |
 | Ownership & xattrs | Every entry is `uid 0 / gid 0` with no user or group name, and no extended attributes, so the builder's account identity and macOS xattrs (including `com.apple.quarantine`) never reach the image. |
@@ -224,6 +231,11 @@ overwrites whatever that tag named before. The CLI reads your archive as you and
 server's push credential, through the same path as `k3sm image push`; `--work-dir` names the
 control plane's state directory when it is not the one your user resolves. A tarred layout whose one
 entry is a multi-platform index is recorded as that whole index.
+
+An archive that names another registry, such as a `docker save` of `ghcr.io/org/app:v1`, is
+refused. Pass `--reference registry-k3sm:6450/org/app:v1` (or any cluster name) to record it in the
+cluster. The two verbs have no `--push`: to send an image to another registry, push it there from an
+OCI layout with `k3sm image push`.
 
 The verb then pulls the image into this node's cache through the runtime's ordinary pull, which
 re-hashes every blob against its digest before it records anything. A Pod on any node can name the
@@ -306,16 +318,16 @@ longer want it, then prune.
 can pull it the ordinary way instead of being loaded one at a time.
 
 ```sh
-k3sm build --tag registry.example.com/me/myapp:v1 --output ./layout --format oci .
+k3sm build --tag registry.example.com/me/myapp:v1 --no-record --output ./layout --format oci .
 k3sm image push ./layout registry.example.com/me/myapp:v1
 ```
 
 A build you are pushing straight away needs neither step. `k3sm build --push` uploads through this
-same path, after recording the image in the store:
+same path. A tag that names the cluster registry is already there once the build records it, so
+`--push` adds nothing for it:
 
 ```sh
-k3sm build --tag registry.example.com/me/myapp:v1 --push .
-k3sm build --tag myapp:v1 --push .                     # a bare tag: this node's own registry
+k3sm build --tag registry.example.com/me/myapp:v1 --push .   # to that registry only
 ```
 
 The first argument is normally that layout directory. A first argument that is **no path on

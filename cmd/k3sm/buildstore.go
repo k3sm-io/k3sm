@@ -74,9 +74,9 @@ func (b built) digest() (ggcrv1.Hash, error) {
 }
 
 // deliver puts a built image where the operator can use it: recorded in the
-// cluster registry under the normalised registry-k3sm:6450 name, and, when they
-// were given, ADDITIONALLY written as a portable artifact (--output) and
-// uploaded to a registry of the operator's choosing (--push).
+// cluster registry under the normalised registry-k3sm:6450 name or, for a tag
+// naming another registry, pushed there (--push), and, when it was given,
+// ADDITIONALLY written as a portable artifact (--output).
 //
 // The registry is the DEFAULT terminal state for both build paths, so `k3sm
 // build -t app:dev .` is followed by naming registry-k3sm:6450/app:dev in a
@@ -85,19 +85,35 @@ func (b built) digest() (ggcrv1.Hash, error) {
 // the image too. The node's own store is a pull cache: no build writes it
 // directly.
 //
-// THE ORDER IS ARTIFACT, RECORD, PUSH. The artifact is local and cheap, so a
-// bad --output path fails before anything is uploaded, and if the recording
-// then fails the operator holds a file `k3sm image load` can finish with. The
-// extra push is LAST because a target outside this cluster is the step most
-// likely to fail for a reason outside this Mac, and that must not cost the
-// operator the recording.
+// THE ORDER IS ARTIFACT, THEN THE UPLOAD. The artifact is local and cheap, so
+// a bad --output path fails before anything is uploaded, and if the upload then
+// fails the operator holds a file `k3sm image load` can finish with. The upload
+// is the recording for a tag naming the cluster registry and the push for a tag
+// naming another one; a build never does both.
 //
 // --no-record drops the recording and nothing else: artifact, then push, and
 // the summary says the image was not recorded and how to load it.
+//
+// A tag naming a registry other than the cluster registry is never recorded:
+// with --push the image goes to that registry only, and without it the build
+// is refused (parseBuildArgs refuses it before any work; this is the same rule
+// for a caller that did not parse).
 func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.Writer, record storeRecorder, push imagePusher, engineEndpoint, enginePlatform string) error {
-	recorded, err := registryReference(o.tag)
-	if err != nil {
+	workDir := workDirFromEnv()
+	foreign := tagIsForeign(o.tag, workDir)
+	if foreign && !o.push && !o.noRecord {
+		// registryReference renders the refusal, naming both ways forward.
+		_, err := registryReference(o.tag, workDir)
 		return err
+	}
+	recordIt := !o.noRecord && !foreign
+	var recorded name.Tag
+	if recordIt {
+		r, err := registryReference(o.tag, workDir)
+		if err != nil {
+			return err
+		}
+		recorded = r
 	}
 	if o.output != "" {
 		// A multi-platform build writes the whole INDEX, which only the layout
@@ -119,22 +135,23 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.
 		}
 	}
 	// --no-record ends the build at the artifact and the upload: neither the
-	// registry nor the runtime daemon is contacted for the recording.
-	if !o.noRecord {
+	// registry nor the runtime daemon is contacted for the recording. Nor are
+	// they for a foreign tag, which --push alone delivers.
+	if recordIt {
 		if err := record(ctx, recorded, b); err != nil {
 			return err
 		}
 	}
 
-	// The extra upload comes after the recording, so a target this node cannot
-	// reach costs the operator an error message rather than the build. A tag that
-	// already names the cluster registry was uploaded by the recording itself, so
-	// it is not sent twice. The reference it landed under is returned rather than
-	// re-derived for the summary: a printed target that was computed twice can
-	// disagree with the one that was pushed to.
+	// A tag that names the cluster registry was uploaded by the recording
+	// itself, so --push sends nothing a second time. Anything else, a foreign tag
+	// or a --no-record build, is uploaded here, LAST, after the artifact. The
+	// reference it landed under is returned rather than re-derived for the
+	// summary: a printed target that was computed twice can disagree with the one
+	// that was pushed to.
 	var target name.Tag
 	if o.push {
-		if !o.noRecord && namesClusterRegistry(o.tag, workDirFromEnv()) {
+		if recordIt {
 			target = recorded
 		} else {
 			pushed, err := pushDelivered(ctx, o, ref, b, push)
@@ -154,15 +171,18 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.
 	// at admission — printing it on every successful build sent the operator
 	// straight into a failure.
 	fmt.Fprintf(out, "built %s\n  digest: %s\n", ref, digest)
-	if o.noRecord {
+	switch {
+	case o.noRecord:
 		fmt.Fprintf(out, "  store:  not recorded (--no-record); to record it in the cluster registry: %s\n", noRecordLoadHint(o))
-	} else {
+	case foreign:
+		fmt.Fprintf(out, "  store:  not recorded in the cluster registry (the tag names another registry; --push sent it there)\n")
+	default:
 		fmt.Fprintf(out, "  store:  recorded in the cluster registry as %s (name it in a Pod manifest)\n", recorded)
 	}
 	// The platform line appears only for a build that produced more than one,
 	// where "which of these does this node run" is a question the operator now
 	// has. The registry holds every platform; this node's cache holds its own.
-	if len(b.platforms) > 1 && o.noRecord {
+	if len(b.platforms) > 1 && !recordIt {
 		fmt.Fprintf(out, "  built:  %s\n", strings.Join(b.platforms, ", "))
 	} else if len(b.platforms) > 1 {
 		fmt.Fprintf(out, "  built:  %s (this node's cache holds %s)\n", strings.Join(b.platforms, ", "), b.storePlatform)
