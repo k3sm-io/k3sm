@@ -177,9 +177,13 @@ from a worker, copy the admin kubeconfig from the server and write one on the wo
 k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write
 ```
 
-`k3sm registry token` and `k3sm registry login` then mint a push token through it. A user who should
-push without administering the cluster needs only the `k3sm:registry-builder-token` role, bound in
-the `k3sm-registry` namespace. See [the cluster registry](registry.md#pushing-with-other-tools).
+`k3sm build`, `k3sm image load`, `import` and `push` then upload to the server's registry at its
+cluster address on port 6450, over HTTPS checked against the cluster CA, with a push token minted
+through that kubeconfig. `k3sm registry login` writes the same address and the cluster CA into your
+docker config for docker, buildx, crane and oras. A user who should push without administering the
+cluster needs the `k3sm:registry-builder-token` Role, bound with a RoleBinding in `k3sm-registry`,
+and a read of EndpointSlices there to find the address. See
+[the cluster registry](registry.md#pushing-with-other-tools).
 
 ### Restarting a node
 

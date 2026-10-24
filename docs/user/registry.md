@@ -68,27 +68,32 @@ from Docker Hub, not from this cluster.
 
 ## Pushing From the Mac
 
-`k3sm build --push` builds and uploads in one command. You need no credential on the command line,
-because the build finds the server's own push credential when, and only when, the target is this
-server's registry:
+`k3sm build`, `k3sm image load`, `k3sm image import` and `k3sm image push` write to the cluster
+registry with a push token for the `builder` ServiceAccount, minted through your kubeconfig for each
+command (see [Who can mint a token](#who-can-mint-a-token)). You need no credential on the command
+line:
 
 ```sh
-k3sm build --tag localhost:6450/myapp:v1 --push .
-k3sm build --tag myapp:v1 --push .          # a bare tag goes here too
+k3sm build --tag myapp:v1 .                               # recorded as registry-k3sm:6450/myapp:v1
+k3sm build --tag myapp:v1 --format oci --output ./myapp-layout .
+k3sm image push ./myapp-layout registry-k3sm:6450/myapp:v1
 ```
 
-A bare tag is the short form of the same thing. It resolves to `localhost:<registry-port>`, which is
-also where a bare `image: myapp:v1` in a Pod spec is served from.
+A bare tag, `registry-k3sm:6450/...` and `localhost:6451/...` all name the cluster registry. Where
+the upload goes depends on the Mac:
 
-For an image that already exists, such as a layout you built earlier or one someone handed you,
-push it on its own:
+- On the server it goes to the push gate on loopback, `localhost:6451`. The gate checks the token
+  and hands the write to the registry. It always runs, with or without workers or Linux guests.
+- On a worker it goes to the server's cluster address on port 6450, the endpoint of the
+  `registry-k3sm` Service.
 
-```sh
-k3sm build --tag localhost:6450/myapp:v1 --format oci --output ./myapp-layout .
-k3sm image push ./myapp-layout localhost:6450/myapp:v1
-```
+Both serve HTTPS under a certificate from the cluster CA that names `registry-k3sm`, and k3sm
+verifies it against the CA in your kubeconfig. The gate's port is the registry port plus one: 6451
+with the default `--registry-port 6450`.
 
-Then reference it like any other image:
+A Mac with no kubeconfig stops with an error that names the fix (see [On a worker](#on-a-worker)).
+
+Reference the image like any other:
 
 ```yaml
 apiVersion: v1
@@ -98,36 +103,18 @@ metadata:
 spec:
   containers:
     - name: app
-      image: localhost:6450/myapp:v1
+      image: registry-k3sm:6450/myapp:v1
       imagePullPolicy: Always
 ```
 
-The Mac does not resolve `registry-k3sm`, and does not need to: pushes from the Mac go to
-`localhost:6450`, which is the same registry.
+The Mac does not resolve `registry-k3sm`, and does not need to: every node maps that name to the
+registry itself.
 
-The packaged install runs the control plane as its own service account. If the control plane runs as
-a different user than the one you are pushing from, point push at that control plane's state
-directory:
-
-```sh
-k3sm image push --work-dir /var/lib/k3sm/server ./myapp-layout localhost:6450/myapp:v1
-```
-
-`k3sm build --push` reads the same file, from the work dir it resolves for the current user or from
-`K3SM_WORK_DIR` when that is set.
-
-The credential itself lives at:
-
-```
-<work-dir>/registry/push-credential.json     mode 0600
-```
-
-It is regenerated on every server start, so a credential that leaked out of a previous run is
-already worthless, and it is never copied anywhere else. `k3sm` presents it only to a loopback
-target on exactly the port recorded inside it, so it is never offered to a public registry or to a
-second cluster's registry on the same Mac.
-
-You can also push from the Mac with any OCI tool, using that file's `username` and `password`.
+`k3sm image tag`, `untag`, `inspect` and `save` still talk to the registry's own loopback listener,
+so they run only on the server. `tag` and `untag` write with the server's per-boot credential, and
+need an account that can read `<work-dir>/registry/push-credential.json` (mode `0600`); `untag` will
+keep doing so, because the push gate never forwards a delete. That credential is regenerated on
+every server start.
 
 ## Pulling
 
@@ -135,8 +122,8 @@ Pulls are anonymous. The node's runtime pulls with no credential at all, which i
 reference an image here with nothing configured.
 
 Pushes are authenticated. Together those two are the whole access model. Anyone who can reach the
-registry can read the images this cluster runs, and only the holder of the current push credential,
-or a Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),
+registry can read the images this cluster runs, and only a user holding a builder token (see
+[Pushing With Other Tools](#pushing-with-other-tools)), or a Pod the cluster's RBAC allows to push (see [Pushing From Inside a Pod](#pushing-from-inside-a-pod)),
 can put a new one there.
 
 ## One Store for the Cluster
@@ -369,17 +356,26 @@ docker config:
 k3sm registry login
 ```
 
-That sets the `registry-k3sm:6450` entry in `$DOCKER_CONFIG/config.json`, or
-`~/.docker/config.json`, with mode `0600`, and keeps everything else in the file. Run it again when
-the token expires. If your docker config keeps credentials in a credential store (Docker Desktop
-does), `login` stops and tells you to feed the store instead:
+That writes the entry for the address a tool on this Mac reaches the registry at: `localhost:6451`
+on the server, or the server's cluster address with port 6450 on a worker. It goes in
+`$DOCKER_CONFIG/config.json`, or `~/.docker/config.json`, with mode `0600`, and everything else in
+the file is kept. `login` also writes the cluster CA to `certs.d/<host:port>/ca.crt` beside that
+file (mode `0644`), where docker and buildx look for a registry's CA, and prints each path it wrote.
+Run it again when the token expires.
 
 ```sh
-k3sm registry token | docker login registry-k3sm:6450 -u builder --password-stdin
+crane copy alpine:3.20 localhost:6451/alpine:3.20     # on the server
 ```
 
-The registry checks the token at its HTTPS front, `registry-k3sm:6450`, which listens on the
-server's cluster network address. Trust the cluster CA. It is the CA your kubeconfig embeds:
+If your docker config keeps credentials in a credential store (Docker Desktop does), `login` stops
+and tells you to feed the store instead:
+
+```sh
+k3sm registry token | docker login localhost:6451 -u builder --password-stdin
+```
+
+A tool that does not read `certs.d` needs the cluster CA another way. It is the CA your kubeconfig
+embeds:
 
 ```sh
 kubectl config view --raw --minify \
@@ -390,10 +386,10 @@ kubectl config view --raw --minify \
 
 - The admin kubeconfig can. `sudo k3sm install` merges it into the installing user's
   `~/.kube/config` on the server, so `k3sm registry token` works there right after the install.
-- Anyone else needs a grant. k3sm ships the `k3sm:registry-builder-token` ClusterRole, which allows
-  only `create` on `serviceaccounts/token` for the name `builder`, and binds it to nobody. Bind it
-  with a RoleBinding in `k3sm-registry`, never with a ClusterRoleBinding, which would also cover a
-  ServiceAccount named `builder` in every other namespace:
+- Anyone else needs a grant. k3sm ships the `k3sm:registry-builder-token` Role in `k3sm-registry`,
+  which allows only `create` on `serviceaccounts/token` for the name `builder`, and binds it to
+  nobody. Bind it with a RoleBinding in `k3sm-registry`. Because it is a namespaced Role, no binding
+  can make it reach a ServiceAccount named `builder` in another namespace:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -403,7 +399,7 @@ metadata:
   namespace: k3sm-registry
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: k3sm:registry-builder-token
 subjects:
   - apiGroup: rbac.authorization.k8s.io
@@ -416,12 +412,18 @@ history and logs, and ask for the shortest lifetime the job allows.
 
 ### On a worker
 
-A worker writes no user kubeconfig, so `k3sm registry token` and `login` stop there with an error
-that names the fix. Copy the admin kubeconfig from the server and write one:
+A worker writes no user kubeconfig, so `k3sm build`, `image load`, `import` and `push`, and
+`registry token` and `login`, stop there with an error that names the fix. Copy the admin
+kubeconfig from the server and write one:
 
 ```sh
 k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write
 ```
+
+The worker finds the server's registry address in the `registry-k3sm` Service's EndpointSlice in
+`k3sm-registry`, so the kubeconfig must also be allowed to read EndpointSlices there. The admin
+kubeconfig is; the `k3sm:registry-builder-token` Role alone is not, and such a user pushes from the
+server or is given that read by an admin.
 
 ## Storage
 
@@ -442,7 +444,8 @@ depends on its contents.
   that is not configurable; a non-loopback bind is rejected at startup rather than served.
 - The cluster reaches it through one front, over HTTPS only. A separate listener on the server's
   cluster network address and its guest network's gateway, and never a wildcard bind, terminates
-  TLS and passes reads through and checks every write. It does not expose the registry to any other
+  TLS and passes reads through and checks every write. The same front also listens on
+  `127.0.0.1:6451` for the server's own Mac. It does not expose the registry to any other
   network your Mac is on, and a plain-HTTP request to it is refused.
 - The certificate comes from the cluster CA. It is minted in the server's memory at start, its key
   is never written to disk, and it is replaced before it expires. No new trust anchor is involved:
@@ -450,10 +453,9 @@ depends on its contents.
 - Reads are anonymous. Anything that can reach the registry can list and pull the images the
   cluster runs. Do not treat it as a private store for content the host's other users or the
   cluster's other workloads should not see.
-- Writes are authenticated. A push from the Mac needs the per-boot credential, or, at the HTTPS
-  front, a token for the `builder` ServiceAccount minted through a kubeconfig allowed to (see
-  [Pushing With Other Tools](#pushing-with-other-tools)), so a process that merely reached the port
-  cannot plant an image the cluster will then run. From inside the cluster,
+- Writes are authenticated. A push from a Mac needs a token for the `builder` ServiceAccount
+  minted through a kubeconfig allowed to (see [Pushing With Other Tools](#pushing-with-other-tools)),
+  so a process that merely reached the port cannot plant an image the cluster will then run. From inside the cluster,
   a Pod can push only with its own ServiceAccount token, in a namespace that opted in, under that
   namespace's prefix, with an RBAC grant to push, and it can never delete. The token is encrypted on
   every hop; see [What the token is exposed to](#what-the-token-is-exposed-to).
