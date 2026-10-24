@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -140,5 +141,116 @@ func TestStatusReadsTheMigrationJournal(t *testing.T) {
 		if !strings.Contains(string(b), field) {
 			t.Errorf("journal %s lacks %s, which the status row reads", b, field)
 		}
+	}
+}
+
+// TestMigrationPublishesItsSummary: every journal write also publishes a
+// 0644 summary in the status directory beside the work dir, which the status
+// row reads without root: the state, the counts and the pending reason, and
+// no image name. A Mac with no status directory gets the journal only.
+func TestMigrationPublishesItsSummary(t *testing.T) {
+	cases := []struct {
+		name    string
+		journal migrationJournal
+		want    status.ImageMigrationSummary
+	}{
+		{
+			name: "complete",
+			journal: migrationJournal{Schema: migrationSchema, Complete: true, Images: []migrationRecord{
+				{Reference: "docker.io/library/secret-app:dev", Outcome: migrationMigrated, Target: "registry-k3sm:6450/secret-app:dev"},
+				{Reference: "ghcr.io/org/tool:1", Outcome: migrationCached},
+				{Reference: "example.test/old:v1", Outcome: migrationRenamed},
+				{Reference: "example.test/broken:v1", Outcome: migrationUnexportable},
+			}},
+			want: status.ImageMigrationSummary{Schema: 1, State: "complete", InRegistry: 2, CacheEntries: 1, Held: 1},
+		},
+		{
+			name: "pending, with the reason that names no image",
+			journal: migrationJournal{Schema: migrationSchema,
+				LastError:     "migrate docker.io/library/secret-app:dev to the cluster registry: connection refused",
+				PendingReason: "an image could not be copied into the cluster registry: the registry could not be reached",
+				Images:        []migrationRecord{{Reference: "docker.io/library/secret-app:dev", Outcome: migrationPresent}},
+			},
+			want: status.ImageMigrationSummary{Schema: 1, State: "pending", InRegistry: 1,
+				LastError: "an image could not be copied into the cluster registry: the registry could not be reached"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			workDir := filepath.Join(root, "server")
+			if err := os.MkdirAll(filepath.Join(root, "status"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeMigrationJournal(workDir, tc.journal); err != nil {
+				t.Fatal(err)
+			}
+			path := status.ImageMigrationSummaryPath(workDir)
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("no summary published: %v", err)
+			}
+			if info.Mode().Perm() != 0o644 {
+				t.Errorf("summary mode = %v, want 0644", info.Mode().Perm())
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(raw), "secret-app") || strings.Contains(string(raw), "registry-k3sm:6450/") {
+				t.Errorf("the summary names an image: %s", raw)
+			}
+			var got status.ImageMigrationSummary
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("summary = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("no status directory, no summary", func(t *testing.T) {
+		workDir := filepath.Join(t.TempDir(), "server")
+		if err := writeMigrationJournal(workDir, migrationJournal{Schema: migrationSchema}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(status.ImageMigrationSummaryPath(workDir)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("summary without a status directory: %v", err)
+		}
+	})
+}
+
+// TestStoppedRunPublishesAReasonWithoutImageNames: a run that stops on one
+// image records the full error in the journal and a reason naming no image in
+// the summary.
+func TestStoppedRunPublishesAReasonWithoutImageNames(t *testing.T) {
+	rig := newMigrationRig(t)
+	rig.store.add(t, "docker.io/library/secret-app:dev", "darwin/arm64", randomImage(t))
+	statusDir := filepath.Join(filepath.Dir(rig.workDir), "status")
+	if err := os.MkdirAll(statusDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rig.pusher.fail = func(name.Reference) bool { return true }
+	if _, err := rig.migrator().run(t.Context()); err == nil {
+		t.Fatal("run succeeded with a failing registry")
+	}
+	j, err := readMigrationJournal(rig.workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(j.LastError, "secret-app") {
+		t.Errorf("journal lastError %q does not name the image", j.LastError)
+	}
+	raw, err := os.ReadFile(status.ImageMigrationSummaryPath(rig.workDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s status.ImageMigrationSummary
+	if err := json.Unmarshal(raw, &s); err != nil {
+		t.Fatal(err)
+	}
+	if s.State != status.ImageMigrationPending || !strings.Contains(s.LastError, "an image could not be copied") || strings.Contains(string(raw), "secret-app") {
+		t.Errorf("summary = %s, want pending with a reason that names no image", raw)
 	}
 }

@@ -36,6 +36,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 
 	"k3sm.io/k3sm/internal/atomicfile"
+	"k3sm.io/k3sm/pkg/status"
 )
 
 // The image-store migration moves every user image out of this node's store
@@ -282,6 +283,50 @@ func writeMigrationJournal(workDir string, j migrationJournal) error {
 	}
 	if err := atomicfile.Replace(migrationJournalPath(workDir), append(b, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write the image migration journal: %w", err)
+	}
+	return publishMigrationSummary(workDir, j)
+}
+
+// migrationSummaryOf is the journal's world-readable summary: its state, its
+// counts and its pending reason, never an image name.
+func migrationSummaryOf(j migrationJournal) status.ImageMigrationSummary {
+	s := j.summary()
+	out := status.ImageMigrationSummary{
+		Schema:       status.ImageMigrationSummarySchema,
+		State:        status.ImageMigrationPending,
+		InRegistry:   s.Migrated + s.Present + s.Renamed,
+		CacheEntries: s.Cached,
+		Held:         s.Unexportable,
+	}
+	if j.Complete {
+		out.State = status.ImageMigrationComplete
+	}
+	if j.LastError != "" {
+		out.LastError = j.PendingReason
+		if out.LastError == "" {
+			out.LastError = "the last run stopped short; sudo k3sm image migrate --report says why"
+		}
+	}
+	return out
+}
+
+// publishMigrationSummary writes the journal's summary, 0644, into the status
+// directory beside workDir, where the server publishes every record `k3sm
+// status` reads (as registrysvc.WriteState publishes the registry's state),
+// so an account that cannot read the 0600 journal still sees the copy's
+// progress. A Mac with no status directory (a hand-run server, a test) gets
+// the journal only.
+func publishMigrationSummary(workDir string, j migrationJournal) error {
+	path := status.ImageMigrationSummaryPath(workDir)
+	if _, err := os.Stat(filepath.Dir(path)); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	b, err := json.Marshal(migrationSummaryOf(j))
+	if err != nil {
+		return fmt.Errorf("encode the image migration summary: %w", err)
+	}
+	if err := atomicfile.Replace(path, append(b, '\n'), 0o644); err != nil {
+		return fmt.Errorf("publish the image migration summary: %w", err)
 	}
 	return nil
 }
