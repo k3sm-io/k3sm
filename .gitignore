@@ -8,6 +8,10 @@
 # the control-plane payload, and the tarball built from them. Hundreds of MB of
 # build output, rebuilt from scratch on every run.
 /hack/release/out/
+# The lab staging cache of hack/release/build-cp.sh's control-plane builds
+# (hack/release/stage.sh, overridden by K3SM_CP_CACHE): one directory per cache
+# key, a few hundred MB each.
+/.cp-build-cache/
 /bin/
 /k3sm
 *.test

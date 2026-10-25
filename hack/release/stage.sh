@@ -53,8 +53,8 @@
 #                    `codesign -dvvv` text instead of a tree (no codesign is run).
 #   --release        release staging: refuse to sign any cp-payload file that was
 #                    not built from pinned upstream source. Requires --cp-build.
-#                    The control-plane binaries are taken from --cp-build instead
-#                    of the prebuilt download, and every cp-payload file must be
+#                    The control-plane binaries are taken from --cp-build, and
+#                    every cp-payload file must be
 #                    one of PINNED_SOURCE_FILES, byte-identical to its --cp-build
 #                    copy. kine, etcd, etcdutl and zot and their version markers
 #                    are accepted too (K3SM_BUILT_FILES): k3sm builds them itself
@@ -67,10 +67,12 @@
 #                    still refuses, naming it. Signing any of
 #                    this with a Developer ID is the attended signing pipeline's
 #                    job, never this script's. Without --release (the default)
-#                    the ad-hoc lab staging below is unchanged.
+#                    staging is the ad-hoc lab staging, with the same
+#                    control-plane binaries (see "The control-plane binaries").
 #   --cp-build <dir> with --release: the output directory of
 #                    hack/release/build-cp.sh <dir>; it must hold exactly the
-#                    files build-cp.sh produces.
+#                    files build-cp.sh produces, and its stamp must carry the
+#                    cache key build-cp.sh prints today.
 #   --print-pinned-source-files
 #                    print PINNED_SOURCE_FILES, one per line (build-cp.sh's
 #                    self-test compares it with its own output list)
@@ -89,6 +91,20 @@
 #   (k3sm-vmhost is always built and signed with
 #   cmd/k3sm-vmhost/vmhost.entitlements: pkg/install.RequiredSiblings names it,
 #   so a stage without it fails the required-artifact loop.)
+#
+# The control-plane binaries (kube-apiserver, kube-scheduler,
+# kube-controller-manager, kubectl) are always hack/release/build-cp.sh's
+# outputs: built from the digest-pinned Kubernetes source on PAYLOAD_GO_VERSION
+# with build-cp's raise list, so the lab runs what a release ships. `k3sm payload`
+# still downloads its prebuilt set (its marker and its digest checks are its own);
+# staging replaces the four with build-cp's and checks each was built with
+# PAYLOAD_GO_VERSION. --release takes them from --cp-build. Lab staging builds them
+# itself into a cache, $K3SM_CP_CACHE (default <repo>/.cp-build-cache, git-ignored),
+# one directory per `build-cp.sh --print-cache-key` (tag, toolchain, raise list):
+# a cached build whose stamp names the current key is reused, any other key
+# builds afresh (a long build) and replaces the cache's older keys. The build
+# stamp's lines are recorded in UPSTREAM-DIGESTS' note and in PAYLOAD-SHA256's
+# comments.
 #
 # Staging scans every staged Go child with govulncheck (-mode=binary, the version
 # hack/ci.sh pins) after the payload is final and before signing: a finding whose
@@ -127,6 +143,9 @@ WS_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 # self-test can feed captured text through the same walk; signing always uses
 # the system codesign.
 CODESIGN="${CODESIGN:-codesign}"
+
+# The control-plane build lab staging runs. Overridable for the self-test only.
+BUILD_CP="${BUILD_CP:-$HERE/build-cp.sh}"
 
 MANIFEST_NAME="PAYLOAD-SHA256"
 UPSTREAM_NAME="UPSTREAM-DIGESTS"
@@ -484,6 +503,7 @@ manifest_comments() {
 	printf 'zot: zotregistry.dev/zot/v2 %s patch-set none variant %s\n' "$ZOT_VERSION" "$ZOT_VARIANT"
 	printf 'helm: %s from the helm %s release tarball, sha256 %s (verified before extraction)\n' "$HELM_BINARY" "$HELM_VERSION" "$HELM_SHA256"
 	if [ "$stub" = stub ]; then
+		echo "control plane: STUB payload, not built"
 		echo "build: STUB payload, the source-built children were not built"
 		return 0
 	fi
@@ -492,6 +512,9 @@ manifest_comments() {
 		[ "$kind" = kine ] && printf ' -ldflags=-X github.com/k3s-io/kine/pkg/version.Version=%s+%s' "$KINE_VERSION" "$KINE_PATCH"
 		printf '\n'
 	done
+	[ -n "${CP_BUILD:-}" ] || return 0
+	echo "control plane: kube-apiserver, kube-scheduler, kube-controller-manager and kubectl built by hack/release/build-cp.sh; its $CP_STAMP_NAME follows"
+	sed 's/^/control plane: /' "$CP_BUILD/$CP_STAMP_NAME"
 }
 
 # upstream_digests_write <tree> <note>
@@ -520,6 +543,9 @@ cp-payload/kube-scheduler
 cp-payload/kube-controller-manager
 cp-payload/kubectl"
 
+# The stamp build-cp.sh writes beside its outputs (its STAMP_NAME).
+CP_STAMP_NAME="BUILD-STAMP"
+
 # Newline-separated cp-payload/<name> entries k3sm builds itself from pinned
 # module source in `k3sm payload` (child_problems proves each is the pinned build),
 # with their version markers. Release staging accepts them beside
@@ -542,7 +568,8 @@ release_payload_files() {
 }
 
 # cp_build_problems <dir>: non-zero, naming each problem, unless <dir> holds
-# exactly the regular files PINNED_SOURCE_FILES names (by base name), no more.
+# exactly the regular files PINNED_SOURCE_FILES names (by base name) and the
+# build stamp CP_STAMP_NAME, no more.
 cp_build_problems() {
 	local dir="$1" rel name bad=0 f
 	[ -d "$dir" ] || { echo "    --cp-build $dir is not a directory"; return 1; }
@@ -550,12 +577,76 @@ cp_build_problems() {
 		name="${rel#cp-payload/}"
 		[ -f "$dir/$name" ] && [ ! -L "$dir/$name" ] || { echo "    --cp-build lacks $name"; bad=1; }
 	done <<<"$PINNED_SOURCE_FILES"
+	[ -f "$dir/$CP_STAMP_NAME" ] && [ ! -L "$dir/$CP_STAMP_NAME" ] || { echo "    --cp-build lacks $CP_STAMP_NAME"; bad=1; }
 	for f in "$dir"/* "$dir"/.[!.]*; do
 		[ -e "$f" ] || [ -L "$f" ] || continue
+		[ "$(basename "$f")" = "$CP_STAMP_NAME" ] && continue
 		printf '%s\n' "$PINNED_SOURCE_FILES" | grep -qxF -- "cp-payload/$(basename "$f")" || { echo "    --cp-build holds an unexpected $(basename "$f")"; bad=1; }
 	done
 	return "$bad"
 }
+
+# cp_stamp_problems <dir> <key>: non-zero, naming each, unless the build stamp in
+# <dir> names cache key <key> and the payload toolchain PAYLOAD_GO_VERSION.
+cp_stamp_problems() {
+	local st="$1/$CP_STAMP_NAME" key="$2" bad=0
+	grep -qxF -- "cache-key: $key" "$st" 2>/dev/null || { echo "    $CP_STAMP_NAME does not name cache key $key (built from another tag, toolchain or raise list)"; bad=1; }
+	grep -q "^toolchain: $PAYLOAD_GO_VERSION " "$st" 2>/dev/null || { echo "    $CP_STAMP_NAME does not name toolchain $PAYLOAD_GO_VERSION"; bad=1; }
+	return "$bad"
+}
+
+# cp_toolchain_problems <payload-dir>: non-zero, naming each, unless every
+# pinned-source binary in <payload-dir> records PAYLOAD_GO_VERSION as the Go that
+# built it (`go version <file>` reads the build info; the file is never run).
+cp_toolchain_problems() {
+	local dir="$1" rel name got bad=0
+	while IFS= read -r rel; do
+		name="${rel#cp-payload/}"
+		got="$("$GO" version "$dir/$name" 2>/dev/null | sed -n 's/^.*: \(go[0-9][^[:space:]]*\)$/\1/p')"
+		[ "$got" = "$PAYLOAD_GO_VERSION" ] || { echo "    $name: built with '${got:-?}', the payload pins $PAYLOAD_GO_VERSION"; bad=1; }
+	done <<<"$PINNED_SOURCE_FILES"
+	return "$bad"
+}
+
+# lab_cp_build <cache-root> <build-cp>: print the directory of a build-cp output
+# for the key `<build-cp> --print-cache-key` prints today, building it into
+# <cache-root>/<key> first unless a complete one whose stamp names that key is
+# there. A fresh build goes to a temp sibling and is renamed into place only once
+# it is complete; the cache's directories for other keys are then removed.
+# Progress goes to stderr.
+lab_cp_build() {
+	local root="$1" bcp="$2" key dir old
+	key="$("$bcp" --print-cache-key)" || { echo "stage: $bcp --print-cache-key failed" >&2; return 1; }
+	printf '%s' "$key" | grep -Eq '^v[0-9][0-9A-Za-z.+-]*-go[0-9][0-9.]*-[0-9a-f]{16}$' || { echo "stage: unexpected cache key '$key'" >&2; return 1; }
+	mkdir -p "$root" || return 1
+	root="$(cd "$root" && pwd -P)"
+	dir="$root/$key"
+	if [ -d "$dir" ] && cp_build_problems "$dir" >/dev/null && cp_stamp_problems "$dir" "$key" >/dev/null; then
+		echo "==> control-plane binaries: reusing the build-cp cache $dir" >&2
+		printf '%s\n' "$dir"
+		return 0
+	fi
+	echo "==> control-plane binaries: no cached build for $key; running build-cp.sh (a full Kubernetes build)" >&2
+	cleanup_dir "$dir.partial"
+	"$bcp" "$dir.partial" >&2 || { cleanup_dir "$dir.partial"; echo "stage: build-cp.sh failed" >&2; return 1; }
+	if ! cp_build_problems "$dir.partial" >&2 || ! cp_stamp_problems "$dir.partial" "$key" >&2; then
+		echo "stage: build-cp.sh's output in $dir.partial is not a complete build for $key" >&2
+		return 1
+	fi
+	cleanup_dir "$dir"
+	mv "$dir.partial" "$dir" || return 1
+	for old in "$root"/v*-go*-*; do
+		[ -d "$old" ] && [ "$old" != "$dir" ] || continue
+		cleanup_dir "$old"
+	done
+	printf '%s\n' "$dir"
+}
+
+# cleanup_dir <dir>: remove a directory tree, read-only parts included.
+cleanup_dir() { [ -e "$1" ] || return 0; chmod -R u+w "$1" 2>/dev/null || true; rm -rf "$1"; }
+
+# cp_stamp_note <dir>: the build stamp as one line, for the UPSTREAM-DIGESTS note.
+cp_stamp_note() { sed -n 's/^cache-key: //p' "$1/$CP_STAMP_NAME"; }
 
 # place_cp_build <cp-build> <payload-dir>: put each pinned-source file into the
 # payload dir as a new file (copy to a temp, then rename), replacing what the
@@ -1101,6 +1192,8 @@ cat "%s" >&2
 	local cb="$tmp/cp-build" rel
 	mkdir -p "$cb"
 	while IFS= read -r rel; do printf 'built-%s\n' "${rel#cp-payload/}" >"$cb/${rel#cp-payload/}"; done <<<"$PINNED_SOURCE_FILES"
+	if out="$(cp_build_problems "$cb")"; then bad "a --cp-build without its stamp passed"; elif printf '%s\n' "$out" | grep -q "lacks $CP_STAMP_NAME"; then ok "a --cp-build without $CP_STAMP_NAME is refused"; else bad "the missing stamp was not named: $out"; fi
+	printf 'cache-key: vX-goY-0000000000000000\ntoolchain: %s (fixture)\n' "$PAYLOAD_GO_VERSION" >"$cb/$CP_STAMP_NAME"
 	if cp_build_problems "$cb" >/dev/null; then ok "a complete --cp-build passes"; else bad "a complete --cp-build was refused"; fi
 	printf 'x\n' >"$cb/extra"
 	if out="$(cp_build_problems "$cb")"; then bad "an extra file in --cp-build passed"; elif printf '%s\n' "$out" | grep -q "unexpected extra"; then ok "an extra --cp-build file is refused"; else bad "extra file not named: $out"; fi
@@ -1117,6 +1210,88 @@ cat "%s" >&2
 	place_cp_build "$cb" "$pt/cp-payload" || bad "place_cp_build failed"
 	if pinned_content_problems "$pt" "$cb" >/dev/null; then ok "the placed pinned-source build passes the content check"; else bad "the placed build failed the content check"; fi
 	if refuse_unpinned_payload "$pt" "$PINNED_SOURCE_FILES" >/dev/null; then ok "a payload of exactly build-cp's outputs passes the release refusal"; else bad "build-cp's outputs were refused"; fi
+	if [ ! -e "$pt/cp-payload/$CP_STAMP_NAME" ]; then ok "the stamp is not placed into the payload"; else bad "the stamp was placed into cp-payload"; fi
+
+	echo "==> the build-cp stamp and toolchain checks"
+	if grep -qx "STAMP_NAME=\"$CP_STAMP_NAME\"" "$HERE/build-cp.sh"; then ok "CP_STAMP_NAME = build-cp.sh's STAMP_NAME"; else bad "build-cp.sh does not write $CP_STAMP_NAME"; fi
+	if cp_stamp_problems "$cb" "vX-goY-0000000000000000" >/dev/null; then ok "a stamp naming the key and the payload toolchain passes"; else bad "a matching stamp was refused"; fi
+	if out="$(cp_stamp_problems "$cb" "vX-goY-1111111111111111")"; then bad "a stamp for another cache key passed"; elif printf '%s\n' "$out" | grep -q "does not name cache key"; then ok "a stamp for another cache key is refused"; else bad "the key mismatch was not named: $out"; fi
+	if (PAYLOAD_GO_VERSION=go1.0.1 cp_stamp_problems "$cb" "vX-goY-0000000000000000" >/dev/null); then bad "a stamp for another toolchain passed"; else ok "a stamp for another toolchain is refused"; fi
+	if out="$("$self" "$tmp/release-out3" --release --cp-build "$cb" 2>&1)"; then
+		bad "--release with a stale --cp-build stamp did not refuse"
+	elif printf '%s\n' "$out" | grep -q "is not build-cp.sh's build for"; then ok "--release refuses a --cp-build built for another cache key"; else bad "--release did not name the stale stamp: $out"; fi
+	local tcp="$tmp/tc-payload" lgo
+	mkdir -p "$tcp/prog" && printf 'module example.com/tc\n\ngo 1.26\n' >"$tcp/prog/go.mod" && printf 'package main\n\nfunc main() {}\n' >"$tcp/prog/main.go"
+	if (cd "$tcp/prog" && GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$tcp/probe" .); then
+		lgo="$(GOTOOLCHAIN=local "$GO" env GOVERSION)"
+		while IFS= read -r rel; do cp "$tcp/probe" "$tcp/${rel#cp-payload/}"; done <<<"$PINNED_SOURCE_FILES"
+		if (PAYLOAD_GO_VERSION="$lgo" cp_toolchain_problems "$tcp" >/dev/null); then ok "control-plane binaries built with the payload toolchain pass"; else bad "binaries built with $lgo were refused under that pin"; fi
+		if out="$(PAYLOAD_GO_VERSION=go1.0.1 cp_toolchain_problems "$tcp")"; then bad "binaries built with another toolchain passed"; elif printf '%s\n' "$out" | grep -q "kubectl: built with '$lgo', the payload pins go1.0.1"; then ok "a control-plane binary built with another toolchain is refused"; else bad "the toolchain refusal: $out"; fi
+		printf 'not a binary\n' >"$tcp/kubectl"
+		if (PAYLOAD_GO_VERSION="$lgo" cp_toolchain_problems "$tcp" >/dev/null); then bad "a non-Go control-plane file passed the toolchain check"; else ok "a non-Go control-plane file fails the toolchain check"; fi
+	else
+		bad "could not build the toolchain probe"
+	fi
+
+	echo "==> lab staging selects build-cp's outputs, through a cache keyed by build-cp --print-cache-key"
+	local fb="$tmp/fake-build-cp" cache="$tmp/cp-cache" lab key1 key2
+	key1="v1.0.0-go1.0.0-0123456789abcdef" key2="v1.0.0-go1.0.0-fedcba9876543210"
+	# The fake writes what build-cp writes: the four binaries and the stamp.
+	cat >"$fb" <<FAKE
+#!/bin/bash
+set -euo pipefail
+if [ "\$1" = --print-cache-key ]; then cat "$tmp/fake-key"; exit 0; fi
+echo "\$1" >>"$tmp/fake-builds"
+mkdir -p "\$1"
+for n in kube-apiserver kube-scheduler kube-controller-manager kubectl; do echo "built \$n \$(cat "$tmp/fake-key")" >"\$1/\$n"; done
+printf 'cache-key: %s\ntoolchain: %s (fake)\n' "\$(cat "$tmp/fake-key")" "\${FAKE_TOOLCHAIN:-$PAYLOAD_GO_VERSION}" >"\$1/$CP_STAMP_NAME"
+FAKE
+	chmod 0755 "$fb"
+	printf '%s' "$key1" >"$tmp/fake-key"
+	nbuilds() { if [ -f "$tmp/fake-builds" ]; then wc -l <"$tmp/fake-builds" | tr -d ' '; else echo 0; fi; }
+	if lab="$(lab_cp_build "$cache" "$fb" 2>/dev/null)" && [ "$lab" = "$(cd "$cache" && pwd -P)/$key1" ] && [ "$(nbuilds)" = 1 ] && cp_build_problems "$lab" >/dev/null; then
+		ok "an empty cache runs build-cp once, into <cache>/<key>"
+	else
+		bad "the first lab build: dir '$lab', builds $(nbuilds)"
+	fi
+	if [ ! -e "$cache/$key1.partial" ]; then ok "no partial build is left behind"; else bad "$key1.partial was left in the cache"; fi
+	if lab="$(lab_cp_build "$cache" "$fb" 2>/dev/null)" && [ "$(nbuilds)" = 1 ] && grep -q "built kubectl $key1" "$lab/kubectl"; then ok "the same key reuses the cached build"; else bad "the same key rebuilt (builds $(nbuilds))"; fi
+	printf 'cache-key: %s\n' "$key2" >"$lab/$CP_STAMP_NAME"
+	if lab="$(lab_cp_build "$cache" "$fb" 2>/dev/null)" && [ "$(nbuilds)" = 2 ] && cp_stamp_problems "$lab" "$key1" >/dev/null; then ok "a cached build whose stamp names another key is rebuilt"; else bad "a mismatched stamp was reused (builds $(nbuilds))"; fi
+	printf '%s' "$key2" >"$tmp/fake-key"
+	if lab="$(lab_cp_build "$cache" "$fb" 2>/dev/null)" && [ "$(nbuilds)" = 3 ] && [ "$lab" = "$(cd "$cache" && pwd -P)/$key2" ] && grep -q "built kubectl $key2" "$lab/kubectl"; then ok "a new key (tag, toolchain or raise list) rebuilds"; else bad "a new key did not rebuild (builds $(nbuilds), dir '$lab')"; fi
+	if [ ! -e "$cache/$key1" ]; then ok "the cache drops the build for the old key"; else bad "the old key's build stayed in the cache"; fi
+	rm -rf "${cache:?}/$key2"
+	if (export FAKE_TOOLCHAIN=go1.0.1; lab_cp_build "$cache" "$fb" >/dev/null 2>&1); then bad "a build-cp output for another toolchain was accepted"; else ok "a fresh build-cp output that names another toolchain is refused"; fi
+	printf 'bogus key' >"$tmp/fake-key"
+	if lab_cp_build "$cache" "$fb" >/dev/null 2>&1; then bad "a malformed cache key was accepted"; else ok "a malformed cache key is refused"; fi
+	printf '%s' "$key1" >"$tmp/fake-key"
+	# End to end: lab staging asks build-cp for its outputs (a fake go answers the
+	# toolchain assert, a failing fake build-cp stops staging right there), and
+	# stub staging never runs it.
+	local fbin="$tmp/fake-go-bin" e2e="$tmp/e2e-builds"
+	mkdir -p "$fbin"
+	cat >"$fbin/go" <<FAKEGO
+#!/bin/bash
+if [ "\$1 \$2" = "env GOVERSION" ]; then echo $PAYLOAD_GO_VERSION; exit 0; fi
+exit 1
+FAKEGO
+	cat >"$fbin/build-cp" <<FAKECP
+#!/bin/bash
+if [ "\$1" = --print-cache-key ]; then echo $key1; exit 0; fi
+echo "\$1" >>"$e2e"
+exit 3
+FAKECP
+	chmod 0755 "$fbin/go" "$fbin/build-cp"
+	if out="$(PATH="$fbin:$PATH" GO=go BUILD_CP="$fbin/build-cp" K3SM_CP_CACHE="$tmp/e2e-cache" "$self" "$tmp/lab-out" 2>&1)"; then
+		bad "lab staging went on after build-cp failed"
+	elif printf '%s\n' "$out" | grep -q "could not produce the control-plane binaries with hack/release/build-cp.sh" &&
+		[ "$(cat "$e2e" 2>/dev/null)" = "$(cd "$tmp/e2e-cache" && pwd -P)/$key1.partial" ]; then
+		ok "lab staging runs build-cp into its cache, keyed, and stops when it fails"
+	else
+		bad "lab staging did not take its control-plane binaries from build-cp: $out"
+	fi
+	if [ ! -e "$tmp/lab-out/k3sm" ]; then ok "nothing was built before the control-plane binaries were in hand"; else bad "k3sm was built before build-cp ran"; fi
 
 	echo "==> --release accepts k3sm's own kine/etcd/etcdutl/zot builds and the pinned helm, still refuses kube.version"
 	read_pins
@@ -1357,6 +1532,11 @@ else
 			printf '%s\n' "$cp_problems" >&2
 			die "--release: --cp-build $CP_BUILD is not exactly the output of hack/release/build-cp.sh"
 		fi
+		cp_key="$("$HERE/build-cp.sh" --print-cache-key)" || die "--release: build-cp.sh --print-cache-key failed"
+		if ! cp_problems="$(cp_stamp_problems "$CP_BUILD" "$cp_key")"; then
+			printf '%s\n' "$cp_problems" >&2
+			die "--release: --cp-build $CP_BUILD is not build-cp.sh's build for $cp_key; rebuild it"
+		fi
 		CP_BUILD="$(cd "$CP_BUILD" && pwd)"
 	fi
 	mkdir -p "$OUT"
@@ -1460,6 +1640,14 @@ if [ "$STUB_PAYLOAD" = 0 ]; then
 	tc_problem="$(toolchain_problems "$PAYLOAD_GO_VERSION")" || die "$tc_problem"
 fi
 
+# The control-plane binaries for lab staging: build-cp.sh's outputs, from the
+# cache when it holds this key (see "The control-plane binaries" above). Release
+# staging was handed them (--cp-build); stubs need none.
+if [ "$STUB_PAYLOAD" = 0 ] && [ "$RELEASE" = 0 ]; then
+	CP_BUILD="$(lab_cp_build "${K3SM_CP_CACHE:-$REPO_ROOT/.cp-build-cache}" "$BUILD_CP")" ||
+		die "could not produce the control-plane binaries with hack/release/build-cp.sh (above)"
+fi
+
 # The k3sm binary. Built from the repo with go.work active (the sibling-checkout layout)
 # so the sibling modules resolve to these checkouts.
 echo "==> build $BINARY_NAME"
@@ -1490,7 +1678,8 @@ echo "==> build k3sm-vmhost (runtimed)"
 # from pinned module source, exactly the builds the daemon would otherwise run on
 # demand, and — on this path — verifies every downloaded binary against its pinned
 # sha256, failing closed on a mismatch or an unexpected file. A module the cache
-# lacks with no network reachable is reported as "needs network: <module>".
+# lacks with no network reachable is reported as "needs network: <module>". The
+# four downloaded control-plane binaries are then replaced with build-cp.sh's.
 if [ "$STUB_PAYLOAD" = 1 ]; then
 	echo "==> stage cp-payload (STUBS — shape only, never publish this tree)"
 	mkdir -p "$PAYLOAD_DIR"
@@ -1519,11 +1708,13 @@ else
 		die "the staged source-built children are not the pinned builds (above)"
 	fi
 	upstream_note="as produced by '$BINARY_NAME payload': downloads checked against their pinned sha256, kine, etcd, etcdutl and zot built from their pinned modules with $PAYLOAD_GO_VERSION"
-	if [ "$RELEASE" = 1 ]; then
-		echo "==> replace the control-plane binaries with the pinned-source build ($CP_BUILD)"
-		place_cp_build "$CP_BUILD" "$PAYLOAD_DIR" || die "could not place the pinned-source build into $PAYLOAD_DIR"
-		upstream_note="$upstream_note; the control-plane binaries replaced by hack/release/build-cp.sh output"
+	echo "==> replace the control-plane binaries with the pinned-source build ($CP_BUILD)"
+	place_cp_build "$CP_BUILD" "$PAYLOAD_DIR" || die "could not place the pinned-source build into $PAYLOAD_DIR"
+	if ! cp_out="$(cp_toolchain_problems "$PAYLOAD_DIR")"; then
+		printf '%s\n' "$cp_out" >&2
+		die "the staged control-plane binaries were not built with $PAYLOAD_GO_VERSION (above)"
 	fi
+	upstream_note="$upstream_note; the control-plane binaries replaced by hack/release/build-cp.sh output, build $(cp_stamp_note "$CP_BUILD")"
 fi
 
 # The children vuln scan: every staged Go child, after the payload is final and

@@ -7,7 +7,9 @@
 # kube-controller-manager, kubectl) are compiled here from the upstream
 # Kubernetes source archive for exactly the tag the executor pins
 # (pkg/executor.DefaultKubeVersion), instead of being taken from a prebuilt set.
-# stage.sh --release accepts exactly this script's outputs as pinned-source files.
+# stage.sh stages exactly this script's outputs as the pinned-source files: from
+# --cp-build with --release, and from its own cache of this script's builds for
+# lab staging, so a lab cluster runs the control plane a release ships.
 #
 #   hack/release/build-cp.sh <out-dir>
 #   hack/release/build-cp.sh --print-plan
