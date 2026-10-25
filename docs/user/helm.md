@@ -34,7 +34,10 @@ k3s's `server/manifests`.
 - The server runs a helm controller. It creates a Job named `helm-install-<name>` in the
   HelmChart's namespace, and on deletion a Job named `helm-delete-<name>`.
 - The Job is a native pod. Its command is the pinned `helm` (v4.3.0) that ships in the k3sm payload
-  beside `kubectl`; there is no helm container image.
+  beside `kubectl`; there is no helm container image. k3sm builds that `helm` from helm's own module
+  source at the pinned tag, with the Go release it pins for every binary it builds and with newer
+  `golang.org/x/crypto` and `golang.org/x/net` than helm's release names, so it reports the same
+  `helm version` as the upstream release and carries fixes released after that build.
 - The release is named after the HelmChart and installed into `targetNamespace`, or the HelmChart's
   own namespace when that is empty.
 - The Job runs `helm upgrade --install` with `--wait` and `--timeout` (`spec.timeout`, default
@@ -120,8 +123,8 @@ k3s's `server/manifests`.
 
 - The server never downloads `helm` while it runs as the launchd daemon. When the payload lacks it,
   the controller logs the missing binary, re-checks the work dir every minute, and starts once a
-  reinstall stages it. A server started from a development shell (one with `gh` on `PATH`) fetches
-  the pinned release instead and verifies it against the pinned digest.
+  reinstall stages it. A server started from a development shell (one with `gh` on `PATH`) builds
+  the pinned `helm` instead, which needs Go on `PATH` and the Go module proxy reachable.
 - `helm` is ad hoc signed, like every binary k3sm stages. A node whose signature policy requires
   notarized binaries cannot run it, and HelmCharts do not install there.
 - The Job runs on the native path. A chart's own workloads still need the Darwin scheduling fields

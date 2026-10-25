@@ -401,7 +401,7 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 		return nil, os.WriteFile(cmd.Args[slices.Index(cmd.Args, "-o")+1], []byte("pretend-etcd"), 0o755)
 	}
 
-	fakeHelmRelease(t, helmTarball(t, map[string]string{helmchart.HelmTarballMember: "pretend-helm"}), "")
+	fakeHelmBuild(t, "pretend-helm")
 	origZot := stageZot
 	t.Cleanup(func() { stageZot = origZot })
 	stageZot = func(_ context.Context, dir string) error {
@@ -428,7 +428,7 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 		t.Errorf("VerifyPayloadSet(staged payload) = %v", err)
 	}
 	if got, err := os.ReadFile(helmchart.HelmPath(dest)); err != nil || string(got) != "pretend-helm" {
-		t.Errorf("payload helm = %q, %v; want the verified tarball's binary", got, err)
+		t.Errorf("payload helm = %q, %v; want the built binary", got, err)
 	}
 }
 

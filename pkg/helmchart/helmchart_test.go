@@ -17,7 +17,12 @@ limitations under the License.
 package helmchart
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -32,6 +37,7 @@ import (
 
 	helmv1 "k3sm.io/apis/helm/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/helmchart/helmchild"
 	"k3sm.io/k3sm/pkg/policy"
 )
 
@@ -434,22 +440,75 @@ func TestValidateHelmPin(t *testing.T) {
 	if HelmPath("/w/bin") != "/w/bin/"+HelmBinaryName || !strings.HasSuffix(HelmBinaryName, HelmVersion) {
 		t.Errorf("HelmPath = %q, want the versioned name under the bin dir", HelmPath("/w/bin"))
 	}
-	if HelmChecksumURL() != "https://get.helm.sh/"+HelmAsset+".sha256sum" {
-		t.Errorf("HelmChecksumURL = %q", HelmChecksumURL())
+	goodMod := []byte("module k3sm.io/helm-child\n\ngo 1.26.0\n\ntool helm.sh/helm/v4/cmd/helm\n\nrequire (\n" +
+		"\tgolang.org/x/crypto v0.57.0 // indirect\n\tgolang.org/x/net v0.60.0 // indirect\n\thelm.sh/helm/v4 v4.3.0 // indirect\n)\n")
+	commit := strings.Repeat("a", 40)
+	raised := "golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0"
+	if err := validateHelmPin("v4.3.0", commit, "helm-v4.3.0", raised, goodMod); err != nil {
+		t.Fatalf("validateHelmPin(good) = %v", err)
 	}
-	good := []string{"v4.3.0", "helm-v4.3.0-darwin-arm64.tar.gz", strings.Repeat("a", 64), "helm-v4.3.0"}
-	for i, bad := range [][4]string{
-		{"4.3.0", good[1], good[2], good[3]},
-		{good[0], "helm-v4.2.0-darwin-arm64.tar.gz", good[2], good[3]},
-		{good[0], good[1], strings.Repeat("A", 64), good[3]},
-		{good[0], good[1], good[2][:63], good[3]},
-		{good[0], good[1], good[2], "helm"},
+	for name, tc := range map[string]struct {
+		version, commit, binary, raised string
+		goMod                           []byte
+	}{
+		"version without v":            {"4.3.0", commit, "helm-4.3.0", raised, goodMod},
+		"short commit":                 {"v4.3.0", commit[:39], "helm-v4.3.0", raised, goodMod},
+		"uppercase commit":             {"v4.3.0", strings.Repeat("A", 40), "helm-v4.3.0", raised, goodMod},
+		"unversioned binary":           {"v4.3.0", commit, "helm", raised, goodMod},
+		"wrapper at another helm":      {"v4.3.1", commit, "helm-v4.3.1", raised, goodMod},
+		"no raised modules":            {"v4.3.0", commit, "helm-v4.3.0", " ", goodMod},
+		"raised module not path@ver":   {"v4.3.0", commit, "helm-v4.3.0", "golang.org/x/net", goodMod},
+		"wrapper lacks a raised level": {"v4.3.0", commit, "helm-v4.3.0", "golang.org/x/net@v0.61.0", goodMod},
+		"wrapper without the tool":     {"v4.3.0", commit, "helm-v4.3.0", raised, []byte(strings.Replace(string(goodMod), "tool ", "// tool ", 1))},
 	} {
-		if err := validateHelmPin(bad[0], bad[1], bad[2], bad[3]); err == nil {
-			t.Errorf("case %d: validateHelmPin(%q) = nil, want an error", i, bad)
+		if err := validateHelmPin(tc.version, tc.commit, tc.binary, tc.raised, tc.goMod); err == nil {
+			t.Errorf("%s: validateHelmPin = nil, want an error", name)
 		}
 	}
-	if !slices.Contains([]string{"darwin-arm64/helm"}, HelmTarballMember) {
-		t.Errorf("HelmTarballMember = %q", HelmTarballMember)
+	single := []byte("module m\n\ntool helm.sh/helm/v4/cmd/helm\nrequire helm.sh/helm/v4 v4.3.0\n")
+	if reqs, tools := goModRequires(single); reqs["helm.sh/helm/v4"] != "v4.3.0" || !tools["helm.sh/helm/v4/cmd/helm"] {
+		t.Errorf("goModRequires(single-line directives) = %v, %v", reqs, tools)
+	}
+}
+
+// TestHelmBuildArgs pins the build to helm's tagged-release recipe: its main
+// package, CGO-free flags and the version stamp `helm version` reports.
+func TestHelmBuildArgs(t *testing.T) {
+	args := HelmBuildArgs("/s/helm")
+	want := []string{"build", "-trimpath", "-buildvcs=false", "-mod=readonly", "-ldflags", HelmLDFlags(), "-o", "/s/helm", "helm.sh/helm/v4/cmd/helm"}
+	if !slices.Equal(args, want) {
+		t.Errorf("HelmBuildArgs = %q, want %q", args, want)
+	}
+	ld := HelmLDFlags()
+	for _, s := range []string{
+		"-w -s",
+		"-X helm.sh/helm/v4/internal/version.version=" + HelmVersion,
+		"-X helm.sh/helm/v4/internal/version.metadata= ",
+		"-X helm.sh/helm/v4/internal/version.gitCommit=" + HelmGitCommit,
+		"-X helm.sh/helm/v4/internal/version.gitTreeState=clean",
+	} {
+		if !strings.Contains(ld, s) {
+			t.Errorf("HelmLDFlags = %q, lacks %q", ld, s)
+		}
+	}
+	dir := filepath.Join(t.TempDir(), "src")
+	if err := WriteHelmWrapper(dir); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string][]byte{"go.mod": helmchild.GoMod, "go.sum": helmchild.GoSum} {
+		if got, err := os.ReadFile(filepath.Join(dir, name)); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("WriteHelmWrapper %s: %v (the bytes differ from the embedded file)", name, err)
+		}
+	}
+}
+
+// TestHelmBuildVariantTracksGoSum: the build variant names the wrapper's
+// dependency set, so a go.sum change without a variant bump would let a marker
+// vouch for bytes built from another set. Changing go.sum.txt fails this test;
+// bump HelmBuildVariant's "+deps<n>" suffix, then update both values here.
+func TestHelmBuildVariantTracksGoSum(t *testing.T) {
+	sum := sha256.Sum256(helmchild.GoSum)
+	if got, wantSum, wantVariant := hex.EncodeToString(sum[:]), "32276c7661a77d8d76b0c9b3a81b4c415d8399fd4deecb1939da1dfecea2d833", "nocgo+deps1"; got != wantSum || HelmBuildVariant != wantVariant {
+		t.Errorf("go.sum.txt sha256 %s with variant %q; this test pins %s with %q: bump HelmBuildVariant with the dependency set", got, HelmBuildVariant, wantSum, wantVariant)
 	}
 }

@@ -17,15 +17,10 @@ limitations under the License.
 package executor
 
 import (
-	"archive/tar"
-	"bytes"
-	"compress/gzip"
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -34,58 +29,39 @@ import (
 	"k3sm.io/k3sm/pkg/helmchart"
 )
 
-// helmTarball builds a gzipped tar holding each name→content member.
-func helmTarball(t *testing.T, members map[string]string) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	for name, content := range members {
-		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o755, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := tw.Write([]byte(content)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
-// fakeHelmRelease serves body as the pinned tarball and pins its digest (or
-// pin, when non-empty), counting downloads. No network.
-func fakeHelmRelease(t *testing.T, body []byte, pin string) *int {
+// fakeHelmBuild replaces the helm build with one that writes content as the
+// built binary, counting builds and keeping the last command. No network, no
+// compiler.
+func fakeHelmBuild(t *testing.T, content string) (*int, **exec.Cmd) {
 	t.Helper()
 	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	wrapper := []string{"go.mod", "go.sum"}
+	var last *exec.Cmd
+	cache := t.TempDir()
+	origCache, origBuild := kineModuleCacheDir, runHelmBuild
+	t.Cleanup(func() { kineModuleCacheDir, runHelmBuild = origCache, origBuild })
+	kineModuleCacheDir = func(context.Context) (string, error) { return cache, nil }
+	runHelmBuild = func(cmd *exec.Cmd) ([]byte, error) {
 		calls++
-		_, _ = w.Write(body)
-	}))
-	t.Cleanup(srv.Close)
-	if pin == "" {
-		sum := sha256.Sum256(body)
-		pin = hex.EncodeToString(sum[:])
+		last = cmd
+		// The wrapper must be fully materialized where the build runs.
+		for _, f := range wrapper {
+			if _, err := os.Stat(filepath.Join(cmd.Dir, f)); err != nil {
+				t.Errorf("wrapper %s not materialized in the build dir: %v", f, err)
+			}
+		}
+		return nil, os.WriteFile(cmd.Args[slices.Index(cmd.Args, "-o")+1], []byte(content), 0o755)
 	}
-	origURL, origSum := helmTarballURL, helmTarballSHA256
-	t.Cleanup(func() { helmTarballURL, helmTarballSHA256 = origURL, origSum })
-	helmTarballURL, helmTarballSHA256 = srv.URL+"/"+helmchart.HelmAsset, pin
-	return &calls
+	return &calls, &last
 }
 
 func TestStageHelm(t *testing.T) {
-	good := helmTarball(t, map[string]string{
-		"darwin-arm64/README.md": "readme",
-		"darwin-arm64/helm":      "the-helm-binary",
-	})
-
-	t.Run("verified download is extracted under the versioned name", func(t *testing.T) {
-		fakeTool(t, "gh") // a dev shell: the download gate is open
-		calls := fakeHelmRelease(t, good, "")
+	t.Run("a dev shell builds the pin under the versioned name, with its marker", func(t *testing.T) {
+		fakeTool(t, "gh", "go") // a dev shell: the build gate is open
+		t.Setenv("GOFLAGS", "-mod=mod")
+		t.Setenv("CGO_ENABLED", "1")
+		t.Setenv("GOWORK", "/somewhere/go.work")
+		calls, last := fakeHelmBuild(t, "the-helm-binary")
 		bd := t.TempDir()
 		path, err := EnsureHelm(t.Context(), bd)
 		if err != nil {
@@ -94,63 +70,81 @@ func TestStageHelm(t *testing.T) {
 		if path != filepath.Join(bd, helmchart.HelmBinaryName) {
 			t.Errorf("path = %s", path)
 		}
-		got, err := os.ReadFile(path)
-		if err != nil || string(got) != "the-helm-binary" {
+		if got, err := os.ReadFile(path); err != nil || string(got) != "the-helm-binary" {
 			t.Errorf("staged helm = %q, %v", got, err)
 		}
 		if fi, _ := os.Stat(path); fi == nil || fi.Mode().Perm() != 0o755 {
 			t.Errorf("staged helm mode = %v, want 0755", fi)
 		}
+		if got, _ := os.ReadFile(filepath.Join(bd, helmchart.HelmMarkerName)); string(got) != helmchart.HelmVersion+" "+helmchart.HelmBuildVariant+"\n" {
+			t.Errorf("marker = %q", got)
+		}
+		cmd := *last
+		if want := append([]string{"go"}, helmchart.HelmBuildArgs(cmd.Args[slices.Index(cmd.Args, "-o")+1])...); !slices.Equal(cmd.Args, want) {
+			t.Errorf("build argv = %q, want %q", cmd.Args, want)
+		}
+		// The last value of a key is the one the go command sees: the pinned
+		// values win over the ambient ones set above.
+		final := map[string]string{}
+		for _, kv := range cmd.Env {
+			k, v, _ := strings.Cut(kv, "=")
+			final[k] = v
+		}
+		for k, v := range map[string]string{"CGO_ENABLED": "0", "GOWORK": "off", "GOFLAGS": "-mod=readonly", "GOTOOLCHAIN": "local", "GOSUMDB": "sum.golang.org"} {
+			if final[k] != v {
+				t.Errorf("build env %s = %q, want %q", k, final[k], v)
+			}
+		}
 		entries, _ := os.ReadDir(bd)
-		if len(entries) != 1 {
+		if len(entries) != 2 {
 			var names []string
 			for _, e := range entries {
 				names = append(names, e.Name())
 			}
-			t.Errorf("bin dir holds %v, want only the helm binary (no tarball, no temp)", names)
+			t.Errorf("bin dir holds %v, want only the helm binary and its marker (no temp)", names)
 		}
-		// A staged copy is kept: the dev-shell fallback downloads only when absent.
+		// A staged copy is kept: the dev-shell fallback builds only when absent.
 		if _, err := EnsureHelm(t.Context(), bd); err != nil {
 			t.Fatal(err)
 		}
 		if *calls != 1 {
-			t.Errorf("downloads = %d, want 1 (a staged helm is not fetched again)", *calls)
+			t.Errorf("builds = %d, want 1 (a staged helm is not built again)", *calls)
 		}
 	})
 
-	t.Run("digest mismatch fails closed and stages nothing", func(t *testing.T) {
-		fakeTool(t, "gh") // a dev shell: the download gate is open
-		fakeHelmRelease(t, good, strings.Repeat("0", 64))
+	t.Run("a failed build stages nothing", func(t *testing.T) {
+		fakeTool(t, "gh", "go")
+		fakeHelmBuild(t, "")
+		runHelmBuild = func(*exec.Cmd) ([]byte, error) { return []byte("compile error"), errors.New("exit status 1") }
 		bd := t.TempDir()
-		if _, err := EnsureHelm(t.Context(), bd); !errors.Is(err, ErrHelmDigestMismatch) {
-			t.Fatalf("EnsureHelm = %v, want ErrHelmDigestMismatch", err)
+		if _, err := EnsureHelm(t.Context(), bd); err == nil || !strings.Contains(err.Error(), "compile error") {
+			t.Fatalf("EnsureHelm = %v, want the build's own output", err)
 		}
-		if fileExists(helmchart.HelmPath(bd)) {
-			t.Error("unverified bytes were staged")
-		}
-	})
-
-	t.Run("a tarball without the binary is an error", func(t *testing.T) {
-		fakeTool(t, "gh") // a dev shell: the download gate is open
-		fakeHelmRelease(t, helmTarball(t, map[string]string{"linux-arm64/helm": "wrong"}), "")
-		bd := t.TempDir()
-		if _, err := EnsureHelm(t.Context(), bd); err == nil || !strings.Contains(err.Error(), helmchart.HelmTarballMember) {
-			t.Fatalf("EnsureHelm = %v, want an error naming %s", err, helmchart.HelmTarballMember)
-		}
-		if fileExists(helmchart.HelmPath(bd)) {
-			t.Error("a binary was staged from a tarball that has none")
+		if fileExists(helmchart.HelmPath(bd)) || fileExists(filepath.Join(bd, helmchart.HelmMarkerName)) {
+			t.Error("a failed build left a binary or a marker")
 		}
 	})
 
-	t.Run("a daemon without gh gets ErrHelmNotStaged and never downloads", func(t *testing.T) {
-		calls := fakeHelmRelease(t, good, "")
+	t.Run("a dev shell without go is ErrNoGoToolchain", func(t *testing.T) {
+		fakeTool(t, "gh")
+		calls, _ := fakeHelmBuild(t, "x")
+		if _, err := EnsureHelm(t.Context(), t.TempDir()); !errors.Is(err, ErrNoGoToolchain) {
+			t.Fatalf("EnsureHelm = %v, want ErrNoGoToolchain", err)
+		}
+		if *calls != 0 {
+			t.Errorf("builds = %d, want 0", *calls)
+		}
+	})
+
+	t.Run("a daemon without gh gets ErrHelmNotStaged and never builds", func(t *testing.T) {
+		calls, _ := fakeHelmBuild(t, "x")
 		t.Setenv("PATH", t.TempDir()) // no gh: the launchd daemon's environment
 		bd := t.TempDir()
 		if _, err := EnsureHelm(t.Context(), bd); !errors.Is(err, ErrHelmNotStaged) {
 			t.Fatalf("EnsureHelm = %v, want ErrHelmNotStaged", err)
 		}
 		if *calls != 0 {
-			t.Errorf("downloads = %d, want 0 (the gate is closed)", *calls)
+			t.Errorf("builds = %d, want 0 (the gate is closed)", *calls)
 		}
 		if fileExists(helmchart.HelmPath(bd)) {
 			t.Error("a helm was staged with the gate closed")
@@ -158,7 +152,7 @@ func TestStageHelm(t *testing.T) {
 	})
 
 	t.Run("a daemon without gh still uses a staged helm", func(t *testing.T) {
-		calls := fakeHelmRelease(t, good, "")
+		calls, _ := fakeHelmBuild(t, "x")
 		t.Setenv("PATH", t.TempDir())
 		bd := t.TempDir()
 		if err := os.WriteFile(helmchart.HelmPath(bd), []byte("payload-helm"), 0o755); err != nil {
@@ -168,36 +162,25 @@ func TestStageHelm(t *testing.T) {
 			t.Fatalf("EnsureHelm = %q, %v", path, err)
 		}
 		if *calls != 0 {
-			t.Errorf("downloads = %d, want 0", *calls)
+			t.Errorf("builds = %d, want 0", *calls)
 		}
 	})
 
-	t.Run("a body over the download bound is truncated and fails the digest", func(t *testing.T) {
-		fakeTool(t, "gh")
-		fakeHelmRelease(t, good, "") // the pin is the digest of the whole body
-		orig := maxHelmTarballBytes
-		t.Cleanup(func() { maxHelmTarballBytes = orig })
-		maxHelmTarballBytes = int64(len(good)) - 1
+	t.Run("the packaging path rebuilds a copy its marker does not vouch for", func(t *testing.T) {
+		fakeTool(t, "go")
+		calls, _ := fakeHelmBuild(t, "the-helm-binary")
 		bd := t.TempDir()
-		if _, err := EnsureHelm(t.Context(), bd); !errors.Is(err, ErrHelmDigestMismatch) {
-			t.Fatalf("EnsureHelm = %v, want ErrHelmDigestMismatch (the bound truncates the body)", err)
-		}
-		if fileExists(helmchart.HelmPath(bd)) {
-			t.Error("truncated bytes were staged")
-		}
-	})
-
-	t.Run("the packaging path re-downloads over a present copy", func(t *testing.T) {
-		calls := fakeHelmRelease(t, good, "")
-		bd := t.TempDir()
-		if err := os.WriteFile(helmchart.HelmPath(bd), []byte("signed-earlier"), 0o755); err != nil {
+		if err := os.WriteFile(helmchart.HelmPath(bd), []byte("an-earlier-download"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := stageHelm(t.Context(), signingPolicy{s: bootCodeSigner}, bd, true); err != nil {
+		if err := stageHelmBuild(t.Context(), bd); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := os.ReadFile(helmchart.HelmPath(bd)); string(got) != "the-helm-binary" || *calls != 1 {
-			t.Errorf("staged = %q after %d downloads, want the verified bytes after 1", got, *calls)
+			t.Errorf("staged = %q after %d builds, want the built bytes after 1", got, *calls)
+		}
+		if err := stageHelmBuild(t.Context(), bd); err != nil || *calls != 1 {
+			t.Errorf("a vouched copy was rebuilt: %v, builds %d", err, *calls)
 		}
 	})
 }

@@ -901,12 +901,12 @@ func StagePayload(ctx context.Context, destDir string) error {
 	if err := ensureEtcdutlInto(ctx, destDir, DefaultEtcdVersion); err != nil {
 		return err
 	}
-	// helm is re-downloaded and re-verified even if present (force): these bytes
-	// are about to be published, and a copy already in the directory may have been
-	// signed, which rewrites it past any digest comparison.
-	// The packaging producer runs no signing decision: what it stages is ad-hoc
-	// signed, and the attended pipeline re-signs the release copy.
-	if err := stageHelm(ctx, signingPolicy{s: bootCodeSigner}, destDir, true); err != nil {
+	// helm is built from its pinned module with its marker, exactly as zot is: a
+	// copy whose marker does not vouch for this pin and variant (an earlier
+	// release's download above all) is rebuilt. The packaging producer runs no
+	// signing decision: what it stages is ad-hoc signed, and the attended pipeline
+	// re-signs the release copy.
+	if err := stageHelmBuild(ctx, destDir); err != nil {
 		return err
 	}
 	// The ingest registry's zot, built from its pinned module with its marker, so a
