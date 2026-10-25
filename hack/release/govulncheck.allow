@@ -25,3 +25,12 @@ GO-2026-6505 zot v2.1.22 go.opentelemetry.io/otel v1.46.0 otlptrace exporter end
 # openpgp/elgamal carries GO-2026-5932 (no fixed version upstream). helm links
 # x/crypto/openpgp only for chart provenance signing and verification.
 GO-2026-5932 helm v4.3.0 golang.org/x/crypto v0.57.0 helm links x/crypto/openpgp only for chart provenance signing and verification (helm package --sign, helm verify, --verify on install and pull), and k3sm's helm Jobs never pass --sign, --verify or a keyring; no fixed version upstream, accepted until one ships or helm drops the package 2027-02-20
+#
+# kube-apiserver, kube-scheduler and kube-controller-manager v1.37.1 are built
+# against golang.org/x/crypto v0.57.0, and govulncheck reports GO-2026-5932 at
+# package level (every openpgp package, "/*") because the binaries are stripped
+# and carry no symbol table to resolve against. The v1.37.1 source vendors no
+# x/crypto/openpgp package, and no openpgp package path appears in the binaries.
+GO-2026-5932 kube-apiserver v1.37.1 golang.org/x/crypto v0.57.0 a package-level report from a stripped binary; the v1.37.1 source vendors no x/crypto/openpgp package and the binary names none, so nothing of it is linked; no fixed version upstream 2027-02-20
+GO-2026-5932 kube-scheduler v1.37.1 golang.org/x/crypto v0.57.0 a package-level report from a stripped binary; the v1.37.1 source vendors no x/crypto/openpgp package and the binary names none, so nothing of it is linked; no fixed version upstream 2027-02-20
+GO-2026-5932 kube-controller-manager v1.37.1 golang.org/x/crypto v0.57.0 a package-level report from a stripped binary; the v1.37.1 source vendors no x/crypto/openpgp package and the binary names none, so nothing of it is linked; no fixed version upstream 2027-02-20
