@@ -76,14 +76,14 @@ buildinfo_problems() {
 	problem() { echo "$kind: $*"; bad=1; }
 	gov="$(printf '%s\n' "$text" | sed -n '1s/^.*: \(go[0-9][^[:space:]]*\)$/\1/p')"
 	[ "$gov" = "$pin" ] || problem "built with '${gov:-?}', the payload pins $pin"
-	printf '%s\n' "$text" | grep -qx "[[:space:]]*path[[:space:]]$path" || problem "main package is not $path"
+	grep -qx "[[:space:]]*path[[:space:]]$path" <<<"$text" || problem "main package is not $path"
 	if [ -n "$mod" ]; then
-		printf '%s\n' "$text" | grep -Eq "^[[:space:]]*(mod|dep)[[:space:]]${mod}[[:space:]]${want}([[:space:]]|\$)" || problem "module $mod is not at $want"
-		printf '%s\n' "$text" | grep -Eq "^[[:space:]]*=>" && problem "a module is replaced"
+		grep -Eq "^[[:space:]]*(mod|dep)[[:space:]]${mod}[[:space:]]${want}([[:space:]]|\$)" <<<"$text" || problem "module $mod is not at $want"
+		grep -Eq "^[[:space:]]*=>" <<<"$text" && problem "a module is replaced"
 	fi
 	case "$kind" in
 	kine | zot)
-		xnet="$(printf '%s\n' "$text" | sed -n 's/^[[:space:]]*dep[[:space:]]golang\.org\/x\/net[[:space:]]\([^[:space:]]*\).*$/\1/p' | head -1)"
+		xnet="$(awk '$1 == "dep" && $2 == "golang.org/x/net" { print $3; exit }' <<<"$text")"
 		if [ -z "$XNET_FLOOR" ]; then
 			problem "no golang.org/x/net floor is set (XNET_FLOOR)"
 		elif [ -z "$xnet" ]; then
@@ -95,7 +95,7 @@ buildinfo_problems() {
 	esac
 	local setting
 	for setting in $settings; do
-		printf '%s\n' "$text" | grep -qx "[[:space:]]*build[[:space:]]$setting" || problem "build setting $setting is missing"
+		grep -qx "[[:space:]]*build[[:space:]]$setting" <<<"$text" || problem "build setting $setting is missing"
 	done
 	unset -f problem
 	return "$bad"
