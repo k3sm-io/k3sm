@@ -37,8 +37,13 @@ import (
 // marker); `k3sm install` stages the payload; seedBinDir copies it into the work
 // dir's bin at boot (it is in PayloadBinaries), and provision re-signs it there.
 //
-// The version is in the binary's name, so in the work dir presence is the version
-// marker: a pin bump stages a new file beside the old one rather than trusting it.
+// The version is in the binary's name, so a pin bump stages a new file beside the
+// old one. The marker tells this build from any other build of the same version (a
+// tarball-era helm above all): on the dev path a helm whose marker does not vouch
+// for the pin and variant is not current, so seedBinDir replaces it from a payload
+// whose marker does, and EnsureHelm rebuilds it in a dev shell. A daemon with no
+// vouching payload keeps running the helm it has: it cannot build, and the remedy
+// is a reinstall with a current payload, which the seed then takes.
 //
 // EnsureHelm is the dev-shell fallback, the analog of the control plane's `gh`
 // re-stage: it builds only when the work dir has no staged helm AND `gh` is on
@@ -51,11 +56,12 @@ import (
 // whose payload lacked helm. The remedy is a reinstall with a current payload.
 var ErrHelmNotStaged = errors.New("helm is not staged and this process does not build it (no `gh` on PATH: not a dev shell)")
 
-// EnsureHelm returns the path of a staged helm in binDir. A staged copy is used
-// as is (see the note above on why presence suffices) and re-signed on the dev
-// path. When none is staged it builds the pinned helm only in a dev shell (`gh`
-// on PATH, the same gate as the control plane's re-stage); otherwise it returns
-// ErrHelmNotStaged without building anything.
+// EnsureHelm returns the path of a staged helm in binDir. On the dev path a copy
+// whose marker vouches for the pin and variant is used and re-signed if needed.
+// Any other copy, or none, is rebuilt only in a dev shell (`gh` on PATH, the same
+// gate as the control plane's re-stage); outside one a present copy is used as it
+// is (the seed owns replacing it) and an absent one is ErrHelmNotStaged, with
+// nothing built.
 //
 // On the release path (a Developer ID-signed k3sm, see signingPolicy) helm comes
 // from the signed payload only: a staged copy is verified against the Developer
@@ -69,34 +75,45 @@ func EnsureHelm(ctx context.Context, binDir string) (string, error) {
 	if p.release && !fileExists(helmchart.HelmPath(binDir)) {
 		return "", fmt.Errorf("%w: %s is not staged; a release-signed k3sm runs only the helm its signed payload ships", ErrPayloadSignature, helmchart.HelmPath(binDir))
 	}
-	if !fileExists(helmchart.HelmPath(binDir)) {
-		if _, err := lookPathGh(); err != nil {
-			return "", fmt.Errorf("%w: %s", ErrHelmNotStaged, helmchart.HelmPath(binDir))
-		}
-	}
 	if err := stageHelm(ctx, p, binDir); err != nil {
 		return "", err
 	}
 	return helmchart.HelmPath(binDir), nil
 }
 
-// stageHelm places a signed helmchart.HelmBinaryName in bd: an existing copy is
-// kept (and made runnable under p, see signHelm), an absent one is built. The
-// release path never reaches the build: EnsureHelm refuses an absent helm there
-// first.
+// stageHelm places a signed helmchart.HelmBinaryName in bd.
+//
+// On the release path the staged copy is the signed payload's (the seed replaces
+// any other), verified in place by signHelm; it is never built. On the dev path a
+// copy whose marker vouches for the pin and variant is kept and re-signed if
+// needed; any other copy, or none, is rebuilt in a dev shell (`gh` on PATH). Outside
+// one (a daemon), a present copy is used as it is, and an absent one is
+// ErrHelmNotStaged.
 func stageHelm(ctx context.Context, p signingPolicy, bd string) error {
 	dst := helmchart.HelmPath(bd)
-	// Presence is trusted as the version marker because BinDir is root-owned
-	// 0755 under the daemon: only root (install and the payload seed) can place
-	// a file under the versioned name.
-	if fileExists(dst) {
+	if p.release {
+		if !fileExists(dst) {
+			return fmt.Errorf("%w: %s is not staged and a release-signed k3sm never builds it", ErrPayloadSignature, dst)
+		}
 		return signHelm(ctx, p, bd)
 	}
-	if p.release {
-		return fmt.Errorf("%w: %s is not staged and a release-signed k3sm never builds it", ErrPayloadSignature, dst)
+	if helmChild().staged(bd) {
+		return signHelm(ctx, p, bd)
+	}
+	if _, err := lookPathGh(); err != nil {
+		if fileExists(dst) {
+			return signHelm(ctx, p, bd)
+		}
+		return fmt.Errorf("%w: %s", ErrHelmNotStaged, dst)
 	}
 	return stageHelmBuild(ctx, bd)
 }
+
+// PayloadVouchesHelm reports whether the payload bin dir holds a helm whose marker
+// vouches for the pin and variant: the predicate under which the work-dir seed takes
+// the payload helm over a work-dir copy it does not vouch for. An installer uses it
+// to prove the set it staged is one the seed will take.
+func PayloadVouchesHelm(bd string) bool { return helmChild().staged(bd) }
 
 // stageHelmBuild builds the pinned helm into bd under the stagedChild protocol: a
 // no-op when bd's marker already vouches for the pin and variant, otherwise a

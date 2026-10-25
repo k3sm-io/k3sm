@@ -1001,8 +1001,16 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 			return err
 		}
 	}
+	// helm follows kine's rule on the dev path: a work-dir helm whose marker does not
+	// vouch for the pin and variant (a tarball-era helm of the same version above all)
+	// is replaced by a payload helm whose marker does. The release path compares
+	// bytes instead, below.
+	restageHelm, err := preferShipped(helmChild(), bd, payloadDir)
+	if err != nil {
+		return err
+	}
 	if policy.release {
-		restageKine, restageEtcd = false, false
+		restageKine, restageEtcd, restageHelm = false, false, false
 	}
 	// The control-plane set follows the same rule, with one refusal kine does not need
 	// here (kine's own migration path owns its downgrade story): when the workdir's
@@ -1060,7 +1068,7 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		}
 		dst := filepath.Join(bd, name)
 		versioned := (name == kineBinaryName && restageKine) || (name == etcdBinaryName && restageEtcd) ||
-			(restageKube && isCPBinary(name))
+			(name == helmchart.HelmBinaryName && restageHelm) || (restageKube && isCPBinary(name))
 		// On the release path the work dir runs the payload's helm and no other: a
 		// copy that differs from it (an earlier dev install's ad-hoc build of the same
 		// pin) is replaced, verified, rather than refused at signHelm.
@@ -1101,6 +1109,11 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 	}
 	if restageEtcd {
 		if err := etcdChild(DefaultEtcdVersion).writeMarker(bd); err != nil {
+			return err
+		}
+	}
+	if restageHelm {
+		if err := helmChild().writeMarker(bd); err != nil {
 			return err
 		}
 	}

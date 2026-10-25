@@ -166,6 +166,34 @@ func TestStageHelm(t *testing.T) {
 		}
 	})
 
+	for name, marker := range map[string]string{
+		"no marker (a tarball-era helm)": "",
+		"another variant's marker":       helmchart.HelmVersion + " tarball\n",
+	} {
+		t.Run("a dev shell rebuilds a present helm with "+name, func(t *testing.T) {
+			fakeTool(t, "gh", "go")
+			calls, _ := fakeHelmBuild(t, "the-built-helm")
+			bd := t.TempDir()
+			if err := os.WriteFile(helmchart.HelmPath(bd), []byte("tarball-helm"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if marker != "" {
+				if err := os.WriteFile(filepath.Join(bd, helmchart.HelmMarkerName), []byte(marker), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := EnsureHelm(t.Context(), bd); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := os.ReadFile(helmchart.HelmPath(bd)); string(got) != "the-built-helm" || *calls != 1 {
+				t.Errorf("helm = %q after %d builds, want the built bytes after 1", got, *calls)
+			}
+			if !PayloadVouchesHelm(bd) {
+				t.Error("the rebuilt helm's marker does not vouch for the pin")
+			}
+		})
+	}
+
 	t.Run("the packaging path rebuilds a copy its marker does not vouch for", func(t *testing.T) {
 		fakeTool(t, "go")
 		calls, _ := fakeHelmBuild(t, "the-helm-binary")
@@ -183,6 +211,49 @@ func TestStageHelm(t *testing.T) {
 			t.Errorf("a vouched copy was rebuilt: %v, builds %d", err, *calls)
 		}
 	})
+}
+
+// TestSeedReplacesAnUnvouchedHelm: a work dir holding a helm-v4.3.0 the marker
+// does not vouch for (the tarball-era download, which has no marker) is not
+// current. The seed replaces it from a payload whose own marker vouches, writes
+// the marker, and leaves it alone when the payload does not vouch either.
+func TestSeedReplacesAnUnvouchedHelm(t *testing.T) {
+	vouch := helmchart.HelmVersion + " " + helmchart.HelmBuildVariant + "\n"
+	for _, tc := range []struct {
+		name, payloadMarker, want string
+	}{
+		{"a vouching payload replaces it", vouch, "payload-helm"},
+		{"an unmarked payload leaves it", "", "tarball-helm"},
+		{"a payload of another variant leaves it", helmchart.HelmVersion + " tarball\n", "tarball-helm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, work := t.TempDir(), t.TempDir()
+			bd := BinDir(work)
+			if err := os.MkdirAll(bd, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(helmchart.HelmPath(bd), []byte("tarball-helm"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(helmchart.HelmPath(payload), []byte("payload-helm"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.payloadMarker != "" {
+				if err := os.WriteFile(filepath.Join(payload, helmchart.HelmMarkerName), []byte(tc.payloadMarker), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := seedBinDir(t.Context(), discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := os.ReadFile(helmchart.HelmPath(bd)); !strings.HasPrefix(string(got), tc.want) {
+				t.Errorf("work-dir helm = %q, want %q", got, tc.want)
+			}
+			if vouched := PayloadVouchesHelm(bd); vouched != (tc.want == "payload-helm") {
+				t.Errorf("work-dir marker vouches = %v after the seed", vouched)
+			}
+		})
+	}
 }
 
 // TestPayloadCarriesHelm: helm is a payload binary, so install stages it, the
