@@ -14,13 +14,9 @@
 # that matches no symbol-level finding in a scan is a red too: delete it, so
 # exemptions do not outlive what they excused.
 #
-# zot v2.1.22 links golang.org/x/net v0.59.0, whose HTTP/2 code carries the five
-# GO-2026-66xx findings (fixed in v0.60.0), and go.opentelemetry.io/otel v1.46.0
-# (GO-2026-6505, no fixed version upstream). All six were reviewed in the
-# k3sm#815 security review; the x/net fix is a zot build against v0.60.0.
-GO-2026-6603 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 Trailer memory exhaustion, exposed only on the loopback registry address where zot serves HTTP/2; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
-GO-2026-6610 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 transport framing headers, exposed only on the loopback registry address where zot serves HTTP/2; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
-GO-2026-6611 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 repeated window changes, exposed only on the loopback registry address where zot serves HTTP/2; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
-GO-2026-6612 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 double flow control refund, exposed only on the loopback registry address where zot serves HTTP/2; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
-GO-2026-6617 zot v2.1.22 golang.org/x/net v0.59.0 HTTP/2 HPACK encoder race, exposed only on the loopback registry address where zot serves HTTP/2; fixed in v0.60.0, rebuild of zot against it pending (k3sm#815 security review) 2026-11-15
+# zot v2.1.22 links go.opentelemetry.io/otel v1.46.0 (GO-2026-6505, no fixed
+# version upstream), reviewed in the k3sm#815 security review. The five
+# golang.org/x/net findings of that review are fixed: kine and zot are built
+# against x/net v0.60.0 (internal/childreq), and stage.sh refuses a staged
+# kine or zot that links an older one.
 GO-2026-6505 zot v2.1.22 go.opentelemetry.io/otel v1.46.0 otlptrace exporter endpoint URL logging, which concerns an OTLP endpoint URL k3sm never configures for zot; no fixed version upstream, accepted until one ships (k3sm#815 security review) 2026-11-15

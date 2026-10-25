@@ -10,7 +10,8 @@
 #   toolchain_problems   the go on PATH, under GOTOOLCHAIN=local, is that release
 #   buildinfo_problems   the build info Go records in the binary names the pinned
 #                        toolchain, main package, module version, no replace,
-#                        and the pinned build settings
+#                        the pinned build settings, and (kine, zot) the raised
+#                        golang.org/x/net at XNET_FLOOR or newer
 #   buildinfo_settings   the `build` lines, as one line, for a record
 #   marker_problems      the version marker beside a binary names its pin
 #
@@ -34,16 +35,34 @@ toolchain_problems() {
 	[ "$got" = "$want" ] || { echo "the go on PATH is $got; k3sm's out-of-module builds pin $want (PAYLOAD_GO_VERSION): put $want first on PATH"; return 1; }
 }
 
+# XNET_FLOOR is the lowest golang.org/x/net a staged kine or zot may link: the
+# version both are built against (internal/childreq XNetVersion). The caller sets
+# it from that source; an unset floor is itself a problem for kine and zot.
+XNET_FLOOR="${XNET_FLOOR:-}"
+
+# release_less <a> <b>: true when release version a ("vX.Y.Z") sorts below b. A
+# version of any other shape (a pseudo-version, a prerelease) never compares as
+# at-or-above a floor, so it is reported rather than passed.
+release_less() {
+	awk -v a="$1" -v b="$2" 'BEGIN {
+		if (a !~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ || b !~ /^v[0-9]+\.[0-9]+\.[0-9]+$/) exit 0
+		split(substr(a, 2), x, "."); split(substr(b, 2), y, ".")
+		for (i = 1; i <= 3; i++) { if (x[i] + 0 < y[i] + 0) exit 0; if (x[i] + 0 > y[i] + 0) exit 1 }
+		exit 1
+	}'
+}
+
 # buildinfo_problems <kind> <want-version> <go-pin>  (stdin: `go version -m` text)
 # The build stamp of one out-of-module binary, from the build info Go records in
 # it (read, never executed): the toolchain, the main package, the pinned module
 # version (etcd: the server module; etcdutl, zot and metrics-server: their own;
 # kine: built from patched source, so its version is the marker's and the
-# stamped string's), no replaced module, and the build settings: CGO_ENABLED=0,
-# darwin/arm64, and -trimpath for all but zot (registrysvc builds it with a plain
-# `go install`). Prints one line per problem; returns 0 only when there are none.
+# stamped string's), no replaced module, the build settings: CGO_ENABLED=0,
+# darwin/arm64 and -trimpath, and for kine and zot the raised golang.org/x/net,
+# at XNET_FLOOR or newer. Prints one line per problem; returns 0 only when there
+# are none.
 buildinfo_problems() {
-	local kind="$1" want="$2" pin="$3" text path mod gov bad=0
+	local kind="$1" want="$2" pin="$3" text path mod gov xnet bad=0
 	text="$(cat)"
 	case "$kind" in
 	kine) path="github.com/k3s-io/kine"; mod="" ;;
@@ -54,7 +73,6 @@ buildinfo_problems() {
 	*) echo "unknown child $kind"; return 1 ;;
 	esac
 	local settings="CGO_ENABLED=0 -trimpath=true GOOS=darwin GOARCH=arm64"
-	[ "$kind" = zot ] && settings="CGO_ENABLED=0 GOOS=darwin GOARCH=arm64"
 	problem() { echo "$kind: $*"; bad=1; }
 	gov="$(printf '%s\n' "$text" | sed -n '1s/^.*: \(go[0-9][^[:space:]]*\)$/\1/p')"
 	[ "$gov" = "$pin" ] || problem "built with '${gov:-?}', the payload pins $pin"
@@ -63,6 +81,18 @@ buildinfo_problems() {
 		printf '%s\n' "$text" | grep -Eq "^[[:space:]]*(mod|dep)[[:space:]]${mod}[[:space:]]${want}([[:space:]]|\$)" || problem "module $mod is not at $want"
 		printf '%s\n' "$text" | grep -Eq "^[[:space:]]*=>" && problem "a module is replaced"
 	fi
+	case "$kind" in
+	kine | zot)
+		xnet="$(printf '%s\n' "$text" | sed -n 's/^[[:space:]]*dep[[:space:]]golang\.org\/x\/net[[:space:]]\([^[:space:]]*\).*$/\1/p' | head -1)"
+		if [ -z "$XNET_FLOOR" ]; then
+			problem "no golang.org/x/net floor is set (XNET_FLOOR)"
+		elif [ -z "$xnet" ]; then
+			problem "golang.org/x/net is not in the build info (want $XNET_FLOOR or newer)"
+		elif release_less "$xnet" "$XNET_FLOOR"; then
+			problem "golang.org/x/net is $xnet, below the raised $XNET_FLOOR"
+		fi
+		;;
+	esac
 	local setting
 	for setting in $settings; do
 		printf '%s\n' "$text" | grep -qx "[[:space:]]*build[[:space:]]$setting" || problem "build setting $setting is missing"

@@ -2,6 +2,7 @@
 	path	github.com/k3s-io/kine
 	mod	github.com/k3s-io/kine	(devel)	
 	dep	go.etcd.io/etcd/server/v3	v3.7.2	h1:gfnwItZwsDFKUqCJocsBVMNNtWYGTl7/dHc+83qeYVo=
+	dep	golang.org/x/net	v0.60.0	h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=
 	build	-buildmode=exe
 	build	-compiler=gc
 	build	-trimpath=true
