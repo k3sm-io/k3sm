@@ -455,17 +455,17 @@ read_pins() {
 helm_buildinfo_problems() {
 	local want="$1" pin="$2" raised="$3" text gov bad=0 setting pv
 	text="$(cat)"
-	gov="$(printf '%s\n' "$text" | sed -n '1s/^.*: \(go[0-9][^[:space:]]*\)$/\1/p')"
+	gov="$(sed -n '1s/^.*: \(go[0-9][^[:space:]]*\)$/\1/p' <<<"$text")"
 	[ "$gov" = "$pin" ] || { echo "helm: built with '${gov:-?}', the payload pins $pin"; bad=1; }
-	printf '%s\n' "$text" | grep -qx "[[:space:]]*path[[:space:]]helm.sh/helm/v4/cmd/helm" || { echo "helm: main package is not helm.sh/helm/v4/cmd/helm"; bad=1; }
-	printf '%s\n' "$text" | grep -Eq "^[[:space:]]*(mod|dep)[[:space:]]helm.sh/helm/v4[[:space:]]${want}([[:space:]]|\$)" || { echo "helm: module helm.sh/helm/v4 is not at $want"; bad=1; }
-	if printf '%s\n' "$text" | grep -Eq "^[[:space:]]*=>"; then echo "helm: a module is replaced"; bad=1; fi
+	grep -qx "[[:space:]]*path[[:space:]]helm.sh/helm/v4/cmd/helm" <<<"$text" || { echo "helm: main package is not helm.sh/helm/v4/cmd/helm"; bad=1; }
+	grep -Eq "^[[:space:]]*(mod|dep)[[:space:]]helm.sh/helm/v4[[:space:]]${want}([[:space:]]|\$)" <<<"$text" || { echo "helm: module helm.sh/helm/v4 is not at $want"; bad=1; }
+	if grep -Eq "^[[:space:]]*=>" <<<"$text"; then echo "helm: a module is replaced"; bad=1; fi
 	for setting in CGO_ENABLED=0 -trimpath=true GOOS=darwin GOARCH=arm64; do
-		printf '%s\n' "$text" | grep -qx "[[:space:]]*build[[:space:]]$setting" || { echo "helm: build setting $setting is missing"; bad=1; }
+		grep -qx "[[:space:]]*build[[:space:]]$setting" <<<"$text" || { echo "helm: build setting $setting is missing"; bad=1; }
 	done
 	[ -n "$raised" ] || { echo "helm: no raised modules to check (HELM_RAISED unset)"; bad=1; }
 	for pv in $raised; do
-		printf '%s\n' "$text" | grep -Eq "^[[:space:]]*dep[[:space:]]${pv%@*}[[:space:]]${pv#*@}([[:space:]]|\$)" || { echo "helm: module ${pv%@*} is not at the raised ${pv#*@}"; bad=1; }
+		grep -Eq "^[[:space:]]*dep[[:space:]]${pv%@*}[[:space:]]${pv#*@}([[:space:]]|\$)" <<<"$text" || { echo "helm: module ${pv%@*} is not at the raised ${pv#*@}"; bad=1; }
 	done
 	return "$bad"
 }
