@@ -408,7 +408,7 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 		if err := os.WriteFile(registrysvc.ZotPath(dir), []byte("pretend-zot"), 0o755); err != nil {
 			return err
 		}
-		return os.WriteFile(filepath.Join(dir, registrysvc.ZotMarkerName), []byte(registrysvc.DefaultZotVersion+" minimal\n"), 0o644)
+		return os.WriteFile(filepath.Join(dir, registrysvc.ZotMarkerName), []byte(registrysvc.DefaultZotVersion+" minimal+r1\n"), 0o644)
 	}
 
 	dest := filepath.Join(t.TempDir(), "payload")

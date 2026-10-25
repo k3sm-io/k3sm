@@ -3331,7 +3331,7 @@ func TestInstallStagesTheZotMarker(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(payload, registrysvc.ZotBinaryName), []byte("zot\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	marker := registrysvc.DefaultZotVersion + " minimal\n"
+	marker := registrysvc.DefaultZotVersion + " minimal+r1\n"
 	if err := os.WriteFile(filepath.Join(payload, registrysvc.ZotMarkerName), []byte(marker), 0o644); err != nil {
 		t.Fatal(err)
 	}

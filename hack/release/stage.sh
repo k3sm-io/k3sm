@@ -104,7 +104,8 @@
 #                     manifest itself and .DS_Store excluded), after `#` comment
 #                     lines recording the pinned toolchain and, for kine, etcd,
 #                     etcdutl and zot, the module version, the patch-set id, the
-#                     build variant and the build flags, and for helm its pinned
+#                     build variant and the build flags (kine and zot: also the
+#                     raised golang.org/x/net), and for helm its pinned
 #                     release asset and digest. After
 #                     signing it is the authority for the payload's bytes; check it
 #                     with `shasum -a 256 -c PAYLOAD-SHA256` inside the tree. Also
@@ -390,11 +391,12 @@ GV_ALLOW="$HERE/govulncheck.allow"
 
 # read_pins: KUBE_VERSION (the control-plane release), KINE_VERSION, ETCD_VERSION,
 # KINE_VARIANT, ETCD_VARIANT and KINE_PATCH
-# (the patch-set id, "none" without one), ZOT_VERSION and ZOT_VARIANT, and
-# HELM_VERSION, HELM_SHA256 and HELM_BINARY, read from the source the staged k3sm
-# is built from, so the checks below compare against that build's own pins.
+# (the patch-set id, "none" without one), ZOT_VERSION and ZOT_VARIANT,
+# HELM_VERSION, HELM_SHA256 and HELM_BINARY, and XNET_FLOOR (the golang.org/x/net
+# kine and zot are built against), read from the source the staged k3sm is built
+# from, so the checks below compare against that build's own pins.
 read_pins() {
-	local ex="$REPO_ROOT/pkg/executor" rs="$REPO_ROOT/pkg/registrysvc/pin.go" hc="$REPO_ROOT/pkg/helmchart/pin.go"
+	local ex="$REPO_ROOT/pkg/executor" rs="$REPO_ROOT/pkg/registrysvc/pin.go" hc="$REPO_ROOT/pkg/helmchart/pin.go" cr="$REPO_ROOT/internal/childreq/childreq.go"
 	KINE_VERSION="$(sed -n 's/^[[:space:]]*DefaultKineVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/executor.go")"
 	ETCD_VERSION="$(sed -n 's/^[[:space:]]*DefaultEtcdVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/executor.go")"
 	KINE_VARIANT="$(sed -n 's/^[[:space:]]*kineBuildVariant[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/setup.go")"
@@ -413,11 +415,14 @@ read_pins() {
 	[ -n "$ZOT_VERSION" ] && [ -n "$ZOT_VARIANT" ] && [ -n "$HELM_VERSION" ] && [ -n "$HELM_SHA256" ] ||
 		die "cannot read the zot and helm pins from $rs and $hc"
 	HELM_BINARY="helm-$HELM_VERSION"
+	XNET_FLOOR="$(sed -n 's/^[[:space:]]*const XNetVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cr")"
+	[ -n "$XNET_FLOOR" ] || die "cannot read the raised golang.org/x/net (XNetVersion) from $cr"
 }
 
 # child_problems <payload-dir> <go-pin>: the staged kine, etcd, etcdutl and zot are
 # the pinned builds: each marker names the pin and variant, each build info passes
-# buildinfo_problems against <go-pin>, and kine carries its stamped version (pin+patch set) in its
+# buildinfo_problems against <go-pin> (kine and zot: with x/net at XNET_FLOOR or
+# newer), and kine carries its stamped version (pin+patch set) in its
 # bytes. The pinned helm release is staged under its versioned name. Prints one
 # line per problem; returns 0 only when there are none.
 child_problems() {
@@ -471,17 +476,18 @@ unbang() {
 
 # manifest_comments [stub]: the manifest's header lines. The toolchain pin, then,
 # per source-built child, its module version, patch-set id, build variant and the
-# build settings its own build info records (kine's -ldflags stamp is added
+# build settings its own build info records, and for kine and zot the raised
+# golang.org/x/net they are built against (kine's -ldflags stamp is added
 # explicitly: -trimpath keeps ldflags out of Go's build info). With "stub" the
 # children were not built, and the header says so.
 manifest_comments() {
 	local stub="${1:-}" dir="$PAYLOAD_DIR" kind
 	printf 'k3sm payload manifest; verify inside the tree with: shasum -a 256 -c %s\n' "$MANIFEST_NAME"
 	printf 'toolchain: %s %s/%s (pinned: PAYLOAD_GO_VERSION %s)\n' "$("$GO" env GOVERSION)" "$GOOS" "$GOARCH" "$PAYLOAD_GO_VERSION"
-	printf 'kine: github.com/k3s-io/kine %s patch-set %s variant %s (stamped %s+%s)\n' "$KINE_VERSION" "$KINE_PATCH" "$KINE_VARIANT" "$KINE_VERSION" "$KINE_PATCH"
+	printf 'kine: github.com/k3s-io/kine %s patch-set %s variant %s (stamped %s+%s) raises golang.org/x/net %s\n' "$KINE_VERSION" "$KINE_PATCH" "$KINE_VARIANT" "$KINE_VERSION" "$KINE_PATCH" "$XNET_FLOOR"
 	printf 'etcd: go.etcd.io/etcd/server/v3 %s patch-set none variant %s\n' "$ETCD_VERSION" "$ETCD_VARIANT"
 	printf 'etcdutl: go.etcd.io/etcd/etcdutl/v3 %s patch-set none variant %s\n' "$ETCD_VERSION" "$ETCD_VARIANT"
-	printf 'zot: zotregistry.dev/zot/v2 %s patch-set none variant %s\n' "$ZOT_VERSION" "$ZOT_VARIANT"
+	printf 'zot: zotregistry.dev/zot/v2 %s patch-set none variant %s raises golang.org/x/net %s\n' "$ZOT_VERSION" "$ZOT_VARIANT" "$XNET_FLOOR"
 	printf 'helm: %s from the helm %s release tarball, sha256 %s (verified before extraction)\n' "$HELM_BINARY" "$HELM_VERSION" "$HELM_SHA256"
 	if [ "$stub" = stub ]; then
 		echo "build: STUB payload, the source-built children were not built"
@@ -1148,10 +1154,15 @@ cat "%s" >&2
 		else
 			echo "  FAIL  read_pins: kine '$KINE_VERSION' '$KINE_VARIANT' '$KINE_PATCH', etcd '$ETCD_VERSION' '$ETCD_VARIANT'"; exit 1
 		fi
-		if printf '%s' "$ZOT_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' && [ "$ZOT_VARIANT" = minimal ] && [ "$HELM_BINARY" = "helm-$HELM_VERSION" ] && printf '%s' "$HELM_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+		if printf '%s' "$ZOT_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' && [ "$ZOT_VARIANT" = "minimal+r1" ] && [ "$HELM_BINARY" = "helm-$HELM_VERSION" ] && printf '%s' "$HELM_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
 			echo "  ok    read_pins: zot $ZOT_VERSION $ZOT_VARIANT, $HELM_BINARY sha256 $HELM_SHA256"
 		else
 			echo "  FAIL  read_pins: zot '$ZOT_VERSION' '$ZOT_VARIANT', helm '$HELM_BINARY' '$HELM_SHA256'"; exit 1
+		fi
+		if printf '%s' "$XNET_FLOOR" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+			echo "  ok    read_pins: kine and zot raise golang.org/x/net to $XNET_FLOOR"
+		else
+			echo "  FAIL  read_pins: XNET_FLOOR '$XNET_FLOOR'"; exit 1
 		fi
 	) || fails=$((fails + 1))
 	if printf '%s\n' "$PAYLOAD_GO_VERSION" | grep -Eq '^go[0-9]+\.[0-9]+\.[0-9]+$'; then ok "PAYLOAD_GO_VERSION is an exact release ($PAYLOAD_GO_VERSION)"; else bad "PAYLOAD_GO_VERSION '$PAYLOAD_GO_VERSION' is not an exact goX.Y.Z"; fi
@@ -1182,15 +1193,24 @@ FAKE
 
 	echo "==> the build stamp of kine, etcd, etcdutl and zot (go version -m captures; dep lists trimmed)"
 	local kind want fx2
+	# The floor the fixtures are captured at; read_pins sets it from the source, and
+	# the read_pins check above proves that read.
+	XNET_FLOOR=v0.60.0
 	for kind in kine etcd etcdutl zot; do
 		case "$kind" in kine) want=v0.17.2 ;; zot) want=v2.1.22 ;; *) want=v3.6.15 ;; esac
 		fx2="$td/goversion-$kind.txt"
 		if out="$(buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then ok "$kind capture passes"; else bad "$kind capture rejected: $out"; fi
 		if out="$(buildinfo_problems "$kind" "$want" go1.27.9 <"$fx2")"; then bad "$kind: another toolchain passed"; elif printf '%s\n' "$out" | grep -q "built with 'go1.27.3'"; then ok "$kind: another toolchain is refused"; else bad "$kind: toolchain not named: $out"; fi
 		if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a cgo build passed"; elif printf '%s\n' "$out" | grep -q "CGO_ENABLED=0"; then ok "$kind: a cgo build is refused"; else bad "$kind: cgo not named: $out"; fi
-		if [ "$kind" != zot ]; then
-			if out="$(grep -v -- '-trimpath' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build without -trimpath passed"; else ok "$kind: a build without -trimpath is refused"; fi
-		fi
+		if out="$(grep -v -- '-trimpath' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build without -trimpath passed"; else ok "$kind: a build without -trimpath is refused"; fi
+		case "$kind" in
+		kine | zot)
+			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.59.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: x/net v0.59.0 passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/net is v0.59.0, below the raised v0.60.0"; then ok "$kind: x/net v0.59.0 is reported"; else bad "$kind: x/net v0.59.0 not named: $out"; fi
+			if out="$(sed 's/\(golang\.org\/x\/net[[:space:]]\)v0\.60\.0/\1v0.61.0/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then ok "$kind: a newer x/net passes"; else bad "$kind: a newer x/net was refused: $out"; fi
+			if out="$(grep -v 'golang\.org/x/net' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a build info without x/net passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/net is not in the build info"; then ok "$kind: a missing x/net is reported"; else bad "$kind: missing x/net not named: $out"; fi
+			if out="$(XNET_FLOOR='' buildinfo_problems "$kind" "$want" go1.27.3 <"$fx2")"; then bad "$kind: passed with no x/net floor set"; elif printf '%s\n' "$out" | grep -q "no golang.org/x/net floor"; then ok "$kind: an unset x/net floor is refused"; else bad "$kind: unset floor not named: $out"; fi
+			;;
+		esac
 		if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: an amd64 build passed"; else ok "$kind: an amd64 build is refused"; fi
 		if out="$(sed 's/^\([[:space:]]*path[[:space:]]\).*/\1example.com\/other/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: another main package passed"; else ok "$kind: another main package is refused"; fi
 	done
@@ -1204,27 +1224,27 @@ FAKE
 	local cpd="$tmp/children"
 	mkdir -p "$cpd"
 	(
-		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p1 KINE_PATCH=p1 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
-		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal HELM_BINARY=helm-v4.3.0
-		printf 'zot\n' >"$cpd/zot"; echo "v2.1.22 minimal" >"$cpd/zot.version"
+		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p2 KINE_PATCH=p2 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
+		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal+r1 HELM_BINARY=helm-v4.3.0 XNET_FLOOR=v0.60.0
+		printf 'zot\n' >"$cpd/zot"; echo "v2.1.22 minimal+r1" >"$cpd/zot.version"
 		printf 'helm\n' >"$cpd/helm-v4.3.0"
-		printf 'mach-o...v0.17.2+p1...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p1" >"$cpd/kine.version"
+		printf 'mach-o...v0.17.2+p2...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p2" >"$cpd/kine.version"
 		printf 'etcd\n' >"$cpd/etcd"; echo "v3.6.15 nocgo" >"$cpd/etcd.version"
 		printf 'etcdutl\n' >"$cpd/etcdutl"; echo "v3.6.15 nocgo" >"$cpd/etcdutl.version"
 		r=0
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  ok    the pinned children pass"; else echo "  FAIL  the pinned children were refused: $o"; r=1; fi
 		echo "v0.17.2 nocgo+p0" >"$cpd/kine.version"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a patch-set mismatch passed"; r=1; elif printf '%s\n' "$o" | grep -q "kine.version"; then echo "  ok    a marker naming another patch set is refused"; else echo "  FAIL  marker not named: $o"; r=1; fi
-		echo "v0.17.2 nocgo+p1" >"$cpd/kine.version"
+		echo "v0.17.2 nocgo+p2" >"$cpd/kine.version"
 		printf 'mach-o...v0.17.2...\n' >"$cpd/kine"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a kine without the stamped version passed"; r=1; elif printf '%s\n' "$o" | grep -q "stamped version"; then echo "  ok    a kine without its stamp is refused"; else echo "  FAIL  stamp not named: $o"; r=1; fi
-		printf 'mach-o...v0.17.2+p1...\n' >"$cpd/kine"
+		printf 'mach-o...v0.17.2+p2...\n' >"$cpd/kine"
 		rm "$cpd/etcdutl"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without etcdutl passed"; r=1; elif printf '%s\n' "$o" | grep -q "etcdutl: not staged"; then echo "  ok    a missing etcdutl is refused"; else echo "  FAIL  missing etcdutl not named: $o"; r=1; fi
 		printf 'etcdutl\n' >"$cpd/etcdutl"
-		echo "v2.1.20 minimal" >"$cpd/zot.version"
+		echo "v2.1.20 minimal+r1" >"$cpd/zot.version"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
-		echo "v2.1.22 minimal" >"$cpd/zot.version"
+		echo "v2.1.22 minimal+r1" >"$cpd/zot.version"
 		rm "$cpd/zot" "$cpd/helm-v4.3.0"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without zot and helm passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot: not staged" && printf '%s\n' "$o" | grep -q "helm-v4.3.0: not staged"; then echo "  ok    a missing zot and a missing helm are refused"; else echo "  FAIL  missing zot or helm not named: $o"; r=1; fi
 		exit "$r"

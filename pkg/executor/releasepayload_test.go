@@ -68,7 +68,7 @@ exit 2
 func writeZotPayload(t *testing.T, dir, content string) {
 	t.Helper()
 	writeBin(t, registrysvc.ZotPath(dir), content)
-	marker := registrysvc.DefaultZotVersion + " minimal\n"
+	marker := registrysvc.DefaultZotVersion + " minimal+r1\n"
 	if err := os.WriteFile(filepath.Join(dir, registrysvc.ZotMarkerName), []byte(marker), 0o644); err != nil {
 		t.Fatal(err)
 	}
