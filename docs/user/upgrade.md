@@ -386,8 +386,8 @@ upgrade copies them into the registry once.
 
 The server does this by itself on its first start after the upgrade, in the background, as soon as
 its registry is up. It writes to its own registry with the server's own push credential. A worker
-never copies anything on its own: run the copy there by hand, on that worker. Run it by hand on the
-server too to retry:
+never copies anything on its own: run the copy there by hand, with `sudo`, on that worker. Run it by
+hand on the server too to retry:
 
 ```sh
 sudo k3sm image migrate            # copy, then print the report
@@ -396,7 +396,9 @@ sudo k3sm image migrate -o json    # the report as JSON
 ```
 
 `sudo` is needed because the copy reads the node's image store through the runtime's socket, which
-only root and the k3sm service user can open, as for `k3sm image prune`. A copy you run pushes the
+only root and the k3sm service user can open, as for `k3sm image prune`. On a worker, `--report`
+needs it too, since the journal there is readable by root only; without `sudo` the command stops and
+says so. A copy you run pushes the
 way `k3sm build --push` does: through the push gate, with a builder token minted from your
 kubeconfig, to the server's loopback gate on the server and to the server's cluster address on a
 worker. So on a worker you need the kubeconfig described in

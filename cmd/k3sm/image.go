@@ -50,7 +50,7 @@ Usage: k3sm image pull <reference> [flags]
        k3sm image prune [flags]
        k3sm image ls [-o json] [flags]
        k3sm image df [-o json] [flags]
-       k3sm image migrate [--report] [-o json]   (copy this node's images into the cluster registry once)
+       k3sm image migrate [--report] [-o json]   (copy this node's images into the cluster registry once; sudo on a worker)
 
 pull    fetch a reference into this node's store through the daemon's OWN
         puller — the same code path a pod-driven pull takes, so every blob is

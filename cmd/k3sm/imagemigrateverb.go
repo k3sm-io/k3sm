@@ -39,6 +39,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/k3sm/pkg/status"
 )
@@ -231,7 +232,8 @@ in the node store and runnable until it is loaded again.
 The server runs this by itself on its first start after an upgrade. A worker
 never pushes on its own: run it there by hand, with sudo, because the node
 store is read through the runtime's socket, which only root and the k3sm
-service user may open (as for image prune). The copy goes through the push
+service user may open (as for image prune). On a worker --report needs sudo
+too, because the journal is root's there. The copy goes through the push
 gate with a builder token minted from your kubeconfig, the way
 k3sm build --push does: on a server to its loopback gate, on a worker to the
 server's cluster address. Progress is journalled on this node.
@@ -282,6 +284,9 @@ func runImageMigrate(args []string) error {
 
 // imageMigrateCommand runs the verb against a dialer.
 func imageMigrateCommand(ctx context.Context, o imageMigrateOptions, out io.Writer, dial imagesDialer) error {
+	if err := migrateAgentAccess(); err != nil {
+		return err
+	}
 	var (
 		j   migrationJournal
 		err error
@@ -319,10 +324,12 @@ func imageMigrateCommand(ctx context.Context, o imageMigrateOptions, out io.Writ
 }
 
 // migrateGeteuid and migrateServiceUID are the identity the runtime-socket
-// rule is decided for, seams so the refusal is testable.
+// rule is decided for, and migrateRole the node this Mac is installed as;
+// seams so the refusals are testable.
 var (
 	migrateGeteuid    = os.Geteuid
 	migrateServiceUID = lookupServiceUID
+	migrateRole       = installedRole
 )
 
 // migrateRuntimeAccess refuses, before anything is dialled, a run that cannot
@@ -335,6 +342,20 @@ func migrateRuntimeAccess(socket string) error {
 		return nil
 	}
 	return fmt.Errorf("k3sm image migrate reads this node's image store through the runtime's socket %s, which only root and the k3sm service user may open (the same rule as k3sm image prune); run it with sudo: sudo k3sm image migrate", socket)
+}
+
+// migrateAgentAccess refuses, before any journal is read, a run on a worker
+// by an account that is neither root nor the k3sm service user. A worker's
+// migration reads its node store through the runtime's socket and journals
+// under the root-owned installed work dir, so an ordinary account can neither
+// run it nor read its report: without this it would resolve a work dir of
+// its own and report a migration that never ran there. The server keeps the
+// runtime-socket rule alone (migrateRuntimeAccess).
+func migrateAgentAccess() error {
+	if role, _ := migrateRole(); role != install.RoleAgent || status.RuntimedReachable(migrateGeteuid(), migrateServiceUID()) {
+		return nil
+	}
+	return errors.New("on a worker, k3sm image migrate (--report included) reads this node's image store and its migration journal, which only root and the k3sm service user may open; run it with sudo: sudo k3sm image migrate")
 }
 
 // migrationLock serialises migrations within this process: the on-upgrade

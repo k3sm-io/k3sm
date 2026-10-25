@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -38,9 +39,12 @@ import (
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"google.golang.org/grpc"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // fakeNodeStore is a node store the migration reads. It has no write verb at
@@ -512,22 +516,31 @@ func TestUserImageMigratePushesWithBuilderTokenAndJournals(t *testing.T) {
 	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("builder:"+fakeBuilderTokenToken))
 	cases := []struct {
 		name string
+		// role is the node the run is on. A worker's run is root's (sudo),
+		// the only account migrateAgentAccess lets run there.
+		role install.Role
 		// setup returns the node's work dir and the builder-token count.
 		setup func(t *testing.T, g gateRegistry) (string, *int)
 	}{
-		{"on a worker, to the server's cluster address", func(t *testing.T, g gateRegistry) (string, *int) {
+		{"on a worker, to the server's cluster address", install.RoleAgent, func(t *testing.T, g gateRegistry) (string, *int) {
 			minted := clusterAPIFor(t, g, flatSlice("127.0.0.1", int32(g.port)))
 			dir := t.TempDir()
 			t.Setenv("K3SM_WORK_DIR", dir)
 			return dir, minted
 		}},
-		{"on the server, to its loopback gate", func(t *testing.T, g gateRegistry) (string, *int) {
+		{"on the server, to its loopback gate", install.RoleServer, func(t *testing.T, g gateRegistry) (string, *int) {
 			minted := clusterAPIFor(t, g)
 			return asServer(t, g.port), minted
 		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			prevEUID, prevRole := migrateGeteuid, migrateRole
+			t.Cleanup(func() { migrateGeteuid, migrateRole = prevEUID, prevRole })
+			migrateRole = func() (install.Role, bool) { return tc.role, true }
+			if tc.role == install.RoleAgent {
+				migrateGeteuid = func() int { return 0 }
+			}
 			empty := t.TempDir()
 			t.Setenv("HOME", empty)
 			t.Setenv("DOCKER_CONFIG", empty)
@@ -700,4 +713,62 @@ func TestImageMigrationLock(t *testing.T) {
 		t.Fatalf("the lock was not released: %v", err)
 	}
 	unlock2()
+}
+
+// TestImageMigrateRefusesUserRunOnAgent: on a worker every form of the verb,
+// --report included, reads state only root and the service user may read, so
+// an ordinary account is refused before any journal is read or anything is
+// dialled, naming sudo. Root on a worker, and any account on a server, are
+// not refused by this rule.
+func TestImageMigrateRefusesUserRunOnAgent(t *testing.T) {
+	cases := []struct {
+		name       string
+		role       install.Role
+		euid       int
+		report     bool
+		wantRefuse bool
+	}{
+		{"an ordinary account's report on a worker", install.RoleAgent, 501, true, true},
+		{"an ordinary account's run on a worker", install.RoleAgent, 501, false, true},
+		{"root's report on a worker", install.RoleAgent, 0, true, false},
+		{"the service user's report on a worker", install.RoleAgent, 270, true, false},
+		{"an ordinary account's report on a server", install.RoleServer, 501, true, false},
+	}
+	prevEUID, prevSvc, prevRole := migrateGeteuid, migrateServiceUID, migrateRole
+	t.Cleanup(func() { migrateGeteuid, migrateServiceUID, migrateRole = prevEUID, prevSvc, prevRole })
+	migrateServiceUID = func() int { return 270 }
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			migrateGeteuid = func() int { return tc.euid }
+			migrateRole = func() (install.Role, bool) { return tc.role, true }
+			workDir := t.TempDir()
+			if err := writeMigrationJournal(workDir, migrationJournal{Schema: migrationSchema, Complete: true}); err != nil {
+				t.Fatal(err)
+			}
+			dialled := false
+			dial := func(context.Context, string) (grpc.ClientConnInterface, io.Closer, error) {
+				dialled = true
+				return nil, nil, errors.New("no runtime in this test")
+			}
+			var out bytes.Buffer
+			err := imageMigrateCommand(t.Context(), imageMigrateOptions{
+				socket: runtimed.DefaultSocketPath, workDir: workDir, report: tc.report,
+			}, &out, dial)
+			if !tc.wantRefuse {
+				if err != nil && strings.Contains(err.Error(), "on a worker") {
+					t.Fatalf("refused: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "sudo k3sm image migrate") {
+				t.Fatalf("imageMigrateCommand = %v, want a refusal naming sudo k3sm image migrate", err)
+			}
+			if out.Len() != 0 {
+				t.Errorf("a refused run printed %q, want nothing", out.String())
+			}
+			if dialled {
+				t.Errorf("a refused run dialled the runtime")
+			}
+		})
+	}
 }
