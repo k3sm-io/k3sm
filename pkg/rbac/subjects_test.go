@@ -91,6 +91,7 @@ func TestProvisionSubjectsUnchanged(t *testing.T) {
 		"serviceaccount k3sm-registry/builder",
 		"bind ClusterRoleBinding /k3sm:registry-builder -> ClusterRole k3sm:registry-pusher ServiceAccount k3sm-registry/builder",
 		"rule Role k3sm-registry/k3sm:registry-builder-token [] [serviceaccounts/token] [create] [builder]",
+		"rule Role k3sm-registry/k3sm:registry-builder-token [discovery.k8s.io] [endpointslices] [get] [registry-k3sm]",
 	}
 	sort.Strings(want)
 	got := grantLines(objs)

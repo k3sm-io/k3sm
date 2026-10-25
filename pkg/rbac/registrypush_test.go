@@ -198,9 +198,81 @@ func TestEnsureGraphCreatesRegistryBuilder(t *testing.T) {
 	})
 }
 
+// wantRegistryEndpointSlice is the one EndpointSlice the server's registry
+// Service publishes, spelled as a literal like the names above.
+const wantRegistryEndpointSlice = "registry-k3sm"
+
+// wantBuilderTokenRules is the token role's whole grant: create on the one
+// builder ServiceAccount's token, and get on the one registry EndpointSlice a
+// worker's login reads the server's address from.
+var wantBuilderTokenRules = []rbacv1.PolicyRule{
+	{
+		APIGroups:     []string{""},
+		Resources:     []string{"serviceaccounts/token"},
+		ResourceNames: []string{wantBuilderSA},
+		Verbs:         []string{"create"},
+	},
+	{
+		APIGroups:     []string{"discovery.k8s.io"},
+		Resources:     []string{"endpointslices"},
+		ResourceNames: []string{wantRegistryEndpointSlice},
+		Verbs:         []string{"get"},
+	},
+}
+
+// equalRules compares two rule lists in order.
+func equalRules(a, b []rbacv1.PolicyRule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !equalRule(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// TestRegistryBuilderTokenReadsOnlyTheRegistryEndpointSlice pins the token
+// role's one read: get, by name, on the registry Service's EndpointSlice, so a
+// user holding only the role can find the server's registry address from a
+// worker. It is exactly the token grant plus that rule: no list or watch,
+// which would let the holder read every EndpointSlice in the namespace, and no
+// other resource. A widened copy is repaired on the next start.
+func TestRegistryBuilderTokenReadsOnlyTheRegistryEndpointSlice(t *testing.T) {
+	cs := fake.NewClientset()
+	ctx := context.Background()
+	if err := Provision(ctx, cs); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	role, err := cs.RbacV1().Roles(wantBuilderNamespace).Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get %s: %v", wantBuilderTokenRole, err)
+	}
+	if !equalRules(role.Rules, wantBuilderTokenRules) {
+		t.Fatalf("%s rules = %+v, want exactly %+v", wantBuilderTokenRole, role.Rules, wantBuilderTokenRules)
+	}
+
+	t.Run("a list or an unnamed get is repaired on the next start", func(t *testing.T) {
+		r, _ := cs.RbacV1().Roles(wantBuilderNamespace).Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
+		r.Rules[1].ResourceNames = nil
+		r.Rules[1].Verbs = []string{"get", "list", "watch"}
+		if _, err := cs.RbacV1().Roles(wantBuilderNamespace).Update(ctx, r, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := Provision(ctx, cs); err != nil {
+			t.Fatalf("Provision: %v", err)
+		}
+		r, _ = cs.RbacV1().Roles(wantBuilderNamespace).Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
+		if !equalRules(r.Rules, wantBuilderTokenRules) {
+			t.Errorf("after repair %s rules = %+v, want %+v", wantBuilderTokenRole, r.Rules, wantBuilderTokenRules)
+		}
+	})
+}
+
 // TestRegistryBuilderTokenRoleShipsUnbound pins the token role: exactly create
-// on serviceaccounts/token for the one name builder, and no binding to it
-// anywhere in the graph k3sm provisions.
+// on serviceaccounts/token for the one name builder and get on the one registry
+// EndpointSlice, and no binding to it anywhere in the graph k3sm provisions.
 func TestRegistryBuilderTokenRoleShipsUnbound(t *testing.T) {
 	cs := fake.NewClientset()
 	ctx := context.Background()
@@ -214,13 +286,8 @@ func TestRegistryBuilderTokenRoleShipsUnbound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get %s: %v", wantBuilderTokenRole, err)
 	}
-	want := []rbacv1.PolicyRule{{
-		APIGroups:     []string{""},
-		Resources:     []string{"serviceaccounts/token"},
-		ResourceNames: []string{wantBuilderSA},
-		Verbs:         []string{"create"},
-	}}
-	if len(role.Rules) != 1 || !equalRule(role.Rules[0], want[0]) {
+	want := wantBuilderTokenRules
+	if !equalRules(role.Rules, want) {
 		t.Errorf("%s rules = %+v, want exactly %+v", wantBuilderTokenRole, role.Rules, want)
 	}
 	if role.Labels["k3sm.io/managed"] != "true" {
@@ -243,7 +310,7 @@ func TestRegistryBuilderTokenRoleShipsUnbound(t *testing.T) {
 			t.Fatalf("Provision: %v", err)
 		}
 		r, _ = cs.RbacV1().Roles(wantBuilderNamespace).Get(ctx, wantBuilderTokenRole, metav1.GetOptions{})
-		if len(r.Rules) != 1 || !equalRule(r.Rules[0], want[0]) {
+		if !equalRules(r.Rules, want) {
 			t.Errorf("after repair %s rules = %+v, want %+v", wantBuilderTokenRole, r.Rules, want)
 		}
 	})

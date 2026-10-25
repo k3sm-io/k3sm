@@ -251,17 +251,29 @@ const RegistryBuilderBinding = "k3sm:registry-builder"
 const RegistryBuilderTokenRole = "k3sm:registry-builder-token"
 
 // registryBuilderTokenRules is the token role's whole grant: create on the
-// serviceaccounts/token subresource of the one ServiceAccount named builder.
-// Bound by a RoleBinding in the builder's namespace it reaches exactly
-// k3sm-registry/builder; it carries no get, list or watch, so a holder cannot
-// read the ServiceAccount, its Secrets or anything else.
+// serviceaccounts/token subresource of the one ServiceAccount named builder,
+// and get on the one EndpointSlice the server's registry Service publishes
+// (registrysvc.FlatServiceName), which is where `k3sm registry login` on a
+// worker reads the server's registry address. Bound by a RoleBinding in the
+// builder's namespace it reaches exactly k3sm-registry/builder and
+// k3sm-registry/registry-k3sm. It carries no list or watch and no other
+// resource, so a holder cannot read the ServiceAccount, its Secrets, any other
+// EndpointSlice or anything else.
 func registryBuilderTokenRules() []rbacv1.PolicyRule {
-	return []rbacv1.PolicyRule{{
-		APIGroups:     []string{""},
-		Resources:     []string{"serviceaccounts/token"},
-		ResourceNames: []string{registrysvc.BuilderServiceAccount},
-		Verbs:         []string{"create"},
-	}}
+	return []rbacv1.PolicyRule{
+		{
+			APIGroups:     []string{""},
+			Resources:     []string{"serviceaccounts/token"},
+			ResourceNames: []string{registrysvc.BuilderServiceAccount},
+			Verbs:         []string{"create"},
+		},
+		{
+			APIGroups:     []string{"discovery.k8s.io"},
+			Resources:     []string{"endpointslices"},
+			ResourceNames: []string{registrysvc.FlatServiceName},
+			Verbs:         []string{"get"},
+		},
+	}
 }
 
 // ensureRegistryBuilderRBAC provisions the builder identity a user pushes as
