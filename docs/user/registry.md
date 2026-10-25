@@ -395,8 +395,8 @@ kubectl config view --raw --minify \
 - The admin kubeconfig can. `sudo k3sm install` merges it into the installing user's
   `~/.kube/config` on the server, so `k3sm registry token` works there right after the install.
 - Anyone else needs a grant. k3sm ships the `k3sm:registry-builder-token` Role in `k3sm-registry`,
-  which allows only `create` on `serviceaccounts/token` for the name `builder`, and binds it to
-  nobody. Bind it with a RoleBinding in `k3sm-registry`. Because it is a namespaced Role, no binding
+  which allows only `create` on `serviceaccounts/token` for the name `builder` and `get` on the
+  `registry-k3sm` EndpointSlice, and binds it to nobody. Bind it with a RoleBinding in `k3sm-registry`. Because it is a namespaced Role, no binding
   can make it reach a ServiceAccount named `builder` in another namespace:
 
 ```yaml
@@ -439,10 +439,10 @@ kubeconfig from the server and write one:
 k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write
 ```
 
-The worker finds the server's registry address in the `registry-k3sm` Service's EndpointSlice in
-`k3sm-registry`, so the kubeconfig must also be allowed to read EndpointSlices there. The admin
-kubeconfig is; the `k3sm:registry-builder-token` Role alone is not, and such a user pushes from the
-server or is given that read by an admin.
+The worker finds the server's registry address by getting the `registry-k3sm` EndpointSlice in
+`k3sm-registry` by name. The admin kubeconfig may, and so may a user bound to the
+`k3sm:registry-builder-token` Role, which grants `get` on that one slice and no `list`, so such a
+user can log in and push from a worker with no other grant.
 
 ## Reaching It From Another Mac
 
