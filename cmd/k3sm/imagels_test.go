@@ -38,6 +38,7 @@ import (
 	"k3sm.io/k3sm/pkg/registryclient"
 	"k3sm.io/k3sm/pkg/registryclient/registrytest"
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/k3sm/pkg/status"
 )
 
 var updateImageGolden = flag.Bool("update-image-golden", false, "rewrite testdata/image_ls.golden.json and image_df.golden.json")
@@ -291,5 +292,80 @@ func TestImageLsArgs(t *testing.T) {
 	}
 	if o, err := parseImageArgs([]string{"df", "-o", "json"}, io.Discard); err != nil || o.output != "json" {
 		t.Errorf("df -o json = %+v, %v", o, err)
+	}
+}
+
+// TestImageLsFallsBackToUserKubeconfig: `k3sm image ls` finds the cluster the
+// way the other read verbs do. The role's credentials come first; on a worker
+// whose node credential this account cannot read, the account's own
+// kubeconfig for the server it joined is used instead, and only when neither
+// gives a client does the verb fail, naming the first reason.
+func TestImageLsFallsBackToUserKubeconfig(t *testing.T) {
+	kubeAt := func(t *testing.T, host string) func() (status.Kube, string, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "kubeconfig")
+		cfg := "apiVersion: v1\nkind: Config\ncurrent-context: k3sm\n" +
+			"clusters:\n- name: k3sm\n  cluster:\n    server: https://" + host + ":6444\n    insecure-skip-tls-verify: true\n" +
+			"users:\n- name: k3sm\n  user:\n    token: test\n" +
+			"contexts:\n- name: k3sm\n  context:\n    cluster: k3sm\n    user: k3sm\n"
+		if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return func() (status.Kube, string, error) { return buildStatusKube(kubectlConfig{kubeconfig: path}) }
+	}
+	failing := func(msg string) func() (status.Kube, string, error) {
+		return func() (status.Kube, string, error) { return nil, "", fmt.Errorf("%s", msg) }
+	}
+	const unreadable = "node credential /var/lib/k3sm/agent/kubeconfig is not readable by this account (re-run with sudo)"
+	cases := []struct {
+		name     string
+		primary  func(t *testing.T) func() (status.Kube, string, error)
+		user     func(t *testing.T) func() (status.Kube, string, error)
+		wantHost string
+		wantErr  string
+	}{
+		{
+			name:     "the role's credentials answer",
+			primary:  func(t *testing.T) func() (status.Kube, string, error) { return kubeAt(t, "192.0.2.1") },
+			user:     func(t *testing.T) func() (status.Kube, string, error) { return kubeAt(t, "192.0.2.2") },
+			wantHost: "192.0.2.1",
+		},
+		{
+			name:     "a worker's node credential is unreadable, the user's kubeconfig answers",
+			primary:  func(*testing.T) func() (status.Kube, string, error) { return failing(unreadable) },
+			user:     func(t *testing.T) func() (status.Kube, string, error) { return kubeAt(t, "192.0.2.2") },
+			wantHost: "192.0.2.2",
+		},
+		{
+			name:    "a worker with no usable kubeconfig either",
+			primary: func(*testing.T) func() (status.Kube, string, error) { return failing(unreadable) },
+			user: func(*testing.T) func() (status.Kube, string, error) {
+				return failing("neither the k3sm context nor the current one points at the server this Mac joined")
+			},
+			wantErr: unreadable,
+		},
+		{
+			name:    "a server has no fallback",
+			primary: func(*testing.T) func() (status.Kube, string, error) { return failing("no kubeconfig") },
+			user:    func(*testing.T) func() (status.Kube, string, error) { return nil },
+			wantErr: "no kubeconfig",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env, err := imageRegistryEnvFrom(tc.primary(t), tc.user(t))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("imageRegistryEnvFrom = %v, want an error naming %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("imageRegistryEnvFrom: %v", err)
+			}
+			if env.apiHost != tc.wantHost || env.kube == nil {
+				t.Errorf("env apiHost = %q (kube %v), want %q with a client", env.apiHost, env.kube != nil, tc.wantHost)
+			}
+		})
 	}
 }

@@ -42,6 +42,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/registryclient"
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/k3sm/pkg/status"
 )
 
 // The registry listing's fixed facts.
@@ -128,11 +129,25 @@ type imageRegistryEnv struct {
 }
 
 // newImageRegistryEnv resolves the cluster the way `k3sm status` does, over the
-// invoking user's own credentials: no root, no daemon socket.
+// invoking user's own credentials: no root, no daemon socket. On a worker
+// whose node credential this account cannot read, that is the account's own
+// kubeconfig context for the server the worker joined.
 func newImageRegistryEnv() (imageRegistryEnv, error) {
 	role, _ := installedRole()
 	workDir := statusWorkDir(os.Geteuid(), lookupServiceUID())
-	k, _, err := newStatusKube(statusKubeInputsFor(role, statusPaths(workDir)))
+	return imageRegistryEnvFrom(
+		func() (status.Kube, string, error) {
+			return newStatusKube(statusKubeInputsFor(role, statusPaths(workDir)))
+		},
+		statusUserKubeFor(role, statusAgentJoinServer, installedStatusDir()),
+	)
+}
+
+// imageRegistryEnvFrom builds the environment from the role's credentials
+// (primary) and the account's own kubeconfig fallback (user, nil on a server),
+// resolved the way every read verb resolves them (readVerbKube).
+func imageRegistryEnvFrom(primary, user func() (status.Kube, string, error)) (imageRegistryEnv, error) {
+	k, _, err := readVerbKube(primary, user)
 	if err != nil {
 		return imageRegistryEnv{}, fmt.Errorf("find the cluster: %w", err)
 	}
