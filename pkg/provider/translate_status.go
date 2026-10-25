@@ -709,9 +709,11 @@ func toContainerStatuses(rcs []*runtimev1.ContainerStatus) []corev1.ContainerSta
 		st := corev1.ContainerStatus{
 			Name:  rc.GetName(),
 			Image: rc.GetImage(),
-			// The identity pair: image_id is the image's config digest,
-			// carried verbatim because it is a content address the runtime
-			// resolved and this boundary has no business rewriting; container_id
+			// The identity pair: image_id is runtimed's digested image
+			// reference, <repository>@<digest> (the shape of containerd's CRI
+			// image_ref: the pod's reference without its tag, at the digest it
+			// resolved to at pull; empty for a host binary), carried verbatim
+			// because this boundary has no business rewriting it; container_id
 			// is scheme-qualified here (see qualifyContainerID).
 			ImageID:      rc.GetImageId(),
 			ContainerID:  qualifyContainerID(rc.GetContainerId()),
