@@ -33,8 +33,12 @@
 #           uncached), each listed at app:v1's digest
 #   ois.7   untag: `k3sm image untag` of app:second removes that tag and leaves app:v1
 #           at its digest; untagging native:v1 leaves its manifest untagged for ois.8
-#   ois.8   prune: the dry run (`-o json`) lists the aged untagged manifest
-#           ($K3SM_OIS_PRUNE_AGED) for deletion, keeps the just-untagged native
+#   ois.8   prune: the run first makes its own aged seed (a native pod pushes a
+#           one-layer image whose content carries the run id to <run>-pods/aged:v1,
+#           the server untags it, and its manifest blob in the registry root is
+#           backdated two hours as root, past the one-hour prune grace), and
+#           confirms the seed is still there; then the dry run (`-o json`) lists
+#           that aged untagged manifest for deletion, keeps the just-untagged native
 #           manifest as younger than the grace period, and names no tagged digest;
 #           `--force` deletes the aged manifest (inspect by digest then fails), keeps
 #           the young one (inspect still answers) and reports no failed deletion;
@@ -56,11 +60,14 @@
 #     image with the PREVIOUS release (`k3sm build -t ois-premig:v1 .` or
 #     `sudo k3sm image load <tar>`), so it lives only in that node's store. After the
 #     upgrade the node store is a pull cache and no verb can put a user image there.
-#   - $K3SM_OIS_PRUNE_AGED: AT LEAST AN HOUR before the run (prune keeps untagged
-#     manifests younger than an hour), on the server: build any image as
-#     registry-k3sm:6450/ois-aged/x:v1, note its digest from `k3sm image ls -o json`,
-#     then `sudo k3sm image untag registry-k3sm:6450/ois-aged/x:v1`. Pass
-#     `ois-aged/x@sha256:<digest>`.
+#   The aged prune seed is NOT seeded by the driver: ois.8 makes it inside the run.
+#   The cluster registry runs its own garbage collection (zot: gc on, gcDelay 1h,
+#   gcInterval 6h; pkg/registrysvc/config.go), which deletes untagged manifests older
+#   than an hour on its own sweeps, so a seed untagged an hour before the run is
+#   usually gone by ois.8. `k3sm image prune` judges age by the manifest blob's
+#   mtime (pkg/registrysvc/prune.go, PruneGrace one hour), so backdating that blob
+#   right before the dry run gives prune an aged manifest zot has not swept. If the
+#   seed is absent anyway, ois.8 fails naming the registry's garbage collection.
 #
 # Pods follow the lab rules: nodeName AND the darwin nodeSelector; tolerations are
 # k3sm.io/provider plus only the keys in K3SM_LAB_TOLERATE_KEYS
@@ -74,7 +81,6 @@
 #   K3SM_OIS_SERVER_SSH        ssh destination of the server Mac (`local` runs here)
 #   K3SM_OIS_WORKER_SSH        ssh destination of the worker Mac (`local` runs here)
 #   K3SM_OIS_PREMIGRATE_REF    the node-store reference seeded before the upgrade
-#   K3SM_OIS_PRUNE_AGED        <repository>@sha256:<hex>, untagged over an hour ago
 # Optional:
 #   K3SM_OIS_PREMIGRATE_NODE   the node the migration seed lives on (default: worker)
 #   K3SM_OIS_VM_NODE           the node the vm pusher runs on (default: worker)
@@ -105,7 +111,11 @@ MODE="lab"
 REG="registry-k3sm:6450"
 VM_IMAGE="${K3SM_OIS_VM_IMAGE:-docker.io/curlimages/curl:8.10.1}"
 SERVER_PLIST="${K3SM_OIS_SERVER_PLIST:-/Library/LaunchDaemons/io.k3sm.server.plist}"
-REQUIRED_ENV="KUBECONFIG K3SM_OIS_SERVER_NODE K3SM_OIS_WORKER_NODE K3SM_OIS_SERVER_SSH K3SM_OIS_WORKER_SSH K3SM_OIS_PREMIGRATE_REF K3SM_OIS_PRUNE_AGED"
+# REGISTRY_ROOT is the registry's storage root as `sudo -n k3sm image prune` reads it:
+# registrysvc.StateDir(<work-dir>) = <work-dir>/registry, and a root k3sm resolves
+# its work dir to executor.DefaultWorkDir (/var/lib/k3sm/server).
+REGISTRY_ROOT="/var/lib/k3sm/server/registry"
+REQUIRED_ENV="KUBECONFIG K3SM_OIS_SERVER_NODE K3SM_OIS_WORKER_NODE K3SM_OIS_SERVER_SSH K3SM_OIS_WORKER_SSH K3SM_OIS_PREMIGRATE_REF"
 
 # The leg table: `name|statement`. --plan prints it, the run reports against it, and
 # --self-test checks every name is unique and run.
@@ -170,16 +180,15 @@ else:
 # ojson <op> [args...] < document
 ojson() { python3 -c "$OIS_PY" "$@"; }
 
-# aged_parts <repository@sha256:hex>: "<repository> <digest>"; fails on any other shape.
-aged_parts() {
-	local v="$1" repo dg
-	case "$v" in *@sha256:*) ;; *) return 1 ;; esac
-	repo="${v%@*}"
-	dg="${v#*@}"
-	[ -n "$repo" ] || return 1
-	case "$repo" in */* | [a-z0-9]*) ;; *) return 1 ;; esac
+# manifest_blob <registry-root> <repository> <sha256:hex>: the path zot stores the
+# manifest blob at (<root>/<repository>/blobs/sha256/<hex>, as prune.go's blobPath);
+# fails on a digest of any other shape.
+manifest_blob() {
+	local root="$1" repo="$2" dg="$3"
 	[[ "$dg" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
-	echo "$repo $dg"
+	[ -n "$repo" ] && [ -n "$root" ] || return 1
+	case "$repo" in /* | *..*) return 1 ;; esac
+	echo "$root/$repo/blobs/sha256/${dg#sha256:}"
 }
 
 # probe_field <log> <key>: the last value a pod reported for key (`OIS key=value`).
@@ -373,7 +382,7 @@ plan() {
 		printf '  %-7s %s\n' "${row%%|*}" "${row#*|}"
 	done
 	echo "required under K3SM_LAB=1: $REQUIRED_ENV"
-	echo "seeding: K3SM_OIS_PREMIGRATE_REF before the upgrade, K3SM_OIS_PRUNE_AGED an hour before the run (see the header)"
+	echo "seeding: K3SM_OIS_PREMIGRATE_REF before the upgrade; ois.8 makes its own aged prune seed in the run (see the header)"
 	echo "exit: 0 every leg held, 1 a leg failed, 2 not run (K3SM_LAB unset: SKIP; a bad argument; a refused precondition)"
 }
 
@@ -410,9 +419,9 @@ self_test() {
 	check "$([ -z "$(printf '%s' "$t" | ojson ls-digest registry-k3sm:6450/r/app:v2)" ] && echo ok)" "ls-digest: an absent reference is empty"
 	check "$([ "$(printf '%s' "$t" | ojson ls-cached registry-k3sm:6450/r/app:v1)" = "a b" ] && echo ok)" "ls-cached: the nodes"
 	check "$([ "$(printf '%s' "$t" | ojson ls-incomplete)" = c ] && echo ok)" "ls-incomplete: the capped nodes"
-	t='{"dryRun":true,"registry":{"name":"registry-k3sm:6450","manifests":[{"repository":"ois-aged/x","digest":"sha256:01"}],"kept":[{"repository":"r-pods/native","digest":"sha256:02","reason":"younger than the grace period"}],"failed":[{"repository":"q","digest":"sha256:03","error":"e"}]},"cache":{"blobs":[],"reclaimedBytes":0}}'
+	t='{"dryRun":true,"registry":{"name":"registry-k3sm:6450","manifests":[{"repository":"r-pods/aged","digest":"sha256:01"}],"kept":[{"repository":"r-pods/native","digest":"sha256:02","reason":"younger than the grace period"}],"failed":[{"repository":"q","digest":"sha256:03","error":"e"}]},"cache":{"blobs":[],"reclaimedBytes":0}}'
 	check "$([ "$(printf '%s' "$t" | ojson prune-dry)" = true ] && echo ok)" "prune-dry"
-	check "$([ "$(printf '%s' "$t" | ojson prune-in manifests ois-aged/x sha256:01)" = listed ] && echo ok)" "prune-in: a manifest to delete"
+	check "$([ "$(printf '%s' "$t" | ojson prune-in manifests r-pods/aged sha256:01)" = listed ] && echo ok)" "prune-in: a manifest to delete"
 	check "$([ "$(printf '%s' "$t" | ojson prune-in kept r-pods/native sha256:02)" = "younger than the grace period" ] && echo ok)" "prune-in: a kept manifest's reason"
 	check "$([ -z "$(printf '%s' "$t" | ojson prune-in manifests r-pods/native sha256:02)" ] && echo ok)" "prune-in: kept is not listed for deletion"
 	check "$([ "$(printf '%s' "$t" | ojson prune-digests)" = "sha256:01 sha256:02" ] && echo ok)" "prune-digests: every planned digest"
@@ -422,10 +431,12 @@ self_test() {
 	check "$([ "$(printf '%s' "$t" | ojson mig-record ois-premig:v1)" = "$(printf 'migrated\tregistry-k3sm:6450/ois-premig:v1\tsha256:0a\tsha256:0b,sha256:0a')" ] && echo ok)" "mig-record: matched by its trailing reference"
 	check "$([ -z "$(printf '%s' "$t" | ojson mig-record other:v1)" ] && echo ok)" "mig-record: an absent reference is empty"
 	t="$(printf 'sha256:%064d' 0)"
-	check "$([ "$(aged_parts "ois-aged/x@$t")" = "ois-aged/x $t" ] && echo ok)" "aged_parts: repository@digest"
-	check "$(if aged_parts ois-aged/x:v1 >/dev/null; then echo no; else echo ok; fi)" "aged_parts: a tag is refused"
-	check "$(if aged_parts "@$t" >/dev/null; then echo no; else echo ok; fi)" "aged_parts: no repository is refused"
-	check "$(if aged_parts "x@sha256:abc" >/dev/null; then echo no; else echo ok; fi)" "aged_parts: a short digest is refused"
+	check "$([ "$(manifest_blob /r ois-1-pods/aged "$t")" = "/r/ois-1-pods/aged/blobs/sha256/${t#sha256:}" ] && echo ok)" "manifest_blob: <root>/<repository>/blobs/sha256/<hex>"
+	check "$(if manifest_blob /r x "sha256:abc" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: a short digest is refused"
+	check "$(if manifest_blob /r ../x "$t" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: a repository escaping the root is refused"
+	check "$(if manifest_blob /r "" "$t" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: no repository is refused"
+	case "$src" in *K3SM_OIS_PRUNE""_AGED*) check no "no operator-made aged seed is read" ;; *) check ok "no operator-made aged seed is read" ;; esac
+	case "$src" in *$'leg_prune() {\n'*'seed_aged || return 1'*'ojson prune-dry'*) check ok "ois.8 makes its aged seed before the dry run" ;; *) check no "ois.8 makes its aged seed before the dry run" ;; esac
 	t=$'OIS begin\nOIS manifest_status=401\nOIS manifest_status=201\nOIS end'
 	check "$([ "$(probe_field "$t" manifest_status)" = 201 ] && echo ok)" "probe_field: the last report wins"
 	t=$'k3sm.io/provider:NoSchedule\nexample.io/estate-off:NoExecute\nexample.io/soft:PreferNoSchedule'
@@ -478,19 +489,14 @@ self_test() {
 	out="$(env -i "$t" HOME="$tmp" K3SM_LAB=1 /bin/bash "$SELF" a b 2>&1)" && code=0 || code=$?
 	check "$([ "$code" = 2 ] && echo ok)" "two positional arguments: exit 2 (got $code)"
 	out="$(env -i "$t" HOME="$tmp" K3SM_LAB=1 /bin/bash "$SELF" "$tmp/evidence" 2>&1)" && code=0 || code=$?
-	case "$out" in *"K3SM_OIS_SERVER_NODE"*"K3SM_OIS_PRUNE_AGED"*) ;; *) code=97 ;; esac
+	case "$out" in *"K3SM_OIS_SERVER_NODE"*"K3SM_OIS_PREMIGRATE_REF"*) ;; *) code=97 ;; esac
 	check "$([ "$code" = 2 ] && [ ! -e "$tmp/evidence" ] && echo ok)" "K3SM_LAB=1, required variables unset: refused, exit 2, names them, no evidence dir (got $code)"
-	out="$(env -i "$t" HOME="$tmp" K3SM_LAB=1 KUBECONFIG=/nonexistent K3SM_OIS_SERVER_NODE=a K3SM_OIS_WORKER_NODE=b \
-		K3SM_OIS_SERVER_SSH=local K3SM_OIS_WORKER_SSH=local K3SM_OIS_PREMIGRATE_REF=x:v1 K3SM_OIS_PRUNE_AGED=x:v1 \
-		/bin/bash "$SELF" "$tmp/evidence" 2>&1)" && code=0 || code=$?
-	case "$out" in *K3SM_OIS_PRUNE_AGED*) ;; *) code=96 ;; esac
-	check "$([ "$code" = 2 ] && [ ! -e "$tmp/evidence" ] && echo ok)" "a malformed K3SM_OIS_PRUNE_AGED: refused, exit 2 (got $code)"
 	out="$(env -i "$t" HOME="$tmp" K3SM_LAB=1 KUBECONFIG=/nonexistent K3SM_OIS_SERVER_NODE=a K3SM_OIS_WORKER_NODE=a \
-		K3SM_OIS_SERVER_SSH=local K3SM_OIS_WORKER_SSH=local K3SM_OIS_PREMIGRATE_REF=x:v1 K3SM_OIS_PRUNE_AGED="x@$(printf 'sha256:%064d' 0)" \
+		K3SM_OIS_SERVER_SSH=local K3SM_OIS_WORKER_SSH=local K3SM_OIS_PREMIGRATE_REF=x:v1 \
 		/bin/bash "$SELF" "$tmp/evidence" 2>&1)" && code=0 || code=$?
 	check "$([ "$code" = 2 ] && echo ok)" "the same node as server and worker: refused, exit 2 (got $code)"
 	out="$(env -i "$t" HOME="$tmp" K3SM_LAB=1 KUBECONFIG=/nonexistent K3SM_OIS_SERVER_NODE=a K3SM_OIS_WORKER_NODE=b \
-		K3SM_OIS_SERVER_SSH=local K3SM_OIS_WORKER_SSH=local K3SM_OIS_PREMIGRATE_REF=x:v1 K3SM_OIS_PRUNE_AGED="x@$(printf 'sha256:%064d' 0)" \
+		K3SM_OIS_SERVER_SSH=local K3SM_OIS_WORKER_SSH=local K3SM_OIS_PREMIGRATE_REF=x:v1 \
 		/bin/bash "$SELF" "$tmp/evidence" 2>&1)" && code=0 || code=$?
 	check "$([ "$code" = 2 ] && [ ! -e "$tmp/evidence" ] && echo ok)" "the cluster not serving: refused, exit 2, no evidence dir (got $code)"
 	if grep -Eq '(^| )(apply|create|delete|label|patch|launchctl|build|push|untag|tag|prune|migrate)( |$)' "$tmp/calls.log" 2>/dev/null; then
@@ -540,8 +546,6 @@ for v in $REQUIRED_ENV; do
 	[ -n "${!v:-}" ] || missing="$missing $v"
 done
 [ -z "$missing" ] || refuse "required variable(s) unset:$missing (see the header of $SELF)"
-read -r AGED_REPO AGED_DIGEST <<<"$(aged_parts "$K3SM_OIS_PRUNE_AGED" || true)"
-[ -n "${AGED_DIGEST:-}" ] || refuse "K3SM_OIS_PRUNE_AGED must be <repository>@sha256:<64 hex> (got '$K3SM_OIS_PRUNE_AGED')"
 SERVER="$K3SM_OIS_SERVER_NODE"
 WORKER="$K3SM_OIS_WORKER_NODE"
 [ "$SERVER" != "$WORKER" ] || refuse "K3SM_OIS_SERVER_NODE and K3SM_OIS_WORKER_NODE name the same node ($SERVER)"
@@ -602,6 +606,8 @@ APP_SECOND="$REG/$APP_REPO:second"
 APP_CONTROL="$REG/$APP_REPO:control"
 APP_UNCACHED="$REG/$APP_REPO:uncached"
 NATIVE_REF="$REG/$PUSH_PREFIX/native:v1"
+AGED_REPO="$PUSH_PREFIX/aged"
+AGED_REF="$REG/$AGED_REPO:v1"
 VM_REF="$REG/$PUSH_PREFIX/vm:v1"
 RUNLOG="$EVIDENCE/run.log"
 emit_run_log_header FAIL >"$RUNLOG"
@@ -910,8 +916,43 @@ leg_untag || leg_red
 leg_pass
 
 # ---- ois.8 prune -------------------------------------------------------------------------
+# seed_aged: the aged untagged manifest the prune must delete, made in the run because
+# the registry's own garbage collection (zot, gcDelay 1h) sweeps untagged manifests
+# older than an hour, so a seed made an hour ahead is usually gone. A native pod
+# pushes a one-layer image carrying the run id (unique content per run) to
+# <run>-pods/aged:v1, the server untags it, and the manifest blob's mtime, which
+# prune reads as the manifest's age, is set two hours back as root. The ref is
+# recorded for the trap like every run tag; a seed left behind is untagged and past
+# the grace, so the trap's prune deletes it.
+AGED_DIGEST=""
+seed_aged() {
+	local blob
+	push_leg ois-push-aged "$WORKER" native "$AGED_REPO" "$AGED_REF" || {
+		DETAIL="seed: the aged seed push failed: $DETAIL"
+		return 1
+	}
+	AGED_DIGEST="$(probe_field "$(cat "$EVIDENCE/ois-push-aged.log")" manifest_digest)"
+	blob="$(manifest_blob "$REGISTRY_ROOT" "$AGED_REPO" "$AGED_DIGEST")" || {
+		DETAIL="seed: the pusher reported no usable digest ('${AGED_DIGEST:-none}')"
+		return 1
+	}
+	on_server "sudo -n k3sm image untag '$AGED_REF'" >>"$EVIDENCE/ois.8-seed.txt" 2>&1 || {
+		DETAIL="seed: untag $AGED_REF failed (ois.8-seed.txt)"
+		return 1
+	}
+	# shellcheck disable=SC2016 # the date is the server's, expanded by its shell
+	on_server 'sudo -n touch -t "$(date -v-2H +%Y%m%d%H%M)" '"'$blob'"' && sudo -n ls -lT '"'$blob'" >>"$EVIDENCE/ois.8-seed.txt" 2>&1 || {
+		DETAIL="seed: could not backdate the manifest blob $blob on the server (ois.8-seed.txt)"
+		return 1
+	}
+	if ! on_server "k3sm image inspect '$REG/$AGED_REPO@$AGED_DIGEST'" >"$EVIDENCE/ois.8-inspect-seed.txt" 2>&1; then
+		DETAIL="seed: $AGED_REPO@$AGED_DIGEST is gone before the dry run; the registry's own garbage collection (zot gc) removed the untagged manifest, so prune had nothing aged to delete (ois.8-inspect-seed.txt)"
+		return 1
+	fi
+}
 leg_prune() {
 	local dry force d digests p aged_after young_after
+	seed_aged || return 1
 	dry="$(on_server 'sudo -n k3sm image prune -o json' 2>"$EVIDENCE/ois.8-dry.err" | tee "$EVIDENCE/ois.8-dry.json")" || {
 		DETAIL="the dry run failed"
 		return 1
