@@ -130,15 +130,28 @@ func reportTopKube() (status.Kube, error) {
 	euid := os.Geteuid()
 	role, _ := installedRole()
 	paths := statusPaths(statusWorkDir(euid, lookupServiceUID()))
-	kube, _, err := newStatusKube(statusKubeInputsFor(role, paths))
-	if kube == nil {
-		if user := statusUserKubeFor(role, statusAgentJoinServer, installedStatusDir()); user != nil {
-			if k, _, uerr := user(); uerr == nil {
-				kube, err = k, nil
-			}
-		}
-	}
+	kube, _, err := readVerbKube(
+		func() (status.Kube, string, error) { return newStatusKube(statusKubeInputsFor(role, paths)) },
+		statusUserKubeFor(role, statusAgentJoinServer, installedStatusDir()),
+	)
 	return kube, err
+}
+
+// readVerbKube is the apiserver client a read verb (the top view, the status
+// stream, image ls and df) uses: the role's credentials (primary, from
+// newStatusKube) and, when they give no client, the invoking account's own
+// kubeconfig context for the server a worker joined (user, from
+// statusUserKubeFor, nil on a server). When the fallback fails too, the
+// primary's error is the one returned, since it says what the role lacked.
+func readVerbKube(primary, user func() (status.Kube, string, error)) (status.Kube, string, error) {
+	kube, source, err := primary()
+	if kube != nil || user == nil {
+		return kube, source, err
+	}
+	if k, s, uerr := user(); uerr == nil && k != nil {
+		return k, s, nil
+	}
+	return kube, source, err
 }
 
 // appBundlePath is where k3sm.app is installed.
