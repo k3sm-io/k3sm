@@ -45,6 +45,10 @@ var errTagRepoint = errors.New("the tag already names another manifest")
 // The source is a tag, a repository@digest, or a bare digest, which names a
 // manifest in the new tag's repository. --platform tags the platform's child
 // of an index rather than the whole index.
+//
+// It writes as the caller: with the server's per-boot credential when this
+// account can read it, else through the push gate with a builder token minted
+// through the caller's kubeconfig, as `k3sm image push` does (registryAccess).
 func imageTag(ctx context.Context, o imageOptions, out io.Writer) error {
 	dst, err := resolveClusterImage(o.target, o.workDir)
 	if err != nil {
@@ -55,18 +59,25 @@ func imageTag(ctx context.Context, o imageOptions, out io.Writer) error {
 	}
 	var src clusterImage
 	if looksLikeDigest(o.source) {
-		src, err = clusterImageAt(dst.flat.Context().RepositoryStr(), o.source, o.workDir)
+		src, err = clusterImageAt(dst.flat.Context().RepositoryStr(), o.source)
 	} else {
 		src, err = resolveClusterImage(o.source, o.workDir)
 	}
 	if err != nil {
 		return err
 	}
-	opts, err := registryOptions(ctx, dst, o.workDir)
+	acc, err := registryWriteAccess(ctx, o.workDir)
 	if err != nil {
+		return fmt.Errorf("tag %s: %w", dst.flat, err)
+	}
+	if dst, err = acc.locate(dst); err != nil {
 		return err
 	}
-	desc, _, err := getClusterImage(src, o.platform, o.workDir, opts)
+	if src, err = acc.locate(src); err != nil {
+		return err
+	}
+	opts := acc.opts
+	desc, _, err := getClusterImage(src, o.platform, acc)
 	if err != nil {
 		return err
 	}
@@ -115,6 +126,9 @@ func imageTag(ctx context.Context, o imageOptions, out io.Writer) error {
 // It is deliberately not idempotent-by-silence: an absent tag is an error,
 // because the operator asked to remove a specific name. --digest refuses the
 // removal unless the tag still names that manifest.
+//
+// It needs the server's per-boot credential: the push gate never forwards a
+// delete, so a builder token cannot remove a tag (registryDeleteAccess).
 func imageUntag(ctx context.Context, o imageOptions, out io.Writer) error {
 	c, err := resolveClusterImage(o.source, o.workDir)
 	if err != nil {
@@ -123,10 +137,14 @@ func imageUntag(ctx context.Context, o imageOptions, out io.Writer) error {
 	if !c.isTag() {
 		return fmt.Errorf("untag %s: name the tag to remove, not a digest", o.source)
 	}
-	opts, err := registryOptions(ctx, c, o.workDir)
+	acc, err := registryDeleteAccess(ctx, o.workDir)
 	if err != nil {
+		return fmt.Errorf("untag %s: %w", c.flat, err)
+	}
+	if c, err = acc.locate(c); err != nil {
 		return err
 	}
+	opts := acc.opts
 	desc, err := remote.Head(c.remote, opts...)
 	if err != nil {
 		return registryError("untag "+c.flat.String(), err)
