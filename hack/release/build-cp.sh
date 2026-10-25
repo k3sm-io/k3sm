@@ -28,6 +28,11 @@
 #                    print the key a cached build is valid for: the tag, the
 #                    toolchain and the hash of the raise list. stage.sh keys its
 #                    lab cache on it, so a change to any of the three rebuilds
+#   --print-raises   print the raise list as "<module> <version>" lines, the
+#                    versions stage.sh requires the four binaries to link
+#   --print-raise-list-hash
+#                    print the sha256 of the raise, removal and held lists, which
+#                    stage.sh requires the stamp's raise-list-sha256 to equal
 #   --self-test      hermetic checks: the tag pin against the executor, the pin
 #                    shapes, the required build flags, no floating versions, the
 #                    digest refusal over a tiny fixture tarball, the payload
@@ -751,11 +756,13 @@ self_test() {
 	local k1 k2
 	k1="$(cache_key)"
 	k2="$(RAISES="$RAISES
-example.com/mod v1.2.3 $t0 GO-2026-0001"; cache_key)"
+example.com/mod v1.2.3 $t0 GO-2026-0001" cache_key)"
 	case "$k1" in "$KUBE_TAG-$PAYLOAD_GO_VERSION-"????????????????) ok "the cache key names the tag and the toolchain ($k1)" ;; *) bad "cache key '$k1'" ;; esac
 	if [ "$k1" != "$k2" ]; then ok "a raise list change moves the cache key"; else bad "the cache key ignores the raise list"; fi
 	if [ "$k1" != "$(PAYLOAD_GO_VERSION=go1.0.1 cache_key)" ]; then ok "a toolchain change moves the cache key"; else bad "the cache key ignores the toolchain"; fi
 	if [ "$k1" != "$(REMOVALS="" cache_key)" ]; then ok "a removal list change moves the cache key"; else bad "the cache key ignores the removal list"; fi
+	if [ "$("$self" --print-raises)" = "$(printf '%s\n' "$RAISES" | awk '{print $1, $2}')" ] && [ "$("$self" --print-raises | wc -l | tr -d ' ')" = "$(printf '%s\n' "$RAISES" | wc -l | tr -d ' ')" ]; then ok "--print-raises prints each raise as <module> <version>"; else bad "--print-raises: $("$self" --print-raises)"; fi
+	if [ "$("$self" --print-raise-list-hash)" = "$(raise_list_hash)" ] && [ "$(raise_list_hash | cut -c1-16)" = "${k1##*-}" ]; then ok "--print-raise-list-hash is the hash the cache key abbreviates"; else bad "--print-raise-list-hash: $("$self" --print-raise-list-hash)"; fi
 
 	echo "==> requires_module reads both require forms"
 	printf 'module x\n\nrequire a.example/one v1.0.0\n\nrequire (\n\tb.example/two v1.0.0 // indirect\n)\n' >"$tmp/req.mod"
@@ -870,7 +877,9 @@ case "${1:-}" in
 --print-plan) [ $# -eq 1 ] || die "--print-plan takes no arguments"; print_plan ;;
 --print-outputs) [ $# -eq 1 ] || die "--print-outputs takes no arguments"; print_outputs ;;
 --print-cache-key) [ $# -eq 1 ] || die "--print-cache-key takes no arguments"; cache_key ;;
+--print-raises) [ $# -eq 1 ] || die "--print-raises takes no arguments"; printf '%s\n' "$RAISES" | awk 'NF { print $1, $2 }' ;;
+--print-raise-list-hash) [ $# -eq 1 ] || die "--print-raise-list-hash takes no arguments"; raise_list_hash ;;
 -h | --help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' ;;
-"" | -*) die "usage: build-cp.sh <out-dir> | --print-plan | --print-outputs | --print-cache-key | --self-test" ;;
+"" | -*) die "usage: build-cp.sh <out-dir> | --print-plan | --print-outputs | --print-cache-key | --print-raises | --print-raise-list-hash | --self-test" ;;
 *) [ $# -eq 1 ] || die "usage: build-cp.sh <out-dir>"; build "$1" ;;
 esac
