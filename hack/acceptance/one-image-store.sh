@@ -23,18 +23,24 @@
 #           container's imageID carries the registry's digest
 #   ois.3   cached on both: `k3sm image ls -o json` lists both nodes in cachedOn for
 #           the reference (a node over the 50-entry status cap is reported, not failed)
-#   ois.4   push from a native pod: a pod on the worker pushes a one-layer image to
+#   ois.4   push from a native pod: the worker builds the push client image
+#           (hack/acceptance/testdata/ois-pusher, `k3sm build --tag
+#           registry-k3sm:6450/<run>/pusher:v1 .`), then a pod on the worker running
+#           that image pushes a one-layer image to
 #           registry-k3sm:6450/<run>-pods/native:v1 over HTTPS (cluster CA) with its
 #           projected k3sm-registry token, the registry answers the manifest PUT with
-#           201 and the digest the pod computed, and `image ls` lists it at that digest
+#           201 and the digest the pod computed, and `image ls` lists it at that digest.
+#           The client ships in the image because a platform binary (/usr/bin/curl)
+#           loses the path-rebase and DNS shims in a native pod
+#           (docs/user/limitations.md)
 #   ois.5   push from a vm pod: the same push from a runtimeClassName vm pod, to
 #           .../<run>-pods/vm:v1
 #   ois.6   tag: `k3sm image tag` gives app:v1 three more tags (second, control,
 #           uncached), each listed at app:v1's digest
 #   ois.7   untag: `k3sm image untag` of app:second removes that tag and leaves app:v1
 #           at its digest; untagging native:v1 leaves its manifest untagged for ois.8
-#   ois.8   prune: the run first makes its own aged seed (a native pod pushes a
-#           one-layer image whose content carries the run id to <run>-pods/aged:v1,
+#   ois.8   prune: the run first makes its own aged seed (a native pod running the
+#           ois.4 push client image pushes a one-layer image whose content carries the run id to <run>-pods/aged:v1,
 #           the server untags it, and its manifest blob in the registry root is
 #           backdated two hours as root, past the one-hour prune grace), and
 #           confirms the seed is still there; then the dry run (`-o json`) lists
@@ -71,8 +77,8 @@
 #
 # Pods follow the lab rules: nodeName AND the darwin nodeSelector; tolerations are
 # k3sm.io/provider plus only the keys in K3SM_LAB_TOLERATE_KEYS
-# (hack/lab/lib/tolerations.sh); in-pod scripts ride a ConfigMap (a native pod
-# cannot read /tmp). Events are selected by involvedObject.uid.
+# (hack/lab/lib/tolerations.sh); the vm pod's in-pod script rides a ConfigMap, and
+# the native pods' push client rides its own image. Events are selected by involvedObject.uid.
 #
 # Environment (required under K3SM_LAB=1):
 #   KUBECONFIG                 the admin kubeconfig of the running cluster
@@ -215,7 +221,8 @@ untolerated_keys() {
 
 # ---- in-pod and build-context files -------------------------------------------------
 
-# push_script: the in-pod pusher (POSIX sh, curl). It builds a one-layer image in the
+# push_script: the vm pod's in-pod pusher (POSIX sh, curl, in a Linux image). The
+# native pods run the same push from testdata/ois-pusher instead (see push_pod). It builds a one-layer image in the
 # emptyDir at /ois-work and pushes it to registry-k3sm:6450 over HTTPS, trusting the
 # service-account CA and presenting the projected k3sm-registry token as the Basic
 # password (from a netrc file, so it never sits in a process argument). It reports
@@ -283,6 +290,20 @@ ENTRYPOINT ["/bin/hello-http", "--id", "ois-app", "--addr", ":8080"]
 DOCKERFILE
 }
 
+# pusher_context <dir>: the push client image the native pods run, built by the
+# worker in ois.4: the ois-pusher fixture (darwin/arm64, built here), the same
+# client and report grammar as push_script with no platform binary in the pod.
+pusher_context() {
+	local dir="$1"
+	mkdir -p "$dir"
+	(cd "$REPO_ROOT" && env GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o "$dir/ois-pusher" ./hack/acceptance/testdata/ois-pusher) || return 1
+	cat >"$dir/Dockerfile" <<'DOCKERFILE'
+FROM scratch
+COPY ois-pusher /bin/ois-pusher
+ENTRYPOINT ["/bin/ois-pusher"]
+DOCKERFILE
+}
+
 # ---- manifests ------------------------------------------------------------------------
 
 # scripts_configmap <ns>
@@ -329,13 +350,22 @@ spec:
 EOF
 }
 
-# push_pod <ns> <name> <node> <kind native|vm> <repo> <tolerations> <run>
+# push_pod <ns> <name> <node> <kind native|vm> <repo> <tolerations> <run> [<native-image>]
+# A vm pod runs push.sh from the ConfigMap with the Linux image's curl; a native pod
+# runs the push client from its own image (pusher_context), in memory, with no
+# ConfigMap and no scratch volume.
 push_pod() {
-	local image cmd rc os arch
+	local image cmd rc os arch mounts vols
 	if [ "$4" = vm ]; then
 		image="$VM_IMAGE" cmd='["sh", "/ois/push.sh"]' rc="  runtimeClassName: vm" os=linux arch=arm64
+		mounts="    - {name: ois, mountPath: /ois}
+    - {name: work, mountPath: /ois-work}
+"
+		vols="  - {name: ois, configMap: {name: ois-scripts}}
+  - {name: work, emptyDir: {}}
+"
 	else
-		image=native cmd='["/bin/sh", "/ois/push.sh"]' rc="" os=darwin arch=arm64
+		image="$8" cmd='["/bin/ois-pusher"]' rc="" os=darwin arch=arm64 mounts="" vols=""
 	fi
 	cat <<EOF
 apiVersion: v1
@@ -359,13 +389,9 @@ $rc
     - {name: OIS_ARCH, value: "$arch"}
     - {name: OIS_RUN, value: "$7"}
     volumeMounts:
-    - {name: ois, mountPath: /ois}
-    - {name: work, mountPath: /ois-work}
-    - {name: registry-token, mountPath: /var/run/secrets/registry, readOnly: true}
+${mounts}    - {name: registry-token, mountPath: /var/run/secrets/registry, readOnly: true}
   volumes:
-  - {name: ois, configMap: {name: ois-scripts}}
-  - {name: work, emptyDir: {}}
-  - name: registry-token
+${vols}  - name: registry-token
     projected:
       sources:
       - serviceAccountToken: {audience: k3sm-registry, expirationSeconds: 600, path: token}
@@ -435,6 +461,7 @@ self_test() {
 	check "$(if manifest_blob /r x "sha256:abc" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: a short digest is refused"
 	check "$(if manifest_blob /r ../x "$t" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: a repository escaping the root is refused"
 	check "$(if manifest_blob /r "" "$t" >/dev/null; then echo no; else echo ok; fi)" "manifest_blob: no repository is refused"
+	case "$src" in *$'leg_push_native() {\n\tbuild_pusher || return 1'*) check ok "ois.4 builds the push client image before its push" ;; *) check no "ois.4 builds the push client image before its push" ;; esac
 	case "$src" in *K3SM_OIS_PRUNE""_AGED*) check no "no operator-made aged seed is read" ;; *) check ok "no operator-made aged seed is read" ;; esac
 	case "$src" in *$'leg_prune() {\n'*'seed_aged || return 1'*'ojson prune-dry'*) check ok "ois.8 makes its aged seed before the dry run" ;; *) check no "ois.8 makes its aged seed before the dry run" ;; esac
 	t=$'OIS begin\nOIS manifest_status=401\nOIS manifest_status=201\nOIS end'
@@ -445,7 +472,7 @@ self_test() {
 
 	tol="$(K3SM_LAB_TOLERATE_KEYS="" lab_tolerations_yaml "")"
 	for m in "$(app_pod ns-x ois-app-a node-a "$REG/r/app:v1" Always "$tol")" \
-		"$(push_pod ns-x ois-push-native node-a native r-pods/native "$tol" r)" \
+		"$(push_pod ns-x ois-push-native node-a native r-pods/native "$tol" r "$REG/r/pusher:v1")" \
 		"$(push_pod ns-x ois-push-vm node-b vm r-pods/vm "$tol" r)"; do
 		name="$(printf '%s\n' "$m" | sed -n 's/^metadata: {name: \([^,]*\),.*/\1/p')"
 		case "$m" in *"nodeName: node-"*) check ok "$name: nodeName" ;; *) check no "$name: nodeName" ;; esac
@@ -458,8 +485,11 @@ self_test() {
 	m="$(push_pod ns-x ois-push-vm node-b vm r-pods/vm "$tol" r)"
 	case "$m" in *"runtimeClassName: vm"*"image: $VM_IMAGE"*'command: ["sh", "/ois/push.sh"]'*) check ok "vm pusher: runtimeClassName vm, the Linux image, the ConfigMap script" ;; *) check no "vm pusher: runtimeClassName vm, the Linux image, the ConfigMap script" ;; esac
 	case "$m" in *"audience: k3sm-registry"*"path: token"*) check ok "pusher: a projected k3sm-registry token" ;; *) check no "pusher: a projected k3sm-registry token" ;; esac
-	m="$(push_pod ns-x ois-push-native node-a native r-pods/native "$tol" r)"
-	case "$m" in *runtimeClassName*) check no "native pusher: no runtimeClassName" ;; *'command: ["/bin/sh", "/ois/push.sh"]'*"configMap: {name: ois-scripts}"*) check ok "native pusher: the script by ConfigMap" ;; *) check no "native pusher: the script by ConfigMap" ;; esac
+	case "$m" in *'mountPath: /ois}'*'mountPath: /ois-work}'*"configMap: {name: ois-scripts}"*"emptyDir: {}"*) check ok "vm pusher: the ConfigMap and the scratch volume" ;; *) check no "vm pusher: the ConfigMap and the scratch volume" ;; esac
+	m="$(push_pod ns-x ois-push-native node-a native r-pods/native "$tol" r "$REG/r/pusher:v1")"
+	case "$m" in *runtimeClassName*) check no "native pusher: no runtimeClassName" ;; *"image: $REG/r/pusher:v1"*'command: ["/bin/ois-pusher"]'*) check ok "native pusher: the client from its own image" ;; *) check no "native pusher: the client from its own image" ;; esac
+	case "$m" in *push.sh* | *ois-scripts* | */ois-work* | */usr/bin/*) check no "native pusher: no ConfigMap script, scratch mount or platform binary" ;; *) check ok "native pusher: no ConfigMap script, scratch mount or platform binary" ;; esac
+	case "$m" in *"mountPath: /var/run/secrets/registry"*"audience: k3sm-registry"*"path: token"*) check ok "native pusher: a projected k3sm-registry token" ;; *) check no "native pusher: a projected k3sm-registry token" ;; esac
 	m="$(scripts_configmap ns-x)"
 	case "$m" in *"  push.sh: |"*"    emit end"*) check ok "ConfigMap: the pusher, indented" ;; *) check no "ConfigMap: the pusher, indented" ;; esac
 	m="$(push_rbac ns-x r-pods)"
@@ -609,6 +639,7 @@ NATIVE_REF="$REG/$PUSH_PREFIX/native:v1"
 AGED_REPO="$PUSH_PREFIX/aged"
 AGED_REF="$REG/$AGED_REPO:v1"
 VM_REF="$REG/$PUSH_PREFIX/vm:v1"
+PUSHER_REF="$REG/$RUN/pusher:v1"
 RUNLOG="$EVIDENCE/run.log"
 emit_run_log_header FAIL >"$RUNLOG"
 log() { printf '%s\n' "$*" | tee -a "$RUNLOG"; }
@@ -844,7 +875,7 @@ leg_pass
 # push_leg <pod> <node> <native|vm> <repository> <reference>
 push_leg() {
 	local pod="$1" node="$2" kind="$3" repo="$4" ref="$5" phase logs status mine theirs listed err
-	push_pod "$NS" "$pod" "$node" "$kind" "$repo" "$TOLERATIONS" "$RUN" >"$EVIDENCE/$pod.yaml"
+	push_pod "$NS" "$pod" "$node" "$kind" "$repo" "$TOLERATIONS" "$RUN" "$PUSHER_REF" >"$EVIDENCE/$pod.yaml"
 	note_tag "$ref"
 	kc apply -f "$EVIDENCE/$pod.yaml" >/dev/null || return 1
 	phase="$(wait_done "$pod" 300 || true)"
@@ -858,8 +889,36 @@ push_leg() {
 	DETAIL="$kind pod on $node: phase $phase, manifest PUT ${status:-none}, pod digest ${mine:-none}, registry ${theirs:-none}, image ls ${listed:-absent}${err:+, error $err}"
 	[ "$phase" = Succeeded ] && [ "$status" = 201 ] && [ -n "$mine" ] && [ "$mine" = "$theirs" ] && [ "$listed" = "$mine" ]
 }
+# build_pusher: the worker builds the push client image the native pods run, from a
+# context made here and copied beside ois.1's, as the worker's user (like ois.1).
+build_pusher() {
+	local got
+	pusher_context "$LOCAL_DIR/pusher" || {
+		DETAIL="could not build the ois-pusher fixture here"
+		return 1
+	}
+	if [ "$K3SM_OIS_WORKER_SSH" = local ]; then
+		cp -R "$LOCAL_DIR/pusher" "$REMOTE_DIR/" || return 1
+	else
+		scp -q -r "$LOCAL_DIR/pusher" "$K3SM_OIS_WORKER_SSH:$REMOTE_DIR/" || {
+			DETAIL="could not copy the push client context to the worker"
+			return 1
+		}
+	fi
+	note_tag "$PUSHER_REF"
+	if ! on_worker "cd '$REMOTE_DIR/pusher' && k3sm build --tag '$PUSHER_REF' ." >"$EVIDENCE/ois.4-build-pusher.txt" 2>&1; then
+		DETAIL="k3sm build of the push client on the worker failed (ois.4-build-pusher.txt)"
+		return 1
+	fi
+	got="$(image_ls ois.4-pusher-image-ls | ojson ls-digest "$PUSHER_REF" || true)"
+	[[ "$got" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+		DETAIL="image ls does not list $PUSHER_REF with a digest (got '${got:-none}')"
+		return 1
+	}
+}
 NATIVE_DIGEST=""
 leg_push_native() {
+	build_pusher || return 1
 	push_leg ois-push-native "$WORKER" native "$PUSH_PREFIX/native" "$NATIVE_REF" || return 1
 	NATIVE_DIGEST="$(probe_field "$(cat "$EVIDENCE/ois-push-native.log")" manifest_digest)"
 }
