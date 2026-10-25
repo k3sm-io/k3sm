@@ -933,3 +933,55 @@ func TestUpdateApplyPinRequiresRoot(t *testing.T) {
 		}
 	})
 }
+
+// TestUpdateNotRecordedWording pins what a check that could not write its
+// record says: a permission error (an account that may not write the status
+// directory) names the cause and the sudo remedy without the temporary file's
+// path; any other error keeps its own text.
+func TestUpdateNotRecordedWording(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+	wd := installedWorkDir(t)
+	if err := os.Chmod(status.Dir(wd), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(status.Dir(wd), 0o755) })
+	err := writeUpdateRecord(wd, status.UpdateRecord{CheckedAt: time.Now()})
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("err = %v, want a permission error", err)
+	}
+	const want = "k3sm update: not recorded for `k3sm status`: writing the record needs root; run with sudo to record it"
+	if got := updateNotRecorded(err); got != want {
+		t.Errorf("permission error says %q, want %q", got, want)
+	}
+	other := updateNotRecorded(errNoStatusDir)
+	if !strings.Contains(other, "(no status directory)") || strings.Contains(other, "needs root") {
+		t.Errorf("another error says %q, want its own text", other)
+	}
+}
+
+// TestRenderUpdateNamesAnUntaggedBuild pins the check's text: an installed
+// binary or node built from an untagged commit keeps its state word and says
+// it is an untagged build; a tagged one and a dirty one say only the word.
+func TestRenderUpdateNamesAnUntaggedBuild(t *testing.T) {
+	const pseudo = "v0.1.8-0.20261025152241-96fbff948562"
+	node := version.Info{KubeVersion: "v1.37.1", Version: pseudo}.NodeVersion()
+	tagged := version.Info{KubeVersion: "v1.37.1", Version: "v0.1.7"}.NodeVersion()
+	rep := update.Report{Latest: update.Release{Tag: "v0.1.7"}, Installed: pseudo, InstalledState: status.UpdateAhead,
+		Nodes: []update.Node{{Name: "a", Version: node, State: status.UpdateAhead}, {Name: "b", Version: tagged, State: status.UpdateCurrent}}}
+	var b bytes.Buffer
+	renderUpdate(&b, rep)
+	out := b.String()
+	for _, want := range []string{"installed   " + pseudo + " (ahead, untagged build of 0.1.8)", node + "   ahead, untagged build of 0.1.8", " current\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q:\n%s", want, out)
+		}
+	}
+	rep = update.Report{Latest: update.Release{Tag: "v0.1.7"}, Installed: pseudo + "+dirty", InstalledDirty: true, InstalledState: status.UpdateUnknown}
+	b.Reset()
+	renderUpdate(&b, rep)
+	if !strings.Contains(b.String(), "(unknown)\n") {
+		t.Errorf("a dirty build is not plainly unknown:\n%s", b.String())
+	}
+}
