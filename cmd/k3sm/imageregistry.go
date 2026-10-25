@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
@@ -28,6 +29,9 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/darwin-net/pkg/tcpseg"
+
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // errNotInRegistry reports that the cluster registry holds no manifest under
@@ -36,8 +40,9 @@ var errNotInRegistry = errors.New("not in the cluster registry")
 
 // clusterImage is one name in the cluster registry, spelled twice: flat is the
 // registry-k3sm:6450 name a Pod spec uses and the output prints, and remote is
-// the loopback spelling this Mac reaches the same registry at, the only one the
-// push credential is presented to.
+// the spelling this run reaches the same registry at (registryAccess.locate),
+// the only one a credential is presented to. A parsed name has no remote until
+// it is located.
 type clusterImage struct {
 	flat   name.Reference
 	remote name.Reference
@@ -64,29 +69,25 @@ func resolveClusterImage(source, workDir string) (clusterImage, error) {
 	if !isClusterRegistryHost(reg, workDir) {
 		return clusterImage{}, fmt.Errorf("%q: %w (%s); these verbs act on the cluster registry, so name it as %s/%s", source, errForeignTag, reg, flatRegistryHost, probe.Context().RepositoryStr())
 	}
-	return clusterImageAt(probe.Context().RepositoryStr(), probe.Identifier(), workDir)
+	return clusterImageAt(probe.Context().RepositoryStr(), probe.Identifier())
 }
 
 // clusterImageAt is the cluster image repository:identifier, where identifier
 // is a tag or a digest.
-func clusterImageAt(repository, identifier, workDir string) (clusterImage, error) {
-	sep := ":"
+func clusterImageAt(repository, identifier string) (clusterImage, error) {
+	flat, err := name.ParseReference(flatRegistryHost + "/" + repository + identifierSep(identifier) + identifier)
+	if err != nil {
+		return clusterImage{}, fmt.Errorf("reference %s/%s%s%s: %w", flatRegistryHost, repository, identifierSep(identifier), identifier, err)
+	}
+	return clusterImage{flat: flat}, nil
+}
+
+// identifierSep is the separator a reference puts before identifier.
+func identifierSep(identifier string) string {
 	if looksLikeDigest(identifier) {
-		sep = "@"
+		return "@"
 	}
-	flat, err := name.ParseReference(flatRegistryHost + "/" + repository + sep + identifier)
-	if err != nil {
-		return clusterImage{}, fmt.Errorf("reference %s/%s%s%s: %w", flatRegistryHost, repository, sep, identifier, err)
-	}
-	authority, err := nodeRegistryAuthority(workDir)
-	if err != nil {
-		return clusterImage{}, err
-	}
-	rem, err := name.ParseReference(authority + "/" + repository + sep + identifier)
-	if err != nil {
-		return clusterImage{}, fmt.Errorf("reference %s/%s%s%s: %w", authority, repository, sep, identifier, err)
-	}
-	return clusterImage{flat: flat, remote: rem}, nil
+	return ":"
 }
 
 // isTag reports whether the image is named by a tag rather than a digest.
@@ -95,21 +96,128 @@ func (c clusterImage) isTag() bool {
 	return ok
 }
 
-// registryOptions are the options every cluster-registry call carries: the
-// deadline, and this node's push credential, resolved through the same chain
-// `k3sm image push` uses.
-func registryOptions(ctx context.Context, c clusterImage, workDir string) ([]remote.Option, error) {
-	auth, err := registryAuth(c.remote, workDir)
+// registryAccess is how one run of a cluster-registry verb reaches the
+// registry: the authority its names are spelled under, and the options every
+// call carries. Three ways, chosen by what the verb does and what this account
+// can read:
+//
+//   - the per-boot push credential, when this account can read it (root, or a
+//     --work-dir naming a control plane it runs as): the registry's own
+//     loopback listener, as before the push gate existed;
+//   - for a write without it, the push gate with a builder token minted
+//     through the account's kubeconfig, exactly as `k3sm image push` and
+//     `k3sm build --push` write;
+//   - for a read without it, the registry's loopback listener anonymously at
+//     the port the server's published record names, because reads of the
+//     cluster registry are anonymous everywhere.
+type registryAccess struct {
+	authority string
+	opts      []remote.Option
+}
+
+// locate spells c's repository and identifier under a's authority.
+func (a registryAccess) locate(c clusterImage) (clusterImage, error) {
+	repo := c.flat.Context().RepositoryStr() + identifierSep(c.flat.Identifier()) + c.flat.Identifier()
+	rem, err := name.ParseReference(a.authority + "/" + repo)
 	if err != nil {
-		return nil, err
+		return clusterImage{}, fmt.Errorf("reference %s/%s: %w", a.authority, repo, err)
 	}
-	return []remote.Option{remote.WithContext(ctx), remote.WithAuth(auth)}, nil
+	return clusterImage{flat: c.flat, remote: rem}, nil
+}
+
+// credentialAccess is the per-boot push credential's access, when this account
+// can read the credential under workDir. ok is false when it cannot, for any
+// reason (none was minted there, or the file is another account's 0600 one),
+// which is the caller's cue to use the account's own identity.
+func credentialAccess(ctx context.Context, workDir string) (acc registryAccess, ok bool, err error) {
+	if workDir == "" {
+		return registryAccess{}, false, nil
+	}
+	if _, err := registrysvc.ReadCredential(workDir); err != nil {
+		return registryAccess{}, false, nil
+	}
+	authority, err := nodeRegistryAuthority(workDir)
+	if err != nil {
+		return registryAccess{}, true, err
+	}
+	// registryAuth keys on the registry alone; the repository and tag only
+	// make the name a reference.
+	probe, err := name.NewTag(authority + "/k3sm:access")
+	if err != nil {
+		return registryAccess{}, true, fmt.Errorf("reference %s: %w", authority, err)
+	}
+	auth, err := registryAuth(probe, workDir)
+	if err != nil {
+		return registryAccess{}, true, err
+	}
+	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithAuth(auth)}}, true, nil
+}
+
+// registryReadAccess is how a read (inspect, save, and tag's reads) reaches the
+// cluster registry: with the push credential when it is readable, else
+// anonymously at the registry's loopback listener on this server. A Mac whose
+// server serves no registry here is told where the read runs.
+func registryReadAccess(ctx context.Context, workDir string) (registryAccess, error) {
+	if acc, ok, err := credentialAccess(ctx, workDir); ok {
+		return acc, err
+	}
+	port := localRegistryPort(workDir)
+	authority := registrysvc.LoopbackAuthority(port)
+	if authority == "" {
+		return registryAccess{}, fmt.Errorf("%w: this Mac serves no cluster registry (no serving registry record under %s or %s); run this on the server, whose registry it reads anonymously", errNoNodeRegistry, workDir, installedServerWorkDir)
+	}
+	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithTransport(loopbackReadTransport())}}, nil
+}
+
+// loopbackReadTransport is the transport of an anonymous read at the
+// registry's loopback listener: segment-clamped like every dial this CLI makes
+// toward the registry (the push gate's included), and dialed through gateDial
+// when a test serves the registry in process.
+func loopbackReadTransport() http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&tcpseg.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	if gateDial != nil {
+		t.DialContext = gateDial
+	}
+	return t
+}
+
+// registryWriteAccess is how a write (tag) reaches the cluster registry: with
+// the push credential when it is readable, else through the push gate with a
+// builder token minted through the account's kubeconfig, the identity every
+// push already writes with. A failure to mint one carries its own remedy
+// (builderTokenRemedy, or the RoleBinding an admin grants).
+func registryWriteAccess(ctx context.Context, workDir string) (registryAccess, error) {
+	if acc, ok, err := credentialAccess(ctx, workDir); ok {
+		return acc, err
+	}
+	cr, err := resolveClusterRegistry(ctx, workDir)
+	if err != nil {
+		return registryAccess{}, err
+	}
+	opts, err := cr.options(ctx)
+	if err != nil {
+		return registryAccess{}, err
+	}
+	return registryAccess{authority: cr.authority, opts: opts}, nil
+}
+
+// registryDeleteAccess is how untag reaches the cluster registry: only with the
+// push credential. The push gate never forwards a delete, so no builder token
+// removes a tag, and without the credential this names the root run that has
+// it rather than sending a request the gate refuses.
+func registryDeleteAccess(ctx context.Context, workDir string) (registryAccess, error) {
+	if acc, ok, err := credentialAccess(ctx, workDir); ok {
+		return acc, err
+	}
+	return registryAccess{}, fmt.Errorf("%w: untag deletes, and the push gate a builder token writes through never forwards a delete, so untag needs the server's per-boot credential, which this account cannot read at %s; run it on the server as root: sudo k3sm image --work-dir %s untag <name>",
+		errNoNodeRegistry, registrysvc.CredentialPath(workDir), installedServerWorkDir)
 }
 
 // getClusterImage fetches the manifest c names, and when platform is set and
 // the manifest is an index, the child for that platform.
-func getClusterImage(c clusterImage, platform *runtimev1.Platform, workDir string, opts []remote.Option) (*remote.Descriptor, *remote.Descriptor, error) {
-	desc, err := remote.Get(c.remote, opts...)
+func getClusterImage(c clusterImage, platform *runtimev1.Platform, acc registryAccess) (*remote.Descriptor, *remote.Descriptor, error) {
+	desc, err := remote.Get(c.remote, acc.opts...)
 	if err != nil {
 		return nil, nil, registryError("read "+c.flat.String(), err)
 	}
@@ -133,11 +241,14 @@ func getClusterImage(c clusterImage, platform *runtimev1.Platform, workDir strin
 		if !platformMatches(child.Platform, platform) {
 			continue
 		}
-		at, err := clusterImageAt(c.flat.Context().RepositoryStr(), child.Digest.String(), workDir)
+		at, err := clusterImageAt(c.flat.Context().RepositoryStr(), child.Digest.String())
 		if err != nil {
 			return nil, nil, err
 		}
-		cd, err := remote.Get(at.remote, opts...)
+		if at, err = acc.locate(at); err != nil {
+			return nil, nil, err
+		}
+		cd, err := remote.Get(at.remote, acc.opts...)
 		if err != nil {
 			return nil, nil, registryError("read "+at.flat.String(), err)
 		}
@@ -216,7 +327,7 @@ func registryError(what string, err error) error {
 	if errors.As(err, &terr) {
 		switch terr.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
-			return fmt.Errorf("%s: %w: the cluster registry answered HTTP %d (point --work-dir at the control plane whose push credential you can read)", what, errPushAuth, terr.StatusCode)
+			return fmt.Errorf("%s: %w: the cluster registry answered HTTP %d (run as root with --work-dir naming the control plane whose push credential it reads, or check that your kubeconfig may mint a registry push token)", what, errPushAuth, terr.StatusCode)
 		}
 		return fmt.Errorf("%s: the cluster registry answered HTTP %d: %v", what, terr.StatusCode, terr)
 	}

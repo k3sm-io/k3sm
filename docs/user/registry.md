@@ -111,11 +111,12 @@ The Mac does not resolve `registry-k3sm`, and does not need to: every node maps 
 registry itself.
 From another Mac, see [Reaching It From Another Mac](#reaching-it-from-another-mac).
 
-`k3sm image tag`, `untag`, `inspect` and `save` still talk to the registry's own loopback listener,
-so they run only on the server. `tag` and `untag` write with the server's per-boot credential, and
-need an account that can read `<work-dir>/registry/push-credential.json` (mode `0600`); `untag` will
-keep doing so, because the push gate never forwards a delete. That credential is regenerated on
-every server start.
+`k3sm image tag` writes as you, through the push gate with your builder token, like a push.
+`inspect` and `save` read the registry's own loopback listener anonymously, so they run on the
+server, as any account. `untag` deletes, and the push gate never forwards a delete, so it needs the
+server's per-boot credential, `<work-dir>/registry/push-credential.json` (mode `0600`): run it on the
+server as root, `sudo k3sm image --work-dir /var/lib/k3sm/server untag <tag>`. That credential is
+regenerated on every server start. An account that can read it uses it for all four verbs.
 
 ## Pulling
 

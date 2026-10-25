@@ -86,9 +86,13 @@ save    export one image from the cluster registry as a tarred OCI image
         layout (the ` + "`docker save`" + ` analog, and what import reads back) into
         the file -o names. An index is saved whole unless --platform picks
         one. A failed save leaves no file behind.
-        tag, untag, inspect and save talk to this server's registry as you,
-        with this node's push credential (see --work-dir); they never contact
-        the daemon, and a name naming another registry is refused.
+        tag, untag, inspect and save never contact the daemon, and a name
+        naming another registry is refused. tag writes through the push gate
+        with a token minted through your kubeconfig; inspect and save read
+        this server's registry anonymously; untag deletes, which the gate
+        never forwards, so it needs the server's push credential: run it as
+        root with --work-dir /var/lib/k3sm/server. An account that can read
+        that credential (see --work-dir) uses it for all four.
 load    record a ` + "`docker save`" + ` tar in the cluster registry, the cluster's one
         image store, under registry-k3sm:6450/<repository>:<tag>, overwriting
         that tag; then pull it into this node's cache.

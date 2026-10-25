@@ -42,11 +42,14 @@ func imageInspect(ctx context.Context, o imageOptions, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	opts, err := registryOptions(ctx, c, o.workDir)
+	acc, err := registryReadAccess(ctx, o.workDir)
 	if err != nil {
 		return err
 	}
-	desc, parent, err := getClusterImage(c, o.platform, o.workDir, opts)
+	if c, err = acc.locate(c); err != nil {
+		return err
+	}
+	desc, parent, err := getClusterImage(c, o.platform, acc)
 	if err != nil {
 		return err
 	}

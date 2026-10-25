@@ -287,9 +287,19 @@ repairs it under `Next:`; the latter is a `--socket` away.
 ## Naming and Reading Images: `tag`, `untag`, `inspect`, `save`, `pull`
 
 `tag`, `untag`, `inspect` and `save` act on the cluster registry, where `build`, `load` and `import`
-record images. They talk to this server's registry as you, with its push credential (`--work-dir`
-names the control plane's state directory when it is not the one your user resolves), and never
-contact the node's runtime daemon. A name may be written bare, as `registry-k3sm:6450/...`, or as
+record images. They never contact the node's runtime daemon, and they run as you, with no `sudo`,
+except `untag`:
+
+- `inspect` and `save` read the server's registry anonymously, as every read of it is. They run on
+  the server.
+- `tag` writes as you, through the push gate with a token minted through your kubeconfig, the same
+  identity `k3sm image push` and `k3sm build --push` use, so it also runs from a worker.
+- `untag` deletes, and the push gate never forwards a delete, so it needs the server's per-boot
+  push credential: run it on the server as root, `sudo k3sm image --work-dir /var/lib/k3sm/server
+  untag <tag>`.
+
+An account that can read that credential (root, with `--work-dir` naming the control plane's state
+directory) uses it for every verb here. A name may be written bare, as `registry-k3sm:6450/...`, or as
 this node's `localhost:<port>/...`; a name that points at another registry is refused. `pull` is the
 one verb here that fills this node's cache.
 
@@ -297,7 +307,7 @@ one verb here that fills this node's cache.
 k3sm image tag myapp:v1 myapp:stable          # a second tag for the same manifest
 k3sm image inspect myapp:stable               # digest, platform, config, layer sizes
 k3sm image save myapp:stable -o myapp.tar     # export a tarred OCI layout
-k3sm image untag myapp:stable                 # remove that tag again
+sudo k3sm image --work-dir /var/lib/k3sm/server untag myapp:stable   # remove that tag again
 k3sm image pull ghcr.io/org/app:v1            # warm this node's cache ahead of a workload
 ```
 
