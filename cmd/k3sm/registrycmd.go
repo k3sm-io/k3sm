@@ -125,7 +125,7 @@ func runRegistry(args []string, stdout, stderr io.Writer) error {
 // loginAuthority is the registry address a Mac tool reaches the push gate at:
 // localhost:<gate port> on a server (the loopback gate), or the server's
 // cluster address from the flat Service's endpoint on a worker.
-func loginAuthority(ctx context.Context, workDir string, slices endpointSliceLister) (string, error) {
+func loginAuthority(ctx context.Context, workDir string, slices endpointSliceGetter) (string, error) {
 	if port := localGatePort(workDir); port > 0 {
 		return net.JoinHostPort("localhost", strconv.Itoa(port)), nil
 	}

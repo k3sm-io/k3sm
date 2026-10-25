@@ -515,3 +515,66 @@ func TestOrdinaryUserOnServerUsesLoopbackGate(t *testing.T) {
 		}
 	})
 }
+
+// TestRegistryLoginOnWorkerGetsTheRegistrySliceByName pins how a worker's
+// `k3sm registry login` finds the server: one get of the registry-k3sm
+// EndpointSlice by name, through a fake apiserver that answers exactly what the
+// k3sm:registry-builder-token Role grants (create on builder's token, get on
+// that one slice) and refuses everything else, a list included.
+func TestRegistryLoginOnWorkerGetsTheRegistrySliceByName(t *testing.T) {
+	prev := installedServerWorkDir
+	installedServerWorkDir = filepath.Join(t.TempDir(), "server")
+	t.Cleanup(func() { installedServerWorkDir = prev })
+	t.Setenv("K3SM_WORK_DIR", t.TempDir())
+
+	other := flatSlice("100.64.9.9", 6450)
+	other.Name = "registry-node-a"
+	cs := fake.NewClientset(flatSlice("100.64.0.1", 6450), other)
+	var gets []string
+	var refused []string
+	cs.PrependReactor("*", "*", func(a ktesting.Action) (bool, runtime.Object, error) {
+		gr := a.GetResource().GroupResource()
+		switch {
+		case a.GetVerb() == "create" && gr == (schema.GroupResource{Resource: "serviceaccounts"}) && a.GetSubresource() == "token" &&
+			a.GetNamespace() == "k3sm-registry" && a.(ktesting.CreateActionImpl).Name == "builder":
+			out, err := issue(a.(ktesting.CreateAction).GetObject().(*authnv1.TokenRequest).Spec)
+			return true, out, err
+		case a.GetVerb() == "get" && gr == (schema.GroupResource{Group: "discovery.k8s.io", Resource: "endpointslices"}) &&
+			a.GetNamespace() == "k3sm-registry" && a.(ktesting.GetAction).GetName() == "registry-k3sm":
+			gets = append(gets, a.(ktesting.GetAction).GetName())
+			return false, nil, nil
+		}
+		refused = append(refused, a.GetVerb()+" "+gr.String())
+		return true, nil, apierrors.NewForbidden(gr, "", errors.New("the builder token role does not grant this"))
+	})
+	fakeClusterAPI(t, cs)
+	dir := t.TempDir()
+	t.Setenv("DOCKER_CONFIG", dir)
+	if err := runRegistry([]string{"login"}, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("registry login with only the builder token role: %v (refused: %v)", err, refused)
+	}
+	if len(refused) != 0 {
+		t.Errorf("login asked for %v, which the builder token role does not grant", refused)
+	}
+	if len(gets) != 1 || gets[0] != "registry-k3sm" {
+		t.Errorf("EndpointSlice gets = %v, want exactly one get of registry-k3sm", gets)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "config.json"))
+	var doc struct {
+		Auths map[string]struct{ Auth string } `json:"auths"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse the written config: %v", err)
+	}
+	if _, ok := doc.Auths["100.64.0.1:6450"]; !ok || len(doc.Auths) != 1 {
+		t.Errorf("docker config auths = %s, want exactly the registry slice's 100.64.0.1:6450", raw)
+	}
+
+	t.Run("a missing slice says the server publishes none", func(t *testing.T) {
+		slices := fake.NewClientset(other).DiscoveryV1().EndpointSlices("k3sm-registry")
+		_, err := clusterEndpointAuthority(t.Context(), slices)
+		if !errors.Is(err, errNoNodeRegistry) || !strings.Contains(err.Error(), "registry-k3sm") {
+			t.Errorf("err = %v, want errNoNodeRegistry naming registry-k3sm", err)
+		}
+	})
+}

@@ -62,10 +62,11 @@ var defaultGatePort = registrysvc.GatePort(executor.DefaultRegistryPort)
 // pushTokenDuration is the lifetime of the builder token a push mints.
 const pushTokenDuration = defaultBuilderTokenDuration
 
-// endpointSliceLister is the slice of the API the worker path reads the flat
-// Service's endpoint through.
-type endpointSliceLister interface {
-	List(ctx context.Context, opts metav1.ListOptions) (*discoveryv1.EndpointSliceList, error)
+// endpointSliceGetter is the slice of the API the worker path reads the flat
+// Service's endpoint through: a get of the one EndpointSlice by name, which is
+// all the k3sm:registry-builder-token Role grants (it has no list).
+type endpointSliceGetter interface {
+	Get(ctx context.Context, name string, opts metav1.GetOptions) (*discoveryv1.EndpointSlice, error)
 }
 
 // clusterRegistryAPI is what the caller's kubeconfig gives the cluster-registry
@@ -73,7 +74,7 @@ type endpointSliceLister interface {
 // cluster CA the registry's certificates are verified against.
 type clusterRegistryAPI struct {
 	tokens serviceAccountTokens
-	slices endpointSliceLister
+	slices endpointSliceGetter
 	caPEM  []byte
 }
 
@@ -142,7 +143,7 @@ func clusterRegistryFrom(ctx context.Context, workDir string, api clusterRegistr
 // clusterRegistryAuthority is the address this Mac reaches the push gate at:
 // the loopback gate when this Mac's server serves one, else the flat
 // Service's endpoint.
-func clusterRegistryAuthority(ctx context.Context, workDir string, slices endpointSliceLister) (string, error) {
+func clusterRegistryAuthority(ctx context.Context, workDir string, slices endpointSliceGetter) (string, error) {
 	if port := localGatePort(workDir); port > 0 {
 		return net.JoinHostPort(registrysvc.LoopbackAddress, strconv.Itoa(port)), nil
 	}
@@ -196,23 +197,23 @@ func localGatePort(workDir string) int {
 	return 0
 }
 
-// clusterEndpointAuthority reads the flat registry-k3sm Service's EndpointSlice
-// and returns its ready endpoint as host:port: the server's cluster address
-// and the relay's port.
-func clusterEndpointAuthority(ctx context.Context, slices endpointSliceLister) (string, error) {
-	list, err := slices.List(ctx, metav1.ListOptions{LabelSelector: discoveryv1.LabelServiceName + "=" + registrysvc.FlatServiceName})
+// clusterEndpointAuthority reads the flat registry-k3sm Service's EndpointSlice,
+// by name, and returns its ready endpoint as host:port: the server's cluster
+// address and the relay's port. The server publishes exactly one slice for the
+// Service, named after it, so a get by name finds it with no list right.
+func clusterEndpointAuthority(ctx context.Context, slices endpointSliceGetter) (string, error) {
+	s, err := slices.Get(ctx, registrysvc.FlatServiceName, metav1.GetOptions{})
 	switch {
 	case apierrors.IsForbidden(err):
-		return "", fmt.Errorf("%w: this kubeconfig may not read the %s Service's EndpointSlices in %s, which name the server's registry address",
+		return "", fmt.Errorf("%w: this kubeconfig may not get the %s EndpointSlice in %s, which names the server's registry address",
+			errNoNodeRegistry, registrysvc.FlatServiceName, registrysvc.FlatServiceNamespace)
+	case apierrors.IsNotFound(err):
+		return "", fmt.Errorf("%w: the cluster publishes no %s EndpointSlice in %s (the server's registry is off or down, or it has no mesh address a worker reaches)",
 			errNoNodeRegistry, registrysvc.FlatServiceName, registrysvc.FlatServiceNamespace)
 	case err != nil:
 		return "", fmt.Errorf("find the cluster registry (the %s Service's endpoint): %w", registrysvc.FlatServiceName, err)
 	}
-	for _, s := range list.Items {
-		port := slicePort(s.Ports)
-		if port == 0 {
-			continue
-		}
+	if port := slicePort(s.Ports); port != 0 {
 		for _, ep := range s.Endpoints {
 			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
 				continue

@@ -311,6 +311,20 @@
         "resourceNames": [
           "builder"
         ]
+      },
+      {
+        "verbs": [
+          "get"
+        ],
+        "apiGroups": [
+          "discovery.k8s.io"
+        ],
+        "resources": [
+          "endpointslices"
+        ],
+        "resourceNames": [
+          "registry-k3sm"
+        ]
       }
     ]
   },
