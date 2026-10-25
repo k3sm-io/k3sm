@@ -1558,10 +1558,11 @@ FAILCP
 	# so the run is a copy of this script in a scratch tree with a failing fake
 	# build-cp.sh there); a fake go answers the toolchain assert.
 	local tree="$tmp/tree" fbin="$tmp/fake-go-bin" e2e="$tmp/e2e-builds"
-	mkdir -p "$tree/hack/release/lib" "$tree/hack/lib" "$tree/pkg/executor" "$tree/pkg/registrysvc" "$tree/pkg/helmchart" "$fbin"
+	mkdir -p "$tree/hack/release/lib" "$tree/hack/lib" "$tree/pkg/executor" "$tree/pkg/registrysvc" "$tree/pkg/helmchart" "$tree/internal/childreq" "$fbin"
 	cp "$self" "$tree/hack/release/stage.sh" && cp "$HERE/lib/gochild.sh" "$tree/hack/release/lib/" && cp "$REPO_ROOT/hack/lib/govulncheck.sh" "$tree/hack/lib/"
 	cp "$REPO_ROOT/pkg/executor/executor.go" "$REPO_ROOT/pkg/executor/setup.go" "$REPO_ROOT/pkg/executor/etcdstage.go" "$tree/pkg/executor/"
 	cp "$REPO_ROOT/pkg/registrysvc/pin.go" "$tree/pkg/registrysvc/" && cp "$REPO_ROOT/pkg/helmchart/pin.go" "$tree/pkg/helmchart/"
+	cp "$REPO_ROOT/internal/childreq/childreq.go" "$tree/internal/childreq/"
 	# shellcheck disable=SC2016 # the fakes' own "$1" and "$2" are written literally
 	{
 		printf '#!/bin/bash\nif [ "$1" = --print-cache-key ]; then echo %s; exit 0; fi\n' "$key1"
