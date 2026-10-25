@@ -443,22 +443,23 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh staging: helm is extracted and signed on a temp", func(t *testing.T) {
+	t.Run("fresh staging: helm is built and signed on a temp", func(t *testing.T) {
 		calls := fakeCodesign(t)
-		fakeHelmRelease(t, helmTarball(t, map[string]string{
-			helmchart.HelmTarballMember: "the-new-helm-binary-bytes",
-		}), "")
+		origLook := lookPathGo
+		t.Cleanup(func() { lookPathGo = origLook })
+		lookPathGo = func() (string, error) { return "/usr/local/go/bin/go", nil }
+		fakeHelmBuild(t, "the-new-helm-binary-bytes")
 		bd := t.TempDir()
 		dst := helmchart.HelmPath(bd)
 		writeBin(t, dst, "old-helm"+signedSuffix)
 		h := hold(t, dst)
-		if err := stageHelm(t.Context(), signingPolicy{s: bootCodeSigner}, bd, true); err != nil {
+		if err := stageHelmBuild(t.Context(), bd); err != nil {
 			t.Fatal(err)
 		}
 		signed := calls()
 		assertSignedOnlyTemps(t, signed, dst)
 		if len(signed) != 1 {
-			t.Errorf("signed %v, want the one extracted temp", signed)
+			t.Errorf("signed %v, want the one built temp", signed)
 		}
 		h.assertReplaced(t)
 		assertSignedAt(t, dst)

@@ -32,7 +32,6 @@ pkg/builder/buildxhost_test.go until=2026-12-31 # httptest server for the buildx
 pkg/executor/apiserverhost_test.go until=2026-12-31 # readiness probe must hit the effective bind address
 pkg/executor/bringuperror_test.go until=2026-12-31 # held loopback port drives the bring-up port-conflict error
 pkg/executor/componentexit_test.go until=2026-12-31 # real listener satisfies the readiness gate before the crash
-pkg/executor/helm_test.go until=2026-12-31 # httptest server for the helm release download
 pkg/executor/portguard_test.go until=2026-12-31 # port guard under test needs a held loopback port (also hosts freePort)
 pkg/executor/snapshot_test.go until=2026-12-31 # control-plane port probe needs a held loopback port
 pkg/hostnet/hostnet_test.go until=2026-12-31 # reachability probe against a real unix socket

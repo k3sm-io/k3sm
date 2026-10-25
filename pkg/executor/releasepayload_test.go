@@ -144,7 +144,10 @@ func TestReleaseInstallNeverResignsHelmOrZot(t *testing.T) {
 			t.Fatal(err)
 		}
 		writeBin(t, helmchart.HelmPath(bd), "old-helm"+fakeAdHoc)
-		writeBin(t, helmchart.HelmPath(payload), "helm"+devID)
+		// The seed reads the payload helm's build stamp (ensureShipped); the
+		// fake stamp reader reads the line writeChildBin writes.
+		useChildSeams(t)
+		writeChildBin(t, helmchart.HelmPath(payload), helmchart.HelmVersion, helmchart.HelmBuildVariant, "helm", devID)
 		writeZotPayload(t, payload, "zot"+devID)
 		if err := seedBinDir(t.Context(), discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatalf("seedBinDir: %v", err)

@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
@@ -173,6 +174,8 @@ func VerifyPayloadSet(dir string) error {
 	allowed[KubeMarkerName] = true
 	// zot's version marker rides beside the registry binary on kine's terms.
 	allowed[registrysvc.ZotMarkerName] = true
+	// helm's version marker rides beside the helm binary on the same terms.
+	allowed[helmchart.HelmMarkerName] = true
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read payload dir %s: %w", dir, err)

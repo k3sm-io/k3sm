@@ -52,7 +52,6 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
-	"k3sm.io/k3sm/pkg/registrysvc"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -2332,8 +2331,8 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     The control-plane version marker is staged the same way and for the same
 	//     reasons: without it the seed cannot tell this release's kube binaries from
 	//     the ones an earlier release left in the work dir, and an absent marker only
-	//     means the seed leaves the present set alone. The zot marker rides along: without it the server cannot take the payload zot.
-	for _, m := range []string{executor.KubeMarkerName, registrysvc.ZotMarkerName} {
+	//     means the seed leaves the present set alone. The zot and helm markers ride along: without them the server cannot take the payload zot, and the seed keeps an older helm build.
+	for _, m := range payloadSetMarkers {
 		_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, m), cfg.stagedPayloadFile(m))
 	}
 

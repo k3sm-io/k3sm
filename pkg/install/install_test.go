@@ -1937,6 +1937,8 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KubeMarkerName,
 		// The zot version marker, staged the same best-effort way beside zot.
 		"CopyToRootOwned:/Library/k3sm.swap/bin/" + registrysvc.ZotMarkerName,
+		// The helm version marker, staged the same best-effort way beside helm.
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + helmchart.HelmMarkerName,
 		// The shadow binary set, staged with the binary that uses it: each copy
 		// in the shared list cloned root:wheel 0755, re-signed ad hoc, verified,
 		// its source's cdhash read, then the manifest (TestShadowSetIsMadeAtInstall
@@ -2138,10 +2140,10 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// The payload set lands at InstallDir/bin/<name> — one copy per
 	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims + vmhost.
 	head := len(fixedHead)
-	// +5 for the five version markers (kine, etcd, etcdutl, the control-plane
-	// set, then zot), staged beside the binaries they describe.
-	if want := head + len(executor.PayloadBinaries()) + 5; len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the five markers)", len(dsts), want)
+	// +6 for the six version markers (kine, etcd, etcdutl, the control-plane
+	// set, zot, then helm), staged beside the binaries they describe.
+	if want := head + len(executor.PayloadBinaries()) + 6; len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the six markers)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], stage+"/bin/"+name; got != want {
@@ -3362,5 +3364,47 @@ func TestInstallStagesTheZotMarker(t *testing.T) {
 	}
 	if !registrysvc.PayloadVouchesZot(bin, registrysvc.DefaultZotVersion) {
 		t.Errorf("the staged zot set is not one the server would use (marker %q, pin %s)", marker, registrysvc.DefaultZotVersion)
+	}
+}
+
+// TestInstallStagesTheHelmMarker: the work-dir seed replaces a helm whose marker
+// does not vouch for the pin and variant (a tarball-era helm of the same version)
+// only from a payload whose own helm.version does. So an install must stage the
+// marker from the payload, publish it beside the binary, and what it stages must
+// satisfy the seed's own predicate.
+func TestInstallStagesTheHelmMarker(t *testing.T) {
+	payload := t.TempDir()
+	if err := os.WriteFile(filepath.Join(payload, helmchart.HelmBinaryName), []byte("helm\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := helmchart.HelmVersion + " " + helmchart.HelmBuildVariant + "\n"
+	if err := os.WriteFile(filepath.Join(payload, helmchart.HelmMarkerName), []byte(marker), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeSystem{}
+	cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice", PayloadSource: payload}
+	if err := Install(context.Background(), f, cfg); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	live := f.treeUnder(cfg.withDefaults().InstallDir)
+	bin := t.TempDir()
+	for _, name := range []string{helmchart.HelmBinaryName, helmchart.HelmMarkerName} {
+		src, ok := live["bin/"+name]
+		if !ok {
+			t.Fatalf("%s is not in the published install root %v", name, live)
+		}
+		if want := filepath.Join(payload, name); src != want {
+			t.Errorf("%s came from %q, want the payload's %q", name, src, want)
+		}
+		b, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatalf("read the staged source of %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(bin, name), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !executor.PayloadVouchesHelm(bin) {
+		t.Errorf("the staged helm set is not one the seed would take (marker %q)", marker)
 	}
 }
