@@ -90,10 +90,11 @@ var selfExecutable = os.Executable
 // The source-built children kine and etcd (and the offline etcdutl) are part of
 // the signed payload: on the release path they are verified the same way and their
 // build stamp, read from the verified bytes, must match the pins
-// (stagedChild.ensureShipped); they are never built or signed there. helm and the
-// registry's zot are part of the signed payload too: on the release path they are
-// verified against the same requirement and used byte-identical (signHelm, and
-// ReleaseVerifier for pkg/registrysvc), never downloaded, built or signed.
+// (stagedChild.ensureShipped); they are never built or signed there. helm is
+// staged the same way, by the payload seed, and signHelm re-verifies the staged
+// copy. The registry's zot is part of the signed payload too: on the release path
+// it is verified against the same requirement and used byte-identical
+// (ReleaseVerifier for pkg/registrysvc), never built or signed.
 type signingPolicy struct {
 	s       codeSigner
 	release bool

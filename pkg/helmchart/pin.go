@@ -63,6 +63,11 @@ const (
 	// least 14 days old when adopted). The wrapper's go.mod requires exactly these
 	// versions (ValidateHelmPin), and a staged helm's build info must carry them.
 	HelmRaisedModules = "golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0"
+	// HelmMinGoVersion is the oldest Go release a staged helm may be built with:
+	// the first that fixes the standard library findings reachable in helm. The
+	// payload toolchain (hack/release/lib/gochild.sh PAYLOAD_GO_VERSION) builds
+	// it, and the release path refuses a helm whose build info names an older one.
+	HelmMinGoVersion = "go1.27.3"
 	// HelmBinaryName is the staged binary's basename (in an install payload and
 	// in the work dir's bin). The version is in the name so a bump stages beside
 	// the old copy instead of silently reusing it.

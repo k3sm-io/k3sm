@@ -503,12 +503,13 @@ func TestHelmBuildArgs(t *testing.T) {
 }
 
 // TestHelmBuildVariantTracksGoSum: the build variant names the wrapper's
-// dependency set, so a go.sum change without a variant bump would let a marker
-// vouch for bytes built from another set. Changing go.sum.txt fails this test;
-// bump HelmBuildVariant's "+deps<n>" suffix, then update both values here.
+// dependency set, so a go.mod or go.sum change without a variant bump would let a
+// marker vouch for bytes built from another set. Changing go.mod.txt or go.sum.txt
+// fails this test; bump HelmBuildVariant's "+deps<n>" suffix, then update both
+// values here.
 func TestHelmBuildVariantTracksGoSum(t *testing.T) {
-	sum := sha256.Sum256(helmchild.GoSum)
-	if got, wantSum, wantVariant := hex.EncodeToString(sum[:]), "32276c7661a77d8d76b0c9b3a81b4c415d8399fd4deecb1939da1dfecea2d833", "nocgo+deps1"; got != wantSum || HelmBuildVariant != wantVariant {
-		t.Errorf("go.sum.txt sha256 %s with variant %q; this test pins %s with %q: bump HelmBuildVariant with the dependency set", got, HelmBuildVariant, wantSum, wantVariant)
+	sum := sha256.Sum256(append(append(append([]byte{}, helmchild.GoMod...), 0), helmchild.GoSum...))
+	if got, wantSum, wantVariant := hex.EncodeToString(sum[:]), "23303ffdac839998995784e5642bdc04e4e6312d3729b95c4b0e4488a481acec", "nocgo+deps1"; got != wantSum || HelmBuildVariant != wantVariant {
+		t.Errorf("go.mod.txt+go.sum.txt sha256 %s with variant %q; this test pins %s with %q: bump HelmBuildVariant with the dependency set", got, HelmBuildVariant, wantSum, wantVariant)
 	}
 }

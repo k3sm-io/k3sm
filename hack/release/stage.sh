@@ -414,9 +414,10 @@ GV_ALLOW="$HERE/govulncheck.allow"
 # KINE_VARIANT, ETCD_VARIANT and KINE_PATCH
 # (the patch-set id, "none" without one), ZOT_VERSION and ZOT_VARIANT,
 # HELM_VERSION, HELM_VARIANT, HELM_RAISED (the raised modules, space-separated
-# path@version) and HELM_BINARY, and XNET_FLOOR (the golang.org/x/net kine and
-# zot are built against), read from the source the staged k3sm is built from, so
-# the checks below compare against that build's own pins.
+# path@version), HELM_COMMIT (the tag's commit the build stamps) and HELM_BINARY,
+# and XNET_FLOOR (the golang.org/x/net kine and zot are built against), read from
+# the source the staged k3sm is built from, so the checks below compare against
+# that build's own pins.
 read_pins() {
 	local ex="$REPO_ROOT/pkg/executor" rs="$REPO_ROOT/pkg/registrysvc/pin.go" hc="$REPO_ROOT/pkg/helmchart/pin.go" cr="$REPO_ROOT/internal/childreq/childreq.go"
 	KINE_VERSION="$(sed -n 's/^[[:space:]]*DefaultKineVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ex/executor.go")"
@@ -435,7 +436,9 @@ read_pins() {
 	HELM_VERSION="$(sed -n 's/^[[:space:]]*HelmVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$hc")"
 	HELM_VARIANT="$(sed -n 's/^[[:space:]]*HelmBuildVariant[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$hc")"
 	HELM_RAISED="$(sed -n 's/^[[:space:]]*HelmRaisedModules[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$hc")"
-	[ -n "$ZOT_VERSION" ] && [ -n "$ZOT_VARIANT" ] && [ -n "$HELM_VERSION" ] && [ -n "$HELM_VARIANT" ] && [ -n "$HELM_RAISED" ] ||
+	HELM_COMMIT="$(sed -n 's/^[[:space:]]*HelmGitCommit[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$hc")"
+	HELM_MIN_GO="$(sed -n 's/^[[:space:]]*HelmMinGoVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$hc")"
+	[ -n "$ZOT_VERSION" ] && [ -n "$ZOT_VARIANT" ] && [ -n "$HELM_VERSION" ] && [ -n "$HELM_VARIANT" ] && [ -n "$HELM_RAISED" ] && [ -n "$HELM_COMMIT" ] && [ -n "$HELM_MIN_GO" ] ||
 		die "cannot read the zot and helm pins from $rs and $hc"
 	HELM_BINARY="helm-$HELM_VERSION"
 	XNET_FLOOR="$(sed -n 's/^[[:space:]]*const XNetVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cr")"
@@ -470,7 +473,12 @@ helm_buildinfo_problems() {
 # child_problems <payload-dir> <go-pin>: the staged kine, etcd, etcdutl, zot and
 # helm are the pinned builds: each marker names the pin and variant, each build
 # info passes buildinfo_problems (helm: helm_buildinfo_problems) against <go-pin>
-# (kine and zot: with x/net at XNET_FLOOR or newer), and kine carries its stamped version (pin+patch set) in its bytes. Prints one
+# (kine and zot: with x/net at XNET_FLOOR or newer), kine carries its stamped
+# version (pin+patch set) in its bytes, and helm carries the version and the tag's
+# commit its release build stamps with -X (the build info cannot show them:
+# -trimpath keeps -ldflags out of it, and -s strips the symbols the daemon could
+# read them from). The commit is in no helm source file, so its presence proves
+# the -X flags were applied. Prints one
 # line per problem; returns 0 only when there are none.
 child_problems() {
 	local dir="$1" pin="$2" bad=0 kind want variant
@@ -490,6 +498,10 @@ child_problems() {
 	if [ -f "$dir/$HELM_BINARY" ]; then
 		marker_problems "$dir" helm "$HELM_VERSION" "$HELM_VARIANT" || bad=1
 		"$GO" version -m "$dir/$HELM_BINARY" 2>/dev/null | helm_buildinfo_problems "$HELM_VERSION" "$pin" "$HELM_RAISED" || bad=1
+		local s
+		for s in "$HELM_VERSION" "$HELM_COMMIT"; do
+			LC_ALL=C grep -aqF -- "$s" "$dir/$HELM_BINARY" || { echo "helm: the stamped string $s is not in the binary (built without helm's -X version flags?)"; bad=1; }
+		done
 	else
 		echo "$HELM_BINARY: not staged in $dir"; bad=1
 	fi
@@ -1613,6 +1625,11 @@ FAILCP
 		else
 			echo "  FAIL  read_pins: XNET_FLOOR '$XNET_FLOOR'"; exit 1
 		fi
+		if printf '%s' "$HELM_COMMIT" | grep -Eq '^[0-9a-f]{40}$' && [ "$(printf '%s\n%s\n' "$HELM_MIN_GO" "$PAYLOAD_GO_VERSION" | sort -V | head -1)" = "$HELM_MIN_GO" ]; then
+			echo "  ok    read_pins: helm commit $HELM_COMMIT; PAYLOAD_GO_VERSION $PAYLOAD_GO_VERSION is not older than HelmMinGoVersion $HELM_MIN_GO"
+		else
+			echo "  FAIL  read_pins: helm commit '$HELM_COMMIT', HelmMinGoVersion '$HELM_MIN_GO' newer than PAYLOAD_GO_VERSION $PAYLOAD_GO_VERSION?"; exit 1
+		fi
 	) || fails=$((fails + 1))
 	if printf '%s\n' "$PAYLOAD_GO_VERSION" | grep -Eq '^go[0-9]+\.[0-9]+\.[0-9]+$'; then ok "PAYLOAD_GO_VERSION is an exact release ($PAYLOAD_GO_VERSION)"; else bad "PAYLOAD_GO_VERSION '$PAYLOAD_GO_VERSION' is not an exact goX.Y.Z"; fi
 	# A fake go: `env GOVERSION` prints $FAKE_GOVERSION (and records GOTOOLCHAIN),
@@ -1688,9 +1705,9 @@ FAKE
 	(
 		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p2 KINE_PATCH=p2 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
 		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal+r1 HELM_BINARY=helm-v4.3.0 HELM_VERSION=v4.3.0 HELM_VARIANT=nocgo+deps1 XNET_FLOOR=v0.60.0
-		HELM_RAISED="golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0"
+		HELM_RAISED="golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0" HELM_COMMIT=bec5b06ed841fe5269972d864d5177944fd5970f
 		printf 'zot\n' >"$cpd/zot"; echo "v2.1.22 minimal+r1" >"$cpd/zot.version"
-		printf 'helm\n' >"$cpd/helm-v4.3.0"; echo "v4.3.0 nocgo+deps1" >"$cpd/helm.version"
+		printf 'mach-o...v4.3.0...bec5b06ed841fe5269972d864d5177944fd5970f...\n' >"$cpd/helm-v4.3.0"; echo "v4.3.0 nocgo+deps1" >"$cpd/helm.version"
 		printf 'mach-o...v0.17.2+p2...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p2" >"$cpd/kine.version"
 		printf 'etcd\n' >"$cpd/etcd"; echo "v3.6.15 nocgo" >"$cpd/etcd.version"
 		printf 'etcdutl\n' >"$cpd/etcdutl"; echo "v3.6.15 nocgo" >"$cpd/etcdutl.version"
@@ -1711,6 +1728,11 @@ FAKE
 		echo "v4.3.0 tarball" >"$cpd/helm.version"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm marker naming another variant passed"; r=1; elif printf '%s\n' "$o" | grep -q "helm.version is not 'v4.3.0 nocgo+deps1'"; then echo "  ok    a helm marker naming another build variant is refused"; else echo "  FAIL  helm marker not named: $o"; r=1; fi
 		echo "v4.3.0 nocgo+deps1" >"$cpd/helm.version"
+		printf 'mach-o...v4.3.0...\n' >"$cpd/helm-v4.3.0"
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm without its stamped commit passed"; r=1; elif printf '%s\n' "$o" | grep -q "helm: the stamped string bec5b06ed841fe5269972d864d5177944fd5970f is not in the binary"; then echo "  ok    a helm built without its -X stamp (no commit in the bytes) is refused"; else echo "  FAIL  helm stamp not named: $o"; r=1; fi
+		printf 'mach-o...bec5b06ed841fe5269972d864d5177944fd5970f...\n' >"$cpd/helm-v4.3.0"
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm without its stamped version passed"; r=1; elif printf '%s\n' "$o" | grep -q "helm: the stamped string v4.3.0 is not in the binary"; then echo "  ok    a helm without its stamped version is refused"; else echo "  FAIL  helm version stamp not named: $o"; r=1; fi
+		printf 'mach-o...v4.3.0...bec5b06ed841fe5269972d864d5177944fd5970f...\n' >"$cpd/helm-v4.3.0"
 		if o="$(child_problems "$cpd" go1.27.9)"; then echo "  FAIL  a helm built on another toolchain passed child_problems"; r=1; elif printf '%s\n' "$o" | grep -q "^helm: built with 'go1.27.3', the payload pins go1.27.9"; then echo "  ok    child_problems names a helm built on another toolchain"; else echo "  FAIL  helm toolchain not named by child_problems: $o"; r=1; fi
 		rm "$cpd/zot" "$cpd/helm-v4.3.0"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a payload without zot and helm passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot: not staged" && printf '%s\n' "$o" | grep -q "helm-v4.3.0: not staged"; then echo "  ok    a missing zot and a missing helm are refused"; else echo "  FAIL  missing zot or helm not named: $o"; r=1; fi

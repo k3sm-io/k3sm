@@ -18,12 +18,17 @@ package executor
 
 import (
 	"context"
+	"debug/buildinfo"
 	"errors"
 	"fmt"
+	"go/version"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
+	"slices"
+	"strings"
 
 	"k3sm.io/k3sm/pkg/helmchart"
 )
@@ -129,17 +134,70 @@ func stageHelmBuild(ctx context.Context, bd string) error {
 	return helmChild().ensureInto(ctx, bd)
 }
 
-// helmChild is helm's stagedChild declaration at the pin. It is staged only by
-// ensureInto (the dev path and the packaging producer); the release path takes the
-// payload's helm through the seed and signHelm, so it reads no stamp.
+// helmChild is helm's stagedChild declaration at the pin. The dev path and the
+// packaging producer stage it with ensureInto (marker plus build); the release
+// path's seed stages the payload's copy with ensureShipped, which reads the stamp
+// from the verified bytes (helmStampFromBinary).
 func helmChild() stagedChild {
 	return stagedChild{
-		name:    helmchart.HelmBinaryName,
-		marker:  helmchart.HelmMarkerName,
-		version: helmchart.HelmVersion,
-		variant: helmchart.HelmBuildVariant,
-		build:   buildHelmWrapper,
+		name:      helmchart.HelmBinaryName,
+		marker:    helmchart.HelmMarkerName,
+		version:   helmchart.HelmVersion,
+		variant:   helmchart.HelmBuildVariant,
+		build:     buildHelmWrapper,
+		readStamp: helmStampFromBinary,
 	}
+}
+
+// helmStampFromBinary is helm's production stamp reader: the build info Go records
+// in the binary, read without running it.
+func helmStampFromBinary(path string) (string, string, error) {
+	return recoverStamp(path, func() (string, string, error) {
+		bi, err := buildinfo.ReadFile(path)
+		if err != nil {
+			return "", "", fmt.Errorf("read build info: %w", err)
+		}
+		return helmStampOf(bi)
+	})
+}
+
+// helmStampOf derives helm's (version, variant) from its build info. The version is
+// the helm module's (main package helmchart.HelmMainPackage, never replaced). The
+// variant is helmchart.HelmBuildVariant only for the build the wrapper produces:
+// CGO_ENABLED=0, -trimpath, a toolchain no older than helmchart.HelmMinGoVersion,
+// and every module of helmchart.HelmRaisedModules linked at its raised version,
+// unreplaced. A build that misses any of those is an error naming it, so the
+// upstream tarball (an older toolchain, helm's own golang.org/x versions) is never
+// taken for the pinned build. helm's -X version stamp is not checked here: the
+// release build strips the symbol table (-s), so the staging script checks the
+// stamped strings in the bytes instead. Pure.
+func helmStampOf(bi *debug.BuildInfo) (string, string, error) {
+	v, cgo, err := etcdStampOf(bi, helmchart.HelmMainPackage, helmchart.HelmModule)
+	if err != nil {
+		return "", "", err
+	}
+	if !version.IsValid(bi.GoVersion) || version.Compare(bi.GoVersion, helmchart.HelmMinGoVersion) < 0 {
+		return "", "", fmt.Errorf("built with %q, older than the %s helm requires", bi.GoVersion, helmchart.HelmMinGoVersion)
+	}
+	if !slices.ContainsFunc(bi.Settings, func(s debug.BuildSetting) bool { return s.Key == "-trimpath" && s.Value == "true" }) {
+		return "", "", errors.New("build info records no -trimpath=true")
+	}
+	for _, pv := range strings.Fields(helmchart.HelmRaisedModules) {
+		path, want, _ := strings.Cut(pv, "@")
+		i := slices.IndexFunc(bi.Deps, func(d *debug.Module) bool { return d.Path == path })
+		switch {
+		case i < 0:
+			return "", "", fmt.Errorf("build info does not link %s (the wrapper raises it to %s)", path, want)
+		case bi.Deps[i].Replace != nil:
+			return "", "", fmt.Errorf("module %s is replaced by %s", path, bi.Deps[i].Replace.Path)
+		case bi.Deps[i].Version != want:
+			return "", "", fmt.Errorf("module %s is at %s, the wrapper raises it to %s", path, bi.Deps[i].Version, want)
+		}
+	}
+	if cgo != "nocgo" {
+		return v, cgo, nil
+	}
+	return v, helmchart.HelmBuildVariant, nil
 }
 
 // buildHelmWrapper materializes the wrapper module under scratch and builds helm

@@ -1069,15 +1069,11 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		dst := filepath.Join(bd, name)
 		versioned := (name == kineBinaryName && restageKine) || (name == etcdBinaryName && restageEtcd) ||
 			(name == helmchart.HelmBinaryName && restageHelm) || (restageKube && isCPBinary(name))
-		// On the release path the work dir runs the payload's helm and no other: a
-		// copy that differs from it (an earlier dev install's ad-hoc build of the same
-		// pin) is replaced, verified, rather than refused at signHelm.
+		// On the release path helm is the payload's copy and no other, staged by
+		// ensureShipped below (signature verified, then the build stamp read from the
+		// verified bytes), never filled in here.
 		if policy.release && name == helmchart.HelmBinaryName {
-			same, err := sameContent(filepath.Join(payloadDir, name), dst)
-			if err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("compare the shipped %s with %s: %w", name, dst, err)
-			}
-			versioned = err == nil && !same
+			continue
 		}
 		if _, err := os.Stat(dst); err == nil && !versioned {
 			continue // already present (a prior boot seeded/acquired it)
@@ -1095,7 +1091,7 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 		// the name; on the release path a control-plane copy is verified against
 		// the release requirement instead, and never signed.
 		prepare := binsign.SignIfInvalid(ctx, bootCodeSigner, name)
-		if policy.release && (isCPBinary(name) || name == helmchart.HelmBinaryName) {
+		if policy.release && isCPBinary(name) {
 			prepare = verifyTempHook(ctx, policy, name)
 		}
 		if err := atomicfile.InstallFile(src, dst, 0o755, prepare); err != nil {
@@ -1114,6 +1110,15 @@ func seedBinDir(ctx context.Context, logger *slog.Logger, workDir, payloadDir, k
 	}
 	if restageHelm {
 		if err := helmChild().writeMarker(bd); err != nil {
+			return err
+		}
+	}
+	// The release path's helm: the payload's copy, verified against the release
+	// requirement and its build stamp checked against the pins, exactly as kine and
+	// etcd are (ErrPayloadStamp on a mismatch). A payload without helm is left to
+	// EnsureHelm, which reports it without failing the boot.
+	if policy.release && fileExists(helmchart.HelmPath(payloadDir)) {
+		if err := helmChild().ensureShipped(ctx, policy, bd, payloadDir); err != nil {
 			return err
 		}
 	}

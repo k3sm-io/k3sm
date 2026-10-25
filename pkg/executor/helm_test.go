@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"testing"
@@ -271,5 +272,126 @@ func TestPayloadCarriesHelm(t *testing.T) {
 	}
 	if got, err := os.ReadFile(helmchart.HelmPath(BinDir(work))); err != nil || string(got) != "payload-helm" {
 		t.Errorf("seeded helm = %q, %v", got, err)
+	}
+}
+
+// helmBuildInfo is the build info the wrapper build records in helm (dep list
+// trimmed), the shape `go version -m` prints for the staged binary.
+const helmBuildInfo = "go\tgo1.27.3\npath\thelm.sh/helm/v4/cmd/helm\nmod\thelm.sh/helm/v4\tv4.3.0\th1:w=\n" +
+	"dep\tgolang.org/x/crypto\tv0.57.0\th1:c=\ndep\tgolang.org/x/net\tv0.60.0\th1:n=\n" +
+	"build\t-trimpath=true\nbuild\tCGO_ENABLED=0\nbuild\tGOARCH=arm64\nbuild\tGOOS=darwin\n"
+
+// parseHelmInfo parses build-info text the way buildinfo.ReadFile reads a binary:
+// the leading "go" line is the toolchain (GoVersion, which debug.ParseBuildInfo
+// leaves to its caller), the rest the module and build lines.
+func parseHelmInfo(text string) (*debug.BuildInfo, error) {
+	first, rest, _ := strings.Cut(text, "\n")
+	bi, err := debug.ParseBuildInfo(rest)
+	if err != nil {
+		return nil, err
+	}
+	bi.GoVersion, _ = strings.CutPrefix(first, "go\t")
+	return bi, nil
+}
+
+// TestHelmStampOf pins the release path's reading of helm's build info: only the
+// wrapper build at the pin reads as (HelmVersion, HelmBuildVariant).
+func TestHelmStampOf(t *testing.T) {
+	parse := func(t *testing.T, text string) *debug.BuildInfo {
+		t.Helper()
+		bi, err := parseHelmInfo(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bi
+	}
+	if v, variant, err := helmStampOf(parse(t, helmBuildInfo)); err != nil || v != helmchart.HelmVersion || variant != helmchart.HelmBuildVariant {
+		t.Fatalf("helmStampOf(the wrapper build) = %q %q %v, want %q %q", v, variant, err, helmchart.HelmVersion, helmchart.HelmBuildVariant)
+	}
+	if _, _, err := helmStampOf(parse(t, strings.Replace(helmBuildInfo, "go1.27.3", "go1.28.0", 1))); err != nil {
+		t.Errorf("a newer toolchain was refused: %v", err)
+	}
+	if _, variant, _ := helmStampOf(parse(t, strings.Replace(helmBuildInfo, "CGO_ENABLED=0", "CGO_ENABLED=1", 1))); variant != "cgo" {
+		t.Errorf("a cgo build reads as %q", variant)
+	}
+	for name, info := range map[string]string{
+		"the upstream tarball's toolchain": strings.Replace(helmBuildInfo, "go1.27.3", "go1.27.1", 1),
+		"helm's own x/net":                 strings.Replace(helmBuildInfo, "x/net\tv0.60.0", "x/net\tv0.57.0", 1),
+		"an unreadable toolchain":          strings.Replace(helmBuildInfo, "go\tgo1.27.3", "go\tdevel", 1),
+		"no x/crypto":                      strings.Replace(helmBuildInfo, "dep\tgolang.org/x/crypto\tv0.57.0\th1:c=\n", "", 1),
+		"a replaced x/net":                 strings.Replace(helmBuildInfo, "h1:n=\n", "h1:n=\n=>\texample.com/fork\tv0.0.1\th1:f=\n", 1),
+		"no -trimpath":                     strings.Replace(helmBuildInfo, "build\t-trimpath=true\n", "", 1),
+		"another main package":             strings.Replace(helmBuildInfo, "path\thelm.sh/helm/v4/cmd/helm", "path\texample.com/helm", 1),
+		"helm at another version":          strings.Replace(helmBuildInfo, "v4.3.0", "v4.2.0", 1),
+	} {
+		v, variant, err := helmStampOf(parse(t, info))
+		if err == nil && v == helmchart.HelmVersion && variant == helmchart.HelmBuildVariant {
+			t.Errorf("%s: read as the pinned build", name)
+		}
+	}
+}
+
+// TestReleaseSeedRefusesAMisbuiltHelm: on the release path the seed stages the
+// payload's helm through ensureShipped, so a correctly signed helm-v4.3.0 whose
+// build info names another toolchain or lacks the raised x/net is refused with
+// ErrPayloadStamp and never reaches the work dir, while the wrapper build is
+// installed and marked. The fake stamp reader parses the build-info text the
+// fake binary carries through the production helmStampOf.
+func TestReleaseSeedRefusesAMisbuiltHelm(t *testing.T) {
+	const team = "ABCDE12345"
+	devID := fakeDevIDPrefix + team
+	origStamp := shippedStamp
+	t.Cleanup(func() { shippedStamp = origStamp })
+	shippedStamp = func(c stagedChild, path string) (string, string, error) {
+		if c.name != helmchart.HelmBinaryName {
+			return "", "", errors.New("only helm is staged here")
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", "", err
+		}
+		bi, err := parseHelmInfo(strings.TrimSuffix(string(b), devID))
+		if err != nil {
+			return "", "", err
+		}
+		return helmStampOf(bi)
+	}
+	for name, tc := range map[string]struct {
+		info   string
+		refuse bool
+	}{
+		"the wrapper build":    {helmBuildInfo, false},
+		"another toolchain":    {strings.Replace(helmBuildInfo, "go1.27.3", "go1.27.1", 1), true},
+		"without raised x/net": {strings.Replace(helmBuildInfo, "x/net\tv0.60.0", "x/net\tv0.57.0", 1), true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := &fakeCodeSigner{}
+			useFakeSigning(t, s, devID)
+			work, payload := t.TempDir(), t.TempDir()
+			bd := binDir(work)
+			writeBin(t, helmchart.HelmPath(payload), tc.info+devID)
+			err := seedBinDir(t.Context(), discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false)
+			if tc.refuse {
+				if !errors.Is(err, ErrPayloadStamp) {
+					t.Fatalf("seedBinDir = %v, want ErrPayloadStamp", err)
+				}
+				if fileExists(helmchart.HelmPath(bd)) {
+					t.Error("a misbuilt helm was staged into the work dir")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("seedBinDir = %v", err)
+			}
+			if got, _ := os.ReadFile(helmchart.HelmPath(bd)); string(got) != tc.info+devID {
+				t.Errorf("work-dir helm is not the payload's bytes")
+			}
+			if !PayloadVouchesHelm(bd) {
+				t.Error("the shipped helm's marker was not written")
+			}
+			if len(s.signed) != 0 {
+				t.Errorf("the release path signed %v", s.signed)
+			}
+		})
 	}
 }
