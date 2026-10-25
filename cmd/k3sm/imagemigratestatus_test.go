@@ -330,3 +330,84 @@ func TestMigrationJournalKeepsTheServerAccountsOwner(t *testing.T) {
 		})
 	}
 }
+
+// TestMigrationProgressClearsLastError: a run that follows a failed one and
+// gets as far as copying images publishes no stale reason while its counts
+// climb. The summary written after the first image of the new run carries no
+// lastError; a run that then stops again publishes its own reason, never the
+// earlier one.
+func TestMigrationProgressClearsLastError(t *testing.T) {
+	const stale = "this node's image store could not be listed"
+	cases := []struct {
+		name string
+		// failSecond makes the second image's upload fail.
+		failSecond   bool
+		wantComplete bool
+		// wantFinal is a substring of the final summary's lastError, empty
+		// for none.
+		wantFinal string
+	}{
+		{name: "the run completes", wantComplete: true},
+		{name: "the run stops on a later image", failSecond: true, wantFinal: "an image could not be copied"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newMigrationRig(t)
+			rig.store.add(t, "docker.io/library/app:dev", "darwin/arm64", randomImage(t))
+			rig.store.add(t, "example.test/svc:v1", "darwin/arm64", randomImage(t))
+			if err := os.MkdirAll(filepath.Join(filepath.Dir(rig.workDir), "status"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// The first attempt stopped before it listed anything.
+			if err := writeMigrationJournal(rig.workDir, migrationJournal{Schema: migrationSchema,
+				LastError: "list this node's image store: rpc error", PendingReason: stale}); err != nil {
+				t.Fatal(err)
+			}
+			readSummary := func() status.ImageMigrationSummary {
+				t.Helper()
+				raw, err := os.ReadFile(status.ImageMigrationSummaryPath(rig.workDir))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var s status.ImageMigrationSummary
+				if err := json.Unmarshal(raw, &s); err != nil {
+					t.Fatal(err)
+				}
+				return s
+			}
+			if s := readSummary(); s.LastError != stale {
+				t.Fatalf("seeded summary lastError = %q, want %q", s.LastError, stale)
+			}
+
+			// The second upload observes what the first image's journal write
+			// published.
+			var mid []status.ImageMigrationSummary
+			rig.pusher.fail = func(ref name.Reference) bool {
+				if len(rig.pusher.calls) < 2 {
+					return false
+				}
+				mid = append(mid, readSummary())
+				return tc.failSecond
+			}
+			_, err := rig.migrator().run(t.Context())
+			if tc.wantComplete != (err == nil) {
+				t.Fatalf("run = %v, want complete %v", err, tc.wantComplete)
+			}
+			if len(mid) != 1 {
+				t.Fatalf("observed %d mid-run summaries, want 1", len(mid))
+			}
+			if mid[0].InRegistry != 1 || mid[0].LastError != "" {
+				t.Errorf("summary after the first image = %+v, want 1 in the registry and no lastError", mid[0])
+			}
+			final := readSummary()
+			switch {
+			case tc.wantFinal == "" && final.LastError != "":
+				t.Errorf("final summary lastError = %q, want none", final.LastError)
+			case tc.wantFinal != "" && !strings.Contains(final.LastError, tc.wantFinal):
+				t.Errorf("final summary lastError = %q, want one naming %q", final.LastError, tc.wantFinal)
+			case final.LastError == stale:
+				t.Errorf("final summary kept the earlier run's reason %q", stale)
+			}
+		})
+	}
+}

@@ -429,6 +429,11 @@ func (m imageMigrator) run(ctx context.Context) (migrationJournal, error) {
 				err: fmt.Errorf("reach the cluster registry: %w", err)})
 		}
 	}
+	// The run has read the node store and reached the registry, so whatever
+	// stopped an earlier run no longer holds. Every journal write from here
+	// publishes this run's progress, and a later stop records its own reason.
+	j.LastError = ""
+	j.PendingReason = ""
 	for _, group := range groups {
 		rec, err := m.migrate(ctx, &j, group, w)
 		if err != nil {
