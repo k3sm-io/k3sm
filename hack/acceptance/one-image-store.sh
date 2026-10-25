@@ -27,20 +27,20 @@
 #           (hack/acceptance/testdata/ois-pusher, `k3sm build --tag
 #           registry-k3sm:6450/<run>/pusher:v1 .`), then a pod on the worker running
 #           that image pushes a one-layer image to
-#           registry-k3sm:6450/<run>-pods/native:v1 over HTTPS (cluster CA) with its
+#           registry-k3sm:6450/<run>-lab/native:v1 over HTTPS (cluster CA) with its
 #           projected k3sm-registry token, the registry answers the manifest PUT with
 #           201 and the digest the pod computed, and `image ls` lists it at that digest.
 #           The client ships in the image because a platform binary (/usr/bin/curl)
 #           loses the path-rebase and DNS shims in a native pod
 #           (docs/user/limitations.md)
 #   ois.5   push from a vm pod: the same push from a runtimeClassName vm pod, to
-#           .../<run>-pods/vm:v1
+#           .../<run>-lab/vm:v1
 #   ois.6   tag: `k3sm image tag` gives app:v1 three more tags (second, control,
 #           uncached), each listed at app:v1's digest
 #   ois.7   untag: `k3sm image untag` of app:second removes that tag and leaves app:v1
 #           at its digest; untagging native:v1 leaves its manifest untagged for ois.8
 #   ois.8   prune: the run first makes its own aged seed (a native pod running the
-#           ois.4 push client image pushes a one-layer image whose content carries the run id to <run>-pods/aged:v1,
+#           ois.4 push client image pushes a one-layer image whose content carries the run id to <run>-lab/aged:v1,
 #           the server untags it, and its manifest blob in the registry root is
 #           backdated two hours as root, past the one-hour prune grace), and
 #           confirms the seed is still there; then the dry run (`-o json`) lists
@@ -630,7 +630,7 @@ mkdir -p "$EVIDENCE"
 RUN="ois-$(date -u +%m%d%H%M%S)"
 NS="$RUN-lab"
 APP_REPO="$RUN/app"
-PUSH_PREFIX="$RUN-pods"
+PUSH_PREFIX="$NS"
 APP_V1="$REG/$APP_REPO:v1"
 APP_SECOND="$REG/$APP_REPO:second"
 APP_CONTROL="$REG/$APP_REPO:control"
@@ -979,7 +979,7 @@ leg_pass
 # the registry's own garbage collection (zot, gcDelay 1h) sweeps untagged manifests
 # older than an hour, so a seed made an hour ahead is usually gone. A native pod
 # pushes a one-layer image carrying the run id (unique content per run) to
-# <run>-pods/aged:v1, the server untags it, and the manifest blob's mtime, which
+# <run>-lab/aged:v1, the server untags it, and the manifest blob's mtime, which
 # prune reads as the manifest's age, is set two hours back as root. The ref is
 # recorded for the trap like every run tag; a seed left behind is untagged and past
 # the grace, so the trap's prune deletes it.
