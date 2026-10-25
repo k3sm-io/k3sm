@@ -364,7 +364,11 @@ The `update` row appears on an installed server and an installed worker. It repo
 release, from the record the last update check left (see [Upgrade](upgrade.md#checking-for-an-update)).
 The server checks at most once an hour and `sudo k3sm update check` checks on demand; the report itself
 never contacts GitHub. The record is `/var/lib/k3sm/status/update.json` (mode 0644), so any account
-reads the row. Its `state` is:
+reads the row. The row takes the latest release and the check time from the record, and compares that
+release with the versions running when the report is taken: the `k3sm` binary, and every node's
+kubelet version from the node list the report reads (the recorded node versions when it cannot list
+nodes). A build of an untagged commit (a Go pseudo-version) ranks by the release it leads up to, and
+`detail` calls it an untagged build, for example `a (untagged build of 0.1.8)`. Its `state` is:
 
 On a worker the row is read-only. After each check a server publishes the latest release and when it
 checked on its own Node (the `k3sm.io/release-latest` and `k3sm.io/release-checked` annotations),

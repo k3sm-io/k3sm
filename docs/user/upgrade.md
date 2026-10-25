@@ -13,13 +13,17 @@ release, or, before the first stable release exists, the newest release of any k
 release tag, when it was published, the Kubernetes version it ships when its release notes say, the
 version of the `k3sm` binary you ran, and every node of the cluster with the version its kubelet
 reports, marked `current`, `behind`, or `ahead` (newer than the latest release, such as a build of
-a tag not yet published). A node whose kubelet reports no tagged k3sm release (no k3sm version, a
-development build, or a build from a modified tree) is `unknown`. It
-only reads; it downloads and installs nothing. It exits 0 when the check finished and 1 when it
+a tag not yet published). A build of an untagged commit, whose version is a Go pseudo-version such
+as `v0.1.8-0.20261025152241-96fbff948562`, ranks by the release it leads up to: it is `ahead` of
+v0.1.7, `behind` v0.1.8, and is shown as an untagged build, for example `ahead, untagged build of
+0.1.8`. A node whose kubelet reports no k3sm version, a development build, or a build from a
+modified tree is `unknown`. It only reads; it downloads and installs nothing. It exits 0 when the check finished and 1 when it
 could not (GitHub unreachable, for example), with the reason on stderr.
 
 The same check feeds the `update` row of `k3sm status` on a server. The server runs it at most once
-an hour and records the result; `k3sm status` reads that record and never contacts GitHub itself.
+an hour and records the latest release it found; `k3sm status` reads that record and never contacts
+GitHub itself. It compares that release with the `k3sm` binary and the nodes running when you run
+it, so the row is right straight after an in-place upgrade, before the next check.
 The row is `ok` when every node runs the latest release, `behind` (severity `warn`) naming each node
 on an older one, `ahead` when a node runs a newer one and none is behind, and `unknown` when the last
 check could not reach GitHub, when no check is recorded, or when the record is more than 24 hours
