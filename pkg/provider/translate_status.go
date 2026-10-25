@@ -711,8 +711,9 @@ func toContainerStatuses(rcs []*runtimev1.ContainerStatus) []corev1.ContainerSta
 			Image: rc.GetImage(),
 			// The identity pair: image_id is runtimed's digested image
 			// reference, <repository>@<digest> (the shape of containerd's CRI
-			// image_ref: the pod's reference without its tag, at the digest it
-			// resolved to at pull; empty for a host binary), carried verbatim
+			// image_ref: the normalized repository, docker.io/library/alpine for
+			// a bare alpine, at the index digest for a multi-platform tag and
+			// the manifest digest otherwise; empty for a host binary), carried verbatim
 			// because this boundary has no business rewriting it; container_id
 			// is scheme-qualified here (see qualifyContainerID).
 			ImageID:      rc.GetImageId(),
