@@ -59,7 +59,7 @@
 #   - $K3SM_OIS_PRUNE_AGED: AT LEAST AN HOUR before the run (prune keeps untagged
 #     manifests younger than an hour), on the server: build any image as
 #     registry-k3sm:6450/ois-aged/x:v1, note its digest from `k3sm image ls -o json`,
-#     then `k3sm image untag registry-k3sm:6450/ois-aged/x:v1`. Pass
+#     then `sudo k3sm image untag registry-k3sm:6450/ois-aged/x:v1`. Pass
 #     `ois-aged/x@sha256:<digest>`.
 #
 # Pods follow the lab rules: nodeName AND the darwin nodeSelector; tolerations are
@@ -640,7 +640,7 @@ cleanup() {
 	kc get namespace "$NS" >/dev/null 2>&1 && echo "cleanup: namespace $NS is still terminating" >>"$RUNLOG"
 	local ref
 	for ref in $TAGS_CREATED $MIGRATED_TARGET; do
-		on_server "k3sm image untag '$ref'" >>"$EVIDENCE/cleanup-untag.txt" 2>&1
+		on_server "sudo -n k3sm image untag '$ref'" >>"$EVIDENCE/cleanup-untag.txt" 2>&1
 	done
 	# The prune deletes only untagged manifests past the grace period and evicts only
 	# cache entries no pod uses; the run's own manifests go on a later prune.
@@ -890,11 +890,11 @@ leg_pass
 # ---- ois.7 untag -------------------------------------------------------------------------
 leg_untag() {
 	local doc v1 second native
-	on_server "k3sm image untag '$APP_SECOND'" >>"$EVIDENCE/ois.7-untag.txt" 2>&1 || {
+	on_server "sudo -n k3sm image untag '$APP_SECOND'" >>"$EVIDENCE/ois.7-untag.txt" 2>&1 || {
 		DETAIL="untag $APP_SECOND failed"
 		return 1
 	}
-	on_server "k3sm image untag '$NATIVE_REF'" >>"$EVIDENCE/ois.7-untag.txt" 2>&1 || {
+	on_server "sudo -n k3sm image untag '$NATIVE_REF'" >>"$EVIDENCE/ois.7-untag.txt" 2>&1 || {
 		DETAIL="untag $NATIVE_REF failed"
 		return 1
 	}
