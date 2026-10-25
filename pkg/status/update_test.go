@@ -183,7 +183,7 @@ func TestUpdateRowReadsTheRecord(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := Collector{FS: tc.fs, Paths: Paths{WorkDir: wd}, EUID: tc.euid, ServiceUID: service}
-			r, ok := c.updateRow(now)
+			r, ok := c.updateRow(now, nil, false)
 			if !ok {
 				t.Fatal("no update row")
 			}
@@ -192,7 +192,7 @@ func TestUpdateRowReadsTheRecord(t *testing.T) {
 			}
 		})
 	}
-	if _, ok := (Collector{FS: fakeFS{}}).updateRow(now); ok {
+	if _, ok := (Collector{FS: fakeFS{}}).updateRow(now, nil, false); ok {
 		t.Error("a collector with no work dir has an update row")
 	}
 }
@@ -357,4 +357,129 @@ func TestUpdateRowCarriesLatestDuringARollAndOnAgents(t *testing.T) {
 			t.Errorf("row = %+v", r)
 		}
 	})
+}
+
+// TestReleaseStatePseudoVersionRanksByCore pins how a Go pseudo-version (a
+// build of an untagged commit) compares with the latest release: by its core
+// and prerelease in semver order, so v0.1.8-0.<stamp>-<rev> is ahead of
+// v0.1.7, behind v0.1.8 (its core, not yet tagged when it was built) and
+// behind v0.1.9, and the row says it is an untagged build. A dirty build stays
+// unknown, in either spelling.
+func TestReleaseStatePseudoVersionRanksByCore(t *testing.T) {
+	const pseudo = "v0.1.8-0.20261025152241-96fbff948562"
+	cases := []struct {
+		have, latest string
+		state        string
+		untaggedOf   string
+	}{
+		{pseudo, "v0.1.7", UpdateAhead, "0.1.8"},
+		{pseudo, "v0.1.8", UpdateBehind, "0.1.8"},
+		{pseudo, "v0.1.8-rc.1", UpdateBehind, "0.1.8"},
+		{pseudo, "v0.1.9", UpdateBehind, "0.1.8"},
+		{"v0.1.6-0.20261025152241-96fbff948562", "v0.1.7", UpdateBehind, "0.1.6"},
+		{pseudo + "+dirty", "v0.1.7", UpdateUnknown, ""},
+		{"0.1.8-0.20261025152241-96fbff948562.dirty", "v0.1.7", UpdateUnknown, ""},
+		{"dev", "v0.1.7", UpdateUnknown, ""},
+		{"v0.1.7", "v0.1.7", UpdateCurrent, ""},
+		{pseudo, pseudo, UpdateUnknown, ""},
+	}
+	for _, tc := range cases {
+		if got := ReleaseState(tc.have, tc.latest); got != tc.state {
+			t.Errorf("ReleaseState(%q, %q) = %s, want %s", tc.have, tc.latest, got, tc.state)
+		}
+		if got, of := BuildState(tc.have, tc.latest); got != tc.state || of != tc.untaggedOf {
+			t.Errorf("BuildState(%q, %q) = %s, %q; want %s, %q", tc.have, tc.latest, got, of, tc.state, tc.untaggedOf)
+		}
+	}
+	node := version.Info{KubeVersion: "v1.37.1", Version: pseudo}.NodeVersion()
+	if got := NodeReleaseState(node, "v0.1.7"); got != UpdateAhead {
+		t.Errorf("NodeReleaseState(%q, v0.1.7) = %s, want ahead", node, got)
+	}
+	dirty := version.Info{KubeVersion: "v1.37.1", Version: pseudo, Dirty: true}.NodeVersion()
+	if got := NodeReleaseState(dirty, "v0.1.7"); got != UpdateUnknown {
+		t.Errorf("NodeReleaseState(%q, v0.1.7) = %s, want unknown", dirty, got)
+	}
+
+	now := time.Date(2026, 10, 25, 16, 0, 0, 0, time.UTC)
+	fresh := now.Add(-10 * time.Minute)
+	for _, tc := range []struct {
+		name   string
+		rec    UpdateRecord
+		state  RowState
+		detail string
+	}{
+		{"nodes ahead", UpdateRecord{CheckedAt: fresh, Latest: "v0.1.7", Nodes: []UpdateNode{nodeAt("a", pseudo, UpdateUnknown), nodeAt("b", pseudo, UpdateUnknown)}},
+			StateAhead, "newer than the latest release: a (untagged build of 0.1.8), b (untagged build of 0.1.8)"},
+		{"node behind", UpdateRecord{CheckedAt: fresh, Latest: "v0.1.7", Nodes: []UpdateNode{nodeAt("a", "v0.1.6-0.20261025152241-96fbff948562", UpdateUnknown)}},
+			StateBehind, "behind: a (untagged build of 0.1.6)"},
+		{"this Mac ahead", UpdateRecord{CheckedAt: fresh, Latest: "v0.1.7", Installed: pseudo, InstalledState: UpdateUnknown},
+			StateAhead, "this Mac (untagged build of 0.1.8)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := UpdateRowFrom(tc.rec, now)
+			if r.State != tc.state || !strings.Contains(r.Detail, tc.detail) {
+				t.Errorf("row = %s %q, want %s containing %q", r.State, r.Detail, tc.state, tc.detail)
+			}
+		})
+	}
+}
+
+// TestUpdateRowRederivesFromTheRunningVersion pins that the row does not
+// replay the verdict the record was written with: a record an older binary
+// left (every node and the binary on v0.1.7, the latest) reads against the
+// binary that runs now and the live node list this report took, so after an
+// in-place install of an untagged build the row says ahead. The record's
+// latest release and check time stay as recorded. With no live node list the
+// recorded nodes stay, re-ranked; with no nodes at all the running binary is
+// the fact.
+func TestUpdateRowRederivesFromTheRunningVersion(t *testing.T) {
+	now := time.Date(2026, 10, 25, 16, 0, 0, 0, time.UTC)
+	checked := now.Add(-20 * time.Minute)
+	const pseudo = "v0.1.8-0.20261025152241-96fbff948562"
+	wd := "/var/lib/k3sm/server"
+	path := UpdatePath(wd)
+	old := UpdateRecord{CheckedAt: checked, Latest: "v0.1.7", Published: "2026-10-05T00:00:00Z", Installed: "v0.1.7", InstalledState: UpdateCurrent,
+		Nodes: []UpdateNode{nodeAt("a", "0.1.7", UpdateCurrent), nodeAt("b", "0.1.7", UpdateCurrent)}}
+	noNodes := old
+	noNodes.Nodes = nil
+	running := version.Info{KubeVersion: "v1.37.1", Version: pseudo}
+	liveNode := func(name string) corev1.Node {
+		n := readyNode(name)
+		n.Status.NodeInfo.KubeletVersion = running.NodeVersion()
+		return n
+	}
+	live := []corev1.Node{liveNode("b"), liveNode("a")}
+	for _, tc := range []struct {
+		name   string
+		rec    UpdateRecord
+		ver    version.Info
+		live   []corev1.Node
+		liveOK bool
+		state  RowState
+		detail string
+	}{
+		{"live nodes on the new build", old, running, live, true, StateAhead,
+			"k3sm v0.1.7 is the latest; newer than the latest release: a (untagged build of 0.1.8), b (untagged build of 0.1.8)"},
+		{"node list not read keeps the recorded nodes", old, running, nil, false, StateOK, "every node runs the latest release, k3sm v0.1.7"},
+		{"no nodes, the running binary", noNodes, running, nil, false, StateAhead, "this Mac (untagged build of 0.1.8)"},
+		{"no nodes, a dirty running binary", noNodes, version.Info{Version: pseudo, Dirty: true}, nil, false, StateUnknown, "no tagged k3sm release reported by: this Mac"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := Collector{FS: fakeFS{contents: map[string][]byte{path: raw}}, Paths: Paths{WorkDir: wd}, EUID: 0, ServiceUID: 250, Version: tc.ver}
+			r, ok := c.updateRow(now, tc.live, tc.liveOK)
+			if !ok {
+				t.Fatal("no update row")
+			}
+			if r.State != tc.state || !strings.Contains(r.Detail, tc.detail) {
+				t.Errorf("row = %s %q, want %s containing %q", r.State, r.Detail, tc.state, tc.detail)
+			}
+			if r.Wide["latest"] != "v0.1.7" || r.Wide["checked"] != checked.Format(time.RFC3339) {
+				t.Errorf("wide = %v, want the recorded latest and check time", r.Wide)
+			}
+		})
+	}
 }

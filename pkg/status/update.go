@@ -50,38 +50,63 @@ const (
 	// UpdateBehind is one that runs an older release.
 	UpdateBehind = "behind"
 	// UpdateAhead is one that runs a release newer than the latest (a build
-	// from a tag not yet published as a release).
+	// from a tag not yet published as a release, or of an untagged commit past
+	// it).
 	UpdateAhead = "ahead"
-	// UpdateUnknown is one whose version is not a tagged release: no k3sm
-	// version at all, a dev build, or a build from a modified tree.
+	// UpdateUnknown is one whose version does not compare: no k3sm version at
+	// all, a dev build, or a build from a modified tree.
 	UpdateUnknown = "unknown"
 )
 
-// ReleaseState compares a k3sm release version with the latest release tag in
+// ReleaseState compares a k3sm build version with the latest release tag in
 // semver order, build metadata ignored: UpdateCurrent, UpdateBehind,
-// UpdateAhead, or UpdateUnknown when either is not a tagged release. It is the
-// one comparison both the check and the status row make.
+// UpdateAhead, or UpdateUnknown when latest is not a tagged release or have is
+// not comparable (a dev build, a build from a modified tree). A build of an
+// untagged commit (a Go pseudo-version) ranks by its core, so it is never
+// current (BuildState says it is untagged). It is the one comparison both the
+// check and the status row make; it is for display, and nothing that chooses
+// what to install acts on it.
 func ReleaseState(have, latest string) string {
-	cmp, ok := version.CompareReleases(have, latest)
+	state, _ := BuildState(have, latest)
+	return state
+}
+
+// BuildState is ReleaseState plus, for a build of an untagged commit, the
+// release core it was built as ("0.1.8"), so a caller can say it is an
+// untagged build; untaggedOf is empty for a tagged release.
+func BuildState(have, latest string) (state, untaggedOf string) {
+	cmp, of, ok := version.CompareBuild(have, latest)
 	switch {
 	case !ok:
-		return UpdateUnknown
+		return UpdateUnknown, ""
 	case cmp < 0:
-		return UpdateBehind
+		return UpdateBehind, of
 	case cmp > 0:
-		return UpdateAhead
+		return UpdateAhead, of
 	}
-	return UpdateCurrent
+	return UpdateCurrent, of
 }
 
 // NodeReleaseState is ReleaseState for a node's kubelet version, which carries
 // its k3sm release after "+k3sm." (version.Info.NodeVersion).
 func NodeReleaseState(kubelet, latest string) string {
+	state, _ := NodeBuildState(kubelet, latest)
+	return state
+}
+
+// NodeBuildState is BuildState for a node's kubelet version.
+func NodeBuildState(kubelet, latest string) (state, untaggedOf string) {
 	rel, ok := version.NodeRelease(kubelet)
 	if !ok {
-		return UpdateUnknown
+		return UpdateUnknown, ""
 	}
-	return ReleaseState(rel, latest)
+	return BuildState(rel, latest)
+}
+
+// UntaggedLabel is how a build of an untagged commit is named beside its
+// state: "untagged build of 0.1.8".
+func UntaggedLabel(untaggedOf string) string {
+	return "untagged build of " + untaggedOf
 }
 
 // UpdateRecord is what an update check records for `k3sm status`.
@@ -99,7 +124,9 @@ type UpdateRecord struct {
 	KubeVersion string `json:"kubeVersion,omitempty"`
 	// Installed is the version of the binary that ran the check,
 	// InstalledDirty whether it was built from a modified tree, and
-	// InstalledState how it compares with Latest (a reader recomputes it).
+	// InstalledState how it compares with Latest. A server's report replaces
+	// all three with the binary running when it reads the record
+	// (Collector.rederive), and every reader recomputes the state.
 	Installed      string `json:"installed,omitempty"`
 	InstalledDirty bool   `json:"installedDirty,omitempty"`
 	InstalledState string `json:"installedState,omitempty"`
@@ -270,8 +297,13 @@ func UpdatePath(workDir string) string {
 }
 
 // updateRow reads the update record, or false when this report has no work dir
-// to read it from.
-func (c Collector) updateRow(now time.Time) (Row, bool) {
+// to read it from. The record supplies the latest release and when it was
+// checked; each state is re-derived at read time from what runs now, since
+// the record is written only by the hourly check and `k3sm update check` and
+// so outlives an in-place install: this binary's version (c.Version) replaces
+// the recorded one, and the node list this report already took (live, when
+// liveOK) replaces the recorded nodes.
+func (c Collector) updateRow(now time.Time, live []corev1.Node, liveOK bool) (Row, bool) {
 	wd := c.Paths.WorkDir
 	if wd == "" || c.FS == nil {
 		return Row{}, false
@@ -292,12 +324,32 @@ func (c Collector) updateRow(now time.Time) (Row, bool) {
 		row.Detail, row.Remedy = "the update record does not parse: "+path, c.updateCheckRemedy()
 		return row, true
 	}
-	r := UpdateRowFrom(rec, now)
+	r := UpdateRowFrom(c.rederive(rec, live, liveOK), now)
 	r.Wide["record"] = path
 	if r.Remedy == UpdateCheckRemedy {
 		r.Remedy = c.updateCheckRemedy()
 	}
 	return r, true
+}
+
+// rederive replaces what rec recorded about the running versions with what
+// runs now: this binary's version and dirty flag (when the report knows it),
+// and every node's kubelet version from the live node list (when it was read).
+// The stored state words are cleared; UpdateRowFrom recomputes every state
+// from the versions and rec.Latest. Latest, Published, KubeVersion, CheckedAt,
+// Error and Roll are what the check found and stay as recorded.
+func (c Collector) rederive(rec UpdateRecord, live []corev1.Node, liveOK bool) UpdateRecord {
+	if c.Version.Version != "" {
+		rec.Installed, rec.InstalledDirty, rec.InstalledState = c.Version.Version, c.Version.Dirty, ""
+	}
+	if liveOK && len(live) > 0 {
+		rec.Nodes = make([]UpdateNode, 0, len(live))
+		for _, n := range live {
+			rec.Nodes = append(rec.Nodes, UpdateNode{Name: n.Name, Version: n.Status.NodeInfo.KubeletVersion, State: UpdateUnknown})
+		}
+		sort.Slice(rec.Nodes, func(i, j int) bool { return rec.Nodes[i].Name < rec.Nodes[j].Name })
+	}
+	return rec
 }
 
 // updateCheckRemedy is the refresh command for the account running the
@@ -351,8 +403,11 @@ func UpdateRowFrom(rec UpdateRecord, now time.Time) Row {
 		return row
 	}
 	var behind, ahead, unknown []string
-	add := func(name, ver, state string) {
+	add := func(name, ver, state, untaggedOf string) {
 		label := name + " (" + ClipText(ver, updateTextMax) + ")"
+		if untaggedOf != "" {
+			label = name + " (" + UntaggedLabel(untaggedOf) + ")"
+		}
 		switch state {
 		case UpdateBehind:
 			behind = append(behind, label)
@@ -363,16 +418,17 @@ func UpdateRowFrom(rec UpdateRecord, now time.Time) Row {
 		}
 	}
 	for _, n := range rec.Nodes {
-		add(n.Name, n.Version, NodeReleaseState(n.Version, rec.Latest))
+		state, of := NodeBuildState(n.Version, rec.Latest)
+		add(n.Name, n.Version, state, of)
 	}
-	// With no node list (no apiserver to ask), the binary that ran the check is
-	// the one fact there is.
+	// With no node list (no apiserver to ask), the binary is the one fact
+	// there is.
 	if len(rec.Nodes) == 0 {
-		state := UpdateUnknown
+		state, of := UpdateUnknown, ""
 		if !rec.InstalledDirty {
-			state = ReleaseState(rec.Installed, rec.Latest)
+			state, of = BuildState(rec.Installed, rec.Latest)
 		}
-		add("this Mac", rec.Installed, state)
+		add("this Mac", rec.Installed, state, of)
 	}
 	row.Remedy = ""
 	newer := ""

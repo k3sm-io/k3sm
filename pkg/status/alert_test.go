@@ -191,7 +191,7 @@ func alertCases() []alertCase {
 	}
 	updateFile := func(fsys fakeFS) func(t *testing.T) Row {
 		return func(t *testing.T) Row {
-			r, _ := Collector{FS: fsys, Paths: Paths{WorkDir: wd}, EUID: 501, ServiceUID: 250}.updateRow(now)
+			r, _ := Collector{FS: fsys, Paths: Paths{WorkDir: wd}, EUID: 501, ServiceUID: 250}.updateRow(now, nil, false)
 			return r
 		}
 	}

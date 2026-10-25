@@ -169,7 +169,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 		}
 		// Whether every node runs the latest release, from the last update
 		// check, on an installed Mac only (there is nothing to update before).
-		if r, ok := c.updateRow(now()); ok && installed {
+		if r, ok := c.updateRow(now(), nodes, nodesRead && nodesErr == nil); ok && installed {
 			rows = append(rows, r)
 		}
 	}
