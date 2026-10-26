@@ -32,14 +32,15 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
-// servingPosture is a server where metrics-server can serve: mesh serving certs.
+// servingPosture is a server where metrics-server can serve: the kubelet
+// serving certs chain to the cluster CA.
 // The add-on is a native pod, so no node capability is part of it.
 var servingPosture = Posture{ClusterCAKubeletServing: true}
 
 // TestMetricsServerAddonGate is the gate on WHERE the metrics-server add-on is
 // applied. Applied where it cannot serve, its APIService stays unavailable,
 // which breaks aggregated discovery and wedges namespace deletion, so it is
-// applied only on the mesh serving posture, and never
+// applied only on the cluster-CA kubelet serving posture, and never
 // over an operator's own metrics.k8s.io APIService. Elsewhere
 // it is skipped with one Info line naming the reason, and objects k3sm applied
 // earlier are withdrawn, the APIService first.
@@ -67,7 +68,7 @@ func TestMetricsServerAddonGate(t *testing.T) {
 		return n
 	}
 
-	t.Run("applied on the mesh serving posture", func(t *testing.T) {
+	t.Run("applied on the cluster-CA kubelet serving posture", func(t *testing.T) {
 		actions, logs := converge(t, servingPosture)
 		if applies := verifyTrafficShape(t, afterGuardRead(t, actions)); len(applies) != len(wantMetricsServerObjects) {
 			t.Errorf("%d applies, want %d", len(applies), len(wantMetricsServerObjects))

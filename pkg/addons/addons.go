@@ -51,8 +51,8 @@ var embedded embed.FS
 const manifestRoot = "manifests"
 
 // FieldManager is the server-side-apply field manager every object this package applies
-// is written under. It is deliberately NOT the bare "k3sm" manager, which is reserved for
-// the queued embedded-CRD applier: two independent appliers sharing one manager name
+// is written under. It is deliberately NOT the bare "k3sm" manager, which is the field manager
+// of the CRD applier (pkg/crdensure.DefaultFieldManager): two independent appliers sharing one manager name
 // would each take ownership of the other's fields and fight over them on every boot.
 const FieldManager = "k3sm-addons"
 

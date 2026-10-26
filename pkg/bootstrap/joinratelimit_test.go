@@ -84,7 +84,7 @@ func rateLimitJoin(t *testing.T, token, nodeName string) bootstrap.JoinRequest {
 //
 // What it costs per round trip: a bcrypt compare, a first-write-wins
 // node-password bind, a CSR parse and its policy checks, a mesh enroll that
-// carves an index plus the release that gives it back, and two signatures. A
+// carves an index plus the release that gives it back, and three signatures. A
 // holder of ONE token could drive that as fast as the network allows, and
 // nothing upstream of the limiter would refuse it.
 //
@@ -183,7 +183,7 @@ func TestJoinIsRateLimitedPerToken(t *testing.T) {
 		}
 
 		// The second token is a separate operator decision with its own budget:
-		// this is what makes "mint a token per batch" the real mitigation for
+		// this is what makes "mint a token per Mac" the real mitigation for
 		// onboarding several Macs at once.
 		for i := range bootstrap.JoinRateBurst {
 			if status, body := rig.post(t, rateLimitJoin(t, second, fmt.Sprintf("other-%d", i))); status != http.StatusOK {

@@ -108,7 +108,8 @@ func RequestHeaderCAKeyPath(workDir string) string {
 // same read-only contract: it reads only the certificate and returns its PinHash, it
 // creates nothing (an absent CA is ErrNoHierarchy), and it never opens the private
 // key, which is lstat'ed only to refuse a half-present pair (ErrIncompleteHierarchy).
-// `k3sm certificate rotate` and `k3sm status` read the pin with it.
+// `k3sm certificate rotate` reads the pin with it; the `k3sm status` request-header row
+// reads the certificate through its own collector filesystem.
 func LoadRequestHeaderPin(workDir string) (string, error) {
 	pin, err := caPin(RequestHeaderCACertPath(workDir), RequestHeaderCAKeyPath(workDir))
 	if err != nil {

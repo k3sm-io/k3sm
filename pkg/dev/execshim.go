@@ -65,7 +65,7 @@ type ExecShimBuilder interface {
 }
 
 // goExecShimBuilder is the production ExecShimBuilder over `go build` + `codesign`.
-// It mirrors executor.ensureKine (CGO_ENABLED=1 go build) and signs through
+// It builds with CGO_ENABLED=1 (libsandbox links) and signs through
 // binsign.Codesign, k3sm's one signing entry point.
 type goExecShimBuilder struct{}
 
@@ -74,7 +74,7 @@ func NewExecShimBuilder() ExecShimBuilder { return goExecShimBuilder{} }
 
 // Build runs `go build -o outPath k3sm.io/runtimed/cmd/k3sm-execshim` with
 // CGO_ENABLED=1, leaving GOWORK at the workspace default so the runtimed module
-// resolves. Mirrors executor.ensureKine's cgo build.
+// resolves.
 func (goExecShimBuilder) Build(ctx context.Context, outPath string) error {
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", outPath, execShimPkg)
 	// CGO_ENABLED=1 (libsandbox links); GOWORK is intentionally left at the

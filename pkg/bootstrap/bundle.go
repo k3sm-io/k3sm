@@ -28,9 +28,9 @@ import (
 	"fmt"
 )
 
-// AES-256-GCM bootstrap-bundle envelope parameters. The CA bundle (the four
-// cluster+signing CA PEMs an HA server-join reconstructs identical, certs.Hierarchy
-// .Marshal) is sealed under a key DERIVED from the high-entropy server-bootstrap secret
+// AES-256-GCM bootstrap-bundle envelope parameters. The CA bundle (the five
+// CA certificate and key PEMs an HA server-join reconstructs identical: cluster,
+// signing, etcd server, etcd peer and request-header; certs.Hierarchy.Marshal) is sealed under a key DERIVED from the high-entropy server-bootstrap secret
 // via PBKDF2-HMAC-SHA256 with a per-seal crypto/rand salt; a per-seal crypto/rand nonce
 // (NEVER a counter — launchctl kickstart resets in-process state, so a counter would
 // repeat and break GCM); and a versioned header bound as GCM AAD so a downgrade or any
