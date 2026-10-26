@@ -32,8 +32,8 @@ limitations under the License.
 //     bytes;
 //   - encryption at rest, rotation, listing, deletion, and re-wrapping every
 //     entry under a new master key;
-//   - the operator verbs `sudo k3sm keys put|list|rotate|rm|show`, which never
-//     print a value unless asked with --reveal;
+//   - the operator verbs `sudo k3sm keys put|list|show|rotate|rm|rewrap|deliver`,
+//     which never print a value unless asked with --reveal;
 //   - a control-plane reconciler, in the style of pkg/addons, that writes one
 //     labelled Secret per declared target, refuses delivery while secrets
 //     encryption is off unless the operator overrides that explicitly, and
@@ -57,11 +57,13 @@ limitations under the License.
 //   - Standard library only. No new module enters the graph for the keystore.
 //   - The master key is a mode 0600 file owned by the service user, with a
 //     fingerprint beside it, in a directory separate from the entries, so a
-//     copy of the entries alone decrypts nothing.
+//     copy of the entries alone decrypts nothing. It lives in its own
+//     subdirectory of the server's credential directory, and only k3sm mints
+//     it: no verb takes a key from the operator.
 //   - Every entry version is sealed with AES-256-GCM. The additional data is
 //     a length-prefixed encoding of (record-format version, kind, name,
-//     version), never a bare concatenation, so a ciphertext moved to another
-//     name, version or kind fails to open.
+//     version, generation), never a bare concatenation, so a ciphertext moved
+//     to another name, version, kind or generation fails to open.
 //   - The nonce is 96 bits from crypto/rand, fresh on every seal, Rewrap
 //     included, and never derived from the name or the version.
 //   - Rotation is crash safe: the new version is written and made durable
@@ -69,18 +71,26 @@ limitations under the License.
 //     is written to a temporary file and renamed into place, with the file and
 //     its directory fsynced. The pointer's target version is covered by the
 //     same authenticated record, so a writer of the files cannot roll an entry
-//     back by editing the pointer alone. A crash at any point leaves either the
-//     old or the new version current, never neither.
+//     back by editing the pointer alone. The pointer also carries a monotonic
+//     sequence, and the store records the highest sequence it has committed in
+//     a root-owned file a Pod cannot write, so an older pointer that still
+//     authenticates is refused. A crash at any point leaves either the old or
+//     the new version current, never neither.
 //   - Rewrap is two-phase: the new master key is written beside the old one,
-//     every version is re-sealed under it, and then the pointer to the master
-//     flips. A crash leaves both masters present and nothing unreadable.
+//     every record is re-sealed under it, and then the master flips. A crash
+//     leaves a state a rerun completes and nothing unreadable.
 //   - A Delete followed by a new Put of the same name at version 1 must not
 //     reopen a replayed old record: each record carries a per-entry
-//     generation, or the implementation states why replay is accepted under
-//     the same-user threat model.
+//     generation, bound into the additional data.
 //   - The master key file is opened with O_NOFOLLOW and checked with fstat on
 //     the open descriptor (owner, mode) and against its fingerprint. The
 //     fingerprint detects a wrong file, not tampering. `sudo k3sm keys` runs
 //     as root against a file owned by the service user, so ownership is
 //     checked, never assumed.
+//
+// # Acceptance
+//
+// docs/design/keystore.md specifies the acceptance gate, hack/acceptance/
+// keystore.sh, one test per requirement. The implementation is complete when
+// that gate passes.
 package keystore
