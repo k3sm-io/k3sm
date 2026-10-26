@@ -33,6 +33,8 @@ limitations under the License.
 // k3sm.io/zot-child" and zot's go directive to go.mod, run `go get -tool
 // zotregistry.dev/zot/v2/cmd/zot@<pin>`, then `go get` each childreq raise, then
 // `go mod tidy`, and check with `go list -m all` that only the raised modules moved.
+// Then vendor zot's own go.mod at the pin into pkg/registrysvc/testdata (from the
+// module proxy, with the header TestZotWrapperGraphMatchesPinnedZot checks).
 package zotchild
 
 import _ "embed" // the wrapper files below
