@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"k3sm.io/k3sm/pkg/builder"
@@ -46,20 +47,62 @@ type buildxSession struct {
 	env      []string
 }
 
-// newBuildxSession prepares a buildx run against the engine for workDir.
+// buildxSessionOptions is the builder options a buildx session runs with. Its
+// work dir comes from the environment only (K3SM_WORK_DIR, else the posture
+// default), never from a flag: `k3sm builder buildx` passes its argv to buildx
+// verbatim, and `k3sm build` has no --work-dir of its own. K3SM_WORK_DIR pins
+// that work dir's admin kubeconfig, as --work-dir does for the builder verbs.
+func buildxSessionOptions() builderOptions {
+	dir, explicit := builderWorkDir("")
+	return builderOptions{workDir: dir, workDirExplicit: explicit}
+}
+
+// buildxStateDir is where a buildx session stages the pinned binary
+// (executor.BinDir of it) and its BUILDX_CONFIG (builder.HostConfigDir of it).
+//
+// When the session runs on the work dir's admin kubeconfig (root, the _k3sm
+// service user, or an explicitly named work dir) that is the work dir, as it
+// always was. When the account runs on its own kubeconfig because the work dir
+// is not readable to it (an ordinary account on a root install), the work dir
+// is not its to write either, so the state goes under <home>/.k3sm, the
+// per-user home the build ledger already uses (<home>/.k3sm/builds).
+func buildxStateDir(opts builderOptions, in kubectlInputs, cfg kubectlConfig) (string, error) {
+	if cfg.kubeconfig != "" {
+		return opts.workDir, nil
+	}
+	if in.home == "" {
+		return "", errors.New("no home dir to stage the bundled buildx in: run with sudo, or set HOME")
+	}
+	return filepath.Join(in.home, ".k3sm"), nil
+}
+
+// newBuildxSession prepares a buildx run against the engine.
+//
+// The kubeconfig is the builder verbs' choice (builderKubeconfig): the work
+// dir's admin kubeconfig when it is readable or explicitly named, else the
+// account's own kubeconfig pinned to the installed context. The binary and
+// config are staged where buildxStateDir says, a directory this account owns.
 //
 // bootstrap decides what an ABSENT engine means. `k3sm builder buildx` passes
 // false: the operator is driving buildx directly, so the answer is the legible
 // refusal that names `k3sm builder up`. `k3sm build` passes true: a Dockerfile
 // that needs a real builder gets one, which is the whole point of there being a
 // single build command.
-func newBuildxSession(ctx context.Context, workDir string, bootstrap bool, out io.Writer) (buildxSession, error) {
-	// The buildx session stages its binary and config under workDir, so it
-	// keeps that work dir's admin kubeconfig with no user fallback.
-	mgr, err := newBuilderManager(builderOptions{workDir: workDir, workDirExplicit: true})
+func newBuildxSession(ctx context.Context, opts builderOptions, bootstrap bool, out io.Writer) (buildxSession, error) {
+	in := builderKubeInputs(opts)
+	cfg, err := builderKubeconfig(in)
 	if err != nil {
 		return buildxSession{}, err
 	}
+	stateDir, err := buildxStateDir(opts, in, cfg)
+	if err != nil {
+		return buildxSession{}, err
+	}
+	restCfg, cs, err := builderClients(in)
+	if err != nil {
+		return buildxSession{}, err
+	}
+	mgr := builderManagerFrom(restCfg, cs, opts)
 
 	var endpoint string
 	if bootstrap {
@@ -81,11 +124,11 @@ func newBuildxSession(ctx context.Context, workDir string, bootstrap bool, out i
 		}
 	}
 
-	bin, err := builder.EnsureHostBuildx(ctx, executor.BinDir(workDir))
+	bin, err := builder.EnsureHostBuildx(ctx, executor.BinDir(stateDir))
 	if err != nil {
 		return buildxSession{}, err
 	}
-	cfgDir := builder.HostConfigDir(workDir)
+	cfgDir := builder.HostConfigDir(stateDir)
 	if err := builder.EnsureBuilderInstance(ctx, bin, cfgDir, endpoint); err != nil {
 		return buildxSession{}, err
 	}
@@ -113,7 +156,7 @@ func runBuilderBuildx(args []string) error {
 
 	setupCtx, cancel := context.WithTimeout(context.Background(), buildxSetupTimeout)
 	defer cancel()
-	sess, err := newBuildxSession(setupCtx, workDirFromEnv(), false, os.Stdout)
+	sess, err := newBuildxSession(setupCtx, buildxSessionOptions(), false, os.Stdout)
 	if err != nil {
 		return err
 	}
