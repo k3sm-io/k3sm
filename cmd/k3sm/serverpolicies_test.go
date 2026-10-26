@@ -51,19 +51,19 @@ func testDeniedLocalPorts() []int {
 // half of the documented no-per-pod-uid-isolation ceiling, and it was previously
 // provisioned ONLY under the netd-helper backend — so a `--network none` or
 // `--network direct` cluster had no such object and ADMITTED a pod requesting a
-// foreign fsGroup/runAsUser, which is exactly what the first SIT T1 run observed.
+// foreign fsGroup/runAsUser, which is exactly what the first root `--network direct` run observed.
 //
-// k3sm-warn-pod-hand-set-internet-egress is the member: the policy landed
+// k3sm-warn-pod-hand-set-internet-egress is a member of the set: the policy landed
 // with its package-level tests, but bring-up never called the provisioner, so a live
 // cluster carried six policies and this list is what makes that seventh one's
 // absence a failing test rather than a `kubectl get vap` count nobody runs.
 //
-// k3sm-warn-pod-hand-set-xcode-toolchain is the member — the second hand-set
+// k3sm-warn-pod-hand-set-xcode-toolchain is a member of the set — the second hand-set
 // opt-in advisory, listed here for the same reason as the first: the two annotations
 // are provisioned side by side in bring-up, and this list is what keeps one of them
 // from being dropped while the other's tests stay green.
 //
-// k3sm-reject-service-denied-local-port is the member: the Service-side half
+// k3sm-reject-service-denied-local-port is a member of the set: the Service-side half
 // of the sandbox local-port deny. It is provisioned from the SAME
 // opts.deniedLocalPorts() value the node stamps onto every pod's SBPL, so its
 // absence means a Service can be published on a port every pod is denied
@@ -99,9 +99,9 @@ func TestBringupProvisionsPolicies(t *testing.T) {
 		{"", rootEUID},   // auto, root -> direct
 		{"auto", normalEUID},
 		{"auto", rootEUID},
-		{"none", normalEUID}, // the SIT T0 posture
+		{"none", normalEUID}, // the unprivileged `--network none` posture
 		{"none", rootEUID},
-		{"direct", rootEUID}, // the SIT T1 posture
+		{"direct", rootEUID}, // the root `--network direct` posture
 		{"helper", normalEUID},
 		{"helper", rootEUID},
 	}
@@ -173,8 +173,8 @@ func TestBringupForeignUserPolicyPinsThePodExecutionUID(t *testing.T) {
 		// provisioning to read os.Geteuid() instead of the euid it is handed,
 		// these rows would embed the developer's uid and fail.
 		{"unprivileged helper (the shipped posture)", "helper", 271},
-		{"unprivileged none (SIT T0)", "none", 271},
-		{"root direct (SIT T1)", "direct", 0},
+		{"unprivileged none", "none", 271},
+		{"root direct", "direct", 0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			mode, err := hostnet.ResolveFor(tt.network, tt.euid)

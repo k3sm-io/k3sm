@@ -37,7 +37,7 @@ import (
 
 const buildUsage = `k3sm build — build an image from a Dockerfile
 
-Usage: k3sm build --tag <ref> --output <path> [flags] <context-dir>
+Usage: k3sm build --tag <ref> [--output <path>] [flags] <context-dir>
        k3sm build ls [-o text|json]
        k3sm build cancel <id>
        k3sm build rm <id>
@@ -86,7 +86,7 @@ image when the Dockerfile needs the engine. An EXPLICIT Linux target always
 builds on the engine, so a COPY-only Dockerfile can produce a Linux image too:
 
   k3sm build -t myapp:v1 --platform linux/arm64 .
-  k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci -o out .
+  k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci --output out .
 
 Several platforms at once produce an index. The cluster registry, --output (as
 "oci") and --push carry every one of them; this node's cache holds the platform
@@ -178,7 +178,7 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	fs.StringVar(&o.dockerfile, "f", "", "short form of --file")
 	fs.StringVar(&o.tag, "tag", "", "image reference to assign, e.g. myapp:v1 (required)")
 	fs.StringVar(&o.tag, "t", "", "short form of --tag")
-	fs.StringVar(&o.output, "output", "", "additionally write the image to this path (the store recording always happens)")
+	fs.StringVar(&o.output, "output", "", "additionally write the image to this path (the cluster registry recording still happens unless --no-record is set)")
 	fs.BoolVar(&o.push, "push", false, "upload the image to the registry the tag names; required for a tag naming a registry other than the cluster registry, which is then not recorded")
 	fs.BoolVar(&o.noRecord, "no-record", false, "do not record the image in the cluster registry (never dials the runtime daemon, needs no root); requires --output or --push")
 	fs.StringVar(&o.format, "format", "docker", "output format: docker (a `docker load` tarball) or oci (an OCI layout dir)")
@@ -208,8 +208,9 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	}
 	o.contextDir = rest[0]
 
-	// --tag is required with or without --output: it NAMES the store entry the
-	// build always creates, and an unnamed recording is one nothing can select.
+	// --tag is required with or without --output: it names the image the build
+	// delivers (the cluster-registry entry, unless --no-record, and the --output
+	// and --push targets), and an unnamed image is one nothing can select.
 	if o.tag == "" {
 		return o, errors.New("--tag is required")
 	}

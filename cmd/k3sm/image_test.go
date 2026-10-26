@@ -203,7 +203,7 @@ func runImageCmd(t *testing.T, args []string) (string, error) {
 	return out.String(), err
 }
 
-// TestImagePruneIsAnRPCClient is the k3sm-side gate for B130b: `k3sm image
+// TestImagePruneIsAnRPCClient is the k3sm-side gate for the prune verb: `k3sm image
 // prune` is a CLIENT of the daemon's Images service. Deletion is daemon-owned —
 // no upstream runtime lets anything outside the store owner unlink, and a CLI
 // walking a live store cannot be made race-free by locking, because no lock it

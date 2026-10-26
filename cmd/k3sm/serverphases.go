@@ -652,13 +652,6 @@ func startServerOperators(ctx context.Context, plan serverPlan, restCfg *rest.Co
 	}
 }
 
-// startUpdateController is the update step: the update controller (pkg/updatectl),
-// which ensures the Update CRD and rolls the cluster to the release the
-// singleton Update names, workers first and this server last. It runs under
-// the in-process admin client, as the other server operators do, and under its
-// own Lease, so one server of an HA control plane rolls at a time. Same
-// lifetime as the MLX operator: drained before the control plane stops. A
-// client or controller that cannot be built is logged and stop is noStop.
 // updateSignerIssuer loads the cluster CA once, the way the server node's
 // identity does (EnsureHierarchy loads the existing CAs in every posture), and
 // returns the controller's IssueSigner: each call mints a fresh one-day update
@@ -680,6 +673,13 @@ func updateResolver(rawBase string) updatectl.HTTPResolver {
 	return updatectl.HTTPResolver{Base: releaseBaseURL(rawBase)}
 }
 
+// startUpdateController is the update step: the update controller (pkg/updatectl),
+// which ensures the Update CRD and rolls the cluster to the release the
+// singleton Update names, workers first and this server last. It runs under
+// the in-process admin client, as the other server operators do, and under its
+// own Lease, so one server of an HA control plane rolls at a time. Same
+// lifetime as the MLX operator: drained before the control plane stops. A
+// client or controller that cannot be built is logged and stop is noStop.
 func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
 	dyn, err := dynamic.NewForConfig(restCfg)
 	if err != nil {
@@ -737,8 +737,8 @@ func startUpdateController(ctx context.Context, plan serverPlan, restCfg *rest.C
 const updateControllerStopWait = 30 * time.Second
 
 // startMLXOperator is step 4f: the MLX operator, which ensures the MLXModel CRD,
-// then reconciles each MLXModel into a StatefulSet plus its headless and ClusterIP
-// Services. Same lifetime and the same reasoning as the provisioner — started
+// then reconciles each MLXModel into a StatefulSet (one operator-owned Pod per rank
+// for a sharded model) plus its headless and ClusterIP Services. Same lifetime and the same reasoning as the provisioner — started
 // once the apiserver is healthy, and drained BEFORE exec.Stop tears the control
 // plane down by a defer registered after it, so LIFO runs this one first. A
 // client or operator that cannot be built is logged and stop is noStop.

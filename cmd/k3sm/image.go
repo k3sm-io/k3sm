@@ -162,7 +162,7 @@ type imageOptions struct {
 	// cacheOnly marks a pull as a cache warm-up rather than an operator pull:
 	// the daemon records no operator root for it, so prune may reclaim the
 	// image once no pod uses it. No flag sets it; only the warm-up after a
-	// build, load or push into the cluster registry does.
+	// build, load or import into the cluster registry does.
 	cacheOnly bool
 	// digest is untag's --digest pin: the removal is refused unless the entry
 	// still resolves to it.
@@ -187,10 +187,11 @@ type imageOptions struct {
 	workDir string
 }
 
-// Ingest streams a whole archive, so it cannot share the deadline sized for a
-// metadata call: a multi-GB tar over a unix socket routinely outlives two
-// minutes, and a deadline that fires mid-stream throws away every byte already
-// sent. Both are still one flag — an explicit --timeout always wins.
+// Moving image content (load, import, push, pull, save) cannot share the
+// deadline sized for a metadata call: a multi-GB upload to or download from the
+// registry routinely outlives two minutes, and a deadline that fires mid-stream
+// throws away every byte already sent. Both are still one flag — an explicit
+// --timeout always wins.
 const (
 	metadataTimeout  = 2 * time.Minute
 	streamingTimeout = 30 * time.Minute
@@ -233,11 +234,13 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	}
 	fs.StringVar(&o.socket, "socket", runtimed.DefaultSocketPath, "runtimed control socket to dial")
 	// The control-plane state root, consulted by the verbs that talk to the
-	// cluster registry, and only to find this node's ingest-registry credential. A resolve failure is not reported here:
-	// every other subcommand is a client of runtimed and has no use for a work
-	// dir, so an unresolvable one must not make `k3sm image ls` fail.
+	// cluster registry (push, load, import, tag, untag, inspect, save, prune, and
+	// pull's copy into the cluster registry) to find this node's registry
+	// credential and, for prune, its store. A resolve failure is not reported
+	// here: ls and df find the registry through the cluster API and have no use
+	// for a work dir, so an unresolvable one must not make `k3sm image ls` fail.
 	defaultWorkDir, _ := executor.ResolveWorkDir()
-	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's registry push credential and store from (push, load, import, tag, untag, inspect, save, prune)")
+	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's registry push credential and store from (push, pull, load, import, tag, untag, inspect, save, prune)")
 	// DRY RUN IS THE DEFAULT and deleting takes an explicit flag, because the
 	// blast radius is asymmetric: a needless dry run costs a statfs, while an
 	// unintended prune on a node that cannot reach its registry costs every image

@@ -34,9 +34,8 @@ const canaryPort = 1023
 
 // TestWildcardPrivilegedBindPremise is the PREMISE CANARY for the wildcard-bind design.
 //
-// The entire design — LoadBalancer and ingress listeners binding 0.0.0.0 with the
-// root netd helper off the datapath, no privileged binder anywhere — rests on ONE
-// undocumented XNU behaviour, INVERTED from Linux:
+// The design for the helper-less posture, and for ports of 1024 and above — LoadBalancer
+// and ingress listeners binding 0.0.0.0 — rests on ONE undocumented XNU behaviour, INVERTED from Linux:
 //
 //	0.0.0.0:<1024   binds fine as an ordinary uid
 //	127.0.0.1:<1024 returns EACCES

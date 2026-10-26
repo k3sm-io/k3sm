@@ -36,7 +36,8 @@ import (
 
 // pruneReport is the `k3sm image prune -o json` document: what the prune
 // deleted, or would delete, from the cluster registry and from this node's
-// cache. The field names are the contract the app reads.
+// cache. The app reads the table renderPrune writes, not this document, so a
+// change to that table's lines is a change to the app's contract.
 type pruneReport struct {
 	DryRun   bool                `json:"dryRun"`
 	Registry registryPruneResult `json:"registry"`

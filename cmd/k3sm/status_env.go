@@ -258,9 +258,11 @@ func newStatusCollector() status.Collector {
 		// credential from one that was merely found.
 		ReviewSelf: statusReviewSelf,
 		// What proves, on a server, that the apiserver the report dials is
-		// this Mac's own: loopback or one of its addresses, at the apiserver
-		// port. A server installed with a non-default --api-port fails it, and
-		// those rows then stay unknown as an ordinary account.
+		// this Mac's own: the endpoints record the server published (its hosts
+		// and apiserver port), or, on a node older than the record, loopback or
+		// one of its addresses at the default apiserver port. Without the record,
+		// a server installed with a non-default --api-port fails it, and those
+		// rows then stay unknown as an ordinary account.
 		ServerAnchor: status.NodeAnchor(statusEndpoints(statusDir), status.ServerAnchor(executor.DefaultAPIServerPort, localAddrs())),
 		Paths:        paths,
 		EUID:         euid,

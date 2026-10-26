@@ -96,8 +96,8 @@ func TestPayloadSignatureRefusalParksImmediately(t *testing.T) {
 	}
 }
 
-// TestPermanentBringUpFailureParksImmediately is the two-tier breaker's gate
-// . A kine pin bump on a daemon whose launchd PATH has no `go` used to
+// TestPermanentBringUpFailureParksImmediately is the two-tier breaker's gate.
+// A kine pin bump on a daemon whose launchd PATH has no `go` used to
 // burn CrashLoopThreshold identical bring-up failures before parking, though
 // the fault could not heal on any lap. A failure carrying
 // executor.ErrNoGoToolchain through BringUpError's chain must park on the

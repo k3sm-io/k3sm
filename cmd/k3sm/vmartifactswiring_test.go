@@ -38,10 +38,10 @@ import (
 // tell whether anything ever CALLS it. Delete the two lines in buildProvider and
 // every other test in this repo stays green while no shipped node ever
 // materialises an artifact — the exact shape of the defect the startup pod reap
-// had before B-something forced it into NewRuntimed. The observable is therefore
+// once had, before it was wired into NewRuntimed. The observable is therefore
 // deliberately the ensure's own narration rather than any downstream state: with
-// the shipped (unminted) pin there IS no downstream state, which is precisely the
-// condition under which a missing call site is invisible.
+// a node whose fetch is refused there is no downstream state either, which is
+// precisely the condition under which a missing call site is invisible.
 //
 // It asserts on the structured `guest_kernel` ATTRIBUTE, not on the message
 // prose, so rewording the log line does not break it while removing the call does.

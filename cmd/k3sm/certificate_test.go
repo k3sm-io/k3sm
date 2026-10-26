@@ -114,7 +114,7 @@ type fileState struct {
 // walkTree records every path under root. withData selects whether file CONTENTS are
 // read, so a snapshot can be taken while a case has a file chmod 0000'd.
 //
-// Mode AND owner are always captured: R2's hazard is "the unprivileged _k3sm daemon
+// Mode AND owner are always captured: the hazard is "the unprivileged _k3sm daemon
 // can no longer open this path on its next boot", and a root chmod 0600 / chown 0:0
 // causes that just as surely as a write does. A snapshot that recorded only contents
 // would make the whole permission class of damage structurally invisible.
@@ -440,7 +440,7 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 			wantHealth:    true,
 		},
 		{
-			// 7 (R7): an unloaded/not-installed daemon errors — never a silent success.
+			// 7: an unloaded/not-installed daemon errors — never a silent success.
 			name:          "kickstart failure propagates",
 			restart:       true,
 			restarterErr:  errBoom,

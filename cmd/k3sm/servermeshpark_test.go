@@ -164,7 +164,7 @@ func TestMemberRoute409IsPermanent(t *testing.T) {
 	}
 }
 
-// TestJoinerRefusesAnUnacknowledgedMeshClaim is R5's capability handshake: a joiner
+// TestJoinerRefusesAnUnacknowledgedMeshClaim is the capability handshake: a joiner
 // that sent a mesh claim and got an answer without meshClaim=reserved (an existing
 // server that predates claims, which reserved nothing) refuses to start its member,
 // permanently, naming the upgrade. With the acknowledgement it proceeds, and a
@@ -211,7 +211,7 @@ func TestJoinerRefusesAnUnacknowledgedMeshClaim(t *testing.T) {
 	}
 }
 
-// TestAbandonedServerClaims is R7's predicate. A claim older than the abandonment
+// TestAbandonedServerClaims is the abandoned-claim predicate. A claim older than the abandonment
 // age is abandoned when it is a server's range with no Ready Node and no etcd member
 // (by name, or by the peer host its reservation recorded — all an unstarted learner
 // has), or when its holder has no MeshPeer at the range. Everything else is kept:

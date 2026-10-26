@@ -238,8 +238,7 @@ func TestEnrollAssignsLowestFreeIndexAboveZero(t *testing.T) {
 // allocation a join carved and then failed to use. The enroll is what DECIDES a
 // node's address, so it runs before the certificates are signed; without a release
 // every join that dies at its CSR leaves a MeshPeer holding a /24 that
-// lowestFreeNodeIndex will never hand out again, and index recycling across node
-// deletes does not exist to reclaim it.
+// lowestFreeNodeIndex will never hand out again.
 //
 // The list-back is the assertion that matters: "the delete returned nil" and "the
 // index can be assigned again" are different claims, and only the second one is
@@ -478,7 +477,7 @@ func TestEnrollSelfDoesNotWriteWithoutItsClaim(t *testing.T) {
 	}
 }
 
-// TestSelfEnrollRacesConcurrentJoinsWithoutSharingAnIndex is the d4 race test.
+// TestSelfEnrollRacesConcurrentJoinsWithoutSharingAnIndex is the race test for the self-enroll ordering.
 //
 // It runs the server's own enroll CONCURRENTLY with a burst of simulated worker
 // joins through the SAME enroller instance — the two-actor race the ordering

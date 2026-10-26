@@ -80,9 +80,9 @@ var (
 // THE UPLOAD IS NOT A DAEMON CLIENT. It reads a path the invoking user owns and
 // talks to a registry as that user, so no daemon has to be running for the
 // primary form. The store-ref form is the one exception, and it is contained:
-// the daemon is asked only for the BYTES, through the same verified SaveImage
-// export `k3sm image save` uses, and everything after that is the identical
-// layout upload.
+// the daemon is asked only for the BYTES, through the verified SaveImage
+// export (saveImageArchive, which the image migration also uses), and everything
+// after that is the identical layout upload.
 func imagePush(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer) error {
 	// Read as build --push reads its tag: a reference naming no registry names
 	// the cluster registry, not Docker Hub.

@@ -385,7 +385,7 @@ func TestRejoiningServerReclaimsItsRange(t *testing.T) {
 	}
 }
 
-// TestConcurrentEnrollersNeverShareARange is R1's proof: TWO enrollers — two
+// TestConcurrentEnrollersNeverShareARange is the concurrent-enroller proof: TWO enrollers — two
 // servers, each with its own mutex — serve concurrent worker joins against one
 // apiserver. Their only coordination is the claim object's create-if-absent, and no
 // /24 ends up held by two names: every peer's range is distinct, and every range's
