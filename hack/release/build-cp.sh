@@ -26,8 +26,8 @@
 #                    (cp-payload/<name>), the list stage.sh accepts
 #   --print-cache-key
 #                    print the key a cached build is valid for: the tag, the
-#                    toolchain and the hash of the raise list. stage.sh keys its
-#                    lab cache on it, so a change to any of the three rebuilds
+#                    toolchain and the hash of the raise, removal and held lists.
+#                    stage.sh keys its lab cache on it, so a change to any of them rebuilds
 #   --print-raises   print the raise list as "<module> <version>" lines, the
 #                    versions stage.sh requires the four binaries to link
 #   --print-raise-list-hash

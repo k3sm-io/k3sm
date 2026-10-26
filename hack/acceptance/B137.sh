@@ -385,7 +385,7 @@ else
 	ladder no "b137.T8  download-only: artifacts in cwd, no sudo (rc=$CASE_RC)"
 fi
 
-# T9 — zero-release latest shape (the exact state the live channel ships into).
+# T9 — zero-release latest shape (a channel with no published release yet).
 run_case t9 K3SM_INSTALL_BASE_URL="$BASE_ZERO"
 if [ "$CASE_RC" -ne 0 ] && has 'published yet' && no_exec; then
 	ladder ok "b137.T9  zero-release latest: friendly 'published yet?' abort"

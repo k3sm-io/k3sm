@@ -32,20 +32,6 @@
 #   real datastore; without K3SM_LAB the rungs are announced LAB-PENDING and never
 #   silently pass.
 #
-#   KNOWN BLOCKER, recorded 2026-08-30: this tier cannot reach its assertions yet.
-#   `--mesh-ip` bring-up dies inside the executor's Start — kube-controller-manager is
-#   given --root-ca-file <work-dir>/apiserver-certs/apiserver.crt, but the mesh path
-#   writes the apiserver serving cert under <work-dir>/tls/, leaving that dir empty.
-#   That is a SEPARATE defect, upstream of everything added (the CRD ensure runs
-#   after Start returns), and it is being fixed on its own item. The legs below stay
-#   FAILING until it lands — they are never softened into a skip, because "the mesh
-#   path cannot boot" is exactly the kind of thing a gate must keep saying out loud.
-#   The assertions themselves are NOT speculative: with that cert dir hand-seeded, a
-#   2026-08-30 run of exactly this bring-up logged `ensured the MeshPeer CRD` at
-#   .330 and `bootstrap supervisor listening` at .352 (the ordering, live), reported
-#   the CRD Established=True, and accepted the enroll-shaped MeshPeer below with
-#   every field reading back intact.
-#
 # THE MESH-REGRESSION OBLIGATION (what the apis accessor's doc comment owed). Adopting
 # MeshPeer into the applied set had to be shown not to perturb the mesh/enroll path.
 # Discharged by three legs, and honest about their reach:

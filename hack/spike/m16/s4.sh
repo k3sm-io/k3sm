@@ -56,7 +56,7 @@ MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
 
 # The worker's engine lives in its own package, exactly as the contract's own
 # documentation says a backend may: it does not need to be part of the upstream
-# repository, and the fleet work ships this file's descendant as hack/images/mlx-worker/src/.
+# repository, and the fleet work ships this file's descendant as the mlx-worker image.
 cat > "$W/mlx_engine.py" <<'PY'
 """An MLX backend for the upstream serving contract, in the shape the fleet work productizes.
 

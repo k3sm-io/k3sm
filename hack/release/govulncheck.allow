@@ -14,12 +14,13 @@
 # that matches no symbol-level finding in a scan is a red too: delete it, so
 # exemptions do not outlive what they excused.
 #
-# zot v2.1.22 links go.opentelemetry.io/otel v1.46.0 (GO-2026-6505, no fixed
-# version upstream), reviewed in the k3sm#815 security review. The five
+# zot v2.1.22 links the otlptracegrpc and otlptracehttp exporters at v1.44.0
+# (hack/deps-zotchild.lock; GO-2026-6505 is fixed in the otel exporters at v1.45.0,
+# which zot's graph does not select), reviewed in the k3sm#815 security review. The five
 # golang.org/x/net findings of that review are fixed: kine and zot are built
 # against x/net v0.60.0 (internal/childreq), and stage.sh refuses a staged
 # kine or zot that links an older one.
-GO-2026-6505 zot v2.1.22 go.opentelemetry.io/otel v1.46.0 otlptrace exporter endpoint URL logging, which concerns an OTLP endpoint URL k3sm never configures for zot; no fixed version upstream, accepted until one ships (k3sm#815 security review) 2026-11-15
+GO-2026-6505 zot v2.1.22 go.opentelemetry.io/otel exporters v1.44.0 otlptrace exporter endpoint URL logging, which concerns an OTLP endpoint URL k3sm never configures for zot; fixed in the exporters at v1.45.0, accepted until a zot release selects it (k3sm#815 security review) 2026-11-15
 #
 # GO-2026-5932 marks golang.org/x/crypto/openpgp deprecated and names no
 # vulnerable symbols, so govulncheck lists every openpgp package ("/*") for any

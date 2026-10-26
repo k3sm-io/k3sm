@@ -3,7 +3,7 @@
 # k3sm goreleaser snapshot acceptance gate — the runnable proof of the UNSIGNED goreleaser
 # SNAPSHOT config (.goreleaser.yaml): the single k3sm Mach-O plus its renamed
 # k3sm-netd copy, LICENSE and NOTICE, staged into a darwin/arm64 tarball with a
-# checksums file. Signing/notarization/tap-push are the human release-signing slice and are
+# checksums file. Signing and notarization are the human release-signing slice and are
 # stubbed-disabled in the config, so this gate proves BUILD SHAPE only.
 #
 # This is an integration-tier, lab-pending gate: goreleaser is not installed in

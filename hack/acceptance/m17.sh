@@ -7,7 +7,7 @@
 #
 # This is the M17 row in hack/acceptance/phases.json (gate hack/acceptance/m17.sh,
 # tier integration, requires dev-mac, manual: false, skeleton: true). It needs no
-# cable. The cabled slices are the SEPARATE rows M17.0 (hack/spike/m17/run.sh),
+# cable. The cabled slices are the SEPARATE rows: the M17 spike (hack/spike/m17/run.sh),
 # M17-lab (hack/lab/m17.sh) and M17-rdma (hack/lab/m17-rdma.sh), all manual: true.
 #
 # The REAL M17 gate is a COMPOSITE (listed below), written when the gate lands:

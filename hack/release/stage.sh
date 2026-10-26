@@ -1865,7 +1865,7 @@ else
 	if [ "$RELEASE" = 1 ]; then
 		# Fail before building or downloading anything. A release never signs a
 		# third-party build: the control-plane binaries must come from k3sm's own
-		# pinned-source build, which does not exist yet.
+		# pinned-source build, hack/release/build-cp.sh, handed in as --cp-build.
 		[ "$STUB_PAYLOAD" = 0 ] || die "--release cannot stage stub payload files"
 		[ -x "$HERE/build-cp.sh" ] || die "--release: hack/release/build-cp.sh is missing or not executable"
 		[ -n "$CP_BUILD" ] ||
@@ -1983,9 +1983,9 @@ fi
 
 echo "==> staging into $OUT (darwin/arm64)"
 
-# The pinned toolchain, before anything is built: `k3sm payload` builds kine and
-# etcd with the go on PATH (GOTOOLCHAIN=local), and the manifest records it. Stub
-# staging builds neither and is exempt.
+# The pinned toolchain, before anything is built: `k3sm payload` builds kine,
+# etcd, etcdutl, zot and helm with the go on PATH (GOTOOLCHAIN=local), and the
+# manifest records it. Stub staging builds none of them and is exempt.
 if [ "$STUB_PAYLOAD" = 0 ]; then
 	echo "==> assert the pinned Go toolchain ($PAYLOAD_GO_VERSION)"
 	tc_problem="$(toolchain_problems "$PAYLOAD_GO_VERSION")" || die "$tc_problem"
@@ -2034,10 +2034,10 @@ echo "==> build k3sm-vmhost (runtimed)"
 ( cd "$WS_ROOT" && go build -trimpath -o "$OUT/k3sm-vmhost" k3sm.io/runtimed/cmd/k3sm-vmhost )
 
 # The control-plane payload. `k3sm payload` downloads the pinned kwok-ci/k8s
-# binaries, builds kine (the patched build) and etcd and etcdutl (the wrapper module)
-# from pinned module source, exactly the builds the daemon would otherwise run on
-# demand, and — on this path — verifies every downloaded binary against its pinned
-# sha256, failing closed on a mismatch or an unexpected file. A module the cache
+# binaries, builds kine (the patched build), etcd and etcdutl (the wrapper module),
+# zot and helm from pinned module source, exactly the builds the daemon would
+# otherwise run on demand, and — on this path — verifies every downloaded binary
+# against its pinned sha256, failing closed on a mismatch or an unexpected file. A module the cache
 # lacks with no network reachable is reported as "needs network: <module>". The
 # four downloaded control-plane binaries are then replaced with build-cp.sh's.
 if [ "$STUB_PAYLOAD" = 1 ]; then

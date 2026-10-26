@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# k3sm M17 lab gate: the phases.json M17-lab row's path. The ladder itself, the
+# k3sm M17 lab gate shim: the former M17-lab gate path. The ladder itself, the
 # two-Mac interconnect ladder, lives in one place,
-# hack/lab/m17-interconnect.sh; this file only hands over to it, so the row's
-# gate path and every invocation of it keep working.
+# hack/lab/m17-interconnect.sh (the row's gate); this file only hands over to it, so
+# every existing invocation of hack/lab/m17.sh keeps working.
 #
 # Row in hack/acceptance/phases.json:
 #   M17-lab  gate hack/lab/m17-interconnect.sh, tier lab, requires two-macs +

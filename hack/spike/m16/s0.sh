@@ -596,7 +596,7 @@ except Exception as e:
   case "$G2N" in
     *M16-NATIVE*)
       verdict PASS "s0.3 guest->native  a vm guest reached the native pod's own lo0-alias pod IP $NIP:8099 directly"
-      recorded "s0.3 TRUST-DOMAIN FACT: that dial bypasses the Service proxy and the NetworkPolicy L4 hint, exactly as any same-node process does — docs/user/mlx-fleet.md must say so"
+      recorded "s0.3 TRUST-DOMAIN FACT: that dial bypasses the Service proxy and the NetworkPolicy L4 hint, exactly as any same-node process does — the MLX user docs (docs/user/mlx-quickstart.md) must say so"
       ;;
     *) verdict FAIL "s0.3 guest->native  blocked ($G2N) — the native-Darwin fallback applies: the control plane moves to the native-Darwin build" ;;
   esac

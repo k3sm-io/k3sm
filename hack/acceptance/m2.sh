@@ -97,7 +97,7 @@ echo "==> k3sm M2 acceptance (user-space: sudo k3sm install once, then fidelity 
 _sha() { local d="$1" s; s="$(git -C "$d" rev-parse --short HEAD 2>/dev/null || echo '?')"; git -C "$d" diff --quiet 2>/dev/null || s="$s+dirty"; printf '%s' "$s"; }
 echo "==> RUN $(date '+%Y-%m-%dT%H:%M:%S%z')  code: k3sm@$(_sha "$REPO_ROOT") runtimed@$(_sha "$REPO_ROOT/../runtimed")"
 
-# Build the single binary CGO_ENABLED=1 (kine sqlite), runtime pinned to runtimed.
+# Build the single binary CGO_ENABLED=1 (runtimed's darwin probes), runtime pinned to runtimed.
 ( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN" ./cmd/k3sm )
 codesign -s - -f "$BIN" >/dev/null 2>&1 || true
 # Build the k3sm-execshim Seatbelt helper BESIDE it — `k3sm install` stages the

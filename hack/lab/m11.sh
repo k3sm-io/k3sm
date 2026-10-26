@@ -7,7 +7,7 @@
 #
 #   M11-core  gate hack/lab/m11.sh, args ["--core"], tier lab, manual: true,
 #             requires dev-mac + vz + network. The LAUNCH row: the vm path
-#             (linux/arm64) must demonstrate this before v0.1 ships.
+#             (linux/arm64) must demonstrate this before a release ships.
 #   M11-lab   gate hack/lab/m11.sh (NO args), tier lab, manual: true,
 #             requires vz + network. The FULL vm-path ledger — every vm-path leg.
 #
@@ -59,9 +59,9 @@
 #                      the pod goes away, rather than hanging.
 #   m11.12 stats       FULL ONLY. The node's /stats/summary reports the vm pod with a
 #                      memory working set (per-container cgroup2 leaves exist in the
-#                      guest). Deliberately NOT `kubectl top`: that needs an
-#                      operator-installed metrics-server, which k3sm does not ship
-#                      (docs/user/limitations.md).
+#                      guest). Deliberately NOT `kubectl top`: that reads
+#                      metrics-server's aggregated API, a separate rung from the
+#                      node's own stats path.
 #
 # Every wait is bounded. A hang is a FAIL against a named rung, never a gate that runs
 # until someone kills it. Every object the gate creates lives in ONE namespace, deleted
@@ -913,9 +913,9 @@ else
 fi
 
 # ── m11.12 stats (FULL) ───────────────────────────────────────────────────────────
-# The node's own /stats/summary, NOT `kubectl top`: top needs an operator-installed
-# metrics-server, which k3sm deliberately does not ship (docs/user/limitations.md), so
-# asserting top would test the operator's cluster rather than k3sm's stats path.
+# The node's own /stats/summary, NOT `kubectl top`: top goes through
+# metrics-server, so asserting it would test that add-on rather than the vm pod's
+# stats path.
 if [ "$BOOT_OK" -eq 1 ]; then
 	SUMMARY="$(kubectl get --raw "/api/v1/nodes/$VM_NODE/proxy/stats/summary" 2>/dev/null || true)"
 	WS="$(printf '%s' "$SUMMARY" | python3 -c '

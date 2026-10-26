@@ -5,10 +5,10 @@
 # This is the M9 row in hack/acceptance/phases.json (gate hack/acceptance/m9.sh, tier
 # lab, requires dev-mac, manual: true, skeleton: true). M9 is the public flip / site
 # go-live / v0.1.0 tag / announcement. Its gate is a machine PRE-FLIGHT that
-# enumerates the launch-blocking gate set from the validation-debt disposition table
-# (m2/m3/m4 dev-mac, hack/lab/m3.sh two-Mac, hack/lab/m7.sh reboot/brew, the soak,
+# enumerates the launch-blocking gate set
+# (m2/m3/m4 dev-mac, hack/lab/m3.sh two-Mac, hack/lab/m7.sh reboot/install, the soak,
 # m8.sh MLX) and confirms each is green at the flip SHA. NONE of that enumeration
-# exists yet — it is tracked internally.
+# exists yet.
 #
 # Honesty contract (mirrors hack/lab/m7.sh; TestLabSkeletonHonesty pins it):
 #   - K3SM_LAB unset / != 1 (the common case, incl. CI): this pre-flight is NOT being
@@ -20,7 +20,7 @@
 #     flip; the gate therefore stays RED until the real launch pre-flight replaces
 #     this skeleton.
 #
-# Tier: lab (dev-mac). The real implementation is tracked internally.
+# Tier: lab (dev-mac). The real implementation is not written yet.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
@@ -31,7 +31,7 @@ if [ "${K3SM_LAB:-}" != "1" ]; then
 	exit 0
 fi
 
-# ── K3SM_LAB=1: the real pre-flight is tracked internally; this skeleton cannot prove it. ──
-echo "M9 gate: NOT YET IMPLEMENTED — the real M9 launch pre-flight (enumerate + verify the launch-blocking gate set at the flip SHA) is tracked internally; this skeleton cannot clear launch." >&2
+# ── K3SM_LAB=1: the real pre-flight is not written yet; this skeleton cannot prove it. ──
+echo "M9 gate: NOT YET IMPLEMENTED — the real M9 launch pre-flight (enumerate + verify the launch-blocking gate set at the flip SHA) is not written yet; this skeleton cannot clear launch." >&2
 echo "         (under K3SM_LAB=1 this exits 1 by design so the gate fails closed rather than falsely passing M9 from a placeholder; repo root: $REPO_ROOT)" >&2
 exit 1

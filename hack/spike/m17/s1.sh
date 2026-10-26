@@ -3,7 +3,7 @@
 # the cable, maps it to an interface by the method the product uses, and asks what
 # the link watcher can and cannot see.
 #
-#   (1) The F3 commands on both Macs (system_profiler SPThunderboltDataType -json and
+#   (1) The enumeration commands on both Macs (system_profiler SPThunderboltDataType -json and
 #       networksetup -listallhardwareports), through darwin-net's linkenum (the probe's
 #       `enum`), so the finding is about the production parser.
 #   (2) Domain UUID <-> peer: a port pair whose peer domain UUIDs point at each other.

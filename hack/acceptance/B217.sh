@@ -175,7 +175,7 @@ else
 			# helpers; the operator running this tier fills in the datapath probe (two
 			# Pods on :8080 + a curl through each Service VIP). Left as an explicit
 			# operator step rather than a half-tested auto-run, per the lab-run contract.
-			lab_pending "b217.L1-L5  apply examples/two-bind-8080.yaml and probe each podIP:8080 (operator step; see the header)"
+			lab_pending "b217.L1-L5  two Pods each binding :8080, each probed at its own podIP:8080 (no fixture ships; run by hand)"
 			cluster_down || true
 		else
 			ladder no "b217.L0  single-node cluster up (cluster_up failed — see output above)"

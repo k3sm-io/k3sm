@@ -32,7 +32,7 @@
 
 | # | criterion | observed | consequence this selects |
 |---|---|---|---|
-| **6** | source address the host observes | **the guest's own vmnet IP** — `192.168.64.5`, on TCP and UDP, to both a wildcard-bound and a gateway-address-bound host listener | **per-pod attribution is a straight map; per-pod attributionb is tractable and the lease→pod registry is buildable.** The gateway-rewrite branch is NOT taken, so per-pod attributiona's fail-closed does not become the permanent answer |
+| **6** | source address the host observes | **the guest's own vmnet IP** — `192.168.64.5`, on TCP and UDP, to both a wildcard-bound and a gateway-address-bound host listener | **per-pod attribution is a straight map; the lease-based per-pod attribution is tractable and the lease→pod registry is buildable.** The gateway-rewrite branch is NOT taken, so the fail-closed default does not become the permanent answer |
 | **2** | guest vmnet address host-dialable | **yes** — `192.168.64.5:34811` dialed and delivered from the host | the one path carrying readiness probes, port-forward and the Service-proxy backend dial exists; no netd verb needed for host→guest |
 | **1a** | guest → host listener, no route added | **wildcard-bound: connected. Gateway-address-bound: connected. Loopback(127.0.0.1)-bound: refused** (TCP); UDP identical by host receipt | a guest reaches any host listener that binds the vmnet gateway address or the wildcard. It does **not** reach a loopback-only bind — which is exactly the shape a ClusterIP lo0 alias has, so this is the first evidence that the VIP leg is not free |
 | **1b** | guest-side route for a service-CIDR prefix | `ip route add 10.43.0.0/16 via 192.168.64.1` **accepted**; the dial to `10.43.0.10:34807` got **no answer after 6s** with **`tx_packets_delta=6`** | packets for a service-CIDR prefix **do leave the guest** and are handed to the host as the next hop. Whether the host then weak-host-delivers them to a lo0-alias VIP is UNANSWERED here (no VIP could be plumbed unprivileged) — see the human slice |
@@ -41,7 +41,7 @@
 | **1 (VIP-c)** | + host `net.inet.ip.forwarding=1` | **delivers, both TCP and UDP/53** | consistent with (a); adds nothing (a) did not already give |
 | **1 (VIP-d)** | + an explicit host route for the VIP on lo0 | **delivers, both TCP and UDP/53** | consistent with (a); adds nothing (a) did not already give |
 | **4** | guest ↔ guest | **NOT reachable, in either protocol** — ICMP 100% loss, TCP unreachable, ARP FAILED — while both guests were proven live to the host | the trust ceiling is **narrower than the guest-networking note assumed**: on this rig two vm pods on the same NAT segment cannot address each other directly. See the caveat below before this is published |
-| **5** | lease stability under a deterministic MAC | **stable**: `192.168.64.5` on all 3 restarts of the same MAC; a control MAC got a different address (`192.168.64.6`) | the deterministic-MAC lease is semi-stable enough for per-pod attributionb's address→pod registry, **provided** the lease-change liveness contract is still implemented — stability observed over 3 restarts is not a guarantee |
+| **5** | lease stability under a deterministic MAC | **stable**: `192.168.64.5` on all 3 restarts of the same MAC; a control MAC got a different address (`192.168.64.6`) | the deterministic-MAC lease is semi-stable enough for the lease-based per-pod attribution's address→pod registry, **provided** the lease-change liveness contract is still implemented — stability observed over 3 restarts is not a guarantee |
 | **7** | guest link MTU | **1500** | above the ≤1380 the mesh mss-clamp reasoning assumes. If cross-node vm traffic is ever claimed, the DHCP/init plan must set the guest MTU down — the link will not do it |
 | **3** | PodIP-as-guest-eth0-alias + a host route | **delivers** — host dials the PodIP and the guest receives the exact payload | the PodIP-as-alias model, if adopted, needs a narrow privileged **host-route** verb (the netd route-verb shape) for THIS leg only — the VIP-delivery legs above need no privileged surface at all |
 
@@ -311,7 +311,7 @@ fixed string; the address did not move. The control MAC took a different
 address in the same session, so the stability is MAC-derived and not "this
 server hands out one address".
 
-**Consequence.** per-pod attributionb's address→pod registry is buildable. The observation does
+**Consequence.** the lease-based per-pod attribution's address→pod registry is buildable. The observation does
 NOT license dropping the lease-change liveness contract: three restarts inside
 one session say nothing about a lease expiring, a reboot of the host, or
 another guest taking the address after a long gap.

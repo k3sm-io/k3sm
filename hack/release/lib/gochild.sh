@@ -2,9 +2,10 @@
 #
 # gochild.sh: the toolchain pin and the build checks for every binary k3sm builds
 # from a pinned Go module OUTSIDE its own go.mod. Sourced, never run. Its callers
-# are hack/release/stage.sh (kine, etcd, etcdutl and zot, which `k3sm payload`
-# builds) and hack/images/metrics-server/build.sh (the native metrics-server
-# image). One home, so a recipe cannot drift from the payload's discipline:
+# are hack/release/stage.sh (kine, etcd, etcdutl, zot and helm, which `k3sm payload`
+# builds), hack/release/build-cp.sh (the control-plane binaries, which take
+# PAYLOAD_GO_VERSION from here) and hack/images/metrics-server/build.sh (the native
+# metrics-server image). One home, so a recipe cannot drift from the payload's discipline:
 #
 #   PAYLOAD_GO_VERSION   the exact Go release every such build runs under
 #   toolchain_problems   the go on PATH, under GOTOOLCHAIN=local, is that release

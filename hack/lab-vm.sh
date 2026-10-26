@@ -194,7 +194,7 @@ base_present() {
 # as an option however it was meant, and -oProxyCommand=<cmd> is executed BY THE
 # LOCAL SHELL, ON THIS HOST, before any guest is contacted. That is a second path
 # from the harness to a real machine — exactly what guest_exec exists to prevent
-# and what b149.4 certifies does not exist. Two independent controls now stand in
+# and what hack/acceptance/B149.sh certifies does not exist. Two independent controls now stand in
 # the way: this charset check (no leading '-', no shell metacharacters), and
 # guest_exec's use of `-l <user> <host>`, which puts the account in an option
 # VALUE position where it can never be re-read as a flag.

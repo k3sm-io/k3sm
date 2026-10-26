@@ -700,7 +700,7 @@ export S5_SHARE_DIR="$S5DIR/share" S5_WAIT=70
 
 # A locally-administered MAC derived from a fixed string, so the DHCP server
 # sees the SAME client across restarts. Criterion 5 asks whether that is enough
-# to keep the lease: per-pod attributionb's address->pod registry is only buildable if it is.
+# to keep the lease: the lease-based per-pod attribution's address->pod registry is only buildable if it is.
 MAC_A=$(printf '5a:c3:%s' "$(echo -n k3sm-s5-guest-a | shasum -a 256 | cut -c1-8 | sed 's/../&:/g;s/:$//')")
 MAC_CTL=$(printf '5a:c3:%s' "$(echo -n k3sm-s5-guest-ctl | shasum -a 256 | cut -c1-8 | sed 's/../&:/g;s/:$//')")
 echo "S5_C5_MAC_A=$MAC_A"

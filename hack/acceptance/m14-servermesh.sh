@@ -9,7 +9,7 @@
 # worker had an AllowedIPs route to its /24, and the server's own Service proxy was
 # left with MeshEgressIP deliberately EMPTY — because the proxy bound that source
 # on EVERY dial, and a non-local value there broke all backend dials, including
-# same-node loopback. fixes both halves: the server enrolls itself at index 0
+# same-node loopback. This change fixes both halves: the server enrolls itself at index 0
 # (k3sm, this gate) and the source bind becomes destination-scoped (darwin-net).
 #
 # WHY THIS GATE EXISTS SEPARATELY FROM m3.sh: hack/acceptance/m3.sh boots
@@ -26,7 +26,7 @@
 #   the mesh-IP alias ensure, and — the legs that catch this repo's recurring
 #   defect class of a well-tested helper bring-up never calls — the structural
 #   ORDERING pins read out of cmd/k3sm/server.go. Plus the two-actor race test that
-#   pins the d4 happens-before, run under -race.
+#   pins the server-enroll-before-worker-join happens-before, run under -race.
 #   RED BEFORE: on the unmodified tree EnrollSelf, lowestFreeNodeIndex,
 #   loadOrCreateServerMeshKey and enrollSelfAndBringUpMesh do not exist, so the Go
 #   legs fail to build and every structural pin fails.
@@ -169,7 +169,7 @@ else
 	ladder no "m14.1  ensureMeshIPAlias(:${ali_ln:-none}) < exec.Start(:${sup_start_ln:-none}) — the apiserver would bind a --mesh-ip nothing has plumbed"
 fi
 
-# d8 — the doc deliverable, and the retirement of the claim it replaces.
+# The doc deliverable, and the retirement of the claim it replaces.
 d=ok
 grep -q 'destination-scoped' "$DESIGN_MD" || d=no
 grep -q 'The server is a peer, not only a broker' "$DESIGN_MD" || d=no
@@ -211,7 +211,7 @@ run_test() {
 	fi
 }
 
-# ---- m14.2 — the index-0 pin and the allocator (d3) -------------------------
+# ---- m14.2 — the index-0 pin and the allocator -------------------------
 run_test "m14.2" 9 TestNodeIndexOf                                  ./cmd/k3sm/
 run_test "m14.2" 10 TestLowestFreeNodeIndex                         ./cmd/k3sm/
 run_test "m14.2" 0 TestLowestFreeNodeIndexExhaustsClosed            ./cmd/k3sm/
@@ -220,21 +220,21 @@ run_test "m14.2" 0 TestEnrollSelfPinsIndexZero                      ./cmd/k3sm/
 run_test "m14.2" 0 TestEnrollSelfFailsClosedOnAForeignIndexZeroClaim ./cmd/k3sm/
 run_test "m14.2" 0 TestEnrollSelfRequiresTheWriteToReadBack         ./cmd/k3sm/
 
-# ---- m14.3 — the d4 happens-before, under -race ----------------------------
+# ---- m14.3 — the server-enroll happens-before, under -race ----------------------------
 # The two-actor race: the server's own enroll against a burst of simulated worker
 # joins through ONE enroller. -race is not decoration here — the property being
 # proven is that two entry points sharing an allocator never hand out one /24, and
 # an unsynchronized read is exactly how that would regress.
 run_test "m14.3" 0 TestSelfEnrollRacesConcurrentJoinsWithoutSharingAnIndex ./cmd/k3sm/ -race
 
-# ---- m14.4 — the persistent identity + the bring-up contract (d2/d6) -------
+# ---- m14.4 — the persistent identity + the bring-up contract -------
 run_test "m14.4" 0 TestServerMeshKeyIsMintedOnceAndReused           ./cmd/k3sm/
 run_test "m14.4" 3 TestServerMeshKeyRefusesAnUnusableFile           ./cmd/k3sm/
 run_test "m14.4" 0 TestServerMeshKeyRefIsNotTheAgentRef             ./cmd/k3sm/
 run_test "m14.4" 0 TestServerMeshEndpointPrefersAnUnderlayAddress   ./cmd/k3sm/
 run_test "m14.4" 0 TestBringUpMeshRefusesAMeshIPTheCIDRDoesNotDerive ./cmd/k3sm/
 
-# ---- m14.5 — the bring-up wiring, structurally (d4/d5/d7) ------------------
+# ---- m14.5 — the bring-up wiring, structurally ------------------
 run_test "m14.5" 0 TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener ./cmd/k3sm/
 run_test "m14.5" 0 TestRunServerSharesOneMeshEnroller               ./cmd/k3sm/
 run_test "m14.5" 0 TestServerMeshBringUpIsLogAndContinue            ./cmd/k3sm/

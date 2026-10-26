@@ -290,7 +290,7 @@ run_test "builder.12d" 2 TestLayoutSinkWriteIndex ./pkg/oci/
 
 # ---- builder.13 — no Docker Desktop deep link ------------------------------
 # A Mac that once used Desktop's build backend made buildx end every build with
-# "View build details: docker-desktop://…". buildx v0.17.1 gates that print on
+# "View build details: docker-desktop://…". buildx (read at v0.17.1; the shipped pin is v0.38.0) gates that print on
 # os.Stat($HOME/.docker/desktop-build/.lastaccess) taken from os.UserHomeDir()
 # LITERALLY (util/desktop/desktop.go), so the only lever is HOME — and moving
 # HOME is safe only because DOCKER_CONFIG hands the credentials back. Both
