@@ -20,30 +20,39 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 
 	"k3sm.io/k3sm/pkg/builder"
 	"k3sm.io/k3sm/pkg/executor"
 )
 
-// fakeAPIServer is an apiserver that knows no objects: every request is a 404,
-// so the builder's Service lookup reports builder.ErrAbsent. hits counts the
-// requests, which is how a case proves WHICH kubeconfig the session dialled.
-func fakeAPIServer(t *testing.T) (string, *atomic.Int32) {
+// fakeBuildxClients replaces the session's client seam for one test. The fake
+// resolves the kubeconfig exactly as builderClients does (builderKubeconfig over
+// the session's inputs), records the choice, and returns an empty fake
+// clientset, so the builder's Service lookup reports builder.ErrAbsent without
+// any socket. calls counts how often the session reached the seam.
+func fakeBuildxClients(t *testing.T) (chosen *kubectlConfig, calls *int) {
 	t.Helper()
-	var hits atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		http.NotFound(w, r)
-	}))
-	t.Cleanup(srv.Close)
-	return srv.URL, &hits
+	chosen, calls = &kubectlConfig{}, new(int)
+	prev := buildxClients
+	buildxClients = func(in kubectlInputs) (*rest.Config, kubernetes.Interface, error) {
+		*calls++
+		cfg, err := builderKubeconfig(in)
+		if err != nil {
+			return nil, nil, err
+		}
+		*chosen = cfg
+		return &rest.Config{}, fake.NewClientset(), nil
+	}
+	t.Cleanup(func() { buildxClients = prev })
+	return chosen, calls
 }
 
 // TestBuildxSessionUnprivilegedOnRootInstall is the gate for the buildx session
@@ -65,8 +74,8 @@ func TestBuildxSessionUnprivilegedOnRootInstall(t *testing.T) {
 		adminKubeconfig bool
 		// userKubeconfig writes the account's ~/.kube/config when true.
 		userKubeconfig bool
-		// wantDial is "admin" or "user": the kubeconfig the session must reach
-		// the cluster through ("" when the session must fail first).
+		// wantDial is "admin" or "user": the kubeconfig the session must build
+		// its clients from ("" when the session must fail first).
 		wantDial string
 		// wantStateUnderHome stages buildx under <home>/.k3sm, else the work dir.
 		wantStateUnderHome bool
@@ -118,13 +127,12 @@ func TestBuildxSessionUnprivilegedOnRootInstall(t *testing.T) {
 			} else {
 				t.Setenv("K3SM_WORK_DIR", "")
 			}
-			adminURL, adminHits := fakeAPIServer(t)
-			userURL, userHits := fakeAPIServer(t)
+			chosen, calls := fakeBuildxClients(t)
 			if tt.adminKubeconfig {
-				writeKubeconfigAt(t, executor.KubeconfigPath(workDir), adminURL)
+				writeKubeconfigAt(t, executor.KubeconfigPath(workDir), "https://127.0.0.1:6443")
 			}
 			if tt.userKubeconfig {
-				writeContextKubeconfig(t, filepath.Join(home, ".kube", "config"), contextName, userURL)
+				writeContextKubeconfig(t, filepath.Join(home, ".kube", "config"), contextName, "https://127.0.0.1:16443")
 			}
 
 			opts := buildxSessionOptions()
@@ -135,7 +143,7 @@ func TestBuildxSessionUnprivilegedOnRootInstall(t *testing.T) {
 				t.Fatalf("session workDirExplicit = %v, want %v", opts.workDirExplicit, tt.explicitWorkDir)
 			}
 
-			// bootstrap=false: the empty fake cluster has no engine, so a session
+			// bootstrap=false: the empty fake clientset has no engine, so a session
 			// that reached it stops at ErrAbsent, before any buildx download.
 			_, err := newBuildxSession(context.Background(), opts, false, io.Discard)
 			if tt.wantDial == "" {
@@ -147,18 +155,25 @@ func TestBuildxSessionUnprivilegedOnRootInstall(t *testing.T) {
 						t.Errorf("error %q does not contain %q", err.Error(), want)
 					}
 				}
-				if adminHits.Load()+userHits.Load() != 0 {
-					t.Errorf("a failed kubeconfig choice still dialled a cluster")
+				if *calls != 0 {
+					t.Errorf("a failed kubeconfig choice still built clients (%d calls)", *calls)
 				}
 				return
 			}
 			if !errors.Is(err, builder.ErrAbsent) {
-				t.Fatalf("newBuildxSession err = %v, want builder.ErrAbsent from the fake cluster", err)
+				t.Fatalf("newBuildxSession err = %v, want builder.ErrAbsent from the fake clientset", err)
 			}
-			dialled := map[string]int32{"admin": adminHits.Load(), "user": userHits.Load()}
-			for who, n := range dialled {
-				if (who == tt.wantDial) != (n > 0) {
-					t.Errorf("%s kubeconfig dialled %d times; want the session to dial only %s", who, n, tt.wantDial)
+			if *calls != 1 {
+				t.Fatalf("session built clients %d times, want 1", *calls)
+			}
+			switch tt.wantDial {
+			case "admin":
+				if want := executor.KubeconfigPath(workDir); chosen.kubeconfig != want || chosen.context != "" {
+					t.Errorf("session chose %+v, want the admin kubeconfig %s", *chosen, want)
+				}
+			case "user":
+				if chosen.kubeconfig != "" || chosen.context != contextName {
+					t.Errorf("session chose %+v, want the user kubeconfig at context %q", *chosen, contextName)
 				}
 			}
 

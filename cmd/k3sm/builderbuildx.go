@@ -76,6 +76,11 @@ func buildxStateDir(opts builderOptions, in kubectlInputs, cfg kubectlConfig) (s
 	return filepath.Join(in.home, ".k3sm"), nil
 }
 
+// buildxClients builds the session's clients from the resolved kubeconfig
+// inputs. It is a variable only so the unit tests can see which kubeconfig the
+// session chose and hand back a fake clientset instead of dialling a cluster.
+var buildxClients = builderClients
+
 // newBuildxSession prepares a buildx run against the engine.
 //
 // The kubeconfig is the builder verbs' choice (builderKubeconfig): the work
@@ -98,7 +103,7 @@ func newBuildxSession(ctx context.Context, opts builderOptions, bootstrap bool, 
 	if err != nil {
 		return buildxSession{}, err
 	}
-	restCfg, cs, err := builderClients(in)
+	restCfg, cs, err := buildxClients(in)
 	if err != nil {
 		return buildxSession{}, err
 	}
