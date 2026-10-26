@@ -58,9 +58,14 @@ improvement over a hand-made Secret. The value is on the *host* side: encrypted 
 instead of plaintext in kine, named and versioned instead of an anonymous datastore row,
 rotated by one command with a rollback path instead of an unrecoverable manual edit.
 
-One consequence shapes the design: every file the service user owns is writable by every
-native Pod. Anything whose integrity must hold against a Pod therefore either carries an
-authenticated record, or lives where only root can write it. Both are used below.
+One consequence shapes the design. Ownership is not a barrier between a Pod and the
+service user's files, because they share a uid. What keeps a confined native Pod out of
+`<work dir>/server` is runtimed's Seatbelt profile, which denies it read and write there
+(`DaemonTreeSubdirs` in runtimed's `pkg/sandbox`, rendered after every allow so not even a
+caller-supplied extra path overrides it). That is a profile rule, not a permission, and it
+names the default work dir. So anything whose integrity must hold against a process running
+as the service user outside that profile either carries an authenticated record, or lives
+where only root can write it. Both are used below.
 
 ## Storage format and master key
 
@@ -231,9 +236,12 @@ equals the floor's generation for that name, and the pointer's sequence is at le
 floor's. So an older `current` that still authenticates is refused.
 
 **Where the floor lives is the load-bearing choice.** A floor kept in the service user's
-tree would be one more file a Pod can copy back, and the check would only be as strong as
-the attacker's patience. `keystore-floor.json` is therefore root:wheel 0644 in the
-root-owned data root, written only by root-run verbs, and read with the same check
+tree would be one more file that any process running as the service user can copy back, and
+the check would only be as strong as that process's patience. `keystore-floor.json` is
+therefore root:wheel 0644 directly under the data root. The data root is root:wheel 0755
+(`pkg/install/statetree.go`), and on macOS the right to create, rename or unlink an entry is
+the parent directory's write bit, so the service user cannot replace the file. It is
+written only by root-run verbs, and read with the same check
 `pkg/addons` applies to the manifest directory (`rootOwnedNotShared`, judged on the opened
 descriptor with O_NOFOLLOW): refused unless root-owned and not group/other-writable. Every
 mutating verb is already root-run, so no write path loses anything by this; the service
@@ -311,9 +319,10 @@ exclusive for Put, Rotate, Delete and Rewrap, shared for List, Get and Current. 
 serializes Rewrap, Rotate and Put against each other and against the reconciler's reads.
 
 - Every acquisition has a bounded wait (10 seconds). A timeout is an error, never an
-  indefinite block: a Pod owns the lock file and could hold it, which is a denial of
-  service the same-user model already permits (that Pod can delete the entries), and a
-  reconciler that times out simply tries again on its next sweep.
+  indefinite block: the service user owns the lock file, so any process running as it
+  could hold the lock, a denial of service the same-user model already permits (that
+  process can delete the entries), and a reconciler that times out simply tries again on
+  its next sweep.
 - Each file write is still temp-and-rename, so a process that dies releases the lock and
   leaves a state the next operation can finish or discard. The lock is for serialization,
   not for crash safety.
@@ -434,9 +443,10 @@ root:wheel 0644, atomically (temp-and-rename), and nothing else writes it:
 ```
 
 `secretName` defaults to the entry name and `dataKey` to `value`. The file is root-owned
-and outside the service user's tree for the reason `pkg/addons/doc.go` gives for the
-manifest directory: a Pod can write the service user's tree, and a declaration a Pod could
-write would let a Pod choose which namespace gets a Secret. It is read with the manifest
+and outside the service user's tree for the reason the manifest directory is
+(`pkg/install/statetree.go`'s `ManifestDirMode`): the declaration decides which namespace
+the admin client writes a Secret into, so a file any process running as the service user
+could write would hand that process the reconciler's grant. It is read with the manifest
 directory's check (`rootOwnedNotShared`, on the opened descriptor, O_NOFOLLOW); a file
 that fails the check is refused as a whole and logged. The reconciler sweeps on start, on
 a change to the file (fsnotify, debounced), and every `ManifestSweepInterval` as the
@@ -448,10 +458,9 @@ kubeconfig). **It adds no role, no binding and no ServiceAccount.** What it does
 client is narrower than the client allows: Get, create and update of one named `Opaque`
 Secret per declared target, labelled as below, and nothing else — no list, no delete, no
 other kind, no Secret it does not own. The set of principals who can cause a write stays
-{root on the node} because only root can edit the declaration. If the maintainer would
-rather this run as a bounded ServiceAccount in the manner of `kube-system/k3sm-manifests`,
-that needs a new Role granting Secret write, which widens what the control plane can do,
-and so it is listed under "Open questions" for a ruling and not assumed here.
+{root on the node} because only root can edit the declaration. A bounded ServiceAccount in
+the manner of `kube-system/k3sm-manifests` would need a new Role granting Secret write,
+which widens what the control plane can do; Phase A does not add one.
 
 **Ed25519 encoding in the Secret:** the stored seed or expanded key, base64 under
 `dataKey` exactly as Kubernetes already base64-encodes every Secret `data` value — no PEM
@@ -625,21 +634,18 @@ The maintainer's three rulings on this pull request: the delivery target is decl
 `k3sm keys` verb, not a file; the master pair lives under `server/cred/` in its own
 subdirectory; the pointer rollback residual is not accepted.
 
-Settled in this revision: the master directory; the delivery-target mechanism (a verb); the
-`Rewrap` argument check (a plain error, no sentinel); retention (unbounded in Phase A).
+Settled in this revision:
 
-Owed by the implementation: `hack/acceptance/keystore.sh`, specified above.
+- The master directory: `server/cred/keystore-master/`.
+- The delivery-target mechanism: the `k3sm keys deliver` verb, writing a root-owned file.
+- The pointer floor: recorded in a root-owned file directly under the data root, written
+  only by root-run verbs, with the restore procedure in "Backup and snapshots".
+- The reconciler's identity: the admin client the server process already holds, with no new
+  role, binding or ServiceAccount.
+- The verbs `rewrap` and `deliver`, beside `put`, `list`, `show`, `rotate` and `rm`.
+- `Entry.Err`: the contract change for per-entry listing, made in this pull request.
+- The `Rewrap` argument check: a plain error, no sentinel.
+- Retention: unbounded in Phase A.
 
-Still open, raised by this revision, for a ruling before implementation:
-
-- **Where the pointer floor is recorded.** This document puts it in a root-owned file under
-  the data root, because a floor in the service user's tree can be copied back like the
-  pointer. That is a new root-owned file and an operator step on restore. If a different
-  home is preferred, the requirement (an older pointer refuses even when it authenticates)
-  does not change.
-- **The reconciler's identity.** This document reuses the admin client the server process
-  already holds and adds no role. A bounded ServiceAccount would need a new Role granting
-  Secret write.
-- **`k3sm keys rewrap` and `k3sm keys deliver` as verbs.** Both follow from the rulings,
-  but each is an operator-facing surface the issue did not name.
-- **`Entry.Err`.** A contract change to `pkg/keystore`, made in this pull request.
+Owed by the implementation: `hack/acceptance/keystore.sh`, specified above. There are no
+open questions.
