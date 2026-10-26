@@ -49,14 +49,15 @@ const (
 	reasonCreated = "Created" // container object created, before process start
 	reasonStarted = "Started" // container process started successfully
 	// reasonKilling is recorded when a container process is being stopped: by
-	// DeletePod on both paths (one per container still running), on the runtimed
+	// DeletePod (on the runtimed path one per container last observed running, on
+	// the HostProcess path one per container it started), on the runtimed
 	// path before a live container is killed and re-exec'd (a committed liveness
 	// failure, a failed postStart hook under a restarting policy), and after a
 	// container whose postStart hook failed under a non-restarting policy was
 	// stopped (msgKillingPostStart).
 	reasonKilling = "Killing"
 	reasonFailed  = "Failed"  // container process failed to start
-	reasonBackOff = "BackOff" // container re-exec is throttled by CrashLoopBackOff
+	reasonBackOff = "BackOff" // a container re-exec (CrashLoopBackOff) or an image pull is throttled by its back-off
 	// reasonInspectFailed is recorded when a container's image reference cannot
 	// be parsed at all — upstream's InspectFailed, the event that pairs with the
 	// InvalidImageName waiting reason.

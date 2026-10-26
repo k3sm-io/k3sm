@@ -35,7 +35,8 @@ func TestRestartPolicyOnExit(t *testing.T) {
 		exit0 := &corev1.ContainerStateTerminated{ExitCode: 0}
 		exitNonzero := &corev1.ContainerStateTerminated{ExitCode: 1}
 		// OOMKilled / SIGKILL: the runtime reports Signal=9 with ExitCode 0;
-		// OnFailure must still treat this as a failure (mirrors translate.go:707).
+		// OnFailure must still treat this as a failure (the Signal predicate in
+		// restartpolicy.go).
 		signalKill := &corev1.ContainerStateTerminated{ExitCode: 0, Signal: 9}
 		sidecar := corev1.ContainerRestartPolicyAlways
 

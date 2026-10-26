@@ -173,10 +173,10 @@ func assertBoundToPod(t *testing.T, tr *authnv1.TokenRequest, name, uid string) 
 	}
 }
 
-// TestB226_ProjectedTokenBoundToPod proves the provider binds every projected
+// TestProjectedTokenBoundToPod proves the provider binds every projected
 // ServiceAccount token to the Pod object that caused it to be minted, and fails
 // closed rather than minting an unbound token.
-func TestB226_ProjectedTokenBoundToPod(t *testing.T) {
+func TestProjectedTokenBoundToPod(t *testing.T) {
 	const ns = "team"
 
 	t.Run("CreatePod binds the token to the creating pod", func(t *testing.T) {

@@ -77,7 +77,7 @@ func effectivePodRestartPolicy(pod *corev1.Pod) corev1.RestartPolicy {
 //     Completed container under Always still restarts).
 //   - RestartPolicyOnFailure restarts IFF the termination is a failure, where
 //     failure means a non-zero exit code OR a non-zero terminating signal. The
-//     Signal check mirrors the status predicate in toPodStatus (translate.go:707),
+//     Signal check mirrors the status predicate in toPodStatus (translate_status.go),
 //     so an OOMKilled/SIGKILL termination (Signal=9) counts as a failure even
 //     when ExitCode is reported as 0.
 //   - RestartPolicyNever never restarts.

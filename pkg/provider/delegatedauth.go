@@ -79,7 +79,7 @@ const (
 // that user may get nodes/metrics (on /metrics/resource) or nodes/stats (on
 // /stats/summary) for THIS node by name. That is upstream kubelet's webhook
 // authn/authz shape (--authentication-token-webhook, --authorization-mode=Webhook),
-// as k3s runs it, restricted to the two routes metrics-server scrapes.
+// as k3s runs it, restricted to the two read-only metrics routes.
 //
 // Every failure denies: a review error, a timeout, an unauthenticated token, an
 // empty username, a TokenReview reporting Status.Error, a SAR that does not

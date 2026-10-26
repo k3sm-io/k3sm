@@ -39,7 +39,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// The StartContainer seam (R17): a FIFO of outcomes plus an optional hold, so
+// The StartContainer seam: a FIFO of outcomes plus an optional hold, so
 // the retry worker's two observable windows — sleeping (ImagePullBackOff) and
 // attempting (ErrImagePull) — are stepped deterministically instead of raced.
 // ---------------------------------------------------------------------------

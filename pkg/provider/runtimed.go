@@ -207,7 +207,7 @@ type runtimedRuntime struct {
 	probeTransport http.RoundTripper
 
 	// client force-deletes a pod from the apiserver the instant its containers are
-	// torn down. Virtual Kubelet's PodController (v1.12.0) otherwise delays the
+	// torn down. Virtual Kubelet's PodController (v1.14.0) otherwise delays the
 	// API-side delete of a running-then-deleted pod by the FULL
 	// deletionGracePeriodSeconds: its prompt path (syncPodInProvider force-deleting
 	// on !running) is reachable only via the informer, whose podShouldEnqueue →
@@ -2382,8 +2382,8 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 // GetPods returns every tracked pod with its current status applied.
 func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 	// The pod POINTER is snapshotted inside the critical section, not just the
-	// track. r.mu guards the t.pod field itself — UpdatePod reassigns it at
-	// :1170 under this same lock — so reading t.pod out in the loop below was a
+	// track. r.mu guards the t.pod field itself — UpdatePod reassigns it
+	// under this same lock — so reading t.pod out in the loop below was a
 	// data race, reported by -race against the 10s backstop's GetPods running
 	// concurrently with a VK pod worker's UpdatePod. It is the one mutable field
 	// of podTrack that r.mu guards: readyMu, restartMu and hookMu exist

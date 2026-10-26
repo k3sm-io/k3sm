@@ -612,8 +612,8 @@ func restartFailureCause(container string, err error) string {
 // maxEventMessageLen is the apiserver's limit on an Event message, in bytes.
 const maxEventMessageLen = 1024
 
-// stripControlKeepTab drops the C0 control characters except tab, DEL and the C1
-// range, so text from a guest cannot inject terminal escapes or line breaks into
+// stripControlKeepTab drops every control character except tab (the C0 range, DEL
+// and the C1 range), so text from a guest cannot inject terminal escapes or line breaks into
 // `kubectl describe` output.
 func stripControlKeepTab(s string) string {
 	return strings.Map(func(r rune) rune {

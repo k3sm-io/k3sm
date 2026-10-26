@@ -247,8 +247,10 @@ func (t *podTrack) runningContainersToKill(pod *corev1.Pod) []string {
 // recordKilling records the Killing Event for one container of a tracked pod,
 // once per instance (claimKilling), before the stop is requested. message is
 // the cause-specific text, or "" for upstream's "Stopping container <name>".
-// Every runtimed-path Killing goes through here: DeletePod, the kill-and-re-exec
-// of a live container, and the terminal stop of a failed postStart hook.
+// Every runtimed-path Killing is claimed once per instance through claimKilling:
+// DeletePod claims its set with runningContainersToKill and records each Event
+// itself; the kill-and-re-exec of a live container and the terminal stop of a
+// failed postStart hook record through here.
 func (r *runtimedRuntime) recordKilling(t *podTrack, pod *corev1.Pod, container, message string) {
 	if t == nil || pod == nil || !t.claimKilling(container, false) {
 		return

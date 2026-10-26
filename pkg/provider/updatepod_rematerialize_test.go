@@ -36,8 +36,9 @@ import (
 // UpdatePodDoesNotRematerializeVolumes pins TODAY's contract — runtimed's
 // UpdatePod applies labels/annotations only (its updatableOnly check rejects
 // every other field change as NOT_UPDATABLE), and volumes are materialized
-// exactly once, at create: nothing on any path re-resolves ConfigMap, Secret, or
-// projected ServiceAccount-token DATA after creation. This is a
+// exactly once, at create: nothing on the UpdatePod path re-resolves ConfigMap,
+// Secret, or projected ServiceAccount-token DATA. Projected data is refreshed on
+// a separate path (projectedrefresh.go), which this test does not cover. This is a
 // CHARACTERIZATION test of that TODAY, not a design requirement — a
 // projected-volume refresh feature must invert it DELIBERATELY, not by
 // accident, and this test is exactly what would need to change to do that.

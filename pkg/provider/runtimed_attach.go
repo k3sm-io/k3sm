@@ -41,9 +41,10 @@ import (
 // ORDERING (and why it lives in the constructor): every attach runs
 // BEFORE runtimed's startup pod reap, because the reap kills every recorded
 // process group no registered pod owns, and an attach is what registers one.
-// The reap runs before any create, because Virtual Kubelet — the only caller of
-// CreatePod — is started with the provider NewRuntimed returns, so nothing can
-// create a pod until adoptNodePods has returned. Creates are therefore never
+// The reap runs before any create, because every CreatePod starts from Virtual
+// Kubelet (directly, or through the claim hold a Virtual Kubelet create set up),
+// and Virtual Kubelet is started with the provider NewRuntimed returns, so
+// nothing can create a pod until adoptNodePods has returned. Creates are therefore never
 // issued from here: a pod left unattached is left untracked, and Virtual
 // Kubelet's first sync finds it unknown to GetPod and calls CreatePod, exactly
 // as for a pod scheduled to this node a moment ago. Issuing those creates here
@@ -257,9 +258,11 @@ func (r *runtimedRuntime) attachPod(ctx context.Context, a podAttacher, pod *cor
 // is re-reserved the same way, through ReattachGuest: podnet records the binding
 // as a guest's, the startup sweep (ReconcileStartup) keeps its alias, and
 // buildBox's SetupGuest for the pod returns that same address and records the
-// guest network config runtimed reads. If runtimed then refuses to adopt the
-// helper, attachPod releases the address and the pod is created again with a
-// fresh SetupGuest, as before.
+// guest network config runtimed reads. If runtimed then refuses the attach,
+// attachPod releases the address and the pod is created again with a fresh
+// SetupGuest, as before, except when the helper is still running under another
+// runtime (runtimed.ErrVMHelperUnadoptable): the address then stays reserved
+// and the pod is not created beside the live guest.
 func (r *runtimedRuntime) reattachPodIP(ctx context.Context, pod *corev1.Pod) (string, bool) {
 	if r.network == nil {
 		return r.nodeIP, true
