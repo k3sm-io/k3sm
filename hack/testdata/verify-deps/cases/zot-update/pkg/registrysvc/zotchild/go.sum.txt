@@ -1,0 +1,6 @@
+example.com/old v1.2.3 h1:oldzip=
+example.com/old v1.2.3/go.mod h1:oldmod=
+example.com/pruned v0.1.0/go.mod h1:prunedmod=
+example.com/zchild v0.3.0 h1:zchildzip=
+example.com/zchild v0.3.0/go.mod h1:zchildmod=
+example.com/zextra v1.0.0 h1:zextra=

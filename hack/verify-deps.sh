@@ -23,6 +23,13 @@
 #                            time re-read from the proxy, so a forged lock
 #                            time cannot clear the cooldown.
 #   malicious-package check  no module version carries an OSV MAL- advisory
+#   zotchild graph           the same lock, cooldown and malicious-package
+#                            stages over the zot wrapper module's graph (every
+#                            module pkg/registrysvc/zotchild/go.sum.txt hashes
+#                            the source of), locked in hack/deps-zotchild.lock:
+#                            the registry builds zot from that go.sum, outside
+#                            this repo's go.mod, so its modules are not in the
+#                            repo graph above
 #   replace discipline       every go.mod replace sits directly under its own
 #                            comment line, and a filesystem replace points
 #                            only at a sibling repo
@@ -32,9 +39,11 @@
 #
 # Usage (from anywhere; the script runs from the repo root with GOWORK=off):
 #   hack/verify-deps.sh              run every stage
-#   hack/verify-deps.sh --update     rewrite hack/deps.lock from the current graph,
-#                                    then run the cooldown and malicious-package
-#                                    stages on the modules that changed
+#   hack/verify-deps.sh --update     rewrite hack/deps.lock from the current graph
+#                                    and hack/deps-zotchild.lock from the zot
+#                                    wrapper's go.sum, then run the cooldown and
+#                                    malicious-package stages on the modules
+#                                    that changed
 #   hack/verify-deps.sh --self-test  hermetic fixtures (hack/testdata/verify-deps),
 #                                    stubbed go and curl, no network
 #   hack/verify-deps.sh --modules <file>
@@ -71,6 +80,10 @@ OSV_BATCH_URL="https://api.osv.dev/v1/querybatch"
 OSV_QUERY_URL="https://api.osv.dev/v1/query"
 OSV_BATCH_SIZE=500
 LOCK="hack/deps.lock"
+# The zot wrapper module's lockfile (the registry's zot child is built from it
+# with -mod=readonly) and the lock that makes its graph a reviewed file.
+ZOT_SUM="pkg/registrysvc/zotchild/go.sum.txt"
+ZOT_LOCK="hack/deps-zotchild.lock"
 EXEMPT="hack/deps.cooldown-exempt"
 # The only filesystem paths a go.mod replace may name: the sibling k3sm repos.
 LOCAL_REPLACE_ALLOW="../apis ../runtimed ../darwin-net ../k3sm"
@@ -170,6 +183,31 @@ def parse_time(s):
 def cmd_graph_clean():
     lines = sorted({l.rstrip() for l in sys.stdin if l.strip()})
     sys.stdout.write("".join(l + "\n" for l in lines))
+
+
+def cmd_sum_graph(sumpath):
+    """Print "<module> <version>" for every module a go.sum hashes the source
+    of (its zip lines; a /go.mod-only line is graph metadata, never built)."""
+    try:
+        with open(sumpath) as f:
+            raw = f.read().splitlines()
+    except OSError as e:
+        die("cannot read %s: %s" % (sumpath, e))
+    mods = {}
+    for n, line in enumerate(raw, 1):
+        t = line.split()
+        if not t:
+            continue
+        if len(t) != 3 or not t[2].startswith("h1:"):
+            die("%s:%d: not a go.sum line" % (sumpath, n))
+        if t[1].endswith("/go.mod"):
+            continue
+        prev = mods.setdefault(t[0], t[1])
+        if prev != t[1]:
+            die("%s: %s is hashed at two versions (%s, %s)" % (sumpath, t[0], prev, t[1]))
+    if not mods:
+        die("%s hashes no module source" % sumpath)
+    sys.stdout.write("".join("%s %s\n" % (p, mods[p]) for p in sorted(mods)))
 
 
 def cmd_lockdiff(lockpath, graphpath):
@@ -780,7 +818,7 @@ def cmd_ago(days):
 
 
 CMDS = {
-    "graph-clean": cmd_graph_clean, "lockdiff": cmd_lockdiff,
+    "graph-clean": cmd_graph_clean, "sum-graph": cmd_sum_graph, "lockdiff": cmd_lockdiff,
     "update-plan": cmd_update_plan, "update-write": cmd_update_write,
     "cooldown": cmd_cooldown, "verify-plan": cmd_verify_plan, "verify-times": cmd_verify_times, "osv-build": cmd_osv_build, "osv-parse": cmd_osv_parse,
     "osv-page-req": cmd_osv_page_req, "osv-page-parse": cmd_osv_page_parse,
@@ -859,40 +897,51 @@ current_graph() {
 	py graph-clean <"$raw" >"$WORK/graph"
 }
 
+# The zot wrapper's graph, from its go.sum, into $WORK/zgraph.
+zot_graph() {
+	py sum-graph "$ZOT_SUM" >"$WORK/zgraph" || fail "$1" "cannot read the zot wrapper graph from $ZOT_SUM"
+}
+
 # ---- c: lock -----------------------------------------------------------------
 lock_check() {
 	stage "lock"
 	current_graph lock
-	[ -f "$LOCK" ] || fail "lock" "$LOCK is missing; create it with hack/verify-deps.sh --update"
+	lock_compare lock "$LOCK" "$WORK/graph"
+}
+
+# lock_compare <stage> <lock> <graph>: the graph equals the lock, line for line.
+lock_compare() {
+	local st="$1" lock="$2" graph="$3"
+	[ -f "$lock" ] || fail "$st" "$lock is missing; create it with hack/verify-deps.sh --update"
 	local rc=0
-	py lockdiff "$LOCK" "$WORK/graph" || rc=$?
+	py lockdiff "$lock" "$graph" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		cat >&2 <<EOF
-The module graph no longer matches $LOCK (lines above).
+The module graph no longer matches $lock (lines above).
 Before accepting it, check every added or changed module:
   - provenance: who publishes it, and is it the module you meant (not a look-alike)?
   - age: a version whose proxy-recorded commit time is under $COOLDOWN_DAYS days old is
     refused by the cooldown stage (a backdated commit is not caught; check the release)
   - need: why this change needs it, and which import pulls it in (go mod why -m <module>)
   - alternative: would a small in-repo implementation do instead?
-Then run hack/verify-deps.sh --update and commit $LOCK with the change.
+Then run hack/verify-deps.sh --update and commit $lock with the change.
 EOF
-		fail "lock" "$LOCK is out of date"
+		fail "$st" "$lock is out of date"
 	fi
 }
 
 # ---- d: cooldown -------------------------------------------------------------
-cooldown_ages() { # cooldown_ages <lock-format file>
-	local rc=0
+cooldown_ages() { # cooldown_ages <lock-format file> [stage]
+	local rc=0 st="${2:-cooldown}"
 	py cooldown "$1" "$EXEMPT" "$COOLDOWN_DAYS" || rc=$?
-	[ "$rc" -eq 0 ] || fail "cooldown" "module versions whose proxy-recorded commit time is under $COOLDOWN_DAYS days old (above). The age is the commit time the proxy records, not first publication, so a backdated commit is not caught. Wait, or add '<module> <version> <reason>' to $EXEMPT after an audit"
+	[ "$rc" -eq 0 ] || fail "$st" "module versions whose proxy-recorded commit time is under $COOLDOWN_DAYS days old (above). The age is the commit time the proxy records, not first publication, so a backdated commit is not caught. Wait, or add '<module> <version> <reason>' to $EXEMPT after an audit"
 }
 
-# cooldown_check <lock-format file>: the age check on lock times that are
-# already trusted (--update just fetched them from the proxy).
+# cooldown_check <lock-format file> [stage]: the age check on lock times that
+# are already trusted (--update just fetched them from the proxy).
 cooldown_check() {
-	stage "cooldown"
-	cooldown_ages "$1"
+	stage "${2:-cooldown}"
+	cooldown_ages "$1" "${2:-cooldown}"
 }
 
 # cooldown_verify: check mode. A lock line added or changed since the merge base
@@ -900,20 +949,23 @@ cooldown_check() {
 # from the proxy again and must agree with the lock within an hour; the age
 # check then uses the proxy's time. Lines unchanged since the base keep the lock
 # time. With no base lock (no origin/main, or no lock there) every line is new.
+# cooldown_verify [lock] [stage]: the lock defaults to $LOCK.
 cooldown_verify() {
-	stage "cooldown"
+	local lock="${1:-$LOCK}" st="${2:-cooldown}"
+	stage "$st"
 	local base="-" mb
+	rm -f "$WORK/base.lock"
 	if [ -e .git ] && command -v git >/dev/null 2>&1 &&
 		mb="$(git merge-base HEAD origin/main 2>/dev/null)" &&
-		git show "$mb:$LOCK" >"$WORK/base.lock" 2>/dev/null; then
+		git show "$mb:$lock" >"$WORK/base.lock" 2>/dev/null; then
 		base="$WORK/base.lock"
 	fi
-	py verify-plan "$LOCK" "$base" "$WORK" "$PROXY_URL" || fail "cooldown" "could not read $LOCK"
-	fetch_infos cooldown
+	py verify-plan "$lock" "$base" "$WORK" "$PROXY_URL" || fail "$st" "could not read $lock"
+	fetch_infos "$st"
 	local rc=0
 	py verify-times "$WORK" "$WORK/verified.lock" || rc=$?
-	[ "$rc" -eq 0 ] || fail "cooldown" "lock time does not match the proxy (above); regenerate the lines with hack/verify-deps.sh --update"
-	cooldown_ages "$WORK/verified.lock"
+	[ "$rc" -eq 0 ] || fail "$st" "lock time does not match the proxy (above); regenerate the lines with hack/verify-deps.sh --update"
+	cooldown_ages "$WORK/verified.lock" "$st"
 }
 
 # fetch_infos <stage>: download every "<url> <file>" pair in $WORK/fetch.
@@ -932,33 +984,34 @@ osv_post() { # osv_post <url> <request file> <response file>
 		--data-binary "@$2" -o "$3" "$1"
 }
 
-malicious_check() { # malicious_check <lock-format file>
-	stage "malicious-package check"
+malicious_check() { # malicious_check <lock-format file> [stage]
+	local st="${2:-malicious-package check}"
+	stage "$st"
 	local n i rc hits="$WORK/osv-hits" pages="$WORK/osv-pages"
 	: >"$hits"
-	n="$(py osv-build "$1" "$WORK" "$OSV_BATCH_SIZE")" || fail "malicious-package check" "could not read $1"
+	n="$(py osv-build "$1" "$WORK" "$OSV_BATCH_SIZE")" || fail "$st" "could not read $1"
 	for ((i = 0; i < n; i++)); do
 		osv_post "$OSV_BATCH_URL" "$WORK/osv-req.$i" "$WORK/osv-resp.$i" ||
-			fail "malicious-package check" "network failure querying $OSV_BATCH_URL (a failed query is a failure, never a skip)"
+			fail "$st" "network failure querying $OSV_BATCH_URL (a failed query is a failure, never a skip)"
 		rc=0
 		py osv-parse "$WORK/osv-q.$i" "$WORK/osv-resp.$i" >>"$hits" || rc=$?
-		[ "$rc" -eq 0 ] || fail "malicious-package check" "unreadable response from $OSV_BATCH_URL"
+		[ "$rc" -eq 0 ] || fail "$st" "unreadable response from $OSV_BATCH_URL"
 	done
 	# A result with more advisories than one page holds carries a page token.
 	local guard=0 p v tok
 	while grep -q '^PAGE ' "$hits"; do
 		guard=$((guard + 1))
-		[ "$guard" -le 50 ] || fail "malicious-package check" "OSV paging did not terminate"
+		[ "$guard" -le 50 ] || fail "$st" "OSV paging did not terminate"
 		grep '^PAGE ' "$hits" >"$pages"
 		grep -v '^PAGE ' "$hits" >"$hits.keep" || true
 		mv "$hits.keep" "$hits"
 		while read -r _ p v tok; do
 			py osv-page-req "$p" "$v" "$tok" >"$WORK/osv-page-req"
 			osv_post "$OSV_QUERY_URL" "$WORK/osv-page-req" "$WORK/osv-page-resp" ||
-				fail "malicious-package check" "network failure querying $OSV_QUERY_URL (a failed query is a failure, never a skip)"
+				fail "$st" "network failure querying $OSV_QUERY_URL (a failed query is a failure, never a skip)"
 			rc=0
 			py osv-page-parse "$p" "$v" "$WORK/osv-page-resp" >>"$hits" || rc=$?
-			[ "$rc" -eq 0 ] || fail "malicious-package check" "unreadable response from $OSV_QUERY_URL"
+			[ "$rc" -eq 0 ] || fail "$st" "unreadable response from $OSV_QUERY_URL"
 		done <"$pages"
 	done
 	if grep -q '^MAL ' "$hits"; then
@@ -966,8 +1019,20 @@ malicious_check() { # malicious_check <lock-format file>
 		while read -r _ id p v; do
 			echo "  $id: $p $v is reported as a malicious package (https://osv.dev/vulnerability/$id)" >&2
 		done < <(grep '^MAL ' "$hits")
-		fail "malicious-package check" "remove or replace the module versions above"
+		fail "$st" "remove or replace the module versions above"
 	fi
+}
+
+# ---- zotchild graph ----------------------------------------------------------
+# The zot wrapper module's graph gets the repo graph's lock, cooldown and
+# malicious-package stages: the registry builds zot from that go.sum, so a module
+# moved there runs on the node exactly like one in this repo's go.mod.
+zot_check() {
+	stage "lock (zotchild)"
+	zot_graph "lock (zotchild)"
+	lock_compare "lock (zotchild)" "$ZOT_LOCK" "$WORK/zgraph"
+	cooldown_verify "$ZOT_LOCK" "cooldown (zotchild)"
+	malicious_check "$ZOT_LOCK" "malicious-package check (zotchild)"
 }
 
 # ---- f: replace discipline ---------------------------------------------------
@@ -1008,7 +1073,16 @@ update() {
 	py update-write "$LOCK" "$WORK" || fail "lock (update)" "could not write $LOCK"
 	cooldown_check "$WORK/delta"
 	malicious_check "$WORK/delta"
-	echo "OK: [verify-deps] $LOCK updated; review the diff and commit it"
+	stage "lock (zotchild update)"
+	zot_graph "lock (zotchild update)"
+	mkdir -p "$WORK/z"
+	py update-plan "$ZOT_LOCK" "$WORK/zgraph" "$WORK/z" "$PROXY_URL" || fail "lock (zotchild update)" "could not plan the update"
+	cp "$WORK/z/fetch" "$WORK/fetch"
+	fetch_infos "lock (zotchild update)"
+	py update-write "$ZOT_LOCK" "$WORK/z" || fail "lock (zotchild update)" "could not write $ZOT_LOCK"
+	cooldown_check "$WORK/z/delta" "cooldown (zotchild)"
+	malicious_check "$WORK/z/delta" "malicious-package check (zotchild)"
+	echo "OK: [verify-deps] $LOCK and $ZOT_LOCK updated; review the diff and commit them"
 }
 
 # ---- --modules -----------------------------------------------------------------
@@ -1036,6 +1110,7 @@ check() {
 	lock_check
 	cooldown_verify
 	malicious_check "$LOCK"
+	zot_check
 	replace_check
 	tools_check
 	echo "OK: [verify-deps] dependency supply-chain check green"
@@ -1064,7 +1139,7 @@ self_test() {
 		mkdir -p "$dir/hack"
 		cp "$SELF" "$dir/hack/verify-deps.sh"
 		local f
-		for f in "$dir/hack/deps.lock" "$dir/stub/info" "$dir/base/hack/deps.lock"; do
+		for f in "$dir/hack/deps.lock" "$dir/hack/deps-zotchild.lock" "$dir/stub/info" "$dir/base/hack/deps.lock"; do
 			[ ! -f "$f" ] || { sed -e "s/@RECENT@/$recent/g" -e "s/@OLD@/$old/g" "$f" >"$f.s" && mv "$f.s" "$f"; }
 		done
 		# A case with base/hack/deps.lock becomes a git repo whose origin/main
@@ -1168,6 +1243,12 @@ self_test() {
 	bg modules-mal "--modules modules.txt" "malicious-package check" "MAL-2026-0004"
 	bg modules-missing "--modules absent.txt" modules "no module list"
 	bg update-network --update "lock (update)" "network failure"
+	bg zot-lock-added - "lock (zotchild)" "added:   example.com/zextra v1.0.0"
+	bg zot-cooldown-fresh - "cooldown (zotchild)" "example.com/zyoung v0.1.0 has a proxy-recorded commit time"
+	bg zot-osv-mal - "malicious-package check (zotchild)" "MAL-2026-0005"
+	bg zot-sum-empty - "lock (zotchild)" "hashes no module source"
+	bg zot-sum-two-versions - "lock (zotchild)" "example.com/zchild is hashed at two versions"
+	bg zot-update --update pass "wrote hack/deps-zotchild.lock: 3 modules, 1 new or changed"
 	wait
 	for ((i = 1; i <= seq; i++)); do
 		cat "$WORK/result.$i"

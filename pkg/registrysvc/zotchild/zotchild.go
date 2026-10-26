@@ -34,7 +34,8 @@ limitations under the License.
 // zotregistry.dev/zot/v2/cmd/zot@<pin>`, then `go get` each childreq raise, then
 // `go mod tidy`, and check with `go list -m all` that only the raised modules moved.
 // Then vendor zot's own go.mod at the pin into pkg/registrysvc/testdata (from the
-// module proxy, with the header TestZotWrapperGraphMatchesPinnedZot checks).
+// module proxy, with the header TestZotWrapperGraphMatchesPinnedZot checks), and
+// run hack/verify-deps.sh --update to record the graph in hack/deps-zotchild.lock.
 package zotchild
 
 import _ "embed" // the wrapper files below
