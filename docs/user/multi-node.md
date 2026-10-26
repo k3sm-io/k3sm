@@ -88,7 +88,7 @@ sudo k3sm install --agent \
 ```
 
 `--server` is the control-plane Mac's **underlay** address (a LAN IP or DNS name, no scheme, no
-port). The join dials `<server>:9345`, not the apiserver's `:6443`.
+port). The join dials `<server>:9345`, not the apiserver's `:6444`.
 
 `--node-ip` is **optional**, and it does not name this Mac's own LAN address at all. It names the
 **mesh** address this node holds inside the cluster's wireguard mesh range (100.64.0.0/10 by
@@ -167,6 +167,23 @@ later install.
 The agent authenticates with the bootstrap token, receives its node credentials, and its wireguard peer
 **public** key is registered in the `MeshPeer` records held in the datastore. Private keys never leave
 the node. The `MeshPeer` records carry public keys only.
+
+### Pushing images from a worker
+
+A worker writes no user kubeconfig, which is also how k3s behaves. To push to the cluster registry
+from a worker, copy the admin kubeconfig from the server and write one on the worker:
+
+```sh
+k3sm kubeconfig --server https://<server>:6444 --certificate-authority <ca> --write
+```
+
+`k3sm build`, `k3sm image load`, `import` and `push` then upload to the server's registry at its
+cluster address on port 6450, over HTTPS checked against the cluster CA, with a push token minted
+through that kubeconfig. `k3sm registry login` writes the same address and the cluster CA into your
+docker config for docker, buildx, crane and oras. A user who should push without administering the
+cluster needs only the `k3sm:registry-builder-token` Role, bound with a RoleBinding in
+`k3sm-registry`; it also lets them read the one EndpointSlice that names the address. See
+[the cluster registry](registry.md#pushing-with-other-tools).
 
 ### Restarting a node
 

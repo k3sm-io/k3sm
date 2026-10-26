@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# M17.0 / S2 — addressing and routing, and the R15 figure schema. The rung that says
-# whether the M17 plan §1 data path works at all on macOS, and what it is worth.
+# S2 — addressing and routing, and the figure schema. The rung that says
+# whether the direct-link design's data path works at all on macOS, and what it is worth.
 #
 #   (1) `ifconfig bridge0 deletem <enX>` takes the cable port out of the bridge.
 #   (2) The /32 alias plus an on-link host route to the peer's link address ARP-
@@ -14,10 +14,10 @@
 #   (6) A TCP dial sourced from a reserved-half address works, as the _k3sm user.
 #   (7) TSO/LRO are off on the cable port after `-tso -lro` (build amendment A3).
 #   (8) configd leaves the alias alone for the length of the rung.
-#   (9) R3's recorded question: nothing on the wire checks that a pod-range source
+#   (9) The pod-source question recorded here: nothing on the wire checks that a pod-range source
 #       arriving on enX is that peer's pod (a dial from a pod-range address is
 #       accepted).
-#   THE FIGURES (R15; RECORDED, never a verdict): iperf3 single and 4-stream, both
+#   THE FIGURES (figure schema; RECORDED, never a verdict): iperf3 single and 4-stream, both
 #   directions, for direct, wireguard-over-cable and Wi-Fi (plus the raw LAN as a
 #   reference); idle and loaded RTT; k3sm/helper/wireguard CPU%; ClusterIP vs pod-IP;
 #   UDP loss at the MTU boundary; netstat -s fragment and netstat -I error counters.
@@ -29,9 +29,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/lib.sh"
 
 RUNG="S2"
-QUESTION="Does the direct-link data path of the M17 plan §1 work on macOS (bridge member removal, a /32 link alias with
+QUESTION="Does the direct-link data path of the direct-link design work on macOS (bridge member removal, a /32 link alias with
 an on-link host route, two /25 gateway routes sourced from the mesh-egress address, weak-host delivery to a lo0
-alias), and what do the direct, wireguard-over-cable and Wi-Fi paths measure under the R15 figure schema?"
+alias), and what do the direct, wireguard-over-cable and Wi-Fi paths measure under the figure schema?"
 CRITERIA="s2.1 the cable port is not a bridge0 member after deletem (read back), on both Macs
 s2.2 the peer's link address ARP-resolves on the cable port through the on-link host route, both ways
 s2.3 the two /25s through the peer's link address are installed and chosen for a pod-range destination
@@ -41,7 +41,7 @@ s2.5 the reply's source is the lo0-alias address
 s2.6 a TCP dial bound to a reserved-half address connects, as the _k3sm user
 s2.7 TSO4, TSO6 and LRO are off on the cable port after -tso -lro
 s2.8 the link alias is still present at the end of the rung (configd left it alone)
-RECORDED: every R15 figure (median, p99, exact command, Mac models, macOS build, cable); s2.9 (R3)"
+RECORDED: every figure (median, p99, exact command, Mac models, macOS build, cable); s2.9 "
 METHOD="Privileged script files with the restore trap configure both Macs as netd would (deletem, the /32 alias, the
 on-link host route, -tso -lro, then the /25s with -ifa <mesh egress>); a pod-range lo0 alias (.250 of the worker's pod
 /24) carries a python listener that reports each connection's local and peer address; dials are made from the server
@@ -49,18 +49,18 @@ as the login user and as _k3sm. The figures run iperf3 against that alias over t
 wireguard-over-cable when K3SM_M17_WG_CABLE_ROUTE=1 pins the worker's path to the server's wireguard endpoint onto
 the cable), then over the /25s (direct), then through a selector-less ClusterIP Service whose EndpointSlice names the
 alias; RUNS (>= 5) runs each."
-HALT="s2.4 fails (weak host) -> R8: the direct route is route-only via the on-link peer address, with the peer's /25s
+HALT="s2.4 fails (weak host) -> the direct route is route-only via the on-link peer address, with the peer's /25s
   re-pointed through a second host route (never an on-link /24 alias on enX, which would fight the lo0 aliases).
-s2.3b fails (RTAX_IFA not honoured) -> R8: the proxy and the shim pin the .1 source for all cross-node dials, and
+s2.3b fails (RTAX_IFA not honoured) -> the proxy and the shim pin the .1 source for all cross-node dials, and
   unbound host dials are documented as cable-only.
-s2.1/s2.2/s2.3/s2.6/s2.7/s2.8 fail -> no substitution is pre-decided: the M17 plan §1 addressing does not hold
+s2.1/s2.2/s2.3/s2.6/s2.7/s2.8 fail -> no substitution is pre-decided: the direct-link design's addressing does not hold
   as written, and the spike stops for a re-plan."
 
 spike_args "$RUNG" "$QUESTION" "$CRITERIA" "$METHOD" "$HALT" "$@"
 
 spike_require "$RUNG"
 if ! [ "$RUNS" -ge 5 ] 2>/dev/null; then
-	echo "FAIL      M17.0 S2: K3SM_M17_RUNS=$RUNS; the R15 figure schema needs >= 5 runs" >&2
+	echo "FAIL      M17 spike S2: K3SM_M17_RUNS=$RUNS; the figure schema needs >= 5 runs" >&2
 	exit 1
 fi
 
@@ -257,13 +257,13 @@ ok*)
   if [ "$peer_seen" = "$EGRESS" ]; then
     verdict PASS "s2.3b the unbound dial was sourced from the mesh-egress address $EGRESS (RTAX_IFA honoured)"
   else
-    verdict FAIL "s2.3b the unbound dial was sourced from $peer_seen, not the mesh-egress $EGRESS — halt (R8): the proxy and the shim pin the .1 source for all cross-node dials, and unbound host dials are documented as cable-only"
+    verdict FAIL "s2.3b the unbound dial was sourced from $peer_seen, not the mesh-egress $EGRESS — halt: the proxy and the shim pin the .1 source for all cross-node dials, and unbound host dials are documented as cable-only"
   fi
   reply_from="$(printf '%s' "$out" | sed -n 's/.* peer=\([^ ]*\) local=.*/\1/p')"
   if [ "$reply_from" = "$T" ]; then verdict PASS "s2.5 the reply came from the lo0-alias address $T"; else verdict FAIL "s2.5 the reply came from '$reply_from', not $T"; fi
   ;;
 *)
-  verdict FAIL "s2.4 a lo0-alias destination ($T) over the cable was not delivered ($out) — halt (R8): the direct route is route-only via the on-link peer address, with the peer's /25s re-pointed through a second host route (never an on-link /24 alias on enX)"
+  verdict FAIL "s2.4 a lo0-alias destination ($T) over the cable was not delivered ($out) — halt: the direct route is route-only via the on-link peer address, with the peer's /25s re-pointed through a second host route (never an on-link /24 alias on enX)"
   ;;
 esac
 EOF
@@ -288,7 +288,7 @@ esac
 [ "$user" = _k3sm ] || recorded "s2.6 there is no _k3sm user on this Mac; the dial ran as $user"
 spike_lo0_alias "$PODSRC" >/dev/null 2>&1
 out="$(python3 -c "$dial" "$PODSRC" "$PODDST" 19401 2>&1)"
-recorded "s2.9 (R3) a dial sourced from the server's pod-range address $PODSRC to $PODDST over the cable: $out — nothing on the wire checks a pod source"
+recorded "s2.9 a dial sourced from the server's pod-range address $PODSRC to $PODDST over the cable: $out — nothing on the wire checks a pod source"
 EOF
 
 # ---------------------------------------------------------------------------------

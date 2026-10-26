@@ -54,7 +54,7 @@ func nextBlock(screen string) (string, bool) {
 	return block, ok
 }
 
-// TestDoctorRendersRemedies is the B252 gate: `k3sm doctor` renders its
+// TestDoctorRendersRemedies is the gate for this behaviour: `k3sm doctor` renders its
 // preflight checks as status rows, with a real remedy for every non-pass in the
 // Next block, and an exit code that keeps its own 0/1 contract while borrowing
 // status's code for a WARN-only run.

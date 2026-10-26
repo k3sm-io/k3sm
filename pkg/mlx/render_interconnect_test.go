@@ -71,8 +71,8 @@ func podEnv(pod *corev1.Pod) map[string]string {
 	return env
 }
 
-// TestShardedHostfileUsesInterconnectAddresses is the B451 BI8 render gate
-// (plan §4 and I3). On the thunderbolt path every rank Pod opts into the
+// TestShardedHostfileUsesInterconnectAddresses pins this contract.
+// On the thunderbolt path every rank Pod opts into the
 // thunderbolt Interconnect and carries K3SM_MLX_HOSTS: every rank's slot-1
 // address and the collective port, in RANK order. Each rank's own entry equals
 // the slot-1 address the provider attaches to it (K3SM_INTERCONNECT_IP), and the

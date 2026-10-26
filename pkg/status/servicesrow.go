@@ -39,8 +39,8 @@ const servicesStaleAfter = 2 * ServicesRecordInterval
 const ServicesRemedy = "the proxy re-lists Services and EndpointSlices every 30 seconds and repairs a lost update; if the row still differs after a minute, restart the server (`sudo launchctl kickstart -k system/io.k3sm.server`)"
 
 // ServicesComparer compares a services record with the API. It is a seam because
-// the comparison belongs to the Service proxy's own package, which this
-// reporting leaf does not import; cmd/k3sm wires svcstatus.Comparer here.
+// the comparison lives in pkg/svcstatus, which imports this package, so a direct
+// call would be an import cycle; cmd/k3sm wires svcstatus.Comparer here.
 type ServicesComparer interface {
 	CompareServices(ctx context.Context, rec ServicesRecord) (ServicesComparison, error)
 }

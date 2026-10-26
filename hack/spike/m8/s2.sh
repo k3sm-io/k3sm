@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# M8.0-d2 / S2 — nested-dylib signing under AMFI, and exec from a clonefiled tree.
+# S2 — nested-dylib signing under AMFI, and exec from a clonefiled tree.
 #
-# Feeds runtimed M8.2-d3 (AdHocSignTree) and M8.4-a1's mechanized walk-verify.
+# Feeds runtimed (AdHocSignTree) and the image build's mechanized walk-verify.
 # Questions, in order:
 #   walk     how many Mach-Os are in an MLX python tree, and what is the
 #            signed / linker-ad-hoc / unsigned / INVALID tally?

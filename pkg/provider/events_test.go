@@ -87,7 +87,7 @@ func nextLifecycleEvent(ch <-chan string, d time.Duration) string {
 	}
 }
 
-// TestProviderEmitsLifecycleEvents is the B75 gate: the HostProcess provider must
+// TestProviderEmitsLifecycleEvents pins that the HostProcess provider must
 // emit Pulled/Created/Started on CreatePod and Killing on DeletePod, each carrying
 // the exact reason/type and the container name in the message. A provider that
 // accepts the recorder but emits nothing fails the drain (behavioral red), and it

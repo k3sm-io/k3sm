@@ -191,7 +191,7 @@ func alertCases() []alertCase {
 	}
 	updateFile := func(fsys fakeFS) func(t *testing.T) Row {
 		return func(t *testing.T) Row {
-			r, _ := Collector{FS: fsys, Paths: Paths{WorkDir: wd}, EUID: 501, ServiceUID: 250}.updateRow(now)
+			r, _ := Collector{FS: fsys, Paths: Paths{WorkDir: wd}, EUID: 501, ServiceUID: 250}.updateRow(now, nil, false)
 			return r
 		}
 	}
@@ -213,7 +213,7 @@ func alertCases() []alertCase {
 	registry := func(st registrysvc.State, probe error) func(t *testing.T) Row {
 		return func(t *testing.T) Row {
 			st.Port, st.Since = 5000, now.Add(-time.Hour)
-			return ingestRegistryRowFrom(st, probe, "k3sm status logs server\nsudo launchctl kickstart -k system/io.k3sm.server")
+			return ingestRegistryRowFrom(st, probe, "k3sm status logs server\nsudo launchctl kickstart -k system/io.k3sm.server", time.Now())
 		}
 	}
 	registryFile := func(fsys fakeFS) func(t *testing.T) Row {

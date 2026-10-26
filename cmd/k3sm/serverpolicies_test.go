@@ -47,23 +47,23 @@ func testDeniedLocalPorts() []int {
 // derived from the code under test: a derived expectation would move with a
 // regression instead of catching it.
 //
-// k3sm-reject-foreign-user is the load-bearing member (B153). It is the admission
+// k3sm-reject-foreign-user is the load-bearing member. It is the admission
 // half of the documented no-per-pod-uid-isolation ceiling, and it was previously
 // provisioned ONLY under the netd-helper backend — so a `--network none` or
 // `--network direct` cluster had no such object and ADMITTED a pod requesting a
 // foreign fsGroup/runAsUser, which is exactly what the first SIT T1 run observed.
 //
-// k3sm-warn-pod-hand-set-internet-egress is the B209 member: B91 landed the policy
-// and its package-level tests, but bring-up never called the provisioner, so a live
+// k3sm-warn-pod-hand-set-internet-egress is the member: the policy landed
+// with its package-level tests, but bring-up never called the provisioner, so a live
 // cluster carried six policies and this list is what makes that seventh one's
 // absence a failing test rather than a `kubectl get vap` count nobody runs.
 //
-// k3sm-warn-pod-hand-set-xcode-toolchain is the B264 member — the second hand-set
+// k3sm-warn-pod-hand-set-xcode-toolchain is the member — the second hand-set
 // opt-in advisory, listed here for the same reason as the first: the two annotations
 // are provisioned side by side in bring-up, and this list is what keeps one of them
 // from being dropped while the other's tests stay green.
 //
-// k3sm-reject-service-denied-local-port is the B301 member: the Service-side half
+// k3sm-reject-service-denied-local-port is the member: the Service-side half
 // of the sandbox local-port deny. It is provisioned from the SAME
 // opts.deniedLocalPorts() value the node stamps onto every pod's SBPL, so its
 // absence means a Service can be published on a port every pod is denied
@@ -80,7 +80,7 @@ var wantClusterPolicies = []string{
 	"k3sm-warn-service-udp",
 }
 
-// TestBringupProvisionsPolicies is the B153 regression gate: the set of admission
+// TestBringupProvisionsPolicies is the regression gate: the set of admission
 // policies bring-up provisions is INDEPENDENT of the host-network posture. The
 // table is the real cross-product of the `--network` flag values and the two euid
 // classes, resolved through the production resolver (hostnet.ResolveFor), so a row
@@ -204,13 +204,13 @@ func TestBringupForeignUserPolicyPinsThePodExecutionUID(t *testing.T) {
 	}
 }
 
-// TestServerProvisionsTheEgressWarnVAP is the B209 gate: bring-up must CALL
+// TestServerProvisionsTheEgressWarnVAP is the gate for this behaviour: bring-up must CALL
 // policy.EnsureEgressAnnotationWarn, not merely be able to.
 //
-// B91 landed the policy, its CEL, and its package-level tests — all green — while
+// The policy landed with its CEL, and its package-level tests — all green — while
 // provisionClusterPolicies never invoked it, so a live cluster ran with six
 // ValidatingAdmissionPolicies and hand-setting the internet-egress annotation
-// warned nothing. That is the B195 class: a unit test over an exported constructor
+// warned nothing. That is the class: a unit test over an exported constructor
 // proves the object can be built, never that anything builds it. This test is
 // therefore written at the ASSEMBLY seam (provisionClusterPolicies, the one
 // production caller) and reds the moment the call site is dropped.

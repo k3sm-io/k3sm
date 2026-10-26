@@ -113,10 +113,12 @@ const allRepositories = "**"
 //
 // The access-control shape is the whole security posture in four lines:
 // anonymousPolicy grants "read" to an unauthenticated caller, defaultPolicy is
-// EMPTY (an authenticated caller gets nothing by being authenticated), and the
-// one policy entry grants the push user read+create+update+delete. So the node's
-// runtime pulls with no credential, and only the holder of the per-boot password
-// can put an image into the store the cluster runs out of.
+// EMPTY (an authenticated caller gets nothing by being authenticated), the push
+// user is granted read+create+update+delete, and the push gate's user
+// read+create+update and never delete. So the node's runtime pulls with no
+// credential, and only the holder of a per-boot password can put an image into
+// the store the cluster runs out of: the local CLI, or the gate on behalf of a
+// pod the cluster's RBAC authorized.
 func renderConfig(workDir, bindAddress string, port int) ([]byte, error) {
 	if err := validateBind(bindAddress, port); err != nil {
 		return nil, err
@@ -143,10 +145,16 @@ func renderConfig(workDir, bindAddress string, port int) ([]byte, error) {
 			AccessControl: zotAccessControl{
 				Repositories: map[string]zotPolicyGroup{
 					allRepositories: {
-						Policies: []zotPolicy{{
-							Users:   []string{pushUser},
-							Actions: []string{"read", "create", "update", "delete"},
-						}},
+						Policies: []zotPolicy{
+							{
+								Users:   []string{pushUser},
+								Actions: []string{"read", "create", "update", "delete"},
+							},
+							{
+								Users:   []string{gateUser},
+								Actions: []string{"read", "create", "update"},
+							},
+						},
 						DefaultPolicy:   []string{},
 						AnonymousPolicy: []string{"read"},
 					},

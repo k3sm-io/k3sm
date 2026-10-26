@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-// TestEtcdSnapshotScheduleRetains is B466's gate. With a fake clock and a fake member
+// TestEtcdSnapshotScheduleRetains pins this contract. With a fake clock and a fake member
 // behind the real save path: every tick writes a verified 0600 snapshot named
 // etcd-snapshot-<node>-<unix>; retention keeps exactly the N newest scheduled
 // snapshots of THIS node and never a manual one, another node's, or a partial file;

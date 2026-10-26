@@ -23,7 +23,7 @@ import (
 )
 
 // guestArtifactsDirFlag is the DEV-ONLY guest-artifact directory override named
-// by the M11.2-d3 ledger row: a way to point a lab node at a locally-built
+// by the roadmap: a way to point a test node at a locally-built
 // kernel + initramfs instead of the pinned, published, digest-verified pair.
 //
 // It does not exist anywhere in this repo today, and this test is what keeps its

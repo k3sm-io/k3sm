@@ -19,7 +19,8 @@
 # 127.0.0.1 only.
 pkg/executor/supervised.go tcpReady net.Dialer{} # readiness dial of a child component on 127.0.0.1
 pkg/registrysvc/service.go Service.await net.Dialer{} # readiness dial of the registry child; validateBind admits loopback only
-pkg/registrysvc/relay.go newRelay net.Dialer{} # relay's upstream is the registry's 127.0.0.1 listener; the relay listener itself is clamped
+pkg/registrysvc/gate.go newGate net.Dialer{} # gate's upstream is the registry's 127.0.0.1 listener; the gate listener itself is clamped
+pkg/registrysvc/gate.go newGate http.Transport{} # dials only the registry's 127.0.0.1 listener through the dialer above; the apiserver clients are separate
 cmd/k3sm/certificate.go probeAPIServerServing http.Transport{} # healthz probe of the local apiserver at 127.0.0.1
 pkg/netserve/credential.go RotatingCredential.RESTConfig http.Transport{} # dials only through the credential's connrotation dialer, which wraps tcpseg.Dialer (NewRotatingCredential)
 
@@ -50,7 +51,6 @@ cmd/k3sm/agent.go agentResumeFromCredential net.Dialer{} # route probe toward th
 cmd/k3sm/meshrefresh.go newWorkerEndpointRefresher net.Dialer{} # route probe toward the --server underlay address
 
 # Internet downloads, digest-verified, over the default route.
-pkg/executor/helm.go downloadHashed http.DefaultClient # helm release tarball download
 pkg/builder/buildxhost.go downloadTo http.DefaultClient # buildx release asset download
 
 # Embedded etcd: its client and metrics listeners are loopback-only by argv (etcdArgs), never a pod address.
@@ -60,3 +60,7 @@ pkg/status/etcd.go httpGetLoopback http.DefaultClient # etcd metrics/health read
 pkg/status/registryrow.go probeRegistry http.DefaultClient # ingest registry /v2/ probe on 127.0.0.1
 pkg/builder/cancel.go RequestCancel var net.Dialer # dials a running build's cancel unix socket in the 0700 ledger dir
 pkg/builder/cancel.go BuildAlive var net.Dialer # liveness dial of a running build's cancel unix socket
+
+# Registry reads: the CLI's image ls/df client dials the server's registry on the apiserver host (loopback on the server, the underlay address otherwise), never a pod address.
+pkg/registryclient/client.go New http.Transport{} # anonymous registry read toward the server host on the physical interface; no mesh, no lo0 alias
+pkg/registryclient/client.go New net.Dialer{} # anonymous registry read toward the server host on the physical interface; no mesh, no lo0 alias

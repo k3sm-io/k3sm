@@ -250,7 +250,7 @@ func newLANRig(t *testing.T, role install.Role) *lanRig {
 	return rig
 }
 
-// lanRigHost is the rig Mac's interface addresses: a Wi-Fi address,
+// lanRigHost is a lab Mac's interface addresses: a Wi-Fi address,
 // loopback and the mesh address on its utun.
 func lanRigHost() ([]netip.Addr, error) {
 	return []netip.Addr{netip.MustParseAddr("192.0.2.20"), netip.MustParseAddr("127.0.0.1"), lanNode}, nil
@@ -776,6 +776,7 @@ func TestNetworkLanToggle(t *testing.T) {
 			{"off: a LoadBalancer on the Wi-Fi address", install.LANOff, install.RoleServer, nil, []netip.AddrPort{ap("192.0.2.20:8080")}, false},
 			{"off: the join wildcard on a worker is not allowed", install.LANOff, install.RoleAgent, nil, []netip.AddrPort{ap("0.0.0.0:9345")}, false},
 			{"off: the vm NAT gateway relay is not the LAN", install.LANOff, install.RoleServer, []string{"--registry-port", "5000"}, []netip.AddrPort{ap("192.168.64.1:5000")}, true},
+			{"off: the default registry relay is not the LAN", install.LANOff, install.RoleServer, nil, []netip.AddrPort{ap("192.168.64.1:6450")}, true},
 			{"on: wildcard NodePort, LoadBalancer and ingress", install.LANOn, install.RoleServer, nil,
 				[]netip.AddrPort{ap("0.0.0.0:30090"), ap("0.0.0.0:8080"), ap("0.0.0.0:80"), ap("0.0.0.0:443"), ap("100.64.0.1:10250"), ap("10.43.0.1:443")}, true},
 			{"on: a NodePort left on the local set", install.LANOn, install.RoleServer, nil, []netip.AddrPort{ap("127.0.0.1:30090"), ap("100.64.0.1:30090")}, false},

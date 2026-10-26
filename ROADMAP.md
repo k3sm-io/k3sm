@@ -92,7 +92,7 @@ release engineering. What ships:
 - Install arrives in three generations, in shipping order: *(1)*
   `curl -fsSL https://k3sm.io/install.sh | sh`, a checksum-verified release tarball handed to
   `sudo k3sm install` (a curl download carries no quarantine xattr); *(2)*
-  the k3sm app, a Developer ID signed, notarized download from k3sm.io that updates itself; *(3)* a signed, notarized `.pkg`. Underneath it are goreleaser,
+  the k3sm app, a Developer ID signed, notarized download from k3sm.io; *(3)* a signed, notarized `.pkg`. Underneath it are goreleaser,
   [user docs](docs/user/), and the website.
 - `k3sm image load` / `k3sm image import` ingest docker-save
   tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and
@@ -131,15 +131,52 @@ release engineering. What ships:
   Services reach `vm` Pods across nodes. The experimental two-server control plane above ships in
   this release.
 
-## v0.2 (planned)
+## v0.2 (shipped)
 
-- **The Linux `vm` path.** The Linux-image capability ships at v0.1 (above); v0.2 adds
+v0.2.0 was released on 2026-10-26.
+
+- **One image store and one name for it.** The server's registry becomes the single place the
+  cluster's images live, under one flat reference, `registry-k3sm:6450/<repo>:<tag>`, that works
+  the same in a Pod spec, inside native and `vm` Pods, and from every node. `k3sm build`,
+  `k3sm image load` and the other image commands write to it, each node keeps only a pull cache,
+  and an upgrade moves the images already on a node into the registry without losing any. The
+  registry serves HTTPS with a certificate from the cluster CA, which every Pod already trusts, so
+  no client needs an insecure-registry setting. The macOS app's Images view shows the registry. An
+  opt-in NodePort exposes it off the cluster.
+- **Pushing from inside a Pod.** A Pod pushes with its own ServiceAccount token, in a namespace
+  that opts in with a label and a RoleBinding, into a repository prefix that namespace owns.
+  Reads stay anonymous; no shared push password is handed out.
+- **Managed updates.** `k3sm update check` and `k3sm update apply` roll the cluster to a release
+  node by node, and each node installs only a payload its server signed.
+- **A real stop and start.** `sudo k3sm stop`, `start` and `restart`, with a stop that holds
+  across a reboot.
+- **Operations.** `k3sm status top`, `kubectl top` through the bundled metrics-server, build
+  history and cancellation, LoadBalancer Services on every node, and scheduled etcd snapshots on
+  HA servers.
+
+## v0.3 (planned)
+
+- **The Linux `vm` path.** The Linux-image capability ships at v0.1 (above); v0.3 adds
   the remaining two-Mac and vm tests with **published performance figures** (VM boot latency = restart
   cost, the Rosetta non-TSO ratio, virtiofs I/O vs native APFS), and the remaining ceilings
   either closed or documented (per-pod network segmentation between micro-VMs, host-path
   sharing). It also adds darwin/amd64 pod payloads under host Rosetta on the native path.
+- **llama.cpp serving.** A second native model-serving engine beside MLX: a model resource names a
+  GGUF model and its serving settings (context size, parallel slots, GPU layers), and k3sm runs
+  llama.cpp's own server, which speaks the common chat-completions API, for it as a native Pod on
+  the Mac's GPU, behind a Service, the same way `MLXModel` runs an MLX model.
+- **Hardware resources named for the hardware.** The GPU becomes one engine-neutral resource that
+  every Metal workload requests, whether it runs MLX, llama.cpp, PyTorch or another framework, and
+  the media engines become countable resources for video work. Node labels report the chip, the
+  memory the GPU can use, and whether the Neural Engine and Apple's on-device model are available.
+  This is a breaking change: `mlx.k3sm.io/gpu` and the `mlx.k3sm.io/*` node labels are retired, and
+  the release notes say how to move a hand-written Pod to the new names.
 
-## v0.3 (planned)
+- **The app finds its own new releases.** The k3sm app checks a release index signed with the
+  project's Developer ID for a newer release of itself and of k3sm, says how far behind it is, and
+  points to the download. Installing a release in place comes after it.
+
+## v0.4 (planned)
 
 - **De-EXPERIMENTAL HA.** The headline of this line, once it has been run on two Macs with Postgres.
 - **Multi-node graduates.** Multi-node clusters leave EXPERIMENTAL together with the two-server
@@ -150,10 +187,6 @@ release engineering. What ships:
 - **`linux/amd64` in the build engine, via guest Rosetta.** The managed buildkitd builder (see
   v0.1, above) builds `linux/arm64` only today; targeting `linux/amd64` needs the same
   in-guest Rosetta translation the `vm` RuntimeClass itself doesn't have yet (see Limitations).
-- **Kubelet-faithful registry semantics on the native path.** The pull-failure backoff taxonomy
-  (`ErrImagePull`/`ImagePullBackOff` alternation, `ErrImageNeverPull`), Rosetta-consuming
-  multi-arch selection, and a warm-cache offline start under `imagePullPolicy: IfNotPresent` /
-  `Never` are still open.
 - **ANE.** Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA.** Dynamic Resource Allocation for GPUs, once extended resources have shipped.
 - **A serving fleet for MLX models.** Multi-model, multi-worker inference above `MLXModel`: an
@@ -164,7 +197,7 @@ release engineering. What ships:
   across, and autoscaling is a planner sitting above one. `MLXModel` stays the one-object way to
   serve a single model.
 - **Direct links.** Macs cabled together over Thunderbolt find each other on the cable, and a new
-  Mac joins while the server's pairing window is open (`sudo k3sm pair`), optionally pinned to the
+  Mac joins while the server's pairing window is open (a planned pairing step), optionally pinned to the
   cluster it expects. Cluster traffic between two cabled Macs then takes the cable as a plain kernel
   route, with the wireguard mesh kept for peers that have no cable and as the fallback when one is
   pulled. That route is not encrypted, so the cable is treated as a trusted segment, and a per-link
@@ -172,11 +205,8 @@ release engineering. What ships:
   sharded across cabled Macs (the reserved `MLXModel.Distributed` seam, one rank per Mac) on MLX's
   `ring` backend. The `jaccl` backend over RDMA follows where macOS exposes it, which today means
   Thunderbolt 5 Macs on macOS 26.2 or later with RDMA enabled once in macOS Recovery.
-- **A macOS app, and a real stop and start.** k3sm gains `k3sm stop`, `k3sm start` and
-  `k3sm restart`. Stop is a full stop, like k3s's killall script: the node, its pods, the mesh and
-  the cluster addresses come down, and the node stays stopped across a reboot until you start it
-  again. Restart keeps pods running. On top of that, k3sm gets a second way to install: a notarized
-  app you drag into Applications. While k3sm runs it shows a menu-bar item with status, stop,
+- **A macOS app.** On top of `k3sm stop` and `start` (v0.2), k3sm gets a second way to install: a
+  notarized app you drag into Applications. While k3sm runs it shows a menu-bar item with status, stop,
   restart and logs (and, on the server, a command that joins a worker), and its window handles
   first-time setup, updates and uninstall. An optional auto-stop takes the node down when the Mac
   joins a Wi-Fi network you have not marked trusted; it is a convenience, not a security boundary.

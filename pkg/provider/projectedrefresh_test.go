@@ -179,8 +179,8 @@ func withVolumes(vs ...mount.VolumeRefresh) mount.RefreshResult {
 	return mount.RefreshResult{Volumes: vs}
 }
 
-// TestProjectedRefreshLoopCallsRuntimeAndReportsFailures is the B234 gate for
-// the provider half of the projected-volume refresh: once per tick the provider
+// TestProjectedRefreshLoopCallsRuntimeAndReportsFailures pins the provider
+// half of the projected-volume refresh: once per tick the provider
 // asks the in-process runtime to refresh every running non-vm pod it tracks,
 // with the pod's identity bound for token re-minting; a failed volume is one
 // Warning Event per volume per failure class; vm pods and the runtime's

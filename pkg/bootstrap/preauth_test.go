@@ -114,7 +114,7 @@ func (r *preAuthRig) post(remoteAddr, body string) *httptest.ResponseRecorder {
 // wellFormedJoin decodes cleanly, so an admitted request reaches VerifyToken.
 const wellFormedJoin = `{"token":"K10abc::id.secret","nodeName":"worker"}`
 
-// TestJoinPreAuthBoundRefusesFloods is the B372 gate: anonymous join volume is
+// TestJoinPreAuthBoundRefusesFloods pins this contract: anonymous join volume is
 // bounded BEFORE the bcrypt compare in VerifyToken and before the body is
 // decoded, per source address and in total.
 //

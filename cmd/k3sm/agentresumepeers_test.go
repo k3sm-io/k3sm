@@ -134,7 +134,7 @@ func sameNames(got [][]string, want [][]string) bool {
 	return true
 }
 
-// TestAgentResumeSeedsPeersFromALiveList is B308's gate.
+// TestAgentResumeSeedsPeersFromALiveList is the gate for this behaviour.
 //
 // Before it, the credential-resume path programmed cred.Assignment.Peers — the
 // snapshot of the ORIGINAL join, which Save writes back unchanged on every start

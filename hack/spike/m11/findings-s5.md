@@ -32,7 +32,7 @@
 
 | # | criterion | observed | consequence this selects |
 |---|---|---|---|
-| **6** | source address the host observes | **the guest's own vmnet IP** — `192.168.64.5`, on TCP and UDP, to both a wildcard-bound and a gateway-address-bound host listener | **per-pod attribution is a straight map; B113b is tractable and the lease→pod registry is buildable.** The gateway-rewrite branch is NOT taken, so B113a's fail-closed does not become the permanent answer |
+| **6** | source address the host observes | **the guest's own vmnet IP** — `192.168.64.5`, on TCP and UDP, to both a wildcard-bound and a gateway-address-bound host listener | **per-pod attribution is a straight map; per-pod attributionb is tractable and the lease→pod registry is buildable.** The gateway-rewrite branch is NOT taken, so per-pod attributiona's fail-closed does not become the permanent answer |
 | **2** | guest vmnet address host-dialable | **yes** — `192.168.64.5:34811` dialed and delivered from the host | the one path carrying readiness probes, port-forward and the Service-proxy backend dial exists; no netd verb needed for host→guest |
 | **1a** | guest → host listener, no route added | **wildcard-bound: connected. Gateway-address-bound: connected. Loopback(127.0.0.1)-bound: refused** (TCP); UDP identical by host receipt | a guest reaches any host listener that binds the vmnet gateway address or the wildcard. It does **not** reach a loopback-only bind — which is exactly the shape a ClusterIP lo0 alias has, so this is the first evidence that the VIP leg is not free |
 | **1b** | guest-side route for a service-CIDR prefix | `ip route add 10.43.0.0/16 via 192.168.64.1` **accepted**; the dial to `10.43.0.10:34807` got **no answer after 6s** with **`tx_packets_delta=6`** | packets for a service-CIDR prefix **do leave the guest** and are handed to the host as the next hop. Whether the host then weak-host-delivers them to a lo0-alias VIP is UNANSWERED here (no VIP could be plumbed unprivileged) — see the human slice |
@@ -40,10 +40,10 @@
 | **1 (VIP-b)** | + guest-side route for the service CIDR via the NAT gateway | **delivers, both TCP and UDP/53** | consistent with (a); adds nothing (a) did not already give |
 | **1 (VIP-c)** | + host `net.inet.ip.forwarding=1` | **delivers, both TCP and UDP/53** | consistent with (a); adds nothing (a) did not already give |
 | **1 (VIP-d)** | + an explicit host route for the VIP on lo0 | **delivers, both TCP and UDP/53** | consistent with (a); adds nothing (a) did not already give |
-| **4** | guest ↔ guest | **NOT reachable, in either protocol** — ICMP 100% loss, TCP unreachable, ARP FAILED — while both guests were proven live to the host | the trust ceiling is **narrower than M11.3-d4 assumed**: on this rig two vm pods on the same NAT segment cannot address each other directly. See the caveat below before this is published |
-| **5** | lease stability under a deterministic MAC | **stable**: `192.168.64.5` on all 3 restarts of the same MAC; a control MAC got a different address (`192.168.64.6`) | the deterministic-MAC lease is semi-stable enough for B113b's address→pod registry, **provided** the lease-change liveness contract is still implemented — stability observed over 3 restarts is not a guarantee |
+| **4** | guest ↔ guest | **NOT reachable, in either protocol** — ICMP 100% loss, TCP unreachable, ARP FAILED — while both guests were proven live to the host | the trust ceiling is **narrower than the guest-networking note assumed**: on this rig two vm pods on the same NAT segment cannot address each other directly. See the caveat below before this is published |
+| **5** | lease stability under a deterministic MAC | **stable**: `192.168.64.5` on all 3 restarts of the same MAC; a control MAC got a different address (`192.168.64.6`) | the deterministic-MAC lease is semi-stable enough for per-pod attributionb's address→pod registry, **provided** the lease-change liveness contract is still implemented — stability observed over 3 restarts is not a guarantee |
 | **7** | guest link MTU | **1500** | above the ≤1380 the mesh mss-clamp reasoning assumes. If cross-node vm traffic is ever claimed, the DHCP/init plan must set the guest MTU down — the link will not do it |
-| **3** | PodIP-as-guest-eth0-alias + a host route | **delivers** — host dials the PodIP and the guest receives the exact payload | the PodIP-as-alias model, if adopted, needs a narrow privileged **host-route** verb (the B232 shape) for THIS leg only — the VIP-delivery legs above need no privileged surface at all |
+| **3** | PodIP-as-guest-eth0-alias + a host route | **delivers** — host dials the PodIP and the guest receives the exact payload | the PodIP-as-alias model, if adopted, needs a narrow privileged **host-route** verb (the netd route-verb shape) for THIS leg only — the VIP-delivery legs above need no privileged surface at all |
 
 ## Criterion 6 — the source address (THE deciding fact) · verbatim
 
@@ -68,7 +68,7 @@ sent carries that address, so the accepted peer address and the sender agree.
 Scope of the claim: this is the address an ordinary host socket observes for
 traffic **from a guest to the host**. It says nothing about what a host outside
 this Mac observes for guest→LAN traffic, which is separately NATted and is not
-what B113 attributes.
+what per-pod attribution attributes.
 
 ## Criterion 2 — host → guest · verbatim
 
@@ -199,7 +199,7 @@ alone suffices ⇒ ZERO new privileged surface, the route set becomes data on
 pre-named branch. The observation here is that **even (b) is unnecessary**:
 arrangement (a) — no guest route, host forwarding forced to 0, no host route —
 **already delivers**, on both protocols. So VIP delivery needs NO route data
-pushed into `podnet.GuestNetwork`, NO netd route verb (B232), NO host
+pushed into `podnet.GuestNetwork`, NO netd route verb, NO host
 `ip.forwarding=1`, and NO host route for the VIP. The guest's ordinary default
 NAT route is sufficient on its own; XNU weak-host-delivers the packet to the
 lo0 alias without any of the three widenings the runbook staged as fallbacks.
@@ -236,7 +236,7 @@ no-root sitting's `SIOCAIFADDR: permission denied` reconfirmed the same class
 of negative for the alias case). So **the privileged plumbing need did not
 disappear — it moved**:
 if the PodIP-as-guest-eth0-alias identity model is adopted for the vm path, a
-narrow privileged route verb (the B232 shape named in `s5.sh` — per-pod,
+narrow privileged route verb (the netd route-verb shape named in `s5.sh` — per-pod,
 idempotent, revoked at teardown, uid-gated like every existing netd verb) is
 needed for **this** leg, not for ordinary VIP/Service delivery. Which identity
 model to adopt is not decided here; this file records the dependency only.
@@ -278,10 +278,10 @@ controls to the gateway both passed in the same boot in which its probes to the
 peer failed, so "busybox ping does not work" and "this guest has no stack" are
 both excluded.
 
-**Consequence.** This is *narrower* than M11.3-d4 assumed. Its premise —
+**Consequence.** This is *narrower* than guest networking-d4 assumed. Its premise —
 "guests share one vmnet NAT segment (guest↔guest at NAT addresses bypasses
 Services/policy)" — is **not what this rig does**: guest↔guest is blocked, so
-the bypass M11.3-d4 was written to document does not exist here, and the
+the bypass that note was written to document does not exist here, and the
 pf-filter follow-on it offered as an alternative has nothing to filter.
 
 **Caveat that must travel with this row, and must be discharged before it is
@@ -290,7 +290,7 @@ published as a ceiling.** One rig, one macOS version, one attachment type
 this attachment, so this is an OBSERVED BEHAVIOUR of macOS 26.6.2, not a
 contract. A limitations.md claim of "vm pods are isolated from one another"
 would be a security claim resting on undocumented behaviour that a point
-release may change. The honest M11.3-d4 wording is therefore the negative one:
+release may change. The honest wording is therefore the negative one:
 we do not rely on guest↔guest reachability, and we do not promise its absence.
 A bridged or a `VZFileHandleNetworkDeviceAttachment` topology is a DIFFERENT
 question and is untested here.
@@ -311,7 +311,7 @@ fixed string; the address did not move. The control MAC took a different
 address in the same session, so the stability is MAC-derived and not "this
 server hands out one address".
 
-**Consequence.** B113b's address→pod registry is buildable. The observation does
+**Consequence.** per-pod attributionb's address→pod registry is buildable. The observation does
 NOT license dropping the lease-change liveness contract: three restarts inside
 one session say nothing about a lease expiring, a reboot of the host, or
 another guest taking the address after a long gap.
@@ -326,7 +326,7 @@ S5_C7_IPLINK=2: eth0: <NO-CARRIER,BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdis
 (The `NO-CARRIER`/`state DOWN` flags are busybox `ip`'s rendering; the link
 carried DHCP, TCP and UDP in the same boot.)
 
-**Consequence.** 1500, i.e. the link does NOT come up pre-clamped. M11.3-d4's
+**Consequence.** 1500, i.e. the link does NOT come up pre-clamped. guest networking-d4's
 "guest link MTU ≤1380 if cross-node is ever claimed" is therefore an action for
 the DHCP/init plan, not a property to inherit.
 

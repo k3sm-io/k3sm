@@ -64,9 +64,11 @@ func run(args []string, w io.Writer) error {
 	return err
 }
 
-// fields is the key=value form publish.sh compares, in its order.
+// fields is the key=value form publish.sh compares, in its order. publish.sh
+// prints minimum_supported_tag rather than comparing it with anything.
 func fields(ix update.ReleaseIndex) string {
 	return "tag=" + ix.Tag + "\n" +
+		"minimum_supported_tag=" + ix.MinimumSupportedTag + "\n" +
 		"image_name=" + ix.App.Image.Name + "\n" +
 		"image_sha256=" + ix.App.Image.SHA256 + "\n" +
 		"image_size=" + strconv.FormatInt(ix.App.Image.Size, 10) + "\n" +

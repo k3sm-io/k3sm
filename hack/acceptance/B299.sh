@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k3sm B299 lab measurement: what TCP MSS, UDP size and path-MTU behaviour pod
+# k3sm MSS measurement lab measurement: what TCP MSS, UDP size and path-MTU behaviour pod
 # traffic actually gets on the wireguard mesh between two joined Macs, against
 # an INSTALLED, RUNNING two-node cluster ($KUBECONFIG). This gate boots nothing.
 #
@@ -671,7 +671,7 @@ NEW_PANICS="$(echo "$NEW_PANICS" | grep -v '^$' || true)"
 
 # ── Results ───────────────────────────────────────────────────────────────────
 echo
-echo "================ B299 results ================"
+echo "================ results ================"
 echo "pf: local status=${PF_LOCAL:-?} io.k3sm.mesh=${ANCHOR_LOCAL}; peer status=${PF_PEER:-?} io.k3sm.mesh=${ANCHOR_PEER}"
 echo "tunnel: local $LOCAL_UTUN mtu=${UTUN_MTU_LOCAL:-?} route-mtu=${ROUTE_MTU_LOCAL:-?}; peer $PEER_UTUN mtu=${UTUN_MTU_PEER:-?} route-mtu=${ROUTE_MTU_PEER:-?}"
 if [ "$ANCHOR_LOCAL" = referenced ] || [ "$ANCHOR_PEER" = referenced ]; then

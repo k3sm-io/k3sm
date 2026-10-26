@@ -25,12 +25,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 
 	"k3sm.io/k3sm/internal/atomicfile"
 	"k3sm.io/k3sm/internal/binsign"
+	"k3sm.io/k3sm/pkg/registrysvc/zotchild"
 )
 
 // The zot pin and its staging contract. The binary is accompanied by a VERSION
@@ -40,15 +40,17 @@ import (
 // installed base.
 const (
 	// DefaultZotVersion is THE zot module version the registry child is built
-	// from. v2.1.20 is the newest v2.1.x tag at the time of writing and it was
-	// chosen by BUILDING it: `go install zotregistry.dev/zot/v2/cmd/zot@v2.1.20`
+	// from. v2.1.22 is the newest v2.1.x tag at the time of writing and it was
+	// chosen by BUILDING it: `go install zotregistry.dev/zot/v2/cmd/zot@v2.1.22`
 	// completes CGO_ENABLED=0 for darwin/arm64 out of module, and the resulting
 	// binary was driven through the four behaviours this package depends on —
 	// authenticated push accepted, anonymous push refused 401, anonymous pull
 	// served, and the rendered config accepted by zot's STRICT loader (it
 	// UnmarshalExact's the file and fails on any unknown key, so a config this
-	// package renders is either exactly right or refused at boot).
-	DefaultZotVersion = "v2.1.20"
+	// package renders is either exactly right or refused at boot). It is built
+	// from the zotchild wrapper module, which pins it: a bump regenerates that
+	// module (see its package doc) in the same change.
+	DefaultZotVersion = "v2.1.22"
 	// ZotBinaryName is the staged binary's basename (in the workdir bin, in an
 	// install payload, and in the release archive).
 	ZotBinaryName = "zot"
@@ -58,12 +60,16 @@ const (
 	ZotMarkerName = "zot.version"
 	// zotBuildVariant records HOW the pinned child was built. "minimal" is the
 	// plain `cmd/zot` build with NO build tags, which is zot's dist-spec-only
-	// flavor: no search, metrics, scrub, sync, UI, or image-trust extensions. It
-	// is part of the marker because version alone does not identify the binary —
-	// the same zot tag builds a much larger registry when its extension tags are
-	// passed, and the minimal flavor is what an ingest registry needs.
-	zotBuildVariant = "minimal"
-	// zotModulePath is the pinned `go install` target.
+	// flavor: no search, metrics, scrub, sync, UI, or image-trust extensions. "+r1"
+	// is the first set of requirement raises the build carries (internal/childreq:
+	// golang.org/x/net v0.60.0, required by the zotchild wrapper module); the bare
+	// "minimal" was zot's tag graph unchanged. It is part of the marker because
+	// version alone does not identify the binary: the same zot tag builds a much
+	// larger registry when its extension tags are passed, and links different
+	// dependencies with and without the raises. Changing the raises changes the
+	// "+r" suffix, which is what makes every already-staged zot re-stage.
+	zotBuildVariant = "minimal+r1"
+	// zotModulePath is the main package the wrapper module builds.
 	zotModulePath = "zotregistry.dev/zot/v2/cmd/zot"
 )
 
@@ -106,6 +112,12 @@ func zotStaged(bd, version string) bool {
 	v, variant := readZotMarker(bd)
 	return v == version && variant == zotBuildVariant
 }
+
+// PayloadVouchesZot reports whether the payload bin dir holds a zot whose marker
+// vouches for version: the exact predicate under which the server takes the
+// payload zot instead of building one. An installer uses it to prove the set it
+// staged is one the server will use.
+func PayloadVouchesZot(bd, version string) bool { return zotStaged(bd, version) }
 
 // writeZotMarker writes the marker atomically (temp + rename) so a crashed or
 // killed boot can never leave a half-written marker vouching for the wrong bytes.
@@ -309,17 +321,14 @@ func fileSHA256(path string) ([sha256.Size]byte, error) {
 // anything.
 var (
 	zotModuleCacheDir = hostGoModCache
-	runZotBuild       = goInstallZot
+	runZotBuild       = buildZotWrapper
 )
 
-// buildZot runs the pinned `go install` into a scratch GOPATH and copies the
-// result into bd.
+// buildZot builds the pinned zot from the zotchild wrapper module into a scratch
+// GOPATH's bin and installs the result into bd. An explicit GOOS/GOARCH in the
+// environment (the release stages darwin/arm64 explicitly) cross-compiles to the
+// same path.
 func buildZot(ctx context.Context, bd, version string) error {
-	// `go install pkg@version` REFUSES to write a cross-compiled binary when GOBIN
-	// is set, and a Go toolchain running under Rosetta on an Apple-silicon Mac
-	// counts as cross-compiling for darwin/arm64. So install into a scratch GOPATH
-	// and copy the result out. Cross-compiled installs land in
-	// bin/<goos>_<goarch>/, native ones directly in bin/, so both are probed.
 	gopath, err := os.MkdirTemp("", "k3sm-zot-gopath")
 	if err != nil {
 		return fmt.Errorf("zot build scratch dir: %w", err)
@@ -338,17 +347,7 @@ func buildZot(ctx context.Context, bd, version string) error {
 		return fmt.Errorf("build zot %s (CGO_ENABLED=0): %w (a packaged install has no Go toolchain — re-run `sudo k3sm install` so the staged payload carries this pin): %s",
 			version, err, out)
 	}
-	goos, goarch := runtime.GOOS, runtime.GOARCH
-	if v := os.Getenv("GOOS"); v != "" {
-		goos = v
-	}
-	if v := os.Getenv("GOARCH"); v != "" {
-		goarch = v
-	}
-	built := filepath.Join(gopath, "bin", goos+"_"+goarch, ZotBinaryName) // cross-compiled
-	if _, statErr := os.Stat(built); statErr != nil {
-		built = filepath.Join(gopath, "bin", ZotBinaryName) // native
-	}
+	built := filepath.Join(gopath, "bin", ZotBinaryName)
 	// Stage on a new inode, signed as a temp before the rename: an interrupted
 	// copy cannot leave a truncated binary at the real path, the real path never
 	// names unsigned bytes, and a running zot's mapping is never rewritten.
@@ -358,14 +357,14 @@ func buildZot(ctx context.Context, bd, version string) error {
 	return nil
 }
 
-// zotBuildEnv is the environment the pinned `go install` runs under.
+// zotBuildEnv is the environment the pinned zot build runs under.
 //
 // CGO_ENABLED=0 because nothing in the minimal zot build needs cgo and a pure-Go
 // child is what keeps a C toolchain out of every k3sm artifact. GOWORK=off keeps
-// the workspace's go.work out of an out-of-module install. GOBIN is CLEARED (not
-// merely unset in our own env) so an ambient GOBIN cannot re-trigger the
-// cross-compile refusal buildZot documents. GOMODCACHE is pinned away from the
-// scratch GOPATH so the pin's modules are fetched once per machine.
+// the workspace's go.work out of the wrapper module's build. GOBIN is CLEARED (not
+// merely unset in our own env) so nothing ambient decides where a Go command
+// writes. GOMODCACHE is pinned away from the scratch GOPATH so the pin's modules
+// are fetched once per machine.
 //
 // The Go variables that weaken module verification or redirect the fetch are
 // DROPPED from the ambient environment and the safe values set explicitly, last,
@@ -394,7 +393,7 @@ var zotDroppedEnv = []string{
 }
 
 // ErrZotGoTooOld marks a zot build refused because the host Go is older than
-// the pinned zot's go directive. The install runs with GOTOOLCHAIN=local, so the
+// the pinned zot's go directive. The build runs with GOTOOLCHAIN=local, so the
 // toolchain is never fetched; the operator upgrades Go or installs the packaged payload.
 var ErrZotGoTooOld = errors.New("the host Go toolchain is older than the pinned zot requires (GOTOOLCHAIN=local forbids fetching one)")
 
@@ -421,19 +420,46 @@ func hostGoModCache(ctx context.Context) (string, error) {
 		dir = filepath.Join(base, "k3sm", "gomodcache")
 	}
 	// Created here rather than left to the toolchain so an unwritable cache fails
-	// with the path named instead of inside a `go install` diagnostic.
+	// with the path named instead of inside a Go build diagnostic.
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create Go module cache %s: %w", dir, err)
 	}
 	return dir, nil
 }
 
-// goInstallZot runs the pinned `go install` into the scratch GOPATH's bin,
-// downloading through the stable module cache. It returns the combined output so
-// a failure carries the toolchain's own diagnostic.
-func goInstallZot(ctx context.Context, version, gopath, modCache string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "go", "install", zotModulePath+"@"+version)
-	cmd.Env = zotBuildEnv(gopath, modCache)
+// ErrZotVersionUnpinned marks a request to build a zot version other than the one
+// the embedded wrapper module pins. The wrapper's go.sum is the lockfile for
+// exactly one version, so another one cannot be built from it.
+var ErrZotVersionUnpinned = errors.New("zot version is not the one the embedded wrapper pins")
+
+// buildZotWrapper materializes the zotchild wrapper module under gopath/src and
+// builds zot's main package from it into gopath/bin, downloading through the
+// stable module cache. It returns the combined output so a failure carries the
+// toolchain's own diagnostic.
+//
+// zot is built from a wrapper rather than with `go install
+// zotregistry.dev/zot/v2/cmd/zot@<pin>` because `go install pkg@version` builds
+// exactly the tag's module graph and cannot raise a requirement; the wrapper
+// requires zot at the pin and childreq's raises, and nothing else. -mod=readonly
+// (set in the env as well, last, so an ambient value cannot loosen it) makes the
+// wrapper's go.sum the only acceptable source of module hashes; -trimpath and
+// -buildvcs=false keep host paths and VCS state out of the binary.
+func buildZotWrapper(ctx context.Context, version, gopath, modCache string) ([]byte, error) {
+	if version != DefaultZotVersion {
+		return nil, fmt.Errorf("build zot %s: %w (%s)", version, ErrZotVersionUnpinned, DefaultZotVersion)
+	}
+	src := filepath.Join(gopath, "src", "zot-child")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		return nil, fmt.Errorf("zot wrapper dir: %w", err)
+	}
+	for name, data := range map[string][]byte{"go.mod": zotchild.GoMod, "go.sum": zotchild.GoSum} {
+		if err := os.WriteFile(filepath.Join(src, name), data, 0o644); err != nil {
+			return nil, fmt.Errorf("write zot wrapper %s: %w", name, err)
+		}
+	}
+	cmd := exec.CommandContext(ctx, "go", zotBuildArgs(filepath.Join(gopath, "bin", ZotBinaryName))...)
+	cmd.Dir = src
+	cmd.Env = append(zotBuildEnv(gopath, modCache), "GOFLAGS=-mod=readonly")
 	out, err := cmd.CombinedOutput()
 	if err != nil && zotGoTooOld(out) {
 		err = fmt.Errorf("%w: %w", ErrZotGoTooOld, err)
@@ -441,7 +467,12 @@ func goInstallZot(ctx context.Context, version, gopath, modCache string) ([]byte
 	return out, err
 }
 
-// zotGoTooOld reports whether a `go install` diagnostic is the local-toolchain
+// zotBuildArgs is the `go build` argv for zot's main package inside the wrapper.
+func zotBuildArgs(out string) []string {
+	return []string{"build", "-trimpath", "-buildvcs=false", "-mod=readonly", "-o", out, zotModulePath}
+}
+
+// zotGoTooOld reports whether a Go build diagnostic is the local-toolchain
 // refusal ("requires go >= X (running go Y; GOTOOLCHAIN=local)").
 func zotGoTooOld(out []byte) bool {
 	s := string(out)

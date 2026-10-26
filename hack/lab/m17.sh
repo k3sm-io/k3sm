@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # k3sm M17 lab gate: the phases.json M17-lab row's path. The ladder itself, the
-# two-Mac interconnect ladder of the B451 amendment, lives in one place,
+# two-Mac interconnect ladder, lives in one place,
 # hack/lab/m17-interconnect.sh; this file only hands over to it, so the row's
 # gate path and every invocation of it keep working.
 #

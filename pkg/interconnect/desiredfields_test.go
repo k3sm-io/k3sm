@@ -36,8 +36,8 @@ import (
 )
 
 // TestResolverDesiredCarriesNamespacesAndModelUIDs covers the two desired
-// fields the node's pod attach reads instead of the Interconnect and MLXModel
-// (plan I9): both are filled, a change in either rewrites the value, and a
+// fields the node's pod attach reads instead of the Interconnect and MLXModel:
+// both are filled, a change in either rewrites the value, and a
 // failed MLXModel read writes nothing new and clears nothing.
 func TestResolverDesiredCarriesNamespacesAndModels(t *testing.T) {
 	ctx := context.Background()

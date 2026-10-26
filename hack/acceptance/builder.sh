@@ -23,7 +23,7 @@
 #   LIVE TIER (needs $KUBECONFIG on a vm-capable node) — the engine actually
 #   serving. It is PRINTED AS OWED here, not run: it needs a booted vm guest, a
 #   real buildkitd worker and a real RUN build, which is the orchestrator's
-#   single-node lab step, not a CI leg (CI is disabled by operator directive).
+#   single-node lab step, not a CI leg (CI is disabled).
 #
 # The GOARCH=arm64 pin is a CORRECTNESS requirement: a Mac's Go toolchain may be
 # x86_64-under-Rosetta, and an unpinned build produces an x86_64 binary this
@@ -312,12 +312,12 @@ owed "builder.20 live: \`k3sm builder up\` registers a buildkit worker          
 owed "builder.21 live: a RUN-containing build through Endpoint() produces an OCI layout"
 owed "builder.22 live: \`k3sm builder buildx build --output type=oci,dest=out .\` of a RUN Dockerfile succeeds"
 owed "builder.23 live: \`k3sm build -t app:dev .\` on a RUN Dockerfile starts the engine and records app:dev in the store"
-owed "builder.23b live: \`k3sm image ls\` shows that entry and a Pod naming app:dev runs (both build paths)"
+owed "builder.23b live: \`k3sm image inspect app:dev\` finds that entry in the node store and a Pod naming app:dev runs (both build paths)"
 owed "builder.24 live: \`k3sm image push\` of the layout, then a Pod runs it"
 owed "builder.25 live: \`k3sm builder down\` deletes the Pod but keeps the cache PVC"
 owed "builder.26 live: \`k3sm builder delete\` removes the Pod, Service, cache PVC AND the namespace (full reset)"
 owed "builder.27 live: \`k3sm build -t myapp:v1 --push .\` on a node with --registry-port lands the image in that node's registry and a Pod naming myapp:v1 pulls it back"
-owed "builder.28 live: \`k3sm build -t myapp:v1 --push .\` with the registry DISABLED exits non-zero, names --registry-port, and \`k3sm image ls\` still shows myapp:v1"
+owed "builder.28 live: \`k3sm build -t myapp:v1 --push .\` with the registry DISABLED exits non-zero, names --registry-port, and \`k3sm image inspect myapp:v1\` still finds it in the node store"
 owed "builder.29 live: \`k3sm build -t myapp:v1 --platform linux/arm64 .\` on a COPY-only Dockerfile produces a LINUX image (k3sm image inspect reports linux/arm64) and a runtimeClassName: vm Pod runs it"
 owed "builder.30 live: \`k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci -o out .\` writes an index holding both, the store records linux/arm64, and --push publishes the whole index"
 owed "builder.31 live: \`k3sm build --platform linux/amd64 .\` on a COPY-only Dockerfile — does buildkit accept a target its worker cannot execute? (the one multi-arch behaviour no offline gate can settle)"

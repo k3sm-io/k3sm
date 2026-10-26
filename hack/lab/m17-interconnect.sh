@@ -2,8 +2,8 @@
 # shellcheck disable=SC2329 # the assertions and their helpers run through the rung table's "$fn"
 #
 # k3sm M17 lab ladder: the Thunderbolt cable between two cluster Macs as an
-# admin-armed interconnect beside the wireguard mesh (the B451 amendment to the
-# M17 plan, its I1..I10 resolutions and BI10). This file is the one executable
+# admin-armed interconnect beside the wireguard mesh (the cabled-interconnect
+# ladder). This file is the one executable
 # home of the ladder; hack/lab/m17.sh execs it.
 #
 # Row in hack/acceptance/phases.json:
@@ -34,7 +34,7 @@
 #   r4-mesh-traffic  ordinary pod and ClusterIP traffic stays on the mesh; wildcard and
 #                    source-pin negatives
 #   r5-ring          a sharded MLXModel on the interconnect serves through rank 0
-#   r6-unplug        the I10 budget measured from the carrier event; UpHold; one restart
+#   r6-unplug        the unplug budget measured from the carrier event; UpHold; one restart
 #   r7-desired-forge a node-forged desired annotation yields no out-of-policy alias
 #   r8-killswitch    k3sm interconnect disable leaves no reserved-half state anywhere
 #   r9-downgrade     the previous binary node by node leaves no state; HelperTooOld leg
@@ -1039,9 +1039,9 @@ assert_r9_downgrade() {
 		check "$s Mac: no reboot happened (kern.boottime unchanged; a reboot is never the cleanup)" \
 			test "$(on "$s" 'sysctl -n kern.boottime' 2>/dev/null)" = "$(side_var "$s" BOOT)"
 	done
-	# Leave the rig on the artifact under test, worker first.
-	reinstall "$first" "$K3SM_ARTIFACT" current || fail "the artifact under test did not reinstall on the $first Mac (the rig is left downgraded: fix by hand)"
-	reinstall "$second" "$K3SM_ARTIFACT" current || fail "the artifact under test did not reinstall on the $second Mac (the rig is left downgraded: fix by hand)"
+	# Leave the lab host on the artifact under test, worker first.
+	reinstall "$first" "$K3SM_ARTIFACT" current || fail "the artifact under test did not reinstall on the $first Mac (the lab hosts are left downgraded: fix by hand)"
+	reinstall "$second" "$K3SM_ARTIFACT" current || fail "the artifact under test did not reinstall on the $second Mac (the lab hosts are left downgraded: fix by hand)"
 }
 
 # ── --plan ──────────────────────────────────────────────────────────────────────

@@ -29,7 +29,7 @@ import (
 
 // TestM3_3_WorkerNetserveConfig proves a joined worker constructs its node-local
 // datapath (the Service proxy + per-node cluster DNS) with the right join-derived
-// inputs — the M3.3-a1 worker-bringup wiring. The gap M3.3 closes is that the
+// inputs — the worker-bringup wiring. The gap it closes is that the
 // agent path ran NO netserve, so a worker had no proxy and no DNS; this asserts the
 // config the worker now feeds netserve.New: the proxy's backend-dial source is this
 // node's assigned mesh-egress /32 (so cross-node dials are not blackholed by
@@ -101,7 +101,7 @@ func TestM3_3_WorkerNetserveConfig(t *testing.T) {
 	})
 }
 
-// TestAgentPathShimFlag pins the B159 half of the pod-support-shim wiring on the
+// TestAgentPathShimFlag pins the half of the pod-support-shim wiring on the
 // WORKER path: `k3sm agent` accepts --path-shim, threads it to its in-process
 // node, and gives it the SAME precedence `k3sm server` / `k3sm node` use — an
 // explicit flag wins, else the sibling-dylib lookup.

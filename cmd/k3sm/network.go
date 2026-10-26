@@ -51,8 +51,10 @@ is restored and checked the same way. If the daemon does not apply it live,
 k3sm restarts the node daemon in place instead (pods keep running) and says so.
 
 With LAN access off, a LoadBalancer port below 1024 is not served (macOS lets
-only root bind a specific address there), and the ingress answers on the
-node's own address but not on 127.0.0.1.
+only root bind a specific address there) unless it is listed in
+--lb-privileged-ports, which the root network helper then serves on the
+node's own address and on 127.0.0.1. The ingress answers on the node's own
+address but not on 127.0.0.1.
 
 Not covered: the apiserver (loopback, or the mesh address), the worker join
 port (a new worker joins over the LAN, and every request needs the join

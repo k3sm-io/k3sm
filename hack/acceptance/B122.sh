@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B122 acceptance gate — digest-pinned image constants and the two checks that keep
+# k3sm image pin acceptance gate — digest-pinned image constants and the two checks that keep
 # them honest.
 #
 #   pkg/images            the pins, plus Lockstep (constants <-> hack/images/mirror.yaml)
@@ -30,7 +30,7 @@ ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "==> k3sm B122 acceptance (image pins: lockstep + live verifier)"
+echo "==> k3sm image pin acceptance (image pins: lockstep + live verifier)"
 
 # ---- b122.0 — the artifacts exist -------------------------------------------
 for f in "$MANIFEST" "$SCRIPT" "$K3SM_ROOT/pkg/images/pins.go" "$K3SM_ROOT/pkg/images/doc.go"; do
@@ -47,7 +47,7 @@ else
 fi
 if [ "$FAIL" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "B122: $PASS passed, $FAIL failed (artifacts absent — red at main by construction)" >&2
+	echo "image pin: $PASS passed, $FAIL failed (artifacts absent — red at main by construction)" >&2
 	exit 1
 fi
 
@@ -134,7 +134,7 @@ fi
 
 # (b) a flipped digest in BOTH refs: schema-valid, so the LOCKSTEP check must be what
 #     rejects it. This is the leg that proves lockstep itself bites.
-sed 's|\(sha256:\)6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3|\1deadbeef0000000000000000000000000000000000000000000000000000beef|g' \
+sed 's|\(sha256:\)b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c|\1deadbeef0000000000000000000000000000000000000000000000000000beef|g' \
 	"$MANIFEST" >"$TMP/flip-both.yaml"
 if cmp -s "$MANIFEST" "$TMP/flip-both.yaml"; then
 	ladder no "b122.3b mutation actually changed the manifest (sed matched nothing)"
@@ -209,6 +209,6 @@ KNOWN-UNPROVEN HERE:
     (an unused constant is still a registered constant).
 UNPROVEN
 echo "----------------------------------------"
-echo "B122: $PASS passed, $FAIL failed"
+echo "image pin: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B122 GREEN ================"
+echo "================ image pin GREEN ================"

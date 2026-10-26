@@ -38,7 +38,7 @@ import (
 const conformanceNS = "default"
 
 // nativePod builds a one-shot native Pod for the conformance suite: it targets the
-// darwin Virtual Kubelet node (nodeSelector os=darwin, satisfying the M1.2
+// darwin Virtual Kubelet node (nodeSelector os=darwin, satisfying the
 // admission policy), tolerates the provider taint, runs image "native" with the
 // given command, and uses RestartPolicyNever — so a clean exit (0) drives the pod
 // to Succeeded and a non-zero exit to Failed, which the test asserts as the
@@ -136,7 +136,7 @@ func darwinNodeIP(t *testing.T, c *Cluster) string {
 
 // readyEndpointAddrs returns the addresses currently marked Ready across all
 // EndpointSlices of svc — the set the Service proxy load-balances to. A pod that
-// fails its readiness probe drops OUT of this set (the M2.2 semantic).
+// fails its readiness probe drops OUT of this set.
 func readyEndpointAddrs(t *testing.T, c *Cluster, ns, svc string) []string {
 	t.Helper()
 	slices, err := c.Client.DiscoveryV1().EndpointSlices(ns).List(context.Background(), metav1.ListOptions{

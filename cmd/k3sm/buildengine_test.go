@@ -105,7 +105,7 @@ func TestBuildRouting(t *testing.T) {
 			out := filepath.Join(t.TempDir(), "img.tar")
 			o := buildOptions{
 				dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-				tag:        "example.com/app:v1",
+				tag:        "app:v1",
 				output:     out,
 				format:     "docker",
 				platforms:  []string{oci.DefaultPlatform},

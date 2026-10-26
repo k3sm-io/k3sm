@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# k3sm B59 acceptance gate — the cross-repo public-CI manifest proof.
+# k3sm CI manifest acceptance gate — the cross-repo public-CI manifest proof.
 #
-# B59 adds an INTERIM M7-bootstrap per-repo GitHub Actions CI workflow
+# This change adds an INTERIM bootstrap per-repo GitHub Actions CI workflow
 # (.github/workflows/ci.yml) to each of the four k3sm code repos. This gate is the
 # runnable red->green proof that every repo's workflow exists and holds the required
 # security + build posture:
@@ -72,7 +72,7 @@ if ! WS="$(find_workspace_root "$HERE")"; then
 	echo "FAIL  could not locate the k3sm workspace root (a dir with apis/ runtimed/ darwin-net/ k3sm/ or go.work) walking up from $HERE" >&2
 	exit 1
 fi
-echo "==> B59 cross-repo public-CI manifest gate (workspace: $WS)"
+echo "==> cross-repo public-CI manifest gate (workspace: $WS)"
 
 PASS=0; FAIL=0; DORMANT=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
@@ -287,15 +287,15 @@ fi
 
 echo "----------------------------------------"
 if [ "$DORMANT" -ne 0 ]; then
-	echo "B59: $PASS passed, $FAIL failed, $DORMANT recorded-not-run"
+	echo "CI manifest: $PASS passed, $FAIL failed, $DORMANT recorded-not-run"
 	echo "  NOT PROVEN HERE: the workflow CONTENT posture (runs hack/ci.sh, the"
 	echo "  CGO_ENABLED=1 -race step, macos-15, least-privilege token, SHA-pinned"
 	echo "  actions, sibling checkouts) for $DORMANT repo(s) whose ci.yml is fully"
 	echo "  commented out. Nothing about those repos' CI posture is claimed by a"
-	echo "  green B59 today; the assertions re-arm on the run after a workflow is"
+	echo "  green today; the assertions re-arm on the run after a workflow is"
 	echo "  uncommented, which is when they can mean anything again."
 else
-	echo "B59: $PASS passed, $FAIL failed"
+	echo "CI manifest: $PASS passed, $FAIL failed"
 fi
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B59 GREEN ================"
+echo "================ CI manifest GREEN ================"

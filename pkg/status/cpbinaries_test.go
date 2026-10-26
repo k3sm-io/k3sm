@@ -96,7 +96,7 @@ func TestApplyStagedControlPlaneOnTheServerRow(t *testing.T) {
 	})
 }
 
-// TestCollectorStagedVsPinnedMismatch is the status half of B395: a healthy
+// TestCollectorStagedVsPinnedMismatch is the status half of the staged-version check: a healthy
 // cluster whose work dir staged an older control plane than this binary pins is
 // DEGRADED, and the server row names both versions and the remedy. The same
 // cluster with no marker at all (every install before markers) stays RUNNING.

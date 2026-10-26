@@ -8,7 +8,7 @@ too, in a per-pod Virtualization.framework micro-VM, through an opt-in RuntimeCl
 (`runtimeClassName: vm`). The `vm` path runs `linux/arm64` images; `linux/amd64` images do not
 run on any path yet.
 
-The latest release is a pre-release, v0.1.7 (2026-10-05). The control plane on `main` embeds
+The latest release is a pre-release, v0.2.0 (2026-10-26). The control plane on `main` embeds
 Kubernetes v1.37.1. Multi-node clusters, two Macs joined over a wireguard mesh, and a control plane shared by
 two servers are experimental; both graduate in a later release. Models served on
 the Mac's GPU with MLX have their own resource and CRD (`mlx.k3sm.io/gpu` and `MLXModel`). The
@@ -51,7 +51,9 @@ Darwin provider that turns a Pod spec into a running process; `pkg/executor` bri
 supervises the embedded control plane; `pkg/bootstrap` and `pkg/certs` handle join tokens, node
 identity and the certificate hierarchy; `pkg/install` manages the launchd daemons; `pkg/mlx`
 renders an `MLXModel` into the objects that serve it; `pkg/addons` carries the metrics-server
-add-on, which a server installed with `--mesh-ip` applies once a node can run `vm` Pods; and
+add-on, which every server applies once its node has minted its kubelet serving certificate; `pkg/update` and `pkg/updatectl` back `k3sm update`, the release check and the server-driven roll of
+the cluster to a release, workers first and the server last; `pkg/interconnect` is the opt-in
+Thunderbolt cable network between Macs, beside the wireguard mesh; and
 `pkg/oci` is the one place in the repo that reads or writes OCI image bytes. k3sm imports
 `k3sm.io/runtimed` (the native runtime daemon) and `k3sm.io/darwin-net` (pod networking) to do
 the actual work of running and connecting pods.
@@ -91,8 +93,21 @@ An install needs more than the binary: the Seatbelt exec helper, two DYLD shims,
 helper and the control-plane payload sit beside it. `hack/release/stage.sh` builds the binary
 again and assembles that whole set, ad-hoc signed, into the folder you name. It needs the Command
 Line Tools, a signed-in GitHub CLI (`gh`), and the exact Go release the script pins
-(`PAYLOAD_GO_VERSION` in the script) first on your `PATH`, and the staged folder comes to about
+(`PAYLOAD_GO_VERSION` in `hack/release/lib/gochild.sh`, which the script sources) first on your `PATH`, and the staged folder comes to about
 700 MB.
+
+Before it signs anything, the staging script scans the bundled Go binaries for known
+vulnerabilities: every Go binary in the control-plane payload (the Kubernetes binaries, kine,
+etcd, etcdutl, zot and helm), with `govulncheck -mode=binary` at the version `hack/ci.sh` pins. It
+needs that govulncheck installed and the Go vulnerability database reachable. A finding whose
+trace reaches a vulnerable symbol in a binary stops the staging unless
+`hack/release/govulncheck.allow` names it by vulnerability id, child and the child's pinned
+version, with a reason and an expiry date. Allow entries expire, and an expired entry turns the
+repo gate (`hack/ci.sh`) red until it is re-reviewed. An expired entry stops the staging, and so
+does an entry that matches no finding, so an exemption ends when its finding or its pin goes away.
+A finding with no vulnerable symbol in the binary is printed and does not stop it. A missing or
+mismatched govulncheck, an unreachable or stale database or an incomplete scan output stops the
+staging with the failure named.
 
 Install runs once, as root, and sets up an unprivileged `_k3sm` user and daemon that everything
 else runs under. Day-to-day use after that needs no `sudo`:

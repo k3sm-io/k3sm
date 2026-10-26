@@ -44,7 +44,7 @@ func (s *infoServer) GetRuntimeInfo(context.Context, *runtimev1.GetRuntimeInfoRe
 	return s.info, nil
 }
 
-// TestRosettaCapabilitiesFromInfo is the B103 k3sm-side proof of the ONE-RPC →
+// TestRosettaCapabilitiesFromInfo is the k3sm-side proof of the ONE-RPC →
 // ONE-capability-value mapping the node labels from: nodeCapabilitiesFromInfo maps a
 // GetRuntimeInfo response to the three capability booleans, failing CLOSED on every
 // degenerate input, and Capabilities makes exactly one RPC and fails closed on error.
@@ -146,8 +146,8 @@ func TestRosettaCapabilitiesFromInfo(t *testing.T) {
 		}
 	})
 
-	// Version skew: an OLDER runtimed that predates B103 emits only the two B1
-	// conditions. The vm fact still lands (B1 does not regress); the Rosetta pair
+	// Version skew: an OLDER runtimed that predates the Rosetta conditions emits only
+	// the two vm conditions. The vm fact still lands (it does not regress); the Rosetta pair
 	// fails closed with no error anywhere, so the node simply carries no Rosetta label.
 	t.Run("rosetta_conditions_absent_older_runtimed", func(t *testing.T) {
 		t.Parallel()
@@ -202,10 +202,10 @@ func TestRosettaCapabilitiesFromInfo(t *testing.T) {
 		r, _ := newRuntimedFake(t)
 		got := r.Capabilities(context.Background())
 		assertCaps(t, got, NodeCapabilities{})
-		// B1's vm fact specifically: it is read off the SAME snapshot, so an RPC error
+		// The vm fact specifically: it is read off the SAME snapshot, so an RPC error
 		// leaves it false too (never a node falsely advertised as vm-schedulable).
 		if got.VMBackend {
-			t.Error("Capabilities().VMBackend must be false on an RPC error (B1 fail-closed)")
+			t.Error("Capabilities().VMBackend must be false on an RPC error (fail-closed)")
 		}
 	})
 
@@ -235,7 +235,7 @@ func TestRosettaCapabilitiesFromInfo(t *testing.T) {
 		}
 	})
 
-	// B1 must not regress through the CONSOLIDATED reader: the vm fact still tracks the
+	// The vm capability must not regress through the CONSOLIDATED reader: the vm fact still tracks the
 	// VMBackendAvailable condition across every status — and costs NO extra RPC. That
 	// second assertion is the regression guard on the incoherent-snapshot hazard: a
 	// single-fact accessor that issued its own GetRuntimeInfo (the deleted

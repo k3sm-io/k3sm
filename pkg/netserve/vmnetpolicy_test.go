@@ -59,7 +59,7 @@ func TestVMNetPolicyPrefixSelection(t *testing.T) {
 // TestVMNetPolicyTableConstruction proves the selection above reaches the table
 // netserve CONSTRUCTS, through darwin-net's exported verdict rather than through
 // a field read: on a vm-capable node an unattributable source INSIDE the node's
-// NAT segment is DENIED (the M11.3-d3a fail-closed branch — a guest's packets
+// NAT segment is DENIED (the fail-closed branch — a guest's packets
 // carry its DHCP lease, and nothing maps a lease back to a pod yet), while the
 // same source on a node with no vm backend is ALLOWED, exactly as before.
 //
@@ -112,7 +112,7 @@ func TestVMNetPolicyTableConstruction(t *testing.T) {
 	}
 }
 
-// TestTransportOverrideSinkReachesTheProxyTable pins the other half of the M11.3
+// TestTransportOverrideSinkReachesTheProxyTable pins the other half of the
 // wiring: the Server exposes the routing table's transport-override setter, and
 // it is the SAME table the proxy routes on — not a second one. darwin-net exposes
 // no reader for the override map, so the assertion available here is that the
@@ -135,7 +135,7 @@ func TestTransportOverrideSinkReachesTheProxyTable(t *testing.T) {
 	s.SetTransportOverrides(nil)
 }
 
-// TestDefaultVMNetSubnetScopesTheConstructedTable is the B237 wiring gate for the
+// TestDefaultVMNetSubnetScopesTheConstructedTable pins this contract for the
 // CONSTANT rather than for the selection: DefaultVMNetSubnet — the one home for
 // the vmnet segment both node bring-ups pass — must be a value that actually
 // scopes a constructed table, and must scope it only when the node advertises the
@@ -156,7 +156,7 @@ func TestDefaultVMNetSubnetScopesTheConstructedTable(t *testing.T) {
 	if segment != segment.Masked() {
 		t.Errorf("DefaultVMNetSubnet = %q, want a masked segment (a host address would still scope, but the constant should read as the segment it is)", DefaultVMNetSubnet)
 	}
-	// The address the reference rig observed a guest lease. It is the value this
+	// The address a reference machine observed as a guest lease. It is the value this
 	// constant exists to cover, so a prefix that excludes it is the wrong prefix.
 	observed := netip.MustParseAddr("192.168.64.7")
 	if !segment.Contains(observed) {

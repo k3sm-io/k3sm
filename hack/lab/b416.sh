@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k3sm B416 gate: multi-node ServiceLB with node pools.
+# k3sm gate: multi-node ServiceLB with node pools.
 #
 # TWO TIERS:
 #
@@ -16,7 +16,7 @@
 #   Without K3SM_LAB=1 the gate then reports LAB-PENDING and exits 3.
 #
 #   LAB (K3SM_LAB=1). Runs against the RUNNING two-node cluster in $KUBECONFIG and
-#   boots nothing. The rig driver has already installed the build under test
+#   boots nothing. The driver has already installed the build under test
 #   AGENT FIRST, SERVER LAST (the deploy contract's order), polled the join port
 #   before the agent rejoin, and re-copied the kubeconfig. Required:
 #     K3SM_B416_SERVER_NODE   the server's node name
@@ -88,7 +88,7 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 summary() {
 	echo "----------------------------------------"
-	echo "B416 ($1): $PASS passed, $FAIL failed"
+	echo "multi-node ServiceLB ($1): $PASS passed, $FAIL failed"
 }
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
@@ -103,7 +103,7 @@ if [ "${K3SM_LAB:-}" != 1 ]; then
 	: "${B416_NODE_NAME:=k3sm-b416}"
 	: "${B416_KUBELET_PORT:=10356}"
 	trap cluster_down EXIT
-	echo "==> k3sm B416 integration gate (single-node k3sm server; node $B416_NODE_NAME on :$B416_KUBELET_PORT)"
+	echo "==> k3sm integration gate (single-node k3sm server; node $B416_NODE_NAME on :$B416_KUBELET_PORT)"
 	server_up "$B416_NODE_NAME" hostprocess none "" "$B416_KUBELET_PORT"
 	# The leg mints the node identity from this cluster's signing CA.
 	export K3SM_WORK_DIR="$SERVER_WORKDIR"
@@ -115,8 +115,8 @@ if [ "${K3SM_LAB:-}" != 1 ]; then
 	fi
 	summary integration
 	[ "$FAIL" -eq 0 ] || exit 1
-	echo "B416 integration tier GREEN"
-	echo "LAB-PENDING: rig legs not run (set K3SM_LAB=1)"
+	echo "integration tier GREEN"
+	echo "LAB-PENDING: lab legs not run (set K3SM_LAB=1)"
 	exit 3
 fi
 
@@ -126,7 +126,7 @@ for v in KUBECONFIG K3SM_B416_SERVER_NODE K3SM_B416_WORKER_NODE K3SM_B416_SERVER
 	[ -n "${!v:-}" ] || missing="$missing $v"
 done
 if [ -n "$missing" ]; then
-	echo "B416 lab tier: required variable(s) unset:$missing (see the header of $0)" >&2
+	echo "lab tier: required variable(s) unset:$missing (see the header of $0)" >&2
 	exit 2
 fi
 KUBECTL="${KUBECTL:-kubectl}"
@@ -136,19 +136,19 @@ EVIDENCE="${K3SM_B416_EVIDENCE:-$(mktemp -d -t b416-evidence)}"
 mkdir -p "$EVIDENCE"
 NS=default
 kc() { "$KUBECTL" "$@"; }
-# Remote commands need a login shell on the rig Macs.
+# Remote commands need a login shell on the lab Macs.
 on() { local host="$1"; shift; ssh -o BatchMode=yes "$host" "zsh -lc $(printf '%q' "$*")"; }
 
 kc get --raw /healthz >/dev/null || { echo "the cluster at \$KUBECONFIG is not serving" >&2; exit 2; }
 for n in "$SERVER" "$WORKER"; do
 	ready="$(kc get node "$n" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
-	[ "$ready" = True ] || { echo "B416 lab tier: node $n is not Ready (got '${ready:-absent}')" >&2; exit 2; }
+	[ "$ready" = True ] || { echo "lab tier: node $n is not Ready (got '${ready:-absent}')" >&2; exit 2; }
 done
 mesh_ip() { kc get meshpeers.net.k3sm.io "$1" -o jsonpath='{.spec.meshIP}'; }
 SERVER_IP="$(mesh_ip "$SERVER")"
 WORKER_IP="$(mesh_ip "$WORKER")"
-[ -n "$SERVER_IP" ] && [ -n "$WORKER_IP" ] || { echo "B416 lab tier: a MeshPeer mesh address is missing (server '$SERVER_IP', worker '$WORKER_IP')" >&2; exit 2; }
-echo "==> k3sm B416 lab tier (server $SERVER @ $SERVER_IP, worker $WORKER @ $WORKER_IP; evidence $EVIDENCE)"
+[ -n "$SERVER_IP" ] && [ -n "$WORKER_IP" ] || { echo "lab tier: a MeshPeer mesh address is missing (server '$SERVER_IP', worker '$WORKER_IP')" >&2; exit 2; }
+echo "==> k3sm lab tier (server $SERVER @ $SERVER_IP, worker $WORKER @ $WORKER_IP; evidence $EVIDENCE)"
 lab_tolerations_header
 
 PORT_HOLDER_PID=""
@@ -294,4 +294,4 @@ fi
 
 summary lab
 [ "$FAIL" -eq 0 ] || exit 1
-echo "B416 lab tier GREEN"
+echo "lab tier GREEN"

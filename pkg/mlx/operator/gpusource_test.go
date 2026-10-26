@@ -59,12 +59,12 @@ func warnLog() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})), buf
 }
 
-// TestServerPathFitCheckUsesLiveGPUFacts is the B195 gate: the server path's fit
+// TestServerPathFitCheckUsesLiveGPUFacts pins this contract: the server path's fit
 // check runs against the node's LIVE GPU facts, read from the same
 // GetRuntimeInfo the node path's capability probe calls.
 //
 // Before this wiring the server built the operator with a nil GPUSource, so
-// ValidateFit was skipped in production — the whole M8.5 refusal path existed,
+// ValidateFit was skipped in production — the whole refusal path existed,
 // was mutant-tested, and could not fire on the only path that ships it. The
 // first subtest is therefore the one that matters: an unfittable spec reaching a
 // LIVE source must be refused before anything is applied. The remaining subtests

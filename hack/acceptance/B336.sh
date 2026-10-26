@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B336 acceptance gate — the runnable proof that docs/user/multi-node.md
+# k3sm node-ip docs acceptance gate — the runnable proof that docs/user/multi-node.md
 # tells a worker's `--node-ip` for what it actually is.
 #
 # The defect: the doc told the reader to pass `--node-ip <this-macs-underlay-ip>`
@@ -30,7 +30,7 @@ INSTALL_GO="$K3SM_ROOT/cmd/k3sm/install.go"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B336 acceptance (docs/user/multi-node.md: --node-ip is the worker's mesh address)"
+echo "==> k3sm node-ip docs acceptance (docs/user/multi-node.md: --node-ip is the worker's mesh address)"
 
 # ---- b336.0 — the gate parses and its sources exist -------------------------
 b0=ok
@@ -40,8 +40,8 @@ b0=ok
 ladder "$b0" "b336.0  gate parses (bash -n) + docs/user/multi-node.md and cmd/k3sm/install.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B336: the gate or its sources are missing/unparseable — nothing else can run" >&2
-	echo "B336: $PASS passed, $FAIL failed" >&2
+	echo "node-ip docs: the gate or its sources are missing/unparseable — nothing else can run" >&2
+	echo "node-ip docs: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -78,6 +78,6 @@ grep -qE 'fs\.StringVar\(&o\.nodeIP, "node-ip".*mesh' "$INSTALL_GO" || i=no
 ladder "$i" "b336.3  cmd/k3sm/install.go's --node-ip flag registration string says 'mesh'"
 
 echo "----------------------------------------"
-echo "B336: $PASS passed, $FAIL failed"
+echo "node-ip docs: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B336 GREEN ================"
+echo "================ node-ip docs GREEN ================"

@@ -44,7 +44,7 @@ const (
 	exchangeIssued = "issued-9876543210-scoped"
 )
 
-// TestTokenExchange is the B653 gate. ghcr, Docker Hub and most hosted
+// TestTokenExchange is the gate for this behaviour. ghcr, Docker Hub and most hosted
 // registries refuse a credential presented directly as a bearer: they answer
 // 401 with a `WWW-Authenticate: Bearer realm=…,service=…,scope=…` challenge, and
 // the client must trade the credential at the realm for a token scoped to the

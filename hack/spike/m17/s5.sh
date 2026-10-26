@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M17.0 / S5 — two mlx-lm ranks over the ring backend, between pods on the two Macs.
+# S5 — two mlx-lm ranks over the ring backend, between pods on the two Macs.
 #
 #   (1) Two native pods (one per Mac) from the mlx-serve image, each holding one GPU
 #       slot; the ranks are started by `kubectl exec` with a hostfile of the two POD
@@ -10,7 +10,7 @@
 #       generated; rank 0's tokens/s is recorded per path: ring over the direct
 #       /25s, ring over wireguard-over-cable (K3SM_M17_WG_CABLE_ROUTE=1), ring over
 #       Wi-Fi (the mesh on the LAN), and the same model on one Mac, each Mac — so a
-#       negative result is published as such (R15: figures before claims).
+#       negative result is published as such (figures before claims).
 # The laptop has 8 GiB, so the model is the smallest the M16 spike pins, and each
 # rank asks for K3SM_M17_RANK_MEMORY (default 3Gi).
 set -uo pipefail
@@ -31,15 +31,15 @@ the provider toleration, one mlx.k3sm.io/gpu in requests and limits) from $MLX_I
 carries rank.py. Per path the driver configures the cable (the S2 configuration, restore trap held), then execs
 rank.py in both pods at once with the pod-IP hostfile; the model is $MODEL_REPO at $MODEL_REV, fixed prompt,
 max_tokens 128, K3SM_M17_S5_RUNS (default 3) generations per path."
-HALT="s5.1/s5.2 fail with the 8 GiB worker's rank out of memory -> R8: the rung moves the model to the workstation.
+HALT="s5.1/s5.2 fail with the 8 GiB worker's rank out of memory -> the rung moves the model to the workstation.
 s5.1/s5.2 fail otherwise (the ranks cannot bind or dial pod IPs) -> no substitution is pre-decided: the sharded
-  path of the M17 plan §5 does not hold under the pod network, and the spike stops for a re-plan."
+  path of the sharded-ring design does not hold under the pod network, and the spike stops for a re-plan."
 
 spike_args "$RUNG" "$QUESTION" "$CRITERIA" "$METHOD" "$HALT" "$@"
 spike_begin "$RUNG"
 
 S5_RUNS="${K3SM_M17_S5_RUNS:-3}"
-R8_S5="halt (R8): the rung moves the model to the workstation"
+R8_S5="halt: the rung moves the model to the workstation"
 
 spike_cleanup() {
 	kc delete namespace "$NS" --ignore-not-found --wait=false </dev/null >/dev/null 2>&1 || true

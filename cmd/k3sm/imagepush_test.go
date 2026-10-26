@@ -42,7 +42,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-// TestImagePushOCILayout is the B189 gate: `k3sm image push <layout-dir> <ref>`
+// TestImagePushOCILayout is the gate for this behaviour: `k3sm image push <layout-dir> <ref>`
 // uploads the one image a layout holds, prints the digest a caller pins with,
 // takes its credential from the environment and never from argv, and tells the
 // four failure modes apart.
@@ -316,16 +316,17 @@ func appendFixture(t *testing.T, layoutDir, tag, payload string) {
 	if err := os.WriteFile(dockerfile, []byte("FROM scratch\nCOPY app /app\nENTRYPOINT [\"/app\"]"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// noStore: this fixture wants the ARTIFACT only. A build normally also
-	// records the image in the node's store, which needs a running daemon this
-	// test has no business requiring.
+	// --no-record: this fixture wants the ARTIFACT only. A build normally also
+	// records the image in the cluster registry, which this test has no
+	// business requiring.
 	if err := buildWith(t.Context(), buildOptions{
 		dockerfile: dockerfile,
 		tag:        tag,
 		output:     layoutDir,
+		noRecord:   true,
 		format:     "oci",
 		contextDir: ctxDir,
-	}, io.Discard, engineBuildWith(recordInStore), noStore, noPush); err != nil {
+	}, io.Discard, engineBuildWith(noStore), noStore, noPush); err != nil {
 		t.Fatalf("build fixture: %v", err)
 	}
 }
@@ -472,4 +473,58 @@ func deadAddr(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return addr
+}
+
+// TestImagePushBareTagNamesClusterRegistry pins how `k3sm image push` reads its
+// target, the same way `k3sm build --push` reads a tag: a bare name is the
+// cluster registry's and goes through the push gate with the builder token,
+// while a reference that names Docker Hub still goes to Docker Hub.
+func TestImagePushBareTagNamesClusterRegistry(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("HOME", empty)
+	t.Setenv("DOCKER_CONFIG", empty)
+	t.Setenv(registryTokenEnv, "")
+
+	t.Run("a bare tag goes to the cluster registry", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("pins the ordinary account on the server, whose own work dir holds no registry record")
+		}
+		g := startGateRegistry(t)
+		clusterAPIFor(t, g)
+		asInstalledServer(t, g.port)
+		layout := fixtureLayout(t, "app:v1", "bare")
+		out, err := runPush(t, layout, "myapp:v3")
+		if err != nil {
+			t.Fatalf("image push myapp:v3: %v", err)
+		}
+		if !strings.Contains(out, "pushed registry-k3sm:6450/myapp:v3") {
+			t.Errorf("push output = %q, want it pushed as registry-k3sm:6450/myapp:v3", out)
+		}
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("builder:"+fakeBuilderTokenToken))
+		if !containsHeader(g.probe.headers(), want) {
+			t.Errorf("the gate never saw the builder token; headers = %q", g.probe.headers())
+		}
+	})
+
+	t.Run("an explicit docker.io reference goes to Docker Hub", func(t *testing.T) {
+		asServer(t, 6451)
+		resolveClusterRegistry = func(context.Context, string) (gateEndpoint, error) {
+			t.Error("a docker.io reference resolved the cluster registry")
+			return gateEndpoint{}, errors.New("unexpected")
+		}
+		t.Cleanup(func() { resolveClusterRegistry = resolveClusterRegistryLive })
+		for _, in := range []string{"docker.io/team/myapp:v3", "docker.io/myapp:v3", "index.docker.io/team/myapp:v3"} {
+			ref, err := pushReference(in)
+			if err != nil {
+				t.Fatalf("pushReference(%q): %v", in, err)
+			}
+			target, _, dest, err := imagePushTarget(t.Context(), ref, os.Getenv("K3SM_WORK_DIR"))
+			if err != nil {
+				t.Fatalf("imagePushTarget(%q): %v", in, err)
+			}
+			if got := target.Context().RegistryStr(); got != name.DefaultRegistry || dest.cluster != nil {
+				t.Errorf("%s: target %s (registry %q, cluster %v), want Docker Hub with no push gate", in, target, got, dest.cluster != nil)
+			}
+		}
+	})
 }

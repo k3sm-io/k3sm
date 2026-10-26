@@ -99,18 +99,18 @@ func TestAdvertisement(t *testing.T) {
 				t.Errorf("data[%s] = %q, want %q", AdvertisementMeshHostKey, cm.Data[AdvertisementMeshHostKey], tc.wantHost)
 			}
 			// The peer's transport decision comes from the advertiser, and the
-			// ingest registry serves plain HTTP: a peer that inferred https from
-			// the address family would fail the TLS handshake on every pull.
-			if cm.Data[AdvertisementPlainHTTPKey] != "true" {
-				t.Errorf("data[%s] = %q, want \"true\"", AdvertisementPlainHTTPKey, cm.Data[AdvertisementPlainHTTPKey])
+			// relay a peer dials serves HTTPS only: a peer told plain HTTP would
+			// be answered 400 on every pull.
+			if cm.Data[AdvertisementPlainHTTPKey] != "false" {
+				t.Errorf("data[%s] = %q, want \"false\"", AdvertisementPlainHTTPKey, cm.Data[AdvertisementPlainHTTPKey])
 			}
 			// Round-trip: what one node writes is exactly what a peer decodes.
 			p, perr := ParseAdvertisement(cm)
 			if perr != nil {
 				t.Fatalf("ParseAdvertisement of our own document: %v", perr)
 			}
-			if p.Node != tc.node || p.MeshHost != tc.wantHost || !p.PlainHTTP {
-				t.Errorf("round trip = %+v, want node %q host %q plainHTTP true", p, tc.node, tc.wantHost)
+			if p.Node != tc.node || p.MeshHost != tc.wantHost || p.PlainHTTP {
+				t.Errorf("round trip = %+v, want node %q host %q plainHTTP false", p, tc.node, tc.wantHost)
 			}
 		})
 	}

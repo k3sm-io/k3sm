@@ -171,10 +171,15 @@ type Report struct {
 	Workers *[]Worker `json:"workers,omitempty"`
 	// JoinTarget is, on an agent, the bootstrap endpoint (host:port) of the
 	// server this Mac was installed to join. Empty when it cannot be read.
-	JoinTarget string       `json:"joinTarget,omitempty"`
-	Version    version.Info `json:"version"`
-	Host       string       `json:"host"`
-	Timestamp  time.Time    `json:"timestamp"`
+	JoinTarget string `json:"joinTarget,omitempty"`
+	// ImageMigration is the image migration row (ImageMigrationRow), for the
+	// text screen only. It is deliberately not in Rows and not in the JSON
+	// encoding: the -o json contract is unchanged, and the verdict and the
+	// Next block never turn on a copy that loses nothing while it is pending.
+	ImageMigration *Row         `json:"-"`
+	Version        version.Info `json:"version"`
+	Host           string       `json:"host"`
+	Timestamp      time.Time    `json:"timestamp"`
 }
 
 // CapabilityWatchJSON is the capability word for the NDJSON stream: on a

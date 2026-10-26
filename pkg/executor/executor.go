@@ -52,7 +52,7 @@ type Executor interface {
 
 // ErrEmbeddedNotImplemented is returned by the Embedded strategy: from-source
 // in-process embedding of the control plane is deferred to a future milestone
-// (Wave-0 confirmed the k3s-io/kubernetes monorepo import is infeasible today).
+// (a feasibility test showed the k3s-io/kubernetes monorepo import is infeasible today).
 var ErrEmbeddedNotImplemented = errors.New("executor: from-source in-process embedding is not implemented yet (deferred milestone); use the Supervised strategy")
 
 // Config configures an Executor. Zero values get sensible defaults in New*.
@@ -319,12 +319,11 @@ const (
 	// DefaultControllerManagerPort is the kube-controller-manager secure-serving
 	// port (the upstream default), bound on loopback only.
 	DefaultControllerManagerPort = 10257
-	// DefaultRegistryPort is the loopback port `k3sm server --registry-port`
-	// serves the node-local OCI ingest registry on (pkg/registrysvc).
-	//
-	// It is DISABLED by default — the flag's own default is 0 — so this constant
-	// is the port an operator gets when they ask for the registry without naming
-	// one, not a port k3sm binds unasked.
+	// DefaultRegistryPort is the loopback port `k3sm server` serves its OCI
+	// image registry on (pkg/registrysvc) unless --registry-port names another;
+	// --registry-port 0 opts out. The registry is the cluster's one image store,
+	// so it runs by default, and its relay serves the same port over HTTPS on
+	// the server's mesh and vm-gateway addresses.
 	//
 	// 6450 was picked by elimination rather than convention. The obvious choices
 	// are taken: 5000 and 7000 are macOS AirPlay Receiver (a bind there succeeds

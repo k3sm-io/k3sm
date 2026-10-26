@@ -87,7 +87,7 @@ func TestForeignUserExprEvaluates(t *testing.T) {
 		wantAdmit bool
 	}{
 		// ---- REJECT: pod-level securityContext ----------------------------------
-		// fsGroup 2000 is the exact shape e2e TestM2_FsGroup submits (B153).
+		// fsGroup 2000 is the exact shape e2e TestM2_FsGroup submits.
 		{"pod fsGroup foreign is REJECTED", foreignUserPod(sc(map[string]any{"fsGroup": foreign}), []map[string]any{nil}, nil, nil), false},
 		{"pod runAsUser foreign is REJECTED", foreignUserPod(sc(map[string]any{"runAsUser": foreign}), []map[string]any{nil}, nil, nil), false},
 		{"pod runAsGroup foreign is REJECTED", foreignUserPod(sc(map[string]any{"runAsGroup": foreign}), []map[string]any{nil}, nil, nil), false},
@@ -143,7 +143,7 @@ func TestForeignUserExprEvaluates(t *testing.T) {
 // expression is built for a different id. Without this, the evaluation table above
 // would pass against an expression that hard-wired 271.
 //
-// It is the CEL-side half of the B153 sub-decision that the allowed uid comes from
+// It is the CEL-side half of the rule that the allowed uid comes from
 // the pod-execution posture; the other half (which uid that is) is pinned in
 // pkg/provider's TestPodExecutionUID, and the wiring between them in
 // cmd/k3sm's TestBringupForeignUserPolicyPinsThePodExecutionUID.

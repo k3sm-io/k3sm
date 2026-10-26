@@ -85,10 +85,10 @@ func overBudget(counts map[string]int, max int) ([]string, error) {
 
 // ratchetAdvice is appended to every gate failure: the cap is a deliberate
 // ratchet, and the fix for a red is a smaller function, never a larger number.
-const ratchetAdvice = "this cap is a deliberate ratchet (B242's thin-main standard): extract a named helper " +
+const ratchetAdvice = "this cap is a deliberate ratchet (the thin-main standard): extract a named helper " +
 	"into serverprovision.go or serverphases.go, keeping every defer in runServer; do NOT raise maxServerFuncLines"
 
-// TestRunServerUnder150Lines is the B242 gate: runServer is an orchestrator of
+// TestRunServerUnder150Lines is the gate for this behaviour: runServer is an orchestrator of
 // at most maxServerFuncLines physical lines, and no function in any non-test
 // server*.go file exceeds the same budget.
 func TestRunServerUnder150Lines(t *testing.T) {

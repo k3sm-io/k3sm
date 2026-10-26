@@ -1,4 +1,4 @@
-/fixture/etcdutl: go1.27.2
+/fixture/etcdutl: go1.27.3
 	path	go.etcd.io/etcd/etcdutl/v3
 	mod	go.etcd.io/etcd/etcdutl/v3	v3.6.15	h1:ADNOV2EjHgbsmWyQvIvoOxYEph1nNGJrFSvbriC3kjU=
 	dep	go.etcd.io/etcd/server/v3	v3.6.15	h1:IFlqNq0ia29PAcT73gfZjaYO/R+QCOavhenkAP4Y1N0=

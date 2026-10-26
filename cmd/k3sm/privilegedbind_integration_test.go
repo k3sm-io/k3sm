@@ -32,7 +32,7 @@ import (
 // live listener there is anomalous rather than routine.
 const canaryPort = 1023
 
-// TestWildcardPrivilegedBindPremise is the PREMISE CANARY for B116.
+// TestWildcardPrivilegedBindPremise is the PREMISE CANARY for the wildcard-bind design.
 //
 // The entire design — LoadBalancer and ingress listeners binding 0.0.0.0 with the
 // root netd helper off the datapath, no privileged binder anywhere — rests on ONE

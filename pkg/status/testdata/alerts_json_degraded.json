@@ -10,7 +10,7 @@
       "state": "expired",
       "severity": "warn",
       "detail": "pid 1292 · the node credential expired on 2026-09-04, so this worker can no longer authenticate",
-      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
+      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
       "wide": {
         "credential": "expired",
         "credential-dir": "/var/lib/k3sm/agent",
@@ -44,7 +44,7 @@
             "confirm": true
           },
           {
-            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
             "needsAdmin": true,
             "confirm": false
           },
@@ -64,7 +64,7 @@
       "state": "unknown",
       "severity": "unknown",
       "detail": "the node credential has expired, so this worker can no longer reach its apiserver: no k3sm context in ~/.kube/config",
-      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
+      "remedy": "k3sm token create   # on the control-plane Mac\nsudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e   # on this Mac\nk3sm status logs agent",
       "alert": {
         "cause": "The worker's node credential has expired, so it can no longer reach its control plane.",
         "evidence": [
@@ -78,7 +78,7 @@
             "confirm": true
           },
           {
-            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --role agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
+            "step": "Install this Mac as a worker with that token (on this Mac), filling in the names: sudo k3sm install --agent --server \u003ccontrol-plane\u003e --token-file \u003cfile\u003e",
             "needsAdmin": true,
             "confirm": false
           },

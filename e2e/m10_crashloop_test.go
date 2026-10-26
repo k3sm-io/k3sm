@@ -65,7 +65,7 @@ type crashSample struct {
 
 var backoffMsg = regexp.MustCompile(`^back-off (\S+) restarting failed container=(\S+) pod=(\S+)$`)
 
-// TestM10_CrashLoopBackOff is the M10.2/B26 live-restart criterion: the provider is
+// TestM10_CrashLoopBackOff is the live-restart criterion: the provider is
 // the SINGLE exit-driven restart authority on the runtimed path (runtimed performs no
 // exit-driven restarts), re-execing a crashed container in place under the effective
 // restart policy with the upstream CrashLoopBackOff schedule. The unit-level contract

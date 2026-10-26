@@ -28,7 +28,7 @@ import (
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
-// TestShimInactiveConditionBecomesAnEvent pins the node half of B243's
+// TestShimInactiveConditionBecomesAnEvent pins the node half of lost-shim
 // detection: runtimed publishes k3sm.io/shim-inactive on PodStatus.conditions
 // and has no API client, so the provider must (1) forward the condition onto
 // the published pod status, and (2) record exactly ONE Warning ShimInactive

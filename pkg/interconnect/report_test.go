@@ -115,7 +115,7 @@ func decode(t *testing.T, v string) netv1alpha1.InterconnectReport {
 	return r
 }
 
-// TestReportWrittenOnChange is the B524 reporter gate: the report goes on the
+// TestReportWrittenOnChange pins this contract: the report goes on the
 // node's own Node only when its stable content changes (no RTT, no times), at
 // most once per InterconnectReportMinInterval, and a change held by the rate
 // limit is written when the window ends, never dropped.

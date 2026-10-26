@@ -19,9 +19,11 @@ package status
 import (
 	"errors"
 	"io/fs"
+	"strconv"
 	"strings"
 
 	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 )
 
@@ -137,10 +139,15 @@ func argSetting(args []string, key string) string {
 		}
 		return "every interface"
 	case SettingRegistryPort:
-		if v, ok := argValue(args, "registry-port"); ok && v != "" && v != "0" {
-			return v
+		// The registry runs by default; only an explicit 0 turns it off.
+		v, ok := argValue(args, "registry-port")
+		switch {
+		case !ok || v == "":
+			return strconv.Itoa(executor.DefaultRegistryPort)
+		case v == "0":
+			return "off"
 		}
-		return "off"
+		return v
 	case SettingTLSSANs:
 		if sans := install.ServerArgValues(args, install.TLSSANFlag); len(sans) > 0 {
 			return strings.Join(sans, ",")

@@ -30,11 +30,11 @@ import (
 // first pass, so a wait given it reaches its deadline branch with no prior poll
 // and no wall-clock wait. The tests below use it to state "the deadline has
 // expired" as a fact rather than as something they wait for — which is what
-// makes them independent of how loaded the machine is (B172, B206).
+// makes them independent of how loaded the machine is.
 const expiredDeadline = time.Nanosecond
 
-// TestAwaitHealthyFailFast table-tests the pure bring-up select loop (M10.0
-// SRE fail-fast): child-exit beats the timeout (killing the opaque 90s wedge),
+// TestAwaitHealthyFailFast table-tests the pure bring-up select loop (SRE
+// fail-fast): child-exit beats the timeout (killing the opaque 90s wedge),
 // readiness returns nil, the timeout still fires when nothing happens, and ctx
 // cancellation propagates. Pure channels + funcs — no real control-plane
 // binaries are spawned.
@@ -118,7 +118,7 @@ func TestAwaitHealthyFailFast(t *testing.T) {
 //
 // The exit is OBSERVED (<-c.exited) before the wait is entered, and the wait is
 // then given an already-expired deadline — so no wall-clock window decides the
-// shape of the error this test asserts on (B206). It previously handed the wait
+// shape of the error this test asserts on. It previously handed the wait
 // a 10s health window and relied on the child dying inside it; on a machine
 // loaded enough to delay the child's exit past that window the wait legitimately
 // authored "failer not healthy within 10s" and the classification assertions
@@ -165,7 +165,7 @@ func TestSpawnChildExitSurfacesLog(t *testing.T) {
 }
 
 // TestSpawnChildExitTieBreaksAnExpiredDeadline is the REAL-CHILD half of the
-// B172 tie-break that TestSpawnChildExitSurfacesLog no longer covers now that it
+// tie-break that TestSpawnChildExitSurfacesLog no longer covers now that it
 // synchronises on the exit before waiting: a genuine child process, the genuine
 // kernel probe (processExited, not a stub), and a deadline that has already
 // expired must still yield the exit-shaped error rather than the opaque "not
@@ -233,7 +233,7 @@ func TestSpawnChildExitTieBreaksAnExpiredDeadline(t *testing.T) {
 }
 
 // TestAwaitHealthyExitBeatsExpiredDeadline constructs the interleaving that a
-// real child process cannot be made to reproduce on demand (B172): the health
+// real child process cannot be made to reproduce on demand: the health
 // deadline has ALREADY expired while the child has ALREADY exited and the reaper
 // goroutine that closes exited has not been scheduled yet. The exit-shaped error
 // must win regardless — the deadline may only author its "not healthy within"

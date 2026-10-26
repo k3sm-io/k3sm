@@ -1,9 +1,8 @@
 # k3sm System Integration Test (SIT)
 
-> **Internal dev-docs only.** This framing (envtest-plus, the SAFE/UNSAFE fidelity
-> table, the `k3sm dev` disposable-cluster loop) is deliberately kept out of
-> `k3sm.io` while the public site is stealthed. Do not lift this copy into the
-> site or any public README.
+> Developer documentation for the system integration test. The fidelity table
+> below describes what the test can and cannot reproduce; it is not a
+> conformance claim.
 
 ## What this is (and what it is NOT)
 
@@ -14,7 +13,7 @@ surface as two privilege tiers — plus a third, short **flagged-boot** leg — 
 reports what it proved.
 
 It is **more than envtest** — it boots a **REAL upstream control plane**
-(`kube-apiserver` v1.36.2 + `kube-controller-manager` + `kube-scheduler`, which
+(the pinned upstream `kube-apiserver` + `kube-controller-manager` + `kube-scheduler`, which
 envtest does not run) + a **real single node** (native-process pods under
 Seatbelt via `runtimed`).
 
@@ -24,8 +23,11 @@ The table below is the load-bearing part — read it before trusting a green.
 
 | Axis | SAFE — faithful, develop freely | NEEDS `--datapath` (root) | UNFAITHFUL — won't reproduce on real k8s |
 |---|---|---|---|
-| What | the declarative API: CRD schemas, SSA, CEL, admission registration, RBAC/Node authz, scheduling, GC/finalizers/ownerReferences, conditions-driven reconcile **up to Ready**; macOS-native workloads | anything that routes: Service/ClusterIP reachability, cluster DNS, Service-backed admission webhooks, the operator's terminal **Ready/Endpoint** | no SRV/PTR/headless DNS (A-only resolver), NetworkPolicy is a hint not isolation, no cgroup CPU limits / HPA-on-cpu, no EventRecorder (`kubectl describe` is blank), no `metrics.k8s.io`, native-process pods (Linux images need the `vm` RuntimeClass) |
+| What | the declarative API: CRD schemas, SSA, CEL, admission registration, RBAC/Node authz, scheduling, GC/finalizers/ownerReferences, conditions-driven reconcile **up to Ready**; macOS-native workloads | anything that routes: Service/ClusterIP reachability, cluster DNS, Service-backed admission webhooks, the operator's terminal **Ready/Endpoint** | NetworkPolicy is a hint not isolation, no cgroup CPU limits / HPA-on-cpu, native-process pods (Linux images need the `vm` RuntimeClass) |
 | Tier | T0 rootless (`k3sm dev up`) | T1 root (`sudo k3sm dev up --datapath`) | documented ceiling — neither tier |
+
+`metrics.k8s.io` is served by the metrics-server add-on, which every server applies, so
+`kubectl top` works in the SIT cluster.
 
 The **blessed audience** for the SAFE surface: reconcile-only CRD operators
 (CRD-ensure / render / CEL / conditions **up to Ready**) and macOS-native
@@ -37,7 +39,7 @@ webhook works rootless).
 
 This is a **capability register, not a restatement**: it cites, and does not
 duplicate, the repo's `docs/conformance-profile.md` (the honest self-assessment)
-and the internal full-surface conformance register (the canonical "why k3sm cannot
+and the conformance register (the canonical "why k3sm cannot
 pass `[Conformance]`" summary). This is **not** a CNCF `[Conformance]`/Sonobuoy
 pass.
 
@@ -92,7 +94,7 @@ Two root reasons appear in `criteria.env`:
 - **uid-drop** — `setuid-uid-drop`: setuid to a foreign uid, root-only **even
   with the netd helper installed**. Seatbelt self-confinement needs **neither**,
   so `DenyUsers`/profile-integrity is a **rootless** (T0) criterion. **No
-  criterion carries this reason today**: since B153 the `k3sm-reject-foreign-user`
+  criterion carries this reason today**: since the admission fix the `k3sm-reject-foreign-user`
   ValidatingAdmissionPolicy is provisioned in every posture, so a pod asking for a
   foreign uid/gid is refused at the API and never reaches a `setuid`.
 
@@ -101,7 +103,7 @@ SIT runs them under `direct`, which gives the same **datapath** pod-view (real p
 IPs, real ClusterIP) — T1 is the full-posture run.
 
 The two topologies were **not** the same for **admission**, and that gap is what
-hid B153: the `k3sm-reject-foreign-user` policy was provisioned only under the
+hid that fix: the `k3sm-reject-foreign-user` policy was provisioned only under the
 helper backend, so `none` (T0) and `direct` (T1) ran with the object absent and
 `M2_FsGroup` was red on real hardware for a reason no criterion field expressed.
 It is now provisioned in every posture, which is why that criterion is `rootless`
@@ -140,10 +142,13 @@ silently passed:
   `sudo` (T1 did not run).
 - **multi-node-deferred** — a criterion a single node cannot prove
   (`M3_InPodKubectlAndDNSOnWorker`, the `M6_*` HA set) — needs a second Mac.
-- **feature-unbuilt-deferred** — the permanent `t.Skip` TODO stubs
-  (`M10_PerPodIP`, `M10_Ingress`, and the other unbuilt M10 features). These are
-  **excluded from every required-set** — a required permanent-skip would red T1
-  forever.
+- **feature-unbuilt-deferred** — criteria classified `tier=unbuilt` in
+  `criteria.env` (today the six M10 criteria `M10_PerPodIP`, `M10_Ingress`,
+  `M10_NativeSidecar`, `M10_CrashLoopBackOff`, `M10_JobCompletion` and
+  `M10_ProviderEvents`, plus `M10_ImagePullSecret`). Their tests exist and are real
+  (`e2e/m10_*_test.go`); the SIT keeps them out of every required set until each is
+  re-tiered by what it needs (rootless or root), so they are reported as deferred
+  rather than proven.
 - **unaccounted** — the residue: criteria in the manifest that no bucket claimed.
   It must be **empty**, and a non-empty one is RED. This is what makes the
   partition *total* rather than merely plausible: a criterion classified to a
@@ -166,7 +171,7 @@ proof.
 ## Scope
 
 - **Single node only.** Cross-node mesh/DNS/HA criteria are `multi-node-deferred`
-  (they run on a two-Mac rig, `hack/lab/`, not here).
+  (they run on a two-Mac lab, `hack/lab/`, not here).
 - **A diagnostic, not a milestone gate.** The SIT has **no `phases.json` row**
   (a `manual:false` euid-gated row is unmodeled by the `(manual, skeleton)`
   honesty schema and would let an orchestrator read exit-0-on-T0 as "datapath

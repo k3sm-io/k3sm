@@ -242,6 +242,18 @@ func TestImageVerbArgGrammar(t *testing.T) {
 		{name: "prune refuses --platform", args: []string{"prune", "--platform", "darwin/arm64"}, wantErr: "prune does not take --platform"},
 		{name: "ls refuses --policy", args: []string{"ls", "--policy", "always"}, wantErr: "ls does not take --policy"},
 		{name: "inspect refuses --digest", args: []string{"inspect", "a:1", "--digest", digest}, wantErr: "inspect does not take --digest"},
+		// A registry tag names the whole index, so there is no platform to untag.
+		{name: "untag refuses --platform", args: []string{"untag", "a:1", "--platform", "darwin/arm64"}, wantErr: "untag does not take --platform"},
+		{name: "ls refuses --force", args: []string{"ls", "--force"}, wantErr: "ls does not take --force"},
+		{
+			name: "tag takes --force",
+			args: []string{"tag", "a:1", "a:2", "--force"},
+			check: func(t *testing.T, o imageOptions) {
+				if !o.force {
+					t.Errorf("force = false")
+				}
+			},
+		},
 		{name: "load refuses -o", args: []string{"load", "a.tar", "-o", "x"}, wantErr: "load does not take -o"},
 		{name: "a bad platform fails before anything is dialled", args: []string{"pull", "a:1", "--platform", "darwin"}, wantErr: "os/arch"},
 		{

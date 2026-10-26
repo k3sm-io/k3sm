@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B391 acceptance gate — the buildx re-pin procedure checks the darwin
+# k3sm buildx pin acceptance gate — the buildx re-pin procedure checks the darwin
 # signer MECHANICALLY, not as reviewer prose.
 #
 # hack/verify-buildx-signer.sh downloads the pinned darwin buildx asset, asserts
@@ -37,7 +37,7 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 GOENV=(env GOARCH=arm64 CGO_ENABLED=1)
 
-echo "==> k3sm B391 acceptance (re-pin-time buildx signer check)"
+echo "==> k3sm buildx pin acceptance (re-pin-time buildx signer check)"
 
 # ---- b391.0 — the gate parses and its pieces exist --------------------------
 b0=ok
@@ -48,7 +48,7 @@ bash -n "$SELF" || b0=no
 command -v codesign >/dev/null 2>&1 || b0=no
 ladder "$b0" "b391.0  gate + wrapper parse; checker package and codesign present"
 if [ "$b0" != ok ]; then
-	echo "B391: $PASS passed, $FAIL failed" >&2
+	echo "buildx pin: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -109,6 +109,6 @@ fi
 ladder "$b3" "b391.3  ad-hoc-signed fixture Mach-O rejected with exit 5 (ad-hoc)"
 
 echo "----------------------------------------"
-echo "B391: $PASS passed, $FAIL failed"
+echo "buildx pin: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B391 GREEN ================"
+echo "================ buildx pin GREEN ================"

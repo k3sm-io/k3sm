@@ -225,7 +225,7 @@ func TestInstallFailsWhenTheServerIsParked(t *testing.T) {
 	}
 }
 
-// TestBringUpWindowStartsAtTheDaemonBootstrap is the install half of B577. An
+// TestBringUpWindowStartsAtTheDaemonBootstrap is the install half. An
 // in-place install booted out a server whose apiserver was still in bring-up; the
 // stop cancelled it and the old daemon recorded "apiserver not healthy: context
 // canceled", dated after the install began but before the new daemon existed.

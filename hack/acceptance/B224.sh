@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B224 acceptance gate — the runnable proof that `k3sm server --mesh-ip`
+# k3sm MeshPeer CRD acceptance gate — the runnable proof that `k3sm server --mesh-ip`
 # ESTABLISHES the MeshPeer CustomResourceDefinition itself, fail-closed, before the
 # worker-join supervisor exists.
 #
@@ -36,7 +36,7 @@
 #   `--mesh-ip` bring-up dies inside the executor's Start — kube-controller-manager is
 #   given --root-ca-file <work-dir>/apiserver-certs/apiserver.crt, but the mesh path
 #   writes the apiserver serving cert under <work-dir>/tls/, leaving that dir empty.
-#   That is a SEPARATE defect, upstream of everything B224 added (the CRD ensure runs
+#   That is a SEPARATE defect, upstream of everything added (the CRD ensure runs
 #   after Start returns), and it is being fixed on its own item. The legs below stay
 #   FAILING until it lands — they are never softened into a skip, because "the mesh
 #   path cannot boot" is exactly the kind of thing a gate must keep saying out loud.
@@ -58,7 +58,7 @@
 #             it previously 404'd (b224.L2/L3).
 #   DOES NOT PROVE — a cross-node join. Two Macs, a live wireguard mesh and a real
 #             worker agent are the K3SM_LAB two-Mac slice, unchanged by this item.
-#             B224 makes the CRD exist; it brings up no mesh (that is M14.2).
+#             makes the CRD exist; it brings up no mesh (that is the server-mesh work).
 #
 # Usage:  hack/acceptance/B224.sh            # CI tier only
 #         K3SM_LAB=1 hack/acceptance/B224.sh # + the live single-node integration tier
@@ -74,7 +74,7 @@ SELF="$HERE/B224.sh"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B224 acceptance (server bring-up ensures the MeshPeer CRD, fail-closed)"
+echo "==> k3sm MeshPeer CRD acceptance (server bring-up ensures the MeshPeer CRD, fail-closed)"
 
 # ---- b224.0 — the gate parses and the wiring source exists -----------------
 b0=ok
@@ -84,20 +84,20 @@ b0=ok
 ladder "$b0" "b224.0  gate parses (bash -n) + cmd/k3sm/server.go, cmd/k3sm/serverphases.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B224: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B224: $PASS passed, $FAIL failed" >&2
+	echo "MeshPeer CRD: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
+	echo "MeshPeer CRD: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
 # ---- b224.pre — the cross-repo precondition --------------------------------
 # The ensure applies k3sm.io/apis' OWN bytes through its named accessor. The two
 # halves only meet through the workspace go.work, so a standalone k3sm clone cannot
-# prove this — its absence is a hard FAIL, never a skip, or "B224 green" would mean
-# "B224 was not checked".
+# prove this — its absence is a hard FAIL, never a skip, or "green" would mean
+# "MeshPeer CRD was not checked".
 if [ -f "$WS_ROOT/go.work" ]; then
 	ladder ok "b224.pre  workspace go.work present ($WS_ROOT/go.work)"
 else
-	ladder no "b224.pre  workspace go.work present — B224 applies apis' embedded manifest; a standalone k3sm checkout cannot prove it"
+	ladder no "b224.pre  workspace go.work present — applies apis' embedded manifest; a standalone k3sm checkout cannot prove it"
 fi
 pre=ok
 [ -f "$APIS_CRD" ] || pre=no
@@ -106,7 +106,7 @@ grep -qE 'func MeshPeerCRD\(\) \[\]byte' "$APIS_CRD" 2>/dev/null || pre=no
 ladder "$pre" "b224.pre  sibling apis exports MeshPeerCRDName + MeshPeerCRD() (the accessor the ensure consumes)"
 if [ "$FAIL" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "B224: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
+	echo "MeshPeer CRD: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
 	exit 1
 fi
 
@@ -218,15 +218,15 @@ lab_pending() { echo "LAB-PENDING  $1"; }
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "B224 INTEGRATION tier (set K3SM_LAB=1 on a dev Mac to run; no root needed):"
+	echo "INTEGRATION tier (set K3SM_LAB=1 on a dev Mac to run; no root needed):"
 	lab_pending "b224.L0  \`k3sm server --mesh-ip 127.0.0.1 --network none\` reaches a healthy apiserver"
 	lab_pending "b224.L1  the MeshPeer CRD reports Established (RED before: NotFound — nothing applied it)"
 	lab_pending "b224.L2  \`kubectl get meshpeers\` succeeds (RED before: the server has no such resource)"
 	lab_pending "b224.L3  an enroll-shaped MeshPeer is ACCEPTED and reads back intact (the live half of the mesh-regression leg)"
-	lab_pending "b224.L4  [two-Mac harness] a real worker join enrolls over the mesh — M14.2, NOT proven here"
+	lab_pending "b224.L4  [two-Mac harness] a real worker join enrolls over the mesh — server-mesh work, NOT proven here"
 else
 	# This tier reuses hack/lib/clusterup.sh for RESET and TEARDOWN only — never for
-	# bring-up, because server_up cannot pass --mesh-ip and B224 is exactly about the
+	# bring-up, because server_up cannot pass --mesh-ip and this gate is exactly about the
 	# mesh path. cluster_reset is what removes the previous run's datastore and reaps
 	# the listeners it left behind (a killed run leaves a live kine holding the
 	# datastore port, which the next run then reports as a bind failure); it keeps the
@@ -250,7 +250,7 @@ else
 	if [ ! -f "$LIB" ]; then
 		ladder no "b224.L0  hack/lib/clusterup.sh present (required for the integration tier)"
 		echo "----------------------------------------"
-		echo "B224: $PASS passed, $FAIL failed" >&2
+		echo "MeshPeer CRD: $PASS passed, $FAIL failed" >&2
 		exit 1
 	fi
 	# shellcheck source=/dev/null
@@ -265,14 +265,14 @@ else
 	if ! cluster_reset; then
 		ladder no "b224.L0  cluster_reset (free this gate's ports + drop the previous datastore)"
 		echo "----------------------------------------"
-		echo "B224: $PASS passed, $FAIL failed" >&2
+		echo "MeshPeer CRD: $PASS passed, $FAIL failed" >&2
 		exit 1
 	fi
 	# A codesign interrupted by a previous kill leaves a .cstemp beside its binary,
 	# and the next signing pass refuses to overwrite it.
 	rm -f "$SERVER_WORKDIR/bin"/*.cstemp
 	echo "----------------------------------------"
-	echo "B224 INTEGRATION tier: booting a mesh-path control plane in $B224_WORK"
+	echo "INTEGRATION tier: booting a mesh-path control plane in $B224_WORK"
 	# The ingress listeners are disabled outright so no privileged bind is attempted
 	# and the tier stays rootless; --network none means no datapath and no lo0 alias.
 	( cd "$K3SM_ROOT" && nohup env CGO_ENABLED=1 go run ./cmd/k3sm server \
@@ -314,7 +314,7 @@ else
 	ladder "$up" "b224.L0  \`k3sm server --mesh-ip 127.0.0.1 --network none\` reached a healthy apiserver"
 	if [ "$up" != ok ]; then
 		tail -30 "$B224_WORK/server.log" >&2
-		# Name the one known blocker rather than let it read as a B224 failure. It is
+		# Name the one known blocker rather than let it read as a failure. It is
 		# NOT one: it happens inside the executor's Start, strictly BEFORE any code
 		# this item added runs. Observed 2026-08-30 on the mesh path — the apiserver
 		# serving cert is written under tls/ while kube-controller-manager is pointed
@@ -322,7 +322,7 @@ else
 		# leg still FAILS (a named cause is not a pass); it goes green once the
 		# separate mesh-path --root-ca-file fix lands.
 		if grep -q 'root-ca-file.*apiserver-certs' "$B224_WORK/server.log" 2>/dev/null; then
-			echo "b224.L0: this is the known mesh-path --root-ca-file defect (kube-controller-manager cannot read apiserver-certs/apiserver.crt), NOT a B224 regression — it fails before the CRD ensure is reached" >&2
+			echo "b224.L0: this is the known mesh-path --root-ca-file defect (kube-controller-manager cannot read apiserver-certs/apiserver.crt), NOT a regression — it fails before the CRD ensure is reached" >&2
 		fi
 	else
 		# NOT clusterup.sh's kc(): that one dials a fixed port with a static token.
@@ -381,17 +381,17 @@ else
 		else
 			ladder no "b224.L3  an enroll-shaped MeshPeer is accepted and reads back intact"
 		fi
-		lab_pending "b224.L4  [two-Mac harness] a real worker join enrolls over the mesh — M14.2, NOT proven here"
+		lab_pending "b224.L4  [two-Mac harness] a real worker join enrolls over the mesh — server-mesh work, NOT proven here"
 	fi
 	b224_down
 	trap - EXIT
 fi
 
 echo "----------------------------------------"
-echo "B224: $PASS passed, $FAIL failed"
+echo "MeshPeer CRD: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 if [ "${K3SM_LAB:-}" = 1 ]; then
-	echo "================ B224 GREEN (CI + integration tiers) ================"
+	echo "================ MeshPeer CRD GREEN (CI + integration tiers) ================"
 else
-	echo "================ B224 GREEN (CI tier) ================"
+	echo "================ MeshPeer CRD GREEN (CI tier) ================"
 fi

@@ -87,12 +87,12 @@ func parsePSAConfig(t *testing.T, enforce PodSecurityLevel) psaConfigDoc {
 	return psa
 }
 
-// TestPSADefaultLevel is the B71 gate: it pins the cluster-default Pod Security
+// TestPSADefaultLevel pins the cluster-default Pod Security
 // Admission level tuple k3sm ships, by rendering through the production renderer
 // and PARSING the result.
 //
 // The SAFETY PROPERTY is the first subtest: the shipped default must be
-// warn-only — enforce=privileged, i.e. admission rejects nothing (Res.2). PSA is
+// warn-only — enforce=privileged, i.e. admission rejects nothing. PSA is
 // conformance-surface + defense-in-depth here, NOT the privilege boundary (the
 // foreign-uid VAP + Seatbelt stay that), so a silent warn→enforce drift would be
 // a rejection surface nobody signed off; flipping DefaultPodSecurityEnforceLevel
@@ -102,7 +102,7 @@ func TestPSADefaultLevel(t *testing.T) {
 	t.Run("shipped default is warn-only (enforce=privileged)", func(t *testing.T) {
 		psa := parsePSAConfig(t, DefaultPodSecurityEnforceLevel)
 		if got := PodSecurityLevel(psa.Defaults.Enforce); got != PodSecurityLevelPrivileged {
-			t.Errorf("defaults.enforce = %q, want %q — the SHIPPED posture rejects NOTHING (Res.2 warn-first)", got, PodSecurityLevelPrivileged)
+			t.Errorf("defaults.enforce = %q, want %q — the SHIPPED posture rejects NOTHING (warn-first)", got, PodSecurityLevelPrivileged)
 		}
 	})
 
@@ -112,7 +112,7 @@ func TestPSADefaultLevel(t *testing.T) {
 		wantEnforce PodSecurityLevel
 	}{
 		{"warn-first default renders enforce=privileged", DefaultPodSecurityEnforceLevel, PodSecurityLevelPrivileged},
-		{"the B71 cutover renders enforce=baseline, levels otherwise unchanged", PodSecurityLevelBaseline, PodSecurityLevelBaseline},
+		{"the baseline-enforce cutover renders enforce=baseline, levels otherwise unchanged", PodSecurityLevelBaseline, PodSecurityLevelBaseline},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			psa := parsePSAConfig(t, tc.enforce)

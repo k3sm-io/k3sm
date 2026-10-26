@@ -47,6 +47,9 @@ func grantLines(objs []GoldenObject) []string {
 		if o.Kind == "Namespace" {
 			out = append(out, "namespace "+o.Name)
 		}
+		if o.Kind == "ServiceAccount" {
+			out = append(out, "serviceaccount "+o.Namespace+"/"+o.Name)
+		}
 	}
 	sort.Strings(out)
 	return out
@@ -80,6 +83,15 @@ func TestProvisionSubjectsUnchanged(t *testing.T) {
 		"rule ClusterRole /k3sm:node-datapath [net.k3sm.io] [meshpeers] [get list watch] []",
 		"rule Role default/k3sm:in-pod-reader [] [pods configmaps services] [get list watch] []",
 		"rule Role k3sm-registry/k3sm-registry-advert-reader [] [configmaps] [get list watch] []",
+		"bind ClusterRoleBinding /k3sm:registry-gate -> ClusterRole k3sm:registry-gate Group /k3sm:registry-gates",
+		"rule ClusterRole /k3sm:registry-gate [authentication.k8s.io] [tokenreviews] [create] []",
+		"rule ClusterRole /k3sm:registry-gate [authorization.k8s.io] [subjectaccessreviews] [create] []",
+		"rule ClusterRole /k3sm:registry-gate [] [namespaces] [get] []",
+		"rule ClusterRole /k3sm:registry-pusher [registry.k3sm.io] [repositories] [push] []",
+		"serviceaccount k3sm-registry/builder",
+		"bind ClusterRoleBinding /k3sm:registry-builder -> ClusterRole k3sm:registry-pusher ServiceAccount k3sm-registry/builder",
+		"rule Role k3sm-registry/k3sm:registry-builder-token [] [serviceaccounts/token] [create] [builder]",
+		"rule Role k3sm-registry/k3sm:registry-builder-token [discovery.k8s.io] [endpointslices] [get] [registry-k3sm]",
 	}
 	sort.Strings(want)
 	got := grantLines(objs)

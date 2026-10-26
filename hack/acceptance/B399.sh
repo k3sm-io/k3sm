@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B399 acceptance gate — the conformance helper binaries reach the worker Mac,
+# k3sm conformance helpers acceptance gate — the conformance helper binaries reach the worker Mac,
 # and a root-owned helper dir is named instead of failing inside `go test`.
 #
 # Native pods exec a host binary path, so a TestM3 pod pinned to the worker needs
@@ -44,7 +44,7 @@ esac
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B399 acceptance (conformance helpers staged on the worker Mac)"
+echo "==> k3sm conformance helpers acceptance (conformance helpers staged on the worker Mac)"
 
 # ---- b399.0 — the lib exists and defines both functions ---------------------
 b0=ok
@@ -58,7 +58,7 @@ else
 fi
 ladder "$b0" "b399.0  hack/lib/conformance-stage.sh parses and defines conformance_bin_preflight + conformance_stage_worker"
 if [ "$b0" != ok ]; then
-	echo "B399: $PASS passed, $FAIL failed" >&2
+	echo "conformance helpers: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -157,6 +157,6 @@ b5=ok
 ladder "$b5" "b399.5  hack/lab/m3.sh sources conformance-stage.sh and calls preflight + stage (helper names read from e2e/testdata/cmd)"
 
 echo "----------------------------------------"
-echo "B399: $PASS passed, $FAIL failed"
+echo "conformance helpers: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B399 GREEN ================"
+echo "================ conformance helpers GREEN ================"

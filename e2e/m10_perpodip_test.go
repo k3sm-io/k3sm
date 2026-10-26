@@ -30,7 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestM10_PerPodIP is the M10.1 per-pod-IP criterion (Res.1): two pods on the same
+// TestM10_PerPodIP is the per-pod-IP criterion (Res.1): two pods on the same
 // node each report a DISTINCT status.podIP (a real podnet /32, not podIP≈nodeIP), and
 // a headless Service returns ALL backend pod IPs — proving the podnet adapter over
 // supervisor.NodeNetwork on the converged runtimed path.

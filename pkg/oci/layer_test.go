@@ -29,7 +29,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
-// TestBuildLayerMediaTypeMatchesBytes is B192's gate. It builds a fixture
+// TestBuildLayerMediaTypeMatchesBytes pins this contract. It builds a fixture
 // image and, for every layer, proves the declared media type matches what is
 // actually on the wire in BOTH directions — gzip magic bytes iff a "+gzip"
 // media type, genuine tar shape iff the plain "v1.tar" media type — then

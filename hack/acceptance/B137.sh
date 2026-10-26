@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B137 acceptance gate — the fully mocked end-to-end proof of the gen-1
+# k3sm installer acceptance gate — the fully mocked end-to-end proof of the gen-1
 # curl|sh installer (install.sh): download → sha256-verify → sudo k3sm install,
 # with every external seam substituted (loopback HTTP release server; PATH stubs
 # for sudo/uname/sw_vers/sysctl; a stub k3sm that logs its argv). The gate's
@@ -21,7 +21,7 @@ CONFIG="$REPO_ROOT/.goreleaser.yaml"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B137 acceptance (gen-1 curl|sh installer, fully mocked e2e)"
+echo "==> k3sm installer acceptance (gen-1 curl|sh installer, fully mocked e2e)"
 
 # ---- static checks ----------------------------------------------------------
 
@@ -31,8 +31,8 @@ if [ -f "$SCRIPT" ] && sh -n "$SCRIPT"; then
 else
 	ladder no "b137.0  install.sh present + parses (sh -n)"
 	echo "----------------------------------------"
-	echo "B137: install.sh missing or unparseable — nothing else can run" >&2
-	echo "B137: $PASS passed, $((FAIL)) failed" >&2
+	echo "installer: install.sh missing or unparseable — nothing else can run" >&2
+	echo "installer: $PASS passed, $((FAIL)) failed" >&2
 	exit 1
 fi
 
@@ -515,6 +515,6 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B137: $PASS passed, $FAIL failed"
+echo "installer: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B137 GREEN ================"
+echo "================ installer GREEN ================"

@@ -151,7 +151,7 @@ func waitForEvent(t *testing.T, f *fakeLifecycleServer, kind string) {
 
 // --- TestLifecycleHooksExecHTTP ----------------------------------------------
 
-// TestLifecycleHooksExecHTTP is the B10 gate: the provider serves container
+// TestLifecycleHooksExecHTTP pins that the provider serves container
 // postStart/preStop lifecycle hooks (exec, httpGet, sleep) itself — runtimed never
 // sees them (toPodBox drops Lifecycle). It proves, with no live runtimed (the exec
 // seam is the in-process Exec stream the exec-probe tests fake; httpGet is a

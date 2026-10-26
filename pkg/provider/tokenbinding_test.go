@@ -29,7 +29,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// B226 (lab defect D5) — a projected ServiceAccount token must be BOUND to the
+// A projected ServiceAccount token must be BOUND to the
 // Pod object it was minted for, exactly as upstream kubelet binds it. Without
 // spec.boundObjectRef the token stays valid after the pod is deleted (until
 // expiry) and the apiserver emits no authentication.kubernetes.io/pod-name or
@@ -118,7 +118,7 @@ func (f *tokenMintingRuntime) CreatePod(ctx context.Context, req *runtimev1.Crea
 // UpdatePod mints the pod's token on ctx, then delegates to the recording fake.
 // This is a FORWARD GUARD, not a real scenario: it proves the identity binding
 // would survive a hypothetical re-materializing update. Real runtimed never
-// issues this call on UpdatePod — volumes materialize once, at create (B233).
+// issues this call on UpdatePod — volumes materialize once, at create.
 func (f *tokenMintingRuntime) UpdatePod(ctx context.Context, req *runtimev1.UpdatePodRequest) (*runtimev1.UpdatePodResponse, error) {
 	f.mint(ctx, req.GetPod().GetNamespace())
 	return &runtimev1.UpdatePodResponse{}, nil

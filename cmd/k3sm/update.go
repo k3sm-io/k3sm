@@ -109,9 +109,11 @@ Flags:
                       to remove
   --watch             keep printing until the update finishes (status)
 
-Every subcommand but check reaches the cluster with the credentials
+Every subcommand reaches the cluster with the credentials
 ` + "`k3sm status`" + ` uses: the server's admin kubeconfig as root or the service
-user, the k3sm context of ~/.kube/config otherwise.
+user, the k3sm context of ~/.kube/config otherwise. Only check also works
+with no reachable cluster: it then compares this Mac's k3sm alone with the
+latest release.
 
 Exit codes: 0 done, 1 it could not be done (the error says why), 2 usage, or
 apply without --yes on a stdin that is not a terminal.
@@ -237,7 +239,7 @@ func runUpdateCheck(ctx context.Context, args []string, env updateEnv) int {
 	rep, checkErr := update.Check(ctx, env.inputs)
 	if env.workDir != "" {
 		if err := writeUpdateRecord(env.workDir, rep.Record(checkErr)); err != nil {
-			fmt.Fprintf(env.errOut, "k3sm update: not recorded for `k3sm status` (%v); run with sudo to record it\n", err)
+			fmt.Fprintln(env.errOut, updateNotRecorded(err))
 		}
 	}
 	if checkErr != nil {
@@ -268,16 +270,42 @@ func renderUpdate(w io.Writer, rep update.Report) {
 	if rep.Latest.KubeVersion != "" {
 		fmt.Fprintf(tw, "kubernetes\t%s\n", rep.Latest.KubeVersion)
 	}
-	fmt.Fprintf(tw, "installed\t%s (%s)\n", rep.Installed, rep.InstalledState)
+	installed := rep.InstalledState
+	if !rep.InstalledDirty {
+		installed = withUntagged(installed, rep.Installed, rep.Latest.Tag, status.BuildState)
+	}
+	fmt.Fprintf(tw, "installed\t%s (%s)\n", rep.Installed, installed)
 	if len(rep.Nodes) > 0 {
 		fmt.Fprintf(tw, "\nNODE\tVERSION\tSTATE\n")
 		// Node names and versions are what each node says of itself, so they
 		// are control-stripped before they reach a terminal.
 		for _, n := range rep.Nodes {
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", status.ClipText(n.Name, 253), status.ClipText(n.Version, 128), n.State)
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", status.ClipText(n.Name, 253), status.ClipText(n.Version, 128), withUntagged(n.State, n.Version, rep.Latest.Tag, status.NodeBuildState))
 		}
 	}
 	_ = tw.Flush()
+}
+
+// withUntagged appends ", untagged build of X.Y.Z" to state when ver is a
+// build of an untagged commit that compares as state (buildState is
+// status.BuildState or status.NodeBuildState), and returns state unchanged
+// otherwise.
+func withUntagged(state, ver, latest string, buildState func(have, latest string) (string, string)) string {
+	if s, of := buildState(ver, latest); of != "" && s == state {
+		return state + ", " + status.UntaggedLabel(of)
+	}
+	return state
+}
+
+// updateNotRecorded is what `k3sm update check` says when it could not write
+// the record `k3sm status` reads. A permission error is the common case (an
+// account that is not root may not write the status directory) and is named
+// as such, without the temporary file's path; any other error keeps its text.
+func updateNotRecorded(err error) string {
+	if errors.Is(err, fs.ErrPermission) {
+		return "k3sm update: not recorded for `k3sm status`: writing the record needs root; run with sudo to record it"
+	}
+	return fmt.Sprintf("k3sm update: not recorded for `k3sm status` (%v); run with sudo to record it", err)
 }
 
 // errNoStatusDir is a work dir with no status directory beside it (a work dir

@@ -20,6 +20,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -355,7 +356,7 @@ func (c *CA) issueLeaf(pub any, subject pkix.Name, dnsSANs []string, ipSANs []ne
 		Subject:               subject,
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.Add(validFor),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		KeyUsage:              leafKeyUsage(pub),
 		ExtKeyUsage:           append([]x509.ExtKeyUsage(nil), ekus...),
 		BasicConstraintsValid: true,
 		DNSNames:              dnsSANs,
@@ -366,6 +367,17 @@ func (c *CA) issueLeaf(pub any, subject pkix.Name, dnsSANs []string, ipSANs []ne
 		return nil, fmt.Errorf("sign leaf certificate: %w", err)
 	}
 	return der, nil
+}
+
+// leafKeyUsage is the key usage of a leaf for pub: digital signature, plus key
+// encipherment only for an RSA key, the one key type whose TLS key exchange
+// encrypts with it. An ECDSA or Ed25519 key only signs, so asserting key
+// encipherment for one claims a use the key cannot have (RFC 5480 §3).
+func leafKeyUsage(pub any) x509.KeyUsage {
+	if _, ok := pub.(*rsa.PublicKey); ok {
+		return x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment
+	}
+	return x509.KeyUsageDigitalSignature
 }
 
 // VerifyPinnedChain verifies that the server's TLS-presented chain (leaf-first,

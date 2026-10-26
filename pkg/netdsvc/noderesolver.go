@@ -128,7 +128,7 @@ var ErrNodeResolverUnsupported = errors.New("node resolver entry unsupported: Sy
 // writes the FULL entry (on every start, a post-crash respawn included, so a
 // stale or partial entry is always overwritten), Stop removes it.
 //
-// It is the resolv.conf translation of B243: on Linux the kubelet writes each
+// It is the macOS translation of a pod's resolv.conf: on Linux the kubelet writes each
 // container's resolv.conf and every descendant inherits it; on macOS the
 // equivalent reach is the host resolver configuration mDNSResponder enforces
 // for every process, platform binaries included, so a pod whose shell lost the

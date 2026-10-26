@@ -95,8 +95,8 @@ type agentOptions struct {
 	// which the installer renders from this recorded argument.
 	lbPrivilegedPorts string
 	// updateReleaseBase is --update-release-base: the release index the
-	// managed update reads instead of GitHub's (a mirror, a lab rig). Empty is
-	// GitHub's; it is validated after the flags parse (releaseBaseFlag).
+	// managed update reads instead of GitHub's (a mirror, a test environment). Empty is
+	// GitHub's; it is validated after the flags parse (releaseBase).
 	updateReleaseBase string
 	// lan is the daemon's LAN switch (startDaemonLAN), set by agentStart; not
 	// a flag. The datapath and the node's svclb hoster attach to it.
@@ -185,7 +185,7 @@ func agentTerminal(ctx context.Context, b *crashBreaker, logger *slog.Logger, er
 //
 // It is a thin wrapper around agentStart because of what an agent's start
 // failure has to leave behind. This daemon backs off instead of exiting, so
-// launchd reports a healthy pid whatever happened, and until k3sm#B322 the only
+// launchd reports a healthy pid whatever happened, and until a start failure was recorded the only
 // trace of a worker that could not join was a log line — which `k3sm install`
 // cannot read a verdict out of. So EVERY start failure is recorded on the same
 // crash-loop record the server keeps (pkg/executor's CrashRecord, under the
@@ -586,7 +586,12 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
 	logger.Info(fmt.Sprintf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName))
-	return startNode(ctx, agentNodeOptions(opts, res, kubeconfigPath, mode, datapath))
+	nodeOpts := agentNodeOptions(opts, res, kubeconfigPath, mode, datapath)
+	// The cluster's one registry name, fetched from where the flat Service's
+	// EndpointSlice says the server's relay listens, over TLS verified against
+	// the cluster CA this join pinned.
+	nodeOpts.flatRegistry = agentFlatRegistry(ctx, kubeconfigPath, res, logger)
+	return startNode(ctx, nodeOpts)
 }
 
 // agentTokenJoin runs the credential-issuing join and returns the result plus the
@@ -842,6 +847,9 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		// The worker's own Service proxy is where its vm pods' live guest leases
 		// are published; nil when the worker runs no datapath.
 		transportOverrides: nodeTransportOverrides(datapath, mode),
+
+		// flatRegistry is left to runAgent: it is read from the cluster
+		// (agentFlatRegistry), which this pure builder does not do.
 	}
 }
 
@@ -1139,7 +1147,7 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 		// The resume path reports it IMMEDIATELY. A kubeconfig that will not load is
 		// a bring-up that cannot list peers and cannot start a watcher, so spending
 		// the whole first-sync bound discovering that would only delay the same
-		// failure — and the pre-B308 code returned it here, before any wait existed.
+		// failure — and the earlier code returned it here, before any wait existed.
 		if restErr != nil {
 			return teardown, fmt.Errorf("load kubeconfig for mesh watch: %w", restErr)
 		}
@@ -1424,7 +1432,7 @@ func restConfigHost(cfg *rest.Config) string {
 //
 // The datapath's client presents its netserve certificate through a
 // netserve.RotatingCredential, and rot keeps that certificate in date in
-// process (startNetserveRotation): the datapath is never restarted for a
+// process (rot.start): the datapath is never restarted for a
 // renewal, its connections are.
 func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, netserveKubeconfig string, rot workerNetserveRotation, logger *slog.Logger) (*netserve.Server, error) {
 	restCfg, _, err := kubeclient.FromPath(netserveKubeconfig)

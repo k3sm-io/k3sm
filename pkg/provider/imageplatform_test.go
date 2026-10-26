@@ -64,7 +64,7 @@ func translatePlatformPod(t *testing.T, pod *corev1.Pod) (*runtimev1.PodBox, err
 	return toPodBox(pod, "10.42.0.7", "192.168.1.10", t.TempDir(), "", netv1.DNSConfig{}, nil)
 }
 
-// TestImagePlatformAnnotationStampsContainers is the M11.4-d3 stamp gate: the
+// TestImagePlatformAnnotationStampsContainers pins the stamp: the
 // pod-level k3sm.io/image-platform annotation is parsed ONCE, provider-side, into
 // the TYPED runtimev1.Platform message and stamped onto every container.
 //
@@ -261,7 +261,7 @@ func capabilityInfo(caps NodeCapabilities) *runtimev1.GetRuntimeInfoResponse {
 	}
 }
 
-// TestImagePlatformPreflightFailsClosed is the M11.4-d3 pre-RPC gate: a pod whose
+// TestImagePlatformPreflightFailsClosed pins the pre-RPC check: a pod whose
 // k3sm.io/image-platform annotation names a platform this node's capabilities
 // cannot serve is refused BEFORE runtimed is asked to create it, with a Warning
 // Event naming the missing capability label.

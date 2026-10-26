@@ -41,7 +41,7 @@ So a reader should:
 
 ## Exit codes and stdout
 
-Both commands write their JSON document to stdout **whatever the exit code**. A non-zero exit is a
+Every shape writes its JSON document to stdout **whatever the exit code**. A non-zero exit is a
 verdict, not a failure to answer, so read stdout first and use the exit code as a shortcut.
 
 | exit | meaning |
@@ -238,7 +238,7 @@ A `403 Forbidden` is not `refused`: the credential authenticated and RBAC denied
 row stays `ok`. A review that fails any other way (a timeout, an apiserver that does not answer)
 leaves the row `ok` without `wide.user`; the `apiserver` row reports reachability.
 
-`ingest-registry`, on a server started with `--registry-port`, is `ok` when the registry the server recorded as serving answers `/v2/` on its loopback port, `down` (`warn`) when it does not, `disabled` (`warn`, with the reason in `detail`) when the server gave up starting it, and `stopped` (`skip`) after the server tore it down; `wide.port` and `wide.since` carry the port and when it entered that state, and the row reads the copy of the server's record in `/var/lib/k3sm/status/` (mode 0644, no credential), so any account sees the same row; `wide.record` names the file read.
+`ingest-registry`, on a server that runs the registry (every server unless started with `--registry-port 0`), is `ok` when the registry the server recorded as serving answers `/v2/` on its loopback port, `down` (`warn`) when it does not, `disabled` (`warn`, with the reason in `detail`) when the server gave up starting it, and `stopped` (`skip`) after the server tore it down; `wide.port` and `wide.since` carry the port and when it entered that state, `wide.service` the in-cluster name it is published under (`registry-k3sm:6450`, on the server that publishes it), `wide.tls` whether its cluster-facing listener serves HTTPS, and `wide.cert_not_after` when that listener's certificate expires (the row is `down` once it has expired), and the row reads the copy of the server's record in `/var/lib/k3sm/status/` (mode 0644, no credential), so any account sees the same row; `wide.record` names the file read.
 
 `needs-admin` marks a check that only root can run, so nothing was checked and nothing is wrong. Its
 `remedy` is `sudo k3sm status`, and it never changes the `verdict`. A client can show it as not
@@ -313,7 +313,7 @@ row on a worker, and it never changes the `verdict`. Its `wide` keys are part of
 | key | value |
 |---|---|
 | `nodeport-addresses` | the `--nodeport-addresses` value, or `every interface` |
-| `registry-port` | the node registry's port, or `off`; server only |
+| `registry-port` | the registry's port (`6450` unless set), or `off` for `--registry-port 0`; server only |
 | `tls-sans` | the extra apiserver certificate names, comma-separated, or `none`; server only |
 | `mesh-ip` | the mesh address, or `none`; server only |
 | `kubeconfig-name` | the name the admin kubeconfig is merged under; server only |
@@ -364,7 +364,11 @@ The `update` row appears on an installed server and an installed worker. It repo
 release, from the record the last update check left (see [Upgrade](upgrade.md#checking-for-an-update)).
 The server checks at most once an hour and `sudo k3sm update check` checks on demand; the report itself
 never contacts GitHub. The record is `/var/lib/k3sm/status/update.json` (mode 0644), so any account
-reads the row. Its `state` is:
+reads the row. The row takes the latest release and the check time from the record, and compares that
+release with the versions running when the report is taken: the `k3sm` binary, and every node's
+kubelet version from the node list the report reads (the recorded node versions when it cannot list
+nodes). A build of an untagged commit (a Go pseudo-version) ranks by the release it leads up to, and
+`detail` calls it an untagged build, for example `a (untagged build of 0.1.8)`. Its `state` is:
 
 On a worker the row is read-only. After each check a server publishes the latest release and when it
 checked on its own Node (the `k3sm.io/release-latest` and `k3sm.io/release-checked` annotations),

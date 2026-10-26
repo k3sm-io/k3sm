@@ -52,7 +52,7 @@ import (
 var ErrPayloadStamp = errors.New("payload binary is not the build this k3sm pins")
 
 // maxStampLen bounds the stamped version string read out of a binary: a stamp is a
-// short tag such as "v0.17.2+p1", and a larger length means the read went wrong.
+// short tag such as "v0.17.2+p2", and a larger length means the read went wrong.
 const maxStampLen = 128
 
 // shippedStamp reads the (version, variant) a child binary at path was built as, from
@@ -82,8 +82,8 @@ func cgoVariant(bi *debug.BuildInfo) (string, error) {
 }
 
 // kineStampOf derives kine's (version, variant) from its build info and the version
-// string stamped into kine's version package: "v0.17.2+p1" with CGO_ENABLED=0 is
-// ("v0.17.2", "nocgo+p1"), the pair kineChild's marker records. Pure.
+// string stamped into kine's version package: "v0.17.2+p2" with CGO_ENABLED=0 is
+// ("v0.17.2", "nocgo+p2"), the pair kineChild's marker records. Pure.
 func kineStampOf(bi *debug.BuildInfo, stamped string) (version, variant string, err error) {
 	if bi.Path != kineModulePath {
 		return "", "", fmt.Errorf("main package is %q, want %q", bi.Path, kineModulePath)

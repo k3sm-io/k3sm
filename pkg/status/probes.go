@@ -70,10 +70,10 @@ type Kube interface {
 
 // Liveness is the tri-state answer to "is this pid there?".
 //
-// It mirrors dev.Liveness deliberately rather than importing it: pkg/dev pulls
-// the whole dev-cluster stack (pkg/install, the executor, darwin-net) in behind
-// a three-value enum, and pkg/status is a reporting leaf that should stay cheap
-// to import. cmd/k3sm converts at the adapter.
+// It mirrors dev.Liveness deliberately rather than importing it, so the report
+// does not depend on the dev-cluster package's API for a three-value enum.
+// (pkg/status does import pkg/install, so this is about coupling, not import
+// cost.) cmd/k3sm converts at the adapter.
 //
 // The three values exist because kill(pid, 0) has three answers, not two: ESRCH
 // (gone), success (there, and signalable), and EPERM (there, owned by someone
@@ -264,8 +264,8 @@ type Collector struct {
 	// It exists for exactly one question -- how much a data volume that carries
 	// NO quota is using. statfs(2) cannot answer it: on a quota-less APFS
 	// volume the kernel reports the whole CONTAINER's block counts, so the
-	// "used" it yields is the entire disk's usage and not the volume's (on the
-	// lab rig, 790G against a 34.8G volume). diskutil's container listing is the
+	// "used" it yields is the entire disk's usage and not the volume's (on a
+	// test machine, 790G against a 34.8G volume). diskutil's container listing is the
 	// only source of the volume's own figure, and it needs no privilege to read.
 	// A volume WITH a quota is exempt: statfs reports the quota there, which is
 	// the bound the reclaim ladder reads, so it stays the source.
@@ -274,16 +274,16 @@ type Collector struct {
 	// installed server plist's bytes, and it is OPTIONAL: a nil ServerArgs
 	// simply leaves that row out of the report.
 	//
-	// It is a seam rather than a direct call because the parse lives in
-	// pkg/install, and pkg/status is a reporting leaf — importing the installer
-	// would pull the certs, datavol, podnet and sandbox stack in behind one row.
-	// cmd/k3sm wires install.OperatorServerArgs here, so there is still exactly
-	// one reader of that plist's argv.
+	// It is a seam rather than a direct call to install.OperatorServerArgs
+	// (which pkg/status could import; it already imports pkg/install) so that a
+	// test can drive the row with a stub parse and a caller can leave the row
+	// out. cmd/k3sm wires install.OperatorServerArgs here, so there is still
+	// exactly one reader of that plist's argv.
 	ServerArgs func(plist []byte) ([]string, error)
 	// NodeResolverPresent reports whether netd's node resolver entry is in the
 	// host's dynamic store. OPTIONAL: nil leaves the node-resolver row out. A
-	// seam because the read is a SystemConfiguration call (cgo) that pkg/status,
-	// a reporting leaf, does not make itself.
+	// seam because the read is a SystemConfiguration call (cgo) that pkg/status
+	// does not make itself, which also keeps the row testable without the host.
 	NodeResolverPresent func() (bool, error)
 	// DNS sends the dns row's query to the node resolver (NetDNS in
 	// production). OPTIONAL: nil leaves the dns row out.

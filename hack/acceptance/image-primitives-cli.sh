@@ -269,10 +269,10 @@ b8=ok
 "${K3SM_IMAGE[@]}" tag "$PULLED_DIGEST" "$TAG_REF" --platform "$PULL_PLATFORM" >"$LIVE_OUT" 2>&1 || b8=no
 [ "$b8" = ok ] || tail -10 "$LIVE_OUT" || true
 ladder "$b8" "image-cli.8a \`k3sm image tag\` recorded $TAG_REF for the pulled digest"
-if "${K3SM_IMAGE[@]}" ls 2>/dev/null | grep -q "probe-tag"; then
-	ladder ok "image-cli.8b the new name appears in \`k3sm image ls\`"
+if "${K3SM_IMAGE[@]}" inspect "$TAG_REF" --platform "$PULL_PLATFORM" >"$LIVE_OUT" 2>&1; then
+	ladder ok "image-cli.8b the new name is in the node store (\`k3sm image inspect\` finds it)"
 else
-	ladder no "image-cli.8b the new name appears in \`k3sm image ls\`"
+	ladder no "image-cli.8b the new name is in the node store (\`k3sm image inspect\` finds it)"
 fi
 
 # ---- image-cli.9 — inspect reports both names -----------------------------
@@ -337,10 +337,10 @@ b12=ok
 "${K3SM_IMAGE[@]}" untag "$TAG_REF" --platform "$PULL_PLATFORM" --digest "$PULLED_DIGEST" >"$LIVE_OUT" 2>&1 || b12=no
 [ "$b12" = ok ] || tail -10 "$LIVE_OUT" || true
 ladder "$b12" "image-cli.12a \`k3sm image untag\` removed $TAG_REF"
-if "${K3SM_IMAGE[@]}" ls 2>/dev/null | grep -q "probe-tag"; then
-	ladder no "image-cli.12b the untagged name is gone from \`k3sm image ls\`"
+if "${K3SM_IMAGE[@]}" inspect "$TAG_REF" --platform "$PULL_PLATFORM" >"$LIVE_OUT" 2>&1; then
+	ladder no "image-cli.12b the untagged name is gone from the node store (\`k3sm image inspect\` still finds it)"
 else
-	ladder ok "image-cli.12b the untagged name is gone from \`k3sm image ls\`"
+	ladder ok "image-cli.12b the untagged name is gone from the node store (\`k3sm image inspect\` no longer finds it)"
 fi
 # THE PRUNE STORY IS UNCHANGED: the pulled reference still holds an operator root
 # over that content, so a dry-run prune must not offer to delete the digest the

@@ -158,8 +158,8 @@ func specSchema(t *testing.T, c *apiextensionsv1.CustomResourceDefinition) *apie
 	return &spec
 }
 
-// TestEnsureAppliesTheCRDAndAwaitsEstablished is the core of the M8.5-a1 ensure
-// slice: the manifest is written by a FORCED server-side apply under the bare
+// TestEnsureAppliesTheCRDAndAwaitsEstablished is the core of the ensure
+// behaviour: the manifest is written by a FORCED server-side apply under the bare
 // "k3sm" field manager, and Ensure does not return until the API server reports
 // the CRD Established.
 //
@@ -207,7 +207,7 @@ func TestEnsureAppliesTheCRDAndAwaitsEstablished(t *testing.T) {
 	}
 }
 
-// TestEnsureConvergesSchemaDrift is the convergence half of M8.5-a1: a CRD whose
+// TestEnsureConvergesSchemaDrift is the convergence half of the ensure behaviour: a CRD whose
 // stored schema has DRIFTED from the shipped bytes — a stale property this binary
 // no longer ships, and a missing validation rule it does — is brought back to the
 // shipped schema by a re-ensure, not merely added to.

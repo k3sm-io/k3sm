@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# k3sm B226 acceptance gate — the runnable proof that every projected
+# k3sm SA token binding acceptance gate — the runnable proof that every projected
 # ServiceAccount token the provider mints is BOUND to the Pod object it was minted
-# for, exactly as upstream kubelet binds it (lab defect D5; plan M14.1-d5).
+# for, exactly as upstream kubelet binds it (lab defect D5; server-mesh work).
 #
 # The defect: kubeResolver.ServiceAccountToken built a TokenRequestSpec carrying
 # only Audiences + ExpirationSeconds. With no spec.boundObjectRef the apiserver
@@ -25,9 +25,9 @@
 #   CI TIER (always runs, GOARCH=arm64 CGO_ENABLED=1 pinned) — the unit-provable
 #   wiring: the resolver stamps the exact ref, the fail-closed sentinel is on the
 #   only mint path, both provider seams (CreatePod, UpdatePod) bind the pod
-#   identity onto the request context, and the pre-B226 name-only carrier is gone.
-#   Proven by the structural pins plus two Go legs (the B226 binding matrix and
-#   the M2.4 in-pod-API suite it must not regress). This tier reddens if the
+#   identity onto the request context, and the earlier name-only carrier is gone.
+#   Proven by the structural pins plus two Go legs (the binding matrix and
+#   the in-pod-API suite it must not regress). This tier reddens if the
 #   BoundObjectRef, its UID, or the fail-closed return is removed (the mutant
 #   check).
 #
@@ -56,7 +56,7 @@ SELF="$HERE/B226.sh"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B226 acceptance (projected SA tokens bound to their Pod object)"
+echo "==> k3sm SA token binding acceptance (projected SA tokens bound to their Pod object)"
 
 # ---- b226.0 — the gate parses and both wiring sources exist -----------------
 b0=ok
@@ -66,8 +66,8 @@ b0=ok
 ladder "$b0" "b226.0  gate parses (bash -n) + pkg/provider/{resolver,runtimed}.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B226: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B226: $PASS passed, $FAIL failed" >&2
+	echo "SA token binding: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
+	echo "SA token binding: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -103,7 +103,7 @@ mint_sites="$( { grep -rn --include='*.go' 'CreateToken(' "$K3SM_ROOT/pkg" "$K3S
 ladder "$fc" "b226.2  errNoPodIdentity fails the mint closed; the ONLY CreateToken sites are the pod-bound mint + the manifest reconciler's own identity (found: ${mint_sites:-none})"
 
 # ---- b226.3 — the identity is threaded at BOTH provider seams ---------------
-# CreatePod and UpdatePod both bind it; the pre-B226 name-only carrier
+# CreatePod and UpdatePod both bind it; the earlier name-only carrier
 # (withServiceAccount / serviceAccountFromContext) must be GONE, since leaving it
 # reachable leaves a route to a mint with no pod object in scope.
 thread=ok
@@ -155,7 +155,7 @@ run_test() {
 # its pod object, and the no-identity call errors having minted nothing.
 run_test "b226.5" 4 TestB226_ProjectedTokenBoundToPod ./pkg/provider/
 
-# ---- b226.6 — the M2.4 in-pod-API surface is not regressed ------------------
+# ---- b226.6 — the in-pod-API surface is not regressed ------------------
 # The binding rides the same carrier that selects the pod's ServiceAccount; this
 # leg is what keeps the SA-selection half honest while the pod-object half lands.
 run_test "b226.6" 4 TestM2_InPodKubectl ./pkg/provider/
@@ -167,7 +167,7 @@ lab_pending() { echo "LAB-PENDING  $1"; }
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "B226 LAB tier (set K3SM_LAB=1 on a dev Mac to run):"
+	echo "LAB tier (set K3SM_LAB=1 on a dev Mac to run):"
 	lab_pending "b226.L1  a Running pod's projected token authenticates (kubectl auth whoami / TokenReview says authenticated)"
 	lab_pending "b226.L2  after the pod is deleted the SAME token is REJECTED well before its TTL (RED before: it still authenticates on origin/main)"
 	lab_pending "b226.L3  a TokenReview of the live token reports the authentication.kubernetes.io/pod-name and pod-uid extras (RED before: absent)"
@@ -185,7 +185,7 @@ else
 		# shellcheck source=/dev/null
 		. "$LIB"
 		echo "----------------------------------------"
-		echo "B226 LAB tier: booting a single-node cluster (this mutates lo0/datastore on this Mac)"
+		echo "LAB tier: booting a single-node cluster (this mutates lo0/datastore on this Mac)"
 		if cluster_up; then
 			ladder ok "b226.L0  single-node cluster up"
 			lab_pending "b226.L1-L4  apply a projected-SA-token pod, read /var/run/secrets/kubernetes.io/serviceaccount/token, TokenReview it before and after deleting the pod (operator step; see the header)"
@@ -198,6 +198,6 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B226: $PASS passed, $FAIL failed"
+echo "SA token binding: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B226 GREEN (CI tier) ================"
+echo "================ SA token binding GREEN (CI tier) ================"

@@ -101,7 +101,7 @@ func TestLoadImageLineStamped(t *testing.T) {
 	}
 }
 
-// TestDatapathBannerNamesTheRootPodPosture is the B210 gate: the `--datapath`
+// TestDatapathBannerNamesTheRootPodPosture pins this contract: the `--datapath`
 // banner must state that pods on that tier run as ROOT.
 //
 // The M8 gate run confirmed uid=0 inside a --datapath pod. The chain is

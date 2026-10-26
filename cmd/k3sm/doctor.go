@@ -396,7 +396,7 @@ func checkAgentDaemon(env doctorEnv) checkResult {
 	// rejoin is the two-Mac repair, one step per line: the token is minted on
 	// the CONTROL PLANE and only then can this Mac be reinstalled with it.
 	rejoin := fmt.Sprintf(
-		"k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server <control-plane> --token-file <file>   # here (staged at %s)\nsudo k3sm status logs agent   # read %s",
+		"k3sm token create   # on the control-plane Mac\nsudo k3sm install --agent --server <control-plane> --token-file <file>   # here (staged at %s)\nsudo k3sm status logs agent   # read %s",
 		agentStagedTokenPath(), install.AgentLogPath())
 	role, installed := env.nodeRole()
 	if !installed || role != install.RoleAgent {

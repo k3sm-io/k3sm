@@ -30,7 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestM10_JobCompletion is the M10.2/B74 Job terminal-phase criterion: the controller
+// TestM10_JobCompletion is the Job terminal-phase criterion: the controller
 // composition of the per-pod contract pinned by pkg/provider
 // TestJobBackoffAndCompletionAccounting (Never/exit≠0 → Failed terminal; OnFailure/
 // exit≠0 → restart-in-place; mains 0 → Succeeded) against the REAL embedded

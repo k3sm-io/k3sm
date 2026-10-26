@@ -32,7 +32,7 @@ import (
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 )
 
-// measuredSurface is the `vllm_mlx.cli serve` command line as MEASURED on the rig
+// measuredSurface is the `vllm_mlx.cli serve` command line as MEASURED on hardware
 // against 0.4.1 and re-read from the pinned engine's `serve --help` (0.5.0, the
 // version hack/images/mlx-serve/build.sh installs), byte-for-byte reproduced
 // host-side: the key is the option, the value says whether it consumes the

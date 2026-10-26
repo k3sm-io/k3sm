@@ -45,7 +45,7 @@ type podLogEntry struct {
 	kind EntryKind
 }
 
-// TestAgentInstallAdoptsThePodLogTree is the gate for B327: a reinstall over a
+// TestAgentInstallAdoptsThePodLogTree pins this contract: a reinstall over a
 // worker whose agent once ran as root hands the PER-POD log directories to the
 // service user, not just the root of the tree.
 //
@@ -276,7 +276,7 @@ func TestAgentInstallAdoptsThePodLogTree(t *testing.T) {
 			for _, e := range tc.extra {
 				f.putOwned(e.path, e.uid, e.gid, e.mode, EntryRegular)
 			}
-			// No --token-file: B327's shape is a reinstall over a node that has
+			// No --token-file: the shape is a reinstall over a node that has
 			// already joined and already run pods. The server row is the same
 			// reinstall one role up — a single-node control plane that has run
 			// pods of its own.

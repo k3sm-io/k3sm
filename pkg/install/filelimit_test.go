@@ -35,7 +35,7 @@ const (
 	maxFilesPerProc8GB  = 10240
 )
 
-// TestServerFileLimitDeploymentUX is the B405 gate: the operator-visible side of
+// TestServerFileLimitDeploymentUX pins this contract: the operator-visible side of
 // serverFileLimit. The kernel allocates a process at most kern.maxfilesperproc
 // descriptors whatever launchd granted it, and launchd binds a changed limit
 // only on bootout→bootstrap; install has to say both out loud, for both node

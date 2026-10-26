@@ -33,7 +33,7 @@ import (
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
-// TestLogsOfTerminatedVMPodSurviveRestart is the B539 gate: after a node-daemon
+// TestLogsOfTerminatedVMPodSurviveRestart pins that after a node-daemon
 // restart, `kubectl logs` on a TERMINATED pod the apiserver still holds reads
 // its retained log file, as the kubelet does, instead of answering NotFound.
 //

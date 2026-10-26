@@ -26,7 +26,7 @@ import (
 	"k3sm.io/apis/config/crd"
 )
 
-// TestEnsuresInterconnectCRD is the B524 gate for the Interconnect CRD: the
+// TestEnsuresInterconnectCRD pins this contract for the Interconnect CRD: the
 // server's resolver hands this package crd.InterconnectCRD() beside the CRDs it
 // already ensures (MeshPeer, MLXModel), and the ensure must apply exactly that
 // manifest, wait for Established, and leave the shape the resolver and the

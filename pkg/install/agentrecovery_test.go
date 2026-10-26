@@ -119,7 +119,7 @@ func TestVerifyAgentJoinedAcceptsARecoveredStart(t *testing.T) {
 			// (b) The same failure with nothing behind it: no live daemon, so
 			// no recovery, and the budget runs out on the failure itself.
 			//
-			// HONESTY: this row passes on the pre-B332 code too — that code
+			// HONESTY: this row passes on the earlier code too — that code
 			// failed the install on the first sight of the entry, which is also
 			// a failure naming it. It is here to pin the MESSAGE (the count,
 			// the detail, the log, the remedy) across the rewrite, not to prove

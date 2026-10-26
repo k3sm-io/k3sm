@@ -444,7 +444,7 @@ func (n *leaseNode) published(t *testing.T, podID string) string {
 	return cfg.PodIP.String()
 }
 
-// TestGuestLeaseFeedsTransportOverride is the B237 named gate for the consumer
+// TestGuestLeaseFeedsTransportOverride pins the consumer
 // half of the guest-lease chain: the provider reads a vm pod's
 // PodStatus.guest_transport_address off runtimed's status stream and maintains
 // the Service proxy's published-/32 -> live-lease override map across the whole
@@ -576,7 +576,7 @@ func TestGuestLeaseFeedsTransportOverride(t *testing.T) {
 	t.Run("the real routing table is the sink", func(t *testing.T) {
 		t.Parallel()
 		// darwin-net's table exposes no reader for its override map, so the
-		// assertion available from outside that package is the BINDING: the real
+		// assertion available from outside that package is the binding: the real
 		// type is accepted as the sink and takes the feed's whole lifecycle. The
 		// override's effect on the dial is proven inside darwin-net
 		// (TestTransportOverrideDialTarget), against the same setter.
@@ -626,7 +626,7 @@ func portedVMPod(ns, name string) *corev1.Pod {
 	return pod
 }
 
-// TestTransportFeedPublishesDeclaredPorts is the B440 named gate for the k3sm
+// TestTransportFeedPublishesDeclaredPorts pins the k3sm
 // half of the published-address relay: every override the provider publishes
 // carries the vm pod's declared TCP container ports, canonical (sorted,
 // de-duplicated), so the node's relay listens on exactly those; and the feed
@@ -636,7 +636,7 @@ func portedVMPod(ns, name string) *corev1.Pod {
 // WHY IT IS NOT VACUOUS. The ports asserted are derived from a pod spec the
 // test wrote untidily (order, a duplicate, UDP, a plain init container), so a
 // feed that copied the spec verbatim, kept UDP, or read only the first container
-// fails; the key is the /32 the node's own pool drew, as in the B237 gate.
+// fails; the key is the /32 the node's own pool drew, as in TestGuestLeaseFeedsTransportOverride.
 func TestTransportFeedPublishesDeclaredPorts(t *testing.T) {
 	t.Parallel()
 

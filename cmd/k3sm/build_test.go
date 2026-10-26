@@ -50,7 +50,7 @@ func mkfifo(t *testing.T, path string) {
 	}
 }
 
-// TestCopyOnlyDockerfileBuild is B118's acceptance gate. It proves, in one test:
+// TestCopyOnlyDockerfileBuild is the acceptance gate. It proves, in one test:
 //
 //   - the Dockerfile subset parse table — every accepted verb, the RUN rejection
 //     (whose message must name the vm-backed builder), the known-but-unsupported
@@ -812,11 +812,11 @@ func testOutputSinks(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "img.tar")
 		if err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        "example.com/app:v1",
+			tag:        "app:v1",
 			output:     out,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuildWith(recordInStore), noStore, noPush); err != nil {
+		}, io.Discard, engineBuildWith(noStore), noStore, noPush); err != nil {
 			t.Fatalf("build: %v", err)
 		}
 		img, err := tarball.ImageFromPath(out, nil)
@@ -837,11 +837,11 @@ func testOutputSinks(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "layout")
 		if err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
-			tag:        "example.com/app:v1",
+			tag:        "app:v1",
 			output:     out,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuildWith(recordInStore), noStore, noPush); err != nil {
+		}, io.Discard, engineBuildWith(noStore), noStore, noPush); err != nil {
 			t.Fatalf("build: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(out, "index.json")); err != nil {
@@ -864,8 +864,8 @@ func testOutputSinks(t *testing.T) {
 		}
 		out := filepath.Join(t.TempDir(), "img.tar")
 		err := buildWith(t.Context(), buildOptions{
-			dockerfile: bad, tag: "example.com/app:v1", output: out, format: "docker", contextDir: ctxDir,
-		}, io.Discard, engineBuildWith(recordInStore), noStore, noPush)
+			dockerfile: bad, tag: "app:v1", output: out, format: "docker", contextDir: ctxDir,
+		}, io.Discard, engineBuildWith(noStore), noStore, noPush)
 		if !errors.Is(err, oci.ErrBadInstruction) {
 			t.Fatalf("build = %v, want ErrBadInstruction", err)
 		}

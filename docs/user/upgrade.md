@@ -13,13 +13,17 @@ release, or, before the first stable release exists, the newest release of any k
 release tag, when it was published, the Kubernetes version it ships when its release notes say, the
 version of the `k3sm` binary you ran, and every node of the cluster with the version its kubelet
 reports, marked `current`, `behind`, or `ahead` (newer than the latest release, such as a build of
-a tag not yet published). A node whose kubelet reports no tagged k3sm release (no k3sm version, a
-development build, or a build from a modified tree) is `unknown`. It
-only reads; it downloads and installs nothing. It exits 0 when the check finished and 1 when it
+a tag not yet published). A build of an untagged commit, whose version is a Go pseudo-version such
+as `v0.1.8-0.20261025152241-96fbff948562`, ranks by the release it leads up to: it is `ahead` of
+v0.1.7, `behind` v0.1.8, and is shown as an untagged build, for example `ahead, untagged build of
+0.1.8`. A node whose kubelet reports no k3sm version, a development build, or a build from a
+modified tree is `unknown`. It only reads; it downloads and installs nothing. It exits 0 when the check finished and 1 when it
 could not (GitHub unreachable, for example), with the reason on stderr.
 
 The same check feeds the `update` row of `k3sm status` on a server. The server runs it at most once
-an hour and records the result; `k3sm status` reads that record and never contacts GitHub itself.
+an hour and records the latest release it found; `k3sm status` reads that record and never contacts
+GitHub itself. It compares that release with the `k3sm` binary and the nodes running when you run
+it, so the row is right straight after an in-place upgrade, before the next check.
 The row is `ok` when every node runs the latest release, `behind` (severity `warn`) naming each node
 on an older one, `ahead` when a node runs a newer one and none is behind, and `unknown` when the last
 check could not reach GitHub, when no check is recorded, or when the record is more than 24 hours
@@ -49,7 +53,7 @@ k3sm update cancel                      # stop after the current node
 k3sm update abort                       # recover from a failed step
 ```
 
-`k3sm update apply [--version <tag>] [--drain] [--allow-downgrade] [--signature if-signed|required] [--yes]`
+`k3sm update apply [--version <tag>] [--drain] [--allow-downgrade] [--signature if-signed|required] [--yes] [--pin-sha256 <digest>]`
 moves the cluster to the latest release, or to the tag `--version` names. It prints the plan
 first: the nodes in the order they will be updated with the version each runs, the target, whether
 nodes are drained, and the signature policy. It then asks for confirmation; `--yes` skips the
@@ -64,6 +68,13 @@ creates the `Update` named `current` that the server's update controller rolls.
   Developer ID build accepts only the same team's signature, an ad-hoc build accepts an ad-hoc
   release. `required` refuses any release without a Developer ID signature. The release's
   checksum is verified under either policy.
+
+- `--pin-sha256 <digest>` binds the roll to one darwin/arm64 archive checksum. It needs
+  `--version` and must run as root. The pin is written to the server before the Update is created,
+  and the update controller refuses the release, before any node is cordoned, unless its checksums
+  file carries exactly this digest.
+- `k3sm update apply --clear-pin` removes that pin and exits. It takes no other flag (except
+  `--yes`) and must run as root.
 
 While an update is in progress, `apply` refuses and names its phase. A finished update
 (`Succeeded`, `Failed` or `Cancelled`) is removed and replaced, so a retry is a new update.
@@ -97,7 +108,7 @@ The k3sm app offers the same update as a menu item and a button, both of which r
 
 ## Single Node
 
-For script (gen-1) installs, re-run the one-liner:
+For script installs, re-run the one-liner:
 
 ```sh
 curl -fsSL https://k3sm.io/install.sh | sh
@@ -123,7 +134,7 @@ Mac, 10240 on an 8 GB one). When it is below the limit k3sm requests, the instal
 the node's UDP Service flow capacity drops toward its floor. `sudo sysctl -w kern.maxfiles=131072
 kern.maxfilesperproc=131072` raises it until the next reboot.
 
-> **The k3sm app** is a second upgrade channel: a signed, notarized download from k3sm.io that updates itself.
+> **The k3sm app** is a second upgrade channel: a signed, notarized download from k3sm.io. It does not look for a newer version of itself yet: a new version is a new download from the release page.
 
 ## Multi-Node Rolling Upgrade
 
@@ -250,6 +261,9 @@ install again with another `--update-release-base` to change it.
   it. If that matters for a workload (a database, for example), drain or scale down its `vm` Pods
   before you upgrade or roll back. Native Pods are recreated the same way. See
   [what survives a restart](limitations.md#what-survives-a-node-daemon-restart).
+- Relabel registry push namespaces. A namespace whose `k3sm.io/registry-push` value is not its own
+  name can no longer push from a Pod; run `kubectl label namespace <ns> k3sm.io/registry-push=<ns> --overwrite`.
+  See [the cluster registry](registry.md#pushing-from-inside-a-pod).
 
 ## Upgrading Across a Datastore-Engine Change
 
@@ -366,6 +380,55 @@ provisioned it, while `--kine-port` is per server. A control plane whose servers
 datastore ports would have a policy that names one of them, and a Service on another server's port
 would be admitted by the API and still unreachable from the pods on that server's node. That case
 needs more than one server (see [HA](ha.md)).
+
+## Upgrading Into the One Image Store
+
+From this release the cluster registry is the one place images are stored. `k3sm build`,
+`k3sm image load` and `k3sm image import` record there, and each node's own image store is a pull
+cache. Images you built or loaded under an earlier release are still in that node's store, so the
+upgrade copies them into the registry once.
+
+The server does this by itself on its first start after the upgrade, in the background, as soon as
+its registry is up. It writes to its own registry with the server's own push credential. A worker
+never copies anything on its own: run the copy there by hand, with `sudo`, on that worker. Run it by
+hand on the server too to retry:
+
+```sh
+sudo k3sm image migrate            # copy, then print the report
+sudo k3sm image migrate --report   # print the last report without running
+sudo k3sm image migrate -o json    # the report as JSON
+```
+
+`sudo` is needed because the copy reads the node's image store through the runtime's socket, which
+only root and the k3sm service user can open, as for `k3sm image prune`. On a worker, `--report`
+needs it too, since the journal there is readable by root only; without `sudo` the command stops and
+says so. A copy you run pushes the
+way `k3sm build --push` does: through the push gate, with a builder token minted from your
+kubeconfig, to the server's loopback gate on the server and to the server's cluster address on a
+worker. So on a worker you need the kubeconfig described in
+[Registry: on a worker](registry.md#on-a-worker). Progress is journalled on the node the copy ran on,
+and `k3sm status` shows it on that node without `sudo`.
+
+What it does with each image in the node store:
+
+- **migrated**: pushed to the registry as `registry-k3sm:6450/<repository>:<tag>`. An image you
+  built as `app:dev` lands at `registry-k3sm:6450/app:dev`; a reference that names another registry
+  keeps its repository path (`ghcr.io/org/tool:1.0` lands at `registry-k3sm:6450/org/tool:1.0`).
+- **present**: the registry already held that digest at that tag, so nothing was pushed.
+- **renamed**: the registry already held the tag at a different digest, for example from a build
+  since the upgrade. The registry's image keeps the tag and this node's older image is pushed as
+  `<tag>-k3sm-migrated-<first 12 hex of its digest>`. The report names both.
+- **cache entries left**: the registry the reference names still serves that exact digest (a public
+  image a Pod pulled), so it stays a cache entry and is not copied. A registry that cannot be
+  reached counts as not serving it, and the image is copied.
+- **held (unexportable)**: the node store could not export it. It stays in the node store and keeps
+  running Pods there until you load it again.
+
+The migration never deletes anything from a node store and never changes its records, so rolling
+back to the previous release finds every image where it was. It is resumable: progress is journalled
+under the work dir (`image-migration/journal.json`) after each image, a re-run skips images the
+registry already holds at their digest, and an interrupted run continues where it stopped. A digest-only
+reference (`repo@sha256:...`) has no tag to keep and lands as `<repository>:k3sm-migrated-<12 hex>`.
 
 ## Rollback
 

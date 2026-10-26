@@ -32,8 +32,9 @@ limitations under the License.
 //     bytes;
 //   - encryption at rest, rotation, listing, deletion, and re-wrapping every
 //     entry under a new master key;
-//   - the operator verbs `sudo k3sm keys put|list|show|rotate|rm|rewrap|deliver`,
-//     which never print a value unless asked with --reveal;
+//   - the operator verbs `sudo k3sm keys put|list|show|rotate|rm|rewrap|deliver`
+//     (planned, not yet present), which will never print a value unless asked
+//     with --reveal;
 //   - a control-plane reconciler, in the style of pkg/addons, that writes one
 //     labelled Secret per declared target, refuses delivery while secrets
 //     encryption is off unless the operator overrides that explicitly, and

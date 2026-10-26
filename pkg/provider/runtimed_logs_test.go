@@ -104,8 +104,8 @@ func criLine(ts time.Time, stream, tag, content string) string {
 	return ts.Format("2006-01-02T15:04:05.000000000Z07:00") + " " + stream + " " + tag + " " + content + "\n"
 }
 
-// TestContainerLogsReadFromLogPath is the B282 gate, and the SUCCESSOR to B163's
-// TestContainerLogOptsForwarded.
+// TestContainerLogsReadFromLogPath pins on-disk container logs, and is the
+// SUCCESSOR to TestContainerLogOptsForwarded.
 //
 // That test asserted every `kubectl logs` option reached the runtime as a field
 // on a GetLogsRequest. The contract has moved: the node is the kubelet now, so

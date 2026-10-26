@@ -41,7 +41,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// The M10.2 imagePullSecrets criterion.
+// The imagePullSecrets criterion.
 //
 // WHAT IT PROVES. A pod naming a kubernetes.io/dockerconfigjson Secret in
 // imagePullSecrets pulls a private image from a registry that refuses
@@ -103,7 +103,7 @@ import (
 // Not covered, stated rather than scanned:
 //
 //   - files the node keeps outside the pod rootfs (runtimed's own state and
-//     image store), which the M2.6 unit tests for the pull path cover (the
+//     image store), which the unit tests for the pull path cover (the
 //     credential is confined to the fetch transport and never written);
 //   - the k3sm server, provider and runtimed daemon logs, which the test
 //     neither locates nor reads (where they land depends on how the node was
@@ -137,7 +137,7 @@ func TestM10_ImagePullSecret(t *testing.T) {
 	node := pullSecretNode(t, c)
 	suffix := runSuffix(t)
 	ns := "b80-" + suffix
-	sentinel := "B80-SENTINEL-" + randomHex(t, 8)
+	sentinel := "PULLPROBE-SENTINEL-" + randomHex(t, 8)
 
 	// The strings that must never surface. The username is not among them: it
 	// is not a secret, and the dockerconfigjson Secret object names it anyway.
@@ -262,10 +262,10 @@ func TestM10_ImagePullSecret(t *testing.T) {
 	if !strings.Contains(out, sentinel) {
 		t.Fatalf("log lacks the run sentinel %s; the pulled binary did not run:\n%s", sentinel, out)
 	}
-	if !strings.Contains(out, "B80-CONFIDENTIALITY clean") || strings.Contains(out, "B80-LEAK") {
+	if !strings.Contains(out, "PULLPROBE-CONFIDENTIALITY clean") || strings.Contains(out, "PULLPROBE-LEAK") {
 		t.Fatalf("the in-pod scan found a credential or did not finish:\n%s", out)
 	}
-	if m := regexp.MustCompile(`B80-SCAN files=(\d+)`).FindStringSubmatch(out); m == nil || m[1] == "0" {
+	if m := regexp.MustCompile(`PULLPROBE-SCAN files=(\d+)`).FindStringSubmatch(out); m == nil || m[1] == "0" {
 		t.Fatalf("the in-pod rootfs scan read no file, so it proves nothing:\n%s", out)
 	}
 	// Every file under the rootfs must have been READ, not passed over: a file
@@ -273,8 +273,8 @@ func TestM10_ImagePullSecret(t *testing.T) {
 	// file whose content was never searched. The fixture image holds one file,
 	// the probe binary (a few MiB), so a nonzero count means the pod's tree
 	// holds something the scan could not vouch for, which fails the criterion.
-	if m := regexp.MustCompile(`B80-SCAN files=\d+ bytes=\d+ skipped=(\d+)`).FindStringSubmatch(out); m == nil || m[1] != "0" ||
-		strings.Contains(out, "B80-UNREADABLE") || strings.Contains(out, "B80-SKIPPED") {
+	if m := regexp.MustCompile(`PULLPROBE-SCAN files=\d+ bytes=\d+ skipped=(\d+)`).FindStringSubmatch(out); m == nil || m[1] != "0" ||
+		strings.Contains(out, "PULLPROBE-UNREADABLE") || strings.Contains(out, "PULLPROBE-SKIPPED") {
 		t.Fatalf("the in-pod rootfs scan skipped or could not read some files, so their content is unsearched:\n%s", out)
 	}
 	t.Logf("in-pod confidentiality scan:\n%s", out)

@@ -39,7 +39,7 @@ func testNetserve(t *testing.T) *netserve.Server {
 	})
 }
 
-// TestVMDatapathWiring is the B237 wiring gate for the cmd half of the guest-lease
+// TestVMDatapathWiring is the wiring gate for the cmd half of the guest-lease
 // chain: the node-local datapath must be told this node's vm posture, and the
 // in-process node must be given the Server to publish vm-pod transport overrides
 // into. Neither is derivable later — netserve is constructed steps BEFORE the VK

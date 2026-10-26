@@ -33,7 +33,7 @@ import (
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
-// The control-plane version marker (B395). The four kwok-ci/k8s binaries used to be
+// The control-plane version marker. The four kwok-ci/k8s binaries used to be
 // provisioned on presence alone, so a binary-only upgrade that moved
 // DefaultKubeVersion kept serving the previous release's apiserver with nothing in
 // the log, the status report, or the crash record. These tests pin the marker
@@ -151,7 +151,7 @@ func TestKubeMarkerParse(t *testing.T) {
 	})
 }
 
-// TestSeedBinDirRestagesStaleControlPlaneBinaries is the B395 gate: a workdir whose
+// TestSeedBinDirRestagesStaleControlPlaneBinaries pins this contract: a workdir whose
 // marker names an older release, beside a payload whose marker vouches for the
 // target, gets the WHOLE set from the payload and a marker vouching for the target.
 func TestSeedBinDirRestagesStaleControlPlaneBinaries(t *testing.T) {
@@ -401,14 +401,14 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 		return nil, os.WriteFile(cmd.Args[slices.Index(cmd.Args, "-o")+1], []byte("pretend-etcd"), 0o755)
 	}
 
-	fakeHelmRelease(t, helmTarball(t, map[string]string{helmchart.HelmTarballMember: "pretend-helm"}), "")
+	fakeHelmBuild(t, "pretend-helm")
 	origZot := stageZot
 	t.Cleanup(func() { stageZot = origZot })
 	stageZot = func(_ context.Context, dir string) error {
 		if err := os.WriteFile(registrysvc.ZotPath(dir), []byte("pretend-zot"), 0o755); err != nil {
 			return err
 		}
-		return os.WriteFile(filepath.Join(dir, registrysvc.ZotMarkerName), []byte(registrysvc.DefaultZotVersion+" minimal\n"), 0o644)
+		return os.WriteFile(filepath.Join(dir, registrysvc.ZotMarkerName), []byte(registrysvc.DefaultZotVersion+" minimal+r1\n"), 0o644)
 	}
 
 	dest := filepath.Join(t.TempDir(), "payload")
@@ -428,7 +428,7 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 		t.Errorf("VerifyPayloadSet(staged payload) = %v", err)
 	}
 	if got, err := os.ReadFile(helmchart.HelmPath(dest)); err != nil || string(got) != "pretend-helm" {
-		t.Errorf("payload helm = %q, %v; want the verified tarball's binary", got, err)
+		t.Errorf("payload helm = %q, %v; want the built binary", got, err)
 	}
 }
 

@@ -82,7 +82,7 @@ func TestBuildNoRecordNeverDialsStore(t *testing.T) {
 				pusher := &recordingPush{log: &log}
 				var summary bytes.Buffer
 				if entry == "buildWith" {
-					err = buildWith(t.Context(), o, &summary, engineBuildWith(recordInStore), store.record, pusher.push)
+					err = buildWith(t.Context(), o, &summary, engineBuildWith(noStore), store.record, pusher.push)
 				} else {
 					err = buildRecorded(t.Context(), nil, o, &summary, engineBuildWith, store.record, pusher.push)
 				}
@@ -132,7 +132,7 @@ func TestBuildNoRecordNeverDialsStore(t *testing.T) {
 
 	t.Run("without the flag the store is still recorded", func(t *testing.T) {
 		ctxDir := writeCtx(t, "FROM scratch\nCOPY app /app")
-		o, err := parseBuildArgs([]string{"-t", "example.com/app:v1", ctxDir}, io.Discard)
+		o, err := parseBuildArgs([]string{"-t", "app:v1", ctxDir}, io.Discard)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}

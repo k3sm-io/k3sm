@@ -102,9 +102,9 @@ write into it.
 
 ## Install Channels
 
-k3sm's distribution ships in three generations, listed in shipping order:
+k3sm ships through three channels, listed in shipping order:
 
-1. **The install script (gen 1, first to ship):**
+1. **The install script (first to ship):**
 
    ```sh
    curl -fsSL https://k3sm.io/install.sh | sh
@@ -113,19 +113,20 @@ k3sm's distribution ships in three generations, listed in shipping order:
    The script preflights (Apple silicon, macOS 26+), downloads the release tarball and its
    checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do,
    and then runs `sudo k3sm install`. The verification checks **same-origin integrity**, meaning
-   the tarball matches the checksums published beside it. It does not check publisher identity;
-   provenance (Developer ID + notarization) arrives with gen 3. Environment variables set the
+   the tarball matches the checksums published beside it. It does not check publisher identity.
+   Publisher identity comes from the other two channels: the app download is Developer ID signed
+   and notarized, and so is the `.pkg`. Environment variables set the
    options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
    unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
-   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh` (v0.1.7 is the release you are on
+   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.2.0 sh` (v0.2.0 is the release you are on
    today, so a repair pins the newest tag and never an older one; the [releases page](https://k3sm.io/releases/) lists every version you can pin).
    `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
    one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
 
-2. **The k3sm app,** a signed, notarized download from k3sm.io that updates itself (see [Installing From k3sm.app](#installing-from-k3smapp)).
+2. **The k3sm app,** a signed, notarized download from k3sm.io (see [Installing From k3sm.app](#installing-from-k3smapp)).
 
-3. **Notarized `.pkg` (gen 3)** is a signed, stapled installer package for offline and managed
+3. **Notarized `.pkg`** is a signed, stapled installer package for offline and managed
    installs.
 
 > **Status:** pre-release builds are published; the script resolves the newest one, and a pin
@@ -259,7 +260,7 @@ Every listener a node opens, and the addresses it binds:
 | apiserver (server) | `6444` (`--api-port`) | `127.0.0.1` on a single server; the mesh address only on a server with `--mesh-ip` |
 | worker join (server with `--mesh-ip`) | `9345` | every interface, because a joining worker has no mesh yet; every request needs the cluster join token |
 | embedded etcd peer (HA servers) | `--etcd-peer-port` | the `--etcd-peer-ip` address you name; peers need a peer certificate |
-| ingest registry (opt-in, `--registry-port`) | the chosen port | `127.0.0.1`, plus a relay on the mesh address and the `vm` NAT gateway |
+| image registry (on by default; `--registry-port`, 0 turns it off) | 6450, or the chosen port | `127.0.0.1`, plus an HTTPS relay on the mesh address and the `vm` NAT gateway |
 | cluster DNS and ClusterIP Services | Service ports | their virtual IPs, aliased on `lo0` |
 | datastore, scheduler, controller-manager (server) | their own ports | `127.0.0.1` |
 

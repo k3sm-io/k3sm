@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k3sm B262 acceptance gate — the crash-loop circuit breaker (k3sm#344).
+# k3sm crash-loop breaker acceptance gate — the crash-loop circuit breaker (k3sm#344).
 #
 # After #336 a dead control-plane child takes `k3sm server` down and launchd's
 # KeepAlive brings it back. A PERSISTENT fault made that a loop with no throttle,
@@ -36,14 +36,14 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 run() { ( cd "$K3SM_ROOT" && go test -count=1 -run "$2" "$1" >/dev/null 2>&1 ) && echo ok || echo no; }
 
-echo "==> k3sm B262 acceptance (crash-loop circuit breaker: record, park, one answer, status)"
+echo "==> k3sm crash-loop breaker acceptance (crash-loop circuit breaker: record, park, one answer, status)"
 
 b0=ok
 [ -f "$SELF" ] && bash -n "$SELF" || b0=no
 for f in pkg/executor/crashloop.go cmd/k3sm/crashloop.go pkg/status/crashloop.go; do [ -f "$K3SM_ROOT/$f" ] || b0=no; done
 ladder "$b0" "b262.0  gate parses (bash -n) + the three breaker sources exist"
 if [ "$b0" != ok ]; then
-	echo "B262: $PASS passed, $FAIL failed" >&2
+	echo "crash-loop breaker: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -53,5 +53,5 @@ ladder "$(run ./cmd/k3sm/ '^(TestRunServerHasOneAnswerOnFatalFaults|TestServerMe
 ladder "$(run ./pkg/status/ '^(TestClassifyCrashLoop|TestApplyCrashLoop|TestCollectorServerRowReadsTheCrashRecord)')" "b262.4  pkg/status: parked FAIL + remedy, restarting WARN, unreadable noted, detail never quoted"
 
 echo "----------------------------------------"
-echo "B262: $PASS passed, $FAIL failed"
+echo "crash-loop breaker: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

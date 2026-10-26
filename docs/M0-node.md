@@ -26,7 +26,7 @@ Proves the k3sm runtime end to end: a Kubernetes Pod, applied with `kubectl`, ru
 **Known gap:** `kubectl logs`/`exec` over the apiserver→node proxy need the node served over
 **TLS** with an IP-preferred address (the apiserver currently dials the node by hostname over
 HTTPS → `lookup k3sm-m0: no such host`). The on-disk log works today; wiring the kubelet
-serving cert + `--kubelet-preferred-address-types=InternalIP` is an M0.3/M2 follow-up.
+serving cert + `--kubelet-preferred-address-types=InternalIP` is a later follow-up.
 
 ## Run it
 ```sh
@@ -57,7 +57,7 @@ kubectl --kubeconfig "$KCFG" delete pod hello-native
 ```
 
 ## Next
-- M0.3: kubelet-serving TLS so `kubectl logs/exec` work via the apiserver proxy; scheduler-based
+- Kubelet-serving TLS so `kubectl logs/exec` work via the apiserver proxy; scheduler-based
   placement + the provider taint + the `os=darwin` admission policy (so it's not nodeName-pinned).
 - M2: move execution into `runtimed` (gRPC), add the Seatbelt default-deny profile + userspace
   resource limits.

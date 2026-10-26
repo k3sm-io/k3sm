@@ -233,7 +233,7 @@ func mountOnce(ctx context.Context, deps Deps, fsys dataroot.FS, rec dataroot.Re
 //
 // Every step is idempotent, which is what lets both of MountRecorded's paths
 // call it. The fast path needs it because a volume can be mounted without ever
-// having been marked -- the rig's own volume was, mounted from /etc/fstab
+// having been marked -- a development machine's own volume was, mounted from /etc/fstab
 // years before k3sm had a record -- and an adoption that returned early left
 // no marker, so the next Ensure could not recognise its own volume.
 //

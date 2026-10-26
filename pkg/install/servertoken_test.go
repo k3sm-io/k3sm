@@ -43,7 +43,7 @@ func legacyServerPlist(cfg Config, token string) []byte {
 	})
 }
 
-// TestServerPlistCarriesNoToken is the gate for B249: the control plane's
+// TestServerPlistCarriesNoToken pins this contract: the control plane's
 // static admin token must not be on the server LaunchDaemon's argv.
 //
 // The token authenticates as system:masters. Rendered as a value, it was

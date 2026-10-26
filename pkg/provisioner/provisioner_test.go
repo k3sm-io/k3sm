@@ -31,10 +31,10 @@ import (
 	storagev1 "k3sm.io/apis/storage/v1"
 )
 
-// M3.2 APFS local-path provisioner. These unit tests prove the controller logic
+// APFS local-path provisioner. These unit tests prove the controller logic
 // and the StorageClass/PV shapes against a fake apiserver (no root, no real FS);
 // the live "write data → restart → same data" persistence run is the M3 two-Mac
-// lab e2e (the M3.2-a1 acceptance gate).
+// lab e2e (the acceptance gate).
 
 // testRoot is a RESOLVED storage root under an unprivileged _k3sm home — NOT the
 // root-only storagev1.DefaultBasePath — so the tests exercise ClassForRoot's
@@ -72,7 +72,7 @@ func boundPVC(ns, name, uid, node string) *corev1.PersistentVolumeClaim {
 	return pvc
 }
 
-// TestProvisionerCreatesPVForBoundPVC asserts the core M3.2-a1 reconcile: a PVC
+// TestProvisionerCreatesPVForBoundPVC asserts the core reconcile: a PVC
 // the scheduler has placed yields a PV with a UID-derived name, Retain reclaim,
 // the advisory path on the resolved root, nodeAffinity pinned to the selected
 // node, the requested capacity, and a ClaimRef pre-binding it to the PVC. It also

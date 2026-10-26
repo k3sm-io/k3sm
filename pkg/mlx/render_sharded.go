@@ -156,7 +156,7 @@ const (
 //
 // Its COST is a real one-token generation every minute: one forward pass of
 // the whole sharded model across every rank, plus a collective round trip.
-// M17-lab records that cost on the rig beside the tokens/s figure; if it is too
+// A hardware run records that cost beside the tokens/s figure; if it is too
 // costly the cadence is a recorded open question, not a silent gap. The timeout
 // is generous because the forward pass runs behind whatever requests are
 // already in flight. A server that has not opened its listener yet (still

@@ -1,0 +1,4 @@
+# Module graph lock for hack/verify-deps.sh (fixture: the zot wrapper graph).
+example.com/old v1.2.3 # @OLD@
+example.com/zchild v0.3.0 # @OLD@
+example.com/zyoung v0.1.0 # @RECENT@

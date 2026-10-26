@@ -25,12 +25,12 @@ import (
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
-// TestNodeVMArtifactsLabel is the advertisement half of B108: the
+// TestNodeVMArtifactsLabel is the advertisement half of the guest-artifact join: the
 // VMArtifactsAvailable capability reaches the node object as
 // k3sm.io/vm-artifacts, present ONLY when this daemon start ensured and verified
 // the pinned guest boot artifacts.
 //
-// It mirrors TestNodeVirtualizationLabel (the B1 precedent) because it must obey
+// It mirrors TestNodeVirtualizationLabel (the precedent) because it must obey
 // the same presence-only, DELETE-on-loss discipline, and the delete direction is
 // the one that matters most here: ensure re-verifies on EVERY start rather than
 // trusting a marker file, so "this node had artifacts yesterday" is not a claim

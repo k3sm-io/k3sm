@@ -46,7 +46,7 @@ func foreignConfig(name string) *clientcmdapi.Config {
 	return c
 }
 
-// TestInstallKubeconfigContextName pins B512: --kubeconfig-name is parsed,
+// TestInstallKubeconfigContextName pins that --kubeconfig-name is parsed,
 // recorded with the other install arguments, read back by the lookups, and
 // is the name the merge uses, with foreign entries refused.
 func TestInstallKubeconfigContextName(t *testing.T) {

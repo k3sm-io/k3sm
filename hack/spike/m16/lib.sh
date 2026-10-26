@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
-# Shared plumbing for the M16.0 spikes (s0.sh … s4.sh) and for run.sh, which chains
-# them. The M16 plan's §M16.0 is what each rung answers; docs/PHASES.md M16.0-d1…d5
-# is the ledger row each one discharges.
+# Shared plumbing for the M16 spikes (s0.sh … s4.sh) and for run.sh, which chains
+# them. Each rung answers one question of the M16 spike.
 #
-# The spikes run on the M16 RIG, not on the workstation: the rig is a laptop Mac
+# The spikes run on the M16 RIG, not on the workstation: the lab host is a laptop Mac
 # running its OWN single-node `k3sm server`, so the fleet shares a node with its
 # apiserver (cross-node vm traffic is out of scope) and the workstation's cluster is
 # never touched. Each s<N>.sh is a DRIVER — it ships a rig-side payload over ssh and
-# runs it under the guardrails recorded in docs/PHASES.md M16.0:
+# runs it under the guardrails recorded in docs/PHASES.md M16 spike:
 #
 #   * every write confined to $PREFIX (default ~/k3sm-spike-m16) or /tmp scratch;
 #   * never /Library/Sandbox/Profiles, the TCC/Privacy DB, Gatekeeper/SIP state,
 #     or any LaunchDaemon;
-#   * no sudo and no root — nothing in M16.0 needs privilege;
+#   * no sudo and no root — nothing in M16 spike needs privilege;
 #   * every Kubernetes object created in the spike namespace and deleted at the end
 #     of the rung that made it; the M8 MLXModel and its PVC are never touched;
-#   * any halt lands the plan's PRE-DECIDED substitution in the findings file, and
+#   * any halt lands the spike's PRE-DECIDED substitution in the findings file, and
 #     no rung improvises a new one.
 #
 # Usage (from a k3sm checkout):
@@ -31,10 +30,10 @@
 # THE EXIT CONTRACT (defined here, ONCE — every s<N>.sh and run.sh obey it)
 #
 #   0  PASS      every required criterion of the rung reached a verdict, and passed.
-#   1  FAIL      at least one required criterion failed. The plan's halt for that
+#   1  FAIL      at least one required criterion failed. The spike's halt for that
 #                criterion applies, and its substitution is pre-decided.
 #   2  RECORDED  nothing failed, but the rung produced only measurements and no
-#                verdict. This is NOT a green M16.0: a measurement without a verdict
+#                verdict. This is NOT a green M16 spike: a measurement without a verdict
 #                cannot discharge a ledger row, and the acceptance asks for exit 0.
 #
 # A rung that both passes a criterion and records figures exits 0 — recording is
@@ -52,7 +51,7 @@ PREFIX="${K3SM_M16_PREFIX:-\$HOME/k3sm-spike-m16}"   # expanded rig-side, delibe
 NS="${K3SM_M16_NAMESPACE:-k3sm-m16-spike}"
 RIG_KUBECONFIG="${K3SM_M16_KUBECONFIG:-\$HOME/.kube/config}"   # expanded rig-side
 
-# The engine and model pins. The model class is R16's budget decision: on 8 GiB this
+# The engine and model pins. The model class is a budget decision: on 8 GiB this
 # is the only class that fits TWO engines beside the control plane. The revision is
 # the same one hack/acceptance/m8.sh pins, so S0(2) and the M8 baseline it is
 # compared against are the same weights.
@@ -62,7 +61,7 @@ MODEL_REV="${K3SM_M16_MODEL_REV:-73e3e38d981303bc594367cd910ea6eb48349da8}"
 
 # The upstream serving framework (Apache-2.0), named here as a compatibility fact.
 # S1 resolves UPSTREAM_REF to a commit and RECORDS it — that resolved sha is the pin
-# the plan's R2 promotes, so nothing here hard-codes one it has not verified.
+# we promote, so nothing here hard-codes one it has not verified.
 UPSTREAM_REPO="${K3SM_M16_UPSTREAM_REPO:-https://github.com/ai-dynamo/dynamo.git}"
 UPSTREAM_REF="${K3SM_M16_UPSTREAM_REF:-main}"
 RUST_TOOLCHAIN="${K3SM_M16_RUST_TOOLCHAIN:-1.90.0}"
@@ -85,7 +84,7 @@ spike_verdict() {
 	echo
 	echo "==== $1: $PASSES passed, $FAILS failed, $RECORDS recorded ===="
 	if [ "$FAILS" -gt 0 ]; then
-		echo "$1: FAIL — the plan's halt for the failed criterion applies; land its pre-decided substitution in findings-$(echo "$1" | tr 'A-Z' 'a-z').md"
+		echo "$1: FAIL — the spike's halt for the failed criterion applies; land its pre-decided substitution in findings-$(echo "$1" | tr 'A-Z' 'a-z').md"
 		exit 1
 	fi
 	if [ "$PASSES" -eq 0 ]; then
@@ -100,7 +99,7 @@ spike_verdict() {
 # rung's question, method and halt and exits 0 WITHOUT reading K3SM_M16_HOST, so the
 # shape of the ladder is reviewable with no rig attached.
 spike_plan() {
-	echo "==> k3sm M16.0 spike $1 — PLAN ONLY (nothing is contacted, nothing is written)"
+	echo "==> k3sm M16 spike $1 — PLAN ONLY (nothing is contacted, nothing is written)"
 	echo
 	echo "question"
 	printf '  %s\n' "$2"
@@ -130,7 +129,7 @@ spike_require_pin() {
 	eval "val=\${$var:-}"
 	if [ -z "$val" ]; then
 		echo "FAIL      $var is unset — $what" >&2
-		echo "          Set it from the mirror (the plan's R12) or, until the mirror push lands, from the upstream registry BY DIGEST. Never a tag." >&2
+		echo "          Set it from the mirror (the mirror) or, until the mirror push lands, from the upstream registry BY DIGEST. Never a tag." >&2
 		exit 1
 	fi
 }
@@ -152,7 +151,7 @@ run_timeout() {
 }
 
 # verdict PASS|FAIL <text> / recorded <text> — the ONLY way a payload reports. The
-# driver scans for these tokens, so a rung's verdict is data the rig produced, never
+# driver scans for these tokens, so a rung's verdict is data the lab host produced, never
 # the driver's reading of a log.
 verdict()  { echo "VERDICT $1 $2"; }
 recorded() { echo "RECORD $*"; }
@@ -268,12 +267,12 @@ spike_preflight() {
   command -v python3 >/dev/null || { echo "SPIKE PREFLIGHT FAIL: python3 not found"; missing=1; }
   [ -r "$KUBECONFIG_RIG" ] || { echo "SPIKE PREFLIGHT FAIL: no kubeconfig at $KUBECONFIG_RIG"; missing=1; }
   [ "$missing" -eq 0 ] || exit 1
-  kc get --raw /healthz >/dev/null || { echo "SPIKE PREFLIGHT FAIL: the rig's apiserver does not answer /healthz"; exit 1; }
+  kc get --raw /healthz >/dev/null || { echo "SPIKE PREFLIGHT FAIL: the lab host's apiserver does not answer /healthz"; exit 1; }
   echo "preflight ok: $(kubectl version --client -o yaml 2>/dev/null | head -2 | tr '\n' ' ')"
 }
 PREEOF
 
-# lab <<'EOF' — run a heredoc payload on the rig, with the preamble in scope. Its
+# lab <<'EOF' — run a heredoc payload on the lab host, with the preamble in scope. Its
 # output is teed so the transcript keeps the audit trail, and scanned so the
 # payload's own VERDICT/RECORD lines drive the scoreboard.
 lab() {
@@ -292,7 +291,7 @@ lab() {
 		 K3SM_M16_WEBHOOK_CERT=${K3SM_M16_WEBHOOK_CERT:-} K3SM_M16_POD_RUNASUSER=${K3SM_M16_POD_RUNASUSER:-} \
 		 bash -s" 2>&1 | tee "$out" || rc=$?
 	if [ "$rc" != 0 ]; then
-		fail "the rig-side payload exited non-zero (ssh/bash rc=$rc) — read the transcript above before reading the scoreboard"
+		fail "the lab host-side payload exited non-zero (ssh/bash rc=$rc) — read the transcript above before reading the scoreboard"
 	fi
 	spike_scan "$out"
 	rm -f "$out"

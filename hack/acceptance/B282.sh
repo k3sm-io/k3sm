@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 #
-# k3sm B282 acceptance gate — the runnable proof that container logs are kept as
+# k3sm CRI logs acceptance gate — the runnable proof that container logs are kept as
 # rotated CRI FILES ON DISK and served the way a kubelet serves them.
 #
 # The defect: runtimed kept each container's output IN MEMORY only, capped at
-# 256 KiB with oldest-first eviction (B162), wrote nothing to disk, had no
-# rotation, and refused `kubectl logs --previous` as Unimplemented (B163
-# residual). A chatty container's first lines were gone before anyone looked, a
+# 256 KiB with oldest-first eviction, wrote nothing to disk, had no
+# rotation, and refused `kubectl logs --previous` as Unimplemented. A chatty container's first lines were gone before anyone looked, a
 # crashed container's last instance could not be read at all, and no host-level
 # log shipper had anything to read. Upstream's kubelet keeps rotated on-disk
 # files (containerLogMaxSize 10Mi x containerLogMaxFiles 5) and retains the
@@ -28,7 +27,7 @@
 #   manager, log GC, termination-message tail and HTTP handler; runtimed's CRI
 #   writer, two-stream pumps, instance numbering and the pod-logs sandbox deny.
 #   RED BEFORE: on the unmodified tree pkg/provider/podlogs and pkg/crilog do
-#   not exist, so every Go leg fails to build, and B163's superseded gate
+#   not exist, so every Go leg fails to build, and the earlier superseded gate
 #   (TestContainerLogOptsForwarded) is still the thing that passes.
 #
 #   INTEGRATION TIER (K3SM_LAB=1, a dev Mac) — a live `k3sm server` with
@@ -55,7 +54,7 @@ SELF="$HERE/B282.sh"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B282 acceptance (container logs: CRI files on disk, rotated, served as the kubelet serves them)"
+echo "==> k3sm CRI logs acceptance (container logs: CRI files on disk, rotated, served as the kubelet serves them)"
 
 # ---- b282.0 — the gate parses and both halves of the split exist -----------
 b0=ok
@@ -64,15 +63,15 @@ b0=ok
 ladder "$b0" "b282.0  gate parses (bash -n) + k3sm pkg/provider/podlogs present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B282: the gate or the reader package is missing/unparseable — nothing else can run" >&2
-	echo "B282: $PASS passed, $FAIL failed" >&2
+	echo "CRI logs: the gate or the reader package is missing/unparseable — nothing else can run" >&2
+	echo "CRI logs: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
 # ---- b282.pre — the cross-repo precondition --------------------------------
 # The split spans two repos: k3sm reads what runtimed writes. A k3sm-only
 # checkout cannot prove the writer half, and its absence is a hard FAIL rather
-# than a skip — "B282 green" must never mean "half of B282 was not checked".
+# than a skip — "green" must never mean "half of CRI logs was not checked".
 pre=ok
 [ -f "$WS_ROOT/go.work" ] || pre=no
 ladder "$pre" "b282.pre  workspace go.work present ($WS_ROOT/go.work)"
@@ -81,7 +80,7 @@ w=ok
 ladder "$w" "b282.pre  sibling runtimed exports pkg/crilog (the CRI writer this reader reads)"
 if [ "$FAIL" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "B282: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
+	echo "CRI logs: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
 	exit 1
 fi
 
@@ -162,7 +161,7 @@ run_test "b282.2" 5  TestTerminationMessageTailRing    ./pkg/provider/podlogs/
 run_test "b282.2" 20 TestContainerLogsHandlerMatchesKubelet ./pkg/provider/podlogs/
 
 # ---- b282.3 — the PROVIDER wiring (k3sm) -----------------------------------
-# TestContainerLogsReadFromLogPath SUPERSEDES B163's TestContainerLogOptsForwarded:
+# TestContainerLogsReadFromLogPath SUPERSEDES the earlier TestContainerLogOptsForwarded:
 # that gate asserted the options reached the runtime as GetLogsRequest fields;
 # the contract is now that they are applied to the bytes on disk.
 run_test "b282.3" 8 TestContainerLogsReadFromLogPath ./pkg/provider/
@@ -200,7 +199,7 @@ lab_pending() { echo "LAB-PENDING  $1"; }
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "B282 INTEGRATION tier (set K3SM_LAB=1 on a dev Mac to run; no root needed):"
+	echo "INTEGRATION tier (set K3SM_LAB=1 on a dev Mac to run; no root needed):"
 	lab_pending "b282.L0  \`k3sm server --pod-logs-dir <tmp>\` reaches a healthy apiserver"
 	lab_pending "b282.L1  a pod's output lands at <tree>/<ns>_<pod>_<uid>/<container>/0.log in CRI format"
 	lab_pending "b282.L2  a pod writing >10 MiB rotates: 0.log plus a timestamped .gz sibling"
@@ -226,7 +225,7 @@ else
 	if [ ! -f "$LIB" ]; then
 		ladder no "b282.L0  hack/lib/clusterup.sh present (required for the integration tier)"
 		echo "----------------------------------------"
-		echo "B282: $PASS passed, $FAIL failed" >&2
+		echo "CRI logs: $PASS passed, $FAIL failed" >&2
 		exit 1
 	fi
 	# shellcheck source=/dev/null
@@ -241,7 +240,7 @@ else
 	if ! cluster_reset; then
 		ladder no "b282.L0  cluster_reset (free this gate's ports + drop the previous datastore)"
 		echo "----------------------------------------"
-		echo "B282: $PASS passed, $FAIL failed" >&2
+		echo "CRI logs: $PASS passed, $FAIL failed" >&2
 		exit 1
 	fi
 	rm -f "$SERVER_WORKDIR/bin"/*.cstemp
@@ -249,7 +248,7 @@ else
 	# real one), so the gate creates its own at the mode install would use.
 	rm -rf "$LOGTREE"; mkdir -p "$LOGTREE"; chmod 0700 "$LOGTREE"
 	echo "----------------------------------------"
-	echo "B282 INTEGRATION tier: booting a control plane in $B282_WORK with --pod-logs-dir $LOGTREE"
+	echo "INTEGRATION tier: booting a control plane in $B282_WORK with --pod-logs-dir $LOGTREE"
 	# runtimed locates k3sm-execshim next to the k3sm executable or on PATH
 	# (sandbox.FindExecShim); a `go run` binary lives alone in a build cache dir,
 	# so build both into one bin dir and run the server from there.
@@ -472,10 +471,10 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B282: $PASS passed, $FAIL failed"
+echo "CRI logs: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 if [ "${K3SM_LAB:-}" = 1 ]; then
-	echo "================ B282 GREEN (CI + integration tiers) ================"
+	echo "================ CRI logs GREEN (CI + integration tiers) ================"
 else
-	echo "================ B282 GREEN (CI tier) ================"
+	echo "================ CRI logs GREEN (CI tier) ================"
 fi

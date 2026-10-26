@@ -33,13 +33,13 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// B233: UpdatePodDoesNotRematerializeVolumes pins TODAY's contract — runtimed's
+// UpdatePodDoesNotRematerializeVolumes pins TODAY's contract — runtimed's
 // UpdatePod applies labels/annotations only (its updatableOnly check rejects
 // every other field change as NOT_UPDATABLE), and volumes are materialized
 // exactly once, at create: nothing on any path re-resolves ConfigMap, Secret, or
 // projected ServiceAccount-token DATA after creation. This is a
 // CHARACTERIZATION test of that TODAY, not a design requirement — a
-// projected-volume refresh feature (B234) must invert it DELIBERATELY, not by
+// projected-volume refresh feature must invert it DELIBERATELY, not by
 // accident, and this test is exactly what would need to change to do that.
 
 // updateRecordingRuntime is a PLAIN (non-minting) fake runtime — unlike
@@ -117,7 +117,7 @@ func rematerializePod(ns, name string) *corev1.Pod {
 	}
 }
 
-// TestUpdatePodDoesNotRematerializeVolumes pins the PROVIDER half of B233's
+// TestUpdatePodDoesNotRematerializeVolumes pins the PROVIDER half of that
 // contract: an UpdatePod that changes only labels/annotations must reach the
 // runtime with a PodBox that is byte-identical to the one CreatePod sent, save
 // for those two fields, must issue no further CreatePod, and must not mint a
@@ -129,7 +129,7 @@ func rematerializePod(ns, name string) *corev1.Pod {
 // future buildBox change, not that proof.
 func TestUpdatePodDoesNotRematerializeVolumes(t *testing.T) {
 	cs := fake.NewSimpleClientset()
-	// A minimal TokenRequest reactor. It exists ONLY so that the B233 brief's
+	// A minimal TokenRequest reactor. It exists ONLY so that a
 	// fails-before mutation proof (a direct call to resolver.ServiceAccountToken
 	// added temporarily inside UpdatePod) can mint successfully instead of
 	// erroring on an unregistered subresource; it changes nothing about what
@@ -161,7 +161,7 @@ func TestUpdatePodDoesNotRematerializeVolumes(t *testing.T) {
 
 	// Snapshot AFTER the create — resolvePodBoxEnv already ran once for it (with
 	// zero env sources, so it touched nothing) — so every action counted below is
-	// scoped to "between the create and the end of the update", as B233 specifies.
+	// scoped to "between the create and the end of the update", as the contract specifies.
 	cs.ClearActions()
 
 	updated := pod.DeepCopy()
@@ -177,13 +177,13 @@ func TestUpdatePodDoesNotRematerializeVolumes(t *testing.T) {
 	for _, a := range cs.Actions() {
 		if a.GetResource().Resource == "serviceaccounts" {
 			if ca, ok := a.(ktesting.CreateActionImpl); ok && ca.GetSubresource() == "token" {
-				t.Errorf("UpdatePod minted a ServiceAccount token (%s/%s) — volumes must materialize ONLY at create (B233)", a.GetNamespace(), ca.Name)
+				t.Errorf("UpdatePod minted a ServiceAccount token (%s/%s) — volumes must materialize ONLY at create", a.GetNamespace(), ca.Name)
 			}
 			continue
 		}
 		if (a.GetResource().Resource == "configmaps" || a.GetResource().Resource == "secrets") &&
 			(a.GetVerb() == "get" || a.GetVerb() == "list") {
-			t.Errorf("UpdatePod issued a %s on %s in namespace %s — volumes must materialize ONLY at create (B233)", a.GetVerb(), a.GetResource().Resource, a.GetNamespace())
+			t.Errorf("UpdatePod issued a %s on %s in namespace %s — volumes must materialize ONLY at create", a.GetVerb(), a.GetResource().Resource, a.GetNamespace())
 		}
 	}
 

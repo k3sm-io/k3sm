@@ -21,11 +21,11 @@ import (
 	"testing"
 )
 
-// This file asserts M14.2's bring-up WIRING structurally, by reading runServer's
+// This file asserts the server-mesh bring-up WIRING structurally, by reading runServer's
 // trace (servertrace_test.go): runServer's body with its server*.go helpers
 // expanded at their call sites, every pinned call in a straight-line sequence.
 
-// TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener is M14.2 d4's ordering
+// TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener is the ordering
 // pin, and it encodes two distinct reasons:
 //
 //   - BEFORE netserve.New — mesh.Start plumbs the mesh-egress lo0 alias the
@@ -57,7 +57,7 @@ func TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener(t *testing.T) {
 	}
 	for _, name := range required {
 		if _, ok := first[name]; !ok {
-			t.Fatalf("runServer never calls %s — the M14.2 server-mesh wiring is absent (the server would broker a mesh it is not on)", name)
+			t.Fatalf("runServer never calls %s — the server-mesh wiring is absent (the server would broker a mesh it is not on)", name)
 		}
 	}
 
@@ -96,7 +96,7 @@ func TestRunServerSharesOneMeshEnroller(t *testing.T) {
 	}
 }
 
-// TestServerMeshBringUpIsLogAndContinue is M14.2 d7 / R12.
+// TestServerMeshBringUpIsLogAndContinue pins that a mesh-only failure is log-and-continue.
 //
 // The repo's one rule for a fault on this process: unsurvivable faults exit (a
 // dead control-plane child does, and the crash-loop breaker bounds the respawns);
@@ -125,7 +125,7 @@ func TestServerMeshBringUpIsLogAndContinue(t *testing.T) {
 		found = true
 		ast.Inspect(ifStmt.Body, func(m ast.Node) bool {
 			if ret, ok := m.(*ast.ReturnStmt); ok {
-				t.Errorf("runServer RETURNS at %s when the server mesh bring-up fails; a mesh-only defect is survivable and must not take the control plane down (M14.2 d7 requires log-and-continue)",
+				t.Errorf("runServer RETURNS at %s when the server mesh bring-up fails; a mesh-only defect is survivable and must not take the control plane down (a mesh-only failure must log and continue)",
 					tr.where(ret))
 			}
 			return true
@@ -147,7 +147,7 @@ func TestServerMeshBringUpIsLogAndContinue(t *testing.T) {
 	}
 }
 
-// TestServerNetserveWiresTheMeshEgressSource is M14.2 d5.
+// TestServerNetserveWiresTheMeshEgressSource pins the mesh egress source wiring.
 //
 // The proxy's mesh-egress source and the peer mesh-egress /32s the NetworkPolicy
 // table always-allows were BOTH deliberately left unset on the server, because the
@@ -203,11 +203,11 @@ func TestServerNetserveWiresTheMeshEgressSource(t *testing.T) {
 // the second defect the first real --mesh-ip boot exposed.
 //
 // runServer hands --mesh-ip to the executor as the apiserver's BindAddress at step
-// 1, but for M14.2 the only code that ever plumbed that address was mesh.Start —
+// 1, but until the mesh bring-up wiring the only code that ever plumbed that address was mesh.Start —
 // at the mesh bring-up, several phases later. So a mesh IP that is not already a host address
 // dies at `listen tcp 100.64.0.1:6444: bind: can't assign requested address`
 // before any of this file's other pins can even be reached, and the operator has
-// to alias it by hand. The M14.2 lab tier booted --mesh-ip 127.0.0.1, which every
+// to alias it by hand. The lab tier booted --mesh-ip 127.0.0.1, which every
 // host already answers on, so the ordering was never exercised.
 //
 // The ensure must therefore precede BOTH the executor's construction and its

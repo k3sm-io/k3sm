@@ -37,7 +37,7 @@ import (
 
 // The seed-advance gate.
 //
-// B308 made a resuming node fetch the LIVE MeshPeer list before programming its
+// A resuming node now fetch the LIVE MeshPeer list before programming its
 // device, but nothing kept that list: the only writer of node-assignment.json was
 // Save, which a resume feeds from the credential it just loaded (joinResultFrom),
 // so the stored seed was the join-time snapshot written back over itself on every
@@ -150,7 +150,7 @@ func TestAgentResumeAdvancesTheStoredSeed(t *testing.T) {
 			t.Fatalf("bringUpMesh: %v", err)
 		}
 
-		// Read IMMEDIATELY on return, for the same reason B308's gate does: the
+		// Read IMMEDIATELY on return, for the same reason the gate does: the
 		// synchronous return is what node registration follows, so the write must
 		// have happened by then rather than be scheduled behind it.
 		_, cred, err := nodecred.Store{Dir: store.dir}.Status(time.Now())
@@ -178,7 +178,7 @@ func TestAgentResumeAdvancesTheStoredSeed(t *testing.T) {
 
 		assertUntouched(t, "after a successful live list", untouched)
 
-		// The device is still programmed the way B308 requires; persisting the seed
+		// The device is still programmed the way a resume requires; persisting the seed
 		// is an addition to that sequence, not a change to it.
 		if names := peerNames(dev.programmed()); !sameNames(names, [][]string{{"server-0"}, {"server-0", "worker-b"}}) {
 			t.Errorf("programmed %v; want [[server-0] [server-0 worker-b]]", names)

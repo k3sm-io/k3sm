@@ -29,7 +29,7 @@ import (
 // controller-mediated enroll lets a node write ONLY its own MeshPeer, so a node
 // writing a MeshPeer for a DIFFERENT node is rejected (a forged peer over a victim
 // podCIDR would hijack cross-node routing). The guard is permanent — NodeRestriction
-// (M4.1) never covers the net.k3sm.io/MeshPeer CRD, so the write stays server-mediated.
+// never covers the net.k3sm.io/MeshPeer CRD, so the write stays server-mediated.
 func TestMeshPeerWriteGuardOwnNodeOnly(t *testing.T) {
 	if err := bootstrap.AuthorizeMeshPeerWrite("worker-a", "worker-a"); err != nil {
 		t.Errorf("a node writing its OWN MeshPeer must be allowed: %v", err)

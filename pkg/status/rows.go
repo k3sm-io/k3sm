@@ -169,7 +169,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 		}
 		// Whether every node runs the latest release, from the last update
 		// check, on an installed Mac only (there is nothing to update before).
-		if r, ok := c.updateRow(now()); ok && installed {
+		if r, ok := c.updateRow(now(), nodes, nodesRead && nodesErr == nil); ok && installed {
 			rows = append(rows, r)
 		}
 	}
@@ -193,25 +193,35 @@ func (c Collector) Collect(ctx context.Context) Report {
 		}
 	}
 
+	// The image migration row stays out of rows, so neither the verdict nor
+	// the JSON encoding sees it (Report.ImageMigration), and only on an
+	// installed Mac, which is the only one with node-store images to copy.
+	var imageMigration *Row
+	if installed {
+		if r, ok := c.imageMigrationRow(); ok {
+			imageMigration = &r
+		}
+	}
 	verdict, summary, next := Aggregate(rows, installed, role)
 	stopped := c.stoppedBy()
 	attachAlerts(rows, alertContext{now: now(), role: role, stopped: stopped})
 	return Report{
-		SchemaVersion: SchemaVersion,
-		Capabilities:  Capabilities(),
-		Verdict:       verdict,
-		Role:          role,
-		Summary:       summary,
-		Rows:          rows,
-		Next:          next,
-		Interconnect:  icBlock,
-		StoppedBy:     stopped,
-		Network:       network,
-		Workers:       c.workers(role, nodesRead, nodes, nodesErr),
-		JoinTarget:    c.joinTarget(role),
-		Version:       c.Version,
-		Host:          c.Host,
-		Timestamp:     now(),
+		SchemaVersion:  SchemaVersion,
+		Capabilities:   Capabilities(),
+		Verdict:        verdict,
+		Role:           role,
+		Summary:        summary,
+		Rows:           rows,
+		Next:           next,
+		Interconnect:   icBlock,
+		StoppedBy:      stopped,
+		Network:        network,
+		Workers:        c.workers(role, nodesRead, nodes, nodesErr),
+		JoinTarget:     c.joinTarget(role),
+		ImageMigration: imageMigration,
+		Version:        c.Version,
+		Host:           c.Host,
+		Timestamp:      now(),
 	}
 }
 
@@ -351,11 +361,11 @@ func (c Collector) installRow(hasDataVolume bool, role dataroot.Role, bothRoles 
 			c.Paths.AgentLabel, dataroot.RoleServer)
 	}
 	// A control-plane work dir sitting beside an AGENT install is a leftover:
-	// `k3sm install --role agent` never creates one, so it is an earlier
+	// `k3sm install --agent` never creates one, so it is an earlier
 	// server-era install whose state directory outlived its daemon. It is said
 	// out loud because an operator who finds that directory reasonably concludes
-	// this Mac still runs a control plane, and because until B324 the report
-	// itself drew that conclusion — it read the stale admin kubeconfig and
+	// this Mac still runs a control plane, and because the report once drew
+	// that conclusion itself — it read the stale admin kubeconfig and
 	// probed the loopback apiserver. Nothing reads it now, so the note is
 	// advisory: like the bothRoles clause above it leaves the severity where the
 	// missing-parts arms put it, and never moves the verdict.
@@ -383,9 +393,9 @@ func (c Collector) installRow(hasDataVolume bool, role dataroot.Role, bothRoles 
 // same posture every other "could not see it from here" row takes.
 //
 // The row exists because these arguments were, until now, only knowable by
-// reading LaunchDaemon XML: --registry-port in particular disables the node
-// registry by its ABSENCE, with no log line either way, so "is it set" had no
-// answer an operator could ask for.
+// reading LaunchDaemon XML: --registry-port in particular moves or (with 0)
+// turns off the server's registry, with no log line either way, so "is it set"
+// had no answer an operator could ask for.
 func (c Collector) serverArgsRow() (Row, bool) {
 	if c.ServerArgs == nil || c.FS == nil || c.Paths.ServerLabel == "" {
 		return Row{}, false

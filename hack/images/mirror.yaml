@@ -41,19 +41,19 @@
 
 images:
   - name: buildkit
-    upstream: docker.io/moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
-    mirror: ghcr.io/k3sm-io/mirror/buildkit@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
-    tag: v0.33.0
+    upstream: docker.io/moby/buildkit:v0.34.0@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
+    mirror: ghcr.io/k3sm-io/mirror/buildkit@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
+    tag: v0.34.0
     platforms:
       - platform: linux/arm64
-        digest: sha256:e8efce994e456acb94944bcc0530b3188478572914f413d4476568d8b63515c6
+        digest: sha256:455c7870ed0b77faf36dea550a865d6d8fce4e600bbd4392106df7b2aae2570e
       - platform: linux/amd64
-        digest: sha256:a461e7f0ce921972028acfbed628d45663d83e67ac1230722c2b34cf72760a0d
+        digest: sha256:3eea2ed5d1766c44eb4740853abf56ba85ad40b2c8d4a22e047cbacf15f463c8
 
   - name: debian
-    upstream: docker.io/library/debian:trixie-20260918-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
-    mirror: ghcr.io/k3sm-io/mirror/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
-    tag: trixie-20260918-slim
+    upstream: docker.io/library/debian:trixie-20261005-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+    mirror: ghcr.io/k3sm-io/mirror/debian@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+    tag: trixie-20261005-slim
     platforms:
       - platform: linux/arm64/v8
-        digest: sha256:da496358bd6934d2bd6a563a33176a2e50eff5490c54b4ac6fb051b69fef4071
+        digest: sha256:a2ca65377c251208de42e1a2722cb949211236c161b634f6f3663754e2d06850

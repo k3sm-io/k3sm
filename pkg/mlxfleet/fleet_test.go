@@ -200,3 +200,45 @@ func difference(a, b []string) []string {
 	}
 	return out
 }
+
+// TestChartVersionMatchesStagedChart holds ChartVersion to the Helm chart the
+// image mirror stages: the staged chart entry's tag must equal ChartVersion, and
+// its pinned digest must be the same on the upstream and mirror sides. Without
+// it the recorded CRDs and ClusterRole could describe a chart nobody installs.
+func TestChartVersionMatchesStagedChart(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "hack", "images", "mirror-staged.yaml"))
+	if err != nil {
+		t.Fatalf("read the staged mirror manifest: %v", err)
+	}
+	var doc struct {
+		Images []struct {
+			Name     string `json:"name"`
+			Upstream string `json:"upstream"`
+			Mirror   string `json:"mirror"`
+			Tag      string `json:"tag"`
+		} `json:"images"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse the staged mirror manifest: %v", err)
+	}
+	for _, img := range doc.Images {
+		if img.Name != "dynamo-platform" {
+			continue
+		}
+		if img.Tag != ChartVersion {
+			t.Errorf("staged chart tag is %q, ChartVersion is %q: re-record the testdata and stage the same chart", img.Tag, ChartVersion)
+		}
+		if !strings.Contains(img.Upstream, "/dynamo-platform:"+ChartVersion+"@sha256:") {
+			t.Errorf("staged chart upstream %q does not name version %s by digest", img.Upstream, ChartVersion)
+		}
+		_, upDigest, _ := strings.Cut(img.Upstream, "@")
+		_, mirDigest, _ := strings.Cut(img.Mirror, "@")
+		if upDigest == "" || upDigest != mirDigest {
+			t.Errorf("staged chart digests differ: upstream %q, mirror %q", upDigest, mirDigest)
+		}
+		return
+	}
+	t.Fatal("the staged mirror manifest has no dynamo-platform chart entry")
+}

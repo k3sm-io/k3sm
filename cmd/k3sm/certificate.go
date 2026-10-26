@@ -105,7 +105,7 @@ func runCertificateRotate(args []string) error {
 		defaultWorkDir = executor.DefaultWorkDir
 	}
 	workDir := fs.String("work-dir", defaultWorkDir, "control-plane state root (the CA hierarchy lives here)")
-	restart := fs.Bool("restart", false, "restart the control-plane daemon to perform the rotation (destroys every pod on this node)")
+	restart := fs.Bool("restart", false, "restart the control-plane daemon to perform the rotation (pods keep running and are re-attached)")
 	yes := fs.Bool("yes", false, "alias for --restart")
 	port := fs.Int("apiserver-port", executor.DefaultAPIServerPort, "apiserver secure port the post-restart health probe checks")
 	fs.Usage = func() { fmt.Fprintf(os.Stderr, certificateUsage, executor.DefaultAPIServerPort) }
@@ -339,9 +339,9 @@ implemented.
 	fmt.Fprintf(w, `
 BLAST RADIUS — a rotation restarts %s:
 `, label)
-	fmt.Fprint(w, `  * every pod on this node is destroyed. Pods are in-process children of the daemon
-    with no durable podID->IP manifest, and startup reconciliation sweeps every
-    k3sm-owned lo0 alias.
+	fmt.Fprint(w, `  * pods keep running: the restarted daemon re-attaches every pod whose processes
+    are still alive (see "What Survives a Node-Daemon Restart" in the
+    limitations doc).
   * the apiserver is unavailable for roughly 5-90s while kine and the apiserver come
     back, and the watch cache is rebuilt from the datastore.
   * on an HA control plane the scheduler/controller-manager leader-election leases flap.

@@ -199,7 +199,7 @@ type macOpts struct {
 	// address instead of the one the assignment names. It is the on-disk shape
 	// of a node that joined asserting a `--node-ip` the control plane did not
 	// assign: the node registers the assigned address, and its certificate
-	// names another one (B340).
+	// names another one.
 	credentialAddress string
 	// unreadableCredential makes the staged credential store unreadable by
 	// this account: the ordinary posture of an unprivileged `k3sm status`
@@ -208,7 +208,7 @@ type macOpts struct {
 	// stateDB stages a kine state.db inside the control-plane work dir, with
 	// this SQLite write-format byte in its header (2 = wal, 1 = rollback).
 	// Zero stages none. On an agent Mac it is the dead database the stale
-	// directory carries, which is what B333 is about.
+	// directory carries, which is what the worker-status fix is about.
 	stateDB byte
 	// unreadableStateDB makes that staged database unreadable by this account.
 	// It changes nothing a report may print — which is the point: a row that
@@ -427,7 +427,7 @@ func collectFrom(t *testing.T, mac nodeMac, role install.Role, ready bool, tweak
 
 // ---- the gate -------------------------------------------------------------
 
-// TestStatusOnAWorkerNeverProbesTheLoopbackApiserver is the B324 gate.
+// TestStatusOnAWorkerNeverProbesTheLoopbackApiserver is the gate for this behaviour.
 //
 // The defect: `k3sm status` chose its credentials from the EUID alone, so on a
 // worker whose Mac still carried a stale <DataRoot>/server directory from an
@@ -678,10 +678,10 @@ func TestStatusKubeconfigDistinguishesAbsentFromUnreadable(t *testing.T) {
 	}
 }
 
-// TestStatusOnAWorkerRendersNoControlPlaneRows is the B333 gate.
+// TestStatusOnAWorkerRendersNoControlPlaneRows is the gate for this behaviour.
 //
-// The defect, seen on the two-Mac rig after a worker rejoin and a residual of
-// B324: a Mac installed as an agent still carried the <DataRoot>/server
+// The defect, seen on a two-Mac cluster after a worker rejoin and a residual of
+// the earlier server-era status fix: a Mac installed as an agent still carried the <DataRoot>/server
 // directory an earlier server-era install left behind, and `k3sm status` PROBED
 // the dead kine database inside it. The report then read "datastore ok kine
 // sqlite, wal, user_version 0" — a fact about a database no daemon on this Mac
@@ -858,7 +858,7 @@ func TestStatusOnAWorkerRendersNoControlPlaneRows(t *testing.T) {
 		// The two rows whose remedies restart a node daemon: the runtime daemon
 		// that did not answer, and the shadowed data root that has to be
 		// re-opened once it is mounted. Both used to name io.k3sm.server, a
-		// launchd job a worker's Mac does not have — `k3sm install --role agent`
+		// launchd job a worker's Mac does not have — `k3sm install --agent`
 		// never writes that plist, so the operator's kickstart fails with
 		// "could not find service".
 		mac := stageNodeMac(t, macOpts{role: install.RoleAgent, joined: true, serverWorkDir: true, stateDB: 2})

@@ -52,7 +52,7 @@ func helperBin(t *testing.T, name string) string {
 
 // TestMain builds + ad-hoc-signs the conformance helper binaries ONCE before the
 // suite, but ONLY when a cluster is targeted ($KUBECONFIG set). The no-$KUBECONFIG
-// compile-smoke (workspace hack/ci.sh --e2e) skips every test in Up, so building —
+// compile-smoke (the e2e package built and vetted without a cluster) skips every test in Up, so building —
 // and codesign, which is macOS-only — would be wasted work and a portability
 // hazard. Determinism: CGO_ENABLED=0, a fixed output dir (helperBinDir), one
 // ad-hoc signature per binary.

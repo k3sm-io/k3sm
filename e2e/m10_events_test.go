@@ -30,7 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 )
 
-// TestM10_ProviderEvents is the M10.2 node-lifecycle-Events criterion: the provider's
+// TestM10_ProviderEvents is the node-lifecycle-Events criterion: the provider's
 // EventRecorder emits Pulled/Created/Started/Killing/BackOff so `kubectl describe pod`
 // shows the container lifecycle.
 //

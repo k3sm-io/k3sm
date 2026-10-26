@@ -26,7 +26,7 @@ import (
 )
 
 // ReleaseBaseFlag is the install and daemon argument that points the managed
-// update at another release index than GitHub's: a mirror, or a lab rig
+// update at another release index than GitHub's: a mirror, or a test environment
 // serving its own builds. Empty is DefaultBaseURL.
 const ReleaseBaseFlag = install.UpdateReleaseBaseFlag
 

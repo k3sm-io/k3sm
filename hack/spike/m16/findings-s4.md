@@ -1,4 +1,4 @@
-# S4 findings — the worker, end to end (M16.0-d5)
+# S4 findings — the worker, end to end
 
 > **Status: NOT YET RUN.** Write-back target for `hack/spike/m16/s4.sh`.
 
@@ -6,7 +6,7 @@
 
 Does a worker built on the M8 engine, behind the upstream backend contract, pass the
 conformance kit and serve tokens end to end through a frontend — including as a Pod
-requesting `mlx.k3sm.io/gpu`? This is the shape M16.3 productizes, so nothing left
+requesting `mlx.k3sm.io/gpu`? This is the shape the fleet work productizes, so nothing left
 undecided here gets decided later by a build wave.
 
 ## Method
@@ -16,13 +16,13 @@ Rig-side over ssh: an `MLXEngine` implementing the documented contract
 upstream conformance kit run against it; a frontend plus that worker with file
 discovery serving a completion; then the same through S2's frontend ClusterIP. The
 extended-resource leg runs here only against a **published** worker image
-(`K3SM_M16_WORKER_IMAGE`), because a Pod needs one and M16.3 is what builds it;
+(`K3SM_M16_WORKER_IMAGE`), because a Pod needs one and the fleet work is what builds it;
 otherwise it is **recorded as owed** to the gate's worker rung, never silently
 skipped.
 
 ## Halt
 
-None of its own. A worker that cannot be built on the in-process core is R3's
+None of its own. A worker that cannot be built on the in-process core is the HTTP
 sidecar shape — the same substitution S3 already names.
 
 ## Scoreboard
@@ -36,7 +36,7 @@ sidecar shape — the same substitution S3 already names.
 | s4.4 a Pod requesting `mlx.k3sm.io/gpu: 1` (or: owed, and to whom) | | |
 | s4.5 warm-prefix routing (stretch here, required by the gate) | | |
 
-## What M16.3 inherits from this rung
+## What the fleet work inherits from this rung
 
 - The engine module's final shape, which becomes
   `hack/images/mlx-worker/src/mlx_worker/`.

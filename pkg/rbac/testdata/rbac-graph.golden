@@ -98,6 +98,68 @@
     ]
   },
   {
+    "kind": "ClusterRole",
+    "name": "k3sm:registry-gate",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "rules": [
+      {
+        "verbs": [
+          "create"
+        ],
+        "apiGroups": [
+          "authentication.k8s.io"
+        ],
+        "resources": [
+          "tokenreviews"
+        ]
+      },
+      {
+        "verbs": [
+          "create"
+        ],
+        "apiGroups": [
+          "authorization.k8s.io"
+        ],
+        "resources": [
+          "subjectaccessreviews"
+        ]
+      },
+      {
+        "verbs": [
+          "get"
+        ],
+        "apiGroups": [
+          ""
+        ],
+        "resources": [
+          "namespaces"
+        ]
+      }
+    ]
+  },
+  {
+    "kind": "ClusterRole",
+    "name": "k3sm:registry-pusher",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "rules": [
+      {
+        "verbs": [
+          "push"
+        ],
+        "apiGroups": [
+          "registry.k3sm.io"
+        ],
+        "resources": [
+          "repositories"
+        ]
+      }
+    ]
+  },
+  {
     "kind": "ClusterRoleBinding",
     "name": "k3sm:netserve",
     "labels": {
@@ -132,6 +194,44 @@
         "kind": "Group",
         "apiGroup": "rbac.authorization.k8s.io",
         "name": "system:nodes"
+      }
+    ]
+  },
+  {
+    "kind": "ClusterRoleBinding",
+    "name": "k3sm:registry-builder",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "roleRef": {
+      "apiGroup": "rbac.authorization.k8s.io",
+      "kind": "ClusterRole",
+      "name": "k3sm:registry-pusher"
+    },
+    "subjects": [
+      {
+        "kind": "ServiceAccount",
+        "name": "builder",
+        "namespace": "k3sm-registry"
+      }
+    ]
+  },
+  {
+    "kind": "ClusterRoleBinding",
+    "name": "k3sm:registry-gate",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "roleRef": {
+      "apiGroup": "rbac.authorization.k8s.io",
+      "kind": "ClusterRole",
+      "name": "k3sm:registry-gate"
+    },
+    "subjects": [
+      {
+        "kind": "Group",
+        "apiGroup": "rbac.authorization.k8s.io",
+        "name": "k3sm:registry-gates"
       }
     ]
   },
@@ -191,6 +291,44 @@
     ]
   },
   {
+    "kind": "Role",
+    "namespace": "k3sm-registry",
+    "name": "k3sm:registry-builder-token",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "rules": [
+      {
+        "verbs": [
+          "create"
+        ],
+        "apiGroups": [
+          ""
+        ],
+        "resources": [
+          "serviceaccounts/token"
+        ],
+        "resourceNames": [
+          "builder"
+        ]
+      },
+      {
+        "verbs": [
+          "get"
+        ],
+        "apiGroups": [
+          "discovery.k8s.io"
+        ],
+        "resources": [
+          "endpointslices"
+        ],
+        "resourceNames": [
+          "registry-k3sm"
+        ]
+      }
+    ]
+  },
+  {
     "kind": "RoleBinding",
     "namespace": "default",
     "name": "k3sm:in-pod-reader",
@@ -229,5 +367,13 @@
         "name": "system:nodes"
       }
     ]
+  },
+  {
+    "kind": "ServiceAccount",
+    "namespace": "k3sm-registry",
+    "name": "builder",
+    "labels": {
+      "k3sm.io/managed": "true"
+    }
   }
 ]

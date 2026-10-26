@@ -34,14 +34,14 @@ func fixture(t *testing.T, name string) []byte {
 }
 
 // TestPlistDictReader pins the decoder against real diskutil output captured
-// from the lab rig, and pins its strictness: a key with the wrong type and an
+// from a test environment, and pins its strictness: a key with the wrong type and an
 // element the decoder does not know are errors, never a silent zero, because
 // every decision this package makes is read out of this structure.
 func TestPlistDictReader(t *testing.T) {
 	const rigUUID = "6DEAE471-6CDE-4A4E-88A1-6A7B4DEF2DDD"
 	const quotaUUID = "49533279-726B-4618-BEAB-BFD3980D9D31"
 
-	t.Run("diskutil info of the rig's data volume", func(t *testing.T) {
+	t.Run("diskutil info of a development machine's data volume", func(t *testing.T) {
 		info, err := parseInfoPlist(fixture(t, "disk3s7.plist"))
 		if err != nil {
 			t.Fatalf("parseInfoPlist: %v", err)
@@ -81,10 +81,10 @@ func TestPlistDictReader(t *testing.T) {
 			t.Fatalf("parseCapacityPlist: %v", err)
 		}
 		if got.Quota != 0 {
-			t.Fatalf("Quota = %d, want 0 (the rig's volume carries no quota)", got.Quota)
+			t.Fatalf("Quota = %d, want 0 (the sample volume carries no quota)", got.Quota)
 		}
 		if got.InUse == 0 {
-			t.Fatal("InUse = 0, want the rig's real usage")
+			t.Fatal("InUse = 0, want the sample's real usage")
 		}
 	})
 

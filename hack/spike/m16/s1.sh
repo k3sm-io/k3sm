@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M16.0-d2 / S1 — the Darwin build, and an infrastructure-free smoke.
+# S1 — the Darwin build, and an infrastructure-free smoke.
 #
 # The upstream serving framework (Apache-2.0) keeps macOS as a maintained in-tree
 # build target — the build guide covers it, and the python bindings split on
@@ -12,9 +12,9 @@
 #   s1.1  the toolchain is PINNED, not defaulted — the Rust toolchain and maturin
 #         versions are recorded here because a compiled PyO3 extension's behaviour
 #         depends on the compiler, not only on the source, and the image build
-#         (M16.3) asserts these same two pins before it stages anything.
+# asserts these same two pins before it stages anything.
 #   s1.2  the build completes, and the RESOLVED COMMIT is recorded. That sha is the
-#         pin the plan's R2 promotes to the first tag containing it; nothing in this
+#         pin we promote to the first tag containing it; nothing in this
 #         repo hard-codes a commit it has not built.
 #   s1.3  the built wheel's sha256, and whether the extension arrives
 #         linker-ad-hoc-signed — which is what every hack/images/*/walk-verify.sh
@@ -57,7 +57,7 @@ export PATH="$CARGO_HOME/bin:$PREFIX/bin:$PATH"
 
 # ---- s1.1 the toolchain, pinned --------------------------------------------------
 for t in cmake protoc git curl; do
-  command -v "$t" >/dev/null || { verdict FAIL "s1.1 toolchain  $t is not on the rig (brew install cmake protobuf)"; exit 0; }
+  command -v "$t" >/dev/null || { verdict FAIL "s1.1 toolchain  $t is not on the lab host (brew install cmake protobuf)"; exit 0; }
 done
 command -v uv >/dev/null || spike_install_uv || { verdict FAIL "s1.1 toolchain  the pinned uv did not install"; exit 0; }
 if ! command -v rustup >/dev/null; then
@@ -88,7 +88,7 @@ git fetch --all --tags >/dev/null 2>&1
 git checkout --quiet "$UPSTREAM_REF" >/dev/null 2>&1 || { verdict FAIL "s1.2 clone  ref $UPSTREAM_REF does not resolve"; exit 0; }
 COMMIT=$(git rev-parse HEAD)
 DESCRIBE=$(git describe --tags --always 2>/dev/null)
-recorded "s1.2 upstream: $UPSTREAM_REPO ref=$UPSTREAM_REF commit=$COMMIT describe=$DESCRIBE — THIS sha is the pin R2 promotes to the first tag containing it"
+recorded "s1.2 upstream: $UPSTREAM_REPO ref=$UPSTREAM_REF commit=$COMMIT describe=$DESCRIBE — THIS sha is the pin we promote to the first tag containing it"
 
 # The bindings' own Cargo.toml is what drops the CUDA-bearing default features off
 # Linux; building the bindings crate is therefore the whole risk surface, and its
@@ -99,7 +99,7 @@ if "$PREFIX/venv-s1/bin/maturin" build --release --out "$W/wheels" > "$BUILD_LOG
   verdict PASS "s1.2 build  the python bindings built from source on darwin/arm64 at $COMMIT"
 else
   if grep -qiE 'nixl|dynamo-memory|-lstdc\+\+' "$BUILD_LOG"; then
-    verdict FAIL "s1.2 build  the memory crate / nixl-sys link failed on darwin/arm64 — the plan's HALT applies: the worker re-plans on the Rust backend contract, which does not pull that crate, BEFORE any build wave. Log: $BUILD_LOG"
+    verdict FAIL "s1.2 build  the memory crate / nixl-sys link failed on darwin/arm64 — the spike's HALT applies: the worker re-plans on the Rust backend contract, which does not pull that crate, BEFORE any build wave. Log: $BUILD_LOG"
   else
     verdict FAIL "s1.2 build  maturin build failed for another reason (tail below); $BUILD_LOG"
   fi

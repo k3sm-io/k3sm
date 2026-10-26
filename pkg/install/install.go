@@ -22,8 +22,8 @@ limitations under the License.
 // chown) lives in install_darwin.go; the seam, the install/uninstall ordering,
 // the launchd plist rendering, and the fake live here.
 //
-// The goreleaser config / notarization + designated-requirement entitlements that drive these commands
-// are the packaging follow-up (DESIGN §5c) — out of scope here.
+// The goreleaser config, notarization and entitlements that drive these commands
+// live outside this package, in the release packaging (hack/release, .goreleaser.yaml).
 package install
 
 import (
@@ -2331,9 +2331,10 @@ func install(ctx context.Context, sys System, cfg Config, res *Result) (err erro
 	//     The control-plane version marker is staged the same way and for the same
 	//     reasons: without it the seed cannot tell this release's kube binaries from
 	//     the ones an earlier release left in the work dir, and an absent marker only
-	//     means the seed leaves the present set alone.
-	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KubeMarkerName),
-		cfg.stagedPayloadFile(executor.KubeMarkerName))
+	//     means the seed leaves the present set alone. The zot and helm markers ride along: without them the server cannot take the payload zot, and the seed keeps an older helm build.
+	for _, m := range payloadSetMarkers {
+		_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, m), cfg.stagedPayloadFile(m))
+	}
 
 	// 2c′. The shadow binary set: ad-hoc re-signed copies of the host shells,
 	//      tar and the common coreutils under <InstallDir>/shadow, with the manifest of what they were made

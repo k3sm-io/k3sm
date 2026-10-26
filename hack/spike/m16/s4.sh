@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# M16.0-d5 / S4 — the worker, end to end.
+# S4 — the worker, end to end.
 #
 # S0 proved the platform, S1 the build, S2 the control plane, S3 the engine. S4 is
-# the one rung that puts all four in a line, and it is the shape M16.3 productizes:
+# the one rung that puts all four in a line, and it is the shape the fleet work productizes:
 # nothing S4 leaves undecided gets decided later by a build wave.
 #
 #   s4.1  the backend contract  an MLXEngine implementing the documented contract
@@ -14,7 +14,7 @@
 #         discovery (the minimum deployment: two processes and a directory), then
 #         through the frontend's ClusterIP if S2's control plane is up.
 #   s4.4  the extended resource a Pod requesting mlx.k3sm.io/gpu: 1. This needs an
-#         IMAGE, and M16.3 is what builds it — so the leg runs here only when the
+#         IMAGE, and the fleet work is what builds it — so the leg runs here only when the
 #         operator points K3SM_M16_WORKER_IMAGE at a published one, and is otherwise
 #         RECORDED as discharged by the gate's worker rung. It is never quietly
 #         skipped: a recorded owed leg is the point of the exit contract's third code.
@@ -30,7 +30,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RUNG="S4"
 QUESTION="Does a worker built on the M8 engine, behind the upstream backend contract, pass the conformance kit and serve tokens end to end through a frontend, including as a Pod requesting mlx.k3sm.io/gpu?"
 METHOD="Rig-side over ssh: an MLXEngine implementing the documented backend contract over S3's in-process core, the upstream conformance kit run against it, then a frontend plus that worker with file discovery serving a completion, then the same through S2's frontend ClusterIP, and the extended-resource leg run only against a published worker image (otherwise recorded as owed to the gate's worker rung)."
-HALT="none of its own: a worker that cannot be built on the in-process core is R3's sidecar shape, the same substitution S3 already names."
+HALT="none of its own: a worker that cannot be built on the in-process core is the HTTP sidecar shape, the same substitution S3 already names."
 
 case "${1:-}" in
 --plan | --dry-run) spike_plan "$RUNG" "$QUESTION" "$METHOD" "$HALT" ;;
@@ -56,9 +56,9 @@ MP=$(ls -d "$PREFIX"/hf/hub/models--*/snapshots/* 2>/dev/null | head -1)
 
 # The worker's engine lives in its own package, exactly as the contract's own
 # documentation says a backend may: it does not need to be part of the upstream
-# repository, and M16.3 ships this file's descendant as hack/images/mlx-worker/src/.
+# repository, and the fleet work ships this file's descendant as hack/images/mlx-worker/src/.
 cat > "$W/mlx_engine.py" <<'PY'
-"""An MLX backend for the upstream serving contract, in the shape M16.3 productizes.
+"""An MLX backend for the upstream serving contract, in the shape the fleet work productizes.
 
 It resolves the contract's base class and the engine core at import time and reports
 what it found, because both are young APIs: the contract is documented as
@@ -224,7 +224,7 @@ YAML
   fi
   kc -n "$NS" delete pod m16-worker --ignore-not-found --wait=false >/dev/null 2>&1
 else
-  recorded "s4.4 extended resource  OWED, not skipped: a Pod requesting mlx.k3sm.io/gpu needs a published worker image, which M16.3 builds. Set K3SM_M16_WORKER_IMAGE to run this leg here; otherwise the gate's worker rung discharges it."
+  recorded "s4.4 extended resource  OWED, not skipped: a Pod requesting mlx.k3sm.io/gpu needs a published worker image, which the fleet work builds. Set K3SM_M16_WORKER_IMAGE to run this leg here; otherwise the gate's worker rung discharges it."
 fi
 
 # ---- s4.5 the routing stretch ----------------------------------------------------

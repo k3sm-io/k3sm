@@ -302,7 +302,7 @@ func TestSvclbBindHonesty(t *testing.T) {
 		}
 	})
 
-	// INVERTED by B116 (was "privileged port routes through the privileged
+	// INVERTED when the wildcard bind landed (was "privileged port routes through the privileged
 	// binder"): the port-keyed binder selection is DELETED. A Service declaring
 	// both a <1024 and a >=1024 port goes through the ONE configured binder, on
 	// the WILDCARD.
@@ -449,7 +449,7 @@ func TestSvclbNewHosterValidation(t *testing.T) {
 
 // TestRetractable pins the retraction rule the ingress host applies (svclb's
 // decider replaces the whole slice instead). A single-value comparison against the current advertise address strands both a
-// pre-B116 loopback entry and a previous enrollment's derived .1.
+// loopback entry from the old 127.0.0.1 default and a previous enrollment's derived .1.
 func TestRetractable(t *testing.T) {
 	podCIDR := netip.MustParsePrefix("100.64.0.0/10")
 	advertise := netip.MustParseAddr("100.64.2.1")
@@ -460,10 +460,10 @@ func TestRetractable(t *testing.T) {
 	}{
 		{"the current advertise address", "100.64.2.1", true},
 		{"a previous enrollment's derived .1", "100.64.0.1", true},
-		{"the pre-B116 loopback default", "127.0.0.1", true},
+		{"the old loopback default", "127.0.0.1", true},
 		{"another loopback address", "127.0.0.53", true},
 		{"a foreign public address", "203.0.113.9", false},
-		{"a LAN address", "192.168.7.20", false},
+		{"a LAN address", "192.0.2.20", false},
 		{"not an address at all", "some-hostname", false},
 		{"empty", "", false},
 	}

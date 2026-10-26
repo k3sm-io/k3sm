@@ -244,6 +244,12 @@ type nodeOptions struct {
 	// a loopback spelling nor one of clusterRegistries, so the two travel together.
 	localRegistryHost string
 
+	// flatRegistry is where runtimed fetches the cluster's one registry name
+	// (flatRegistryHost) from: the server's own registry on loopback on
+	// `k3sm server`, the server's mesh address over TLS on `k3sm agent`. The zero
+	// value (a standalone `k3sm node`, a server with no registry) maps nothing.
+	flatRegistry flatRegistryEndpoint
+
 	// deniedLocalPorts are loopback-only TCP ports every pod's SBPL denies
 	// connect() to — this node's EFFECTIVE kine (etcd shim) port, so a networked
 	// native pod sharing the node's _k3sm uid cannot dial the plaintext
@@ -1765,6 +1771,8 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		ClusterRegistries: opts.clusterRegistries,
 		// The same registry under the name a bare reference resolves against.
 		LocalRegistryHost: opts.localRegistryHost,
+		// The cluster's one registry name, mapped to where this node reaches it.
+		FlatRegistry: opts.flatRegistry.mapping(),
 		// Wire the process default logger so the runtimed provider is not SILENT: it
 		// otherwise falls back to a DiscardHandler, dropping pod-lifecycle + cluster-DNS
 		// wiring logs the operator needs (server.log had no provider lines at all).
@@ -1928,7 +1936,7 @@ func nodeCapacity(numCPU int, memBytes uint64, maxPods int64) corev1.ResourceLis
 // system-reserved headroom for the CO-LOCATED control plane. apiserver, scheduler,
 // KCM, kine/SQLite, runtimed, and the node-agent all run in the single io.k3sm.server
 // launchd job, with a combined real working set of roughly 1.2-2.3Gi — so 2Gi is a
-// conservative, lab-refinable floor (a lab run measures the true RSS). It DOMINATES
+// conservative floor, refinable by measurement (a test run measures the true RSS). It DOMINATES
 // the 10% term on small/8Gi hosts (10% of 8Gi = 800Mi < 2Gi); the 10% term scales the
 // apiserver watch-cache up on larger Macs. See memReserveBytes.
 const defaultMemReserveBytes int64 = 2 * 1024 * 1024 * 1024

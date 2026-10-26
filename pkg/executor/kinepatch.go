@@ -26,6 +26,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"k3sm.io/k3sm/internal/childreq"
 )
 
 // kineModulePath is the upstream kine module the child is built from.
@@ -43,9 +45,12 @@ type kineSourcePatch struct {
 	old, new string
 }
 
-// kinePatches is the patch set the kine child is built with. kineBuildVariant names
-// it: any change to this list changes that variant, so every staged kine re-stages.
-// TestKinePatchSetIsMarked enforces that, against an append-only history of digests.
+// kinePatches is the source half of the patch set the kine child is built with; the
+// other half is childreq.Raises, the module requirements raised in the copied tree's
+// go.mod (p2 added golang.org/x/net v0.60.0 to p1's source patch). kineBuildVariant
+// names the whole set: any change to either changes that variant, so every staged
+// kine re-stages. TestKinePatchSetIsMarked enforces that, against an append-only
+// history of digests.
 //
 // migrate-scan-in-order: generic.(*Generic).Migrate issues BOTH of its COUNT(*)
 // queries before scanning either, then returns after the first Scan (the legacy
@@ -116,15 +121,16 @@ func applyKinePatches(root string, patches []kineSourcePatch) error {
 }
 
 // buildPatchedKine builds kine at version from its module source with kinePatches
-// applied, writing the binary to gopath/bin/kine. It returns the toolchain's combined
+// applied and childreq.Raises raised in its go.mod, writing the binary to gopath/bin/kine. It returns the toolchain's combined
 // output so a failure carries its own diagnostic.
 //
 // `go install module@version` cannot build a patched tree, so the steps are spelled
 // out: `go mod download` fetches the module into the stable cache, checksum-verified
 // against the Go checksum database exactly as `go install` would; the tree is copied
-// out of the read-only cache into the scratch dir and patched there; and `go build
-// -mod=readonly` builds it against kine's own go.sum, so the dependency graph is the
-// one the upstream tag pins and every module is hash-checked. The flags match what
+// out of the read-only cache into the scratch dir and patched there, its go.mod
+// raised and the raised modules' checksum-database hashes added to its go.sum; and
+// `go build -mod=readonly` builds it against that go.sum, so the dependency graph is
+// the one the upstream tag pins plus the raises, and every module is hash-checked. The flags match what
 // `go install` used (no -trimpath), so dependency packages a previous build compiled
 // stay cache hits. The build is -trimpath and GOTOOLCHAIN=local, like the etcd
 // wrapper's, so no host path lands in the binary and no other compiler is fetched on
@@ -159,6 +165,9 @@ func buildPatchedKine(ctx context.Context, version, gopath, modCache string) ([]
 	if err := applyKinePatches(src, kinePatches); err != nil {
 		return log.Bytes(), err
 	}
+	if err := childreq.Apply(src, childreq.Raises); err != nil {
+		return log.Bytes(), fmt.Errorf("kine %s: %w (if the pin already requires it, drop the raise and change kineBuildVariant)", version, err)
+	}
 
 	bin := filepath.Join(gopath, "bin", kineBinaryName)
 	build := exec.CommandContext(ctx, "go", kineBuildArgs(version, bin)...)
@@ -176,14 +185,14 @@ func kineBuildArgs(version, out string) []string {
 		"-o", out, "."}
 }
 
-// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p1" of "nocgo+p1").
+// kinePatchSetID is the patch-set suffix of kineBuildVariant ("p2" of "nocgo+p2").
 func kinePatchSetID() string {
 	_, id, _ := strings.Cut(kineBuildVariant, "+")
 	return id
 }
 
 // kineStampedVersion is the version a patched kine build reports: the upstream pin
-// plus the patch set, "v0.17.2+p1" (the bare pin with no patch set). `kine --version`
+// plus the patch set, "v0.17.2+p2" (the bare pin with no patch set). `kine --version`
 // prints it.
 func kineStampedVersion(version string) string {
 	if id := kinePatchSetID(); id != "" {

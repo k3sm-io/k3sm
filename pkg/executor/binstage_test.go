@@ -229,7 +229,7 @@ func writeBin(t *testing.T, path, content string) {
 	}
 }
 
-// TestBinaryStagingNeverRewritesALiveInode is the B544 gate. macOS caches a Mach-O's
+// TestBinaryStagingNeverRewritesALiveInode pins this contract. macOS caches a Mach-O's
 // code signature per vnode: rewriting a signed binary IN PLACE while any process has
 // it mapped (an O_TRUNC write, a copy onto it, `codesign -f` on it) leaves the
 // kernel holding the old signature, and every process mapping the file afterwards is
@@ -318,7 +318,7 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 		hInvalid.assertReplaced(t)
 		assertSignedAt(t, invalid)
 		// A valid non-ad-hoc signature (a Developer ID) is never replaced by an
-		// ad-hoc one: that would strip its provenance (B480).
+		// ad-hoc one: that would strip its provenance.
 		if got := inode(t, devID); got != devIDIno {
 			t.Errorf("the Developer ID-signed %s was replaced (inode %d -> %d)", filepath.Base(devID), devIDIno, got)
 		}
@@ -443,22 +443,23 @@ func TestBinaryStagingNeverRewritesALiveInode(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh staging: helm is extracted and signed on a temp", func(t *testing.T) {
+	t.Run("fresh staging: helm is built and signed on a temp", func(t *testing.T) {
 		calls := fakeCodesign(t)
-		fakeHelmRelease(t, helmTarball(t, map[string]string{
-			helmchart.HelmTarballMember: "the-new-helm-binary-bytes",
-		}), "")
+		origLook := lookPathGo
+		t.Cleanup(func() { lookPathGo = origLook })
+		lookPathGo = func() (string, error) { return "/usr/local/go/bin/go", nil }
+		fakeHelmBuild(t, "the-new-helm-binary-bytes")
 		bd := t.TempDir()
 		dst := helmchart.HelmPath(bd)
 		writeBin(t, dst, "old-helm"+signedSuffix)
 		h := hold(t, dst)
-		if err := stageHelm(t.Context(), signingPolicy{s: bootCodeSigner}, bd, true); err != nil {
+		if err := stageHelmBuild(t.Context(), bd); err != nil {
 			t.Fatal(err)
 		}
 		signed := calls()
 		assertSignedOnlyTemps(t, signed, dst)
 		if len(signed) != 1 {
-			t.Errorf("signed %v, want the one extracted temp", signed)
+			t.Errorf("signed %v, want the one built temp", signed)
 		}
 		h.assertReplaced(t)
 		assertSignedAt(t, dst)

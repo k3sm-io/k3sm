@@ -6,7 +6,7 @@
 # lab, requires dev-mac, manual: true, skeleton: true). M9 is the public flip / site
 # go-live / v0.1.0 tag / announcement. Its gate is a machine PRE-FLIGHT that
 # enumerates the launch-blocking gate set from the validation-debt disposition table
-# (m2/m3/m4 dev-mac, hack/lab/m3.sh two-Mac, hack/lab/m7.sh reboot/brew, the B28 soak,
+# (m2/m3/m4 dev-mac, hack/lab/m3.sh two-Mac, hack/lab/m7.sh reboot/brew, the soak,
 # m8.sh MLX) and confirms each is green at the flip SHA. NONE of that enumeration
 # exists yet — it is tracked internally.
 #

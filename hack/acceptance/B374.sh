@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# k3sm B374 acceptance gate — the runnable proof that docs/privilege-model.md
+# k3sm privilege-model doc acceptance gate — the runnable proof that docs/privilege-model.md
 # no longer claims the io.k3sm.* pf anchor survives uninstall.
 #
 # The defect this documents against: the doc's Uninstall bullet said the
 # anchor "is not removed" and uninstall "does *not* flush all privileged
-# state" — stale since B274, which added FlushMeshPFAnchor
+# state" — stale since the uninstall pf-anchor gate, which added FlushMeshPFAnchor
 # (pkg/install/install_darwin.go) as an unconditional, best-effort uninstall
 # backstop (pkg/install/install.go wires it into every Uninstall call). This
 # gate asserts the corrected sentence is present, the stale claim is gone, and
@@ -13,7 +13,7 @@
 # filter, so its enable state is whatever the Mac's owner set.
 #
 # CI TIER ONLY — no rig, no cluster, nothing runs. Every rung but the voice
-# lint is a grep over checked-in text; content-anchored per the B336 idiom
+# lint is a grep over checked-in text; content-anchored per the node-ip docs gate idiom
 # (never heading-only).
 #
 # Usage:  hack/acceptance/B374.sh
@@ -24,7 +24,7 @@ SELF="$HERE/B374.sh"
 DOC="$K3SM_ROOT/docs/privilege-model.md"
 # The voice lint lives in the workspace control-center, one level above the
 # repo checkout in the ordinary layout -- but this public repo's script must
-# stand alone (no workspace path may appear here, the B365 lesson). The rung
+# stand alone (no workspace path may appear here). The rung
 # runs only when the caller names the lint through K3SM_VOICE_LINT; otherwise
 # it SKIPs, and the workspace ci (which owns the lint) still covers the file
 # at publish.
@@ -33,7 +33,7 @@ VOICE_LINT="${K3SM_VOICE_LINT:-}"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B374 acceptance (privilege-model.md: uninstall flushes the mesh pf anchor)"
+echo "==> k3sm privilege-model doc acceptance (privilege-model.md: uninstall flushes the mesh pf anchor)"
 
 # ---- b374.0 — the gate parses and its source exists -------------------------
 b0=ok
@@ -42,8 +42,8 @@ b0=ok
 ladder "$b0" "b374.0  gate parses (bash -n) + docs/privilege-model.md present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B374: the gate or its source is missing/unparseable — nothing else can run" >&2
-	echo "B374: $PASS passed, $FAIL failed" >&2
+	echo "privilege-model doc: the gate or its source is missing/unparseable — nothing else can run" >&2
+	echo "privilege-model doc: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -93,6 +93,6 @@ if [ "$v" != skip ]; then
 fi
 
 echo "----------------------------------------"
-echo "B374: $PASS passed, $FAIL failed"
+echo "privilege-model doc: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B374 GREEN ================"
+echo "================ privilege-model doc GREEN ================"

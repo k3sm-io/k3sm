@@ -24,7 +24,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"sort"
 	"time"
 
 	"google.golang.org/grpc"
@@ -38,50 +37,69 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
-const imageUsage = `k3sm image — ingest, inspect and reclaim this node's image store
+const imageUsage = `k3sm image — record, name and inspect images in the cluster registry, list where each is cached, and manage this node's cache
 
 Usage: k3sm image pull <reference> [flags]
-       k3sm image tag <digest|reference> <new-reference> [flags]
-       k3sm image untag <reference> [flags]
-       k3sm image inspect <reference|digest> [flags]
+       k3sm image tag <reference|digest> <new-tag> [flags]
+       k3sm image untag <tag> [flags]
+       k3sm image inspect <tag|repository@digest> [flags]
        k3sm image save <reference> -o <file.tar> [flags]
        k3sm image load <docker-save.tar> [flags]
        k3sm image import <oci-layout.tar> [flags]
        k3sm image push <oci-layout-dir|reference> <registry-reference> [flags]
        k3sm image prune [flags]
-       k3sm image ls [flags]
-       k3sm image df [flags]
+       k3sm image ls [-o json] [flags]
+       k3sm image df [-o json] [flags]
+       k3sm image migrate [--report] [-o json]   (copy this node's images into the cluster registry once; sudo on a worker)
 
 pull    fetch a reference into this node's store through the daemon's OWN
         puller — the same code path a pod-driven pull takes, so every blob is
         re-hashed against its digest before it is recorded. Prints the digest
         the reference resolved to. --platform pins which manifest of a
         multi-platform index to fetch; --policy carries the corev1 pull-policy
-        semantics (always, if-not-present, never). A pulled image survives
-        prune until you untag it.
-tag     record an ADDITIONAL name for content this node already holds. The
-        target is named by digest — a reference is resolved to one first —
-        because a tag that named another tag could be re-aimed by a concurrent
-        pull. It never re-points an existing name: that is untag, then tag.
-untag   remove ONE (reference x platform) name. UNTAG REMOVES A NAME, NOT
-        BYTES: no blob is unlinked here, and content is reclaimed only by
-        ` + "`k3sm image prune`" + `, which re-derives reachability first — so untagging
-        a name a running pod still pins leaves that pod unharmed. --digest
-        refuses the removal unless the name still resolves to that digest.
-inspect report what the store knows about one image: digest, resolved platform,
-        creation time, entrypoint/cmd, user, working directory, and each
-        layer's digest and size. -o json prints the daemon's raw response
-        instead of the table. Read-only — it contacts no registry.
-save    stream one image out of the store as a tarred OCI image layout (the
-        ` + "`docker save`" + ` analog) into the file -o names. The archive is checked
-        against the digest and the byte count the daemon reports it sent, and
-        a short one is discarded rather than left on disk.
-load    stream a ` + "`docker save`" + ` tar into this node's image store.
-import  stream a tarred OCI image layout (the ` + "`docker buildx -o type=oci`" + `
-        output) into this node's image store.
-        Both are streamed to the daemon, which is the store's only writer: it
-        re-hashes every byte and records the reference. Loaded content is stored,
-        not yet runnable — see docs/user/images.md.
+        semantics (always, if-not-present, never). Pull fills this node's
+        cache. A pulled image is ordinary cache content, so prune
+        can reclaim it once no pod uses it. A public reference is then also copied into the cluster
+        registry as registry-k3sm:6450/<registry>/<repository>:<tag>
+        (docker.io for Docker Hub), which a node pulls from only when the
+        public registry cannot be reached at all. The copy uploads as you
+        through your kubeconfig, like push; a failed copy is a warning, not a
+        failed pull. A cluster-registry reference, or a registry with a port,
+        gets no copy; --no-mirror skips it.
+tag     add a tag in the cluster registry to a manifest it already holds:
+        an OCI manifest PUT of the same bytes, so the new tag names the same
+        digest. The source is a tag, a <repository>@<digest>, or a bare digest
+        in the new tag's repository; --platform tags that platform's child of
+        an index. It refuses to re-point a tag that already names another
+        manifest unless --force is given.
+untag   delete one tag from the cluster registry. It REMOVES A NAME, NOT BYTES:
+        a manifest another tag names stays, the registry's own garbage
+        collection reclaims what nothing names, and a node that already
+        pulled the image keeps its cached copy. --digest refuses the removal
+        unless the tag still names that manifest.
+inspect report what the cluster registry holds under a tag or a
+        <repository>@<digest>: digest, platform, creation time,
+        entrypoint/cmd, user, working directory, and each layer's digest and
+        size. An index lists its platforms; --platform inspects one. -o json
+        prints the registry's manifest and config documents instead.
+save    export one image from the cluster registry as a tarred OCI image
+        layout (the ` + "`docker save`" + ` analog, and what import reads back) into
+        the file -o names. An index is saved whole unless --platform picks
+        one. A failed save leaves no file behind.
+        tag, untag, inspect and save never contact the daemon, and a name
+        naming another registry is refused. tag writes through the push gate
+        with a token minted through your kubeconfig; inspect and save read
+        this server's registry anonymously; untag deletes, which the gate
+        never forwards, so it needs the server's push credential: run it as
+        root with --work-dir /var/lib/k3sm/server. An account that can read
+        that credential (see --work-dir) uses it for all four.
+load    record a ` + "`docker save`" + ` tar in the cluster registry, the cluster's one
+        image store, under registry-k3sm:6450/<repository>:<tag>, overwriting
+        that tag; then pull it into this node's cache.
+import  the same for a tarred OCI image layout (the ` + "`docker buildx -o type=oci`" + `
+        output); a layout holding a multi-platform index records the index.
+        Both upload as you with this node's push credential (see --work-dir),
+        and the cache pull goes through the daemon's own puller.
 push    upload an image to a registry reference, and print the digest it now has
         there so callers can pin it. The first argument is normally the OCI
         layout directory ` + "`k3sm build --format oci`" + ` writes; a first argument
@@ -93,13 +111,26 @@ push    upload an image to a registry reference, and print the digest it now has
         ingest-registry credential (only when the target IS this node's loopback
         registry), or the docker config chain — never from the command line, and
         k3sm stores none of it.
-prune   delete image content no pod references. DRY RUN BY DEFAULT — pass
-        --force to actually unlink. The daemon does the deleting: this command
-        is a client of the runtimed Images service, it never walks the store
-        itself. A pod's content is never deleted, and if the daemon cannot
-        enumerate every pod's references it refuses the whole prune.
-ls      list the images this node has recorded.
-df      show the image store's filesystem usage.
+prune   delete the cluster registry's untagged manifests and evict what no
+        pod uses from this node's cache. DRY RUN BY DEFAULT — pass --force to
+        delete. The registry half runs on the server that holds the registry:
+        a manifest a tag, a tagged index or a kept referrer still needs stays,
+        and so does one younger than an hour (a push may be in flight); the
+        registry's garbage collection then reclaims the layers. The cache half
+        is the runtimed Images service's own prune: a pod's content is never
+        deleted, and if the daemon cannot enumerate every pod's references it
+        refuses the whole prune. -o json prints both halves as one document.
+ls      list the images in the cluster's one registry (the server's), each
+        under its canonical reference ` + "`" + canonicalRegistry + "/<repo>:<tag>`" + `, with
+        its digest, platforms and size, how many Pods use it, and the nodes
+        whose status.images report it cached. A node at the 50-image
+        status.images cap may cache an image it does not list; -o json names
+        such nodes under cachedOnIncomplete. Read-only and anonymous: it needs
+        no root and no daemon socket, only a kubeconfig that can read Nodes,
+        Pods and the local-registry-hosting ConfigMap. An unreachable registry
+        is reported (reachable: false, with the error) and still exits 0.
+df      show the registry's size (its distinct blobs) and each node's image
+        cache as its status.images reports it. Same reads as ls.
 
 Flags:
 `
@@ -128,6 +159,11 @@ type imageOptions struct {
 	platform *runtimev1.Platform
 	// policy is the parsed --policy, pull only.
 	policy runtimev1.ImagePullPolicy
+	// cacheOnly marks a pull as a cache warm-up rather than an operator pull:
+	// the daemon records no operator root for it, so prune may reclaim the
+	// image once no pod uses it. No flag sets it; only the warm-up after a
+	// build, load or push into the cluster registry does.
+	cacheOnly bool
 	// digest is untag's --digest pin: the removal is refused unless the entry
 	// still resolves to it.
 	digest string
@@ -140,6 +176,11 @@ type imageOptions struct {
 	// neither of them, and is not a flag either — see registryAuth.
 	layoutDir string
 	target    string
+	// noMirror is pull's --no-mirror: skip the copy into the cluster registry.
+	noMirror bool
+	// warn is where a verb writes a warning that does not fail it: the
+	// writer parseImageArgs was given. Nil discards.
+	warn io.Writer
 	// workDir is the control-plane state root push looks in for THIS node's
 	// ingest-registry credential. It is a path, never a secret: the credential
 	// itself stays in a 0600 file the invoking user must already be able to read.
@@ -157,19 +198,33 @@ const (
 
 // runImage is the `k3sm image` entry point.
 func runImage(args []string) error {
+	// migrate has its own flags and touches the registry as well as runtimed,
+	// so it parses on its own (imagemigrateverb.go).
+	if len(args) > 0 && args[0] == "migrate" {
+		return runImageMigrate(args[1:])
+	}
 	opts, err := parseImageArgs(args, os.Stderr)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
 	defer cancel()
+	// ls and df read the cluster's registry, not this node's daemon, so they
+	// dial no socket and need no root.
+	if opts.subcommand == "ls" || opts.subcommand == "df" {
+		env, err := newImageRegistryEnv()
+		if err != nil {
+			return err
+		}
+		return imageRegistryCommand(ctx, opts, os.Stdout, env)
+	}
 	return imageCommand(ctx, opts, os.Stdout, dialRuntimed)
 }
 
 // parseImageArgs parses argv. ContinueOnError so a bad flag is an error the
 // caller reports, never an os.Exit inside a test binary.
 func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
-	var o imageOptions
+	o := imageOptions{warn: errOut}
 	fs := flag.NewFlagSet("image", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	fs.Usage = func() {
@@ -177,30 +232,31 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		fs.PrintDefaults()
 	}
 	fs.StringVar(&o.socket, "socket", runtimed.DefaultSocketPath, "runtimed control socket to dial")
-	// The control-plane state root, consulted by push ONLY, and only to find this
-	// node's ingest-registry credential. A resolve failure is not reported here:
+	// The control-plane state root, consulted by the verbs that talk to the
+	// cluster registry, and only to find this node's ingest-registry credential. A resolve failure is not reported here:
 	// every other subcommand is a client of runtimed and has no use for a work
 	// dir, so an unresolvable one must not make `k3sm image ls` fail.
 	defaultWorkDir, _ := executor.ResolveWorkDir()
-	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's ingest-registry push credential from (push only)")
+	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's registry push credential and store from (push, load, import, tag, untag, inspect, save, prune)")
 	// DRY RUN IS THE DEFAULT and deleting takes an explicit flag, because the
 	// blast radius is asymmetric: a needless dry run costs a statfs, while an
 	// unintended prune on a node that cannot reach its registry costs every image
 	// it cannot re-pull.
-	fs.BoolVar(&o.force, "force", false, "actually unlink (without this, prune only reports what it would delete)")
+	fs.BoolVar(&o.force, "force", false, "prune: actually delete (without this, prune only reports what it would delete); tag: re-point a tag that names another manifest")
 	fs.StringVar(&o.reference, "reference", "", "reference to record a loaded image under (load, import; defaults to the one the archive names)")
 	// The platform is part of the store's (reference x platform) KEY, never a
 	// filter, so it is spelled the way an OCI platform is spelled everywhere
 	// else — os/arch[/variant] — rather than as three flags nobody would pair
 	// correctly.
 	var platformSpec, policySpec string
-	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull, tag, untag, inspect, save)")
+	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull; tag, inspect, save: one platform of an index)")
 	fs.StringVar(&policySpec, "policy", "", "pull policy: always, if-not-present or never (pull only; default is the pull-through behaviour)")
+	fs.BoolVar(&o.noMirror, "no-mirror", false, "pull: do not copy a public image into the cluster registry")
 	fs.StringVar(&o.digest, "digest", "", "refuse the removal unless the name still resolves to this manifest digest (untag only)")
-	// One flag, two meanings, chosen by the subcommand — the spelling `docker`
+	// One flag, several meanings, chosen by the subcommand — the spelling `docker`
 	// uses for both. It is validated per subcommand at parse time so `inspect -o
 	// out.tar` fails before anything is dialled.
-	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the daemon's raw response instead of the table")
+	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table; prune: json, for one document with both halves; ls, df: json")
 	fs.StringVar(&o.output, "output", "", "alias for -o")
 	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call (load, import, push, pull and save default to 30m — they stream image content)")
 	if err := fs.Parse(args); err != nil {
@@ -284,9 +340,12 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// Every flag below belongs to a subset of the verbs. Refusing a flag the
 	// verb cannot honour beats ignoring it: an ignored --platform on a prune
 	// reads as "that platform was pruned" until someone re-reads the store.
-	platformVerbs := map[string]bool{"pull": true, "tag": true, "untag": true, "inspect": true, "save": true}
+	platformVerbs := map[string]bool{"pull": true, "tag": true, "inspect": true, "save": true}
 	if flagWasSet(fs, "platform") && !platformVerbs[o.subcommand] {
-		return o, fmt.Errorf("%s does not take --platform (it selects the (reference x platform) entry pull, tag, untag, inspect and save act on)", o.subcommand)
+		return o, fmt.Errorf("%s does not take --platform (it selects the platform pull fetches, or the child of an index tag, inspect and save act on; a tag names the whole index, so untag takes none)", o.subcommand)
+	}
+	if o.force && o.subcommand != "prune" && o.subcommand != "tag" {
+		return o, fmt.Errorf("%s does not take --force (it unlinks for prune and re-points a tag for tag)", o.subcommand)
 	}
 	var err error
 	if o.platform, err = parsePlatform(platformSpec); err != nil {
@@ -298,6 +357,12 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	if o.policy, err = parsePullPolicy(policySpec); err != nil {
 		return o, err
 	}
+	if flagWasSet(fs, "socket") && (o.subcommand == "ls" || o.subcommand == "df") {
+		return o, fmt.Errorf("%s does not take --socket (it reads the cluster's registry, not this node's daemon)", o.subcommand)
+	}
+	if o.noMirror && o.subcommand != "pull" {
+		return o, fmt.Errorf("%s does not take --no-mirror (it skips the cluster-registry copy pull writes of a public image)", o.subcommand)
+	}
 	if flagWasSet(fs, "digest") && o.subcommand != "untag" {
 		return o, fmt.Errorf("%s does not take --digest (it pins the entry untag is allowed to remove)", o.subcommand)
 	}
@@ -306,13 +371,13 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		if o.output == "" {
 			return o, errors.New("save requires -o <file.tar>: the archive is written to a file you name, never to the terminal")
 		}
-	case "inspect":
+	case "inspect", "prune", "ls", "df":
 		if o.output != "" && o.output != "json" {
-			return o, fmt.Errorf("-o %q: inspect renders a table by default and `json` on request", o.output)
+			return o, fmt.Errorf("-o %q: %s renders a table by default and `json` on request", o.output, o.subcommand)
 		}
 	default:
 		if flagWasSet(fs, "o") || flagWasSet(fs, "output") {
-			return o, fmt.Errorf("%s does not take -o (save writes an archive to it, inspect chooses a rendering with it)", o.subcommand)
+			return o, fmt.Errorf("%s does not take -o (save writes an archive to it; inspect, prune, ls and df choose a rendering with it)", o.subcommand)
 		}
 	}
 	// The streaming default applies only when the operator did not choose. Visit
@@ -398,6 +463,12 @@ func dialRuntimed(_ context.Context, socket string) (grpc.ClientConnInterface, i
 // correct by locking, because no lock it holds is also held across the daemon's
 // own pull commit, so it would race the very writer it is trying to reason about.
 func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer) error {
+	return imageCommandWith(ctx, o, out, dial, deleteManifest)
+}
+
+// imageCommandWith is imageCommand with the registry's manifest deleter as a
+// seam, which only prune uses.
+func imageCommandWith(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer, del manifestDeleter) error {
 	// push is the one subcommand whose ordinary form is not a daemon client: it
 	// reads a layout the invoking user owns and uploads it to a registry as that
 	// user. Dialing first would fail a perfectly valid push on a node whose
@@ -405,6 +476,26 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 	// form, which genuinely has to ask the daemon for the bytes.
 	if o.subcommand == "push" {
 		return imagePush(ctx, o, out, dial)
+	}
+	// load and import upload to the cluster registry as the invoking user, and
+	// dial the daemon only for the warm pull that follows.
+	switch o.subcommand {
+	case "load":
+		return imageIngest(ctx, o, out, ingestPusher, warmNodeCache(dial, o.socket), runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE)
+	case "import":
+		return imageIngest(ctx, o, out, ingestPusher, warmNodeCache(dial, o.socket), runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT)
+	}
+	// tag, untag, inspect and save act on the cluster registry and never dial
+	// the daemon: the node's store is a pull cache no user verb names.
+	switch o.subcommand {
+	case "tag":
+		return imageTag(ctx, o, out)
+	case "untag":
+		return imageUntag(ctx, o, out)
+	case "inspect":
+		return imageInspect(ctx, o, out)
+	case "save":
+		return imageSave(ctx, o, out)
 	}
 	cc, closer, err := dial(ctx, o.socket)
 	if err != nil {
@@ -415,65 +506,23 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 	}
 	client := runtimev1.NewImagesClient(cc)
 	switch o.subcommand {
-	case "load":
-		return imageLoad(ctx, client, o, out, runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE)
-	case "import":
-		return imageLoad(ctx, client, o, out, runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT)
 	case "pull":
-		return imagePull(ctx, client, o, out)
-	case "tag":
-		return imageTag(ctx, client, o, out)
-	case "untag":
-		return imageUntag(ctx, client, o, out)
-	case "inspect":
-		return imageInspect(ctx, client, o, out)
-	case "save":
-		return imageSave(ctx, client, o, out)
+		img, err := imagePull(ctx, client, o, out)
+		if err != nil {
+			return err
+		}
+		if !o.noMirror {
+			warn := o.warn
+			if warn == nil {
+				warn = io.Discard
+			}
+			mirrorPulled(ctx, o, img, out, warn, pullMirrorer)
+		}
+		return nil
 	case "prune":
-		return imagePrune(ctx, client, o, out)
-	case "ls":
-		return imageList(ctx, client, out)
-	case "df":
-		return imageDF(ctx, client, out)
+		return imagePrune(ctx, client, o, out, del, time.Now())
 	}
 	return fmt.Errorf("unknown subcommand %q", o.subcommand)
-}
-
-// imagePrune asks the daemon to prune and renders the typed outcome.
-func imagePrune(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) error {
-	resp, err := client.PruneImages(ctx, &runtimev1.PruneImagesRequest{DryRun: !o.force})
-	if err != nil {
-		return imageRPCError("prune images", o.socket, err)
-	}
-	verb := "would delete"
-	if o.force {
-		verb = "deleted"
-	}
-	if len(resp.GetRemovedDigests()) == 0 {
-		fmt.Fprintln(out, "nothing to reclaim: every blob in the store is referenced.")
-	}
-	for _, d := range resp.GetRemovedDigests() {
-		fmt.Fprintf(out, "%s %s\n", verb, d)
-	}
-	fmt.Fprintf(out, "%s %d blob(s), %s\n", verb, len(resp.GetRemovedDigests()), humanBytes(resp.GetReclaimedBytes()))
-	if !o.force {
-		fmt.Fprintln(out, "(dry run — pass --force to unlink)")
-	}
-	// Kept blobs are summarized by REASON rather than listed one per line: an
-	// operator asking "why is my disk still full" needs the shape of the answer,
-	// and a store with thousands of layers would otherwise bury it.
-	if counts := skipCounts(resp.GetSkipped()); len(counts) > 0 {
-		fmt.Fprintln(out, "kept:")
-		reasons := make([]string, 0, len(counts))
-		for r := range counts {
-			reasons = append(reasons, r)
-		}
-		sort.Strings(reasons)
-		for _, r := range reasons {
-			fmt.Fprintf(out, "  %-24s %d\n", r, counts[r])
-		}
-	}
-	return nil
 }
 
 // skipCounts tallies kept blobs by their typed reason, rendered in the operator's
@@ -503,44 +552,6 @@ func skipReasonText(r runtimev1.PruneSkipReason) string {
 		return "no reason reported"
 	}
 	return r.String()
-}
-
-// imageList renders the node's recorded images.
-func imageList(ctx context.Context, client runtimev1.ImagesClient, out io.Writer) error {
-	resp, err := client.ListImages(ctx, &runtimev1.ListImagesRequest{})
-	if err != nil {
-		return imageRPCError("list images", "", err)
-	}
-	if len(resp.GetImages()) == 0 {
-		fmt.Fprintln(out, "no images recorded on this node.")
-		return nil
-	}
-	fmt.Fprintf(out, "%-48s %-8s %s\n", "REFERENCE", "LAYERS", "CONFIG")
-	for _, img := range resp.GetImages() {
-		m := img.GetManifest()
-		fmt.Fprintf(out, "%-48s %-8d %s\n", m.GetReference(), len(m.GetLayers()), m.GetConfig().GetDigest())
-	}
-	return nil
-}
-
-// imageDF renders the image store's filesystem usage.
-func imageDF(ctx context.Context, client runtimev1.ImagesClient, out io.Writer) error {
-	resp, err := client.ImageFsInfo(ctx, &runtimev1.ImageFsInfoRequest{})
-	if err != nil {
-		return imageRPCError("image filesystem info", "", err)
-	}
-	fmt.Fprintf(out, "store: %s\n", humanBytes(resp.GetStoreBytes()))
-	for _, fsu := range resp.GetFilesystems() {
-		fmt.Fprintf(out, "%s: %s used of %s, %s available\n",
-			fsu.GetMountpoint(), humanBytes(fsu.GetUsedBytes()),
-			humanBytes(fsu.GetCapacityBytes()), humanBytes(fsu.GetAvailableBytes()))
-	}
-	// The store figure counts every blob at its full logical size, but a blob
-	// whose extents are cloned into a live pod's rootfs shares them — so the sum
-	// is not what a prune would give back, and saying so is cheaper than an
-	// operator inferring a broken prune from the arithmetic.
-	fmt.Fprintln(out, "(store bytes are logical sizes; APFS clones share extents, so a prune frees less)")
-	return nil
 }
 
 // imageRPCError translates a daemon status into an operator-actionable message.

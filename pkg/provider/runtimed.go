@@ -529,6 +529,11 @@ type RuntimedConfig struct {
 	// rather than silently treating a third-party registry as this node's own. ""
 	// is the default and leaves bare-name resolution stock.
 	LocalRegistryHost string
+	// FlatRegistry maps the cluster's one registry name to the endpoint this
+	// node reaches it at, with the loopback spellings recorded under it. The
+	// contract is runtimed/pkg/image's FlatRegistry; the zero value maps nothing,
+	// and runtimed refuses an invalid mapping at construction.
+	FlatRegistry image.FlatRegistry
 	// GuestArtifacts is this node's ENSURED, digest-verified guest boot artifact
 	// set — the kernel, the initramfs and the cmdline a vm pod boots from.
 	// It is DATA, already materialised by GuestArtifactSource.Ensure before this
@@ -646,6 +651,7 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	// name it.
 	deps.ClusterRegistries = cfg.ClusterRegistries
 	deps.LocalRegistryHost = cfg.LocalRegistryHost
+	deps.FlatRegistry = cfg.FlatRegistry
 	rt, err := runtimed.New(runtimed.Config{
 		Root:           cfg.Root,
 		RuntimeVersion: version.Get().Version,
@@ -1687,7 +1693,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 			return nil
 		}
 	}
-	// Ordering (BINDING): allocate the pod's /32 BEFORE translation/env
+	// Ordering: allocate the pod's /32 BEFORE translation/env
 	// resolution so box.PodIp and the status.podIP downward-API env carry it. A
 	// translate failure below does NOT release it here (an idempotent retry or
 	// the eventual DeletePod → releasePodNetwork reclaims it; auto-releasing
@@ -1996,8 +2002,7 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	// lifetime, binding the pod identity on its own context. The binding here
 	// stays because env-source resolution in buildBox (resolvePodBoxEnv →
 	// ConfigMap/Secret key refs) legitimately re-runs on every box build, and
-	// this seam is kept uniform for CreatePod and UpdatePod rather than split
-	// (B233).
+	// this seam is kept uniform for CreatePod and UpdatePod rather than split.
 	ctx = withPodIdentity(ctx, pod)
 	// A spec change (an ephemeral container added) can add references; the
 	// registration is replaced, so a removed reference stops being fetchable.

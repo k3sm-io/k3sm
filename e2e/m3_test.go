@@ -197,7 +197,7 @@ func TestM3_PVCPersistsAcrossRestart(t *testing.T) {
 
 // TestM3_InPodKubectlAndDNSOnWorker proves a pod scheduled on the JOINED worker
 // (not the control-plane Mac) resolves cluster DNS and reaches the apiserver via
-// the node-local API VIP — the M3.3 infra-VIP mesh-exemption behavior. It is
+// the node-local API VIP — the infra-VIP mesh-exemption behavior. It is
 // LAB-ONLY: skipped unless $K3SM_WORKER names a Ready worker node, so the
 // single-node integration gate (hack/acceptance/m3.sh) does not require it while
 // the two-Mac lab gate (hack/lab/m3.sh) does.
@@ -206,7 +206,7 @@ func TestM3_InPodKubectlAndDNSOnWorker(t *testing.T) {
 	ctx := context.Background()
 	worker := os.Getenv("K3SM_WORKER")
 	if worker == "" {
-		t.Skip("LAB-ONLY: set $K3SM_WORKER to a joined worker node (two-Mac rig) — single-node gates do not run this")
+		t.Skip("LAB-ONLY: set $K3SM_WORKER to a joined worker node (two-Mac cluster) — single-node gates do not run this")
 	}
 	bin := helperBin(t, "conftool")
 	ns, sa := rbac.ConformanceNamespace, rbac.ConformanceServiceAccount
@@ -221,7 +221,7 @@ func TestM3_InPodKubectlAndDNSOnWorker(t *testing.T) {
 	// legs exec conftool DIRECTLY: a /bin/sh -c wrapper is a SIP-restricted platform
 	// binary whose exec strips DYLD_* from the environment, so the DNS shim would
 	// never reach conftool and every cluster name would be NXDOMAIN (measured on
-	// both nodes of the two-Mac rig). The resolve leg rides an init container so
+	// both nodes of the two-Mac cluster). The resolve leg rides an init container so
 	// the two stay ordered in one pod.
 	pod := nativePod("m3-worker-access", bin, "apicall",
 		"-path", "/api/v1/namespaces/"+ns+"/pods", "-expect-status", "200")

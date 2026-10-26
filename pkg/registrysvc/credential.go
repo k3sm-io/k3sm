@@ -35,6 +35,13 @@ import (
 // while a stable one keeps the htpasswd file and the failure messages readable.
 const pushUser = "k3sm"
 
+// gateUser is the registry identity the push gate forwards an authorized
+// in-pod write as. It is a SECOND user so its grant can be narrower than the
+// local CLI's: it may create and update but never delete, and its password is
+// minted per boot and held in the server's memory only, never written in
+// plaintext. Only its bcrypt hash reaches the htpasswd file.
+const gateUser = "k3sm-gate"
+
 // pushSecretBytes is the entropy behind the generated password. 32 bytes of
 // crypto/rand is far past any brute-force reachable through zot's authentication
 // path, which is rate-limited by a fail delay and by bcrypt's own cost.
@@ -88,13 +95,23 @@ func LogPath(workDir string) string { return filepath.Join(workDir, "registry.lo
 // generated on every call — the credential is per-boot, so nothing an earlier
 // boot leaked is still valid.
 func generateCredential(addr string) (Credential, error) {
+	return generateCredentialFor(addr, pushUser)
+}
+
+// generateGateCredential mints the push gate's per-boot credential for addr.
+func generateGateCredential(addr string) (Credential, error) {
+	return generateCredentialFor(addr, gateUser)
+}
+
+// generateCredentialFor mints a fresh credential for user at addr.
+func generateCredentialFor(addr, user string) (Credential, error) {
 	buf := make([]byte, pushSecretBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return Credential{}, fmt.Errorf("generate the registry push password: %w", err)
 	}
 	return Credential{
 		Address:  addr,
-		Username: pushUser,
+		Username: user,
 		// RawURL encoding: no padding and no '/' or '+', so the value survives a
 		// URL, a shell word and an htpasswd line without quoting or escaping.
 		Password: base64.RawURLEncoding.EncodeToString(buf),
@@ -114,18 +131,24 @@ func htpasswdLine(c Credential) (string, error) {
 
 // WriteCredential writes both halves of the credential for workDir: the bcrypt
 // htpasswd file zot authenticates against, and the plaintext file `k3sm image
-// push` reads. Both are 0600.
+// push` reads. Both are 0600. Each of extra adds its bcrypt line to the
+// htpasswd file and nothing else: an extra credential's plaintext stays with
+// its caller.
 //
 // The plaintext file is written LAST, so a caller that finds it can rely on the
 // htpasswd file beside it already vouching for the same password. Both are
 // written through a temp name + rename, because a reader racing a rewrite must
 // see one whole credential or the other, never a truncated one.
-func WriteCredential(workDir string, c Credential) error {
-	line, err := htpasswdLine(c)
-	if err != nil {
-		return err
+func WriteCredential(workDir string, c Credential, extra ...Credential) error {
+	var lines strings.Builder
+	for _, cred := range append([]Credential{c}, extra...) {
+		line, err := htpasswdLine(cred)
+		if err != nil {
+			return err
+		}
+		lines.WriteString(line)
 	}
-	if err := writeSecretFile(HTPasswdPath(workDir), []byte(line)); err != nil {
+	if err := writeSecretFile(HTPasswdPath(workDir), []byte(lines.String())); err != nil {
 		return fmt.Errorf("write the registry htpasswd: %w", err)
 	}
 	body, err := json.MarshalIndent(c, "", "  ")

@@ -62,6 +62,41 @@ func TestCompareReleases(t *testing.T) {
 	}
 }
 
+// TestCompareBuild pins the display comparison: a tagged build orders as
+// CompareReleases does, a Go pseudo-version ranks by its core and prerelease
+// and names its core, and a dev or dirty build, or an untagged release side,
+// does not compare.
+func TestCompareBuild(t *testing.T) {
+	const stamp = "20261025152241-96fbff948562"
+	cases := []struct {
+		build, release string
+		cmp            int
+		untaggedOf     string
+		ok             bool
+	}{
+		{"v0.2.0", "0.2.0", 0, "", true},
+		{"0.1.7", "v0.2.0", -1, "", true},
+		{"v0.2.0-rc.1", "v0.2.0", -1, "", true},
+		{"v0.1.8-0." + stamp, "v0.1.7", 1, "0.1.8", true},
+		{"0.1.8-0." + stamp, "v0.1.8", -1, "0.1.8", true},
+		{"v0.1.8-0." + stamp, "v0.1.8-rc.1", -1, "0.1.8", true},
+		{"v0.1.8-rc.1.0." + stamp, "v0.1.8-rc.1", 1, "0.1.8", true},
+		{"v0.0.0-" + stamp, "v0.1.7", -1, "0.0.0", true},
+		{"v0.1.8-0." + stamp + "+dirty", "v0.1.7", 0, "", false},
+		{"0.1.8-0." + stamp + ".dirty", "v0.1.7", 0, "", false},
+		{"v0.2.0+dirty", "v0.1.7", 0, "", false},
+		{"0.2.0.dirty", "v0.1.7", 0, "", false},
+		{"dev", "v0.1.7", 0, "", false},
+		{"v0.1.7", "v0.1.8-0." + stamp, 0, "", false},
+	}
+	for _, tc := range cases {
+		cmp, of, ok := CompareBuild(tc.build, tc.release)
+		if cmp != tc.cmp || of != tc.untaggedOf || ok != tc.ok {
+			t.Errorf("CompareBuild(%q, %q) = %d, %q, %v; want %d, %q, %v", tc.build, tc.release, cmp, of, ok, tc.cmp, tc.untaggedOf, tc.ok)
+		}
+	}
+}
+
 func TestNodeRelease(t *testing.T) {
 	if rel, ok := NodeRelease((Info{KubeVersion: "v1.37.1", Version: "v0.2.0"}).NodeVersion()); !ok || rel != "0.2.0" {
 		t.Errorf("NodeRelease = %q, %v", rel, ok)

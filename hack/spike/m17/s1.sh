@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M17.0 / S1 — enumeration and mapping. THE RUNG EVERY OTHER ONE STANDS ON: it finds
+# S1 — enumeration and mapping. THE RUNG EVERY OTHER ONE STANDS ON: it finds
 # the cable, maps it to an interface by the method the product uses, and asks what
 # the link watcher can and cannot see.
 #
@@ -19,7 +19,7 @@
 #       (an operator touch; RECORDED when nobody moves it).
 #   (9) ioreg -c IOThunderboltPort as the substitute source when the Thunderbolt
 #       Bridge network service is deleted (RECORDED: what ioreg carries; the user's
-#       service is never deleted, R10).
+#       service is never deleted).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source-path=SCRIPTDIR source=lib.sh
@@ -39,11 +39,11 @@ command output on both Macs; /usr/bin/time over system_profiler x10; the probe's
 raw PF_ROUTE reader, run as the login user) on both Macs across an ifconfig down/up and then across a physical
 unplug the operator is prompted for (bounded wait); an optional worker reboot; a prompted receptacle/dock move;
 ioreg -c IOThunderboltPort -r -l."
-HALT="s1.5 fails (PF_ROUTE silent on unplug) -> R8: the 2 s poll is the only source and the fallback figure is
+HALT="s1.5 fails (PF_ROUTE silent on unplug) -> the 2 s poll is the only source and the fallback figure is
   re-measured (S4).
 s1.1 NoThunderboltService -> the design's NoThunderboltService condition stands; s1.9 records whether ioreg can
   substitute (no further substitution is pre-decided).
-s1.2/s1.3/s1.7 fail -> no substitution is pre-decided: the mapping the M17 plan §1 rests on does not hold, and the
+s1.2/s1.3/s1.7 fail -> no substitution is pre-decided: the mapping the M17 design rests on does not hold, and the
   spike stops for a re-plan."
 
 spike_args "$RUNG" "$QUESTION" "$CRITERIA" "$METHOD" "$HALT" "$@"
@@ -68,7 +68,7 @@ done
 if [ "$TOPOLOGY_OK" = 1 ] && [ "$SRV_PORT" -ge 0 ] && [ "$WRK_PORT" -ge 0 ]; then
 	pass "s1.2 peer UUIDs point at each other: server port $SRV_PORT ($SRV_UUID) <-> worker port $WRK_PORT ($WRK_UUID)"
 else
-	fail "s1.2 no port pair whose peer domain UUIDs point at each other — halt: no substitution is pre-decided (the M17 plan §1 mapping does not hold)"
+	fail "s1.2 no port pair whose peer domain UUIDs point at each other — halt: no substitution is pre-decided (the direct-link design's mapping does not hold)"
 fi
 
 if [ -n "$SRV_IF" ] && [ -n "$WRK_IF" ]; then
@@ -182,7 +182,7 @@ EOF
 			record "s1.5 $side: $sum (uid != 0 is the unprivileged requirement)"
 			case "$sum" in *"uid=0"*) fail "s1.5 $side: the watch ran as root; the unprivileged question is unanswered" ;; esac
 			case "$sum" in
-			*"route=0"*) fail "s1.5 $side: the poll saw the unplug but the unprivileged PF_ROUTE reader delivered nothing for the cable port — halt (R8): the 2 s poll is the only source and the fallback figure is re-measured in S4" ;;
+			*"route=0"*) fail "s1.5 $side: the poll saw the unplug but the unprivileged PF_ROUTE reader delivered nothing for the cable port — halt: the 2 s poll is the only source and the fallback figure is re-measured in S4" ;;
 			*) pass "s1.5 $side: the unprivileged PF_ROUTE reader delivered the unplug for the cable port" ;;
 			esac
 			case "$sum" in
@@ -310,6 +310,6 @@ recorded "s1.9 $SIDE: ioreg lists $n IOThunderboltPort object(s); keys seen: ${k
 EOF
 	on "$side" "ioreg -c IOThunderboltPort -r -l" >"$RUNG_DIR/ioreg-$side.txt" 2>/dev/null || true
 done
-record "s1.9 the Thunderbolt Bridge service itself is never deleted (R10: the user's System Settings are not edited); whether ioreg alone can substitute is judged from the keys above"
+record "s1.9 the Thunderbolt Bridge service itself is never deleted (the user's System Settings are not edited); whether ioreg alone can substitute is judged from the keys above"
 
 spike_end "$RUNG"

@@ -39,7 +39,7 @@ const (
 	certAddress     = "100.64.9.9"
 )
 
-// The B340 gate: a worker whose stored kubelet serving certificate names an
+// The gate: a worker whose stored kubelet serving certificate names an
 // address the control plane did not assign it is NAMED, at the start that
 // resumes from that certificate and in `k3sm status`.
 //
@@ -190,7 +190,7 @@ func TestAgentResumeWarnsOnACertificateAddressMismatch(t *testing.T) {
 		}
 		// The remedy is the rejoin, and it spans two Macs: the token is minted
 		// on the control plane.
-		for _, want := range []string{"k3sm token create", "k3sm install --role agent", "--token-file"} {
+		for _, want := range []string{"k3sm token create", "k3sm install --agent --server", "--token-file"} {
 			if !strings.Contains(row.Remedy, want) {
 				t.Errorf("remedy = %q, want it to carry %q", row.Remedy, want)
 			}

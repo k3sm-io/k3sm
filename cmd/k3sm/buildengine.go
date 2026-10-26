@@ -122,7 +122,7 @@ func engineBuildRecorded(ctx context.Context, o buildOptions, out io.Writer, rec
 	}
 
 	setupCtx, cancel := context.WithTimeout(ctx, buildxSetupTimeout)
-	sess, err := newBuildxSession(setupCtx, workDirFromEnv(), true, out)
+	sess, err := newBuildxSession(setupCtx, buildxSessionOptions(), true, out)
 	cancel()
 	if err != nil {
 		return err
@@ -147,10 +147,10 @@ func engineBuildRecorded(ctx context.Context, o buildOptions, out io.Writer, rec
 		return err
 	}
 
-	// The SAME delivery as the native path: recorded in this node's store under
-	// --tag, plus the artifact when --output asked for one and the upload when
-	// --push did. Sharing this is what makes "which engine built it" invisible
-	// after the build.
+	// The SAME delivery as the native path: recorded in the cluster registry,
+	// plus the artifact when --output asked for one and the upload when --push
+	// did. Sharing this is what makes "which engine built it" invisible after
+	// the build.
 	return deliver(ctx, o, ref, b, out, record, pushBuilt, sess.endpoint, platform)
 }
 

@@ -27,7 +27,7 @@ import (
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
-// TestContainerStatusIdentityForwarded is the k3sm leg of the B132 gate: the
+// TestContainerStatusIdentityForwarded is the k3sm leg of the identity check: the
 // provider's status translation carries the runtime's identity pair through to
 // the corev1 ContainerStatus the apiserver serves.
 //

@@ -61,10 +61,10 @@ func TestBuildServiceSetDenyAllUntilReady(t *testing.T) {
 }
 
 // TestCanonicalLBServiceIsTheIngressService pins the ONE identity the netd
-// node-address allowlist is bound to (B133). The assembler must name the very
+// node-address allowlist is bound to. The assembler must name the very
 // Service pkg/ingresshost provisions — a drifted or widened ref here would hand
 // the root helper's node-address bind to some other Service, which is exactly
-// the permissiveness B133 removed.
+// the permissiveness the allowlist removed.
 func TestCanonicalLBServiceIsTheIngressService(t *testing.T) {
 	ref := canonicalLBService()
 	if ref.Namespace != ingresshost.ServiceNamespace || ref.Name != ingresshost.ServiceName {

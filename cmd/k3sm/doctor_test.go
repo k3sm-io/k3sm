@@ -129,7 +129,7 @@ func TestDoctorChecksTable(t *testing.T) {
 			e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
 		}, statusSkip},
 		// A state.db that IS there on a worker is the stale <DataRoot>/server
-		// directory of an earlier server-era install, never this node's (B333).
+		// directory of an earlier server-era install, never this node's.
 		// Nor is a posture the worker arm could even fail to read: the role is
 		// consulted first, so an unreadable stale database is still a SKIP and
 		// never the "sudo k3sm doctor" repair of a datastore this Mac lacks.
@@ -304,7 +304,7 @@ func TestDoctorChecksTable(t *testing.T) {
 	// describe the stale <DataRoot>/server database an earlier server-era
 	// install left behind either, readable or not. All three worker cases say
 	// ONE sentence, the one `k3sm status` says, and none of them reads a
-	// posture: the seam is asserted never to have been called (B333).
+	// posture: the seam is asserted never to have been called.
 	t.Run("datastore/a-worker-is-told-it-runs-no-datastore", func(t *testing.T) {
 		t.Parallel()
 		cases := map[string]func() (bool, int, string, error){

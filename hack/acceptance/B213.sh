@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# k3sm B213 acceptance gate — the runnable proof that a node's kubelet SERVING cert
+# k3sm kubelet serving cert acceptance gate — the runnable proof that a node's kubelet SERVING cert
 # chains to the CA the apiserver was told to verify it against.
 #
 # The defect (lab D6, observed on a live two-Mac cluster): `k3sm server --mesh-ip`
 # starts the apiserver with --kubelet-certificate-authority=<cluster CA>, but
 # kubeletServingTLS ALWAYS minted certs.SelfSignedServing and never consumed the
-# cluster-CA-issued keypair the join wire had been delivering since M3.0. Every node
+# cluster-CA-issued keypair the join wire had been delivering since the multi-node join work. Every node
 # therefore presented a cert chaining to nothing:
 #
 #   Error from server: Get "https://<node>:10250/containerLogs/...":
@@ -27,7 +27,7 @@
 #
 #   CI TIER (always runs, GOARCH=arm64 CGO_ENABLED=1 pinned) — the unit-provable
 #   half: the issued pair is what :10250 presents and it chains to the cluster CA;
-#   B176's client-auth stamping survives on the same config; the half-pair refusal
+#   the client-auth stamping survives on the same config; the half-pair refusal
 #   names the SERVER as the cause; the join-delivered pair reaches the worker's node
 #   and an empty one refuses the start; the server's own mint chains to the cluster
 #   CA and its SAN set covers the divergent registered InternalIP of the no-datapath
@@ -42,7 +42,7 @@
 #
 #   LAB TIER (K3SM_LAB=1, a dev Mac; NO root) — the live proof, over the real TLS
 #   handshake: boot `k3sm server --mesh-ip 127.0.0.1 --network none` — the FLAG
-#   alone, no mesh device, so this gate does not secretly depend on the M14.2
+#   alone, no mesh device, so this gate does not secretly depend on the server-mesh
 #   server-side mesh bring-up — verify the cert :10250 actually presents against
 #   <workDir>/tls/cluster-ca.crt and that its SANs cover the address the node
 #   REGISTERED, then run `kubectl logs` on a Running pod, which is the apiserver
@@ -55,7 +55,7 @@
 #
 # WHAT THIS GATE DOES NOT PROVE: the round trip against a JOINED WORKER. One Mac has
 # no second node, so the worker path — the join-delivered pair, d3 — is exercised
-# here only in unit form. That leg is the M14.3 two-Mac session; it is announced
+# here only in unit form. That leg is the two-Mac session; it is announced
 # LAB-PENDING below and never counted as a pass.
 #
 # The GOARCH=arm64 pin is a CORRECTNESS requirement, not hygiene: this Mac's Go
@@ -78,7 +78,7 @@ PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 lab_pending() { echo "LAB-PENDING  $1"; }
 
-echo "==> k3sm B213 acceptance (the kubelet serving cert chains to the cluster CA the apiserver verifies against)"
+echo "==> k3sm kubelet serving cert acceptance (the kubelet serving cert chains to the cluster CA the apiserver verifies against)"
 
 # ---- b213.0 — the gate parses and every wiring source exists ----------------
 b0=ok
@@ -89,8 +89,8 @@ done
 ladder "$b0" "b213.0  gate parses (bash -n) + node.go, agent.go, server.go, certs/serving.go, executor/rotate.go, DESIGN.md present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
-	echo "B213: the gate or a wiring source is missing/unparseable — nothing else can run" >&2
-	echo "B213: $PASS passed, $FAIL failed" >&2
+	echo "kubelet serving cert: the gate or a wiring source is missing/unparseable — nothing else can run" >&2
+	echo "kubelet serving cert: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -215,7 +215,7 @@ run_test "b213.8" 3 TestServerMeshMintFailsClosedWithoutCA     ./cmd/k3sm/
 run_test "b213.9" 2 TestApiserverKubeletCAFlagIffConfigured    ./pkg/executor/
 run_test "b213.9" 2 TestRotationReportsTheKubeletServingPair   ./pkg/executor/
 
-# ---- b213.10 — the B176 neighbour, unchanged -------------------------------
+# ---- b213.10 — the client-cert neighbour, unchanged -------------------------------
 # This change edits the function that carries the CLIENT half. Presenting a
 # verifiable serving cert while losing tls.RequireAndVerifyClientCert would trade
 # this defect for a worse one, so the end-to-end authn proof runs here too.
@@ -226,13 +226,13 @@ run_test "b213.10" 5 TestKubeletEndpointRequiresClientCert     ./pkg/provider/ -
 # ============================================================================
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
-	echo "B213 LAB tier (set K3SM_LAB=1 on a dev Mac to run; no root needed, ~5 min on a cold payload cache):"
+	echo "LAB tier (set K3SM_LAB=1 on a dev Mac to run; no root needed, ~5 min on a cold payload cache):"
 	lab_pending "b213.L1  \`k3sm server --mesh-ip 127.0.0.1 --network none\` reaches apiserver healthz AND registers a node serving :10250"
-	lab_pending "b213.L2  the cert :10250 presents VERIFIES against <workDir>/tls/cluster-ca.crt (RED before: self-signed certificate — B176's client-cert requirement does not hide this, the server cert is sent before client auth completes)"
+	lab_pending "b213.L2  the cert :10250 presents VERIFIES against <workDir>/tls/cluster-ca.crt (RED before: self-signed certificate — the client-cert requirement does not hide this, the server cert is sent before client auth completes)"
 	lab_pending "b213.L3  that leaf's SANs cover the address the node REGISTERED as its InternalIP"
 	lab_pending "b213.L4  kubectl logs on a Running pod completes the apiserver->:10250 round trip (RED before: x509: certificate signed by unknown authority — the exact lab symptom)"
 	lab_pending "b213.L5  a SINGLE-NODE boot still presents a SELF-SIGNED cert (the dev posture, pinned)"
-	lab_pending "b213.L6  [two-Mac harness] the same round trip against a JOINED WORKER — hack/lab/m3.sh at the M14.3 session, NOT provable on one Mac"
+	lab_pending "b213.L6  [two-Mac harness] the same round trip against a JOINED WORKER — hack/lab/m3.sh at the two-Mac session, NOT provable on one Mac"
 else
 	LAB_ROOT="${K3SM_B213_LAB_ROOT:-/tmp/k3sm-b213}"
 	LAB_BIN="$LAB_ROOT/k3sm"
@@ -307,7 +307,7 @@ else
 	}
 
 	# presented_leaf <outfile> — the certificate :10250 actually sends. openssl's
-	# handshake FAILS here by design (B176 requires a client cert this gate does not
+	# handshake FAILS here by design (the apiserver requires a client cert this gate does not
 	# hold), and that is irrelevant: the server certificate is sent before client
 	# auth completes, so the chain is on the wire either way.
 	presented_leaf() {
@@ -325,7 +325,7 @@ else
 	if [ "$FAIL" -eq 0 ]; then
 		MESH_WD="$LAB_ROOT/mesh"
 		echo "----------------------------------------"
-		echo "B213 LAB tier: booting a MESH-PATH control plane (mutates this Mac's :$LAB_API_PORT/:$LAB_KINE_PORT/:$LAB_KUBELET_PORT listeners)"
+		echo "LAB tier: booting a MESH-PATH control plane (mutates this Mac's :$LAB_API_PORT/:$LAB_KINE_PORT/:$LAB_KUBELET_PORT listeners)"
 		if lab_boot "$MESH_WD" b213mesh --mesh-ip 127.0.0.1; then
 			ladder ok "b213.L1  \`k3sm server --mesh-ip 127.0.0.1 --network none\` reached healthz and registered a Ready node serving :$LAB_KUBELET_PORT"
 		else
@@ -375,7 +375,7 @@ else
 			*"hello from a k3sm native pod"*)
 				ladder ok "b213.L4  kubectl logs completed the apiserver->:10250 round trip on the mesh path" ;;
 			*"unknown authority"*)
-				ladder no "b213.L4  kubectl logs: $logs_out — this IS the B213 symptom; the node's serving cert does not chain to the CA the apiserver verifies against" ;;
+				ladder no "b213.L4  kubectl logs: $logs_out — this IS the symptom; the node's serving cert does not chain to the CA the apiserver verifies against" ;;
 			*)
 				ladder no "b213.L4  kubectl logs completed the apiserver->:10250 round trip — got: ${logs_out:-<no output>}" ;;
 			esac
@@ -389,7 +389,7 @@ else
 		# fix had made EVERY node serve a cluster-CA cert, silently changing the
 		# single-node path this item deliberately leaves alone.
 		SOLO_WD="$LAB_ROOT/solo"
-		echo "B213 LAB tier: booting a SINGLE-NODE control plane (the self-signed posture, pinned)"
+		echo "LAB tier: booting a SINGLE-NODE control plane (the self-signed posture, pinned)"
 		if lab_boot "$SOLO_WD" b213solo; then
 			SOLO_LEAF="$LAB_ROOT/kubelet-leaf-solo.pem"
 			if presented_leaf "$SOLO_LEAF" && ! openssl verify -CAfile "$MESH_WD/tls/cluster-ca.crt" "$SOLO_LEAF" >/dev/null 2>&1 &&
@@ -404,14 +404,14 @@ else
 		fi
 		lab_down
 	fi
-	lab_pending "b213.L6  [two-Mac harness] the same round trip against a JOINED WORKER — the M14.3 session, NOT provable on one Mac"
+	lab_pending "b213.L6  [two-Mac harness] the same round trip against a JOINED WORKER — the two-Mac session, NOT provable on one Mac"
 fi
 
 echo "----------------------------------------"
-echo "B213: $PASS passed, $FAIL failed"
+echo "kubelet serving cert: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 if [ "${K3SM_LAB:-}" = 1 ]; then
-	echo "================ B213 GREEN (CI + LAB tiers) ================"
+	echo "================ kubelet serving cert GREEN (CI + LAB tiers) ================"
 else
-	echo "================ B213 GREEN (CI tier; the lab rungs are owed) ================"
+	echo "================ kubelet serving cert GREEN (CI tier; the lab rungs are owed) ================"
 fi

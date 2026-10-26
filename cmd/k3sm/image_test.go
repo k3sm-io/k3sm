@@ -45,21 +45,21 @@ type fakeImagesDaemon struct {
 	gotPrune  *runtimev1.PruneImagesRequest
 	pruneResp *runtimev1.PruneImagesResponse
 	pruneErr  error
-	listResp  *runtimev1.ListImagesResponse
-	fsResp    *runtimev1.ImageFsInfoResponse
 
 	// LoadImage is client-streaming, so the fake keeps the metadata frame apart
 	// from the concatenated payload: the gate asserts on both independently.
+	loadCalls  int
 	loadFirst  *runtimev1.LoadImageRequest
 	loadBody   []byte
 	loadChunks int
 	loadResp   *runtimev1.LoadImageResponse
 	loadErr    error
 
-	// The B191 verbs. Each keeps the request it was handed, because the gate's
+	// The verbs. Each keeps the request it was handed, because the gate's
 	// claim is that the CLI is a CLIENT — the daemon decides — and the only way
 	// to see that is what reached the wire.
 	gotPull     *runtimev1.PullImageRequest
+	pullCalls   int
 	pullResp    *runtimev1.PullImageResponse
 	pullErr     error
 	gotTag      *runtimev1.TagImageRequest
@@ -84,6 +84,7 @@ type fakeImagesDaemon struct {
 
 func (f *fakeImagesDaemon) PullImage(_ context.Context, req *runtimev1.PullImageRequest) (*runtimev1.PullImageResponse, error) {
 	f.gotPull = req
+	f.pullCalls++
 	if f.pullErr != nil {
 		return nil, f.pullErr
 	}
@@ -141,17 +142,10 @@ func (f *fakeImagesDaemon) PruneImages(_ context.Context, req *runtimev1.PruneIm
 	return f.pruneResp, nil
 }
 
-func (f *fakeImagesDaemon) ListImages(context.Context, *runtimev1.ListImagesRequest) (*runtimev1.ListImagesResponse, error) {
-	return f.listResp, nil
-}
-
-func (f *fakeImagesDaemon) ImageFsInfo(context.Context, *runtimev1.ImageFsInfoRequest) (*runtimev1.ImageFsInfoResponse, error) {
-	return f.fsResp, nil
-}
-
 // LoadImage drains the ingest stream, recording the metadata frame and every
 // payload byte. It answers exactly once, at the end, as the RPC's shape requires.
 func (f *fakeImagesDaemon) LoadImage(stream runtimev1.Images_LoadImageServer) error {
+	f.loadCalls++
 	for {
 		req, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -176,7 +170,7 @@ func (f *fakeImagesDaemon) LoadImage(stream runtimev1.Images_LoadImageServer) er
 // serveFakeImages serves fake on a REAL unix socket and returns its path, so the
 // gate exercises the production dialer (dialRuntimed) end to end rather than a
 // substituted transport.
-func serveFakeImages(t *testing.T, fake *fakeImagesDaemon) string {
+func serveFakeImages(t *testing.T, fake runtimev1.ImagesServer) string {
 	t.Helper()
 	// t.TempDir() embeds the test name and overflows darwin's 104-byte sun_path.
 	dir, err := os.MkdirTemp("", "k3i")
@@ -222,7 +216,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 		}}
 		sock := serveFakeImages(t, fake)
 
-		out, err := runImageCmd(t, []string{"--socket", sock, "prune"})
+		out, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", t.TempDir(), "prune"})
 		if err != nil {
 			t.Fatalf("image prune: %v", err)
 		}
@@ -246,7 +240,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 		}}
 		sock := serveFakeImages(t, fake)
 
-		out, err := runImageCmd(t, []string{"--socket", sock, "prune", "--force"})
+		out, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", t.TempDir(), "prune", "--force"})
 		if err != nil {
 			t.Fatalf("image prune --force: %v", err)
 		}
@@ -268,7 +262,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 		}}
 		sock := serveFakeImages(t, fake)
 
-		out, err := runImageCmd(t, []string{"--socket", sock, "prune"})
+		out, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", t.TempDir(), "prune"})
 		if err != nil {
 			t.Fatalf("image prune: %v", err)
 		}
@@ -287,7 +281,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 			"image: reachability root set is incomplete: pod \"pod-x\": no images.json")}
 		sock := serveFakeImages(t, fake)
 
-		_, err := runImageCmd(t, []string{"--socket", sock, "prune"})
+		_, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", t.TempDir(), "prune"})
 		if err == nil {
 			t.Fatalf("a refused prune exited 0")
 		}
@@ -302,7 +296,7 @@ func TestImagePruneIsAnRPCClient(t *testing.T) {
 			t.Fatalf("MkdirTemp: %v", err)
 		}
 		defer os.RemoveAll(dir)
-		_, err = runImageCmd(t, []string{"--socket", filepath.Join(dir, "absent.sock"), "prune", "--timeout", "2s"})
+		_, err = runImageCmd(t, []string{"--socket", filepath.Join(dir, "absent.sock"), "--work-dir", dir, "prune", "--timeout", "2s"})
 		if err == nil {
 			t.Fatalf("prune succeeded with no daemon listening — the CLI must never fall back to walking the store itself")
 		}
@@ -336,7 +330,7 @@ func TestImageArgParsing(t *testing.T) {
 		},
 		{
 			name: "the socket defaults to the daemon's own",
-			args: []string{"ls"},
+			args: []string{"prune"},
 			check: func(t *testing.T, o imageOptions) {
 				if o.socket == "" {
 					t.Errorf("socket default is empty")
@@ -358,48 +352,6 @@ func TestImageArgParsing(t *testing.T) {
 			}
 			tc.check(t, o)
 		})
-	}
-}
-
-// TestImageLsAndDf covers the two read subcommands' rendering, including the
-// clonefile caveat df must not omit.
-func TestImageLsAndDf(t *testing.T) {
-	fake := &fakeImagesDaemon{
-		listResp: &runtimev1.ListImagesResponse{Images: []*runtimev1.Image{{
-			Manifest: &runtimev1.ImageManifest{
-				Reference: "example.test/app:v1",
-				Config:    &runtimev1.Descriptor{Digest: "sha256:cfg"},
-				Layers:    []*runtimev1.Descriptor{{Digest: "sha256:l1"}, {Digest: "sha256:l2"}},
-			},
-		}}},
-		fsResp: &runtimev1.ImageFsInfoResponse{
-			StoreBytes: 2 << 30,
-			Filesystems: []*runtimev1.FilesystemUsage{{
-				Mountpoint: "/var/lib/k3sm", UsedBytes: 1 << 30,
-				CapacityBytes: 100 << 30, AvailableBytes: 40 << 30,
-			}},
-		},
-	}
-	sock := serveFakeImages(t, fake)
-
-	out, err := runImageCmd(t, []string{"--socket", sock, "ls"})
-	if err != nil {
-		t.Fatalf("image ls: %v", err)
-	}
-	for _, want := range []string{"example.test/app:v1", "sha256:cfg", "REFERENCE"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("ls output missing %q:\n%s", want, out)
-		}
-	}
-
-	out, err = runImageCmd(t, []string{"--socket", sock, "df"})
-	if err != nil {
-		t.Fatalf("image df: %v", err)
-	}
-	for _, want := range []string{"/var/lib/k3sm", "2.0 GiB", "40.0 GiB available", "APFS clones share extents"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("df output missing %q:\n%s", want, out)
-		}
 	}
 }
 

@@ -44,7 +44,7 @@ codesign --verify: OK
 **Verdict:** GO — the entitlement-only ad-hoc dev path is proven sufficient
 (row 3) AND necessary (row 2 names the entitlement as the missing piece; row 1
 shows an unsigned binary never reaches VZ at all). A NO-GO here would have been
-TERMINAL for M11 and fired the M11 plan's R19(b); it did not occur.
+TERMINAL for M11 and fired the NO-GO halt; it did not occur.
 
 ## Criterion 2 — console tokens · **GO/NO-GO**
 
@@ -63,7 +63,7 @@ K3SM_S1_DONE
 kernel command line and appeared on the virtio console.
 
 **2b gzip control** — `VZLinuxBootLoader` must REJECT a gzipped `Image`. This is
-recorded here so B111's uncompressed-arm64 constraint is a fact rather than a
+recorded here so the pinned-kernel work's uncompressed-arm64 constraint is a fact rather than a
 first-boot discovery.
 
 ```
@@ -72,7 +72,7 @@ VZBOOT_FAIL stage=start err=Error Domain=VZErrorDomain Code=1
   Description="Internal Virtualization error. The virtual machine failed to start."
 ```
 
-Note the asymmetry, worth carrying into B111: the missing entitlement fails at
+Note the asymmetry, worth carrying into the pinned-kernel work: the missing entitlement fails at
 config VALIDATE with a named cause; a gzipped Image fails at START with a
 generic internal error. The artifact-verify path must not expect VZ to name a
 bad kernel format.
@@ -81,7 +81,7 @@ bad kernel format.
 
 ## Criterion 3 — cold-boot latency · RECORDING
 
-Two figures, because they answer different questions. A is the plan's named
+Two figures, because they answer different questions. A is the named
 figure; **B is what a user experiences as vm-pod restart cost** and is the one
 `limitations.md` publishes.
 
@@ -90,7 +90,7 @@ figure; **B is what a user experiences as vm-pod restart cost** and is the one
 | A: kernel start → init exec | 50ms | 50ms | 60ms | 60ms |
 | B: CreateVM → console token | 148ms | 165ms | 171ms | 172ms |
 
-N=20. Raw: `out/latency.tsv` on the rig. Figure A is the guest's own
+N=20. Raw: `out/latency.tsv` on the lab host. Figure A is the guest's own
 `/proc/uptime` at init exec (10ms resolution). Figure B is derived as
 create→start (host clock, 98–122ms across runs) plus figure A; the token print
 follows init exec by under a millisecond, so the derivation does not flatter it.
@@ -98,7 +98,7 @@ follows init exec by under a millisecond, so the derivation does not flatter it.
 8-second wait and must never be quoted as one.
 
 > Review trigger, not a gate: a median B above ~10s should force a re-read of
-> the `RestartContainer` → whole-pod-recreate claim in M11.2-d6, whose
+> the `RestartContainer` → whole-pod-recreate claim in the container-restart design, whose
 > backoff-bounded-churn argument is latency-dependent. **At 165ms median the
 > trigger does not fire, with two orders of magnitude of margin.**
 
@@ -128,7 +128,7 @@ source address — so this is isolation, not a broken guest.
 a documented guarantee**, and `findings-s5.md` records why it must not be
 published as a security ceiling on that basis.
 
-## Criterion 5 — Seatbelt × VZ coexistence · decides Resolution 7
+## Criterion 5 — Seatbelt × VZ coexistence · decides the vmhost confinement design
 
 The confined process applies the **product's own pod profile** — a verbatim copy
 of what `runtimed` `pkg/sandbox/sbpl.go` `Generate()` emits for a networked pod
@@ -185,10 +185,10 @@ The positive control reads the pod's own data volume — readable, so the
 negative is a targeted denial and not a profile that broke everything.
 
 **Verdict:** WORKS, both orderings, with the profile proven in force.
-Resolution 7's vmhost confinement is **not** blocked by Seatbelt: a vmhost
+The vmhost confinement is **not** blocked by Seatbelt: a vmhost
 process can be confined by the ordinary pod profile and still drive VZ, and it
 does not matter whether confinement precedes or follows VM construction. The
-M11 plan's R22 residual is not needed for this criterion on this rig.
+The documented residual is not needed for this criterion on this rig.
 
 Scope of the claim, stated so it is not over-read: this covers VM
 **construction and start plus a full guest run to power-down** with a virtio
@@ -207,7 +207,7 @@ targets.
 | probe returned | `LinuxRosettaAvailabilityInstalled` |
 | raised? | no — `VZBOOT_ROSETTA_PROBE_DID_NOT_RAISE`, exit=0, unentitled binary |
 
-**Verdict:** PASS — and the rig fact that Rosetta for Linux is INSTALLED here is
+**Verdict:** PASS — and the lab host fact that Rosetta for Linux is INSTALLED here is
 recorded for the v0.1.x amd64 follow-on's lab planning.
 
 ## Deviations from the guardrails

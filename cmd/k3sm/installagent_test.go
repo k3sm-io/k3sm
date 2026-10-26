@@ -76,7 +76,7 @@ func TestInstallAgentFlags(t *testing.T) {
 	})
 
 	t.Run("--node-ip is optional on an agent", func(t *testing.T) {
-		// B338: this Mac's mesh address is the control plane's to assign and the
+		// This Mac's mesh address is the control plane's to assign and the
 		// join returns it, so requiring the flag here made every agent install
 		// start by guessing a value only the server's allocator knew.
 		if _, err := parseInstallFlags([]string{"--agent", "--server", "192.0.2.10"}); err != nil {

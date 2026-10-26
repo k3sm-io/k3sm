@@ -1,4 +1,4 @@
-# S4 — image size & materialize latency (M8.0-d4) — **PASS on both thresholds; ONE packaging defect found**
+# S4 — image size & materialize latency — **PASS on both thresholds; ONE packaging defect found**
 
 > **Verdict: PASS.** Both pruning thresholds clear by an order of magnitude
 > (0.37 GB unpacked against >2 GB; 3.2 s to first token against >1 min), so the
@@ -9,12 +9,12 @@
 > All 9 python-build-standalone symlinks survive COPY → layer → unpack with
 > byte-identical targets, all 7 963 regular files survive with an identical
 > whole-tree content digest, and the unpacked tree execs *through* the
-> `bin/python3` symlink. M8.4 needs no re-plan on this axis.
+> `bin/python3` symlink. The image build needs no re-plan on this axis.
 >
 > **But the spike found a real defect while proving it:** the emitted layer blob
 > is **gzip bytes carrying an UNCOMPRESSED mediaType**. It did not break the
 > round-trip here only because bsdtar sniffs gzip. See §The layer-format defect —
-> this is a **blocking prerequisite for M8.4**, not an S4 threshold failure.
+> this is a **blocking prerequisite for the image build**, not an S4 threshold failure.
 
 Run: 2026-08-29 on the S1 rig, agent-driven over ssh. Re-run with
 `hack/spike/m8/s4.sh` (`--restage` to rebuild the staged rootfs, `--no-build` to
@@ -31,7 +31,7 @@ GOARCH=arm64`, Go 1.27.0, `GOWORK=off`) from a source copy pushed into the
 prefix, so the arch-sensitive parts of the measurement are native rather than
 translated.
 
-### The staged rootfs — what M8.4-d1 will actually ship
+### The staged rootfs — what the image build will actually ship
 
 ```
 python-build-standalone CPython 3.12.14 (macos-aarch64)
@@ -40,7 +40,7 @@ python-build-standalone CPython 3.12.14 (macos-aarch64)
   NO model weights (weights are a PVC concern, never image content)
 ```
 
-Three mechanical facts about that assembly, each of which M8.4-d1 must encode:
+Three mechanical facts about that assembly, each of which the image build must encode:
 
 1. **`uv pip compile --generate-hashes` must NOT be given `--python-platform macos`.**
    Its default is macOS 13.0, for which **no `mlx` wheel exists** — mlx ships
@@ -87,7 +87,7 @@ precompiled Metal shader library). It is not prunable: it is what makes the S1
 finding "no shader-cache write is needed" true, because the kernels are already
 compiled. Treat it as the floor. Any future *pruning* exercise should start with
 `pip`, `pygments` and `share/`, which together are under 3 % — i.e. pruning is
-not a lever on this payload, and the plan's remediation branch is moot.
+not a lever on this payload, and the remediation branch is moot.
 
 **Compression is worth 2.7×** on the wire: 401 352 401 B of files → a
 150 933 138 B layer blob. See the defect section for why that is a finding
@@ -116,13 +116,13 @@ operation** — device open through the two `iokit-open` user clients, pipeline
 state setup. It is a **one-time per-process** cost, not a per-token one: the
 remaining 11 tokens take 50 ms in both modes.
 
-**Consequence for M8.5:** a readiness/health probe with an `initialDelaySeconds`
+**Consequence for the readiness probe:** a readiness/health probe with an `initialDelaySeconds`
 or `timeoutSeconds` tuned against an unsandboxed dev measurement will flap. Size
 the first-token budget from the **sandboxed** column, and note it scales with
 model size only in the "weights loaded" term — the ~2.1 s Metal-init term is
 model-independent.
 
-**Honest limit on "cold".** Dropping the page cache needs root, which the M8.0
+**Honest limit on "cold".** Dropping the page cache needs root, which the M8 spike
 lab guardrails forbid, so **both columns are warm-page-cache**. They therefore
 measure *process* cold start, not *first-pull-on-a-fresh-node* cold start. The
 threshold is still cleared by 19× with the entire disk-read term at zero, so the
@@ -144,7 +144,7 @@ Measured on a clone so the stage stays pristine.
 **41 Mach-Os — the exact count S2 measured** across `venv/` + `pyinstall/`,
 reproduced here on an independently assembled tree (and internally consistent:
 S5 counts 30 in the mlx-lm venv alone, plus S2's 11 in the CPython dist). S2's
-"41 is an M8.0 datum, not an M8.4 budget" caveat is discharged **for this
+"41 is an M8 spike datum, not an image-build budget" caveat is discharged **for this
 payload** — and **findings-s5.md re-opens it with the number**: the chosen engine
 brings the tree to ~353 Mach-Os over ~36 000 entries, which is where the walk
 cost below stops being a footnote.
@@ -160,10 +160,10 @@ Exactly one file, exactly the fat `google/_upb/_message.abi3.so` S2 characterize
 (x86_64 slice unsigned, arm64 slice valid). `codesign -v --arch arm64` reports it
 **valid**; bare `codesign -v` reports it **invalid**. So a whole-file check would
 re-sign one file per tree that needs no signing — de-CoWing it, which is what
-Res. 13's check-then-sign-only-if-invalid clause exists to prevent.
+the check-then-sign-only-if-invalid clause exists to prevent.
 **`AdHocSignTree` must verify with `--arch <native>`.**
 
-**The cost shape is the useful finding, and it is the opposite of what the plan
+**The cost shape is the useful finding, and it is the opposite of what was
 budgeted for.** Signing is *free* (0.67 s worst case); **finding** the Mach-Os
 costs 12× more (8.4 s) because it is a `file(1)` exec per candidate over 7 963
 files. A Go implementation reading the 4-byte Mach-O magic itself collapses that
@@ -193,7 +193,7 @@ adds only 0.5 s for 401 MB.
 terms scale with entry count and model size respectively, neither with image
 bytes.
 
-## E. Per-pod rootfs write amplification — **9 files, 37 KB** (a new number the plan did not ask for)
+## E. Per-pod rootfs write amplification — **9 files, 37 KB** (a new number the spike did not ask for)
 
 Every byte a pod writes *inside* its cloned rootfs breaks CoW sharing with every
 other pod on the node. Measured after four starts:
@@ -214,7 +214,7 @@ architectures accumulates a little private state per pod, and a **read-only
 rootfs would make the interpreter fail to write and fall back to recompiling on
 every start** (~0.8 s of the import phase).
 
-**Recommendation for M8.4-d1:** either ship `PYTHONDONTWRITEBYTECODE=1` in the
+**Recommendation for the image build:** either ship `PYTHONDONTWRITEBYTECODE=1` in the
 image `ENV` and accept the recompile, or (better) run `compileall` over
 site-packages at build time so the count goes to zero and the tree stays fully
 shared. The latter is one build-script line and keeps the import phase at 0.8 s.
@@ -291,7 +291,7 @@ the unpacked rootfs was executed via the symlink and reached the GPU.
 ### Reproducibility
 
 Two builds of the same context and Dockerfile: **IDENTICAL** manifest digest
-`sha256:c97691ca…`. That is M8.4-d1's "builds reproducibly from the lockfile"
+`sha256:c97691ca…`. That is the image build's "builds reproducibly from the lockfile"
 gate in miniature — with the caveat in the defect section below.
 
 ### Negative controls — one build per symlink SHAPE
@@ -308,7 +308,7 @@ one):
 | `dangling.txt -> nowhere.txt` | **1** | `COPY ".": source not found in the build context` |
 | `escape.txt -> ../../../etc/hosts` | **1** | `COPY ".": source not found in the build context` |
 
-**Binding for M8.4-d1:** the builder accepts **relative, resolvable, in-context**
+**Binding for the image build:** the builder accepts **relative, resolvable, in-context**
 symlinks and **nothing else**. This is not hypothetical for this payload — `uv
 python install` maintains a version-alias symlink
 (`cpython-3.12-macos-aarch64-none → <absolute> cpython-3.12.14-macos-aarch64-none`)
@@ -324,7 +324,7 @@ the behavior (refuse) is right.
 
 ## The layer-format defect — **gzip bytes under an uncompressed mediaType**
 
-Found while proving the premise. **This is a prerequisite for M8.4, and it is a
+Found while proving the premise. **This is a prerequisite for the image build, and it is a
 `pkg/oci` bug, not an S4 threshold failure.**
 
 ```
@@ -364,7 +364,7 @@ layer with **`open: layer.Compressed`** and hands the reader to
 `LayerApplier.Apply`, which does `tar.NewReader` — and `runtimed` contains **no
 gzip decompression anywhere**. `Apply` has no production caller yet (the puller
 lands with the OCI-layer unpacker), so **the bug is latent, not live** — which is
-precisely why recording it now is worth more than finding it during M8.4
+precisely why recording it now is worth more than finding it during the image build
 integration.
 
 **Root cause.** `pkg/oci/layer.go:103` calls
@@ -381,7 +381,7 @@ is taken over gzip output, the emitted digest **does** depend on `compress/flate
 byte-level behavior. The IDENTICAL-digest result above was two builds of one
 binary; it is **not** evidence of reproducibility across Go toolchain versions,
 which is exactly the property the comment was protecting and exactly what
-M8.4-d1's "builds reproducibly from the lockfile" gate will be read to mean. Do
+the image build's "builds reproducibly from the lockfile" gate will be read to mean. Do
 not cite this spike's IDENTICAL result as cross-toolchain reproducibility.
 
 **Two acceptable fixes, one decision:**
@@ -394,7 +394,7 @@ not cite this spike's IDENTICAL result as cross-toolchain reproducibility.
    up the cross-toolchain digest-stability property the comment argues for.
 
 Either way the unpacker must be verified against the choice. **This is on the
-critical path for M8.4-d2's digest-pinned publish** — a digest that is not stable
+critical path for the image build's digest-pinned publish** — a digest that is not stable
 across toolchains cannot be pinned, and a mislabelled layer will not be pulled by
 a spec-conformant client.
 
@@ -402,7 +402,7 @@ a spec-conformant client.
 
 1. **No pruning.** 0.37 GB and 3.2 s clear both thresholds by ~5× and ~19×. The
    remediation branch does not fire.
-2. **Fix or re-declare the layer mediaType before M8.4-d1 lands** — and verify
+2. **Fix or re-declare the layer mediaType before the image build lands** — and verify
    the unpacker against the choice. `runtimed` has no gunzip path today.
 3. **`AdHocSignTree` verifies per-arch** (`--arch <native>`), confirmed again on
    an independent tree: 0 invalid arch-aware, 1 invalid whole-file, same file.
@@ -420,6 +420,6 @@ a spec-conformant client.
 7. **`compileall` at build time, or `PYTHONDONTWRITEBYTECODE=1` in the image ENV** —
    otherwise every pod CoW-breaks ~9 files of `__pycache__`, and the set depends
    on which model runs.
-8. **Size M8.5's readiness probe off the SANDBOXED first-token number.** Seatbelt
+8. **Size the readiness probe off the SANDBOXED first-token number.** Seatbelt
    adds ~2.1 s, all of it one-time Metal device/pipeline init, none of it
    per-token.

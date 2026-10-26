@@ -63,7 +63,7 @@ func serverCfg() Config {
 	}
 }
 
-// TestAgentInstallProvisionsTheMeshHelperKey is the B325 gate.
+// TestAgentInstallProvisionsTheMeshHelperKey pins this contract.
 //
 // The defect: `k3sm install` never put this node's wireguard private key in the
 // root-only directory netd's MeshKeyResolver reads, and did not even create that

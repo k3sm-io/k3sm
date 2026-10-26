@@ -103,7 +103,7 @@ func closedChan() <-chan struct{} {
 	return c
 }
 
-// TestDaemonExitStopsTheRuntimeAndTheControlPlaneConcurrently is B320's gate.
+// TestDaemonExitStopsTheRuntimeAndTheControlPlaneConcurrently is the gate for this behaviour.
 //
 // A stopping `k3sm server` runs its two longest teardown stages — the embedded
 // runtime's close (every vm host helper) and the control-plane stop (kine, the

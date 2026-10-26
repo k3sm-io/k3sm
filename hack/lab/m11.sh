@@ -9,7 +9,7 @@
 #             requires dev-mac + vz + network. The LAUNCH row: the vm path
 #             (linux/arm64) must demonstrate this before v0.1 ships.
 #   M11-lab   gate hack/lab/m11.sh (NO args), tier lab, manual: true,
-#             requires vz + network. The FULL B109 ledger — every vm-path leg.
+#             requires vz + network. The FULL vm-path ledger — every vm-path leg.
 #
 # --core is a STRICT SUBSET. A green --core run NEVER satisfies M11-lab; the two rows
 # exist precisely so a launch-blocking subset cannot be mistaken for the whole ledger,
@@ -39,17 +39,17 @@
 #                      recreate against the SAME claim, and find BOTH the old and a new
 #                      marker. Root-in-guest image and NO fsGroup, deliberately: spike
 #                      S3(2) recorded NO (Apple's virtiofs refuses
-#                      mount_setattr(MOUNT_ATTR_IDMAP), EINVAL), and the M11 plan's
-#                      pre-decided consequence moves the fsGroup case to the follow-on.
+#                      mount_setattr(MOUNT_ATTR_IDMAP), EINVAL), and the pre-decided
+#                      consequence moves the fsGroup case to the follow-on.
 #   m11.7  network     in-guest: eth0 UP with an address on the node's vmnet segment and
 #                      a default route; an FQDN resolved through the cluster DNS VIP; a
 #                      TCP connect to the kubernetes ClusterIP:443. From the host: a TCP
 #                      connect to the guest's leased address on a port the pod listens on.
 #   m11.8  amd64       NEGATIVE: an amd64-only image under runtimeClassName: vm FAILS,
 #                      and the failure names the platform mismatch. This is the arm64-only
-#                      posture of this release (M11 plan R19(a)/R26), asserted so a silent
+#                      posture of this release, asserted so a silent
 #                      widening — or an opaque exec-format death in the guest — is caught.
-#   m11.9  footprint   the host-side footprint of ONE vm pod, RECORDED for the B24
+#   m11.9  footprint   the host-side footprint of ONE vm pod, RECORDED for the
 #                      overhead reconcile. A recording criterion never fails the gate:
 #                      there is no committed budget to hold it to, and inventing one here
 #                      would be either vacuous or flaky.
@@ -115,7 +115,7 @@ while [ "$#" -gt 0 ]; do
 		GATE_NAME="M11-core"
 		;;
 	-h | --help)
-		echo "usage: $0 [--core]   (--core = the launch subset; no args = the full B109 ledger)"
+		echo "usage: $0 [--core]   (--core = the launch subset; no args = the full vm-path ledger)"
 		exit 0
 		;;
 	*)
@@ -303,7 +303,7 @@ if [ "${K3SM_LAB:-}" != "1" ]; then
 	if [ "$MODE" = "core" ]; then
 		echo "${GATE_NAME} gate: PENDING (dev-mac + vz + network). The launch subset of the vm path (--core) needs K3SM_LAB=1 + a real VZ-capable Mac; this is NOT a pass."
 	else
-		echo "${GATE_NAME} gate: PENDING (vz + network). The FULL B109 vm-path ledger needs K3SM_LAB=1 + a real VZ-capable Mac; a --core green does not satisfy it. This is NOT a pass."
+		echo "${GATE_NAME} gate: PENDING (vz + network). The FULL vm-path ledger needs K3SM_LAB=1 + a real VZ-capable Mac; a --core green does not satisfy it. This is NOT a pass."
 	fi
 	exit 0
 fi
@@ -664,7 +664,7 @@ if [ -n "$VMHOST_PID" ]; then
 	RSS_KB="$(printf '%s' "$FOOTPRINT" | awk '{print $1}')"
 	RSS_MIB="$(python3 -c 'import sys; print("%.1f" % (int(sys.argv[1]) / 1024.0))' "${RSS_KB:-0}" 2>/dev/null || echo "?")"
 	ladder rec "m11.9  per-VM host footprint: k3sm-vmhost pid $VMHOST_PID rss ${RSS_MIB} MiB (rss_kb vsz_kb etime pcpu: $FOOTPRINT)"
-	note "recorded for the B24 overhead reconcile (RuntimeClass overhead.podFixed); this rung never fails the gate"
+	note "recorded for the overhead reconcile (RuntimeClass overhead.podFixed); this rung never fails the gate"
 else
 	ladder rec "m11.9  per-VM host footprint: NOT RECORDED — no k3sm-vmhost process matched pod uid '${BOOT_UID:-none}'"
 fi
@@ -696,7 +696,7 @@ fi
 # claim that omits it never binds (docs/user/storage.md).
 #
 # Root-in-guest image and NO fsGroup: spike S3(2) recorded NO — Apple's virtiofs refuses
-# mount_setattr(MOUNT_ATTR_IDMAP) with EINVAL — and the M11 plan's pre-decided
+# mount_setattr(MOUNT_ATTR_IDMAP) with EINVAL — and the pre-decided
 # consequence substitutes a root-in-guest image here and moves PVC-PGDATA-with-fsGroup to
 # the follow-on. Adding an fsGroup here would assert a capability the platform does not
 # have.

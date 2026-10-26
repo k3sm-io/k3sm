@@ -29,7 +29,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// Uninstall's pod teardown.
+// The pod teardown shared by uninstall and stop (teardown.go).
 //
 // A native pod's processes are session leaders that outlive the node daemon on
 // purpose: a daemon restart re-attaches to them. So booting the daemon out

@@ -38,8 +38,9 @@ import (
 //
 // The record below is the daemon's own memory of that loop. Every component
 // crash appends one entry; the window and the threshold are constants (a
-// runtime knob here would be a feature flag on a daemon-lifecycle decision, which
-// .claude/rules/plans-default-hard-cut.md forbids); once the threshold is
+// runtime knob here would be a feature flag on a daemon-lifecycle decision;
+// operator-flippable behavior belongs in a resource field read on reconcile,
+// not in an environment switch); once the threshold is
 // reached inside the window the record is TRIPPED and stays tripped until an
 // operator clears it — that is the point: a loop that quietly self-resets has no
 // operator in it.

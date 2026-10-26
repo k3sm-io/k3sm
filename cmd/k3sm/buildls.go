@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"k3sm.io/k3sm/pkg/builder"
 	"k3sm.io/k3sm/pkg/buildledger"
@@ -65,9 +64,10 @@ type buildRecord struct {
 	// started is whether the running record was written; a record that never
 	// started is not finished either, so a ledger that failed once stays quiet.
 	started bool
-	// digest is the digest of the image the store recorded, captured by the
-	// recorder wrapper on the path that ran.
-	digest string
+	// reference and digest are the cluster-registry reference and the digest
+	// the recording wrote, captured by the recorder wrapper on the path that ran.
+	reference string
+	digest    string
 	// log is the build's stored log (`k3sm build logs`), or nil when it could
 	// not be created.
 	log *buildledger.LogWriter
@@ -207,13 +207,16 @@ func (tr *buildRecord) engine(next engineBuilder) engineBuilder {
 	}
 }
 
-// recorder wraps the store seam to capture the digest of the image it records.
+// recorder wraps the store seam to capture the registry reference and the
+// digest of what it records: the index for a multi-platform build, which is
+// what the registry serves under the reference.
 func (tr *buildRecord) recorder(next storeRecorder) storeRecorder {
-	return func(ctx context.Context, ref name.Tag, img ggcrv1.Image) error {
-		if err := next(ctx, ref, img); err != nil {
+	return func(ctx context.Context, ref name.Tag, b built) error {
+		if err := next(ctx, ref, b); err != nil {
 			return err
 		}
-		if d, err := img.Digest(); err == nil {
+		tr.reference = ref.String()
+		if d, err := b.digest(); err == nil {
 			tr.digest = d.String()
 		}
 		return nil
@@ -230,6 +233,7 @@ func (tr *buildRecord) finish(cancelled bool, buildErr error) {
 	if cancelled {
 		_, err = tr.ledger.Cancel(tr.rec)
 	} else {
+		tr.rec.Reference = tr.reference
 		_, err = tr.ledger.Finish(tr.rec, tr.digest, buildErr)
 	}
 	if err != nil {

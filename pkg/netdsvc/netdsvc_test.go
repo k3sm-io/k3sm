@@ -53,7 +53,7 @@ func TestPortAuthorizer(t *testing.T) {
 // provisions and the `k3sm netd` assembler binds.
 var canonicalIngress = ServiceRef{Namespace: "kube-system", Name: "k3sm-ingress"}
 
-// TestNetdAuthorizerNodeAddrLB is the M10.3 deny-by-default table for the
+// TestNetdAuthorizerNodeAddrLB is the deny-by-default table for the
 // node-own-address extension: a <1024 bind on the node's OWN InternalIP is
 // authorized ONLY when the canonical ingress LoadBalancer declares the port.
 // Everything else — wrong address, wrong port, only a non-LB Service declaring,
@@ -268,9 +268,9 @@ func TestBuildConfig(t *testing.T) {
 	})
 }
 
-// TestNodeAddressAuthorizerAllowlist is the B133 gate: the node-own-address
+// TestNodeAddressAuthorizerAllowlist pins that the node-own-address
 // bind class is an ALLOWLIST keyed on namespace+name, not a test on the
-// requester's shape. Before B133 the branch authorized a privileged bind on the
+// requester's shape. The branch once authorized a privileged bind on the
 // node's real address for ANY Service of type LoadBalancer, in ANY namespace,
 // that declared the port — so the requesting object was its own authorization
 // predicate. Now only the canonical ingress Service (kube-system/k3sm-ingress)
@@ -377,7 +377,7 @@ func TestNodeAddressAuthorizerAllowlist(t *testing.T) {
 	})
 }
 
-// TestWildcardAuthorizerAllowlist is the B403 gate, the wildcard twin of
+// TestWildcardAuthorizerAllowlist is the wildcard twin of
 // TestNodeAddressAuthorizerAllowlist: the ingress host asks the root helper for
 // 0.0.0.0:80/443 (the k3s ServiceLB shape), and the helper grants that
 // privileged wildcard bind when the canonical kube-system/k3sm-ingress
@@ -475,7 +475,7 @@ func TestWildcardAuthorizerAllowlist(t *testing.T) {
 	}
 }
 
-// TestPortAuthorizerAdmitsPublishedVMPodPorts is the B440 named gate for the
+// TestPortAuthorizerAdmitsPublishedVMPodPorts pins the
 // published-vm-pod bind class: a privileged bind on a vm pod's published address
 // is authorized only on a port the vm pod set lists for THAT address. It refuses
 // an address the set does not list (an unpublished pod address, a native pod's),
@@ -852,7 +852,7 @@ func TestAuthorizeLBDeclaredRefusesAnIngressOwnedPort(t *testing.T) {
 	}
 }
 
-// TestIngressHostNodeAddressBindAdmitted is the B709 gate. With LAN access off
+// TestIngressHostNodeAddressBindAdmitted pins the LAN-off ingress bind. With LAN access off
 // the ingress host binds 80 and 443 on the node's own address through netd,
 // which reaches the host-address class. A port the canonical ingress Service
 // declares is admitted there for the ingress host on the node's mesh-egress

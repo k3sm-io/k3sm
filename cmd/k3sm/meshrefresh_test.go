@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// TestMeshEndpointRefresherRepublishesOnChange is B283's B2 leg: the debounce and
+// TestMeshEndpointRefresherRepublishesOnChange is the leg: the debounce and
 // retry policy of the endpoint refresher, driven tick by tick.
 //
 // Every row encodes a failure this loop must not have. Publishing on the FIRST

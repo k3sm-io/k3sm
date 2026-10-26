@@ -167,8 +167,8 @@ func waitCond(t *testing.T, what string, cond func() bool) {
 
 // --- TestPostStartFidelity ---------------------------------------------------
 
-// TestPostStartFidelity is the B39 gate: the provider must serve postStart hooks
-// with the upstream kubelet's semantics, not B10's fire-and-forget dispatch. The
+// TestPostStartFidelity pins that the provider serves postStart hooks with
+// the upstream kubelet's semantics, not a fire-and-forget dispatch. The
 // contract is the one stated on the API type itself (k8s.io/api core/v1 types.go,
 // Lifecycle / Lifecycle.PostStart — "management of the container blocks until the
 // action is complete"; "If the handler fails, the container is terminated and
@@ -178,7 +178,7 @@ func waitCond(t *testing.T, what string, cond func() bool) {
 // Four rows, one per semantic, each red on a plausible-wrong implementation:
 //
 //  1. READY-GATING — a container whose hook has not returned must not publish
-//     Ready, and the pod must not publish Ready/ContainersReady. Red on B10's
+//     Ready, and the pod must not publish Ready/ContainersReady. Red on a
 //     dispatch-only hook, which publishes the runtime's Ready verbatim.
 //  2. restartPolicy: Never — a failed hook kills the container, which stays
 //     Terminated: one StopContainer, no restart, the pod Failed, the failure on
@@ -187,7 +187,7 @@ func waitCond(t *testing.T, what string, cond func() bool) {
 //  3. RE-RUN ON RESTART — the hook fires on every container START. Red on a
 //     once-per-pod implementation (exec count stuck at 1 across a restart).
 //  4. CANCELABLE LIFETIME — a hook still running at pod deletion is cancelled with
-//     the pod and never blocks teardown. Red on B10's context.Background() + 2m
+//     the pod and never blocks teardown. Red on a context.Background() + 2m
 //     cap, under which the hook outlives the pod by up to two minutes.
 //
 // TIER: unit. All four are provable at the provider↔runtime seam with the package's

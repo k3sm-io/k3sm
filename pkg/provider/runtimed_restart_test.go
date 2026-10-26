@@ -120,7 +120,7 @@ func rtTerminated(name string, exit, restarts int32, finishedAt time.Time) *runt
 	}
 }
 
-// TestNativeSidecarStaysRunning is the M10.2-a1 provider-side sidecar
+// TestNativeSidecarStaysRunning is the provider-side sidecar
 // criterion: translate marks an init container with restartPolicy: Always as a
 // native sidecar on the proto (ALWAYS; regular containers stay UNSPECIFIED); a
 // running sidecar surfaces in status.initContainerStatuses with started=true;
@@ -218,8 +218,8 @@ func TestNativeSidecarStaysRunning(t *testing.T) {
 	})
 }
 
-// TestJobBackoffAndCompletionAccounting is the M10.2-a1 Job criterion, scoped
-// HONESTLY to the provider terminal-phase contract (B74): what the provider
+// TestJobBackoffAndCompletionAccounting is the Job criterion, scoped
+// to the provider terminal-phase contract: what the provider
 // owes the real kube-controller-manager Job controller per pod — Never +
 // exit≠0 → phase Failed, terminal, no restart; OnFailure + exit≠0 →
 // restart-in-place (RestartContainer; phase stays Running; runtimed's
@@ -354,7 +354,7 @@ func TestJobBackoffAndCompletionAccounting(t *testing.T) {
 	})
 }
 
-// TestRestartTriggerIdempotent pins the B26 BINDING idempotency contract: the
+// TestRestartTriggerIdempotent pins the restart trigger's idempotency contract: the
 // trigger is keyed on the termination identity (container name +
 // restart_count + exit + finish instant) inside the podTrack, so a
 // stream+backstop double-delivery of the SAME terminated status schedules

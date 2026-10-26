@@ -65,7 +65,7 @@ func (s *closeSpyProvider) closeCount() int {
 // is otherwise still up — the second of startNode's two exit paths.
 var errRunLoop = errors.New("virtual kubelet run loop failed")
 
-// TestNodeExitClosesTheEmbeddedRuntime is B253's gate: a node that exits must stop
+// TestNodeExitClosesTheEmbeddedRuntime is the gate for this behaviour: a node that exits must stop
 // the runtime it embedded, on BOTH exit paths, BEFORE its control socket comes
 // down.
 //

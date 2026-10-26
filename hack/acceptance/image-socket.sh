@@ -24,8 +24,9 @@
 #
 #   LIVE TIER (needs $KUBECONFIG) — the socket actually serving: the node bound
 #   it at the derived path with the documented 0700-dir/0600-node posture,
-#   `k3sm image ls` and `k3sm image df` succeed against it, a `k3sm build
-#   --format docker` tarball survives `k3sm image load` and then APPEARS in ls,
+#   `k3sm image prune` (a dry run) succeeds against it, `ls` and `df` refuse
+#   --socket (they read the registry), a `k3sm build --format docker` tarball
+#   survives `k3sm image load` and then `k3sm image inspect` finds it,
 #   and a dial from a second uid is refused.
 #
 # Without $KUBECONFIG the live rungs are announced LIVE-PENDING and never fail —
@@ -155,24 +156,34 @@ fi
 # a panic: that error is the operator's only clue when the node is not serving.
 ABSENT="$(dirname "$K3SM_BIN")/absent.sock"
 LS_OUT="$(dirname "$K3SM_BIN")/ls.err"
-if [ -x "$K3SM_BIN" ] && ! "$K3SM_BIN" image ls --socket "$ABSENT" --timeout 5s >"$LS_OUT" 2>&1; then
+if [ -x "$K3SM_BIN" ] && ! "$K3SM_BIN" image inspect example.test/app:v1 --socket "$ABSENT" --timeout 5s >"$LS_OUT" 2>&1; then
 	if grep -q "$ABSENT" "$LS_OUT"; then
-		ladder ok "image-socket.5c \`k3sm image ls\` against an unbound socket fails naming the path it dialled"
+		ladder ok "image-socket.5c \`k3sm image inspect\` against an unbound socket fails naming the path it dialled"
 	else
 		tail -5 "$LS_OUT"
-		ladder no "image-socket.5c \`k3sm image ls\` against an unbound socket fails naming the path it dialled"
+		ladder no "image-socket.5c \`k3sm image inspect\` against an unbound socket fails naming the path it dialled"
 	fi
 else
-	ladder no "image-socket.5c \`k3sm image ls\` against an unbound socket must fail (it did not)"
+	ladder no "image-socket.5c \`k3sm image inspect\` against an unbound socket must fail (it did not)"
+fi
+
+# ls and df read the cluster registry, not a node socket, so --socket on them
+# is refused up front rather than dialled.
+if [ -x "$K3SM_BIN" ] && ! "$K3SM_BIN" image ls --socket "$ABSENT" --timeout 5s >"$LS_OUT" 2>&1 &&
+	grep -q "does not take --socket" "$LS_OUT" && ! grep -q "$ABSENT" "$LS_OUT"; then
+	ladder ok "image-socket.5d \`k3sm image ls --socket\` is refused with its own message (no dial)"
+else
+	tail -5 "$LS_OUT" 2>/dev/null || true
+	ladder no "image-socket.5d \`k3sm image ls --socket\` is refused with its own message (no dial)"
 fi
 
 # ---- LIVE TIER ------------------------------------------------------------
 if [ -z "${KUBECONFIG:-}" ]; then
 	pending "image-socket.6  live: the node bound the socket at the derived path   (set KUBECONFIG)"
 	pending "image-socket.7  live: the socket posture is 0700 dir / 0600 node      (set KUBECONFIG)"
-	pending "image-socket.8  live: \`k3sm image ls\` succeeds against the node       (set KUBECONFIG)"
-	pending "image-socket.9  live: \`k3sm image df\` reports the store's usage       (set KUBECONFIG)"
-	pending "image-socket.10 live: \`k3sm image load\` ingests and the ref appears   (set KUBECONFIG)"
+	pending "image-socket.8  live: \`k3sm image prune\` (dry run) answers over the socket (set KUBECONFIG)"
+	pending "image-socket.9  live: \`k3sm image df --socket\` is refused               (set KUBECONFIG)"
+	pending "image-socket.10 live: \`k3sm image load\` ingests and the ref is inspectable (set KUBECONFIG)"
 	pending "image-socket.11 live: a dial from a second uid is refused             (set KUBECONFIG)"
 	echo "----------------------------------------"
 	echo "image-socket: $PASS passed, $FAIL failed, $PENDING LIVE-PENDING"
@@ -214,22 +225,22 @@ DIR_MODE="$(stat -f '%Lp' "$(dirname "$SOCK")" 2>/dev/null || stat -c '%a' "$(di
 
 # ---- image-socket.8/9 — the metadata commands answer ----------------------
 LIVE_OUT="$(dirname "$K3SM_BIN")/live.out"
-if "$K3SM_BIN" image ls --socket "$SOCK" >"$LIVE_OUT" 2>&1; then
-	ladder ok "image-socket.8  \`k3sm image ls\` succeeded against the running node"
+if "$K3SM_BIN" image prune --socket "$SOCK" >"$LIVE_OUT" 2>&1; then
+	ladder ok "image-socket.8  \`k3sm image prune\` (dry run) succeeded against the running node"
 else
 	tail -5 "$LIVE_OUT"
-	ladder no "image-socket.8  \`k3sm image ls\` succeeded against the running node"
+	ladder no "image-socket.8  \`k3sm image prune\` (dry run) succeeded against the running node"
 fi
-if "$K3SM_BIN" image df --socket "$SOCK" >"$LIVE_OUT" 2>&1; then
-	ladder ok "image-socket.9  \`k3sm image df\` reported the image store's usage"
+if ! "$K3SM_BIN" image df --socket "$SOCK" >"$LIVE_OUT" 2>&1 && grep -q "does not take --socket" "$LIVE_OUT"; then
+	ladder ok "image-socket.9  \`k3sm image df --socket\` is refused (df reads the registry)"
 else
 	tail -5 "$LIVE_OUT"
-	ladder no "image-socket.9  \`k3sm image df\` reported the image store's usage"
+	ladder no "image-socket.9  \`k3sm image df --socket\` is refused (df reads the registry)"
 fi
 
 # ---- image-socket.10 — load ingests, and the ref becomes visible ----------
 # The two halves are one rung on purpose: a load that reports success but leaves
-# nothing in ls has written to a store the node does not read, which is exactly
+# nothing in the node store has written to a store the node does not read, which is exactly
 # the failure a second out-of-process runtime would produce.
 TMP="$(dirname "$K3SM_BIN")"
 CTX="$TMP/ctx"; mkdir -p "$CTX"
@@ -248,15 +259,15 @@ fi
 if [ "$b10" != ok ]; then
 	tail -10 "$LIVE_OUT" || true
 	ladder no "image-socket.10a a \`docker load\`-shaped probe tarball was built"
-	ladder no "image-socket.10b \`k3sm image load\` ingested it and the ref appears in ls"
+	ladder no "image-socket.10b \`k3sm image load\` ingested it and \`image inspect\` finds the ref"
 else
 	ladder ok "image-socket.10a a \`docker load\`-shaped probe tarball was built"
 	if "$K3SM_BIN" image load "$TARBALL" --socket "$SOCK" >"$LIVE_OUT" 2>&1 &&
-		"$K3SM_BIN" image ls --socket "$SOCK" 2>/dev/null | grep -q "$REF"; then
-		ladder ok "image-socket.10b \`k3sm image load\` ingested it and the ref appears in ls"
+		"$K3SM_BIN" image inspect "$REF" --socket "$SOCK" >>"$LIVE_OUT" 2>&1; then
+		ladder ok "image-socket.10b \`k3sm image load\` ingested it and \`image inspect\` finds the ref"
 	else
 		tail -10 "$LIVE_OUT" || true
-		ladder no "image-socket.10b \`k3sm image load\` ingested it and the ref appears in ls"
+		ladder no "image-socket.10b \`k3sm image load\` ingested it and \`image inspect\` finds the ref"
 	fi
 fi
 
@@ -268,7 +279,7 @@ fi
 if [ "$(id -u)" = "0" ]; then
 	skip "image-socket.11 a second uid is refused (running as root: root bypasses the mode)"
 elif sudo -n true 2>/dev/null; then
-	if sudo -n -u nobody "$K3SM_BIN" image ls --socket "$SOCK" --timeout 10s >"$LIVE_OUT" 2>&1; then
+	if sudo -n -u nobody "$K3SM_BIN" image prune --socket "$SOCK" --timeout 10s >"$LIVE_OUT" 2>&1; then
 		ladder no "image-socket.11 a dial from a second uid is refused (uid 'nobody' READ this node's image store)"
 	else
 		ladder ok "image-socket.11 a dial from a second uid ('nobody') is refused"

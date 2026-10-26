@@ -280,7 +280,7 @@ func dictArray(d map[string]any, key string) ([]any, error) {
 
 // parseInfoPlist decodes "diskutil info -plist <target>" output.
 //
-// The key names are pinned against real output captured from the lab rig
+// The key names are pinned against real output captured from a test environment
 // (testdata/disk3s7.plist). Two are worth naming: case sensitivity is only
 // expressed in the human-readable FilesystemName ("Case-sensitive APFS"), and
 // the encryption flag's key is Encryption, not Encrypted.

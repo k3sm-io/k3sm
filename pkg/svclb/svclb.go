@@ -435,8 +435,8 @@ func (h *Hoster) observeOwnReady(own *corev1.Node) {
 }
 
 // Claims reports whether svclb owns svc — the ONE ownership rule, so the
-// register row, the reconcile filter, the retraction and any dependent item
-// cite one predicate instead of re-deriving it.
+// Hoster's reconcile filter and the Decider's reconcile and retraction
+// (Decider.unclaim) call one predicate instead of re-deriving it.
 //
 // Three conditions, and the middle one is the API's multi-implementation
 // contract: spec.loadBalancerClass nil means "the default implementation", and

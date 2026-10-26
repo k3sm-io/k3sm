@@ -26,7 +26,7 @@ import (
 // not some other line that happens to carry a shim attribute.
 const providerConfiguredMessage = "runtimed provider configured"
 
-// TestProviderLogsBothShimPaths pins the B159 observability contract: the
+// TestProviderLogsBothShimPaths pins the shim observability contract: the
 // provider's startup line reports BOTH pod-support shims — the getaddrinfo DNS
 // shim (dyld_shim) and the path-rebase shim (path_shim) — and reports them
 // UNCONDITIONALLY, empty value included.
@@ -71,7 +71,7 @@ func TestProviderLogsBothShimPaths(t *testing.T) {
 		},
 		{
 			// THE regression case: the DNS shim resolved, the path shim did not.
-			// Pre-B159 this logged one shim and silently dropped the other — the
+			// This once logged one shim and silently dropped the other — the
 			// unstaged one being exactly the fault to diagnose.
 			name:         "path shim absent, dns shim staged",
 			cfg:          RuntimedConfig{NodeName: "n", Root: t.TempDir(), PodLogsDir: t.TempDir(), DyldShim: "/Library/k3sm/libk3sm_getaddrinfo_shim.dylib"},

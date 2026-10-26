@@ -23,7 +23,7 @@ limitations under the License.
 // reached in production only through `k3sm install --data-volume`, which also
 // creates the service user, writes LaunchDaemons and takes over /var/lib/k3sm.
 // Running the installer to prove the volume primitives would mean rebuilding
-// the rig's cluster on every gate run. So the gate calls pkg/datavol directly,
+// the lab host's cluster on every gate run. So the gate calls pkg/datavol directly,
 // in the SAME order pkg/install does (Ensure -> Migrate -> MountRecorded ->
 // WriteRecord), which is what makes the rung evidence about the product rather
 // than about this file.
@@ -32,7 +32,7 @@ limitations under the License.
 //
 //   - Every path it is given must sit under /Library/k3sm-acceptance-datavol/.
 //     A mount point or record outside that root is refused before any disk
-//     work happens, so the gate cannot reach the rig's real data volume, its
+//     work happens, so the gate cannot reach the lab host's real data volume, its
 //     record at /Library/Preferences/io.k3sm.datavol.json, or /var/lib/k3sm.
 //   - It never writes /etc/fstab. datavol.EnsureFstabLine is the installer's
 //     business; a scratch volume that declared itself in fstab would be
@@ -248,7 +248,7 @@ func (ditto) RemoveAll(path string) error { return os.RemoveAll(path) }
 // inScratch refuses any path outside scratchRoot. It is the whole safety story
 // of this tool: everything downstream of it unmounts, creates and destroys APFS
 // volumes as root, and the one thing that must never happen is a gate run
-// aiming any of that at the rig's live data root.
+// aiming any of that at the lab host's live data root.
 func inScratch(label, p string) error {
 	if p == "" {
 		return fmt.Errorf("%s is required", label)

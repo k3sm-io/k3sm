@@ -14,50 +14,60 @@
 # no platforms (a Helm chart is a single OCI manifest, not an index), which mirror.yaml's
 # schema does not yet admit; promoting it is a schema decision for that PR.
 #
-# Every digest below was resolved anonymously against nvcr.io on 2026-09-24 with the
+# Every digest below was resolved anonymously against nvcr.io on 2026-10-22 with the
 # registry v2 manifests endpoint, and cross-checked by sha256 of the returned body
 # (the chart also by `helm pull oci://...@sha256:...`). The same bump rules apply as in
 # mirror.yaml's header, including the reviewer's independent re-resolution.
 
 images:
-  # M16 R12: the upstream serving control plane's Helm chart. It is published as an OCI
+  # M16: the upstream serving control plane's Helm chart. It is published as an OCI
   # chart at nvcr.io/nvidia/ai-dynamo/dynamo-platform, NOT under .../charts/ (that path
   # has no repository: the anonymous token endpoint answers 400).
+  # The chart stays at 1.5.0 while the three images below are at 1.5.1. nvcr.io publishes no
+  # 1.5.1 OCI chart (its tag list stops at 1.5.0); the 1.5.1 chart exists only in NVIDIA's
+  # NGC Helm repository, and this mechanism copies OCI artifacts by digest, so it cannot
+  # carry that tarball. The split is safe because the 1.5.0 chart takes the operator image
+  # tag as a value (dynamo-operator controllerManager.manager.image.tag, and the frontend
+  # tag in the platform values), and rendering the 1.5.0 chart with that one value set to
+  # 1.5.1 changes only the operator image references: CRDs, ClusterRole and every other
+  # object are identical to the 1.5.1 chart's. The install therefore sets the image tags
+  # (by digest in values-k3sm.yaml). pkg/mlxfleet pins ChartVersion to this chart's tag,
+  # and TestChartVersionMatchesStagedChart fails if the two ever disagree.
   - name: dynamo-platform
-    upstream: nvcr.io/nvidia/ai-dynamo/dynamo-platform:1.4.2@sha256:089299c70a31d2e79c933d149a686d04df0965822c4a93d632de9d52701e62a5
-    mirror: ghcr.io/k3sm-io/mirror/dynamo-platform@sha256:089299c70a31d2e79c933d149a686d04df0965822c4a93d632de9d52701e62a5
-    tag: 1.4.2
+    upstream: nvcr.io/nvidia/ai-dynamo/dynamo-platform:1.5.0@sha256:ff09c3bdfb26fb6b9274917a80c0fdf9bf23eeb02912988262ac5f87a5860714
+    mirror: ghcr.io/k3sm-io/mirror/dynamo-platform@sha256:ff09c3bdfb26fb6b9274917a80c0fdf9bf23eeb02912988262ac5f87a5860714
+    tag: 1.5.0
 
-  # M16 R12: the operator. The index also carries two attestation manifests
+  # M16: the operator. The index also carries two attestation manifests
   # (unknown/unknown); a full-index copy keeps them, which is what preserves the digest.
   - name: kubernetes-operator
-    upstream: nvcr.io/nvidia/ai-dynamo/kubernetes-operator:1.4.2@sha256:94e9127882ee30a937a009ae5af0a000047093d5ba5ccefdfbe942c394a020e3
-    mirror: ghcr.io/k3sm-io/mirror/kubernetes-operator@sha256:94e9127882ee30a937a009ae5af0a000047093d5ba5ccefdfbe942c394a020e3
-    tag: 1.4.2
+    upstream: nvcr.io/nvidia/ai-dynamo/kubernetes-operator:1.5.1@sha256:4b8229b913d66fff2111c228e02f65d342b3e136bb1ee2f83892e8a140b96d1d
+    mirror: ghcr.io/k3sm-io/mirror/kubernetes-operator@sha256:4b8229b913d66fff2111c228e02f65d342b3e136bb1ee2f83892e8a140b96d1d
+    tag: 1.5.1
     platforms:
       - platform: linux/arm64
-        digest: sha256:74e5420fe016e4bd91db3f70b8630dc24bf8777e09bb9b8d9a44db0406a14a03
+        digest: sha256:992e4efe7ab00b39d7c8cf9551b41a5f56a89dabac4d30c426ada6695e2a040f
       - platform: linux/amd64
-        digest: sha256:bd6ecb64c7a20438494db08d39d2cf7de6897890c752d8283e37a1206c1730ff
+        digest: sha256:a811250a7bf8051b67ef94d745e958a2585d2d9c321c9a825f4ac09f76ee726a
 
-  # M16 R12: the frontend.
+  # M16: the frontend.
   - name: dynamo-frontend
-    upstream: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.4.2@sha256:80589311c904b82927ae95703c1bc59c49eb7ac10d25925c0e457260da915bc7
-    mirror: ghcr.io/k3sm-io/mirror/dynamo-frontend@sha256:80589311c904b82927ae95703c1bc59c49eb7ac10d25925c0e457260da915bc7
-    tag: 1.4.2
+    upstream: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.5.1@sha256:2ce6f7484185ccae02381fa90b97330bddf021177960d7c0c0ad4ee83a9874fa
+    mirror: ghcr.io/k3sm-io/mirror/dynamo-frontend@sha256:2ce6f7484185ccae02381fa90b97330bddf021177960d7c0c0ad4ee83a9874fa
+    tag: 1.5.1
     platforms:
       - platform: linux/arm64
-        digest: sha256:02c716366162b148d8885669f8921ae85c36c6161b58c022ac532f9a2af9e5e6
+        digest: sha256:ea629e593e27627312fca9dc8156543c2dd82051c49438b3ac115b691a936142
       - platform: linux/amd64
-        digest: sha256:4d6435ad3893487e7e5a8751eb2381199464f80248284bb98c5e0998f09a91c0
+        digest: sha256:4674f75ae28b3d1a1e0eabd9ae81b9d2edd08c43cfb2ba45a17358046640d344
 
-  # M16 R12: the planner image, the mocker vehicle.
+  # M16: the planner image, the mocker vehicle.
   - name: dynamo-planner
-    upstream: nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2@sha256:6a0303be5ae6cd4e1a07d7c1d16d5d5d0d692cad28538de97e640e3893952328
-    mirror: ghcr.io/k3sm-io/mirror/dynamo-planner@sha256:6a0303be5ae6cd4e1a07d7c1d16d5d5d0d692cad28538de97e640e3893952328
-    tag: 1.4.2
+    upstream: nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.5.1@sha256:d1a4f2eac9878fef913ebf4ff4106dd093388ff26f386ae8a3901dc0e4fbde9a
+    mirror: ghcr.io/k3sm-io/mirror/dynamo-planner@sha256:d1a4f2eac9878fef913ebf4ff4106dd093388ff26f386ae8a3901dc0e4fbde9a
+    tag: 1.5.1
     platforms:
       - platform: linux/arm64
-        digest: sha256:8a9d5ac9407418011a4014f1222e60f909f3f19825daf9a2d87a89cd0f5578bc
+        digest: sha256:d9925bdc49110b224c090242e537d3c83db0e0e7265afae7b9efdd3dbdb332af
       - platform: linux/amd64
-        digest: sha256:0892ac2c93a4abf0634a1d0828e735ca55f39c763ae31824b19c86e61ce9fa0a
+        digest: sha256:bfcaa31b8ad4f0825dff55f1b5348636213d573f31cb26b188faf97f2ef2200d

@@ -21,7 +21,7 @@ import (
 	"errors"
 	"flag"
 	"log/slog"
-	"slices"
+	"net"
 	"strconv"
 	"strings"
 	"testing"
@@ -36,11 +36,10 @@ import (
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
-// TestRegistryPortFlagDefaultsOff pins the shipped default. The registry stages
-// and runs a pinned zot child — real disk, a real process, a real port — so a
-// server that was never asked for one must not acquire it. A default that drifted
-// to "on" would be invisible until a second server on the same Mac failed a bind.
-func TestRegistryPortFlagDefaultsOff(t *testing.T) {
+// TestRegistryPortFlagDefaultsOn pins the shipped default: the server's
+// registry is the cluster's one image store, so it runs unless the operator
+// opts out with 0, and the help says how.
+func TestRegistryPortFlagDefaultsOn(t *testing.T) {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
 	var opts serverOptions
 	_ = registerServerFlags(fs, &opts)
@@ -49,23 +48,14 @@ func TestRegistryPortFlagDefaultsOff(t *testing.T) {
 	if f == nil {
 		t.Fatal("--registry-port is not registered")
 	}
-	if f.DefValue != "0" {
-		t.Errorf("--registry-port default = %q, want \"0\" (disabled)", f.DefValue)
+	if f.DefValue != strconv.Itoa(executor.DefaultRegistryPort) {
+		t.Errorf("--registry-port default = %q, want %d", f.DefValue, executor.DefaultRegistryPort)
 	}
 	if !strings.Contains(f.Usage, "0 disables") {
 		t.Errorf("--registry-port usage %q does not say that 0 disables it", f.Usage)
 	}
-	// The suggested port is named in the help so an operator who wants the
-	// registry does not have to go read a constant to find a port that is clear of
-	// every other listener this process owns.
-	if !strings.Contains(f.Usage, strconv.Itoa(executor.DefaultRegistryPort)) {
-		t.Errorf("--registry-port usage %q does not name DefaultRegistryPort", f.Usage)
-	}
-	if err := fs.Parse(nil); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if opts.registryPort != 0 {
-		t.Errorf("registryPort = %d after parsing no args, want 0", opts.registryPort)
+	if !strings.Contains(f.Usage, registrysvc.FlatAuthority()) {
+		t.Errorf("--registry-port usage %q does not name the cluster address %s", f.Usage, registrysvc.FlatAuthority())
 	}
 }
 
@@ -265,73 +255,93 @@ func TestStartIngestRegistry(t *testing.T) {
 		}
 	})
 
-	t.Run("a node with a relay address publishes its cluster Service", func(t *testing.T) {
-		// The ONE cluster address a native Pod, a vm guest and the host all reach
-		// this node's registry at. The endpoint is the relay's own address —
-		// EndpointSlice validation refuses a loopback one, so the registry's
-		// 127.0.0.1 listener can never be published here.
+	t.Run("a server with a relay address publishes the flat Service", func(t *testing.T) {
+		// The ONE cluster name a native Pod and a vm guest reach the registry
+		// at. The endpoint is the relay's own address: EndpointSlice validation
+		// refuses a loopback one.
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		cs := fake.NewSimpleClientset()
 		stop, puller := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
 			hostingCMs:    cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 			advertCMs:     cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
-			clusterSvcs:   cs.CoreV1().Services(registrysvc.AdvertisementNamespace),
-			clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace),
+			clusterSvcs:   cs.CoreV1().Services(registrysvc.FlatServiceNamespace),
+			clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.FlatServiceNamespace),
 			clusterDomain: "cluster.local",
 			logger:        logger,
 		})
-		// runtimed's puller classifies a reference as node-relative by its
-		// authority; it cannot derive these spellings, so the bring-up hands them
-		// over. Without them a Pod pulling by the Service name would be dialled as
-		// HTTPS against a plain-HTTP listener and would get no peer fallback.
-		wantAuthority := registrysvc.ClusterServiceAuthority("mac-a", "cluster.local", 6450)
-		if !slices.Contains(puller.ClusterRegistries, wantAuthority) {
-			t.Errorf("cluster-local authorities = %v, want them to carry %q", puller.ClusterRegistries, wantAuthority)
+		// The runtime is handed only the loopback spelling: the relay serves
+		// HTTPS, which a plain-HTTP cluster spelling could not reach.
+		if len(puller.ClusterRegistries) != 0 {
+			t.Errorf("cluster-local authorities = %v, want none", puller.ClusterRegistries)
 		}
 		if puller.LocalHost != registrysvc.LoopbackAuthority(6450) {
 			t.Errorf("LocalHost = %q, want %q", puller.LocalHost, registrysvc.LoopbackAuthority(6450))
 		}
-		name := registrysvc.ClusterServiceName("mac-a")
-		published, err := cs.CoreV1().Services(registrysvc.AdvertisementNamespace).
-			Get(context.Background(), name, metav1.GetOptions{})
+		if want := serverFlatRegistry(6450); puller.Flat.Addr != want.Addr || puller.Flat.TLS || puller.Flat.aliasPort != 6450 {
+			t.Errorf("Flat = %+v, want the loopback endpoint %+v", puller.Flat, want)
+		}
+		published, err := cs.CoreV1().Services(registrysvc.FlatServiceNamespace).
+			Get(context.Background(), registrysvc.FlatServiceName, metav1.GetOptions{})
 		if err != nil {
-			t.Fatalf("no cluster Service was published: %v", err)
+			t.Fatalf("no flat Service was published: %v", err)
 		}
 		if published.Spec.Selector != nil {
 			t.Errorf("the Service carries a selector %v; nothing schedules the registry", published.Spec.Selector)
 		}
-		es, err := cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace).
-			Get(context.Background(), name, metav1.GetOptions{})
+		es, err := cs.DiscoveryV1().EndpointSlices(registrysvc.FlatServiceNamespace).
+			Get(context.Background(), registrysvc.FlatServiceName, metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("no EndpointSlice was published, so the Service has a VIP and no backend: %v", err)
 		}
 		if len(es.Endpoints) != 1 || len(es.Endpoints[0].Addresses) != 1 || es.Endpoints[0].Addresses[0] != "100.64.1.1" {
-			t.Errorf("endpoints = %+v, want the node's relay address", es.Endpoints)
+			t.Errorf("endpoints = %+v, want the server's relay address", es.Endpoints)
 		}
-		// The discovery document now names it, and only because it exists.
-		cm, err := cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace).
-			Get(context.Background(), registrysvc.HostingConfigMapName, metav1.GetOptions{})
-		if err != nil {
-			t.Fatalf("the discovery ConfigMap was not published: %v", err)
-		}
-		want := registrysvc.ClusterServiceAuthority("mac-a", "cluster.local", 6450)
-		if !strings.Contains(cm.Data[registrysvc.HostingDataKey], want) {
-			t.Errorf("the discovery document %q does not carry hostFromClusterNetwork %q",
-				cm.Data[registrysvc.HostingDataKey], want)
+		// No per-node Service any more.
+		if _, err := cs.CoreV1().Services(registrysvc.FlatServiceNamespace).
+			Get(context.Background(), registrysvc.ClusterServiceName("mac-a"), metav1.GetOptions{}); err == nil {
+			t.Error("a retired per-node registry Service was published")
 		}
 		stop()
-		if _, err := cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace).
-			Get(context.Background(), name, metav1.GetOptions{}); err == nil {
+		// A stop retracts the endpoints and keeps the Service, so its ClusterIP
+		// survives a restart.
+		if _, err := cs.DiscoveryV1().EndpointSlices(registrysvc.FlatServiceNamespace).
+			Get(context.Background(), registrysvc.FlatServiceName, metav1.GetOptions{}); err == nil {
 			t.Error("the EndpointSlice survived a clean shutdown")
 		}
-		if _, err := cs.CoreV1().Services(registrysvc.AdvertisementNamespace).
-			Get(context.Background(), name, metav1.GetOptions{}); err == nil {
-			t.Error("the cluster Service survived a clean shutdown")
+		if _, err := cs.CoreV1().Services(registrysvc.FlatServiceNamespace).
+			Get(context.Background(), registrysvc.FlatServiceName, metav1.GetOptions{}); err != nil {
+			t.Errorf("the flat Service was deleted at shutdown; its ClusterIP would change on every restart: %v", err)
 		}
 	})
 
-	t.Run("a node with no relay address publishes no cluster Service and claims none", func(t *testing.T) {
+	t.Run("a stale per-node Service is removed and a joined server publishes nothing", func(t *testing.T) {
+		stale := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: registrysvc.ClusterServiceName("mac-b"), Namespace: registrysvc.FlatServiceNamespace}}
+		cs := fake.NewSimpleClientset(stale)
+		stop, _ := startIngestRegistry(t.Context(), ingestRegistry{
+			svc: &fakeRegistry{addr: "127.0.0.1:6450"}, port: 6450, nodeName: "mac-b", meshIP: "100.64.2.1", joined: true,
+			hostingCMs:    cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+			advertCMs:     cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			clusterSvcs:   cs.CoreV1().Services(registrysvc.FlatServiceNamespace),
+			clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.FlatServiceNamespace),
+			logger:        logger,
+		})
+		defer stop()
+		if _, err := cs.CoreV1().Services(registrysvc.FlatServiceNamespace).
+			Get(context.Background(), stale.Name, metav1.GetOptions{}); err == nil {
+			t.Error("the retired per-node Service survived the start")
+		}
+		if _, err := cs.CoreV1().Services(registrysvc.FlatServiceNamespace).
+			Get(context.Background(), registrysvc.FlatServiceName, metav1.GetOptions{}); err == nil {
+			t.Error("a joined server published the flat Service; the bootstrap server owns it")
+		}
+		if _, err := cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace).
+			Get(context.Background(), registrysvc.HostingConfigMapName, metav1.GetOptions{}); err == nil {
+			t.Error("a joined server published local-registry-hosting; the bootstrap server owns it")
+		}
+	})
+
+	t.Run("a server with no relay address publishes no Service and claims none", func(t *testing.T) {
 		// No mesh address and no vm network: nothing off loopback answers, so a
 		// hostFromClusterNetwork would name an address no caller could reach.
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
@@ -340,8 +350,8 @@ func TestStartIngestRegistry(t *testing.T) {
 			svc: svc, port: 6450, nodeName: "mac-a",
 			hostingCMs:    cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 			advertCMs:     cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
-			clusterSvcs:   cs.CoreV1().Services(registrysvc.AdvertisementNamespace),
-			clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace),
+			clusterSvcs:   cs.CoreV1().Services(registrysvc.FlatServiceNamespace),
+			clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.FlatServiceNamespace),
 			logger:        logger,
 		})
 		defer stop()
@@ -353,9 +363,9 @@ func TestStartIngestRegistry(t *testing.T) {
 		if puller.LocalHost != registrysvc.LoopbackAuthority(6450) {
 			t.Errorf("LocalHost = %q, want %q", puller.LocalHost, registrysvc.LoopbackAuthority(6450))
 		}
-		if _, err := cs.CoreV1().Services(registrysvc.AdvertisementNamespace).
-			Get(context.Background(), registrysvc.ClusterServiceName("mac-a"), metav1.GetOptions{}); err == nil {
-			t.Error("a node with no relay address published a cluster Service nothing would answer")
+		if _, err := cs.CoreV1().Services(registrysvc.FlatServiceNamespace).
+			Get(context.Background(), registrysvc.FlatServiceName, metav1.GetOptions{}); err == nil {
+			t.Error("a server with no relay address published a Service nothing would answer")
 		}
 		cm, err := cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace).
 			Get(context.Background(), registrysvc.HostingConfigMapName, metav1.GetOptions{})
@@ -401,6 +411,8 @@ func (f *fakeRegistry) Start(context.Context) error {
 }
 
 func (f *fakeRegistry) Addr() string { return f.addr }
+
+func (f *fakeRegistry) GateCredential() registrysvc.Credential { return registrysvc.Credential{} }
 
 func (f *fakeRegistry) Shutdown(ctx context.Context) error {
 	// The teardown runs from a defer during shutdown, so it must NOT inherit the
@@ -458,15 +470,17 @@ func TestRegistryPullerWiringIsAccepted(t *testing.T) {
 		if w.LocalHost != "" {
 			opts = append(opts, image.WithLocalRegistry(w.LocalHost))
 		}
+		opts = append(opts, image.WithFlatRegistry(w.Flat.mapping()))
 		_, perr := image.NewPuller(cache, image.RemoteFetch, image.NoLocalIndex{}, opts...)
 		return perr
 	}
 
-	t.Run("a node with a registry Service", func(t *testing.T) {
-		w := registryPullerWiring{
-			LocalHost:         registrysvc.LoopbackAuthority(6450),
-			ClusterRegistries: registrysvc.ClusterLocalAuthorities("mac-a", "cluster.local", "10.43.7.9", 6450),
+	t.Run("a node with cluster spellings of its registry", func(t *testing.T) {
+		var cluster []string
+		for _, name := range registrysvc.FlatServiceDNSNames("cluster.local") {
+			cluster = append(cluster, net.JoinHostPort(name, strconv.Itoa(registrysvc.FlatServicePort)))
 		}
+		w := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(6450), ClusterRegistries: cluster, Flat: serverFlatRegistry(6450)}
 		if err := newPuller(w); err != nil {
 			t.Fatalf("runtimed refuses the wiring this node publishes (%+v): %v", w, err)
 		}
@@ -475,7 +489,7 @@ func TestRegistryPullerWiringIsAccepted(t *testing.T) {
 	t.Run("a node with no registry Service", func(t *testing.T) {
 		// Loopback alone is cluster-local unconditionally, so the single-Mac
 		// wiring must be accepted with no authority set at all.
-		w := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(6450)}
+		w := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(6450), Flat: serverFlatRegistry(6450)}
 		if err := newPuller(w); err != nil {
 			t.Fatalf("runtimed refuses the single-node wiring (%+v): %v", w, err)
 		}

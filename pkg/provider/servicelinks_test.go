@@ -39,7 +39,7 @@ func svc(ns, name string, typ corev1.ServiceType, clusterIP string, ports ...cor
 	}
 }
 
-// TestResolvePodBoxEnvInjectsNamespaceServiceLinks is B363's gate: a pod's
+// TestResolvePodBoxEnvInjectsNamespaceServiceLinks pins that a pod's
 // containers get the kubelet's service-links environment for every Service in
 // the pod's namespace whose ClusterIP is set (type-independent), resolved once
 // at the translate boundary, layered UNDER the master service, envFrom and the

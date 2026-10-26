@@ -1,0 +1,35 @@
+# Allowed govulncheck findings in the child binaries hack/release/stage.sh stages.
+#
+# stage.sh scans every staged Go child (govulncheck -mode=binary) after staging
+# and before signing, and reds on any finding whose trace reaches a vulnerable
+# symbol in the binary unless a line below names it. One entry per line:
+#
+#   <GO-id> <child> <child-version> <reason> <expiry YYYY-MM-DD>
+#
+# <child> is the staged name (helm without its version suffix) and
+# <child-version> the pin it was built or downloaded at, so a pin bump makes the
+# entry match nothing and the finding is reviewed again. The reason is required
+# (at least 20 characters) and says why shipping the finding is acceptable until
+# the expiry, which is at most 120 days out. An expired entry is a red. An entry
+# that matches no symbol-level finding in a scan is a red too: delete it, so
+# exemptions do not outlive what they excused.
+#
+# zot v2.1.22 links go.opentelemetry.io/otel v1.46.0 (GO-2026-6505, no fixed
+# version upstream), reviewed in the k3sm#815 security review. The five
+# golang.org/x/net findings of that review are fixed: kine and zot are built
+# against x/net v0.60.0 (internal/childreq), and stage.sh refuses a staged
+# kine or zot that links an older one.
+GO-2026-6505 zot v2.1.22 go.opentelemetry.io/otel v1.46.0 otlptrace exporter endpoint URL logging, which concerns an OTLP endpoint URL k3sm never configures for zot; no fixed version upstream, accepted until one ships (k3sm#815 security review) 2026-11-15
+#
+# GO-2026-5932 marks golang.org/x/crypto/openpgp deprecated and names no
+# vulnerable symbols, so govulncheck lists every openpgp package ("/*") for any
+# binary that links golang.org/x/crypto, whatever packages of it the binary
+# uses. kubectl links no x/crypto and reports clean. helm v4.3.0 and the three
+# kube daemons below link x/crypto v0.57.0 for other packages; none of them
+# names an x/crypto/openpgp package path, and helm's OpenPGP code (chart
+# provenance) is github.com/ProtonMail/go-crypto. The v1.37.1 source vendors
+# no x/crypto/openpgp package.
+GO-2026-5932 helm v4.3.0 golang.org/x/crypto v0.57.0 GO-2026-5932 names no symbols, so govulncheck reports every openpgp package of any binary that links golang.org/x/crypto at all; this binary names no x/crypto/openpgp package path, so nothing of it is linked; no fixed version upstream 2027-02-20
+GO-2026-5932 kube-apiserver v1.37.1 golang.org/x/crypto v0.57.0 GO-2026-5932 names no symbols, so govulncheck reports every openpgp package of any binary that links golang.org/x/crypto at all; this binary names no x/crypto/openpgp package path, so nothing of it is linked; no fixed version upstream 2027-02-20
+GO-2026-5932 kube-scheduler v1.37.1 golang.org/x/crypto v0.57.0 GO-2026-5932 names no symbols, so govulncheck reports every openpgp package of any binary that links golang.org/x/crypto at all; this binary names no x/crypto/openpgp package path, so nothing of it is linked; no fixed version upstream 2027-02-20
+GO-2026-5932 kube-controller-manager v1.37.1 golang.org/x/crypto v0.57.0 GO-2026-5932 names no symbols, so govulncheck reports every openpgp package of any binary that links golang.org/x/crypto at all; this binary names no x/crypto/openpgp package path, so nothing of it is linked; no fixed version upstream 2027-02-20

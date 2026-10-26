@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M8.0-d4 / S4 — mlx-serve image size & materialize latency, and the M8.4
+# S4 — mlx-serve image size & materialize latency, and the image build
 # PACKAGING PREMISE check.
 #
 # Two independent jobs:
@@ -7,7 +7,7 @@
 #   A. BUDGET. Stage a representative mlx-serve rootfs in the lab prefix
 #      (python-build-standalone darwin-arm64 + the hash-pinned mlx/mlx-lm wheel
 #      set; NO model weights — weights live on a PVC, never in the image) and
-#      measure it against the two pruning thresholds the M8 plan sets for S4:
+#      measure it against the two pruning thresholds the spike sets for S4:
 #        >2 GB unpacked      -> forces payload pruning
 #        >1 min cold start   -> forces payload pruning
 #      Four costs are measured SEPARATELY, because they are paid at different
@@ -15,11 +15,11 @@
 #      ad-hoc tree-sign (AdHocSignTree, once per image arrival), clonefile
 #      (per-pod materialize), and cold-start-to-first-token (per pod start).
 #
-#   B. PREMISE. M8.4 assembles that rootfs with `k3sm build` from a COPY-only
+#   B. PREMISE. The image build assembles that rootfs with `k3sm build` from a COPY-only
 #      Dockerfile. python-build-standalone ships SYMLINKS (bin/python3 ->
 #      python3.12 and friends). If a symlink does not survive
 #      COPY -> layer tar -> unpack byte-for-byte, the image is broken in a way
-#      no size budget would reveal and M8.4 must be re-planned. So: build the
+#      no size budget would reveal and the image build must be re-planned. So: build the
 #      k3sm binary on the lab, build the staged tree into an OCI layout, unpack
 #      it, and compare every entry — plus a negative control for the one symlink
 #      shape the builder is known to refuse.
@@ -114,7 +114,7 @@ if [ "$RESTAGE" = 1 ] || [ ! -x "$S/bin/python3.12" ]; then
   grep -E '^(mlx|mlx-lm|mlx-metal)==' "$PREFIX/logs/pip-freeze.txt" > "$PREFIX/stage/requirements.in"
   # NOTE: no --python-platform. Its default (macOS 13.0) has NO mlx wheel — mlx
   # ships macosx_14_0_arm64 and newer — so a lockfile compiled with the flag is
-  # unsatisfiable. M8.4's lockfile must be compiled for macOS 14+ arm64.
+  # unsatisfiable. The image build's lockfile must be compiled for macOS 14+ arm64.
   "$UV" pip compile --generate-hashes "$PREFIX/stage/requirements.in" -o "$PREFIX/stage/requirements-mlx.txt" 2>&1 | tail -2
   "$UV" pip install --python "$S/bin/python3.12" --require-hashes -r "$PREFIX/stage/requirements-mlx.txt" 2>&1 | tail -2
 fi
@@ -226,7 +226,7 @@ PY
 # The S1 minimal profile, re-pointed at the staged rootfs: two exact user-client
 # classes and nothing else. Unwidened.
 cat > "$PREFIX/sbpl/s4.sb" <<SB
-;; k3sm M8.0/S4 — the S1 minimal profile, re-pointed at the staged rootfs.
+;; k3sm M8 spike S4 — the S1 minimal profile, re-pointed at the staged rootfs.
 (version 1)
 (deny default)
 (import "system.sb")
@@ -292,7 +292,7 @@ DF
       'BEGIN{printf "  oci layout: apparent %d KB (%.2f GB)  on-disk %d KB\n", k, k/1048576, d}'
     ls -l "$B/oci/blobs/sha256" | sed 's/^/    /'
     # Reproducibility: the same context + Dockerfile must produce the same digest,
-    # which is M8.4-d1's "builds reproducibly from the lockfile" gate in miniature.
+    # which is the image build's "builds reproducibly from the lockfile" gate in miniature.
     D1=$("$K" build --file "$B/Dockerfile" --tag mlx-serve:s4 --format oci --output "$B/oci2" "$S" | awk '/digest:/{print $2}')
     D0=$(SPY -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifests"][0]["digest"])' "$B/oci/index.json")
     echo "  reproducible: first=$D0 second=$D1 -> $([ "$D0" = "$D1" ] && echo IDENTICAL || echo DIVERGED)"
@@ -420,7 +420,7 @@ PY
 
   echo "  --- negative controls: one build per SYMLINK SHAPE ---"
   # uv's own install dir carries an ABSOLUTE alias symlink
-  # (cpython-3.12-macos-aarch64-none -> the absolute versioned dir), so M8.4 must
+  # (cpython-3.12-macos-aarch64-none -> the absolute versioned dir), so the image build must
   # know what the builder does with each shape rather than discover it in CI.
   NC=$PREFIX/work/s4-neg
   shape() { # shape <name> <ln -s args...>

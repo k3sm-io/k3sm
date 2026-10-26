@@ -52,7 +52,7 @@ func readyStatusOf(conds []corev1.PodCondition) (corev1.PodCondition, bool) {
 	return corev1.PodCondition{}, false
 }
 
-// TestRollingUpdateSurfacesReadyGates is the B79 gate: PodReady must honor
+// TestRollingUpdateSurfacesReadyGates pins that PodReady honors
 // spec.readinessGates so a Deployment rolling update does not advance before the
 // gates are satisfied — while NEVER stalling on a gate condition the k3sm VK
 // provider cannot observe (the absent-gate anti-stall ceiling).

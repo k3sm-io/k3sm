@@ -41,35 +41,31 @@ const (
 	// HostingDataKey is the single data key, fixed by the KEP.
 	HostingDataKey = "localRegistryHosting.v1"
 	// hostingHelp points a reader at the documentation for this registry, and
-	// states the one transport fact the addresses themselves cannot.
-	//
-	// The two localhost addresses carry their transport in their name: the
-	// docker/OCI toolchain special-cases the literal `localhost` as an insecure
-	// (plain HTTP) registry. The in-cluster address is a Service name, which gets
-	// no such treatment — a client handed it would infer HTTPS and fail the
-	// handshake against a plain-HTTP listener. The KEP gives no field for
-	// transport, so it is said here, where a reader of the document is already
-	// looking. The FIELD NAME is deliberately not repeated in this sentence: a
-	// reader (and a gate) greps the document for the key, and a help string
-	// carrying it would answer that grep from the wrong line.
-	hostingHelp = "https://k3sm.io/docs/user/registry/ — the in-cluster address serves plain HTTP, not TLS"
+	// states the one transport fact the addresses themselves cannot: the
+	// in-cluster name serves HTTPS under a certificate from the cluster CA, which
+	// every Pod already holds as its service-account ca.crt, while the localhost
+	// address (which the OCI toolchain treats as plain HTTP by its name) is the
+	// node runtime's own loopback path. The KEP gives no field for transport, so
+	// it is said here. The FIELD NAMES are deliberately not repeated in this
+	// sentence: a reader (and a gate) greps the document for a key, and a help
+	// string carrying it would answer that grep from the wrong line.
+	hostingHelp = "https://k3sm.io/docs/user/registry/ (the in-cluster name serves HTTPS; trust the cluster CA, a Pod's service-account ca.crt)"
 )
 
 // hosting is the KEP-1755 document.
 //
-// hostFromClusterNetwork means "an address a workload inside the cluster network
-// can pull from". k3sm publishes the node's per-node registry Service
-// (clusterservice.go), which is one name that answers for all three classes of
-// caller: a native Pod (a Darwin process, reaching the VIP through the node's
-// lo0 alias), a Linux vm guest (whose own loopback answers nothing, and which
-// reaches the VIP through the same userspace proxy every other Service is
-// reached through), and the host.
+// When the flat registry Service is published, host and hostFromClusterNetwork
+// both name it, registry-k3sm:6450: the one name an image is pushed and pulled
+// by from inside the cluster, by a native Pod and a Linux vm guest alike.
+// hostFromContainerRuntime stays the loopback address the node runtime pulls
+// the server's registry from today; the runtime's mapping of the flat name to
+// this registry replaces it.
 //
-// It is OMITTED when there is no such Service — a single-Mac cluster with no
-// mesh address and no vm network has no relay, so nothing off loopback answers,
-// and an address published there would be one no caller could use. Emptiness is
-// therefore a statement, not a default: the field is present exactly when it is
-// true.
+// When there is no such Service (a single Mac with no mesh address and no vm
+// network has no relay, so nothing off loopback answers), host is the loopback
+// address and hostFromClusterNetwork is OMITTED: an address published there
+// would be one no caller could use. Emptiness is therefore a statement, not a
+// default: the field is present exactly when it is true.
 type hosting struct {
 	Host                     string `json:"host"`
 	HostFromContainerRuntime string `json:"hostFromContainerRuntime"`
@@ -88,26 +84,26 @@ type ConfigMapClient interface {
 	Update(ctx context.Context, cm *corev1.ConfigMap, opts metav1.UpdateOptions) (*corev1.ConfigMap, error)
 }
 
-// HostingDocument renders the KEP-1755 document for a registry on port, reachable
-// from inside the cluster network at clusterNetworkHost.
+// HostingDocument renders the KEP-1755 document for a registry on loopback
+// port, reachable from inside the cluster network at clusterNetworkHost.
 //
-// The first two addresses are "localhost:<port>" rather than "127.0.0.1:<port>",
-// because the docker/OCI toolchain special-cases the literal name `localhost` to
-// mean an insecure (plain HTTP) registry, and this one serves plain HTTP. A
-// reader handed 127.0.0.1 would have to be told separately to disable TLS.
+// clusterNetworkHost is FlatAuthority() when the flat Service was published, or
+// "", which names the loopback address as host and OMITS
+// hostFromClusterNetwork. It is a parameter rather than something rendered here
+// because only the caller knows whether the Service was actually published.
 //
-// clusterNetworkHost is the node's registry Service authority
-// (ClusterServiceAuthority) — or "", which OMITS hostFromClusterNetwork. It is a
-// parameter rather than something rendered here because only the caller knows
-// whether the Service was actually published; rendering the name unconditionally
-// would publish an address on a node that has no relay to answer it. That
-// authority speaks PLAIN HTTP and does not say so in its name, which is why the
-// help string does (see hostingHelp).
+// The loopback address is "localhost:<port>" rather than "127.0.0.1:<port>",
+// because the docker/OCI toolchain special-cases the literal name `localhost`
+// as a plain-HTTP registry, and zot on loopback serves plain HTTP.
 func HostingDocument(port int, clusterNetworkHost string) ([]byte, error) {
-	addr := "localhost:" + strconv.Itoa(port)
+	local := "localhost:" + strconv.Itoa(port)
+	host := local
+	if clusterNetworkHost != "" {
+		host = clusterNetworkHost
+	}
 	b, err := yaml.Marshal(hosting{
-		Host:                     addr,
-		HostFromContainerRuntime: addr,
+		Host:                     host,
+		HostFromContainerRuntime: local,
 		HostFromClusterNetwork:   clusterNetworkHost,
 		Help:                     hostingHelp,
 	})
@@ -121,10 +117,10 @@ func HostingDocument(port int, clusterNetworkHost string) ([]byte, error) {
 //
 // It REFRESHES rather than creating once: the port is a per-boot fact (a `k3sm
 // dev` instance allocates its own), so a ConfigMap left over from a previous boot
-// would send every reader to a port nothing is listening on. An Update conflict
-// is returned to the caller, which logs it — a losing writer in a two-server
-// cluster is not an error worth retrying, because the winner published the same
-// document.
+// would send every reader to a port nothing is listening on. Only the server
+// that publishes the flat Service publishes this document, so a second server
+// never overwrites it with an address of its own. An Update conflict is
+// returned to the caller, which logs it.
 func PublishHosting(ctx context.Context, c ConfigMapClient, port int, clusterNetworkHost string) error {
 	doc, err := HostingDocument(port, clusterNetworkHost)
 	if err != nil {

@@ -40,6 +40,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/k3sm/pkg/registrysvc"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
@@ -1862,7 +1863,7 @@ func TestInstallOrchestration(t *testing.T) {
 		// inside that tree over, for BOTH roles, because a single-node server
 		// writes the same tree. Each root is opened once and found absent on a
 		// first install, which is the only reason this is two calls and not a
-		// walk (B327).
+		// walk.
 		"AdoptTree:/var/log/pods",
 		"AdoptTree:/var/log/containers",
 		// Before any daemon bootstraps: root netd would otherwise create the run
@@ -1934,6 +1935,10 @@ func TestInstallOrchestration(t *testing.T) {
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
 		"CopyToRootOwned:/Library/k3sm.swap/bin/" + executor.KubeMarkerName,
+		// The zot version marker, staged the same best-effort way beside zot.
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + registrysvc.ZotMarkerName,
+		// The helm version marker, staged the same best-effort way beside helm.
+		"CopyToRootOwned:/Library/k3sm.swap/bin/" + helmchart.HelmMarkerName,
 		// The shadow binary set, staged with the binary that uses it: each copy
 		// in the shared list cloned root:wheel 0755, re-signed ad hoc, verified,
 		// its source's cdhash read, then the manifest (TestShadowSetIsMadeAtInstall
@@ -2135,10 +2140,10 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// The payload set lands at InstallDir/bin/<name> — one copy per
 	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims + vmhost.
 	head := len(fixedHead)
-	// +4 for the four version markers (kine, etcd, etcdutl, then the control-plane
-	// set), staged beside the binaries they describe.
-	if want := head + len(executor.PayloadBinaries()) + 4; len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the four markers)", len(dsts), want)
+	// +6 for the six version markers (kine, etcd, etcdutl, the control-plane
+	// set, zot, then helm), staged beside the binaries they describe.
+	if want := head + len(executor.PayloadBinaries()) + 6; len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the six markers)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], stage+"/bin/"+name; got != want {
@@ -2191,7 +2196,7 @@ func TestInstallRequiresInputs(t *testing.T) {
 }
 
 // TestUninstallIdempotent proves uninstall boots out BOTH daemons (server first,
-// then netd), REMOVES both leaked plists (the B62 fix), and sweeps the install
+// then netd), REMOVES both leaked plists (the earlier uninstall fix), and sweeps the install
 // dir — in reverse install order — and that re-running is safe.
 func TestUninstallIdempotent(t *testing.T) {
 	f := &fakeSystem{}
@@ -2253,7 +2258,7 @@ func TestUninstallIdempotent(t *testing.T) {
 		// one that outlived its daemon is killed by its recorded identity.
 		"ReadVMHostRecords:/var/lib/k3sm",
 		"ReapOrphans:/var/lib/k3sm/server/bin",
-		// The mesh pf anchor flush (B274) is the uninstall backstop for the
+		// The mesh pf anchor flush is the uninstall backstop for the
 		// MSS-clamp rule netd's own shutdown path never reaches.
 		"FlushMeshPFAnchor",
 		// The lo0 flush covers the pinned pod aggregate + the Service CIDR — the
@@ -2288,7 +2293,7 @@ func TestUninstallIdempotent(t *testing.T) {
 }
 
 // TestUninstallFlushesTheMeshPFAnchor proves Uninstall calls FlushMeshPFAnchor
-// exactly once — the B274 backstop for the mesh MSS-clamp pf anchor, which
+// exactly once — the backstop for the mesh MSS-clamp pf anchor, which
 // outlives netd (only the RemoveMesh RPC reaches mesh.WGDevice.Down, and no
 // signal path ever calls it) and would otherwise survive scoped to a utun
 // number macOS recycles onto an unrelated tunnel.
@@ -2320,16 +2325,16 @@ func TestNetdPlistXML(t *testing.T) {
 	if strings.Contains(x, "<key>UserName</key>") {
 		t.Error("netd plist must NOT carry a UserName (it runs as root)")
 	}
-	// B116/B133 — the plist must render NO --node-ip. netdsvc's node-address
+	// The plist must render NO --node-ip. netdsvc's node-address
 	// authorizer branch (a <1024 bind on the node's OWN InternalIP, authorized
-	// ONLY by the canonical kube-system/k3sm-ingress Service since B133) is
+	// ONLY by the canonical kube-system/k3sm-ingress Service) is
 	// DORMANT BY CONFIGURATION, not by construction: the code is still there, and
-	// passing --node-ip would re-arm it. Since B116 the ingress/svclb listeners
+	// passing --node-ip would re-arm it. The ingress/svclb listeners
 	// bind the wildcard in-process and never ask netd for a node-address bind, so
 	// re-adding the flag would widen the root helper's authorized surface with no
 	// consumer. Adding it must redden HERE.
 	if strings.Contains(x, "--node-ip") {
-		t.Error("netd plist must NOT render --node-ip: the node-address authorizer branch is dormant by configuration (B116/B133); re-arming it needs a deliberate decision, not a plist edit")
+		t.Error("netd plist must NOT render --node-ip: the node-address authorizer branch is dormant by configuration; re-arming it needs a deliberate decision, not a plist edit")
 	}
 	// The LoadBalancer port list is ALWAYS rendered, the default included:
 	// netd's own default allows no port, so a job without the flag is one
@@ -2500,7 +2505,7 @@ func TestServerPlistXML(t *testing.T) {
 }
 
 // TestServerPlistRaisesFileLimit proves the server plist raises RLIMIT_NOFILE so
-// darwin-net's UDP flow budget (B48, rl.Cur/2) sizes against a real fd table, not
+// darwin-net's UDP flow budget (rl.Cur/2) sizes against a real fd table, not
 // launchd's 256 default. The load-bearing assertion is well-formedness: a
 // hand-rolled unbalanced/mis-nested <dict> would still pass the substring checks
 // yet make launchd REJECT the plist at bootstrap (a non-loading control plane),
@@ -2817,7 +2822,7 @@ func uninstallGaps(cfg Config, installCalls, uninstallCalls []string) []string {
 	return gaps
 }
 
-// TestUninstallManifestCoversInstall is the B62 gate. It asserts over the seam
+// TestUninstallManifestCoversInstall pins this contract. It asserts over the seam
 // calls RECORDED from a REAL Install run + a REAL Uninstall run against the fake
 // (never the manifest against itself — that tautology would never catch a future
 // off-manifest install line, the exact bug): forward coverage, bidirectional
@@ -2845,7 +2850,7 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		}
 	})
 
-	t.Run("both leaked plists are now removed (the B62 fix)", func(t *testing.T) {
+	t.Run("both leaked plists are now removed (the earlier uninstall fix)", func(t *testing.T) {
 		for _, label := range []string{ServerLabel, NetdLabel} {
 			plist := dc.plistPath(label)
 			if !bootedOut[label] {
@@ -3315,5 +3320,91 @@ func mustContain(t *testing.T, haystack, needle string) {
 	t.Helper()
 	if !strings.Contains(haystack, needle) {
 		t.Errorf("plist missing %q\n--- plist ---\n%s", needle, haystack)
+	}
+}
+
+// TestInstallStagesTheZotMarker is the gate for the bundled registry: the server
+// seeds zot from the payload only when zot.version beside it vouches for the
+// pin, and without it falls back to a build a launchd daemon cannot run. So an
+// install must stage the marker from the payload, publish it into the live
+// bin dir, and what it stages must satisfy the server's own predicate.
+func TestInstallStagesTheZotMarker(t *testing.T) {
+	payload := t.TempDir()
+	if err := os.WriteFile(filepath.Join(payload, registrysvc.ZotBinaryName), []byte("zot\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := registrysvc.DefaultZotVersion + " minimal+r1\n"
+	if err := os.WriteFile(filepath.Join(payload, registrysvc.ZotMarkerName), []byte(marker), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeSystem{}
+	cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice", PayloadSource: payload}
+	if err := Install(context.Background(), f, cfg); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	live := f.treeUnder(cfg.withDefaults().InstallDir)
+	src, ok := live["bin/"+registrysvc.ZotMarkerName]
+	if !ok {
+		t.Fatalf("%s is not in the published install root %v", registrysvc.ZotMarkerName, live)
+	}
+	if want := filepath.Join(payload, registrysvc.ZotMarkerName); src != want {
+		t.Errorf("zot marker came from %q, want the payload's %q", src, want)
+	}
+	// Reproduce the staged bin dir from what the install copied and ask the
+	// server's predicate about it.
+	bin := t.TempDir()
+	for _, name := range []string{registrysvc.ZotBinaryName, registrysvc.ZotMarkerName} {
+		b, err := os.ReadFile(live["bin/"+name])
+		if err != nil {
+			t.Fatalf("read the staged source of %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(bin, name), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !registrysvc.PayloadVouchesZot(bin, registrysvc.DefaultZotVersion) {
+		t.Errorf("the staged zot set is not one the server would use (marker %q, pin %s)", marker, registrysvc.DefaultZotVersion)
+	}
+}
+
+// TestInstallStagesTheHelmMarker: the work-dir seed replaces a helm whose marker
+// does not vouch for the pin and variant (a tarball-era helm of the same version)
+// only from a payload whose own helm.version does. So an install must stage the
+// marker from the payload, publish it beside the binary, and what it stages must
+// satisfy the seed's own predicate.
+func TestInstallStagesTheHelmMarker(t *testing.T) {
+	payload := t.TempDir()
+	if err := os.WriteFile(filepath.Join(payload, helmchart.HelmBinaryName), []byte("helm\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := helmchart.HelmVersion + " " + helmchart.HelmBuildVariant + "\n"
+	if err := os.WriteFile(filepath.Join(payload, helmchart.HelmMarkerName), []byte(marker), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeSystem{}
+	cfg := Config{BinarySource: "/tmp/build/k3sm", TargetUser: "alice", PayloadSource: payload}
+	if err := Install(context.Background(), f, cfg); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	live := f.treeUnder(cfg.withDefaults().InstallDir)
+	bin := t.TempDir()
+	for _, name := range []string{helmchart.HelmBinaryName, helmchart.HelmMarkerName} {
+		src, ok := live["bin/"+name]
+		if !ok {
+			t.Fatalf("%s is not in the published install root %v", name, live)
+		}
+		if want := filepath.Join(payload, name); src != want {
+			t.Errorf("%s came from %q, want the payload's %q", name, src, want)
+		}
+		b, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatalf("read the staged source of %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(bin, name), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !executor.PayloadVouchesHelm(bin) {
+		t.Errorf("the staged helm set is not one the seed would take (marker %q)", marker)
 	}
 }

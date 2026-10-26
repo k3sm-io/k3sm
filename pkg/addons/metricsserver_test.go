@@ -83,13 +83,13 @@ var wantMetricsServerObjects = []objID{
 	{"apiregistration.k8s.io/v1", "APIService", "", "v1beta1.metrics.k8s.io"},
 }
 
-// TestMetricsServerAddonManifest is the B93 gate on the shipped add-on: the
+// TestMetricsServerAddonManifest pins this contract on the shipped add-on: the
 // embedded tree decodes, holds exactly the approved objects, grants exactly
 // upstream metrics-server's RBAC (no extra verb, resource or group, no
 // nodes/proxy anywhere), and registers the
 // metrics.k8s.io APIService with upstream's insecureSkipTLSVerify posture (the
 // aggregator does not verify metrics-server's self-generated serving cert; the
-// proxy-client certificate still authenticates the apiserver to it). Before B93
+// proxy-client certificate still authenticates the apiserver to it). Before the add-on was added
 // the tree shipped empty and every assertion below failed.
 func TestMetricsServerAddonManifest(t *testing.T) {
 	objs, errs := (&Reconciler{fsys: FS()}).load()

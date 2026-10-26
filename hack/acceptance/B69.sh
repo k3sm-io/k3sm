@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B69 acceptance gate — the kine single-pin collapse.
+# k3sm kine pin acceptance gate — the kine single-pin collapse.
 #
 # What it proves, in seven legs:
 #
@@ -29,7 +29,7 @@
 #
 #   *** GOPROXY REQUIREMENT (not optional) ***
 # The superseded pin, kine v1.14.2, has NO corresponding upstream git tag: it resolves
-# only through a module proxy that already carries it (the B38 provenance finding). With
+# only through a module proxy that already carries it (the provenance finding). With
 # GOPROXY=direct — or a cold proxy — the b69.2/b69.3 fixture build CANNOT succeed, and
 # this script says so explicitly rather than surfacing an opaque resolution error.
 #
@@ -42,7 +42,7 @@ EXEC_PKG="$REPO_ROOT/pkg/executor"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B69 acceptance (kine single-pin collapse: >=0.16.x, CGO_ENABLED=0, migration-safe)"
+echo "==> k3sm kine pin acceptance (kine single-pin collapse: >=0.16.x, CGO_ENABLED=0, migration-safe)"
 
 WORK="$(mktemp -d /tmp/b69.XXXXXX)"
 # The scratch GOPATHs below hold only bin/ — GOMODCACHE stays on the shared, already
@@ -107,7 +107,7 @@ else
 			fi
 			;;
 		*)
-			echo "  kine pin $KINE_PIN is not a v0.x release — the orphan v1.14.x line is retired (B38)" >&2
+			echo "  kine pin $KINE_PIN is not a v0.x release — the orphan v1.14.x line is retired" >&2
 			lint_ok=false
 			;;
 	esac
@@ -143,8 +143,8 @@ if $lint_ok; then
 else
 	ladder no "b69.1  ONE kine pin (>=0.16.x), CGO_ENABLED=0 child build, marker-gated staging, VACUUM opt-out"
 	echo "----------------------------------------"
-	echo "B69: the lint leg is red — the compat legs below would measure the wrong build" >&2
-	echo "B69: $PASS passed, $FAIL failed" >&2
+	echo "kine pin: the lint leg is red — the compat legs below would measure the wrong build" >&2
+	echo "kine pin: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -155,14 +155,14 @@ fi
 PRE_ORPHANS="$(fixture_kine_pids)"
 if [ -n "$PRE_ORPHANS" ]; then
 	echo "----------------------------------------" >&2
-	echo "B69: REFUSING to run — kine process(es) from an EARLIER run of these fixtures are still alive:" >&2
+	echo "kine pin: REFUSING to run — kine process(es) from an EARLIER run of these fixtures are still alive:" >&2
 	name_pids "$PRE_ORPHANS"
-	echo "B69: each holds a TCP port and a temp-dir datastore, and bring-up refuses a datastore port" >&2
-	echo "B69: it finds held — so a later run fails for a reason that has nothing to do with it." >&2
-	echo "B69: stop them by hand (kill $(echo "$PRE_ORPHANS" | tr "\n" " ")) and re-run." >&2
-	echo "B69: this gate never kills a process it did not start: only the run that started one" >&2
-	echo "B69: knows it is finished with it." >&2
-	echo "B69: $PASS passed, $FAIL failed" >&2
+	echo "kine pin: each holds a TCP port and a temp-dir datastore, and bring-up refuses a datastore port" >&2
+	echo "kine pin: it finds held — so a later run fails for a reason that has nothing to do with it." >&2
+	echo "kine pin: stop them by hand (kill $(echo "$PRE_ORPHANS" | tr "\n" " ")) and re-run." >&2
+	echo "kine pin: this gate never kills a process it did not start: only the run that started one" >&2
+	echo "kine pin: knows it is finished with it." >&2
+	echo "kine pin: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -194,28 +194,28 @@ run_test() { # run_test <logfile> <go-test-args...>
 echo "==> building the superseded pin ($OLD_PIN, CGO_ENABLED=1) — the migration fixture"
 if ! KINE_OLD="$(build_kine "$OLD_PIN" 1 "$GOPATH_OLD")"; then
 	echo "----------------------------------------" >&2
-	echo "B69: could not build kine $OLD_PIN — the FORWARD/DOWNGRADE fixture cannot be created." >&2
-	echo "B69: This pin has NO upstream git tag (the B38 provenance finding); it resolves ONLY" >&2
-	echo "B69: through a module proxy that already carries it. Re-run with the public proxy" >&2
-	echo "B69: reachable (GOPROXY=https://proxy.golang.org,direct) — GOPROXY=direct CANNOT" >&2
-	echo "B69: resolve it, and no amount of retrying will change that." >&2
-	echo "B69: go install output:" >&2
+	echo "kine pin: could not build kine $OLD_PIN — the FORWARD/DOWNGRADE fixture cannot be created." >&2
+	echo "kine pin: This pin has NO upstream git tag (the provenance finding); it resolves ONLY" >&2
+	echo "kine pin: through a module proxy that already carries it. Re-run with the public proxy" >&2
+	echo "kine pin: reachable (GOPROXY=https://proxy.golang.org,direct) — GOPROXY=direct CANNOT" >&2
+	echo "kine pin: resolve it, and no amount of retrying will change that." >&2
+	echo "kine pin: go install output:" >&2
 	tail -20 "$GOPATH_OLD.log" >&2 || true
 	ladder no "b69.2  FORWARD: old-pin datastore served by the new pin"
 	ladder no "b69.3  DOWNGRADE: new-pin datastore served by the old pin"
 	echo "----------------------------------------"
-	echo "B69: $PASS passed, $FAIL failed" >&2
+	echo "kine pin: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
 echo "==> building the target pin ($NEW_PIN, CGO_ENABLED=0) — the shipped build"
 if ! KINE_NEW="$(build_kine "$NEW_PIN" 0 "$GOPATH_NEW")"; then
-	echo "B69: could not build kine $NEW_PIN (CGO_ENABLED=0):" >&2
+	echo "kine pin: could not build kine $NEW_PIN (CGO_ENABLED=0):" >&2
 	tail -20 "$GOPATH_NEW.log" >&2 || true
 	ladder no "b69.2  FORWARD: old-pin datastore served by the new pin"
 	ladder no "b69.3  DOWNGRADE: new-pin datastore served by the old pin"
 	echo "----------------------------------------"
-	echo "B69: $PASS passed, $FAIL failed" >&2
+	echo "kine pin: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 export K3SM_KINE_OLD="$KINE_OLD" K3SM_KINE_NEW="$KINE_NEW"
@@ -232,11 +232,11 @@ if run_test "$WORK/forward.log" -tags kinecompat ./pkg/executor/ -run TestKineCo
 else
 	ladder no "b69.2  FORWARD: production-shaped old-pin datastore round-trips on $NEW_PIN"
 	echo "----------------------------------------" >&2
-	echo "B69: FORWARD compatibility FAILED. If this is not a harness bug, the collapse HALTS:" >&2
-	echo "B69: it escalates to the phased additive cycle (ADD -> dual-read -> CUT -> DROP)." >&2
+	echo "kine pin: FORWARD compatibility FAILED. If this is not a harness bug, the collapse HALTS:" >&2
+	echo "kine pin: it escalates to the phased additive cycle (ADD -> dual-read -> CUT -> DROP)." >&2
 	tail -40 "$WORK/forward.log" >&2 || true
 	echo "----------------------------------------"
-	echo "B69: $PASS passed, $FAIL failed" >&2
+	echo "kine pin: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
 
@@ -332,6 +332,6 @@ else
 fi
 
 echo "----------------------------------------"
-echo "B69: $PASS passed, $FAIL failed"
+echo "kine pin: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B69 GREEN ================"
+echo "================ kine pin GREEN ================"

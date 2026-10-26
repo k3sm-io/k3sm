@@ -67,6 +67,10 @@ type ReleaseIndex struct {
 	Tag string `json:"tag"`
 	// MinimumMacOS is the lowest macOS release the set runs on, MAJOR[.MINOR[.PATCH]].
 	MinimumMacOS string `json:"minimumMacOS"`
+	// MinimumSupportedTag is the oldest final release the project still
+	// supports, vMAJOR.MINOR.PATCH, at or below Tag. The app refuses to go
+	// back to a release below it, and a later index can raise it.
+	MinimumSupportedTag string `json:"minimumSupportedTag"`
 	// App is the app half of the set.
 	App ReleaseIndexApp `json:"app"`
 	// K3sm is the k3sm half of the set.
@@ -125,8 +129,9 @@ var (
 // its grammar. It refuses a document over MaxReleaseIndexBytes before parsing
 // it; a key that is not a schema key in exact case, or that appears twice in
 // one object; anything after the one JSON object; a schema or context other
-// than the v1 constants; a tag that is not a final release; and an image URL
-// other than the release download URL of that tag and image name.
+// than the v1 constants; a tag that is not a final release; a minimum supported
+// tag that is not a final release or is above the tag; and an image URL other
+// than the release download URL of that tag and image name.
 func ParseReleaseIndex(raw []byte) (ReleaseIndex, error) {
 	if len(raw) > MaxReleaseIndexBytes {
 		return ReleaseIndex{}, fmt.Errorf("%w: %d bytes, over the %d byte cap", ErrReleaseIndex, len(raw), MaxReleaseIndexBytes)
@@ -156,7 +161,7 @@ func ParseReleaseIndex(raw []byte) (ReleaseIndex, error) {
 type releaseIndexKeys map[string]releaseIndexKeys
 
 var releaseIndexSchemaKeys = releaseIndexKeys{
-	"schema": nil, "context": nil, "issuedAt": nil, "tag": nil, "minimumMacOS": nil,
+	"schema": nil, "context": nil, "issuedAt": nil, "tag": nil, "minimumMacOS": nil, "minimumSupportedTag": nil,
 	"app": {
 		"bundleID": nil, "shortVersion": nil,
 		"image": {"name": nil, "url": nil, "sha256": nil, "size": nil},
@@ -227,6 +232,12 @@ func (ix ReleaseIndex) check() error {
 		return errors.New("tag is not a final release tag vMAJOR.MINOR.PATCH")
 	case !macOSVersion.MatchString(ix.MinimumMacOS):
 		return errors.New("minimumMacOS is not MAJOR[.MINOR[.PATCH]]")
+	case !version.ValidTag(ix.MinimumSupportedTag) || !finalTag.MatchString(ix.MinimumSupportedTag):
+		return errors.New("minimumSupportedTag is not a final release tag vMAJOR.MINOR.PATCH")
+	}
+	// Both tags matched finalTag, so both parse and the comparison is defined.
+	if c, ok := version.CompareReleases(ix.MinimumSupportedTag, ix.Tag); !ok || c > 0 {
+		return fmt.Errorf("minimumSupportedTag %s is above tag %s", ix.MinimumSupportedTag, ix.Tag)
 	}
 	t, err := time.Parse(releaseIssuedAtLayout, ix.IssuedAt)
 	if err != nil || t.Format(releaseIssuedAtLayout) != ix.IssuedAt {

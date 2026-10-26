@@ -329,7 +329,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	if !provisioned {
 		runtimeName = runtimeHostProcess
 		binDir = ""
-		fmt.Fprint(m.out, "NOTE: Seatbelt confinement unavailable (no buildable k3sm-execshim helper) — pods run UNCONFINED (dev-only). Run k3sm dev from the workspace, or install, for real isolation.\n")
+		fmt.Fprint(m.out, "NOTE: Seatbelt confinement unavailable (no buildable k3sm-execshim helper) — pods run UNCONFINED (dev-only). Run k3sm dev from a source checkout (the go.work workspace), or install, for real isolation.\n")
 	}
 
 	// Provision the two pod-support DYLD shims and hand them to the server as

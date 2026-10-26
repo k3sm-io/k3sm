@@ -33,7 +33,7 @@ import (
 // The provider is the image-pull RETRY authority on the runtimed path, exactly
 // as it is the exit-driven restart authority next door (runtimed_restart.go).
 //
-// The ownership split (binding): runtimed owns the container's waiting STATE —
+// The ownership split: runtimed owns the container's waiting STATE —
 // it attempted the start, it recorded the typed failure_reason and the bounded
 // message on ContainerStateWaiting, and it will re-attempt only when asked. The
 // provider owns the SCHEDULE — when to ask again, how long to wait, and which

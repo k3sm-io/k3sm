@@ -24,6 +24,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"k3sm.io/k3sm/internal/childreq"
 )
 
 // TestApplyKinePatches pins the patch applier's fail-closed contract: an anchor
@@ -68,11 +70,19 @@ func TestApplyKinePatches(t *testing.T) {
 	})
 }
 
-// kinePatchSetDigest is the sha256 of kinePatches' content.
+// kinePatchSetDigest is the sha256 of the patch set's content: kinePatches, then
+// the requirement raises (childreq.Raises) applied to the same tree. The p1 entry of
+// kinePatchSetHistory predates the raises and was the source patches alone.
 func kinePatchSetDigest() string {
 	h := sha256.New()
 	for _, p := range kinePatches {
 		for _, f := range []string{p.name, p.file, p.old, p.new} {
+			h.Write([]byte(f))
+			h.Write([]byte{0})
+		}
+	}
+	for _, r := range childreq.Raises {
+		for _, f := range []string{"raise", r.Path, r.Version, r.Sum, r.GoModSum} {
 			h.Write([]byte(f))
 			h.Write([]byte{0})
 		}
@@ -86,6 +96,7 @@ func kinePatchSetDigest() string {
 // kinePatches means a new "+p<n>" in kineBuildVariant and a new line here.
 var kinePatchSetHistory = map[string]string{
 	"nocgo+p1": "d6c6334601320bd1bc3c88c5e97144f0df8c38e41ede21f225bdff71ff19af24",
+	"nocgo+p2": "4056b8ca92fa544e024153ec01765ff84468be118b516dd5b2e02052a93397ea",
 }
 
 // TestKinePatchSetIsMarked pins the link between the carried patches and the staging
@@ -99,7 +110,7 @@ func TestKinePatchSetIsMarked(t *testing.T) {
 	case !ok:
 		t.Errorf("kineBuildVariant %q has no kinePatchSetHistory entry; add %q: %q", kineBuildVariant, kineBuildVariant, got)
 	case want != got:
-		t.Errorf("kinePatches changed (digest %s) but kineBuildVariant is still %q, which names %s: bump the \"+p<n>\" suffix and add the new pair to kinePatchSetHistory", got, kineBuildVariant, want)
+		t.Errorf("the kine patch set changed (digest %s) but kineBuildVariant is still %q, which names %s: bump the \"+p<n>\" suffix and add the new pair to kinePatchSetHistory", got, kineBuildVariant, want)
 	}
 	seen := map[string]string{}
 	for variant, digest := range kinePatchSetHistory {

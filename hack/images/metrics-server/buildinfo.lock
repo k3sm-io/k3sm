@@ -1,4 +1,4 @@
-metrics-server: go1.27.2
+metrics-server: go1.27.3
 	path	sigs.k8s.io/metrics-server/cmd/metrics-server
 	mod	sigs.k8s.io/metrics-server	v0.9.0	h1:nlqqZ2H0Xfko8eJC/1qaNVVT17hu4rxndkOi22KTZ4w=
 	dep	cel.dev/expr	v0.25.2	h1:K6j46C81hXtZQfuX60cVWQFBJahKSE2gfRbNuvr5bFs=

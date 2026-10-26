@@ -28,8 +28,9 @@ limitations under the License.
 // # Shape
 //
 // zot is NOT linked in. It is a pinned CHILD PROCESS built on demand
-// (`go install zotregistry.dev/zot/v2/cmd/zot@<pin>`, CGO_ENABLED=0, out of this
-// module) or seeded from a packaged install's staged payload — exactly the
+// (`go build zotregistry.dev/zot/v2/cmd/zot` inside the embedded zotchild wrapper
+// module, which requires zot at the pin plus the raised golang.org/x/net of
+// internal/childreq; CGO_ENABLED=0, out of this module) or seeded from a packaged install's staged payload — exactly the
 // treatment pkg/executor gives kine, and for the same two reasons: the registry's
 // dependency tree never enters any k3sm.io go.mod, and the binary that runs is
 // identified by a VERSION MARKER rather than by mere presence, so a pin change
@@ -39,7 +40,7 @@ limitations under the License.
 //
 //	<work-dir>/registry/                    the registry state root, mode 0700
 //	<work-dir>/registry/config.json         the rendered zot config, mode 0600
-//	<work-dir>/registry/htpasswd            the bcrypt push credential, mode 0600
+//	<work-dir>/registry/htpasswd            the bcrypt push credentials, mode 0600
 //	<work-dir>/registry/push-credential.json the same credential in plaintext, mode 0600
 //	<work-dir>/registry/<repo>/…            the OCI blob store (zot's rootDirectory)
 //	<work-dir>/registry.log                 the child's stdout+stderr, mode 0600
@@ -68,4 +69,12 @@ limitations under the License.
 // certificate would buy nothing against an attacker who is already on the host.
 // Constructing a Service with a non-loopback bind address is an error, so the
 // posture cannot be widened by configuration.
+//
+// Off loopback, the relay (relay.go) serves the push gate (gate.go): reads pass
+// through anonymously, and a pod may push only with its own projected
+// ServiceAccount token, audience RegistryAudience, from a namespace labelled
+// PushLabel=<its own name>, into a repository under that name, with an RBAC
+// grant of PushVerb on PushAPIGroup/PushResource. The gate forwards such a
+// write with a second, in-memory registry credential that cannot delete, and
+// refuses DELETE outright.
 package registrysvc

@@ -46,6 +46,8 @@ func TestIngestRegistryRow(t *testing.T) {
 		}
 		return b
 	}
+	certExpiry := time.Date(2099, 1, 2, 3, 4, 5, 0, time.UTC)
+	certExpired := time.Date(2001, 1, 2, 3, 4, 5, 0, time.UTC)
 	answers := func(context.Context, string) error { return nil }
 	silent := func(context.Context, string) error { return errors.New("connection refused") }
 
@@ -110,9 +112,24 @@ func TestIngestRegistryRow(t *testing.T) {
 			state: record(registrysvc.State{State: registrysvc.StateServing}), probe: answers,
 		},
 		{
-			name: "arguments that configure no registry are no row", role: dataroot.RoleServer,
+			name: "arguments without --registry-port run it by default", role: dataroot.RoleServer,
 			state: record(registrysvc.State{State: registrysvc.StateServing}), probe: answers,
-			args: []string{"--mesh-ip", "100.64.0.1"},
+			args:    []string{"--mesh-ip", "100.64.0.1"},
+			wantRow: true, wantState: StateOK, wantSev: SeverityOK,
+		},
+		{
+			name: "the flat name, HTTPS and the certificate expiry are reported", role: dataroot.RoleServer,
+			state:   record(registrysvc.State{State: registrysvc.StateServing, Service: "registry-k3sm:6450", TLS: true, CertNotAfter: &certExpiry}),
+			probe:   answers,
+			wantRow: true, wantState: StateOK, wantSev: SeverityOK,
+			wantDetail: []string{"in the cluster as registry-k3sm:6450", "over HTTPS", "certificate expires 2099-01-02T03:04:05Z"},
+		},
+		{
+			name: "an expired serving certificate warns", role: dataroot.RoleServer,
+			state:   record(registrysvc.State{State: registrysvc.StateServing, Service: "registry-k3sm:6450", TLS: true, CertNotAfter: &certExpired}),
+			probe:   answers,
+			wantRow: true, wantState: StateDown, wantSev: SeverityWarn, wantRemedy: true,
+			wantDetail: []string{"serving certificate expired at 2001-01-02T03:04:05Z"},
 		},
 		{
 			name: "--registry-port=0 is no row", role: dataroot.RoleServer,

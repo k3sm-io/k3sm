@@ -161,7 +161,7 @@ func agentStartFailure(at time.Time, detail string) executor.Crash {
 // pins.
 //
 // Every row that PASSES seeds a live io.k3sm.agent pid, because the credential
-// is proof only of a join some process made: since B332 the verification also
+// is proof only of a join some process made: the verification now also
 // requires the daemon to have been observed running steadily
 // (agentRecoveryObservation). The rows that fail deliberately leave the daemon
 // down — a credential nothing is presenting is the shape this test exists for.

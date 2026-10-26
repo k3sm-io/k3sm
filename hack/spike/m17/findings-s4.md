@@ -1,4 +1,4 @@
-# S4 findings — sleep, unplug and replug under a bulk flow (M17.0)
+# S4 findings — sleep, unplug and replug under a bulk flow
 
 > **Status: NOT YET RUN.** Write-back target for `hack/spike/m17/s4.sh`. The fallback
 > figures are in `$K3SM_EVIDENCE/figures.jsonl`; the per-event observer logs (link
@@ -27,8 +27,8 @@ physical unplug/replug cycles; a pf anchor that drops the worker's cable traffic
 
 | criterion | on failure |
 |---|---|
-| s4.3 configd re-adds faster than the watcher | R8: the watcher removes on every network-change event, and the doc says the bridge is managed |
-| s1.5 failed (PF_ROUTE silent) | R8: the fallback figure recorded here is the poll-only figure |
+| s4.3 configd re-adds faster than the watcher | the watcher removes on every network-change event, and the doc says the bridge is managed |
+| s1.5 failed (PF_ROUTE silent) | the fallback figure recorded here is the poll-only figure |
 | s4.2 a kernel fault | no substitution is pre-decided: the spike stops and the panic report is attached; nothing ships over a path that faults the kernel |
 
 ## Scoreboard
@@ -56,8 +56,8 @@ physical unplug/replug cycles; a pf anchor that drops the worker's cable traffic
 
 ## Consequences recorded here
 
-- Whether the kernel's own route deletion is the fallback (R14), or a route
-  survives a dead link and the liveness probe (R13) is the only thing that withdraws it.
+- Whether the kernel's own route deletion is the fallback, or a route
+  survives a dead link and the liveness probe is the only thing that withdraws it.
 - The fallback figure the doc may quote, and the eviction timing beside it.
-- Whether the watcher must re-remove on every network event (R8) or the
+- Whether the watcher must re-remove on every network event or the
   reconcile-time re-confirmation (A2) is enough.

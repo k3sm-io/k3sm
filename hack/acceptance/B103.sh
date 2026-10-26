@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B103 acceptance gate — the runnable proof of TRUTHFUL Rosetta node-capability
+# k3sm Rosetta capability acceptance gate — the runnable proof of TRUTHFUL Rosetta node-capability
 # advertisement across the runtimed/k3sm seam:
 #
 #   producer (runtimed)  GetRuntimeInfo grows two additive RuntimeConditions,
@@ -10,9 +10,9 @@
 #                        delete()-on-loss, rosetta-linux composed as
 #                        VMBackendAvailable AND RosettaGuestAvailable.
 #
-# B103 spans TWO repos, so this gate spans them too: it drives runtimed's producer
+# spans TWO repos, so this gate spans them too: it drives runtimed's producer
 # test and k3sm's two consumer tests through the workspace go.work. A standalone
-# k3sm checkout cannot prove B103 — that is a hard FAIL below, never a skip.
+# k3sm checkout cannot prove it — that is a hard FAIL below, never a skip.
 #
 # Usage: bash hack/acceptance/B103.sh
 set -euo pipefail
@@ -24,13 +24,13 @@ RUNTIMED_ROOT="$WS_ROOT/runtimed"
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
 
-echo "==> k3sm B103 acceptance (Rosetta node-capability advertisement, runtimed<->k3sm)"
+echo "==> k3sm Rosetta capability acceptance (Rosetta node-capability advertisement, runtimed<->k3sm)"
 
 # ---- cross-repo preconditions ------------------------------------------------
 # The two halves only compile against each other through the workspace go.work. A
 # standalone k3sm clone CANNOT prove the producer half, so its absence is a hard FAIL
-# (never a skip and never exit 0 — an unprovable gate must read red, or "B103 green"
-# would mean "B103 was not checked").
+# (never a skip and never exit 0 — an unprovable gate must read red, or "green"
+# would mean "Rosetta capability was not checked").
 #
 # NOTE: $WS_ROOT is NOT a Go module (it holds go.work only), so never run a bare
 # `go build ./...` there — every Go leg below cd's into a repo and uses
@@ -38,16 +38,16 @@ echo "==> k3sm B103 acceptance (Rosetta node-capability advertisement, runtimed<
 if [ -f "$WS_ROOT/go.work" ]; then
 	ladder ok "b103.pre  workspace go.work present ($WS_ROOT/go.work)"
 else
-	ladder no "b103.pre  workspace go.work present — B103 spans two repos; a standalone k3sm checkout cannot prove it"
+	ladder no "b103.pre  workspace go.work present — spans two repos; a standalone k3sm checkout cannot prove it"
 fi
 if [ -f "$RUNTIMED_ROOT/go.mod" ]; then
 	ladder ok "b103.pre  sibling runtimed module present ($RUNTIMED_ROOT)"
 else
-	ladder no "b103.pre  sibling runtimed module present — the producer half of B103 is unreachable"
+	ladder no "b103.pre  sibling runtimed module present — the producer half is unreachable"
 fi
 if [ "$FAIL" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "B103: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
+	echo "Rosetta capability: $PASS passed, $FAIL failed (cross-repo preconditions unmet)" >&2
 	exit 1
 fi
 
@@ -99,7 +99,7 @@ fi
 # SCOPED to those same two packages ON PURPOSE: `CGO_ENABLED=0 go build ./...` is
 # ALREADY RED at runtimed's main for an UNRELATED pre-existing defect
 # (cmd/k3sm-execshim/main.go:128:57 — a supervisor.LaunchSpec/Credential mismatch), so
-# a whole-module pure-Go leg here would report a failure B103 neither caused nor can
+# a whole-module pure-Go leg here would report a failure neither caused nor can
 # fix. Do NOT "fix" this scope by widening it to ./... — widen it only once that
 # defect is repaired.
 if (cd "$RUNTIMED_ROOT" && CGO_ENABLED=0 go build ./pkg/sandbox/ ./pkg/runtime/); then
@@ -185,7 +185,7 @@ KNOWN-UNPROVEN HERE:
     inward; the buildProvider call itself is compile-checked, not behaviour-checked.
   - Real probe VALUES are host-dependent BY DESIGN. This gate proves the MAPPING and the
     fail-closed verdicts, never that this particular Mac reports Rosetta available.
-  - Executing a TRANSLATED darwin/amd64 Mach-O under Seatbelt is B105 (integration tier)
+  - Executing a TRANSLATED darwin/amd64 Mach-O under Seatbelt is a separate gap (integration tier)
     and is not exercised here — a node may truthfully carry k3sm.io/rosetta before that
     path is end-to-end proven.
   - A LIVE Rosetta-for-Linux guest (boot a VZ Linux guest, run a linux/amd64 ELF) is a
@@ -196,10 +196,10 @@ KNOWN-UNPROVEN HERE:
     via a three-way merge patch to the STATUS subresource, which emits no deletions
     when its last-applied annotation is missing, so whether a label REMOVAL actually
     reaches kine is an open lab question. B1's shipped k3sm.io/virtualization inherits
-    the identical unverified path — B103 does not make it worse, and does not fix it.
+    the identical unverified path — does not make it worse, and does not fix it.
     Operator remediation is documented in docs/user/limitations.md.
 UNPROVEN
 echo "----------------------------------------"
-echo "B103: $PASS passed, $FAIL failed"
+echo "Rosetta capability: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "================ B103 GREEN ================"
+echo "================ Rosetta capability GREEN ================"

@@ -41,7 +41,7 @@ import (
 	"k3sm.io/k3sm/pkg/interconnect"
 )
 
-// Pod opt-in to an interconnect (plan B451 §3, I9).
+// Pod opt-in to an interconnect.
 //
 // A pod annotated k3sm.io/interconnects: <name>[,…] gets, at create, a second
 // address on the node's interconnect: a free slot of the node's /24, a /32
@@ -60,8 +60,8 @@ import (
 //
 // The source pin the env sets up is attribution by cooperation, not an
 // identity boundary: any process on the host may bind any bridge0 alias. The
-// authority to use the cable is the admin's arming act (plan I1); the checks
-// here bound which pods attach for trusted tenancy (plan I9).
+// authority to use the cable is the admin's arming act; the checks here bound
+// which pods attach for trusted tenancy.
 
 // Reasons the attach condition and Event carry beyond the apis-defined
 // InterconnectUnsupportedRuntime and InterconnectSlotsExhausted. A refusal by

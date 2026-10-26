@@ -38,7 +38,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// TestVMRuntimeClassNodeSelector is the M5.1 proof that Provision lays down the
+// TestVMRuntimeClassNodeSelector is the proof that Provision lays down the
 // node.k8s.io/v1 RuntimeClass "vm" with handler "vm" AND a scheduling.nodeSelector
 // pinning it to VZ-capable nodes (k3sm.io/virtualization=true) — the fail-closed
 // scheduling gate that keeps a vm pod off a non-VZ node. The handler matches the
@@ -103,7 +103,7 @@ func TestVMRuntimeClassProvisionIdempotent(t *testing.T) {
 // runtimeclasses (it returns handled=false so the default tracker still performs the
 // update). It lets a test prove the reconcile MECHANISM — how many Update calls a
 // Provision issues: exactly one on upgrade, zero on an already-current re-provision (no
-// churn). Shared by TestVMRuntimeClassOverhead and the B45 reconcile test.
+// churn). Shared by TestVMRuntimeClassOverhead and the reconcile test.
 func countUpdates(cs *fake.Clientset, n *int) {
 	cs.PrependReactor("update", "runtimeclasses", func(k8stesting.Action) (bool, runtime.Object, error) {
 		*n++
@@ -111,7 +111,7 @@ func countUpdates(cs *fake.Clientset, n *int) {
 	})
 }
 
-// TestVMRuntimeClassOverhead is the B24 proof that the vm RuntimeClass carries a
+// TestVMRuntimeClassOverhead is the proof that the vm RuntimeClass carries a
 // host-side scheduler-accounting Overhead.PodFixed memory floor (so the scheduler
 // stops accounting ZERO micro-VM overhead and oversubscribing the node), on BOTH the
 // fresh-create path and the upgrade/reconcile path — the latter being the case that a
@@ -159,7 +159,7 @@ func TestVMRuntimeClassOverhead(t *testing.T) {
 		assertOverheadFloor(t, get(t, cs))
 	})
 
-	// upgrade is the reconcile proof: a cluster provisioned before B24 carries a "vm"
+	// upgrade is the reconcile proof: a cluster provisioned before the Overhead floor existed carries a "vm"
 	// RuntimeClass with NO Overhead (it persists in kine across restarts). Provision
 	// MUST Get+Update it to carry the floor — create-only logic leaves Overhead==nil and
 	// this subtest stays RED.
@@ -174,13 +174,13 @@ func TestVMRuntimeClassOverhead(t *testing.T) {
 			Scheduling: &nodev1.Scheduling{
 				NodeSelector: map[string]string{LabelVirtualization: LabelTrue},
 			},
-			// Overhead deliberately nil — the pre-B24 shape.
+			// Overhead deliberately nil — the earlier shape.
 		}
 		if _, err := cs.NodeV1().RuntimeClasses().Create(ctx, preexisting, metav1.CreateOptions{}); err != nil {
 			t.Fatalf("seed pre-existing vm runtime class: %v", err)
 		}
 		if seeded := get(t, cs); seeded.Overhead != nil {
-			t.Fatalf("seed sanity: Overhead = %v, want nil (the pre-B24 shape)", seeded.Overhead)
+			t.Fatalf("seed sanity: Overhead = %v, want nil (the earlier shape)", seeded.Overhead)
 		}
 
 		var updates int
@@ -220,7 +220,7 @@ func TestVMRuntimeClassOverhead(t *testing.T) {
 	})
 }
 
-// TestProvisionReconcileSurgicalAndConflictBenign is the B45 gate hardening B24's
+// TestProvisionReconcileSurgicalAndConflictBenign pins this contract hardening the
 // vm-RuntimeClass overhead reconcile. It proves the per-key floor-merge is SURGICAL
 // (raises a below-floor memory term to the floor, preserves a non-memory PodFixed key,
 // leaves an operator-raised value untouched), that the Get→reconcile→Update is wrapped in
@@ -232,7 +232,7 @@ func TestProvisionReconcileSurgicalAndConflictBenign(t *testing.T) {
 	q := func(s string) resource.Quantity { return resource.MustParse(s) }
 
 	// seed lays down a pre-existing "vm" class with the full desired shape but a custom
-	// Overhead — the operator-/pre-B24-authored object the reconcile measures against.
+	// Overhead — the operator-/earlier-authored object the reconcile measures against.
 	seed := func(t *testing.T, cs *fake.Clientset, overhead *nodev1.Overhead) {
 		t.Helper()
 		rc := desiredRuntimeClass()
@@ -297,7 +297,7 @@ func TestProvisionReconcileSurgicalAndConflictBenign(t *testing.T) {
 		}
 	})
 
-	// HA-conflict-retries-to-convergence: a nil-Overhead (pre-B24) class so the reconcile
+	// HA-conflict-retries-to-convergence: a nil-Overhead (earlier) class so the reconcile
 	// actually REACHES the Update (a current class would short-circuit and make this
 	// vacuous); the first Update returns a Conflict (the optimistic-concurrency loss a
 	// simultaneous HA-server upgrade produces), the second succeeds. Provision must return
@@ -380,7 +380,7 @@ func captureLogs(t *testing.T) *bytes.Buffer {
 	return &buf
 }
 
-// TestProvisionReconcilesNodeSelectorAndHandler is the B49 gate: the vm-RuntimeClass reconcile
+// TestProvisionReconcilesNodeSelectorAndHandler pins this contract: the vm-RuntimeClass reconcile
 // repairs the k3sm-owned MANAGED SHAPE (scheduling.nodeSelector VZ pin), not just Overhead. It
 // proves the four load-bearing properties the pre-build critiques converged on:
 //

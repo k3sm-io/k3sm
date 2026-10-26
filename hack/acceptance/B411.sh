@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# k3sm B411 acceptance gate — the apiserver aggregation layer's request-header
+# k3sm request-header CA acceptance gate — the apiserver aggregation layer's request-header
 # trust: a fifth CA, k3sm-request-header-ca, issuing only the front-proxy client
 # leaf (CN system:auth-proxy), and the eight kube-apiserver flags k3s sets
 # (--requestheader-*, --proxy-client-*, --enable-aggregator-routing=false).
@@ -10,7 +10,7 @@
 #   UNIT TIER (always runs; GOARCH=arm64 CGO_ENABLED=1) — the named unit gates in
 #   pkg/certs, pkg/bootstrap, pkg/executor, pkg/rbac and cmd/k3sm, with -race.
 #
-#   LAB TIER (K3SM_LAB=1, on the SERVER Mac of the rig; uses sudo for reads of the
+#   LAB TIER (K3SM_LAB=1, on the SERVER Mac of the lab host; uses sudo for reads of the
 #   0600 key files only) — against the installed, running server:
 #
 #     b411.L0  the e2e suite compiles (`go test -c -tags e2e`); a build failure
@@ -32,7 +32,7 @@
 #              again (the request-header CA pin must survive the rotation).
 #
 #   Without K3SM_LAB=1 the lab tier is announced PENDING and the gate exits 2: it
-#   NEVER passes without the rig run.
+#   NEVER passes without the lab host run.
 #
 #   --rollback-check (K3SM_LAB=1): after a rollback to a release without the
 #   aggregation layer, asserts kube-system/extension-apiserver-authentication
@@ -67,7 +67,7 @@ esac
 
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
-summary() { echo "----------------------------------------"; echo "B411: $PASS passed, $FAIL failed"; }
+summary() { echo "----------------------------------------"; echo "request-header CA: $PASS passed, $FAIL failed"; }
 
 WORK_DIR="${B411_WORK_DIR:-/var/lib/k3sm/server}"
 K3SM="${B411_K3SM:-k3sm}"
@@ -89,7 +89,7 @@ if [ "$mode" = rollback ]; then
 	exit 0
 fi
 
-echo "==> k3sm B411 acceptance (the aggregation layer's request-header trust) [$K3SM_ROOT]"
+echo "==> k3sm request-header CA acceptance (the aggregation layer's request-header trust) [$K3SM_ROOT]"
 
 # ---- unit tier ---------------------------------------------------------------
 b0=ok
@@ -118,7 +118,7 @@ unit ./pkg/rbac '^TestProvisionSubjectsUnchanged$' \
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "PENDING  b411.L0-L5 lab tier: run on the server Mac with K3SM_LAB=1, KUBECONFIG and B411_SERVER_NODE set"
 	summary
-	echo "B411: the lab tier is PENDING; this gate never passes without it" >&2
+	echo "request-header CA: the lab tier is PENDING; this gate never passes without it" >&2
 	[ "$FAIL" -eq 0 ] || exit 1
 	exit 2
 fi

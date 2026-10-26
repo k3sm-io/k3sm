@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# M8.0-d3 / S3 — memory visibility and growth for an MLX serving process.
+# S3 — memory visibility and growth for an MLX serving process.
 #
-# Feeds runtimed M8.2-d5's contingency and the M8.5 sizing formula. The five
-# questions of the M8 plan §M8.0 S3, in order:
+# Feeds runtimed's contingency and the sizing formula. The five
+# questions of the M8 spike S3, in order:
 #   (1) visibility     does ri_phys_footprint — the OOM watcher's input,
 #                      runtimed/pkg/supervisor/sampler.go — see the Metal /
 #                      unified-memory working set at all?
@@ -13,10 +13,10 @@
 #                      allocator, or jetsam? BOUNDED probe only: a hard GiB cap
 #                      and an abort guard on kern.memorystatus_level. This
 #                      deliberately does NOT drive the machine into real
-#                      pressure (M8.0 guardrail: never destabilize the lab).
+#                      pressure (M8 spike guardrail: never destabilize the lab).
 #   (5) group coverage does the sampler's leader-PID-only walk cover a forking
 #                      engine, and does proc_listpids(PROC_PGRP_ONLY) fix it?
-#                      (Res. 18's pre-authorized contingency.)
+#                      (the pre-authorized contingency.)
 #
 # The sampler harness (s3mem.go) mirrors runtimed/pkg/supervisor/rusage_darwin.go
 # exactly — proc_pid_rusage(RUSAGE_INFO_V2).ri_phys_footprint — so a divergence
@@ -34,7 +34,7 @@ GO=${GO:-/opt/homebrew/bin/go}
 mkdir -p "$W/s3" "$POD/tmp" "$PREFIX/logs" "$PREFIX/bin"
 
 cat > "$W/s3/main.go" <<'GO'
-// s3mem — M8.0/S3 spike sampler. Mirrors runtimed/pkg/supervisor/rusage_darwin.go
+// s3mem — M8 spike S3 spike sampler. Mirrors runtimed/pkg/supervisor/rusage_darwin.go
 // (proc_pid_rusage(RUSAGE_INFO_V2).ri_phys_footprint) and adds the process-GROUP
 // walk S3(5) needs: proc_listpids(PROC_PGRP_ONLY, getpgid(pid)).
 package main
