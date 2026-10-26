@@ -12,3 +12,4 @@
 # The reason is required. Delete a line once its version is older than the
 # cooldown; the script prints a note for every line that no longer matches.
 golang.org/x/net v0.60.0 x/net v0.60.0 adopted 2026-10-09 for GO-2026-6611/6612/6617; supply-chain audit 2026-10-11 (two blind auditors + per-module third opinion) found it byte-identical to the upstream tag; also the security fix for GO-2026-6617, 6612, 6611, 6603 (HTTP/2 server DoS reachable on the metrics-server serving path) in hack/images/metrics-server/go.mod
+buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260415201107-50325440f8f2.1 the module proxy records the zero commit time for this buf.build generated-SDK version (its pseudo-version names 2026-04-15); it is in the zot wrapper graph only, required at this version by zot v2.1.22's own go.mod (pkg/registrysvc/testdata/zot-v2.1.22.go.mod) and hash-pinned in pkg/registrysvc/zotchild/go.sum.txt
