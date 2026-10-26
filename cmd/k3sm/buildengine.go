@@ -122,7 +122,7 @@ func engineBuildRecorded(ctx context.Context, o buildOptions, out io.Writer, rec
 	}
 
 	setupCtx, cancel := context.WithTimeout(ctx, buildxSetupTimeout)
-	sess, err := newBuildxSession(setupCtx, workDirFromEnv(), true, out)
+	sess, err := newBuildxSession(setupCtx, buildxSessionOptions(), true, out)
 	cancel()
 	if err != nil {
 		return err
