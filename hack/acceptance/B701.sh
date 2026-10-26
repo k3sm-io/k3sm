@@ -17,15 +17,24 @@
 #   1. the worker leaves the cluster with a plain `k3sm uninstall` (never a purge:
 #      the data root, the PV data under /var/lib/k3sm/storage, the logs and the
 #      recorded arguments stay; pkg/install/manifest.go dispPreserve);
-#   2. `k3sm install --mesh-ip <mesh-ip>` makes it a single-node server on a fresh,
+#   2. when /var/lib/k3sm/server holds only image-migration/ (the journal a worker's
+#      `sudo k3sm image migrate` keeps under the installed work dir), that directory
+#      is moved, never copied, to /var/lib/k3sm/.fdb-preserved-image-migration on the
+#      same volume, the owner and mode of the server dir are recorded, and the then
+#      empty server dir is removed, so every boot starts on an empty work dir;
+#   3. `k3sm install --mesh-ip <mesh-ip>` makes it a single-node server on a fresh,
 #      empty datastore at /var/lib/k3sm/server (install has no work-dir flag; the
 #      server work dir is <data root>/server), the probe asserts the mesh came up,
 #      and `k3sm uninstall` plus the removal of everything that boot created
 #      returns the worker to its left state; repeated K3SM_FDB_BOOTS times;
-#   3. the worker rejoins as an agent with a fresh five-minute token, and every
+#   4. after the last teardown the server dir is made again with the recorded owner
+#      and mode and image-migration/ is moved back into it;
+#   5. the worker rejoins as an agent with a fresh five-minute token, and every
 #      non-k3sm label and taint it carried before is put back if the rejoin lost it.
 # Every remote root step is a script file run under `sudo -n /bin/bash`. The exit
-# trap tears a throwaway server down and rejoins the worker on any failure.
+# trap tears a throwaway server down, moves image-migration/ back and rejoins the
+# worker on any failure; a move back that fails is reported in the run log and on
+# stderr with the manual restore, never skipped.
 #
 # Legs (`--plan` prints them; the first red leg ends the run, exit 1, naming the leg):
 #   fdb.1  pre: the worker's labels and taints (from the cluster), its k3sm version
@@ -45,13 +54,16 @@
 #            - the log line `enrolled this control-plane node into its own mesh`,
 #              and neither `server mesh bring-up failed` (serverMeshBringUpFailure)
 #              nor `pod range is not its own` (parkServerDataPath)
-#          then the throwaway server is uninstalled and its state removed
+#          then the throwaway server is uninstalled and its state removed; after
+#          the last one a preserved image-migration/ is moved back into a server
+#          dir with its recorded owner and mode (a failed move back is this leg red)
 #   fdb.4  rejoin: the join port answers, a fresh 5m token is minted on the server,
 #          `k3sm install --agent` rejoins the worker, and its node is Ready
 #   fdb.5  restore: every non-k3sm label and taint recorded in fdb.1 is on the node
 #          again (only those; nothing else is added)
 #   fdb.6  end state: the worker runs the version it ran before, both nodes print
-#          `k3sm version`, and every PV directory recorded in fdb.1 is still there
+#          `k3sm version`, every PV directory recorded in fdb.1 is still there, and
+#          /var/lib/k3sm/server is as it was (absent, or holding only image-migration/)
 #
 # Environment (required under K3SM_LAB=1):
 #   KUBECONFIG              the admin kubeconfig of the running cluster
@@ -78,8 +90,12 @@
 #   KUBECTL                   kubectl binary (default: kubectl)
 #
 # Refused (exit 2, nothing changed) when the worker already holds server state the
-# gate would reuse or remove: /var/lib/k3sm/server (the datastore would not be
-# fresh), the server-arguments record, or a server LaunchDaemon.
+# gate would reuse or remove: a /var/lib/k3sm/server that holds anything but an
+# image-migration/ directory (a datastore, certs, any other file, or nothing at
+# all: the datastore would not be fresh), the server-arguments record, or a server
+# LaunchDaemon. Refused too when /var/lib/k3sm/.fdb-preserved-image-migration
+# exists: a previous run was interrupted with the journal moved aside, and it is
+# put back by hand (the refusal prints how) before the gate runs again.
 #
 # Exit: 0 every leg held; 1 a leg failed (the run log names it); 2 the run did not
 # happen: K3SM_LAB unset (SKIP, never a pass), a bad argument, or a refused
@@ -118,6 +134,10 @@ SERVER_RECORD="/Library/Preferences/io.k3sm.server-args.json"
 SERVER_PLIST="/Library/LaunchDaemons/io.k3sm.server.plist"
 AGENT_PLIST="/Library/LaunchDaemons/io.k3sm.agent.plist"
 SERVER_LOG="/var/log/k3sm/server.log"
+# A worker's image-migration journal (cmd/k3sm/imagemigrate.go migrationDir) lives
+# in the server work dir; the boots move it here, on the same volume, and back.
+MIGRATION_DIR="$SERVER_DIR/image-migration"
+PRESERVE_DIR="$DATA_ROOT/.fdb-preserved-image-migration"
 
 # The leg table: `name|statement`. --plan prints it, the run reports against it, and
 # --self-test checks every name is unique and run.
@@ -127,7 +147,7 @@ LEGS=(
 	"fdb.3|every fresh first boot binds its node-password, claims its range, writes its MeshPeer and brings its utun up"
 	"fdb.4|rejoin: join port open, a fresh 5m token, install --agent, the worker node Ready"
 	"fdb.5|restore: every recorded non-k3sm label and taint is on the worker node again"
-	"fdb.6|end state: the worker's version is unchanged and every recorded PV directory is still there"
+	"fdb.6|end state: the worker's version is unchanged, every recorded PV directory is still there and the server work dir is as it was"
 )
 
 # ---- pure helpers (the --self-test surface) -----------------------------------------
@@ -281,14 +301,40 @@ fi
 BODY
 }
 
+# server_dir_kind_body: the definition of `server_dir_kind <dir>`, which prints
+#   absent          nothing is at <dir>
+#   migration-only  <dir> is a directory holding exactly one entry, a directory
+#                   (not a symlink) named image-migration
+#   other           anything else: a file, a symlink, an empty directory, or any
+#                   entry beside image-migration (a datastore, certs, a stray file)
+# It is pasted into the remote scripts and evaluated by --self-test.
+server_dir_kind_body() {
+	cat <<'BODY'
+server_dir_kind() {
+	if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo absent; return; fi
+	if [ -L "$1" ] || [ ! -d "$1" ]; then echo other; return; fi
+	if [ -n "$(find "$1" -mindepth 1 -maxdepth 1 ! -name image-migration -print 2>/dev/null | head -1)" ] ||
+		[ -L "$1/image-migration" ] || [ ! -d "$1/image-migration" ]; then
+		echo other
+		return
+	fi
+	echo migration-only
+}
+BODY
+}
+
 # facts_script <k3sm>: what the worker holds; reads only.
 facts_script() {
 	script_head "K3SM=$1" "SERVER_DIR=$SERVER_DIR" "AGENT_DIR=$AGENT_DIR" "STORAGE_DIR=$STORAGE_DIR" \
 		"SERVER_KEY=$SERVER_KEY" "SERVER_RECORD=$SERVER_RECORD" "SERVER_PLIST=$SERVER_PLIST" \
-		"AGENT_PLIST=$AGENT_PLIST" "SERVER_LOG=$SERVER_LOG"
+		"AGENT_PLIST=$AGENT_PLIST" "SERVER_LOG=$SERVER_LOG" "PRESERVE_DIR=$PRESERVE_DIR"
+	server_dir_kind_body
 	cat <<'BODY'
-have() { if [ -e "$1" ]; then echo 1; else echo 0; fi; }
+have() { if [ -e "$1" ] || [ -L "$1" ]; then echo 1; else echo 0; fi; }
 emit server_dir=$(have "$SERVER_DIR")
+emit server_dir_kind=$(server_dir_kind "$SERVER_DIR")
+if [ -d "$SERVER_DIR" ]; then emit server_dir_owner_mode="$(stat -f '%u:%g %Mp%Lp' "$SERVER_DIR")"; fi
+emit preserve=$(have "$PRESERVE_DIR")
 emit server_record=$(have "$SERVER_RECORD")
 emit server_plist=$(have "$SERVER_PLIST")
 emit server_key=$(have "$SERVER_KEY")
@@ -395,6 +441,60 @@ emit end
 BODY
 }
 
+# preserve_script: moves a migration-only server dir's image-migration/ to
+# PRESERVE_DIR with mv on one volume (a cross-volume mv would copy, so it is
+# refused), then removes the empty server dir with rmdir, which removes nothing
+# else. It re-checks the precondition's predicate itself.
+preserve_script() {
+	script_head "SERVER_DIR=$SERVER_DIR" "MIGRATION_DIR=$MIGRATION_DIR" "PRESERVE_DIR=$PRESERVE_DIR"
+	server_dir_kind_body
+	cat <<'BODY'
+if [ -e "$PRESERVE_DIR" ] || [ -L "$PRESERVE_DIR" ]; then emit error=the-preserve-path-exists; emit end; exit 1; fi
+kind="$(server_dir_kind "$SERVER_DIR")"
+emit server_dir_kind="$kind"
+case "$kind" in
+absent) emit preserved=0; emit end; exit 0 ;;
+migration-only) ;;
+*) emit error=the-server-dir-holds-other-state; emit end; exit 1 ;;
+esac
+emit server_dir_owner_mode="$(stat -f '%u:%g %Mp%Lp' "$SERVER_DIR")"
+if [ "$(stat -f %d "$MIGRATION_DIR")" != "$(stat -f %d "$(dirname "$PRESERVE_DIR")")" ]; then
+	emit error=the-preserve-path-is-on-another-volume; emit end; exit 1
+fi
+mv "$MIGRATION_DIR" "$PRESERVE_DIR" || { emit error=the-move-failed; emit end; exit 1; }
+rmdir "$SERVER_DIR" || { emit error=the-server-dir-is-not-empty-after-the-move; emit end; exit 1; }
+emit preserved=1
+emit end
+BODY
+}
+
+# restore_script <uid:gid> <mode>: makes the server dir again with the recorded
+# owner and mode and moves image-migration/ back. Safe to re-run: a server dir that
+# already holds image-migration/ with nothing left at PRESERVE_DIR is put back.
+restore_script() {
+	script_head "OWNER=$1" "MODE=$2" "SERVER_DIR=$SERVER_DIR" "MIGRATION_DIR=$MIGRATION_DIR" "PRESERVE_DIR=$PRESERVE_DIR"
+	cat <<'BODY'
+fail() { emit error="$1"; emit restore_rc=1; emit end; exit 1; }
+if [ -e "$PRESERVE_DIR" ] || [ -L "$PRESERVE_DIR" ]; then
+	[ -d "$PRESERVE_DIR" ] && [ ! -L "$PRESERVE_DIR" ] || fail the-preserve-path-is-not-a-directory
+	if [ -e "$SERVER_DIR" ] || [ -L "$SERVER_DIR" ]; then
+		[ -d "$SERVER_DIR" ] && [ ! -L "$SERVER_DIR" ] || fail the-server-dir-is-not-a-directory
+		[ -z "$(find "$SERVER_DIR" -mindepth 1 -maxdepth 1 -print 2>/dev/null | head -1)" ] || fail the-server-dir-is-not-empty
+	else
+		(umask 077 && mkdir "$SERVER_DIR") || fail mkdir-the-server-dir
+	fi
+	chown "$OWNER" "$SERVER_DIR" || fail chown-the-server-dir
+	chmod "$MODE" "$SERVER_DIR" || fail chmod-the-server-dir
+	mv "$PRESERVE_DIR" "$MIGRATION_DIR" || fail the-move-back-failed
+fi
+[ -d "$MIGRATION_DIR" ] && [ ! -L "$MIGRATION_DIR" ] || fail image-migration-is-not-in-the-server-dir
+got="$(stat -f '%u:%g %Mp%Lp' "$SERVER_DIR")"
+[ "$got" = "$OWNER $MODE" ] || fail "the-server-dir-is-$got"
+emit restore_rc=0
+emit end
+BODY
+}
+
 # teardown_script <k3sm> <remove-key 0|1> <remove-log 0|1>: uninstalls the throwaway
 # server and removes the state its boot created. The precondition refused a worker
 # that held any of it before the run, so all of it is the run's own.
@@ -456,7 +556,7 @@ plan() {
 # ---- --self-test --------------------------------------------------------------------------
 
 self_test() {
-	local bad=0 row name names="" dup="" src t out code fake tmp pre cur f
+	local bad=0 row name names="" dup="" src t out code fake tmp pre cur f sd ino me
 	check() { if [ "$1" = ok ]; then echo "ok    $2"; else echo "FAIL  $2"; bad=1; fi; }
 
 	if command -v shellcheck >/dev/null 2>&1; then
@@ -470,7 +570,8 @@ self_test() {
 
 	# Every remote root script parses.
 	for f in "facts_script /x/k3sm" "leave_script /x/k3sm" "boot_script /x/k3sm 100.64.0.1 kc-x u" \
-		"probe_script /x/k3sm 0 100.64.0.1" "teardown_script /x/k3sm 1 0" "rejoin_script /x/k3sm host.invalid u" "token_script"; do
+		"probe_script /x/k3sm 0 100.64.0.1" "teardown_script /x/k3sm 1 0" "rejoin_script /x/k3sm host.invalid u" "token_script" \
+		"preserve_script" "restore_script 1:2 0700"; do
 		# shellcheck disable=SC2086 # the function name and its arguments
 		if $f | bash -n 2>/dev/null; then check ok "remote script parses: ${f%% *}"; else check no "remote script parses: ${f%% *}"; fi
 	done
@@ -560,6 +661,75 @@ FDB settle=4'
 		out="$(judge_boot "$green"$'\n'"FDB $f" 100.64.0.0/24)" && code=0 || code=$?
 		case "$code:$out" in 1:*"${t##*|}"*) check ok "judge_boot: $f is red, named" ;; *) check no "judge_boot: $f is red, named (got $code: $out)" ;; esac
 	done
+
+	# The server work dir predicate: only an image-migration directory passes.
+	eval "$(server_dir_kind_body)"
+	sd="$tmp/sd"
+	check "$([ "$(server_dir_kind "$sd")" = absent ] && echo ok)" "server_dir_kind: nothing there is absent"
+	mkdir -p "$sd/image-migration" && : >"$sd/image-migration/journal.json" && : >"$sd/image-migration/lock"
+	check "$([ "$(server_dir_kind "$sd")" = migration-only ] && echo ok)" "server_dir_kind: only image-migration/ (journal, lock) passes"
+	for t in "db/|a datastore beside it" "cred/|certs beside it" ".hidden|a dotfile beside it" "stray|a file beside it"; do
+		f="${t%%|*}"
+		case "$f" in */) mkdir "$sd/$f" ;; *) : >"$sd/$f" ;; esac
+		check "$([ "$(server_dir_kind "$sd")" = other ] && echo ok)" "server_dir_kind: ${t#*|} is other (refused)"
+		rm -rf "${sd:?}/$f"
+	done
+	rm -rf "$sd" && mkdir "$sd"
+	check "$([ "$(server_dir_kind "$sd")" = other ] && echo ok)" "server_dir_kind: an empty dir is other (refused)"
+	: >"$sd/image-migration"
+	check "$([ "$(server_dir_kind "$sd")" = other ] && echo ok)" "server_dir_kind: a file named image-migration is other"
+	rm -f "$sd/image-migration" && mkdir "$tmp/elsewhere" && ln -s "$tmp/elsewhere" "$sd/image-migration"
+	check "$([ "$(server_dir_kind "$sd")" = other ] && echo ok)" "server_dir_kind: a symlinked image-migration is other"
+	rm -rf "$sd" && ln -s "$tmp/elsewhere" "$sd"
+	check "$([ "$(server_dir_kind "$sd")" = other ] && echo ok)" "server_dir_kind: a symlinked server dir is other"
+	rm -f "$sd"
+	src="$(cat "$SELF")"
+	# shellcheck disable=SC2016 # the literal text of this file
+	case "$src" in *'other) refuse "the worker already holds $SERVER_DIR with more than an image-migration'*) check ok "precondition: an other server dir is refused" ;; *) check no "precondition: an other server dir is refused" ;; esac
+	# shellcheck disable=SC2016 # the literal text of this file
+	case "$src" in *'probe_field "$PRE_FACTS" preserve)" = 0 ] || refuse "the worker already holds $PRESERVE_DIR'*'sudo mv $PRESERVE_DIR $MIGRATION_DIR"'*) check ok "precondition: an existing preserve path is refused, with the manual restore" ;; *) check no "precondition: an existing preserve path is refused, with the manual restore" ;; esac
+
+	# The move aside and back, run for real on a scratch tree (owner: this user).
+	me="$(id -u):$(id -g)"
+	fdb_sd() {
+		local SERVER_DIR="$tmp/sd" MIGRATION_DIR="$tmp/sd/image-migration" PRESERVE_DIR="$tmp/.fdb-preserved-image-migration"
+		"$@" | /bin/bash 2>&1
+	}
+	mkdir -p "$sd/image-migration" && printf 'j\n' >"$sd/image-migration/journal.json" && chmod 0750 "$sd"
+	ino="$(stat -f %i "$sd/image-migration")"
+	out="$(fdb_sd preserve_script)" || true
+	check "$([ "$(probe_field "$out" preserved)" = 1 ] && [ ! -e "$sd" ] && [ "$(probe_field "$out" server_dir_owner_mode)" = "$me 0750" ] && echo ok)" "preserve: image-migration moved aside, the empty server dir removed, owner and mode reported ($(probe_field "$out" error))"
+	check "$([ "$(stat -f %i "$tmp/.fdb-preserved-image-migration" 2>/dev/null)" = "$ino" ] && echo ok)" "preserve: a move, not a copy (same inode)"
+	# shellcheck disable=SC2016 # the literal text of the remote script
+	case "$(preserve_script)" in *'stat -f %d "$MIGRATION_DIR")" != "$(stat -f %d "$(dirname "$PRESERVE_DIR")")"'*'mv "$MIGRATION_DIR" "$PRESERVE_DIR"'*'rmdir "$SERVER_DIR"'*) check ok "preserve: one-volume check, mv, rmdir" ;; *) check no "preserve: one-volume check, mv, rmdir" ;; esac
+	case "$(preserve_script)$(restore_script 1:2 0700)" in *"cp "* | *"rm -"*) check no "preserve and restore never copy or rm" ;; *) check ok "preserve and restore never copy or rm" ;; esac
+	out="$(fdb_sd restore_script "$me" 0750)" || true
+	check "$([ "$(probe_field "$out" restore_rc)" = 0 ] && [ ! -e "$tmp/.fdb-preserved-image-migration" ] && [ "$(stat -f '%u:%g %Mp%Lp' "$sd")" = "$me 0750" ] && [ "$(stat -f %i "$sd/image-migration")" = "$ino" ] && [ "$(cat "$sd/image-migration/journal.json")" = j ] && echo ok)" "restore: server dir made again with the recorded owner and mode, the same image-migration moved back ($(probe_field "$out" error))"
+	out="$(fdb_sd restore_script "$me" 0750)" || true
+	check "$([ "$(probe_field "$out" restore_rc)" = 0 ] && echo ok)" "restore: re-running on a restored dir holds"
+	out="$(fdb_sd restore_script "$me" 0700)" || true
+	check "$([ "$(probe_field "$out" restore_rc)" = 1 ] && echo ok)" "restore: a dir whose mode differs from the recorded one is red"
+	mkdir "$tmp/.fdb-preserved-image-migration"
+	out="$(fdb_sd preserve_script)" && code=0 || code=$?
+	check "$([ "$code" = 1 ] && [ "$(probe_field "$out" error)" = the-preserve-path-exists ] && [ "$(stat -f %i "$sd/image-migration")" = "$ino" ] && echo ok)" "preserve: an existing preserve path is refused, nothing moved"
+	rmdir "$tmp/.fdb-preserved-image-migration" && mkdir "$sd/db"
+	out="$(fdb_sd preserve_script)" && code=0 || code=$?
+	check "$([ "$code" = 1 ] && [ "$(probe_field "$out" error)" = the-server-dir-holds-other-state ] && [ -d "$sd/db" ] && [ "$(stat -f %i "$sd/image-migration")" = "$ino" ] && echo ok)" "preserve: a server dir with an extra entry is refused, nothing moved"
+	rmdir "$sd/db"
+	out="$(fdb_sd preserve_script)" || true
+	mkdir "$sd" && : >"$sd/state.db"
+	out="$(fdb_sd restore_script "$me" 0750)" && code=0 || code=$?
+	check "$([ "$code" = 1 ] && [ "$(probe_field "$out" error)" = the-server-dir-is-not-empty ] && [ -d "$tmp/.fdb-preserved-image-migration" ] && echo ok)" "restore: a server dir a boot left behind is red, the journal stays aside"
+	rm -rf "$sd" "$tmp/.fdb-preserved-image-migration"
+
+	# Where the gate moves it aside and back: before the first boot; after the last
+	# teardown; and in the trap after its teardown and before its rejoin.
+	t="$(printf '%s\n' "$src" | sed -n '/^leg_boots() {/,/^}/p' | grep -oE 'preserve_migration|boot_once|restore_migration final' | tr '\n' ' ')"
+	check "$([ "$t" = "preserve_migration boot_once restore_migration final " ] && echo ok)" "fdb.3: move aside, boots, move back (got: $t)"
+	t="$(printf '%s\n' "$src" | sed -n '/^cleanup() {/,/^}/p' | grep -oE 'teardown trap|restore_migration trap|cleanup: RED|if rejoin' | tr '\n' ' ')"
+	check "$([ "$t" = "teardown trap restore_migration trap cleanup: RED if rejoin " ] && echo ok)" "trap: teardown, move back (a failure is RED), then rejoin (got: $t)"
+	t="$(printf '%s\n' "$src" | sed -n '/^preserve_migration() {/,/^}/p')"
+	case "$t" in *"PRESERVED=1"*'as_root worker preserve'*) check ok "preserve_migration: the trap owns the move back before the move is tried" ;; *) check no "preserve_migration: the trap owns the move back before the move is tried" ;; esac
 
 	# The exit contract, as child processes with kubectl, ssh, scp and sudo stand-ins
 	# that record any call: nothing may reach a host.
@@ -738,7 +908,18 @@ PRE_FACTS="$(as_root worker facts "$(facts_script "$WK3SM")" 2>&1)" || true
 printf '%s\n' "$PRE_FACTS" | grep -q '^FDB end$' || refuse "the worker's fact script did not finish: $(printf '%s' "$PRE_FACTS" | tail -3 | tr '\n' ' ')"
 [ "$(probe_field "$PRE_FACTS" agent_plist)" = 1 ] || refuse "the worker carries no agent LaunchDaemon ($AGENT_PLIST): it is not a joined worker"
 [ "$(probe_field "$PRE_FACTS" server_plist)" = 0 ] || refuse "the worker carries a server LaunchDaemon ($SERVER_PLIST)"
-[ "$(probe_field "$PRE_FACTS" server_dir)" = 0 ] || refuse "the worker already holds $SERVER_DIR: a boot there would not be on a fresh datastore, and this gate never removes state it did not create"
+[ "$(probe_field "$PRE_FACTS" preserve)" = 0 ] || refuse "the worker already holds $PRESERVE_DIR: a previous run was interrupted with the image-migration journal moved aside. Put it back by hand, then run again: sudo mkdir $SERVER_DIR if it is absent (it must be empty), give it the owner and mode the previous run log recorded (sudo chown <uid:gid> $SERVER_DIR; sudo chmod <mode> $SERVER_DIR), then sudo mv $PRESERVE_DIR $MIGRATION_DIR"
+PRE_SERVER_DIR_KIND="$(probe_field "$PRE_FACTS" server_dir_kind)"
+SD_OWNER_MODE=""
+case "$PRE_SERVER_DIR_KIND" in
+absent) ;;
+migration-only)
+	SD_OWNER_MODE="$(probe_field "$PRE_FACTS" server_dir_owner_mode)"
+	[[ "$SD_OWNER_MODE" =~ ^[0-9]+:[0-9]+\ [0-7]{3,4}$ ]] || refuse "could not read the owner and mode of $SERVER_DIR on the worker (got '$SD_OWNER_MODE')"
+	;;
+other) refuse "the worker already holds $SERVER_DIR with more than an image-migration directory in it: a boot there would not be on a fresh datastore, and this gate never removes state it did not create" ;;
+*) refuse "the worker's fact script reported no state for $SERVER_DIR" ;;
+esac
 [ "$(probe_field "$PRE_FACTS" server_record)" = 0 ] || refuse "the worker already holds $SERVER_RECORD: a server install would reuse its recorded arguments"
 [ "$(probe_field "$PRE_FACTS" bin_ok)" = 1 ] || refuse "$WK3SM on the worker is not a k3sm build set with its required artifacts beside it$(m="$(probe_field "$PRE_FACTS" missing_artifact)"; [ -n "$m" ] && echo " (missing $m)")"
 BIN_VERSION="$(printf '%s\n' "$PRE_FACTS" | sed -n 's/^FDB-VERSION //p' | sed 's/ *$//')"
@@ -768,6 +949,9 @@ printf '%s\n' "$PRE_FACTS" >"$EVIDENCE/pre-facts.txt"
 # the cluster), server (a throwaway server may be installed on it).
 STATE=joined
 KUBE_SAVED=""
+# PRESERVED is 1 from the moment the move of image-migration/ is attempted until it
+# is back in the server dir; the trap moves it back while it is 1.
+PRESERVED=0
 
 # kube_save / kube_restore: the worker user's ~/.kube/config, which a server
 # install merges its admin entry into, is copied aside once and put back after
@@ -846,12 +1030,49 @@ restore_meta() {
 	done < <(fjson missing-meta "$EVIDENCE/pre-node.json" <"$EVIDENCE/node-after-rejoin.json")
 }
 
+# preserve_migration: moves the worker's image-migration/ out of the server dir
+# before the first boot, when the dir held only that. Detail in DETAIL.
+preserve_migration() {
+	local out msg
+	[ "$PRE_SERVER_DIR_KIND" = migration-only ] || return 0
+	PRESERVED=1
+	out="$(as_root worker preserve "$(preserve_script)" 2>&1)" || true
+	printf '%s\n' "$out" >"$EVIDENCE/preserve.txt"
+	if [ "$(probe_field "$out" preserved)" != 1 ]; then
+		DETAIL="could not move $MIGRATION_DIR to $PRESERVE_DIR ($(probe_field "$out" error); $EVIDENCE/preserve.txt)"
+		return 1
+	fi
+	msg="moved $MIGRATION_DIR to $PRESERVE_DIR (mv, one volume) and removed the empty $SERVER_DIR, owner and mode ${SD_OWNER_MODE} recorded"
+	log "    $msg"
+}
+
+# restore_migration <tag>: makes the server dir again with the recorded owner and
+# mode and moves image-migration/ back. Detail in DETAIL.
+restore_migration() {
+	local out
+	[ "$PRESERVED" = 1 ] || return 0
+	out="$(as_root worker "restore-$1" "$(restore_script "${SD_OWNER_MODE% *}" "${SD_OWNER_MODE#* }")" 2>&1)" || true
+	printf '%s\n' "$out" >"$EVIDENCE/restore-$1.txt"
+	if [ "$(probe_field "$out" restore_rc)" != 0 ]; then
+		DETAIL="could not move $PRESERVE_DIR back to $MIGRATION_DIR ($(probe_field "$out" error); $EVIDENCE/restore-$1.txt); restore by hand: sudo mkdir $SERVER_DIR if absent, sudo chown ${SD_OWNER_MODE% *} $SERVER_DIR, sudo chmod ${SD_OWNER_MODE#* } $SERVER_DIR, sudo mv $PRESERVE_DIR $MIGRATION_DIR"
+		return 1
+	fi
+	PRESERVED=0
+	log "    moved $PRESERVE_DIR back to $MIGRATION_DIR; $SERVER_DIR is ${SD_OWNER_MODE} again"
+}
+
 # shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
 	set +e
 	if [ "$STATE" = server ]; then
 		teardown trap || echo "cleanup: the throwaway server on the worker did not tear down cleanly ($EVIDENCE/teardown-trap.txt); finish it by hand: sudo k3sm uninstall, then remove $SERVER_DIR and $SERVER_RECORD" >>"$RUNLOG"
 		STATE=left
+	fi
+	if [ "$PRESERVED" = 1 ]; then
+		if ! restore_migration trap; then
+			log "cleanup: RED: the image-migration journal was NOT put back: $DETAIL"
+			echo "fresh-datastore-boot: cleanup RED: $DETAIL" >&2
+		fi
 	fi
 	if [ "$STATE" = left ]; then
 		kube_restore >/dev/null 2>&1
@@ -963,10 +1184,14 @@ boot_once() {
 }
 leg_boots() {
 	local i
+	preserve_migration || return 1
 	for ((i = 1; i <= BOOTS; i++)); do
 		boot_once "$i" || return 1
 	done
+	restore_migration final || return 1
 	DETAIL="$BOOTS fresh first boot(s), every one on its own mesh"
+	[ "$PRE_SERVER_DIR_KIND" = migration-only ] && DETAIL="$DETAIL; image-migration moved aside and back"
+	return 0
 }
 run_leg fdb.3
 leg_boots || leg_red
@@ -1016,8 +1241,13 @@ leg_end() {
 		DETAIL="PV entries gone: $(printf '%s' "$gone" | tr '\n' ' ')"
 		return 1
 	fi
-	if [ "$(probe_field "$out" server_dir)" != 0 ] || [ "$(probe_field "$out" server_record)" != 0 ] || [ "$(probe_field "$out" server_plist)" != 0 ]; then
-		DETAIL="throwaway server state is left on the worker ($EVIDENCE/final-facts.txt)"
+	if [ "$(probe_field "$out" server_dir_kind)" != "$PRE_SERVER_DIR_KIND" ] || [ "$(probe_field "$out" preserve)" != 0 ] ||
+		[ "$(probe_field "$out" server_record)" != 0 ] || [ "$(probe_field "$out" server_plist)" != 0 ]; then
+		DETAIL="throwaway server state is left on the worker, or $SERVER_DIR is not as it was ($PRE_SERVER_DIR_KIND) ($EVIDENCE/final-facts.txt)"
+		return 1
+	fi
+	if [ "$PRE_SERVER_DIR_KIND" = migration-only ] && [ "$(probe_field "$out" server_dir_owner_mode)" != "$SD_OWNER_MODE" ]; then
+		DETAIL="$SERVER_DIR is $(probe_field "$out" server_dir_owner_mode), not $SD_OWNER_MODE as before ($EVIDENCE/final-facts.txt)"
 		return 1
 	fi
 	DETAIL="server $(printf '%s' "$sv" | head -1); worker $(printf '%s' "$wv" | head -1), unchanged; every PV entry present; no throwaway server state left"
