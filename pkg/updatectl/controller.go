@@ -99,8 +99,8 @@ type Config struct {
 	// DrainTimeout bounds a node's drain, counted from the moment it left
 	// Pending. Zero means 10 minutes.
 	DrainTimeout time.Duration
-	// NodeTimeout bounds a node's whole update, counted from the moment it left
-	// Pending. Zero means 30 minutes.
+	// NodeTimeout bounds a node's update from its handover (the drain is bounded
+	// separately by DrainTimeout). Zero means 30 minutes.
 	NodeTimeout time.Duration
 	// Poll is how often an in-progress roll is re-read. Zero means 5 seconds.
 	Poll time.Duration

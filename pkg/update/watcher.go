@@ -327,13 +327,13 @@ func (w *Watcher) now() time.Time {
 // writing each step forward once. Verifying and Installing are already
 // written by the node before the verb runs, so the node's Installing covers
 // the helper's own checks. The helper sends its Installing frame only after
-// every check passed, immediately before it execs the staged installer, and
-// that installer stops this daemon before the stream can end: so the node
-// writes Restarting on that frame, while it still runs, and a watcher sees
-// Restarting before the stop on every node. The progress callback runs
-// synchronously, so the patch is sent before the next frame is read; the
-// helper does not wait for it, so an installer that stopped this daemon
-// within the patch's round trip would still win. A later Restarting (the
+// every check passed, then waits for the client's acknowledgement (or a short
+// bound) before it execs the staged installer, and that installer stops this
+// daemon before the stream can end: so the node writes Restarting on that
+// frame, while it still runs, and a watcher sees Restarting before the stop on
+// every node. The progress callback runs synchronously and the client
+// acknowledges Installing only after it returns, so the patch is sent before
+// the installer starts unless it takes longer than the helper's bound. A later Restarting (the
 // stream ending mid-install) or Done (the installer exited 0) moves nothing,
 // because Done is the claim of the restarted daemon running the new build.
 // Failed is reported from the verb's error, with its message.

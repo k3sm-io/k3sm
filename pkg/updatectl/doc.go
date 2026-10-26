@@ -58,9 +58,10 @@ limitations under the License.
 //     refused before anything starts.
 //   - The node is handed over: the Node annotations k3sm.io/update-version (the
 //     tag) and k3sm.io/update-payload (a JSON Payload: the archive URL, its
-//     sha256, the signature policy and the downgrade permission) are set, a
-//     stale k3sm.io/update-phase is cleared and the handover time is recorded,
-//     in one patch. The node timeout counts from the handover.
+//     sha256, the signature policy and the downgrade permission), the payload's
+//     signature and the update signer's certificate (issued from the cluster CA)
+//     are set, a stale k3sm.io/update-phase is cleared and the handover time is
+//     recorded, in one patch. The node timeout counts from the handover.
 //   - The node-side applies the release and reports k3sm.io/update-phase as
 //     "<phase>[: <message>]". The controller mirrors the phase into status;
 //     Failed fails the node. The node is done once it reports Done, its

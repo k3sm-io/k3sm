@@ -34,9 +34,11 @@ const (
 )
 
 // PodSecurityPinnedVersion is the policy version every defaults entry pins
-// (enforce-version/warn-version/audit-version). PINNED to the vendored k8s minor
-// — NEVER "latest": "latest" would silently retarget every level on a
-// control-plane upgrade, turning a kube bump into an unreviewed policy change.
+// (enforce-version/warn-version/audit-version). It is a deliberate fixed policy
+// version, set when v1.36 was current and moved by hand on a kube bump, not
+// the vendored minor; NEVER "latest": "latest" would silently retarget every
+// level on a control-plane upgrade, turning a kube bump into an unreviewed
+// policy change.
 const PodSecurityPinnedVersion = "v1.36"
 
 // The shipped cluster-default PSA level tuple (the warn-first posture). These three constants ARE the posture; nothing else in the tree
@@ -57,9 +59,9 @@ const PodSecurityPinnedVersion = "v1.36"
 //     observation-only by construction, which is what "audit-observable, zero
 //     rejection" means.
 //
-// PSA here is conformance-surface + defense-in-depth, NOT the privilege boundary
-// — the foreign-uid VAP (see foreignuser.go) and the runtimed Seatbelt profile
-// stay that.
+// PSA here is conformance-surface + defense-in-depth, NOT the privilege boundary:
+// the foreign-uid VAP (see EnsureNoForeignUserAdmission in admission.go) and
+// the runtimed Seatbelt profile stay that.
 const (
 	DefaultPodSecurityEnforceLevel = PodSecurityLevelPrivileged
 	PodSecurityWarnLevel           = PodSecurityLevelBaseline
@@ -69,8 +71,8 @@ const (
 // PodSecurityAdmissionConfigYAML renders the apiserver's
 // --admission-control-config-file content: an apiserver.config.k8s.io/v1
 // AdmissionConfiguration embedding the pod-security.admission.config.k8s.io/v1
-// PodSecurityConfiguration cluster defaults. Both apiVersions are pinned to the
-// vendored k8s v1.36.5.
+// PodSecurityConfiguration cluster defaults. The policy version is pinned to
+// PodSecurityPinnedVersion.
 //
 // It is a PURE function and the SINGLE authority for the level tuple: enforce is
 // the caller's argument (DefaultPodSecurityEnforceLevel ships it), warn and audit

@@ -355,8 +355,9 @@ type Collector struct {
 	// found. OPTIONAL: nil leaves the row to report only that a client exists.
 	ReviewSelf func(ctx context.Context, kube Kube) (string, error)
 	// ServerAnchor proves, on a server, that the apiserver URL the report's
-	// client dials is this Mac's own control plane (ServerAnchor in
-	// production). The datastore and serving-cert rows of an account that
+	// client dials is this Mac's own control plane (NodeAnchor in
+	// production: the published endpoints record when this node has one, else
+	// ServerAnchor). The datastore and serving-cert rows of an account that
 	// cannot read the work dir vouch for what that endpoint answers only when
 	// it passes. OPTIONAL: nil anchors nothing, and those rows stay unknown.
 	ServerAnchor Anchor

@@ -19,7 +19,9 @@ limitations under the License.
 // node's pod /24, the cluster Service CIDR, the _k3sm service uid) and two
 // fail-closed seams — a PortAuthorizer that confirms a privileged (<1024) bind
 // against the authoritative Service set (and, for a bind on the node's own
-// address or the IPv4 wildcard, against ONE named canonical Service, and for a
+// address, against ONE named canonical Service, for a bind on the IPv4
+// wildcard, against that Service or any LoadBalancer Service that declares the
+// port, and for a
 // bind on a published vm pod address, against the ports that pod is relayed
 // on, and for a bind on one of this Mac's own addresses, against the
 // operator's LoadBalancer port list), and a MeshKeyResolver that
@@ -67,7 +69,10 @@ type Options struct {
 	// node-own-address and wildcard branches of the privileged-port authorizer
 	// (the ingress listener). nil denies every <1024 node-address or wildcard
 	// bind (fail safe). It yields identities rather than a bare bool because
-	// those branches are an ALLOWLIST: declaring the port is necessary but NOT sufficient.
+	// the node-address branch, and the wildcard on a port the canonical Service
+	// declares, are an ALLOWLIST: declaring the port is necessary but NOT
+	// sufficient there. On the wildcard, any LoadBalancer Service that declares
+	// a port the canonical Service does not is admitted too.
 	LBDeclarers func(port int) []ServiceRef
 	// Synced reports whether the Service set behind Declares and LBDeclarers has
 	// completed its first sync. It changes only the wording of a refusal ("not
@@ -75,8 +80,10 @@ type Options struct {
 	// nil means the set is always synced.
 	Synced func() bool
 	// NodeAddressService is the ONE Service permitted to authorize a privileged
-	// bind on this node's own address or on the IPv4 wildcard — the canonical
-	// ingress LoadBalancer. The
+	// bind on this node's own address, and the owner of every port it declares
+	// on the IPv4 wildcard: the canonical ingress LoadBalancer. On the
+	// wildcard, the canonical Service, or any LoadBalancer Service that declares
+	// the port, is admitted (see PortPolicy). The
 	// assembler binds it from ingresshost.ServiceNamespace/ServiceName (the
 	// single source of that identity). The zero ServiceRef denies the
 	// node-address and wildcard branches entirely (fail safe).
@@ -323,12 +330,15 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 //     the svclb hoster never asks for an ingress-declared port (it reserves
 //     them on every node), so the ingress host is the only caller for one.
 //
-// The node-address and wildcard classes are one ALLOWLIST keyed on namespace+name, not a
-// test on the requester's shape. It used to authorize the bind for ANY Service
+// The node-address class, and the wildcard on a port the canonical Service
+// declares, are one ALLOWLIST keyed on namespace+name, not a test on the
+// requester's shape. It used to authorize the bind for ANY Service
 // of type LoadBalancer declaring the port, in any namespace — which made the
 // requesting object its own authorization predicate: any tenant able to create
 // a LoadBalancer Service on :80 could authorize a root-helper bind on the
-// node's real address. Declaring the port is now necessary but not sufficient.
+// node's real address. For those binds, declaring the port is now necessary but
+// not sufficient. The wildcard on any other port is open to any LoadBalancer
+// Service that declares it (the k3s ServiceLB model).
 //
 // Every other address class, an undeclared port, a Service outside the
 // allowlist, and a nil predicate are all denied — the daemon never trusts the
@@ -350,7 +360,10 @@ type PortPolicy struct {
 	// only changes refusal wording. nil means always synced.
 	Synced func() bool
 	// NodeAddressService is the only Service whose declaration authorizes a
-	// node-address or wildcard bind. The zero ServiceRef denies the class (deny).
+	// node-address bind, and it owns every wildcard port it declares; on the
+	// wildcard, any LoadBalancer Service that declares the port is admitted
+	// too. The zero ServiceRef denies the node-address class and the wildcard
+	// (deny).
 	NodeAddressService ServiceRef
 	// NodePodCIDR reports this node's pod /24 in force (NodePodCIDRInForce). It
 	// bounds the published-vm-pod class: an address outside it is refused before

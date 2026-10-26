@@ -87,7 +87,7 @@ func TestWriteZotMarker(t *testing.T) {
 	}
 }
 
-// TestEnsureZotBuildsThenIsANoOp drives EnsureZot with the go-install seam faked,
+// TestEnsureZotBuildsThenIsANoOp drives EnsureZot with the wrapper-build seam (runZotBuild) faked,
 // so the staging contract is provable without a toolchain, a network, or a
 // hundred-megabyte download.
 func TestEnsureZotBuildsThenIsANoOp(t *testing.T) {
@@ -225,11 +225,11 @@ func TestEnsureZotSeedsFromAPayload(t *testing.T) {
 	})
 }
 
-// TestZotBuildEnv pins the environment the out-of-module install runs under. Each
+// TestZotBuildEnv pins the environment the out-of-module build runs under. Each
 // entry is load bearing and each has its own failure mode: CGO_ENABLED=0 keeps a
 // C toolchain out of every artifact, GOWORK=off keeps the workspace out of an
-// out-of-module install, the cleared GOBIN avoids `go install`'s cross-compile
-// refusal, and the pinned GOMODCACHE keeps the dependency tree off the per-boot
+// out-of-module build, the cleared GOBIN keeps ambient settings from deciding
+// where the build writes, and the pinned GOMODCACHE keeps the dependency tree off the per-boot
 // scratch dir it would otherwise be re-downloaded into every boot.
 func TestZotBuildEnv(t *testing.T) {
 	env := zotBuildEnv("/scratch/gopath", "/stable/modcache")
@@ -257,7 +257,7 @@ func TestPayloadBinaries(t *testing.T) {
 	}
 }
 
-// errNoToolchain stands in for the `go install` failure a packaged host produces.
+// errNoToolchain stands in for the build failure a packaged host produces.
 var errNoToolchain = os.ErrNotExist
 
 // fakeBuild replaces the two build seams with an in-process fake and returns a

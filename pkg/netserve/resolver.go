@@ -604,7 +604,7 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, in
 	}
 
 	// EDNS(0) negotiation: a client OPT lifts the UDP truncation budget from the
-	// 512 floor up to ednsUDPPayloadSize; a non-EDNS query stays at 512 (unchanged).
+	// 512 floor up to dns.EDNSUDPPayloadSize; a non-EDNS query stays at 512 (unchanged).
 	edns := parseEDNS(query)
 	negotiated := negotiatedUDPSize(edns)
 
@@ -957,7 +957,7 @@ func (r *clusterResolver) forward(ctx context.Context, host string) ([]netip.Add
 // OpCode (RFC 1035 §4.1.1) from reqHdr; RecursionAvailable is set so a resolver
 // client does not treat the answer as refusing recursion. When the request
 // carried an OPT (edns.present), a well-formed response OPT is appended,
-// advertising ednsUDPPayloadSize and folding any extended RCODE into its TTL. The
+// advertising dns.EDNSUDPPayloadSize and folding any extended RCODE into its TTL. The
 // rcode's low nibble goes in the header, its high bits into the OPT (BADVERS).
 func buildResponse(reqHdr dnsmessage.Header, q dnsmessage.Question, ans dnsAnswer, rcode dnsmessage.RCode, edns ednsRequest) ([]byte, error) {
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
