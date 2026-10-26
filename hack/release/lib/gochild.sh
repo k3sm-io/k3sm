@@ -37,8 +37,10 @@ toolchain_problems() {
 
 # XNET_FLOOR is the lowest golang.org/x/net a staged kine or zot may link: the
 # version both are built against (internal/childreq XNetVersion). The caller sets
-# it from that source; an unset floor is itself a problem for kine and zot.
-XNET_FLOOR="${XNET_FLOOR:-}"
+# it from that source after sourcing this file; an unset floor is itself a
+# problem for kine and zot. It starts empty, never from the environment, so an
+# ambient XNET_FLOOR cannot lower the floor a caller forgot to set.
+XNET_FLOOR=""
 
 # release_less <a> <b>: true when release version a ("vX.Y.Z") sorts below b. A
 # version of any other shape (a pseudo-version, a prerelease) never compares as
@@ -79,8 +81,9 @@ buildinfo_problems() {
 	grep -qx "[[:space:]]*path[[:space:]]$path" <<<"$text" || problem "main package is not $path"
 	if [ -n "$mod" ]; then
 		grep -Eq "^[[:space:]]*(mod|dep)[[:space:]]${mod}[[:space:]]${want}([[:space:]]|\$)" <<<"$text" || problem "module $mod is not at $want"
-		grep -Eq "^[[:space:]]*=>" <<<"$text" && problem "a module is replaced"
 	fi
+	# Every child, kine included (it names no module version to check).
+	grep -Eq "^[[:space:]]*=>" <<<"$text" && problem "a module is replaced"
 	case "$kind" in
 	kine | zot)
 		xnet="$(awk '$1 == "dep" && $2 == "golang.org/x/net" { print $3; exit }' <<<"$text")"

@@ -1662,6 +1662,8 @@ FAKE
 	local kind want fx2
 	# The floor the fixtures are captured at; read_pins sets it from the source, and
 	# the read_pins check above proves that read.
+	# shellcheck disable=SC2016 # expanded by the inner shell
+	if [ -z "$(XNET_FLOOR=v0.0.1 bash -c '. "$1"; printf %s "$XNET_FLOOR"' _ "$HERE/lib/gochild.sh")" ]; then ok "an ambient XNET_FLOOR does not set the floor"; else bad "gochild.sh took XNET_FLOOR from the environment"; fi
 	XNET_FLOOR=v0.60.0
 	for kind in kine etcd etcdutl zot; do
 		case "$kind" in kine) want=v0.17.2 ;; zot) want=v2.1.22 ;; *) want=v3.6.15 ;; esac
@@ -1679,6 +1681,7 @@ FAKE
 			;;
 		esac
 		if out="$(sed 's/GOARCH=arm64/GOARCH=amd64/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: an amd64 build passed"; else ok "$kind: an amd64 build is refused"; fi
+		if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$fx2")" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: a replaced module passed"; elif printf '%s\n' "$out" | grep -q "$kind: a module is replaced"; then ok "$kind: a replaced module is refused"; else bad "$kind: replace not named: $out"; fi
 		if out="$(sed 's/^\([[:space:]]*path[[:space:]]\).*/\1example.com\/other/' "$fx2" | buildinfo_problems "$kind" "$want" go1.27.3)"; then bad "$kind: another main package passed"; else ok "$kind: another main package is refused"; fi
 	done
 	if out="$(buildinfo_problems etcd v3.6.14 go1.27.3 <"$td/goversion-etcd.txt")"; then bad "etcd at another version passed"; elif printf '%s\n' "$out" | grep -q "server/v3 is not at v3.6.14"; then ok "etcd at another version is refused"; else bad "etcd version not named: $out"; fi
