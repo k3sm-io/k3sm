@@ -77,11 +77,10 @@ type artifact struct {
 	// the link and its target cannot name different files. Empty otherwise.
 	target string
 	// assertExists records whether the path is expected on disk today. It is
-	// false for the forward-declared cp-payload items (the /Library/k3sm/bin tree
-	// + relocated k3sm-netd): the packaging follow-up owns moving cp/kine off
-	// DataRoot into InstallDir, so those paths do not exist yet. The manifest
-	// proves the disposition (InstallDir-covered), not on-disk presence — that
-	// follow-up lights them up with no manifest change.
+	// false for entries an install may not have written (the InstallDir/bin
+	// directory entry itself, the optional version markers, files a data root
+	// from an older build lacks). The manifest proves the disposition
+	// (InstallDir-covered), not on-disk presence.
 	assertExists bool
 	// oneshot marks a kindDaemon that RUNS AND EXITS rather than staying up
 	// (io.k3sm.datavol). It changes two things and nothing else: the restart
@@ -163,10 +162,11 @@ func artifactManifest(cfg Config) []artifact {
 	// a payload whose marker does.
 	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", helmchart.HelmMarkerName), assertExists: false})
 	items = append(items, []artifact{
-		// Forward-declared: the cp-payload bin tree + relocated k3sm-netd land
-		// under InstallDir once the packaging follow-up moves them off DataRoot. They
-		// do not exist on disk today (cp/kine land under DataRoot at runtime), so
-		// existence is not asserted; the InstallDir sweep already covers them.
+		// The InstallDir/bin directory holds the staged control-plane payload
+		// (asserted above, binary by binary). Existence of the directory entry
+		// itself is not asserted; the InstallDir sweep covers it. No k3sm-netd
+		// binary is staged (netd is a subcommand of k3sm), so that path is not
+		// asserted either.
 		{kind: kindDir, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin"), assertExists: false},
 		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "k3sm-netd"), assertExists: false},
 
@@ -197,13 +197,6 @@ func artifactManifest(cfg Config) []artifact {
 	if cfg.Role == RoleAgent {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.agentTokenPath(), assertExists: false})
 	}
-	// The control plane's staged admin token, the same entry for the other role
-	// and in the same position, for the same reason: it is a system:masters
-	// bearer token with no use once this Mac is no longer a k3sm server, so it
-	// is REMOVED rather than preserved with the rest of the data root, and it is
-	// removed after the daemon that reads it has been booted out.
-	// assertExists is false because a data root an older build installed has no
-	// such file until the next install stages one.
 	// The endpoints record either node daemon publishes in the status
 	// directory, REMOVED after that daemon is booted out for the reason the
 	// server's records below are: it describes a node that no longer runs.
@@ -214,6 +207,13 @@ func artifactManifest(cfg Config) []artifact {
 	// false: no check may have run.
 	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: filepath.Join(StateStatus.Path(cfg.DataRoot), UpdateRecordName), assertExists: false})
 	if cfg.Role == RoleServer {
+		// The control plane's staged admin token, the counterpart of the agent's
+		// join token above: it is a system:masters bearer token with no use once
+		// this Mac is no longer a k3sm server, so it is REMOVED rather than
+		// preserved with the rest of the data root, and it is removed after the
+		// daemon that reads it has been booted out. assertExists is false because
+		// a data root an older build installed has no such file until the next
+		// install stages one.
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
 		// A joining HA server's staged server-class join token, removed for the
 		// same reason and with more cause: it decrypts every cluster CA. It

@@ -160,7 +160,8 @@ type StagingOptions struct {
 	// RequireTeamSignature is --require-team-signature (with --from-staging
 	// only): refuse the tree unless every Mach-O in it carries a Developer ID
 	// Application team signature, whatever the installed build carries. The
-	// managed update passes it for the required signature policy. The
+	// managed update does not pass it: k3sm-netd enforces the payload's
+	// signature policy itself before it runs the staged installer. The
 	// same-team continuity check runs as well.
 	RequireTeamSignature bool
 	// StagingFS and Signer are the read-only seams the --from-staging

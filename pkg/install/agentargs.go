@@ -312,8 +312,8 @@ func operatorJoinToken(sys System, cfg Config) (string, bootstrap.Token, error) 
 const tokenFileMask fs.FileMode = 0o077
 
 // resolvedExtraAgentArgs returns ExtraAgentArgs with this install's
-// --nodeport-addresses merged in, the agent counterpart of
-// resolvedExtraServerArgs: AgentPlist and writeAgentArgsRecord both read it,
+// --nodeport-addresses and --update-release-base merged in, the agent
+// counterpart of resolvedExtraServerArgs: AgentPlist and writeAgentArgsRecord both read it,
 // so the rendered argv and the record cannot disagree.
 func (c Config) resolvedExtraAgentArgs() []string {
 	return setReleaseBaseArg(c.setNodePortAddressesArg(c.ExtraAgentArgs), c.UpdateReleaseBase)

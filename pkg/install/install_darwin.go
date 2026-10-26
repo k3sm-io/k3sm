@@ -860,8 +860,7 @@ func (darwinSystem) DialJoinServer(addr string, timeout time.Duration) error {
 // FetchJoinCA reads the cluster CA PEM the bootstrap listener at addr serves.
 //
 // The TLS posture is InsecureSkipVerify with NO replacement verification, which
-// is the one place in k3sm that is true and is why the System interface states
-// the reason at the seam: the join's own first hop (bootstrap.PinnedClient) does
+// is why the System interface states the reason at the seam: the join's own first hop (bootstrap.PinnedClient) does
 // the opposite — it disables the default verification and re-imposes pinned-CA
 // verification — because it is about to present a credential. This fetch
 // presents nothing and trusts nothing. It reads a deliberately public document
@@ -1555,8 +1554,8 @@ var ownershipByPathSite = func(name string) {}
 //
 // The write is temp-and-rename inside the parent, with owner and mode applied to
 // the temp file BEFORE the rename, so no reader ever observes the file at wider
-// terms than the ones asked for. That matters for the only file written this way:
-// a wireguard private key.
+// terms than the ones asked for. That matters most for the wireguard private key,
+// the credential this seam was written for.
 func (darwinSystem) WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error {
 	return writeRootOnlyFile(path, contents, 0, 0, mode)
 }
@@ -1773,8 +1772,8 @@ func (darwinSystem) Now() time.Time { return time.Now() }
 // LaunchctlBootstrap loads the daemon into the system domain. A failure launchd
 // attributes to the domain still settling is wrapped with ErrLaunchctlTransient so
 // the caller can retry exactly that class — see transientLaunchctlOutput. This is
-// the ONLY place launchctl's output text is inspected; the orchestration above
-// compares sentinels.
+// the only place a launchctl failure is classified as transient; the
+// orchestration above compares sentinels.
 func (darwinSystem) LaunchctlBootstrap(label string) error {
 	plist := filepath.Join(DefaultLaunchDaemonDir, label+".plist")
 	out, err := exec.Command("launchctl", "bootstrap", "system", plist).CombinedOutput()

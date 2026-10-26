@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package install lays down (and tears down) k3sm's two boot-surviving root
-// LaunchDaemons — io.k3sm.netd (the root privileged-network helper) and
-// io.k3sm.server (the control plane, running as the unprivileged _k3sm user) —
-// behind a small System seam so the privileged orchestration is unit-testable
-// with a fake. The real darwin System (sysadminctl/dscl, ditto, launchctl,
+// Package install lays down (and tears down) k3sm's boot-surviving root
+// LaunchDaemons: io.k3sm.netd (the root privileged-network helper), the role's
+// node daemon (io.k3sm.server or io.k3sm.agent, as the unprivileged _k3sm user)
+// and, with a data volume, the io.k3sm.datavol mount oneshot, behind a small
+// System seam so the orchestration is unit-testable with a fake. The real darwin System (sysadminctl/dscl, ditto, launchctl,
 // chown) lives in install_darwin.go; the seam, the install/uninstall ordering,
 // the launchd plist rendering, and the fake live here.
 //
@@ -114,7 +114,7 @@ const (
 	// copy of a signed Mach-O out of its install tree is a signature/notarization
 	// hazard a symlink simply does not have.
 	DefaultLinkDir = "/usr/local/bin"
-	// DefaultLaunchDaemonDir is where the two .plist files are written.
+	// DefaultLaunchDaemonDir is where the LaunchDaemon plist files are written.
 	DefaultLaunchDaemonDir = "/Library/LaunchDaemons"
 	// DefaultDataRoot is the data root (the _k3sm home): the control-plane
 	// work-dir, runtimed pods/storage/image cache and the root-only mesh keys
@@ -831,9 +831,10 @@ type System interface {
 	// directory through its own seam, so one write cannot silently loosen a
 	// directory another step decided).
 	//
-	// It is WriteServiceUserFile's opposite number and exists for exactly one
-	// file today: the root-only copy of this node's wireguard private key in
-	// MeshKeyDir. The service-user seam cannot be reused for it, because handing
+	// It is WriteServiceUserFile's opposite number and exists for the files root
+	// alone may place: the root-only copy of this node's wireguard private key in
+	// MeshKeyDir, the worker's cluster CA copy, the LAN network record and the
+	// shadow manifest. The service-user seam cannot be reused for it, because handing
 	// that copy to _k3sm would erase the only difference between the two copies —
 	// see MeshKeyDirMode.
 	//
@@ -1241,8 +1242,8 @@ type Config struct {
 	// crash-loop. Defaults to the k3sm-execshim sibling of BinarySource.
 	ExecShimSource string
 	// PayloadSource is a directory holding the control-plane payload
-	// (executor.PayloadBinaries: kube-apiserver/scheduler/controller-manager/
-	// kubectl + kine + etcd) staged by `k3sm payload <dir>`. Install copies it to
+	// (executor.PayloadBinaries: kube-apiserver, kube-scheduler,
+	// kube-controller-manager, kubectl, kine, etcd, etcdutl, helm and zot) staged by `k3sm payload <dir>`. Install copies it to
 	// InstallDir/bin, from which the daemon boot seeds its workdir — the launchd
 	// _k3sm daemon has neither gh nor a Go toolchain to acquire them itself.
 	// Defaults to the cp-payload sibling dir of BinarySource.
@@ -1856,9 +1857,9 @@ func (c Config) plistPath(label string) string {
 	return filepath.Join(c.LaunchDaemonDir, label+".plist")
 }
 
-// Install lays down both daemons in dependency order. It is the single root step
-// (run via sudo): ensure _k3sm, copy the binary root-owned, write the two
-// plists, bootstrap netd (the helper) BEFORE server (which needs it), then write
+// Install lays down the daemons the role needs in dependency order. It is the
+// single root step (run via sudo): ensure _k3sm, copy the binary root-owned,
+// write the plists, bootstrap netd (the helper) BEFORE server (which needs it), then write
 // the admin kubeconfig to the human's home. The caller has already verified root.
 func Install(ctx context.Context, sys System, cfg Config) error {
 	_, err := InstallWithResult(ctx, sys, cfg)
@@ -2613,7 +2614,7 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 // used to assert the opposite — "netd's SIGTERM handler then flushes lo0/pf/utun"
 // — and believing it is how the residue below went unaccounted for.
 //
-// So a booted-out netd leaves durable kernel state, and uninstall removes two
+// So a booted-out netd leaves durable kernel state, and uninstall removes three
 // classes of it:
 //
 //   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
