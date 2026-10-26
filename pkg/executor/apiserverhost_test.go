@@ -18,6 +18,7 @@ package executor
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -249,11 +250,15 @@ func TestReadyProbesEffectiveBindAddress(t *testing.T) {
 	}))
 	_ = srv.Listener.Close()
 	srv.Listener = ln
+	// The probe verifies the serving leaf against the work dir's cluster CA, so the
+	// server presents one issued for ::1, as the apiserver's leaf carries its bind IP.
+	workDir := t.TempDir()
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{servingPair(t, writeClusterCA(t, workDir), net.IPv6loopback)}}
 	srv.StartTLS()
 	defer srv.Close()
 
 	port := ln.Addr().(*net.TCPAddr).Port
-	s := NewSupervised(Config{WorkDir: t.TempDir(), APIServerPort: port, BindAddress: "::1", NodeIP: "::1", Token: token})
+	s := NewSupervised(Config{WorkDir: workDir, APIServerPort: port, BindAddress: "::1", NodeIP: "::1", Token: token})
 	if !s.Ready(context.Background()) {
 		server, _ := s.RESTConfigToken()
 		t.Errorf("Ready = false against a healthy apiserver bound to [::1]:%d — the probe dialled %q instead of the configured bind", port, server)

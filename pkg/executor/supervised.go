@@ -17,8 +17,10 @@ limitations under the License.
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -228,8 +230,14 @@ func (c *component) exitedNow() bool {
 // mu is never held across provision/bringUp, so a Ready poll is never blocked by
 // a boot in progress. No Context is stored.
 type Supervised struct {
-	cfg    Config
-	client *http.Client
+	cfg Config
+	// probe is the healthz probe's HTTP client, rebuilt whenever the cluster CA it
+	// trusts changes on disk (see probeClient). Guarded by probeMu, which is never
+	// held with mu.
+	probeMu   sync.Mutex
+	probe     *http.Client
+	probeCA   []byte
+	probeDial func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	mu      sync.Mutex
 	comps   []*component // in start order; Stop walks it in reverse
@@ -293,17 +301,10 @@ func NewSupervised(cfg Config) *Supervised {
 		cfg:   cfg,
 		token: cfg.Token,
 		etcd:  defaultEtcdSeams(),
-		// The healthz probe is token-less and carries no credential, so it does not yet
-		// verify the apiserver's cluster-CA serving leaf. The probe dials the apiserver's
-		// bind host, which is the node or mesh address on a multi-node server, so its
-		// dialer clamps the TCP segment size like every other node-address connection.
-		client: &http.Client{
-			Timeout: 3 * time.Second,
-			Transport: &http.Transport{
-				DialContext:     (&tcpseg.Dialer{}).DialContext,
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		},
+		// The healthz probe dials the apiserver's bind host, which is the node or mesh
+		// address on a multi-node server, so its dialer clamps the TCP segment size like
+		// every other node-address connection.
+		probeDial: (&tcpseg.Dialer{}).DialContext,
 	}
 }
 
@@ -1330,14 +1331,25 @@ func redactLogTail(tail string) string {
 // apiserver's EFFECTIVE BIND (apiServerURL), not loopback: a mesh server binds its
 // wireguard IP only, so a hardcoded loopback probe would never observe it healthy and
 // bring-up would wedge until the healthTimeout.
+//
+// The probe carries the system:masters admin bearer token (anonymous auth is off),
+// so it sends it only to a server that proves itself: the client verifies the
+// serving certificate against the cluster CA in the work dir, exactly as the admin
+// kubeconfig does. A listener that took the bind address first, or answers while
+// the apiserver restarts, fails the handshake and never sees the token. Without a
+// readable cluster CA the probe reports not ready rather than skip verification.
 func (s *Supervised) Ready(ctx context.Context) bool {
 	url := apiServerURL(s.cfg) + "/healthz"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false
 	}
+	client, err := s.probeClient()
+	if err != nil {
+		return false
+	}
 	req.Header.Set("Authorization", "Bearer "+s.currentToken())
-	resp, err := s.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}
@@ -1345,6 +1357,42 @@ func (s *Supervised) Ready(ctx context.Context) bool {
 	buf := make([]byte, 2)
 	n, _ := resp.Body.Read(buf)
 	return resp.StatusCode == http.StatusOK && string(buf[:n]) == "ok"
+}
+
+// probeClient returns the healthz probe's HTTP client, trusting only the cluster CA
+// at certs.ClusterCACertPath. The CA is re-read on every call (a small file, polled
+// at the probe's cadence) so a probe that ran before Start minted the hierarchy, or
+// a CA replaced under a reset work dir, is picked up; the client and its pooled
+// connections are rebuilt only when the bytes change. A missing or unparsable CA is
+// an error, and Ready treats it as not ready: there is no unverified fallback.
+// The server name is the URL's host (apiServerURL), which the serving leaf carries
+// as a SAN on every topology.
+func (s *Supervised) probeClient() (*http.Client, error) {
+	caPEM, err := os.ReadFile(certs.ClusterCACertPath(s.cfg.WorkDir))
+	if err != nil {
+		return nil, fmt.Errorf("read the cluster CA for the healthz probe: %w", err)
+	}
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if s.probe != nil && bytes.Equal(s.probeCA, caPEM) {
+		return s.probe, nil
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("parse the cluster CA %s: no certificate", certs.ClusterCACertPath(s.cfg.WorkDir))
+	}
+	if s.probe != nil {
+		s.probe.CloseIdleConnections()
+	}
+	s.probe = &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			DialContext:     s.probeDial,
+			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		},
+	}
+	s.probeCA = caPEM
+	return s.probe, nil
 }
 
 // ErrStopBudgetExceeded is returned by Stop when its context ended before every
