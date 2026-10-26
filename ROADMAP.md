@@ -131,7 +131,9 @@ release engineering. What ships:
   Services reach `vm` Pods across nodes. The experimental two-server control plane above ships in
   this release.
 
-## v0.2 (planned)
+## v0.2 (shipped)
+
+v0.2.0 was released on 2026-10-26.
 
 - **One image store and one name for it.** The server's registry becomes the single place the
   cluster's images live, under one flat reference, `registry-k3sm:6450/<repo>:<tag>`, that works

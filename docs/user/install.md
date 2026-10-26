@@ -118,7 +118,7 @@ k3sm ships through three channels, listed in shipping order:
    and notarized, and so is the `.pkg`. Environment variables set the
    options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
    unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
-   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.1.7 sh` (v0.1.7 is the release you are on
+   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.2.0 sh` (v0.2.0 is the release you are on
    today, so a repair pins the newest tag and never an older one; the [releases page](https://k3sm.io/releases/) lists every version you can pin).
    `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
    the current directory without ever running `sudo`, so you can inspect first. Re-running the

@@ -10,6 +10,8 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+## v0.2.0 — 2026-10-26
+
 ### Breaking
 
 - **`k3sm status -o json` is versioned.** The report carries `schemaVersion: 1`, and the keys under `version` are now lowerCamel. `k3sm doctor --json` carries the same field. See [status JSON](https://k3sm.io/docs/status-json/).
@@ -119,6 +121,7 @@ pin, its date, and the tarball's sha256.
 - **A server killed with `kill -9` starts again by itself.** The next start stops the control-plane processes the previous run left behind (the datastore, apiserver, scheduler, controller manager and registry) instead of failing on the held datastore port and parking on the crash-loop breaker. A process it cannot prove is its own keeps the old refusal.
 - **A re-attached `vm` Pod keeps its containers' `startedAt`.** After a node daemon restart the time no longer resets to the re-attach time.
 - **A LoadBalancer on a port below 1024 re-binds after `k3sm network lan off` and `on`.** A Service whose port is not in the listed ports failed with `address already in use` after the switch; the bind now goes through the root network helper. The macOS host-service ports 22, 53, 88, 445, 548 and 631 are reserved, so a LoadBalancer cannot take them.
+- **`k3sm build` with `RUN` steps or a Linux target, and `k3sm builder buildx`, work from an ordinary account on a root install.** The build engine's files and credentials belonged to root, so these commands failed for the user who ran them. They now run as that user.
 
 ### Upgrade Notes
 
