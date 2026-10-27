@@ -134,7 +134,7 @@ run_test "mirrors.2" 14 TestParseAdvertisement ./pkg/registrysvc/
 run_test "mirrors.3a" 11 TestNewRelayBindDiscipline ./pkg/registrysvc/
 run_test "mirrors.3b" 4 TestNewRelayPortDiscipline ./pkg/registrysvc/
 run_test "mirrors.3c" 4 TestVMNetGateway ./pkg/registrysvc/
-run_test "mirrors.3d" 3 TestRelayForwards ./pkg/registrysvc/
+run_test "mirrors.3d" 5 TestRelayServesTheGate ./pkg/registrysvc/
 run_flat_test "mirrors.3e" TestRelaySkipsAnAbsentAddress ./pkg/registrysvc/
 run_flat_test "mirrors.3f" TestRelayStopsOnContextCancel ./pkg/registrysvc/
 
