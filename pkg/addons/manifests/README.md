@@ -17,11 +17,13 @@ withdrawn. It is never applied over an operator's own metrics.k8s.io APIService.
 
 ## Why the manifests live in the binary and not on disk
 
-An on-disk manifest directory under the server work dir would be readable *and writable* by
-every pod on the node — all pods run as the same `_k3sm` uid and the work dir is not in
-runtimed's sandbox-protected prefix set — while the reconciler applies its contents with the
-`system:masters` admin kubeconfig. That widens the set of principals that can reach
-cluster-admin from "whoever holds the 0600 admin kubeconfig" to "every pod on the node".
+An on-disk manifest directory under the server work dir would be owned by the same `_k3sm`
+uid every pod runs as, so ownership is no barrier. Only runtimed's Seatbelt profile keeps a
+confined pod out of `<work dir>/server`, and that is a profile rule keyed to the work dir it
+was generated for, not a permission. The reconciler would apply the directory's contents with
+the `system:masters` admin kubeconfig. That widens the set of principals that can reach
+cluster-admin from "whoever holds the 0600 admin kubeconfig" to "any process running as the
+service user".
 Compiling the manifests in removes the ingress entirely: there is no path an unprivileged
 process can write, and manifest integrity is inherited from the signed binary.
 
