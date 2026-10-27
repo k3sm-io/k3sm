@@ -477,6 +477,13 @@ self_test() {
 
 case "${1:-}" in
 --self-test) self_test ;;
+"")
+	# Bare invocation (the release gate's CI tier): the self-test is the CI
+	# tier; the sampling tier needs a rig node, so it is announced as owed.
+	self_test || exit 1
+	echo "LAB-PENDING  b668.L  sample and summarize need K3SM_LAB=1 on a rig node (see --help)"
+	exit 3
+	;;
 sample)
 	shift
 	if [ "${K3SM_LAB:-}" != 1 ]; then
