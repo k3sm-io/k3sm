@@ -364,8 +364,9 @@ svclb: loadbalancer hoster starting node=node-a bind=0.0.0.0
 
 Then look for one of these:
 
-- **`svclb: loadbalancer port is RESERVED by a k3sm wildcard listener`**. The Service declares a port
-  k3sm's own listeners own (the NodePort range `30000-32767`, or the kubelet API port `10250`) or a
+- **`svclb: loadbalancer port is RESERVED by a k3sm listener (the NodePort range, the kubelet API port, or a port the ingress host's kube-system/k3sm-ingress Service declares) or for a macOS host service (22, 53, 88, 445, 548, 631); no listener bound, this node is not advertised`**. The Service declares a port
+  k3sm's own listeners own (the NodePort range `30000-32767`, the kubelet API port `10250`, or a port
+  the ingress host's `kube-system/k3sm-ingress` Service declares, `80` and `443` by default) or a
   macOS host-service port (`22`, `53`, `88`, `445`, `548` or `631`). No
   listener is bound and the status stays empty, because taking `10250` would break
   `kubectl logs`/`exec`/`top` on this node. Pick a different `spec.ports[].port`. Normally the API
