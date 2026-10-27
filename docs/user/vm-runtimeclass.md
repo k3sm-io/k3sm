@@ -5,7 +5,7 @@ isolation**, and same-node Pods share one OS trust domain. The **`vm` RuntimeCla
 answer for **untrusted or multi-tenant** workloads, an isolation boundary backed by
 Virtualization.framework.
 
-> **Single-node.** A Pod that sets `runtimeClassName: vm` boots a `linux/arm64` container image
+> **Mostly single-node.** A Pod that sets `runtimeClassName: vm` boots a `linux/arm64` container image
 > in its own micro-VM. It supports boot and restart, `kubectl logs` with every option (including
 > `--tail`, `-f` and `--previous`), `kubectl exec` with exit-code propagation,
 > `CrashLoopBackOff` and restart backoff,
@@ -20,7 +20,9 @@ Virtualization.framework.
 >
 > It ships **`linux/arm64` only** (`linux/amd64` needs in-guest translation
 > and is held for a later release); its acceptance script
-> (`hack/acceptance/m11.sh`) runs against the release build. This path is single-node.
+> (`hack/acceptance/m11.sh`) runs against the release build. Cross-node access works only for TCP to a `vm` Pod's pod IP,
+> through a relay on its node; everything else on this path was measured on a single node (see
+> [Limitations](limitations.md#vm-pods-services-and-direct-pod-ips)).
 
 ## When to Use It
 

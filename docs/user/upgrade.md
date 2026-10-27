@@ -14,9 +14,9 @@ release tag, when it was published, the Kubernetes version it ships when its rel
 version of the `k3sm` binary you ran, and every node of the cluster with the version its kubelet
 reports, marked `current`, `behind`, or `ahead` (newer than the latest release, such as a build of
 a tag not yet published). A build of an untagged commit, whose version is a Go pseudo-version such
-as `v0.1.8-0.20261025152241-96fbff948562`, ranks by the release it leads up to: it is `ahead` of
-v0.1.7, `behind` v0.1.8, and is shown as an untagged build, for example `ahead, untagged build of
-0.1.8`. A node whose kubelet reports no k3sm version, a development build, or a build from a
+as `v0.2.1-0.20261101120000-96fbff948562`, ranks by the release it leads up to: it is `ahead` of
+v0.2.0, `behind` v0.2.1, and is shown as an untagged build, for example `ahead, untagged build of
+0.2.1`. A node whose kubelet reports no k3sm version, a development build, or a build from a
 modified tree is `unknown`. It only reads; it downloads and installs nothing. It exits 0 when the check finished and 1 when it
 could not (GitHub unreachable, for example), with the reason on stderr.
 
@@ -103,8 +103,11 @@ controller set it; a node you cordoned yourself stays cordoned. It prints each s
 update status` to see which node failed and why before you abort, and fix that node before the
 next `apply`.
 
-The k3sm app offers the same update as a menu item and a button, both of which run
-`k3sm update apply`.
+The k3sm app offers updates from its menu, its window and Settings > Updates. On the server of a
+cluster with workers it runs the managed update (`k3sm update apply`), or, when the app carries a
+newer release, `k3sm update apply --version <tag> --pin-sha256 <digest>` bound to that release. On
+a single-node server or a worker it installs the release it carries over this Mac's k3sm with
+`k3sm install --from-staging`.
 
 ## Single Node
 
@@ -426,7 +429,7 @@ What it does with each image in the node store:
 
 The migration never deletes anything from a node store and never changes its records, so rolling
 back to the previous release finds every image where it was. It is resumable: progress is journalled
-under the work dir (`image-migration/journal.json`) after each image, a re-run skips images the
+under the work dir (`/var/lib/k3sm/server/image-migration/journal.json` by default) after each image, a re-run skips images the
 registry already holds at their digest, and an interrupted run continues where it stopped. A digest-only
 reference (`repo@sha256:...`) has no tag to keep and lands as `<repository>:k3sm-migrated-<12 hex>`.
 

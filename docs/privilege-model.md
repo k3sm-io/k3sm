@@ -67,17 +67,16 @@ class `vmnetd` and `socket_vmnet` have lived through. `k3sm-netd` is built to a 
   against pinned policy: an alias must be a `/32` inside the pinned aggregate intersected with the
   node's Pod CIDR; a route must pass the route-set predicate. This follows the `socket_vmnet` lesson that
   caller-supplied arguments never reach a privileged tool.
-- A privileged-port bind is authorized, not merely requested, and only for **specific `lo0` VIP
-  addresses**, never a wildcard. The helper's `<1024` `BindPort` serves the infra VIPs
-  (`10.43.0.1:443`, `10.43.0.10:53`) and any `<1024` ClusterIP port. The bind is permitted only when
-  the Service-backed authorizer confirms a real Service declares that port, and the daemon binds the
-  **specific VIP address**, rejecting a wildcard request. The helper does not bind NodePort, which
-  needs all-interfaces reachability including `127.0.0.1`, so the Service proxy binds a wildcard
-  `*:nodePort` in-process, and the apiserver pins the NodePort range to `30000-32767`, all of which
-  are `≥1024` and bindable unprivileged as `_k3sm`. A `<1024` NodePort is unsupported. LoadBalancer
-  and Ingress listeners likewise bind the **wildcard**, and on macOS a wildcard privileged bind needs
-  no root while a specific-address one does (inverted from Linux), so that datapath never reaches the
-  helper at all.
+- A privileged-port bind is authorized, not merely requested. The helper's `<1024` `BindPort`
+  serves the infra VIPs (`10.43.0.1:443`, `10.43.0.10:53`) and any `<1024` ClusterIP port, bound on
+  the **specific VIP address**, and the `<1024` LoadBalancer and ingress ports, bound on `127.0.0.1`
+  and the node's own address with LAN access off, or on every interface with it on (see
+  [Network Exposure](user/install.md#network-exposure)). Every `<1024` bind is permitted only when
+  the Service-backed authorizer confirms that a real Service, or the canonical ingress, declares
+  that port, and a wildcard on a port `≥1024` is refused outright. The helper does not bind
+  NodePort: the apiserver pins the NodePort range to `30000-32767`, all of which are `≥1024` and
+  bindable unprivileged as `_k3sm`, so the Service proxy binds each NodePort in-process, on the
+  addresses LAN access selects. A `<1024` NodePort is unsupported.
 - The socket authenticates its peer. `LOCAL_PEERCRED` requires the `_k3sm` uid, which keeps *other*
   local users off the socket. A code-identity check (audit token → code-signature validity against
   the signed binary's designated requirement) is a documented defense-in-depth follow-up.

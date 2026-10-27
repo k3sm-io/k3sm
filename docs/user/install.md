@@ -102,9 +102,9 @@ write into it.
 
 ## Install Channels
 
-k3sm ships through three channels, listed in shipping order:
+k3sm ships through two channels:
 
-1. **The install script (first to ship):**
+1. **The install script:**
 
    ```sh
    curl -fsSL https://k3sm.io/install.sh | sh
@@ -113,9 +113,9 @@ k3sm ships through three channels, listed in shipping order:
    The script preflights (Apple silicon, macOS 26+), downloads the release tarball and its
    checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do,
    and then runs `sudo k3sm install`. The verification checks **same-origin integrity**, meaning
-   the tarball matches the checksums published beside it. It does not check publisher identity.
-   Publisher identity comes from the other two channels: the app download is Developer ID signed
-   and notarized, and so is the `.pkg`. Environment variables set the
+   the tarball matches the checksums published beside it. The script does not check publisher
+   identity, but the programs in the tarball are Developer ID signed and notarized, and
+   `codesign --verify --strict /Library/k3sm/k3sm` checks that after install. Environment variables set the
    options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
    unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
    `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.2.0 sh` (v0.2.0 is the release you are on
@@ -126,22 +126,16 @@ k3sm ships through three channels, listed in shipping order:
 
 2. **The k3sm app,** a signed, notarized download from k3sm.io (see [Installing From k3sm.app](#installing-from-k3smapp)).
 
-3. **Notarized `.pkg`** is a signed, stapled installer package for offline and managed
-   installs.
-
-> **Status:** pre-release builds are published; the script resolves the newest one, and a pin
-> via `K3SM_INSTALL_VERSION` always wins. The `.pkg` arrives with the first stable release.
-
-Every channel manages the same `/Library/k3sm`. Once more than one has shipped, run
-`sudo k3sm install` after switching so the daemons run the newly delivered binary, or run
+Both channels manage the same `/Library/k3sm`. Run
+`sudo k3sm install` after switching from one to the other so the daemons run the newly delivered binary, or run
 `sudo k3sm uninstall` first for a clean cutover.
 
 ### Installing From k3sm.app
 
 k3sm.app is built from its own public repository, [k3sm-io/app](https://github.com/k3sm-io/app),
 a separate SwiftPM package. The command-line install needs nothing from the app. The app runs the
-same `k3sm install` with the same defaults as `install.sh`, adding only `--from-staging` and
-`--user`, and it installs the release it carries, which can be older than the newest release the
+same `k3sm install` with the same defaults as `install.sh`, adding `--from-staging` and `--user`
+(and, to join a cluster, `--agent`, `--server` and `--token-file`), and it installs the release it carries, which can be older than the newest release the
 script picks.
 
 When the app is installed in `/Applications`, `k3sm install`, `k3sm start` and
@@ -183,8 +177,9 @@ node credential. A server rewrites the admin kubeconfig for `--user`, or without
 the kubeconfig the last install wrote. With nothing installed and no `--user`, it refuses: there is
 nothing to update in place. A plain `sudo k3sm install` makes none of these checks and is unchanged.
 
-To remove an install made from the app, run `sudo k3sm uninstall`, or use Uninstall in the app's
-window. Dragging the app to the Trash does not remove k3sm: the cluster keeps running.
+To remove an install made from the app, run `sudo k3sm uninstall`, or use **Uninstall k3sm…** in the
+app's Settings > Advanced, which keeps the cluster's data unless you tick **Also delete k3sm's
+data**. Dragging the app to the Trash does not remove k3sm: the cluster keeps running.
 
 ## Secrets Encryption at Rest
 

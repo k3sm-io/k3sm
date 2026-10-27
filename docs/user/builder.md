@@ -97,11 +97,11 @@ k3sm image push ./layout localhost:6450/myapp:v1
 
 ### Building without recording: `--no-record`
 
-The cache pull after the recording goes through the node's runtime daemon, whose
-socket only the daemon's own account can use, so an ordinary user's build fails
-at that step. `--no-record` skips the recording. The build writes `--output`,
-uploads with `--push`, or both, and never contacts the daemon, so it needs no
-root:
+An ordinary account's build records the image in the cluster registry and warns
+that this node's cache was not warmed, because the runtime daemon's socket is
+usable only by the daemon's own account. `--no-record` skips the recording
+altogether. The build writes `--output`, uploads with `--push`, or both, and
+never contacts the daemon, so it needs no root:
 
 ```sh
 k3sm build -t myapp:v1 --no-record --output myapp.tar .

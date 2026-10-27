@@ -9,11 +9,11 @@ Virtualization.framework, while the node stays an ordinary Mac.
 That combination is the point of this example. The **server** is a Linux system running on your Mac,
 and the **client** is the native macOS `temporal` binary from Homebrew, talking to it over a Service.
 
-> **Requirements:** Apple Silicon, macOS 26+, a running k3sm cluster ([quickstart.md](quickstart.md)),
+> **Requirements:** Apple Silicon, macOS 26+, a running k3sm cluster ([Quickstart](quickstart.md)),
 > a node that advertises `k3sm.io/virtualization`, and network access to pull images from a public OCI registry.
 >
 > The `vm` RuntimeClass runs unmodified `linux/arm64` images in a per-Pod micro-VM. Read
-> [vm-runtimeclass.md](vm-runtimeclass.md) and [limitations.md](limitations.md) for what it supports
+> [Linux images](vm-runtimeclass.md) and [Limitations](limitations.md) for what it supports
 > today.
 
 ## What It Stands Up
@@ -41,7 +41,7 @@ kubectl get nodes -L k3sm.io/virtualization
 
 A node without that label cannot run a `vm` Pod, and the Pod stays Pending. If the Mac is capable but
 the label is missing, the capability was probed at daemon start; see
-[vm-runtimeclass.md](vm-runtimeclass.md).
+[Linux images](vm-runtimeclass.md).
 
 ## 2. Apply the Server
 
@@ -161,7 +161,7 @@ in memory. Nothing is left on disk beyond the cached image.
   PersistentVolumeClaim at `/data`. PVC storage works on the `vm` path, with ceilings worth reading
   first: a foreign `runAsUser` or `fsGroup` is refused at admission, `hostPath` is refused outright,
   the host volume is case-insensitive, and an unprivileged `k3sm server` needs `--pod-root` before any
-  PVC binds. See [storage.md](storage.md) and [limitations.md](limitations.md).
+  PVC binds. See [Storage](storage.md) and [Limitations](limitations.md).
 - Probes must be `exec` probes. `httpGet`, `tcpSocket` and gRPC probes are dialed at the published
   pod IP, which a `vm` Pod does not answer; only `exec` reaches into the guest.
 - A container restart recreates the whole VM. There is no in-guest supervisor, because the container
@@ -171,13 +171,13 @@ in memory. Nothing is left on disk beyond the cached image.
   bigger machine.
 - NetworkPolicy will not isolate this. It is enforced only on Service-mediated ingress and cannot
   yet name a `vm` Pod as an allowed traffic *source*. Treat it as a hint, not a boundary
-  ([limitations.md](limitations.md)).
+  ([Limitations](limitations.md)).
 - Keep it on one node. Cross-node traffic to or from a `vm` Pod is out of scope for this release, so
   run the server and anything in-cluster that talks to it on the same Mac.
 
 ## Next
 
-- [vm-runtimeclass.md](vm-runtimeclass.md), the RuntimeClass this example runs on.
-- [limitations.md](limitations.md), the measured ceilings referenced throughout.
-- [what-runs.md](what-runs.md), which workloads run natively and which need a guest.
-- [images.md](images.md), how images are pulled, cached and selected per platform.
+- [Linux images](vm-runtimeclass.md), the RuntimeClass this example runs on.
+- [Limitations](limitations.md), the measured ceilings referenced throughout.
+- [Supported workloads](what-runs.md), which workloads run natively and which need a guest.
+- [Images](images.md), how images are pulled, cached and selected per platform.

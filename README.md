@@ -8,7 +8,7 @@ too, in a per-pod Virtualization.framework micro-VM, through an opt-in RuntimeCl
 (`runtimeClassName: vm`). The `vm` path runs `linux/arm64` images; `linux/amd64` images do not
 run on any path yet.
 
-The latest release is a pre-release, v0.2.0 (2026-10-26). The control plane on `main` embeds
+The latest release is v0.2.0 (2026-10-26). The control plane on `main` embeds
 Kubernetes v1.37.1. Multi-node clusters, two Macs joined over a wireguard mesh, and a control plane shared by
 two servers are experimental; both graduate in a later release. Models served on
 the Mac's GPU with MLX have their own resource and CRD (`mlx.k3sm.io/gpu` and `MLXModel`). The
@@ -34,7 +34,8 @@ k3sm ships as a single binary. Its subcommands:
 | `interconnect` | Arm or disarm a Thunderbolt cable between Macs as an opt-in network (alpha) |
 | `build` | Build a Dockerfile into an image: natively for copy-only recipes, on the cluster's build engine for `RUN` |
 | `builder` | Manage the in-cluster buildkitd build engine and its bundled buildx |
-| `image` | Load, import, push, prune, list and inspect this node's images |
+| `image` | Load, import, push, prune, list and inspect images in the cluster registry and this node's pull cache, and migrate a node's older images into the registry |
+| `registry` | Mint the cluster registry's push token for any OCI tool, through your kubeconfig (`registry token\|login`) |
 | `payload` | Stage the control-plane binaries an install copies into place |
 | `kubectl` | Run the bundled kubectl against this cluster, with `KUBECONFIG` preset |
 | `kubeconfig` | Print the admin kubeconfig, or write/merge it into `~/.kube/config` |
@@ -60,7 +61,7 @@ the actual work of running and connecting pods.
 
 ## Quick start
 
-Install the latest release (pre-releases included until the first stable one):
+Install the latest release:
 
 ```sh
 curl -fsSL https://k3sm.io/install.sh | sh

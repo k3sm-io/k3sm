@@ -69,8 +69,8 @@ See [Versions](versions.md), and read the live pin from `k3sm version`.
 
 Re-run the install script, `curl -fsSL https://k3sm.io/install.sh | sh`, which installs the latest
 release and restarts the daemons. The k3sm app, a signed, notarized download from k3sm.io, is the second
-install channel. A multi-node cluster rolls node-by-node. See
-[Upgrade](upgrade.md).
+install channel. On a server, `k3sm update apply` rolls the whole cluster to the latest release,
+node by node, workers first and the server last. See [Upgrade](upgrade.md).
 
 ## Do I Need `sudo` Every Time?
 
