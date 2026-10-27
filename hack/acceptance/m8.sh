@@ -61,6 +61,8 @@
 #   KUBECONFIG=/path/to/kubeconfig hack/acceptance/m8.sh
 #   hack/acceptance/m8.sh --plan     # print the ladder and the pins; touch nothing
 #   hack/acceptance/m8.sh --self-test  # render the manifest and the seed Job; no cluster
+#   hack/acceptance/m8.sh --render-seed-job <namespace> <node> <pvc>
+#                                    # print the m8.3-b seed Job for another driver
 #
 # Knobs (all optional):
 #   K3SM_MLX_IMAGE        serving image override, ideally the @sha256 digest pin
@@ -224,7 +226,26 @@ if [ "${1:-}" = "--self-test" ]; then
 	printf '%s\n' "$body" | grep -q 'cascade=foreground' && st ok "seed Job delete is foreground" || st no "seed Job delete is foreground"
 	[ "$(seed_image lab-ns)" = "$(grep -E '^[[:space:]]*image:' "$EXAMPLE" | head -1 | sed -E 's#^[[:space:]]*image:[[:space:]]*##')" ] &&
 		st ok "seed image is the example's serving image" || st no "seed image is the example's serving image"
+	[ "$("$0" --render-seed-job lab-ns node-a "cache-$MODEL_NAME-0")" = "$(render_seed_job lab-ns node-a "$(seed_image lab-ns)" "cache-$MODEL_NAME-0")" ] &&
+		st ok "--render-seed-job prints the m8.3-b seed Job for the example's image" || st no "--render-seed-job prints the m8.3-b seed Job for the example's image"
+	if "$0" --render-seed-job lab-ns >/dev/null 2>&1; then st no "--render-seed-job refuses a short argument list"; else
+		[ $? -eq 2 ] && st ok "--render-seed-job refuses a short argument list" || st no "--render-seed-job refuses a short argument list"; fi
 	exit "$st_fail"
+fi
+
+# --------------------------------------------------------------------------------
+# --render-seed-job <namespace> <node> <pvc>: print the seed Job for the shipped
+# example's pinned revision, so another driver that applies examples/mlxmodel.yaml
+# (the release gate's demo tier) seeds the cache volume the way m8.3-b does, from
+# this one rendering, rather than carrying a copy of it. A pinned revision is
+# loaded from the cache and never fetched into it (pkg/mlx modelReference), so a
+# driver that skips this step waits on a replica that crash-loops for as long as
+# the cache stays empty.
+# --------------------------------------------------------------------------------
+if [ "${1:-}" = "--render-seed-job" ]; then
+	[ $# -eq 4 ] || { echo "m8.sh: --render-seed-job <namespace> <node> <pvc>" >&2; exit 2; }
+	render_seed_job "$2" "$3" "$(seed_image "$2")" "$4"
+	exit 0
 fi
 
 # --------------------------------------------------------------------------------
@@ -267,7 +288,7 @@ if [ "${1:-}" = "--plan" ] || [ "${1:-}" = "--dry-run" ]; then
 fi
 
 if [ $# -gt 0 ]; then
-	echo "m8.sh: unknown argument: $1 (try --plan or --self-test)" >&2
+	echo "m8.sh: unknown argument: $1 (try --plan, --self-test or --render-seed-job)" >&2
 	exit 2
 fi
 

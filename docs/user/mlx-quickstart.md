@@ -70,7 +70,9 @@ k3sm points it at that revision's directory **inside the cache volume** instead:
   rejected up front with an `InvalidSpec` reason rather than served from the moving default branch.
 - A pinned revision is loaded from the cache, not fetched into it. On a volume that has never held this
   model, leave `revision` empty for the first start (the engine downloads the default branch), or stage
-  the weights into the volume yourself.
+  the weights into the volume first. `hack/acceptance/m8.sh --render-seed-job <namespace> <node>
+  cache-qwen3-06b-0 | kubectl apply -f -` renders a Job that writes the example's pinned revision into
+  its claim once the claim has bound to a node; delete the Job before the pod restarts onto the weights.
 
 `quantization` is rejected today, because the engine has no expression for it and serving a different
 variant than the one asked for would look like success. Name the quantized repository in `model`
