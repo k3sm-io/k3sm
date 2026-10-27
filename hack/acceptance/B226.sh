@@ -93,8 +93,8 @@ ladder "$ref" "b226.1  ServiceAccountToken sets BoundObjectRef{Kind:Pod, APIVers
 # memory, never handed to a pod); and the registry builder token
 # (cmd/k3sm/registrybuilder.go, the `k3sm registry token`/push credential, a
 # TokenRequest for the k3sm-registry/builder ServiceAccount minted through the
-# user's own kubeconfig, audience k3sm-registry, 1h by default and never under
-# 10m, refused when the apiserver clamps it; deliberately unbound because it
+# user's own kubeconfig, audience k3sm-registry, 1h by default, never under
+# 10m or over 24h, refused when the apiserver clamps it; deliberately unbound because it
 # authenticates a user's push from a Mac, not a pod). Neither of the last two is a
 # pod identity, so errNoPodIdentity does not apply to them. Any other site, or a
 # second site in any of the three files, reddens this rung. The pattern matches a
