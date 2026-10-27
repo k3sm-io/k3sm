@@ -244,19 +244,19 @@ Push the layout with the registry token from the environment, as your own user:
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
-  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1
+  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2
 ```
 
 The credential is read from the environment or the docker config chain — never
 from argv — and is not stored. `push` prints the digest and the pin:
 
 ```
-pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1
+pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2
   digest: sha256:…
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```
 
-The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`), so a tag never changes what it names.
+The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`), so a tag never changes what it names.
 
 Record that pin. The operator resolves the image **by digest**; the tag is
 display-only and the next push moves it.
