@@ -46,8 +46,8 @@ kubeconfig may create that ServiceAccount's token (an admin kubeconfig can; an
 admin can grant it to anyone by binding the k3sm:registry-builder-token
 Role with a RoleBinding in k3sm-registry).
 
-  token   print a token on stdout (--duration, default 1h; refused above the
-          cluster's maximum). The same call as
+  token   print a token on stdout (--duration, default 1h; minimum 10m,
+          maximum 24h). The same call as
           kubectl create token builder -n k3sm-registry --audience k3sm-registry
   login   write the token into your docker config ($DOCKER_CONFIG/config.json,
           else ~/.docker/config.json, mode 0600) for the address this Mac
@@ -69,7 +69,7 @@ func runRegistry(args []string, stdout, stderr io.Writer) error {
 	}
 	fs := flag.NewFlagSet("k3sm registry "+args[0], flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	d := fs.Duration("duration", defaultBuilderTokenDuration, "how long the token is valid (minimum 10m)")
+	d := fs.Duration("duration", defaultBuilderTokenDuration, "how long the token is valid (minimum 10m, maximum 24h)")
 	switch args[0] {
 	case "token", "login":
 	default:
