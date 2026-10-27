@@ -8,7 +8,9 @@ It runs vllm-mlx's own CLI (vllm_mlx.cli.main) in this process with the same
 argv, so the server, its flags and its HTTP surface are vllm-mlx's. Before the
 CLI starts it installs one guard on the server module: a request whose prompt
 plus completion would not fit the engine's context window is refused with HTTP
-400, the way vLLM enforces max_model_len, instead of being served.
+400, the way vLLM enforces max_model_len, instead of being served. It also
+patches the prefill mask of mlx-lm's rotating cache so the cache's attention
+sinks stay attended (see The attention sinks, below).
 
 Why the guard exists. vllm-mlx 0.5.0 has no max-model-len option and does no
 prompt-length validation: its only per-sequence bound is --max-kv-size, which
@@ -45,6 +47,16 @@ streaming request is refused with a real 400 rather than an empty 200 stream:
   * /v1/chat/completions (streaming or not): around
     server._prepare_chat_completion_invocation, which runs once the engine is
     acquired and before either response path;
+  * /v1/messages (streaming or not): around
+    server._prepare_anthropic_endpoint_invocation, which the handler calls
+    once the engine is acquired and before it builds the StreamingResponse;
+  * /v1/responses, streaming: around server._responses_request_to_chat_request,
+    the one call the handler makes before it builds the StreamingResponse (the
+    stream's first SSE event is written before the engine is reached, so a
+    check any later would come after bytes were sent);
+  * /v1/responses (streaming or not): around server._prepare_responses_request,
+    which builds the engine call's arguments, so an omitted max_tokens is
+    clamped on the arguments the engine runs with;
   * /v1/completions, streaming: around server.stream_completion, which the
     handler calls synchronously before it builds the StreamingResponse;
   * /v1/completions, not streaming: around BatchedEngine.generate, the call the
@@ -60,14 +72,47 @@ unguarded. The guard needs vllm-mlx's batched engine (the one that applies the
 chat template in the engine), which --continuous-batching selects; the image's
 ENTRYPOINT always passes it, and this module refuses to serve without it.
 
-Not covered: /v1/responses and /v1/messages (the guard's contract is the two
-OpenAI completion endpoints; a non-streaming /v1/messages request reaches the
-engine-level check and is held to the same rule), and image or audio tokens a
-multimodal processor adds after the template, which a text tokenizer does not
-count.
+Not covered: image or audio tokens a multimodal processor adds after the
+template, which a text tokenizer does not count.
+
+The attention sinks. mlx-lm 0.32.0's make_prompt_cache(model, max_kv_size)
+builds RotatingKVCache(max_kv_size, keep=4): the first four tokens stay in the
+cache as attention sinks however far the window rotates. Its make_mask builds
+the multi-token (prefill) mask as a plain sliding window over the cache
+columns, so once a chunked prefill has trimmed the cache each query row masks
+out the sink columns before it (all four, from the fifth row on) and attends
+as many more recent tokens in their place as a decode step would not. Decode
+(one token at a time) attends the whole cache, so the defect shows only as
+lost recall after a long prompt. patch_rotating_kv_cache replaces make_mask
+with one that keeps the sink columns attended and the recent band at
+max_kv_size - keep, the mask upstream proposes in ml-explore/mlx-lm#1978. In
+this image the cache with sinks is the one vllm-mlx's multimodal scheduler
+prefills per request; the text scheduler builds its caches with keep=0, where
+the patch leaves the mask unchanged.
+
+The KV geometry clamp. k3sm sizes --max-kv-size W from a fixed per-token KV
+cost (pkg/mlx/sizing.go's kvBytesPerToken, 157286 bytes, calibrated on a 3B
+model), because the model's config.json is not on disk when the pod is
+rendered. The real fp16 cost is 4 x num_hidden_layers x num_key_value_heads x
+head_dim bytes per token (Qwen2.5-32B: 262144; Llama-3.3-70B: 327680), so on a
+large model W would over-allocate the memory it was sized for. Before the
+engine starts, clamp_max_kv_size reads the model's config.json (a local
+directory directly; a Hub reference by fetching only config.json with
+huggingface_hub.snapshot_download into the cache mlx-lm's loader uses, so the
+weight download reuses it; K3SM_MODEL_CONFIG_DIR names a directory to read it
+from instead), takes the decoder's geometry (a nested text_config wins;
+num_key_value_heads falls back to num_attention_heads, head_dim to
+hidden_size // num_attention_heads), and when that cost exceeds the assumed one
+(K3SM_KV_BYTES_PER_TOKEN, default 157286) rewrites W to
+floor(W x assumed / actual), never below 1024, logging one line. A config it
+cannot read, or a missing field, logs one line and leaves W as given: the clamp
+never fails the pod. K3SM_KV_GEOMETRY_CLAMP=off disables it. It is
+conservative where the cache costs less than fp16 for every layer (a quantized
+KV cache, sliding-window layers).
 """
 
 import logging
+import os
 import sys
 
 ENGINE_CLI = "vllm_mlx.cli"
@@ -179,6 +224,63 @@ def chat_prompt(engine, messages, chat_kwargs, extract_multimodal_content, conve
     )
 
 
+SINK_PATCHED = "_k3sm_sink_mask"
+
+
+def sink_mask(mx, N, offset, window, keep):
+    """The prefill mask of a rotating cache that keeps `keep` sink tokens.
+
+    Columns are the cache's: the sinks first, then the most recent tokens in
+    temporal order, the N new ones last. Each query row attends the sinks it
+    follows and the window - keep most recent tokens up to itself, which is
+    what a decode step attends once the cache is full. The formula is the one
+    upstream proposes in ml-explore/mlx-lm#1978.
+    """
+    rinds = mx.arange(offset + N)[None]
+    linds = mx.arange(offset, offset + N)[:, None]
+    return (linds >= rinds) & ((rinds < keep) | (linds < rinds + window - keep))
+
+
+def patch_rotating_kv_cache(cache_classes, mx):
+    """Keep a RotatingKVCache's sink columns attended in its prefill mask.
+
+    Patches make_mask on each class in place. Only the multi-token mask of a
+    cache with sinks (keep > 0) at its own window changes; every other call,
+    including an explicit window that differs from the cache size, goes to the
+    original. Raises GuardError when a class does not have the make_mask this
+    was written against, so an mlx-lm bump that moves it fails at pod start.
+    """
+    import inspect
+
+    patched = []
+    for cls in cache_classes:
+        original = getattr(cls, "make_mask", None)
+        if original is None or not callable(original):
+            raise GuardError(f"{cls.__module__}.{cls.__name__} has no make_mask; the sink patch was written "
+                             f"against mlx-lm 0.32.0 and this cache moved it")
+        if getattr(original, SINK_PATCHED, False):
+            patched.append(cls)
+            continue
+        params = list(inspect.signature(original).parameters)
+        if params != ["self", "N", "window_size", "return_array"]:
+            raise GuardError(f"{cls.__module__}.{cls.__name__}.make_mask takes {params}; the sink patch was "
+                             f"written against mlx-lm 0.32.0's (self, N, window_size, return_array)")
+
+        def make_mask(self, N, window_size=None, return_array=False, _original=original):
+            keep = getattr(self, "keep", 0)
+            if N > 1 and keep > 0 and (window_size or self.max_size) == self.max_size:
+                offset = min(self.max_size - 1, self.offset)
+                if offset + N > self.max_size or return_array:
+                    return sink_mask(mx, N, offset, self.max_size, keep)
+            return _original(self, N, window_size=window_size, return_array=return_array)
+
+        setattr(make_mask, SINK_PATCHED, True)
+        make_mask.__doc__ = original.__doc__
+        cls.make_mask = make_mask
+        patched.append(cls)
+    return patched
+
+
 def _seam(owner, name):
     value = getattr(owner, name, None)
     if value is None or not callable(value):
@@ -196,6 +298,9 @@ def install(server, engine_cls, http_exception, json_response, extract_multimoda
     """
     resolve = _seam(server, "_resolve_request_max_tokens")
     prepare_chat = _seam(server, "_prepare_chat_completion_invocation")
+    prepare_anthropic = _seam(server, "_prepare_anthropic_endpoint_invocation")
+    to_chat_request = _seam(server, "_responses_request_to_chat_request")
+    prepare_responses = _seam(server, "_prepare_responses_request")
     stream_completion = _seam(server, "stream_completion")
     generate = _seam(engine_cls, "generate")
     app = getattr(server, "app", None)
@@ -220,19 +325,53 @@ def install(server, engine_cls, http_exception, json_response, extract_multimoda
         value = resolve(requested_value)
         return DefaultMaxTokens(value) if requested_value is None else RequestedMaxTokens(value)
 
-    def prepare_chat_guarded(engine, request, effective_max_tokens, *args, **kwargs):
-        prepared = prepare_chat(engine, request, effective_max_tokens, *args, **kwargs)
+    def guard_chat(engine, messages, chat_kwargs, max_tokens, where):
+        """Check a prepared chat call and set the max_tokens it runs with."""
         window = window_of(engine)
-        chat_kwargs = prepared.chat_kwargs
-        max_tokens = chat_kwargs.get("max_tokens", effective_max_tokens)
         if window > 0:
-            prompt = chat_prompt(engine, prepared.messages, chat_kwargs, extract_multimodal_content,
+            prompt = chat_prompt(engine, messages, chat_kwargs, extract_multimodal_content,
                                  convert_tools_for_template)
             prompt_tokens = count_tokens(engine.tokenizer, prompt)
-            chat_kwargs["max_tokens"] = refuse(prompt_tokens, max_tokens, window, "/v1/chat/completions")
+            chat_kwargs["max_tokens"] = refuse(prompt_tokens, max_tokens, window, where)
         else:
             chat_kwargs["max_tokens"] = int(max_tokens)
+
+    def prepare_chat_guarded(engine, request, effective_max_tokens, *args, **kwargs):
+        prepared = prepare_chat(engine, request, effective_max_tokens, *args, **kwargs)
+        guard_chat(engine, prepared.messages, prepared.chat_kwargs,
+                   prepared.chat_kwargs.get("max_tokens", effective_max_tokens), "/v1/chat/completions")
         return prepared
+
+    def prepare_anthropic_guarded(engine, openai_request, effective_max_tokens, *args, **kwargs):
+        prepared = prepare_anthropic(engine, openai_request, effective_max_tokens, *args, **kwargs)
+        guard_chat(engine, prepared.messages, prepared.chat_kwargs,
+                   prepared.chat_kwargs.get("max_tokens", effective_max_tokens), "/v1/messages")
+        return prepared
+
+    # The Responses path builds its engine arguments in _prepare_responses_request,
+    # which calls _responses_request_to_chat_request itself. The streaming
+    # handler calls the conversion alone before it starts the stream, so the
+    # conversion runs the guarded preparation when it is called from outside
+    # it. Both are synchronous, so a plain depth count cannot interleave with
+    # another request.
+    depth = [0]
+
+    def prepare_responses_guarded(request, *args, **kwargs):
+        depth[0] += 1
+        try:
+            engine, chat_request, messages, chat_kwargs = prepare_responses(request, *args, **kwargs)
+        finally:
+            depth[0] -= 1
+        requested = chat_request.max_tokens
+        max_tokens = chat_kwargs.get("max_tokens")
+        max_tokens = RequestedMaxTokens(max_tokens) if requested else DefaultMaxTokens(max_tokens)
+        guard_chat(engine, messages, chat_kwargs, max_tokens, "/v1/responses")
+        return engine, chat_request, messages, chat_kwargs
+
+    def to_chat_request_guarded(request, *args, **kwargs):
+        if depth[0] == 0:
+            prepare_responses_guarded(request, validate_remote_media=False)
+        return to_chat_request(request, *args, **kwargs)
 
     def stream_completion_guarded(engine, prompt, request, max_tokens, *args, **kwargs):
         window = window_of(engine)
@@ -258,14 +397,222 @@ def install(server, engine_cls, http_exception, json_response, extract_multimoda
 
     server._resolve_request_max_tokens = resolve_marked
     server._prepare_chat_completion_invocation = prepare_chat_guarded
+    server._prepare_anthropic_endpoint_invocation = prepare_anthropic_guarded
+    server._prepare_responses_request = prepare_responses_guarded
+    server._responses_request_to_chat_request = to_chat_request_guarded
     server.stream_completion = stream_completion_guarded
     engine_cls.generate = generate_guarded
     app.add_exception_handler(ContextRefusal, on_refusal)
     return ContextRefusal
 
 
+KV_CLAMP_ENV = "K3SM_KV_GEOMETRY_CLAMP"
+KV_ASSUMED_ENV = "K3SM_KV_BYTES_PER_TOKEN"
+MODEL_CONFIG_DIR_ENV = "K3SM_MODEL_CONFIG_DIR"
+MAX_KV_SIZE = "--max-kv-size"
+# pkg/mlx/sizing.go's kvBytesPerToken: the per-token KV cost the operator sized
+# --max-kv-size with. K3SM_KV_BYTES_PER_TOKEN overrides it.
+DEFAULT_KV_BYTES_PER_TOKEN = 157_286
+MIN_CLAMPED_KV_SIZE = 1024
+
+
+class KVGeometryUnknown(Exception):
+    """The model's KV geometry could not be read; the message says why."""
+
+
+def engine_serve_args(argv):
+    """(model, max_kv_size) as vllm-mlx's own serve parser reads argv.
+
+    Uses vllm_mlx.cli.create_parser, so the positional model and the final
+    --max-kv-size (argparse takes the last occurrence, and accepts an
+    abbreviation) are the ones the engine will run with. A parse error is
+    left for the engine's own parse to report.
+    """
+    import contextlib
+    import io
+
+    try:
+        from vllm_mlx.cli import create_parser
+    except ImportError:
+        return None, None
+
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            args, _ = create_parser().parse_known_args(argv)
+    except SystemExit:
+        return None, None
+    return getattr(args, "model", None), getattr(args, "max_kv_size", None)
+
+
+def model_config(model, environ):
+    """The model's config.json as a dict.
+
+    K3SM_MODEL_CONFIG_DIR, when set, names the directory to read it from (the
+    selftest's seam, and a way to point at a staged config). Otherwise a model
+    reference that exists on disk is a local directory, read directly, as
+    mlx-lm's _download treats it; any other reference is a Hub repository, and
+    only its config.json is fetched with huggingface_hub.snapshot_download
+    into the default cache, which is the call and the cache mlx-lm's load
+    (the engine's loader) downloads the weights with, so that later download
+    reuses this file.
+    """
+    import json
+    from pathlib import Path
+
+    override = environ.get(MODEL_CONFIG_DIR_ENV)
+    if override:
+        directory = Path(override)
+    elif Path(model).exists():
+        directory = Path(model)
+    elif environ.get("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
+        raise KVGeometryUnknown("MLXLM_USE_MODELSCOPE is set; only a local model directory is read")
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+
+            directory = Path(snapshot_download(model, allow_patterns=["config.json"]))
+        except Exception as e:  # any Hub failure leaves the pin alone; never fail the pod over it
+            raise KVGeometryUnknown(f"fetch config.json for {model}: {e}") from None
+    path = directory / "config.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, ValueError) as e:
+        raise KVGeometryUnknown(f"read {path}: {e}") from None
+    if not isinstance(config, dict):
+        raise KVGeometryUnknown(f"{path} is not a JSON object")
+    return config
+
+
+def _positive_int(config, key):
+    value = config.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def kv_geometry(config):
+    """(layers, kv_heads, head_dim) of the model's text decoder.
+
+    A multimodal config nests the decoder under text_config; its fields win
+    over the top level's. num_key_value_heads falls back to
+    num_attention_heads and head_dim to hidden_size // num_attention_heads,
+    the defaults mlx-lm's models apply.
+    """
+    merged = dict(config)
+    text = config.get("text_config")
+    if isinstance(text, dict):
+        merged.update(text)
+    layers = _positive_int(merged, "num_hidden_layers")
+    heads = _positive_int(merged, "num_attention_heads")
+    kv_heads = _positive_int(merged, "num_key_value_heads") or heads
+    head_dim = _positive_int(merged, "head_dim")
+    if head_dim is None:
+        hidden = _positive_int(merged, "hidden_size")
+        if hidden and heads and hidden % heads == 0:
+            head_dim = hidden // heads
+    missing = [name for name, value in (("num_hidden_layers", layers), ("num_key_value_heads", kv_heads),
+                                        ("head_dim", head_dim)) if value is None]
+    if missing:
+        raise KVGeometryUnknown("config.json has no usable " + ", ".join(missing))
+    return layers, kv_heads, head_dim
+
+
+def kv_bytes_per_token(layers, kv_heads, head_dim):
+    """The fp16 KV cache's bytes per token: a key and a value, 2 bytes each."""
+    return 4 * layers * kv_heads * head_dim
+
+
+def _set_max_kv_size(argv, value, parse):
+    out = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == MAX_KV_SIZE and i + 1 < len(argv):
+            out += [token, str(value)]
+            i += 2
+            continue
+        if token.startswith(MAX_KV_SIZE + "="):
+            token = f"{MAX_KV_SIZE}={value}"
+        out.append(token)
+        i += 1
+    if parse(out)[1] != value:
+        out += [MAX_KV_SIZE, str(value)]
+    return out
+
+
+def clamp_max_kv_size(argv, environ, parse=None, load_config=None, say=None):
+    """Return argv with --max-kv-size clamped to the model's KV geometry.
+
+    The operator sizes --max-kv-size W from a fixed per-token KV cost (the
+    assumed figure, K3SM_KV_BYTES_PER_TOKEN); a model whose own cost is higher
+    would outgrow the memory W was sized for. When it is, W becomes
+    floor(W x assumed / actual), never below 1024 and never above W. Any
+    failure to read the geometry leaves argv unchanged with one line said;
+    K3SM_KV_GEOMETRY_CLAMP=off disables the clamp. parse, load_config and say
+    default to engine_serve_args, model_config and a line on stderr.
+    """
+    parse = parse or engine_serve_args
+    load_config = load_config or model_config
+    say = say or (lambda line: print(line, file=sys.stderr, flush=True))
+    model, window = parse(argv)
+    if not isinstance(window, int) or window <= 0:
+        return argv
+    if environ.get(KV_CLAMP_ENV, "").strip().lower() == "off":
+        say(f"k3sm-serve: {KV_CLAMP_ENV}=off; --max-kv-size {window} left as given")
+        return argv
+    raw = environ.get(KV_ASSUMED_ENV, "").strip()
+    try:
+        assumed = int(raw) if raw else DEFAULT_KV_BYTES_PER_TOKEN
+        if assumed <= 0:
+            raise ValueError(raw)
+    except ValueError:
+        say(f"k3sm-serve: {KV_ASSUMED_ENV}={raw!r} is not a positive integer; --max-kv-size {window} left as given")
+        return argv
+    if not model:
+        say(f"k3sm-serve: no single model in argv; --max-kv-size {window} left as given")
+        return argv
+    try:
+        layers, kv_heads, head_dim = kv_geometry(load_config(model, environ))
+    except KVGeometryUnknown as e:
+        say(f"k3sm-serve: KV geometry of {model} unknown ({e}); --max-kv-size {window} left as given")
+        return argv
+    actual = kv_bytes_per_token(layers, kv_heads, head_dim)
+    if actual <= assumed:
+        return argv
+    clamped = min(window, max(MIN_CLAMPED_KV_SIZE, window * assumed // actual))
+    if clamped >= window:
+        return argv
+    say(f"k3sm-serve: --max-kv-size {window} clamped to {clamped}: {model} has {layers} layers x {kv_heads} KV "
+        f"heads x head_dim {head_dim} = {actual} KV bytes per token, above the {assumed} it was sized with")
+    return _set_max_kv_size(argv, clamped, parse)
+
+
+def rotating_cache_classes():
+    """The RotatingKVCache classes the image's engine builds caches from.
+
+    mlx-lm's is required; mlx-vlm carries its own copy of the same class (and
+    of the same make_mask), patched too when it is installed.
+    """
+    from mlx_lm.models.cache import RotatingKVCache
+
+    classes = [RotatingKVCache]
+    try:
+        from mlx_vlm.models.cache import RotatingKVCache as VLMRotatingKVCache
+    except ImportError:
+        return classes
+    if VLMRotatingKVCache is not RotatingKVCache:
+        classes.append(VLMRotatingKVCache)
+    return classes
+
+
 def install_on_engine():
-    """Install the guard on the real vllm_mlx server (the image's engine)."""
+    """Install the sink patch and the guard on the real engine, before it loads."""
+    import mlx.core as mx
+
+    patch_rotating_kv_cache(rotating_cache_classes(), mx)
+
     from fastapi import HTTPException
     from fastapi.responses import JSONResponse
     from vllm_mlx import server
@@ -284,13 +631,15 @@ def main(argv=None):
             print(f"k3sm-serve: {CONTINUOUS_BATCHING} is required: the context guard runs on the batched engine, "
                   "and without it the engine serves one request at a time", file=sys.stderr, flush=True)
             return 2
+        argv = clamp_max_kv_size(argv, os.environ)
         try:
             install_on_engine()
         except GuardError as e:
             print(f"k3sm-serve: {e}", file=sys.stderr, flush=True)
             return 2
-        print("k3sm-serve: context guard on /v1/completions and /v1/chat/completions "
-              "(window: the engine's --max-kv-size)", file=sys.stderr, flush=True)
+        print("k3sm-serve: context guard on /v1/completions, /v1/chat/completions, /v1/messages and "
+              "/v1/responses (window: the engine's --max-kv-size); RotatingKVCache sink mask patched",
+              file=sys.stderr, flush=True)
     from vllm_mlx import cli
 
     sys.argv = [ENGINE_CLI] + argv

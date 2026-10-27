@@ -53,3 +53,4 @@ hack/lab/runs/*.log
 
 # hack/etcd-wrapper.sh scratch (removed on exit; ignored in case a run is killed).
 /hack/.etcd-wrapper/
+__pycache__/

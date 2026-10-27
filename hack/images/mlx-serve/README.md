@@ -33,11 +33,12 @@ derived context and which selects a rotating KV cache: a sequence that outgrows
 it loses its first tokens, and the engine answers HTTP 200 with text built on
 the context it has left. `k3sm_serve` closes that gap the way vLLM enforces
 `max_model_len`. It runs `vllm_mlx.cli` in the same process with the same
-arguments, after hooking the server so that, on `/v1/completions` and
-`/v1/chat/completions` (streaming or not), a request is checked before a
-response starts. With the window W taken from the engine's `--max-kv-size` (the
-last one in argv wins, as it does for the cache) and the prompt counted with
-the model's tokenizer after the chat template:
+arguments, after hooking the server so that, on `/v1/completions`,
+`/v1/chat/completions`, `/v1/messages` and `/v1/responses` (streaming or not),
+a request is checked before a response starts. With the window W taken from
+the engine's `--max-kv-size` (the last one in argv wins, as it does for the
+cache) and the prompt counted with the model's tokenizer after the chat
+template:
 
 - a prompt of W tokens or more is refused;
 - a prompt plus a client `max_tokens` over W is refused;
@@ -48,8 +49,32 @@ A refusal is HTTP 400 with vLLM's error object
 "type": "BadRequestError", "param": null, "code": 400}}`). The guard hooks
 engine functions by name and the process exits at start if one has moved, so
 an engine bump fails loudly rather than serving unguarded; selftest rung 9
-checks the hooks against a staged tree. `/v1/responses`, `/v1/messages` and
-multimodal input tokens are not counted.
+checks the hooks against a staged tree. Image and audio tokens a multimodal
+processor adds after the template are not counted.
+
+`k3sm_serve` also patches the prefill mask of mlx-lm's `RotatingKVCache`. The
+cache keeps its first four tokens as attention sinks, but mlx-lm 0.32.0 builds
+the multi-token mask as a plain sliding window, so after a chunked prefill
+trims the cache the sinks are masked out and recall inside the window drops
+while decode looks fine. The patched mask keeps the sinks attended and the
+recent band at the window minus the sinks, as proposed upstream in
+[ml-explore/mlx-lm#1978](https://github.com/ml-explore/mlx-lm/pull/1978). In
+this image the cache with sinks is the one the multimodal scheduler builds; the
+text scheduler's caches have none, and their mask is unchanged.
+
+Before the engine starts, `k3sm_serve` clamps `--max-kv-size` to the model's
+KV geometry. k3sm sizes W from a fixed 157286 bytes of KV cache per token
+(`kvBytesPerToken` in `pkg/mlx/sizing.go`, measured on a 3B model), because the
+model's `config.json` is only on disk inside the pod. The real fp16 cost is
+4 x `num_hidden_layers` x `num_key_value_heads` x `head_dim` bytes per token
+(262144 for Qwen2.5-32B, 327680 for Llama-3.3-70B), so `k3sm_serve` reads
+`config.json` (from a local model directory, or only that file from the Hub
+into the cache the weight download then reuses; a nested `text_config` wins)
+and, when the real cost is higher, lowers W to W x 157286 / cost, never below
+1024, logging one line. A config it cannot read leaves W as given. The assumed
+figure is `K3SM_KV_BYTES_PER_TOKEN`, `K3SM_MODEL_CONFIG_DIR` names a directory
+to read `config.json` from instead, and `K3SM_KV_GEOMETRY_CLAMP=off` disables
+the clamp. Selftest rung 8 checks it against fake configs.
 
 ## Files
 
@@ -233,19 +258,19 @@ Push the layout with the registry token from the environment, as your own user:
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
-  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1
+  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2
 ```
 
 The credential is read from the environment or the docker config chain — never
 from argv — and is not stored. `push` prints the digest and the pin:
 
 ```
-pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1
+pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2
   digest: sha256:…
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```
 
-The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`), so a tag never changes what it names.
+The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`), so a tag never changes what it names.
 
 Record that pin. The operator resolves the image **by digest**; the tag is
 display-only and the next push moves it.
@@ -272,8 +297,9 @@ refusal. It also drives `k3sm_shard` with fake name resolution
 (no model, no GPU): the ring hostfile and the `jaccl` device matrix land in the
 pod data volume, resolution retries and gives up on time, and the liveness
 probe answers correctly. It drives the `k3sm_serve` context guard against
-fakes, and, when a staged tree exists (`K3SM_MLX_STAGE`, default the build's
-work dir), against the real engine's HTTP app. It prints what it does **not** cover; the stage Job on a cluster, the live build,
+fakes, the `--max-kv-size` clamp against fake `config.json` files, and, when a staged tree exists (`K3SM_MLX_STAGE`, default the build's
+work dir), against the real engine's HTTP app, and checks the attention-sink
+mask on the real mlx-lm cache. It prints what it does **not** cover; the stage Job on a cluster, the live build,
 the real payload walk, the push, and a sharded model on two Macs are the lab
 run.
 

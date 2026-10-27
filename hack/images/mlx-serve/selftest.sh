@@ -25,7 +25,14 @@
 #     bounds resolution, and its liveness probe answers 0 and 1 correctly;
 #   * the k3sm-serve context guard refuses a request longer than the engine's
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
-#     when a staged tree is present, against the real vllm-mlx server.
+#     when a staged tree is present, against the real vllm-mlx server, on the
+#     completion, chat, Messages and Responses routes, streaming or not;
+#   * k3sm-serve lowers --max-kv-size for a model whose config.json geometry
+#     costs more KV bytes per token than k3sm sized it for, and leaves it alone
+#     for a smaller model, a missing config, a missing field and the off switch;
+#   * with a staged tree, the patched RotatingKVCache prefill mask keeps the
+#     attention-sink columns attended after a trim, which the pinned mlx-lm's
+#     own mask does not;
 #   * the stage Job stage-job.sh renders pins uv by version and published
 #     sha256 and the lockfile by digest, carries the checkout's files verbatim,
 #     fails closed on a digest mismatch, carries no credential, and is placed by
@@ -620,6 +627,18 @@ server._resolve_request_max_tokens = lambda v: 32768 if v is None else v
 server._prepare_chat_completion_invocation = lambda engine, request, mt: types.SimpleNamespace(
     messages=request["messages"], chat_kwargs={"max_tokens": mt})
 server.stream_completion = lambda engine, prompt, request, mt, **kw: ("stream", mt)
+server._prepare_anthropic_endpoint_invocation = lambda engine, request, mt: types.SimpleNamespace(
+    messages=request["messages"], chat_kwargs={"max_tokens": mt})
+CONVERSIONS = []
+def to_chat_request(request):
+    CONVERSIONS.append(1)
+    return types.SimpleNamespace(messages=request["messages"], max_tokens=request.get("max_output_tokens"))
+def prepare_responses(request, *, validate_remote_media=True):
+    chat_request = server._responses_request_to_chat_request(request)
+    return (server._engine, chat_request, chat_request.messages,
+            {"max_tokens": chat_request.max_tokens or 32768})
+server._responses_request_to_chat_request = to_chat_request
+server._prepare_responses_request = prepare_responses
 mmc = lambda messages: (None, [], [], [])
 Refusal = ks.install(server, Engine, HTTPError, lambda status_code, content: (status_code, content), mmc, lambda t: t)
 
@@ -645,6 +664,27 @@ p = server._prepare_chat_completion_invocation(eng, msgs(short), res(None))
 check("chat.default  an omitted max_tokens runs as the rest of the window (64 - 12)", p.chat_kwargs["max_tokens"] == 52)
 check("chat.templated  the chat count is of the engine's templated prompt, not the raw text",
       refusal(lambda: server._prepare_chat_completion_invocation(eng, msgs(" ".join(["w"] * 60)), res(3))) is not None)
+check("messages.over  an over-length /v1/messages request is refused with HTTP 400 (stream or not)",
+      refusal(lambda: server._prepare_anthropic_endpoint_invocation(eng, msgs(long), res(8))) is not None)
+p = server._prepare_anthropic_endpoint_invocation(eng, msgs(short), res(8))
+check("messages.fit  an in-window /v1/messages request passes with its max_tokens", p.chat_kwargs["max_tokens"] == 8)
+p = server._prepare_anthropic_endpoint_invocation(eng, msgs(short), res(None))
+check("messages.default  an omitted max_tokens runs as the rest of the window (64 - 12)",
+      p.chat_kwargs["max_tokens"] == 52)
+server._engine = eng
+resp = lambda t, mt=None: dict(msgs(t), max_output_tokens=mt)
+check("responses.stream  an over-length /v1/responses request is refused at the conversion the streaming "
+      "handler makes before its first SSE event",
+      refusal(lambda: server._responses_request_to_chat_request(resp(long, 8))) is not None)
+check("responses.streamfit  an in-window /v1/responses conversion returns the chat request",
+      server._responses_request_to_chat_request(resp(short, 8)).max_tokens == 8)
+check("responses.over  an over-length /v1/responses request is refused where its engine arguments are built",
+      refusal(lambda: server._prepare_responses_request(resp(long, 8))) is not None)
+CONVERSIONS.clear()
+_, _, _, kw = server._prepare_responses_request(resp(short))
+check("responses.default  an omitted max_output_tokens runs as the rest of the window (64 - 12)",
+      kw["max_tokens"] == 52)
+check("responses.once  the conversion inside the preparation is not checked a second time", CONVERSIONS == [1])
 check("stream.over  an over-length streaming completion is refused before the stream starts",
       refusal(lambda: server.stream_completion(eng, long, {}, res(8))) is not None)
 check("stream.fit  an in-window streaming completion streams", server.stream_completion(eng, short, {}, res(8)) == ("stream", 8))
@@ -684,11 +724,159 @@ while read -r verdict name; do
 		*)  ladder no "8.driver  $verdict $name" ;;
 	esac
 done <<< "$serve_out"
-if [ "$SERVE_CHECKS" -ge 26 ]; then
+if [ "$SERVE_CHECKS" -ge 34 ]; then
 	ladder ok "8.count  all $SERVE_CHECKS guard checks reported"
 else
-	ladder no "8.count  only $SERVE_CHECKS of 26 guard checks reported (the driver crashed?)"
+	ladder no "8.count  only $SERVE_CHECKS of 34 guard checks reported (the driver crashed?)"
 	head -20 "$WORK/serve-driver.err"
+fi
+
+# ---- 8k — --max-kv-size clamped to the model's KV geometry ------------------
+# k3sm sizes --max-kv-size from a fixed 157286 KV bytes per token (a 3B model);
+# a larger model costs more, so k3sm_serve lowers the pin at start from the
+# model's config.json. Here against fake config.json files shaped like the real
+# Qwen2.5-32B, Qwen2.5-3B, Llama-3.3-70B and Gemma 3 (text_config) ones, a fake
+# Hub client and a fake engine CLI: no network, no engine.
+cat > "$WORK/kv-driver.py" <<'PY'
+import argparse, json, os, sys, types
+sys.path.insert(0, sys.argv[1])
+work = sys.argv[2]
+import k3sm_serve as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+def config(name, **fields):
+    d = os.path.join(work, name)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "config.json"), "w") as f:
+        json.dump(fields, f)
+    return d
+
+Q32 = config("qwen2.5-32b", num_hidden_layers=64, num_attention_heads=40, num_key_value_heads=8, hidden_size=5120)
+Q3 = config("qwen2.5-3b", num_hidden_layers=36, num_attention_heads=16, num_key_value_heads=2, hidden_size=2048)
+L70 = config("llama-3.3-70b", num_hidden_layers=80, num_attention_heads=64, num_key_value_heads=8, head_dim=128,
+             hidden_size=8192)
+G27 = config("gemma-3-27b", model_type="gemma3", text_config={"num_hidden_layers": 62, "num_attention_heads": 32,
+             "num_key_value_heads": 16, "head_dim": 128, "hidden_size": 5376})
+NOFIELD = config("nolayers", num_attention_heads=40, num_key_value_heads=8, hidden_size=5120)
+EMPTY = os.path.join(work, "no-config")
+os.makedirs(EMPTY, exist_ok=True)
+
+# A stand-in for vllm-mlx's serve parser: positional model, last --max-kv-size wins.
+P = argparse.ArgumentParser()
+P.add_argument("command")
+P.add_argument("model", nargs="?")
+P.add_argument("--max-kv-size", type=int)
+P.add_argument("--host"); P.add_argument("--port"); P.add_argument("--max-num-seqs")
+P.add_argument("--continuous-batching", action="store_true")
+def parse(argv):
+    a, _ = P.parse_known_args(argv)
+    return a.model, a.max_kv_size
+
+def argv(model, *tail, w="32768"):
+    return ["serve", "--continuous-batching", "--host", "0.0.0.0", "--port", "8080", model, "--port", "8080",
+            "--max-kv-size", w, "--max-num-seqs", "4", "--continuous-batching"] + list(tail)
+
+def run(args, env=None):
+    lines = []
+    out = ks.clamp_max_kv_size(args, env or {}, parse=parse, say=lines.append)
+    return out, lines
+
+a = argv(Q32)
+out, lines = run(a)
+check("clamp.32b  a Qwen2.5-32B geometry (262144 B/token) lowers 32768 to floor(32768 x 157286 / 262144) = 19660",
+      parse(out)[1] == 19660 and len(out) == len(a) and [t for t in out if t != "19660"] == [t for t in a if t != "32768"])
+check("clamp.log  one line names W, the geometry, both figures and the clamped value",
+      len(lines) == 1 and all(s in lines[0] for s in ("32768", "64 layers", "8 KV heads", "head_dim 128", "262144",
+                                                       "157286", "19660")))
+out, lines = run(argv(L70))
+check("clamp.70b  a Llama-3.3-70B geometry with an explicit head_dim (327680 B/token) lowers 32768 to 15728",
+      parse(out)[1] == 15728 and len(lines) == 1)
+out, lines = run(argv(G27))
+check("clamp.textconfig  a multimodal config's nested text_config is the geometry read (507904 B/token, 10147)",
+      parse(out)[1] == 10147 and "62 layers" in lines[0])
+a = argv(Q3)
+out, lines = run(a)
+check("noclamp.3b  a Qwen2.5-3B geometry (36864 B/token) leaves W alone, silently", out == a and lines == [])
+a = argv(EMPTY)
+out, lines = run(a)
+check("missing.config  a model with no config.json leaves W alone, with one line", out == a and len(lines) == 1)
+a = argv(NOFIELD)
+out, lines = run(a)
+check("missing.field  a config without num_hidden_layers leaves W alone, with one line",
+      out == a and len(lines) == 1 and "num_hidden_layers" in lines[0])
+a = argv(Q32)
+out, lines = run(a, {"K3SM_KV_GEOMETRY_CLAMP": "off"})
+check("off  K3SM_KV_GEOMETRY_CLAMP=off leaves W alone", out == a and len(lines) == 1)
+out, lines = run(a, {"K3SM_KV_BYTES_PER_TOKEN": "262144"})
+check("assumed.env  K3SM_KV_BYTES_PER_TOKEN is the assumed figure (sized for 262144: no clamp)", out == a and lines == [])
+out, lines = run(a, {"K3SM_KV_BYTES_PER_TOKEN": "lots"})
+check("assumed.bad  an unparsable K3SM_KV_BYTES_PER_TOKEN leaves W alone, with one line", out == a and len(lines) == 1)
+out, _ = run(argv(Q32, w="2048"), {"K3SM_KV_BYTES_PER_TOKEN": "1000"})
+check("floor  the clamp never goes below 1024", parse(out)[1] == 1024)
+a = argv(Q32, w="512")
+out, _ = run(a, {"K3SM_KV_BYTES_PER_TOKEN": "1000"})
+check("floor.noraise  a W already under 1024 is never raised", out == a)
+a = argv(Q32, "--max-kv-size", "16384")
+out, _ = run(a)
+check("override.last  the operator's later --max-kv-size is the W clamped (16384 -> 9830)", parse(out)[1] == 9830)
+a = [t for t in argv(Q32) if t not in ("--max-kv-size", "32768")] + ["--max-kv-size=32768"]
+out, _ = run(a)
+check("equals  a --max-kv-size=W spelling is rewritten in place", out[-1] == "--max-kv-size=19660" and len(out) == len(a))
+a = [t for t in argv(Q32) if t not in ("--max-kv-size", "32768")]
+out, lines = run(a)
+check("nokv  no --max-kv-size, nothing read or said", out == a and lines == [])
+out, _ = run(argv("Qwen/Qwen2.5-32B-Instruct"), {"K3SM_MODEL_CONFIG_DIR": Q32})
+check("configdir  K3SM_MODEL_CONFIG_DIR is read instead of the model reference", parse(out)[1] == 19660)
+
+calls = []
+hub = types.ModuleType("huggingface_hub")
+def snapshot_download(repo, **kw):
+    calls.append((repo, kw))
+    return Q32
+hub.snapshot_download = snapshot_download
+sys.modules["huggingface_hub"] = hub
+out, _ = run(argv("Qwen/Qwen2.5-32B-Instruct"))
+check("hub  a Hub reference fetches only config.json with snapshot_download, into the default cache",
+      calls == [("Qwen/Qwen2.5-32B-Instruct", {"allow_patterns": ["config.json"]})] and parse(out)[1] == 19660)
+def unreachable(repo, **kw):
+    raise OSError("offline")
+hub.snapshot_download = unreachable
+a = argv("Qwen/Qwen2.5-32B-Instruct")
+out, lines = run(a)
+check("hub.down  a Hub fetch that fails leaves W alone, with one line", out == a and len(lines) == 1)
+
+seen = []
+cli = types.ModuleType("vllm_mlx.cli")
+cli.main = lambda: seen.append(list(sys.argv))
+pkg = types.ModuleType("vllm_mlx")
+pkg.cli = cli
+sys.modules["vllm_mlx"], sys.modules["vllm_mlx.cli"] = pkg, cli
+ks.engine_serve_args = parse
+ks.install_on_engine = lambda: None
+os.environ.pop("K3SM_KV_GEOMETRY_CLAMP", None)
+os.environ.pop("K3SM_KV_BYTES_PER_TOKEN", None)
+os.environ.pop("K3SM_MODEL_CONFIG_DIR", None)
+rc = ks.main(argv(Q32))
+check("main  serve hands the engine the clamped argv", rc == 0 and len(seen) == 1 and parse(seen[0][1:])[1] == 19660)
+PY
+KV_CHECKS=0
+kv_out="$(PYTHONDONTWRITEBYTECODE=1 python3 "$WORK/kv-driver.py" "$HERE" "$WORK/kv" 2>"$WORK/kv-driver.err")"
+while read -r verdict name; do
+	[ -n "$verdict" ] || continue
+	KV_CHECKS=$((KV_CHECKS + 1))
+	case "$verdict" in
+		ok) ladder ok "8k.$name" ;;
+		no) ladder no "8k.$name" ;;
+		*)  ladder no "8k.driver  $verdict $name" ;;
+	esac
+done <<< "$kv_out"
+if [ "$KV_CHECKS" -ge 19 ]; then
+	ladder ok "8k.count  all $KV_CHECKS clamp checks reported"
+else
+	ladder no "8k.count  only $KV_CHECKS of 19 clamp checks reported (the driver crashed?)"
+	head -20 "$WORK/kv-driver.err"
 fi
 
 # ---- 9 — the guard on the REAL engine (needs a staged tree) -----------------
@@ -742,6 +930,7 @@ class Engine(BatchedEngine):
         self._model_name, self._loaded, self._engine, self._mllm_scheduler = "fake", True, Core(), None
 
 engine = Engine(64)
+server._engine = engine
 async def acquire(raw_request, **kw):
     return engine
 async def release(raw_request):
@@ -760,6 +949,16 @@ def check(name, r, want, text=None):
     ok = r.status_code == want and (text is None or text in r.text)
     print(("ok " if ok else "no ") + "%s (HTTP %d)" % (name, r.status_code), flush=True)
 
+def refused_unstreamed(name, r):
+    # A refusal is the JSON error object and nothing else: no SSE event was
+    # written before it, and the engine never ran.
+    ok = (r.status_code == 400 and r.headers.get("content-type", "").startswith("application/json")
+          and r.json().get("error", {}).get("type") == "BadRequestError"
+          and "maximum context length is 64 tokens" in r.json()["error"]["message"]
+          and "event:" not in r.text and "data:" not in r.text and RAN == [])
+    print(("ok " if ok else "no ") + "%s (HTTP %d, %s)" % (name, r.status_code, r.headers.get("content-type")),
+          flush=True)
+
 chat = lambda t: [{"role": "user", "content": t}]
 for stream in (False, True):
     tag = "stream" if stream else "plain"
@@ -772,10 +971,24 @@ for stream in (False, True):
           post("/v1/completions", prompt=long, max_tokens=8, stream=stream), 400, '"type":"BadRequestError"')
     check("real.cmpl.fit.%s  /v1/completions inside the window answers 200" % tag,
           post("/v1/completions", prompt=short, max_tokens=8, stream=stream), 200)
+for stream in (False, True):
+    tag = "stream" if stream else "plain"
+    RAN.clear()
+    refused_unstreamed("real.msgs.over.%s  /v1/messages over the window answers 400 before any SSE byte" % tag,
+                       post("/v1/messages", messages=chat(long), max_tokens=8, stream=stream))
+    check("real.msgs.fit.%s  /v1/messages inside the window answers 200" % tag,
+          post("/v1/messages", messages=chat(short), max_tokens=8, stream=stream), 200)
+    RAN.clear()
+    refused_unstreamed("real.resp.over.%s  /v1/responses over the window answers 400 before any SSE byte" % tag,
+                       post("/v1/responses", input=long, max_output_tokens=8, stream=stream))
+    check("real.resp.fit.%s  /v1/responses inside the window answers 200" % tag,
+          post("/v1/responses", input=short, max_output_tokens=8, stream=stream), 200)
 RAN.clear()
 post("/v1/chat/completions", messages=chat(short))
 post("/v1/completions", prompt=short)
-print(("ok " if RAN == [52, 54] else "no ") + "real.default  an omitted max_tokens runs as the rest of the window %r" % RAN)
+post("/v1/responses", input=short)
+print(("ok " if RAN[:2] == [52, 54] and len(RAN) == 3 and 0 < RAN[2] < 64 else "no ")
+      + "real.default  an omitted max_tokens runs as the rest of the window %r" % RAN)
 PY
 	REAL_CHECKS=0
 	real_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/serve-real.py" "$HERE" 2>"$WORK/serve-real.err")"
@@ -788,14 +1001,135 @@ PY
 			*)  ladder no "9.driver  $verdict $name" ;;
 		esac
 	done <<< "$real_out"
-	if [ "$REAL_CHECKS" -ge 9 ]; then
+	if [ "$REAL_CHECKS" -ge 17 ]; then
 		ladder ok "9.count  all $REAL_CHECKS real-engine checks reported"
 	else
-		ladder no "9.count  only $REAL_CHECKS of 9 real-engine checks reported (the driver crashed?)"
+		ladder no "9.count  only $REAL_CHECKS of 17 real-engine checks reported (the driver crashed?)"
 		tail -20 "$WORK/serve-real.err"
 	fi
 else
 	ladder skip "9.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+fi
+
+# ---- 9s — the attention-sink mask on the REAL mlx-lm cache (staged tree) ----
+# mlx-lm 0.32.0's RotatingKVCache keeps its first `keep` tokens as attention
+# sinks, but its prefill mask is a plain sliding window: once the cache has
+# trimmed, every query row masks the sink columns out (the upstream defect,
+# shown red here first). k3sm_serve patches make_mask; this rung drives the
+# pinned mlx-lm's own cache through a chunked prefill past its window and
+# checks, row by row, that each query sees the sinks plus exactly the
+# max_size - keep most recent tokens, which is what a decode step sees.
+if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
+	cat > "$WORK/sink-real.py" <<'PY'
+import sys, types
+sys.path.insert(0, sys.argv[1])
+import mlx.core as mx
+from mlx_lm.models.cache import RotatingKVCache, make_prompt_cache
+import k3sm_serve as ks
+
+W, KEEP = 16, 4
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+def rows_seen(size, keep, history, step, n, window=None, return_array=False):
+    """Prefill `history` ids in chunks of `step`, then n more; the ids each new row sees."""
+    cache = RotatingKVCache(max_size=size, keep=keep)
+    for start in range(0, history, step):
+        kv = mx.arange(start, min(start + step, history)).reshape(1, 1, -1, 1)
+        cache.update_and_fetch(kv, kv)
+    mask = cache.make_mask(n, window, return_array)
+    kv = mx.arange(history, history + n).reshape(1, 1, n, 1)
+    keys, _ = cache.update_and_fetch(kv, kv)
+    ids = keys[0, 0, :, 0].tolist()
+    rows = None if isinstance(mask, str) else mask.tolist()
+    seen = []
+    for row in range(n):
+        end = history + row + 1
+        seen.append(sorted(t for col, t in enumerate(ids) if (t < end if rows is None else rows[row][col])))
+    return seen, rows
+
+def decode_view(size, keep, end):
+    return list(range(min(keep, end))) + list(range(max(keep, end - (size - keep)), end))
+
+check("sink.target  make_prompt_cache(model, max_kv_size) builds RotatingKVCache with keep=4",
+      [c.keep for c in make_prompt_cache(types.SimpleNamespace(layers=[0]), max_kv_size=W)] == [KEEP])
+
+_, rows = rows_seen(W, KEEP, 40, 8, 8)
+check("sink.upstream  unpatched, a trimmed cache's prefill mask hides the sink columns (the defect is real)",
+      rows is not None and not all(all(r[:KEEP]) for r in rows))
+
+original = RotatingKVCache.make_mask
+classes = ks.rotating_cache_classes()
+ks.patch_rotating_kv_cache(classes, mx)
+check("sink.patched  RotatingKVCache.make_mask is replaced", RotatingKVCache.make_mask is not original)
+ks.patch_rotating_kv_cache(classes, mx)
+check("sink.idempotent  a second patch does not wrap the first",
+      RotatingKVCache.make_mask.__defaults__[-1] is original)
+
+seen, rows = rows_seen(W, KEEP, 40, 8, 8)
+check("sink.columns  after a trim, columns 0..3 are unmasked for every query row",
+      rows is not None and all(all(r[:KEEP]) for r in rows))
+check("sink.window  every row sees the sinks and the max_size - keep most recent tokens, as decode does",
+      all(seen[r] == decode_view(W, KEEP, 40 + r + 1) for r in range(8)))
+
+ok = True
+for size in (4, 8, 16):
+    for keep in sorted({1, min(4, size - 1), size - 1}):
+        for history in (0, size - 1, size, 2 * size + 3):
+            for step in (1, size + 1):
+                for n in (2, size + 2):
+                    for ra in (False, True):
+                        seen, _ = rows_seen(size, keep, history, step, n, None, ra)
+                        ok = ok and all(seen[r] == decode_view(size, keep, history + r + 1) for r in range(n))
+check("sink.sweep  the same holds across sizes, keeps, histories, chunk sizes and return_array", ok)
+
+same = True
+for keep, window in ((0, None), (0, 8), (KEEP, 8)):
+    for history in (0, 9, 40):
+        cache = RotatingKVCache(max_size=W, keep=keep)
+        for start in range(0, history, 8):
+            kv = mx.arange(start, min(start + 8, history)).reshape(1, 1, -1, 1)
+            cache.update_and_fetch(kv, kv)
+        a, b = cache.make_mask(6, window, True), original(cache, 6, window, True)
+        same = same and mx.array_equal(a, b).item()
+check("sink.unchanged  keep=0, or an explicit window other than the cache size, builds upstream's mask", same)
+
+try:
+    from mlx_vlm.models.cache import RotatingKVCache as VLM
+    check("sink.vlm  mlx-vlm's copy of RotatingKVCache is patched too",
+          VLM in classes and getattr(VLM.make_mask, ks.SINK_PATCHED, False))
+except ImportError:
+    check("sink.vlm  mlx-vlm is not installed; only mlx-lm's cache is patched", classes == [RotatingKVCache])
+
+class Moved:
+    def make_mask(self, N):
+        return None
+try:
+    ks.patch_rotating_kv_cache([Moved], mx)
+    check("sink.failclosed  a make_mask with another signature ends the process", False)
+except ks.GuardError:
+    check("sink.failclosed  a make_mask with another signature ends the process", True)
+PY
+	SINK_CHECKS=0
+	sink_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/sink-real.py" "$HERE" 2>"$WORK/sink-real.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		SINK_CHECKS=$((SINK_CHECKS + 1))
+		case "$verdict" in
+			ok) ladder ok "9s.$name" ;;
+			no) ladder no "9s.$name" ;;
+			*)  ladder no "9s.driver  $verdict $name" ;;
+		esac
+	done <<< "$sink_out"
+	if [ "$SINK_CHECKS" -ge 10 ]; then
+		ladder ok "9s.count  all $SINK_CHECKS sink-mask checks reported"
+	else
+		ladder no "9s.count  only $SINK_CHECKS of 10 sink-mask checks reported (the driver crashed?)"
+		tail -20 "$WORK/sink-real.err"
+	fi
+else
+	ladder skip "9s.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
 fi
 
 # ---- 10 — the stage Job (stage-job.sh render) --------------------------------
