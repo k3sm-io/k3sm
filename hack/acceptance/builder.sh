@@ -204,7 +204,7 @@ else
 	ladder no "builder.8g k3sm build consults the engine classification"
 fi
 
-# ---- builder.9 — the sink matrix (store by default, artifact on request) ---
+# ---- builder.9: the sink matrix (the registry by default, artifact on request) ---
 # Docker parity: `k3sm build -t app:dev .` is followed by naming app:dev in a
 # Pod, with nothing in between and no difference between the two build paths.
 # The store is faked at its seam, so the CI tier needs no runtimed.
