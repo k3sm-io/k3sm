@@ -113,8 +113,8 @@ func issue(spec authnv1.TokenRequestSpec) (*authnv1.TokenRequest, error) {
 // TestRegistryTokenPrintsBuilderToken pins `k3sm registry token`: one
 // TokenRequest for k3sm-registry/builder, audience k3sm-registry, for the
 // default hour or the asked --duration, and the token alone on stdout. A
-// lifetime the cluster clamps (above its maximum) or below the minimum is
-// refused, and no token is printed then.
+// lifetime the cluster clamps, below the 10m minimum or above the 24h maximum
+// is refused, and no token is printed then.
 func TestRegistryTokenPrintsBuilderToken(t *testing.T) {
 	t.Run("the default lifetime", func(t *testing.T) {
 		seen := fakeTokenAPI(t, issue)
@@ -155,19 +155,43 @@ func TestRegistryTokenPrintsBuilderToken(t *testing.T) {
 			t.Errorf("expirationSeconds = %d, want 1200", got)
 		}
 	})
-	t.Run("above the cluster's maximum is refused", func(t *testing.T) {
+	t.Run("a lifetime the cluster clamps is refused", func(t *testing.T) {
 		fakeTokenAPI(t, func(spec authnv1.TokenRequestSpec) (*authnv1.TokenRequest, error) {
 			return &authnv1.TokenRequest{Status: authnv1.TokenRequestStatus{
 				Token: fakeBuilderTokenToken, ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
 			}}, nil
 		})
 		var out bytes.Buffer
-		err := runRegistry([]string{"token", "--duration", "48h"}, &out, &bytes.Buffer{})
+		err := runRegistry([]string{"token", "--duration", "20h"}, &out, &bytes.Buffer{})
 		if !errors.Is(err, errBuilderTokenDuration) {
 			t.Fatalf("err = %v, want errBuilderTokenDuration", err)
 		}
 		if out.Len() != 0 || strings.Contains(err.Error(), fakeBuilderTokenToken) {
 			t.Errorf("a refused token reached the output: stdout %q, err %v", out.String(), err)
+		}
+	})
+	t.Run("exactly the 24h maximum is accepted", func(t *testing.T) {
+		seen := fakeTokenAPI(t, issue)
+		var out bytes.Buffer
+		if err := runRegistry([]string{"token", "--duration", "24h"}, &out, &bytes.Buffer{}); err != nil {
+			t.Fatalf("registry token: %v", err)
+		}
+		if len(*seen) != 1 || *(*seen)[0].spec.ExpirationSeconds != 86400 {
+			t.Fatalf("requests = %v, want one for 86400s", *seen)
+		}
+		if got := out.String(); got != fakeBuilderTokenToken+"\n" {
+			t.Errorf("stdout = %q, want the token and a newline", got)
+		}
+	})
+	t.Run("above the 24h maximum is refused before any request", func(t *testing.T) {
+		seen := fakeTokenAPI(t, issue)
+		var out bytes.Buffer
+		err := runRegistry([]string{"token", "--duration", "24h0m1s"}, &out, &bytes.Buffer{})
+		if !errors.Is(err, errBuilderTokenDuration) || len(*seen) != 0 {
+			t.Fatalf("err = %v, requests = %d; want errBuilderTokenDuration and none", err, len(*seen))
+		}
+		if out.Len() != 0 {
+			t.Errorf("stdout = %q, want nothing", out.String())
 		}
 	})
 	t.Run("below the minimum is refused before any request", func(t *testing.T) {
