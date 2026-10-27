@@ -15,7 +15,7 @@
 #     build refuses one that is not;
 #   * the build refuses to run at all without uv;
 #   * the build packages with `k3sm build --no-record --output`, so it needs no
-#     root and never touches the node's image store;
+#     root and never records into the cluster registry;
 #   * walk-verify goes RED on an invalid signature, on a mislabelled layer, on a
 #     blob that does not match its digest, and on a non-Mach-O entrypoint — and
 #     GREEN on the universal-binary shape that a whole-file signature check
@@ -141,8 +141,9 @@ else
 fi
 
 # The packaging step writes the layout only. Without --no-record, `k3sm build`
-# records into the node's image store through the runtime daemon's socket, which
-# an ordinary user cannot reach, so a non-root build would fail at packaging.
+# records the image in the cluster registry and warms this node's cache through
+# the runtime daemon's socket, which needs root, so a non-root build would fail at
+# packaging.
 # Every `k3sm build` invocation in build.sh must carry --no-record and --output.
 # shellcheck disable=SC2016 # the pattern is the literal text "$K3SM_BIN"
 calls="$(grep -F '"$K3SM_BIN" build ' "$BUILD")"

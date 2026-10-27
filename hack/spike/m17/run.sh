@@ -4,9 +4,9 @@
 # cable.
 #
 # Row in hack/acceptance/phases.json:
-#   M17.0  gate hack/spike/m17/run.sh, tier lab, requires two-macs + thunderbolt-cable,
-#          manual: true (a rig run, never greened by CI). The row stays skeleton: true
-#          until a rig run is recorded in the findings files; the scripts are real.
+#   The M17 spike row: gate hack/spike/m17/run.sh, tier lab, requires two-macs +
+#          thunderbolt-cable, manual: true (a rig run, never greened by CI). The row
+#          stays skeleton: true until a rig run is recorded in the findings files; the scripts are real.
 #
 # Usage:
 #   K3SM_LAB=1 K3SM_M17_SERVER=<ssh target> K3SM_M17_WORKER=<ssh target> \

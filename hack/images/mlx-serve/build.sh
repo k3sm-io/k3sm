@@ -35,7 +35,7 @@
 # Requires: macOS on Apple silicon, uv, python3, and a `k3sm` binary
 # (--stage-only needs only uv; --from-stage needs no uv). It needs no root: it
 # packages with `k3sm build --no-record`, which writes the OCI layout and never
-# touches this node's image store. It writes only under its work dir (and, with
+# records into the cluster registry or this node's cache. It writes only under its work dir (and, with
 # --stage-only, the --stage dir) and pushes nothing anywhere — see README.md for
 # the publish step.
 set -euo pipefail
@@ -77,7 +77,8 @@ SHARD_MODULE="k3sm_shard"
 # refused with HTTP 400 instead of served through a rotating cache.
 SERVE_MODULE="k3sm_serve"
 
-# The tag this script builds and pushes. A build output has no digest until it is built,
+# The tag this script builds under (the publish step, `k3sm image push`, is the
+# operator's; see README.md). A build output has no digest until it is built,
 # so it stays a tag here; consumers pin the digest the registry reports for it.
 DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1"
 

@@ -7,8 +7,9 @@
 # home of the ladder; hack/lab/m17.sh execs it.
 #
 # Row in hack/acceptance/phases.json:
-#   M17-lab  gate hack/lab/m17.sh, tier lab, requires two-macs + thunderbolt-cable,
-#            manual: true, skeleton: false
+#   M17-lab  gate hack/lab/m17-interconnect.sh, tier lab, requires two-macs +
+#            thunderbolt-cable, manual: true, skeleton: false (hack/lab/m17.sh is a
+#            shim that execs this file)
 #
 # Usage:
 #   hack/lab/m17-interconnect.sh --plan                 # the rung table; no host
@@ -1145,10 +1146,6 @@ runlog_missing_refuses() {
 	}
 }
 
-# st_driver <r3|r4> <profile> <want 0|1> — run the real r3 or r4 assertion with the
-# host and cluster helpers stubbed over fixture outputs (driver/<profile>/), so a
-# swapped argument between the rung glue and its predicates reds without a rig.
-# The stubs live only in the subshell.
 # st_driver_run <rung> <profile> — the body st_driver runs in a subshell: the
 # stubs below replace the host and cluster helpers there only.
 st_driver_run() {
@@ -1195,6 +1192,10 @@ st_driver_run() {
 	echo "DRIVER passes=$R_PASS fails=$R_FAIL"
 }
 
+# st_driver <r3|r4> <profile> <want 0|1> — run the real r3 or r4 assertion with the
+# host and cluster helpers stubbed over fixture outputs (driver/<profile>/), so a
+# swapped argument between the rung glue and its predicates reds without a rig.
+# The stubs live only in the subshell.
 st_driver() {
 	local rung="$1" prof="$2" want="$3" out rc=0
 	out="$(st_driver_run "$rung" "$prof")" || rc=$?

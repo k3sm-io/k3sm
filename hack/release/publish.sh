@@ -152,8 +152,9 @@
 # names the newest final release's image, never a candidate's. The name keeps
 # the tarball's darwin_arm64 platform suffix, so a downloaded file says what it
 # is and an image for another platform could sit beside it under its own name.
-# A final release without --disk-image is refused (image-required), so the
-# link never answers 404; a release candidate needs none.
+# A final --upload without --disk-image is refused (image-required), so the
+# link never answers 404; a release candidate needs none. The one-shot,
+# tarball-only run takes no image and does not apply this check.
 #
 # THE RELEASE INDEX (--upload --release-index, final releases from v0.3.0
 # only; operator ruling of 2026-10-23: the self-updater, the only reader of

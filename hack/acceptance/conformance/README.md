@@ -3,7 +3,7 @@
 The **reference-workload-driven** acceptance spec: assertions that exercise every Kubernetes feature class a
 representative reference workload needs, built from tiny native test binaries with **no dependency on any
 proprietary images**. It proves *feature-class coverage* (deterministic, CI-able) — **not** image-level
-compatibility (the amd64-Linux images are handled only by the `vm` path, proven by `hack/lab/m11.sh`).
+compatibility (Linux images are handled only by the `vm` path, which runs `linux/arm64` images, proven by `hack/lab/m11.sh`).
 
 ## How it wires in (no parallel gate family)
 

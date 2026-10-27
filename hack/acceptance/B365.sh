@@ -23,12 +23,8 @@ K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
 SELF="$HERE/B365.sh"
 DOC="$K3SM_ROOT/docs/user/troubleshooting.md"
 MULTINODE_DOC="$K3SM_ROOT/docs/user/multi-node.md"
-# The voice lint lives in the workspace control-center, one level above the
-# repo checkout in the ordinary layout -- but a lane checkout
-# The voice lint is a workspace-tier gate; this public repo's script must stand
-# alone (no workspace path may appear here). The rung runs only when the caller
-# names the lint through K3SM_VOICE_LINT; otherwise it SKIPs, and the workspace
-# ci (which owns the lint) still covers the file at publish.
+# The voice lint is not part of this repo. The rung runs only when the caller
+# names the lint through K3SM_VOICE_LINT; otherwise it SKIPs.
 VOICE_LINT="${K3SM_VOICE_LINT:-}"
 
 PASS=0; FAIL=0

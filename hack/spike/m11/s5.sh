@@ -19,7 +19,7 @@
 #   5 vmnet lease stability across restart under a deterministic MAC.
 #   6 WHAT SOURCE ADDRESS THE HOST OBSERVES for guest traffic — the deciding
 #     fact for per-pod attribution: a gateway rewrite makes per-pod attribution IMPOSSIBLE as
-#     specified, and per-pod attributiona's fail-closed becomes the permanent answer.
+#     specified, and the attribution design's fail-closed fallback becomes the permanent answer.
 #   7 guest link MTU.
 #
 # Runs on S1's harness plus a throwaway stock linux/arm64 minirootfs over
@@ -97,12 +97,13 @@ cat <<'EOF'
   With a host listener on both the VIP and the vmnet interface, record what
   source address guest traffic arrives with.
 
-    guest's own vmnet IP  => per-pod attribution is a straight map; per-pod attributionb is
-                             tractable and the lease->pod registry is buildable.
+    guest's own vmnet IP  => per-pod attribution is a straight map; the lease-based
+                             attribution is tractable and the lease->pod registry
+                             is buildable.
     rewritten to the NAT  => per-pod attribution is IMPOSSIBLE as specified.
-    gateway address          per-pod attributiona's fail-closed becomes the PERMANENT answer,
-                             and that must be said plainly in limitations.md
-                             rather than left as a "future work" line.
+    gateway address          the attribution design's fail-closed fallback becomes
+                             the PERMANENT answer, and that must be said plainly in
+                             limitations.md rather than left as a "future work" line.
 
   This criterion is the one most likely to be skipped as an implementation
   detail. It is not: it decides whether a NetworkPolicy can ever mean anything

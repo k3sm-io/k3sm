@@ -11,8 +11,9 @@
 # What it answers, in order:
 #   s1.1  the toolchain is PINNED, not defaulted — the Rust toolchain and maturin
 #         versions are recorded here because a compiled PyO3 extension's behaviour
-#         depends on the compiler, not only on the source, and the image build
-# asserts these same two pins before it stages anything.
+#         depends on the compiler, not only on the source, and the planned
+#         mlx-worker image build is to assert these same two pins before it
+#         stages anything.
 #   s1.2  the build completes, and the RESOLVED COMMIT is recorded. That sha is the
 #         pin we promote to the first tag containing it; nothing in this
 #         repo hard-codes a commit it has not built.

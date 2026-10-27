@@ -17,11 +17,7 @@
 #
 # The conformance-profile.md citation in limitations.md IS a relative link
 # (../conformance-profile.md, resolved and asserted by check 2 above, since
-# that file lives in-repo at k3sm/docs/): the maintainer-facing full-surface
-# UPSTREAM-ALIGNMENT.md register it is backed by lives at the WORKSPACE-root
-# docs/ dir, OUTSIDE the k3sm repo, and is deliberately not linked or named
-# from a public page (removed by the public-repo scrub, k3sm#54) — it would
-# dangle in a standalone checkout / on the published site.
+# that file lives in-repo at k3sm/docs/).
 #
 # Exit 0 iff every check passes. Mirrors hack/acceptance/m1.sh conventions.
 #
@@ -122,9 +118,7 @@ if [ -f "$LIM" ]; then
 		fi
 	done
 	# citation-presence (the conformance CRITICAL): the public self-assessment
-	# register (conformance-profile.md) is named. The internal, workspace-root
-	# UPSTREAM-ALIGNMENT.md register was removed from limitations.md by the
-	# public-repo scrub (k3sm#54) and is no longer checked for here.
+	# register (conformance-profile.md) is named.
 	if grep -iq "conformance-profile" "$LIM"; then
 		ladder ok "docs.3  limitations cites conformance-profile register"
 	else

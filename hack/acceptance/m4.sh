@@ -11,7 +11,7 @@
 #     signing CA on disk (it SKIPS single-node here — covered by hack/lab/m3.sh).
 #
 # This is the RBAC/conformance INTEGRATION slice, split out from the packaging /
-# launchd lab gate (hack/lab/m4.sh, the M4-lab row in phases.json) so the live
+# launchd lab gate (hack/lab/m7.sh, the M4-lab row in phases.json) so the live
 # authz assertion has a CI-runnable home rather than riding the two-Mac lab. It
 # needs NO root: TestM4_RBACEnforced is SelfSubjectAccessReviews + a token mint +
 # API calls, no pods/datapath. The full verdict (incl. the system:node leg)

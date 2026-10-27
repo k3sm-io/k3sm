@@ -634,8 +634,8 @@ server_up() {
 #
 # It exists because the multi-node claim had no unattended harness at all: every
 # join proof was a two-Mac K3SM_LAB session, so anything a joined worker derives
-# INDEPENDENTLY of its server — the guest-artifact verdict this was added for
-#, the capability labels, the per-node datapath — had no way to be checked
+# INDEPENDENTLY of its server — the guest-artifact verdict this was added for,
+# the capability labels, the per-node datapath — had no way to be checked
 # by a gate. One host cannot prove the mesh (there is no second machine to route
 # between), but it can prove per-node DERIVATION, which is a different property
 # and the one most likely to drift silently.

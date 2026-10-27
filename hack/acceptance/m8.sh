@@ -28,7 +28,7 @@
 #                     completion below posts. The engine registers whatever it
 #                     decided to call the served snapshot (often a resolved
 #                     on-disk PATH, not examples/mlxmodel.yaml's repo id), so
-#                     posting the spec's repo id 404s a Ready pod (lab D10).
+#                     posting the spec's repo id 404s a Ready pod.
 #                     m8.0-b's pin check is untouched: it pins the SPEC, not
 #                     the served name.
 #   m8.6  completion— one OpenAI chat completion through the ClusterIP returns
@@ -258,7 +258,7 @@ if [ "${1:-}" = "--plan" ] || [ "${1:-}" = "--dry-run" ]; then
 	echo "  m8.5  endpoint    ClusterIP allocated; status.endpoint published"
 	echo "  m8.5-c served id  GET /v1/models (singular) — the id every completion posts"
 	echo "  m8.6  completion  POST /v1/chat/completions via the ClusterIP returns tokens"
-	echo "  m8.7  concurrent  $CONCURRENCY simultaneous completions ALL succeed (S5-binding)"
+	echo "  m8.7  concurrent  $CONCURRENCY simultaneous completions ALL succeed (see hack/spike/m8/findings-s5.md)"
 	echo "  m8.8  latency     TTFT + tokens/sec, ClusterIP vs direct pod (recorded)"
 	echo "  m8.9  deletion    every operator-owned object absent; PVC deleted; PV retained"
 	echo
@@ -473,7 +473,7 @@ VIP="$CLUSTER_IP:$SERVING_PORT"
 #
 # The engine registers whatever it decided to call the served snapshot — often
 # a resolved on-disk PATH, not examples/mlxmodel.yaml's repo id — so a
-# completion posted against MODEL_REPO 404s a Ready pod (lab D10). Ask the
+# completion posted against MODEL_REPO 404s a Ready pod. Ask the
 # serving surface directly, require EXACTLY one model listed (a plural listing
 # would make "the" served id ambiguous), and use THAT id for every completion
 # below. m8.0-b's pin check is a different assertion (the SPEC matches the
@@ -552,7 +552,7 @@ fi
 rm -f "$body"
 
 # --------------------------------------------------------------------------------
-# m8.7 THE CONCURRENCY RUNG (S5-binding). See the header.
+# m8.7 THE CONCURRENCY RUNG (see hack/spike/m8/findings-s5.md). See the header.
 # --------------------------------------------------------------------------------
 cdir="$(mktemp -d)"
 pids=""

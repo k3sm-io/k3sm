@@ -12,7 +12,7 @@
 #       delivered.
 #   (5) The reply comes from that lo0-alias address.
 #   (6) A TCP dial sourced from a reserved-half address works, as the _k3sm user.
-#   (7) TSO/LRO are off on the cable port after `-tso -lro` (build amendment A3).
+#   (7) TSO/LRO are off on the cable port after `-tso -lro` (the direct-link build disables both).
 #   (8) configd leaves the alias alone for the length of the rung.
 #   (9) The pod-source question recorded here: nothing on the wire checks that a pod-range source
 #       arriving on enX is that peer's pod (a dial from a pod-range address is

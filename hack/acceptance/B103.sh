@@ -63,8 +63,7 @@ GOFLAGS_ENV=(env GOARCH=arm64 CGO_ENABLED=1)
 #
 # Asserts the leg actually RAN its subtests. `go test -run <filter>` with a
 # ZERO-MATCH filter EXITS 0 — so a typo'd or renamed test name would read as PASS
-# forever (and hack/go-selftest.sh's stale-gate-name check does not apply to script
-# gates). Each leg therefore fails unless (a) "no tests to run" / "no test files" are
+# forever (a stale name in a script gate is not caught by any name check). Each leg therefore fails unless (a) "no tests to run" / "no test files" are
 # ABSENT from the -v output and (b) the count of `--- PASS: <TestName>/` subtest lines
 # meets the pinned per-leg minimum.
 run_test() {
@@ -96,12 +95,8 @@ else
 fi
 
 # ---- b103.0b — pure-Go stub parity ------------------------------------------
-# SCOPED to those same two packages ON PURPOSE: `CGO_ENABLED=0 go build ./...` is
-# ALREADY RED at runtimed's main for an UNRELATED pre-existing defect
-# (cmd/k3sm-execshim/main.go:128:57 — a supervisor.LaunchSpec/Credential mismatch), so
-# a whole-module pure-Go leg here would report a failure neither caused nor can
-# fix. Do NOT "fix" this scope by widening it to ./... — widen it only once that
-# defect is repaired.
+# SCOPED to those same two packages: they are the ones the Rosetta probe lives in, and
+# the stub-parity question is about them, not about the whole module.
 if (cd "$RUNTIMED_ROOT" && CGO_ENABLED=0 go build ./pkg/sandbox/ ./pkg/runtime/); then
 	ladder ok "b103.0b runtimed pkg/sandbox + pkg/runtime build CGO_ENABLED=0 (pure-Go stub parity)"
 else
