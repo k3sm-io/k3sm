@@ -19,7 +19,7 @@ version you want), put the variable after
 the pipe so it reaches `sh`:
 
 ```sh
-curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.2.0 sh
+curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=v0.2.1 sh
 ```
 
 Set `K3SM_INSTALL_DOWNLOAD_ONLY=1` the same way to download and verify into the current directory
