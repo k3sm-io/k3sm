@@ -302,7 +302,13 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 	// spec whose memory cannot fund a serving context has no StatefulSet worth
 	// applying, and the alternative — rendering an unpinned engine — is the
 	// mid-generation SIGKILL DeriveSizing exists to prevent.
-	sizing, err := DeriveSizing(m.Spec.Memory)
+	//
+	// The geometry is unknown here, so the pins use the fallback constant: the
+	// weights are downloaded by the engine inside the pod, into its cache
+	// volume, after this render, and the controller that calls it has no view
+	// of that volume. A geometry read with ReadKVGeometry needs a snapshot
+	// staged where the renderer can read it, which no path does yet.
+	sizing, err := DeriveSizing(m.Spec.Memory, KVGeometry{})
 	if err != nil {
 		return nil, renderErr(m, err)
 	}

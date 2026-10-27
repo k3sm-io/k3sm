@@ -104,7 +104,8 @@ const (
 // Every constant below carries the measurement it comes from — a number here
 // without a basis is a guess that becomes a SIGKILL on someone's node.
 const (
-	// kvBytesPerToken is the KV-cache growth per generated token, per sequence.
+	// kvBytesPerToken is the FALLBACK KV-cache growth per generated token, per
+	// sequence: the figure DeriveSizing uses when it is given no KVGeometry.
 	//
 	// S3 (hack/spike/m8/findings-s3.md §2) measured a 3B-4bit model growing
 	// 1960.6 MB -> ~2132 MB over 1200 tokens = ~0.145 MB/token, linear. This
@@ -112,11 +113,16 @@ const (
 	// context.
 	//
 	// RESIDUAL, stated rather than hidden: KV geometry scales with the model's
-	// layer count, head count and head dimension, and the spec carries no
-	// per-model geometry — so this constant is calibrated for the 3B-4bit class
-	// and is generous for a smaller model and optimistic for a much larger one.
-	// A per-model geometry input (a spec field, or a fact read from the model's
-	// config at load) is the seam that would fix it; until then the sampler's
+	// layer count, KV head count and head dimension, so this constant is
+	// calibrated for the 3B-4bit class. It is generous for a smaller model and
+	// optimistic for a much larger one: a 64-layer 32B model grows 262144
+	// bytes/token at fp16, two thirds more than this. The seam that fixes it
+	// exists: ReadKVGeometry reads the geometry from a staged snapshot's
+	// config.json, and DeriveSizing then sizes from KVGeometry.BytesPerToken
+	// (which S3's own samples agree with for its model, to within the 256-token
+	// allocation step). The constant remains for a model not yet on disk, which
+	// is every model at render time today: the engine downloads the weights
+	// inside the pod, after the pins are rendered. For those the sampler's
 	// N-consecutive-sample OOM kill remains the backstop, which is exactly the
 	// posture S3 §4 leaves k3sm in.
 	kvBytesPerToken = 157_286
@@ -202,22 +208,30 @@ type Sizing struct {
 	// MaxSequences is the concurrent-sequence ceiling, rendered as
 	// --max-num-seqs.
 	MaxSequences int64
+	// KVBytesPerToken is the per-token, per-sequence KV growth the pins were
+	// derived from: the model's geometry when it was known, the fallback
+	// constant otherwise.
+	KVBytesPerToken int64
 	// KVCacheBytes is what those two cost at full occupancy —
-	// MaxSequences * MaxContextTokens * kvBytesPerToken. It is the number the
+	// MaxSequences * MaxContextTokens * KVBytesPerToken. It is the number the
 	// formula actually bounds, carried so a caller (a status condition, a
 	// validation report) can show the operator where their memory went.
 	KVCacheBytes int64
 }
 
 // DeriveSizing derives the engine's context and concurrency pins from the
-// unified memory an MLXModel asks for. It is pure: same quantity in, same
-// Sizing out, no IO and no clock.
+// unified memory an MLXModel asks for and, when known, the model's KV
+// geometry. It is pure: same inputs, same Sizing out, no IO and no clock.
+//
+// geo is optional: the zero KVGeometry (or any geometry that is not Known)
+// sizes from the measured fallback constant kvBytesPerToken; a known one sizes
+// from geo.BytesPerToken, the model's fp16 upper bound.
 //
 // The derivation is the sizing formula solved for its one growing term:
 //
 //	usable   = memory - compile/scratch - headroom
 //	kvBudget = usable * kvSharePercent     (the rest is weights)
-//	context  = kvBudget / maxSequences / kvBytesPerToken, capped and rounded down
+//	context  = kvBudget / maxSequences / bytesPerToken, capped and rounded down
 //
 // It is MONOTONE by construction — every step is multiplication by a positive
 // constant, subtraction of a constant, or integer division, so more memory never
@@ -229,7 +243,7 @@ type Sizing struct {
 // rather than a tiny context, because a 128-token pin serves nothing and hides
 // the real problem (the pod is too small for the weights) behind a symptom that
 // looks like a truncation bug.
-func DeriveSizing(memory resource.Quantity) (Sizing, error) {
+func DeriveSizing(memory resource.Quantity, geo KVGeometry) (Sizing, error) {
 	total := memory.Value()
 	if total <= 0 {
 		return Sizing{}, ErrNoMemory
@@ -241,7 +255,12 @@ func DeriveSizing(memory resource.Quantity) (Sizing, error) {
 		kvBudget = usable * kvSharePercent / 100
 	}
 
-	context := kvBudget / defaultMaxSequences / kvBytesPerToken
+	bytesPerToken := int64(kvBytesPerToken)
+	if geo.Known() {
+		bytesPerToken = geo.BytesPerToken()
+	}
+
+	context := kvBudget / defaultMaxSequences / bytesPerToken
 	if context > maxContextTokens {
 		context = maxContextTokens
 	}
@@ -255,7 +274,8 @@ func DeriveSizing(memory resource.Quantity) (Sizing, error) {
 	return Sizing{
 		MaxContextTokens: context,
 		MaxSequences:     defaultMaxSequences,
-		KVCacheBytes:     context * defaultMaxSequences * kvBytesPerToken,
+		KVBytesPerToken:  bytesPerToken,
+		KVCacheBytes:     context * defaultMaxSequences * bytesPerToken,
 	}, nil
 }
 
@@ -302,7 +322,9 @@ func PerRankMemory(memory resource.Quantity, ranks int32) (resource.Quantity, er
 		perRank += perRankRoundingBytes - rem
 	}
 	q := *resource.NewQuantity(perRank, resource.BinarySI)
-	if _, err := DeriveSizing(q); err != nil {
+	// The floor check uses the fallback constant: a sharded model's snapshot is
+	// no more on disk at placement time than a single-node one's.
+	if _, err := DeriveSizing(q, KVGeometry{}); err != nil {
 		return resource.Quantity{}, fmt.Errorf("per-rank share of %s across %d ranks: %w", memory.String(), ranks, err)
 	}
 	return q, nil

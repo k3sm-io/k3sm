@@ -52,6 +52,14 @@ is both the scheduling constraint and the budget the serving engine's context wi
 More memory buys a longer context; too little is rejected up front with a reason, rather than failing
 later on the node.
 
+The context is pinned with the engine's `--max-kv-size`: a quarter of `memory`, after a fixed runtime
+allowance and 6% headroom, is set aside for the KV cache of four concurrent sequences, and divided by
+what one token costs. The weights are downloaded inside the pod after that pin is set, so the cost per
+token is a fixed estimate of about 0.15 MiB, measured on a 3B model. Larger models cost more: a
+64-layer 32B model with 8 KV heads of dimension 128 grows 2 x 2 bytes x 64 x 8 x 128 = 256 KiB per
+token at fp16. For a large model, raise `memory` or set a lower `--max-kv-size` in `runtime.args`,
+which is applied after the derived pin.
+
 Pin `revision` to an exact model revision. Leaving it empty means the repository's default branch, which
 moves, and two replicas started weeks apart would then serve different weights under one object.
 
