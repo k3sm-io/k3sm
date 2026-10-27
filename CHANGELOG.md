@@ -86,6 +86,9 @@ pin, its date, and the tarball's sha256.
 
 ### Security
 
+- **`k3sm registry token` caps `--duration` at 24 hours.** The cluster sets no service-account
+  token maximum, so the command enforces the ceiling itself beside the 10 minute floor, and a
+  longer lifetime is refused before any token is requested.
 - **The release binaries are built with Go 1.27.3**, which distrusts the compromised intermediate certificates that earlier toolchains kept trusting in `crypto/x509` (GO-2026-6809).
 - **Each node's datapath runs as its own identity.** The Service proxy, the cluster DNS resolver and the NetworkPolicy watcher authenticate as `k3sm:netserve:<node>` in the `k3sm:netservers` group, which the `k3sm:netserve` ClusterRole lets get, list and watch Services, EndpointSlices, Namespaces, NetworkPolicies and Pods and nothing else, instead of as the node or, on the server, as the admin. It can read every Pod spec in the cluster, never a Secret or ConfigMap value, and has no write, log or exec access. An agent receives the certificate at join; one already joined fetches it from the server at start with its node certificate, and a running node renews it in place before it expires. As in k3s, an issued certificate is cut off only by rotating the cluster CA. See [multi-node](https://k3sm.io/docs/multi-node/).
 - **The kubelet API binds the node's own address only**, not every interface, so port 10250 is no longer reachable from the LAN. A joined agent under `--network none` holds no mesh address and now refuses to start.
