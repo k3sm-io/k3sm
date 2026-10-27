@@ -87,9 +87,10 @@ const drainGrace = 5 * time.Second
 // reapers.Wait that follows it.
 //
 // It is exported because it is NOT only this package's business: it is one stage
-// of the single ExitTimeOut launchd gives the daemon, and pkg/install derives that
-// number from this symbol rather than from a literal that would drift the moment
-// drainGrace or the component count changed.
+// of the single ExitTimeOut launchd gives the daemon, and pkg/install's teardown
+// table carries it as a literal that TestExitTimeOutCoversTheDaemonTeardown checks
+// against this symbol, so a change to drainGrace or the component count reds that
+// test instead of drifting.
 //
 // It is a budget Stop KEEPS: every wait in the teardown selects on the caller's
 // context, so a daemon that calls Stop under this bound gets it back at the
@@ -226,7 +227,8 @@ func (c *component) exitedNow() bool {
 // Concurrency: mu guards comps, started, and token — every read and write of
 // those three fields is under mu, including the token reads on the
 // RESTConfigToken/Ready paths a caller may drive concurrently with Start. The
-// components run until Stop, which tears them down in reverse dependency order.
+// components run until Stop, which stops them in shutdownOrder: the apiserver first,
+// then the scheduler and controller-manager, and the datastore (kine or etcd) last.
 // mu is never held across provision/bringUp, so a Ready poll is never blocked by
 // a boot in progress. No Context is stored.
 type Supervised struct {
@@ -240,7 +242,7 @@ type Supervised struct {
 	probeDial func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	mu      sync.Mutex
-	comps   []*component // in start order; Stop walks it in reverse
+	comps   []*component // in start order; Stop stops them in shutdownOrder
 	started bool
 	// supervising is the BACKSTOP for the per-component flags: component.supervised
 	// is the real gate, marked at each child's own readiness gate, and this is
@@ -582,8 +584,8 @@ func (s *Supervised) provision(ctx context.Context) error {
 // authenticate with — each its own system: identity instead of the shared system:masters
 // admin token (the k3s model; no shared component identity). The certs
 // are signed by the signing CA (= --client-ca-file). EnsureHierarchy is idempotent — it
-// loads an existing hierarchy (the mesh path in cmd/k3sm/server.go creates it before
-// Start), so single-node mints a fresh hierarchy and both paths re-issue the component
+// loads an existing hierarchy (the mesh path, provisionMeshPKI in
+// cmd/k3sm/serverprovision.go, creates it before Start), so single-node mints a fresh hierarchy and both paths re-issue the component
 // kubeconfigs against the same CA on every boot. It runs in provision() (before bringUp
 // starts the scheduler/KCM) so the kubeconfigs and the client-CA exist when those
 // components — and the apiserver — start.
@@ -623,20 +625,6 @@ func (s *Supervised) provisionComponentCerts() error {
 // bind within a second or are never going to.
 const componentReadyTimeout = 30 * time.Second
 
-// bringUp starts the components in order and waits for the apiserver to be
-// healthy before starting scheduler + controller-manager. Each bring-up wait
-// selects on child-exit as well as readiness (fail fast): a kine or
-// apiserver that dies on a bad flag/config surfaces immediately — with its log
-// tail — instead of wedging opaquely until the healthz timeout.
-//
-// The scheduler and the controller-manager get that same wait, and they need it
-// for a reason the earlier components did not have: they were previously started
-// fire-and-forget, so a component that died on its own secure-port bind left
-// bring-up reporting success and the failure surfaced far downstream as something
-// else entirely — a control plane with no service-account controller fails at the
-// first namespace bootstrap, which reads as a bootstrap defect and not as a dead
-// KCM. Waiting on the listener each one owns puts the error back where the fault
-// is, with that component's name and log tail.
 // markSupervised promotes one component from "coming up" to "supervised": from
 // here its own death is a crash for OnComponentExit to report, not a bring-up
 // failure awaitHealthy is already reporting.
@@ -683,6 +671,20 @@ func (s *Supervised) markSupervised(c *component) error {
 		c.name, c.waitErr, c.logPath, RedactedLogTail(c.logPath)))
 }
 
+// bringUp starts the components in order and waits for the apiserver to be
+// healthy before starting scheduler + controller-manager. Each bring-up wait
+// selects on child-exit as well as readiness (fail fast): a kine or
+// apiserver that dies on a bad flag/config surfaces immediately — with its log
+// tail — instead of wedging opaquely until the healthz timeout.
+//
+// The scheduler and the controller-manager get that same wait, and they need it
+// for a reason the earlier components did not have: they were previously started
+// fire-and-forget, so a component that died on its own secure-port bind left
+// bring-up reporting success and the failure surfaced far downstream as something
+// else entirely — a control plane with no service-account controller fails at the
+// first namespace bootstrap, which reads as a bootstrap defect and not as a dead
+// KCM. Waiting on the listener each one owns puts the error back where the fault
+// is, with that component's name and log tail.
 func (s *Supervised) bringUp(ctx context.Context) error {
 	if s.cfg.Etcd != nil {
 		if err := s.bringUpEtcdMember(ctx); err != nil {
@@ -1404,14 +1406,14 @@ func (s *Supervised) probeClient() (*http.Client, error) {
 // posture the next server start stops it (ReapOrphanedControlPlane).
 var ErrStopBudgetExceeded = errors.New("control-plane teardown exceeded its budget")
 
-// Stop tears the control plane down in reverse dependency order: the components
-// were appended in start order (kine, apiserver, scheduler, controller-manager),
-// so walking the slice in reverse stops the apiserver and the controllers first
-// and kine last, after which the SQLite DB is no longer in use. Idempotent.
+// Stop tears the control plane down in shutdownOrder: the components were appended
+// in start order (kine, apiserver, scheduler, controller-manager), and Stop stops
+// the apiserver first, then the scheduler and controller-manager, and the datastore
+// (kine or etcd) last, after which the SQLite DB is no longer in use. Idempotent.
 //
 // It HONOURS ctx, and that is the whole of its contract. The daemon calls it under
-// context.WithTimeout(…, StopBound) and pkg/install derives the plist's
-// ExitTimeOut from that same symbol — but Stop used to ignore the context
+// context.WithTimeout(…, StopBound), and pkg/install's ExitTimeOut budgets that
+// same bound (its literal is test-checked against StopBound), but Stop used to ignore the context
 // entirely, waiting on a component's exited channel without a bound once the
 // SIGKILL was out. A child that would not die, or a reaper that never observed the
 // death, therefore parked the teardown forever, launchd answered the blown
@@ -1448,8 +1450,8 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	s.stopEtcdSnapshotSchedule(ctx)
 	s.stopEtcdWatcher(ctx)
 
-	// Reverse start order = correct shutdown order, but the datastore (index 0) must
-	// die last. Build the explicit order: apiserver, scheduler, controller-manager,
+	// Start order with the datastore moved last = correct shutdown order
+	// (shutdownOrder): apiserver, scheduler, controller-manager,
 	// then kine or etcd.
 	var alive []string
 	var unreaped []*component

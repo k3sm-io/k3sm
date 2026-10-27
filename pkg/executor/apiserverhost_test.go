@@ -57,7 +57,7 @@ type bindHostCase struct {
 
 // bindHostCases are the postures shared by every leg below.
 //
-// The mesh rows are the defect (lab D1): cmd/k3sm/server.go sets BindAddress to the
+// The mesh rows are the defect: cmd/k3sm/server.go sets BindAddress to the
 // wireguard mesh IP and the apiserver then binds THAT interface only, so a probe or
 // a kubeconfig hardcoded to loopback dials an address nothing is listening on and
 // bring-up wedges at the healthz wait. The loopback rows are the compatibility
@@ -129,7 +129,7 @@ func TestAPIServerHostChain(t *testing.T) {
 	}
 }
 
-// TestAPIServerClientsFollowEffectiveBind is the (lab D1) contract: the URL the
+// TestAPIServerClientsFollowEffectiveBind is the contract: the URL the
 // in-process clients dial tracks the address the apiserver ACTUALLY BINDS, which is
 // the same self-defaulting chain apiServerArgs renders --bind-address from
 // (BindAddress -> NodeIP -> loopback).

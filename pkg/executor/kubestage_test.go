@@ -370,8 +370,9 @@ func TestEnsureControlPlaneBinariesReportsStagedVersion(t *testing.T) {
 }
 
 // TestStagePayloadWritesKubeMarker is the end-to-end producer check: StagePayload's
-// output carries both markers and passes VerifyPayloadSet, which it runs last. Both
-// tools are faked, and the pin table is pointed at the fake bytes' digests for the
+// output carries the control-plane, kine and etcd markers and passes
+// VerifyPayloadSet, which it runs last. The go tool, the release download, the kine,
+// etcd and helm builds and the zot staging are faked, and the pin table is pointed at the fake bytes' digests for the
 // duration — the real digests would need a sha256 preimage.
 func TestStagePayloadWritesKubeMarker(t *testing.T) {
 	fakeTool(t, "go")

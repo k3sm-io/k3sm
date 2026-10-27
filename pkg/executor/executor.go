@@ -43,7 +43,7 @@ type Executor interface {
 	// scheduler/controller-manager → kine → close DB). It is idempotent.
 	Stop(ctx context.Context) error
 	// Kubeconfig returns the path to the admin kubeconfig the executor wrote, for
-	// the in-process node and kubectl to use.
+	// kubectl and the provisioning client to use.
 	Kubeconfig() string
 	// RESTConfigToken returns the static bearer token and apiserver URL the
 	// in-process clients use to reach the control plane.
@@ -94,8 +94,8 @@ type Config struct {
 	NodeIP string
 	// BindAddress is the address the apiserver binds. For a MULTI-NODE cluster it is
 	// the node's wireguard mesh IP so a joining node can reach the apiserver and the
-	// AlwaysAllow+token surface is NOT exposed on 0.0.0.0 or the LAN (bind the mesh
-	// interface ONLY). Empty falls back to NodeIP (loopback for the
+	// apiserver is not exposed on 0.0.0.0 or the LAN (bind the mesh interface
+	// ONLY). Empty falls back to NodeIP (loopback for the
 	// single-node dev path).
 	BindAddress string
 	// ClientCAFile is the apiserver --client-ca-file: the client-CA the apiserver trusts
@@ -116,8 +116,9 @@ type Config struct {
 	// system:anonymous and RBAC default-denies them, but closing the surface outright
 	// is defense-in-depth — it keeps an unauthenticated caller from probing the
 	// apiserver at all (and under the old AlwaysAllow posture it was the only thing stopping
-	// anonymous cluster-admin). The static bearer token (scheduler/CM/kubectl/healthz
-	// all carry it) is unaffected; only credential-less requests are rejected. The pure
+	// anonymous cluster-admin). The static bearer token (the admin client, kubectl and
+	// the healthz probe carry it) and the scheduler's and controller-manager's client
+	// certificates are unaffected; only credential-less requests are rejected. The pure
 	// apiServerArgs still omits the flag for a nil pointer, so the multi-node path
 	// (explicit false) and the arg-rendering tests are unchanged.
 	AnonymousAuth *bool
@@ -138,8 +139,8 @@ type Config struct {
 	// AuthorizationMode is the apiserver --authorization-mode. Empty defaults to
 	// DefaultAuthorizationMode (Node,RBAC) — the hard-cut flip from AlwaysAllow.
 	// The flip is pure because no in-process component is left unauthorized: the VK node
-	// + provisioners carry the static admin token (mapped to system:masters, which
-	// bypasses RBAC), the scheduler/KCM carry their own client-cert identities the
+	// carries its own system:node:<name> cert, the provisioners carry the static admin
+	// token (mapped to system:masters, which bypasses RBAC), the scheduler/KCM carry their own client-cert identities the
 	// apiserver's bootstrap RBAC already binds, and joined workers' system:node
 	// identities get a pre-provisioned datapath grant (pkg/rbac); set it
 	// to "AlwaysAllow" only for a deliberate diagnostic bring-up.
