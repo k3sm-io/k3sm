@@ -51,6 +51,16 @@ an engine bump fails loudly rather than serving unguarded; selftest rung 9
 checks the hooks against a staged tree. `/v1/responses`, `/v1/messages` and
 multimodal input tokens are not counted.
 
+`k3sm_serve` also patches the prefill mask of mlx-lm's `RotatingKVCache`. The
+cache keeps its first four tokens as attention sinks, but mlx-lm 0.32.0 builds
+the multi-token mask as a plain sliding window, so after a chunked prefill
+trims the cache the sinks are masked out and recall inside the window drops
+while decode looks fine. The patched mask keeps the sinks attended and the
+recent band at the window minus the sinks, as proposed upstream in
+[ml-explore/mlx-lm#1978](https://github.com/ml-explore/mlx-lm/pull/1978). In
+this image the cache with sinks is the one the multimodal scheduler builds; the
+text scheduler's caches have none, and their mask is unchanged.
+
 ## Files
 
 | file | what it is |
@@ -273,7 +283,8 @@ refusal. It also drives `k3sm_shard` with fake name resolution
 pod data volume, resolution retries and gives up on time, and the liveness
 probe answers correctly. It drives the `k3sm_serve` context guard against
 fakes, and, when a staged tree exists (`K3SM_MLX_STAGE`, default the build's
-work dir), against the real engine's HTTP app. It prints what it does **not** cover; the stage Job on a cluster, the live build,
+work dir), against the real engine's HTTP app, and checks the attention-sink
+mask on the real mlx-lm cache. It prints what it does **not** cover; the stage Job on a cluster, the live build,
 the real payload walk, the push, and a sharded model on two Macs are the lab
 run.
 

@@ -8,7 +8,9 @@ It runs vllm-mlx's own CLI (vllm_mlx.cli.main) in this process with the same
 argv, so the server, its flags and its HTTP surface are vllm-mlx's. Before the
 CLI starts it installs one guard on the server module: a request whose prompt
 plus completion would not fit the engine's context window is refused with HTTP
-400, the way vLLM enforces max_model_len, instead of being served.
+400, the way vLLM enforces max_model_len, instead of being served. It also
+patches the prefill mask of mlx-lm's rotating cache so the cache's attention
+sinks stay attended (see The attention sinks, below).
 
 Why the guard exists. vllm-mlx 0.5.0 has no max-model-len option and does no
 prompt-length validation: its only per-sequence bound is --max-kv-size, which
@@ -65,6 +67,21 @@ OpenAI completion endpoints; a non-streaming /v1/messages request reaches the
 engine-level check and is held to the same rule), and image or audio tokens a
 multimodal processor adds after the template, which a text tokenizer does not
 count.
+
+The attention sinks. mlx-lm 0.32.0's make_prompt_cache(model, max_kv_size)
+builds RotatingKVCache(max_kv_size, keep=4): the first four tokens stay in the
+cache as attention sinks however far the window rotates. Its make_mask builds
+the multi-token (prefill) mask as a plain sliding window over the cache
+columns, so once a chunked prefill has trimmed the cache each query row masks
+out the sink columns before it (all four, from the fifth row on) and attends
+as many more recent tokens in their place as a decode step would not. Decode
+(one token at a time) attends the whole cache, so the defect shows only as
+lost recall after a long prompt. patch_rotating_kv_cache replaces make_mask
+with one that keeps the sink columns attended and the recent band at
+max_kv_size - keep, the mask upstream proposes in ml-explore/mlx-lm#1978. In
+this image the cache with sinks is the one vllm-mlx's multimodal scheduler
+prefills per request; the text scheduler builds its caches with keep=0, where
+the patch leaves the mask unchanged.
 """
 
 import logging
@@ -179,6 +196,63 @@ def chat_prompt(engine, messages, chat_kwargs, extract_multimodal_content, conve
     )
 
 
+SINK_PATCHED = "_k3sm_sink_mask"
+
+
+def sink_mask(mx, N, offset, window, keep):
+    """The prefill mask of a rotating cache that keeps `keep` sink tokens.
+
+    Columns are the cache's: the sinks first, then the most recent tokens in
+    temporal order, the N new ones last. Each query row attends the sinks it
+    follows and the window - keep most recent tokens up to itself, which is
+    what a decode step attends once the cache is full. The formula is the one
+    upstream proposes in ml-explore/mlx-lm#1978.
+    """
+    rinds = mx.arange(offset + N)[None]
+    linds = mx.arange(offset, offset + N)[:, None]
+    return (linds >= rinds) & ((rinds < keep) | (linds < rinds + window - keep))
+
+
+def patch_rotating_kv_cache(cache_classes, mx):
+    """Keep a RotatingKVCache's sink columns attended in its prefill mask.
+
+    Patches make_mask on each class in place. Only the multi-token mask of a
+    cache with sinks (keep > 0) at its own window changes; every other call,
+    including an explicit window that differs from the cache size, goes to the
+    original. Raises GuardError when a class does not have the make_mask this
+    was written against, so an mlx-lm bump that moves it fails at pod start.
+    """
+    import inspect
+
+    patched = []
+    for cls in cache_classes:
+        original = getattr(cls, "make_mask", None)
+        if original is None or not callable(original):
+            raise GuardError(f"{cls.__module__}.{cls.__name__} has no make_mask; the sink patch was written "
+                             f"against mlx-lm 0.32.0 and this cache moved it")
+        if getattr(original, SINK_PATCHED, False):
+            patched.append(cls)
+            continue
+        params = list(inspect.signature(original).parameters)
+        if params != ["self", "N", "window_size", "return_array"]:
+            raise GuardError(f"{cls.__module__}.{cls.__name__}.make_mask takes {params}; the sink patch was "
+                             f"written against mlx-lm 0.32.0's (self, N, window_size, return_array)")
+
+        def make_mask(self, N, window_size=None, return_array=False, _original=original):
+            keep = getattr(self, "keep", 0)
+            if N > 1 and keep > 0 and (window_size or self.max_size) == self.max_size:
+                offset = min(self.max_size - 1, self.offset)
+                if offset + N > self.max_size or return_array:
+                    return sink_mask(mx, N, offset, self.max_size, keep)
+            return _original(self, N, window_size=window_size, return_array=return_array)
+
+        setattr(make_mask, SINK_PATCHED, True)
+        make_mask.__doc__ = original.__doc__
+        cls.make_mask = make_mask
+        patched.append(cls)
+    return patched
+
+
 def _seam(owner, name):
     value = getattr(owner, name, None)
     if value is None or not callable(value):
@@ -264,8 +338,30 @@ def install(server, engine_cls, http_exception, json_response, extract_multimoda
     return ContextRefusal
 
 
+def rotating_cache_classes():
+    """The RotatingKVCache classes the image's engine builds caches from.
+
+    mlx-lm's is required; mlx-vlm carries its own copy of the same class (and
+    of the same make_mask), patched too when it is installed.
+    """
+    from mlx_lm.models.cache import RotatingKVCache
+
+    classes = [RotatingKVCache]
+    try:
+        from mlx_vlm.models.cache import RotatingKVCache as VLMRotatingKVCache
+    except ImportError:
+        return classes
+    if VLMRotatingKVCache is not RotatingKVCache:
+        classes.append(VLMRotatingKVCache)
+    return classes
+
+
 def install_on_engine():
-    """Install the guard on the real vllm_mlx server (the image's engine)."""
+    """Install the sink patch and the guard on the real engine, before it loads."""
+    import mlx.core as mx
+
+    patch_rotating_kv_cache(rotating_cache_classes(), mx)
+
     from fastapi import HTTPException
     from fastapi.responses import JSONResponse
     from vllm_mlx import server
@@ -290,7 +386,8 @@ def main(argv=None):
             print(f"k3sm-serve: {e}", file=sys.stderr, flush=True)
             return 2
         print("k3sm-serve: context guard on /v1/completions and /v1/chat/completions "
-              "(window: the engine's --max-kv-size)", file=sys.stderr, flush=True)
+              "(window: the engine's --max-kv-size); RotatingKVCache sink mask patched",
+              file=sys.stderr, flush=True)
     from vllm_mlx import cli
 
     sys.argv = [ENGINE_CLI] + argv

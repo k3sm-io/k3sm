@@ -26,6 +26,9 @@
 #   * the k3sm-serve context guard refuses a request longer than the engine's
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
 #     when a staged tree is present, against the real vllm-mlx server.
+#   * with a staged tree, the patched RotatingKVCache prefill mask keeps the
+#     attention-sink columns attended after a trim, which the pinned mlx-lm's
+#     own mask does not;
 #   * the stage Job stage-job.sh renders pins uv by version and published
 #     sha256 and the lockfile by digest, carries the checkout's files verbatim,
 #     fails closed on a digest mismatch, carries no credential, and is placed by
@@ -795,6 +798,127 @@ PY
 	fi
 else
 	ladder skip "9.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+fi
+
+# ---- 9s — the attention-sink mask on the REAL mlx-lm cache (staged tree) ----
+# mlx-lm 0.32.0's RotatingKVCache keeps its first `keep` tokens as attention
+# sinks, but its prefill mask is a plain sliding window: once the cache has
+# trimmed, every query row masks the sink columns out (the upstream defect,
+# shown red here first). k3sm_serve patches make_mask; this rung drives the
+# pinned mlx-lm's own cache through a chunked prefill past its window and
+# checks, row by row, that each query sees the sinks plus exactly the
+# max_size - keep most recent tokens, which is what a decode step sees.
+if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
+	cat > "$WORK/sink-real.py" <<'PY'
+import sys, types
+sys.path.insert(0, sys.argv[1])
+import mlx.core as mx
+from mlx_lm.models.cache import RotatingKVCache, make_prompt_cache
+import k3sm_serve as ks
+
+W, KEEP = 16, 4
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+def rows_seen(size, keep, history, step, n, window=None, return_array=False):
+    """Prefill `history` ids in chunks of `step`, then n more; the ids each new row sees."""
+    cache = RotatingKVCache(max_size=size, keep=keep)
+    for start in range(0, history, step):
+        kv = mx.arange(start, min(start + step, history)).reshape(1, 1, -1, 1)
+        cache.update_and_fetch(kv, kv)
+    mask = cache.make_mask(n, window, return_array)
+    kv = mx.arange(history, history + n).reshape(1, 1, n, 1)
+    keys, _ = cache.update_and_fetch(kv, kv)
+    ids = keys[0, 0, :, 0].tolist()
+    rows = None if isinstance(mask, str) else mask.tolist()
+    seen = []
+    for row in range(n):
+        end = history + row + 1
+        seen.append(sorted(t for col, t in enumerate(ids) if (t < end if rows is None else rows[row][col])))
+    return seen, rows
+
+def decode_view(size, keep, end):
+    return list(range(min(keep, end))) + list(range(max(keep, end - (size - keep)), end))
+
+check("sink.target  make_prompt_cache(model, max_kv_size) builds RotatingKVCache with keep=4",
+      [c.keep for c in make_prompt_cache(types.SimpleNamespace(layers=[0]), max_kv_size=W)] == [KEEP])
+
+_, rows = rows_seen(W, KEEP, 40, 8, 8)
+check("sink.upstream  unpatched, a trimmed cache's prefill mask hides the sink columns (the defect is real)",
+      rows is not None and not all(all(r[:KEEP]) for r in rows))
+
+original = RotatingKVCache.make_mask
+classes = ks.rotating_cache_classes()
+ks.patch_rotating_kv_cache(classes, mx)
+check("sink.patched  RotatingKVCache.make_mask is replaced", RotatingKVCache.make_mask is not original)
+ks.patch_rotating_kv_cache(classes, mx)
+check("sink.idempotent  a second patch does not wrap the first",
+      RotatingKVCache.make_mask.__defaults__[-1] is original)
+
+seen, rows = rows_seen(W, KEEP, 40, 8, 8)
+check("sink.columns  after a trim, columns 0..3 are unmasked for every query row",
+      rows is not None and all(all(r[:KEEP]) for r in rows))
+check("sink.window  every row sees the sinks and the max_size - keep most recent tokens, as decode does",
+      all(seen[r] == decode_view(W, KEEP, 40 + r + 1) for r in range(8)))
+
+ok = True
+for size in (4, 8, 16):
+    for keep in sorted({1, min(4, size - 1), size - 1}):
+        for history in (0, size - 1, size, 2 * size + 3):
+            for step in (1, size + 1):
+                for n in (2, size + 2):
+                    for ra in (False, True):
+                        seen, _ = rows_seen(size, keep, history, step, n, None, ra)
+                        ok = ok and all(seen[r] == decode_view(size, keep, history + r + 1) for r in range(n))
+check("sink.sweep  the same holds across sizes, keeps, histories, chunk sizes and return_array", ok)
+
+same = True
+for keep, window in ((0, None), (0, 8), (KEEP, 8)):
+    for history in (0, 9, 40):
+        cache = RotatingKVCache(max_size=W, keep=keep)
+        for start in range(0, history, 8):
+            kv = mx.arange(start, min(start + 8, history)).reshape(1, 1, -1, 1)
+            cache.update_and_fetch(kv, kv)
+        a, b = cache.make_mask(6, window, True), original(cache, 6, window, True)
+        same = same and mx.array_equal(a, b).item()
+check("sink.unchanged  keep=0, or an explicit window other than the cache size, builds upstream's mask", same)
+
+try:
+    from mlx_vlm.models.cache import RotatingKVCache as VLM
+    check("sink.vlm  mlx-vlm's copy of RotatingKVCache is patched too",
+          VLM in classes and getattr(VLM.make_mask, ks.SINK_PATCHED, False))
+except ImportError:
+    check("sink.vlm  mlx-vlm is not installed; only mlx-lm's cache is patched", classes == [RotatingKVCache])
+
+class Moved:
+    def make_mask(self, N):
+        return None
+try:
+    ks.patch_rotating_kv_cache([Moved], mx)
+    check("sink.failclosed  a make_mask with another signature ends the process", False)
+except ks.GuardError:
+    check("sink.failclosed  a make_mask with another signature ends the process", True)
+PY
+	SINK_CHECKS=0
+	sink_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/sink-real.py" "$HERE" 2>"$WORK/sink-real.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		SINK_CHECKS=$((SINK_CHECKS + 1))
+		case "$verdict" in
+			ok) ladder ok "9s.$name" ;;
+			no) ladder no "9s.$name" ;;
+			*)  ladder no "9s.driver  $verdict $name" ;;
+		esac
+	done <<< "$sink_out"
+	if [ "$SINK_CHECKS" -ge 10 ]; then
+		ladder ok "9s.count  all $SINK_CHECKS sink-mask checks reported"
+	else
+		ladder no "9s.count  only $SINK_CHECKS of 10 sink-mask checks reported (the driver crashed?)"
+		tail -20 "$WORK/sink-real.err"
+	fi
+else
+	ladder skip "9s.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
 fi
 
 # ---- 10 — the stage Job (stage-job.sh render) --------------------------------

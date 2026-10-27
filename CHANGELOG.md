@@ -122,6 +122,7 @@ pin, its date, and the tarball's sha256.
 - **A re-attached `vm` Pod keeps its containers' `startedAt`.** After a node daemon restart the time no longer resets to the re-attach time.
 - **A LoadBalancer on a port below 1024 re-binds after `k3sm network lan off` and `on`.** A Service whose port is not in the listed ports failed with `address already in use` after the switch; the bind now goes through the root network helper. The macOS host-service ports 22, 53, 88, 445, 548 and 631 are reserved, so a LoadBalancer cannot take them.
 - **`k3sm build` with `RUN` steps or a Linux target, and `k3sm builder buildx`, work from an ordinary account on a root install.** The build engine's files and credentials belonged to root, so these commands failed for the user who ran them. They now run as that user.
+- **The MLX serving image keeps a rotating KV cache's attention sinks after a long prompt.** mlx-lm's `RotatingKVCache` keeps the first four tokens of a sequence as attention sinks, but once a chunked prefill had trimmed the cache its prefill mask hid them, so a model could lose facts inside its window while still answering normally. `ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2` patches the mask to keep the sinks attended, as proposed upstream in [ml-explore/mlx-lm#1978](https://github.com/ml-explore/mlx-lm/pull/1978). In this image the cache with sinks is the one multimodal models use (thanks to @robertcprice).
 
 ### Upgrade Notes
 
