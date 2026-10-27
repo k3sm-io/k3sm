@@ -210,19 +210,30 @@ fi
 # The store is faked at its seam, so the CI tier needs no runtimed.
 run_test "builder.9a" 6 TestBuildSinkMatrix ./cmd/k3sm/
 run_test "builder.9b" 4 TestBuildTagRequiredWithoutOutput ./cmd/k3sm/
-# BOTH paths must deliver through the one function, or the two terminal states
-# drift and "which engine built it" becomes visible again.
+# BOTH paths must deliver through the one function, with the one recorder, or
+# the two terminal states drift and "which engine built it" becomes visible
+# again. The engine path is handed the caller's recorder, not a copy of its own.
+C="$K3SM_ROOT/cmd/k3sm"
 b9c=ok
-grep -q 'deliver(ctx, o, ref, built{' "$K3SM_ROOT/cmd/k3sm/build.go" || b9c=no
-grep -q 'deliver(ctx, o, ref, b, out, recordInStore' "$K3SM_ROOT/cmd/k3sm/buildengine.go" || b9c=no
+grep -q 'deliver(ctx, o, ref, built{' "$C/build.go" || b9c=no
+grep -q 'tr.engine(engineFor(record))' "$C/build.go" || b9c=no
+grep -q 'return engineBuildRecorded(ctx, o, out, record)' "$C/buildengine.go" || b9c=no
+grep -q 'deliver(ctx, o, ref, b, out, record, pushBuilt, ' "$C/buildengine.go" || b9c=no
 ladder "$b9c" "builder.9c both build paths deliver through the same store+artifact function"
-# The store leg must use the daemon's own ingest RPC — the CLI never writes the
-# store itself (the daemon is its sole writer).
-if grep -q 'LOAD_IMAGE_FORMAT_DOCKER_SAVE' "$K3SM_ROOT/cmd/k3sm/buildstore.go"; then
-	ladder ok "builder.9d the store recording goes through the daemon's LoadImage ingest"
-else
-	ladder no "builder.9d the store recording goes through the daemon's LoadImage ingest"
-fi
+# The recording is the cluster registry, through the shared upload path, and the
+# node's cache is warmed by the daemon's own pull: the CLI never writes the node
+# store itself (the daemon is its sole writer). The deprecated LoadImage ingest
+# is gone from the CLI, so no command can reach the store around the puller.
+b9d=ok
+grep -q 'recordInRegistry(pushBuilt, defaultCacheWarmer(), ' "$C/build.go" || b9d=no
+grep -q 'recordInto(ctx, ref, b, workDirFromEnv(), push, warm)' "$C/buildstore.go" || b9d=no
+grep -q 'if err := push(ctx, target, b, dest); err != nil' "$C/buildstore.go" || b9d=no
+grep -q 'if err := warm(ctx, ref); err != nil' "$C/buildstore.go" || b9d=no
+grep -q 'imagePull(ctx, runtimev1.NewImagesClient(cc), o, io.Discard)' "$C/buildstore.go" || b9d=no
+grep -q 'policy: runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS, cacheOnly: true' "$C/buildstore.go" || b9d=no
+grep -q 'recordInto(ctx, ref, b, o.workDir, push, warm)' "$C/imageload.go" || b9d=no
+if grep -lE '\.LoadImage\(' "$C"/*.go 2>/dev/null | grep -v '_test\.go$' | grep -q .; then b9d=no; fi
+ladder "$b9d" "builder.9d the recording goes to the cluster registry and the node cache is written only by the daemon's pull"
 
 # ---- builder.10 — `k3sm build --push` (the build→push one-liner) ----------
 # THE SECOND RED→GREEN RUNG. On main there is no --push at all: an image reached
@@ -240,22 +251,34 @@ run_test "builder.10c" 4 TestBuildPushFlag ./cmd/k3sm/
 run_test "builder.10d" 2 TestBuildPushToRegistry ./cmd/k3sm/
 # The upload must go through the ONE path `k3sm image push` uses. A second
 # remote.Write would fork the credential chain, the plain-HTTP selection and the
-# failure taxonomy — and the fork is the copy nobody re-reads.
+# failure taxonomy — and the fork is the copy nobody re-reads. The recording,
+# --push to another registry, the image verb and load/import all reach
+# pushImage/pushIndex, and those are the only uploads in the CLI.
 b10e=ok
-grep -q 'push imagePusher' "$K3SM_ROOT/cmd/k3sm/buildstore.go" || b10e=no
-grep -q 'func pushImage(' "$K3SM_ROOT/cmd/k3sm/imagepush.go" || b10e=no
-grep -q 'pushImage(ctx, ref, img, o.workDir)' "$K3SM_ROOT/cmd/k3sm/imagepush.go" || b10e=no
-grep -q 'out, record, push, ' "$K3SM_ROOT/cmd/k3sm/build.go" || b10e=no
-grep -q 'recordInStore, pushBuilt' "$K3SM_ROOT/cmd/k3sm/buildengine.go" || b10e=no
+grep -q 'func pushImage(' "$C/imagepush.go" || b10e=no
+grep -q 'if err := pushImage(ctx, target, img, dest); err != nil' "$C/imagepush.go" || b10e=no
+grep -q 'return pushIndex(ctx, ref, b.index, dest)' "$C/buildpush.go" || b10e=no
+grep -q 'return pushImage(ctx, ref, b.image, dest)' "$C/buildpush.go" || b10e=no
+grep -q 'if err := push(ctx, target, b, dest); err != nil' "$C/buildpush.go" || b10e=no
+grep -q 'recordInRegistry(pushBuilt, defaultCacheWarmer(), os.Stderr), pushBuilt)' "$C/build.go" || b10e=no
+grep -q 'record, pushBuilt, sess.endpoint, platform)' "$C/buildengine.go" || b10e=no
+grep -q 'var ingestPusher imagePusher = pushBuilt' "$C/imageload.go" || b10e=no
+uploads="$(grep -hE 'remote\.Write(Index)?\(' $(ls "$C"/*.go | grep -v '_test\.go$') | grep -vE '^[[:space:]]*//' | wc -l | tr -d ' ')"
+[ "$uploads" = 2 ] || b10e=no
+[ "$(grep -cE '^[[:space:]]*if err := remote\.Write(Index)?\(' "$C/imagepush.go")" = 2 ] || b10e=no
 ladder "$b10e" "builder.10e both build paths push through the same upload path k3sm image push uses"
-# The store recording is NOT skipped by --push (the divergence from docker
-# buildx): deliver records first and uploads second, so a failed upload leaves a
-# runnable image and an error that says so.
-if grep -q 'is in the node store; push failed' "$K3SM_ROOT/cmd/k3sm/buildpush.go"; then
-	ladder ok "builder.10f a failed push reports that the image is already in the node store"
-else
-	ladder no "builder.10f a failed push reports that the image is already in the node store"
-fi
+# A failed upload says where the image is left. A tag naming the cluster
+# registry is uploaded by the recording itself, so --push uploads only what was
+# NOT recorded (a foreign tag or --no-record), and its failure names --output or
+# nowhere. A recording whose upload succeeded but whose cache warm failed says
+# the image is in the cluster registry.
+b10f=ok
+grep -q 'return name.Tag{}, pushFailure(o, ref, err)' "$C/buildpush.go" || b10f=no
+grep -q 'was written to %s and not recorded (%s); push failed: %w' "$C/buildpush.go" || b10f=no
+grep -q 'was not recorded (%s) and has no --output; push failed: %w' "$C/buildpush.go" || b10f=no
+grep -q 'is in the cluster registry; warming this node' "$C/buildstore.go" || b10f=no
+grep -q 'return &cacheWarmError{ref: ref, err: err}' "$C/buildstore.go" || b10f=no
+ladder "$b10f" "builder.10f a failed push or cache warm reports where the image is left"
 
 # ---- builder.11 — `--platform` is a first-class target ---------------------
 # THE THIRD RED→GREEN RUNG. On main --platform only qualified a build the
