@@ -29,7 +29,7 @@ import (
 	"strings"
 )
 
-// Hierarchy is k3sm's CA PKI (DESIGN §5c). Every multi-node server holds two CAs: the
+// Hierarchy is k3sm's CA PKI (DESIGN §5c). Every server holds two CAs: the
 // CLUSTER CA — the serving anchor a join token pins and the issuer of kubelet-serving
 // certs — and the SIGNING CA that issues system:node client certs. They are
 // independent self-signed roots (the k3s server-ca / client-ca split): a compromised
@@ -67,8 +67,8 @@ type Hierarchy struct {
 	requestHeader *CA
 }
 
-// On-disk filenames within the PKI dir: the two CA keypairs, plus the multi-node
-// apiserver serving keypair the mesh path issues from the cluster CA.
+// On-disk filenames within the PKI dir: the cluster and signing CA keypairs, plus the
+// apiserver serving keypair every server re-issues from the cluster CA on every boot.
 const (
 	clusterCACert = "cluster-ca.crt"
 	clusterCAKey  = "cluster-ca.key"

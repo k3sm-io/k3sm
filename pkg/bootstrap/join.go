@@ -110,7 +110,7 @@ type JoinResult struct {
 	// NetserveClientCertPEM / NetserveClientKeyPEM are this node's netserve
 	// identity (certs.NetserveSubject), the credential its datapath runs under.
 	// Empty against a server that predates it; the agent then fetches one at
-	// start (FetchNetserveCert), as it does on every resume.
+	// start (FetchNetserveCert), as it does on a resume whose stored pair is missing or near expiry.
 	NetserveClientCertPEM []byte
 	NetserveClientKeyPEM  []byte
 	PodCIDR               string

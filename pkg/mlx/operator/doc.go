@@ -26,8 +26,8 @@ limitations under the License.
 //
 // # Shape
 //
-// One informer over MLXModels, one informer over the pods those models own, and
-// a SINGLE workqueue worker. The worker serializes every reconcile by model key,
+// One informer over MLXModels, one over the pods those models own, one over the
+// StatefulSets they own, and a SINGLE workqueue worker. The worker serializes every reconcile by model key,
 // so nothing here needs a lock and no Context is stored in a struct. It mirrors
 // pkg/provisioner deliberately: same start-after-the-apiserver-is-healthy,
 // drain-before-teardown lifetime, same resync-re-delivers-everything recovery

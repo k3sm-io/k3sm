@@ -11,8 +11,9 @@ on a server node. `TestMetricsServerAddonManifest` pins the exact object set and
 `TestMetricsServerAddonRunsNative` pins the scheduling fields, the args and the upstream bytes;
 `TestMetricsServerImageLockstep` binds the image line to `hack/images/metrics-server/image.yaml`,
 its one digest record. Any change to this file is a deliberate change to those tests too. It is
-applied only where it can serve (the multi-node cluster CA posture); elsewhere it is skipped and
-withdrawn. It is never applied over an operator's own metrics.k8s.io APIService. See
+applied once the server's node has minted its kubelet serving certificate, on every server
+topology; before that, or when the cluster CA does not issue the kubelet serving certificates, it
+is skipped (and withdrawn only on positive evidence). It is never applied over an operator's own metrics.k8s.io APIService. See
 `TestMetricsServerAddonGate`.
 
 ## Why the manifests live in the binary and not on disk

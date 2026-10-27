@@ -126,7 +126,7 @@ func connected(r netv1alpha1.InterconnectReport) bool {
 // connected peer, or that is already a member and still exists. A member is up
 // iff its report is fresh, its index is within 0..MaxInterconnectNodeIndex (so
 // its address InterconnectSlotAddress(idx, 0) exists, recomputed here and never
-// taken from the node), it is not in a cable loop, and at least one peer it
+// taken from the node) and held by no other Node, it is not in a cable loop, and at least one peer it
 // reaches also reaches it; then it must stay so for UpHold, measured from its
 // persisted lastTransition.
 //
