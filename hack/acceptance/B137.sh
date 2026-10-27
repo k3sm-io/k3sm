@@ -489,7 +489,7 @@ run_case t17 PATH="$HINT_PATH" \
 	K3SM_INSTALL_BASE_URL="$BASE_OK" K3SM_INSTALL_VERSION=v9.9.9
 if [ "$CASE_RC" -eq 0 ] && sudo_ran && k3sm_ran \
 	&& has 'installed to /Library/k3sm; /usr/local/bin/k3sm is the launcher' \
-	&& ! has 'installed — try:'; then
+	&& ! has 'installed. Try:'; then
 	ladder ok "b137.T17 k3sm NOT on PATH: closing hint names the launcher + the PATH remedy"
 else
 	ladder no "b137.T17 k3sm NOT on PATH: closing hint names the launcher + the PATH remedy (rc=$CASE_RC)"
@@ -507,7 +507,7 @@ chmod +x "$HINT_STUBS/k3sm"
 run_case t18 PATH="$STUBS:$HINT_STUBS:/usr/bin:/bin" \
 	K3SM_INSTALL_BASE_URL="$BASE_OK" K3SM_INSTALL_VERSION=v9.9.9
 if [ "$CASE_RC" -eq 0 ] && sudo_ran && k3sm_ran \
-	&& has 'installed — try: k3sm status, then k3sm kubectl get nodes' \
+	&& has 'installed. Try: k3sm status, then k3sm kubectl get nodes' \
 	&& ! has 'is the launcher'; then
 	ladder ok "b137.T18 k3sm ON PATH: closing hint is the runnable one"
 else
