@@ -144,7 +144,10 @@ kern.maxfilesperproc=131072` raises it until the next reboot.
 A cluster upgrades **one node at a time**, not all at once. Restarting each node's daemon via `launchctl
 kickstart` creates a short **binary-version-skew window** where old and new nodes coexist; k3sm releases
 are designed so adjacent versions interoperate across that window. Upgrade agents first and the
-control-plane Mac last unless a release note says otherwise. An HA cluster has its own order, mint-authority server first; see [HA](ha.md#upgrading-an-ha-cluster-to-the-aggregation-layer). See [Multi-node](multi-node.md) and
+control-plane Mac last unless a release note says otherwise. The upgrade to v0.2.0 from a v0.1 release
+is such an exception: upgrade the server first. An agent on v0.2.0 needs the datapath identity
+certificate that only a v0.2.0 server issues; an agent upgraded before its server logs that and retries
+every half minute until the server is upgraded (see [Multi-node](multi-node.md#the-datapath-identity)). An HA cluster has its own order, mint-authority server first; see [HA](ha.md#upgrading-an-ha-cluster-to-the-aggregation-layer). See [Multi-node](multi-node.md) and
 [HA](ha.md).
 
 ## How a Managed Update Runs
