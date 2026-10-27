@@ -39,8 +39,9 @@ type Executor interface {
 	// Ready reports whether the control plane is currently serving (apiserver
 	// healthz ok). It is cheap to call repeatedly.
 	Ready(ctx context.Context) bool
-	// Stop tears the control plane down in reverse dependency order (apiserver →
-	// scheduler/controller-manager → kine → close DB). It is idempotent.
+	// Stop tears the control plane down in shutdownOrder (apiserver, then
+	// scheduler and controller-manager, then the datastore, then close DB). It is
+	// idempotent.
 	Stop(ctx context.Context) error
 	// Kubeconfig returns the path to the admin kubeconfig the executor wrote, for
 	// kubectl and the provisioning client to use.
