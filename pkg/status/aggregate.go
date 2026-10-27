@@ -24,7 +24,7 @@ import (
 )
 
 // Row names. They are the tokens `-o json` consumers key on, so they are stable
-// and lowercase, and Aggregate reads three of them by name.
+// and lowercase, and Aggregate reads several of them by name (netd, server or agent, apiserver and node; install is not one).
 const (
 	RowInstall = "install"
 	RowNetd    = "netd"
@@ -71,7 +71,7 @@ const (
 
 // advisoryRows are the rows whose WARN is a note to the operator rather than a
 // claim about the cluster, and which therefore do not move the verdict off
-// running. There is exactly one on a control plane, and it earns the exemption:
+// running. Each earns the exemption on its own grounds, the first being:
 //
 // pre-volume reports a leftover copy of the data root after a successful
 // migration. It is housekeeping — disk an operator may reclaim once they are
@@ -81,7 +81,7 @@ const (
 // signal stops being read. The row itself still warns, in the table, with its
 // remedy; only the headline verdict is unmoved.
 //
-// A FAIL is never exempt, on any row.
+// A FAIL is never exempt, on any row but workloads (below).
 //
 // node-resolver and shadow-shells are notes of the same kind: both describe
 // how shim-less and shell-wrapped processes reach cluster DNS, and a cluster
@@ -129,7 +129,7 @@ var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, Ro
 //
 // What is NOT exempt is the worker's own health: the agent daemon and its node
 // credential (RowAgent) carry the verdict here exactly as the server row does
-// on a control plane, and a FAIL is never exempt on any row — which is why the
+// on a control plane, and a FAIL on these rows is never exempt, which is why the
 // two rows above report a worker's unreachable control plane as a WARN at the
 // source (see Collector.apiserverRow and Collector.nodeRow) rather than leaning
 // on an exemption this map does not grant.

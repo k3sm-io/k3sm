@@ -105,9 +105,9 @@ type HosterConfig struct {
 	// injectable for tests. On Darwin a WILDCARD bind below 1024 does not
 	// require root; it is the SPECIFIC-address bind that returns EACCES,
 	// inverted from Linux. On a node with the root netd helper the node daemon
-	// passes a binder that sends every bind of a port the operator listed
-	// (--lb-privileged-ports), the wildcard included, to the helper, and binds
-	// every other port in-process. One owner for both the wildcard and the
+	// passes a binder that sends every bind below 1024, listed in
+	// --lb-privileged-ports or not, the wildcard included, to the helper, and
+	// binds every other port in-process. One owner for both the wildcard and the
 	// specific-address listener of a port is what lets a LAN access swap bind
 	// the new set before it closes the old one: Darwin refuses an unprivileged
 	// wildcard bind while a socket of another user holds a specific address on
@@ -642,8 +642,8 @@ func (h *Hoster) report(ctx context.Context, entries []string) {
 
 // bind opens one listener on every address of the set through the configured
 // binder and starts its forwarder. Which process makes a bind is the binder's
-// concern (HosterConfig.Binder): with the netd helper present, every bind of a
-// listed port goes to it; every other bind is in-process.
+// concern (HosterConfig.Binder): with the netd helper present, every bind below
+// 1024 goes to it; every other bind is in-process.
 //
 // It REFUSES a reserved port before touching the binder: against a wildcard
 // NodePort listener the winner would be decided by start order, and against

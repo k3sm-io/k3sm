@@ -86,9 +86,9 @@ import (
 //
 // RBAC: nothing new. The publisher is the server's retained admin client, the
 // same one that writes the advertisement ConfigMaps, and the readers (a node's
-// Service proxy and DNS resolver) already hold cluster-wide get/list/watch on
-// services and endpointslices through the k3sm:node-datapath ClusterRole
-// (pkg/rbac).
+// Service proxy and DNS resolver, running as the netserve identity) already
+// hold cluster-wide get/list/watch on services and endpointslices through the
+// k3sm:netserve ClusterRole (pkg/rbac).
 const (
 	// FlatServiceName is the registry's one cluster name. darwin-net's cluster
 	// DNS resolver and the node runtime's registry mapping spell the same
@@ -102,8 +102,9 @@ const (
 	// FlatServicePort is the Service port, and the port every image reference
 	// carries: registry-k3sm:6450/<repo>. It is fixed whatever --registry-port
 	// says, because a reference written into a Pod spec must not change with a
-	// server flag; the target port follows the flag. darwin-net and the runtime
-	// mapping use the same literal.
+	// server flag; the target port follows the flag. The node runtime mapping
+	// (flatRegistryHost in cmd/k3sm) spells the same literal, and a test pins
+	// the two together.
 	FlatServicePort = 6450
 	// ClusterServicePrefix prefixed the retired per-node registry Services
 	// (registry-<node>). It is kept so a server can find and remove its own

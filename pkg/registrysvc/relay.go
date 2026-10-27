@@ -54,9 +54,10 @@ import (
 // than a configuration the registry accepts.
 //
 // WHAT REACHABILITY BUYS, AND WHAT IT DOES NOT. Pull inside the mesh is
-// anonymous, exactly as it is on loopback — that is the point: a peer node's
-// puller falls back to this node when its own ingest registry misses a
-// node-relative reference. A WRITE is not carried blindly: every relay address
+// anonymous, exactly as it is on loopback, which is the point: this server's
+// registry is the cluster's one image store, and every node's runtime and every
+// Pod pulls from it through this relay (directly or by the registry-k3sm
+// Service). A WRITE is not carried blindly: every relay address
 // serves the push gate (gate.go), which forwards a write only for a pod whose
 // own ServiceAccount token the apiserver vouches for, in a namespace that opted
 // in, under that namespace's repository prefix, with an RBAC grant to push, and

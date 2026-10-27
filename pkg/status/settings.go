@@ -84,8 +84,9 @@ var settingsOrder = []setting{
 // It is read-only and never moves the verdict. Every value is one the
 // installer wrote in the open (the daemon's argv, the data-volume record, the
 // LAN record): the flags it names are a fixed list, none of which carries a
-// credential, and each value still goes through Redact, so a release base URL
-// with a password in it reaches the row with the password masked. A source
+// credential, and each value read from the daemon's argv still goes through Redact, so a
+// release base URL with a password in it reaches the row with the password
+// masked (the data-volume and LAN entries come from records that hold no URL). A source
 // this account may not read yields SettingRestricted for the values it holds
 // and the row says needs-admin, the way every other root-only check does.
 func (c Collector) settingsRow(role dataroot.Role, installed bool, dataRoot Row, volume *dataroot.Record, network *Network) (Row, bool) {

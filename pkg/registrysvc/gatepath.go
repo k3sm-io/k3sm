@@ -337,8 +337,8 @@ func validDigest(d string) bool {
 }
 
 // validUploadID accepts an upload session id: the registry mints a lowercase
-// UUID, so a lowercase alphanumeric-and-dash token of bounded length is the
-// whole grammar.
+// UUID, so a lowercase alphanumeric, dash and underscore token of bounded
+// length is the whole grammar.
 func validUploadID(id string) bool {
 	if id == "" || len(id) > maxUploadIDLen {
 		return false

@@ -299,8 +299,8 @@ func UpdatePath(workDir string) string {
 // updateRow reads the update record, or false when this report has no work dir
 // to read it from. The record supplies the latest release and when it was
 // checked; each state is re-derived at read time from what runs now, since
-// the record is written only by the hourly check and `k3sm update check` and
-// so outlives an in-place install: this binary's version (c.Version) replaces
+// the record is written only by the hourly check, `k3sm update check` and
+// the server's roll poll (which keeps the check's fields), and so outlives an in-place install: this binary's version (c.Version) replaces
 // the recorded one, and the node list this report already took (live, when
 // liveOK) replaces the recorded nodes.
 func (c Collector) updateRow(now time.Time, live []corev1.Node, liveOK bool) (Row, bool) {

@@ -35,10 +35,8 @@ import (
 // media type, genuine tar shape iff the plain "v1.tar" media type — then
 // opens the blob exactly as a strict reader would: trusting the label, no
 // sniffing, no fallback (the shape of runtimed's LayerApplier, which has no
-// gunzip path). It is red at main: BuildLayer there declares
-// types.OCIUncompressedLayer but ggcr still gzip-compresses the bytes, so the
-// blob is gzip under an uncompressed label and the strict tar.Reader fails
-// with "invalid header" on the first entry.
+// gunzip path). It pins the fix for a layer that declared an uncompressed media
+// type over gzip bytes.
 func TestBuildLayerMediaTypeMatchesBytes(t *testing.T) {
 	t.Parallel()
 

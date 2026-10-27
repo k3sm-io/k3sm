@@ -176,12 +176,12 @@ func TestNetworkPolicyHosting(t *testing.T) {
 	}
 }
 
-// TestM10_4_LimitationsDocKeepsLoadBearingPhrases is the line-assert:
+// TestLimitationsDocKeepsLoadBearingPhrases is the line-assert:
 // docs/user/limitations.md must keep the load-bearing honest-limit phrases of
 // the NetworkPolicy section so the doc cannot silently lose them. Markdown
 // emphasis (backticks/asterisks) is stripped before matching so formatting
 // tweaks don't defeat the check while a factual edit still does.
-func TestM10_4_LimitationsDocKeepsLoadBearingPhrases(t *testing.T) {
+func TestLimitationsDocKeepsLoadBearingPhrases(t *testing.T) {
 	t.Parallel()
 	raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "user", "limitations.md"))
 	if err != nil {

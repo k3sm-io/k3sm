@@ -103,14 +103,14 @@ func (f *recordingForwarder) callCount() int {
 
 func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
-// TestM3_3_ResolverAnswersClusterAndForwards is a unit proof: the
+// TestResolverAnswersClusterAndForwards is a unit proof: the
 // in-process per-node resolver answers cluster Service A records — including
 // kubernetes.default.svc.cluster.local → the API VIP (so an in-pod client-go
 // resolves the kubernetes endpoint NODE-LOCALLY, the in-pod-kubectl half of
 // that) — and forwards off-cluster names upstream, over BOTH the UDP and TCP
 // transports it binds on the DNS VIP. The live cross-node DNS is the m3.sh lab leg;
 // this pins the resolver's wire behavior.
-func TestM3_3_ResolverAnswersClusterAndForwards(t *testing.T) {
+func TestResolverAnswersClusterAndForwards(t *testing.T) {
 	t.Parallel()
 
 	zone := mapZone{
@@ -233,12 +233,12 @@ func TestNewClusterResolverDefaultsDomain(t *testing.T) {
 	}
 }
 
-// TestM3_3_ResolverBindsViaHelper is a unit proof of the bind backend
+// TestResolverBindsViaHelper is a unit proof of the bind backend
 // SELECTION: an unprivileged node (a non-empty netd socket) binds the DNS VIP
 // through the netd helper (which plumbs the alias and passes the <1024 socket back
 // over SCM_RIGHTS), while the explicit run-as-root mode binds directly. The live
 // fd-passing bind is the lab leg; this pins which backend the resolver selects.
-func TestM3_3_ResolverBindsViaHelper(t *testing.T) {
+func TestResolverBindsViaHelper(t *testing.T) {
 	t.Parallel()
 
 	if b, ok := newDNSBinder("/var/lib/k3sm/run/netd.sock").(*helperDNSBinder); !ok || b == nil {
@@ -655,10 +655,8 @@ func addrStrings(addrs []netip.Addr) []string {
 // response is served as header+question with TC set — the whole answer set is
 // dropped, never partially packed. RFC 2181 §9 PERMITS partial data, so this
 // drop-all is a legal DIVERGENCE from CoreDNS's partial-packing, not a correctness
-// edge (registered as an owed alignment row — see the truncateResponse TODO). The
-// same query over TCP returns the full set. The client half (TCP refetch on TC)
-// lives in darwin-net's resolver and getaddrinfo shim — a CROSS-PR dependency that
-// holds only once darwin-net #38 merges, not a present in-tree fact.
+// edge. The same query over TCP returns the full set. The client half (TCP
+// refetch on TC) lives in darwin-net's resolver and getaddrinfo shim.
 func TestOversizedUDPResponseTruncatesToTCP(t *testing.T) {
 	t.Parallel()
 

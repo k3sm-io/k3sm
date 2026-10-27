@@ -1675,10 +1675,10 @@ func (c Collector) refusedKubeconfigRemedy(role dataroot.Role) string {
 // kubeconfig the apiserver refused: copy the server's admin kubeconfig again.
 const RefusedUserKubeconfigRemedy = "k3sm kubeconfig > k3sm.yaml   # on the control-plane Mac; then merge k3sm.yaml into ~/.kube/config on this Mac"
 
-// runtimedRow reports the native runtime daemon's health. It is rendered only by
-// the cluster view and by JSON — the overview has no room for it and it is the
-// row an ordinary account can least often answer — but it still participates in
-// the verdict, because a node whose runtime is unhealthy runs no pods.
+// runtimedRow reports the native runtime daemon's health. The overview has
+// no room for it and it is the row an ordinary account can least often answer,
+// so it is rendered by the cluster view, by `k3sm alerts` when it is not ok, and
+// by JSON; it still participates in the verdict, because a node whose runtime is unhealthy runs no pods.
 func (c Collector) runtimedRow(ctx context.Context, role dataroot.Role) Row {
 	row := Row{Name: RowRuntimed}
 	// The uid test is repeated here, not just in the adapter that builds the

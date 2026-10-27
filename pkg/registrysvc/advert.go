@@ -82,10 +82,10 @@ const (
 // ErrNoMeshAddress reports that this node has no mesh address, so it has no
 // address a peer could dial and there is nothing to advertise.
 //
-// It is a SENTINEL rather than a silent no-op because the two callers want
-// opposite things from it: the single-node server treats it as the expected
-// non-event, while a caller that believed it was on a mesh wants to see why no
-// peer can reach it. It is never a failure of publication.
+// It is a SENTINEL rather than a silent no-op so a caller can tell that
+// expected non-event (a single-node server) from a failed publication; the
+// ingest registry's advertiser treats it as no publication. It is never a
+// failure of publication.
 var ErrNoMeshAddress = errors.New("this node has no mesh address to advertise")
 
 // ErrMalformedAdvertisement reports that a ConfigMap in the advertisement set

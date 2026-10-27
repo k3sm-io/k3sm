@@ -27,7 +27,7 @@ limitations under the License.
 // daemon on an unmounted data root — a posture no unprivileged test could
 // create — and pin the exact screen an operator would read.
 //
-// Two invariants are load-bearing and are pinned by tests:
+// Three invariants are load-bearing and are pinned by tests:
 //
 //   - Raw launchctl output NEVER reaches a Row. `launchctl print` echoes a
 //     job's whole argv, and the server's argv carries the cluster join token.
