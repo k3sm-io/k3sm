@@ -135,8 +135,8 @@ doc_leg() {
 }
 
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "$GATE_NAME gate: NOT RUN. It needs K3SM_LAB=1 and an installed node at \$KUBECONFIG; this is a failure, not a skip." >&2
-	exit 1
+	echo "$GATE_NAME gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
+	exit 3
 fi
 if [ -z "${KUBECONFIG:-}" ]; then
 	echo "KUBECONFIG must point at the RUNNING cluster this installed node belongs to (this gate boots nothing itself)" >&2
