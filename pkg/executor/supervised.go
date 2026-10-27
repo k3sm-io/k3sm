@@ -241,7 +241,9 @@ type Supervised struct {
 	probeCA []byte
 	// probeErr is the last probe failure logged, so each distinct failure is logged
 	// once rather than every poll; a success clears it. Guarded by probeMu.
-	probeErr  string
+	probeErr string
+	// probeDial replaces the probe's dialer in tests (an in-memory pipe); nil, as
+	// NewSupervised leaves it, dials through the segment-clamped tcpseg.Dialer.
 	probeDial func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	mu      sync.Mutex
@@ -306,10 +308,6 @@ func NewSupervised(cfg Config) *Supervised {
 		cfg:   cfg,
 		token: cfg.Token,
 		etcd:  defaultEtcdSeams(),
-		// The healthz probe dials the apiserver's bind host, which is the node or mesh
-		// address on a multi-node server, so its dialer clamps the TCP segment size like
-		// every other node-address connection.
-		probeDial: (&tcpseg.Dialer{}).DialContext,
 	}
 }
 
@@ -1429,10 +1427,17 @@ func (s *Supervised) probeClient() (*http.Client, error) {
 	if s.probe != nil {
 		s.probe.CloseIdleConnections()
 	}
+	// The probe dials the apiserver's bind host, which is the node or mesh address on
+	// a multi-node server, so its dialer clamps the TCP segment size like every other
+	// node-address connection.
+	dial := s.probeDial
+	if dial == nil {
+		dial = (&tcpseg.Dialer{}).DialContext
+	}
 	s.probe = &http.Client{
 		Timeout: 3 * time.Second,
 		Transport: &http.Transport{
-			DialContext:     s.probeDial,
+			DialContext:     dial,
 			TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: probeServerName, MinVersion: tls.VersionTLS12},
 		},
 	}
