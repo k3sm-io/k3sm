@@ -68,7 +68,7 @@ spec:
   replicas: 1
   port: 8000
   runtime:
-    image: ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.1@sha256:4cff6a04732649f67744654d328c099b1620e6f9d6902a5266462d9293057941
+    image: ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2@sha256:63a152289cc06c05166e508851279d70be7ad68e56cf968d0f493f98e919f1f7
   cache:
     # Must comfortably exceed the model's on-disk size (~351 MB here). A volume
     # too small to hold the weights fails the download rather than degrading to
