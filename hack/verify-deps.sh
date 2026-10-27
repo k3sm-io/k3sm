@@ -1073,16 +1073,20 @@ update() {
 	py update-write "$LOCK" "$WORK" || fail "lock (update)" "could not write $LOCK"
 	cooldown_check "$WORK/delta"
 	malicious_check "$WORK/delta"
-	stage "lock (zotchild update)"
-	zot_graph "lock (zotchild update)"
-	mkdir -p "$WORK/z"
-	py update-plan "$ZOT_LOCK" "$WORK/zgraph" "$WORK/z" "$PROXY_URL" || fail "lock (zotchild update)" "could not plan the update"
-	cp "$WORK/z/fetch" "$WORK/fetch"
-	fetch_infos "lock (zotchild update)"
-	py update-write "$ZOT_LOCK" "$WORK/z" || fail "lock (zotchild update)" "could not write $ZOT_LOCK"
-	cooldown_check "$WORK/z/delta" "cooldown (zotchild)"
-	malicious_check "$WORK/z/delta" "malicious-package check (zotchild)"
-	echo "OK: [verify-deps] $LOCK and $ZOT_LOCK updated; review the diff and commit them"
+	if [ -f "$ZOT_SUM" ]; then
+		stage "lock (zotchild update)"
+		zot_graph "lock (zotchild update)"
+		mkdir -p "$WORK/z"
+		py update-plan "$ZOT_LOCK" "$WORK/zgraph" "$WORK/z" "$PROXY_URL" || fail "lock (zotchild update)" "could not plan the update"
+		cp "$WORK/z/fetch" "$WORK/fetch"
+		fetch_infos "lock (zotchild update)"
+		py update-write "$ZOT_LOCK" "$WORK/z" || fail "lock (zotchild update)" "could not write $ZOT_LOCK"
+		cooldown_check "$WORK/z/delta" "cooldown (zotchild)"
+		malicious_check "$WORK/z/delta" "malicious-package check (zotchild)"
+		echo "OK: [verify-deps] $LOCK and $ZOT_LOCK updated; review the diff and commit them"
+	else
+		echo "OK: [verify-deps] $LOCK updated; review the diff and commit it"
+	fi
 }
 
 # ---- --modules -----------------------------------------------------------------
@@ -1110,7 +1114,13 @@ check() {
 	lock_check
 	cooldown_verify
 	malicious_check "$LOCK"
-	zot_check
+	if [ -f "$ZOT_SUM" ]; then
+		zot_check
+	elif [ -f "$ZOT_LOCK" ]; then
+		fail "lock (zotchild)" "$ZOT_LOCK exists but $ZOT_SUM does not: the zot wrapper graph moved or was removed without its lock"
+	else
+		echo "    no zot wrapper module ($ZOT_SUM absent): the zotchild stages do not apply to this repo"
+	fi
 	replace_check
 	tools_check
 	echo "OK: [verify-deps] dependency supply-chain check green"
@@ -1138,6 +1148,12 @@ self_test() {
 		[ ! -d "$td/cases/$name" ] || cp -R "$td/cases/$name/." "$dir/"
 		mkdir -p "$dir/hack"
 		cp "$SELF" "$dir/hack/verify-deps.sh"
+		# A case carrying .no-zot is a repo without a zot wrapper module (apis,
+		# runtimed, darwin-net): the zotchild stages must not run there.
+		[ ! -f "$dir/.no-zot" ] || rm -f "$dir/$ZOT_SUM" "$dir/hack/deps-zotchild.lock" "$dir/.no-zot"
+		# .no-zot-sum keeps the lock and removes only the graph: the check must refuse,
+		# never skip, a wrapper that moved out from under its lock.
+		[ ! -f "$dir/.no-zot-sum" ] || rm -f "$dir/$ZOT_SUM" "$dir/.no-zot-sum"
 		local f
 		for f in "$dir/hack/deps.lock" "$dir/hack/deps-zotchild.lock" "$dir/stub/info" "$dir/base/hack/deps.lock"; do
 			[ ! -f "$f" ] || { sed -e "s/@RECENT@/$recent/g" -e "s/@OLD@/$old/g" "$f" >"$f.s" && mv "$f.s" "$f"; }
@@ -1249,6 +1265,9 @@ self_test() {
 	bg zot-sum-empty - "lock (zotchild)" "hashes no module source"
 	bg zot-sum-two-versions - "lock (zotchild)" "example.com/zchild is hashed at two versions"
 	bg zot-update --update pass "wrote hack/deps-zotchild.lock: 3 modules, 1 new or changed"
+	bg no-zot - pass "the zotchild stages do not apply to this repo"
+	bg no-zot-update --update pass "OK: [verify-deps] hack/deps.lock updated; review the diff and commit it"
+	bg zot-lock-no-sum - "lock (zotchild)" "exists but pkg/registrysvc/zotchild/go.sum.txt does not"
 	wait
 	for ((i = 1; i <= seq; i++)); do
 		cat "$WORK/result.$i"
