@@ -21,7 +21,7 @@
 # server mints its own (365d, in memory, SANs covering every address the apiserver
 # may dial it at), on every topology, because a single-node server's metrics-server
 # verifies the kubelet against the cluster CA too; only the standalone node and dev
-# paths self-sign. Neither role falls back — a missing pair or a failed mint stops
+# paths self-sign. Neither role falls back: a missing pair or a failed mint stops
 # the node.
 #
 # TWO TIERS, split by what can be proven without booting a cluster:
@@ -417,9 +417,9 @@ else
 				solo_sans="$(openssl x509 -in "$SOLO_LEAF" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^[[:space:]]*IP Address:[[:space:]]*//p' | sort -u)"
 				want_sans="$(printf '%s\n' "$solo_internal" 127.0.0.1 | sort -u)"
 				if ! openssl verify -CAfile "$SOLO_CA" "$SOLO_LEAF" >/dev/null 2>&1; then
-					ladder no "b213.L5  the single-node boot's :10250 cert VERIFIES against $SOLO_CA — $(openssl verify -CAfile "$SOLO_CA" "$SOLO_LEAF" 2>&1 | tail -1)"
+					ladder no "b213.L5  the single-node boot's :10250 cert VERIFIES against $SOLO_CA, openssl says: $(openssl verify -CAfile "$SOLO_CA" "$SOLO_LEAF" 2>&1 | tail -1)"
 				elif [ "$solo_sans" != "$want_sans" ]; then
-					ladder no "b213.L5  the single-node leaf's IP SANs are the node's own (InternalIP $solo_internal + 127.0.0.1), no mesh address — got: $(printf '%s ' $solo_sans)"
+					ladder no "b213.L5  the single-node leaf's IP SANs are the node's own (InternalIP $solo_internal + 127.0.0.1), no mesh address; got: $(printf '%s ' $solo_sans)"
 				else
 					ladder ok "b213.L5  the single-node boot's :10250 cert VERIFIES against $SOLO_CA and its IP SANs are the node's own ($(printf '%s ' $want_sans)), no mesh address"
 				fi

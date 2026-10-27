@@ -91,7 +91,7 @@ ladder "$ref" "b226.1  ServiceAccountToken sets BoundObjectRef{Kind:Pod, APIVers
 # manifest reconciler's own in-process identity (pkg/addons/manifestidentity.go —
 # a TokenRequest for the reconciler's ServiceAccount, held only in that process's
 # memory, never handed to a pod); and the registry builder token
-# (cmd/k3sm/registrybuilder.go — the `k3sm registry token`/push credential, a
+# (cmd/k3sm/registrybuilder.go, the `k3sm registry token`/push credential, a
 # TokenRequest for the k3sm-registry/builder ServiceAccount minted through the
 # user's own kubeconfig, audience k3sm-registry, 1h by default and never under
 # 10m, refused when the apiserver clamps it; deliberately unbound because it
