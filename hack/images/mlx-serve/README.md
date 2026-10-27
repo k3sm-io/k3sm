@@ -107,11 +107,16 @@ model is one logical replica; rank 0 alone serves HTTP.
 `k3sm_shard` does name resolution and `exec`, nothing else. It reads the
 environment the operator renders (`MLX_RANK`, `MLX_WORLD_SIZE`,
 `MLX_METAL_FAST_SYNCH`, `K3SM_MLX_BACKEND`, `K3SM_MLX_PARALLELISM`,
-`K3SM_MLX_RANKS`, `K3SM_MLX_PORT`, `K3SM_MLX_SERVE_PORT`, and for `jaccl`
-`K3SM_MLX_IBV_DEVICES_JSON`), resolves every rank's per-pod name under the
-model's headless Service (retrying, bounded), and writes MLX's rendezvous file
-into the pod data volume (`$TMPDIR`, the one writable path under the pod's
-sandbox profile):
+`K3SM_MLX_RANKS`, `K3SM_MLX_PORT`, `K3SM_MLX_SERVE_PORT`, for `jaccl`
+`K3SM_MLX_IBV_DEVICES_JSON`, and on the Thunderbolt path `K3SM_MLX_HOSTS`). On
+the network path it resolves every rank's per-pod name under the model's
+headless Service (retrying, bounded), taking its own address from
+`K3SM_POD_IP` when the runtime set it. On the Thunderbolt path nothing is
+resolved: `K3SM_MLX_HOSTS` already names every rank's interconnect address and
+port in rank order, and the rank refuses to start unless its own entry is
+`K3SM_INTERCONNECT_IP`, the address the runtime attached to it. Either way it
+writes MLX's rendezvous file into the pod data volume (`$TMPDIR`, the one
+writable path under the pod's sandbox profile):
 
 | backend | file | also set |
 |---|---|---|
