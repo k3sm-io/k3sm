@@ -47,6 +47,16 @@ streaming request is refused with a real 400 rather than an empty 200 stream:
   * /v1/chat/completions (streaming or not): around
     server._prepare_chat_completion_invocation, which runs once the engine is
     acquired and before either response path;
+  * /v1/messages (streaming or not): around
+    server._prepare_anthropic_endpoint_invocation, which the handler calls
+    once the engine is acquired and before it builds the StreamingResponse;
+  * /v1/responses, streaming: around server._responses_request_to_chat_request,
+    the one call the handler makes before it builds the StreamingResponse (the
+    stream's first SSE event is written before the engine is reached, so a
+    check any later would come after bytes were sent);
+  * /v1/responses (streaming or not): around server._prepare_responses_request,
+    which builds the engine call's arguments, so an omitted max_tokens is
+    clamped on the arguments the engine runs with;
   * /v1/completions, streaming: around server.stream_completion, which the
     handler calls synchronously before it builds the StreamingResponse;
   * /v1/completions, not streaming: around BatchedEngine.generate, the call the
@@ -62,11 +72,8 @@ unguarded. The guard needs vllm-mlx's batched engine (the one that applies the
 chat template in the engine), which --continuous-batching selects; the image's
 ENTRYPOINT always passes it, and this module refuses to serve without it.
 
-Not covered: /v1/responses and /v1/messages (the guard's contract is the two
-OpenAI completion endpoints; a non-streaming /v1/messages request reaches the
-engine-level check and is held to the same rule), and image or audio tokens a
-multimodal processor adds after the template, which a text tokenizer does not
-count.
+Not covered: image or audio tokens a multimodal processor adds after the
+template, which a text tokenizer does not count.
 
 The attention sinks. mlx-lm 0.32.0's make_prompt_cache(model, max_kv_size)
 builds RotatingKVCache(max_kv_size, keep=4): the first four tokens stay in the
@@ -270,6 +277,9 @@ def install(server, engine_cls, http_exception, json_response, extract_multimoda
     """
     resolve = _seam(server, "_resolve_request_max_tokens")
     prepare_chat = _seam(server, "_prepare_chat_completion_invocation")
+    prepare_anthropic = _seam(server, "_prepare_anthropic_endpoint_invocation")
+    to_chat_request = _seam(server, "_responses_request_to_chat_request")
+    prepare_responses = _seam(server, "_prepare_responses_request")
     stream_completion = _seam(server, "stream_completion")
     generate = _seam(engine_cls, "generate")
     app = getattr(server, "app", None)
@@ -294,19 +304,53 @@ def install(server, engine_cls, http_exception, json_response, extract_multimoda
         value = resolve(requested_value)
         return DefaultMaxTokens(value) if requested_value is None else RequestedMaxTokens(value)
 
-    def prepare_chat_guarded(engine, request, effective_max_tokens, *args, **kwargs):
-        prepared = prepare_chat(engine, request, effective_max_tokens, *args, **kwargs)
+    def guard_chat(engine, messages, chat_kwargs, max_tokens, where):
+        """Check a prepared chat call and set the max_tokens it runs with."""
         window = window_of(engine)
-        chat_kwargs = prepared.chat_kwargs
-        max_tokens = chat_kwargs.get("max_tokens", effective_max_tokens)
         if window > 0:
-            prompt = chat_prompt(engine, prepared.messages, chat_kwargs, extract_multimodal_content,
+            prompt = chat_prompt(engine, messages, chat_kwargs, extract_multimodal_content,
                                  convert_tools_for_template)
             prompt_tokens = count_tokens(engine.tokenizer, prompt)
-            chat_kwargs["max_tokens"] = refuse(prompt_tokens, max_tokens, window, "/v1/chat/completions")
+            chat_kwargs["max_tokens"] = refuse(prompt_tokens, max_tokens, window, where)
         else:
             chat_kwargs["max_tokens"] = int(max_tokens)
+
+    def prepare_chat_guarded(engine, request, effective_max_tokens, *args, **kwargs):
+        prepared = prepare_chat(engine, request, effective_max_tokens, *args, **kwargs)
+        guard_chat(engine, prepared.messages, prepared.chat_kwargs,
+                   prepared.chat_kwargs.get("max_tokens", effective_max_tokens), "/v1/chat/completions")
         return prepared
+
+    def prepare_anthropic_guarded(engine, openai_request, effective_max_tokens, *args, **kwargs):
+        prepared = prepare_anthropic(engine, openai_request, effective_max_tokens, *args, **kwargs)
+        guard_chat(engine, prepared.messages, prepared.chat_kwargs,
+                   prepared.chat_kwargs.get("max_tokens", effective_max_tokens), "/v1/messages")
+        return prepared
+
+    # The Responses path builds its engine arguments in _prepare_responses_request,
+    # which calls _responses_request_to_chat_request itself. The streaming
+    # handler calls the conversion alone before it starts the stream, so the
+    # conversion runs the guarded preparation when it is called from outside
+    # it. Both are synchronous, so a plain depth count cannot interleave with
+    # another request.
+    depth = [0]
+
+    def prepare_responses_guarded(request, *args, **kwargs):
+        depth[0] += 1
+        try:
+            engine, chat_request, messages, chat_kwargs = prepare_responses(request, *args, **kwargs)
+        finally:
+            depth[0] -= 1
+        requested = chat_request.max_tokens
+        max_tokens = chat_kwargs.get("max_tokens")
+        max_tokens = RequestedMaxTokens(max_tokens) if requested else DefaultMaxTokens(max_tokens)
+        guard_chat(engine, messages, chat_kwargs, max_tokens, "/v1/responses")
+        return engine, chat_request, messages, chat_kwargs
+
+    def to_chat_request_guarded(request, *args, **kwargs):
+        if depth[0] == 0:
+            prepare_responses_guarded(request, validate_remote_media=False)
+        return to_chat_request(request, *args, **kwargs)
 
     def stream_completion_guarded(engine, prompt, request, max_tokens, *args, **kwargs):
         window = window_of(engine)
@@ -332,6 +376,9 @@ def install(server, engine_cls, http_exception, json_response, extract_multimoda
 
     server._resolve_request_max_tokens = resolve_marked
     server._prepare_chat_completion_invocation = prepare_chat_guarded
+    server._prepare_anthropic_endpoint_invocation = prepare_anthropic_guarded
+    server._prepare_responses_request = prepare_responses_guarded
+    server._responses_request_to_chat_request = to_chat_request_guarded
     server.stream_completion = stream_completion_guarded
     engine_cls.generate = generate_guarded
     app.add_exception_handler(ContextRefusal, on_refusal)
@@ -385,8 +432,8 @@ def main(argv=None):
         except GuardError as e:
             print(f"k3sm-serve: {e}", file=sys.stderr, flush=True)
             return 2
-        print("k3sm-serve: context guard on /v1/completions and /v1/chat/completions "
-              "(window: the engine's --max-kv-size); RotatingKVCache sink mask patched",
+        print("k3sm-serve: context guard on /v1/completions, /v1/chat/completions, /v1/messages and "
+              "/v1/responses (window: the engine's --max-kv-size); RotatingKVCache sink mask patched",
               file=sys.stderr, flush=True)
     from vllm_mlx import cli
 

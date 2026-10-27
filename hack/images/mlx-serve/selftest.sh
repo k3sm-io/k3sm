@@ -25,7 +25,8 @@
 #     bounds resolution, and its liveness probe answers 0 and 1 correctly;
 #   * the k3sm-serve context guard refuses a request longer than the engine's
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
-#     when a staged tree is present, against the real vllm-mlx server.
+#     when a staged tree is present, against the real vllm-mlx server, on the
+#     completion, chat, Messages and Responses routes, streaming or not;
 #   * with a staged tree, the patched RotatingKVCache prefill mask keeps the
 #     attention-sink columns attended after a trim, which the pinned mlx-lm's
 #     own mask does not;
@@ -622,6 +623,18 @@ server._resolve_request_max_tokens = lambda v: 32768 if v is None else v
 server._prepare_chat_completion_invocation = lambda engine, request, mt: types.SimpleNamespace(
     messages=request["messages"], chat_kwargs={"max_tokens": mt})
 server.stream_completion = lambda engine, prompt, request, mt, **kw: ("stream", mt)
+server._prepare_anthropic_endpoint_invocation = lambda engine, request, mt: types.SimpleNamespace(
+    messages=request["messages"], chat_kwargs={"max_tokens": mt})
+CONVERSIONS = []
+def to_chat_request(request):
+    CONVERSIONS.append(1)
+    return types.SimpleNamespace(messages=request["messages"], max_tokens=request.get("max_output_tokens"))
+def prepare_responses(request, *, validate_remote_media=True):
+    chat_request = server._responses_request_to_chat_request(request)
+    return (server._engine, chat_request, chat_request.messages,
+            {"max_tokens": chat_request.max_tokens or 32768})
+server._responses_request_to_chat_request = to_chat_request
+server._prepare_responses_request = prepare_responses
 mmc = lambda messages: (None, [], [], [])
 Refusal = ks.install(server, Engine, HTTPError, lambda status_code, content: (status_code, content), mmc, lambda t: t)
 
@@ -647,6 +660,27 @@ p = server._prepare_chat_completion_invocation(eng, msgs(short), res(None))
 check("chat.default  an omitted max_tokens runs as the rest of the window (64 - 12)", p.chat_kwargs["max_tokens"] == 52)
 check("chat.templated  the chat count is of the engine's templated prompt, not the raw text",
       refusal(lambda: server._prepare_chat_completion_invocation(eng, msgs(" ".join(["w"] * 60)), res(3))) is not None)
+check("messages.over  an over-length /v1/messages request is refused with HTTP 400 (stream or not)",
+      refusal(lambda: server._prepare_anthropic_endpoint_invocation(eng, msgs(long), res(8))) is not None)
+p = server._prepare_anthropic_endpoint_invocation(eng, msgs(short), res(8))
+check("messages.fit  an in-window /v1/messages request passes with its max_tokens", p.chat_kwargs["max_tokens"] == 8)
+p = server._prepare_anthropic_endpoint_invocation(eng, msgs(short), res(None))
+check("messages.default  an omitted max_tokens runs as the rest of the window (64 - 12)",
+      p.chat_kwargs["max_tokens"] == 52)
+server._engine = eng
+resp = lambda t, mt=None: dict(msgs(t), max_output_tokens=mt)
+check("responses.stream  an over-length /v1/responses request is refused at the conversion the streaming "
+      "handler makes before its first SSE event",
+      refusal(lambda: server._responses_request_to_chat_request(resp(long, 8))) is not None)
+check("responses.streamfit  an in-window /v1/responses conversion returns the chat request",
+      server._responses_request_to_chat_request(resp(short, 8)).max_tokens == 8)
+check("responses.over  an over-length /v1/responses request is refused where its engine arguments are built",
+      refusal(lambda: server._prepare_responses_request(resp(long, 8))) is not None)
+CONVERSIONS.clear()
+_, _, _, kw = server._prepare_responses_request(resp(short))
+check("responses.default  an omitted max_output_tokens runs as the rest of the window (64 - 12)",
+      kw["max_tokens"] == 52)
+check("responses.once  the conversion inside the preparation is not checked a second time", CONVERSIONS == [1])
 check("stream.over  an over-length streaming completion is refused before the stream starts",
       refusal(lambda: server.stream_completion(eng, long, {}, res(8))) is not None)
 check("stream.fit  an in-window streaming completion streams", server.stream_completion(eng, short, {}, res(8)) == ("stream", 8))
@@ -686,10 +720,10 @@ while read -r verdict name; do
 		*)  ladder no "8.driver  $verdict $name" ;;
 	esac
 done <<< "$serve_out"
-if [ "$SERVE_CHECKS" -ge 26 ]; then
+if [ "$SERVE_CHECKS" -ge 34 ]; then
 	ladder ok "8.count  all $SERVE_CHECKS guard checks reported"
 else
-	ladder no "8.count  only $SERVE_CHECKS of 26 guard checks reported (the driver crashed?)"
+	ladder no "8.count  only $SERVE_CHECKS of 34 guard checks reported (the driver crashed?)"
 	head -20 "$WORK/serve-driver.err"
 fi
 
@@ -744,6 +778,7 @@ class Engine(BatchedEngine):
         self._model_name, self._loaded, self._engine, self._mllm_scheduler = "fake", True, Core(), None
 
 engine = Engine(64)
+server._engine = engine
 async def acquire(raw_request, **kw):
     return engine
 async def release(raw_request):
@@ -762,6 +797,16 @@ def check(name, r, want, text=None):
     ok = r.status_code == want and (text is None or text in r.text)
     print(("ok " if ok else "no ") + "%s (HTTP %d)" % (name, r.status_code), flush=True)
 
+def refused_unstreamed(name, r):
+    # A refusal is the JSON error object and nothing else: no SSE event was
+    # written before it, and the engine never ran.
+    ok = (r.status_code == 400 and r.headers.get("content-type", "").startswith("application/json")
+          and r.json().get("error", {}).get("type") == "BadRequestError"
+          and "maximum context length is 64 tokens" in r.json()["error"]["message"]
+          and "event:" not in r.text and "data:" not in r.text and RAN == [])
+    print(("ok " if ok else "no ") + "%s (HTTP %d, %s)" % (name, r.status_code, r.headers.get("content-type")),
+          flush=True)
+
 chat = lambda t: [{"role": "user", "content": t}]
 for stream in (False, True):
     tag = "stream" if stream else "plain"
@@ -774,10 +819,24 @@ for stream in (False, True):
           post("/v1/completions", prompt=long, max_tokens=8, stream=stream), 400, '"type":"BadRequestError"')
     check("real.cmpl.fit.%s  /v1/completions inside the window answers 200" % tag,
           post("/v1/completions", prompt=short, max_tokens=8, stream=stream), 200)
+for stream in (False, True):
+    tag = "stream" if stream else "plain"
+    RAN.clear()
+    refused_unstreamed("real.msgs.over.%s  /v1/messages over the window answers 400 before any SSE byte" % tag,
+                       post("/v1/messages", messages=chat(long), max_tokens=8, stream=stream))
+    check("real.msgs.fit.%s  /v1/messages inside the window answers 200" % tag,
+          post("/v1/messages", messages=chat(short), max_tokens=8, stream=stream), 200)
+    RAN.clear()
+    refused_unstreamed("real.resp.over.%s  /v1/responses over the window answers 400 before any SSE byte" % tag,
+                       post("/v1/responses", input=long, max_output_tokens=8, stream=stream))
+    check("real.resp.fit.%s  /v1/responses inside the window answers 200" % tag,
+          post("/v1/responses", input=short, max_output_tokens=8, stream=stream), 200)
 RAN.clear()
 post("/v1/chat/completions", messages=chat(short))
 post("/v1/completions", prompt=short)
-print(("ok " if RAN == [52, 54] else "no ") + "real.default  an omitted max_tokens runs as the rest of the window %r" % RAN)
+post("/v1/responses", input=short)
+print(("ok " if RAN[:2] == [52, 54] and len(RAN) == 3 and 0 < RAN[2] < 64 else "no ")
+      + "real.default  an omitted max_tokens runs as the rest of the window %r" % RAN)
 PY
 	REAL_CHECKS=0
 	real_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/serve-real.py" "$HERE" 2>"$WORK/serve-real.err")"
@@ -790,10 +849,10 @@ PY
 			*)  ladder no "9.driver  $verdict $name" ;;
 		esac
 	done <<< "$real_out"
-	if [ "$REAL_CHECKS" -ge 9 ]; then
+	if [ "$REAL_CHECKS" -ge 17 ]; then
 		ladder ok "9.count  all $REAL_CHECKS real-engine checks reported"
 	else
-		ladder no "9.count  only $REAL_CHECKS of 9 real-engine checks reported (the driver crashed?)"
+		ladder no "9.count  only $REAL_CHECKS of 17 real-engine checks reported (the driver crashed?)"
 		tail -20 "$WORK/serve-real.err"
 	fi
 else

@@ -33,11 +33,12 @@ derived context and which selects a rotating KV cache: a sequence that outgrows
 it loses its first tokens, and the engine answers HTTP 200 with text built on
 the context it has left. `k3sm_serve` closes that gap the way vLLM enforces
 `max_model_len`. It runs `vllm_mlx.cli` in the same process with the same
-arguments, after hooking the server so that, on `/v1/completions` and
-`/v1/chat/completions` (streaming or not), a request is checked before a
-response starts. With the window W taken from the engine's `--max-kv-size` (the
-last one in argv wins, as it does for the cache) and the prompt counted with
-the model's tokenizer after the chat template:
+arguments, after hooking the server so that, on `/v1/completions`,
+`/v1/chat/completions`, `/v1/messages` and `/v1/responses` (streaming or not),
+a request is checked before a response starts. With the window W taken from
+the engine's `--max-kv-size` (the last one in argv wins, as it does for the
+cache) and the prompt counted with the model's tokenizer after the chat
+template:
 
 - a prompt of W tokens or more is refused;
 - a prompt plus a client `max_tokens` over W is refused;
@@ -48,8 +49,8 @@ A refusal is HTTP 400 with vLLM's error object
 "type": "BadRequestError", "param": null, "code": 400}}`). The guard hooks
 engine functions by name and the process exits at start if one has moved, so
 an engine bump fails loudly rather than serving unguarded; selftest rung 9
-checks the hooks against a staged tree. `/v1/responses`, `/v1/messages` and
-multimodal input tokens are not counted.
+checks the hooks against a staged tree. Image and audio tokens a multimodal
+processor adds after the template are not counted.
 
 `k3sm_serve` also patches the prefill mask of mlx-lm's `RotatingKVCache`. The
 cache keeps its first four tokens as attention sinks, but mlx-lm 0.32.0 builds
