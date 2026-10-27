@@ -22,7 +22,7 @@
 # stale, unrelated CA, which is the quieter half of the same bug.
 #
 # The fix derives the flag from the SAME predicate that gates --tls-cert-file
-# (Config.meshServingCert), so the pair can never name CAs from two different postures.
+# (Config.clusterSignedServing), so the pair can never name CAs from two different postures.
 #
 # TWO TIERS, split by what can be proven without booting a cluster:
 #
@@ -79,14 +79,17 @@ fi
 
 # ---- b223.1 — ONE posture predicate, consumed by BOTH flags ------------------
 # The crux of the item. --tls-cert-file (what the apiserver presents) and --root-ca-file
-# (the CA published to every Pod) must be gated on the SAME predicate; two independent
-# conditions are exactly how they come to disagree. These pins redden if either flag is
-# re-split onto its own condition.
+# (the CA published to every Pod) must come from the SAME posture; two independent
+# conditions are exactly how they come to disagree. Since the apiserver serves a
+# cluster-CA-issued leaf on every topology, that posture is Config.clusterSignedServing:
+# it gates --tls-cert-file, Validate requires it before Start (b223.4), and
+# rootCAFile defaults to the cluster CA that issued the leaf (b223.2). These pins
+# redden if --tls-cert-file is re-split onto its own condition.
 p=ok
-grep -qE 'func \(c Config\) meshServingCert\(\) bool' "$EXECUTOR" || p=no
+grep -qE 'func \(c Config\) clusterSignedServing\(\) bool' "$EXECUTOR" || p=no
 grep -qE 'c\.ServingCertFile != "" && c\.ServingKeyFile != ""' "$EXECUTOR" || p=no
-grep -qE 'if cfg\.meshServingCert\(\) \{' "$SUPERVISED" || p=no
-ladder "$p" "b223.1  meshServingCert is the ONE posture predicate, and --tls-cert-file is gated on it"
+grep -A1 -E 'if cfg\.clusterSignedServing\(\) \{' "$SUPERVISED" | grep -qE '"--tls-cert-file", cfg\.ServingCertFile' || p=no
+ladder "$p" "b223.1  clusterSignedServing is the ONE posture predicate, and --tls-cert-file is gated on it"
 
 # ---- b223.2 — --root-ca-file is DERIVED, never re-pinned at a literal --------
 # The mutant check: the shipped bug was a literal filepath.Join(certDir(wd),
@@ -101,20 +104,29 @@ ladder "$d" "b223.2  --root-ca-file renders cfg.rootCAFile() (derived), not a li
 
 # ---- b223.3 — the mesh call site names the issuing CA explicitly -------------
 # cmd/k3sm sets RootCAFile beside ServingCertFile: one posture, set in one place, so a
-# reader of the mesh block sees which CA the cluster publishes. Since the server
-# decomposition the mesh block is provisionMeshPKI in serverprovision.go; "beside"
-# is pinned as both assignments living in that one function's body.
+# reader sees which CA the cluster publishes. The serving leaf is issued by
+# provisionServingLeaf on every topology, so "beside" is pinned as both assignments
+# living in that one function's body; the mesh block (provisionMeshPKI) must reach it
+# and must not re-assign RootCAFile afterwards.
+fn_body() { awk -v f="^func $1[(]" '$0 ~ f {on=1} on {print} on && /^}/ {exit}' "$SERVER_PROVISION"; }
 c=ok
-mesh_body="$(awk '/^func provisionMeshPKI[(]/ {on=1} on {print} on && /^}/ {exit}' "$SERVER_PROVISION")"
-[ -n "$mesh_body" ] || c=no
-printf '%s\n' "$mesh_body" | grep -qE 'cfg\.RootCAFile = certs\.ClusterCACertPath\(opts\.workDir\)' || c=no
-printf '%s\n' "$mesh_body" | grep -qE 'cfg\.ServingCertFile = servingCert' || c=no
-ladder "$c" "b223.3  cmd/k3sm mesh block (provisionMeshPKI) sets cfg.RootCAFile = certs.ClusterCACertPath beside the serving cert"
+leaf_body="$(fn_body provisionServingLeaf)"
+mesh_body="$(fn_body provisionMeshPKI)"
+[ -n "$leaf_body" ] && [ -n "$mesh_body" ] || c=no
+printf '%s\n' "$leaf_body" | grep -qE 'cfg\.RootCAFile = certs\.ClusterCACertPath\(opts\.workDir\)' || c=no
+printf '%s\n' "$leaf_body" | grep -qE 'cfg\.ServingCertFile = servingCert' || c=no
+printf '%s\n' "$mesh_body" | grep -qE 'provisionServingLeaf\(\*opts, cfg, logger\)' || c=no
+if printf '%s\n' "$mesh_body" | grep -qE 'cfg\.RootCAFile ='; then c=no; fi
+ladder "$c" "b223.3  provisionServingLeaf sets cfg.RootCAFile = certs.ClusterCACertPath beside the serving cert, and provisionMeshPKI reaches it"
 
 # ---- b223.4 — the misconfiguration is LOUD, not silently ignored -------------
+# Validate refuses ANY Config without the serving keypair, first and unconditionally,
+# so a RootCAFile with no serving keypair can never reach Start (b223.7 runs it).
 v=ok
-grep -qE 'ErrRootCAWithoutServingCert' "$EXECUTOR" || v=no
-grep -qE 'if c\.RootCAFile != "" && !c\.meshServingCert\(\)' "$EXECUTOR" || v=no
+grep -qE '^var ErrNoServingCert = errors\.New' "$EXECUTOR" || v=no
+validate_body="$(awk '/^func \(c Config\) Validate\(\) error/ {on=1} on {print} on && /^}/ {exit}' "$EXECUTOR")"
+printf '%s\n' "$validate_body" | sed -n 2p | grep -qE '^[[:space:]]*if !c\.clusterSignedServing\(\) \{' || v=no
+printf '%s\n' "$validate_body" | sed -n 3p | grep -qE '^[[:space:]]*return ErrNoServingCert$' || v=no
 ladder "$v" "b223.4  Validate fails closed on a RootCAFile with no serving keypair"
 
 # ---- Go leg runner (GOARCH=arm64 CGO_ENABLED=1) ----------------------------
