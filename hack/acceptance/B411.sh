@@ -31,7 +31,7 @@
 #     b411.L5  `k3sm certificate rotate --restart` once, then L2's first two tests
 #              again (the request-header CA pin must survive the rotation).
 #
-#   Without K3SM_LAB=1 the lab tier is announced PENDING and the gate exits 2: it
+#   Without K3SM_LAB=1 the lab tier is announced LAB-PENDING and the gate exits 3: it
 #   NEVER passes without the lab host run.
 #
 #   --rollback-check (K3SM_LAB=1): after a rollback to a release without the
@@ -116,11 +116,11 @@ unit ./pkg/rbac '^TestProvisionSubjectsUnchanged$' \
 	"b411.5  pkg/rbac: no grant added or widened"
 
 if [ "${K3SM_LAB:-}" != 1 ]; then
-	echo "PENDING  b411.L0-L5 lab tier: run on the server Mac with K3SM_LAB=1, KUBECONFIG and B411_SERVER_NODE set"
+	echo "LAB-PENDING  b411.L0-L5 lab tier: run on the server Mac with K3SM_LAB=1, KUBECONFIG and B411_SERVER_NODE set"
 	summary
-	echo "request-header CA: the lab tier is PENDING; this gate never passes without it" >&2
 	[ "$FAIL" -eq 0 ] || exit 1
-	exit 2
+	echo "request-header CA: LAB-PENDING: not a pass (the lab tier needs K3SM_LAB=1 on the server Mac)" >&2
+	exit 3
 fi
 
 # ---- lab tier ----------------------------------------------------------------
