@@ -43,7 +43,7 @@ Three fields in it look optional but are not:
 
 | Field | Why you must set it |
 |---|---|
-| `runtime.image` | k3sm ships no built-in serving image. Use the published `mlx-serve` image, ideally by digest. The digest for your release is recorded in [the image's build notes](../../hack/images/mlx-serve/README.md). |
+| `runtime.image` | k3sm ships no built-in serving image. Use the published `mlx-serve` image, ideally by digest. The digest for this release is in [`examples/mlxmodel.yaml`](../../examples/mlxmodel.yaml); [the image's build notes](../../hack/images/mlx-serve/README.md) show how the image is built and published. |
 | `port` | Must match the image; `mlx-serve` listens on 8000. |
 | `cache.storageClassName` | k3sm marks no StorageClass as default, so `local-path` must be named or the cache volume never binds. See [Storage](storage.md). |
 

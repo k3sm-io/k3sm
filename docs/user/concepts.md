@@ -46,8 +46,8 @@ runs under the `vm` RuntimeClass. See
 
 Each Pod gets its own `lo0` address; Services are handled by a userspace Service proxy, and each node
 serves cluster DNS on `:53` for Service A records, headless Services, StatefulSet per-Pod names, SRV
-and PTR. What a Pod resolves depends on its runtime path, and general UDP Services are still deferred
-(see [Limitations](limitations.md)).
+and PTR. What a Pod resolves depends on its runtime path. UDP ClusterIP Services work on ports 1024 and
+above, and NodePort UDP is not implemented (see [Limitations](limitations.md)).
 
 ## Storage
 

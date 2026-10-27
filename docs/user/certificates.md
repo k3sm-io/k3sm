@@ -14,7 +14,7 @@ k3sm stands up two independent self-signed CAs under the server work dir's `tls/
 
 | CA | File | Role |
 |---|---|---|
-| **cluster CA** | `tls/cluster-ca.crt` | The serving anchor. A join token embeds `K10<sha256(cluster CA)>`; a joining node pins it. Issues kubelet-serving certs and the apiserver serving cert, on a single-node server as on a multi-node one. |
+| **cluster CA** | `tls/cluster-ca.crt` | The serving anchor. A join token embeds `K10<sha256(cluster CA)>`; a joining node pins it. Issues kubelet-serving certs and the apiserver serving cert, on a single-node server as on a multi-node one, plus the image registry's serving cert and the server's one-day update-signing cert. |
 | **signing CA** | `tls/signing-ca.crt` | The apiserver's `--client-ca-file`. Issues the `system:node:<name>` client certs and the scheduler / controller-manager client certs. |
 
 **Neither CA is ever re-minted.** Re-minting the cluster CA would invalidate the pin in every
@@ -44,6 +44,9 @@ Every control-plane boot re-issues the CA-signed leaves unconditionally: the sch
 controller-manager client-cert kubeconfigs, the apiserver serving cert, and the server node's own
 kubelet serving cert, which the cluster CA signs on a single-node server as on a multi-node one and
 which is held in memory, never written to disk. A restart therefore *is* the rotation.
+
+The image registry's serving certificate and the managed update's signing certificate are also
+held in memory, and the server replaces each before it expires, without a restart.
 
 Both serving certs are issued for one year, and only a boot re-issues them. A server that runs more
 than 365 days without a restart serves an expired kubelet certificate until it is restarted.

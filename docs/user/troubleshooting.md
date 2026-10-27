@@ -11,7 +11,7 @@ fixes whatever is down sits at the bottom.
 A healthy cluster looks like this:
 
 ```
-k3sm running: 1/1 nodes ready                               v0.1.1 · kube v1.37.1 · macOS 26.1
+k3sm running: 1/1 nodes ready                               v0.2.0 · kube v1.37.1 · macOS 26.1
 
     install     ok          /Library/k3sm/k3sm · launcher /usr/local/bin/k3sm · 2 LaunchDaemons in /Library/LaunchDaemons
     netd        running     pid 512 · socket /var/lib/k3sm/run/netd.sock
@@ -30,7 +30,7 @@ A control plane that will not start looks like this. The verdict names the cause
 quotes the last line of its log:
 
 ```
-k3sm stopped: io.k3sm.server is crash-looping (12 runs, last exit 1)  v0.1.1 · kube v1.37.1 · macOS 26.1
+k3sm stopped: io.k3sm.server is crash-looping (12 runs, last exit 1)  v0.2.0 · kube v1.37.1 · macOS 26.1
 
     install     ok          /Library/k3sm/k3sm · launcher /usr/local/bin/k3sm · 2 LaunchDaemons in /Library/LaunchDaemons
     netd        running     pid 512 · socket /var/lib/k3sm/run/netd.sock
@@ -322,8 +322,9 @@ per-path picture.
 
 ## UDP Service Failures
 
-Only cluster DNS on `:53` uses UDP today; general UDP Services (ClusterIP **and** NodePort) are deferred.
-See [Limitations](limitations.md).
+ClusterIP UDP Services work on ports 1024 and above, and cluster DNS answers on `:53`. A UDP
+ClusterIP Service on a port below 1024 fails to bind, and NodePort UDP is not implemented. See
+[Limitations](limitations.md#udp-services-clusterip-only).
 
 ## LoadBalancer Stuck `<pending>`
 
@@ -395,8 +396,8 @@ Restart the control plane after fixing the conflict:
 sudo launchctl kickstart -k system/io.k3sm.server
 ```
 
-A `<pending>` Service is not visible in `kubectl describe`, because k3sm has no `EventRecorder` for
-this path yet (the event pipeline is planned). The log file is the only place the reason appears.
+Some causes are not an Event: a node that has never reported, and the bind errors listed above,
+appear only in the node's log file.
 
 ## `kubectl top` Returns No Metrics
 
@@ -435,19 +436,19 @@ Both verbs are served by the Pod's guest, so the refusal message says which half
 A garbled first screen after attaching is not a failure, because attach replays a bounded buffer and
 can start mid-escape-sequence. Redraw with `Ctrl-L`.
 
-## A Pod Cannot Pull From the Node-Local Registry
+## A Pod Cannot Pull From the Cluster Registry
 
 - **Connection refused**. The registry runs on the server, on port 6450 unless `--registry-port`
   says otherwise. A server started with `--registry-port 0` runs none. Read the address back from
   the `local-registry-hosting` ConfigMap in `kube-public` rather than remembering it.
-- **A Pod under `runtimeClassName: vm` cannot reach it at all.** The guest has its own loopback, and
-  the registry listens only on the node's. That is a documented limit, not a misconfiguration. Use
-  a registry the guest can reach, or load the image into the node's store directly.
-- **Push denied**. Pushes need the per-boot credential, pulls do not. If the control plane runs as
-  a different user than the one you are pushing from, point push at its state directory with
-  `--work-dir`.
+- **A `vm` Pod cannot reach it.** The in-cluster name `registry-k3sm:6450` needs the server to be
+  running guests or to be on a mesh (see
+  [Using It From Inside a Pod](registry.md#using-it-from-inside-a-pod)).
+- **Push denied**. Pushes need a token, pulls do not. Run `k3sm registry token` (see
+  [Pushing With Other Tools](registry.md#pushing-with-other-tools)), or for a Pod see
+  [Pushing From Inside a Pod](registry.md#pushing-from-inside-a-pod).
 
-See [Node-local registry](registry.md) for the full model.
+See [The cluster registry](registry.md) for the full model.
 
 ## Certificate Nearing Expiry
 
@@ -701,8 +702,8 @@ pods, or none.
 
 ## The Ingest Registry
 
-A server started with `--registry-port` runs a node-local registry and records whether it is
-serving. The `ingest-registry` row checks that record against the registry itself:
+Every server runs the cluster registry unless it was started with `--registry-port 0`, and records
+whether it is serving. The `ingest-registry` row checks that record against the registry itself:
 
 - **`down`**: the registry was recorded as serving but does not answer on its port, so pushes and
   pulls through it fail. Restart the server, which restarts the registry:
@@ -714,8 +715,8 @@ serving. The `ingest-registry` row checks that record against the registry itsel
   record. An unknown state means the record was written by a newer k3sm than the one you ran the
   report with.
 
-See [Node-local registry](registry.md) and
-[A Pod Cannot Pull From the Node-Local Registry](#a-pod-cannot-pull-from-the-node-local-registry).
+See [The cluster registry](registry.md) and
+[A Pod Cannot Pull From the Cluster Registry](#a-pod-cannot-pull-from-the-cluster-registry).
 
 ## The Runtime Daemon Is Unhealthy
 

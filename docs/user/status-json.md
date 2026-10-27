@@ -192,7 +192,7 @@ four.
   "summary": "1/1 nodes ready",
   "rows": [ { "name": "install", "state": "ok", "severity": "ok", "detail": "..." } ],
   "next": [ "k3sm kubectl get pods -A" ],
-  "version": { "version": "v0.1.7", "commit": "...", "dirty": false, "date": "...", "goVersion": "go1.26.1", "platform": "darwin/arm64", "kubeVersion": "v1.37.1", "kineVersion": "v0.17.2", "modules": [ { "path": "k3sm.io/k3sm", "sha": "..." } ] },
+  "version": { "version": "v0.2.0", "commit": "...", "dirty": false, "date": "...", "goVersion": "go1.26.1", "platform": "darwin/arm64", "kubeVersion": "v1.37.1", "kineVersion": "v0.17.2", "modules": [ { "path": "k3sm.io/k3sm", "sha": "..." } ] },
   "host": "26.1",
   "timestamp": "2026-10-01T09:30:00Z"
 }
@@ -368,7 +368,7 @@ reads the row. The row takes the latest release and the check time from the reco
 release with the versions running when the report is taken: the `k3sm` binary, and every node's
 kubelet version from the node list the report reads (the recorded node versions when it cannot list
 nodes). A build of an untagged commit (a Go pseudo-version) ranks by the release it leads up to, and
-`detail` calls it an untagged build, for example `a (untagged build of 0.1.8)`. Its `state` is:
+`detail` calls it an untagged build, for example `a (untagged build of 0.2.1)`.
 
 On a worker the row is read-only. After each check a server publishes the latest release and when it
 checked on its own Node (the `k3sm.io/release-latest` and `k3sm.io/release-checked` annotations),
@@ -493,8 +493,8 @@ the `node` row reads:
 
 ```json
 "workers": [
-  { "name": "node-a", "role": "server", "version": "v1.37.1+k3sm.0.1.7" },
-  { "name": "node-b", "role": "agent", "version": "v1.37.1+k3sm.0.1.6" }
+  { "name": "node-a", "role": "server", "version": "v1.37.1+k3sm.0.2.0" },
+  { "name": "node-b", "role": "agent", "version": "v1.37.1+k3sm.0.1.7" }
 ]
 ```
 
@@ -635,7 +635,7 @@ and how do I fix it". Its exit code is the verdict, exactly as `k3sm status`'s i
   "summary": "dns: the resolver at 10.43.0.10 did not answer over UDP in 3 s",
   "node": "my-mac",
   "alerts": [ { "name": "dns", "state": "down", "severity": "warn", "detail": "the resolver at 10.43.0.10 did not answer over UDP in 3 s", "remedy": "...", "alert": { "cause": "..." } } ],
-  "version": { "version": "v0.1.7", "kubeVersion": "v1.37.1" },
+  "version": { "version": "v0.2.0", "kubeVersion": "v1.37.1" },
   "timestamp": "2026-10-01T09:30:00Z"
 }
 ```
