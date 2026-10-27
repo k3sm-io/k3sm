@@ -22,7 +22,7 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26 or later** (each `go.mod` declare
 - Wrap with context: `fmt.Errorf("create pod %s: %w", name, err)`. Preserve the chain with `%w`.
 - Error strings: lowercase, no trailing punctuation. Sentinels via `errors.New`; compare with
   `errors.Is` / `errors.As`, never string matching.
-- Check every error. If intentionally ignored, `_ = f()` with a reason, or a `//nolint` note.
+- Check every error. If intentionally ignored, `_ = f()` with a reason, or a `//lint:ignore <Check> <reason>` note (see the staticcheck suppression syntax under Commit gates).
 
 ## Context
 - `ctx context.Context` is the **first** parameter of any blocking/IO/RPC function.
