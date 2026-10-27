@@ -125,10 +125,12 @@ run_test "image-cli.2b" 0 TestTagRefusesRepointWithoutForce ./cmd/k3sm/
 run_test "image-cli.2c" 0 TestImageUntagDeletesOneTag ./cmd/k3sm/
 run_test "image-cli.2d" 0 TestImageInspectReadsTheRegistry ./cmd/k3sm/
 
-# ---- image-cli.3 — the truncation refusal ---------------------------------
-# The load-bearing one. The wire's terminal frame is the ONLY thing that tells a
-# complete archive from a short one, so a save that accepted a stream without it
-# would hand an operator a tar that opens and is missing a layer.
+# ---- image-cli.3: the truncation refusal ----------------------------------
+# The load-bearing one. saveImageArchive is the stream reader behind push's
+# store form and migrate (`k3sm image save` itself reads the cluster registry).
+# The wire's terminal frame is the ONLY thing that tells a complete archive from
+# a short one, so a reader that accepted a stream without it would hand an
+# operator a tar that opens and is missing a layer.
 run_test "image-cli.3a" 6 TestSaveImageArchiveVerifiesTheStream ./cmd/k3sm/
 
 # ---- image-cli.4 — push's store form, and its unpacker --------------------
