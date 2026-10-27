@@ -772,6 +772,27 @@ func resolvePurgeTarget(userFlag, sudoUser, sudoUID string) (name, home string, 
 	return purgeTarget(sudoUser, sudoUID)
 }
 
+// resolveThroughMissing returns path with its symlinks resolved even when its tail
+// does not exist: the longest existing ancestor is resolved and the rest is put back.
+// EvalSymlinks alone fails on a missing path, which left /var/lib/k3sm unresolved
+// beside a home resolved to /private/var, so the prefix check below passed only on a
+// Mac where k3sm was already installed.
+func resolveThroughMissing(path string) string {
+	path = filepath.Clean(path)
+	var rest []string
+	for p := path; ; {
+		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(append([]string{resolved}, rest...)...)
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return path
+		}
+		rest = append([]string{filepath.Base(p)}, rest...)
+		p = parent
+	}
+}
+
 // explicitPurgeTarget resolves --user. The uid and home come only from the
 // account lookup, never from SUDO_UID. It refuses root, a uid below 501, a
 // service account (a leading underscore, nobody, daemon; nobody's uid is
@@ -800,10 +821,7 @@ func explicitPurgeTarget(name string) (string, string, error) {
 		return "", "", fmt.Errorf("resolve the home of --user %s: %w", name, err)
 	}
 	home = filepath.Clean(home)
-	dataRoot := filepath.Clean(install.DefaultDataRoot)
-	if resolved, err := filepath.EvalSymlinks(dataRoot); err == nil {
-		dataRoot = resolved
-	}
+	dataRoot := resolveThroughMissing(install.DefaultDataRoot)
 	if home == "/" || dataRoot == home || strings.HasPrefix(dataRoot, home+"/") {
 		return "", "", fmt.Errorf("--user %s has home %s, which contains the cluster data; refusing", name, home)
 	}
