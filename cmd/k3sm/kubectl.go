@@ -43,8 +43,9 @@ var kubectlExec func(bin string, argv []string, env []string) error = syscall.Ex
 // with the bundled kubectl the server downloaded into that work dir. An ordinary
 // user cannot read that directory — it is mode 0700 and owned by the service
 // user — so for them k3sm falls back to kubectl's own kubeconfig loading rules
-// ($KUBECONFIG, else ~/.kube/config) pinned to the `k3sm` context that
-// `sudo k3sm install` merged there, run through the kubectl the installer laid
+// ($KUBECONFIG, else ~/.kube/config) pinned to the context
+// `sudo k3sm install` merged there (`k3sm` unless --kubeconfig-name named
+// another), run through the kubectl the installer laid
 // down beside the daemon. K3SM_WORK_DIR pins a non-default `k3sm server
 // --work-dir` and, when set, is used verbatim with no fallback.
 func runKubectl(args []string) error {
@@ -92,10 +93,10 @@ func envWithKubeconfig(env []string, path string) []string {
 	return append(out, "KUBECONFIG="+path)
 }
 
-// installedContextName is the cluster/user/context name `k3sm install` merges
-// into the invoking user's kubeconfig (install.AdminKubeconfig), and therefore
-// the context `k3sm kubectl` selects when it falls back to that kubeconfig. It
-// is also the `k3sm kubeconfig --context-name` default.
+// installedContextName is the default cluster/user/context name `k3sm install`
+// merges into the invoking user's kubeconfig (install.DefaultKubeconfigName),
+// used when no --kubeconfig-name is recorded or the record cannot be read
+// (installedKubeconfigName).
 const installedContextName = install.DefaultKubeconfigName
 
 // installedKubeconfigName is the context name the installed control plane's

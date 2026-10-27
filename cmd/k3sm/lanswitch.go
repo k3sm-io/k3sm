@@ -96,7 +96,8 @@ type lanSwitch struct {
 // newLANSwitch reads the record at recordPath and returns a switch in that
 // state. An absent record is LAN access on (an install from before the switch
 // served every interface). An unusable one is off, the narrower exposure, and
-// the error is reported in the applied file and the log.
+// the error is logged; the applied file then reports off with no error until the
+// next apply.
 func newLANSwitch(recordPath, appliedPath string, log *slog.Logger) *lanSwitch {
 	s := &lanSwitch{
 		recordPath:  recordPath,

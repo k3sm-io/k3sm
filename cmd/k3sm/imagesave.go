@@ -33,10 +33,10 @@ import (
 	"k3sm.io/k3sm/pkg/oci"
 )
 
-// errSaveTruncated is the verdict a caller acts on differently from every other
-// export failure: bytes arrived, but the archive is not the whole image. It is a
-// sentinel because "the export failed" and "the export is incomplete" call for
-// the same retry but for very different trust in what is already on disk.
+// errSaveTruncated reports that bytes arrived but the archive is not the whole
+// image. It is a sentinel so a caller can tell "the export is incomplete" from
+// "the export failed": the retry is the same, but the trust in what reached disk
+// is not.
 var errSaveTruncated = errors.New("the archive arrived truncated")
 
 // imageSave exports one image from the cluster registry as a tarred OCI image

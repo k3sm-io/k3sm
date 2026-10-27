@@ -77,7 +77,7 @@ func TestRunServerEnrollsSelfBeforeTheDatapathAndJoinListener(t *testing.T) {
 	}
 }
 
-// TestRunServerSharesOneMeshEnroller pins R8's "same instance": the mutex that
+// TestRunServerSharesOneMeshEnroller pins the "same instance" rule: the mutex that
 // serializes this node's index-0 claim against a concurrent worker join only does
 // anything if both callers hold the SAME enroller. Two constructions would
 // contend on nothing.
@@ -152,7 +152,7 @@ func TestServerMeshBringUpIsLogAndContinue(t *testing.T) {
 // The proxy's mesh-egress source and the peer mesh-egress /32s the NetworkPolicy
 // table always-allows were BOTH deliberately left unset on the server, because the
 // dialer bound the source unconditionally and any non-local value broke every
-// backend dial. With the bind destination-scoped (d1) the wiring is safe, and its
+// backend dial. With the bind destination-scoped the wiring is safe, and its
 // absence is once again a real gap: cross-node backend dials sourced from the
 // kernel default are dropped by the peer's wireguard as outside AllowedIPs.
 //

@@ -264,7 +264,7 @@ func manifestList(doc pruneJSON) []string {
 	return got
 }
 
-// TestImagePruneDryRunReportsRegistryAndCache is B910's gate: `k3sm image
+// TestImagePruneDryRunReportsRegistryAndCache is the gate for the prune plan: `k3sm image
 // prune` plans the deletion of the registry's untagged manifests AND the
 // eviction of this node's cache, deletes nothing without --force, and reports
 // both halves in one -o json document.

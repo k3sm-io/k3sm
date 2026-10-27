@@ -66,9 +66,10 @@ type netdOptions struct {
 	clusterCA string
 	nodeIP    string
 	// dnsVIP and clusterDomain are the node resolver entry's server and
-	// cluster match domain. Their defaults are the same constants the server
-	// and agent --dns-vip/--cluster-domain flags default to, and the installed
-	// plists pass neither, so the three daemons agree by construction.
+	// cluster match domain. clusterDomain defaults to dns.DefaultClusterDomain,
+	// the constant the server and agent --cluster-domain flags default to; dnsVIP
+	// defaults to dns.DefaultDNSVIP, whose value matches the server and agent
+	// --dns-vip default (a literal there). The installed plists pass neither flag.
 	dnsVIP        string
 	clusterDomain string
 	// lbPrivilegedPorts is --lb-privileged-ports, the LoadBalancer ports below

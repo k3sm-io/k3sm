@@ -116,7 +116,7 @@ func TestServerMeshKeyRefIsNotTheAgentRef(t *testing.T) {
 	}
 }
 
-// TestServerMeshEndpointPrefersAnUnderlayAddress pins d3's endpoint rule: a
+// TestServerMeshEndpointPrefersAnUnderlayAddress pins the endpoint rule: a
 // joining worker has no mesh yet, so the endpoint it dials for the wireguard
 // handshake has to be an address the host answers on TODAY. It falls back to the
 // configured node IP only when that IP is loopback (a single-host cluster, where

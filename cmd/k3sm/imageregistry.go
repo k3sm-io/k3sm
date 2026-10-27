@@ -317,8 +317,9 @@ func isNotFound(err error) bool {
 }
 
 // registryError classifies a cluster-registry failure: a name the registry
-// does not hold is errNotInRegistry, a refused credential is errPushAuth, and
-// an unreachable registry is errPushNetwork, the sentinels push already uses.
+// does not hold is errNotInRegistry and a refused credential is errPushAuth (the
+// sentinel push uses); any other status, a missed deadline (which names
+// --timeout) or a transport failure is wrapped with what was being done.
 func registryError(what string, err error) error {
 	if isNotFound(err) {
 		return fmt.Errorf("%s: %w", what, errNotInRegistry)

@@ -37,9 +37,9 @@ import (
 // nodeRestrictionAllowedLabelNamespaces below.
 //
 // Derived from k8s.io/kubelet/pkg/apis/well_known_labels.go:35-48 (`kubeletLabels`,
-// vendored v0.36.5), which the v1.36.2 NodeRestriction admission plugin consults via
-// kubeletapis.IsKubeletLabel — see k8s.io/kubernetes@v1.36.2
-// plugin/pkg/admission/noderestriction/admission.go:601-620 (getForbiddenLabels).
+// vendored v0.37.1), which the v1.37.1 NodeRestriction admission plugin consults via
+// kubeletapis.IsKubeletLabel — see k8s.io/kubernetes@v1.37.1
+// plugin/pkg/admission/noderestriction/admission.go (getForbiddenLabels).
 //
 // It is written out rather than derived so a reader can see the set, and it is
 // asserted equal to the live kubeletapis.KubeletLabels() by the first subtest — a
@@ -67,7 +67,7 @@ var nodeRestrictionAllowedLabelNamespaces = []string{
 	"node.kubernetes.io",
 }
 
-// nodeRestrictionForbids reports whether the v1.36.2 NodeRestriction admission
+// nodeRestrictionForbids reports whether the v1.37.1 NodeRestriction admission
 // plugin would reject a `system:node:<name>` identity setting key on its own Node.
 //
 // It is the upstream rule, re-expressed over the upstream predicate rather than over
@@ -105,8 +105,8 @@ func isKubernetesLabelNamespace(ns string) bool {
 		ns == "k8s.io" || strings.HasSuffix(ns, ".k8s.io")
 }
 
-// TestConfigureNodeStampsNoForbiddenLabels is the (lab defect D4) regression
-// gate: a JOINED WORKER registers as `system:node:<name>`, so every label on the
+// TestConfigureNodeStampsNoForbiddenLabels is the regression
+// gate for a joined worker's registration being rejected by NodeRestriction: a JOINED WORKER registers as `system:node:<name>`, so every label on the
 // Node object it creates — and re-asserts on every status tick — passes through
 // NodeRestriction. One forbidden key rejects the whole create/patch and the worker
 // never registers.

@@ -42,10 +42,12 @@ import (
 	"k3sm.io/k3sm/pkg/version"
 )
 
-// runInstall lays down k3sm's two root LaunchDaemons (io.k3sm.netd as root,
-// io.k3sm.server as the _k3sm user) via the install package's system seam. It is
+// runInstall lays down k3sm's LaunchDaemons (io.k3sm.netd as root, and
+// io.k3sm.server, or io.k3sm.agent with --agent, as the _k3sm user; plus the root
+// io.k3sm.datavol oneshot when this Mac has a data volume) via the install
+// package's system seam. It is
 // the single root step (run as `sudo k3sm install`): it copies THIS binary into
-// the root-owned install dir, writes the plists, bootstraps both daemons, and
+// the root-owned install dir, writes the plists, bootstraps the daemons, and
 // writes the admin kubeconfig to the invoking human's home ($SUDO_USER), owned by
 // them. Code signing and notarization happen at release time, in hack/release.
 func runInstall(args []string) error {

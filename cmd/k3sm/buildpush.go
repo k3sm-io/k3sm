@@ -29,14 +29,14 @@ import (
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
-// errNoNodeRegistry reports that `k3sm build --push` was given a BARE tag on a
-// node whose ingest registry is not running, so there is no
-// "localhost:<port>" for the image to go to.
+// errNoNodeRegistry reports that the cluster registry cannot be found from this
+// Mac: the kubeconfig carries no cluster CA, or the registry-k3sm Service
+// publishes no readable ready EndpointSlice.
 //
-// It is a sentinel, and the push is REFUSED rather than skipped, because the two
-// silent alternatives are both worse than an error: pushing a bare tag to Docker
-// Hub would publish a private image to the internet, and doing nothing would
-// exit 0 on a command whose entire purpose was the upload.
+// A push is REFUSED rather than skipped, because the two silent alternatives are
+// both worse than an error: pushing a bare tag to Docker Hub would publish a
+// private image to the internet, and doing nothing would exit 0 on a command
+// whose entire purpose was the upload.
 var errNoNodeRegistry = errors.New("no cluster registry to push to")
 
 // errForeignTag reports a tag that names a registry other than the cluster

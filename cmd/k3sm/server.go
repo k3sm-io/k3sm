@@ -388,14 +388,14 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// server's database. The executor refuses that outright; this flag is how a
 	// second control plane on the same host gets a datastore of its own.
 	fs.IntVar(&opts.kinePort, "kine-port", executor.DefaultKinePort, "kine (etcd shim) listen port on 127.0.0.1 — every control plane on a host needs its own")
+	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
+	fs.StringVar(&opts.lbPrivilegedPorts, dataroot.LBPrivilegedPortsFlag, dataroot.DefaultLBPrivilegedPorts, lbPrivilegedPortsUsage)
+	fs.StringVar(&opts.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
 	// The node's kubelet-API port. Same per-server reasoning as --kine-port, one
 	// process further down the bring-up: a second server on the default port gets
 	// a healthy control plane and then a node that dies with "listen tcp :10250:
 	// bind: address already in use". This renumbers the LISTENER ONLY; it does not
 	// change the bind address or the API's authn posture.
-	fs.StringVar(&opts.nodePortAddresses, nodePortAddressesFlag, "", nodePortAddressesUsage)
-	fs.StringVar(&opts.lbPrivilegedPorts, dataroot.LBPrivilegedPortsFlag, dataroot.DefaultLBPrivilegedPorts, lbPrivilegedPortsUsage)
-	fs.StringVar(&opts.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
 	fs.IntVar(&opts.kubeletPort, "kubelet-port", ports.KubeletAPIPort, "kubelet HTTP API (logs/exec/stats) listen port — every node on a host needs its own")
 	// The scheduler's and controller-manager's secure ports, the last two fixed
 	// singletons in a server's listener set. A second server on the defaults gets
@@ -895,11 +895,12 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		// The cluster's one registry name, fetched from this server's own
 		// registry on loopback; zero when it runs none.
 		flatRegistry: w.registryPuller.Flat,
-		// This server's own kine port — the SAME resolved value (flag or default)
-		// that reaches executor.Config.KinePort — so every pod's SBPL denies
-		// connect() to the node's plaintext datastore listener. The deny is by
-		// port, not address (Seatbelt cannot filter by IP), so a Service that
-		// reuses this port number is also unreachable from confined pods.
+		// The loopback ports this server's datastore listens on (deniedLocalPorts:
+		// the --kine-port value that reaches executor.Config.KinePort, plus the etcd
+		// metrics port in the etcd posture), so every pod's SBPL denies connect() to
+		// them. The deny is by port, not address (Seatbelt cannot filter by IP), so a
+		// Service that reuses one of these port numbers is also unreachable from
+		// confined pods.
 		deniedLocalPorts: opts.deniedLocalPorts(),
 		// The resolver's metrics, so the node's kubelet endpoint serves the
 		// server-side counters beside its own.
@@ -1250,8 +1251,8 @@ func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP, node
 // graph that follows), because a node that refuses to start is strictly worse than
 // a node missing an advisory.
 //
-// The set is POSTURE-INDEPENDENT — mode is logged, never branched on. That is the
-// The fix: the foreign-user ceiling used to be provisioned only under the netd
+// The set is POSTURE-INDEPENDENT — mode is logged, never branched on. The
+// foreign-user ceiling used to be provisioned only under the netd
 // helper backend, so a `--network none`/`direct` cluster ran with no such policy
 // object at all and admitted the very pods the ceiling exists to reject.
 //
@@ -1268,7 +1269,8 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	}
 	// Honest-gap Warn advisories on Services: externalTrafficPolicy: Local
 	// is not honored (the userspace splice does not preserve client source IP) and
-	// UDP ports have no datapath yet (the proxy opens no UDP listener). They warn at
+	// UDP is relayed for a ClusterIP only, so a UDP port on a NodePort, a LoadBalancer
+	// port, or a port below 1024 has no datapath (see pkg/policy udpServiceExpr). They warn at
 	// the API (never reject) so the divergence is visible in kubectl. Provisioned
 	// unconditionally — these are inherent Service-model limits, not mode-specific.
 	if err := policy.EnsureExternalTrafficPolicyLocalWarn(ctx, cs); err != nil {
@@ -1329,7 +1331,7 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	// MUTATING policies on DaemonSet templates and DaemonSet-owned Pods: the DS
 	// controller picks nodes from the template, and the CREATE-Warn advisory above
 	// never reaches a DS pod's author, so without the provider toleration a DaemonSet
-	// schedules nowhere. Inject it (never the os=darwin nodeSelector — Res.7).
+	// schedules nowhere. Inject it (never the os=darwin nodeSelector).
 	// CHANGES the stored object, unlike the Warn/Deny VAPs. Log-and-continue; writes
 	// admissionregistration.k8s.io/v1, which the pinned apiserver serves by default.
 	// Runs before startEmbeddedAddons, so an add-on DaemonSet is admitted with it.
@@ -1363,9 +1365,9 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	// scheduling.nodeSelector pinning it to VZ-capable nodes via
 	// k3sm.io/virtualization). Log-and-continue (NOT fail-closed like rbac): a missing
 	// RuntimeClass cannot lock workers out — it only makes a vm pod unschedulable / a
-	// vm-pod admission rejected — so it never halts bring-up. No node advertises the
-	// VZ label today (runtimed reports no per-backend availability), so a vm pod stays
-	// Pending — the correct posture for this non-VZ foundation.
+	// vm-pod admission rejected — so it never halts bring-up. A node advertises the
+	// label only when runtimed reports the VZ backend available
+	// (applyVirtualizationLabel), so on a node without it a vm pod stays Pending.
 	if err := runtimeclass.Provision(ctx, cs); err != nil {
 		logger.Error("provision vm runtime class", "err", err)
 	}

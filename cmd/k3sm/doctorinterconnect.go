@@ -268,8 +268,9 @@ func checkICBridge(f icFacts) checkResult {
 	return checkResult{name: icBridge, status: statusPass, detail: "bridge0 members: " + members}
 }
 
-// checkICNetd reports whether netd answers on its socket: it is the only
-// process that adds or removes an interconnect address.
+// checkICNetd reports whether netd answers on its socket: it is the process that
+// adds and removes this node's interconnect addresses while k3sm runs (uninstall
+// sweeps the ones its record names).
 func checkICNetd(err error) checkResult {
 	switch {
 	case err == nil:

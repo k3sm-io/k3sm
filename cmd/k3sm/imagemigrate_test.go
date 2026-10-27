@@ -181,7 +181,7 @@ func (r *migrationRig) registryDigest(t *testing.T, flat string) string {
 	return desc.Digest.String()
 }
 
-// TestStoreMigrationImportsEveryUserImageAndLosesNone is B911's gate: every
+// TestStoreMigrationImportsEveryUserImageAndLosesNone is the gate for the store migration: every
 // user image in the node store reaches the cluster registry at its digest; a
 // public cache entry is left a cache entry; a tag the registry holds at
 // another digest keeps the registry's image while the node's copy lands under

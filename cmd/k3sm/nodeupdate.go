@@ -95,8 +95,8 @@ func productionUpdateDeps(opts nodeOptions, ready func(context.Context) bool) no
 
 // newNodeUpdater builds the node's update watcher, or nil when this node
 // cannot apply a managed update: no apiserver client, no k3sm-netd root helper
-// (the install step is the helper's), or no update root (the standalone
-// `k3sm node`, which no install manages).
+// (the install step is the helper's), no update root (the standalone
+// `k3sm node`, which no install manages), or no cluster CA to pin the signer to.
 func newNodeUpdater(opts nodeOptions, cs kubernetes.Interface, deps nodeUpdateDeps, logger *slog.Logger) (*update.Watcher, error) {
 	if cs == nil || !opts.netMode.UsesHelper() || opts.updateRoot == "" || len(opts.updateClusterCAPEM) == 0 {
 		return nil, nil

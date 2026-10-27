@@ -475,7 +475,7 @@ func registerNodeFlags(fs *flag.FlagSet, opts *nodeOptions) {
 }
 
 // runNode registers this Mac as a Virtual Kubelet node and runs pods via the
-// selected runtime (the host-process skeleton, or the runtimed image runtime).
+// selected runtime (the host-process runtime, or the runtimed image runtime).
 func runNode(args []string) error {
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	opts := nodeOptions{}
@@ -584,14 +584,14 @@ func defaultNodePodCIDR() string {
 // apiserver node-proxy rejects a loopback NodeInternalIP — its isProxyableHostname
 // runs net.IP.IsGlobalUnicast(), which loopback fails — with HTTP 400, breaking
 // `kubectl top node` (GET /nodes/<n>/proxy/stats/summary). Off the datapath
-// (`k3sm dev` rootless) proxyableNodeIP does the same job with a host interface
-// address, since no adapter is there to alias a derived one.
+// (`k3sm dev` rootless) it stays 127.0.0.1 and node-proxy answers 400; logs and
+// exec still work (see proxyableNodeIP).
 const loopbackNodeIP = "127.0.0.1"
 
 // isLoopbackDefault reports whether nodeIP is the shipped --node-ip default, i.e.
 // the operator did not choose an address. It is the ONE value predicate its call
-// sites share (server.go's mesh rewrite, node.go's advertise derivation, and the
-// LB/ingress config assembly) — a
+// sites share (serverprovision.go's mesh rewrite, meshNodeIP, and node.go's advertise
+// derivation, which the LB/ingress config reaches through advertisedNodeIP) — a
 // flag.Visit-style "was it set?" predicate would diverge from it the moment a
 // caller passes 127.0.0.1 explicitly, and a bare "127.0.0.1" literal (which one
 // site carried) diverges from the const the moment the default moves.
@@ -766,7 +766,7 @@ const nodeAPIRequestTimeout = 90 * time.Second
 // startNode itself needs a live apiserver.
 //
 // The budget is QPS 50 / Burst 100, the upstream kubelet's kubeAPIQPS and
-// kubeAPIBurst defaults (k8s v1.36.2), which is the fidelity target: the node
+// kubeAPIBurst defaults (k8s v1.37.1), which is the fidelity target: the node
 // stands in for a kubelet and should pace itself like one. BuildConfigFromFlags
 // leaves both fields at zero, which client-go turns into 5/10 — one bucket the
 // node's status writes, informers, leases, events, and volume reads all share,
@@ -1630,17 +1630,6 @@ func checkNodeAliasAddr(nodeIP, podCIDR, serviceCIDR string) error {
 		errNodeAliasOutsidePodNetwork, ip, podCIDR, podnet.ClusterPodCIDR, serviceCIDR)
 }
 
-// runtimedConfig builds the runtimed runtime configuration from the node options:
-// the on-disk root, the DNS shim, the apiserver client, the helper-socket deny,
-// and the per-pod Seatbelt egress VIPs. ResolverVIP is the cluster DNS VIP (the
-// --dns-vip flag, defaulting to the cluster DNS VIP — never runtimed's legacy
-// 10.96.0.10) and APIServerVIP is the kubernetes Service ClusterIP derived from
-// the cluster service CIDR; runtimed threads both into its per-pod sandbox.Posture
-// so a confined pod's DNS + in-pod client-go reach the node-local resolver / API
-// VIP. ClusterDomain (the --cluster-domain flag) is the in-pod shim search
-// suffix the provider injects as K3SM_DNS_* env so cluster Service names resolve
-// env; it MUST match the resolver's served zone. It is pure (no I/O) so the VIP +
-// domain wiring is unit-tested directly.
 // resolvePathShim returns the path-rebase DYLD shim dylib installed beside the
 // k3sm binary (/Library/k3sm/<PathShimName> in the packaged layout), or "" when
 // absent — so a from-source/dev run without the staged shim leaves absolute mount
@@ -1697,6 +1686,18 @@ func resolveSiblingDylib(name string) string {
 	return p
 }
 
+// runtimedConfig builds the runtimed runtime configuration from the node options:
+// the on-disk root, the DNS shim, the apiserver client, the helper-socket deny,
+// and the per-pod Seatbelt egress VIPs. ResolverVIP is the cluster DNS VIP (the
+// --dns-vip flag, defaulting to the cluster DNS VIP — never runtimed's legacy
+// 10.96.0.10) and APIServerVIP is the kubernetes Service ClusterIP derived from
+// the cluster service CIDR; runtimed threads both into its per-pod sandbox.Posture
+// so a confined pod's DNS + in-pod client-go reach the node-local resolver / API
+// VIP. ClusterDomain (the --cluster-domain flag) is the in-pod shim search
+// suffix the provider injects as K3SM_DNS_* env so cluster Service names resolve; it
+// MUST match the resolver's served zone. It is pure (no I/O) so the VIP + domain
+// wiring is unit-tested directly.
+//
 // opts.standalone (set ONLY by runNode) skips the empty-dnsVIP default-fill
 // below, leaving ResolverVIP "". dns.PodDNSConfig then builds a DNSConfig with an
 // empty ClusterDNSIP, which Validate() rejects — the SAME "dnsCfg not usable"
@@ -2018,8 +2019,8 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	// labels — the kubelet.kubernetes.io/ and node.kubernetes.io/ namespaces plus a
 	// fixed list (hostname, os, arch, the topology and instance-type keys); every
 	// other kubernetes.io/k8s.io-namespaced key is forbidden on create AND on update
-	// (k8s v1.36.2 plugin/pkg/admission/noderestriction/admission.go:519-524,
-	// 556-560, 601-620, over k8s.io/kubelet/pkg/apis/well_known_labels.go). role is
+	// (k8s v1.37.1 plugin/pkg/admission/noderestriction/admission.go, over
+	// k8s.io/kubelet/pkg/apis/well_known_labels.go). role is
 	// not on that list, so leaving it here makes the apiserver reject the worker's
 	// Node create outright — and, since the label set rides every status patch, its
 	// heartbeat too. The in-process server node never noticed: it acts as
@@ -2030,7 +2031,7 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	// workloads to itself, which is exactly what the plugin exists to prevent).
 	delete(labels, "kubernetes.io/role")
 
-	// Well-known topology labels, GA keys only (the v1.36.2 scheduler reads these; the
+	// Well-known topology labels, GA keys only (the v1.37.1 scheduler reads these; the
 	// deprecated failure-domain.beta.kubernetes.io aliases are cruft). zone is set to THIS
 	// node's name — == kubernetes.io/hostname by construction (same `name`): a DELIBERATE
 	// per-node failure domain, since each Mac is a genuine independent one. A zone
@@ -2088,8 +2089,8 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	// (all in the one io.k3sm.server job). Capacity stays the true hw.memsize; cpu/pods
 	// pass through unchanged. This is a SCHEDULING-ONLY hold-back — no kubepods cgroup
 	// enforces it at runtime, so it lowers (not eliminates) the chance macOS jetsam kills
-	// the largest process (the control plane); the runtime fix (a jetsam-priority band)
-	// is a jetsam-priority band, not yet built. See nodeAllocatable / DESIGN §5a.
+	// the largest process (the control plane); the runtime fix, a jetsam-priority band,
+	// is not yet built. See nodeAllocatable / DESIGN §5a.
 	capMem := n.Status.Capacity.Memory().Value()
 	reserve := memReserveBytes(capMem)
 	n.Status.Allocatable = nodeAllocatable(n.Status.Capacity, reserve)
@@ -2257,9 +2258,10 @@ var errHalfKubeletServingPair = errors.New("kubelet serving keypair is half-pres
 // cert's SANs include loopback, the node name, and EVERY address in nodeIPs —
 // which must cover the registered NodeInternalIP, since the apiserver (started
 // with --kubelet-preferred-address-types=InternalIP) dials that address by IP and
-// verifies the cert against it. The advertised address and the registered
-// InternalIP diverge in the no-datapath posture (see proxyableNodeIP), so both
-// are passed; duplicates and unparseable entries are dropped.
+// verifies the cert against it. The two addresses passed (opts.nodeIP and
+// the registered InternalIP) differ only on a datapath node left at the loopback
+// --node-ip default, where the InternalIP is the derived pod-range .1 (see
+// advertisedNodeIP); duplicates and unparseable entries are dropped.
 //
 // servingCertPEM/servingKeyPEM are the CLUSTER-CA-ISSUED pair this node was given
 // (a worker in its join response, a server from its own mint, on every topology).
@@ -2272,7 +2274,7 @@ var errHalfKubeletServingPair = errors.New("kubelet serving keypair is half-pres
 // The CLIENT half is not optional and is not this function's to choose: auth
 // stamps tls.RequireAndVerifyClientCert plus the cluster's client-identity CA onto
 // the result, so the listener authenticates the apiserver instead of serving
-// exec/attach to anything that can reach the wildcard bind. Taking auth as
+// exec/attach to anything that can reach the listener. Taking auth as
 // a required PARAMETER rather than an optional field is deliberate: there is no
 // argument list that produces a serving config without client authentication, so
 // the posture cannot be lost by forgetting to opt into it. The issued-pair path
