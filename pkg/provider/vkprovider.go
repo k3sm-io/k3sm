@@ -275,7 +275,7 @@ func (v *VKProvider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summar
 }
 
 // GetMetricsResource serves the VK /metrics/resource endpoint — the kubelet
-// resource-metrics scrape target an bundled metrics-server (pkg/addons) reads to
+// resource-metrics scrape target a bundled metrics-server (pkg/addons) reads to
 // populate metrics.k8s.io (`kubectl top`, HPA-on-CPU).
 //
 // It transcodes the SAME Summary snapshot GetStatsSummary serves when the Runtime
