@@ -251,7 +251,7 @@ run_test "builder.10c" 4 TestBuildPushFlag ./cmd/k3sm/
 run_test "builder.10d" 2 TestBuildPushToRegistry ./cmd/k3sm/
 # The upload must go through the ONE path `k3sm image push` uses. A second
 # remote.Write would fork the credential chain, the plain-HTTP selection and the
-# failure taxonomy — and the fork is the copy nobody re-reads. The recording,
+# failure taxonomy, and the fork is the copy nobody re-reads. The recording,
 # --push to another registry, the image verb and load/import all reach
 # pushImage/pushIndex, and those are the only uploads in the CLI.
 b10e=ok
