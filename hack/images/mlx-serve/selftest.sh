@@ -27,6 +27,9 @@
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
 #     when a staged tree is present, against the real vllm-mlx server, on the
 #     completion, chat, Messages and Responses routes, streaming or not;
+#   * k3sm-serve lowers --max-kv-size for a model whose config.json geometry
+#     costs more KV bytes per token than k3sm sized it for, and leaves it alone
+#     for a smaller model, a missing config, a missing field and the off switch;
 #   * with a staged tree, the patched RotatingKVCache prefill mask keeps the
 #     attention-sink columns attended after a trim, which the pinned mlx-lm's
 #     own mask does not;
@@ -725,6 +728,154 @@ if [ "$SERVE_CHECKS" -ge 34 ]; then
 else
 	ladder no "8.count  only $SERVE_CHECKS of 34 guard checks reported (the driver crashed?)"
 	head -20 "$WORK/serve-driver.err"
+fi
+
+# ---- 8k — --max-kv-size clamped to the model's KV geometry ------------------
+# k3sm sizes --max-kv-size from a fixed 157286 KV bytes per token (a 3B model);
+# a larger model costs more, so k3sm_serve lowers the pin at start from the
+# model's config.json. Here against fake config.json files shaped like the real
+# Qwen2.5-32B, Qwen2.5-3B, Llama-3.3-70B and Gemma 3 (text_config) ones, a fake
+# Hub client and a fake engine CLI: no network, no engine.
+cat > "$WORK/kv-driver.py" <<'PY'
+import argparse, json, os, sys, types
+sys.path.insert(0, sys.argv[1])
+work = sys.argv[2]
+import k3sm_serve as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+def config(name, **fields):
+    d = os.path.join(work, name)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "config.json"), "w") as f:
+        json.dump(fields, f)
+    return d
+
+Q32 = config("qwen2.5-32b", num_hidden_layers=64, num_attention_heads=40, num_key_value_heads=8, hidden_size=5120)
+Q3 = config("qwen2.5-3b", num_hidden_layers=36, num_attention_heads=16, num_key_value_heads=2, hidden_size=2048)
+L70 = config("llama-3.3-70b", num_hidden_layers=80, num_attention_heads=64, num_key_value_heads=8, head_dim=128,
+             hidden_size=8192)
+G27 = config("gemma-3-27b", model_type="gemma3", text_config={"num_hidden_layers": 62, "num_attention_heads": 32,
+             "num_key_value_heads": 16, "head_dim": 128, "hidden_size": 5376})
+NOFIELD = config("nolayers", num_attention_heads=40, num_key_value_heads=8, hidden_size=5120)
+EMPTY = os.path.join(work, "no-config")
+os.makedirs(EMPTY, exist_ok=True)
+
+# A stand-in for vllm-mlx's serve parser: positional model, last --max-kv-size wins.
+P = argparse.ArgumentParser()
+P.add_argument("command")
+P.add_argument("model", nargs="?")
+P.add_argument("--max-kv-size", type=int)
+P.add_argument("--host"); P.add_argument("--port"); P.add_argument("--max-num-seqs")
+P.add_argument("--continuous-batching", action="store_true")
+def parse(argv):
+    a, _ = P.parse_known_args(argv)
+    return a.model, a.max_kv_size
+
+def argv(model, *tail, w="32768"):
+    return ["serve", "--continuous-batching", "--host", "0.0.0.0", "--port", "8080", model, "--port", "8080",
+            "--max-kv-size", w, "--max-num-seqs", "4", "--continuous-batching"] + list(tail)
+
+def run(args, env=None):
+    lines = []
+    out = ks.clamp_max_kv_size(args, env or {}, parse=parse, say=lines.append)
+    return out, lines
+
+a = argv(Q32)
+out, lines = run(a)
+check("clamp.32b  a Qwen2.5-32B geometry (262144 B/token) lowers 32768 to floor(32768 x 157286 / 262144) = 19660",
+      parse(out)[1] == 19660 and len(out) == len(a) and [t for t in out if t != "19660"] == [t for t in a if t != "32768"])
+check("clamp.log  one line names W, the geometry, both figures and the clamped value",
+      len(lines) == 1 and all(s in lines[0] for s in ("32768", "64 layers", "8 KV heads", "head_dim 128", "262144",
+                                                       "157286", "19660")))
+out, lines = run(argv(L70))
+check("clamp.70b  a Llama-3.3-70B geometry with an explicit head_dim (327680 B/token) lowers 32768 to 15728",
+      parse(out)[1] == 15728 and len(lines) == 1)
+out, lines = run(argv(G27))
+check("clamp.textconfig  a multimodal config's nested text_config is the geometry read (507904 B/token, 10147)",
+      parse(out)[1] == 10147 and "62 layers" in lines[0])
+a = argv(Q3)
+out, lines = run(a)
+check("noclamp.3b  a Qwen2.5-3B geometry (36864 B/token) leaves W alone, silently", out == a and lines == [])
+a = argv(EMPTY)
+out, lines = run(a)
+check("missing.config  a model with no config.json leaves W alone, with one line", out == a and len(lines) == 1)
+a = argv(NOFIELD)
+out, lines = run(a)
+check("missing.field  a config without num_hidden_layers leaves W alone, with one line",
+      out == a and len(lines) == 1 and "num_hidden_layers" in lines[0])
+a = argv(Q32)
+out, lines = run(a, {"K3SM_KV_GEOMETRY_CLAMP": "off"})
+check("off  K3SM_KV_GEOMETRY_CLAMP=off leaves W alone", out == a and len(lines) == 1)
+out, lines = run(a, {"K3SM_KV_BYTES_PER_TOKEN": "262144"})
+check("assumed.env  K3SM_KV_BYTES_PER_TOKEN is the assumed figure (sized for 262144: no clamp)", out == a and lines == [])
+out, lines = run(a, {"K3SM_KV_BYTES_PER_TOKEN": "lots"})
+check("assumed.bad  an unparsable K3SM_KV_BYTES_PER_TOKEN leaves W alone, with one line", out == a and len(lines) == 1)
+out, _ = run(argv(Q32, w="2048"), {"K3SM_KV_BYTES_PER_TOKEN": "1000"})
+check("floor  the clamp never goes below 1024", parse(out)[1] == 1024)
+a = argv(Q32, w="512")
+out, _ = run(a, {"K3SM_KV_BYTES_PER_TOKEN": "1000"})
+check("floor.noraise  a W already under 1024 is never raised", out == a)
+a = argv(Q32, "--max-kv-size", "16384")
+out, _ = run(a)
+check("override.last  the operator's later --max-kv-size is the W clamped (16384 -> 9830)", parse(out)[1] == 9830)
+a = [t for t in argv(Q32) if t not in ("--max-kv-size", "32768")] + ["--max-kv-size=32768"]
+out, _ = run(a)
+check("equals  a --max-kv-size=W spelling is rewritten in place", out[-1] == "--max-kv-size=19660" and len(out) == len(a))
+a = [t for t in argv(Q32) if t not in ("--max-kv-size", "32768")]
+out, lines = run(a)
+check("nokv  no --max-kv-size, nothing read or said", out == a and lines == [])
+out, _ = run(argv("Qwen/Qwen2.5-32B-Instruct"), {"K3SM_MODEL_CONFIG_DIR": Q32})
+check("configdir  K3SM_MODEL_CONFIG_DIR is read instead of the model reference", parse(out)[1] == 19660)
+
+calls = []
+hub = types.ModuleType("huggingface_hub")
+def snapshot_download(repo, **kw):
+    calls.append((repo, kw))
+    return Q32
+hub.snapshot_download = snapshot_download
+sys.modules["huggingface_hub"] = hub
+out, _ = run(argv("Qwen/Qwen2.5-32B-Instruct"))
+check("hub  a Hub reference fetches only config.json with snapshot_download, into the default cache",
+      calls == [("Qwen/Qwen2.5-32B-Instruct", {"allow_patterns": ["config.json"]})] and parse(out)[1] == 19660)
+def unreachable(repo, **kw):
+    raise OSError("offline")
+hub.snapshot_download = unreachable
+a = argv("Qwen/Qwen2.5-32B-Instruct")
+out, lines = run(a)
+check("hub.down  a Hub fetch that fails leaves W alone, with one line", out == a and len(lines) == 1)
+
+seen = []
+cli = types.ModuleType("vllm_mlx.cli")
+cli.main = lambda: seen.append(list(sys.argv))
+pkg = types.ModuleType("vllm_mlx")
+pkg.cli = cli
+sys.modules["vllm_mlx"], sys.modules["vllm_mlx.cli"] = pkg, cli
+ks.engine_serve_args = parse
+ks.install_on_engine = lambda: None
+os.environ.pop("K3SM_KV_GEOMETRY_CLAMP", None)
+os.environ.pop("K3SM_KV_BYTES_PER_TOKEN", None)
+os.environ.pop("K3SM_MODEL_CONFIG_DIR", None)
+rc = ks.main(argv(Q32))
+check("main  serve hands the engine the clamped argv", rc == 0 and len(seen) == 1 and parse(seen[0][1:])[1] == 19660)
+PY
+KV_CHECKS=0
+kv_out="$(PYTHONDONTWRITEBYTECODE=1 python3 "$WORK/kv-driver.py" "$HERE" "$WORK/kv" 2>"$WORK/kv-driver.err")"
+while read -r verdict name; do
+	[ -n "$verdict" ] || continue
+	KV_CHECKS=$((KV_CHECKS + 1))
+	case "$verdict" in
+		ok) ladder ok "8k.$name" ;;
+		no) ladder no "8k.$name" ;;
+		*)  ladder no "8k.driver  $verdict $name" ;;
+	esac
+done <<< "$kv_out"
+if [ "$KV_CHECKS" -ge 19 ]; then
+	ladder ok "8k.count  all $KV_CHECKS clamp checks reported"
+else
+	ladder no "8k.count  only $KV_CHECKS of 19 clamp checks reported (the driver crashed?)"
+	head -20 "$WORK/kv-driver.err"
 fi
 
 # ---- 9 — the guard on the REAL engine (needs a staged tree) -----------------

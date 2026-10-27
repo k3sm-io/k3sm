@@ -62,6 +62,20 @@ recent band at the window minus the sinks, as proposed upstream in
 this image the cache with sinks is the one the multimodal scheduler builds; the
 text scheduler's caches have none, and their mask is unchanged.
 
+Before the engine starts, `k3sm_serve` clamps `--max-kv-size` to the model's
+KV geometry. k3sm sizes W from a fixed 157286 bytes of KV cache per token
+(`kvBytesPerToken` in `pkg/mlx/sizing.go`, measured on a 3B model), because the
+model's `config.json` is only on disk inside the pod. The real fp16 cost is
+4 x `num_hidden_layers` x `num_key_value_heads` x `head_dim` bytes per token
+(262144 for Qwen2.5-32B, 327680 for Llama-3.3-70B), so `k3sm_serve` reads
+`config.json` (from a local model directory, or only that file from the Hub
+into the cache the weight download then reuses; a nested `text_config` wins)
+and, when the real cost is higher, lowers W to W x 157286 / cost, never below
+1024, logging one line. A config it cannot read leaves W as given. The assumed
+figure is `K3SM_KV_BYTES_PER_TOKEN`, `K3SM_MODEL_CONFIG_DIR` names a directory
+to read `config.json` from instead, and `K3SM_KV_GEOMETRY_CLAMP=off` disables
+the clamp. Selftest rung 8 checks it against fake configs.
+
 ## Files
 
 | file | what it is |
@@ -283,7 +297,7 @@ refusal. It also drives `k3sm_shard` with fake name resolution
 (no model, no GPU): the ring hostfile and the `jaccl` device matrix land in the
 pod data volume, resolution retries and gives up on time, and the liveness
 probe answers correctly. It drives the `k3sm_serve` context guard against
-fakes, and, when a staged tree exists (`K3SM_MLX_STAGE`, default the build's
+fakes, the `--max-kv-size` clamp against fake `config.json` files, and, when a staged tree exists (`K3SM_MLX_STAGE`, default the build's
 work dir), against the real engine's HTTP app, and checks the attention-sink
 mask on the real mlx-lm cache. It prints what it does **not** cover; the stage Job on a cluster, the live build,
 the real payload walk, the push, and a sharded model on two Macs are the lab
