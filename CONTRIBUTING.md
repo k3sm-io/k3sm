@@ -10,8 +10,8 @@ By participating, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md
 k3sm is a multi-repository project. Most repositories are Go modules (`apis`,
 `runtimed`, `darwin-net`, `k3sm`); the macOS app and the Swift SDK are Swift
 packages, and the C++ SDK is a CMake project. Every repository has a `hack/ci.sh`
-that is its commit gate. Run it before opening a pull request. Every gate runs
-`shellcheck` over its `hack/` scripts and fails when it is not installed.
+that is its commit gate. Run it before opening a pull request. The Swift and C++
+gates run `shellcheck` over their `hack/` scripts and fail when it is not installed.
 
 ### Go repositories
 
