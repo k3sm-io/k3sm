@@ -17,7 +17,7 @@ limitations under the License.
 // Package vkadapter is the SINGLE seam through which k3sm touches the
 // github.com/virtual-kubelet/virtual-kubelet module. Every other package in this
 // repo imports vkadapter, never virtual-kubelet directly, so the VK coupling is
-// confined to one file and one edit site (enforced by
+// confined to this one package directory (enforced by
 // provider.TestVKImportsConfinedToAdapter). See docs/vk-exit.md for the ceiling
 // this achieves (import-confinement) and what a true VK swap still costs.
 //
@@ -230,9 +230,10 @@ func providerRoutesEnabled(cfg NodeConfig) bool { return cfg.TLSConfig != nil }
 
 // tokenRouteSubresource maps every kubelet endpoint path that may be admitted on a
 // delegated bearer token to the nodes subresource a SubjectAccessReview checks for
-// it. It is the whole set, and it is read-only resource metrics only: the two
-// routes metrics-server scrapes, each with the trailing-slash form Virtual
-// Kubelet also registers. The mapping is upstream kubelet's (/stats/* is
+// it. It is the whole set, and it is read-only node metrics only:
+// /metrics/resource, which metrics-server scrapes, and the /stats/summary
+// Summary API, each with the trailing-slash form Virtual Kubelet also
+// registers. The mapping is upstream kubelet's (/stats/* is
 // nodes/stats, /metrics/* is nodes/metrics).
 var tokenRouteSubresource = map[string]string{
 	"/metrics/resource":  "metrics",

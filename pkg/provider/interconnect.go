@@ -88,7 +88,7 @@ const (
 	// attach; its message names the specific reason and the fallback taken.
 	ReasonInterconnectFailed = "InterconnectAttachFailed"
 
-	// runtimeClassContainerVM is the M15 RuntimeClass, refused like vm.
+	// runtimeClassContainerVM is the container-vm RuntimeClass (one Linux VM per container), refused like vm.
 	runtimeClassContainerVM = "container-vm"
 	// envInterconnectPrefix names every variable the attach owns in a pod that
 	// asked for an interconnect.

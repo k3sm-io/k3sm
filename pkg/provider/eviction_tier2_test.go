@@ -50,7 +50,7 @@ import (
 //	A9                   which arm names the eviction
 //	A10                  a pressured first sample evicts in the same cycle
 //	A11                  the eviction message per arm
-//	B1, B2               the candidate order (band ranking goes in front)
+//	R1, R2               the candidate order (band ranking goes in front)
 //	D3                   the band annotation has no effect today
 //	H1                   the fast stale boundary (the cadence changes)
 //	G1                   the step schedule of the cascade-cap subtest
@@ -73,10 +73,10 @@ import (
 //	    TestComputeNodeConditionsCompressorHeadroom ("exactly 8Gi free ...")
 //	A12 the monitor cadence, 10 s calm, 1 s past half-way, back after three calm:
 //	    TestPressureMonitorSharesMemoryPressurePredicate ("cadence: ...")
-//	B1  the kubelet's rankMemoryPressure order and the QoS mix:
+//	R1  the kubelet's rankMemoryPressure order and the QoS mix:
 //	    TestEvictionRanksBestEffortFirst ("upstream helpers_test.go cases,
 //	    transcribed", "QoS classes at mixed priorities, full order")
-//	B2  a pod without stats ranks first:
+//	R2  a pod without stats ranks first:
 //	    TestEvictionRanksBestEffortFirst ("missing stats rank before any pod ...")
 //	C1  no victim and no stats fetch without pressure:
 //	    TestEvictionRanksBestEffortFirst ("no victim, and no stats fetch, ...")

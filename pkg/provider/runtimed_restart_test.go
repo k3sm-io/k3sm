@@ -226,7 +226,7 @@ func TestNativeSidecarStaysRunning(t *testing.T) {
 // restart_count surfaced verbatim); all mains exit 0 → Succeeded; a
 // sidecar-bearing Job pod is terminal on its MAINS. The controller-side
 // composition (a live Job's completions/backoffLimit accounting against the
-// real KCM) is the e2e stub TestM10_JobCompletion (e2e/m10_test.go).
+// real KCM) is the e2e stub TestM10_JobCompletion (e2e/m10_job_test.go).
 func TestJobBackoffAndCompletionAccounting(t *testing.T) {
 	newTracked := func(t *testing.T, pod *corev1.Pod) (*runtimedRuntime, *fakeRuntimeServer, *testclock.FakeClock, *podTrack) {
 		t.Helper()

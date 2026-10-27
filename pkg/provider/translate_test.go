@@ -1279,7 +1279,7 @@ func TestDerivePhase(t *testing.T) {
 // init container is counted (it can flip a Guaranteed pod to Burstable), (3) that
 // the apiserver's value is carried forward verbatim and beats re-derivation, (4)
 // the blank-status derive fallback, and (5) that BOTH the pod-bearing GetPods path
-// and the formerly pod-less GetPodStatus path (runtimed.go:321) now emit the class.
+// and the formerly pod-less GetPodStatus path (GetPodStatus) now emit the class.
 //
 // It FAILS against the earlier toPodStatus (no QOSClass → blank) and PASSES now.
 func TestPodStatusQOSClass(t *testing.T) {
@@ -1386,7 +1386,7 @@ func TestPodStatusQOSClass(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = r.DeletePod(ctx, pod) })
 
-		// GetPodStatus is the path that used to lack the pod (runtimed.go:321); the
+		// GetPodStatus is the path that used to lack the pod (GetPodStatus); the
 		// lookup-threaded pod must now make it emit the class.
 		got, err := r.GetPodStatus(ctx, "default", "pp")
 		if err != nil {

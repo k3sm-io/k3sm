@@ -352,8 +352,8 @@ func TestCreatePodAssignsDistinctPodIP(t *testing.T) {
 		// The bind-discipline env is NOT injected for a hostNetwork pod (podIP ==
 		// nodeIP, no distinct /32). Injecting K3SM_POD_IP would rewrite its wildcard
 		// binds onto the node IP and silently narrow the shipped hostNetwork semantic
-		// (share the node's addresses). This asserts the guard the plan's architect
-		// WARNING requires — the shipped hostNetwork behaviour must not be narrowed.
+		// (share the node's addresses). This asserts the guard that the shipped
+		// hostNetwork behaviour must not be narrowed.
 		if createdEnvPresent(t, f, "uid-hostnet", podnet.EnvPodIP) {
 			t.Errorf("hostNetwork pod carries %s; want NONE (a hostNetwork pod must keep its wildcard binds, not be rewritten onto the node IP)", podnet.EnvPodIP)
 		}
