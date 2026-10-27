@@ -88,8 +88,9 @@ export TEMPORAL_ADDRESS=127.0.0.1:30733
 temporal workflow list
 ```
 
-Dial the Service, never the Pod. A NodePort answers on every interface the Mac has, and k3sm's
-userspace Service proxy is what carries the connection into the guest. A `vm` Pod's pod IP is its
+Dial the Service, never the Pod. A NodePort answers on `127.0.0.1` and the node's own address, and on every
+interface the Mac has once you run `sudo k3sm network lan on` (new installs start with LAN access
+off). k3sm's userspace Service proxy is what carries the connection into the guest. A `vm` Pod's pod IP is its
 published cluster identity rather than a live address, so `kubectl get pod -o wide` gives you an
 address that nothing answers on, as do headless Services and per-Pod DNS names. From inside the
 cluster, use the Service's DNS name instead, fully qualified:
