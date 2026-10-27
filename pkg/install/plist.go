@@ -493,13 +493,14 @@ const agentThrottleInterval = 10
 // The join credential is rendered as a --token-file PATH and NEVER as a token
 // value. A LaunchDaemon plist is root-owned 0644, so a token on this argv would
 // be readable by every account on the Mac and visible in `ps` for the life of
-// the process; the file the path names is the operator's, is read once at
-// start, and is theirs to delete once the node has joined. A node that has
+// the process; the file the path names is the installer's staged copy in the
+// agent work dir, read at start; the operator's own token file is never
+// referenced by the daemon and is theirs to delete once the node has joined. A node that has
 // already joined needs neither: it starts from its stored credential.
 //
 // ExitTimeOut is derived the same way the server's is (see serverExitTimeOut),
-// from the stages an AGENT runs: it stops its embedded runtime's vm guests, tears
-// down the runtimed control socket, drains the Service proxy's listeners and runs
+// from the stages an AGENT runs: it closes its embedded runtime's supervision,
+// tears down the runtimed control socket, drains the Service proxy's listeners and runs
 // the same deferred mesh teardown the server does — everything except the
 // control-plane stop, which a worker has no control plane to run. A SIGKILL
 // part-way through leaves vm helpers, or a utun and its routes, behind on a node

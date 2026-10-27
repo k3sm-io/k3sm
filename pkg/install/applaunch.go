@@ -320,10 +320,11 @@ func launchAppAfterInstall(ctx context.Context, sys System, cfg Config) {
 // brought the node up. It never fails the command: an error is one Warn line.
 //
 // The whole call is held to appLaunchBound. The launcher gets a context with
-// that deadline (every command it runs is killed at it, with WaitDelay
-// bounding the pipe wait), and launchApp also stops waiting at the deadline,
-// so even a step that ignores its context cannot hold the command longer. An
-// abandoned launcher goroutine ends when its killed command is reaped.
+// that deadline (every command it runs is killed at it; the plutil, pgrep and
+// open commands also carry WaitDelay to bound the pipe wait, codesign does
+// not), and launchApp also stops waiting at the deadline, so even a step that
+// ignores its context cannot hold the command longer. An abandoned launcher
+// goroutine ends when its killed command is reaped and its output pipe closes.
 func launchApp(ctx context.Context, cfg Config, command string) {
 	if cfg.AppLauncher == nil {
 		return

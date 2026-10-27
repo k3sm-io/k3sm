@@ -104,10 +104,10 @@ var (
 // node's.
 //
 // The agent is in the long class for the reason its own plist sets a raised
-// ExitTimeOut: its teardown is not instantaneous either (it stops its embedded
-// runtime's vm guests, closes the mesh device and drains the Service proxy's
-// listeners), so any unload budget at or below that
-// SIGTERM-to-SIGKILL grace would time out on precisely the slow-but-healthy
+// ExitTimeOut: its teardown is not instantaneous either (it closes its embedded
+// runtime's supervision, stops the managed-update watcher and the runtimed
+// socket, and closes the mesh device; agentTeardownSteps in plist.go), so any
+// unload budget at or below that SIGTERM-to-SIGKILL grace would time out on precisely the slow-but-healthy
 // shutdown the wait exists to tolerate — and the install would then refuse to
 // bootstrap into a label it had just asked to stop.
 func restartBudgetFor(label string) restartBudget {
