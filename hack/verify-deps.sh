@@ -55,7 +55,7 @@
 #                                    For binaries k3sm builds from a pinned
 #                                    module outside its own go.mod, whose full
 #                                    list comes from `go version -m`
-#                                    (hack/images/metrics-server/build.sh).
+#                                    (hack/images/metrics-server/build.sh in the k3sm repository).
 #                                    The exemptions in hack/deps.cooldown-exempt
 #                                    apply to it too.
 #
