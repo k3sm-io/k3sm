@@ -104,6 +104,7 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- **A pinned `MLXModel` answers to its `spec.model` name.** With `spec.revision` set, the engine was started on the snapshot path inside the cache volume and listed that path as the only model, so the request the quickstart shows, naming `spec.model`, was refused as a model that does not exist. The engine is now told to serve the model under `spec.model`, pinned or not.
 - **A build of an untagged commit compares with the latest release.** `k3sm update check` and the `update` row of `k3sm status` called a node or binary built from an untagged commit (a Go pseudo-version such as `v0.1.8-0.20261025152241-96fbff948562`) `unknown`. It now ranks by the release it leads up to, `ahead` of v0.1.7 and `behind` v0.1.8, and is named an untagged build, for example `ahead, untagged build of 0.1.8`. A build from a modified tree and a development build stay `unknown`, and a managed update still moves only to a tagged release. See [upgrade](https://k3sm.io/docs/upgrade/).
 - **The `update` row is right after an in-place upgrade.** The row replayed the verdict the last check recorded, so until the next hourly check it described the binary and nodes from before the upgrade. It now takes only the latest release from the record and compares it with the binary and nodes running when you run `k3sm status`.
 - **`k3sm update check` without `sudo` says why it did not record its result.** It printed the path of a temporary file it could not create; it now says `writing the record needs root; run with sudo to record it`.
