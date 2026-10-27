@@ -40,8 +40,8 @@ type Executor interface {
 	// healthz ok). It is cheap to call repeatedly.
 	Ready(ctx context.Context) bool
 	// Stop tears the control plane down in shutdownOrder (apiserver, then
-	// scheduler and controller-manager, then the datastore, then close DB). It is
-	// idempotent.
+	// scheduler and controller-manager, then the datastore last, after which its
+	// SQLite database is no longer in use). It is idempotent.
 	Stop(ctx context.Context) error
 	// Kubeconfig returns the path to the admin kubeconfig the executor wrote, for
 	// kubectl and the provisioning client to use.

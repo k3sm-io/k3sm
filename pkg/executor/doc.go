@@ -40,11 +40,11 @@ limitations under the License.
 // # Lifecycle
 //
 // Start brings the components up in dependency order and blocks until the
-// apiserver reports healthz ok (or ctx ends). Stop tears them down in shutdownOrder:
-// the apiserver first (so it drains and stops writing), then scheduler and
-// controller-manager, then the datastore LAST (so no component loses its datastore
-// mid-shutdown), and finally closes the SQLite database. The whole lifecycle is
-// ctx-driven.
+// apiserver reports healthz ok (or ctx ends). Stop tears them down in
+// shutdownOrder: the apiserver first (so it drains and stops writing), then
+// scheduler and controller-manager, then the datastore LAST (so no component
+// loses its datastore mid-shutdown); once the datastore child has exited its
+// SQLite database is no longer in use. The whole lifecycle is ctx-driven.
 //
 // # Auth posture
 //
