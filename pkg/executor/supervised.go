@@ -236,9 +236,12 @@ type Supervised struct {
 	// probe is the healthz probe's HTTP client, rebuilt whenever the cluster CA it
 	// trusts changes on disk (see probeClient). Guarded by probeMu, which is never
 	// held with mu.
-	probeMu   sync.Mutex
-	probe     *http.Client
-	probeCA   []byte
+	probeMu sync.Mutex
+	probe   *http.Client
+	probeCA []byte
+	// probeErr is the last probe failure logged, so each distinct failure is logged
+	// once rather than every poll; a success clears it. Guarded by probeMu.
+	probeErr  string
 	probeDial func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	mu      sync.Mutex
@@ -1348,18 +1351,55 @@ func (s *Supervised) Ready(ctx context.Context) bool {
 	}
 	client, err := s.probeClient()
 	if err != nil {
+		s.noteProbe(err)
 		return false
 	}
 	req.Header.Set("Authorization", "Bearer "+s.currentToken())
 	resp, err := client.Do(req)
 	if err != nil {
+		s.noteProbe(err)
 		return false
 	}
 	defer resp.Body.Close()
+	s.noteProbe(nil)
 	buf := make([]byte, 2)
 	n, _ := resp.Body.Read(buf)
 	return resp.StatusCode == http.StatusOK && string(buf[:n]) == "ok"
 }
+
+// noteProbe logs a healthz probe failure once per distinct error, so a probe that
+// fails the same way on every poll (a refused connection while the apiserver
+// starts, or a serving leaf the probe will not trust) is visible without flooding
+// the log. A certificate the probe refuses is a Warn: bring-up can only time out
+// behind it. Anything else is a Debug. A nil err (a response arrived) clears the
+// memory, so a later failure is logged again.
+func (s *Supervised) noteProbe(err error) {
+	s.probeMu.Lock()
+	if err == nil {
+		s.probeErr = ""
+		s.probeMu.Unlock()
+		return
+	}
+	msg := err.Error()
+	if msg == s.probeErr {
+		s.probeMu.Unlock()
+		return
+	}
+	s.probeErr = msg
+	s.probeMu.Unlock()
+	var verr *tls.CertificateVerificationError
+	if errors.As(err, &verr) {
+		s.cfg.Logger.Warn("apiserver healthz probe refused the serving certificate; the probe trusts only the cluster CA and the name "+probeServerName,
+			"url", apiServerURL(s.cfg), "err", err)
+		return
+	}
+	s.cfg.Logger.Debug("apiserver healthz probe failed", "url", apiServerURL(s.cfg), "err", err)
+}
+
+// probeServerName is the name the healthz probe verifies the apiserver's serving
+// leaf against. cmd/k3sm issues every leaf with the fixed in-cluster DNS set
+// (apiServerFixedDNS there), of which "kubernetes" is the first, on every topology.
+const probeServerName = "kubernetes"
 
 // probeClient returns the healthz probe's HTTP client, trusting only the cluster CA
 // at certs.ClusterCACertPath. The CA is re-read on every call (a small file, polled
@@ -1367,8 +1407,11 @@ func (s *Supervised) Ready(ctx context.Context) bool {
 // a CA replaced under a reset work dir, is picked up; the client and its pooled
 // connections are rebuilt only when the bytes change. A missing or unparsable CA is
 // an error, and Ready treats it as not ready: there is no unverified fallback.
-// The server name is the URL's host (apiServerURL), which the serving leaf carries
-// as a SAN on every topology.
+// The client dials the bind host (apiServerURL) but verifies the leaf against
+// probeServerName, not that host: the bind host is not a SAN on every topology (a
+// server without a mesh that runs a non-loopback --node-ip binds that IP, which
+// the leaf carries only when --tls-san names it), while every apiserver leaf
+// carries the fixed in-cluster name.
 func (s *Supervised) probeClient() (*http.Client, error) {
 	caPEM, err := os.ReadFile(certs.ClusterCACertPath(s.cfg.WorkDir))
 	if err != nil {
@@ -1390,7 +1433,7 @@ func (s *Supervised) probeClient() (*http.Client, error) {
 		Timeout: 3 * time.Second,
 		Transport: &http.Transport{
 			DialContext:     s.probeDial,
-			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+			TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: probeServerName, MinVersion: tls.VersionTLS12},
 		},
 	}
 	s.probeCA = caPEM

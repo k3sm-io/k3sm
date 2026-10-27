@@ -49,10 +49,17 @@ func writeClusterCA(t *testing.T, workDir string) *certs.CA {
 	return ca
 }
 
-// servingPair issues a serving leaf for ip from ca as a tls.Certificate.
+// servingPair issues a serving leaf for ip from ca as a tls.Certificate, carrying
+// the name every apiserver leaf carries (probeServerName).
 func servingPair(t *testing.T, ca *certs.CA, ip net.IP) tls.Certificate {
 	t.Helper()
-	certPEM, keyPEM, err := ca.IssueServing("kube-apiserver", nil, []net.IP{ip}, time.Hour)
+	return servingPairNames(t, ca, []string{probeServerName}, ip)
+}
+
+// servingPairNames issues a serving leaf for dnsNames and ip from ca.
+func servingPairNames(t *testing.T, ca *certs.CA, dnsNames []string, ip net.IP) tls.Certificate {
+	t.Helper()
+	certPEM, keyPEM, err := ca.IssueServing("kube-apiserver", dnsNames, []net.IP{ip}, time.Hour)
 	if err != nil {
 		t.Fatalf("issue serving leaf: %v", err)
 	}
@@ -90,6 +97,22 @@ func TestReadyProbeVerifiesClusterCA(t *testing.T) {
 			serving:   func(ca *certs.CA) *tls.Certificate { p := servingPair(t, ca, loopback); return &p },
 			writeCA:   true,
 			wantReady: true,
+		},
+		{
+			// A server without a mesh on a non-loopback --node-ip dials an IP its
+			// leaf need not carry; the pinned name is what is verified.
+			name:      "leaf from the cluster CA without the dialed IP is accepted",
+			serving:   func(ca *certs.CA) *tls.Certificate { p := servingPair(t, ca, net.ParseIP("192.0.2.10")); return &p },
+			writeCA:   true,
+			wantReady: true,
+		},
+		{
+			name: "leaf from the cluster CA without the pinned name is refused",
+			serving: func(ca *certs.CA) *tls.Certificate {
+				p := servingPairNames(t, ca, []string{"not-the-apiserver"}, loopback)
+				return &p
+			},
+			writeCA: true,
 		},
 		{
 			name:    "self-signed listener is refused",
