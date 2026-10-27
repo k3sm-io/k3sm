@@ -49,10 +49,10 @@
 # on disk are reclaimed by hand, deliberately.
 #
 # The pinned revision is loaded from the cache volume, never fetched into it. On a
-# volume that has never held it, seed the weights first (hack/acceptance/m8.sh
-# --render-seed-job renders a Job that does it once the cache claim has bound;
-# docs/user/mlx-quickstart.md step 2 has the alternatives), or leave revision
-# empty for the first start.
+# volume that has never held it, seed the weights first (for example with a
+# one-off Job that runs the engine's download for that revision against the bound
+# cache claim; docs/user/mlx-quickstart.md step 2 has the alternatives), or leave
+# revision empty for the first start.
 #
 #   kubectl apply -f examples/mlxmodel.yaml
 #   kubectl get mlxmodel qwen3-06b -w
