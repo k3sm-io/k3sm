@@ -18,6 +18,7 @@ package executor
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -56,7 +57,7 @@ type bindHostCase struct {
 
 // bindHostCases are the postures shared by every leg below.
 //
-// The mesh rows are the defect (lab D1): cmd/k3sm/server.go sets BindAddress to the
+// The mesh rows are the defect: cmd/k3sm/server.go sets BindAddress to the
 // wireguard mesh IP and the apiserver then binds THAT interface only, so a probe or
 // a kubeconfig hardcoded to loopback dials an address nothing is listening on and
 // bring-up wedges at the healthz wait. The loopback rows are the compatibility
@@ -128,7 +129,7 @@ func TestAPIServerHostChain(t *testing.T) {
 	}
 }
 
-// TestAPIServerClientsFollowEffectiveBind is the (lab D1) contract: the URL the
+// TestAPIServerClientsFollowEffectiveBind is the contract: the URL the
 // in-process clients dial tracks the address the apiserver ACTUALLY BINDS, which is
 // the same self-defaulting chain apiServerArgs renders --bind-address from
 // (BindAddress -> NodeIP -> loopback).
@@ -249,11 +250,15 @@ func TestReadyProbesEffectiveBindAddress(t *testing.T) {
 	}))
 	_ = srv.Listener.Close()
 	srv.Listener = ln
+	// The probe verifies the serving leaf against the work dir's cluster CA, so the
+	// server presents one issued for ::1, as the apiserver's leaf carries its bind IP.
+	workDir := t.TempDir()
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{servingPair(t, writeClusterCA(t, workDir), net.IPv6loopback)}}
 	srv.StartTLS()
 	defer srv.Close()
 
 	port := ln.Addr().(*net.TCPAddr).Port
-	s := NewSupervised(Config{WorkDir: t.TempDir(), APIServerPort: port, BindAddress: "::1", NodeIP: "::1", Token: token})
+	s := NewSupervised(Config{WorkDir: workDir, APIServerPort: port, BindAddress: "::1", NodeIP: "::1", Token: token})
 	if !s.Ready(context.Background()) {
 		server, _ := s.RESTConfigToken()
 		t.Errorf("Ready = false against a healthy apiserver bound to [::1]:%d — the probe dialled %q instead of the configured bind", port, server)

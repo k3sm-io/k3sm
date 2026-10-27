@@ -140,7 +140,7 @@ func TestEnsureKineWithoutToolchainFailsActionably(t *testing.T) {
 		return "", errors.New("unreachable")
 	}
 	runKineBuild = func(context.Context, string, string, string) ([]byte, error) {
-		t.Error("the kine build ran `go install` without a toolchain on PATH")
+		t.Error("the kine build ran without a toolchain on PATH")
 		return nil, errors.New("unreachable")
 	}
 
@@ -225,8 +225,8 @@ func TestKineBuildReusesModuleCache(t *testing.T) {
 		if strings.HasPrefix(got, gopath) {
 			t.Errorf("GOMODCACHE %q lives inside the per-build scratch GOPATH %q — it dies with the build", got, gopath)
 		}
-		// The scratch-GOPATH/cleared-GOBIN posture is what lets `go install pkg@version`
-		// write a cross-compiled binary at all; pinning the cache must not disturb it.
+		// The scratch-GOPATH/cleared-GOBIN posture is what lets the patched kine build
+		// write a cross-compiled binary into the scratch GOPATH at all; pinning the cache must not disturb it.
 		for _, want := range []struct{ key, val string }{
 			{"GOPATH", gopath}, {"GOBIN", ""}, {"CGO_ENABLED", "0"}, {"GOWORK", "off"},
 		} {
@@ -262,7 +262,7 @@ func TestKineBuildReusesModuleCache(t *testing.T) {
 		t.Cleanup(func() { kineModuleCacheDir, runKineBuild = origCache, origBuild })
 		kineModuleCacheDir = func(context.Context) (string, error) { return cache, nil }
 
-		// The fake stands in for `go install`: it records what it was handed, notes
+		// The fake stands in for buildPatchedKine: it records what it was handed, notes
 		// whether the cache it was pointed at was already populated, leaves a
 		// downloaded-module sentinel behind, and stages the "built" binary where
 		// ensureKineInto looks for a native install.

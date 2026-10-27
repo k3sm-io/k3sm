@@ -130,9 +130,8 @@ func applyKinePatches(root string, patches []kineSourcePatch) error {
 // out of the read-only cache into the scratch dir and patched there, its go.mod
 // raised and the raised modules' checksum-database hashes added to its go.sum; and
 // `go build -mod=readonly` builds it against that go.sum, so the dependency graph is
-// the one the upstream tag pins plus the raises, and every module is hash-checked. The flags match what
-// `go install` used (no -trimpath), so dependency packages a previous build compiled
-// stay cache hits. The build is -trimpath and GOTOOLCHAIN=local, like the etcd
+// the one the upstream tag pins plus the raises, and every module is hash-checked.
+// The build is -trimpath and GOTOOLCHAIN=local, like the etcd
 // wrapper's, so no host path lands in the binary and no other compiler is fetched on
 // the go.mod's say-so. kineStampedVersion is stamped into kine's version package, as
 // kine's own release build stamps its tag, so `kine --version` names both the pin and

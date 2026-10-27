@@ -49,8 +49,9 @@ limitations under the License.
 // # Auth posture
 //
 // The apiserver enforces Node,RBAC by default (DefaultAuthorizationMode); the
-// static bearer token remains for the in-process Virtual Kubelet node, the
-// post-bring-up provisioning client, and the healthz probe.
+// static bearer token remains for the post-bring-up admin client and the
+// provisioners built on it, kubectl, and the healthz probe; the in-process node and
+// the scheduler and controller-manager carry their own client certificates (below).
 //
 // # HA datastore
 //

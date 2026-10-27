@@ -67,7 +67,7 @@ type admissionConfigParsed struct {
 }
 
 // requireMetadataOnly walks EVERY rule and fails on any level that is not
-// Metadata or None — the SECURITY-BINDING structural invariant (Res.4): no
+// Metadata or None, the security-binding structural invariant: no
 // Request/RequestResponse rule anywhere means no Secret cleartext at rest,
 // regardless of rule ordering mistakes in a future edit.
 func requireMetadataOnly(t *testing.T, rules []auditRuleDoc) {
@@ -81,7 +81,7 @@ func requireMetadataOnly(t *testing.T, rules []auditRuleDoc) {
 	}
 }
 
-// TestProvisionConformanceConfigPinned pins the provision write (Res.3/4):
+// TestProvisionConformanceConfigPinned pins the provision write:
 // writeConformanceConfig produces the three artifacts (0700 audit dir + the two
 // 0600 config files), the GV literals are exactly the vendored-k8s pins, the
 // audit policy is structurally Metadata/None-only with secrets/configmaps as the
@@ -116,7 +116,7 @@ func TestProvisionConformanceConfigPinned(t *testing.T) {
 			t.Fatalf("parse audit policy: %v", err)
 		}
 		if p.APIVersion != "audit.k8s.io/v1" || p.Kind != "Policy" {
-			t.Errorf("audit policy GV = %s/%s, want audit.k8s.io/v1 Policy (pinned, Res.3)", p.APIVersion, p.Kind)
+			t.Errorf("audit policy GV = %s/%s, want audit.k8s.io/v1 Policy (pinned)", p.APIVersion, p.Kind)
 		}
 		if len(p.Rules) < 2 {
 			t.Fatalf("audit policy has %d rules, want >= 2 (secrets/configmaps first + catch-all last)", len(p.Rules))
