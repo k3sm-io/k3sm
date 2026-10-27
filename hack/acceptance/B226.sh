@@ -86,21 +86,28 @@ ladder "$ref" "b226.1  ServiceAccountToken sets BoundObjectRef{Kind:Pod, APIVers
 # ---- b226.2 — fail-closed, on the ONLY pod-identity mint path --------------
 # The sentinel plus its early return, and the CreateToken call sites in the shipped
 # (non-test) tree. A second POD-identity mint site would be a second chance to emit
-# an unbound token, invisible to every assertion above. Exactly two sites ship, and
-# they are named: the provider's pod-bound mint (pkg/provider/resolver.go) and the
+# an unbound token, invisible to every assertion above. Exactly three sites ship, and
+# they are named: the provider's pod-bound mint (pkg/provider/resolver.go); the
 # manifest reconciler's own in-process identity (pkg/addons/manifestidentity.go —
 # a TokenRequest for the reconciler's ServiceAccount, held only in that process's
-# memory, never handed to a pod). Any other site, or a second site in either file,
-# reddens this rung.
+# memory, never handed to a pod); and the registry builder token
+# (cmd/k3sm/registrybuilder.go — the `k3sm registry token`/push credential, a
+# TokenRequest for the k3sm-registry/builder ServiceAccount minted through the
+# user's own kubeconfig, audience k3sm-registry, 1h by default and never under
+# 10m, refused when the apiserver clamps it; deliberately unbound because it
+# authenticates a user's push from a Mac, not a pod). Neither of the last two is a
+# pod identity, so errNoPodIdentity does not apply to them. Any other site, or a
+# second site in any of the three files, reddens this rung. The pattern matches a
+# CALL (`.CreateToken(`), not the consumer-side interface method that declares it.
 fc=ok
 grep -qE 'errNoPodIdentity = errors\.New\(' "$RESOLVER" || fc=no
 grep -qE 'return "", fmt\.Errorf\("mint token in namespace %s: %w", namespace, errNoPodIdentity\)' "$RESOLVER" || fc=no
 # `|| true` on the pipeline, not laziness: under `set -o pipefail` a grep that
 # matches NOTHING exits 1 and would abort the gate mid-ladder — and zero matches is
 # a verdict here (b226.3 asserts exactly that), not an error.
-mint_sites="$( { grep -rn --include='*.go' 'CreateToken(' "$K3SM_ROOT/pkg" "$K3SM_ROOT/cmd" 2>/dev/null || true; } | { grep -v '_test\.go:' || true; } | cut -d: -f1 | sed "s|^$K3SM_ROOT/||" | sort | tr '\n' ' ' | sed 's/ $//')"
-[ "$mint_sites" = "pkg/addons/manifestidentity.go pkg/provider/resolver.go" ] || fc=no
-ladder "$fc" "b226.2  errNoPodIdentity fails the mint closed; the ONLY CreateToken sites are the pod-bound mint + the manifest reconciler's own identity (found: ${mint_sites:-none})"
+mint_sites="$( { grep -rn --include='*.go' '\.CreateToken(' "$K3SM_ROOT/pkg" "$K3SM_ROOT/cmd" 2>/dev/null || true; } | { grep -v '_test\.go:' || true; } | cut -d: -f1 | sed "s|^$K3SM_ROOT/||" | sort | tr '\n' ' ' | sed 's/ $//')"
+[ "$mint_sites" = "cmd/k3sm/registrybuilder.go pkg/addons/manifestidentity.go pkg/provider/resolver.go" ] || fc=no
+ladder "$fc" "b226.2  errNoPodIdentity fails the mint closed; the ONLY CreateToken sites are the pod-bound mint + the manifest reconciler's own identity + the registry builder token (found: ${mint_sites:-none})"
 
 # ---- b226.3 — the identity is threaded at BOTH provider seams ---------------
 # CreatePod and UpdatePod both bind it; the earlier name-only carrier
