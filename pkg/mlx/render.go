@@ -555,7 +555,8 @@ func modelReference(spec mlxv1alpha1.MLXModelSpec) (string, error) {
 }
 
 // engineArgs builds the serving container's argument vector in three blocks: the
-// model POSITIONAL and the port to listen on; the memory-derived sizing pins and
+// model POSITIONAL, the port to listen on and the served model name (spec.model,
+// whatever the positional resolves to); the memory-derived sizing pins and
 // the required --continuous-batching flag (see sizing.go); then the caller's own
 // arguments LAST so an operator can override any of it without this package
 // growing a flag per knob.
@@ -576,6 +577,7 @@ func engineArgs(spec mlxv1alpha1.MLXModelSpec, modelRef string, port int32, sizi
 	args := []string{
 		modelRef,
 		argPort, strconv.FormatInt(int64(port), 10),
+		argServedModelName, spec.Model,
 	}
 	args = append(args, sizing.Args()...)
 	return append(args, spec.Runtime.Args...)

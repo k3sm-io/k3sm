@@ -93,6 +93,12 @@ const (
 	// argPort is the port the engine listens on. The image's ENTRYPOINT already
 	// names its own default, so this is rendered to make the SPEC's port win.
 	argPort = "--port"
+	// argServedModelName is the id the engine lists in /v1/models and accepts in
+	// a request. Without it vllm-mlx serves the model under its positional, which
+	// for a pinned revision is the snapshot PATH inside the cache volume, so a
+	// request naming spec.model (what the quickstart, the probe and every client
+	// use) is refused as "does not exist". spec.model is always the served id.
+	argServedModelName = "--served-model-name"
 )
 
 // The sizing formula's constants.

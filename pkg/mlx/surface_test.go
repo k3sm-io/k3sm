@@ -55,6 +55,7 @@ var measuredSurface = map[string]bool{
 	"--max-kv-size":         true,
 	"--continuous-batching": false,
 	"--port":                true,
+	"--served-model-name":   true,
 	"--host":                true,
 }
 
@@ -194,6 +195,29 @@ func surfaceCases() []struct {
 // than a measurement, and the assumption's own stated safety net ("a renamed flag
 // fails loudly") is false: argparse's default abbreviation made the most important
 // option of all bind silently to the wrong destination.
+// TestEngineArgsServeTheModelUnderItsSpecName pins the served id: whatever the
+// positional resolves to (the repo id unpinned, the snapshot path pinned), the
+// engine lists and accepts spec.model, which is what the probe, the quickstart
+// and every client name. Seen 2026-10-27 on the pinned example: without the
+// option vllm-mlx served the snapshot path and refused the documented request.
+func TestEngineArgsServeTheModelUnderItsSpecName(t *testing.T) {
+	for _, tc := range surfaceCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			rendered, _ := splitRendered(t, tc.model)
+			i := slices.Index(rendered, argServedModelName)
+			if i < 0 || i+1 >= len(rendered) {
+				t.Fatalf("rendered argv %v lacks %s <name>", rendered, argServedModelName)
+			}
+			if rendered[i+1] != tc.model.Spec.Model {
+				t.Errorf("rendered argv serves %q, want spec.model %q", rendered[i+1], tc.model.Spec.Model)
+			}
+			if rendered[0] == tc.model.Spec.Model && tc.model.Spec.Revision != "" {
+				t.Errorf("pinned positional %q is the repo id, want the snapshot path", rendered[0])
+			}
+		})
+	}
+}
+
 func TestEngineArgsMatchTheMeasuredSurface(t *testing.T) {
 	t.Run("every_rendered_option_is_in_the_measured_surface", func(t *testing.T) {
 		for _, tc := range surfaceCases() {
