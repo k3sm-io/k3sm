@@ -10,16 +10,27 @@ By participating, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md
 k3sm is a multi-repository project. Most repositories are Go modules (`apis`,
 `runtimed`, `darwin-net`, `k3sm`); the macOS app and the Swift SDK are Swift
 packages, and the C++ SDK is a CMake project. Every repository has a `hack/ci.sh`
-that is its commit gate. Run it before opening a pull request. Each repository's
-README says what its gate checks and which toolchain it needs.
+that is its commit gate. Run it before opening a pull request. Every gate runs
+`shellcheck` over its `hack/` scripts and fails when it is not installed.
 
 ### Go repositories
 
-The Go gate runs `gofmt -l`, `go vet`, `go build`, `go test`, the per-file
-license-header check, and `staticcheck -tests=false ./...`. Each Go repository
-documents its commands in `docs/GO-STANDARDS.md`. The staticcheck version is
-pinned; install it with `go install honnef.co/go/tools/cmd/staticcheck@2026.2.1`.
-The gate fails when staticcheck is missing or is any other version.
+The Go gate runs `gofmt -l`, `go vet`, `go build`, `go test` (`go test -race` in
+`k3sm`), the per-file license-header check, `staticcheck -tests=false ./...`,
+a `go mod tidy` no-diff check, `hack/verify-deps.sh`, and `govulncheck`. Each Go
+repository documents its commands in `docs/GO-STANDARDS.md`. Two tools are pinned,
+and the gate fails when either is missing or is any other version:
+
+    go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
+    go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+
+`hack/verify-deps.sh` needs network access to proxy.golang.org and api.osv.dev;
+offline it fails rather than skips.
+
+### Swift and C++ repositories
+
+The app and the Swift SDK need Swift 6 (the Xcode Command Line Tools are enough)
+on macOS 26 or later. The C++ SDK needs CMake 3.24 or later and a C++20 compiler.
 
 ## Developer Certificate of Origin (DCO)
 

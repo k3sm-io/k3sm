@@ -3,7 +3,7 @@
 The shared coding standards for every `k3sm.io/*` repo, kept identical across the four
 modules.
 
-Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
+Targets **darwin/arm64, macOS 26+**. Go **1.26 or later** (each `go.mod` declares `go 1.26.0`).
 
 ## Formatting & imports
 - `gofmt` (tabs) is non-negotiable — `gofmt -l` must be empty. `goimports` for import grouping.
@@ -45,7 +45,7 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
 - Guard shared state with `sync.Mutex`/`RWMutex`; document the locking discipline in a comment.
   Run `cb` callbacks (e.g. VK `NotifyPods`) **outside** held locks to avoid re-entrancy deadlock.
 - Every goroutine has a clear lifetime and a way to stop (`ctx`/done channel). No leaks.
-- The sender closes channels, never the receiver. Tests run with `-race`.
+- The sender closes channels, never the receiver. Tests must pass under `-race`; run `go test -race ./...` before a concurrency change.
 
 ## Logging
 - Structured logging via `log/slog`. No `fmt.Print*` in library code. Levels: Error/Warn/Info/Debug.
@@ -54,7 +54,7 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
 ## Testing
 - Table-driven tests with `t.Run` subtests; descriptive case names. Fixtures in `testdata/`
   (golden files where useful).
-- `go test ./...` must pass; CI runs `-race`. No network or real privilege in unit tests — fake at
+- `go test ./...` must pass, and `go test -race ./...` too; the `k3sm` gate runs `-race`. No network or real privilege in unit tests — fake at
   seams (interfaces). Integration/e2e tests are build-tagged and live separately.
 
 ## Dependencies
@@ -91,7 +91,7 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
     build compiles but reports those capabilities unavailable). kine is **not** embedded: the
     executor runs it as a pinned **child process**, built on demand out-of-module
     (`go install …/kine@pin`, built `CGO_ENABLED=0` against kine's pure-Go
-    `modernc.org/sqlite` backend since the kine pin collapse); `mattn/go-sqlite3` is not a
+    `modernc.org/sqlite` backend); `mattn/go-sqlite3` is not a
     dependency of any `k3sm.io` module and no longer ships in the kine child either.
   - `runtimed` — **`CGO_ENABLED=1`** (darwin syscall shims).
 
@@ -105,7 +105,7 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
 gofmt -l .                  # must print nothing
 go vet ./...                # clean
 go build ./...              # builds
-go test ./...               # passes (CI adds -race)
+go test ./...               # passes (run -race too; the k3sm gate does)
 hack/verify-boilerplate.sh  # every .go file carries the Apache-2.0 header
 go mod tidy                 # no diff
 staticcheck -tests=false ./...  # clean (pinned version below)
