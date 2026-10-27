@@ -10,6 +10,13 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+## v0.2.1 (2026-10-27)
+
+### Security
+
+- The control-plane binaries and the bundled helm are built against golang.org/x/net v0.62.0,
+  which fixes GO-2026-6860 and GO-2026-6866 in the HTML parser and renderer.
+
 ## v0.2.0 — 2026-10-26
 
 ### Breaking
