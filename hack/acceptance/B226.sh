@@ -153,7 +153,7 @@ run_test() {
 # ---- b226.5 — the binding matrix -------------------------------------------
 # CreatePod and UpdatePod each bind the exact ref, an SA-less pod still binds to
 # its pod object, and the no-identity call errors having minted nothing.
-run_test "b226.5" 4 TestB226_ProjectedTokenBoundToPod ./pkg/provider/
+run_test "b226.5" 4 TestProjectedTokenBoundToPod ./pkg/provider/
 
 # ---- b226.6 — the in-pod-API surface is not regressed ------------------
 # The binding rides the same carrier that selects the pod's ServiceAccount; this
