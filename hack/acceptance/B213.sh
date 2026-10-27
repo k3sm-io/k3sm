@@ -18,10 +18,11 @@
 # only WORKERS. The server must mint its own from the same cluster CA.
 #
 # The fix, in one sentence per role: a worker uses the pair its join delivered; a
-# mesh server mints its own (365d, in memory, SANs covering every address the
-# apiserver may dial it at); single-node keeps self-signing, because that posture
-# names no --kubelet-certificate-authority and nothing would verify a CA-issued leaf.
-# Neither role falls back — a missing pair or a failed mint stops the node.
+# server mints its own (365d, in memory, SANs covering every address the apiserver
+# may dial it at), on every topology, because a single-node server's metrics-server
+# verifies the kubelet against the cluster CA too; only the standalone node and dev
+# paths self-sign. Neither role falls back — a missing pair or a failed mint stops
+# the node.
 #
 # TWO TIERS, split by what can be proven without booting a cluster:
 #
@@ -118,7 +119,10 @@ ladder "$a" "b213.2  agentNodeOptions passes the join-delivered pair through, an
 
 # ---- b213.3 — the control-plane half (the observed defect) -----------------
 s=ok
-grep -qE 'if err := setServerKubeletServing\(&nodeOpts, plan\.hierarchy, opts\.meshIP\); err != nil' "$SERVER_GO" || s=no
+# The CA it signs with is the hierarchy serverNodeOptions loads on EVERY topology
+# (nodeHierarchy), never plan.hierarchy, which is set on the mesh path only.
+grep -qE 'nodeHierarchy, err := certs\.EnsureHierarchy\(opts\.workDir, opts\.role\(\), opts\.posture\(\)\)' "$SERVER_GO" || s=no
+grep -qE 'if err := setServerKubeletServing\(&nodeOpts, nodeHierarchy, opts\.meshIP\); err != nil' "$SERVER_GO" || s=no
 grep -qE 'hierarchy\.Cluster\.IssueServing\(' "$SERVER_GO" || s=no
 grep -qE 'kubeletServingValidFor = 365 \* 24 \* time\.Hour' "$SERVER_GO" || s=no
 grep -qE 'proxyableNodeIP\(advertised\)' "$SERVER_GO" || s=no
@@ -136,7 +140,7 @@ func_body() { awk -v re="$2" '$0 ~ re {on=1} on {print} on && /^}/ {exit}' "$1";
 build_body="$(func_body "$SERVER_GO" '^func serverNodeOptions[(]')"
 drive_body="$(func_body "$SERVER_GO" '^func runServer[(]')"
 lit_ln="$(printf '%s\n' "$build_body" | grep -n 'nodeOpts := nodeOptions{' | head -1 | cut -d: -f1 || true)"
-mint_ln="$(printf '%s\n' "$build_body" | grep -n 'setServerKubeletServing(&nodeOpts, plan\.hierarchy' | head -1 | cut -d: -f1 || true)"
+mint_ln="$(printf '%s\n' "$build_body" | grep -n 'setServerKubeletServing(&nodeOpts, nodeHierarchy' | head -1 | cut -d: -f1 || true)"
 ret_ln="$(printf '%s\n' "$build_body" | grep -n 'return nodeOpts, nil' | head -1 | cut -d: -f1 || true)"
 ret_n="$(printf '%s\n' "$build_body" | grep -c 'return nodeOpts' || true)"
 if [ -n "$lit_ln" ] && [ -n "$mint_ln" ] && [ -n "$ret_ln" ] && [ "$ret_n" = 1 ] &&
@@ -155,16 +159,20 @@ else
 fi
 
 # ---- b213.4 — the rotation report stays complete ---------------------------
+# Every server topology mints the pair, so reissuedArtifacts lists it and reports
+# it present unconditionally (pinned inside each function's own body, so a call
+# elsewhere in the file cannot stand in for the listing).
 r=ok
-grep -qE 'kubeletServingArtifact\(workDir\),' "$ROTATE_GO" || r=no
-grep -qE 'func kubeletServingArtifact\(workDir string\) RotationArtifact' "$ROTATE_GO" || r=no
+grep -qE '^[[:space:]]*kubeletServingArtifact\(\),' <<<"$(func_body "$ROTATE_GO" '^func reissuedArtifacts[(]')" || r=no
+grep -qE 'Present:[[:space:]]+true,' <<<"$(func_body "$ROTATE_GO" '^func kubeletServingArtifact[(][)] RotationArtifact')" || r=no
 ladder "$r" "b213.4  reissuedArtifacts lists the newly re-minted kubelet serving pair (the report's completeness contract)"
 
 # ---- b213.5 — the docs describe the mechanism, not the aspiration ----------
 d=ok
 grep -q 'two mint sites and one anchor' "$DESIGN_MD" || d=no
 grep -q 'setServerKubeletServing' "$DESIGN_MD" || d=no
-grep -q 'SCOPE — this is the SINGLE-NODE, dev and standalone' "$SERVING_GO" || d=no
+grep -q 'SCOPE — this is the standalone `k3sm node` and dev cert, and nothing else' "$SERVING_GO" || d=no
+grep -q 'No `k3sm server` cluster uses it, on any topology' "$SERVING_GO" || d=no
 grep -q 'kubelet-certificate-authority' "$SERVING_GO" || d=no   # the mechanism, not a backlog id (public code carries no ids since #319)
 ladder "$d" "b213.5  DESIGN §5c names both mint sites, and SelfSignedServing's doc scopes itself to the dev posture"
 
@@ -208,7 +216,11 @@ run_test "b213.6" 2 TestKubeletServingTLSRejectsHalfPair       ./cmd/k3sm/
 run_test "b213.7" 4 TestAgentNodeOptionsCarriesServingPair     ./cmd/k3sm/
 
 # ---- b213.8 — the control-plane path, incl. fail-closed (d4) ---------------
-run_test "b213.8" 3 TestServerMeshNodeOptionsMintFromClusterCA ./cmd/k3sm/
+# The mesh mint (the mesh and no-datapath legs). The non-mesh leg is its own test
+# since every server topology mints: the single-node mint chains to the cluster CA,
+# its SANs equal the mesh SANs minus the mesh IP, and it fails closed too.
+run_test "b213.8" 2 TestServerMeshNodeOptionsMintFromClusterCA ./cmd/k3sm/
+run_test "b213.8" 4 TestSingleNodeKubeletServingCertChainsToClusterCA ./cmd/k3sm/
 run_test "b213.8" 3 TestServerMeshMintFailsClosedWithoutCA     ./cmd/k3sm/
 
 # ---- b213.9 — the apiserver flag pin + the rotation report (d5) ------------
