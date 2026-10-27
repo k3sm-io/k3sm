@@ -584,11 +584,19 @@ changes to `k3sm install`; importing existing Secrets.
 
 ## Acceptance gate
 
-The gate is `hack/acceptance/keystore.sh`, written with the implementation and named in
-the implementation pull request. This section is its specification, so that what review
-approves here is what the gate checks. Each row is a requirement from this document and the
-test that must exist for it; the gate runs them and fails if any row has no test or any
-test fails. The implementation pull request cites a test name per row.
+The gate is `hack/acceptance/keystore.sh`, written with the implementation. This section is
+its specification, so that what review approves here is what the gate checks. Each row is a
+requirement from this document and the test that must exist for it; the gate runs them and
+fails if any row has no test or any test fails.
+
+The implementation lands as a series of pull requests in dependency order, each one
+checkable on its own: the core store (G2 to G4, G10, G11, G14, G15 and the library half of
+G16), then Rotate with the pointer sequence and floor (G5 to G9), then Rewrap (G12, G13),
+then the `k3sm keys` verbs (the CLI half of G16, G17, G21), then delivery (G18 to G20). The
+first pull request adds the gate script with every row listed; a row whose pull request has
+not landed is reported as pending, not passed. Each pull request cites a test name for the
+rows it delivers, and G1 and G22 are checked on every one. Phase A is complete when the
+last pull request lands and no row is pending.
 
 | # | Requirement | Validated by |
 |---|---|---|
@@ -615,7 +623,7 @@ test fails. The implementation pull request cites a test name per row.
 | G21 | The rollback recipe in this document runs as written | a script test that pipes `show --reveal` into `rotate --in -` |
 | G22 | `hack/ci.sh` is green | the gate runs it |
 
-Phase A is complete when the gate passes. A row can be reworded or dropped only by a change
+Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
 to this document, reviewed like any other.
 
 ## Open questions
