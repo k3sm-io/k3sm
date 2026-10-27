@@ -18,10 +18,11 @@
 # only WORKERS. The server must mint its own from the same cluster CA.
 #
 # The fix, in one sentence per role: a worker uses the pair its join delivered; a
-# mesh server mints its own (365d, in memory, SANs covering every address the
-# apiserver may dial it at); single-node keeps self-signing, because that posture
-# names no --kubelet-certificate-authority and nothing would verify a CA-issued leaf.
-# Neither role falls back — a missing pair or a failed mint stops the node.
+# server mints its own (365d, in memory, SANs covering every address the apiserver
+# may dial it at), on every topology, because a single-node server's metrics-server
+# verifies the kubelet against the cluster CA too; only the standalone node and dev
+# paths self-sign. Neither role falls back: a missing pair or a failed mint stops
+# the node.
 #
 # TWO TIERS, split by what can be proven without booting a cluster:
 #
@@ -47,8 +48,9 @@
 #   <workDir>/tls/cluster-ca.crt and that its SANs cover the address the node
 #   REGISTERED, then run `kubectl logs` on a Running pod, which is the apiserver
 #   making that judgement itself rather than openssl making it. Then the same boot
-#   WITHOUT --mesh-ip must present a self-signed cert, which is what keeps the dev
-#   posture pinned rather than merely unbroken. It needs no root (the datapath is
+#   WITHOUT --mesh-ip must present a cert that verifies against its own cluster CA
+#   and names only the node's own addresses, which keeps the single-node posture
+#   pinned rather than merely unbroken. It needs no root (the datapath is
 #   off and every port is off-default), but it downloads the control-plane payload on
 #   a cold cache and mutates host listeners, so it is opt-in. Without K3SM_LAB the
 #   lab rungs are announced LAB-PENDING and never silently pass.
@@ -118,7 +120,10 @@ ladder "$a" "b213.2  agentNodeOptions passes the join-delivered pair through, an
 
 # ---- b213.3 — the control-plane half (the observed defect) -----------------
 s=ok
-grep -qE 'if err := setServerKubeletServing\(&nodeOpts, plan\.hierarchy, opts\.meshIP\); err != nil' "$SERVER_GO" || s=no
+# The CA it signs with is the hierarchy serverNodeOptions loads on EVERY topology
+# (nodeHierarchy), never plan.hierarchy, which is set on the mesh path only.
+grep -qE 'nodeHierarchy, err := certs\.EnsureHierarchy\(opts\.workDir, opts\.role\(\), opts\.posture\(\)\)' "$SERVER_GO" || s=no
+grep -qE 'if err := setServerKubeletServing\(&nodeOpts, nodeHierarchy, opts\.meshIP\); err != nil' "$SERVER_GO" || s=no
 grep -qE 'hierarchy\.Cluster\.IssueServing\(' "$SERVER_GO" || s=no
 grep -qE 'kubeletServingValidFor = 365 \* 24 \* time\.Hour' "$SERVER_GO" || s=no
 grep -qE 'proxyableNodeIP\(advertised\)' "$SERVER_GO" || s=no
@@ -136,7 +141,7 @@ func_body() { awk -v re="$2" '$0 ~ re {on=1} on {print} on && /^}/ {exit}' "$1";
 build_body="$(func_body "$SERVER_GO" '^func serverNodeOptions[(]')"
 drive_body="$(func_body "$SERVER_GO" '^func runServer[(]')"
 lit_ln="$(printf '%s\n' "$build_body" | grep -n 'nodeOpts := nodeOptions{' | head -1 | cut -d: -f1 || true)"
-mint_ln="$(printf '%s\n' "$build_body" | grep -n 'setServerKubeletServing(&nodeOpts, plan\.hierarchy' | head -1 | cut -d: -f1 || true)"
+mint_ln="$(printf '%s\n' "$build_body" | grep -n 'setServerKubeletServing(&nodeOpts, nodeHierarchy' | head -1 | cut -d: -f1 || true)"
 ret_ln="$(printf '%s\n' "$build_body" | grep -n 'return nodeOpts, nil' | head -1 | cut -d: -f1 || true)"
 ret_n="$(printf '%s\n' "$build_body" | grep -c 'return nodeOpts' || true)"
 if [ -n "$lit_ln" ] && [ -n "$mint_ln" ] && [ -n "$ret_ln" ] && [ "$ret_n" = 1 ] &&
@@ -155,16 +160,20 @@ else
 fi
 
 # ---- b213.4 — the rotation report stays complete ---------------------------
+# Every server topology mints the pair, so reissuedArtifacts lists it and reports
+# it present unconditionally (pinned inside each function's own body, so a call
+# elsewhere in the file cannot stand in for the listing).
 r=ok
-grep -qE 'kubeletServingArtifact\(workDir\),' "$ROTATE_GO" || r=no
-grep -qE 'func kubeletServingArtifact\(workDir string\) RotationArtifact' "$ROTATE_GO" || r=no
+grep -qE '^[[:space:]]*kubeletServingArtifact\(\),' <<<"$(func_body "$ROTATE_GO" '^func reissuedArtifacts[(]')" || r=no
+grep -qE 'Present:[[:space:]]+true,' <<<"$(func_body "$ROTATE_GO" '^func kubeletServingArtifact[(][)] RotationArtifact')" || r=no
 ladder "$r" "b213.4  reissuedArtifacts lists the newly re-minted kubelet serving pair (the report's completeness contract)"
 
 # ---- b213.5 — the docs describe the mechanism, not the aspiration ----------
 d=ok
 grep -q 'two mint sites and one anchor' "$DESIGN_MD" || d=no
 grep -q 'setServerKubeletServing' "$DESIGN_MD" || d=no
-grep -q 'SCOPE — this is the SINGLE-NODE, dev and standalone' "$SERVING_GO" || d=no
+grep -q 'SCOPE — this is the standalone `k3sm node` and dev cert, and nothing else' "$SERVING_GO" || d=no
+grep -q 'No `k3sm server` cluster uses it, on any topology' "$SERVING_GO" || d=no
 grep -q 'kubelet-certificate-authority' "$SERVING_GO" || d=no   # the mechanism, not a backlog id (public code carries no ids since #319)
 ladder "$d" "b213.5  DESIGN §5c names both mint sites, and SelfSignedServing's doc scopes itself to the dev posture"
 
@@ -208,7 +217,11 @@ run_test "b213.6" 2 TestKubeletServingTLSRejectsHalfPair       ./cmd/k3sm/
 run_test "b213.7" 4 TestAgentNodeOptionsCarriesServingPair     ./cmd/k3sm/
 
 # ---- b213.8 — the control-plane path, incl. fail-closed (d4) ---------------
-run_test "b213.8" 3 TestServerMeshNodeOptionsMintFromClusterCA ./cmd/k3sm/
+# The mesh mint (the mesh and no-datapath legs). The non-mesh leg is its own test
+# since every server topology mints: the single-node mint chains to the cluster CA,
+# its SANs equal the mesh SANs minus the mesh IP, and it fails closed too.
+run_test "b213.8" 2 TestServerMeshNodeOptionsMintFromClusterCA ./cmd/k3sm/
+run_test "b213.8" 4 TestSingleNodeKubeletServingCertChainsToClusterCA ./cmd/k3sm/
 run_test "b213.8" 3 TestServerMeshMintFailsClosedWithoutCA     ./cmd/k3sm/
 
 # ---- b213.9 — the apiserver flag pin + the rotation report (d5) ------------
@@ -231,7 +244,7 @@ if [ "${K3SM_LAB:-}" != 1 ]; then
 	lab_pending "b213.L2  the cert :10250 presents VERIFIES against <workDir>/tls/cluster-ca.crt (RED before: self-signed certificate — the client-cert requirement does not hide this, the server cert is sent before client auth completes)"
 	lab_pending "b213.L3  that leaf's SANs cover the address the node REGISTERED as its InternalIP"
 	lab_pending "b213.L4  kubectl logs on a Running pod completes the apiserver->:10250 round trip (RED before: x509: certificate signed by unknown authority — the exact lab symptom)"
-	lab_pending "b213.L5  a SINGLE-NODE boot still presents a SELF-SIGNED cert (the dev posture, pinned)"
+	lab_pending "b213.L5  a SINGLE-NODE boot's :10250 cert VERIFIES against its own <workDir>/tls/cluster-ca.crt and its IP SANs are the node's own (registered InternalIP + 127.0.0.1), no mesh address"
 	lab_pending "b213.L6  [two-Mac harness] the same round trip against a JOINED WORKER — hack/lab/m3.sh at the two-Mac session, NOT provable on one Mac"
 else
 	LAB_ROOT="${K3SM_B213_LAB_ROOT:-/tmp/k3sm-b213}"
@@ -385,18 +398,33 @@ else
 		fi
 		lab_down
 
-		# The dev posture, pinned. Without this rung the gate would still pass if the
-		# fix had made EVERY node serve a cluster-CA cert, silently changing the
-		# single-node path this item deliberately leaves alone.
+		# The single-node posture, pinned. A server without --mesh-ip mints its kubelet
+		# serving pair from its OWN cluster CA too (metrics-server verifies the kubelet
+		# against kube-root-ca.crt, the cluster CA, on every topology), so the leaf
+		# :10250 presents must verify against <solo workDir>/tls/cluster-ca.crt, and
+		# its IP SANs must be the node's own addresses only: the registered InternalIP
+		# and the 127.0.0.1 same-host dial. Any other IP SAN is a mesh address leaking
+		# into the single-node set. On one Mac the mesh boot above uses 127.0.0.1 as
+		# its mesh IP, so this rung pins the SAN set exactly rather than looking for
+		# that address by value.
 		SOLO_WD="$LAB_ROOT/solo"
-		echo "LAB tier: booting a SINGLE-NODE control plane (the self-signed posture, pinned)"
+		echo "LAB tier: booting a SINGLE-NODE control plane (the cluster-CA posture, pinned)"
 		if lab_boot "$SOLO_WD" b213solo; then
 			SOLO_LEAF="$LAB_ROOT/kubelet-leaf-solo.pem"
-			if presented_leaf "$SOLO_LEAF" && ! openssl verify -CAfile "$MESH_WD/tls/cluster-ca.crt" "$SOLO_LEAF" >/dev/null 2>&1 &&
-				[ "$(openssl x509 -in "$SOLO_LEAF" -noout -issuer)" = "$(openssl x509 -in "$SOLO_LEAF" -noout -subject | sed 's/^subject=/issuer=/')" ]; then
-				ladder ok "b213.L5  the single-node boot still presents a SELF-SIGNED cert (the dev posture the apiserver does not verify)"
+			SOLO_CA="$SOLO_WD/tls/cluster-ca.crt"
+			solo_internal="$("$SOLO_WD/bin/kubectl" --kubeconfig "$SOLO_WD/k3sm.kubeconfig" get node b213solo -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
+			if presented_leaf "$SOLO_LEAF" && [ -s "$SOLO_CA" ] && [ -n "$solo_internal" ]; then
+				solo_sans="$(openssl x509 -in "$SOLO_LEAF" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^[[:space:]]*IP Address:[[:space:]]*//p' | sort -u)"
+				want_sans="$(printf '%s\n' "$solo_internal" 127.0.0.1 | sort -u)"
+				if ! openssl verify -CAfile "$SOLO_CA" "$SOLO_LEAF" >/dev/null 2>&1; then
+					ladder no "b213.L5  the single-node boot's :10250 cert VERIFIES against $SOLO_CA, openssl says: $(openssl verify -CAfile "$SOLO_CA" "$SOLO_LEAF" 2>&1 | tail -1)"
+				elif [ "$solo_sans" != "$want_sans" ]; then
+					ladder no "b213.L5  the single-node leaf's IP SANs are the node's own (InternalIP $solo_internal + 127.0.0.1), no mesh address; got: $(printf '%s ' $solo_sans)"
+				else
+					ladder ok "b213.L5  the single-node boot's :10250 cert VERIFIES against $SOLO_CA and its IP SANs are the node's own ($(printf '%s ' $want_sans)), no mesh address"
+				fi
 			else
-				ladder no "b213.L5  the single-node boot still presents a SELF-SIGNED cert — issuer=$(openssl x509 -in "$SOLO_LEAF" -noout -issuer 2>/dev/null)"
+				ladder no "b213.L5  read the single-node leaf, its cluster CA and its registered InternalIP (leaf on the wire, $SOLO_CA, InternalIP=${solo_internal:-<unread>})"
 			fi
 		else
 			tail -25 "$SOLO_WD.log" >&2

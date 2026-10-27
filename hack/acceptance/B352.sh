@@ -59,6 +59,7 @@ INSTALL_GO="$K3SM_ROOT/pkg/install/install.go"
 DARWIN_GO="$K3SM_ROOT/pkg/install/install_darwin.go"
 RESTART_GO="$K3SM_ROOT/pkg/install/restart.go"
 DATAVOL_GO="$K3SM_ROOT/pkg/install/datavol.go"
+LOCK_GO="$K3SM_ROOT/pkg/install/staginglock.go"
 
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
@@ -73,10 +74,10 @@ echo "==> k3sm install publish acceptance (the install root is staged and publis
 # b352.1 below asserts it, rung by rung.
 b0=ok
 [ -f "$SELF" ] && bash -n "$SELF" || b0=no
-for f in "$INSTALL_GO" "$DARWIN_GO" "$RESTART_GO" "$DATAVOL_GO"; do
+for f in "$INSTALL_GO" "$DARWIN_GO" "$RESTART_GO" "$DATAVOL_GO" "$LOCK_GO"; do
 	[ -f "$f" ] || b0=no
 done
-ladder "$b0" "b352.0  gate parses (bash -n) + pkg/install/{install,install_darwin,restart,datavol}.go present"
+ladder "$b0" "b352.0  gate parses (bash -n) + pkg/install/{install,install_darwin,restart,datavol,staginglock}.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
 	echo "install publish: the gate or its sources are missing — nothing else can run" >&2
@@ -104,10 +105,25 @@ ladder "$w" "b352.1  the publish is unix.RenamexNp(...RENAME_SWAP) with EXDEV na
 
 # The lock. flock, not an O_CREAT|O_EXCL sentinel: a sentinel outlives the
 # process that made it, so a ^C'd install would lock every later one out.
+#
+# Install takes the lock through lockForInstall (staginglock.go), which has two
+# paths: a plain install takes the install lock directly, and an install from a
+# k3sm.app staging directory takes the staging lock first and then the install
+# lock in lockStagingThenInstall. Both function bodies are read, so neither
+# path can drop the install lock without this rung noticing. The darwin
+# LockInstall is the shared non-blocking helper flockNoWait.
 l=ok
 grep -q 'unix\.Flock(fd, unix\.LOCK_EX|unix\.LOCK_NB)' "$DARWIN_GO" || l=no
+grep -q 'return flockNoWait(path, "the install lock"' "$DARWIN_GO" || l=no
 grep -q 'ErrInstallInProgress' "$STAGE_GO" || l=no
-grep -q 'sys\.LockInstall(cfg\.installLockPath())' "$INSTALL_GO" || l=no
+grep -q 'release, err := lockForInstall(sys, cfg)' "$INSTALL_GO" || l=no
+# fbody FILE NAME: the body of top-level func NAME, from its signature to the
+# closing brace in column 0.
+fbody() { awk -v f="func $2(" 'index($0, f) == 1 { on = 1 } on { print } on && /^}/ { exit }' "$1"; }
+lfi="$(fbody "$LOCK_GO" lockForInstall)"
+grep -q 'sys\.LockInstall(cfg\.installLockPath())' <<<"$lfi" || l=no
+grep -q 'lockStagingThenInstall(sys, cfg, lockInstallFromStaging)' <<<"$lfi" || l=no
+grep -q 'sys\.LockInstall(cfg\.installLockPath())' <<<"$(fbody "$LOCK_GO" lockStagingThenInstall)" || l=no
 ladder "$l" "b352.1  the install-wide lock is a non-blocking flock and Install takes it"
 
 # The honesty clause: crash/power-loss atomicity is documented for plain
@@ -127,20 +143,29 @@ c=ok
 for s in stagedBinary stagedExecShim stagedPathShim stagedDNSShim stagedVMHost; do
 	grep -q "sys\.CopyToRootOwned(.*cfg\.$s(" "$INSTALL_GO" || c=no
 done
-# The payload loop and the three version markers (kine, etcd, control plane)
-# reach the staged path through a `dst` binding and wrapped calls, so they are
-# asserted by their own accessor: one use in the loop plus one per marker.
-# Counted across both files that carry Install's code, so a copy moved between
-# them is still counted rather than lost.
-[ "$(cat "$INSTALL_GO" "$DARWIN_GO" | grep -c 'cfg\.stagedPayloadFile(' || true)" = 4 ] || c=no
+# The payload loop and the version markers reach the staged path through a
+# `dst` binding and wrapped calls, so they are asserted by their own accessor:
+# one use in the payload loop, one per named marker (kine, etcd, etcdutl) and
+# one in the loop over payloadSetMarkers (control plane, zot, helm). The
+# etcdutl marker and the marker loop arrived after this gate was written; the
+# loop replaced the single control-plane marker copy.
+# Counted across every non-test file in pkg/install, so a copy moved into a
+# helper in another file is still counted rather than lost.
+PKG_SRC=()
+for f in "$K3SM_ROOT"/pkg/install/*.go; do
+	case "$f" in *_test.go) ;; *) PKG_SRC+=("$f") ;; esac
+done
+[ "$(cat "${PKG_SRC[@]}" | grep -c 'cfg\.stagedPayloadFile(' || true)" = 5 ] || c=no
+grep -q 'sys\.CopyToRootOwned(filepath\.Join(cfg\.PayloadSource, m), cfg\.stagedPayloadFile(m))' "$INSTALL_GO" || c=no
 # ...and NO copy names a live path. This is the negative that matters: one
 # CopyToRootOwned(..., cfg.installed*) would be a hole straight back into the
 # defect, and it would pass every positive rung above.
-# The total is the five named binaries + the payload loop + the three markers;
-# a tenth call is one the rungs above have not classified.
-grep -qE 'sys\.CopyToRootOwned\([^)]*cfg\.installed' "$INSTALL_GO" "$DARWIN_GO" && c=no
-[ "$(cat "$INSTALL_GO" "$DARWIN_GO" | grep -c 'sys\.CopyToRootOwned(' || true)" = 9 ] || c=no
-ladder "$c" "b352.1  all 9 CopyToRootOwned calls in Install name a staged destination, none an installed one"
+# The total is the five named binaries + the payload loop + the three named
+# markers + the marker loop; an eleventh call is one the rungs above have not
+# classified.
+grep -qE 'sys\.CopyToRootOwned\([^)]*cfg\.installed' "${PKG_SRC[@]}" && c=no
+[ "$(cat "${PKG_SRC[@]}" | grep -c 'sys\.CopyToRootOwned(' || true)" = 10 ] || c=no
+ladder "$c" "b352.1  all 10 CopyToRootOwned calls in Install name a staged destination, none an installed one"
 
 # The ORDER, by line number: stage, publish, wire, reap. This is the single
 # choice that makes rollback possible — a reap before the verification would
@@ -168,7 +193,10 @@ i=ok
 link_l="$(ln 'sys\.EnsureSymlink(a\.target, a\.path)' "$INSTALL_GO")"
 plist_l="$(ln 'sys\.WriteLaunchDaemon(a\.path, content, plistMode(a\.label))' "$INSTALL_GO")"
 rest_l="$(ln 'restartDaemons(ctx, sys, cfg, m)' "$INSTALL_GO")"
-ver_l="$(ln 'verifyDaemons(ctx, sys, cfg, m, startedAt)' "$INSTALL_GO")"
+ver_l="$(ln 'verifyDaemons(ctx, sys, cfg, m, bringUpWindow{startedAt: startedAt, fences: fences})' "$INSTALL_GO")"
+# The verification takes the bring-up fences restartDaemons returns, so it is
+# matched with them: a verification that stopped waiting on the restart's own
+# fences would no longer match.
 # Compared within publishedWiring, which is a separate function below Install —
 # the reap's position relative to it is the previous rung's wire -> reap pair.
 for pair in "$link_l $plist_l" "$plist_l $rest_l" "$rest_l $ver_l"; do

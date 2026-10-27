@@ -81,6 +81,7 @@ ladder "$p" "b330.1  spike_venv/spike_pip are defined inside LAB_PREAMBLE (the t
 w=ok
 for f in "$S0" "$S1" "$S3"; do
 	grep -qE '(^|[^a-zA-Z_])uv venv ' "$f" && w=no
+	grep -qE '(^|[^a-zA-Z_])uv pip install ' "$f" && w=no
 done
 grep -q 'spike_venv "\$PREFIX/venv" ' "$S0" || w=no
 grep -q 'spike_venv "\$PREFIX/venv-s1" ' "$S1" || w=no
@@ -89,7 +90,9 @@ grep -q 'spike_pip "\$V" "vllm-mlx==\$ENGINE_VERSION"' "$S0" || w=no
 grep -q 'spike_pip "\$V" "maturin>=\$MATURIN_MIN"' "$S1" || w=no
 grep -q 'spike_pip "\$V" "\$WHEEL"' "$S1" || w=no
 grep -q 'spike_pip "\$V" ai-dynamo' "$S1" || w=no
-grep -q 'spike_pip "\$VM" vllm-metal' "$S3" || w=no
+# s3.sh pins the alternative engine to an exact version ("vllm-metal==<ver>"),
+# so the rung matches the quoted, version-pinned spec without naming the version.
+grep -qE 'spike_pip "\$VM" "vllm-metal==[0-9][^"]*"' "$S3" || w=no
 ladder "$w" "b330.2  s0.sh/s1.sh/s3.sh create every venv and install every wheel through spike_venv/spike_pip (no raw uv venv/pip install left)"
 
 # s3.5's alternative-engine control is RECORDED, never gating — it must still be
@@ -97,7 +100,7 @@ ladder "$w" "b330.2  s0.sh/s1.sh/s3.sh create every venv and install every wheel
 # a plain install failure must still fall through to the "recorded, not gating"
 # branch rather than becoming a false criterion.
 c=ok
-grep -qF 'if ! spike_pip "$VM" vllm-metal; then' "$S3" || c=no
+grep -qE '^if ! spike_pip "\$VM" "vllm-metal==[0-9][^"]*"; then$' "$S3" || c=no
 grep -qF 'recorded "s3.5 control  the alternative engine did not install' "$S3" || c=no
 ladder "$c" "b330.2  s3.5's alternative-engine install stays RECORDED-not-gating through spike_pip's non-zero return"
 

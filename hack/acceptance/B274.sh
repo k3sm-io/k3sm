@@ -48,6 +48,7 @@ K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
 SELF="$HERE/B274.sh"
 INSTALL_GO="$K3SM_ROOT/pkg/install/install.go"
 INSTALL_DARWIN_GO="$K3SM_ROOT/pkg/install/install_darwin.go"
+TEARDOWN_GO="$K3SM_ROOT/pkg/install/teardown.go"
 
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
@@ -60,7 +61,8 @@ b0=ok
 [ -f "$SELF" ] && bash -n "$SELF" || b0=no
 [ -f "$INSTALL_GO" ] || b0=no
 [ -f "$INSTALL_DARWIN_GO" ] || b0=no
-ladder "$b0" "b274.0  gate parses (bash -n) + pkg/install/install.go + install_darwin.go present"
+[ -f "$TEARDOWN_GO" ] || b0=no
+ladder "$b0" "b274.0  gate parses (bash -n) + pkg/install/install.go + install_darwin.go + teardown.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
 	echo "uninstall pf anchor: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
@@ -69,12 +71,19 @@ if [ "$b0" != ok ]; then
 fi
 
 # ---- b274.1 — the WIRING, read straight out of the source -------------------
+# Uninstall reaches the flush through the post-bootout teardown it shares with
+# `k3sm stop`: uninstall -> teardownTail -> flushHostNetwork ->
+# sys.FlushMeshPFAnchor, whose failure is reported as a pf-anchor leftover.
 w=ok
 grep -qE 'FlushMeshPFAnchor\(\) error' "$INSTALL_GO" || w=no
-grep -qE 'note\(sys\.FlushMeshPFAnchor\(\)\)' "$INSTALL_GO" || w=no
+grep -qE 'tail := teardownTail\(ctx, sys, cfg, ' "$INSTALL_GO" || w=no
+grep -qE '^func teardownTail\(' "$TEARDOWN_GO" || w=no
+grep -qE 'hostLeft, swept := flushHostNetwork\(sys, cfg, ' "$TEARDOWN_GO" || w=no
+grep -qE '^func flushHostNetwork\(' "$TEARDOWN_GO" || w=no
+grep -qE 'add\(LeftoverPFAnchor, sys\.FlushMeshPFAnchor\(\)\)' "$TEARDOWN_GO" || w=no
 grep -qE 'func \(darwinSystem\) FlushMeshPFAnchor\(\) error' "$INSTALL_DARWIN_GO" || w=no
 grep -qE 'pfctl", "-a", mesh\.PFAnchor, "-F", "all"' "$INSTALL_DARWIN_GO" || w=no
-ladder "$w" "b274.1  System.FlushMeshPFAnchor exists, Uninstall calls it, and darwinSystem runs pfctl -a mesh.PFAnchor -F all"
+ladder "$w" "b274.1  System.FlushMeshPFAnchor exists, Uninstall calls it via teardownTail -> flushHostNetwork, and darwinSystem runs pfctl -a mesh.PFAnchor -F all"
 
 # ---- Go leg runner ------------------------------------------------------------
 # GOARCH is pinned to arm64: a Mac whose Go toolchain is itself x86_64-under-

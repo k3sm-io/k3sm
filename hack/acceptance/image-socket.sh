@@ -154,17 +154,19 @@ else
 fi
 # An absent socket must fail as a DIAL against the named path, not as a parse or
 # a panic: that error is the operator's only clue when the node is not serving.
+# pull is the verb that dials the node socket; tag, untag, inspect and save read
+# the cluster registry and never dial it.
 ABSENT="$(dirname "$K3SM_BIN")/absent.sock"
 LS_OUT="$(dirname "$K3SM_BIN")/ls.err"
-if [ -x "$K3SM_BIN" ] && ! "$K3SM_BIN" image inspect example.test/app:v1 --socket "$ABSENT" --timeout 5s >"$LS_OUT" 2>&1; then
-	if grep -q "$ABSENT" "$LS_OUT"; then
-		ladder ok "image-socket.5c \`k3sm image inspect\` against an unbound socket fails naming the path it dialled"
+if [ -x "$K3SM_BIN" ] && ! "$K3SM_BIN" image pull example.test/app:v1 --socket "$ABSENT" --timeout 5s >"$LS_OUT" 2>&1; then
+	if grep -qF "cannot reach runtimed at $ABSENT" "$LS_OUT"; then
+		ladder ok "image-socket.5c \`k3sm image pull\` against an unbound socket fails naming the path it dialled"
 	else
 		tail -5 "$LS_OUT"
-		ladder no "image-socket.5c \`k3sm image inspect\` against an unbound socket fails naming the path it dialled"
+		ladder no "image-socket.5c \`k3sm image pull\` against an unbound socket fails naming the path it dialled"
 	fi
 else
-	ladder no "image-socket.5c \`k3sm image inspect\` against an unbound socket must fail (it did not)"
+	ladder no "image-socket.5c \`k3sm image pull\` against an unbound socket must fail (it did not)"
 fi
 
 # ls and df read the cluster registry, not a node socket, so --socket on them

@@ -85,8 +85,10 @@ GOFLAGS_ENV=(env GOARCH=arm64 CGO_ENABLED=1)
 # run_test <id> <min-subtests> <TestName> <pkg>
 # Asserts the leg actually RAN its subtests: `go test -run <filter>` EXITS 0 on a
 # zero-match filter, so a renamed test would read PASS forever. Each leg fails
-# unless "no tests to run" is ABSENT and the count of `--- PASS: <TestName>/`
-# subtest lines meets the pinned minimum.
+# unless "no tests to run" is ABSENT, the test's own `--- PASS: <TestName> (`
+# line is present, and the count of `--- PASS: <TestName>/` subtest lines meets
+# the pinned minimum. A minimum of 0 names a test with no subtests, which then
+# stands on its own PASS line.
 run_test() {
 	local id="$1" min="$2" name="$3" pkg="$4" out rc=0 ran
 	out="$(cd "$K3SM_ROOT" && "${GOFLAGS_ENV[@]}" go test -count=1 -v -run "^${name}\$" "$pkg" 2>&1)" || rc=$?
@@ -97,6 +99,10 @@ run_test() {
 	fi
 	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
+		return
+	fi
+	if ! printf '%s\n' "$out" | grep -qE "^--- PASS: ${name} \("; then
+		ladder no "$id  $name ($pkg) reported no PASS line of its own"
 		return
 	fi
 	ran="$(printf '%s\n' "$out" | grep -cE "^[[:space:]]*--- PASS: ${name}/" || true)"
@@ -113,15 +119,19 @@ run_test "image-cli.1b" 10 TestImageVerbArgGrammar ./cmd/k3sm/
 
 # ---- image-cli.2 — each verb is a client, and renders what it was told -----
 run_test "image-cli.2a" 4 TestImagePullVerb ./cmd/k3sm/
-run_test "image-cli.2b" 4 TestImageTagVerb ./cmd/k3sm/
-run_test "image-cli.2c" 3 TestImageUntagVerb ./cmd/k3sm/
-run_test "image-cli.2d" 4 TestImageInspectVerb ./cmd/k3sm/
+# tag, untag and inspect act on the cluster registry, not the node's daemon;
+# each test drives its verb against an in-process registry with no subtests.
+run_test "image-cli.2b" 0 TestTagRefusesRepointWithoutForce ./cmd/k3sm/
+run_test "image-cli.2c" 0 TestImageUntagDeletesOneTag ./cmd/k3sm/
+run_test "image-cli.2d" 0 TestImageInspectReadsTheRegistry ./cmd/k3sm/
 
-# ---- image-cli.3 — the truncation refusal ---------------------------------
-# The load-bearing one. The wire's terminal frame is the ONLY thing that tells a
-# complete archive from a short one, so a save that accepted a stream without it
-# would hand an operator a tar that opens and is missing a layer.
-run_test "image-cli.3a" 6 TestImageSaveVerb ./cmd/k3sm/
+# ---- image-cli.3: the truncation refusal ----------------------------------
+# The load-bearing one. saveImageArchive is the stream reader behind push's
+# store form and migrate (`k3sm image save` itself reads the cluster registry).
+# The wire's terminal frame is the ONLY thing that tells a complete archive from
+# a short one, so a reader that accepted a stream without it would hand an
+# operator a tar that opens and is missing a layer.
+run_test "image-cli.3a" 6 TestSaveImageArchiveVerifiesTheStream ./cmd/k3sm/
 
 # ---- image-cli.4 — push's store form, and its unpacker --------------------
 run_test "image-cli.4a" 2 TestImagePushFromStore ./cmd/k3sm/
@@ -181,11 +191,12 @@ refuses "image-cli.6e prune refuses --platform, which it cannot honour" prune --
 refuses "image-cli.6f pull refuses an invented policy" pull example.test/app:v1 --policy sometimes
 
 # An absent socket must fail as a DIAL against the named path: that error is the
-# operator's only clue when the node is not serving.
+# operator's only clue when the node is not serving. pull is the store verb that
+# dials the daemon; tag, untag, inspect and save read the cluster registry.
 ABSENT="$BIN_DIR/absent.sock"
 DIAL_OUT="$BIN_DIR/dial.err"
-if ! "$K3SM_BIN" image inspect example.test/app:v1 --socket "$ABSENT" --timeout 5s >"$DIAL_OUT" 2>&1; then
-	if grep -q "$ABSENT" "$DIAL_OUT"; then
+if ! "$K3SM_BIN" image pull example.test/app:v1 --socket "$ABSENT" --timeout 5s >"$DIAL_OUT" 2>&1; then
+	if grep -qF "cannot reach runtimed at $ABSENT" "$DIAL_OUT"; then
 		ladder ok "image-cli.6g a store verb against an unbound socket fails naming the path it dialled"
 	else
 		tail -5 "$DIAL_OUT"

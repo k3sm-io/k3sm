@@ -95,7 +95,11 @@ ladder "$w" "b282.1  the provider reads the FILE (podlogs.ReadLogs) and no longe
 
 w=ok
 grep -qE 'ExtraRoutes' "$K3SM_ROOT/pkg/provider/vkadapter/vkadapter.go" || w=no
-grep -qE 'ExtraRoutes:\s*containerLogRoutes\(prov\)' "$K3SM_ROOT/cmd/k3sm/node.go" || w=no
+# The logs route rides the ExtraRoutes value, alone or as the first operand of
+# an append that adds other k3sm routes, and containerLogRoutes is called from
+# exactly one place in non-test cmd/ code: no second registration path.
+grep -qE 'ExtraRoutes:\s*(append\()?containerLogRoutes\(prov\)' "$K3SM_ROOT/cmd/k3sm/node.go" || w=no
+[ "$(grep -rhoE 'containerLogRoutes\(prov\)' --include='*.go' --exclude='*_test.go' "$K3SM_ROOT/cmd" | wc -l | tr -d ' ')" = 1 ] || w=no
 grep -qE 'HandlerPath\s*=\s*"/containerLogs/"' "$K3SM_ROOT/pkg/provider/podlogs/handler.go" || w=no
 ladder "$w" "b282.1  the kubelet /containerLogs handler is registered through the ONE vkadapter seam"
 
