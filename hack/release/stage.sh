@@ -61,9 +61,12 @@
 #                    versioned name): k3sm builds them itself from pinned module
 #                    source in `k3sm payload`, with the toolchain
 #                    PAYLOAD_GO_VERSION pins, and staging proves each is the
-#                    pinned build.
-#                    kube.version is not on any list yet, so today --release
-#                    still refuses, naming it. Signing any of
+#                    pinned build. The control-plane marker kube.version
+#                    (KUBE_MARKER_FILE) is accepted only with a content proof:
+#                    a regular file whose bytes are exactly "<tag>\n", where
+#                    <tag> is the Kubernetes tag the --cp-build BUILD-STAMP
+#                    records and equals the executor's DefaultKubeVersion
+#                    (kube_marker_problems). Signing any of
 #                    this with a Developer ID is the attended signing pipeline's
 #                    job, never this script's. Without --release (the default)
 #                    staging is the ad-hoc lab staging, with the same
@@ -616,11 +619,42 @@ cp-payload/zot
 cp-payload/zot.version
 cp-payload/helm.version"
 
+# The control-plane version marker `k3sm payload` writes beside the four
+# control-plane binaries (pkg/executor KubeMarkerName). A text marker, not code:
+# release staging accepts it only when kube_marker_problems proves its content.
+KUBE_MARKER_FILE="cp-payload/kube.version"
+
 # release_payload_files: every cp-payload entry release staging accepts, one per
-# line: PINNED_SOURCE_FILES, K3SM_BUILT_FILES, and the k3sm-built helm under its
-# versioned name. Needs read_pins.
+# line: PINNED_SOURCE_FILES, KUBE_MARKER_FILE, K3SM_BUILT_FILES, and the
+# k3sm-built helm under its versioned name. Needs read_pins.
 release_payload_files() {
-	printf '%s\n%s\ncp-payload/%s\n' "$PINNED_SOURCE_FILES" "$K3SM_BUILT_FILES" "$HELM_BINARY"
+	printf '%s\n%s\n%s\ncp-payload/%s\n' "$PINNED_SOURCE_FILES" "$KUBE_MARKER_FILE" "$K3SM_BUILT_FILES" "$HELM_BINARY"
+}
+
+# kube_marker_problems <tree> <stamp-text> <kube-version>: non-zero, naming the
+# file and the expected content, unless <tree>/KUBE_MARKER_FILE is a regular file
+# (not a symlink) whose bytes are exactly "<tag>\n", where <tag> is the one
+# `tag: <tag> (commit ...)` line of <stamp-text> (the --cp-build BUILD-STAMP) and
+# equals <kube-version> (read_pins' DefaultKubeVersion).
+kube_marker_problems() {
+	local tree="$1" stamp="$2" kv="$3" f tags tag
+	f="$tree/$KUBE_MARKER_FILE"
+	tags="$(printf '%s\n' "$stamp" | sed -n 's/^tag: \([^[:space:]]*\) .*/\1/p')"
+	if [ -z "$tags" ] || [ "$(printf '%s\n' "$tags" | wc -l | tr -d ' ')" != 1 ]; then
+		echo "    $KUBE_MARKER_FILE: $CP_STAMP_NAME does not record exactly one tag line, so the marker has no expected content"
+		return 1
+	fi
+	tag="$tags"
+	if [ -z "$kv" ] || [ "$tag" != "$kv" ]; then
+		echo "    $KUBE_MARKER_FILE: $CP_STAMP_NAME records tag $tag, the executor's DefaultKubeVersion is '${kv}'"
+		return 1
+	fi
+	if [ -L "$f" ] || [ ! -f "$f" ]; then
+		printf '    %s: missing or not a regular file; expected exactly "%s\\n"\n' "$KUBE_MARKER_FILE" "$tag"
+		return 1
+	fi
+	cmp -s "$f" <(printf '%s\n' "$tag") || { printf '    %s: content is not exactly "%s\\n"\n' "$KUBE_MARKER_FILE" "$tag"; return 1; }
+	return 0
 }
 
 # cp_build_problems <dir>: non-zero, naming each problem, unless <dir> holds
@@ -1585,24 +1619,46 @@ FAILCP
 	fi
 	if [ ! -e "$tmp/lab-out/k3sm" ]; then ok "nothing was built before the control-plane binaries were in hand"; else bad "k3sm was built before build-cp ran"; fi
 
-	echo "==> --release accepts k3sm's own kine/etcd/etcdutl/zot/helm builds, still refuses kube.version"
+	echo "==> --release accepts k3sm's own kine/etcd/etcdutl/zot/helm builds and a proven kube.version"
 	read_pins
-	local kb="$tmp/k3sm-built" rpf
+	local kb="$tmp/k3sm-built" rpf kstamp
 	rpf="$(release_payload_files)"
 	mkdir -p "$kb/cp-payload"
 	while IFS= read -r rel; do printf 'x\n' >"$kb/$rel"; done <<<"$rpf"
-	if printf '%s\n' "$rpf" | grep -qxF "cp-payload/$HELM_BINARY" && printf '%s\n' "$rpf" | grep -qxF cp-payload/helm.version && printf '%s\n' "$rpf" | grep -qxF cp-payload/zot && printf '%s\n' "$rpf" | grep -qxF cp-payload/zot.version; then
-		ok "the release list names $HELM_BINARY, helm.version, zot and zot.version"
+	printf '%s\n' "$KUBE_VERSION" >"$kb/$KUBE_MARKER_FILE"
+	kstamp="$(printf 'build-cp stamp\ntag: %s (commit 0)\ntoolchain: %s (the source'"'"'s .go-version: go1.0.0)\n' "$KUBE_VERSION" "$PAYLOAD_GO_VERSION")"
+	if printf '%s\n' "$rpf" | grep -qxF "cp-payload/$HELM_BINARY" && printf '%s\n' "$rpf" | grep -qxF cp-payload/helm.version && printf '%s\n' "$rpf" | grep -qxF cp-payload/zot && printf '%s\n' "$rpf" | grep -qxF cp-payload/zot.version && printf '%s\n' "$rpf" | grep -qxF cp-payload/kube.version; then
+		ok "the release list names $HELM_BINARY, helm.version, zot, zot.version and kube.version"
 	else
-		bad "the release list lacks helm or zot: $rpf"
+		bad "the release list lacks helm, zot or kube.version: $rpf"
 	fi
-	if out="$(refuse_unpinned_payload "$kb" "$rpf")"; then ok "kine, etcd, etcdutl, zot, helm and their markers pass the release refusal"; else bad "k3sm's own builds or the pinned helm were refused: $out"; fi
-	printf 'x\n' >"$kb/cp-payload/kube.version"
+	if out="$(refuse_unpinned_payload "$kb" "$rpf")"; then ok "kine, etcd, etcdutl, zot, helm, kube.version and their markers pass the release refusal"; else bad "k3sm's own builds, kube.version or the pinned helm were refused: $out"; fi
+	if out="$(kube_marker_problems "$kb" "$kstamp" "$KUBE_VERSION")"; then ok "a kube.version of exactly \"$KUBE_VERSION\\n\" passes the content proof"; else bad "a correct kube.version was refused: $out"; fi
+	local kc
+	for kc in 'v1.36.0\n' 'x\n' "$KUBE_VERSION" "$KUBE_VERSION\\n$KUBE_VERSION\\n" "$KUBE_VERSION\\n\\n"; do
+		# shellcheck disable=SC2059 # the case is the format: it carries the escapes
+		printf "$kc" >"$kb/$KUBE_MARKER_FILE"
+		if out="$(kube_marker_problems "$kb" "$kstamp" "$KUBE_VERSION")"; then
+			bad "a kube.version of '$kc' passed the content proof"
+		elif printf '%s\n' "$out" | grep -qF "cp-payload/kube.version: content is not exactly \"$KUBE_VERSION\\n\""; then
+			ok "a kube.version of '$kc' is refused, naming the file and the expected content"
+		else
+			bad "a kube.version of '$kc' was refused for the wrong reason: $out"
+		fi
+	done
+	rm -f "$kb/$KUBE_MARKER_FILE"
+	ln -s "$kb/cp-payload/kine.version" "$kb/$KUBE_MARKER_FILE"
+	if out="$(kube_marker_problems "$kb" "$kstamp" "$KUBE_VERSION")"; then bad "a symlinked kube.version passed the content proof"; elif printf '%s\n' "$out" | grep -qF "cp-payload/kube.version: missing or not a regular file"; then ok "a symlinked kube.version is refused"; else bad "a symlinked kube.version was refused for the wrong reason: $out"; fi
+	rm -f "$kb/$KUBE_MARKER_FILE"
+	if out="$(kube_marker_problems "$kb" "$kstamp" "$KUBE_VERSION")"; then bad "a missing kube.version passed the content proof"; else ok "a missing kube.version is refused"; fi
+	printf '%s\n' "$KUBE_VERSION" >"$kb/$KUBE_MARKER_FILE"
+	if out="$(kube_marker_problems "$kb" "$kstamp" "v0.0.0")"; then bad "a stamp tag other than DefaultKubeVersion passed the content proof"; elif printf '%s\n' "$out" | grep -qF "DefaultKubeVersion is 'v0.0.0'"; then ok "a --cp-build tag other than DefaultKubeVersion is refused"; else bad "a tag mismatch was refused for the wrong reason: $out"; fi
+	if out="$(kube_marker_problems "$kb" "build-cp stamp" "$KUBE_VERSION")"; then bad "a stamp without a tag line passed the content proof"; else ok "a stamp without a tag line is refused"; fi
 	printf 'x\n' >"$kb/cp-payload/helm-v0.0.0"
 	if out="$(refuse_unpinned_payload "$kb" "$rpf")"; then
-		bad "kube.version or an unpinned helm passed the release refusal"
-	elif printf '%s\n' "$out" | grep -q "kube.version" && printf '%s\n' "$out" | grep -q "helm-v0.0.0" && ! printf '%s\n' "$out" | grep -Eq "cp-payload/(kine|etcd|zot|$HELM_BINARY)\$"; then
-		ok "kube.version and a helm at another version are refused, the pinned set is not"
+		bad "an unpinned helm passed the release refusal"
+	elif printf '%s\n' "$out" | grep -q "helm-v0.0.0" && ! printf '%s\n' "$out" | grep -Eq "cp-payload/(kine|etcd|zot|kube\.version|$HELM_BINARY)\$"; then
+		ok "a helm at another version is refused, the pinned set and kube.version are not"
 	else
 		bad "release refusal named the wrong files: $out"
 	fi
@@ -2099,6 +2155,8 @@ upstream_digests_write "$OUT" "$upstream_note" || die "could not write $OUT/$UPS
 if [ "$RELEASE" = 1 ]; then
 	pinned_content_problems "$OUT" "$CP_BUILD" ||
 		die "--release: the staged control-plane binaries are not the pinned-source build in $CP_BUILD"
+	kube_marker_problems "$OUT" "$CP_STAMP" "$KUBE_VERSION" ||
+		die "--release: the staged $KUBE_MARKER_FILE does not vouch for the --cp-build tag (above)"
 	refuse_unpinned_payload "$OUT" "$(release_payload_files)" ||
 		die "--release: refusing to sign cp-payload files not built from pinned source (hack/release/build-cp.sh, or k3sm's own kine/etcd/zot/helm build)"
 fi
