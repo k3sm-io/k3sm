@@ -10,6 +10,17 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+## v0.2.1 — 2026-10-27
+
+The first published v0.2 release. v0.2.0 was tagged but never published: Go announced
+the two advisories below while it was being signed. v0.2.1 is v0.2.0 with that fix, so
+every change listed under v0.2.0 ships in it.
+
+### Security
+
+- The control-plane binaries and the bundled helm are built against golang.org/x/net v0.62.0,
+  which fixes GO-2026-6860 and GO-2026-6866 in the HTML parser and renderer.
+
 ## v0.2.0 — 2026-10-26
 
 ### Breaking

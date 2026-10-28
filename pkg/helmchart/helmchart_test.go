@@ -509,7 +509,7 @@ func TestHelmBuildArgs(t *testing.T) {
 // values here.
 func TestHelmBuildVariantTracksGoSum(t *testing.T) {
 	sum := sha256.Sum256(append(append(append([]byte{}, helmchild.GoMod...), 0), helmchild.GoSum...))
-	if got, wantSum, wantVariant := hex.EncodeToString(sum[:]), "23303ffdac839998995784e5642bdc04e4e6312d3729b95c4b0e4488a481acec", "nocgo+deps1"; got != wantSum || HelmBuildVariant != wantVariant {
+	if got, wantSum, wantVariant := hex.EncodeToString(sum[:]), "0657a63a5f36a2dd5a3923e49542f231bb2762c04e85f2df8428cafc698c7060", "nocgo+deps2"; got != wantSum || HelmBuildVariant != wantVariant {
 		t.Errorf("go.mod.txt+go.sum.txt sha256 %s with variant %q; this test pins %s with %q: bump HelmBuildVariant with the dependency set", got, HelmBuildVariant, wantSum, wantVariant)
 	}
 }

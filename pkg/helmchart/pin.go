@@ -59,10 +59,16 @@ const (
 	HelmMainPackage = HelmModule + "/cmd/helm"
 	// HelmRaisedModules names the modules the wrapper raises above the versions
 	// helm's own go.mod requires, as space-separated path@version, each the first
-	// release fixing a govulncheck finding reachable in the pinned helm (and at
-	// least 14 days old when adopted). The wrapper's go.mod requires exactly these
-	// versions (ValidateHelmPin), and a staged helm's build info must carry them.
-	HelmRaisedModules = "golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0"
+	// release fixing a govulncheck finding reachable in the pinned helm, or the
+	// higher version another raise requires (golang.org/x/net v0.62.0 requires
+	// golang.org/x/crypto v0.58.0). A raise is at least 14 days old when adopted
+	// unless a security fix cannot wait: x/net v0.62.0, which fixes
+	// GO-2026-6860 and GO-2026-6866, was adopted the day it was published, by the
+	// same exemption hack/release/build-cp.sh records for the control plane. The
+	// wrapper build itself checks no publish date. The wrapper's go.mod requires
+	// exactly these versions (ValidateHelmPin), and a staged helm's build info
+	// must carry them.
+	HelmRaisedModules = "golang.org/x/crypto@v0.58.0 golang.org/x/net@v0.62.0"
 	// HelmMinGoVersion is the oldest Go release a staged helm may be built with:
 	// the first that fixes the standard library findings reachable in helm. The
 	// payload toolchain (hack/release/lib/gochild.sh PAYLOAD_GO_VERSION) builds
@@ -81,7 +87,7 @@ const (
 	// wrapper module, whose dependency set is the "+deps<n>" suffix. Bump the
 	// suffix with every change to helmchild's go.sum, so a work dir or payload
 	// built from the previous set re-stages instead of trusting its marker.
-	HelmBuildVariant = "nocgo+deps1"
+	HelmBuildVariant = "nocgo+deps2"
 
 	// helmVersionPackage is the package helm's release build stamps.
 	helmVersionPackage = HelmModule + "/internal/version"

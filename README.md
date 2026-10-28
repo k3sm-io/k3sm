@@ -8,7 +8,7 @@ too, in a per-pod Virtualization.framework micro-VM, through an opt-in RuntimeCl
 (`runtimeClassName: vm`). The `vm` path runs `linux/arm64` images; `linux/amd64` images do not
 run on any path yet.
 
-The latest release is v0.2.0 (2026-10-26). The control plane on `main` embeds
+The latest release is v0.2.1 (2026-10-27). The control plane on `main` embeds
 Kubernetes v1.37.1. Multi-node clusters, two Macs joined over a wireguard mesh, and a control plane shared by
 two servers are experimental; both graduate in a later release. Models served on
 the Mac's GPU with MLX have their own resource and CRD (`mlx.k3sm.io/gpu` and `MLXModel`). The

@@ -1689,12 +1689,12 @@ FAKE
 	if out="$(buildinfo_problems zot v2.1.21 go1.27.3 <"$td/goversion-zot.txt")"; then bad "zot at another version passed"; elif printf '%s\n' "$out" | grep -q "zot/v2 is not at v2.1.21"; then ok "zot at another version is refused"; else bad "zot version not named: $out"; fi
 	if out="$(printf '%s\n\t=>\texample.com/fork\tv0.0.1\th1:x=\n' "$(cat "$td/goversion-etcd.txt")" | buildinfo_problems etcd v3.6.15 go1.27.3)"; then bad "a replaced module passed"; elif printf '%s\n' "$out" | grep -q "replaced"; then ok "a replaced module is refused"; else bad "replace not named: $out"; fi
 	echo "==> the build stamp of helm (go version -m capture of the wrapper build; dep list trimmed)"
-	local hraised="golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0" hfx="$td/goversion-helm-v4.3.0.txt"
+	local hraised="golang.org/x/crypto@v0.58.0 golang.org/x/net@v0.62.0" hfx="$td/goversion-helm-v4.3.0.txt"
 	if out="$(helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised" <"$hfx")"; then ok "helm capture passes"; else bad "helm capture rejected: $out"; fi
 	if out="$(helm_buildinfo_problems v4.3.0 go1.27.9 "$hraised" <"$hfx")"; then bad "helm: another toolchain passed"; elif printf '%s\n' "$out" | grep -q "helm: built with 'go1.27.3', the payload pins go1.27.9"; then ok "helm: a build on another toolchain is refused, naming both"; else bad "helm: toolchain not named: $out"; fi
 	if out="$(sed '1s/go1.27.3$/go1.27.1/' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: the upstream release's go1.27.1 passed"; elif printf '%s\n' "$out" | grep -q "built with 'go1.27.1'"; then ok "helm: a build-info line on go1.27.1 (the upstream tarball's toolchain) is refused"; else bad "helm: go1.27.1 not named: $out"; fi
-	if out="$(sed 's/v0.60.0/v0.57.0/' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: helm's own x/net passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/net is not at the raised v0.60.0"; then ok "helm: a build without the raised x/net is refused"; else bad "helm: raised x/net not named: $out"; fi
-	if out="$(grep -v 'golang.org/x/crypto' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: a build without x/crypto passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/crypto is not at the raised v0.57.0"; then ok "helm: a build without the raised x/crypto is refused"; else bad "helm: raised x/crypto not named: $out"; fi
+	if out="$(sed 's/v0.62.0/v0.60.0/' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: helm's own x/net passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/net is not at the raised v0.62.0"; then ok "helm: a build without the raised x/net is refused"; else bad "helm: raised x/net not named: $out"; fi
+	if out="$(grep -v 'golang.org/x/crypto' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: a build without x/crypto passed"; elif printf '%s\n' "$out" | grep -q "golang.org/x/crypto is not at the raised v0.58.0"; then ok "helm: a build without the raised x/crypto is refused"; else bad "helm: raised x/crypto not named: $out"; fi
 	if out="$(helm_buildinfo_problems v4.3.1 go1.27.3 "$hraised" <"$hfx")"; then bad "helm at another version passed"; elif printf '%s\n' "$out" | grep -q "helm.sh/helm/v4 is not at v4.3.1"; then ok "helm at another version is refused"; else bad "helm version not named: $out"; fi
 	if out="$(sed 's/CGO_ENABLED=0/CGO_ENABLED=1/' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: a cgo build passed"; else ok "helm: a cgo build is refused"; fi
 	if out="$(grep -v -- '-trimpath' "$hfx" | helm_buildinfo_problems v4.3.0 go1.27.3 "$hraised")"; then bad "helm: a build without -trimpath passed"; else ok "helm: a build without -trimpath is refused"; fi
@@ -1708,10 +1708,10 @@ FAKE
 	mkdir -p "$cpd"
 	(
 		KINE_VERSION=v0.17.2 KINE_VARIANT=nocgo+p2 KINE_PATCH=p2 ETCD_VERSION=v3.6.15 ETCD_VARIANT=nocgo GO="$fgo"
-		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal+r1 HELM_BINARY=helm-v4.3.0 HELM_VERSION=v4.3.0 HELM_VARIANT=nocgo+deps1 XNET_FLOOR=v0.60.0
-		HELM_RAISED="golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0" HELM_COMMIT=bec5b06ed841fe5269972d864d5177944fd5970f
+		ZOT_VERSION=v2.1.22 ZOT_VARIANT=minimal+r1 HELM_BINARY=helm-v4.3.0 HELM_VERSION=v4.3.0 HELM_VARIANT=nocgo+deps2 XNET_FLOOR=v0.60.0
+		HELM_RAISED="golang.org/x/crypto@v0.58.0 golang.org/x/net@v0.62.0" HELM_COMMIT=bec5b06ed841fe5269972d864d5177944fd5970f
 		printf 'zot\n' >"$cpd/zot"; echo "v2.1.22 minimal+r1" >"$cpd/zot.version"
-		printf 'mach-o...v4.3.0...bec5b06ed841fe5269972d864d5177944fd5970f...\n' >"$cpd/helm-v4.3.0"; echo "v4.3.0 nocgo+deps1" >"$cpd/helm.version"
+		printf 'mach-o...v4.3.0...bec5b06ed841fe5269972d864d5177944fd5970f...\n' >"$cpd/helm-v4.3.0"; echo "v4.3.0 nocgo+deps2" >"$cpd/helm.version"
 		printf 'mach-o...v0.17.2+p2...\n' >"$cpd/kine"; echo "v0.17.2 nocgo+p2" >"$cpd/kine.version"
 		printf 'etcd\n' >"$cpd/etcd"; echo "v3.6.15 nocgo" >"$cpd/etcd.version"
 		printf 'etcdutl\n' >"$cpd/etcdutl"; echo "v3.6.15 nocgo" >"$cpd/etcdutl.version"
@@ -1730,8 +1730,8 @@ FAKE
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a zot marker at another pin passed"; r=1; elif printf '%s\n' "$o" | grep -q "zot.version"; then echo "  ok    a zot marker naming another pin is refused"; else echo "  FAIL  zot marker not named: $o"; r=1; fi
 		echo "v2.1.22 minimal+r1" >"$cpd/zot.version"
 		echo "v4.3.0 tarball" >"$cpd/helm.version"
-		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm marker naming another variant passed"; r=1; elif printf '%s\n' "$o" | grep -q "helm.version is not 'v4.3.0 nocgo+deps1'"; then echo "  ok    a helm marker naming another build variant is refused"; else echo "  FAIL  helm marker not named: $o"; r=1; fi
-		echo "v4.3.0 nocgo+deps1" >"$cpd/helm.version"
+		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm marker naming another variant passed"; r=1; elif printf '%s\n' "$o" | grep -q "helm.version is not 'v4.3.0 nocgo+deps2'"; then echo "  ok    a helm marker naming another build variant is refused"; else echo "  FAIL  helm marker not named: $o"; r=1; fi
+		echo "v4.3.0 nocgo+deps2" >"$cpd/helm.version"
 		printf 'mach-o...v4.3.0...\n' >"$cpd/helm-v4.3.0"
 		if o="$(child_problems "$cpd" go1.27.3)"; then echo "  FAIL  a helm without its stamped commit passed"; r=1; elif printf '%s\n' "$o" | grep -q "helm: the stamped string bec5b06ed841fe5269972d864d5177944fd5970f is not in the binary"; then echo "  ok    a helm built without its -X stamp (no commit in the bytes) is refused"; else echo "  FAIL  helm stamp not named: $o"; r=1; fi
 		printf 'mach-o...bec5b06ed841fe5269972d864d5177944fd5970f...\n' >"$cpd/helm-v4.3.0"

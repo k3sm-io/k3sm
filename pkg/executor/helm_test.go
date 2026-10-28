@@ -278,7 +278,7 @@ func TestPayloadCarriesHelm(t *testing.T) {
 // helmBuildInfo is the build info the wrapper build records in helm (dep list
 // trimmed), the shape `go version -m` prints for the staged binary.
 const helmBuildInfo = "go\tgo1.27.3\npath\thelm.sh/helm/v4/cmd/helm\nmod\thelm.sh/helm/v4\tv4.3.0\th1:w=\n" +
-	"dep\tgolang.org/x/crypto\tv0.57.0\th1:c=\ndep\tgolang.org/x/net\tv0.60.0\th1:n=\n" +
+	"dep\tgolang.org/x/crypto\tv0.58.0\th1:c=\ndep\tgolang.org/x/net\tv0.62.0\th1:n=\n" +
 	"build\t-trimpath=true\nbuild\tCGO_ENABLED=0\nbuild\tGOARCH=arm64\nbuild\tGOOS=darwin\n"
 
 // parseHelmInfo parses build-info text the way buildinfo.ReadFile reads a binary:
@@ -316,9 +316,9 @@ func TestHelmStampOf(t *testing.T) {
 	}
 	for name, info := range map[string]string{
 		"the upstream tarball's toolchain": strings.Replace(helmBuildInfo, "go1.27.3", "go1.27.1", 1),
-		"helm's own x/net":                 strings.Replace(helmBuildInfo, "x/net\tv0.60.0", "x/net\tv0.57.0", 1),
+		"helm's own x/net":                 strings.Replace(helmBuildInfo, "x/net\tv0.62.0", "x/net\tv0.57.0", 1),
 		"an unreadable toolchain":          strings.Replace(helmBuildInfo, "go\tgo1.27.3", "go\tdevel", 1),
-		"no x/crypto":                      strings.Replace(helmBuildInfo, "dep\tgolang.org/x/crypto\tv0.57.0\th1:c=\n", "", 1),
+		"no x/crypto":                      strings.Replace(helmBuildInfo, "dep\tgolang.org/x/crypto\tv0.58.0\th1:c=\n", "", 1),
 		"a replaced x/net":                 strings.Replace(helmBuildInfo, "h1:n=\n", "h1:n=\n=>\texample.com/fork\tv0.0.1\th1:f=\n", 1),
 		"no -trimpath":                     strings.Replace(helmBuildInfo, "build\t-trimpath=true\n", "", 1),
 		"another main package":             strings.Replace(helmBuildInfo, "path\thelm.sh/helm/v4/cmd/helm", "path\texample.com/helm", 1),
@@ -362,7 +362,7 @@ func TestReleaseSeedRefusesAMisbuiltHelm(t *testing.T) {
 	}{
 		"the wrapper build":    {helmBuildInfo, false},
 		"another toolchain":    {strings.Replace(helmBuildInfo, "go1.27.3", "go1.27.1", 1), true},
-		"without raised x/net": {strings.Replace(helmBuildInfo, "x/net\tv0.60.0", "x/net\tv0.57.0", 1), true},
+		"without raised x/net": {strings.Replace(helmBuildInfo, "x/net\tv0.62.0", "x/net\tv0.57.0", 1), true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := &fakeCodeSigner{}
