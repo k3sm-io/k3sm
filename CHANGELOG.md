@@ -10,11 +10,12 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
-## v0.2.1 — 2026-10-27
+## v0.2.2 — 2026-10-28
 
-The first published v0.2 release. v0.2.0 was tagged but never published: Go announced
-the two advisories below while it was being signed. v0.2.1 is v0.2.0 with that fix, so
-every change listed under v0.2.0 ships in it.
+The first published v0.2 release. v0.2.0 and v0.2.1 were tagged but never published: Go
+announced the two advisories below while v0.2.0 was being signed, and release signing could
+not yet ship the control-plane version marker when v0.2.1 was. v0.2.2 is v0.2.0 with both
+fixes, so every change listed under v0.2.0 ships in it.
 
 ### Security
 
