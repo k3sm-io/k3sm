@@ -91,7 +91,9 @@ kubectl wait --for=condition=Ready mlxmodel/qwen3-06b --timeout=30m
 
 The `Ready` condition's `reason` names the state: `Pending` (no replica running yet), `Downloading`
 (fetching weights), `Loading` (weights fetched, model loading), `Serving` (ready), `PodFailed` (the
-replica died), `ScaledToZero` (you set `replicas: 0`).
+replica died), `Crashing` (the serving container keeps exiting or cannot start; the message gives the
+replica, the last exit code and the error), `ImagePullFailed` (the serving image cannot be pulled),
+`ScaledToZero` (you set `replicas: 0`).
 
 There is no liveness probe on the serving pod, because a first start is an unbounded download and a
 probe that killed it would restart the download from zero.
