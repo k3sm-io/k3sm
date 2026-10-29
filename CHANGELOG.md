@@ -36,6 +36,9 @@ pin, its date, and the tarball's sha256.
   starting: the wait follows the guest console's output, up to 120 seconds. A boot whose agent
   never answers is retried once, and the failed boot's console is kept under the work-dir and
   quoted in the pod's error.
+- `k3sm image migrate --report` run without `sudo` on a server no longer reports a finished
+  migration as incomplete with zero images. It prints the summary `k3sm status` shows and says
+  the per-image report needs `sudo`; `-o json` asks for `sudo` instead of printing an empty journal.
 
 ## v0.2.2 — 2026-10-28
 
