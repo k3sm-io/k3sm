@@ -48,17 +48,19 @@ run on hardware, that is an added caveat: nobody has exercised it on real Macs y
 18. [Interconnects](interconnects.md) covers a Thunderbolt cable between Macs as an opt-in network
     for Pods that ask for it, the MLX ranks of a sharded model above all.
 19. [Limitations](limitations.md) lists the gaps.
-20. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
+20. [Conformance profile](../conformance-profile.md) is the self-assessment of what k3sm targets and why it
+    is not a CNCF `[Conformance]` pass.
+21. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
     recovery.
-21. [Status JSON](status-json.md) is the contract for `k3sm status -o json` and the cheap
+22. [Status JSON](status-json.md) is the contract for `k3sm status -o json` and the cheap
     `k3sm status daemons -o json` probe: fields, enums, versioning and exit codes.
-22. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
+23. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
     options, rotation, and how to ship logs off a node.
-23. [Stopping and starting](stop-start.md) covers `k3sm stop`, `start` and `restart`, what a stop does
+24. [Stopping and starting](stop-start.md) covers `k3sm stop`, `start` and `restart`, what a stop does
     to pods and the cluster, and how a stop survives a reboot.
-24. [Building images](builder.md) covers `k3sm build` and the in-cluster build engine.
-25. [Helm charts](helm.md) covers installing releases with the `HelmChart` object.
-26. [FAQ](faq.md) gives short answers to the common questions.
+25. [Building images](builder.md) covers `k3sm build` and the in-cluster build engine.
+26. [Helm charts](helm.md) covers installing releases with the `HelmChart` object.
+27. [FAQ](faq.md) gives short answers to the common questions.
 
 ## Before You Build Anything Real
 
