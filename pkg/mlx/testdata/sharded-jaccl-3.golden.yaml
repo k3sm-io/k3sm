@@ -163,6 +163,8 @@ spec:
   - args:
     - --model
     - /var/lib/mlx/cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/0f1e2d3c4b5a69788796a5b4c3d2e1f001234567
+    - --served-model-name
+    - mlx-community/Qwen3-0.6B-4bit
     - --max-tokens
     - "512"
     command:
@@ -273,6 +275,8 @@ spec:
   - args:
     - --model
     - /var/lib/mlx/cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/0f1e2d3c4b5a69788796a5b4c3d2e1f001234567
+    - --served-model-name
+    - mlx-community/Qwen3-0.6B-4bit
     - --max-tokens
     - "512"
     command:
@@ -361,6 +365,8 @@ spec:
   - args:
     - --model
     - /var/lib/mlx/cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/0f1e2d3c4b5a69788796a5b4c3d2e1f001234567
+    - --served-model-name
+    - mlx-community/Qwen3-0.6B-4bit
     - --max-tokens
     - "512"
     command:

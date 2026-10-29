@@ -10,6 +10,10 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Fixed
+
+- **A pinned sharded `MLXModel` answers to its `spec.model` name too.** Sharded serving listed the snapshot path on `/v1/models`, and a request naming `spec.model` made every rank load the model again. Each rank now serves the model it loaded under `spec.model`, pinned or not. This needs the `mlx-serve` image that carries the updated sharded entrypoint.
+
 ## v0.2.3 — 2026-10-29
 
 ### Added
