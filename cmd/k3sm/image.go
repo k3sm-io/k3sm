@@ -104,8 +104,14 @@ push    upload an image to a registry reference, and print the digest it now has
         there so callers can pin it. The first argument is normally the OCI
         layout directory ` + "`k3sm build --format oci`" + ` writes; a first argument
         that is no path on disk is taken as a reference in THIS NODE's store,
-        exported with save and then uploaded. The upload itself does NOT talk to
-        the daemon: it reads a directory you own and uploads as you. The
+        exported with save and then uploaded. A reference this node's store does
+        not hold may name an image the cluster registry holds, as image ls and
+        inspect show it (the one ` + "`k3sm build`" + ` recorded): it is copied from
+        there through the push gate, blobs the destination has are skipped and,
+        within the cluster registry, mounted rather than sent again; a
+        destination naming the same repository and tag copies nothing. The
+        layout upload itself does NOT talk to the daemon: it reads a directory
+        you own and uploads as you. The
         credential comes from $K3SM_REGISTRY_TOKEN (with $K3SM_REGISTRY_USER
         as its user, "token" by default), this node's own
         ingest-registry credential (only when the target IS this node's loopback
@@ -306,7 +312,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		o.archive = positional[0]
 	case "push":
 		if len(positional) < 2 {
-			return o, errors.New("push requires a source (an OCI layout directory, or a reference in this node's store) and the registry reference to push it to")
+			return o, errors.New("push requires a source (an OCI layout directory, or a reference in this node's store or the cluster registry) and the registry reference to push it to")
 		}
 		if len(positional) > 2 {
 			// A third word is most often an operator reaching for a credential
@@ -564,6 +570,8 @@ func imageRPCError(what, socket string, err error) error {
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	switch st.Code() {
+	case codes.NotFound:
+		return notInNodeStore{fmt.Errorf("%s: %s", what, st.Message())}
 	case codes.Unimplemented:
 		return fmt.Errorf("%s: this runtimed does not serve the image service: %s", what, st.Message())
 	case codes.FailedPrecondition:
@@ -579,6 +587,21 @@ func imageRPCError(what, socket string, err error) error {
 	}
 	return fmt.Errorf("%s: %s", what, st.Message())
 }
+
+// errNotInNodeStore matches a daemon answer that this node's store holds no
+// image under the name asked for (gRPC NOT_FOUND). push reads it as the cue to
+// look in the cluster registry.
+var errNotInNodeStore = errors.New("not in this node's store")
+
+// notInNodeStore carries the daemon's own not-found text and matches
+// errNotInNodeStore, so the message an operator reads is unchanged.
+type notInNodeStore struct{ error }
+
+// Is matches errNotInNodeStore.
+func (notInNodeStore) Is(target error) bool { return target == errNotInNodeStore }
+
+// Unwrap returns the daemon's error.
+func (e notInNodeStore) Unwrap() error { return e.error }
 
 // humanBytes renders a byte count in binary units.
 func humanBytes(n uint64) string {

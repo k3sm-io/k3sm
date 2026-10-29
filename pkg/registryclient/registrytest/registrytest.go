@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package registrytest is an in-memory, read-only OCI distribution registry for
-// tests: the catalog, tag lists, manifests and blobs a registryclient reads,
-// served from content a test builds with Image and Index.
+// Package registrytest is an in-memory OCI distribution registry for tests: the
+// catalog, tag lists, manifests and blobs a registryclient reads, served from
+// content a test builds with Image and Index. It is read-only unless
+// AcceptWrites is set, when it also takes blob uploads (chunked and
+// monolithic), cross-repository blob mounts and manifest pushes, and records
+// each in Writes.
 package registrytest
 
 import (
@@ -24,7 +27,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,8 +45,56 @@ type Registry struct {
 	// Link header, the way a real registry does past its page limit.
 	PageSize int
 
-	mu    sync.Mutex
-	repos map[string]*repo
+	// AcceptWrites, when set, serves the push endpoints too. Unset, every
+	// method but GET and HEAD is refused 405.
+	AcceptWrites bool
+
+	mu      sync.Mutex
+	repos   map[string]*repo
+	uploads map[string][]byte // upload id -> bytes so far
+	nextID  int
+	writes  []Write
+}
+
+// Write is one write the registry took: Op is "mount" (a blob mounted from
+// From), "upload" (a blob whose bytes were sent) or "manifest".
+type Write struct {
+	Op         string
+	Repository string
+	Digest     string
+	From       string
+}
+
+// Writes returns the writes taken so far, in order.
+func (r *Registry) Writes() []Write {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]Write(nil), r.writes...)
+}
+
+// Manifest returns the manifest digest tag names in repository, and whether
+// the tag exists.
+func (r *Registry) Manifest(repository, tag string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rp, ok := r.repos[repository]
+	if !ok {
+		return "", false
+	}
+	d, ok := rp.tags[tag]
+	return d, ok
+}
+
+// HasBlob reports whether repository holds the blob digest.
+func (r *Registry) HasBlob(repository, digest string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rp, ok := r.repos[repository]
+	if !ok {
+		return false
+	}
+	_, ok = rp.blobs[digest]
+	return ok
 }
 
 type repo struct {
@@ -56,7 +109,7 @@ type stored struct {
 }
 
 // New returns an empty registry.
-func New() *Registry { return &Registry{repos: map[string]*repo{}} }
+func New() *Registry { return &Registry{repos: map[string]*repo{}, uploads: map[string][]byte{}} }
 
 func (r *Registry) repo(name string) *repo {
 	rp, ok := r.repos[name]
@@ -123,14 +176,21 @@ func (r *Registry) Index(repository, tag string, children ...registryclient.Desc
 	return d
 }
 
-// Handler serves the registry's read endpoints.
+// Handler serves the registry's read endpoints, and its write endpoints when
+// AcceptWrites is set.
 func (r *Registry) Handler() http.Handler {
 	return http.HandlerFunc(r.serve)
 }
 
 func (r *Registry) serve(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
-		http.Error(w, "read-only", http.StatusMethodNotAllowed)
+		if !r.AcceptWrites {
+			http.Error(w, "read-only", http.StatusMethodNotAllowed)
+			return
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.serveWrite(w, req)
 		return
 	}
 	r.mu.Lock()
@@ -188,10 +248,112 @@ func (r *Registry) serve(w http.ResponseWriter, req *http.Request) {
 			http.NotFound(w, req)
 			return
 		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(b)))
 		_, _ = w.Write(b)
 	default:
 		http.NotFound(w, req)
 	}
+}
+
+// serveWrite serves the push endpoints: POST starts an upload (or mounts, or
+// takes a monolithic upload), PATCH appends to one, PUT finishes one or stores
+// a manifest. The caller holds mu.
+func (r *Registry) serveWrite(w http.ResponseWriter, req *http.Request) {
+	path := req.URL.Path
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	q := req.URL.Query()
+	switch {
+	case req.Method == http.MethodPost && strings.HasSuffix(path, "/blobs/uploads/"):
+		name := strings.TrimSuffix(strings.TrimPrefix(path, "/v2/"), "/blobs/uploads/")
+		if mount, from := q.Get("mount"), q.Get("from"); mount != "" && from != "" {
+			if src, ok := r.repos[from]; ok {
+				if b, ok := src.blobs[mount]; ok {
+					r.repo(name).blobs[mount] = b
+					r.writes = append(r.writes, Write{Op: "mount", Repository: name, Digest: mount, From: from})
+					w.Header().Set("Location", "/v2/"+name+"/blobs/"+mount)
+					w.WriteHeader(http.StatusCreated)
+					return
+				}
+			}
+		}
+		if d := q.Get("digest"); d != "" {
+			r.commitBlob(w, name, d, body)
+			return
+		}
+		r.nextID++
+		id := strconv.Itoa(r.nextID)
+		r.uploads[id] = body
+		r.uploadLocation(w, name, id, http.StatusAccepted)
+	case req.Method == http.MethodPatch && strings.Contains(path, "/blobs/uploads/"):
+		name, id := splitUpload(path)
+		prev, ok := r.uploads[id]
+		if !ok {
+			http.NotFound(w, req)
+			return
+		}
+		r.uploads[id] = append(prev, body...)
+		r.uploadLocation(w, name, id, http.StatusAccepted)
+	case req.Method == http.MethodPut && strings.Contains(path, "/blobs/uploads/"):
+		name, id := splitUpload(path)
+		prev, ok := r.uploads[id]
+		if !ok {
+			http.NotFound(w, req)
+			return
+		}
+		delete(r.uploads, id)
+		r.commitBlob(w, name, q.Get("digest"), append(prev, body...))
+	case req.Method == http.MethodPut && strings.Contains(path, "/manifests/"):
+		i := strings.LastIndex(path, "/manifests/")
+		name, ref := strings.TrimPrefix(path[:i], "/v2/"), path[i+len("/manifests/"):]
+		d := digestOf(body)
+		if strings.HasPrefix(ref, "sha256:") && ref != d {
+			http.Error(w, "digest mismatch", http.StatusBadRequest)
+			return
+		}
+		rp := r.repo(name)
+		rp.manifests[d] = stored{mediaType: req.Header.Get("Content-Type"), body: body}
+		if !strings.HasPrefix(ref, "sha256:") {
+			rp.tags[ref] = d
+		}
+		r.writes = append(r.writes, Write{Op: "manifest", Repository: name, Digest: d})
+		w.Header().Set("Docker-Content-Digest", d)
+		w.Header().Set("Location", "/v2/"+name+"/manifests/"+d)
+		w.WriteHeader(http.StatusCreated)
+	default:
+		http.Error(w, "unsupported", http.StatusMethodNotAllowed)
+	}
+}
+
+// commitBlob stores body as repository's blob digest when the bytes hash to it.
+func (r *Registry) commitBlob(w http.ResponseWriter, repository, digest string, body []byte) {
+	if digest == "" || digestOf(body) != digest {
+		http.Error(w, "digest mismatch", http.StatusBadRequest)
+		return
+	}
+	r.repo(repository).blobs[digest] = body
+	r.writes = append(r.writes, Write{Op: "upload", Repository: repository, Digest: digest})
+	w.Header().Set("Location", "/v2/"+repository+"/blobs/"+digest)
+	w.Header().Set("Docker-Content-Digest", digest)
+	w.WriteHeader(http.StatusCreated)
+}
+
+// uploadLocation answers an upload step with where the next one goes.
+func (r *Registry) uploadLocation(w http.ResponseWriter, repository, id string, code int) {
+	n := len(r.uploads[id])
+	w.Header().Set("Location", "/v2/"+repository+"/blobs/uploads/"+url.PathEscape(id))
+	w.Header().Set("Docker-Upload-UUID", id)
+	w.Header().Set("Range", fmt.Sprintf("0-%d", max(n-1, 0)))
+	w.WriteHeader(code)
+}
+
+// splitUpload splits /v2/<name>/blobs/uploads/<id> into its name and id.
+func splitUpload(path string) (name, id string) {
+	i := strings.LastIndex(path, "/blobs/uploads/")
+	return strings.TrimPrefix(path[:i], "/v2/"), path[i+len("/blobs/uploads/"):]
 }
 
 // page writes one sorted page of items under key, honouring last= and
