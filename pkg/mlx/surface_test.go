@@ -218,6 +218,86 @@ func TestEngineArgsServeTheModelUnderItsSpecName(t *testing.T) {
 	}
 }
 
+// shardSurface is the option set the sharded render owns, measured against the
+// k3sm_shard entrypoint and the mlx_lm.server (mlx-lm 0.32.0) it runs. --model
+// is mlx_lm.server's own; --served-model-name is taken by the entrypoint, which
+// removes it before mlx_lm.server parses its argv (mlx_lm.server has no such
+// option, and its strict parse_args would exit the rank on it). --host, --port
+// and --pipeline are added by the entrypoint from the environment, never
+// rendered. Exact membership, for the reason measuredSurface gives.
+var shardSurface = map[string]bool{
+	shardModelFlag:     true,
+	argServedModelName: true,
+}
+
+// shardedRendered returns each rank's args from RenderSharded, minus the
+// caller's own spec.runtime.args.
+func shardedRendered(t *testing.T, m *mlxv1alpha1.MLXModel) [][]string {
+	t.Helper()
+	objs, err := RenderSharded(m, testOptions(), ringPlacement())
+	if err != nil {
+		t.Fatalf("RenderSharded() error = %v, want nil", err)
+	}
+	var out [][]string
+	for _, pod := range objs.Pods {
+		args := pod.Spec.Containers[0].Args
+		if caller := args[len(args)-len(m.Spec.Runtime.Args):]; !slices.Equal(caller, m.Spec.Runtime.Args) {
+			t.Fatalf("rank %s args %v do not end with the caller's %v", pod.Name, args, m.Spec.Runtime.Args)
+		}
+		out = append(out, args[:len(args)-len(m.Spec.Runtime.Args)])
+	}
+	return out
+}
+
+// TestShardedArgsServeTheModelUnderItsSpecName is the sharded twin of
+// TestEngineArgsServeTheModelUnderItsSpecName: every rank is told to answer to
+// spec.model, so a pinned model (whose --model is the snapshot path) is listed
+// and requested under the name clients use, never the path.
+func TestShardedArgsServeTheModelUnderItsSpecName(t *testing.T) {
+	pinned := shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing, mlxv1alpha1.MLXParallelismPipeline)
+	unpinned := shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing, mlxv1alpha1.MLXParallelismPipeline)
+	unpinned.Spec.Revision = ""
+	for _, tc := range []struct {
+		name  string
+		model *mlxv1alpha1.MLXModel
+	}{{"pinned_revision", pinned}, {"unpinned", unpinned}} {
+		t.Run(tc.name, func(t *testing.T) {
+			for rank, rendered := range shardedRendered(t, tc.model) {
+				i := slices.Index(rendered, argServedModelName)
+				if i < 0 || i+1 >= len(rendered) {
+					t.Fatalf("rank %d argv %v lacks %s <name>", rank, rendered, argServedModelName)
+				}
+				if rendered[i+1] != tc.model.Spec.Model {
+					t.Errorf("rank %d argv serves %q, want spec.model %q", rank, rendered[i+1], tc.model.Spec.Model)
+				}
+				m := slices.Index(rendered, shardModelFlag)
+				if m < 0 || m+1 >= len(rendered) {
+					t.Fatalf("rank %d argv %v lacks %s <ref>", rank, rendered, shardModelFlag)
+				}
+				if tc.model.Spec.Revision != "" && rendered[m+1] == tc.model.Spec.Model {
+					t.Errorf("rank %d pinned %s %q is the repo id, want the snapshot path", rank, shardModelFlag, rendered[m+1])
+				}
+			}
+		})
+	}
+}
+
+// TestShardedArgsMatchTheShardSurface pins every option the sharded render owns
+// to shardSurface, each followed by its value.
+func TestShardedArgsMatchTheShardSurface(t *testing.T) {
+	for rank, rendered := range shardedRendered(t, shardedModel(2, mlxv1alpha1.MLXDistributedBackendRing, "")) {
+		for i := 0; i < len(rendered); i++ {
+			if !shardSurface[rendered[i]] {
+				t.Fatalf("rank %d argv %v: %q is not on the sharded entrypoint's surface", rank, rendered, rendered[i])
+			}
+			i++
+			if i >= len(rendered) || strings.HasPrefix(rendered[i], "--") {
+				t.Fatalf("rank %d argv %v: %s has no value", rank, rendered, rendered[i-1])
+			}
+		}
+	}
+}
+
 func TestEngineArgsMatchTheMeasuredSurface(t *testing.T) {
 	t.Run("every_rendered_option_is_in_the_measured_surface", func(t *testing.T) {
 		for _, tc := range surfaceCases() {

@@ -69,6 +69,7 @@ pin, its date, and the tarball's sha256.
   round-trip between that re-check and the DELETE is still not seen and can lose a tag or a
   child; closing that window needs a delete the registry makes conditional on the manifest's
   state.
+<<<<<<< HEAD
 - `k3sm image prune --force` makes each DELETE conditional on the repository state its re-check
   read, sent as `If-Match`. The k3sm registry server compares it under the lock the delete takes
   and refuses the delete when a push changed the repository in between, so that push keeps its
@@ -78,6 +79,9 @@ pin, its date, and the tarball's sha256.
   deleted since the plan is now reported as gone, no longer as unreadable; one whose directory
   is still there but damaged stays unreadable. An `If-Match` that is empty or malformed is
   refused with 412 and deletes nothing.
+=======
+- **A pinned sharded `MLXModel` answers to its `spec.model` name too.** Sharded serving listed the snapshot path on `/v1/models`, and a request naming `spec.model` made every rank load the model again. Each rank now serves the model it loaded under `spec.model`, pinned or not. This needs the `mlx-serve` image that carries the updated sharded entrypoint.
+>>>>>>> 5008ed73 (fix(mlx): serve a sharded model under its spec.model name)
 
 ## v0.2.3 — 2026-10-29
 
