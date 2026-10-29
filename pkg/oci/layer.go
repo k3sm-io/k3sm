@@ -18,6 +18,9 @@ package oci
 
 import (
 	"archive/tar"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -34,8 +37,9 @@ import (
 // to create.
 var ErrBadEntryName = errors.New("oci: invalid entry name")
 
-// The normalization contract. These constants are the whole reason a layer
-// digest is a function of the CONTENT rather than of the machine that built it —
+// The normalization contract. These constants are the whole reason a layer's
+// diff_id (the sha256 of its uncompressed tar, recorded in the image config) is
+// a function of the CONTENT rather than of the machine that built it —
 // tar.FileInfoHeader would otherwise copy the host's mtime, uid, gid, uname and
 // gname straight into the header, and thence into the digest.
 //
@@ -63,25 +67,46 @@ const (
 // reproducible at all.
 var epoch = time.Unix(0, 0).UTC()
 
-// BuildLayer writes the selected entries as a normalized tar and returns it as a
-// layer. It is the single home of the normalization contract above.
+// The gzip contract. Every field of the gzip stream that is not compressed data
+// is pinned here, so a layer blob carries nothing from the build host or the
+// build time. The compressed bytes themselves are compress/flate's output at
+// layerGzipLevel, which is a function of the tar and the Go release.
+const (
+	// layerGzipLevel is compress/flate's default (level 6): the usual balance
+	// docker, containerd and pigz ship, which takes most of the size win
+	// (a layer moves across the mesh on every pull to another node) without
+	// BestCompression's several-times CPU cost for a few percent more.
+	layerGzipLevel = gzip.DefaultCompression
+
+	// layerGzipOS is RFC 1952's "unknown" OS byte. compress/gzip writes 255 by
+	// default; it is stated so the header never depends on that default.
+	layerGzipOS = 255
+)
+
+// BuildLayer writes the selected entries as a normalized, gzip-compressed tar
+// and returns it as a layer. It is the single home of the normalization
+// contract above.
 //
-// The tar is materialized once into tmpDir and the returned layer re-reads that
-// file. This is load-bearing, not an optimization: go-containerregistry calls a
-// layer's opener once to compute the digest and again to write the bytes out, so
-// an opener that re-walked the build context would hash one filesystem snapshot
-// and ship another — a digest that does not describe the shipped bytes voids the
-// property the whole content-addressed store is built on.
+// The tar is written exactly once, through a gzip writer, into a staged file in
+// tmpDir; that one pass hashes the uncompressed tar (the diff_id) and the gzip
+// bytes written to disk (the layer digest) together, and the returned layer
+// re-reads the staged file. Staging is load-bearing, not an optimization:
+// go-containerregistry reads a layer once to compute the digest and again to
+// write the bytes out, so a layer that re-walked the build context would hash
+// one filesystem snapshot and ship another, and a digest that does not
+// describe the shipped bytes voids the property the whole content-addressed
+// store is built on. Hashing the compressed bytes in the same pass that writes
+// them means the blob on the wire is the one that was digested.
 func BuildLayer(entries []entry, tmpDir string) (ggcrv1.Layer, error) {
-	f, err := os.CreateTemp(tmpDir, "layer-*.tar")
+	f, err := os.CreateTemp(tmpDir, "layer-*.tar.gz")
 	if err != nil {
 		return nil, fmt.Errorf("stage layer: %w", err)
 	}
 	staged := f.Name()
 	defer f.Close()
-	// The staged tar holds whatever the recipe copied; on any error path it must
-	// not be left behind, since a library caller with TmpDir:"" stages into the
-	// shared OS temp dir.
+	// The staged blob holds whatever the recipe copied; on any error path it
+	// must not be left behind, since a library caller with TmpDir:"" stages
+	// into the shared OS temp dir.
 	committed := false
 	defer func() {
 		if !committed {
@@ -89,80 +114,113 @@ func BuildLayer(entries []entry, tmpDir string) (ggcrv1.Layer, error) {
 		}
 	}()
 
-	if err := writeTar(f, entries); err != nil {
+	blobHash := sha256.New()
+	blob := &countingWriter{w: io.MultiWriter(f, blobHash)}
+	gz, err := gzip.NewWriterLevel(blob, layerGzipLevel)
+	if err != nil {
+		return nil, fmt.Errorf("gzip layer: %w", err)
+	}
+	// Pinned, not left to the zero value by accident: no file name, no
+	// comment, no extra field, a zero mtime (written as 0, "no timestamp"),
+	// and a fixed OS byte.
+	gz.Header = gzip.Header{OS: layerGzipOS}
+
+	tarHash := sha256.New()
+	if err := writeTar(io.MultiWriter(tarHash, gz), entries); err != nil {
 		return nil, err
+	}
+	if err := gz.Close(); err != nil {
+		return nil, fmt.Errorf("finish layer gzip: %w", err)
 	}
 	if err := f.Sync(); err != nil {
 		return nil, fmt.Errorf("sync layer: %w", err)
 	}
 
-	// Uncompressed: the digest then depends only on this package's tar output,
-	// never on compress/flate's byte-level behavior, which carries no
-	// cross-version compatibility promise.
-	//
-	// tarball.LayerFromFile + WithMediaType does NOT give this: WithMediaType
-	// only relabels the reported media type, while go-containerregistry always
-	// computes Digest() over a gzip encoding of the opener's bytes regardless —
-	// so the emitted blob was gzip under an UNCOMPRESSED label (a strict OCI
-	// reader with no gunzip path correctly refuses it). uncompressedFileLayer
-	// below is the fix: its Compressed() and Uncompressed() are the SAME
-	// reader, so the declared media type always matches the bytes on the wire.
-	layer, err := newUncompressedFileLayer(staged)
-	if err != nil {
-		return nil, fmt.Errorf("open staged layer: %w", err)
+	// tarball.LayerFromFile is deliberately not used. Its WithMediaType only
+	// relabels the reported media type, while go-containerregistry computes
+	// Digest() over its OWN gzip encoding of the opener's bytes (at a level and
+	// with a header it chooses), so an earlier build shipped gzip bytes under an
+	// UNCOMPRESSED label that a strict OCI reader correctly refused. gzipFileLayer
+	// below declares exactly what it stores: Compressed() is the staged gzip
+	// blob that was digested, Uncompressed() is that blob gunzipped.
+	layer := &gzipFileLayer{
+		path:   staged,
+		digest: ggcrv1.Hash{Algorithm: "sha256", Hex: hex.EncodeToString(blobHash.Sum(nil))},
+		diffID: ggcrv1.Hash{Algorithm: "sha256", Hex: hex.EncodeToString(tarHash.Sum(nil))},
+		size:   blob.n,
 	}
 	committed = true
 	return layer, nil
 }
 
-// uncompressedFileLayer is a ggcrv1.Layer backed by a plain (non-gzip) tar
-// file on disk. Digest and DiffID are the SAME hash — the sha256 of the exact
-// bytes Compressed() and Uncompressed() both return — because for a genuinely
-// uncompressed layer that equality is the property a strict OCI reader is
-// entitled to assume from the declared media type.
-type uncompressedFileLayer struct {
+// countingWriter counts the bytes written through it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// gzipFileLayer is a ggcrv1.Layer backed by a gzip-compressed tar staged on
+// disk. Digest and Size describe the stored gzip bytes, the blob a registry
+// holds and a puller fetches; DiffID is the sha256 of the uncompressed tar,
+// which is what the image config's rootfs.diff_ids records. Both were computed
+// in the single pass that wrote the file.
+type gzipFileLayer struct {
 	path   string
 	digest ggcrv1.Hash
+	diffID ggcrv1.Hash
 	size   int64
 }
 
-// newUncompressedFileLayer reads path once to compute its digest and size,
-// then serves both Compressed() and Uncompressed() by reopening it.
-func newUncompressedFileLayer(path string) (*uncompressedFileLayer, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", path, err)
-	}
-	defer f.Close()
-	digest, size, err := ggcrv1.SHA256(f)
-	if err != nil {
-		return nil, fmt.Errorf("digest %s: %w", path, err)
-	}
-	return &uncompressedFileLayer{path: path, digest: digest, size: size}, nil
-}
+// Digest implements ggcrv1.Layer: the sha256 of the stored gzip bytes.
+func (l *gzipFileLayer) Digest() (ggcrv1.Hash, error) { return l.digest, nil }
 
-// Digest implements ggcrv1.Layer. It equals DiffID: this layer carries no
-// compression, so there is only one hash to report.
-func (l *uncompressedFileLayer) Digest() (ggcrv1.Hash, error) { return l.digest, nil }
+// DiffID implements ggcrv1.Layer: the sha256 of the uncompressed tar.
+func (l *gzipFileLayer) DiffID() (ggcrv1.Hash, error) { return l.diffID, nil }
 
-// DiffID implements ggcrv1.Layer.
-func (l *uncompressedFileLayer) DiffID() (ggcrv1.Hash, error) { return l.digest, nil }
-
-// Size implements ggcrv1.Layer. It is the uncompressed size, since Compressed
-// and Uncompressed return identical bytes.
-func (l *uncompressedFileLayer) Size() (int64, error) { return l.size, nil }
+// Size implements ggcrv1.Layer: the size of the stored gzip bytes.
+func (l *gzipFileLayer) Size() (int64, error) { return l.size, nil }
 
 // MediaType implements ggcrv1.Layer.
-func (l *uncompressedFileLayer) MediaType() (types.MediaType, error) {
-	return types.OCIUncompressedLayer, nil
+func (l *gzipFileLayer) MediaType() (types.MediaType, error) {
+	return types.OCILayer, nil
 }
 
-// Compressed implements ggcrv1.Layer. It returns the same bytes as
-// Uncompressed — the whole point of this type over tarball.LayerFromFile.
-func (l *uncompressedFileLayer) Compressed() (io.ReadCloser, error) { return os.Open(l.path) }
+// Compressed implements ggcrv1.Layer. It returns the staged blob unchanged,
+// the exact bytes Digest describes.
+func (l *gzipFileLayer) Compressed() (io.ReadCloser, error) { return os.Open(l.path) }
 
-// Uncompressed implements ggcrv1.Layer.
-func (l *uncompressedFileLayer) Uncompressed() (io.ReadCloser, error) { return os.Open(l.path) }
+// Uncompressed implements ggcrv1.Layer. It gunzips the staged blob.
+func (l *gzipFileLayer) Uncompressed() (io.ReadCloser, error) {
+	f, err := os.Open(l.path)
+	if err != nil {
+		return nil, err
+	}
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		_ = f.Close() // the gzip header error is the one worth reporting
+		return nil, fmt.Errorf("gunzip %s: %w", l.path, err)
+	}
+	return &gunzipReadCloser{Reader: zr, zr: zr, f: f}, nil
+}
+
+// gunzipReadCloser closes both the gzip reader and the file under it.
+type gunzipReadCloser struct {
+	io.Reader
+	zr *gzip.Reader
+	f  *os.File
+}
+
+func (r *gunzipReadCloser) Close() error {
+	zerr := r.zr.Close()
+	ferr := r.f.Close()
+	return errors.Join(zerr, ferr)
+}
 
 // writeTar emits the normalized archive. Entries arrive pre-sorted by in-image
 // name (see selectEntries), so ordering is content-determined.
@@ -186,8 +244,11 @@ func writeTar(w io.Writer, entries []entry) error {
 	// Chunk size does not affect the emitted bytes — tar.Writer.Write forwards
 	// to regFileWriter.Write, which only decrements its remaining count, and
 	// padding is computed from that count, not from write boundaries — so the
-	// layer digest is unchanged. That is load-bearing here (see the determinism
-	// contract in doc.go) and is gated by TestBuildFromScratchDigestUnchanged.
+	// tar, and so the diff_id, is unchanged. The gzip blob is unchanged too:
+	// compress/flate's output depends on the bytes written, not on how the
+	// writes are split (only Flush would cut a block, and it is never called).
+	// That is load-bearing here (see the determinism contract in doc.go) and is
+	// gated by TestBuildFromScratchDigestUnchanged.
 	buf := make([]byte, 32*1024)
 
 	for _, e := range entries {
