@@ -20,6 +20,8 @@ pin, its date, and the tarball's sha256.
 
 - Images `k3sm build` produces store their layers gzip-compressed, so pulls to other nodes move
   about a third of the bytes. A rebuild of unchanged content gets new layer digests once.
+- The bundled helm is v4.3.1. It waits for a chart's CRDs to be established before going on
+  when the hook-only wait strategy is used.
 
 ### Fixed
 

@@ -214,7 +214,7 @@ func TestStageHelm(t *testing.T) {
 	})
 }
 
-// TestSeedReplacesAnUnvouchedHelm: a work dir holding a helm-v4.3.0 the marker
+// TestSeedReplacesAnUnvouchedHelm: a work dir holding a helm-v4.3.1 the marker
 // does not vouch for (the tarball-era download, which has no marker) is not
 // current. The seed replaces it from a payload whose own marker vouches, writes
 // the marker, and leaves it alone when the payload does not vouch either.
@@ -277,7 +277,7 @@ func TestPayloadCarriesHelm(t *testing.T) {
 
 // helmBuildInfo is the build info the wrapper build records in helm (dep list
 // trimmed), the shape `go version -m` prints for the staged binary.
-const helmBuildInfo = "go\tgo1.27.3\npath\thelm.sh/helm/v4/cmd/helm\nmod\thelm.sh/helm/v4\tv4.3.0\th1:w=\n" +
+const helmBuildInfo = "go\tgo1.27.3\npath\thelm.sh/helm/v4/cmd/helm\nmod\thelm.sh/helm/v4\tv4.3.1\th1:w=\n" +
 	"dep\tgolang.org/x/crypto\tv0.58.0\th1:c=\ndep\tgolang.org/x/net\tv0.62.0\th1:n=\n" +
 	"build\t-trimpath=true\nbuild\tCGO_ENABLED=0\nbuild\tGOARCH=arm64\nbuild\tGOOS=darwin\n"
 
@@ -318,11 +318,11 @@ func TestHelmStampOf(t *testing.T) {
 		"the upstream tarball's toolchain": strings.Replace(helmBuildInfo, "go1.27.3", "go1.27.1", 1),
 		"helm's own x/net":                 strings.Replace(helmBuildInfo, "x/net\tv0.62.0", "x/net\tv0.57.0", 1),
 		"an unreadable toolchain":          strings.Replace(helmBuildInfo, "go\tgo1.27.3", "go\tdevel", 1),
-		"no x/crypto":                      strings.Replace(helmBuildInfo, "dep\tgolang.org/x/crypto\tv0.58.0\th1:c=\n", "", 1),
+		"no x/net":                         strings.Replace(helmBuildInfo, "dep\tgolang.org/x/net\tv0.62.0\th1:n=\n", "", 1),
 		"a replaced x/net":                 strings.Replace(helmBuildInfo, "h1:n=\n", "h1:n=\n=>\texample.com/fork\tv0.0.1\th1:f=\n", 1),
 		"no -trimpath":                     strings.Replace(helmBuildInfo, "build\t-trimpath=true\n", "", 1),
 		"another main package":             strings.Replace(helmBuildInfo, "path\thelm.sh/helm/v4/cmd/helm", "path\texample.com/helm", 1),
-		"helm at another version":          strings.Replace(helmBuildInfo, "v4.3.0", "v4.2.0", 1),
+		"helm at another version":          strings.Replace(helmBuildInfo, "v4.3.1", "v4.2.0", 1),
 	} {
 		v, variant, err := helmStampOf(parse(t, info))
 		if err == nil && v == helmchart.HelmVersion && variant == helmchart.HelmBuildVariant {
@@ -332,7 +332,7 @@ func TestHelmStampOf(t *testing.T) {
 }
 
 // TestReleaseSeedRefusesAMisbuiltHelm: on the release path the seed stages the
-// payload's helm through ensureShipped, so a correctly signed helm-v4.3.0 whose
+// payload's helm through ensureShipped, so a correctly signed helm-v4.3.1 whose
 // build info names another toolchain or lacks the raised x/net is refused with
 // ErrPayloadStamp and never reaches the work dir, while the wrapper build is
 // installed and marked. The fake stamp reader parses the build-info text the

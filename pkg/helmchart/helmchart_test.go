@@ -41,7 +41,7 @@ import (
 	"k3sm.io/k3sm/pkg/policy"
 )
 
-const testHelm = "/var/lib/k3sm/server/bin/helm-v4.3.0"
+const testHelm = "/var/lib/k3sm/server/bin/helm-v4.3.1"
 
 // chart builds a HelmChart in kube-system, applying each mutation in turn.
 func chart(mutate ...func(*helmv1.HelmChart)) *helmv1.HelmChart {
@@ -441,32 +441,32 @@ func TestValidateHelmPin(t *testing.T) {
 		t.Errorf("HelmPath = %q, want the versioned name under the bin dir", HelmPath("/w/bin"))
 	}
 	goodMod := []byte("module k3sm.io/helm-child\n\ngo 1.26.0\n\ntool helm.sh/helm/v4/cmd/helm\n\nrequire (\n" +
-		"\tgolang.org/x/crypto v0.57.0 // indirect\n\tgolang.org/x/net v0.60.0 // indirect\n\thelm.sh/helm/v4 v4.3.0 // indirect\n)\n")
+		"\tgolang.org/x/crypto v0.57.0 // indirect\n\tgolang.org/x/net v0.60.0 // indirect\n\thelm.sh/helm/v4 v4.3.1 // indirect\n)\n")
 	commit := strings.Repeat("a", 40)
 	raised := "golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0"
-	if err := validateHelmPin("v4.3.0", commit, "helm-v4.3.0", raised, goodMod); err != nil {
+	if err := validateHelmPin("v4.3.1", commit, "helm-v4.3.1", raised, goodMod); err != nil {
 		t.Fatalf("validateHelmPin(good) = %v", err)
 	}
 	for name, tc := range map[string]struct {
 		version, commit, binary, raised string
 		goMod                           []byte
 	}{
-		"version without v":            {"4.3.0", commit, "helm-4.3.0", raised, goodMod},
-		"short commit":                 {"v4.3.0", commit[:39], "helm-v4.3.0", raised, goodMod},
-		"uppercase commit":             {"v4.3.0", strings.Repeat("A", 40), "helm-v4.3.0", raised, goodMod},
-		"unversioned binary":           {"v4.3.0", commit, "helm", raised, goodMod},
-		"wrapper at another helm":      {"v4.3.1", commit, "helm-v4.3.1", raised, goodMod},
-		"no raised modules":            {"v4.3.0", commit, "helm-v4.3.0", " ", goodMod},
-		"raised module not path@ver":   {"v4.3.0", commit, "helm-v4.3.0", "golang.org/x/net", goodMod},
-		"wrapper lacks a raised level": {"v4.3.0", commit, "helm-v4.3.0", "golang.org/x/net@v0.61.0", goodMod},
-		"wrapper without the tool":     {"v4.3.0", commit, "helm-v4.3.0", raised, []byte(strings.Replace(string(goodMod), "tool ", "// tool ", 1))},
+		"version without v":            {"4.3.1", commit, "helm-4.3.1", raised, goodMod},
+		"short commit":                 {"v4.3.1", commit[:39], "helm-v4.3.1", raised, goodMod},
+		"uppercase commit":             {"v4.3.1", strings.Repeat("A", 40), "helm-v4.3.1", raised, goodMod},
+		"unversioned binary":           {"v4.3.1", commit, "helm", raised, goodMod},
+		"wrapper at another helm":      {"v4.3.2", commit, "helm-v4.3.2", raised, goodMod},
+		"no raised modules":            {"v4.3.1", commit, "helm-v4.3.1", " ", goodMod},
+		"raised module not path@ver":   {"v4.3.1", commit, "helm-v4.3.1", "golang.org/x/net", goodMod},
+		"wrapper lacks a raised level": {"v4.3.1", commit, "helm-v4.3.1", "golang.org/x/net@v0.61.0", goodMod},
+		"wrapper without the tool":     {"v4.3.1", commit, "helm-v4.3.1", raised, []byte(strings.Replace(string(goodMod), "tool ", "// tool ", 1))},
 	} {
 		if err := validateHelmPin(tc.version, tc.commit, tc.binary, tc.raised, tc.goMod); err == nil {
 			t.Errorf("%s: validateHelmPin = nil, want an error", name)
 		}
 	}
-	single := []byte("module m\n\ntool helm.sh/helm/v4/cmd/helm\nrequire helm.sh/helm/v4 v4.3.0\n")
-	if reqs, tools := goModRequires(single); reqs["helm.sh/helm/v4"] != "v4.3.0" || !tools["helm.sh/helm/v4/cmd/helm"] {
+	single := []byte("module m\n\ntool helm.sh/helm/v4/cmd/helm\nrequire helm.sh/helm/v4 v4.3.1\n")
+	if reqs, tools := goModRequires(single); reqs["helm.sh/helm/v4"] != "v4.3.1" || !tools["helm.sh/helm/v4/cmd/helm"] {
 		t.Errorf("goModRequires(single-line directives) = %v, %v", reqs, tools)
 	}
 }
@@ -509,7 +509,7 @@ func TestHelmBuildArgs(t *testing.T) {
 // values here.
 func TestHelmBuildVariantTracksGoSum(t *testing.T) {
 	sum := sha256.Sum256(append(append(append([]byte{}, helmchild.GoMod...), 0), helmchild.GoSum...))
-	if got, wantSum, wantVariant := hex.EncodeToString(sum[:]), "0657a63a5f36a2dd5a3923e49542f231bb2762c04e85f2df8428cafc698c7060", "nocgo+deps2"; got != wantSum || HelmBuildVariant != wantVariant {
+	if got, wantSum, wantVariant := hex.EncodeToString(sum[:]), "cdd6f49262602fb126b00333214096380578ffca8d4bf30d307ce12c72a78346", "nocgo+deps3"; got != wantSum || HelmBuildVariant != wantVariant {
 		t.Errorf("go.mod.txt+go.sum.txt sha256 %s with variant %q; this test pins %s with %q: bump HelmBuildVariant with the dependency set", got, HelmBuildVariant, wantSum, wantVariant)
 	}
 }

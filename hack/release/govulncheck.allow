@@ -25,12 +25,12 @@ GO-2026-6505 zot v2.1.22 go.opentelemetry.io/otel exporters v1.44.0 otlptrace ex
 # GO-2026-5932 marks golang.org/x/crypto/openpgp deprecated and names no
 # vulnerable symbols, so govulncheck lists every openpgp package ("/*") for any
 # binary that links golang.org/x/crypto, whatever packages of it the binary
-# uses. kubectl links no x/crypto and reports clean. helm v4.3.0 and the three
-# kube daemons below link x/crypto v0.57.0 for other packages; none of them
+# uses. kubectl links no x/crypto and reports clean. helm v4.3.1 links x/crypto
+# v0.58.0 and the three kube daemons below v0.57.0, for other packages; none of them
 # names an x/crypto/openpgp package path, and helm's OpenPGP code (chart
 # provenance) is github.com/ProtonMail/go-crypto. The v1.37.1 source vendors
 # no x/crypto/openpgp package.
-GO-2026-5932 helm v4.3.0 golang.org/x/crypto v0.57.0 GO-2026-5932 names no symbols, so govulncheck reports every openpgp package of any binary that links golang.org/x/crypto at all; this binary names no x/crypto/openpgp package path, so nothing of it is linked; no fixed version upstream 2027-02-20
+GO-2026-5932 helm v4.3.1 golang.org/x/crypto v0.58.0 GO-2026-5932 names no symbols, so govulncheck reports every openpgp package of any binary that links golang.org/x/crypto at all; this binary names no x/crypto/openpgp package path, so nothing of it is linked; no fixed version upstream 2027-02-20
 GO-2026-5932 kube-apiserver v1.37.1 golang.org/x/crypto v0.57.0 GO-2026-5932 names no symbols, so govulncheck reports every openpgp package of any binary that links golang.org/x/crypto at all; this binary names no x/crypto/openpgp package path, so nothing of it is linked; no fixed version upstream 2027-02-20
 GO-2026-5932 kube-scheduler v1.37.1 golang.org/x/crypto v0.57.0 GO-2026-5932 names no symbols, so govulncheck reports every openpgp package of any binary that links golang.org/x/crypto at all; this binary names no x/crypto/openpgp package path, so nothing of it is linked; no fixed version upstream 2027-02-20
 GO-2026-5932 kube-controller-manager v1.37.1 golang.org/x/crypto v0.57.0 GO-2026-5932 names no symbols, so govulncheck reports every openpgp package of any binary that links golang.org/x/crypto at all; this binary names no x/crypto/openpgp package path, so nothing of it is linked; no fixed version upstream 2027-02-20

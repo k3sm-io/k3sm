@@ -1,6 +1,6 @@
-/fixture/helm-v4.3.0: go1.27.3
+/fixture/helm-v4.3.1: go1.27.3
 	path	helm.sh/helm/v4/cmd/helm
-	mod	helm.sh/helm/v4	v4.3.0	h1:wLRTNXzy96ro7waurWMsymlUPaCQOj5nokpJZJNen/w=
+	mod	helm.sh/helm/v4	v4.3.1	h1:UndCoLe9UPmNoL7IvWzaUXveL7T5t/ijoorEmgJdI9g=
 	dep	dario.cat/mergo	v1.0.1	h1:Ra4+bf83h2ztPIQYNP99R6m+Y7KfnARDfID+a+vLl4s=
 	dep	golang.org/x/crypto	v0.58.0	h1:COkYLr4k7nDI4r6QtMML2AfzeIswWHAJthLS6K/M/54=
 	dep	golang.org/x/net	v0.62.0	h1:18ELalfM5+XNRwzM2nYqXsZQ9ByS1uhj2O/U7+5jqRY=
