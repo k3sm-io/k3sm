@@ -33,10 +33,10 @@ k3s's `server/manifests`.
 
 - The server runs a helm controller. It creates a Job named `helm-install-<name>` in the
   HelmChart's namespace, and on deletion a Job named `helm-delete-<name>`.
-- The Job is a native pod. Its command is the pinned `helm` (v4.3.0) that ships in the k3sm payload
+- The Job is a native pod. Its command is the pinned `helm` (v4.3.1) that ships in the k3sm payload
   beside `kubectl`; there is no helm container image. k3sm builds that `helm` from helm's own module
-  source at the pinned tag, with the Go release it pins for every binary it builds and with newer
-  `golang.org/x/crypto` and `golang.org/x/net` than helm's release names, so it reports the same
+  source at the pinned tag, with the Go release it pins for every binary it builds and with a newer
+  `golang.org/x/net` than helm's release names, so it reports the same
   `helm version` as the upstream release and carries fixes released after that build.
 - The release is named after the HelmChart and installed into `targetNamespace`, or the HelmChart's
   own namespace when that is empty.

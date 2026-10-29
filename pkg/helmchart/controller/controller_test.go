@@ -43,7 +43,7 @@ import (
 const (
 	testNS    = "kube-system"
 	testChart = "podinfo"
-	testHelm  = "/var/lib/k3sm/server/bin/helm-v4.3.0"
+	testHelm  = "/var/lib/k3sm/server/bin/helm-v4.3.1"
 	testUID   = "11111111-2222-3333-4444-555555555555"
 )
 
