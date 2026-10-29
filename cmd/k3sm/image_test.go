@@ -399,3 +399,36 @@ func TestImageRPCErrorMapping(t *testing.T) {
 		})
 	}
 }
+
+// TestRegistryVerbsRefuseSocket pins that the verbs which read or write only
+// the cluster registry refuse --socket, as ls and df do, while the verbs that
+// reach this node's daemon still accept it.
+func TestRegistryVerbsRefuseSocket(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		refuse bool
+	}{
+		{"tag", []string{"tag", "--socket", "/x.sock", "a:1", "b:2"}, true},
+		{"untag", []string{"untag", "--socket", "/x.sock", "a:1"}, true},
+		{"inspect", []string{"inspect", "--socket", "/x.sock", "a:1"}, true},
+		{"save", []string{"save", "--socket", "/x.sock", "-o", "out.tar", "a:1"}, true},
+		{"pull", []string{"pull", "--socket", "/x.sock", "a:1"}, false},
+		{"prune", []string{"prune", "--socket", "/x.sock"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseImageArgs(tc.args, io.Discard)
+			if tc.refuse {
+				want := tc.name + " does not take --socket"
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("err = %v; want one containing %q", err, want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseImageArgs: %v", err)
+			}
+		})
+	}
+}

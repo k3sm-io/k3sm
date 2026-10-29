@@ -240,6 +240,10 @@ func runImage(args []string) error {
 	return imageCommand(ctx, opts, os.Stdout, dialRuntimed)
 }
 
+// registryOnlyVerbs are the verbs that read or write only the cluster registry
+// and never dial this node's daemon, so --socket means nothing to them.
+var registryOnlyVerbs = map[string]bool{"ls": true, "df": true, "tag": true, "untag": true, "inspect": true, "save": true}
+
 // parseImageArgs parses argv. ContinueOnError so a bad flag is an error the
 // caller reports, never an os.Exit inside a test binary.
 func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
@@ -378,7 +382,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	if o.policy, err = parsePullPolicy(policySpec); err != nil {
 		return o, err
 	}
-	if flagWasSet(fs, "socket") && (o.subcommand == "ls" || o.subcommand == "df") {
+	if flagWasSet(fs, "socket") && registryOnlyVerbs[o.subcommand] {
 		return o, fmt.Errorf("%s does not take --socket (it reads the cluster's registry, not this node's daemon)", o.subcommand)
 	}
 	if o.noMirror && o.subcommand != "pull" {
