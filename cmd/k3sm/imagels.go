@@ -183,9 +183,19 @@ func imageRegistryEnvFrom(primary, user func() (status.Kube, string, error)) (im
 }
 
 // imageCacheRoot is where the listing keeps its description cache, the
-// invoking account's cache directory, or "" (no cache) when it has none.
-func imageCacheRoot() string {
-	dir, err := os.UserCacheDir()
+// invoking account's cache directory, or "" (no cache).
+func imageCacheRoot() string { return imageCacheRootFor(os.Geteuid(), os.UserCacheDir) }
+
+// imageCacheRootFor is imageCacheRoot for the effective uid euid. A root run
+// keeps no cache: under sudo the cache directory follows the invoking user's
+// HOME, so root would create and rename files through paths that user
+// controls, and leave root-owned directories the user's own runs cannot use.
+func imageCacheRootFor(euid int, userCacheDir func() (string, error)) string {
+	if euid == 0 {
+		slog.Debug("image listing keeps no description cache when run as root")
+		return ""
+	}
+	dir, err := userCacheDir()
 	if err != nil {
 		slog.Debug("image listing keeps no description cache", "err", err)
 		return ""

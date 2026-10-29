@@ -145,3 +145,75 @@ func TestRegistryDirCache(t *testing.T) {
 		t.Error("a cache root under a file was opened")
 	}
 }
+
+// TestRegistryCachedDescriberRejectsBadEntriesAndDigests: an entry describing
+// another digest than its name, or naming a malformed platform, is described
+// afresh and rewritten; a HEAD digest whose content hashes differently fails
+// the describe and caches nothing.
+func TestRegistryCachedDescriberRejectsBadEntriesAndDigests(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*registrytest.Registry, *registryclient.Client, *registryclient.DirCache, string) {
+		reg := registrytest.New()
+		d := reg.Image("app", "v1", registryclient.Platform{OS: "darwin", Architecture: "arm64"}, []byte("layer"))
+		c := newClient(t, reg.Handler(), registryclient.Options{})
+		cache, err := registryclient.OpenDirCache(t.TempDir(), c.Host())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reg, c, cache, d.Digest
+	}
+	const other = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	for name, bad := range map[string]func(digest string) registryclient.Description{
+		"another digest's description": func(string) registryclient.Description {
+			return registryclient.Description{Digest: other, Platforms: []string{"linux/amd64"}, SizeBytes: 1, Blobs: map[string]int64{other: 1}}
+		},
+		"a platform with a control character": func(d string) registryclient.Description {
+			return registryclient.Description{Digest: d, Platforms: []string{"darwin/arm64\x1b[2J"}, SizeBytes: 1, Blobs: map[string]int64{d: 1}}
+		},
+		"a platform with no architecture": func(d string) registryclient.Description {
+			return registryclient.Description{Digest: d, Platforms: []string{"darwin"}, SizeBytes: 1, Blobs: map[string]int64{d: 1}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			reg, c, cache, digest := setup(t)
+			want, err := c.Describe(ctx, "app", "v1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.Store("app", digest, bad(digest)); err != nil {
+				t.Fatal(err)
+			}
+			reg.ResetRequests()
+			got, err := c.NewCachedDescriber(cache).Describe(ctx, "app", "v1")
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("describe = %+v, %v; want %+v", got, err, want)
+			}
+			if reg.Requests(http.MethodGet, registrytest.ClassManifestDigest) != 1 {
+				t.Error("the bad entry was not described afresh")
+			}
+			if e, ok := cache.Load("app", digest); !ok || e.Digest != digest || !reflect.DeepEqual(e.Platforms, want.Platforms) {
+				t.Errorf("entry after the describe = %+v, %v; want it rewritten", e, ok)
+			}
+		})
+	}
+
+	t.Run("a HEAD digest whose content hashes differently", func(t *testing.T) {
+		reg, c, cache, _ := setup(t)
+		reg.HeadDigest = other
+		reg.StoreManifestAt("app", other, registryclient.MediaTypeOCIManifest, []byte(`{"schemaVersion":2}`))
+		if _, err := c.NewCachedDescriber(cache).Describe(ctx, "app", "v1"); !errors.Is(err, registryclient.ErrDigestMismatch) {
+			t.Fatalf("describe = %v; want ErrDigestMismatch", err)
+		}
+		if _, ok := cache.Load("app", other); ok {
+			t.Error("a mismatched digest was cached")
+		}
+	})
+}
+
+func TestRegistryValidRepositoryRefusesTraversal(t *testing.T) {
+	for _, name := range []string{"a/../b", "..", "a/./b", "../a", "a//b", "/a"} {
+		if registryclient.ValidRepository(name) {
+			t.Errorf("ValidRepository(%q) = true", name)
+		}
+	}
+}

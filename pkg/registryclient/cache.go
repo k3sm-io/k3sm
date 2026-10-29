@@ -23,8 +23,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
+
+// platformPattern is the os/arch[/variant] form a cached platform must have:
+// anything else (a control character, an empty part) marks a damaged entry.
+var platformPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$`)
 
 // Description is what a top-level manifest or index digest describes: the
 // part of an Image that depends only on the content, never on the tag that
@@ -51,7 +56,7 @@ func (desc Description) valid(digest string) bool {
 		}
 	}
 	for _, p := range desc.Platforms {
-		if p == "" {
+		if !platformPattern.MatchString(p) {
 			return false
 		}
 	}

@@ -54,6 +54,11 @@ type Registry struct {
 	// it would.
 	OmitHeadDigest bool
 
+	// HeadDigest, when set, is the Docker-Content-Digest a manifest HEAD
+	// reports instead of the true one, the way a lying or racing registry
+	// would.
+	HeadDigest string
+
 	mu       sync.Mutex
 	repos    map[string]*repo
 	uploads  map[string][]byte // upload id -> bytes so far
@@ -233,6 +238,15 @@ func (r *Registry) Index(repository, tag string, children ...registryclient.Desc
 	return d
 }
 
+// StoreManifestAt stores body as repository's manifest under digest without
+// checking that it hashes to it, so a test can serve content that does not
+// match the digest it is read by.
+func (r *Registry) StoreManifestAt(repository, digest, mediaType string, body []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.repo(repository).manifests[digest] = stored{mediaType: mediaType, body: body}
+}
+
 // Handler serves the registry's read endpoints, and its write endpoints when
 // AcceptWrites is set.
 func (r *Registry) Handler() http.Handler {
@@ -293,7 +307,11 @@ func (r *Registry) serve(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", m.mediaType)
-		if req.Method != http.MethodHead || !r.OmitHeadDigest {
+		switch {
+		case req.Method == http.MethodHead && r.OmitHeadDigest:
+		case req.Method == http.MethodHead && r.HeadDigest != "":
+			w.Header().Set("Docker-Content-Digest", r.HeadDigest)
+		default:
 			w.Header().Set("Docker-Content-Digest", ref)
 		}
 		w.Header().Set("Content-Length", strconv.Itoa(len(m.body)))

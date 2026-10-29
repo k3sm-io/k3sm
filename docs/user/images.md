@@ -476,7 +476,8 @@ caches.
 Both commands keep what each image digest describes (its platforms, size and blobs) in a cache
 under your account's cache directory, `~/Library/Caches/k3sm/registry/<registry address>/`, so a
 later run reads only each tag's current digest and describes just the digests it has not seen.
-Which digest a tag names is read afresh every run; deleting the directory is always safe.
+Which digest a tag names is read afresh every run; deleting the directory is always safe. A run
+as root (under `sudo`) keeps no cache.
 
 ### Streaming the list: `-o ndjson`
 

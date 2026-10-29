@@ -219,3 +219,19 @@ func TestImageLsUncreatableCacheIsNoCache(t *testing.T) {
 		t.Errorf("an uncreatable cache changed the listing:\n--- got\n%s\n--- want\n%s", got, want)
 	}
 }
+
+// TestImageLsRootKeepsNoCache: a root run keeps no cache (under sudo the
+// cache directory is the invoking user's); any other account keeps one under
+// its cache directory.
+func TestImageLsRootKeepsNoCache(t *testing.T) {
+	dir := func() (string, error) { return "/Users/someone/Library/Caches", nil }
+	if got := imageCacheRootFor(0, dir); got != "" {
+		t.Errorf("root cache root = %q; want none", got)
+	}
+	if got, want := imageCacheRootFor(501, dir), "/Users/someone/Library/Caches/k3sm/registry"; got != want {
+		t.Errorf("user cache root = %q; want %q", got, want)
+	}
+	if got := imageCacheRootFor(501, func() (string, error) { return "", os.ErrNotExist }); got != "" {
+		t.Errorf("cache root with no cache directory = %q; want none", got)
+	}
+}
