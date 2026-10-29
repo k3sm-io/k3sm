@@ -19,7 +19,6 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -35,11 +34,6 @@ import (
 // TestImagePushFromClusterRegistry is the gate for pushing an image `k3sm
 // build` recorded: it is in the cluster registry, not in this node's store, and
 // push must find it there by the name image ls and inspect show, as they do.
-//
-// The cluster registry is the in-repo fake behind the test push gate, and it
-// refuses an upload query carrying a key the distribution specification does
-// not name, as the real gate does, so a mount the client spells the
-// go-containerregistry way would fail here as it would on a node.
 func TestImagePushFromClusterRegistry(t *testing.T) {
 	empty := t.TempDir()
 	t.Setenv("HOME", empty)
@@ -62,14 +56,7 @@ func TestImagePushFromClusterRegistry(t *testing.T) {
 		reg = registrytest.New()
 		reg.AcceptWrites = true
 		reg.Image("myapp-darwin", "abc123", darwin, base, app)
-		inner := reg.Handler()
-		g := startGateRegistryWith(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodPost && r.URL.Query().Has("origin") {
-				http.Error(w, "the request path or query is not one this registry accepts", http.StatusBadRequest)
-				return
-			}
-			inner.ServeHTTP(w, r)
-		}))
+		g := startGateRegistryWith(t, reg.Handler())
 		clusterAPIFor(t, g)
 		workDir = asServer(t, g.port)
 		// The per-boot credential root reads, which makes 127.0.0.1:6450 a

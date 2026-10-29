@@ -937,3 +937,74 @@ func TestPushAuthorizesBuilderClusterWide(t *testing.T) {
 		}
 	})
 }
+
+// TestPushGateAcceptsMountWithOrigin pins the gate's handling of the "origin"
+// parameter go-containerregistry adds to a cross-repository mount. It is not
+// in the distribution specification and carries no authority: a mount that
+// names it is authorized exactly as the same mount without it (both
+// repositories under the namespace prefix, an access review on each), and the
+// parameter is never forwarded. Anywhere else, and every other key the
+// specification does not name, is refused as before.
+func TestPushGateAcceptsMountWithOrigin(t *testing.T) {
+	const origin = "&origin=registry-k3sm%3A6450"
+	mount := "/v2/team/app/blobs/uploads/?mount=" + digestA
+	denyBase := func(f *gateFixture) {
+		f.access.allow = func(sar *authzv1.SubjectAccessReview) bool {
+			return sar.Spec.User == "system:serviceaccount:team:builder" && sar.Spec.ResourceAttributes.Name != "team/base"
+		}
+	}
+	rows := []struct {
+		name    string
+		method  string
+		target  string
+		setup   func(*gateFixture)
+		status  int
+		forward string
+		sars    int
+	}{
+		{name: "a mount with origin from a repository the caller may use is forwarded without origin",
+			method: "POST", target: mount + "&from=team/base" + origin, status: 202,
+			forward: "POST /v2/team/app/blobs/uploads/?from=team%2Fbase&mount=sha256%3A" + digestA[7:], sars: 2},
+		{name: "origin before mount and from is the same request",
+			method: "POST", target: "/v2/team/app/blobs/uploads/?origin=registry-k3sm%3A6450&from=team/base&mount=" + digestA, status: 202,
+			forward: "POST /v2/team/app/blobs/uploads/?from=team%2Fbase&mount=sha256%3A" + digestA[7:], sars: 2},
+		{name: "a mount with origin from a repository RBAC denies is refused",
+			method: "POST", target: mount + "&from=team/base" + origin, setup: denyBase, status: 403, sars: 2},
+		{name: "a mount with origin from outside the namespace prefix is refused",
+			method: "POST", target: mount + "&from=other/base" + origin, status: 403, sars: 0},
+		{name: "a duplicated origin is refused",
+			method: "POST", target: mount + "&from=team/base" + origin + origin, status: 400, sars: 0},
+		{name: "origin without a mount is refused",
+			method: "POST", target: "/v2/team/app/blobs/uploads/?origin=registry-k3sm%3A6450", status: 400, sars: 0},
+		{name: "origin on a monolithic upload is refused",
+			method: "POST", target: "/v2/team/app/blobs/uploads/?digest=" + digestA + origin, status: 400, sars: 0},
+		{name: "origin on an upload finish is refused",
+			method: "PUT", target: "/v2/team/app/blobs/uploads/abc?digest=" + digestA + origin, status: 400, sars: 0},
+		{name: "another unknown key on a mount is refused",
+			method: "POST", target: mount + "&from=team/base&foo=bar", status: 400, sars: 0},
+		{name: "another unknown key beside origin is refused",
+			method: "POST", target: mount + "&from=team/base" + origin + "&foo=bar", status: 400, sars: 0},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			f := newGateFixture(t)
+			if row.setup != nil {
+				row.setup(f)
+			}
+			resp := f.do(t, row.method, row.target, basic(tokTeam), "", nil)
+			if resp.status != row.status {
+				t.Fatalf("status = %d, want %d (body %s)", resp.status, row.status, resp.body)
+			}
+			seen := f.zot.requests()
+			switch {
+			case row.forward == "" && len(seen) != 0:
+				t.Errorf("the registry saw %+v; nothing must be forwarded", seen)
+			case row.forward != "" && (len(seen) != 1 || seen[0].method+" "+seen[0].uri != row.forward):
+				t.Errorf("the registry saw %+v, want exactly %q", seen, row.forward)
+			}
+			if f.access.count() != row.sars {
+				t.Errorf("access reviews = %d, want %d", f.access.count(), row.sars)
+			}
+		})
+	}
+}

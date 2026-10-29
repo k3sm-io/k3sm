@@ -369,9 +369,15 @@ func validState(s string) bool {
 // parseWriteQuery parses rawQuery strictly against op's allowlist: every key
 // known, none repeated, every value valid. It returns the query re-encoded and
 // a mount's source repository.
+//
+// An upload start may also carry "origin", which go-containerregistry (and so
+// crane and ko) adds to a cross-repository mount to name the source registry.
+// It is not in the distribution specification and grants nothing: it is
+// accepted only beside a mount, once, and dropped, so the mount is authorized
+// and forwarded exactly as the specification's mount without it.
 func parseWriteQuery(op gateOp, rawQuery string) (query, from string, ok bool) {
 	allowed := map[gateOp][]string{
-		opUploadStart:  {"digest", "mount", "from"},
+		opUploadStart:  {"digest", "mount", "from", "origin"},
 		opUploadChunk:  {"digest", "_state"},
 		opUploadFinish: {"digest", "_state"},
 		opUploadStatus: {"_state"},
@@ -403,6 +409,8 @@ func parseWriteQuery(op gateOp, rawQuery string) (query, from string, ok bool) {
 				valid = validRepoName(dv)
 			case "_state":
 				valid = validState(dv)
+			case "origin":
+				valid = true
 			}
 			if !valid {
 				return "", "", false
@@ -414,6 +422,12 @@ func parseWriteQuery(op gateOp, rawQuery string) (query, from string, ok bool) {
 	// mount that is also a monolithic upload is two operations in one request.
 	if vals.Has("mount") != vals.Has("from") || (vals.Has("mount") && vals.Has("digest")) {
 		return "", "", false
+	}
+	if vals.Has("origin") {
+		if !vals.Has("mount") {
+			return "", "", false
+		}
+		vals.Del("origin")
 	}
 	return vals.Encode(), vals.Get("from"), true
 }
