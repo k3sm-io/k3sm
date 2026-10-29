@@ -263,19 +263,19 @@ Push the layout with the registry token from the environment, as your own user:
 
 ```sh
 K3SM_REGISTRY_TOKEN=<ghcr-token> \
-  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2
+  k3sm image push ~/.cache/k3sm/mlx-serve/oci ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
 ```
 
 The credential is read from the environment or the docker config chain — never
 from argv — and is not stored. `push` prints the digest and the pin:
 
 ```
-pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2
+pushed ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3
   digest: sha256:…
   pin:    ghcr.io/k3sm-io/mlx-serve@sha256:…
 ```
 
-The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`), so a tag never changes what it names.
+The tag is the engine version, with a `-k3sm.N` suffix when k3sm rebuilds the same engine with changes of its own (the context-length guard is `0.5.0-k3sm.1`; the attention-sink mask fix and the guard on `/v1/messages` and `/v1/responses` are `0.5.0-k3sm.2`; mlx and mlx-metal 0.32.4, staged with uv 0.13.1, are `0.5.0-k3sm.3`), so a tag never changes what it names.
 
 Record that pin. The operator resolves the image **by digest**; the tag is
 display-only and the next push moves it.
@@ -324,7 +324,14 @@ uv pip compile --generate-hashes --no-header \
 `--exclude-newer` is the 14-day dependency cooldown: the resolver ignores every
 artifact uploaded after midnight UTC 14 days before the run, so a version
 published inside the cooldown never enters the closure. The current lockfile
-was compiled with `--exclude-newer 2026-10-04T00:00:00Z`.
+was compiled with `--exclude-newer 2026-10-15T00:00:00Z`.
+
+To move only some packages, compile over the existing lockfile (the `-o` file)
+and name them with `--upgrade-package <name>`: uv keeps every other pin it
+finds there. The current lockfile moved only `mlx` and `mlx-metal` that way.
+A full re-resolve moves every package to the newest version before the cutoff
+and can add new ones, so it changes the payload and wants a rebuild and a
+size check.
 
 Keep the comment header at the top of `requirements.lock` (it records the uv
 version, the interpreter the closure was resolved against, and the upload
