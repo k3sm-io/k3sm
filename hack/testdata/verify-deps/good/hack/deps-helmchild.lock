@@ -1,0 +1,3 @@
+# Module graph lock for hack/verify-deps.sh (fixture: the helm wrapper graph).
+example.com/hchild v0.4.0 # @OLD@
+example.com/old v1.2.3 # @OLD@
