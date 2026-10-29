@@ -755,12 +755,12 @@ func TestImageMigrateRefusesUserRunOnAgent(t *testing.T) {
 				socket: runtimed.DefaultSocketPath, workDir: workDir, report: tc.report,
 			}, &out, dial)
 			if !tc.wantRefuse {
-				if err != nil && strings.Contains(err.Error(), "on a worker") {
+				if errors.Is(err, errMigrateNeedsSudo) {
 					t.Fatalf("refused: %v", err)
 				}
 				return
 			}
-			if err == nil || !strings.Contains(err.Error(), "sudo k3sm image migrate") {
+			if !errors.Is(err, errMigrateNeedsSudo) || !strings.Contains(err.Error(), "sudo k3sm image migrate") {
 				t.Fatalf("imageMigrateCommand = %v, want a refusal naming sudo k3sm image migrate", err)
 			}
 			if out.Len() != 0 {
