@@ -32,6 +32,10 @@ pin, its date, and the tarball's sha256.
   the tag lists and up to 16 tags at once, reuses connections, and reads each shared manifest
   and config once. On a registry with about 1,150 tags the listing went from about 62 to 37
   seconds. The output is unchanged.
+- A `vm` pod booting on a loaded host is no longer failed at 30 seconds while the guest is still
+  starting: the wait follows the guest console's output, up to 120 seconds. A boot whose agent
+  never answers is retried once, and the failed boot's console is kept under the work-dir and
+  quoted in the pod's error.
 
 ## v0.2.2 — 2026-10-28
 
