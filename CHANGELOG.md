@@ -10,6 +10,11 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Fixed
+
+- Pulling or pushing a large image layer through the cluster registry over a slow link no
+  longer fails after 60 seconds. The registry now lets a transfer take as long as it needs.
+
 ## v0.2.2 — 2026-10-28
 
 The first published v0.2 release. v0.2.0 and v0.2.1 were tagged but never published: Go
