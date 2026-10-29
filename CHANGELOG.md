@@ -10,6 +10,11 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Changed
+
+- Images `k3sm build` produces store their layers gzip-compressed, so pulls to other nodes move
+  about a third of the bytes. A rebuild of unchanged content gets new layer digests once.
+
 ### Fixed
 
 - Pulling or pushing a large image layer through the cluster registry over a slow link no

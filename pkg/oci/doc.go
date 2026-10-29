@@ -94,26 +94,32 @@ limitations under the License.
 //
 // # Determinism
 //
-// BuildLayer is the single home of the normalization that makes a layer digest a
-// function of the CONTENT, not of the machine that built it. See the constant
-// block there for the pinned fields. The emitted image config likewise fixes
-// Created and every History entry's Created to the epoch, so a rebuild of the
-// same context yields the same image digest.
+// BuildLayer is the single home of the normalization that makes a layer's
+// content a function of the build context, not of the machine that built it.
+// See the constant block there for the pinned fields. The emitted image config
+// likewise fixes Created and every History entry's Created to the epoch.
 //
-// The precise claim: determinism is CONTENT-ONLY, not merely same-toolchain.
-// Every layer BuildLayer emits is genuinely uncompressed — the bytes under the
-// declared application/vnd.oci.image.layer.v1.tar media type ARE the tar this
-// package wrote, never a gzip encoding of it — so the layer digest and the
-// config's diff_id are the same hash, and that hash is a function of this
-// package's own tar output only. It carries no dependency on compress/flate's
-// byte-level behavior (which Go makes no cross-version compatibility promise
-// about), so the same context reproducibly digests identically across Go
-// toolchain versions, not merely across repeat builds on one binary. The
-// tradeoff is wire size: an uncompressed layer is larger than a gzip'd one
-// (roughly the gzip ratio of the payload) — accepted because the on-disk
-// materialize path (clonefile) already stores the unpacked tree uncompressed,
-// so the layer blob's size was never bounded by compression in the first
-// place.
+// Every layer is stored gzip-compressed, under the
+// application/vnd.oci.image.layer.v1.tar+gzip media type, because the blob
+// crosses the mesh on every pull to another node and a native payload
+// compresses to roughly a third of its tar. The gzip stream itself is pinned:
+// a fixed compression level, no file name, comment or extra field, a zero
+// mtime and a fixed OS byte (see the gzip contract in layer.go).
+//
+// The precise claim has two tiers:
+//
+//   - CONTENT-ONLY: each layer's diff_id (the sha256 of its uncompressed tar,
+//     recorded in the config's rootfs.diff_ids) and therefore the image config
+//     and its digest, the image ID, depend only on this package's own tar
+//     output. The same context yields the same diff_ids and the same config on
+//     any machine and any Go toolchain.
+//   - SAME-TOOLCHAIN: each layer's digest and size, and therefore the manifest
+//     and its digest, also depend on compress/flate's byte-level output, about
+//     which Go makes no cross-version compatibility promise. A rebuild with the
+//     same k3sm binary reproduces them exactly; a k3sm built with a different
+//     Go release may produce different gzip bytes, and so different layer and
+//     manifest digests, for identical content. That is the property of every
+//     gzip-producing image builder.
 //
 // # Output sinks
 //

@@ -120,7 +120,7 @@ func Build(req Request) (ggcrv1.Image, error) {
 			}
 			img, err = mutate.Append(img, mutate.Addendum{
 				Layer:     layer,
-				MediaType: types.OCIUncompressedLayer,
+				MediaType: types.OCILayer,
 				History:   history(inst),
 			})
 			if err != nil {

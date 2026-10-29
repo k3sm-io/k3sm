@@ -78,7 +78,7 @@ func FuzzCheckEntryName(f *testing.F) {
 // FuzzCheckLinkname asserts that no accepted symlink can point outside the image
 // root, including via the directory its own name sits in.
 //
-// It reproduces writeTar's ORDER (BuildLayer's tar pass; layer.go:174 then :200): checkEntryName gates
+// It reproduces writeTar's ORDER (BuildLayer's tar pass): checkEntryName gates
 // every entry, and checkLinkname only ever sees a name that already passed. That
 // precondition is load-bearing, not decoration — fuzzing checkLinkname standalone
 // reports ("/", "..") as an escape within seconds, because path.Dir("/") is "/"

@@ -18,7 +18,10 @@ package oci
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -26,6 +29,7 @@ import (
 	"strings"
 	"testing"
 
+	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
@@ -35,8 +39,8 @@ import (
 // media type, genuine tar shape iff the plain "v1.tar" media type — then
 // opens the blob exactly as a strict reader would: trusting the label, no
 // sniffing, no fallback (the shape of runtimed's LayerApplier, which has no
-// gunzip path). It pins the fix for a layer that declared an uncompressed media
-// type over gzip bytes.
+// gunzip path for a plain-tar label). It pins the fix for a layer that declared
+// an uncompressed media type over gzip bytes.
 func TestBuildLayerMediaTypeMatchesBytes(t *testing.T) {
 	t.Parallel()
 
@@ -134,28 +138,139 @@ func TestBuildLayerMediaTypeMatchesBytes(t *testing.T) {
 				t.Fatal("strict reader found no tar entries")
 			}
 		})
+	}
+}
 
-		// For a genuinely uncompressed layer, the manifest's layer digest and
-		// the config's diff_id must be the SAME hash — that coincidence is
-		// exactly what "uncompressed" means, and it is the property this
-		// package's determinism claim (pkg/oci/doc.go, "# Determinism") rests
-		// on. It does not hold for a +gzip layer (digest is over the gzip
-		// bytes, diffID over the tar), so this assertion is scoped to the
-		// uncompressed media type only.
-		if mt == types.OCIUncompressedLayer {
-			t.Run("diff_id-equals-blob-digest", func(t *testing.T) {
-				digest, err := l.Digest()
-				if err != nil {
-					t.Fatal(err)
-				}
-				diffID, err := l.DiffID()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if digest != diffID {
-					t.Errorf("uncompressed layer: digest %s != diffID %s (they must coincide)", digest, diffID)
-				}
-			})
-		}
+// buildGzipFixture builds one COPY layer from a fixed context and returns the
+// image.
+func buildGzipFixture(t *testing.T) ggcrv1.Image {
+	t.Helper()
+	ctxDir := t.TempDir()
+	body := strings.Repeat("compressible-payload ", 4096)
+	if err := os.WriteFile(filepath.Join(ctxDir, "app"), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ctxDir, "data"), []byte("data\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	df, err := Parse(strings.NewReader("FROM scratch\nCOPY app data /opt/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bc, err := NewContext(ctxDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := Build(Request{Dockerfile: df, Context: bc, TmpDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	return img
+}
+
+func sha256Of(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// TestBuildLayerIsPinnedGzip pins the stored form of every layer: it is gzip
+// under the tar+gzip media type; the manifest descriptor's digest and size are
+// those of the stored gzip bytes; gunzipping them reproduces exactly the tar
+// whose sha256 the config records as the diff_id; the gzip header carries no
+// name, comment, extra field or mtime; and two builds of the same context give
+// identical layer and manifest digests.
+func TestBuildLayerIsPinnedGzip(t *testing.T) {
+	t.Parallel()
+
+	img := buildGzipFixture(t)
+	manifest, err := img.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers, err := img.Layers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layers) != 1 || len(manifest.Layers) != 1 || len(cfg.RootFS.DiffIDs) != 1 {
+		t.Fatalf("want one layer, got %d layers, %d descriptors, %d diff_ids", len(layers), len(manifest.Layers), len(cfg.RootFS.DiffIDs))
+	}
+	desc := manifest.Layers[0]
+
+	if desc.MediaType != types.OCILayer {
+		t.Errorf("manifest layer media type = %q, want %q", desc.MediaType, types.OCILayer)
+	}
+
+	rc, err := layers[0].Compressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sha256Of(stored); got != desc.Digest.String() {
+		t.Errorf("descriptor digest %s is not the sha256 of the stored bytes (%s)", desc.Digest, got)
+	}
+	if int64(len(stored)) != desc.Size {
+		t.Errorf("descriptor size %d, stored bytes %d", desc.Size, len(stored))
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(stored))
+	if err != nil {
+		t.Fatalf("stored layer is not gzip: %v", err)
+	}
+	if zr.Name != "" || zr.Comment != "" || zr.Extra != nil || !zr.ModTime.IsZero() || zr.OS != layerGzipOS {
+		t.Errorf("gzip header not pinned: name=%q comment=%q extra=%v mtime=%v os=%d", zr.Name, zr.Comment, zr.Extra, zr.ModTime, zr.OS)
+	}
+	plain, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("gunzip stored layer: %v", err)
+	}
+	if got := sha256Of(plain); got != cfg.RootFS.DiffIDs[0].String() {
+		t.Errorf("gunzip of the stored layer hashes to %s, config diff_id is %s", got, cfg.RootFS.DiffIDs[0])
+	}
+	if len(stored) >= len(plain) {
+		t.Errorf("gzip layer (%d bytes) is not smaller than its tar (%d bytes)", len(stored), len(plain))
+	}
+
+	// Uncompressed() must serve the same tar the diff_id names.
+	urc, err := layers[0].Uncompressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	viaLayer, err := io.ReadAll(urc)
+	if cerr := urc.Close(); cerr != nil {
+		t.Errorf("close Uncompressed: %v", cerr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(viaLayer, plain) {
+		t.Error("Uncompressed() differs from gunzip of Compressed()")
+	}
+
+	again := buildGzipFixture(t)
+	d1, err := img.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, err := again.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 != d2 {
+		t.Errorf("two builds of the same context: manifest digests %s and %s", d1, d2)
+	}
+	m2, err := again.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.Layers[0].Digest != desc.Digest {
+		t.Errorf("two builds of the same context: layer digests %s and %s", desc.Digest, m2.Layers[0].Digest)
 	}
 }
