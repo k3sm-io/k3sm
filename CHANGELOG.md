@@ -14,6 +14,7 @@ pin, its date, and the tarball's sha256.
 
 - Pulling or pushing a large image layer through the cluster registry over a slow link no
   longer fails after 60 seconds. The registry now lets a transfer take as long as it needs.
+- An MLXModel whose serving container is crash-looping or cannot pull its image now reports `Crashing` or `ImagePullFailed`, naming the replica, the exit code and the error, instead of `Downloading`.
 
 ## v0.2.2 — 2026-10-28
 
