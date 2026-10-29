@@ -10,6 +10,11 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Fixed
+
+- `k3sm image tag`, `untag`, `inspect` and `save` now refuse `--socket`, as `ls` and `df` do,
+  instead of silently ignoring a flag they never use.
+
 ## v0.2.3 — 2026-10-29
 
 ### Added
