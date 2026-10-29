@@ -249,7 +249,11 @@ func streamSaveImage(ctx context.Context, client runtimev1.ImagesClient, req *ru
 		// a stream that merely stopped. Reporting it from the frame gets the
 		// daemon's reason out even when the RPC status is the transport's.
 		if st := frame.GetError(); st != nil && st.GetCode() != int32(codes.OK) {
-			return savedArchive{}, fmt.Errorf("save image: the daemon could not export it: %s", st.GetMessage())
+			err := fmt.Errorf("save image: the daemon could not export it: %s", st.GetMessage())
+			if st.GetCode() == int32(codes.NotFound) {
+				return savedArchive{}, notInNodeStore{err}
+			}
+			return savedArchive{}, err
 		}
 		if chunk := frame.GetChunk(); len(chunk) > 0 {
 			if terminal != nil {

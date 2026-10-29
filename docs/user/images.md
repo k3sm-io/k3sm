@@ -402,6 +402,21 @@ through the runtime daemon, verifies the export, and uploads the result.
 k3sm image push myapp:v1 registry.example.com/me/myapp:v1
 ```
 
+A reference this node's cache does not hold may also name an image the cluster registry holds,
+by any name `k3sm image ls` and `k3sm image inspect` accept: a bare `myapp:v1`, or the same under
+`registry-k3sm:6450/`. That is where `k3sm build` records its output, so the image a build just
+recorded is pushed on by its tag. k3sm copies it from the cluster registry through the push gate,
+with the builder token the build used. Blobs the destination already has are skipped; within the
+cluster registry they are mounted from the source repository instead of sent again. A destination
+that names the same repository and tag copies nothing and says the image is already there.
+
+```sh
+k3sm build --tag myapp:v1 .
+k3sm image push myapp:v1 registry-k3sm:6450/team/myapp:v1
+```
+
+If neither the cache nor the cluster registry holds the reference, the error names both.
+
 The credential is read at the moment of the upload and forgotten. It comes from
 `K3SM_REGISTRY_TOKEN` if that is set, otherwise from the docker config chain (`docker login`). k3sm
 writes no credential file and never takes one on the command line, where it would land in shell

@@ -82,7 +82,9 @@ var (
 // primary form. The store-ref form is the one exception, and it is contained:
 // the daemon is asked only for the BYTES, through the verified SaveImage
 // export (saveImageArchive, which the image migration also uses), and everything
-// after that is the identical layout upload.
+// after that is the identical layout upload. A reference this node's store does
+// not hold is looked for in the cluster registry, where `k3sm build` records,
+// and copied from there (pushFromClusterRegistry).
 func imagePush(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer) error {
 	// Read as build --push reads its tag: a reference naming no registry names
 	// the cluster registry, not Docker Hub.
@@ -100,6 +102,12 @@ func imagePush(ctx context.Context, o imageOptions, out io.Writer, dial imagesDi
 			defer closer.Close()
 		}
 		staged, cleanup, serr := stageStoreImage(ctx, runtimev1.NewImagesClient(cc), o)
+		if errors.Is(serr, errNotInNodeStore) {
+			// Not on disk and not in this node's store: the image `k3sm build`
+			// recorded, which image ls and inspect show, is in the cluster
+			// registry, so push copies it from there.
+			return pushFromClusterRegistry(ctx, o, ref, serr, out)
+		}
 		if serr != nil {
 			return serr
 		}

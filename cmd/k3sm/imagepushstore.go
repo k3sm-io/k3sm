@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -98,6 +99,11 @@ func stageStoreImage(ctx context.Context, client runtimev1.ImagesClient, o image
 		Digest:    digest,
 		Format:    runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT,
 	}, archive, o.socket); err != nil {
+		if errors.Is(err, errNotInNodeStore) {
+			// Returned as the daemon said it: the caller looks in the cluster
+			// registry next and names both places when neither holds it.
+			return "", nil, err
+		}
 		return "", nil, fmt.Errorf("%s is no directory on disk, and exporting it from this node's store failed: %w", o.layoutDir, err)
 	}
 	layoutDir := filepath.Join(tmp, "layout")
@@ -110,6 +116,88 @@ func stageStoreImage(ctx context.Context, client runtimev1.ImagesClient, o image
 		return "", nil, fmt.Errorf("remove the staged archive: %w", rmErr)
 	}
 	return layoutDir, remove, nil
+}
+
+// pushFromClusterRegistry pushes an image the cluster registry holds: the
+// source of a push that is no directory on disk and that this node's store
+// (storeErr) does not hold. It is how the image `k3sm build` records is pushed
+// on, by the name image ls and inspect show it under.
+//
+// The source is named the way inspect names one (resolveClusterImage: a bare
+// repository[:tag] or repository@digest, or the same under registry-k3sm:6450
+// or a loopback spelling) and read through the push gate with the builder
+// token, the endpoint and identity the build recorded it with, so it works on
+// a worker as on the server. Reads at the gate are anonymous; the token is the
+// one a cluster-registry write already carries, and no other credential is
+// read.
+//
+// The copy is the upload path pushImage and pushIndex share, from the remote
+// image: every blob is checked with a HEAD first and skipped when the
+// destination has it, and when the destination is the cluster registry too
+// (the same gate) a blob it lacks is mounted from the source repository rather
+// than sent again. A destination naming the very same repository and tag or
+// digest copies nothing: the image is already there.
+func pushFromClusterRegistry(ctx context.Context, o imageOptions, ref name.Reference, storeErr error, out io.Writer) error {
+	notHeld := func(why error) error {
+		return fmt.Errorf("%s is no directory on disk, not in this node's store (%v), and not in the cluster registry (%v)", o.layoutDir, storeErr, why)
+	}
+	c, err := resolveClusterImage(o.layoutDir, o.workDir)
+	if err != nil {
+		return notHeld(err)
+	}
+	target, shown, dest, err := imagePushTarget(ctx, ref, o.workDir)
+	if err != nil {
+		return err
+	}
+	src := dest.cluster
+	if src == nil {
+		cr, err := resolveClusterRegistry(ctx, o.workDir)
+		if err != nil {
+			return fmt.Errorf("%s is no directory on disk and not in this node's store (%v); reading it from the cluster registry: %w", o.layoutDir, storeErr, err)
+		}
+		src = &cr
+	}
+	opts, err := src.options(ctx)
+	if err != nil {
+		return err
+	}
+	acc := registryAccess{authority: src.authority, opts: opts}
+	if c, err = acc.locate(c); err != nil {
+		return err
+	}
+	desc, parent, err := getClusterImage(c, o.platform, acc)
+	if err != nil {
+		if errors.Is(err, errNotInRegistry) {
+			return notHeld(err)
+		}
+		return err
+	}
+	digest := desc.Digest
+	if dest.cluster != nil && parent == nil && shown.String() == c.flat.String() {
+		fmt.Fprintf(out, "%s is already in the cluster registry; nothing to copy\n  digest: %s\n  pin:    %s@%s\n", shown, digest, shown.Context().Name(), digest)
+		return nil
+	}
+	if err := pushDescriptor(ctx, target, desc, dest); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "pushed %s\n  from:   %s\n  digest: %s\n  pin:    %s@%s\n", shown, c.flat, digest, shown.Context().Name(), digest)
+	return nil
+}
+
+// pushDescriptor uploads what desc names, an index or an image, to target.
+func pushDescriptor(ctx context.Context, target name.Reference, desc *remote.Descriptor, dest pushDest) error {
+	if desc.MediaType.IsIndex() {
+		idx, err := desc.ImageIndex()
+		if err != nil {
+			return fmt.Errorf("read the index %s: %w", desc.Digest, err)
+		}
+		return pushIndex(ctx, target, idx, dest)
+	}
+	img, err := desc.Image()
+	if err != nil {
+		return fmt.Errorf("read the image %s: %w", desc.Digest, err)
+	}
+	return pushImage(ctx, target, img, dest)
 }
 
 // extractOCILayout unpacks a tarred OCI image layout into dest.

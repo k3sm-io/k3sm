@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -292,7 +293,31 @@ func (c gateEndpoint) options(ctx context.Context) ([]remote.Option, error) {
 		ServerName: registrysvc.FlatServiceName,
 	}
 	auth := authn.FromConfig(authn.AuthConfig{Username: builderTokenUser, Password: c.token.value})
-	return []remote.Option{remote.WithContext(ctx), remote.WithTransport(t), remote.WithAuth(auth)}, nil
+	return []remote.Option{remote.WithContext(ctx), remote.WithTransport(dropMountOrigin{t}), remote.WithAuth(auth)}, nil
+}
+
+// dropMountOrigin removes the "origin" parameter go-containerregistry adds to a
+// cross-repository mount request (POST .../blobs/uploads/?mount=&from=&origin=).
+// It is not part of the distribution specification, and the push gate parses an
+// upload's query against the specification's keys and refuses any other, so
+// with it every mount would be refused and the blob re-sent in full. Without
+// it the request is the specification's mount, which the gate authorizes on
+// both repositories.
+type dropMountOrigin struct{ next http.RoundTripper }
+
+// RoundTrip sends r without an "origin" query parameter on a blob upload start.
+func (d dropMountOrigin) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/blobs/uploads/") {
+		return d.next.RoundTrip(r)
+	}
+	q := r.URL.Query()
+	if !q.Has("origin") {
+		return d.next.RoundTrip(r)
+	}
+	q.Del("origin")
+	out := r.Clone(r.Context())
+	out.URL.RawQuery = q.Encode()
+	return d.next.RoundTrip(out)
 }
 
 // String names the endpoint and redacts the token.
