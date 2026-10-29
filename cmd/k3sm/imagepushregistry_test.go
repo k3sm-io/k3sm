@@ -61,7 +61,7 @@ func TestImagePushFromClusterRegistry(t *testing.T) {
 		t.Helper()
 		reg = registrytest.New()
 		reg.AcceptWrites = true
-		reg.Image("stockkitty-darwin", "abc123", darwin, base, app)
+		reg.Image("myapp-darwin", "abc123", darwin, base, app)
 		inner := reg.Handler()
 		g := startGateRegistryWith(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodPost && r.URL.Query().Has("origin") {
@@ -90,16 +90,16 @@ func TestImagePushFromClusterRegistry(t *testing.T) {
 
 	t.Run("a registry-held image is copied to another repository by mount", func(t *testing.T) {
 		reg, sock, workDir := setup(t)
-		want := digestOf(t, reg, "stockkitty-darwin", "abc123")
-		out, err := push(t, sock, workDir, "stockkitty-darwin:abc123", "127.0.0.1:6450/team/stockkitty:v1")
+		want := digestOf(t, reg, "myapp-darwin", "abc123")
+		out, err := push(t, sock, workDir, "myapp-darwin:abc123", "127.0.0.1:6450/team/myapp:v1")
 		if err != nil {
 			t.Fatalf("push: %v", err)
 		}
-		if !strings.Contains(out, "pushed registry-k3sm:6450/team/stockkitty:v1") || !strings.Contains(out, want) {
+		if !strings.Contains(out, "pushed registry-k3sm:6450/team/myapp:v1") || !strings.Contains(out, want) {
 			t.Errorf("push output = %q, want the flat name and digest %s", out, want)
 		}
-		if got := digestOf(t, reg, "team/stockkitty", "v1"); got != want {
-			t.Errorf("team/stockkitty:v1 = %s, want %s", got, want)
+		if got := digestOf(t, reg, "team/myapp", "v1"); got != want {
+			t.Errorf("team/myapp:v1 = %s, want %s", got, want)
 		}
 		mounted := map[string]bool{}
 		for _, w := range reg.Writes() {
@@ -107,23 +107,23 @@ func TestImagePushFromClusterRegistry(t *testing.T) {
 			case "upload":
 				t.Errorf("blob %s was sent to %s again; the same registry mounts it", w.Digest, w.Repository)
 			case "mount":
-				if w.From != "stockkitty-darwin" {
-					t.Errorf("blob %s mounted from %q, want stockkitty-darwin", w.Digest, w.From)
+				if w.From != "myapp-darwin" {
+					t.Errorf("blob %s mounted from %q, want myapp-darwin", w.Digest, w.From)
 				}
 				mounted[w.Digest] = true
 			}
 		}
 		for _, l := range [][]byte{base, app} {
-			if d := sha(l); !mounted[d] || !reg.HasBlob("team/stockkitty", d) {
-				t.Errorf("layer %s was not mounted into team/stockkitty", d)
+			if d := sha(l); !mounted[d] || !reg.HasBlob("team/myapp", d) {
+				t.Errorf("layer %s was not mounted into team/myapp", d)
 			}
 		}
 	})
 
 	t.Run("the same repository and tag copies nothing", func(t *testing.T) {
 		reg, sock, workDir := setup(t)
-		for _, dst := range []string{"127.0.0.1:6450/stockkitty-darwin:abc123", "registry-k3sm:6450/stockkitty-darwin:abc123", "stockkitty-darwin:abc123"} {
-			out, err := push(t, sock, workDir, "stockkitty-darwin:abc123", dst)
+		for _, dst := range []string{"127.0.0.1:6450/myapp-darwin:abc123", "registry-k3sm:6450/myapp-darwin:abc123", "myapp-darwin:abc123"} {
+			out, err := push(t, sock, workDir, "myapp-darwin:abc123", dst)
 			if err != nil {
 				t.Fatalf("push to %s: %v", dst, err)
 			}
@@ -138,8 +138,8 @@ func TestImagePushFromClusterRegistry(t *testing.T) {
 
 	t.Run("a blob the destination has is not sent again", func(t *testing.T) {
 		reg, sock, workDir := setup(t)
-		reg.Image("team/stockkitty", "old", darwin, base)
-		if _, err := push(t, sock, workDir, "registry-k3sm:6450/stockkitty-darwin:abc123", "registry-k3sm:6450/team/stockkitty:v1"); err != nil {
+		reg.Image("team/myapp", "old", darwin, base)
+		if _, err := push(t, sock, workDir, "registry-k3sm:6450/myapp-darwin:abc123", "registry-k3sm:6450/team/myapp:v1"); err != nil {
 			t.Fatalf("push: %v", err)
 		}
 		for _, w := range reg.Writes() {
@@ -147,7 +147,7 @@ func TestImagePushFromClusterRegistry(t *testing.T) {
 				t.Errorf("the base layer the destination holds was written again: %+v", w)
 			}
 		}
-		if !reg.HasBlob("team/stockkitty", sha(app)) {
+		if !reg.HasBlob("team/myapp", sha(app)) {
 			t.Errorf("the app layer did not arrive")
 		}
 	})
