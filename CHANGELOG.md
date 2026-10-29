@@ -10,6 +10,8 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+## v0.2.3 — 2026-10-29
+
 ### Added
 
 - `k3sm image ls -o ndjson` streams the list as it is read: a start line, progress lines, one
@@ -38,6 +40,11 @@ pin, its date, and the tarball's sha256.
   starting: the wait follows the guest console's output, up to 120 seconds. A boot whose agent
   never answers is retried once, and the failed boot's console is kept under the work-dir and
   quoted in the pod's error.
+- A `vm` pod now reports its image ID, also after a daemon restart, so `k3sm image ls` and
+  `k3sm image prune` count the `vm` pods that use an image.
+- `k3sm uninstall --purge --user` refuses a home that is, or contains, the data root on a Mac
+  where the data root does not exist yet. It resolved the data root's symlinks only when the
+  whole path existed.
 - `k3sm image migrate --report` run without `sudo` on a server no longer reports a finished
   migration as incomplete with zero images. It prints the summary `k3sm status` shows and says
   the per-image report needs `sudo`; `-o json` asks for `sudo` instead of printing an empty journal.
