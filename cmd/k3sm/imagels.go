@@ -58,8 +58,6 @@ const (
 	// applies). A node at the cap may hold an image it does not list, so its
 	// absence from cachedOn proves nothing.
 	nodeStatusImageCap = 50
-	// describeParallelism bounds the manifest reads in flight at once.
-	describeParallelism = 4
 )
 
 // registryReport says which registry a report is about and whether it answered.
@@ -293,20 +291,43 @@ func registryAliases(doc hostingDoc) map[string]bool {
 // listRegistry reads every tag the registry holds. Any failure is the
 // registry's: the caller reports it as unreachable and still exits 0.
 func listRegistry(ctx context.Context, env imageRegistryEnv) (registryListing, error) {
-	doc, err := readHosting(ctx, env.kube)
+	reg, err := openRegistry(ctx, env)
 	if err != nil {
 		return registryListing{}, err
 	}
-	bases, err := registryBases(doc, env.apiHost)
+	images, _, err := reg.read(ctx, listHooks{})
 	if err != nil {
 		return registryListing{}, err
+	}
+	return registryListing{images: images, aliases: reg.aliases}, nil
+}
+
+// openedRegistry is a registry that answered its catalog: the client that
+// reached it, the repositories it holds, and the aliases a Pod spec may name
+// it by.
+type openedRegistry struct {
+	c       *registryclient.Client
+	repos   []string
+	aliases map[string]bool
+}
+
+// openRegistry finds the registry the cluster publishes and reads its
+// catalog, keeping the well-formed repository names.
+func openRegistry(ctx context.Context, env imageRegistryEnv) (openedRegistry, error) {
+	doc, err := readHosting(ctx, env.kube)
+	if err != nil {
+		return openedRegistry{}, err
+	}
+	bases, err := registryBases(doc, env.apiHost)
+	if err != nil {
+		return openedRegistry{}, err
 	}
 	var c *registryclient.Client
 	var repos []string
 	for _, base := range bases {
 		c, err = registryclient.New(base, registryclient.Options{RootCAs: env.rootCAs, Transport: env.transport})
 		if err != nil {
-			return registryListing{}, err
+			return openedRegistry{}, err
 		}
 		repos, err = c.Catalog(ctx)
 		if !errors.Is(err, http.ErrSchemeMismatch) {
@@ -314,53 +335,166 @@ func listRegistry(ctx context.Context, env imageRegistryEnv) (registryListing, e
 		}
 	}
 	if err != nil {
-		return registryListing{}, fmt.Errorf("registry at %s: %w", c.Host(), err)
+		return openedRegistry{}, fmt.Errorf("registry at %s: %w", c.Host(), err)
 	}
-	type job struct{ repo, tag string }
-	var jobs []job
+	reg := openedRegistry{c: c, aliases: registryAliases(doc)}
 	for _, r := range repos {
-		if !registryclient.ValidRepository(r) {
-			continue
-		}
-		tags, err := c.Tags(ctx, r)
-		if errors.Is(err, registryclient.ErrNotFound) {
-			continue // deleted since the catalog was read
-		}
-		if err != nil {
-			return registryListing{}, fmt.Errorf("registry at %s: %w", c.Host(), err)
-		}
-		for _, t := range tags {
-			if registryclient.ValidTag(t) {
-				jobs = append(jobs, job{r, t})
-			}
+		if registryclient.ValidRepository(r) {
+			reg.repos = append(reg.repos, r)
 		}
 	}
-	images := make([]registryclient.Image, len(jobs))
-	errs := make([]error, len(jobs))
-	sem := make(chan struct{}, describeParallelism)
-	var wg sync.WaitGroup
-	for i, j := range jobs {
-		wg.Add(1)
+	return reg, nil
+}
+
+// listProgress is how far a listing has got. Tags is the running total of the
+// tags the repositories read so far hold: it grows until every repository's
+// tag list is read.
+type listProgress struct {
+	Repositories     int `json:"repositories"`
+	RepositoriesRead int `json:"repositoriesRead"`
+	Tags             int `json:"tags"`
+	TagsRead         int `json:"tagsRead"`
+}
+
+// listHooks observe a listing as it runs; a nil hook observes nothing. The
+// listing calls them one at a time, under its lock, so a hook may write to a
+// shared stream without its own. An error from a hook ends the listing with
+// that error.
+type listHooks struct {
+	// repositoryRead follows each repository's tag list.
+	repositoryRead func(p listProgress) error
+	// tagRead follows each tag's describe: img is the tag's image, or nil for
+	// a tag deleted since its tag list was read.
+	tagRead func(p listProgress, img *registryclient.Image) error
+}
+
+// read reads every repository's tag list and describes every tag, all
+// concurrently: a tag is described as soon as its repository's list is read,
+// with at most registryclient.MaxConcurrentReads requests in flight, and each
+// manifest or config a digest names is read once for the whole listing. The
+// images come back in completion order. A repository or a tag deleted since
+// the catalog or its tag list was read is skipped; the first other failure
+// stops the listing and is returned.
+func (reg openedRegistry) read(ctx context.Context, hooks listHooks) ([]registryclient.Image, listProgress, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	describer := reg.c.NewDescriber()
+	sem := make(chan struct{}, registryclient.MaxConcurrentReads)
+	// mu guards images, progress and firstErr, and serialises the hooks.
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		images   []registryclient.Image
+		progress = listProgress{Repositories: len(reg.repos)}
+		firstErr error
+	)
+	// fail records the listing's first error and stops the rest. mu is held.
+	fail := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+	registryErr := func(err error) error { return fmt.Errorf("registry at %s: %w", reg.c.Host(), err) }
+	describe := func(repo, tag string) {
+		defer wg.Done()
 		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			images[i], errs[i] = c.Describe(ctx, j.repo, j.tag)
-		}()
-	}
-	wg.Wait()
-	out := registryListing{aliases: registryAliases(doc)}
-	for i, err := range errs {
+		var img registryclient.Image
+		err := ctx.Err()
+		if err == nil {
+			img, err = describer.Describe(ctx, repo, tag)
+		}
+		<-sem
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr != nil {
+			return
+		}
+		progress.TagsRead++
+		var seen *registryclient.Image
 		switch {
 		case errors.Is(err, registryclient.ErrNotFound):
 			// A tag deleted between the tag list and the read is no row.
 		case err != nil:
-			return registryListing{}, fmt.Errorf("registry at %s: %w", c.Host(), err)
+			fail(registryErr(err))
+			return
 		default:
-			out.images = append(out.images, images[i])
+			images = append(images, img)
+			seen = &img
+		}
+		if hooks.tagRead != nil {
+			if err := hooks.tagRead(progress, seen); err != nil {
+				fail(err)
+			}
 		}
 	}
-	return out, nil
+	readTags := func(repo string) {
+		defer wg.Done()
+		sem <- struct{}{}
+		var tags []string
+		err := ctx.Err()
+		if err == nil {
+			tags, err = reg.c.Tags(ctx, repo)
+		}
+		<-sem
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr != nil {
+			return
+		}
+		progress.RepositoriesRead++
+		switch {
+		case errors.Is(err, registryclient.ErrNotFound):
+			tags = nil // deleted since the catalog was read
+		case err != nil:
+			fail(registryErr(err))
+			return
+		}
+		for _, t := range tags {
+			if registryclient.ValidTag(t) {
+				progress.Tags++
+				wg.Add(1)
+				go describe(repo, t)
+			}
+		}
+		if hooks.repositoryRead != nil {
+			if err := hooks.repositoryRead(progress); err != nil {
+				fail(err)
+			}
+		}
+	}
+	for _, repo := range reg.repos {
+		wg.Add(1)
+		go readTags(repo)
+	}
+	wg.Wait()
+	return images, progress, firstErr
+}
+
+// imageRowFor joins one registry image against where it is cached and which
+// Pods use it.
+func imageRowFor(img registryclient.Image, nodes []corev1.Node, pods []corev1.Pod, aliases map[string]bool) imageRow {
+	row := imageRow{
+		Repository: img.Repository,
+		Tag:        img.Tag,
+		Reference:  canonicalRegistry + "/" + img.Repository + ":" + img.Tag,
+		Digest:     img.Digest,
+		Platforms:  append([]string{}, img.Platforms...),
+		SizeBytes:  img.SizeBytes,
+		CachedOn:   []string{},
+	}
+	for _, n := range nodes {
+		if nodeCaches(n, img.Digest) {
+			row.CachedOn = append(row.CachedOn, n.Name)
+		}
+	}
+	sort.Strings(row.CachedOn)
+	for i := range pods {
+		if podUses(&pods[i], img, aliases) {
+			row.Pods++
+		}
+	}
+	return row
 }
 
 // buildImageList joins the registry's tags against where they are cached and
@@ -373,27 +507,7 @@ func buildImageList(reg registryReport, l registryListing, nodes []corev1.Node, 
 		CachedOnIncomplete: incompleteNodes(nodes),
 	}
 	for _, img := range l.images {
-		row := imageRow{
-			Repository: img.Repository,
-			Tag:        img.Tag,
-			Reference:  canonicalRegistry + "/" + img.Repository + ":" + img.Tag,
-			Digest:     img.Digest,
-			Platforms:  append([]string{}, img.Platforms...),
-			SizeBytes:  img.SizeBytes,
-			CachedOn:   []string{},
-		}
-		for _, n := range nodes {
-			if nodeCaches(n, img.Digest) {
-				row.CachedOn = append(row.CachedOn, n.Name)
-			}
-		}
-		sort.Strings(row.CachedOn)
-		for i := range pods {
-			if podUses(&pods[i], img, l.aliases) {
-				row.Pods++
-			}
-		}
-		rep.Images = append(rep.Images, row)
+		rep.Images = append(rep.Images, imageRowFor(img, nodes, pods, l.aliases))
 	}
 	sort.Slice(rep.Images, func(i, j int) bool {
 		a, b := rep.Images[i], rep.Images[j]

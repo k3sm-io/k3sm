@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,6 +54,13 @@ const (
 	pageSize                 = 1000
 	unknownPlatformComponent = "unknown"
 )
+
+// MaxConcurrentReads is how many requests a caller should keep in flight to
+// one registry, and how many idle connections the client keeps for it. The
+// cluster registry is a local zot behind a TLS relay: each request is a short
+// round trip, so a listing is bound by latency, not by the registry's work,
+// and 16 in flight hides that latency without queueing the relay.
+const MaxConcurrentReads = 16
 
 // Sentinel errors a caller can branch on with errors.Is.
 var (
@@ -112,9 +120,14 @@ func New(base string, opts Options) (*Client, error) {
 		// operator's HTTP proxy, so Proxy stays nil. This is built here rather
 		// than cloned from http.DefaultTransport, which is shared global state.
 		t := &http.Transport{
-			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          10,
+			DialContext:       (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ForceAttemptHTTP2: true,
+			// Keep a connection per request a listing has in flight
+			// (MaxConcurrentReads), so concurrent reads reuse kept-alive
+			// connections instead of handshaking anew; the default per-host
+			// idle limit is 2.
+			MaxIdleConns:          MaxConcurrentReads,
+			MaxIdleConnsPerHost:   MaxConcurrentReads,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: time.Second,
@@ -352,6 +365,88 @@ type Image struct {
 // Describe reads what a tag points at: its digest, its platforms, its size and
 // every blob it reaches.
 func (c *Client) Describe(ctx context.Context, repository, tag string) (Image, error) {
+	return c.describe(ctx, nil, repository, tag)
+}
+
+// Describer describes many tags of one registry, reading each manifest and
+// config a digest names once: the tags of a mirrored image, and every tag of
+// an index, share their children, so a listing that described each tag on its
+// own would fetch the same content again for every tag. What it remembers is
+// content-addressed and verified, so a remembered read answers exactly what a
+// fresh one would, but a Describer is meant for one listing and is then
+// dropped: it never sees a manifest deleted after it was read. It is safe for
+// concurrent use.
+type Describer struct {
+	c *Client
+	// mu guards reads; each entry is filled once, by the first caller, while
+	// the others wait on its done channel.
+	mu    sync.Mutex
+	reads map[string]*memoRead
+}
+
+// memoRead is one remembered read: a manifest or a config platform.
+type memoRead struct {
+	done     chan struct{}
+	manifest Manifest
+	platform Platform
+	err      error
+}
+
+// NewDescriber returns a Describer over c.
+func (c *Client) NewDescriber() *Describer {
+	return &Describer{c: c, reads: map[string]*memoRead{}}
+}
+
+// Describe is Client.Describe, with the reads by digest remembered. The tag's
+// own manifest is always read afresh: a tag is a name, not content.
+func (d *Describer) Describe(ctx context.Context, repository, tag string) (Image, error) {
+	return d.c.describe(ctx, d, repository, tag)
+}
+
+// once runs read for key unless another caller already has, and returns the
+// entry it filled. The key carries the repository: a digest present in one
+// repository may be absent from another.
+func (d *Describer) once(key string, read func(*memoRead)) *memoRead {
+	d.mu.Lock()
+	e, ok := d.reads[key]
+	if !ok {
+		e = &memoRead{done: make(chan struct{})}
+		d.reads[key] = e
+	}
+	d.mu.Unlock()
+	if !ok {
+		read(e)
+		close(e.done)
+	}
+	<-e.done
+	return e
+}
+
+// manifest reads repository@digest, through d when d is non-nil.
+func (c *Client) manifest(ctx context.Context, d *Describer, repository, digest string) (Manifest, error) {
+	if d == nil {
+		return c.Manifest(ctx, repository, digest)
+	}
+	e := d.once("manifest "+repository+"@"+digest, func(e *memoRead) {
+		e.manifest, e.err = c.Manifest(ctx, repository, digest)
+	})
+	return e.manifest, e.err
+}
+
+// configPlatform reads the platform a config records, through d when d is
+// non-nil.
+func (c *Client) configPlatform(ctx context.Context, d *Describer, repository string, config Descriptor) (Platform, error) {
+	if d == nil {
+		return c.ConfigPlatform(ctx, repository, config)
+	}
+	e := d.once("config "+repository+"@"+config.Digest, func(e *memoRead) {
+		e.platform, e.err = c.ConfigPlatform(ctx, repository, config)
+	})
+	return e.platform, e.err
+}
+
+// describe is Describe, remembering reads by digest in d when d is non-nil.
+func (c *Client) describe(ctx context.Context, d *Describer, repository, tag string) (Image, error) {
 	img := Image{Repository: repository, Tag: tag, Blobs: map[string]int64{}}
 	top, err := c.Manifest(ctx, repository, tag)
 	if err != nil {
@@ -359,7 +454,7 @@ func (c *Client) Describe(ctx context.Context, repository, tag string) (Image, e
 	}
 	img.Digest = top.Digest
 	content := map[string]int64{}
-	if err := c.walk(ctx, repository, top, nil, 0, &img, content); err != nil {
+	if err := c.walk(ctx, d, repository, top, nil, 0, &img, content); err != nil {
 		return Image{}, err
 	}
 	for _, size := range content {
@@ -369,19 +464,23 @@ func (c *Client) Describe(ctx context.Context, repository, tag string) (Image, e
 }
 
 // walk accumulates m's blobs, and its children's when m is an index. platform
-// is the platform the parent index declared for m, nil at the top.
-func (c *Client) walk(ctx context.Context, repository string, m Manifest, platform *Platform, depth int, img *Image, content map[string]int64) error {
+// is the platform the parent index declared for m, nil at the top. A child
+// manifest is read once per tag (an index lists each child once), so the
+// requests per tag are its own manifest plus, for an index, one per child, or,
+// for a lone manifest, its config (the only place its platform is recorded).
+// Layers are never read: their descriptors carry their sizes.
+func (c *Client) walk(ctx context.Context, d *Describer, repository string, m Manifest, platform *Platform, depth int, img *Image, content map[string]int64) error {
 	img.Blobs[m.Digest] = m.Size
 	if m.IsIndex() {
 		if depth >= maxIndexDepth {
 			return fmt.Errorf("image %s:%s nests indexes deeper than %d", repository, img.Tag, maxIndexDepth)
 		}
 		for _, child := range m.Manifests {
-			cm, err := c.Manifest(ctx, repository, child.Digest)
+			cm, err := c.manifest(ctx, d, repository, child.Digest)
 			if err != nil {
 				return err
 			}
-			if err := c.walk(ctx, repository, cm, child.Platform, depth+1, img, content); err != nil {
+			if err := c.walk(ctx, d, repository, cm, child.Platform, depth+1, img, content); err != nil {
 				return err
 			}
 		}
@@ -394,7 +493,7 @@ func (c *Client) walk(ctx context.Context, repository string, m Manifest, platfo
 		content[l.Digest] = l.Size
 	}
 	if platform == nil {
-		p, err := c.ConfigPlatform(ctx, repository, *m.Config)
+		p, err := c.configPlatform(ctx, d, repository, *m.Config)
 		if err != nil {
 			return err
 		}
