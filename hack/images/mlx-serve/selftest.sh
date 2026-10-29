@@ -583,8 +583,21 @@ eng.main()
 check("alias.rankn  every other rank joins the generator and serves no HTTP",
       eng.rec["joined"] and eng.rec["http"] is None)
 eng = fake_engine()
-_, Hn, _ = ks.install_alias(eng, None)
-check("alias.none  without a served name the stock models listing answers", models(Hn, "/v1/models")[1] == b"upstream")
+stock = (eng.ModelProvider, eng.APIHandler, eng.run)
+eng._run_http_server = None
+got = ks.install_alias(eng, None)
+check("alias.none  without a served name nothing is checked or replaced: the engine is stock",
+      got == stock and (eng.ModelProvider, eng.APIHandler, eng.run) == stock
+      and models(eng.APIHandler, "/v1/models")[1] == b"upstream")
+def fake_run(host, port, model_provider, server_class=None, handler_class=None):
+    group = mx.distributed.init()
+    return group
+try:
+    ks.check_run_shape(types.SimpleNamespace(run=fake_run))
+    check("alias.runshape  a run whose body is not the copied 0.32.0 one is refused with the re-derive instruction", False)
+except ks.ShardError as e:
+    check("alias.runshape  a run whose body is not the copied 0.32.0 one is refused with the re-derive instruction",
+          "re-derive" in str(e) and "ENGINE_RUN_SHA256" in str(e))
 for label, drop, needle in (
         ("alias.failclosed.missing  an engine without _run_http_server ends the rank naming it",
          {"_run_http_server": None}, "_run_http_server"),
@@ -656,10 +669,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 33 ]; then
+if [ "$SHARD_CHECKS" -ge 34 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 33 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 34 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 
@@ -1260,23 +1273,78 @@ fi
 # ---- 9a — the served-name alias against the pinned mlx-lm (staged tree) ------
 # k3sm_shard's alias hooks four mlx_lm.server internals; this rung checks them
 # on the real module the image carries, so an mlx-lm bump that moves one goes
-# red here before a rank refuses to start.
+# red here before a rank refuses to start: every hook's signature, the source
+# of the run the alias copies (pinned to 0.32.0's), and the real models
+# listing against the aliased one. No model is loaded and no distributed group
+# is formed: the handlers are built without a socket over an empty Hub cache.
 if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
-	alias_out="$(cd "$WORK" && PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B -c '
-import sys
+	cat > "$WORK/alias-real.py" <<'PY'
+import email.message, importlib, io, json, os, sys, tempfile, types
 sys.path.insert(0, sys.argv[1])
-import importlib, k3sm_shard as ks
+import k3sm_shard as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
 server = importlib.import_module(ks.ENGINE_MODULE)
-ks.check_engine_hooks(server)
+stock_handler = server.APIHandler
+try:
+    ks.check_engine_hooks(server)
+    check("hooks  every hook the alias uses has the 0.32.0 signature", True)
+except ks.ShardError as e:
+    print(f"k3sm-shard: {e}", file=sys.stderr)
+    check("hooks  every hook the alias uses has the 0.32.0 signature", False)
+try:
+    ks.check_run_shape(server)
+    check("runshape  mlx_lm.server.run is the 0.32.0 body the alias's run copies", True)
+except ks.ShardError as e:
+    print(f"k3sm-shard: {e}", file=sys.stderr)
+    check("runshape  mlx_lm.server.run is the 0.32.0 body the alias's run copies", False)
+
 P, H, run = ks.install_alias(server, "org/m")
-ok = server.run is run and server.ModelProvider is P and issubclass(H, server.APIHandler)
-print("ok" if ok else "no")
-' "$HERE" 2>"$WORK/alias-real.err")"
-	if [ "$alias_out" = "ok" ]; then
-		ladder ok "9a.hooks  the pinned mlx_lm.server has every hook the served-name alias uses, and it installs"
+check("install  ModelProvider and run are replaced, the handler subclasses the real one",
+      server.run is run and server.ModelProvider is P and issubclass(H, stock_handler))
+
+model_dir = tempfile.mkdtemp(dir=sys.argv[2])
+def answer(cls, path):
+    h = cls.__new__(cls)
+    h.path, h.created, h.wfile = path, 1700000000, io.BytesIO()
+    h.request_version, h.command, h.requestline = "HTTP/1.1", "GET", f"GET {path} HTTP/1.1"
+    h.client_address, h.headers, h.close_connection = ("127.0.0.1", 0), email.message.Message(), True
+    h.response_generator = types.SimpleNamespace(cli_args=types.SimpleNamespace(model=model_dir, allowed_origins=["*"]))
+    h.log_message = lambda *a: None
+    h.handle_models_request()
+    head, body = h.wfile.getvalue().split(b"\r\n\r\n", 1)
+    lines = head.decode().split("\r\n")
+    hdrs = sorted(l for l in lines[1:] if not l.lower().startswith(("date:", "server:")))
+    return lines[0], hdrs, json.loads(body)
+
+real = answer(stock_handler, "/v1/models")
+aliased = answer(H, "/v1/models")
+resolved = os.path.realpath(model_dir)
+renamed = [dict(d, id="org/m") if d["id"] == resolved else d for d in real[2]["data"]]
+check("models.real  the real listing names the --model path (what the alias replaces)",
+      [d["id"] for d in real[2]["data"]] == [resolved])
+check("models.same  the aliased listing is the real one with the id renamed: status, headers and body",
+      aliased[:2] == real[:2] and aliased[2] == {"object": real[2]["object"], "data": renamed})
+PY
+	mkdir -p "$WORK/alias-hf" "$WORK/alias-models"
+	ALIAS_CHECKS=0
+	alias_out="$(cd "$WORK" && HF_HUB_CACHE="$WORK/alias-hf" HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/alias-real.py" "$HERE" "$WORK/alias-models" 2>"$WORK/alias-real.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		ALIAS_CHECKS=$((ALIAS_CHECKS + 1))
+		case "$verdict" in
+			ok) ladder ok "9a.$name" ;;
+			no) ladder no "9a.$name" ;;
+			*)  ladder no "9a.driver  $verdict $name" ;;
+		esac
+	done <<< "$alias_out"
+	if [ "$ALIAS_CHECKS" -ge 5 ]; then
+		ladder ok "9a.count  all $ALIAS_CHECKS alias checks reported"
 	else
-		ladder no "9a.hooks  the pinned mlx_lm.server has every hook the served-name alias uses, and it installs"
-		tail -5 "$WORK/alias-real.err"
+		ladder no "9a.count  only $ALIAS_CHECKS of 5 alias checks reported (the driver crashed?)"
+		tail -20 "$WORK/alias-real.err"
 	fi
 else
 	ladder skip "9a.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
