@@ -133,7 +133,7 @@ release engineering. What ships:
 
 ## v0.2 (shipped)
 
-v0.2.2 was released on 2026-10-28.
+v0.2.3 was released on 2026-10-29.
 
 - **One image store and one name for it.** The server's registry becomes the single place the
   cluster's images live, under one flat reference, `registry-k3sm:6450/<repo>:<tag>`, that works
