@@ -19,9 +19,13 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -154,6 +158,97 @@ func TestImagePushFromClusterRegistry(t *testing.T) {
 			t.Errorf("a failed push wrote %v", w)
 		}
 	})
+}
+
+// TestImagePushMountHasNoTokenRefreshRace is the gate for a push that mounts
+// several layers from another repository of the same registry. The writer
+// asks for the source repository's pull scope the first time it mounts from
+// it, and that refresh replaces the HTTP client every concurrent layer upload
+// reads. The push must give the writer that scope before any layer upload
+// runs, so no refresh (a /v2/ ping) ever happens while a blob request is in
+// flight. Under -race the overlap is also the data race itself.
+func TestImagePushMountHasNoTokenRefreshRace(t *testing.T) {
+	empty := t.TempDir()
+	t.Setenv("HOME", empty)
+	t.Setenv("DOCKER_CONFIG", empty)
+	t.Setenv(registryTokenEnv, "")
+
+	darwin := registryclient.Platform{OS: "darwin", Architecture: "arm64"}
+	var layers [][]byte
+	for i := range 6 {
+		layers = append(layers, []byte(fmt.Sprintf("layer %d", i)))
+	}
+	reg := registrytest.New()
+	reg.AcceptWrites = true
+	reg.Image("myapp-darwin", "abc123", darwin, layers...)
+	watch := &refreshWatch{inner: reg.Handler()}
+	g := startGateRegistryWith(t, watch)
+	clusterAPIFor(t, g)
+	workDir := asServer(t, g.port)
+	if err := os.MkdirAll(registrysvc.StateDir(workDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := registrysvc.WriteCredential(workDir, registrysvc.Credential{Address: "127.0.0.1:6450", Username: "k3sm", Password: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	sock := serveFakeImages(t, &fakeImagesDaemon{saveErr: status.Error(codes.NotFound, "image: no such image in the local index")})
+
+	if _, err := runImageCmd(t, []string{"--socket", sock, "--work-dir", workDir, "push", "myapp-darwin:abc123", "127.0.0.1:6450/team/myapp:v1"}); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if n := watch.overlaps(); n != 0 {
+		t.Errorf("the writer refreshed its token %d time(s) while a layer upload was in flight; the mount source's pull scope must be in place before the uploads start", n)
+	}
+	for _, l := range layers {
+		if !reg.HasBlob("team/myapp", sha(l)) {
+			t.Errorf("layer %s was not mounted into team/myapp", sha(l))
+		}
+	}
+}
+
+// refreshWatch counts the /v2/ pings (each one a writer building a new
+// transport, the token refresh) that arrive while a blob request is in
+// flight. The first blob request is held, so a refresh any other concurrent
+// layer upload triggers lands inside it.
+type refreshWatch struct {
+	inner http.Handler
+
+	mu       sync.Mutex
+	held     bool
+	inFlight int
+	overlap  int
+}
+
+func (r *refreshWatch) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	switch {
+	case req.URL.Path == "/v2/" || req.URL.Path == "/v2":
+		r.mu.Lock()
+		if r.inFlight > 0 {
+			r.overlap++
+		}
+		r.mu.Unlock()
+	case strings.Contains(req.URL.Path, "/blobs/"):
+		r.mu.Lock()
+		r.inFlight++
+		hold := !r.held
+		r.held = true
+		r.mu.Unlock()
+		defer func() {
+			r.mu.Lock()
+			r.inFlight--
+			r.mu.Unlock()
+		}()
+		if hold {
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+	r.inner.ServeHTTP(w, req)
+}
+
+func (r *refreshWatch) overlaps() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.overlap
 }
 
 // sha is the sha256 digest of b, as a registry names a blob.
