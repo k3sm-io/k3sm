@@ -17,7 +17,8 @@ gates run `shellcheck` over their `hack/` scripts and fail when it is not instal
 
 The Go gate runs `gofmt -l`, `go vet`, `go build`, `go test` (`go test -race` in
 `k3sm`), the per-file license-header check, `staticcheck -tests=false ./...`,
-a `go mod tidy` no-diff check, `hack/verify-deps.sh`, and `govulncheck`. Each Go
+a `go mod tidy` no-diff check, `hack/verify-deps.sh`, and `govulncheck`, and it compiles
+any integration-tagged tests without running them. Each Go
 repository documents its commands in `docs/GO-STANDARDS.md`. Two tools are pinned,
 and the gate fails when either is missing or is any other version:
 

@@ -34,7 +34,7 @@ k3sm ships as a single binary. Its subcommands:
 | `interconnect` | Arm or disarm a Thunderbolt cable between Macs as an opt-in network (alpha) |
 | `build` | Build a Dockerfile into an image: natively for copy-only recipes, on the cluster's build engine for `RUN` |
 | `builder` | Manage the in-cluster buildkitd build engine and its bundled buildx |
-| `image` | Load, import, push, prune, list and inspect images in the cluster registry and this node's pull cache, and migrate a node's older images into the registry |
+| `image` | Load, import, pull, tag, untag, push, save, prune, list (`ls`, `df`) and inspect images in the cluster registry and this node's pull cache, and migrate a node's older images into the registry |
 | `registry` | Mint the cluster registry's push token for any OCI tool, through your kubeconfig (`registry token\|login`) |
 | `payload` | Stage the control-plane binaries an install copies into place |
 | `kubectl` | Run the bundled kubectl against this cluster, with `KUBECONFIG` preset |
@@ -51,8 +51,8 @@ Underneath, a few packages carry most of the weight: `pkg/provider` is the Virtu
 Darwin provider that turns a Pod spec into a running process; `pkg/executor` brings up and
 supervises the embedded control plane; `pkg/bootstrap` and `pkg/certs` handle join tokens, node
 identity and the certificate hierarchy; `pkg/install` manages the launchd daemons; `pkg/mlx`
-renders an `MLXModel` into the objects that serve it; `pkg/addons` carries the metrics-server
-add-on, which every server applies once its node has minted its kubelet serving certificate; `pkg/update` and `pkg/updatectl` back `k3sm update`, the release check and the server-driven roll of
+renders an `MLXModel` into the objects that serve it; `pkg/addons` carries the add-on reconcilers: the embedded metrics-server
+add-on, which every server applies once its node has minted its kubelet serving certificate, and the operator's root-owned manifest directory; `pkg/update` and `pkg/updatectl` back `k3sm update`, the release check and the server-driven roll of
 the cluster to a release, workers first and the server last; `pkg/interconnect` is the opt-in
 Thunderbolt cable network between Macs, beside the wireguard mesh; and
 `pkg/oci` is the one place in the repo that reads or writes OCI image bytes. k3sm imports

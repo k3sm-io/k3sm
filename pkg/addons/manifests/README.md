@@ -28,9 +28,9 @@ service user".
 Compiling the manifests in removes the ingress entirely: there is no path an unprivileged
 process can write, and manifest integrity is inherited from the signed binary.
 
-Do not add a filesystem, ConfigMap, URL, or flag ingress to this reconciler. A directory-drop
-mechanism is a separate design with its own applying identity (a bounded ServiceAccount, never
-`system:masters`), a root-owned location, and symlink/size/GVK guards.
+Do not add a filesystem, ConfigMap, URL, or flag ingress to this embedded reconciler. The
+operator-drop ingress is the separate `ManifestDir` reconciler (`manifestdir.go`), which applies a
+root-owned `/var/lib/k3sm/manifests` with its own guards (see `../doc.go`).
 
 ## Authoring contract for a manifest added here
 

@@ -56,6 +56,9 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26 or later** (each `go.mod` declare
   (golden files where useful).
 - `go test ./...` must pass, and `go test -race ./...` too; the `k3sm` gate runs `-race`. No network or real privilege in unit tests — fake at
   seams (interfaces). Integration/e2e tests are build-tagged and live separately.
+- A root check in an integration-tagged test goes through `k3smtest.SkipUnless(t, k3smtest.Root)`
+  (`k3sm.io/apis`), never a hand-rolled `os.Geteuid()` gate; `darwin-net`'s gate fails on a raw
+  `Geteuid` there.
 
 ## Dependencies
 - Keep the graph minimal. `go mod tidy` before every commit. Pin versions; no `@latest` in committed go.mod.
@@ -109,12 +112,16 @@ go test ./...               # passes (run -race too; the k3sm gate does)
 hack/verify-boilerplate.sh  # every .go file carries the Apache-2.0 header
 go mod tidy                 # no diff
 staticcheck -tests=false ./...  # clean (pinned version below)
+hack/verify-deps.sh         # module graph matches hack/deps.lock, cooldown, OSV (needs network)
+govulncheck ./...           # clean (pinned version below)
 ```
 
 **staticcheck is pinned**, and this line is where the pin lives:
 `go install honnef.co/go/tools/cmd/staticcheck@2026.2.1`. Every repo's `hack/ci.sh` carries the
 same version as its `STATICCHECK_VERSION` constant and goes red when the installed binary is
 missing or reports any other version, because a different staticcheck reports different findings.
+govulncheck is pinned the same way, at `golang.org/x/vuln/cmd/govulncheck@v1.9.0`, in each repo's
+`GOVULNCHECK_VERSION`.
 - **Scope**: `-tests=false` checks non-test code only. Each repo's `hack/ci.sh` says why at the stage.
 - **Suppressions**: one syntax, on the line before the finding:
   `//lint:ignore <Check> <reason>`. A reason is required. `//nolint:...` is golangci-lint's
