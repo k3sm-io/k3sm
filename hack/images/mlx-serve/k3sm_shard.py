@@ -52,13 +52,17 @@ exits 1.
 Standard library only: the image carries the engine's closure and nothing else.
 """
 
+import hashlib
 import importlib
 import inspect
+import io
 import json
 import os
 import socket
 import sys
+import textwrap
 import time
+import tokenize
 import urllib.error
 import urllib.request
 
@@ -340,6 +344,31 @@ ENGINE_HOOKS = (
 )
 
 
+# The normalized source of mlx_lm.server.run in mlx-lm 0.32.0, which
+# install_alias's run copies. A bump that changes run's body must re-derive the
+# copy; the selftest's staged-tree rung compares this against the engine the
+# image carries. Not checked at pod start: it needs the engine's .py source.
+ENGINE_RUN_SHA256 = "fe245246598aa896f0299795f7fc0f12a05d022f36f9a9b9eae4dfa47590e01a"
+
+
+def source_shape(func):
+    """sha256 of func's source with comments, blank lines and layout removed."""
+    src = textwrap.dedent(inspect.getsource(func))
+    skip = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+            tokenize.ENCODING, tokenize.ENDMARKER}
+    toks = [t.string for t in tokenize.generate_tokens(io.StringIO(src).readline) if t.type not in skip]
+    return hashlib.sha256(" ".join(toks).encode()).hexdigest()
+
+
+def check_run_shape(server):
+    """Raise ShardError unless server.run is the 0.32.0 body install_alias copies."""
+    got = source_shape(server.run)
+    if got != ENGINE_RUN_SHA256:
+        raise ShardError(f"{ENGINE_MODULE}.run is not the mlx-lm 0.32.0 body the served-name alias copies "
+                         f"(source sha256 {got}, pinned {ENGINE_RUN_SHA256}): re-derive install_alias's run from "
+                         f"the new source, then pin the new hash in ENGINE_RUN_SHA256")
+
+
 def check_engine_hooks(server):
     """Raise ShardError naming the first hook the engine module lacks."""
     for path, params in ENGINE_HOOKS:
@@ -364,16 +393,18 @@ def install_alias(server, served):
     """Make the engine module serve its --model under the name served.
 
     Replaces server.ModelProvider and server.run, which main() looks up when it
-    runs. With served None the engine behaves as stock mlx_lm.server.
-    Returns (provider class, handler class, run) for the tests.
+    runs. With served None nothing is checked or replaced: the engine is stock
+    mlx_lm.server. Returns (provider class, handler class, run) as installed.
     """
+    if served is None:
+        return server.ModelProvider, server.APIHandler, server.run
     check_engine_hooks(server)
 
     class AliasedModelProvider(server.ModelProvider):
         """Maps the served name to the model already loaded."""
 
         def load(self, model_path, adapter_path=None, draft_model_path=None):
-            if served is not None and model_path == served:
+            if model_path == served:
                 model_path = ENGINE_DEFAULT_MODEL
             return super().load(model_path, adapter_path, draft_model_path)
 
@@ -381,8 +412,6 @@ def install_alias(server, served):
         """Lists the served name, and only it, on /v1/models."""
 
         def handle_models_request(self):
-            if served is None:
-                return super().handle_models_request()
             parts = self.path.split("?", 1)[0].split("/")
             wanted = "/".join(parts[3:]) if len(parts) > 3 else None
             models = []

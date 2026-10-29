@@ -136,8 +136,12 @@ naming `spec.model` is served by the model already loaded. This hooks four
 `mlx_lm.server` internals (`ModelProvider.load`,
 `APIHandler.handle_models_request`, `run` and `_run_http_server`). The rank
 checks each one against the shape mlx-lm 0.32.0 gives it and exits, naming the
-hook, if one is missing or has changed. The selftest checks the same hooks on a
-staged tree.
+hook, if one is missing or has changed. Without `--served-model-name` nothing
+is hooked and the engine runs as stock `mlx_lm.server`. On a staged tree the
+selftest checks the same hooks, checks that the real `run` is the 0.32.0 body
+the replacement copies (`ENGINE_RUN_SHA256`; an mlx-lm bump that changes it
+re-derives the copy and the hash), and compares the real `/v1/models` answer
+with the aliased one.
 
 `k3sm_shard --probe` is the rank-0 liveness probe: a one-token completion
 against the local server every 60 seconds, to catch a collective that hung
