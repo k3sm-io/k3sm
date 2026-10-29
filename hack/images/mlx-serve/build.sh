@@ -68,8 +68,8 @@ SERVE_HOST="0.0.0.0"
 HF_HOME_PATH="/models"
 
 # The sharded-rank entrypoint module (k3sm_shard.py beside this script). A
-# sharded MLXModel's rank Pods run it instead of the ENTRYPOINT; it execs
-# mlx_lm.server, which the engine's closure already carries.
+# sharded MLXModel's rank Pods run it instead of the ENTRYPOINT; it runs
+# mlx_lm.server, which the engine's closure already carries, in its own process.
 SHARD_MODULE="k3sm_shard"
 # The single-node entrypoint module (k3sm_serve.py beside this script). It runs
 # the engine's own CLI (vllm_mlx.cli) in-process with the same argv, after

@@ -95,7 +95,7 @@ A sharded `MLXModel` (one that sets `spec.distributed`) runs one Pod per rank,
 and every rank runs this same image with a different command:
 
 ```
-/bin/python3.12 -m k3sm_shard --model <ref> [spec.runtime.args...]
+/bin/python3.12 -m k3sm_shard --model <ref> --served-model-name <spec.model> [spec.runtime.args...]
 ```
 
 The sharded engine is **`mlx-lm`'s server** (`mlx_lm.server`), which the
@@ -104,7 +104,7 @@ has no multi-node support, so the image's `ENTRYPOINT` stays the single-node
 server and only the operator's sharded render overrides the command. A sharded
 model is one logical replica; rank 0 alone serves HTTP.
 
-`k3sm_shard` does name resolution and `exec`, nothing else. It reads the
+`k3sm_shard` does name resolution, then runs the engine in its own process. It reads the
 environment the operator renders (`MLX_RANK`, `MLX_WORLD_SIZE`,
 `MLX_METAL_FAST_SYNCH`, `K3SM_MLX_BACKEND`, `K3SM_MLX_PARALLELISM`,
 `K3SM_MLX_RANKS`, `K3SM_MLX_PORT`, `K3SM_MLX_SERVE_PORT`, for `jaccl`
@@ -123,8 +123,21 @@ writable path under the pod's sandbox profile):
 | `ring` | `MLX_HOSTFILE`: `[["<podIP>:<port>"], ...]`, one entry per rank | |
 | `jaccl` | `MLX_IBV_DEVICES`: the per-rank RDMA device matrix, `null` for self | `MLX_JACCL_COORDINATOR=<rank 0 podIP>:<port>` |
 
-It then execs `mlx_lm.server --host 0.0.0.0 --port <serve port>`, adding
-`--pipeline` for pipeline parallelism, with its own arguments last.
+It then runs `mlx_lm.server --host 0.0.0.0 --port <serve port>` in the same
+process, adding `--pipeline` for pipeline parallelism, with its own arguments
+last.
+
+`mlx_lm.server` has no `--served-model-name`, so `k3sm_shard` takes that option
+itself and does not pass it on. Without it a pinned model, whose `--model` is
+the snapshot path in the cache volume, would list that path on `/v1/models`,
+and a request naming `spec.model` would make every rank load the model again
+from the Hub cache. With it, `/v1/models` lists `spec.model` alone and a request
+naming `spec.model` is served by the model already loaded. This hooks four
+`mlx_lm.server` internals (`ModelProvider.load`,
+`APIHandler.handle_models_request`, `run` and `_run_http_server`). The rank
+checks each one against the shape mlx-lm 0.32.0 gives it and exits, naming the
+hook, if one is missing or has changed. The selftest checks the same hooks on a
+staged tree.
 
 `k3sm_shard --probe` is the rank-0 liveness probe: a one-token completion
 against the local server every 60 seconds, to catch a collective that hung
