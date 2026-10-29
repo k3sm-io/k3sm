@@ -102,11 +102,11 @@ func provisionServerCluster(ctx context.Context, plan serverPlan, restCfg *rest.
 // the re-evaluation of its gated add-ons. It runs right after provisionServerCluster.
 //
 // SSA-converge the EMBEDDED add-on manifest set. The manifests are
-// compiled into this binary (embed.FS), never read from disk: the work dir is
-// writable by every pod (all pods share the _k3sm uid and it is outside runtimed's
-// sandbox-protected prefixes) and this client is the system:masters admin, so a
-// directory ingress would hand cluster-admin to every pod on the node. See
-// pkg/addons/doc.go. Runs AFTER the fail-closed RBAC graph so a slow or failing
+// compiled into this binary (embed.FS), never read from disk: the work dir belongs to
+// the _k3sm uid every pod shares, so ownership is no barrier, and only runtimed's
+// Seatbelt profile keeps a confined pod out of it; this client is the system:masters
+// admin, so a directory ingress would hand cluster-admin to any process running as the
+// service user. See pkg/addons/doc.go. Runs AFTER the fail-closed RBAC graph so a slow or failing
 // add-on can never delay it. The reconciler never lists; its only delete withdraws,
 // by name, an add-on it applied earlier that can no longer serve here.
 // Log-and-continue like the sibling boot provisioners, by the repo's one rule for a
