@@ -33,6 +33,7 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -58,6 +59,9 @@ const (
 	// applies). A node at the cap may hold an image it does not list, so its
 	// absence from cachedOn proves nothing.
 	nodeStatusImageCap = 50
+	// streamProgressInterval is the least time between two progress lines
+	// of -o ndjson while tags are being described.
+	streamProgressInterval = 250 * time.Millisecond
 )
 
 // registryReport says which registry a report is about and whether it answered.
@@ -178,6 +182,9 @@ func imageRegistryCommand(ctx context.Context, o imageOptions, out io.Writer, en
 	nodes, err := env.kube.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
+	}
+	if o.subcommand == "ls" && o.output == "ndjson" {
+		return streamImageList(ctx, out, env, nodes.Items)
 	}
 	listing, regErr := listRegistry(ctx, env)
 	reg := registryReport{Name: canonicalRegistry, Reachable: regErr == nil}
@@ -469,6 +476,118 @@ func (reg openedRegistry) read(ctx context.Context, hooks listHooks) ([]registry
 	}
 	wg.Wait()
 	return images, progress, firstErr
+}
+
+// The lines of `k3sm image ls -o ndjson`, one JSON object per line, each
+// naming its type: start first, then progress and image lines as the listing
+// runs, then end, or error when the listing fails after it started.
+type (
+	imageLineStart struct {
+		Type          string         `json:"type"`
+		SchemaVersion int            `json:"schemaVersion"`
+		Registry      registryReport `json:"registry"`
+	}
+	imageLineProgress struct {
+		Type string `json:"type"`
+		listProgress
+	}
+	imageLineImage struct {
+		Type string `json:"type"`
+		imageRow
+	}
+	imageLineEnd struct {
+		Type               string   `json:"type"`
+		Images             int      `json:"images"`
+		CachedOnIncomplete []string `json:"cachedOnIncomplete"`
+		Migration          any      `json:"migration"`
+	}
+	imageLineError struct {
+		Type  string `json:"type"`
+		Error string `json:"error"`
+	}
+)
+
+// lineWriter writes one JSON line per call, in one Write, flushing a writer
+// that buffers, so a reader sees each line as soon as it is written.
+type lineWriter struct{ out io.Writer }
+
+func (w lineWriter) line(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if _, err := w.out.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	if f, ok := w.out.(interface{ Flush() error }); ok {
+		return f.Flush()
+	}
+	return nil
+}
+
+// fail writes the error line and returns err, so the command exits non-zero.
+func (w lineWriter) fail(err error) error {
+	_ = w.line(imageLineError{Type: "error", Error: err.Error()}) // err is what the caller reports either way
+	return err
+}
+
+// streamImageList is `k3sm image ls -o ndjson`: the listing as it runs, an
+// image line per tag as its describe completes, in completion order. An
+// unreachable registry is a start line saying so and an end line, exit 0, as
+// in -o json; a failure after the registry answered is an error line and a
+// non-zero exit. The Pods are read once, before any tag is described.
+func streamImageList(ctx context.Context, out io.Writer, env imageRegistryEnv, nodes []corev1.Node) error {
+	w := lineWriter{out: out}
+	reg, regErr := openRegistry(ctx, env)
+	start := imageLineStart{Type: "start", SchemaVersion: imageReportSchemaVersion,
+		Registry: registryReport{Name: canonicalRegistry, Reachable: regErr == nil}}
+	if regErr != nil {
+		start.Registry.Error = regErr.Error()
+	}
+	if err := w.line(start); err != nil {
+		return err
+	}
+	end := imageLineEnd{Type: "end", CachedOnIncomplete: incompleteNodes(nodes)}
+	if regErr != nil {
+		return w.line(end)
+	}
+	pl, err := env.kube.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return w.fail(fmt.Errorf("list pods: %w", err))
+	}
+	var sent listProgress
+	var sentAt time.Time
+	progress := func(p listProgress) error {
+		sent, sentAt = p, time.Now()
+		return w.line(imageLineProgress{Type: "progress", listProgress: p})
+	}
+	if err := progress(listProgress{Repositories: len(reg.repos)}); err != nil {
+		return err
+	}
+	_, final, err := reg.read(ctx, listHooks{
+		repositoryRead: progress,
+		tagRead: func(p listProgress, img *registryclient.Image) error {
+			if img != nil {
+				end.Images++
+				if err := w.line(imageLineImage{Type: "image", imageRow: imageRowFor(*img, nodes, pl.Items, reg.aliases)}); err != nil {
+					return err
+				}
+			}
+			if time.Since(sentAt) >= streamProgressInterval {
+				return progress(p)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return w.fail(err)
+	}
+	if final != sent {
+		if err := progress(final); err != nil {
+			return err
+		}
+	}
+	return w.line(end)
 }
 
 // imageRowFor joins one registry image against where it is cached and which

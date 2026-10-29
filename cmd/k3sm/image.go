@@ -48,7 +48,7 @@ Usage: k3sm image pull <reference> [flags]
        k3sm image import <oci-layout.tar> [flags]
        k3sm image push <oci-layout-dir|reference> <registry-reference> [flags]
        k3sm image prune [flags]
-       k3sm image ls [-o json] [flags]
+       k3sm image ls [-o json|ndjson] [flags]
        k3sm image df [-o json] [flags]
        k3sm image migrate [--report] [-o json]   (copy this node's images into the cluster registry once; sudo on a worker)
 
@@ -135,6 +135,18 @@ ls      list the images in the cluster's one registry (the server's), each
         no root and no daemon socket, only a kubeconfig that can read Nodes,
         Pods and the local-registry-hosting ConfigMap. An unreachable registry
         is reported (reachable: false, with the error) and still exits 0.
+        -o ndjson streams the listing as it runs, one JSON object per line,
+        each with a "type": first {"type":"start","schemaVersion":1,
+        "registry":{"name","reachable"[,"error"]}}; then
+        {"type":"progress","repositories","repositoriesRead","tags",
+        "tagsRead"} after each repository's tag list (tags is the running
+        total, growing until every list is read) and at most every 250ms
+        while tags are read; {"type":"image",...} per tag as it is read,
+        with the fields of an element of -o json's images, in completion
+        order; and last {"type":"end","images","cachedOnIncomplete",
+        "migration"}. An unreachable registry is a start line saying so,
+        then end, exit 0; a failure after the registry answered is
+        {"type":"error","error"} and a non-zero exit, with no end line.
 df      show the registry's size (its distinct blobs) and each node's image
         cache as its status.images reports it. Same reads as ls.
 
@@ -380,7 +392,11 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		if o.output == "" {
 			return o, errors.New("save requires -o <file.tar>: the archive is written to a file you name, never to the terminal")
 		}
-	case "inspect", "prune", "ls", "df":
+	case "ls":
+		if o.output != "" && o.output != "json" && o.output != "ndjson" {
+			return o, fmt.Errorf("-o %q: ls renders a table by default, `json` or `ndjson` (one JSON line per image as it is read) on request", o.output)
+		}
+	case "inspect", "prune", "df":
 		if o.output != "" && o.output != "json" {
 			return o, fmt.Errorf("-o %q: %s renders a table by default and `json` on request", o.output, o.subcommand)
 		}

@@ -456,6 +456,7 @@ publishes.
 ```sh
 k3sm image ls             # every tag, where it is cached, and how many Pods use it
 k3sm image ls -o json     # the same, as a versioned document
+k3sm image ls -o ndjson   # the same, one JSON line per image as it is read
 k3sm image df             # the registry's size and each node's image cache
 k3sm image df -o json
 ```
@@ -471,6 +472,23 @@ nodes under `cachedOnIncomplete`.
 If the registry does not answer, both commands still exit 0: the table says it is unreachable, and
 the JSON document carries `"reachable": false` with the error. `df` then still reports the node
 caches.
+
+### Streaming the list: `-o ndjson`
+
+`k3sm image ls -o ndjson` writes the listing while it runs, one JSON object per line, so a program
+can show progress and fill a list before a large registry has been read. Every line has a `type`:
+
+| `type` | When | Fields |
+|---|---|---|
+| `start` | first | `schemaVersion` (1), `registry` (`name`, `reachable`, and `error` when it is unreachable) |
+| `progress` | after each repository's tag list is read, and at most every 250 ms while tags are read | `repositories`, `repositoriesRead`, `tags`, `tagsRead`; `tags` is the running total and grows until every repository's list is read |
+| `image` | as each tag is read, in the order the reads finish | the fields of one element of `images` in `-o json`: `repository`, `tag`, `reference`, `digest`, `platforms`, `sizeBytes`, `pods`, `cachedOn` |
+| `end` | last | `images` (how many image lines were written), `cachedOnIncomplete`, `migration` |
+| `error` | instead of `end`, when the listing fails after the registry answered | `error` |
+
+An unreachable registry is a `start` line with `"reachable": false`, then `end`, and the command
+exits 0, as with `-o json`. After an `error` line the command exits non-zero. Image lines arrive in
+completion order; sort them yourself.
 
 ## Next
 
