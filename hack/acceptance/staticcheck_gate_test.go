@@ -161,6 +161,9 @@ func TestK3smCIGateRunsPinnedStaticcheck(t *testing.T) {
 			env := staticcheckSandboxEnv(t, tc.versionLine, marker)
 			extra := map[string]string{
 				"zzpkg/zz.go": licensed(t, script, "package zzpkg\n\n// Answer is here only so the package is non-empty.\nfunc Answer() int { return 42 }\n"),
+				// The test-sleep lint checks the allowlist against this tree,
+				// which has no tests; the real repo's entries would all be stale.
+				"hack/test-sleeps.allow": "# count: 0\n",
 			}
 			out, ok := sandboxCIEnv(t, script, goModOK, extra, env)
 
@@ -228,6 +231,8 @@ func staticcheckSandboxEnv(t *testing.T, versionLine, marker string) []string {
 		{"bash", true}, {"env", true}, {"dirname", true}, {"go", true}, {"gofmt", true},
 		{"git", true}, {"python3", true}, {"grep", true}, {"mktemp", true}, {"rm", true},
 		{"cat", true},
+		// hack/verify-test-sleeps.sh, the test-sleep lint stage.
+		{"find", true}, {"sort", true}, {"awk", true}, {"date", true}, {"mkdir", true}, {"sed", true},
 		// The cgo toolchain, when the host has one (ci.sh builds CGO_ENABLED=1).
 		{"cc", false}, {"clang", false}, {"xcrun", false},
 	}
