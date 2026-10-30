@@ -49,11 +49,71 @@ type Registry struct {
 	// method but GET and HEAD is refused 405.
 	AcceptWrites bool
 
-	mu      sync.Mutex
-	repos   map[string]*repo
-	uploads map[string][]byte // upload id -> bytes so far
-	nextID  int
-	writes  []Write
+	// OmitHeadDigest, when set, answers a manifest HEAD without the
+	// Docker-Content-Digest header, the way a registry that does not report
+	// it would.
+	OmitHeadDigest bool
+
+	// HeadDigest, when set, is the Docker-Content-Digest a manifest HEAD
+	// reports instead of the true one, the way a lying or racing registry
+	// would.
+	HeadDigest string
+
+	mu       sync.Mutex
+	repos    map[string]*repo
+	uploads  map[string][]byte // upload id -> bytes so far
+	nextID   int
+	writes   []Write
+	requests map[RequestClass]int
+}
+
+// The request classes Requests counts by.
+const (
+	ClassCatalog        = "catalog"
+	ClassTags           = "tags"
+	ClassManifestTag    = "manifest-by-tag"
+	ClassManifestDigest = "manifest-by-digest"
+	ClassBlob           = "blob"
+	ClassOther          = "other"
+)
+
+// RequestClass is a request's method and the kind of endpoint it named.
+type RequestClass struct {
+	Method string
+	Class  string
+}
+
+// Requests returns how many requests of method to the class of endpoint the
+// registry has served (any answer, found or not).
+func (r *Registry) Requests(method, class string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.requests[RequestClass{Method: method, Class: class}]
+}
+
+// ResetRequests zeroes the request counts.
+func (r *Registry) ResetRequests() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.requests = map[RequestClass]int{}
+}
+
+// classify names the kind of endpoint path is.
+func classify(path string) string {
+	switch {
+	case path == "/v2/_catalog":
+		return ClassCatalog
+	case strings.HasSuffix(path, "/tags/list"):
+		return ClassTags
+	case strings.Contains(path, "/manifests/"):
+		if strings.HasPrefix(path[strings.LastIndex(path, "/manifests/")+len("/manifests/"):], "sha256:") {
+			return ClassManifestDigest
+		}
+		return ClassManifestTag
+	case strings.Contains(path, "/blobs/"):
+		return ClassBlob
+	}
+	return ClassOther
 }
 
 // Write is one write the registry took: Op is "mount" (a blob mounted from
@@ -109,7 +169,9 @@ type stored struct {
 }
 
 // New returns an empty registry.
-func New() *Registry { return &Registry{repos: map[string]*repo{}, uploads: map[string][]byte{}} }
+func New() *Registry {
+	return &Registry{repos: map[string]*repo{}, uploads: map[string][]byte{}, requests: map[RequestClass]int{}}
+}
 
 func (r *Registry) repo(name string) *repo {
 	rp, ok := r.repos[name]
@@ -176,6 +238,15 @@ func (r *Registry) Index(repository, tag string, children ...registryclient.Desc
 	return d
 }
 
+// StoreManifestAt stores body as repository's manifest under digest without
+// checking that it hashes to it, so a test can serve content that does not
+// match the digest it is read by.
+func (r *Registry) StoreManifestAt(repository, digest, mediaType string, body []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.repo(repository).manifests[digest] = stored{mediaType: mediaType, body: body}
+}
+
 // Handler serves the registry's read endpoints, and its write endpoints when
 // AcceptWrites is set.
 func (r *Registry) Handler() http.Handler {
@@ -183,6 +254,9 @@ func (r *Registry) Handler() http.Handler {
 }
 
 func (r *Registry) serve(w http.ResponseWriter, req *http.Request) {
+	r.mu.Lock()
+	r.requests[RequestClass{Method: req.Method, Class: classify(req.URL.Path)}]++
+	r.mu.Unlock()
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		if !r.AcceptWrites {
 			http.Error(w, "read-only", http.StatusMethodNotAllowed)
@@ -233,8 +307,17 @@ func (r *Registry) serve(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", m.mediaType)
-		w.Header().Set("Docker-Content-Digest", ref)
+		switch {
+		case req.Method == http.MethodHead && r.OmitHeadDigest:
+		case req.Method == http.MethodHead && r.HeadDigest != "":
+			w.Header().Set("Docker-Content-Digest", r.HeadDigest)
+		default:
+			w.Header().Set("Docker-Content-Digest", ref)
+		}
 		w.Header().Set("Content-Length", strconv.Itoa(len(m.body)))
+		if req.Method == http.MethodHead {
+			return
+		}
 		_, _ = w.Write(m.body)
 	case strings.Contains(path, "/blobs/"):
 		i := strings.LastIndex(path, "/blobs/")

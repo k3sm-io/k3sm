@@ -26,10 +26,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -319,6 +321,29 @@ func (c *Client) Manifest(ctx context.Context, repository, reference string) (Ma
 	return m, nil
 }
 
+// ManifestDigest asks the registry, with a HEAD and the Accept header a
+// manifest read sends, which digest tag names in repository. It returns ""
+// when the registry answers without a well-formed sha256 Docker-Content-Digest:
+// the caller then reads the manifest to learn it. Nothing is verified here,
+// because nothing is read; a digest it returns is checked when the content it
+// names is read.
+func (c *Client) ManifestDigest(ctx context.Context, repository, tag string) (string, error) {
+	if !ValidRepository(repository) {
+		return "", fmt.Errorf("invalid repository name %q", repository)
+	}
+	if !ValidTag(tag) {
+		return "", fmt.Errorf("invalid tag %q", tag)
+	}
+	resp, _, err := c.do(ctx, http.MethodHead, c.endpoint("/v2/"+repository+"/manifests/"+tag), acceptManifests, 0)
+	if err != nil {
+		return "", fmt.Errorf("head manifest %s:%s: %w", repository, tag, err)
+	}
+	if d := resp.Header.Get(contentDigestHeader); digestPattern.MatchString(d) {
+		return d, nil
+	}
+	return "", nil
+}
+
 // ConfigPlatform reads an image config blob and returns the platform it
 // records. The blob is re-hashed against its digest.
 func (c *Client) ConfigPlatform(ctx context.Context, repository string, config Descriptor) (Platform, error) {
@@ -378,18 +403,23 @@ func (c *Client) Describe(ctx context.Context, repository, tag string) (Image, e
 // concurrent use.
 type Describer struct {
 	c *Client
+	// cache, when set, keeps what each top-level digest describes across
+	// listings.
+	cache DescriptionCache
 	// mu guards reads; each entry is filled once, by the first caller, while
 	// the others wait on its done channel.
 	mu    sync.Mutex
 	reads map[string]*memoRead
 }
 
-// memoRead is one remembered read: a manifest or a config platform.
+// memoRead is one remembered read: a manifest, a config platform, or what a
+// top-level digest describes.
 type memoRead struct {
-	done     chan struct{}
-	manifest Manifest
-	platform Platform
-	err      error
+	done        chan struct{}
+	manifest    Manifest
+	platform    Platform
+	description Description
+	err         error
 }
 
 // NewDescriber returns a Describer over c.
@@ -397,10 +427,87 @@ func (c *Client) NewDescriber() *Describer {
 	return &Describer{c: c, reads: map[string]*memoRead{}}
 }
 
+// NewCachedDescriber returns a Describer over c that keeps what each tag's
+// digest describes in cache, so a later listing reads only each tag's digest
+// (a HEAD) and describes the digests it has not seen. A digest names
+// immutable, verified content, so a description stays true for as long as the
+// digest exists; the tag-to-digest mapping is never cached.
+func (c *Client) NewCachedDescriber(cache DescriptionCache) *Describer {
+	d := c.NewDescriber()
+	d.cache = cache
+	return d
+}
+
 // Describe is Client.Describe, with the reads by digest remembered. The tag's
-// own manifest is always read afresh: a tag is a name, not content.
+// digest is always read afresh: a tag is a name, not content.
 func (d *Describer) Describe(ctx context.Context, repository, tag string) (Image, error) {
-	return d.c.describe(ctx, d, repository, tag)
+	if d.cache == nil {
+		return d.c.describe(ctx, d, repository, tag)
+	}
+	digest, err := d.c.ManifestDigest(ctx, repository, tag)
+	if errors.Is(err, ErrNotFound) {
+		return Image{}, err
+	}
+	var top *Manifest
+	if err != nil || digest == "" {
+		// The HEAD failed or named no digest: read the tag's manifest, which
+		// says what it is.
+		m, err := d.c.Manifest(ctx, repository, tag)
+		if err != nil {
+			return Image{}, err
+		}
+		digest, top = m.Digest, &m
+	}
+	desc, err := d.describeDigest(ctx, repository, tag, digest, top)
+	if err != nil {
+		return Image{}, err
+	}
+	img := Image{
+		Repository: repository,
+		Tag:        tag,
+		Digest:     desc.Digest,
+		SizeBytes:  desc.SizeBytes,
+		Blobs:      maps.Clone(desc.Blobs),
+	}
+	if len(desc.Platforms) > 0 {
+		img.Platforms = slices.Clone(desc.Platforms)
+	}
+	return img, nil
+}
+
+// describeDigest returns what repository@digest describes: from the cache
+// when it holds a valid entry, else by reading it (top, when the caller read
+// it already) and its children, storing the result. Once per listing per
+// digest.
+func (d *Describer) describeDigest(ctx context.Context, repository, tag, digest string, top *Manifest) (Description, error) {
+	e := d.once("image "+repository+"@"+digest, func(e *memoRead) {
+		if desc, ok := d.cache.Load(repository, digest); ok && desc.valid(digest) {
+			e.description = desc
+			return
+		}
+		if top == nil {
+			m, err := d.c.manifest(ctx, d, repository, digest)
+			if err != nil {
+				e.err = err
+				return
+			}
+			top = &m
+		}
+		img := Image{Repository: repository, Tag: tag, Digest: top.Digest, Blobs: map[string]int64{}}
+		content := map[string]int64{}
+		if err := d.c.walk(ctx, d, repository, *top, nil, 0, &img, content); err != nil {
+			e.err = err
+			return
+		}
+		for _, size := range content {
+			img.SizeBytes += size
+		}
+		e.description = Description{Digest: img.Digest, Platforms: img.Platforms, SizeBytes: img.SizeBytes, Blobs: img.Blobs}
+		// A description the cache cannot keep is described again next time;
+		// this listing's answer is the same either way.
+		_ = d.cache.Store(repository, digest, e.description)
+	})
+	return e.description, e.err
 }
 
 // once runs read for key unless another caller already has, and returns the
@@ -574,7 +681,13 @@ func (c *Client) endpoint(path string) *url.URL {
 // get performs one anonymous GET and reads at most limit bytes of body. A
 // non-200 answer is an error; 404 and 401/403 map to the sentinels.
 func (c *Client) get(ctx context.Context, u *url.URL, accept string, limit int64) (*http.Response, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	return c.do(ctx, http.MethodGet, u, accept, limit)
+}
+
+// do performs one anonymous request and, for a GET, reads at most limit bytes
+// of body. A non-200 answer is an error; 404 and 401/403 map to the sentinels.
+func (c *Client) do(ctx context.Context, method string, u *url.URL, accept string, limit int64) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -593,6 +706,9 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, limit int64
 		return nil, nil, ErrUnauthorized
 	case resp.StatusCode != http.StatusOK:
 		return nil, nil, fmt.Errorf("registry answered %s", resp.Status)
+	}
+	if method == http.MethodHead {
+		return resp, nil, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {

@@ -23,11 +23,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -128,6 +130,9 @@ type imageRegistryEnv struct {
 	// transport replaces the registry client's HTTP transport; nil in
 	// production.
 	transport http.RoundTripper
+	// cacheRoot is the directory the listing keeps its description cache
+	// under, one subdirectory per registry host. Empty keeps no cache.
+	cacheRoot string
 }
 
 // newImageRegistryEnv resolves the cluster the way `k3sm status` does, over the
@@ -161,7 +166,7 @@ func imageRegistryEnvFrom(primary, user func() (status.Kube, string, error)) (im
 	if err != nil {
 		return imageRegistryEnv{}, fmt.Errorf("parse the apiserver URL %q: %w", rk.cfg.Host, err)
 	}
-	env := imageRegistryEnv{kube: rk.client, apiHost: u.Hostname()}
+	env := imageRegistryEnv{kube: rk.client, apiHost: u.Hostname(), cacheRoot: imageCacheRoot()}
 	ca := rk.cfg.TLSClientConfig.CAData
 	if len(ca) == 0 && rk.cfg.TLSClientConfig.CAFile != "" {
 		if ca, err = os.ReadFile(rk.cfg.TLSClientConfig.CAFile); err != nil {
@@ -175,6 +180,27 @@ func imageRegistryEnvFrom(primary, user func() (status.Kube, string, error)) (im
 		}
 	}
 	return env, nil
+}
+
+// imageCacheRoot is where the listing keeps its description cache, the
+// invoking account's cache directory, or "" (no cache).
+func imageCacheRoot() string { return imageCacheRootFor(os.Geteuid(), os.UserCacheDir) }
+
+// imageCacheRootFor is imageCacheRoot for the effective uid euid. A root run
+// keeps no cache: under sudo the cache directory follows the invoking user's
+// HOME, so root would create and rename files through paths that user
+// controls, and leave root-owned directories the user's own runs cannot use.
+func imageCacheRootFor(euid int, userCacheDir func() (string, error)) string {
+	if euid == 0 {
+		slog.Debug("image listing keeps no description cache when run as root")
+		return ""
+	}
+	dir, err := userCacheDir()
+	if err != nil {
+		slog.Debug("image listing keeps no description cache", "err", err)
+		return ""
+	}
+	return filepath.Join(dir, "k3sm", "registry")
 }
 
 // imageRegistryCommand runs ls or df.
@@ -316,6 +342,8 @@ type openedRegistry struct {
 	c       *registryclient.Client
 	repos   []string
 	aliases map[string]bool
+	// cache keeps tag descriptions across listings; nil keeps none.
+	cache registryclient.DescriptionCache
 }
 
 // openRegistry finds the registry the cluster publishes and reads its
@@ -345,6 +373,15 @@ func openRegistry(ctx context.Context, env imageRegistryEnv) (openedRegistry, er
 		return openedRegistry{}, fmt.Errorf("registry at %s: %w", c.Host(), err)
 	}
 	reg := openedRegistry{c: c, aliases: registryAliases(doc)}
+	if env.cacheRoot != "" {
+		// A cache that cannot be created (a read-only home) only costs this
+		// listing its reuse: every tag is described, as with no cache.
+		if dc, err := registryclient.OpenDirCache(env.cacheRoot, c.Host()); err != nil {
+			slog.Debug("image listing keeps no description cache", "err", err)
+		} else {
+			reg.cache = dc
+		}
+	}
 	for _, r := range repos {
 		if registryclient.ValidRepository(r) {
 			reg.repos = append(reg.repos, r)
@@ -378,14 +415,19 @@ type listHooks struct {
 // read reads every repository's tag list and describes every tag, all
 // concurrently: a tag is described as soon as its repository's list is read,
 // with at most registryclient.MaxConcurrentReads requests in flight, and each
-// manifest or config a digest names is read once for the whole listing. The
-// images come back in completion order. A repository or a tag deleted since
+// manifest or config a digest names is read once for the whole listing. With
+// a description cache, each tag's digest is read with a HEAD and only the
+// digests no earlier listing described are read in full. The images come
+// back in completion order. A repository or a tag deleted since
 // the catalog or its tag list was read is skipped; the first other failure
 // stops the listing and is returned.
 func (reg openedRegistry) read(ctx context.Context, hooks listHooks) ([]registryclient.Image, listProgress, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	describer := reg.c.NewDescriber()
+	if reg.cache != nil {
+		describer = reg.c.NewCachedDescriber(reg.cache)
+	}
 	sem := make(chan struct{}, registryclient.MaxConcurrentReads)
 	// mu guards images, progress and firstErr, and serialises the hooks.
 	var (

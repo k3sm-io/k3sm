@@ -24,6 +24,12 @@ pin, its date, and the tarball's sha256.
   nothing taints the node or evicts a Pod on it. The node's pressure sampler now runs once a
   second from the warn rung up, not only past the half-way marks.
 
+### Changed
+
+- `k3sm image ls` and `k3sm image df` keep a cache of image descriptions by digest under
+  `~/Library/Caches/k3sm/registry`, so a repeat listing of a large registry reads each tag's
+  digest and describes only new content.
+
 ### Fixed
 
 - `k3sm image tag`, `untag`, `inspect` and `save` now refuse `--socket`, as `ls` and `df` do,

@@ -473,6 +473,12 @@ If the registry does not answer, both commands still exit 0: the table says it i
 the JSON document carries `"reachable": false` with the error. `df` then still reports the node
 caches.
 
+Both commands keep what each image digest describes (its platforms, size and blobs) in a cache
+under your account's cache directory, `~/Library/Caches/k3sm/registry/<registry address>/`, so a
+later run reads only each tag's current digest and describes just the digests it has not seen.
+Which digest a tag names is read afresh every run; deleting the directory is always safe. A run
+as root (under `sudo`) keeps no cache.
+
 ### Streaming the list: `-o ndjson`
 
 `k3sm image ls -o ndjson` writes the listing while it runs, one JSON object per line, so a program
