@@ -50,8 +50,8 @@ func TestComputeNodeConditionsPressure(t *testing.T) {
 
 	t.Run("all healthy: every condition explicitly False", func(t *testing.T) {
 		conds := computeNodeConditions(healthy, now)
-		if len(conds) != 4 {
-			t.Fatalf("got %d conditions, want 4: %+v", len(conds), conds)
+		if len(conds) != 5 {
+			t.Fatalf("got %d conditions, want 5: %+v", len(conds), conds)
 		}
 		checkCond(t, conds, corev1.NodeMemoryPressure, corev1.ConditionFalse,
 			"KubeletHasSufficientMemory", "kubelet has sufficient memory available", now)

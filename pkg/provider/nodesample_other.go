@@ -33,3 +33,7 @@ func sampleHostMemory(int64) (int64, error) { return 0, errHostSampleUnsupported
 
 // sampleProcessCount is unsupported off darwin/cgo.
 func sampleProcessCount() (int64, error) { return 0, errHostSampleUnsupported }
+
+// sampleMemorystatus reads nothing off darwin/cgo: both readings are
+// information only, so they are absent rather than an error.
+func sampleMemorystatus() (vmPressureLevel, memorystatusLevel *int64) { return nil, nil }
