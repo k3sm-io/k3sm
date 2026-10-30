@@ -177,6 +177,11 @@ node credential. A server rewrites the admin kubeconfig for `--user`, or without
 the kubeconfig the last install wrote. With nothing installed and no `--user`, it refuses: there is
 nothing to update in place. A plain `sudo k3sm install` makes none of these checks and is unchanged.
 
+The app also updates itself and the cluster. It checks for a newer k3sm.app, and it can move the
+cluster to the k3sm release it carries, bound to that release's checksum with `--pin-sha256`.
+[Upgrade](upgrade.md#updating-from-k3smapp) describes both beside the command-line path, which is
+unchanged, and [Privacy](privacy.md) lists what the check sends.
+
 To remove an install made from the app, run `sudo k3sm uninstall`, or use **Uninstall k3sm…** in the
 app's Settings > Advanced, which keeps the cluster's data unless you tick **Also delete k3sm's
 data**. Dragging the app to the Trash does not remove k3sm: the cluster keeps running.
