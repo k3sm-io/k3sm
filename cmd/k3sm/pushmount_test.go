@@ -18,7 +18,6 @@ package main
 
 import (
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -99,9 +98,8 @@ func TestWithMountScopesFailsClosed(t *testing.T) {
 			reg := registrytest.New()
 			reg.AcceptWrites = true
 			c := &concurrencyWatch{inner: reg.Handler()}
-			srv := httptest.NewServer(c)
-			t.Cleanup(srv.Close)
-			ref, err := name.NewTag(strings.TrimPrefix(srv.URL, "http://") + "/team/myapp:v1")
+			// Served in process (handlerTransport): no socket is opened.
+			ref, err := name.NewTag("registry.invalid:5000/team/myapp:v1", name.Insecure)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -109,7 +107,7 @@ func TestWithMountScopesFailsClosed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			opts, err := withMountScopes(t.Context(), ref, tc.shape(img), []remote.Option{remote.WithContext(t.Context())})
+			opts, err := withMountScopes(t.Context(), ref, tc.shape(img), []remote.Option{remote.WithContext(t.Context()), remote.WithTransport(handlerTransport{c})})
 			if err != nil {
 				t.Fatal(err)
 			}
