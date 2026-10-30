@@ -124,7 +124,7 @@ func mirrorPublicImage(ctx context.Context, src, mirror name.Reference, workDir 
 	if err != nil {
 		return err
 	}
-	desc, err := remote.Get(src, remote.WithContext(ctx), remote.WithAuthFromKeychain(authn.DefaultKeychain))
+	desc, err := remote.Get(src, remote.WithContext(ctx), remote.WithTransport(boundRequests(nil)), remote.WithAuthFromKeychain(authn.DefaultKeychain))
 	if err != nil {
 		return fmt.Errorf("read %s from %s: %w", src, src.Context().RegistryStr(), err)
 	}

@@ -66,7 +66,7 @@ func (d pushDest) options(ctx context.Context, ref name.Reference) ([]remote.Opt
 	if err != nil {
 		return nil, err
 	}
-	return []remote.Option{remote.WithContext(ctx), remote.WithAuth(auth)}, nil
+	return []remote.Option{remote.WithContext(ctx), remote.WithTransport(boundRequests(nil)), remote.WithAuth(auth)}, nil
 }
 
 // pushBuilt is the production imagePusher: it uploads a single-platform build

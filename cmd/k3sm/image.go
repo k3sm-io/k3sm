@@ -24,6 +24,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -159,7 +161,8 @@ type imageOptions struct {
 	subcommand string
 	socket     string
 	force      bool
-	timeout    time.Duration
+	// timeout is the overall deadline; zero (a streaming verb's default) is none.
+	timeout time.Duration
 	// archive is the positional path load/import ingests; empty for every other
 	// subcommand, which take no positional argument at all.
 	archive   string
@@ -205,15 +208,12 @@ type imageOptions struct {
 	workDir string
 }
 
-// Moving image content (load, import, push, pull, save) cannot share the
-// deadline sized for a metadata call: a multi-GB upload to or download from the
-// registry routinely outlives two minutes, and a deadline that fires mid-stream
-// throws away every byte already sent. Both are still one flag — an explicit
-// --timeout always wins.
-const (
-	metadataTimeout  = 2 * time.Minute
-	streamingTimeout = 30 * time.Minute
-)
+// metadataTimeout is the overall deadline of a verb that moves no image
+// content. The verbs that do (load, import, push, pull, save) have none unless
+// --timeout sets one: each of their requests is bounded by requestIdleTimeout
+// instead (imagebound.go), because a fixed deadline cuts a slow transfer that is
+// still moving and makes a stalled one wait it out.
+const metadataTimeout = 2 * time.Minute
 
 // runImage is the `k3sm image` entry point.
 func runImage(args []string) error {
@@ -226,7 +226,9 @@ func runImage(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := imageContext(sigCtx, opts)
 	defer cancel()
 	// ls and df read the cluster's registry, not this node's daemon, so they
 	// dial no socket and need no root.
@@ -238,6 +240,21 @@ func runImage(args []string) error {
 		return imageRegistryCommand(ctx, opts, os.Stdout, env)
 	}
 	return imageCommand(ctx, opts, os.Stdout, dialRuntimed)
+}
+
+// imageContext is the context a parsed verb runs under: parent (cancelled by
+// Ctrl-C) with the --timeout deadline when one applies, and, for a verb that
+// moves image content, the per-request idle bound every registry request and
+// the daemon's export stream honour.
+func imageContext(parent context.Context, o imageOptions) (context.Context, context.CancelFunc) {
+	ctx, cancel := parent, context.CancelFunc(func() {})
+	if o.timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, o.timeout)
+	}
+	if streamingSubcommands[o.subcommand] {
+		ctx = withRequestIdle(ctx, requestIdleTimeout)
+	}
+	return ctx, cancel
 }
 
 // registryOnlyVerbs are the verbs that read or write only the cluster registry
@@ -283,7 +300,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// out.tar` fails before anything is dialled.
 	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the registry's documents instead of the table; prune: json, for one document with both halves; ls, df: json")
 	fs.StringVar(&o.output, "output", "", "alias for -o")
-	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call (load, import, push, pull and save default to 30m — they stream image content)")
+	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call; load, import, push, pull and save have none by default, and abandon a request only when it moves no byte for "+requestIdleTimeout.String())
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -409,20 +426,15 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 			return o, fmt.Errorf("%s does not take -o (save writes an archive to it; inspect, prune, ls and df choose a rendering with it)", o.subcommand)
 		}
 	}
-	// The streaming default applies only when the operator did not choose. Visit
-	// reports flags actually set across both Parse calls, so it distinguishes
-	// "--timeout 2m" from "left alone".
-	timeoutSet := false
-	fs.Visit(func(fl *flag.Flag) {
-		if fl.Name == "timeout" {
-			timeoutSet = true
-		}
-	})
-	if !timeoutSet && streamingSubcommands[o.subcommand] {
-		o.timeout = streamingTimeout
-	}
-	if o.timeout <= 0 {
+	// The streaming verbs have no overall deadline unless the operator chose
+	// one. Visit reports flags actually set across both Parse calls, so it
+	// distinguishes "--timeout 2m" from "left alone".
+	timeoutSet := flagWasSet(fs, "timeout")
+	if timeoutSet && o.timeout <= 0 {
 		return o, fmt.Errorf("--timeout must be positive, got %v", o.timeout)
+	}
+	if !timeoutSet && streamingSubcommands[o.subcommand] {
+		o.timeout = 0
 	}
 	return o, nil
 }
@@ -432,9 +444,10 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 const imageSubcommands = "pull, tag, untag, inspect, save, load, import, push, prune, ls, df"
 
 // streamingSubcommands are the verbs that move image content rather than
-// metadata, and so inherit the streaming deadline when the operator did not
-// choose one. A deadline sized for a metadata call fires mid-transfer and
-// throws away every byte already moved.
+// metadata: they carry no overall deadline unless the operator chose one, and
+// each of their requests is bounded by its own idle window instead. A deadline
+// sized for a metadata call fires mid-transfer and throws away every byte
+// already moved.
 var streamingSubcommands = map[string]bool{
 	"load": true, "import": true, "push": true, "pull": true, "save": true,
 }

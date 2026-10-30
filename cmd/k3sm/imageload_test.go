@@ -299,10 +299,10 @@ func TestImageLoadRefusesBeforeUpload(t *testing.T) {
 			if o.archive != archive {
 				t.Errorf("%s archive = %q; want %q", sub, o.archive, archive)
 			}
-			if o.timeout <= lsOpts.timeout {
-				t.Errorf("%s default timeout %v is not longer than ls's %v", sub, o.timeout, lsOpts.timeout)
+			if o.timeout != 0 {
+				t.Errorf("%s default timeout = %v; want none (each request is idle-bounded instead)", sub, o.timeout)
 			}
-			// An explicit flag still wins — the streaming default is a default.
+			// An explicit flag still sets an overall deadline.
 			explicit, err := parseImageArgs([]string{sub, archive, "--timeout", "45s"}, io.Discard)
 			if err != nil {
 				t.Fatalf("parse %s --timeout: %v", sub, err)
