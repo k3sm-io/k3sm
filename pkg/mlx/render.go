@@ -529,14 +529,15 @@ func podResources(memory resource.Quantity) corev1.ResourceRequirements {
 //
 //   - A pin needs a cache volume (ErrRevisionNeedsCache). Without one this render
 //     sets no HF_HOME, so it does not know the path it would have to name.
-//   - A pin does NOT self-populate. The path is loaded, not fetched: on a cache
-//     that has never held this revision the engine finds no such directory and —
-//     by inference from the reference implementation's resolution order, not from
-//     a measurement — falls back to treating the path as a repository id, which
-//     it is not, and fails loudly at start. Pin the revision AND stage the
-//     weights (hack/acceptance/m8.sh does), or leave the revision empty and let
-//     the engine download. Loud is the deliberate half of this: the alternative
-//     shape, silently serving the default branch, is unnoticeable.
+//   - The engine loads the path; it never fetches it. The serving image's
+//     entrypoint (hack/images/mlx-serve/k3sm_serve.py, seed_pinned_revision)
+//     does: it reads the repository and revision back out of this path and
+//     fetches that revision into the cache before the engine starts, so a pin
+//     populates a fresh volume. It refuses at start, naming the revision, when
+//     the fetch fails on a volume that does not hold the snapshot or when the
+//     revision resolves to a different commit (a branch or tag name). The
+//     path's shape is therefore a contract with that entrypoint, not only with
+//     the engine: TestRenderSeedsPinnedRevision runs the rendered argv through it.
 func modelReference(spec mlxv1alpha1.MLXModelSpec) (string, error) {
 	if spec.Revision == "" {
 		return spec.Model, nil

@@ -48,11 +48,8 @@
 # underlying PersistentVolume is Retained by the local-path class, so the weights
 # on disk are reclaimed by hand, deliberately.
 #
-# The pinned revision is loaded from the cache volume, never fetched into it. On a
-# volume that has never held it, seed the weights first (for example with a
-# one-off Job that runs the engine's download for that revision against the bound
-# cache claim; docs/user/mlx-quickstart.md step 2 has the alternatives), or leave
-# revision empty for the first start.
+# The first start fetches the pinned revision into the cache volume, so it takes
+# a while on a fresh volume; later starts load it from there.
 #
 #   kubectl apply -f examples/mlxmodel.yaml
 #   kubectl get mlxmodel qwen3-06b -w
