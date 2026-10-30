@@ -38,10 +38,18 @@ func FuzzParseName(f *testing.F) {
 		f.Add(s)
 	}
 	root := filepath.FromSlash("/store/root")
+	for _, s := range lookalikes {
+		f.Add(s)
+	}
 	f.Fuzz(func(t *testing.T, s string) {
 		n, err := ParseName(s)
 		if err != nil {
 			return
+		}
+		for i := 0; i < len(s); i++ {
+			if !nameByte(s[i]) {
+				t.Fatalf("accepted %q with byte %#x", s, s[i])
+			}
 		}
 		if n.String() != s || len(s) > MaxNameLength || strings.ToLower(s) != s {
 			t.Fatalf("accepted %q", s)

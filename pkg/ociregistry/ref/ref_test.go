@@ -85,6 +85,40 @@ func TestParseName(t *testing.T) {
 	}
 }
 
+// lookalikes are names a case-folding or Unicode-normalising volume could map
+// onto an accepted ASCII name, or that differ from one only invisibly.
+var lookalikes = []string{
+	"\uff41pp",                      // fullwidth a
+	"\u0430pp",                      // Cyrillic a
+	"\u212a8s",                      // KELVIN SIGN, folds to k
+	"caf\u00e9",                     // NFC e-acute
+	"cafe\u0301",                    // NFD e + combining acute
+	"app ",                          // trailing space
+	"app.",                          // trailing dot
+	"app/",                          // trailing slash
+	"apP",                           // uppercase
+	"a/" + strings.Repeat("b", 254), // one component past the total cap
+	strings.Repeat("c", 256),
+	"app\u200b",  // zero-width space
+	"\u0131mage", // dotless i, uppercases to I
+	"\u017fha",   // long s, folds to s
+}
+
+func TestParseNameRefusesLookalikes(t *testing.T) {
+	for _, s := range lookalikes {
+		if n, err := ParseName(s); !errors.Is(err, ErrInvalidName) {
+			t.Errorf("ParseName(%q) = %v, %v; want ErrInvalidName", s, n, err)
+		}
+	}
+	for i := 0; i < 256; i++ {
+		s := "a" + string(rune(i)) + "b"
+		_, err := ParseName(s)
+		if err == nil && !nameByte(byte(i)) {
+			t.Errorf("ParseName accepted byte %#x", i)
+		}
+	}
+}
+
 func TestParseReference(t *testing.T) {
 	hex64 := strings.Repeat("ab", 32)
 	cases := []struct {

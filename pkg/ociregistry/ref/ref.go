@@ -119,6 +119,14 @@ func ParseName(s string) (Name, error) {
 	if err != nil || reference.Domain(named) != anchorDomain || reference.Path(named) != s {
 		return Name{}, fmt.Errorf("%w: %q", ErrInvalidName, s)
 	}
+	// The grammar above is the reference library's; the guarantee the
+	// mapping's injectivity rests on (no byte a case-insensitive or
+	// normalising volume could fold) is asserted here, in this package.
+	for i := 0; i < len(s); i++ {
+		if !nameByte(s[i]) {
+			return Name{}, fmt.Errorf("%w: byte %#x in %q", ErrInvalidName, s[i], s)
+		}
+	}
 	comps := strings.Split(s, "/")
 	for _, c := range comps {
 		if layoutWords[c] || strings.HasPrefix(c, ".") {
@@ -129,6 +137,12 @@ func ParseName(s string) (Name, error) {
 		return Name{}, fmt.Errorf("%w: %q names a file of the store root", ErrReservedName, s)
 	}
 	return Name{s: s}, nil
+}
+
+// nameByte reports whether b may appear in a repository name: lowercase ASCII
+// letters, digits, and the separators '.', '_', '-' and '/'.
+func nameByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '.' || b == '_' || b == '-' || b == '/'
 }
 
 // String returns the name as it is spelled on the wire.
