@@ -109,7 +109,7 @@ func applyGPUAdvertisement(n *corev1.Node, facts *runtimev1.GPUFacts) {
 // pure and nil-safe (the proto getters are), so the fail-closed verdict is unit-tested
 // without a live runtimed.
 func gpuAdvertisable(facts *runtimev1.GPUFacts) bool {
-	return facts.GetMetalAvailable() && facts.GetSandboxGpuSupported()
+	return mlx.GPUAdvertisable(facts)
 }
 
 // gpuLabelValue gates a derived label value on the advertisement verdict, returning

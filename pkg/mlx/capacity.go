@@ -112,6 +112,16 @@ func GPUCeilingBytes(f *runtimev1.GPUFacts) int64 {
 	}
 }
 
+// GPUAdvertisable reports whether facts justify advertising a GPU on this
+// node: a usable Metal device AND a sandbox backend that can grant a pod GPU
+// access. Neither implies the other, so either alone is a fail-open
+// mislabel. It is pure and nil-safe (the proto getters are). This is the one
+// home of the verdict: the node advertiser and the budget capacity both
+// call it, so the two never disagree about whether the node has a GPU.
+func GPUAdvertisable(f *runtimev1.GPUFacts) bool {
+	return f.GetMetalAvailable() && f.GetSandboxGpuSupported()
+}
+
 // GPUSlots reports how many units of mlx.k3sm.io/gpu this node advertises, from
 // its usable GPU memory ceiling: one slot per whole GPUSlotFloorBytes of
 // ceiling, at least 1, at most MaxGPUSlots.
