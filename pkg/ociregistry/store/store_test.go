@@ -74,7 +74,7 @@ func extractFixture(t *testing.T) string {
 			t.Fatal(err)
 		}
 		p := filepath.Join(root, filepath.FromSlash(h.Name))
-		if rel, err := filepath.Rel(root, p); err != nil || strings.HasPrefix(rel, "..") {
+		if rel, err := filepath.Rel(root, p); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			t.Fatalf("fixture entry %q escapes the root", h.Name)
 		}
 		mode := os.FileMode(h.Mode).Perm()
@@ -103,7 +103,11 @@ func extractFixture(t *testing.T) string {
 				t.Fatal(err)
 			}
 		case tar.TypeLink:
-			if err := os.Link(filepath.Join(root, filepath.FromSlash(h.Linkname)), p); err != nil {
+			target := filepath.Join(root, filepath.FromSlash(h.Linkname))
+			if rel, err := filepath.Rel(root, target); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				t.Fatalf("fixture link %q -> %q escapes the root", h.Name, h.Linkname)
+			}
+			if err := os.Link(target, p); err != nil {
 				t.Fatal(err)
 			}
 		default:

@@ -31,7 +31,16 @@ limitations under the License.
 // so a rollback finds them. A blob already present in another repository is
 // shared by hardlink, never copied, and a blob file is never modified once in
 // place: a link that would replace one keeps the existing file instead
-// (link-or-keep), because the inode is shared across repositories.
+// (link-or-keep), because the inode is shared across repositories. "Keep"
+// is verified: an existing destination is kept only after its content hashes
+// to the blob's digest. One that does not is replaced by a link of the
+// verified source under a temp name in the same directory and a rename over
+// it, so the bad inode is left unchanged for whoever else links it. A link is
+// made by path only after re-checking that the path still names the inode
+// that was hashed, and every upload session operation re-checks, after taking
+// the session's flock, that the path names the opened inode and that inode has
+// a single link; a session committed or cancelled meanwhile is gone, so a
+// late chunk can never reach a published blob.
 //
 // Writes are durable in order: a blob is F_FULLFSYNCed before it is linked
 // into blobs/, and index.json is written to a temp file under .uploads,

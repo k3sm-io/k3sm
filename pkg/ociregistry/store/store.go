@@ -49,6 +49,9 @@ const (
 	fileMode    = 0o600
 	dirMode     = 0o700
 	maxIndexLen = 64 << 20
+	// MaxManifestSize is the largest manifest body the store reads: the
+	// registry's 4 MiB manifest cap.
+	MaxManifestSize = 4 << 20
 )
 
 // layoutBody is oci-layout's content, as zot writes it.
@@ -85,6 +88,9 @@ type Store struct {
 	state string
 	// now is the clock blob mtimes are touched with (a seam for tests).
 	now func() time.Time
+	// uploadOpened, when set, runs between an upload session's open and its
+	// flock (a seam for tests that interleave two session operations).
+	uploadOpened func(id string)
 }
 
 // Open opens the store rooted at root, with server state under state. It
@@ -296,6 +302,9 @@ func (s *Store) Manifest(n ref.Name, r ref.Reference) (ispec.Descriptor, []byte,
 	d, err := s.Resolve(n, r)
 	if err != nil {
 		return ispec.Descriptor{}, nil, err
+	}
+	if d.Size < 0 || d.Size > MaxManifestSize {
+		return ispec.Descriptor{}, nil, fmt.Errorf("manifest %s in %s: size %d is outside 0..%d", d.Digest, n, d.Size, MaxManifestSize)
 	}
 	p, err := s.blobPath(n, d.Digest)
 	if err != nil {
