@@ -589,6 +589,94 @@ def clamp_max_kv_size(argv, environ, parse=None, load_config=None, say=None):
     return _set_max_kv_size(argv, clamped, parse)
 
 
+HF_HOME_ENV = "HF_HOME"
+HUB_DIR = "hub"
+REPO_FOLDER_PREFIX = "models--"
+SNAPSHOTS_DIR = "snapshots"
+
+
+class SeedError(Exception):
+    """A pinned revision could not be put in the cache; the message says why."""
+
+
+def pinned_snapshot(model, environ):
+    """(repo_id, revision, hub) when model is a pinned snapshot path, else None.
+
+    k3sm renders a pinned revision as <HF_HOME>/hub/models--<repo>/snapshots/<rev>
+    (pkg/mlx modelReference), because the engine has no revision option. The
+    repository id is the folder name with the prefix dropped and "--" turned
+    back into "/", the inverse of the Hub cache's own naming; a repository id
+    cannot contain "--", so the inverse is exact. Any other model reference,
+    including a path outside HF_HOME's hub cache, is not k3sm's pin and is
+    left alone.
+    """
+    home = environ.get(HF_HOME_ENV, "")
+    if not model or not home:
+        return None
+    hub = os.path.normpath(os.path.join(home, HUB_DIR))
+    path = os.path.normpath(model)
+    snapshots, revision = os.path.split(path)
+    folder_path, snapshots_name = os.path.split(snapshots)
+    parent, folder = os.path.split(folder_path)
+    if snapshots_name != SNAPSHOTS_DIR or parent != hub or not folder.startswith(REPO_FOLDER_PREFIX):
+        return None
+    repo_id = folder[len(REPO_FOLDER_PREFIX):].replace("--", "/")
+    if not repo_id or not revision:
+        return None
+    return repo_id, revision, hub
+
+
+def _hub_download(repo_id, revision, cache_dir):
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(repo_id, revision=revision, cache_dir=cache_dir)
+
+
+def seed_pinned_revision(argv, environ, parse=None, download=None, say=None):
+    """Fetch a pinned revision into the cache volume before the engine loads it.
+
+    The engine loads a pinned snapshot path; it never fetches one. So when the
+    model is k3sm's pinned path, the revision is fetched here with
+    huggingface_hub.snapshot_download into the hub cache that path lives in,
+    which lands it at exactly that path. The fetch runs on every start: on a
+    complete snapshot it moves no weights, and it finishes a snapshot an
+    earlier start left half-written. If the fetch fails and the snapshot is
+    already on the volume (a restart with no network), the engine is started
+    on it with one line said; if the snapshot is not there, SeedError, so the
+    pod fails at start naming the revision. A revision the Hub resolves to a
+    different commit (a branch or tag name) is refused: the pin is the commit.
+
+    The cache directory is taken relative to the working directory when the
+    mount point is materialized there, as a native pod's volume mount is: the
+    path-rebase shim rewrites the mounted prefix, and the Hub client resolves
+    /var to /private/var before it creates directories, which would leave the
+    prefix behind. Elsewhere the absolute path is used.
+    """
+    parse = parse or engine_serve_args
+    download = download or _hub_download
+    say = say or (lambda line: print(line, file=sys.stderr, flush=True))
+    model, _ = parse(argv)
+    pin = pinned_snapshot(model, environ)
+    if pin is None:
+        return
+    repo_id, revision, hub = pin
+    mount = "." + os.path.dirname(os.path.normpath(environ[HF_HOME_ENV]))
+    local = os.path.isdir(mount)
+    cache_dir = "." + hub if local else hub
+    snapshot = "." + os.path.normpath(model) if local else os.path.normpath(model)
+    try:
+        landed = download(repo_id, revision, cache_dir)
+    except Exception as e:  # any Hub failure: serve a staged snapshot, else refuse
+        if os.path.isdir(snapshot):
+            say(f"k3sm-serve: fetch {repo_id} at {revision} failed ({e}); serving the snapshot already in the cache")
+            return
+        raise SeedError(f"fetch {repo_id} at revision {revision} into {hub}: {e}") from None
+    if os.path.basename(os.path.normpath(str(landed))) != revision or not os.path.isdir(snapshot):
+        raise SeedError(f"revision {revision} of {repo_id} resolved to {os.path.basename(str(landed))}; "
+                        "pin the full commit hash, a branch or tag name moves")
+    say(f"k3sm-serve: {repo_id} at revision {revision} is in the cache")
+
+
 def rotating_cache_classes():
     """The RotatingKVCache classes the image's engine builds caches from.
 
@@ -630,6 +718,11 @@ def main(argv=None):
         if CONTINUOUS_BATCHING not in argv:
             print(f"k3sm-serve: {CONTINUOUS_BATCHING} is required: the context guard runs on the batched engine, "
                   "and without it the engine serves one request at a time", file=sys.stderr, flush=True)
+            return 2
+        try:
+            seed_pinned_revision(argv, os.environ)
+        except SeedError as e:
+            print(f"k3sm-serve: {e}", file=sys.stderr, flush=True)
             return 2
         argv = clamp_max_kv_size(argv, os.environ)
         try:

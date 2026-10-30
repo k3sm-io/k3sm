@@ -68,10 +68,10 @@ k3sm points it at that revision's directory **inside the cache volume** instead:
 
 - `revision` requires `cache`. Without a cache volume there is no such directory, and the model is
   rejected up front with an `InvalidSpec` reason rather than served from the moving default branch.
-- A pinned revision is loaded from the cache, not fetched into it. On a volume that has never held this
-  model, leave `revision` empty for the first start (the engine downloads the default branch), or stage
-  the weights into the volume first, for example with a one-off Job that runs the engine's download for
-  that revision against the bound claim. Delete the Job before the pod restarts onto the weights.
+- On a volume that has never held this revision, the serving image fetches it into the cache before the
+  engine starts. Pin the full commit hash: a branch or tag name is refused at start, because it moves.
+  If the fetch fails and the revision is not already in the volume, the pod exits naming the revision
+  and retries on restart; once it is in the volume, a restart without network serves it from there.
 
 `quantization` is rejected today, because the engine has no expression for it and serving a different
 variant than the one asked for would look like success. Name the quantized repository in `model`
@@ -79,8 +79,7 @@ instead. `mlx-community/Qwen3-0.6B-4bit` already does.
 
 ## 3. Watch It Become Ready
 
-The first start downloads the weights, which can take a while on a cold cache. If `revision` is
-pinned, the weights must already be in the volume (above). Read the **conditions**, not the `PHASE`
+The first start downloads the weights, which can take a while on a cold cache. Read the **conditions**, not the `PHASE`
 column. `PHASE` is a one-word summary for humans and loses information:
 
 ```sh
@@ -140,8 +139,8 @@ That removes the serving workload, both Services, and the cache PVC. The underly
 - Because it runs natively, a served model shares the `_k3sm` trust domain with the other native Pods on
   that Mac. Serve **models and code you trust**; see [Limitations](limitations.md).
 - Weights never live in the image. They are downloaded on first start into the cache volume, so give
-  that volume room for the model you are serving. A pinned `revision` is loaded from that volume rather
-  than downloaded into it (see step 2).
+  that volume room for the model you are serving. A pinned `revision` is downloaded into that volume
+  the same way, once (see step 2).
 - Sharded serving is [experimental](README.md#what-experimental-means): an alpha, for trusted tenancy only, and not yet run on hardware.
   A model may set `spec.distributed` (`ranks`, `backend`, `parallelism`), and the operator places
   the ranks as gang-scheduled rank Pods with per-rank DNS and reports placement and link health in

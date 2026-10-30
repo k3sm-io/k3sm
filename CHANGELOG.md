@@ -14,6 +14,9 @@ pin, its date, and the tarball's sha256.
 
 - `k3sm image tag`, `untag`, `inspect` and `save` now refuse `--socket`, as `ls` and `df` do,
   instead of silently ignoring a flag they never use.
+- An `MLXModel` with a pinned `revision` now starts on a fresh cache volume: the mlx-serve image
+  fetches that revision into the cache before the engine loads it, so the weights no longer have
+  to be staged by hand first. A branch or tag name in `revision` is refused at start.
 
 ## v0.2.3 — 2026-10-29
 

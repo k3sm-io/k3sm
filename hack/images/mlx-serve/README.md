@@ -76,6 +76,18 @@ figure is `K3SM_KV_BYTES_PER_TOKEN`, `K3SM_MODEL_CONFIG_DIR` names a directory
 to read `config.json` from instead, and `K3SM_KV_GEOMETRY_CLAMP=off` disables
 the clamp. Selftest rung 8 checks it against fake configs.
 
+A pinned revision reaches the engine as its snapshot path in the cache volume,
+`<HF_HOME>/hub/models--<org>--<name>/snapshots/<revision>`, because the engine
+has no revision option, and the engine only loads that path. So before the
+clamp, `k3sm_serve` reads the repository and revision back out of the path and
+fetches that revision into the same hub cache with
+`huggingface_hub.snapshot_download`, on every start: a complete snapshot moves
+no weights, and a half-written one is finished. A failed fetch serves the
+snapshot if the volume already holds it, and otherwise exits 2 naming the
+revision; a revision the Hub resolves to another commit (a branch or tag name)
+exits 2 too. A model reference that is not such a path is left to the engine.
+`TestRenderSeedsPinnedRevision` in `pkg/mlx` runs the rendered argv through it.
+
 ## Files
 
 | file | what it is |
