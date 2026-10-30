@@ -78,8 +78,14 @@ func stubServer(t *testing.T, h http.Handler) *rest.Config {
 type handlerTransport struct{ h http.Handler }
 
 func (t handlerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	sr := r
+	// A server always hands its handler a non-nil Body; a client request may carry none.
+	if sr.Body == nil {
+		sr = r.Clone(r.Context())
+		sr.Body = http.NoBody
+	}
 	rec := httptest.NewRecorder()
-	t.h.ServeHTTP(rec, r)
+	t.h.ServeHTTP(rec, sr)
 	resp := rec.Result()
 	resp.Request = r
 	return resp, nil

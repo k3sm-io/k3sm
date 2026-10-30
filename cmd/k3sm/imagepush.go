@@ -156,6 +156,9 @@ func pushImage(ctx context.Context, ref name.Reference, img ggcrv1.Image, dest p
 	if err != nil {
 		return err
 	}
+	if opts, err = withMountScopes(ctx, ref, img, opts); err != nil {
+		return pushError(ref, err)
+	}
 	if err := remote.Write(ref, img, opts...); err != nil {
 		return pushError(ref, err)
 	}
@@ -173,6 +176,9 @@ func pushIndex(ctx context.Context, ref name.Reference, idx ggcrv1.ImageIndex, d
 	opts, err := dest.options(ctx, ref)
 	if err != nil {
 		return err
+	}
+	if opts, err = withMountScopes(ctx, ref, idx, opts); err != nil {
+		return pushError(ref, err)
 	}
 	if err := remote.WriteIndex(ref, idx, opts...); err != nil {
 		return pushError(ref, err)

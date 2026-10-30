@@ -17,6 +17,10 @@ pin, its date, and the tarball's sha256.
 - An `MLXModel` with a pinned `revision` now starts on a fresh cache volume: the mlx-serve image
   fetches that revision into the cache before the engine loads it, so the weights no longer have
   to be staged by hand first. A branch or tag name in `revision` is refused at start.
+- The cluster registry's push gate accepts the `origin` parameter crane, ko and other
+  go-containerregistry clients add to a cross-repository blob mount, which it refused. The
+  parameter grants nothing and is dropped; the mount is authorized on both repositories as
+  before.
 
 ## v0.2.3 — 2026-10-29
 
