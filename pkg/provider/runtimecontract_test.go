@@ -19,7 +19,7 @@ package provider
 import (
 	"testing"
 
-	"k3sm.io/apis/k3smtest"
+	"k3sm.io/apis/k3smtest/runtimecontract"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -29,8 +29,8 @@ import (
 // repository). A provider test that passes against a fake breaking the
 // contract would prove nothing about the daemon.
 func TestRuntimeContract(t *testing.T) {
-	k3smtest.RunRuntimeContract(t, k3smtest.RuntimeContract{
-		Client: k3smtest.ServeRuntime(t, newFakeRuntimeServer()),
+	runtimecontract.RunRuntimeContract(t, runtimecontract.RuntimeContract{
+		Client: runtimecontract.ServeRuntime(t, newFakeRuntimeServer()),
 		Pod: func(id string) *runtimev1.PodBox {
 			return &runtimev1.PodBox{
 				PodId:      id,
