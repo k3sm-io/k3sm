@@ -279,11 +279,11 @@ func checkInstallTLSSANs(raw []string, meshIP, serviceCIDR string) ([]string, er
 
 // checkServerTLSSANs is the server-start judgement of --tls-san, against the
 // server's Service range serviceCIDR, on every topology (meshIP is "" on a
-// single-node server). An invalid name is refused. An IP this Mac no longer holds
+// single-node server; nodeIP is the server's --node-ip). An invalid name is refused. An IP this Mac no longer holds
 // (DHCP moved it) is a Warn and still issued: a recorded operator choice must
 // never crash-loop the control plane. The final set, with nodeName, is logged
 // once at Info.
-func checkServerTLSSANs(raw []string, meshIP, nodeName, serviceCIDR string, logger *slog.Logger) error {
+func checkServerTLSSANs(raw []string, meshIP, nodeIP, nodeName, serviceCIDR string, logger *slog.Logger) error {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -298,7 +298,7 @@ func checkServerTLSSANs(raw []string, meshIP, nodeName, serviceCIDR string, logg
 	for _, ip := range foreign {
 		logger.Warn("--tls-san names an address this Mac does not hold now; issuing it anyway, so clients dialling it reach nothing until it returns", "tls-san", ip.String())
 	}
-	dns, ips, err := apiServerServingSANs(meshIP, nodeName, raw)
+	dns, ips, err := apiServerServingSANs(meshIP, nodeIP, nodeName, raw)
 	if err != nil {
 		return err
 	}
@@ -323,15 +323,34 @@ func nodeNameSAN(nodeName string) (string, error) {
 	return v, nil
 }
 
+// nodeIPSAN is the IP the serving certificate carries for the server's node
+// address: nodeIP canonicalised to IPv4 where it is one, or nil when it does
+// not parse or names no single remote-reachable host (loopback, which the fixed
+// set already carries, unspecified, multicast or link-local).
+func nodeIPSAN(nodeIP string) net.IP {
+	ip := net.ParseIP(nodeIP)
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() {
+		return nil
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4
+	}
+	return ip
+}
+
 // apiServerServingSANs is the one assembly of the apiserver serving
 // certificate's names, on every topology. DNS: the fixed in-cluster set
 // (apiServerFixedDNS) and the canonical node name (nodeNameSAN; a name it
 // refuses is left out). IPs: the mesh IP only when meshIP parses (a single-node
-// server has none, and a nil IP is never appended), loopback, and the
-// kubernetes Service IP of the server's Service range,
-// install.DefaultServiceCIDR, which `k3sm server` always runs with. Unioned with
-// the --tls-san extras, validated by validateTLSSANs unchanged.
-func apiServerServingSANs(meshIP, nodeName string, extra []string) (dns []string, ips []net.IP, err error) {
+// server has none, and a nil IP is never appended), the node IP when it is a
+// host address (nodeIPSAN), loopback, and the kubernetes Service IP of the
+// server's Service range, install.DefaultServiceCIDR, which `k3sm server` always
+// runs with. Unioned with the --tls-san extras, validated by validateTLSSANs
+// unchanged.
+//
+// The node IP is named because a server without --mesh-ip binds the apiserver
+// to it, and the in-process kubeconfigs dial that bind address.
+func apiServerServingSANs(meshIP, nodeIP, nodeName string, extra []string) (dns []string, ips []net.IP, err error) {
 	svc, err := parseServiceCIDR(install.DefaultServiceCIDR)
 	if err != nil {
 		return nil, nil, err
@@ -345,6 +364,9 @@ func apiServerServingSANs(meshIP, nodeName string, extra []string) (dns []string
 			mesh = mesh4
 		}
 		ips = append(ips, mesh)
+	}
+	if node := nodeIPSAN(nodeIP); node != nil && !slices.ContainsFunc(ips, node.Equal) {
+		ips = append(ips, node)
 	}
 	for _, ip := range reservedTLSSANIPs(svc) {
 		if ip != nil && !slices.ContainsFunc(ips, ip.Equal) {

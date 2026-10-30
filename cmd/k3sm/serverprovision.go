@@ -246,7 +246,7 @@ func preflightServer(opts *serverOptions, workDirErr error, logger *slog.Logger)
 	// --tls-san: an invalid name is refused here, after the maintenance exits
 	// above so a bad name never blocks them, on every topology; an IP this Mac no
 	// longer holds is only warned about (checkServerTLSSANs).
-	if err := checkServerTLSSANs(opts.tlsSANs, opts.meshIP, opts.nodeName, install.DefaultServiceCIDR, logger); err != nil {
+	if err := checkServerTLSSANs(opts.tlsSANs, opts.meshIP, opts.nodeIP, opts.nodeName, install.DefaultServiceCIDR, logger); err != nil {
 		return nil, mode, true, err
 	}
 	// runtimed's on-disk root is the work-dir's parent (so the SBPL Posture.WorkDir
@@ -370,7 +370,7 @@ func provisionServingLeaf(opts serverOptions, cfg *executor.Config, logger *slog
 	if err != nil {
 		return fail(fmt.Errorf("ensure CA hierarchy: %w", err))
 	}
-	servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP, opts.nodeName, opts.tlsSANs, logger)
+	servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP, opts.nodeIP, opts.nodeName, opts.tlsSANs, logger)
 	if err != nil {
 		return fail(err)
 	}
