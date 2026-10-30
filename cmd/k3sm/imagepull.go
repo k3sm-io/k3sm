@@ -43,6 +43,13 @@ import (
 // It returns the store entry the daemon resolved, so a caller that acts on the
 // pulled image afterwards names that entry's digest rather than the reference.
 func imagePull(ctx context.Context, client runtimev1.ImagesClient, o imageOptions, out io.Writer) (*runtimev1.Image, error) {
+	// The daemon moves the bytes and reports no progress over this unary call,
+	// so a verb under a per-request idle bound bounds the call as a whole.
+	if requestIdle(ctx) > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, daemonPullCeiling)
+		defer cancel()
+	}
 	resp, err := client.PullImage(ctx, &runtimev1.PullImageRequest{
 		Reference: o.source,
 		Platform:  o.platform,

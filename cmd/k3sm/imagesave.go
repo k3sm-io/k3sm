@@ -227,10 +227,19 @@ func saveImageArchive(ctx context.Context, client runtimev1.ImagesClient, req *r
 // streamSaveImage drains the export stream into w and returns what the terminal
 // frame reported.
 func streamSaveImage(ctx context.Context, client runtimev1.ImagesClient, req *runtimev1.SaveImageRequest, w io.Writer, socket string) (savedArchive, error) {
+	// Under a per-request idle bound the export is abandoned once no frame has
+	// arrived for the window; every frame restarts it.
+	touch := func() {}
+	if idle := requestIdle(ctx); idle > 0 {
+		var w *stallWatch
+		ctx, w = watchStall(ctx, idle)
+		defer w.stop()
+		touch = w.touch
+	}
 	//lint:ignore SA1019 push's node-store source form still exports through SaveImage
 	stream, err := client.SaveImage(ctx, req)
 	if err != nil {
-		return savedArchive{}, imageRPCError("save image", socket, err)
+		return savedArchive{}, saveStreamError(ctx, socket, err)
 	}
 	var (
 		written  int64
@@ -242,8 +251,9 @@ func streamSaveImage(ctx context.Context, client runtimev1.ImagesClient, req *ru
 			break
 		}
 		if rerr != nil {
-			return savedArchive{}, imageRPCError("save image", socket, rerr)
+			return savedArchive{}, saveStreamError(ctx, socket, rerr)
 		}
+		touch()
 		// A mid-transfer failure arrives as a terminal frame carrying the status
 		// AND as the RPC's own error, so a client never has to infer failure from
 		// a stream that merely stopped. Reporting it from the frame gets the
@@ -283,4 +293,14 @@ func streamSaveImage(ctx context.Context, client runtimev1.ImagesClient, req *ru
 		return savedArchive{}, errors.New("save image: the terminal frame reported no digest, so there is nothing to verify the archive against")
 	}
 	return savedArchive{digest: terminal.GetDigest(), bytes: written}, nil
+}
+
+// saveStreamError is the export stream's failure, naming the idle window when
+// that is what ended it.
+func saveStreamError(ctx context.Context, socket string, err error) error {
+	if stalled(ctx) {
+		return fmt.Errorf("save image: the daemon's export stream: %w for %s (the export is abandoned when no frame arrives for that long): %w",
+			errNoProgress, requestIdle(ctx), err)
+	}
+	return imageRPCError("save image", socket, err)
 }

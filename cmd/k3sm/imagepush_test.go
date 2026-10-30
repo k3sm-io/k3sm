@@ -175,10 +175,10 @@ func TestImagePushOCILayout(t *testing.T) {
 		if opts.layoutDir != dir || opts.target != "example.com/app:v1" {
 			t.Errorf("parsed layoutDir=%q target=%q", opts.layoutDir, opts.target)
 		}
-		// An upload streams every blob, so it inherits the streaming deadline
-		// rather than the one sized for a metadata RPC.
-		if opts.timeout != streamingTimeout {
-			t.Errorf("push default timeout = %v, want %v", opts.timeout, streamingTimeout)
+		// An upload streams every blob, so it carries no overall deadline;
+		// each request is idle-bounded instead.
+		if opts.timeout != 0 {
+			t.Errorf("push default timeout = %v, want none", opts.timeout)
 		}
 	})
 

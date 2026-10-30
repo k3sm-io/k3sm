@@ -252,7 +252,7 @@ registry reference, and a Pod on this node with `imagePullPolicy: Never` finds i
 | Format detection | None. The verb is the declaration. A layout handed to `load` (or a docker-save tar handed to `import`) is refused with an error naming the other verb, never sniffed. |
 | Signatures & provenance | Loaded images carry no provenance. This path evaluates no signature policy, because it is an operator-only surface, and what it records is exactly what you handed it. |
 | Requires a running node | Yes. The upload needs this server's registry and its push credential, and the cache pull goes through the node's runtime daemon over its local socket, which is readable only by the daemon's own account. |
-| Deadline | `--timeout` defaults to 30m for these two verbs (they stream a whole archive) and 2m for the metadata verbs. |
+| Deadline | None by default for these two verbs, or for `push`, `pull` and `save`: each registry request is abandoned only after 2m without moving a byte, so a slow transfer that keeps moving is never cut, and Ctrl-C cancels. The pull the node's daemon does itself reports no progress, so it is bounded at 30m. An explicit `--timeout` sets an overall deadline. The metadata verbs default to a 2m deadline. |
 
 ### The Daemon Socket
 

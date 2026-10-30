@@ -150,7 +150,7 @@ func credentialAccess(ctx context.Context, workDir string) (acc registryAccess, 
 	if err != nil {
 		return registryAccess{}, true, err
 	}
-	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithAuth(auth)}}, true, nil
+	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithTransport(boundRequests(nil)), remote.WithAuth(auth)}}, true, nil
 }
 
 // registryReadAccess is how a read (inspect, save, and tag's reads) reaches the
@@ -166,7 +166,7 @@ func registryReadAccess(ctx context.Context, workDir string) (registryAccess, er
 	if authority == "" {
 		return registryAccess{}, fmt.Errorf("%w: this Mac serves no cluster registry (no serving registry record under %s or %s); run this on the server, whose registry it reads anonymously", errNoNodeRegistry, workDir, installedServerWorkDir)
 	}
-	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithTransport(loopbackReadTransport())}}, nil
+	return registryAccess{authority: authority, opts: []remote.Option{remote.WithContext(ctx), remote.WithTransport(boundRequests(loopbackReadTransport()))}}, nil
 }
 
 // loopbackReadTransport is the transport of an anonymous read at the

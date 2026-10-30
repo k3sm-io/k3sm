@@ -293,7 +293,7 @@ func (c gateEndpoint) options(ctx context.Context) ([]remote.Option, error) {
 		ServerName: registrysvc.FlatServiceName,
 	}
 	auth := authn.FromConfig(authn.AuthConfig{Username: builderTokenUser, Password: c.token.value})
-	return []remote.Option{remote.WithContext(ctx), remote.WithTransport(dropMountOrigin{t}), remote.WithAuth(auth)}, nil
+	return []remote.Option{remote.WithContext(ctx), remote.WithTransport(boundRequests(dropMountOrigin{t})), remote.WithAuth(auth)}, nil
 }
 
 // dropMountOrigin removes the "origin" parameter go-containerregistry adds to a
