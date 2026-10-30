@@ -30,6 +30,7 @@ import (
 	"io"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -69,6 +70,9 @@ var (
 	// relative regular file or directory, or a file whose content is not the
 	// kind the manifest declares.
 	ErrPayloadMember = errors.New("certs: the payload holds an unsafe member")
+	// ErrPayloadDestination refuses a destination that is not an empty
+	// directory of this user's, mode 0700, reached without a symlink.
+	ErrPayloadDestination = errors.New("certs: the payload destination is not a fresh private directory")
 	// ErrPayloadTooLarge refuses an archive, an extraction or a member count
 	// over its bound.
 	ErrPayloadTooLarge = errors.New("certs: the payload is over its size bound")
@@ -143,16 +147,26 @@ type payloadLimits struct {
 	archiveBytes   int64
 	extractedBytes int64
 	members        int
+	// headerBytes is the decompressed stream's allowance beyond
+	// extractedBytes.
+	headerBytes int64
 }
 
 var defaultPayloadLimits = payloadLimits{
 	archiveBytes:   MaxPayloadArchiveBytes,
 	extractedBytes: MaxPayloadExtractedBytes,
 	members:        MaxPayloadMembers,
+	headerBytes:    payloadHeaderAllowance,
 }
 
+// payloadHeaderAllowance is what the decompressed stream may carry beyond
+// the members' content: tar headers, PAX records and padding.
+const payloadHeaderAllowance = 64 << 20
+
 // VerifySignedPayload is the k3sm check of a release archive the caller has
-// already copied somewhere only root can write. In order, it:
+// already copied somewhere only root can write. dst must be an empty
+// directory owned by the caller's effective uid, mode 0700, and not a
+// symlink. In order, it:
 //
 //  1. verifies that the signer certificate chains to the cluster CA at
 //     p.Now, carries the Code Signing extended key usage itself and names
@@ -161,11 +175,12 @@ var defaultPayloadLimits = payloadLimits{
 //  2. parses the verified manifest strictly;
 //  3. hashes archive (at most MaxPayloadArchiveBytes) and requires the
 //     manifest's ArchiveSHA256;
-//  4. extracts the gzip tar archive into dst, an existing empty directory,
-//     refusing any symlink, hard link, device or other non-regular member,
+//  4. extracts the gzip tar archive into dst, the decompressed stream
+//     bounded and the context checked on every read, refusing any symlink, hard link, device or other non-regular member,
 //     an absolute or unclean path or a ".." component, a set-id or sticky
 //     bit, a file the manifest does not list, more than MaxPayloadMembers
-//     entries and more than MaxPayloadExtractedBytes in total;
+//     entries, more than MaxPayloadExtractedBytes in total, and a member
+//     over its kind's size bound before any of it is written;
 //  5. re-reads every file now under dst and requires the set to equal the
 //     manifest's members, each with its sha256, each Mach-O member to be a
 //     Mach-O, each version marker a small text file, and each data member at
@@ -179,6 +194,9 @@ func VerifySignedPayload(ctx context.Context, p SignedPayload, archive io.ReadSe
 }
 
 func verifySignedPayload(ctx context.Context, p SignedPayload, archive io.ReadSeeker, dst string, lim payloadLimits) (*PayloadManifest, error) {
+	if err := checkPayloadDestination(dst); err != nil {
+		return nil, err
+	}
 	if err := verifyManifestSignature(p); err != nil {
 		return nil, err
 	}
@@ -309,14 +327,17 @@ func parsePayloadManifest(raw []byte, maxMembers int) (*PayloadManifest, error) 
 	if err := dec.Decode(&m); err != nil {
 		return nil, fmt.Errorf("%w: the manifest is not valid JSON: %w", ErrPayloadManifest, err)
 	}
-	if dec.More() {
-		return nil, fmt.Errorf("%w: the manifest holds more than one JSON value", ErrPayloadManifest)
+	if len(bytes.TrimSpace(raw[dec.InputOffset():])) != 0 {
+		return nil, fmt.Errorf("%w: the manifest holds bytes after its JSON value", ErrPayloadManifest)
+	}
+	if err := refuseDuplicateKeys(raw); err != nil {
+		return nil, err
 	}
 	for _, f := range []struct{ name, val string }{
 		{"version", m.Version}, {"kubeMinor", m.KubeMinor}, {"compatibleFrom", m.CompatibleFrom},
 	} {
 		if !validManifestString(f.val) {
-			return nil, fmt.Errorf("%w: the manifest %s %q is not a version string", ErrPayloadManifest, f.name, f.val)
+			return nil, fmt.Errorf("%w: the manifest %s %s is not a version string", ErrPayloadManifest, f.name, untrusted(f.val))
 		}
 	}
 	if !validSHA256Hex(m.ArchiveSHA256) {
@@ -331,24 +352,24 @@ func parsePayloadManifest(raw []byte, maxMembers int) (*PayloadManifest, error) 
 	seen := make(map[string]bool, len(m.Members))
 	for _, mem := range m.Members {
 		if !cleanMemberPath(mem.Path) {
-			return nil, fmt.Errorf("%w: the manifest member path %q is not a clean relative path", ErrPayloadManifest, mem.Path)
+			return nil, fmt.Errorf("%w: the manifest member path %s is not a clean relative path", ErrPayloadManifest, untrusted(mem.Path))
 		}
 		if seen[mem.Path] {
-			return nil, fmt.Errorf("%w: the manifest lists %s twice", ErrPayloadManifest, mem.Path)
+			return nil, fmt.Errorf("%w: the manifest lists %s twice", ErrPayloadManifest, untrusted(mem.Path))
 		}
 		seen[mem.Path] = true
 		if !validSHA256Hex(mem.SHA256) {
-			return nil, fmt.Errorf("%w: the manifest member %s has no lowercase hex sha256", ErrPayloadManifest, mem.Path)
+			return nil, fmt.Errorf("%w: the manifest member %s has no lowercase hex sha256", ErrPayloadManifest, untrusted(mem.Path))
 		}
 		switch mem.Kind {
 		case PayloadMachO, PayloadData:
 		case PayloadVersionMarker:
 			base := path.Base(mem.Path)
-			if !strings.HasSuffix(base, versionMarkerSuffix) || base == versionMarkerSuffix {
-				return nil, fmt.Errorf("%w: the version marker %s is not named <name>%s", ErrPayloadManifest, mem.Path, versionMarkerSuffix)
+			if path.Dir(mem.Path) != payloadMarkerDir || !strings.HasSuffix(base, versionMarkerSuffix) || base == versionMarkerSuffix {
+				return nil, fmt.Errorf("%w: the version marker %s is not %s/<name>%s", ErrPayloadManifest, untrusted(mem.Path), payloadMarkerDir, versionMarkerSuffix)
 			}
 		default:
-			return nil, fmt.Errorf("%w: the manifest member %s has unknown kind %q", ErrPayloadManifest, mem.Path, mem.Kind)
+			return nil, fmt.Errorf("%w: the manifest member %s has unknown kind %s", ErrPayloadManifest, untrusted(mem.Path), untrusted(string(mem.Kind)))
 		}
 	}
 	// A member path may not also be the directory of another member.
@@ -386,22 +407,108 @@ func validSHA256Hex(s string) bool {
 	return err == nil
 }
 
-// cleanMemberPath reports whether name is a clean relative slash path with no
-// "." or ".." component, no NUL or backslash, within maxPayloadDepth.
+// Bounds on a member path: its length, and the length of one component.
+const (
+	maxMemberPathBytes      = 1024
+	maxMemberComponentBytes = 255
+)
+
+// cleanMemberPath reports whether name is a clean relative slash path of
+// printable ASCII with no backslash and no "." or ".." component, within
+// maxPayloadDepth components, maxMemberPathBytes in all and
+// maxMemberComponentBytes per component.
 func cleanMemberPath(name string) bool {
-	if name == "" || strings.HasPrefix(name, "/") || strings.ContainsAny(name, "\x00\\") || path.Clean(name) != name {
+	if name == "" || len(name) > maxMemberPathBytes || strings.HasPrefix(name, "/") || path.Clean(name) != name {
 		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c < 0x20 || c > 0x7e || c == '\\' {
+			return false
+		}
 	}
 	parts := strings.Split(name, "/")
 	if len(parts) > maxPayloadDepth {
 		return false
 	}
 	for _, c := range parts {
-		if c == "." || c == ".." || c == "" {
+		if c == "." || c == ".." || c == "" || len(c) > maxMemberComponentBytes {
 			return false
 		}
 	}
 	return true
+}
+
+// maxUntrustedQuote bounds how much of an untrusted string an error message
+// carries.
+const maxUntrustedQuote = 200
+
+// untrusted renders s, which came from the archive or the manifest, for an
+// error message: quoted, and cut to maxUntrustedQuote bytes.
+func untrusted(s string) string {
+	if len(s) > maxUntrustedQuote {
+		return strconv.Quote(s[:maxUntrustedQuote]) + "..."
+	}
+	return strconv.Quote(s)
+}
+
+// maxManifestDepth bounds the nesting refuseDuplicateKeys follows.
+const maxManifestDepth = 8
+
+// refuseDuplicateKeys walks the manifest JSON and refuses any object that
+// names a key twice, which encoding/json would otherwise resolve silently to
+// the last value.
+func refuseDuplicateKeys(raw []byte) error {
+	type frame struct {
+		keys      map[string]bool // nil for an array
+		expectKey bool
+	}
+	var stack []*frame
+	valueDone := func() {
+		if n := len(stack); n > 0 && stack[n-1].keys != nil {
+			stack[n-1].expectKey = true
+		}
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("%w: the manifest is not valid JSON: %w", ErrPayloadManifest, err)
+		}
+		if n := len(stack); n > 0 && stack[n-1].keys != nil && stack[n-1].expectKey {
+			top := stack[n-1]
+			if d, ok := tok.(json.Delim); ok && d == '}' {
+				stack = stack[:n-1]
+				valueDone()
+				continue
+			}
+			key, _ := tok.(string)
+			if top.keys[key] {
+				return fmt.Errorf("%w: the manifest names the key %s twice in one object", ErrPayloadManifest, untrusted(key))
+			}
+			top.keys[key] = true
+			top.expectKey = false
+			continue
+		}
+		switch tok {
+		case json.Delim('{'), json.Delim('['):
+			if len(stack) >= maxManifestDepth {
+				return fmt.Errorf("%w: the manifest nests deeper than %d", ErrPayloadManifest, maxManifestDepth)
+			}
+			f := &frame{}
+			if tok == json.Delim('{') {
+				f.keys, f.expectKey = map[string]bool{}, true
+			}
+			stack = append(stack, f)
+		case json.Delim(']'):
+			stack = stack[:len(stack)-1]
+			valueDone()
+		default:
+			valueDone()
+		}
+	}
 }
 
 // checkArchiveDigest hashes at most limit bytes of archive and requires want.

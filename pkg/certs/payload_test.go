@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -76,6 +77,13 @@ type payloadFixture struct {
 	sign     func(manifest []byte) []byte
 	archive  func([]byte) []byte
 	limits   payloadLimits
+	// rawManifest edits the manifest bytes before they are signed.
+	rawManifest func([]byte) []byte
+	// prepDst prepares the destination and returns the path to verify into.
+	prepDst func(t *testing.T, dst string) string
+	// wrap wraps the archive copy the verifier reads; cancel cancels the
+	// verification's context.
+	wrap func(r io.ReadSeeker, cancel context.CancelFunc) io.ReadSeeker
 }
 
 func newPayloadFixture(t *testing.T) *payloadFixture {
@@ -175,6 +183,9 @@ func (f *payloadFixture) run(t *testing.T) (*PayloadManifest, string, error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if f.rawManifest != nil {
+		raw = f.rawManifest(raw)
+	}
 	var sig []byte
 	if f.sign != nil {
 		sig = f.sign(raw)
@@ -204,7 +215,16 @@ func (f *payloadFixture) run(t *testing.T) (*PayloadManifest, string, error) {
 		Manifest:      raw,
 		Signature:     sig,
 	}
-	got, err := verifySignedPayload(context.Background(), p, af, dst, f.limits)
+	if f.prepDst != nil {
+		dst = f.prepDst(t, dst)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var r io.ReadSeeker = af
+	if f.wrap != nil {
+		r = f.wrap(af, cancel)
+	}
+	got, err := verifySignedPayload(ctx, p, r, dst, f.limits)
 	return got, dst, err
 }
 
@@ -572,5 +592,233 @@ func TestVerifySignedPayloadRefusesANonCABundle(t *testing.T) {
 	_, _, err := f.run(t)
 	if !errors.Is(err, ErrPayloadSignature) || !strings.Contains(err.Error(), "not a CA") {
 		t.Fatalf("VerifySignedPayload = %v, want %v for a non-CA certificate", err, ErrPayloadSignature)
+	}
+}
+
+// cancelAfter cancels the verification once the extraction pass (the second
+// read of the archive, after the rewind) has read more than n bytes.
+type cancelAfter struct {
+	io.ReadSeeker
+	cancel  context.CancelFunc
+	n       int64
+	rewound bool
+	read    int64
+}
+
+func (c *cancelAfter) Read(b []byte) (int, error) {
+	k, err := c.ReadSeeker.Read(b)
+	if c.rewound {
+		c.read += int64(k)
+		if c.read > c.n {
+			c.cancel()
+		}
+	}
+	return k, err
+}
+
+func (c *cancelAfter) Seek(off int64, whence int) (int64, error) {
+	c.rewound = true
+	return c.ReadSeeker.Seek(off, whence)
+}
+
+// notWritten fails when the verification left dst/rel on disk.
+func notWritten(rel string) func(t *testing.T, _ *PayloadManifest, dst string) {
+	return func(t *testing.T, _ *PayloadManifest, dst string) {
+		if _, err := os.Lstat(filepath.Join(dst, filepath.FromSlash(rel))); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s was written before the refusal (%v)", rel, err)
+		}
+	}
+}
+
+// TestVerifySignedPayloadBounds covers the bounds on the decompressed
+// stream, the per-kind sizes, the member names, the destination and the
+// manifest encoding.
+func TestVerifySignedPayloadBounds(t *testing.T) {
+	t.Parallel()
+	incompressible := make([]byte, 8<<20)
+	if _, err := rand.Read(incompressible); err != nil {
+		t.Fatal(err)
+	}
+	copy(incompressible, machOBody(""))
+	tests := []struct {
+		name  string
+		edit  func(t *testing.T, f *payloadFixture)
+		want  error
+		check func(t *testing.T, m *PayloadManifest, dst string)
+	}{
+		{
+			name: "decompressed stream over the cap in a long-name header run",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				long := strings.Repeat("a", 256<<10)
+				f.entries = append(f.entries, regEntry(long, machOBody("long")))
+				f.manifest = dropMember(long)
+				f.limits.extractedBytes = 4 << 10
+				f.limits.headerBytes = 64 << 10
+			},
+			want: ErrPayloadTooLarge,
+		},
+		{
+			name: "context cancelled inside a member copy",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.entries = append(f.entries, regEntry("cp-payload/zot", incompressible))
+				f.wrap = func(r io.ReadSeeker, cancel context.CancelFunc) io.ReadSeeker {
+					return &cancelAfter{ReadSeeker: r, cancel: cancel, n: 1 << 20}
+				}
+			},
+			want: context.Canceled,
+			check: func(t *testing.T, _ *PayloadManifest, dst string) {
+				fi, err := os.Lstat(filepath.Join(dst, "cp-payload", "zot"))
+				if err == nil && fi.Size() == int64(len(incompressible)) {
+					t.Errorf("the member was copied in full after the cancel")
+				}
+			},
+		},
+		{
+			name: "data member over 1 MiB",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.entries = append(f.entries, regEntry("NOTICE", bytes.Repeat([]byte("n"), MaxPayloadDataBytes+1)))
+			},
+			want:  ErrPayloadTooLarge,
+			check: notWritten("NOTICE"),
+		},
+		{
+			name: "version marker of 4 KiB",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.entries = append(f.entries, regEntry("cp-payload/zot.version", bytes.Repeat([]byte("v"), maxVersionMarkerBytes)))
+			},
+			want:  ErrPayloadTooLarge,
+			check: notWritten("cp-payload/zot.version"),
+		},
+		{
+			name: "member name with a newline",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.entries = append(f.entries, regEntry("cp-payload/zot\nk3sm", machOBody("zot")))
+				f.manifest = dropMember("cp-payload/zot\nk3sm")
+			},
+			want: ErrPayloadMember,
+		},
+		{
+			name: "member name with a control character",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.entries = append(f.entries, regEntry("cp-payload/zot\x1b[2J", machOBody("zot")))
+				f.manifest = dropMember("cp-payload/zot\x1b[2J")
+			},
+			want: ErrPayloadMember,
+		},
+		{
+			name: "member name component over 255 bytes",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				long := "cp-payload/" + strings.Repeat("z", 256)
+				f.entries = append(f.entries, regEntry(long, machOBody("zot")))
+				f.manifest = dropMember(long)
+			},
+			want: ErrPayloadMember,
+		},
+		{
+			name: "member name over 1024 bytes",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				long := "cp-payload/" + strings.Repeat(strings.Repeat("z", 200)+"/", 5) + strings.Repeat("z", 200)
+				f.entries = append(f.entries, regEntry(long, machOBody("zot")))
+				f.manifest = dropMember(long)
+			},
+			want: ErrPayloadMember,
+		},
+		{
+			name: "destination is a symlink",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.prepDst = func(t *testing.T, dst string) string {
+					link := dst + ".link"
+					if err := os.Symlink(dst, link); err != nil {
+						t.Fatal(err)
+					}
+					return link
+				}
+			},
+			want: ErrPayloadDestination,
+		},
+		{
+			name: "destination not mode 0700",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.prepDst = func(t *testing.T, dst string) string {
+					if err := os.Chmod(dst, 0o755); err != nil {
+						t.Fatal(err)
+					}
+					return dst
+				}
+			},
+			want: ErrPayloadDestination,
+		},
+		{
+			name: "destination not empty",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.prepDst = func(t *testing.T, dst string) string {
+					if err := os.WriteFile(filepath.Join(dst, "stale"), nil, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					return dst
+				}
+			},
+			want: ErrPayloadDestination,
+		},
+		{
+			name: "version marker outside cp-payload",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.entries = append(f.entries, regEntry("k3sm.version", []byte("v0.3.0\n")))
+			},
+			want: ErrPayloadManifest,
+		},
+		{
+			name: "version marker nested below cp-payload",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.entries = append(f.entries, dirEntry("cp-payload/etc/"), regEntry("cp-payload/etc/zot.version", []byte("v2\n")))
+			},
+			want: ErrPayloadManifest,
+		},
+		{
+			name: "trailing bytes after the manifest",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.rawManifest = func(raw []byte) []byte { return append(raw, ']') }
+			},
+			want: ErrPayloadManifest,
+		},
+		{
+			name: "duplicate manifest key",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.rawManifest = func(raw []byte) []byte {
+					return append([]byte(`{"version":"v9.9.9",`), raw[1:]...)
+				}
+			},
+			want: ErrPayloadManifest,
+		},
+		{
+			name: "duplicate key in a manifest member",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.rawManifest = func(raw []byte) []byte {
+					return bytes.Replace(raw, []byte(`{"path":"k3sm",`), []byte(`{"path":"k3sm-execshim","path":"k3sm",`), 1)
+				}
+			},
+			want: ErrPayloadManifest,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newPayloadFixture(t)
+			tc.edit(t, f)
+			m, dst, err := f.run(t)
+			t.Logf("VerifySignedPayload: %v", err)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("VerifySignedPayload = %v, want %v", err, tc.want)
+			}
+			if m != nil {
+				t.Fatalf("VerifySignedPayload returned a manifest with a refusal")
+			}
+			if len(err.Error()) > 1024 {
+				t.Errorf("the refusal is %d bytes long; untrusted strings must be truncated", len(err.Error()))
+			}
+			if tc.check != nil {
+				tc.check(t, m, dst)
+			}
+		})
 	}
 }
