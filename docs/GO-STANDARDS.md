@@ -69,7 +69,9 @@ Targets **darwin/arm64, macOS 26+**. Go **1.26 or later** (each `go.mod` declare
   ported function names its upstream file and license in a comment, and the license must be
   Apache-2.0 compatible. Cryptography, TLS, authentication, password hashing, and parsers or
   decompressors of untrusted input are the exception: they stay on maintained libraries however
-  little of them you use.
+  little of them you use. Where no broadly accepted library does the job, write it in the repo and
+  treat it as security-critical: a security review, fuzz tests with committed seeds, explicit size
+  and count limits, and fail-closed handling of anything it does not recognise.
 - **Every dependency change is visible and checked.** `hack/deps.lock` records the full module
   graph, and `hack/verify-deps.sh` (run by `hack/ci.sh`) fails on any drift until the lock is
   regenerated with `--update`. A PR that adds or bumps a module explains why the module is needed
