@@ -61,6 +61,7 @@ run on hardware, that is an added caveat: nobody has exercised it on real Macs y
 25. [Building images](builder.md) covers `k3sm build` and the in-cluster build engine.
 26. [Helm charts](helm.md) covers installing releases with the `HelmChart` object.
 27. [FAQ](faq.md) gives short answers to the common questions.
+28. [Privacy](privacy.md) lists what the k3sm app's update check sends and what it still reveals.
 
 ## Before You Build Anything Real
 

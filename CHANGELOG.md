@@ -10,6 +10,14 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Added
+
+- k3sm.app checks for a newer k3sm.app against a signed release index, and can move the cluster
+  to the k3sm release the app carries with `k3sm update apply --version <tag> --pin-sha256
+  <digest>`, the digest taken from the app's signed record. [Upgrade](docs/user/upgrade.md) describes
+  the app path beside the command-line one, and the new [Privacy](docs/user/privacy.md) page lists
+  what the check sends and what it still reveals.
+
 ### Fixed
 
 - `k3sm image tag`, `untag`, `inspect` and `save` now refuse `--socket`, as `ls` and `df` do,

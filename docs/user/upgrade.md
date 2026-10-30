@@ -103,11 +103,47 @@ controller set it; a node you cordoned yourself stays cordoned. It prints each s
 update status` to see which node failed and why before you abort, and fix that node before the
 next `apply`.
 
-The k3sm app offers updates from its menu, its window and Settings > Updates. On the server of a
-cluster with workers it runs the managed update (`k3sm update apply`), or, when the app carries a
-newer release, `k3sm update apply --version <tag> --pin-sha256 <digest>` bound to that release. On
-a single-node server or a worker it installs the release it carries over this Mac's k3sm with
-`k3sm install --from-staging`.
+The k3sm app offers the same updates; see [Updating From k3sm.app](#updating-from-k3smapp).
+
+## Updating From k3sm.app
+
+The command-line path above is unchanged and needs nothing from the app. The app adds a second
+path with two parts: it checks for a newer app, and it moves k3sm to the release it carries.
+
+**The app's own release.** A release build of the app checks for a newer k3sm.app about a minute
+after it starts and then about once a day (half as often under Low power). A check also runs when you choose
+Check for Updates in the app menu or Check Now in Settings > Updates. The check reads one signed
+release index from GitHub. The app verifies the signature and refuses an index older than one it has
+already accepted, so a replayed index is not an offer. A newer release raises a notification, once
+per release while "Notify me when an update is available" is on, and a line in the menu and in Settings > Updates. A release that needs a newer macOS
+than yours is shown and not offered. A development build never checks. Settings > Updates holds
+**Check for app updates automatically**, on by default; with it off, only Check for Updates and
+Check Now send the request. What the request sends is on [Privacy](privacy.md).
+
+**The cluster, pinned to the app's payload.** Each app bundle carries one k3sm release and a signed
+record of that release's archive checksum. When the app carries a newer k3sm than the server runs and
+the cluster has workers, the menu and Settings > Updates offer **Update the Cluster to <tag>**. The app
+asks for an administrator password once. It copies its own bundle into a root-owned stage, checks the
+copy's signature, reads the checksum from the copy, and runs
+
+```sh
+k3sm update apply --yes --version <tag> --pin-sha256 <digest>
+```
+
+so the roll is bound to the bytes the app carries rather than to whatever the release host serves.
+The update controller refuses the release, before any node is cordoned, unless the release's
+checksums file carries exactly that digest. Workers update first and the server last, as for any
+managed update. The app refuses to start the roll when a node is not Ready, when the node list could
+not be read, when a node already runs a newer release, when the installed `k3sm` or the running
+controller does not know the release pin, or when the server runs a release more than one minor
+version older than the app's.
+
+The same flags are on the command line. `--pin-sha256 <digest>` needs `--version` and root, and
+`k3sm update apply --clear-pin` (root, no other flag) removes the pin; both are described under
+[Managed Update](#managed-update). The app does not clear the pin for you.
+
+On a one-node server, and on a worker, the app instead installs the release it carries over this
+Mac's k3sm, with `k3sm install --from-staging`.
 
 ## Single Node
 
