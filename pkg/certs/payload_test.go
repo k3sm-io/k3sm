@@ -159,9 +159,12 @@ func (f *payloadFixture) run(t *testing.T) (*PayloadManifest, string, error) {
 		if e.typeflag != tar.TypeReg {
 			continue
 		}
-		kind := PayloadVersionMarker
-		if isMachOHeader(e.body) || e.size != 0 {
+		kind := PayloadData
+		switch {
+		case isMachOHeader(e.body) || e.size != 0:
 			kind = PayloadMachO
+		case strings.HasSuffix(e.name, versionMarkerSuffix):
+			kind = PayloadVersionMarker
 		}
 		m.Members = append(m.Members, PayloadMember{Path: strings.TrimPrefix(e.name, "./"), SHA256: sha256Hex(e.body), Kind: kind})
 	}
@@ -236,6 +239,33 @@ func leafUnderCA(t *testing.T, ca *CA, ekus []x509.ExtKeyUsage) (*x509.Certifica
 	return cert, key
 }
 
+// releaseShapeEntries is the member list of a published darwin/arm64
+// release archive, with tiny stand-ins for its contents.
+func releaseShapeEntries() []payloadEntry {
+	text := func(name, body string) payloadEntry {
+		return payloadEntry{name: name, typeflag: tar.TypeReg, mode: 0o644, body: []byte(body)}
+	}
+	es := []payloadEntry{
+		text("PAYLOAD-SHA256", "0000  k3sm\n"),
+		text("UPSTREAM-DIGESTS", "etcd sha256:0000\n"),
+		text("LICENSE", "Apache License\n"),
+		text("NOTICE", "k3sm\n"),
+		dirEntry("cp-payload/"),
+	}
+	for _, bin := range []string{"etcd", "etcdutl", "kine", "kube-apiserver", "kube-controller-manager",
+		"kube-scheduler", "kubectl", "zot", "helm-v4.3.1"} {
+		es = append(es, regEntry("cp-payload/"+bin, machOBody(bin)))
+	}
+	for _, marker := range []string{"etcd", "kine", "kube", "zot", "helm"} {
+		es = append(es, text("cp-payload/"+marker+".version", "v1.0.0\n"))
+	}
+	for _, bin := range []string{"k3sm", "k3sm-execshim", "k3sm-vmhost",
+		"libk3sm_getaddrinfo_shim.dylib", "libk3sm_pathrebase_shim.dylib"} {
+		es = append(es, regEntry(bin, machOBody(bin)))
+	}
+	return es
+}
+
 // dropMember removes path from the manifest.
 func dropMember(path string) func(*PayloadManifest) {
 	return func(m *PayloadManifest) {
@@ -276,6 +306,43 @@ func TestVerifySignedPayload(t *testing.T) {
 					t.Errorf("cp-payload/kine = %q, %v", b, err)
 				}
 			},
+		},
+		{
+			name: "accepts the release archive shape",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.entries = releaseShapeEntries()
+			},
+			check: func(t *testing.T, m *PayloadManifest, dst string) {
+				if m == nil || len(m.Members) != len(releaseShapeEntries())-1 {
+					t.Fatalf("manifest = %+v", m)
+				}
+				for rel, mode := range map[string]fs.FileMode{
+					"LICENSE": 0o644, "PAYLOAD-SHA256": 0o644, "UPSTREAM-DIGESTS": 0o644,
+					"k3sm-vmhost": 0o755, "cp-payload/helm-v4.3.1": 0o755, "cp-payload/helm.version": 0o644,
+				} {
+					fi, err := os.Lstat(filepath.Join(dst, filepath.FromSlash(rel)))
+					if err != nil {
+						t.Fatalf("extracted %s: %v", rel, err)
+					}
+					if !fi.Mode().IsRegular() || fi.Mode().Perm() != mode {
+						t.Errorf("%s mode = %v, want regular %v", rel, fi.Mode(), mode)
+					}
+				}
+			},
+		},
+		{
+			name: "data member carrying Mach-O magic",
+			edit: func(_ *testing.T, f *payloadFixture) {
+				f.entries = append(f.entries, regEntry("NOTICE", machOBody("notice")))
+				f.manifest = func(m *PayloadManifest) {
+					for i := range m.Members {
+						if m.Members[i].Path == "NOTICE" {
+							m.Members[i].Kind = PayloadData
+						}
+					}
+				}
+			},
+			want: ErrPayloadMember,
 		},
 		{
 			name: "tampered digest",

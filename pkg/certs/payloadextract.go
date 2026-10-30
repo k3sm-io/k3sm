@@ -57,11 +57,11 @@ var machOMagics = []uint32{
 const setIDBits = unix.S_ISUID | unix.S_ISGID | unix.S_ISVTX
 
 // Modes of what extraction creates: directories and Mach-O members are
-// 0755, version markers 0644.
+// 0755, version markers and data members 0644.
 const (
-	payloadDirMode    fs.FileMode = 0o755
-	payloadExecMode   fs.FileMode = 0o755
-	payloadMarkerMode fs.FileMode = 0o644
+	payloadDirMode  fs.FileMode = 0o755
+	payloadExecMode fs.FileMode = 0o755
+	payloadDataMode fs.FileMode = 0o644
 )
 
 // extractPayload unpacks the gzip tar r into dst, an existing empty
@@ -135,8 +135,8 @@ func extractPayload(ctx context.Context, r io.Reader, dst string, m *PayloadMani
 			return fmt.Errorf("%w: the archive member %s is not in the manifest", ErrPayloadManifest, name)
 		}
 		perm := payloadExecMode
-		if mem.Kind == PayloadVersionMarker {
-			perm = payloadMarkerMode
+		if mem.Kind != PayloadMachO {
+			perm = payloadDataMode
 		}
 		if err := writePayloadMember(tr, dst, name, hdr.Size, perm); err != nil {
 			return err
@@ -274,6 +274,9 @@ func checkExtractedFile(p string, mem PayloadMember) error {
 	if !fi.Mode().IsRegular() || fi.Mode()&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky) != 0 {
 		return fmt.Errorf("%w: the extracted %s is not a plain regular file", ErrPayloadMember, mem.Path)
 	}
+	if mem.Kind == PayloadData && fi.Size() > MaxPayloadDataBytes {
+		return fmt.Errorf("%w: the data member %s is larger than %d bytes", ErrPayloadTooLarge, mem.Path, MaxPayloadDataBytes)
+	}
 	h := sha256.New()
 	head := &headWriter{max: maxVersionMarkerBytes}
 	if _, err := io.Copy(io.MultiWriter(h, head), f); err != nil {
@@ -289,6 +292,11 @@ func checkExtractedFile(p string, mem PayloadMember) error {
 		if machO || fi.Size() >= maxVersionMarkerBytes || !printableText(head.buf) {
 			return fmt.Errorf("%w: the declared version marker %s is not a small text file", ErrPayloadMember, mem.Path)
 		}
+	case PayloadData:
+		if machO {
+			return fmt.Errorf("%w: the data member %s is a Mach-O", ErrPayloadMember, mem.Path)
+		}
+
 	default:
 		return fmt.Errorf("%w: the manifest member %s has unknown kind %q", ErrPayloadManifest, mem.Path, mem.Kind)
 	}

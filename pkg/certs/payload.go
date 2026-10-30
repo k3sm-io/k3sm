@@ -47,6 +47,8 @@ const (
 	MaxPayloadMembers = 64
 	// MaxPayloadManifestBytes is the largest manifest accepted.
 	MaxPayloadManifestBytes = 64 << 10
+	// MaxPayloadDataBytes is the largest data member accepted.
+	MaxPayloadDataBytes = 1 << 20
 	// MaxClusterCABytes is the largest cluster CA bundle accepted.
 	MaxClusterCABytes = 1 << 20
 )
@@ -79,9 +81,13 @@ const (
 	// PayloadMachO is a Mach-O executable or library, which the Apple code
 	// signature check covers.
 	PayloadMachO PayloadMemberKind = "mach-o"
-	// PayloadVersionMarker is a small text file named <name>.version that is
-	// copied as data and never executed or loaded.
+	// PayloadVersionMarker is a text file named <name>.version, under 4 KiB,
+	// at any depth, that is copied as data and never executed or loaded.
 	PayloadVersionMarker PayloadMemberKind = "version-marker"
+	// PayloadData is any other non-code file (the legal files, the digest
+	// lists), at most MaxPayloadDataBytes, that must not start with a Mach-O
+	// magic.
+	PayloadData PayloadMemberKind = "data"
 )
 
 // PayloadMember is one file of a release archive as its manifest lists it.
@@ -162,7 +168,8 @@ var defaultPayloadLimits = payloadLimits{
 //     entries and more than MaxPayloadExtractedBytes in total;
 //  5. re-reads every file now under dst and requires the set to equal the
 //     manifest's members, each with its sha256, each Mach-O member to be a
-//     Mach-O and every other file to be a declared version marker.
+//     Mach-O, each version marker a small text file, and each data member at
+//     most MaxPayloadDataBytes and not a Mach-O.
 //
 // It returns the manifest only when every step passed. Extended attributes
 // in the archive are never applied. On a refusal dst may hold a partial
@@ -334,7 +341,7 @@ func parsePayloadManifest(raw []byte, maxMembers int) (*PayloadManifest, error) 
 			return nil, fmt.Errorf("%w: the manifest member %s has no lowercase hex sha256", ErrPayloadManifest, mem.Path)
 		}
 		switch mem.Kind {
-		case PayloadMachO:
+		case PayloadMachO, PayloadData:
 		case PayloadVersionMarker:
 			base := path.Base(mem.Path)
 			if !strings.HasSuffix(base, versionMarkerSuffix) || base == versionMarkerSuffix {
