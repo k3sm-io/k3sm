@@ -1215,18 +1215,19 @@ func serverKubeletServingIPs(nodeOpts nodeOptions, meshIP string) []net.IP {
 // on every topology (so any client that pinned the cluster CA verifies the
 // apiserver via its kubeconfig) with the names apiServerServingSANs assembles:
 // loopback, the kubernetes Service IP, the in-cluster DNS names, the canonical node
-// name, the mesh IP when there is one, and the operator's --tls-san extras. An
+// name, the mesh IP when there is one, the node IP when it is not loopback, and
+// the operator's --tls-san extras. An
 // invalid extra is refused before anything is written; a node name that cannot be
 // a SAN is logged at Warn and left out. The key (0600) is written before the cert
 // (0644), each with atomicfile.Replace (temp file, fsync, rename), so a crash
 // mid-write leaves the previous file or the new one, never a torn one, and the
 // next boot re-issues the pair. It returns their paths for --tls-cert-file /
 // --tls-private-key-file. The CA is only read.
-func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP, nodeName string, extraSANs []string, logger *slog.Logger) (certFile, keyFile string, err error) {
+func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP, nodeIP, nodeName string, extraSANs []string, logger *slog.Logger) (certFile, keyFile string, err error) {
 	if _, nerr := nodeNameSAN(nodeName); nerr != nil {
 		logger.Warn("leaving the node name out of the apiserver serving certificate", "err", nerr)
 	}
-	dnsNames, ips, err := apiServerServingSANs(meshIP, nodeName, extraSANs)
+	dnsNames, ips, err := apiServerServingSANs(meshIP, nodeIP, nodeName, extraSANs)
 	if err != nil {
 		return "", "", err
 	}
