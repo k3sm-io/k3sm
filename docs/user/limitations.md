@@ -769,6 +769,13 @@ always agree.
   trigger covers both. When the data root is on another disk, `DiskPressure` also goes True while
   the swap volume has less free space than the floor above, and clears at one and a half times the
   floor. Its message names the swap volume.
+- **`SoftPressure` is advisory.** It goes True while any budget signal is at its warn rung or
+  above, well before `MemoryPressure`, and its message names each signal with its value and rung.
+  No taint, eviction or admission decision follows from it. A raised level stays published for
+  5 minutes after the last sample that saw it, the kubelet's default pressure transition period.
+  The rungs are held in memory: after a node-daemon restart the first sample starts with no hold,
+  and swap growth reads unset until a second sample exists. The rung values for swap growth and
+  swap-volume free space are provisional.
 - **One Pod per round.** After each eviction k3sm waits for that Pod to stop and for a fresh
   sample, and evicts again only if pressure is not falling. After 3 evictions in 5 minutes it stops
   for the rest of that pressure episode, logs an error, and records an `EvictionCascadeHalted`

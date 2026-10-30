@@ -17,6 +17,12 @@ pin, its date, and the tarball's sha256.
   <digest>`, the digest taken from the app's signed record. [Upgrade](docs/user/upgrade.md) describes
   the app path beside the command-line one, and the new [Privacy](docs/user/privacy.md) page lists
   what the check sends and what it still reveals.
+- Nodes report a `SoftPressure` condition: an early warning, graded on the node budget's ladder,
+  that goes True while any signal (available memory, the memory compressor, swap growth, free
+  space on the swap and data volumes, free process IDs) is at its warn rung or above. Its reason
+  names the worst signal and its message lists each one with its value and rung. It is advisory:
+  nothing taints the node or evicts a Pod on it. The node's pressure sampler now runs once a
+  second from the warn rung up, not only past the half-way marks.
 
 ### Fixed
 
