@@ -3,7 +3,7 @@
 # The seeded deadlines are staggered by package, one package a week, so they do
 # not all expire together. Fixing a test means deleting its entry and lowering
 # the count; adding an entry means raising it, in the same reviewed change.
-# count: 160
+# count: 164
 cmd/k3sm/agentcrashloop_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/agentcrashloop_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/agentrestart_integration_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
@@ -13,7 +13,10 @@ cmd/k3sm/exitoverlap_test.go:time.After seeded 2026-10-29, predates the lint 202
 cmd/k3sm/exitoverlap_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/gatedloop_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/gatedloop_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
+cmd/k3sm/imagebound_test.go:time.After seeded 2026-10-30, merged before the lint 2027-01-04
+cmd/k3sm/imagebound_test.go:time.Sleep seeded 2026-10-30, merged before the lint 2027-01-04
 cmd/k3sm/imagelsperf_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
+cmd/k3sm/imagepushregistry_test.go:time.Sleep seeded 2026-10-30, merged before the lint 2027-01-04
 cmd/k3sm/joinlistener_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/lbhosting_netdwire_integration_test.go:Listen seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/lbhosting_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
@@ -27,6 +30,7 @@ cmd/k3sm/node_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/nodeexit_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/noderestriction_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/nodeupdate_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
+cmd/k3sm/pushmount_test.go:time.Sleep seeded 2026-10-30, merged before the lint 2027-01-04
 cmd/k3sm/registrysweep_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/registrytls_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/runtimedsocket_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
