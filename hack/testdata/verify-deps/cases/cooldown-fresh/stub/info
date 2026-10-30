@@ -6,3 +6,4 @@ example.com/new v1.0.0 400
 github.com/Upper/New v1.2.0 400
 example.com/young v0.2.0 @RECENT@
 example.com/zchild v0.3.0 @OLD@
+example.com/hchild v0.4.0 @OLD@

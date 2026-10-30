@@ -23,13 +23,17 @@
 #                            time re-read from the proxy, so a forged lock
 #                            time cannot clear the cooldown.
 #   malicious-package check  no module version carries an OSV MAL- advisory
-#   zotchild graph           the same lock, cooldown and malicious-package
-#                            stages over the zot wrapper module's graph (every
-#                            module pkg/registrysvc/zotchild/go.sum.txt hashes
-#                            the source of), locked in hack/deps-zotchild.lock:
-#                            the registry builds zot from that go.sum, outside
-#                            this repo's go.mod, so its modules are not in the
-#                            repo graph above
+#   wrapper graphs           the same lock, cooldown and malicious-package
+#                            stages over each wrapper module's graph (every
+#                            module its go.sum hashes the source of), each in
+#                            its own lock: the zot wrapper
+#                            (pkg/registrysvc/zotchild/go.sum.txt,
+#                            hack/deps-zotchild.lock) and the helm wrapper
+#                            (pkg/helmchart/helmchild/go.sum.txt,
+#                            hack/deps-helmchild.lock). k3sm builds zot and
+#                            helm from those go.sums, outside this repo's
+#                            go.mod, so their modules are not in the repo
+#                            graph above (WRAPPERS below)
 #   replace discipline       every go.mod replace sits directly under its own
 #                            comment line, and a filesystem replace points
 #                            only at a sibling repo
@@ -40,8 +44,8 @@
 # Usage (from anywhere; the script runs from the repo root with GOWORK=off):
 #   hack/verify-deps.sh              run every stage
 #   hack/verify-deps.sh --update     rewrite hack/deps.lock from the current graph
-#                                    and hack/deps-zotchild.lock from the zot
-#                                    wrapper's go.sum, then run the cooldown and
+#                                    and each wrapper lock from its wrapper's
+#                                    go.sum, then run the cooldown and
 #                                    malicious-package stages on the modules
 #                                    that changed
 #   hack/verify-deps.sh --self-test  hermetic fixtures (hack/testdata/verify-deps),
@@ -80,10 +84,24 @@ OSV_BATCH_URL="https://api.osv.dev/v1/querybatch"
 OSV_QUERY_URL="https://api.osv.dev/v1/query"
 OSV_BATCH_SIZE=500
 LOCK="hack/deps.lock"
-# The zot wrapper module's lockfile (the registry's zot child is built from it
-# with -mod=readonly) and the lock that makes its graph a reviewed file.
+# The wrapper modules: a binary k3sm builds outside its own go.mod, from a
+# wrapper module's go.sum embedded in the repo (built with -mod=readonly). Each
+# graph gets its own lock, so a module that moves there is a reviewed file
+# change exactly like one in hack/deps.lock. One line per wrapper:
+#
+#   <name> <go.sum> <lock>
+#
+# zotchild: the registry's zot child (pkg/registrysvc).
+# helmchild: the helm binary the daemon builds (pkg/helmchart). Its graph
+#   carries golang.org/x/net v0.62.0, the version the control-plane build raises
+#   to under the cooldown exemption in hack/release/build-cp.sh (EXEMPT there,
+#   expiring 2026-11-10). The matching x/net line in hack/deps.cooldown-exempt
+#   rests on that ruling and is to be dropped when that exemption goes.
+WRAPPERS="zotchild pkg/registrysvc/zotchild/go.sum.txt hack/deps-zotchild.lock
+helmchild pkg/helmchart/helmchild/go.sum.txt hack/deps-helmchild.lock"
+# The two go.sum paths again, for the self-test's per-case removal markers.
 ZOT_SUM="pkg/registrysvc/zotchild/go.sum.txt"
-ZOT_LOCK="hack/deps-zotchild.lock"
+HELM_SUM="pkg/helmchart/helmchild/go.sum.txt"
 EXEMPT="hack/deps.cooldown-exempt"
 # The only filesystem paths a go.mod replace may name: the sibling k3sm repos.
 LOCAL_REPLACE_ALLOW="../apis ../runtimed ../darwin-net ../k3sm"
@@ -897,9 +915,10 @@ current_graph() {
 	py graph-clean <"$raw" >"$WORK/graph"
 }
 
-# The zot wrapper's graph, from its go.sum, into $WORK/zgraph.
-zot_graph() {
-	py sum-graph "$ZOT_SUM" >"$WORK/zgraph" || fail "$1" "cannot read the zot wrapper graph from $ZOT_SUM"
+# wrapper_graph <stage> <name> <go.sum> <out>: a wrapper module's graph, from
+# its go.sum.
+wrapper_graph() {
+	py sum-graph "$3" >"$4" || fail "$1" "cannot read the $2 wrapper graph from $3"
 }
 
 # ---- c: lock -----------------------------------------------------------------
@@ -1023,16 +1042,40 @@ malicious_check() { # malicious_check <lock-format file> [stage]
 	fi
 }
 
-# ---- zotchild graph ----------------------------------------------------------
-# The zot wrapper module's graph gets the repo graph's lock, cooldown and
-# malicious-package stages: the registry builds zot from that go.sum, so a module
+# ---- wrapper graphs -----------------------------------------------------------
+# Each wrapper module's graph gets the repo graph's lock, cooldown and
+# malicious-package stages: the binary is built from that go.sum, so a module
 # moved there runs on the node exactly like one in this repo's go.mod.
-zot_check() {
-	stage "lock (zotchild)"
-	zot_graph "lock (zotchild)"
-	lock_compare "lock (zotchild)" "$ZOT_LOCK" "$WORK/zgraph"
-	cooldown_verify "$ZOT_LOCK" "cooldown (zotchild)"
-	malicious_check "$ZOT_LOCK" "malicious-package check (zotchild)"
+# wrapper_check <name> <go.sum> <lock>
+wrapper_check() {
+	local name="$1" sum="$2" lock="$3"
+	if [ ! -f "$sum" ]; then
+		[ ! -f "$lock" ] || fail "lock ($name)" "$lock exists but $sum does not: the $name wrapper graph moved or was removed without its lock"
+		echo "    no $name wrapper module ($sum absent): the $name stages do not apply to this repo"
+		return 0
+	fi
+	stage "lock ($name)"
+	wrapper_graph "lock ($name)" "$name" "$sum" "$WORK/wgraph-$name"
+	lock_compare "lock ($name)" "$lock" "$WORK/wgraph-$name"
+	cooldown_verify "$lock" "cooldown ($name)"
+	malicious_check "$lock" "malicious-package check ($name)"
+}
+
+# wrapper_update <name> <go.sum> <lock>: --update for one wrapper; a lock it
+# rewrites is appended to $WORK/updated.
+wrapper_update() {
+	local name="$1" sum="$2" lock="$3" w="$WORK/w-$1"
+	[ -f "$sum" ] || return 0
+	stage "lock ($name update)"
+	mkdir -p "$w"
+	wrapper_graph "lock ($name update)" "$name" "$sum" "$w/graph"
+	py update-plan "$lock" "$w/graph" "$w" "$PROXY_URL" || fail "lock ($name update)" "could not plan the update"
+	cp "$w/fetch" "$WORK/fetch"
+	fetch_infos "lock ($name update)"
+	py update-write "$lock" "$w" || fail "lock ($name update)" "could not write $lock"
+	cooldown_check "$w/delta" "cooldown ($name)"
+	malicious_check "$w/delta" "malicious-package check ($name)"
+	echo "$lock" >>"$WORK/updated"
 }
 
 # ---- f: replace discipline ---------------------------------------------------
@@ -1073,17 +1116,13 @@ update() {
 	py update-write "$LOCK" "$WORK" || fail "lock (update)" "could not write $LOCK"
 	cooldown_check "$WORK/delta"
 	malicious_check "$WORK/delta"
-	if [ -f "$ZOT_SUM" ]; then
-		stage "lock (zotchild update)"
-		zot_graph "lock (zotchild update)"
-		mkdir -p "$WORK/z"
-		py update-plan "$ZOT_LOCK" "$WORK/zgraph" "$WORK/z" "$PROXY_URL" || fail "lock (zotchild update)" "could not plan the update"
-		cp "$WORK/z/fetch" "$WORK/fetch"
-		fetch_infos "lock (zotchild update)"
-		py update-write "$ZOT_LOCK" "$WORK/z" || fail "lock (zotchild update)" "could not write $ZOT_LOCK"
-		cooldown_check "$WORK/z/delta" "cooldown (zotchild)"
-		malicious_check "$WORK/z/delta" "malicious-package check (zotchild)"
-		echo "OK: [verify-deps] $LOCK and $ZOT_LOCK updated; review the diff and commit them"
+	: >"$WORK/updated"
+	local name sum lock
+	while read -r name sum lock <&3; do
+		wrapper_update "$name" "$sum" "$lock"
+	done 3<<<"$WRAPPERS"
+	if [ -s "$WORK/updated" ]; then
+		echo "OK: [verify-deps] $LOCK and $(paste -sd ' ' "$WORK/updated" | sed 's/ /, /g') updated; review the diff and commit them"
 	else
 		echo "OK: [verify-deps] $LOCK updated; review the diff and commit it"
 	fi
@@ -1114,13 +1153,10 @@ check() {
 	lock_check
 	cooldown_verify
 	malicious_check "$LOCK"
-	if [ -f "$ZOT_SUM" ]; then
-		zot_check
-	elif [ -f "$ZOT_LOCK" ]; then
-		fail "lock (zotchild)" "$ZOT_LOCK exists but $ZOT_SUM does not: the zot wrapper graph moved or was removed without its lock"
-	else
-		echo "    no zot wrapper module ($ZOT_SUM absent): the zotchild stages do not apply to this repo"
-	fi
+	local name sum lock
+	while read -r name sum lock <&3; do
+		wrapper_check "$name" "$sum" "$lock"
+	done 3<<<"$WRAPPERS"
 	replace_check
 	tools_check
 	echo "OK: [verify-deps] dependency supply-chain check green"
@@ -1154,8 +1190,11 @@ self_test() {
 		# .no-zot-sum keeps the lock and removes only the graph: the check must refuse,
 		# never skip, a wrapper that moved out from under its lock.
 		[ ! -f "$dir/.no-zot-sum" ] || rm -f "$dir/$ZOT_SUM" "$dir/.no-zot-sum"
+		# .no-helm and .no-helm-sum do the same for the helm wrapper module.
+		[ ! -f "$dir/.no-helm" ] || rm -f "$dir/$HELM_SUM" "$dir/hack/deps-helmchild.lock" "$dir/.no-helm"
+		[ ! -f "$dir/.no-helm-sum" ] || rm -f "$dir/$HELM_SUM" "$dir/.no-helm-sum"
 		local f
-		for f in "$dir/hack/deps.lock" "$dir/hack/deps-zotchild.lock" "$dir/stub/info" "$dir/base/hack/deps.lock"; do
+		for f in "$dir/hack/deps.lock" "$dir/hack/deps-zotchild.lock" "$dir/hack/deps-helmchild.lock" "$dir/stub/info" "$dir/base/hack/deps.lock"; do
 			[ ! -f "$f" ] || { sed -e "s/@RECENT@/$recent/g" -e "s/@OLD@/$old/g" "$f" >"$f.s" && mv "$f.s" "$f"; }
 		done
 		# A case with base/hack/deps.lock becomes a git repo whose origin/main
@@ -1268,6 +1307,12 @@ self_test() {
 	bg no-zot - pass "the zotchild stages do not apply to this repo"
 	bg no-zot-update --update pass "OK: [verify-deps] hack/deps.lock updated; review the diff and commit it"
 	bg zot-lock-no-sum - "lock (zotchild)" "exists but pkg/registrysvc/zotchild/go.sum.txt does not"
+	bg helm-clean - pass "==> [verify-deps] malicious-package check (helmchild)"
+	bg helm-lock-added - "lock (helmchild)" "added:   example.com/hextra v1.0.0"
+	bg helm-cooldown-fresh - "cooldown (helmchild)" "example.com/hyoung v0.1.0 has a proxy-recorded commit time"
+	bg helm-osv-mal - "malicious-package check (helmchild)" "MAL-2026-0006"
+	bg helm-update --update pass "wrote hack/deps-helmchild.lock: 3 modules, 1 new or changed"
+	bg helm-lock-no-sum - "lock (helmchild)" "exists but pkg/helmchart/helmchild/go.sum.txt does not"
 	wait
 	for ((i = 1; i <= seq; i++)); do
 		cat "$WORK/result.$i"

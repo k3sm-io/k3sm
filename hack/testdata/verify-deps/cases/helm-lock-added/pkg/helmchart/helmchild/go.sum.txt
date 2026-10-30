@@ -1,0 +1,5 @@
+example.com/hchild v0.4.0 h1:hchildzip=
+example.com/hchild v0.4.0/go.mod h1:hchildmod=
+example.com/old v1.2.3 h1:oldzip=
+example.com/old v1.2.3/go.mod h1:oldmod=
+example.com/hextra v1.0.0 h1:hextra=
