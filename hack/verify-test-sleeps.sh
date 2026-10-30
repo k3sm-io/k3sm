@@ -36,7 +36,7 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+self="$(cd "$(dirname "$0")" && pwd)/${0##*/}"
 
 lint() {
 	local root="$1" allow="$2" today="$3"

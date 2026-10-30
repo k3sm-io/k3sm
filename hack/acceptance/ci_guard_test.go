@@ -121,6 +121,12 @@ func sandboxCIEnv(t *testing.T, realScript, goMod string, extra map[string]strin
 		t.Fatalf("read %s: %v", realHack, err)
 	}
 	for _, e := range entries {
+		// A fixture file for hack/<name> replaces the real entry. It is never
+		// symlinked first: writing the fixture through the link would overwrite
+		// the real repo's file.
+		if _, own := extra["hack/"+e.Name()]; own {
+			continue
+		}
 		if err := os.Symlink(filepath.Join(realHack, e.Name()), filepath.Join(hack, e.Name())); err != nil {
 			t.Fatalf("symlink %s: %v", e.Name(), err)
 		}

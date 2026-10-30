@@ -81,7 +81,13 @@ if [ -n "$go_pkgs" ]; then
 	# The output is kept so that a red run ends with the failing tests, not only
 	# a long scroll.
 	echo "==> [k3sm] go test -race"
-	if ! CGO_ENABLED=$CGO go test -race ./... 2>&1 | tee "$ci_tmp/gotest.log"; then   # e2e/ is //go:build e2e — excluded here
+	# Written to a file and then printed, not piped through tee: the
+	# gate runs under a minimal PATH (the staticcheck acceptance test) and
+	# the exit status comes straight from go test, not a pipeline.
+	test_rc=0
+	CGO_ENABLED=$CGO go test -race ./... > "$ci_tmp/gotest.log" 2>&1 || test_rc=$?   # e2e/ is //go:build e2e — excluded here
+	cat "$ci_tmp/gotest.log"
+	if [ "$test_rc" -ne 0 ]; then
 		echo "==> [k3sm] go test FAILED; failing tests:" >&2
 		grep -E '^[[:space:]]*--- FAIL:|^FAIL[[:space:]]|^panic:' "$ci_tmp/gotest.log" >&2 || echo "    (no FAIL line; read the output above)" >&2
 		races="$(grep -c 'WARNING: DATA RACE' "$ci_tmp/gotest.log" || true)"
