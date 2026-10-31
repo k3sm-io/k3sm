@@ -186,6 +186,47 @@ To remove an install made from the app, run `sudo k3sm uninstall`, or use **Unin
 app's Settings > Advanced, which keeps the cluster's data unless you tick **Also delete k3sm's
 data**. Dragging the app to the Trash does not remove k3sm: the cluster keeps running.
 
+## Developer mode
+
+Developer mode is for a build from source. It turns the signature checks off on this Mac, so a
+build you made yourself can be installed, and so a developer build of k3sm.app can install,
+update, stop and start it.
+
+- **Contributors.** Run `sudo <tree>/k3sm install --developer-mode on` with the binary you built.
+  An ad-hoc signed build may then replace a team-signed one, and a developer build of the app can
+  install, update, stop and start that k3sm. The downgrade rule still applies: pass
+  `--allow-downgrade` to install an older version on purpose.
+- **Turned on by mistake.** Run `sudo <tree>/k3sm install --developer-mode off` from any tree,
+  or install a signed release, which turns developer mode off:
+  - a plain `sudo k3sm install` turns it off when the `k3sm` doing the install carries a
+    Developer ID Application signature. An ad-hoc signed build from source, or one signed for
+    Apple Development, leaves it on;
+  - an update through k3sm.app turns it off only when every program in the update carries a
+    Developer ID Application signature of one team, and that team is the installed k3sm's when
+    the installed k3sm has one. That is the same team the signature checks require of an update
+    when the mode is off.
+
+  An install that leaves the mode on says why.
+- **Auditing a Mac.** The record is the marker `/Library/k3sm.developer-mode`: a root-owned file,
+  and its presence is the whole record. `k3sm status` shows a `developer-mode` row at severity
+  `warn` while it is there, with the state `on` for a valid marker and `invalid` for anything else
+  at that path (a symlink, a file that is not root-owned, a file others can write, or one with an
+  ACL). An invalid marker is ignored and the checks stay on. The status `verdict` stays `ok` while
+  the mode is on, and only the `developer-mode` row warns, so automation that audits a Mac reads
+  that row rather than the verdict. A release build of the app never uses the mode.
+  `k3sm uninstall` removes the marker.
+- **How long it lasts.** The marker sits outside the install root, so it survives reboots and
+  ordinary updates. `--developer-mode on` writes it before anything else the install changes, and
+  an install that fails after that leaves it in place, so the checks stay off.
+- **Given up while it is on.** The signature of the k3sm that runs as root is not compared with the
+  installed one. A corrupt copy is still refused, as are the staging directory checks and
+  `--require-team-signature`.
+- Without the flag, the mode stays as it is, except for the signed installs described above.
+  `--developer-mode` is accepted on every install shape. If the marker changes while an install
+  is running, the install refuses and asks to be run again.
+
+See [Status JSON](status-json.md) for the row.
+
 ## Secrets Encryption at Rest
 
 Secrets are stored unencrypted in the datastore by default. To encrypt them at rest, ask for it
@@ -371,6 +412,9 @@ mints a new one, and so are the records the node writes for `k3sm status` (in th
 and in `/var/lib/k3sm/status/`), because they describe a node that no longer runs. The command prints the full list of what it kept. If you
 installed a data volume, it stays mounted and declared; the command prints `sudo k3sm install
 --data-volume` to reinstall onto it and `sudo k3sm datavol delete --yes` to remove it for good.
+
+Uninstall also removes the developer-mode marker `/Library/k3sm.developer-mode`, if there is one (see
+[Developer mode](#developer-mode)).
 
 Uninstall also removes `/Library/k3sm.staging`, the directory the k3sm app copies itself into, and
 refuses to run while the app is in the middle of an install.

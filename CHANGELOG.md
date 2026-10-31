@@ -12,6 +12,14 @@ pin, its date, and the tarball's sha256.
 
 ### Added
 
+- `k3sm install --developer-mode on` installs a build from source, ad-hoc signed, over any
+  install: the signature of the k3sm that runs as root is no longer compared with the installed
+  one, and a development build of k3sm.app opens beside it. `--developer-mode off` turns it off,
+  and so does installing a signed release: a `k3sm install` whose `k3sm` carries a Developer ID
+  signature, or a k3sm.app update whose every program is signed by one Developer ID team (the
+  installed build's team, if it has one). Uninstall removes it. `k3sm status` shows a
+  `developer-mode` row while it is on. [Developer mode](docs/user/install.md#developer-mode)
+  describes what is no longer checked.
 - k3sm.app checks for a newer k3sm.app against a signed release index, and can move the cluster
   to the k3sm release the app carries with `k3sm update apply --version <tag> --pin-sha256
   <digest>`, the digest taken from the app's signed record. [Upgrade](docs/user/upgrade.md) describes

@@ -333,6 +333,12 @@ func artifactManifest(cfg Config) []artifact {
 		{kind: kindDir, disp: dispRemove, path: PodLogsDir, assertExists: false},
 		{kind: kindDir, disp: dispRemove, path: ContainerLogsDir, assertExists: false},
 	}...)
+	// The developer-mode marker, beside the install root and outside it, so
+	// the InstallDir sweep cannot reach it. Removed: an uninstalled Mac keeps
+	// no switch that turns the next install's signature checks off. The
+	// removal unlinks whatever is at the path, a symlink included, and never
+	// follows one. Only `install --developer-mode on` writes it.
+	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: DeveloperModeMarkerPath, assertExists: false})
 	return items
 }
 

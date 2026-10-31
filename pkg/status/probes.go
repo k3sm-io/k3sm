@@ -361,12 +361,20 @@ type Collector struct {
 	// cannot read the work dir vouch for what that endpoint answers only when
 	// it passes. OPTIONAL: nil anchors nothing, and those rows stay unknown.
 	ServerAnchor Anchor
-	Paths        Paths
-	EUID         int
-	ServiceUID   int
-	Now          func() time.Time
-	Version      version.Info
-	Host         string
+	// DeveloperMode reads the developer-mode marker
+	// (install.ReadDeveloperModeState in production). OPTIONAL: nil leaves
+	// the developer-mode row out.
+	DeveloperMode func() install.DeveloperModeState
+	// SigningTeamID reads the Team ID of a binary's signature
+	// (install.CodesignTeamID in production), for the developer-mode row's
+	// wide signing key. OPTIONAL: nil leaves that key out.
+	SigningTeamID func(ctx context.Context, path string) (string, error)
+	Paths         Paths
+	EUID          int
+	ServiceUID    int
+	Now           func() time.Time
+	Version       version.Info
+	Host          string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

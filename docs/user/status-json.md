@@ -220,9 +220,9 @@ four.
 Row names in the full report include `install`, `netd`, `server` or `agent`, `apiserver`, `node`,
 `workloads`, `data-root`, `datastore`, `kubeconfig`, `runtimed` and `dns`; some rows appear only when the
 thing they describe exists (`datavol`, `server-args`, `settings`, `heartbeat`, `pre-volume`, `etcd`,
-`mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`, `ingest-registry`). Besides the daemon states above, a row's `state` may
+`mesh-claims`, `services`, `update`, `node-resolver`, `shadow-shells`, `request-header`, `interconnect`, `ingest-registry`, `developer-mode`). Besides the daemon states above, a row's `state` may
 be `ok`, `ready`, `down`, `not-ready`, `wrong-owner`, `not-mounted`, `absent`, `partial`, `missing`,
-`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind`, `ahead`, `rolling` or `refused`.
+`skip`, `drift`, `healthy`, `unhealthy`, `stale`, `needs-admin`, `behind`, `ahead`, `rolling`, `refused`, `on` or `invalid`.
 
 `kubeconfig` names the credentials the report reads the cluster with and where it found them. When
 it has a client, it proves the credential with one authenticated request, a `SelfSubjectReview`
@@ -326,6 +326,18 @@ A value read from a file only root can read is `restricted`, and the row's `stat
 the row's `state` when that source is the node daemon's arguments. No value is a token, key or
 password: the row names a fixed set of settings, none of which is a credential. `detail` gives the
 same values in one line.
+
+The `developer-mode` row appears only while something is at `/Library/k3sm.developer-mode`, and it
+never changes the `verdict`. Its `severity` is `warn`. The verdict stays `ok` while developer mode is
+on, so automation that needs to know reads this row. See [Developer mode](install.md#developer-mode).
+
+| `state` | meaning |
+|---|---|
+| `on` | a valid marker is there: the signature of the k3sm that runs as root is not checked. `remedy` is `sudo k3sm install --developer-mode off`; installing a release signed with a Developer ID also turns developer mode off, and reinstalling an ad-hoc signed build from source does not |
+| `invalid` | something is at the path that is not a root-owned file nobody else can write, with no ACL. It is ignored and the signature checks stay on. `remedy` is `sudo rm /Library/k3sm.developer-mode` |
+
+`wide.signing` names how the installed k3sm is signed, `ad-hoc` or `team <ID>`; it is omitted when
+that cannot be read. `detail` and `remedy` are sentences for a person; do not parse them.
 
 The `heartbeat` row reports how long ago this Mac's node last posted its status and renewed its
 Lease, as the apiserver holds them. It appears when the apiserver answered and this Mac's node was

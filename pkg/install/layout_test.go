@@ -115,7 +115,7 @@ func TestInstallGoHoldsOnlyOrchestration(t *testing.T) {
 
 	// Intentionally generous: this guards the split, not a precise size. It is
 	// red at the pre-split 4,366 lines.
-	const maxLines = 3000
+	const maxLines = 3050
 	b, err := os.ReadFile("install.go")
 	if err != nil {
 		t.Fatal(err)

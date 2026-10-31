@@ -44,6 +44,7 @@ type fakeAppHost struct {
 	cliSig     binsign.Signature
 	running    bool
 	runErr     error
+	devMode    bool
 	// block, when set, runs at the start of Signature: a check that hangs.
 	block func(ctx context.Context)
 
@@ -74,6 +75,7 @@ func (h *fakeAppHost) Running(_ context.Context, uid uint32, name string) (bool,
 	h.pgreps = append(h.pgreps, name)
 	return h.running, nil
 }
+func (h *fakeAppHost) DeveloperMode() bool { return h.devMode }
 func (h *fakeAppHost) Run(_ context.Context, argv, env []string) ([]byte, error) {
 	h.runs = append(h.runs, argv)
 	h.envs = append(h.envs, env)
@@ -146,6 +148,13 @@ func TestInstallLaunchesTheAppHidden(t *testing.T) {
 			h.cliSig = team
 			h.appSig = binsign.Signature{Valid: true, TeamID: "ZZZZZ99999", Identifier: AppBundleID}
 		}, wantWarn: "ZZZZZ99999"},
+		// Developer mode: a signing mismatch is a note, and the app opens.
+		{name: "developer mode: ad-hoc k3sm, team-signed app: opened", launch: true, mutate: func(h *fakeAppHost) { h.appSig, h.devMode = team, true }},
+		{name: "developer mode: team-signed k3sm, ad-hoc app: opened", launch: true, mutate: func(h *fakeAppHost) { h.cliSig, h.devMode = team, true }},
+		// ...but every other check still holds.
+		{name: "developer mode: codesign verify fails on the app", mutate: func(h *fakeAppHost) {
+			h.appSig, h.devMode = binsign.Signature{}, true
+		}, wantWarn: "does not verify"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -195,6 +204,23 @@ func TestInstallLaunchesTheAppHidden(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("developer mode logs the signing mismatch at Info", func(t *testing.T) {
+		h := good()
+		h.appSig, h.devMode = team, true
+		var logs bytes.Buffer
+		l := hiddenAppLauncher{host: h, executable: testCLI, bundle: testAppBundle, logger: slog.New(slog.NewTextHandler(&logs, nil))}
+		if err := l.Launch(context.Background(), AppLaunchRequest{Command: "install"}); err != nil {
+			t.Fatal(err)
+		}
+		out := logs.String()
+		if strings.Contains(out, "level=WARN") || !strings.Contains(out, "level=INFO") || !strings.Contains(out, "developer mode") || !strings.Contains(out, "ad-hoc signed but the app is signed by team") {
+			t.Errorf("want the mismatch at Info under developer mode, logs:\n%s", out)
+		}
+		if len(h.runs) != 1 {
+			t.Errorf("ran %q, want one launch", h.runs)
+		}
+	})
 
 	t.Run("a long executable name is matched as the kernel truncates it", func(t *testing.T) {
 		h := good()

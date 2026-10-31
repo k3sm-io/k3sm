@@ -71,6 +71,8 @@ func TestMain(m *testing.M) {
 // the install orchestration without any real privilege.
 type fakeSystem struct {
 	calls []string
+	// acls marks the paths HasACL reports as carrying an extended ACL.
+	acls map[string]bool
 	// serverBooted is set once the fake launchd starts the server label; from then
 	// on a read of any work dir's tls/cluster-ca.crt answers with fakeBootClusterCA,
 	// modelling the control plane minting its CA on first boot. noBootCA keeps the
@@ -397,6 +399,12 @@ func (f *fakeSystem) putOwned(path string, uid, gid int, mode fs.FileMode, kind 
 		f.owners = map[string]OwnedEntry{}
 	}
 	f.owners[path] = OwnedEntry{Path: path, UID: uid, GID: gid, Mode: mode, Kind: kind}
+}
+
+// HasACL answers from acls; a path with no entry carries none.
+func (f *fakeSystem) HasACL(path string) (bool, error) {
+	f.calls = append(f.calls, "HasACL:"+path)
+	return f.acls[path], nil
 }
 
 // Owner answers from the ownership table. A path with no entry is ABSENT with
@@ -2224,6 +2232,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		// --service-cidr before the walk removes it (absent here, so the
 		// uninstall configuration's default stands in at the flush below).
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.netd.plist",
+		// The developer-mode marker, last in the manifest so first removed;
+		// RemoveAll unlinks a symlink there and never follows it.
+		"RemoveAll:/Library/k3sm.developer-mode",
 		"RemoveAll:/var/log/containers",
 		"RemoveAll:/var/log/pods",
 		"Bootout:io.k3sm.server",
@@ -2941,6 +2952,11 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 				created[filepath.Join(StateStatus.Path(dc.DataRoot), name)] = true
 			}
 		}
+		// The developer-mode marker is written only by an install with
+		// --developer-mode on, which this one is not. Uninstall cannot tell
+		// whether an earlier install wrote it, so it removes that one path on
+		// every role; it is admitted by that exact path.
+		created[DeveloperModeMarkerPath] = true
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
 			if !created[p] {
 				t.Errorf("uninstall removed %q, which install never created (over-broad removal)", p)

@@ -175,6 +175,19 @@ v0.2.3 was released on 2026-10-29.
 - **The app finds its own new releases.** The k3sm app checks a release index signed with the
   project's Developer ID for a newer release of itself and of k3sm, says how far behind it is, and
   points to the download. Installing a release in place comes after it.
+- **Developer mode.** A build from source can be installed and driven from the app: `k3sm install
+  --developer-mode on` turns the signature checks off on that Mac, with a warning in `k3sm status`
+  and in the app while it is on. A developer build of the app then installs, updates, stops and
+  starts that k3sm. `k3sm install --developer-mode off` turns it off, and so does installing a
+  signed release (through the app, every program must be signed by one Developer ID team, the
+  installed build's team if it has one). A release build of the app never uses it.
+- **Update channels.** `stable` (the default, tagged releases only) and `rc` (release candidates
+  too), set once for the cluster. `k3sm update check` and the app's Update button follow the
+  cluster's channel.
+- **Developer builds rank in the version order.** A k3sm built from source already reads as a
+  pre-release of the next patch (`0.2.4-0.<stamp>-<commit>`), below every release candidate and
+  release of that version. The app's developer build takes the same shape instead of `0.0.0`, so a
+  developer app and a developer k3sm rank against releases the same way.
 
 ## v0.4 (planned)
 

@@ -192,6 +192,11 @@ func (c Collector) Collect(ctx context.Context) Report {
 			rows = append(rows, r)
 		}
 	}
+	// The developer-mode marker, whenever something is at its path: it can
+	// outlive an install, and an uninstall removes it.
+	if r, ok := c.developerModeRow(ctx); ok {
+		rows = append(rows, r)
+	}
 
 	// The image migration row stays out of rows, so neither the verdict nor
 	// the JSON encoding sees it (Report.ImageMigration), and only on an
