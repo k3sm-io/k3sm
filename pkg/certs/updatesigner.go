@@ -20,6 +20,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -99,4 +100,23 @@ func (c *CA) IssueUpdateSigner() (*UpdateSigner, error) {
 		return nil, fmt.Errorf("parse the update signer certificate: %w", err)
 	}
 	return &UpdateSigner{Key: key, Cert: cert, CertPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}, nil
+}
+
+// SignManifest signs a release payload manifest with s: the ASN.1 ECDSA
+// signature over sha256(manifest), the form VerifySignedPayload checks
+// (SignedPayload.Signature). manifest is signed exactly as given, so the
+// caller delivers those bytes unchanged beside the signature.
+func (s *UpdateSigner) SignManifest(manifest []byte) ([]byte, error) {
+	if s == nil || s.Key == nil {
+		return nil, errors.New("sign the payload manifest: no update signer")
+	}
+	if len(manifest) == 0 || len(manifest) > MaxPayloadManifestBytes {
+		return nil, fmt.Errorf("sign the payload manifest: %d bytes, want 1 to %d", len(manifest), MaxPayloadManifestBytes)
+	}
+	digest := sha256.Sum256(manifest)
+	sig, err := ecdsa.SignASN1(rand.Reader, s.Key, digest[:])
+	if err != nil {
+		return nil, fmt.Errorf("sign the payload manifest: %w", err)
+	}
+	return sig, nil
 }

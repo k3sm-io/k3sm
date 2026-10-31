@@ -383,6 +383,18 @@ func parsePayloadManifest(raw []byte, maxMembers int) (*PayloadManifest, error) 
 	return &m, nil
 }
 
+// ParsePayloadManifest decodes raw as VerifySignedPayload does after the
+// signature check: strict JSON (no unknown or repeated key, nothing after the
+// value), at most MaxPayloadManifestBytes, every field checked. It verifies
+// no signature: a caller about to sign a manifest uses it to refuse one it
+// would not accept back.
+func ParsePayloadManifest(raw []byte) (*PayloadManifest, error) {
+	if len(raw) > MaxPayloadManifestBytes {
+		return nil, fmt.Errorf("%w: the manifest is larger than %d bytes", ErrPayloadTooLarge, MaxPayloadManifestBytes)
+	}
+	return parsePayloadManifest(raw, MaxPayloadMembers)
+}
+
 // validManifestString reports whether s is a non-empty bounded version
 // string of letters, digits and ".+-_".
 func validManifestString(s string) bool {
