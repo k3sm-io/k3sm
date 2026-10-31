@@ -106,6 +106,19 @@ func (c *CA) IssueUpdateSigner() (*UpdateSigner, error) {
 // signature over sha256(manifest), the form VerifySignedPayload checks
 // (SignedPayload.Signature). manifest is signed exactly as given, so the
 // caller delivers those bytes unchanged beside the signature.
+//
+// Key use. The same key signs the update payload annotation
+// (update.SignPayload), and both signatures are over a bare sha256 of the
+// signed bytes, with no context string. What keeps a payload signature from
+// standing in for a manifest signature, and the reverse, is that no byte
+// string is accepted by both decoders: ParsePayloadManifest rejects unknown
+// keys and requires a non-empty members list, and the payload decoder
+// (update.ParsePayload) rejects unknown keys, members among them.
+// TestManifestAndPayloadDecodersAreDisjoint pins that property; a field added
+// to either type must keep it. The planned form signs sha256 over a
+// domain-separation prefix and the bytes (one context per use), which waits
+// until every verifier in a cluster accepts the context; the verifiers that
+// predate the manifest check a bare digest only.
 func (s *UpdateSigner) SignManifest(manifest []byte) ([]byte, error) {
 	if s == nil || s.Key == nil {
 		return nil, errors.New("sign the payload manifest: no update signer")
