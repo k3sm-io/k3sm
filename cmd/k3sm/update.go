@@ -61,7 +61,7 @@ Usage:
   k3sm update check [-o text|json]
   k3sm update apply [--version <tag>] [--drain] [--allow-downgrade]
                     [--signature if-signed|required] [--yes]
-                    [--pin-sha256 <digest>]
+                    [--pin-sha256 <digest> [--manifest-sha256 <digest>]]
   k3sm update apply --clear-pin
   k3sm update status [-o text|json] [--watch]
   k3sm update cancel
@@ -103,6 +103,11 @@ Flags:
                       update controller refuses the release, before any node
                       is cordoned, unless its checksums file carries exactly
                       this digest
+  --manifest-sha256 <digest>
+                      also bind the release's payload manifest to this sha256
+                      (apply; needs --pin-sha256): the update controller
+                      refuses the release, before any node is cordoned,
+                      unless its manifest file has exactly this digest
   --clear-pin         remove the release pin and exit (apply; root only); a pin
                       directory that cannot be trusted is moved aside, and the
                       aside entries stay in the work dir for the service user
@@ -713,6 +718,7 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 	signature := fsFlags.String("signature", string(updatesv1alpha1.UpdateSignatureIfSigned), "code-signature policy: if-signed or required")
 	yes := fsFlags.Bool("yes", false, "do not ask for confirmation")
 	pinSHA := fsFlags.String("pin-sha256", "", "bind the roll to this archive sha256 (root only; needs --version)")
+	manifestSHA := fsFlags.String("manifest-sha256", "", "also bind the release's payload manifest to this sha256 (needs --pin-sha256)")
 	clearPin := fsFlags.Bool("clear-pin", false, "remove the release pin and exit (root only)")
 	if err := fsFlags.Parse(args); err != nil {
 		return exitUsage
@@ -725,8 +731,15 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 	if *clearPin {
 		return runUpdateClearPin(fsFlags, env)
 	}
-	pinning := false // --pin-sha256 was given, even empty
-	fsFlags.Visit(func(f *flag.Flag) { pinning = pinning || f.Name == "pin-sha256" })
+	pinning, manifestPinning := false, false // the flag was given, even empty
+	fsFlags.Visit(func(f *flag.Flag) {
+		pinning = pinning || f.Name == "pin-sha256"
+		manifestPinning = manifestPinning || f.Name == "manifest-sha256"
+	})
+	if manifestPinning && !pinning {
+		fmt.Fprintln(env.errOut, "k3sm update apply: --manifest-sha256 extends the release pin; pass --pin-sha256 too")
+		return exitUsage
+	}
 	if pinning {
 		if !env.root {
 			fmt.Fprintln(env.errOut, "k3sm update apply: --pin-sha256 writes the server's release pin and must run as root")
@@ -739,6 +752,18 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 		if err := (updatectl.ReleasePin{Version: *tag, SHA256: *pinSHA}).Validate(); err != nil {
 			fmt.Fprintln(env.errOut, "k3sm update apply: --pin-sha256:", err)
 			return exitUsage
+		}
+		if manifestPinning {
+			// Validate accepts an empty manifest digest (an archive-only pin),
+			// so a given-but-empty flag is refused here.
+			err := (updatectl.ReleasePin{Version: *tag, SHA256: *pinSHA, ManifestSHA256: *manifestSHA}).Validate()
+			if err == nil && *manifestSHA == "" {
+				err = errors.New("the pinned manifest sha256 is not 64 lowercase hex digits")
+			}
+			if err != nil {
+				fmt.Fprintln(env.errOut, "k3sm update apply: --manifest-sha256:", err)
+				return exitUsage
+			}
 		}
 		if env.workDir == "" {
 			fmt.Fprintln(env.errOut, "k3sm update apply: no server work dir to write the release pin in")
@@ -800,12 +825,15 @@ func runUpdateApply(ctx context.Context, args []string, env updateEnv) int {
 		if write == nil {
 			write = updatectl.WriteReleasePin
 		}
-		pin := updatectl.ReleasePin{Version: target, SHA256: *pinSHA, At: time.Now().UTC().Truncate(time.Second)}
+		pin := updatectl.ReleasePin{Version: target, SHA256: *pinSHA, ManifestSHA256: *manifestSHA, At: time.Now().UTC().Truncate(time.Second)}
 		if err := write(env.workDir, pin); err != nil {
 			fmt.Fprintln(env.errOut, "k3sm update apply:", err)
 			return exitInternalError
 		}
 		fmt.Fprintf(env.out, "Pinned %s to sha256:%s.\n", status.ClipText(target, 128), *pinSHA)
+		if *manifestSHA != "" {
+			fmt.Fprintf(env.out, "Pinned the payload manifest of %s to sha256:%s.\n", status.ClipText(target, 128), *manifestSHA)
+		}
 	}
 	if existing != nil {
 		uid := existing.UID

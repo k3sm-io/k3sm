@@ -839,6 +839,16 @@ func TestUpdateApplyPinRequiresRoot(t *testing.T) {
 		{name: "clear as a user", args: []string{"apply", "--clear-pin"}, wantCode: exitInternalError, wantErr: "must run as root"},
 		{name: "pin without --version", root: true, args: []string{"apply", "--yes", "--pin-sha256", sum}, wantCode: exitUsage, wantErr: "--version"},
 		{name: "a malformed digest", root: true, args: []string{"apply", "--yes", "--version", "v0.2.0", "--pin-sha256", strings.ToUpper(sum)}, wantCode: exitUsage, wantErr: "64 lowercase hex"},
+		{name: "a manifest digest without a pin", root: true, args: []string{"apply", "--yes", "--version", "v0.2.0", "--manifest-sha256", sum},
+			wantCode: exitUsage, wantErr: "pass --pin-sha256 too"},
+		{name: "a malformed manifest digest", root: true, args: []string{"apply", "--yes", "--version", "v0.2.0", "--pin-sha256", sum, "--manifest-sha256", strings.ToUpper(sum)},
+			wantCode: exitUsage, wantErr: "--manifest-sha256: the pinned manifest sha256 is not 64 lowercase hex"},
+		{name: "a short manifest digest", root: true, args: []string{"apply", "--yes", "--version", "v0.2.0", "--pin-sha256", sum, "--manifest-sha256", sum[:63]},
+			wantCode: exitUsage, wantErr: "64 lowercase hex"},
+		{name: "an empty manifest digest", root: true, args: []string{"apply", "--yes", "--version", "v0.2.0", "--pin-sha256", sum, "--manifest-sha256", ""},
+			wantCode: exitUsage, wantErr: "64 lowercase hex"},
+		{name: "a manifest digest as a user", args: []string{"apply", "--yes", "--version", "v0.2.0", "--pin-sha256", sum, "--manifest-sha256", sum},
+			wantCode: exitInternalError, wantErr: "must run as root"},
 		{name: "clear with another flag", root: true, args: []string{"apply", "--clear-pin", "--version", "v0.2.0"}, wantCode: exitUsage, wantErr: "takes no other flag"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -885,6 +895,31 @@ func TestUpdateApplyPinRequiresRoot(t *testing.T) {
 		code, _, errOut = c.runWith(t, asRoot(c, &p, true), "apply", "--yes", "--version", "v0.2.1", "--pin-sha256", sum)
 		if code != exitInternalError || !strings.Contains(errOut, "is Rolling") || len(p.written) != 1 {
 			t.Fatalf("pinned apply while Rolling: exit %d, stderr %q, pins %+v", code, errOut, p.written)
+		}
+	})
+
+	t.Run("root writes the manifest digest into the pin", func(t *testing.T) {
+		const manifestSum = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+		c := newUpdateCluster(server)
+		var p pins
+		code, out, errOut := c.runWith(t, asRoot(c, &p, true), "apply", "--yes", "--version", "v0.2.0", "--pin-sha256", sum, "--manifest-sha256", manifestSum)
+		if code != 0 {
+			t.Fatalf("exit %d, stderr %s", code, errOut)
+		}
+		if len(p.written) != 1 || p.written[0].SHA256 != sum || p.written[0].ManifestSHA256 != manifestSum {
+			t.Fatalf("pin %+v", p.written)
+		}
+		if !strings.Contains(out, "Pinned the payload manifest of v0.2.0 to sha256:"+manifestSum) {
+			t.Fatalf("output %s", out)
+		}
+		// Without the flag the pin stays archive-only.
+		c = newUpdateCluster(server)
+		p = pins{}
+		if code, _, errOut := c.runWith(t, asRoot(c, &p, true), "apply", "--yes", "--version", "v0.2.0", "--pin-sha256", sum); code != 0 {
+			t.Fatalf("exit %d, stderr %s", code, errOut)
+		}
+		if len(p.written) != 1 || p.written[0].ManifestSHA256 != "" {
+			t.Fatalf("an archive-only apply wrote %+v", p.written)
 		}
 	})
 

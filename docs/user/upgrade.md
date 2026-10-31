@@ -53,7 +53,7 @@ k3sm update cancel                      # stop after the current node
 k3sm update abort                       # recover from a failed step
 ```
 
-`k3sm update apply [--version <tag>] [--drain] [--allow-downgrade] [--signature if-signed|required] [--yes] [--pin-sha256 <digest>]`
+`k3sm update apply [--version <tag>] [--drain] [--allow-downgrade] [--signature if-signed|required] [--yes] [--pin-sha256 <digest> [--manifest-sha256 <digest>]]`
 moves the cluster to the latest release, or to the tag `--version` names. It prints the plan
 first: the nodes in the order they will be updated with the version each runs, the target, whether
 nodes are drained, and the signature policy. It then asks for confirmation; `--yes` skips the
@@ -73,6 +73,12 @@ creates the `Update` named `current` that the server's update controller rolls.
   `--version` and must run as root. The pin is written to the server before the Update is created,
   and the update controller refuses the release, before any node is cordoned, unless its checksums
   file carries exactly this digest.
+- `--manifest-sha256 <digest>` also binds the release's payload manifest, the file that names the
+  release's Kubernetes minor, the oldest version it updates in place, and whether it needs the
+  installer. It needs `--pin-sha256`. The update controller refuses the release, before any node
+  is cordoned, unless the manifest it downloads has exactly this sha256. Without it the pin binds
+  the archive only, and the manifest is trusted as far as the release host is. A server running a
+  k3sm older than this flag cannot read a pin that carries a manifest digest and refuses the update.
 - `k3sm update apply --clear-pin` removes that pin and exits. It takes no other flag (except
   `--yes`) and must run as root.
 

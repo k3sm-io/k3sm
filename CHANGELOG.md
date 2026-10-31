@@ -10,6 +10,12 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Added
+
+- `k3sm update apply --manifest-sha256 <digest>`, beside `--pin-sha256`, also binds the release's
+  payload manifest: the update is refused, with no node cordoned, unless the manifest has exactly
+  that sha256.
+
 ### Changed
 
 - A managed update now reads the release's payload manifest before it touches a node. It
