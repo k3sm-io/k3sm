@@ -42,8 +42,10 @@ limitations under the License.
 // had its full grace. The first sweep over a store without the
 // registry-state/gc-ran marker only reports what it would reap, then writes
 // the marker. A sweep that would delete more than half of a repository's
-// blobs stops with ErrMassDelete, unless the repository has no rows left
-// because its manifests were deleted. Anything the collector cannot read
+// blobs stops with ErrMassDelete, unless it empties the repository: it leaves
+// no row and every blob it reaps is older than the last change to the rows.
+// A first push in progress, whose blobs are newer than its empty index, stays
+// under the brake. Anything the collector cannot read
 // (a manifest body that is missing or does not parse) stops that
 // repository's sweep: it never deletes on a guess.
 package gc

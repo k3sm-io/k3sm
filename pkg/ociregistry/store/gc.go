@@ -123,7 +123,7 @@ func contents(dir string) (Contents, error) {
 			switch {
 			case !fi.Mode().IsRegular():
 				c.Unknown++
-			case isTempName(e.Name()):
+			case isTempName(e.Name()) && isAlgorithm(a.Name()):
 				c.Temps = append(c.Temps, Temp{Algorithm: a.Name(), Name: e.Name(), ModTime: fi.ModTime()})
 			default:
 				d, err := ref.ParseDigest(a.Name() + ":" + e.Name())
