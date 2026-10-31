@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -130,18 +131,46 @@ type sleepHarness struct {
 	mu       sync.Mutex
 	clock    time.Time
 	publishd int
+	// promote is the fake dark-wake timer; afterD records the armed bound.
+	promote chan time.Time
+	afterD  time.Duration
+	log     *lockedBuffer
+}
+
+// lockedBuffer is a log sink safe to read while the reporter writes.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func startSleepHarness(t *testing.T, host *fakePowerHost) *sleepHarness {
 	t.Helper()
 	h := &sleepHarness{host: host, rec: record.NewFakeRecorder(16), done: make(chan error, 1),
-		clock: time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)}
-	r, err := NewSleepReporter(SleepReporterConfig{NodeName: "mac-a", Recorder: h.rec, Host: host, Log: discardLog()})
+		clock: time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC), promote: make(chan time.Time, 1), log: &lockedBuffer{}}
+	r, err := NewSleepReporter(SleepReporterConfig{NodeName: "mac-a", Recorder: h.rec, Host: host, Log: slog.New(slog.NewTextHandler(h.log, nil))})
 	if err != nil {
 		t.Fatalf("NewSleepReporter: %v", err)
 	}
 	r.now = func() time.Time { h.mu.Lock(); defer h.mu.Unlock(); return h.clock }
 	r.publish = func(context.Context) error { h.mu.Lock(); defer h.mu.Unlock(); h.publishd++; return nil }
+	r.after = func(d time.Duration) <-chan time.Time {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.afterD = d
+		return h.promote
+	}
 	h.r = r
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
@@ -388,5 +417,98 @@ func TestSleepConditionTransitionTimes(t *testing.T) {
 	_ = nextEvent(t, h.rec)
 	if got := h.r.condition(later).LastTransitionTime; !got.Equal(&wokeAt) {
 		t.Fatalf("woken LastTransitionTime = %v, want the wake time %v", got, wokeAt)
+	}
+}
+
+// waitPublishes waits until the harness has seen n publications.
+func (h *sleepHarness) waitPublishes(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.publishes() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("publishes = %d, want %d", h.publishes(), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestSleepLongDarkWakeIsServing pins the promotion with a fake clock: a dark
+// wake keeps Sleeping=True until it has lasted 60 s, then publishes
+// Sleeping=False with reason DarkWake; the next will-sleep is a real sleep
+// again, with its Event and publication.
+func TestSleepLongDarkWakeIsServing(t *testing.T) {
+	host := newFakePowerHost()
+	h := startSleepHarness(t, host)
+	host.deliver(t, PowerWillSleep)
+	_ = nextEvent(t, h.rec)
+
+	h.advance(30 * time.Minute)
+	host.deliver(t, PowerDarkWake)
+	if c := h.r.condition(metav1.Now()); c.Status != corev1.ConditionTrue {
+		t.Fatalf("a fresh dark wake changed Sleeping: %+v", c)
+	}
+	h.mu.Lock()
+	armed := h.afterD
+	h.mu.Unlock()
+	if armed != darkWakePromoteAfter || darkWakePromoteAfter != 60*time.Second {
+		t.Fatalf("promotion armed for %s, want 60s", armed)
+	}
+	if h.publishes() != 1 {
+		t.Fatalf("a dark wake published: publishes = %d, want 1", h.publishes())
+	}
+
+	h.advance(61 * time.Second)
+	h.promote <- time.Now()
+	h.waitPublishes(t, 2)
+	c := h.r.condition(metav1.Now())
+	if c.Status != corev1.ConditionFalse || c.Reason != sleepDarkReason || !strings.Contains(c.Message, "maintenance (dark) wake") || !strings.Contains(c.Message, "serving") {
+		t.Fatalf("long dark wake condition = %+v", c)
+	}
+
+	host.deliver(t, PowerWillSleep)
+	if e := nextEvent(t, h.rec); !strings.HasPrefix(e, "Normal "+sleepEventReason+" ") {
+		t.Fatalf("sleep after a serving dark wake recorded %q", e)
+	}
+	if h.publishes() != 3 {
+		t.Fatalf("publishes = %d after the next sleep, want 3", h.publishes())
+	}
+	if c := h.r.condition(metav1.Now()); c.Status != corev1.ConditionTrue || c.Reason != sleepWillReason {
+		t.Fatalf("condition after the next sleep = %+v", c)
+	}
+}
+
+// TestSleepShortDarkWakeIsNotPromoted pins the other side: a dark wake that
+// ends in sleep before 60 s leaves Sleeping=True, and the timer firing late
+// changes nothing.
+func TestSleepShortDarkWakeIsNotPromoted(t *testing.T) {
+	host := newFakePowerHost()
+	h := startSleepHarness(t, host)
+	host.deliver(t, PowerWillSleep)
+	_ = nextEvent(t, h.rec)
+	host.deliver(t, PowerDarkWake)
+	h.advance(20 * time.Second)
+	host.deliver(t, PowerWillSleep)
+	h.promote <- time.Now()
+	host.deliver(t, PowerWillSleep) // a round trip through Run after the firing
+	if h.publishes() != 1 {
+		t.Fatalf("publishes = %d, want 1", h.publishes())
+	}
+	if c := h.r.condition(metav1.Now()); c.Status != corev1.ConditionTrue || c.Reason != sleepWillReason {
+		t.Fatalf("condition = %+v, want still asleep", c)
+	}
+}
+
+// TestSleepUnclassifiedWakeWarnsOnce pins the visible fail-open: a host that
+// cannot classify wakes makes the reporter warn once, not per notice.
+func TestSleepUnclassifiedWakeWarnsOnce(t *testing.T) {
+	host := newFakePowerHost()
+	h := startSleepHarness(t, host)
+	host.deliver(t, PowerWakeUnclassified)
+	host.deliver(t, PowerWakeUnclassified)
+	if n := strings.Count(h.log.String(), "dark wakes (Power Nap, maintenance wakes) will be counted as full wakes"); n != 1 {
+		t.Fatalf("warned %d times, want once:\n%s", n, h.log.String())
+	}
+	if !strings.Contains(h.log.String(), "level=WARN") {
+		t.Fatalf("not logged at Warn:\n%s", h.log.String())
 	}
 }

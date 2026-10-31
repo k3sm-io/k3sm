@@ -48,9 +48,12 @@ import (
 //     notice, so the NotReady that follows carries a reason on the Node. On
 //     wake it publishes Sleeping=False and a SystemWake Event naming how long
 //     the Mac slept. A dark wake (Power Nap, a maintenance wake) is not a
-//     wake: the host reports only a full wake, so Sleeping stays True through
-//     one and the reporter publishes nothing for it. A will-sleep that ends a
-//     dark wake finds the node already asleep and is acknowledged at once.
+//     full wake: Sleeping stays True through a short one, the reporter
+//     publishes nothing for it (the regular status heartbeat may still land),
+//     and the will-sleep that ends it is acknowledged at once. A dark wake
+//     that lasts past darkWakePromoteAfter, which a headless Mac on AC power
+//     holding the assertion can stay in indefinitely while it serves, is
+//     published as Sleeping=False with reason DarkWake.
 //
 // The assertion and the notices come through PowerHost, the seam over IOKit's
 // power-management API (sleep_darwin.go); tests use a fake.
@@ -64,6 +67,7 @@ const (
 	sleepAwakeReason   = "SystemAwake"
 	sleepWillReason    = "SystemWillSleep"
 	sleepWokeReason    = "SystemWoke"
+	sleepDarkReason    = "DarkWake"
 	sleepEventReason   = "SystemSleep"
 	wakeEventReason    = "SystemWake"
 	sleepAssertionName = "k3sm node: pods are scheduled on this Mac"
@@ -79,6 +83,10 @@ const (
 	willSleepFlushGrace     = 2 * time.Second
 )
 
+// darkWakePromoteAfter is how long a dark wake lasts before the node reports
+// itself as serving rather than sleeping.
+const darkWakePromoteAfter = 60 * time.Second
+
 // PowerNoticeKind names a system power transition.
 type PowerNoticeKind int
 
@@ -86,8 +94,13 @@ const (
 	// PowerWillSleep is delivered before the system sleeps. The system waits
 	// for its Ack (or a bound) before it goes on.
 	PowerWillSleep PowerNoticeKind = iota + 1
-	// PowerDidWake is delivered after the system has woken.
+	// PowerDidWake is delivered after a full (user) wake.
 	PowerDidWake
+	// PowerDarkWake is delivered once when a sleep turns into a dark wake.
+	PowerDarkWake
+	// PowerWakeUnclassified is delivered once when the host cannot tell a
+	// dark wake from a full one, and will count every wake as full.
+	PowerWakeUnclassified
 )
 
 // PowerNotice is one system power transition. Ack, when non-nil, lets the
@@ -118,8 +131,8 @@ type PowerHost interface {
 	PreventSleep(name string) (release func() error, err error)
 	// PowerSource reports the power source the Mac draws from now.
 	PowerSource() PowerSource
-	// WatchSleep delivers the system's sleep notices and its FULL wakes (never
-	// a dark wake) until ctx is done, then closes the channel.
+	// WatchSleep delivers the system's sleep notices, its full wakes and the
+	// start of each dark wake until ctx is done, then closes the channel.
 	WatchSleep(ctx context.Context) (<-chan PowerNotice, error)
 }
 
@@ -149,6 +162,8 @@ type SleepReporter struct {
 	host     PowerHost
 	log      *slog.Logger
 	now      func() time.Time
+	// after is the dark-wake promotion timer; tests substitute a fake.
+	after func(time.Duration) <-chan time.Time
 
 	// publish asks the status loop for an immediate publication; set by
 	// NewNodeStatusProvider. nil until a status provider adopts the reporter.
@@ -163,6 +178,14 @@ type SleepReporter struct {
 	wokeAt    time.Time
 	sleptFor  time.Duration
 	everWoken bool
+	// darkAt is when the current sleep turned into a dark wake (zero if it
+	// has not); darkServing is set, at darkServingAt, once that dark wake has
+	// lasted darkWakePromoteAfter. asleep stays true through both.
+	darkAt        time.Time
+	darkServing   bool
+	darkServingAt time.Time
+	// warnedUnclassified records the one-time Warn for PowerWakeUnclassified.
+	warnedUnclassified bool
 }
 
 // NewSleepReporter returns a reporter for the named node.
@@ -182,7 +205,7 @@ func NewSleepReporter(cfg SleepReporterConfig) (*SleepReporter, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	r := &SleepReporter{nodeName: cfg.NodeName, recorder: rec, host: host, log: log, now: time.Now}
+	r := &SleepReporter{nodeName: cfg.NodeName, recorder: rec, host: host, log: log, now: time.Now, after: time.After}
 	r.startedAt = r.now().Round(0)
 	return r, nil
 }
@@ -216,8 +239,14 @@ func (r *SleepReporter) Run(ctx context.Context) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}
+	// promote fires darkWakePromoteAfter into a dark wake; only this loop
+	// touches it. A stale firing (the dark wake already ended) is a no-op.
+	var promote <-chan time.Time
 	for {
 		select {
+		case <-promote:
+			promote = nil
+			r.promoteDark(ctx)
 		case <-ctx.Done():
 			// Drain so a host blocked on a will-sleep is acknowledged.
 			for n := range notices {
@@ -231,7 +260,9 @@ func (r *SleepReporter) Run(ctx context.Context) error {
 				<-ctx.Done()
 				return ctx.Err()
 			}
-			r.handle(ctx, n)
+			if r.handle(ctx, n) {
+				promote = r.after(darkWakePromoteAfter)
+			}
 		}
 	}
 }
@@ -245,24 +276,26 @@ func (r *SleepReporter) Held() bool {
 
 // handle applies one notice: state first, then the Event and the publication,
 // then the acknowledgement, so the condition is on its way before the Mac
-// sleeps.
-func (r *SleepReporter) handle(ctx context.Context, n PowerNotice) {
+// sleeps. It reports whether a dark wake began, arming the promotion timer.
+func (r *SleepReporter) handle(ctx context.Context, n PowerNotice) (darkBegan bool) {
 	ref := &corev1.ObjectReference{Kind: "Node", Name: r.nodeName, UID: types.UID(r.nodeName)}
 	switch n.Kind {
 	case PowerWillSleep:
 		r.mu.Lock()
-		if r.asleep {
-			// The end of a dark wake: the node never reported waking, so
-			// there is nothing to publish and the original sleep time stands.
+		if r.asleep && !r.darkServing {
+			// The end of a short dark wake: the node never reported waking,
+			// so there is nothing to publish and the original sleep time
+			// stands. The dark wake is over, so its promotion is void.
+			r.darkAt = time.Time{}
 			r.mu.Unlock()
 			break
 		}
-		r.asleep = true
+		r.asleep, r.darkAt, r.darkServing = true, time.Time{}, false
 		// Wall clock, monotonic reading stripped: the monotonic clock does not
 		// advance while a Mac sleeps, so only the wall clock measures the sleep.
 		r.sleptAt = r.now().Round(0)
 		r.mu.Unlock()
-		r.recorder.Event(ref, corev1.EventTypeNormal, sleepEventReason, "Node is going to system sleep; it stops posting status until it wakes")
+		r.recorder.Event(ref, corev1.EventTypeNormal, sleepEventReason, "Node is going to system sleep; it posts no status while the Mac sleeps")
 		r.publishNow(ctx, willSleepPublishTimeout)
 		select {
 		case <-ctx.Done():
@@ -276,6 +309,7 @@ func (r *SleepReporter) handle(ctx context.Context, n PowerNotice) {
 			slept = now.Sub(r.sleptAt)
 		}
 		r.asleep, r.wokeAt, r.sleptFor, r.everWoken = false, now, slept, true
+		r.darkAt, r.darkServing = time.Time{}, false
 		r.mu.Unlock()
 		msg := "Node woke from system sleep"
 		if slept > 0 {
@@ -283,10 +317,40 @@ func (r *SleepReporter) handle(ctx context.Context, n PowerNotice) {
 		}
 		r.recorder.Event(ref, corev1.EventTypeNormal, wakeEventReason, msg)
 		r.publishNow(ctx, willSleepPublishTimeout)
+	case PowerDarkWake:
+		r.mu.Lock()
+		if r.asleep && r.darkAt.IsZero() {
+			r.darkAt = r.now().Round(0)
+			darkBegan = true
+		}
+		r.mu.Unlock()
+	case PowerWakeUnclassified:
+		r.mu.Lock()
+		first := !r.warnedUnclassified
+		r.warnedUnclassified = true
+		r.mu.Unlock()
+		if first {
+			r.log.Warn("cannot read the system's wake capabilities; dark wakes (Power Nap, maintenance wakes) will be counted as full wakes")
+		}
 	}
 	if n.Ack != nil {
 		n.Ack()
 	}
+	return darkBegan
+}
+
+// promoteDark reports a dark wake that has outlasted darkWakePromoteAfter as
+// serving: the Mac is awake enough to run pods, so Sleeping=True would
+// misreport it. A firing after the dark wake ended does nothing.
+func (r *SleepReporter) promoteDark(ctx context.Context) {
+	r.mu.Lock()
+	if !r.asleep || r.darkAt.IsZero() || r.darkServing {
+		r.mu.Unlock()
+		return
+	}
+	r.darkServing, r.darkServingAt = true, r.now().Round(0)
+	r.mu.Unlock()
+	r.publishNow(ctx, willSleepPublishTimeout)
 }
 
 // publishNow asks the status loop for an immediate publication, bounded.
@@ -317,11 +381,15 @@ func (r *SleepReporter) condition(now metav1.Time) corev1.NodeCondition {
 		LastTransitionTime: metav1.NewTime(r.startedAt),
 	}
 	switch {
+	case r.asleep && r.darkServing:
+		c.Reason = sleepDarkReason
+		c.LastTransitionTime = metav1.NewTime(r.darkServingAt)
+		c.Message = fmt.Sprintf("the Mac has been in a maintenance (dark) wake since %s and the node is serving; the display and user session stay asleep", r.darkAt.UTC().Format(time.RFC3339))
 	case r.asleep:
 		c.Status = corev1.ConditionTrue
 		c.Reason = sleepWillReason
 		c.LastTransitionTime = metav1.NewTime(r.sleptAt)
-		c.Message = fmt.Sprintf("the Mac began system sleep at %s; the node posts no status until it wakes", r.sleptAt.UTC().Format(time.RFC3339))
+		c.Message = fmt.Sprintf("the Mac began system sleep at %s; the node posts no status while it sleeps, and may post status during a short dark wake (Power Nap, maintenance) without this condition changing", r.sleptAt.UTC().Format(time.RFC3339))
 		return c
 	case r.everWoken:
 		c.Reason = sleepWokeReason

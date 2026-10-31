@@ -76,10 +76,11 @@ func TestSleepAckMatchesItsNotice(t *testing.T) {
 	})
 }
 
-// TestSleepWakeNeedsGraphics pins the dark-wake classification: a wake counts
-// only with the CPU and Graphics capabilities, and a capability change counts
-// only when it has completed the gain of a full wake.
-func TestSleepWakeNeedsGraphics(t *testing.T) {
+// TestSleepWakePredicateNeedsGraphics pins only the C classification
+// predicates: a capability set is a full wake only with CPU and Graphics, and
+// a capability change counts only when it has completed the gain of one. It
+// claims nothing about which messages reach the watcher's port.
+func TestSleepWakePredicateNeedsGraphics(t *testing.T) {
 	const cpu, gfx, audio, net = 0x01, 0x02, 0x04, 0x08
 	const will, did = 0x01, 0x02
 	if !isFullWake(cpu | gfx | audio | net) {
