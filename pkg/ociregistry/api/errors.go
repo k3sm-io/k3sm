@@ -136,6 +136,8 @@ func classify(err error) *apiError {
 		return e(http.StatusInsufficientStorage, codeSizeInvalid, "the registry volume is low on space")
 	case errors.Is(err, errBodyTooSlow), errors.Is(err, errRequestTooLong):
 		return e(http.StatusRequestTimeout, codeBlobUploadInvalid, "the request body did not arrive in time")
+	case errors.Is(err, errCatalogCeiling):
+		return e(http.StatusServiceUnavailable, codeUnavailable, "the catalog page could not be completed within the registry's walk limit")
 	case errors.Is(err, errTooManySessions):
 		return e(http.StatusServiceUnavailable, codeUnavailable, "too many upload sessions in progress")
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):

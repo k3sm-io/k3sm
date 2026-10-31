@@ -44,6 +44,16 @@ const defaultCatalogPage = 1000
 // visits an entry, and at least 1,000.
 func catalogVisits(n int) int { return max(4*n, 1000) }
 
+// catalogCeilingFactor is the hard ceiling of one catalog walk, as a multiple
+// of its visit budget. A walk that reaches catalogCeilingFactor times
+// catalogVisits(n) visits without filling its page or finding a readable name
+// to end it on stops and answers an error with no Link, rather than walking a
+// run of denied names without bound.
+const catalogCeilingFactor = 64
+
+// errCatalogCeiling is a catalog walk stopped at its hard ceiling (503).
+var errCatalogCeiling = errors.New("catalog walk reached its visit ceiling")
+
 // parsePage reads n and last from q. n is def when absent and at most most;
 // a negative def means no limit. validLast checks the cursor's grammar.
 func parsePage(q url.Values, def, most int, validLast func(string) error) (n int, last string, err error) {
@@ -136,9 +146,10 @@ func writeJSON(w http.ResponseWriter, r *http.Request, contentType string, v any
 // or any string placed between denied names, would tell the caller where
 // names it may not see sort, so it is never used. The cost of that choice is
 // that a run of denied names after the budget is spent is still walked, up to
-// the next readable name or the end of the store; a caller denied on nearly
-// every repository is bounded only by an Authorizer that can answer for many
-// names at once.
+// the next readable name or the end of the store, but never past the hard
+// ceiling of catalogCeilingFactor times the budget: a walk that would visit
+// more answers errCatalogCeiling with no Link. The walk also stops as soon as
+// the request's context is done.
 func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 	if !s.allow(w, r, VerbRead, ref.Name{}) {
 		return
@@ -155,7 +166,21 @@ func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 	more := false
 	if n > 0 {
 		budget, visits := catalogVisits(n), 0
+		ceiling := s.catalogCeil * budget
+		var stop error
 		err = s.st.WalkRepositories(last, func(rn ref.Name) bool {
+			if err := r.Context().Err(); err != nil {
+				stop = err // the client went away
+				return false
+			}
+			if visits >= ceiling {
+				if len(page) == n {
+					more = true // a full page, and a name after it
+				} else {
+					stop = errCatalogCeiling
+				}
+				return false
+			}
 			visits++
 			if s.catalogVisited != nil {
 				s.catalogVisited()
@@ -174,6 +199,9 @@ func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 			}
 			return true
 		})
+		if err == nil {
+			err = stop
+		}
 		if err != nil {
 			s.fail(w, r, err)
 			return

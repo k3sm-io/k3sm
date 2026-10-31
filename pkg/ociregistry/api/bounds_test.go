@@ -17,6 +17,7 @@ limitations under the License.
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -29,7 +30,9 @@ import (
 
 	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+
 	"k3sm.io/k3sm/pkg/ociregistry/ref"
+	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
 
 // nextLink returns the target of a Link rel="next" header, or "".
@@ -489,4 +492,202 @@ func TestListingBounds(t *testing.T) {
 			t.Errorf("%d pages: %v", pages, got)
 		}
 	})
+}
+
+// TestReferrersRereadNegatives: a manifest cached as unreadable because of its
+// file (missing, mismatched, not regular) is read again once index.json
+// changes, and those reads count against the request's read budget; one
+// unreadable because of its row (an out-of-bounds size) is not.
+func TestReferrersRereadNegatives(t *testing.T) {
+	f := newFixture(t)
+	subject := f.image(t, "app", "v1", "l")
+	var bodies [][]byte
+	for i := range 6 {
+		bodies = append(bodies, referrerBody(subject, "application/vnd.example.sig", i))
+	}
+	f.addRows(t, "app", bodies)
+	// A row whose size no manifest may have.
+	dir := filepath.Join(f.root, "app")
+	raw, err := os.ReadFile(filepath.Join(dir, "index.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var idx ispec.Index
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		t.Fatal(err)
+	}
+	oversize := dg([]byte("oversize"))
+	idx.Manifests = append(idx.Manifests, ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: oversize, Size: store.MaxManifestSize + 1})
+	raw, _ = json.Marshal(idx)
+	if err := os.WriteFile(filepath.Join(dir, ".uploads", "test-index"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, ".uploads", "test-index"), filepath.Join(dir, "index.json")); err != nil {
+		t.Fatal(err)
+	}
+	blob := func(b []byte) string { return filepath.Join(dir, "blobs", "sha256", dg(b).Encoded()) }
+	saved := map[int][]byte{}
+	for i := range 3 {
+		saved[i] = bodies[i]
+		if err := os.Remove(blob(bodies[i])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := map[digest.Digest]int{}
+	reads := 0
+	f.srv.referrerRead = func(d digest.Digest) { read[d]++; reads++ }
+	path := "/v2/app/referrers/" + dg(subject).String()
+	count := func(w *httptest.ResponseRecorder) int {
+		t.Helper()
+		want(t, w, 200, "")
+		var out ispec.Index
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return len(out.Manifests)
+	}
+	if n := count(f.do(http.MethodGet, path, nil)); n != 3 {
+		t.Fatalf("with three blobs missing: %d referrers", n)
+	}
+	// The blobs come back, but index.json is unchanged: nothing is re-read.
+	for i, b := range saved {
+		if err := os.WriteFile(blob(bodies[i]), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reads = 0
+	if n := count(f.do(http.MethodGet, path, nil)); n != 3 || reads != 0 {
+		t.Fatalf("an unchanged index: %d referrers, %d reads", n, reads)
+	}
+	// index.json changes: the three negatives and the new manifest are read
+	// within a budget of two a request, so the first request is busy.
+	f.addRows(t, "app", [][]byte{referrerBody(subject, "application/vnd.example.sig", 6)})
+	f.srv.refScanRows = 2
+	reads = 0
+	want(t, f.do(http.MethodGet, path, nil), http.StatusTooManyRequests, codeTooManyRequests)
+	if reads != 2 {
+		t.Fatalf("the first request after the change read %d manifests, want the budget of 2", reads)
+	}
+	reads = 0
+	if n := count(f.do(http.MethodGet, path, nil)); n != 7 || reads != 2 {
+		t.Fatalf("the second request: %d referrers, %d reads", n, reads)
+	}
+	for i := range 3 {
+		if read[dg(bodies[i])] != 2 {
+			t.Errorf("restored manifest %d read %d times, want 2", i, read[dg(bodies[i])])
+		}
+	}
+	if read[oversize] != 1 {
+		t.Errorf("the out-of-bounds row was read %d times, want 1", read[oversize])
+	}
+}
+
+// TestReferrerCachePartialCaps: the view and byte bounds of the cache hold
+// over partly read views too, dropping the least recently used one that is
+// not being built, once no whole view is left to drop.
+func TestReferrerCachePartialCaps(t *testing.T) {
+	t.Run("views", func(t *testing.T) {
+		c := newReferrerCache()
+		for i := range referrerCacheViews + 10 {
+			k := fmt.Sprint(i)
+			c.account(k, c.view(k), 1, 1, true)
+		}
+		if n := len(c.views); n > referrerCacheViews {
+			t.Errorf("%d partly read views cached, bound %d", n, referrerCacheViews)
+		}
+		if _, ok := c.views["0"]; ok {
+			t.Error("the least recently used partly read view survived")
+		}
+		if c.rows != int64(len(c.views)) || c.partialRows != c.rows {
+			t.Errorf("rows %d, partial rows %d, views %d", c.rows, c.partialRows, len(c.views))
+		}
+	})
+	t.Run("bytes", func(t *testing.T) {
+		c := newReferrerCache()
+		half := int64(referrerCacheBytes/2 + 1)
+		pinned := c.view("pinned")
+		c.account("pinned", pinned, 1, half, true)
+		c.building(pinned, true)
+		a := c.view("a")
+		c.account("a", a, 1, half/2, true)
+		b := c.view("b")
+		c.account("b", b, 1, half, true)
+		if c.views["pinned"] != pinned || c.views["b"] != b {
+			t.Fatal("a view being built, or the view just accounted, was dropped")
+		}
+		if _, ok := c.views["a"]; ok {
+			t.Error("the evictable partly read view survived")
+		}
+		c.building(pinned, false)
+		c.account("b", b, 1, half, true)
+		if c.bytes > referrerCacheBytes {
+			t.Errorf("%d bytes cached in partly read views, bound %d", c.bytes, referrerCacheBytes)
+		}
+		if c.views["b"] != b {
+			t.Error("the view just accounted was dropped")
+		}
+	})
+}
+
+// TestCatalogCancelled: a cancelled request stops the catalog walk.
+func TestCatalogCancelled(t *testing.T) {
+	f := newFixture(t)
+	var names []string
+	for i := range 100 {
+		names = append(names, fmt.Sprintf("r%04d", i))
+	}
+	layRepos(t, f.root, names)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	visits := 0
+	f.srv.catalogVisited = func() {
+		if visits++; visits == 10 {
+			cancel()
+		}
+	}
+	w := f.serve(req(http.MethodGet, "/v2/_catalog?n=2000", nil).WithContext(ctx))
+	if visits != 10 {
+		t.Errorf("the walk visited %d repositories, the client went away at 10", visits)
+	}
+	if w.Code == 200 || w.Header().Get("Link") != "" {
+		t.Errorf("a cancelled walk answered %d, Link %q", w.Code, w.Header().Get("Link"))
+	}
+}
+
+// TestCatalogCeiling: a walk through a run of denied names stops at its hard
+// ceiling, catalogCeilingFactor times the visit budget, and answers an error
+// with no Link.
+func TestCatalogCeiling(t *testing.T) {
+	readable := map[string]bool{"r0000": true, "r1499": true}
+	f := newFixture(t, func(c *Config) {
+		c.Authorize = func(r *http.Request, v Verb, n ref.Name) error {
+			if n.String() == "" || readable[n.String()] {
+				return nil
+			}
+			return ErrDenied
+		}
+	})
+	var names []string
+	for i := range 1500 {
+		names = append(names, fmt.Sprintf("r%04d", i))
+	}
+	layRepos(t, f.root, names)
+	visits := 0
+	f.srv.catalogVisited = func() { visits++ }
+	// At the default ceiling the 1,500 visits fit: both readable names.
+	w := f.do(http.MethodGet, "/v2/_catalog?n=2", nil)
+	want(t, w, 200, "")
+	if !strings.Contains(w.Body.String(), "r1499") {
+		t.Fatalf("catalog %s", w.Body.String())
+	}
+	// At a ceiling of once the budget (1,000 visits) the walk stops.
+	f.srv.catalogCeil = 1
+	visits = 0
+	w = f.do(http.MethodGet, "/v2/_catalog?n=2", nil)
+	if w.Code == 200 || w.Header().Get("Link") != "" || strings.Contains(w.Body.String(), "r0000") {
+		t.Errorf("past the ceiling: %d %s, Link %q", w.Code, w.Body.String(), w.Header().Get("Link"))
+	}
+	if visits != catalogVisits(2) {
+		t.Errorf("the walk visited %d repositories, ceiling %d", visits, catalogVisits(2))
+	}
 }
