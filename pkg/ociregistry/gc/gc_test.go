@@ -209,6 +209,114 @@ func TestStopsAtHalfARepository(t *testing.T) {
 	}
 }
 
+// TestBrakesAFirstPush covers a repository whose first push has committed
+// blobs but no manifest yet: the index has no rows, and the blobs, though past
+// the grace, are newer than the index the layout was made with. The brake
+// holds; an empty index alone does not make a sweep an emptying one.
+func TestBrakesAFirstPush(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	e.clk.set(-2 * time.Hour)
+	var blobs []digest.Digest
+	for _, b := range []string{"config", "l1", "l2", "l3"} {
+		blobs = append(blobs, e.blob(t, n, []byte(b)).Digest)
+	}
+	// The layout, and so index.json, was made before the first blob.
+	e.backdate(t, filepath.Join(e.dir(t, n), "index.json"), -3*time.Hour)
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+
+	for i := range 2 {
+		rep, err := c.Sweep(e.ctx)
+		if !errors.Is(err, ErrMassDelete) || !slices.Equal(rep.Stopped, []string{"app"}) {
+			t.Fatalf("sweep %d of a first push: %v, stopped %v; want ErrMassDelete for app", i, err, rep.Stopped)
+		}
+	}
+	for _, d := range blobs {
+		if !e.has(n, d) {
+			t.Fatalf("the stopped sweep deleted %s", d)
+		}
+	}
+}
+
+// TestEmptiesAnUntaggedRepository covers a repository whose only rows are
+// untagged manifests past the grace: the sweep reaps every row and every blob,
+// which is all of the repository, and is not stopped by the brake; a later
+// sweep removes the layout.
+func TestEmptiesAnUntaggedRepository(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	e.clk.set(-2 * time.Hour)
+	a := e.push(t, n, "", "a", []byte("layer a"))
+	b := e.push(t, n, "", "b", []byte("layer b"))
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+
+	rep := e.sweep(t, c)
+	if rep.Count(KindManifest) != 2 || rep.Count(KindBlob) != 6 {
+		t.Fatalf("report %+v, want 2 rows and 6 blobs reaped", rep)
+	}
+	for _, d := range slices.Concat(a.blobs(), b.blobs()) {
+		if e.has(n, d) {
+			t.Fatalf("%s survived the emptying sweep", d)
+		}
+	}
+	if rep.Count(KindRepository) != 0 {
+		t.Fatal("the layout went while index.json was inside the grace")
+	}
+	e.backdate(t, filepath.Join(e.dir(t, n), "index.json"), -2*time.Hour)
+	rep = e.sweep(t, c)
+	if rep.Count(KindRepository) != 1 {
+		t.Fatalf("report %+v, want the emptied repository reaped", rep)
+	}
+	if repos, err := e.s.Repositories(); err != nil || len(repos) != 0 {
+		t.Fatalf("repositories after the emptied one went: %v, %v", repos, err)
+	}
+}
+
+// TestLeavesATempNameUnderAnUnknownDirectory covers a .tmp-<uuid> under a
+// blobs/ directory that is not a digest algorithm: it is not the store's temp
+// link, so it is left alone and the sweep still succeeds.
+func TestLeavesATempNameUnderAnUnknownDirectory(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	img := e.push(t, n, "v1", "app", []byte("layer"))
+	odd := filepath.Join(e.dir(t, n), "blobs", "md5")
+	if err := os.Mkdir(odd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(odd, ".tmp-0b0e8e7a-1c1d-4e3f-8a9b-0c1d2e3f4a5b")
+	if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cont, err := e.s.Contents(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cont.Temps) != 0 || cont.Unknown != 1 {
+		t.Fatalf("contents: %d temps, %d unknown; want 0 and 1", len(cont.Temps), cont.Unknown)
+	}
+
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+	for i := range 2 {
+		if rep := e.sweep(t, c); rep.Count(KindTemp) != 0 {
+			t.Fatalf("sweep %d: report %+v, want no temp", i, rep)
+		}
+	}
+	if _, err := os.Lstat(p); err != nil {
+		t.Fatalf("the unknown entry was removed: %v", err)
+	}
+	for _, d := range img.blobs() {
+		if !e.has(n, d) {
+			t.Errorf("%s was reaped", d)
+		}
+	}
+}
+
 // TestReapsCommittedSession covers a commit that linked the session into
 // blobs/ and stopped before removing it: the session's inode has two links,
 // so the store's session check refuses it and a cancel cannot remove it.
