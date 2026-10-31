@@ -32,6 +32,14 @@ import (
 	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
 
+// live returns how many sessions count against max, after pruning.
+func (t *sessions) live() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.prune()
+	return t.inUse()
+}
+
 // entries returns how many entries the table holds, confirmed or not.
 func (t *sessions) entries() int {
 	t.mu.Lock()

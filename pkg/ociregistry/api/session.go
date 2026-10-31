@@ -259,11 +259,3 @@ func (t *sessions) drop(key string, e *session) {
 	}
 	t.mu.Unlock()
 }
-
-// live returns how many sessions count against max, after pruning.
-func (t *sessions) live() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.prune()
-	return t.inUse()
-}
