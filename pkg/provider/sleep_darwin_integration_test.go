@@ -117,3 +117,17 @@ func TestIOKitPowerSourceIsRead(t *testing.T) {
 		t.Fatal("IOPSGetProvidingPowerSourceType returned no source")
 	}
 }
+
+// TestIOKitSystemCapabilitiesCanary pins the private registry key the dark-wake
+// check reads: the root domain's "System Capabilities" must be a CFNumber with
+// the CPU bit set on this macOS build. If it goes red, the watcher counts every
+// dark wake as a full wake (and warns once at start).
+func TestIOKitSystemCapabilitiesCanary(t *testing.T) {
+	caps, isNumber := readSystemCapabilities()
+	if !isNumber {
+		t.Fatal(`IOPMrootDomain "System Capabilities" is absent or not a CFNumber`)
+	}
+	if caps == ^uint32(0) || caps&0x01 == 0 {
+		t.Fatalf(`IOPMrootDomain "System Capabilities" = %#x, want the CPU bit (0x1) set`, caps)
+	}
+}
