@@ -121,6 +121,37 @@ func TestPaths(t *testing.T) {
 	})
 }
 
+// TestVersionedBinary pins which recorded executable paths count as one of the
+// tree's binaries: exactly root/versions/<ver>/<bin>, cleaned, with a valid
+// version, and nothing else.
+func TestVersionedBinary(t *testing.T) {
+	l := New("/tmp/root")
+	for _, tc := range []struct {
+		name, path, bin, ver string
+		ok                   bool
+	}{
+		{"release version", "/tmp/root/versions/0.3.0/k3sm-vmhost", "k3sm-vmhost", "0.3.0", true},
+		{"migrated unknown version", "/tmp/root/versions/unknown-0123456789ab/k3sm-vmhost", "k3sm-vmhost", "unknown-0123456789ab", true},
+		{"uncleaned path", "/tmp/root/versions/./0.3.0//k3sm-vmhost", "k3sm-vmhost", "0.3.0", true},
+		{"other basename", "/tmp/root/versions/0.3.0/k3sm", "k3sm-vmhost", "", false},
+		{"flat path", "/tmp/root/k3sm-vmhost", "k3sm-vmhost", "", false},
+		{"through current", "/tmp/root/current/k3sm-vmhost", "k3sm-vmhost", "", false},
+		{"deeper", "/tmp/root/versions/0.3.0/bin/k3sm-vmhost", "k3sm-vmhost", "", false},
+		{"partial version", "/tmp/root/versions/0.3.0.partial/k3sm-vmhost", "k3sm-vmhost", "", false},
+		{"dot-dot escape", "/tmp/root/versions/../k3sm-vmhost", "k3sm-vmhost", "", false},
+		{"outside the root", "/tmp/other/versions/0.3.0/k3sm-vmhost", "k3sm-vmhost", "", false},
+		{"relative", "versions/0.3.0/k3sm-vmhost", "k3sm-vmhost", "", false},
+		{"bad bin", "/tmp/root/versions/0.3.0/k3sm-vmhost", "a/b", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ver, ok := l.VersionedBinary(tc.path, tc.bin)
+			if ok != tc.ok || ver != tc.ver {
+				t.Errorf("VersionedBinary(%q, %q) = %q, %v; want %q, %v", tc.path, tc.bin, ver, ok, tc.ver, tc.ok)
+			}
+		})
+	}
+}
+
 // links is a Readlink over a fixed map.
 func links(m map[string]string) Readlink {
 	return func(name string) (string, error) {

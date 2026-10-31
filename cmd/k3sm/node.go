@@ -1654,6 +1654,22 @@ func resolveShadowDir() string {
 	if err != nil {
 		return ""
 	}
+	return shadowDirIn(dir)
+}
+
+// shadowDirIn is resolveShadowDir over dir, the symlink-resolved directory of
+// the running executable (install.ExecutableDir). The result names the real
+// directory, inside versions/<v>/ on a versioned install, never a path through
+// current: Seatbelt matches resolved paths, so a grant on a symlinked path
+// would match nothing. A shadow entry that is itself a symlink is refused.
+//
+// The result is a resolved path only because of two things this function does
+// not check itself: dir must already be resolved (the caller passes
+// install.ExecutableDir, never a path through current or a compat link), and
+// os.Lstat must refuse a shadow entry that is a symlink, since a symlinked
+// entry would carry an unresolved path into a Seatbelt grant. Lstat reports a
+// symlink as not a directory, so that entry yields "".
+func shadowDirIn(dir string) string {
 	p := filepath.Join(dir, shadow.DirName)
 	if fi, err := os.Lstat(p); err != nil || !fi.IsDir() {
 		return ""
@@ -1679,6 +1695,14 @@ func resolveSiblingDylib(name string) string {
 	if err != nil {
 		return ""
 	}
+	return siblingDylibIn(dir, name)
+}
+
+// siblingDylibIn is resolveSiblingDylib over dir, the symlink-resolved
+// directory of the running executable. The path a pod is started with
+// therefore names the version directory the daemon runs from, so a later flip
+// of current does not change which file the pod's processes load.
+func siblingDylibIn(dir, name string) string {
 	p := filepath.Join(dir, name)
 	if fi, err := os.Stat(p); err != nil || fi.IsDir() {
 		return ""

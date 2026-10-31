@@ -144,6 +144,31 @@ func (l Layout) CompatLink(bin string) (string, error) {
 	return filepath.Join(l.root, bin), nil
 }
 
+// VersionedBinary reports whether path names bin directly inside a version
+// directory, root/versions/<ver>/bin with a valid ver, and returns that ver.
+// path is compared cleaned and must be absolute; anything else (another
+// basename, a deeper or shallower directory, a temporary or partial version
+// name, a relative path) is false. It reads nothing: a caller holding a path
+// the kernel recorded asks whether it is one of this tree's binaries.
+func (l Layout) VersionedBinary(path, bin string) (string, bool) {
+	if validBinary(bin) != nil || !filepath.IsAbs(path) {
+		return "", false
+	}
+	path = filepath.Clean(path)
+	if filepath.Base(path) != bin {
+		return "", false
+	}
+	dir := filepath.Dir(path)
+	if filepath.Dir(dir) != l.VersionsDir() {
+		return "", false
+	}
+	ver := filepath.Base(dir)
+	if ValidateVersion(ver) != nil {
+		return "", false
+	}
+	return ver, true
+}
+
 // UpdaterDir returns the directory of the updater's own pointers.
 func (l Layout) UpdaterDir() string { return filepath.Join(l.root, UpdaterName) }
 

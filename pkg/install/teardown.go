@@ -37,6 +37,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/k3sm/pkg/updater/layout"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -316,7 +317,7 @@ func stopVMHelpers(ctx context.Context, sys System, cfg Config) error {
 		errs = errors.Join(errs, fmt.Errorf("untrusted vm helper record %s (not acted on)", name))
 	}
 	verify := func(rec VMHostRecord) (bool, error) {
-		return verifyVMHelper(sys, cfg, rec, cfg.installedVMHost(), svcUID)
+		return verifyVMHelper(sys, cfg, rec, svcUID)
 	}
 	var helpers []VMHostRecord
 	for _, rec := range store.Records {
@@ -480,11 +481,12 @@ func shortenVMHelper(ctx context.Context, sys System, rec VMHostRecord, bound ti
 // recorded helper, the check every signal the teardown sends is preceded by:
 // the group can be inspected and its leader (pid == pgid) is alive with exactly
 // the recorded start time, and the leader is the installed k3sm-vmhost running
-// as the service user. A group that cannot be inspected, a gone leader or a
-// recycled pgid is false with no error (nothing of ours is provably there); a
-// start-time match on another executable or uid is false with an error (a
-// forged or corrupted record), as is an executable that cannot be read.
-func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, want string, svcUID uint32) (bool, error) {
+// as the service user (isInstalledVMHost). A group that cannot be inspected, a
+// gone leader or a recycled pgid is false with no error (nothing of ours is
+// provably there); a start-time match on another executable or uid is false
+// with an error (a forged or corrupted record), as is an executable that cannot
+// be read.
+func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, svcUID uint32) (bool, error) {
 	start, alive := sys.ProcessGroupLeaderStart(rec.Pgid)
 	if !alive {
 		return false, nil
@@ -497,11 +499,72 @@ func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, want string, svcUI
 	switch {
 	case err != nil:
 		return false, fmt.Errorf("vm helper group %d: cannot read its executable, not signalled: %w", rec.Pgid, err)
-	case filepath.Clean(exe) != want || uid != svcUID:
+	case uid != svcUID || !isInstalledVMHost(sys, cfg, exe):
+		want := cfg.installedVMHost()
 		cfg.Logger.Warn("a vm helper record names a process that is not this install's k3sm-vmhost; not signalled", "pod", rec.PodID, "pgid", rec.Pgid, "exe", exe, "uid", uid)
 		return false, fmt.Errorf("vm helper record for group %d names %s (uid %d), not %s (uid %d); not signalled", rec.Pgid, exe, uid, want, svcUID)
 	}
 	return true, nil
+}
+
+// isInstalledVMHost reports whether exe, the executable path the kernel
+// recorded for a helper, is this install's k3sm-vmhost in any of the forms the
+// runtime can have started it through:
+//
+//   - the flat installed path (installedVMHost), which in the versioned layout
+//     is a compatibility symlink;
+//   - the same name through the current symlink (<InstallDir>/current/<name>);
+//   - the name directly inside a retained version directory
+//     (<InstallDir>/versions/<ver>/<name>), where the runtime's symlink-resolved
+//     lookup lands: <ver> must be the version current or previous points at
+//     now, so a helper started before a flip still matches while its version
+//     is kept as previous, and a version the tree no longer retains, however
+//     validly named, is refused. Without a current link (the flat layout) no
+//     version directory is accepted;
+//   - the flat installed path with every symlink resolved, read only when the
+//     forms above do not match.
+//
+// Every other path, any other basename or a directory outside versions/
+// included, is refused. A tree that is root-owned to / is what makes a path
+// under versions/ an identity; this check names which of its files it is.
+func isInstalledVMHost(sys System, cfg Config, exe string) bool {
+	if !filepath.IsAbs(exe) {
+		return false
+	}
+	exe = filepath.Clean(exe)
+	installed := cfg.installedVMHost()
+	tree := layout.New(cfg.InstallDir)
+	if exe == installed {
+		return true
+	}
+	if through, err := tree.Binary(VMHostName); err == nil && exe == through {
+		return true
+	}
+	if ver, ok := tree.VersionedBinary(exe, VMHostName); ok {
+		return retainedVersion(sys, tree, ver)
+	}
+	resolved, err := sys.ResolvePath(installed)
+	if err != nil {
+		return false
+	}
+	resolved = filepath.Clean(resolved)
+	if resolved == installed {
+		return false
+	}
+	return exe == resolved && filepath.Base(resolved) == VMHostName
+}
+
+// retainedVersion reports whether ver is the version the tree's current or
+// previous link points at. A link that is missing or does not read exactly
+// versions/<ver> retains nothing.
+func retainedVersion(sys System, tree layout.Layout, ver string) bool {
+	if v, err := tree.ResolveActive(sys.Readlink); err == nil && v == ver {
+		return true
+	}
+	if v, err := tree.ResolvePrevious(sys.Readlink); err == nil && v == ver {
+		return true
+	}
+	return false
 }
 
 // vmHelperStop is one helper the teardown sent SIGTERM, and how long it gets.

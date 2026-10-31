@@ -40,6 +40,8 @@ type fakePurge struct {
 	stats map[string]PathStat
 	// resolved answers ResolvePath; an absent key resolves to itself.
 	resolved map[string]string
+	// links answers Readlink; an absent key is not a symlink that exists.
+	links map[string]string
 	// markers answers ReadDataRootMarker; markerErrs overrides it.
 	markers    map[string]dataroot.MarkerFacts
 	markerErrs map[string]error
@@ -132,6 +134,14 @@ func (f *fakeSystem) ResolvePath(path string) (string, error) {
 		return r, nil
 	}
 	return path, nil
+}
+
+func (f *fakeSystem) Readlink(path string) (string, error) {
+	f.calls = append(f.calls, "Readlink:"+path)
+	if t, ok := f.purge.links[path]; ok {
+		return t, nil
+	}
+	return "", &fs.PathError{Op: "readlink", Path: path, Err: fs.ErrNotExist}
 }
 
 func (f *fakeSystem) StatNoFollow(path string) (PathStat, error) {

@@ -1116,6 +1116,9 @@ type System interface {
 
 	// ResolvePath returns path with every symlink resolved (EvalSymlinks).
 	ResolvePath(path string) (string, error)
+	// Readlink reads one symlink's target, as os.Readlink does. The vm helper
+	// identity check reads the current and previous links through it.
+	Readlink(path string) (string, error)
 	// StatNoFollow lstats path. A missing path has ReadFile's fs.ErrNotExist
 	// contract.
 	StatNoFollow(path string) (PathStat, error)
