@@ -178,9 +178,9 @@ v0.2.3 was released on 2026-10-29.
 - **Developer mode.** A build from source can be installed and driven from the app: `k3sm install
   --developer-mode on` turns the signature checks off on that Mac, with a warning in `k3sm status`
   and in the app while it is on. A developer build of the app then installs, updates, stops and
-  starts that k3sm. `k3sm install --developer-mode off` turns it off, and so does an update
-  through the app whose every program is signed by one Developer ID team (the installed build's
-  team, if it has one). A release build of the app never uses it.
+  starts that k3sm. `k3sm install --developer-mode off` turns it off, and so does installing a
+  signed release (through the app, every program must be signed by one Developer ID team, the
+  installed build's team if it has one). A release build of the app never uses it.
 - **Update channels.** `stable` (the default, tagged releases only) and `rc` (release candidates
   too), set once for the cluster. `k3sm update check` and the app's Update button follow the
   cluster's channel.

@@ -30,10 +30,11 @@ import (
 // off, so a build from source can be installed and driven by a development
 // build of k3sm.app. Its one record is a marker file beside the install root
 // (outside the tree a swap replaces): `k3sm install --developer-mode on`
-// creates it, `--developer-mode off` removes it, and uninstall removes it. An
-// install from a k3sm.app staging directory without the flag removes it only
-// when the whole staged tree is signed by the team the signing continuity
-// check requires (developerModeOff); every other install keeps it. Presence is
+// creates it, `--developer-mode off` removes it, and uninstall removes it.
+// Without the flag, an install from a k3sm.app staging directory removes it
+// only when the whole staged tree is signed by the team the signing continuity
+// check requires (developerModeOff), and any other install removes it when its
+// k3sm carries a Developer ID signature (plainInstallTeam). Presence is
 // the whole record; the content is never parsed.
 //
 // The marker counts only when it is a root-owned regular file nobody else
@@ -57,9 +58,9 @@ func DeveloperModeMarkerContent(now time.Time) []byte {
 type DeveloperMode string
 
 const (
-	// DeveloperModeUnset keeps the marker as it is, except that an install
-	// from a staging directory whose whole tree is signed by the k3sm team
-	// removes it (developerModeOff).
+	// DeveloperModeUnset keeps the marker as it is, except that a
+	// team-signed install removes it (developerModeOff for a staging
+	// directory, plainInstallTeam otherwise).
 	DeveloperModeUnset DeveloperMode = ""
 	// DeveloperModeOn writes the marker and skips the signing continuity check.
 	DeveloperModeOn DeveloperMode = "on"
@@ -88,9 +89,10 @@ type DeveloperModeOptions struct {
 	// DeveloperModeUnset keeps it as it is, except that an install from a
 	// staging directory whose staged k3sm and every other Mach-O carry the
 	// Developer ID signature of the team the continuity check requires
-	// removes it (developerModeOff). Under --from-staging a valid marker on
-	// disk turns developer mode on when the flag is not passed. The marker
-	// that read is read again under the install lock, and a change refuses
+	// removes it (developerModeOff); any other install whose k3sm carries a
+	// Developer ID signature removes it (plainInstallTeam). Under
+	// --from-staging a valid marker on disk turns developer mode on when the
+	// flag is not passed. The marker that read is read again under the install lock, and a change refuses
 	// the install (ErrDeveloperModeChanged). --require-team-signature, the
 	// staging directory checks and the downgrade rule apply whatever the mode.
 	DeveloperMode DeveloperMode
@@ -268,20 +270,52 @@ func applyDeveloperMode(ctx context.Context, sys System, cfg Config) error {
 	if state == DeveloperModeAbsent {
 		return nil
 	}
-	team := cfg.offTeam
+	team, keepReason := cfg.offTeam, cfg.keepReason
 	if cfg.FromStagingDir == "" {
-		cfg.Logger.Warn("developer mode stays on: only an install from a k3sm.app staging directory can show that every binary it installs is signed by the k3sm team; run k3sm install --developer-mode off to turn it off", "marker", path)
-		return nil
+		team, keepReason = plainInstallTeam(ctx, cfg)
 	}
 	if team == "" {
-		cfg.Logger.Warn("developer mode stays on: "+cfg.keepReason+"; run k3sm install --developer-mode off to turn it off", "marker", path)
+		if state == DeveloperModeInvalid {
+			cfg.Logger.Warn("ignored invalid marker: it does not turn developer mode on, and it stays because "+keepReason, "marker", path)
+			return nil
+		}
+		cfg.Logger.Warn("developer mode stays on: "+keepReason+"; run k3sm install --developer-mode off to turn it off", "marker", path)
 		return nil
 	}
 	if err := RemoveDeveloperModeMarker(sys, path); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
+	if state == DeveloperModeInvalid {
+		cfg.Logger.Info("removed an invalid developer-mode marker by a signed install", "team-id", team, "marker", path)
+		return nil
+	}
 	cfg.Logger.Info("developer mode turned off by a signed install", "team-id", team, "marker", path)
 	return nil
+}
+
+// plainInstallTeam decides whether an install that is not from a staging
+// directory, without the flag, turns developer mode off: the k3sm doing the
+// install (or, without an Executable, the one being installed) must carry a
+// Developer ID Application signature, whose team it returns. A plain install
+// has no staged tree to walk, so this is the one check it can make; it fails
+// toward removal only for a team-signed binary, and removing the marker only
+// turns the signature checks back on. It returns "" and why on any doubt.
+func plainInstallTeam(ctx context.Context, cfg Config) (string, string) {
+	exe := cfg.Executable
+	if exe == "" {
+		exe = cfg.BinarySource
+	}
+	if exe == "" {
+		return "", "this install names no k3sm binary whose signature could be read"
+	}
+	team, err := cfg.Signer.TeamID(ctx, exe)
+	if err != nil {
+		return "", "the k3sm doing the install carries no Developer ID team signature (" + reason(err) + ")"
+	}
+	if err := requireDeveloperID(ctx, cfg.Signer, exe, team); err != nil {
+		return "", "the k3sm doing the install is not signed with a Developer ID (" + reason(err) + ")"
+	}
+	return team, ""
 }
 
 // developerModeOff decides whether an install from a staging directory without
@@ -292,6 +326,11 @@ func applyDeveloperMode(ctx context.Context, sys System, cfg Config) error {
 // ad-hoc signed or absent. There is no other team pin: the installed build is
 // the record. It returns that team, or "" and why the marker stays.
 func developerModeOff(ctx context.Context, cfg Config, entries []StagedEntry) (string, string) {
+	// The installed k3sm's team is read here, before the install lock, like
+	// every other --from-staging signing check. A concurrent install could
+	// swap the installed binary between this read and the lock; that window
+	// is accepted, because the only thing this verdict can cause is removing
+	// the marker, which turns the signature checks back on and never off.
 	installed := cfg.installedBinary()
 	team, err := cfg.Signer.TeamID(ctx, installed)
 	switch {

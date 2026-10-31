@@ -116,10 +116,10 @@ var markerContent = regexp.MustCompile(`^developer mode enabled by k3sm install 
 // TestDeveloperModeMarkerOnInstall pins what an install does with the marker:
 // on writes it root:wheel 0644 through the temp-and-rename seam before the
 // install root is swapped, and a failed install leaves it; off removes it
-// without following a symlink; not passed keeps it. A plain install of a k3sm
-// that carries a Developer ID team signature keeps it too, with a Warn saying
-// why: only an install from a staging directory can show the whole tree is
-// team-signed (TestDeveloperModeOffNeedsTheWholeTree).
+// without following a symlink; not passed keeps it with a Warn saying why,
+// unless the k3sm being installed carries a Developer ID team signature, which
+// removes it with an Info line. An install from a staging directory needs the
+// whole tree team-signed instead (TestDeveloperModeOffNeedsTheWholeTree).
 func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 	t.Parallel()
 	const src = "/tmp/k3sm"
@@ -142,6 +142,10 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 		// wantKeepWarn is the Warn a no-flag install logs when it keeps a
 		// marker it could have turned off.
 		wantKeepWarn bool
+		// wantInvalidInfo is the Info line for an invalid marker a signed
+		// install removed; wantIgnoredWarn the Warn for one it kept.
+		wantInvalidInfo bool
+		wantIgnoredWarn bool
 	}{
 		{name: "on writes the marker", mode: DeveloperModeOn, wantWrite: true},
 		{name: "on writes the marker over a team-signed build", mode: DeveloperModeOn, signer: teamSigned, wantWrite: true},
@@ -152,9 +156,11 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 		{name: "not passed keeps the marker", onDisk: &marker},
 		{name: "not passed keeps the marker over an ad-hoc build", signer: adHoc, onDisk: &marker, wantKeepWarn: true},
 		{name: "not passed keeps the marker over an Apple Development build", signer: appleDevelopment, onDisk: &marker, wantKeepWarn: true},
-		{name: "a team-signed plain install without the flag keeps the marker and says why", signer: teamSigned, onDisk: &marker, wantKeepWarn: true},
-		{name: "a team-signed plain install without the flag keeps an invalid marker and says why", signer: teamSigned,
-			onDisk: &OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o666}, wantKeepWarn: true},
+		{name: "a team-signed install without the flag removes the marker", signer: teamSigned, onDisk: &marker, wantRemove: true, wantInfo: true},
+		{name: "a team-signed install without the flag removes an invalid marker", signer: teamSigned,
+			onDisk: &OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o666}, wantRemove: true, wantInvalidInfo: true},
+		{name: "an ad-hoc install without the flag keeps an invalid marker and says it is ignored", signer: adHoc,
+			onDisk: &OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o666}, wantIgnoredWarn: true},
 		{name: "a team-signed install with nothing there removes nothing", signer: teamSigned},
 	}
 	for _, tc := range cases {
@@ -205,6 +211,14 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 			info := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"developer mode turned off by a signed install"`)
 			if info != tc.wantInfo {
 				t.Errorf("the turned-off Info line logged = %v, want %v; logs:\n%s", info, tc.wantInfo, logs.String())
+			}
+			invalidInfo := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"removed an invalid developer-mode marker by a signed install"`)
+			if invalidInfo != tc.wantInvalidInfo {
+				t.Errorf("the removed-invalid Info line logged = %v, want %v; logs:\n%s", invalidInfo, tc.wantInvalidInfo, logs.String())
+			}
+			ignoredWarn := strings.Contains(logs.String(), "level=WARN") && strings.Contains(logs.String(), `"ignored invalid marker:`)
+			if ignoredWarn != tc.wantIgnoredWarn {
+				t.Errorf("the ignored-invalid Warn logged = %v, want %v; logs:\n%s", ignoredWarn, tc.wantIgnoredWarn, logs.String())
 			}
 			keepWarn := strings.Contains(logs.String(), "level=WARN") && strings.Contains(logs.String(), `"developer mode stays on`)
 			if keepWarn != tc.wantKeepWarn {
