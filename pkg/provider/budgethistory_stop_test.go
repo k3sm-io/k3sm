@@ -21,6 +21,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -49,14 +50,21 @@ func fileEvictions(t *testing.T, dir string, band budgetv1alpha1.Band) int64 {
 // Fails-before: stop saw the writer already stopped and reported true, and
 // nothing wrote the later change.
 func TestStopBudgetHistoryFlushesAfterTheContextEnds(t *testing.T) {
+	synctest.Test(t, testStopBudgetHistoryFlushesAfterTheContextEnds)
+}
+
+func testStopBudgetHistoryFlushesAfterTheContextEnds(t *testing.T) {
 	dir := t.TempDir()
 	h := OpenBudgetHistory(dir, "fp", discardLog())
 	ctx, cancel := context.WithCancel(context.Background())
 	h.start(ctx)
 	cancel()
+	// Once the bubble is idle the writer has made its final flush and returned,
+	// or it is parked and never will.
+	synctest.Wait()
 	select {
 	case <-h.stopped:
-	case <-time.After(10 * time.Second):
+	default:
 		t.Fatal("the writer did not exit when its context ended")
 	}
 	h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())

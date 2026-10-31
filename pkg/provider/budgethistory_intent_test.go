@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -369,7 +370,12 @@ func blockWrites(h *BudgetHistory, release <-chan struct{}) {
 // Fails-before: every mutation wrote the file inline, so a stalled write held
 // evictPod after the kill and buildStatus on the write lock.
 func TestBudgetHistoryStalledWriterBlocksNoHotPath(t *testing.T) {
+	synctest.Test(t, testBudgetHistoryStalledWriterBlocksNoHotPath)
+}
+
+func testBudgetHistoryStalledWriterBlocksNoHotPath(t *testing.T) {
 	h := newEvictionHarness(t)
+	quiesceInBubble(t, h.r)
 	h.r.history = openHistory(t, t.TempDir(), "fp")
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) }) // runs before the writer's own cleanup
@@ -383,6 +389,7 @@ func TestBudgetHistoryStalledWriterBlocksNoHotPath(t *testing.T) {
 	h.add(hog, "2Gi")
 	h.add(quiet, "200Mi")
 
+	start := time.Now()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -392,10 +399,13 @@ func TestBudgetHistoryStalledWriterBlocksNoHotPath(t *testing.T) {
 		qt := h.r.trackByID("uid-quiet")
 		h.r.buildStatus(quiet.DeepCopy(), qt, exitStatus("uid-quiet", 137, "Error", 0, time.Unix(5000, 0)), nil)
 	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("a stalled history writer blocked the eviction or the status path")
+	// In the bubble the clock moves only while every goroutine waits, so the
+	// elapsed time is exactly the hot path's own waits; a hot path parked on
+	// the stalled write never returns, which synctest reports as a deadlock.
+	<-done
+	if took := time.Since(start); took > budgetIntentWriteBound {
+		t.Fatalf("the eviction and the status path took %v with a stalled writer, want at most the intent wait %v",
+			took, budgetIntentWriteBound)
 	}
 	now := time.Now()
 	batch := bandTotals(t, h.r.history, now, budgetv1alpha1.BandBatch)
@@ -412,15 +422,20 @@ func TestBudgetHistoryStalledWriterBlocksNoHotPath(t *testing.T) {
 // TestBudgetHistoryFinalFlushOnShutdown: a change made just before the
 // provider's context ends reaches disk, and the writer stops.
 func TestBudgetHistoryFinalFlushOnShutdown(t *testing.T) {
+	synctest.Test(t, testBudgetHistoryFinalFlushOnShutdown)
+}
+
+func testBudgetHistoryFinalFlushOnShutdown(t *testing.T) {
 	dir := t.TempDir()
 	h := OpenBudgetHistory(dir, "fp", discardLog())
 	ctx, cancel := context.WithCancel(context.Background())
 	h.start(ctx)
 	h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
 	cancel()
+	synctest.Wait()
 	select {
 	case <-h.stopped:
-	case <-time.After(10 * time.Second):
+	default:
 		t.Fatal("the writer did not stop on shutdown")
 	}
 	got := openHistory(t, dir, "fp")

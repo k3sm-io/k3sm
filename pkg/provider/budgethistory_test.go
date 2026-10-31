@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -61,15 +62,36 @@ func openHistory(t *testing.T, dir, fingerprint string) *BudgetHistory {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.start(ctx)
+	// The writer's exit is bounded by its own final-flush bound, so the join
+	// needs no timer of its own: a writer that never stops hangs the test, a
+	// deadlock synctest reports inside a bubble and -timeout reports outside one.
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case <-h.stopped:
-		case <-time.After(10 * time.Second):
-			t.Errorf("the budget history writer did not stop")
-		}
+		<-h.stopped
 	})
 	return h
+}
+
+// quiesceInBubble ends, at test cleanup, the goroutines a provider built by
+// newRuntimedFake leaves running, so a synctest bubble holding it can finish:
+// every pod's re-exec workers are cancelled, and the log rotator's queue, which
+// only a started rotator shuts down, is started under an ended context.
+func quiesceInBubble(t *testing.T, r *runtimedRuntime) {
+	t.Helper()
+	t.Cleanup(func() {
+		r.mu.Lock()
+		tracks := make([]*podTrack, 0, len(r.track))
+		for _, pt := range r.track {
+			tracks = append(tracks, pt)
+		}
+		r.mu.Unlock()
+		for _, pt := range tracks {
+			pt.cancelRestarts()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r.logRotator.Start(ctx)
+	})
 }
 
 // flushHistory waits for h's state to reach disk.
@@ -99,8 +121,13 @@ func exitStatus(id string, exit int32, reason string, restarts int32, finishedAt
 // the manager's in-process map, gone on restart, and exit 137 was never
 // classified.
 func TestBudgetHistorySurvivesProviderRestart(t *testing.T) {
+	synctest.Test(t, testBudgetHistorySurvivesProviderRestart)
+}
+
+func testBudgetHistorySurvivesProviderRestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "server", "budget")
 	h := newEvictionHarness(t)
+	quiesceInBubble(t, h.r)
 	h.r.history = openHistory(t, dir, "fp-1")
 	clk := h.r.clk.(*testclock.FakeClock)
 
@@ -129,12 +156,11 @@ func TestBudgetHistorySurvivesProviderRestart(t *testing.T) {
 	// The lifecycle restarts it: one restart.
 	waitWaiters(t, clk, 1)
 	clk.Step(time.Minute)
-	deadline := time.Now().Add(2 * time.Second)
-	for bandTotals(t, h.r.history, clk.Now(), budgetv1alpha1.BandStandard).RestartsTotal != 1 {
-		if time.Now().After(deadline) {
-			t.Fatalf("the restart was never counted")
-		}
-		time.Sleep(2 * time.Millisecond)
+	// The restart runs on the lifecycle's goroutine; once the bubble is idle
+	// again it has run to completion or parked.
+	synctest.Wait()
+	if got := bandTotals(t, h.r.history, clk.Now(), budgetv1alpha1.BandStandard).RestartsTotal; got != 1 {
+		t.Fatalf("restarts counted = %d after the lifecycle restarted the container, want 1", got)
 	}
 
 	// An OOM kill (a vm guest's) and a k3sm-initiated stop: the stop's intent is
@@ -175,6 +201,7 @@ func TestBudgetHistorySurvivesProviderRestart(t *testing.T) {
 	// The provider restarts: a new runtime over the same work dir.
 	flushHistory(t, h.r.history)
 	r2, _, clk2 := newRestartFake(t)
+	quiesceInBubble(t, r2)
 	clk2.SetTime(clk.Now().Add(2 * time.Minute))
 	r2.history = openHistory(t, dir, "fp-1")
 	if err := r2.CreatePod(t.Context(), quiet.DeepCopy()); err != nil {
