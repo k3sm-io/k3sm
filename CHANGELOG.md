@@ -15,9 +15,10 @@ pin, its date, and the tarball's sha256.
 - `k3sm install --developer-mode on` installs a build from source, ad-hoc signed, over any
   install: the signature of the k3sm that runs as root is no longer compared with the installed
   one, and a development build of k3sm.app opens beside it. `--developer-mode off` turns it off,
-  and so does installing a signed release: a `k3sm install` whose `k3sm` carries a Developer ID
-  signature, or a k3sm.app update whose every program is signed by one Developer ID team (the
-  installed build's team, if it has one). Uninstall removes it. `k3sm status` shows a
+  and so does installing a signed release. A plain `k3sm install` turns it off when the `k3sm`
+  doing the install carries a Developer ID signature, from any team. A k3sm.app update turns it
+  off only when every program in it is signed by one Developer ID team, the installed build's
+  team if it has one. Uninstall removes it. `k3sm status` shows a
   `developer-mode` row while it is on. [Developer mode](docs/user/install.md#developer-mode)
   describes what is no longer checked.
 - k3sm.app checks for a newer k3sm.app against a signed release index, and can move the cluster
@@ -36,7 +37,8 @@ pin, its date, and the tarball's sha256.
   recorded on disk so a restart keeps it, and a sweep re-reads the index and re-checks each
   candidate under the repository lock before deleting. The first sweep over a store only
   reports what it would reap, no sweep runs within one grace period of start, and a sweep that
-  would delete more than half of a repository's blobs stops. It also removes upload sessions
+  would delete more than half of a repository's blobs stops. A first sweep that the brake
+  stops still records that it ran, so the next sweep deletes. It also removes upload sessions
   and temporary blob links an interrupted write left behind. It is not yet scheduled.
 
 - The registry gains its own OCI distribution API server over the on-disk store, written to
@@ -45,6 +47,13 @@ pin, its date, and the tarball's sha256.
   referrers. It requires an access policy, caps each upload's size and the free space it
   may use, and cuts off request bodies that stall or trickle. It is not yet the server the
   daemon runs.
+
+- The control-plane node fills each MeshPeer's `status.lastHandshakeTime` from its own
+  WireGuard view, so `kubectl get meshpeer -o yaml` shows when the server last completed a
+  handshake with that peer.
+- Uninstall names a vm helper still running from a k3sm version the install no longer keeps. It
+  does not signal that helper, and the error gives its process ID and the command to stop it by
+  hand, `sudo kill -TERM -<pid>`.
 
 ### Changed
 
@@ -86,7 +95,6 @@ pin, its date, and the tarball's sha256.
   deleted since the plan is now reported as gone, no longer as unreadable; one whose directory
   is still there but damaged stays unreadable. An `If-Match` that is empty or malformed is
   refused with 412 and deletes nothing.
-- **A pinned sharded `MLXModel` answers to its `spec.model` name too.** Sharded serving listed the snapshot path on `/v1/models`, and a request naming `spec.model` made every rank load the model again. Each rank now serves the model it loaded under `spec.model`, pinned or not. This needs the `mlx-serve` image that carries the updated sharded entrypoint.
 - **A pinned sharded `MLXModel` answers to its `spec.model` name too.** Sharded serving listed the snapshot path on `/v1/models`, and a request naming `spec.model` made every rank load the model again. Each rank now serves the model it loaded under `spec.model`, pinned or not. This needs `ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3` or later, which carries the updated sharded entrypoint.
 
 ## v0.2.3 — 2026-10-29
