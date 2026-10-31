@@ -461,3 +461,94 @@ func (r *Registry) page(w http.ResponseWriter, req *http.Request, key string, it
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{key: items})
 }
+
+// PushTo copies every repository the fake holds into the registry h serves,
+// through its push endpoints: each blob by a monolithic upload, each manifest
+// by digest (image manifests before indexes), then each tag. A test uses it to
+// run the same content against a real registry server in process.
+func (r *Registry) PushTo(h http.Handler) error {
+	r.mu.Lock()
+	type manifest struct {
+		repo, digest string
+		m            stored
+	}
+	type blob struct {
+		repo, digest string
+		b            []byte
+	}
+	var blobs []blob
+	var images, indexes []manifest
+	var tags []manifest
+	names := make([]string, 0, len(r.repos))
+	for name := range r.repos {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		rp := r.repos[name]
+		for d, b := range rp.blobs {
+			blobs = append(blobs, blob{name, d, b})
+		}
+		for d, m := range rp.manifests {
+			if strings.Contains(m.mediaType, "index") || strings.Contains(m.mediaType, "list") {
+				indexes = append(indexes, manifest{name, d, m})
+			} else {
+				images = append(images, manifest{name, d, m})
+			}
+		}
+		for tag, d := range rp.tags {
+			tags = append(tags, manifest{name, tag, rp.manifests[d]})
+		}
+	}
+	r.mu.Unlock()
+	do := func(method, path, contentType string, body []byte, want int) error {
+		req, err := http.NewRequest(method, "http://registry.test"+path, strings.NewReader(string(body)))
+		if err != nil {
+			return err
+		}
+		req.ContentLength = int64(len(body))
+		req.Header.Set("Content-Type", contentType)
+		rec := &recorder{header: http.Header{}}
+		h.ServeHTTP(rec, req)
+		if rec.status != want {
+			return fmt.Errorf("%s %s: status %d, want %d: %s", method, path, rec.status, want, rec.body.String())
+		}
+		return nil
+	}
+	for _, b := range blobs {
+		if err := do(http.MethodPost, "/v2/"+b.repo+"/blobs/uploads/?digest="+b.digest, "application/octet-stream", b.b, http.StatusCreated); err != nil {
+			return err
+		}
+	}
+	for _, m := range append(images, indexes...) {
+		if err := do(http.MethodPut, "/v2/"+m.repo+"/manifests/"+m.digest, m.m.mediaType, m.m.body, http.StatusCreated); err != nil {
+			return err
+		}
+	}
+	for _, m := range tags {
+		if err := do(http.MethodPut, "/v2/"+m.repo+"/manifests/"+m.digest, m.m.mediaType, m.m.body, http.StatusCreated); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recorder is a minimal http.ResponseWriter for PushTo.
+type recorder struct {
+	header http.Header
+	status int
+	body   strings.Builder
+}
+
+func (w *recorder) Header() http.Header { return w.header }
+
+func (w *recorder) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+}
+
+func (w *recorder) Write(b []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	return w.body.Write(b)
+}

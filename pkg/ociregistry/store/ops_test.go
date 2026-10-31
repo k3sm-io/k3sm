@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -183,5 +184,36 @@ func TestDeleteRows(t *testing.T) {
 	}
 	if err := s.DeleteTag(ctx, n, "a"); !errors.Is(err, ErrManifestUnknown) {
 		t.Fatalf("DeleteTag of a missing tag = %v", err)
+	}
+}
+
+func TestAppendUploadLimit(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	n := name(t, "app")
+	id, err := s.NewUpload(ctx, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size, err := s.AppendUploadLimit(ctx, n, id, 0, 8, strings.NewReader("abcde")); err != nil || size != 5 {
+		t.Fatalf("a chunk under the limit = %d, %v", size, err)
+	}
+	// A chunk that would pass the limit is refused, and the session keeps
+	// only what it had before it.
+	if size, err := s.AppendUploadLimit(ctx, n, id, -1, 8, strings.NewReader("fghi")); !errors.Is(err, ErrUploadTooLarge) || size != 5 {
+		t.Fatalf("a chunk past the limit = %d, %v", size, err)
+	}
+	if size, err := s.UploadSize(ctx, n, id); err != nil || size != 5 {
+		t.Fatalf("session after a refused chunk = %d, %v", size, err)
+	}
+	// A chunk that fills the session exactly is accepted.
+	if size, err := s.AppendUploadLimit(ctx, n, id, 5, 8, strings.NewReader("fgh")); err != nil || size != 8 {
+		t.Fatalf("a chunk up to the limit = %d, %v", size, err)
+	}
+	if size, err := s.AppendUploadLimit(ctx, n, id, 8, 8, strings.NewReader("")); err != nil || size != 8 {
+		t.Fatalf("an empty chunk at the limit = %d, %v", size, err)
+	}
+	if size, err := s.AppendUploadLimit(ctx, n, id, 8, 8, strings.NewReader("x")); !errors.Is(err, ErrUploadTooLarge) || size != 8 {
+		t.Fatalf("a byte past a full session = %d, %v", size, err)
 	}
 }

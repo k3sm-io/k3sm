@@ -142,7 +142,12 @@ func (s *Store) NewUpload(ctx context.Context, n ref.Name) (string, error) {
 // check a chunk would be appended to the published blob the commit linked from
 // the same inode, which other repositories share. It returns the file and the
 // session path.
-func (s *Store) openUpload(ctx context.Context, n ref.Name, id string, flag int) (*os.File, string, error) {
+//
+// shared relaxes the single-link rule, and only for the two operations that
+// never write the inode: a commit retried after a commit that linked the
+// session into blobs/ but did not remove it, and a cancel of such a session.
+// Both only hash, link and unlink; an append always requires one link.
+func (s *Store) openUpload(ctx context.Context, n ref.Name, id string, flag int, shared bool) (*os.File, string, error) {
 	p, err := s.uploadPath(n, id)
 	if err != nil {
 		return nil, "", err
@@ -161,16 +166,16 @@ func (s *Store) openUpload(ctx context.Context, n ref.Name, id string, flag int)
 		f.Close()
 		return nil, "", fmt.Errorf("lock upload %s: %w", id, err)
 	}
-	if err := checkSession(f, p); err != nil {
+	if err := checkSession(f, p, shared); err != nil {
 		f.Close()
 		return nil, "", fmt.Errorf("%w: %s in %s: %v", ErrUploadUnknown, id, n, err)
 	}
 	return f, p, nil
 }
 
-// checkSession requires that p still names f's inode and that the inode has a
-// single link (no blob shares it yet).
-func checkSession(f *os.File, p string) error {
+// checkSession requires that p still names f's inode and, unless shared, that
+// the inode has a single link (no blob shares it yet).
+func checkSession(f *os.File, p string, shared bool) error {
 	fst, err := f.Stat()
 	if err != nil {
 		return err
@@ -182,7 +187,7 @@ func checkSession(f *os.File, p string) error {
 	if !lst.Mode().IsRegular() || !os.SameFile(fst, lst) {
 		return errors.New("the session path no longer names the opened file")
 	}
-	if nlink(fst) != 1 {
+	if !shared && nlink(fst) != 1 {
 		return fmt.Errorf("the session file has %d links", nlink(fst))
 	}
 	return nil
@@ -197,7 +202,7 @@ func nlink(fi os.FileInfo) uint64 {
 
 // UploadSize returns session id's length, which is its offset.
 func (s *Store) UploadSize(ctx context.Context, n ref.Name, id string) (int64, error) {
-	f, _, err := s.openUpload(ctx, n, id, os.O_RDONLY)
+	f, _, err := s.openUpload(ctx, n, id, os.O_RDONLY, false)
 	if err != nil {
 		return 0, err
 	}
@@ -211,9 +216,20 @@ func (s *Store) UploadSize(ctx context.Context, n ref.Name, id string) (int64, e
 
 // AppendUpload appends r to session id and returns its new length. offset is
 // where the chunk starts and must be the session's length; a negative offset
-// appends wherever the session ends.
+// appends wherever the session ends. The session's length is not limited; a
+// caller serving untrusted bodies uses AppendUploadLimit.
 func (s *Store) AppendUpload(ctx context.Context, n ref.Name, id string, offset int64, r io.Reader) (int64, error) {
-	f, _, err := s.openUpload(ctx, n, id, os.O_WRONLY|os.O_APPEND)
+	return s.AppendUploadLimit(ctx, n, id, offset, -1, r)
+}
+
+// AppendUploadLimit is AppendUpload for a session that may never be longer
+// than limit bytes (no limit when limit is negative). At most the bytes that
+// fit are read from r; when r holds more, the chunk is refused with
+// ErrUploadTooLarge and the session is cut back to the length it had before
+// the chunk, so no byte past the limit, and none of the refused chunk, stays
+// on disk.
+func (s *Store) AppendUploadLimit(ctx context.Context, n ref.Name, id string, offset, limit int64, r io.Reader) (int64, error) {
+	f, _, err := s.openUpload(ctx, n, id, os.O_WRONLY|os.O_APPEND, false)
 	if err != nil {
 		return 0, err
 	}
@@ -222,45 +238,94 @@ func (s *Store) AppendUpload(ctx context.Context, n ref.Name, id string, offset 
 	if err != nil {
 		return 0, err
 	}
-	if offset >= 0 && offset != fi.Size() {
-		return fi.Size(), fmt.Errorf("%w: chunk at %d, session at %d", ErrOffsetMismatch, offset, fi.Size())
+	size := fi.Size()
+	if offset >= 0 && offset != size {
+		return size, fmt.Errorf("%w: chunk at %d, session at %d", ErrOffsetMismatch, offset, size)
 	}
-	w, err := io.Copy(f, r)
+	if limit < 0 {
+		w, err := io.Copy(f, r)
+		if err != nil {
+			return size + w, fmt.Errorf("append to upload %s: %w", id, err)
+		}
+		return size + w, nil
+	}
+	room := max(limit-size, 0)
+	w, err := io.Copy(f, io.LimitReader(r, room))
 	if err != nil {
-		return fi.Size() + w, fmt.Errorf("append to upload %s: %w", id, err)
+		return size + w, fmt.Errorf("append to upload %s: %w", id, err)
 	}
-	return fi.Size() + w, nil
+	if w == room {
+		var probe [1]byte
+		k, perr := io.ReadFull(r, probe[:])
+		if k > 0 {
+			if err := f.Truncate(size); err != nil {
+				return size + w, fmt.Errorf("cut back oversized upload %s: %w", id, err)
+			}
+			return size, fmt.Errorf("%w: session %s would pass %d bytes", ErrUploadTooLarge, id, limit)
+		}
+		if perr != io.EOF && perr != io.ErrUnexpectedEOF {
+			return size + w, fmt.Errorf("append to upload %s: %w", id, perr)
+		}
+	}
+	return size + w, nil
 }
 
 // CommitUpload finishes session id as blob want: the content is hashed, made
 // durable, and linked into blobs/ (link-or-keep), then the session file is
 // removed. A digest mismatch leaves the session in place.
+//
+// A session a previous commit already linked into blobs/ (its inode has two
+// links because the session file was not removed) is committed again by the
+// same steps: it is re-hashed, link-or-keep finds the blob in place, and the
+// session name is unlinked. Nothing writes to the shared inode.
 func (s *Store) CommitUpload(ctx context.Context, n ref.Name, id string, want digest.Digest) error {
+	return s.commitUpload(ctx, n, id, want, -1)
+}
+
+// CommitHashedUpload is CommitUpload for a caller that hashed the session's
+// bytes as they streamed in: size is how many bytes that hash covered, and the
+// caller has checked that they hash to want. The file is not read again when
+// it is still exactly size bytes and has one link; otherwise (another writer
+// appended, or the session is already shared with a blob) it is re-hashed as
+// CommitUpload does. The caller's hash is trusted only for bytes this process
+// wrote under the session's flock.
+func (s *Store) CommitHashedUpload(ctx context.Context, n ref.Name, id string, want digest.Digest, size int64) error {
+	if size < 0 {
+		return fmt.Errorf("commit upload %s: negative hashed size %d", id, size)
+	}
+	return s.commitUpload(ctx, n, id, want, size)
+}
+
+// commitUpload is the commit; hashed is the length the caller's streamed hash
+// covered, or -1 when there is none.
+func (s *Store) commitUpload(ctx context.Context, n ref.Name, id string, want digest.Digest, hashed int64) error {
 	if _, err := ref.ParseDigest(want.String()); err != nil {
 		return err
 	}
-	f, src, err := s.openUpload(ctx, n, id, os.O_RDWR)
+	f, src, err := s.openUpload(ctx, n, id, os.O_RDWR, true)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	v := want.Verifier()
-	if _, err := io.Copy(v, f); err != nil {
-		return fmt.Errorf("hash upload %s: %w", id, err)
+	fi, err := f.Stat()
+	if err != nil {
+		return err
 	}
-	if !v.Verified() {
-		return fmt.Errorf("%w: upload %s is not %s", ErrDigestMismatch, id, want)
+	if hashed < 0 || hashed != fi.Size() || nlink(fi) != 1 {
+		v := want.Verifier()
+		if _, err := io.Copy(v, f); err != nil {
+			return fmt.Errorf("hash upload %s: %w", id, err)
+		}
+		if !v.Verified() {
+			return fmt.Errorf("%w: upload %s is not %s", ErrDigestMismatch, id, want)
+		}
 	}
 	if err := fullSync(f); err != nil {
 		return fmt.Errorf("sync upload %s: %w", id, err)
 	}
 	// Link by path only while the path still names the inode just hashed.
-	if err := checkSession(f, src); err != nil {
+	if err := checkSession(f, src, true); err != nil {
 		return fmt.Errorf("%w: %s in %s: %v", ErrUploadUnknown, id, n, err)
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		return err
 	}
 	if err := s.linkBlob(n, src, fi, true, want); err != nil {
 		return err
@@ -271,9 +336,11 @@ func (s *Store) CommitUpload(ctx context.Context, n ref.Name, id string, want di
 	return nil
 }
 
-// CancelUpload removes session id.
+// CancelUpload removes session id. A session already linked into blobs/ by a
+// commit that did not finish is cancelled too: only the session name is
+// unlinked, and the blob keeps the inode.
 func (s *Store) CancelUpload(ctx context.Context, n ref.Name, id string) error {
-	f, p, err := s.openUpload(ctx, n, id, os.O_RDONLY)
+	f, p, err := s.openUpload(ctx, n, id, os.O_RDONLY, true)
 	if err != nil {
 		return err
 	}
@@ -308,8 +375,11 @@ func (s *Store) writeBlob(ctx context.Context, n ref.Name, d digest.Digest, body
 }
 
 // MountBlob makes blob d of repository from a blob of n by link(2): the same
-// inode, no copy. It returns ErrMountUnavailable when from does not hold the
-// blob or the link crosses volumes, so the caller falls back to an upload.
+// inode, no copy. The source blob is trusted as it stands: it was verified
+// against d when it was committed (or when link-or-keep replaced it), and blob
+// files are never written in place, so a mount does not hash it again. It
+// returns ErrMountUnavailable when from does not hold the blob or the link
+// crosses volumes, so the caller falls back to an upload.
 func (s *Store) MountBlob(ctx context.Context, n, from ref.Name, d digest.Digest) error {
 	src, err := s.blobPath(from, d)
 	if err != nil {

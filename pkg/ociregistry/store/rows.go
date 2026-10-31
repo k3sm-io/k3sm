@@ -93,6 +93,16 @@ func putUntagged(rows []ispec.Descriptor, desc ispec.Descriptor) ([]ispec.Descri
 // body must hash to). The body is a blob first, durable before the index
 // names it. The store checks no manifest content; the server does.
 func (s *Store) PutManifest(ctx context.Context, n ref.Name, r ref.Reference, mediaType string, body []byte) (ispec.Descriptor, error) {
+	return s.PutManifestChecked(ctx, n, r, mediaType, body, nil)
+}
+
+// PutManifestChecked is PutManifest that runs check, when it is set, under
+// the repository lock immediately before index.json is written, and writes
+// nothing to the index when it fails. The server checks there that every blob
+// the manifest names is still in the repository: a sweep deletes only under
+// the same lock, so a blob present at the check stays until the index names
+// it. check must not take the repository lock.
+func (s *Store) PutManifestChecked(ctx context.Context, n ref.Name, r ref.Reference, mediaType string, body []byte, check func() error) (ispec.Descriptor, error) {
 	if mediaType == "" {
 		return ispec.Descriptor{}, fmt.Errorf("put manifest in %s: no media type", n)
 	}
@@ -109,6 +119,11 @@ func (s *Store) PutManifest(ctx context.Context, n ref.Name, r ref.Reference, me
 	}
 	desc := ispec.Descriptor{MediaType: mediaType, Digest: d, Size: int64(len(body))}
 	err := s.updateIndex(ctx, n, func(rows []ispec.Descriptor) ([]ispec.Descriptor, bool, error) {
+		if check != nil {
+			if err := check(); err != nil {
+				return nil, false, err
+			}
+		}
 		if r.Tag != "" {
 			rows, changed := putTagged(rows, desc, r.Tag)
 			return rows, changed, nil
@@ -142,5 +157,21 @@ func (s *Store) DeleteDigest(ctx context.Context, n ref.Name, d digest.Digest) e
 			return nil, false, fmt.Errorf("%w: %s in %s", ErrManifestUnknown, d, n)
 		}
 		return kept, true, nil
+	})
+}
+
+// DeleteDigestChecked is DeleteDigest that first runs check over the rows
+// under the repository lock and deletes nothing when it fails, so a refusal
+// based on the index (a manifest an index still names) cannot race a PUT
+// that changes it. check must not take the repository lock.
+func (s *Store) DeleteDigestChecked(ctx context.Context, n ref.Name, d digest.Digest, check func([]ispec.Descriptor) error) error {
+	return s.updateIndex(ctx, n, func(rows []ispec.Descriptor) ([]ispec.Descriptor, bool, error) {
+		if !slices.ContainsFunc(rows, func(r ispec.Descriptor) bool { return r.Digest == d }) {
+			return nil, false, fmt.Errorf("%w: %s in %s", ErrManifestUnknown, d, n)
+		}
+		if err := check(rows); err != nil {
+			return nil, false, err
+		}
+		return slices.DeleteFunc(rows, func(r ispec.Descriptor) bool { return r.Digest == d }), true, nil
 	})
 }

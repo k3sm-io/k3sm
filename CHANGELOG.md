@@ -24,6 +24,13 @@ pin, its date, and the tarball's sha256.
   nothing taints the node or evicts a Pod on it. The node's pressure sampler now runs once a
   second from the warn rung up, not only past the half-way marks.
 
+- The registry gains its own OCI distribution API server over the on-disk store, written to
+  replace the zot child in a later release: manifests, blobs, chunked and monolithic uploads,
+  cross-repository mounts that link only from the named source, tag and catalog paging, and
+  referrers. It requires an access policy, caps each upload's size and the free space it
+  may use, and cuts off request bodies that stall or trickle. It is not yet the server the
+  daemon runs.
+
 ### Changed
 
 - `k3sm image ls` and `k3sm image df` keep a cache of image descriptions by digest under
