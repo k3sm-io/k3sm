@@ -381,7 +381,7 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 	// Decided now, over the same entries, and acted on under the install
 	// lock (applyDeveloperMode).
 	if cfg.DeveloperMode == DeveloperModeUnset && cfg.preLockMarker != DeveloperModeAbsent {
-		cfg.offTeam, cfg.keepReason = developerModeOff(ctx, *cfg, entries)
+		cfg.offTeam, cfg.keepReason = developerModeOff(ctx, *cfg, installed, entries)
 	}
 	// Last, because it runs the installed binary: only a tree that passed
 	// every signing check gets that far.
@@ -401,6 +401,12 @@ var errInstalledUnresolvable = errors.New("the installed k3sm does not resolve t
 // with a valid <v>; a dangling link, a loop, a directory, another name or a
 // target outside that tree is errInstalledUnresolvable, never fs.ErrNotExist,
 // so a broken link is not mistaken for no install.
+//
+// A path resolved from a link is returned fully evaluated (EvalSymlinks): no
+// component of it is a symlink, so the later reads follow none again. A path
+// returned as it is (not a link, or missing) is not evaluated: a symlinked
+// component above it, an install root that is itself a link, is followed
+// again by each later read.
 //
 // The callers read only the returned path. Nothing stops the tree changing
 // after the resolve; that needs a write to the root-owned install directory.

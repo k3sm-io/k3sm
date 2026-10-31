@@ -74,6 +74,8 @@ func TestStagingChecksResolveTheInstallOnce(t *testing.T) {
 		{name: "a downgrade read through the link is refused", link: true, version: "v0.5.0", want: ErrDowngrade},
 		{name: "an entry point that resolves outside the tree is refused", link: true, version: "v0.3.9",
 			resolve: errors.New("the installed k3sm resolves outside its install tree"), wantMsg: "outside its install tree"},
+		{name: "an entry point that resolves outside the tree is refused in developer mode", link: true, version: "v0.3.9",
+			devMode: true, resolve: errors.New("the installed k3sm resolves outside its install tree"), wantMsg: "outside its install tree"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -194,6 +196,24 @@ func TestResolveInstalledBinary(t *testing.T) {
 				putInstalledFile(t, filepath.Join(root, "versions", ".tmp-v0.3.9", "k3sm"))
 				putInstalledLink(t, "versions/.tmp-v0.3.9/k3sm", filepath.Join(root, "k3sm"))
 			}},
+		{name: "a version directory that is a link out of the tree",
+			setup: func(t *testing.T, root string) {
+				out := t.TempDir()
+				putInstalledFile(t, filepath.Join(out, "k3sm"))
+				if err := os.MkdirAll(filepath.Join(root, "versions"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				putInstalledLink(t, out, filepath.Join(root, "versions", "v0.3.9"))
+				putInstalledLink(t, "versions/v0.3.9", filepath.Join(root, "current"))
+				putInstalledLink(t, "current/k3sm", filepath.Join(root, "k3sm"))
+			}},
+		{name: "a version directory that is a link to another version resolves to that one", want: "versions/v0.4.0/k3sm",
+			setup: func(t *testing.T, root string) {
+				putInstalledFile(t, filepath.Join(root, "versions", "v0.4.0", "k3sm"))
+				putInstalledLink(t, "v0.4.0", filepath.Join(root, "versions", "v0.3.9"))
+				putInstalledLink(t, "versions/v0.3.9", filepath.Join(root, "current"))
+				putInstalledLink(t, "current/k3sm", filepath.Join(root, "k3sm"))
+			}},
 		{name: "a link to a directory",
 			setup: func(t *testing.T, root string) {
 				if err := os.MkdirAll(filepath.Join(root, "versions", "v0.3.9", "k3sm"), 0o755); err != nil {
@@ -223,6 +243,113 @@ func TestResolveInstalledBinary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResolveInstalledBinaryUnderALinkedRoot pins the resolution when the
+// install root itself (the directory holding the entry point) is a symlink. A
+// link entry point resolves into the real root's version directory, every
+// component evaluated. A flat file is not a link and is returned as named,
+// the root link still in it.
+func TestResolveInstalledBinaryUnderALinkedRoot(t *testing.T) {
+	t.Parallel()
+	linkedRoot := func(t *testing.T) (real, linked string) {
+		t.Helper()
+		base, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		real, linked = filepath.Join(base, "real"), filepath.Join(base, "k3sm-root")
+		if err := os.Mkdir(real, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		putInstalledLink(t, real, linked)
+		return real, linked
+	}
+	t.Run("a versioned install resolves into the real root", func(t *testing.T) {
+		t.Parallel()
+		real, linked := linkedRoot(t)
+		putInstalledFile(t, filepath.Join(real, "versions", "v0.3.9", "k3sm"))
+		putInstalledLink(t, "versions/v0.3.9", filepath.Join(real, "current"))
+		putInstalledLink(t, "current/k3sm", filepath.Join(real, "k3sm"))
+		got, err := resolveInstalledBinary(filepath.Join(linked, "k3sm"), os.Lstat, filepath.EvalSymlinks)
+		if want := filepath.Join(real, "versions", "v0.3.9", "k3sm"); err != nil || got != want {
+			t.Fatalf("resolveInstalledBinary = %q, %v; want %s", got, err, want)
+		}
+	})
+	t.Run("a flat install is returned as named", func(t *testing.T) {
+		t.Parallel()
+		real, linked := linkedRoot(t)
+		putInstalledFile(t, filepath.Join(real, "k3sm"))
+		entry := filepath.Join(linked, "k3sm")
+		got, err := resolveInstalledBinary(entry, os.Lstat, filepath.EvalSymlinks)
+		if err != nil || got != entry {
+			t.Fatalf("resolveInstalledBinary = %q, %v; want %s", got, err, entry)
+		}
+	})
+}
+
+// TestDeveloperModeOffJudgesTheResolvedInstall pins that the decision to turn
+// developer mode off reads the installed k3sm preflightFromStaging resolved,
+// never the entry point again, and that a developer-mode install (a marker,
+// no flag) whose entry point resolves outside the tree is refused.
+func TestDeveloperModeOffJudgesTheResolvedInstall(t *testing.T) {
+	t.Parallel()
+	flat := Config{}.withDefaults().installedBinary()
+	versioned := filepath.Join(filepath.Dir(flat), "versions", "v0.3.9", "k3sm")
+	setup := func(t *testing.T) (*fakeStagingFS, Config) {
+		t.Helper()
+		sfs, cfg := stagedFixture()
+		sfs.links = map[string]string{flat: versioned}
+		sfs.versions[versioned] = "v0.3.9"
+		cfg.Signer = linkSigner{fakeSigner: fakeSigner{ids: signedTree(map[string]string{versioned: testTeamID})}, sfs: sfs}
+		f := &fakeSystem{owners: map[string]OwnedEntry{}}
+		f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
+		f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
+		if err := resolveDeveloperMode(f, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		sfs.calls = nil
+		return sfs, cfg
+	}
+	t.Run("the resolved binary decides", func(t *testing.T) {
+		t.Parallel()
+		sfs, cfg := setup(t)
+		if err := preflightFromStaging(context.Background(), &cfg); err != nil {
+			t.Fatalf("preflightFromStaging = %v, want accepted", err)
+		}
+		if cfg.offTeam != testTeamID {
+			t.Fatalf("offTeam = %q (keep: %q), want %s", cfg.offTeam, cfg.keepReason, testTeamID)
+		}
+		var sawResolved bool
+		for _, c := range sfs.calls {
+			op, path, _ := strings.Cut(c, ":")
+			if op == "ResolveInstalled" {
+				continue
+			}
+			if path == flat {
+				t.Errorf("%s read the entry point %s again", op, flat)
+			}
+			sawResolved = sawResolved || (op == "TeamID" && path == versioned)
+		}
+		if !sawResolved {
+			t.Errorf("the installed signature was never read from %s (calls %v)", versioned, sfs.calls)
+		}
+	})
+	t.Run("an entry point outside the tree is refused", func(t *testing.T) {
+		t.Parallel()
+		sfs, cfg := setup(t)
+		sfs.resolveErr = map[string]error{flat: errInstalledUnresolvable}
+		if err := preflightFromStaging(context.Background(), &cfg); !errors.Is(err, errInstalledUnresolvable) {
+			t.Fatalf("preflightFromStaging = %v, want %v", err, errInstalledUnresolvable)
+		}
+		for _, c := range sfs.calls {
+			if _, path, _ := strings.Cut(c, ":"); path == flat || path == versioned {
+				if !strings.HasPrefix(c, "ResolveInstalled:") {
+					t.Errorf("a refused entry point was still read: %s", c)
+				}
+			}
+		}
+	})
 }
 
 func putInstalledFile(t *testing.T, path string) {

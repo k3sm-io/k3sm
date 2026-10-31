@@ -93,8 +93,8 @@ pin, its date, and the tarball's sha256.
 
 - An install from a k3sm.app staging directory resolves the installed `k3sm` once and reads its
   signature and its version from that one file, so the two checks cannot judge different binaries
-  when the installed `k3sm` is a link into a version directory. A link that leads anywhere else is
-  refused.
+  when the installed `k3sm` is a link into a version directory. A link that leads anywhere else
+  refuses the install, in developer mode too.
 - `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
   a versioned install directory or through a symlinked install path, not only from the flat
   `/Library/k3sm/k3sm-vmhost`, so such a helper is still stopped instead of reported as unknown.
