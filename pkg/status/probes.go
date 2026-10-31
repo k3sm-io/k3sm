@@ -318,6 +318,10 @@ type Collector struct {
 	// a permission error sets network.appliedReadable false. The daemons
 	// probe never calls it.
 	NetworkApplied func(role install.Role) ([]byte, error)
+	// Budget reads the node daemon's budget record (BudgetPath in the status
+	// directory in production). OPTIONAL: nil, an error or an unusable record
+	// leaves the report's budget block out. The daemons probe never calls it.
+	Budget func() ([]byte, error)
 	// AgentJoinServer returns the control-plane host the installed agent
 	// joins: ONLY the --server value of the agent LaunchDaemon's argv
 	// (install.AgentJoinServer in production). OPTIONAL: nil, or an error,

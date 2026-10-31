@@ -131,6 +131,10 @@ const (
 	// under the same name (it cannot import this package; a pkg/status test
 	// pins the two together).
 	RegistryStateRecordName = "registry-state.json"
+	// BudgetRecordName is the sixth, written by either node role and only in
+	// StatusSubdir: this node's budget observation (the budget.k3sm.io/status
+	// payload), node-level figures with no pod or workload name in them.
+	BudgetRecordName = "budget.json"
 )
 
 // manifestsSubdir is the manifest directory's leaf name, spelled once.

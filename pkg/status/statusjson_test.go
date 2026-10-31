@@ -49,7 +49,7 @@ var (
 	// reportRequired and reportOptional are the top-level keys of `k3sm status
 	// -o json`. The optional ones are omitted when empty.
 	reportRequired = []string{"schemaVersion", "capabilities", "verdict", "role", "summary", "rows", "version", "host", "timestamp"}
-	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy", "network", "workers", "joinTarget"}
+	reportOptional = []string{"next", "peers", "interconnect", "stoppedBy", "network", "workers", "joinTarget", "budget"}
 	// workerRequired and workerOptional are the keys of each entry of the
 	// optional workers list; version is omitted while a kubelet has reported
 	// none.
@@ -323,6 +323,13 @@ func contractScenarios() map[string]contractScenario {
 			peer.Labels = map[string]string{controlPlaneNodeLabel: ""}
 			kube.nodes = append(kube.nodes, older, peer)
 			return contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", kube, nil)
+		}},
+		// A running server whose node daemon has a fresh budget record: the
+		// budget block, which the daemons probe never carries.
+		"running-budget": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			c := contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", heartbeatingKube(goldenTime), nil)
+			c.Budget = budgetRecordSeam(t, contractBudget(goldenTime.Add(-5*time.Second)))
+			return c
 		}},
 		"network-recorded": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
 			c := contractNetwork(t, contractRecordOff, func(install.Role) ([]byte, error) {
@@ -747,6 +754,9 @@ func TestStatusJSONContractGolden(t *testing.T) {
 			if !reflect.DeepEqual(gotFull.Capabilities, full.Capabilities) || !reflect.DeepEqual(full.Capabilities, []string{CapabilityWatchJSON}) {
 				t.Errorf("capabilities: collected %v, golden %v, want [%s]", gotFull.Capabilities, full.Capabilities, CapabilityWatchJSON)
 			}
+			if !reflect.DeepEqual(budgetJSON(t, gotFull.Budget), budgetJSON(t, full.Budget)) {
+				t.Errorf("budget: collected %s, golden %s", budgetJSON(t, gotFull.Budget), budgetJSON(t, full.Budget))
+			}
 			if gotFull.JoinTarget != full.JoinTarget {
 				t.Errorf("joinTarget: collected %q, golden %q", gotFull.JoinTarget, full.JoinTarget)
 			}
@@ -767,12 +777,27 @@ func TestStatusJSONContractGolden(t *testing.T) {
 		// Every optional key appears in some golden, so a rename of a key that
 		// one fixture omits still fails in another. peers is the exception: it
 		// is reserved, and no posture emits it yet (the struct check covers it).
-		for _, k := range append(append(append(append([]string{"next", "interconnect", "stoppedBy", "workers", "joinTarget", "network"}, rowOptional...), versionOptional...), interconnectOptional...), append(networkOptional, append(alertOptional, fixStepOptional...)...)...) {
+		for _, k := range append(append(append(append([]string{"next", "interconnect", "stoppedBy", "workers", "joinTarget", "network", "budget"}, rowOptional...), versionOptional...), interconnectOptional...), append(networkOptional, append(alertOptional, fixStepOptional...)...)...) {
 			if !optionalSeen[k] {
 				t.Errorf("no golden carries the optional key %q", k)
 			}
 		}
 	})
+}
+
+// budgetJSON is a budget block's encoding, the form its contract pins ("" for
+// none), so a golden's block compares with a collected one whatever the time
+// zone and slice nil-ness the decode produced.
+func budgetJSON(t *testing.T, b any) string {
+	t.Helper()
+	if reflect.ValueOf(b).IsNil() {
+		return ""
+	}
+	raw, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 // stateTable renders rows as name=state/severity, the contract-level facts a

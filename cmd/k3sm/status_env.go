@@ -43,6 +43,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/tcpseg"
@@ -240,6 +241,7 @@ func newStatusCollector() status.Collector {
 		StopMarker:     statusStopMarker,
 		Network:        statusNetwork,
 		NetworkApplied: statusNetworkApplied,
+		Budget:         statusBudgetFor(statusDir),
 		// The developer-mode marker, judged by the installer's own reader
 		// (lstat, no symlink followed, plus the ACL probe; no privilege
 		// needed), and the installed k3sm's signing for the row's wide key.
@@ -299,6 +301,20 @@ func statusStopMarker() (install.StopMarker, bool, error) {
 // reader; the record is world-readable, so this works for any user.
 func statusNetwork() (install.NetworkRecord, bool, error) {
 	return install.ReadNetworkRecord(install.ReadNetworkRecordFile, install.DefaultNetworkRecordPath)
+}
+
+// statusBudgetFor reads the node daemon's budget record from statusDir, where
+// any account may read it. The read stops one byte past the record's size
+// bound, so an oversized file is refused by the parser, never read whole.
+func statusBudgetFor(statusDir string) func() ([]byte, error) {
+	return func() ([]byte, error) {
+		f, err := os.Open(status.BudgetPath(statusDir))
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = f.Close() }()
+		return io.ReadAll(io.LimitReader(f, budgetv1alpha1.MaxBudgetAnnotationBytes+1))
+	}
 }
 
 // statusNetworkApplied reads the node daemon's applied report; it is in the
