@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -29,9 +30,11 @@ import (
 // off, so a build from source can be installed and driven by a development
 // build of k3sm.app. Its one record is a marker file beside the install root
 // (outside the tree a swap replaces): `k3sm install --developer-mode on`
-// creates it, `--developer-mode off` removes it, an install of a team-signed
-// build without `on` removes it, and uninstall removes it. Presence is the
-// whole record; the content is never parsed.
+// creates it, `--developer-mode off` removes it, and uninstall removes it. An
+// install from a k3sm.app staging directory without the flag removes it only
+// when the whole staged tree is signed by the team the signing continuity
+// check requires (developerModeOff); every other install keeps it. Presence is
+// the whole record; the content is never parsed.
 //
 // The marker counts only when it is a root-owned regular file nobody else
 // can write and that carries no ACL (DeveloperModeMarkerState). A marker that
@@ -54,8 +57,9 @@ func DeveloperModeMarkerContent(now time.Time) []byte {
 type DeveloperMode string
 
 const (
-	// DeveloperModeUnset keeps the marker as it is, except that an install of
-	// a team-signed build removes it.
+	// DeveloperModeUnset keeps the marker as it is, except that an install
+	// from a staging directory whose whole tree is signed by the k3sm team
+	// removes it (developerModeOff).
 	DeveloperModeUnset DeveloperMode = ""
 	// DeveloperModeOn writes the marker and skips the signing continuity check.
 	DeveloperModeOn DeveloperMode = "on"
@@ -81,29 +85,59 @@ type DeveloperModeOptions struct {
 	// (DeveloperModeMarkerPath) before the install root is swapped, leaves it
 	// there if the install then fails, and skips the --from-staging signing
 	// continuity check; DeveloperModeOff removes the marker;
-	// DeveloperModeUnset keeps it as it is, except that an install whose k3sm
-	// carries a Developer ID team signature (judged through Signer) removes
-	// it. Under --from-staging a valid marker on disk turns developer mode on
-	// when the flag is not passed. --require-team-signature, the staging
-	// directory checks and the downgrade rule apply whatever the mode.
+	// DeveloperModeUnset keeps it as it is, except that an install from a
+	// staging directory whose staged k3sm and every other Mach-O carry the
+	// Developer ID signature of the team the continuity check requires
+	// removes it (developerModeOff). Under --from-staging a valid marker on
+	// disk turns developer mode on when the flag is not passed. The marker
+	// that read is read again under the install lock, and a change refuses
+	// the install (ErrDeveloperModeChanged). --require-team-signature, the
+	// staging directory checks and the downgrade rule apply whatever the mode.
 	DeveloperMode DeveloperMode
 	// markerState reads the marker on disk when DeveloperMode is unset
 	// (resolveDeveloperMode sets it). Nil reads as absent.
 	markerState func() DeveloperModeState
+	// preLockMarker is the marker state the --from-staging predicate read and
+	// acted on, before the install lock; empty when it was not read.
+	preLockMarker DeveloperModeState
+	// offTeam is the team whose signature covers the whole staged tree, set by
+	// the --from-staging predicate when the flag is unset and a marker is
+	// there (developerModeOff); empty keeps the marker, for keepReason.
+	offTeam    string
+	keepReason string
+}
+
+// readMarker reads the marker through markerState and records the first read
+// in preLockMarker, which the read under the install lock is compared with.
+func (o *DeveloperModeOptions) readMarker() DeveloperModeState {
+	state := DeveloperModeAbsent
+	if o.markerState != nil {
+		state = o.markerState()
+	}
+	if o.preLockMarker == "" {
+		o.preLockMarker = state
+	}
+	return state
 }
 
 // developerModeOn reports whether this install runs in developer mode: the
 // flag said on, or it was not passed and a valid marker is on disk. It skips
 // checkSigningContinuity.
-func (o DeveloperModeOptions) developerModeOn() bool {
+func (o *DeveloperModeOptions) developerModeOn() bool {
 	switch o.DeveloperMode {
 	case DeveloperModeOn:
 		return true
 	case DeveloperModeUnset:
-		return o.markerState != nil && o.markerState() == DeveloperModeMarkerOn
+		return o.readMarker() == DeveloperModeMarkerOn
 	}
 	return false
 }
+
+// ErrDeveloperModeChanged is a developer-mode marker that changed between the
+// read the --from-staging predicate acted on and the read under the install
+// lock. The install is refused, because the signing checks it ran, or skipped,
+// followed the first read.
+var ErrDeveloperModeChanged = errors.New("the developer-mode marker changed during the install")
 
 // DeveloperModeState is what the marker on disk says.
 type DeveloperModeState string
@@ -202,10 +236,13 @@ func resolveDeveloperMode(sys System, cfg *Config) error {
 	return nil
 }
 
-// applyDeveloperMode records the mode on disk, before the install root is
-// swapped: on writes the marker (and a failed install leaves it), off removes
-// it, and not passed keeps it unless the build being installed is team-signed,
-// which turns developer mode off.
+// applyDeveloperMode records the mode on disk, under the install lock and
+// before the install root is swapped: on writes the marker (and a failed
+// install leaves it), off removes it, and not passed keeps it unless the
+// --from-staging predicate found the whole staged tree signed by the k3sm team
+// (developerModeOff), which turns developer mode off. Not passed, it reads the
+// marker again first and refuses the install if that read differs from the
+// one the predicate acted on.
 func applyDeveloperMode(ctx context.Context, sys System, cfg Config) error {
 	path := DeveloperModeMarkerPath
 	switch cfg.DeveloperMode {
@@ -221,11 +258,23 @@ func applyDeveloperMode(ctx context.Context, sys System, cfg Config) error {
 		}
 		return nil
 	}
-	team, ok := teamSignedBuild(ctx, cfg)
-	if !ok {
+	if cfg.Signer == nil {
 		return nil
 	}
-	if ReadDeveloperModeState(sys, path) == DeveloperModeAbsent {
+	state := ReadDeveloperModeState(sys, path)
+	if cfg.preLockMarker != "" && state != cfg.preLockMarker {
+		return fmt.Errorf("install: %w: it was %s when the signing checks ran and is %s now; run the install again", ErrDeveloperModeChanged, cfg.preLockMarker, state)
+	}
+	if state == DeveloperModeAbsent {
+		return nil
+	}
+	team := cfg.offTeam
+	if cfg.FromStagingDir == "" {
+		cfg.Logger.Warn("developer mode stays on: only an install from a k3sm.app staging directory can show that every binary it installs is signed by the k3sm team; run k3sm install --developer-mode off to turn it off", "marker", path)
+		return nil
+	}
+	if team == "" {
+		cfg.Logger.Warn("developer mode stays on: "+cfg.keepReason+"; run k3sm install --developer-mode off to turn it off", "marker", path)
 		return nil
 	}
 	if err := RemoveDeveloperModeMarker(sys, path); err != nil {
@@ -235,28 +284,39 @@ func applyDeveloperMode(ctx context.Context, sys System, cfg Config) error {
 	return nil
 }
 
-// teamSignedBuild reports whether the k3sm this install runs (the staged one
-// under --from-staging) carries a Developer ID Application signature, and its
-// team. Without a Signer, or on any doubt, it reports false: the marker is
-// then kept as it is.
-func teamSignedBuild(ctx context.Context, cfg Config) (string, bool) {
-	if cfg.Signer == nil {
-		return "", false
+// developerModeOff decides whether an install from a staging directory without
+// the flag turns developer mode off: the staged k3sm and every other Mach-O of
+// the staged tree must carry the Developer ID Application signature of the
+// team checkSigningContinuity requires. That is the installed k3sm's team when
+// it is team-signed, and the staged k3sm's own team when what is installed is
+// ad-hoc signed or absent. There is no other team pin: the installed build is
+// the record. It returns that team, or "" and why the marker stays.
+func developerModeOff(ctx context.Context, cfg Config, entries []StagedEntry) (string, string) {
+	installed := cfg.installedBinary()
+	team, err := cfg.Signer.TeamID(ctx, installed)
+	switch {
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, ErrNoTeamID):
+		team, err = stagedTeam(ctx, cfg)
+		if err != nil {
+			return "", "the staged k3sm carries no Developer ID team signature (" + reason(err) + ")"
+		}
+	case err != nil:
+		return "", "the signature of the installed k3sm could not be read (" + reason(err) + ")"
+	default:
+		if err := requireDeveloperID(ctx, cfg.Signer, installed, team); err != nil {
+			return "", "the installed k3sm names no Developer ID team (" + reason(err) + ")"
+		}
+		if err := requireTeam(ctx, cfg.Signer, cfg.Executable, team); err != nil {
+			return "", "the staged k3sm is not signed by the installed team " + team + " (" + reason(err) + ")"
+		}
 	}
-	exe := cfg.Executable
-	if exe == "" {
-		exe = cfg.BinarySource
+	if err := requireTreeTeam(ctx, cfg, entries, team); err != nil {
+		return "", "not every binary in the staged tree is signed by team " + team + " (" + reason(err) + ")"
 	}
-	if exe == "" {
-		return "", false
-	}
-	team, err := cfg.Signer.TeamID(ctx, exe)
-	if err != nil {
-		return "", false
-	}
-	ok, err := cfg.Signer.DeveloperID(ctx, exe, team)
-	if err != nil || !ok {
-		return "", false
-	}
-	return team, true
+	return team, ""
+}
+
+// reason is err's text without the package prefix, for a keepReason.
+func reason(err error) string {
+	return strings.TrimPrefix(err.Error(), "install: ")
 }

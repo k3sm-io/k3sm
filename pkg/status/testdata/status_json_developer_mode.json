@@ -176,7 +176,7 @@
       "state": "on",
       "severity": "warn",
       "detail": "Developer mode: the signature of the k3sm that runs as root is not checked",
-      "remedy": "Install a signed release of k3sm; it turns developer mode off",
+      "remedy": "Run sudo k3sm install --developer-mode off, or update through k3sm.app to a release whose every program carries the Developer ID signature of one team, the installed k3sm's team if it has one",
       "wide": {
         "signing": "ad-hoc"
       },
@@ -187,8 +187,8 @@
         ],
         "fix": [
           {
-            "step": "Install a signed release of k3sm; it turns developer mode off",
-            "needsAdmin": false,
+            "step": "Run sudo k3sm install --developer-mode off, or update through k3sm.app to a release whose every program carries the Developer ID signature of one team, the installed k3sm's team if it has one",
+            "needsAdmin": true,
             "confirm": false
           }
         ],

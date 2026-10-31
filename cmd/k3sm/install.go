@@ -90,8 +90,8 @@ func runInstall(args []string) error {
 		return err
 	}
 	// The signature reader: the --from-staging continuity check reads through
-	// it, and on every install shape it tells a team-signed build, which turns
-	// developer mode off.
+	// it, and so does the check that a staged tree signed throughout by the
+	// k3sm team turns developer mode off.
 	cfg.Signer = install.CodesignTeamID{}
 	if opts.fromStaging != "" {
 		// The seam the --from-staging predicate reads through, and the
@@ -425,7 +425,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.allowDowngrade, "allow-downgrade", false, "with --from-staging: install even when the installed k3sm is newer, or its version cannot be read")
 	fs.StringVar(&o.updateReleaseBase, update.ReleaseBaseFlag, "", releaseBaseUsage)
 	fs.BoolVar(&o.requireTeamSignature, "require-team-signature", false, "with --from-staging: refuse the install unless every Mach-O in the staging directory carries a Developer ID team signature, whatever the installed k3sm is signed with")
-	fs.StringVar(&o.developerModeRaw, "developer-mode", "", "on or off. on: developer mode, for a build from source; the signature of the k3sm that runs as root is no longer checked, and an ad-hoc signed build may replace a team-signed one. off: the signature checks are back on. Not passed, the mode stays as it is, and installing a build signed with a Developer ID turns it off. Recorded in "+install.DeveloperModeMarkerPath)
+	fs.StringVar(&o.developerModeRaw, "developer-mode", "", "on or off. on: developer mode, for a build from source; the signature of the k3sm that runs as root is no longer checked, and an ad-hoc signed build may replace a team-signed one. off: the signature checks are back on. Not passed, the mode stays as it is, except that an install from a k3sm.app staging directory whose every binary is signed by the team the signing checks require (the installed build's team, when it has one) turns it off. Recorded in "+install.DeveloperModeMarkerPath)
 	fs.BoolVar(&o.start, "start", false, "on a node stopped with 'k3sm stop', start it after installing (without it the node is updated and stays stopped)")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")

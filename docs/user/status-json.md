@@ -328,11 +328,12 @@ password: the row names a fixed set of settings, none of which is a credential. 
 same values in one line.
 
 The `developer-mode` row appears only while something is at `/Library/k3sm.developer-mode`, and it
-never changes the `verdict`. Its `severity` is `warn`. See [Developer mode](install.md#developer-mode).
+never changes the `verdict`. Its `severity` is `warn`. The verdict stays `ok` while developer mode is
+on, so automation that needs to know reads this row. See [Developer mode](install.md#developer-mode).
 
 | `state` | meaning |
 |---|---|
-| `on` | a valid marker is there: the signature of the k3sm that runs as root is not checked. `remedy` is to install a signed release of k3sm, which turns developer mode off |
+| `on` | a valid marker is there: the signature of the k3sm that runs as root is not checked. `remedy` is `sudo k3sm install --developer-mode off`, or a k3sm.app update whose every program carries the Developer ID signature of one team (the installed k3sm's team, if it has one), which turns developer mode off |
 | `invalid` | something is at the path that is not a root-owned file nobody else can write, with no ACL. It is ignored and the signature checks stay on. `remedy` is `sudo rm /Library/k3sm.developer-mode` |
 
 `wide.signing` names how the installed k3sm is signed, `ad-hoc` or `team <ID>`; it is omitted when

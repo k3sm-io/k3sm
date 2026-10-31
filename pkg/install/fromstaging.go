@@ -363,6 +363,12 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 	} else if err := checkSigningContinuity(ctx, *cfg, entries); err != nil {
 		return err
 	}
+	// Not passed, a marker is there: does this tree turn developer mode off?
+	// Decided now, over the same entries, and acted on under the install
+	// lock (applyDeveloperMode).
+	if cfg.DeveloperMode == DeveloperModeUnset && cfg.preLockMarker != DeveloperModeAbsent {
+		cfg.offTeam, cfg.keepReason = developerModeOff(ctx, *cfg, entries)
+	}
 	// Last, because it runs the installed binary: only a tree that passed
 	// every signing check gets that far.
 	return checkStagedVersion(*cfg)

@@ -116,9 +116,10 @@ var markerContent = regexp.MustCompile(`^developer mode enabled by k3sm install 
 // TestDeveloperModeMarkerOnInstall pins what an install does with the marker:
 // on writes it root:wheel 0644 through the temp-and-rename seam before the
 // install root is swapped, and a failed install leaves it; off removes it
-// without following a symlink; not passed keeps it, unless the k3sm being
-// installed carries a Developer ID team signature, which removes it with an
-// Info line.
+// without following a symlink; not passed keeps it. A plain install of a k3sm
+// that carries a Developer ID team signature keeps it too, with a Warn saying
+// why: only an install from a staging directory can show the whole tree is
+// team-signed (TestDeveloperModeOffNeedsTheWholeTree).
 func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 	t.Parallel()
 	const src = "/tmp/k3sm"
@@ -138,6 +139,9 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 		wantWrite  bool
 		wantRemove bool
 		wantInfo   bool
+		// wantKeepWarn is the Warn a no-flag install logs when it keeps a
+		// marker it could have turned off.
+		wantKeepWarn bool
 	}{
 		{name: "on writes the marker", mode: DeveloperModeOn, wantWrite: true},
 		{name: "on writes the marker over a team-signed build", mode: DeveloperModeOn, signer: teamSigned, wantWrite: true},
@@ -146,11 +150,11 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 		{name: "off removes a symlink at the path, never its target", mode: DeveloperModeOff,
 			onDisk: &OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntrySymlink, Mode: 0o755}, wantRemove: true},
 		{name: "not passed keeps the marker", onDisk: &marker},
-		{name: "not passed keeps the marker over an ad-hoc build", signer: adHoc, onDisk: &marker},
-		{name: "not passed keeps the marker over an Apple Development build", signer: appleDevelopment, onDisk: &marker},
-		{name: "a team-signed install without the flag removes the marker", signer: teamSigned, onDisk: &marker, wantRemove: true, wantInfo: true},
-		{name: "a team-signed install without the flag removes an invalid marker", signer: teamSigned,
-			onDisk: &OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o666}, wantRemove: true, wantInfo: true},
+		{name: "not passed keeps the marker over an ad-hoc build", signer: adHoc, onDisk: &marker, wantKeepWarn: true},
+		{name: "not passed keeps the marker over an Apple Development build", signer: appleDevelopment, onDisk: &marker, wantKeepWarn: true},
+		{name: "a team-signed plain install without the flag keeps the marker and says why", signer: teamSigned, onDisk: &marker, wantKeepWarn: true},
+		{name: "a team-signed plain install without the flag keeps an invalid marker and says why", signer: teamSigned,
+			onDisk: &OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o666}, wantKeepWarn: true},
 		{name: "a team-signed install with nothing there removes nothing", signer: teamSigned},
 	}
 	for _, tc := range cases {
@@ -201,6 +205,10 @@ func TestDeveloperModeMarkerOnInstall(t *testing.T) {
 			info := strings.Contains(logs.String(), "level=INFO") && strings.Contains(logs.String(), `"developer mode turned off by a signed install"`)
 			if info != tc.wantInfo {
 				t.Errorf("the turned-off Info line logged = %v, want %v; logs:\n%s", info, tc.wantInfo, logs.String())
+			}
+			keepWarn := strings.Contains(logs.String(), "level=WARN") && strings.Contains(logs.String(), `"developer mode stays on`)
+			if keepWarn != tc.wantKeepWarn {
+				t.Errorf("the stays-on Warn logged = %v, want %v; logs:\n%s", keepWarn, tc.wantKeepWarn, logs.String())
 			}
 		})
 	}

@@ -32,7 +32,7 @@ const RowDeveloperMode = "developer-mode"
 // so they change like an API.
 const (
 	developerModeOnDetail      = "Developer mode: the signature of the k3sm that runs as root is not checked"
-	developerModeOnRemedy      = "Install a signed release of k3sm; it turns developer mode off"
+	developerModeOnRemedy      = "Run sudo k3sm install --developer-mode off, or update through k3sm.app to a release whose every program carries the Developer ID signature of one team, the installed k3sm's team if it has one"
 	developerModeInvalidDetail = "A developer-mode marker exists but is not a root-owned file, so it is ignored and the signature checks stay on"
 )
 
