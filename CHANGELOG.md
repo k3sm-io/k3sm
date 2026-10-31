@@ -14,10 +14,13 @@ pin, its date, and the tarball's sha256.
 
 - A managed update now reads the release's payload manifest before it touches a node. It
   refuses the update, with no node cordoned, when a node runs a release older than the
-  manifest allows (`OutsideCompatibilityWindow`); it updates the server first when the release
-  raises the Kubernetes minor; and it stops at the first node that reports it rolled back,
-  refused the payload, or has no data root mounted. Each node is handed the manifest, signed
-  by the same update signer as the payload.
+  manifest allows, when the release needs the installer, or when it raises a node's Kubernetes
+  minor by more than one (`OutsideCompatibilityWindow`); it updates the server first when the
+  release raises the Kubernetes minor by one; and it stops at the first node that reports it
+  rolled back, refused the payload, or has no data root mounted. Each node is handed the
+  manifest, signed by the same update signer as the payload. A manifest that cannot be read
+  within ten minutes of resolving the release fails the update (`ManifestMismatch`), and a
+  GitHub rate limit on the release download is retried instead of failing it.
 
 ### Fixed
 

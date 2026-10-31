@@ -423,7 +423,7 @@ func (c *Controller) plan(ctx context.Context, u *updatesv1alpha1.Update, nodes 
 		}
 		m, err := c.ensureManifest(ctx, u)
 		if err != nil {
-			return err
+			return manifestBound(u, now, err)
 		}
 		if err := checkWindow(m.m, pending); err != nil {
 			return rollFailure{err: err, reason: ReasonOutsideCompatibilityWindow}
@@ -439,6 +439,27 @@ func (c *Controller) plan(ctx context.Context, u *updatesv1alpha1.Update, nodes 
 	}
 	u.Status.Phase = updatesv1alpha1.UpdatePhasePending
 	return nil
+}
+
+// manifestBound bounds the plan's transient manifest read failures the way
+// ensureResolved bounds the release index's: err is returned to be retried
+// until ResolveBound has passed since the release resolved (the Resolved
+// condition's transition time, which survives a restart), then the roll fails
+// with ReasonManifestMismatch before any node is cordoned. A rollFailure is
+// returned as is.
+func manifestBound(u *updatesv1alpha1.Update, now time.Time, err error) error {
+	var rf rollFailure
+	if errors.As(err, &rf) {
+		return err
+	}
+	resolved := meta.FindStatusCondition(u.Status.Conditions, ConditionResolved)
+	if resolved != nil && resolved.Status == metav1.ConditionTrue && now.Sub(resolved.LastTransitionTime.Time) > ResolveBound {
+		return rollFailure{
+			err:    fmt.Errorf("the payload manifest of %s could not be read within %s of the resolve; last error: %w", u.Spec.Version, ResolveBound, err),
+			reason: ReasonManifestMismatch,
+		}
+	}
+	return err
 }
 
 // order is the roll order. By default it is workers-then-server: every node

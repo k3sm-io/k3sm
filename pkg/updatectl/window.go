@@ -126,6 +126,9 @@ func (c *Controller) ensureManifest(ctx context.Context, u *updatesv1alpha1.Upda
 	raw, err := c.cfg.Resolver.Manifest(ctx, u.Spec.Version)
 	if err != nil {
 		err = fmt.Errorf("read the payload manifest of %s: %w", u.Spec.Version, err)
+		if errors.Is(err, ErrReleasePinMismatch) {
+			return nil, rollFailure{err: err, reason: ReasonReleasePinMismatch}
+		}
 		if errors.Is(err, ErrRelease) {
 			return nil, rollFailure{err: err, reason: ReasonManifestMismatch}
 		}
@@ -166,11 +169,20 @@ func signManifest(signer *certs.UpdateSigner, m *releaseManifest) (raw, sig stri
 	return string(m.raw), base64.StdEncoding.EncodeToString(der), nil
 }
 
-// checkWindow refuses a roll in which a node to be updated runs a release
-// older than the manifest's compatibleFrom, or one that does not parse as a
-// release (it cannot be placed in the window, so it is refused). It runs
-// before any node is cordoned.
+// checkWindow refuses a roll the release cannot make in place: a release
+// whose manifest requires the installer, a node to be updated that runs a
+// release older than the manifest's compatibleFrom or one that does not parse
+// as a release (it cannot be placed in the window, so it is refused), or a
+// node whose Kubernetes minor the release raises by more than one (the
+// upstream skew policy moves one minor at a time). It runs before any node is
+// cordoned.
 func checkWindow(m *certs.PayloadManifest, pending []*corev1.Node) error {
+	if m.RequiresInstaller {
+		return fmt.Errorf("%s requires the installer and cannot be applied in place; install it on each node with the installer", m.Version)
+	}
+	if err := checkKubeMinorStep(m, pending); err != nil {
+		return err
+	}
 	floor, ok := parseSemver(m.CompatibleFrom)
 	if !ok {
 		return fmt.Errorf("the payload manifest's compatibleFrom %q is not a release version", m.CompatibleFrom)
@@ -235,4 +247,30 @@ func kubeMinorRises(m *certs.PayloadManifest, pending []*corev1.Node) bool {
 		}
 	}
 	return false
+}
+
+// checkKubeMinorStep refuses a release that raises the Kubernetes minor of a
+// node to be updated by more than one, or moves it to another major. A node
+// whose minor cannot be read is left to kubeMinorRises, which puts the server
+// first.
+func checkKubeMinorStep(m *certs.PayloadManifest, pending []*corev1.Node) error {
+	target, ok := parseKubeMinor(m.KubeMinor)
+	if !ok {
+		return fmt.Errorf("the payload manifest's kubeMinor %q is not MAJOR.MINOR", m.KubeMinor)
+	}
+	var bad []string
+	for _, n := range pending {
+		cur, ok := parseKubeMinor(n.Status.NodeInfo.KubeletVersion)
+		if !ok {
+			continue
+		}
+		if cur.major != target.major || target.minor-cur.minor > 1 {
+			bad = append(bad, fmt.Sprintf("%s runs Kubernetes %d.%d", n.Name, cur.major, cur.minor))
+		}
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("%s ships Kubernetes %d.%d, more than one minor above where %s; update through each minor in between first",
+			m.Version, target.major, target.minor, strings.Join(bad, ", "))
+	}
+	return nil
 }

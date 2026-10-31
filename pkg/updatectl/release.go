@@ -40,8 +40,10 @@ const maxChecksumsBytes = 1 << 20
 
 // ErrRelease marks a definitive release-index failure: the tag is unusable,
 // the release or its checksums file does not exist, or the checksums file
-// names no darwin/arm64 archive (a 404, 403 or 410 included). Retrying cannot fix it, so the roll fails.
-// Every other resolve error (the network, a 5xx) is transient and retried.
+// names no darwin/arm64 archive (a 404, 410, or a 403 that is not a rate
+// limit). Retrying cannot fix it, so the roll fails. Every other resolve
+// error (the network, a 5xx, a 429 or a rate-limited 403) is transient and
+// retried.
 var ErrRelease = errors.New("release cannot be resolved")
 
 // Release is a resolved target: the tag, the darwin/arm64 archive's URL and
@@ -164,6 +166,8 @@ func (r HTTPResolver) Resolve(ctx context.Context, tag string) (Release, error) 
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		return Release{}, fmt.Errorf("%w: %s: not found (has release %s been published?)", ErrRelease, sumsURL, vtag)
+	case rateLimited(resp):
+		return Release{}, fmt.Errorf("fetch %s: http %d: rate limited", sumsURL, resp.StatusCode)
 	case resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusGone:
 		// A refused or withdrawn release does not come back by retrying.
 		return Release{}, fmt.Errorf("%w: %s: http %d", ErrRelease, sumsURL, resp.StatusCode)
@@ -207,6 +211,8 @@ func (r HTTPResolver) Manifest(ctx context.Context, tag string) ([]byte, error) 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	switch {
+	case rateLimited(resp):
+		return nil, fmt.Errorf("fetch %s: http %d: rate limited", u, resp.StatusCode)
 	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusGone:
 		return nil, fmt.Errorf("%w: %s: http %d (release %s publishes no payload manifest)", ErrRelease, u, resp.StatusCode, vtag)
 	case resp.StatusCode != http.StatusOK:
@@ -220,6 +226,18 @@ func (r HTTPResolver) Manifest(ctx context.Context, tag string) ([]byte, error) 
 		return nil, fmt.Errorf("%w: %s is larger than %d bytes", ErrRelease, u, certs.MaxPayloadManifestBytes)
 	}
 	return body, nil
+}
+
+// rateLimited reports whether resp is a 403 GitHub sends when a client is
+// rate limited rather than refused: it says no request is left in the window
+// (X-RateLimit-Remaining: 0) or when to come back (Retry-After, the secondary
+// limit). Such a 403 is transient; a 429 is already transient as any other
+// non-200 status.
+func rateLimited(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusForbidden {
+		return false
+	}
+	return strings.TrimSpace(resp.Header.Get("X-RateLimit-Remaining")) == "0" || resp.Header.Get("Retry-After") != ""
 }
 
 // checksumFor returns the sha256 the checksums file records for archive: the

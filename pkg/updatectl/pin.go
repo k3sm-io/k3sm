@@ -18,6 +18,8 @@ package updatectl
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -89,6 +91,10 @@ type ReleasePin struct {
 	SHA256 string `json:"sha256"`
 	// At is when the pin was written.
 	At time.Time `json:"at"`
+	// ManifestSHA256, when set, is the lowercase hex sha256 of the exact
+	// payload manifest bytes the release must publish. Empty binds the
+	// archive only (see the release pin's scope above).
+	ManifestSHA256 string `json:"manifestSHA256,omitempty"`
 }
 
 // Validate refuses a record with an unusable tag or a digest that is not 64
@@ -99,6 +105,9 @@ func (p ReleasePin) Validate() error {
 	}
 	if !isSHA256Hex(p.SHA256) {
 		return errors.New("the pinned sha256 is not 64 lowercase hex digits")
+	}
+	if p.ManifestSHA256 != "" && !isSHA256Hex(p.ManifestSHA256) {
+		return errors.New("the pinned manifest sha256 is not 64 lowercase hex digits")
 	}
 	return nil
 }
@@ -134,14 +143,36 @@ type PinnedResolver struct {
 // AssetURL implements Resolver.
 func (r PinnedResolver) AssetURL(tag string) (string, error) { return r.Resolver.AssetURL(tag) }
 
-// Manifest implements Resolver. The pin binds the archive digest; the
-// controller requires the manifest to name that digest, so the manifest
-// needs no pin of its own.
+// Manifest implements Resolver. With no pin, a pin for another version, or a
+// pin for tag that names no manifest digest, it is Resolver's manifest: the
+// pin then binds the archive only, and the controller requires the manifest
+// to name the resolved archive digest. With a pin for tag that names a
+// manifest digest, the manifest bytes must hash to it, else the read is
+// ErrReleasePinMismatch; so are a pin it cannot trust and a definitive read
+// failure under such a pin. A transient read error passes through.
 func (r PinnedResolver) Manifest(ctx context.Context, tag string) ([]byte, error) {
-	if r.Resolver == nil {
-		return nil, pinError("the pinned resolver has no resolver")
+	if r.Resolver == nil || r.WorkDir == "" {
+		return nil, pinError("the pinned resolver has no resolver or work dir")
 	}
-	return r.Resolver.Manifest(ctx, tag)
+	pin, err := readReleasePin(r.WorkDir, r.owner)
+	if err != nil {
+		return nil, pinError("the release pin cannot be trusted: %v", err)
+	}
+	raw, err := r.Resolver.Manifest(ctx, tag)
+	if pin == nil || pin.Version != tag || pin.ManifestSHA256 == "" {
+		return raw, err
+	}
+	if err != nil {
+		if errors.Is(err, ErrRelease) {
+			return nil, pinError("the manifest of %s is pinned to sha256:%s, and it could not be read: %v", tag, pin.ManifestSHA256, err)
+		}
+		return nil, err
+	}
+	sum := sha256.Sum256(raw)
+	if got := hex.EncodeToString(sum[:]); got != pin.ManifestSHA256 {
+		return nil, pinError("the manifest of %s is pinned to sha256:%s, the release publishes sha256:%s", tag, pin.ManifestSHA256, got)
+	}
+	return raw, nil
 }
 
 // Resolve implements Resolver.

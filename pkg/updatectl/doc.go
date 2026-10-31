@@ -35,9 +35,12 @@ limitations under the License.
 // certs.PayloadManifest). A release that does not exist, whose checksums name
 // no archive, or whose manifest is missing, malformed, or names another
 // version or archive digest (ManifestMismatch) fails the roll before any node
-// is cordoned. So does the compatibility window: a node to be updated that
-// runs a release older than the manifest's compatibleFrom, or one that does
-// not parse as a release, ends the Update Failed with
+// is cordoned, as does a manifest that still cannot be read ResolveBound
+// after the release resolved. So does the compatibility window: a node to be
+// updated that runs a release older than the manifest's compatibleFrom, or
+// one that does not parse as a release, a release whose manifest says it
+// requires the installer, and a release that raises a node's Kubernetes
+// minor by more than one (or changes its major) end the Update Failed with
 // OutsideCompatibilityWindow.
 //
 // The plan is recorded in status.nodes. When the manifest's kubeMinor is the
@@ -58,6 +61,12 @@ limitations under the License.
 //     pin that cannot be trusted fails the roll with the reason
 //     ReleasePinMismatch before any node is cordoned, and a match is recorded
 //     with the reason ResolvedPinned. A pin for another version is ignored.
+//     The pin binds the archive; it binds the payload manifest (whose
+//     compatibleFrom, kubeMinor, requiresInstaller and version the controller
+//     signs as policy) only when it also names the manifest's sha256, and
+//     then a manifest with other bytes fails the roll with ReleasePinMismatch.
+//     A pin without a manifest digest leaves the manifest as trustworthy as
+//     the release host, held only to naming the pinned archive digest.
 //   - The node is cordoned. A node an operator had already cordoned stays
 //     cordoned after the update: only a cordon this controller made (marked by
 //     the CordonedAnnotation) is lifted.
@@ -90,7 +99,9 @@ limitations under the License.
 // Every node phase transition is an Event on the Update and on the Node and an
 // Info log line; node messages and the Progressing condition end in "last
 // progress <RFC3339>". A transient release-index failure is retried for
-// ResolveBound, then fails the Update.
+// ResolveBound, then fails the Update. A 403 that carries GitHub's rate-limit
+// signals (X-RateLimit-Remaining: 0, or Retry-After) is transient; any other
+// 403, a 404 or a 410 is definitive.
 //
 // A failed node stops the roll: status.phase is Failed, the failed node stays
 // cordoned with its annotations for the operator, and every later node stays
