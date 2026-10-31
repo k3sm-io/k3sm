@@ -1,0 +1,7 @@
+go test fuzz v1
+uint8(0)
+string("/v2/app/tags/list")
+string("n=99999999999")
+string("")
+uint8(0)
+[]byte("")

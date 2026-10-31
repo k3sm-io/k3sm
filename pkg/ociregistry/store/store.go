@@ -94,6 +94,9 @@ type Store struct {
 	// uploadOpened, when set, runs between an upload session's open and its
 	// flock (a seam for tests that interleave two session operations).
 	uploadOpened func(id string)
+	// dirRead, when set, runs before WalkRepositories reads a directory (a
+	// seam for tests that count the walk's work).
+	dirRead func(dir string)
 }
 
 // Open opens the store rooted at root, with server state under state. It
@@ -215,13 +218,28 @@ func (s *Store) Index(n ref.Name) (ispec.Index, error) {
 }
 
 func readIndex(dir string) (ispec.Index, error) {
-	b, err := readRegular(filepath.Join(dir, indexFile), maxIndexLen)
+	p := filepath.Join(dir, indexFile)
+	f, err := openRegular(p, os.O_RDONLY)
 	if err != nil {
 		return ispec.Index{}, fmt.Errorf("read index: %w", err)
 	}
+	defer f.Close()
+	return decodeIndex(f, p)
+}
+
+// decodeIndex reads and parses an index.json of at most maxIndexLen bytes
+// from r, which was opened from p.
+func decodeIndex(r io.Reader, p string) (ispec.Index, error) {
+	b, err := io.ReadAll(io.LimitReader(r, maxIndexLen+1))
+	if err != nil {
+		return ispec.Index{}, fmt.Errorf("read index: read %s: %w", p, err)
+	}
+	if int64(len(b)) > maxIndexLen {
+		return ispec.Index{}, fmt.Errorf("read index: read %s: larger than %d bytes", p, int64(maxIndexLen))
+	}
 	var idx ispec.Index
 	if err := json.Unmarshal(b, &idx); err != nil {
-		return ispec.Index{}, fmt.Errorf("parse %s: %w", filepath.Join(dir, indexFile), err)
+		return ispec.Index{}, fmt.Errorf("parse %s: %w", p, err)
 	}
 	return idx, nil
 }
