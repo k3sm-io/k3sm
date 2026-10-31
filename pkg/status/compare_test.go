@@ -19,6 +19,10 @@ package status
 import (
 	"testing"
 	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 )
 
 // TestSameState pins what the stream treats as a change: the row facts and
@@ -35,6 +39,12 @@ func TestSameState(t *testing.T) {
 				{Name: RowHeartbeat, State: StateOK, Severity: SeverityOK, Detail: "mac: node status posted 12s ago · lease renewed 3s ago", Wide: map[string]string{"leaseAgeSeconds": "3"}},
 				{Name: RowRuntimed, State: StateNeedsAdmin, Severity: SeveritySkip, Detail: "the runtime socket is root-only"},
 			},
+			Budget: &budgetv1alpha1.NodeBudgetStatus{NodeBudgetObservation: budgetv1alpha1.NodeBudgetObservation{
+				ObservedAt: metav1.NewTime(time.Date(2026, 10, 18, 8, 59, 55, 0, time.UTC)),
+				Platform:   budgetv1alpha1.PlatformDarwin,
+				Level:      budgetv1alpha1.LevelOK,
+				Admit:      true,
+			}},
 			Timestamp: time.Date(2026, 10, 18, 9, 0, 0, 0, time.UTC),
 		}
 	}
@@ -56,6 +66,19 @@ func TestSameState(t *testing.T) {
 		{"a detail changed", func(r *Report) { r.Rows[0].Detail = "2/2 nodes ready" }, false},
 		{"a row appeared", func(r *Report) { r.Rows = append(r.Rows, Row{Name: RowDNS, State: StateOK}) }, false},
 		{"the verdict changed", func(r *Report) { r.Verdict = VerdictDegraded }, false},
+		{"only the budget's observedAt moved", func(r *Report) {
+			r.Budget.ObservedAt = metav1.NewTime(r.Budget.ObservedAt.Add(10 * time.Second))
+		}, true},
+		{"only a budget signal value moved", func(r *Report) {
+			v := int64(512 << 20)
+			r.Budget.Signals = []budgetv1alpha1.BudgetSignal{{ID: budgetv1alpha1.SignalMemoryAvailable, Unit: budgetv1alpha1.UnitBytes, Value: &v}}
+		}, true},
+		{"the budget level changed", func(r *Report) { r.Budget.Level = budgetv1alpha1.LevelWarn }, false},
+		{"the budget stopped admitting", func(r *Report) {
+			r.Budget.Admit, r.Budget.AdmitReasonSignal = false, budgetv1alpha1.SignalMemoryCompressor
+		}, false},
+		{"the budget reason signal changed", func(r *Report) { r.Budget.AdmitReasonSignal = budgetv1alpha1.SignalMemoryAvailable }, false},
+		{"the budget became unknown", func(r *Report) { r.Budget = nil }, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

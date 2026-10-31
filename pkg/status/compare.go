@@ -16,7 +16,11 @@ limitations under the License.
 
 package status
 
-import "regexp"
+import (
+	"regexp"
+
+	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
+)
 
 // SameState reports whether two reports say the same thing about the cluster:
 // the same verdict, role and summary, and the same rows in the same order with
@@ -30,6 +34,10 @@ import "regexp"
 // network, the stop marker, the interconnect block) are not compared on their
 // own either; each of them is also stated by a row or by the verdict.
 //
+// The budget block is the exception, because no row states it: its presence,
+// level, admit and admit reason are compared (sameBudget). Its observedAt and
+// its measured values are not, since the node rewrites them on every sample.
+//
 // A detail is compared with its clock-derived ages masked ("posted 12s ago",
 // "ran 3 hours ago"), because the rows that print an age re-derive it from
 // the clock on every collect: a heartbeat row whose node posts on time would
@@ -37,7 +45,7 @@ import "regexp"
 // change that matters moves the row's state or severity, which are compared
 // as they are.
 func SameState(a, b Report) bool {
-	if a.Verdict != b.Verdict || a.Role != b.Role || maskAges(a.Summary) != maskAges(b.Summary) || len(a.Rows) != len(b.Rows) {
+	if a.Verdict != b.Verdict || a.Role != b.Role || maskAges(a.Summary) != maskAges(b.Summary) || len(a.Rows) != len(b.Rows) || !sameBudget(a.Budget, b.Budget) {
 		return false
 	}
 	for i := range a.Rows {
@@ -47,6 +55,15 @@ func SameState(a, b Report) bool {
 		}
 	}
 	return true
+}
+
+// sameBudget reports whether two budget blocks state the same thing: both
+// unknown, or both known with the same level, admit and admit reason signal.
+func sameBudget(a, b *budgetv1alpha1.NodeBudgetStatus) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Level == b.Level && a.Admit == b.Admit && a.AdmitReasonSignal == b.AdmitReasonSignal
 }
 
 // clockAges matches an age a row derives from the clock: a Go duration
