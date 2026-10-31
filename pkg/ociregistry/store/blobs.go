@@ -115,14 +115,24 @@ func (s *Store) Uploads(n ref.Name) ([]Upload, error) {
 }
 
 // NewUpload starts an upload session in n, creating the repository's layout
-// when it is missing, and returns its id.
+// when it is missing, and returns its id. The session file is created under
+// the repository lock.
 func (s *Store) NewUpload(ctx context.Context, n ref.Name) (string, error) {
-	if err := s.Init(ctx, n); err != nil {
+	dir, err := s.repoDir(n)
+	if err != nil {
 		return "", err
 	}
 	id, err := newID()
 	if err != nil {
 		return "", err
+	}
+	unlock, err := s.lock(ctx, n)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	if err := s.initLocked(dir); err != nil {
+		return "", fmt.Errorf("init %s: %w", n, err)
 	}
 	p, err := s.uploadPath(n, id)
 	if err != nil {
@@ -262,7 +272,7 @@ func (s *Store) CommitUpload(ctx context.Context, n ref.Name, id string, want di
 	if err != nil {
 		return err
 	}
-	if err := s.linkBlob(n, src, fi, true, want); err != nil {
+	if err := s.linkBlob(ctx, n, src, fi, true, want); err != nil {
 		return err
 	}
 	if err := os.Remove(src); err != nil {
@@ -325,10 +335,7 @@ func (s *Store) MountBlob(ctx context.Context, n, from ref.Name, d digest.Digest
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%w: %s", ErrNotRegular, src)
 	}
-	if err := s.Init(ctx, n); err != nil {
-		return err
-	}
-	err = s.linkBlob(n, src, fi, false, d)
+	err = s.linkBlob(ctx, n, src, fi, false, d)
 	if errors.Is(err, unix.EXDEV) || errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%w: %v", ErrMountUnavailable, err)
 	}
@@ -348,12 +355,31 @@ func (s *Store) MountBlob(ctx context.Context, n, from ref.Name, d digest.Digest
 //     a rename over it; no blob file is ever written in place, so every other
 //     repository sharing the bad inode keeps exactly what it had.
 //
-// It then touches the blob inode's mtime, so GC's grace counts from now even
-// for an inode shared with an older blob, and syncs blobs/<algorithm>.
-func (s *Store) linkBlob(n ref.Name, src string, srcFi os.FileInfo, srcVerified bool, d digest.Digest) error {
+// It then touches the blob inode's mtime (futimes on the descriptor), so GC's
+// grace counts from now even for an inode shared with an older blob, and
+// syncs blobs/<algorithm>.
+//
+// All of it runs under n's repository lock, creating n's layout first when it
+// is missing. GC re-stats a candidate and deletes it under the same lock, so a
+// blob this call links or keeps is either touched before GC looks at it or
+// linked anew after GC removed the old name; it is never deleted after this
+// call returns on the strength of a stat taken before the touch.
+func (s *Store) linkBlob(ctx context.Context, n ref.Name, src string, srcFi os.FileInfo, srcVerified bool, d digest.Digest) error {
 	dst, err := s.blobPath(n, d)
 	if err != nil {
 		return err
+	}
+	repo, err := s.repoDir(n)
+	if err != nil {
+		return err
+	}
+	unlock, err := s.lock(ctx, n)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := s.initLocked(repo); err != nil {
+		return fmt.Errorf("init %s: %w", n, err)
 	}
 	dir := filepath.Dir(dst)
 	if err := s.mkdirs(dir); err != nil {
@@ -408,8 +434,8 @@ func verifyFile(f *os.File, d digest.Digest) (bool, error) {
 	return v.Verified(), nil
 }
 
-// replaceBlob points dst at the source inode: a link under a temp name in
-// dst's directory, checked to be that inode (and, when the caller has not
+// replaceBlob points dst at the source inode: a link under a temp name
+// (.tmp-<uuid>) in dst's directory, checked to be that inode (and, when the caller has not
 // hashed it, hashed now), then renamed over dst.
 func (s *Store) replaceBlob(src string, srcFi os.FileInfo, srcVerified bool, dst string, d digest.Digest) error {
 	id, err := newID()
