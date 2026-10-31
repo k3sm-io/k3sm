@@ -57,6 +57,44 @@ func (s *Store) StatBlob(n ref.Name, d digest.Digest) (int64, error) {
 	return fi.Size(), nil
 }
 
+// TouchBlob sets blob d's mtime in n to now, under n's repository lock, and
+// fails with ErrBlobUnknown when n does not hold it. A blob HEAD calls it, so
+// a client that saw the blob present and then PUTs a manifest naming it finds
+// it still there: GC re-stats a candidate under the same lock before it
+// deletes, so it either sees the fresh mtime (and keeps the blob for a grace
+// period) or removed the blob first (and the HEAD answers 404). An absent blob
+// is answered without the lock, so a probe of a repository that does not
+// exist creates no lock file.
+func (s *Store) TouchBlob(ctx context.Context, n ref.Name, d digest.Digest) error {
+	if _, err := s.StatBlob(n, d); err != nil {
+		return err
+	}
+	err := s.WithLock(ctx, n, func(l *Locked) error {
+		p, err := s.blobPath(n, d)
+		if err != nil {
+			return err
+		}
+		f, err := openRegular(p, os.O_RDONLY)
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %s in %s", ErrBlobUnknown, d, n)
+		}
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		now := unix.NsecToTimeval(s.now().UnixNano())
+		if err := unix.Futimes(int(f.Fd()), []unix.Timeval{now, now}); err != nil {
+			return fmt.Errorf("touch blob %s in %s: %w", d, n, err)
+		}
+		return nil
+	})
+	if errors.Is(err, ErrRepositoryUnknown) {
+		// GC removed the layout between the stat and the lock.
+		return fmt.Errorf("%w: %s in %s", ErrBlobUnknown, d, n)
+	}
+	return err
+}
+
 // OpenBlob opens blob d in n for reading. The caller closes it.
 func (s *Store) OpenBlob(n ref.Name, d digest.Digest) (*os.File, error) {
 	p, err := s.blobPath(n, d)

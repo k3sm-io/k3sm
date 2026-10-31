@@ -57,6 +57,10 @@ pin, its date, and the tarball's sha256.
 
 ### Fixed
 
+- A blob HEAD on the k3sm registry server restarts the blob's garbage-collection grace, so a
+  client that skips an upload because the blob is already there no longer loses it to a sweep
+  before its manifest PUT.
+
 - `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
   a versioned install directory or through a symlinked install path, not only from the flat
   `/Library/k3sm/k3sm-vmhost`, so such a helper is still stopped instead of reported as unknown.
