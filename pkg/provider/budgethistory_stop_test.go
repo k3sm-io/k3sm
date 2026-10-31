@@ -60,7 +60,7 @@ func TestStopBudgetHistoryFlushesAfterTheContextEnds(t *testing.T) {
 		t.Fatal("the writer did not exit when its context ended")
 	}
 	h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
-	if !h.stop(budgetHistoryStopBound) {
+	if !h.stop(BudgetHistoryStopBound) {
 		t.Fatal("stop did not finish in its bound")
 	}
 	if got := fileEvictions(t, dir, budgetv1alpha1.BandBatch); got != 1 {
@@ -69,7 +69,7 @@ func TestStopBudgetHistoryFlushesAfterTheContextEnds(t *testing.T) {
 	// A change after stop has returned is no longer covered; a second stop
 	// still writes what is pending.
 	h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
-	if !h.stop(budgetHistoryStopBound) {
+	if !h.stop(BudgetHistoryStopBound) {
 		t.Fatal("a second stop did not finish in its bound")
 	}
 	if got := fileEvictions(t, dir, budgetv1alpha1.BandBatch); got != 2 {
@@ -87,7 +87,7 @@ func TestBudgetHistoryStartAfterStopLaunchesNoWriter(t *testing.T) {
 	dir := t.TempDir()
 	h := OpenBudgetHistory(dir, "fp", discardLog())
 	h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
-	if !h.stop(budgetHistoryStopBound) {
+	if !h.stop(BudgetHistoryStopBound) {
 		t.Fatal("stop did not finish in its bound")
 	}
 	h.start(context.Background())
@@ -106,9 +106,9 @@ func TestBudgetHistoryStartAfterStopLaunchesNoWriter(t *testing.T) {
 // Fails-before: both were budgetHistoryFinalFlushBound, so a flush near its
 // bound raced the teardown's timer.
 func TestBudgetHistoryStopOutwaitsTheFinalFlush(t *testing.T) {
-	if budgetHistoryStopBound <= budgetHistoryFinalFlushBound {
-		t.Fatalf("budgetHistoryStopBound %v must exceed budgetHistoryFinalFlushBound %v",
-			budgetHistoryStopBound, budgetHistoryFinalFlushBound)
+	if BudgetHistoryStopBound <= budgetHistoryFinalFlushBound {
+		t.Fatalf("BudgetHistoryStopBound %v must exceed budgetHistoryFinalFlushBound %v",
+			BudgetHistoryStopBound, budgetHistoryFinalFlushBound)
 	}
 }
 

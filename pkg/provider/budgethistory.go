@@ -112,12 +112,19 @@ import (
 // runs, so changes keep arriving after the writer has exited (the eviction
 // loop's last count, a teardown's intent, an exit seen while draining); the
 // teardown's stop therefore joins the writer and then writes whatever is still
-// pending itself, all within budgetHistoryStopBound, so every change recorded
+// pending itself, all within BudgetHistoryStopBound, so every change recorded
 // before stop reaches disk unless the disk is stalled past the bound. An unreadable or unrecognised file is moved aside (the last
 // budgetHistoryAsideMax are kept) and the history starts empty: the totals then
 // restart at 0, as a counter does after a reset. A history dir that cannot be
 // prepared or written degrades to an in-memory history with a Warn log: the
 // node runs, and its counters restart at 0 on the next provider start.
+
+// BudgetHistoryStopBound is how long the node teardown's StopBudgetHistory
+// waits: the writer's own final flush (budgetHistoryFinalFlushBound) plus a
+// margin for the join and one catch-up write of a change made after that
+// flush. It is exported for pkg/install's ExitTimeOut budget, whose
+// teardown-step literal a test binds to it.
+const BudgetHistoryStopBound = budgetHistoryFinalFlushBound + time.Second
 
 // The history file and its bounds.
 const (
@@ -147,10 +154,6 @@ const (
 	// budgetHistoryFinalFlushBound bounds the writer's final flush on shutdown,
 	// and the node teardown's wait for it (StopBudgetHistory).
 	budgetHistoryFinalFlushBound = 2 * time.Second
-	// budgetHistoryStopBound is how long the node teardown's stop waits: the
-	// writer's own final flush (budgetHistoryFinalFlushBound) plus a margin for
-	// the join and one catch-up write of a change made after that flush.
-	budgetHistoryStopBound = budgetHistoryFinalFlushBound + time.Second
 	// budgetHistoryRetryInterval is how often the writer retries a failed write.
 	budgetHistoryRetryInterval = 30 * time.Second
 )
@@ -997,13 +1000,13 @@ func (r *runtimedRuntime) recordStopIntentWithin(pod *corev1.Pod, container stri
 }
 
 // StopBudgetHistory makes the budget history's writer flush and stop, then
-// writes anything recorded since, waiting at most budgetHistoryStopBound
+// writes anything recorded since, waiting at most BudgetHistoryStopBound
 // (strictly longer than the writer's own final-flush bound), so a node exiting
 // right after its context ends still persists its last changes. It is the node
 // teardown's seam; it is idempotent and reports whether every change recorded
 // before it reached disk in time.
 func (r *runtimedRuntime) StopBudgetHistory() bool {
-	return r.history.stop(budgetHistoryStopBound)
+	return r.history.stop(BudgetHistoryStopBound)
 }
 
 // pruneBudgetHistory drops the history entries of pods that are gone: in
