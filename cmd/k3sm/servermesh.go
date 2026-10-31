@@ -277,6 +277,12 @@ type meshBringUp struct {
 	// kubeconfig authenticates the MeshPeer watch that keeps the peer set
 	// converging after the initial program.
 	kubeconfig string
+	// handshakeStatus makes the MeshPeer watch write each MeshPeer's
+	// status.lastHandshakeTime from this node's own wireguard view
+	// (mesh.WithHandshakeStatus). Only the control-plane node sets it: its
+	// identity already writes MeshPeers, so no node identity gains authority,
+	// and the one status value per MeshPeer records the server's view.
+	handshakeStatus bool
 	// refresher republishes this node's own endpoint when the address it is
 	// reachable at changes. It is a FIELD rather than something bringUpMesh
 	// builds because the two roles publish through different channels (a worker
@@ -401,6 +407,9 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bo
 		peers:         res.Peers,
 		listenPort:    serverMeshListenPort,
 		kubeconfig:    kubeconfig,
+		// The server, and only the server, records each peer's last handshake
+		// from its own wireguard view.
+		handshakeStatus: true,
 		// The control-plane node's endpoint goes stale the same way a worker's
 		// does — this Mac's LAN address is no more fixed than any other — and a
 		// worker that joined before the move dials the old one on its next full
