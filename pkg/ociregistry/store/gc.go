@@ -304,6 +304,9 @@ func (l *Locked) ReapSession(id string, idleBefore time.Time) (SessionVerdict, e
 		return SessionKept, err
 	}
 	defer f.Close()
+	if l.s.uploadOpened != nil {
+		l.s.uploadOpened(id)
+	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		if errors.Is(err, unix.EWOULDBLOCK) {
 			return SessionBusy, nil
@@ -365,6 +368,11 @@ func (l *Locked) RemoveLayout(idleBefore time.Time) (bool, error) {
 	for _, f := range []string{indexFile, layoutFile} {
 		if err := os.Remove(filepath.Join(l.dir, f)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return false, fmt.Errorf("remove %s layout: %w", l.n, err)
+		}
+		if f == indexFile && l.s.indexRemoved != nil {
+			if err := l.s.indexRemoved(); err != nil {
+				return false, err
+			}
 		}
 	}
 	dirs := []string{filepath.Join(l.dir, uploadsDir)}

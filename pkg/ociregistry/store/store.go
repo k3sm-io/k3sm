@@ -91,6 +91,9 @@ type Store struct {
 	// uploadOpened, when set, runs between an upload session's open and its
 	// flock (a seam for tests that interleave two session operations).
 	uploadOpened func(id string)
+	// indexRemoved, when set, runs in RemoveLayout right after index.json is
+	// removed; an error stops the removal there (a seam for crash tests).
+	indexRemoved func() error
 }
 
 // Open opens the store rooted at root, with server state under state. It
