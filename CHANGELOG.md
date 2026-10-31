@@ -61,6 +61,10 @@ pin, its date, and the tarball's sha256.
   client that skips an upload because the blob is already there no longer loses it to a sweep
   before its manifest PUT.
 
+- The registry's garbage collector stops a repository's sweep, deleting nothing, when a manifest
+  there is not an OCI or Docker v2 image manifest, index or manifest list (a Docker schema1
+  manifest, for example). It used to read such a manifest as referencing nothing and could reap
+  the blobs it still used.
 - `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
   a versioned install directory or through a symlinked install path, not only from the flat
   `/Library/k3sm/k3sm-vmhost`, so such a helper is still stopped instead of reported as unknown.

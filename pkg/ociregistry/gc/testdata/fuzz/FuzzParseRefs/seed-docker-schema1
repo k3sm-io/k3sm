@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"schemaVersion\":1,\"name\":\"app\",\"tag\":\"v1\",\"fsLayers\":[{\"blobSum\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}],\"history\":[{\"v1Compatibility\":\"{}\"}]}")

@@ -482,21 +482,53 @@ func (p plan) objects(n ref.Name) []Object {
 	return out
 }
 
+// The manifest media types the registry accepts at PUT, and so the only ones
+// the collector knows how to follow.
+const (
+	mediaTypeDockerManifest     = "application/vnd.docker.distribution.manifest.v2+json"
+	mediaTypeDockerManifestList = "application/vnd.docker.distribution.manifest.list.v2+json"
+)
+
 // refs is the part of a manifest or index body that names other content:
 // image manifests (OCI and Docker v2 schema2) name a config and layers,
-// artifact manifests name blobs, indexes and manifest lists name manifests.
+// indexes and manifest lists name manifests, and either may name a subject.
 type refs struct {
-	Config    *ispec.Descriptor  `json:"config"`
-	Layers    []ispec.Descriptor `json:"layers"`
-	Blobs     []ispec.Descriptor `json:"blobs"`
-	Manifests []ispec.Descriptor `json:"manifests"`
-	Subject   *ispec.Descriptor  `json:"subject"`
+	SchemaVersion int                `json:"schemaVersion"`
+	MediaType     string             `json:"mediaType"`
+	Config        *ispec.Descriptor  `json:"config"`
+	Layers        []ispec.Descriptor `json:"layers"`
+	Manifests     []ispec.Descriptor `json:"manifests"`
+	Subject       *ispec.Descriptor  `json:"subject"`
 }
 
+// parseRefs reads what the manifest body b, stored as d, references. It
+// fails closed: a body it cannot be sure it has read in full is ErrUnreadable,
+// so the sweep stops for that repository instead of reaping what the body
+// may still name. It accepts schemaVersion 2 and the OCI and Docker v2 image
+// manifest, index and manifest list media types. A body without a mediaType
+// (optional in OCI) is an image manifest when it has a config and an index
+// when it has a manifests array; anything else, Docker schema1 included, is
+// unreadable. An image manifest without a config is unreadable too.
 func parseRefs(d digest.Digest, b []byte) (refs, error) {
 	var r refs
 	if err := json.Unmarshal(b, &r); err != nil {
 		return refs{}, fmt.Errorf("%w: %s: %v", ErrUnreadable, d, err)
+	}
+	if r.SchemaVersion != 2 {
+		return refs{}, fmt.Errorf("%w: %s: schemaVersion %d, want 2", ErrUnreadable, d, r.SchemaVersion)
+	}
+	switch r.MediaType {
+	case ispec.MediaTypeImageManifest, mediaTypeDockerManifest:
+		if r.Config == nil {
+			return refs{}, fmt.Errorf("%w: %s: image manifest without a config", ErrUnreadable, d)
+		}
+	case ispec.MediaTypeImageIndex, mediaTypeDockerManifestList:
+	case "":
+		if r.Config == nil && r.Manifests == nil {
+			return refs{}, fmt.Errorf("%w: %s: no mediaType, and neither a config nor a manifests array", ErrUnreadable, d)
+		}
+	default:
+		return refs{}, fmt.Errorf("%w: %s: unknown mediaType %q", ErrUnreadable, d, r.MediaType)
 	}
 	return r, nil
 }
@@ -580,7 +612,7 @@ func makePlan(idx ispec.Index, cont store.Contents, cutoff time.Time, read func(
 		if m.Config != nil {
 			referenced[m.Config.Digest] = true
 		}
-		for _, l := range slices.Concat(m.Layers, m.Blobs) {
+		for _, l := range m.Layers {
 			referenced[l.Digest] = true
 		}
 		for _, ch := range m.Manifests {
