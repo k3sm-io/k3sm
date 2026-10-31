@@ -1827,7 +1827,7 @@ self_test() {
 	# The full upload: the create succeeds, the draft read back is bad.
 	upload_case x "$tag" "$A" "$(draft_json "$A" "$tag" '.assets[0].digest = "sha256:0000"')"
 	if [ "$rc" -ne 0 ] && grep -q -- "^gh release create $tag .*--draft" "$log" &&
-		! grep '^gh release create' "$log" | grep -qv -- ' --draft ' && ! grep -q -- '--draft=false' "$log"; then
+		! grep -qv -- ' --draft ' <<<"$(grep '^gh release create' "$log")" && ! grep -q -- '--draft=false' "$log"; then
 		ok "upload creates only a draft and does not promote a bad one"
 	else
 		bad "upload with a bad draft (rc=$rc, log: $(tr '\n' ';' <"$log"))"; printf '%s\n' "$out" | sed 's/^/       /'
@@ -2218,7 +2218,7 @@ EOF
 	# An absolute tool path would bypass PATH, and with it these fakes.
 	local abs='/(usr/)?s?bin/[[:alnum:]_.-]|/opt/home''brew|/Library/Dev''eloper|/Applications/X''code'
 	for s in "$HERE/publish.sh" "$sign"; do
-		if sed 's|#!/usr/bin/env bash||g' "$s" | grep -nE "$abs" | grep -q .; then
+		if grep -q . <<<"$(sed 's|#!/usr/bin/env bash||g' "$s" | grep -nE "$abs")"; then
 			bad "$(basename "$s") names a tool by absolute path:"; sed 's|#!/usr/bin/env bash||g' "$s" | grep -nE "$abs" | sed 's/^/       /'
 		else
 			ok "$(basename "$s") calls no tool by absolute path"
