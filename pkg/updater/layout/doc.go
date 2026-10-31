@@ -33,11 +33,13 @@ limitations under the License.
 //
 // The package computes paths, validates version directory names, resolves the
 // active version from a symlink read through an injected seam, plans the atomic
-// flip of current and previous as a list of steps, checks the ownership of a
-// directory and its ancestors through an injected stat, and states the frozen
-// program arguments every k3sm launchd job runs with. It executes nothing: it
-// creates no file, renames nothing and restarts no job. The caller carries out
-// a plan.
+// flip of current and previous as a list of steps, decides which version
+// directories a prune removes (never current, previous, the staged version or a
+// version a running pod was started under) and when staging is refused, checks
+// the ownership of a directory and its ancestors through an injected stat, and
+// states the frozen program arguments every k3sm launchd job runs with. It
+// executes nothing: it creates no file, renames nothing and restarts no job. The
+// caller carries out a plan.
 //
 // It is a leaf that imports only the standard library, so the updater can use
 // it without the installer's launchd renderer or client-go, and the installer
