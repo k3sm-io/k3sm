@@ -128,6 +128,12 @@ pin, its date, and the tarball's sha256.
   is still there but damaged stays unreadable. An `If-Match` that is empty or malformed is
   refused with 412 and deletes nothing.
 - **A pinned sharded `MLXModel` answers to its `spec.model` name too.** Sharded serving listed the snapshot path on `/v1/models`, and a request naming `spec.model` made every rank load the model again. Each rank now serves the model it loaded under `spec.model`, pinned or not. This needs `ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3` or later, which carries the updated sharded entrypoint.
+- The registry's catalog answers 1,000 repositories per page when the request names no `n`, caps
+  `n` at 10,000, and stops reading the store once the page is full, with a `Link` header to the
+  next page. The referrers list comes from a per-repository view rebuilt only when the
+  repository's index changes, reading each manifest once and at most 4,096 manifests or 64 MiB
+  per request (a larger repository answers 429 with `Retry-After` until its view is built), and
+  it is paged by digest with a `Link` header.
 
 ## v0.2.3 — 2026-10-29
 

@@ -126,6 +126,8 @@ func classify(err error) *apiError {
 		return e(http.StatusUnauthorized, codeUnauthorized, "authentication required")
 	case errors.Is(err, ErrDenied):
 		return e(http.StatusForbidden, codeDenied, "requested access to the resource is denied")
+	case errors.Is(err, errReferrersBusy):
+		return e(http.StatusTooManyRequests, codeTooManyRequests, "the referrers list is still being read; retry")
 	case errors.Is(err, ErrRateLimited):
 		return e(http.StatusTooManyRequests, codeTooManyRequests, "too many requests")
 	case errors.Is(err, store.ErrUploadTooLarge):
