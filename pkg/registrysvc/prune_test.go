@@ -347,15 +347,14 @@ func pruneConcurrentWithPush(t *testing.T, old time.Duration) {
 	ageBlobs(t, wd, "app", old, append([]string{digestOf(base)}, stale...)...)
 
 	cred := Credential{Username: "k3sm", Password: "prune-test-secret"}
-	srv := httptest.NewServer(fakeDeleteAPI(t, st, cred))
-	defer srv.Close()
+	client := &http.Client{Transport: handlerTransport{h: fakeDeleteAPI(t, st, cred)}}
 	apiDelete := func(m StoredManifest, c Credential) error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, srv.URL+"/v2/"+m.Repository+"/manifests/"+m.Digest, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, "http://registry.test/v2/"+m.Repository+"/manifests/"+m.Digest, nil)
 		if err != nil {
 			return err
 		}
 		req.SetBasicAuth(c.Username, c.Password)
-		resp, err := srv.Client().Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return err
 		}
@@ -476,6 +475,20 @@ func pruneConcurrentWithPush(t *testing.T, old time.Duration) {
 			t.Errorf("stale untagged %s survived the prune: %v", dg, err)
 		}
 	}
+}
+
+// handlerTransport is an http.RoundTripper that serves each request with h in
+// process, so a test drives a fake registry API through a real http.Client
+// without opening a socket.
+type handlerTransport struct{ h http.Handler }
+
+// RoundTrip records h's answer to req and returns it as the response.
+func (t handlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rec := httptest.NewRecorder()
+	t.h.ServeHTTP(rec, req)
+	resp := rec.Result()
+	resp.Request = req
+	return resp, nil
 }
 
 // fakeDeleteAPI is the registry server's manifest DELETE, as far as prune uses
