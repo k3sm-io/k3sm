@@ -20,6 +20,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"time"
 
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -158,26 +161,30 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 // repoPlan is one read of a repository: its plan, every digest its index holds
 // mapped to whether any row tags it, and the index state the plan was made
 // from (store.IndexState). present is nil, and err says why, when the index
-// itself could not be read.
+// itself could not be read; gone is set when that is because the repository's
+// directory is absent.
 type repoPlan struct {
 	plan    PrunePlan
 	present map[string]bool
 	state   string
 	err     error
+	gone    bool
 }
 
 // planRepository is PlanRepository that also returns what the plan was read
 // from.
 func planRepository(workDir, repo string, now time.Time) repoPlan {
+	n, err := ref.ParseName(repo)
 	unreadable := func(err error) repoPlan {
-		// A repository the store no longer holds has nothing to plan; it is
-		// gone, not unreadable.
-		if errors.Is(err, store.ErrRepositoryUnknown) {
-			return repoPlan{err: err}
+		// A repository whose directory is absent has nothing to plan; it is
+		// gone, not unreadable. One whose directory is still there but fails
+		// the store's repository check (a missing or irregular layout file,
+		// index.json or blobs directory) is damaged, and stays unreadable.
+		if errors.Is(err, store.ErrRepositoryUnknown) && repoDirAbsent(workDir, n) {
+			return repoPlan{err: err, gone: true}
 		}
 		return repoPlan{plan: PrunePlan{Unreadable: []string{repo}}, err: err}
 	}
-	n, err := ref.ParseName(repo)
 	if err != nil {
 		return unreadable(err)
 	}
@@ -296,6 +303,22 @@ func planRepository(workDir, repo string, now time.Time) repoPlan {
 	return repoPlan{plan: p, present: present, state: state}
 }
 
+// repoDirAbsent reports whether n's directory is absent from the store: the
+// path does not exist at all. Anything else, a symlink on the way or an
+// entry of any kind at the path, is not absent.
+func repoDirAbsent(workDir string, n ref.Name) bool {
+	root := StateDir(workDir)
+	dir, err := n.Dir(root)
+	if err != nil {
+		return false
+	}
+	if err := ref.NoSymlinks(root, filepath.Dir(dir)); err != nil {
+		return false
+	}
+	_, err = os.Lstat(dir)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
 // Recheck re-plans the repository of a planned manifest from its current
 // state, immediately before that manifest's delete. It returns why the
 // manifest must now be kept, or "" and the repository state (store.IndexState)
@@ -310,7 +333,7 @@ func planRepository(workDir, repo string, now time.Time) repoPlan {
 // it is still in that fresh plan's delete set. Otherwise the reason is the
 // fresh plan's own (KeepChildOfKept, KeepReferrer, KeepRecent), or
 // KeepTaggedSincePlan for a digest now tagged, or GoneSincePlan for a digest
-// no longer in the index or a repository no longer in the store, which the
+// no longer in the index or a repository whose directory is absent, which the
 // caller skips rather than deletes, or KeepUnreadable for anything else it
 // cannot read.
 //
@@ -322,7 +345,7 @@ func planRepository(workDir, repo string, now time.Time) repoPlan {
 func Recheck(workDir string, m StoredManifest, now time.Time) (KeepReason, string) {
 	rp := planRepository(workDir, m.Repository, now)
 	if rp.present == nil {
-		if errors.Is(rp.err, store.ErrRepositoryUnknown) {
+		if rp.gone {
 			return GoneSincePlan, ""
 		}
 		return KeepUnreadable, ""

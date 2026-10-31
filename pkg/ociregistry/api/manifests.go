@@ -325,7 +325,9 @@ var errPreconditionFailed = errorf(http.StatusPreconditionFailed, codeDenied, "t
 // entity tag is store.IndexState of its index.json rows, compared under the
 // repository lock that the delete itself holds, so no write lands between the
 // comparison and the delete. A state that no longer holds is a 412 and deletes
-// nothing. A request without If-Match is unconditional.
+// nothing. A request without If-Match is unconditional. Presence is any
+// If-Match field line, so a request whose If-Match lines are empty or hold no
+// well-formed tag is a 412, never unconditional (RFC 9110 section 13.1.1).
 func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
 	rf, err := parseReference(r)
 	if err != nil {
@@ -335,7 +337,8 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 	if !s.allow(w, r, VerbDelete, n) {
 		return
 	}
-	ifMatch, conditional := r.Header.Values("If-Match"), r.Header.Get("If-Match") != ""
+	ifMatch := r.Header.Values("If-Match")
+	conditional := len(ifMatch) > 0
 	precondition := func(rows []ispec.Descriptor) error {
 		if !conditional {
 			return nil
@@ -369,22 +372,48 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 
 // matchesEntityTag reports whether the If-Match field values match state:
 // "*" matches any current state, and a quoted strong entity tag matches when
-// its value is state (RFC 9110 section 13.1.1, strong comparison). A weak tag
-// never matches, and neither does a member that is not a quoted tag, so a
-// malformed condition fails rather than deletes.
+// its value is state (RFC 9110 section 13.1.1, strong comparison). The values
+// are one comma-separated list across every field line, and a quoted tag is
+// read to its closing quote, so a comma inside it does not split it. A weak
+// tag never matches. A field that is empty, or holds any member that is not
+// "*" or an entity tag, matches nothing, so a malformed condition fails
+// rather than deletes.
 func matchesEntityTag(values []string, state string) bool {
+	matched, members := false, 0
 	for _, v := range values {
-		for member := range strings.SplitSeq(v, ",") {
-			member = strings.TrimSpace(member)
-			if member == "*" {
-				return true
+		for i := 0; i < len(v); {
+			switch c := v[i]; {
+			case c == ' ' || c == '\t' || c == ',':
+				i++
+				continue
+			case c == '*':
+				i++
+				matched = true
+			case c == '"' || strings.HasPrefix(v[i:], `W/"`):
+				weak := c == 'W'
+				if weak {
+					i += 2
+				}
+				end := strings.IndexByte(v[i+1:], '"')
+				if end < 0 {
+					return false
+				}
+				tag := v[i+1 : i+1+end]
+				i += end + 2
+				if !weak && tag == state {
+					matched = true
+				}
+			default:
+				return false
 			}
-			if len(member) >= 2 && member[0] == '"' && member[len(member)-1] == '"' && member[1:len(member)-1] == state {
-				return true
+			members++
+			// A member ends at whitespace, a comma or the end of the line.
+			if i < len(v) && v[i] != ' ' && v[i] != '\t' && v[i] != ',' {
+				return false
 			}
 		}
 	}
-	return false
+	return members > 0 && matched
 }
 
 // notNamedByIndex fails when an index row of rows, other than d itself, lists

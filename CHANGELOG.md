@@ -68,7 +68,9 @@ pin, its date, and the tarball's sha256.
   tag, child or referrer; the manifest is listed under the kept manifests as "repository changed
   at delete", not as a failure. zot, the server the daemon still runs, ignores `If-Match`, so
   until the k3sm registry replaces it the window described above stays open. A repository
-  deleted since the plan is now reported as gone, no longer as unreadable.
+  deleted since the plan is now reported as gone, no longer as unreadable; one whose directory
+  is still there but damaged stays unreadable. An `If-Match` that is empty or malformed is
+  refused with 412 and deletes nothing.
 
 ## v0.2.3 — 2026-10-29
 

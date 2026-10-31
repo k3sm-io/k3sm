@@ -32,6 +32,10 @@ import (
 // the repository's index is no longer in the state the delete named.
 var ErrChangedSincePlan = errors.New("the repository changed since the re-check")
 
+// ErrNoState is a DeleteManifest call that names no repository state to make
+// the DELETE conditional on.
+var ErrNoState = errors.New("no repository state to condition the delete on")
+
 // DeleteManifest deletes the manifest ref names, conditional on its
 // repository still being in state, the store.IndexState Recheck returned.
 //
@@ -40,7 +44,8 @@ var ErrChangedSincePlan = errors.New("the repository changed since the re-check"
 // delete takes, so a push that lands after the re-check (a tag on the planned
 // digest, a tagged index naming it, a tagged subject it refers to) makes the
 // server refuse the delete with 412, reported as ErrChangedSincePlan, rather
-// than drop the push's rows. An empty state sends no condition.
+// than drop the push's rows. An empty state is refused with ErrNoState and
+// sends nothing: the delete is never unconditional by omission.
 //
 // A registry that does not implement If-Match on DELETE, zot among them,
 // ignores the field and deletes unconditionally; for it the window between
@@ -49,12 +54,13 @@ var ErrChangedSincePlan = errors.New("the repository changed since the re-check"
 // rt is the transport under go-containerregistry's own (nil uses
 // remote.DefaultTransport).
 func DeleteManifest(ctx context.Context, ref name.Digest, state string, auth authn.Authenticator, rt http.RoundTripper) error {
+	if state == "" {
+		return fmt.Errorf("delete %s: %w", ref, ErrNoState)
+	}
 	if rt == nil {
 		rt = remote.DefaultTransport
 	}
-	if state != "" {
-		rt = ifMatchTransport{base: rt, etag: `"` + state + `"`}
-	}
+	rt = ifMatchTransport{base: rt, etag: `"` + state + `"`}
 	err := remote.Delete(ref, remote.WithAuth(auth), remote.WithContext(ctx), remote.WithTransport(rt))
 	var terr *transport.Error
 	if errors.As(err, &terr) && terr.StatusCode == http.StatusPreconditionFailed {

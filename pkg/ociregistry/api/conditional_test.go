@@ -75,12 +75,54 @@ func TestConditionalDelete(t *testing.T) {
 		{"a weak tag never matches", `W/"<state>"`, http.StatusPreconditionFailed},
 		{"an unquoted tag never matches", `<state>`, http.StatusPreconditionFailed},
 		{"an empty quoted tag never matches", `""`, http.StatusPreconditionFailed},
+		{"a weak tag of a stranger never matches", `W/"x"`, http.StatusPreconditionFailed},
+		{"a quoted value containing a comma is one tag, not the state", `"<state>,"`, http.StatusPreconditionFailed},
+		{"a quoted value containing a comma before the state is not the state", `"x,<state>"`, http.StatusPreconditionFailed},
+		{"a list matches after a quoted value containing a comma", `"a,b", "<state>"`, http.StatusAccepted},
+		{"an empty field value is a condition no state meets", ``, http.StatusPreconditionFailed},
+		{"a blank field value is a condition no state meets", `   `, http.StatusPreconditionFailed},
+		{"a list of empty members is a condition no state meets", `, ,`, http.StatusPreconditionFailed},
+		{"a star inside a quoted value is no star", `"x,*,y"`, http.StatusPreconditionFailed},
+		{"a malformed member fails the whole list", `"<state>", bogus`, http.StatusPreconditionFailed},
+		{"an unterminated tag fails the whole list", `"<state>", "x`, http.StatusPreconditionFailed},
+		{"a tag run into the next member fails the whole list", `"<state>""x"`, http.StatusPreconditionFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
 			body := f.image(t, "app", "", "l")
 			v := strings.ReplaceAll(tc.ifMatch, "<state>", state(t, f))
 			want(t, f.do(http.MethodDelete, "/v2/app/manifests/"+dg(body).String(), nil, "If-Match", v), tc.status, "")
+		})
+	}
+
+	// Several If-Match field lines are one list (RFC 9110 section 5.3): an
+	// empty first line must not turn the condition off for the lines after it.
+	for _, tc := range []struct {
+		name   string
+		lines  []string
+		status int
+	}{
+		{"an empty line then a stale tag is refused", []string{"", `"<stale>"`}, http.StatusPreconditionFailed},
+		{"an empty line then a weak tag is refused", []string{"", `W/"<state>"`}, http.StatusPreconditionFailed},
+		{"an empty line then the current state deletes", []string{"", `"<state>"`}, http.StatusAccepted},
+		{"only empty lines are refused", []string{"", ""}, http.StatusPreconditionFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			body := f.image(t, "app", "", "l")
+			stale := state(t, f)
+			f.image(t, "app", "v1", "m")
+			cur := state(t, f)
+			r := req(http.MethodDelete, "/v2/app/manifests/"+dg(body).String(), nil)
+			for _, l := range tc.lines {
+				r.Header.Add("If-Match", strings.NewReplacer("<state>", cur, "<stale>", stale).Replace(l))
+			}
+			want(t, f.serve(r), tc.status, "")
+			wantGone := tc.status == http.StatusAccepted
+			got := f.do(http.MethodGet, "/v2/app/manifests/"+dg(body).String(), nil).Code
+			if gone := got == http.StatusNotFound; gone != wantGone {
+				t.Errorf("after the DELETE the manifest GET is %d; want it gone=%v", got, wantGone)
+			}
 		})
 	}
 }

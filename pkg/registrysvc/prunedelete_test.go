@@ -19,6 +19,7 @@ package registrysvc
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -206,6 +207,58 @@ func TestRecheckFailsClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, GoneSincePlan},
+		// A directory still there but failing the store's repository check
+		// is damaged, not gone: the store calls both ErrRepositoryUnknown.
+		{"a repository directory missing its layout file", func(t *testing.T, wd string) {
+			if err := os.Remove(filepath.Join(repoDir(wd), "oci-layout")); err != nil {
+				t.Fatal(err)
+			}
+		}, KeepUnreadable},
+		{"a repository directory missing its index", func(t *testing.T, wd string) {
+			if err := os.Remove(filepath.Join(repoDir(wd), "index.json")); err != nil {
+				t.Fatal(err)
+			}
+		}, KeepUnreadable},
+		{"a repository directory whose index is a directory", func(t *testing.T, wd string) {
+			p := filepath.Join(repoDir(wd), "index.json")
+			if err := os.Remove(p); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, KeepUnreadable},
+		{"a repository directory whose index is a symlink", func(t *testing.T, wd string) {
+			p := filepath.Join(repoDir(wd), "index.json")
+			if err := os.Rename(p, p+".real"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(p+".real", p); err != nil {
+				t.Fatal(err)
+			}
+		}, KeepUnreadable},
+		{"a repository directory missing its blobs", func(t *testing.T, wd string) {
+			if err := os.RemoveAll(filepath.Join(repoDir(wd), "blobs")); err != nil {
+				t.Fatal(err)
+			}
+		}, KeepUnreadable},
+		{"a repository directory replaced by a symlink", func(t *testing.T, wd string) {
+			real := filepath.Join(wd, "elsewhere")
+			if err := os.Rename(repoDir(wd), real); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, repoDir(wd)); err != nil {
+				t.Fatal(err)
+			}
+		}, KeepUnreadable},
+		{"a repository path that is now a file", func(t *testing.T, wd string) {
+			if err := os.RemoveAll(repoDir(wd)); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(repoDir(wd), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, KeepUnreadable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wd, p := plan(t)
@@ -214,11 +267,52 @@ func TestRecheckFailsClosed(t *testing.T) {
 			if reason != tc.want || state != "" {
 				t.Errorf("recheck = %q, state %q; want %q and no state", reason, state, tc.want)
 			}
-			if tc.want == GoneSincePlan {
-				if again := PlanRepository(wd, "r", time.Now()); len(again.Unreadable) != 0 || len(again.Delete) != 0 {
-					t.Errorf("plan of a repository gone from the store = %+v; want nothing planned and nothing unreadable", again)
-				}
+			again := PlanRepository(wd, "r", time.Now())
+			switch {
+			case len(again.Delete) != 0:
+				t.Errorf("plan after the break deletes %v; want nothing", digests(again.Delete))
+			case tc.want == GoneSincePlan && len(again.Unreadable) != 0:
+				t.Errorf("plan of a repository gone from the store = %+v; want nothing unreadable", again)
+			case tc.want == KeepUnreadable && len(again.Unreadable) == 0 && len(again.Kept) == 0:
+				t.Errorf("plan of a damaged repository = %+v; want it unreadable or every manifest kept", again)
 			}
 		})
 	}
 }
+
+// TestRecheckReasonWording pins the two words a report prints for a repository
+// the re-check cannot plan: an absent one is gone, a damaged one is unreadable.
+func TestRecheckReasonWording(t *testing.T) {
+	if GoneSincePlan != "already gone since the plan" {
+		t.Errorf("GoneSincePlan = %q", GoneSincePlan)
+	}
+	if KeepUnreadable != "repository not fully readable" {
+		t.Errorf("KeepUnreadable = %q", KeepUnreadable)
+	}
+}
+
+// TestDeleteManifestRefusesNoState proves an empty state is an error and
+// sends no request at all: the delete is never unconditional by omission.
+func TestDeleteManifestRefusesNoState(t *testing.T) {
+	var sent int
+	rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		sent++
+		return nil, errors.New("no request may be sent")
+	})
+	r, err := name.NewDigest("127.0.0.1:6450/app@" + digestOf(manifestBody("a")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteManifest(t.Context(), r, "", authn.Anonymous, rt); !errors.Is(err, ErrNoState) {
+		t.Errorf("delete with no state = %v; want ErrNoState", err)
+	}
+	if sent != 0 {
+		t.Errorf("%d requests sent; want none", sent)
+	}
+}
+
+// roundTripFunc is an http.RoundTripper from a function.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+// RoundTrip calls f.
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
