@@ -92,6 +92,12 @@ const (
 	// StateRolling is the update row's word for a cluster the server's update
 	// controller is rolling to a release (an Update not yet finished).
 	StateRolling RowState = "rolling"
+	// StateOn is the developer-mode row's word for a valid marker: the
+	// signature checks are off.
+	StateOn RowState = "on"
+	// StateInvalid is the developer-mode row's word for something at the
+	// marker path that fails the checks, so it is ignored.
+	StateInvalid RowState = "invalid"
 )
 
 // Row is one subsystem's line in the report.

@@ -102,12 +102,16 @@ const (
 // fault, and a cluster serving every request is not degraded because a newer
 // build exists. The row warns with the upgrade command.
 //
+// developer-mode is one too: it reports a choice an administrator made at
+// install time (or a stray file at its path that is ignored), not a fault in
+// the cluster. The row warns with its remedy.
+//
 // workloads is the strongest case, and the only one whose FAIL is exempt too
 // (see verdictExempt): pods fail and restart routinely, and the verdict
 // describes k3sm's own health, not the health of what runs on it. A single
 // failed pod is not a degraded cluster. The row keeps its counts, state and
 // severity in the report.
-var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, RowShadowShells: true, RowMeshClaims: true, RowInterconnect: true, RowUpdate: true, RowWorkloads: true}
+var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, RowShadowShells: true, RowMeshClaims: true, RowInterconnect: true, RowUpdate: true, RowDeveloperMode: true, RowWorkloads: true}
 
 // workerAdvisoryRows are the rows that are advisory ON A WORKER, because they
 // describe a control plane this Mac does not run.

@@ -107,6 +107,7 @@ var (
 		StateDisabled, StateDown, StateNotReady, StateWrongOwner, StateNotMounted, StateAbsent, StatePartial,
 		StateMissing, StateSkip, StateWaiting, StateExpired, StateCorrupt, StateAddressMismatch, StateDrift,
 		StateUnknown, StateHealthy, StateUnhealthy, StateStale, StateNeedsAdmin, StateBehind, StateAhead, StateRefused,
+		StateOn, StateInvalid,
 	}
 )
 
@@ -176,6 +177,16 @@ func contractServer(t *testing.T, netd, server string, kube Kube, kubeErr error)
 		Host:       goldenHost,
 		Hostname:   "my-mac",
 	}
+}
+
+// contractDeveloperMode is the running control plane with a developer-mode
+// marker in state and an installed k3sm whose signature reads as team, err.
+func contractDeveloperMode(t *testing.T, state install.DeveloperModeState, team string, err error) Collector {
+	t.Helper()
+	c := contractServer(t, "launchctl_netd_running.txt", "launchctl_netd_running.txt", heartbeatingKube(goldenTime), nil)
+	c.DeveloperMode = func() install.DeveloperModeState { return state }
+	c.SigningTeamID = func(context.Context, string) (string, error) { return team, err }
+	return c
 }
 
 // contractRecordOff is a readable LAN record that says off.
@@ -353,6 +364,16 @@ func contractScenarios() map[string]contractScenario {
 				return []string{"--nodeport-addresses", "192.0.2.0/24"}, nil
 			}
 			return c
+		}},
+		// Developer mode on, over an ad-hoc signed k3sm: the row warns and the
+		// verdict stays running.
+		"developer_mode": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			return contractDeveloperMode(t, install.DeveloperModeMarkerOn, "", install.ErrNoTeamID)
+		}},
+		// A marker that fails the checks, over a team-signed k3sm: ignored, and
+		// the verdict stays running.
+		"developer_mode_invalid": {verdict: VerdictRunning, collector: func(t *testing.T) Collector {
+			return contractDeveloperMode(t, install.DeveloperModeInvalid, "ABCDE12345", nil)
 		}},
 		"agent-waiting": {verdict: VerdictDegraded, collector: func(t *testing.T) Collector {
 			return contractAgent(t, func(_ *testing.T, _ Paths, fsys fakeFS) fakeFS { return fsys })
