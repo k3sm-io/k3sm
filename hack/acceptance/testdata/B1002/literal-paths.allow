@@ -2,23 +2,29 @@
 # its binaries under versions/<v>/ behind current and flat compatibility links.
 #
 # hack/acceptance/B1002.sh --check scans the non-test Go of runtimed, darwin-net
-# and k3sm for a "/Library/k3sm" string literal (the root or a path under it)
-# and for a binary path built from the install root (filepath.Join on
-# InstallDir or DefaultInstallDir, or DefaultInstallDir + "/"). Every hit must
-# match one entry below, and every entry must match at least one hit.
+# and k3sm for:
+#   - a "/Library/k3sm" string literal (the root or a path under it);
+#   - a path built from the install root: filepath.Join or path.Join on
+#     InstallDir, DefaultInstallDir or DefaultRoot, or DefaultInstallDir + "/";
+#   - a fmt.Sprintf whose format names /Library/k3sm;
+#   - a call of an installed binary path accessor (installedBinary,
+#     installedExecShim, installedPathShim, installedDNSShim, installedVMHost).
+# Each hit must be claimed by exactly one entry below, and each entry must claim
+# exactly <count> hits: a second consumer in an allowed file with the same
+# expression reds as one hit too many, and a removed one reds as a stale count.
 #
-#   allow   <repo>:<path> | <substring of the line> | <reason>
+#   allow   <repo>:<path> | <substring of the line> | <count> | <reason>
 #   exclude <repo>:<glob> | <reason>       shell files under hack/, not scanned
 #
 # A consumer that compares a path the kernel or a peer reports, or grants a
 # Seatbelt rule on it, must resolve symlinks first and does not belong here.
 
 # The install root itself. A root is not a binary path.
-allow k3sm:pkg/install/install.go | DefaultInstallDir = "/Library/k3sm" | the install root constant; the versioned tree lives under it
-allow k3sm:pkg/updater/layout/layout.go | DefaultRoot = "/Library/k3sm" | the versioned layout's root constant
-allow k3sm:pkg/datavol/guard.go | "/Library/k3sm"} | a refusal guard: the data volume may never be mounted over the install root
-allow k3sm:pkg/install/install.go | DatavolStagingDir = DefaultInstallDir + "/" | a staging directory, not a binary; it stays at the root across layouts
-allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, datavolStagingName) | the same staging directory, per config
+allow k3sm:pkg/install/install.go | DefaultInstallDir = "/Library/k3sm" | 1 | the install root constant; the versioned tree lives under it
+allow k3sm:pkg/updater/layout/layout.go | DefaultRoot = "/Library/k3sm" | 1 | the versioned layout's root constant
+allow k3sm:pkg/datavol/guard.go | "/Library/k3sm"} | 1 | a refusal guard: the data volume may never be mounted over the install root
+allow k3sm:pkg/install/install.go | DatavolStagingDir = DefaultInstallDir + "/" | 1 | a staging directory, not a binary; it stays at the root across layouts
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, datavolStagingName) | 1 | the same staging directory, per config
 
 # Installer copy destinations and launchd program arguments. On the flat layout
 # these are the files themselves; after the migration to versions/ they are the
@@ -26,17 +32,37 @@ allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, datavolStagingNa
 # move to <root>/current/<bin> in the migration that creates current, which
 # rewrites them; changing an accessor before current exists would point every
 # plist at a path that is not there.
-allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, "k3sm") | installedBinary: copy destination and plist ProgramArguments; moves to current/ with the migration that creates it
-allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, "k3sm-execshim") | installedExecShim: copy destination; runtime lookups resolve symlinks beside the running binary
-allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, PathShimName) | installedPathShim: copy destination; the node resolves the shim beside its symlink-resolved executable
-allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, DNSShimName) | installedDNSShim: copy destination; the node resolves the shim beside its symlink-resolved executable
-allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, VMHostName) | installedVMHost: copy destination; the vm helper identity check accepts it, current/ and versions/<v>/ (isInstalledVMHost)
-allow k3sm:pkg/install/manifest.go | filepath.Join(cfg.InstallDir, "bin" | the control-plane payload's manifest entries: copy destinations removed by uninstall, not a peer identity
-allow k3sm:pkg/install/stage.go | filepath.Join(c.InstallDir, "bin", name) | a staging path for the control-plane payload, derived from the destination
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, "k3sm") | 1 | installedBinary: copy destination and plist ProgramArguments; moves to current/ with the migration that creates it
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, "k3sm-execshim") | 1 | installedExecShim: copy destination; runtime lookups resolve symlinks beside the running binary
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, PathShimName) | 1 | installedPathShim: copy destination; the node resolves the shim beside its symlink-resolved executable
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, DNSShimName) | 1 | installedDNSShim: copy destination; the node resolves the shim beside its symlink-resolved executable
+allow k3sm:pkg/install/install.go | filepath.Join(c.InstallDir, VMHostName) | 1 | installedVMHost: copy destination; the vm helper identity check accepts it, current/ and versions/<v>/ (isInstalledVMHost)
+allow k3sm:pkg/install/manifest.go | filepath.Join(cfg.InstallDir, "bin" | 9 | the control-plane payload's manifest entries: copy destinations removed by uninstall, not a peer identity
+allow k3sm:pkg/install/stage.go | filepath.Join(c.InstallDir, "bin", name) | 1 | a staging path for the control-plane payload, derived from the destination
+
+# Calls of the installed binary path accessors. Each names the flat path, which
+# is the file itself on the flat layout and the compatibility link after the
+# migration; what each does with it follows that link or does not need to.
+allow k3sm:pkg/install/datavol.go | cfg.installedBinary(), "datavol", "mount" | 1 | the data volume plist's program argument; launchd execs through the compatibility link, and the plists move to current/ with the migration that creates it
+allow k3sm:pkg/install/plist.go | cfg.installedBinary(), "netd" | 1 | the netd plist's program argument; same as the data volume plist
+allow k3sm:pkg/install/plist.go | cfg.installedBinary(), "server" | 1 | the server plist's program argument; same as the data volume plist
+allow k3sm:pkg/install/plist.go | cfg.installedBinary(), "agent" | 1 | the agent plist's program argument; same as the data volume plist
+allow k3sm:pkg/install/install.go | filepath.Base(c.installedBinary()) | 1 | installedLink takes only the basename, so the shell launcher and the daemons share one name
+allow k3sm:pkg/install/manifest.go | path: cfg.installedBinary() | 1 | the manifest's k3sm entry, covered by the install root sweep on uninstall
+allow k3sm:pkg/install/manifest.go | target: cfg.installedBinary() | 1 | the launcher symlink's target; the shell follows it and then the compatibility link
+allow k3sm:pkg/install/manifest.go | path: cfg.installedExecShim() | 1 | the manifest's exec shim entry, covered by the sweep
+allow k3sm:pkg/install/manifest.go | path: cfg.installedPathShim() | 1 | the manifest's path shim entry, covered by the sweep
+allow k3sm:pkg/install/manifest.go | path: cfg.installedDNSShim() | 1 | the manifest's DNS shim entry, covered by the sweep
+allow k3sm:pkg/install/manifest.go | path: cfg.installedVMHost() | 1 | the manifest's vm helper entry, covered by the sweep
+allow k3sm:pkg/install/stage.go | c.stagedPath(c.installed | 5 | the staged copy of each binary, derived from its destination; a staging path, never read as a peer identity
+allow k3sm:pkg/install/fromstaging.go | installed := cfg.installedBinary() | 1 | the signing continuity check reads the installed team id; codesign follows the compatibility link
+allow k3sm:pkg/install/releaseversion.go | installedPath := cfg.installedBinary() | 1 | the downgrade check runs the installed binary's version; exec follows the compatibility link
+allow k3sm:pkg/install/teardown.go | want := cfg.installedVMHost() | 1 | the expected path in a refusal message only; the identity decision is isInstalledVMHost
+allow k3sm:pkg/install/teardown.go | installed := cfg.installedVMHost() | 1 | isInstalledVMHost's flat form; current/ and the retained versions/<v>/ are accepted beside it
 
 # Read-only probes that follow symlinks.
-allow k3sm:cmd/k3sm/status_env.go | filepath.Join(install.DefaultInstallDir, installedBinaryName) | status reports the installed binary through the flat path; stat and exec follow the compatibility link
-allow darwin-net:pkg/netd/update.go | DefaultInstalledK3sm = "/Library/k3sm/k3sm" | netd resolves the installed k3sm through its symlinks before reading its signature or running its version probe
+allow k3sm:cmd/k3sm/status_env.go | filepath.Join(install.DefaultInstallDir, installedBinaryName) | 1 | status reports the installed binary through the flat path; stat and exec follow the compatibility link
+allow darwin-net:pkg/netd/update.go | DefaultInstalledK3sm = "/Library/k3sm/k3sm" | 1 | netd resolves the installed k3sm once per update, inside the install tree, and reads its signature and runs its version probe on that one file
 
 # Shell scripts under k3sm/hack/ invoke the installed CLI by its flat path, the
 # compatibility link the versioned layout keeps for the shell, the app and the

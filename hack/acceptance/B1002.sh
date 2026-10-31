@@ -12,10 +12,11 @@
 #
 # --check runs:
 #   b1002.1  no unlisted install-root path consumer in the non-test Go of
-#            runtimed, darwin-net and k3sm: every hit of the scan matches an
-#            entry of testdata/B1002/literal-paths.allow (with a reason), every
-#            entry matches a hit, and every hack/ shell file naming the root
-#            matches an exclude line
+#            runtimed, darwin-net and k3sm: every hit of the scan is claimed by
+#            one entry of testdata/B1002/literal-paths.allow (with a reason),
+#            every entry claims exactly the number of hits it lists, and every
+#            hack/ shell file naming the root matches an exclude line; a
+#            self-check plants each defect and requires the verdict to red
 #   b1002.2  each Seatbelt allowance resolves the versioned path: runtimed's
 #            TestShadowAllowFollowsVersionedDir, and k3sm's
 #            TestPodPathsResolveIntoTheVersionDir (the shadow dir and the DYLD
@@ -91,80 +92,178 @@ gofiles() {
 	fi | grep -v '_test\.go$' | grep -v '/testdata/' | grep -v '^testdata/' || true
 }
 
-PATTERN='"/Library/k3sm(/[^"]*)?"|filepath\.Join\((install\.|cfg\.|c\.)?(Default)?InstallDir,|(Default)?InstallDir \+ "/"'
-: > "$tmp/hits"
-if [ "$b1" = ok ]; then
-	for pair in "runtimed=$RUNTIMED_DIR" "darwin-net=$DARWINNET_DIR" "k3sm=$K3SM_ROOT"; do
-		repo="${pair%%=*}"; dir="${pair#*=}"
-		gofiles "$dir" > "$tmp/files.$repo"
-		[ -s "$tmp/files.$repo" ] || { echo "    no Go files found in $repo ($dir)" >&2; b1=no; continue; }
-		( cd "$dir" && tr '\n' '\0' < "$tmp/files.$repo" | xargs -0 grep -nE "$PATTERN" /dev/null || true ) |
-			grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' | sed "s|^|$repo:|" >> "$tmp/hits" || true
-	done
-fi
+# The scan. One alternative per consumer shape:
+#   a "/Library/k3sm" string literal, the root or a path under it;
+#   a path built from the install root: filepath.Join or path.Join on
+#     InstallDir, DefaultInstallDir or DefaultRoot, or DefaultInstallDir + "/";
+#   a fmt.Sprintf whose format names /Library/k3sm;
+#   a call of an installed binary path accessor (installedBinary and kin).
+PATTERN='"/Library/k3sm(/[^"]*)?"'
+PATTERN+='|path\.Join\(([A-Za-z_][A-Za-z0-9_]*\.)?(InstallDir|DefaultInstallDir|DefaultRoot)([^A-Za-z0-9_]|$)'
+PATTERN+='|(Default)?InstallDir \+ "/"'
+PATTERN+='|fmt\.Sprintf\([^"]*"[^"]*/Library/k3sm'
+PATTERN+='|\.installed(Binary|ExecShim|PathShim|DNSShim|VMHost)\(\)'
 
-# The allowlist: allow <repo>:<path> | <needle> | <reason>; exclude <repo>:<glob> | <reason>.
+# scan_repo <repo> <dir> <out>: append the scan's hits in dir to out, as
+# <repo>:<path>:<line>:<text>, skipping comment lines.
+scan_repo() {
+	local repo="$1" dir="$2" out="$3" files
+	files="$(mktemp "$tmp/files.XXXXXX")"
+	gofiles "$dir" > "$files"
+	[ -s "$files" ] || { echo "    no Go files found in $repo ($dir)" >&2; return 1; }
+	( cd "$dir" && tr '\n' '\0' < "$files" | xargs -0 grep -nE "$PATTERN" /dev/null || true ) |
+		grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' | sed "s|^|$repo:|" >> "$out" || true
+}
+
+# check_hits <hits> <allowlist> <shell-files>: the b1002.1 verdict over a hits
+# file, an allowlist and the list of hack/ shell files naming the root. Prints
+# each finding and the summary; returns 1 on any finding.
+#
+#   allow   <repo>:<path> | <needle> | <count> | <reason>
+#   exclude <repo>:<glob> | <reason>
+#
+# A hit is claimed by the one entry whose path is its file and whose needle is
+# a substring of its line; two entries claiming one hit is an ambiguous
+# allowlist. Each entry must claim exactly <count> hits: one more in the file
+# is a new consumer hiding behind an old line, and one fewer is a stale count.
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
-allow_where=(); allow_needle=(); allow_used=()
-excl_glob=(); excl_used=()
-if [ "$b1" = ok ]; then
+check_hits() {
+	local hits="$1" allowf="$2" shells="$3" ok=0
+	local -a a_where=() a_needle=() a_want=() a_got=() x_glob=() x_used=()
+	local line kind rest where needle count reason glob hit repo r path text i owner nhits=0 sh matched
 	while IFS= read -r line || [ -n "$line" ]; do
 		case "$line" in ''|'#'*) continue ;; esac
 		kind="${line%% *}"; rest="${line#* }"
 		case "$kind" in
 		allow)
-			where="$(trim "${rest%%|*}")"; rest="${rest#*|}"
-			needle="$(trim "${rest%%|*}")"
-			reason=""; [ "$rest" != "${rest#*|}" ] && reason="$(trim "${rest#*|}")"
+			IFS='|' read -r where needle count reason <<< "$rest"
+			where="$(trim "$where")"; needle="$(trim "$needle")"; count="$(trim "$count")"; reason="$(trim "$reason")"
 			if [ -z "$where" ] || [ -z "$needle" ] || [ -z "$reason" ]; then
-				echo "    allowlist line without a path, a needle and a reason: $line" >&2; b1=no; continue
+				echo "    allowlist line without a path, a needle, a count and a reason: $line" >&2; ok=1; continue
 			fi
-			allow_where+=("$where"); allow_needle+=("$needle"); allow_used+=(0) ;;
+			if ! [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+				echo "    allowlist line without a positive hit count: $line" >&2; ok=1; continue
+			fi
+			a_where+=("$where"); a_needle+=("$needle"); a_want+=("$count"); a_got+=(0) ;;
 		exclude)
 			glob="$(trim "${rest%%|*}")"
 			reason=""; [ "$rest" != "${rest#*|}" ] && reason="$(trim "${rest#*|}")"
 			if [ -z "$glob" ] || [ -z "$reason" ]; then
-				echo "    exclude line without a glob and a reason: $line" >&2; b1=no; continue
+				echo "    exclude line without a glob and a reason: $line" >&2; ok=1; continue
 			fi
-			excl_glob+=("$glob"); excl_used+=(0) ;;
-		*) echo "    allowlist line of unknown kind: $line" >&2; b1=no ;;
+			x_glob+=("$glob"); x_used+=(0) ;;
+		*) echo "    allowlist line of unknown kind: $line" >&2; ok=1 ;;
 		esac
-	done < "$ALLOW"
-fi
+	done < "$allowf"
 
-nhits=0
-if [ "$b1" = ok ]; then
 	while IFS= read -r hit; do
 		[ -n "$hit" ] || continue
 		nhits=$((nhits+1))
 		repo="${hit%%:*}"; r="${hit#*:}"; path="${r%%:*}"; r="${r#*:}"; text="${r#*:}"
-		matched=no
-		for i in "${!allow_where[@]}"; do
-			if [ "${allow_where[$i]}" = "$repo:$path" ] && [[ "$text" == *"${allow_needle[$i]}"* ]]; then
-				allow_used[$i]=1; matched=yes
+		owner=""
+		for i in "${!a_where[@]}"; do
+			if [ "${a_where[$i]}" = "$repo:$path" ] && [[ "$text" == *"${a_needle[$i]}"* ]]; then
+				if [ -n "$owner" ]; then
+					echo "    two allowlist entries claim one hit (${a_needle[$owner]} | ${a_needle[$i]}): $hit" >&2; ok=1
+				else
+					owner="$i"
+				fi
 			fi
 		done
-		[ "$matched" = yes ] || { echo "    unlisted install-root path consumer: $hit" >&2; b1=no; }
-	done < "$tmp/hits"
-	[ "$nhits" -gt 0 ] || { echo "    the scan found nothing; it cannot be checking anything" >&2; b1=no; }
-	for i in "${!allow_where[@]}"; do
-		[ "${allow_used[$i]}" = 1 ] || { echo "    stale allowlist entry (matches nothing): ${allow_where[$i]} | ${allow_needle[$i]}" >&2; b1=no; }
+		if [ -z "$owner" ]; then
+			echo "    unlisted install-root path consumer: $hit" >&2; ok=1
+		else
+			a_got[owner]=$((a_got[owner]+1))
+		fi
+	done < "$hits"
+	[ "$nhits" -gt 0 ] || { echo "    the scan found nothing; it cannot be checking anything" >&2; ok=1; }
+	for i in "${!a_where[@]}"; do
+		if [ "${a_got[$i]}" = 0 ]; then
+			echo "    stale allowlist entry (matches nothing): ${a_where[$i]} | ${a_needle[$i]}" >&2; ok=1
+		elif [ "${a_got[$i]}" -gt "${a_want[$i]}" ]; then
+			echo "    more hits than listed (${a_got[$i]} > ${a_want[$i]}), a new consumer behind an allowed line: ${a_where[$i]} | ${a_needle[$i]}" >&2; ok=1
+		elif [ "${a_got[$i]}" -lt "${a_want[$i]}" ]; then
+			echo "    fewer hits than listed (${a_got[$i]} < ${a_want[$i]}), a stale count: ${a_where[$i]} | ${a_needle[$i]}" >&2; ok=1
+		fi
 	done
 
 	# hack/ shell files naming an installed path must sit under an exclude glob.
 	while IFS= read -r sh; do
 		[ -n "$sh" ] || continue
 		matched=no
-		for i in "${!excl_glob[@]}"; do
+		for i in "${!x_glob[@]}"; do
 			# shellcheck disable=SC2053 # the glob is the point
-			if [[ "k3sm:$sh" == ${excl_glob[$i]} ]]; then excl_used[$i]=1; matched=yes; fi
+			if [[ "k3sm:$sh" == ${x_glob[$i]} ]]; then x_used[i]=1; matched=yes; fi
 		done
-		[ "$matched" = yes ] || { echo "    hack/ shell file names the install root and is not excluded: $sh" >&2; b1=no; }
-	done < <(git ls-files -- 'hack/*.sh' 'hack/**/*.sh' | sort -u | while IFS= read -r f; do grep -q '/Library/k3sm/' "$f" && echo "$f"; done || true)
-	for i in "${!excl_glob[@]}"; do
-		[ "${excl_used[$i]}" = 1 ] || { echo "    stale exclude (matches no shell file): ${excl_glob[$i]}" >&2; b1=no; }
+		[ "$matched" = yes ] || { echo "    hack/ shell file names the install root and is not excluded: $sh" >&2; ok=1; }
+	done < "$shells"
+	for i in "${!x_glob[@]}"; do
+		[ "${x_used[$i]}" = 1 ] || { echo "    stale exclude (matches no shell file): ${x_glob[$i]}" >&2; ok=1; }
 	done
-	echo "    scanned: $nhits hits, ${#allow_where[@]} allow entries, ${#excl_glob[@]} excludes"
+	echo "    scanned: $nhits hits, ${#a_where[@]} allow entries, ${#x_glob[@]} excludes"
+	return "$ok"
+}
+
+# self_check: the scan and the verdict red on each planted defect and pass on a
+# clean plant, so a green b1002.1 means the checks are live.
+self_check() {
+	local plant="$tmp/plant" sc=ok name
+	mkdir -p "$plant/k3sm/pkg/x"
+	cat > "$plant/k3sm/pkg/x/x.go" <<'GO'
+package x
+
+const Root = "/Library/k3sm"
+
+func a() string { return filepath.Join(c.InstallDir, "k3sm") }
+GO
+	: > "$plant/shells"
+	cat > "$plant/allow.base" <<'ALLOW'
+allow k3sm:pkg/x/x.go | Root = "/Library/k3sm" | 1 | planted root
+allow k3sm:pkg/x/x.go | filepath.Join(c.InstallDir, "k3sm") | 1 | planted copy destination
+ALLOW
+	# expect <name> <want: pass|red> <allowlist> [<extra Go line>]
+	expect() {
+		local name="$1" want="$2" allowf="$3" extra="${4:-}" hits="$plant/hits.$1" got
+		cp "$plant/k3sm/pkg/x/x.go" "$plant/x.go.orig"
+		[ -z "$extra" ] || printf '%s\n' "$extra" >> "$plant/k3sm/pkg/x/x.go"
+		: > "$hits"
+		( cd "$plant/k3sm" && grep -nE "$PATTERN" pkg/x/x.go /dev/null || true ) |
+			grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' | sed 's|^|k3sm:|' >> "$hits" || true
+		if check_hits "$hits" "$allowf" "$plant/shells" >/dev/null 2>&1; then got=pass; else got=red; fi
+		mv "$plant/x.go.orig" "$plant/k3sm/pkg/x/x.go"
+		[ "$got" = "$want" ] || { echo "    self-check '$name': want $want, got $got" >&2; sc=no; }
+	}
+	expect clean pass "$plant/allow.base"
+	expect second-hit-behind-an-entry red "$plant/allow.base" 'func b() string { return filepath.Join(c.InstallDir, "k3sm") }'
+	expect path-join-default-root red "$plant/allow.base" 'func d() string { return path.Join(layout.DefaultRoot, "k3sm") }'
+	expect filepath-join-default-root red "$plant/allow.base" 'func e() string { return filepath.Join(DefaultRoot, "current") }'
+	expect sprintf-install-root red "$plant/allow.base" 'func f(v string) string { return fmt.Sprintf("%s/Library/k3sm/%s", "", v) }'
+	expect installed-accessor red "$plant/allow.base" 'func g() string { return cfg.installedVMHost() }'
+	expect a-commented-hit-is-skipped pass "$plant/allow.base" '	// return cfg.installedBinary()'
+	grep -v 'planted root' "$plant/allow.base" > "$plant/allow.unlisted"
+	expect unlisted red "$plant/allow.unlisted"
+	{ cat "$plant/allow.base"; echo 'allow k3sm:pkg/x/x.go | nothing-matches-this | 1 | planted stale'; } > "$plant/allow.stale"
+	expect stale-entry red "$plant/allow.stale"
+	sed 's/| 1 | planted copy/| 2 | planted copy/' "$plant/allow.base" > "$plant/allow.overcount"
+	expect stale-count red "$plant/allow.overcount"
+	sed 's/| 1 | planted root/| planted root/' "$plant/allow.base" > "$plant/allow.nocount"
+	expect missing-count red "$plant/allow.nocount"
+	{ cat "$plant/allow.base"; echo 'allow k3sm:pkg/x/x.go | "/Library/k3sm" | 1 | planted overlap'; } > "$plant/allow.overlap"
+	expect overlapping-entries red "$plant/allow.overlap"
+	echo "$sc"
+}
+
+: > "$tmp/hits"
+if [ "$b1" = ok ]; then
+	for pair in "runtimed=$RUNTIMED_DIR" "darwin-net=$DARWINNET_DIR" "k3sm=$K3SM_ROOT"; do
+		scan_repo "${pair%%=*}" "${pair#*=}" "$tmp/hits" || b1=no
+	done
+fi
+if [ "$b1" = ok ]; then
+	git ls-files -- 'hack/*.sh' 'hack/**/*.sh' | sort -u |
+		while IFS= read -r f; do grep -q '/Library/k3sm/' "$f" && echo "$f"; done > "$tmp/shells" || true
+	check_hits "$tmp/hits" "$ALLOW" "$tmp/shells" || b1=no
+	[ "$(self_check)" = ok ] || { echo "    the scan's self-check failed (a planted case gave the wrong verdict)" >&2; b1=no; }
 fi
 ladder "$b1" "b1002.1  no unlisted install-root path consumer in runtimed, darwin-net, k3sm"
 
