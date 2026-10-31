@@ -38,6 +38,7 @@ type fakePowerHost struct {
 	released int
 	name     string
 	holdErr  error
+	source   PowerSource
 	notices  chan PowerNotice
 	watching chan struct{}
 }
@@ -62,6 +63,18 @@ func (f *fakePowerHost) PreventSleep(name string) (func() error, error) {
 		f.released++
 		return nil
 	}, nil
+}
+
+func (f *fakePowerHost) PowerSource() PowerSource {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.source
+}
+
+func (f *fakePowerHost) setSource(src PowerSource) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.source = src
 }
 
 func (f *fakePowerHost) WatchSleep(ctx context.Context) (<-chan PowerNotice, error) {
@@ -182,7 +195,7 @@ func TestSleepAssertionHeldWhileJoined(t *testing.T) {
 			t.Fatalf("assertion name %q", host.name)
 		}
 		c := h.r.condition(metav1.Now())
-		if c.Type != nodeSleeping || c.Status != corev1.ConditionFalse || !strings.Contains(c.Message, "PreventSystemSleep") {
+		if c.Type != nodeSleeping || c.Status != corev1.ConditionFalse || !strings.Contains(c.Message, "PreventSystemSleep assertion") {
 			t.Fatalf("awake condition = %+v", c)
 		}
 	})
@@ -289,5 +302,91 @@ func TestNodeStatusPublishesSleeping(t *testing.T) {
 	c := findNodeCondition(last.Status.Conditions, nodeSleeping)
 	if c == nil || c.Status != corev1.ConditionTrue || c.Reason != sleepWillReason {
 		t.Fatalf("published Sleeping = %+v", c)
+	}
+}
+
+// TestSleepRepeatedWillSleepIsAcknowledgedOnly pins the dark-wake path: the
+// host reports no wake for a dark wake, so the will-sleep that ends one finds
+// the node asleep. It is acknowledged without a second Event or publication,
+// and the condition keeps the first sleep's time.
+func TestSleepRepeatedWillSleepIsAcknowledgedOnly(t *testing.T) {
+	host := newFakePowerHost()
+	h := startSleepHarness(t, host)
+	host.deliver(t, PowerWillSleep)
+	_ = nextEvent(t, h.rec)
+	first := h.r.condition(metav1.Now())
+
+	h.advance(10 * time.Minute)
+	start := time.Now()
+	host.deliver(t, PowerWillSleep)
+	if d := time.Since(start); d >= willSleepFlushGrace {
+		t.Fatalf("repeated will-sleep held for %s, want an immediate ack", d)
+	}
+	select {
+	case e := <-h.rec.Events:
+		t.Fatalf("repeated will-sleep recorded %q", e)
+	default:
+	}
+	if h.publishes() != 1 {
+		t.Fatalf("publishes = %d, want 1", h.publishes())
+	}
+	again := h.r.condition(metav1.Now())
+	if again.Status != corev1.ConditionTrue || !again.LastTransitionTime.Equal(&first.LastTransitionTime) || again.Message != first.Message {
+		t.Fatalf("condition moved on a repeated will-sleep: %+v then %+v", first, again)
+	}
+}
+
+// TestSleepConditionReportsPowerSource pins the message's honesty: the held
+// assertion is described by what macOS does with it on the current source.
+func TestSleepConditionReportsPowerSource(t *testing.T) {
+	cases := []struct {
+		name string
+		src  PowerSource
+		want string
+	}{
+		{"on AC power the assertion holds", PowerSourceAC, "is on external power, so it does not idle-sleep"},
+		{"on a UPS the assertion holds", PowerSourceUPS, "is on external power, so it does not idle-sleep"},
+		{"on battery the assertion is ignored", PowerSourceBattery, "ignores on battery power: the Mac is on battery and can idle-sleep"},
+		{"an unread source claims nothing", PowerSourceUnknown, "the power source could not be read"},
+	}
+	host := newFakePowerHost()
+	h := startSleepHarness(t, host)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			host.setSource(tc.src)
+			c := h.r.condition(metav1.Now())
+			if !strings.Contains(c.Message, tc.want) {
+				t.Fatalf("message %q, want it to contain %q", c.Message, tc.want)
+			}
+		})
+	}
+}
+
+// TestSleepConditionTransitionTimes pins LastTransitionTime to the flips: the
+// reporter's start while awake, the sleep, then the wake, and never the time
+// of the call.
+func TestSleepConditionTransitionTimes(t *testing.T) {
+	host := newFakePowerHost()
+	h := startSleepHarness(t, host)
+	start := h.r.condition(metav1.Now()).LastTransitionTime
+	later := metav1.NewTime(time.Now().Add(time.Hour))
+	if got := h.r.condition(later).LastTransitionTime; !got.Equal(&start) {
+		t.Fatalf("awake LastTransitionTime moved from %v to %v", start, got)
+	}
+
+	h.advance(time.Minute)
+	sleptAt := metav1.NewTime(h.r.now())
+	host.deliver(t, PowerWillSleep)
+	_ = nextEvent(t, h.rec)
+	if got := h.r.condition(later).LastTransitionTime; !got.Equal(&sleptAt) {
+		t.Fatalf("asleep LastTransitionTime = %v, want the sleep time %v", got, sleptAt)
+	}
+
+	h.advance(time.Hour)
+	wokeAt := metav1.NewTime(h.r.now())
+	host.deliver(t, PowerDidWake)
+	_ = nextEvent(t, h.rec)
+	if got := h.r.condition(later).LastTransitionTime; !got.Equal(&wokeAt) {
+		t.Fatalf("woken LastTransitionTime = %v, want the wake time %v", got, wokeAt)
 	}
 }

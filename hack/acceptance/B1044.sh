@@ -16,10 +16,21 @@
 #                                      wall-clock sleep length
 #   TestNodeStatusPublishesSleeping    the published Node carries the Sleeping
 #                                      condition, and a publish request is served
+#   TestSleepRepeatedWillSleepIsAcknowledgedOnly  the will-sleep ending a dark
+#                                      wake publishes nothing new
+#   TestSleepConditionReportsPowerSource  the message says whether macOS honours
+#                                      the assertion on the current power source
+#   TestSleepConditionTransitionTimes  LastTransitionTime moves only on a flip
+#   TestSleepAckMatchesItsNotice       (darwin) a stale or foreign ack byte never
+#                                      answers a will-sleep
+#   TestSleepWakeNeedsGraphics         (darwin) a dark wake is not a wake
 # Host tier (darwin, no privilege), integration build tag:
 #   TestIOKitSleepAssertionHeldAndReleased  the real IOKit assertion is listed by
 #                                      pmset while held and gone after release,
 #                                      and the IOKit sleep watcher stops cleanly
+#   TestIOKitSleepWatcherStopsAtOnce   200 start-then-stop rounds, each bounded:
+#                                      a stop is never lost and shutdown never hangs
+#   TestIOKitPowerSourceIsRead         the power source is read
 # Rig tier (K3SM_LAB=1 on a joined node, NODE=<node name>, kubectl configured):
 #   pmset lists the node's assertion, and the Node carries a Sleeping condition.
 #   A real sleep and wake is not driven here: it would suspend the machine
@@ -44,15 +55,23 @@ run_tests() { # <tags> <regex> <name>...
 	done
 }
 
-run_tests "" '^(TestSleepAssertionHeldWhileJoined|TestSleepAndWakeAreReported|TestNodeStatusPublishesSleeping)$' \
+run_tests "" '^(TestSleep.*|TestNodeStatusPublishesSleeping)$' \
 	'TestSleepAssertionHeldWhileJoined' \
 	'TestSleepAssertionHeldWhileJoined/held_while_the_node_runs' \
 	'TestSleepAssertionHeldWhileJoined/released_when_the_node_stops' \
 	'TestSleepAndWakeAreReported' \
-	'TestNodeStatusPublishesSleeping'
+	'TestNodeStatusPublishesSleeping' \
+	'TestSleepRepeatedWillSleepIsAcknowledgedOnly' \
+	'TestSleepConditionReportsPowerSource' \
+	'TestSleepConditionTransitionTimes'
 
 if [ "$(uname -s)" = Darwin ]; then
-	run_tests "-tags integration" '^TestIOKitSleepAssertionHeldAndReleased$' 'TestIOKitSleepAssertionHeldAndReleased'
+	run_tests "" '^(TestSleepAckMatchesItsNotice|TestSleepWakeNeedsGraphics)$' \
+		'TestSleepAckMatchesItsNotice/a_stale_ack_is_drained_before_the_wait' \
+		'TestSleepAckMatchesItsNotice/another_notice'"'"'s_byte_is_ignored' \
+		'TestSleepWakeNeedsGraphics'
+	run_tests "-tags integration" '^TestIOKit' 'TestIOKitSleepAssertionHeldAndReleased' \
+		'TestIOKitSleepWatcherStopsAtOnce' 'TestIOKitPowerSourceIsRead'
 else
 	echo "B1044: FAIL: the IOKit leg needs a Mac"; exit 1
 fi
