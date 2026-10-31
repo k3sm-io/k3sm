@@ -289,6 +289,16 @@ func (s *Service) provision() error {
 	s.mu.Lock()
 	s.gateCred = gate
 	s.mu.Unlock()
+	// The k3sm registry server authenticates against the serve config, which
+	// carries the two principals' secret hashes; it is rewritten with the
+	// credentials on every attempt so the two never disagree.
+	serve, err := renderServeConfig(cred, gate)
+	if err != nil {
+		return err
+	}
+	if err := writeServeConfig(s.cfg.WorkDir, serve); err != nil {
+		return err
+	}
 	body, err := renderConfig(s.cfg.WorkDir, s.cfg.BindAddress, s.cfg.Port)
 	if err != nil {
 		return err
