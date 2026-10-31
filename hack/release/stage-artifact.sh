@@ -195,7 +195,7 @@ done
 ( cd "$OUT" && shasum -a 256 -c "$CHECKSUMS" >/dev/null ) || die "$ARCHIVE does not match $CHECKSUMS"
 
 codesign --verify --strict "$vdir/k3sm" >/dev/null 2>&1 || die "the archived k3sm fails codesign --verify"
-codesign -d --entitlements - "$vdir/k3sm-vmhost" 2>/dev/null | grep -q com.apple.security.virtualization ||
+grep -q com.apple.security.virtualization <<<"$(codesign -d --entitlements - "$vdir/k3sm-vmhost" 2>/dev/null)" ||
 	die "the archived k3sm-vmhost carries no virtualization entitlement"
 
 echo "----------------------------------------"
