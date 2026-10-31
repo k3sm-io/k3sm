@@ -76,7 +76,9 @@ creates the `Update` named `current` that the server's update controller rolls.
 - `--manifest-sha256 <digest>` also binds the release's payload manifest, the file that names the
   release's Kubernetes minor, the oldest version it updates in place, and whether it needs the
   installer. It needs `--pin-sha256`. The update controller refuses the release, before any node
-  is cordoned, unless the manifest it downloads has exactly this sha256. Without it the pin binds
+  is cordoned, unless the manifest it downloads has exactly this sha256. Take the digest from a
+  source other than the release host, such as a copy of the release you verified yourself: a
+  digest read from the same host the manifest comes from binds nothing. Without it the pin binds
   the archive only, and the manifest is trusted as far as the release host is. A server running a
   k3sm older than this flag cannot read a pin that carries a manifest digest and refuses the update.
 - `k3sm update apply --clear-pin` removes that pin and exits. It takes no other flag (except

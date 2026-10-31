@@ -107,7 +107,9 @@ Flags:
                       also bind the release's payload manifest to this sha256
                       (apply; needs --pin-sha256): the update controller
                       refuses the release, before any node is cordoned,
-                      unless its manifest file has exactly this digest
+                      unless its manifest file has exactly this digest; take
+                      the digest from a source other than the release host
+                      (a digest read from the host binds nothing)
   --clear-pin         remove the release pin and exit (apply; root only); a pin
                       directory that cannot be trusted is moved aside, and the
                       aside entries stay in the work dir for the service user
