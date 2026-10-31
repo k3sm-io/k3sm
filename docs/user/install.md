@@ -197,10 +197,11 @@ update, stop and start it.
   install, update, stop and start that k3sm. The downgrade rule still applies: pass
   `--allow-downgrade` to install an older version on purpose.
 - **Turned on by mistake.** Run `sudo <tree>/k3sm install --developer-mode off` from any tree,
-  or install a signed release, which turns developer mode off:
+  or install a Developer ID signed k3sm, which turns developer mode off:
   - a plain `sudo k3sm install` turns it off when the `k3sm` doing the install carries a
-    Developer ID Application signature. An ad-hoc signed build from source, or one signed for
-    Apple Development, leaves it on;
+    Developer ID Application signature of any team, not only the team that signs k3sm releases.
+    Turning the mode off only turns the signature checks back on. An ad-hoc signed build from
+    source, or one signed for Apple Development, leaves it on;
   - an update through k3sm.app turns it off only when every program in the update carries a
     Developer ID Application signature of one team, and that team is the installed k3sm's when
     the installed k3sm has one. That is the same team the signature checks require of an update
