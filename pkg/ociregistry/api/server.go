@@ -191,8 +191,9 @@ type Server struct {
 	// catalogPage and catalogMax are the catalog's default and largest page.
 	catalogPage, catalogMax int
 	// catalogCeil is the catalog walk's hard ceiling as a multiple of its
-	// visit budget (catalogCeilingFactor; a seam for tests).
-	catalogCeil int
+	// visit budget (catalogCeilingFactor), and catalogCap its absolute
+	// ceiling in visits (catalogCeilingMax); seams for tests.
+	catalogCeil, catalogCap int
 	// refs is the referrers view cache and refBuilds its build slots;
 	// refScanRows and refScanBytes are the
 	// manifests and bytes one referrers request may read, refPage and
@@ -248,6 +249,7 @@ func New(cfg Config) (*Server, error) {
 		catalogPage:   defaultCatalogPage,
 		catalogMax:    maxPage,
 		catalogCeil:   catalogCeilingFactor,
+		catalogCap:    catalogCeilingMax,
 		refs:          newReferrerCache(),
 		refBuilds:     make(chan struct{}, referrersBuilds),
 		refScanRows:   referrersScanRows,

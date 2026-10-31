@@ -57,14 +57,21 @@ const (
 	maxArtifactTypes = 8
 	// referrerCacheViews, referrerCacheRows and referrerCacheBytes bound the
 	// cache over all repositories; past any of them the least recently used
-	// whole views are dropped. A view being built is never dropped. A partly
+	// whole views are dropped. The bounds are soft by a margin: the view just
+	// accounted and the views being built (at most referrersBuilds) are never
+	// dropped, so the cache may exceed any bound by those views, each bounded
+	// by its own index.json and the per-request read budget. A partly
 	// read view is dropped first only once partly read views hold more than
 	// referrerPartialRows entries, so touching many other repositories cannot
 	// throw away a large repository's progress; otherwise it is dropped only
 	// when no whole view is left to drop, so every bound holds over partly
 	// read views too.
-	referrerCacheViews  = 1024
-	referrerCacheRows   = 1 << 18
+	referrerCacheViews = 1024
+	referrerCacheRows  = 1 << 18
+	// referrerCacheBytes is the soft bound on the encoded descriptor bytes
+	// of all views: the view under construction and up to referrersBuilds
+	// views being built may take the cache past it, each bounded by its
+	// index.
 	referrerCacheBytes  = 64 << 20
 	referrerPartialRows = 1 << 17
 )
@@ -218,7 +225,9 @@ func (c *referrerCache) account(key string, v *refView, rows, bytes int64, parti
 			oldKey, old = partKey, part
 		}
 		if old == nil {
-			return // only v and views being built are left; each is bounded by its index and the read budget
+			// Only v and views being built are left: the soft margin, each
+			// bounded by its index and the read budget.
+			return
 		}
 		c.remove(oldKey, old)
 	}

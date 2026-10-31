@@ -56,6 +56,11 @@ type apiError struct {
 	detail map[string]string
 	// cause is logged, never sent.
 	cause error
+	// level, when leveled, is the level writeError logs at instead of the
+	// one the status implies (a 5xx a client can cause on purpose, or one
+	// whose client went away, is not an Error).
+	level   slog.Level
+	leveled bool
 }
 
 func (e *apiError) Error() string { return e.code + ": " + e.msg }
@@ -76,11 +81,14 @@ type errorEntry struct {
 
 // writeError answers e. A HEAD gets the status and headers only.
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, e *apiError) {
+	msg, level := "registry request refused", slog.LevelDebug
 	if e.status >= 500 {
-		s.log.Error("registry request failed", "method", r.Method, "path", r.URL.Path, "status", e.status, "code", e.code, "err", e.cause)
-	} else {
-		s.log.Debug("registry request refused", "method", r.Method, "path", r.URL.Path, "status", e.status, "code", e.code, "err", e.cause)
+		msg, level = "registry request failed", slog.LevelError
 	}
+	if e.leveled {
+		level = e.level
+	}
+	s.log.Log(r.Context(), level, msg, "method", r.Method, "path", r.URL.Path, "status", e.status, "code", e.code, "err", e.cause)
 	if e.status == http.StatusUnauthorized {
 		w.Header().Set("WWW-Authenticate", `Basic realm="k3sm registry"`)
 	}
@@ -137,7 +145,9 @@ func classify(err error) *apiError {
 	case errors.Is(err, errBodyTooSlow), errors.Is(err, errRequestTooLong):
 		return e(http.StatusRequestTimeout, codeBlobUploadInvalid, "the request body did not arrive in time")
 	case errors.Is(err, errCatalogCeiling):
-		return e(http.StatusServiceUnavailable, codeUnavailable, "the catalog page could not be completed within the registry's walk limit")
+		ce := e(http.StatusServiceUnavailable, codeUnavailable, "the catalog page could not be completed within the registry's walk limit")
+		ce.level, ce.leveled = slog.LevelWarn, true // any caller denied on many names can reach it
+		return ce
 	case errors.Is(err, errTooManySessions):
 		return e(http.StatusServiceUnavailable, codeUnavailable, "too many upload sessions in progress")
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
@@ -147,9 +157,16 @@ func classify(err error) *apiError {
 	}
 }
 
-// fail answers err through classify.
+// fail answers err through classify. A cancellation of the request's own
+// context (the client went away) is logged at Debug.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
-	s.writeError(w, r, classify(err))
+	e := classify(err)
+	if errors.Is(err, context.Canceled) && errors.Is(r.Context().Err(), context.Canceled) {
+		c := *e // classify may return the caller's own *apiError
+		c.level, c.leveled = slog.LevelDebug, true
+		e = &c
+	}
+	s.writeError(w, r, e)
 }
 
 // logger returns l, or a logger that discards when l is nil.

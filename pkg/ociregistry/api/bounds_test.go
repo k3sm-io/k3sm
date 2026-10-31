@@ -20,12 +20,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -689,5 +691,87 @@ func TestCatalogCeiling(t *testing.T) {
 	}
 	if visits != catalogVisits(2) {
 		t.Errorf("the walk visited %d repositories, ceiling %d", visits, catalogVisits(2))
+	}
+	if ra := w.Header().Get("Retry-After"); ra != "" {
+		t.Errorf("the ceiling answer carries Retry-After %q", ra)
+	}
+	// The ceiling is absolute: n=10000 raises the budget to 40,000 visits,
+	// but not the walk past the absolute ceiling (lowered here to 1,200).
+	f.srv.catalogCeil, f.srv.catalogCap = catalogCeilingFactor, 1200
+	visits = 0
+	w = f.do(http.MethodGet, "/v2/_catalog?n=10000", nil)
+	if w.Code != http.StatusServiceUnavailable || w.Header().Get("Link") != "" || w.Header().Get("Retry-After") != "" {
+		t.Errorf("a large n past the absolute ceiling: %d %s, Link %q, Retry-After %q", w.Code, w.Body.String(), w.Header().Get("Link"), w.Header().Get("Retry-After"))
+	}
+	if visits != 1200 {
+		t.Errorf("a large n visited %d repositories, absolute ceiling 1,200", visits)
+	}
+}
+
+// levelRecorder is a slog handler that records the level of every record.
+type levelRecorder struct {
+	mu     sync.Mutex
+	levels []slog.Level
+}
+
+func (h *levelRecorder) Enabled(context.Context, slog.Level) bool { return true }
+func (h *levelRecorder) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.levels = append(h.levels, r.Level)
+	return nil
+}
+func (h *levelRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *levelRecorder) WithGroup(string) slog.Handler      { return h }
+
+// take returns the levels recorded since the last take.
+func (h *levelRecorder) take() []slog.Level {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	l := h.levels
+	h.levels = nil
+	return l
+}
+
+// TestCatalogLogLevels: a catalog walk stopped at its ceiling is logged at
+// Warn and one whose client went away at Debug, never at Error.
+func TestCatalogLogLevels(t *testing.T) {
+	h := &levelRecorder{}
+	f := newFixture(t, func(c *Config) {
+		c.Logger = slog.New(h)
+		c.Authorize = func(r *http.Request, v Verb, n ref.Name) error {
+			if n.String() == "" {
+				return nil
+			}
+			return ErrDenied
+		}
+	})
+	var names []string
+	for i := range 20 {
+		names = append(names, fmt.Sprintf("r%04d", i))
+	}
+	layRepos(t, f.root, names)
+	f.srv.catalogCap = 5
+	h.take()
+	w := f.do(http.MethodGet, "/v2/_catalog", nil)
+	want(t, w, http.StatusServiceUnavailable, codeUnavailable)
+	if got := h.take(); !slices.Equal(got, []slog.Level{slog.LevelWarn}) {
+		t.Errorf("the ceiling logged at %v, want [WARN]", got)
+	}
+	f.srv.catalogCap = catalogCeilingMax
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	visits := 0
+	f.srv.catalogVisited = func() {
+		if visits++; visits == 3 {
+			cancel()
+		}
+	}
+	w = f.serve(req(http.MethodGet, "/v2/_catalog", nil).WithContext(ctx))
+	if w.Code == 200 {
+		t.Fatalf("a cancelled walk answered 200")
+	}
+	if got := h.take(); !slices.Equal(got, []slog.Level{slog.LevelDebug}) {
+		t.Errorf("a cancellation logged at %v, want [DEBUG]", got)
 	}
 }
