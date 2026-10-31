@@ -190,6 +190,9 @@ type Server struct {
 	router        *mux.Router
 	// catalogPage and catalogMax are the catalog's default and largest page.
 	catalogPage, catalogMax int
+	// catalogCeil is the catalog walk's hard ceiling as a multiple of its
+	// visit budget (catalogCeilingFactor; a seam for tests).
+	catalogCeil int
 	// refs is the referrers view cache and refBuilds its build slots;
 	// refScanRows and refScanBytes are the
 	// manifests and bytes one referrers request may read, refPage and
@@ -244,6 +247,7 @@ func New(cfg Config) (*Server, error) {
 		spaceEvery:    spaceCheckEvery,
 		catalogPage:   defaultCatalogPage,
 		catalogMax:    maxPage,
+		catalogCeil:   catalogCeilingFactor,
 		refs:          newReferrerCache(),
 		refBuilds:     make(chan struct{}, referrersBuilds),
 		refScanRows:   referrersScanRows,

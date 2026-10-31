@@ -57,10 +57,12 @@ const (
 	maxArtifactTypes = 8
 	// referrerCacheViews, referrerCacheRows and referrerCacheBytes bound the
 	// cache over all repositories; past any of them the least recently used
-	// whole views are dropped. A view being built is never dropped, and a
-	// partly read view is dropped only once partly read views hold more than
+	// whole views are dropped. A view being built is never dropped. A partly
+	// read view is dropped first only once partly read views hold more than
 	// referrerPartialRows entries, so touching many other repositories cannot
-	// throw away a large repository's progress.
+	// throw away a large repository's progress; otherwise it is dropped only
+	// when no whole view is left to drop, so every bound holds over partly
+	// read views too.
 	referrerCacheViews  = 1024
 	referrerCacheRows   = 1 << 18
 	referrerCacheBytes  = 64 << 20
@@ -88,22 +90,28 @@ type referrerDoc struct {
 // stays right for its digest for as long as a row names it.
 //
 // An unreadable entry is a manifest whose blob is missing, is not a regular
-// file, or does not match its row: it contributes nothing and is not read
-// again while a row names it.
+// file, or does not match its row, or whose row has a size no manifest may
+// have: it contributes nothing and is not read again while index.json is
+// unchanged. fileState marks the first three, which a later write to the
+// blob can cure, so they are read again (against the read budget) once
+// index.json changes; a row's size cannot change under its digest, so an
+// out-of-bounds row is never read again while a row names it.
 type refEntry struct {
 	subject    digest.Digest
 	desc       ispec.Descriptor
 	size       int
 	unreadable bool
+	fileState  bool
 }
 
 // refView is the referrers view of one repository.
 type refView struct {
 	// sem is held while the view is checked or rebuilt.
 	sem chan struct{}
-	// Guarded by sem: the index version the view was built at, whether the
-	// build was whole, the entries by manifest digest, and the referrers by
-	// subject sorted by digest (each slice is never changed once published).
+	// Guarded by sem: the index version the view was last built at (whole or
+	// partly), whether that build was whole, the entries by manifest digest,
+	// and the referrers by subject sorted by digest (each slice is never
+	// changed once published).
 	version   store.IndexVersion
 	ready     bool
 	entries   map[digest.Digest]refEntry
@@ -188,10 +196,18 @@ func (c *referrerCache) account(key string, v *refView, rows, bytes int64, parti
 	}
 	for len(c.views) > referrerCacheViews || c.rows > referrerCacheRows || c.bytes > referrerCacheBytes || c.partialRows > referrerPartialRows {
 		partialOver := c.partialRows > referrerPartialRows
-		var oldKey string
-		var old *refView
+		// The least recently used evictable view, preferring a whole one
+		// unless partly read views are over their own bound.
+		var oldKey, partKey string
+		var old, part *refView
 		for k, o := range c.views {
-			if o == v || o.building || (o.partial && !partialOver) {
+			if o == v || o.building {
+				continue
+			}
+			if o.partial && !partialOver {
+				if part == nil || o.used < part.used {
+					partKey, part = k, o
+				}
 				continue
 			}
 			if old == nil || o.used < old.used {
@@ -199,7 +215,10 @@ func (c *referrerCache) account(key string, v *refView, rows, bytes int64, parti
 			}
 		}
 		if old == nil {
-			return // only pinned views left; each is bounded by its index and the read budget
+			oldKey, old = partKey, part
+		}
+		if old == nil {
+			return // only v and views being built are left; each is bounded by its index and the read budget
 		}
 		c.remove(oldKey, old)
 	}
@@ -261,6 +280,9 @@ func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 	if err != nil {
 		return err
 	}
+	// A changed index re-reads the file-state negatives: their blobs may
+	// have been written since.
+	reread := v.version != ver
 	v.ready = false
 	entries := make(map[digest.Digest]refEntry, len(idx.Manifests))
 	var readRows, readBytes int64
@@ -272,7 +294,7 @@ func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 		if _, ok := entries[row.Digest]; ok {
 			continue
 		}
-		if e, ok := v.entries[row.Digest]; ok && e.desc.MediaType == row.MediaType && e.desc.Size == row.Size {
+		if e, ok := v.entries[row.Digest]; ok && e.desc.MediaType == row.MediaType && e.desc.Size == row.Size && !(reread && e.unreadable && e.fileState) {
 			entries[row.Digest] = e
 			continue
 		}
@@ -294,13 +316,13 @@ func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 				continue
 			}
 			s.log.Warn("registry referrers scan skipped an unreadable manifest", "repository", key, "digest", row.Digest.String(), "err", err)
-			entries[row.Digest] = refEntry{desc: ispec.Descriptor{MediaType: row.MediaType, Digest: row.Digest, Size: row.Size}, size: 64, unreadable: true}
+			entries[row.Digest] = refEntry{desc: ispec.Descriptor{MediaType: row.MediaType, Digest: row.Digest, Size: row.Size}, size: 64, unreadable: true, fileState: !errors.Is(err, errManifestSize)}
 			continue
 		}
 		readBytes += int64(len(body))
 		entries[row.Digest] = entryOf(row, body)
 	}
-	v.entries = entries
+	v.entries, v.version = entries, ver
 	var rows, bytes int64
 	bySubject := map[digest.Digest][]refEntry{}
 	for _, e := range entries {
@@ -318,7 +340,7 @@ func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 	for _, l := range bySubject {
 		slices.SortFunc(l, func(a, b refEntry) int { return strings.Compare(a.desc.Digest.String(), b.desc.Digest.String()) })
 	}
-	v.bySubject, v.version, v.ready = bySubject, ver, true
+	v.bySubject, v.ready = bySubject, true
 	return nil
 }
 
