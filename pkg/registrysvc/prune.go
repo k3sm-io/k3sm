@@ -67,6 +67,10 @@ const (
 	// KeepTaggedSincePlan is a planned manifest a push tagged after the plan
 	// was read. A delete by digest would drop that tag.
 	KeepTaggedSincePlan KeepReason = "tagged since the plan"
+	// GoneSincePlan is a planned manifest no longer in its repository when its
+	// delete comes up: something else deleted it. Prune sends no DELETE for it
+	// and does not count it as one of its own deletions.
+	GoneSincePlan KeepReason = "already gone since the plan"
 )
 
 // StoredManifest is one manifest in one repository of the registry.
@@ -142,18 +146,26 @@ var errUnreadable = errors.New("repository not fully readable")
 // PlanRepository plans one repository. It never fails: a repository it cannot
 // read completely keeps all its untagged manifests under KeepUnreadable.
 func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
+	p, _ := planRepository(workDir, repo, now)
+	return p
+}
+
+// planRepository is PlanRepository that also returns every digest the
+// repository's index holds, mapped to whether any row tags it. The map is nil
+// when the index itself could not be read.
+func planRepository(workDir, repo string, now time.Time) (PrunePlan, map[string]bool) {
 	unreadable := PrunePlan{Unreadable: []string{repo}}
 	n, err := ref.ParseName(repo)
 	if err != nil {
-		return unreadable
+		return unreadable, nil
 	}
 	r, err := store.OpenReader(StateDir(workDir))
 	if err != nil {
-		return unreadable
+		return unreadable, nil
 	}
 	idx, err := r.Index(n)
 	if err != nil {
-		return unreadable
+		return unreadable, nil
 	}
 	type entry struct {
 		m      StoredManifest
@@ -166,7 +178,7 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 		// anything but a canonical sha256 or sha512 digest makes the whole
 		// repository unreadable rather than being opened.
 		if _, err := ref.ParseDigest(d.Digest.String()); err != nil {
-			return unreadable
+			return unreadable, nil
 		}
 		dg := d.Digest.String()
 		e, ok := byDigest[dg]
@@ -180,6 +192,10 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 		if d.Annotations[ispec.AnnotationRefName] != "" {
 			e.tagged = true
 		}
+	}
+	present := make(map[string]bool, len(byDigest))
+	for dg, e := range byDigest {
+		present[dg] = e.tagged
 	}
 	untagged := func(reason KeepReason) PrunePlan {
 		var p PrunePlan
@@ -196,7 +212,7 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 	for _, dg := range order {
 		l, modTime, err := readManifest(r, n, dg)
 		if err != nil {
-			return untagged(KeepUnreadable)
+			return untagged(KeepUnreadable), present
 		}
 		links[dg] = l
 		if byDigest[dg].tagged {
@@ -251,50 +267,54 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 		}
 	}
 	p.Delete = append(indexes, others...)
-	return p
+	return p, present
 }
 
-// Recheck re-reads the repository of a planned manifest immediately before
-// its delete and returns why it must now be kept, or "" when it may still be
-// deleted. A plan goes stale while its deletes run: a push may tag a planned
-// digest (and a delete by digest drops every row with it, the new tag too),
-// or re-push it, which makes it young again. Anything Recheck cannot read is
-// kept, as the plan keeps it. A digest no longer in the index is not kept:
-// there is nothing left to protect.
+// Recheck re-plans the repository of a planned manifest from its current
+// state, immediately before that manifest's delete, and returns why it must
+// now be kept, or "" when it may still be deleted.
+//
+// A plan goes stale while its deletes run. A push may tag a planned digest (a
+// delete by digest drops every row with it, the new tag too), re-push it into
+// the grace period, or tag an index that names it or that it refers to. So
+// Recheck does not test the digest alone: it runs the same planning
+// PlanRepository runs, keep closure included, and the digest may go only if
+// it is still in that fresh plan's delete set. Otherwise the reason is the
+// fresh plan's own (KeepChildOfKept, KeepReferrer, KeepRecent), or
+// KeepTaggedSincePlan for a digest now tagged, or KeepUnreadable for anything
+// it cannot read, or GoneSincePlan for a digest no longer in the index, which
+// the caller skips rather than deletes.
+//
+// This closes the race up to the request round-trip between the re-check and
+// the DELETE: a push landing inside that window is not seen. Only a delete the
+// server makes conditional on the digest's state, under its own index lock,
+// closes that window too. Each call re-reads every manifest of the
+// repository, so a prune of n planned manifests reads the repository n times.
 func Recheck(workDir string, m StoredManifest, now time.Time) KeepReason {
-	n, err := ref.ParseName(m.Repository)
-	if err != nil {
+	p, present := planRepository(workDir, m.Repository, now)
+	if present == nil {
 		return KeepUnreadable
 	}
-	r, err := store.OpenReader(StateDir(workDir))
-	if err != nil {
-		return KeepUnreadable
+	tagged, ok := present[m.Digest]
+	switch {
+	case !ok:
+		return GoneSincePlan
+	case tagged:
+		return KeepTaggedSincePlan
 	}
-	idx, err := r.Index(n)
-	if err != nil {
-		return KeepUnreadable
-	}
-	present := false
-	for _, d := range idx.Manifests {
-		if d.Digest.String() != m.Digest {
-			continue
-		}
-		present = true
-		if d.Annotations[ispec.AnnotationRefName] != "" {
-			return KeepTaggedSincePlan
+	for _, d := range p.Delete {
+		if d.Digest == m.Digest {
+			return ""
 		}
 	}
-	if !present {
-		return ""
+	for _, k := range p.Kept {
+		if k.Digest == m.Digest {
+			return k.Reason
+		}
 	}
-	_, modTime, err := readManifest(r, n, m.Digest)
-	if err != nil {
-		return KeepUnreadable
-	}
-	if now.Sub(modTime) < PruneGrace {
-		return KeepRecent
-	}
-	return ""
+	// An untagged digest in the index is always in one of the two lists; keep
+	// it should that ever not hold.
+	return KeepUnreadable
 }
 
 // readManifest reads one manifest through the store, which checks its body

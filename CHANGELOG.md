@@ -44,6 +44,14 @@ pin, its date, and the tarball's sha256.
   go-containerregistry clients add to a cross-repository blob mount, which it refused. The
   parameter grants nothing and is dropped; the mount is authorized on both repositories as
   before.
+- `k3sm image prune --force` re-plans each repository from its current state immediately before
+  every DELETE, so a manifest a push tagged since the plan is skipped, and so is an untagged
+  child or referrer of an index or manifest that a push tagged since the plan. Each skip is
+  listed under the kept manifests with its reason, and a planned manifest something else
+  already deleted is reported as gone, not as a deletion. A push that lands in the request
+  round-trip between that re-check and the DELETE is still not seen and can lose a tag or a
+  child; closing that window needs a delete the registry makes conditional on the manifest's
+  state.
 
 ## v0.2.3 — 2026-10-29
 

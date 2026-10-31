@@ -296,11 +296,65 @@ func TestPruneThroughTheStore(t *testing.T) {
 				t.Errorf("recheck %s = %q; want %q", m.Digest, got, want[m.Digest])
 			}
 		}
-		if got := Recheck(wd, StoredManifest{Repository: "r", Digest: digestOf(manifestBody("gone"))}, time.Now()); got != "" {
-			t.Errorf("recheck of a digest no longer in the index = %q; want deletable (nothing to protect)", got)
+		if got := Recheck(wd, StoredManifest{Repository: "r", Digest: digestOf(manifestBody("gone"))}, time.Now()); got != GoneSincePlan {
+			t.Errorf("recheck of a digest no longer in the index = %q; want %q (skipped, not deleted)", got, GoneSincePlan)
 		}
 		if got := Recheck(wd, StoredManifest{Repository: "missing", Digest: digestOf(a)}, time.Now()); got != KeepUnreadable {
 			t.Errorf("recheck in an unreadable repository = %q; want %q", got, KeepUnreadable)
+		}
+	})
+
+	t.Run("a child of an index tagged since the plan is re-checked out", func(t *testing.T) {
+		wd := t.TempDir()
+		c := manifestBody("child")
+		ix := indexBody(t, c)
+		blobs := map[string][]byte{digestOf(c): c, digestOf(ix): ix}
+		layoutRepo(t, wd, "r", idx(row(c, manifestType, ""), row(ix, indexType, "")), blobs, old)
+		p := PlanRepository(wd, "r", time.Now())
+		if got, want := digests(p.Delete), []string{digestOf(ix), digestOf(c)}; strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("delete = %v; want the untagged index and its child planned: %v", got, want)
+		}
+		// A push tags the index between plan and delete.
+		layoutRepo(t, wd, "r", idx(row(c, manifestType, ""), row(ix, indexType, "v1")), blobs, old)
+		want := map[string]KeepReason{digestOf(ix): KeepTaggedSincePlan, digestOf(c): KeepChildOfKept}
+		for _, m := range p.Delete {
+			if got := Recheck(wd, m, time.Now()); got != want[m.Digest] {
+				t.Errorf("recheck %s = %q; want %q (the tagged index must keep naming its child)", m.Digest, got, want[m.Digest])
+			}
+		}
+	})
+
+	t.Run("a referrer of a subject tagged since the plan is re-checked out", func(t *testing.T) {
+		wd := t.TempDir()
+		subj := manifestBody("subject")
+		ref := fmt.Appendf(nil, `{"schemaVersion":2,"mediaType":%q,"subject":{"mediaType":%q,"digest":%q,"size":%d}}`, manifestType, manifestType, digestOf(subj), len(subj))
+		blobs := map[string][]byte{digestOf(subj): subj, digestOf(ref): ref}
+		layoutRepo(t, wd, "r", idx(row(subj, manifestType, ""), row(ref, manifestType, "")), blobs, old)
+		p := PlanRepository(wd, "r", time.Now())
+		if len(p.Delete) != 2 {
+			t.Fatalf("delete = %v; want the untagged subject and its referrer planned", digests(p.Delete))
+		}
+		layoutRepo(t, wd, "r", idx(row(subj, manifestType, "v1"), row(ref, manifestType, "")), blobs, old)
+		want := map[string]KeepReason{digestOf(subj): KeepTaggedSincePlan, digestOf(ref): KeepReferrer}
+		for _, m := range p.Delete {
+			if got := Recheck(wd, m, time.Now()); got != want[m.Digest] {
+				t.Errorf("recheck %s = %q; want %q (a tagged subject keeps its referrers)", m.Digest, got, want[m.Digest])
+			}
+		}
+	})
+
+	t.Run("a planned digest deleted by someone else is reported gone", func(t *testing.T) {
+		wd := t.TempDir()
+		a, b := manifestBody("a"), manifestBody("b")
+		blobs := map[string][]byte{digestOf(a): a, digestOf(b): b}
+		layoutRepo(t, wd, "r", idx(row(a, manifestType, ""), row(b, manifestType, "")), blobs, old)
+		p := PlanRepository(wd, "r", time.Now())
+		layoutRepo(t, wd, "r", idx(row(b, manifestType, "")), blobs, old)
+		want := map[string]KeepReason{digestOf(a): GoneSincePlan, digestOf(b): ""}
+		for _, m := range p.Delete {
+			if got := Recheck(wd, m, time.Now()); got != want[m.Digest] {
+				t.Errorf("recheck %s = %q; want %q", m.Digest, got, want[m.Digest])
+			}
 		}
 	})
 
