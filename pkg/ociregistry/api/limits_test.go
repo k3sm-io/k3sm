@@ -320,14 +320,9 @@ func TestRequestLimits(t *testing.T) {
 		f.srv.chunkAppending = func() { panic("append bug") }
 		want(t, f.do(http.MethodPatch, loc, []byte("a")), http.StatusInternalServerError, codeUnavailable)
 		f.srv.chunkAppending = nil
-		done := make(chan *httptest.ResponseRecorder, 1)
-		go func() { done <- f.do(http.MethodPatch, loc, []byte("a")) }()
-		select {
-		case w := <-done:
-			want(t, w, http.StatusAccepted, "")
-		case <-time.After(30 * time.Second):
-			t.Fatal("a PATCH after a panicked one never got the session")
-		}
+		// A lock the panic left held would hang this PATCH, and the test
+		// binary's own -timeout reports the hang with every goroutine's stack.
+		want(t, f.do(http.MethodPatch, loc, []byte("a")), http.StatusAccepted, "")
 	})
 	t.Run("an id the store does not hold leaves nothing in the table", func(t *testing.T) {
 		f := newFixture(t, func(c *Config) { c.MaxSessions = 1 })
