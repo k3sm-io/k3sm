@@ -134,6 +134,16 @@ type PinnedResolver struct {
 // AssetURL implements Resolver.
 func (r PinnedResolver) AssetURL(tag string) (string, error) { return r.Resolver.AssetURL(tag) }
 
+// Manifest implements Resolver. The pin binds the archive digest; the
+// controller requires the manifest to name that digest, so the manifest
+// needs no pin of its own.
+func (r PinnedResolver) Manifest(ctx context.Context, tag string) ([]byte, error) {
+	if r.Resolver == nil {
+		return nil, pinError("the pinned resolver has no resolver")
+	}
+	return r.Resolver.Manifest(ctx, tag)
+}
+
 // Resolve implements Resolver.
 func (r PinnedResolver) Resolve(ctx context.Context, tag string) (Release, error) {
 	if r.Resolver == nil || r.WorkDir == "" {

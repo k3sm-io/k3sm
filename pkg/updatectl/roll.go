@@ -241,9 +241,14 @@ func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update, newest
 		byName[list.Items[i].Name] = &list.Items[i]
 	}
 	if len(st.Nodes) == 0 {
-		if err := c.plan(u, list.Items); err != nil {
-			c.fail(u, err.Error())
-			return idleResync
+		if err := c.plan(ctx, u, list.Items, now); err != nil {
+			var rf rollFailure
+			if errors.As(err, &rf) {
+				c.failWith(u, rf.reason, rf.Error())
+				return idleResync
+			}
+			c.progress(u, ReasonRetrying, err.Error())
+			return errorBackoff
 		}
 	}
 	// Every pass, before any entry advances or the roll ends, so a rotation a
@@ -257,7 +262,7 @@ func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update, newest
 		case updatesv1alpha1.UpdateNodePhaseDone, updatesv1alpha1.UpdateNodePhaseSkipped, updatesv1alpha1.UpdateNodePhaseCancelled:
 			continue
 		case updatesv1alpha1.UpdateNodePhaseFailed:
-			c.fail(u, fmt.Sprintf("node %s: %s", e.Name, e.Message))
+			c.failWith(u, failedNodeReason(e), fmt.Sprintf("node %s: %s", e.Name, e.Message))
 			return idleResync
 		case "", updatesv1alpha1.UpdateNodePhasePending:
 			if u.Spec.Cancel {
@@ -287,7 +292,7 @@ func (c *Controller) roll(ctx context.Context, u *updatesv1alpha1.Update, newest
 		case updatesv1alpha1.UpdateNodePhaseDone, updatesv1alpha1.UpdateNodePhaseSkipped:
 			continue
 		case updatesv1alpha1.UpdateNodePhaseFailed:
-			c.fail(u, fmt.Sprintf("node %s: %s", e.Name, e.Message))
+			c.failWith(u, failedNodeReason(e), fmt.Sprintf("node %s: %s", e.Name, e.Message))
 			return idleResync
 		case updatesv1alpha1.UpdateNodePhaseCancelled:
 			c.cancelFrom(u, i+1, byName)
@@ -378,29 +383,54 @@ func (c *Controller) transition(u *updatesv1alpha1.Update, e *updatesv1alpha1.Up
 
 // plan records the node order and each node's starting release in status, and
 // refuses a request that cannot start: an unusable tag, too many nodes, a
-// drain with nowhere to move pods, or a downgrade the spec does not allow.
-func (c *Controller) plan(u *updatesv1alpha1.Update, nodes []corev1.Node) error {
+// drain with nowhere to move pods, a downgrade the spec does not allow, or a
+// node outside the release's compatibility window. Unless every node already
+// runs the target, it resolves the release and reads its payload manifest
+// first, since the window and the order come from the manifest. Every refusal
+// is a rollFailure, returned before any node is cordoned; any other error is
+// transient and the plan is retried.
+func (c *Controller) plan(ctx context.Context, u *updatesv1alpha1.Update, nodes []corev1.Node, now time.Time) error {
 	tag := u.Spec.Version
+	refuse := func(format string, args ...any) error { return rollFailure{err: fmt.Errorf(format, args...)} }
 	if !validTag(tag) {
-		return fmt.Errorf("spec.version %q is not a usable release tag", tag)
+		return refuse("spec.version %q is not a usable release tag", tag)
 	}
 	if len(nodes) == 0 {
-		return errors.New("the cluster has no nodes")
+		return refuse("the cluster has no nodes")
 	}
 	if len(nodes) > maxNodes {
-		return fmt.Errorf("the cluster has %d nodes; an Update records at most %d", len(nodes), maxNodes)
+		return refuse("the cluster has %d nodes; an Update records at most %d", len(nodes), maxNodes)
 	}
 	if u.Spec.Strategy.Drain && len(nodes) == 1 {
-		return errors.New("spec.strategy.drain needs another node to move pods to, and this cluster has one node; create the Update without drain")
+		return refuse("spec.strategy.drain needs another node to move pods to, and this cluster has one node; create the Update without drain")
 	}
-	ordered := c.order(nodes)
-	if !u.Spec.AllowDowngrade {
-		for _, n := range ordered {
+	var pending []*corev1.Node
+	for i := range nodes {
+		n := &nodes[i]
+		if !u.Spec.AllowDowngrade {
 			if from := fromRelease(n); isDowngrade(from, tag) {
-				return fmt.Errorf("node %s runs %s and %s is older; set spec.allowDowngrade to move it back", n.Name, from, tag)
+				return refuse("node %s runs %s and %s is older; set spec.allowDowngrade to move it back", n.Name, from, tag)
 			}
 		}
+		if !onTarget(n, tag) {
+			pending = append(pending, n)
+		}
 	}
+	serverFirst := false
+	if len(pending) > 0 {
+		if err := c.ensureResolved(ctx, u, now); err != nil {
+			return err
+		}
+		m, err := c.ensureManifest(ctx, u)
+		if err != nil {
+			return err
+		}
+		if err := checkWindow(m.m, pending); err != nil {
+			return rollFailure{err: err, reason: ReasonOutsideCompatibilityWindow}
+		}
+		serverFirst = kubeMinorRises(m.m, pending)
+	}
+	ordered := c.order(nodes, serverFirst)
 	u.Status.Nodes = make([]updatesv1alpha1.UpdateNodeStatus, 0, len(ordered))
 	for _, n := range ordered {
 		u.Status.Nodes = append(u.Status.Nodes, updatesv1alpha1.UpdateNodeStatus{
@@ -411,9 +441,16 @@ func (c *Controller) plan(u *updatesv1alpha1.Update, nodes []corev1.Node) error 
 	return nil
 }
 
-// order is workers-then-server: every node that is not a server by name, then
-// every other server by name, then this controller's own server last.
-func (c *Controller) order(nodes []corev1.Node) []*corev1.Node {
+// order is the roll order. By default it is workers-then-server: every node
+// that is not a server by name, then every other server by name, then this
+// controller's own server last, so the controller and its signer are never
+// down while a worker is mid-roll and a bad payload is caught on a worker.
+// With serverFirst (the release raises the Kubernetes minor, and the upstream
+// skew policy forbids a kubelet newer than its apiserver) it is reversed:
+// this controller's server first, then every other server by name, then every
+// worker by name. The order is recorded in status, so a controller that
+// restarts on its own server resumes it.
+func (c *Controller) order(nodes []corev1.Node, serverFirst bool) []*corev1.Node {
 	var workers, servers []*corev1.Node
 	var self *corev1.Node
 	for i := range nodes {
@@ -433,7 +470,16 @@ func (c *Controller) order(nodes []corev1.Node) []*corev1.Node {
 	}
 	byName(workers)
 	byName(servers)
-	out := append(workers, servers...)
+	out := make([]*corev1.Node, 0, len(nodes))
+	if serverFirst {
+		if self != nil {
+			out = append(out, self)
+		}
+		out = append(out, servers...)
+		return append(out, workers...)
+	}
+	out = append(out, workers...)
+	out = append(out, servers...)
 	if self != nil {
 		out = append(out, self)
 	}
@@ -557,6 +603,12 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 	}
 	ready := nodeReady(n)
 	reported, msg := parsePhase(n.Annotations[updatesv1alpha1.AnnotationUpdatePhase])
+	if code, halt := haltCode(msg); halt && (reported == updatesv1alpha1.UpdateNodePhaseFailed || nodeSidePhase(reported)) {
+		// Rolled back, refused or without its data root: the roll stops at
+		// this node, whatever phase it reports, and it stays cordoned.
+		e.Phase, e.Message, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, haltMessage(code, msg), &at
+		return nil
+	}
 	switch {
 	case reported == updatesv1alpha1.UpdateNodePhaseFailed:
 		if msg == "" {
@@ -727,7 +779,8 @@ func (c *Controller) payload(u *updatesv1alpha1.Update) ([]byte, error) {
 }
 
 // handover asks the node for the release: the version, the payload, its
-// signature and the signer certificate are set, any earlier phase report and
+// signature, the release's payload manifest and its signature (both by the
+// one signer) and the signer certificate are set, any earlier phase report and
 // settle mark are cleared, and the handover time is recorded (the node timeout
 // counts from it), in one patch. A rotation mark an earlier install left is
 // cleared in the same patch, so a mark the node carries after it is this
@@ -746,11 +799,21 @@ func (c *Controller) handover(ctx context.Context, u *updatesv1alpha1.Update, n 
 	if err != nil {
 		return nil, err
 	}
+	m, err := c.ensureManifest(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	manifest, manifestSig, err := signManifest(signer, m)
+	if err != nil {
+		return nil, err
+	}
 	return c.patchNode(ctx, n.Name, annotations(map[string]any{
 		updatesv1alpha1.AnnotationUpdateVersion: u.Spec.Version,
 		update.AnnotationUpdatePayload:          string(p),
 		update.AnnotationUpdatePayloadSig:       sig,
 		update.AnnotationUpdateSigner:           string(signer.CertPEM),
+		update.AnnotationUpdateManifest:         manifest,
+		update.AnnotationUpdateManifestSig:      manifestSig,
 		updatesv1alpha1.AnnotationUpdatePhase:   nil,
 		HandedOverAnnotation:                    now.Format(time.RFC3339),
 		ReadyAtAnnotation:                       nil,
@@ -847,12 +910,7 @@ func (c *Controller) progress(u *updatesv1alpha1.Update, reason, msg string) {
 	c.setCondition(u, ConditionFailed, metav1.ConditionFalse, ReasonRolling, "no node has failed")
 }
 
-// fail ends the roll Failed. Nodes not reached stay Pending.
-func (c *Controller) fail(u *updatesv1alpha1.Update, msg string) {
-	c.failWith(u, ReasonFailed, msg)
-}
-
-// failWith ends the roll Failed with reason on the Failed condition (empty
+// failWith ends the roll Failed (nodes not reached stay Pending) with reason on the Failed condition (empty
 // means ReasonFailed). Progressing and Succeeded keep ReasonFailed, the end
 // state every reader of the Update tests for.
 func (c *Controller) failWith(u *updatesv1alpha1.Update, reason, msg string) {

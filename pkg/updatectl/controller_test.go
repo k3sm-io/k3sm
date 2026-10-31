@@ -52,11 +52,61 @@ const (
 	serverName = "srv"
 )
 
-// fakeResolver resolves every tag to one archive and counts the calls.
+// fakeResolver resolves every tag to one archive and counts the calls. Its
+// payload manifest is manifest when set, else testManifest(tag, sha) with the
+// rig's kube minor and compatibleFrom.
 type fakeResolver struct {
 	mu    sync.Mutex
 	calls int
 	err   error
+	// sha is the archive digest; empty means targetSum.
+	sha string
+	// manifest, when set, is the manifest served; manifestErr fails the read.
+	manifest      []byte
+	manifestErr   error
+	manifestCalls int
+}
+
+func (r *fakeResolver) sum() string {
+	if r.sha != "" {
+		return r.sha
+	}
+	return targetSum
+}
+
+func (r *fakeResolver) Manifest(_ context.Context, tag string) ([]byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.manifestCalls++
+	if r.manifestErr != nil {
+		return nil, r.manifestErr
+	}
+	if r.manifest != nil {
+		return r.manifest, nil
+	}
+	return testManifest(tag, rigKubeMinor, rigCompatibleFrom, r.sum(), nil), nil
+}
+
+// The rig release's manifest defaults: the kube minor oldKubelet runs, and a
+// window that admits it.
+const (
+	rigKubeMinor      = "1.34"
+	rigCompatibleFrom = "v0.1.0"
+)
+
+// testManifest is a payload manifest JSON for tag and the archive digest sum.
+// members nil means one data member.
+func testManifest(tag, kubeMinor, compatibleFrom, sum string, members []certs.PayloadMember) []byte {
+	if members == nil {
+		members = []certs.PayloadMember{{Path: "LICENSE", SHA256: targetSum, Kind: certs.PayloadData}}
+	}
+	b, err := json.Marshal(certs.PayloadManifest{
+		Version: tag, KubeMinor: kubeMinor, CompatibleFrom: compatibleFrom, ArchiveSHA256: sum, Members: members,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
 
 func (r *fakeResolver) Resolve(_ context.Context, tag string) (Release, error) {
@@ -67,7 +117,7 @@ func (r *fakeResolver) Resolve(_ context.Context, tag string) (Release, error) {
 		return Release{}, r.err
 	}
 	url, _ := r.AssetURL(tag)
-	return Release{Version: tag, URL: url, SHA256: targetSum}, nil
+	return Release{Version: tag, URL: url, SHA256: r.sum()}, nil
 }
 
 func (r *fakeResolver) AssetURL(tag string) (string, error) {
@@ -88,8 +138,13 @@ type rig struct {
 
 	// failNodes report Failed with this message instead of Done.
 	failNodes map[string]string
+	// reportNodes report this k3sm.io/update-phase value instead of Done.
+	reportNodes map[string]string
 	// notReady nodes come back NotReady after they report Done.
 	notReady map[string]bool
+	// archive is the release archive the resolver's manifest describes, when
+	// a test serves a real one.
+	archive []byte
 	// step is how far the clock moves between passes.
 	step     time.Duration
 	recorder *record.FakeRecorder
@@ -112,14 +167,15 @@ func newRig(t *testing.T, nodes ...*corev1.Node) *rig {
 		objs = append(objs, n)
 	}
 	r := &rig{
-		t:         t,
-		cs:        fake.NewSimpleClientset(objs...),
-		resolver:  &fakeResolver{},
-		now:       rigStart,
-		failNodes: map[string]string{},
-		notReady:  map[string]bool{},
-		step:      10 * time.Second,
-		recorder:  record.NewFakeRecorder(10000),
+		t:           t,
+		cs:          fake.NewSimpleClientset(objs...),
+		resolver:    &fakeResolver{},
+		now:         rigStart,
+		failNodes:   map[string]string{},
+		reportNodes: map[string]string{},
+		notReady:    map[string]bool{},
+		step:        10 * time.Second,
+		recorder:    record.NewFakeRecorder(10000),
 	}
 	// An empty scheme: the fake then stores the Updates as unstructured, as
 	// the apiserver serves them to a dynamic client.
@@ -276,7 +332,9 @@ func (r *rig) nodeSide() {
 		case "":
 			n.Annotations[updatesv1alpha1.AnnotationUpdatePhase] = string(updatesv1alpha1.UpdateNodePhaseInstalling)
 		case string(updatesv1alpha1.UpdateNodePhaseInstalling):
-			if msg, bad := r.failNodes[n.Name]; bad {
+			if v, report := r.reportNodes[n.Name]; report {
+				n.Annotations[updatesv1alpha1.AnnotationUpdatePhase] = v
+			} else if msg, bad := r.failNodes[n.Name]; bad {
 				n.Annotations[updatesv1alpha1.AnnotationUpdatePhase] = "Failed: " + msg
 			} else {
 				n.Annotations[updatesv1alpha1.AnnotationUpdatePhase] = string(updatesv1alpha1.UpdateNodePhaseDone)

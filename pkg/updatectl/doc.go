@@ -16,7 +16,8 @@ limitations under the License.
 
 // Package updatectl is the server's update controller: it rolls the cluster to
 // the release an updates.k3sm.io/v1alpha1 Update names, one node at a time,
-// every worker first and the server last.
+// every worker first and the server last, or the server first when the
+// release raises the Kubernetes minor.
 //
 // # The singleton
 //
@@ -26,19 +27,31 @@ limitations under the License.
 //
 // # The roll
 //
-// The first reconcile of the singleton records the plan in status.nodes: every
-// node that is not a server, sorted by name, then every other server, then the
-// server this controller runs on, last. Each entry records the release the node
-// ran (From) and the target (To). The roll then visits the entries in order,
-// one at a time (Spec.Strategy.MaxUnavailable is honoured as 1, the only value
-// the server-last order allows):
+// The first reconcile of the singleton plans the roll. Unless every node
+// already runs the target, it first resolves the target once against the
+// release index (the darwin/arm64 archive and its sha256 from the release's
+// checksums file), records it in status.resolved, and reads the release's
+// payload manifest (the asset ManifestAssetName names, a
+// certs.PayloadManifest). A release that does not exist, whose checksums name
+// no archive, or whose manifest is missing, malformed, or names another
+// version or archive digest (ManifestMismatch) fails the roll before any node
+// is cordoned. So does the compatibility window: a node to be updated that
+// runs a release older than the manifest's compatibleFrom, or one that does
+// not parse as a release, ends the Update Failed with
+// OutsideCompatibilityWindow.
+//
+// The plan is recorded in status.nodes. When the manifest's kubeMinor is the
+// minor every node to be updated already runs, the order is every node that
+// is not a server, sorted by name, then every other server, then the server
+// this controller runs on, last: the controller and its signer stay up while
+// workers roll, and a bad payload is caught on a worker. When it rises (or a
+// node's minor cannot be read), the upstream skew policy forbids a kubelet
+// newer than its apiserver, so the order is this server first, then every
+// other server, then every worker. Each entry records the release the node ran
+// (From) and the target (To). The roll then visits the entries in order, one
+// at a time (Spec.Strategy.MaxUnavailable is honoured as 1):
 //
 //   - A node whose kubeletVersion already carries the target is Skipped.
-//   - Before the first node is touched, the target is resolved once against
-//     the release index (the darwin/arm64 archive and its sha256 from the
-//     release's checksums file) and recorded in status.resolved. A release
-//     that does not exist, or whose checksums name no archive, fails the roll
-//     before any node is cordoned.
 //   - When root has pinned the target (`k3sm update apply --pin-sha256`,
 //     the release pin under the server work dir, read by PinnedResolver), the
 //     checksums digest must equal the pin: a mismatch, a missing entry, or a
@@ -59,12 +72,18 @@ limitations under the License.
 //   - The node is handed over: the Node annotations k3sm.io/update-version (the
 //     tag) and k3sm.io/update-payload (a JSON Payload: the archive URL, its
 //     sha256, the signature policy and the downgrade permission), the payload's
-//     signature and the update signer's certificate (issued from the cluster CA)
-//     are set, a stale k3sm.io/update-phase is cleared and the handover time is
+//     signature, the release's payload manifest and its signature (the
+//     update.AnnotationUpdateManifest pair, which the node checks with
+//     certs.VerifySignedPayload) and the update signer's certificate (issued
+//     from the cluster CA, the one signer of both) are set, a stale k3sm.io/update-phase is cleared and the handover time is
 //     recorded, in one patch. The node timeout counts from the handover.
 //   - The node-side applies the release and reports k3sm.io/update-phase as
 //     "<phase>[: <message>]". The controller mirrors the phase into status;
-//     Failed fails the node. The node is done once it reports Done, its
+//     Failed fails the node. A message that starts with a halting reason code
+//     (update.NodeReasonRolledBack, NodeReasonRefused or
+//     NodeReasonDataRootUnmounted) fails the node in whatever phase it
+//     reports, and the Update's Failed condition carries NodeRolledBack,
+//     NodeRefused or DataRootUnmounted. The node is done once it reports Done, its
 //     kubeletVersion carries the target and it is Ready, and has stayed so for
 //     SettlePeriod; then its cordon is lifted and the roll moves on.
 //
@@ -85,9 +104,10 @@ limitations under the License.
 //
 // Every step is idempotent over the persisted status and the Node objects, so a
 // restarted controller resumes where the last one stopped. That restart is part
-// of the design, not an accident: the server updates itself last, through the
-// same node-side path, and its controller restarts on the new release while its
-// own entry is in progress. The timeouts and the settle count from
+// of the design, not an accident: the server updates itself through the same
+// node-side path (last, or first when the Kubernetes minor rises), and its
+// controller restarts on the new release while its own entry is in progress,
+// reading the payload manifest again before its next handover. The timeouts and the settle count from
 // status.nodes[].startedAt and the controller's own Node annotations, which
 // survive the restart. On an HA control plane the controller runs under a
 // Lease, so one server rolls at a time.

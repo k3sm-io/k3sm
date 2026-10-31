@@ -26,6 +26,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"k3sm.io/k3sm/pkg/certs"
 )
 
 // DefaultReleaseBase is the GitHub Releases root the release index is read
@@ -65,6 +67,11 @@ type Resolver interface {
 	// controller rebuilds a node's payload from status.resolved with it after
 	// a restart, so the release is resolved only once.
 	AssetURL(tag string) (string, error)
+	// Manifest reads the release's payload manifest (certs.PayloadManifest
+	// JSON, unsigned as published), at most certs.MaxPayloadManifestBytes.
+	// The controller checks it against the resolved archive and signs it. A
+	// definitive failure (no such asset) wraps ErrRelease.
+	Manifest(ctx context.Context, tag string) ([]byte, error)
 }
 
 // HTTPResolver reads the release index over HTTP, the way install.sh does: the
@@ -89,6 +96,17 @@ func names(tag string) (vtag, archive, checksums string, err error) {
 		return "", "", "", fmt.Errorf("%w: empty release version in tag %q", ErrRelease, tag)
 	}
 	return "v" + ver, "k3sm_" + ver + "_darwin_arm64.tar.gz", "k3sm_" + ver + "_checksums.txt", nil
+}
+
+// ManifestAssetName is the release asset that carries the payload manifest
+// of tag's darwin/arm64 archive: k3sm_<version>_darwin_arm64.manifest.json,
+// beside the archive under <base>/download/<tag>/.
+func ManifestAssetName(tag string) (string, error) {
+	_, archive, _, err := names(tag)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(archive, ".tar.gz") + ".manifest.json", nil
 }
 
 // validTag is install.sh's valid_tag: non-empty, no leading "-", and only
@@ -165,6 +183,43 @@ func (r HTTPResolver) Resolve(ctx context.Context, tag string) (Release, error) 
 	}
 	url, _ := r.AssetURL(tag) // names already accepted tag
 	return Release{Version: tag, URL: url, SHA256: sum}, nil
+}
+
+// Manifest implements Resolver.
+func (r HTTPResolver) Manifest(ctx context.Context, tag string) ([]byte, error) {
+	vtag, _, _, err := names(tag)
+	if err != nil {
+		return nil, err
+	}
+	name, _ := ManifestAssetName(tag) // names already accepted tag
+	client := r.Client
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+	u := r.base() + "/download/" + vtag + "/" + name
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build manifest request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", u, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	switch {
+	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusGone:
+		return nil, fmt.Errorf("%w: %s: http %d (release %s publishes no payload manifest)", ErrRelease, u, resp.StatusCode, vtag)
+	case resp.StatusCode != http.StatusOK:
+		return nil, fmt.Errorf("fetch %s: http %d", u, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, certs.MaxPayloadManifestBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", u, err)
+	}
+	if len(body) > certs.MaxPayloadManifestBytes {
+		return nil, fmt.Errorf("%w: %s is larger than %d bytes", ErrRelease, u, certs.MaxPayloadManifestBytes)
+	}
+	return body, nil
 }
 
 // checksumFor returns the sha256 the checksums file records for archive: the

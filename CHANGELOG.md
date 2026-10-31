@@ -10,6 +10,15 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+### Changed
+
+- A managed update now reads the release's payload manifest before it touches a node. It
+  refuses the update, with no node cordoned, when a node runs a release older than the
+  manifest allows (`OutsideCompatibilityWindow`); it updates the server first when the release
+  raises the Kubernetes minor; and it stops at the first node that reports it rolled back,
+  refused the payload, or has no data root mounted. Each node is handed the manifest, signed
+  by the same update signer as the payload.
+
 ### Fixed
 
 - `k3sm image tag`, `untag`, `inspect` and `save` now refuse `--socket`, as `ls` and `df` do,
