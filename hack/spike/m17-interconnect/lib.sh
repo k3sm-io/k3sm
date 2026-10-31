@@ -116,15 +116,15 @@ CREATED="$IC_STATE_DIR/created"
 mkdir -p "$IC_STATE_DIR" && chmod 700 "$IC_STATE_DIR" && touch "$LEDGER" "$CREATED"
 refuse() { echo "RESTORE-LIB REFUSED: $*" >&2; return 1; }
 is_half() { [ "$1" = 169.254.0.0/24 ] || [ "$1" = 169.254.255.0/24 ]; }
-has_alias() { ifconfig bridge0 | awk '$1=="inet"{print $2}' | grep -qxF "$1"; }
+has_alias() { grep -qxF "$1" <<<"$(ifconfig bridge0 | awk '$1=="inet"{print $2}')"; }
 reserved_routes() { netstat -rn -f inet | awk "$IC_NETSTAT_AWK"; }
 has_half_route() {   # a route for exactly this half exists, on any interface
-  reserved_routes | awk -v d="$1" '$1==d' | grep -q .
+  grep -q . <<<"$(reserved_routes | awk -v d="$1" '$1==d')"
 }
 created() { grep -qxF "$1" "$CREATED" || echo "$1" >>"$CREATED"; }
 # covered <ip> — a non-ARP route entry for exactly this address already exists (for
 # example an undeletable entry an earlier run's alias left behind).
-covered() { reserved_routes | awk -v d="$1/32" '$1==d && $2 !~ /L/' | grep -q .; }
+covered() { grep -q . <<<"$(reserved_routes | awk -v d="$1/32" '$1==d && $2 !~ /L/')"; }
 ic_alias() {         # ic_alias <reserved-half ip> <netmask>
   in_reserved "$1" || { refuse "$1 is outside the reserved halves"; return 1; }
   has_alias "$1" && { refuse "$1 is already on bridge0 and not in this spike's ledger"; return 1; }
@@ -167,7 +167,7 @@ was_created() {
   done
   return 1
 }
-entry_left() { reserved_routes | awk -v d="$1" '$1==d && $2 !~ /L/' | grep -q .; }
+entry_left() { grep -q . <<<"$(reserved_routes | awk -v d="$1" '$1==d && $2 !~ /L/')"; }
 # ic_residue — after a restore, every reserved-half route entry that is not an ARP
 # host entry (flags with L) is residue. IC_RESIDUE_MODE selects the rule:
 #   preflight  an entry this spike recorded creating is deleted; whatever remains
@@ -183,7 +183,7 @@ ic_residue() {
   while read -r dest flags netif gw; do
     case "$flags" in *L*) continue ;; esac
     found=1
-    if [ "${IC_RESIDUE_MODE:-post}" = post ] && printf '%s\n' "${IC_BASELINE:-}" | grep -qxF "$dest $flags $netif $gw"; then
+    if [ "${IC_RESIDUE_MODE:-post}" = post ] && grep -qxF "$dest $flags $netif $gw" <<<"${IC_BASELINE:-}"; then
       echo "RESIDUE-BASELINE $dest $flags $netif $gw (present at preflight, unchanged)"
       continue
     fi

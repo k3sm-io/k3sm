@@ -97,11 +97,11 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
-	if ! printf '%s\n' "$out" | grep -qE "^--- PASS: ${name} \("; then
+	if ! grep -qE "^--- PASS: ${name} \(" <<<"$out"; then
 		ladder no "$id  $name ($pkg) reported no PASS line of its own"
 		return
 	fi
@@ -166,10 +166,10 @@ fi
 IMAGE_HELP="$("$K3SM_BIN" image -h 2>&1 || true)"
 b6b=ok
 for verb in pull tag untag inspect save; do
-	printf '%s\n' "$IMAGE_HELP" | grep -q "k3sm image $verb " || b6b=no
+	grep -q "k3sm image $verb " <<<"$IMAGE_HELP" || b6b=no
 done
 for flag in -platform -policy -digest; do
-	printf '%s\n' "$IMAGE_HELP" | grep -q -- "$flag" || b6b=no
+	grep -q -- "$flag" <<<"$IMAGE_HELP" || b6b=no
 done
 ladder "$b6b" "image-cli.6b \`k3sm image -h\` advertises every verb and its selectors"
 
@@ -311,7 +311,7 @@ if [ "$b10" = ok ]; then
 	[ -s "$ARCHIVE" ] || b10=no
 	# An OCI layout, which is what v1 exports — a docker-save tar would be a
 	# different archive shape and the daemon answers UNIMPLEMENTED for it.
-	tar -tf "$ARCHIVE" 2>/dev/null | grep -q '^\./\{0,1\}index\.json$\|^index\.json$' || b10=no
+	grep -q '^\./\{0,1\}index\.json$\|^index\.json$' <<<"$(tar -tf "$ARCHIVE" 2>/dev/null)" || b10=no
 fi
 [ "$b10" = ok ] || tail -10 "$LIVE_OUT" || true
 ladder "$b10" "image-cli.10a \`k3sm image save\` wrote a tarred OCI layout with an index.json"

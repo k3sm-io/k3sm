@@ -161,7 +161,7 @@ EOF
 }
 
 listening() {
-	netstat -an -p tcp | awk '$NF=="LISTEN"{print $4}' | grep -qx "$1.$2"
+	grep -qx "$1.$2" <<<"$(netstat -an -p tcp | awk '$NF=="LISTEN"{print $4}')"
 }
 # max_tick <pod> - the highest tick number in the pod's log, or 0.
 max_tick() {
@@ -352,7 +352,7 @@ while [ $(( $(date +%s) - T_KILL )) -lt 90 ]; do
 		back=yes
 	fi
 	if [ "$a_bumped" = yes ] && [ "$TICK_A" -gt 0 ] \
-		&& kc logs "$POD_2" -c a --previous -n "$NS" 2>/dev/null | grep -qx "tick $TICK_A"; then
+		&& grep -qx "tick $TICK_A" <<<"$(kc logs "$POD_2" -c a --previous -n "$NS" 2>/dev/null)"; then
 		previous=yes
 	fi
 	if [ "$(cs "$POD_2" a lastState.terminated.exitCode)" = 137 ] \

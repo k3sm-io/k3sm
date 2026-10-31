@@ -38,14 +38,14 @@ while IFS= read -r -d '' f; do
   case "$(/usr/bin/file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
   macho=$((macho+1))
   dv=$(/usr/bin/codesign -dvvv "$f" 2>&1)
-  if echo "$dv" | grep -q "code object is not signed at all"; then
+  if grep -q "code object is not signed at all" <<<"$dv"; then
     unsigned=$((unsigned+1)); echo "UNSIGNED $f" >> "$OUT"; continue
   fi
   if ! /usr/bin/codesign -v "$f" >/dev/null 2>&1; then
     invalid=$((invalid+1))
     echo "INVALID  $f  [$(/usr/bin/lipo -info "$f" 2>/dev/null | sed 's/.*are: //')]" >> "$OUT"; continue
   fi
-  if echo "$dv" | grep -q "Signature=adhoc"; then
+  if grep -q "Signature=adhoc" <<<"$dv"; then
     adhoc=$((adhoc+1)); echo "ADHOC    $f" >> "$OUT"
   else
     ident=$((ident+1)); echo "SIGNED   $f  [$(echo "$dv" | grep '^Authority=' | head -1)]" >> "$OUT"

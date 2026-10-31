@@ -1,0 +1,25 @@
+# Script bodies the pipefail grep -q scanner must red on, one per block; a line
+# holding only %% ends a block. Each is planted as a script that sets pipefail.
+printf '%s\n' "$out" | grep -q -- "^--- PASS: TestX "
+%%
+go test -v ./... 2>&1 | grep -qF 'ok  '
+%%
+if ! scutil --dns | awk '{print $1}' | grep -Eq "^nameserver"; then :; fi
+%%
+seen() { newlog | command grep -qx "$1"; }
+%%
+kc get pods -o name |
+	grep -q pod/x
+%%
+kc get pods -o name \
+	| grep --quiet pod/x
+%%
+echo "$x" | fgrep -qs y && echo yes
+%%
+cat <<'BODY'
+ifconfig lo0 | grep -q "inet 10."
+BODY
+%%
+! find . -name x | grep -q .
+%%
+out="$(on peer "ifconfig bridge0 | grep -q member && echo up")"

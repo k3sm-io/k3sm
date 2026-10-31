@@ -73,8 +73,8 @@ fi
 # function the lab host's bash never sees, and every s<N>.sh call site would fail
 # "command not found" on the real path despite this gate's CI tier reading green.
 p=ok
-awk '/^read -r -d .. LAB_PREAMBLE <<.PREEOF./,/^PREEOF$/' "$LIB" | grep -q 'spike_venv()' || p=no
-awk '/^read -r -d .. LAB_PREAMBLE <<.PREEOF./,/^PREEOF$/' "$LIB" | grep -q 'spike_pip()' || p=no
+grep -q 'spike_venv()' <<<"$(awk '/^read -r -d .. LAB_PREAMBLE <<.PREEOF./,/^PREEOF$/' "$LIB")" || p=no
+grep -q 'spike_pip()' <<<"$(awk '/^read -r -d .. LAB_PREAMBLE <<.PREEOF./,/^PREEOF$/' "$LIB")" || p=no
 ladder "$p" "b330.1  spike_venv/spike_pip are defined inside LAB_PREAMBLE (the text lab() actually ships to the lab host)"
 
 # ---- b330.2 — the WIRING: s0/s1/s3 call the helpers, never a raw uv call ---
@@ -192,7 +192,7 @@ v1=ok
 grep -qF 'python install cpython-3.12-macos-aarch64-none' "$ARGV_LOG" || v1=no
 grep -qF 'venv --python cpython-3.12-macos-aarch64-none' "$ARGV_LOG" || v1=no
 [ -x "$SCRATCH/prefix/newvenv/bin/python" ] || v1=no
-printf '%s\n' "$OUT" | grep -q '^REACHED-AFTER$' || v1=no
+grep -q '^REACHED-AFTER$' <<<"$OUT" || v1=no
 ladder "$v1" "b330.3  spike_venv asks uv for the exact cpython-3.12-macos-aarch64-none spec, never a bare 3.12 version match"
 
 # ---- b330.4 — an x86_64-reporting interpreter FAILs, naming the machine ----
@@ -204,11 +204,11 @@ PY
 chmod +x "$SCRATCH/prefix/badvenv/bin/python"
 OUT="$(run_helper FAKE_PY_MACH=x86_64 -- 'spike_venv "$PREFIX/badvenv" "b330.4-label"')"
 v2=ok
-printf '%s\n' "$OUT" | grep -q 'VERDICT FAIL' || v2=no
-printf '%s\n' "$OUT" | grep -qF 'b330.4-label' || v2=no
-printf '%s\n' "$OUT" | grep -qF 'x86_64' || v2=no
-printf '%s\n' "$OUT" | grep -qF "$SCRATCH/prefix/badvenv/bin/python" || v2=no
-printf '%s\n' "$OUT" | grep -q '^REACHED-AFTER$' && v2=no   # must NOT reach past the FAIL
+grep -q 'VERDICT FAIL' <<<"$OUT" || v2=no
+grep -qF 'b330.4-label' <<<"$OUT" || v2=no
+grep -qF 'x86_64' <<<"$OUT" || v2=no
+grep -qF "$SCRATCH/prefix/badvenv/bin/python" <<<"$OUT" || v2=no
+grep -q '^REACHED-AFTER$' <<<"$OUT" && v2=no   # must NOT reach past the FAIL
 ladder "$v2" "b330.4  an x86_64-reporting interpreter FAILs the rung by name, naming the label, the interpreter path and the machine"
 
 # ---- b330.5 — an arm64-reporting interpreter PASSes silently ---------------
@@ -220,8 +220,8 @@ PY
 chmod +x "$SCRATCH/prefix/goodvenv/bin/python"
 OUT="$(run_helper FAKE_PY_MACH=arm64 -- 'spike_venv "$PREFIX/goodvenv" "b330.5-label"')"
 v3=ok
-printf '%s\n' "$OUT" | grep -q 'VERDICT FAIL' && v3=no
-printf '%s\n' "$OUT" | grep -q '^REACHED-AFTER$' || v3=no
+grep -q 'VERDICT FAIL' <<<"$OUT" && v3=no
+grep -q '^REACHED-AFTER$' <<<"$OUT" || v3=no
 ladder "$v3" "b330.5  an arm64-reporting interpreter passes with no FAIL verdict and execution continues past the call"
 
 # ---- b330.6 — a failing uv pip install surfaces the log's last line -------
@@ -233,9 +233,9 @@ PY
 chmod +x "$SCRATCH/prefix/venv/bin/python"
 OUT="$(run_helper FAKE_PIP_FAIL=1 -- 'spike_pip "$PREFIX/venv/bin/python" "vllm-mlx==0.4.1" || echo HELPER-RC=$?; echo "LASTLINE=$(tail -1 "$PREFIX/logs/pip-venv-vllm-mlx.log")"')"
 v4=ok
-printf '%s\n' "$OUT" | grep -qF 'HELPER-RC=1' || v4=no
-printf '%s\n' "$OUT" | grep -qF 'macosx_26_0_x86_64' || v4=no
-printf '%s\n' "$OUT" | grep -qF 'LASTLINE=error: mlx>=0.29.0 has no wheels with a matching platform tag (macosx_26_0_x86_64)' || v4=no
+grep -qF 'HELPER-RC=1' <<<"$OUT" || v4=no
+grep -qF 'macosx_26_0_x86_64' <<<"$OUT" || v4=no
+grep -qF 'LASTLINE=error: mlx>=0.29.0 has no wheels with a matching platform tag (macosx_26_0_x86_64)' <<<"$OUT" || v4=no
 [ -f "$SCRATCH/prefix/logs/pip-venv-vllm-mlx.log" ] || v4=no
 ladder "$v4" "b330.6  a failing uv pip install prints the log's last 8 lines and leaves pip-<venv>-<pkg>.log for the caller to quote"
 

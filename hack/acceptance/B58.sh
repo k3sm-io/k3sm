@@ -131,7 +131,7 @@ if [ -n "$TARBALL" ] && [ -f "$TARBALL" ]; then
 	# derived. cp-payload members are asserted with their DIRECTORY prefix, since
 	# landing them at the archive root is the exact mis-encoding that breaks install.
 	for want in k3sm k3sm-netd LICENSE NOTICE; do
-		if printf '%s\n' "$members" | grep -qE "(^|/)${want}$"; then
+		if grep -qE "(^|/)${want}$" <<<"$members"; then
 			ladder ok "b58.3  archive contains $want"
 		else
 			ladder no "b58.3  archive contains $want"
@@ -142,7 +142,7 @@ if [ -n "$TARBALL" ] && [ -f "$TARBALL" ]; then
 		cp-payload/*) pat="(^|/)$(printf '%s' "$want" | sed 's|/|/|g')$" ;;
 		*) pat="(^|/)${want}$" ;;
 		esac
-		if printf '%s\n' "$members" | grep -qE "$pat"; then
+		if grep -qE "$pat" <<<"$members"; then
 			ladder ok "b58.3  archive contains $want"
 		else
 			ladder no "b58.3  archive contains $want (required by pkg/install.RequiredSiblings)"
@@ -153,7 +153,7 @@ else
 fi
 
 # snapshot.4 — a checksums file is produced.
-if find "$DIST" -name '*checksums.txt' -print -quit | grep -q .; then
+if grep -q . <<<"$(find "$DIST" -name '*checksums.txt' -print -quit)"; then
 	ladder ok "b58.4  checksums file produced"
 else
 	ladder no "b58.4  checksums file produced"

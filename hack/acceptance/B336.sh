@@ -66,8 +66,8 @@ else
 	end_line="$(awk -v s="$start_line" 'NR>s && /^#/{print NR; exit}' "$DOC")"
 	[ -n "$end_line" ] || end_line=$(( $(wc -l < "$DOC") + 1 ))
 	para="$(sed -n "${start_line},$((end_line-1))p" "$DOC")"
-	printf '%s\n' "$para" | grep -qi 'mesh' || p=no
-	printf '%s\n' "$para" | grep -qi 'underlay address' && p=no
+	grep -qi 'mesh' <<<"$para" || p=no
+	grep -qi 'underlay address' <<<"$para" && p=no
 fi
 ladder "$p" "b336.2  the --node-ip section says 'mesh' and never calls it an 'underlay address'"
 

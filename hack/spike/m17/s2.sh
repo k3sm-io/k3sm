@@ -86,7 +86,7 @@ done
 record "context cable: $CABLE_DESC; link ${SPEED_GBPS} Gb/s as enumerated (Thunderbolt 4 class unless enumerated otherwise)"
 if [ "$FAILS" -gt 0 ]; then spike_end "$RUNG"; fi
 
-if kc get pods -A -o 'jsonpath={range .items[*]}{.status.podIP}{" "}{end}' </dev/null 2>/dev/null | tr ' ' '\n' | grep -qxF "$WRK_PROBE_IP"; then
+if grep -qxF "$WRK_PROBE_IP" <<<"$(kc get pods -A -o 'jsonpath={range .items[*]}{.status.podIP}{" "}{end}' </dev/null 2>/dev/null | tr ' ' '\n')"; then
 	fail "s2 preflight: a pod already holds $WRK_PROBE_IP; pick a free pod-range address before re-running"
 	spike_end "$RUNG"
 fi
@@ -103,7 +103,9 @@ for side in server worker; do
 	remote_sudo "$side" "s2-link-check" SPIKE_HOLD=1 IFC="$ifc" PEER_LINK="$peer" <<'EOF'
 if is_member "$IFC"; then verdict FAIL "s2.1 $SIDE: $IFC is still a bridge0 member after deletem"; else verdict PASS "s2.1 $SIDE: $IFC is not a bridge0 member (read back)"; fi
 ping -c 3 -t 5 -q "$PEER_LINK" >/dev/null 2>&1
-if arp -n "$PEER_LINK" 2>/dev/null | grep -q "on $IFC" && arp -n "$PEER_LINK" | grep -qv incomplete; then
+arp_out="$(arp -n "$PEER_LINK" 2>/dev/null)"
+# -v over a here-string: an empty capture is one empty line, so require output first.
+if [ -n "$arp_out" ] && grep -q "on $IFC" <<<"$arp_out" && grep -qv incomplete <<<"$arp_out"; then
   verdict PASS "s2.2 $SIDE: $PEER_LINK ARP-resolves on $IFC ($(arp -n "$PEER_LINK" | awk '{print $4}'))"
 else
   verdict FAIL "s2.2 $SIDE: $PEER_LINK does not ARP-resolve on $IFC ($(arp -n "$PEER_LINK" 2>&1 | head -1))"
@@ -351,7 +353,7 @@ note "S2(8) — the alias survived the rung"
 for side in server worker; do
 	if [ "$side" = server ]; then ifc="$SRV_IF" link="$SRV_LINK"; else ifc="$WRK_IF" link="$WRK_LINK"; fi
 	remote "$side" "s2-alias-kept" IFC="$ifc" LINK="$link" <<'EOF'
-if ifconfig "$IFC" | grep -q "inet $LINK "; then verdict PASS "s2.8 $SIDE: the alias $LINK is still on $IFC"; else verdict FAIL "s2.8 $SIDE: the alias $LINK is gone from $IFC (configd or another agent removed it) — halt: no substitution is pre-decided"; fi
+if grep -q "inet $LINK " <<<"$(ifconfig "$IFC")"; then verdict PASS "s2.8 $SIDE: the alias $LINK is still on $IFC"; else verdict FAIL "s2.8 $SIDE: the alias $LINK is gone from $IFC (configd or another agent removed it) — halt: no substitution is pre-decided"; fi
 EOF
 done
 

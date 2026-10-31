@@ -397,10 +397,10 @@ probe_script() {
 		"BOOT_BOUND=$BOOT_BOUND" "SERVER_DIR=$SERVER_DIR" "SERVER_LOG=$SERVER_LOG"
 	cat <<'BODY'
 newlog() { tail -c +"$((OFF + 1))" "$SERVER_LOG" 2>/dev/null; }
-seen() { newlog | grep -qF "$1"; }
+seen() { grep -qF "$1" <<<"$(newlog)"; }
 kc() { K3SM_WORK_DIR="$SERVER_DIR" "$K3SM" kubectl "$@" 2>/dev/null; }
 utun_up() {
-	ifconfig 2>/dev/null | awk '/^utun[0-9]+:/ { u = 1; next } /^[^ \t]/ { u = 0 } u && /inet /' | grep -qF "inet $LINK --> $LINK "
+	grep -qF "inet $LINK --> $LINK " <<<"$(ifconfig 2>/dev/null | awk '/^utun[0-9]+:/ { u = 1; next } /^[^ \t]/ { u = 0 } u && /inet /')"
 }
 healthy=0
 deadline=$((SECONDS + HEALTHY_BOUND))
@@ -905,7 +905,7 @@ REMOTE_S="$(on_server 'mktemp -d "${TMPDIR:-/tmp}/fdb.XXXXXX"' 2>/dev/null | tai
 [ -n "$REMOTE_W" ] && [ -n "$REMOTE_S" ] || refuse "could not make a run directory on both Macs"
 
 PRE_FACTS="$(as_root worker facts "$(facts_script "$WK3SM")" 2>&1)" || true
-printf '%s\n' "$PRE_FACTS" | grep -q '^FDB end$' || refuse "the worker's fact script did not finish: $(printf '%s' "$PRE_FACTS" | tail -3 | tr '\n' ' ')"
+grep -q '^FDB end$' <<<"$PRE_FACTS" || refuse "the worker's fact script did not finish: $(printf '%s' "$PRE_FACTS" | tail -3 | tr '\n' ' ')"
 [ "$(probe_field "$PRE_FACTS" agent_plist)" = 1 ] || refuse "the worker carries no agent LaunchDaemon ($AGENT_PLIST): it is not a joined worker"
 [ "$(probe_field "$PRE_FACTS" server_plist)" = 0 ] || refuse "the worker carries a server LaunchDaemon ($SERVER_PLIST)"
 [ "$(probe_field "$PRE_FACTS" preserve)" = 0 ] || refuse "the worker already holds $PRESERVE_DIR: a previous run was interrupted with the image-migration journal moved aside. Put it back by hand, then run again: sudo mkdir $SERVER_DIR if it is absent (it must be empty), give it the owner and mode the previous run log recorded (sudo chown <uid:gid> $SERVER_DIR; sudo chmod <mode> $SERVER_DIR), then sudo mv $PRESERVE_DIR $MIGRATION_DIR"

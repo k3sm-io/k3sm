@@ -64,7 +64,7 @@ runtest() {
 		echo no; return
 	fi
 	for t in "$@"; do
-		printf '%s\n' "$out" | grep -q -- "--- PASS: $t " || { echo "    $t did not run in $pkg" >&2; echo no; return; }
+		grep -q -- "--- PASS: $t " <<<"$out" || { echo "    $t did not run in $pkg" >&2; echo no; return; }
 	done
 	echo ok
 }
@@ -79,8 +79,25 @@ b1=ok
 [ -f "$ALLOW" ] || { echo "    missing $ALLOW" >&2; b1=no; }
 RUNTIMED_DIR="$(go list -m -f '{{.Dir}}' k3sm.io/runtimed 2>/dev/null || true)"
 DARWINNET_DIR="$(go list -m -f '{{.Dir}}' k3sm.io/darwin-net 2>/dev/null || true)"
+# A sibling resolved into the module cache is a published copy, not the
+# checkout this build compiles: outside a workspace (go.work) go list -m names
+# the cache, and the scan would pass over the wrong source.
+MODCACHE="$(go env GOMODCACHE 2>/dev/null || true)"
+MODCACHE_REAL=""
+[ -z "$MODCACHE" ] || [ ! -d "$MODCACHE" ] || MODCACHE_REAL="$(cd "$MODCACHE" && pwd -P)"
 for d in "$RUNTIMED_DIR" "$DARWINNET_DIR"; do
-	[ -n "$d" ] && [ -d "$d" ] || { echo "    could not locate a sibling module (go list -m said '${d:-<nothing>}')" >&2; b1=no; }
+	if [ -z "$d" ] || [ ! -d "$d" ]; then
+		echo "    could not locate a sibling module (go list -m said '${d:-<nothing>}')" >&2; b1=no; continue
+	fi
+	real="$(cd "$d" && pwd -P)" incache=no
+	for c in "$MODCACHE" "$MODCACHE_REAL"; do
+		[ -n "$c" ] || continue
+		case "$d/" in "$c"/*) incache=yes ;; esac
+		case "$real/" in "$c"/*) incache=yes ;; esac
+	done
+	if [ "$incache" = yes ]; then
+		echo "    sibling module $d is the module-cache copy, not a checkout; run inside the workspace (go.work)" >&2; b1=no
+	fi
 done
 
 # gofiles <dir>: the non-test Go files of a module, relative, outside testdata.
@@ -260,8 +277,20 @@ if [ "$b1" = ok ]; then
 	done
 fi
 if [ "$b1" = ok ]; then
-	git ls-files -- 'hack/*.sh' 'hack/**/*.sh' | sort -u |
-		while IFS= read -r f; do grep -q '/Library/k3sm/' "$f" && echo "$f"; done > "$tmp/shells" || true
+	# The listing is captured first so a git failure is a red, and each file's
+	# grep is judged by its status: 1 is no match, anything else is an error.
+	shlist="$(git ls-files -- 'hack/*.sh' 'hack/**/*.sh')" || { echo "    git ls-files could not list the hack/ shell files" >&2; b1=no; }
+	: > "$tmp/shells"
+	if [ -n "$shlist" ]; then
+		while IFS= read -r f; do
+			rc=0; grep -q '/Library/k3sm/' "$f" || rc=$?
+			case "$rc" in
+			0) echo "$f" ;;
+			1) ;;
+			*) echo "    could not read $f" >&2; b1=no ;;
+			esac
+		done <<<"$(sort -u <<<"$shlist")" > "$tmp/shells"
+	fi
 	check_hits "$tmp/hits" "$ALLOW" "$tmp/shells" || b1=no
 	[ "$(self_check)" = ok ] || { echo "    the scan's self-check failed (a planted case gave the wrong verdict)" >&2; b1=no; }
 fi

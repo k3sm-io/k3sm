@@ -89,10 +89,10 @@ if [ -w "$RODIR" ]; then
 fi
 rc=0; out="$(conformance_bin_preflight "$RODIR" 2>&1)" || rc=$?
 [ "$rc" -eq 1 ] || b2=no
-printf '%s\n' "$out" | grep -qF "$RODIR" || b2=no
-printf '%s\n' "$out" | grep -qF "sudo rm -rf $RODIR" || b2=no
-printf '%s\n' "$out" | grep -qF "K3SM_CONFORMANCE_BIN" || b2=no
-printf '%s\n' "$out" | grep -qF "SAME absolute path on the worker" || b2=no
+grep -qF "$RODIR" <<<"$out" || b2=no
+grep -qF "sudo rm -rf $RODIR" <<<"$out" || b2=no
+grep -qF "K3SM_CONFORMANCE_BIN" <<<"$out" || b2=no
+grep -qF "SAME absolute path on the worker" <<<"$out" || b2=no
 [ "$b2" = ok ] || printf '%s\n' "$out" | sed 's/^/    /'
 ladder "$b2" "b399.2  preflight on a non-writable dir returns 1 and names the path + remedy (rc=$rc)"
 
@@ -135,10 +135,10 @@ rc=0
 out="$(unset K3SM_WORKER_SSH; K3SM_SSH_BIN="$WORKDIR/fake-ssh" K3SM_SCP_BIN="$WORKDIR/fake-scp" \
 	conformance_stage_worker "$HDIR" helper-one helper-two 2>&1)" || rc=$?
 [ "$rc" -eq 0 ] || b4=no
-printf '%s\n' "$out" | grep -qF "PREREQUISITE (worker Mac): the worker needs the same conformance helpers at the same absolute path $HDIR" || b4=no
-printf '%s\n' "$out" | grep -qF "helper-one" || b4=no
-printf '%s\n' "$out" | grep -qF "helper-two" || b4=no
-printf '%s\n' "$out" | grep -qF "K3SM_WORKER_SSH=" || b4=no
+grep -qF "PREREQUISITE (worker Mac): the worker needs the same conformance helpers at the same absolute path $HDIR" <<<"$out" || b4=no
+grep -qF "helper-one" <<<"$out" || b4=no
+grep -qF "helper-two" <<<"$out" || b4=no
+grep -qF "K3SM_WORKER_SSH=" <<<"$out" || b4=no
 [ -s "$LOG" ] && b4=no
 [ "$b4" = ok ] || printf '%s\n' "$out" | sed 's/^/    /'
 ladder "$b4" "b399.4  K3SM_WORKER_SSH unset: prerequisite notice names the path and every helper, returns 0, calls no ssh/scp (rc=$rc)"

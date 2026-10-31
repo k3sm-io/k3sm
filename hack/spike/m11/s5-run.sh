@@ -259,9 +259,9 @@ if [ "$S5_ROLE" = "prober" ]; then
   # The ARP verdict turns on lladdr, NOT on the peer merely APPEARING in the
   # table: a FAILED entry is a record that resolution was ATTEMPTED and did not
   # answer, which is the opposite of adjacency.
-  if ip neigh show | grep "^$S5_PEER " | grep -q lladdr; then
+  if grep -q lladdr <<<"$(ip neigh show | grep "^$S5_PEER ")"; then
     log "S5_C4_ADJACENCY=L2-adjacent (peer ARP-resolved to an lladdr)"
-  elif ip neigh show | grep -q "^$S5_PEER "; then
+  elif grep -q "^$S5_PEER " <<<"$(ip neigh show)"; then
     log "S5_C4_ADJACENCY=NOT-adjacent (ARP attempted, no lladdr: $(ip neigh show | grep "^$S5_PEER " | tr '\n' '|'))"
   else
     log "S5_C4_ADJACENCY=NOT-adjacent (no ARP entry for the peer at all)"

@@ -297,7 +297,7 @@ has()        { grep -qF "$1" "$OUT"; }
 sudo_ran()   { grep -qE '^sudo .*k3sm install$' "$OUT"; }
 k3sm_ran()   { grep -qE '^k3sm install$' "$KLOG"; }
 no_exec()    { ! grep -qE '^sudo ' "$OUT" && [ ! -s "$KLOG" ]; }
-staging_gone() { ! find "$CASE_TMP" -mindepth 1 -maxdepth 1 -name 'k3sm-install.*' 2>/dev/null | grep -q .; }
+staging_gone() { ! grep -q . <<<"$(find "$CASE_TMP" -mindepth 1 -maxdepth 1 -name 'k3sm-install.*' 2>/dev/null)"; }
 banner_before_sudo() {
 	local b s
 	b="$(grep -nF 'about to run: sudo' "$OUT" | head -1 | cut -d: -f1)"

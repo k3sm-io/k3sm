@@ -73,8 +73,8 @@ supplemental_at_vip() {
 
 if [ "${1:-}" = "--after-uninstall" ]; then
 	echo "==> resolver floor acceptance, after uninstall"
-	if ! scutil --dns | grep -q "nameserver\[[0-9]*\] : $DNS_VIP\$" \
-		&& printf 'show %s\n' "$STORE_KEY" | scutil | grep -q "No such key"; then
+	if ! grep -q "nameserver\[[0-9]*\] : $DNS_VIP\$" <<<"$(scutil --dns)" \
+		&& grep -q "No such key" <<<"$(printf 'show %s\n' "$STORE_KEY" | scutil)"; then
 		ladder ok "b243-6  scutil --dns clean after uninstall (no resolver at $DNS_VIP, $STORE_KEY gone)"
 	else
 		ladder no "b243-6  scutil --dns clean after uninstall (a resolver at $DNS_VIP or $STORE_KEY remains)"
@@ -196,7 +196,7 @@ resolved() {
 	grep -q "resolve: kubernetes.default.svc -> " <<<"$1" && grep -q "resolve: kubernetes -> " <<<"$1"
 }
 listening() {
-	netstat -an -p tcp | awk '$NF=="LISTEN"{print $4}' | grep -qx "$1.$2"
+	grep -qx "$1.$2" <<<"$(netstat -an -p tcp | awk '$NF=="LISTEN"{print $4}')"
 }
 for spec in "$POD_SH:18431" "$POD_SCRIPT:18432" "$POD_ENV:18433"; do
 	pod="${spec%%:*}"; port="${spec##*:}"

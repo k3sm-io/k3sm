@@ -59,7 +59,7 @@ named() {
 	printf '%s\n' "$out" | grep -E '^(--- |ok|PASS)'
 	# A test that does not run is not a pass.
 	for t in "$@"; do
-		printf '%s\n' "$out" | grep -q -- "^--- PASS: $t " || { echo "B1020: FAIL: $t did not run"; exit 1; }
+		grep -q -- "^--- PASS: $t " <<<"$out" || { echo "B1020: FAIL: $t did not run"; exit 1; }
 	done
 	NAMED_OUT="$out"
 }

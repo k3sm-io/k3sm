@@ -319,7 +319,7 @@ spec:
             spec: {type: object, properties: {sizeBytes: {type: integer}}}
 YAML
 for i in $(seq 1 30); do
-  kc get crd m16widgets.spike.k3sm.io -o jsonpath='{.status.conditions[?(@.type=="Established")].status}' 2>/dev/null | grep -q True && break
+  grep -q True <<<"$(kc get crd m16widgets.spike.k3sm.io -o jsonpath='{.status.conditions[?(@.type=="Established")].status}' 2>/dev/null)" && break
   sleep 2
 done
 

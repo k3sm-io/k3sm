@@ -381,7 +381,7 @@ wait_ready() {
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		phase="$(kn get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
 		ready="$(kn get pod "$pod" -o jsonpath='{.status.containerStatuses[*].ready}' 2>/dev/null || true)"
-		if [ "$phase" = "Running" ] && [ -n "$ready" ] && ! printf '%s' "$ready" | grep -q false; then
+		if [ "$phase" = "Running" ] && [ -n "$ready" ] && ! grep -q false <<<"$ready"; then
 			return 0
 		fi
 		reason="$(kn get pod "$pod" -o jsonpath='{.status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || true)"
@@ -563,7 +563,7 @@ fi
 # ── m11.3 logs ────────────────────────────────────────────────────────────────────
 if [ "$BOOT_OK" -eq 1 ]; then
 	LOGS="$(kn logs "$POD_BOOT" 2>/dev/null || true)"
-	if printf '%s\n' "$LOGS" | grep -q "m11-log-${LOG_LINES} $MARKER"; then
+	if grep -q "m11-log-${LOG_LINES} $MARKER" <<<"$LOGS"; then
 		ladder ok "m11.3-a  kubectl logs returns the marker the container echoed (m11-log-${LOG_LINES} $MARKER)"
 	else
 		ladder no "m11.3-a  kubectl logs does not contain the container's marker (got $(printf '%s\n' "$LOGS" | grep -c . || true) lines)"
@@ -597,7 +597,7 @@ if [ "$BOOT_OK" -eq 1 ]; then
 	ADDR_OUT="$(gexec "$POD_BOOT" 'ip -4 -o addr show eth0 2>/dev/null || ifconfig eth0' 2>/dev/null || true)"
 	GUEST_IP="$(printf '%s\n' "$ADDR_OUT" | awk '{for (i = 1; i <= NF; i++) if ($i == "inet") {split($(i+1), a, "/"); print a[1]; exit}}')"
 	LINK_OUT="$(gexec "$POD_BOOT" 'ip -o link show eth0 2>/dev/null || ifconfig eth0' 2>/dev/null || true)"
-	if [ -n "$GUEST_IP" ] && [ "$(in_cidr "$GUEST_IP" "$VMNET_CIDR")" = "yes" ] && printf '%s' "$LINK_OUT" | grep -q UP; then
+	if [ -n "$GUEST_IP" ] && [ "$(in_cidr "$GUEST_IP" "$VMNET_CIDR")" = "yes" ] && grep -q UP <<<"$LINK_OUT"; then
 		ladder ok "m11.7-a  guest eth0 is UP with $GUEST_IP, inside the node's vmnet segment $VMNET_CIDR"
 	else
 		ladder no "m11.7-a  guest eth0 address '${GUEST_IP:-none}' is not an UP address inside $VMNET_CIDR"
@@ -616,7 +616,7 @@ if [ "$BOOT_OK" -eq 1 ]; then
 	API_CLUSTERIP="$(kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
 	if [ -n "$DNS_VIP" ] && [ -n "$API_CLUSTERIP" ]; then
 		NS_OUT="$(gexec "$POD_BOOT" "nslookup kubernetes.default.svc.cluster.local $DNS_VIP" 2>&1 || true)"
-		if printf '%s\n' "$NS_OUT" | grep -q "$API_CLUSTERIP"; then
+		if grep -q "$API_CLUSTERIP" <<<"$NS_OUT"; then
 			ladder ok "m11.7-c  kubernetes.default.svc.cluster.local resolves to $API_CLUSTERIP through the cluster DNS VIP $DNS_VIP"
 		else
 			ladder no "m11.7-c  the FQDN did not resolve to $API_CLUSTERIP through $DNS_VIP"
@@ -678,7 +678,7 @@ if wait_ready "$POD_WORKLOAD" "$READY_TIMEOUT"; then
 	found=0
 	deadline=$((SECONDS + 120))
 	while [ "$SECONDS" -lt "$deadline" ]; do
-		if kn logs "$POD_WORKLOAD" 2>/dev/null | grep -q "Server is ready"; then found=1; break; fi
+		if grep -q "Server is ready" <<<"$(kn logs "$POD_WORKLOAD" 2>/dev/null)"; then found=1; break; fi
 		sleep 5
 	done
 	if [ "$found" -eq 1 ]; then
@@ -721,7 +721,7 @@ store_pod "$MARKER_A"
 if wait_ready "$POD_STORE" "$READY_TIMEOUT"; then
 	BOUND="$(kn get pvc "$PVC" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
 	MARKERS="$(gexec "$POD_STORE" 'cat /data/markers' 2>/dev/null || true)"
-	if [ "$BOUND" = "Bound" ] && printf '%s\n' "$MARKERS" | grep -q "$MARKER_A"; then
+	if [ "$BOUND" = "Bound" ] && grep -q "$MARKER_A" <<<"$MARKERS"; then
 		STORE_OK=1
 		PVNAME="$(kn get pvc "$PVC" -o jsonpath='{.spec.volumeName}' 2>/dev/null || true)"
 		ladder ok "m11.6-a  local-path PVC $PVC is $BOUND (PV ${PVNAME:-?}) and the vm pod wrote $MARKER_A into it"
@@ -755,7 +755,7 @@ if [ "$STORE_OK" -eq 1 ]; then
 			ready="$(kn get pod "$POD_STORE" -o jsonpath='{.status.containerStatuses[*].ready}' 2>/dev/null || true)"
 			reason="$(kn get pod "$POD_STORE" -o jsonpath='{.status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || true)"
 			phase="$(kn get pod "$POD_STORE" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-			if [ "$reason" = "CrashLoopBackOff" ] || printf '%s' "$ready" | grep -q false || [ "$phase" = "Failed" ]; then
+			if [ "$reason" = "CrashLoopBackOff" ] || grep -q false <<<"$ready" || [ "$phase" = "Failed" ]; then
 				unhealthy=1
 				note "$POD_STORE after the helper SIGKILL: phase=${phase:-?} waiting=${reason:-none} ready=${ready:-?}"
 				break
@@ -778,7 +778,7 @@ if [ "$STORE_OK" -eq 1 ]; then
 		store_pod "$MARKER_B"
 		if wait_ready "$POD_STORE" "$READY_TIMEOUT"; then
 			MARKERS="$(gexec "$POD_STORE" 'cat /data/markers' 2>/dev/null || true)"
-			if printf '%s\n' "$MARKERS" | grep -q "$MARKER_A" && printf '%s\n' "$MARKERS" | grep -q "$MARKER_B"; then
+			if grep -q "$MARKER_A" <<<"$MARKERS" && grep -q "$MARKER_B" <<<"$MARKERS"; then
 				ladder ok "m11.6-c  a fresh vm pod on the SAME claim sees both the pre-kill marker $MARKER_A and the new $MARKER_B — the bytes survived the guest"
 			else
 				ladder no "m11.6-c  the recreated pod does not see both markers (got: ${MARKERS:-none})"
@@ -803,7 +803,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 	phase="$(kn get pod "$POD_AMD64" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
 	if [ "$phase" = "Running" ] || [ "$phase" = "Succeeded" ]; then ran=1; break; fi
 	EVIDENCE="$( { kn describe pod "$POD_AMD64"; kn get events --field-selector "involvedObject.name=$POD_AMD64"; } 2>/dev/null || true )"
-	if printf '%s\n' "$EVIDENCE" | grep -qF "$AMD64_SUBSTR"; then matched=1; break; fi
+	if grep -qF "$AMD64_SUBSTR" <<<"$EVIDENCE"; then matched=1; break; fi
 	sleep 5
 done
 if [ "$ran" -eq 1 ]; then
@@ -848,7 +848,7 @@ if [ "$BOOT_OK" -eq 1 ]; then
 		if [ -n "$eps" ]; then break; fi
 		sleep 5
 	done
-	if [ -n "$POD_IP" ] && printf '%s' "$eps" | grep -qF "$POD_IP" && printf '%s' "$epready" | grep -q true; then
+	if [ -n "$POD_IP" ] && grep -qF "$POD_IP" <<<"$eps" && grep -q true <<<"$epready"; then
 		ladder ok "m11.10-a  the EndpointSlice for $SVC_BOOT carries the vm pod's published IP $POD_IP, ready"
 	else
 		ladder no "m11.10-a  the EndpointSlice for $SVC_BOOT does not carry a ready endpoint for pod IP '${POD_IP:-none}' (addresses: '${eps:-none}', ready: '${epready:-none}')"
@@ -858,11 +858,11 @@ if [ "$BOOT_OK" -eq 1 ]; then
 		deadline=$((SECONDS + 60))
 		while [ "$SECONDS" -lt "$deadline" ]; do
 			body="$(curl -sS -m 10 "http://$SVC_IP/" 2>/dev/null || true)"
-			if printf '%s' "$body" | grep -qF "$MARKER"; then break; fi
+			if grep -qF "$MARKER" <<<"$body"; then break; fi
 			sleep 5
 		done
 	fi
-	if printf '%s' "$body" | grep -qF "$MARKER"; then
+	if grep -qF "$MARKER" <<<"$body"; then
 		ladder ok "m11.10-b  a client reaches the vm-hosted workload through the ClusterIP $SVC_IP (marker $MARKER)"
 	else
 		ladder no "m11.10-b  the ClusterIP '${SVC_IP:-none}' did not serve the vm pod's marker (got: '${body:-nothing}')"

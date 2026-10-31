@@ -217,7 +217,7 @@ ring() {
 }
 
 oom_on_worker() {
-	kc get pod m17-rank1 -n "$NS" -o 'jsonpath={.status.containerStatuses[0].state.terminated.reason}{.status.containerStatuses[0].lastState.terminated.reason}' </dev/null 2>/dev/null | grep -q OOMKilled ||
+	grep -q OOMKilled <<<"$(kc get pod m17-rank1 -n "$NS" -o 'jsonpath={.status.containerStatuses[0].state.terminated.reason}{.status.containerStatuses[0].lastState.terminated.reason}' </dev/null 2>/dev/null)" ||
 		grep -qiE 'killed|out of memory|MemoryError|exit code 137' "$RUNG_DIR/ring-direct-rank1.jsonl"
 }
 

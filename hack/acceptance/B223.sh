@@ -88,7 +88,7 @@ fi
 p=ok
 grep -qE 'func \(c Config\) clusterSignedServing\(\) bool' "$EXECUTOR" || p=no
 grep -qE 'c\.ServingCertFile != "" && c\.ServingKeyFile != ""' "$EXECUTOR" || p=no
-grep -A1 -E 'if cfg\.clusterSignedServing\(\) \{' "$SUPERVISED" | grep -qE '"--tls-cert-file", cfg\.ServingCertFile' || p=no
+grep -qE '"--tls-cert-file", cfg\.ServingCertFile' <<<"$(grep -A1 -E 'if cfg\.clusterSignedServing\(\) \{' "$SUPERVISED")" || p=no
 ladder "$p" "b223.1  clusterSignedServing is the ONE posture predicate, and --tls-cert-file is gated on it"
 
 # ---- b223.2 — --root-ca-file is DERIVED, never re-pinned at a literal --------
@@ -113,10 +113,10 @@ c=ok
 leaf_body="$(fn_body provisionServingLeaf)"
 mesh_body="$(fn_body provisionMeshPKI)"
 [ -n "$leaf_body" ] && [ -n "$mesh_body" ] || c=no
-printf '%s\n' "$leaf_body" | grep -qE 'cfg\.RootCAFile = certs\.ClusterCACertPath\(opts\.workDir\)' || c=no
-printf '%s\n' "$leaf_body" | grep -qE 'cfg\.ServingCertFile = servingCert' || c=no
-printf '%s\n' "$mesh_body" | grep -qE 'provisionServingLeaf\(\*opts, cfg, logger\)' || c=no
-if printf '%s\n' "$mesh_body" | grep -qE 'cfg\.RootCAFile ='; then c=no; fi
+grep -qE 'cfg\.RootCAFile = certs\.ClusterCACertPath\(opts\.workDir\)' <<<"$leaf_body" || c=no
+grep -qE 'cfg\.ServingCertFile = servingCert' <<<"$leaf_body" || c=no
+grep -qE 'provisionServingLeaf\(\*opts, cfg, logger\)' <<<"$mesh_body" || c=no
+if grep -qE 'cfg\.RootCAFile =' <<<"$mesh_body"; then c=no; fi
 ladder "$c" "b223.3  provisionServingLeaf sets cfg.RootCAFile = certs.ClusterCACertPath beside the serving cert, and provisionMeshPKI reaches it"
 
 # ---- b223.4 — the misconfiguration is LOUD, not silently ignored -------------
@@ -125,8 +125,8 @@ ladder "$c" "b223.3  provisionServingLeaf sets cfg.RootCAFile = certs.ClusterCAC
 v=ok
 grep -qE '^var ErrNoServingCert = errors\.New' "$EXECUTOR" || v=no
 validate_body="$(awk '/^func \(c Config\) Validate\(\) error/ {on=1} on {print} on && /^}/ {exit}' "$EXECUTOR")"
-printf '%s\n' "$validate_body" | sed -n 2p | grep -qE '^[[:space:]]*if !c\.clusterSignedServing\(\) \{' || v=no
-printf '%s\n' "$validate_body" | sed -n 3p | grep -qE '^[[:space:]]*return ErrNoServingCert$' || v=no
+grep -qE '^[[:space:]]*if !c\.clusterSignedServing\(\) \{' <<<"$(printf '%s\n' "$validate_body" | sed -n 2p)" || v=no
+grep -qE '^[[:space:]]*return ErrNoServingCert$' <<<"$(printf '%s\n' "$validate_body" | sed -n 3p)" || v=no
 ladder "$v" "b223.4  Validate fails closed on a RootCAFile with no serving keypair"
 
 # ---- Go leg runner (GOARCH=arm64 CGO_ENABLED=1) ----------------------------
@@ -145,7 +145,7 @@ run_test() {
 		ladder no "$id  $name ($pkg) passed"
 		return
 	fi
-	if printf '%s\n' "$out" | grep -qE 'no tests to run|no test files'; then
+	if grep -qE 'no tests to run|no test files' <<<"$out"; then
 		ladder no "$id  $name ($pkg) actually RAN — go test reported no tests to run (renamed test?)"
 		return
 	fi
@@ -276,7 +276,7 @@ else
 			# The end-to-end property the ConfigMap exists FOR: a client holding only the
 			# published bytes can verify the live apiserver. Byte-equality alone would
 			# still pass if both files were the wrong CA.
-			if [ -s "$pub" ] && openssl s_client -connect "127.0.0.1:$LAB_API_PORT" -CAfile "$pub" -servername kubernetes </dev/null 2>/dev/null | grep -q "Verify return code: 0 (ok)"; then
+			if [ -s "$pub" ] && grep -q "Verify return code: 0 (ok)" <<<"$(openssl s_client -connect "127.0.0.1:$LAB_API_PORT" -CAfile "$pub" -servername kubernetes </dev/null 2>/dev/null)"; then
 				ladder ok "b223.L3  the live apiserver serving cert VERIFIES against the published CA bytes"
 			else
 				ladder no "b223.L3  the live apiserver serving cert VERIFIES against the published CA bytes"

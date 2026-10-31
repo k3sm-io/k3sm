@@ -149,7 +149,7 @@ done
 # kube_host <kubeconfig>: the host of the kubeconfig's server URL (a mesh IP here).
 kube_host() { kubectl config view --kubeconfig "$1" --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null | sed -E 's#^https?://##; s#:[0-9]+/?$##'; }
 MESH_A="$(kube_host "$KUBECONFIG")"; MESH_B="$(kube_host "$K3SM_KUBECONFIG_B")"
-if [ -z "$MESH_B" ] || ! ifconfig 2>/dev/null | grep -Eq "inet ${MESH_B//./\\.} "; then
+if [ -z "$MESH_B" ] || ! grep -Eq "inet ${MESH_B//./\\.} " <<<"$(ifconfig 2>/dev/null)"; then
 	ladder no "m6.pre  this host is server B (B's mesh IP ${MESH_B:-unknown} is not an address here; m6.B stops A and would cut a run host on A's side off from B)"
 	finish
 fi
@@ -175,7 +175,8 @@ PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
 E="$WD/tls/etcd"
 etcd_api() { curl -sS --max-time 10 --cacert "$E/server-ca.crt" --cert "$E/client.crt" --key "$E/client.key" -X POST -d "$2" "https://127.0.0.1:$CP$1"; }
 etcd_metrics() { curl -sS --max-time 10 "http://127.0.0.1:$MP/metrics"; }
-daemon_running() { launchctl print "system/$LABEL" 2>/dev/null | grep -q 'state = running'; }
+# A case match, not a pipe into grep -q: this runs under sh -s, where a here-string is not POSIX.
+daemon_running() { case "$(launchctl print "system/$LABEL" 2>/dev/null)" in *'state = running'*) return 0 ;; esac; return 1; }
 # launchd removes a booted-out service asynchronously: the daemon keeps stopping its
 # children for several seconds, and a bootstrap issued meanwhile fails with 5
 # (Input/output error) while kickstart on the departing service returns 0 and starts
@@ -224,7 +225,7 @@ member_list() { remote "$1" 'etcd_api /v3/cluster/member/list "{\"linearizable\"
 # voting <A|B> <n>: that server's member reports exactly n members and no learner.
 voting() {
 	local out; out="$(member_list "$1" 2>/dev/null || true)"
-	[ "$(printf '%s' "$out" | grep -o '"ID":' | wc -l | tr -d ' ')" = "$2" ] && ! printf '%s' "$out" | grep -q '"isLearner":true'
+	[ "$(printf '%s' "$out" | grep -o '"ID":' | wc -l | tr -d ' ')" = "$2" ] && ! grep -q '"isLearner":true' <<<"$out"
 }
 cm_value() { kubectl --kubeconfig "$1" get configmap -n default "$2" -o jsonpath='{.data.v}' 2>/dev/null || true; }
 # rh_pin <A|B> <tag>: the SHA-256 fingerprint of that server's request-header CA
@@ -281,15 +282,15 @@ mesh_cidr() { printf '%s.0/24' "${1%.*}"; }
 server_peers() { kA get meshpeers -l net.k3sm.io/control-plane=true -o jsonpath='{range .items[*]}{.spec.podCIDR}={.spec.publicKey}{"\n"}{end}' 2>/dev/null || true; }
 SERVER_PEERS="$(server_peers)"
 printf '%s\n' "$SERVER_PEERS" > "$EV/server-meshpeers.txt"
-if printf '%s\n' "$SERVER_PEERS" | grep -q "^$(mesh_cidr "$MESH_A")=" &&
-	printf '%s\n' "$SERVER_PEERS" | grep -q "^$(mesh_cidr "$MESH_B")=" &&
+if grep -q "^$(mesh_cidr "$MESH_A")=" <<<"$SERVER_PEERS" &&
+	grep -q "^$(mesh_cidr "$MESH_B")=" <<<"$SERVER_PEERS" &&
 	[ "$(printf '%s\n' "$SERVER_PEERS" | grep -c '=')" = 2 ]; then
 	ladder ok "m6.M  two MeshPeers labelled net.k3sm.io/control-plane=true, at $(mesh_cidr "$MESH_A") and $(mesh_cidr "$MESH_B")"
 else
 	ladder no "m6.M  two MeshPeers labelled net.k3sm.io/control-plane=true, at $(mesh_cidr "$MESH_A") and $(mesh_cidr "$MESH_B") (got: $(printf '%s' "$SERVER_PEERS" | sed 's/=.*//' | tr '\n' ' '))"
 fi
 EPS="$(kA get endpoints -n default kubernetes -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
-if printf ' %s ' "$EPS" | grep -q " $MESH_A " && printf ' %s ' "$EPS" | grep -q " $MESH_B "; then
+if grep -q " $MESH_A " <<<"$(printf ' %s ' "$EPS")" && grep -q " $MESH_B " <<<"$(printf ' %s ' "$EPS")"; then
 	ladder ok "m6.M  default/kubernetes lists both apiservers ($MESH_A, $MESH_B)"
 else
 	ladder no "m6.M  default/kubernetes lists both apiservers ($MESH_A, $MESH_B; got: ${EPS:-none})"
@@ -324,7 +325,7 @@ fi
 pre_ok=yes
 remote B 'daemon_running' || pre_ok="no (B's daemon is not running)"
 [ "$(kB get --raw /livez 2>/dev/null || true)" = ok ] || pre_ok="no (B's /livez is not ok)"
-remote B 'etcd_api /v3/maintenance/status "{}"' 2>/dev/null | grep -q '"header"' || pre_ok="no (B's etcd does not answer Status)"
+grep -q '"header"' <<<"$(remote B 'etcd_api /v3/maintenance/status "{}"' 2>/dev/null)" || pre_ok="no (B's etcd does not answer Status)"
 if [ "$pre_ok" != yes ]; then
 	ladder no "m6.B  precondition: B alive, /livez ok, its etcd answers Status — $pre_ok"
 else
@@ -338,15 +339,15 @@ else
 		end=$((SECONDS + 60))
 		while [ "$SECONDS" -lt "$end" ]; do
 			st="$(remote B 'etcd_api /v3/maintenance/status "{}"' 2>/dev/null || true)"
-			if printf '%s' "$st" | grep -q '"header"' && ! printf '%s' "$st" | grep -q '"leader":"[1-9]'; then noleader=yes; fi
+			if grep -q '"header"' <<<"$st" && ! grep -q '"leader":"[1-9]' <<<"$st"; then noleader=yes; fi
 			if [ "$noleader" = yes ] && [ "$writefail" = no ]; then
 				if lastwrite="$(kB create configmap -n default "m6-noleader-$SECONDS" --from-literal=v=x --request-timeout=15s 2>&1)"; then
 					lastwrite="the write SUCCEEDED without quorum: $lastwrite"
-				elif printf '%s' "$lastwrite" | grep -Eqi 'no leader|leader changed|timeout|timed out|deadline exceeded|unable to return a response in the time allotted'; then
+				elif grep -Eqi 'no leader|leader changed|timeout|timed out|deadline exceeded|unable to return a response in the time allotted' <<<"$lastwrite"; then
 					writefail=yes
 				fi
 			fi
-			if remote B "etcd_api /v3/kv/range '{\"key\":\"$key\",\"serializable\":true}'" 2>/dev/null | grep -q '"kvs"'; then localread=yes; fi
+			if grep -q '"kvs"' <<<"$(remote B "etcd_api /v3/kv/range '{\"key\":\"$key\",\"serializable\":true}'" 2>/dev/null)"; then localread=yes; fi
 			[ "$noleader$writefail$localread" = yesyesyes ] && break
 			sleep 3
 		done
@@ -465,7 +466,7 @@ sudo -u "$user" env HOME="${home:-$HOME}" "$bin" server --cluster-reset "$@"' >>
 	# A rejoined with its mesh key file intact (the wipe above removes only
 	# $WD/etcd), so its reservation re-asserts the same row: same /24, same key.
 	# shellcheck disable=SC2329  # invoked through await
-	a_peer_back() { [ -n "$A_PEER_BEFORE" ] && server_peers | grep -qxF "$A_PEER_BEFORE"; }
+	a_peer_back() { [ -n "$A_PEER_BEFORE" ] && grep -qxF "$A_PEER_BEFORE" <<<"$(server_peers)"; }
 	if await 120 a_peer_back; then
 		ladder ok "m6.D  A's MeshPeer is back at $(mesh_cidr "$MESH_A") with its pre-reset public key"
 	else
@@ -474,7 +475,7 @@ sudo -u "$user" env HOME="${home:-$HOME}" "$bin" server --cluster-reset "$@"' >>
 	PEER_URLS_AFTER="$(peer_urls "$(cat "$EV/members-after-reset-B.json" 2>/dev/null || true)")"
 	note "m6.D etcd peer URLs before: $(printf '%s' "$PEER_URLS_BEFORE" | tr '\n' ' ') after: $(printf '%s' "$PEER_URLS_AFTER" | tr '\n' ' ')"
 	if [ -n "$PEER_URLS_BEFORE" ] && [ "$PEER_URLS_AFTER" = "$PEER_URLS_BEFORE" ] &&
-		! printf '%s\n' "$PEER_URLS_AFTER" | grep -Eq '^https://100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'; then
+		! grep -Eq '^https://100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' <<<"$PEER_URLS_AFTER"; then
 		ladder ok "m6.D  B's member list carries the pre-reset peer URLs, A's on its LAN address, none on the mesh"
 	else
 		ladder no "m6.D  B's member list carries the pre-reset peer URLs, A's on its LAN address, none on the mesh"

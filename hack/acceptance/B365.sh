@@ -67,8 +67,8 @@ a=ok
 if [ -z "$SECTION" ]; then
 	a=no
 else
-	printf '%s\n' "$SECTION" | grep -qi 'asleep' || a=no
-	printf '%s\n' "$SECTION" | grep -qi 'ping its LAN address\|ping.*LAN' || a=no
+	grep -qi 'asleep' <<<"$SECTION" || a=no
+	grep -qi 'ping its LAN address\|ping.*LAN' <<<"$SECTION" || a=no
 	# It must precede the taint command, or a reader could act before checking.
 	asleep_pos="$(printf '%s\n' "$SECTION" | grep -ni 'asleep' | head -1 | cut -d: -f1)"
 	taint_pos="$(printf '%s\n' "$SECTION" | grep -ni 'kubectl taint node' | head -1 | cut -d: -f1)"
@@ -83,10 +83,10 @@ br=ok
 if [ -z "$SECTION" ]; then
 	br=no
 else
-	printf '%s\n' "$SECTION" | grep -qi 'coming back' || br=no
-	printf '%s\n' "$SECTION" | grep -qi 'stop after' || br=no
-	printf '%s\n' "$SECTION" | grep -qi 'leaving the cluster' || br=no
-	printf '%s\n' "$SECTION" | grep -q 'multi-node.md#removing-a-worker' || br=no
+	grep -qi 'coming back' <<<"$SECTION" || br=no
+	grep -qi 'stop after' <<<"$SECTION" || br=no
+	grep -qi 'leaving the cluster' <<<"$SECTION" || br=no
+	grep -q 'multi-node.md#removing-a-worker' <<<"$SECTION" || br=no
 fi
 ladder "$br" "b365.3  the section names the coming-back-vs-leaving branch and cross-links the removal flow"
 
@@ -95,8 +95,8 @@ t=ok
 if [ -z "$SECTION" ]; then
 	t=no
 else
-	printf '%s\n' "$SECTION" | grep -qF 'kubectl taint node <name> node.kubernetes.io/out-of-service=nodeshutdown:NoExecute' || t=no
-	printf '%s\n' "$SECTION" | grep -qF 'kubectl taint node <name> node.kubernetes.io/out-of-service:NoExecute-' || t=no
+	grep -qF 'kubectl taint node <name> node.kubernetes.io/out-of-service=nodeshutdown:NoExecute' <<<"$SECTION" || t=no
+	grep -qF 'kubectl taint node <name> node.kubernetes.io/out-of-service:NoExecute-' <<<"$SECTION" || t=no
 fi
 ladder "$t" "b365.4  the section gives the exact apply and remove out-of-service NoExecute taint commands"
 
@@ -105,13 +105,13 @@ f=ok
 if [ -z "$SECTION" ]; then
 	f=no
 else
-	printf '%s\n' "$SECTION" | grep -qF -- '--grace-period=0' || f=no
-	printf '%s\n' "$SECTION" | grep -qi 'force' || f=no
-	printf '%s\n' "$SECTION" | grep -qi 'two copies can run at once' || f=no
+	grep -qF -- '--grace-period=0' <<<"$SECTION" || f=no
+	grep -qi 'force' <<<"$SECTION" || f=no
+	grep -qi 'two copies can run at once' <<<"$SECTION" || f=no
 	# No em dash anywhere in the section, per the public-tier voice rule; the
 	# voice lint below also catches this, but pinning it here names WHY. The
 	# literal byte match (not -P, absent from BSD grep) is portable to macOS.
-	printf '%s\n' "$SECTION" | grep -qF $'\xe2\x80\x94' && f=no
+	grep -qF $'\xe2\x80\x94' <<<"$SECTION" && f=no
 fi
 ladder "$f" "b365.5  the force-delete escape names --grace-period=0 and the split-brain caveat without an em dash"
 
@@ -120,7 +120,7 @@ s=ok
 if [ -z "$SECTION" ]; then
 	s=no
 else
-	printf '%s\n' "$SECTION" | grep -qi 'k3sm status' || s=no
+	grep -qi 'k3sm status' <<<"$SECTION" || s=no
 fi
 ladder "$s" "b365.6  the section points at the k3sm status workloads-row pointer"
 
@@ -129,9 +129,9 @@ d=ok
 if [ -z "$SECTION" ]; then
 	d=no
 else
-	printf '%s\n' "$SECTION" | grep -qi 'maxSurge' || d=no
-	printf '%s\n' "$SECTION" | grep -qi 'maxUnavailable' || d=no
-	printf '%s\n' "$SECTION" | grep -qi 'DaemonSet' || d=no
+	grep -qi 'maxSurge' <<<"$SECTION" || d=no
+	grep -qi 'maxUnavailable' <<<"$SECTION" || d=no
+	grep -qi 'DaemonSet' <<<"$SECTION" || d=no
 fi
 ladder "$d" "b365.7  the section covers DaemonSet surge settings so one offline node cannot freeze a rollout"
 

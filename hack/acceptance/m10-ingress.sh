@@ -79,13 +79,13 @@ if [ "${1:-}" = "--self-test" ]; then
 	st=0
 	chk() { if [ "$1" = ok ]; then echo "ok   $2"; else echo "FAIL $2"; st=1; fi; }
 	out="$(K3SM_LAB_TOLERATE_KEYS="example.com/estate-off" backend_pod node-x)"
-	echo "$out" | grep -q '^  nodeName: node-x$' && chk ok "nodeName pinned" || chk no "nodeName pinned"
-	echo "$out" | grep -q '^  nodeSelector: {kubernetes.io/os: darwin}$' && chk ok "darwin nodeSelector" || chk no "darwin nodeSelector"
-	echo "$out" | grep -q 'key: k3sm.io/provider, operator: Exists, effect: NoSchedule' && chk ok "helper provider toleration" || chk no "helper provider toleration"
-	echo "$out" | grep -q 'key: example.com/estate-off, operator: Exists' && chk ok "helper extra-key toleration" || chk no "helper extra-key toleration"
-	if echo "$out" | grep -E '^  tolerations:' | grep -Eq '\[\{operator: Exists\}|, \{operator: Exists\}'; then chk no "no Exists-only toleration"; else chk ok "no Exists-only toleration"; fi
-	echo "$out" | grep -q 'nc -l "\$K3SM_POD_IP" 8080' && chk ok "responder binds the pod IP" || chk no "responder binds the pod IP"
-	if echo "$out" | grep -q '/tmp'; then chk no "no /tmp path"; else chk ok "no /tmp path"; fi
+	grep -q '^  nodeName: node-x$' <<<"$out" && chk ok "nodeName pinned" || chk no "nodeName pinned"
+	grep -q '^  nodeSelector: {kubernetes.io/os: darwin}$' <<<"$out" && chk ok "darwin nodeSelector" || chk no "darwin nodeSelector"
+	grep -q 'key: k3sm.io/provider, operator: Exists, effect: NoSchedule' <<<"$out" && chk ok "helper provider toleration" || chk no "helper provider toleration"
+	grep -q 'key: example.com/estate-off, operator: Exists' <<<"$out" && chk ok "helper extra-key toleration" || chk no "helper extra-key toleration"
+	if grep -Eq '\[\{operator: Exists\}|, \{operator: Exists\}' <<<"$(echo "$out" | grep -E '^  tolerations:')"; then chk no "no Exists-only toleration"; else chk ok "no Exists-only toleration"; fi
+	grep -q 'nc -l "\$K3SM_POD_IP" 8080' <<<"$out" && chk ok "responder binds the pod IP" || chk no "responder binds the pod IP"
+	if grep -q '/tmp' <<<"$out"; then chk no "no /tmp path"; else chk ok "no /tmp path"; fi
 	exit "$st"
 fi
 
@@ -254,7 +254,7 @@ for _ in $(seq 1 30); do
 	sleep 2
 done
 TLS_SUBJECT="$(echo | openssl s_client -connect "$NODE_IP:$INGRESS_HTTPS_PORT" -servername "$HOST" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || true)"
-if [ "$TLS_BODY" = "$BACKEND_ID" ] && printf '%s' "$TLS_SUBJECT" | grep -q "CN *= *$HOST"; then
+if [ "$TLS_BODY" = "$BACKEND_ID" ] && grep -q "CN *= *$HOST" <<<"$TLS_SUBJECT"; then
 	ladder ok "m10.3-6  TLS from Secret terminates on :$INGRESS_HTTPS_PORT (SNI $HOST serves the Secret's cert, backend identity)"
 else
 	ladder no "m10.3-6  TLS from Secret terminates on :$INGRESS_HTTPS_PORT (body '${TLS_BODY:-}', subject '${TLS_SUBJECT:-none}')"

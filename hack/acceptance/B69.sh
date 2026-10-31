@@ -280,16 +280,16 @@ fi
 # every shipped artifact. Read the BUILT binary's module list, not the source.
 mods="$(go version -m "$KINE_NEW" || true)"
 dep_ok=true
-if printf '%s' "$mods" | grep -q 'github.com/mattn/go-sqlite3'; then
+if grep -q 'github.com/mattn/go-sqlite3' <<<"$mods"; then
 	echo "  the shipped kine still links github.com/mattn/go-sqlite3" >&2
 	dep_ok=false
 fi
-if ! printf '%s' "$mods" | grep -q 'modernc.org/sqlite'; then
+if ! grep -q 'modernc.org/sqlite' <<<"$mods"; then
 	echo "  the shipped kine links no modernc.org/sqlite — it has NO SQLite backend" >&2
 	dep_ok=false
 fi
 # ...and it must be gone from k3sm's own module graph too.
-if (cd "$REPO_ROOT" && go list -deps ./... 2>/dev/null | grep -q 'github.com/mattn/go-sqlite3'); then
+if (cd "$REPO_ROOT" && grep -q 'github.com/mattn/go-sqlite3' <<<"$(go list -deps ./... 2>/dev/null)"); then
 	echo "  k3sm itself imports github.com/mattn/go-sqlite3" >&2
 	dep_ok=false
 fi

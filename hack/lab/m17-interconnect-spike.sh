@@ -321,9 +321,9 @@ tbdevs="$(networksetup -listallhardwareports 2>/dev/null | awk '/^Hardware Port:
 tbm="" tba="" macs=""
 for m in $members; do
   macs="$macs $(ifconfig "$m" 2>/dev/null | awk '$1=="ether"{print $2; exit}')"
-  if printf '%s\n' "$tbdevs" | grep -qx "$m"; then
+  if grep -qx "$m" <<<"$tbdevs"; then
     tbm="$tbm $m"
-    ifconfig "$m" | grep -q 'status: active' && tba="$tba $m"
+    grep -q 'status: active' <<<"$(ifconfig "$m")" && tba="$tba $m"
   fi
 done
 echo "MEMBERS=$(echo $members)"
@@ -435,7 +435,7 @@ EOF
 # check_carrier <side> — a Thunderbolt member of bridge0 with carrier, read now.
 check_carrier() {
 	local out
-	out="$(on "$1" "tb=\$(networksetup -listallhardwareports | awk '/^Hardware Port:/{tb=(\$0 ~ /Thunderbolt/ && \$0 !~ /Bridge/)} /^Device:/{if(tb) print \$2; tb=0}'); for m in \$(ifconfig bridge0 | awk '\$1==\"member:\"{print \$2}'); do printf '%s\n' \"\$tb\" | grep -qx \"\$m\" && ifconfig \"\$m\" | grep -q 'status: active' && echo \"\$m\"; done" 2>/dev/null | tr '\n' ' ')"
+	out="$(on "$1" "tb=\$(networksetup -listallhardwareports | awk '/^Hardware Port:/{tb=(\$0 ~ /Thunderbolt/ && \$0 !~ /Bridge/)} /^Device:/{if(tb) print \$2; tb=0}'); for m in \$(ifconfig bridge0 | awk '\$1==\"member:\"{print \$2}'); do grep -qx \"\$m\" <<<\"\$tb\" && grep -q 'status: active' <<<\"\$(ifconfig \"\$m\")\" && echo \"\$m\"; done" 2>/dev/null | tr '\n' ' ')"
 	if [ -n "${out// /}" ]; then
 		ok "form $FORM carrier $1: Thunderbolt bridge0 member(s) with carrier: $out"
 	else
@@ -509,7 +509,7 @@ check_arp() {
 	mac="$(printf '%s\n' "$line" | awk '{print $4; exit}')"
 	if [ "$side" = local ]; then mine="$MACS_local" theirs="$MACS_peer"; else mine="$MACS_peer" theirs="$MACS_local"; fi
 	nm="$(norm_mac "$mac")"
-	if printf '%s\n' "$line" | grep -q permanent; then
+	if grep -q permanent <<<"$line"; then
 		bad "form $FORM arp $label on $side: a permanent entry for $dst ($mac): the self-ARP trap, nothing crosses the cable"
 	elif [ -z "$mac" ] || [ "$mac" = "(incomplete)" ] || [ "$mac" = no ] || [ "$mac" = entry ]; then
 		bad "form $FORM arp $label on $side: no resolved entry for $dst ($line)"
@@ -539,11 +539,11 @@ presence() {
 	local side="$1" tag="$2" f="$EVIDENCE_DIR/state-$FORM-$1-$2.txt" a h
 	PRES_MISS=""
 	for a in $3; do
-		awk '/^== /{sec=$2; next} sec=="ifconfig" && $1=="inet"{print $2}' "$f" | grep -qxF "$a" || PRES_MISS="$PRES_MISS alias:$a"
+		grep -qxF "$a" <<<"$(awk '/^== /{sec=$2; next} sec=="ifconfig" && $1=="inet"{print $2}' "$f")" || PRES_MISS="$PRES_MISS alias:$a"
 	done
 	for h in $4; do
-		awk '/^== /{sec=$2; next} sec=="netstat"' "$f" | awk "$IC_NETSTAT_AWK" |
-			awk -v d="$h" '$1==d && $3=="bridge0" && $2 !~ /L/' | grep -q . || PRES_MISS="$PRES_MISS route:$h"
+		grep -q . <<<"$(awk '/^== /{sec=$2; next} sec=="netstat"' "$f" | awk "$IC_NETSTAT_AWK" |
+			awk -v d="$h" '$1==d && $3=="bridge0" && $2 !~ /L/')" || PRES_MISS="$PRES_MISS route:$h"
 	done
 	echo "form $FORM $side $tag: aliases [$3] routes [$4] missing [${PRES_MISS# }]" >"$EVIDENCE_DIR/presence-$FORM-$side-$tag.txt"
 	echo "      presence $side $tag: missing [${PRES_MISS# }]"
