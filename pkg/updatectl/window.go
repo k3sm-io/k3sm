@@ -143,9 +143,15 @@ func (c *Controller) ensureManifest(ctx context.Context, u *updatesv1alpha1.Upda
 		if errors.Is(err, ErrRelease) {
 			return nil, rollFailure{err: err, reason: ReasonManifestMismatch}
 		}
-		prev := meta.FindStatusCondition(u.Status.Conditions, ConditionManifest)
-		c.setCondition(u, ConditionManifest, metav1.ConditionFalse, ReasonRetrying, err.Error())
-		if prev != nil && prev.Status == metav1.ConditionFalse && now.Sub(prev.LastTransitionTime.Time) > ResolveBound {
+		since := c.manifestFailureStart(u, now)
+		meta.SetStatusCondition(&u.Status.Conditions, metav1.Condition{
+			Type: ConditionManifest, Status: metav1.ConditionFalse, Reason: ReasonRetrying, Message: clipMessage(err.Error()),
+			ObservedGeneration: u.Generation, LastTransitionTime: metav1.NewTime(since),
+		})
+		// SetStatusCondition keeps a False condition's old transition time;
+		// write the clamped one.
+		meta.FindStatusCondition(u.Status.Conditions, ConditionManifest).LastTransitionTime = metav1.NewTime(since)
+		if now.Sub(since) > ResolveBound {
 			return nil, rollFailure{
 				err:    fmt.Errorf("the payload manifest could not be read within %s; last error: %w", ResolveBound, err),
 				reason: ReasonManifestMismatch,
@@ -176,8 +182,42 @@ func (c *Controller) ensureManifest(ctx context.Context, u *updatesv1alpha1.Upda
 		return nil, mismatch("compatibleFrom %q is not a release version", m.CompatibleFrom)
 	}
 	c.manifest = &releaseManifest{version: u.Spec.Version, digest: digest, raw: raw, m: m}
+	c.manifestFailingSince = time.Time{}
 	c.setCondition(u, ConditionManifest, metav1.ConditionTrue, ReasonManifestRead, "sha256:"+sha256Hex(raw))
 	return c.manifest, nil
+}
+
+// manifestClockLimit is how old a persisted Manifest condition's transition
+// time may be and still count as the start of a failure streak: a few
+// bounds, so a streak a restart interrupted keeps counting while a stale or
+// edited time does not end a roll at its first failure.
+const manifestClockLimit = 3 * ResolveBound
+
+// manifestFailureStart is when the current streak of transient manifest read
+// failures started. Within one controller run it is the time this run
+// fixed at its first failure. At that first failure it is the persisted
+// Manifest condition's transition time when the condition is False and the
+// time is neither in the future nor older than manifestClockLimit (a
+// controller restarted mid-streak keeps the bound); any other value, the
+// status being an input the controller does not vouch for, restarts the
+// clock at now. With no False condition (a new Update, or a read that
+// succeeded since) the streak starts now.
+func (c *Controller) manifestFailureStart(u *updatesv1alpha1.Update, now time.Time) time.Time {
+	prev := meta.FindStatusCondition(u.Status.Conditions, ConditionManifest)
+	if prev == nil || prev.Status != metav1.ConditionFalse {
+		// No streak recorded (a new Update, or the last read succeeded).
+		c.manifestFailingSince = now
+		return now
+	}
+	if !c.manifestFailingSince.IsZero() && !c.manifestFailingSince.After(now) {
+		return c.manifestFailingSince
+	}
+	since := now
+	if t := prev.LastTransitionTime.Time.UTC(); !t.After(now) && now.Sub(t) <= manifestClockLimit {
+		since = t
+	}
+	c.manifestFailingSince = since
+	return since
 }
 
 // sha256Hex is the lowercase hex sha256 of b.
@@ -294,7 +334,7 @@ func checkKubeMinorStep(m *certs.PayloadManifest, pending []*corev1.Node) error 
 		}
 	}
 	if len(unreadable) > 0 {
-		return fmt.Errorf("unreadable node Kubernetes version: %s; the release's Kubernetes step cannot be checked, so the update is refused until the node reports its version",
+		return fmt.Errorf("unreadable node Kubernetes version: %s; the release's Kubernetes step cannot be checked; repair the node so its kubelet reports a version, or remove it from the cluster, then create a new Update",
 			strings.Join(unreadable, ", "))
 	}
 	if len(bad) > 0 {

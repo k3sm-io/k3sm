@@ -129,6 +129,12 @@ type Controller struct {
 	// ensureManifest; a restarted controller reads it again. Only the loop
 	// goroutine touches it.
 	manifest *releaseManifest
+	// manifestFailingSince is when this controller run counts the current
+	// streak of transient manifest read failures from (zero: no streak). It
+	// is set on the first failure the run sees, from the Manifest condition
+	// when that time is plausible, and is never moved by a later status
+	// edit. Only the loop goroutine touches it.
+	manifestFailingSince time.Time
 }
 
 // New builds a Controller from cfg. Call Run to start it.

@@ -36,10 +36,15 @@ limitations under the License.
 // no archive, or whose manifest is missing, malformed, or names another
 // version or archive digest (ManifestMismatch) fails the roll before any node
 // is cordoned, as does a manifest that still cannot be read ResolveBound
-// after its first failed read (the Manifest condition records the read). A
+// after its first failed read (the Manifest condition records the read; a
+// recorded start in the future or older than three bounds is not trusted,
+// and the clock restarts at the first failure the controller sees). A
 // controller that restarts mid-roll reads the manifest again before its next
-// handover under the same bound; past it that node is failed in place, still
-// cordoned, and the roll stops with ManifestMismatch. So does the compatibility window: a node to be
+// handover under the same bound; past it a node not yet handed over is
+// failed in place, still cordoned, and the roll stops with ManifestMismatch.
+// A node already handed over whose request must be handed to it again keeps
+// its phase, its message says the re-handover was refused, and the roll
+// stops the same way. So does the compatibility window: a node to be
 // updated that runs a release older than the manifest's compatibleFrom, or
 // one that does not parse as a release, a release whose manifest says it
 // requires the installer, a release that raises a node's Kubernetes minor by

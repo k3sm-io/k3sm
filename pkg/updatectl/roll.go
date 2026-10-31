@@ -25,6 +25,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -601,7 +603,7 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 		// Someone moved the request; hand the node this Update's again.
 		var err error
 		if n, err = c.handover(ctx, u, n, now); err != nil {
-			return failHandover(e, at, err)
+			return refuseRehandover(e, err)
 		}
 	}
 	handedAt, ok := annotationTime(n, HandedOverAnnotation)
@@ -785,20 +787,57 @@ func (c *Controller) payload(u *updatesv1alpha1.Update) ([]byte, error) {
 	})
 }
 
-// failHandover records a definitive handover failure (a rollFailure, such as
-// a manifest that does not describe the release or could not be read within
-// ResolveBound) on the node's entry the way the other failures of a node in
-// progress are: the entry is Failed with the error, the node stays cordoned
-// for the operator, and the rollFailure is returned so the Update fails with
-// its reason and every later node stays Pending. A transient error is
-// returned as is, to be retried.
+// failHandover records a definitive failure of a node's first handover (a
+// rollFailure, such as a manifest that does not describe the release or
+// could not be read within ResolveBound) on its entry the way the other
+// failures of a node in progress are: the node was cordoned and never handed
+// over, so the entry is Failed with the error, the node stays cordoned for
+// the operator, and the rollFailure is returned so the Update fails with its
+// reason and every later node stays Pending. A transient error is returned
+// as is, to be retried.
 func failHandover(e *updatesv1alpha1.UpdateNodeStatus, at metav1.Time, err error) error {
 	var rf rollFailure
 	if !errors.As(err, &rf) {
 		return err
 	}
-	e.Phase, e.Message, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, "not handed over: "+err.Error(), &at
+	e.Phase, e.Message, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, "not handed over: "+clipMessage(err.Error()), &at
 	return err
+}
+
+// refuseRehandover records a definitive failure to hand a node its request
+// again (someone moved its k3sm.io/update-version). The node was already
+// handed over and may be downloading or installing, so its entry keeps its
+// phase, and the message says the re-handover was refused; the rollFailure
+// is returned so the Update fails with its reason. A transient error is
+// returned as is, to be retried.
+func refuseRehandover(e *updatesv1alpha1.UpdateNodeStatus, err error) error {
+	var rf rollFailure
+	if !errors.As(err, &rf) {
+		return err
+	}
+	e.Message = "re-handover refused: " + clipMessage(err.Error())
+	return err
+}
+
+// maxMessageBytes bounds an error's text where it enters a node entry's
+// message or a condition message.
+const maxMessageBytes = 256
+
+// clipMessage is s without control or format characters (an error can carry
+// text from the release host) and at most maxMessageBytes bytes, cut on a
+// rune boundary with "..." marking the cut.
+func clipMessage(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		if b.Len()+utf8.RuneLen(r) > maxMessageBytes-len("...") {
+			return b.String() + "..."
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // handover asks the node for the release: the version, the payload, its

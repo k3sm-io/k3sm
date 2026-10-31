@@ -27,9 +27,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 	"k3sm.io/k3sm/pkg/certs"
@@ -390,5 +392,116 @@ func TestHandoverManifestReadRetryIsBounded(t *testing.T) {
 	}
 	if c := meta.FindStatusCondition(u.Status.Conditions, ConditionManifest); c == nil || c.Status != "False" || c.Reason != ReasonRetrying {
 		t.Fatalf("Manifest condition %+v", c)
+	}
+}
+
+// TestRehandoverRefusalKeepsThePhase pins that a node already handed over,
+// whose request someone moved, is not marked as never handed over when its
+// re-handover is refused: its entry keeps its phase, the message says the
+// re-handover was refused, the node stays cordoned and the Update fails.
+func TestRehandoverRefusalKeepsThePhase(t *testing.T) {
+	r := newRig(t, threeNodes()...)
+	r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+	r.drive(r.controller(), func() bool {
+		return phases(r.update(updatesv1alpha1.UpdateName))["w1"] == updatesv1alpha1.UpdateNodePhaseDownloading
+	})
+	w1 := r.node("w1")
+	w1.Annotations[updatesv1alpha1.AnnotationUpdateVersion] = "v0.1.9"
+	if _, err := r.cs.CoreV1().Nodes().Update(context.Background(), w1, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r.resolver.mu.Lock()
+	r.resolver.manifestErr = fmt.Errorf("%w: the manifest asset was withdrawn", ErrRelease)
+	r.resolver.mu.Unlock()
+	// A restarted controller holds no manifest, so the re-handover reads it.
+	if _, err := r.controller().reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	u := r.update(updatesv1alpha1.UpdateName)
+	if u.Status.Phase != updatesv1alpha1.UpdatePhaseFailed || failedReason(u) != ReasonManifestMismatch {
+		t.Fatalf("phase %q reason %q", u.Status.Phase, failedReason(u))
+	}
+	for _, e := range u.Status.Nodes {
+		if e.Name != "w1" {
+			continue
+		}
+		if e.Phase != updatesv1alpha1.UpdateNodePhaseDownloading || !strings.Contains(e.Message, "re-handover refused") ||
+			strings.Contains(e.Message, "not handed over") {
+			t.Fatalf("w1 entry %+v", e)
+		}
+	}
+	if !r.node("w1").Spec.Unschedulable {
+		t.Fatal("w1 was uncordoned")
+	}
+}
+
+// TestManifestClockIsClamped pins the bound's clock against the persisted
+// Manifest condition: a transition time in the future or older than
+// manifestClockLimit restarts the clock at the first failure, a plausible
+// one carries a restarted controller's streak on, and within one run a
+// later edit of the condition does not move the clock.
+func TestManifestClockIsClamped(t *testing.T) {
+	ctx := context.Background()
+	newUpdate := func(r *rig, ltt time.Time) *updatesv1alpha1.Update {
+		u := &updatesv1alpha1.Update{Spec: updatesv1alpha1.UpdateSpec{Version: target}}
+		u.Status.Resolved = &updatesv1alpha1.UpdateResolved{Version: target, Digest: "sha256:" + targetSum}
+		u.Status.Conditions = []metav1.Condition{{
+			Type: ConditionManifest, Status: metav1.ConditionFalse, Reason: ReasonRetrying, Message: "seeded",
+			LastTransitionTime: metav1.NewTime(ltt),
+		}}
+		return u
+	}
+	transient := errors.New("connection reset by peer")
+	for _, tc := range []struct {
+		name     string
+		seed     time.Duration // relative to now
+		wantFail bool
+	}{
+		{name: "a future time restarts the clock", seed: time.Hour},
+		{name: "a stale time restarts the clock", seed: -(manifestClockLimit + time.Minute)},
+		{name: "a plausible time carries the streak on", seed: -(ResolveBound + time.Minute), wantFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t, threeNodes()...)
+			r.resolver.manifestErr = transient
+			c := r.controller()
+			u := newUpdate(r, r.now.Add(tc.seed))
+			_, err := c.ensureManifest(ctx, u, r.now)
+			var rf rollFailure
+			if failed := errors.As(err, &rf); failed != tc.wantFail {
+				t.Fatalf("err %v, want a roll failure %v", err, tc.wantFail)
+			}
+			if tc.wantFail {
+				return
+			}
+			cond := meta.FindStatusCondition(u.Status.Conditions, ConditionManifest)
+			if !cond.LastTransitionTime.Time.Equal(r.now) {
+				t.Fatalf("the clock starts at %s, want now %s", cond.LastTransitionTime, r.now)
+			}
+			// An edit within the run does not move the clock: the streak ends
+			// ResolveBound after the first failure, not after the edit.
+			cond.LastTransitionTime = metav1.NewTime(r.now.Add(-manifestClockLimit + time.Minute))
+			if _, err := c.ensureManifest(ctx, u, r.now.Add(time.Minute)); errors.As(err, &rf) {
+				t.Fatalf("an edited condition ended the roll early: %v", err)
+			}
+			if _, err := c.ensureManifest(ctx, u, r.now.Add(ResolveBound+time.Minute)); !errors.As(err, &rf) || rf.reason != ReasonManifestMismatch {
+				t.Fatalf("past the bound: err %v", err)
+			}
+		})
+	}
+}
+
+// TestClipMessage pins the bound and the character filter on error text
+// that enters a node message or a condition.
+func TestClipMessage(t *testing.T) {
+	if got := clipMessage("a\nb\x1b[31mc​d"); got != "ab[31mcd" {
+		t.Fatalf("clipMessage kept a control or format character: %q", got)
+	}
+	long := clipMessage(strings.Repeat("é", 400))
+	if len(long) > maxMessageBytes || !strings.HasSuffix(long, "...") || !utf8.ValidString(long) {
+		t.Fatalf("clipped to %d bytes: %q", len(long), long)
+	}
+	if got := clipMessage("short"); got != "short" {
+		t.Fatalf("clipMessage changed a short message: %q", got)
 	}
 }
