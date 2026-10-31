@@ -50,6 +50,13 @@ limitations under the License.
 // The state directory is outside the root: nothing the store writes in the root
 // is anything but the layout's own files.
 //
+// For garbage collection (pkg/ociregistry/gc), every mount, link and upload
+// commit runs under the same repository lock and touches the blob inode's
+// mtime there, so a blob's age is the time since a write last named it, on
+// disk, across restarts. Session files are created under that lock too, and
+// a write into a repository whose layout GC removed recreates it first. The
+// lock-holding view GC deletes through is Locked (WithLock).
+//
 // Every path is resolved through ref, and a symlink anywhere inside the store is
 // refused.
 package store
