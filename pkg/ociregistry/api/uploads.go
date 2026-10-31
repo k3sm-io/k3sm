@@ -42,6 +42,15 @@ func (s *Server) getBlob(w http.ResponseWriter, r *http.Request, n ref.Name) {
 	if !s.allow(w, r, VerbRead, n) {
 		return
 	}
+	// A HEAD is how a pushing client decides to skip an upload, so it
+	// restarts the blob's GC grace: the manifest PUT that follows finds the
+	// blob still there. A GET (a pull) writes nothing.
+	if r.Method == http.MethodHead {
+		if err := s.st.TouchBlob(r.Context(), n, d); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+	}
 	f, err := s.st.OpenBlob(n, d)
 	if err != nil {
 		s.fail(w, r, err)

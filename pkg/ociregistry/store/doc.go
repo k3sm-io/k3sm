@@ -53,7 +53,8 @@ limitations under the License.
 // For garbage collection (pkg/ociregistry/gc), every mount, link and upload
 // commit runs under the same repository lock and touches the blob inode's
 // mtime there, so a blob's age is the time since a write last named it, on
-// disk, across restarts. Session files are created under that lock too, and
+// disk, across restarts. TouchBlob, which a blob HEAD calls, does the same
+// for a blob a client found present and will name in a manifest. Session files are created under that lock too, and
 // a write into a repository whose layout GC removed recreates it first. The
 // lock-holding view GC deletes through is Locked (WithLock).
 //

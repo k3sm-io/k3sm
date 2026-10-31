@@ -37,7 +37,9 @@ limitations under the License.
 //     above), requires the blobs an image manifest names to be in the
 //     repository and never requires an index's children;
 //   - a blob GET goes through http.ServeContent, so Range, 206 and 416 are
-//     the standard library's;
+//     the standard library's; a blob HEAD restarts the blob's
+//     garbage-collection grace (store.TouchBlob), so a client that skips an
+//     upload on a HEAD hit finds the blob at its manifest PUT;
 //   - upload Location headers are path-only, a status GET answers 204 with
 //     Range "0-<n-1>", and both Blob-Upload-UUID and Docker-Upload-UUID are set;
 //   - a mount links the blob from the repository named by from and from no
