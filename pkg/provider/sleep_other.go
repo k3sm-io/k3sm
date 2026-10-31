@@ -31,6 +31,9 @@ func (unsupportedPowerHost) PreventSleep(string) (func() error, error) {
 	return nil, errPowerUnsupported
 }
 
+// PowerSource implements PowerHost; the source is unknown.
+func (unsupportedPowerHost) PowerSource() PowerSource { return PowerSourceUnknown }
+
 // WatchSleep implements PowerHost; it always fails.
 func (unsupportedPowerHost) WatchSleep(context.Context) (<-chan PowerNotice, error) {
 	return nil, errPowerUnsupported

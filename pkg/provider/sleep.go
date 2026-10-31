@@ -40,12 +40,17 @@ import (
 //     Mac on AC power does not idle-sleep under its pods. macOS ignores this
 //     assertion class on battery power and it never stops a forced sleep (the
 //     Apple menu's Sleep, a closed lid without an external display), so the
-//     node can still sleep, and when it does:
+//     node can still sleep, and the condition says which power source the Mac
+//     is on, so it never claims a protection macOS is not giving. When it does
+//     sleep:
 //   - The node reports it. On the system's will-sleep notice it publishes a
 //     Sleeping=True condition and a SystemSleep Event BEFORE acknowledging the
 //     notice, so the NotReady that follows carries a reason on the Node. On
 //     wake it publishes Sleeping=False and a SystemWake Event naming how long
-//     the Mac slept.
+//     the Mac slept. A dark wake (Power Nap, a maintenance wake) is not a
+//     wake: the host reports only a full wake, so Sleeping stays True through
+//     one and the reporter publishes nothing for it. A will-sleep that ends a
+//     dark wake finds the node already asleep and is acknowledged at once.
 //
 // The assertion and the notices come through PowerHost, the seam over IOKit's
 // power-management API (sleep_darwin.go); tests use a fake.
@@ -92,13 +97,29 @@ type PowerNotice struct {
 	Ack  func()
 }
 
+// PowerSource names the power source the Mac draws from.
+type PowerSource int
+
+const (
+	// PowerSourceUnknown is a source the host could not read.
+	PowerSourceUnknown PowerSource = iota
+	// PowerSourceAC is external power: the sleep assertion is honoured.
+	PowerSourceAC
+	// PowerSourceBattery is the internal battery: macOS ignores the assertion.
+	PowerSourceBattery
+	// PowerSourceUPS is a UPS reporting itself as one: external power.
+	PowerSourceUPS
+)
+
 // PowerHost is the host power-management seam the sleep reporter consumes.
 type PowerHost interface {
 	// PreventSleep takes a PreventSystemSleep assertion named name and returns
 	// the function that releases it.
 	PreventSleep(name string) (release func() error, err error)
-	// WatchSleep delivers the system's sleep and wake notices until ctx is
-	// done, then closes the channel.
+	// PowerSource reports the power source the Mac draws from now.
+	PowerSource() PowerSource
+	// WatchSleep delivers the system's sleep notices and its FULL wakes (never
+	// a dark wake) until ctx is done, then closes the channel.
 	WatchSleep(ctx context.Context) (<-chan PowerNotice, error)
 }
 
@@ -134,6 +155,7 @@ type SleepReporter struct {
 	publish func(ctx context.Context) error
 
 	mu        sync.Mutex
+	startedAt time.Time
 	held      bool
 	holdErr   error
 	asleep    bool
@@ -160,7 +182,9 @@ func NewSleepReporter(cfg SleepReporterConfig) (*SleepReporter, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &SleepReporter{nodeName: cfg.NodeName, recorder: rec, host: host, log: log, now: time.Now}, nil
+	r := &SleepReporter{nodeName: cfg.NodeName, recorder: rec, host: host, log: log, now: time.Now}
+	r.startedAt = r.now().Round(0)
+	return r, nil
 }
 
 // Run holds the sleep assertion and handles power notices until ctx is done,
@@ -227,6 +251,12 @@ func (r *SleepReporter) handle(ctx context.Context, n PowerNotice) {
 	switch n.Kind {
 	case PowerWillSleep:
 		r.mu.Lock()
+		if r.asleep {
+			// The end of a dark wake: the node never reported waking, so
+			// there is nothing to publish and the original sleep time stands.
+			r.mu.Unlock()
+			break
+		}
 		r.asleep = true
 		// Wall clock, monotonic reading stripped: the monotonic clock does not
 		// advance while a Mac sleeps, so only the wall clock measures the sleep.
@@ -271,8 +301,12 @@ func (r *SleepReporter) publishNow(ctx context.Context, bound time.Duration) {
 	}
 }
 
-// condition renders the Sleeping condition at now.
+// condition renders the Sleeping condition at now. LastTransitionTime is the
+// moment the state last flipped (the sleep, the wake, or the reporter's start),
+// never now, so it holds still across publications.
 func (r *SleepReporter) condition(now metav1.Time) corev1.NodeCondition {
+	// Read before taking mu: the host call is IPC to the power daemon.
+	src := r.host.PowerSource()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c := corev1.NodeCondition{
@@ -280,16 +314,18 @@ func (r *SleepReporter) condition(now metav1.Time) corev1.NodeCondition {
 		Status:             corev1.ConditionFalse,
 		Reason:             sleepAwakeReason,
 		LastHeartbeatTime:  now,
-		LastTransitionTime: now,
+		LastTransitionTime: metav1.NewTime(r.startedAt),
 	}
 	switch {
 	case r.asleep:
 		c.Status = corev1.ConditionTrue
 		c.Reason = sleepWillReason
+		c.LastTransitionTime = metav1.NewTime(r.sleptAt)
 		c.Message = fmt.Sprintf("the Mac began system sleep at %s; the node posts no status until it wakes", r.sleptAt.UTC().Format(time.RFC3339))
 		return c
 	case r.everWoken:
 		c.Reason = sleepWokeReason
+		c.LastTransitionTime = metav1.NewTime(r.wokeAt)
 		c.Message = fmt.Sprintf("the Mac woke from system sleep at %s", r.wokeAt.UTC().Format(time.RFC3339))
 		if r.sleptFor > 0 {
 			c.Message += fmt.Sprintf(" after %s", r.sleptFor.Round(time.Second))
@@ -298,9 +334,21 @@ func (r *SleepReporter) condition(now metav1.Time) corev1.NodeCondition {
 		c.Message = "the Mac is awake"
 	}
 	if r.held {
-		c.Message += "; the node holds a PreventSystemSleep assertion (honoured on AC power)"
+		c.Message += "; the node holds a PreventSystemSleep assertion, " + assertionEffect(src)
 	} else if r.holdErr != nil {
 		c.Message += fmt.Sprintf("; no sleep assertion is held: %v", r.holdErr)
 	}
 	return c
+}
+
+// assertionEffect says what the held assertion does on the given source:
+// macOS honours PreventSystemSleep on external power only.
+func assertionEffect(src PowerSource) string {
+	switch src {
+	case PowerSourceAC, PowerSourceUPS:
+		return "and the Mac is on external power, so it does not idle-sleep"
+	case PowerSourceBattery:
+		return "which macOS ignores on battery power: the Mac is on battery and can idle-sleep"
+	}
+	return "which macOS honours only on external power; the power source could not be read"
 }
