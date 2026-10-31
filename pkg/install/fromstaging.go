@@ -23,6 +23,8 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strings"
+
+	"k3sm.io/k3sm/pkg/updater/layout"
 )
 
 // `k3sm install --from-staging <dir>`: the install side of k3sm.app.
@@ -124,6 +126,11 @@ type StagingFS interface {
 	// MachO reports whether the regular file at path starts with a Mach-O or
 	// universal-binary magic number, opening it without following a symlink.
 	MachO(path string) (bool, error)
+	// ResolveInstalled returns the file the installed k3sm entry point path
+	// names (resolveInstalledBinary): path itself when it is not a symlink or
+	// does not exist, otherwise the regular file <dir>/versions/<v>/<base> it
+	// leads to. Anything else is an error.
+	ResolveInstalled(path string) (string, error)
 }
 
 // TeamIDReader reads and checks the code signature of a binary.
@@ -358,9 +365,16 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 			return err
 		}
 	}
+	// The installed k3sm is resolved once, here: the signature and the
+	// version compared below are then read from one file, however the entry
+	// point reaches it.
+	installed, err := cfg.StagingFS.ResolveInstalled(cfg.installedBinary())
+	if err != nil {
+		return fmt.Errorf("install: %w", err)
+	}
 	if cfg.developerModeOn() {
 		cfg.Logger.Warn(developerModeContinuityWarning)
-	} else if err := checkSigningContinuity(ctx, *cfg, entries); err != nil {
+	} else if err := checkSigningContinuity(ctx, *cfg, installed, entries); err != nil {
 		return err
 	}
 	// Not passed, a marker is there: does this tree turn developer mode off?
@@ -371,7 +385,54 @@ func preflightFromStaging(ctx context.Context, cfg *Config) error {
 	}
 	// Last, because it runs the installed binary: only a tree that passed
 	// every signing check gets that far.
-	return checkStagedVersion(*cfg)
+	return checkStagedVersion(*cfg, installed)
+}
+
+// errInstalledUnresolvable reports an installed k3sm entry point whose links do
+// not lead to one regular file of its own install tree.
+var errInstalledUnresolvable = errors.New("the installed k3sm does not resolve to a binary of its install tree")
+
+// resolveInstalledBinary is the one resolution of the installed k3sm the
+// --from-staging checks read through. path is the entry point
+// (installedBinary). A missing path, or one that is not a symlink, is returned
+// as it is, and the checks judge it there. A symlink must lead, with every
+// link followed, to a regular file named like path directly inside a version
+// directory of path's own (resolved) directory, <dir>/versions/<v>/<base>
+// with a valid <v>; a dangling link, a loop, a directory, another name or a
+// target outside that tree is errInstalledUnresolvable, never fs.ErrNotExist,
+// so a broken link is not mistaken for no install.
+//
+// The callers read only the returned path. Nothing stops the tree changing
+// after the resolve; that needs a write to the root-owned install directory.
+func resolveInstalledBinary(path string, lstat func(string) (fs.FileInfo, error), evalSymlinks func(string) (string, error)) (string, error) {
+	fi, err := lstat(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return path, nil
+	case err != nil:
+		return "", fmt.Errorf("%w: inspect %s: %v", errInstalledUnresolvable, path, err)
+	case fi.Mode()&fs.ModeSymlink == 0:
+		return path, nil
+	}
+	target, err := evalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", errInstalledUnresolvable, path, err)
+	}
+	tfi, err := lstat(target)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s -> %s: %v", errInstalledUnresolvable, path, target, err)
+	}
+	if !tfi.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: %s -> %s is not a regular file", errInstalledUnresolvable, path, target)
+	}
+	root, err := evalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return "", fmt.Errorf("%w: resolve the install root of %s: %v", errInstalledUnresolvable, path, err)
+	}
+	if _, ok := layout.New(root).VersionedBinary(target, filepath.Base(path)); !ok {
+		return "", fmt.Errorf("%w: %s -> %s is not %s in a version directory of %s", errInstalledUnresolvable, path, target, filepath.Base(path), root)
+	}
+	return filepath.Clean(target), nil
 }
 
 // requireTeamSignatures is --require-team-signature: the staged k3sm and every
@@ -426,8 +487,9 @@ const developerModeContinuityWarning = "developer mode: the staged build's signa
 // than one that runs unchecked. --require-team-signature
 // (requireTeamSignatures) refuses any tree without a team signature first,
 // whatever is installed.
-func checkSigningContinuity(ctx context.Context, cfg Config, entries []StagedEntry) error {
-	installed := cfg.installedBinary()
+//
+// installed is the installed k3sm as preflightFromStaging resolved it.
+func checkSigningContinuity(ctx context.Context, cfg Config, installed string, entries []StagedEntry) error {
 	installedTeam, err := cfg.Signer.TeamID(ctx, installed)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):

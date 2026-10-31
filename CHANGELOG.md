@@ -91,6 +91,10 @@ pin, its date, and the tarball's sha256.
   garbage-collection grace, so a client that skips pushing an index's child manifest because it
   is already there no longer loses the untagged child to a sweep before its index PUT.
 
+- An install from a k3sm.app staging directory resolves the installed `k3sm` once and reads its
+  signature and its version from that one file, so the two checks cannot judge different binaries
+  when the installed `k3sm` is a link into a version directory. A link that leads anywhere else is
+  refused.
 - `k3sm stop` and `k3sm uninstall` recognise a vm pod's `k3sm-vmhost` helper when it runs from
   a versioned install directory or through a symlinked install path, not only from the flat
   `/Library/k3sm/k3sm-vmhost`, so such a helper is still stopped instead of reported as unknown.

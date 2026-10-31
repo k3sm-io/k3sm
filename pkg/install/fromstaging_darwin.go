@@ -234,6 +234,11 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	return c.buf.Write(p)
 }
 
+// ResolveInstalled is resolveInstalledBinary over the real filesystem.
+func (DarwinStagingFS) ResolveInstalled(path string) (string, error) {
+	return resolveInstalledBinary(path, os.Lstat, filepath.EvalSymlinks)
+}
+
 // MachO reports whether the regular file at path starts with a Mach-O magic
 // number (thin, either byte order, 32- or 64-bit) or a universal-binary one.
 // It opens path with O_NOFOLLOW and reads four bytes. A file shorter than
