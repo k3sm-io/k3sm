@@ -80,3 +80,40 @@ func TestIOKitSleepAssertionHeldAndReleased(t *testing.T) {
 		t.Fatal("the sleep watcher did not stop")
 	}
 }
+
+// TestIOKitSleepWatcherStopsAtOnce starts the IOKit sleep watcher and stops it
+// immediately, 200 times, each stop bounded: a stop that lands before the
+// watcher's run loop is running must not be lost, or the node's shutdown
+// hangs on the watcher thread.
+func TestIOKitSleepWatcherStopsAtOnce(t *testing.T) {
+	host := newPowerHost()
+	for i := 0; i < 200; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		notices, err := host.WatchSleep(ctx)
+		if err != nil {
+			cancel()
+			t.Fatalf("round %d: WatchSleep: %v", i, err)
+		}
+		cancel()
+		deadline := time.After(5 * time.Second)
+	drain:
+		for {
+			select {
+			case _, ok := <-notices:
+				if !ok {
+					break drain
+				}
+			case <-deadline:
+				t.Fatalf("round %d: the sleep watcher did not stop within 5s", i)
+			}
+		}
+	}
+}
+
+// TestIOKitPowerSourceIsRead checks the host reads a power source: every Mac
+// draws from AC, battery or a UPS.
+func TestIOKitPowerSourceIsRead(t *testing.T) {
+	if src := newPowerHost().PowerSource(); src == PowerSourceUnknown {
+		t.Fatal("IOPSGetProvidingPowerSourceType returned no source")
+	}
+}
