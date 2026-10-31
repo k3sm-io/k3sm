@@ -22,6 +22,7 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/helmchart"
+	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
@@ -183,8 +184,12 @@ func artifactManifest(cfg Config) []artifact {
 	// root, and the reverse uninstall walk boots it out last of the three.
 	// assertExists is false because a Mac that never asked for a volume has no
 	// such plist, and one that just asked for its first has none yet either.
-	if cfg.dataVolumeDeclared {
-		items = append(items, artifact{kind: kindDaemon, disp: dispRemove, label: DatavolLabel, path: cfg.plistPath(DatavolLabel), oneshot: true, assertExists: false})
+	// The jobs come from pkg/install/order, the one definition of the start
+	// order the installer and the updater share: its oneshots lead it.
+	jobs := order.Start(orderRole(cfg.Role), cfg.dataVolumeDeclared)
+	for len(jobs) > 0 && jobs[0].Oneshot {
+		items = append(items, artifact{kind: kindDaemon, disp: dispRemove, label: jobs[0].Label, path: cfg.plistPath(jobs[0].Label), oneshot: true, assertExists: false})
+		jobs = jobs[1:]
 	}
 	// The staged join token, for an agent node only, and REMOVED on uninstall
 	// unlike everything else under the preserved data root. It is a credential
@@ -286,10 +291,10 @@ func artifactManifest(cfg Config) []artifact {
 	// ever in a manifest — a Mac that carried both would register two nodes out
 	// of one data root — and the position is the same either way, because both
 	// depend on the helper netd bootstraps first.
+	for _, j := range jobs {
+		items = append(items, artifact{kind: kindDaemon, disp: dispRemove, label: j.Label, path: cfg.plistPath(j.Label), assertExists: true})
+	}
 	items = append(items, []artifact{
-		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
-		{kind: kindDaemon, disp: dispRemove, label: daemonLabel(cfg.Role), path: cfg.plistPath(daemonLabel(cfg.Role)), assertExists: true},
-
 		// The admin kubeconfig in the human's home — preserved (it may hold other
 		// clusters; k3sm never owns the whole file).
 		{kind: kindKubeconfig, disp: dispPreserve, user: cfg.TargetUser},
@@ -329,6 +334,14 @@ func artifactManifest(cfg Config) []artifact {
 		{kind: kindDir, disp: dispRemove, path: ContainerLogsDir, assertExists: false},
 	}...)
 	return items
+}
+
+// orderRole maps an install role onto the restart order's role.
+func orderRole(r Role) order.Role {
+	if r == RoleAgent {
+		return order.Agent
+	}
+	return order.Server
 }
 
 // carriesServerDaemon reports whether the manifest tears down the control-plane

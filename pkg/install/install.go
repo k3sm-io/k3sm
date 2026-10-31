@@ -50,30 +50,31 @@ import (
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// Reverse-DNS launchd labels for the two daemons (io.k3sm.* per the project
-// conventions). netd is root; server runs as the _k3sm service user.
+// Reverse-DNS launchd labels for the daemons (io.k3sm.* per the project
+// conventions); their home, and their start order, is pkg/install/order.
 const (
 	// NetdLabel is the root privileged-network helper LaunchDaemon.
-	NetdLabel = "io.k3sm.netd"
+	NetdLabel = order.NetdLabel
 	// ServerLabel is the control-plane LaunchDaemon (UserName=_k3sm).
-	ServerLabel = "io.k3sm.server"
+	ServerLabel = order.ServerLabel
 	// AgentLabel is the joining-worker LaunchDaemon (UserName=_k3sm): `k3sm
 	// agent`, the node half of the distribution on a Mac that has no control
 	// plane of its own. It is the SIBLING of ServerLabel, never its companion —
 	// a node carries one or the other, which is what RoleServer/RoleAgent
 	// decide and what Install refuses to blur.
-	AgentLabel = "io.k3sm.agent"
+	AgentLabel = order.AgentLabel
 	// DatavolLabel is the data-volume mount LaunchDaemon. It is root, it is a
 	// ONESHOT (`k3sm datavol mount` mounts and exits), and it exists because
 	// launchd offers no ordering: netd and the server would otherwise race disk
 	// arbitration for the volume their data root lives on. See DatavolPlist.
-	DatavolLabel = "io.k3sm.datavol"
+	DatavolLabel = order.DatavolLabel
 )
 
 // Leaf values shared with the runtime packages; their home is pkg/defaults.
@@ -408,12 +409,7 @@ func RoleFromPlists(serverPresent, agentPresent bool) (Role, bool) {
 // daemonLabel is the LaunchDaemon label a role's node daemon carries. It is a
 // function rather than a method because Role is an alias for a type this
 // package does not define, and the LABELS are this package's own.
-func daemonLabel(r Role) string {
-	if r == RoleAgent {
-		return AgentLabel
-	}
-	return ServerLabel
-}
+func daemonLabel(r Role) string { return orderRole(r).NodeLabel() }
 
 // EntryKind is what an OwnedEntry IS, stated explicitly rather than left to a
 // caller to re-derive from the type bits.

@@ -29,6 +29,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/nodecred"
 )
 
@@ -224,7 +225,7 @@ func (w bringUpWindow) since(label string) time.Time {
 // the manifest position, because the manifest carries whichever of the two this
 // role installs and a positional rule would silently mean something else on the
 // other role.
-func isNodeDaemon(label string) bool { return label == ServerLabel || label == AgentLabel }
+func isNodeDaemon(label string) bool { return order.IsNodeDaemon(label) }
 
 // awaitNetdServing blocks until the netd helper ANSWERS on its unix socket, and
 // is the gap between the two daemons the restart sequence used to leave open.
