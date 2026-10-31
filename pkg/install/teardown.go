@@ -514,10 +514,13 @@ func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, svcUID uint32) (bo
 //   - the flat installed path (installedVMHost), which in the versioned layout
 //     is a compatibility symlink;
 //   - the same name through the current symlink (<InstallDir>/current/<name>);
-//   - the name directly inside a version directory
+//   - the name directly inside a retained version directory
 //     (<InstallDir>/versions/<ver>/<name>), where the runtime's symlink-resolved
-//     lookup lands, current or not: a helper started before a flip still runs
-//     from the version it was started in;
+//     lookup lands: <ver> must be the version current or previous points at
+//     now, so a helper started before a flip still matches while its version
+//     is kept as previous, and a version the tree no longer retains, however
+//     validly named, is refused. Without a current link (the flat layout) no
+//     version directory is accepted;
 //   - the flat installed path with every symlink resolved, read only when the
 //     forms above do not match.
 //
@@ -537,8 +540,8 @@ func isInstalledVMHost(sys System, cfg Config, exe string) bool {
 	if through, err := tree.Binary(VMHostName); err == nil && exe == through {
 		return true
 	}
-	if _, ok := tree.VersionedBinary(exe, VMHostName); ok {
-		return true
+	if ver, ok := tree.VersionedBinary(exe, VMHostName); ok {
+		return retainedVersion(sys, tree, ver)
 	}
 	resolved, err := sys.ResolvePath(installed)
 	if err != nil {
@@ -549,6 +552,19 @@ func isInstalledVMHost(sys System, cfg Config, exe string) bool {
 		return false
 	}
 	return exe == resolved && filepath.Base(resolved) == VMHostName
+}
+
+// retainedVersion reports whether ver is the version the tree's current or
+// previous link points at. A link that is missing or does not read exactly
+// versions/<ver> retains nothing.
+func retainedVersion(sys System, tree layout.Layout, ver string) bool {
+	if v, err := tree.ResolveActive(sys.Readlink); err == nil && v == ver {
+		return true
+	}
+	if v, err := tree.ResolvePrevious(sys.Readlink); err == nil && v == ver {
+		return true
+	}
+	return false
 }
 
 // vmHelperStop is one helper the teardown sent SIGTERM, and how long it gets.

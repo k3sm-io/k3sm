@@ -2257,6 +2257,9 @@ func (darwinSystem) FlushMeshPFAnchor() error {
 // ResolvePath resolves every symlink in path.
 func (darwinSystem) ResolvePath(path string) (string, error) { return filepath.EvalSymlinks(path) }
 
+// Readlink reads one symlink's target.
+func (darwinSystem) Readlink(path string) (string, error) { return os.Readlink(path) }
+
 // StatNoFollow lstats path.
 func (darwinSystem) StatNoFollow(path string) (PathStat, error) {
 	var st unix.Stat_t
