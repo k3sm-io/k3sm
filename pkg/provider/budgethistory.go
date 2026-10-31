@@ -17,6 +17,7 @@ limitations under the License.
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,9 +89,15 @@ import (
 // eviction path, which, like the kubelet's own eviction, does not consult
 // PodDisruptionBudgets.
 //
-// Every write replaces the file atomically. A write failure is returned to the
-// caller and logged there; the in-memory state stays authoritative for this
-// run. An unreadable or unrecognised file is moved aside (the last
+// No provider hot path waits on the disk. Every mutation changes the state in
+// memory under the state lock and signals one writer goroutine (run), started
+// with the provider's run context, which writes a snapshot of the latest state,
+// so a burst of mutations coalesces into one write. Every write replaces the
+// file atomically. A write failure is logged and retried; the in-memory state
+// stays authoritative for this run. The one ordering guarantee is the emergency
+// eviction's: it asks the writer to flush and waits up to budgetIntentWriteBound
+// for its intent to reach disk before the kill. On shutdown the writer makes
+// one final flush, bounded by budgetHistoryFinalFlushBound. An unreadable or unrecognised file is moved aside (the last
 // budgetHistoryAsideMax are kept) and the history starts empty: the totals then
 // restart at 0, as a counter does after a reset. A history dir that cannot be
 // prepared or written degrades to an in-memory history with a Warn log: the
@@ -118,6 +125,10 @@ const (
 	// budgetIntentWriteBound is how long the emergency eviction waits for its
 	// intent to reach disk before it kills anyway (recordStopIntentWithin).
 	budgetIntentWriteBound = 250 * time.Millisecond
+	// budgetHistoryFinalFlushBound bounds the writer's final flush on shutdown.
+	budgetHistoryFinalFlushBound = 2 * time.Second
+	// budgetHistoryRetryInterval is how often the writer retries a failed write.
+	budgetHistoryRetryInterval = 30 * time.Second
 )
 
 // budgetHistoryAsideInfix names a moved-aside unreadable history:
@@ -186,19 +197,24 @@ type historyState struct {
 // records nothing and reports zeros, which is what a node with no work dir
 // (a standalone `k3sm node`) runs with.
 //
-// Locking: mu guards st and seq and is held only for in-memory work, never
-// across a file write. writeMu serialises the writes; it is taken before mu and
-// each write marshals the state current when it holds writeMu, so a later write
-// never lands an older state.
+// Locking: mu guards every field below it and is held only for in-memory work,
+// never across a file write. Only the writer goroutine (run) writes the file
+// after open; it marshals the state under mu and writes outside it.
 type BudgetHistory struct {
-	path  string // "" keeps the history in memory only
-	log   *slog.Logger
-	write func(path string, data []byte, mode os.FileMode) error
+	path string // "" keeps the history in memory only
+	log  *slog.Logger
 
-	writeMu sync.Mutex
+	dirty   chan struct{} // capacity 1: a pending-write signal, coalesced
+	once    sync.Once     // starts run once
+	stopped chan struct{} // closed when run returns
+
 	mu      sync.Mutex
 	st      historyState
-	seq     uint64
+	seq     uint64        // entry order, for retainPods marks
+	gen     uint64        // bumped by every mutation
+	written uint64        // the gen the file last held
+	wrote   chan struct{} // closed and replaced after each successful write
+	write   func(path string, data []byte, mode os.FileMode) error
 }
 
 // OpenBudgetHistory opens (creating it if needed) the history in dir, which it
@@ -211,7 +227,10 @@ func OpenBudgetHistory(dir, fingerprint string, log *slog.Logger) *BudgetHistory
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	h := &BudgetHistory{log: log, write: atomicfile.Replace}
+	h := &BudgetHistory{
+		log: log, write: atomicfile.Replace,
+		dirty: make(chan struct{}, 1), stopped: make(chan struct{}), wrote: make(chan struct{}),
+	}
 	memoryOnly := func(why string, err error) *BudgetHistory {
 		log.Warn("budget history: keeping the history in memory only; its counters restart at 0 on the next start",
 			"dir", dir, "why", why, "err", err)
@@ -252,7 +271,13 @@ func OpenBudgetHistory(dir, fingerprint string, log *slog.Logger) *BudgetHistory
 		st.Fingerprint = fingerprint
 	}
 	h.st = st
-	if err := h.persist(); err != nil {
+	// The one direct write, before the writer runs: it proves the file
+	// writable at startup, and nothing else touches h yet.
+	data, err := json.Marshal(&h.st)
+	if err == nil {
+		err = h.write(h.path, data, 0o600)
+	}
+	if err != nil {
 		return memoryOnly("the history file cannot be written", err)
 	}
 	return h
@@ -380,23 +405,136 @@ func keepLast[T any](s []T, n int) []T {
 	return s
 }
 
-// persist writes the current state. It must not be called with h.mu held.
-func (h *BudgetHistory) persist() error {
-	if h.path == "" {
-		return nil
+// changedLocked records that the state changed and signals the writer.
+// Caller holds h.mu.
+func (h *BudgetHistory) changedLocked() {
+	h.gen++
+	h.signal()
+}
+
+// signal wakes the writer without blocking: a signal already pending covers
+// this change too, because the writer snapshots the latest state.
+func (h *BudgetHistory) signal() {
+	if h.dirty == nil {
+		return
 	}
-	h.writeMu.Lock()
-	defer h.writeMu.Unlock()
+	select {
+	case h.dirty <- struct{}{}:
+	default:
+	}
+}
+
+// start runs the writer until ctx ends. It is idempotent, and a nil or
+// in-memory history has no writer.
+func (h *BudgetHistory) start(ctx context.Context) {
+	if h == nil || h.path == "" {
+		return
+	}
+	h.once.Do(func() { go h.run(ctx) })
+}
+
+// run is the writer: one write per coalesced signal, a retry of a failed write
+// every budgetHistoryRetryInterval, and on ctx's end one final flush bounded by
+// budgetHistoryFinalFlushBound. A write in progress when ctx ends finishes
+// first; run's goroutine is nobody's critical path, so a hung write delays
+// only its own exit.
+func (h *BudgetHistory) run(ctx context.Context) {
+	defer close(h.stopped)
+	retry := time.NewTicker(budgetHistoryRetryInterval)
+	defer retry.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			h.finalFlush()
+			return
+		case <-h.dirty:
+			h.writeOnce()
+		case <-retry.C:
+			if h.pending() {
+				h.writeOnce()
+			}
+		}
+	}
+}
+
+// finalFlush writes a pending state, waiting at most
+// budgetHistoryFinalFlushBound. A write past the bound is left to finish on its
+// own goroutine, which ends with the write.
+func (h *BudgetHistory) finalFlush() {
+	if !h.pending() {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.writeOnce()
+	}()
+	t := time.NewTimer(budgetHistoryFinalFlushBound)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+		h.log.Warn("budget history: the final flush did not finish in time; the latest changes may be lost",
+			"bound", budgetHistoryFinalFlushBound)
+	}
+}
+
+// pending reports whether the file is behind the in-memory state.
+func (h *BudgetHistory) pending() bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.written < h.gen
+}
+
+// writeOnce writes a snapshot of the current state.
+func (h *BudgetHistory) writeOnce() {
+	h.mu.Lock()
+	gen, write := h.gen, h.write
 	data, err := json.Marshal(&h.st)
 	h.mu.Unlock()
+	if err == nil {
+		err = write(h.path, data, 0o600)
+	}
 	if err != nil {
-		return fmt.Errorf("encode budget history: %w", err)
+		h.log.Warn("budget history: could not write the history; retrying", "path", h.path, "err", err)
+		return
 	}
-	if err := h.write(h.path, data, 0o600); err != nil {
-		return fmt.Errorf("write budget history: %w", err)
+	h.mu.Lock()
+	if gen > h.written {
+		h.written = gen
 	}
-	return nil
+	close(h.wrote)
+	h.wrote = make(chan struct{})
+	h.mu.Unlock()
+}
+
+// flush asks the writer to write the current state and waits at most bound for
+// it to reach disk. It reports whether it did; an in-memory history has
+// nothing to wait for.
+func (h *BudgetHistory) flush(bound time.Duration) bool {
+	if h == nil || h.path == "" {
+		return true
+	}
+	h.mu.Lock()
+	target := h.gen
+	h.mu.Unlock()
+	h.signal()
+	t := time.NewTimer(bound)
+	defer t.Stop()
+	for {
+		h.mu.Lock()
+		if h.written >= target {
+			h.mu.Unlock()
+			return true
+		}
+		wrote := h.wrote
+		h.mu.Unlock()
+		select {
+		case <-wrote:
+		case <-t.C:
+			return false
+		}
+	}
 }
 
 // recordLocked counts one event of reason for band: the total and the ring.
@@ -420,34 +558,29 @@ func (h *BudgetHistory) recordLocked(band budgetv1alpha1.Band, reason budgetv1al
 	h.st.Ring = keepLast(append(h.st.Ring, historyEvent{At: now.Unix(), Band: band, Reason: reason}), budgetHistoryRingMax)
 }
 
-// record counts one event and persists it.
-func (h *BudgetHistory) record(band budgetv1alpha1.Band, reason budgetv1alpha1.CounterReason, now time.Time) error {
+// record counts one event; the writer persists it.
+func (h *BudgetHistory) record(band budgetv1alpha1.Band, reason budgetv1alpha1.CounterReason, now time.Time) {
 	if h == nil {
-		return nil
+		return
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.recordLocked(band, reason, now)
-	h.mu.Unlock()
-	return h.persist()
+	h.changedLocked()
 }
 
 // noteIntent records in memory that k3sm is about to stop pod (container
-// empty: every container of it). The caller persists it (persist) before the
-// stop is issued.
-func (h *BudgetHistory) noteIntent(pod types.UID, container string) {
+// empty: every container of it), before the stop is issued; the writer
+// persists it.
+func (h *BudgetHistory) recordIntent(pod types.UID, container string) {
+	if h == nil {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.seq++
 	h.st.Intents = keepLast(append(h.st.Intents, killIntent{Pod: pod, Container: container, seq: h.seq}), budgetIntentMax)
-}
-
-// recordIntent records and persists a stop intent (noteIntent, then persist).
-func (h *BudgetHistory) recordIntent(pod types.UID, container string) error {
-	if h == nil {
-		return nil
-	}
-	h.noteIntent(pod, container)
-	return h.persist()
+	h.changedLocked()
 }
 
 // mark returns the current entry sequence: an entry recorded after it has a
@@ -462,24 +595,22 @@ func (h *BudgetHistory) mark() uint64 {
 }
 
 // retainPods drops every intent and classified termination recorded at or
-// before mark whose pod live does not hold, and persists when anything went.
+// before mark whose pod live does not hold; the writer persists the result.
 // live is the provider's pod set read after mark was taken; an entry recorded
 // after mark is kept, so a pod tracked between the read and this call keeps
 // its intent.
-func (h *BudgetHistory) retainPods(live map[types.UID]bool, mark uint64) error {
+func (h *BudgetHistory) retainPods(live map[types.UID]bool, mark uint64) {
 	if h == nil {
-		return nil
+		return
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	ni, ns := len(h.st.Intents), len(h.st.Seen)
 	h.st.Intents = filterInPlace(h.st.Intents, func(i killIntent) bool { return i.seq > mark || live[i.Pod] })
 	h.st.Seen = filterInPlace(h.st.Seen, func(s seenExit) bool { return s.seq > mark || live[s.Pod] })
-	changed := ni != len(h.st.Intents) || ns != len(h.st.Seen)
-	h.mu.Unlock()
-	if !changed {
-		return nil
+	if ni != len(h.st.Intents) || ns != len(h.st.Seen) {
+		h.changedLocked()
 	}
-	return h.persist()
 }
 
 func filterInPlace[T any](s []T, keep func(T) bool) []T {
@@ -502,20 +633,19 @@ func filterInPlace[T any](s []T, keep func(T) bool) []T {
 // remembered (nothing to dedupe). The classified-termination list is consulted
 // before anything changes, so a re-delivered exit neither counts again nor
 // consumes a later intent.
-func (h *BudgetHistory) observeExit(band budgetv1alpha1.Band, pod types.UID, container string, key terminationKey, term *corev1.ContainerStateTerminated, now time.Time) error {
+func (h *BudgetHistory) observeExit(band budgetv1alpha1.Band, pod types.UID, container string, key terminationKey, term *corev1.ContainerStateTerminated, now time.Time) {
 	if h == nil || term == nil {
-		return nil
+		return
 	}
 	kill := term.Reason == oomKilledReason || term.ExitCode == evictedExitCode
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if !kill && !h.coversLocked(pod, container) {
-		h.mu.Unlock()
-		return nil
+		return
 	}
 	for _, s := range h.st.Seen {
 		if s.Pod == pod && s.Container == container && s.RestartCount == key.restartCount && s.FinishedAt == key.finishedAt {
-			h.mu.Unlock()
-			return nil
+			return
 		}
 	}
 	h.seq++
@@ -529,8 +659,7 @@ func (h *BudgetHistory) observeExit(band budgetv1alpha1.Band, pod types.UID, con
 	case term.ExitCode == evictedExitCode && !covered:
 		h.recordLocked(band, budgetv1alpha1.CounterKernelKill, now)
 	}
-	h.mu.Unlock()
-	return h.persist()
+	h.changedLocked()
 }
 
 // coversLocked reports whether an unconsumed intent covers pod's container.
@@ -659,40 +788,29 @@ func binaryIdentity(info version.Info) string {
 	return id
 }
 
-// recordStopIntent persists, before k3sm stops pod (container empty: the whole
-// pod), that the stop is k3sm's. A failed write is logged and the stop goes
-// ahead: the in-memory intent still covers the exit in this run, and the cost
-// after a restart is a later exit 137 counted as a SIGKILL k3sm did not send.
+// recordStopIntent records, before k3sm stops pod (container empty: the whole
+// pod), that the stop is k3sm's. It is in memory at once and covers the exit in
+// this run; the writer persists it shortly after. A provider restart in that
+// window costs a later exit 137 counted as a SIGKILL k3sm did not send.
 func (r *runtimedRuntime) recordStopIntent(pod *corev1.Pod, container string) {
 	if r.history == nil || pod == nil {
 		return
 	}
-	if err := r.history.recordIntent(pod.UID, container); err != nil {
-		r.log.Warn("budget history: could not persist a stop intent", "pod", podKey(pod.Namespace, pod.Name), "container", container, "err", err)
-	}
+	r.history.recordIntent(pod.UID, container)
 }
 
-// recordStopIntentWithin is recordStopIntent for a stop that must not wait on
-// the disk (the emergency eviction): the intent is recorded in memory at once,
-// and the write is waited for at most bound. A write that completes in time
-// keeps intent-before-kill ordering on disk; one that does not is left to
-// finish on its own (its goroutine ends with the write) and the stop proceeds.
+// recordStopIntentWithin is recordStopIntent for the emergency eviction, which
+// keeps intent-before-kill ordering on disk when the disk allows it: the intent
+// is recorded in memory, then the writer is asked to flush and the call waits
+// at most bound. A flush that does not finish in time is logged and the stop
+// proceeds.
 func (r *runtimedRuntime) recordStopIntentWithin(pod *corev1.Pod, container string, bound time.Duration) {
 	if r.history == nil || pod == nil {
 		return
 	}
-	r.history.noteIntent(pod.UID, container)
-	done := make(chan error, 1)
-	go func() { done <- r.history.persist() }()
-	t := time.NewTimer(bound)
-	defer t.Stop()
-	select {
-	case err := <-done:
-		if err != nil {
-			r.log.Warn("budget history: could not persist a stop intent", "pod", podKey(pod.Namespace, pod.Name), "container", container, "err", err)
-		}
-	case <-t.C:
-		r.log.Warn("budget history: the stop intent write is slow; stopping without waiting for it",
+	r.history.recordIntent(pod.UID, container)
+	if !r.history.flush(bound) {
+		r.log.Warn("budget history: the stop intent did not reach disk in time; stopping without waiting for it",
 			"pod", podKey(pod.Namespace, pod.Name), "container", container, "bound", bound)
 	}
 }
@@ -701,6 +819,11 @@ func (r *runtimedRuntime) recordStopIntentWithin(pod *corev1.Pod, container stri
 // neither listed (a successful apiserver list of this node's pods) nor the
 // provider's tracked pods. mark is the history's mark taken before the list
 // was read.
+//
+// It runs on the orphan reaper's tick, so a node with no apiserver client never
+// prunes by pod lifetime. Its ledger is still bounded: budgetIntentMax and
+// budgetSeenMax drop the oldest entry first, which is pruning by age at the
+// caps.
 func (r *runtimedRuntime) pruneBudgetHistory(listed map[string]bool, mark uint64) {
 	if r.history == nil {
 		return
@@ -714,9 +837,7 @@ func (r *runtimedRuntime) pruneBudgetHistory(listed map[string]bool, mark uint64
 		live[types.UID(id)] = true
 	}
 	r.mu.Unlock()
-	if err := r.history.retainPods(live, mark); err != nil {
-		r.log.Warn("budget history: could not persist the pruned history", "err", err)
-	}
+	r.history.retainPods(live, mark)
 }
 
 // recordBudgetEvent counts one event of reason in pod's band.
@@ -724,9 +845,7 @@ func (r *runtimedRuntime) recordBudgetEvent(pod *corev1.Pod, reason budgetv1alph
 	if r.history == nil || pod == nil {
 		return
 	}
-	if err := r.history.record(bandOf(pod), reason, r.clk.Now()); err != nil {
-		r.log.Warn("budget history: could not persist an event", "reason", string(reason), "err", err)
-	}
+	r.history.record(bandOf(pod), reason, r.clk.Now())
 }
 
 // observeBudgetExits hands every terminated container of rs to the history
@@ -744,10 +863,7 @@ func (r *runtimedRuntime) observeBudgetExits(pod *corev1.Pod, rs *runtimev1.PodS
 				continue
 			}
 			key := terminationKey{restartCount: cs.GetRestartCount(), exitCode: term.ExitCode, finishedAt: term.FinishedAt.UnixNano()}
-			if err := r.history.observeExit(band, pod.UID, cs.GetName(), key, term, now); err != nil {
-				r.log.Warn("budget history: could not persist a classified exit",
-					"pod", podKey(pod.Namespace, pod.Name), "container", cs.GetName(), "err", err)
-			}
+			r.history.observeExit(band, pod.UID, cs.GetName(), key, term, now)
 		}
 	}
 }

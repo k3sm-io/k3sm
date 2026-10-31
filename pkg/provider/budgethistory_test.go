@@ -17,6 +17,7 @@ limitations under the License.
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -58,7 +59,25 @@ func openHistory(t *testing.T, dir, fingerprint string) *BudgetHistory {
 	if h.path == "" {
 		t.Fatalf("OpenBudgetHistory(%s) degraded to memory only", dir)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	h.start(ctx)
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-h.stopped:
+		case <-time.After(10 * time.Second):
+			t.Errorf("the budget history writer did not stop")
+		}
+	})
 	return h
+}
+
+// flushHistory waits for h's state to reach disk.
+func flushHistory(t *testing.T, h *BudgetHistory) {
+	t.Helper()
+	if !h.flush(10 * time.Second) {
+		t.Fatalf("the budget history did not flush")
+	}
 }
 
 // exitStatus is a runtimed status for pod id whose container c0 terminated
@@ -154,6 +173,7 @@ func TestBudgetHistorySurvivesProviderRestart(t *testing.T) {
 	check(t, h.r.history, clk.Now())
 
 	// The provider restarts: a new runtime over the same work dir.
+	flushHistory(t, h.r.history)
 	r2, _, clk2 := newRestartFake(t)
 	clk2.SetTime(clk.Now().Add(2 * time.Minute))
 	r2.history = openHistory(t, dir, "fp-1")
@@ -185,10 +205,9 @@ func TestBudgetHistorySurvivesProviderRestart(t *testing.T) {
 	// binary or policy change; the totals stay.
 	r2.history.mu.Lock()
 	r2.history.st.ArmingEpisodes = 2
+	r2.history.changedLocked()
 	r2.history.mu.Unlock()
-	if err := r2.history.persist(); err != nil {
-		t.Fatal(err)
-	}
+	flushHistory(t, r2.history)
 	if got := openHistory(t, dir, "fp-1").ArmingEpisodes(); got != 2 {
 		t.Errorf("armingEpisodes under the same fingerprint = %d, want 2", got)
 	}
@@ -282,9 +301,7 @@ func TestBudgetHistoryRingIsBounded(t *testing.T) {
 		h.recordLocked(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterRestart, now)
 		h.mu.Unlock()
 	}
-	if err := h.record(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterRestart, now); err != nil {
-		t.Fatal(err)
-	}
+	h.record(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterRestart, now)
 	c := bandTotals(t, h, now, budgetv1alpha1.BandBatch)
 	if c.RestartsTotal != budgetHistoryRingMax+11 {
 		t.Errorf("restartsTotal = %d, want %d", c.RestartsTotal, budgetHistoryRingMax+11)

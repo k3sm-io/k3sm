@@ -2581,6 +2581,8 @@ func (r *runtimedRuntime) Watch(ctx context.Context, cb func(*corev1.Pod)) {
 	r.notify = cb
 	r.mu.Unlock()
 
+	// The budget history's one writer, for the provider's run lifetime.
+	r.history.start(ctx)
 	go r.runWatch(ctx)
 	go r.runBackstop(ctx)
 	go r.runOrphanReaper(ctx)

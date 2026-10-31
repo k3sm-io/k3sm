@@ -43,9 +43,7 @@ func exitOf(code int32, reason string) *corev1.ContainerStateTerminated {
 func observe(t *testing.T, h *BudgetHistory, pod types.UID, c string, restarts int32, finished int64, term *corev1.ContainerStateTerminated, now time.Time) {
 	t.Helper()
 	key := terminationKey{restartCount: restarts, exitCode: term.ExitCode, finishedAt: finished}
-	if err := h.observeExit(budgetv1alpha1.BandStandard, pod, c, key, term, now); err != nil {
-		t.Fatalf("observeExit: %v", err)
-	}
+	h.observeExit(budgetv1alpha1.BandStandard, pod, c, key, term, now)
 }
 
 func uninitiated(t *testing.T, h *BudgetHistory, now time.Time) int64 {
@@ -68,9 +66,8 @@ func TestBudgetHistoryIntentOutlivesASlowStop(t *testing.T) {
 	t0 := time.Unix(1_000_000, 0)
 
 	// A container intent, its exit observed 6 h later after a restart.
-	if err := h.recordIntent("uid-slow", "c0"); err != nil {
-		t.Fatal(err)
-	}
+	h.recordIntent("uid-slow", "c0")
+	flushHistory(t, h)
 	h = openHistory(t, dir, "fp")
 	late := t0.Add(6 * time.Hour)
 	observe(t, h, "uid-slow", "c0", 0, 1, exitOf(137, "Error"), late)
@@ -85,9 +82,7 @@ func TestBudgetHistoryIntentOutlivesASlowStop(t *testing.T) {
 	}
 
 	// A pod intent covers each container once.
-	if err := h.recordIntent("uid-pod", ""); err != nil {
-		t.Fatal(err)
-	}
+	h.recordIntent("uid-pod", "")
 	observe(t, h, "uid-pod", "a", 0, 10, exitOf(137, "Error"), late)
 	observe(t, h, "uid-pod", "b", 0, 11, exitOf(137, "Error"), late)
 	if got := uninitiated(t, h, late); got != 1 {
@@ -100,17 +95,13 @@ func TestBudgetHistoryIntentOutlivesASlowStop(t *testing.T) {
 
 	// A graceful exit consumes its container intent; a re-delivery of that exit
 	// does not consume a later intent.
-	if err := h.recordIntent("uid-grace", "c0"); err != nil {
-		t.Fatal(err)
-	}
+	h.recordIntent("uid-grace", "c0")
 	observe(t, h, "uid-grace", "c0", 0, 20, exitOf(143, "Error"), late)
 	observe(t, h, "uid-grace", "c0", 1, 21, exitOf(137, "Error"), late)
 	if got := uninitiated(t, h, late); got != 3 {
 		t.Fatalf("the graceful exit left its intent for the next SIGKILL: %d, want 3", got)
 	}
-	if err := h.recordIntent("uid-grace", "c0"); err != nil {
-		t.Fatal(err)
-	}
+	h.recordIntent("uid-grace", "c0")
 	observe(t, h, "uid-grace", "c0", 0, 20, exitOf(143, "Error"), late) // re-delivered
 	observe(t, h, "uid-grace", "c0", 2, 22, exitOf(137, "Error"), late)
 	if got := uninitiated(t, h, late); got != 3 {
@@ -131,9 +122,7 @@ func TestBudgetHistoryNeverPodCountedOnce(t *testing.T) {
 	for i := 0; i <= 25; i++ {
 		now := t0.Add(time.Duration(i) * time.Hour)
 		observe(t, h, "uid-job", "main", 0, t0.UnixNano(), exitOf(137, "Error"), now)
-		if err := h.retainPods(live, h.mark()); err != nil {
-			t.Fatal(err)
-		}
+		h.retainPods(live, h.mark())
 	}
 	end := t0.Add(25 * time.Hour)
 	if got := uninitiated(t, h, end); got != 1 {
@@ -143,12 +132,8 @@ func TestBudgetHistoryNeverPodCountedOnce(t *testing.T) {
 	// An intent recorded after the mark survives a prune whose pod set predates
 	// it; the gone pod's entries go.
 	mark := h.mark()
-	if err := h.recordIntent("uid-new", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.retainPods(map[types.UID]bool{}, mark); err != nil {
-		t.Fatal(err)
-	}
+	h.recordIntent("uid-new", "")
+	h.retainPods(map[types.UID]bool{}, mark)
 	h.mu.Lock()
 	intents, seen := slices.Clone(h.st.Intents), len(h.st.Seen)
 	h.mu.Unlock()
@@ -167,9 +152,7 @@ func TestPruneBudgetHistoryKeepsTrackedPods(t *testing.T) {
 		t.Fatalf("CreatePod: %v", err)
 	}
 	for _, id := range []types.UID{pod.UID, "uid-listed", "uid-gone"} {
-		if err := r.history.recordIntent(id, ""); err != nil {
-			t.Fatal(err)
-		}
+		r.history.recordIntent(id, "")
 	}
 	r.pruneBudgetHistory(map[string]bool{"uid-listed": true}, r.history.mark())
 	var got []types.UID
@@ -244,10 +227,7 @@ func TestEvictionIntentWriteIsTimeBoxed(t *testing.T) {
 	r, _ := newRuntimedFake(t)
 	r.history = openHistory(t, t.TempDir(), "fp")
 	release := make(chan struct{})
-	r.history.write = func(string, []byte, os.FileMode) error {
-		<-release
-		return nil
-	}
+	blockWrites(r.history, release)
 	pod := runtimedPod("default", "hog")
 	start := time.Now()
 	r.recordStopIntentWithin(pod, "", 50*time.Millisecond)
@@ -288,9 +268,7 @@ func TestBudgetHistoryDegradesToMemory(t *testing.T) {
 		t.Fatalf("history = %+v, want an in-memory history", r.history)
 	}
 	now := time.Now()
-	if err := r.history.record(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, now); err != nil {
-		t.Fatalf("an in-memory record failed: %v", err)
-	}
+	r.history.record(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, now)
 	if got := bandTotals(t, r.history, now, budgetv1alpha1.BandBatch).EvictionsTotal; got != 1 {
 		t.Fatalf("in-memory evictions = %d, want 1", got)
 	}
@@ -370,5 +348,83 @@ func TestBudgetHistoryFullFileFitsTheReadBound(t *testing.T) {
 	}
 	if len(data) > budgetHistoryMaxBytes {
 		t.Fatalf("a full history is %d bytes, over the read bound %d", len(data), budgetHistoryMaxBytes)
+	}
+}
+
+// blockWrites makes every later write of h wait until release is closed.
+func blockWrites(h *BudgetHistory, release <-chan struct{}) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.write = func(string, []byte, os.FileMode) error {
+		<-release
+		return nil
+	}
+}
+
+// TestBudgetHistoryStalledWriterBlocksNoHotPath: with the writer blocked
+// forever, an eviction completes within its 250 ms intent wait, the post-kill
+// count and the status path's classification return at once, and the memory
+// state is right. The writer stops once its write is released.
+//
+// Fails-before: every mutation wrote the file inline, so a stalled write held
+// evictPod after the kill and buildStatus on the write lock.
+func TestBudgetHistoryStalledWriterBlocksNoHotPath(t *testing.T) {
+	h := newEvictionHarness(t)
+	h.r.history = openHistory(t, t.TempDir(), "fp")
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) }) // runs before the writer's own cleanup
+	// Wedge the writer inside a write first, so every later change queues.
+	blockWrites(h.r.history, release)
+	h.r.history.record(budgetv1alpha1.BandStandard, budgetv1alpha1.CounterRestart, time.Now())
+
+	hog := evPod("hog", nil, "", "")
+	hog.Annotations = map[string]string{budgetv1alpha1.AnnotationBand: "batch"}
+	quiet := evPod("quiet", nil, "1Gi", "1Gi")
+	h.add(hog, "2Gi")
+	h.add(quiet, "200Mi")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := h.r.evictPod(context.Background(), hog, evictionNotice{signal: signalCompressor, message: "x"}); err != nil {
+			t.Errorf("evictPod: %v", err)
+		}
+		qt := h.r.trackByID("uid-quiet")
+		h.r.buildStatus(quiet.DeepCopy(), qt, exitStatus("uid-quiet", 137, "Error", 0, time.Unix(5000, 0)), nil)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stalled history writer blocked the eviction or the status path")
+	}
+	now := time.Now()
+	batch := bandTotals(t, h.r.history, now, budgetv1alpha1.BandBatch)
+	std := bandTotals(t, h.r.history, now, budgetv1alpha1.BandStandard)
+	if batch.EvictionsTotal != 1 || std.KernelKillsTotal != 1 || std.RestartsTotal != 1 {
+		t.Fatalf("in memory: evictions=%d kernelKills=%d restarts=%d, want 1/1/1",
+			batch.EvictionsTotal, std.KernelKillsTotal, std.RestartsTotal)
+	}
+	if got := intentsFor(h.r.history, hog.UID); len(got) != 1 {
+		t.Fatalf("the eviction's intent = %+v, want one in memory", got)
+	}
+}
+
+// TestBudgetHistoryFinalFlushOnShutdown: a change made just before the
+// provider's context ends reaches disk, and the writer stops.
+func TestBudgetHistoryFinalFlushOnShutdown(t *testing.T) {
+	dir := t.TempDir()
+	h := OpenBudgetHistory(dir, "fp", discardLog())
+	ctx, cancel := context.WithCancel(context.Background())
+	h.start(ctx)
+	h.record(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
+	cancel()
+	select {
+	case <-h.stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the writer did not stop on shutdown")
+	}
+	got := openHistory(t, dir, "fp")
+	if n := bandTotals(t, got, time.Now(), budgetv1alpha1.BandBatch).EvictionsTotal; n != 1 {
+		t.Fatalf("after shutdown the file holds evictions=%d, want 1", n)
 	}
 }
