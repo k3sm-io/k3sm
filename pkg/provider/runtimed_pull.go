@@ -1317,6 +1317,8 @@ func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
 	// is the apis contract's immediate kill, which only evictPod sends.
 	grace := floorGrace(graceSeconds(pod))
 	backoff := newCrashLoopBackoff(r.clk)
+	// The delete is k3sm's stop: record it before the first attempt.
+	r.recordStopIntent(pod, "")
 	for {
 		_, err := r.rt.DeletePod(context.Background(),
 			&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: grace})

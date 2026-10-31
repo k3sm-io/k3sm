@@ -149,6 +149,9 @@ func (r *runtimedRuntime) reapOrphans(ctx context.Context) {
 	if r.podSource == nil {
 		return
 	}
+	// Taken before the list: a budget-history entry recorded after it is kept
+	// whatever the list says.
+	mark := r.history.mark()
 	listCtx, cancel := context.WithTimeout(ctx, orphanAPITimeout)
 	listed, err := r.podSource.listNodePods(listCtx, r.nodeName)
 	cancel()
@@ -165,6 +168,9 @@ func (r *runtimedRuntime) reapOrphans(ctx context.Context) {
 	// A retained terminated pod the apiserver no longer holds owes no logs: drop
 	// it, and the log GC removes its tree on its next sweep.
 	r.pruneRetained(present)
+	// The budget history's intents and classified exits live as long as their
+	// pod: drop the ones whose pod is neither listed nor tracked.
+	r.pruneBudgetHistory(present, mark)
 
 	r.mu.Lock()
 	tracked := make(map[string]orphanCandidate, len(r.track))

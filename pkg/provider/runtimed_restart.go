@@ -530,7 +530,7 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 			pod := r.podByID(podID)
 			r.recordKilling(t, pod, name, msg)
 			if pod != nil {
-				r.recordStopIntent(pod, name, time.Duration(graceSeconds(pod))*time.Second)
+				r.recordStopIntent(pod, name)
 			}
 		}
 		err := r.respawn(ctx, t, podID, name, reason)

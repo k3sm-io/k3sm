@@ -54,9 +54,9 @@ func windowCount(c budgetv1alpha1.BandCounters, w budgetv1alpha1.CounterWindow, 
 
 func openHistory(t *testing.T, dir, fingerprint string) *BudgetHistory {
 	t.Helper()
-	h, err := OpenBudgetHistory(dir, fingerprint, discardLog())
-	if err != nil {
-		t.Fatalf("OpenBudgetHistory: %v", err)
+	h := OpenBudgetHistory(dir, fingerprint, discardLog())
+	if h.path == "" {
+		t.Fatalf("OpenBudgetHistory(%s) degraded to memory only", dir)
 	}
 	return h
 }
@@ -121,7 +121,7 @@ func TestBudgetHistorySurvivesProviderRestart(t *testing.T) {
 	// An OOM kill (a vm guest's) and a k3sm-initiated stop: the stop's intent is
 	// persisted first, so its exit 137 is not a kernel kill.
 	h.r.buildStatus(quiet.DeepCopy(), qt, exitStatus("uid-quiet", 137, oomKilledReason, 1, t0.Add(time.Second)), nil)
-	h.r.recordStopIntent(quiet, "c0", 0)
+	h.r.recordStopIntent(quiet, "c0")
 
 	check := func(t *testing.T, hist *BudgetHistory, now time.Time) {
 		t.Helper()
@@ -155,7 +155,7 @@ func TestBudgetHistorySurvivesProviderRestart(t *testing.T) {
 
 	// The provider restarts: a new runtime over the same work dir.
 	r2, _, clk2 := newRestartFake(t)
-	clk2.SetTime(clk.Now().Add(2 * time.Minute)) // inside the stop intent's validity
+	clk2.SetTime(clk.Now().Add(2 * time.Minute))
 	r2.history = openHistory(t, dir, "fp-1")
 	if err := r2.CreatePod(t.Context(), quiet.DeepCopy()); err != nil {
 		t.Fatalf("CreatePod after restart: %v", err)
@@ -185,10 +185,10 @@ func TestBudgetHistorySurvivesProviderRestart(t *testing.T) {
 	// binary or policy change; the totals stay.
 	r2.history.mu.Lock()
 	r2.history.st.ArmingEpisodes = 2
-	if err := r2.history.persistLocked(); err != nil {
+	r2.history.mu.Unlock()
+	if err := r2.history.persist(); err != nil {
 		t.Fatal(err)
 	}
-	r2.history.mu.Unlock()
 	if got := openHistory(t, dir, "fp-1").ArmingEpisodes(); got != 2 {
 		t.Errorf("armingEpisodes under the same fingerprint = %d, want 2", got)
 	}

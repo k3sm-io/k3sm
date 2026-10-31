@@ -605,11 +605,9 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	// startup attach observes is classified against the persisted intents.
 	var history *BudgetHistory
 	if cfg.BudgetDir != "" {
-		h, err := OpenBudgetHistory(cfg.BudgetDir, budgetFingerprint(binaryIdentity(version.Get())), log)
-		if err != nil {
-			return nil, fmt.Errorf("init runtimed: %w", err)
-		}
-		history = h
+		// It never fails the node: an unusable dir or file degrades to an
+		// in-memory history with a Warn log.
+		history = OpenBudgetHistory(cfg.BudgetDir, budgetFingerprint(binaryIdentity(version.Get())), log)
 	}
 	// runtimed never talks to the apiserver: the provider (which holds the client)
 	// supplies the volume Resolver + imagePullSecret CredentialResolver. nil client
@@ -2228,7 +2226,9 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 	r.recorder.Event(tracked, corev1.EventTypeWarning, reasonEvicted, n.message)
 
 	t.quiesceForEviction()
-	r.recordStopIntent(tracked, "", 0)
+	// The intent write is time-boxed: a stalled disk must not hold back the
+	// kill that keeps the node from running out of memory.
+	r.recordStopIntentWithin(tracked, "", budgetIntentWriteBound)
 	if _, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: 0}); err != nil {
 		t.unmarkEvicted(st)
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
@@ -2280,7 +2280,7 @@ func (t *podTrack) quiesce() {
 // idempotent re-create installed meanwhile is left alone.
 func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grace int64, owned *podTrack) error {
 	id := string(pod.UID)
-	r.recordStopIntent(pod, "", time.Duration(grace)*time.Second)
+	r.recordStopIntent(pod, "")
 	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace})
 	if err != nil {
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)

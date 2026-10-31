@@ -402,7 +402,13 @@ var (
 // that carries no override. The two Unimplemented channels are returned as
 // distinct sentinels (errStopVerbMissing, errStopUnsupported); any other refusal
 // or transport failure is a plain wrapped error.
+//
+// The stop intent is recorded before the RPC, so the container's exit 137 is
+// k3sm's own stop, not a SIGKILL k3sm did not send.
 func (r *runtimedRuntime) stopContainerReason(ctx context.Context, podID, container, reason string) error {
+	if r.history != nil {
+		r.recordStopIntent(r.podByID(podID), container)
+	}
 	resp, err := r.rt.StopContainer(ctx, &runtimev1.StopContainerRequest{
 		PodId:     podID,
 		Container: container,
