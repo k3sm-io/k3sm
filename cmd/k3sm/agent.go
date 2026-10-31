@@ -1055,7 +1055,7 @@ func meshTeardownOnExit(ctx context.Context, down meshTeardown, logger *slog.Log
 // bring-up-then-teardown sequence with no privilege and no apiserver.
 type meshSeam struct {
 	newMesh  func(self netip.Prefix, opts ...mesh.Option) (meshDatapath, error)
-	newWatch func(cfg *rest.Config, m meshDatapath, logger *slog.Logger) (meshWatch, error)
+	newWatch func(cfg *rest.Config, m meshDatapath, logger *slog.Logger, opts ...mesh.WatcherOption) (meshWatch, error)
 }
 
 // productionMeshSeam builds the real wireguard mesh and its watcher. The watcher
@@ -1065,12 +1065,12 @@ var productionMeshSeam = meshSeam{
 	newMesh: func(self netip.Prefix, opts ...mesh.Option) (meshDatapath, error) {
 		return mesh.New(self, opts...)
 	},
-	newWatch: func(cfg *rest.Config, m meshDatapath, logger *slog.Logger) (meshWatch, error) {
+	newWatch: func(cfg *rest.Config, m meshDatapath, logger *slog.Logger, opts ...mesh.WatcherOption) (meshWatch, error) {
 		wg, ok := m.(*mesh.Mesh)
 		if !ok {
 			return nil, fmt.Errorf("mesh watcher needs darwin-net's *mesh.Mesh, got %T", m)
 		}
-		return mesh.NewWatcher(cfg, wg, logger)
+		return mesh.NewWatcher(cfg, wg, logger, opts...)
 	},
 }
 
@@ -1160,7 +1160,11 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 	if restErr != nil {
 		return teardown, fmt.Errorf("load kubeconfig for mesh watch: %w", restErr)
 	}
-	watcher, err := activeMeshSeam.newWatch(restCfg, m, logger)
+	var watchOpts []mesh.WatcherOption
+	if in.handshakeStatus {
+		watchOpts = append(watchOpts, mesh.WithHandshakeStatus())
+	}
+	watcher, err := activeMeshSeam.newWatch(restCfg, m, logger, watchOpts...)
 	if err != nil {
 		return teardown, fmt.Errorf("build mesh watcher: %w", err)
 	}

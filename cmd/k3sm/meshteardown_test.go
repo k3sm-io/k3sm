@@ -124,7 +124,7 @@ func installFakeMeshSeam(t *testing.T) (*fakeMeshDatapath, chan struct{}) {
 	prev := activeMeshSeam
 	activeMeshSeam = meshSeam{
 		newMesh: func(netip.Prefix, ...mesh.Option) (meshDatapath, error) { return dev, nil },
-		newWatch: func(*rest.Config, meshDatapath, *slog.Logger) (meshWatch, error) {
+		newWatch: func(*rest.Config, meshDatapath, *slog.Logger, ...mesh.WatcherOption) (meshWatch, error) {
 			return &fakeMeshWatch{done: watchDone}, nil
 		},
 	}
