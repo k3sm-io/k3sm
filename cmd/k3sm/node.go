@@ -1069,6 +1069,17 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// SYNCHRONOUSLY inside NewNode — so it is set before NewNode returns and the
 	// status loop can be started right after, with no handshake.
 	var nodeStatus *provider.NodeStatusProvider
+	// The sleep reporter holds this Mac's PreventSystemSleep assertion while the
+	// node runs and reports sleep and wake as the Sleeping condition and Events,
+	// so a NotReady during sleep has a reason on the Node.
+	sleepReporter, err := provider.NewSleepReporter(provider.SleepReporterConfig{
+		NodeName: opts.nodeName,
+		Recorder: recorder,
+		Log:      slog.Default(),
+	})
+	if err != nil {
+		return fmt.Errorf("sleep reporter: %w", err)
+	}
 	// The by-name Secret/ConfigMap reader behind the node's Virtual Kubelet
 	// listers: the provider's own pod-reference manager when it has one (the
 	// runtimed provider), else none, and such a read then fails loudly.
@@ -1123,6 +1134,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 				RuntimeHealthy: runtimeHealthProbe(prov),
 				Images:         nodeImageInventory(prov),
 				PodProcesses:   nodePodProcessCounter(prov),
+				Sleep:          sleepReporter,
 				Log:            slog.Default(),
 			})
 			if nerr != nil {
@@ -1150,13 +1162,16 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// caller's teardown — `k3sm server` stopping its control plane — does not take
 	// the apiserver away while this node is still writing to it.
 	var nodeLoops sync.WaitGroup
-	nodeLoops.Add(2)
+	nodeLoops.Add(3)
 	go func() { defer nodeLoops.Done(); errc <- n.Run(ctx) }()
 	// The status loop's first publication is what marks the node Ready (supplying a
 	// node provider disables VK's own ready callback), so it must run for the whole
 	// life of the node, not only after startup succeeds. Its first UpdateStatus
 	// blocks until VK registers the notify callback, so starting it here is safe.
 	go func() { defer nodeLoops.Done(); _ = nodeStatus.Run(ctx) }()
+	// The sleep assertion is held for the life of the node and released when
+	// ctx ends: on leave and on stop alike.
+	go func() { defer nodeLoops.Done(); _ = sleepReporter.Run(ctx) }()
 	// The node-pressure eviction manager is counted in nodeLoops from here, but
 	// held until the node is Ready (eviction.open, below): only then has Virtual
 	// Kubelet's pod informer synced, so the provider's pod set is the cluster's.
