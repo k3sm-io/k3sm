@@ -294,7 +294,10 @@ func teardownTail(ctx context.Context, sys System, cfg Config, fp flushPrefixes,
 //     start, means nothing of ours is there: skipped, and not a leftover;
 //   - the leader must be the installed k3sm-vmhost (its executable path) and
 //     run as the service user. A start-time match on any other process is a
-//     forged or corrupted record: never signalled, and reported.
+//     forged or corrupted record: never signalled, and reported. A helper of
+//     the service user running from a version directory the tree no longer
+//     retains (started two updates ago or more) is never signalled either,
+//     and is reported as the leftover it is, by pid, path and version.
 //
 // Nothing is ever matched by process name. The helpers are stopped together,
 // so the stage costs the longest wait, not their sum.
@@ -485,7 +488,11 @@ func shortenVMHelper(ctx context.Context, sys System, rec VMHostRecord, bound ti
 // gone leader or a recycled pgid is false with no error (nothing of ours is
 // provably there); a start-time match on another executable or uid is false
 // with an error (a forged or corrupted record), as is an executable that cannot
-// be read.
+// be read. A service-user helper running from a version directory the tree no
+// longer retains (unretainedVMHost) is false with an error of its own, naming
+// its pid, path and version and how to stop it: it is a real leftover, not a
+// forged record, but nothing vouches for its path any more, so it is reported
+// and never signalled.
 func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, svcUID uint32) (bool, error) {
 	start, alive := sys.ProcessGroupLeaderStart(rec.Pgid)
 	if !alive {
@@ -500,6 +507,12 @@ func verifyVMHelper(sys System, cfg Config, rec VMHostRecord, svcUID uint32) (bo
 	case err != nil:
 		return false, fmt.Errorf("vm helper group %d: cannot read its executable, not signalled: %w", rec.Pgid, err)
 	case uid != svcUID || !isInstalledVMHost(sys, cfg, exe):
+		if ver, ok := unretainedVMHost(sys, cfg, exe); ok && uid == svcUID {
+			cfg.Logger.Warn("a vm helper runs from a version this install no longer retains; not signalled, stop it by hand",
+				"pod", rec.PodID, "pid", rec.Pgid, "exe", filepath.Clean(exe), "version", ver)
+			return false, fmt.Errorf("vm helper pid %d (pod %s) runs %s from version %s, which this install no longer retains; not signalled, stop it with: sudo kill -TERM -%d",
+				rec.Pgid, rec.PodID, filepath.Clean(exe), ver, rec.Pgid)
+		}
 		want := cfg.installedVMHost()
 		cfg.Logger.Warn("a vm helper record names a process that is not this install's k3sm-vmhost; not signalled", "pod", rec.PodID, "pgid", rec.Pgid, "exe", exe, "uid", uid)
 		return false, fmt.Errorf("vm helper record for group %d names %s (uid %d), not %s (uid %d); not signalled", rec.Pgid, exe, uid, want, svcUID)
@@ -552,6 +565,25 @@ func isInstalledVMHost(sys System, cfg Config, exe string) bool {
 		return false
 	}
 	return exe == resolved && filepath.Base(resolved) == VMHostName
+}
+
+// unretainedVMHost reports whether exe, refused by isInstalledVMHost, is the
+// helper's name directly inside a validly named version directory that neither
+// current nor previous retains, and which version that is. Such a helper was
+// started from a version the updates since have retired (two flips ago or
+// more). It is never signalled: once its version is no longer retained, the
+// tree no longer vouches for that path. The teardown reports it by pid and
+// path instead, as a leftover, rather than as a forged record.
+func unretainedVMHost(sys System, cfg Config, exe string) (string, bool) {
+	if !filepath.IsAbs(exe) {
+		return "", false
+	}
+	tree := layout.New(cfg.InstallDir)
+	ver, ok := tree.VersionedBinary(exe, VMHostName)
+	if !ok || retainedVersion(sys, tree, ver) {
+		return "", false
+	}
+	return ver, true
 }
 
 // retainedVersion reports whether ver is the version the tree's current or
