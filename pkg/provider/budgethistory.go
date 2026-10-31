@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,14 +55,21 @@ import (
 //     k3sm, restarts, memory.high events, refused tier-1 deliveries), never
 //     reset;
 //   - a bounded ring of recent events (time, band, reason) from which the 1 h
-//     and 24 h windowed counts are derived. The ring carries no pod name,
-//     namespace or UID;
+//     and 24 h windowed counts are derived. On disk the ring carries no pod
+//     name, namespace or UID. In memory each entry this run recorded keeps its
+//     pod UID so one pod holds at most budgetHistoryRingPerPod entries of the
+//     last 24 h: a pod that kills itself in a loop drops its own oldest entry,
+//     never another pod's, so it cannot push other pods out of the windows.
+//     The windows then under-count that pod; the totals stay exact;
 //   - the intent ledger: a record, written BEFORE every k3sm-initiated stop, of
 //     which pod (or which container) k3sm is about to stop, so a later exit 137
 //     can be told apart from a SIGKILL k3sm did not send. Beside it, the
-//     identities of the terminations already classified, so a re-delivered exit
-//     (the status stream and the backstop, or the first status after a restart)
-//     is counted once. Both hold pod UIDs; neither is ever published.
+//     identity of the latest termination classified per (pod UID, container),
+//     so a re-delivered exit (the status stream and the backstop, or the first
+//     status after a restart) is counted once. A newer termination of the
+//     container replaces its entry in place, so the list is bounded by the
+//     node's containers, not by how often one of them dies. Both hold pod UIDs;
+//     neither is ever published.
 //
 // Intents and classified terminations live as long as their pod: an entry is
 // dropped when its pod UID is in neither the provider's tracked pods nor a
@@ -96,8 +104,12 @@ import (
 // file atomically. A write failure is logged and retried; the in-memory state
 // stays authoritative for this run. The one ordering guarantee is the emergency
 // eviction's: it asks the writer to flush and waits up to budgetIntentWriteBound
-// for its intent to reach disk before the kill. On shutdown the writer makes
-// one final flush, bounded by budgetHistoryFinalFlushBound. An unreadable or unrecognised file is moved aside (the last
+// for its intent to reach disk before the kill. On shutdown (the provider's run
+// context ending, or the node's teardown calling StopBudgetHistory) the writer
+// makes one final flush and stops; the node's teardown waits at most
+// budgetHistoryFinalFlushBound for that, so a change made in the last moments
+// before the process exits reaches disk unless the disk is stalled past the
+// bound. An unreadable or unrecognised file is moved aside (the last
 // budgetHistoryAsideMax are kept) and the history starts empty: the totals then
 // restart at 0, as a counter does after a reset. A history dir that cannot be
 // prepared or written degrades to an in-memory history with a Warn log: the
@@ -114,6 +126,9 @@ const (
 	// records more than this in 24 h under-reports its 24 h windows; the
 	// totals are unaffected.
 	budgetHistoryRingMax = 2048
+	// budgetHistoryRingPerPod is the most ring entries of the last 24 h one pod
+	// holds (in this run); past it the pod's own oldest entry goes.
+	budgetHistoryRingPerPod = 16
 	// budgetIntentMax and budgetSeenMax bound the intent ledger and the
 	// classified-termination list; past them the oldest entry goes first. Both
 	// are pruned by pod lifetime, so they hold only live pods' entries: a
@@ -125,7 +140,8 @@ const (
 	// budgetIntentWriteBound is how long the emergency eviction waits for its
 	// intent to reach disk before it kills anyway (recordStopIntentWithin).
 	budgetIntentWriteBound = 250 * time.Millisecond
-	// budgetHistoryFinalFlushBound bounds the writer's final flush on shutdown.
+	// budgetHistoryFinalFlushBound bounds the writer's final flush on shutdown,
+	// and the node teardown's wait for it (StopBudgetHistory).
 	budgetHistoryFinalFlushBound = 2 * time.Second
 	// budgetHistoryRetryInterval is how often the writer retries a failed write.
 	budgetHistoryRetryInterval = 30 * time.Second
@@ -152,11 +168,13 @@ type historyTotals struct {
 	Tier1Refused int64 `json:"tier1Refused"`
 }
 
-// historyEvent is one ring entry: when, which band, what. No pod identity.
+// historyEvent is one ring entry: when, which band, what. pod is kept in
+// memory only, for the per-pod cap; it is never persisted.
 type historyEvent struct {
 	At     int64                        `json:"at"` // unix seconds
 	Band   budgetv1alpha1.Band          `json:"band"`
 	Reason budgetv1alpha1.CounterReason `json:"reason"`
+	pod    types.UID
 }
 
 // killIntent records that k3sm is about to stop a pod (Container empty) or one
@@ -170,8 +188,8 @@ type killIntent struct {
 	seq       uint64
 }
 
-// seenExit is one classified termination: the container and runtimed's
-// termination identity. seq is as killIntent's.
+// seenExit is the latest classified termination of one container: the
+// container and runtimed's termination identity. seq is as killIntent's.
 type seenExit struct {
 	Pod          types.UID `json:"pod"`
 	Container    string    `json:"container"`
@@ -204,9 +222,12 @@ type BudgetHistory struct {
 	path string // "" keeps the history in memory only
 	log  *slog.Logger
 
-	dirty   chan struct{} // capacity 1: a pending-write signal, coalesced
-	once    sync.Once     // starts run once
-	stopped chan struct{} // closed when run returns
+	dirty    chan struct{} // capacity 1: a pending-write signal, coalesced
+	once     sync.Once     // starts run once
+	started  atomic.Bool
+	quit     chan struct{} // closed by stop
+	quitOnce sync.Once
+	stopped  chan struct{} // closed when run returns
 
 	mu      sync.Mutex
 	st      historyState
@@ -229,7 +250,7 @@ func OpenBudgetHistory(dir, fingerprint string, log *slog.Logger) *BudgetHistory
 	}
 	h := &BudgetHistory{
 		log: log, write: atomicfile.Replace,
-		dirty: make(chan struct{}, 1), stopped: make(chan struct{}), wrote: make(chan struct{}),
+		dirty: make(chan struct{}, 1), quit: make(chan struct{}), stopped: make(chan struct{}), wrote: make(chan struct{}),
 	}
 	memoryOnly := func(why string, err error) *BudgetHistory {
 		log.Warn("budget history: keeping the history in memory only; its counters restart at 0 on the next start",
@@ -424,13 +445,35 @@ func (h *BudgetHistory) signal() {
 	}
 }
 
-// start runs the writer until ctx ends. It is idempotent, and a nil or
-// in-memory history has no writer.
+// start runs the writer until ctx ends or stop is called. The writer is bound
+// to the FIRST start's ctx: a later call (a second Watch) is a no-op and its
+// ctx is ignored. A nil or in-memory history has no writer.
 func (h *BudgetHistory) start(ctx context.Context) {
 	if h == nil || h.path == "" {
 		return
 	}
-	h.once.Do(func() { go h.run(ctx) })
+	h.once.Do(func() {
+		h.started.Store(true)
+		go h.run(ctx)
+	})
+}
+
+// stop tells the writer to make its final flush and stop, and waits at most
+// bound for it. It reports whether the writer stopped in time; a history with
+// no running writer reports true.
+func (h *BudgetHistory) stop(bound time.Duration) bool {
+	if h == nil || !h.started.Load() {
+		return true
+	}
+	h.quitOnce.Do(func() { close(h.quit) })
+	t := time.NewTimer(bound)
+	defer t.Stop()
+	select {
+	case <-h.stopped:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // run is the writer: one write per coalesced signal, a retry of a failed write
@@ -445,6 +488,9 @@ func (h *BudgetHistory) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			h.finalFlush()
+			return
+		case <-h.quit:
 			h.finalFlush()
 			return
 		case <-h.dirty:
@@ -538,7 +584,9 @@ func (h *BudgetHistory) flush(bound time.Duration) bool {
 }
 
 // recordLocked counts one event of reason for band: the total and the ring.
-func (h *BudgetHistory) recordLocked(band budgetv1alpha1.Band, reason budgetv1alpha1.CounterReason, now time.Time) {
+// pod (empty for none) is held to budgetHistoryRingPerPod entries of the last
+// 24 h; the totals count every event.
+func (h *BudgetHistory) recordLocked(pod types.UID, band budgetv1alpha1.Band, reason budgetv1alpha1.CounterReason, now time.Time) {
 	t := h.st.Totals[band]
 	switch reason {
 	case budgetv1alpha1.CounterEviction:
@@ -555,32 +603,70 @@ func (h *BudgetHistory) recordLocked(band budgetv1alpha1.Band, reason budgetv1al
 		t.Tier1Refused++
 	}
 	h.st.Totals[band] = t
-	h.st.Ring = keepLast(append(h.st.Ring, historyEvent{At: now.Unix(), Band: band, Reason: reason}), budgetHistoryRingMax)
+	if pod != "" {
+		h.capPodRingLocked(pod, now)
+	}
+	h.st.Ring = keepLast(append(h.st.Ring, historyEvent{At: now.Unix(), Band: band, Reason: reason, pod: pod}), budgetHistoryRingMax)
 }
 
-// record counts one event; the writer persists it.
-func (h *BudgetHistory) record(band budgetv1alpha1.Band, reason budgetv1alpha1.CounterReason, now time.Time) {
+// capPodRingLocked drops pod's oldest ring entries of the last 24 h until one
+// more fits under budgetHistoryRingPerPod.
+func (h *BudgetHistory) capPodRingLocked(pod types.UID, now time.Time) {
+	cut := now.Add(-24 * time.Hour).Unix()
+	n := 0
+	for _, e := range h.st.Ring {
+		if e.pod == pod && e.At > cut {
+			n++
+		}
+	}
+	for drop := n - (budgetHistoryRingPerPod - 1); drop > 0; drop-- {
+		for i, e := range h.st.Ring {
+			if e.pod == pod && e.At > cut {
+				h.st.Ring = slices.Delete(h.st.Ring, i, i+1)
+				break
+			}
+		}
+	}
+}
+
+// record counts one event of pod (empty for none); the writer persists it.
+func (h *BudgetHistory) record(pod types.UID, band budgetv1alpha1.Band, reason budgetv1alpha1.CounterReason, now time.Time) {
 	if h == nil {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.recordLocked(band, reason, now)
+	h.recordLocked(pod, band, reason, now)
 	h.changedLocked()
 }
 
 // noteIntent records in memory that k3sm is about to stop pod (container
 // empty: every container of it), before the stop is issued; the writer
-// persists it.
-func (h *BudgetHistory) recordIntent(pod types.UID, container string) {
+// persists it. It returns the intent's handle for dropIntent.
+func (h *BudgetHistory) recordIntent(pod types.UID, container string) uint64 {
 	if h == nil {
-		return
+		return 0
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.seq++
 	h.st.Intents = keepLast(append(h.st.Intents, killIntent{Pod: pod, Container: container, seq: h.seq}), budgetIntentMax)
 	h.changedLocked()
+	return h.seq
+}
+
+// dropIntent removes the intent recordIntent returned id for, if it is still
+// held: the stop it announced did not happen.
+func (h *BudgetHistory) dropIntent(id uint64) {
+	if h == nil || id == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if i := slices.IndexFunc(h.st.Intents, func(in killIntent) bool { return in.seq == id }); i >= 0 {
+		h.st.Intents = slices.Delete(h.st.Intents, i, i+1)
+		h.changedLocked()
+	}
 }
 
 // mark returns the current entry sequence: an entry recorded after it has a
@@ -643,23 +729,35 @@ func (h *BudgetHistory) observeExit(band budgetv1alpha1.Band, pod types.UID, con
 	if !kill && !h.coversLocked(pod, container) {
 		return
 	}
-	for _, s := range h.st.Seen {
-		if s.Pod == pod && s.Container == container && s.RestartCount == key.restartCount && s.FinishedAt == key.finishedAt {
+	h.seq++
+	entry := seenExit{Pod: pod, Container: container, RestartCount: key.restartCount, FinishedAt: key.finishedAt, At: now.Unix(), seq: h.seq}
+	if i := slices.IndexFunc(h.st.Seen, func(s seenExit) bool { return s.Pod == pod && s.Container == container }); i >= 0 {
+		// The container's latest classified termination: this one again, or
+		// an older one re-delivered late, is not counted.
+		if prev := h.st.Seen[i]; !newerTermination(key, prev) {
 			return
 		}
+		h.st.Seen[i] = entry
+	} else {
+		h.st.Seen = keepLast(append(h.st.Seen, entry), budgetSeenMax)
 	}
-	h.seq++
-	h.st.Seen = keepLast(append(h.st.Seen, seenExit{
-		Pod: pod, Container: container, RestartCount: key.restartCount, FinishedAt: key.finishedAt, At: now.Unix(), seq: h.seq,
-	}), budgetSeenMax)
 	covered := h.consumeIntentLocked(pod, container)
 	switch {
 	case term.Reason == oomKilledReason:
-		h.recordLocked(band, budgetv1alpha1.CounterOOMKill, now)
+		h.recordLocked(pod, band, budgetv1alpha1.CounterOOMKill, now)
 	case term.ExitCode == evictedExitCode && !covered:
-		h.recordLocked(band, budgetv1alpha1.CounterKernelKill, now)
+		h.recordLocked(pod, band, budgetv1alpha1.CounterKernelKill, now)
 	}
 	h.changedLocked()
+}
+
+// newerTermination reports whether key is a later termination than prev: a
+// higher restart count, or the same count and a later finish.
+func newerTermination(key terminationKey, prev seenExit) bool {
+	if key.restartCount != prev.RestartCount {
+		return key.restartCount > prev.RestartCount
+	}
+	return key.finishedAt > prev.FinishedAt
 }
 
 // coversLocked reports whether an unconsumed intent covers pod's container.
@@ -792,11 +890,15 @@ func binaryIdentity(info version.Info) string {
 // pod), that the stop is k3sm's. It is in memory at once and covers the exit in
 // this run; the writer persists it shortly after. A provider restart in that
 // window costs a later exit 137 counted as a SIGKILL k3sm did not send.
-func (r *runtimedRuntime) recordStopIntent(pod *corev1.Pod, container string) {
+//
+// It returns the intent's handle; a caller whose stop RPC fails passes it to
+// r.history.dropIntent, so the exit the failed stop did not cause is
+// classified without it.
+func (r *runtimedRuntime) recordStopIntent(pod *corev1.Pod, container string) uint64 {
 	if r.history == nil || pod == nil {
-		return
+		return 0
 	}
-	r.history.recordIntent(pod.UID, container)
+	return r.history.recordIntent(pod.UID, container)
 }
 
 // recordStopIntentWithin is recordStopIntent for the emergency eviction, which
@@ -804,15 +906,24 @@ func (r *runtimedRuntime) recordStopIntent(pod *corev1.Pod, container string) {
 // is recorded in memory, then the writer is asked to flush and the call waits
 // at most bound. A flush that does not finish in time is logged and the stop
 // proceeds.
-func (r *runtimedRuntime) recordStopIntentWithin(pod *corev1.Pod, container string, bound time.Duration) {
+func (r *runtimedRuntime) recordStopIntentWithin(pod *corev1.Pod, container string, bound time.Duration) uint64 {
 	if r.history == nil || pod == nil {
-		return
+		return 0
 	}
-	r.history.recordIntent(pod.UID, container)
+	id := r.history.recordIntent(pod.UID, container)
 	if !r.history.flush(bound) {
 		r.log.Warn("budget history: the stop intent did not reach disk in time; stopping without waiting for it",
 			"pod", podKey(pod.Namespace, pod.Name), "container", container, "bound", bound)
 	}
+	return id
+}
+
+// StopBudgetHistory makes the budget history's writer flush and stop, waiting
+// at most budgetHistoryFinalFlushBound, so a node exiting right after its
+// context ends still persists its last changes. It is the node teardown's
+// seam; it is idempotent and reports whether the writer stopped in time.
+func (r *runtimedRuntime) StopBudgetHistory() bool {
+	return r.history.stop(budgetHistoryFinalFlushBound)
 }
 
 // pruneBudgetHistory drops the history entries of pods that are gone: in
@@ -845,7 +956,7 @@ func (r *runtimedRuntime) recordBudgetEvent(pod *corev1.Pod, reason budgetv1alph
 	if r.history == nil || pod == nil {
 		return
 	}
-	r.history.record(bandOf(pod), reason, r.clk.Now())
+	r.history.record(pod.UID, bandOf(pod), reason, r.clk.Now())
 }
 
 // observeBudgetExits hands every terminated container of rs to the history

@@ -137,6 +137,23 @@ func (v *VKProvider) ServableRuntime() (*runtimed.Runtime, bool) {
 	return s.ServableRuntime()
 }
 
+// BudgetHistoryStopper is the optional Runtime capability that flushes and
+// stops the node's budget history writer at node exit (StopBudgetHistory).
+type BudgetHistoryStopper interface {
+	StopBudgetHistory() bool
+}
+
+// StopBudgetHistory flushes and stops the backing Runtime's budget history
+// writer, waiting a bounded time, delegating to its optional
+// BudgetHistoryStopper capability. A Runtime without one reports true.
+func (v *VKProvider) StopBudgetHistory() bool {
+	s, ok := v.rt.(BudgetHistoryStopper)
+	if !ok {
+		return true
+	}
+	return s.StopBudgetHistory()
+}
+
 // NotifyPods wires the Runtime's status watch to the VK status callback.
 func (v *VKProvider) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	v.rt.Watch(ctx, cb)
@@ -212,6 +229,9 @@ type ObjectSource interface {
 var (
 	_ ObjectSource = (*VKProvider)(nil)
 	_ ObjectSource = (*runtimedRuntime)(nil)
+
+	_ BudgetHistoryStopper = (*VKProvider)(nil)
+	_ BudgetHistoryStopper = (*runtimedRuntime)(nil)
 )
 
 // Objects returns the backing Runtime's ObjectGetter, or nil when it has none.

@@ -404,11 +404,22 @@ var (
 // or transport failure is a plain wrapped error.
 //
 // The stop intent is recorded before the RPC, so the container's exit 137 is
-// k3sm's own stop, not a SIGKILL k3sm did not send.
+// k3sm's own stop, not a SIGKILL k3sm did not send. Any error (a failed RPC, a
+// refusal, a missing verb) drops it again: no stop happened for it to cover.
 func (r *runtimedRuntime) stopContainerReason(ctx context.Context, podID, container, reason string) error {
+	var intent uint64
 	if r.history != nil {
-		r.recordStopIntent(r.podByID(podID), container)
+		intent = r.recordStopIntent(r.podByID(podID), container)
 	}
+	err := r.stopContainerRPC(ctx, podID, container, reason)
+	if err != nil {
+		r.history.dropIntent(intent)
+	}
+	return err
+}
+
+// stopContainerRPC is stopContainerReason's RPC and its error mapping.
+func (r *runtimedRuntime) stopContainerRPC(ctx context.Context, podID, container, reason string) error {
 	resp, err := r.rt.StopContainer(ctx, &runtimev1.StopContainerRequest{
 		PodId:     podID,
 		Container: container,

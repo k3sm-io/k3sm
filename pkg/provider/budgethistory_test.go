@@ -298,10 +298,10 @@ func TestBudgetHistoryRingIsBounded(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	for i := 0; i < budgetHistoryRingMax+10; i++ {
 		h.mu.Lock()
-		h.recordLocked(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterRestart, now)
+		h.recordLocked("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterRestart, now)
 		h.mu.Unlock()
 	}
-	h.record(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterRestart, now)
+	h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterRestart, now)
 	c := bandTotals(t, h, now, budgetv1alpha1.BandBatch)
 	if c.RestartsTotal != budgetHistoryRingMax+11 {
 		t.Errorf("restartsTotal = %d, want %d", c.RestartsTotal, budgetHistoryRingMax+11)

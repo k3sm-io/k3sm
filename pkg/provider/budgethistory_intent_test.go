@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -28,6 +29,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -268,7 +271,7 @@ func TestBudgetHistoryDegradesToMemory(t *testing.T) {
 		t.Fatalf("history = %+v, want an in-memory history", r.history)
 	}
 	now := time.Now()
-	r.history.record(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, now)
+	r.history.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, now)
 	if got := bandTotals(t, r.history, now, budgetv1alpha1.BandBatch).EvictionsTotal; got != 1 {
 		t.Fatalf("in-memory evictions = %d, want 1", got)
 	}
@@ -375,7 +378,7 @@ func TestBudgetHistoryStalledWriterBlocksNoHotPath(t *testing.T) {
 	t.Cleanup(func() { close(release) }) // runs before the writer's own cleanup
 	// Wedge the writer inside a write first, so every later change queues.
 	blockWrites(h.r.history, release)
-	h.r.history.record(budgetv1alpha1.BandStandard, budgetv1alpha1.CounterRestart, time.Now())
+	h.r.history.record("", budgetv1alpha1.BandStandard, budgetv1alpha1.CounterRestart, time.Now())
 
 	hog := evPod("hog", nil, "", "")
 	hog.Annotations = map[string]string{budgetv1alpha1.AnnotationBand: "batch"}
@@ -416,7 +419,7 @@ func TestBudgetHistoryFinalFlushOnShutdown(t *testing.T) {
 	h := OpenBudgetHistory(dir, "fp", discardLog())
 	ctx, cancel := context.WithCancel(context.Background())
 	h.start(ctx)
-	h.record(budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
+	h.record("", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
 	cancel()
 	select {
 	case <-h.stopped:
@@ -426,5 +429,135 @@ func TestBudgetHistoryFinalFlushOnShutdown(t *testing.T) {
 	got := openHistory(t, dir, "fp")
 	if n := bandTotals(t, got, time.Now(), budgetv1alpha1.BandBatch).EvictionsTotal; n != 1 {
 		t.Fatalf("after shutdown the file holds evictions=%d, want 1", n)
+	}
+}
+
+// TestBudgetHistorySelfKillCannotEvictOthers: a restartPolicy: Always pod
+// that SIGKILLs itself thousands of times holds one classified-exit entry and
+// at most budgetHistoryRingPerPod window entries, so another pod's earlier OOM
+// kill is neither re-counted on re-delivery nor pushed out of the windows.
+// Its own totals stay exact.
+//
+// Fails-before: every termination appended a Seen entry and a ring entry, so
+// 5000 self-kills evicted the other pod's Seen entry (its re-delivered OOM
+// counted twice) and its ring entry (its windows read 0).
+func TestBudgetHistorySelfKillCannotEvictOthers(t *testing.T) {
+	h := openHistory(t, t.TempDir(), "fp")
+	t0 := time.Unix(1_000_000, 0)
+	oom := func(now time.Time) {
+		key := terminationKey{restartCount: 0, exitCode: 137, finishedAt: 1}
+		h.observeExit(budgetv1alpha1.BandBatch, "uid-victim", "c0", key, exitOf(137, oomKilledReason), now)
+	}
+	oom(t0)
+	const kills = 5000
+	for i := 0; i < kills; i++ {
+		observe(t, h, "uid-loop", "c0", int32(i), int64(i+10), exitOf(137, "Error"), t0.Add(time.Duration(i)*time.Millisecond))
+	}
+	now := t0.Add(10 * time.Minute)
+	oom(now) // re-delivered
+	batch := bandTotals(t, h, now, budgetv1alpha1.BandBatch)
+	std := bandTotals(t, h, now, budgetv1alpha1.BandStandard)
+	if batch.OOMKillsTotal != 1 {
+		t.Errorf("the victim's OOM kill counted %d times, want 1", batch.OOMKillsTotal)
+	}
+	if got := windowCount(batch, budgetv1alpha1.Window1h, budgetv1alpha1.CounterOOMKill); got != 1 {
+		t.Errorf("the victim's 1h OOM window = %d, want 1", got)
+	}
+	if got := windowCount(batch, budgetv1alpha1.Window24h, budgetv1alpha1.CounterOOMKill); got != 1 {
+		t.Errorf("the victim's 24h OOM window = %d, want 1", got)
+	}
+	if std.KernelKillsTotal != kills {
+		t.Errorf("the looping pod's total = %d, want %d (totals stay exact)", std.KernelKillsTotal, kills)
+	}
+	if got := windowCount(std, budgetv1alpha1.Window24h, budgetv1alpha1.CounterKernelKill); got != budgetHistoryRingPerPod {
+		t.Errorf("the looping pod's 24h window = %d, want the per-pod cap %d", got, budgetHistoryRingPerPod)
+	}
+	h.mu.Lock()
+	seen := len(h.st.Seen)
+	h.mu.Unlock()
+	if seen != 2 {
+		t.Errorf("classified-exit entries = %d, want 2 (one per container)", seen)
+	}
+}
+
+// TestStopBudgetHistoryFlushesBeforeExit: the node teardown's StopBudgetHistory
+// writes the last change and stops the writer even when the provider's context
+// has not ended (the run-loop-error exit), so a process that exits right after
+// it loses nothing.
+//
+// Fails-before: nothing joined the writer, so an exit right after the context
+// ended could beat the final flush.
+func TestStopBudgetHistoryFlushesBeforeExit(t *testing.T) {
+	dir := t.TempDir()
+	r, _ := newRuntimedFake(t)
+	r.history = OpenBudgetHistory(dir, "fp", discardLog())
+	r.history.start(context.Background())
+	r.history.record("uid-x", budgetv1alpha1.BandBatch, budgetv1alpha1.CounterEviction, time.Now())
+	if !NewVKProvider(r, "n").StopBudgetHistory() {
+		t.Fatal("StopBudgetHistory did not finish in its bound")
+	}
+	select {
+	case <-r.history.stopped:
+	default:
+		t.Fatal("the writer is still running after StopBudgetHistory")
+	}
+	st, err := readHistory(filepath.Join(dir, budgetHistoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Totals[budgetv1alpha1.BandBatch].Evictions; got != 1 {
+		t.Fatalf("the file holds evictions=%d after the stop, want 1", got)
+	}
+	if !r.StopBudgetHistory() {
+		t.Fatal("a second StopBudgetHistory must report true")
+	}
+}
+
+// TestFailedStopLeavesNoIntent: a stop whose RPC fails, is refused, or whose
+// verb runtimed lacks drops the intent it recorded, so the container's later
+// exit 137 is classified as if k3sm had not stopped it.
+//
+// Fails-before: the intent stayed and covered an exit the failed stop never
+// caused.
+func TestFailedStopLeavesNoIntent(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		stop func(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer, pod *corev1.Pod)
+	}{
+		{"StopContainer transport error", func(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer, pod *corev1.Pod) {
+			f.setStopErr(errors.New("connection reset"))
+			if err := r.stopContainerReason(ctx, string(pod.UID), "c0", reasonFailedPostStartHook); err == nil {
+				t.Fatal("the stop did not fail")
+			}
+		}},
+		{"StopContainer verb missing", func(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer, pod *corev1.Pod) {
+			f.setStopErr(status.Error(codes.Unimplemented, "unknown method StopContainer"))
+			if err := r.stopContainerReason(ctx, string(pod.UID), "c0", reasonFailedPostStartHook); !errors.Is(err, errStopVerbMissing) {
+				t.Fatalf("err = %v, want errStopVerbMissing", err)
+			}
+		}},
+		{"DeletePod error", func(t *testing.T, r *runtimedRuntime, f *fakeRuntimeServer, pod *corev1.Pod) {
+			f.mu.Lock()
+			f.deleteFIFO = append(f.deleteFIFO, errors.New("runtimed unavailable"))
+			f.mu.Unlock()
+			if err := r.teardownPod(ctx, pod, minimumGracePeriodSeconds, nil); err == nil {
+				t.Fatal("the delete did not fail")
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, f := newRuntimedFake(t)
+			r.history = openHistory(t, t.TempDir(), "fp")
+			pod := runtimedPod("default", "web")
+			if err := r.CreatePod(ctx, pod); err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			tc.stop(t, r, f, pod)
+			if got := intentsFor(r.history, pod.UID); len(got) != 0 {
+				t.Fatalf("intents after a failed stop = %+v, want none", got)
+			}
+		})
 	}
 }

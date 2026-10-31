@@ -997,8 +997,11 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// runs once the node is Ready (open, below).
 	eviction := newGatedLoop(ctx)
 	closeRuntime := stopEmbeddedRuntime(prov, slog.Default())
+	flushBudgetHistory := stopBudgetHistory(prov, slog.Default())
 	stopRuntime := func() {
 		eviction.stop(evictionStopTimeout)
+		// After the eviction loop, so its last count is in the final flush.
+		flushBudgetHistory()
 		closeRuntime()
 	}
 	// nodeExited closes once BOTH of this node's loops have returned — the Virtual
@@ -1303,6 +1306,32 @@ func stopEmbeddedRuntime(prov vkadapter.Provider, log *slog.Logger) func() {
 			}
 			log.Info("stopped the embedded runtime at node exit (pod processes and vm helpers left running for the next start)",
 				"elapsed", time.Since(start))
+		})
+	}
+}
+
+// budgetHistoryStopper is the node-exit seam that flushes and stops the
+// provider's budget history writer, waiting a bounded time (the provider owns
+// the bound). Declared at this consumer, like embeddedRuntimeCloser.
+type budgetHistoryStopper interface {
+	StopBudgetHistory() bool
+}
+
+// stopBudgetHistory returns the idempotent teardown closure that flushes and
+// stops prov's budget history writer, so a node exiting right after its
+// context ends (a `launchctl kickstart -k`) still persists its last counts. A
+// provider without the seam gets a no-op.
+func stopBudgetHistory(prov vkadapter.Provider, log *slog.Logger) func() {
+	s, ok := prov.(budgetHistoryStopper)
+	if !ok {
+		return func() {}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if !s.StopBudgetHistory() {
+				log.Warn("the budget history did not finish its final flush before node exit; its latest counts may be lost")
+			}
 		})
 	}
 }

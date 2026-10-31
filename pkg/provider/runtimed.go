@@ -2228,8 +2228,9 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 	t.quiesceForEviction()
 	// The intent write is time-boxed: a stalled disk must not hold back the
 	// kill that keeps the node from running out of memory.
-	r.recordStopIntentWithin(tracked, "", budgetIntentWriteBound)
+	intent := r.recordStopIntentWithin(tracked, "", budgetIntentWriteBound)
 	if _, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: 0}); err != nil {
+		r.history.dropIntent(intent)
 		t.unmarkEvicted(st)
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
@@ -2280,9 +2281,10 @@ func (t *podTrack) quiesce() {
 // idempotent re-create installed meanwhile is left alone.
 func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grace int64, owned *podTrack) error {
 	id := string(pod.UID)
-	r.recordStopIntent(pod, "")
+	intent := r.recordStopIntent(pod, "")
 	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace})
 	if err != nil {
+		r.history.dropIntent(intent)
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	// Stop the probe runner before forgetting the pod (stopProber waits for the
