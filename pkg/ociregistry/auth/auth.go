@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -200,6 +199,7 @@ func (a *Access) Authorize(r *http.Request, verb api.Verb, n ref.Name) error {
 		return nil
 	}
 	if user == "" {
+		a.log.Debug("registry request refused", "reason", "anonymous", "source", source(r), "method", r.Method, "path", r.URL.Path, "verb", verb.String(), "repository", n.String())
 		return api.ErrUnauthenticated
 	}
 	a.log.Warn("registry request refused", "reason", "denied", "user", user, "source", source(r), "method", r.Method, "path", r.URL.Path, "verb", verb.String(), "repository", n.String())
@@ -260,23 +260,24 @@ func (a *Access) verify(hdr []string) (string, bool) {
 }
 
 // take reports whether src has a failure token. With charge it spends one;
-// without, it only looks. A source not yet tracked starts full; when MaxSources
-// are tracked, sources whose buckets have refilled are forgotten first, and a
-// new source that still finds no room is refused before anything is compared.
+// without, it only looks. A source not yet tracked has a full bucket, so a
+// look at it always succeeds and takes no slot. Charging a new source needs a
+// slot: when MaxSources are tracked, sources whose buckets have refilled are
+// forgotten first, and a new source that still finds no room is refused.
 func (a *Access) take(src string, charge bool) bool {
 	t := a.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	b, ok := a.sources[src]
 	if !ok {
+		if !charge {
+			return true
+		}
 		if len(a.sources) >= MaxSources {
 			a.forgetFull(t)
 			if len(a.sources) >= MaxSources {
 				return false
 			}
-		}
-		if !charge {
-			return true
 		}
 		b = &bucket{tokens: a.burst, at: t}
 		a.sources[src] = b
@@ -310,11 +311,8 @@ func (a *Access) forgetFull(t time.Time) {
 	}
 }
 
-// source is the host of r's RemoteAddr: the peer the connection came from,
-// never a header the client wrote.
-func source(r *http.Request) string {
-	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return h
-	}
-	return r.RemoteAddr
-}
+// source is r's RemoteAddr, host and port: the connection the request came
+// on, never a header the client wrote. Keying on the connection rather than
+// the host keeps one loopback client's failures off every other loopback
+// client's bucket.
+func source(r *http.Request) string { return r.RemoteAddr }

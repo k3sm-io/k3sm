@@ -580,3 +580,59 @@ func FuzzAuthorization(f *testing.F) {
 		}
 	})
 }
+
+// TestFailureBucketPerConnection checks that the failure bucket is keyed on
+// the connection, not the host: every native pod and the push gate reach the
+// registry from loopback, so a client sending wrong secrets on its own
+// connections must not make another connection's valid credential get 429,
+// even with every tracked slot held by an empty bucket.
+func TestFailureBucketPerConnection(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	clock := func() time.Time { return now }
+	conn := func(port int, c caller) *http.Request {
+		r := httptest.NewRequest(http.MethodPut, "/v2/x/manifests/latest", nil)
+		r.RemoteAddr = fmt.Sprintf("127.0.0.1:%d", port)
+		if c.auth != "" {
+			r.Header.Set("Authorization", c.auth)
+		}
+		return r
+	}
+
+	t.Run("an exhausted connection leaves the others alone", func(t *testing.T) {
+		a := newAccess(t, func(c *Config) { c.Burst, c.Refill, c.Now = 2, time.Hour, clock })
+		for range 5 {
+			_ = a.Authorize(conn(50001, wrong), api.VerbWrite, ref.Name{})
+		}
+		if err := a.Authorize(conn(50001, asPush), api.VerbWrite, ref.Name{}); !errors.Is(err, api.ErrRateLimited) {
+			t.Fatalf("the exhausted connection: %v, want ErrRateLimited", err)
+		}
+		for i, c := range []caller{asPush, asGate} {
+			if err := a.Authorize(conn(50002+i, c), api.VerbWrite, ref.Name{}); err != nil {
+				t.Errorf("%s on another loopback connection: %v", c.name, err)
+			}
+		}
+	})
+
+	t.Run("a full table does not refuse a good credential", func(t *testing.T) {
+		a := newAccess(t, func(c *Config) { c.Burst, c.Refill, c.Now = 1, time.Hour, clock })
+		for i := range MaxSources {
+			_ = a.Authorize(conn(10000+i, wrong), api.VerbWrite, ref.Name{})
+		}
+		if len(a.sources) != MaxSources {
+			t.Fatalf("tracked %d sources, want %d", len(a.sources), MaxSources)
+		}
+		for i, c := range []caller{asPush, asGate} {
+			if err := a.Authorize(conn(60000+i, c), api.VerbWrite, ref.Name{}); err != nil {
+				t.Errorf("%s on a new connection with the table full: %v", c.name, err)
+			}
+		}
+		// A new failing connection finds no slot: it is refused, and the
+		// table stays bounded.
+		if err := a.Authorize(conn(60010, wrong), api.VerbWrite, ref.Name{}); !errors.Is(err, api.ErrRateLimited) {
+			t.Fatalf("a new failing connection with the table full: %v, want ErrRateLimited", err)
+		}
+		if len(a.sources) != MaxSources {
+			t.Errorf("tracked %d sources, want %d", len(a.sources), MaxSources)
+		}
+	})
+}

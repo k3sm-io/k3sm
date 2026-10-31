@@ -69,15 +69,14 @@ func renderServeConfig(push, gate Credential) ([]byte, error) {
 
 // writeServeConfig writes the serve config for workDir: the state dir at 0700,
 // the file at 0600 through a fresh temp file and a rename, owned by this
-// process's user (the service user the daemon runs as).
+// process's user (the service user the daemon runs as), and the directory
+// synced after the rename so the new file survives a crash.
 func writeServeConfig(workDir string, body []byte) error {
-	dir := ServeStateDir(workDir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create the registry state dir: %w", err)
+	d, err := openStateDir(ServeStateDir(workDir))
+	if err != nil {
+		return err
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return fmt.Errorf("restrict the registry state dir: %w", err)
-	}
+	defer d.Close()
 	path := ServeConfigPath(workDir)
 	tmp := path + ".tmp"
 	// A leftover temp file from an interrupted write may have any mode; it is
@@ -102,6 +101,66 @@ func writeServeConfig(workDir string, body []byte) error {
 	if werr != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("write the registry serve config: %w", werr)
+	}
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync the registry state dir: %w", err)
+	}
+	return nil
+}
+
+// openStateDir creates the state dir at 0700 if it is missing and returns it
+// open. It refuses, fail-closed, a path that is a symlink or not a directory,
+// and a directory another user owns. A directory of this user's own with a
+// wider mode is corrected to 0700, through the open descriptor, so the chmod
+// never follows a symlink. Only the last component is checked: the work dir
+// above it belongs to the service user.
+func openStateDir(dir string) (*os.File, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("create the registry state dir: %w", err)
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return nil, fmt.Errorf("check the registry state dir: %w", err)
+	}
+	if err := checkStateDir(dir, fi); err != nil {
+		return nil, err
+	}
+	d, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open the registry state dir: %w", err)
+	}
+	// The open descriptor is what is checked and changed from here on; it must
+	// be the directory the Lstat saw.
+	dfi, err := d.Stat()
+	if err == nil && !os.SameFile(fi, dfi) {
+		err = fmt.Errorf("registry state dir %s changed while it was checked", dir)
+	}
+	if err == nil {
+		err = checkStateDir(dir, dfi)
+	}
+	if err == nil && dfi.Mode().Perm() != 0o700 {
+		if cerr := d.Chmod(0o700); cerr != nil {
+			err = fmt.Errorf("restrict the registry state dir: %w", cerr)
+		}
+	}
+	if err != nil {
+		_ = d.Close()
+		return nil, err
+	}
+	return d, nil
+}
+
+// checkStateDir refuses a state dir that is a symlink, not a directory, or
+// not owned by this process's user.
+func checkStateDir(dir string, fi os.FileInfo) error {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	switch {
+	case fi.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("registry state dir %s is a symlink", dir)
+	case !fi.IsDir():
+		return fmt.Errorf("registry state dir %s is not a directory", dir)
+	case !ok || int(st.Uid) != os.Geteuid():
+		return fmt.Errorf("registry state dir %s is not owned by this user", dir)
 	}
 	return nil
 }

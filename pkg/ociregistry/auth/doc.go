@@ -34,7 +34,10 @@ limitations under the License.
 // hashes the presented secret once and compares the digests with
 // crypto/subtle, and an unknown user runs the same compare against a dummy
 // digest, so the answer's timing does not tell a known user from an unknown
-// one.
+// one. An unsalted SHA-256 is safe only for a secret of that entropy, so the
+// daemon's per-boot credential generator is the only sanctioned producer of a
+// stored hash; a hash of a chosen or human password must never be written
+// into the serve config.
 //
 // Answers:
 //
@@ -45,19 +48,30 @@ limitations under the License.
 //     and is charged to the source's failure bucket;
 //   - a verified principal without the permission is ErrDenied: 403 DENIED;
 //   - a source whose failure bucket is empty gets ErrRateLimited (429) for any
-//     request that presents credentials, before anything is compared. Requests
-//     without credentials do not draw on the bucket.
+//     request that presents credentials, before anything is compared, so a
+//     guess from an empty bucket cannot be told from a hit. Requests without
+//     credentials do not draw on the bucket.
 //
 // The bucket replaces the registry's earlier one-second failure delay without
 // holding a goroutine per failed attempt. A source is the request's
-// RemoteAddr host only: a forwarded-for header is never trusted. Every
-// connection through the TLS relay arrives from loopback, so all relayed
-// clients share one bucket; a client that exhausts it with wrong secrets can
-// make the others wait for the refill, which is the price of not trusting a
-// header the client writes.
+// RemoteAddr, host and port, which is the TCP connection the request came on:
+// a forwarded-for header is never trusted. Every caller of the registry is on
+// loopback (the local CLI, the node's runtime, native pods and the push gate),
+// so a bucket per host would be one bucket for all of them, and a pod sending
+// wrong secrets could keep the CLI and the gate at 429. Per connection, a
+// client's failures spend only its own connections' buckets. Relayed clients
+// never reach this package with a credential of their own: the push gate
+// strips every client Authorization header and forwards a write only under
+// its own credential, which verifies, so the gate's pooled connections are
+// never charged. The bucket therefore bounds the work one connection can
+// cause; it is not a brute-force defence (a client may open new connections),
+// and need not be, because the secrets carry 256 bits.
 //
 // Limits, all fail-closed: one Authorization header of at most
 // MaxAuthorizationBytes, a user name of at most MaxUserBytes and a secret of
-// at most MaxSecretBytes, and at most MaxSources tracked sources (a new
-// source beyond that, when no tracked one has refilled, is rate limited).
+// at most MaxSecretBytes, and at most MaxSources tracked sources. Only a
+// source with a failure takes a slot; a new source that fails while every
+// slot is held by a bucket that has not refilled is rate limited, and a new
+// source whose credential verifies never needs a slot, so a full table never
+// refuses it.
 package auth

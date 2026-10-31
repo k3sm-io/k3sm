@@ -161,3 +161,54 @@ func TestServeConfig(t *testing.T) {
 		}
 	})
 }
+
+// TestServeStateDirHardening checks that writeServeConfig refuses a state dir
+// that is a symlink or not a directory, and corrects the mode of one that is
+// this user's own real directory.
+func TestServeStateDirHardening(t *testing.T) {
+	body := []byte("{}\n")
+	t.Run("refuses a symlinked state dir", func(t *testing.T) {
+		work := t.TempDir()
+		target := t.TempDir()
+		if err := os.Chmod(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, ServeStateDir(work)); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeServeConfig(work, body); err == nil {
+			t.Fatal("writeServeConfig wrote through a symlinked state dir")
+		}
+		if _, err := os.Lstat(target + "/serve.json"); !os.IsNotExist(err) {
+			t.Errorf("a serve config landed in the symlink target: %v", err)
+		}
+	})
+	t.Run("refuses a state dir that is a file", func(t *testing.T) {
+		work := t.TempDir()
+		if err := os.WriteFile(ServeStateDir(work), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeServeConfig(work, body); err == nil {
+			t.Fatal("writeServeConfig accepted a regular file as the state dir")
+		}
+	})
+	t.Run("corrects the mode of its own directory", func(t *testing.T) {
+		work := t.TempDir()
+		if err := os.Mkdir(ServeStateDir(work), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(ServeStateDir(work), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeServeConfig(work, body); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Lstat(ServeStateDir(work))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o700 {
+			t.Errorf("state dir mode %#o, want 0700", fi.Mode().Perm())
+		}
+	})
+}
