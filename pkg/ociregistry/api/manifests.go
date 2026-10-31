@@ -453,11 +453,14 @@ func (s *Server) notNamedByIndex(n ref.Name, rows []ispec.Descriptor, d digest.D
 	return nil
 }
 
+// errManifestSize is an index row whose size no manifest may have.
+var errManifestSize = errors.New("manifest size out of bounds")
+
 // readManifestBlob reads the body a row names, bounded and checked against the
 // row's digest.
 func (s *Server) readManifestBlob(n ref.Name, row ispec.Descriptor) ([]byte, error) {
 	if row.Size < 0 || row.Size > store.MaxManifestSize {
-		return nil, fmt.Errorf("manifest %s: size %d out of bounds", row.Digest, row.Size)
+		return nil, fmt.Errorf("%w: manifest %s: size %d", errManifestSize, row.Digest, row.Size)
 	}
 	f, err := s.st.OpenBlob(n, row.Digest)
 	if err != nil {

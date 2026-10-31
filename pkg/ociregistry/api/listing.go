@@ -18,6 +18,7 @@ package api
 
 import (
 	"errors"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -38,6 +39,10 @@ const maxPage = 10000
 // The distribution spec lets a registry page an unbounded catalog request, and
 // a client follows the Link.
 const defaultCatalogPage = 1000
+
+// catalogVisits is the visit budget of a catalog page of n entries: four
+// visits an entry, and at least 1,000.
+func catalogVisits(n int) int { return max(4*n, 1000) }
 
 // parsePage reads n and last from q. n is def when absent and at most most;
 // a negative def means no limit. validLast checks the cursor's grammar.
@@ -123,6 +128,17 @@ func writeJSON(w http.ResponseWriter, r *http.Request, contentType string, v any
 // one page at a time. A request without n gets defaultCatalogPage entries and
 // n is capped at maxPage. The store walk stops once the page is full and skips
 // every subtree before the cursor, so a page never costs the whole root.
+//
+// Every repository the walk visits, readable or denied, counts against a visit
+// budget of catalogVisits(n). Once it is spent the page ends early, at the
+// next readable name, with a Link whose cursor is that name. The cursor is
+// always a name the caller may read and was sent in the page: a denied name,
+// or any string placed between denied names, would tell the caller where
+// names it may not see sort, so it is never used. The cost of that choice is
+// that a run of denied names after the budget is spent is still walked, up to
+// the next readable name or the end of the store; a caller denied on nearly
+// every repository is bounded only by an Authorizer that can answer for many
+// names at once.
 func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 	if !s.allow(w, r, VerbRead, ref.Name{}) {
 		return
@@ -138,7 +154,12 @@ func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 	page := []string{}
 	more := false
 	if n > 0 {
+		budget, visits := catalogVisits(n), 0
 		err = s.st.WalkRepositories(last, func(rn ref.Name) bool {
+			visits++
+			if s.catalogVisited != nil {
+				s.catalogVisited()
+			}
 			if s.authorize(r, VerbRead, rn) != nil {
 				return true
 			}
@@ -147,6 +168,10 @@ func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 				return false
 			}
 			page = append(page, rn.String())
+			if visits >= budget && len(page) < n {
+				more = true // the next page may be empty
+				return false
+			}
 			return true
 		})
 		if err != nil {
@@ -216,6 +241,14 @@ func (s *Server) referrers(w http.ResponseWriter, r *http.Request, n ref.Name) {
 		s.fail(w, r, err)
 		return
 	}
+	if len(q["artifactType"]) > maxArtifactTypes {
+		s.fail(w, r, errorf(http.StatusBadRequest, codeUnsupported, "at most 8 artifactType values"))
+		return
+	}
+	filter := map[string]bool{}
+	for _, at := range q["artifactType"] {
+		filter[at] = true
+	}
 	all, err := s.referrersOf(r, n, d)
 	if err != nil {
 		if errors.Is(err, errReferrersBusy) {
@@ -224,7 +257,6 @@ func (s *Server) referrers(w http.ResponseWriter, r *http.Request, n ref.Name) {
 		s.fail(w, r, err)
 		return
 	}
-	filter := q["artifactType"]
 	out := ispec.Index{MediaType: ispec.MediaTypeImageIndex, Manifests: []ispec.Descriptor{}}
 	out.SchemaVersion = 2
 	i := 0
@@ -237,7 +269,7 @@ func (s *Server) referrers(w http.ResponseWriter, r *http.Request, n ref.Name) {
 	more, used := false, 0
 	for ; i < len(all) && size > 0; i++ {
 		e := all[i]
-		if len(filter) > 0 && !slices.Contains(filter, e.desc.ArtifactType) {
+		if len(filter) > 0 && !filter[e.desc.ArtifactType] {
 			continue
 		}
 		if len(out.Manifests) == size || (len(out.Manifests) > 0 && used+e.size > s.refPageBytes) {
@@ -250,7 +282,7 @@ func (s *Server) referrers(w http.ResponseWriter, r *http.Request, n ref.Name) {
 	if more {
 		v := url.Values{"n": {strconv.Itoa(size)}, "last": {out.Manifests[len(out.Manifests)-1].Digest.String()}}
 		if len(filter) > 0 {
-			v["artifactType"] = filter
+			v["artifactType"] = slices.Sorted(maps.Keys(filter))
 		}
 		w.Header().Set("Link", "</v2/"+n.String()+"/referrers/"+d.String()+"?"+v.Encode()+`>; rel="next"`)
 	}
