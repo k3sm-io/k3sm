@@ -23,6 +23,13 @@ pin, its date, and the tarball's sha256.
   names the worst signal and its message lists each one with its value and rung. It is advisory:
   nothing taints the node or evicts a Pod on it. The node's pressure sampler now runs once a
   second from the warn rung up, not only past the half-way marks.
+- The registry store k3sm is replacing zot with has an online garbage collector that runs
+  while pushes continue. A blob's age counts from the last mount, link or upload that named it,
+  recorded on disk so a restart keeps it, and a sweep re-reads the index and re-checks each
+  candidate under the repository lock before deleting. The first sweep over a store only
+  reports what it would reap, no sweep runs within one grace period of start, and a sweep that
+  would delete more than half of a repository's blobs stops. It also removes upload sessions
+  and temporary blob links an interrupted write left behind. It is not yet scheduled.
 
 ### Changed
 
