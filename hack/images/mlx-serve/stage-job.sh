@@ -36,8 +36,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # generated requirements.lock (build.sh's UV_MIN), and it is the uv whose
 # manifest maps build.sh's PY_KEY to build.sh's PY_URL; a later uv maps the same
 # key to a newer python-build-standalone build, which build.sh refuses.
-UV_VERSION="0.12.7"
-UV_SHA256="127ebdda7ad953cdf198e964b570ea5771b85467ea93eb7cb6d6f8e6f55408f3"
+UV_VERSION="0.13.1"
+UV_SHA256="cfe454573412ff7380d15fc7dae5997ab53ffce72fce0a78e91ddbc84001acd2"
 UV_URL="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-aarch64-apple-darwin.tar.gz"
 
 NAMESPACE="mlx-serve-build"

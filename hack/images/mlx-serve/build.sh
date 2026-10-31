@@ -48,12 +48,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # is not a pin — a later uv ships a newer python-build-standalone build of the
 # same CPython patch version — so the URL is asserted before staging.
 PY_KEY="cpython-3.12.14-macos-aarch64-none"
-PY_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20260825/cpython-3.12.14%2B20260825-aarch64-apple-darwin-install_only_stripped.tar.gz"
+PY_URL="https://releases.astral.sh/github/python-build-standalone/releases/download/20260929/cpython-3.12.14%2B20260929-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PY_BIN="bin/python3.12"
 # The uv that generated requirements.lock. Older uv is refused rather than
 # tried: the JSON interpreter listing this script pins against is not in every
 # release, and a silent skip of the URL assertion would un-pin the interpreter.
-UV_MIN="0.12.7"
+UV_MIN="0.13.1"
 
 # The serving contract, and the one flag the engine will not work without.
 # At its defaults this engine serves ONE request at a time and answers HTTP 503
@@ -80,7 +80,7 @@ SERVE_MODULE="k3sm_serve"
 # The tag this script builds under (the publish step, `k3sm image push`, is the
 # operator's; see README.md). A build output has no digest until it is built,
 # so it stays a tag here; consumers pin the digest the registry reports for it.
-DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.2"
+DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3"
 
 # ---- options ----------------------------------------------------------------
 WORK="${K3SM_MLX_WORK:-$HOME/.cache/k3sm/mlx-serve}"

@@ -1137,8 +1137,8 @@ fi
 # here, independently of stage-job.sh, so an edited pin goes red until it is
 # re-checked against the release's published sha256 and edited here too.
 STAGEJOB="$HERE/stage-job.sh"
-GOLD_UV_VERSION="0.12.7"
-GOLD_UV_SHA256="127ebdda7ad953cdf198e964b570ea5771b85467ea93eb7cb6d6f8e6f55408f3"
+GOLD_UV_VERSION="0.13.1"
+GOLD_UV_SHA256="cfe454573412ff7380d15fc7dae5997ab53ffce72fce0a78e91ddbc84001acd2"
 GOLD_UV_URL="https://github.com/astral-sh/uv/releases/download/$GOLD_UV_VERSION/uv-aarch64-apple-darwin.tar.gz"
 GOLD_NODE="k3sm-golden"
 RJ="$WORK/stage-job.yaml"
