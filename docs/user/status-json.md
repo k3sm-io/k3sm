@@ -575,6 +575,11 @@ and no pod or workload names. `budget` is omitted when the budget is unknown: th
 running, its record is missing or does not parse, or its `observedAt` is more than 60 seconds from
 the time of the report. Readers must treat a missing `budget` as unknown, never as calm.
 
+The block is read from that node-local record, which the k3sm service user writes. Nothing
+authenticates it, and any process running as that user could change it, so it is informational. A
+consumer may use it only to refuse or delay an action, never to allow one. The authoritative copy
+is the cluster's `NodeBudget` for this node.
+
 ## Interconnect
 
 The `interconnect` object describes the cluster's [interconnect](interconnects.md), read from the

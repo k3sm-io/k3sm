@@ -106,7 +106,11 @@ const StatusDirMode fs.FileMode = 0o755
 // profile, which confines pod writes to the pod's own volume, not the owner.
 // Nothing that acts reads these copies (`k3sm status` only reports them, and the
 // 0600 originals in the work dir stay the source), so a forged copy can mislead
-// an unprivileged report and nothing else.
+// an unprivileged report and nothing else. The budget record (BudgetRecordName)
+// has no work-dir original: it is the node-local record the service user
+// writes, the source of the report's budget block. It is unauthenticated and
+// informational. A consumer may use it only to refuse or delay an action, never
+// to allow one; the cluster's NodeBudget is the authoritative copy.
 const StatusSubdir = "status"
 
 // MeshClaimsRecordName and ServicesRecordName are the basenames of the two
