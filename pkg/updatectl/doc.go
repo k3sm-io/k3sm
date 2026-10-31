@@ -36,19 +36,25 @@ limitations under the License.
 // no archive, or whose manifest is missing, malformed, or names another
 // version or archive digest (ManifestMismatch) fails the roll before any node
 // is cordoned, as does a manifest that still cannot be read ResolveBound
-// after the release resolved. So does the compatibility window: a node to be
+// after its first failed read (the Manifest condition records the read). A
+// controller that restarts mid-roll reads the manifest again before its next
+// handover under the same bound; past it that node is failed in place, still
+// cordoned, and the roll stops with ManifestMismatch. So does the compatibility window: a node to be
 // updated that runs a release older than the manifest's compatibleFrom, or
 // one that does not parse as a release, a release whose manifest says it
-// requires the installer, and a release that raises a node's Kubernetes
-// minor by more than one (or changes its major) end the Update Failed with
-// OutsideCompatibilityWindow.
+// requires the installer, a release that raises a node's Kubernetes minor by
+// more than one (or changes its major), and a node whose kubeletVersion does
+// not parse end the Update Failed with OutsideCompatibilityWindow; each
+// refusal's message starts with its own prefix ("outside the compatibility
+// window", "requires the installer", "Kubernetes minor step too large",
+// "unreadable node Kubernetes version").
 //
 // The plan is recorded in status.nodes. When the manifest's kubeMinor is the
 // minor every node to be updated already runs, the order is every node that
 // is not a server, sorted by name, then every other server, then the server
 // this controller runs on, last: the controller and its signer stay up while
-// workers roll, and a bad payload is caught on a worker. When it rises (or a
-// node's minor cannot be read), the upstream skew policy forbids a kubelet
+// workers roll, and a bad payload is caught on a worker. When it rises, the
+// upstream skew policy forbids a kubelet
 // newer than its apiserver, so the order is this server first, then every
 // other server, then every worker. Each entry records the release the node ran
 // (From) and the target (To). The roll then visits the entries in order, one

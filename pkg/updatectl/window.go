@@ -18,14 +18,19 @@ package updatectl
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	updatesv1alpha1 "k3sm.io/apis/updates/v1alpha1"
 	"k3sm.io/k3sm/pkg/certs"
@@ -110,11 +115,17 @@ type releaseManifest struct {
 // resolved archive digest. A missing asset or a mismatch is a rollFailure; a
 // transient read error is returned as is, to be retried.
 //
+// A transient read failure is retried for ResolveBound, counted from the
+// first failure (the Manifest condition's transition time, so the bound
+// survives a restart); past it the read is a rollFailure with
+// ReasonManifestMismatch. The bound holds at the plan, before any cordon,
+// and at a handover after a restart, where the node is failed in place.
+//
 // The resolved digest is what anchors a re-read manifest: the node checks
 // every extracted file against the manifest and the archive against its
 // digest, so a manifest swapped between two reads cannot change the bytes a
 // node runs, only describe the same archive.
-func (c *Controller) ensureManifest(ctx context.Context, u *updatesv1alpha1.Update) (*releaseManifest, error) {
+func (c *Controller) ensureManifest(ctx context.Context, u *updatesv1alpha1.Update, now time.Time) (*releaseManifest, error) {
 	r := u.Status.Resolved
 	if r == nil || !strings.HasPrefix(r.Digest, "sha256:") {
 		return nil, errors.New("the release has not been resolved")
@@ -131,6 +142,14 @@ func (c *Controller) ensureManifest(ctx context.Context, u *updatesv1alpha1.Upda
 		}
 		if errors.Is(err, ErrRelease) {
 			return nil, rollFailure{err: err, reason: ReasonManifestMismatch}
+		}
+		prev := meta.FindStatusCondition(u.Status.Conditions, ConditionManifest)
+		c.setCondition(u, ConditionManifest, metav1.ConditionFalse, ReasonRetrying, err.Error())
+		if prev != nil && prev.Status == metav1.ConditionFalse && now.Sub(prev.LastTransitionTime.Time) > ResolveBound {
+			return nil, rollFailure{
+				err:    fmt.Errorf("the payload manifest could not be read within %s; last error: %w", ResolveBound, err),
+				reason: ReasonManifestMismatch,
+			}
 		}
 		return nil, err
 	}
@@ -157,8 +176,12 @@ func (c *Controller) ensureManifest(ctx context.Context, u *updatesv1alpha1.Upda
 		return nil, mismatch("compatibleFrom %q is not a release version", m.CompatibleFrom)
 	}
 	c.manifest = &releaseManifest{version: u.Spec.Version, digest: digest, raw: raw, m: m}
+	c.setCondition(u, ConditionManifest, metav1.ConditionTrue, ReasonManifestRead, "sha256:"+sha256Hex(raw))
 	return c.manifest, nil
 }
+
+// sha256Hex is the lowercase hex sha256 of b.
+func sha256Hex(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 
 // signManifest is the manifest annotations of a handover, signed by signer.
 func signManifest(signer *certs.UpdateSigner, m *releaseManifest) (raw, sig string, err error) {
@@ -178,7 +201,7 @@ func signManifest(signer *certs.UpdateSigner, m *releaseManifest) (raw, sig stri
 // cordoned.
 func checkWindow(m *certs.PayloadManifest, pending []*corev1.Node) error {
 	if m.RequiresInstaller {
-		return fmt.Errorf("%s requires the installer and cannot be applied in place; install it on each node with the installer", m.Version)
+		return fmt.Errorf("requires the installer: %s cannot be applied in place; install it on each node with the installer", m.Version)
 	}
 	if err := checkKubeMinorStep(m, pending); err != nil {
 		return err
@@ -196,7 +219,7 @@ func checkWindow(m *certs.PayloadManifest, pending []*corev1.Node) error {
 		}
 	}
 	if len(bad) > 0 {
-		return fmt.Errorf("%s accepts nodes from %s on, and %s; update those nodes with the installer first",
+		return fmt.Errorf("outside the compatibility window: %s accepts nodes from %s on, and %s; update those nodes with the installer first",
 			m.Version, m.CompatibleFrom, strings.Join(bad, ", "))
 	}
 	return nil
@@ -234,7 +257,8 @@ func parseKubeMinor(s string) (kubeMinor, bool) {
 // kubeMinorRises reports whether the release raises the Kubernetes minor of
 // any node to be updated: one whose kubeletVersion carries an older minor, or
 // whose minor cannot be read (then the server goes first, the order the
-// upstream skew policy always allows).
+// upstream skew policy always allows; the plan has already refused such a
+// node in checkKubeMinorStep, so this is a fail-safe default).
 func kubeMinorRises(m *certs.PayloadManifest, pending []*corev1.Node) bool {
 	target, ok := parseKubeMinor(m.KubeMinor)
 	if !ok {
@@ -250,26 +274,31 @@ func kubeMinorRises(m *certs.PayloadManifest, pending []*corev1.Node) bool {
 }
 
 // checkKubeMinorStep refuses a release that raises the Kubernetes minor of a
-// node to be updated by more than one, or moves it to another major. A node
-// whose minor cannot be read is left to kubeMinorRises, which puts the server
-// first.
+// node to be updated by more than one, or moves it to another major, and a
+// node whose kubeletVersion does not parse (its minor cannot be placed, so it
+// is refused, as an unparseable manifest kubeMinor is).
 func checkKubeMinorStep(m *certs.PayloadManifest, pending []*corev1.Node) error {
 	target, ok := parseKubeMinor(m.KubeMinor)
 	if !ok {
-		return fmt.Errorf("the payload manifest's kubeMinor %q is not MAJOR.MINOR", m.KubeMinor)
+		return fmt.Errorf("unreadable manifest kubeMinor: the payload manifest's kubeMinor %q is not MAJOR.MINOR", m.KubeMinor)
 	}
-	var bad []string
+	var unreadable, bad []string
 	for _, n := range pending {
 		cur, ok := parseKubeMinor(n.Status.NodeInfo.KubeletVersion)
 		if !ok {
+			unreadable = append(unreadable, fmt.Sprintf("%s reports kubeletVersion %q", n.Name, n.Status.NodeInfo.KubeletVersion))
 			continue
 		}
 		if cur.major != target.major || target.minor-cur.minor > 1 {
 			bad = append(bad, fmt.Sprintf("%s runs Kubernetes %d.%d", n.Name, cur.major, cur.minor))
 		}
 	}
+	if len(unreadable) > 0 {
+		return fmt.Errorf("unreadable node Kubernetes version: %s; the release's Kubernetes step cannot be checked, so the update is refused until the node reports its version",
+			strings.Join(unreadable, ", "))
+	}
 	if len(bad) > 0 {
-		return fmt.Errorf("%s ships Kubernetes %d.%d, more than one minor above where %s; update through each minor in between first",
+		return fmt.Errorf("Kubernetes minor step too large: %s ships Kubernetes %d.%d, more than one minor above where %s; update through each minor in between first",
 			m.Version, target.major, target.minor, strings.Join(bad, ", "))
 	}
 	return nil

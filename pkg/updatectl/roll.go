@@ -185,6 +185,10 @@ const (
 	ConditionSucceeded   = "Succeeded"
 	ConditionFailed      = "Failed"
 	ConditionResolved    = "Resolved"
+	// ConditionManifest is True once the release's payload manifest was read
+	// and checked, and False (ReasonRetrying) while a transient read failure
+	// is retried; its transition time is where ResolveBound counts from.
+	ConditionManifest = "Manifest"
 )
 
 // The condition reasons this controller writes.
@@ -196,6 +200,9 @@ const (
 	ReasonFailed    = "Failed"
 	ReasonCancelled = "Cancelled"
 	ReasonResolved  = "Resolved"
+	// ReasonManifestRead is the Manifest condition's reason once the
+	// manifest was read and checked.
+	ReasonManifestRead = "ManifestRead"
 )
 
 // Payload is the JSON value of the k3sm.io/update-payload Node annotation, the
@@ -421,9 +428,9 @@ func (c *Controller) plan(ctx context.Context, u *updatesv1alpha1.Update, nodes 
 		if err := c.ensureResolved(ctx, u, now); err != nil {
 			return err
 		}
-		m, err := c.ensureManifest(ctx, u)
+		m, err := c.ensureManifest(ctx, u, now)
 		if err != nil {
-			return manifestBound(u, now, err)
+			return err
 		}
 		if err := checkWindow(m.m, pending); err != nil {
 			return rollFailure{err: err, reason: ReasonOutsideCompatibilityWindow}
@@ -439,27 +446,6 @@ func (c *Controller) plan(ctx context.Context, u *updatesv1alpha1.Update, nodes 
 	}
 	u.Status.Phase = updatesv1alpha1.UpdatePhasePending
 	return nil
-}
-
-// manifestBound bounds the plan's transient manifest read failures the way
-// ensureResolved bounds the release index's: err is returned to be retried
-// until ResolveBound has passed since the release resolved (the Resolved
-// condition's transition time, which survives a restart), then the roll fails
-// with ReasonManifestMismatch before any node is cordoned. A rollFailure is
-// returned as is.
-func manifestBound(u *updatesv1alpha1.Update, now time.Time, err error) error {
-	var rf rollFailure
-	if errors.As(err, &rf) {
-		return err
-	}
-	resolved := meta.FindStatusCondition(u.Status.Conditions, ConditionResolved)
-	if resolved != nil && resolved.Status == metav1.ConditionTrue && now.Sub(resolved.LastTransitionTime.Time) > ResolveBound {
-		return rollFailure{
-			err:    fmt.Errorf("the payload manifest of %s could not be read within %s of the resolve; last error: %w", u.Spec.Version, ResolveBound, err),
-			reason: ReasonManifestMismatch,
-		}
-	}
-	return err
 }
 
 // order is the roll order. By default it is workers-then-server: every node
@@ -602,7 +588,7 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 	if handover {
 		var err error
 		if n, err = c.handover(ctx, u, n, now); err != nil {
-			return err
+			return failHandover(e, at, err)
 		}
 		e.Phase, e.Message = updatesv1alpha1.UpdateNodePhaseDownloading, "handed to the node; waiting for it to report"
 		mark()
@@ -615,7 +601,7 @@ func (c *Controller) advance(ctx context.Context, u *updatesv1alpha1.Update, e *
 		// Someone moved the request; hand the node this Update's again.
 		var err error
 		if n, err = c.handover(ctx, u, n, now); err != nil {
-			return err
+			return failHandover(e, at, err)
 		}
 	}
 	handedAt, ok := annotationTime(n, HandedOverAnnotation)
@@ -799,6 +785,22 @@ func (c *Controller) payload(u *updatesv1alpha1.Update) ([]byte, error) {
 	})
 }
 
+// failHandover records a definitive handover failure (a rollFailure, such as
+// a manifest that does not describe the release or could not be read within
+// ResolveBound) on the node's entry the way the other failures of a node in
+// progress are: the entry is Failed with the error, the node stays cordoned
+// for the operator, and the rollFailure is returned so the Update fails with
+// its reason and every later node stays Pending. A transient error is
+// returned as is, to be retried.
+func failHandover(e *updatesv1alpha1.UpdateNodeStatus, at metav1.Time, err error) error {
+	var rf rollFailure
+	if !errors.As(err, &rf) {
+		return err
+	}
+	e.Phase, e.Message, e.FinishedAt = updatesv1alpha1.UpdateNodePhaseFailed, "not handed over: "+err.Error(), &at
+	return err
+}
+
 // handover asks the node for the release: the version, the payload, its
 // signature, the release's payload manifest and its signature (both by the
 // one signer) and the signer certificate are set, any earlier phase report and
@@ -820,7 +822,7 @@ func (c *Controller) handover(ctx context.Context, u *updatesv1alpha1.Update, n 
 	if err != nil {
 		return nil, err
 	}
-	m, err := c.ensureManifest(ctx, u)
+	m, err := c.ensureManifest(ctx, u, now)
 	if err != nil {
 		return nil, err
 	}

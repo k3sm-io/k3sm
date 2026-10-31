@@ -19,8 +19,6 @@ package updatectl
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,8 +35,6 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/update"
 )
-
-func sha256Hex(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 
 // manifestPinWorkDir is a work dir with a pin for target, the rig's archive
 // digest and manifestSum.
@@ -262,21 +258,32 @@ func requiresInstallerManifest() []byte {
 }
 
 // TestPreCordonRefusals pins the manifest policy the plan refuses before any
-// node is cordoned: a release that requires the installer, and one that
-// raises a node's Kubernetes minor by more than one or changes its major.
+// node is cordoned, each under OutsideCompatibilityWindow with its own
+// message prefix: a release that requires the installer, one that raises a
+// node's Kubernetes minor by more than one or changes its major, a node whose
+// kubeletVersion does not parse, and a node below compatibleFrom.
 func TestPreCordonRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		manifest []byte
 		nodes    []*corev1.Node
-		want     string
+		// prefix is the refusal's own message prefix; want is in the rest.
+		prefix string
+		want   string
 	}{
-		{name: "requires the installer", manifest: requiresInstallerManifest(), want: "requires the installer"},
-		{name: "a kube minor rise of two", manifest: testManifest(target, "1.36", rigCompatibleFrom, targetSum, nil), want: "w1 runs Kubernetes 1.34"},
-		{name: "a kube major change", manifest: testManifest(target, "2.0", rigCompatibleFrom, targetSum, nil), want: "more than one minor"},
+		{name: "requires the installer", manifest: requiresInstallerManifest(), prefix: "requires the installer:", want: "cannot be applied in place"},
+		{name: "a kube minor rise of two", manifest: testManifest(target, "1.36", rigCompatibleFrom, targetSum, nil),
+			prefix: "Kubernetes minor step too large:", want: "w1 runs Kubernetes 1.34"},
+		{name: "a kube major change", manifest: testManifest(target, "2.0", rigCompatibleFrom, targetSum, nil),
+			prefix: "Kubernetes minor step too large:", want: "more than one minor"},
 		{name: "one lagging node is enough", manifest: testManifest(target, "1.36", rigCompatibleFrom, targetSum, nil),
-			nodes: []*corev1.Node{node(serverName, "v1.35.0+k3sm.0.1.0", true), node("w1", "v1.35.0+k3sm.0.1.0", false), node("w2", oldKubelet, false)},
-			want:  "w2 runs Kubernetes 1.34"},
+			nodes:  []*corev1.Node{node(serverName, "v1.35.0+k3sm.0.1.0", true), node("w1", "v1.35.0+k3sm.0.1.0", false), node("w2", oldKubelet, false)},
+			prefix: "Kubernetes minor step too large:", want: "w2 runs Kubernetes 1.34"},
+		{name: "an unreadable node kubelet version", manifest: testManifest(target, risingKubeMinor, rigCompatibleFrom, targetSum, nil),
+			nodes:  []*corev1.Node{node(serverName, oldKubelet, true), node("w1", "unknown", false), node("w2", oldKubelet, false)},
+			prefix: "unreadable node Kubernetes version:", want: `w1 reports kubeletVersion "unknown"`},
+		{name: "outside the window", manifest: testManifest(target, rigKubeMinor, "v0.1.5", targetSum, nil),
+			prefix: "outside the compatibility window:", want: "w1 runs v0.1.0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			nodes := tc.nodes
@@ -289,8 +296,9 @@ func TestPreCordonRefusals(t *testing.T) {
 			r.drive(r.controller(), nil)
 			u := r.update(updatesv1alpha1.UpdateName)
 			f := meta.FindStatusCondition(u.Status.Conditions, ConditionFailed)
-			if u.Status.Phase != updatesv1alpha1.UpdatePhaseFailed || f == nil || f.Reason != ReasonOutsideCompatibilityWindow || !strings.Contains(f.Message, tc.want) {
-				t.Fatalf("phase %q Failed %+v, want %s naming %q", u.Status.Phase, f, ReasonOutsideCompatibilityWindow, tc.want)
+			if u.Status.Phase != updatesv1alpha1.UpdatePhaseFailed || f == nil || f.Reason != ReasonOutsideCompatibilityWindow ||
+				!strings.HasPrefix(f.Message, tc.prefix) || !strings.Contains(f.Message, tc.want) {
+				t.Fatalf("phase %q Failed %+v, want %s starting %q naming %q", u.Status.Phase, f, ReasonOutsideCompatibilityWindow, tc.prefix, tc.want)
 			}
 			if got := r.log(); len(got) != 0 {
 				t.Fatalf("a node was touched: %v", got)
@@ -336,5 +344,51 @@ func TestHandoversCarryIdenticalManifestBytes(t *testing.T) {
 	}
 	if r.resolver.manifestCalls != 1 {
 		t.Fatalf("read the manifest %d times, want once", r.resolver.manifestCalls)
+	}
+}
+
+// TestHandoverManifestReadRetryIsBounded pins the bound on a manifest read at
+// a handover after a controller restart (the new controller holds no
+// manifest): a transient failure is retried for ResolveBound, then the node
+// being handed over is failed in place, still cordoned and never handed
+// over, the Update fails with ManifestMismatch and every later node stays
+// Pending.
+func TestHandoverManifestReadRetryIsBounded(t *testing.T) {
+	r := newRig(t, threeNodes()...)
+	r.createUpdate(updatesv1alpha1.UpdateName, updatesv1alpha1.UpdateSpec{Version: target})
+	r.drive(r.controller(), func() bool {
+		return phases(r.update(updatesv1alpha1.UpdateName))["w1"] == updatesv1alpha1.UpdateNodePhaseDownloading
+	})
+	r.resolver.mu.Lock()
+	r.resolver.manifestErr = errors.New("connection reset by peer")
+	r.resolver.mu.Unlock()
+	start := r.now
+	r.drive(r.controller(), nil)
+	u := r.update(updatesv1alpha1.UpdateName)
+	f := meta.FindStatusCondition(u.Status.Conditions, ConditionFailed)
+	if u.Status.Phase != updatesv1alpha1.UpdatePhaseFailed || f == nil || f.Reason != ReasonManifestMismatch ||
+		!strings.Contains(f.Message, "connection reset by peer") {
+		t.Fatalf("phase %q Failed %+v", u.Status.Phase, f)
+	}
+	if elapsed := r.now.Sub(start); elapsed < ResolveBound {
+		t.Fatalf("the roll failed after %s, inside the %s bound", elapsed, ResolveBound)
+	}
+	want := map[string]updatesv1alpha1.UpdateNodePhase{
+		"w1": updatesv1alpha1.UpdateNodePhaseDone, "w2": updatesv1alpha1.UpdateNodePhaseFailed, serverName: updatesv1alpha1.UpdateNodePhasePending,
+	}
+	if got := phases(u); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("node phases %v, want %v", got, want)
+	}
+	w2 := r.node("w2")
+	if !w2.Spec.Unschedulable || w2.Annotations[updatesv1alpha1.AnnotationUpdateVersion] != "" {
+		t.Fatalf("w2 was uncordoned or handed over: unschedulable=%v annotations %v", w2.Spec.Unschedulable, w2.Annotations)
+	}
+	for _, e := range u.Status.Nodes {
+		if e.Name == "w2" && (!strings.Contains(e.Message, "not handed over") || e.FinishedAt == nil) {
+			t.Fatalf("w2 entry %+v", e)
+		}
+	}
+	if c := meta.FindStatusCondition(u.Status.Conditions, ConditionManifest); c == nil || c.Status != "False" || c.Reason != ReasonRetrying {
+		t.Fatalf("Manifest condition %+v", c)
 	}
 }

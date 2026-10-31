@@ -18,8 +18,6 @@ package updatectl
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,6 +38,20 @@ import (
 // consulted only for its own version, and a pin the controller cannot trust
 // (a wrong owner, a group- or world-writable file or directory, a symlink, a
 // malformed record) refuses the roll rather than being skipped.
+//
+// What a pin binds. The archive digest (sha256) is always bound. The
+// release's payload manifest is bound only when the pin also names its digest
+// (manifestSHA256, written by `k3sm update apply --manifest-sha256`): the
+// manifest is what the controller signs as policy (the version, kubeMinor,
+// compatibleFrom and requiresInstaller it checks before a cordon and the
+// node checks again), and those fields are not covered by the archive
+// digest. A pin without manifestSHA256, every pin written before the field
+// existed, binds the archive only: the manifest is then read from the
+// release host and must name the pinned archive digest, but its policy fields
+// are as trustworthy as that host. The field is optional, so an existing pin
+// file reads unchanged. An older controller, one that predates the field,
+// reads a pin file that carries it as untrusted (its reader rejects an
+// unknown field) and refuses the roll: the binding is never silently ignored.
 const (
 	// releasePinDirName is the directory under the server work dir.
 	releasePinDirName = "update"
@@ -168,8 +180,7 @@ func (r PinnedResolver) Manifest(ctx context.Context, tag string) ([]byte, error
 		}
 		return nil, err
 	}
-	sum := sha256.Sum256(raw)
-	if got := hex.EncodeToString(sum[:]); got != pin.ManifestSHA256 {
+	if got := sha256Hex(raw); got != pin.ManifestSHA256 {
 		return nil, pinError("the manifest of %s is pinned to sha256:%s, the release publishes sha256:%s", tag, pin.ManifestSHA256, got)
 	}
 	return raw, nil
