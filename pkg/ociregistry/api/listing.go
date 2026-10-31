@@ -45,11 +45,16 @@ const defaultCatalogPage = 1000
 func catalogVisits(n int) int { return max(4*n, 1000) }
 
 // catalogCeilingFactor is the hard ceiling of one catalog walk, as a multiple
-// of its visit budget. A walk that reaches catalogCeilingFactor times
-// catalogVisits(n) visits without filling its page or finding a readable name
-// to end it on stops and answers an error with no Link, rather than walking a
-// run of denied names without bound.
+// of its visit budget, capped at catalogCeilingMax visits so a large n cannot
+// raise it. A walk that reaches min(catalogCeilingFactor*catalogVisits(n),
+// catalogCeilingMax) visits without filling its page or finding a readable
+// name to end it on stops and answers 503 with no Link and no Retry-After,
+// rather than walking a run of denied names without bound.
 const catalogCeilingFactor = 64
+
+// catalogCeilingMax is the absolute ceiling of one catalog walk in visits,
+// whatever n the request names.
+const catalogCeilingMax = 64000
 
 // errCatalogCeiling is a catalog walk stopped at its hard ceiling (503).
 var errCatalogCeiling = errors.New("catalog walk reached its visit ceiling")
@@ -147,9 +152,10 @@ func writeJSON(w http.ResponseWriter, r *http.Request, contentType string, v any
 // names it may not see sort, so it is never used. The cost of that choice is
 // that a run of denied names after the budget is spent is still walked, up to
 // the next readable name or the end of the store, but never past the hard
-// ceiling of catalogCeilingFactor times the budget: a walk that would visit
-// more answers errCatalogCeiling with no Link. The walk also stops as soon as
-// the request's context is done.
+// ceiling of catalogCeilingFactor times the budget or catalogCeilingMax
+// visits, whichever is lower: a walk that would visit more answers
+// errCatalogCeiling with no Link. The walk also stops as soon as the
+// request's context is done.
 func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 	if !s.allow(w, r, VerbRead, ref.Name{}) {
 		return
@@ -166,7 +172,7 @@ func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 	more := false
 	if n > 0 {
 		budget, visits := catalogVisits(n), 0
-		ceiling := s.catalogCeil * budget
+		ceiling := min(s.catalogCeil*budget, s.catalogCap)
 		var stop error
 		err = s.st.WalkRepositories(last, func(rn ref.Name) bool {
 			if err := r.Context().Err(); err != nil {
