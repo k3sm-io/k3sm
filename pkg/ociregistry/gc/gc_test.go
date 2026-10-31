@@ -484,3 +484,54 @@ func TestFailsClosedOnAMissingManifest(t *testing.T) {
 		}
 	}
 }
+
+// TestKeepsBlobsOfAnUnknownManifest stores a tagged Docker schema1 manifest,
+// whose layers parse as no references under a reader that knows only the
+// schema2 field names, beside an ordinary image large enough that reaping the
+// schema1 layers stays under the half brake. The sweep must stop for the
+// repository with ErrUnreadable and leave every blob in place.
+func TestKeepsBlobsOfAnUnknownManifest(t *testing.T) {
+	for _, tc := range []struct{ name, mediaType string }{
+		{"docker schema1", "application/vnd.docker.distribution.manifest.v1+prettyjws"},
+		{"unknown media type", "application/vnd.example.manifest.v1+json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			n := name(t, "app")
+			e.clk.set(-2 * time.Hour)
+			img := e.push(t, n, "v1", "app", []byte("l1"), []byte("l2"), []byte("l3"), []byte("l4"))
+			l1 := e.blob(t, n, []byte("legacy layer one"))
+			l2 := e.blob(t, n, []byte("legacy layer two"))
+			var body []byte
+			var err error
+			if tc.mediaType == "application/vnd.docker.distribution.manifest.v1+prettyjws" {
+				body, err = json.Marshal(map[string]any{
+					"schemaVersion": 1, "name": "app", "tag": "legacy", "architecture": "arm64",
+					"fsLayers": []map[string]string{{"blobSum": l1.Digest.String()}, {"blobSum": l2.Digest.String()}},
+					"history":  []map[string]string{{"v1Compatibility": "{}"}, {"v1Compatibility": "{}"}},
+				})
+			} else {
+				body, err = json.Marshal(map[string]any{
+					"schemaVersion": 2, "mediaType": tc.mediaType,
+					"parts": []ispec.Descriptor{l1, l2},
+				})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			legacy := e.putManifest(t, n, "legacy", tc.mediaType, body)
+			c := e.collector(t, -3*time.Hour)
+			e.ran(t)
+			e.clk.set(0)
+			_, err = c.Sweep(e.ctx)
+			if !errors.Is(err, ErrUnreadable) {
+				t.Errorf("sweep: %v, want ErrUnreadable", err)
+			}
+			for _, d := range append(img.blobs(), legacy.Digest, l1.Digest, l2.Digest) {
+				if !e.has(n, d) {
+					t.Errorf("%s was reaped", d)
+				}
+			}
+		})
+	}
+}

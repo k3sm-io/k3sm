@@ -45,7 +45,8 @@ limitations under the License.
 // blobs stops with ErrMassDelete, unless it empties the repository: it leaves
 // no row and every blob it reaps is older than the last change to the rows.
 // A first push in progress, whose blobs are newer than its empty index, stays
-// under the brake. Anything the collector cannot read
-// (a manifest body that is missing or does not parse) stops that
+// under the brake. Anything the collector cannot read (a manifest body that
+// is missing, does not parse, or is not an OCI or Docker v2 image manifest,
+// index or manifest list, such as a Docker schema1 manifest) stops that
 // repository's sweep: it never deletes on a guess.
 package gc
