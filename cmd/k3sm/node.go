@@ -126,6 +126,10 @@ type nodeOptions struct {
 	// own address, the same value it registers as NodeInternalIP.
 	kubeletPort int
 	podRoot     string
+	// budgetDir is the node's protected budget state directory (budgetDirFor):
+	// `k3sm server` and `k3sm agent` set it; empty (the standalone `k3sm node`)
+	// keeps no budget history.
+	budgetDir string
 	// logs is the container-log flag group (--pod-logs-dir and the four rotation
 	// knobs), carried through every bring-up path so `k3sm server`, `k3sm agent`
 	// and `k3sm node` configure the node's logs identically.
@@ -993,8 +997,11 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// runs once the node is Ready (open, below).
 	eviction := newGatedLoop(ctx)
 	closeRuntime := stopEmbeddedRuntime(prov, slog.Default())
+	flushBudgetHistory := stopBudgetHistory(prov, slog.Default())
 	stopRuntime := func() {
 		eviction.stop(evictionStopTimeout)
+		// After the eviction loop, so its last count is in the final flush.
+		flushBudgetHistory()
 		closeRuntime()
 	}
 	// nodeExited closes once BOTH of this node's loops have returned — the Virtual
@@ -1299,6 +1306,32 @@ func stopEmbeddedRuntime(prov vkadapter.Provider, log *slog.Logger) func() {
 			}
 			log.Info("stopped the embedded runtime at node exit (pod processes and vm helpers left running for the next start)",
 				"elapsed", time.Since(start))
+		})
+	}
+}
+
+// budgetHistoryStopper is the node-exit seam that flushes and stops the
+// provider's budget history writer, waiting a bounded time (the provider owns
+// the bound). Declared at this consumer, like embeddedRuntimeCloser.
+type budgetHistoryStopper interface {
+	StopBudgetHistory() bool
+}
+
+// stopBudgetHistory returns the idempotent teardown closure that flushes and
+// stops prov's budget history writer, so a node exiting right after its
+// context ends (a `launchctl kickstart -k`) still persists its last counts. A
+// provider without the seam gets a no-op.
+func stopBudgetHistory(prov vkadapter.Provider, log *slog.Logger) func() {
+	s, ok := prov.(budgetHistoryStopper)
+	if !ok {
+		return func() {}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if !s.StopBudgetHistory() {
+				log.Warn("the budget history did not finish its final flush before node exit; its latest counts may be lost")
+			}
 		})
 	}
 }
@@ -1710,6 +1743,13 @@ func siblingDylibIn(dir, name string) string {
 	return p
 }
 
+// budgetDirFor is the budget state directory of a node whose work dir is
+// workDir: <workDir>/budget, inside the protected server or agent tree. It is
+// distinct from the pod-readable page directory under the data root.
+func budgetDirFor(workDir string) string {
+	return filepath.Join(workDir, "budget")
+}
+
 // runtimedConfig builds the runtimed runtime configuration from the node options:
 // the on-disk root, the DNS shim, the apiserver client, the helper-socket deny,
 // and the per-pod Seatbelt egress VIPs. ResolverVIP is the cluster DNS VIP (the
@@ -1746,6 +1786,9 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		NodeName: opts.nodeName,
 		NodeIP:   opts.nodeIP,
 		Root:     opts.podRoot,
+		// The persisted eviction, OOM and restart history, under the node's
+		// own work dir and outside every pod-readable tree.
+		BudgetDir: opts.budgetDir,
 		// Prefer an explicit --dns-shim; else resolve the staged shim next to the
 		// binary (the packaged server plist passes no --dns-shim). Empty leaves pods
 		// on the system resolver.

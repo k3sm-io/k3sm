@@ -847,6 +847,7 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		kubeletPort: opts.kubeletPort,
 		podRoot:     opts.podRoot,
 		updateRoot:  updateRootFor(opts.workDir),
+		budgetDir:   budgetDirFor(opts.workDir),
 		// The recorded release base, which the update watcher's pin admits.
 		updateReleaseBase: opts.updateReleaseBase,
 		// The server's own cluster CA: the update signer it mints chains to it.

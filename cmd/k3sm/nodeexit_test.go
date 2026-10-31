@@ -197,3 +197,28 @@ func TestStopEmbeddedRuntimeWithoutARuntimeIsANoop(t *testing.T) {
 	stop()
 	stop()
 }
+
+// historyStopSpy is a provider exposing the budget history stop seam.
+type historyStopSpy struct {
+	vkadapter.Provider
+	calls int
+}
+
+func (s *historyStopSpy) StopBudgetHistory() bool {
+	s.calls++
+	return true
+}
+
+// TestStopBudgetHistoryRunsOnceAtNodeExit pins the node teardown's budget
+// history join: the closure reaches the provider's seam exactly once however
+// often teardown runs it, and a provider without the seam gets a no-op.
+func TestStopBudgetHistoryRunsOnceAtNodeExit(t *testing.T) {
+	spy := &historyStopSpy{}
+	stop := stopBudgetHistory(spy, slog.New(slog.DiscardHandler))
+	stop()
+	stop()
+	if spy.calls != 1 {
+		t.Fatalf("StopBudgetHistory calls = %d, want 1", spy.calls)
+	}
+	stopBudgetHistory(&closeSpyProvider{}, slog.New(slog.DiscardHandler))()
+}

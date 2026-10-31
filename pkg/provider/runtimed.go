@@ -36,6 +36,7 @@ import (
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/utils/clock"
 
+	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
@@ -142,7 +143,11 @@ type runtimedRuntime struct {
 	// happens to be published on the same port is also unreachable from a
 	// confined pod (see the proto field's own doc comment).
 	deniedLocalPorts []uint32
-	log              *slog.Logger
+	// history is the node's persisted eviction, OOM and restart history
+	// (budgethistory.go), opened from RuntimedConfig.BudgetDir. nil records
+	// nothing. Set at construction, never replaced.
+	history *BudgetHistory
+	log     *slog.Logger
 
 	// developerDir is this node's active developer directory (`xcode-select -p`),
 	// resolved ONCE at construction and stamped onto the SandboxProfile of every
@@ -568,6 +573,11 @@ type RuntimedConfig struct {
 	// ContainerLogMonitorInterval is how often the rotation scan runs (kubelet
 	// containerLogMonitorInterval; default 10s).
 	ContainerLogMonitorInterval time.Duration
+	// BudgetDir is the node's budget state directory, <workdir>/budget/ under
+	// the node's own (server or agent) work dir: protected, mode 0700, outside
+	// every tree a pod can open. The persisted eviction, OOM and restart
+	// history lives there. Empty keeps no history (a standalone `k3sm node`).
+	BudgetDir string
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
@@ -590,6 +600,14 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	// empty) deny stanza for the control-plane datastore port.
 	if _, err := normalizeLocalPortDenies(cfg.DeniedLocalPorts); err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
+	}
+	// The budget history opens before anything runs, so the first exit the
+	// startup attach observes is classified against the persisted intents.
+	var history *BudgetHistory
+	if cfg.BudgetDir != "" {
+		// It never fails the node: an unusable dir or file degrades to an
+		// in-memory history with a Warn log.
+		history = OpenBudgetHistory(cfg.BudgetDir, budgetFingerprint(binaryIdentity(version.Get())), log)
 	}
 	// runtimed never talks to the apiserver: the provider (which holds the client)
 	// supplies the volume Resolver + imagePullSecret CredentialResolver. nil client
@@ -677,6 +695,7 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
 	r := newRuntimedWith(rt, cfg, resolver, log)
+	r.history = history
 	// Startup re-attachment, then the startup pod reap — MUST run here,
 	// in-process, before any CreatePod can be served. The embedded node drives
 	// this Runtime by direct RPC and never runs runtime.Server.Serve, so
@@ -2207,10 +2226,19 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 	r.recorder.Event(tracked, corev1.EventTypeWarning, reasonEvicted, n.message)
 
 	t.quiesceForEviction()
+	// The intent write is time-boxed: a stalled disk must not hold back the
+	// kill that keeps the node from running out of memory.
+	intent := r.recordStopIntentWithin(tracked, "", budgetIntentWriteBound)
 	if _, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: 0}); err != nil {
+		// Only a definitive refusal proves the kill did not happen; after a
+		// deadline or a lost transport it may have, so the intent stays.
+		if stopNotIssued(err) {
+			r.history.dropIntent(intent)
+		}
 		t.unmarkEvicted(st)
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
+	r.recordBudgetEvent(tracked, budgetv1alpha1.CounterEviction)
 	r.stopProber(id)
 	r.transport.drop(id)
 
@@ -2257,8 +2285,13 @@ func (t *podTrack) quiesce() {
 // idempotent re-create installed meanwhile is left alone.
 func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grace int64, owned *podTrack) error {
 	id := string(pod.UID)
+	intent := r.recordStopIntent(pod, "")
 	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace})
 	if err != nil {
+		// Only a definitive refusal proves the stop did not happen.
+		if stopNotIssued(err) {
+			r.history.dropIntent(intent)
+		}
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	// Stop the probe runner before forgetting the pod (stopProber waits for the
@@ -2557,6 +2590,8 @@ func (r *runtimedRuntime) Watch(ctx context.Context, cb func(*corev1.Pod)) {
 	r.notify = cb
 	r.mu.Unlock()
 
+	// The budget history's one writer, for the provider's run lifetime.
+	r.history.start(ctx)
 	go r.runWatch(ctx)
 	go r.runBackstop(ctx)
 	go r.runOrphanReaper(ctx)

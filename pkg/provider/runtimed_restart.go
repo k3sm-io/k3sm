@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 
+	budgetv1alpha1 "k3sm.io/apis/budget/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -309,6 +310,7 @@ func (r *runtimedRuntime) observeExits(pod *corev1.Pod, t *podTrack, rs *runtime
 	if rs == nil || pod == nil {
 		return
 	}
+	r.observeBudgetExits(pod, rs)
 	podPolicy := effectivePodRestartPolicy(pod)
 
 	type exit struct {
@@ -525,10 +527,15 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 		// that stops it, once per worker, not once per retried RPC.
 		if msg, live := killMessageFor(reason, name); live && !killAnnounced {
 			killAnnounced = true
-			r.recordKilling(t, r.podByID(podID), name, msg)
+			pod := r.podByID(podID)
+			r.recordKilling(t, pod, name, msg)
+			if pod != nil {
+				r.recordStopIntent(pod, name)
+			}
 		}
 		err := r.respawn(ctx, t, podID, name, reason)
 		if err == nil {
+			r.recordBudgetEvent(r.podByID(podID), budgetv1alpha1.CounterRestart)
 			// The container has been started again, so its postStart hook fires
 			// again: upstream runs the hook inside startContainer, which is
 			// the same path a restart takes.
