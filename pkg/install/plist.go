@@ -268,6 +268,9 @@ func ServerPlist(cfg Config) []byte {
 // A stopping server runs its deferred steps on two lanes at once:
 //
 //	NODE LANE, on the daemon's own goroutine, one step after another:
+//	eviction loop stop 10s  provider.EvictionStopTimeout: the wait for the
+//	                        node-pressure eviction loop to return, run first
+//	                        because the loop acts through the runtime.
 //	budget history      3s  provider.BudgetHistoryStopBound: the budget history
 //	                        writer's join and its last write, run just before
 //	                        the runtime closes so the last counts reach disk.
@@ -321,15 +324,16 @@ func ServerPlist(cfg Config) []byte {
 //	headroom           10s  launchd's own signal/reap latency and the log flush.
 //
 // So the server's budget is the LONGER of the two lanes, plus the steps after the
-// wait: max(3+2+2+5+30, 5+25+30+5) + 5 + 10 = 80s. A worker runs no control plane,
+// wait: max(10+3+2+2+5+30, 5+25+30+5) + 5 + 10 = 80s. A worker runs no control plane,
 // no ingest registry and no operators, so its budget is its node lane alone:
-// 3+2+2+5+5+10 = 27s.
+// 10+3+2+2+5+5+10 = 37s.
 //
-// Every bound is a LITERAL here so the table can be read in one place. Three are
+// Every bound is a LITERAL here so the table can be read in one place. Four are
 // bound back to their owners by more than trust: TestExitTimeOutCoversTheDaemonTeardown
 // compares the control-plane step with executor.StopBound,
-// TestExitTimeOutCountsTheBudgetHistoryStop compares the budget history step
-// with provider.BudgetHistoryStopBound (both owners importable from a test), and hack/acceptance/B253.sh's CI tier reads runtimed's
+// TestExitTimeOutCountsTheBudgetHistoryStop and TestExitTimeOutCountsTheEvictionLoopStop
+// compare the budget history and eviction loop steps with provider.BudgetHistoryStopBound
+// and provider.EvictionStopTimeout (both owners importable from a test), and hack/acceptance/B253.sh's CI tier reads runtimed's
 // close grace out of its module and compares it with the close step. The steps
 // whose owners live in package main have no importable owner and no gate; the
 // headroom absorbs a small drift in any of them.
@@ -341,6 +345,9 @@ func ServerPlist(cfg Config) []byte {
 // A changed ExitTimeOut reaches a Mac only through the plist launchd reads, so it
 // takes effect at the next `k3sm install` (or managed update), not at a restart.
 const (
+	// teardownEvictionStop is provider.EvictionStopTimeout in whole seconds: the
+	// node teardown's wait for the eviction loop.
+	teardownEvictionStop = 10
 	// teardownBudgetHistoryStop is provider.BudgetHistoryStopBound in whole
 	// seconds, rounded up: the node teardown's StopBudgetHistory.
 	teardownBudgetHistoryStop = 3
@@ -404,6 +411,7 @@ type teardownStep struct {
 // order each lane runs them. TestExitTimeOutCoversEveryTeardownStep names each
 // step it expects and checks the plist's ExitTimeOut covers them.
 var serverTeardownSteps = []teardownStep{
+	{"eviction loop stop (provider.EvictionStopTimeout)", teardownEvictionStop, laneNode},
 	{"budget history stop (provider.BudgetHistoryStopBound)", teardownBudgetHistoryStop, laneNode},
 	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
@@ -437,6 +445,7 @@ var serverTeardownSteps = []teardownStep{
 // agentTeardownSteps is every deferred step of a stopping `k3sm agent`: its
 // node's, then its mesh teardown. It has no control-plane lane.
 var agentTeardownSteps = []teardownStep{
+	{"eviction loop stop (provider.EvictionStopTimeout)", teardownEvictionStop, laneNode},
 	{"budget history stop (provider.BudgetHistoryStopBound)", teardownBudgetHistoryStop, laneNode},
 	{"runtimed close (defaultCloseGrace)", teardownRuntimedClose, laneNode},
 	{"node update watcher stop (nodeUpdateStopGrace)", teardownNodeUpdate, laneNode},
