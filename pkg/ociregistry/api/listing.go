@@ -115,7 +115,7 @@ func (s *Server) catalog(w http.ResponseWriter, r *http.Request) {
 	}
 	names := make([]string, 0, len(repos))
 	for _, n := range repos {
-		if s.authorize == nil || s.authorize(r, VerbRead, n) == nil {
+		if s.authorize(r, VerbRead, n) == nil {
 			names = append(names, n.String())
 		}
 	}

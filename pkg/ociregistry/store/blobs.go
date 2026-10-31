@@ -216,8 +216,19 @@ func (s *Store) UploadSize(ctx context.Context, n ref.Name, id string) (int64, e
 
 // AppendUpload appends r to session id and returns its new length. offset is
 // where the chunk starts and must be the session's length; a negative offset
-// appends wherever the session ends.
+// appends wherever the session ends. The session's length is not limited; a
+// caller serving untrusted bodies uses AppendUploadLimit.
 func (s *Store) AppendUpload(ctx context.Context, n ref.Name, id string, offset int64, r io.Reader) (int64, error) {
+	return s.AppendUploadLimit(ctx, n, id, offset, -1, r)
+}
+
+// AppendUploadLimit is AppendUpload for a session that may never be longer
+// than limit bytes (no limit when limit is negative). At most the bytes that
+// fit are read from r; when r holds more, the chunk is refused with
+// ErrUploadTooLarge and the session is cut back to the length it had before
+// the chunk, so no byte past the limit, and none of the refused chunk, stays
+// on disk.
+func (s *Store) AppendUploadLimit(ctx context.Context, n ref.Name, id string, offset, limit int64, r io.Reader) (int64, error) {
 	f, _, err := s.openUpload(ctx, n, id, os.O_WRONLY|os.O_APPEND, false)
 	if err != nil {
 		return 0, err
@@ -227,14 +238,36 @@ func (s *Store) AppendUpload(ctx context.Context, n ref.Name, id string, offset 
 	if err != nil {
 		return 0, err
 	}
-	if offset >= 0 && offset != fi.Size() {
-		return fi.Size(), fmt.Errorf("%w: chunk at %d, session at %d", ErrOffsetMismatch, offset, fi.Size())
+	size := fi.Size()
+	if offset >= 0 && offset != size {
+		return size, fmt.Errorf("%w: chunk at %d, session at %d", ErrOffsetMismatch, offset, size)
 	}
-	w, err := io.Copy(f, r)
+	if limit < 0 {
+		w, err := io.Copy(f, r)
+		if err != nil {
+			return size + w, fmt.Errorf("append to upload %s: %w", id, err)
+		}
+		return size + w, nil
+	}
+	room := max(limit-size, 0)
+	w, err := io.Copy(f, io.LimitReader(r, room))
 	if err != nil {
-		return fi.Size() + w, fmt.Errorf("append to upload %s: %w", id, err)
+		return size + w, fmt.Errorf("append to upload %s: %w", id, err)
 	}
-	return fi.Size() + w, nil
+	if w == room {
+		var probe [1]byte
+		k, perr := io.ReadFull(r, probe[:])
+		if k > 0 {
+			if err := f.Truncate(size); err != nil {
+				return size + w, fmt.Errorf("cut back oversized upload %s: %w", id, err)
+			}
+			return size, fmt.Errorf("%w: session %s would pass %d bytes", ErrUploadTooLarge, id, limit)
+		}
+		if perr != io.EOF && perr != io.ErrUnexpectedEOF {
+			return size + w, fmt.Errorf("append to upload %s: %w", id, perr)
+		}
+	}
+	return size + w, nil
 }
 
 // CommitUpload finishes session id as blob want: the content is hashed, made

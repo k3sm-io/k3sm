@@ -52,7 +52,7 @@ func newFixture(t testing.TB, opts ...func(*Config)) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{Store: st, FreeSpace: func() (uint64, error) { return 1 << 40, nil }}
+	cfg := Config{Store: st, Authorize: AllowAll, FreeSpace: func() (uint64, error) { return 1 << 40, nil }}
 	for _, o := range opts {
 		o(&cfg)
 	}

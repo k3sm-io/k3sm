@@ -22,6 +22,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"time"
 
@@ -45,6 +46,25 @@ const (
 	DefaultSessionIdle = time.Hour
 	// DefaultBodyIdle is the longest a request body may go without a byte.
 	DefaultBodyIdle = 2 * time.Minute
+	// DefaultBodyWindow and DefaultBodyMinBytes are the minimum progress of a
+	// request body: at least DefaultBodyMinBytes in every DefaultBodyWindow
+	// until it ends (about 4 KiB/s).
+	DefaultBodyWindow   = time.Minute
+	DefaultBodyMinBytes = 256 << 10
+	// DefaultUploadTimeout bounds the whole of one request that carries a
+	// body (an upload chunk, a monolithic upload, a manifest PUT).
+	DefaultUploadTimeout = 2 * time.Hour
+	// DefaultMaxUploadSize is the most bytes one upload session may hold.
+	DefaultMaxUploadSize = 16 << 30
+	// DefaultResponseTimeout is the time any response has to be written,
+	// before the time a blob's size adds at DefaultMinWriteRate.
+	DefaultResponseTimeout = 2 * time.Minute
+	// DefaultMinWriteRate is the slowest rate, in bytes per second, a blob
+	// GET is given time for.
+	DefaultMinWriteRate = 512 << 10
+	// spaceCheckEvery is how many body bytes an upload streams between two
+	// free-space checks.
+	spaceCheckEvery = 64 << 20
 	// ReadHeaderTimeout bounds reading a request's headers.
 	ReadHeaderTimeout = 30 * time.Second
 	// maxHeaderBytes bounds a request's headers.
@@ -94,15 +114,21 @@ var (
 // and any other error is a 500.
 type Authorizer func(r *http.Request, verb Verb, n ref.Name) error
 
-// Config configures a Server. Store is required; every other field has a
-// default.
+// AllowAll is an Authorizer that allows every request. A server has no
+// default access model, so a caller that wants an open registry says so by
+// passing it.
+func AllowAll(*http.Request, Verb, ref.Name) error { return nil }
+
+// Config configures a Server. Store and Authorize are required; every other
+// field has a default.
 type Config struct {
 	// Store is the on-disk store the server serves.
 	Store *store.Store
 	// Logger receives the server's records; nil discards them.
 	Logger *slog.Logger
-	// Authorize, when set, is asked before every request is served. Nil
-	// allows everything (the access model is the caller's).
+	// Authorize is asked before every request is served. It is required: New
+	// refuses a nil Authorizer rather than allow everything (AllowAll does
+	// that on purpose).
 	Authorize Authorizer
 	// FreeSpace reports the free bytes of the store volume; nil asks statfs
 	// about the store root.
@@ -119,6 +145,25 @@ type Config struct {
 	// BodyIdle is the longest a request body may go without a byte
 	// (DefaultBodyIdle when zero).
 	BodyIdle time.Duration
+	// BodyWindow and BodyMinBytes are the minimum progress of a request
+	// body: at least BodyMinBytes in every BodyWindow, or the request fails
+	// with 408 (DefaultBodyWindow and DefaultBodyMinBytes when zero).
+	BodyWindow   time.Duration
+	BodyMinBytes int64
+	// UploadTimeout bounds the whole of a request that carries a body
+	// (DefaultUploadTimeout when zero).
+	UploadTimeout time.Duration
+	// MaxUploadSize is the most bytes one upload session may hold; a chunk
+	// that would pass it is refused with 413 and leaves the session as it was
+	// (DefaultMaxUploadSize when zero).
+	MaxUploadSize int64
+	// ResponseTimeout is the time a response has to be written, and
+	// MinWriteRate the slowest rate a blob GET is given time for on top of it
+	// (DefaultResponseTimeout and DefaultMinWriteRate when zero). The write
+	// deadline is set per request, so a large blob GET is never cut by a
+	// server-wide timeout.
+	ResponseTimeout time.Duration
+	MinWriteRate    int64
 	// Now is the clock (time.Now when nil).
 	Now func() time.Time
 }
@@ -126,17 +171,33 @@ type Config struct {
 // Server serves the distribution API. It is an http.Handler and is safe for
 // concurrent use.
 type Server struct {
-	st        *store.Store
-	log       *slog.Logger
-	authorize Authorizer
-	freeSpace func() (uint64, error)
-	minFree   uint64
-	bodyIdle  time.Duration
-	sessions  *sessions
-	router    *mux.Router
+	st            *store.Store
+	log           *slog.Logger
+	authorize     Authorizer
+	freeSpace     func() (uint64, error)
+	minFree       uint64
+	bodyIdle      time.Duration
+	bodyWindow    time.Duration
+	bodyMinBytes  int64
+	uploadTimeout time.Duration
+	maxUpload     int64
+	respTimeout   time.Duration
+	minWriteRate  int64
+	spaceEvery    int64
+	now           func() time.Time
+	sessions      *sessions
+	router        *mux.Router
+	// setWriteDeadline sets a response's write deadline (a seam for tests;
+	// the default goes through http.ResponseController).
+	setWriteDeadline func(w http.ResponseWriter, t time.Time)
 	// manifestChecked, when set, runs between a manifest PUT's first blob
 	// check and the index write (a seam for tests that race a sweep).
 	manifestChecked func()
+	// sessionAdmitted and chunkAppending, when set, run after a new session's
+	// slot is reserved and before a chunk is appended (seams for tests that
+	// make those steps panic).
+	sessionAdmitted func()
+	chunkAppending  func()
 }
 
 // New returns a Server over cfg.Store. It logs the effective RLIMIT_NOFILE,
@@ -145,13 +206,26 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("registry api: no store")
 	}
+	if cfg.Authorize == nil {
+		return nil, errors.New("registry api: no authorizer (pass AllowAll for an open registry)")
+	}
 	s := &Server{
-		st:        cfg.Store,
-		log:       logger(cfg.Logger),
-		authorize: cfg.Authorize,
-		freeSpace: cfg.FreeSpace,
-		minFree:   cfg.MinFreeSpace,
-		bodyIdle:  cfg.BodyIdle,
+		st:            cfg.Store,
+		log:           logger(cfg.Logger),
+		authorize:     cfg.Authorize,
+		freeSpace:     cfg.FreeSpace,
+		minFree:       cfg.MinFreeSpace,
+		bodyIdle:      positive(cfg.BodyIdle, DefaultBodyIdle),
+		bodyWindow:    positive(cfg.BodyWindow, DefaultBodyWindow),
+		bodyMinBytes:  positive(cfg.BodyMinBytes, DefaultBodyMinBytes),
+		uploadTimeout: positive(cfg.UploadTimeout, DefaultUploadTimeout),
+		maxUpload:     positive(cfg.MaxUploadSize, DefaultMaxUploadSize),
+		respTimeout:   positive(cfg.ResponseTimeout, DefaultResponseTimeout),
+		minWriteRate:  positive(cfg.MinWriteRate, DefaultMinWriteRate),
+		spaceEvery:    spaceCheckEvery,
+		setWriteDeadline: func(w http.ResponseWriter, t time.Time) {
+			_ = http.NewResponseController(w).SetWriteDeadline(t) // ErrNotSupported off a real connection
+		},
 	}
 	if s.freeSpace == nil {
 		root := cfg.Store.Root()
@@ -159,9 +233,6 @@ func New(cfg Config) (*Server, error) {
 	}
 	if s.minFree == 0 {
 		s.minFree = DefaultMinFreeSpace
-	}
-	if s.bodyIdle <= 0 {
-		s.bodyIdle = DefaultBodyIdle
 	}
 	maxSessions, idle, now := cfg.MaxSessions, cfg.SessionIdle, cfg.Now
 	if maxSessions <= 0 {
@@ -173,6 +244,7 @@ func New(cfg Config) (*Server, error) {
 	if now == nil {
 		now = time.Now
 	}
+	s.now = now
 	s.sessions = newSessions(maxSessions, idle, now)
 	var rl unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err == nil {
@@ -180,6 +252,14 @@ func New(cfg Config) (*Server, error) {
 	}
 	s.router = s.routes()
 	return s, nil
+}
+
+// positive returns v, or def when v is not positive.
+func positive[T int64 | time.Duration](v, def T) T {
+	if v <= 0 {
+		return def
+	}
+	return v
 }
 
 // statfsFree returns the bytes available to an unprivileged writer on the
@@ -193,9 +273,9 @@ func statfsFree(p string) (uint64, error) {
 }
 
 // HTTPServer returns an http.Server for s on addr: a 30 s header read
-// timeout and no overall body timeout (request bodies have the per-read idle
-// bound instead), bounded headers, and errors logged through the server's
-// logger.
+// timeout and no overall read or write timeout (request bodies have the
+// progress bound instead, and each response gets its own write deadline),
+// bounded headers, and errors logged through the server's logger.
 func (s *Server) HTTPServer(addr string) *http.Server {
 	return &http.Server{
 		Addr:              addr,
@@ -207,8 +287,17 @@ func (s *Server) HTTPServer(addr string) *http.Server {
 	}
 }
 
-// ServeHTTP serves one request, recovering from a panic in any handler.
+// ServeHTTP serves one request, recovering from a panic in any handler. It
+// sets the response's write deadline: ResponseTimeout, after UploadTimeout for
+// a request that carries a body; a blob GET moves it out by the blob's size.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	window := s.respTimeout
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		window += s.uploadTimeout
+	}
+	s.setWriteDeadline(w, s.now().Add(window))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	defer func() {
 		v := recover()
 		if v == nil {
@@ -275,9 +364,6 @@ func (s *Server) withName(h nameHandler) http.HandlerFunc {
 // allow asks the Authorizer, answering the refusal itself; it reports whether
 // the request may proceed.
 func (s *Server) allow(w http.ResponseWriter, r *http.Request, verb Verb, n ref.Name) bool {
-	if s.authorize == nil {
-		return true
-	}
 	err := s.authorize(r, verb, n)
 	if err == nil {
 		return true
@@ -302,20 +388,79 @@ func (s *Server) version(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// idleBody wraps a request body so that each read must make progress within
-// the idle bound: the connection's read deadline moves forward on every read.
-// Where the deadline cannot be set (an in-process transport) it is a no-op.
-type idleBody struct {
-	rc   *http.ResponseController
-	body io.Reader
-	idle time.Duration
+// Errors a request body fails with.
+var (
+	// errBodyTooSlow is a body that went BodyIdle without a byte, or a
+	// BodyWindow with fewer than BodyMinBytes.
+	errBodyTooSlow = errors.New("request body too slow")
+	// errRequestTooLong is a body still arriving after UploadTimeout.
+	errRequestTooLong = errors.New("request took too long")
+)
+
+// progressBody wraps a request body so that it must keep making progress: no
+// read may wait longer than idle, every window must bring at least minBytes,
+// and nothing is read after deadline. The connection's read deadline is moved
+// to the earliest of those bounds before each read, so a stalled peer is cut
+// by the kernel rather than waited on; where it cannot be set (an in-process
+// transport) the checks between reads still hold. It is used by one goroutine.
+type progressBody struct {
+	rc       *http.ResponseController
+	body     io.Reader
+	now      func() time.Time
+	idle     time.Duration
+	window   time.Duration
+	minBytes int64
+	deadline time.Time
+
+	winStart time.Time
+	winBytes int64
 }
 
-func (b idleBody) Read(p []byte) (int, error) {
-	_ = b.rc.SetReadDeadline(time.Now().Add(b.idle)) // ErrNotSupported off a real connection
-	return b.body.Read(p)
+func (b *progressBody) Read(p []byte) (int, error) {
+	t := b.now()
+	if !t.Before(b.deadline) {
+		return 0, errRequestTooLong
+	}
+	if t.Sub(b.winStart) >= b.window {
+		if b.winBytes < b.minBytes {
+			return 0, errBodyTooSlow
+		}
+		b.winStart, b.winBytes = t, 0
+	}
+	dl := t.Add(b.idle)
+	if end := b.winStart.Add(b.window); b.winBytes < b.minBytes && end.Before(dl) {
+		dl = end
+	}
+	if b.deadline.Before(dl) {
+		dl = b.deadline
+	}
+	_ = b.rc.SetReadDeadline(dl) // ErrNotSupported off a real connection
+	n, err := b.body.Read(p)
+	b.winBytes += int64(n)
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		err = errBodyTooSlow
+	}
+	return n, err
 }
 
+// body returns r's body under the progress bounds, with UploadTimeout from
+// now as its deadline.
 func (s *Server) body(w http.ResponseWriter, r *http.Request) io.Reader {
-	return idleBody{rc: http.NewResponseController(w), body: r.Body, idle: s.bodyIdle}
+	t := s.now()
+	return &progressBody{
+		rc: http.NewResponseController(w), body: r.Body, now: s.now,
+		idle: s.bodyIdle, window: s.bodyWindow, minBytes: s.bodyMinBytes,
+		deadline: t.Add(s.uploadTimeout), winStart: t,
+	}
+}
+
+// writeWindow is the time a response of size bytes is given: ResponseTimeout
+// plus size at MinWriteRate.
+func (s *Server) writeWindow(size int64) time.Duration {
+	const most = 30 * 24 * time.Hour
+	secs := size / s.minWriteRate
+	if secs >= int64(most/time.Second) {
+		return most
+	}
+	return s.respTimeout + time.Duration(secs)*time.Second + time.Duration(size%s.minWriteRate)*time.Second/time.Duration(s.minWriteRate)
 }

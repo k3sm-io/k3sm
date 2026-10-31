@@ -10,8 +10,12 @@
 #                         blob Range, upload, paging and referrers behaviour,
 #                         the session cap, the low-space refusal, panic
 #                         recovery and the client-compat cases
+#   TestRequestLimits     (pkg/ociregistry/api) the required authorizer, the
+#                         upload size cap, the free-space checks, the body
+#                         progress and duration bounds, the write deadlines,
+#                         release on a panic and unconfirmed session ids
 #   the chunk-range and session-state tests with their committed fuzz seeds
-#   the store's linked-session and checked-delete tests
+#   the store's linked-session, checked-delete and append-limit tests
 #   TestClientAgainstTheRegistryServer          (pkg/registryclient)
 #   TestImageVerbsAgainstTheRegistryServer      (cmd/k3sm)
 # and one iteration of the 2,000-row index benchmark.
@@ -46,8 +50,8 @@ run() {
 	done
 }
 
-run ./pkg/ociregistry/api/ '^(TestDistributionAPI|TestParseChunkRange|TestSessionHashState|TestSessionTable|FuzzParseChunkRange|FuzzSessionHashState)$' \
-	TestDistributionAPI TestParseChunkRange TestSessionHashState TestSessionTable FuzzParseChunkRange FuzzSessionHashState
+run ./pkg/ociregistry/api/ '^(TestDistributionAPI|TestRequestLimits|TestParseChunkRange|TestSessionHashState|TestSessionTable|FuzzParseChunkRange|FuzzSessionHashState)$' \
+	TestDistributionAPI TestRequestLimits TestParseChunkRange TestSessionHashState TestSessionTable FuzzParseChunkRange FuzzSessionHashState
 out="$(go test -count=1 -v -run '^TestDistributionAPI$' ./pkg/ociregistry/api/ 2>&1)"
 n="$(printf '%s\n' "$out" | grep -c -- '--- PASS: TestDistributionAPI/')"
 [ "$n" -ge 50 ] || { echo "B1018: FAIL: only $n TestDistributionAPI subtests passed"; exit 1; }
@@ -56,8 +60,8 @@ for sub in 'delete/a_tag_DELETE' 'delete/a_digest_DELETE_removes' 'delete/a_dige
 	'limits/the_session_cap' 'limits/under_2_GiB' 'limits/a_panicking_handler' 'manifest/a_blob_deleted_after'; do
 	printf '%s\n' "$out" | grep -q -- "--- PASS: TestDistributionAPI/$sub" || { echo "B1018: FAIL: subtest $sub did not pass"; exit 1; }
 done
-run ./pkg/ociregistry/store/ '^(TestLinkedSessionCanFinish|TestHashedCommitFallsBackToRehash|TestDeleteDigestChecked|TestLateChunkNeverReachesPublishedBlob)$' \
-	TestLinkedSessionCanFinish TestHashedCommitFallsBackToRehash TestDeleteDigestChecked TestLateChunkNeverReachesPublishedBlob
+run ./pkg/ociregistry/store/ '^(TestLinkedSessionCanFinish|TestHashedCommitFallsBackToRehash|TestDeleteDigestChecked|TestLateChunkNeverReachesPublishedBlob|TestAppendUploadLimit)$' \
+	TestLinkedSessionCanFinish TestHashedCommitFallsBackToRehash TestDeleteDigestChecked TestLateChunkNeverReachesPublishedBlob TestAppendUploadLimit
 run ./pkg/registryclient/ '^TestClientAgainstTheRegistryServer$' TestClientAgainstTheRegistryServer
 run ./cmd/k3sm/ '^TestImageVerbsAgainstTheRegistryServer$' TestImageVerbsAgainstTheRegistryServer
 go test -count=1 -run '^$' -bench '^BenchmarkIndex2000Rows$' -benchtime 1x ./pkg/ociregistry/api/ >/dev/null ||

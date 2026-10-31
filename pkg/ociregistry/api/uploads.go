@@ -17,10 +17,11 @@ limitations under the License.
 package api
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -47,6 +48,12 @@ func (s *Server) getBlob(w http.ResponseWriter, r *http.Request, n ref.Name) {
 		return
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.setWriteDeadline(w, s.now().Add(s.writeWindow(fi.Size())))
 	h := w.Header()
 	h.Set("Docker-Content-Digest", d.String())
 	h.Set("Content-Type", "application/octet-stream")
@@ -123,7 +130,11 @@ func (s *Server) startUpload(w http.ResponseWriter, r *http.Request, n ref.Name)
 		s.fail(w, r, err)
 		return
 	}
-	if err := s.roomForUpload(); err != nil {
+	var need int64
+	if hasDigest {
+		need = r.ContentLength
+	}
+	if err := s.roomFor(need); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -183,17 +194,51 @@ func (s *Server) mount(w http.ResponseWriter, r *http.Request, n ref.Name, mount
 	return true
 }
 
-// roomForUpload refuses a new upload when the store volume is short of space.
-func (s *Server) roomForUpload() error {
+// errInsufficientSpace is an upload refused because the store volume is, or
+// would become, shorter of space than MinFreeSpace.
+var errInsufficientSpace = errors.New("insufficient free space")
+
+// roomFor refuses an upload of need bytes (0 when the length is not known)
+// unless the store volume keeps MinFreeSpace free after it. The answer never
+// says how much space there is.
+func (s *Server) roomFor(need int64) error {
 	free, err := s.freeSpace()
 	if err != nil {
-		return &apiError{status: http.StatusInsufficientStorage, code: codeSizeInvalid, msg: "cannot determine free space", cause: err}
+		return fmt.Errorf("%w: %w", errInsufficientSpace, err)
 	}
-	if free < s.minFree {
-		return &apiError{status: http.StatusInsufficientStorage, code: codeSizeInvalid,
-			msg: "the registry volume has " + strconv.FormatUint(free, 10) + " bytes free, under the " + strconv.FormatUint(s.minFree, 10) + " it keeps"}
+	if free < s.minFree || need > 0 && uint64(need) > free-s.minFree {
+		return fmt.Errorf("%w: %d bytes free, %d kept, %d asked", errInsufficientSpace, free, s.minFree, max(need, 0))
 	}
 	return nil
+}
+
+// tooLarge refuses a body whose known length alone passes MaxUploadSize.
+func (s *Server) tooLarge(r *http.Request) error {
+	if r.ContentLength > s.maxUpload {
+		return fmt.Errorf("%w: a %d-byte body", store.ErrUploadTooLarge, r.ContentLength)
+	}
+	return nil
+}
+
+// spaceReader re-checks free space every `every` bytes of a body, failing the
+// read with errInsufficientSpace once the volume falls under MinFreeSpace.
+type spaceReader struct {
+	r     io.Reader
+	room  func(int64) error
+	every int64
+	since int64
+}
+
+func (sr *spaceReader) Read(p []byte) (int, error) {
+	n, err := sr.r.Read(p)
+	sr.since += int64(n)
+	if sr.since >= sr.every {
+		sr.since = 0
+		if rerr := sr.room(0); rerr != nil {
+			return n, rerr
+		}
+	}
+	return n, err
 }
 
 // newSession admits and creates a session, returning its id.
@@ -208,19 +253,29 @@ func (s *Server) newSession(r *http.Request, n ref.Name) (string, error) {
 
 // admitSession reserves a slot in the session table, creates the session on
 // disk and returns its id with the table entry still held. The slot is taken
-// before the file exists, so the cap holds while the store creates it.
+// before the file exists, so the cap holds while the store creates it; it is
+// given back on every other way out, a panic included.
 func (s *Server) admitSession(r *http.Request, n ref.Name) (string, *session, func(), error) {
 	e, release, err := s.sessions.admit()
 	if err != nil {
 		return "", nil, nil, err
 	}
+	bound := false
+	defer func() {
+		if !bound {
+			release()
+			s.sessions.abandon()
+		}
+	}()
+	if s.sessionAdmitted != nil {
+		s.sessionAdmitted()
+	}
 	id, err := s.st.NewUpload(r.Context(), n)
 	if err != nil {
-		release()
-		s.sessions.abandon()
 		return "", nil, nil, err
 	}
 	s.sessions.bind(sessionKey(n, id), e)
+	bound = true
 	return id, e, release, nil
 }
 
@@ -236,24 +291,36 @@ func (s *Server) monolithic(w http.ResponseWriter, r *http.Request, n ref.Name, 
 		s.writeError(w, r, errorf(http.StatusBadRequest, codeBlobUploadInvalid, "a monolithic upload needs a Content-Length"))
 		return
 	}
+	if err := s.tooLarge(r); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	id, e, release, err := s.admitSession(r, n)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	key := sessionKey(n, id)
+	// The entry is released, and the session removed unless it was
+	// committed, on every way out, a panic included. The cancel outlives a
+	// client that went away.
+	pushed := false
+	defer func() {
+		release()
+		if !pushed {
+			_ = s.st.CancelUpload(context.WithoutCancel(r.Context()), n, id) // best effort; GC reaps an idle session
+		}
+		s.sessions.forget(key)
+	}()
 	_, err = s.appendChunk(r, w, n, id, e, 0)
 	if err == nil {
 		err = s.commit(r, n, id, e, d)
 	}
-	release()
 	if err != nil {
-		_ = s.st.CancelUpload(r.Context(), n, id) // best effort; GC reaps an idle session
-		s.sessions.forget(key)
 		s.fail(w, r, err)
 		return
 	}
-	s.sessions.forget(key)
+	pushed = true
 	w.Header().Set("Blob-Upload-UUID", id)
 	w.Header().Set("Docker-Upload-UUID", id)
 	s.log.Info("registry blob pushed", "repository", n.String(), "digest", d.String())
@@ -308,14 +375,34 @@ func chunkOffset(r *http.Request) (int64, error) {
 // appendChunk appends the request body to session id at offset (-1: at its
 // end), hashing it as it streams when the session's hash is still known.
 // The caller holds e.
+// The session may not grow past MaxUploadSize, and free space is checked
+// again every 64 MiB of the body.
 func (s *Server) appendChunk(r *http.Request, w http.ResponseWriter, n ref.Name, id string, e *session, offset int64) (int64, error) {
+	if s.chunkAppending != nil {
+		s.chunkAppending()
+	}
+	body := &spaceReader{r: s.body(w, r), room: s.roomFor, every: s.spaceEvery}
 	tee := e.hash.writer()
-	newLen, err := s.st.AppendUpload(r.Context(), n, id, offset, io.TeeReader(s.body(w, r), tee))
+	newLen, err := s.st.AppendUploadLimit(r.Context(), n, id, offset, s.maxUpload, io.TeeReader(body, tee))
 	e.hash.settle(newLen, err)
 	if err != nil && errors.Is(err, store.ErrOffsetMismatch) {
 		uploadHeaders(w, n, id, newLen)
 	}
 	return newLen, err
+}
+
+// settle records the outcome of a store operation on an acquired entry: a
+// success confirms the session; an error drops the entry when the session is
+// unknown or invalid, or was never confirmed, so a made-up id leaves nothing
+// in the table.
+func (s *Server) settle(key string, e *session, err error) {
+	if err == nil {
+		s.sessions.confirm(e)
+		return
+	}
+	if errors.Is(err, store.ErrUploadUnknown) || errors.Is(err, ref.ErrInvalidUploadID) || !s.sessions.isConfirmed(e) {
+		s.sessions.drop(key, e)
+	}
 }
 
 // commit finishes session id as blob d: with the streamed hash when it covers
@@ -339,6 +426,12 @@ func (s *Server) patchUpload(w http.ResponseWriter, r *http.Request, n ref.Name)
 		return
 	}
 	offset, err := chunkOffset(r)
+	if err == nil {
+		err = s.tooLarge(r)
+	}
+	if err == nil {
+		err = s.roomFor(r.ContentLength)
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -347,10 +440,8 @@ func (s *Server) patchUpload(w http.ResponseWriter, r *http.Request, n ref.Name)
 	e, release := s.sessions.acquire(key)
 	defer release()
 	newLen, err := s.appendChunk(r, w, n, id, e, offset)
+	s.settle(key, e, err)
 	if err != nil {
-		if errors.Is(err, store.ErrUploadUnknown) {
-			s.sessions.forget(key)
-		}
 		s.fail(w, r, err)
 		return
 	}
@@ -383,6 +474,13 @@ func (s *Server) finishUpload(w http.ResponseWriter, r *http.Request, n ref.Name
 		return
 	}
 	offset, err := chunkOffset(r)
+	chunk := offset >= 0 || r.ContentLength != 0
+	if err == nil && chunk {
+		err = s.tooLarge(r)
+		if err == nil {
+			err = s.roomFor(r.ContentLength)
+		}
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -390,19 +488,16 @@ func (s *Server) finishUpload(w http.ResponseWriter, r *http.Request, n ref.Name
 	key := sessionKey(n, id)
 	e, release := s.sessions.acquire(key)
 	defer release()
-	if offset >= 0 || r.ContentLength != 0 {
-		if _, err := s.appendChunk(r, w, n, id, e, offset); err != nil {
-			if errors.Is(err, store.ErrUploadUnknown) {
-				s.sessions.forget(key)
-			}
+	if chunk {
+		_, err := s.appendChunk(r, w, n, id, e, offset)
+		s.settle(key, e, err)
+		if err != nil {
 			s.fail(w, r, err)
 			return
 		}
 	}
 	if err := s.commit(r, n, id, e, d); err != nil {
-		if errors.Is(err, store.ErrUploadUnknown) {
-			s.sessions.forget(key)
-		}
+		s.settle(key, e, err)
 		s.fail(w, r, err)
 		return
 	}
@@ -422,10 +517,12 @@ func (s *Server) cancelUpload(w http.ResponseWriter, r *http.Request, n ref.Name
 		return
 	}
 	key := sessionKey(n, id)
-	_, release := s.sessions.acquire(key)
+	e, release := s.sessions.acquire(key)
+	defer func() {
+		release()
+		s.sessions.drop(key, e)
+	}()
 	err = s.st.CancelUpload(r.Context(), n, id)
-	release()
-	s.sessions.forget(key)
 	if err != nil {
 		s.fail(w, r, err)
 		return

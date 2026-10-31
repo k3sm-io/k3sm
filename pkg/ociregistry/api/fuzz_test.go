@@ -230,8 +230,36 @@ func TestSessionTable(t *testing.T) {
 	if _, _, ok := e.hash.sum(digest.SHA256); ok {
 		t.Error("a resumed session claims a hash")
 	}
-	rel()
-	tab.forget("resumed")
+	// An unconfirmed entry does not count against max: two admissions still
+	// fit beside it.
+	if tab.live() != 0 {
+		t.Errorf("live = %d with only an unconfirmed entry, want 0", tab.live())
+	}
+	ea, rela, err := tab.admit()
+	if err != nil {
+		t.Fatalf("an admission beside an unconfirmed entry = %v", err)
+	}
+	tab.bind("b", ea)
+	rela()
+	eb, relb, err := tab.admit()
+	if err != nil {
+		t.Fatalf("a second admission beside an unconfirmed entry = %v", err)
+	}
+	tab.bind("c", eb)
+	relb()
+	// Once the store confirms it, it counts.
+	tab.confirm(e)
+	if tab.live() != 3 {
+		t.Errorf("live = %d after a confirmation, want 3", tab.live())
+	}
+	// drop removes only the entry it names.
+	tab.drop("resumed", &session{})
+	if tab.live() != 3 {
+		t.Error("drop removed an entry it was not given")
+	}
+	tab.drop("resumed", e)
+	tab.forget("b")
+	tab.forget("c")
 	if tab.live() != 0 {
 		t.Error("forget left the entry")
 	}

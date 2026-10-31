@@ -71,6 +71,9 @@ var (
 	ErrDigestMismatch = errors.New("digest mismatch")
 	// ErrOffsetMismatch is a chunk that does not start at the session's length.
 	ErrOffsetMismatch = errors.New("upload offset mismatch")
+	// ErrUploadTooLarge is a chunk that would take a session past its size
+	// limit.
+	ErrUploadTooLarge = errors.New("upload too large")
 	// ErrMountUnavailable is a mount that cannot be a link: the source does not
 	// hold the blob, or it is on another volume. The caller falls back to an
 	// upload session.

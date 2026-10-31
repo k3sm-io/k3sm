@@ -128,6 +128,12 @@ func classify(err error) *apiError {
 		return e(http.StatusForbidden, codeDenied, "requested access to the resource is denied")
 	case errors.Is(err, ErrRateLimited):
 		return e(http.StatusTooManyRequests, codeTooManyRequests, "too many requests")
+	case errors.Is(err, store.ErrUploadTooLarge):
+		return e(http.StatusRequestEntityTooLarge, codeSizeInvalid, "the upload is larger than the registry accepts")
+	case errors.Is(err, errInsufficientSpace):
+		return e(http.StatusInsufficientStorage, codeSizeInvalid, "the registry volume is low on space")
+	case errors.Is(err, errBodyTooSlow), errors.Is(err, errRequestTooLong):
+		return e(http.StatusRequestTimeout, codeBlobUploadInvalid, "the request body did not arrive in time")
 	case errors.Is(err, errTooManySessions):
 		return e(http.StatusServiceUnavailable, codeUnavailable, "too many upload sessions in progress")
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):

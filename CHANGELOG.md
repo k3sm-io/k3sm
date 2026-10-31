@@ -27,7 +27,9 @@ pin, its date, and the tarball's sha256.
 - The registry gains its own OCI distribution API server over the on-disk store, written to
   replace the zot child in a later release: manifests, blobs, chunked and monolithic uploads,
   cross-repository mounts that link only from the named source, tag and catalog paging, and
-  referrers. It is not yet the server the daemon runs.
+  referrers. It requires an access policy, caps each upload's size and the free space it
+  may use, and cuts off request bodies that stall or trickle. It is not yet the server the
+  daemon runs.
 
 ### Changed
 

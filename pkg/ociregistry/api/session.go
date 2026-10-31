@@ -115,9 +115,15 @@ func (s *hashState) sum(alg digest.Algorithm) (digest.Digest, int64, bool) {
 var errTooManySessions = errors.New("too many upload sessions")
 
 // sessions is the table of upload sessions this server has seen. mu guards the
-// map and each entry's busy and last fields; an entry's own mu serialises the
-// requests on that session and guards its hash state. Lock order: an entry's mu
-// is never taken while the table's mu is held.
+// map and each entry's busy, last and confirmed fields; an entry's own mu
+// serialises the requests on that session and guards its hash state. Lock
+// order: an entry's mu is never taken while the table's mu is held.
+//
+// Only confirmed entries count against max: a session this server created,
+// or one the store has accepted an operation on. An entry acquire creates for
+// an id the server has not seen is unconfirmed until then, and the caller
+// drops it on a store error, so ids a client makes up cannot fill the table.
+// There is no per-principal cap: one client may use every slot.
 type sessions struct {
 	max  int
 	idle time.Duration
@@ -133,8 +139,9 @@ type session struct {
 	hash hashState
 
 	// Guarded by sessions.mu.
-	busy int
-	last time.Time
+	busy      int
+	last      time.Time
+	confirmed bool
 }
 
 func newSessions(max int, idle time.Duration, now func() time.Time) *sessions {
@@ -151,6 +158,18 @@ func (t *sessions) prune() {
 	}
 }
 
+// inUse counts the confirmed entries and the reserved slots. The caller
+// holds mu.
+func (t *sessions) inUse() int {
+	n := t.reserved
+	for _, e := range t.m {
+		if e.confirmed {
+			n++
+		}
+	}
+	return n
+}
+
 // admit reserves a slot for a new session, refusing with errTooManySessions
 // when max sessions are in use or reserved. The entry is returned locked and
 // is not yet in the table; bind adds it under the session's key once the
@@ -158,12 +177,12 @@ func (t *sessions) prune() {
 func (t *sessions) admit() (*session, func(), error) {
 	t.mu.Lock()
 	t.prune()
-	if len(t.m)+t.reserved >= t.max {
+	if t.inUse() >= t.max {
 		t.mu.Unlock()
 		return nil, nil, errTooManySessions
 	}
 	t.reserved++
-	e := &session{hash: newHashState(), busy: 1, last: t.now()}
+	e := &session{hash: newHashState(), busy: 1, last: t.now(), confirmed: true}
 	t.mu.Unlock()
 	e.mu.Lock()
 	return e, t.releaser(e), nil
@@ -184,9 +203,8 @@ func (t *sessions) abandon() {
 	t.mu.Unlock()
 }
 
-// acquire returns the entry for an existing session, creating an unhashed one
-// for a session the server has not seen (it exists on disk already, so it is
-// not counted against max), locked; release unlocks it.
+// acquire returns the entry for key locked; release unlocks it. A key the
+// server has not seen gets a new unhashed, unconfirmed entry.
 func (t *sessions) acquire(key string) (*session, func()) {
 	t.mu.Lock()
 	e, ok := t.m[key]
@@ -211,6 +229,20 @@ func (t *sessions) releaser(e *session) func() {
 	}
 }
 
+// confirm marks e as a session the store holds.
+func (t *sessions) confirm(e *session) {
+	t.mu.Lock()
+	e.confirmed = true
+	t.mu.Unlock()
+}
+
+// isConfirmed reports whether e is confirmed.
+func (t *sessions) isConfirmed(e *session) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return e.confirmed
+}
+
 // forget removes key's entry: the session was committed, cancelled or is gone.
 func (t *sessions) forget(key string) {
 	t.mu.Lock()
@@ -218,10 +250,20 @@ func (t *sessions) forget(key string) {
 	t.mu.Unlock()
 }
 
-// live returns how many sessions are in the table or reserved, after pruning.
+// drop removes key's entry only while it is still e, so a request that
+// fails late never removes an entry a newer request created.
+func (t *sessions) drop(key string, e *session) {
+	t.mu.Lock()
+	if t.m[key] == e {
+		delete(t.m, key)
+	}
+	t.mu.Unlock()
+}
+
+// live returns how many sessions count against max, after pruning.
 func (t *sessions) live() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.prune()
-	return len(t.m) + t.reserved
+	return t.inUse()
 }
