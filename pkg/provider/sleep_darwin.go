@@ -122,8 +122,9 @@ static int k3sm_pw_wait_ack(int fd, uint8_t seq, int ms) {
 
 // The sleep watcher: IORegisterForSystemPower (IOPMLib.h) on a dedicated
 // thread running its own CFRunLoop. The callback never calls into Go; it
-// writes one two-byte record per notice to evfd: {'S', seq} before sleep and
-// {'W', 0} on a full wake. For will-sleep it waits on ackfd for seq (bounded
+// writes one two-byte record per notice to evfd: {'S', seq} before sleep,
+// {'W', 0} on a full wake, {'D', 0} once when a sleep turns into a dark wake,
+// and {'U', 0} once if the capabilities cannot be read. For will-sleep it waits on ackfd for seq (bounded
 // by ack_ms) before IOAllowPowerChange, which the system requires for every
 // kIOMessageCanSystemSleep and kIOMessageSystemWillSleep (it otherwise waits
 // 30 s). Closing ackfd's write end ends the wait at once.
@@ -131,12 +132,16 @@ static int k3sm_pw_wait_ack(int fd, uint8_t seq, int ms) {
 // Dark wakes. kIOMessageSystemHasPoweredOn also arrives for a dark wake
 // (Power Nap, a maintenance wake), so it is not taken as a wake on its own:
 // the watcher reads the root domain's "System Capabilities" registry property
-// (kIOPMSystemCapabilitiesKey in xnu's IOPMPrivate.h; not in the public SDK)
-// and reports a wake only when Graphics is present. In a dark wake it polls
-// that property every 5 s, and takes a kIOMessageSystemCapabilityChange that
-// gains Graphics too, so the promotion of a dark wake to a full one is seen.
-// An unreadable property counts as a full wake. 'W' is written once per
-// sleep (asleep gates it).
+// (kIOPMSystemCapabilitiesKey in xnu's IOPMPrivate.h; not in the public SDK;
+// TestIOKitSystemCapabilitiesCanary pins its shape) and reports a wake only
+// when Graphics is present. In a dark wake it polls that property every 5 s:
+// the poll is the dependable path, so a full wake that follows a dark wake is
+// reported up to 5 s late. kIOMessageSystemCapabilityChange is handled too,
+// but IOPM.h documents it for in-kernel priority-interest clients and it
+// probably never reaches an IORegisterForSystemPower port; nothing relies on
+// it. An unreadable property counts as a full wake (fail-open), and the 'U'
+// record makes the Go side warn once. 'W' is written once per sleep (asleep
+// gates it).
 //
 // Stopping is sticky. stopsrc is a version-0 CFRunLoopSource whose perform
 // stops the loop; once signalled it stays pending until the loop runs it, so
@@ -156,28 +161,52 @@ typedef struct {
 	pthread_mutex_t mu;
 	pthread_cond_t cv;
 	int ready, err;
-	int asleep;
+	int asleep, dark_reported, caps_warned;
 	uint8_t seq;
 } k3sm_pw;
 
-// k3sm_pw_caps reads the root domain's current capabilities, or returns
-// UINT32_MAX when they cannot be read.
-static uint32_t k3sm_pw_caps(k3sm_pw *w) {
-	if (w->rootdomain == IO_OBJECT_NULL) return UINT32_MAX;
-	CFTypeRef v = IORegistryEntryCreateCFProperty(w->rootdomain, CFSTR("System Capabilities"), kCFAllocatorDefault, 0);
+static void k3sm_pw_emit(k3sm_pw *w, char kind, uint8_t seq) {
+	uint8_t rec[2] = { (uint8_t)kind, seq };
+	(void)write(w->evfd, rec, 2);
+}
+
+// k3sm_caps_read reads the "System Capabilities" property of rootdomain. It
+// sets *is_number when the property is a CFNumber and returns its value, or
+// UINT32_MAX when it is absent, not a number or out of range.
+static uint32_t k3sm_caps_read(io_service_t rootdomain, int *is_number) {
+	*is_number = 0;
+	if (rootdomain == IO_OBJECT_NULL) return UINT32_MAX;
+	CFTypeRef v = IORegistryEntryCreateCFProperty(rootdomain, CFSTR("System Capabilities"), kCFAllocatorDefault, 0);
 	if (v == NULL) return UINT32_MAX;
 	uint32_t caps = UINT32_MAX;
 	if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+		*is_number = 1;
 		int64_t n = 0;
-		if (CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &n)) caps = (uint32_t)n;
+		if (CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &n) && n >= 0 && n < UINT32_MAX) caps = (uint32_t)n;
 	}
 	CFRelease(v);
 	return caps;
 }
 
-static void k3sm_pw_emit(k3sm_pw *w, char kind, uint8_t seq) {
-	uint8_t rec[2] = { (uint8_t)kind, seq };
-	(void)write(w->evfd, rec, 2);
+// k3sm_caps_probe reads the property once from a fresh root-domain lookup,
+// for the canary test.
+static uint32_t k3sm_caps_probe(int *is_number) {
+	io_service_t rd = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
+	uint32_t caps = k3sm_caps_read(rd, is_number);
+	if (rd != IO_OBJECT_NULL) IOObjectRelease(rd);
+	return caps;
+}
+
+// k3sm_pw_caps reads the root domain's current capabilities, or returns
+// UINT32_MAX when they cannot be read; the first such failure writes 'U'.
+static uint32_t k3sm_pw_caps(k3sm_pw *w) {
+	int is_number;
+	uint32_t caps = k3sm_caps_read(w->rootdomain, &is_number);
+	if (caps == UINT32_MAX && !w->caps_warned) {
+		w->caps_warned = 1;
+		k3sm_pw_emit(w, 'U', 0);
+	}
+	return caps;
 }
 
 static void k3sm_pw_dark_disarm(k3sm_pw *w) {
@@ -207,7 +236,9 @@ static void k3sm_pw_cb(void *refcon, io_service_t svc, natural_t type, void *arg
 		break;
 	case kIOMessageSystemWillSleep: {
 		w->asleep = 1;
+		w->dark_reported = 0;
 		k3sm_pw_dark_disarm(w);
+		// seq runs 1..255 and wraps, skipping 0 so no notice's byte is 0.
 		if (++w->seq == 0) w->seq = 1;
 		k3sm_pw_drain(w->ackfd);
 		k3sm_pw_emit(w, 'S', w->seq);
@@ -221,10 +252,15 @@ static void k3sm_pw_cb(void *refcon, io_service_t svc, natural_t type, void *arg
 			k3sm_pw_woke(w);
 		} else if (w->asleep) {
 			CFRunLoopTimerSetNextFireDate(w->darkpoll, CFAbsoluteTimeGetCurrent() + 5.0);
+			if (!w->dark_reported) {
+				w->dark_reported = 1;
+				k3sm_pw_emit(w, 'D', 0);
+			}
 		}
 		break;
 	}
 	case kIOMessageSystemCapabilityChange: {
+		// Probably never delivered to this port (see above); harmless if it is.
 		const struct IOPMSystemCapabilityChangeParameters *p = arg;
 		if (p != NULL && k3sm_pw_cap_change_full_wake(p->changeFlags, p->fromCapabilities, p->toCapabilities)) {
 			k3sm_pw_woke(w);
@@ -263,6 +299,9 @@ static void *k3sm_pw_main(void *p) {
 		return NULL;
 	}
 	w->rootdomain = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
+	// Read once now, so an unreadable property is warned about at start, not
+	// at the first wake.
+	(void)k3sm_pw_caps(w);
 	w->rl = CFRunLoopGetCurrent();
 	CFRetain(w->rl);
 	CFRunLoopSourceContext sc = { .version = 0, .info = w, .perform = k3sm_pw_stop_perform };
@@ -432,13 +471,22 @@ func (iokitPowerHost) WatchSleep(ctx context.Context) (<-chan PowerNotice, error
 			if _, err := io.ReadFull(evR, rec); err != nil {
 				return
 			}
-			n := PowerNotice{Kind: PowerDidWake}
-			if rec[0] == 'S' {
+			var n PowerNotice
+			switch rec[0] {
+			case 'W':
+				n = PowerNotice{Kind: PowerDidWake}
+			case 'D':
+				n = PowerNotice{Kind: PowerDarkWake}
+			case 'U':
+				n = PowerNotice{Kind: PowerWakeUnclassified}
+			case 'S':
 				seq := rec[1]
 				var once sync.Once
 				n = PowerNotice{Kind: PowerWillSleep, Ack: func() {
 					once.Do(func() { _, _ = ackW.Write([]byte{seq}) })
 				}}
+			default:
+				continue
 			}
 			select {
 			case out <- n:
@@ -473,4 +521,14 @@ func isFullWake(caps uint32) bool { return C.k3sm_pw_full_wake(C.uint32_t(caps))
 //lint:ignore U1000 test hook: cgo cannot appear in a _test.go file
 func capChangeIsFullWake(flags, from, to uint32) bool {
 	return C.k3sm_pw_cap_change_full_wake(C.uint32_t(flags), C.uint32_t(from), C.uint32_t(to)) != 0
+}
+
+// readSystemCapabilities reads the root domain's "System Capabilities"
+// property, for the canary test: the value, and whether it is a CFNumber.
+//
+//lint:ignore U1000 test hook: cgo cannot appear in a _test.go file
+func readSystemCapabilities() (caps uint32, isNumber bool) {
+	var num C.int
+	caps = uint32(C.k3sm_caps_probe(&num))
+	return caps, num != 0
 }
