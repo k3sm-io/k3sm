@@ -83,6 +83,12 @@ type Entry struct {
 	Current Version
 	// Versions is every stored version, oldest first, including Current.
 	Versions []Version
+	// Err is non-nil exactly when the entry could not be opened: its current
+	// pointer failed authentication, is older than the recorded floor, or does
+	// not parse. Current and Versions are zero then. List reports such an entry
+	// here, not as an error for the whole call, so one bad entry does not hide
+	// the healthy ones.
+	Err error
 }
 
 // Store is the keystore contract a consumer (the CLI verbs, the delivery
@@ -102,6 +108,9 @@ type Store interface {
 	// entry does not exist, or ErrVersionNotFound when the version does not.
 	Get(ctx context.Context, name string, version uint64) (Version, []byte, error)
 	// List returns the metadata of every entry, sorted by name, with no values.
+	// An entry that cannot be opened is still returned, with Entry.Err set. The
+	// call itself fails only for a problem that is not about one entry: the
+	// master key missing or untrusted, or the store lock not acquired in time.
 	List(ctx context.Context) ([]Entry, error)
 	// Rotate writes value as the next version of name and then flips the
 	// current pointer to it, returning the new version, or ErrNotFound.
@@ -125,8 +134,10 @@ var (
 	// an existing entry is a Rotate.
 	ErrExists = errors.New("keystore entry already exists; use rotate to store a new version")
 	// ErrCorrupt reports a record that fails its authenticated open or does
-	// not parse: it was tampered with, moved or truncated. It is distinct
-	// from ErrMasterUntrusted, which concerns the master key file itself.
+	// not parse: it was tampered with, moved or truncated. A current pointer
+	// that authenticates but is older than the recorded floor is reported the
+	// same way, with a message that says so. It is distinct from
+	// ErrMasterUntrusted, which concerns the master key file itself.
 	ErrCorrupt = errors.New("keystore record is corrupt: it failed authentication or does not parse, so it was tampered with, moved or truncated; restore it from backup")
 	// ErrNotFound reports that no entry has the requested name.
 	ErrNotFound = errors.New("keystore entry not found")
