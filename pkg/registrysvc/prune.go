@@ -20,29 +20,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
-	"os"
-	"path/filepath"
-	"regexp"
-	"sort"
-	"strings"
 	"time"
+
+	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"k3sm.io/k3sm/pkg/ociregistry/ref"
+	"k3sm.io/k3sm/pkg/ociregistry/store"
 )
 
 // The registry half of `k3sm image prune`: which untagged manifests in this
 // server's registry may be deleted.
 //
-// THE PLAN READS ZOT'S STORAGE AND NEVER WRITES IT. zot keeps every repository
-// as an OCI image layout under StateDir, and its index.json lists every manifest
-// the repository holds, tagged or not; the dist-spec API has no way to list the
-// untagged ones, and the pinned minimal zot serves no search extension. The
-// deletion itself is a DELETE through zot's own API with this node's push
-// credential, so zot updates its own index and its GC reclaims the blobs.
-
-// pruneIndexLimit caps index.json and every manifest the plan reads. zot wrote
-// them, but a bounded read costs nothing and an unbounded one is a footgun.
-const pruneIndexLimit = 16 << 20
+// THE PLAN READS THE STORE AND NEVER WRITES IT. Every repository is an OCI
+// image layout under StateDir, and its index.json lists every manifest the
+// repository holds, tagged or not; the dist-spec API has no way to list the
+// untagged ones. The plan reads that layout only through pkg/ociregistry/store,
+// opened read-only, so the registry has one parser of its own layout. The
+// deletion itself is a DELETE through the registry's API with this node's
+// push credential, so the server stays the only writer: it updates its own
+// index under its own lock, and its GC reclaims the blobs.
 
 // PruneGrace is how old an untagged manifest must be before prune deletes it.
 // It equals zot's own GC delay (gcDelay, pinned equal by a test), for the same
@@ -68,6 +64,13 @@ const (
 	// Without every manifest it cannot tell what a tagged index names, so it
 	// deletes nothing there.
 	KeepUnreadable KeepReason = "repository not fully readable"
+	// KeepTaggedSincePlan is a planned manifest a push tagged after the plan
+	// was read. A delete by digest would drop that tag.
+	KeepTaggedSincePlan KeepReason = "tagged since the plan"
+	// GoneSincePlan is a planned manifest no longer in its repository when its
+	// delete comes up: something else deleted it. Prune sends no DELETE for it
+	// and does not count it as one of its own deletions.
+	GoneSincePlan KeepReason = "already gone since the plan"
 )
 
 // StoredManifest is one manifest in one repository of the registry.
@@ -113,69 +116,29 @@ func PlanPrune(workDir string, now time.Time) (PrunePlan, error) {
 	return plan, nil
 }
 
-// Repositories lists the repositories zot stores under workDir, sorted. A
-// repository is a directory holding both oci-layout and index.json.
+// Repositories lists the repositories the store under workDir holds, sorted.
 func Repositories(workDir string) ([]string, error) {
-	root := StateDir(workDir)
-	var repos []string
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		// A repository's blobs and zot's upload staging hold no repositories.
-		// A repository literally named "blobs" or ".uploads" is skipped too,
-		// which deletes nothing there: the safe direction.
-		if p != root && (d.Name() == "blobs" || d.Name() == ".uploads") {
-			return filepath.SkipDir
-		}
-		if isRegular(filepath.Join(p, "oci-layout")) && isRegular(filepath.Join(p, "index.json")) {
-			rel, err := filepath.Rel(root, p)
-			if err != nil {
-				return err
-			}
-			repos = append(repos, filepath.ToSlash(rel))
-		}
-		return nil
-	})
+	r, err := store.OpenReader(StateDir(workDir))
 	if err != nil {
-		return nil, fmt.Errorf("list the registry's repositories under %s: %w", root, err)
+		return nil, fmt.Errorf("list the registry's repositories: %w", err)
 	}
-	sort.Strings(repos)
+	names, err := r.Repositories()
+	if err != nil {
+		return nil, fmt.Errorf("list the registry's repositories under %s: %w", r.Root(), err)
+	}
+	repos := make([]string, 0, len(names))
+	for _, n := range names {
+		repos = append(repos, n.String())
+	}
 	return repos, nil
 }
 
-func isRegular(p string) bool {
-	fi, err := os.Lstat(p)
-	return err == nil && fi.Mode().IsRegular()
-}
-
-// digestPattern is the only digest shape the plan turns into a blob path. A
-// digest is read from a file and then joined into a path, so anything else
-// (a "..", a slash, an algorithm zot does not write) makes the repository
-// unreadable rather than being opened.
-var digestPattern = regexp.MustCompile(`^(sha256:[a-f0-9]{64}|sha512:[a-f0-9]{128})$`)
-
-// ociDescriptor is the subset of an OCI descriptor the plan reads.
-type ociDescriptor struct {
-	MediaType   string            `json:"mediaType"`
-	Digest      string            `json:"digest"`
-	Size        int64             `json:"size"`
-	Annotations map[string]string `json:"annotations"`
-}
-
-// ociManifestLinks is the subset of a manifest or index that links it to other
+// manifestLinks is the subset of a manifest or index that links it to other
 // manifests: an index's children and a referrer's subject.
-type ociManifestLinks struct {
-	MediaType string          `json:"mediaType"`
-	Manifests []ociDescriptor `json:"manifests"`
-	Subject   *ociDescriptor  `json:"subject"`
+type manifestLinks struct {
+	Manifests []ispec.Descriptor `json:"manifests"`
+	Subject   *ispec.Descriptor  `json:"subject"`
 }
-
-// refNameAnnotation is how zot's index.json marks a tag on a manifest entry.
-const refNameAnnotation = "org.opencontainers.image.ref.name"
 
 // errUnreadable marks a repository the plan must not delete from.
 var errUnreadable = errors.New("repository not fully readable")
@@ -183,10 +146,26 @@ var errUnreadable = errors.New("repository not fully readable")
 // PlanRepository plans one repository. It never fails: a repository it cannot
 // read completely keeps all its untagged manifests under KeepUnreadable.
 func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
-	dir := filepath.Join(StateDir(workDir), filepath.FromSlash(repo))
-	entries, err := readIndex(dir)
+	p, _ := planRepository(workDir, repo, now)
+	return p
+}
+
+// planRepository is PlanRepository that also returns every digest the
+// repository's index holds, mapped to whether any row tags it. The map is nil
+// when the index itself could not be read.
+func planRepository(workDir, repo string, now time.Time) (PrunePlan, map[string]bool) {
+	unreadable := PrunePlan{Unreadable: []string{repo}}
+	n, err := ref.ParseName(repo)
 	if err != nil {
-		return PrunePlan{Unreadable: []string{repo}}
+		return unreadable, nil
+	}
+	r, err := store.OpenReader(StateDir(workDir))
+	if err != nil {
+		return unreadable, nil
+	}
+	idx, err := r.Index(n)
+	if err != nil {
+		return unreadable, nil
 	}
 	type entry struct {
 		m      StoredManifest
@@ -194,18 +173,29 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 	}
 	byDigest := map[string]*entry{}
 	var order []string
-	for _, d := range entries {
-		e, ok := byDigest[d.Digest]
-		if !ok {
-			e = &entry{m: StoredManifest{Repository: repo, Digest: d.Digest, MediaType: d.MediaType, Size: d.Size}}
-			byDigest[d.Digest] = e
-			order = append(order, d.Digest)
+	for _, d := range idx.Manifests {
+		// A digest is read from a file and then resolved to a blob path, so
+		// anything but a canonical sha256 or sha512 digest makes the whole
+		// repository unreadable rather than being opened.
+		if _, err := ref.ParseDigest(d.Digest.String()); err != nil {
+			return unreadable, nil
 		}
-		// zot's delete by digest drops EVERY entry with that digest, tags
-		// included, so one tagged entry makes the whole digest tagged.
-		if d.Annotations[refNameAnnotation] != "" {
+		dg := d.Digest.String()
+		e, ok := byDigest[dg]
+		if !ok {
+			e = &entry{m: StoredManifest{Repository: repo, Digest: dg, MediaType: d.MediaType, Size: d.Size}}
+			byDigest[dg] = e
+			order = append(order, dg)
+		}
+		// A delete by digest drops EVERY row with that digest, tags included,
+		// so one tagged row makes the whole digest tagged.
+		if d.Annotations[ispec.AnnotationRefName] != "" {
 			e.tagged = true
 		}
+	}
+	present := make(map[string]bool, len(byDigest))
+	for dg, e := range byDigest {
+		present[dg] = e.tagged
 	}
 	untagged := func(reason KeepReason) PrunePlan {
 		var p PrunePlan
@@ -217,24 +207,19 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 		return p
 	}
 
-	links := map[string]ociManifestLinks{}
+	links := map[string]manifestLinks{}
 	kept := map[string]KeepReason{}
 	for _, dg := range order {
-		l, err := readLinks(dir, dg)
+		l, modTime, err := readManifest(r, n, dg)
 		if err != nil {
-			return untagged(KeepUnreadable)
+			return untagged(KeepUnreadable), present
 		}
 		links[dg] = l
-		e := byDigest[dg]
-		if e.tagged {
+		if byDigest[dg].tagged {
 			kept[dg] = ""
 			continue
 		}
-		fi, err := os.Stat(blobPath(dir, dg))
-		if err != nil {
-			return untagged(KeepUnreadable)
-		}
-		if now.Sub(fi.ModTime()) < PruneGrace {
+		if now.Sub(modTime) < PruneGrace {
 			kept[dg] = KeepRecent
 		}
 	}
@@ -245,9 +230,10 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 		for _, dg := range order {
 			if _, ok := kept[dg]; ok {
 				for _, c := range links[dg].Manifests {
-					if _, ok := kept[c.Digest]; !ok {
-						if _, inRepo := byDigest[c.Digest]; inRepo {
-							kept[c.Digest] = KeepChildOfKept
+					cd := c.Digest.String()
+					if _, ok := kept[cd]; !ok {
+						if _, inRepo := byDigest[cd]; inRepo {
+							kept[cd] = KeepChildOfKept
 							changed = true
 						}
 					}
@@ -255,7 +241,7 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 				continue
 			}
 			if s := links[dg].Subject; s != nil {
-				if _, ok := kept[s.Digest]; ok {
+				if _, ok := kept[s.Digest.String()]; ok {
 					kept[dg] = KeepReferrer
 					changed = true
 				}
@@ -281,61 +267,80 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 		}
 	}
 	p.Delete = append(indexes, others...)
-	return p
+	return p, present
 }
 
-// readIndex reads a repository's index.json and validates every digest in it.
-func readIndex(dir string) ([]ociDescriptor, error) {
-	b, err := readBounded(filepath.Join(dir, "index.json"))
-	if err != nil {
-		return nil, err
+// Recheck re-plans the repository of a planned manifest from its current
+// state, immediately before that manifest's delete, and returns why it must
+// now be kept, or "" when it may still be deleted.
+//
+// A plan goes stale while its deletes run. A push may tag a planned digest (a
+// delete by digest drops every row with it, the new tag too), re-push it into
+// the grace period, or tag an index that names it or that it refers to. So
+// Recheck does not test the digest alone: it runs the same planning
+// PlanRepository runs, keep closure included, and the digest may go only if
+// it is still in that fresh plan's delete set. Otherwise the reason is the
+// fresh plan's own (KeepChildOfKept, KeepReferrer, KeepRecent), or
+// KeepTaggedSincePlan for a digest now tagged, or KeepUnreadable for anything
+// it cannot read, or GoneSincePlan for a digest no longer in the index, which
+// the caller skips rather than deletes.
+//
+// This closes the race up to the request round-trip between the re-check and
+// the DELETE: a push landing inside that window is not seen. Only a delete the
+// server makes conditional on the digest's state, under its own index lock,
+// closes that window too. Each call re-reads every manifest of the
+// repository, so a prune of n planned manifests reads the repository n times.
+func Recheck(workDir string, m StoredManifest, now time.Time) KeepReason {
+	p, present := planRepository(workDir, m.Repository, now)
+	if present == nil {
+		return KeepUnreadable
 	}
-	var idx struct {
-		Manifests []ociDescriptor `json:"manifests"`
+	tagged, ok := present[m.Digest]
+	switch {
+	case !ok:
+		return GoneSincePlan
+	case tagged:
+		return KeepTaggedSincePlan
 	}
-	if err := json.Unmarshal(b, &idx); err != nil {
-		return nil, fmt.Errorf("%w: parse index.json: %w", errUnreadable, err)
-	}
-	for _, d := range idx.Manifests {
-		if !digestPattern.MatchString(d.Digest) {
-			return nil, fmt.Errorf("%w: index.json names digest %q", errUnreadable, d.Digest)
+	for _, d := range p.Delete {
+		if d.Digest == m.Digest {
+			return ""
 		}
 	}
-	return idx.Manifests, nil
-}
-
-// readLinks reads one manifest blob for its children and subject.
-func readLinks(dir, digest string) (ociManifestLinks, error) {
-	b, err := readBounded(blobPath(dir, digest))
-	if err != nil {
-		return ociManifestLinks{}, err
+	for _, k := range p.Kept {
+		if k.Digest == m.Digest {
+			return k.Reason
+		}
 	}
-	var l ociManifestLinks
-	if err := json.Unmarshal(b, &l); err != nil {
-		return ociManifestLinks{}, fmt.Errorf("%w: parse manifest %s: %w", errUnreadable, digest, err)
-	}
-	return l, nil
+	// An untagged digest in the index is always in one of the two lists; keep
+	// it should that ever not hold.
+	return KeepUnreadable
 }
 
-// blobPath is where zot stores a blob of a repository. digest has already
-// matched digestPattern.
-func blobPath(dir, digest string) string {
-	alg, hex, _ := strings.Cut(digest, ":")
-	return filepath.Join(dir, "blobs", alg, hex)
-}
-
-func readBounded(p string) ([]byte, error) {
-	f, err := os.Open(p)
+// readManifest reads one manifest through the store, which checks its body
+// against the index row's digest and size, and returns its links and the
+// modification time of its blob.
+func readManifest(r *store.Reader, n ref.Name, dg string) (manifestLinks, time.Time, error) {
+	d, err := ref.ParseDigest(dg)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", errUnreadable, err)
+		return manifestLinks{}, time.Time{}, fmt.Errorf("%w: %w", errUnreadable, err)
+	}
+	_, body, err := r.Manifest(n, ref.Reference{Digest: d})
+	if err != nil {
+		return manifestLinks{}, time.Time{}, fmt.Errorf("%w: %w", errUnreadable, err)
+	}
+	var l manifestLinks
+	if err := json.Unmarshal(body, &l); err != nil {
+		return manifestLinks{}, time.Time{}, fmt.Errorf("%w: parse manifest %s: %w", errUnreadable, dg, err)
+	}
+	f, err := r.OpenBlob(n, d)
+	if err != nil {
+		return manifestLinks{}, time.Time{}, fmt.Errorf("%w: %w", errUnreadable, err)
 	}
 	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, pruneIndexLimit+1))
+	fi, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("%w: read %s: %w", errUnreadable, p, err)
+		return manifestLinks{}, time.Time{}, fmt.Errorf("%w: stat manifest %s: %w", errUnreadable, dg, err)
 	}
-	if len(b) > pruneIndexLimit {
-		return nil, fmt.Errorf("%w: %s exceeds %d bytes", errUnreadable, p, pruneIndexLimit)
-	}
-	return b, nil
+	return l, fi.ModTime(), nil
 }

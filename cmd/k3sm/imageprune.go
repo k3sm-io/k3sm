@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"time"
 
@@ -54,6 +55,10 @@ type registryPruneResult struct {
 	// Manifests are the untagged manifests deleted, or that would be.
 	Manifests []registrysvc.StoredManifest `json:"manifests"`
 	// Kept are the untagged manifests the prune keeps, each with its reason.
+	// Under --force it includes every planned manifest the re-check before its
+	// delete skipped, with the re-check's reason: one tagged, re-pushed or
+	// newly named by a kept manifest since the plan, one the re-check could not
+	// read, or one already gone from its repository.
 	Kept []registrysvc.KeptManifest `json:"kept"`
 	// Unreadable are repositories whose index could not be read; nothing in
 	// them is touched.
@@ -173,11 +178,18 @@ func pruneCredential(workDir string) (registrysvc.Credential, string, error) {
 // pruneRegistry plans each repository and, under --force, deletes its
 // untagged manifests. It returns how many deletions failed.
 //
-// Each repository is planned IMMEDIATELY before its deletions, not once up
-// front, because zot's delete by digest drops every tag on that digest: a tag
-// pushed onto an untagged manifest between plan and delete must take it out
-// of the plan. The window that remains is the one between the read and the
-// DELETE.
+// The registry's delete by digest drops every row with that digest, tags
+// included, so a tag pushed onto a planned manifest after the plan was read
+// would be lost with it, and an untagged child or referrer deleted after a
+// push tagged its index or subject would leave that image incomplete. Each
+// repository is planned immediately before its deletions, and immediately
+// before each DELETE registrysvc.Recheck re-plans the repository from its
+// current state, keep closure included: a planned manifest the fresh plan no
+// longer deletes is skipped and reported under Kept with the reason. That
+// closes the race up to the request round-trip between the re-check and the
+// DELETE; a push landing inside that window is not seen. Closing it fully
+// needs a delete the server makes conditional on the digest's state, under
+// its own index lock.
 func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credential, res *registryPruneResult, del manifestDeleter, now time.Time) (int, error) {
 	repos, err := registrysvc.Repositories(o.workDir)
 	if err != nil {
@@ -198,6 +210,13 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 		for _, m := range plan.Delete {
 			if !o.force {
 				res.Manifests = append(res.Manifests, m)
+				continue
+			}
+			if reason := registrysvc.Recheck(o.workDir, m, now); reason != "" {
+				res.Kept = append(res.Kept, registrysvc.KeptManifest{StoredManifest: m, Reason: reason})
+				if reason == registrysvc.KeepUnreadable && !slices.Contains(res.Unreadable, m.Repository) {
+					res.Unreadable = append(res.Unreadable, m.Repository)
+				}
 				continue
 			}
 			ref, err := name.NewDigest(authority + "/" + m.Repository + "@" + m.Digest)
