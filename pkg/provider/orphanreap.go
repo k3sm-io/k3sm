@@ -279,6 +279,15 @@ func (r *runtimedRuntime) reapOrphan(ctx context.Context, pod *corev1.Pod, t *po
 	pod = t.pod // the latest spec for this same track, still under r.mu
 	r.mu.Unlock()
 
+	if t.rejected {
+		// Refused at admission: the runtime never heard of it, so there is
+		// nothing to tear down, only the track to forget.
+		r.forgetRejected(ctx, pod, t)
+		r.orphanMu.Lock()
+		delete(r.orphanGauges, id)
+		r.orphanMu.Unlock()
+		return
+	}
 	r.log.Info("orphan reaper: the apiserver no longer holds a pod this node runs; tearing it down",
 		"namespace", pod.Namespace, "name", pod.Name, "uid", id,
 		"consecutiveNotFound", orphanReapThreshold)

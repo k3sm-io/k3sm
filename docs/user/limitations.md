@@ -743,9 +743,22 @@ When the node runs low on memory, k3sm evicts Pods itself, one at a time, the wa
 The node's `MemoryPressure` condition and the eviction decision come from the same sample, so they
 always agree.
 
-- **Hard and memory-only.** There are no soft thresholds, no disk or PID eviction, no refusal of
-  new BestEffort Pods while the node is under pressure, and no `--eviction-hard` override. The
-  thresholds are fixed.
+- **Hard and memory-only.** There are no soft thresholds, no disk or PID eviction, and no
+  `--eviction-hard` override. The thresholds are fixed.
+- **New Pods are refused under pressure.** While `MemoryPressure` is True, a new BestEffort Pod is
+  refused the way the kubelet refuses it: phase `Failed`, reason `Evicted`, message
+  `Pod was rejected: The node had condition: [MemoryPressure].`, and nothing runs. Pods at
+  system-critical priority and Pods that tolerate `node.kubernetes.io/memory-pressure` are still
+  admitted.
+- **Batch Pods are refused at the critical level.** While the node budget is at `critical` or
+  `evicting`, a new Pod annotated `budget.k3sm.io/band: batch` is refused with reason
+  `NodeBudgetCritical`. Like any refused Pod it counts as a failed Pod, and its controller
+  replaces it.
+- **Only memory refuses Pods.** `DiskPressure` and `PIDPressure` are reported on the node but
+  refuse nothing, where the kubelet refuses every new Pod that is not critical.
+- **Admission starts with eviction.** A Pod created before the node's eviction manager starts,
+  shortly after the node turns Ready, is admitted without the check. A Pod is checked once, when
+  it is first created on the node.
 - **`PIDPressure` has a second trigger.** Besides 90% of the machine's process table
   (`kern.maxproc`), it goes True above 90% of the per-user process limit (`kern.maxprocperuid`)
   that the Pods' service user meets. Upstream Kubernetes has no such trigger. The count is a lower
