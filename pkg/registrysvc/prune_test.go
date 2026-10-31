@@ -292,15 +292,15 @@ func TestPruneThroughTheStore(t *testing.T) {
 		ageBlobs(t, wd, "r", 0, digestOf(c))
 		want := map[string]KeepReason{digestOf(a): "", digestOf(b): KeepTaggedSincePlan, digestOf(c): KeepRecent}
 		for _, m := range p.Delete {
-			if got := Recheck(wd, m, time.Now()); got != want[m.Digest] {
+			if got, _ := Recheck(wd, m, time.Now()); got != want[m.Digest] {
 				t.Errorf("recheck %s = %q; want %q", m.Digest, got, want[m.Digest])
 			}
 		}
-		if got := Recheck(wd, StoredManifest{Repository: "r", Digest: digestOf(manifestBody("gone"))}, time.Now()); got != GoneSincePlan {
+		if got, _ := Recheck(wd, StoredManifest{Repository: "r", Digest: digestOf(manifestBody("gone"))}, time.Now()); got != GoneSincePlan {
 			t.Errorf("recheck of a digest no longer in the index = %q; want %q (skipped, not deleted)", got, GoneSincePlan)
 		}
-		if got := Recheck(wd, StoredManifest{Repository: "missing", Digest: digestOf(a)}, time.Now()); got != KeepUnreadable {
-			t.Errorf("recheck in an unreadable repository = %q; want %q", got, KeepUnreadable)
+		if got, _ := Recheck(wd, StoredManifest{Repository: "missing", Digest: digestOf(a)}, time.Now()); got != GoneSincePlan {
+			t.Errorf("recheck in a repository the store does not hold = %q; want %q", got, GoneSincePlan)
 		}
 	})
 
@@ -318,7 +318,7 @@ func TestPruneThroughTheStore(t *testing.T) {
 		layoutRepo(t, wd, "r", idx(row(c, manifestType, ""), row(ix, indexType, "v1")), blobs, old)
 		want := map[string]KeepReason{digestOf(ix): KeepTaggedSincePlan, digestOf(c): KeepChildOfKept}
 		for _, m := range p.Delete {
-			if got := Recheck(wd, m, time.Now()); got != want[m.Digest] {
+			if got, _ := Recheck(wd, m, time.Now()); got != want[m.Digest] {
 				t.Errorf("recheck %s = %q; want %q (the tagged index must keep naming its child)", m.Digest, got, want[m.Digest])
 			}
 		}
@@ -337,7 +337,7 @@ func TestPruneThroughTheStore(t *testing.T) {
 		layoutRepo(t, wd, "r", idx(row(subj, manifestType, "v1"), row(ref, manifestType, "")), blobs, old)
 		want := map[string]KeepReason{digestOf(subj): KeepTaggedSincePlan, digestOf(ref): KeepReferrer}
 		for _, m := range p.Delete {
-			if got := Recheck(wd, m, time.Now()); got != want[m.Digest] {
+			if got, _ := Recheck(wd, m, time.Now()); got != want[m.Digest] {
 				t.Errorf("recheck %s = %q; want %q (a tagged subject keeps its referrers)", m.Digest, got, want[m.Digest])
 			}
 		}
@@ -352,7 +352,7 @@ func TestPruneThroughTheStore(t *testing.T) {
 		layoutRepo(t, wd, "r", idx(row(b, manifestType, "")), blobs, old)
 		want := map[string]KeepReason{digestOf(a): GoneSincePlan, digestOf(b): ""}
 		for _, m := range p.Delete {
-			if got := Recheck(wd, m, time.Now()); got != want[m.Digest] {
+			if got, _ := Recheck(wd, m, time.Now()); got != want[m.Digest] {
 				t.Errorf("recheck %s = %q; want %q", m.Digest, got, want[m.Digest])
 			}
 		}

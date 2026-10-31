@@ -62,6 +62,13 @@ pin, its date, and the tarball's sha256.
   round-trip between that re-check and the DELETE is still not seen and can lose a tag or a
   child; closing that window needs a delete the registry makes conditional on the manifest's
   state.
+- `k3sm image prune --force` makes each DELETE conditional on the repository state its re-check
+  read, sent as `If-Match`. The k3sm registry server compares it under the lock the delete takes
+  and refuses the delete when a push changed the repository in between, so that push keeps its
+  tag, child or referrer; the manifest is listed under the kept manifests as "repository changed
+  at delete", not as a failure. zot, the server the daemon still runs, ignores `If-Match`, so
+  until the k3sm registry replaces it the window described above stays open. A repository
+  deleted since the plan is now reported as gone, no longer as unreadable.
 
 ## v0.2.3 — 2026-10-29
 

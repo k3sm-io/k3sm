@@ -25,6 +25,7 @@ import (
 	"mime"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gorilla/mux"
 	"github.com/opencontainers/go-digest"
@@ -313,8 +314,18 @@ func (s *Server) blobsPresent(n ref.Name, needs []digest.Digest) error {
 // still names.
 var errNamedByIndex = errorf(http.StatusMethodNotAllowed, codeDenied, "the manifest is named by an index in the repository")
 
+// errPreconditionFailed is a DELETE whose If-Match names no state the
+// repository is in.
+var errPreconditionFailed = errorf(http.StatusPreconditionFailed, codeDenied, "the repository changed since the state the request names")
+
 // deleteManifest is a manifest DELETE: by tag, only that tag's row; by digest,
 // every row of the digest, refused while an index in the repository names it.
+//
+// A DELETE carrying If-Match is conditional on the repository's state: the
+// entity tag is store.IndexState of its index.json rows, compared under the
+// repository lock that the delete itself holds, so no write lands between the
+// comparison and the delete. A state that no longer holds is a 412 and deletes
+// nothing. A request without If-Match is unconditional.
 func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Name) {
 	rf, err := parseReference(r)
 	if err != nil {
@@ -324,10 +335,27 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 	if !s.allow(w, r, VerbDelete, n) {
 		return
 	}
+	ifMatch, conditional := r.Header.Values("If-Match"), r.Header.Get("If-Match") != ""
+	precondition := func(rows []ispec.Descriptor) error {
+		if !conditional {
+			return nil
+		}
+		state, err := store.IndexState(rows)
+		if err != nil {
+			return err
+		}
+		if !matchesEntityTag(ifMatch, state) {
+			return errPreconditionFailed
+		}
+		return nil
+	}
 	if rf.Tag != "" {
-		err = s.st.DeleteTag(r.Context(), n, rf.Tag)
+		err = s.st.DeleteTagChecked(r.Context(), n, rf.Tag, precondition)
 	} else {
 		err = s.st.DeleteDigestChecked(r.Context(), n, rf.Digest, func(rows []ispec.Descriptor) error {
+			if err := precondition(rows); err != nil {
+				return err
+			}
 			return s.notNamedByIndex(n, rows, rf.Digest)
 		})
 	}
@@ -337,6 +365,26 @@ func (s *Server) deleteManifest(w http.ResponseWriter, r *http.Request, n ref.Na
 	}
 	s.log.Info("registry manifest deleted", "repository", n.String(), "reference", rf.String())
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// matchesEntityTag reports whether the If-Match field values match state:
+// "*" matches any current state, and a quoted strong entity tag matches when
+// its value is state (RFC 9110 section 13.1.1, strong comparison). A weak tag
+// never matches, and neither does a member that is not a quoted tag, so a
+// malformed condition fails rather than deletes.
+func matchesEntityTag(values []string, state string) bool {
+	for _, v := range values {
+		for member := range strings.SplitSeq(v, ",") {
+			member = strings.TrimSpace(member)
+			if member == "*" {
+				return true
+			}
+			if len(member) >= 2 && member[0] == '"' && member[len(member)-1] == '"' && member[1:len(member)-1] == state {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // notNamedByIndex fails when an index row of rows, other than d itself, lists

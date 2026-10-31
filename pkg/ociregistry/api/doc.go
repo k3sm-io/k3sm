@@ -44,6 +44,10 @@ limitations under the License.
 //     other; anything else is a 202 upload session;
 //   - a tag DELETE removes that tag's row, a digest DELETE every row of the
 //     digest, and a digest an index in the repository names is not deleted;
+//   - a DELETE with If-Match is conditional on the repository's index state
+//     (store.IndexState of its rows, as a quoted entity tag), compared under
+//     the repository lock; a state that no longer holds is 412 and deletes
+//     nothing. The registry this replaces ignores If-Match;
 //   - blobs are never deleted through the API; garbage collection removes
 //     them.
 //
