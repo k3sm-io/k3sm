@@ -118,6 +118,25 @@ type Collector struct {
 	// afterMark, when set, runs between a repository's mark and its locked
 	// sweep (a seam for tests that interleave a push).
 	afterMark func(ref.Name)
+	// fault, when set, runs at each faultPoint in apply; an error stops the
+	// sweep there, as a crash would (a seam for crash tests). i counts the
+	// blobs removed so far at faultBlob.
+	fault func(at faultPoint, i int) error
+}
+
+// faultPoint is a place in apply where the fault seam runs.
+type faultPoint int
+
+const (
+	faultRows faultPoint = iota // after SetRows
+	faultBlob                   // after each RemoveBlob
+)
+
+func (c *Collector) inject(at faultPoint, i int) error {
+	if c.fault == nil {
+		return nil
+	}
+	return c.fault(at, i)
 }
 
 // New returns a collector over s. Its start time, from which the first grace
@@ -257,13 +276,17 @@ func (c *Collector) mark(n ref.Name, cutoff time.Time) (plan, ispec.Index, store
 // not yet named blobs stay under the brake however old they are. A blob
 // written at the same instant as index.json counts as newer: the brake holds.
 func (c *Collector) brake(n ref.Name, p plan, idx ispec.Index, cont store.Contents) error {
-	if 2*len(p.blobs) <= len(cont.Blobs) || emptying(p, idx, cont) {
+	if 2*len(p.blobs) <= len(cont.Blobs) || emptyingRule(p, idx, cont) {
 		return nil
 	}
 	c.log.Error("registry gc: sweep stopped", "repository", n.String(), "reap", len(p.blobs), "blobs", len(cont.Blobs),
 		"reason", "more than half of the repository's blobs")
 	return fmt.Errorf("%w: %d of %d", ErrMassDelete, len(p.blobs), len(cont.Blobs))
 }
+
+// emptyingRule is the rule brake applies (a seam for the test that proves
+// the brake's tests fail without it).
+var emptyingRule = emptying
 
 // emptying reports whether p empties the repository, by the rule brake
 // documents.
@@ -303,12 +326,18 @@ func (c *Collector) apply(l *store.Locked, n ref.Name, p plan, idx ispec.Index, 
 		for _, d := range sortedKeys(p.rows) {
 			reaped(KindManifest, d.String(), reasonManifest)
 		}
+		if err := c.inject(faultRows, 0); err != nil {
+			return objs, err
+		}
 	}
-	for _, d := range sortedKeys(p.blobs) {
+	for i, d := range sortedKeys(p.blobs) {
 		if err := l.RemoveBlob(d); err != nil {
 			return objs, err
 		}
 		reaped(KindBlob, d.String(), reasonBlob)
+		if err := c.inject(faultBlob, i+1); err != nil {
+			return objs, err
+		}
 	}
 	for _, id := range sortedKeys(p.sessions) {
 		v, err := l.ReapSession(id, cutoff)
