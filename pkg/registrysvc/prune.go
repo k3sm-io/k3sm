@@ -20,6 +20,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"time"
 
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -68,9 +71,14 @@ const (
 	// was read. A delete by digest would drop that tag.
 	KeepTaggedSincePlan KeepReason = "tagged since the plan"
 	// GoneSincePlan is a planned manifest no longer in its repository when its
-	// delete comes up: something else deleted it. Prune sends no DELETE for it
-	// and does not count it as one of its own deletions.
+	// delete comes up, or whose repository is gone: something else deleted it.
+	// Prune sends no DELETE for it and does not count it as one of its own
+	// deletions.
 	GoneSincePlan KeepReason = "already gone since the plan"
+	// KeepChangedSincePlan is a planned manifest whose conditional DELETE the
+	// registry refused: the repository changed between the re-check and the
+	// delete, so the re-check's verdict no longer holds.
+	KeepChangedSincePlan KeepReason = "repository changed at delete"
 )
 
 // StoredManifest is one manifest in one repository of the registry.
@@ -144,28 +152,53 @@ type manifestLinks struct {
 var errUnreadable = errors.New("repository not fully readable")
 
 // PlanRepository plans one repository. It never fails: a repository it cannot
-// read completely keeps all its untagged manifests under KeepUnreadable.
+// read completely keeps all its untagged manifests under KeepUnreadable, and
+// one the store no longer holds (deleted since it was listed) plans nothing.
 func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
-	p, _ := planRepository(workDir, repo, now)
-	return p
+	return planRepository(workDir, repo, now).plan
 }
 
-// planRepository is PlanRepository that also returns every digest the
-// repository's index holds, mapped to whether any row tags it. The map is nil
-// when the index itself could not be read.
-func planRepository(workDir, repo string, now time.Time) (PrunePlan, map[string]bool) {
-	unreadable := PrunePlan{Unreadable: []string{repo}}
+// repoPlan is one read of a repository: its plan, every digest its index holds
+// mapped to whether any row tags it, and the index state the plan was made
+// from (store.IndexState). present is nil, and err says why, when the index
+// itself could not be read; gone is set when that is because the repository's
+// directory is absent.
+type repoPlan struct {
+	plan    PrunePlan
+	present map[string]bool
+	state   string
+	err     error
+	gone    bool
+}
+
+// planRepository is PlanRepository that also returns what the plan was read
+// from.
+func planRepository(workDir, repo string, now time.Time) repoPlan {
 	n, err := ref.ParseName(repo)
+	unreadable := func(err error) repoPlan {
+		// A repository whose directory is absent has nothing to plan; it is
+		// gone, not unreadable. One whose directory is still there but fails
+		// the store's repository check (a missing or irregular layout file,
+		// index.json or blobs directory) is damaged, and stays unreadable.
+		if errors.Is(err, store.ErrRepositoryUnknown) && repoDirAbsent(workDir, n) {
+			return repoPlan{err: err, gone: true}
+		}
+		return repoPlan{plan: PrunePlan{Unreadable: []string{repo}}, err: err}
+	}
 	if err != nil {
-		return unreadable, nil
+		return unreadable(err)
 	}
 	r, err := store.OpenReader(StateDir(workDir))
 	if err != nil {
-		return unreadable, nil
+		return unreadable(err)
 	}
 	idx, err := r.Index(n)
 	if err != nil {
-		return unreadable, nil
+		return unreadable(err)
+	}
+	state, err := store.IndexState(idx.Manifests)
+	if err != nil {
+		return unreadable(err)
 	}
 	type entry struct {
 		m      StoredManifest
@@ -178,7 +211,7 @@ func planRepository(workDir, repo string, now time.Time) (PrunePlan, map[string]
 		// anything but a canonical sha256 or sha512 digest makes the whole
 		// repository unreadable rather than being opened.
 		if _, err := ref.ParseDigest(d.Digest.String()); err != nil {
-			return unreadable, nil
+			return unreadable(err)
 		}
 		dg := d.Digest.String()
 		e, ok := byDigest[dg]
@@ -212,7 +245,7 @@ func planRepository(workDir, repo string, now time.Time) (PrunePlan, map[string]
 	for _, dg := range order {
 		l, modTime, err := readManifest(r, n, dg)
 		if err != nil {
-			return untagged(KeepUnreadable), present
+			return repoPlan{plan: untagged(KeepUnreadable), present: present, state: state}
 		}
 		links[dg] = l
 		if byDigest[dg].tagged {
@@ -267,12 +300,30 @@ func planRepository(workDir, repo string, now time.Time) (PrunePlan, map[string]
 		}
 	}
 	p.Delete = append(indexes, others...)
-	return p, present
+	return repoPlan{plan: p, present: present, state: state}
+}
+
+// repoDirAbsent reports whether n's directory is absent from the store: the
+// path does not exist at all. Anything else, a symlink on the way or an
+// entry of any kind at the path, is not absent.
+func repoDirAbsent(workDir string, n ref.Name) bool {
+	root := StateDir(workDir)
+	dir, err := n.Dir(root)
+	if err != nil {
+		return false
+	}
+	if err := ref.NoSymlinks(root, filepath.Dir(dir)); err != nil {
+		return false
+	}
+	_, err = os.Lstat(dir)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // Recheck re-plans the repository of a planned manifest from its current
-// state, immediately before that manifest's delete, and returns why it must
-// now be kept, or "" when it may still be deleted.
+// state, immediately before that manifest's delete. It returns why the
+// manifest must now be kept, or "" and the repository state (store.IndexState)
+// the fresh plan was read from, which the caller's DELETE names as its
+// condition (DeleteManifest).
 //
 // A plan goes stale while its deletes run. A push may tag a planned digest (a
 // delete by digest drops every row with it, the new tag too), re-push it into
@@ -281,40 +332,44 @@ func planRepository(workDir, repo string, now time.Time) (PrunePlan, map[string]
 // PlanRepository runs, keep closure included, and the digest may go only if
 // it is still in that fresh plan's delete set. Otherwise the reason is the
 // fresh plan's own (KeepChildOfKept, KeepReferrer, KeepRecent), or
-// KeepTaggedSincePlan for a digest now tagged, or KeepUnreadable for anything
-// it cannot read, or GoneSincePlan for a digest no longer in the index, which
-// the caller skips rather than deletes.
+// KeepTaggedSincePlan for a digest now tagged, or GoneSincePlan for a digest
+// no longer in the index or a repository whose directory is absent, which the
+// caller skips rather than deletes, or KeepUnreadable for anything else it
+// cannot read.
 //
-// This closes the race up to the request round-trip between the re-check and
-// the DELETE: a push landing inside that window is not seen. Only a delete the
-// server makes conditional on the digest's state, under its own index lock,
-// closes that window too. Each call re-reads every manifest of the
-// repository, so a prune of n planned manifests reads the repository n times.
-func Recheck(workDir string, m StoredManifest, now time.Time) KeepReason {
-	p, present := planRepository(workDir, m.Repository, now)
-	if present == nil {
-		return KeepUnreadable
+// The state closes the window between this re-check and the DELETE: a
+// registry that honours If-Match refuses the delete once any row of the
+// repository has changed, so a push landing in between is never lost. Each
+// call re-reads every manifest of the repository, so a prune of n planned
+// manifests reads the repository n times.
+func Recheck(workDir string, m StoredManifest, now time.Time) (KeepReason, string) {
+	rp := planRepository(workDir, m.Repository, now)
+	if rp.present == nil {
+		if rp.gone {
+			return GoneSincePlan, ""
+		}
+		return KeepUnreadable, ""
 	}
-	tagged, ok := present[m.Digest]
+	tagged, ok := rp.present[m.Digest]
 	switch {
 	case !ok:
-		return GoneSincePlan
+		return GoneSincePlan, ""
 	case tagged:
-		return KeepTaggedSincePlan
+		return KeepTaggedSincePlan, ""
 	}
-	for _, d := range p.Delete {
+	for _, d := range rp.plan.Delete {
 		if d.Digest == m.Digest {
-			return ""
+			return "", rp.state
 		}
 	}
-	for _, k := range p.Kept {
+	for _, k := range rp.plan.Kept {
 		if k.Digest == m.Digest {
-			return k.Reason
+			return k.Reason, ""
 		}
 	}
 	// An untagged digest in the index is always in one of the two lists; keep
 	// it should that ever not hold.
-	return KeepUnreadable
+	return KeepUnreadable, ""
 }
 
 // readManifest reads one manifest through the store, which checks its body

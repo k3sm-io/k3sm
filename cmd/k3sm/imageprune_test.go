@@ -173,7 +173,7 @@ type fakeZot struct {
 	authority []string
 }
 
-func (z *fakeZot) delete(_ context.Context, ref name.Digest, auth authn.Authenticator) error {
+func (z *fakeZot) delete(_ context.Context, ref name.Digest, _ string, auth authn.Authenticator) error {
 	cfg, err := auth.Authorization()
 	if err != nil {
 		return err
@@ -406,7 +406,7 @@ func TestImagePruneReportsARefusedDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	refuse := func(_ context.Context, ref name.Digest, _ authn.Authenticator) error {
+	refuse := func(_ context.Context, ref name.Digest, _ string, _ authn.Authenticator) error {
 		if ref.DigestStr() == f.oldLeaf {
 			return errors.New("MANIFEST_UNKNOWN")
 		}
@@ -497,7 +497,7 @@ func TestImagePruneRechecksEachPlannedDigestBeforeItsDelete(t *testing.T) {
 	firstDigest, secondDigest := digest.FromBytes(first), digest.FromBytes(second)
 
 	var deleted []string
-	del := func(ctx context.Context, rf name.Digest, _ authn.Authenticator) error {
+	del := func(ctx context.Context, rf name.Digest, _ string, _ authn.Authenticator) error {
 		if len(deleted) == 0 {
 			if _, err := st.PutManifest(ctx, repo, ref.Reference{Tag: "v1"}, ociManifestType, second); err != nil {
 				return err
@@ -590,7 +590,7 @@ func TestImagePruneRecheckAppliesTheKeepClosure(t *testing.T) {
 	loneD, childD, ixD, staleD := digest.FromBytes(lone), digest.FromBytes(child), digest.FromBytes(ix), digest.FromBytes(stale)
 
 	var deleted []string
-	del := func(ctx context.Context, rf name.Digest, _ authn.Authenticator) error {
+	del := func(ctx context.Context, rf name.Digest, _ string, _ authn.Authenticator) error {
 		if len(deleted) == 0 {
 			if _, err := st.PutManifest(ctx, repo, ref.Reference{Tag: "v1"}, ociIndexType, ix); err != nil {
 				return err
@@ -643,5 +643,124 @@ func TestImagePruneRecheckAppliesTheKeepClosure(t *testing.T) {
 	}
 	if len(doc.Registry.Failed) != 0 {
 		t.Errorf("report failed = %+v; want none", doc.Registry.Failed)
+	}
+}
+
+// TestImagePruneReportsRecheckSkips pins how the delete loop reports the
+// planned manifests it does not delete: a repository the re-check cannot read
+// is listed as unreadable once, however many of its manifests were skipped; a
+// repository gone since the plan is reported under kept only, never as
+// unreadable; and a delete the registry refused because the repository
+// changed after the re-check is kept, not failed. The deleter's first call
+// deletes through the store and then breaks the repository as the case needs,
+// so the re-checks of the other two planned manifests meet the broken state.
+// Each case runs once for the JSON report and once, on a fresh fixture, for
+// the table.
+func TestImagePruneReportsRecheckSkips(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		breakRepo      func(t *testing.T, workDir string)
+		refuse         bool
+		wantReason     registrysvc.KeepReason
+		wantKept       int
+		wantUnreadable []string
+	}{
+		{"an index the re-check cannot read", func(t *testing.T, workDir string) {
+			if err := os.WriteFile(filepath.Join(registrysvc.StateDir(workDir), "app", "index.json"), []byte("{"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, false, registrysvc.KeepUnreadable, 2, []string{"app"}},
+		{"a repository gone since the plan", func(t *testing.T, workDir string) {
+			if err := os.RemoveAll(filepath.Join(registrysvc.StateDir(workDir), "app")); err != nil {
+				t.Fatal(err)
+			}
+		}, false, registrysvc.GoneSincePlan, 2, nil},
+		{"a repository changed at the delete", nil, true, registrysvc.KeepChangedSincePlan, 3, nil},
+	} {
+		for _, output := range []string{"json", "table"} {
+			t.Run(tc.name+"/"+output, func(t *testing.T) {
+				workDir := t.TempDir()
+				serveFakeZot(t, workDir)
+				st, err := store.OpenWorkDir(workDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx := t.Context()
+				repo, err := ref.ParseName("app")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := st.Init(ctx, repo); err != nil {
+					t.Fatal(err)
+				}
+				old := time.Now().Add(-2 * time.Hour)
+				for _, seed := range []string{"one", "two", "three"} {
+					b := []byte(`{"schemaVersion":2,"mediaType":"` + ociManifestType + `","annotations":{"seed":"` + seed + `"}}`)
+					if _, err := st.PutManifest(ctx, repo, ref.Reference{Digest: digest.FromBytes(b)}, ociManifestType, b); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chtimes(filepath.Join(registrysvc.StateDir(workDir), "app", "blobs", "sha256", digest.FromBytes(b).Encoded()), old, old); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				var calls int
+				del := func(ctx context.Context, rf name.Digest, state string, _ authn.Authenticator) error {
+					calls++
+					if state == "" {
+						t.Errorf("the DELETE of %s named no repository state", rf.DigestStr())
+					}
+					if tc.refuse {
+						return fmt.Errorf("delete %s: %w", rf, registrysvc.ErrChangedSincePlan)
+					}
+					if err := st.DeleteDigest(ctx, repo, digest.Digest(rf.DigestStr())); err != nil {
+						return err
+					}
+					if calls == 1 {
+						tc.breakRepo(t, workDir)
+					}
+					return nil
+				}
+				sock := serveFakeImages(t, &fakeImagesDaemon{pruneResp: &runtimev1.PruneImagesResponse{}})
+				args := []string{"--socket", sock, "--work-dir", workDir, "prune", "--force"}
+				if output == "json" {
+					args = append(args, "-o", "json")
+				}
+				opts, err := parseImageArgs(args, io.Discard)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var out bytes.Buffer
+				if err := imageCommandWith(ctx, opts, &out, dialRuntimed, del); err != nil {
+					t.Fatalf("image prune --force: %v\n%s", err, out.String())
+				}
+
+				if output == "table" {
+					if got := strings.Count(out.String(), "  unreadable, left alone: app\n"); got != len(tc.wantUnreadable) {
+						t.Errorf("table carries %d unreadable lines for app; want %d:\n%s", got, len(tc.wantUnreadable), out.String())
+					}
+					want := fmt.Sprintf("    %-28s %d\n", tc.wantReason, tc.wantKept)
+					if !strings.Contains(out.String(), want) {
+						t.Errorf("table lacks the kept line %q:\n%s", want, out.String())
+					}
+					return
+				}
+				doc := decodePrune(t, out.String())
+				if strings.Join(doc.Registry.Unreadable, ",") != strings.Join(tc.wantUnreadable, ",") {
+					t.Errorf("report unreadable = %v; want %v", doc.Registry.Unreadable, tc.wantUnreadable)
+				}
+				if len(doc.Registry.Failed) != 0 {
+					t.Errorf("report failed = %+v; want none", doc.Registry.Failed)
+				}
+				if len(doc.Registry.Kept) != tc.wantKept {
+					t.Errorf("report kept %d; want %d: %+v", len(doc.Registry.Kept), tc.wantKept, doc.Registry.Kept)
+				}
+				for _, k := range doc.Registry.Kept {
+					if k.Reason != string(tc.wantReason) {
+						t.Errorf("report kept %s = %q; want %q", k.Digest, k.Reason, tc.wantReason)
+					}
+				}
+			})
+		}
 	}
 }

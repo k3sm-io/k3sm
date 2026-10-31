@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
@@ -137,12 +138,40 @@ func (s *Store) PutManifestChecked(ctx context.Context, n ref.Name, r ref.Refere
 	return desc, nil
 }
 
+// IndexState is a digest over a repository's index.json rows, in order: it
+// changes whenever a row is added, removed, re-tagged or reordered, and only
+// then. A reader that computes it from Index and a writer that computes it from
+// the rows under the repository lock get the same value for the same rows, so
+// it serves as the entity tag of a conditional request: a delete that names
+// the state its caller planned against is refused once the repository has
+// moved on.
+func IndexState(rows []ispec.Descriptor) (string, error) {
+	d := digest.Canonical.Digester()
+	enc := json.NewEncoder(d.Hash())
+	for _, r := range rows {
+		if err := enc.Encode(r); err != nil {
+			return "", fmt.Errorf("index state: %w", err)
+		}
+	}
+	return d.Digest().String(), nil
+}
+
 // DeleteTag removes the one row carrying tag.
 func (s *Store) DeleteTag(ctx context.Context, n ref.Name, tag string) error {
+	return s.DeleteTagChecked(ctx, n, tag, func([]ispec.Descriptor) error { return nil })
+}
+
+// DeleteTagChecked is DeleteTag that first runs check over the rows under the
+// repository lock and deletes nothing when it fails. check must not take the
+// repository lock.
+func (s *Store) DeleteTagChecked(ctx context.Context, n ref.Name, tag string, check func([]ispec.Descriptor) error) error {
 	return s.updateIndex(ctx, n, func(rows []ispec.Descriptor) ([]ispec.Descriptor, bool, error) {
 		i := slices.IndexFunc(rows, func(r ispec.Descriptor) bool { return r.Annotations[ispec.AnnotationRefName] == tag })
 		if i < 0 {
 			return nil, false, fmt.Errorf("%w: %s in %s", ErrManifestUnknown, tag, n)
+		}
+		if err := check(rows); err != nil {
+			return nil, false, err
 		}
 		return slices.Delete(rows, i, i+1), true, nil
 	})
