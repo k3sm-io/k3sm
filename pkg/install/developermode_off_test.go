@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -172,6 +173,85 @@ func TestDeveloperModeMarkerChangedUnderTheLock(t *testing.T) {
 		}
 		if err := applyDeveloperMode(context.Background(), f, cfg); err != nil {
 			t.Fatalf("applyDeveloperMode = %v, want accepted", err)
+		}
+	})
+}
+
+// pinPlainInstallSignature, run by TestDeveloperModeMarkerOnInstall, pins which signature on a plain install
+// (no --from-staging, no flag) turns developer mode off and which leaves it
+// on, the log line that names the team, and the sentences of the user docs
+// that say so.
+func pinPlainInstallSignature(t *testing.T) {
+	const exe = "/usr/local/bin/k3sm"
+	const sibling = "/usr/local/bin/k3sm-vmhost"
+	cases := []struct {
+		name       string
+		signer     fakeSigner
+		wantRemove bool
+		wantTeam   string
+	}{
+		{name: "a Developer ID of the release team turns it off", wantRemove: true, wantTeam: testTeamID,
+			signer: fakeSigner{ids: map[string]string{exe: testTeamID}}},
+		{name: "a Developer ID of any other team turns it off", wantRemove: true, wantTeam: "ZZZZZ99999",
+			signer: fakeSigner{ids: map[string]string{exe: "ZZZZZ99999"}}},
+		{name: "an ad-hoc sibling payload is not checked", wantRemove: true, wantTeam: testTeamID,
+			signer: fakeSigner{ids: map[string]string{exe: testTeamID}, errs: map[string]error{sibling: ErrNoTeamID}}},
+		{name: "an Apple Development signature keeps it",
+			signer: fakeSigner{ids: map[string]string{exe: testTeamID}, notDevID: map[string]bool{exe: true}}},
+		{name: "an ad-hoc signature keeps it",
+			signer: fakeSigner{errs: map[string]error{exe: ErrNoTeamID}}},
+		{name: "an unreadable signature keeps it",
+			signer: fakeSigner{errs: map[string]error{exe: errSignatureUnreadable}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fakeSystem{owners: map[string]OwnedEntry{}}
+			f.owners[DeveloperModeMarkerPath] = OwnedEntry{Path: DeveloperModeMarkerPath, Kind: EntryRegular, Mode: 0o644}
+			f.putFile(DeveloperModeMarkerPath, []byte("developer mode enabled by k3sm install on 2026-10-31T00:00:00Z\n"))
+			var logs strings.Builder
+			cfg := Config{
+				BinarySource:   exe,
+				Logger:         slog.New(slog.NewTextHandler(&logs, nil)),
+				StagingOptions: StagingOptions{Executable: exe, Signer: tc.signer},
+			}
+			if err := resolveDeveloperMode(f, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyDeveloperMode(context.Background(), f, cfg); err != nil {
+				t.Fatalf("applyDeveloperMode = %v", err)
+			}
+			_, kept := f.files[DeveloperModeMarkerPath]
+			if kept == tc.wantRemove {
+				t.Fatalf("marker kept = %v, want %v; logs:\n%s", kept, !tc.wantRemove, logs.String())
+			}
+			if tc.wantRemove {
+				want := "developer mode turned off by a signed install"
+				if !strings.Contains(logs.String(), want) || !strings.Contains(logs.String(), "team-id="+tc.wantTeam) {
+					t.Errorf("log does not say %q with team-id=%s:\n%s", want, tc.wantTeam, logs.String())
+				}
+			} else if !strings.Contains(logs.String(), "developer mode stays on") {
+				t.Errorf("a kept marker is not explained:\n%s", logs.String())
+			}
+		})
+	}
+
+	t.Run("the user docs say what the code does", func(t *testing.T) {
+		t.Parallel()
+		doc, err := os.ReadFile("../../docs/user/install.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := strings.Join(strings.Fields(string(doc)), " ")
+		for _, want := range []string{
+			"a plain `sudo k3sm install` turns it off when the `k3sm` doing the install carries a Developer ID Application signature of any team",
+			"The team is not compared with the installed one",
+			"the other programs the install lays down are not checked",
+			"An ad-hoc signed build from source, or one signed for Apple Development, leaves it on",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("docs/user/install.md lacks %q", want)
+			}
 		}
 	})
 }

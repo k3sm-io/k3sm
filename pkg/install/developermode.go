@@ -300,6 +300,14 @@ func applyDeveloperMode(ctx context.Context, sys System, cfg Config) error {
 // has no staged tree to walk, so this is the one check it can make; it fails
 // toward removal only for a team-signed binary, and removing the marker only
 // turns the signature checks back on. It returns "" and why on any doubt.
+//
+// Three limits are accepted, because each fails closed (a wrong verdict can
+// only remove the marker, which re-arms the checks). The signature is read
+// from the running binary's path, not from the bytes later copied into the
+// install root, so a swap in that window goes unseen. Any Developer ID team
+// qualifies: no release team is pinned, and the installed build is not
+// consulted. The sibling payloads and helpers are not checked; only the
+// --from-staging path can walk a tree (developerModeOff).
 func plainInstallTeam(ctx context.Context, cfg Config) (string, string) {
 	exe := cfg.Executable
 	if exe == "" {
