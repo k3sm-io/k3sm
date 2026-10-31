@@ -103,7 +103,13 @@ func (s pruneStore) layout(repo string, entries ...indexEntry) {
 	dir := filepath.Join(registrysvc.StateDir(s.workDir), filepath.FromSlash(repo))
 	var ms []map[string]any
 	for _, e := range entries {
-		d := map[string]any{"mediaType": e.mediaType, "digest": e.digest, "size": 100}
+		// The row carries the blob's real size, as the registry writes it: the
+		// store checks every manifest body against its row.
+		fi, err := os.Stat(filepath.Join(dir, "blobs", "sha256", strings.TrimPrefix(e.digest, "sha256:")))
+		if err != nil {
+			s.t.Fatal(err)
+		}
+		d := map[string]any{"mediaType": e.mediaType, "digest": e.digest, "size": fi.Size()}
 		if e.tag != "" {
 			d["annotations"] = map[string]string{"org.opencontainers.image.ref.name": e.tag}
 		}

@@ -29,6 +29,9 @@ pin, its date, and the tarball's sha256.
 - `k3sm image ls` and `k3sm image df` keep a cache of image descriptions by digest under
   `~/Library/Caches/k3sm/registry`, so a repeat listing of a large registry reads each tag's
   digest and describes only new content.
+- `k3sm image prune` reads the cluster registry through the registry's own store code, read-only,
+  and checks every manifest it reads against its digest; a repository whose manifests do not match
+  is left alone. Deletions still go through the registry's API with the node's push credential.
 
 ### Fixed
 
