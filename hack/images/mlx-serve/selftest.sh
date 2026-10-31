@@ -23,6 +23,11 @@
 #   * the k3sm-shard entrypoint renders the ring hostfile and the jaccl device
 #     matrix into the pod data volume from fake name resolution, retries and
 #     bounds resolution, and its liveness probe answers 0 and 1 correctly;
+#   * the entrypoint takes --served-model-name itself and makes the engine
+#     answer to that name on /v1/models and in a request's model field,
+#     against a fake engine module, and refuses to start when a hook it
+#     relies on is missing or reshaped (and, with a staged tree, finds every
+#     hook on the pinned mlx_lm.server);
 #   * the k3sm-serve context guard refuses a request longer than the engine's
 #     window with vLLM's HTTP 400 and passes one inside it, against fakes and,
 #     when a staged tree is present, against the real vllm-mlx server, on the
@@ -378,7 +383,7 @@ else
 fi
 
 # ---- 7 — the k3sm-shard entrypoint (sharded ranks) ---------------------------
-# What a rank does before exec, with FAKE name resolution: no model, no GPU,
+# What a rank does before it starts the engine, with FAKE name resolution: no model, no GPU,
 # no cluster DNS. The live rendezvous (real per-pod records, two Macs, the
 # sandbox profile) is the M17 lab ladder's sharded-ring rung.
 SHARD="$HERE/k3sm_shard.py"
@@ -426,7 +431,7 @@ check("ring.hostfile  one [podIP:port] entry per rank, in rank order",
       json.loads(content) == [["10.42.0.5:29500"], ["10.42.1.5:29500"]])
 check("ring.datavolume  the hostfile lands inside TMPDIR and MLX_HOSTFILE names it",
       path.startswith(podvol + os.sep) and cenv["MLX_HOSTFILE"] == path)
-check("ring.argv  execs mlx_lm.server on 0.0.0.0 and the serve port, caller args last, no --pipeline for tensor",
+check("ring.argv  runs mlx_lm.server on 0.0.0.0 and the serve port, caller args last, no --pipeline for tensor",
       argv[1:8] == ["-m", "mlx_lm.server", "--host", "0.0.0.0", "--port", "8000", "--model"]
       and argv[-2:] == ["--max-tokens", "8"] and "--pipeline" not in argv)
 check("ring.env  MLX_RANK and MLX_WORLD_SIZE exported", cenv["MLX_RANK"] == "1" and cenv["MLX_WORLD_SIZE"] == "2")
@@ -493,6 +498,139 @@ for label, e in (("nodatavolume  refuses to write anywhere but the pod data volu
     except ks.ShardError:
         check(label, True)
 
+# --served-model-name: taken by the entrypoint, never passed to mlx_lm.server
+name, rest = ks.split_served_name(["--model", "/snap", "--served-model-name", "org/m", "--max-tokens", "8"])
+check("alias.split  --served-model-name is removed from the engine's argv and returned",
+      name == "org/m" and rest == ["--model", "/snap", "--max-tokens", "8"])
+name, rest = ks.split_served_name(["--served-model-name", "a", "--served-model-name=b"])
+check("alias.lastwins  the last --served-model-name wins, as a caller override does", name == "b" and rest == [])
+check("alias.absent  no --served-model-name leaves argv alone",
+      ks.split_served_name(["--model", "/m"]) == (None, ["--model", "/m"]))
+try:
+    ks.split_served_name(["--served-model-name"])
+    check("alias.novalue  --served-model-name without a name ends the rank", False)
+except ks.ShardError:
+    check("alias.novalue  --served-model-name without a name ends the rank", True)
+
+import io, types
+def fake_engine(**drop):
+    """A stand-in for mlx_lm.server 0.32.0 with the hooks the alias uses."""
+    m = types.ModuleType("mlx_lm.server")
+    rec = m.rec = {"loads": [], "http": None, "joined": False, "rank": 0}
+    class ModelProvider:
+        def __init__(self, cli_args):
+            self.cli_args = cli_args
+        def load(self, model_path, adapter_path=None, draft_model_path=None):
+            rec["loads"].append((model_path, adapter_path, draft_model_path))
+            return "model", "tokenizer"
+    class APIHandler:
+        def __init__(self, path):
+            self.path, self.created, self.wfile, self.status = path, 7, io.BytesIO(), None
+        def handle_models_request(self):
+            self.wfile.write(b"upstream")
+        def _set_completion_headers(self, status_code=200):
+            self.status = status_code
+        def end_headers(self):
+            pass
+    class ResponseGenerator:
+        def __init__(self, model_provider, prompt_cache):
+            self.model_provider, self.prompt_cache = model_provider, prompt_cache
+        def join(self):
+            rec["joined"] = True
+    def run(host, port, model_provider, server_class=None, handler_class=None):
+        raise AssertionError("the stock run was called")
+    def _run_http_server(host, port, response_generator, server_class=None, handler_class=APIHandler):
+        rec["http"] = (host, port, response_generator, handler_class)
+    def main():
+        rec["argv"] = list(sys.argv)
+        m.run("0.0.0.0", 8000, m.ModelProvider(types.SimpleNamespace(prompt_cache_size=3)))
+    group = types.SimpleNamespace(rank=lambda: rec["rank"])
+    m.mx = types.SimpleNamespace(distributed=types.SimpleNamespace(init=lambda: group))
+    m.ModelProvider, m.APIHandler, m.ResponseGenerator = ModelProvider, APIHandler, ResponseGenerator
+    m.LRUPromptCache = lambda size: ("cache", size)
+    m.run, m._run_http_server, m.main = run, _run_http_server, main
+    for path, value in drop.items():
+        owner, _, attr = path.rpartition(".")
+        setattr(getattr(m, owner) if owner else m, attr, value)
+    return m
+
+eng = fake_engine()
+P, Hd, _ = ks.install_alias(eng, "org/m")
+prov = eng.ModelProvider(types.SimpleNamespace(prompt_cache_size=3))
+prov.load("org/m", None, "default_model")
+prov.load("other/x", None, "default_model")
+check("alias.load  a request naming the served name loads default_model (the loaded snapshot), others pass through",
+      eng.rec["loads"] == [("default_model", None, "default_model"), ("other/x", None, "default_model")])
+def models(handler_cls, path):
+    h = handler_cls(path)
+    h.handle_models_request()
+    return h.status, h.wfile.getvalue()
+st, body = models(Hd, "/v1/models")
+check("alias.models  /v1/models lists the served name and nothing else",
+      st == 200 and [d["id"] for d in json.loads(body)["data"]] == ["org/m"])
+_, b1 = models(Hd, "/v1/models/org/m")
+_, b2 = models(Hd, "/v1/models/other/x")
+check("alias.modelsfilter  /v1/models/<id> finds the served name and no other",
+      [d["id"] for d in json.loads(b1)["data"]] == ["org/m"] and json.loads(b2)["data"] == [])
+eng.main()
+host, port, rg, handler = eng.rec["http"]
+check("alias.rank0  rank 0 serves HTTP through the aliased handler and provider",
+      handler is Hd and isinstance(rg.model_provider, P) and rg.prompt_cache == ("cache", 3) and port == 8000)
+eng = fake_engine()
+eng.rec["rank"] = 1
+ks.install_alias(eng, "org/m")
+eng.main()
+check("alias.rankn  every other rank joins the generator and serves no HTTP",
+      eng.rec["joined"] and eng.rec["http"] is None)
+eng = fake_engine()
+stock = (eng.ModelProvider, eng.APIHandler, eng.run)
+eng._run_http_server = None
+got = ks.install_alias(eng, None)
+check("alias.none  without a served name nothing is checked or replaced: the engine is stock",
+      got == stock and (eng.ModelProvider, eng.APIHandler, eng.run) == stock
+      and models(eng.APIHandler, "/v1/models")[1] == b"upstream")
+def fake_run(host, port, model_provider, server_class=None, handler_class=None):
+    group = mx.distributed.init()
+    return group
+try:
+    ks.check_run_shape(types.SimpleNamespace(run=fake_run))
+    check("alias.runshape  a run whose body is not the copied 0.32.0 one is refused with the re-derive instruction", False)
+except ks.ShardError as e:
+    check("alias.runshape  a run whose body is not the copied 0.32.0 one is refused with the re-derive instruction",
+          "re-derive" in str(e) and "ENGINE_RUN_SHA256" in str(e))
+for label, drop, needle in (
+        ("alias.failclosed.missing  an engine without _run_http_server ends the rank naming it",
+         {"_run_http_server": None}, "_run_http_server"),
+        ("alias.failclosed.signature  a ModelProvider.load with other parameters ends the rank naming it",
+         {"ModelProvider.load": lambda self, model_path: None}, "ModelProvider.load")):
+    eng = fake_engine(**drop)
+    stock_run, stock_provider = eng.run, eng.ModelProvider
+    try:
+        ks.install_alias(eng, "org/m")
+        check(label, False)
+    except ks.ShardError as e:
+        check(label, needle in str(e) and eng.run is stock_run and eng.ModelProvider is stock_provider)
+
+# serve: the rendezvous environment is in place before the engine is imported,
+# and the engine sees plan()'s argv (pipeline included) without the alias flag
+saved = dict(os.environ)
+seen = {}
+def importer(name):
+    seen["name"], seen["hostfile"] = name, os.environ.get("MLX_HOSTFILE")
+    seen["eng"] = fake_engine()
+    return seen["eng"]
+served, rest = ks.split_served_name(["--model", "/snap", "--served-model-name", "org/m"])
+files, cenv, cargv = ks.plan(env(K3SM_MLX_PARALLELISM="pipeline"), rest, resolver=resolver)
+try:
+    ks.serve(cenv, cargv, served, importer=importer)
+finally:
+    os.environ.clear()
+    os.environ.update(saved)
+check("serve.env  the engine is imported after MLX_HOSTFILE is set", seen["name"] == "mlx_lm.server"
+      and seen["hostfile"] == cenv["MLX_HOSTFILE"])
+check("serve.argv  main() sees the plan's argv, --pipeline kept, --served-model-name gone",
+      seen["eng"].rec["argv"] == ["mlx_lm.server", "--host", "0.0.0.0", "--port", "8000", "--pipeline", "--model", "/snap"])
+
 # the liveness probe against a local server
 class H(http.server.BaseHTTPRequestHandler):
     code = 200
@@ -531,10 +669,10 @@ while read -r verdict name; do
 	esac
 done <<< "$shard_out"
 # A driver that crashed before its checks would otherwise pass vacuously.
-if [ "$SHARD_CHECKS" -ge 19 ]; then
+if [ "$SHARD_CHECKS" -ge 34 ]; then
 	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
 else
-	ladder no "7.count  only $SHARD_CHECKS of 19 entrypoint checks reported (the driver crashed?)"
+	ladder no "7.count  only $SHARD_CHECKS of 34 entrypoint checks reported (the driver crashed?)"
 	head -20 "$WORK/shard-driver.err"
 fi
 
@@ -1130,6 +1268,86 @@ PY
 	fi
 else
 	ladder skip "9s.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
+fi
+
+# ---- 9a — the served-name alias against the pinned mlx-lm (staged tree) ------
+# k3sm_shard's alias hooks four mlx_lm.server internals; this rung checks them
+# on the real module the image carries, so an mlx-lm bump that moves one goes
+# red here before a rank refuses to start: every hook's signature, the source
+# of the run the alias copies (pinned to 0.32.0's), and the real models
+# listing against the aliased one. No model is loaded and no distributed group
+# is formed: the handlers are built without a socket over an empty Hub cache.
+if [ -x "$STAGED/bin/python3.12" ] && [ -d "$STAGED/lib/python3.12/site-packages/mlx_lm" ]; then
+	cat > "$WORK/alias-real.py" <<'PY'
+import email.message, importlib, io, json, os, sys, tempfile, types
+sys.path.insert(0, sys.argv[1])
+import k3sm_shard as ks
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+server = importlib.import_module(ks.ENGINE_MODULE)
+stock_handler = server.APIHandler
+try:
+    ks.check_engine_hooks(server)
+    check("hooks  every hook the alias uses has the 0.32.0 signature", True)
+except ks.ShardError as e:
+    print(f"k3sm-shard: {e}", file=sys.stderr)
+    check("hooks  every hook the alias uses has the 0.32.0 signature", False)
+try:
+    ks.check_run_shape(server)
+    check("runshape  mlx_lm.server.run is the 0.32.0 body the alias's run copies", True)
+except ks.ShardError as e:
+    print(f"k3sm-shard: {e}", file=sys.stderr)
+    check("runshape  mlx_lm.server.run is the 0.32.0 body the alias's run copies", False)
+
+P, H, run = ks.install_alias(server, "org/m")
+check("install  ModelProvider and run are replaced, the handler subclasses the real one",
+      server.run is run and server.ModelProvider is P and issubclass(H, stock_handler))
+
+model_dir = tempfile.mkdtemp(dir=sys.argv[2])
+def answer(cls, path):
+    h = cls.__new__(cls)
+    h.path, h.created, h.wfile = path, 1700000000, io.BytesIO()
+    h.request_version, h.command, h.requestline = "HTTP/1.1", "GET", f"GET {path} HTTP/1.1"
+    h.client_address, h.headers, h.close_connection = ("127.0.0.1", 0), email.message.Message(), True
+    h.response_generator = types.SimpleNamespace(cli_args=types.SimpleNamespace(model=model_dir, allowed_origins=["*"]))
+    h.log_message = lambda *a: None
+    h.handle_models_request()
+    head, body = h.wfile.getvalue().split(b"\r\n\r\n", 1)
+    lines = head.decode().split("\r\n")
+    hdrs = sorted(l for l in lines[1:] if not l.lower().startswith(("date:", "server:")))
+    return lines[0], hdrs, json.loads(body)
+
+real = answer(stock_handler, "/v1/models")
+aliased = answer(H, "/v1/models")
+resolved = os.path.realpath(model_dir)
+renamed = [dict(d, id="org/m") if d["id"] == resolved else d for d in real[2]["data"]]
+check("models.real  the real listing names the --model path (what the alias replaces)",
+      [d["id"] for d in real[2]["data"]] == [resolved])
+check("models.same  the aliased listing is the real one with the id renamed: status, headers and body",
+      aliased[:2] == real[:2] and aliased[2] == {"object": real[2]["object"], "data": renamed})
+PY
+	mkdir -p "$WORK/alias-hf" "$WORK/alias-models"
+	ALIAS_CHECKS=0
+	alias_out="$(cd "$WORK" && HF_HUB_CACHE="$WORK/alias-hf" HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 "$STAGED/bin/python3.12" -I -B "$WORK/alias-real.py" "$HERE" "$WORK/alias-models" 2>"$WORK/alias-real.err")"
+	while read -r verdict name; do
+		[ -n "$verdict" ] || continue
+		ALIAS_CHECKS=$((ALIAS_CHECKS + 1))
+		case "$verdict" in
+			ok) ladder ok "9a.$name" ;;
+			no) ladder no "9a.$name" ;;
+			*)  ladder no "9a.driver  $verdict $name" ;;
+		esac
+	done <<< "$alias_out"
+	if [ "$ALIAS_CHECKS" -ge 5 ]; then
+		ladder ok "9a.count  all $ALIAS_CHECKS alias checks reported"
+	else
+		ladder no "9a.count  only $ALIAS_CHECKS of 5 alias checks reported (the driver crashed?)"
+		tail -20 "$WORK/alias-real.err"
+	fi
+else
+	ladder skip "9a.real  no staged tree at $STAGED (run build.sh, or set K3SM_MLX_STAGE)"
 fi
 
 # ---- 10 — the stage Job (stage-job.sh render) --------------------------------

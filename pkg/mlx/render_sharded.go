@@ -528,10 +528,14 @@ func rankPod(m *mlxv1alpha1.MLXModel, p prepared, placement Placement, r RankPla
 		Name:    containerName,
 		Image:   p.image,
 		Command: []string{shardInterpreter, "-m", shardModule},
-		// The model leads, then the caller's own arguments LAST: the override
-		// seam the single-node engineArgs keeps. The entrypoint adds --host,
-		// --port and --pipeline itself, from the environment.
-		Args: append([]string{shardModelFlag, p.modelRef}, m.Spec.Runtime.Args...),
+		// The model leads, then the name it serves under, then the caller's
+		// own arguments LAST: the override seam the single-node engineArgs
+		// keeps. The served name is spec.model, as on the single-node path: a
+		// pinned modelRef is the snapshot path, which no client names. The
+		// entrypoint takes --served-model-name itself (mlx_lm.server has no
+		// such option) and adds --host, --port and --pipeline from the
+		// environment.
+		Args: append([]string{shardModelFlag, p.modelRef, argServedModelName, m.Spec.Model}, m.Spec.Runtime.Args...),
 		Ports: []corev1.ContainerPort{{
 			Name:          collectivePortName,
 			ContainerPort: CollectivePort,
