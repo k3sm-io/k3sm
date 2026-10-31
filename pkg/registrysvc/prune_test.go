@@ -277,6 +277,33 @@ func TestPruneThroughTheStore(t *testing.T) {
 		}
 	})
 
+	t.Run("a planned digest tagged or re-pushed before its delete is re-checked out", func(t *testing.T) {
+		wd := t.TempDir()
+		a, b, c := manifestBody("a"), manifestBody("b"), manifestBody("c")
+		blobs := map[string][]byte{digestOf(a): a, digestOf(b): b, digestOf(c): c}
+		layoutRepo(t, wd, "r", idx(row(a, manifestType, ""), row(b, manifestType, ""), row(c, manifestType, "")), blobs, old)
+		p := PlanRepository(wd, "r", time.Now())
+		if len(p.Delete) != 3 {
+			t.Fatalf("delete = %v; want all three old untagged manifests planned", digests(p.Delete))
+		}
+		// Between plan and delete: a push tags b, and another re-pushes c,
+		// which touches its blob.
+		layoutRepo(t, wd, "r", idx(row(a, manifestType, ""), row(b, manifestType, ""), row(b, manifestType, "v1"), row(c, manifestType, "")), blobs, old)
+		ageBlobs(t, wd, "r", 0, digestOf(c))
+		want := map[string]KeepReason{digestOf(a): "", digestOf(b): KeepTaggedSincePlan, digestOf(c): KeepRecent}
+		for _, m := range p.Delete {
+			if got := Recheck(wd, m, time.Now()); got != want[m.Digest] {
+				t.Errorf("recheck %s = %q; want %q", m.Digest, got, want[m.Digest])
+			}
+		}
+		if got := Recheck(wd, StoredManifest{Repository: "r", Digest: digestOf(manifestBody("gone"))}, time.Now()); got != "" {
+			t.Errorf("recheck of a digest no longer in the index = %q; want deletable (nothing to protect)", got)
+		}
+		if got := Recheck(wd, StoredManifest{Repository: "missing", Digest: digestOf(a)}, time.Now()); got != KeepUnreadable {
+			t.Errorf("recheck in an unreadable repository = %q; want %q", got, KeepUnreadable)
+		}
+	})
+
 	t.Run("a prune concurrent with a push does not lose the pushed tag", func(t *testing.T) {
 		pruneConcurrentWithPush(t, old)
 	})

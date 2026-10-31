@@ -64,6 +64,9 @@ const (
 	// Without every manifest it cannot tell what a tagged index names, so it
 	// deletes nothing there.
 	KeepUnreadable KeepReason = "repository not fully readable"
+	// KeepTaggedSincePlan is a planned manifest a push tagged after the plan
+	// was read. A delete by digest would drop that tag.
+	KeepTaggedSincePlan KeepReason = "tagged since the plan"
 )
 
 // StoredManifest is one manifest in one repository of the registry.
@@ -249,6 +252,49 @@ func PlanRepository(workDir, repo string, now time.Time) PrunePlan {
 	}
 	p.Delete = append(indexes, others...)
 	return p
+}
+
+// Recheck re-reads the repository of a planned manifest immediately before
+// its delete and returns why it must now be kept, or "" when it may still be
+// deleted. A plan goes stale while its deletes run: a push may tag a planned
+// digest (and a delete by digest drops every row with it, the new tag too),
+// or re-push it, which makes it young again. Anything Recheck cannot read is
+// kept, as the plan keeps it. A digest no longer in the index is not kept:
+// there is nothing left to protect.
+func Recheck(workDir string, m StoredManifest, now time.Time) KeepReason {
+	n, err := ref.ParseName(m.Repository)
+	if err != nil {
+		return KeepUnreadable
+	}
+	r, err := store.OpenReader(StateDir(workDir))
+	if err != nil {
+		return KeepUnreadable
+	}
+	idx, err := r.Index(n)
+	if err != nil {
+		return KeepUnreadable
+	}
+	present := false
+	for _, d := range idx.Manifests {
+		if d.Digest.String() != m.Digest {
+			continue
+		}
+		present = true
+		if d.Annotations[ispec.AnnotationRefName] != "" {
+			return KeepTaggedSincePlan
+		}
+	}
+	if !present {
+		return ""
+	}
+	_, modTime, err := readManifest(r, n, m.Digest)
+	if err != nil {
+		return KeepUnreadable
+	}
+	if now.Sub(modTime) < PruneGrace {
+		return KeepRecent
+	}
+	return ""
 }
 
 // readManifest reads one manifest through the store, which checks its body

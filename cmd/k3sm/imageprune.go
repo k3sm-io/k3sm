@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -173,11 +174,14 @@ func pruneCredential(workDir string) (registrysvc.Credential, string, error) {
 // pruneRegistry plans each repository and, under --force, deletes its
 // untagged manifests. It returns how many deletions failed.
 //
-// Each repository is planned IMMEDIATELY before its deletions, not once up
-// front, because zot's delete by digest drops every tag on that digest: a tag
-// pushed onto an untagged manifest between plan and delete must take it out
-// of the plan. The window that remains is the one between the read and the
-// DELETE.
+// The registry's delete by digest drops every row with that digest, tags
+// included, so a tag pushed onto a planned manifest after the plan was read
+// would be lost with it. Each repository is planned immediately before its
+// deletions, and each planned manifest is re-checked through the store
+// immediately before its own DELETE: one a push has tagged, or re-pushed into
+// the grace period, since the plan is skipped. That narrows the window to one
+// request round-trip; closing it fully needs a delete the server makes
+// conditional on the digest still being untagged, under its own index lock.
 func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credential, res *registryPruneResult, del manifestDeleter, now time.Time) (int, error) {
 	repos, err := registrysvc.Repositories(o.workDir)
 	if err != nil {
@@ -198,6 +202,10 @@ func pruneRegistry(ctx context.Context, o imageOptions, cred registrysvc.Credent
 		for _, m := range plan.Delete {
 			if !o.force {
 				res.Manifests = append(res.Manifests, m)
+				continue
+			}
+			if reason := registrysvc.Recheck(o.workDir, m, now); reason != "" {
+				slog.DebugContext(ctx, "prune: skip a planned manifest", "repository", m.Repository, "digest", m.Digest, "reason", string(reason))
 				continue
 			}
 			ref, err := name.NewDigest(authority + "/" + m.Repository + "@" + m.Digest)

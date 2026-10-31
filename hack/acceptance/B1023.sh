@@ -8,9 +8,15 @@
 #   TestPruneThroughTheStore  the plan reads the layout only through
 #                             pkg/ociregistry/store, read-only: a tagged digest is
 #                             never deleted, an untagged index is deleted before the
-#                             manifests it names, planning writes nothing, and a
-#                             prune whose deletes go through the registry API runs
-#                             concurrently with a push without losing the pushed tag
+#                             manifests it names, planning writes nothing, a planned
+#                             digest a push tags or re-pushes before its delete is
+#                             re-checked out of it, and prune rounds run concurrently
+#                             with a push without losing the pushed tag; the deletes
+#                             there go to a fake DELETE handler backed by the store,
+#                             not to the real registry server
+# then, in cmd/k3sm:
+#   TestImagePruneRechecksEachPlannedDigestBeforeItsDelete  the command's delete loop
+#                             skips a planned digest tagged between plan and DELETE
 # then the registrysvc and store package tests, all under -race, and asserts
 # prune.go opens no layout file itself.
 #
@@ -38,8 +44,13 @@ for t in 'TestPruneThroughTheStore' \
 	'TestPruneThroughTheStore/a_tagged_digest_is_never_deleted' \
 	'TestPruneThroughTheStore/an_untagged_index_is_deleted_before_the_manifests_it_names' \
 	'TestPruneThroughTheStore/planning_writes_nothing' \
+	'TestPruneThroughTheStore/a_planned_digest_tagged_or_re-pushed_before_its_delete_is_re-checked_out' \
 	'TestPruneThroughTheStore/a_prune_concurrent_with_a_push_does_not_lose_the_pushed_tag'; do
 	printf '%s\n' "$out" | grep -q -- "--- PASS: $t" || { echo "B1023: FAIL: $t did not run"; exit 1; }
 done
+out="$(go test -race -count=1 -v -run '^TestImagePruneRechecksEachPlannedDigestBeforeItsDelete$' ./cmd/k3sm/ 2>&1)" || {
+	printf '%s\n' "$out"; echo "B1023: FAIL: prune re-check test"; exit 1; }
+printf '%s\n' "$out" | grep -q -- '--- PASS: TestImagePruneRechecksEachPlannedDigestBeforeItsDelete' || {
+	echo "B1023: FAIL: TestImagePruneRechecksEachPlannedDigestBeforeItsDelete did not run"; exit 1; }
 go test -race -count=1 ./pkg/registrysvc/ ./pkg/ociregistry/store/ || { echo "B1023: FAIL: package tests"; exit 1; }
 echo "B1023: PASS"
