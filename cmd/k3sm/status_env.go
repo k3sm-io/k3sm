@@ -304,15 +304,27 @@ func statusNetwork() (install.NetworkRecord, bool, error) {
 }
 
 // statusBudgetFor reads the node daemon's budget record from statusDir, where
-// any account may read it. The read stops one byte past the record's size
-// bound, so an oversized file is refused by the parser, never read whole.
+// any account may read it. The service user writes that directory, so the
+// path is untrusted: it is opened without following a symlink and without
+// blocking on a FIFO, and only a regular file is read. Anything else is an
+// error, which leaves the report's budget block out. The read stops one byte
+// past the record's size bound, so an oversized file is refused by the
+// parser, never read whole.
 func statusBudgetFor(statusDir string) func() ([]byte, error) {
 	return func() ([]byte, error) {
-		f, err := os.Open(status.BudgetPath(statusDir))
+		path := status.BudgetPath(statusDir)
+		f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 		if err != nil {
 			return nil, err
 		}
 		defer func() { _ = f.Close() }()
+		fi, err := f.Stat()
+		if err != nil {
+			return nil, err
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("budget record %s is not a regular file (%v)", path, fi.Mode().Type())
+		}
 		return io.ReadAll(io.LimitReader(f, budgetv1alpha1.MaxBudgetAnnotationBytes+1))
 	}
 }

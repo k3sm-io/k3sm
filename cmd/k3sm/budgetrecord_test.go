@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -113,4 +114,70 @@ func TestRecordBudget(t *testing.T) {
 			t.Errorf("record written for an invalid observation: %v", err)
 		}
 	})
+}
+
+func TestStatusBudgetForReadsOnlyARegularFile(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		stage   func(t *testing.T, dir, path string)
+		wantErr bool
+	}{
+		{"a regular file is read", func(t *testing.T, _, path string) {
+			if err := os.WriteFile(path, []byte(`{"schema":1}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"no record", func(*testing.T, string, string) {}, true},
+		{"a symlink is not followed", func(t *testing.T, dir, path string) {
+			target := filepath.Join(dir, "elsewhere.json")
+			if err := os.WriteFile(target, []byte(`{"schema":1}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a FIFO is refused without blocking", func(t *testing.T, _, path string) {
+			if err := syscall.Mkfifo(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a directory is refused", func(t *testing.T, _, path string) {
+			if err := os.Mkdir(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			tc.stage(t, dir, status.BudgetPath(dir))
+			type result struct {
+				raw []byte
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				raw, err := statusBudgetFor(dir)()
+				done <- result{raw, err}
+			}()
+			// A bound on a failure, not a wait for a condition: a read that
+			// blocks (a FIFO opened without O_NONBLOCK) never sends.
+			bound := time.NewTimer(5 * time.Second)
+			defer bound.Stop()
+			var r result
+			select {
+			case r = <-done:
+			case <-bound.C:
+				t.Fatal("the read blocked")
+			}
+			if (r.err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, want error %v", r.err, tc.wantErr)
+			}
+			if tc.wantErr && r.raw != nil {
+				t.Errorf("read %q alongside the error", r.raw)
+			}
+		})
+	}
 }
