@@ -242,15 +242,43 @@ func (c *Collector) mark(n ref.Name, cutoff time.Time) (plan, ispec.Index, store
 	return p, idx, cont, err
 }
 
-// brake applies the half-repository rule to a plan over idx and cont.
+// brake applies the half-repository rule to a plan over idx and cont: a plan
+// that would reap more than half of the repository's blobs stops, unless it
+// empties the repository.
+//
+// A plan empties the repository when it leaves no row (every row, if there
+// were any, is one it reaps) and every blob it reaps predates index.json's
+// last write. index.json is written when a repository's layout is made, before
+// its first blob, and afterwards only when its rows change. So an index
+// written after every reaped blob means the rows that named those blobs were
+// removed (by a delete, or by this plan, or by an earlier sweep that stopped
+// after its row write), and the blobs are what a removed image left. A first
+// push in progress has an index older than its blobs, so its committed but
+// not yet named blobs stay under the brake however old they are. A blob
+// written at the same instant as index.json counts as newer: the brake holds.
 func (c *Collector) brake(n ref.Name, p plan, idx ispec.Index, cont store.Contents) error {
-	emptied := len(idx.Manifests) == 0
-	if !emptied && 2*len(p.blobs) > len(cont.Blobs) {
-		c.log.Error("registry gc: sweep stopped", "repository", n.String(), "reap", len(p.blobs), "blobs", len(cont.Blobs),
-			"reason", "more than half of the repository's blobs")
-		return fmt.Errorf("%w: %d of %d", ErrMassDelete, len(p.blobs), len(cont.Blobs))
+	if 2*len(p.blobs) <= len(cont.Blobs) || emptying(p, idx, cont) {
+		return nil
 	}
-	return nil
+	c.log.Error("registry gc: sweep stopped", "repository", n.String(), "reap", len(p.blobs), "blobs", len(cont.Blobs),
+		"reason", "more than half of the repository's blobs")
+	return fmt.Errorf("%w: %d of %d", ErrMassDelete, len(p.blobs), len(cont.Blobs))
+}
+
+// emptying reports whether p empties the repository, by the rule brake
+// documents.
+func emptying(p plan, idx ispec.Index, cont store.Contents) bool {
+	for _, r := range idx.Manifests {
+		if _, tagged := r.Annotations[ispec.AnnotationRefName]; tagged || !p.rows[r.Digest] {
+			return false
+		}
+	}
+	for _, b := range cont.Blobs {
+		if p.blobs[b.Digest] && !b.ModTime.Before(cont.IndexModTime) {
+			return false
+		}
+	}
+	return true
 }
 
 // apply deletes a plan under the lock: rows first, so index.json never names
