@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"k3sm.io/k3sm/pkg/ociregistry/ref"
 )
 
 // nextLink returns the target of a Link rel="next" header, or "".
@@ -252,7 +254,9 @@ func TestListingBounds(t *testing.T) {
 		path := "/v2/app/referrers/" + dg(subject).String()
 		w := f.do(http.MethodGet, path, nil)
 		want(t, w, http.StatusTooManyRequests, codeTooManyRequests)
-		if reads > 10 {
+		// The budget counts what was read, and the read that spends it is the
+		// last: the subject's own manifest, then ten referrers.
+		if reads != 11 {
 			t.Fatalf("a %d-byte budget read %d manifests", f.srv.refScanBytes, reads)
 		}
 		f.srv.refScanBytes = referrersScanBytes
@@ -269,15 +273,220 @@ func TestListingBounds(t *testing.T) {
 	t.Run("referrers/the cache drops its least recently used view past its bound", func(t *testing.T) {
 		c := newReferrerCache()
 		a := c.view("a")
-		c.account("a", a, referrerCacheRows, 1)
+		c.account("a", a, referrerCacheRows, 1, false)
 		b := c.view("b")
-		c.account("b", b, 1, 1)
+		c.account("b", b, 1, 1, false)
 		if _, ok := c.views["a"]; ok || c.views["b"] != b || c.rows != 1 || c.bytes != 1 {
 			t.Errorf("views %v, rows %d, bytes %d", c.views, c.rows, c.bytes)
 		}
 		c.drop("b", b)
 		if len(c.views) != 0 || c.rows != 0 || c.bytes != 0 {
 			t.Errorf("after drop: views %v, rows %d, bytes %d", c.views, c.rows, c.bytes)
+		}
+	})
+
+	t.Run("referrers/more than 8 artifactType values are refused", func(t *testing.T) {
+		f := newFixture(t)
+		subject := f.image(t, "app", "v1", "l")
+		path := "/v2/app/referrers/" + dg(subject).String() + "?"
+		for i := range 8 {
+			path += fmt.Sprintf("artifactType=a%d&", i)
+		}
+		want(t, f.do(http.MethodGet, path, nil), 200, "")
+		want(t, f.do(http.MethodGet, path+"artifactType=a8", nil), http.StatusBadRequest, codeUnsupported)
+		want(t, f.do(http.MethodGet, path+"artifactType=a0", nil), http.StatusBadRequest, codeUnsupported)
+	})
+
+	t.Run("referrers/touching 1,100 other repositories keeps a partial view's progress", func(t *testing.T) {
+		f := newFixture(t)
+		subject := f.image(t, "app", "v1", "l")
+		var bodies [][]byte
+		for i := range 2000 {
+			bodies = append(bodies, referrerBody(subject, "application/vnd.example.sig", i))
+		}
+		f.addRows(t, "app", bodies)
+		var others []string
+		for i := range 1100 {
+			others = append(others, fmt.Sprintf("o/r%04d", i))
+		}
+		layRepos(t, f.root, others)
+		read := map[digest.Digest]int{}
+		f.srv.referrerRead = func(d digest.Digest) { read[d]++ }
+		f.srv.refScanRows = 600
+		path := "/v2/app/referrers/" + dg(subject).String()
+		for i := 0; ; i++ {
+			w := f.do(http.MethodGet, path, nil)
+			if w.Code == 200 {
+				var idx ispec.Index
+				_ = json.Unmarshal(w.Body.Bytes(), &idx)
+				if len(idx.Manifests) != 1000 || nextLink(t, w.Header()) == "" {
+					t.Fatalf("the whole view's first page: %d", len(idx.Manifests))
+				}
+				break
+			}
+			want(t, w, http.StatusTooManyRequests, codeTooManyRequests)
+			if i == 4 {
+				t.Fatal("the view never completed")
+			}
+			for _, o := range others {
+				want(t, f.do(http.MethodGet, "/v2/"+o+"/referrers/"+dg(subject).String(), nil), 200, "")
+			}
+		}
+		if len(read) != 2001 {
+			t.Errorf("read %d distinct manifests, want 2,001", len(read))
+		}
+		for d, c := range read {
+			if c != 1 {
+				t.Errorf("%s read %d times", d, c)
+			}
+		}
+		if n := len(f.srv.refs.views); n > referrerCacheViews {
+			t.Errorf("%d views cached", n)
+		}
+	})
+
+	t.Run("referrers/an unreadable manifest is read once and a retryable error answers busy", func(t *testing.T) {
+		f := newFixture(t)
+		subject := f.image(t, "app", "v1", "l")
+		var bodies [][]byte
+		for i := range 10 {
+			bodies = append(bodies, referrerBody(subject, "application/vnd.example.sig", i))
+		}
+		f.addRows(t, "app", bodies)
+		blob := func(b []byte) string { return filepath.Join(f.root, "app", "blobs", "sha256", dg(b).Encoded()) }
+		if err := os.Remove(blob(bodies[3])); err != nil {
+			t.Fatal(err)
+		}
+		read := map[digest.Digest]int{}
+		f.srv.referrerRead = func(d digest.Digest) { read[d]++ }
+		f.srv.refScanRows = 3
+		path := "/v2/app/referrers/" + dg(subject).String()
+		var w *httptest.ResponseRecorder
+		for range 6 {
+			if w = f.do(http.MethodGet, path, nil); w.Code == 200 {
+				break
+			}
+			want(t, w, http.StatusTooManyRequests, codeTooManyRequests)
+		}
+		var idx ispec.Index
+		_ = json.Unmarshal(w.Body.Bytes(), &idx)
+		if w.Code != 200 || len(idx.Manifests) != 9 || read[dg(bodies[3])] != 1 {
+			t.Fatalf("status %d, %d referrers, the missing manifest read %d times", w.Code, len(idx.Manifests), read[dg(bodies[3])])
+		}
+		// A permission error is worth retrying: the request is busy and the
+		// manifest is not left out of a whole view.
+		extra := referrerBody(subject, "application/vnd.example.sig", 10)
+		f.addRows(t, "app", [][]byte{extra})
+		if err := os.Chmod(blob(extra), 0); err != nil {
+			t.Fatal(err)
+		}
+		want(t, f.do(http.MethodGet, path, nil), http.StatusTooManyRequests, codeTooManyRequests)
+		if err := os.Chmod(blob(extra), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w = f.do(http.MethodGet, path, nil)
+		want(t, w, 200, "")
+		_ = json.Unmarshal(w.Body.Bytes(), &idx)
+		if len(idx.Manifests) != 10 {
+			t.Errorf("after the retry: %d referrers", len(idx.Manifests))
+		}
+	})
+
+	t.Run("referrers/a build needs a free slot and a cached view does not", func(t *testing.T) {
+		f := newFixture(t)
+		subject := f.image(t, "app", "v1", "l")
+		f.image(t, "cold", "v1", "l")
+		path := "/v2/app/referrers/" + dg(subject).String()
+		want(t, f.do(http.MethodGet, path, nil), 200, "")
+		for range referrersBuilds {
+			f.srv.refBuilds <- struct{}{}
+		}
+		want(t, f.do(http.MethodGet, "/v2/cold/referrers/"+dg(subject).String(), nil), http.StatusTooManyRequests, codeTooManyRequests)
+		want(t, f.do(http.MethodGet, path, nil), 200, "")
+		<-f.srv.refBuilds
+		want(t, f.do(http.MethodGet, "/v2/cold/referrers/"+dg(subject).String(), nil), 200, "")
+	})
+
+	t.Run("referrers/4,096 manifests, or sixteen of 4 MiB, are read by one request", func(t *testing.T) {
+		f := newFixture(t)
+		subject := f.image(t, "app", "v1", "l")
+		var bodies [][]byte
+		for i := range referrersScanRows - 1 {
+			bodies = append(bodies, referrerBody(subject, "application/vnd.example.sig", i))
+		}
+		f.addRows(t, "app", bodies)
+		w := f.do(http.MethodGet, "/v2/app/referrers/"+dg(subject).String(), nil)
+		want(t, w, 200, "")
+
+		g := newFixture(t)
+		subject = g.image(t, "big", "v1", "l")
+		bodies = bodies[:0]
+		for i := range 16 {
+			m := ispec.Manifest{
+				MediaType: ispec.MediaTypeImageManifest, ArtifactType: "application/vnd.example.big",
+				Config: ispec.DescriptorEmptyJSON, Layers: []ispec.Descriptor{},
+				Subject:     &ispec.Descriptor{MediaType: ispec.MediaTypeImageManifest, Digest: dg(subject), Size: int64(len(subject))},
+				Annotations: map[string]string{"pad": strings.Repeat(fmt.Sprint(i%10), 4<<20-1024)},
+			}
+			m.SchemaVersion = 2
+			b, _ := json.Marshal(m)
+			if len(b) > 4<<20 {
+				t.Fatalf("a %d-byte manifest", len(b))
+			}
+			bodies = append(bodies, b)
+		}
+		g.addRows(t, "big", bodies)
+		w = g.do(http.MethodGet, "/v2/big/referrers/"+dg(subject).String(), nil)
+		want(t, w, 200, "")
+	})
+
+	t.Run("catalog/denied repositories count toward the visit budget and the cursor is readable", func(t *testing.T) {
+		readable := map[string]bool{}
+		f := newFixture(t, func(c *Config) {
+			c.Authorize = func(r *http.Request, v Verb, n ref.Name) error {
+				if n.String() == "" || readable[n.String()] {
+					return nil
+				}
+				return ErrDenied
+			}
+		})
+		var names, want []string
+		for i := range 3000 {
+			n := fmt.Sprintf("r%04d", i)
+			names = append(names, n)
+			if i%500 == 0 {
+				readable[n] = true
+				want = append(want, n)
+			}
+		}
+		layRepos(t, f.root, names)
+		visits := 0
+		f.srv.catalogVisited = func() { visits++ }
+		var got []string
+		path, pages := "/v2/_catalog?n=10", 0
+		for path != "" {
+			visits = 0
+			w := f.do(http.MethodGet, path, nil)
+			if w.Code != 200 {
+				t.Fatalf("status %d", w.Code)
+			}
+			var cat struct{ Repositories []string }
+			_ = json.Unmarshal(w.Body.Bytes(), &cat)
+			got = append(got, cat.Repositories...)
+			if visits > catalogVisits(10)+1 {
+				t.Errorf("a page visited %d repositories", visits)
+			}
+			path = nextLink(t, w.Header())
+			if path != "" {
+				last := cat.Repositories[len(cat.Repositories)-1]
+				if !readable[last] || !strings.Contains(path, "last="+last+"&") {
+					t.Fatalf("Link %q after a page ending %q", path, last)
+				}
+			}
+			pages++
+		}
+		if !slices.Equal(got, want) || pages < 3 {
+			t.Errorf("%d pages: %v", pages, got)
 		}
 	})
 }

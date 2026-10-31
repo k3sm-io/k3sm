@@ -190,10 +190,12 @@ type Server struct {
 	router        *mux.Router
 	// catalogPage and catalogMax are the catalog's default and largest page.
 	catalogPage, catalogMax int
-	// refs is the referrers view cache; refScanRows and refScanBytes are the
+	// refs is the referrers view cache and refBuilds its build slots;
+	// refScanRows and refScanBytes are the
 	// manifests and bytes one referrers request may read, refPage and
 	// refPageBytes the largest referrers page.
 	refs         *referrerCache
+	refBuilds    chan struct{}
 	refScanRows  int
 	refScanBytes int64
 	refPage      int
@@ -201,6 +203,9 @@ type Server struct {
 	// referrerRead, when set, runs before the referrers view reads a manifest
 	// (a seam for tests that count the reads).
 	referrerRead func(digest.Digest)
+	// catalogVisited, when set, runs for each repository a catalog walk
+	// visits (a seam for tests that count the visits).
+	catalogVisited func()
 	// setWriteDeadline sets a response's write deadline (a seam for tests;
 	// the default goes through http.ResponseController).
 	setWriteDeadline func(w http.ResponseWriter, t time.Time)
@@ -240,6 +245,7 @@ func New(cfg Config) (*Server, error) {
 		catalogPage:   defaultCatalogPage,
 		catalogMax:    maxPage,
 		refs:          newReferrerCache(),
+		refBuilds:     make(chan struct{}, referrersBuilds),
 		refScanRows:   referrersScanRows,
 		refScanBytes:  referrersScanBytes,
 		refPage:       referrersPage,

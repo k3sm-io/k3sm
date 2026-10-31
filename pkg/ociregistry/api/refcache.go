@@ -33,27 +33,43 @@ import (
 
 // Bounds of the referrers view.
 const (
-	// referrersScanRows and referrersScanBytes are the most manifests, and
-	// manifest bytes, one referrers request reads. A repository with more
-	// unread manifests than that is read over several requests: each one keeps
-	// what it read, and answers 429 with Retry-After until the view is whole.
+	// referrersScanRows and referrersScanBytes bound what one referrers
+	// request reads: at most 4,096 manifests it has not read before, and no
+	// further manifest once 64 MiB of manifest bytes have been read (so a
+	// request reads at most 64 MiB plus one 4 MiB manifest). A repository of
+	// up to 4,096 manifests totalling up to 64 MiB (sixteen at the 4 MiB
+	// manifest maximum, or 4,096 of 16 KiB) is read whole by its first
+	// request. A larger one is read over several requests the first time:
+	// each keeps what it read and answers 429 with Retry-After until the view
+	// is whole; after that only manifests new to the index are read.
 	referrersScanRows  = 4096
 	referrersScanBytes = 64 << 20
+	// referrersBuilds is the most views built at once across repositories;
+	// a request that needs a build while all are in use answers 429.
+	referrersBuilds = 4
 	// referrersPage is the default and the largest page of one referrers
 	// answer, and referrersPageBytes the encoded descriptor bytes a page
 	// stops at (a page always carries at least one descriptor).
 	referrersPage      = 1000
 	referrersPageBytes = 4 << 20
+	// maxArtifactTypes is the most artifactType filter values a request may
+	// name.
+	maxArtifactTypes = 8
 	// referrerCacheViews, referrerCacheRows and referrerCacheBytes bound the
 	// cache over all repositories; past any of them the least recently used
-	// views are dropped.
-	referrerCacheViews = 1024
-	referrerCacheRows  = 1 << 18
-	referrerCacheBytes = 64 << 20
+	// whole views are dropped. A view being built is never dropped, and a
+	// partly read view is dropped only once partly read views hold more than
+	// referrerPartialRows entries, so touching many other repositories cannot
+	// throw away a large repository's progress.
+	referrerCacheViews  = 1024
+	referrerCacheRows   = 1 << 18
+	referrerCacheBytes  = 64 << 20
+	referrerPartialRows = 1 << 17
 )
 
 // errReferrersBusy is a referrers request that used its read budget before the
-// repository's view was whole (429; the next request carries on).
+// repository's view was whole, met a read error worth retrying, or found every
+// build slot in use (429; the next request carries on).
 var errReferrersBusy = errors.New("referrers view still being built")
 
 // referrerDoc is what the referrers scan reads from each manifest.
@@ -70,10 +86,15 @@ type referrerDoc struct {
 // when it has none) and the descriptor a referrers answer lists for it, with
 // that descriptor's encoded size. A manifest is content addressed, so an entry
 // stays right for its digest for as long as a row names it.
+//
+// An unreadable entry is a manifest whose blob is missing, is not a regular
+// file, or does not match its row: it contributes nothing and is not read
+// again while a row names it.
 type refEntry struct {
-	subject digest.Digest
-	desc    ispec.Descriptor
-	size    int
+	subject    digest.Digest
+	desc       ispec.Descriptor
+	size       int
+	unreadable bool
 }
 
 // refView is the referrers view of one repository.
@@ -87,18 +108,21 @@ type refView struct {
 	ready     bool
 	entries   map[digest.Digest]refEntry
 	bySubject map[digest.Digest][]refEntry
-	// Guarded by referrerCache.mu: the last use, and the cost last accounted.
-	used        uint64
-	rows, bytes int64
+	// Guarded by referrerCache.mu: the last use, the cost last accounted,
+	// whether a build is running, and whether the view is only partly read.
+	used              uint64
+	rows, bytes       int64
+	building, partial bool
 }
 
 // referrerCache holds the views. Lock order: a view's sem, then mu.
 type referrerCache struct {
-	mu    sync.Mutex
-	tick  uint64
-	views map[string]*refView
-	rows  int64
-	bytes int64
+	mu          sync.Mutex
+	tick        uint64
+	views       map[string]*refView
+	rows        int64
+	bytes       int64
+	partialRows int64
 }
 
 func newReferrerCache() *referrerCache {
@@ -124,37 +148,60 @@ func (c *referrerCache) drop(key string, v *refView) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.views[key] == v {
-		delete(c.views, key)
-		c.rows -= v.rows
-		c.bytes -= v.bytes
+		c.remove(key, v)
 	}
 }
 
-// account records v's new cost and drops the least recently used other views
-// until the cache is within its bounds.
-func (c *referrerCache) account(key string, v *refView, rows, bytes int64) {
+// remove deletes v and its cost. The caller holds mu.
+func (c *referrerCache) remove(key string, v *refView) {
+	delete(c.views, key)
+	c.rows -= v.rows
+	c.bytes -= v.bytes
+	if v.partial {
+		c.partialRows -= v.rows
+	}
+}
+
+// building marks v as being built, which pins it against eviction.
+func (c *referrerCache) building(v *refView, on bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v.building = on
+}
+
+// account records v's new cost and whether it is partly read, then drops the
+// least recently used evictable views until the cache is within its bounds.
+func (c *referrerCache) account(key string, v *refView, rows, bytes int64, partial bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.views[key] != v {
-		return // dropped while it was built
+		return // dropped (its repository went away)
+	}
+	if v.partial {
+		c.partialRows -= v.rows
 	}
 	c.rows += rows - v.rows
 	c.bytes += bytes - v.bytes
-	v.rows, v.bytes = rows, bytes
-	for len(c.views) > referrerCacheViews || c.rows > referrerCacheRows || c.bytes > referrerCacheBytes {
+	v.rows, v.bytes, v.partial = rows, bytes, partial
+	if partial {
+		c.partialRows += rows
+	}
+	for len(c.views) > referrerCacheViews || c.rows > referrerCacheRows || c.bytes > referrerCacheBytes || c.partialRows > referrerPartialRows {
+		partialOver := c.partialRows > referrerPartialRows
 		var oldKey string
 		var old *refView
 		for k, o := range c.views {
-			if o != v && (old == nil || o.used < old.used) {
+			if o == v || o.building || (o.partial && !partialOver) {
+				continue
+			}
+			if old == nil || o.used < old.used {
 				oldKey, old = k, o
 			}
 		}
 		if old == nil {
-			return // v alone; it is bounded by the index and the read budget
+			return // only pinned views left; each is bounded by its index and the read budget
 		}
-		delete(c.views, oldKey)
-		c.rows -= old.rows
-		c.bytes -= old.bytes
+		c.remove(oldKey, old)
 	}
 }
 
@@ -179,20 +226,36 @@ func (s *Server) referrersOf(r *http.Request, n ref.Name, d digest.Digest) ([]re
 	if err != nil {
 		return nil, err
 	}
-	if !v.ready || v.version != ver {
-		if err := s.buildReferrers(key, n, v); err != nil {
-			if errors.Is(err, store.ErrRepositoryUnknown) {
-				s.refs.drop(key, v)
-				return nil, nil
-			}
-			return nil, err
+	if v.ready && v.version == ver {
+		return v.bySubject[d], nil
+	}
+	select {
+	case s.refBuilds <- struct{}{}:
+	default:
+		return nil, errReferrersBusy
+	}
+	defer func() { <-s.refBuilds }()
+	s.refs.building(v, true)
+	defer s.refs.building(v, false)
+	if err := s.buildReferrers(key, n, v); err != nil {
+		if errors.Is(err, store.ErrRepositoryUnknown) {
+			s.refs.drop(key, v)
+			return nil, nil
 		}
+		return nil, err
 	}
 	return v.bySubject[d], nil
 }
 
+// permanentReadError reports whether a manifest read failed for a reason that
+// will not change while the row names the same digest.
+func permanentReadError(err error) bool {
+	return errors.Is(err, store.ErrBlobUnknown) || errors.Is(err, store.ErrDigestMismatch) ||
+		errors.Is(err, store.ErrNotRegular) || errors.Is(err, ref.ErrSymlink) || errors.Is(err, errManifestSize)
+}
+
 // buildReferrers rebuilds v from n's current index.json. The caller holds
-// v.sem.
+// v.sem and a build slot.
 func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 	idx, ver, err := s.st.IndexAt(n)
 	if err != nil {
@@ -213,21 +276,28 @@ func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 			entries[row.Digest] = e
 			continue
 		}
-		if readRows >= int64(s.refScanRows) || readBytes+max(row.Size, 0) > s.refScanBytes {
+		if readRows >= int64(s.refScanRows) || readBytes >= s.refScanBytes {
 			whole = false
 			continue
 		}
 		readRows++
-		readBytes += max(row.Size, 0)
 		if s.referrerRead != nil {
 			s.referrerRead(row.Digest)
 		}
 		body, err := s.readManifestBlob(n, row)
 		if err != nil {
-			// Not kept: the next rebuild (the next index change) tries again.
+			if !permanentReadError(err) {
+				// Worth retrying: the view is not whole, and the
+				// request answers busy rather than omit the manifest.
+				s.log.Warn("registry referrers scan could not read a manifest; will retry", "repository", key, "digest", row.Digest.String(), "err", err)
+				whole = false
+				continue
+			}
 			s.log.Warn("registry referrers scan skipped an unreadable manifest", "repository", key, "digest", row.Digest.String(), "err", err)
+			entries[row.Digest] = refEntry{desc: ispec.Descriptor{MediaType: row.MediaType, Digest: row.Digest, Size: row.Size}, size: 64, unreadable: true}
 			continue
 		}
+		readBytes += int64(len(body))
 		entries[row.Digest] = entryOf(row, body)
 	}
 	v.entries = entries
@@ -236,11 +306,11 @@ func (s *Server) buildReferrers(key string, n ref.Name, v *refView) error {
 	for _, e := range entries {
 		rows++
 		bytes += int64(e.size)
-		if e.subject != "" {
+		if e.subject != "" && !e.unreadable {
 			bySubject[e.subject] = append(bySubject[e.subject], e)
 		}
 	}
-	s.refs.account(key, v, rows, bytes)
+	s.refs.account(key, v, rows, bytes, !whole)
 	if !whole {
 		v.bySubject = nil
 		return errReferrersBusy
