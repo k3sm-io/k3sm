@@ -1662,6 +1662,13 @@ func resolveShadowDir() string {
 // directory, inside versions/<v>/ on a versioned install, never a path through
 // current: Seatbelt matches resolved paths, so a grant on a symlinked path
 // would match nothing. A shadow entry that is itself a symlink is refused.
+//
+// The result is a resolved path only because of two things this function does
+// not check itself: dir must already be resolved (the caller passes
+// install.ExecutableDir, never a path through current or a compat link), and
+// os.Lstat must refuse a shadow entry that is a symlink, since a symlinked
+// entry would carry an unresolved path into a Seatbelt grant. Lstat reports a
+// symlink as not a directory, so that entry yields "".
 func shadowDirIn(dir string) string {
 	p := filepath.Join(dir, shadow.DirName)
 	if fi, err := os.Lstat(p); err != nil || !fi.IsDir() {

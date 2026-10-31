@@ -59,6 +59,11 @@ func ExecutableDir() (string, error) {
 
 // resolveExecutable follows every symlink in exe, falling back to exe unchanged
 // when resolution fails (a dangling link, a path removed since exec).
+//
+// The fallback returns the unresolved path, which may run through current or a
+// flat compat link. A Seatbelt grant built on it then matches nothing, because
+// Seatbelt matches resolved paths, so the sandboxed pod is denied what the
+// grant meant to allow: the fallback fails closed, never open.
 func resolveExecutable(exe string) string {
 	if real, err := filepath.EvalSymlinks(exe); err == nil {
 		return real
