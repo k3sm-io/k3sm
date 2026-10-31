@@ -1,0 +1,149 @@
+{
+  "blobs": [
+    "cfg",
+    "layer-1",
+    "layer-2"
+  ],
+  "cases": [
+    {
+      "name": "oci-manifest-present",
+      "file": "oci-manifest-present.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 201,
+      "code": ""
+    },
+    {
+      "name": "oci-manifest-missing-layer",
+      "file": "oci-manifest-missing-layer.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_BLOB_UNKNOWN"
+    },
+    {
+      "name": "oci-manifest-missing-config",
+      "file": "oci-manifest-missing-config.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_BLOB_UNKNOWN"
+    },
+    {
+      "name": "oci-manifest-empty-config-missing",
+      "file": "oci-manifest-empty-config-missing.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_BLOB_UNKNOWN"
+    },
+    {
+      "name": "oci-manifest-nondistributable-layer-absent",
+      "file": "oci-manifest-nondistributable-layer-absent.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 201,
+      "code": ""
+    },
+    {
+      "name": "oci-manifest-artifact-config-skips-checks",
+      "file": "oci-manifest-artifact-config-skips-checks.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 201,
+      "code": ""
+    },
+    {
+      "name": "oci-manifest-no-layers",
+      "file": "oci-manifest-no-layers.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 201,
+      "code": ""
+    },
+    {
+      "name": "oci-manifest-with-subject",
+      "file": "oci-manifest-with-subject.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 201,
+      "code": ""
+    },
+    {
+      "name": "oci-index-children-not-required",
+      "file": "oci-index-children-not-required.json",
+      "contentType": "application/vnd.oci.image.index.v1+json",
+      "status": 201,
+      "code": ""
+    },
+    {
+      "name": "docker-manifest-present",
+      "file": "docker-manifest-present.json",
+      "contentType": "application/vnd.docker.distribution.manifest.v2+json",
+      "status": 201,
+      "code": ""
+    },
+    {
+      "name": "docker-manifest-missing-config",
+      "file": "docker-manifest-missing-config.json",
+      "contentType": "application/vnd.docker.distribution.manifest.v2+json",
+      "status": 400,
+      "code": "MANIFEST_BLOB_UNKNOWN"
+    },
+    {
+      "name": "docker-manifest-foreign-layer-absent",
+      "file": "docker-manifest-foreign-layer-absent.json",
+      "contentType": "application/vnd.docker.distribution.manifest.v2+json",
+      "status": 400,
+      "code": "MANIFEST_BLOB_UNKNOWN"
+    },
+    {
+      "name": "docker-list-children-not-required",
+      "file": "docker-list-children-not-required.json",
+      "contentType": "application/vnd.docker.distribution.manifest.list.v2+json",
+      "status": 201,
+      "code": ""
+    },
+    {
+      "name": "docker-schema1-unsupported",
+      "file": "docker-schema1-unsupported.json",
+      "contentType": "application/vnd.docker.distribution.manifest.v1+prettyjws",
+      "status": 415,
+      "code": "MANIFEST_INVALID"
+    },
+    {
+      "name": "oci-artifact-manifest-unsupported",
+      "file": "oci-artifact-manifest-unsupported.json",
+      "contentType": "application/vnd.oci.artifact.manifest.v1+json",
+      "status": 415,
+      "code": "MANIFEST_INVALID"
+    },
+    {
+      "name": "schema-version-1-refused",
+      "file": "schema-version-1-refused.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_INVALID"
+    },
+    {
+      "name": "media-type-field-mismatch",
+      "file": "media-type-field-mismatch.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_INVALID"
+    },
+    {
+      "name": "not-json",
+      "file": "not-json.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_INVALID"
+    },
+    {
+      "name": "invalid-layer-digest",
+      "file": "invalid-layer-digest.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_INVALID"
+    },
+    {
+      "name": "negative-size",
+      "file": "negative-size.json",
+      "contentType": "application/vnd.oci.image.manifest.v1+json",
+      "status": 400,
+      "code": "MANIFEST_INVALID"
+    }
+  ]
+}
