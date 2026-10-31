@@ -126,6 +126,10 @@ type nodeOptions struct {
 	// own address, the same value it registers as NodeInternalIP.
 	kubeletPort int
 	podRoot     string
+	// budgetDir is the node's protected budget state directory (budgetDirFor):
+	// `k3sm server` and `k3sm agent` set it; empty (the standalone `k3sm node`)
+	// keeps no budget history.
+	budgetDir string
 	// logs is the container-log flag group (--pod-logs-dir and the four rotation
 	// knobs), carried through every bring-up path so `k3sm server`, `k3sm agent`
 	// and `k3sm node` configure the node's logs identically.
@@ -1710,6 +1714,13 @@ func siblingDylibIn(dir, name string) string {
 	return p
 }
 
+// budgetDirFor is the budget state directory of a node whose work dir is
+// workDir: <workDir>/budget, inside the protected server or agent tree. It is
+// distinct from the pod-readable page directory under the data root.
+func budgetDirFor(workDir string) string {
+	return filepath.Join(workDir, "budget")
+}
+
 // runtimedConfig builds the runtimed runtime configuration from the node options:
 // the on-disk root, the DNS shim, the apiserver client, the helper-socket deny,
 // and the per-pod Seatbelt egress VIPs. ResolverVIP is the cluster DNS VIP (the
@@ -1746,6 +1757,9 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		NodeName: opts.nodeName,
 		NodeIP:   opts.nodeIP,
 		Root:     opts.podRoot,
+		// The persisted eviction, OOM and restart history, under the node's
+		// own work dir and outside every pod-readable tree.
+		BudgetDir: opts.budgetDir,
 		// Prefer an explicit --dns-shim; else resolve the staged shim next to the
 		// binary (the packaged server plist passes no --dns-shim). Empty leaves pods
 		// on the system resolver.
