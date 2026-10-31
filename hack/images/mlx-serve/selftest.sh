@@ -556,6 +556,10 @@ def fake_engine(**drop):
         setattr(getattr(m, owner) if owner else m, attr, value)
     return m
 
+# The rank checks run's source against the 0.32.0 pin; the stand-in's run is
+# not that body, so the driver pins the stand-in's own (rung 9a checks the real
+# engine against the real pin).
+ks.ENGINE_RUN_SHA256 = ks.source_shape(fake_engine().run)
 eng = fake_engine()
 P, Hd, _ = ks.install_alias(eng, "org/m")
 prov = eng.ModelProvider(types.SimpleNamespace(prompt_cache_size=3))

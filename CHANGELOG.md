@@ -120,6 +120,9 @@ pin, its date, and the tarball's sha256.
   deleted since the plan is now reported as gone, no longer as unreadable; one whose directory
   is still there but damaged stays unreadable. An `If-Match` that is empty or malformed is
   refused with 412 and deletes nothing.
+- A rank of a sharded `MLXModel` serving under `spec.model` refuses to start when the engine's
+  `run` is not the body the name alias copies, rather than serving through a stale copy of it.
+  This needs an `mlx-serve` image that carries the updated sharded entrypoint.
 - **A pinned sharded `MLXModel` answers to its `spec.model` name too.** Sharded serving listed the snapshot path on `/v1/models`, and a request naming `spec.model` made every rank load the model again. Each rank now serves the model it loaded under `spec.model`, pinned or not. This needs `ghcr.io/k3sm-io/mlx-serve:0.5.0-k3sm.3` or later, which carries the updated sharded entrypoint.
 
 ## v0.2.3 — 2026-10-29
