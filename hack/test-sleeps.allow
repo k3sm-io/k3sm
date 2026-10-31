@@ -3,7 +3,7 @@
 # The seeded deadlines are staggered by package, one package a week, so they do
 # not all expire together. Fixing a test means deleting its entry and lowering
 # the count; adding an entry means raising it, in the same reviewed change.
-# count: 164
+# count: 166
 cmd/k3sm/agentcrashloop_test.go:time.After seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/agentcrashloop_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
 cmd/k3sm/agentrestart_integration_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-01-04
@@ -149,6 +149,8 @@ pkg/provider/runtimed_lifecycle_test.go:time.Sleep seeded 2026-10-29, predates t
 pkg/provider/runtimed_restart_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/runtimed_test.go:time.After seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/runtimed_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03
+pkg/provider/sleep_darwin_integration_test.go:time.After bounds the real IOKit watcher thread stop (a CFRunLoop on an OS thread), which synctest cannot fake 2027-05-03
+pkg/provider/sleep_darwin_test.go:time.Sleep lands a byte mid-wait in the cgo poll(2) of the C ack wait, which runs on the real clock outside synctest 2027-05-03
 pkg/provider/transportoverride_test.go:time.After seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/transportprobe_test.go:time.After seeded 2026-10-29, predates the lint 2027-05-03
 pkg/provider/transportprobe_test.go:time.Sleep seeded 2026-10-29, predates the lint 2027-05-03

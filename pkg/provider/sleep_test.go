@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -105,21 +106,14 @@ func (f *fakePowerHost) state() (held, taken, released int) {
 	return f.held, f.taken, f.released
 }
 
-// deliver sends one notice and waits for its acknowledgement.
+// deliver sends one notice and waits for its acknowledgement. It runs inside
+// a synctest bubble, so a notice that is never taken or never acknowledged
+// fails the test as a deadlock instead of waiting on the wall clock.
 func (f *fakePowerHost) deliver(t *testing.T, kind PowerNoticeKind) {
 	t.Helper()
 	acked := make(chan struct{})
-	n := PowerNotice{Kind: kind, Ack: func() { close(acked) }}
-	select {
-	case f.notices <- n:
-	case <-time.After(5 * time.Second):
-		t.Fatal("notice not taken")
-	}
-	select {
-	case <-acked:
-	case <-time.After(10 * time.Second):
-		t.Fatal("notice not acknowledged")
-	}
+	f.notices <- PowerNotice{Kind: kind, Ack: func() { close(acked) }}
+	<-acked
 }
 
 type sleepHarness struct {
@@ -155,6 +149,9 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
+// startSleepHarness runs a reporter over host. Call it inside synctest.Test:
+// the harness waits on channels only, and the bubble turns a reporter that
+// never starts watching into a deadlock failure.
 func startSleepHarness(t *testing.T, host *fakePowerHost) *sleepHarness {
 	t.Helper()
 	h := &sleepHarness{host: host, rec: record.NewFakeRecorder(16), done: make(chan error, 1),
@@ -175,11 +172,7 @@ func startSleepHarness(t *testing.T, host *fakePowerHost) *sleepHarness {
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 	go func() { h.done <- r.Run(ctx) }()
-	select {
-	case <-host.watching:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reporter never watched for sleep")
-	}
+	<-host.watching
 	t.Cleanup(func() { cancel(); <-h.done })
 	return h
 }
@@ -198,13 +191,7 @@ func (h *sleepHarness) publishes() int {
 
 func nextEvent(t *testing.T, rec *record.FakeRecorder) string {
 	t.Helper()
-	select {
-	case e := <-rec.Events:
-		return e
-	case <-time.After(5 * time.Second):
-		t.Fatal("no Event recorded")
-		return ""
-	}
+	return <-rec.Events
 }
 
 // TestSleepAssertionHeldWhileJoined pins the assertion's span: taken when the
@@ -212,50 +199,52 @@ func nextEvent(t *testing.T, rec *record.FakeRecorder) string {
 // leave and stop paths).
 func TestSleepAssertionHeldWhileJoined(t *testing.T) {
 	t.Run("held while the node runs", func(t *testing.T) {
-		host := newFakePowerHost()
-		h := startSleepHarness(t, host)
-		if held, taken, _ := host.state(); held != 1 || taken != 1 {
-			t.Fatalf("held=%d taken=%d, want one assertion held", held, taken)
-		}
-		if !h.r.Held() {
-			t.Fatal("Held() = false while running")
-		}
-		if host.name != sleepAssertionName {
-			t.Fatalf("assertion name %q", host.name)
-		}
-		c := h.r.condition(metav1.Now())
-		if c.Type != nodeSleeping || c.Status != corev1.ConditionFalse || !strings.Contains(c.Message, "PreventSystemSleep assertion") {
-			t.Fatalf("awake condition = %+v", c)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			host := newFakePowerHost()
+			h := startSleepHarness(t, host)
+			if held, taken, _ := host.state(); held != 1 || taken != 1 {
+				t.Fatalf("held=%d taken=%d, want one assertion held", held, taken)
+			}
+			if !h.r.Held() {
+				t.Fatal("Held() = false while running")
+			}
+			if host.name != sleepAssertionName {
+				t.Fatalf("assertion name %q", host.name)
+			}
+			c := h.r.condition(metav1.Now())
+			if c.Type != nodeSleeping || c.Status != corev1.ConditionFalse || !strings.Contains(c.Message, "PreventSystemSleep assertion") {
+				t.Fatalf("awake condition = %+v", c)
+			}
+		})
 	})
 	t.Run("released when the node stops", func(t *testing.T) {
-		host := newFakePowerHost()
-		h := startSleepHarness(t, host)
-		h.cancel()
-		select {
-		case err := <-h.done:
+		synctest.Test(t, func(t *testing.T) {
+			host := newFakePowerHost()
+			h := startSleepHarness(t, host)
+			h.cancel()
+			err := <-h.done
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("Run = %v", err)
 			}
 			h.done <- err // for the cleanup
-		case <-time.After(5 * time.Second):
-			t.Fatal("Run did not return on stop")
-		}
-		if held, _, released := host.state(); held != 0 || released != 1 {
-			t.Fatalf("held=%d released=%d after stop, want released once", held, released)
-		}
-		if h.r.Held() {
-			t.Fatal("Held() = true after stop")
-		}
+			if held, _, released := host.state(); held != 0 || released != 1 {
+				t.Fatalf("held=%d released=%d after stop, want released once", held, released)
+			}
+			if h.r.Held() {
+				t.Fatal("Held() = true after stop")
+			}
+		})
 	})
 	t.Run("a refused assertion is reported, the node still runs", func(t *testing.T) {
-		host := newFakePowerHost()
-		host.holdErr = errors.New("IOReturn 0xe00002c2")
-		h := startSleepHarness(t, host)
-		c := h.r.condition(metav1.Now())
-		if h.r.Held() || !strings.Contains(c.Message, "no sleep assertion is held") {
-			t.Fatalf("condition = %+v held=%v", c, h.r.Held())
-		}
+		synctest.Test(t, func(t *testing.T) {
+			host := newFakePowerHost()
+			host.holdErr = errors.New("IOReturn 0xe00002c2")
+			h := startSleepHarness(t, host)
+			c := h.r.condition(metav1.Now())
+			if h.r.Held() || !strings.Contains(c.Message, "no sleep assertion is held") {
+				t.Fatalf("condition = %+v held=%v", c, h.r.Held())
+			}
+		})
 	})
 }
 
@@ -264,34 +253,36 @@ func TestSleepAssertionHeldWhileJoined(t *testing.T) {
 // a wake lowers it, records SystemWake with the wall-clock sleep length and
 // publishes.
 func TestSleepAndWakeAreReported(t *testing.T) {
-	host := newFakePowerHost()
-	h := startSleepHarness(t, host)
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakePowerHost()
+		h := startSleepHarness(t, host)
 
-	host.deliver(t, PowerWillSleep)
-	if e := nextEvent(t, h.rec); !strings.HasPrefix(e, "Normal "+sleepEventReason+" ") {
-		t.Fatalf("sleep Event = %q", e)
-	}
-	if h.publishes() != 1 {
-		t.Fatalf("publishes = %d before the will-sleep ack, want 1", h.publishes())
-	}
-	c := h.r.condition(metav1.Now())
-	if c.Status != corev1.ConditionTrue || c.Reason != sleepWillReason {
-		t.Fatalf("asleep condition = %+v", c)
-	}
+		host.deliver(t, PowerWillSleep)
+		if e := nextEvent(t, h.rec); !strings.HasPrefix(e, "Normal "+sleepEventReason+" ") {
+			t.Fatalf("sleep Event = %q", e)
+		}
+		if h.publishes() != 1 {
+			t.Fatalf("publishes = %d before the will-sleep ack, want 1", h.publishes())
+		}
+		c := h.r.condition(metav1.Now())
+		if c.Status != corev1.ConditionTrue || c.Reason != sleepWillReason {
+			t.Fatalf("asleep condition = %+v", c)
+		}
 
-	h.advance(90 * time.Minute)
-	host.deliver(t, PowerDidWake)
-	e := nextEvent(t, h.rec)
-	if !strings.HasPrefix(e, "Normal "+wakeEventReason+" ") || !strings.Contains(e, "after 1h30m0s") {
-		t.Fatalf("wake Event = %q", e)
-	}
-	if h.publishes() != 2 {
-		t.Fatalf("publishes = %d after wake, want 2", h.publishes())
-	}
-	c = h.r.condition(metav1.Now())
-	if c.Status != corev1.ConditionFalse || c.Reason != sleepWokeReason || !strings.Contains(c.Message, "after 1h30m0s") {
-		t.Fatalf("woken condition = %+v", c)
-	}
+		h.advance(90 * time.Minute)
+		host.deliver(t, PowerDidWake)
+		e := nextEvent(t, h.rec)
+		if !strings.HasPrefix(e, "Normal "+wakeEventReason+" ") || !strings.Contains(e, "after 1h30m0s") {
+			t.Fatalf("wake Event = %q", e)
+		}
+		if h.publishes() != 2 {
+			t.Fatalf("publishes = %d after wake, want 2", h.publishes())
+		}
+		c = h.r.condition(metav1.Now())
+		if c.Status != corev1.ConditionFalse || c.Reason != sleepWokeReason || !strings.Contains(c.Message, "after 1h30m0s") {
+			t.Fatalf("woken condition = %+v", c)
+		}
+	})
 }
 
 // TestNodeStatusPublishesSleeping pins the status side: the published node
@@ -339,30 +330,32 @@ func TestNodeStatusPublishesSleeping(t *testing.T) {
 // the node asleep. It is acknowledged without a second Event or publication,
 // and the condition keeps the first sleep's time.
 func TestSleepRepeatedWillSleepIsAcknowledgedOnly(t *testing.T) {
-	host := newFakePowerHost()
-	h := startSleepHarness(t, host)
-	host.deliver(t, PowerWillSleep)
-	_ = nextEvent(t, h.rec)
-	first := h.r.condition(metav1.Now())
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakePowerHost()
+		h := startSleepHarness(t, host)
+		host.deliver(t, PowerWillSleep)
+		_ = nextEvent(t, h.rec)
+		first := h.r.condition(metav1.Now())
 
-	h.advance(10 * time.Minute)
-	start := time.Now()
-	host.deliver(t, PowerWillSleep)
-	if d := time.Since(start); d >= willSleepFlushGrace {
-		t.Fatalf("repeated will-sleep held for %s, want an immediate ack", d)
-	}
-	select {
-	case e := <-h.rec.Events:
-		t.Fatalf("repeated will-sleep recorded %q", e)
-	default:
-	}
-	if h.publishes() != 1 {
-		t.Fatalf("publishes = %d, want 1", h.publishes())
-	}
-	again := h.r.condition(metav1.Now())
-	if again.Status != corev1.ConditionTrue || !again.LastTransitionTime.Equal(&first.LastTransitionTime) || again.Message != first.Message {
-		t.Fatalf("condition moved on a repeated will-sleep: %+v then %+v", first, again)
-	}
+		h.advance(10 * time.Minute)
+		start := time.Now()
+		host.deliver(t, PowerWillSleep)
+		if d := time.Since(start); d >= willSleepFlushGrace {
+			t.Fatalf("repeated will-sleep held for %s, want an immediate ack", d)
+		}
+		select {
+		case e := <-h.rec.Events:
+			t.Fatalf("repeated will-sleep recorded %q", e)
+		default:
+		}
+		if h.publishes() != 1 {
+			t.Fatalf("publishes = %d, want 1", h.publishes())
+		}
+		again := h.r.condition(metav1.Now())
+		if again.Status != corev1.ConditionTrue || !again.LastTransitionTime.Equal(&first.LastTransitionTime) || again.Message != first.Message {
+			t.Fatalf("condition moved on a repeated will-sleep: %+v then %+v", first, again)
+		}
+	})
 }
 
 // TestSleepConditionReportsPowerSource pins the message's honesty: the held
@@ -378,15 +371,17 @@ func TestSleepConditionReportsPowerSource(t *testing.T) {
 		{"on battery the assertion is ignored", PowerSourceBattery, "ignores on battery power: the Mac is on battery and can idle-sleep"},
 		{"an unread source claims nothing", PowerSourceUnknown, "the power source could not be read"},
 	}
-	host := newFakePowerHost()
-	h := startSleepHarness(t, host)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			host.setSource(tc.src)
-			c := h.r.condition(metav1.Now())
-			if !strings.Contains(c.Message, tc.want) {
-				t.Fatalf("message %q, want it to contain %q", c.Message, tc.want)
-			}
+			synctest.Test(t, func(t *testing.T) {
+				host := newFakePowerHost()
+				h := startSleepHarness(t, host)
+				host.setSource(tc.src)
+				c := h.r.condition(metav1.Now())
+				if !strings.Contains(c.Message, tc.want) {
+					t.Fatalf("message %q, want it to contain %q", c.Message, tc.want)
+				}
+			})
 		})
 	}
 }
@@ -395,40 +390,40 @@ func TestSleepConditionReportsPowerSource(t *testing.T) {
 // reporter's start while awake, the sleep, then the wake, and never the time
 // of the call.
 func TestSleepConditionTransitionTimes(t *testing.T) {
-	host := newFakePowerHost()
-	h := startSleepHarness(t, host)
-	start := h.r.condition(metav1.Now()).LastTransitionTime
-	later := metav1.NewTime(time.Now().Add(time.Hour))
-	if got := h.r.condition(later).LastTransitionTime; !got.Equal(&start) {
-		t.Fatalf("awake LastTransitionTime moved from %v to %v", start, got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakePowerHost()
+		h := startSleepHarness(t, host)
+		start := h.r.condition(metav1.Now()).LastTransitionTime
+		later := metav1.NewTime(time.Now().Add(time.Hour))
+		if got := h.r.condition(later).LastTransitionTime; !got.Equal(&start) {
+			t.Fatalf("awake LastTransitionTime moved from %v to %v", start, got)
+		}
 
-	h.advance(time.Minute)
-	sleptAt := metav1.NewTime(h.r.now())
-	host.deliver(t, PowerWillSleep)
-	_ = nextEvent(t, h.rec)
-	if got := h.r.condition(later).LastTransitionTime; !got.Equal(&sleptAt) {
-		t.Fatalf("asleep LastTransitionTime = %v, want the sleep time %v", got, sleptAt)
-	}
+		h.advance(time.Minute)
+		sleptAt := metav1.NewTime(h.r.now())
+		host.deliver(t, PowerWillSleep)
+		_ = nextEvent(t, h.rec)
+		if got := h.r.condition(later).LastTransitionTime; !got.Equal(&sleptAt) {
+			t.Fatalf("asleep LastTransitionTime = %v, want the sleep time %v", got, sleptAt)
+		}
 
-	h.advance(time.Hour)
-	wokeAt := metav1.NewTime(h.r.now())
-	host.deliver(t, PowerDidWake)
-	_ = nextEvent(t, h.rec)
-	if got := h.r.condition(later).LastTransitionTime; !got.Equal(&wokeAt) {
-		t.Fatalf("woken LastTransitionTime = %v, want the wake time %v", got, wokeAt)
-	}
+		h.advance(time.Hour)
+		wokeAt := metav1.NewTime(h.r.now())
+		host.deliver(t, PowerDidWake)
+		_ = nextEvent(t, h.rec)
+		if got := h.r.condition(later).LastTransitionTime; !got.Equal(&wokeAt) {
+			t.Fatalf("woken LastTransitionTime = %v, want the wake time %v", got, wokeAt)
+		}
+	})
 }
 
-// waitPublishes waits until the harness has seen n publications.
+// waitPublishes waits until every goroutine in the bubble is blocked, then
+// checks the harness has seen n publications.
 func (h *sleepHarness) waitPublishes(t *testing.T, n int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for h.publishes() < n {
-		if time.Now().After(deadline) {
-			t.Fatalf("publishes = %d, want %d", h.publishes(), n)
-		}
-		time.Sleep(time.Millisecond)
+	synctest.Wait()
+	if got := h.publishes(); got != n {
+		t.Fatalf("publishes = %d, want %d", got, n)
 	}
 }
 
@@ -437,78 +432,84 @@ func (h *sleepHarness) waitPublishes(t *testing.T, n int) {
 // Sleeping=False with reason DarkWake; the next will-sleep is a real sleep
 // again, with its Event and publication.
 func TestSleepLongDarkWakeIsServing(t *testing.T) {
-	host := newFakePowerHost()
-	h := startSleepHarness(t, host)
-	host.deliver(t, PowerWillSleep)
-	_ = nextEvent(t, h.rec)
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakePowerHost()
+		h := startSleepHarness(t, host)
+		host.deliver(t, PowerWillSleep)
+		_ = nextEvent(t, h.rec)
 
-	h.advance(30 * time.Minute)
-	host.deliver(t, PowerDarkWake)
-	if c := h.r.condition(metav1.Now()); c.Status != corev1.ConditionTrue {
-		t.Fatalf("a fresh dark wake changed Sleeping: %+v", c)
-	}
-	h.mu.Lock()
-	armed := h.afterD
-	h.mu.Unlock()
-	if armed != darkWakePromoteAfter || darkWakePromoteAfter != 60*time.Second {
-		t.Fatalf("promotion armed for %s, want 60s", armed)
-	}
-	if h.publishes() != 1 {
-		t.Fatalf("a dark wake published: publishes = %d, want 1", h.publishes())
-	}
+		h.advance(30 * time.Minute)
+		host.deliver(t, PowerDarkWake)
+		if c := h.r.condition(metav1.Now()); c.Status != corev1.ConditionTrue {
+			t.Fatalf("a fresh dark wake changed Sleeping: %+v", c)
+		}
+		h.mu.Lock()
+		armed := h.afterD
+		h.mu.Unlock()
+		if armed != darkWakePromoteAfter || darkWakePromoteAfter != 60*time.Second {
+			t.Fatalf("promotion armed for %s, want 60s", armed)
+		}
+		if h.publishes() != 1 {
+			t.Fatalf("a dark wake published: publishes = %d, want 1", h.publishes())
+		}
 
-	h.advance(61 * time.Second)
-	h.promote <- time.Now()
-	h.waitPublishes(t, 2)
-	c := h.r.condition(metav1.Now())
-	if c.Status != corev1.ConditionFalse || c.Reason != sleepDarkReason || !strings.Contains(c.Message, "maintenance (dark) wake") || !strings.Contains(c.Message, "serving") {
-		t.Fatalf("long dark wake condition = %+v", c)
-	}
+		h.advance(61 * time.Second)
+		h.promote <- time.Now()
+		h.waitPublishes(t, 2)
+		c := h.r.condition(metav1.Now())
+		if c.Status != corev1.ConditionFalse || c.Reason != sleepDarkReason || !strings.Contains(c.Message, "maintenance (dark) wake") || !strings.Contains(c.Message, "serving") {
+			t.Fatalf("long dark wake condition = %+v", c)
+		}
 
-	host.deliver(t, PowerWillSleep)
-	if e := nextEvent(t, h.rec); !strings.HasPrefix(e, "Normal "+sleepEventReason+" ") {
-		t.Fatalf("sleep after a serving dark wake recorded %q", e)
-	}
-	if h.publishes() != 3 {
-		t.Fatalf("publishes = %d after the next sleep, want 3", h.publishes())
-	}
-	if c := h.r.condition(metav1.Now()); c.Status != corev1.ConditionTrue || c.Reason != sleepWillReason {
-		t.Fatalf("condition after the next sleep = %+v", c)
-	}
+		host.deliver(t, PowerWillSleep)
+		if e := nextEvent(t, h.rec); !strings.HasPrefix(e, "Normal "+sleepEventReason+" ") {
+			t.Fatalf("sleep after a serving dark wake recorded %q", e)
+		}
+		if h.publishes() != 3 {
+			t.Fatalf("publishes = %d after the next sleep, want 3", h.publishes())
+		}
+		if c := h.r.condition(metav1.Now()); c.Status != corev1.ConditionTrue || c.Reason != sleepWillReason {
+			t.Fatalf("condition after the next sleep = %+v", c)
+		}
+	})
 }
 
 // TestSleepShortDarkWakeIsNotPromoted pins the other side: a dark wake that
 // ends in sleep before 60 s leaves Sleeping=True, and the timer firing late
 // changes nothing.
 func TestSleepShortDarkWakeIsNotPromoted(t *testing.T) {
-	host := newFakePowerHost()
-	h := startSleepHarness(t, host)
-	host.deliver(t, PowerWillSleep)
-	_ = nextEvent(t, h.rec)
-	host.deliver(t, PowerDarkWake)
-	h.advance(20 * time.Second)
-	host.deliver(t, PowerWillSleep)
-	h.promote <- time.Now()
-	host.deliver(t, PowerWillSleep) // a round trip through Run after the firing
-	if h.publishes() != 1 {
-		t.Fatalf("publishes = %d, want 1", h.publishes())
-	}
-	if c := h.r.condition(metav1.Now()); c.Status != corev1.ConditionTrue || c.Reason != sleepWillReason {
-		t.Fatalf("condition = %+v, want still asleep", c)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakePowerHost()
+		h := startSleepHarness(t, host)
+		host.deliver(t, PowerWillSleep)
+		_ = nextEvent(t, h.rec)
+		host.deliver(t, PowerDarkWake)
+		h.advance(20 * time.Second)
+		host.deliver(t, PowerWillSleep)
+		h.promote <- time.Now()
+		host.deliver(t, PowerWillSleep) // a round trip through Run after the firing
+		if h.publishes() != 1 {
+			t.Fatalf("publishes = %d, want 1", h.publishes())
+		}
+		if c := h.r.condition(metav1.Now()); c.Status != corev1.ConditionTrue || c.Reason != sleepWillReason {
+			t.Fatalf("condition = %+v, want still asleep", c)
+		}
+	})
 }
 
 // TestSleepUnclassifiedWakeWarnsOnce pins the visible fail-open: a host that
 // cannot classify wakes makes the reporter warn once, not per notice.
 func TestSleepUnclassifiedWakeWarnsOnce(t *testing.T) {
-	host := newFakePowerHost()
-	h := startSleepHarness(t, host)
-	host.deliver(t, PowerWakeUnclassified)
-	host.deliver(t, PowerWakeUnclassified)
-	if n := strings.Count(h.log.String(), "dark wakes (Power Nap, maintenance wakes) will be counted as full wakes"); n != 1 {
-		t.Fatalf("warned %d times, want once:\n%s", n, h.log.String())
-	}
-	if !strings.Contains(h.log.String(), "level=WARN") {
-		t.Fatalf("not logged at Warn:\n%s", h.log.String())
-	}
+	synctest.Test(t, func(t *testing.T) {
+		host := newFakePowerHost()
+		h := startSleepHarness(t, host)
+		host.deliver(t, PowerWakeUnclassified)
+		host.deliver(t, PowerWakeUnclassified)
+		if n := strings.Count(h.log.String(), "dark wakes (Power Nap, maintenance wakes) will be counted as full wakes"); n != 1 {
+			t.Fatalf("warned %d times, want once:\n%s", n, h.log.String())
+		}
+		if !strings.Contains(h.log.String(), "level=WARN") {
+			t.Fatalf("not logged at Warn:\n%s", h.log.String())
+		}
+	})
 }
