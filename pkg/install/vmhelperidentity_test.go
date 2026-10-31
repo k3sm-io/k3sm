@@ -18,6 +18,8 @@ package install
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -112,5 +114,64 @@ func TestVerifyVMHelperFollowsVersionedLayout(t *testing.T) {
 				t.Errorf("a refused helper reported %v, want the forged record named", err)
 			}
 		})
+	}
+}
+
+// TestTeardownReportsAnUnretainedVMHelper pins the teardown's answer to a
+// helper still running from a version the tree no longer retains (one started
+// two updates ago, whose version is neither current nor previous): it is never
+// signalled, because nothing but its path vouches for it, and the teardown
+// names it as the leftover it is, by pid, executable path and version, with
+// the command that stops it, instead of reporting it as a forged record. A
+// helper of a retained version beside it is still stopped.
+func TestTeardownReportsAnUnretainedVMHelper(t *testing.T) {
+	const (
+		stale = 811 // runs from 0.2.8, which no link retains
+		live  = 812 // runs from 0.3.0, the active version
+	)
+	staleExe := DefaultInstallDir + "/versions/0.2.8/" + VMHostName
+	var logs bytes.Buffer
+	f := &fakeSystem{}
+	f.podLeaders = map[int]int64{stale: 1, live: 2}
+	f.life.vmhosts = []VMHostRecord{
+		{Schema: 1, PodID: "stale-pod", Pgid: stale, StartUnixNano: 1},
+		{Schema: 1, PodID: "live-pod", Pgid: live, StartUnixNano: 2},
+	}
+	f.life.procs = map[int]fakeProc{
+		stale: {exe: staleExe, uid: fakeServiceUID},
+		live:  {exe: DefaultInstallDir + "/versions/0.3.0/" + VMHostName, uid: fakeServiceUID},
+	}
+	f.purge.links = map[string]string{
+		DefaultInstallDir + "/current":  "versions/0.3.0",
+		DefaultInstallDir + "/previous": "versions/0.2.9",
+	}
+	cfg := Config{Logger: slog.New(slog.NewTextHandler(&logs, nil))}.withDefaults()
+
+	err := stopVMHelpers(context.Background(), f, cfg)
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, fmt.Sprintf("Signal:%d:", stale)) {
+			t.Errorf("the unretained helper was signalled: %q", c)
+		}
+	}
+	if idx(f.calls, fmt.Sprintf("Signal:%d:TERM", live)) < 0 {
+		t.Errorf("the retained helper beside it was not stopped: %q", f.calls)
+	}
+	if err == nil {
+		t.Fatal("stopVMHelpers = nil, want the unretained helper reported as a leftover")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		fmt.Sprintf("pid %d", stale),
+		staleExe,
+		"version 0.2.8",
+		"no longer retains",
+		fmt.Sprintf("kill -TERM -%d", stale),
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("stopVMHelpers = %q, want it to name %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "not "+cfg.installedVMHost()) {
+		t.Errorf("stopVMHelpers = %q, reports the unretained helper as a forged record", msg)
 	}
 }
