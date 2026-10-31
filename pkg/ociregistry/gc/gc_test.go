@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -318,8 +319,11 @@ func TestLeavesATempNameUnderAnUnknownDirectory(t *testing.T) {
 }
 
 // TestReapsCommittedSession covers a commit that linked the session into
-// blobs/ and stopped before removing it: the session's inode has two links,
-// so the store's session check refuses it and a cancel cannot remove it.
+// blobs/ and stopped before removing it: the session's inode has two links.
+// The store refuses to append to it (a late chunk would write the published
+// blob), and a client that never retries or cancels leaves it for the sweep,
+// which removes only the session name and never a session whose lock an
+// upload operation holds.
 func TestReapsCommittedSession(t *testing.T) {
 	e := newEnv(t)
 	n := name(t, "app")
@@ -333,8 +337,8 @@ func TestReapsCommittedSession(t *testing.T) {
 	if err := os.Link(e.sessionFile(t, n, id), blob); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.s.CancelUpload(e.ctx, n, id); !errors.Is(err, store.ErrUploadUnknown) {
-		t.Fatalf("cancel of a linked session: %v, want ErrUploadUnknown", err)
+	if _, err := e.s.AppendUpload(e.ctx, n, id, -1, strings.NewReader("late")); !errors.Is(err, store.ErrUploadUnknown) {
+		t.Fatalf("append to a linked session: %v, want ErrUploadUnknown", err)
 	}
 
 	// A second such session whose lock an upload operation holds is left.
@@ -367,6 +371,45 @@ func TestReapsCommittedSession(t *testing.T) {
 	}
 	if _, err := os.Lstat(e.sessionFile(t, n, busy)); err != nil {
 		t.Fatalf("the busy session was reaped: %v", err)
+	}
+}
+
+// TestCancelledCommittedSessionLeavesNothing covers a client that cancels a
+// session a commit already linked into blobs/: the cancel removes the session
+// name, the blob keeps the inode and its content, and the next sweep finds no
+// session to reap; the blob is then an ordinary one, and the image a manifest
+// names keeps every blob.
+func TestCancelledCommittedSessionLeavesNothing(t *testing.T) {
+	e := newEnv(t)
+	n := name(t, "app")
+	img := e.push(t, n, "v1", "app", []byte("layer"))
+	body := "committed body"
+	id := e.session(t, n, body)
+	d := digest.FromString(body)
+	blob := e.blobFile(t, n, d)
+	if err := os.Link(e.sessionFile(t, n, id), blob); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.CancelUpload(e.ctx, n, id); err != nil {
+		t.Fatalf("cancel of a linked session: %v", err)
+	}
+	if _, err := os.Lstat(e.sessionFile(t, n, id)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the cancelled session is still there: %v", err)
+	}
+	if b, err := os.ReadFile(blob); err != nil || string(b) != body {
+		t.Fatalf("the blob lost its content: %q, %v", b, err)
+	}
+
+	c := e.collector(t, -3*time.Hour)
+	e.ran(t)
+	e.clk.set(0)
+	if rep := e.sweep(t, c); rep.Count(KindUpload) != 0 {
+		t.Fatalf("report %+v, want no session reaped", rep)
+	}
+	for _, d := range img.blobs() {
+		if !e.has(n, d) {
+			t.Errorf("%s was reaped", d)
+		}
 	}
 }
 
